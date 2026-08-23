@@ -188,8 +188,8 @@ async fn uc14_transpile_cache_and_hot_reload() {
         let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
         assert_eq!(v["data"]["v"], 1);
     }
-    // 3 次请求只发生 1 次实际转译（转译缓存全局共享，跨 actor）。
-    assert_eq!(transpile_hits(), before + 1);
+    // 启动内省已预热转译缓存：3 次请求 0 次新转译（缓存全局共享，跨 actor）。
+    assert_eq!(transpile_hits(), before);
     // 热重载：改文件 → mtime 变 → 下次请求新结果。
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(
@@ -258,7 +258,8 @@ async fn uc10_404_and_405_and_traversal() {
     assert_eq!(s, 404);
     let (s, v) = req(addr, "DELETE", "/v1/api/u/f/", None).await;
     assert_eq!(s, 405);
-    assert!(v["msg"].as_str().unwrap().contains("del"), "{v}");
+    // 405 判定上移到路由表层（pattern 命中、方法缺席），消息随之变化。
+    assert!(v["msg"].as_str().unwrap().contains("DELETE"), "{v}");
     // 目录穿越按 404（url crate 将 ../ 归一化为 /v1/etc/，同样落 404 信封）。
     let (s, _) = req(addr, "GET", "/v1/api/../etc/", None).await;
     assert_eq!(s, 404);

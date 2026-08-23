@@ -63,9 +63,6 @@ pub async fn start(
     for m in manifest::load_modules(&dir)? {
         println!("module {} v{} — {}", m.name, m.version, m.desc);
     }
-    for r in routes::route_table(&dir, ts) {
-        println!("  {base}/{r}/");
-    }
     // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
     let dir = dir.canonicalize().unwrap_or(dir);
     let loader = Arc::new(LoaderShared {
@@ -73,6 +70,29 @@ pub async fn start(
         ts,
     });
     let kv = Arc::new(InMemoryKV::new());
+    // 路由表：启动内省 .route 声明（设计 §2；dev/release 同路径，release 直载在后续任务）。
+    let (table, failures) = {
+        let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
+        let make = move || {
+            Bridge::with_dbs_and_loader(
+                dbs.clone(),
+                kv.clone(),
+                SchemaRegistry::new(),
+                false,
+                Some(loader.clone()),
+            )
+        };
+        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make))
+    };
+    for f in &failures {
+        eprintln!("error: route: {f}");
+    }
+    if !failures.is_empty() {
+        eprintln!("warn: {} route declaration(s) skipped (see errors above)", failures.len());
+    }
+    for r in table.listing() {
+        println!("  {:8} {}  <- {}", r.method.to_uppercase(), r.pattern, r.file.display());
+    }
     let n = cfg.server.pool_size.max(1) as usize;
     let timeout = config::parse_duration(&cfg.server.timeout).ok();
     let actor = JsActor::pool(n, {
@@ -93,7 +113,7 @@ pub async fn start(
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind: {e}"))?;
     let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
     let h = tokio::spawn(async move {
-        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, actor, timeout).await;
+        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, table, actor, timeout).await;
     });
     Ok((bound, h))
 }
