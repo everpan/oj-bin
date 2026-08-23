@@ -415,7 +415,79 @@ impl Bridge {
             Err(e) => Err(RunError::Core(e)),
         }
     }
+
+    /// 启动期内省：import api 模块、读 default[method].route，经 json.ok 信封回传 data
+    /// （{"get": "{id}" | null, ...}，仅含函数导出的方法；null = 导出但未挂 .route）。
+    /// 复用 run_module 的 driver/KillSwitch/checkin 管道（其注释同样适用）。
+    pub async fn introspect_module(
+        &self,
+        api_path: &std::path::Path,
+    ) -> Result<serde_json::Value, RunError> {
+        let spec = module_loader::versioned_specifier(api_path)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        static INTRO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = INTRO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/introspect/{n}.js"))
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
+        let code = format!(
+            "const m = await import(\"{spec}\");\n\
+             const out = {{}};\n\
+             for (const k of [\"get\",\"post\",\"put\",\"del\",\"patch\",\"head\",\"options\"]) {{\n\
+               const fn = m.default && m.default[k];\n\
+               if (typeof fn === \"function\") out[k] = fn.route === undefined ? null : String(fn.route);\n\
+             }}\n\
+             json.ok(out);\n"
+        );
+        let timeout = INTROSPECT_TIMEOUT;
+        let mut rt = self.pool.checkout();
+        let ptr: usize = {
+            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
+            iso as *mut _ as usize
+        };
+        self.kill.arm(ptr, timeout);
+        {
+            let op_state = runtime::op_state(&rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().reset(RequestInfo::default());
+        }
+        let result: Result<(), CoreError> = async {
+            let id = rt
+                .load_side_es_module_from_code(&driver_spec, code)
+                .await?;
+            let eval = rt.mod_evaluate(id);
+            rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
+            eval.await?;
+            Ok(())
+        }
+        .await;
+        if self.kill.disarm() {
+            return Err(RunError::Timeout);
+        }
+        match result {
+            Ok(()) => {
+                let capture = {
+                    let op_state = runtime::op_state(&rt);
+                    let g = op_state.borrow();
+                    let rs = g.borrow::<ReqState>();
+                    Capture {
+                        status: rs.status,
+                        headers: rs.headers.clone(),
+                        body: rs.response.clone().unwrap_or_default(),
+                    }
+                };
+                self.pool.checkin(rt);
+                let v: serde_json::Value =
+                    serde_json::from_slice(&capture.body).unwrap_or_default();
+                Ok(v["data"].clone())
+            }
+            Err(e) => Err(RunError::Core(e)),
+        }
+    }
 }
+
+/// 内省超时：坏模块顶层死循环不挂死启动。
+/// ponytail: 常量而非配置；真有 >2s 的合法顶层模块再加 server.introspect_timeout。
+pub const INTROSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// WS 帧执行结果：HTTP 捕获 + ws.send 集合 + ws.close 置位。
 #[derive(Debug, Default)]
@@ -811,6 +883,40 @@ mod tests {
         let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
         assert_eq!(v1["data"], json!({"n": 1}), "{v1}");
         assert_eq!(v2["data"], json!({"n": 2}), "{v2}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_reads_route_decls() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "a/api.ts",
+            "function get() { json.ok({}); }\n\
+             get.route = \"{id}\";\n\
+             function del() { json.ok({}); }\n\
+             export default { get, del };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(v["get"], json!("{id}"), "{v}");
+        assert_eq!(v["del"], json!(null), "{v}");
+        assert!(v.get("post").is_none(), "{v}"); // 未导出 → 缺席
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_broken_module_errs() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[("bad/api.ts", "function {{{{\nexport default {};")]);
+        let b = module_bridge(&root);
+        assert!(b.introspect_module(&api).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_top_level_loop_times_out() {
+        let _t = transpile_serial();
+        let (root, api) =
+            mod_fx(&[("loop/api.ts", "while (true) {}\nexport default { get() {} };\n")]);
+        let b = module_bridge(&root);
+        assert!(matches!(b.introspect_module(&api).await, Err(RunError::Timeout)));
     }
 
     #[tokio::test(flavor = "current_thread")]
