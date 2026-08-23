@@ -9,6 +9,9 @@ mdm-server = { path = "../server" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 
 [dev-dependencies]

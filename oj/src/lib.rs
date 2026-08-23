@@ -3,4 +3,5 @@
 pub mod args;
 pub mod build_cmd;
 pub mod manifest;
+pub mod pack;
 pub mod server_cmd;
