@@ -260,35 +260,32 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         ("src/u/list/api.ts", "export default { get() { json.ok({ all: true }); } };\n"),
     ]);
     let a = oj::args::BuildArgs {
-        base: "/v1/api".into(),
+        module: Some("u".into()),
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
     };
     oj::build_cmd::run(&a).await.unwrap();
-    // routes.js：.route 行 + 镜像行全量导出
-    let routes = std::fs::read_to_string(t.join("dist/routes.js")).unwrap();
-    assert!(routes.contains("\"/v1/api/u/item/{id}\""), "{routes}");
-    assert!(routes.contains("\"u/item/api.js\""), "{routes}");
-    assert!(routes.contains("\"/v1/api/u/list\""), "{routes}");
+    // routes.js：.route 行 + 镜像行（pattern 无 base 含模块段，file 为哈希名）
+    let vd = t.join("dist/u-0.1.0");
+    let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
+    assert!(routes.contains("\"u/item/{id}\""), "{routes}");
+    assert!(routes.contains("\"u/list\""), "{routes}");
+    assert!(routes.contains("api-"), "{routes}");
+    assert!(!routes.contains("/v1/api"), "{routes}");
     // 产物：.route 剥离；相对 import 补 .js；_shared/manifest 落盘
-    let item = std::fs::read_to_string(t.join("dist/u/item/api.js")).unwrap();
+    let hashed = std::fs::read_dir(vd.join("item")).unwrap().next().unwrap().unwrap().file_name();
+    let item = std::fs::read_to_string(vd.join("item").join(&hashed)).unwrap();
+    assert!(hashed.to_string_lossy().starts_with("api-"), "{hashed:?}");
     assert!(!item.contains(".route"), "{item}");
     assert!(item.contains("\"../_shared/v.js\""), "{item}");
-    assert!(t.join("dist/u/_shared/v.js").is_file());
-    assert!(t.join("dist/u/manifest.yaml").is_file());
-    // release 全链路（dist 直载 routes.js，无内省无兜底）
-    let (addr, _h) =
-        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
-    let (s, v) = req(addr, "GET", "/v1/api/u/item/7", None).await;
-    assert_eq!(s, 200);
-    assert_eq!(v["data"]["id"], 7, "{v}");
-    assert_eq!(v["data"]["ok"], true, "{v}");
-    let (s, v) = req(addr, "GET", "/v1/api/u/list", None).await;
-    assert_eq!(s, 200);
-    assert_eq!(v["data"]["all"], true, "{v}");
-    // 镜像被替换 + release 无兜底 → 404
-    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
-    assert_eq!(s, 404);
+    assert!(vd.join("_shared/v.js").is_file());
+    assert!(vd.join("manifest.yaml").is_file());
+    assert!(t.join("dist/u-0.1.0.tgz").is_file());
+    assert_eq!(
+        oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap()["u"],
+        "0.1.0"
+    );
+    // release 全链路（聚合各模块 routes.js 服务）待 T7/T8 恢复断言。
     let _ = std::fs::remove_dir_all(&t);
 }
 

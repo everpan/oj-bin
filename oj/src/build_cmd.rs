@@ -1,67 +1,41 @@
-//! oj build：src → dist。转译全部 .ts、剥离 `.route`、补相对 import 后缀，
-//! 并生成 `dist/routes.js`（release 直载的唯一路由来源，见设计 §4.1/§4.2）。
+//! oj build：src → dist（按模块）。转译 .ts、剥 `.route`、补相对 import 后缀；
+//! api.ts 按内容哈希改名，产出 `dist/<module>-<version>/`（routes.js + manifest.yaml）
+//! 与 `dist/manifests.yaml`、`<module>-<version>.tgz`（spec §2）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::{transpile, Bridge, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor};
-use mdm_server::routes::{self, RouteTable};
+use mdm_server::routes;
 
 use crate::args::BuildArgs;
 
-/// 构建入口（内省器自带独立线程 runtime；async 仅因内存库初始化）。
+/// 构建入口：单模块或全部（None）。内省器自带独立线程 runtime；async 仅因内存库初始化。
 pub async fn run(a: &BuildArgs) -> Result<(), String> {
     let src = PathBuf::from(&a.dir)
         .canonicalize()
         .map_err(|e| format!("src dir '{}': {e}", a.dir))?;
     let out = PathBuf::from(&a.out);
-    // 1. 全量落盘：.ts → 转译 + 剥 .route + 补相对 import 后缀；manifest.yaml 原样复制。
-    let mut files = Vec::new();
-    collect(&src, &src, &mut files)?;
-    for rel in &files {
-        let dst = out.join(rel);
-        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
-        if rel.extension().is_some_and(|e| e == "yaml") {
-            std::fs::copy(src.join(rel), &dst).map_err(|e| format!("copy {}: {e}", dst.display()))?;
-        } else {
-            // .ts → .js（同名）
-            let js = rel.with_extension("js");
-            let dst = out.join(&js);
-            let code = transpile::cached_transpile(&src.join(rel))
-                .map_err(|e| format!("transpile {}: {e}", rel.display()))?;
-            std::fs::write(&dst, fix_relative_imports(&strip_route_decls(&code)))
-                .map_err(|e| format!("write {}: {e}", dst.display()))?;
+    let mut names: Vec<String> = match &a.module {
+        Some(m) => {
+            crate::manifest::validate_module(m)?;
+            let mf = src.join(m).join("manifest.yaml");
+            if !mf.is_file() {
+                return Err(format!("module {m:?}: no manifest.yaml under {}", src.display()));
+            }
+            vec![m.clone()]
         }
+        None => crate::manifest::load_modules(&src)?
+            .into_iter()
+            .map(|m| m.name)
+            .collect(),
+    };
+    names.sort(); // read_dir 顺序不定；构建顺序确定 → 控制台/lock 写入顺序稳定
+    for name in &names {
+        build_one(&src, &out, name).await?;
     }
-    // 2. 建表（复用 dev 内省：含 .route 行与镜像行）→ 3. routes.js。
-    let (table, failures) = build_table("", &src).await?;
-    for f in &failures {
-        eprintln!("error: route: {f}");
-    }
-    let mut js = String::from("// 由 oj build 生成；勿手改（release 模式直载注册，见设计 §4.1）。\nexport default [\n");
-    for r in table.listing() {
-        let rel = r
-            .file
-            .strip_prefix(&src)
-            .map_err(|_| format!("route file outside src: {}", r.file.display()))?
-            .with_extension("js");
-        js.push_str(&format!(
-            "  {{ method: {}, pattern: {}, file: {} }},\n",
-            q(&r.method),
-            q(&r.pattern),
-            q(&rel.to_string_lossy().replace('\\', "/"))
-        ));
-    }
-    js.push_str("];\n");
-    let routes_js = out.join("routes.js");
-    std::fs::write(&routes_js, js).map_err(|e| format!("write {}: {e}", routes_js.display()))?;
-    println!(
-        "oj build: {} module file(s) → {} ({} route row(s))",
-        files.len(),
-        out.display(),
-        table.listing().len()
-    );
+    println!("oj build: {} module(s) → {}", names.len(), out.display());
     Ok(())
 }
 
@@ -70,15 +44,122 @@ fn q(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_default()
 }
 
-/// 建表：与 dev server 同构（bridge_introspector 独立线程内省 src 的 api.ts）。
-/// project_root 取 src 父目录（= 项目根，同 dev 的 config_dir）：bare import 要沿
-/// node_modules 向上解析到项目根（src 下没有 node_modules）。
-/// db 用内存库：构建零磁盘副作用，模块顶层建表/查询语句照常执行后即弃。
-async fn build_table(base: &str, src: &Path) -> Result<(RouteTable, Vec<String>), String> {
+/// rel 路径的目录段（正斜杠；模块根下为 ""）。
+fn rel_dir(rel: &Path) -> String {
+    rel.parent().unwrap_or(Path::new("")).to_string_lossy().replace('\\', "/")
+}
+
+/// 单模块构建：清场同名版本目录 → 落盘 → 内省产 routes.js → lock upsert → tgz。
+async fn build_one(src: &Path, out: &Path, module: &str) -> Result<(), String> {
+    let mdir = src.join(module);
+    let m = crate::manifest::parse_one(&mdir.join("manifest.yaml"))?;
+    if m.name != module {
+        return Err(format!("manifest name {:?} != module {:?}", m.name, module));
+    }
+    crate::manifest::validate_version(&m.version)?;
+    let vdir = out.join(format!("{module}-{}", m.version));
+    // 清场：同版本重建先删（旧哈希残留根治，spec §2.3）
+    if vdir.exists() {
+        std::fs::remove_dir_all(&vdir).map_err(|e| format!("clean {}: {e}", vdir.display()))?;
+    }
+    std::fs::create_dir_all(&vdir).map_err(|e| format!("mkdir {}: {e}", vdir.display()))?;
+
+    // 1. 收集 + api.ts 不可被 import 守卫
+    let files = collect_module(&mdir)?;
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .filter(|(rel, _)| rel.extension().is_some_and(|e| e == "ts"))
+        .map(|(rel, _)| {
+            let text = std::fs::read_to_string(mdir.join(rel))
+                .map_err(|e| format!("read {}: {e}", rel.display()))?;
+            Ok((rel.to_string_lossy().into_owned(), text))
+        })
+        .collect::<Result<_, String>>()?;
+    guard_no_api_imports(&sources)?;
+
+    // 2. 落盘：api.ts → api-<hash16>.js（转译+剥 .route+补后缀，哈希含变换后内容）；
+    //    其余 .ts 原路径换 .js 扩展；manifest.yaml 原样复制。
+    let mut hashed: HashMap<String, String> = HashMap::new(); // rel 目录 → 哈希文件名
+    for (rel, is_api) in &files {
+        let dir = rel.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(""));
+        let dst_dir = vdir.join(dir);
+        std::fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
+        if rel.extension().is_some_and(|e| e == "yaml") {
+            let dst = dst_dir.join(rel.file_name().unwrap());
+            std::fs::copy(mdir.join(rel), &dst).map_err(|e| format!("copy {}: {e}", dst.display()))?;
+        } else {
+            let js = transpile::cached_transpile(&mdir.join(rel))
+                .map_err(|e| format!("transpile {}: {e}", rel.display()))?;
+            let stripped; // 生命周期：strip 产物要活过 fix_relative_imports 调用
+            let js = fix_relative_imports(if *is_api { stripped = strip_route_decls(&js); &stripped } else { &js });
+            let name = if *is_api {
+                let n = format!("api-{}.js", crate::pack::hash16(&js));
+                hashed.insert(rel_dir(rel), n.clone());
+                n
+            } else {
+                rel.with_extension("js").file_name().unwrap().to_string_lossy().into_owned()
+            };
+            let dst = dst_dir.join(&name);
+            std::fs::write(&dst, js).map_err(|e| format!("write {}: {e}", dst.display()))?;
+        }
+    }
+
+    // 3. 内省（内存库）→ routes.js：pattern 无 base 含模块段（rel_pattern），file 为哈希名
+    let decls = introspect_module_files(src, &mdir, &files).await?;
+    let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
+    for (dir, rows) in decls {
+        for (method, route) in rows {
+            let file = hashed
+                .get(&dir)
+                .cloned()
+                .ok_or_else(|| format!("module {module:?}: no hashed api file for {dir:?}"))?;
+            js.push_str(&format!(
+                "  {{ method: {}, pattern: {}, file: {} }},\n",
+                q(&method),
+                q(&rel_pattern(module, &dir, route.as_deref())),
+                q(&file)
+            ));
+        }
+    }
+    js.push_str("];\n");
+    std::fs::write(vdir.join("routes.js"), js).map_err(|e| format!("write routes.js: {e}"))?;
+
+    // 4. manifests.yaml：读旧（无则空表）→ upsert → 原子写
+    let lock_path = out.join("manifests.yaml");
+    let mut lock = crate::manifest::load_lock(&lock_path).unwrap_or_default();
+    lock.insert(module.to_string(), m.version.clone());
+    crate::manifest::save_lock(&lock_path, &lock)?;
+
+    // 5. tgz
+    crate::pack::write_tgz(
+        &vdir,
+        &out.join(format!("{module}-{}.tgz", m.version)),
+        &format!("{module}-{}", m.version),
+    )?;
+    println!(
+        "oj build: {module} v{} → {} ({} api file(s))",
+        m.version,
+        vdir.display(),
+        hashed.len()
+    );
+    Ok(())
+}
+
+/// 模块内省：每个 api.ts 一线程 + current_thread runtime（Bridge !Send），内存库
+/// 零磁盘副作用（同 dev 内省管道）。project_root 取 src 父目录（= 项目根，同 dev 的
+/// config_dir）：bare import 要沿 node_modules 向上解析到项目根（src 下没有）。
+/// 返回 (rel 目录, 该 api.ts 的 (method, route) 行)，顺序随 collect_module 确定。
+async fn introspect_module_files(
+    src: &Path,
+    mdir: &Path,
+    files: &[(PathBuf, bool)],
+) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
     let mut dbs: HashMap<String, Arc<dyn mdm_base_rust::bridge::DataAccessor>> = HashMap::new();
     dbs.insert(
         "default".into(),
-        SqlxAccessor::arc("sqlite::memory:").await.map_err(|e| format!("open build db: {e}"))?,
+        SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .map_err(|e| format!("open build db: {e}"))?,
     );
     let root = src.parent().unwrap_or(src).to_path_buf();
     let make = {
@@ -93,11 +174,28 @@ async fn build_table(base: &str, src: &Path) -> Result<(RouteTable, Vec<String>)
             )
         }
     };
-    Ok(routes::RouteTable::build(base, src, true, routes::bridge_introspector(make)))
+    let introspect = routes::bridge_introspector(make);
+    let mut out = Vec::new();
+    for (rel, is_api) in files {
+        if !is_api {
+            continue;
+        }
+        let rows = introspect(&mdir.join(rel))
+            .map_err(|e| format!("introspect {}: {e}", rel.display()))?;
+        out.push((rel_dir(rel), rows));
+    }
+    Ok(out)
 }
 
-/// 递归收集 .ts 与 manifest.yaml（相对 root 的路径，确定性排序）。
-fn collect(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) -> Result<(), String> {
+/// 递归收集模块内 .ts 与 manifest.yaml（相对模块根，确定性排序）。
+/// is_api = 文件名是 api.ts（哈希改名 + 进 routes.js）。
+fn collect_module(root: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
+    let mut acc = Vec::new();
+    walk(root, root, &mut acc)?;
+    Ok(acc)
+}
+
+fn walk(root: &Path, dir: &Path, acc: &mut Vec<(PathBuf, bool)>) -> Result<(), String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("read {}: {e}", dir.display()))?
         .flatten()
@@ -105,11 +203,14 @@ fn collect(root: &Path, dir: &Path, acc: &mut Vec<PathBuf>) -> Result<(), String
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
-        let name = e.file_name().to_string_lossy().into_owned();
         if p.is_dir() {
-            collect(root, &p, acc)?;
-        } else if name.ends_with(".ts") || name == "manifest.yaml" {
-            acc.push(p.strip_prefix(root).unwrap().to_path_buf());
+            walk(root, &p, acc)?;
+        } else {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_api = name == "api.ts";
+            if is_api || name.ends_with(".ts") || name == "manifest.yaml" {
+                acc.push((p.strip_prefix(root).unwrap().to_path_buf(), is_api));
+            }
         }
     }
     Ok(())
@@ -279,5 +380,115 @@ mod tests {
         assert!(e.contains("_shared/util.ts") && e.contains("../account/api"), "{e}");
         // 无违规
         assert!(guard_no_api_imports(&[("x.ts".into(), "import m from \"pkg\";".into())]).is_ok());
+    }
+
+    /// 测试辅助：目录下唯一文件的文件名（String）。
+    fn only_file(dir: &std::path::Path) -> String {
+        let mut it = std::fs::read_dir(dir).unwrap();
+        let name = it.next().unwrap().unwrap().file_name();
+        assert!(it.next().is_none(), "expected exactly one file in {}", dir.display());
+        name.to_string_lossy().into_owned()
+    }
+
+    /// 测试辅助：摆一个 src（user 带 .route + _shared，other 纯镜像）。
+    fn src_fixture(t: &std::path::Path) {
+        let src = t.join("src");
+        for d in ["user/item", "user/_shared", "other/list"] {
+            std::fs::create_dir_all(src.join(d)).unwrap();
+        }
+        std::fs::write(src.join("user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n").unwrap();
+        std::fs::write(src.join("other/manifest.yaml"), "name: other\ndesc: d\nversion: 0.9.0\n").unwrap();
+        std::fs::write(src.join("user/_shared/validate.ts"), "export const v = 1;\n").unwrap();
+        std::fs::write(src.join("user/item/api.ts"),
+            "import { v } from \"../_shared/validate\";\nfunction get(){ json.ok({v}); }\nget.route = \"{id}\";\nexport default { get };\n").unwrap();
+        std::fs::write(src.join("other/list/api.ts"),
+            "function get(){ json.ok({}); }\nexport default { get };\n").unwrap();
+    }
+
+    fn build_args(t: &std::path::Path, module: Option<&str>) -> BuildArgs {
+        BuildArgs {
+            module: module.map(str::to_string),
+            dir: t.join("src").display().to_string(),
+            out: t.join("dist").display().to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_module_emits_versioned_artifacts() {
+        let t = std::env::temp_dir().join(format!("oj-build-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        run(&build_args(&t, Some("user"))).await.unwrap();
+
+        let vd = t.join("dist/user-0.1.0");
+        let item_name = only_file(&vd.join("item"));
+        assert!(item_name.starts_with("api-") && item_name.ends_with(".js"), "{item_name}");
+        assert_eq!(item_name.len(), "api-".len() + 16 + ".js".len()); // 16 hex
+
+        let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
+        assert!(routes.contains("\"user/item/{id}\""), "{routes}"); // pattern 无 base 含模块段
+        assert!(routes.contains(&item_name), "{routes}");           // file = 哈希文件名
+        assert!(!routes.contains("/v1/api"), "{routes}");
+
+        let item_js = std::fs::read_to_string(vd.join("item").join(&item_name)).unwrap();
+        assert!(!item_js.contains(".route ="), "{item_js}");       // .route 已剥
+        assert!(item_js.contains("../_shared/validate.js"), "{item_js}"); // import 后缀已补
+
+        assert!(vd.join("manifest.yaml").is_file());               // 原样复制
+        assert!(vd.join("_shared/validate.js").is_file());         // 非 api 原路径
+        assert!(vd.join("item/api.ts").metadata().is_err());       // 不留旧名
+
+        let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
+        assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
+        assert!(!lock.contains_key("other"));                       // 单模块构建不动他人
+        assert!(t.join("dist/user-0.1.0.tgz").is_file());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn rebuild_same_version_stable_hash_then_wipes() {
+        let t = std::env::temp_dir().join(format!("oj-build-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        let first = only_file(&t.join("dist/user-0.1.0/item"));
+        // 内容未变 → 重建哈希稳定（转译确定性 + hash16）
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        assert_eq!(only_file(&t.join("dist/user-0.1.0/item")), first);
+        // 内容变更 → 旧哈希清场，目录内恰好 1 个 api-*.js
+        std::fs::write(t.join("src/user/item/api.ts"),
+            "function get(){ json.ok({v:2}); }\nget.route = \"{id}\";\nexport default { get };\n").unwrap();
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        let second = only_file(&t.join("dist/user-0.1.0/item"));
+        assert_ne!(second, first);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_rejects_api_import() {
+        let t = std::env::temp_dir().join(format!("oj-build-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("src/user/_shared")).unwrap();
+        std::fs::write(t.join("src/user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n").unwrap();
+        std::fs::write(t.join("src/user/_shared/x.ts"), "import { g } from \"../item/api\";\n").unwrap();
+        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        assert!(e.contains("api.ts") || e.contains("api"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_all_modules() {
+        let t = std::env::temp_dir().join(format!("oj-build-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        run(&build_args(&t, None)).await.unwrap();
+        assert!(t.join("dist/user-0.1.0/routes.js").is_file());
+        assert!(t.join("dist/other-0.9.0/routes.js").is_file());
+        let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
+        assert_eq!(lock.len(), 2, "{lock:?}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 }
