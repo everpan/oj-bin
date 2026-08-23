@@ -16,7 +16,7 @@ auth:
   # Required
   jwt_secret: "change-me"
   auth_url: "https://..."  #external origin (falls back to request headers)
-  db: "default",   #
+  db: "default"
 
   # Tokens
   signing_method: "HS256" # HS256 | HS384 | HS512
@@ -26,14 +26,14 @@ auth:
   # Web
   sign_in_redirect_url: "/sign-in"
   cookie_session_name: "cnf.id"
-  cookies: #CookieOptions::default(),
+  cookies: # CookieOptions::default()
 
   # Storage
-  redis: "default",  # optional in redis section
+  redis: "default"  # optional in redis section
   redis_prefix: "AUTH-SESSION"
-  redis_ttl: 1800,
+  redis_ttl: 1800
   user_table_name: "users"  # needs at least: id, roles
-  session_table_name: "sessions".into(),   // see examples/schema.sql
+  session_table_name: "sessions"   # see examples/schema.sql
 
   # Providers & callbacks
   providers:
