@@ -6,7 +6,7 @@ async fn main() {
     match args::parse(&argv) {
         Command::None => {
             eprintln!(
-                "usage: oj <server|build> [flags]\n  oj server -c config.yaml -b /v1/api -d src --dev\n  oj build -b /v1/api -d src -o dist"
+                "usage: oj <server|build> [flags]\n  oj server -c config.yaml -b /v1/api -d src --dev\n  oj build [module] -d src -o dist"
             );
             std::process::exit(2);
         }

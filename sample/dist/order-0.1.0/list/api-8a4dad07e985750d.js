@@ -1,4 +1,4 @@
-import { requireRole } from "../../user/_shared/validate.js";
+import { requireRole } from "../../user-0.1.0/_shared/validate.js";
 function get() {
   const role = requireRole(http.param("role", "admin")); // 跨模块相对导入（UC-13）
   db.query(`select o.id, o.no, o.amount, a.name as account_name, a.role
