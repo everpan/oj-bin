@@ -17,6 +17,8 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         .canonicalize()
         .map_err(|e| format!("src dir '{}': {e}", a.dir))?;
     let out = PathBuf::from(&a.out);
+    // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
+    let mut view = crate::manifest::load_lock(&out.join("manifests.yaml")).unwrap_or_default();
     let mut names: Vec<String> = match &a.module {
         Some(m) => {
             crate::manifest::validate_module(m)?;
@@ -28,12 +30,15 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         }
         None => crate::manifest::load_modules(&src)?
             .into_iter()
-            .map(|m| m.name)
+            .map(|m| {
+                view.insert(m.name.clone(), m.version);
+                m.name
+            })
             .collect(),
     };
     names.sort(); // read_dir 顺序不定；构建顺序确定 → 控制台/lock 写入顺序稳定
     for name in &names {
-        build_one(&src, &out, name).await?;
+        build_one(&src, &out, name, &view).await?;
     }
     println!("oj build: {} module(s) → {}", names.len(), out.display());
     Ok(())
@@ -50,7 +55,13 @@ fn rel_dir(rel: &Path) -> String {
 }
 
 /// 单模块构建：清场同名版本目录 → 落盘 → 内省产 routes.js → lock upsert → tgz。
-async fn build_one(src: &Path, out: &Path, module: &str) -> Result<(), String> {
+/// view = 跨模块导入目标的版本表（run 构建）。
+async fn build_one(
+    src: &Path,
+    out: &Path,
+    module: &str,
+    view: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
     let mdir = src.join(module);
     let m = crate::manifest::parse_one(&mdir.join("manifest.yaml"))?;
     if m.name != module {
@@ -91,7 +102,13 @@ async fn build_one(src: &Path, out: &Path, module: &str) -> Result<(), String> {
             let js = transpile::cached_transpile(&mdir.join(rel))
                 .map_err(|e| format!("transpile {}: {e}", rel.display()))?;
             let stripped; // 生命周期：strip 产物要活过 fix_relative_imports 调用
-            let js = fix_relative_imports(if *is_api { stripped = strip_route_decls(&js); &stripped } else { &js });
+            let js = fix_relative_imports(
+                if *is_api { stripped = strip_route_decls(&js); &stripped } else { &js },
+                module,
+                &m.version,
+                &rel_dir(rel),
+                view,
+            )?;
             let name = if *is_api {
                 let n = format!("api-{}.js", crate::pack::hash16(&js));
                 // routes.js 的 file：相对版本目录根（含目录段，正斜杠；根级 api.ts 为裸名）
@@ -233,28 +250,102 @@ fn strip_route_decls(src: &str) -> String {
     out
 }
 
-/// 静态 import/export-from 的相对裸 specifier 补 `.js`（dist 产物可直接运行的 ESM）。
+/// 静态 import/export-from 的相对裸 specifier 改写为 dist 产物路径（spec §2.4）：
+/// 归一解析后仍在 `src/<m>/` 内 → 模块内重算相对路径（版本目录布局下原 specifier
+/// 上溯会落到无版本段的 `dist/<m>/…` 悬空）；越界 → 跨模块，查版本视图得 v_t，
+/// 指向 `dist/<m_t>-<v_t>/`，视图缺 m_t fail-fast。
 /// ponytail: 逐行、仅 `from "…"` 字面量；动态 import / 别名出现时再补。
-fn fix_relative_imports(src: &str) -> String {
-    src.lines()
-        .map(|l| {
-            let Some(i) = l.find("from ") else { return l.to_string() };
-            let rest = &l[i + 5..];
-            let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-                return l.to_string()
-            };
-            let s = &rest[1..];
-            let Some(end) = s.find(quote) else { return l.to_string() };
-            let spec = &s[..end];
-            let bare = !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json");
-            if (spec.starts_with("./") || spec.starts_with("../")) && bare {
-                return format!("{}{}{}.js{}", &l[..i + 5], quote, spec, &s[end..]);
+fn fix_relative_imports(
+    src: &str,
+    module: &str,
+    version: &str,
+    rel_dir: &str,
+    view: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    for l in src.lines() {
+        let Some(i) = l.find("from ") else {
+            out.push(l.to_string());
+            continue;
+        };
+        let rest = &l[i + 5..];
+        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            out.push(l.to_string());
+            continue;
+        };
+        let s = &rest[1..];
+        let Some(end) = s.find(quote) else {
+            out.push(l.to_string());
+            continue;
+        };
+        let spec = &s[..end];
+        let bare = !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json");
+        if !(spec.starts_with("./") || spec.starts_with("../")) || !bare {
+            out.push(l.to_string());
+            continue;
+        }
+        let segs = resolve_spec(spec, module, rel_dir)?;
+        let target_dir = if segs[0] == module {
+            format!("{module}-{version}")
+        } else {
+            let m_t = &segs[0];
+            let v_t = view.get(m_t).ok_or_else(|| {
+                format!(
+                    "cross-module import {spec:?} → module {m_t:?} version unknown \
+                     (not in dist/manifests.yaml) — run `oj build {m_t}` first"
+                )
+            })?;
+            format!("{m_t}-{v_t}")
+        };
+        let to = std::iter::once(target_dir).chain(segs[1..].iter().cloned()).collect();
+        let new_spec = product_spec(module, version, rel_dir, to);
+        out.push(format!("{}{}{}{}", &l[..i + 5], quote, new_spec, &s[end..]));
+    }
+    Ok(out.join("\n") + "\n")
+}
+
+/// 归一解析相对 specifier（相对 `src/<module>/<rel_dir>/`）为 src 下段列表。
+/// `..` 越过 src 根 / 解析到 src 根本身都报错（无第一段 → 既非模块内也非跨模块）。
+fn resolve_spec(spec: &str, module: &str, rel_dir: &str) -> Result<Vec<String>, String> {
+    let mut segs = vec![module.to_string()];
+    segs.extend(rel_dir.split('/').filter(|s| !s.is_empty()).map(str::to_string));
+    for part in spec.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                if segs.pop().is_none() {
+                    return Err(format!(
+                        "relative import {spec:?} escapes src/ (from {module}/{rel_dir})"
+                    ));
+                }
             }
-            l.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+            p => segs.push(p.to_string()),
+        }
+    }
+    if segs.is_empty() {
+        return Err(format!("relative import {spec:?} resolves to src/ root"));
+    }
+    Ok(segs)
+}
+
+/// 产物相对 specifier：从 `dist/<module>-<version>/<rel_dir>/`（当前产物文件位置）到
+/// `to`（首段为目标版本目录）的相对路径；末段 `.ts` 改 `.js`、无后缀补 `.js`；
+/// 无上溯时必须带 `./` 前缀（ESM 裸 specifier 会被当包名解析）。
+fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>) -> String {
+    let from: Vec<String> = std::iter::once(format!("{module}-{version}"))
+        .chain(rel_dir.split('/').filter(|s| !s.is_empty()).map(str::to_string))
+        .collect();
+    let mut i = 0;
+    while i < from.len() && i < to.len() && from[i] == to[i] {
+        i += 1;
+    }
+    let last = to.len() - 1;
+    let stem = to[last].strip_suffix(".ts").unwrap_or(&to[last]);
+    to[last] = format!("{stem}.js");
+    let mut parts: Vec<String> = vec!["..".into(); from.len() - i];
+    parts.extend(to[i..].iter().cloned());
+    let joined = parts.join("/");
+    if i == from.len() { format!("./{joined}") } else { joined }
 }
 
 /// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块名段。
@@ -338,10 +429,15 @@ mod tests {
         assert!(out.contains("x.route"), "{out}"); // 读取不剥
     }
 
+    /// 测试辅助：默认上下文（模块 a 0.1.0、rel_dir item、空版本视图）。
+    fn fix(src: &str, rel_dir: &str, view: &std::collections::BTreeMap<String, String>) -> String {
+        fix_relative_imports(src, "a", "0.1.0", rel_dir, view).unwrap()
+    }
+
     #[test]
     fn fix_imports_appends_js_to_relative_only() {
         let src = "import { v } from \"../_shared/validate\";\nimport x from \"./a.js\";\nimport y from \"pkg\";\nimport m from \"./m.mjs\";\nimport j from \"./d.json\";\nexport { v } from \"./b\";\nconst s = \"from \\\"./nope\\\"\";\n";
-        let out = fix_relative_imports(src);
+        let out = fix(src, "item", &Default::default());
         assert!(out.contains("\"../_shared/validate.js\""), "{out}");
         assert!(out.contains("\"./a.js\""), "{out}");
         assert!(out.contains("from \"pkg\""), "{out}");
@@ -349,6 +445,42 @@ mod tests {
         assert!(out.contains("\"./d.json\""), "{out}");
         assert!(out.contains("\"./b.js\""), "{out}");
         assert!(out.contains("from \\\"./nope\\\""), "{out}"); // 引号未开 → 不动
+    }
+
+    /// 版本视图 {b: 0.2.0}。
+    fn view_b() -> std::collections::BTreeMap<String, String> {
+        [("b".to_string(), "0.2.0".to_string())].into_iter().collect()
+    }
+
+    #[test]
+    fn cross_module_import_rewrites_to_versioned_path() {
+        // ① 模块根出发：../b/util → dist/b-0.2.0/util.js
+        let out = fix("import { v } from \"../b/util\";\n", "", &view_b());
+        assert!(out.contains("\"../b-0.2.0/util.js\""), "{out}");
+        // ①' 子目录出发：../../b/util → 同样落到 dist/b-0.2.0/
+        let out = fix("import { v } from \"../../b/util\";\n", "sub", &view_b());
+        assert!(out.contains("\"../../b-0.2.0/util.js\""), "{out}");
+        // ③ 嵌套 rel_dir：src/a/x/y/f.ts 导入 ../../../b/util
+        let out = fix("import { v } from \"../../../b/util\";\n", "x/y", &view_b());
+        assert!(out.contains("\"../../../b-0.2.0/util.js\""), "{out}");
+        // 显式 .ts 后缀目标 → .js
+        let out = fix("export { v } from \"../b/util.ts\";\n", "", &view_b());
+        assert!(out.contains("\"../b-0.2.0/util.js\""), "{out}");
+        // 模块内绕出再绕回（../../a/y/g 从 x/ 出发）→ 产物路径不悬空
+        let out = fix("import { v } from \"../../a/y/g\";\n", "x", &Default::default());
+        assert!(out.contains("\"../y/g.js\""), "{out}");
+    }
+
+    #[test]
+    fn cross_module_import_without_version_fails_fast() {
+        // ② 视图缺 b → Err 报目标模块并提示先构建
+        let e = fix_relative_imports("import { v } from \"../b/util\";\n", "a", "0.1.0", "", &Default::default())
+            .unwrap_err();
+        assert!(e.contains("b") && e.contains("oj build"), "{e}");
+        // 逃出 src/ → Err
+        let e = fix_relative_imports("import { v } from \"../../b/util\";\n", "a", "0.1.0", "", &view_b())
+            .unwrap_err();
+        assert!(e.contains("src"), "{e}");
     }
 
     #[test]
