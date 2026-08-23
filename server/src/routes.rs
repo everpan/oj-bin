@@ -184,6 +184,18 @@ impl RouteTable {
                 failures.push(format!("routes.js: unknown method {} {}", e.method, e.pattern));
                 continue;
             }
+            let legal_file = |f: &str| {
+                !f.is_empty()
+                    && !f.split('/').any(|s| s.is_empty() || s == ".." || s == "." || s.contains('\\') || s.contains('\0'))
+            };
+            if !legal_file(&e.file) {
+                failures.push(format!("routes.js: illegal file path {}", e.file));
+                continue;
+            }
+            if !e.pattern.starts_with('/') || e.pattern.contains("//") {
+                failures.push(format!("routes.js: illegal pattern {}", e.pattern));
+                continue;
+            }
             t.register(&mut failures, &e.method, &e.pattern, &root.join(&e.file));
         }
         (t, failures)
@@ -659,5 +671,22 @@ mod tests {
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].pattern, "/a/{id}");
         assert!(entries_from_value(&serde_json::json!(null)).is_empty());
+    }
+
+    #[test]
+    fn from_entries_rejects_traversal_and_bad_pattern() {
+        let root = PathBuf::from("/r");
+        let es = |m: &str, p: &str, f: &str| RouteEntry { method: m.into(), pattern: p.into(), file: f.into() };
+        let (t, failures) = RouteTable::from_entries(&root, &[
+            es("get", "/a/{id}", "../etc/passwd"),   // 穿越
+            es("get", "/a/{id}", "a/../b.js"),        // 中段 ..
+            es("get", "/a/{id}", "a\\b.js"),          // 反斜杠
+            es("get", "/a//x", "a/api.js"),           // pattern 空段
+            es("get", "a/x", "a/api.js"),             // pattern 无首斜杠
+            es("get", "/a/{id}", "a/api.js"),         // 合法行仍注册
+        ]);
+        assert_eq!(failures.len(), 5, "{failures:?}");
+        assert!(failures.iter().all(|f| f.contains("illegal")), "{failures:?}");
+        assert!(matches!(t.lookup("/a/1", "GET"), Lookup::Hit { .. }));
     }
 }
