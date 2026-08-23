@@ -8,11 +8,13 @@ pub struct ServerArgs {
     pub dev: bool,
 }
 
-/// `oj build [module] [-d src] [-o dist]`（src → dist，生成 routes.js）。
+/// `oj build [module] [-d src] [-o dist] [--no-minify]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
     pub module: Option<String>,
     pub dir: String,
     pub out: String,
+    /// 转译产物 minify（单行、剥注释）。默认开；`--no-minify` 排障逃生门。
+    pub minify: bool,
 }
 
 /// 解析结果。None = 无子命令（main 打用法）；Err = 参数错误（main exit 1）。
@@ -28,12 +30,13 @@ pub fn parse(args: &[String]) -> Command {
     let mut it = args.iter();
     match it.next().map(|s| s.as_str()) {
         Some("build") => {
-            let (mut module, mut dir, mut out) = (None, String::new(), String::new());
+            let (mut module, mut dir, mut out, mut minify) = (None, String::new(), String::new(), true);
             let mut cur = it.clone().peekable();
             while let Some(a) = cur.next() {
                 match a.as_str() {
                     // 已删参数：吞值会让 `-b user` 静默变成全量构建，值得专属报错
                     "-b" => return Command::Err("oj build no longer takes -b".into()),
+                    "--no-minify" => minify = false,
                     "-d" | "-o" => {
                         if let Some(v) = cur.next() {
                             match a.as_str() {
@@ -56,6 +59,7 @@ pub fn parse(args: &[String]) -> Command {
                 module,
                 dir: if dir.is_empty() { "src".into() } else { dir },
                 out: if out.is_empty() { "dist".into() } else { out },
+                minify,
             })
         }
         Some("server") => {
@@ -118,7 +122,9 @@ mod tests {
     #[test]
     fn build_parses_module_positional() {
         let Command::Build(a) = parse(&args(&["build"])) else { panic!() };
-        assert_eq!((a.module.as_deref(), a.dir.as_str(), a.out.as_str()), (None, "src", "dist"));
+        assert_eq!((a.module.as_deref(), a.dir.as_str(), a.out.as_str(), a.minify), (None, "src", "dist", true));
+        let Command::Build(a) = parse(&args(&["build", "--no-minify"])) else { panic!() };
+        assert!(!a.minify); // 排障逃生门
         let Command::Build(a) = parse(&args(&["build", "user"])) else { panic!() };
         assert_eq!(a.module.as_deref(), Some("user"));
         let Command::Build(a) = parse(&args(&["build", "user", "-d", "s", "-o", "d"])) else { panic!() };

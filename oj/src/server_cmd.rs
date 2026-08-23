@@ -257,7 +257,7 @@ mod tests {
         assert!(e.contains("name"), "{e}");
     }
 
-    /// 夹具：手摆 release dist（file 名任意合法即可，不要求真哈希）。
+    /// 夹具：手摆 release dist（file 名任意合法即可）。
     fn rel_fixture(files: &[(&str, &str)]) -> PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         use std::sync::atomic::Ordering;

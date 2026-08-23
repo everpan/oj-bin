@@ -1,5 +1,6 @@
-//! oj build：src → dist（按模块）。转译 .ts、剥 `.route`、补相对 import 后缀；
-//! api.ts 按内容哈希改名，产出 `dist/<module>-<version>/`（routes.js + manifest.yaml）
+//! oj build：src → dist（按模块）。转译 .ts（默认 minify，`--no-minify` 关）、剥 `.route`、
+//! 补相对 import 后缀；产物保留原名与目录结构（api.ts → 同目录 api.js），
+//! 产出 `dist/<module>-<version>/`（routes.js + manifest.yaml）
 //! 与 `dist/manifests.yaml`、`<module>-<version>.tgz`（spec §2）。
 
 use std::collections::HashMap;
@@ -47,7 +48,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         }
     }
     for name in &names {
-        build_one(&src, &out, name, &view).await?;
+        build_one(&src, &out, name, &view, a.minify).await?;
     }
     println!("oj build: {} module(s) → {}", names.len(), out.display());
     Ok(())
@@ -64,12 +65,13 @@ fn rel_dir(rel: &Path) -> String {
 }
 
 /// 单模块构建：清场同名版本目录 → 落盘 → 内省产 routes.js → lock upsert → tgz。
-/// view = 跨模块导入目标的版本表（run 构建）。
+/// view = 跨模块导入目标的版本表（run 构建）；minify = 转译产物压缩开关。
 async fn build_one(
     src: &Path,
     out: &Path,
     module: &str,
     view: &std::collections::BTreeMap<String, String>,
+    minify: bool,
 ) -> Result<(), String> {
     let mdir = src.join(module);
     crate::manifest::validate_module(module)?; // 两路径共用的白名单（全量路径同样过）
@@ -79,7 +81,7 @@ async fn build_one(
     }
     crate::manifest::validate_version(&m.version)?;
     let vdir = out.join(format!("{module}-{}", m.version));
-    // 清场：同版本重建先删（旧哈希残留根治，spec §2.3）
+    // 清场：同版本重建先删（旧产物残留根治，spec §2.3）
     if vdir.exists() {
         std::fs::remove_dir_all(&vdir).map_err(|e| format!("clean {}: {e}", vdir.display()))?;
     }
@@ -98,9 +100,8 @@ async fn build_one(
         .collect::<Result<_, String>>()?;
     guard_no_api_imports(&sources)?;
 
-    // 2. 落盘：api.ts → api-<hash16>.js（转译+剥 .route+补后缀，哈希含变换后内容）；
-    //    其余 .ts 原路径换 .js 扩展；manifest.yaml 原样复制。
-    let mut hashed: HashMap<String, String> = HashMap::new(); // rel 目录 → 哈希文件名
+    // 2. 落盘：全部 .ts 原路径换 .js 扩展（api.ts 同名 api.js，仅多一步剥 .route）；
+    //    补相对 import 后缀后按需 minify；manifest.yaml 原样复制。
     for (rel, is_api) in &files {
         let dir = rel.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(""));
         let dst_dir = vdir.join(dir);
@@ -119,29 +120,26 @@ async fn build_one(
                 &rel_dir(rel),
                 view,
             )?;
-            let name = if *is_api {
-                let n = format!("api-{}.js", crate::pack::hash16(&js));
-                // routes.js 的 file：相对版本目录根（含目录段，正斜杠；根级 api.ts 为裸名）
-                let key = rel_dir(rel);
-                hashed.insert(key.clone(), if key.is_empty() { n.clone() } else { format!("{key}/{n}") });
-                n
+            let js = if minify {
+                transpile::minify_js(&mdir.join(rel), &js)
+                    .map_err(|e| format!("minify {}: {e}", rel.display()))?
             } else {
-                rel.with_extension("js").file_name().unwrap().to_string_lossy().into_owned()
+                js
             };
+            let name = rel.with_extension("js").file_name().unwrap().to_string_lossy().into_owned();
             let dst = dst_dir.join(&name);
             std::fs::write(&dst, js).map_err(|e| format!("write {}: {e}", dst.display()))?;
         }
     }
 
-    // 3. 内省（内存库）→ routes.js：pattern 无 base 含模块段（rel_pattern），file 为哈希名
+    // 3. 内省（内存库）→ routes.js：pattern 无 base 含模块段（rel_pattern），
+    //    file = 同名产物相对版本目录根（正斜杠；根级 api.ts 为裸 api.js）
     let decls = introspect_module_files(src, &mdir, &files).await?;
+    let n_api = decls.len();
     let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
     for (dir, rows) in decls {
+        let file = if dir.is_empty() { "api.js".to_string() } else { format!("{dir}/api.js") };
         for (method, route) in rows {
-            let file = hashed
-                .get(&dir)
-                .cloned()
-                .ok_or_else(|| format!("module {module:?}: no hashed api file for {dir:?}"))?;
             js.push_str(&format!(
                 "  {{ method: {}, pattern: {}, file: {} }},\n",
                 q(&method),
@@ -169,7 +167,7 @@ async fn build_one(
         "oj build: {module} v{} → {} ({} api file(s))",
         m.version,
         vdir.display(),
-        hashed.len()
+        n_api
     );
     Ok(())
 }
@@ -217,7 +215,7 @@ async fn introspect_module_files(
 }
 
 /// 递归收集模块内 .ts 与 manifest.yaml（相对模块根，确定性排序）。
-/// is_api = 文件名是 api.ts（哈希改名 + 进 routes.js）。
+/// is_api = 文件名是 api.ts（剥 .route + 进 routes.js）。
 fn collect_module(root: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
     let mut acc = Vec::new();
     walk(root, root, &mut acc)?;
@@ -398,7 +396,8 @@ fn relative_import_specifiers(src: &str) -> Vec<String> {
     out
 }
 
-/// 哈希改名的配套防线：api.ts 只许作路由入口（spec §2.5）。
+/// api.ts 只许作路由入口（spec §2.5）：它是 routes.js 的聚合单元而非可复用模块，
+/// 被导入会把路由副作用（.route 声明、默认导出的 handler 表）拖进普通模块。
 /// 目标 basename（剥扩展）== "api" 即拒绝——宁枉勿纵，报错给全部违规。
 fn guard_no_api_imports(files: &[(String, String)]) -> Result<(), String> {
     let mut bad = Vec::new();
@@ -554,6 +553,7 @@ mod tests {
             module: module.map(str::to_string),
             dir: t.join("src").display().to_string(),
             out: t.join("dist").display().to_string(),
+            minify: true,
         }
     }
 
@@ -566,22 +566,21 @@ mod tests {
         run(&build_args(&t, Some("user"))).await.unwrap();
 
         let vd = t.join("dist/user-0.1.0");
-        let item_name = only_file(&vd.join("item"));
-        assert!(item_name.starts_with("api-") && item_name.ends_with(".js"), "{item_name}");
-        assert_eq!(item_name.len(), "api-".len() + 16 + ".js".len()); // 16 hex
+        assert_eq!(only_file(&vd.join("item")), "api.js"); // 保留原目录结构原名
 
         let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
         assert!(routes.contains("\"user/item/{id}\""), "{routes}"); // pattern 无 base 含模块段
-        assert!(routes.contains(&format!("\"item/{item_name}\"")), "{routes}"); // file 含目录段
+        assert!(routes.contains("\"item/api.js\""), "{routes}");    // file 含目录段
         assert!(!routes.contains("/v1/api"), "{routes}");
 
-        let item_js = std::fs::read_to_string(vd.join("item").join(&item_name)).unwrap();
-        assert!(!item_js.contains(".route ="), "{item_js}");       // .route 已剥
-        assert!(item_js.contains("../_shared/validate.js"), "{item_js}"); // import 后缀已补
+        let item_js = std::fs::read_to_string(vd.join("item/api.js")).unwrap();
+        assert!(!item_js.contains(".route"), "{item_js}");          // .route 已剥
+        assert!(item_js.contains("\"../_shared/validate.js\""), "{item_js}"); // import 后缀已补
+        assert!(!item_js.contains('\n'), "{item_js}");              // 默认 minify：单行
 
         assert!(vd.join("manifest.yaml").is_file());               // 原样复制
         assert!(vd.join("_shared/validate.js").is_file());         // 非 api 原路径
-        assert!(vd.join("item/api.ts").metadata().is_err());       // 不留旧名
+        assert!(!item_js.contains("sourceMappingURL"), "{item_js}"); // minify 剥内联 sourcemap
 
         let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
         assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
@@ -591,22 +590,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_same_version_stable_hash_then_wipes() {
+    async fn build_is_deterministic_and_wipes_on_change() {
         let t = std::env::temp_dir().join(format!("oj-build-wipe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         std::fs::create_dir_all(&t).unwrap();
         src_fixture(&t);
         run(&build_args(&t, Some("user"))).await.unwrap();
-        let first = only_file(&t.join("dist/user-0.1.0/item"));
-        // 内容未变 → 重建哈希稳定（转译确定性 + hash16）
+        let snap = |p: &std::path::Path| std::fs::read(p).unwrap();
+        let (js1, tgz1) = (snap(&t.join("dist/user-0.1.0/item/api.js")), snap(&t.join("dist/user-0.1.0.tgz")));
+        // 内容未变 → 重建字节一致（转译 + minify 确定性，落点 tgz）
         run(&build_args(&t, Some("user"))).await.unwrap();
-        assert_eq!(only_file(&t.join("dist/user-0.1.0/item")), first);
-        // 内容变更 → 旧哈希清场，目录内恰好 1 个 api-*.js
+        assert_eq!(snap(&t.join("dist/user-0.1.0/item/api.js")), js1);
+        assert_eq!(snap(&t.join("dist/user-0.1.0.tgz")), tgz1, "同输入两次构建 tgz 必须字节一致");
+        // 内容变更 → 产物更新，目录内仍恰好 1 个 api.js（同版本清场）
         std::fs::write(t.join("src/user/item/api.ts"),
             "function get(){ json.ok({v:2}); }\nget.route = \"{id}\";\nexport default { get };\n").unwrap();
         run(&build_args(&t, Some("user"))).await.unwrap();
-        let second = only_file(&t.join("dist/user-0.1.0/item"));
-        assert_ne!(second, first);
+        let js2 = snap(&t.join("dist/user-0.1.0/item/api.js"));
+        assert_ne!(js2, js1);
+        assert_eq!(only_file(&t.join("dist/user-0.1.0/item")), "api.js");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn no_minify_keeps_readable_output() {
+        let t = std::env::temp_dir().join(format!("oj-build-nomin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        let mut a = build_args(&t, Some("user"));
+        a.minify = false;
+        run(&a).await.unwrap();
+        let js = std::fs::read_to_string(t.join("dist/user-0.1.0/item/api.js")).unwrap();
+        assert!(js.contains('\n'), "{js}");               // 未压缩：多行可读
+        assert!(js.contains("function get"), "{js}");
         let _ = std::fs::remove_dir_all(&t);
     }
 

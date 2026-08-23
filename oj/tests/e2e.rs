@@ -44,6 +44,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
             module: None,
             dir: root.join("src").display().to_string(),
             out: dist.display().to_string(),
+            minify: true,
         })
         .await
         .unwrap();
@@ -283,20 +284,21 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         module: Some("u".into()),
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
+        minify: true,
     };
     oj::build_cmd::run(&a).await.unwrap();
-    // routes.js：.route 行 + 镜像行（pattern 无 base 含模块段，file 为哈希名）
+    // routes.js：.route 行 + 镜像行（pattern 无 base 含模块段，file 为同名产物）
     let vd = t.join("dist/u-0.1.0");
     let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
     assert!(routes.contains("\"u/item/{id}\""), "{routes}");
     assert!(routes.contains("\"u/list\""), "{routes}");
-    assert!(routes.contains("api-"), "{routes}");
+    assert!(routes.contains("\"item/api.js\""), "{routes}");
+    assert!(routes.contains("\"list/api.js\""), "{routes}");
     assert!(!routes.contains("/v1/api"), "{routes}");
-    // 产物：.route 剥离；相对 import 补 .js；_shared/manifest 落盘
-    let hashed = std::fs::read_dir(vd.join("item")).unwrap().next().unwrap().unwrap().file_name();
-    let item = std::fs::read_to_string(vd.join("item").join(&hashed)).unwrap();
-    assert!(hashed.to_string_lossy().starts_with("api-"), "{hashed:?}");
+    // 产物：原名原目录；.route 剥离；相对 import 补 .js；默认 minify 单行；_shared/manifest 落盘
+    let item = std::fs::read_to_string(vd.join("item/api.js")).unwrap();
     assert!(!item.contains(".route"), "{item}");
+    assert!(!item.trim_end().contains('\n'), "{item}");
     assert!(item.contains("\"../_shared/v.js\""), "{item}");
     assert!(vd.join("_shared/v.js").is_file());
     assert!(vd.join("manifest.yaml").is_file());
@@ -336,6 +338,7 @@ async fn build_then_release_serves_end_to_end() {
         module: None,
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
+        minify: true,
     })
     .await
     .unwrap();

@@ -73,6 +73,46 @@ pub fn transpile_src(path: &Path, src: &str) -> Result<String, String> {
     Ok(out.into_source().text)
 }
 
+/// minify：解析 JS → codegen minify 重排（单行、剥注释——含转译尾部内联 sourcemap，
+/// 顺带消掉其中绝对路径与整份源码副本）。确定性：同输入同输出。
+/// ponytail: codegen 级 minify（去空白/注释，不混淆、不做 DCE），保留名字利于排障；
+/// 需要更强压缩时再引 swc_ecma_minifier。
+pub fn minify_js(path: &Path, src: &str) -> Result<String, String> {
+    let parsed = deno_ast::parse_module(deno_ast::ParseParams {
+        specifier: deno_ast::ModuleSpecifier::from_file_path(path)
+            .unwrap_or_else(|_| deno_ast::ModuleSpecifier::parse("file:///minify.js").unwrap()),
+        text: src.into(),
+        media_type: deno_ast::MediaType::JavaScript,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    // 位置仅在记 srcmap 时回查；同 deno 内部 emit 流程，单文件 SourceMap 即可。
+    let cm = deno_ast::SourceMap::single(parsed.specifier().clone(), src.to_string());
+    let mut buf = vec![];
+    {
+        use deno_ast::swc::codegen::Node;
+        let mut emitter = deno_ast::swc::codegen::Emitter {
+            cfg: deno_ast::swc::codegen::Config::default().with_minify(true),
+            comments: None,
+            cm: cm.inner().clone(),
+            wr: Box::new(deno_ast::swc::codegen::text_writer::JsWriter::new(
+                cm.inner().clone(),
+                "\n",
+                &mut buf,
+                None,
+            )),
+        };
+        match parsed.program_ref() {
+            deno_ast::ProgramRef::Module(m) => m.emit_with(&mut emitter),
+            deno_ast::ProgramRef::Script(s) => s.emit_with(&mut emitter),
+        }
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    String::from_utf8(buf).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// 计数器为进程全局，测试并行跑会互相污染 delta 断言——
 /// 所有会触发 .ts 转译的测试（本组 + bridge 模块测试的 run_module 路径）共用此锁串行。
 /// （不能复用 cache 锁：cached_transpile 内部已持有，重入会死锁。）
@@ -98,6 +138,18 @@ mod tests {
         let _g = TRANSPILE_TEST_LOCK.lock().unwrap();
         let e = transpile_src(Path::new("bad.ts"), "function {{{{").unwrap_err();
         assert!(e.contains("bad.ts"), "{e}");
+    }
+
+    #[test]
+    fn minify_is_single_line_and_strips_comments() {
+        let src = "// 注释\nimport { v } from \"./a.js\";\nfunction get() { json.ok({ v }); }\nget.route = \"{id}\";\nexport default { get };\n//# sourceMappingURL=data:application/json;base64,AAA\n";
+        let out = minify_js(Path::new("m.js"), src).unwrap();
+        assert!(!out.trim_end().contains('\n'), "{out}");   // 单行（允尾换行）
+        assert!(!out.contains("//"), "{out}");              // 注释全剥（含 sourcemap 行）
+        assert!(out.contains("from\"./a.js\""), "{out}");   // 语句/空白压缩
+        assert!(out.contains("json.ok({v})") || out.contains("json.ok({ v })"), "{out}");
+        // 同输入同输出（构建确定性依赖）
+        assert_eq!(minify_js(Path::new("m.js"), src).unwrap(), out);
     }
 
     #[test]

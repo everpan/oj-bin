@@ -1,15 +1,6 @@
-//! 制品辅助：内容哈希命名与确定性 tgz（spec §2.8——mtime=0、权限抹平、无 uid）。
+//! 制品辅助：确定性 tgz（spec §2.8——mtime=0、权限抹平、无 uid）。
 
 use std::path::Path;
-
-/// SHA-256 前 16 hex。ponytail: 16 hex 碰撞在本地可信构建威胁模型下忽略（spec §7）。
-pub fn hash16(data: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(data.as_bytes());
-    let digest = h.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string()
-}
 
 /// src_dir 全部文件 → out 的 tar.gz；entry 路径 = `prefix/<相对路径>`，正斜杠。
 /// 元数据抹平（mtime=0 / mode 0644 / uid=gid=0 / 空 uname）→ 同输入同字节。
@@ -58,20 +49,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hash16_stable_and_discriminating() {
-        assert_eq!(hash16("x").len(), 16);
-        assert_eq!(hash16("abc"), hash16("abc"));
-        assert_ne!(hash16("abc"), hash16("abd"));
-    }
-
-    #[test]
     fn tgz_deterministic_and_prefixed() {
         let d = std::env::temp_dir().join(format!("oj-pack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let src = d.join("src/user-0.1.0");
         std::fs::create_dir_all(src.join("f")).unwrap();
         std::fs::write(src.join("routes.js"), "export default [];\n").unwrap();
-        std::fs::write(src.join("f/api-abc.js"), "export default {};\n").unwrap();
+        std::fs::write(src.join("f/api.js"), "export default {};\n").unwrap();
         let a = d.join("a.tgz");
         let b = d.join("b.tgz");
         write_tgz(&src, &a, "user-0.1.0").unwrap();
