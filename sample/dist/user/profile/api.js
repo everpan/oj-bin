@@ -1,16 +1,24 @@
 function get() {
   const id = Number(http.param("id", 0));
-  db.query("select id, name, role from account where id = ?", [id])
-    .then((r) => json.ok(r[0] ?? null))
-    .catch((e) => json.fail(500, String(e)));
+  db.query("select id, name, role from account where id = ?", [
+    id
+  ]).then((r)=>json.ok(r[0] ?? null)).catch((e)=>json.fail(500, String(e)));
 }
-
 function post() {
   const b = http.body;
-  if (!b.id || !b.name) { json.fail(400, "id and name required"); return; }
-  db.exec("update account set name = ? where id = ?", [b.name, b.id])
-    .then(() => json.ok({ renamed: true }))
-    .catch((e) => json.fail(500, String(e)));
+  if (!b.id || !b.name) {
+    json.fail(400, "id and name required");
+    return;
+  }
+  db.exec("update account set name = ? where id = ?", [
+    b.name,
+    b.id
+  ]).then(()=>json.ok({
+      renamed: true
+    })).catch((e)=>json.fail(500, String(e)));
 }
-
-export default { get, post };
+export default {
+  get,
+  post
+};
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbImZpbGU6Ly8vVXNlcnMvZXZlci9naXQvZ29sYW5nL21kbS1iYXNlLXJ1c3Qvc2FtcGxlL3NyYy91c2VyL3Byb2ZpbGUvYXBpLnRzIl0sInNvdXJjZXNDb250ZW50IjpbImZ1bmN0aW9uIGdldCgpOiB2b2lkIHtcbiAgY29uc3QgaWQgPSBOdW1iZXIoaHR0cC5wYXJhbShcImlkXCIsIDApKTtcbiAgZGIucXVlcnkoXCJzZWxlY3QgaWQsIG5hbWUsIHJvbGUgZnJvbSBhY2NvdW50IHdoZXJlIGlkID0gP1wiLCBbaWRdKVxuICAgIC50aGVuKChyKSA9PiBqc29uLm9rKHJbMF0gPz8gbnVsbCkpXG4gICAgLmNhdGNoKChlKSA9PiBqc29uLmZhaWwoNTAwLCBTdHJpbmcoZSkpKTtcbn1cblxuZnVuY3Rpb24gcG9zdCgpOiB2b2lkIHtcbiAgY29uc3QgYiA9IGh0dHAuYm9keSBhcyB7IGlkPzogbnVtYmVyOyBuYW1lPzogc3RyaW5nIH07XG4gIGlmICghYi5pZCB8fCAhYi5uYW1lKSB7IGpzb24uZmFpbCg0MDAsIFwiaWQgYW5kIG5hbWUgcmVxdWlyZWRcIik7IHJldHVybjsgfVxuICBkYi5leGVjKFwidXBkYXRlIGFjY291bnQgc2V0IG5hbWUgPSA/IHdoZXJlIGlkID0gP1wiLCBbYi5uYW1lLCBiLmlkXSlcbiAgICAudGhlbigoKSA9PiBqc29uLm9rKHsgcmVuYW1lZDogdHJ1ZSB9KSlcbiAgICAuY2F0Y2goKGUpID0+IGpzb24uZmFpbCg1MDAsIFN0cmluZyhlKSkpO1xufVxuXG5leHBvcnQgZGVmYXVsdCB7IGdldCwgcG9zdCB9O1xuIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiJBQUFBLFNBQVM7RUFDUCxNQUFNLEtBQUssT0FBTyxLQUFLLEtBQUssQ0FBQyxNQUFNO0VBQ25DLEdBQUcsS0FBSyxDQUFDLG1EQUFtRDtJQUFDO0dBQUcsRUFDN0QsSUFBSSxDQUFDLENBQUMsSUFBTSxLQUFLLEVBQUUsQ0FBQyxDQUFDLENBQUMsRUFBRSxJQUFJLE9BQzVCLEtBQUssQ0FBQyxDQUFDLElBQU0sS0FBSyxJQUFJLENBQUMsS0FBSyxPQUFPO0FBQ3hDO0FBRUEsU0FBUztFQUNQLE1BQU0sSUFBSSxLQUFLLElBQUk7RUFDbkIsSUFBSSxDQUFDLEVBQUUsRUFBRSxJQUFJLENBQUMsRUFBRSxJQUFJLEVBQUU7SUFBRSxLQUFLLElBQUksQ0FBQyxLQUFLO0lBQXlCO0VBQVE7RUFDeEUsR0FBRyxJQUFJLENBQUMsNENBQTRDO0lBQUMsRUFBRSxJQUFJO0lBQUUsRUFBRSxFQUFFO0dBQUMsRUFDL0QsSUFBSSxDQUFDLElBQU0sS0FBSyxFQUFFLENBQUM7TUFBRSxTQUFTO0lBQUssSUFDbkMsS0FBSyxDQUFDLENBQUMsSUFBTSxLQUFLLElBQUksQ0FBQyxLQUFLLE9BQU87QUFDeEM7QUFFQSxlQUFlO0VBQUU7RUFBSztBQUFLLEVBQUUifQ==

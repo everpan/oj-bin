@@ -8,19 +8,47 @@ pub struct ServerArgs {
     pub dev: bool,
 }
 
+/// `oj build [-b /v1/api] [-d src] [-o dist]`（src → dist，生成 routes.js）。
+pub struct BuildArgs {
+    pub base: String,
+    pub dir: String,
+    pub out: String,
+}
+
 /// 解析结果。None = 无子命令（main 打用法）。
 pub enum Command {
     Server(ServerArgs),
-    Build(Vec<String>),
+    Build(BuildArgs),
     None,
 }
 
-/// `oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]`。
-/// -d 缺省：--dev → src，否则 dist。
+/// `oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]` / `oj build [-b base] [-d src] [-o dist]`。
 pub fn parse(args: &[String]) -> Command {
     let mut it = args.iter();
     match it.next().map(|s| s.as_str()) {
-        Some("build") => Command::Build(args[1..].to_vec()),
+        Some("build") => {
+            let (mut base, mut dir, mut out) = (String::new(), String::new(), String::new());
+            let mut cur = it.clone().peekable();
+            while let Some(a) = cur.next() {
+                match a.as_str() {
+                    "-b" | "-d" | "-o" => {
+                        if let Some(v) = cur.next() {
+                            match a.as_str() {
+                                "-b" => base = v.clone(),
+                                "-d" => dir = v.clone(),
+                                _ => out = v.clone(),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Command::Build(BuildArgs {
+                base: if base.is_empty() { "/v1/api".into() } else { base },
+                dir: if dir.is_empty() { "src".into() } else { dir },
+                out: if out.is_empty() { "dist".into() } else { out },
+            })
+        }
         Some("server") => {
             let (mut config, mut base, mut dir, mut dev) =
                 (String::new(), String::new(), String::new(), false);

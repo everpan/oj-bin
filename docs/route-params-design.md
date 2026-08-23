@@ -129,7 +129,7 @@ export default [
 
 ### 4.2 `oj build` 生成 `routes.js`（并剥离 `.route`）
 
-见第十二节。
+见第十一节。
 
 ## 五、冲突处理（已确认决策）
 
@@ -242,7 +242,9 @@ if (p === "param") {
 | `server/src/lib.rs` | 126-138 | `parse_query` 改 form-urlencoded 解码，移除原"未 decode" ponytail 注（行为变更见 §7） |
 | `src/bridge/mod.rs` | 340-400 | 内省 driver 变体（读 `.route` 回传）；`run_module` 管道复用 |
 | `src/bridge/bootstrap.js` | 43-48 | `http.param` 合并 path→query |
-| `cli/src/server_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物 |
+| `cli/src/server_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |
+| `cli/src/build_cmd.rs` | 新文件 | `oj build`（§十一）：src → dist 转译、剥 `.route`、补相对 import 后缀、生成 `routes.js` |
+| `cli/src/args.rs` | — | `Command::Build(BuildArgs)`（`-b/-d/-o`），替换占位 `Vec<String>` |
 | `docs/user-manual.md` | §9 表 / §10 表 / §11 | `http.param` 优先级 + 新增 `http.params` 行；§10 加 500 冲突行、404/405 文案更新、query 解码变更说明；§11 补 `.route` 示例与 `global.d.ts` |
 | `sample/` | — | 新增 `.route` 示例（含 `global.d.ts`，见第九节） |
 
@@ -354,3 +356,23 @@ get.route = "{id}";
 2. **顶层副作用执行次数**：内省运行时 1 次 + 每个 actor 运行时首次触达该模块各 1 次（池大小 N → 最多 N+1 次；模块缓存 per-runtime，`?v=` 不变则不重跑）。顶层 db 写必须幂等（推荐迁移到 `seed.sql`）。内省期 dbs 已就绪（`server_cmd.rs` 先开库执行 seed），顶层只读查询安全。
 3. **热重载边界**：handler 内容修改靠 `?v=mtime` 免重启（不变）；新增/删除 api 文件、修改 `.route` 需重启——dev 由 §6.2 兜底缓解（带参数路由除外），release 一律重启。
 4. 可选参数（`{id?}`）、正则约束暂不纳入，列入后续迭代。
+
+## 十一、`oj build`（src → dist 产物与 `routes.js` 生成）
+
+```
+oj build [-b /v1/api] [-d src] [-o dist]
+```
+
+流程（`cli/src/build_cmd.rs`）：
+
+1. **落盘**：递归收集 `.ts` 与 `manifest.yaml`（确定性排序）。`.ts` → `cached_transpile` 转译 → **剥离 `.route` 赋值行** → **相对裸 import 补 `.js`** → 写 `dist/**/ *.js`；`manifest.yaml` 原样复制。
+2. **建表**：与 dev server 完全同构——`RouteTable::build(base, src, ts=true, bridge_introspector(...))` 内省 src 的 `api.ts`，得到全量路由行（`.route` 行 + 目录镜像行；release 无 fs 兜底，表是唯一路由来源，镜像行必须进 routes.js）。
+   - `project_root` 取 **src 父目录**（= 项目根，同 dev 的 config_dir）：bare import（如 `escape-goat`）要沿 node_modules 向上解析到项目根，src 下没有 node_modules。
+   - db 用 `sqlite::memory:` 空库：构建零磁盘副作用，模块顶层建表/查询语句照常执行后即弃；不执行 seed。
+3. **生成 `dist/routes.js`**：`table.listing()` 全量行（`file` 字段转 dist 相对路径 + `.js` 后缀），字符串经 serde_json 转义。头部注释 `由 oj build 生成；勿手改`。
+
+剥离与补后缀均为行级处理（`strip_route_decls` / `fix_relative_imports`）：
+- 剥离只删"语句起始的 `xxx.route = …`"整行；表达式中间的 `.route` 读取不受影响。动态/别名 import 不处理（出现再加）。
+- 补后缀仅限静态 `from "…"` 字面量且以 `./`、`../` 开头；bare specifier（node_modules）原样保留（release 运行时 project_root 在项目根，可解析）。
+
+`.route` 剥离后 dist 产物即纯 handler；路由事实的唯一来源是 `routes.js`——release 启动不再读任何 `.route`。dev 与 release 的行为对齐靠"同一套注册语义"（`register()` 共享）保证。

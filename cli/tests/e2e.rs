@@ -245,6 +245,54 @@ async fn uc7_manifest_mismatch_blocks_startup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_emits_routes_js_strips_route_then_release_serves() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        ("src/u/_shared/v.ts", "export const ok = (x) => x > 0;\n"),
+        (
+            "src/u/item/api.ts",
+            "import { ok } from \"../_shared/v\";\n\
+             function detail() { json.ok({ id: Number(http.param(\"id\", 0)), ok: ok(1) }); }\n\
+             detail.route = \"{id}\";\n\
+             export default { get: detail };\n",
+        ),
+        ("src/u/list/api.ts", "export default { get() { json.ok({ all: true }); } };\n"),
+    ]);
+    let a = oj::args::BuildArgs {
+        base: "/v1/api".into(),
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+    };
+    oj::build_cmd::run(&a).await.unwrap();
+    // routes.js：.route 行 + 镜像行全量导出
+    let routes = std::fs::read_to_string(t.join("dist/routes.js")).unwrap();
+    assert!(routes.contains("\"/v1/api/u/item/{id}\""), "{routes}");
+    assert!(routes.contains("\"u/item/api.js\""), "{routes}");
+    assert!(routes.contains("\"/v1/api/u/list\""), "{routes}");
+    // 产物：.route 剥离；相对 import 补 .js；_shared/manifest 落盘
+    let item = std::fs::read_to_string(t.join("dist/u/item/api.js")).unwrap();
+    assert!(!item.contains(".route"), "{item}");
+    assert!(item.contains("\"../_shared/v.js\""), "{item}");
+    assert!(t.join("dist/u/_shared/v.js").is_file());
+    assert!(t.join("dist/u/manifest.yaml").is_file());
+    // release 全链路（dist 直载 routes.js，无内省无兜底）
+    let (addr, _h) =
+        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/item/7", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["id"], 7, "{v}");
+    assert_eq!(v["data"]["ok"], true, "{v}");
+    let (s, v) = req(addr, "GET", "/v1/api/u/list", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["all"], true, "{v}");
+    // 镜像被替换 + release 无兜底 → 404
+    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
+    assert_eq!(s, 404);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_mode_loads_routes_js_without_introspection() {
     let _g = lock();
     let t = tmp_project(&[
