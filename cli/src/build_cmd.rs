@@ -143,7 +143,8 @@ fn fix_relative_imports(src: &str) -> String {
             let s = &rest[1..];
             let Some(end) = s.find(quote) else { return l.to_string() };
             let spec = &s[..end];
-            if (spec.starts_with("./") || spec.starts_with("../")) && !spec.ends_with(".js") {
+            let bare = !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json");
+            if (spec.starts_with("./") || spec.starts_with("../")) && bare {
                 return format!("{}{}{}.js{}", &l[..i + 5], quote, spec, &s[end..]);
             }
             l.to_string()
@@ -168,11 +169,13 @@ mod tests {
 
     #[test]
     fn fix_imports_appends_js_to_relative_only() {
-        let src = "import { v } from \"../_shared/validate\";\nimport x from \"./a.js\";\nimport y from \"pkg\";\nexport { v } from \"./b\";\nconst s = \"from \\\"./nope\\\"\";\n";
+        let src = "import { v } from \"../_shared/validate\";\nimport x from \"./a.js\";\nimport y from \"pkg\";\nimport m from \"./m.mjs\";\nimport j from \"./d.json\";\nexport { v } from \"./b\";\nconst s = \"from \\\"./nope\\\"\";\n";
         let out = fix_relative_imports(src);
         assert!(out.contains("\"../_shared/validate.js\""), "{out}");
         assert!(out.contains("\"./a.js\""), "{out}");
         assert!(out.contains("from \"pkg\""), "{out}");
+        assert!(out.contains("\"./m.mjs\""), "{out}"); // 已带后缀不动（.mjs/.json 不误加 .js）
+        assert!(out.contains("\"./d.json\""), "{out}");
         assert!(out.contains("\"./b.js\""), "{out}");
         assert!(out.contains("from \\\"./nope\\\""), "{out}"); // 引号未开 → 不动
     }

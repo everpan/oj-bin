@@ -168,11 +168,17 @@ export default { get: detail };
 |---|---|---|
 | `{id}` | 单段（不含 `/`） | `/user/item/42` → `http.param("id") === "42"` |
 | `{*path}` | 尾部一段及以上（含 `/`） | `/file/a/b/c` → `http.param("path") === "a/b/c"` |
-| `{id}` 前缀/后缀字面 | 段内混合 | `v{major}.{minor}`、`{id}.json` |
+
+v0.1 的 matchit 被 axum 钉在 `=0.8.4`：**参数段内不得混字面**（`{id}.json`、
+`v{major}.{minor}` 均属非法 pattern，启动时按设计 §5 丢弃并记日志
+`InvalidParamSegment`）。需要"前缀/后缀字面"的 URL 拆成静态多段
+（`/file/{name}` 由 handler 自行校验扩展名）。matchit 0.8.6 已放宽该限制，
+axum 放开 pin 后可启用。
 
 - 挂 `.route` 后**目录镜像被替换**：`/v1/api/user/item`（镜像路径）→ 404。
 - `"{id}"` 相对当前目录；`"/user/{id}"` 以 `/` 开头挂到 base 根下；`fn.route = ""` 视同未挂。
-- TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错。
+- TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错（无 tsconfig 时
+  TS 语言服务通常也能拾取；严格工程可在 tsconfig `include` 里显式列入）。
 - dev（`--dev`）启动内省建表；release 用 `oj build` 生成的 `dist/routes.js` 直载（见 §2），
   `dist` 产物中的 `.route` 已被剥离——路由事实唯一来源是 `routes.js`。
 

@@ -57,6 +57,10 @@ export default { get: list, post: detail };
 | `{*name}` | catch-all，**一或多段**，且只能在模式末尾 | `/file/{*path}` |
 | `{{` / `}}` | 字面 `{` / `}` 转义 | `/foo/{{id}}` 匹配字面 `{id}` |
 
+> 约束（实测 matchit `=0.8.4`，axum 0.8.9 硬钉该版本）：**参数段内不得混字面**——
+> `{id}.json`、`foo-{bar}`、`v{a}.{b}` 一律 `InvalidParamSegment`（按 §5 丢弃+日志）；
+> 参数必须独占一段。0.8.6 已放宽，axum 放开 pin 后可启用。
+
 > 评审定论：matchit 0.8.4（axum 0.8 同款）的原生语法就是 `{param}`/`{*param}`；`:id`/`*path` 是 0.7 旧语法。**用户侧直接采用原生语法**，不做 `:id`→`{id}` 翻译层——两套语法并存 + 翻译规则是净增概念与 bug 面（partial segment `/foo-{bar}`、`{{` 转义都会被朴素替换弄坏）。
 >
 > catch-all 语义（matchit tree.rs 源码级核实）：到达 catch-all 节点前必须先吃掉分隔符 `/`，故 `{*path}` **匹配一或多段**——`/v1/api/file` 与归一后的 `/v1/api/file/` 均 404（见第六节 normalize）。另：未归一时 `{*p}` 会把尾斜杠吞进参数值（`bar/`），尾斜杠归一后此问题不存在。

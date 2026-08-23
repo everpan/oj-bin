@@ -558,6 +558,23 @@ mod tests {
     }
 
     #[test]
+    fn table_mixed_segment_patterns_rejected() {
+        // axum 钉 matchit =0.8.4：参数段内混字面一律非法（{id}.json / v{major}.{minor}）
+        // → 丢弃 + failures；0.8.6 放宽后此测试需反转（手册 §7.1）。
+        let (t, f) = tbl(
+            &["a/api.ts", "b/api.ts"],
+            &[
+                ("a/api.ts", "get", "{id}.json"),
+                ("b/api.ts", "get", "v{major}.{minor}"),
+            ],
+        );
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f[0].contains("invalid route"), "{f:?}");
+        assert!(matches!(t.lookup("/v1/api/a/42.json", "GET"), Lookup::NotFound));
+        assert!(matches!(t.lookup("/v1/api/b/v1.2", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
     fn table_catch_all_needs_one_segment() {
         let (t, _) = tbl(&["file/api.ts"], &[("file/api.ts", "get", "{*path}")]);
         match t.lookup("/v1/api/file/a/b/c", "GET") {
