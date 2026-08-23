@@ -3,5 +3,39 @@ server:
   port: 9778
 db:
   default: "sqlite://db.sqlite"
+  test: "sqlite://db_test.sqlite"
+
 redis:
   default: "redis://127.0.0.1:6379/1"   # v0.1: warn + 内存 KV 模拟
+
+tenant:
+  enable: true
+  header_key: "X-TENANT-ID"
+
+auth:
+  # Required
+  jwt_secret: "change-me"
+  auth_url: "https://..."  #external origin (falls back to request headers)
+  db: "default",   #
+
+  # Tokens
+  signing_method: "HS256" # HS256 | HS384 | HS512
+  access_token_duration: "60s"  # s / m / h / d / w / mo / y
+  refresh_token_duration: "1y"
+
+  # Web
+  sign_in_redirect_url: "/sign-in"
+  cookie_session_name: "cnf.id"
+  cookies: #CookieOptions::default(),
+
+  # Storage
+  redis: "default",  # optional in redis section
+  redis_prefix: "AUTH-SESSION"
+  redis_ttl: 1800,
+  user_table_name: "users"  # needs at least: id, roles
+  session_table_name: "sessions".into(),   // see examples/schema.sql
+
+  # Providers & callbacks
+  providers:
+  resolve_user: # required for OAuth sign-in
+  on_provider_connect: #
