@@ -245,6 +245,40 @@ async fn uc7_manifest_mismatch_blocks_startup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_mode_loads_routes_js_without_introspection() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("dist/u/manifest.yaml", MANIFEST),
+        ("dist/u/f/api.js", "export default { get() { json.ok({ v: 1 }); } };\n"),
+        (
+            "dist/routes.js",
+            "export default [\n  { method: \"get\", pattern: \"/v1/api/u/f/{id}\", file: \"u/f/api.js\" },\n];\n",
+        ),
+    ]);
+    let (addr, _h) =
+        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/f/7", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["v"], 1, "{v}");
+    // release 无 fs 兜底：routes.js 之外的镜像路径 404
+    let (s, _) = req(addr, "GET", "/v1/api/u/f/", None).await;
+    assert_eq!(s, 404);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_mode_without_routes_js_fails_fast() {
+    let _g = lock();
+    let t = tmp_project(&[("dist/u/manifest.yaml", MANIFEST)]);
+    let e = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+        .await
+        .err()
+        .unwrap_or_default();
+    assert!(e.contains("oj build"), "{e}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc10_404_and_405_and_traversal() {
     let _g = lock();
     let t = tmp_project(&[

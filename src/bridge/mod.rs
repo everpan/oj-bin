@@ -425,10 +425,6 @@ impl Bridge {
     ) -> Result<serde_json::Value, RunError> {
         let spec = module_loader::versioned_specifier(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
-        static INTRO_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = INTRO_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/introspect/{n}.js"))
-            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
         let code = format!(
             "const m = await import(\"{spec}\");\n\
              const out = {{}};\n\
@@ -438,7 +434,35 @@ impl Bridge {
              }}\n\
              json.ok(out);\n"
         );
-        let timeout = INTROSPECT_TIMEOUT;
+        self.run_side_driver("introspect", code, INTROSPECT_TIMEOUT).await
+    }
+
+    /// 读模块 default 导出（release 直载 routes.js：一次 import，不逐模块内省）。
+    pub async fn read_module_default(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<serde_json::Value, RunError> {
+        let spec = module_loader::versioned_specifier(path)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        let code = format!(
+            "const m = await import(\"{spec}\");\n\
+             json.ok(m.default === undefined ? null : m.default);\n"
+        );
+        self.run_side_driver("routes", code, INTROSPECT_TIMEOUT).await
+    }
+
+    /// 一次性 side-module driver：执行 code，返回 json.ok 信封的 data。
+    /// introspect_module / read_module_default 共用（KillSwitch + 事件循环 + 信封解析）。
+    async fn run_side_driver(
+        &self,
+        tag: &str,
+        code: String,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, RunError> {
+        static DRV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = DRV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/{tag}/{n}.js"))
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
         let mut rt = self.pool.checkout();
         let ptr: usize = {
             let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
@@ -917,6 +941,28 @@ mod tests {
             mod_fx(&[("loop/api.ts", "while (true) {}\nexport default { get() {} };\n")]);
         let b = module_bridge(&root);
         assert!(matches!(b.introspect_module(&api).await, Err(RunError::Timeout)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_module_default_reads_export() {
+        // release 直载：routes.js 的 default 导出原样读出（不逐模块内省）
+        let _t = transpile_serial();
+        let (root, p) = mod_fx(&[(
+            "routes.js",
+            "export default [{ method: \"get\", pattern: \"/a/{id}\", file: \"a/api.js\" }];\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.read_module_default(&p).await.unwrap();
+        assert_eq!(v[0]["pattern"], "/a/{id}", "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_module_default_without_export_yields_null() {
+        let _t = transpile_serial();
+        let (root, p) = mod_fx(&[("plain.js", "export const x = 1;\n")]);
+        let b = module_bridge(&root);
+        let v = b.read_module_default(&p).await.unwrap();
+        assert!(v.is_null(), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

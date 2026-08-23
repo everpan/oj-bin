@@ -110,6 +110,27 @@ build_route_table(root, base, loader_shared):
 - **同一函数挂多个方法**（`export default { get: f, post: f }`）：`.route` 在函数上，两个方法共享同一模式——若非本意，拆成两个函数。
 - `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`cli/src/server_cmd.rs:66-68` 的打印改用其产物。
 
+### 4.1 release 直载（`routes.js`，免内省）
+
+dev（ts）走 §4 的启动内省；**release（js）不内省**，改为一次性 import 模块根目录下的 `routes.js`：
+
+```js
+// dist/routes.js — oj build 生成（§4.2），手工产物启动直接拒绝
+export default [
+  { method: "get", pattern: "/v1/api/user/account/{id}", file: "user/account/api.js" },
+  // ... 全量路由行：含 .route 声明行 + 目录镜像行（release 无 fs 兜底，表是唯一路由来源）
+];
+```
+
+- 读取走 `Bridge::read_module_default`（与内省同构的 side-module driver，复用 2s 超时与信封解析），`RouteTable::from_entries` 注册——注册语义与 dev 完全一致（合并 / 冲突 / 非法 pattern 丢弃）。
+- **fail-fast**：`dist/routes.js` 不存在 → 启动失败，提示 `run 'oj build' first`；存在但 default 导出不是数组 → 同样启动失败。
+- dev 与 release 差异总结：dev = 内省 + fs 兜底（新文件免重启）；release = routes.js 直载，表外一律 404。
+- `file` 字段相对模块根（dist）；`replaced` 集合在 release 恒空（无兜底可拦截）。
+
+### 4.2 `oj build` 生成 `routes.js`（并剥离 `.route`）
+
+见第十二节。
+
 ## 五、冲突处理（已确认决策）
 
 **单 matcher + 方法映射值**（比"逐方法一个 matcher + 独立哨兵集合"更省概念）：

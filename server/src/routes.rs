@@ -164,42 +164,71 @@ impl RouteTable {
                 if route.is_some() {
                     t.replaced.insert((file.clone(), method.clone()));
                 }
-                match t.matcher.at_mut(&pattern) {
-                    Ok(m) => {
-                        // pattern 已在树中：合并方法；同 (pattern, method) 二次声明 → 冲突
-                        match m.value.get(&method) {
-                            Some(Entry::File(a)) => {
-                                let msg = format!(
-                                    "route conflict: {method} {pattern} declared in {} and {}",
-                                    a.display(),
-                                    file.display()
-                                );
-                                *m.value.get_mut(&method).unwrap() = Entry::Conflict(msg.clone());
-                                failures.push(msg);
-                            }
-                            _ => {
-                                m.value.insert(method.clone(), Entry::File(file.clone()));
-                                t.rows.push(RouteRow { method, pattern, file: file.clone() });
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        let mut map = HashMap::new();
-                        map.insert(method.clone(), Entry::File(file.clone()));
-                        match t.matcher.insert(pattern.clone(), map) {
-                            Ok(()) => t.rows
-                                .push(RouteRow { method, pattern, file: file.clone() }),
-                            // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
-                            Err(e) => failures.push(format!(
-                                "invalid route {method} {pattern} from {}: {e}",
-                                file.display()
-                            )),
-                        }
-                    }
-                }
+                t.register(&mut failures, &method, &pattern, &file);
             }
         }
         (t, failures)
+    }
+
+    /// release 直载：routes.js 导出的全量行（pattern 已含 base，file 相对 root）。
+    /// 注册语义与 build 一致（合并 / 冲突 / 非法 pattern 丢弃），replaced 恒空（无 fs 兜底）。
+    pub fn from_entries(root: &Path, entries: &[RouteEntry]) -> (Self, Vec<String>) {
+        let mut t = RouteTable {
+            matcher: matchit::Router::new(),
+            replaced: std::collections::HashSet::new(),
+            rows: Vec::new(),
+        };
+        let mut failures = Vec::new();
+        for e in entries {
+            if !METHODS.contains(&e.method.as_str()) {
+                failures.push(format!("routes.js: unknown method {} {}", e.method, e.pattern));
+                continue;
+            }
+            t.register(&mut failures, &e.method, &e.pattern, &root.join(&e.file));
+        }
+        (t, failures)
+    }
+
+    /// 注册一行：新 pattern 建方法映射；已有 pattern 合并方法；
+    /// 同 (pattern, method) 二次声明 → Conflict（请求期 500）；matchit 拒绝 → 记 failures。
+    fn register(&mut self, failures: &mut Vec<String>, method: &str, pattern: &str, file: &Path) {
+        match self.matcher.at_mut(pattern) {
+            Ok(m) => match m.value.get(method) {
+                Some(Entry::File(a)) => {
+                    let msg = format!(
+                        "route conflict: {method} {pattern} declared in {} and {}",
+                        a.display(),
+                        file.display()
+                    );
+                    *m.value.get_mut(method).unwrap() = Entry::Conflict(msg.clone());
+                    failures.push(msg);
+                }
+                _ => {
+                    m.value.insert(method.to_string(), Entry::File(file.to_path_buf()));
+                    self.rows.push(RouteRow {
+                        method: method.to_string(),
+                        pattern: pattern.to_string(),
+                        file: file.to_path_buf(),
+                    });
+                }
+            },
+            Err(_) => {
+                let mut map = HashMap::new();
+                map.insert(method.to_string(), Entry::File(file.to_path_buf()));
+                match self.matcher.insert(pattern.to_string(), map) {
+                    Ok(()) => self.rows.push(RouteRow {
+                        method: method.to_string(),
+                        pattern: pattern.to_string(),
+                        file: file.to_path_buf(),
+                    }),
+                    // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
+                    Err(e) => failures.push(format!(
+                        "invalid route {method} {pattern} from {}: {e}",
+                        file.display()
+                    )),
+                }
+            }
+        }
     }
 
     /// 查表：path 须先经 `normalize`。未映射动词按"路径存在 → 405"契约处理。
@@ -255,6 +284,30 @@ fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
     }
 }
 
+/// routes.js 导出行（oj build 生成；release 直载免内省）。
+pub struct RouteEntry {
+    pub method: String,
+    pub pattern: String,
+    pub file: String,
+}
+
+/// routes.js 的 default 导出 → 行集（缺字段/类型错的行跳过）。
+pub fn entries_from_value(v: &serde_json::Value) -> Vec<RouteEntry> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    Some(RouteEntry {
+                        method: e.get("method")?.as_str()?.to_string(),
+                        pattern: e.get("pattern")?.as_str()?.to_string(),
+                        file: e.get("file")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 内省结果 Value（introspect_module 约定：仅函数导出的方法，null=未挂）→ decls。
 pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> {
     v.as_object()
@@ -297,6 +350,29 @@ pub fn bridge_introspector(
         })
         .join()
         .unwrap_or_else(|_| Err("introspect thread panicked".into()))
+    }
+}
+
+/// 读模块 default 导出（release 直载 dist/routes.js）：独立线程 + current_thread rt，
+/// 与 bridge_introspector 同构（Bridge !Send，不可在异步上下文嵌套建 runtime）。
+pub fn bridge_default_reader(
+    make: impl Fn() -> mdm_base_rust::bridge::Bridge + Send + Sync + 'static,
+) -> impl Fn(&Path) -> Result<serde_json::Value, String> {
+    let make = std::sync::Arc::new(make);
+    move |f: &Path| {
+        let f = f.to_path_buf();
+        let make = make.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("reader rt");
+            let b = make();
+            rt.block_on(async { b.read_module_default(&f).await })
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .unwrap_or_else(|_| Err("routes.js reader thread panicked".into()))
     }
 }
 
@@ -521,5 +597,50 @@ mod tests {
         let (t2, _) = tbl(&["v/api.ts"], &[("v/api.ts", "get", "  ")]);
         // 非空但仅空白：作为字面 pattern 注册（不特判，文档写明空串视同未挂）
         assert!(matches!(t2.lookup("/v1/api/v/  ", "GET"), Lookup::Hit { .. }));
+    }
+
+    // ----- release 直载（routes.js）-----
+
+    #[test]
+    fn from_entries_registers_and_conflicts() {
+        let root = PathBuf::from("/r");
+        let es = |m: &str, p: &str, f: &str| RouteEntry {
+            method: m.into(),
+            pattern: p.into(),
+            file: f.into(),
+        };
+        let (t, failures) = RouteTable::from_entries(
+            &root,
+            &[
+                es("get", "/a/{id}", "a/api.js"),
+                es("post", "/a/{id}", "a/api.js"), // 跨方法合并
+                es("get", "/a/{id}", "b/api.js"),  // 同 (pattern, method) → 冲突（请求期 500）
+                es("get", "/bad/{*x}tail", "c/api.js"), // matchit 拒绝 → failure
+                es("brew", "/a", "d/api.js"),           // 未知方法 → failure
+            ],
+        );
+        assert_eq!(failures.len(), 3, "{failures:?}");
+        assert!(matches!(t.lookup("/a/1", "GET"), Lookup::Conflict(_)));
+        assert!(matches!(t.lookup("/a/1", "POST"), Lookup::Hit { .. }));
+        assert!(matches!(t.lookup("/a/1", "PUT"), Lookup::MethodNotAllowed));
+        // 无冲突表：Hit 的 file 相对 root 解析
+        let (t2, _) = RouteTable::from_entries(&root, &[es("get", "/a/{id}", "a/api.js")]);
+        let Lookup::Hit { file, .. } = t2.lookup("/a/1", "GET") else { panic!() };
+        assert_eq!(file, PathBuf::from("/r/a/api.js"));
+        // release 无 fs 兜底：表外路径 404
+        assert!(matches!(t.lookup("/nope", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn entries_from_value_parses_and_skips() {
+        let v = serde_json::json!([
+            { "method": "get", "pattern": "/a/{id}", "file": "a/api.js" },
+            { "method": 1 },  // 缺字段/类型错 → 跳过
+            "junk",
+        ]);
+        let es = entries_from_value(&v);
+        assert_eq!(es.len(), 1);
+        assert_eq!(es[0].pattern, "/a/{id}");
+        assert!(entries_from_value(&serde_json::json!(null)).is_empty());
     }
 }

@@ -70,10 +70,10 @@ pub async fn start(
         ts,
     });
     let kv = Arc::new(InMemoryKV::new());
-    // 路由表：启动内省 .route 声明（设计 §2；dev/release 同路径，release 直载在后续任务）。
-    let (table, failures) = {
+    // 路由表：dev 启动内省 .route 声明（设计 §2）；release 直载 dist/routes.js（免内省）。
+    let make_bridge = {
         let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
-        let make = move || {
+        move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
                 kv.clone(),
@@ -81,8 +81,24 @@ pub async fn start(
                 false,
                 Some(loader.clone()),
             )
-        };
-        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make))
+        }
+    };
+    let (table, failures) = if ts {
+        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge))
+    } else {
+        let routes_js = dir.join("routes.js");
+        if !routes_js.is_file() {
+            return Err(format!(
+                "release mode: {} not found — run `oj build` first",
+                routes_js.display()
+            ));
+        }
+        let v = routes::bridge_default_reader(make_bridge)(&routes_js)
+            .map_err(|e| format!("load {}: {e}", routes_js.display()))?;
+        if !v.is_array() {
+            return Err(format!("{}: expected default export of an array", routes_js.display()));
+        }
+        routes::RouteTable::from_entries(&dir, &routes::entries_from_value(&v))
     };
     for f in &failures {
         eprintln!("error: route: {f}");
