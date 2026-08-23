@@ -31,6 +31,7 @@ pub fn parse(args: &[String]) -> Command {
             let mut cur = it.clone().peekable();
             while let Some(a) = cur.next() {
                 match a.as_str() {
+                    "-b" => { cur.next(); }
                     "-d" | "-o" => {
                         if let Some(v) = cur.next() {
                             match a.as_str() {
