@@ -42,7 +42,8 @@ globalThis.http = new Proxy({}, {
   get: (_t, p) => {
     if (p === "param") {
       return (name, def) => {
-        const v = httpInfo().query[name];
+        const info = httpInfo();
+        const v = info.params[name] !== undefined ? info.params[name] : info.query[name];
         return v === undefined ? def : v;
       };
     }

@@ -232,7 +232,7 @@ mod tests {
     async fn ws_echo_roundtrip_on_pinned_thread() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::actor(t.0.clone(), true), None).merge(echo_route()),
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None).merge(echo_route()),
         )
         .await;
         let mut c = WsClient::connect(addr, "/ws").await;
@@ -247,7 +247,7 @@ mod tests {
         let handler = t.0.join("WS.js");
         std::fs::write(&handler, r#"json.ok({ pong: true });"#).unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::actor(t.0.clone(), true), None).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None).merge(js_route(
                 "/ws/js",
                 handler.clone(),
                 std::time::Duration::from_secs(1),
@@ -275,7 +275,7 @@ mod tests {
         let handler = t.0.join("WS.js");
         std::fs::write(&handler, r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#).unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::actor(t.0.clone(), true), None).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None).merge(js_route(
                 "/ws/close",
                 handler,
                 std::time::Duration::from_secs(1),
@@ -300,7 +300,7 @@ mod tests {
     async fn js_route_missing_handler_closes_quietly() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::actor(t.0.clone(), true), None).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None).merge(js_route(
                 "/ws/missing",
                 t.0.join("nope.js"),
                 std::time::Duration::from_secs(1),

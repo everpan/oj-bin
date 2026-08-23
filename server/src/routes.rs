@@ -101,6 +101,7 @@ pub enum Lookup {
 }
 
 /// 启动打印行（method × pattern × file）。
+#[derive(Clone)]
 pub struct RouteRow {
     pub method: String,
     pub pattern: String,
@@ -109,6 +110,7 @@ pub struct RouteRow {
 
 /// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
 /// 405 判定 O(1)（命中 pattern 但方法缺席），“冲突哨兵”即映射里的 Conflict 变体。
+#[derive(Clone)]
 pub struct RouteTable {
     matcher: matchit::Router<HashMap<String, Entry>>,
     /// 挂了 .route 的 (file, js 方法名)：dev 兜底不得复活其目录镜像 URL。
@@ -253,27 +255,48 @@ fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
     }
 }
 
-/// 收集 root 下全部路由相对路径（启动时打印路由表用，UC-8）。
-pub fn route_table(root: &Path, ts: bool) -> Vec<String> {
-    let ext = if ts { "api.ts" } else { "api.js" };
-    let mut out = Vec::new();
-    walk(root, ext, &mut Vec::new(), &mut out);
-    out.sort();
-    out
+/// 内省结果 Value（introspect_module 约定：仅函数导出的方法，null=未挂）→ decls。
+pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> {
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| {
+                    Some((
+                        k.clone(),
+                        match v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Null => None,
+                            _ => return None,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn walk(dir: &Path, ext: &str, rel: &mut Vec<String>, acc: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = e.file_name().to_string_lossy().into_owned();
-        if p.is_dir() {
-            rel.push(name);
-            walk(&p, ext, rel, acc);
-            rel.pop();
-        } else if name == ext {
-            acc.push(rel.join("/"));
-        }
+/// 真实内省闭包：每文件一线程 + 独立 current_thread runtime（Bridge !Send 不跨线程；
+/// 嵌套 runtime 会 panic，故换线程）。CLI 与测试共用。
+/// ponytail: 每文件起线程；文件数极大时改单线程批处理。
+pub fn bridge_introspector(
+    make: impl Fn() -> mdm_base_rust::bridge::Bridge + Send + Sync + 'static,
+) -> impl Fn(&Path) -> Result<Vec<(String, Option<String>)>, String> {
+    let make = std::sync::Arc::new(make);
+    move |f: &Path| {
+        let f = f.to_path_buf();
+        let make = make.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("introspect rt");
+            let b = make();
+            rt.block_on(async { b.introspect_module(&f).await })
+                .map(|v| decls_from_value(&v))
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .unwrap_or_else(|_| Err("introspect thread panicked".into()))
     }
 }
 
