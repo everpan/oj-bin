@@ -1,6 +1,10 @@
 # 路径参数路由设计（Route Params Design）
 
-> 状态：设计稿（待实现；已经两轮多角色评审修正——匹配器内核 / JS 运行时 / 安全契约 / API 设计）
+> 状态：历史设计稿（.route 语义已实现并随 sample 验收）。
+> **本文 §4.1/§十一 的 release/routes.js/build 部分已被 2026-08-24 的 oj build 取代**
+> （多模块版本目录 + `dist/manifests.yaml` 锁 + 聚合加载，见
+> `docs/superpowers/specs/2026-08-23-oj-build-design.md` 与 `docs/cli2.md`）；
+> 其余章节（matchit 语法/冲突处理/http.params）仍准确。
 > 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/server_cmd.rs`
 > 背景：当前目录镜像路由（`base + 目录路径 → <root>/<path>/api.(ts|js)`）**无路径参数**。`lib.rs:87` 写死 `params: HashMap::new()`，`http.param`(`bootstrap.js:43`) 只读 query。
 

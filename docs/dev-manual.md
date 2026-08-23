@@ -40,9 +40,11 @@ server/               # crate: mdm-server（axum HTTP 层）
 cli/                  # crate: oj（CLI 入口）
 ├── main.rs           # entry
 ├── lib.rs            # CLI lib
-├── args.rs           # 参数解析（server/build/None、默认 config.yaml//v1/api/dist|src）
-├── manifest.rs       # manifest.yaml 解析
-└── server_cmd.rs     # server 子命令：start() + config_dir_of()
+├── args.rs           # 参数解析（server/build/None、build 的 module 位置参数）
+├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
+├── pack.rs           # hash16（SHA-256 前 16 hex）+ 确定性 tgz 打包
+├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译/哈希改名/routes.js/锁/tgz）
+└── server_cmd.rs     # server 子命令：start() + config_dir_of() + release 聚合
 ```
 
 依赖分层：`bridge`（纯执行，不依赖 HTTP 框架）← `server`（axum 路由 + actor）← `cli`（装配）。
@@ -52,11 +54,18 @@ cli/                  # crate: oj（CLI 入口）
 ```bash
 cargo build                                   # debug
 cargo build --release                         # release（产物在 target/release/oj）
-cargo test -p oj                              # 单测
-cargo test                                    # 全部（含 e2e）
+cargo test -p oj                              # 单测 + e2e
+cargo test -p mdm-server                      # server 单测
+cargo test --workspace --exclude mdm-base-rust # 全部（见下条说明）
 cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev
+cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
 ```
+
+> ⚠️ 存量问题：`cargo test -p mdm-base-rust --lib` 在
+> `bridge::tests::infinite_loop_times_out_and_bridge_survives` 稳定 SIGSEGV
+> （master 即如此，debug/release 均崩，deno_core 超时中断路径）。跑全套用上面的
+> `--exclude` 形式；修复前勿因它误判本地改动。
 
 约定（本仓库硬性规范）：
 - **debug/release 双绿**：改动后 `cargo test` 与 `cargo build --release` 都要通过才算完成。
@@ -145,12 +154,14 @@ HTTP 请求
 - `../oj/tests/e2e.rs`：端到端验收（UC-1…15）。`start()` 返回 2 元组 `(SocketAddr, JoinHandle)`；
   测试用 `cfg.server.port = 0` + `db default = "sqlite::memory:"` 隔离；每个用例都要自带
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
-  500（编译错误）、408（死循环超时后 server 存活）。
+  500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：62 通过 + 1 ignored（E2E_LOCK 串行锁，避免端口/文件冲突）。
+- 当前计数：89 通过 + 1 ignored（mdm-server 39 + oj lib 35 + e2e 15；E2E_LOCK 串行锁，
+  避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
-- Redis 退回内存 KV、db 仅 sqlite、`build` 未实现、相对 `require()` 不支持——均接受为 v0.1
-  已知限制，不阻塞发布。
+- Redis 退回内存 KV、db 仅 sqlite、相对 `require()` 不支持——均接受为 v0.1 已知限制。
+- `build` 已于 2026-08-24 实现（按模块版本目录 + 内容哈希 + manifests.yaml 锁 + 确定性
+  tgz + release 聚合），设计见 `docs/superpowers/specs/2026-08-23-oj-build-design.md`。

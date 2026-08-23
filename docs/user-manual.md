@@ -12,7 +12,8 @@ cargo build                     # 构建（debug）
 # dev 模式：直接跑 .ts 源码
 cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev
 
-# release 模式：跑编译产物 dist/
+# release 模式：先构建再跑编译产物 dist/
+cargo run -p oj -- build -d sample/src -o sample/dist
 cargo run -p oj -- server -c sample/config.yaml -d sample/dist
 ```
 
@@ -27,21 +28,31 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 ```
 oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
-oj build  [-b /v1/api] [-d src] [-o dist]
+oj build  [module] [-d src] [-o dist]
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c` | `config.yaml` | 配置文件路径（host/port/db/redis） |
-| `-b` | `/v1/api` | 基础路由前缀 |
-| `-d` | `--dev` → `src`，否则 `dist` | 服务目录（模块树的根） |
+| `-c` | `config.yaml` | （server）配置文件路径（host/port/db/redis） |
+| `-b` | `/v1/api` | （server）基础路由前缀（build 无此参数） |
+| `-d` | `--dev` → `src`，否则 `dist` | 服务目录（server：模块树的根；build：源码目录） |
 | `--dev` | 关 | 开发模式跑 `.ts`；缺省为 release 跑 `.js` |
+| `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
 
-- `oj build`：src → dist 全量转译，剥离 `.route`、相对 import 补 `.js`，生成
-  `dist/routes.js`（release 启动直载，`oj server` 不带 `--dev` 时必须先 build）。
-  构建零磁盘副作用（db 用内存库，不执行 seed）。
-- release 模式启动时 `dist/routes.js` 缺失会直接报错（提示先 `oj build`）。
+- `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
+  读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
+  - `api.ts` → 剥离 `.route`、补相对 import 后缀，按内容 SHA-256 前 16 位 hex 改名
+    `api-<hash>.js`；其余 `.ts` 原路径换 `.js`；`manifest.yaml` 原样复制。
+  - 生成模块内 `routes.js`（pattern 无首斜杠、不含 base、含模块名段；file 相对版本目录根）。
+  - 更新 `dist/manifests.yaml`（模块 → 锁定版本，原子写，保留其他模块条目）——
+    多版本目录可共存，锁文件决定 release 加载哪个。
+  - 跨模块相对导入（如 order 引 `../../user/_shared/validate`）构建期改写为指向
+    目标模块版本目录的相对路径；目标模块未构建过则报错（先 `oj build user`）。
+  - 产出确定性 tgz：`dist/<module>-<version>.tgz`（同输入字节一致），用于整体发布。
+- release 模式启动时按 `dist/manifests.yaml` 逐模块加载各版本目录的 `routes.js` 聚合路由；
+  锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错（提示先 `oj build`）。
+- `-b` 已不是 build 参数（pattern 不含 base）；误用时显式报错退出。
 - 无子命令则打印用法退出。
 - 相对路径（`-c`/`-d`）相对**当前工作目录**（CWD），不是相对 config 所在目录。
 
@@ -87,6 +98,21 @@ redis:
 │       ├── list/api.ts           # → /v1/api/order/list/
 │       └── detail/api.ts         # → /v1/api/order/detail/
 └── node_modules/        # 裸 specifier 解析起点（见 §7 导入）
+```
+
+`oj build` 后的 `dist/` 结构（release 服务目录，**与 src 布局不同**）：
+
+```
+dist/
+├── manifests.yaml              # 模块 → 锁定版本（release 按此加载）
+├── user-0.1.0/                 # 版本目录 = <module>-<version>
+│   ├── manifest.yaml           # 原样复制
+│   ├── routes.js               # 本模块路由表
+│   ├── _shared/validate.js     # 非 api.ts：原路径换 .js
+│   ├── account/api-<hash>.js   # api.ts：内容哈希改名
+│   └── item/api-<hash>.js
+├── user-0.1.0.tgz              # 确定性发布包
+└── …                           # 其他模块各自的版本目录（多版本可共存）
 ```
 
 约束：
@@ -179,8 +205,9 @@ axum 放开 pin 后可启用。
 - `"{id}"` 相对当前目录；`"/user/{id}"` 以 `/` 开头挂到 base 根下；`fn.route = ""` 视同未挂。
 - TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错（无 tsconfig 时
   TS 语言服务通常也能拾取；严格工程可在 tsconfig `include` 里显式列入）。
-- dev（`--dev`）启动内省建表；release 用 `oj build` 生成的 `dist/routes.js` 直载（见 §2），
-  `dist` 产物中的 `.route` 已被剥离——路由事实唯一来源是 `routes.js`。
+- dev（`--dev`）启动内省建表；release 用 `oj build` 生成的各模块版本目录内 `routes.js`
+  按 `dist/manifests.yaml` 聚合直载（见 §2），`dist` 产物中的 `.route` 已被剥离——
+  路由事实唯一来源是 `routes.js`。
 
 ## 8. 导入（import）
 
@@ -261,5 +288,7 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 - `redis` 不真连 Redis，退回内存 KV。
 - `db` 仅 sqlite；`build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - 相对 `require("./x")`、`package.json` `exports`/`conditions`、pnpm 布局不支持。
+- npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules` 解析，发布物需自带）。
+- 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
 - `.tsx`/`.mts` 不转译（直通 V8）。

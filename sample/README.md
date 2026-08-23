@@ -1,10 +1,12 @@
-# oj sample — user/order
+# oj sample — user/order/file
 
   cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev   # dev（TS，热重载）
   curl http://localhost:9778/v1/api/user/account/?id=1
 
-  cargo run -p oj -- server -c sample/config.yaml -d sample/dist       # release（dist 手写制品）
+  cargo run -p oj -- build -d sample/src -o sample/dist    # 构建（版本目录+manifests.yaml+tgz）
+  cargo run -p oj -- server -c sample/config.yaml -d sample/dist       # release（按锁聚合）
 
 - 路由 = 目录镜像：src/user/profile/detail/api.ts → /v1/api/user/profile/detail/
+- dist/ 为 oj build 产物（api-<hash>.js 内容哈希命名），可再生，勿手改
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由 seed.sql 初始化（幂等），已 gitignore

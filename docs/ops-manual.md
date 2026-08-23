@@ -13,11 +13,12 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 
 发布流程：
 1. `cargo build --release`（确认 debug/release 双绿）。
-2. 打包 `oj` 二进制 + `dist/`（编译好的 `.js`）+ `config.yaml` + `seed.sql`（可选）+ vendored
-   `node_modules/`。
-3. 目标机解包，`./oj server -c config.yaml -d dist`（release 默认跑 `.js`，**不带 `--dev`**）。
-
-> v0.1 的 `oj build` 未实现，`dist/` 目前手工准备（`.ts` 剥离类型后的 `.js`）。
+2. `oj build -d src -o dist`（无参 = 全部模块）——生成各模块版本目录
+   `dist/<module>-<version>/`、锁文件 `dist/manifests.yaml` 与确定性发布包
+   `dist/<module>-<version>.tgz`（同输入重复打包字节一致，可校验完整性）。
+3. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
+   `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
+4. 目标机解包，`./oj server -c config.yaml -d dist`（release 默认跑 `.js`，**不带 `--dev`**）。
 
 ## 2. 运行
 
@@ -45,7 +46,9 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 ## 4. 热重载语义
 
 - **dev 模式**：`api.ts` 及其依赖按 mtime 缓存；改文件后下次请求用新代码（mtime 版本化 specifier）。
-- **release 模式**：跑编译好的 `.js`，同样按 mtime 失效（dist 更新即生效，无需重启）。
+- **release 模式**：跑编译好的 `.js`，同样按 mtime 失效（dist 更新即生效，无需重启）——
+  但**版本目录布局下换版本需重启**：`dist/manifests.yaml` 仅启动时读取，运行中改锁指向
+  新版本目录不会生效。同版本重建（清场重写同目录）靠 mtime 失效即时生效。
 - **不触发热重载**：`config.yaml`（重启生效）、`seed.sql`（仅启动重放）、`manifest.yaml` 新增/删除
   模块（重启生效）、`node_modules` 新增包（重启生效，已加载包缓存于进程）。
 
@@ -71,7 +74,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 |---|---|---|
 | 启动即报「missing manifest.yaml」 | 某首层子目录缺 `manifest.yaml`，或残留空目录 | 补齐；删除空目录（空目录不参与 git，但 `read_dir` 会扫到） |
 | 启动报「manifest name mismatch」 | `manifest.yaml` 的 `name` ≠ 父目录名 | 对齐 |
-| 404 | 路由无对应 `api.ts/js`，或目录穿越/非法段 | 核对路径与 `-b` 前缀 |
+| 启动报 `manifests.yaml … run oj build first` | release 下锁文件缺失/损坏，或指向不存在的版本目录 | 跑 `oj build <module>`；锁被手工改坏时按报错修 |
+| 启动报「version dir collision」 | 两个 (module, version) 组合拼出同一目录名（如 `a`/`1-x` 与 `a-1`/`x`） | 改 version 命名避开 |
+| 404 | 路由无对应 `api.ts/js`，或目录穿越/非法段 | 核对路径与 `-b` 前缀；release 先确认模块在锁内 |
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |
@@ -83,5 +88,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 ## 8. 回滚与恢复
 
 - 配置/代码均有版本；二进制与 `dist/` 打包发布，回滚 = 换回上一版打包产物。
+- **多版本共存回滚**：`dist/` 内旧版本目录不被构建清除（仅锁内当前版本的同名目录清场重建），
+  回滚单模块 = 把 `dist/manifests.yaml` 该模块指回旧版本 + 重启 server（锁仅启动时读）。
 - sqlite 数据文件随 `db.default` 路径落盘；升级前备份 `*.sqlite`。
 - 无外部依赖（Redis 未真连），故障面小：主要是「二进制 + dist 不一致」→ 保持二者同版本发布。
