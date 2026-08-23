@@ -26,6 +26,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             if !mf.is_file() {
                 return Err(format!("module {m:?}: no manifest.yaml under {}", src.display()));
             }
+            view.insert(m.clone(), crate::manifest::parse_one(&mf)?.version);
             vec![m.clone()]
         }
         None => crate::manifest::load_modules(&src)?
@@ -37,10 +38,9 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             .collect(),
     };
     names.sort(); // read_dir 顺序不定；构建顺序确定 → 控制台/lock 写入顺序稳定
-    // 计划内 {m}-{v} 不单射（a v1-x 与 a-1 vx 同落一个版本目录，后者清场前者）→ fail-fast
+    // view 全量（锁∪计划）{m}-{v} 不单射（a v1-x 与 a-1 vx 同落一个版本目录，后者清场前者；锁内陈旧条目同理）→ fail-fast
     let mut vdirs = std::collections::HashSet::new();
-    for m in &names {
-        let Some(v) = view.get(m) else { continue };
+    for (m, v) in &view {
         let vd = format!("{m}-{v}");
         if !vdirs.insert(vd.clone()) {
             return Err(format!("version dir collision: {vd}"));
@@ -679,6 +679,19 @@ mod tests {
         let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
         assert!(e.contains("collision") && e.contains("a-1-x"), "{e}");
         assert!(!t.join("dist/a-1-x").exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_rejects_collision_with_stale_lock_entry() {
+        // R-1：撞名比对含锁内条目——锁 {a-1: x} 陈旧残留时，单建 a v1-x 同落 dist/a-1-x → Err
+        let t = std::env::temp_dir().join(format!("oj-build-vdir2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        one_module(&t, "a", "1-x");
+        std::fs::create_dir_all(t.join("dist")).unwrap();
+        std::fs::write(t.join("dist/manifests.yaml"), "a-1: x\n").unwrap();
+        let e = run(&build_args(&t, Some("a"))).await.err().unwrap_or_default();
+        assert!(e.contains("collision") && e.contains("a-1-x"), "{e}");
         let _ = std::fs::remove_dir_all(&t);
     }
 
