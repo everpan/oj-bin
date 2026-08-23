@@ -27,6 +27,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 ```
 oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
+oj build  [-b /v1/api] [-d src] [-o dist]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -35,8 +36,13 @@ oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
 | `-b` | `/v1/api` | 基础路由前缀 |
 | `-d` | `--dev` → `src`，否则 `dist` | 服务目录（模块树的根） |
 | `--dev` | 关 | 开发模式跑 `.ts`；缺省为 release 跑 `.js` |
+| `-o` | `dist` | （build）产物目录 |
 
-- `oj build moduleA` 是 v0.1 占位（未实现，预留 vite 包装）。无子命令则打印用法退出。
+- `oj build`：src → dist 全量转译，剥离 `.route`、相对 import 补 `.js`，生成
+  `dist/routes.js`（release 启动直载，`oj server` 不带 `--dev` 时必须先 build）。
+  构建零磁盘副作用（db 用内存库，不执行 seed）。
+- release 模式启动时 `dist/routes.js` 缺失会直接报错（提示先 `oj build`）。
+- 无子命令则打印用法退出。
 - 相对路径（`-c`/`-d`）相对**当前工作目录**（CWD），不是相对 config 所在目录。
 
 ## 3. 配置 config.yaml
@@ -148,6 +154,28 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 - 尾斜杠有无皆可。
 - 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
 
+### 7.1 路径参数路由（`.route`）
+
+handler 函数挂 `.route` 属性即替换目录镜像，支持 matchit 语法：
+
+```ts
+function detail() { json.ok({ id: Number(http.param("id", 0)) }); }
+detail.route = "{id}";          // /v1/api/user/item/{id}
+export default { get: detail };
+```
+
+| 语法 | 匹配 | 示例 |
+|---|---|---|
+| `{id}` | 单段（不含 `/`） | `/user/item/42` → `http.param("id") === "42"` |
+| `{*path}` | 尾部一段及以上（含 `/`） | `/file/a/b/c` → `http.param("path") === "a/b/c"` |
+| `{id}` 前缀/后缀字面 | 段内混合 | `v{major}.{minor}`、`{id}.json` |
+
+- 挂 `.route` 后**目录镜像被替换**：`/v1/api/user/item`（镜像路径）→ 404。
+- `"{id}"` 相对当前目录；`"/user/{id}"` 以 `/` 开头挂到 base 根下；`fn.route = ""` 视同未挂。
+- TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错。
+- dev（`--dev`）启动内省建表；release 用 `oj build` 生成的 `dist/routes.js` 直载（见 §2），
+  `dist` 产物中的 `.route` 已被剥离——路由事实唯一来源是 `routes.js`。
+
 ## 8. 导入（import）
 
 - **相对导入** `./x`、`../x`：自动补全 `.ts` → `.js` → `/index.ts` → `/index.js`。
@@ -169,7 +197,8 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 | `http.query` | query 参数对象（`{id: "1"}`） |
 | `http.headers` | 请求头对象 |
 | `http.body` | 请求体（见 §6） |
-| `http.param(name, default)` | 取 query 参数（等价 `http.query[name] ?? default`；**仅 query，无路径参数**） |
+| `http.params` | 路径参数对象（`{id: "42"}`，已 percent-decode） |
+| `http.param(name, default)` | 取参数：**路径参数优先**，query 兜底（`http.params[name] ?? http.query[name] ?? default`） |
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
@@ -182,6 +211,10 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 
 SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 
+路径参数已解码（可含 `/`、`..` 字面）——仅用于参数化查询与类型转换，**勿拼接文件路径/URL**；
+单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码
+（`+`→空格、`%XX` 解码；旧版不解码，迁移注意）。
+
 ## 10. 响应信封与错误
 
 统一信封 `{code, msg, data}`；HTTP 状态码 = `code`（`code=0` → 200）。
@@ -189,8 +222,10 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 | 场景 | HTTP | 信封示例 |
 |---|---|---|
 | 成功 | 200 | `{"code":0,"msg":"ok","data":…}` |
-| api 文件不存在 / 目录穿越 | 404 | `{"code":404,"msg":"no api file for route","data":null}` |
-| 方法未导出（如 `DELETE` 但无 `del`） | 405 | `{"code":405,"msg":"method 'del' not exported by …/api.ts","data":null}` |
+| 无路由匹配 / 目录穿越 | 404 | `{"code":404,"msg":"no route matched","data":null}` |
+| 路径命中但动词未注册（如 `DELETE`） | 405 | `{"code":405,"msg":"method DELETE not allowed","data":null}` |
+| 非映射动词（`TRACE` 等） | 405 | `{"code":405,"msg":"method TRACE not allowed","data":null}` |
+| 路由冲突（同 pattern 同方法双声明） | 500 | `{"code":500,"msg":"route conflict: GET /v1/api/user/{id} declared in a/api.ts and b/api.ts","data":null}` |
 | TS 编译错误 / 模块解析失败 | 500 | `{"code":500,"msg":"…/api.ts: 语法错误…","data":null}` |
 | handler 死循环 / 超时 | 408 | `{"code":408,"msg":"handler execution timed out","data":null}` |
 
@@ -208,13 +243,17 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 - **order/list**：跨模块相对导入 `../../user/_shared/validate`（`requireRole`）+ `orders`/`account`
   join 联查。
 - **order/detail**：`kv` 读穿缓存（命中返回 `cached:true`，未命中查库并回填）。
+- **user/item**：路径参数路由（`detail.route = "{id}"`，§7.1）——`/v1/api/user/item/1` 查账号，
+  镜像路径 404（替换语义）。
+- **file**：catch-all 路由（`get.route = "{*path}"`）——`/v1/api/file/a/b/c` 拆段返回，
+  `/v1/api/file` 404（catch-all 至少一段）。
 
 跑法见 §1。验收用例见 `cli/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 
 ## 12. 已知限制（v0.1）
 
 - `redis` 不真连 Redis，退回内存 KV。
-- `db` 仅 sqlite；`build` 子命令未实现。
+- `db` 仅 sqlite；`build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - 相对 `require("./x")`、`package.json` `exports`/`conditions`、pnpm 布局不支持。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
 - `.tsx`/`.mts` 不转译（直通 V8）。
