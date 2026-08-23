@@ -4,7 +4,7 @@
 
 **Goal:** 实现独立 CLI `oj server`（目录镜像路由 + ESM 执行 + TS 转译 + 两级编译缓存 + node_modules 解析），并以 `sample/`（user/order 双模块）作为 15 用例验收载体。
 
-**Architecture:** 新 workspace member `cli/`（bin `oj`）做装配；`server` crate 换新路由（目录镜像）；根 crate bridge 增加 `ModuleLoader`（FS + deno_ast 转译 + 全局转译缓存）与 `Bridge::run_module`（TLA driver 模块，复用 KillSwitch 408）。旧 devserver/旧 router 删除。
+**Architecture:** 新 workspace member `../../../oj/`（bin `oj`）做装配；`server` crate 换新路由（目录镜像）；根 crate bridge 增加 `ModuleLoader`（FS + deno_ast 转译 + 全局转译缓存）与 `Bridge::run_module`（TLA driver 模块，复用 KillSwitch 408）。旧 devserver/旧 router 删除。
 
 **Tech Stack:** Rust 2024 / deno_core 0.410（`load_main_es_module_from_code` + `mod_evaluate`）/ deno_ast（transpile）/ axum 0.8 / sqlx sqlite / serde_yaml。
 
@@ -53,7 +53,7 @@ sample/                       # T11 全量（config/seed/manifest/api.ts/dist/ve
 ### Task 1: cli crate 骨架 + 参数解析
 
 **Files:**
-- Create: `cli/Cargo.toml`, `cli/src/main.rs`, `cli/src/args.rs`（含 tests）
+- Create: `../../../oj/Cargo.toml`, `../../../oj/src/main.rs`, `../../../oj/src/args.rs`（含 tests）
 - Modify: `/Users/ever/git/golang/mdm-base-rust/Cargo.toml`（members 加 `"cli"`）
 
 **Interfaces:**
@@ -61,7 +61,7 @@ sample/                       # T11 全量（config/seed/manifest/api.ts/dist/ve
 
 - [ ] **Step 1: 建 crate 与依赖**
 
-`cli/Cargo.toml`：
+`../../../oj/Cargo.toml`：
 ```toml
 [package]
 name = "oj"
@@ -80,7 +80,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "w
 ```
 根 `Cargo.toml`：`members = ["server", "cli"]`。
 
-- [ ] **Step 2: 写失败测试**（`cli/src/args.rs` 底部）
+- [ ] **Step 2: 写失败测试**（`../../../oj/src/args.rs` 底部）
 
 ```rust
 #[cfg(test)]
@@ -114,7 +114,7 @@ mod tests {
 Run: `cargo test -p oj`
 Expected: 编译失败（`Command`/`parse` 未定义）。
 
-- [ ] **Step 4: 实现**（`cli/src/args.rs`）
+- [ ] **Step 4: 实现**（`../../../oj/src/args.rs`）
 
 ```rust
 //! oj 参数解析（纯函数）。v0.1 子命令：server（build 占位）。
@@ -172,7 +172,7 @@ pub fn parse(args: &[String]) -> Command {
 }
 ```
 
-`cli/src/main.rs`：
+`../../../oj/src/main.rs`：
 ```rust
 mod args;
 mod server_cmd; // T11 填充；先放占位模块见 Step 6
@@ -198,7 +198,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 5: 占位 server_cmd**（`cli/src/server_cmd.rs`，T11 替换）
+- [ ] **Step 5: 占位 server_cmd**（`../../../oj/src/server_cmd.rs`，T11 替换）
 
 ```rust
 //! server 装配层（T11 实现）。
@@ -215,7 +215,7 @@ Run: `cargo test -p oj && cargo build --workspace`
 Expected: 1 passed；workspace 编译通过。
 
 ```bash
-git add Cargo.toml Cargo.lock cli
+git add Cargo.toml Cargo.lock oj
 git commit -m "feat(oj): cli crate skeleton with arg parsing
 
 unix@vip.qq.com ai"
@@ -1569,8 +1569,8 @@ unix@vip.qq.com ai"
 ### Task 11: cli server 装配
 
 **Files:**
-- Create: `cli/src/manifest.rs`（含 tests）
-- Rewrite: `cli/src/server_cmd.rs`（含 tests）
+- Create: `../../../oj/src/manifest.rs`（含 tests）
+- Rewrite: `../../../oj/src/server_cmd.rs`（含 tests）
 
 **Interfaces:**
 - Consumes: T1 `ServerArgs`、T3 `config`、T4 `method_table/route_table`、T9 `with_dbs_and_loader`、T10 `serve`。
@@ -1579,7 +1579,7 @@ unix@vip.qq.com ai"
 - [ ] **Step 1: manifest 失败测试**
 
 ```rust
-// cli/src/manifest.rs tests
+// oj/src/manifest.rs tests
     #[test]
     fn loads_and_validates() {
         let d = tmp("mf-ok");
@@ -1652,7 +1652,7 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
 - [ ] **Step 4: server_cmd 失败测试**
 
 ```rust
-// cli/src/server_cmd.rs tests
+// oj/src/server_cmd.rs tests
     #[tokio::test]
     async fn rejects_non_sqlite_dsn_at_startup() {
         let mut cfg = Config::default();
@@ -1814,7 +1814,7 @@ Run: `cargo test -p oj && cargo test --workspace`
 Expected: 全绿。
 
 ```bash
-git add cli server/src/lib.rs
+git add oj server/src/lib.rs
 git commit -m "feat(oj): server assembly (sqlite-only DSN, seed, manifest gate, route table)
 
 unix@vip.qq.com ai"
@@ -2105,7 +2105,7 @@ unix@vip.qq.com ai"
 ### Task 13: E2E — sample 用例集
 
 **Files:**
-- Create: `cli/tests/e2e.rs`
+- Create: `../../../oj/tests/e2e.rs`
 
 **Interfaces:**
 - Consumes: T11 `server_cmd::start`、T6 `transpile_hits`、T12 sample 文件。
@@ -2254,7 +2254,7 @@ async fn uc14_transpile_cache_and_hot_reload() {
     let _ = std::fs::remove_dir_all(&t);
 }
 ```
-（`oj::server_cmd` 与 `mdm_base_rust::bridge::transpile` 需 pub 可达：`cli/src/main.rs` 加 `pub mod server_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
+（`oj::server_cmd` 与 `mdm_base_rust::bridge::transpile` 需 pub 可达：`../../../oj/src/main.rs` 加 `pub mod server_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
 
 - [ ] **Step 2: 跑测试确认通过（允许的失败逐个修）**
 
@@ -2264,7 +2264,7 @@ Expected: 全绿。常见坑：HEAD 响应 body 被要求解析 JSON——reqwes
 - [ ] **Step 3: 提交**
 
 ```bash
-git add cli
+git add oj
 git commit -m "test(oj): sample e2e acceptance (UC-1..6,8,9,13,14,15)
 
 unix@vip.qq.com ai"
@@ -2275,7 +2275,7 @@ unix@vip.qq.com ai"
 ### Task 14: E2E 临时目录用例 + 收尾
 
 **Files:**
-- Modify: `cli/tests/e2e.rs`（追加 UC-7/10/11/12）
+- Modify: `../../../oj/tests/e2e.rs`（追加 UC-7/10/11/12）
 - Modify: `docs/cli2.md`（实现状态标注）
 - Modify: `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md`（收官注记）
 
@@ -2366,7 +2366,7 @@ Expected: debug/release 全绿（根 + server + oj，含 E2E）。
 `docs/cli2.md` 末尾加实现记录段（commit 链、escape-goat 偏差、双绿数字）；spec 加收官注记。
 
 ```bash
-git add cli docs
+git add oj docs
 git commit -m "test(oj): negative-path e2e (manifest/404/405/500/408) and docs closeout
 
 unix@vip.qq.com ai"

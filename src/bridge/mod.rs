@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::{OpState, op2};
+use deno_core::{JsRuntime, OpState, op2};
 use deno_core::error::CoreError;
 
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
@@ -239,32 +239,53 @@ impl Bridge {
 
     /// 带请求上下文执行。
     pub async fn run_with(&self, source: &str, req: RequestInfo) -> Result<Capture, CoreError> {
-        let mut rt = self.pool.checkout();
-        // 重置 per-request 状态。
+        let mut rt = self.checkout_reset(req);
+        let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
+        // 仅成功执行（已轮询 event loop）的 runtime 才归还；失败的可能 isolate 损坏，直接丢弃。
+        match result {
+            Ok(()) => {
+                let cap = Self::read_capture(&rt);
+                self.pool.checkin(rt);
+                Ok(cap)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // ----- 执行管道复用辅助 -----
+
+    /// 借出 runtime 并重置 per-request 状态（不武装看门狗）。
+    fn checkout_reset(&self, req: RequestInfo) -> JsRuntime {
+        let rt = self.pool.checkout();
         {
             let op_state = runtime::op_state(&rt);
             let mut g = op_state.borrow_mut();
             g.borrow_mut::<ReqState>().reset(req);
         }
-        let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
-        // 读取捕获。
-        let capture = {
-            let op_state = runtime::op_state(&rt);
-            let g = op_state.borrow();
-            let rs = g.borrow::<ReqState>();
-            Capture {
-                status: rs.status,
-                headers: rs.headers.clone(),
-                body: rs.response.clone().unwrap_or_default(),
-            }
+        rt
+    }
+
+    /// 借出 runtime、重置状态并武装看门狗（KillSwitch）。
+    /// isolate 裸指针仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
+    fn checkout_armed(&self, req: RequestInfo, timeout: std::time::Duration) -> JsRuntime {
+        let mut rt = self.checkout_reset(req);
+        let ptr: usize = {
+            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
+            iso as *mut _ as usize
         };
-        // 仅成功执行（已轮询 event loop）的 runtime 才归还；失败的可能 isolate 损坏，直接丢弃。
-        match result {
-            Ok(()) => {
-                self.pool.checkin(rt);
-                Ok(capture)
-            }
-            Err(e) => Err(e),
+        self.kill.arm(ptr, timeout);
+        rt
+    }
+
+    /// 读取当前 runtime 的 per-request 响应捕获。
+    fn read_capture(rt: &JsRuntime) -> Capture {
+        let op_state = runtime::op_state(rt);
+        let g = op_state.borrow();
+        let rs = g.borrow::<ReqState>();
+        Capture {
+            status: rs.status,
+            headers: rs.headers.clone(),
+            body: rs.response.clone().unwrap_or_default(),
         }
     }
 
@@ -297,44 +318,22 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<WsOutcome, RunError> {
-        let mut rt = self.pool.checkout();
-        // isolate 裸指针：仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
-        let ptr: usize = {
-            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
-            iso as *mut _ as usize
-        };
-        self.kill.arm(ptr, timeout);
-        {
-            let op_state = runtime::op_state(&rt);
-            let mut g = op_state.borrow_mut();
-            g.borrow_mut::<ReqState>().reset(req);
-        }
+        let mut rt = self.checkout_armed(req, timeout);
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         if self.kill.disarm() {
             // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
             return Err(RunError::Timeout);
         }
-        match result {
-            Ok(()) => {
-                let outcome = {
-                    let op_state = runtime::op_state(&rt);
-                    let g = op_state.borrow();
-                    let rs = g.borrow::<ReqState>();
-                    WsOutcome {
-                        capture: Capture {
-                            status: rs.status,
-                            headers: rs.headers.clone(),
-                            body: rs.response.clone().unwrap_or_default(),
-                        },
-                        sends: rs.ws_sends.clone(),
-                        close: rs.ws_close,
-                    }
-                };
-                self.pool.checkin(rt);
-                Ok(outcome)
-            }
-            Err(e) => Err(RunError::Core(e)),
-        }
+        result.map_err(RunError::Core)?;
+        let (sends, close) = {
+            let op_state = runtime::op_state(&rt);
+            let g = op_state.borrow();
+            let rs = g.borrow::<ReqState>();
+            (rs.ws_sends.clone(), rs.ws_close)
+        };
+        let capture = Self::read_capture(&rt);
+        self.pool.checkin(rt);
+        Ok(WsOutcome { capture, sends, close })
     }
 
     /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
@@ -348,10 +347,6 @@ impl Bridge {
     ) -> Result<Capture, RunError> {
         let spec = module_loader::versioned_specifier(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
-        static DRIVER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = DRIVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/driver/{n}.js"))
-            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
         // TLA driver：import 命中 V8 模块缓存（?v= 不变时零转译零重编译）；
         // 方法未导出 → json.fail(405)（信封映射 HTTP 405）。
         // method/msg 以 JSON 编码嵌入（合法 JS 字面量，杜绝引号注入）。
@@ -367,53 +362,7 @@ impl Bridge {
              if (typeof fn !== \"function\") json.fail(405, {msg_lit});\n\
              else await fn();\n"
         );
-        let mut rt = self.pool.checkout();
-        // isolate 裸指针：仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
-        let ptr: usize = {
-            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
-            iso as *mut _ as usize
-        };
-        self.kill.arm(ptr, timeout);
-        {
-            let op_state = runtime::op_state(&rt);
-            let mut g = op_state.borrow_mut();
-            g.borrow_mut::<ReqState>().reset(req);
-        }
-        // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
-        // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
-        // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
-        // 池化 runtime 的第二个请求（driver/N 递增）会撞 MainModuleAlreadyExists。
-        let result: Result<(), CoreError> = async {
-            let id = rt
-                .load_side_es_module_from_code(&driver_spec, code)
-                .await?;
-            let eval = rt.mod_evaluate(id);
-            rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
-            eval.await?;
-            Ok(())
-        }
-        .await;
-        if self.kill.disarm() {
-            // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
-            return Err(RunError::Timeout);
-        }
-        match result {
-            Ok(()) => {
-                let capture = {
-                    let op_state = runtime::op_state(&rt);
-                    let g = op_state.borrow();
-                    let rs = g.borrow::<ReqState>();
-                    Capture {
-                        status: rs.status,
-                        headers: rs.headers.clone(),
-                        body: rs.response.clone().unwrap_or_default(),
-                    }
-                };
-                self.pool.checkin(rt);
-                Ok(capture)
-            }
-            Err(e) => Err(RunError::Core(e)),
-        }
+        self.run_side_driver(req, code, timeout).await
     }
 
     /// 启动期内省：import api 模块、读 default[method].route，经 json.ok 信封回传 data
@@ -434,7 +383,11 @@ impl Bridge {
              }}\n\
              json.ok(out);\n"
         );
-        self.run_side_driver("introspect", code, INTROSPECT_TIMEOUT).await
+        let cap = self
+            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT)
+            .await?;
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
+        Ok(v["data"].clone())
     }
 
     /// 读模块 default 导出（release 直载 routes.js：一次 import，不逐模块内省）。
@@ -448,64 +401,48 @@ impl Bridge {
             "const m = await import(\"{spec}\");\n\
              json.ok(m.default === undefined ? null : m.default);\n"
         );
-        self.run_side_driver("routes", code, INTROSPECT_TIMEOUT).await
+        let cap = self
+            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT)
+            .await?;
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
+        Ok(v["data"].clone())
     }
 
-    /// 一次性 side-module driver：执行 code，返回 json.ok 信封的 data。
-    /// introspect_module / read_module_default 共用（KillSwitch + 事件循环 + 信封解析）。
+    /// 一次性 side-module driver 执行：借出 runtime、武装看门狗、执行 `code`
+    /// （code 已 import 目标模块并触发对应 handler/内省），返回响应捕获。
+    /// run_module / introspect_module / read_module_default 共用（KillSwitch + 事件循环 + 信封解析）。
+    /// 超时 → RunError::Timeout（runtime 不归还）；handler 错误 → RunError::Core。
     async fn run_side_driver(
         &self,
-        tag: &str,
+        req: RequestInfo,
         code: String,
         timeout: std::time::Duration,
-    ) -> Result<serde_json::Value, RunError> {
+    ) -> Result<Capture, RunError> {
         static DRV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = DRV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/{tag}/{n}.js"))
+        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/driver/{n}.js"))
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
-        let mut rt = self.pool.checkout();
-        let ptr: usize = {
-            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
-            iso as *mut _ as usize
-        };
-        self.kill.arm(ptr, timeout);
-        {
-            let op_state = runtime::op_state(&rt);
-            let mut g = op_state.borrow_mut();
-            g.borrow_mut::<ReqState>().reset(RequestInfo::default());
-        }
+        let mut rt = self.checkout_armed(req, timeout);
+        // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
+        // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
+        // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
+        // 池化 runtime 的第二个请求（driver/N 递增）会撞 MainModuleAlreadyExists。
         let result: Result<(), CoreError> = async {
-            let id = rt
-                .load_side_es_module_from_code(&driver_spec, code)
-                .await?;
+            let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
             let eval = rt.mod_evaluate(id);
             rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
             eval.await?;
             Ok(())
         }
         .await;
+        // 超时熔断：看门狗已 terminate isolate，runtime 不可复用，直接丢弃（不 checkin）。
         if self.kill.disarm() {
             return Err(RunError::Timeout);
         }
-        match result {
-            Ok(()) => {
-                let capture = {
-                    let op_state = runtime::op_state(&rt);
-                    let g = op_state.borrow();
-                    let rs = g.borrow::<ReqState>();
-                    Capture {
-                        status: rs.status,
-                        headers: rs.headers.clone(),
-                        body: rs.response.clone().unwrap_or_default(),
-                    }
-                };
-                self.pool.checkin(rt);
-                let v: serde_json::Value =
-                    serde_json::from_slice(&capture.body).unwrap_or_default();
-                Ok(v["data"].clone())
-            }
-            Err(e) => Err(RunError::Core(e)),
-        }
+        result.map_err(RunError::Core)?;
+        let capture = Self::read_capture(&rt);
+        self.pool.checkin(rt);
+        Ok(capture)
     }
 }
 

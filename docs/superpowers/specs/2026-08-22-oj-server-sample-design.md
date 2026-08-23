@@ -22,7 +22,7 @@
 KillSwitch 408 熔断、actor 线程桥、axum 装配。
 
 **决策（已确认）**：sample 与 oj server 全做（sample 即验收）；方案 B——独立
-`cli/` crate 承载 `oj`；`oj` **替代** devserver（旧 devserver/旧 router 删除）。
+`../../../oj/` crate 承载 `oj`；`oj` **替代** devserver（旧 devserver/旧 router 删除）。
 
 ## 2. 产品需求（PRD）
 
@@ -131,7 +131,7 @@ export default { get, post, put, del, patch, head, options };
 
 ### 5.1 Crate 布局（方案 B）
 
-- `cli/`（新 workspace member，package `oj`）：子命令解析（`server`；`build`
+- `../../../oj/`（新 workspace member，package `oj`）：子命令解析（`server`；`build`
   占位报 not implemented）→ config 加载 → 逐 db 开库（共享池）→ 执行项目根
   `seed.sql`（存在则对 default db 执行）→ `Bridge::with_dbs` → actor 池 → serve。
   启动时全量 manifest 校验 + 打印路由表。

@@ -1,7 +1,7 @@
 # 路径参数路由设计（Route Params Design）
 
 > 状态：设计稿（待实现；已经两轮多角色评审修正——匹配器内核 / JS 运行时 / 安全契约 / API 设计）
-> 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`cli/src/server_cmd.rs`
+> 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/server_cmd.rs`
 > 背景：当前目录镜像路由（`base + 目录路径 → <root>/<path>/api.(ts|js)`）**无路径参数**。`lib.rs:87` 写死 `params: HashMap::new()`，`http.param`(`bootstrap.js:43`) 只读 query。
 
 ## 一、目标
@@ -112,7 +112,7 @@ build_route_table(root, base, loader_shared):
 
 - **拼接规范化**：`Routes::new` 把 base 归一成 `/v1/api/`（尾斜杠，`routes.rs:17`），字面 `base + route` 会得双斜杠（matchit 精确匹配，永不命中）。拼接前 `base.trim_end_matches('/')`，`route` 侧保留首 `/` 即可。
 - **同一函数挂多个方法**（`export default { get: f, post: f }`）：`.route` 在函数上，两个方法共享同一模式——若非本意，拆成两个函数。
-- `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`cli/src/server_cmd.rs:66-68` 的打印改用其产物。
+- `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`../oj/src/server_cmd.rs:66-68` 的打印改用其产物。
 
 ### 4.1 release 直载（`routes.js`，免内省）
 
@@ -246,9 +246,9 @@ if (p === "param") {
 | `server/src/lib.rs` | 126-138 | `parse_query` 改 form-urlencoded 解码，移除原"未 decode" ponytail 注（行为变更见 §7） |
 | `src/bridge/mod.rs` | 340-400 | 内省 driver 变体（读 `.route` 回传）；`run_module` 管道复用 |
 | `src/bridge/bootstrap.js` | 43-48 | `http.param` 合并 path→query |
-| `cli/src/server_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |
-| `cli/src/build_cmd.rs` | 新文件 | `oj build`（§十一）：src → dist 转译、剥 `.route`、补相对 import 后缀、生成 `routes.js` |
-| `cli/src/args.rs` | — | `Command::Build(BuildArgs)`（`-b/-d/-o`），替换占位 `Vec<String>` |
+| `../oj/src/server_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |
+| `../oj/src/build_cmd.rs` | 新文件 | `oj build`（§十一）：src → dist 转译、剥 `.route`、补相对 import 后缀、生成 `routes.js` |
+| `../oj/src/args.rs` | — | `Command::Build(BuildArgs)`（`-b/-d/-o`），替换占位 `Vec<String>` |
 | `docs/user-manual.md` | §9 表 / §10 表 / §11 | `http.param` 优先级 + 新增 `http.params` 行；§10 加 500 冲突行、404/405 文案更新、query 解码变更说明；§11 补 `.route` 示例与 `global.d.ts` |
 | `sample/` | — | 新增 `.route` 示例（含 `global.d.ts`，见第九节） |
 
@@ -367,7 +367,7 @@ get.route = "{id}";
 oj build [-b /v1/api] [-d src] [-o dist]
 ```
 
-流程（`cli/src/build_cmd.rs`）：
+流程（`../oj/src/build_cmd.rs`）：
 
 1. **落盘**：递归收集 `.ts` 与 `manifest.yaml`（确定性排序）。`.ts` → `cached_transpile` 转译 → **剥离 `.route` 赋值行** → **相对裸 import 补 `.js`** → 写 `dist/**/ *.js`；`manifest.yaml` 原样复制。
 2. **建表**：与 dev server 完全同构——`RouteTable::build(base, src, ts=true, bridge_introspector(...))` 内省 src 的 `api.ts`，得到全量路由行（`.route` 行 + 目录镜像行；release 无 fs 兜底，表是唯一路由来源，镜像行必须进 routes.js）。

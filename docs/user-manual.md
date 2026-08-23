@@ -254,7 +254,7 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 - **file**：catch-all 路由（`get.route = "{*path}"`）——`/v1/api/file/a/b/c` 拆段返回，
   `/v1/api/file` 404（catch-all 至少一段）。
 
-跑法见 §1。验收用例见 `cli/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
+跑法见 §1。验收用例见 `../oj/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 
 ## 12. 已知限制（v0.1）
 

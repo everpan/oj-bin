@@ -52,7 +52,7 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 ## 5. 超时与资源
 
 - 超时 handler → 对应 JsRuntime 被 `terminate_execution` 强杀并**丢弃不回池**，HTTP 408。
-  server 不崩，后续请求正常（`cli/tests/e2e.rs` 的 `uc12` 验证了这一点）。
+  server 不崩，后续请求正常（`../oj/tests/e2e.rs` 的 `uc12` 验证了这一点）。
 - `RuntimePool` 最大空闲 16；池在负载后自动收缩。被杀的 runtime 会即时从池移除。
 
 ## 6. 日志

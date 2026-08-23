@@ -713,7 +713,7 @@ pub(crate) fn build_table(dir: &Path, ts: bool, base: &str) -> RouteTable {
 ### Task 5: CLI 接线与启动打印
 
 **Files:**
-- Modify: `cli/src/server_cmd.rs`（hoist make 闭包；内省建表；打印；serve 传参）
+- Modify: `../../../oj/src/server_cmd.rs`（hoist make 闭包；内省建表；打印；serve 传参）
 
 **Interfaces:**
 - Consumes: Task 4 的 `serve(addr, base, dir, ts, table, actor, timeout)`、`RouteTable::listing`、`bridge_introspector`；Task 3 `INTROSPECT_TIMEOUT`（间接）。
