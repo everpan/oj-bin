@@ -1,11 +1,1 @@
-// 模块内共享校验（无 api.ts → 非路由目录，UC-13 相对导入载体）
-export function requireRole(role) {
-  if (role !== "admin" && role !== "user") throw new Error("invalid role: " + role);
-  return role;
-}
-export function positiveId(raw) {
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) throw new Error("invalid id: " + String(raw));
-  return n;
-}
-//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbImZpbGU6Ly8vVXNlcnMvZXZlci9naXQvZ29sYW5nL21kbS1iYXNlLXJ1c3Qvc2FtcGxlL3NyYy91c2VyL19zaGFyZWQvdmFsaWRhdGUudHMiXSwic291cmNlc0NvbnRlbnQiOlsiLy8g5qih5Z2X5YaF5YWx5Lqr5qCh6aqM77yI5pegIGFwaS50cyDihpIg6Z2e6Lev55Sx55uu5b2V77yMVUMtMTMg55u45a+55a+85YWl6L295L2T77yJXG5leHBvcnQgZnVuY3Rpb24gcmVxdWlyZVJvbGUocm9sZTogc3RyaW5nIHwgdW5kZWZpbmVkKTogc3RyaW5nIHtcbiAgaWYgKHJvbGUgIT09IFwiYWRtaW5cIiAmJiByb2xlICE9PSBcInVzZXJcIikgdGhyb3cgbmV3IEVycm9yKFwiaW52YWxpZCByb2xlOiBcIiArIHJvbGUpO1xuICByZXR1cm4gcm9sZTtcbn1cblxuZXhwb3J0IGZ1bmN0aW9uIHBvc2l0aXZlSWQocmF3OiB1bmtub3duKTogbnVtYmVyIHtcbiAgY29uc3QgbiA9IE51bWJlcihyYXcpO1xuICBpZiAoIU51bWJlci5pc0ludGVnZXIobikgfHwgbiA8PSAwKSB0aHJvdyBuZXcgRXJyb3IoXCJpbnZhbGlkIGlkOiBcIiArIFN0cmluZyhyYXcpKTtcbiAgcmV0dXJuIG47XG59XG4iXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6IkFBQUEseUNBQXlDO0FBQ3pDLE9BQU8sU0FBUyxZQUFZLElBQXdCO0VBQ2xELElBQUksU0FBUyxXQUFXLFNBQVMsUUFBUSxNQUFNLElBQUksTUFBTSxtQkFBbUI7RUFDNUUsT0FBTztBQUNUO0FBRUEsT0FBTyxTQUFTLFdBQVcsR0FBWTtFQUNyQyxNQUFNLElBQUksT0FBTztFQUNqQixJQUFJLENBQUMsT0FBTyxTQUFTLENBQUMsTUFBTSxLQUFLLEdBQUcsTUFBTSxJQUFJLE1BQU0saUJBQWlCLE9BQU87RUFDNUUsT0FBTztBQUNUIn0=
+export function requireRole(role){if(role!=="admin"&&role!=="user")throw new Error("invalid role: "+role);return role;}export function positiveId(raw){const n=Number(raw);if(!Number.isInteger(n)||n<=0)throw new Error("invalid id: "+String(raw));return n;}

@@ -28,7 +28,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 ```
 oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
-oj build  [module] [-d src] [-o dist]
+oj build  [module] [-d src] [-o dist] [--no-minify]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -39,11 +39,13 @@ oj build  [module] [-d src] [-o dist]
 | `--dev` | 关 | 开发模式跑 `.ts`；缺省为 release 跑 `.js` |
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
+| `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
   读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
-  - `api.ts` → 剥离 `.route`、补相对 import 后缀，按内容 SHA-256 前 16 位 hex 改名
-    `api-<hash>.js`；其余 `.ts` 原路径换 `.js`；`manifest.yaml` 原样复制。
+  - 产物**保留原名与目录结构**：全部 `.ts` 原路径换 `.js` 扩展（api.ts → 同目录
+    `api.js`，仅多一步剥 `.route` 声明）；`manifest.yaml` 原样复制。
+  - 转译产物默认 minify（单行、剥注释——含内联 sourcemap），`--no-minify` 关闭。
   - 生成模块内 `routes.js`（pattern 无首斜杠、不含 base、含模块名段；file 相对版本目录根）。
   - 更新 `dist/manifests.yaml`（模块 → 锁定版本，原子写，保留其他模块条目）——
     多版本目录可共存，锁文件决定 release 加载哪个。
@@ -108,9 +110,9 @@ dist/
 ├── user-0.1.0/                 # 版本目录 = <module>-<version>
 │   ├── manifest.yaml           # 原样复制
 │   ├── routes.js               # 本模块路由表
-│   ├── _shared/validate.js     # 非 api.ts：原路径换 .js
-│   ├── account/api-<hash>.js   # api.ts：内容哈希改名
-│   └── item/api-<hash>.js
+│   ├── _shared/validate.js     # 非 api.ts：原路径换 .js（minified）
+│   ├── account/api.js          # api.ts：原名原目录（minified）
+│   └── item/api.js
 ├── user-0.1.0.tgz              # 确定性发布包
 └── …                           # 其他模块各自的版本目录（多版本可共存）
 ```

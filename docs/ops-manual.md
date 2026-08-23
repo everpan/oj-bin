@@ -14,8 +14,10 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 发布流程：
 1. `cargo build --release`（确认 debug/release 双绿）。
 2. `oj build -d src -o dist`（无参 = 全部模块）——生成各模块版本目录
-   `dist/<module>-<version>/`、锁文件 `dist/manifests.yaml` 与确定性发布包
+   `dist/<module>-<version>/`（产物保留 src 目录结构与原名，如 `account/api.js`，
+   默认 minify 成单行）、锁文件 `dist/manifests.yaml` 与确定性发布包
    `dist/<module>-<version>.tgz`（同输入重复打包字节一致，可校验完整性）。
+   排障需要可读产物时加 `--no-minify` 重建。
 3. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
    `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
 4. 目标机解包，`./oj server -c config.yaml -d dist`（release 默认跑 `.js`，**不带 `--dev`**）。

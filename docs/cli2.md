@@ -46,7 +46,7 @@
 ### 访问规则
    --dev 开发模式下
    如果某个子文件夹中存在 `api.ts`, 如 `src/moduleA/featB/api.ts`, 则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行 `api.ts` 中导出的`get`方法
-   --release 发布模式下，一般是编译文件目录，如 `-d dist/` 下存在各模块版本目录 `moduleA-{VERSION}/`，server 按 `dist/manifests.yaml` 锁定的版本加载各 `routes.js` 聚合路由，则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行对应 `api-[hash].js` 中导出的`get`方法
+   --release 发布模式下，一般是编译文件目录，如 `-d dist/` 下存在各模块版本目录 `moduleA-{VERSION}/`，server 按 `dist/manifests.yaml` 锁定的版本加载各 `routes.js` 聚合路由，则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行对应 `featB/api.js`（minified）中导出的`get`方法
    其中 `DELETE` 映射为 `del` 方法
 
    `api.ts` 伪代码如下
@@ -66,19 +66,21 @@
   开发者通过执行 `oj build user` 命令来编译 user 模块，`build` 子命令为内置转译管线（swc）的包装，基本过程如下
       - 校验 user/manifest.yaml 中的模块名是否与根目录相同，即模块名必须严格相同, 其中 version 记录为 {VERSION}
       - 遍历所有子文件夹的 `api.ts`, 并将其路径提取，例如 `user/profile/detail/api.ts` `API_PATH='user/profile/detail'`
-      - 从api.ts中export的方法中，提取 route，如 `get.route={id}`, 则可以依此作为生产 `routes.js` 的路由项数据 `{ method: "get", pattern: "user/profile/detail/{id}", file: "api-[hash].js" }`, 其中 `[hash]` 为 api.ts 转译产物（剥 `.route` 声明、补相对 import 后缀后）内容的 SHA-256 前 16 位 hex；`file` 相对版本目录根，子目录下的 api.ts 形如 `detail/api-[hash].js`
+      - 从api.ts中export的方法中，提取 route，如 `get.route={id}`, 则可以依此作为生产 `routes.js` 的路由项数据 `{ method: "get", pattern: "user/profile/detail/{id}", file: "detail/api.js" }`；`file` 相对版本目录根，子目录下的 api.ts 形如 `detail/api.js`（产物保留原名与目录结构，api.ts → 同目录 `api.js`）
       - pattern 无首斜杠、不含 base，以模块名段开头（`/` 开头的根级声明则剥首斜杠、不加模块段）
-      - 非 api.ts 的 .ts 按原路径换 .js 扩展落盘，manifest.yaml 原样复制；跨模块相对导入（如 order 导入 `../user/_shared/validate`）构建期改写为指向目标模块版本目录的相对路径
-      - 最后将形成若干 `dist/user-{VERSION}/api-[hash].js` 以及 `dist/user-{VERSION}/routes.js`, routes.js 中包含若干路由项数据
+      - 全部 .ts 按原路径换 .js 扩展落盘（api.ts 同名 `api.js`，仅多一步剥 `.route` 声明），manifest.yaml 原样复制；跨模块相对导入（如 order 导入 `../user/_shared/validate`）构建期改写为指向目标模块版本目录的相对路径
+      - 转译产物默认 minify（单行、剥注释——含内联 sourcemap），`--no-minify` 可关闭以得到可读产物排障
+      - 最后将形成若干 `dist/user-{VERSION}/`（如 `detail/api.js`、`_shared/validate.js`）以及 `dist/user-{VERSION}/routes.js`, routes.js 中包含若干路由项数据
       - 同时形成压缩包文件 `dist/user-{VERSION}.tgz`, 用于整体发布（内容确定，同输入重复打包结果一致）
 
   参数：
 ```
-    oj build [module] -d src -o dist
+    oj build [module] -d src -o dist [--no-minify]
 ```
       module  可选，指定要编译的模块名；缺省为全部模块
       -d      源码目录，默认 `src`
       -o      产物目录，默认 `dist`
+      --no-minify  关闭产物 minify（多行可读，排障用；默认开启）
 
   产物树示例：
 ```
@@ -87,8 +89,8 @@
     ├── user-0.1.0/
     │   ├── manifest.yaml           # 原样复制
     │   ├── routes.js               # 本模块路由表
-    │   ├── _shared/validate.js     # 非 api.ts，原路径换 .js
-    │   └── account/api-[hash].js
+    │   ├── _shared/validate.js     # 非 api.ts，原路径换 .js（minified）
+    │   └── account/api.js          # api.ts 产物，原名原目录（minified）
     ├── user-0.1.0.tgz
     └── order-0.1.0/ ...
 ```

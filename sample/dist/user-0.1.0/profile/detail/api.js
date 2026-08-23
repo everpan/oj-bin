@@ -1,0 +1,1 @@
+function get(){json.ok({path:"user/profile/detail",depth:3,ts:true});}export default{get};
