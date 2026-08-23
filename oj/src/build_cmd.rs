@@ -154,6 +154,74 @@ fn fix_relative_imports(src: &str) -> String {
         + "\n"
 }
 
+/// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块名段。
+/// None/空 route → 目录镜像；相对声明 → 目录 + route；根级声明（/ 开头）→ 剥首斜杠不加模块段。
+fn rel_pattern(module: &str, rel_dir: &str, route: Option<&str>) -> String {
+    match route.map(str::trim).filter(|r| !r.is_empty()) {
+        None => {
+            if rel_dir.is_empty() {
+                module.to_string()
+            } else {
+                format!("{module}/{rel_dir}")
+            }
+        }
+        Some(r) if r.starts_with('/') => r.trim_start_matches('/').to_string(),
+        Some(r) => {
+            if rel_dir.is_empty() {
+                format!("{module}/{r}")
+            } else {
+                format!("{module}/{rel_dir}/{r}")
+            }
+        }
+    }
+}
+
+/// 静态 import/export-from 的相对 specifier（与 fix_relative_imports 同口径：行级、字面量）。
+/// ponytail: 动态 import()/别名出现时再补。
+fn relative_import_specifiers(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for l in src.lines() {
+        let Some(i) = l.find("from ") else { continue };
+        let rest = &l[i + 5..];
+        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+        let s = &rest[1..];
+        let Some(end) = s.find(q) else { continue };
+        let spec = &s[..end];
+        if spec.starts_with("./") || spec.starts_with("../") {
+            out.push(spec.to_string());
+        }
+    }
+    out
+}
+
+/// 哈希改名的配套防线：api.ts 只许作路由入口（spec §2.5）。
+/// 目标 basename（剥扩展）== "api" 即拒绝——宁枉勿纵，报错给全部违规。
+fn guard_no_api_imports(files: &[(String, String)]) -> Result<(), String> {
+    let mut bad = Vec::new();
+    for (rel, src) in files {
+        for spec in relative_import_specifiers(src) {
+            let target = spec.rsplit('/').next().unwrap_or("");
+            let stem = target
+                .strip_suffix(".ts")
+                .or_else(|| target.strip_suffix(".js"))
+                .unwrap_or(target);
+            if stem == "api" {
+                bad.push(format!(
+                    "  {rel} imports {spec:?} (api.ts 是路由入口，不可被 import)"
+                ));
+            }
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "api.ts 不可被模块内 import：\n{}",
+            bad.join("\n")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +246,38 @@ mod tests {
         assert!(out.contains("\"./d.json\""), "{out}");
         assert!(out.contains("\"./b.js\""), "{out}");
         assert!(out.contains("from \\\"./nope\\\""), "{out}"); // 引号未开 → 不动
+    }
+
+    #[test]
+    fn rel_pattern_rules() {
+        // 镜像行：模块名 + 目录段
+        assert_eq!(rel_pattern("user", "account", None), "user/account");
+        assert_eq!(rel_pattern("user", "", None), "user");
+        assert_eq!(rel_pattern("user", "profile/detail", None), "user/profile/detail");
+        // 相对 .route 声明
+        assert_eq!(rel_pattern("user", "item", Some("{id}")), "user/item/{id}");
+        assert_eq!(rel_pattern("user", "", Some("{id}")), "user/{id}");
+        // 根级声明（/ 开头）：剥首斜杠，不加模块段
+        assert_eq!(rel_pattern("user", "item", Some("/v2/user/{id}")), "v2/user/{id}");
+        // 空 route 视同未挂
+        assert_eq!(rel_pattern("user", "item", Some("")), "user/item");
+    }
+
+    #[test]
+    fn import_specifier_extraction() {
+        let src = "import { v } from \"../_shared/validate\";\nimport x from './a.js';\nimport p from \"pkg\";\nexport { v } from \"./b\";\nconst s = 1;";
+        assert_eq!(relative_import_specifiers(src), vec!["../_shared/validate", "./a.js", "./b"]);
+    }
+
+    #[test]
+    fn guard_rejects_api_imports() {
+        let files = vec![
+            ("_shared/util.ts".into(), "import { g } from \"../account/api\";\n".into()),
+            ("account/api.ts".into(), "import { v } from \"../_shared/validate\";\n".into()),
+        ];
+        let e = guard_no_api_imports(&files).unwrap_err();
+        assert!(e.contains("_shared/util.ts") && e.contains("../account/api"), "{e}");
+        // 无违规
+        assert!(guard_no_api_imports(&[("x.ts".into(), "import m from \"pkg\";".into())]).is_ok());
     }
 }
