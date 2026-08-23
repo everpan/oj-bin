@@ -85,6 +85,174 @@ pub fn method_name(m: &str) -> Option<&'static str> {
     }
 }
 
+/// 单 pattern 下某方法的归宿：文件 / 冲突（请求期 500）。
+#[derive(Clone)]
+pub enum Entry {
+    File(PathBuf),
+    Conflict(String),
+}
+
+/// 查表结果四态（handle 据此映射 200/500/405/404）。
+pub enum Lookup {
+    Hit { file: PathBuf, params: HashMap<String, String> },
+    Conflict(String),
+    MethodNotAllowed,
+    NotFound,
+}
+
+/// 启动打印行（method × pattern × file）。
+pub struct RouteRow {
+    pub method: String,
+    pub pattern: String,
+    pub file: PathBuf,
+}
+
+/// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
+/// 405 判定 O(1)（命中 pattern 但方法缺席），“冲突哨兵”即映射里的 Conflict 变体。
+pub struct RouteTable {
+    matcher: matchit::Router<HashMap<String, Entry>>,
+    /// 挂了 .route 的 (file, js 方法名)：dev 兜底不得复活其目录镜像 URL。
+    replaced: std::collections::HashSet<(PathBuf, String)>,
+    rows: Vec<RouteRow>,
+}
+
+const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
+
+impl RouteTable {
+    /// 建表：内省闭包按文件返回 Vec<(方法, .route 或 None)>；返回 (表, 失败/冲突清单)。
+    /// 纯逻辑（依赖倒置：不依赖 JS 运行时），CLI/测试注入真实或假内省。
+    pub fn build(
+        base: &str,
+        root: &Path,
+        ts: bool,
+        introspect: impl Fn(&Path) -> Result<Vec<(String, Option<String>)>, String>,
+    ) -> (Self, Vec<String>) {
+        let b = base.trim_matches('/');
+        let mut failures = Vec::new();
+        let mut t = RouteTable {
+            matcher: matchit::Router::new(),
+            replaced: std::collections::HashSet::new(),
+            rows: Vec::new(),
+        };
+        for file in api_files(root, ts) {
+            let decls = match introspect(&file) {
+                Ok(d) => d,
+                Err(e) => {
+                    failures.push(format!("{}: {e}", file.display()));
+                    continue;
+                }
+            };
+            let rel = file
+                .parent()
+                .and_then(|p| p.strip_prefix(root).ok())
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .replace('\\', "/");
+            let dir_base = if rel.is_empty() { format!("/{b}") } else { format!("/{b}/{rel}") };
+            for (method, route) in decls {
+                if !METHODS.contains(&method.as_str()) {
+                    continue;
+                }
+                let route = route.filter(|r| !r.is_empty()); // "" 视同未挂
+                let pattern = match &route {
+                    None => dir_base.clone(),
+                    Some(r) if r.starts_with('/') => format!("/{b}{r}"), // 根级（base 根下）
+                    Some(r) => format!("{dir_base}/{r}"),                // 相对
+                };
+                if route.is_some() {
+                    t.replaced.insert((file.clone(), method.clone()));
+                }
+                match t.matcher.at_mut(&pattern) {
+                    Ok(m) => {
+                        // pattern 已在树中：合并方法；同 (pattern, method) 二次声明 → 冲突
+                        match m.value.get(&method) {
+                            Some(Entry::File(a)) => {
+                                let msg = format!(
+                                    "route conflict: {method} {pattern} declared in {} and {}",
+                                    a.display(),
+                                    file.display()
+                                );
+                                *m.value.get_mut(&method).unwrap() = Entry::Conflict(msg.clone());
+                                failures.push(msg);
+                            }
+                            _ => {
+                                m.value.insert(method.clone(), Entry::File(file.clone()));
+                                t.rows.push(RouteRow { method, pattern, file: file.clone() });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let mut map = HashMap::new();
+                        map.insert(method.clone(), Entry::File(file.clone()));
+                        match t.matcher.insert(pattern.clone(), map) {
+                            Ok(()) => t.rows
+                                .push(RouteRow { method, pattern, file: file.clone() }),
+                            // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
+                            Err(e) => failures.push(format!(
+                                "invalid route {method} {pattern} from {}: {e}",
+                                file.display()
+                            )),
+                        }
+                    }
+                }
+            }
+        }
+        (t, failures)
+    }
+
+    /// 查表：path 须先经 `normalize`。未映射动词按"路径存在 → 405"契约处理。
+    pub fn lookup(&self, path: &str, verb: &str) -> Lookup {
+        let m = match self.matcher.at(path) {
+            Ok(m) => m,
+            Err(_) => return Lookup::NotFound,
+        };
+        let Some(name) = method_name(verb) else {
+            return Lookup::MethodNotAllowed;
+        };
+        match m.value.get(name) {
+            Some(Entry::File(f)) => {
+                let pairs = m.params.iter().map(|(k, v)| (k.to_string(), v.to_string()));
+                match decode_params(pairs) {
+                    Some(params) => Lookup::Hit { file: f.clone(), params },
+                    None => Lookup::NotFound, // 走私参数 → 404（§6.1-4）
+                }
+            }
+            Some(Entry::Conflict(msg)) => Lookup::Conflict(msg.clone()),
+            None => Lookup::MethodNotAllowed,
+        }
+    }
+
+    /// dev 兜底守卫：该 (file, 方法) 是否已挂 .route（目录镜像被替换）。
+    pub fn is_replaced(&self, file: &Path, js_method: &str) -> bool {
+        self.replaced.contains(&(file.to_path_buf(), js_method.to_string()))
+    }
+
+    pub fn listing(&self) -> &[RouteRow] {
+        &self.rows
+    }
+}
+
+/// root 下全部 api 文件（排序 → 冲突裁决顺序确定）。
+fn api_files(root: &Path, ts: bool) -> Vec<PathBuf> {
+    let ext = if ts { "api.ts" } else { "api.js" };
+    let mut out = Vec::new();
+    walk_files(root, ext, &mut out);
+    out.sort();
+    out
+}
+
+fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk_files(&p, ext, acc);
+        } else if e.file_name().to_string_lossy() == ext {
+            acc.push(p);
+        }
+    }
+}
+
 /// 收集 root 下全部路由相对路径（启动时打印路由表用，UC-8）。
 pub fn route_table(root: &Path, ts: bool) -> Vec<String> {
     let ext = if ts { "api.ts" } else { "api.js" };
@@ -114,8 +282,12 @@ mod tests {
     use super::*;
 
     fn fixture(files: &[&str]) -> std::path::PathBuf {
+        // 计数器唯一化：并行测试下 `{:p}` 指针可被分配器复用，曾致临时目录串台。
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let base = std::env::temp_dir().join(format!(
-            "oj-routes-{}-{:p}", std::process::id(), files as *const _
+            "oj-routes-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -191,5 +363,140 @@ mod tests {
         // catch-all 值：raw 含真实分隔符 → 放行
         let ca = decode_params(vec![("path".into(), "a/b%20c".into())].into_iter());
         assert_eq!(ca.unwrap()["path"], "a/b c");
+    }
+
+    // ----- RouteTable（纯逻辑，假内省闭包） -----
+
+    fn tbl(files: &[&str], decls: &[(&str, &str, &str)]) -> (RouteTable, Vec<String>) {
+        // decls: (文件相对路径, 方法, .route 值；空串 = 未挂)
+        let root = fixture(files);
+        let m: HashMap<String, Vec<(String, Option<String>)>> = decls
+            .iter()
+            .map(|(f, m, r)| {
+                (
+                    f.to_string(),
+                    vec![(
+                        m.to_string(),
+                        if r.is_empty() { None } else { Some(r.to_string()) },
+                    )],
+                )
+            })
+            .collect();
+        RouteTable::build(
+            "/v1/api",
+            &root,
+            true,
+            |p: &Path| {
+                let key = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+                Ok(m.get(&key).cloned().unwrap_or_default())
+            },
+        )
+    }
+
+    #[test]
+    fn table_registers_relative_and_rooted() {
+        let (t, f) = tbl(&["user/account/api.ts"], &[("user/account/api.ts", "get", "")]);
+        assert!(f.is_empty(), "{f:?}");
+        assert!(matches!(t.lookup("/v1/api/user/account", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(t.lookup("/v1/api/user/account", "POST"), Lookup::MethodNotAllowed));
+        assert!(matches!(t.lookup("/v1/api/none", "GET"), Lookup::NotFound));
+        // 根级 api.ts：dir_base = base 本身（无尾斜杠）
+        let (t2, f2) = tbl(&["api.ts"], &[("api.ts", "get", "")]);
+        assert!(f2.is_empty(), "{f2:?}");
+        assert!(matches!(t2.lookup("/v1/api", "GET"), Lookup::Hit { .. }));
+    }
+
+    #[test]
+    fn table_param_extraction_and_route_suffix() {
+        let (t, _) = tbl(&["user/account/api.ts"], &[("user/account/api.ts", "get", "{id}")]);
+        match t.lookup("/v1/api/user/account/42", "GET") {
+            Lookup::Hit { params, .. } => assert_eq!(params["id"], "42"),
+            _ => panic!("expected hit"),
+        }
+        // 挂 .route 后目录镜像不再注册（替换语义）
+        assert!(matches!(t.lookup("/v1/api/user/account", "GET"), Lookup::NotFound));
+        let file = t.listing().iter().find(|r| r.method == "get").unwrap().file.clone();
+        assert!(t.is_replaced(&file, "get"));
+        assert!(!t.is_replaced(&file, "post"));
+    }
+
+    #[test]
+    fn table_rooted_route_ignores_dir() {
+        let (t, _) =
+            tbl(&["legacy/compat/api.ts"], &[("legacy/compat/api.ts", "get", "/v2/user/{id}")]);
+        assert!(matches!(t.lookup("/v1/api/v2/user/42", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(t.lookup("/v1/api/legacy/compat", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_duplicate_is_conflict_500() {
+        let (t, f) = tbl(
+            &["a/api.ts", "b/api.ts"],
+            &[("a/api.ts", "get", "/user/{id}"), ("b/api.ts", "get", "/user/{id}")],
+        );
+        assert!(f.iter().any(|s| s.contains("route conflict")), "{f:?}");
+        assert!(matches!(t.lookup("/v1/api/user/1", "GET"), Lookup::Conflict(_)));
+        // 冲突 pattern 的其它 verb 仍 405 语义
+        assert!(matches!(t.lookup("/v1/api/user/1", "POST"), Lookup::MethodNotAllowed));
+    }
+
+    #[test]
+    fn table_merges_verbs_across_files() {
+        let (t, f) = tbl(
+            &["a/api.ts", "b/api.ts"],
+            &[("a/api.ts", "get", "/x"), ("b/api.ts", "post", "/x")],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        assert!(matches!(t.lookup("/v1/api/x", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(t.lookup("/v1/api/x", "POST"), Lookup::Hit { .. }));
+    }
+
+    #[test]
+    fn table_invalid_pattern_dropped_with_failure() {
+        let (t, f) = tbl(&["a/api.ts"], &[("a/api.ts", "get", "{*p}/tail")]); // catch-all 非末尾
+        assert!(!f.is_empty());
+        assert!(matches!(t.lookup("/v1/api/a", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_catch_all_needs_one_segment() {
+        let (t, _) = tbl(&["file/api.ts"], &[("file/api.ts", "get", "{*path}")]);
+        match t.lookup("/v1/api/file/a/b/c", "GET") {
+            Lookup::Hit { params, .. } => assert_eq!(params["path"], "a/b/c"),
+            _ => panic!("expected hit"),
+        }
+        assert!(matches!(t.lookup("/v1/api/file", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_introspect_failure_skips_file() {
+        let root = fixture(&["bad/api.ts", "good/api.ts"]);
+        let (t, f) = RouteTable::build("/v1/api", &root, true, |p: &Path| {
+            if p.ends_with("bad/api.ts") {
+                Err("syntax error".into())
+            } else {
+                Ok(vec![("get".into(), None)])
+            }
+        });
+        assert_eq!(f.len(), 1);
+        assert!(matches!(t.lookup("/v1/api/good", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(t.lookup("/v1/api/bad", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_unmapped_verb_405_when_path_exists() {
+        let (t, _) = tbl(&["u/api.ts"], &[("u/api.ts", "get", "")]);
+        assert!(matches!(t.lookup("/v1/api/u", "TRACE"), Lookup::MethodNotAllowed));
+        assert!(matches!(t.lookup("/v1/api/none", "TRACE"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_empty_route_string_means_unset() {
+        // .route = "" 视同未挂：目录镜像照常注册
+        let (t, _) = tbl(&["u/api.ts"], &[("u/api.ts", "get", "")]);
+        assert!(matches!(t.lookup("/v1/api/u", "GET"), Lookup::Hit { .. }));
+        let (t2, _) = tbl(&["v/api.ts"], &[("v/api.ts", "get", "  ")]);
+        // 非空但仅空白：作为字面 pattern 注册（不特判，文档写明空串视同未挂）
+        assert!(matches!(t2.lookup("/v1/api/v/  ", "GET"), Lookup::Hit { .. }));
     }
 }
