@@ -91,4 +91,21 @@ mod tests {
         assert!(names.iter().any(|n| n == "user-0.1.0/routes.js"), "{names:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    #[test]
+    fn tgz_bytes_differ_on_content_change() {
+        // 内容变更 → 字节不同（防全 0 / 常数输出的退化）
+        let d = std::env::temp_dir().join(format!("oj-pack-chg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("src/user-0.1.0");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("routes.js"), "export default [];\n").unwrap();
+        let a = d.join("a.tgz");
+        write_tgz(&src, &a, "user-0.1.0").unwrap();
+        std::fs::write(src.join("routes.js"), "export default [1];\n").unwrap();
+        let b = d.join("b.tgz");
+        write_tgz(&src, &b, "user-0.1.0").unwrap();
+        assert_ne!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

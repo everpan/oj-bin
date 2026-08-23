@@ -15,14 +15,15 @@ pub struct BuildArgs {
     pub out: String,
 }
 
-/// 解析结果。None = 无子命令（main 打用法）。
+/// 解析结果。None = 无子命令（main 打用法）；Err = 参数错误（main exit 1）。
 pub enum Command {
     Server(ServerArgs),
     Build(BuildArgs),
+    Err(String),
     None,
 }
 
-/// `oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]` / `oj build [-b base] [-d src] [-o dist]`。
+/// `oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]` / `oj build [module] [-d src] [-o dist]`。
 pub fn parse(args: &[String]) -> Command {
     let mut it = args.iter();
     match it.next().map(|s| s.as_str()) {
@@ -31,7 +32,8 @@ pub fn parse(args: &[String]) -> Command {
             let mut cur = it.clone().peekable();
             while let Some(a) = cur.next() {
                 match a.as_str() {
-                    "-b" => { cur.next(); }
+                    // 已删参数：吞值会让 `-b user` 静默变成全量构建，值得专属报错
+                    "-b" => return Command::Err("oj build no longer takes -b".into()),
                     "-d" | "-o" => {
                         if let Some(v) = cur.next() {
                             match a.as_str() {
@@ -44,6 +46,8 @@ pub fn parse(args: &[String]) -> Command {
                     _ => {
                         if module.is_none() {
                             module = Some(a.clone());
+                        } else {
+                            eprintln!("oj build: ignoring extra module {a:?}");
                         }
                     }
                 }
@@ -119,8 +123,10 @@ mod tests {
         assert_eq!(a.module.as_deref(), Some("user"));
         let Command::Build(a) = parse(&args(&["build", "user", "-d", "s", "-o", "d"])) else { panic!() };
         assert_eq!((a.module.as_deref(), a.dir.as_str(), a.out.as_str()), (Some("user"), "s", "d"));
-        // -b 不再是 build 参数：被忽略（未知 flag 现行为），base 字段已删
-        let Command::Build(a) = parse(&args(&["build", "-b", "/x"])) else { panic!() };
-        assert_eq!(a.module, None);
+        // -b 已删：显式报错（不再吞值静默全量构建）
+        assert!(matches!(parse(&args(&["build", "-b", "/x"])), Command::Err(e) if e.contains("-b")));
+        // 第二个位置参数被丢弃 → eprintln 提示，首个生效
+        let Command::Build(a) = parse(&args(&["build", "user", "other"])) else { panic!() };
+        assert_eq!(a.module.as_deref(), Some("user"));
     }
 }

@@ -32,9 +32,14 @@ pub fn parse_one(path: &Path) -> Result<Manifest, String> {
     serde_yaml::from_str(&text).map_err(|e| format!("parse {path:?}: {e}"))
 }
 
-/// dist/manifests.yaml：模块 → 锁定版本。缺失/类型错/解析错都是 Err。
+/// dist/manifests.yaml：模块 → 锁定版本。缺失 = 空表（首次构建合法）；
+/// 其余读错 / 类型错 / 解析错 = Err（坏锁不得被当空表静默重置）。
 pub fn load_lock(path: &Path) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
     serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -151,8 +156,11 @@ mod tests {
         assert_eq!(load_lock(&p).unwrap()["user"], "0.2.0");
         // 序列化确定性（同输入同字节）
         save_lock(&p, &m).unwrap();
-        assert!(load_lock(&p).is_ok());
-        assert!(load_lock(&d.0.join("none.yaml")).is_err());
+        let b1 = std::fs::read(&p).unwrap();
+        save_lock(&p, &m).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b1);
+        // 缺失 = 空表（首次构建合法）
+        assert!(load_lock(&d.0.join("none.yaml")).unwrap().is_empty());
         // yaml 非 map 类型
         std::fs::write(&p, "- a\n").unwrap();
         assert!(load_lock(&p).is_err());

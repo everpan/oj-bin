@@ -22,5 +22,9 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Err(e) => {
+            eprintln!("oj: {e}");
+            std::process::exit(1);
+        }
     }
 }

@@ -89,9 +89,12 @@ pub async fn start(
     } else {
         // release：manifests.yaml 锁版本 → 逐模块加载 routes.js → 扁平化单次 from_entries（spec §3）。
         let lock = manifest::load_lock(&dir.join("manifests.yaml"))
-            .map_err(|_| format!("release mode: {} not found or invalid — run `oj build` first", dir.join("manifests.yaml").display()))?;
+            .map_err(|e| format!("release mode: {}: {e}", dir.join("manifests.yaml").display()))?;
         if lock.is_empty() {
-            return Err("release mode: dist/manifests.yaml is empty — run `oj build` first".into());
+            return Err(format!(
+                "release mode: {} missing or empty — run `oj build` first",
+                dir.join("manifests.yaml").display()
+            ));
         }
         let reader = routes::bridge_default_reader(make_bridge);
         let mut entries = Vec::new();
@@ -310,6 +313,47 @@ mod tests {
         ]);
         let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
         assert!(e.contains("name"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn release_routes_js_syntax_error_fails_fast() {
+        // routes.js 语法错 → reader 解析失败 → 启动 Err（spec §4）
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: 0.1.0\n"),
+            ("dist/user-0.1.0/manifest.yaml", MANI),
+            ("dist/user-0.1.0/routes.js", "export default [ "),
+        ]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("routes.js"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn release_conflicting_patterns_fail_fast() {
+        // 两模块同 pattern 同 method → from_entries failures → 启动 Err（spec §4）
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: 0.1.0\nother: 0.9.0\n"),
+            ("dist/user-0.1.0/manifest.yaml", MANI),
+            ("dist/user-0.1.0/routes.js",
+             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n"),
+            ("dist/user-0.1.0/item/api-x.js", "export default { get() { json.ok({}); } };\n"),
+            ("dist/other-0.9.0/manifest.yaml", "name: other\ndesc: d\nversion: 0.9.0\n"),
+            ("dist/other-0.9.0/routes.js",
+             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-y.js\" } ];\n"),
+            ("dist/other-0.9.0/item/api-y.js", "export default { get() { json.ok({}); } };\n"),
+        ]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("conflict"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn release_keeps_real_error_from_corrupt_lock() {
+        // M-2：锁解析错保留真实错误（不与缺失混为一句 not found or invalid）
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: [unclosed\n"),
+            ("dist/user-0.1.0/manifest.yaml", MANI),
+        ]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("unclosed") || e.contains("parse"), "{e}");
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         .map_err(|e| format!("src dir '{}': {e}", a.dir))?;
     let out = PathBuf::from(&a.out);
     // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
-    let mut view = crate::manifest::load_lock(&out.join("manifests.yaml")).unwrap_or_default();
+    let mut view = crate::manifest::load_lock(&out.join("manifests.yaml"))?;
     let mut names: Vec<String> = match &a.module {
         Some(m) => {
             crate::manifest::validate_module(m)?;
@@ -37,6 +37,15 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             .collect(),
     };
     names.sort(); // read_dir 顺序不定；构建顺序确定 → 控制台/lock 写入顺序稳定
+    // 计划内 {m}-{v} 不单射（a v1-x 与 a-1 vx 同落一个版本目录，后者清场前者）→ fail-fast
+    let mut vdirs = std::collections::HashSet::new();
+    for m in &names {
+        let Some(v) = view.get(m) else { continue };
+        let vd = format!("{m}-{v}");
+        if !vdirs.insert(vd.clone()) {
+            return Err(format!("version dir collision: {vd}"));
+        }
+    }
     for name in &names {
         build_one(&src, &out, name, &view).await?;
     }
@@ -63,6 +72,7 @@ async fn build_one(
     view: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), String> {
     let mdir = src.join(module);
+    crate::manifest::validate_module(module)?; // 两路径共用的白名单（全量路径同样过）
     let m = crate::manifest::parse_one(&mdir.join("manifest.yaml"))?;
     if m.name != module {
         return Err(format!("manifest name {:?} != module {:?}", m.name, module));
@@ -143,9 +153,9 @@ async fn build_one(
     js.push_str("];\n");
     std::fs::write(vdir.join("routes.js"), js).map_err(|e| format!("write routes.js: {e}"))?;
 
-    // 4. manifests.yaml：读旧（无则空表）→ upsert → 原子写
+    // 4. manifests.yaml：读旧（缺失=空表；坏锁 Err 不静默重置）→ upsert → 原子写
     let lock_path = out.join("manifests.yaml");
-    let mut lock = crate::manifest::load_lock(&lock_path).unwrap_or_default();
+    let mut lock = crate::manifest::load_lock(&lock_path)?;
     lock.insert(module.to_string(), m.version.clone());
     crate::manifest::save_lock(&lock_path, &lock)?;
 
@@ -608,7 +618,7 @@ mod tests {
         std::fs::write(t.join("src/user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n").unwrap();
         std::fs::write(t.join("src/user/_shared/x.ts"), "import { g } from \"../item/api\";\n").unwrap();
         let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
-        assert!(e.contains("api.ts") || e.contains("api"), "{e}");
+        assert!(e.contains("不可被"), "{e}"); // 守卫专属文案（"api" 子串近似恒真）
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -623,6 +633,82 @@ mod tests {
         assert!(t.join("dist/other-0.9.0/routes.js").is_file());
         let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
         assert_eq!(lock.len(), 2, "{lock:?}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 测试辅助：单模块 src（name/version 可注入）。
+    fn one_module(t: &std::path::Path, name: &str, version: &str) {
+        std::fs::create_dir_all(t.join("src").join(name)).unwrap();
+        std::fs::write(
+            t.join("src").join(name).join("manifest.yaml"),
+            format!("name: {name}\ndesc: d\nversion: {version}\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_all_rejects_illegal_module_dir() {
+        // 全量路径的模块名同样是信任边界输入（I-1）：fail-fast 且锁不被污染
+        let t = std::env::temp_dir().join(format!("oj-build-illegal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        one_module(&t, "bad module", "0.1.0");
+        let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
+        assert!(e.contains("illegal module"), "{e}");
+        assert!(!t.join("dist/manifests.yaml").is_file());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_rejects_illegal_version() {
+        let t = std::env::temp_dir().join(format!("oj-build-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        one_module(&t, "user", "0..1");
+        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        assert!(e.contains("illegal version") && e.contains("0..1"), "{e}");
+        assert!(!t.join("dist/manifests.yaml").is_file());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_all_rejects_vdir_collision() {
+        // {m}-{v} 不单射：a v1-x 与 a-1 vx 同落 dist/a-1-x（后者构建清场前者）→ 计划期 Err
+        let t = std::env::temp_dir().join(format!("oj-build-vdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        one_module(&t, "a", "1-x");
+        one_module(&t, "a-1", "x");
+        let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
+        assert!(e.contains("collision") && e.contains("a-1-x"), "{e}");
+        assert!(!t.join("dist/a-1-x").exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn single_build_preserves_other_lock_entries() {
+        let t = std::env::temp_dir().join(format!("oj-build-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("dist")).unwrap();
+        std::fs::write(t.join("dist/manifests.yaml"), "other: 0.9.0\n").unwrap(); // 预置他模块
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
+        assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
+        assert_eq!(lock.get("other").map(String::as_str), Some("0.9.0")); // spec §6：保留
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_errs_on_corrupt_lock() {
+        // 坏锁（非法 YAML）→ Err，不得 unwrap_or_default 当空表静默重置（I-2）
+        let t = std::env::temp_dir().join(format!("oj-build-badlock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("dist")).unwrap();
+        std::fs::write(t.join("dist/manifests.yaml"), "user: [unclosed\n").unwrap();
+        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        assert!(e.contains("manifests.yaml"), "{e}");
+        assert!(std::fs::read_to_string(t.join("dist/manifests.yaml")).unwrap().contains("unclosed"));
         let _ = std::fs::remove_dir_all(&t);
     }
 }
