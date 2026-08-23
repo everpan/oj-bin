@@ -8,6 +8,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use mdm_base_rust::bridge::transpile::transpile_hits;
 use mdm_base_rust::config::Config;
+use oj::args::BuildArgs;
 use oj::server_cmd;
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -146,8 +147,11 @@ async fn uc6_release_mode_dist() {
     let (s, v) = req(addr, "GET", "/v1/api/user/account/?id=1", None).await;
     assert_eq!(s, 200);
     assert_eq!(v["data"][0]["name"], "neo", "{v}");
-    // order/list（跨模块相对导入）：版本目录布局下 build 尚未重写跨模块 specifier，
-    // release 全链路断言待 T8 恢复（同 build_emits 测试尾注）。
+    // order/list（跨模块相对导入 ../../user/_shared/validate）：build 已改写 specifier
+    // 指向 dist/user-0.1.0/，release 全链路命中（spec §2.4）。
+    let (s, v) = req(addr, "GET", "/v1/api/order/list/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"][0]["account_name"], "neo", "{v}");
     let _ = std::fs::remove_dir_all(sample().join(".e2e-dist"));
 }
 
@@ -275,7 +279,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         ),
         ("src/u/list/api.ts", "export default { get() { json.ok({ all: true }); } };\n"),
     ]);
-    let a = oj::args::BuildArgs {
+    let a = BuildArgs {
         module: Some("u".into()),
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
@@ -301,7 +305,56 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap()["u"],
         "0.1.0"
     );
-    // release 全链路（聚合各模块 routes.js 服务）待 T7/T8 恢复断言。
+    // release 全链路：聚合 dist/manifests.yaml 锁定版本服务（spec §3）
+    let (addr, _h) =
+        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/item/3", None).await;
+    assert_eq!(s, 200, "{v}"); // .route 行：{id} 参数 + _shared import 生效
+    assert_eq!(v["data"]["id"], 3, "{v}");
+    assert_eq!(v["data"]["ok"], true, "{v}");
+    let (s, _) = req(addr, "GET", "/v1/api/u/list/", None).await;
+    assert_eq!(s, 200); // 镜像行
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_then_release_serves_end_to_end() {
+    let _g = lock();
+    // 夹具：两个模块（user 0.1.0 带 .route、other 0.9.0 纯镜像）
+    let t = tmp_project(&[
+        ("src/user/manifest.yaml", "name: user\ndesc: d\nversion: 0.1.0\n"),
+        (
+            "src/user/item/api.ts",
+            "function get() { json.ok({ id: Number(http.param(\"id\", 0)) }); }\n\
+             get.route = \"{id}\";\n\
+             export default { get };\n",
+        ),
+        ("src/other/manifest.yaml", "name: other\ndesc: d\nversion: 0.9.0\n"),
+        ("src/other/l/api.ts", "export default { get() { json.ok({ m: 1 }); } };\n"),
+    ]);
+    oj::build_cmd::run(&BuildArgs {
+        module: None,
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+    })
+    .await
+    .unwrap();
+    // manifests.yaml 两键
+    let lock = oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
+    assert_eq!(lock.len(), 2, "{lock:?}");
+    assert_eq!(lock["other"], "0.9.0");
+    let (addr, _h) =
+        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    // /v1/api/user/item/3 命中 .route 行；/v1/api/other/l 命中镜像行
+    let (s, v) = req(addr, "GET", "/v1/api/user/item/3", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["id"], 3, "{v}");
+    let (s, v) = req(addr, "GET", "/v1/api/other/l/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["m"], 1, "{v}");
+    // 表外模块 404
+    let (s, _) = req(addr, "GET", "/v1/api/none", None).await;
+    assert_eq!(s, 404);
     let _ = std::fs::remove_dir_all(&t);
 }
 
