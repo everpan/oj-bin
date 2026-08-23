@@ -2049,8 +2049,11 @@ name = "mdm-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "form_urlencoded",
  "futures-util",
+ "matchit",
  "mdm-base-rust",
+ "percent-encoding",
  "serde_json",
  "tokio",
 ]
