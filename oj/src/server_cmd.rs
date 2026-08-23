@@ -59,10 +59,6 @@ pub async fn start(
             }
         }
     }
-    // manifest 校验 + 路由表打印（UC-8）。
-    for m in manifest::load_modules(&dir)? {
-        println!("module {} v{} — {}", m.name, m.version, m.desc);
-    }
     // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
     let dir = dir.canonicalize().unwrap_or(dir);
     let loader = Arc::new(LoaderShared {
@@ -70,7 +66,7 @@ pub async fn start(
         ts,
     });
     let kv = Arc::new(InMemoryKV::new());
-    // 路由表：dev 启动内省 .route 声明（设计 §2）；release 直载 dist/routes.js（免内省）。
+    // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
     let make_bridge = {
         let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
         move || {
@@ -84,21 +80,50 @@ pub async fn start(
         }
     };
     let (table, failures) = if ts {
+        // manifest 校验 + 路由表打印（UC-8）。release 的版本目录命名 `m-v` 过不了
+        // name==dirname 校验，模块清单改在下方锁循环里打印。
+        for m in manifest::load_modules(&dir)? {
+            println!("module {} v{} — {}", m.name, m.version, m.desc);
+        }
         routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge))
     } else {
-        let routes_js = dir.join("routes.js");
-        if !routes_js.is_file() {
-            return Err(format!(
-                "release mode: {} not found — run `oj build` first",
-                routes_js.display()
-            ));
+        // release：manifests.yaml 锁版本 → 逐模块加载 routes.js → 扁平化单次 from_entries（spec §3）。
+        let lock = manifest::load_lock(&dir.join("manifests.yaml"))
+            .map_err(|_| format!("release mode: {} not found or invalid — run `oj build` first", dir.join("manifests.yaml").display()))?;
+        if lock.is_empty() {
+            return Err("release mode: dist/manifests.yaml is empty — run `oj build` first".into());
         }
-        let v = routes::bridge_default_reader(make_bridge)(&routes_js)
-            .map_err(|e| format!("load {}: {e}", routes_js.display()))?;
-        if !v.is_array() {
-            return Err(format!("{}: expected default export of an array", routes_js.display()));
+        let reader = routes::bridge_default_reader(make_bridge);
+        let mut entries = Vec::new();
+        let b = base.trim_matches('/');
+        for (module, version) in &lock {
+            manifest::validate_module(module).map_err(|e| format!("manifests.yaml: {e}"))?;
+            manifest::validate_version(version).map_err(|e| format!("manifests.yaml: {e}"))?;
+            let mdir = dir.join(format!("{module}-{version}"));
+            let mf = mdir.join("manifest.yaml");
+            if !mf.is_file() {
+                return Err(format!("release mode: {} missing — run `oj build {module}`", mf.display()));
+            }
+            let m = manifest::parse_one(&mf)?;
+            if m.name != *module {
+                return Err(format!("manifest name {:?} != module {module:?} (in {})", m.name, mf.display()));
+            }
+            println!("module {} v{} — {}", m.name, m.version, m.desc);
+            let rjs = mdir.join("routes.js");
+            let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
+            for e in routes::entries_from_value(&v) {
+                entries.push(routes::RouteEntry {
+                    method: e.method,
+                    pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
+                    file: format!("{module}-{version}/{}", e.file),
+                });
+            }
         }
-        routes::RouteTable::from_entries(&dir, &routes::entries_from_value(&v))
+        let (table2, failures2) = routes::RouteTable::from_entries(&dir, &entries);
+        if !failures2.is_empty() {
+            return Err(format!("release routes: {}", failures2.join("; "))); // release fail-fast（spec §4）
+        }
+        (table2, Vec::new())
     };
     for f in &failures {
         eprintln!("error: route: {f}");
@@ -226,6 +251,64 @@ mod tests {
             .await
             .err()
             .unwrap_or_default();
+        assert!(e.contains("name"), "{e}");
+    }
+
+    /// 夹具：手摆 release dist（file 名任意合法即可，不要求真哈希）。
+    fn rel_fixture(files: &[(&str, &str)]) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::Ordering;
+        let t = std::env::temp_dir().join(format!(
+            "oj-sc-rel-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        for (rel, c) in files {
+            let p = t.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, c).unwrap();
+        }
+        t
+    }
+
+    const MANI: &str = "name: user\ndesc: d\nversion: 0.1.0\n";
+
+    #[tokio::test]
+    async fn release_aggregates_modules_via_lock() {
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: 0.1.0\n"),
+            ("dist/user-0.1.0/manifest.yaml", MANI),
+            ("dist/user-0.1.0/routes.js",
+             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n"),
+            ("dist/user-0.1.0/item/api-x.js", "export default { get() { json.ok({ v: 1 }); } };\n"),
+        ]);
+        let mut cfg = Config::default();
+        cfg.server.port = 0; // 随机端口（默认 778 并行测试会撞）
+        let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+        let r = reqwest::get(format!("http://{addr}/v1/api/user/item/7")).await.unwrap();
+        assert_eq!(r.status(), 200); // pattern 无 base → 聚合拼 /v1/api/user/item/{id}
+    }
+
+    #[tokio::test]
+    async fn release_fail_fast_paths() {
+        // a) 无 manifests.yaml
+        let t = rel_fixture(&[("dist/user-0.1.0/manifest.yaml", MANI)]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("manifests.yaml") || e.contains("oj build"), "{e}");
+        // b) 锁指向不存在版本
+        let t = rel_fixture(&[("dist/manifests.yaml", "user: 9.9.9\n"), ("dist/user-0.1.0/manifest.yaml", MANI)]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("9.9.9"), "{e}");
+        // c) version 注入
+        let t = rel_fixture(&[("dist/manifests.yaml", "user: ../../etc\n")]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        assert!(e.contains("version") || e.contains("illegal"), "{e}");
+        // d) manifest name 不符
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: 0.1.0\n"),
+            ("dist/user-0.1.0/manifest.yaml", "name: other\ndesc: d\nversion: 0.1.0\n"),
+        ]);
+        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
         assert!(e.contains("name"), "{e}");
     }
 
