@@ -35,7 +35,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         }
     }
     // 2. 建表（复用 dev 内省：含 .route 行与镜像行）→ 3. routes.js。
-    let (table, failures) = build_table(&a.base, &src).await?;
+    let (table, failures) = build_table("", &src).await?;
     for f in &failures {
         eprintln!("error: route: {f}");
     }

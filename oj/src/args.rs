@@ -8,9 +8,9 @@ pub struct ServerArgs {
     pub dev: bool,
 }
 
-/// `oj build [-b /v1/api] [-d src] [-o dist]`（src → dist，生成 routes.js）。
+/// `oj build [module] [-d src] [-o dist]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
-    pub base: String,
+    pub module: Option<String>,
     pub dir: String,
     pub out: String,
 }
@@ -27,24 +27,28 @@ pub fn parse(args: &[String]) -> Command {
     let mut it = args.iter();
     match it.next().map(|s| s.as_str()) {
         Some("build") => {
-            let (mut base, mut dir, mut out) = (String::new(), String::new(), String::new());
+            let (mut module, mut dir, mut out) = (None, String::new(), String::new());
             let mut cur = it.clone().peekable();
             while let Some(a) = cur.next() {
                 match a.as_str() {
-                    "-b" | "-d" | "-o" => {
+                    "-d" | "-o" => {
                         if let Some(v) = cur.next() {
                             match a.as_str() {
-                                "-b" => base = v.clone(),
                                 "-d" => dir = v.clone(),
                                 _ => out = v.clone(),
                             }
                         }
                     }
-                    _ => {}
+                    s if s.starts_with('-') => {}
+                    _ => {
+                        if module.is_none() {
+                            module = Some(a.clone());
+                        }
+                    }
                 }
             }
             Command::Build(BuildArgs {
-                base: if base.is_empty() { "/v1/api".into() } else { base },
+                module,
                 dir: if dir.is_empty() { "src".into() } else { dir },
                 out: if out.is_empty() { "dist".into() } else { out },
             })
@@ -90,7 +94,7 @@ mod tests {
 
     #[test]
     fn parse_branches() {
-        // 无参 → None；server 默认值（dev=false, dir=dist）；显式覆盖；build 占位。
+        // 无参 → None；server 默认值（dev=false, dir=dist）；显式覆盖。
         assert!(matches!(parse(&args(&[])), Command::None));
         let Command::Server(a) = parse(&args(&["server"])) else { panic!() };
         assert_eq!((a.config.as_str(), a.base.as_str(), a.dir.as_str(), a.dev),
@@ -104,6 +108,18 @@ mod tests {
                    ("config.yaml", "/api", "dist", false));
         let Command::Server(a) = parse(&args(&["server", "--dev", "-d", "x"])) else { panic!() };
         assert!(a.dev && a.dir == "x");
-        assert!(matches!(parse(&args(&["build", "moduleA"])), Command::Build(_)));
+    }
+
+    #[test]
+    fn build_parses_module_positional() {
+        let Command::Build(a) = parse(&args(&["build"])) else { panic!() };
+        assert_eq!((a.module.as_deref(), a.dir.as_str(), a.out.as_str()), (None, "src", "dist"));
+        let Command::Build(a) = parse(&args(&["build", "user"])) else { panic!() };
+        assert_eq!(a.module.as_deref(), Some("user"));
+        let Command::Build(a) = parse(&args(&["build", "user", "-d", "s", "-o", "d"])) else { panic!() };
+        assert_eq!((a.module.as_deref(), a.dir.as_str(), a.out.as_str()), (Some("user"), "s", "d"));
+        // -b 不再是 build 参数：被忽略（未知 flag 现行为），base 字段已删
+        let Command::Build(a) = parse(&args(&["build", "-b", "/x"])) else { panic!() };
+        assert_eq!(a.module, None);
     }
 }
