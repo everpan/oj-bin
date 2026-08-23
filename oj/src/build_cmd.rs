@@ -94,7 +94,9 @@ async fn build_one(src: &Path, out: &Path, module: &str) -> Result<(), String> {
             let js = fix_relative_imports(if *is_api { stripped = strip_route_decls(&js); &stripped } else { &js });
             let name = if *is_api {
                 let n = format!("api-{}.js", crate::pack::hash16(&js));
-                hashed.insert(rel_dir(rel), n.clone());
+                // routes.js 的 file：相对版本目录根（含目录段，正斜杠；根级 api.ts 为裸名）
+                let key = rel_dir(rel);
+                hashed.insert(key.clone(), if key.is_empty() { n.clone() } else { format!("{key}/{n}") });
                 n
             } else {
                 rel.with_extension("js").file_name().unwrap().to_string_lossy().into_owned()
@@ -428,7 +430,7 @@ mod tests {
 
         let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
         assert!(routes.contains("\"user/item/{id}\""), "{routes}"); // pattern 无 base 含模块段
-        assert!(routes.contains(&item_name), "{routes}");           // file = 哈希文件名
+        assert!(routes.contains(&format!("\"item/{item_name}\"")), "{routes}"); // file 含目录段
         assert!(!routes.contains("/v1/api"), "{routes}");
 
         let item_js = std::fs::read_to_string(vd.join("item").join(&item_name)).unwrap();
