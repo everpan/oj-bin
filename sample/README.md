@@ -7,6 +7,6 @@
   cargo run -p oj -- server -c sample/config.yaml -d sample/dist       # release（按锁聚合）
 
 - 路由 = 目录镜像：src/user/profile/detail/api.ts → /v1/api/user/profile/detail/
-- dist/ 为 oj build 产物（api-<hash>.js 内容哈希命名），可再生，勿手改
+- dist/ 为 oj build 产物（保留原名原结构，默认 minify），可再生，勿手改
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由 seed.sql 初始化（幂等），已 gitignore

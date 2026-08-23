@@ -42,8 +42,8 @@ cli/                  # crate: oj（CLI 入口）
 ├── lib.rs            # CLI lib
 ├── args.rs           # 参数解析（server/build/None、build 的 module 位置参数）
 ├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
-├── pack.rs           # hash16（SHA-256 前 16 hex）+ 确定性 tgz 打包
-├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译/哈希改名/routes.js/锁/tgz）
+├── pack.rs           # 确定性 tgz 打包（mtime=0/mode 0644/排序 → 同输入同字节）
+├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/剥 .route/routes.js/锁/tgz）
 └── server_cmd.rs     # server 子命令：start() + config_dir_of() + release 聚合
 ```
 
@@ -163,5 +163,6 @@ HTTP 请求
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
 - Redis 退回内存 KV、db 仅 sqlite、相对 `require()` 不支持——均接受为 v0.1 已知限制。
-- `build` 已于 2026-08-24 实现（按模块版本目录 + 内容哈希 + manifests.yaml 锁 + 确定性
-  tgz + release 聚合），设计见 `docs/superpowers/specs/2026-08-23-oj-build-design.md`。
+- `build` 已于 2026-08-24 实现（按模块版本目录 + 产物保留原名原结构 + 默认 minify +
+  manifests.yaml 锁 + 确定性 tgz + release 聚合），设计见
+  `docs/superpowers/specs/2026-08-23-oj-build-design.md`（顶部有去 hash 修订注记）。
