@@ -5,7 +5,7 @@
 //! Rust 的硬约束：`JsRuntime` !Send → 整条帧循环钉在专用线程的 current_thread runtime 上，
 //! axum 侧只完成 upgrade 后把 socket 整体移交（WebSocket: Send 可跨线程搬）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -35,6 +35,47 @@ pub fn js_route(
         let make = make.clone();
         async move { ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make)) }
     }))
+}
+
+/// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/WS.ts（优先）/WS.js → GET {base}/<dir>/ws；
+/// 根级 WS.ts → {base}/ws；无 WS 文件返回空 Router（merge 无副作用）。
+/// release 下 root=dist，URL 含模块版本段（news-0.1.0/ws）——v0.2 已知限制，见 user-manual。
+pub fn mirror_routes(
+    base: &str,
+    root: &Path,
+    timeout: std::time::Duration,
+    make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
+) -> axum::Router {
+    let make = Arc::new(make_bridge);
+    let base = format!("/{}/", base.trim_matches('/'));
+    let mut seen = std::collections::HashSet::new();
+    let mut router = axum::Router::new();
+    for file in ws_files(root) {
+        let rel = file
+            .parent()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let path = format!("{base}{rel}/ws");
+        if !seen.insert(path.clone()) {
+            continue; // 同目录 WS.ts 与 WS.js 并存：先到者（.ts）胜
+        }
+        let m = make.clone();
+        router = router.merge(js_route(&path, file, timeout, move || m()));
+    }
+    router
+}
+
+/// root 下全部 WS 处理器：WS.ts 全部在前（优先），WS.js 在后；各自排序保证注册序确定。
+fn ws_files(root: &Path) -> Vec<PathBuf> {
+    let mut ts = Vec::new();
+    crate::routes::walk_files(root, "WS.ts", &mut ts);
+    let mut js = Vec::new();
+    crate::routes::walk_files(root, "WS.js", &mut js);
+    ts.sort();
+    js.sort();
+    ts.extend(js);
+    ts
 }
 
 /// upgrade 后的连接处理：整个连接搬到专用 OS 线程（current_thread runtime）。
@@ -95,7 +136,8 @@ async fn frame_loop(
     timeout: std::time::Duration,
     make: Arc<dyn Fn() -> Bridge + Send + Sync>,
 ) {
-    let source = match std::fs::read_to_string(&handler_file) {
+    // 统一转译管线：WS.ts 类型标注可用（.js 原样），mtime 缓存与模块加载共享。
+    let source = match mdm_base_rust::bridge::transpile::cached_transpile(&handler_file) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ws compile {}: {e}", handler_file.display());
@@ -382,6 +424,67 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = c.0.read(&mut buf).await.unwrap();
         assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes: {:x?}", &buf[..n]);
+    }
+
+    /// 生产挂载（与 oj server 装配同构）：<root>/<dir>/WS.ts 目录镜像 → GET {base}/<dir>/ws；
+    /// app().merge(mirror_routes())，WS 工厂与 actor 共享 Bus → HTTP publish 广播到订阅连接。
+    /// WS.ts 经统一转译管线（类型标注可用）。
+    #[tokio::test]
+    async fn mirror_routes_mount_directory_ws() {
+        use crate::actor::JsActor;
+        use mdm_base_rust::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[
+            (
+                "news/api.ts",
+                "function post() { bus.publish(\"news\", { a: 1 }); json.ok({ sent: 1 }); }\n\
+                 export default { post };\n",
+            ),
+            (
+                "news/WS.ts",
+                "const n: number = 1;\nbus.subscribe(\"news\");\njson.ok({ sub: n });\n",
+            ),
+        ]);
+        let bus = Arc::new(Bus::new());
+        let root = t.0.clone();
+        let bus2 = bus.clone();
+        let make = move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                Extras { blob: None, bus: Some(bus2.clone()), ..Default::default() },
+            )
+        };
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                JsActor::pool(1, make.clone()),
+                None,
+                None,
+                crate::Pipeline::default(),
+            )
+            .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
+        )
+        .await;
+
+        let mut c = WsClient::connect(addr, "/v1/api/news/ws").await;
+        c.send_text("hi").await;
+        let env = c.read_text().await;
+        assert!(env.contains("\"sub\":1"), "{env}");
+        // HTTP publish（run_module 生产路径）→ 订阅连接收广播帧
+        raw_http(
+            addr,
+            "POST /v1/api/news HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
+        assert_eq!(v, serde_json::json!({"topic": "news", "data": {"a": 1}}), "{v}");
     }
 
     /// 移植 Go TestWSHandle_Connection_MissingFile：handler 文件缺失不 panic，连接直接关闭。

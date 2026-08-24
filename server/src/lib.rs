@@ -121,7 +121,15 @@ pub async fn serve_with_listener(
     static_root: Option<PathBuf>,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
-    axum::serve(listener, app(base, dir, ts, table, actor, timeout, static_root, pipeline)).await
+    serve_router(listener, app(base, dir, ts, table, actor, timeout, static_root, pipeline)).await
+}
+
+/// 已绑定监听 + 完整 Router 服务（oj server 生产路径：app().merge(ws) 后经此起服务）。
+pub async fn serve_router(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) -> std::io::Result<()> {
+    axum::serve(listener, router).await
 }
 
 async fn handle(

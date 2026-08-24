@@ -284,7 +284,7 @@ fn api_files(root: &Path, ts: bool) -> Vec<PathBuf> {
     out
 }
 
-fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
+pub(crate) fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();

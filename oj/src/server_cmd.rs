@@ -160,7 +160,7 @@ pub async fn start(
         for m in manifest::load_modules(&dir)? {
             println!("module {} v{} — {}", m.name, m.version, m.desc);
         }
-        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge))
+        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge.clone()))
     } else {
         // release：manifests.yaml 锁版本 → 逐模块加载 routes.js → 扁平化单次 from_entries（spec §3）。
         let lock = manifest::load_lock(&dir.join("manifests.yaml"))
@@ -171,7 +171,7 @@ pub async fn start(
                 dir.join("manifests.yaml").display()
             ));
         }
-        let reader = routes::bridge_default_reader(make_bridge);
+        let reader = routes::bridge_default_reader(make_bridge.clone());
         let mut entries = Vec::new();
         let b = base.trim_matches('/');
         for (module, version) in &lock {
@@ -214,19 +214,8 @@ pub async fn start(
     }
     let n = cfg.server.pool_size.max(1) as usize;
     let timeout = config::parse_duration(&cfg.server.timeout).ok();
-    let actor = JsActor::pool(n, {
-        let (dbs, kv, loader, blob, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone(), es.clone(), bus.clone());
-        move || {
-            Bridge::with_dbs_and_loader(
-                dbs.clone(),
-                kv.clone(),
-                SchemaRegistry::new(),
-                false,
-                Some(loader.clone()),
-                Extras { blob: blob.clone(), es: es.clone(), bus: Some(bus.clone()) },
-            )
-        }
-    });
+    // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，Clone 即共享。
+    let actor = JsActor::pool(n, make_bridge.clone());
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     // localhost → 127.0.0.1 解析；阻塞 resolve 仅启动一次，可接受——ponytail。
     let addr = to_socket_addrs_sync(&addr)?;
@@ -247,9 +236,17 @@ pub async fn start(
         max_upload: cfg.server.max_upload_bytes,
         blob: blob.clone(),
     };
+    // WS 目录镜像挂载（<dir>/WS.ts → {base}/<dir>/ws）：帧超时随 server.timeout（缺省 30s）。
+    let ws = mdm_server::ws::mirror_routes(
+        &base,
+        &dir,
+        timeout.unwrap_or(std::time::Duration::from_secs(30)),
+        make_bridge,
+    );
     let h = tokio::spawn(async move {
-        let _ = mdm_server::serve_with_listener(
-            listener, &base, dir, ts, table, actor, timeout, static_root, pipeline,
+        let _ = mdm_server::serve_router(
+            listener,
+            mdm_server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline).merge(ws),
         )
         .await;
     });
