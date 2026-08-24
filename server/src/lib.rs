@@ -29,6 +29,15 @@ pub struct AppState {
     timeout: Option<std::time::Duration>,
     /// 静态站点根（config server.root）；None → 不开静态服务。
     static_root: Option<PathBuf>,
+    /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
+    pipeline: Pipeline,
+}
+
+/// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
+#[derive(Clone, Default)]
+pub struct Pipeline {
+    /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
+    pub tenant_header: Option<String>,
 }
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
@@ -41,6 +50,7 @@ pub fn app(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    pipeline: Pipeline,
 ) -> Router {
     let dir = dir.into();
     Router::new().fallback(any(handle)).with_state(AppState {
@@ -49,6 +59,7 @@ pub fn app(
         actor,
         timeout,
         static_root,
+        pipeline,
     })
 }
 
@@ -63,9 +74,10 @@ pub async fn serve(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    pipeline: Pipeline,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_listener(listener, base, dir, ts, table, actor, timeout, static_root).await
+    serve_with_listener(listener, base, dir, ts, table, actor, timeout, static_root, pipeline).await
 }
 
 /// 已绑定监听上服务（测试/T11：先 bind 端口 0 再读 local_addr）。
@@ -79,8 +91,9 @@ pub async fn serve_with_listener(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    pipeline: Pipeline,
 ) -> std::io::Result<()> {
-    axum::serve(listener, app(base, dir, ts, table, actor, timeout, static_root)).await
+    axum::serve(listener, app(base, dir, ts, table, actor, timeout, static_root, pipeline)).await
 }
 
 async fn handle(
@@ -92,18 +105,34 @@ async fn handle(
 ) -> Response {
     let verb = method.as_str();
     let run = |file: PathBuf, params: HashMap<String, String>| {
-        let req = RequestInfo {
-            method: verb.to_string(),
-            params,
-            query: parse_query(uri.query()),
-            headers: headers
-                .iter()
-                .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
-                .collect(),
-            body: body.to_vec(),
-        };
         let m = crate::routes::method_name(verb).expect("checked by caller").to_string();
+        let query = parse_query(uri.query());
         async move {
+            // 前置管线：租户提取（启用后缺失/空 → 400）。
+            let tenant_id = match st.pipeline.tenant_header.as_deref() {
+                Some(key) => {
+                    let Some(tid) = headers
+                        .get(key)
+                        .and_then(|v| v.to_str().ok())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return fail_response(400, &format!("missing tenant header: {key}"));
+                    };
+                    Some(tid.to_string())
+                }
+                None => None,
+            };
+            let req = RequestInfo {
+                method: verb.to_string(),
+                params,
+                query,
+                headers: headers
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+                    .collect(),
+                body: body.to_vec(),
+                tenant_id,
+            };
             match st.actor.run_module(file, m, req, st.timeout).await {
                 Ok(cap) => capture_response(cap),
                 // 超时熔断 → 408（对齐 Go dev server）。
@@ -277,14 +306,26 @@ pub(crate) mod tests {
         ts: bool,
         timeout: Option<std::time::Duration>,
     ) -> std::net::SocketAddr {
+        spawn_pipeline(base, dir, ts, timeout, Pipeline::default()).await
+    }
+
+    pub(crate) async fn spawn_pipeline(
+        base: &str,
+        dir: PathBuf,
+        ts: bool,
+        timeout: Option<std::time::Duration>,
+        pipeline: Pipeline,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let table = build_table(&dir, ts, base);
         let base = base.to_string();
         tokio::spawn(async move {
-            serve_with_listener(listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout, None)
-                .await
-                .unwrap();
+            serve_with_listener(
+                listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout, None, pipeline,
+            )
+            .await
+            .unwrap();
         });
         addr
     }
@@ -319,6 +360,43 @@ pub(crate) mod tests {
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.unwrap();
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// tenant.enable：header 存在 → 注入 http.tenantId；缺失 → 400；未启用 → null。
+    #[tokio::test]
+    async fn tenant_header_injected_or_400() {
+        let t = routes(&[(
+            "u/f/api.ts",
+            "export default { get() { json.ok({ t: http.tenantId === undefined ? null : http.tenantId }); } };",
+        )]);
+        let addr = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline { tenant_header: Some("X-TENANT-ID".into()) },
+        )
+        .await;
+        let ok = raw_http(
+            addr,
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nX-TENANT-ID: acme\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("\"t\":\"acme\""), "{ok}");
+        let miss = raw_http(
+            addr,
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(miss.starts_with("HTTP/1.1 400") && miss.contains("X-TENANT-ID"), "{miss}");
+        // 未启用 → 无注入也无 400
+        let addr2 = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let plain = raw_http(
+            addr2,
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"), "{plain}");
     }
 
     #[tokio::test]
@@ -521,9 +599,12 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         let (dir, table, site) = (t.0.clone(), build_table(&t.0, true, "/v1/api"), s.0.clone());
         tokio::spawn(async move {
-            serve_with_listener(listener, "/v1/api", dir.clone(), true, table, actor(dir, true), None, Some(site))
-                .await
-                .unwrap();
+            serve_with_listener(
+                listener, "/v1/api", dir.clone(), true, table, actor(dir, true), None, Some(site),
+                Pipeline::default(),
+            )
+            .await
+            .unwrap();
         });
         (addr, (t, s))
     }

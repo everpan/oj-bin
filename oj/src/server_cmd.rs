@@ -199,8 +199,14 @@ pub async fn start(
     };
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind: {e}"))?;
     let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    let pipeline = mdm_server::Pipeline {
+        tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
+    };
     let h = tokio::spawn(async move {
-        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, table, actor, timeout, static_root).await;
+        let _ = mdm_server::serve_with_listener(
+            listener, &base, dir, ts, table, actor, timeout, static_root, pipeline,
+        )
+        .await;
     });
     Ok((bound, h))
 }
