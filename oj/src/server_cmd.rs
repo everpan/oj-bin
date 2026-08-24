@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+    Bridge, DataAccessor, Dialect, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
 };
 use mdm_base_rust::config::{self, Config};
 use mdm_server::actor::JsActor;
@@ -70,22 +70,27 @@ pub async fn start(
     for (name, url) in &cfg.redis {
         eprintln!("warn: redis '{name}' ({url}) configured but served by in-memory KV (v0.1)");
     }
-    // 逐 db 开库：v0.1 仅 sqlite，其余 fail-fast。
+    // 逐 db 开库：sqlite/mysql/postgres 按 DSN 分发，其余 fail-fast。
     let mut dbs: HashMap<String, Arc<dyn DataAccessor>> = HashMap::new();
     for (name, dsn) in &cfg.db {
-        let acc = SqlxAccessor::arc(&resolve_sqlite(dsn, config_dir)?)
+        let acc = SqlxAccessor::arc(&resolve_dsn(dsn, config_dir)?)
             .await
             .map_err(|e| format!("open db '{name}': {e}"))?;
         dbs.insert(name.clone(), acc);
     }
     // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
+    // 仅 sqlite 库重放（分号切分规则 sqlite 专用；mysql/pg 建库归运维）。
     let seed = config_dir.join("seed.sql");
     if seed.is_file() {
-        let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
-        if let Some(db) = dbs.get("default") {
-            for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
+        if dbs.get("default").map(|d| d.dialect()) == Some(Dialect::Sqlite) {
+            let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
+            if let Some(db) = dbs.get("default") {
+                for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
+                }
             }
+        } else {
+            eprintln!("warn: seed.sql skipped (default db is not sqlite)");
         }
     }
     // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
@@ -218,13 +223,17 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("resolve {s}: no addresses"))
 }
 
-/// DSN 归一：非 sqlite 报错；相对路径相对 config_dir；内存库原样。
-fn resolve_sqlite(dsn: &str, config_dir: &Path) -> Result<String, String> {
+/// DSN 归一：sqlite 相对路径相对 config_dir（缺文件建空库）；mysql/postgres 原样透传；
+/// 其余 scheme fail-fast。内存库原样。
+fn resolve_dsn(dsn: &str, config_dir: &Path) -> Result<String, String> {
+    if dsn.starts_with("mysql://") || dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        return Ok(dsn.to_string());
+    }
     let rest = dsn.strip_prefix("sqlite://").or_else(|| {
         if dsn == "sqlite::memory:" { Some("") } else { None }
     });
     let Some(rest) = rest else {
-        return Err(format!("v0.1 supports only sqlite:// DSN (got '{dsn}')"));
+        return Err(format!("unsupported DSN scheme (got '{dsn}')"));
     };
     if rest.is_empty() {
         return Ok("sqlite::memory:".into()); // sqlite://（空）视作内存
@@ -297,14 +306,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_sqlite_dsn_at_startup() {
+    async fn rejects_unknown_dsn_scheme() {
         let mut cfg = Config::default();
-        cfg.db.insert("default".into(), "mysql://u:p@localhost/test".into());
+        cfg.db.insert("default".into(), "oracle://u:p@localhost/test".into());
         let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
             .await
             .err()
             .unwrap_or_default();
-        assert!(e.contains("sqlite"), "{e}");
+        assert!(e.contains("scheme"), "{e}");
+    }
+
+    #[test]
+    fn resolve_dsn_dispatches_by_scheme() {
+        let t = tmpdir("sc-dsn");
+        // sqlite：相对路径归一为 config_dir 下绝对路径
+        let sql = resolve_dsn("sqlite://db.sqlite", &t.0).unwrap();
+        assert!(sql.starts_with("sqlite://"), "{sql}");
+        assert!(sql != "sqlite://db.sqlite", "relative path must be resolved: {sql}");
+        assert!(Path::new(sql.trim_start_matches("sqlite://")).is_absolute(), "{sql}");
+        assert_eq!(resolve_dsn("sqlite::memory:", &t.0).unwrap(), "sqlite::memory:");
+        // mysql/postgres：原样透传
+        for passthrough in ["mysql://u:p@127.0.0.1:3306/app", "postgres://h/app", "postgresql://h/app"] {
+            assert_eq!(resolve_dsn(passthrough, &t.0).unwrap(), passthrough);
+        }
+        // 未知 scheme 拒绝
+        assert!(resolve_dsn("oracle://x", &t.0).is_err());
     }
 
     #[tokio::test]

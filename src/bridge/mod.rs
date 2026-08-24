@@ -37,7 +37,7 @@ mod runtime;
 pub mod transpile;
 mod ws;
 
-pub use db::{DataAccessor, InMemoryAccessor, Row};
+pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use envelope::{fail, ok, status_code};
 pub use http::RequestInfo;
