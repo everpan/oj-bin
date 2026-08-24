@@ -32,6 +32,8 @@ pub struct RequestInfo {
     pub user: Option<Value>,
     /// 上传文件（multipart 解析结果；非 multipart 为空）。
     pub files: Vec<UploadedFile>,
+    /// WS 会话的 bus 发送端（bus.subscribe 注册用；HTTP 请求为 None）。
+    pub bus_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 use std::collections::HashMap;

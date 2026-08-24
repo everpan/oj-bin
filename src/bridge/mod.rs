@@ -24,6 +24,7 @@ mod db;
 mod envelope;
 mod fetch;
 mod accessor_sqlx;
+mod bus;
 pub mod blob;
 mod http;
 mod inspector;
@@ -41,6 +42,7 @@ mod ws;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
+pub use bus::Bus;
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
@@ -68,14 +70,18 @@ pub struct StableState {
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
     pub loader: Option<Arc<module_loader::LoaderShared>>,
-    /// 可选能力扩展（OJ-5 blob / OJ-6 es）：单一扩展点，后续只加字段。
+    /// 可选能力扩展（OJ-5 blob / OJ-6 bus/es）：单一扩展点，后续只加字段。
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
+    /// 订阅发布总线（OJ-6）：server 装配共享一个 Bus 跨连接广播；缺省每 Bridge 自带空 Bus。
+    pub bus: Arc<bus::Bus>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
 #[derive(Default)]
 pub struct Extras {
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
+    /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus。
+    pub bus: Option<Arc<bus::Bus>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -138,6 +144,8 @@ deno_core::extension!(
         blob::op_blob_del,
         blob::op_blob_url,
         blob::op_blob_content_type,
+        bus::op_bus_publish,
+        bus::op_bus_subscribe,
         fetch::op_fetch,
         log::op_log,
         module_loader::op_resolve_cjs,
@@ -237,6 +245,7 @@ impl Bridge {
             registry: Arc::new(registry),
             loader,
             blob: extras.blob,
+            bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -594,7 +603,7 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blob: Some(Arc::new(local)) },
+            Extras { blob: Some(Arc::new(local)), ..Default::default() },
         );
         let cap = b
             .run_with(
@@ -767,6 +776,49 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"], json!({"n": 3, "ok": true, "r": 10}), "{v}");
+    }
+
+    /// bus：WS 上下文订阅（bus_tx 注入）→ 后续发布广播 JSON 帧到订阅方；
+    /// HTTP 上下文订阅 → 抛错（无 WS 连接）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bus_subscribe_publish_and_http_rejects() {
+        let (b, _) = new_bridge();
+        let (bus_tx, mut bus_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // 帧 1：WS 会话订阅（RequestInfo.bus_tx 注入）
+        let o1 = b
+            .run_ws(
+                r#"(async () => { await bus.subscribe("news"); json.ok({ ok: 1 }); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo { bus_tx: Some(bus_tx.clone()), ..Default::default() },
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o1.capture.status, 200);
+        // 帧 2：发布（无 bus_tx 也广播）→ 返回接收方数
+        let o2 = b
+            .run_ws(
+                r#"(async () => { const n = await bus.publish("news", { a: 1 }); json.ok({ n }); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let v2: Value = serde_json::from_slice(&o2.capture.body).unwrap();
+        assert_eq!(v2["data"]["n"], 1, "{v2}");
+        // 订阅方收到 {"topic","data"} JSON 帧
+        let frame = bus_rx.try_recv().unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v, json!({"topic": "news", "data": {"a": 1}}), "{v}");
+        // HTTP 上下文（bus_tx None）订阅 → 报错（msg 含 WebSocket）
+        let cap = b
+            .run_with(
+                r#"(async () => { await bus.subscribe("news"); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("WebSocket"), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -955,6 +1007,7 @@ mod tests {
             registry: Arc::new(SchemaRegistry::new()),
             loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
             blob: None,
+            bus: Arc::new(bus::Bus::new()),
         });
         let pool = runtime::RuntimePool::new(stable, false);
         let mut rt = pool.checkout();

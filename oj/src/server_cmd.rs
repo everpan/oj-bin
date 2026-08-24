@@ -145,7 +145,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blob: blob.clone() },
+                Extras { blob: blob.clone(), ..Default::default() },
             )
         }
     };
@@ -218,7 +218,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blob: blob.clone() },
+                Extras { blob: blob.clone(), ..Default::default() },
             )
         }
     });

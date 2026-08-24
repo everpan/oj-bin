@@ -11,6 +11,8 @@ import {
   op_blob_get,
   op_blob_put,
   op_blob_url,
+  op_bus_publish,
+  op_bus_subscribe,
   op_db_exec,
   op_db_has,
   op_db_query,
@@ -108,6 +110,12 @@ globalThis.blob = {
 globalThis.ws = {
   send: (data) => op_ws_send(String(data)),
   close: () => op_ws_close(),
+};
+
+// ----- bus: publish/subscribe (WS sessions subscribe; any handler publishes broadcast frames) -----
+globalThis.bus = {
+  publish: (topic, data) => op_bus_publish(String(topic), data === undefined ? null : data),
+  subscribe: (topic) => op_bus_subscribe(String(topic)),
 };
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----

@@ -107,6 +107,8 @@ async fn frame_loop(
     };
     let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
+    // bus 会话端：订阅注册用的发送端注入每帧 RequestInfo；收到的广播帧转写回 socket。
+    let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<String>();
     let (mut sink, mut stream) = socket.split();
 
     // Reader：读帧 → msgChan（满则背压至 TCP 层）。
@@ -134,12 +136,24 @@ async fn frame_loop(
         let _ = sink.send(Message::Close(None)).await;
     });
 
+    // Bus forwarder：订阅的广播帧 → 同一写出通道（与 ws.send 天然保序）。
+    // 连接结束由 frame_loop abort 收尾——bus_tx 会滞留 Bus 表，不 abort 则 Writer 永不排空。
+    let forwarder = tokio::spawn({
+        let resp_tx = resp_tx.clone();
+        async move {
+            while let Some(frame) = bus_rx.recv().await {
+                let _ = resp_tx.try_send(frame);
+            }
+        }
+    });
+
     // Processor：串行执行 JS（当前任务），每帧独立 ReqState，超时/出错丢弃该帧继续。
     let bridge = make();
     while let Some(msg) = msg_rx.recv().await {
         let req = RequestInfo {
             method: "WS".into(),
             body: msg,
+            bus_tx: Some(bus_tx.clone()),
             ..Default::default()
         };
         match bridge.run_ws(&source, req, timeout).await {
@@ -158,6 +172,7 @@ async fn frame_loop(
         }
     }
     drop(resp_tx); // Writer 排空后自然退出
+    forwarder.abort(); // 释放 bus_rx 与 resp_tx 克隆，Writer 才能排空退出
     let _ = writer.await;
 }
 
@@ -226,6 +241,80 @@ mod tests {
             Arc::new(InMemoryAccessor::new()),
             Arc::new(InMemoryKV::new()),
         )
+    }
+
+    async fn raw_http(addr: std::net::SocketAddr, req: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// bus 跨会话广播：WS 帧订阅 → HTTP 打 api 路由 publish → WS 客户端收 JSON 帧。
+    /// actor 与 ws make_bridge 共享同一 Bus（Extras.bus）——publish 广播到订阅的 WS 连接。
+    #[tokio::test]
+    async fn ws_bus_subscribe_receives_http_publish() {
+        use crate::actor::JsActor;
+        use mdm_base_rust::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[(
+            "pub/api.ts",
+            "function post() { bus.publish(\"news\", { a: 1 }); json.ok({ sent: 1 }); }\n\
+             export default { post };\n",
+        )]);
+        let handler = t.0.join("WS.js");
+        std::fs::write(&handler, r#"bus.subscribe("news"); json.ok({ sub: 1 });"#).unwrap();
+        let bus = Arc::new(Bus::new());
+        let root = t.0.clone();
+        let bus_actor = bus.clone();
+        let actor = JsActor::pool(1, move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                Extras { blob: None, bus: Some(bus_actor.clone()) },
+            )
+        });
+        let make_bridge = {
+            let root = t.0.clone();
+            let bus = bus.clone();
+            move || {
+                Bridge::with_dbs_and_loader(
+                    HashMap::new(),
+                    Arc::new(InMemoryKV::new()),
+                    SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                    Extras { blob: None, bus: Some(bus.clone()) },
+                )
+            }
+        };
+        let addr = spawn(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), actor, None, None, crate::Pipeline::default()).merge(js_route(
+                "/ws/bus",
+                handler,
+                std::time::Duration::from_secs(1),
+                make_bridge,
+            )),
+        )
+        .await;
+
+        let mut c = WsClient::connect(addr, "/ws/bus").await;
+        c.send_text("subscribe").await;
+        let env = c.read_text().await;
+        assert!(env.contains("\"sub\":1"), "{env}");
+        // HTTP 发布 → 广播到订阅的 WS 连接
+        raw_http(
+            addr,
+            "POST /v1/api/pub HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let frame = c.read_text().await;
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v, serde_json::json!({"topic": "news", "data": {"a": 1}}), "{v}");
     }
 
     #[tokio::test]

@@ -249,6 +249,7 @@ async fn handle(
                 tenant_id,
                 user,
                 files,
+                bus_tx: None,
             };
             match st.actor.run_module(file, m, req, st.timeout).await {
                 Ok(cap) => capture_response(cap),
@@ -528,7 +529,7 @@ pub(crate) mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blob: Some(blob2.clone()) },
+                Extras { blob: Some(blob2.clone()), ..Default::default() },
             )
         });
         let base = base.to_string();
