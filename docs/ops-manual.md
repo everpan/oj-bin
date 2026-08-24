@@ -48,6 +48,9 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
   mysql/pg 的建库/迁移归运维。
 - **Redis** `redis.default`：v0.1 **不真连**，仅 warn 并退回内存 KV——多实例部署时 KV 不共享，
   需业务自行注意（避免把跨实例一致状态塞进 `redis`/`kv`）。
+- **租户** `tenant.enable / tenant.header_key`：启用后所有 `{base}` 请求必须带该 header
+  （缺失/空 → 400），值注入 `http.tenantId` 供 handler 做数据隔离（**框架不自动改写 SQL**，
+  行级过滤归业务）。
 - **seed.sql**：项目根存在则启动时对 `default` 库重放。语句按 `;` 切分 → **seed 内不得有分号
   字面量**；用 `INSERT OR IGNORE` 保证可重复执行。
 
@@ -94,6 +97,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
 | 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
 | `redis` 数据不跨实例 | v0.1 退回内存 KV | 改走 `db` 或外部服务 |
+| 400 `missing tenant header: X-TENANT-ID` | `tenant.enable: true` 且请求未带（或值为空）该 header | 客户端补 header，或关掉 `tenant.enable` |
 | 500 信封 `transaction already active` | 同一请求内嵌套 `db.tx`（每请求仅一个活跃事务） | 合并为一个 `db.tx` 回调，或先完结再开 |
 | 日志 `open transaction on db '…' rolled back at request end` | handler 未等待 `db.tx` 结束（漏 await / 中途 throw）即返回 | 修 handler：`await db.tx(...)`；数据已按未提交丢弃 |
 | 端口占用 | `778` 需 root | 换 ≥1024 端口 |

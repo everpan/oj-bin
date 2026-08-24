@@ -132,6 +132,10 @@ HTTP 请求
 query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）；
 `Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
 
+前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（OJ-3 租户已接入，
+OJ-4 鉴权/OJ-5 上传只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，
+失败走 `fail_response(400/401, …)` 信封。
+
 ## 5. 安全模型
 
 - **project_root 钳制**：所有 import 解析结果必须落在 project root 内（`ensure_within`）。
@@ -162,7 +166,7 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：98 通过（mdm-server 42 + oj lib 41 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：99 通过（mdm-server 43 + oj lib 41 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）

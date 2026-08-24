@@ -247,6 +247,7 @@ axum 放开 pin 后可启用。
 | `http.body` | 请求体（见 §6） |
 | `http.params` | 路径参数对象（`{id: "42"}`，已 percent-decode） |
 | `http.param(name, default)` | 取参数：**路径参数优先**，query 兜底（`http.params[name] ?? http.query[name] ?? default`） |
+| `http.tenantId` | 租户 id（`tenant.enable` 时从 `header_key` 提取注入；未启用为 `null`） |
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
