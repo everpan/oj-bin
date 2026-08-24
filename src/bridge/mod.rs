@@ -43,7 +43,7 @@ pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
-pub use kv::{InMemoryKV, KVStore};
+pub use kv::{InMemoryKV, KVStore, RedisKV};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
 pub use registry::SchemaRegistry;

@@ -166,6 +166,66 @@ pub async fn op_kv_incr(
         .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
+/// 真 Redis 驱动（redis 0.27 ConnectionManager 复用连接；全命令落真 Redis）。
+pub struct RedisKV {
+    conn: redis::aio::ConnectionManager,
+}
+
+impl RedisKV {
+    /// 连接失败/认证失败 → Err（装配 fail-fast；与 InMemoryKV 同接口可替换）。
+    /// 先单次连接探活（ECONNREFUSED 立即失败）——ConnectionManager 内部连不上会无限重试，
+    /// 直接构造会把「redis 宕机」变成启动挂死而非 fail-fast。
+    pub async fn arc(url: &str) -> BridgeResult<Arc<RedisKV>> {
+        let client = redis::Client::open(url).map_err(|e| format!("redis open {url}: {e}"))?;
+        let _probe = client
+            .get_multiplexed_tokio_connection()
+            .await
+            .map_err(|e| format!("redis connect {url}: {e}"))?;
+        let conn = redis::aio::ConnectionManager::new(client)
+            .await
+            .map_err(|e| format!("redis connect {url}: {e}"))?;
+        Ok(Arc::new(Self { conn }))
+    }
+}
+
+#[async_trait]
+impl KVStore for RedisKV {
+    async fn get(&self, key: &str) -> BridgeResult<Option<String>> {
+        use redis::AsyncCommands;
+        let mut c = self.conn.clone();
+        c.get(key).await.map_err(|e| format!("redis get: {e}").into())
+    }
+
+    async fn set(&self, key: &str, value: &str) -> BridgeResult<()> {
+        use redis::AsyncCommands;
+        let mut c = self.conn.clone();
+        let _: () = c
+            .set(key, value)
+            .await
+            .map_err(|e| -> String { format!("redis set: {e}") })?;
+        Ok(())
+    }
+
+    async fn del(&self, key: &str) -> BridgeResult<()> {
+        use redis::AsyncCommands;
+        let mut c = self.conn.clone();
+        let _: i64 = c.del(key).await.map_err(|e| -> String { format!("redis del: {e}") })?;
+        Ok(())
+    }
+
+    async fn expire(&self, key: &str, ttl: std::time::Duration) -> BridgeResult<bool> {
+        use redis::AsyncCommands;
+        let mut c = self.conn.clone();
+        c.expire(key, ttl.as_secs() as i64).await.map_err(|e| format!("redis expire: {e}").into())
+    }
+
+    async fn incr(&self, key: &str) -> BridgeResult<i64> {
+        use redis::AsyncCommands;
+        let mut c = self.conn.clone();
+        c.incr(key, 1).await.map_err(|e| format!("redis incr: {e}").into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +254,32 @@ mod tests {
         kv.set("t", "v2").await.unwrap();
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(kv.get("t").await.unwrap().as_deref(), Some("v2"));
+    }
+
+    /// 连接拒绝 → Err（装配 fail-fast 路径；端口 1 无监听）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn redis_connect_refused_errors() {
+        assert!(RedisKV::arc("redis://127.0.0.1:1/").await.is_err());
+    }
+
+    /// 真 Redis roundtrip：env `OJ_TEST_REDIS` 给 DSN（如 redis://127.0.0.1:6379/1）。
+    /// 未设置 → 跳过。
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn redis_roundtrip() {
+        let Ok(url) = std::env::var("OJ_TEST_REDIS") else {
+            eprintln!("skip: OJ_TEST_REDIS unset");
+            return;
+        };
+        let kv = RedisKV::arc(&url).await.unwrap();
+        let k = format!("oj-test/{}", std::process::id());
+        kv.set(&k, "v").await.unwrap();
+        assert_eq!(kv.get(&k).await.unwrap().as_deref(), Some("v"));
+        assert!(kv.incr(&k).await.is_err()); // INCR 于非数字值 → Err
+        kv.set(&k, "1").await.unwrap();
+        assert_eq!(kv.incr(&k).await.unwrap(), 2);
+        assert!(kv.expire(&k, Duration::from_secs(10)).await.unwrap());
+        kv.del(&k).await.unwrap();
+        assert_eq!(kv.get(&k).await.unwrap(), None);
     }
 }

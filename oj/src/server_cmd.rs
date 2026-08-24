@@ -67,8 +67,15 @@ pub async fn start(
     base: String,
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
-    for (name, url) in &cfg.redis {
-        eprintln!("warn: redis '{name}' ({url}) configured but served by in-memory KV (v0.1)");
+    // KV：redis.default 存在 → 真连（单例 fail-fast）；否则内存 KV。其余 redis key warn 忽略。
+    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = match cfg.redis.get("default") {
+        Some(url) => mdm_base_rust::bridge::RedisKV::arc(url)
+            .await
+            .map_err(|e| format!("redis 'default': {e}"))?,
+        None => Arc::new(InMemoryKV::new()),
+    };
+    for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
+        eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
     }
     // 逐 db 开库：sqlite/mysql/postgres 按 DSN 分发，其余 fail-fast。
     let mut dbs: HashMap<String, Arc<dyn DataAccessor>> = HashMap::new();
@@ -99,9 +106,8 @@ pub async fn start(
         project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
         ts,
     });
-    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = Arc::new(InMemoryKV::new());
     // 鉴权（OJ-4）：auth 块存在即启用；secret 空 fail-fast；session 与 bridge 共用同一 KV
-    // （Phase 6 换 RedisKV 时单点替换）。login 查 default 库。
+    // （redis.default 真连时即共享 Redis 会话）。login 查 default 库。
     let auth = match &cfg.auth {
         Some(a) if a.jwt_secret.trim().is_empty() => {
             return Err("auth.jwt_secret must not be empty".into())
