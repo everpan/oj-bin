@@ -40,6 +40,17 @@ pub fn dialect_of(dsn: &str) -> Dialect {
     }
 }
 
+/// 活跃事务会话（`DataAccessor::begin` 产出的运行期事务句柄）。
+/// commit/rollback 取 `&self`（内部 take，二次调用报 "tx finished"）——
+/// 会话存于 per-request 状态并被 `tokio::sync::Mutex` 串行化，不能按值交出。
+#[async_trait]
+pub trait TxSession: Send {
+    async fn query(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Row>>;
+    async fn exec(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
+    async fn commit(&self) -> BridgeResult<()>;
+    async fn rollback(&self) -> BridgeResult<()>;
+}
+
 /// 数据访问统一契约（接口隔离 + 依赖倒置）。
 /// M0 用内存 fake；后续 sqlx 以同接口接入（`query_with_params` 参数化），handler 无需改动。
 #[async_trait]
@@ -47,6 +58,12 @@ pub trait DataAccessor: Send + Sync {
     /// 库方言（构造器选 builder 用；默认 sqlite，fake/未知驱动走默认）。
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
+    }
+
+    /// 开启事务（不支持事务的 accessor 走默认 Err）。
+    async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
+        let _: &Self = self;
+        Err("transactions not supported by this accessor".into())
     }
 
     /// 无参查询（便捷形式）。
@@ -63,10 +80,11 @@ pub trait DataAccessor: Send + Sync {
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
 }
 
-/// DataAccessor 的内存实现（fake）。接口与未来 sqlx 实现一致（Liskov 可替换）。
+/// DataAccessor 的内存实现（fake）。接口与 sqlx 实现一致（Liskov 可替换）。
+/// inner 用 Arc 共享：begin() 派生的假事务与其读写同一存储。
 #[derive(Default)]
 pub struct InMemoryAccessor {
-    inner: RwLock<Inner>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 #[derive(Default)]
@@ -93,6 +111,10 @@ impl InMemoryAccessor {
 
 #[async_trait]
 impl DataAccessor for InMemoryAccessor {
+    async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
+        Ok(Box::new(InMemoryTx { inner: self.inner.clone() }))
+    }
+
     async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
         let g = self.inner.read().unwrap();
         if let Some(e) = &g.err {
@@ -107,6 +129,38 @@ impl DataAccessor for InMemoryAccessor {
             return Err(e.clone().into());
         }
         Ok(g.rows.len() as i64)
+    }
+}
+
+/// 内存假事务：与父 accessor 读写同一 inner；commit/rollback no-op。
+struct InMemoryTx {
+    inner: Arc<RwLock<Inner>>,
+}
+
+#[async_trait]
+impl TxSession for InMemoryTx {
+    async fn query(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
+        let g = self.inner.read().unwrap();
+        if let Some(e) = &g.err {
+            return Err(e.clone().into());
+        }
+        Ok(g.rows.clone())
+    }
+
+    async fn exec(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+        let g = self.inner.read().unwrap();
+        if let Some(e) = &g.err {
+            return Err(e.clone().into());
+        }
+        Ok(g.rows.len() as i64)
+    }
+
+    async fn commit(&self) -> BridgeResult<()> {
+        Ok(())
+    }
+
+    async fn rollback(&self) -> BridgeResult<()> {
+        Ok(())
     }
 }
 

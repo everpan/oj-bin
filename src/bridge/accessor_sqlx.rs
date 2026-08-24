@@ -108,10 +108,80 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
     None
 }
 
+/// sqlx 事务会话：`Pool::begin` 产 `Transaction<'static, Any>`；Mutex 串行并发 op，
+/// Option 被 take 后（已完结）再调用报 "tx finished"。
+struct SqlxTx {
+    tx: tokio::sync::Mutex<Option<sqlx::Transaction<'static, Any>>>,
+}
+
+#[async_trait]
+impl super::db::TxSession for SqlxTx {
+    async fn query(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
+        let mut g = self.tx.lock().await;
+        let Some(tx) = g.as_mut() else {
+            return Err("tx finished".into());
+        };
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for p in params {
+            q = bind_value(q, p);
+        }
+        let rows = q
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|e| format!("sqlx tx query: {e}"))?;
+        Ok(rows.iter().map(row_to_json).collect())
+    }
+
+    async fn exec(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
+        let mut g = self.tx.lock().await;
+        let Some(tx) = g.as_mut() else {
+            return Err("tx finished".into());
+        };
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for p in params {
+            q = bind_value(q, p);
+        }
+        let res = q
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| format!("sqlx tx exec: {e}"))?;
+        Ok(res.rows_affected() as i64)
+    }
+
+    async fn commit(&self) -> BridgeResult<()> {
+        let Some(tx) = self.tx.lock().await.take() else {
+            return Err("tx finished".into());
+        };
+        tx.commit()
+            .await
+            .map_err(|e| format!("sqlx tx commit: {e}"))?;
+        Ok(())
+    }
+
+    async fn rollback(&self) -> BridgeResult<()> {
+        let Some(tx) = self.tx.lock().await.take() else {
+            return Err("tx finished".into());
+        };
+        tx.rollback()
+            .await
+            .map_err(|e| format!("sqlx tx rollback: {e}"))?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl DataAccessor for SqlxAccessor {
     fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    async fn begin(&self) -> BridgeResult<Box<dyn super::db::TxSession>> {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("sqlx tx begin: {e}"))?;
+        Ok(Box::new(SqlxTx { tx: tokio::sync::Mutex::new(Some(tx)) }))
     }
 
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
@@ -150,6 +220,34 @@ mod tests {
     fn _assert_impl() {
         fn takes<T: DataAccessor>() {}
         takes::<SqlxAccessor>();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_commit_and_rollback_roundtrip() {
+        let db = SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .expect("connect");
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        // commit 路径
+        let tx = db.begin().await.unwrap();
+        tx.exec("insert into t (v) values (?)", &[json!("a")]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            db.query_with_params("select count(*) c from t", &[]).await.unwrap()[0]["c"],
+            json!(1)
+        );
+        // rollback 路径
+        let tx = db.begin().await.unwrap();
+        tx.exec("insert into t (v) values (?)", &[json!("b")]).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            db.query_with_params("select count(*) c from t", &[]).await.unwrap()[0]["c"],
+            json!(1)
+        );
+        // 已完结的 tx 再用 → 错误（"tx finished"）
+        assert!(tx.exec("select 1", &[]).await.is_err());
     }
 
     #[test]
