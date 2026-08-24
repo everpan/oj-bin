@@ -7,6 +7,10 @@
 // Not ported yet: ws, Redis(name), XORM(name).
 
 import {
+  op_blob_del,
+  op_blob_get,
+  op_blob_put,
+  op_blob_url,
   op_db_exec,
   op_db_has,
   op_db_query,
@@ -80,6 +84,14 @@ globalThis.kv = {
   get: (key) => op_kv_get(String(key)),
   set: (key, value) => op_kv_set(String(key), String(value)),
   del: (key) => op_kv_del(String(key)),
+};
+
+// ----- blob: object storage (put/get/del/url; contentType via http blob route) -----
+globalThis.blob = {
+  put: (key, bytes, ct) => op_blob_put(String(key), bytes, ct === undefined ? null : String(ct)),
+  get: (key) => op_blob_get(String(key)),
+  del: (key) => op_blob_del(String(key)),
+  url: (key) => op_blob_url(String(key)),
 };
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----

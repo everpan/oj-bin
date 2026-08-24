@@ -331,7 +331,7 @@ fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{Bridge, InMemoryKV, LoaderShared, SchemaRegistry};
+    use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -367,6 +367,7 @@ pub(crate) mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts })),
+                Extras::default(),
             )
         })
     }
@@ -414,6 +415,7 @@ pub(crate) mod tests {
                     SchemaRegistry::new(),
                     false,
                     Some(Arc::new(LoaderShared { project_root: root.clone(), ts })),
+                    Extras::default(),
                 )
             }
         };

@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mdm_base_rust::bridge::{transpile, Bridge, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor};
+use mdm_base_rust::bridge::{
+    transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+};
 use mdm_server::routes;
 
 use crate::args::BuildArgs;
@@ -198,6 +200,7 @@ async fn introspect_module_files(
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                Extras::default(),
             )
         }
     };

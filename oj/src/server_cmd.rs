@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, Dialect, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+    Bridge, DataAccessor, Dialect, Extras, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
 };
 use mdm_base_rust::config::{self, Config};
 use mdm_server::actor::JsActor;
@@ -122,6 +122,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
+                Extras::default(),
             )
         }
     };
@@ -194,6 +195,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
+                Extras::default(),
             )
         }
     });

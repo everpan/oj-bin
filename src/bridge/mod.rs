@@ -24,6 +24,7 @@ mod db;
 mod envelope;
 mod fetch;
 mod accessor_sqlx;
+pub mod blob;
 mod http;
 mod inspector;
 mod json;
@@ -39,6 +40,7 @@ mod ws;
 
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
+pub use blob::{BlobBackend, LocalBlob, valid_key};
 pub use envelope::{fail, ok, status_code};
 pub use http::RequestInfo;
 pub use kv::{InMemoryKV, KVStore};
@@ -66,6 +68,14 @@ pub struct StableState {
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
     pub loader: Option<Arc<module_loader::LoaderShared>>,
+    /// 可选能力扩展（OJ-5 blob / OJ-6 es）：单一扩展点，后续只加字段。
+    pub blob: Option<Arc<dyn blob::BlobBackend>>,
+}
+
+/// bridge 可选能力注入（构造期一次）。
+#[derive(Default)]
+pub struct Extras {
+    pub blob: Option<Arc<dyn blob::BlobBackend>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -120,6 +130,11 @@ deno_core::extension!(
         db::op_db_tx_commit,
         db::op_db_tx_rollback,
         query::op_db_query_build,
+        blob::op_blob_put,
+        blob::op_blob_get,
+        blob::op_blob_del,
+        blob::op_blob_url,
+        blob::op_blob_content_type,
         fetch::op_fetch,
         log::op_log,
         module_loader::op_resolve_cjs,
@@ -190,16 +205,18 @@ impl Bridge {
         registry: SchemaRegistry,
         inspect: bool,
     ) -> Self {
-        Self::with_dbs_and_loader(dbs, kv, registry, inspect, None)
+        Self::with_dbs_and_loader(dbs, kv, registry, inspect, None, Extras::default())
     }
 
     /// 全量命名 DB + 模块加载器构造（oj server 专用路径，T10/T11 装配消费）。
+    /// extras：可选能力（blob/es）单一扩展点。
     pub fn with_dbs_and_loader(
         mut dbs: HashMap<String, Arc<dyn DataAccessor>>,
         kv: Arc<dyn KVStore>,
         registry: SchemaRegistry,
         inspect: bool,
         loader: Option<Arc<module_loader::LoaderShared>>,
+        extras: Extras,
     ) -> Self {
         // 防御：无 "default" 键时取任一实例补位（对齐 Go buildServer；JS 侧 db = DB("default")）。
         if !dbs.contains_key("default") {
@@ -216,6 +233,7 @@ impl Bridge {
                 .unwrap_or_default(),
             registry: Arc::new(registry),
             loader,
+            blob: extras.blob,
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -548,6 +566,52 @@ mod tests {
         assert_eq!(v["data"]["t"], "t-9");
     }
 
+    /// blob 未配置（Extras 缺省）：JS 侧 blob.* 报 "blob not configured"。
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_not_configured_errors() {
+        let (b, _) = new_bridge();
+        let e = b
+            .run_with(
+                r#"blob.put("a/b.png", new Uint8Array([1]));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("blob not configured"), "{e}");
+    }
+
+    /// blob 经 Extras 注入：JS put/get/url 走 LocalBlob。
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_roundtrip_via_extras() {
+        let dir = std::env::temp_dir().join(format!("oj-blobjs-{}", std::process::id()));
+        let local = blob::LocalBlob::new(&dir, "/v1/api").unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras { blob: Some(Arc::new(local)) },
+        );
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    await blob.put("js/a.png", new Uint8Array([1, 2, 3]), "image/png");
+                    const got = await blob.get("js/a.png");
+                    await blob.del("js/none");
+                    json.ok({ n: got.length, url: await blob.url("js/a.png") });
+                })();
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 3);
+        assert_eq!(v["data"]["url"], "/v1/api/blob/js/a.png");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn globals_injected_and_json_ok() {
         let (b, _) = new_bridge();
@@ -823,6 +887,7 @@ mod tests {
             client: Default::default(),
             registry: Arc::new(SchemaRegistry::new()),
             loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
+            blob: None,
         });
         let pool = runtime::RuntimePool::new(stable, false);
         let mut rt = pool.checkout();
@@ -865,6 +930,7 @@ mod tests {
             SchemaRegistry::new(),
             false,
             Some(Arc::new(LoaderShared { project_root: root.to_path_buf(), ts: true })),
+            Extras::default(),
         )
     }
 
