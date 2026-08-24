@@ -40,7 +40,7 @@ mod ws;
 
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
-pub use blob::{BlobBackend, LocalBlob, valid_key};
+pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};

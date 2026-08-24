@@ -117,11 +117,19 @@ HTTP 请求
 - `ensure_within`：两侧都 `canonicalize` 后做前缀判断，拒绝逃逸；macOS `/var` vs `/private/var`
   的符号链接差异已处理。
 
-### 4.2 http.rs / envelope.rs — 请求与响应
+### 4.2 http.rs / envelope.rs / blob.rs — 请求与响应与对象存储
 
-- `RequestInfo { method, params, query, headers, body: Vec<u8> }`（`params` 在目录镜像路由下恒空）。
+- `RequestInfo { method, params, query, headers, body, tenant_id, user, files }`（`params` 在目录
+  镜像路由下恒空）。multipart 时 `files: Vec<UploadedFile{field,filename,content_type,bytes}>`，
+  文本字段并入 `body`（`{name: value}`）；`op_http_file` 按索引取字节（async + `#[buffer]` 返回，
+  sync buffer-return 在 fast-call 路径会卡死）。
 - `export_bytes`：空 body → `Value::Null`；可 JSON 解析 → 解析后的 `Value`；否则 UTF-8 字符串。
 - 信封 `{code,msg,data}`：`code<=0` → 500；HTTP 状态 = `code`（`code>0`）。
+- `blob.rs`：`BlobBackend` 统一契约（put/get/del/url/content_type/serve），local/s3 双驱动可替换。
+  local 用 object_store `LocalFileSystem` + `<key>.ct` sidecar 持久化 Content-Type；s3 用
+  `AmazonS3`（具体类型才能拿 `Signer` presign）+ GET 15min → `serve` 返回 302。`valid_key`
+  逐段白名单（`.`/`..`/`\`/NUL/空段拒绝）；下载路由 `decode_blob_key` 先 percent-decode 再校验。
+  `Extras.blob` 是 bridge 单一扩展点（构造期注入，`StableState` 内不可变 Arc）。
 
 ### 4.3 bootstrap.js — JS SDK globals
 
@@ -133,11 +141,14 @@ HTTP 请求
 query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）；
 `Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
 
-前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（OJ-3 租户/OJ-4 鉴权已接入，
-OJ-5 上传只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，
+前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（OJ-3 租户/OJ-4 鉴权/OJ-5
+blob 已接入，后续只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，
 失败走 `fail_response(400/401, …)` 信封。鉴权另含内置路由（handle() 顶部
 `{base}/auth/*` 先于路由表）与 `auth.rs`（Claims 签验、session 存 KV 键
-`AUTH-SESSION:sha256(refresh_token)`，Phase 6 换 RedisKV 时单点替换）。
+`AUTH-SESSION:sha256(refresh_token)`，Phase 6 换 RedisKV 时单点替换）。blob 下载路由同样
+内置（`{base}/blob/{key}` GET，auth 内置路由之后、路由表 lookup 之前，公开免鉴权）——
+local 直出字节 + Content-Type，s3 302 presign。`max_upload` 双闸：axum `DefaultBodyLimit::max(2x)`
+兜 2x 外裸 413，handle() 内 `body.len() > max_upload` 出信封 413。
 
 角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的——路由级
 RBAC 等真需求出现再议（YAGNI）。
@@ -172,7 +183,7 @@ RBAC 等真需求出现再议（YAGNI）。
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：104 通过（mdm-server 47 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：106 通过（mdm-server 49 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）

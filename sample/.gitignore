@@ -2,3 +2,4 @@ db.sqlite
 db.sqlite-*
 .e2e-dist
 *_test.sqlite
+uploads/

@@ -56,6 +56,13 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
   是常规组合——access 无服务端吊销，只能等它过期；refresh 可经 logout 主动失效。
 - **seed.sql**：项目根存在则启动时对 `default` 库重放。语句按 `;` 切分 → **seed 内不得有分号
   字面量**；用 `INSERT OR IGNORE` 保证可重复执行。
+- **blob** `blob.*`：块存在即启用（`blob.put/get/del/url` + `{base}/blob/{key}` 下载路由）。
+  - `driver: local`：`root` 相对 config **所在目录**绝对化（缺目录自动建）。进程需写权限
+    （上传失败打 `blob put:` 错误）。下载路由公开免鉴权——**不要把需鉴权的对象塞进去**。
+  - `driver: s3`：`bucket`/`region` **必填**（缺失启动 fail-fast）；`endpoint`/`access_key`/
+    `secret_key` 可选。MinIO/自建 S3 用 `path_style: true`（默认 virtual-hosted 风格，
+    自建对象存储通常不支持）。`blob.url()` 走 GET presign 15min；下载路由 302 跳转。
+    生产密钥经环境/密钥管理注入，勿硬编码进 config.yaml。
 
 ## 4. 热重载语义
 
@@ -108,6 +115,11 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 日志 `open transaction on db '…' rolled back at request end` | handler 未等待 `db.tx` 结束（漏 await / 中途 throw）即返回 | 修 handler：`await db.tx(...)`；数据已按未提交丢弃 |
 | 端口占用 | `778` 需 root | 换 ≥1024 端口 |
 | 改 `api.ts` 不生效 | release 下 `dist/` 未更新 / 已加载包缓存 | 确认 dist 同步；必要时重启 |
+| 启动报 `blob.driver must be local\|s3` | config `blob.driver` 值非法 | 改成 local 或 s3 |
+| 启动报 `blob s3: bucket required` / `region required` | s3 驱动缺 `bucket`/`region`（fail-fast） | 补全；endpoint/密钥可省 |
+| 上传/下载 500 `blob put:/get:` | local 根不可写 / s3 连接失败 / 对象不存在 | 查根目录权限与磁盘；s3 核对 DSN、网络、MinIO 是否 path_style |
+| `GET {base}/blob/x` 404 | 对象不存在，或 key 含非法段（`.`/`..`/`\`/NUL/空，含编码走私 `%2e%2e`） | 核对 key 与编码；下载路由免鉴权，公开对象才放这里 |
+| `blob not configured` 报错 | JS 调 `blob.*` 但 config 无 `blob:` 段 | 加配置；该 op 仅在启用时可用 |
 
 ## 8. 回滚与恢复
 

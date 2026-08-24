@@ -13,6 +13,18 @@ db:
 redis:
   default: "redis://127.0.0.1:6379/1"   # v0.1: warn + 内存 KV 模拟
 
+blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/blob/{key} 下载路由
+  driver: "local"   # local | s3（s3: endpoint/bucket/region/access_key/secret_key 必配 bucket/region）
+  root: "uploads"   # local 专用：存储根（相对本文件目录绝对化；需写权限）
+  # s3 示例（MinIO path_style 需 true）：
+  # driver: "s3"
+  # endpoint: "http://127.0.0.1:9000"
+  # bucket: "oj-blobs"
+  # region: "us-east-1"
+  # access_key: "minioadmin"
+  # secret_key: "minioadmin"
+  # path_style: true
+
 tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
   enable: true
   header_key: "X-TENANT-ID"

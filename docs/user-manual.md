@@ -249,6 +249,13 @@ axum 放开 pin 后可启用。
 | `http.param(name, default)` | 取参数：**路径参数优先**，query 兜底（`http.params[name] ?? http.query[name] ?? default`） |
 | `http.tenantId` | 租户 id（`tenant.enable` 时从 `header_key` 提取注入；未启用为 `null`） |
 | `http.user` | 已验签用户 `{id, roles, claims}`（auth 启用且通过 Bearer 守卫；否则 `null`） |
+| `http.files` | 上传文件元信息数组 `[{field, filename, content_type, size}]`（multipart；非 multipart 为空） |
+| `http.file(i)` | 第 i 个上传文件的字节（`Uint8Array`；越界 Err `no such file`） |
+| `blob.put(key, bytes, contentType?)` | 写对象 → Promise（local 落盘 / s3 上传） |
+| `blob.get(key)` | 读对象 → Promise<Uint8Array>（不存在 Err） |
+| `blob.del(key)` | 删对象（幂等：不存在视为成功） |
+| `blob.url(key)` | 下载地址：local = `{base}/blob/{key}`；s3 = presigned URL（15min） |
+| `blob.contentType(key)` | 对象 Content-Type（local 读 sidecar / 按扩展名推断；s3 = null） |
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
@@ -302,6 +309,32 @@ await db.tx(async (tx) => {
 
 完整演示见 `sample/src/auth_demo/`（demo/demo1234）。
 
+### 文件上传与 blob（上传 + 对象存储）
+
+`config.yaml` `blob:` 段存在即启用（`blob.put/get/del/url/contentType` 可用，未配置调用报错）。
+
+**multipart 上传**：请求 `Content-Type: multipart/form-data` 时，`http.body` = 文本字段对象
+（`{name: value}`），文件进 `http.files`（`field`/`filename`/`content_type`/`size`），字节经
+`await http.file(i)` 取：
+
+```js
+export default {
+  async post() {
+    const f = http.files[0];
+    if (!f) json.fail(400, "need a file field");
+    const b = await http.file(0);
+    await blob.put(f.filename, b, f.content_type);
+    json.ok({ url: await blob.url(f.filename) });
+  },
+};
+```
+
+**下载路由**：`GET {base}/blob/{key}` 公开下载（免鉴权、不落业务表）。local 驱动直出字节 +
+Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法（`.`/`..`/`\`/NUL/空，
+含 `%2e%2e` 等编码走私）→ 404。
+
+完整演示见 `sample/src/upload/`（curl 跑法见该模块 README）。
+
 路径参数已解码（可含 `/`、`..` 字面）——仅用于参数化查询与类型转换，**勿拼接文件路径/URL**；
 单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码
 （`+`→空格、`%XX` 解码；旧版不解码，迁移注意）。
@@ -319,6 +352,8 @@ await db.tx(async (tx) => {
 | 路由冲突（同 pattern 同方法双声明） | 500 | `{"code":500,"msg":"route conflict: GET /v1/api/user/{id} declared in a/api.ts and b/api.ts","data":null}` |
 | TS 编译错误 / 模块解析失败 | 500 | `{"code":500,"msg":"…/api.ts: 语法错误…","data":null}` |
 | handler 死循环 / 超时 | 408 | `{"code":408,"msg":"handler execution timed out","data":null}` |
+| 上传超 `max_upload_bytes` | 413 | `{"code":413,"msg":"upload too large","data":null}` |
+| blob 不存在 | 404 | `{"code":404,"msg":"blob not found","data":null}` |
 
 业务层自定义错误用 `json.fail(400, "…")` 等直接返回对应状态码。
 
@@ -338,6 +373,9 @@ await db.tx(async (tx) => {
   镜像路径 404（替换语义）。
 - **file**：catch-all 路由（`get.route = "{*path}"`）——`/v1/api/file/a/b/c` 拆段返回，
   `/v1/api/file` 404（catch-all 至少一段）。
+- **upload**：multipart 上传 → `blob.put` → 返回下载地址；`del` 删 blob（query `k`）。下载走内置
+  `{base}/blob/{key}` 路由（§9 文件上传与 blob）。
+- **auth_demo**：JWT 鉴权演示（`/me` 受保护 / `/health` 匿名），login/refresh/logout 内置路由。
 
 跑法见 §1。验收用例见 `../oj/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 

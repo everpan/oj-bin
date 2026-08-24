@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::actor::JsActor;
 use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
-use mdm_base_rust::bridge::{fail, RequestInfo, UploadedFile};
+use mdm_base_rust::bridge::{fail, BlobBackend, BlobServed, RequestInfo, UploadedFile};
 use serde_json::json;
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
@@ -48,6 +48,8 @@ pub struct Pipeline {
     pub auth: Option<Arc<Auth>>,
     /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
     pub max_upload: u64,
+    /// Some = blob 启用：`{base}/blob/{key}` 公开下载（local 直出 / s3 302 presign）。
+    pub blob: Option<Arc<dyn BlobBackend>>,
 }
 
 impl Default for Pipeline {
@@ -56,6 +58,7 @@ impl Default for Pipeline {
             tenant_header: None,
             auth: None,
             max_upload: 10 * 1024 * 1024, // 10MiB
+            blob: None,
         }
     }
 }
@@ -156,6 +159,37 @@ async fn handle(
             _ => fail_response(405, "auth route not found"),
         };
     }
+    // 内置 blob 下载路由（{base}/blob/{key}，公开 GET，先于路由表）。
+    if verb == "GET"
+        && let Some(blob) = st.pipeline.blob.as_ref()
+        && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
+        && let Some(key) = decode_blob_key(key)
+    {
+        return match blob.serve(&key).await {
+            Ok(BlobServed::Bytes(bytes, ct)) => {
+                let mut r = Response::new(axum::body::Body::from(bytes));
+                if let Some(ct) = ct {
+                    r.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_str(&ct)
+                            .unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+                    );
+                }
+                r
+            }
+            Ok(BlobServed::Redirect(url)) => {
+                let mut r = Response::new(axum::body::Body::empty());
+                *r.status_mut() = StatusCode::SEE_OTHER;
+                r.headers_mut().insert(
+                    axum::http::header::LOCATION,
+                    axum::http::HeaderValue::from_str(&url)
+                        .unwrap_or(axum::http::HeaderValue::from_static("/")),
+                );
+                r
+            }
+            Err(_) => fail_response(404, "blob not found"),
+        };
+    }
     // 去 base 路径（鉴权匿名匹配用；不在 base 下 → None = 不设防）。
     let path_no_base = crate::routes::normalize(uri.path())
         .and_then(|p| p.strip_prefix(st.base.as_str()).map(|s| s.to_string()));
@@ -253,6 +287,16 @@ async fn handle(
         return file_response(&file, body);
     }
     fail_response(404, "no route matched")
+}
+
+/// blob 下载 key：percent-decode 每段后过 valid_key（防 `%2e%2e` 穿越，与 resolve_static 同款守卫）。
+fn decode_blob_key(s: &str) -> Option<String> {
+    let decoded = s
+        .split('/')
+        .map(|seg| percent_encoding::percent_decode_str(seg).decode_utf8().ok())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    mdm_base_rust::bridge::valid_key(&decoded).then_some(decoded)
 }
 
 /// 静态文件解析：uri.path()（仍 percent-encoded）逐段解码后拼 root；
@@ -395,7 +439,7 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry};
+    use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, LocalBlob, SchemaRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -459,6 +503,39 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             serve_with_listener(
                 listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout, None, pipeline,
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    /// blob 启用的 serve fixture：actor 与 Pipeline 共享同一 backend。
+    async fn spawn_blob(
+        base: &str,
+        dir: PathBuf,
+        blob: Arc<dyn BlobBackend>,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let table = build_table(&dir, true, base);
+        let root = dir.clone();
+        let blob2 = blob.clone();
+        let actor = JsActor::new(move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                Extras { blob: Some(blob2.clone()) },
+            )
+        });
+        let base = base.to_string();
+        let pipeline = Pipeline { blob: Some(blob), ..Default::default() };
+        tokio::spawn(async move {
+            serve_with_listener(
+                listener, &base, dir.clone(), true, table, actor, None, None, pipeline,
             )
             .await
             .unwrap();
@@ -593,6 +670,71 @@ pub(crate) mod tests {
         )
         .await;
         assert!(r.starts_with("HTTP/1.1 413") && r.contains("upload too large"), "3: {r}");
+    }
+
+    /// blob 下载路由（local）：api 上传 → {base}/blob/k 200 bytes 一致 → del 404 →
+    /// 非 GET 404 → %2e%2e 穿越 404。
+    #[tokio::test]
+    async fn blob_download_route_local() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() {\n\
+               const f = http.files[0];\n\
+               const b = await http.file(0);\n\
+               await blob.put(f.filename, b, f.content_type);\n\
+               json.ok({ url: await blob.url(f.filename), n: b.length });\n\
+             },\n\
+             async del() { await blob.del(http.param(\"k\", \"\")); json.ok({ ok: 1 }); } };",
+        )]);
+        let root = std::env::temp_dir().join(format!("oj-blob-srv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob("/v1/api", t.0.clone(), blob).await;
+        // 上传 a.png（PNGDATA 7B）
+        let mp = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--X-BND--\r\n"
+        );
+        let req = format!(
+            "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{mp}",
+            mp.len()
+        );
+        let r = raw_http(addr, &req).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"n\":7"), "upload: {r}");
+        // 下载：bytes 一致 + Content-Type 按扩展名推断
+        let r = raw_http(
+            addr,
+            "GET /v1/api/blob/a.png HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("image/png") && r.ends_with("PNGDATA"), "get: {r}");
+        // 非 GET 不走 blob 路由
+        let r = raw_http(
+            addr,
+            "POST /v1/api/blob/a.png HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 404"), "post: {r}");
+        // del（query k=…）→ 之后 GET 404
+        let r = raw_http(
+            addr,
+            "DELETE /v1/api/u/?k=a.png HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "del: {r}");
+        let r = raw_http(
+            addr,
+            "GET /v1/api/blob/a.png HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 404"), "after del: {r}");
+        // %2e%2e 穿越 → decode 后 valid_key 拒绝 → 404
+        let r = raw_http(
+            addr,
+            "GET /v1/api/blob/%2e%2e/x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 404"), "traversal: {r}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// auth 全链路：401/匿名/login/Bearer 注入/篡改/refresh 轮换/logout。

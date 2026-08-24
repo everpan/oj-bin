@@ -112,9 +112,26 @@ pub async fn start(
         }
         None => None,
     };
+    // blob（OJ-5）：config blob: 段存在即启用。local root 相对 config_dir 绝对化；
+    // s3 bucket/region 缺失 fail-fast（S3Blob::new 内校验）。
+    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> = match &cfg.blob {
+        None => None,
+        Some(c) if c.driver == "local" => {
+            let root = Path::new(&c.root);
+            let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
+            Some(Arc::new(
+                mdm_base_rust::bridge::LocalBlob::new(&root, &base)
+                    .map_err(|e| format!("blob: {e}"))?,
+            ))
+        }
+        Some(c) if c.driver == "s3" => Some(Arc::new(
+            mdm_base_rust::bridge::S3Blob::new(c).map_err(|e| format!("blob: {e}"))?,
+        )),
+        Some(c) => return Err(format!("blob.driver must be local|s3, got {:?}", c.driver)),
+    };
     // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
     let make_bridge = {
-        let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
+        let (dbs, kv, loader, blob) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone());
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -122,7 +139,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras::default(),
+                Extras { blob: blob.clone() },
             )
         }
     };
@@ -187,7 +204,7 @@ pub async fn start(
     let n = cfg.server.pool_size.max(1) as usize;
     let timeout = config::parse_duration(&cfg.server.timeout).ok();
     let actor = JsActor::pool(n, {
-        let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
+        let (dbs, kv, loader, blob) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone());
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -195,7 +212,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras::default(),
+                Extras { blob: blob.clone() },
             )
         }
     });
@@ -217,6 +234,7 @@ pub async fn start(
         tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
         auth,
         max_upload: cfg.server.max_upload_bytes,
+        blob: blob.clone(),
     };
     let h = tokio::spawn(async move {
         let _ = mdm_server::serve_with_listener(

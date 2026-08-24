@@ -13,7 +13,9 @@ use deno_core::{JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
+use object_store::signer::Signer;
 use object_store::{ObjectStore, PutPayload};
+use reqwest::Method;
 
 use super::{BridgeResult, StableState};
 
@@ -156,6 +158,91 @@ impl BlobBackend for LocalBlob {
     }
 }
 
+/// S3/MinIO 驱动（object_store AmazonS3 + Signer presign）。
+/// url = GET presign 15min；serve = 302 重定向（S3 侧自带 Content-Type，无需 sidecar）。
+pub struct S3Blob {
+    store: object_store::aws::AmazonS3,
+}
+
+impl S3Blob {
+    /// 从 config BlobCfg 装配：bucket/region 必填 fail-fast，endpoint/access_key/secret_key 可选。
+    pub fn new(c: &crate::config::BlobCfg) -> BridgeResult<Self> {
+        let bucket = c
+            .bucket
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "blob s3: bucket required".to_string())?;
+        let region = c
+            .region
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "blob s3: region required".to_string())?;
+        let mut b = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(region)
+            // 默认 virtual-hosted 风格；path_style（MinIO/自建）切回。
+            .with_virtual_hosted_style_request(!c.path_style);
+        if let Some(e) = c.endpoint.as_deref().filter(|s| !s.is_empty()) {
+            b = b.with_endpoint(e);
+        }
+        if let Some(k) = c.access_key.as_deref().filter(|s| !s.is_empty()) {
+            b = b.with_access_key_id(k);
+        }
+        if let Some(k) = c.secret_key.as_deref().filter(|s| !s.is_empty()) {
+            b = b.with_secret_access_key(k);
+        }
+        Ok(Self { store: b.build().map_err(|e| format!("blob s3 build: {e}"))? })
+    }
+}
+
+#[async_trait]
+impl BlobBackend for S3Blob {
+    async fn put(&self, key: &str, bytes: &[u8], content_type: Option<&str>) -> BridgeResult<()> {
+        let path = os_path(key)?;
+        self.store
+            .put(&path, PutPayload::from(bytes.to_vec()))
+            .await
+            .map_err(|e| format!("blob put: {e}"))?;
+        // 忽略 content_type：presign GET 无法覆盖 S3 侧元数据——ponytail: s3 由对象自身元数据负责。
+        let _ = content_type;
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> BridgeResult<Vec<u8>> {
+        let path = os_path(key)?;
+        let r = self.store.get(&path).await.map_err(|e| format!("blob get: {e}"))?;
+        Ok(r.bytes().await.map_err(|e| format!("blob get: {e}"))?.to_vec())
+    }
+
+    async fn del(&self, key: &str) -> BridgeResult<()> {
+        let path = os_path(key)?;
+        match self.store.delete(&path).await {
+            Ok(()) => {}
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(format!("blob del: {e}").into()),
+        }
+        Ok(())
+    }
+
+    async fn url(&self, key: &str) -> BridgeResult<String> {
+        let path = os_path(key)?;
+        self.store
+            .signed_url(Method::GET, &path, std::time::Duration::from_secs(15 * 60))
+            .await
+            .map(|u| u.to_string())
+            .map_err(|e| format!("blob s3 sign: {e}").into())
+    }
+
+    async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
+        os_path(key)?;
+        Ok(None)
+    }
+
+    async fn serve(&self, key: &str) -> BridgeResult<BlobServed> {
+        Ok(BlobServed::Redirect(self.url(key).await?))
+    }
+}
+
 fn backend(state: &OpState) -> Result<Arc<dyn BlobBackend>, JsErrorBox> {
     state
         .borrow::<Arc<StableState>>()
@@ -259,5 +346,35 @@ mod tests {
             assert!(!valid_key(bad), "{bad}");
             assert!(b.put(bad, b"x", None).await.is_err(), "{bad}");
         }
+    }
+
+    /// S3/MinIO e2e：env `OJ_TEST_S3` = `endpoint|bucket|region|access|secret|path_style`
+    /// （path_style 缺省 true，适配 MinIO）。未设置 → 跳过。
+    #[tokio::test]
+    #[ignore]
+    async fn s3_e2e_roundtrip() {
+        let Ok(dsn) = std::env::var("OJ_TEST_S3") else {
+            eprintln!("skip: OJ_TEST_S3 unset");
+            return;
+        };
+        let p: Vec<&str> = dsn.split('|').collect();
+        assert!(p.len() >= 5, "OJ_TEST_S3 = endpoint|bucket|region|access|secret|path_style");
+        let cfg = crate::config::BlobCfg {
+            driver: "s3".into(),
+            root: String::new(),
+            endpoint: Some(p[0].into()),
+            bucket: Some(p[1].into()),
+            region: Some(p[2].into()),
+            access_key: Some(p[3].into()),
+            secret_key: Some(p[4].into()),
+            path_style: p.get(5).map(|s| *s == "true").unwrap_or(true),
+        };
+        let b = S3Blob::new(&cfg).unwrap();
+        let key = format!("oj-test/{}.bin", std::process::id());
+        b.put(&key, b"hello-s3", Some("application/octet-stream")).await.unwrap();
+        assert_eq!(b.get(&key).await.unwrap(), b"hello-s3".to_vec());
+        assert!(b.url(&key).await.unwrap().starts_with("http"), "presigned url");
+        b.del(&key).await.unwrap();
+        assert!(b.get(&key).await.is_err());
     }
 }
