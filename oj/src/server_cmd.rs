@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, Dialect, Extras, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+    Bridge, Bus, DataAccessor, Dialect, EsClient, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
+    SqlxAccessor,
 };
 use mdm_base_rust::config::{self, Config};
 use mdm_server::actor::JsActor;
@@ -135,9 +136,13 @@ pub async fn start(
         )),
         Some(c) => return Err(format!("blob.driver must be local|s3, got {:?}", c.driver)),
     };
+    // ES（OJ-6）：config es: 块存在即注入 EsClient；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
+    let es: Option<Arc<EsClient>> = cfg.es.as_ref().map(|c| Arc::new(EsClient::new(c.endpoint.clone())));
+    // 共享总线（OJ-6）：池内所有 Bridge 注入同一 Arc<Bus>，WS 订阅与任意 handler 发布互通。
+    let bus = Arc::new(Bus::new());
     // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
     let make_bridge = {
-        let (dbs, kv, loader, blob) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone());
+        let (dbs, kv, loader, blob, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone(), es.clone(), bus.clone());
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -145,7 +150,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blob: blob.clone(), ..Default::default() },
+                Extras { blob: blob.clone(), es: es.clone(), bus: Some(bus.clone()), ..Default::default() },
             )
         }
     };
@@ -210,7 +215,7 @@ pub async fn start(
     let n = cfg.server.pool_size.max(1) as usize;
     let timeout = config::parse_duration(&cfg.server.timeout).ok();
     let actor = JsActor::pool(n, {
-        let (dbs, kv, loader, blob) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone());
+        let (dbs, kv, loader, blob, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone(), es.clone(), bus.clone());
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -218,7 +223,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blob: blob.clone(), ..Default::default() },
+                Extras { blob: blob.clone(), es: es.clone(), bus: Some(bus.clone()), ..Default::default() },
             )
         }
     });

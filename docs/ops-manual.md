@@ -46,8 +46,12 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
   v0.2 多库混用：`sqlite://`（缺文件自动建空库）/`mysql://`/`postgres://`（透传，连不上启动
   fail-fast）。`sqlite::memory:` 仅测试用，重启即丢。**seed.sql 只对 sqlite 的 default 重放**，
   mysql/pg 的建库/迁移归运维。
-- **Redis** `redis.default`：v0.1 **不真连**，仅 warn 并退回内存 KV——多实例部署时 KV 不共享，
-  需业务自行注意（避免把跨实例一致状态塞进 `redis`/`kv`）。
+- **Redis** `redis.default`：v0.2 **配置即真连**（启动 fail-fast，连不上直接报错退出，不会静默退回
+  内存）。配置后 `kv`/`redis` 全局与 auth 会话共享同一 Redis，**多实例部署即共享会话与 KV**
+  （水平扩展的前提）。不配置 = 进程内存 KV，多实例不共享——把跨实例一致状态放这里前先确认已配 Redis。
+- **ES** `es.endpoint`：块存在即启用 `es.search/index/del`（薄直通，index/id 白名单限
+  `[a-zA-Z0-9_-]+`）。endpoint 尾斜杠自动剪除。生产接入内网 ES 前先核对 `no_proxy`/网络可达性
+  （EsClient 用 no_proxy 独立连接，不随环境代理）。
 - **租户** `tenant.enable / tenant.header_key`：启用后所有 `{base}` 请求必须带该 header
   （缺失/空 → 400），值注入 `http.tenantId` 供 handler 做数据隔离（**框架不自动改写 SQL**，
   行级过滤归业务）。
@@ -82,7 +86,8 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 ## 6. 日志
 
 `tracing-subscriber` 输出：启动横幅（模块/路由表）、请求日志（方法/路径/状态/耗时）、
-`log.*`（handler 内 `log.debug/info/warn/error(msg, ...kv)` 结构化输出）、redis 退回 warn。
+`log.*`（handler 内 `log.debug/info/warn/error(msg, ...kv)` 结构化输出）。另有
+`warn: redis '{name}' ({url}) ignored`——`redis` 段配了 `default` 之外的键（仅 `default` 被使用）。
 生产建议用 `RUST_LOG` 控制级别：
 
 ```bash
@@ -106,7 +111,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 未知 DSN scheme 启动失败 | 仅支持 sqlite/mysql/postgres | 检查 `db:` 各 DSN 前缀 |
 | mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
 | 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
-| `redis` 数据不跨实例 | v0.1 退回内存 KV | 改走 `db` 或外部服务 |
+| `redis` 数据不跨实例 | `redis.default` 未配置 → 进程内存 KV | 配真 Redis（配置即真连，多实例共享会话/KV） |
+| 启动报 `redis 'default': …` 连接失败 | Redis 不可达/未起，fail-fast 直接退出（不静默退回内存） | 起 Redis 或核对 URL/网络；**不想依赖 Redis 就把 `redis:` 段注释掉** |
+| 非 `default` 的 redis 键无效 | 仅 `redis.default` 被使用，其余 warn 忽略 | 核对命名；只配 `default` |
 | 400 `missing tenant header: X-TENANT-ID` | `tenant.enable: true` 且请求未带（或值为空）该 header | 客户端补 header，或关掉 `tenant.enable` |
 | 401 `missing or invalid bearer token` | `auth:` 启用且路径不在 `anonymous_paths`，请求未带/篡改/过期 access token | 走 `/auth/login` 换新 token；长期化用 refresh 轮换 |
 | 401 `invalid or expired refresh token` | refresh token 已被轮换/logout 或 session 过期 | 重新 login；refresh 一次一用是轮换语义，不是故障 |
@@ -120,6 +127,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 上传/下载 500 `blob put:/get:` | local 根不可写 / s3 连接失败 / 对象不存在 | 查根目录权限与磁盘；s3 核对 DSN、网络、MinIO 是否 path_style |
 | `GET {base}/blob/x` 404 | 对象不存在，或 key 含非法段（`.`/`..`/`\`/NUL/空，含编码走私 `%2e%2e`） | 核对 key 与编码；下载路由免鉴权，公开对象才放这里 |
 | `blob not configured` 报错 | JS 调 `blob.*` 但 config 无 `blob:` 段 | 加配置；该 op 仅在启用时可用 |
+| `es not configured` 报错 | JS 调 `es.*` 但 config 无 `es:` 段 | 加 `es.endpoint`；或确认业务不该用 ES |
+| `es search/index/del: invalid index` | index/id 含白名单（`[a-zA-Z0-9_-]+`）外字符 | 校验入参；index/id 不可含 `/`、`.` |
+| `es …: HTTP 4xx/5xx: …` | ES 端错误（索引缺失/DSL 错/ES 未起），直通返回体 | 看返回体排障；`es.index` 自带 refresh=true，写完即可查 |
 
 ## 8. 回滚与恢复
 
@@ -127,4 +137,6 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 - **多版本共存回滚**：`dist/` 内旧版本目录不被构建清除（仅锁内当前版本的同名目录清场重建），
   回滚单模块 = 把 `dist/manifests.yaml` 该模块指回旧版本 + 重启 server（锁仅启动时读）。
 - sqlite 数据文件随 `db.default` 路径落盘；升级前备份 `*.sqlite`。
-- 无外部依赖（Redis 未真连），故障面小：主要是「二进制 + dist 不一致」→ 保持二者同版本发布。
+- 外部依赖可选且默认关闭：不配 `redis:`/`es:` 段即纯本地（sqlite + 内存 KV），故障面最小——
+  主要是「二进制 + dist 不一致」→ 保持二者同版本发布。配了 Redis/ES 则它们的可用性进入启动
+  契约（fail-fast），发布/巡检时先确认目标实例可达。

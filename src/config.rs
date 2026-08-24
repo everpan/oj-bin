@@ -66,6 +66,13 @@ impl Default for BlobCfg {
     }
 }
 
+/// ES 客户端（OJ-6）：`es:` 块存在即启用 es.* op；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct EsCfg {
+    pub endpoint: String,
+}
+
 /// 多租户注入（OJ-3）：enable 后 handle() 从 header 提取租户 id 注入 http.tenantId。
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -121,6 +128,8 @@ pub struct Config {
     pub auth: Option<AuthCfg>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
     pub blob: Option<BlobCfg>,
+    /// None = 不启用 ES（es.* op 报 "es not configured"）。
+    pub es: Option<EsCfg>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -244,6 +253,21 @@ mod tests {
         let d = BlobCfg::default();
         assert_eq!((d.driver.as_str(), d.root.as_str()), ("local", "uploads"));
         assert!(!d.path_style && d.bucket.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn es_cfg_defaults_and_parse() {
+        // 未配置 → None（es.* 报 "es not configured"）
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.es.is_none());
+        // es: 段存在 → Some(endpoint)；endpoint 原样保留（尾斜杠由 EsClient.url_for 剪除）
+        let dir = std::env::temp_dir().join(format!("ojcfge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg.yaml"), "es:\n  endpoint: http://127.0.0.1:9200/\n").unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let e = c.es.expect("some");
+        assert_eq!(e.endpoint, "http://127.0.0.1:9200/");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

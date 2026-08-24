@@ -26,12 +26,14 @@ src/                  # crate: mdm-base-rust（lib + bench）
     ├── db.rs         # db.query/exec/tx + DB(name) + Dialect（DSN 前缀解析）+ ActiveTx 事务路由
     ├── accessor_sqlx.rs # sqlx Any + 结果行导出（mysql/pg/sqlite 按方案分发）
     ├── query.rs      # 安全查询构造器 op（table.select.where…；按库方言选 QueryBuilder）
-    ├── kv.rs         # 内存 KV（redis/kv 同源）
+    ├── kv.rs         # KVStore trait：InMemoryKV（惰性过期） + RedisKV（fail-fast 真连，redis/kv 同源）
+    ├── bus.rs        # 订阅发布总线：publish 广播 + subscribe（WS 会话经 ReqState.req.bus_tx 注册）
+    ├── es.rs         # ES 薄封装：EsClient（endpoint + no_proxy reqwest）+ search/index/del ops
     ├── fetch.rs      # fetch op（reqwest 封装的 HTTP 客户端）
     ├── log.rs        # log op（结构化）
     ├── ws.rs         # ws.send/close ops
     ├── inspector.rs  # v8 inspector / 调试辅助
-    └── bootstrap.js  # JS 侧 SDK globals（json/db/DB/http/redis/kv/log/fetch/ws/finish/__ojRequire）
+    └── bootstrap.js  # JS 侧 SDK globals（json/db/DB/http/redis/kv/log/fetch/ws/bus/es/finish/__ojRequire）
 server/               # crate: mdm-server（axum HTTP 层）
 ├── lib.rs            # axum app 装配 + 静态站点兜底（server.root：resolve_static/mime_of）
 ├── auth.rs           # JWT 核心（OJ-4）：签验/匿名匹配/login/refresh 轮换/session（KV）
@@ -63,10 +65,9 @@ cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
 ```
 
-> ⚠️ 存量问题：`cargo test -p mdm-base-rust --lib` 在
-> `bridge::tests::infinite_loop_times_out_and_bridge_survives` 稳定 SIGSEGV
-> （master 即如此，debug/release 均崩，deno_core 超时中断路径）。跑全套用上面的
-> `--exclude` 形式；修复前勿因它误判本地改动。
+> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，58 通过）。
+> 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
+> `v8::IsolateHandle`，见 §3）。
 
 约定（本仓库硬性规范）：
 - **debug/release 双绿**：改动后 `cargo test` 与 `cargo build --release` 都要通过才算完成。
@@ -98,7 +99,9 @@ HTTP 请求
   `load_side_es_module_from_code`（side module），driver 内 `await import(spec)` 触发 TLA。
 - **两级缓存**：`TranspileCache`（path→(mtime, JS)）+ V8 module cache（靠 mtime 版本化
   specifier `?v=<mtime-nanos>` 实现「改文件即失效」）。
-- **KillSwitch**：超时用 `v8::Isolate::terminate_execution` 强杀；被杀的 runtime 直接丢弃
+- **KillSwitch**：超时用 `v8::IsolateHandle::terminate_execution` 强杀（`checkout_armed` 取
+  `rt.v8_isolate().thread_safe_handle()`，Send+Sync 跨线程句柄——**不是**裸指针：`OwnedIsolate`
+  包装地址 ≠ 真实 isolate 指针，手转裸指针会 SIGSEGV，0bdfa86）；被杀的 runtime 直接丢弃
   （不回池），HTTP 返回 408。这是对 `while(true)` 等死循环的唯一可靠熔断手段。
 
 ## 4. 关键模块职责（深入）
@@ -129,7 +132,7 @@ HTTP 请求
   local 用 object_store `LocalFileSystem` + `<key>.ct` sidecar 持久化 Content-Type；s3 用
   `AmazonS3`（具体类型才能拿 `Signer` presign）+ GET 15min → `serve` 返回 302。`valid_key`
   逐段白名单（`.`/`..`/`\`/NUL/空段拒绝）；下载路由 `decode_blob_key` 先 percent-decode 再校验。
-  `Extras.blob` 是 bridge 单一扩展点（构造期注入，`StableState` 内不可变 Arc）。
+  `Extras { blob, bus, es }` 是 bridge 构造期扩展点终态（构造期注入，`StableState` 内不可变 Arc）。
 
 ### 4.3 bootstrap.js — JS SDK globals
 
@@ -153,13 +156,31 @@ local 直出字节 + Content-Type，s3 302 presign。`max_upload` 双闸：axum 
 角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的——路由级
 RBAC 等真需求出现再议（YAGNI）。
 
+### 4.4 kv.rs / bus.rs / es.rs — 外部状态与广播（OJ-6）
+
+- `kv.rs`：`KVStore` trait（get/set/del/expire/incr）双实现。`InMemoryKV`（`Mutex<HashMap>` +
+  tokio `Instant` 惰性过期）；`RedisKV::arc`（**单例 fail-fast**：先一次性 connect 探测，再包
+  `ConnectionManager`——`ConnectionManager::new` 会无限重试，直接用它启动会挂死，故先探测；
+  用非弃用的 `get_multiplexed_tokio_connection`）。`redis.*` 与 `kv.*` 同源，auth 会话也存同一
+  KV（`AUTH-SESSION:sha256(refresh_token)`），配真 Redis 即多实例共享会话。
+- `bus.rs`：进程内主题广播。`Bus { topics: Mutex<HashMap<String, Vec<UnboundedSender<String>>>> }`，
+  `publish` try_send 广播 JSON 帧并清理 closed sender（返回接收方数），`subscribe` 去重注册。
+  WS 会话的帧通道经 `ReqState.req.bus_tx` 注入（`RequestInfo.bus_tx`，ws.rs frame_loop 里
+  `bus_tx→resp_tx` 转发任务与 `ws.send` 同一写出通道，保序）；HTTP 上下文 `bus_tx=None` →
+  `op_bus_subscribe` 报错。server 装配共享**一个** `Arc<Bus>`（server_cmd 注入 Extras.bus），
+  否则池内各 Bridge 各持空 Bus、订阅与发布不通。
+- `es.rs`：`EsClient { endpoint, http }`（`no_proxy` 独立连接），`url_for` 纯函数拼
+  `/{index}/_search` 或 `/{index}/_doc/{id}?refresh=true`（endpoint 尾斜杠幂等剪除）。
+  index/id 白名单 `[a-zA-Z0-9_-]+` 防路径注入；响应直通（非 2xx 带 ES 返回体）；未配置 → 
+  `es not configured`。真连 roundtrip 用 `OJ_TEST_ES` 环境变量驱动（`#[ignore]`）。
+
 ## 5. 安全模型
 
 - **project_root 钳制**：所有 import 解析结果必须落在 project root 内（`ensure_within`）。
 - **目录穿越防护**：路由路径里的 `..`/`.`/`\`/NUL/空段 → 404。静态兜底（`resolve_static`）
   在此之上先逐段 percent-decode 再校验——解码出 `/`（`%2F` 走私）、`.`、`..`、`\`、NUL、
   空段同样 404。
-- **超时熔断**：`server.timeout` + `v8::Isolate::terminate_execution`（408）。
+- **超时熔断**：`server.timeout` + `v8::IsolateHandle::terminate_execution`（408）。
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符白名单 +
   参数化值（sea-query）。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
@@ -183,14 +204,16 @@ RBAC 等真需求出现再议（YAGNI）。
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：106 通过（mdm-server 49 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
-  避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
+- 当前计数：107 通过（mdm-server 50 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
+  避免端口/文件冲突）+ `mdm-base-rust` lib 58（3 忽略 = 真 ES/外部依赖驱动的 roundtrip）。
+  `cargo test --workspace --exclude mdm-base-rust` 全绿；mdm-base-rust 全套 lib 也可跑（§2）。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
-- Redis 退回内存 KV、相对 `require()` 不支持——均接受为 v0.1 已知限制（db 仅 sqlite 已于
-  v0.2 解除：多库 DSN 按 scheme 分发，设计见 `2026-08-24-oj-p2-design.md` §1）。
+- 相对 `require()` 不支持——v0.1 已知限制（db 仅 sqlite 已于 v0.2 解除：多库 DSN 按 scheme
+  分发，设计见 `2026-08-24-oj-p2-design.md` §1）。Redis 退回内存 KV 已于 v0.2 解除：配置即
+  真连 fail-fast（见 §4.4）。
 - `build` 已于 2026-08-24 实现（按模块版本目录 + 产物保留原名原结构 + 默认 minify +
   manifests.yaml 锁 + 确定性 tgz + release 聚合），设计见
   `docs/superpowers/specs/2026-08-23-oj-build-design.md`（顶部有去 hash 修订注记）。

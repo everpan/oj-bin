@@ -11,7 +11,12 @@ db:
   # warehouse: "postgres://127.0.0.1:5432/app"
 
 redis:
-  default: "redis://127.0.0.1:6379/1"   # v0.1: warn + 内存 KV 模拟
+  # v0.2: 配置存在即真连 Redis（启动 fail-fast，连不上直接报错退出）；注释/删除 → 内存 KV。
+  # 真连后 kv/redis 全局与 auth 会话共享同一 Redis（多实例水平扩展的前提）。
+  # default: "redis://127.0.0.1:6379/1"
+
+es:   # Elasticsearch（v0.2）：块存在即启用 es.search/index/del；endpoint 尾斜杠自动剪除
+  # endpoint: "http://127.0.0.1:9200"
 
 blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/blob/{key} 下载路由
   driver: "local"   # local | s3（s3: endpoint/bucket/region/access_key/secret_key 必配 bucket/region）

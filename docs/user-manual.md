@@ -77,15 +77,20 @@ db:
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # v0.2 多库
   # warehouse: "postgres://127.0.0.1:5432/app"
 redis:
-  default: "redis://127.0.0.1:6379/1"   # v0.1 仅 warn 并退回内存 KV
+  # default: "redis://127.0.0.1:6379/1"   # v0.2 注释/删除 = 内存 KV；配置即真连（连不上启动报错）
+es:
+  # endpoint: "http://127.0.0.1:9200"     # v0.2 存在即启用 es.search/index/del；否则报 "es not configured"
 ```
 
 - `server` 字段全可省（都有默认值）。
 - `db`：`name → DSN` 映射，多库可混用：`sqlite://<path>`（相对 config 目录）、`sqlite::memory:`、
   `mysql://…`、`postgres://…`（原样透传）。`DB("name")` 按名取库；构造器（`db.table()`）
   自动按库方言出 SQL。裸 SQL 的占位符方言归业务（sqlite/mysql `?`，postgres `$1`）。
-- `redis`：`name → url` 映射。v0.1 **不真连 Redis**，仅打印 warn 并用进程内存 KV 模拟
-  （`redis.get/set` 与 `kv.get/set` 同源）。
+- `redis`：`name → url` 映射。v0.2 **配置存在即真连**（启动 fail-fast：连不上直接报错退出，
+  不会静默退回内存），`default` 的 KV 与 auth 会话共享同一 Redis；`redis` 段缺失/全注释 →
+  进程内存 KV（`redis.*` 与 `kv.*` 同源）。
+- `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`；缺失时调用报
+  `es not configured`。endpoint 尾斜杠自动剪除。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
 - `server.root`：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
@@ -261,11 +266,17 @@ axum 放开 pin 后可启用。
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
 | `db.tx(async (tx) => { … })` | 事务：回调 resolve 提交 / throw 回滚再抛；`tx.query/exec/table` 同连接执行 |
 | `DB(name)` | 命名库实例（`db === DB("default")`） |
-| `kv.get/set/del(key)` | 内存 KV（v0.1 无真 Redis 时的缓存抽象） |
-| `redis.get/set(key)` | 同内存 KV（与 `kv` 同源） |
+| `kv.get/set/del(key)` | KV：`redis.default` 配置 → 真 Redis，否则进程内存 KV |
+| `kv.expire(key, ttlSec)` / `kv.incr(key)` | 过期（秒→ms 入 op）与自增（缺省 Redis 时内存实现） |
+| `redis.get/set/del/expire/incr(key)` | 同 KV 全局（与 `kv` 同源；`redis` 真连时二者同栈） |
 | `log.debug/info/warn/error(msg, ...kv)` | 结构化日志 |
 | `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
 | `ws.send/close` | WebSocket 帧控制（HTTP 路径下 no-op） |
+| `bus.publish(topic, data)` | 广播到订阅了 topic 的全部 WS 会话 → 返回接收方数 |
+| `bus.subscribe(topic)` | 当前 WS 会话订阅 topic（HTTP 路径报错） |
+| `es.search(index, dsl)` | ES 搜索：POST `{endpoint}/{index}/_search`，返回 ES 响应体 |
+| `es.index(index, id, doc)` | 写文档：PUT `{endpoint}/{index}/_doc/{id}?refresh=true` |
+| `es.del(index, id)` | 删文档：DELETE 同路径（幂等，缺失返回 404 体） |
 
 SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 
@@ -339,6 +350,36 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法�
 单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码
 （`+`→空格、`%XX` 解码；旧版不解码，迁移注意）。
 
+### 订阅发布总线（bus）与 KV/ES（v0.2）
+
+**bus**：进程内主题广播。`api.ts`（任意 HTTP 路径）`await bus.publish(topic, data)` 广播 JSON 帧
+`{"topic":…,"data":…}` 给全部订阅该主题的 **WebSocket 会话**（返回接收方数）；WS 会话在入口
+`bus.subscribe(topic)`（HTTP 路径调用报错，因为订阅对象是连接本身）。
+
+```js
+// WS 会话入口（dev: src/**/ws.ts 同 api.ts 形态；订阅在连接建帧时执行一次）
+bus.subscribe("news");
+json.ok({ ok: 1 });
+
+// 任意 HTTP handler 广播
+export default {
+  async post() {
+    const n = await bus.publish("news", { from: http.param("user", "anon"), at: Date.now() });
+    json.ok({ receivers: n });
+  },
+};
+```
+
+订阅在 WS 连接断开自动清除；同一会话重复订阅幂等去重。`bus.publish` 在无订阅时返回 0（广播消失）。
+
+**KV 扩展**：`kv.expire(key, ttlSec)` 设过期（真 Redis 走 EXPIRE；内存 KV 惰性过期），
+`kv.incr(key)` 自增返回新值（键不存在从 0 起）。`redis` 全局与 `kv` 同源——`redis.default`
+真连时两者都走 Redis（auth 会话也在同一 Redis，多实例可共享）。
+
+**es**：`config.yaml` `es.endpoint` 存在即启用。`es.search(index, dsl)` / `es.index(index, id, doc)` /
+`es.del(index, id)` 直通 ES 响应体（refresh=true 实时可查）；index/id 限 `[a-zA-Z0-9_-]+`，
+未配置调用报 `es not configured`，非 2xx 报错带 ES 返回体。
+
 ## 10. 响应信封与错误
 
 统一信封 `{code, msg, data}`；HTTP 状态码 = `code`（`code=0` → 200）。
@@ -379,11 +420,11 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法�
 
 跑法见 §1。验收用例见 `../oj/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 
-## 12. 已知限制（v0.1）
+## 12. 已知限制（v0.2）
 
-- `redis` 不真连 Redis，退回内存 KV。
-- 相对 `require()` 不支持；`build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
-- 相对 `require("./x")`、`package.json` `exports`/`conditions`、pnpm 布局不支持。
+- 相对 `require("./x")` 不支持（ESM 相对导入支持，§8；CJS `require` 仅解析裸 specifier，不读
+  `package.json` `exports`/`conditions`；pnpm 布局不支持）。
+- `build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules` 解析，发布物需自带）。
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
