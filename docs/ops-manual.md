@@ -114,6 +114,8 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | `redis` 数据不跨实例 | `redis.default` 未配置 → 进程内存 KV | 配真 Redis（配置即真连，多实例共享会话/KV） |
 | 启动报 `redis 'default': …` 连接失败 | Redis 不可达/未起，fail-fast 直接退出（不静默退回内存） | 起 Redis 或核对 URL/网络；**不想依赖 Redis 就把 `redis:` 段注释掉** |
 | 非 `default` 的 redis 键无效 | 仅 `redis.default` 被使用，其余 warn 忽略 | 核对命名；只配 `default` |
+| `bus.publish` 收不到广播 | bus 是**进程内**广播，跨实例不互通（发布与 WS 订阅须在同一实例） | 确认发布与订阅同实例；多实例跨进程广播暂不支持 |
+| `GET {base}/…/ws` 404 | release 下 WS.ts 未重新 build 进 dist，或 URL 含版本段 | 先 `oj build`；release URL 为 `…/news-0.1.0/ws`（v0.2 已知限制） |
 | 400 `missing tenant header: X-TENANT-ID` | `tenant.enable: true` 且请求未带（或值为空）该 header | 客户端补 header，或关掉 `tenant.enable` |
 | 401 `missing or invalid bearer token` | `auth:` 启用且路径不在 `anonymous_paths`，请求未带/篡改/过期 access token | 走 `/auth/login` 换新 token；长期化用 refresh 轮换 |
 | 401 `invalid or expired refresh token` | refresh token 已被轮换/logout 或 session 过期 | 重新 login；refresh 一次一用是轮换语义，不是故障 |

@@ -35,11 +35,14 @@ src/                  # crate: mdm-base-rust（lib + bench）
     ├── inspector.rs  # v8 inspector / 调试辅助
     └── bootstrap.js  # JS 侧 SDK globals（json/db/DB/http/redis/kv/log/fetch/ws/bus/es/finish/__ojRequire）
 server/               # crate: mdm-server（axum HTTP 层）
-├── lib.rs            # axum app 装配 + 静态站点兜底（server.root：resolve_static/mime_of）
+├── lib.rs            # axum app 装配 + 静态站点兜底（server.root：resolve_static/mime_of）+
+│                     # serve_with_listener（薄封装）→ serve_router(listener, router)（完整 Router 服务，
+│                     # oj server 生产路径 app().merge(ws) 后经此起服务）
 ├── auth.rs           # JWT 核心（OJ-4）：签验/匿名匹配/login/refresh 轮换/session（KV）
-├── routes.rs         # directory-mirror URL → handler 映射
+├── routes.rs         # directory-mirror URL → handler 映射（walk_files pub(crate) 供 ws 复用）
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
-└── ws.rs             # WebSocket
+└── ws.rs             # WebSocket + js_route/mirror_routes（<dir>/WS.ts→{base}/<dir>/ws 目录镜像挂载）
+                      # frame_loop 经 cached_transpile 读源码（WS.ts 类型标注可用）
 cli/                  # crate: oj（CLI 入口）
 ├── main.rs           # entry
 ├── lib.rs            # CLI lib
@@ -65,7 +68,7 @@ cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
 ```
 
-> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，58 通过）。
+> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，59 通过）。
 > 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
 > `v8::IsolateHandle`，见 §3）。
 
@@ -204,8 +207,8 @@ RBAC 等真需求出现再议（YAGNI）。
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：107 通过（mdm-server 50 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
-  避免端口/文件冲突）+ `mdm-base-rust` lib 58（3 忽略 = 真 ES/外部依赖驱动的 roundtrip）。
+- 当前计数：108 通过（mdm-server 51 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
+  避免端口/文件冲突）+ `mdm-base-rust` lib 59（3 忽略 = 真 ES/外部依赖驱动的 roundtrip）。
   `cargo test --workspace --exclude mdm-base-rust` 全绿；mdm-base-rust 全套 lib 也可跑（§2）。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）

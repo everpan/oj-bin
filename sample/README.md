@@ -7,6 +7,8 @@
   cargo run -p oj -- server -c sample/config.yaml -d sample/dist       # release（按锁聚合）
 
 - 路由 = 目录镜像：src/user/profile/detail/api.ts → /v1/api/user/profile/detail/
+- WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/WS.ts 订阅 news），
+  再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧
 - config.yaml `server.root: dist`：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
   /user-0.1.0.tgz 可直接访问；dist 无 index.html 故 / 为 404）
 - dist/ 为 oj build 产物（保留原名原结构，默认 minify），可再生，勿手改
