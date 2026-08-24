@@ -15,6 +15,8 @@ pub struct RequestInfo {
     pub body: Vec<u8>,
     /// 租户 id（tenant.enable 时由 handle() 从 header 提取注入；否则 None）。
     pub tenant_id: Option<String>,
+    /// 已验签用户（auth 启用且非匿名路径：{id, roles, claims}；否则 None）。
+    pub user: Option<Value>,
 }
 
 use std::collections::HashMap;
@@ -31,6 +33,7 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
         "headers": s.req.headers,
         "body": export_bytes(&s.req.body),
         "tenantId": s.req.tenant_id,
+        "user": s.req.user,
     })
 }
 

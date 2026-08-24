@@ -7,6 +7,7 @@ pub mod ws;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -16,8 +17,10 @@ use axum::Router;
 use serde_json::Value;
 
 use crate::actor::JsActor;
+use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
 use mdm_base_rust::bridge::{fail, RequestInfo};
+use serde_json::json;
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
 #[derive(Clone)]
@@ -32,6 +35,8 @@ pub struct AppState {
     static_root: Option<PathBuf>,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
     pipeline: Pipeline,
+    /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
+    base: String,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -39,6 +44,8 @@ pub struct AppState {
 pub struct Pipeline {
     /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
     pub tenant_header: Option<String>,
+    /// Some = 鉴权启用：内置 {base}/auth/* 路由 + Bearer 守卫 + http.user。
+    pub auth: Option<Arc<Auth>>,
 }
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
@@ -61,6 +68,7 @@ pub fn app(
         timeout,
         static_root,
         pipeline,
+        base: base.to_string(),
     })
 }
 
@@ -105,10 +113,56 @@ async fn handle(
     body: axum::body::Bytes,
 ) -> Response {
     let verb = method.as_str();
+    // 内置 auth 路由（{base}/auth/*）：先于路由表（login/refresh/logout，POST only）。
+    if let Some(auth) = st.pipeline.auth.clone()
+        && let Some(rest) = crate::routes::normalize(uri.path())
+            .and_then(|p| p.strip_prefix(&format!("{}/auth/", st.base)).map(|s| s.to_string()))
+    {
+        return match (verb, rest.as_str()) {
+            ("POST", "login") => {
+                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let (u, p) = (
+                    v["username"].as_str().unwrap_or_default().to_string(),
+                    v["password"].as_str().unwrap_or_default().to_string(),
+                );
+                auth_json(auth.login(&u, &p).await)
+            }
+            ("POST", "refresh") => {
+                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let t = v["refresh_token"].as_str().unwrap_or_default().to_string();
+                auth_json(auth.refresh(&t).await)
+            }
+            ("POST", "logout") => {
+                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
+                let t = v["refresh_token"].as_str().unwrap_or_default().to_string();
+                auth_json(auth.logout(&t).await.map(|_| Value::Null))
+            }
+            _ => fail_response(405, "auth route not found"),
+        };
+    }
+    // 去 base 路径（鉴权匿名匹配用；不在 base 下 → None = 不设防）。
+    let path_no_base = crate::routes::normalize(uri.path())
+        .and_then(|p| p.strip_prefix(st.base.as_str()).map(|s| s.to_string()));
     let run = |file: PathBuf, params: HashMap<String, String>| {
         let m = crate::routes::method_name(verb).expect("checked by caller").to_string();
         let query = parse_query(uri.query());
+        let path_no_base = path_no_base.clone();
         async move {
+            // 前置管线：鉴权（base 内非匿名路径必须带有效 Bearer → 401；通过 → http.user）。
+            let user = match (st.pipeline.auth.as_ref(), path_no_base.as_deref()) {
+                (Some(auth), Some(p)) if !auth.is_anonymous(p) => {
+                    let Some(claims) = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.strip_prefix("Bearer "))
+                        .and_then(|t| auth.verify_access(t).ok())
+                    else {
+                        return fail_response(401, "missing or invalid bearer token");
+                    };
+                    Some(json!({ "id": claims.sub, "roles": claims.roles, "claims": claims }))
+                }
+                _ => None,
+            };
             // 前置管线：租户提取（启用后缺失/空 → 400）。
             let tenant_id = match st.pipeline.tenant_header.as_deref() {
                 Some(key) => {
@@ -133,6 +187,7 @@ async fn handle(
                     .collect(),
                 body: body.to_vec(),
                 tenant_id,
+                user,
             };
             match st.actor.run_module(file, m, req, st.timeout).await {
                 Ok(cap) => capture_response(cap),
@@ -242,6 +297,21 @@ fn capture_response(cap: mdm_base_rust::bridge::Capture) -> Response {
         }
     }
     r
+}
+
+/// 内置 auth 路由响应：Ok(data) → ok 信封 200；Err(msg) → 401 信封。
+fn auth_json(r: Result<Value, String>) -> Response {
+    match r {
+        Ok(data) => {
+            let mut resp = Response::new(axum::body::Body::from(mdm_base_rust::bridge::ok(&data)));
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+        Err(msg) => fail_response(401, &msg),
+    }
 }
 
 /// 统一失败信封。
@@ -375,7 +445,7 @@ pub(crate) mod tests {
             t.0.clone(),
             true,
             None,
-            Pipeline { tenant_header: Some("X-TENANT-ID".into()) },
+            Pipeline { tenant_header: Some("X-TENANT-ID".into()), ..Default::default() },
         )
         .await;
         let ok = raw_http(
@@ -398,6 +468,122 @@ pub(crate) mod tests {
         )
         .await;
         assert!(plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"), "{plain}");
+    }
+
+    /// auth 全链路：401/匿名/login/Bearer 注入/篡改/refresh 轮换/logout。
+    #[tokio::test]
+    async fn auth_full_pipeline() {
+        let t = routes(&[
+            (
+                "me/api.ts",
+                "export default { get() { json.ok({ u: http.user }); } };",
+            ),
+            (
+                "health/api.ts",
+                "export default { get() { json.ok({ ok: 1 }); } };",
+            ),
+        ]);
+        // auth 自带库：users 表 + demo 用户（bcrypt cost 4 提速）。
+        let db = mdm_base_rust::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let hash = bcrypt::hash("pw", 4).unwrap();
+        db.exec_with_params(
+            "create table users (id integer primary key, username text, password_hash text, roles text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.exec_with_params(
+            "insert into users (username, password_hash, roles) values ('demo', ?, ?)",
+            &[serde_json::json!(hash), serde_json::json!(r#"["admin"]"#)],
+        )
+        .await
+        .unwrap();
+        let auth = Arc::new(
+            crate::auth::Auth::new(
+                &mdm_base_rust::config::AuthCfg {
+                    jwt_secret: "test-secret".into(),
+                    anonymous_paths: vec!["/health".into()],
+                    ..Default::default()
+                },
+                db,
+                Arc::new(mdm_base_rust::bridge::InMemoryKV::new()),
+            )
+            .unwrap(),
+        );
+        let addr = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline { auth: Some(auth), ..Default::default() },
+        )
+        .await;
+        let get = |p: &str, token: Option<&str>| {
+            format!(
+                "GET {p} HTTP/1.1\r\nHost: t\r\n{}Connection: close\r\n\r\n",
+                token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default()
+            )
+        };
+        // 1) 无 token 访问 /me → 401
+        let r = raw_http(addr, &get("/v1/api/me/", None)).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "1: {r}");
+        // 2) /health 匿名 → 200
+        let r = raw_http(addr, &get("/v1/api/health/", None)).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "2: {r}");
+        // 3) login 错密码 → 401
+        let login_req = |body: &str| {
+            format!(
+                "POST /v1/api/auth/login HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let r = raw_http(addr, &login_req(r#"{"username":"demo","password":"x"}"#)).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "3: {r}");
+        // 4) login 成功 → Bearer 访问 /me → 200 且 user.id=="1"、roles==["admin"]
+        let r = raw_http(addr, &login_req(r#"{"username":"demo","password":"pw"}"#)).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "4a: {r}");
+        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let at = v["data"]["access_token"].as_str().unwrap().to_string();
+        let rt1 = v["data"]["refresh_token"].as_str().unwrap().to_string();
+        let r = raw_http(addr, &get("/v1/api/me/", Some(&at))).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"id\":\"1\"") && r.contains("\"roles\":[\"admin\"]"), "4b: {r}");
+        // 5) 篡改 token → 401
+        let r = raw_http(addr, &get("/v1/api/me/", Some(&format!("{at}x")))).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "5: {r}");
+        // 6) refresh → 新 access 可用
+        let r = raw_http(
+            addr,
+            &format!(
+                "POST /v1/api/auth/refresh HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt1}\"}}",
+                format!("{{\"refresh_token\":\"{rt1}\"}}").len()
+            ),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "6a: {r}");
+        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let at2 = v["data"]["access_token"].as_str().unwrap().to_string();
+        let rt2 = v["data"]["refresh_token"].as_str().unwrap().to_string();
+        let r = raw_http(addr, &get("/v1/api/me/", Some(&at2))).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "6b: {r}");
+        // 7) logout 后 refresh 旧 token → 401
+        let r = raw_http(
+            addr,
+            &format!(
+                "POST /v1/api/auth/logout HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt2}\"}}",
+                format!("{{\"refresh_token\":\"{rt2}\"}}").len()
+            ),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "7a: {r}");
+        let r = raw_http(
+            addr,
+            &format!(
+                "POST /v1/api/auth/refresh HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt2}\"}}",
+                format!("{{\"refresh_token\":\"{rt2}\"}}").len()
+            ),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 401"), "7b: {r}");
     }
 
     #[tokio::test]
