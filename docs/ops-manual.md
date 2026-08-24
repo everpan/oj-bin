@@ -20,13 +20,13 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
    排障需要可读产物时加 `--no-minify` 重建。
 3. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
    `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
-4. 目标机解包，`./oj server -c config.yaml -d dist`（release 默认跑 `.js`，**不带 `--dev`**）。
+4. 目标机解包，`./oj server -c config.yaml -d dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
 
 ## 2. 运行
 
 ```bash
 ./oj server -c config.yaml -d dist            # release
-./oj server -c config.yaml -d src --dev        # dev（跑 .ts，改文件即生效）
+./oj server -c config.yaml -d src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
 ```
 
 启动时打印模块清单 + 路由表，可据此核对发布是否完整。
@@ -36,6 +36,8 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 `config.yaml` 全字段可省，均有默认。生产要点：
 
 - **端口**：代码默认 `778`，但属 macOS/Linux 特权端口（<1024），需 root；**生产用 ≥1024**（如 9778）。
+- **前缀** `server.base`：API 基础路由前缀（默认 `/v1/api`），随配置走版本管理；
+  临时调试可用 `-b` 覆盖。空前缀（空串/纯斜杠）启动即报错。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
 - **静态站点** `server.root`：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录

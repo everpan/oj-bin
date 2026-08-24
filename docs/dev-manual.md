@@ -12,7 +12,7 @@ Cargo.toml            # [workspace] members = ["server", "cli"]；根 crate 本�
 src/                  # crate: mdm-base-rust（lib + bench）
 ├── lib.rs            # 导出 bridge + config
 ├── main.rs           # bench 入口（criterion harness，非服务）
-├── config.rs         # 配置加载：server{host,port,root,timeout,pool_size} + db/redis 映射、timeout 解析
+├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + db/redis 映射、timeout 解析
 └── bridge/           # JS 运行时与 SDK（无 axum/http 依赖，纯执行层）
     ├── mod.rs        # 模块聚合、bridge 工厂（Send）
     ├── runtime.rs    # JsRuntime 生命周期 + RuntimePool（max_idle=16）
@@ -40,11 +40,11 @@ server/               # crate: mdm-server（axum HTTP 层）
 cli/                  # crate: oj（CLI 入口）
 ├── main.rs           # entry
 ├── lib.rs            # CLI lib
-├── args.rs           # 参数解析（server/build/None、build 的 module 位置参数）
+├── args.rs           # CLI（clap derive：Cli/Commands + 到 ServerArgs/BuildArgs 的映射）
 ├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
 ├── pack.rs           # 确定性 tgz 打包（mtime=0/mode 0644/排序 → 同输入同字节）
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/剥 .route/routes.js/锁/tgz）
-└── server_cmd.rs     # server 子命令：start() + config_dir_of() + release 聚合
+└── server_cmd.rs     # server 子命令：start() + 模式自动判定（is_release）+ release 聚合
 ```
 
 依赖分层：`bridge`（纯执行，不依赖 HTTP 框架）← `server`（axum 路由 + actor）← `cli`（装配）。
@@ -57,7 +57,7 @@ cargo build --release                         # release（产物在 target/relea
 cargo test -p oj                              # 单测 + e2e
 cargo test -p mdm-server                      # server 单测
 cargo test --workspace --exclude mdm-base-rust # 全部（见下条说明）
-cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev
+cargo run -p oj -- server -c sample/config.yaml -d sample/src        # dev（按目录自动判定）
 cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
 ```
@@ -158,7 +158,7 @@ HTTP 请求
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：94 通过（mdm-server 42 + oj lib 37 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：97 通过（mdm-server 42 + oj lib 40 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）

@@ -11,6 +11,8 @@ use serde::Deserialize;
 pub struct ServerCfg {
     pub host: String,
     pub port: u16,
+    /// API 基础路由前缀（如 "/v1/api"）；CLI `-b` 显式给出时覆盖。
+    pub base: String,
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
     pub root: Option<String>,
     /// 时长字符串（如 "30s"），parse_duration 解析。
@@ -23,6 +25,7 @@ impl Default for ServerCfg {
         Self {
             host: "localhost".into(),
             port: 778,
+            base: "/v1/api".into(),
             root: None,
             timeout: "30s".into(),
             pool_size: 4,
@@ -84,6 +87,7 @@ mod tests {
     fn defaults_when_no_file() {
         let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
         assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 778));
+        assert_eq!(c.server.base, "/v1/api");
         assert!(c.server.root.is_none());
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);
         assert_eq!(c.server.pool_size, 4);
@@ -101,12 +105,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ojcfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cfg.yaml"), concat!(
-            "server:\n  host: 0.0.0.0\n  port: 9000\n  root: public\n  timeout: 5s\n  pool_size: 2\n",
+            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  root: public\n  timeout: 5s\n  pool_size: 2\n",
             "db:\n  default: sqlite://db.sqlite\n",
             "redis:\n  default: redis://127.0.0.1:6379/1\n",
         )).unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert_eq!(c.server.host, "0.0.0.0");
+        assert_eq!(c.server.base, "/xapi");
         assert_eq!(c.server.root.as_deref(), Some("public"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);

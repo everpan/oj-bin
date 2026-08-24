@@ -22,12 +22,41 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     let config_dir = config_dir_of(&config_path);
     let cfg = config::load_from(&config_dir, config_path.file_name().and_then(|s| s.to_str()))
         .map_err(|e| format!("load config: {e}"))?;
-    let (addr, h) = start(cfg, &config_dir, PathBuf::from(&a.dir), a.base.clone(), a.dev).await?;
+    // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
+    // 默认目录：src 存在取 src（开发流），否则 dist。
+    let dir = a
+        .dir
+        .unwrap_or_else(|| if Path::new("src").is_dir() { "src".into() } else { "dist".into() });
+    let dir_path = Path::new(&dir);
+    if !dir_path.is_dir() {
+        return Err(format!("service dir not found: {dir}（src 源码树或 oj build 产物 dist）"));
+    }
+    let ts = !is_release(dir_path);
+    let base = resolve_base(a.base.as_deref(), &cfg.server.base)?;
+    let (addr, h) = start(cfg, &config_dir, PathBuf::from(&dir), base.clone(), ts).await?;
     println!(
         "oj server listening on http://{addr}{} (dir={}, {})",
-        a.base, a.dir, if a.dev { "dev/ts" } else { "release/js" }
+        base,
+        dir,
+        if ts { "dev/ts" } else { "release/js" }
     );
     h.await.map_err(|e| format!("server task: {e}"))
+}
+
+/// base 归源：CLI `-b` 显式给出 > config `server.base`（默认 /v1/api）。
+/// 空前缀拒绝（全 404 的静默坑）。
+fn resolve_base(cli: Option<&str>, cfg: &str) -> Result<String, String> {
+    let b = cli.unwrap_or(cfg);
+    if b.trim_matches('/').is_empty() {
+        return Err("base prefix must not be empty (-b / server.base)".into());
+    }
+    Ok(b.to_string())
+}
+
+/// 模式判定：服务目录含 `manifests.yaml`（oj build 锁文件）→ release 产物树。
+/// src 源码树无此文件 → dev。两类目录形态互斥，判据确定。
+fn is_release(dir: &Path) -> bool {
+    dir.join("manifests.yaml").is_file()
 }
 
 /// 装配并监听（port=0 → 随机端口，测试用）。
@@ -241,6 +270,30 @@ mod tests {
         assert_eq!(config_dir_of(Path::new("./config.yaml")), PathBuf::from("."));
         assert_eq!(config_dir_of(Path::new("sub/config.yaml")), PathBuf::from("sub"));
         assert_eq!(config_dir_of(Path::new("/abs/config.yaml")), PathBuf::from("/abs"));
+    }
+
+    #[test]
+    fn base_precedence_and_empty_guard() {
+        // CLI -b > config server.base（config 默认 /v1/api 由 ServerCfg::default 兜底）
+        assert_eq!(resolve_base(None, "/xapi").unwrap(), "/xapi");
+        assert_eq!(resolve_base(Some("/cli"), "/xapi").unwrap(), "/cli");
+        assert_eq!(resolve_base(None, "/v1/api").unwrap(), "/v1/api");
+        // 空前缀（仅斜杠）拒绝
+        assert!(resolve_base(Some(""), "/xapi").is_err());
+        assert!(resolve_base(None, "///").is_err());
+    }
+
+    #[test]
+    fn mode_detected_by_lock_file() {
+        let t = tmpdir("sc-mode");
+        // 空目录 / 模块树（只有 manifest.yaml）→ dev
+        assert!(!is_release(&t.0));
+        std::fs::create_dir_all(t.0.join("user")).unwrap();
+        std::fs::write(t.0.join("user/manifest.yaml"), "name: user\n").unwrap();
+        assert!(!is_release(&t.0));
+        // 构建锁存在 → release
+        std::fs::write(t.0.join("manifests.yaml"), "user: 0.1.0\n").unwrap();
+        assert!(is_release(&t.0));
     }
 
     #[tokio::test]

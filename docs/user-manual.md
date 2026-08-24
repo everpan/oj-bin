@@ -9,10 +9,10 @@
 ```bash
 cargo build                     # 构建（debug）
 
-# dev 模式：直接跑 .ts 源码
-cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev
+# dev：直接跑 .ts 源码（目录无 manifests.yaml → 自动 dev/ts）
+cargo run -p oj -- server -c sample/config.yaml -d sample/src
 
-# release 模式：先构建再跑编译产物 dist/
+# release：先构建再跑产物 dist/（目录有 manifests.yaml → 自动 release/js）
 cargo run -p oj -- build -d sample/src -o sample/dist
 cargo run -p oj -- server -c sample/config.yaml -d sample/dist
 ```
@@ -27,16 +27,15 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
+oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>]
 oj build  [module] [-d src] [-o dist] [--no-minify]
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c` | `config.yaml` | （server）配置文件路径（host/port/db/redis） |
-| `-b` | `/v1/api` | （server）基础路由前缀（build 无此参数） |
-| `-d` | `--dev` → `src`，否则 `dist` | 服务目录（server：模块树的根；build：源码目录） |
-| `--dev` | 关 | 开发模式跑 `.ts`；缺省为 release 跑 `.js` |
+| `-c` | `config.yaml` | （server）配置文件路径（host/port/base/root/db/redis） |
+| `-b` | config `server.base`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
+| `-d` | `src` 存在取 `src`，否则 `dist` | 服务目录（server：模块树的根；build：源码目录） |
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
@@ -55,7 +54,12 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
 - release 模式启动时按 `dist/manifests.yaml` 逐模块加载各版本目录的 `routes.js` 聚合路由；
   锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错（提示先 `oj build`）。
 - `-b` 已不是 build 参数（pattern 不含 base）；误用时显式报错退出。
-- 无子命令则打印用法退出。
+- 命令行由 clap 解析：短旗标均有长形式（`--config/--base/--dir/--out`），
+  `-h/--help`、`-V/--version` 随时可用；空参自动打印帮助（exit 2），非法参数
+  （未知旗标、多余位置参数、未知子命令）直接报错退出。
+- **模式自动判定**（server，无 `--dev` 旗标）：`-d` 目录含 `manifests.yaml`
+  （构建锁）→ release 跑 `.js`；否则 dev 跑 `.ts`（改文件即生效）。目录不存在
+  启动即报错。启动行会打印判定结果（`dev/ts` / `release/js`）。
 - 相对路径（`-c`/`-d`）相对**当前工作目录**（CWD），不是相对 config 所在目录。
 
 ## 3. 配置 config.yaml
@@ -64,6 +68,7 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
 server:
   host: "localhost"       # 监听地址（默认 localhost）
   port: 9778              # 监听端口（代码默认 778，但 macOS 特权端口不可用 → 用 ≥1024）
+  base: "/v1/api"         # API 基础路由前缀（CLI -b 显式给出时覆盖；空前缀拒绝）
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
   root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
@@ -90,7 +95,7 @@ redis:
 <project>/
 ├── config.yaml          # 服务配置
 ├── seed.sql             # 可选，启动时对 default 库重放
-├── src/                 # --dev 服务目录（release 用 dist/，结构相同）
+├── src/                 # dev 服务目录（release 用 dist/，结构相同）
 │   ├── user/            # 首层子目录 = 模块名
 │   │   ├── manifest.yaml
 │   │   ├── _shared/validate.ts   # 无 api 文件 → 纯工具代码目录，不产生路由
@@ -184,7 +189,7 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 - 路径任意深度：`/v1/api/user/profile/detail/` → `src/user/profile/detail/api.ts` 的 `get`。
 - 尾斜杠有无皆可。
 - 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
-- **解析顺序**：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（`--dev`）→
+- **解析顺序**：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
   静态站点（`server.root`，仅 GET/HEAD，见 §3）→ 404。API 永远优先于静态文件。
 
 ### 7.1 路径参数路由（`.route`）
@@ -212,7 +217,7 @@ axum 放开 pin 后可启用。
 - `"{id}"` 相对当前目录；`"/user/{id}"` 以 `/` 开头挂到 base 根下；`fn.route = ""` 视同未挂。
 - TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错（无 tsconfig 时
   TS 语言服务通常也能拾取；严格工程可在 tsconfig `include` 里显式列入）。
-- dev（`--dev`）启动内省建表；release 用 `oj build` 生成的各模块版本目录内 `routes.js`
+- dev（目录无 `manifests.yaml`，§2 自动判定）启动内省建表；release 用 `oj build` 生成的各模块版本目录内 `routes.js`
   按 `dist/manifests.yaml` 聚合直载（见 §2），`dist` 产物中的 `.route` 已被剥离——
   路由事实唯一来源是 `routes.js`。
 

@@ -1,6 +1,6 @@
 # oj sample — user/order/file
 
-  cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev   # dev（TS，热重载）
+  cargo run -p oj -- server -c sample/config.yaml -d sample/src         # dev（TS，热重载；模式按目录自动判定）
   curl http://localhost:9778/v1/api/user/account/?id=1
 
   cargo run -p oj -- build -d sample/src -o sample/dist    # 构建（版本目录+manifests.yaml+tgz）

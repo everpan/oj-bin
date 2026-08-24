@@ -1,6 +1,7 @@
 server:
   host: "localhost"
   port: 9778
+  base: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖）
   root: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务）
 db:
   default: "sqlite://db.sqlite"
