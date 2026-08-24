@@ -107,7 +107,7 @@ globalThis.db = globalThis.DB("default");
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})
 //          .orderBy([{field:"id",dir:"desc"}]).limit(10).all()
 function queryBuilder(name, table) {
-  const req = { table, columns: [], conditions: [], order_by: [], limit: null, offset: null };
+  const req = { db: name, table, columns: [], conditions: [], order_by: [], limit: null, offset: null };
   const api = {
     select(cols) { req.columns = (cols || []).map(String); return api; },
     where(cond) { req.conditions.push(cond); return api; },

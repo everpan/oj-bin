@@ -17,6 +17,7 @@ use sea_query::{Alias, Expr, ExprTrait, LikeExpr, Order, Query, SimpleExpr, Sqli
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::db::Dialect;
 use super::registry::SchemaRegistry;
 use super::{BridgeResult, DataAccessor, StableState};
 
@@ -56,6 +57,9 @@ struct OrderBy {
 /// 一次查询构建请求（结构化，非 SQL 字符串）。
 #[derive(Debug, Clone, Deserialize)]
 struct QueryReq {
+    /// 目标命名库（bootstrap 的 queryBuilder 填入；缺省 default）。
+    #[serde(default = "default_db")]
+    db: String,
     table: String,
     #[serde(default)]
     columns: Vec<String>,
@@ -67,6 +71,10 @@ struct QueryReq {
     limit: Option<u32>,
     #[serde(default)]
     offset: Option<u32>,
+}
+
+fn default_db() -> String {
+    "default".into()
 }
 
 const LIMIT_DEFAULT: u32 = 100;
@@ -192,16 +200,28 @@ pub async fn op_db_query_build(
         q.offset(off as u64);
     }
 
-    let (sql, values) = q.build(SqliteQueryBuilder);
+    let da = lookup(&state, &req.db)?;
+    let (sql, values) = build_select(da.dialect(), &q);
     let params: Vec<Value> = values
         .into_iter()
         .map(|v| value_to_json(&v))
         .collect::<Result<_, _>>()?;
 
-    let da = lookup(&state, "default")?;
     da.query_with_params(&sql, &params)
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+/// 按方言出 SQL（sea-query QueryBuilder 非 dyn 兼容，match 分发三实现）。
+fn build_select(
+    d: Dialect,
+    q: &sea_query::SelectStatement,
+) -> (String, sea_query::Values) {
+    match d {
+        Dialect::Sqlite => q.build(SqliteQueryBuilder),
+        Dialect::MySql => q.build(sea_query::MysqlQueryBuilder),
+        Dialect::Postgres => q.build(sea_query::PostgresQueryBuilder),
+    }
 }
 
 /// sea-query 的 `Value` 转 serde_json::Value（简化：整数/浮点/字符串/布尔/ null）。
@@ -246,3 +266,32 @@ pub(crate) fn lookup(
 /// 仅用于 trait 约束引用，避免 unused import 警告。
 #[allow(dead_code)]
 fn _assert(_: &BridgeResult<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 相同条件三种方言的占位符风格：sqlite/mysql 用 `?`，postgres 用 `$1`（builder 职责）。
+    #[test]
+    fn placeholder_per_dialect() {
+        let sql_of = |d: Dialect| {
+            let mut q = sea_query::Query::select();
+            q.column(Alias::new("name")).from(Alias::new("user"));
+            q.and_where(Expr::col(Alias::new("id")).eq(1));
+            build_select(d, &q).0
+        };
+        assert!(sql_of(Dialect::Sqlite).contains('?'));
+        assert!(sql_of(Dialect::MySql).contains('?'));
+        assert!(sql_of(Dialect::Postgres).contains("$1"));
+    }
+
+    /// QueryReq 缺省 db=default（bootstrap 旧调用兼容）。
+    #[test]
+    fn query_req_defaults_to_default_db() {
+        let req: QueryReq = serde_json::from_str(r#"{"table":"user"}"#).unwrap();
+        assert_eq!(req.db, "default");
+        let req: QueryReq =
+            serde_json::from_str(r#"{"db":"other","table":"user"}"#).unwrap();
+        assert_eq!(req.db, "other");
+    }
+}
