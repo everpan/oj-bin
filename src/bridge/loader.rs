@@ -84,12 +84,12 @@ impl HandlerStore {
         let inner = self.inner.clone();
         let watch_dir = dir.clone();
         let mut watcher = match notify::recommended_watcher(move |res: notify::Result<Event>| {
-            if let Ok(ev) = res {
-                if ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove() {
-                    let map = Self::load_dir(&watch_dir);
-                    *inner.write().unwrap() = std::sync::Arc::new(map);
-                    tracing::info!(target: "handler", "reloaded handlers");
-                }
+            if let Ok(ev) = res
+                && (ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove())
+            {
+                let map = Self::load_dir(&watch_dir);
+                *inner.write().unwrap() = std::sync::Arc::new(map);
+                tracing::info!(target: "handler", "reloaded handlers");
             }
         }) {
             Ok(w) => w,

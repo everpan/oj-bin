@@ -94,9 +94,9 @@ fn to_qv(v: &Value) -> Qv {
         Value::Bool(b) => Qv::Bool(Some(*b)),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Qv::BigInt(Some(i.into()))
+                Qv::BigInt(Some(i))
             } else if let Some(f) = n.as_f64() {
-                Qv::Float(Some((f as f32).into()))
+                Qv::Float(Some(f as f32))
             } else {
                 Qv::String(None)
             }
@@ -121,7 +121,7 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
                 .as_ref()
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| JsErrorBox::generic("in needs array value"))?;
-            let vals: Vec<Expr> = arr.iter().map(|v| rhs(v)).collect();
+            let vals: Vec<Expr> = arr.iter().map(rhs).collect();
             c.is_in(vals)
         }
         Op::Like => {

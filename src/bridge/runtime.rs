@@ -108,12 +108,13 @@ impl KillSwitch {
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(25));
                 let g = t.slot.lock().unwrap();
-                if let Some((handle, deadline)) = g.as_ref() {
-                    if Instant::now() >= *deadline && !t.fired.load(Ordering::Relaxed) {
-                        // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
-                        handle.terminate_execution();
-                        t.fired.store(true, Ordering::Relaxed);
-                    }
+                if let Some((handle, deadline)) = g.as_ref()
+                    && Instant::now() >= *deadline
+                    && !t.fired.load(Ordering::Relaxed)
+                {
+                    // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
+                    handle.terminate_execution();
+                    t.fired.store(true, Ordering::Relaxed);
                 }
             })
             .expect("spawn js-watchdog");
@@ -127,10 +128,7 @@ impl KillSwitch {
 
     /// 关闭窗口；返回本窗口内是否触发过熔断。
     pub(crate) fn disarm(&self) -> bool {
-        let fired = {
-            *self.slot.lock().unwrap() = None;
-            self.fired.swap(false, Ordering::Relaxed)
-        };
-        fired
+        *self.slot.lock().unwrap() = None;
+        self.fired.swap(false, Ordering::Relaxed)
     }
 }

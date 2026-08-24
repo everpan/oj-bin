@@ -16,8 +16,9 @@
 //!   - bootstrap.js —— JS 侧全局对象装配
 //!
 //! 状态拆分（revised）：
-//!   - `StableState`：跨请求不变（kv / dbs / client / registry / loader），`Arc` 共享，创建一次。
-//!   - `ReqState`：每请求可变（req / 响应捕获 / done），存入 OpState，checkout 时重置。
+//! - `StableState`：跨请求不变（kv / dbs / client / registry / loader），`Arc` 共享，创建一次。
+//! - `ReqState`：每请求可变（req / 响应捕获 / done），存入 OpState，checkout 时重置。
+//!
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
 mod db;
@@ -184,9 +185,9 @@ pub struct Capture {
     pub body: Vec<u8>,
 }
 
-/// Bridge：持有共享稳定状态、runtime 池、handler 仓库，并执行 handler 脚本。
+/// Bridge：持有 runtime 池、handler 仓库，并执行 handler 脚本。
+/// （StableState 由 pool 构造期捕获，经 OpState 注入；此处不另持 Arc。）
 pub struct Bridge {
-    stable: Arc<StableState>,
     pool: runtime::RuntimePool,
     handlers: HandlerStore,
     /// 是否启用 inspector（透传至 runtime 工厂）。
@@ -239,10 +240,10 @@ impl Bridge {
         extras: Extras,
     ) -> Self {
         // 防御：无 "default" 键时取任一实例补位（对齐 Go buildServer；JS 侧 db = DB("default")）。
-        if !dbs.contains_key("default") {
-            if let Some(first) = dbs.values().next().cloned() {
-                dbs.insert("default".to_string(), first);
-            }
+        if !dbs.contains_key("default")
+            && let Some(first) = dbs.values().next().cloned()
+        {
+            dbs.insert("default".to_string(), first);
         }
         let stable = Arc::new(StableState {
             kv,
@@ -259,7 +260,6 @@ impl Bridge {
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
-            stable,
             pool,
             handlers: HandlerStore::from_env(),
             inspect,

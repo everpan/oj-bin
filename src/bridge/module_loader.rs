@@ -1,6 +1,6 @@
 //! oj 的 ESM 模块加载器：相对导入（Deno 风格补全）+ 裸 specifier（node_modules，T8）
-//! + CJS 包装互操作。?v=<mtime> 版本化 specifier 让 V8 模块缓存天然按内容失效。
-//! ponytail: 旧版本模块不可卸载，按编辑次数缓慢积累（dev 重启清零，release 有界）。
+//! 与 CJS 包装互操作。`?v=<mtime>` 版本化 specifier 让 V8 模块缓存天然按内容失效。
+//! 注意：旧版本模块不可卸载，按编辑次数缓慢积累（dev 重启清零，release 有界）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

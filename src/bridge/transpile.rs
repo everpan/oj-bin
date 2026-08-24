@@ -31,10 +31,10 @@ pub fn cached_transpile(path: &Path) -> Result<String, String> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map_err(|e| format!("stat {}: {e}", path.display()))?;
-    if let Some((t, src)) = cache().lock().unwrap().get(path) {
-        if *t == mtime {
-            return Ok(src.clone());
-        }
+    if let Some((t, src)) = cache().lock().unwrap().get(path)
+        && *t == mtime
+    {
+        return Ok(src.clone());
     }
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let out = if path.extension().is_some_and(|e| e == "ts") {
