@@ -21,10 +21,34 @@ use super::{BridgeResult, Shared, StableState};
 /// 数据访问返回的单行（JSON 对象）。
 pub type Row = Value;
 
+/// SQL 方言（构造器按此选 sea_query QueryBuilder；裸 SQL 占位符方言归业务）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Sqlite,
+    MySql,
+    Postgres,
+}
+
+/// DSN 前缀 → 方言。未知前缀归 Sqlite（非法 DSN 由装配层 fail-fast）。
+pub fn dialect_of(dsn: &str) -> Dialect {
+    if dsn.starts_with("mysql://") {
+        Dialect::MySql
+    } else if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        Dialect::Postgres
+    } else {
+        Dialect::Sqlite
+    }
+}
+
 /// 数据访问统一契约（接口隔离 + 依赖倒置）。
 /// M0 用内存 fake；后续 sqlx 以同接口接入（`query_with_params` 参数化），handler 无需改动。
 #[async_trait]
 pub trait DataAccessor: Send + Sync {
+    /// 库方言（构造器选 builder 用；默认 sqlite，fake/未知驱动走默认）。
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
+    }
+
     /// 无参查询（便捷形式）。
     async fn query(&self, sql: &str) -> BridgeResult<Vec<Row>> {
         self.query_with_params(sql, &[]).await

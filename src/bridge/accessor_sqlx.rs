@@ -13,11 +13,13 @@ use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
 use sqlx::{Column, Row};
 
+use super::db::{Dialect, dialect_of};
 use super::{BridgeResult, DataAccessor, Row as JsRow};
 
 /// 基于 sqlx AnyPool 的 DataAccessor 实现。
 pub struct SqlxAccessor {
     pool: Pool<Any>,
+    dialect: Dialect,
 }
 
 impl SqlxAccessor {
@@ -34,12 +36,7 @@ impl SqlxAccessor {
             .connect(url)
             .await
             .map_err(|e| format!("sqlx connect: {e}"))?;
-        Ok(Self { pool })
-    }
-
-    /// 包装已有池。
-    pub fn from_pool(pool: Pool<Any>) -> Self {
-        Self { pool }
+        Ok(Self { pool, dialect: dialect_of(url) })
     }
 
     /// 便捷构造 Arc 句柄。
@@ -113,6 +110,10 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
 
 #[async_trait]
 impl DataAccessor for SqlxAccessor {
+    fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
@@ -141,6 +142,7 @@ impl DataAccessor for SqlxAccessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::db::{Dialect, dialect_of};
     use crate::bridge::{Bridge, InMemoryKV, SchemaRegistry};
     use serde_json::json;
 
@@ -148,6 +150,17 @@ mod tests {
     fn _assert_impl() {
         fn takes<T: DataAccessor>() {}
         takes::<SqlxAccessor>();
+    }
+
+    #[test]
+    fn dialect_parsed_from_dsn_prefix() {
+        assert_eq!(dialect_of("sqlite://x.sqlite"), Dialect::Sqlite);
+        assert_eq!(dialect_of("sqlite::memory:"), Dialect::Sqlite);
+        assert_eq!(dialect_of("mysql://u:p@h/d"), Dialect::MySql);
+        assert_eq!(dialect_of("postgres://h/d"), Dialect::Postgres);
+        assert_eq!(dialect_of("postgresql://h/d"), Dialect::Postgres);
+        // accessor 侧：构造期解析存字段（不连库，经 connect 后才可见——这里测纯函数）。
+        assert_ne!(Dialect::MySql, Dialect::Postgres);
     }
 
     // P1 集成测：真实 sqlite 落库 → 经 Bridge 的 db.table / db.query 读回（LSP 替换 fake）。
