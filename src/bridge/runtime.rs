@@ -88,11 +88,13 @@ pub fn op_state(rt: &JsRuntime) -> Rc<RefCell<deno_core::OpState>> {
     rt.op_state()
 }
 
-/// 超时熔断开关：arm 记录 isolate 裸指针 + deadline；看门狗线程到期跨线程 terminate。
+/// 超时熔断开关：arm 记录 v8::IsolateHandle + deadline；看门狗线程到期跨线程 terminate。
+/// IsolateHandle 是 V8 提供的跨线程终止官方途径（Send+Sync，内部 Arc<IsolateHandleInner>），
+/// 持有真实 isolate 指针且自带生命周期管理——不必（也不能）手存裸指针。
 /// 每个 Bridge 一个实例（对应一个 JS actor 线程，串行执行故单槽足够）。
 #[derive(Default)]
 pub struct KillSwitch {
-    slot: Mutex<Option<(usize, Instant)>>,
+    slot: Mutex<Option<(v8::IsolateHandle, Instant)>>,
     fired: AtomicBool,
 }
 
@@ -106,11 +108,10 @@ impl KillSwitch {
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(25));
                 let g = t.slot.lock().unwrap();
-                if let Some((ptr, deadline)) = *g {
-                    if Instant::now() >= deadline && !t.fired.load(Ordering::Relaxed) {
-                        // SAFETY: ptr 仅在 arm..disarm 窗口内有效（runtime 存活于窗口内），
-                        // 且 terminate_execution 是 V8 明确允许的跨线程调用。
-                        unsafe { (*(ptr as *const v8::Isolate)).terminate_execution() };
+                if let Some((handle, deadline)) = g.as_ref() {
+                    if Instant::now() >= *deadline && !t.fired.load(Ordering::Relaxed) {
+                        // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
+                        handle.terminate_execution();
                         t.fired.store(true, Ordering::Relaxed);
                     }
                 }
@@ -119,14 +120,17 @@ impl KillSwitch {
         sw
     }
 
-    pub(crate) fn arm(&self, ptr: usize, timeout: Duration) {
+    pub(crate) fn arm(&self, handle: v8::IsolateHandle, timeout: Duration) {
         self.fired.store(false, Ordering::Relaxed);
-        *self.slot.lock().unwrap() = Some((ptr, Instant::now() + timeout));
+        *self.slot.lock().unwrap() = Some((handle, Instant::now() + timeout));
     }
 
     /// 关闭窗口；返回本窗口内是否触发过熔断。
     pub(crate) fn disarm(&self) -> bool {
-        *self.slot.lock().unwrap() = None;
-        self.fired.swap(false, Ordering::Relaxed)
+        let fired = {
+            *self.slot.lock().unwrap() = None;
+            self.fired.swap(false, Ordering::Relaxed)
+        };
+        fired
     }
 }

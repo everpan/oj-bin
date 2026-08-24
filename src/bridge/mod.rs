@@ -304,14 +304,12 @@ impl Bridge {
     }
 
     /// 借出 runtime、重置状态并武装看门狗（KillSwitch）。
-    /// isolate 裸指针仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
+    /// 用 v8::IsolateHandle（Send+Sync 跨线程句柄）而非裸指针：OwnedIsolate 包装地址 ≠ 真实
+    /// isolate 指针，手转裸指针再跨线程 terminate 会解引用垃圾地址（SIGSEGV）。
     fn checkout_armed(&self, req: RequestInfo, timeout: std::time::Duration) -> JsRuntime {
         let mut rt = self.checkout_reset(req);
-        let ptr: usize = {
-            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
-            iso as *mut _ as usize
-        };
-        self.kill.arm(ptr, timeout);
+        let handle = rt.v8_isolate().thread_safe_handle();
+        self.kill.arm(handle, timeout);
         rt
     }
 
