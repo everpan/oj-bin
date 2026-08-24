@@ -28,6 +28,8 @@ import {
   op_kv_get,
   op_kv_set,
   op_kv_del,
+  op_kv_expire,
+  op_kv_incr,
   op_log,
   op_resolve_cjs as __oj_resolve_cjs,
   op_ws_send,
@@ -75,17 +77,23 @@ globalThis.log = {
   error: (msg, ...kv) => logCall(3, msg, kv),
 };
 
-// ----- redis: M0 in-memory KV (get/set) -----
+// ----- redis: KV backend (in-memory default; real Redis when configured) -----
 globalThis.redis = {
   get: (key) => op_kv_get(String(key)),
   set: (key, value) => op_kv_set(String(key), String(value)),
+  del: (key) => op_kv_del(String(key)),
+  // ttl in seconds (op takes ms)
+  expire: (key, ttlSeconds) => op_kv_expire(String(key), Number(ttlSeconds) * 1000),
+  incr: (key) => op_kv_incr(String(key)),
 };
 
-// ----- kv: same in-memory KV as redis global (spec name for oj handlers) -----
+// ----- kv: same KV as redis global (spec name for oj handlers) -----
 globalThis.kv = {
   get: (key) => op_kv_get(String(key)),
   set: (key, value) => op_kv_set(String(key), String(value)),
   del: (key) => op_kv_del(String(key)),
+  expire: (key, ttlSeconds) => op_kv_expire(String(key), Number(ttlSeconds) * 1000),
+  incr: (key) => op_kv_incr(String(key)),
 };
 
 // ----- blob: object storage (put/get/del/url; contentType via http blob route) -----

@@ -124,6 +124,8 @@ deno_core::extension!(
         kv::op_kv_get,
         kv::op_kv_set,
         kv::op_kv_del,
+        kv::op_kv_expire,
+        kv::op_kv_incr,
         db::op_db_has,
         db::op_db_query,
         db::op_db_exec,
@@ -740,6 +742,31 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"], json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_expire_incr_global() {
+        // bootstrap 接线：kv.expire(key, 秒) / kv.incr(key) 经 op 可达；redis 同源。
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    await kv.incr("c");
+                    await kv.incr("c");
+                    const n = await kv.incr("c");        // 3
+                    const ok = await kv.expire("c", 1);   // 秒 → ms
+                    await redis.set("r", "9");
+                    const r = await redis.incr("r");      // 10
+                    json.ok({ n, ok, r });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], json!({"n": 3, "ok": true, "r": 10}), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -36,7 +36,7 @@ object_store = { version = "0.11", features = ["aws"] }
 
 [dev-dependencies]
 criterion = "0.5"
-tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "test-util"] }
 
 [[bench]]
 name = "bridge"
