@@ -149,6 +149,8 @@ impl Auth {
     }
 
     /// refresh 轮换：session 未过期 → 签新对 + 删旧 session（旧 refresh 立即失效）。
+    /// ponytail: get→del 非原子，并发两次 refresh 会各签一对（旧 token 仍一次一用，
+    /// 仅两枚新 token 并存）；跨进程原子换发需 KV 原子 get+del，v0.2 不做（低危）。
     pub async fn refresh(&self, refresh_token: &str) -> Result<Value, String> {
         let Some(uid) = self.session_get(refresh_token).await else {
             return Err("invalid or expired refresh token".into());

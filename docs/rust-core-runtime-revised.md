@@ -130,7 +130,7 @@
 
 ## 六、已落地实现（对照路线图）
 
-> 开发遵循 TDD：每个能力均带单元测试（`cargo test` 全绿，7 项），并复用 `benches/bridge.rs` 保证 JS 全链路可编译。
+> 开发遵循 TDD：每个能力均带单元测试（当前 `cargo test` 全绿：mdm-server 52 + oj 42 + e2e 15 + lib 60），并复用 `benches/bridge.rs` 保证 JS 全链路可编译。
 
 ### 已完成的条目（对应 P0~P3）
 
@@ -138,9 +138,10 @@
 |---|---|---|
 | P0-3 修 SQL 注入雷点 | 完成 | `DataAccessor::query_with_params` / `exec_with_params`，`op_db_query`/`op_db_exec` 收 `params: Option<Vec<Value>>`（`db.rs`）；`db.query(sql, params?)`/`db.exec(sql, params?)`（`bootstrap.js`） |
 | P0-2 每请求 runtime 开销 | 完成（实测结论：需池化） | `RuntimePool`（`runtime.rs`）：复用 `JsRuntime`，idle 上限 `DEFAULT_MAX_IDLE=16`；实测每请求新建 isolate 1~10ms，故 checkout/checkin 复用；**快照等价于 bootstrap 已加载的预热 runtime**。 |
-| P1-5 接 `sqlx` | 完成 | `SqlxAccessor`（`accessor_sqlx.rs`）：`Pool<Any>` 驱动无关接入；`bind_value` 参数化；`row_to_json` 类型探测 |
+| P1-5 接 `sqlx` | 完成 | `SqlxAccessor`（`accessor_sqlx.rs`）：`Pool<Any>` 驱动无关接入；`bind_value` 参数化；`row_to_json` 类型探测；v0.2 增方言字段（`dialect_of` 按 DSN 前缀选 builder） |
 | P1-6 schema 注册表 | 完成 | `SchemaRegistry`（`registry.rs`）：`table(name,pk,columns)`、`has_table`、`has_column`、`is_sortable`、`primary_key` |
-| P1-7 `sea-query` 构造器 | 完成 | `query.rs`：`QueryReq`/`Op`/`Cond`/`OrderBy` → `op_db_query_build`；`db.table(name).select().where().orderBy().limit()`（`bootstrap.js`）；标识符全来自注册表，值全参数化 |
+| P1-7 `sea-query` 构造器 | 完成 | `query.rs`：`QueryReq`/`Op`/`Cond`/`OrderBy` → `op_db_query_build`；`db.table(name).select().where().orderBy().limit()`（`bootstrap.js`）；标识符全来自注册表，值全参数化；v0.2 按方言分发（sqlite/mysql/postgres 占位符） |
+| P1-8 事务 `db.tx(fn)` | 完成 | 回调式（`bootstrap.js` `db.tx(fn)`：resolve 提交 / throw 回滚）；`ActiveTx` + `tokio::sync::Mutex<Box<dyn TxSession>>` 每请求单活跃事务、跨库报错；请求收尾 `finalize_tx` 保底回滚（`mod.rs`）；sqlx 实现 `SqlxTx`（commit/rollback take 防双重完结，drop 亦释连接）；`InMemoryTx` 同契约 |
 | P3-13 模块加载 + 热更 | 完成 | `HandlerStore`（`loader.rs`）：`from_env`(`MDM_HANDLER_DIR`)/`from_embedded`/`from_dir` + `notify` 监听热更；`run_named` |
 | P3-14 dev-only inspector | 完成 | `inspector.rs`：`RuntimeOptions.inspector` + `JsRuntimeInspector::create_local_session` + tungstenite WS；`Bridge::with_opts(..., inspect)` + `start_inspector`；`MDM_INSPECT` 启用 |
 | 弃用 runtime-tsc | 完成 | 不再依赖 tsc；JS 为 ASCII ESM，靠编辑器/CI 的 `tsc --noEmit`（计划外，非运行时） |
@@ -158,11 +159,10 @@
 
 ### 仍待办（P0 其余 + P2 安全加固）
 
-- **P0-1 HTTP 服务器**：`Capture` 已就绪但尚无 axum/tokio 服务器消费（当前 `main.rs` 仅 demo）。**最高优先**。
+- **P0-1 HTTP 服务器**：已完成（`server/` crate：axum `serve_router`/`serve_with_listener`、路由表 + dev 目录镜像、静态站点兜底；v0.1 交付，v0.2 在其上加租户/鉴权/blob/WS）。
 - **P0-4 `fetch` SSRF 防护**：出网白名单、内网 IP 阻断、超时/body 上限、DNS 重绑定复检。
-- **P2-9 V8 沙箱**：执行看门狗 `terminate_execution` + `ResourceLimiter` 内存上限。
+- **P2-9 V8 沙箱**：执行看门狗 `terminate_execution` 已完成（`KillSwitch`，`checkout_armed` 武装 + 到期跨线程 terminate，`v8::IsolateHandle` 修复 SIGSEGV）；`ResourceLimiter` 内存上限仍待办。
 - **P2-10 op 边界埋点**：`metrics` + `/metrics`。
 - **P2-11 错误信息收敛**：`json.fail` 不泄露 Rust/DB 内部。
 - **P2-12 handler 集成测试 harness**。
-- **P1-8 事务 `db.tx(fn)`**：回调式事务尚未实现（`DataAccessor` 已预留连接复用位，但 `tx` op 未加）。
 - **P3-15 手写 `bridge.d.ts`**。
