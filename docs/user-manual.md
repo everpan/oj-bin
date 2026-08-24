@@ -250,6 +250,7 @@ axum 放开 pin 后可启用。
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
+| `db.tx(async (tx) => { … })` | 事务：回调 resolve 提交 / throw 回滚再抛；`tx.query/exec/table` 同连接执行 |
 | `DB(name)` | 命名库实例（`db === DB("default")`） |
 | `kv.get/set/del(key)` | 内存 KV（v0.1 无真 Redis 时的缓存抽象） |
 | `redis.get/set(key)` | 同内存 KV（与 `kv` 同源） |
@@ -258,6 +259,22 @@ axum 放开 pin 后可启用。
 | `ws.send/close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 
 SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
+
+### 事务（db.tx）
+
+```js
+await db.tx(async (tx) => {
+  const n = await tx.exec("update account set balance = balance - ? where id = ?", [50, 1]);
+  await tx.exec("update account set balance = balance + ? where id = ?", [50, 2]);
+  const rows = await tx.table("account").select(["id", "balance"]).all(); // 同连接读未提交
+});
+```
+
+- 回调正常返回 → **提交**；throw/reject → **回滚**并把原错误抛给 handler。
+- 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错（`transaction already active`）；
+  事务未完结时访问其它库报错（先结当前事务）。
+- handler 忘记 await 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
+- `tx` 与 `db` 的 `query/exec/table` 同签名——事务内自动走同一连接，无需改写其余代码。
 
 路径参数已解码（可含 `/`、`..` 字面）——仅用于参数化查询与类型转换，**勿拼接文件路径/URL**；
 单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码

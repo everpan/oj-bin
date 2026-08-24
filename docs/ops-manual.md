@@ -94,6 +94,8 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
 | 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
 | `redis` 数据不跨实例 | v0.1 退回内存 KV | 改走 `db` 或外部服务 |
+| 500 信封 `transaction already active` | 同一请求内嵌套 `db.tx`（每请求仅一个活跃事务） | 合并为一个 `db.tx` 回调，或先完结再开 |
+| 日志 `open transaction on db '…' rolled back at request end` | handler 未等待 `db.tx` 结束（漏 await / 中途 throw）即返回 | 修 handler：`await db.tx(...)`；数据已按未提交丢弃 |
 | 端口占用 | `778` 需 root | 换 ≥1024 端口 |
 | 改 `api.ts` 不生效 | release 下 `dist/` 未更新 / 已加载包缓存 | 确认 dist 同步；必要时重启 |
 

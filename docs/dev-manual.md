@@ -23,7 +23,7 @@ src/                  # crate: mdm-base-rust（lib + bench）
     ├── http.rs       # RequestInfo{method,params,query,headers,body}、export_bytes
     ├── envelope.rs   # {code,msg,data} 信封、HTTP 状态映射
     ├── json.rs       # json.ok/fail/header ops
-    ├── db.rs         # db.query/exec + DB(name) + Dialect（DSN 前缀解析）
+    ├── db.rs         # db.query/exec/tx + DB(name) + Dialect（DSN 前缀解析）+ ActiveTx 事务路由
     ├── accessor_sqlx.rs # sqlx Any + 结果行导出（mysql/pg/sqlite 按方案分发）
     ├── query.rs      # 安全查询构造器 op（table.select.where…；按库方言选 QueryBuilder）
     ├── kv.rs         # 内存 KV（redis/kv 同源）
@@ -127,6 +127,10 @@ HTTP 请求
 见 `docs/user-manual.md` §9 的完整表。注意 `http` 是**每请求惰性 Proxy**（`op_http_info()`），
 `db === DB("default")` 由 JS 侧 `dbCache` Map 保证同源。`json.ok` 在 JS 侧 `JSON.stringify`
 后交 Rust 拼接信封，省一次 serde_v8 反序列化。
+
+事务（db.tx）：活跃事务存 `ReqState.tx`（`Arc<ActiveTx>`，故 ReqState 不再 Clone），
+query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）；
+`Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
 
 ## 5. 安全模型
 
