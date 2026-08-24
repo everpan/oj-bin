@@ -200,16 +200,26 @@ pub async fn op_db_query_build(
         q.offset(off as u64);
     }
 
-    let da = lookup(&state, &req.db)?;
-    let (sql, values) = build_select(da.dialect(), &q);
+    let (sql, values) = build_select(lookup(&state, &req.db)?.dialect(), &q);
     let params: Vec<Value> = values
         .into_iter()
         .map(|v| value_to_json(&v))
         .collect::<Result<_, _>>()?;
 
-    da.query_with_params(&sql, &params)
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+    // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
+    match super::db::resolve_target(&state, &req.db)? {
+        super::db::Target::Pool(da) => da
+            .query_with_params(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+        super::db::Target::Tx(t) => t
+            .session
+            .lock()
+            .await
+            .query(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+    }
 }
 
 /// 按方言出 SQL（sea-query QueryBuilder 非 dyn 兼容，match 分发三实现）。

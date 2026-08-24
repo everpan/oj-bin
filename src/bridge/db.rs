@@ -170,6 +170,112 @@ pub fn op_db_has(state: &mut OpState, #[string] name: &str) -> bool {
     state.borrow::<Arc<StableState>>().dbs.contains_key(name)
 }
 
+/// 每请求活跃事务（存 ReqState；Mutex 串行并发 op，Arc 跨 await 共享——
+/// 不得跨 await 持 OpState/RefCell 借用）。
+pub struct ActiveTx {
+    pub db: String,
+    pub session: tokio::sync::Mutex<Box<dyn TxSession>>,
+}
+
+/// 当前请求的活跃事务句柄（无则 None）。借用即取即还。
+pub(crate) fn current_tx(state: &Rc<RefCell<OpState>>) -> Option<Arc<ActiveTx>> {
+    state.borrow().borrow::<super::ReqState>().tx.clone()
+}
+
+/// 查询/执行的目标：本库活跃事务 → 会话；他库活跃事务 → 报错；无 → 池。
+pub(crate) enum Target {
+    Tx(Arc<ActiveTx>),
+    Pool(Arc<dyn DataAccessor>),
+}
+
+pub(crate) fn resolve_target(
+    state: &Rc<RefCell<OpState>>,
+    name: &str,
+) -> Result<Target, JsErrorBox> {
+    if let Some(t) = current_tx(state) {
+        if t.db == name {
+            return Ok(Target::Tx(t));
+        }
+        return Err(JsErrorBox::generic(format!(
+            "transaction active on db '{}' (finish it before touching db '{name}')",
+            t.db
+        )));
+    }
+    Ok(Target::Pool(super::query::lookup(state, name)?))
+}
+
+/// 取走并校验活跃事务（commit/rollback 收尾用；不匹配/缺失报错）。
+fn take_tx(state: &Rc<RefCell<OpState>>, name: &str) -> Result<Arc<ActiveTx>, JsErrorBox> {
+    let mut g = state.borrow_mut();
+    let rs = g.borrow_mut::<super::ReqState>();
+    match rs.tx.take() {
+        Some(t) if t.db == name => Ok(t),
+        Some(t) => {
+            rs.tx = Some(t.clone()); // 放回（别人的事务不动）
+            Err(JsErrorBox::generic(format!(
+                "transaction belongs to db '{}', not '{name}'",
+                t.db
+            )))
+        }
+        None => Err(JsErrorBox::generic("no active transaction")),
+    }
+}
+
+/// db.tx 开始（JS wrapper 调用）：嵌套（已有活跃事务）报错。
+#[op2]
+pub async fn op_db_tx_begin(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<bool, JsErrorBox> {
+    if current_tx(&state).is_some() {
+        return Err(JsErrorBox::generic(
+            "transaction already active (nested tx not supported)",
+        ));
+    }
+    let da = super::query::lookup(&state, &name)?;
+    let session = da
+        .begin()
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    state.borrow_mut().borrow_mut::<super::ReqState>().tx = Some(Arc::new(ActiveTx {
+        db: name,
+        session: tokio::sync::Mutex::new(session),
+    }));
+    Ok(true)
+}
+
+/// db.tx 提交。
+#[op2]
+pub async fn op_db_tx_commit(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<bool, JsErrorBox> {
+    let t = take_tx(&state, &name)?;
+    t.session
+        .lock()
+        .await
+        .commit()
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(true)
+}
+
+/// db.tx 回滚。
+#[op2]
+pub async fn op_db_tx_rollback(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<bool, JsErrorBox> {
+    let t = take_tx(&state, &name)?;
+    t.session
+        .lock()
+        .await
+        .rollback()
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(true)
+}
+
 /// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
 #[op2]
 #[serde]
@@ -180,10 +286,19 @@ pub async fn op_db_query(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<Vec<Row>, JsErrorBox> {
     let params = params.unwrap_or_default();
-    super::query::lookup(&state, &name)?
-        .query_with_params(&sql, &params)
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+    match resolve_target(&state, &name)? {
+        Target::Pool(da) => da
+            .query_with_params(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+        Target::Tx(t) => t
+            .session
+            .lock()
+            .await
+            .query(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+    }
 }
 
 /// db.exec(sql, params?)：Promise<受影响行数>。
@@ -196,10 +311,19 @@ pub async fn op_db_exec(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<i64, JsErrorBox> {
     let params = params.unwrap_or_default();
-    super::query::lookup(&state, &name)?
-        .exec_with_params(&sql, &params)
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+    match resolve_target(&state, &name)? {
+        Target::Pool(da) => da
+            .exec_with_params(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+        Target::Tx(t) => t
+            .session
+            .lock()
+            .await
+            .exec(&sql, &params)
+            .await
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
+    }
 }
 
 /// 旧 `Shared` 类型兼容别名（部分模块仍引用）。

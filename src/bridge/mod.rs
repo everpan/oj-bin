@@ -69,13 +69,16 @@ pub struct StableState {
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
-#[derive(Default, Clone)]
+/// 不 derive Clone：含活跃事务（ActiveTx 不可复制，clone 掉事务句柄就是漏回滚）。
+#[derive(Default)]
 pub struct ReqState {
     pub req: RequestInfo,
     pub response: Option<Vec<u8>>,
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub done: bool,
+    /// 活跃事务（db.tx；每请求至多一个，reset 时丢弃 = drop 自带回滚）。
+    pub tx: Option<Arc<db::ActiveTx>>,
     /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
     pub ws_sends: Vec<String>,
     /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
@@ -90,6 +93,7 @@ impl ReqState {
         self.status = 200;
         self.headers.clear();
         self.done = false;
+        self.tx = None;
         self.ws_sends.clear();
         self.ws_close = false;
     }
@@ -112,6 +116,9 @@ deno_core::extension!(
         db::op_db_has,
         db::op_db_query,
         db::op_db_exec,
+        db::op_db_tx_begin,
+        db::op_db_tx_commit,
+        db::op_db_tx_rollback,
         query::op_db_query_build,
         fetch::op_fetch,
         log::op_log,
@@ -245,6 +252,7 @@ impl Bridge {
         match result {
             Ok(()) => {
                 let cap = Self::read_capture(&rt);
+                Self::finalize_tx(&rt).await;
                 self.pool.checkin(rt);
                 Ok(cap)
             }
@@ -275,6 +283,28 @@ impl Bridge {
         };
         self.kill.arm(ptr, timeout);
         rt
+    }
+
+    /// 请求收尾：未完结的活跃事务保底回滚（checkin 前调用；错误吞掉只告警，
+    /// sqlx Transaction drop 亦会释放连接）。JS 侧正常路径已显式 commit/rollback。
+    async fn finalize_tx(rt: &JsRuntime) {
+        let t = {
+            let op_state = runtime::op_state(rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().tx.take()
+        };
+        if let Some(t) = t {
+            match t.session.lock().await.rollback().await {
+                Ok(()) => eprintln!(
+                    "warn: open transaction on db '{}' rolled back at request end",
+                    t.db
+                ),
+                Err(e) => eprintln!(
+                    "warn: open tx on db '{}' rollback failed at request end: {e}",
+                    t.db
+                ),
+            }
+        }
     }
 
     /// 读取当前 runtime 的 per-request 响应捕获。
@@ -332,6 +362,7 @@ impl Bridge {
             (rs.ws_sends.clone(), rs.ws_close)
         };
         let capture = Self::read_capture(&rt);
+        Self::finalize_tx(&rt).await;
         self.pool.checkin(rt);
         Ok(WsOutcome { capture, sends, close })
     }
@@ -441,6 +472,7 @@ impl Bridge {
         }
         result.map_err(RunError::Core)?;
         let capture = Self::read_capture(&rt);
+        Self::finalize_tx(&rt).await;
         self.pool.checkin(rt);
         Ok(capture)
     }
@@ -628,6 +660,68 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"], json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_commit_visible_and_throw_rolls_back() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let b = Bridge::new(db, Arc::new(InMemoryKV::new()));
+        // 提交可见
+        let cap = b
+            .run(r#"db.tx(async (tx) => { await tx.exec("insert into t (v) values (?)", ["x"]); })
+                .then(() => db.query("select count(*) c from t"))
+                .then((r) => json.ok(r[0]))
+                .catch((e) => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["c"], 1, "{v}");
+        // fn 抛错 → 自动回滚（y 行不可见）
+        let cap = b
+            .run(r#"db.tx(async (tx) => { await tx.exec("insert into t (v) values (?)", ["y"]); throw new Error("boom"); })
+                .then(() => json.fail(500, "should have thrown"))
+                .catch((e) => db.query("select count(*) c from t").then((r) => json.ok({ err: String(e), c: r[0].c })));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["c"], 1, "y must be rolled back: {v}");
+        assert!(v["data"]["err"].as_str().unwrap().contains("boom"), "{v}");
+        // 嵌套 begin 报错
+        let cap = b
+            .run(r#"db.tx(async () => { await db.tx(async () => {}); })
+                .then(() => json.fail(500, "nested should fail"))
+                .catch((e) => json.ok({ msg: String(e) }));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["msg"].as_str().unwrap().contains("already active"), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn builder_in_tx_shares_connection_and_rolls_back() {
+        // 构造器（SELECT-only）在 tx 内必须走同一事务连接：能读到未提交行；
+        // 回滚后行不可见。（sqlite 单连接池下，若 builder 误走 pool 会死锁到超时。）
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let reg = SchemaRegistry::new().table("t", Some("id"), &["id", "v"]);
+        let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), reg, false);
+        let cap = b
+            .run(r#"db.tx(async (tx) => {
+                    await tx.exec("insert into t (v) values (?)", ["z"]);
+                    const rows = await tx.table("t").select(["v"]).all();  // 同一事务连接 → 见未提交 z
+                    throw new Error("force rollback: " + rows.length);
+                }).then(() => json.fail(500, "no"))
+                .catch((e) => db.query("select count(*) c from t").then((r) => json.ok({ msg: String(e), c: r[0].c })));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["msg"].as_str().unwrap().contains("force rollback: 1"), "{v}");
+        assert_eq!(v["data"]["c"], 0, "z must be rolled back: {v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

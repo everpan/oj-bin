@@ -11,6 +11,9 @@ import {
   op_db_has,
   op_db_query,
   op_db_query_build,
+  op_db_tx_begin,
+  op_db_tx_commit,
+  op_db_tx_rollback,
   op_fetch,
   op_finish,
   op_http_info,
@@ -97,6 +100,24 @@ globalThis.DB = function (name) {
       exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
+      // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
+      // commit on resolve, rollback on throw/reject; tx rides the same connection
+      // (query/exec/table route to the active tx). Nested tx is rejected by the op.
+      tx: async (fn) => {
+        await op_db_tx_begin(name);
+        try {
+          const out = await fn({
+            query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
+            exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
+            table: (t) => queryBuilder(name, String(t)),
+          });
+          await op_db_tx_commit(name);
+          return out;
+        } catch (e) {
+          await op_db_tx_rollback(name);
+          throw e;
+        }
+      },
     });
   }
   return dbCache.get(name);
