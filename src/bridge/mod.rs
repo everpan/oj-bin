@@ -22,6 +22,7 @@
 
 mod db;
 mod envelope;
+mod es;
 mod fetch;
 mod accessor_sqlx;
 mod bus;
@@ -43,6 +44,7 @@ pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
 pub use bus::Bus;
+pub use es::EsClient;
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
@@ -74,6 +76,8 @@ pub struct StableState {
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
     /// 订阅发布总线（OJ-6）：server 装配共享一个 Bus 跨连接广播；缺省每 Bridge 自带空 Bus。
     pub bus: Arc<bus::Bus>,
+    /// ES 客户端（OJ-6）：es 配置存在时注入；否则 es.* 报 "es not configured"。
+    pub es: Option<Arc<es::EsClient>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -82,6 +86,8 @@ pub struct Extras {
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
     /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus。
     pub bus: Option<Arc<bus::Bus>>,
+    /// Some = ES 客户端；None = es.* 未配置报错。
+    pub es: Option<Arc<es::EsClient>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -146,6 +152,9 @@ deno_core::extension!(
         blob::op_blob_content_type,
         bus::op_bus_publish,
         bus::op_bus_subscribe,
+        es::op_es_search,
+        es::op_es_index,
+        es::op_es_del,
         fetch::op_fetch,
         log::op_log,
         module_loader::op_resolve_cjs,
@@ -246,6 +255,7 @@ impl Bridge {
             loader,
             blob: extras.blob,
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
+            es: extras.es,
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -1006,6 +1016,7 @@ mod tests {
             loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
             blob: None,
             bus: Arc::new(bus::Bus::new()),
+            es: None,
         });
         let pool = runtime::RuntimePool::new(stable, false);
         let mut rt = pool.checkout();

@@ -20,6 +20,9 @@ import {
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
+  op_es_search,
+  op_es_index,
+  op_es_del,
   op_fetch,
   op_finish,
   op_http_info,
@@ -116,6 +119,13 @@ globalThis.ws = {
 globalThis.bus = {
   publish: (topic, data) => op_bus_publish(String(topic), data === undefined ? null : data),
   subscribe: (topic) => op_bus_subscribe(String(topic)),
+};
+
+// ----- es: Elasticsearch thin client (search/index/del; es not configured errors) -----
+globalThis.es = {
+  search: (index, dsl) => op_es_search(String(index), dsl === undefined ? null : dsl),
+  index: (index, id, doc) => op_es_index(String(index), String(id), doc === undefined ? null : doc),
+  del: (index, id) => op_es_del(String(index), String(id)),
 };
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----
