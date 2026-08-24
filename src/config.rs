@@ -47,6 +47,34 @@ impl Default for TenantCfg {
     }
 }
 
+/// JWT 鉴权（OJ-4）：`auth:` 块存在即启用；jwt_secret 空 = 装配 fail-fast。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct AuthCfg {
+    pub jwt_secret: String,
+    /// HS256 | HS384 | HS512。
+    pub signing_method: String,
+    pub access_token_duration: String,
+    pub refresh_token_duration: String,
+    /// 免鉴权路径（去 base 后）；结尾 "/*" = 一层前缀通配。
+    pub anonymous_paths: Vec<String>,
+    /// 用户表名（login 查询用；标识符白名单校验）。
+    pub user_table: String,
+}
+
+impl Default for AuthCfg {
+    fn default() -> Self {
+        Self {
+            jwt_secret: String::new(),
+            signing_method: "HS256".into(),
+            access_token_duration: "60s".into(),
+            refresh_token_duration: "720h".into(),
+            anonymous_paths: Vec::new(),
+            user_table: "users".into(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -56,6 +84,8 @@ pub struct Config {
     /// name → redis URL（v0.1 warn 后用内存 KV）。
     pub redis: HashMap<String, String>,
     pub tenant: TenantCfg,
+    /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
+    pub auth: Option<AuthCfg>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -89,6 +119,8 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         "s" | "sec" | "secs" => 1.0,
         "ms" => 0.001,
         "m" | "min" => 60.0,
+        "h" => 3600.0,
+        "d" => 86400.0,
         _ => return Err(format!("invalid duration unit: {unit}")),
     };
     Ok(std::time::Duration::from_secs_f64(n * mult))
@@ -143,6 +175,32 @@ mod tests {
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_cfg_defaults_and_none() {
+        // auth 未配置 → None
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.auth.is_none());
+        // auth: 存在但字段全省缺 → 各默认值
+        let dir = std::env::temp_dir().join(format!("ojcfga-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg.yaml"), "auth:\n  jwt_secret: s3cret\n").unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let a = c.auth.expect("some");
+        assert_eq!(a.jwt_secret, "s3cret");
+        assert_eq!(a.signing_method, "HS256");
+        assert_eq!(a.access_token_duration, "60s");
+        assert_eq!(a.refresh_token_duration, "720h");
+        assert_eq!(a.user_table, "users");
+        assert!(a.anonymous_paths.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duration_hours_and_days() {
+        assert_eq!(parse_duration("720h").unwrap().as_secs(), 2_592_000);
+        assert_eq!(parse_duration("2d").unwrap().as_secs(), 172_800);
     }
 
     #[test]
