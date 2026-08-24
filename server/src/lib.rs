@@ -1,6 +1,7 @@
 //! mdm-server：HTTP 层。目录镜像路由（routes）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
 
 pub mod actor;
+pub mod auth;
 pub mod routes;
 pub mod ws;
 
