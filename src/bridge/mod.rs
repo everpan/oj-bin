@@ -42,7 +42,7 @@ pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, LocalBlob, valid_key};
 pub use envelope::{fail, ok, status_code};
-pub use http::RequestInfo;
+pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
@@ -120,6 +120,7 @@ deno_core::extension!(
         json::op_json_fail,
         json::op_json_header,
         http::op_http_info,
+        http::op_http_file,
         kv::op_kv_get,
         kv::op_kv_set,
         kv::op_kv_del,
@@ -739,6 +740,45 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"], json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_files_and_file_roundtrip() {
+        // http.files 元信息 + http.file(i) 字节；越界 → "no such file"。
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    const f = http.files[0];
+                    const bts = await http.file(0);
+                    json.ok({ name: f.filename, ct: f.content_type, size: f.size, n: bts.length, b0: bts[0] });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo {
+                    files: vec![UploadedFile {
+                        field: "file".into(),
+                        filename: "a.png".into(),
+                        content_type: Some("image/png".into()),
+                        bytes: vec![1, 2, 3],
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], json!({"name": "a.png", "ct": "image/png", "size": 3, "n": 3, "b0": 1}), "{v}");
+        // 无文件时取越界索引 → 报错
+        let cap = b
+            .run_with(
+                r#"(async () => { await http.file(5); json.fail(500, "should throw"); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("no such file"), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

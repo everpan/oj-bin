@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::actor::JsActor;
 use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
-use mdm_base_rust::bridge::{fail, RequestInfo};
+use mdm_base_rust::bridge::{fail, RequestInfo, UploadedFile};
 use serde_json::json;
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
@@ -40,12 +40,24 @@ pub struct AppState {
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Pipeline {
     /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
     pub tenant_header: Option<String>,
     /// Some = 鉴权启用：内置 {base}/auth/* 路由 + Bearer 守卫 + http.user。
     pub auth: Option<Arc<Auth>>,
+    /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
+    pub max_upload: u64,
+}
+
+impl Default for Pipeline {
+    fn default() -> Self {
+        Self {
+            tenant_header: None,
+            auth: None,
+            max_upload: 10 * 1024 * 1024, // 10MiB
+        }
+    }
 }
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
@@ -61,15 +73,19 @@ pub fn app(
     pipeline: Pipeline,
 ) -> Router {
     let dir = dir.into();
-    Router::new().fallback(any(handle)).with_state(AppState {
-        table,
-        fallback: ts.then(|| Routes::new(base, dir, ts)),
-        actor,
-        timeout,
-        static_root,
-        pipeline,
-        base: base.to_string(),
-    })
+    Router::new()
+        .fallback(any(handle))
+        // 超 2x max_upload 的请求在 axum 层直接被拒（裸 413）；handle() 内再做信封 413。
+        .layer(axum::extract::DefaultBodyLimit::max((pipeline.max_upload * 2) as usize))
+        .with_state(AppState {
+            table,
+            fallback: ts.then(|| Routes::new(base, dir, ts)),
+            actor,
+            timeout,
+            static_root,
+            pipeline,
+            base: base.to_string(),
+        })
 }
 
 /// 绑定监听并服务。
@@ -177,6 +193,16 @@ async fn handle(
                 }
                 None => None,
             };
+            // 上传/请求体上限（信封 413）；超 2x 的已在 axum 层被拒。
+            if body.len() > st.pipeline.max_upload as usize {
+                return fail_response(413, "upload too large");
+            }
+            // multipart：文本字段并入 body（{name: value}），文件入 files。
+            let (body_bytes, files) = if is_multipart(&headers) {
+                parse_multipart(&headers, &body).await
+            } else {
+                (body.to_vec(), Vec::new())
+            };
             let req = RequestInfo {
                 method: verb.to_string(),
                 params,
@@ -185,9 +211,10 @@ async fn handle(
                     .iter()
                     .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
                     .collect(),
-                body: body.to_vec(),
+                body: body_bytes,
                 tenant_id,
                 user,
+                files,
             };
             match st.actor.run_module(file, m, req, st.timeout).await {
                 Ok(cap) => capture_response(cap),
@@ -326,6 +353,43 @@ fn fail_response(code: i32, msg: &str) -> Response {
 fn parse_query(q: Option<&str>) -> HashMap<String, String> {
     q.map(|s| form_urlencoded::parse(s.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
         .unwrap_or_default()
+}
+
+/// content-type 是否 multipart/form-data。
+fn is_multipart(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("multipart/form-data"))
+}
+
+/// multer 解析：文本字段 → {name: value}，文件 → Vec<UploadedFile>。
+/// body 已整体在内存（DefaultBodyLimit 上限内），用 once stream 喂 multer。
+async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<UploadedFile>) {
+    let boundary = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split("boundary=").nth(1))
+        .map(|b| b.trim().trim_matches('"'))
+        .unwrap_or_default();
+    let stream = futures_util::stream::once(async move {
+        Ok::<_, multer::Error>(axum::body::Bytes::from(body.to_vec()))
+    });
+    let mut mp = multer::Multipart::new(stream, boundary);
+    let mut fields = serde_json::Map::new();
+    let mut files = Vec::new();
+    while let Some(f) = mp.next_field().await.ok().flatten() {
+        let name = f.name().unwrap_or_default().to_string();
+        let filename = f.file_name().unwrap_or_default().to_string();
+        let content_type = f.content_type().map(|s| s.to_string());
+        let bytes = f.bytes().await.unwrap_or_default().to_vec();
+        if filename.is_empty() {
+            fields.insert(name, Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        } else {
+            files.push(UploadedFile { field: name, filename, content_type, bytes });
+        }
+    }
+    (serde_json::to_vec(&fields).unwrap_or_default(), files)
 }
 
 #[cfg(test)]
@@ -470,6 +534,65 @@ pub(crate) mod tests {
         )
         .await;
         assert!(plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"), "{plain}");
+    }
+
+    /// multipart：文本字段并入 body、文件进 http.files + http.file(i) 取字节；
+    /// 非 multipart JSON 语义不变；超 max_upload 413 信封。
+    #[tokio::test]
+    async fn multipart_upload_and_413() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() {\n\
+               const f = http.files[0];\n\
+               const b = f ? (await http.file(0)) : null;\n\
+               json.ok({ name: f ? f.filename : null, n: f ? b.length : 0, note: http.body.note });\n\
+             } };",
+        )]);
+        // 默认上限（10MiB）：multipart + JSON 双语义。
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let mp = |bytes: &[u8], note: &str| {
+            let body = format!(
+                "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n{note}\r\n\
+                 --X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n{}\r\n\
+                 --X-BND--\r\n",
+                String::from_utf8_lossy(bytes)
+            );
+            format!(
+                "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let r = raw_http(addr, &mp(&[1, 2, 3], "hi")).await;
+        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "1: {r}");
+        assert_eq!(v["data"]["name"], "a.png", "{v}");
+        assert_eq!(v["data"]["n"], 3, "{v}");
+        assert_eq!(v["data"]["note"], "hi", "{v}");
+        // 非 multipart JSON → body 原语义不变（files 空 → name null）
+        let j = format!(
+            "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"note\":\"hi\"}}",
+            13
+        );
+        let r = raw_http(addr, &j).await;
+        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "2: {r}");
+        assert_eq!(v["data"]["name"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["data"]["note"], "hi", "{v}");
+        // 超 max_upload（8B，默认 body limit=16B，12B JSON 能进 handle）→ 413 信封。
+        let addr2 = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline { max_upload: 8, ..Default::default() },
+        )
+        .await;
+        let r = raw_http(
+            addr2,
+            "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"a\":123456}",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 413") && r.contains("upload too large"), "3: {r}");
     }
 
     /// auth 全链路：401/匿名/login/Bearer 注入/篡改/refresh 轮换/logout。

@@ -21,6 +21,7 @@ import {
   op_fetch,
   op_finish,
   op_http_info,
+  op_http_file,
   op_json_fail,
   op_json_header,
   op_json_ok,
@@ -54,6 +55,7 @@ globalThis.http = new Proxy({}, {
         return v === undefined ? def : v;
       };
     }
+    if (p === "file") return (i) => op_http_file(i | 0);
     return httpInfo()[p];
   },
 });

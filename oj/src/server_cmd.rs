@@ -216,6 +216,7 @@ pub async fn start(
     let pipeline = mdm_server::Pipeline {
         tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
         auth,
+        max_upload: cfg.server.max_upload_bytes,
     };
     let h = tokio::spawn(async move {
         let _ = mdm_server::serve_with_listener(
