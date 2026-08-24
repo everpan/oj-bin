@@ -18,6 +18,8 @@ pub struct ServerCfg {
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
+    /// 上传体积上限（字节；超出 413）。axum 层再乘 2 做硬顶。
+    pub max_upload_bytes: u64,
 }
 
 impl Default for ServerCfg {
@@ -29,6 +31,37 @@ impl Default for ServerCfg {
             root: None,
             timeout: "30s".into(),
             pool_size: 4,
+            max_upload_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+/// 对象存储（OJ-5）：driver local|s3；local root 相对 config 目录。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct BlobCfg {
+    pub driver: String,
+    pub root: String,
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    /// MinIO 等路径风格访问。
+    pub path_style: bool,
+}
+
+impl Default for BlobCfg {
+    fn default() -> Self {
+        Self {
+            driver: "local".into(),
+            root: "uploads".into(),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            access_key: None,
+            secret_key: None,
+            path_style: false,
         }
     }
 }
@@ -86,6 +119,8 @@ pub struct Config {
     pub tenant: TenantCfg,
     /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
     pub auth: Option<AuthCfg>,
+    /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
+    pub blob: Option<BlobCfg>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -174,6 +209,41 @@ mod tests {
         std::fs::write(dir.join("cfg.yaml"), "tenant:\n  enable: true\n  header_key: X-ACCT\n").unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_cfg_defaults_and_s3_parse() {
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.blob.is_none());
+        assert_eq!(ServerCfg::default().max_upload_bytes, 10 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("ojcfgbl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "blob:\n",
+                "  driver: s3\n",
+                "  endpoint: http://127.0.0.1:9000\n",
+                "  bucket: app\n",
+                "  region: us-east-1\n",
+                "  access_key: minioadmin\n",
+                "  secret_key: minioadmin\n",
+                "  path_style: true\n",
+                "server:\n  max_upload_bytes: 2048\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let b = c.blob.expect("some");
+        assert_eq!(b.driver, "s3");
+        assert_eq!(b.bucket.as_deref(), Some("app"));
+        assert!(b.path_style);
+        assert_eq!(c.server.max_upload_bytes, 2048);
+        // 省缺字段走默认（直接断 Default；YAML 裸 `blob:` 是 null → None）
+        let d = BlobCfg::default();
+        assert_eq!((d.driver.as_str(), d.root.as_str()), ("local", "uploads"));
+        assert!(!d.path_style && d.bucket.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
