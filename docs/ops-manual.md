@@ -42,8 +42,10 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
 - **静态站点** `server.root`：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
   （目录 → `index.html`）；目录缺失启动即报错。前置站点产物（如 oj build 的 dist）放独立目录。
-- **DB** `db.default = "sqlite://<path>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。
-  v0.1 仅 sqlite。`sqlite::memory:` 仅测试用，重启即丢。
+- **DB** `db.<name> = "<DSN>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。
+  v0.2 多库混用：`sqlite://`（缺文件自动建空库）/`mysql://`/`postgres://`（透传，连不上启动
+  fail-fast）。`sqlite::memory:` 仅测试用，重启即丢。**seed.sql 只对 sqlite 的 default 重放**，
+  mysql/pg 的建库/迁移归运维。
 - **Redis** `redis.default`：v0.1 **不真连**，仅 warn 并退回内存 KV——多实例部署时 KV 不共享，
   需业务自行注意（避免把跨实例一致状态塞进 `redis`/`kv`）。
 - **seed.sql**：项目根存在则启动时对 `default` 库重放。语句按 `;` 切分 → **seed 内不得有分号
@@ -88,7 +90,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |
-| 非 sqlite DSN 启动失败 | v0.1 只支持 sqlite | 改 `sqlite://` |
+| 未知 DSN scheme 启动失败 | 仅支持 sqlite/mysql/postgres | 检查 `db:` 各 DSN 前缀 |
+| mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
+| 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
 | `redis` 数据不跨实例 | v0.1 退回内存 KV | 改走 `db` 或外部服务 |
 | 端口占用 | `778` 需 root | 换 ≥1024 端口 |
 | 改 `api.ts` 不生效 | release 下 `dist/` 未更新 / 已加载包缓存 | 确认 dist 同步；必要时重启 |

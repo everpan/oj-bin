@@ -73,14 +73,17 @@ server:
   pool_size: 4            # JS 执行线程数（并发度）
   root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
 db:
-  default: "sqlite://db.sqlite"   # 命名库实例；v0.1 仅支持 sqlite
+  default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
+  # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # v0.2 多库
+  # warehouse: "postgres://127.0.0.1:5432/app"
 redis:
   default: "redis://127.0.0.1:6379/1"   # v0.1 仅 warn 并退回内存 KV
 ```
 
 - `server` 字段全可省（都有默认值）。
-- `db`：`name → DSN` 映射。v0.1 **只支持 sqlite**：`sqlite://<path>`（相对 config 目录）、
-  `sqlite::memory:`（内存库）。非 sqlite DSN 启动即报错。
+- `db`：`name → DSN` 映射，多库可混用：`sqlite://<path>`（相对 config 目录）、`sqlite::memory:`、
+  `mysql://…`、`postgres://…`（原样透传）。`DB("name")` 按名取库；构造器（`db.table()`）
+  自动按库方言出 SQL。裸 SQL 的占位符方言归业务（sqlite/mysql `?`，postgres `$1`）。
 - `redis`：`name → url` 映射。v0.1 **不真连 Redis**，仅打印 warn 并用进程内存 KV 模拟
   （`redis.get/set` 与 `kv.get/set` 同源）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
@@ -298,7 +301,7 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 ## 12. 已知限制（v0.1）
 
 - `redis` 不真连 Redis，退回内存 KV。
-- `db` 仅 sqlite；`build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
+- 相对 `require()` 不支持；`build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - 相对 `require("./x")`、`package.json` `exports`/`conditions`、pnpm 布局不支持。
 - npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules` 解析，发布物需自带）。
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。

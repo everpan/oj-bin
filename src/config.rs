@@ -37,7 +37,7 @@ impl Default for ServerCfg {
 #[serde(default)]
 pub struct Config {
     pub server: ServerCfg,
-    /// name → DSN（sqlite://…；v0.1 仅 sqlite）。
+    /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 仅 default 为 sqlite 时重放）。
     pub db: HashMap<String, String>,
     /// name → redis URL（v0.1 warn 后用内存 KV）。
     pub redis: HashMap<String, String>,

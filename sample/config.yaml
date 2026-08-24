@@ -6,6 +6,9 @@ server:
 db:
   default: "sqlite://db.sqlite"
   test: "sqlite://db_test.sqlite"
+  # 多库混用（v0.2）：mysql/postgres DSN 原样透传，按名 DB("name") 取用。
+  # analytics: "mysql://user:pass@127.0.0.1:3306/app"
+  # warehouse: "postgres://127.0.0.1:5432/app"
 
 redis:
   default: "redis://127.0.0.1:6379/1"   # v0.1: warn + 内存 KV 模拟

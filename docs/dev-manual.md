@@ -23,9 +23,9 @@ src/                  # crate: mdm-base-rust（lib + bench）
     ├── http.rs       # RequestInfo{method,params,query,headers,body}、export_bytes
     ├── envelope.rs   # {code,msg,data} 信封、HTTP 状态映射
     ├── json.rs       # json.ok/fail/header ops
-    ├── db.rs         # db.query/exec + DB(name)
-    ├── accessor_sqlx.rs # sqlx Any + 结果行导出
-    ├── query.rs      # 安全查询构造器 op（table.select.where…）
+    ├── db.rs         # db.query/exec + DB(name) + Dialect（DSN 前缀解析）
+    ├── accessor_sqlx.rs # sqlx Any + 结果行导出（mysql/pg/sqlite 按方案分发）
+    ├── query.rs      # 安全查询构造器 op（table.select.where…；按库方言选 QueryBuilder）
     ├── kv.rs         # 内存 KV（redis/kv 同源）
     ├── fetch.rs      # fetch op（reqwest 封装的 HTTP 客户端）
     ├── log.rs        # log op（结构化）
@@ -158,13 +158,14 @@ HTTP 请求
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：97 通过（mdm-server 42 + oj lib 40 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：98 通过（mdm-server 42 + oj lib 41 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
-- Redis 退回内存 KV、db 仅 sqlite、相对 `require()` 不支持——均接受为 v0.1 已知限制。
+- Redis 退回内存 KV、相对 `require()` 不支持——均接受为 v0.1 已知限制（db 仅 sqlite 已于
+  v0.2 解除：多库 DSN 按 scheme 分发，设计见 `2026-08-24-oj-p2-design.md` §1）。
 - `build` 已于 2026-08-24 实现（按模块版本目录 + 产物保留原名原结构 + 默认 minify +
   manifests.yaml 锁 + 确定性 tgz + release 聚合），设计见
   `docs/superpowers/specs/2026-08-23-oj-build-design.md`（顶部有去 hash 修订注记）。
