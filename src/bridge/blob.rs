@@ -299,22 +299,29 @@ pub async fn op_blob_url(
     b.url(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
-/// blob.contentType(key)。
+/// blob.contentType(key) → content-type 字符串；缺失/无 sidecar/无法推断扩展名时返回空串。
 #[op2]
 #[string]
 pub async fn op_blob_content_type(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
-) -> Result<Option<String>, JsErrorBox> {
+) -> Result<String, JsErrorBox> {
     let b = { backend(&state.borrow())? };
-    b.content_type(&key)
+    let ct = b
+        .content_type(&key)
         .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(ct.unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::Value;
+
+    use crate::bridge::{BlobServed, Bridge, Extras, InMemoryKV, RequestInfo, S3Blob, SchemaRegistry};
+    use crate::config::BlobCfg;
 
     fn tmp_root() -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -376,5 +383,114 @@ mod tests {
         assert!(b.url(&key).await.unwrap().starts_with("http"), "presigned url");
         b.del(&key).await.unwrap();
         assert!(b.get(&key).await.is_err());
+    }
+
+    #[test]
+    fn infer_content_type_by_extension() {
+        assert_eq!(infer_content_type("a.png"), Some("image/png".into()));
+        assert_eq!(infer_content_type("a.JPG"), Some("image/jpeg".into()));
+        assert_eq!(infer_content_type("a.svg"), Some("image/svg+xml".into()));
+        assert_eq!(infer_content_type("a.pdf"), Some("application/pdf".into()));
+        assert_eq!(infer_content_type("a.json"), Some("application/json".into()));
+        assert_eq!(infer_content_type("a.mp4"), Some("video/mp4".into()));
+        assert_eq!(infer_content_type("a.unknown"), None);
+    }
+
+    #[test]
+    fn s3_new_requires_bucket_and_region() {
+        let missing_bucket = crate::config::BlobCfg {
+            driver: "s3".into(),
+            root: String::new(),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            bucket: None,
+            region: Some("us-east-1".into()),
+            access_key: None,
+            secret_key: None,
+            path_style: true,
+        };
+        assert!(S3Blob::new(&missing_bucket).is_err());
+        let missing_region = crate::config::BlobCfg {
+            driver: "s3".into(),
+            root: String::new(),
+            endpoint: Some("http://127.0.0.1:9000".into()),
+            bucket: Some("b".into()),
+            region: None,
+            access_key: None,
+            secret_key: None,
+            path_style: true,
+        };
+        assert!(S3Blob::new(&missing_region).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_serve_returns_bytes_and_content_type() {
+        let root = tmp_root();
+        let b = LocalBlob::new(&root, "/v1/api").unwrap();
+        b.put("d/e.txt", b"hello", Some("text/plain")).await.unwrap();
+        // serve 直出字节 + content_type
+        let sv = b.serve("d/e.txt").await.unwrap();
+        match sv {
+            BlobServed::Bytes(bytes, ct) => {
+                assert_eq!(bytes, b"hello".to_vec());
+                assert_eq!(ct.as_deref(), Some("text/plain"));
+            }
+            BlobServed::Redirect(_) => panic!("local blob must inline-serve"),
+        }
+        // 越界 key 经 os_path 拒绝
+        assert!(b.serve("../up").await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn s3_new_success_and_content_type_offline() {
+        // S3Blob::new 成功路径（仅需 bucket/region；离线可构造，build 不触网）。
+        let cfg = BlobCfg {
+            driver: "s3".into(),
+            root: String::new(),
+            endpoint: None,
+            bucket: Some("my-bucket".into()),
+            region: Some("us-east-1".into()),
+            access_key: None,
+            secret_key: None,
+            path_style: false,
+        };
+        let s3 = S3Blob::new(&cfg).unwrap();
+        // content_type：S3 侧自身元数据负责 → None（不触网）。
+        assert_eq!(s3.content_type("a/b.png").await.unwrap(), None);
+        // 非法 key（穿越/绝对路径）被 os_path 拒绝。
+        assert!(s3.content_type("/abs").await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn op_blob_content_type_via_bridge() {
+        let root = tmp_root();
+        let local = LocalBlob::new(&root, "/v1/api").unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras { blob: Some(Arc::new(local)), ..Default::default() },
+        );
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    await blob.put("js/a.bin", new Uint8Array([1]), "application/x-foo");
+                    const explicit = await blob.contentType("js/a.bin");     // sidecar
+                    const inferred = await blob.contentType("js/b.png");    // 未见过的 key → 扩展名推断
+                    const missing = await blob.contentType("js/nope");      // 无 sidecar / 无扩展名 → null
+                    json.ok({ explicit, inferred, missing });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["explicit"], "application/x-foo");
+        assert_eq!(v["data"]["inferred"], "image/png");
+        assert_eq!(v["data"]["missing"], "");
     }
 }

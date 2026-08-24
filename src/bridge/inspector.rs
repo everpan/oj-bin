@@ -16,7 +16,7 @@ use tokio_tungstenite::accept_async;
 /// 启动一个 inspector WebSocket 服务，监听 `addr`，将连接绑定到给定 runtime 的 inspector。
 ///
 /// 该 runtime 必须以 `RuntimeOptions { inspector: true }` 创建。服务在后台 task 运行。
-pub fn spawn(inspector: Rc<JsRuntimeInspector>, addr: SocketAddr) {
+pub fn spawn(inspector: Rc<JsRuntimeInspector>, addr: SocketAddr) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
@@ -41,7 +41,7 @@ pub fn spawn(inspector: Rc<JsRuntimeInspector>, addr: SocketAddr) {
             let insp = inspector.clone();
             tokio::task::spawn_local(session_loop(insp, ws));
         }
-    });
+    })
 }
 
 /// 单条 DevTools 连接的消息桥接：WS 文本 <-> local session。
@@ -82,4 +82,65 @@ async fn session_loop(inspector: Rc<JsRuntimeInspector>, ws: tokio_tungstenite::
         }
     }
     pump.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deno_core::{JsRuntime, RuntimeOptions};
+    use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_bind_failure_logs_and_returns() {
+        // rt/insp 必须在 LocalSet 之外创建，且 LocalSet（持有 spawned 任务里的 insp clone）
+        // 必须在 rt 之前释放，否则 JsRuntime drop 断言 "inspector must be dropped before runtime"。
+        let rt = JsRuntime::new(RuntimeOptions { inspector: true, ..Default::default() });
+        let insp = rt.inspector();
+        let ls = tokio::task::LocalSet::new();
+        ls.run_until(async {
+            // 端口 1 通常无绑定权限 → bind 失败分支。
+            spawn(insp.clone(), "0.0.0.0:1".parse().unwrap());
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        })
+        .await;
+        drop(ls);
+        drop(insp);
+        drop(rt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_forwards_cdp_and_close() {
+        let rt = JsRuntime::new(RuntimeOptions { inspector: true, ..Default::default() });
+        let insp = rt.inspector();
+        // 取空闲端口后释放，交给 spawn 重新绑定。
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let ls = tokio::task::LocalSet::new();
+        ls.run_until(async {
+            spawn(insp.clone(), addr);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+
+            let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+            ws.send(Message::Text(r#"{"id":1,"method":"Runtime.enable"}"#.into()))
+                .await
+                .unwrap();
+            // 期望收到 CDP 响应/事件（带超时防挂死）。
+            let got = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
+            assert!(got.is_ok(), "expected a CDP frame from inspector");
+            let msg = got.unwrap().unwrap().unwrap();
+            assert!(matches!(msg, Message::Text(_)), "expected text frame: {msg:?}");
+
+            // Close → session_loop 走 Close 分支并中止 pump。
+            ws.send(Message::Close(None)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        })
+        .await;
+        drop(ls);
+        drop(insp);
+        drop(rt);
+    }
 }

@@ -11,6 +11,7 @@ import {
   op_blob_get,
   op_blob_put,
   op_blob_url,
+  op_blob_content_type,
   op_bus_publish,
   op_bus_subscribe,
   op_db_exec,
@@ -107,6 +108,7 @@ globalThis.blob = {
   get: (key) => op_blob_get(String(key)),
   del: (key) => op_blob_del(String(key)),
   url: (key) => op_blob_url(String(key)),
+  contentType: (key) => op_blob_content_type(String(key)),
 };
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----

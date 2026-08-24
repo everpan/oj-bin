@@ -85,3 +85,41 @@ pub async fn op_bus_subscribe(
         None => Err(JsErrorBox::generic("bus.subscribe requires a WebSocket connection")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn publish_to_subscriber_and_unknown_topic() {
+        let bus = Bus::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bus.subscribe("news", tx);
+        assert_eq!(bus.publish("news", &json!({"a": 1})), 1);
+        let frame = rx.try_recv().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["topic"], "news");
+        assert_eq!(v["data"], json!({"a": 1}));
+        // 无订阅者 → 0
+        assert_eq!(bus.publish("other", &json!(2)), 0);
+    }
+
+    #[test]
+    fn subscribe_dedupes_same_channel_and_cleans_closed() {
+        let bus = Bus::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bus.subscribe("t", tx.clone());
+        bus.subscribe("t", tx); // 同 channel 去重，不重复注册
+        assert_eq!(bus.publish("t", &json!(1)), 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err()); // 只投递一次
+
+        // 订阅者已关闭 → publish 清理并返回 0
+        let bus2 = Bus::new();
+        let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
+        bus2.subscribe("t", tx2);
+        drop(rx2);
+        assert_eq!(bus2.publish("t", &json!(1)), 0);
+    }
+}

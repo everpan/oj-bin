@@ -329,3 +329,91 @@ pub async fn op_db_exec(
 /// 旧 `Shared` 类型兼容别名（部分模块仍引用）。
 #[allow(dead_code)]
 pub type _SharedCompat = Shared;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn dialect_of_recognizes_prefixes() {
+        assert_eq!(dialect_of("sqlite://x"), Dialect::Sqlite);
+        assert_eq!(dialect_of("sqlite::memory:"), Dialect::Sqlite);
+        assert_eq!(dialect_of("mysql://u@h/d"), Dialect::MySql);
+        assert_eq!(dialect_of("postgres://h/d"), Dialect::Postgres);
+        assert_eq!(dialect_of("postgresql://h/d"), Dialect::Postgres);
+        // 未知前缀回落 sqlite
+        assert_eq!(dialect_of("weird://x"), Dialect::Sqlite);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_propagates_accessor_error() {
+        let db = Arc::new(InMemoryAccessor::new());
+        db.seed([json!({"id": 1})]);
+        db.set_error("boom");
+        let b = Bridge::new(db, Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(r#"db.query("select 1").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500);
+        assert!(v["msg"].as_str().unwrap().contains("boom"), "{v}");
+
+        // exec 同理
+        let cap = b
+            .run(r#"db.exec("delete from t").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500);
+        assert!(v["msg"].as_str().unwrap().contains("boom"), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn commit_without_active_tx_errors() {
+        use deno_core::OpState;
+        use crate::bridge::ReqState;
+        // 无活跃事务时收尾（take_tx 缺失分支）→ 直接报 "no active transaction"。
+        // commit/rollback 共用 take_tx，仅需 ReqState，不依赖任何 DataAccessor。
+        let mut op_state = OpState::new(None::<deno_core::OpStackTraceCallback>);
+        op_state.put(ReqState::default());
+        let state = std::rc::Rc::new(std::cell::RefCell::new(op_state));
+        let r = take_tx(&state, "default");
+        assert!(r.is_err(), "expected error when no tx active");
+        assert!(
+            r.err().unwrap().to_string().contains("no active transaction"),
+            "expected no-active-tx error"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_db_query_during_tx_rejected() {
+        let def = Arc::new(InMemoryAccessor::new());
+        def.seed([json!({"id": 1})]);
+        let other = Arc::new(InMemoryAccessor::new());
+        let b = Bridge::with_dbs(
+            std::collections::HashMap::from([
+                ("default".to_string(), def as Arc<dyn DataAccessor>),
+                ("other".to_string(), other as Arc<dyn DataAccessor>),
+            ]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new().table("t", Some("id"), &["id"]),
+            false,
+        );
+        // 在 default 上开事务，再于事务内查询 other → 拒绝。
+        let cap = b
+            .run(r#"
+                db.tx(async () => {
+                  await DB("other").query("select 1");
+                }).then(() => json.ok({})).catch(e => json.fail(409, String(e)));
+            "#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 409, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("transaction active on db 'default'"), "{v}");
+    }
+}

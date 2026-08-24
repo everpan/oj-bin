@@ -62,13 +62,20 @@ cargo build                                   # debug
 cargo build --release                         # release（产物在 target/release/oj）
 cargo test -p oj                              # 单测 + e2e
 cargo test -p mdm-server                      # server 单测
-cargo test --workspace --exclude mdm-base-rust # 全部（见下条说明）
+cargo test --workspace                        # 全部（lib + bin + server + oj + e2e）
 cargo run -p oj -- server -c sample/config.yaml -d sample/src        # dev（按目录自动判定）
 cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
+
+# 覆盖率（需 cargo-llvm-cov；deno_core V8 需用 llvm-cov 而非内置 --coverage）
+cargo llvm-cov --workspace --summary-only
+
+# 集成测试（默认 #[ignore]，需真服务；见 §7）
+OJ_TEST_REDIS=redis://127.0.0.1:6379/1 cargo test --workspace -- --ignored
 ```
 
-> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，60 通过）。
+> 注：mdm-base-rust 全套测试已修复为可跑：当前 `cargo test --workspace` 全绿，
+> 合计 **206 通过 + 3 忽略**（细节见 §7）。mdm-base-rust 覆盖率：**行 92.66% / 区域 91.39%**（>90%）。
 > 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
 > `v8::IsolateHandle`，见 §3）。
 
@@ -206,10 +213,20 @@ RBAC 等真需求出现再议（YAGNI）。
   测试用 `cfg.server.port = 0` + `db default = "sqlite::memory:"` 隔离；每个用例都要自带
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
-- 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：109 通过（mdm-server 52 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
-  避免端口/文件冲突）+ `mdm-base-rust` lib 60（3 忽略 = 真 ES/Redis 驱动的 roundtrip）。
-  `cargo test --workspace --exclude mdm-base-rust` 全绿；mdm-base-rust 全套 lib 也可跑（§2）。
+- 单元测试随模块内联（`#[cfg(test)]`）；独立优先——内存后端（`InMemoryAccessor` /
+  `InMemoryKV` / `SqlxAccessor::arc("sqlite::memory:")`）、临时目录、`httptest` 桩 ES/fetch、
+  本地 `TcpListener` 桩，全程不依赖外部服务。
+- 真服务集成测试走 `#[ignore]` + 环境变量门控，本地无服务时默认跳过，CI 不会因缺服务挂红：
+  - `OJ_TEST_ES=http://127.0.0.1:9200` → `bridge::es::tests::es_roundtrip`
+  - `OJ_TEST_REDIS=redis://127.0.0.1:6379/1` → `bridge::kv::tests::redis_roundtrip`
+  - `OJ_TEST_S3=endpoint|bucket|region|access|secret|path_style`
+    （如 `http://127.0.0.1:9000|oj-test|us-east-1|minioadmin|minioadmin|true`）
+    → `bridge::blob::tests::s3_e2e_roundtrip`
+  - 运行：`cargo test --workspace -- --ignored`（可前置对应环境变量；Redis 已在本地 :6379 常驻时直接通过）。
+- 当前计数：**206 通过 + 3 忽略**。`mdm-base-rust` lib **92** + bin **2**、`mdm-server` **52**、
+  `oj` lib **42** + bin **3**、`e2e` **15**（E2E_LOCK 串行锁避免端口/文件冲突）。
+  覆盖率：**行 92.66% / 区域 91.39%**（`cargo llvm-cov --workspace --summary-only`），整体 >90%。
+  `cargo test --workspace` 全绿。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
 

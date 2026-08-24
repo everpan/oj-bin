@@ -312,4 +312,72 @@ mod tests {
         assert_eq!(v["code"], 0, "raw query failed: {v}");
         assert_eq!(v["data"]["rows"], json!([{"name": "ever"}]));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tx_query_and_typed_columns() {
+        let db = SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .expect("connect");
+        db.exec_with_params(
+            "create table q (id integer primary key, b integer, f real, blobf blob, t text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.exec_with_params(
+            "insert into q (b, f, blobf, t) values (?, ?, ?, ?)",
+            &[json!(true), json!(1.5), json!("raw"), json!("hi")],
+        )
+        .await
+        .unwrap();
+
+        let tx = db.begin().await.unwrap();
+        // SqlxTx::query（事务内查询）+ column_json 的 i64/f64/bytes/text 分支
+        let rows = tx.query("select b, f, blobf, t from q", &[]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].get("b").is_some());
+        assert!((rows[0]["f"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+        assert_eq!(rows[0]["blobf"], json!("raw"));
+        assert_eq!(rows[0]["t"], json!("hi"));
+
+        // bind_value 的 other 分支：绑定对象（Any 接受其字符串化）
+        let r = tx
+            .query("select ? as v", &[json!({"x": 1})])
+            .await
+            .unwrap();
+        assert_eq!(r[0]["v"], json!("{\"x\":1}"));
+
+        tx.commit().await.unwrap();
+        // 已完结的事务再次使用 → "tx finished"
+        assert!(tx.query("select 1", &[]).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bad_sql_errors_and_tx_exec() {
+        let db = SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .expect("connect");
+        // query_with_params 错误路径
+        assert!(db.query_with_params("select * from nope", &[]).await.is_err());
+        assert!(db.exec_with_params("insert into nope (x) values (1)", &[]).await.is_err());
+
+        db.exec_with_params("create table e (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let tx = db.begin().await.unwrap();
+        assert!(tx.exec("insert into e (v) values (?)", &[json!("a")]).await.is_ok());
+        // 事务内查询错误路径
+        assert!(tx.query("select * from missing", &[]).await.is_err());
+        tx.commit().await.unwrap();
+
+        // begin 后 rollback 再查不到
+        let tx = db.begin().await.unwrap();
+        tx.exec("insert into e (v) values (?)", &[json!("b")]).await.unwrap();
+        tx.rollback().await.unwrap();
+        let n = db
+            .query_with_params("select count(*) c from e", &[])
+            .await
+            .unwrap();
+        assert_eq!(n[0]["c"], json!(1));
+    }
 }

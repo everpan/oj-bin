@@ -127,3 +127,85 @@ impl HandlerStore {
         self.dir.as_deref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HandlerStore;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// 在 $TMPDIR 下建一个带进程号+纳秒后缀的唯一临时目录。
+    fn unique_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "mdm-handler-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_dir_reads_js_and_ts_and_skips_others() {
+        let dir = unique_dir("load");
+        std::fs::write(dir.join("a.js"), "export const a=1;").unwrap();
+        std::fs::write(dir.join("b.ts"), "export const b=2;").unwrap();
+        std::fs::write(dir.join("c.txt"), "nope").unwrap();
+        std::fs::write(dir.join("d.js.txt"), "nope").unwrap();
+        let map = HandlerStore::load_dir(&dir);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), Some(&"export const a=1;".to_string()));
+        assert_eq!(map.get("b"), Some(&"export const b=2;".to_string()));
+        assert!(!map.contains_key("c"));
+        assert!(!map.contains_key("d"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_dir_missing_dir_returns_empty() {
+        let map = HandlerStore::load_dir(Path::new("/nonexistent/mdm-handler-xyz"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn from_embedded_get_names_dir_none() {
+        let mut map = HashMap::new();
+        map.insert("greet".into(), "console.log(1)".into());
+        let store = HandlerStore::from_embedded(map);
+        assert_eq!(store.get("greet").as_deref(), Some("console.log(1)"));
+        assert_eq!(store.get("missing"), None);
+        assert_eq!(store.names(), vec!["greet".to_string()]);
+        assert!(store.dir().is_none());
+    }
+
+    #[test]
+    fn from_dir_loads_and_exposes_dir() {
+        let dir = unique_dir("fromdir");
+        std::fs::write(dir.join("h.js"), "h").unwrap();
+        let store = HandlerStore::from_dir(dir.clone());
+        assert_eq!(store.get("h").as_deref(), Some("h"));
+        assert_eq!(store.dir(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_env_uses_dir_when_set() {
+        let dir = unique_dir("fromenv");
+        std::fs::write(dir.join("e.js"), "e").unwrap();
+        let prev = std::env::var("MDM_HANDLER_DIR").ok();
+        unsafe { std::env::set_var("MDM_HANDLER_DIR", &dir); }
+        let store = HandlerStore::from_env();
+        assert_eq!(store.get("e").as_deref(), Some("e"));
+        assert_eq!(store.dir(), Some(dir.as_path()));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("MDM_HANDLER_DIR", v) },
+            None => unsafe { std::env::remove_var("MDM_HANDLER_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

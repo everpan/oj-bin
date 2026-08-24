@@ -257,4 +257,113 @@ mod tests {
         assert_eq!(v["code"], 0, "{v}");
         assert_eq!(v["data"]["hits"], 1, "{v}");
     }
+
+    use httptest::Expectation;
+    use httptest::Server;
+    use httptest::matchers::*;
+    use httptest::responders::*;
+
+    /// 用 httptest 起真实本地 ES 桩，覆盖 search/index/del 的请求拼装与响应直通。
+    fn es_bridge(endpoint: String) -> Bridge {
+        let es = Arc::new(EsClient::new(endpoint));
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras { es: Some(es), ..Default::default() },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_index_del_hit_mock_server() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of![
+                request::method("POST"),
+                request::path("/user/_search")
+            ])
+            .respond_with(status_code(200).body(r#"{"hits":{"total":{"value":3}}}"#)),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method("PUT"),
+                request::path("/user/_doc/d1")
+            ])
+            .respond_with(status_code(200).body(r#"{"result":"created"}"#)),
+        );
+        server.expect(
+            Expectation::matching(all_of![
+                request::method("DELETE"),
+                request::path("/user/_doc/d1")
+            ])
+            .respond_with(status_code(200).body(r#"{"result":"deleted"}"#)),
+        );
+
+        let b = es_bridge(server.url("/").to_string());
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const s = await es.search("user", { query: {} });
+                    const i = await es.index("user", "d1", { a: 1 });
+                    const d = await es.del("user", "d1");
+                    json.ok({ s, i, d });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["s"]["hits"]["total"]["value"], 3);
+        assert_eq!(v["data"]["i"]["result"], "created");
+        assert_eq!(v["data"]["d"]["result"], "deleted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_2xx_and_bad_json_propagate_errors() {
+        let server = Server::run();
+        // 非 2xx → 报错带状态码与响应体
+        server.expect(
+            Expectation::matching(all_of![
+                request::method("POST"),
+                request::path("/user/_search")
+            ])
+            .respond_with(status_code(500).body("es exploded")),
+        );
+        let b = es_bridge(server.url("/").to_string());
+        let cap = b
+            .run_with(
+                r#"(async () => { await es.search("user", {}); json.ok({}); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("HTTP 500") && msg.contains("es exploded"), "{v}");
+
+        // 2xx 但响应体非 JSON → parse 错误
+        let server2 = Server::run();
+        server2.expect(
+            Expectation::matching(all_of![
+                request::method("POST"),
+                request::path("/user/_search")
+            ])
+            .respond_with(status_code(200).body("not-json")),
+        );
+        let b2 = es_bridge(server2.url("/").to_string());
+        let cap = b2
+            .run_with(
+                r#"(async () => { await es.search("user", {}); json.ok({}); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("parse response"), "{v}");
+    }
 }

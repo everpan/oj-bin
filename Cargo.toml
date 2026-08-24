@@ -38,6 +38,7 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 [dev-dependencies]
 criterion = "0.5"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "test-util"] }
+httptest = "0.16"
 
 [[bench]]
 name = "bridge"

@@ -324,6 +324,9 @@ await db.tx(async (tx) => {
 
 `config.yaml` `blob:` 段存在即启用（`blob.put/get/del/url/contentType` 可用，未配置调用报错）。
 
+> `blob.contentType(key)` 由 `op_blob_content_type` 真正接通（`bootstrap.js` 已 import 并挂到
+> `globalThis.blob.contentType`）；缺失 sidecar 且无法按扩展名推断时返回空串而非 `null`。
+
 **multipart 上传**：请求 `Content-Type: multipart/form-data` 时，`http.body` = 文本字段对象
 （`{name: value}`），文件进 `http.files`（`field`/`filename`/`content_type`/`size`），字节经
 `await http.file(i)` 取：

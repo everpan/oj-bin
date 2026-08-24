@@ -104,4 +104,29 @@ mod tests {
         assert!(!t.has_column("password_hash"));
         assert_eq!(t.primary_key.as_deref(), Some("id"));
     }
+
+    #[test]
+    fn sortable_flag_and_table_without_pk() {
+        let mut cols = std::collections::HashMap::new();
+        cols.insert(
+            "a".to_string(),
+            ColumnDef { name: "a".to_string(), sortable: true },
+        );
+        cols.insert(
+            "b".to_string(),
+            ColumnDef { name: "b".to_string(), sortable: false },
+        );
+        let td = TableDef { columns: cols, primary_key: None };
+        assert!(td.is_sortable("a"));
+        assert!(!td.is_sortable("b"));
+        assert!(!td.is_sortable("missing"));
+
+        // table 不带主键：pk 兜底分支（or_insert 不执行），primary_key 为 None。
+        let r = SchemaRegistry::new().table("t", None, &["x", "y"]);
+        let t = r.get("t").unwrap();
+        assert_eq!(t.primary_key, None);
+        assert!(t.has_column("x"));
+        assert!(t.has_column("y"));
+        assert!(r.has_table("t"));
+    }
 }

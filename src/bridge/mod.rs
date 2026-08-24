@@ -546,15 +546,15 @@ impl std::fmt::Display for RunError {
 
 /// 启动 DevTools inspector：借一个 runtime 取其 inspector 句柄并起 WS 服务。
 /// 仅当 `inspect=true` 构造时有效；addr 形如 `127.0.0.1:9229`。
-pub fn start_inspector(bridge: &Bridge, addr: std::net::SocketAddr) {
+pub fn start_inspector(bridge: &Bridge, addr: std::net::SocketAddr) -> tokio::task::JoinHandle<()> {
     if !bridge.inspect {
         tracing::warn!(target: "inspector", "inspector not enabled at construction");
-        return;
+        return tokio::task::spawn_local(async {});
     }
     let rt = bridge.pool.checkout();
     let insp = rt.inspector();
     runtime::RuntimePool::checkin(&bridge.pool, rt);
-    inspector::spawn(insp, addr);
+    inspector::spawn(insp, addr)
 }
 
 // run_module 系测试持 TRANSPILE_TEST_LOCK 跨 await（current_thread 单线程，安全）。

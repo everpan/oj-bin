@@ -238,6 +238,10 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    use serde_json::Value;
+
+    use crate::bridge::{Bridge, InMemoryAccessor, RequestInfo};
+
     /// expire 惰性过期（未到 TTL 可读、到点后 get None、缺失键返回 false）；
     /// incr 从 0 起、连续自增、非数字 Err。start_paused + advance 免真实等待。
     #[tokio::test(start_paused = true)]
@@ -308,5 +312,84 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert_eq!(kv.get(&k).await.unwrap(), None);
         kv.del(&k).await.unwrap();
+    }
+
+    /// 默认 trait 方法（expire/incr 未覆写）→ Err；经 Bridge 验证调用路径。
+    struct PlainKV(std::sync::RwLock<std::collections::HashMap<String, String>>);
+    #[async_trait]
+    impl KVStore for PlainKV {
+        async fn get(&self, key: &str) -> BridgeResult<Option<String>> {
+            Ok(self.0.read().unwrap().get(key).cloned())
+        }
+        async fn set(&self, key: &str, value: &str) -> BridgeResult<()> {
+            self.0.write().unwrap().insert(key.into(), value.into());
+            Ok(())
+        }
+        async fn del(&self, key: &str) -> BridgeResult<()> {
+            self.0.write().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    /// get 直接报错的后端，用于覆盖 op_kv_get 的错误分支（line 112）。
+    struct ErrKV;
+    #[async_trait]
+    impl KVStore for ErrKV {
+        async fn get(&self, _key: &str) -> BridgeResult<Option<String>> {
+            Err("kv boom".into())
+        }
+        async fn set(&self, _key: &str, _value: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+        async fn del(&self, _key: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_error_propagates_to_op() {
+        let b = Bridge::new(Arc::new(InMemoryAccessor::new()), Arc::new(ErrKV));
+        let cap = b
+            .run_with(
+                r#"(async () => { await redis.get("k"); json.ok({}); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("kv boom"), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_expire_incr_unsupported() {
+        use crate::bridge::Bridge;
+        let kv = Arc::new(PlainKV(Default::default()));
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            kv as Arc<dyn KVStore>,
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    await kv.expire("k", 1);
+                    json.ok({});
+                })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("not supported"), "{v}");
+
+        let cap = b
+            .run_with(
+                r#"(async () => { await kv.incr("k"); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("not supported"), "{v}");
     }
 }
