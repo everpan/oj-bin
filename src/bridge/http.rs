@@ -13,6 +13,8 @@ pub struct RequestInfo {
     pub query: HashMap<String, String>,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// 租户 id（tenant.enable 时由 handle() 从 header 提取注入；否则 None）。
+    pub tenant_id: Option<String>,
 }
 
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
         "query": s.req.query,
         "headers": s.req.headers,
         "body": export_bytes(&s.req.body),
+        "tenantId": s.req.tenant_id,
     })
 }
 

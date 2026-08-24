@@ -33,6 +33,20 @@ impl Default for ServerCfg {
     }
 }
 
+/// 多租户注入（OJ-3）：enable 后 handle() 从 header 提取租户 id 注入 http.tenantId。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct TenantCfg {
+    pub enable: bool,
+    pub header_key: String,
+}
+
+impl Default for TenantCfg {
+    fn default() -> Self {
+        Self { enable: false, header_key: "X-TENANT-ID".into() }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -41,6 +55,7 @@ pub struct Config {
     pub db: HashMap<String, String>,
     /// name → redis URL（v0.1 warn 后用内存 KV）。
     pub redis: HashMap<String, String>,
+    pub tenant: TenantCfg,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -115,6 +130,18 @@ mod tests {
         assert_eq!(c.server.root.as_deref(), Some("public"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tenant_cfg_defaults_and_parse() {
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(!c.tenant.enable && c.tenant.header_key == "X-TENANT-ID");
+        let dir = std::env::temp_dir().join(format!("ojcfgt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg.yaml"), "tenant:\n  enable: true\n  header_key: X-ACCT\n").unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

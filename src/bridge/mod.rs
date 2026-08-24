@@ -533,6 +533,21 @@ mod tests {
         (b, db)
     }
 
+    /// tenant.enable 时 handle() 提取注入 → http.tenantId；未启用为 null。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_exposes_tenant_id() {
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"json.ok({ t: http.tenantId === undefined ? null : http.tenantId });"#,
+                RequestInfo { tenant_id: Some("t-9".into()), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["t"], "t-9");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn globals_injected_and_json_ok() {
         let (b, _) = new_bridge();
