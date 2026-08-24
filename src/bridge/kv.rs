@@ -166,6 +166,13 @@ pub async fn op_kv_incr(
         .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
+/// Redis EXPIRE 只接受整秒：毫秒 TTL 向上取整到 ≥1s。
+/// 直接 `ttl.as_secs()` 会把 500ms → 0s → EXPIRE key 0 立即删键，
+/// 与 InMemoryKV 的毫秒语义相悖（见 expire_secs 测试）。
+fn expire_secs(ttl: std::time::Duration) -> i64 {
+    (ttl.as_secs() + u64::from(ttl.subsec_nanos() != 0)) as i64
+}
+
 /// 真 Redis 驱动（redis 0.27 ConnectionManager 复用连接；全命令落真 Redis）。
 pub struct RedisKV {
     conn: redis::aio::ConnectionManager,
@@ -216,7 +223,7 @@ impl KVStore for RedisKV {
     async fn expire(&self, key: &str, ttl: std::time::Duration) -> BridgeResult<bool> {
         use redis::AsyncCommands;
         let mut c = self.conn.clone();
-        c.expire(key, ttl.as_secs() as i64).await.map_err(|e| format!("redis expire: {e}").into())
+        c.expire(key, expire_secs(ttl)).await.map_err(|e| format!("redis expire: {e}").into())
     }
 
     async fn incr(&self, key: &str) -> BridgeResult<i64> {
@@ -256,6 +263,18 @@ mod tests {
         assert_eq!(kv.get("t").await.unwrap().as_deref(), Some("v2"));
     }
 
+    /// Redis EXPIRE 只接受整秒：毫秒 TTL 必须向上取整到 ≥1s——
+    /// 否则 500ms → 0s → EXPIRE key 0 立即删键（与 InMemoryKV 毫秒语义相悖）。
+    #[test]
+    fn expire_secs_ceil_never_zero_for_positive_ms() {
+        assert_eq!(expire_secs(Duration::from_millis(500)), 1);
+        assert_eq!(expire_secs(Duration::from_millis(1)), 1);
+        assert_eq!(expire_secs(Duration::from_secs(1)), 1);
+        assert_eq!(expire_secs(Duration::from_millis(1500)), 2);
+        assert_eq!(expire_secs(Duration::from_secs(2)), 2);
+        assert_eq!(expire_secs(Duration::ZERO), 0); // 0 保持 0（立即过期，语义一致）
+    }
+
     /// 连接拒绝 → Err（装配 fail-fast 路径；端口 1 无监听）。
     #[tokio::test(flavor = "current_thread")]
     async fn redis_connect_refused_errors() {
@@ -281,5 +300,13 @@ mod tests {
         assert!(kv.expire(&k, Duration::from_secs(10)).await.unwrap());
         kv.del(&k).await.unwrap();
         assert_eq!(kv.get(&k).await.unwrap(), None);
+        // 毫秒 TTL 取整契约：500ms → EXPIRE 1s（键不立即消失；等 1.2s 后消失）。
+        kv.set(&k, "v").await.unwrap();
+        assert!(kv.expire(&k, Duration::from_millis(500)).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(kv.get(&k).await.unwrap().as_deref(), Some("v"), "500ms 不得被 EXPIRE 0 立即删键");
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(kv.get(&k).await.unwrap(), None);
+        kv.del(&k).await.unwrap();
     }
 }

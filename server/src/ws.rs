@@ -56,7 +56,8 @@ pub fn mirror_routes(
             .and_then(|p| p.strip_prefix(root).ok())
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        let path = format!("{base}{rel}/ws");
+        // rel 为空 = 根级 WS.ts → {base}/ws（不得拼成 {base}//ws 双斜杠）。
+        let path = if rel.is_empty() { format!("{base}ws") } else { format!("{base}{rel}/ws") };
         if !seen.insert(path.clone()) {
             continue; // 同目录 WS.ts 与 WS.js 并存：先到者（.ts）胜
         }
@@ -485,6 +486,48 @@ mod tests {
         .await;
         let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
         assert_eq!(v, serde_json::json!({"topic": "news", "data": {"a": 1}}), "{v}");
+    }
+
+    /// 根级 WS.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
+    #[tokio::test]
+    async fn mirror_routes_root_ws() {
+        use crate::actor::JsActor;
+        use mdm_base_rust::bridge::{Extras, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[(
+            "WS.ts",
+            "json.ok({ root: true });\n",
+        )]);
+        let make = move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                Extras::default(),
+            )
+        };
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                JsActor::pool(1, make.clone()),
+                None,
+                None,
+                crate::Pipeline::default(),
+            )
+            .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
+        )
+        .await;
+
+        // 单斜杠 {base}/ws 必须命中（文档契约）；双斜杠路径本就不该存在。
+        let mut c = WsClient::connect(addr, "/v1/api/ws").await;
+        c.send_text("hi").await;
+        let env = c.read_text().await;
+        assert!(env.contains("\"root\":true"), "{env}");
     }
 
     /// 移植 Go TestWSHandle_Connection_MissingFile：handler 文件缺失不 panic，连接直接关闭。

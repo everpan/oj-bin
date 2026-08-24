@@ -68,7 +68,7 @@ cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
 ```
 
-> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，59 通过）。
+> 注：mdm-base-rust 全套 lib 测试已修复为可跑（`cargo test -p mdm-base-rust --lib`，60 通过）。
 > 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
 > `v8::IsolateHandle`，见 §3）。
 
@@ -207,8 +207,8 @@ RBAC 等真需求出现再议（YAGNI）。
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：108 通过（mdm-server 51 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
-  避免端口/文件冲突）+ `mdm-base-rust` lib 59（3 忽略 = 真 ES/外部依赖驱动的 roundtrip）。
+- 当前计数：109 通过（mdm-server 52 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
+  避免端口/文件冲突）+ `mdm-base-rust` lib 60（3 忽略 = 真 ES/Redis 驱动的 roundtrip）。
   `cargo test --workspace --exclude mdm-base-rust` 全绿；mdm-base-rust 全套 lib 也可跑（§2）。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
