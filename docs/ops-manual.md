@@ -38,6 +38,8 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 - **端口**：代码默认 `778`，但属 macOS/Linux 特权端口（<1024），需 root；**生产用 ≥1024**（如 9778）。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
+- **静态站点** `server.root`：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
+  （目录 → `index.html`）；目录缺失启动即报错。前置站点产物（如 oj build 的 dist）放独立目录。
 - **DB** `db.default = "sqlite://<path>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。
   v0.1 仅 sqlite。`sqlite::memory:` 仅测试用，重启即丢。
 - **Redis** `redis.default`：v0.1 **不真连**，仅 warn 并退回内存 KV——多实例部署时 KV 不共享，
@@ -79,6 +81,8 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 启动报 `manifests.yaml … run oj build first` | release 下锁文件缺失/损坏，或指向不存在的版本目录 | 跑 `oj build <module>`；锁被手工改坏时按报错修 |
 | 启动报「version dir collision」 | 两个 (module, version) 组合拼出同一目录名（如 `a`/`1-x` 与 `a-1`/`x`） | 改 version 命名避开 |
 | 404 | 路由无对应 `api.ts/js`，或目录穿越/非法段 | 核对路径与 `-b` 前缀；release 先确认模块在锁内 |
+| 启动报 `server.root …` | 静态根目录不存在（相对 config 目录解析） | 建目录或改路径；不配 `root` 即关闭静态服务 |
+| 静态文件 404 | 文件不存在 / 目录缺 `index.html` / 非 GET/HEAD / 无 SPA 回退（v0.1） | 核对文件；SPA 场景先经前置反代补写回退 |
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |

@@ -154,10 +154,19 @@ pub async fn start(
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     // localhost → 127.0.0.1 解析；阻塞 resolve 仅启动一次，可接受——ponytail。
     let addr = to_socket_addrs_sync(&addr)?;
+    // 静态站点根：相对 config_dir 绝对化（缺失目录 fail-fast）。
+    let static_root = match &cfg.server.root {
+        Some(r) => {
+            let p = Path::new(r);
+            let p = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
+            Some(p.canonicalize().map_err(|e| format!("server.root {}: {e}", p.display()))?)
+        }
+        None => None,
+    };
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind: {e}"))?;
     let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
     let h = tokio::spawn(async move {
-        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, table, actor, timeout).await;
+        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, table, actor, timeout, static_root).await;
     });
     Ok((bound, h))
 }
@@ -354,6 +363,30 @@ mod tests {
         ]);
         let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
         assert!(e.contains("unclosed") || e.contains("parse"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn server_root_serves_static_relative_to_config_dir() {
+        let t = tmpdir("sc-root");
+        std::fs::write(t.0.join("index.html"), "<h1>site</h1>").unwrap();
+        let mut cfg = Config::default();
+        cfg.server.port = 0; // 随机端口
+        cfg.server.root = Some(".".into()); // 相对 config_dir
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true).await.unwrap();
+        let r = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("site"));
+    }
+
+    #[tokio::test]
+    async fn server_root_missing_dir_fails_fast() {
+        let mut cfg = Config::default();
+        cfg.server.root = Some("no-such-dir".into());
+        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("server.root"), "{e}");
     }
 
     #[tokio::test]

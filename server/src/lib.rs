@@ -27,9 +27,12 @@ pub struct AppState {
     actor: JsActor,
     /// 单请求超时（None = 不限时）。
     timeout: Option<std::time::Duration>,
+    /// 静态站点根（config server.root）；None → 不开静态服务。
+    static_root: Option<PathBuf>,
 }
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
+#[allow(clippy::too_many_arguments)]
 pub fn app(
     base: &str,
     dir: impl Into<PathBuf>,
@@ -37,6 +40,7 @@ pub fn app(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
+    static_root: Option<PathBuf>,
 ) -> Router {
     let dir = dir.into();
     Router::new().fallback(any(handle)).with_state(AppState {
@@ -44,10 +48,12 @@ pub fn app(
         fallback: ts.then(|| Routes::new(base, dir, ts)),
         actor,
         timeout,
+        static_root,
     })
 }
 
 /// 绑定监听并服务。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: std::net::SocketAddr,
     base: &str,
@@ -56,12 +62,14 @@ pub async fn serve(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
+    static_root: Option<PathBuf>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_listener(listener, base, dir, ts, table, actor, timeout).await
+    serve_with_listener(listener, base, dir, ts, table, actor, timeout, static_root).await
 }
 
 /// 已绑定监听上服务（测试/T11：先 bind 端口 0 再读 local_addr）。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     base: &str,
@@ -70,8 +78,9 @@ pub async fn serve_with_listener(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
+    static_root: Option<PathBuf>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, app(base, dir, ts, table, actor, timeout)).await
+    axum::serve(listener, app(base, dir, ts, table, actor, timeout, static_root)).await
 }
 
 async fn handle(
@@ -123,7 +132,71 @@ async fn handle(
             None => return fail_response(405, &format!("method {verb} not mapped")),
         }
     }
+    // 静态站点兜底（server.root）：API 优先，GET/HEAD only。
+    if let Some(root) = st.static_root.as_deref()
+        && matches!(verb, "GET" | "HEAD")
+        && let Some(file) = resolve_static(root, uri.path())
+        && let Ok(body) = tokio::fs::read(&file).await
+    {
+        return file_response(&file, body);
+    }
     fail_response(404, "no route matched")
+}
+
+/// 静态文件解析：uri.path()（仍 percent-encoded）逐段解码后拼 root；
+/// 根/目录 → index.html；越界段（`.`/`..`/`\`/`/`/`\0`/空段，含解码后——
+/// `%2F` 走私等价穿越）→ None（404）。
+fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
+    let rel = uri_path.strip_prefix('/')?.trim_end_matches('/');
+    let mut p = root.to_path_buf();
+    if !rel.is_empty() {
+        for seg in rel.split('/') {
+            let s = percent_encoding::percent_decode_str(seg).decode_utf8().ok()?;
+            if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']) {
+                return None;
+            }
+            p.push(s.as_ref());
+        }
+    }
+    if p.is_dir() {
+        p.push("index.html");
+    }
+    p.is_file().then_some(p)
+}
+
+/// 扩展名 → Content-Type（常见集，未知 = octet-stream——ponytail: 嫌少再加）。
+fn mime_of(p: &Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" | "map" => "application/json",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/yaml",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_response(file: &Path, body: Vec<u8>) -> Response {
+    let mut r = Response::new(axum::body::Body::from(body));
+    r.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_str(mime_of(file)).expect("valid mime"),
+    );
+    r
 }
 
 /// Capture → axum Response（status/headers/body 原样回写）。
@@ -209,7 +282,7 @@ pub(crate) mod tests {
         let table = build_table(&dir, ts, base);
         let base = base.to_string();
         tokio::spawn(async move {
-            serve_with_listener(listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout)
+            serve_with_listener(listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout, None)
                 .await
                 .unwrap();
         });
@@ -433,6 +506,67 @@ pub(crate) mod tests {
         let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let r = raw_http(addr, &get(addr, "/v1/api/r")).await;
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    // ----- 静态站点（server.root）-----
+
+    /// 返回 (addr, 夹具)：夹具须在测试内持有（TempRoutes Drop 会删目录）。
+    async fn spawn_static(
+        api: &[(&str, &str)],
+        site: &[(&str, &str)],
+    ) -> (std::net::SocketAddr, (TempRoutes, TempRoutes)) {
+        let t = routes(api);
+        let s = routes(site);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dir, table, site) = (t.0.clone(), build_table(&t.0, true, "/v1/api"), s.0.clone());
+        tokio::spawn(async move {
+            serve_with_listener(listener, "/v1/api", dir.clone(), true, table, actor(dir, true), None, Some(site))
+                .await
+                .unwrap();
+        });
+        (addr, (t, s))
+    }
+
+    #[tokio::test]
+    async fn serves_static_index_files_and_content_types() {
+        let (addr, _keep) = spawn_static(
+            &[("u/f/api.ts", "export default { get() { json.ok({ api: true }); } };")],
+            &[("index.html", "<h1>hi</h1>"), ("css/app.css", "body{}"), ("v1/api/u", "STATIC")],
+        )
+        .await;
+        // / → index.html + text/html
+        let r = raw_http(addr, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/html") && r.contains("<h1>hi</h1>"), "{r}");
+        // 普通文件 + Content-Type；目录 → index.html
+        let r = raw_http(addr, &get(addr, "/css/app.css")).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/css"), "{r}");
+        // API 优先于静态：同名路径走路由表
+        let r = raw_http(addr, &get(addr, "/v1/api/u/f/")).await;
+        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"api\":true") && !r.contains("STATIC"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn static_guards_traversal_missing_and_verbs() {
+        let (addr, _keep) = spawn_static(&[], &[("index.html", "x")]).await;
+        for path in ["/../etc/passwd", "/a%2e%2e/b", "/..%2fetc", "/nope.txt", "/css//x"] {
+            let r = raw_http(addr, &get(addr, path)).await;
+            assert!(r.starts_with("HTTP/1.1 404"), "{path}: {r}");
+        }
+        // 非 GET/HEAD 不走静态
+        let r = raw_http(addr, "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    #[test]
+    fn resolve_static_blocks_decoded_traversal() {
+        let root = Path::new("/srv");
+        // %2F 走私（解码后含 /）、点段、反斜杠、NUL、空段 → None
+        for p in [
+            "/..%2fetc%2fpasswd", "/%2e%2e/x", "/a/b%2Fc", "/a%5Cb", "/a%00b", "/a//b",
+        ] {
+            assert_eq!(resolve_static(root, p), None, "{p}");
+        }
     }
 
     // 静态断言：axum state 可跨线程（Send 边界）。

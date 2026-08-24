@@ -66,6 +66,7 @@ server:
   port: 9778              # 监听端口（代码默认 778，但 macOS 特权端口不可用 → 用 ≥1024）
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
+  root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
 db:
   default: "sqlite://db.sqlite"   # 命名库实例；v0.1 仅支持 sqlite
 redis:
@@ -78,6 +79,8 @@ redis:
 - `redis`：`name → url` 映射。v0.1 **不真连 Redis**，仅打印 warn 并用进程内存 KV 模拟
   （`redis.get/set` 与 `kv.get/set` 同源）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
+- `server.root`：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
+  按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
 - 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
   可重复执行；**注意**：seed 内不得有分号字面量）。
 
@@ -181,6 +184,8 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 - 路径任意深度：`/v1/api/user/profile/detail/` → `src/user/profile/detail/api.ts` 的 `get`。
 - 尾斜杠有无皆可。
 - 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
+- **解析顺序**：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（`--dev`）→
+  静态站点（`server.root`，仅 GET/HEAD，见 §3）→ 404。API 永远优先于静态文件。
 
 ### 7.1 路径参数路由（`.route`）
 
@@ -294,3 +299,5 @@ SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
 - `.tsx`/`.mts` 不转译（直通 V8）。
+- 静态站点（`server.root`）无 SPA 回退（未知路径不回落 `index.html`）、无目录列表、
+  无 Range/ETag/缓存头；未知扩展名按 `application/octet-stream` 下载。

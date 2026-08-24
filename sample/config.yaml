@@ -1,6 +1,7 @@
 server:
   host: "localhost"
   port: 9778
+  root: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务）
 db:
   default: "sqlite://db.sqlite"
   test: "sqlite://db_test.sqlite"

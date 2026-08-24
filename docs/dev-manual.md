@@ -12,7 +12,7 @@ Cargo.toml            # [workspace] members = ["server", "cli"]；根 crate 本�
 src/                  # crate: mdm-base-rust（lib + bench）
 ├── lib.rs            # 导出 bridge + config
 ├── main.rs           # bench 入口（criterion harness，非服务）
-├── config.rs         # 配置加载：server{host,port,timeout,pool_size} + db/redis 映射、timeout 解析
+├── config.rs         # 配置加载：server{host,port,root,timeout,pool_size} + db/redis 映射、timeout 解析
 └── bridge/           # JS 运行时与 SDK（无 axum/http 依赖，纯执行层）
     ├── mod.rs        # 模块聚合、bridge 工厂（Send）
     ├── runtime.rs    # JsRuntime 生命周期 + RuntimePool（max_idle=16）
@@ -33,7 +33,7 @@ src/                  # crate: mdm-base-rust（lib + bench）
     ├── inspector.rs  # v8 inspector / 调试辅助
     └── bootstrap.js  # JS 侧 SDK globals（json/db/DB/http/redis/kv/log/fetch/ws/finish/__ojRequire）
 server/               # crate: mdm-server（axum HTTP 层）
-├── lib.rs            # axum app 装配
+├── lib.rs            # axum app 装配 + 静态站点兜底（server.root：resolve_static/mime_of）
 ├── routes.rs         # directory-mirror URL → handler 映射
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 └── ws.rs             # WebSocket
@@ -77,9 +77,9 @@ cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release
 
 ```
 HTTP 请求
-  └─ server/routes.rs：目录镜像 URL → 目标 api 文件路径
-       ├─ 无 api 文件 / 穿越 → 404
-       └─ 命中 → 交给 JsActor
+  └─ server/lib.rs handle：依次 路由表 lookup（matchit）→ dev 目录镜像兜底（routes.rs）
+     → 静态站点（server.root，仅 GET/HEAD）→ 404
+       └─ 命中 api 文件 → 交给 JsActor
             └─ server/actor.rs：线程化执行（Send bridge 工厂），池化 JsRuntime
                  └─ bridge/loader.rs：生成 per-request TLA driver 模块
                       file:///oj/driver/{N}.js  (N = AtomicU64 递增序列)
@@ -131,7 +131,9 @@ HTTP 请求
 ## 5. 安全模型
 
 - **project_root 钳制**：所有 import 解析结果必须落在 project root 内（`ensure_within`）。
-- **目录穿越防护**：路由路径里的 `..`/`.`/`\`/NUL/空段 → 404。
+- **目录穿越防护**：路由路径里的 `..`/`.`/`\`/NUL/空段 → 404。静态兜底（`resolve_static`）
+  在此之上先逐段 percent-decode 再校验——解码出 `/`（`%2F` 走私）、`.`、`..`、`\`、NUL、
+  空段同样 404。
 - **超时熔断**：`server.timeout` + `v8::Isolate::terminate_execution`（408）。
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符白名单 +
   参数化值（sea-query）。
@@ -156,7 +158,7 @@ HTTP 请求
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：89 通过 + 1 ignored（mdm-server 39 + oj lib 35 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：94 通过（mdm-server 42 + oj lib 37 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）
