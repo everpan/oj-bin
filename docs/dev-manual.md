@@ -34,6 +34,7 @@ src/                  # crate: mdm-base-rust（lib + bench）
     └── bootstrap.js  # JS 侧 SDK globals（json/db/DB/http/redis/kv/log/fetch/ws/finish/__ojRequire）
 server/               # crate: mdm-server（axum HTTP 层）
 ├── lib.rs            # axum app 装配 + 静态站点兜底（server.root：resolve_static/mime_of）
+├── auth.rs           # JWT 核心（OJ-4）：签验/匿名匹配/login/refresh 轮换/session（KV）
 ├── routes.rs         # directory-mirror URL → handler 映射
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 └── ws.rs             # WebSocket
@@ -132,9 +133,14 @@ HTTP 请求
 query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）；
 `Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
 
-前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（OJ-3 租户已接入，
-OJ-4 鉴权/OJ-5 上传只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，
-失败走 `fail_response(400/401, …)` 信封。
+前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（OJ-3 租户/OJ-4 鉴权已接入，
+OJ-5 上传只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，
+失败走 `fail_response(400/401, …)` 信封。鉴权另含内置路由（handle() 顶部
+`{base}/auth/*` 先于路由表）与 `auth.rs`（Claims 签验、session 存 KV 键
+`AUTH-SESSION:sha256(refresh_token)`，Phase 6 换 RedisKV 时单点替换）。
+
+角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的——路由级
+RBAC 等真需求出现再议（YAGNI）。
 
 ## 5. 安全模型
 
@@ -166,7 +172,7 @@ OJ-4 鉴权/OJ-5 上传只加字段不改编构）；提取/守卫逻辑在 run 
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
 - 单元测试随模块内联（`#[cfg(test)]`）。
-- 当前计数：99 通过（mdm-server 43 + oj lib 41 + e2e 15；E2E_LOCK 串行锁，
+- 当前计数：104 通过（mdm-server 47 + oj lib 42 + e2e 15；E2E_LOCK 串行锁，
   避免端口/文件冲突）。`mdm-base-rust` lib 见 §2 的存量 SIGSEGV 备注。
 
 ## 8. 已知设计权衡（v0.1 终审裁决）

@@ -1,0 +1,3 @@
+name: "auth_demo"
+desc: "JWT 鉴权演示：me（受保护）/ health（匿名）"
+version: "0.1.0"

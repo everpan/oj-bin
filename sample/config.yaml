@@ -17,30 +17,11 @@ tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（�
   enable: true
   header_key: "X-TENANT-ID"
 
-auth:
-  # Required
-  jwt_secret: "change-me"
-  auth_url: "https://..."  #external origin (falls back to request headers)
-  db: "default"
-
-  # Tokens
-  signing_method: "HS256" # HS256 | HS384 | HS512
-  access_token_duration: "60s"  # s / m / h / d / w / mo / y
-  refresh_token_duration: "1y"
-
-  # Web
-  sign_in_redirect_url: "/sign-in"
-  cookie_session_name: "cnf.id"
-  cookies: # CookieOptions::default()
-
-  # Storage
-  redis: "default"  # optional in redis section
-  redis_prefix: "AUTH-SESSION"
-  redis_ttl: 1800
-  user_table_name: "users"  # needs at least: id, roles
-  session_table_name: "sessions"   # see examples/schema.sql
-
-  # Providers & callbacks
-  providers:
-  resolve_user: # required for OAuth sign-in
-  on_provider_connect: #
+auth:   # JWT 鉴权（v0.2）：块存在即启用——内置 /v1/api/auth/{login,refresh,logout} + Bearer 守卫
+  jwt_secret: "change-me"        # 生产必改；空串启动 fail-fast
+  signing_method: "HS256"        # HS256 | HS384 | HS512
+  access_token_duration: "60s"   # access token 有效期（s/m/h/d）
+  refresh_token_duration: "720h" # refresh session 有效期（轮换制）
+  anonymous_paths:               # 免鉴权路径（去 /v1/api 前缀；尾 /* 为一层通配）
+    - "/health"
+  user_table: "users"            # 最小列：id, username, password_hash, roles(JSON 数组串)

@@ -51,6 +51,9 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 - **租户** `tenant.enable / tenant.header_key`：启用后所有 `{base}` 请求必须带该 header
   （缺失/空 → 400），值注入 `http.tenantId` 供 handler 做数据隔离（**框架不自动改写 SQL**，
   行级过滤归业务）。
+- **鉴权** `auth.*`：块存在即启用。`jwt_secret` 生产必改且入库保管（泄露 = 任意人可签
+  合法 token）；`access_token_duration` 短（分钟级）+ `refresh_token_duration` 长（天级）
+  是常规组合——access 无服务端吊销，只能等它过期；refresh 可经 logout 主动失效。
 - **seed.sql**：项目根存在则启动时对 `default` 库重放。语句按 `;` 切分 → **seed 内不得有分号
   字面量**；用 `INSERT OR IGNORE` 保证可重复执行。
 
@@ -98,6 +101,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
 | `redis` 数据不跨实例 | v0.1 退回内存 KV | 改走 `db` 或外部服务 |
 | 400 `missing tenant header: X-TENANT-ID` | `tenant.enable: true` 且请求未带（或值为空）该 header | 客户端补 header，或关掉 `tenant.enable` |
+| 401 `missing or invalid bearer token` | `auth:` 启用且路径不在 `anonymous_paths`，请求未带/篡改/过期 access token | 走 `/auth/login` 换新 token；长期化用 refresh 轮换 |
+| 401 `invalid or expired refresh token` | refresh token 已被轮换/logout 或 session 过期 | 重新 login；refresh 一次一用是轮换语义，不是故障 |
+| 启动报 `auth.jwt_secret must not be empty` | auth 块配置了但 secret 为空串（fail-fast，不静默裸奔） | 填 secret |
 | 500 信封 `transaction already active` | 同一请求内嵌套 `db.tx`（每请求仅一个活跃事务） | 合并为一个 `db.tx` 回调，或先完结再开 |
 | 日志 `open transaction on db '…' rolled back at request end` | handler 未等待 `db.tx` 结束（漏 await / 中途 throw）即返回 | 修 handler：`await db.tx(...)`；数据已按未提交丢弃 |
 | 端口占用 | `778` 需 root | 换 ≥1024 端口 |

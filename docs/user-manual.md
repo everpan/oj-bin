@@ -248,6 +248,7 @@ axum 放开 pin 后可启用。
 | `http.params` | 路径参数对象（`{id: "42"}`，已 percent-decode） |
 | `http.param(name, default)` | 取参数：**路径参数优先**，query 兜底（`http.params[name] ?? http.query[name] ?? default`） |
 | `http.tenantId` | 租户 id（`tenant.enable` 时从 `header_key` 提取注入；未启用为 `null`） |
+| `http.user` | 已验签用户 `{id, roles, claims}`（auth 启用且通过 Bearer 守卫；否则 `null`） |
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
@@ -276,6 +277,30 @@ await db.tx(async (tx) => {
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 await 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
 - `tx` 与 `db` 的 `query/exec/table` 同签名——事务内自动走同一连接，无需改写其余代码。
+
+### JWT 鉴权（auth）
+
+配置 `auth:` 块存在即启用两层能力：
+
+**内置路由**（`{base}/auth/*`，POST only，不占业务模块名空间）：
+
+| 路由 | 请求体 | 响应 data |
+|---|---|---|
+| `POST /auth/login` | `{"username","password"}` | `{"access_token","refresh_token","expires_in"(秒),"user":{"id","roles"}}` |
+| `POST /auth/refresh` | `{"refresh_token"}` | 同上（**轮换**：旧 refresh 立即失效） |
+| `POST /auth/logout` | `{"refresh_token"}` | `null`（删 refresh session；access 到期前仍有效） |
+
+**Bearer 守卫**：`{base}` 内非匿名路径必须带 `Authorization: Bearer <access_token>`
+（缺失/验签失败/过期 → 401）；通过后 handler 里读 `http.user`（`{id, roles, claims}`）。
+
+- 匿名路径 `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，尾 `/*` 一层通配
+  （`/pub/*` 命中 `/pub/x` 不命中 `/pub`）。
+- 用户表 `auth.user_table`（默认 `users`）最小 schema：
+  `id, username, password_hash(bcrypt), roles(JSON 数组串，如 '["admin"]')`。
+- 登录失败统一报 `invalid credentials`（不区分用户不存在/密码错）。
+- `{base}` 之外的路径（静态站点等）不设防。
+
+完整演示见 `sample/src/auth_demo/`（demo/demo1234）。
 
 路径参数已解码（可含 `/`、`..` 字面）——仅用于参数化查询与类型转换，**勿拼接文件路径/URL**；
 单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码

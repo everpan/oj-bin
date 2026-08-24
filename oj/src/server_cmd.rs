@@ -99,7 +99,19 @@ pub async fn start(
         project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
         ts,
     });
-    let kv = Arc::new(InMemoryKV::new());
+    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = Arc::new(InMemoryKV::new());
+    // 鉴权（OJ-4）：auth 块存在即启用；secret 空 fail-fast；session 与 bridge 共用同一 KV
+    // （Phase 6 换 RedisKV 时单点替换）。login 查 default 库。
+    let auth = match &cfg.auth {
+        Some(a) if a.jwt_secret.trim().is_empty() => {
+            return Err("auth.jwt_secret must not be empty".into())
+        }
+        Some(a) => {
+            let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
+            Some(Arc::new(mdm_server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?))
+        }
+        None => None,
+    };
     // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
     let make_bridge = {
         let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
@@ -201,6 +213,7 @@ pub async fn start(
     let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
     let pipeline = mdm_server::Pipeline {
         tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
+        auth,
     };
     let h = tokio::spawn(async move {
         let _ = mdm_server::serve_with_listener(
@@ -296,6 +309,19 @@ mod tests {
         // 空前缀（仅斜杠）拒绝
         assert!(resolve_base(Some(""), "/xapi").is_err());
         assert!(resolve_base(None, "///").is_err());
+    }
+
+    /// auth 配了但 jwt_secret 空 → 装配 fail-fast（不静默跳过鉴权）。
+    #[tokio::test]
+    async fn empty_jwt_secret_fails_fast() {
+        let mut cfg = Config::default();
+        cfg.db.insert("default".into(), "sqlite::memory:".into());
+        cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"\"\n").unwrap());
+        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("jwt_secret"), "{e}");
     }
 
     #[test]

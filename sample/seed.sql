@@ -8,3 +8,5 @@ INSERT OR IGNORE INTO orders (id, no, account_id, amount) VALUES (2, 'A-0002', 2
 INSERT OR IGNORE INTO tenant (id, guid, en_name, cn_name, dsn_key) VALUES (1, "A1E9BFE9-391B-4F03-5DF5-D0AB6B54F5F8", "XXX", "XXX", "default");
 INSERT OR IGNORE INTO tenant (id, guid, en_name, cn_name, dsn_key) VALUES (2, "A1E9BFE9-0000-0000-0000-000000000000", "TEST", "TEST ENV", "test");
 
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, roles TEXT NOT NULL DEFAULT '[]');
+INSERT OR IGNORE INTO users (id, username, password_hash, roles) VALUES (1, 'demo', '$2b$10$aKN7gpFP.dhK7Il8sc19neUPaziSONYdsfks1xm0H2COzkp2vlqV2', '["admin"]');

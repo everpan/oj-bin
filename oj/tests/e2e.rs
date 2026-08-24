@@ -33,9 +33,10 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         serde_yaml::from_str(&std::fs::read_to_string(root.join("config.yaml")).unwrap()).unwrap();
     cfg.server.port = 0;
     cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", tmp.display()));
-    // e2e 是 v0.1 UC 验收（不带租户头）；sample 的 tenant.enable=true 留给手工冒烟，
-    // 租户注入/400 行为在 mdm-server::tests 覆盖。
+    // e2e 是 v0.1 UC 验收（不带租户头/不登录）；sample 的 tenant/auth 留给手工冒烟，
+    // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
     cfg.tenant = Default::default();
+    cfg.auth = None;
     let dir = if dev {
         root.join("src")
     } else {
