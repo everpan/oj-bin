@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["plugin", "host", "contract", "plugin-dynptr", "host-dynptr"]
+
+[profile.dev]
+panic = "unwind"
