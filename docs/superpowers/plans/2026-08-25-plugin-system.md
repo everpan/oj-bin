@@ -1135,23 +1135,23 @@ pub struct PluginManifestEntry {
 pub(crate) unsafe fn load_forget(path: &Path) -> Result<&'static libloading::Library, PluginLoadError>;
 ```
 
-- [ ] **Step 1: 准备测试插件**——`tests/plugins/` 加一个 mini cdylib crate（`oj-plugin-ffi` 的 `oj_plugin_entry!`，init 返回固定 descriptor），xtask 或 build.rs 在测试前编译并拷到 `target/test-plugins/<triple>/`。（此夹具后续全部加载测试复用。）
+- [x] **Step 1: 准备测试插件**——`tests/plugins/` 加一个 mini cdylib crate（`oj-plugin-ffi` 的 `oj_plugin_entry!`，init 返回固定 descriptor），xtask 或 build.rs 在测试前编译并拷到 `target/test-plugins/<triple>/`。（此夹具后续全部加载测试复用。）
 
-- [ ] **Step 2: 写失败测试**——路径解析四级优先级各一例（env 覆盖 toml、toml 覆盖 exe 旁、显式不存在报错、默认不存在为零插件）；清单模式文件缺失 → `FileMissing`；ABI 不符 → `AbiMismatch`（测试插件编译时用环境变量覆盖其报告版本）；身份不符 → `IdentityMismatch`；扫描模式空目录 → 零插件、坏插件 → Err。
+- [x] **Step 2: 写失败测试**——路径解析四级优先级各一例（env 覆盖 toml、toml 覆盖 exe 旁、显式不存在报错、默认不存在为零插件）；清单模式文件缺失 → `FileMissing`；ABI 不符 → `AbiMismatch`（测试插件编译时用环境变量覆盖其报告版本）；身份不符 → `IdentityMismatch`；扫描模式空目录 → 零插件、坏插件 → Err。
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust plugin_loader -- --skip infinite_loop`
 Expected: FAIL
 
-- [ ] **Step 4: 实现**——`resolve_plugins_dir`（build.rs 捕获 workspace root：`println!("cargo:rustc-env=OJ_WORKSPACE_ROOT={}", ...)`）；`load_forget` + 两模式加载（含**指纹比对：不符仅 eprintln 告警不 fail**，spec §3）；**宿主 panic hook 安装**（装配首个插件前安装一次，输出当前插件上下文与构建指纹用于归因，spec §3）；Windows 分支用 `load_with_flags(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`（cfg(windows)，本期编译过关即可，实测归 CI）。
+- [x] **Step 4: 实现**——`resolve_plugins_dir`（build.rs 捕获 workspace root：`println!("cargo:rustc-env=OJ_WORKSPACE_ROOT={}", ...)`）；`load_forget` + 两模式加载（含**指纹比对：不符仅 eprintln 告警不 fail**，spec §3）；**宿主 panic hook 安装**（装配首个插件前安装一次，输出当前插件上下文与构建指纹用于归因，spec §3）；Windows 分支用 `load_with_flags(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`（cfg(windows)，本期编译过关即可，实测归 CI）。
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cargo test -p mdm-base-rust plugin_loader ffi -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A

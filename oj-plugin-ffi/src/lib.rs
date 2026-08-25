@@ -4,8 +4,10 @@
 //! - stabby 72 注意：`RResult` 的 Ok/Err 是关联函数（构造用 `RResult::Ok(v)`），
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
+pub mod es;
 pub mod future;
 
+pub use es::EsBackendVtable;
 pub use future::FfiFuture;
 
 pub type RString = stabby::string::String;
