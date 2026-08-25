@@ -81,8 +81,8 @@ pub(crate) fn workspace_root() -> PathBuf {
 // ---- core 侧适配器层（spec §3）：每轴一个 FfiXxxBackend，插件永不直接产 dyn Trait 跨界 ----
 
 use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
-use crate::bridge::{BridgeResult, DbBackend, EsBackend};
-use oj_plugin_ffi::{DataAccessorVtable, EsBackendVtable, FfiFuture, RString};
+use crate::bridge::{BlobBackend, BlobServed, BridgeResult, DbBackend, EsBackend};
+use oj_plugin_ffi::{BlobBackendVtable, DataAccessorVtable, EsBackendVtable, FfiFuture, RBytes, RString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -328,6 +328,76 @@ impl Drop for FfiTxSession {
             let fut = (self.vtable.tx_rollback)(self.handle, self.tx_id);
             let _guard = FfiGuard(Some(fut)); // free state；插件侧 rollback 照常执行
         }
+    }
+}
+
+// ---- blob 轴适配器（Task 4.2）：FfiBlobBackend（vtable → core BlobBackend，LocalBlob 留内置）----
+
+/// 经 vtable + FfiFuture 转发（handle 由 connect 产生；五方法过线）。
+/// content_type 空串 ↔ None；vtable 无 serve——serve = Redirect(url)（s3 语义，
+/// LocalBlob 留 core 内置，插件的 serve 一律走 presign 重定向）。
+pub struct FfiBlobBackend {
+    handle: u64,
+    vtable: &'static BlobBackendVtable,
+}
+
+impl FfiBlobBackend {
+    pub fn new(handle: u64, vtable: &'static BlobBackendVtable) -> Self {
+        Self { handle, vtable }
+    }
+}
+
+/// Vec<u8> → RBytes（stabby 无 From<&[u8]>，逐元素 push）。
+fn to_rbytes(bytes: &[u8]) -> RBytes {
+    let mut v = RBytes::new();
+    for b in bytes {
+        v.push(*b);
+    }
+    v
+}
+
+#[async_trait::async_trait]
+impl BlobBackend for FfiBlobBackend {
+    async fn put(&self, key: &str, bytes: &[u8], content_type: Option<&str>) -> BridgeResult<()> {
+        let ct = RString::from(content_type.unwrap_or(""));
+        let fut = (self.vtable.put)(self.handle, RString::from(key), to_rbytes(bytes), ct);
+        await_ffi(fut).await.map_err(|e| ffi_err("blob put", e))?;
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> BridgeResult<Vec<u8>> {
+        let fut = (self.vtable.get)(self.handle, RString::from(key));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("blob get", e))?;
+        Ok(bytes)
+    }
+
+    async fn del(&self, key: &str) -> BridgeResult<()> {
+        let fut = (self.vtable.del)(self.handle, RString::from(key));
+        await_ffi(fut).await.map_err(|e| ffi_err("blob del", e))?;
+        Ok(())
+    }
+
+    async fn url(&self, key: &str) -> BridgeResult<String> {
+        let fut = (self.vtable.url)(self.handle, RString::from(key));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("blob url", e))?;
+        String::from_utf8(bytes).map_err(|e| ffi_err("blob url decode", e))
+    }
+
+    async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
+        let fut = (self.vtable.content_type)(self.handle, RString::from(key));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("blob content_type", e))?;
+        let s = String::from_utf8(bytes).map_err(|e| ffi_err("blob content_type decode", e))?;
+        Ok((!s.is_empty()).then_some(s))
+    }
+
+    async fn serve(&self, key: &str) -> BridgeResult<BlobServed> {
+        Ok(BlobServed::Redirect(self.url(key).await?))
+    }
+}
+
+impl Drop for FfiBlobBackend {
+    fn drop(&mut self) {
+        (self.vtable.close)(self.handle);
     }
 }
 
@@ -616,5 +686,125 @@ mod adapter_tests {
         DB_CLOSED.store(0, AtomicOrdering::SeqCst);
         drop(FfiDataAccessor::new(42, mock_db_vtable()));
         assert_eq!(DB_CLOSED.load(AtomicOrdering::SeqCst), 42);
+    }
+
+    // ---- blob 轴 mock vtable（Task 4.2；五方法转发 + Drop close）----
+
+    use crate::bridge::{BlobBackend, BlobServed};
+
+    static BLOB_PUT: Mutex<(u64, String, Vec<u8>, String)> =
+        Mutex::new((0, String::new(), Vec::new(), String::new()));
+    static BLOB_GET: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static BLOB_DEL: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static BLOB_URL: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static BLOB_CT: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static BLOB_CLOSED: AtomicU64 = AtomicU64::new(0);
+    static BLOB_CT_EMPTY: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn mock_blob_connect(_name: RString, _cfg: RString) -> FfiFuture {
+        ready(Ok(br#"{"handle":42}"#.to_vec()))
+    }
+    extern "C" fn mock_blob_put(handle: u64, key: RString, bytes: RBytes, ct: RString) -> FfiFuture {
+        let mut b = Vec::with_capacity(bytes.len());
+        for x in &bytes {
+            b.push(*x);
+        }
+        *BLOB_PUT.lock().unwrap() = (handle, key[..].to_string(), b, ct[..].to_string());
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_get(handle: u64, key: RString) -> FfiFuture {
+        *BLOB_GET.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(b"blobdata".to_vec()))
+    }
+    extern "C" fn mock_blob_del(handle: u64, key: RString) -> FfiFuture {
+        *BLOB_DEL.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_url(handle: u64, key: RString) -> FfiFuture {
+        *BLOB_URL.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(b"https://b.s3/presign".to_vec()))
+    }
+    extern "C" fn mock_blob_content_type(handle: u64, key: RString) -> FfiFuture {
+        *BLOB_CT.lock().unwrap() = (handle, key[..].to_string());
+        if BLOB_CT_EMPTY.swap(false, AtomicOrdering::SeqCst) {
+            ready(Ok(b"".to_vec()))
+        } else {
+            ready(Ok(b"image/png".to_vec()))
+        }
+    }
+    extern "C" fn mock_blob_close(handle: u64) {
+        BLOB_CLOSED.store(handle, AtomicOrdering::SeqCst);
+    }
+
+    fn mock_blob_vtable() -> &'static BlobBackendVtable {
+        Box::leak(Box::new(BlobBackendVtable {
+            connect: mock_blob_connect,
+            put: mock_blob_put,
+            get: mock_blob_get,
+            del: mock_blob_del,
+            url: mock_blob_url,
+            content_type: mock_blob_content_type,
+            close: mock_blob_close,
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_put_forwards_key_bytes_and_ct() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        b.put("a/b.png", b"hello", Some("image/png")).await.unwrap();
+        let (h, key, bytes, ct) = BLOB_PUT.lock().unwrap().clone();
+        assert_eq!((h, key.as_str(), bytes.as_slice()), (42, "a/b.png", &b"hello"[..]));
+        assert_eq!(ct, "image/png");
+        // None ct → 空串过线
+        b.put("x", b"y", None).await.unwrap();
+        let (_, _, _, ct) = BLOB_PUT.lock().unwrap().clone();
+        assert_eq!(ct, "");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_get_returns_bytes() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        assert_eq!(b.get("k").await.unwrap(), b"blobdata");
+        let (h, key) = BLOB_GET.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_del_succeeds() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        b.del("k").await.unwrap();
+        let (h, key) = BLOB_DEL.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_url_and_content_type_forward() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        assert_eq!(b.url("k").await.unwrap(), "https://b.s3/presign");
+        let (h, key) = BLOB_URL.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+        assert_eq!(b.content_type("k").await.unwrap(), Some("image/png".to_string()));
+        // 空串 → None
+        BLOB_CT_EMPTY.store(true, AtomicOrdering::SeqCst);
+        assert_eq!(b.content_type("k2").await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_serve_redirects_to_url() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        assert!(matches!(b.serve("k").await.unwrap(), BlobServed::Redirect(u) if u == "https://b.s3/presign"));
+    }
+
+    #[test]
+    fn blob_drop_calls_close() {
+        let _g = T_LOCK.lock().unwrap();
+        BLOB_CLOSED.store(0, AtomicOrdering::SeqCst);
+        drop(FfiBlobBackend::new(42, mock_blob_vtable()));
+        assert_eq!(BLOB_CLOSED.load(AtomicOrdering::SeqCst), 42);
     }
 }

@@ -50,7 +50,7 @@ mod ws;
 
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
-pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
+pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
 pub use bus::{Bus, EventBroker};
 pub use es::EsBackend;
 pub use envelope::{fail, ok, status_code};

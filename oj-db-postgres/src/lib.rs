@@ -412,7 +412,7 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: &VTABLE }
+    PluginRegistrations { es: std::ptr::null(), db: &VTABLE, blob: std::ptr::null() }
 }
 
 // ---- 入口 ----

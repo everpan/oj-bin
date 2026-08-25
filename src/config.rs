@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -37,7 +37,8 @@ impl Default for ServerCfg {
 }
 
 /// 对象存储（OJ-5）：driver local|s3；local root 相对 config 目录。
-#[derive(Debug, Clone, Deserialize)]
+// Serialize：装配层经 cfg JSON 透传给 oj-blob-s3 插件（Task 4.2，spec §3 按值传入）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BlobCfg {
     pub driver: String,

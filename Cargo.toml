@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj", "oj-plugin-ffi", "oj-es", "oj-db-mysql", "oj-db-postgres", "xtask", "tests/plugins/mini"]
+members = ["server", "oj", "oj-plugin-ffi", "oj-es", "oj-db-mysql", "oj-db-postgres", "oj-blob-s3", "xtask", "tests/plugins/mini"]
 default-members = ["."]
 
 [package]

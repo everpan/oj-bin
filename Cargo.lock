@@ -3148,11 +3148,24 @@ dependencies = [
  "flate2",
  "mdm-base-rust",
  "mdm-server",
+ "oj-plugin-ffi",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
  "serde_yaml",
  "tar",
+ "tokio",
+]
+
+[[package]]
+name = "oj-blob-s3"
+version = "0.1.0"
+dependencies = [
+ "object_store",
+ "oj-plugin-ffi",
+ "reqwest 0.13.1",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

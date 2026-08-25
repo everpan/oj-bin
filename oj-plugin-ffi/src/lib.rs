@@ -4,10 +4,12 @@
 //! - stabby 72 注意：`RResult` 的 Ok/Err 是关联函数（构造用 `RResult::Ok(v)`），
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
+pub mod blob;
 pub mod db;
 pub mod es;
 pub mod future;
 
+pub use blob::BlobBackendVtable;
 pub use db::DataAccessorVtable;
 pub use es::EsBackendVtable;
 pub use future::FfiFuture;
@@ -20,7 +22,8 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 
 /// 唯一硬门禁：严格相等才允许加载（spec §3）。
 /// 2 = Task 4.1 起（PluginRegistrations 增 db 槽位 + DataAccessorVtable）。
-pub const ABI_VERSION: u32 = 2;
+/// 3 = Task 4.2 起（PluginRegistrations 增 blob 槽位 + BlobBackendVtable）。
+pub const ABI_VERSION: u32 = 3;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -55,11 +58,12 @@ pub struct PluginDescriptor {
 pub struct PluginRegistrations {
     pub es: *const EsBackendVtable,
     pub db: *const DataAccessorVtable,
+    pub blob: *const BlobBackendVtable,
 }
 
 impl PluginRegistrations {
     pub fn none() -> Self {
-        Self { es: std::ptr::null(), db: std::ptr::null() }
+        Self { es: std::ptr::null(), db: std::ptr::null(), blob: std::ptr::null() }
     }
 
     pub fn es(&self) -> Option<&'static EsBackendVtable> {
@@ -68,6 +72,10 @@ impl PluginRegistrations {
 
     pub fn db(&self) -> Option<&'static DataAccessorVtable> {
         unsafe { self.db.as_ref() }
+    }
+
+    pub fn blob(&self) -> Option<&'static BlobBackendVtable> {
+        unsafe { self.blob.as_ref() }
     }
 }
 

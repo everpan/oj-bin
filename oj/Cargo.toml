@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 mdm-base-rust = { path = ".." }
 mdm-server = { path = "../server" }
+# 装配层直接持有插件 vtable 槽位类型（Registries.blob），需直接依赖契约 crate。
+oj-plugin-ffi = { path = "../oj-plugin-ffi" }
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4.5", features = ["derive"] }
 serde_json = "1"

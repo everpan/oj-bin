@@ -1,0 +1,19 @@
+[package]
+name = "oj-blob-s3"
+version = "0.1.0"
+edition = "2024"
+description = "blob 轴 s3 cdylib 插件：object_store AmazonS3 迁自 core S3Blob（Task 4.2）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../oj-plugin-ffi" }
+object_store = { version = "0.11", features = ["aws"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }

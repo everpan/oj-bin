@@ -57,11 +57,12 @@ pub struct PluginManifestEntry {
     pub semver_pin: Option<String>,
 }
 
-/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；blob/bus/kv 槽位随 4.2-4.4 加入）。
+/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；bus/kv 槽位随 4.3-4.4 加入）。
 #[derive(Default)]
 pub struct Registrations {
     pub es: Option<&'static oj_plugin_ffi::EsBackendVtable>, // Task 3.3 起填
     pub db: Option<&'static oj_plugin_ffi::DataAccessorVtable>, // Task 4.1 起填
+    pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>, // Task 4.2 起填
 }
 
 pub struct LoadedPlugin {
@@ -118,6 +119,24 @@ pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBack
         Arc::new(super::ffi::FfiDbBackend::new(&loaded.descriptor.name[..], vt))
             as Arc<dyn crate::bridge::DbBackend>
     })
+}
+
+/// 经 blob vtable `connect` 建立后端（Task 4.2；装配期调用，handle 由插件分配）。
+/// cfg_json 为后端 JSON 配置（每后端一份，按值传入，spec §3 有意的边界）。
+pub async fn blob_backend_connect(
+    vt: &'static oj_plugin_ffi::BlobBackendVtable,
+    name: &str,
+    cfg_json: &str,
+) -> Result<Arc<dyn crate::bridge::BlobBackend>, String> {
+    let fut = (vt.connect)(RString::from(name), RString::from(cfg_json));
+    let bytes = super::ffi::await_ffi(fut).await.map_err(|e| format!("blob connect: {e}"))?;
+    let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|e| format!("blob connect decode: {e}"))?
+        .get("handle")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "blob connect: missing handle".to_string())?;
+    Ok(Arc::new(super::ffi::FfiBlobBackend::new(handle, vt))
+        as Arc<dyn crate::bridge::BlobBackend>)
 }
 
 /// 加载路径四级解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >
@@ -264,7 +283,7 @@ fn load_one(
 
     // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
     let raw = (descriptor.register)();
-    let registrations = Registrations { es: raw.es(), db: raw.db() };
+    let registrations = Registrations { es: raw.es(), db: raw.db(), blob: raw.blob() };
 
     Ok(LoadedPlugin { descriptor, registrations })
 }

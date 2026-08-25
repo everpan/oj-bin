@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::plugin_loader::{
-    LoadedPlugin, PluginManifestEntry, db_backend, es_backend, host_context, load_manifest,
-    load_scanned, resolve_plugins_dir,
+    LoadedPlugin, PluginManifestEntry, blob_backend_connect, db_backend, es_backend, host_context,
+    load_manifest, load_scanned, resolve_plugins_dir,
 };
 use mdm_base_rust::bridge::{
     Bridge, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras, InMemoryKV, LoaderShared,
@@ -89,23 +89,26 @@ pub async fn start(
         project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
         ts,
     });
-    // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
-    // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
-    let blobs: Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> = match &cfg.blob {
-        None => None,
-        Some(section) => Some(assemble_blobs(section, config_dir, &base)?),
-    };
-    // 下载路由仅服务名为 default 的后端（spec §2 裁决；Task 1.3 钉死字节一致回归）。
-    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> =
-        blobs.as_ref().and_then(|r| r.default());
     // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
     // es 后端 = es 插件（cfg es: 声明且已装，经 FfiEsBackend 适配 core trait）；
-    // 「配置声明了能力但插件未装」→ 启动期 fail-fast（§2 闸门）。
+    // 「配置声明了能力但插件未装」→ 启动期 fail-fast（§2 闸门）。blob/bus 装配须在
+    // 插件之后（blob s3 驱动经插件 vtable connect；Task 4.2 起）。
     let mut registries = Registries::default();
     let plugins = assemble_plugins(&cfg, config_dir, &mut registries)
         .await
         .map_err(|e| format!("plugins: {e}"))?;
     let es: Option<Arc<dyn EsBackend>> = registries.es;
+    // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
+    // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
+    let blobs: Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> = match &cfg.blob {
+        None => None,
+        Some(section) => {
+            Some(assemble_blobs(section, config_dir, &base, registries.blob).await?)
+        }
+    };
+    // 下载路由仅服务名为 default 的后端（spec §2 裁决；Task 1.3 钉死字节一致回归）。
+    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> =
+        blobs.as_ref().and_then(|r| r.default());
     // 逐 db 开库：经 DbBackendRegistry 按 scheme 认领（内置 sqlite/memory + 插件 db 工厂），
     // 未知 scheme 由注册表 fail-fast（装配层不再硬编码 scheme 白名单；Task 4.1 起
     // mysql/postgres 由插件提供，缺装 → "unknown db scheme" 明确报错）。
@@ -279,11 +282,13 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
 }
 
 /// blob 命名多后端装配：逐条目构造（local root 相对 config_dir 绝对化；
-/// s3 字段校验在 S3Blob::new）；配置声明即必须成功注册，缺一启动期报错（fail fast，spec §2）。
-fn assemble_blobs(
+/// s3 经 blob 插件 vtable connect，cfg 按值 JSON 透传）。配置声明即必须成功注册，
+/// 缺一启动期报错（fail fast，spec §2）。driver != local 且无 blob 插件 → fail fast。
+async fn assemble_blobs(
     section: &config::BlobSection,
     config_dir: &Path,
     base: &str,
+    blob_vt: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
 ) -> Result<Arc<mdm_base_rust::bridge::blob::BlobRegistry>, String> {
     let mut r = mdm_base_rust::bridge::blob::BlobRegistry::new();
     for (name, c) in section.entries()? {
@@ -296,9 +301,16 @@ fn assemble_blobs(
                         .map_err(|e| format!("blob '{name}': {e}"))?,
                 )
             }
-            "s3" => Arc::new(
-                mdm_base_rust::bridge::S3Blob::new(&c).map_err(|e| format!("blob '{name}': {e}"))?,
-            ),
+            "s3" => {
+                let vt = blob_vt.ok_or_else(|| {
+                    format!("blob '{name}': driver 's3' requires the oj-blob-s3 plugin (run `cargo xtask plugin blob-s3`)")
+                })?;
+                let cfg_json = serde_json::to_string(&c)
+                    .map_err(|e| format!("blob '{name}': serialize cfg: {e}"))?;
+                blob_backend_connect(vt, &name, &cfg_json)
+                    .await
+                    .map_err(|e| format!("blob '{name}': {e}"))?
+            }
             other => return Err(format!("blob '{name}': driver must be local|s3, got {other:?}")),
         };
         r.register(&name, backend).map_err(|e| format!("blob '{name}': {e}"))?;
@@ -323,11 +335,15 @@ pub async fn connect_dbs(
     Ok(dbs)
 }
 
-/// 装配产物：插件注册的后端槽位（es 键选单后端 + db 认领式注册表；blob/bus/kv 随 4.2-4.4）。
+/// 装配产物：插件注册的后端槽位（es 键选单后端 + db 认领式注册表 + blob 键选
+/// 单后端 vtable 槽；bus/kv 随 4.3-4.4）。
 #[derive(Default)]
 pub struct Registries {
     pub es: Option<Arc<dyn EsBackend>>,
     pub dbs: DbBackendRegistry,
+    /// 插件 blob vtable（Task 4.2：单槽位，多 blob 插件注册冲突 fail fast；s3 驱动
+    /// 经它 connect，装配期逐后端调用）。
+    pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -345,6 +361,8 @@ fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
 /// es 为键选式单后端：cfg es: 声明 + 恰好一个 es 插件 → FfiEsBackend(handle 0)；
 /// 「配置声明了能力但插件未装」→ fail fast（§2 闸门）；多个 es 注册冲突 → fail fast。
 /// db 为认领式：内置 sqlite/memory 打底 + 每个插件 db 工厂注册（scheme 交集冲突 → fail fast）。
+/// blob 为键选式单后端 vtable 槽：多个 blob 插件冲突 fail fast；「s3 驱动但无 blob 插件」
+/// 在 assemble_blobs 逐后端判定（driver != local 且无插件 → fail fast）。
 fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries, String> {
     let es_plugins: Vec<&LoadedPlugin> =
         loaded.iter().filter(|p| p.registrations.es.is_some()).collect();
@@ -362,7 +380,13 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
             dbs.register(be).map_err(|e| format!("plugins db register: {e}"))?;
         }
     }
-    Ok(Registries { es, dbs })
+    let blob_plugins: Vec<&LoadedPlugin> =
+        loaded.iter().filter(|p| p.registrations.blob.is_some()).collect();
+    if blob_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register blob backend".to_string());
+    }
+    let blob = blob_plugins.first().and_then(|p| p.registrations.blob);
+    Ok(Registries { es, dbs, blob })
 }
 
 /// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
@@ -509,7 +533,7 @@ mod tests {
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api").unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None).await.unwrap();
         r.default().unwrap().put("k", b"DEF", None).await.unwrap();
         r.get("img").unwrap().put("k", b"IMG", None).await.unwrap();
         match r.default().unwrap().serve("k").await.unwrap() {
@@ -518,21 +542,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn assemble_blobs_multi_local_and_unknown_driver() {
+    #[tokio::test]
+    async fn assemble_blobs_multi_local_and_unknown_driver() {
         let t = tmpdir("sc-blob");
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api").unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None).await.unwrap();
         assert!(r.default().is_some() && r.get("img").is_some());
         // local root 相对 config_dir 绝对化并创建
         assert!(t.0.join("a").is_dir() && t.0.join("b").is_dir());
         // 未知 driver：错误带后端名
         let bad: config::BlobSection =
             serde_yaml::from_str("backends:\n  x:\n    driver: ghost\n").unwrap();
-        let e = assemble_blobs(&bad, &t.0, "/v1/api").err().unwrap_or_default();
+        let e = assemble_blobs(&bad, &t.0, "/v1/api", None).await.err().unwrap_or_default();
         assert!(e.contains("'x'") && e.contains("ghost"), "{e}");
+    }
+
+    /// s3 驱动但无 blob 插件 → fail fast（driver != local 且无插件闸门，Task 4.2）。
+    #[tokio::test]
+    async fn s3_without_blob_plugin_fails_fast() {
+        let t = tmpdir("sc-blob-s3");
+        let section: config::BlobSection = serde_yaml::from_str(
+            "backends:\n  default:\n    driver: s3\n    bucket: b\n    region: r\n",
+        )
+        .unwrap();
+        let e = assemble_blobs(&section, &t.0, "/v1/api", None).await.err().unwrap_or_default();
+        assert!(e.contains("requires the oj-blob-s3 plugin"), "{e}");
     }
 
     #[tokio::test]
@@ -914,5 +950,53 @@ mod tests {
         let e = connect_dbs(&m, &r.dbs, &t.0).await.err().unwrap_or_default();
         assert!(e.contains("mydb"), "{e}");
         assert!(e.contains("unknown db scheme"), "{e}");
+    }
+
+    /// 编译 oj-blob-s3 产物路径（全进程一次；object_store aws 首次编译慢，OnceLock 缓存）。
+    fn blob_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-blob-s3"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-blob-s3");
+            assert!(status.success(), "oj-blob-s3 build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_blob_s3.{ext}"))
+        })
+        .clone()
+    }
+
+    /// 真实 oj-blob-s3 插件装配 → Registries.blob 槽就位；经它 connect 建后端
+    /// （cfg 校验离线路径：bucket/region 必填在插件侧 fail-fast，不触网）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_plugin_wires_vtable_and_connect_gate() {
+        let t = tmpdir("sc-blobplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(blob_plugin_artifact(), pdir.join(plugin_file("blob-s3"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["blob-s3".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "blob-s3");
+        assert!(r.blob.is_some(), "blob vtable slot not registered");
+        // 经 vtable connect：配置缺 bucket → 插件侧 fail-fast（快速失败不触网）
+        let cfg_json = serde_json::json!({ "driver": "s3", "region": "us-east-1" }).to_string();
+        let e = blob_backend_connect(r.blob.unwrap(), "img", &cfg_json)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("bucket required"), "{e}");
     }
 }
