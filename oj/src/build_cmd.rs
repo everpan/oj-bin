@@ -183,14 +183,15 @@ async fn introspect_module_files(
     mdir: &Path,
     files: &[(PathBuf, bool)],
 ) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
+    let root = src.parent().unwrap_or(src).to_path_buf();
     let mut dbs: HashMap<String, Arc<dyn mdm_base_rust::bridge::DataAccessor>> = HashMap::new();
     dbs.insert(
         "default".into(),
-        SqlxAccessor::arc("sqlite::memory:")
+        mdm_base_rust::bridge::DbBackendRegistry::builtin()
+            .connect("sqlite::memory:", &root)
             .await
             .map_err(|e| format!("open build db: {e}"))?,
     );
-    let root = src.parent().unwrap_or(src).to_path_buf();
     let make = {
         let dbs = dbs.clone();
         move || {

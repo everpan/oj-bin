@@ -79,14 +79,10 @@ pub async fn start(
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
         eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
     }
-    // 逐 db 开库：sqlite/mysql/postgres 按 DSN 分发，其余 fail-fast。
-    let mut dbs: HashMap<String, Arc<dyn DataAccessor>> = HashMap::new();
-    for (name, dsn) in &cfg.db {
-        let acc = SqlxAccessor::arc(&resolve_dsn(dsn, config_dir)?)
-            .await
-            .map_err(|e| format!("open db '{name}': {e}"))?;
-        dbs.insert(name.clone(), acc);
-    }
+    // 逐 db 开库：经 DbBackendRegistry 按 scheme 认领（sqlite/mysql/postgres/memory），
+    // 未知 scheme 由注册表 fail-fast（装配层不再硬编码 scheme 白名单）。
+    let db_registry = mdm_base_rust::bridge::DbBackendRegistry::builtin();
+    let mut dbs = connect_dbs(&cfg.db, &db_registry, config_dir).await?;
     // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
     // 仅 sqlite 库重放（分号切分规则 sqlite 专用；mysql/pg 建库归运维）。
     let seed = config_dir.join("seed.sql");
@@ -275,31 +271,21 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("resolve {s}: no addresses"))
 }
 
-/// DSN 归一：sqlite 相对路径相对 config_dir（缺文件建空库）；mysql/postgres 原样透传；
-/// 其余 scheme fail-fast。内存库原样。
-fn resolve_dsn(dsn: &str, config_dir: &Path) -> Result<String, String> {
-    if dsn.starts_with("mysql://") || dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
-        return Ok(dsn.to_string());
+/// 逐 db 开库（server/build 共用）：经注册表按 scheme 认领，错误文案带库名。
+pub async fn connect_dbs(
+    cfg_db: &HashMap<String, String>,
+    registry: &mdm_base_rust::bridge::DbBackendRegistry,
+    config_dir: &Path,
+) -> Result<HashMap<String, Arc<dyn DataAccessor>>, String> {
+    let mut dbs = HashMap::new();
+    for (name, dsn) in cfg_db {
+        let acc = registry
+            .connect(dsn, config_dir)
+            .await
+            .map_err(|e| format!("open db '{name}': {e}"))?;
+        dbs.insert(name.clone(), acc);
     }
-    let rest = dsn.strip_prefix("sqlite://").or_else(|| {
-        if dsn == "sqlite::memory:" { Some("") } else { None }
-    });
-    let Some(rest) = rest else {
-        return Err(format!("unsupported DSN scheme (got '{dsn}')"));
-    };
-    if rest.is_empty() {
-        return Ok("sqlite::memory:".into()); // sqlite://（空）视作内存
-    }
-    if rest.starts_with(':') || rest.starts_with("//") {
-        return Ok(dsn.to_string());
-    }
-    let p = Path::new(rest);
-    let p = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
-    // sqlx 默认 create_if_missing=false：文件库不存在则建零长空库（sqlite 视作有效空 DB）。
-    if !p.is_file() {
-        std::fs::write(&p, b"").map_err(|e| format!("create db file {}: {e}", p.display()))?;
-    }
-    Ok(format!("sqlite://{}", p.display()))
+    Ok(dbs)
 }
 
 #[cfg(test)]
@@ -381,21 +367,39 @@ mod tests {
         assert!(e.contains("scheme"), "{e}");
     }
 
-    #[test]
-    fn resolve_dsn_dispatches_by_scheme() {
+    #[tokio::test]
+    async fn registry_connect_dispatches_by_scheme() {
         let t = tmpdir("sc-dsn");
-        // sqlite：相对路径归一为 config_dir 下绝对路径
-        let sql = resolve_dsn("sqlite://db.sqlite", &t.0).unwrap();
-        assert!(sql.starts_with("sqlite://"), "{sql}");
-        assert!(sql != "sqlite://db.sqlite", "relative path must be resolved: {sql}");
-        assert!(Path::new(sql.trim_start_matches("sqlite://")).is_absolute(), "{sql}");
-        assert_eq!(resolve_dsn("sqlite::memory:", &t.0).unwrap(), "sqlite::memory:");
-        // mysql/postgres：原样透传
-        for passthrough in ["mysql://u:p@127.0.0.1:3306/app", "postgres://h/app", "postgresql://h/app"] {
-            assert_eq!(resolve_dsn(passthrough, &t.0).unwrap(), passthrough);
+        let reg = mdm_base_rust::bridge::DbBackendRegistry::builtin();
+        // sqlite：相对路径归一为 config_dir 下绝对路径并建空库
+        reg.connect("sqlite://db.sqlite", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.0.join("db.sqlite").is_file());
+        reg.connect("sqlite::memory:", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
+        reg.connect("memory://m", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
+        // mysql/postgres：scheme 被认领（连不上是连接层错误，不是 scheme 层错误）
+        for claimed in ["mysql://u:p@127.0.0.1:1/app", "postgres://127.0.0.1:1/app"] {
+            let e = reg.connect(claimed, &t.0).await.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(!e.contains("unknown db scheme"), "{e}");
         }
         // 未知 scheme 拒绝
-        assert!(resolve_dsn("oracle://x", &t.0).is_err());
+        assert!(reg.connect("oracle://x", &t.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_dbs_two_engines_and_unknown_named() {
+        let t = tmpdir("sc-cdb");
+        let reg = mdm_base_rust::bridge::DbBackendRegistry::builtin();
+        let mut m = HashMap::new();
+        m.insert("default".to_string(), "sqlite::memory:".to_string());
+        m.insert("aux".to_string(), "memory://aux".to_string());
+        let dbs = connect_dbs(&m, &reg, &t.0).await.unwrap();
+        assert!(dbs.contains_key("default") && dbs.contains_key("aux"));
+        // 未知 scheme：库名出现在错误里
+        let mut bad = HashMap::new();
+        bad.insert("mydb".to_string(), "oracle://x".to_string());
+        let e = connect_dbs(&bad, &reg, &t.0).await.err().unwrap_or_default();
+        assert!(e.contains("mydb"), "{e}");
+        assert!(e.contains("unknown db scheme"), "{e}");
     }
 
     #[tokio::test]
