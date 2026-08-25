@@ -20,6 +20,10 @@ pub struct ServerCfg {
     pub pool_size: u32,
     /// 上传体积上限（字节；超出 413）。axum 层再乘 2 做硬顶。
     pub max_upload_bytes: u64,
+    /// 日志目录：绝对路径原样；相对 → 相对 config 目录；未配置 → config 目录下的 ./logs。
+    /// 不存在则自动创建。每日滚动 + 每次启动一个新文件（文件名带启动时间到秒）。
+    #[serde(default)]
+    pub logs_dir: Option<String>,
 }
 
 impl Default for ServerCfg {
@@ -32,6 +36,7 @@ impl Default for ServerCfg {
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
+            logs_dir: None,
         }
     }
 }

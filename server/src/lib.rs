@@ -2,6 +2,7 @@
 
 pub mod actor;
 pub mod auth;
+pub mod logging;
 pub mod routes;
 pub mod ws;
 
@@ -78,6 +79,8 @@ pub fn app(
     let dir = dir.into();
     Router::new()
         .fallback(any(handle))
+        // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
+        .layer(axum::middleware::from_fn(crate::logging::log_requests))
         // 超 2x max_upload 的请求在 axum 层直接被拒（裸 413）；handle() 内再做信封 413。
         .layer(axum::extract::DefaultBodyLimit::max((pipeline.max_upload * 2) as usize))
         .with_state(AppState {

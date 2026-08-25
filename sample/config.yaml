@@ -3,6 +3,8 @@ server:
   port: 9778
   base: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖）
   root: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务）
+  # logs_dir: "logs"   # 访问日志目录（按天滚动，每次启动新建文件，文件名带启动秒级时间）
+                     #  绝对路径直接用；相对路径相对本文件目录；省略 = 本文件目录下 ./logs
 db:
   default: "sqlite://db.sqlite"
   test: "sqlite://db_test.sqlite"
