@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj"]
+members = ["server", "oj", "oj-plugin-ffi"]
 
 [package]
 name = "mdm-base-rust"

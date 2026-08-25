@@ -1042,21 +1042,21 @@ edition = "2024"
 stabby = "…" # 版本按 Task S.1 选型记录
 ```
 
-- [ ] **Step 1: 写失败测试**——`oj_plugin_entry!` 宏展开的两符号存在且 abi_version 返回 `ABI_VERSION`；模拟 init 内 panic 的插件函数经宏包装后返回 `RResult::Err` 而非 unwind 跨界（单 crate 内直调测试即可）。
+- [x] **Step 1: 写失败测试**——`oj_plugin_entry!` 宏展开的两符号存在且 abi_version 返回 `ABI_VERSION`；模拟 init 内 panic 的插件函数经宏包装后返回 `RResult::Err` 而非 unwind 跨界（单 crate 内直调测试即可）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p oj-plugin-ffi`
 Expected: FAIL（crate 不存在）
 
-- [ ] **Step 3: 实现**（宏用 `std::panic::catch_unwind`；`#[no_mangle] extern "C"` 两符号；FfiFuture 从 spike S.2 样例迁入）
+- [x] **Step 3: 实现**（宏用 `std::panic::catch_unwind`；`#[no_mangle] extern "C"` 两符号；FfiFuture 从 spike S.2 样例迁入）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p oj-plugin-ffi`
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add oj-plugin-ffi/ Cargo.toml Cargo.lock
