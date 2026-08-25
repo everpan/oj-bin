@@ -82,16 +82,25 @@ pub struct LocalBlob {
     store: LocalFileSystem,
     root: PathBuf,
     base_url: String,
+    /// 注册名（spec §2：下载路由仅服务 "default"，非 default 的 url() 明确报错）。
+    name: String,
 }
 
 impl LocalBlob {
     /// root 绝对/相对均可（调用方负责相对 config_dir 绝对化）；url 前缀 = {base}/blob。
+    /// 等价 named("default", ...)（直构造不入注册表时保持路由可用语义）。
     pub fn new(root: &std::path::Path, base_url: &str) -> BridgeResult<Self> {
+        Self::named("default", root, base_url)
+    }
+
+    /// 带注册名构造（装配层经 BlobRegistry::register 时透传注册名）。
+    pub fn named(name: &str, root: &std::path::Path, base_url: &str) -> BridgeResult<Self> {
         std::fs::create_dir_all(root).map_err(|e| format!("blob root {}: {e}", root.display()))?;
         Ok(Self {
             store: LocalFileSystem::new_with_prefix(root).map_err(|e| format!("blob root {}: {e}", root.display()))?,
             root: root.to_path_buf(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            name: name.to_string(),
         })
     }
 
@@ -145,6 +154,13 @@ impl BlobBackend for LocalBlob {
 
     async fn url(&self, key: &str) -> BridgeResult<String> {
         os_path(key)?;
+        if self.name != "default" {
+            return Err(format!(
+                "blob url() is only available for the 'default' backend (backend '{}': use get() or an s3 presign)",
+                self.name
+            )
+            .into());
+        }
         Ok(format!("{}/blob/{key}", self.base_url))
     }
 
@@ -480,6 +496,18 @@ mod tests {
             path_style: true,
         };
         assert!(S3Blob::new(&missing_region).is_err());
+    }
+
+    /// 非 default local 后端 url() 明确报错（下载路由仅服务 default，spec §2 裁决）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_blob_url_errors_when_not_default() {
+        let root = tmp_root();
+        let b = LocalBlob::named("img", &root, "/v1/api").unwrap();
+        let e = b.url("k").await.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("only available for the 'default' backend"), "{e}");
+        // default 名不受影响
+        let d = LocalBlob::new(&root, "/v1/api").unwrap();
+        assert_eq!(d.url("k").await.unwrap(), "/v1/api/blob/k");
     }
 
     /// blob(name) 工厂：命名分发 + default 兼容旧调用 + 未配置名首次调用期报错（spec §2）。

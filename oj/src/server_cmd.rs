@@ -277,7 +277,7 @@ fn assemble_blobs(
                 let root = Path::new(&c.root);
                 let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
                 Arc::new(
-                    mdm_base_rust::bridge::LocalBlob::new(&root, base)
+                    mdm_base_rust::bridge::LocalBlob::named(&name, &root, base)
                         .map_err(|e| format!("blob '{name}': {e}"))?,
                 )
             }
@@ -403,6 +403,22 @@ mod tests {
         }
         // 未知 scheme 拒绝
         assert!(reg.connect("oracle://x", &t.0).await.is_err());
+    }
+
+    /// 下载路由数据源 = registry.default()：同 key 不同内容时字节与 default 一致（spec §2 裁决回归）。
+    #[tokio::test]
+    async fn download_route_source_is_default_backend_only() {
+        let t = tmpdir("sc-blob-def");
+        let section: config::BlobSection =
+            serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
+                .unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api").unwrap();
+        r.default().unwrap().put("k", b"DEF", None).await.unwrap();
+        r.get("img").unwrap().put("k", b"IMG", None).await.unwrap();
+        match r.default().unwrap().serve("k").await.unwrap() {
+            mdm_base_rust::bridge::BlobServed::Bytes(bytes, _) => assert_eq!(bytes, b"DEF"),
+            _ => panic!("local must inline-serve"),
+        }
     }
 
     #[test]
