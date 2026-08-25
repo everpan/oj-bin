@@ -142,3 +142,5 @@ cargo run -p oj -- serve ...
 | `oj-blob-s3` | blob | object_store aws | core `bridge/blob.rs` S3Blob |
 | `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
 | `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
+
+> 所有第一方插件源码统一位于 `crates/plugins/`；构建产物（cdylib）归置 `plugins/<triple>/`，由 `.gitignore` 忽略。

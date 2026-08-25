@@ -205,7 +205,7 @@ Task 6.2 Step 3 提交 `fix(review): 插件系统完成度 review 意见吸收`�
 | 加载器（路径解析/清单/扫描/七分类） | `src/bridge/plugin_loader.rs` + `tests.rs` |
 | 装配层（清单去重/冲突 fail-fast/§2 闸门） | `oj/src/server_cmd.rs`（`assemble_plugins`/`build_registries`） |
 | 插件自省 op | `src/bridge/plugins_op.rs` |
-| 插件 cdylib | `oj-es` `oj-db-mysql` `oj-db-postgres` `oj-blob-s3` `oj-bus-kafka` `oj-bus-rabbitmq` `oj-kv-redis` |
+| 插件 cdylib | `crates/plugins/oj-es` `crates/plugins/oj-db-mysql` `crates/plugins/oj-db-postgres` `crates/plugins/oj-blob-s3` `crates/plugins/oj-bus-kafka` `crates/plugins/oj-bus-rabbitmq` `crates/plugins/oj-kv-redis` |
 | 测试夹具插件 | `tests/plugins/mini` |
 | 构建产物归置 | `cargo xtask plugin <name>` → `./plugins/<host-triple>/` |
 

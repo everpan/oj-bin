@@ -8,7 +8,7 @@
 ## 1. 工作区结构（宿主 + 契约 crate + 插件）
 
 ```
-Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", 第一方插件…, "xtask"]
+Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "crates/plugins/*", "xtask"]
 src/                  # crate: mdm-base-rust（lib + bench）——核心执行层
 ├── lib.rs            # 导出 bridge + config
 ├── main.rs           # bench 入口（criterion harness，非服务）

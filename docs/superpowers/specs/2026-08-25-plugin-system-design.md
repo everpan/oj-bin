@@ -28,7 +28,7 @@
 Layer 3  装配层    oj / server：解析配置 → PluginLoader 定位/加载/校验 → 工厂注册 → builder
 Layer 2  插件层    oj-db-mysql / oj-db-postgres / oj-blob-s3 / oj-bus-kafka
                    / oj-bus-rabbitmq / oj-es / oj-kv-redis   —— cdylib crate，
-                   只依赖 oj-plugin-ffi + 各自后端 SDK，可单独编译、独立仓库
+                   只依赖 oj-plugin-ffi + 各自后端 SDK，可单独编译、独立仓库（源码位于 `crates/plugins/`；构建产物归置 `plugins/<triple>/`）
 Layer 1  框架层    core：五个注册表 + PluginLoader + ffi.rs（全部 unsafe 收敛于此）
 契约层   oj-plugin-ffi（独立 crate）：稳定 ABI 数据容器、vtable 定义、FfiFuture、
                    HostContext、PluginDescriptor、入口符号宏（内建 panic 收敛）、ABI_VERSION
