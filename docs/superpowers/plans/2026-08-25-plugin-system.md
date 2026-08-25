@@ -883,13 +883,13 @@ unix@vip.qq.com ai"
 **Interfaces:**
 - Produces: 选型结论（写入 NOTES.md 与本计划 Task 3.1 的 `use` 决策）；样例证明：RString/RBytes/RResult 跨界 roundtrip、布局不匹配时 canary 报错而非 UB。
 
-- [ ] **Step 1: 搭样例**——plugin cdylib 导出 `extern "C" fn echo(input: RString) -> RResult<RString, RString>` 与 `abi_version() -> u32`；host 用 libloading 加载调用，断言 roundtrip 一致。
+- [x] **Step 1: 搭样例**——plugin cdylib 导出 `extern "C" fn echo(input: RString) -> RResult<RString, RString>` 与 `abi_version() -> u32`；host 用 libloading 加载调用，断言 roundtrip 一致。
 
-- [ ] **Step 2: 验证布局防护**——host 与 plugin 用**不同版本**的契约 struct 编译（人为改一个字段），断言加载/调用时被 canary/layout 校验拒绝而非静默错乱。两个绑定库各跑一遍。
+- [x] **Step 2: 验证布局防护**——host 与 plugin 用**不同版本**的契约 struct 编译（人为改一个字段），断言加载/调用时被 canary/layout 校验拒绝而非静默错乱。两个绑定库各跑一遍。
 
-- [ ] **Step 3: 决策记录**——NOTES.md 写：选型（默认 stabby，除非样例暴露硬伤）、layout 校验实测行为、rust 版本要求、依赖体积。结论同步进 spec §3 若与默认假设冲突。
+- [x] **Step 3: 决策记录**——NOTES.md 写：选型（默认 stabby，除非样例暴露硬伤）、layout 校验实测行为、rust 版本要求、依赖体积。结论同步进 spec §3 若与默认假设冲突。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add spikes/
@@ -920,13 +920,13 @@ pub struct FfiFuture {
 }
 ```
 
-- [ ] **Step 1: 写样例**——plugin init 时 `tokio::runtime::Builder::new_multi_thread().enable_all().build()` 自建 runtime；导出 `sleep_ms(ms: u64) -> FfiFuture`（内部 `rt.spawn(async { tokio::time::sleep(...).await; ... })`）；host 在**自己的** tokio runtime 里 await 该 FfiFuture（`tokio::task::yield_now` 轮询 poll 或 spawn_blocking block_on），断言结果正确。
+- [x] **Step 1: 写样例**——plugin init 时 `tokio::runtime::Builder::new_multi_thread().enable_all().build()` 自建 runtime；导出 `sleep_ms(ms: u64) -> FfiFuture`（内部 `rt.spawn(async { tokio::time::sleep(...).await; ... })`）；host 在**自己的** tokio runtime 里 await 该 FfiFuture（`tokio::task::yield_now` 轮询 poll 或 spawn_blocking block_on），断言结果正确。
 
-- [ ] **Step 2: 关键断言**——插件内执行真实 `tokio::time::sleep` +（若样例含 sqlx/reqwest 则）真实异步调用**不 panic**（"there is no reactor running" 不复现 = 插件 TLS 在插件自己那份 tokio 上成立）。
+- [x] **Step 2: 关键断言**——插件内执行真实 `tokio::time::sleep` +（若样例含 sqlx/reqwest 则）真实异步调用**不 panic**（"there is no reactor running" 不复现 = 插件 TLS 在插件自己那份 tokio 上成立）。
 
-- [ ] **Step 3: drop 语义样例**——host 提前 drop FfiFuture，断言插件任务跑完（用插件侧 AtomicUsize 计数验证）、无 UB、无泄漏（`free` 被调）。
+- [x] **Step 3: drop 语义样例**——host 提前 drop FfiFuture，断言插件任务跑完（用插件侧 AtomicUsize 计数验证）、无 UB、无泄漏（`free` 被调）。
 
-- [ ] **Step 4: 决策记录 + Commit**——NOTES.md 写 FfiFuture 最终形态（含 take 后的状态清理时序）。
+- [x] **Step 4: 决策记录 + Commit**——NOTES.md 写 FfiFuture 最终形态（含 take 后的状态清理时序）。
 
 ```bash
 git add spikes/
@@ -950,13 +950,13 @@ unix@vip.qq.com ai"
 // tx_commit(handle, tx_id) -> FfiFuture ；句柄表随 commit/rollback 移除条目
 ```
 
-- [ ] **Step 1: 写样例**——plugin 内嵌一个极简内存 DataAccessor（不依赖 sqlx），导出 vtable：`connect(cfg) -> u64 handle` / `query(handle, sql, params) -> FfiFuture` / `begin(handle) -> FfiFuture(tx_id)` / `tx_exec(handle, tx_id, ...) -> FfiFuture` / `tx_commit/tx_rollback(handle, tx_id) -> FfiFuture` / `close(handle)`。
+- [x] **Step 1: 写样例**——plugin 内嵌一个极简内存 DataAccessor（不依赖 sqlx），导出 vtable：`connect(cfg) -> u64 handle` / `query(handle, sql, params) -> FfiFuture` / `begin(handle) -> FfiFuture(tx_id)` / `tx_exec(handle, tx_id, ...) -> FfiFuture` / `tx_commit/tx_rollback(handle, tx_id) -> FfiFuture` / `close(handle)`。
 
-- [ ] **Step 2: host 侧走通**——connect → begin → tx_exec → tx_commit 全链路；再测 tx_id 未 commit 直接 close handle（= drop-rollback 语义的 FFI 映射：host 侧适配器 drop 时调 tx_rollback，见 Task 3.3）。
+- [x] **Step 2: host 侧走通**——connect → begin → tx_exec → tx_commit 全链路；再测 tx_id 未 commit 直接 close handle（= drop-rollback 语义的 FFI 映射：host 侧适配器 drop 时调 tx_rollback，见 Task 3.3）。
 
-- [ ] **Step 3: dynptr 评估**——尝试把同一接口用 stabby dynptr 直出 `dyn Trait` 对象替代 vtable；记录编译复杂度、文档成熟度、panic 收敛兼容性。门槛：样例必须证明 dynptr 形态下 panic 收敛宏与 FfiFuture 仍成立，否则**保持保守 vtable 形态**（spec §3 默认）。
+- [x] **Step 3: dynptr 评估**——尝试把同一接口用 stabby dynptr 直出 `dyn Trait` 对象替代 vtable；记录编译复杂度、文档成熟度、panic 收敛兼容性。门槛：样例必须证明 dynptr 形态下 panic 收敛宏与 FfiFuture 仍成立，否则**保持保守 vtable 形态**（spec §3 默认）。
 
-- [ ] **Step 4: 决策记录 + Commit**——NOTES.md 定案后端对象形态；若升级 dynptr，回写 spec §3 与 Task 3.1/3.3 的 vtable 描述（标注"经 spike S.3 升级为 dynptr"）。
+- [x] **Step 4: 决策记录 + Commit**——NOTES.md 定案后端对象形态；若升级 dynptr，回写 spec §3 与 Task 3.1/3.3 的 vtable 描述（标注"经 spike S.3 升级为 dynptr"）。
 
 ```bash
 git add spikes/
@@ -967,8 +967,8 @@ unix@vip.qq.com ai"
 
 ### Task S.4: 阶段 Spike 任务状态更新
 
-- [ ] **Step 1: 勾选 Task S.1-S.3 复选框**；若决策改变了阶段 3+ 的接口形态，**先回写本计划对应任务再勾选**。
-- [ ] **Step 2: 进度提交**
+- [x] **Step 1: 勾选 Task S.1-S.3 复选框**；若决策改变了阶段 3+ 的接口形态，**先回写本计划对应任务再勾选**。
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md docs/superpowers/specs/
