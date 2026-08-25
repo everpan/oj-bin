@@ -1272,14 +1272,16 @@ cargo xtask plugin <name>        # 编译 oj-<name>（release）+ 拷入 仓库�
 cargo xtask plugin <name> --check # loader dry-run：ABI/semver/符号预检，不注册不驻留
 ```
 
-- [ ] **Step 1: 实现**——`std::process::Command` 调 `cargo build -p oj-<name> --release`；产物名按平台映射（`liboj_<name>.so|dylib` / `oj_<name>.dll`，`-`→`_`）；host triple 用 `rustc -vV` 解析；拷贝目标 = 仓库根 `./plugins/<triple>/`（与 dev 后备查找对应，spec §4）。`--check` 复用 Task 3.2 的 PluginLoader（加载→校验→**不 forget 直接 drop 句柄仅用于 dry-run**？——不：dry-run 在子进程里跑，forget 无妨，复用同一入口保证预检与真实加载一致）。
+- [x] **Step 1: 实现**——`std::process::Command` 调 `cargo build -p oj-<name> --release`；产物名按平台映射（`liboj_<name>.so|dylib` / `oj_<name>.dll`，`-`→`_`）；host triple 用 `rustc -vV` 解析；拷贝目标 = 仓库根 `./plugins/<triple>/`（与 dev 后备查找对应，spec §4）。`--check` 复用 Task 3.2 的 PluginLoader（加载→校验→**不 forget 直接 drop 句柄仅用于 dry-run**？——不：dry-run 在子进程里跑，forget 无妨，复用同一入口保证预检与真实加载一致）。
+  > 命名约定落地：编译产物（crate `oj-<name>` → `liboj_<name>.*`）拷贝时**改名**为 loader 的 `plugin_file_name(name)`（`lib<name>.*`，descriptor.name 对齐，同 plugin_loader 测试对 mini 的做法）；xtask 内复制该命名（loader 的 `plugin_file_name` 是 pub(crate)）。
 
-- [ ] **Step 2: 自验**
+- [x] **Step 2: 自验**
 
 Run: `cargo xtask plugin es && ls plugins/$(rustc -vV | sed -n 's/host: //p')/`
-Expected: `liboj_es.dylib` 就位；`cargo xtask plugin es --check` 退出码 0
+Expected: `libes.dylib` 就位；`cargo xtask plugin es --check` 退出码 0
+实际：`libes.dylib` 就位，`--check` 输出 `ok: es 0.1.0 (abi 1)`，退出码 0
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add xtask/ .cargo/ Cargo.toml

@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj", "oj-plugin-ffi", "oj-es", "tests/plugins/mini"]
+members = ["server", "oj", "oj-plugin-ffi", "oj-es", "xtask", "tests/plugins/mini"]
 default-members = ["."]
 
 [package]
