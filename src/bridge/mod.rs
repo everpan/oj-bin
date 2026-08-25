@@ -22,6 +22,7 @@
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
 mod db;
+pub mod db_backend;
 mod envelope;
 mod es;
 mod fetch;
@@ -53,6 +54,7 @@ pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
+pub use db_backend::{DbBackend, DbBackendRegistry};
 pub use named_registry::NamedRegistry;
 pub use registry::SchemaRegistry;
 
