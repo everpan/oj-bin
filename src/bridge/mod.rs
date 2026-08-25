@@ -36,6 +36,7 @@ mod kv;
 mod loader;
 mod log;
 mod module_loader;
+mod named_registry;
 mod query;
 mod registry;
 mod runtime;
@@ -52,6 +53,7 @@ pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
+pub use named_registry::NamedRegistry;
 pub use registry::SchemaRegistry;
 
 use std::cell::RefCell;
