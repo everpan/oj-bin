@@ -74,23 +74,40 @@ server:
   root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
 db:
   default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
-  # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # v0.2 多库
-  # warehouse: "postgres://127.0.0.1:5432/app"
+  # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # 需 oj-db-mysql 插件
+  # warehouse: "postgres://127.0.0.1:5432/app"          # 需 oj-db-postgres 插件
 redis:
-  # default: "redis://127.0.0.1:6379/1"   # v0.2 注释/删除 = 内存 KV；配置即真连（连不上启动报错）
+  # default: "redis://127.0.0.1:6379/1"   # 注释/删除 = 内存 KV；配置即真连，需 oj-kv-redis 插件
 es:
-  # endpoint: "http://127.0.0.1:9200"     # v0.2 存在即启用 es.search/index/del；否则报 "es not configured"
+  # endpoint: "http://127.0.0.1:9200"     # 存在即启用 es.search/index/del，需 oj-es 插件
+plugins:
+  # - es                       # 显式清单（严格装配：缺文件/版本不符 fail fast）
+  # - db-mysql
+  # - kv-redis
+plugins_dir: "plugins"        # 可选：插件目录（相对 config 目录；省略 = 扫描默认位置）
+broker:
+  # kind: kafka               # 可选：分布式事件总线（local/kafka/rabbitmq；kafka/rabbitmq 需插件）
+  # brokers: ["127.0.0.1:9092"]
+blob:
+  # 可选：对象存储（driver local/s3，s3 需 oj-blob-s3 插件；完整键见 sample/config.yaml）
 ```
 
 - `server` 字段全可省（都有默认值）。
 - `db`：`name → DSN` 映射，多库可混用：`sqlite://<path>`（相对 config 目录）、`sqlite::memory:`、
-  `mysql://…`、`postgres://…`（原样透传）。`DB("name")` 按名取库；构造器（`db.table()`）
-  自动按库方言出 SQL。裸 SQL 的占位符方言归业务（sqlite/mysql `?`，postgres `$1`）。
-- `redis`：`name → url` 映射。v0.2 **配置存在即真连**（启动 fail-fast：连不上直接报错退出，
-  不会静默退回内存），`default` 的 KV 与 auth 会话共享同一 Redis；`redis` 段缺失/全注释 →
-  进程内存 KV（`redis.*` 与 `kv.*` 同源）。
-- `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`；缺失时调用报
-  `es not configured`。endpoint 尾斜杠自动剪除。
+  `mysql://…`、`postgres://…`。**内置只有 sqlite/memory**；`mysql`/`postgres` 需对应插件
+  （oj-db-mysql / oj-db-postgres），未装插件 → 启动报 "unknown db scheme"。`DB("name")` 按名
+  取库；构造器（`db.table()`）自动按库方言出 SQL。裸 SQL 占位符方言归业务（sqlite/mysql
+  `?`，postgres `$1`）。
+- `redis`：`name → url` 映射。`redis.default` **配置存在即真连**（启动 fail-fast：连不上直接
+  报错退出，不静默退回内存），需 **oj-kv-redis** 插件；未装插件 → 启动报
+  "no kv plugin loaded"。`redis` 段缺失/全注释 → 进程内存 KV（`redis.*` 与 `kv.*` 同源）。
+- `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`，需 **oj-es** 插件；缺失时调用
+  报 `es not configured`。endpoint 尾斜杠自动剪除。
+- `plugins` / `plugins_dir`：插件装配。`plugins` 显式给出 → 严格按清单装配（缺失 fail fast）；
+  省略 → 扫描 `<plugins_dir>/<平台目录>/`（缺省平台目录 = 当前编译目标 triple）。目录布局与
+  升级回滚见 `dev-manual.md` §9、`plugin-development.md`。
+- `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
+  （未装 → "unknown broker kind"）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
 - `server.root`：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。

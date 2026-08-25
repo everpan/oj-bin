@@ -1,0 +1,144 @@
+# oj 插件开发指南（第三方）
+
+插件系统把外部分布式后端（db 方言、blob 驱动、bus 消息、kv 存储、es 引擎）抽为
+**动态链接库**，宿主按平台目录扫描/按清单装配。本文档面向第三方插件作者：
+FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装配语义见
+`dev-manual.md` §9，配置见 `user-manual.md` §3。
+
+## 1. 一句话模型
+
+- 插件 = 一个 **cdylib**，导出两个符号（由入口宏生成，禁止手写 `#[no_mangle]` 绕过）。
+- 宿主与插件只通过 `oj-plugin-ffi` crate 的类型跨边界（**唯一允许**）；tokio/tracing 等
+  运行时类型绝不过线。
+- `ABI_VERSION`（u32，**严格相等**）是唯一硬门禁；构建指纹（rustc/契约 crate 版本/triple）
+  仅诊断，不匹配告警不拒绝。
+- 每个插件通过 `register()` 返回各轴 **vtable**（函数指针表）。宿主在 `init` 返回后立即
+  调用 `register` 取槽位——**所有工厂注册必须在 init 调用窗口内完成**（槽位指向的静态表
+  在 init 时就绪）。
+
+## 2. 契约 crate 类型面
+
+所有跨界类型都在 `oj-plugin-ffi`（宿主与插件依赖同一 crate，保证布局一致）：
+
+| 类型 | 说明 |
+|------|------|
+| `RString` | stabby `String`，`repr(C)`，`&s[..]` 取 `&str` |
+| `RBytes` | stabby `Vec<u8>` |
+| `RResult<T,E>` | stabby `Result`；构造用 `RResult::Ok(v)` / `Err(e)`，消费侧 `std::result::Result::from(r)` 转标准 Result 后 match（**不能模式匹配**，`?` 对 stabby Result 无效） |
+| `RArc<T>` | stabby `Arc`（`HostContext` 的载体） |
+| `FfiFuture` | `{ state, poll, take, free }` 异步句柄（见 §4） |
+| `HostContext` | 宿主回调集：`log(level, msg)`、`deliver(topic, payload)` |
+| `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, register }` |
+| `PluginRegistrations` | 各轴 vtable 槽位：`es / db / blob / bus / kv`（未提供 = null） |
+
+各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv}.rs`。方法签名形态：
+同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
+
+## 3. ABI_VERSION 纪律
+
+- `ABI_VERSION` 当前 **5**。任何 `repr(C)` 类型字段变更（加槽位、改签名、增 HostContext
+  回调）= **必须 bump**。向后兼容配置演进走 **cfg JSON 字段**（新增可选键不 bump）。
+- 宿主严格 `plugin_abi == ABI_VERSION` 才加载；不相等 → `plugin ABI mismatch: plugin=N host=M`。
+- 插件构建须对当前 `oj-plugin-ffi` 版本；升级宿主与插件顺序：**先升插件到新 ABI 并验证，
+  再升宿主**（或同版本原子升级）。`cargo xtask plugin <name> --check` 复用宿主 `PluginLoader`
+  做 ABI/身份/semver 预检。
+
+## 4. FfiFuture 异步桥（唯一异步路径）
+
+插件内自建 tokio runtime（`#[tokio::main]` 不经用——插件 init 在宿主线程调用）。推荐形态
+（见第一方插件 `oj-kv-redis` / `oj-blob-s3`）：
+
+```rust
+struct CallState {
+    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
+    result: Option<Result<Vec<u8>, String>>,
+}
+// poll: try_recv → 1 成功 / -1 错误 / 0 未就绪（宿主 yield_now 轮询）
+// take: result.take() → RResult<RBytes, RString>
+// free: Box::from_raw 释放（幂等，null 安全）
+```
+
+`spawn_call`：异步工作 `spawn` 到插件 runtime，oneshot 收结果，返回 `FfiFuture`。
+
+**返回编码约定**：结构化返回值走 JSON 字节（如 `get` → `"value"`/`null`、`expire` → `true`，
+`connect` → `{"handle":N}`）；空操作返回空字节。时长跨线以秒计（Redis EXPIRE 整秒契约）。
+
+## 5. 插件须自包含
+
+- 插件依赖自己 + 各自后端 SDK（sqlx、rdkafka、object_store、redis、reqwest…）——
+  **不依赖宿主 crate**，可脱离宿主 workspace 单独编译、独立仓库发版。
+- 系统级依赖（如 rdkafka 的 librdkafka、openssl）要么静态/vendored 链接，要么在插件
+  README **显式声明**运行环境要求（部署侧 glibc 基线见 CI 矩阵）。
+- 共享逻辑不抽公共运行时——复制可接受的（决策记录：接受复制）。
+
+## 6. panic=unwind（禁止 abort）
+
+- 插件 **必须** `panic=unwind` profile（不得覆盖为 abort）。入口宏内建
+  `catch_unwind(AssertUnwindSafe(..))`，init 内 panic 收敛为 `RResult::Err`，**不 unwind 跨界**。
+- 运行期异步任务内 panic 会中止该任务（不拖垮插件进程——插件与宿主同进程，插件自身线程
+  被 panic 终止；宿主经 panic hook 归因）。
+- 宿主的 panic hook（装配首个插件前安装）：输出 `[oj-plugin] panic while loading plugin
+  '<name>' (host fingerprint: …)` 后透传原始 panic。
+
+## 7. 入口宏用法
+
+```rust
+use oj_plugin_ffi::{ABI_VERSION, HostContext, PluginDescriptor, PluginRegistrations,
+    RArc, RResult, RString, oj_plugin_entry};
+
+fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
+    // 幂等：重复 init 返回已有 descriptor（OnceLock 兜底）
+    if PLUGIN.get().is_some() { return RResult::Ok(descriptor()); }
+    // init 建立插件 runtime + 单例状态；cfg 为装配期配置（无则忽略）
+    let _ = PLUGIN.set(state);
+    RResult::Ok(descriptor())
+}
+
+fn descriptor() -> PluginDescriptor {
+    PluginDescriptor {
+        name: RString::from("my-plugin"),
+        semver: RString::from("0.1.0"),
+        abi_version: ABI_VERSION,
+        fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
+        register,
+    }
+}
+
+// register() 返回各轴 vtable 槽位（无 = null）
+extern "C" fn register() -> PluginRegistrations {
+    PluginRegistrations { es: std::ptr::null(), db: &VTABLE, blob: std::ptr::null(),
+                          bus: std::ptr::null(), kv: std::ptr::null() }
+}
+
+oj_plugin_ffi::oj_plugin_entry!(init);
+```
+
+- 命名：插件 `descriptor.name` 决定存放文件名（`lib<name>.dylib` / `<name>.dll`）；crate 名
+  `oj-<name>` → 构建产物 `liboj_<name>.<ext>`。扫描模式按文件名加载、清单模式按 `plugins`
+  列表核对名字与 `@semver` pin。
+- 插件不得手写 `#[no_mangle] pub extern "C" fn oj_plugin_*` 绕过宏（descriptor 内 abi_version
+  二次校验兜底）。
+
+## 8. 构建与调试
+
+```bash
+# 本地构建 + 拷入 plugins/<host-triple>/（xtask 用 release）
+cargo xtask plugin <name>
+cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/符号）
+
+# 运行宿主（dev），加载扫描
+cargo run -p oj -- serve ...
+```
+
+**panic 归因**：panic hook 已输出插件名 + 宿主指纹。若需源码级调试，在 `plugins/<triple>/`
+旁保留对应构建的符号文件（`symbols/` 目录），`lldb`/`gdb` 附加后 `bt` 定位。
+
+## 9. 第一方插件清单（参照模板）
+
+| 插件 | 轴 | 驱动 | 迁移来源 |
+|------|-----|------|---------|
+| `oj-es` | es | reqwest | core `bridge/es.rs` |
+| `oj-db-mysql` / `oj-db-postgres` | db | sqlx Any 单方言 | core `accessor_sqlx.rs` |
+| `oj-blob-s3` | blob | object_store aws | core `bridge/blob.rs` S3Blob |
+| `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
+| `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
