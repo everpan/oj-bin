@@ -1557,9 +1557,9 @@ unix@vip.qq.com ai"
 - Modify: `docs/dev-manual.md`、`docs/user-manual.md`
 - Create: `docs/plugin-development.md`（第三方插件开发指南）
 
-- [ ] **Step 1: 写文档**——清单与扫描双模式语义、目录布局 `plugins/<triple>/`、升级回滚流程（`.new`/`.bak` + `cargo xtask plugin --check` + ABI bump 部署顺序）、FFI 契约（oj-plugin-ffi 类型面、ABI_VERSION 纪律、契约演进总则）、第三方插件开发指南（插件须自包含或显式声明系统依赖、panic=unwind、入口宏用法）、panic 归因流程（panic hook 输出 + symbols/ 目录）。
+- [x] **Step 1: 写文档**——清单与扫描双模式语义、目录布局 `plugins/<triple>/`、升级回滚流程（`.new`/`.bak` + `cargo xtask plugin --check` + ABI bump 部署顺序）、FFI 契约（oj-plugin-ffi 类型面、ABI_VERSION 纪律、契约演进总则）、第三方插件开发指南（插件须自包含或显式声明系统依赖、panic=unwind、入口宏用法）、panic 归因流程（panic hook 输出 + symbols/ 目录）。
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/
@@ -1570,7 +1570,7 @@ unix@vip.qq.com ai"
 
 ### Task 5.2: 阶段 5 任务状态更新
 
-- [ ] **Step 1: 勾选 Task 5.1 复选框 + 进度提交**
+- [x] **Step 1: 勾选 Task 5.1 复选框 + 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
