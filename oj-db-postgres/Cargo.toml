@@ -1,0 +1,22 @@
+[package]
+name = "oj-db-postgres"
+version = "0.1.0"
+edition = "2024"
+description = "db 轴 postgres cdylib 插件：sqlx Any 单方言（postgres）迁移自 core SqlxAccessor"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../oj-plugin-ffi" }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "any",
+    "postgres",
+    "json",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }

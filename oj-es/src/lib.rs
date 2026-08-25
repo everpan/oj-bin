@@ -228,7 +228,7 @@ extern "C" fn close(handle: u64) {
 static ES_VTABLE: EsBackendVtable = EsBackendVtable { search, index_doc, delete_doc, close };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: &ES_VTABLE }
+    PluginRegistrations { es: &ES_VTABLE, db: std::ptr::null() }
 }
 
 // ---- 入口 ----

@@ -16,8 +16,9 @@ use super::db::{DataAccessor, InMemoryAccessor};
 #[async_trait]
 pub trait DbBackend: Send + Sync {
     fn name(&self) -> &str;
-    /// 认领的 scheme 前缀列表（如 `&["mysql://"]`）；注册时做交集检查。
-    fn schemes(&self) -> &'static [&'static str];
+    /// 认领的 scheme 前缀列表（如 `["mysql://"]`）；注册时做交集检查。
+    /// 非 `'static` 切片：FFI 后端的 scheme 由插件 vtable 运行期自报。
+    fn schemes(&self) -> Vec<String>;
     /// config_dir：sqlite 相对路径归一化的基准（配置文件所在目录）。
     async fn connect(&self, dsn: &str, config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>>;
 }
@@ -32,13 +33,12 @@ impl DbBackendRegistry {
     pub fn new() -> Self {
         Self::default()
     }
-    /// 内置四后端：sqlite / mysql / postgres / memory（顺序即优先级）。
+    /// 内置二后端：sqlite / memory（mysql/postgres 已迁插件，Task 4.1；由插件工厂
+    /// 注册进装配期 registry——内置只留方言无关的内存/本地形态）。
     pub fn builtin() -> Self {
         let mut r = Self::new();
         // 内置注册 scheme 互不相交，unwrap 安全。
         r.register(Arc::new(SqliteBackend)).unwrap();
-        r.register(Arc::new(MySqlBackend)).unwrap();
-        r.register(Arc::new(PostgresBackend)).unwrap();
         r.register(Arc::new(MemoryBackend)).unwrap();
         r
     }
@@ -46,7 +46,7 @@ impl DbBackendRegistry {
     pub fn register(&mut self, b: Arc<dyn DbBackend>) -> BridgeResult<()> {
         for existing in &self.backends {
             for s in b.schemes() {
-                if existing.schemes().contains(s) {
+                if existing.schemes().contains(&s) {
                     return Err(format!(
                         "db backend '{}': scheme '{s}' already claimed by '{}'",
                         b.name(),
@@ -62,7 +62,7 @@ impl DbBackendRegistry {
     /// 无认领 → 未知 scheme 报错（列出已知 scheme 便于排障）。
     pub async fn connect(&self, dsn: &str, config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
         for b in &self.backends {
-            if b.schemes().iter().any(|s| dsn.starts_with(s)) {
+            if b.schemes().iter().any(|s| dsn.starts_with(s.as_str())) {
                 return b.connect(dsn, config_dir).await;
             }
         }
@@ -81,39 +81,11 @@ impl DbBackend for SqliteBackend {
     fn name(&self) -> &str {
         "sqlite"
     }
-    fn schemes(&self) -> &'static [&'static str] {
-        &["sqlite://", "sqlite:"]
+    fn schemes(&self) -> Vec<String> {
+        vec!["sqlite://".into(), "sqlite:".into()]
     }
     async fn connect(&self, dsn: &str, config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
         SqlxAccessor::arc(&normalize_sqlite_dsn(dsn, config_dir)?).await
-    }
-}
-
-pub struct MySqlBackend;
-#[async_trait]
-impl DbBackend for MySqlBackend {
-    fn name(&self) -> &str {
-        "mysql"
-    }
-    fn schemes(&self) -> &'static [&'static str] {
-        &["mysql://"]
-    }
-    async fn connect(&self, dsn: &str, _config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
-        SqlxAccessor::arc(dsn).await
-    }
-}
-
-pub struct PostgresBackend;
-#[async_trait]
-impl DbBackend for PostgresBackend {
-    fn name(&self) -> &str {
-        "postgres"
-    }
-    fn schemes(&self) -> &'static [&'static str] {
-        &["postgres://", "postgresql://"]
-    }
-    async fn connect(&self, dsn: &str, _config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
-        SqlxAccessor::arc(dsn).await
     }
 }
 
@@ -123,8 +95,8 @@ impl DbBackend for MemoryBackend {
     fn name(&self) -> &str {
         "memory"
     }
-    fn schemes(&self) -> &'static [&'static str] {
-        &["memory://"]
+    fn schemes(&self) -> Vec<String> {
+        vec!["memory://".into()]
     }
     async fn connect(&self, _dsn: &str, _config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
         Ok(Arc::new(InMemoryAccessor::new()))
@@ -184,7 +156,8 @@ mod tests {
         let dir = std::path::Path::new("/tmp");
         r.connect("sqlite::memory:", dir).await.unwrap_or_else(|e| panic!("{e}"));
         r.connect("memory://x", dir).await.unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(r.backend_names(), ["sqlite", "mysql", "postgres", "memory"]);
+        // Task 4.1：mysql/postgres 已迁插件，内置只剩 sqlite/memory。
+        assert_eq!(r.backend_names(), ["sqlite", "memory"]);
     }
 
     #[tokio::test]
@@ -195,7 +168,7 @@ mod tests {
             Ok(_) => panic!("unknown scheme must fail"),
         };
         assert!(msg.contains("unknown db scheme"), "{msg}");
-        assert!(msg.contains("mysql://"), "{msg}");
+        assert!(msg.contains("sqlite://"), "{msg}");
     }
 
     #[test]
@@ -204,10 +177,10 @@ mod tests {
         #[async_trait::async_trait]
         impl DbBackend for Fake {
             fn name(&self) -> &str {
-                "fake-mysql"
+                "fake-sqlite"
             }
-            fn schemes(&self) -> &'static [&'static str] {
-                &["mysql://"]
+            fn schemes(&self) -> Vec<String> {
+                vec!["sqlite://".into()]
             }
             async fn connect(
                 &self,
@@ -219,7 +192,7 @@ mod tests {
         }
         let mut r = DbBackendRegistry::builtin();
         let e = r.register(std::sync::Arc::new(Fake)).unwrap_err();
-        assert!(e.to_string().contains("mysql://"));
+        assert!(e.to_string().contains("sqlite://"));
     }
 
     #[test]

@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::plugin_loader::{
-    LoadedPlugin, PluginManifestEntry, es_backend, host_context, load_manifest, load_scanned,
-    resolve_plugins_dir,
+    LoadedPlugin, PluginManifestEntry, db_backend, es_backend, host_context, load_manifest,
+    load_scanned, resolve_plugins_dir,
 };
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, Dialect, EsBackend, Extras, InMemoryKV, LoaderShared, PluginInfo,
-    SchemaRegistry, SqlxAccessor,
+    Bridge, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras, InMemoryKV, LoaderShared,
+    PluginInfo, SchemaRegistry,
 };
 use mdm_base_rust::bridge::broker::build_broker;
 use mdm_base_rust::config::{self, Config};
@@ -83,43 +83,12 @@ pub async fn start(
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
         eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
     }
-    // 逐 db 开库：经 DbBackendRegistry 按 scheme 认领（sqlite/mysql/postgres/memory），
-    // 未知 scheme 由注册表 fail-fast（装配层不再硬编码 scheme 白名单）。
-    let db_registry = mdm_base_rust::bridge::DbBackendRegistry::builtin();
-    let mut dbs = connect_dbs(&cfg.db, &db_registry, config_dir).await?;
-    // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
-    // 仅 sqlite 库重放（分号切分规则 sqlite 专用；mysql/pg 建库归运维）。
-    let seed = config_dir.join("seed.sql");
-    if seed.is_file() {
-        if dbs.get("default").map(|d| d.dialect()) == Some(Dialect::Sqlite) {
-            let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
-            if let Some(db) = dbs.get("default") {
-                for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                    db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
-                }
-            }
-        } else {
-            eprintln!("warn: seed.sql skipped (default db is not sqlite)");
-        }
-    }
     // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
     let dir = dir.canonicalize().unwrap_or(dir);
     let loader = Arc::new(LoaderShared {
         project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
         ts,
     });
-    // 鉴权（OJ-4）：auth 块存在即启用；secret 空 fail-fast；session 与 bridge 共用同一 KV
-    // （redis.default 真连时即共享 Redis 会话）。login 查 default 库。
-    let auth = match &cfg.auth {
-        Some(a) if a.jwt_secret.trim().is_empty() => {
-            return Err("auth.jwt_secret must not be empty".into())
-        }
-        Some(a) => {
-            let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
-            Some(Arc::new(mdm_server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?))
-        }
-        None => None,
-    };
     // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
     // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
     let blobs: Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> = match &cfg.blob {
@@ -137,6 +106,37 @@ pub async fn start(
         .await
         .map_err(|e| format!("plugins: {e}"))?;
     let es: Option<Arc<dyn EsBackend>> = registries.es;
+    // 逐 db 开库：经 DbBackendRegistry 按 scheme 认领（内置 sqlite/memory + 插件 db 工厂），
+    // 未知 scheme 由注册表 fail-fast（装配层不再硬编码 scheme 白名单；Task 4.1 起
+    // mysql/postgres 由插件提供，缺装 → "unknown db scheme" 明确报错）。
+    let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
+    // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
+    // 仅 sqlite 库重放（分号切分规则 sqlite 专用；mysql/pg 建库归运维）。
+    let seed = config_dir.join("seed.sql");
+    if seed.is_file() {
+        if dbs.get("default").map(|d| d.dialect()) == Some(Dialect::Sqlite) {
+            let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
+            if let Some(db) = dbs.get("default") {
+                for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
+                }
+            }
+        } else {
+            eprintln!("warn: seed.sql skipped (default db is not sqlite)");
+        }
+    }
+    // 鉴权（OJ-4）：auth 块存在即启用；secret 空 fail-fast；session 与 bridge 共用同一 KV
+    // （redis.default 真连时即共享 Redis 会话）。login 查 default 库。
+    let auth = match &cfg.auth {
+        Some(a) if a.jwt_secret.trim().is_empty() => {
+            return Err("auth.jwt_secret must not be empty".into())
+        }
+        Some(a) => {
+            let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
+            Some(Arc::new(mdm_server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?))
+        }
+        None => None,
+    };
     // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
     // 缺省进程内 Bus；池内所有 Bridge 注入同一 Arc<dyn EventBroker>，WS 订阅与任意 handler 发布互通。
     let bus = build_broker(&cfg.broker)
@@ -144,7 +144,7 @@ pub async fn start(
         .map_err(|e| format!("broker: {e}"))?;
     // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
     let make_bridge = {
-        let (dbs, kv, loader, blob, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), blob.clone(), es.clone(), bus.clone());
+        let (dbs, kv, loader, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), es.clone(), bus.clone());
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -323,10 +323,11 @@ pub async fn connect_dbs(
     Ok(dbs)
 }
 
-/// 装配产物：插件注册的后端槽位（阶段 3 仅 es 轴；db/blob/bus/kv 随阶段 4 加入）。
+/// 装配产物：插件注册的后端槽位（es 键选单后端 + db 认领式注册表；blob/bus/kv 随 4.2-4.4）。
 #[derive(Default)]
 pub struct Registries {
     pub es: Option<Arc<dyn EsBackend>>,
+    pub dbs: DbBackendRegistry,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -340,9 +341,10 @@ fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
     "{}".to_string()
 }
 
-/// 注册：插件后端（插件先于内置）→ 内置后端（阶段 3 无 db/blob/bus/kv 插件，内置原样）。
+/// 注册：插件后端（插件先于内置）→ 内置后端。
 /// es 为键选式单后端：cfg es: 声明 + 恰好一个 es 插件 → FfiEsBackend(handle 0)；
 /// 「配置声明了能力但插件未装」→ fail fast（§2 闸门）；多个 es 注册冲突 → fail fast。
+/// db 为认领式：内置 sqlite/memory 打底 + 每个插件 db 工厂注册（scheme 交集冲突 → fail fast）。
 fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries, String> {
     let es_plugins: Vec<&LoadedPlugin> =
         loaded.iter().filter(|p| p.registrations.es.is_some()).collect();
@@ -354,7 +356,13 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register es backend".to_string());
     }
     let es = es_plugins.first().and_then(|p| es_backend(p));
-    Ok(Registries { es })
+    let mut dbs = DbBackendRegistry::builtin();
+    for p in loaded {
+        if let Some(be) = db_backend(p) {
+            dbs.register(be).map_err(|e| format!("plugins db register: {e}"))?;
+        }
+    }
+    Ok(Registries { es, dbs })
 }
 
 /// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
@@ -484,10 +492,11 @@ mod tests {
         assert!(t.0.join("db.sqlite").is_file());
         reg.connect("sqlite::memory:", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
         reg.connect("memory://m", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
-        // mysql/postgres：scheme 被认领（连不上是连接层错误，不是 scheme 层错误）
-        for claimed in ["mysql://u:p@127.0.0.1:1/app", "postgres://127.0.0.1:1/app"] {
-            let e = reg.connect(claimed, &t.0).await.err().map(|e| e.to_string()).unwrap_or_default();
-            assert!(!e.contains("unknown db scheme"), "{e}");
+        // Task 4.1：mysql/postgres 已迁插件，内置不再认领 → 缺装时明确 unknown db scheme
+        // （快速失败不触网——原测试真连 127.0.0.1:1 每个 ~30s 超时，本版消除）。
+        for unclaimed in ["mysql://u:p@127.0.0.1:1/app", "postgres://127.0.0.1:1/app"] {
+            let e = reg.connect(unclaimed, &t.0).await.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains("unknown db scheme"), "{e}");
         }
         // 未知 scheme 拒绝
         assert!(reg.connect("oracle://x", &t.0).await.is_err());
@@ -838,5 +847,72 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
+    }
+
+    /// 编译 oj-db-mysql 产物路径（全进程一次；sqlx 首次编译慢，OnceLock 缓存）。
+    fn db_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-db-mysql"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-db-mysql");
+            assert!(status.success(), "oj-db-mysql build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_db_mysql.{ext}"))
+        })
+        .clone()
+    }
+
+    /// 真实 oj-db-mysql 插件装配 → db 工厂经 FfiDbBackend 注册进 DbBackendRegistry
+    /// （scheme 认领；连接转发由 ffi.rs 适配器测试覆盖，此处不断网连接）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_plugin_wires_backend() {
+        let t = tmpdir("sc-dbplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(db_plugin_artifact(), pdir.join(plugin_file("db-mysql"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["db-mysql".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "db-mysql");
+        let names = r.dbs.backend_names();
+        assert!(names.iter().any(|n| *n == "db-mysql"), "factory not registered: {names:?}");
+        // 未认领 scheme 仍 unknown（插件没声明 oracle）→ 快速失败
+        let e = r
+            .dbs
+            .connect("oracle://x", &t.0)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("unknown db scheme"), "{e}");
+    }
+
+    /// mysql DSN 但插件未装 → 明确 "unknown db scheme"（不触网，快速失败）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_declared_without_plugin_unknown_scheme() {
+        let t = tmpdir("sc-dbplug-none");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let mut m = std::collections::HashMap::new();
+        m.insert("mydb".to_string(), "mysql://u:p@127.0.0.1:1/app".to_string());
+        let e = connect_dbs(&m, &r.dbs, &t.0).await.err().unwrap_or_default();
+        assert!(e.contains("mydb"), "{e}");
+        assert!(e.contains("unknown db scheme"), "{e}");
     }
 }

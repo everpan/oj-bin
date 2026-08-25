@@ -3157,6 +3157,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-db-mysql"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "oj-db-postgres"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "oj-es"
 version = "0.1.0"
 dependencies = [

@@ -57,10 +57,11 @@ pub struct PluginManifestEntry {
     pub semver_pin: Option<String>,
 }
 
-/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；db/blob/bus/kv 槽位随阶段 4 加入）。
+/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；blob/bus/kv 槽位随 4.2-4.4 加入）。
 #[derive(Default)]
 pub struct Registrations {
     pub es: Option<&'static oj_plugin_ffi::EsBackendVtable>, // Task 3.3 起填
+    pub db: Option<&'static oj_plugin_ffi::DataAccessorVtable>, // Task 4.1 起填
 }
 
 pub struct LoadedPlugin {
@@ -108,6 +109,14 @@ impl From<&LoadedPlugin> for PluginInfo {
 pub fn es_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::EsBackend>> {
     loaded.registrations.es.map(|vt| {
         Arc::new(super::ffi::FfiEsBackend::new(0, vt)) as Arc<dyn crate::bridge::EsBackend>
+    })
+}
+
+/// 从已加载插件的 db 注册槽构造 core 工厂（scheme 由插件 vtable 自报，Task 4.1）。
+pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBackend>> {
+    loaded.registrations.db.map(|vt| {
+        Arc::new(super::ffi::FfiDbBackend::new(&loaded.descriptor.name[..], vt))
+            as Arc<dyn crate::bridge::DbBackend>
     })
 }
 
@@ -255,7 +264,7 @@ fn load_one(
 
     // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
     let raw = (descriptor.register)();
-    let registrations = Registrations { es: raw.es() };
+    let registrations = Registrations { es: raw.es(), db: raw.db() };
 
     Ok(LoadedPlugin { descriptor, registrations })
 }

@@ -4,9 +4,11 @@
 //! - stabby 72 注意：`RResult` 的 Ok/Err 是关联函数（构造用 `RResult::Ok(v)`），
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
+pub mod db;
 pub mod es;
 pub mod future;
 
+pub use db::DataAccessorVtable;
 pub use es::EsBackendVtable;
 pub use future::FfiFuture;
 
@@ -17,7 +19,8 @@ pub type RResult<T, E> = stabby::result::Result<T, E>;
 pub type RArc<T> = stabby::sync::Arc<T>;
 
 /// 唯一硬门禁：严格相等才允许加载（spec §3）。
-pub const ABI_VERSION: u32 = 1;
+/// 2 = Task 4.1 起（PluginRegistrations 增 db 槽位 + DataAccessorVtable）。
+pub const ABI_VERSION: u32 = 2;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -44,21 +47,27 @@ pub struct PluginDescriptor {
     pub register: extern "C" fn() -> PluginRegistrations,
 }
 
-/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。db/blob/bus/kv 槽位随阶段 4 加入，
-/// 加字段 = ABI bump）。
+/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。blob/bus/kv 槽位随 4.2-4.4 加入，
+/// 加字段 = ABI bump）。db 槽位 = 单个插件自带 vtable（schemes 由 vtable 自我声明），
+/// 多 db 插件并存：宿主遍历各插件读各自 db 槽（scheme 交集冲突在注册时 fail fast）。
 #[stabby::stabby]
 #[repr(C)]
 pub struct PluginRegistrations {
     pub es: *const EsBackendVtable,
+    pub db: *const DataAccessorVtable,
 }
 
 impl PluginRegistrations {
     pub fn none() -> Self {
-        Self { es: std::ptr::null() }
+        Self { es: std::ptr::null(), db: std::ptr::null() }
     }
 
     pub fn es(&self) -> Option<&'static EsBackendVtable> {
         unsafe { self.es.as_ref() }
+    }
+
+    pub fn db(&self) -> Option<&'static DataAccessorVtable> {
+        unsafe { self.db.as_ref() }
     }
 }
 

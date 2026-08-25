@@ -80,8 +80,11 @@ pub(crate) fn workspace_root() -> PathBuf {
 
 // ---- core 侧适配器层（spec §3）：每轴一个 FfiXxxBackend，插件永不直接产 dyn Trait 跨界 ----
 
-use crate::bridge::{BridgeResult, EsBackend};
-use oj_plugin_ffi::{EsBackendVtable, FfiFuture, RResult, RString};
+use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
+use crate::bridge::{BridgeResult, DbBackend, EsBackend};
+use oj_plugin_ffi::{DataAccessorVtable, EsBackendVtable, FfiFuture, RString};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + yield_now；take→free→state 置 null）。
 /// poll 返回 -1 时也 take（错误细节在 take 的 Err 里）。
@@ -120,7 +123,7 @@ impl Drop for FfiGuard {
 }
 
 fn ffi_err(ctx: &str, e: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
-    format!("ffi es {ctx}: {e}").into()
+    format!("ffi {ctx}: {e}").into()
 }
 
 /// 实现 core EsBackend，内部持 opaque handle、经 vtable + FfiFuture 转发（spec §3）。
@@ -172,6 +175,159 @@ impl EsBackend for FfiEsBackend {
 impl Drop for FfiEsBackend {
     fn drop(&mut self) {
         (self.vtable.close)(self.handle);
+    }
+}
+
+// ---- db 轴适配器（Task 4.1）：FfiDbBackend（工厂）→ FfiDataAccessor（连接）→ FfiTxSession（事务）----
+
+/// db 工厂适配器：实现 core DbBackend，scheme 由插件 vtable 自我声明（spec §2 认领式）。
+pub struct FfiDbBackend {
+    name: String,
+    schemes: Vec<String>,
+    vtable: &'static DataAccessorVtable,
+}
+
+impl FfiDbBackend {
+    /// 构造即调 vtable.schemes() 读认领列表（装配期一次）。
+    pub fn new(name: impl Into<String>, vtable: &'static DataAccessorVtable) -> Self {
+        let schemes: Vec<String> = (vtable.schemes)().iter().map(|s| s[..].to_string()).collect();
+        Self { name: name.into(), schemes, vtable }
+    }
+}
+
+#[async_trait::async_trait]
+impl DbBackend for FfiDbBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn schemes(&self) -> Vec<String> {
+        self.schemes.clone()
+    }
+    async fn connect(&self, dsn: &str, _config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
+        let fut = (self.vtable.connect)(RString::from(dsn));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db connect", e))?;
+        let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| ffi_err("db connect decode", e))?
+            .get("handle")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ffi_err("db connect", "missing handle"))?;
+        Ok(Arc::new(FfiDataAccessor::new(handle, self.vtable)))
+    }
+}
+
+/// 连接适配器：实现 core DataAccessor，经 vtable + FfiFuture 转发（handle 查表在插件侧）。
+pub struct FfiDataAccessor {
+    handle: u64,
+    vtable: &'static DataAccessorVtable,
+}
+
+impl FfiDataAccessor {
+    pub fn new(handle: u64, vtable: &'static DataAccessorVtable) -> Self {
+        Self { handle, vtable }
+    }
+}
+
+/// JSON 数组 → 参数化绑定载荷（Value 边界；插件侧反序列化绑定）。
+fn params_json(params: &[serde_json::Value]) -> Result<RString, Box<dyn std::error::Error + Send + Sync>> {
+    let s = serde_json::to_string(params).map_err(|e| ffi_err("db serialize", e))?;
+    Ok(RString::from(s.as_str()))
+}
+
+#[async_trait::async_trait]
+impl DataAccessor for FfiDataAccessor {
+    fn dialect(&self) -> Dialect {
+        match &(self.vtable.dialect)(self.handle)[..] {
+            "mysql" => Dialect::MySql,
+            "postgres" => Dialect::Postgres,
+            _ => Dialect::Sqlite,
+        }
+    }
+
+    async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
+        let fut = (self.vtable.begin)(self.handle);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db begin", e))?;
+        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| ffi_err("db begin decode", e))?
+            .get("tx_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ffi_err("db begin", "missing tx_id"))?;
+        Ok(Box::new(FfiTxSession::new(self.handle, tx_id, self.vtable)))
+    }
+
+    async fn query_with_params(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<Vec<Row>> {
+        let p = params_json(params)?;
+        let fut = (self.vtable.query)(self.handle, RString::from(sql), p);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db query", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("db query decode", e))
+    }
+
+    async fn exec_with_params(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<i64> {
+        let p = params_json(params)?;
+        let fut = (self.vtable.exec)(self.handle, RString::from(sql), p);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db exec", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("db exec decode", e))
+    }
+}
+
+impl Drop for FfiDataAccessor {
+    fn drop(&mut self) {
+        (self.vtable.close)(self.handle);
+    }
+}
+
+/// 事务适配器：实现 core TxSession；Drop 时未完结 → fire tx_rollback（结果放弃，
+/// 插件任务跑在插件 runtime 上照常执行，spec §3 FfiFuture drop 条——ReqState reset
+/// 丢弃存活事务 = 保底回滚语义的 FFI 保留）。
+pub struct FfiTxSession {
+    handle: u64,
+    tx_id: u64,
+    vtable: &'static DataAccessorVtable,
+    finished: AtomicBool,
+}
+
+impl FfiTxSession {
+    fn new(handle: u64, tx_id: u64, vtable: &'static DataAccessorVtable) -> Self {
+        Self { handle, tx_id, vtable, finished: AtomicBool::new(false) }
+    }
+}
+
+#[async_trait::async_trait]
+impl TxSession for FfiTxSession {
+    async fn query(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<Vec<Row>> {
+        let p = params_json(params)?;
+        let fut = (self.vtable.tx_query)(self.handle, self.tx_id, RString::from(sql), p);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db tx_query", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("db tx_query decode", e))
+    }
+
+    async fn exec(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<i64> {
+        let p = params_json(params)?;
+        let fut = (self.vtable.tx_exec)(self.handle, self.tx_id, RString::from(sql), p);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db tx_exec", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("db tx_exec decode", e))
+    }
+
+    async fn commit(&self) -> BridgeResult<()> {
+        let fut = (self.vtable.tx_commit)(self.handle, self.tx_id);
+        await_ffi(fut).await.map_err(|e| ffi_err("db tx_commit", e))?;
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn rollback(&self) -> BridgeResult<()> {
+        let fut = (self.vtable.tx_rollback)(self.handle, self.tx_id);
+        await_ffi(fut).await.map_err(|e| ffi_err("db tx_rollback", e))?;
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Drop for FfiTxSession {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::SeqCst) {
+            let fut = (self.vtable.tx_rollback)(self.handle, self.tx_id);
+            let _guard = FfiGuard(Some(fut)); // free state；插件侧 rollback 照常执行
+        }
     }
 }
 
@@ -322,5 +478,143 @@ mod adapter_tests {
             }));
         }
         assert_eq!(FREED.load(Ordering::SeqCst), before + 1);
+    }
+
+    // ---- db 轴 mock vtable（Task 4.1；共享 statics 串行化互踩）----
+
+    use oj_plugin_ffi::{RResult, RVec};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    static DB_CONNECTED_CFG: Mutex<String> = Mutex::new(String::new());
+    static DB_QUERY: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static DB_TX_QUERY: Mutex<(u64, u64, String, String)> =
+        Mutex::new((0, 0, String::new(), String::new()));
+    static DB_COMMITTED: AtomicU64 = AtomicU64::new(0);
+    static DB_ROLLED_BACK: AtomicU64 = AtomicU64::new(0);
+    static DB_CLOSED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn mock_db_connect(cfg: RString) -> FfiFuture {
+        *DB_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
+        ready(Ok(br#"{"handle":42}"#.to_vec()))
+    }
+    extern "C" fn mock_db_query(handle: u64, sql: RString, params: RString) -> FfiFuture {
+        *DB_QUERY.lock().unwrap() = (handle, sql[..].to_string(), params[..].to_string());
+        ready(Ok(br#"[{"c":1,"t":"a"}]"#.to_vec()))
+    }
+    extern "C" fn mock_db_exec(_h: u64, _s: RString, _p: RString) -> FfiFuture {
+        ready(Ok(br#"3"#.to_vec()))
+    }
+    extern "C" fn mock_db_begin(_handle: u64) -> FfiFuture {
+        ready(Ok(br#"{"tx_id":7}"#.to_vec()))
+    }
+    extern "C" fn mock_db_tx_query(
+        handle: u64,
+        tx_id: u64,
+        sql: RString,
+        params: RString,
+    ) -> FfiFuture {
+        *DB_TX_QUERY.lock().unwrap() = (handle, tx_id, sql[..].to_string(), params[..].to_string());
+        ready(Ok(br#"[{"c":9}]"#.to_vec()))
+    }
+    extern "C" fn mock_db_tx_exec(_h: u64, _t: u64, _s: RString, _p: RString) -> FfiFuture {
+        ready(Ok(br#"1"#.to_vec()))
+    }
+    extern "C" fn mock_db_tx_commit(_h: u64, tx_id: u64) -> FfiFuture {
+        DB_COMMITTED.store(tx_id, AtomicOrdering::SeqCst);
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_db_tx_rollback(_h: u64, tx_id: u64) -> FfiFuture {
+        DB_ROLLED_BACK.store(tx_id, AtomicOrdering::SeqCst);
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_db_dialect(_handle: u64) -> RString {
+        RString::from("postgres")
+    }
+    extern "C" fn mock_db_close(handle: u64) {
+        DB_CLOSED.store(handle, AtomicOrdering::SeqCst);
+    }
+    extern "C" fn mock_db_schemes() -> RVec<RString> {
+        let mut v = RVec::new();
+        v.push(RString::from("mysql://"));
+        v.push(RString::from("mariadb://"));
+        v
+    }
+
+    fn mock_db_vtable() -> &'static DataAccessorVtable {
+        Box::leak(Box::new(DataAccessorVtable {
+            connect: mock_db_connect,
+            query: mock_db_query,
+            exec: mock_db_exec,
+            begin: mock_db_begin,
+            tx_query: mock_db_tx_query,
+            tx_exec: mock_db_tx_exec,
+            tx_commit: mock_db_tx_commit,
+            tx_rollback: mock_db_tx_rollback,
+            dialect: mock_db_dialect,
+            close: mock_db_close,
+            schemes: mock_db_schemes,
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_backend_schemes_and_connect_dispatch() {
+        let _g = T_LOCK.lock().unwrap();
+        let be = FfiDbBackend::new("db-mysql", mock_db_vtable());
+        assert_eq!(be.name(), "db-mysql");
+        assert_eq!(be.schemes(), vec!["mysql://", "mariadb://"]);
+        let da = be.connect("mysql://u:p@h/d", std::path::Path::new("/tmp")).await.unwrap();
+        assert_eq!(*DB_CONNECTED_CFG.lock().unwrap(), "mysql://u:p@h/d");
+        assert_eq!(da.dialect(), Dialect::Postgres);
+        assert_eq!(da.query_with_params("select 1", &[]).await.unwrap()[0]["c"], serde_json::json!(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_query_and_exec_forward_params_and_decode() {
+        let _g = T_LOCK.lock().unwrap();
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let rows = da
+            .query_with_params("select ? as c", &[serde_json::json!(1), serde_json::json!("x")])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["c"], serde_json::json!(1));
+        let (h, sql, params) = DB_QUERY.lock().unwrap().clone();
+        assert_eq!((h, sql.as_str()), (42, "select ? as c"));
+        assert_eq!(params, r#"[1,"x"]"#);
+        assert_eq!(da.exec_with_params("delete from t", &[]).await.unwrap(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_tx_commit_and_drop_does_not_rollback() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_COMMITTED.store(0, AtomicOrdering::SeqCst);
+        DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let tx = da.begin().await.unwrap();
+        let rows = tx.query("select 1", &[]).await.unwrap();
+        assert_eq!(rows[0]["c"], serde_json::json!(9));
+        let (h, tid, sql, _) = DB_TX_QUERY.lock().unwrap().clone();
+        assert_eq!((h, tid, sql.as_str()), (42, 7, "select 1"));
+        tx.commit().await.unwrap();
+        drop(tx);
+        assert_eq!(DB_COMMITTED.load(AtomicOrdering::SeqCst), 7);
+        assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_tx_drop_without_finish_fires_rollback() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let tx = da.begin().await.unwrap();
+        drop(tx); // 未 commit/rollback → drop 保底回滚
+        assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 7);
+    }
+
+    #[test]
+    fn db_accessor_drop_closes_handle() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_CLOSED.store(0, AtomicOrdering::SeqCst);
+        drop(FfiDataAccessor::new(42, mock_db_vtable()));
+        assert_eq!(DB_CLOSED.load(AtomicOrdering::SeqCst), 42);
     }
 }
