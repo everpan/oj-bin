@@ -23,8 +23,8 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     let (cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
-    let logs_dir = mdm_server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
-    mdm_server::logging::init(&logs_dir);
+    let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
+    server::logging::init(&logs_dir);
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts).await?;
     let (bound, h) = app.serve(addr).await?;

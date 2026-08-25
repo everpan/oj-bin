@@ -25,9 +25,9 @@ use mdm_base_rust::bridge::{
 use mdm_base_rust::bridge::blob::{BlobBackend, BlobRegistry};
 use mdm_base_rust::bridge::{EventBroker, StableState};
 use mdm_base_rust::config::{self, Config};
-use mdm_server::actor::JsActor;
-use mdm_server::routes;
-use mdm_server::ws;
+use server::actor::JsActor;
+use server::routes;
+use server::ws;
 use tokio::task::JoinHandle;
 
 use crate::manifest;
@@ -131,7 +131,7 @@ impl App {
             Some(a) => {
                 let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
                 Some(Arc::new(
-                    mdm_server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?,
+                    server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?,
                 ))
             }
             None => None,
@@ -247,7 +247,7 @@ impl App {
             }
             None => None,
         };
-        let pipeline = mdm_server::Pipeline {
+        let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             auth,
             max_upload: cfg.server.max_upload_bytes,
@@ -260,7 +260,7 @@ impl App {
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
         );
-        let router = mdm_server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline)
+        let router = server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline)
             .merge(ws_router);
         // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
         let stable = Arc::new(StableState {
@@ -305,7 +305,7 @@ impl App {
             .local_addr()
             .map_err(|e| format!("local_addr: {e}"))?;
         let h = tokio::spawn(async move {
-            let _ = mdm_server::serve_router(listener, self.router).await;
+            let _ = server::serve_router(listener, self.router).await;
         });
         Ok((bound, h))
     }

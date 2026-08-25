@@ -2904,30 +2904,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdm-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bcrypt",
- "chrono",
- "form_urlencoded",
- "futures-util",
- "getrandom 0.2.17",
- "jsonwebtoken",
- "matchit",
- "mdm-base-rust",
- "multer",
- "percent-encoding",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3163,12 +3139,12 @@ dependencies = [
  "deno_error",
  "flate2",
  "mdm-base-rust",
- "mdm-server",
  "oj-plugin-ffi",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
  "serde_yaml",
+ "server",
  "tar",
  "tokio",
  "tower",
@@ -4490,6 +4466,30 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bcrypt",
+ "chrono",
+ "form_urlencoded",
+ "futures-util",
+ "getrandom 0.2.17",
+ "jsonwebtoken",
+ "matchit",
+ "mdm-base-rust",
+ "multer",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
