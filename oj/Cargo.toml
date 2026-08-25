@@ -15,6 +15,13 @@ serde_yaml = "0.9"
 tar = "0.4"
 flate2 = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+# 测试框架（L1）：进程内 dispatch + 真实 deno_core 运行时内跑 TS 用例。
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+deno_core = "0.410"
+deno_error = "0.7"
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }

@@ -9,43 +9,56 @@ use std::sync::Arc;
 
 use mdm_base_rust::bridge::plugin_loader::{
     LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
-    host_context, kv_backend_connect, load_manifest, load_scanned, resolve_plugins_dir,
+    host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
 use mdm_base_rust::bridge::{
-    Bridge, BusBackendRegistry, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras,
-    InMemoryKV, LoaderShared, PluginInfo, SchemaRegistry,
+    BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo,
 };
 use mdm_base_rust::config::{self, Config};
-use mdm_server::actor::JsActor;
-use mdm_server::routes;
 
+use crate::app::App;
 use crate::args::ServerArgs;
-use crate::manifest;
 
 pub async fn run(a: ServerArgs) -> Result<(), String> {
-    let config_path = PathBuf::from(&a.config);
+    let (cfg, config_dir, dir, ts, base) =
+        load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
+    let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
+    let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts).await?;
+    let (bound, h) = app.serve(addr).await?;
+    println!(
+        "oj server listening on http://{bound}{} (dir={}, {})",
+        base,
+        dir.display(),
+        if ts { "dev/ts" } else { "release/js" }
+    );
+    h.await.map_err(|e| format!("server task: {e}"))
+}
+
+/// 解析配置 + 目录模式（同 server）：读取 config.yaml，确定服务目录（src 优先 / dist 兜底）、
+/// dev/release 判定、base 前缀归源。server 与 test 命令共用，避免重复解析逻辑。
+pub fn load_app_config(
+    config: &str,
+    dir_override: Option<&str>,
+    base_override: Option<&str>,
+) -> Result<(Config, PathBuf, PathBuf, bool, String), String> {
+    let config_path = PathBuf::from(config);
     let config_dir = config_dir_of(&config_path);
     let cfg = config::load_from(&config_dir, config_path.file_name().and_then(|s| s.to_str()))
         .map_err(|e| format!("load config: {e}"))?;
     // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
-    // 默认目录：src 存在取 src（开发流），否则 dist。
-    let dir = a
-        .dir
+    // 默认目录：src 存在取 src，否则 dist。
+    let dir = dir_override
+        .map(|s| s.to_string())
         .unwrap_or_else(|| if Path::new("src").is_dir() { "src".into() } else { "dist".into() });
     let dir_path = Path::new(&dir);
     if !dir_path.is_dir() {
-        return Err(format!("service dir not found: {dir}（src 源码树或 oj build 产物 dist）"));
+        return Err(format!(
+            "service dir not found: {dir}（src 源码树或 oj build 产物 dist）"
+        ));
     }
     let ts = !is_release(dir_path);
-    let base = resolve_base(a.base.as_deref(), &cfg.server.base)?;
-    let (addr, h) = start(cfg, &config_dir, PathBuf::from(&dir), base.clone(), ts).await?;
-    println!(
-        "oj server listening on http://{addr}{} (dir={}, {})",
-        base,
-        dir,
-        if ts { "dev/ts" } else { "release/js" }
-    );
-    h.await.map_err(|e| format!("server task: {e}"))
+    let base = resolve_base(base_override, &cfg.server.base)?;
+    Ok((cfg, config_dir, PathBuf::from(dir), ts, base))
 }
 
 /// base 归源：CLI `-b` 显式给出 > config `server.base`（默认 /v1/api）。
@@ -64,7 +77,8 @@ fn is_release(dir: &Path) -> bool {
     dir.join("manifests.yaml").is_file()
 }
 
-/// 装配并监听（port=0 → 随机端口，测试用）。
+/// 装配并监听（port=0 → 随机端口，测试用）。维持旧签名（返回 (SocketAddr, JoinHandle)），
+/// 现有 `cargo test` 端口 0 + reqwest 用例零改动——内部委托 `App::from_config` + `App::serve`。
 pub async fn start(
     cfg: Config,
     config_dir: &Path,
@@ -72,209 +86,11 @@ pub async fn start(
     base: String,
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
-    // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
-    for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
-        eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
-    }
-    // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
-    let dir = dir.canonicalize().unwrap_or(dir);
-    let loader = Arc::new(LoaderShared {
-        project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
-        ts,
-    });
-    // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
-    // es 后端 = es 插件（cfg es: 声明且已装，经 FfiEsBackend 适配 core trait）；
-    // 「配置声明了能力但插件未装」→ 启动期 fail-fast（§2 闸门）。blob/bus 装配须在
-    // 插件之后（blob s3 驱动经插件 vtable connect；Task 4.2 起）。
-    let mut registries = Registries::default();
-    let plugins = assemble_plugins(&cfg, config_dir, &mut registries)
-        .await
-        .map_err(|e| format!("plugins: {e}"))?;
-    // KV：redis.default 存在 → 经 kv 插件（oj-kv-redis）vtable connect（单例 fail-fast）；
-    // 未声明 → InMemoryKV 内置兜底。「声明了 redis.default 但无 kv 插件」→ 启动期 fail-fast
-    // （§2 闸门，同 es/blob/bus 语义；不退化静默）。
-    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = match cfg.redis.get("default") {
-        Some(url) => match registries.kv {
-            Some(vt) => kv_backend_connect(vt, url)
-                .await
-                .map_err(|e| format!("redis 'default': {e}"))?,
-            None => {
-                return Err("config declares redis.default but no kv plugin loaded \
-                            (run `cargo xtask plugin kv-redis`)"
-                    .to_string())
-            }
-        },
-        None => Arc::new(InMemoryKV::new()),
-    };
-    let es: Option<Arc<dyn EsBackend>> = registries.es;
-    // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
-    // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
-    let blobs: Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> = match &cfg.blob {
-        None => None,
-        Some(section) => {
-            Some(assemble_blobs(section, config_dir, &base, registries.blob).await?)
-        }
-    };
-    // 下载路由仅服务名为 default 的后端（spec §2 裁决；Task 1.3 钉死字节一致回归）。
-    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> =
-        blobs.as_ref().and_then(|r| r.default());
-    // 逐 db 开库：经 DbBackendRegistry 按 scheme 认领（内置 sqlite/memory + 插件 db 工厂），
-    // 未知 scheme 由注册表 fail-fast（装配层不再硬编码 scheme 白名单；Task 4.1 起
-    // mysql/postgres 由插件提供，缺装 → "unknown db scheme" 明确报错）。
-    let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
-    // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
-    // 仅 sqlite 库重放（分号切分规则 sqlite 专用；mysql/pg 建库归运维）。
-    let seed = config_dir.join("seed.sql");
-    if seed.is_file() {
-        if dbs.get("default").map(|d| d.dialect()) == Some(Dialect::Sqlite) {
-            let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
-            if let Some(db) = dbs.get("default") {
-                for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                    db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
-                }
-            }
-        } else {
-            eprintln!("warn: seed.sql skipped (default db is not sqlite)");
-        }
-    }
-    // 鉴权（OJ-4）：auth 块存在即启用；secret 空 fail-fast；session 与 bridge 共用同一 KV
-    // （redis.default 真连时即共享 Redis 会话）。login 查 default 库。
-    let auth = match &cfg.auth {
-        Some(a) if a.jwt_secret.trim().is_empty() => {
-            return Err("auth.jwt_secret must not be empty".into())
-        }
-        Some(a) => {
-            let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
-            Some(Arc::new(mdm_server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?))
-        }
-        None => None,
-    };
-    // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
-    // 缺省进程内 Bus；池内所有 Bridge 注入同一 Arc<dyn EventBroker>，WS 订阅与任意 handler 发布互通。
-    // 插件 bus 工厂（kafka/rabbitmq，Task 4.3）已在 build_registries 注册；未装插件而声明
-    // 对应 kind → "unknown broker kind" 明确报错（不再退化/报 feature 指引）。
-    let bus = registries
-        .bus
-        .connect(&cfg.broker)
-        .await
-        .map_err(|e| format!("broker: {e}"))?;
-    // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
-    let make_bridge = {
-        let (dbs, kv, loader, es, bus) = (dbs.clone(), kv.clone(), loader.clone(), es.clone(), bus.clone());
-        move || {
-            Bridge::with_dbs_and_loader(
-                dbs.clone(),
-                kv.clone(),
-                SchemaRegistry::new(),
-                false,
-                Some(loader.clone()),
-                Extras {
-                    blobs: blobs.clone(),
-                    es: es.clone(),
-                    bus: Some(bus.clone()),
-                    plugins: plugins.clone(),
-                },
-            )
-        }
-    };
-    let (table, failures) = if ts {
-        // manifest 校验 + 路由表打印（UC-8）。release 的版本目录命名 `m-v` 过不了
-        // name==dirname 校验，模块清单改在下方锁循环里打印。
-        for m in manifest::load_modules(&dir)? {
-            println!("module {} v{} — {}", m.name, m.version, m.desc);
-        }
-        routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge.clone()))
-    } else {
-        // release：manifests.yaml 锁版本 → 逐模块加载 routes.js → 扁平化单次 from_entries（spec §3）。
-        let lock = manifest::load_lock(&dir.join("manifests.yaml"))
-            .map_err(|e| format!("release mode: {}: {e}", dir.join("manifests.yaml").display()))?;
-        if lock.is_empty() {
-            return Err(format!(
-                "release mode: {} missing or empty — run `oj build` first",
-                dir.join("manifests.yaml").display()
-            ));
-        }
-        let reader = routes::bridge_default_reader(make_bridge.clone());
-        let mut entries = Vec::new();
-        let b = base.trim_matches('/');
-        for (module, version) in &lock {
-            manifest::validate_module(module).map_err(|e| format!("manifests.yaml: {e}"))?;
-            manifest::validate_version(version).map_err(|e| format!("manifests.yaml: {e}"))?;
-            let mdir = dir.join(format!("{module}-{version}"));
-            let mf = mdir.join("manifest.yaml");
-            if !mf.is_file() {
-                return Err(format!("release mode: {} missing — run `oj build {module}`", mf.display()));
-            }
-            let m = manifest::parse_one(&mf)?;
-            if m.name != *module {
-                return Err(format!("manifest name {:?} != module {module:?} (in {})", m.name, mf.display()));
-            }
-            println!("module {} v{} — {}", m.name, m.version, m.desc);
-            let rjs = mdir.join("routes.js");
-            let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
-            for e in routes::entries_from_value(&v) {
-                entries.push(routes::RouteEntry {
-                    method: e.method,
-                    pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
-                    file: format!("{module}-{version}/{}", e.file),
-                });
-            }
-        }
-        let (table2, failures2) = routes::RouteTable::from_entries(&dir, &entries);
-        if !failures2.is_empty() {
-            return Err(format!("release routes: {}", failures2.join("; "))); // release fail-fast（spec §4）
-        }
-        (table2, Vec::new())
-    };
-    for f in &failures {
-        eprintln!("error: route: {f}");
-    }
-    if !failures.is_empty() {
-        eprintln!("warn: {} route declaration(s) skipped (see errors above)", failures.len());
-    }
-    for r in table.listing() {
-        println!("  {:8} {}  <- {}", r.method.to_uppercase(), r.pattern, r.file.display());
-    }
-    let n = cfg.server.pool_size.max(1) as usize;
-    let timeout = config::parse_duration(&cfg.server.timeout).ok();
-    // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，Clone 即共享。
-    let actor = JsActor::pool(n, make_bridge.clone());
-    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-    // localhost → 127.0.0.1 解析；阻塞 resolve 仅启动一次，可接受——ponytail。
-    let addr = to_socket_addrs_sync(&addr)?;
-    // 静态站点根：相对 config_dir 绝对化（缺失目录 fail-fast）。
-    let static_root = match &cfg.server.root {
-        Some(r) => {
-            let p = Path::new(r);
-            let p = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
-            Some(p.canonicalize().map_err(|e| format!("server.root {}: {e}", p.display()))?)
-        }
-        None => None,
-    };
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind: {e}"))?;
-    let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
-    let pipeline = mdm_server::Pipeline {
-        tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
-        auth,
-        max_upload: cfg.server.max_upload_bytes,
-        blob: blob.clone(),
-    };
-    // WS 目录镜像挂载（<dir>/WS.ts → {base}/<dir>/ws）：帧超时随 server.timeout（缺省 30s）。
-    let ws = mdm_server::ws::mirror_routes(
-        &base,
-        &dir,
-        timeout.unwrap_or(std::time::Duration::from_secs(30)),
-        make_bridge,
-    );
-    let h = tokio::spawn(async move {
-        let _ = mdm_server::serve_router(
-            listener,
-            mdm_server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline).merge(ws),
-        )
-        .await;
-    });
-    Ok((bound, h))
+    let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
+    let app = App::from_config(cfg, config_dir, dir, base, ts).await?;
+    app.serve(addr).await
 }
+
 
 /// config 文件的父目录（即 project_root）。bare 文件名（`parent()==""`）回落当前目录，
 /// 避免 config_dir 为空 → `canonicalize("")` 失败 → project_root 钳制静默失效。
@@ -297,7 +113,7 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
 /// blob 命名多后端装配：逐条目构造（local root 相对 config_dir 绝对化；
 /// s3 经 blob 插件 vtable connect，cfg 按值 JSON 透传）。配置声明即必须成功注册，
 /// 缺一启动期报错（fail fast，spec §2）。driver != local 且无 blob 插件 → fail fast。
-async fn assemble_blobs(
+pub async fn assemble_blobs(
     section: &config::BlobSection,
     config_dir: &Path,
     base: &str,
@@ -465,6 +281,7 @@ pub async fn assemble_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdm_base_rust::bridge::plugin_loader::kv_backend_connect;
 
     struct Tmp(PathBuf);
     fn tmpdir(tag: &str) -> Tmp {

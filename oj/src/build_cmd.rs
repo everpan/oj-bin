@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::{
-    transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+    transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
 };
 use mdm_server::routes;
 
