@@ -1057,6 +1057,29 @@ mod tests {
         .clone()
     }
 
+    /// 编译 oj-bus-rabbitmq 产物路径（全进程一次；lapin 首次编译慢，OnceLock 缓存）。
+    fn bus_rabbitmq_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-bus-rabbitmq"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-bus-rabbitmq");
+            assert!(status.success(), "oj-bus-rabbitmq build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_bus_rabbitmq.{ext}"))
+        })
+        .clone()
+    }
+
     /// 真实 oj-bus-kafka 插件装配 → Registries.bus 注册 kind "kafka"（kind 由插件名
     /// 去 "bus-" 前缀推断）。connect 需真 broker，此处只验证注册与 kind 键选。
     #[tokio::test(flavor = "current_thread")]
@@ -1165,5 +1188,107 @@ mod tests {
             .unwrap_or_default();
         assert!(e.contains("no kv plugin loaded"), "{e}");
         assert!(e.contains("cargo xtask plugin kv-redis"), "{e}");
+    }
+
+    /// 硬验收（Task 6.1 Step 5）：真 kafka 插件 broker 下 Task 0.5 共享语义回归
+    /// （env-gated，`OJ_TEST_KAFKA_BROKERS` 给逗号分隔 bootstrap servers；未设置 → 跳过）。
+    /// 同一 broker 实例（一个 FfiEventBroker，单消费循环/每 topic）上两个订阅通道
+    /// （模拟跨 actor 池与全部 WS 连接）共享同一 topic：一次 publish → 插件消费循环
+    /// 经 host.deliver → 全局 DELIVER_TARGETS 扇出 → 两通道都收到。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kafka_plugin_broker_shared_across_channels() {
+        let brokers = match std::env::var("OJ_TEST_KAFKA_BROKERS") {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                eprintln!("skip: OJ_TEST_KAFKA_BROKERS unset");
+                return;
+            }
+        };
+        let t = tmpdir("sc-busshare-k");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(bus_kafka_plugin_artifact(), pdir.join(plugin_file("bus-kafka"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["bus-kafka".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+            kind: "kafka".into(),
+            brokers: brokers.split(',').map(|s| s.trim().to_string()).collect(),
+            group: Some("oj-shared".into()),
+            topic_prefix: Some(format!("ojshare-k-{}", std::process::id())),
+            ..Default::default()
+        };
+        let broker = r.bus.connect(&Some(broker_cfg)).await.unwrap();
+        let topic = format!("shared.{}", std::process::id());
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe(&topic, tx1).await.unwrap();
+        broker.subscribe(&topic, tx2).await.unwrap(); // 同 topic 第二通道（不新起消费）
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 等消费就绪
+        broker.publish(&topic, &serde_json::json!({ "v": 9 })).await.unwrap();
+        let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
+            .await
+            .expect("shared receive 1 timeout")
+            .expect("channel 1 closed");
+        let f2 = tokio::time::timeout(std::time::Duration::from_secs(10), rx2.recv())
+            .await
+            .expect("shared receive 2 timeout")
+            .expect("channel 2 closed");
+        let v1: serde_json::Value = serde_json::from_str(&f1).unwrap();
+        assert_eq!(v1["data"]["v"], 9, "{f1}");
+        let v2: serde_json::Value = serde_json::from_str(&f2).unwrap();
+        assert_eq!(v2["data"]["v"], 9, "{f2}");
+    }
+
+    /// 硬验收（Task 6.1 Step 5）：真 rabbitmq 插件 broker 下 Task 0.5 共享语义回归
+    /// （env-gated，`OJ_TEST_RABBITMQ_URL` 给 amqp URL；未设置 → 跳过）。语义同 kafka 测试。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rabbitmq_plugin_broker_shared_across_channels() {
+        let url = match std::env::var("OJ_TEST_RABBITMQ_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_RABBITMQ_URL unset");
+                return;
+            }
+        };
+        let t = tmpdir("sc-busshare-r");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(bus_rabbitmq_plugin_artifact(), pdir.join(plugin_file("bus-rabbitmq"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["bus-rabbitmq".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+            kind: "rabbitmq".into(),
+            url: Some(url),
+            topic_prefix: Some(format!("ojshare-r-{}", std::process::id())),
+            ..Default::default()
+        };
+        let broker = r.bus.connect(&Some(broker_cfg)).await.unwrap();
+        let topic = format!("shared.{}", std::process::id());
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe(&topic, tx1).await.unwrap();
+        broker.subscribe(&topic, tx2).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        broker.publish(&topic, &serde_json::json!({ "v": 11 })).await.unwrap();
+        let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
+            .await
+            .expect("shared receive 1 timeout")
+            .expect("channel 1 closed");
+        let f2 = tokio::time::timeout(std::time::Duration::from_secs(10), rx2.recv())
+            .await
+            .expect("shared receive 2 timeout")
+            .expect("channel 2 closed");
+        let v1: serde_json::Value = serde_json::from_str(&f1).unwrap();
+        assert_eq!(v1["data"]["v"], 11, "{f1}");
+        let v2: serde_json::Value = serde_json::from_str(&f2).unwrap();
+        assert_eq!(v2["data"]["v"], 11, "{f2}");
     }
 }

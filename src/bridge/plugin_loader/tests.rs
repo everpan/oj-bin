@@ -153,6 +153,66 @@ fn manifest_semver_pin_mismatch() {
     assert!(matches!(err, PluginLoadError::IdentityMismatch { .. }), "{err}");
 }
 
+/// init 期 panic → 宿主分类为 InitFailed（入口宏 catch_unwind 收敛，宿主进程不终止），
+/// 错误带插件名与 panic 归因（spec §3 panic 围堵）。
+#[test]
+fn init_panic_is_classified_error() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let dir = mini_plugin_dir();
+    unsafe { std::env::set_var("MINI_PANIC", "1") };
+    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
+    unsafe { std::env::remove_var("MINI_PANIC") };
+    match err {
+        PluginLoadError::InitFailed { name, detail } => {
+            assert_eq!(name, "mini");
+            assert!(detail.contains("panic"), "{detail}");
+        }
+        other => panic!("expected InitFailed, got {other}"),
+    }
+}
+
+/// 宿主 panic hook 归因（spec §3）：宿主在 `CURRENT_PLUGIN` 置位窗口内 panic（此处
+/// 为 load_one 的 cfg_for 参数求值期）→ hook 输出 `[oj-plugin] panic while loading
+/// plugin '<name>' (host fingerprint: …)` 后透传。init 期插件侧 panic 由入口宏
+/// catch_unwind 收敛（见 init_panic_is_classified_error），hook 管的是宿主可见的 panic。
+/// 以子进程核对 stderr 归因行（同进程 eprintln 会被测试捕获吞掉）。
+#[test]
+fn panic_hook_attribution_line_emitted() {
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(exe)
+        .arg("panic_hook_emit_helper")
+        .arg("--nocapture") // 直跑测试二进制：不过 --nocapture 则 libtest 吞掉通过测试的 stderr
+        // 父进程并行 env 测试可能已 set 这些变量，子进程不得继承（否则 mini 插件
+        // 行为改变，cfg_for panic 路径走不到，归因行缺失）。
+        .env_remove("MINI_FAKE_ABI")
+        .env_remove("MINI_PANIC")
+        .output()
+        .expect("run helper subprocess");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[oj-plugin] panic while loading plugin 'mini'"),
+        "attribution line missing in subprocess stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(oj_plugin_ffi::HOST_FINGERPRINT),
+        "host fingerprint missing in attribution:\n{stderr}"
+    );
+}
+
+/// helper：宿主 cfg_for 内 panic（CURRENT_PLUGIN=Some("mini") 窗口），经 hook 打印
+/// 归因后传播；catch_unwind 兜住，进程不终止。
+#[test]
+fn panic_hook_emit_helper() {
+    let _g = ENV_LOCK.lock().unwrap();
+    let dir = mini_plugin_dir();
+    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let r = std::panic::catch_unwind(|| {
+        let _ = load_manifest(&dir, &manifest, host_context(), &|_| panic!("cfg boom"));
+    });
+    assert!(r.is_err(), "host panic must propagate (not swallowed)");
+}
+
 #[test]
 fn manifest_semver_pin_ok() {
     let _g = ENV_LOCK.lock().unwrap();

@@ -294,12 +294,13 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
         return RResult::Ok(descriptor());
     }
     let _ = (&host, &cfg); // blob 插件 init 无装配期配置（每后端 cfg 在 connect 传入）
-    let st = BlobPluginState {
+    // get_or_init：并发 init 时闭包只跑一次（竞争方阻塞复用），不重复建 runtime，
+    // 避免 `let _ = set(st)` 在竞争下把败者的 tokio Runtime 从 async 上下文 drop 崩溃。
+    PLUGIN.get_or_init(|| BlobPluginState {
         rt: runtime(),
         stores: Mutex::new(HashMap::new()),
         next_handle: AtomicU64::new(0),
-    };
-    let _ = PLUGIN.set(st);
+    });
     RResult::Ok(descriptor())
 }
 

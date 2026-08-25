@@ -294,13 +294,17 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
         return RResult::Ok(descriptor());
     }
     let _ = cfg; // init 无装配期配置（每 broker cfg 在 connect 传入）
-    let _ = HOST.set(host);
-    let st = BusPluginState {
-        rt: runtime(),
-        brokers: Mutex::new(HashMap::new()),
-        next_handle: AtomicU64::new(0),
-    };
-    let _ = PLUGIN.set(st);
+    // get_or_init：并发 init 时闭包只跑一次（竞争方阻塞复用），不重复建 runtime，
+    // 避免 `let _ = set(st)` 在竞争下把败者的 tokio Runtime 从 async 上下文 drop 崩溃。
+    // HOST 随闭包同设一次；并发下 set 失败丢弃的 RArc 无 runtime，无害。
+    PLUGIN.get_or_init(|| {
+        let _ = HOST.set(host);
+        BusPluginState {
+            rt: runtime(),
+            brokers: Mutex::new(HashMap::new()),
+            next_handle: AtomicU64::new(0),
+        }
+    });
     RResult::Ok(descriptor())
 }
 

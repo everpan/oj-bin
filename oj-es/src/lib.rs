@@ -254,16 +254,18 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     let cfg_v: serde_json::Value = serde_json::from_str(&cfg[..]).unwrap_or(serde_json::json!({}));
     let endpoint = cfg_v.get("endpoint").and_then(|v| v.as_str()).map(str::to_string);
 
-    let mut clients = HashMap::new();
-    if let Some(ep) = endpoint.as_deref() {
-        if !ep.is_empty() {
-            clients.insert(0, EsClientInner::new(ep.to_string()));
-            (host.log)(2, RString::from(format!("oj-es: es backend ready, endpoint {ep}")));
+    // get_or_init：并发 init 时闭包只跑一次，竞争方阻塞后复用——不重复建 runtime，
+    // 避免 `let _ = set(st)` 在竞争下把败者的 tokio Runtime 从 async 上下文 drop 崩溃。
+    PLUGIN.get_or_init(|| {
+        let mut clients = HashMap::new();
+        if let Some(ep) = endpoint.as_deref() {
+            if !ep.is_empty() {
+                clients.insert(0, EsClientInner::new(ep.to_string()));
+                (host.log)(2, RString::from(format!("oj-es: es backend ready, endpoint {ep}")));
+            }
         }
-    }
-    let st = EsPluginState { rt: runtime(), clients: Mutex::new(clients) };
-    // 并发重入：另一线程已建好 → 复用。
-    let _ = PLUGIN.set(st);
+        EsPluginState { rt: runtime(), clients: Mutex::new(clients) }
+    });
 
     RResult::Ok(descriptor())
 }
@@ -294,7 +296,6 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询；插件任务跑在插件
     /// runtime，测试 runtime 的 yield_now 让出即可被并发调度）。
     async fn drive(fut: FfiFuture) -> Result<Vec<u8>, String> {
-        let mut fut = fut;
         for _ in 0..100_000 {
             match (fut.poll)(fut.state) {
                 0 => tokio::task::yield_now().await,
@@ -445,5 +446,70 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
         // 未知 handle → 错误（装配期外调用兜底）。
         let e = drive(search(999, RString::from("user"), RString::from("{}"))).await.unwrap_err();
         assert!(e.contains("unknown handle 999"), "{e}");
+
+        // 硬验收（spec §8 阶段 3）：插件自建 runtime 真实执行 sqlx 连接查询（内嵌
+        // sqlite 测试库）+ reqwest 请求（本地 mock server）+ tokio::time::sleep，
+        // 不 panic（无 "there is no reactor running"）。三者全部 spawn 到插件 rt 上，
+        // 证明该 rt 是带 io/timer/db 的完整真实 runtime。sqlx 仅为 dev-dep，不进 cdylib。
+        // 注：并入本测试而非独立 init——PLUGIN 单例的 handle 0 只能由一个测试持有，
+        // 独立 init 会与 vtable 测试竞争 endpoint 导致互踩（get_or_init 已防 Runtime
+        // 二次构建，但 handle 0 归属仍须唯一）。
+        let s2 = Server::run();
+        s2.expect(
+            Expectation::matching(all_of![
+                request::method("POST"),
+                request::path("/user/_search")
+            ])
+            .respond_with(status_code(200).body(r#"{"hits":{"total":{"value":3}}}"#)),
+        );
+        let ep2 = s2.url("/").to_string();
+        let res: (i64, String, Option<u64>, bool) = state()
+            .rt
+            .spawn(async move {
+                // sqlx 连接查询（sqlite::memory: 内嵌测试库，无需文件）。
+                let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+                    .await
+                    .map_err(|e| format!("sqlx connect: {e}"))?;
+                sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| format!("sqlx create: {e}"))?;
+                sqlx::query("INSERT INTO t (id, v) VALUES (1, 'a')")
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| format!("sqlx insert: {e}"))?;
+                let row: (i64, String) = sqlx::query_as("SELECT id, v FROM t WHERE id = ?")
+                    .bind(1)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| format!("sqlx select: {e}"))?;
+                // tokio timer（插件 rt 需 enable_all）。
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                // reqwest（插件 rt 上的 io）→ mock server。
+                let c = EsClientInner::new(ep2);
+                let v: Value = serde_json::from_slice(&c.search("user", "{}").await?)
+                    .map_err(|e| format!("parse: {e}"))?;
+                Ok((row.0, row.1, v["hits"]["total"]["value"].as_u64(), true))
+            })
+            .await
+            .expect("plugin rt task must not panic/terminate the process")
+            .map_err(|e: String| format!("sqlx/sleep/http failed inside plugin runtime: {e}"))
+            .expect("sqlx/sleep/http in plugin runtime");
+        assert_eq!(res.0, 1);
+        assert_eq!(res.1, "a");
+        assert_eq!(res.2, Some(3));
+        assert!(res.3);
+    }
+
+    /// 运行期任务 panic 围堵（spec §3）：插件 runtime 形态的多线程 tokio 上 spawn 的
+    /// 任务 panic 被捕获于 JoinHandle——worker 线程/宿主进程不终止，panic 载荷含插件
+    /// 消息可归因。自建 runtime 与插件 `runtime()` 同构（multi_thread + enable_all），
+    /// 且不触碰 PLUGIN 单例（避免与 vtable 测试竞争 init）。
+    #[test]
+    fn runtime_phase_panic_is_contained() {
+        let rt = runtime();
+        let err = rt.block_on(rt.spawn(async { panic!("oj-es runtime boom") })).unwrap_err();
+        let payload = err.into_panic().downcast_ref::<&str>().copied().unwrap_or("?");
+        assert!(payload.contains("oj-es runtime boom"), "payload: {payload}");
     }
 }

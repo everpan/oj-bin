@@ -15,4 +15,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util"
 
 [dev-dependencies]
 httptest = "0.16"
+# 硬验收（spec §8 阶段 3）：dev-only，不进 cdylib——插件 runtime 内真实执行 sqlx 连接查询。
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }

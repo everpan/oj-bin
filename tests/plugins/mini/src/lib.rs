@@ -1,5 +1,6 @@
 //! 测试夹具插件：固定 descriptor；`MINI_FAKE_ABI` 运行时环境变量可伪造 abi_version
-//! （供宿主侧 AbiMismatch 门禁测试，无需重编译）。
+//! （供宿主侧 AbiMismatch 门禁测试，无需重编译）；`MINI_PANIC` 使 init 期 panic
+//! （供宿主侧 init panic 围堵测试——入口宏 catch_unwind 收敛为 RResult::Err）。
 
 use oj_plugin_ffi::{
     ABI_VERSION, HostContext, PluginDescriptor, PluginRegistrations, RArc, RResult, RString,
@@ -11,6 +12,9 @@ extern "C" fn no_registrations() -> PluginRegistrations {
 }
 
 fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RString> {
+    if std::env::var("MINI_PANIC").is_ok() {
+        panic!("mini init boom");
+    }
     let abi = std::env::var("MINI_FAKE_ABI")
         .ok()
         .and_then(|s| s.parse().ok())

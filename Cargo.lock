@@ -3218,6 +3218,7 @@ dependencies = [
  "oj-plugin-ffi",
  "reqwest 0.13.1",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 

@@ -1590,28 +1590,28 @@ unix@vip.qq.com ai"
 **Files:**
 - Test: `tests/acceptance/`（或既有集成测试位，按仓库布局）
 
-- [ ] **Step 1: FFI 运行时验收（spec §8 阶段 3 硬验收）**——oj-es 插件 cdylib 内真实执行：sqlx 连接查询（插件内嵌 sqlite 测试库）+ reqwest 请求（本地 mock server）+ `tokio::time::sleep`，**不 panic**（无 "there is no reactor running"）。
+- [x] **Step 1: FFI 运行时验收（spec §8 阶段 3 硬验收）**——oj-es 插件 cdylib 内真实执行：sqlx 连接查询（插件内嵌 sqlite 测试库）+ reqwest 请求（本地 mock server）+ `tokio::time::sleep`，**不 panic**（无 "there is no reactor running"）。
 
-- [ ] **Step 2: 全链路集成测试**——host op → FFI 同步方法 → 插件 runtime 异步执行 → FfiFuture 完成 → host 拿结果，五轴各至少一条链路。
+- [x] **Step 2: 全链路集成测试**——host op → FFI 同步方法 → 插件 runtime 异步执行 → FfiFuture 完成 → host 拿结果，五轴各至少一条链路。
 
-- [ ] **Step 3: 瘦身验收**——`cargo tree -p mdm-base-rust -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'` 无输出。
+- [x] **Step 3: 瘦身验收**——`cargo tree -p mdm-base-rust -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'` 无输出。
 
-- [ ] **Step 4: blob 裁决验收**——非 default local 后端 `url()` 报指定文案；default 下载路由字节一致回归。
+- [x] **Step 4: blob 裁决验收**——非 default local 后端 `url()` 报指定文案；default 下载路由字节一致回归。
 
-- [ ] **Step 5: broker 共享语义验收**——插件 broker（kafka/rabbitmq，env-gated）配置下，同一实例跨 actor 池与全部 WS 连接共享（Task 0.5 回归测试在插件配置下通过）。
+- [x] **Step 5: broker 共享语义验收**——插件 broker（kafka/rabbitmq，env-gated）配置下，同一实例跨 actor 池与全部 WS 连接共享（Task 0.5 回归测试在插件配置下通过）。
 
-- [ ] **Step 6: fail fast 矩阵验收**——逐一构造并断言启动报错文案：清单文件缺失 / ABI 不符 / semver 不满足 @约束 / 插件身份不符 / 注册名冲突 / scheme 交集冲突 / 配置声明但插件未装 / 扫描到损坏插件。
+- [x] **Step 6: fail fast 矩阵验收**——逐一构造并断言启动报错文案：清单文件缺失 / ABI 不符 / semver 不满足 @约束 / 插件身份不符 / 注册名冲突 / scheme 交集冲突 / 配置声明但插件未装 / 扫描到损坏插件。
 
-- [ ] **Step 7: op_plugins 输出核对**——插件名/semver/ABI/指纹 + 宿主 ABI_VERSION 齐全。
+- [x] **Step 7: op_plugins 输出核对**——插件名/semver/ABI/指纹 + 宿主 ABI_VERSION 齐全。
 
-- [ ] **Step 8: panic 围堵验收**——测试插件 init 期 panic 与运行期 panic 各一例：宿主进程不终止，错误归因含插件上下文与构建指纹。
+- [x] **Step 8: panic 围堵验收**——测试插件 init 期 panic 与运行期 panic 各一例：宿主进程不终止，错误归因含插件上下文与构建指纹。
 
-- [ ] **Step 9: 全量测试绿**
+- [x] **Step 9: 全量测试绿**
 
 Run: `cargo test --workspace -- --skip infinite_loop` + 各 `OJ_TEST_*` env 可用时全跑
 Expected: 全绿
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add tests/
