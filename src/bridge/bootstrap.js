@@ -38,6 +38,7 @@ import {
   op_kv_expire,
   op_kv_incr,
   op_log,
+  op_plugins,
   op_resolve_cjs as __oj_resolve_cjs,
   op_ws_send,
   op_ws_close,
@@ -135,6 +136,9 @@ globalThis.es = {
   index: (index, id, doc) => op_es_index(String(index), String(id), doc === undefined ? null : doc),
   del: (index, id) => op_es_del(String(index), String(id)),
 };
+
+// ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
+globalThis.plugins = () => op_plugins();
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----
 const dbCache = new Map();

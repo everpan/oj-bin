@@ -78,6 +78,30 @@ impl fmt::Debug for LoadedPlugin {
     }
 }
 
+/// 插件自省信息（op_plugins 输出；JS `plugins()` → [{name, semver, abi_version, fingerprint,
+/// host_abi_version}]，spec §4 升级核对 + §2 注册表自省并入）。
+#[derive(Clone, serde::Serialize)]
+pub struct PluginInfo {
+    pub name: String,
+    pub semver: String,
+    pub abi_version: u32,
+    pub fingerprint: String,
+    /// 宿主当前 ABI_VERSION（插件不必与此一致，运维据此核对升级窗口）。
+    pub host_abi_version: u32,
+}
+
+impl From<&LoadedPlugin> for PluginInfo {
+    fn from(p: &LoadedPlugin) -> Self {
+        Self {
+            name: p.descriptor.name[..].to_string(),
+            semver: p.descriptor.semver[..].to_string(),
+            abi_version: p.descriptor.abi_version,
+            fingerprint: p.descriptor.fingerprint[..].to_string(),
+            host_abi_version: ABI_VERSION,
+        }
+    }
+}
+
 /// 加载路径四级解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >
 /// <exe>/plugins > build.rs dev 后备（workspace root 常量）。
 /// relative 一律相对 oj.toml 所在目录（config_dir）。返回最终目录 = <plugins_dir>/<host-triple>/。

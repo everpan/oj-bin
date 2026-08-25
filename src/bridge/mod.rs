@@ -41,6 +41,7 @@ mod log;
 mod module_loader;
 mod named_registry;
 pub mod plugin_loader;
+mod plugins_op;
 mod query;
 mod registry;
 mod runtime;
@@ -57,6 +58,7 @@ pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
+pub use plugin_loader::PluginInfo;
 pub use bus_backend::{BusBackend, BusBackendRegistry};
 pub use db_backend::{DbBackend, DbBackendRegistry};
 pub use named_registry::NamedRegistry;
@@ -89,6 +91,8 @@ pub struct StableState {
     pub bus: Arc<dyn bus::EventBroker>,
     /// ES 客户端（OJ-6）：es 配置存在时注入；否则 es.* 报 "es not configured"。
     pub es: Option<Arc<dyn es::EsBackend>>,
+    /// 已装配插件自省信息（op_plugins 输出源；装配层注入）。
+    pub plugins: Vec<PluginInfo>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -100,6 +104,8 @@ pub struct Extras {
     pub bus: Option<Arc<dyn bus::EventBroker>>,
     /// Some = ES 客户端；None = es.* 未配置报错。
     pub es: Option<Arc<dyn es::EsBackend>>,
+    /// 已装配插件自省信息（op_plugins 数据源；装配层注入）。
+    pub plugins: Vec<PluginInfo>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -168,6 +174,7 @@ deno_core::extension!(
         es::op_es_search,
         es::op_es_index,
         es::op_es_del,
+        plugins_op::op_plugins,
         fetch::op_fetch,
         log::op_log,
         module_loader::op_resolve_cjs,
@@ -269,6 +276,7 @@ impl Bridge {
             blobs: extras.blobs.unwrap_or_else(|| Arc::new(blob::BlobRegistry::new())),
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
             es: extras.es,
+            plugins: extras.plugins,
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -1045,6 +1053,7 @@ mod tests {
             blobs: Arc::new(blob::BlobRegistry::new()),
             bus: Arc::new(bus::Bus::new()),
             es: None,
+            plugins: Vec::new(),
         });
         let pool = runtime::RuntimePool::new(stable, false);
         let mut rt = pool.checkout();

@@ -1308,9 +1308,10 @@ pub fn op_plugins(state: &mut OpState) -> Vec<PluginInfo>;
 // JS：globalThis.plugins() → [{name, semver, abi_version, fingerprint, host_abi_version}]
 ```
 
-- [ ] **Step 1: 写失败测试**——装配一个测试插件后 JS 调 `plugins()` 断言字段齐全；零插件时返回空数组且含 host ABI。
+- [x] **Step 1: 写失败测试**——装配一个测试插件后 JS 调 `plugins()` 断言字段齐全；零插件时返回空数组且含 host ABI。
 
-- [ ] **Step 2: 跑测试确认失败** → **Step 3: 实现**（装配结果存 StableState 新字段 `plugins: Vec<PluginInfo>`）→ **Step 4: 测试通过** → **Step 5: Commit**
+- [x] **Step 2: 跑测试确认失败** → **Step 3: 实现**（装配结果存 StableState 新字段 `plugins: Vec<PluginInfo>`）→ **Step 4: 测试通过** → **Step 5: Commit**
+  > `PluginInfo` 落 `plugin_loader.rs`（`From<&LoadedPlugin>`，host_abi_version = ABI_VERSION）；`Extras.plugins` 作装配注入载体（同 es）；`plugins_op.rs` 独立文件。
 
 ```bash
 git commit -m "feat(bridge): op_plugins 自省——插件清单 + 宿主 ABI_VERSION 输出
