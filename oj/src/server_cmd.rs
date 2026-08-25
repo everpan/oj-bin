@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use mdm_base_rust::bridge::plugin_loader::{
     LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
-    host_context, load_manifest, load_scanned, resolve_plugins_dir,
+    host_context, kv_backend_connect, load_manifest, load_scanned, resolve_plugins_dir,
 };
 use mdm_base_rust::bridge::{
     Bridge, BusBackendRegistry, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras,
@@ -72,13 +72,7 @@ pub async fn start(
     base: String,
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
-    // KV：redis.default 存在 → 真连（单例 fail-fast）；否则内存 KV。其余 redis key warn 忽略。
-    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = match cfg.redis.get("default") {
-        Some(url) => mdm_base_rust::bridge::RedisKV::arc(url)
-            .await
-            .map_err(|e| format!("redis 'default': {e}"))?,
-        None => Arc::new(InMemoryKV::new()),
-    };
+    // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
         eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
     }
@@ -96,6 +90,22 @@ pub async fn start(
     let plugins = assemble_plugins(&cfg, config_dir, &mut registries)
         .await
         .map_err(|e| format!("plugins: {e}"))?;
+    // KV：redis.default 存在 → 经 kv 插件（oj-kv-redis）vtable connect（单例 fail-fast）；
+    // 未声明 → InMemoryKV 内置兜底。「声明了 redis.default 但无 kv 插件」→ 启动期 fail-fast
+    // （§2 闸门，同 es/blob/bus 语义；不退化静默）。
+    let kv: Arc<dyn mdm_base_rust::bridge::KVStore> = match cfg.redis.get("default") {
+        Some(url) => match registries.kv {
+            Some(vt) => kv_backend_connect(vt, url)
+                .await
+                .map_err(|e| format!("redis 'default': {e}"))?,
+            None => {
+                return Err("config declares redis.default but no kv plugin loaded \
+                            (run `cargo xtask plugin kv-redis`)"
+                    .to_string())
+            }
+        },
+        None => Arc::new(InMemoryKV::new()),
+    };
     let es: Option<Arc<dyn EsBackend>> = registries.es;
     // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
     // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
@@ -339,7 +349,7 @@ pub async fn connect_dbs(
 }
 
 /// 装配产物：插件注册的后端槽位（es 键选单后端 + db 认领式注册表 + blob 键选
-/// 单后端 vtable 槽 + bus 键选注册表；kv 随 4.4）。
+/// 单后端 vtable 槽 + bus 键选注册表 + kv 键选单 vtable 槽）。
 #[derive(Default)]
 pub struct Registries {
     pub es: Option<Arc<dyn EsBackend>>,
@@ -349,6 +359,9 @@ pub struct Registries {
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
     /// bus 键选注册表（Task 4.3：内置 local + 插件 kafka/rabbitmq 工厂；kind 冲突 fail fast）。
     pub bus: BusBackendRegistry,
+    /// kv 键选单 vtable 槽（Task 4.4：redis.default 声明 → 经插件 connect；
+    /// 未声明仍 InMemoryKV 内置兜底；多 kv 插件注册冲突 fail fast）。
+    pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -399,7 +412,15 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
             bus.register(be).map_err(|e| format!("plugins bus register: {e}"))?;
         }
     }
-    Ok(Registries { es, dbs, blob, bus })
+    // kv 键选式单 vtable 槽（Task 4.4）：多 kv 插件冲突 fail fast；redis.default 声明
+    // 但无 kv 插件 → 在 start() 装配 kv 时 fail fast（未声明走 InMemoryKV，不进插件）。
+    let kv_plugins: Vec<&LoadedPlugin> =
+        loaded.iter().filter(|p| p.registrations.kv.is_some()).collect();
+    if kv_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register kv backend".to_string());
+    }
+    let kv = kv_plugins.first().and_then(|p| p.registrations.kv);
+    Ok(Registries { es, dbs, blob, bus, kv })
 }
 
 /// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
@@ -1078,5 +1099,71 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(e.contains("unknown broker kind 'kafka'"), "{e}");
+    }
+
+    /// 编译 oj-kv-redis 产物路径（全进程一次）。
+    fn kv_redis_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-kv-redis"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-kv-redis");
+            assert!(status.success(), "oj-kv-redis build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_kv_redis.{ext}"))
+        })
+        .clone()
+    }
+
+    /// 真实 oj-kv-redis 插件装配 → Registries.kv 槽就位；经 vtable connect 建 KV
+    /// （连接探活需真 redis——此处只验证槽位 + connect 到无监听端口 fail-fast，不触网）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn kv_plugin_wires_vtable_and_connect_gate() {
+        let t = tmpdir("sc-kvplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(kv_redis_plugin_artifact(), pdir.join(plugin_file("kv-redis"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["kv-redis".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "kv-redis");
+        assert!(r.kv.is_some(), "kv vtable slot not registered");
+        // 经 vtable connect：无监听端口 → 插件侧探活 fail-fast（不挂启动）。
+        let e = kv_backend_connect(r.kv.unwrap(), "redis://127.0.0.1:1/")
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("redis connect"), "{e}");
+    }
+
+    /// redis.default 声明但无 kv 插件 → 启动 fail-fast（§2 闸门，不退化静默）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn redis_declared_without_kv_plugin_fails_fast() {
+        let t = tmpdir("sc-kvplug-none");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.redis.insert("default".into(), "redis://127.0.0.1:1/".into());
+        let mut r = Registries::default();
+        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert!(r.kv.is_none());
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("no kv plugin loaded"), "{e}");
+        assert!(e.contains("cargo xtask plugin kv-redis"), "{e}");
     }
 }

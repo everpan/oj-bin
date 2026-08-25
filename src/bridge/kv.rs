@@ -1,5 +1,5 @@
-//! redis 全局对象：M0 内置的内存 KV 抽象（移植自 Go kv.go）。
-//! 真实 Redis 命名实例 Redis(name) 待 server 层接入 redis crate 时再移植。
+//! KV 全局对象：内置内存 KV 抽象（移植自 Go kv.go），作为未声明 redis.default 的兜底。
+//! 真 Redis 已迁入 oj-kv-redis 插件（Task 4.4）；本模块只留 InMemoryKV 与 trait。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -169,68 +169,8 @@ pub async fn op_kv_incr(
 /// Redis EXPIRE 只接受整秒：毫秒 TTL 向上取整到 ≥1s。
 /// 直接 `ttl.as_secs()` 会把 500ms → 0s → EXPIRE key 0 立即删键，
 /// 与 InMemoryKV 的毫秒语义相悖（见 expire_secs 测试）。
-fn expire_secs(ttl: std::time::Duration) -> i64 {
+pub(crate) fn expire_secs(ttl: std::time::Duration) -> i64 {
     (ttl.as_secs() + u64::from(ttl.subsec_nanos() != 0)) as i64
-}
-
-/// 真 Redis 驱动（redis 0.27 ConnectionManager 复用连接；全命令落真 Redis）。
-pub struct RedisKV {
-    conn: redis::aio::ConnectionManager,
-}
-
-impl RedisKV {
-    /// 连接失败/认证失败 → Err（装配 fail-fast；与 InMemoryKV 同接口可替换）。
-    /// 先单次连接探活（ECONNREFUSED 立即失败）——ConnectionManager 内部连不上会无限重试，
-    /// 直接构造会把「redis 宕机」变成启动挂死而非 fail-fast。
-    pub async fn arc(url: &str) -> BridgeResult<Arc<RedisKV>> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis open {url}: {e}"))?;
-        let _probe = client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| format!("redis connect {url}: {e}"))?;
-        let conn = redis::aio::ConnectionManager::new(client)
-            .await
-            .map_err(|e| format!("redis connect {url}: {e}"))?;
-        Ok(Arc::new(Self { conn }))
-    }
-}
-
-#[async_trait]
-impl KVStore for RedisKV {
-    async fn get(&self, key: &str) -> BridgeResult<Option<String>> {
-        use redis::AsyncCommands;
-        let mut c = self.conn.clone();
-        c.get(key).await.map_err(|e| format!("redis get: {e}").into())
-    }
-
-    async fn set(&self, key: &str, value: &str) -> BridgeResult<()> {
-        use redis::AsyncCommands;
-        let mut c = self.conn.clone();
-        let _: () = c
-            .set(key, value)
-            .await
-            .map_err(|e| -> String { format!("redis set: {e}") })?;
-        Ok(())
-    }
-
-    async fn del(&self, key: &str) -> BridgeResult<()> {
-        use redis::AsyncCommands;
-        let mut c = self.conn.clone();
-        let _: i64 = c.del(key).await.map_err(|e| -> String { format!("redis del: {e}") })?;
-        Ok(())
-    }
-
-    async fn expire(&self, key: &str, ttl: std::time::Duration) -> BridgeResult<bool> {
-        use redis::AsyncCommands;
-        let mut c = self.conn.clone();
-        c.expire(key, expire_secs(ttl)).await.map_err(|e| format!("redis expire: {e}").into())
-    }
-
-    async fn incr(&self, key: &str) -> BridgeResult<i64> {
-        use redis::AsyncCommands;
-        let mut c = self.conn.clone();
-        c.incr(key, 1).await.map_err(|e| format!("redis incr: {e}").into())
-    }
 }
 
 #[cfg(test)]
@@ -277,41 +217,6 @@ mod tests {
         assert_eq!(expire_secs(Duration::from_millis(1500)), 2);
         assert_eq!(expire_secs(Duration::from_secs(2)), 2);
         assert_eq!(expire_secs(Duration::ZERO), 0); // 0 保持 0（立即过期，语义一致）
-    }
-
-    /// 连接拒绝 → Err（装配 fail-fast 路径；端口 1 无监听）。
-    #[tokio::test(flavor = "current_thread")]
-    async fn redis_connect_refused_errors() {
-        assert!(RedisKV::arc("redis://127.0.0.1:1/").await.is_err());
-    }
-
-    /// 真 Redis roundtrip：env `OJ_TEST_REDIS` 给 DSN（如 redis://127.0.0.1:6379/1）。
-    /// 未设置 → 跳过。
-    #[tokio::test(flavor = "current_thread")]
-    #[ignore]
-    async fn redis_roundtrip() {
-        let Ok(url) = std::env::var("OJ_TEST_REDIS") else {
-            eprintln!("skip: OJ_TEST_REDIS unset");
-            return;
-        };
-        let kv = RedisKV::arc(&url).await.unwrap();
-        let k = format!("oj-test/{}", std::process::id());
-        kv.set(&k, "v").await.unwrap();
-        assert_eq!(kv.get(&k).await.unwrap().as_deref(), Some("v"));
-        assert!(kv.incr(&k).await.is_err()); // INCR 于非数字值 → Err
-        kv.set(&k, "1").await.unwrap();
-        assert_eq!(kv.incr(&k).await.unwrap(), 2);
-        assert!(kv.expire(&k, Duration::from_secs(10)).await.unwrap());
-        kv.del(&k).await.unwrap();
-        assert_eq!(kv.get(&k).await.unwrap(), None);
-        // 毫秒 TTL 取整契约：500ms → EXPIRE 1s（键不立即消失；等 1.2s 后消失）。
-        kv.set(&k, "v").await.unwrap();
-        assert!(kv.expire(&k, Duration::from_millis(500)).await.unwrap());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(kv.get(&k).await.unwrap().as_deref(), Some("v"), "500ms 不得被 EXPIRE 0 立即删键");
-        tokio::time::sleep(Duration::from_millis(1300)).await;
-        assert_eq!(kv.get(&k).await.unwrap(), None);
-        kv.del(&k).await.unwrap();
     }
 
     /// 默认 trait 方法（expire/incr 未覆写）→ Err；经 Bridge 验证调用路径。

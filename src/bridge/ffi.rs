@@ -82,12 +82,12 @@ pub(crate) fn workspace_root() -> PathBuf {
 
 use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
 use crate::bridge::{
-    BlobBackend, BlobServed, BridgeResult, BusBackend, DbBackend, EsBackend, EventBroker,
+    BlobBackend, BlobServed, BridgeResult, BusBackend, DbBackend, EsBackend, EventBroker, KVStore,
 };
 use crate::config::BrokerCfg;
 use oj_plugin_ffi::{
-    BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture, RBytes,
-    RString,
+    BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture,
+    KVStoreVtable, RBytes, RString,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -520,6 +520,63 @@ impl Drop for FfiEventBroker {
         (self.vtable.close)(self.handle);
         // 清理本 broker 注册的本地目标（topic 扇出表进程级共享；进程退出即回收）。
         DELIVER_TARGETS.lock().unwrap().clear();
+    }
+}
+
+// ---- kv 轴适配器（Task 4.4）：FfiKVStore（vtable → core KVStore；InMemoryKV 留内置兜底）----
+
+/// 经 vtable + FfiFuture 转发（handle 由 connect 产生；五方法过线）。
+/// 返回编码：get = JSON `Option<String>`；expire = JSON `bool`；incr = JSON `i64`；
+/// set/del = 空。跨线时长以秒计——expire 的 Duration 在宿主侧经 kv::expire_secs
+/// 向上取整到整秒（Redis EXPIRE 契约，ceil 逻辑留宿主，插件只认秒）。
+pub struct FfiKVStore {
+    handle: u64,
+    vtable: &'static KVStoreVtable,
+}
+
+impl FfiKVStore {
+    pub fn new(handle: u64, vtable: &'static KVStoreVtable) -> Self {
+        Self { handle, vtable }
+    }
+}
+
+#[async_trait::async_trait]
+impl KVStore for FfiKVStore {
+    async fn get(&self, key: &str) -> BridgeResult<Option<String>> {
+        let fut = (self.vtable.get)(self.handle, RString::from(key));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv get", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv get decode", e))
+    }
+
+    async fn set(&self, key: &str, value: &str) -> BridgeResult<()> {
+        let fut = (self.vtable.set)(self.handle, RString::from(key), RString::from(value));
+        await_ffi(fut).await.map_err(|e| ffi_err("kv set", e))?;
+        Ok(())
+    }
+
+    async fn del(&self, key: &str) -> BridgeResult<()> {
+        let fut = (self.vtable.del)(self.handle, RString::from(key));
+        await_ffi(fut).await.map_err(|e| ffi_err("kv del", e))?;
+        Ok(())
+    }
+
+    async fn expire(&self, key: &str, ttl: std::time::Duration) -> BridgeResult<bool> {
+        let secs = crate::bridge::kv::expire_secs(ttl) as u64;
+        let fut = (self.vtable.expire)(self.handle, RString::from(key), secs);
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv expire", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv expire decode", e))
+    }
+
+    async fn incr(&self, key: &str) -> BridgeResult<i64> {
+        let fut = (self.vtable.incr)(self.handle, RString::from(key));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("kv incr", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("kv incr decode", e))
+    }
+}
+
+impl Drop for FfiKVStore {
+    fn drop(&mut self) {
+        (self.vtable.close)(self.handle);
     }
 }
 
@@ -1060,5 +1117,106 @@ mod adapter_tests {
         let frame = rx.recv().await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["data"]["v"], 7, "{v}");
+    }
+
+    // ---- kv 轴 mock vtable（Task 4.4；五方法转发 + expire 秒取整 + Drop close）----
+
+    use crate::bridge::KVStore;
+
+    static KV_GET: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static KV_SET: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static KV_DEL: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static KV_EXPIRE: Mutex<(u64, String, u64)> = Mutex::new((0, String::new(), 0));
+    static KV_INCR: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+    static KV_CLOSED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn mock_kv_connect(_cfg: RString) -> FfiFuture {
+        ready(Ok(br#"{"handle":42}"#.to_vec()))
+    }
+    extern "C" fn mock_kv_get(handle: u64, key: RString) -> FfiFuture {
+        *KV_GET.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(br#""blobdata""#.to_vec())) // JSON Option<String>
+    }
+    extern "C" fn mock_kv_set(handle: u64, key: RString, value: RString) -> FfiFuture {
+        *KV_SET.lock().unwrap() = (handle, key[..].to_string(), value[..].to_string());
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_kv_del(handle: u64, key: RString) -> FfiFuture {
+        *KV_DEL.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_kv_expire(handle: u64, key: RString, secs: u64) -> FfiFuture {
+        *KV_EXPIRE.lock().unwrap() = (handle, key[..].to_string(), secs);
+        ready(Ok(b"true".to_vec()))
+    }
+    extern "C" fn mock_kv_incr(handle: u64, key: RString) -> FfiFuture {
+        *KV_INCR.lock().unwrap() = (handle, key[..].to_string());
+        ready(Ok(b"42".to_vec()))
+    }
+    extern "C" fn mock_kv_close(handle: u64) {
+        KV_CLOSED.store(handle, AtomicOrdering::SeqCst);
+    }
+
+    fn mock_kv_vtable() -> &'static KVStoreVtable {
+        Box::leak(Box::new(KVStoreVtable {
+            connect: mock_kv_connect,
+            get: mock_kv_get,
+            set: mock_kv_set,
+            del: mock_kv_del,
+            expire: mock_kv_expire,
+            incr: mock_kv_incr,
+            close: mock_kv_close,
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_get_returns_option_decoded_from_json() {
+        let _g = T_LOCK.lock().unwrap();
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        assert_eq!(kv.get("k").await.unwrap().as_deref(), Some("blobdata"));
+        let (h, key) = KV_GET.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_set_and_del_forward() {
+        let _g = T_LOCK.lock().unwrap();
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        kv.set("k", "v").await.unwrap();
+        let (h, key, value) = KV_SET.lock().unwrap().clone();
+        assert_eq!((h, key.as_str(), value.as_str()), (42, "k", "v"));
+        kv.del("k").await.unwrap();
+        let (h, key) = KV_DEL.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    /// expire 的 Duration 在宿主侧经 kv::expire_secs 向上取整到整秒再过线。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_expire_converts_duration_to_whole_seconds() {
+        let _g = T_LOCK.lock().unwrap();
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        // 500ms → 1s（Redis EXPIRE 不接受 0s——与 InMemoryKV 毫秒语义对齐）。
+        assert!(kv.expire("k", std::time::Duration::from_millis(500)).await.unwrap());
+        let (h, key, secs) = KV_EXPIRE.lock().unwrap().clone();
+        assert_eq!((h, key.as_str(), secs), (42, "k", 1));
+        assert!(kv.expire("k", std::time::Duration::from_secs(2)).await.unwrap());
+        assert_eq!(KV_EXPIRE.lock().unwrap().2, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_incr_returns_i64_decoded_from_json() {
+        let _g = T_LOCK.lock().unwrap();
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        assert_eq!(kv.incr("k").await.unwrap(), 42);
+        let (h, key) = KV_INCR.lock().unwrap().clone();
+        assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    #[test]
+    fn kv_drop_calls_close() {
+        let _g = T_LOCK.lock().unwrap();
+        KV_CLOSED.store(0, AtomicOrdering::SeqCst);
+        drop(FfiKVStore::new(42, mock_kv_vtable()));
+        assert_eq!(KV_CLOSED.load(AtomicOrdering::SeqCst), 42);
     }
 }

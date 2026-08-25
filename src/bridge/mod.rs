@@ -55,7 +55,7 @@ pub use bus::{Bus, EventBroker};
 pub use es::EsBackend;
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
-pub use kv::{InMemoryKV, KVStore, RedisKV};
+pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
 pub use plugin_loader::PluginInfo;

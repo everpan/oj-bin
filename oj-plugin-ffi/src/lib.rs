@@ -9,12 +9,14 @@ pub mod bus;
 pub mod db;
 pub mod es;
 pub mod future;
+pub mod kv;
 
 pub use blob::BlobBackendVtable;
 pub use bus::EventBrokerVtable;
 pub use db::DataAccessorVtable;
 pub use es::EsBackendVtable;
 pub use future::FfiFuture;
+pub use kv::KVStoreVtable;
 
 pub type RString = stabby::string::String;
 pub type RVec<T> = stabby::vec::Vec<T>;
@@ -26,7 +28,8 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 2 = Task 4.1 起（PluginRegistrations 增 db 槽位 + DataAccessorVtable）。
 /// 3 = Task 4.2 起（PluginRegistrations 增 blob 槽位 + BlobBackendVtable）。
 /// 4 = Task 4.3 起（PluginRegistrations 增 bus 槽位 + EventBrokerVtable + HostContext 增 deliver）。
-pub const ABI_VERSION: u32 = 4;
+/// 5 = Task 4.4 起（PluginRegistrations 增 kv 槽位 + KVStoreVtable）。
+pub const ABI_VERSION: u32 = 5;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -53,8 +56,8 @@ pub struct PluginDescriptor {
     pub register: extern "C" fn() -> PluginRegistrations,
 }
 
-/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。kv 槽位随 4.4 加入，
-/// 加字段 = ABI bump）。db 槽位 = 单个插件自带 vtable（schemes 由 vtable 自我声明），
+/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。加字段 = ABI bump）。
+/// db 槽位 = 单个插件自带 vtable（schemes 由 vtable 自我声明），
 /// 多 db 插件并存：宿主遍历各插件读各自 db 槽（scheme 交集冲突在注册时 fail fast）。
 #[stabby::stabby]
 #[repr(C)]
@@ -63,6 +66,7 @@ pub struct PluginRegistrations {
     pub db: *const DataAccessorVtable,
     pub blob: *const BlobBackendVtable,
     pub bus: *const EventBrokerVtable,
+    pub kv: *const KVStoreVtable, // Task 4.4 起
 }
 
 impl PluginRegistrations {
@@ -72,6 +76,7 @@ impl PluginRegistrations {
             db: std::ptr::null(),
             blob: std::ptr::null(),
             bus: std::ptr::null(),
+            kv: std::ptr::null(),
         }
     }
 
@@ -89,6 +94,10 @@ impl PluginRegistrations {
 
     pub fn bus(&self) -> Option<&'static EventBrokerVtable> {
         unsafe { self.bus.as_ref() }
+    }
+
+    pub fn kv(&self) -> Option<&'static KVStoreVtable> {
+        unsafe { self.kv.as_ref() }
     }
 }
 

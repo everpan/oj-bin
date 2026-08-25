@@ -259,7 +259,7 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: std::ptr::null(), bus: &VTABLE }
+    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: std::ptr::null(), bus: &VTABLE, kv: std::ptr::null() }
 }
 
 // ---- 入口 ----

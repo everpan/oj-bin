@@ -2879,7 +2879,6 @@ dependencies = [
  "notify",
  "object_store",
  "oj-plugin-ffi",
- "redis",
  "reqwest 0.13.1",
  "sea-query",
  "serde",
@@ -3218,6 +3217,17 @@ dependencies = [
  "httptest",
  "oj-plugin-ffi",
  "reqwest 0.13.1",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oj-kv-redis"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "redis",
+ "serde",
  "serde_json",
  "tokio",
 ]

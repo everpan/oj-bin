@@ -57,13 +57,14 @@ pub struct PluginManifestEntry {
     pub semver_pin: Option<String>,
 }
 
-/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；kv 槽位随 4.4 加入）。
+/// init 后宿主取得的各轴工厂槽位（未实现轴为 None）。
 #[derive(Default)]
 pub struct Registrations {
     pub es: Option<&'static oj_plugin_ffi::EsBackendVtable>, // Task 3.3 起填
     pub db: Option<&'static oj_plugin_ffi::DataAccessorVtable>, // Task 4.1 起填
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>, // Task 4.2 起填
     pub bus: Option<&'static oj_plugin_ffi::EventBrokerVtable>, // Task 4.3 起填
+    pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>, // Task 4.4 起填
 }
 
 pub struct LoadedPlugin {
@@ -129,6 +130,23 @@ pub fn bus_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::BusBa
         Arc::new(super::ffi::FfiBusBackend::new(&loaded.descriptor.name[..], vt))
             as Arc<dyn crate::bridge::BusBackend>
     })
+}
+
+/// 从已加载插件的 kv 注册槽构造 core 适配器（Task 4.4；redis.default 单实例，
+/// 装配期经 vtable connect，未声明仍 InMemoryKV 内置兜底）。
+pub async fn kv_backend_connect(
+    vt: &'static oj_plugin_ffi::KVStoreVtable,
+    url: &str,
+) -> Result<Arc<dyn crate::bridge::KVStore>, String> {
+    let cfg_json = serde_json::json!({ "url": url }).to_string();
+    let fut = (vt.connect)(RString::from(cfg_json.as_str()));
+    let bytes = super::ffi::await_ffi(fut).await.map_err(|e| format!("kv connect: {e}"))?;
+    let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|e| format!("kv connect decode: {e}"))?
+        .get("handle")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "kv connect: missing handle".to_string())?;
+    Ok(Arc::new(super::ffi::FfiKVStore::new(handle, vt)) as Arc<dyn crate::bridge::KVStore>)
 }
 
 /// 经 blob vtable `connect` 建立后端（Task 4.2；装配期调用，handle 由插件分配）。
@@ -294,8 +312,13 @@ fn load_one(
 
     // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
     let raw = (descriptor.register)();
-    let registrations =
-        Registrations { es: raw.es(), db: raw.db(), blob: raw.blob(), bus: raw.bus() };
+    let registrations = Registrations {
+        es: raw.es(),
+        db: raw.db(),
+        blob: raw.blob(),
+        bus: raw.bus(),
+        kv: raw.kv(),
+    };
 
     Ok(LoadedPlugin { descriptor, registrations })
 }

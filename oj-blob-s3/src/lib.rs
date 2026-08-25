@@ -274,7 +274,7 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: &VTABLE, bus: std::ptr::null() }
+    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: &VTABLE, bus: std::ptr::null(), kv: std::ptr::null() }
 }
 
 // ---- 入口 ----
