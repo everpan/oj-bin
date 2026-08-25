@@ -82,7 +82,7 @@ impl<T> NamedRegistry<T> {
 }
 ```
 
-- [ ] **Step 1: 写失败测试**（同文件 `#[cfg(test)] mod tests`）
+- [x] **Step 1: 写失败测试**（同文件 `#[cfg(test)] mod tests`）
 
 ```rust
 #[cfg(test)]
@@ -111,19 +111,19 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认编译失败**
+- [x] **Step 2: 跑测试确认编译失败**
 
 Run: `cargo test -p mdm-base-rust named_registry`
 Expected: FAIL（`named_registry` 模块不存在）
 
-- [ ] **Step 3: 实现**（上方 Produces 代码全文写入，mod.rs 加 `pub mod named_registry; pub use named_registry::NamedRegistry;`）
+- [x] **Step 3: 实现**（上方 Produces 代码全文写入，mod.rs 加 `pub mod named_registry; pub use named_registry::NamedRegistry;`）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p mdm-base-rust named_registry -- --skip infinite_loop`
 Expected: 2 passed
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/named_registry.rs src/bridge/mod.rs
@@ -251,9 +251,9 @@ impl DbBackend for MemoryBackend {
 }
 ```
 
-- [ ] **Step 1: 先读现状**——读 `oj/src/server_cmd.rs:280-300` 的 `resolve_dsn` 全文与其测试（`server_cmd.rs:385` 起），把 sqlite 归一化规则（相对路径相对 config_dir 绝对化、`sqlite::memory:` 直通、建空库等）原样提炼为纯函数。
+- [x] **Step 1: 先读现状**——读 `oj/src/server_cmd.rs:280-300` 的 `resolve_dsn` 全文与其测试（`server_cmd.rs:385` 起），把 sqlite 归一化规则（相对路径相对 config_dir 绝对化、`sqlite::memory:` 直通、建空库等）原样提炼为纯函数。
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 ```rust
 #[cfg(test)]
@@ -305,19 +305,19 @@ mod tests {
 
 （`tempfile` 若不在 dev-dependencies 则加入；若仓库已有等价临时目录工具（如测试里已有 tempdir 用法）则复用。）
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust db_backend`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 4: 实现** `db_backend.rs`（上方代码 + `normalize_sqlite_dsn` 从 `resolve_dsn` 提炼；`SqlxAccessor::arc` 签名见 accessor_sqlx.rs:29 `pub async fn connect(url: &str)` 的包装——沿用现状）
+- [x] **Step 4: 实现** `db_backend.rs`（上方代码 + `normalize_sqlite_dsn` 从 `resolve_dsn` 提炼；`SqlxAccessor::arc` 签名见 accessor_sqlx.rs:29 `pub async fn connect(url: &str)` 的包装——沿用现状）
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cargo test -p mdm-base-rust db_backend -- --skip infinite_loop`
 Expected: 4 passed
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/bridge/db_backend.rs src/bridge/mod.rs Cargo.toml
@@ -340,19 +340,19 @@ unix@vip.qq.com ai"
 - Consumes: `DbBackendRegistry::builtin()` + `connect(dsn, config_dir)`（Task 0.2）。
 - Produces: `pub async fn connect_dbs(cfg_db: &HashMap<String,String>, registry: &DbBackendRegistry, config_dir: &Path) -> Result<HashMap<String, Arc<dyn DataAccessor>>, String>`（放 `oj/src/server_cmd.rs`，server 与 build 共用；build_cmd 传 memory 注册表或直接用 `MemoryBackend`）。
 
-- [ ] **Step 1: 确认全部 DSN 解析调用点**
+- [x] **Step 1: 确认全部 DSN 解析调用点**
 
 Run: `grep -rn "SqlxAccessor::arc\|resolve_dsn" oj/src/ server/src/ src/ --include='*.rs' | grep -v accessor_sqlx.rs | grep -v db_backend.rs`
 Expected: 列出全部调用点；逐一核对落入本任务改动清单。
 
-- [ ] **Step 2: 迁移/改写测试**——`resolve_dsn_dispatches_by_scheme` 改为经 `DbBackendRegistry::builtin().connect` 断言：sqlite 相对路径归一化不变、未知 scheme（如 `oracle://`）报 `unknown db scheme`、mysql/pg 不真连（只断言错误文案来自连接层而非 scheme 层）。新增 `connect_dbs` 单测：两库（sqlite 内存 + memory://）成功、未知 scheme 库名出现在错误里。
+- [x] **Step 2: 迁移/改写测试**——`resolve_dsn_dispatches_by_scheme` 改为经 `DbBackendRegistry::builtin().connect` 断言：sqlite 相对路径归一化不变、未知 scheme（如 `oracle://`）报 `unknown db scheme`、mysql/pg 不真连（只断言错误文案来自连接层而非 scheme 层）。新增 `connect_dbs` 单测：两库（sqlite 内存 + memory://）成功、未知 scheme 库名出现在错误里。
 
-- [ ] **Step 3: 跑测试确认失败**（`connect_dbs` 未定义）
+- [x] **Step 3: 跑测试确认失败**（`connect_dbs` 未定义）
 
 Run: `cargo test -p oj connect_dbs`
 Expected: FAIL
 
-- [ ] **Step 4: 实现**——server_cmd.rs 的 db 循环改为：
+- [x] **Step 4: 实现**——server_cmd.rs 的 db 循环改为：
 
 ```rust
 let registry = mdm_base_rust::bridge::db_backend::DbBackendRegistry::builtin();
@@ -379,12 +379,12 @@ pub async fn connect_dbs(
 
 build_cmd.rs:186-189 的 `SqlxAccessor::arc("sqlite::memory:")` 改为 `DbBackendRegistry::builtin().connect("sqlite::memory:", &root).await`。删除旧 `resolve_dsn`（其 sqlite 归一化已在 Task 0.2 进 `normalize_sqlite_dsn`）。
 
-- [ ] **Step 5: 跑测试确认通过 + 全量回归**
+- [x] **Step 5: 跑测试确认通过 + 全量回归**
 
 Run: `cargo test -p oj -- --skip infinite_loop && cargo test -p mdm-base-rust -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add oj/src/server_cmd.rs oj/src/build_cmd.rs server/src/
@@ -418,7 +418,7 @@ pub trait EsBackend: Send + Sync {
 impl EsBackend for EsClient { /* 三方法体 = 现 op 内 路径拼装+请求+es_resp 直通逻辑 原样上移 */ }
 ```
 
-- [ ] **Step 1: 写失败测试**——新增 mock 后端验证 op 层改走 trait：
+- [x] **Step 1: 写失败测试**——新增 mock 后端验证 op 层改走 trait：
 
 ```rust
 #[tokio::test]
@@ -437,19 +437,19 @@ async fn ops_dispatch_via_es_backend_trait() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust es:: -- --skip infinite_loop`
 Expected: FAIL（`EsBackend` 未定义）
 
-- [ ] **Step 3: 实现**——三 op 改为：取 `Arc<dyn EsBackend>` → 校验 `valid_ident`（留在 op 层，防注入是 op 职责）→ 调 trait 方法。`StableState.es` 与 `Extras.es` 类型改 `Option<Arc<dyn EsBackend>>`；`oj/src/server_cmd.rs:141` 的 `Arc<EsClient>` 注入处加 `as Arc<dyn EsBackend>`  coercion。op 内错误文案 `es not configured` 保持不变。
+- [x] **Step 3: 实现**——三 op 改为：取 `Arc<dyn EsBackend>` → 校验 `valid_ident`（留在 op 层，防注入是 op 职责）→ 调 trait 方法。`StableState.es` 与 `Extras.es` 类型改 `Option<Arc<dyn EsBackend>>`；`oj/src/server_cmd.rs:141` 的 `Arc<EsClient>` 注入处加 `as Arc<dyn EsBackend>`  coercion。op 内错误文案 `es not configured` 保持不变。
 
-- [ ] **Step 4: 跑测试确认通过 + 全量回归**
+- [x] **Step 4: 跑测试确认通过 + 全量回归**
 
 Run: `cargo test -p mdm-base-rust es:: -- --skip infinite_loop && cargo test -p mdm-base-rust -- --skip infinite_loop`
 Expected: 全绿（含 `OJ_TEST_ES` 未设时 skip）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/es.rs src/bridge/mod.rs oj/src/server_cmd.rs
@@ -509,14 +509,14 @@ impl BlobRegistry {
 
 （`NamedRegistry` 内部可变性：StableState 创建后不可变，注册全部发生在装配期——`BlobRegistry` 在装配时是可变局部量，装进 Arc 前完成注册；故 `NamedRegistry` 无需内部可变性，`register` 收 `&mut self`，装配完成后再 `Arc::new`。Task 0.1 代码即如此，无需改动。）
 
-- [ ] **Step 1: 列出全部受影响的构造/取数点**
+- [x] **Step 1: 列出全部受影响的构造/取数点**
 
 Run: `grep -rn "extras.blob\|\.blob\b\|Extras {" src/ oj/src/ server/src/ --include='*.rs' | grep -v "//" | head -30`
 Expected: blob.rs 五个 op 的取数点 + server_cmd.rs 装配段 + 测试夹具，全部入改动清单。
 
-- [ ] **Step 2: 先改类型再修编译错误**——StableState/Extras 改形后 `cargo check 2>&1 | grep '^error'` 列出的每个点逐一迁移：blob op 从 `state...blob.clone()` 改为 `state...blobs.default()`；`server_cmd.rs` blob 装配段构造 `BlobRegistry` 注册 `default` 后注入；测试夹具同理。ws.rs 的 bus 共享注入不动。
+- [x] **Step 2: 先改类型再修编译错误**——StableState/Extras 改形后 `cargo check 2>&1 | grep '^error'` 列出的每个点逐一迁移：blob op 从 `state...blob.clone()` 改为 `state...blobs.default()`；`server_cmd.rs` blob 装配段构造 `BlobRegistry` 注册 `default` 后注入；测试夹具同理。ws.rs 的 bus 共享注入不动。
 
-- [ ] **Step 3: 新增 broker 共享语义回归测试**（server/src/ws.rs 或既有 ws 测试旁）：
+- [x] **Step 3: 新增 broker 共享语义回归测试**（server/src/ws.rs 或既有 ws 测试旁）：
 
 ```rust
 /// 同一 broker 实例跨两个 Bridge 注入时，A 发布的消息 B 的订阅者能收到
@@ -531,12 +531,12 @@ async fn shared_broker_broadcasts_across_bridges() {
 }
 ```
 
-- [ ] **Step 4: 全量回归**
+- [x] **Step 4: 全量回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿；JS 层行为不变（blob.* 未配置时报 notConfigured 文案不变）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -549,9 +549,9 @@ unix@vip.qq.com ai"
 
 ### Task 0.6: 阶段 0 任务状态更新
 
-- [ ] **Step 1: 勾选本阶段 Task 0.1-0.5 全部复选框**（计划文件内 `- [ ]` → `- [x]`）
+- [x] **Step 1: 勾选本阶段 Task 0.1-0.5 全部复选框**（计划文件内 `- [x]` → `- [x]`）
 
-- [ ] **Step 2: 进度提交**
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
