@@ -52,8 +52,9 @@ oj/                   # crate: oj（CLI 入口）
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/routes.js/锁/tgz）
 └── server_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
 oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION）
-oj-es/ oj-db-mysql/ oj-db-postgres/ oj-blob-s3/   # 第一方插件（es/db/blob 轴，cdylib）
-oj-bus-kafka/ oj-bus-rabbitmq/ oj-kv-redis/       # 第一方插件（bus/kv 轴，cdylib）
+crates/plugins/       # 第一方插件统一目录（cdylib）
+  oj-es/ oj-db-mysql/ oj-db-postgres/ oj-blob-s3/   # es/db/blob 轴
+  oj-bus-kafka/ oj-bus-rabbitmq/ oj-kv-redis/       # bus/kv 轴
 xtask/                # crate: cargo xtask plugin <name> 构建 + 拷入 plugins/<triple>/
 plugins/<triple>/     # 装配产物目录（CI 平台矩阵归置；本地 xtask 写入）
 ```

@@ -1222,7 +1222,7 @@ unix@vip.qq.com ai"
 ### Task 3.4: oj-es cdylib 插件
 
 **Files:**
-- Create: `oj-es/Cargo.toml`（`crate-type = ["cdylib"]`、`panic = "unwind"` 显式声明）、`oj-es/src/lib.rs`
+- Create: `crates/plugins/oj-es/Cargo.toml`（`crate-type = ["cdylib"]`、`panic = "unwind"` 显式声明）、`crates/plugins/oj-es/src/lib.rs`
 - Modify: `Cargo.toml`（workspace members）
 - Test: oj-es 内（单测）+ 阶段 6 全链路验收
 
@@ -1231,7 +1231,7 @@ unix@vip.qq.com ai"
 - Produces: cdylib 产物 `liboj_es.so/.dylib` / `oj_es.dll`；插件侧结构：
 
 ```rust
-// oj-es/src/lib.rs
+// crates/plugins/oj-es/src/lib.rs
 struct EsPluginState { rt: tokio::runtime::Runtime, clients: Mutex<HashMap<u64, EsClientInner>>, next: AtomicU64 }
 // init：建 runtime（Task S.2 形态），解析 cfg JSON（endpoint），注册 es vtable 工厂
 oj_plugin_ffi::oj_plugin_entry!(init);
@@ -1252,7 +1252,7 @@ Expected: 产出 `.dylib`（本机 macOS）/`.so`
 - [x] **Step 4: Commit**
 
 ```bash
-git add oj-es/ Cargo.toml Cargo.lock src/bridge/es.rs
+git add crates/plugins/oj-es/ Cargo.toml Cargo.lock src/bridge/es.rs
 git commit -m "feat(oj-es): 首个 cdylib 插件——es HTTP 实现迁入，插件自建 tokio runtime
 
 unix@vip.qq.com ai"
@@ -1376,7 +1376,7 @@ unix@vip.qq.com ai"
 **Files:**
 - Modify: `oj-plugin-ffi/src/lib.rs`（db vtable + tx 句柄族，ABI_VERSION bump 到 2，全部已出插件同步重编）
 - Modify: `src/bridge/ffi.rs`（FfiDataAccessor 适配器）
-- Create: `oj-db-mysql/`、`oj-db-postgres/`（cdylib）
+- Create: `crates/plugins/oj-db-mysql/`、`crates/plugins/oj-db-postgres/`（cdylib）
 - Test: ffi.rs mock + `OJ_TEST_MYSQL`/`OJ_TEST_PG` env-gated 集成测试
 
 **Interfaces:**
@@ -1408,7 +1408,7 @@ pub struct DataAccessorVtable {
 - [x] **Step 2: 跑测试确认失败** → **Step 3: 实现适配器 + 两插件 crate**（插件内嵌各自 sqlx DataAccessor 实现，插件边界内可用 `sqlx::Any` 单方言 feature；共享逻辑抽插件侧公共 crate 或接受复制——决策在此步做并记录 commit message）→ **Step 4: 测试通过 + env-gated 真连测试**（`OJ_TEST_MYSQL=mysql://… cargo test -p oj-db-mysql`）→ **Step 5: 接线**（DbBackendRegistry 注册 FFI 版 mysql/postgres 工厂，内置 SqliteBackend/MemoryBackend 保留）→ **Step 6: Commit**
 
 ```bash
-git commit -m "feat(db): db 轴 FFI——tx 句柄化 + oj-db-mysql/oj-db-postgres cdylib
+git commit -m "feat(db): db 轴 FFI——tx 句柄化 + crates/plugins/oj-db-mysql + crates/plugins/oj-db-postgres cdylib
 
 unix@vip.qq.com ai"
 ```
@@ -1417,7 +1417,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（blob vtable）、`src/bridge/ffi.rs`（FfiBlobBackend）
-- Create: `oj-blob-s3/`（cdylib；LocalBlob 留 core 内置）
+- Create: `crates/plugins/oj-blob-s3/`（cdylib；LocalBlob 留 core 内置）
 - Test: ffi.rs mock + `OJ_TEST_S3` env-gated
 
 **Interfaces:**
@@ -1448,7 +1448,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（bus vtable + HostContext 增 deliver 回调 = ABI bump）、`src/bridge/ffi.rs`（FfiEventBroker）
-- Create: `oj-bus-kafka/`、`oj-bus-rabbitmq/`（cdylib）
+- Create: `crates/plugins/oj-bus-kafka/`、`crates/plugins/oj-bus-rabbitmq/`（cdylib）
 - Test: ffi.rs mock + env-gated kafka/rabbitmq 集成测试
 
 **Interfaces:**
@@ -1479,7 +1479,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（kv vtable）、`src/bridge/ffi.rs`（FfiKVStore）
-- Create: `oj-kv-redis/`（cdylib；InMemoryKV 留 core 内置兜底）
+- Create: `crates/plugins/oj-kv-redis/`（cdylib；InMemoryKV 留 core 内置兜底）
 - Test: ffi.rs mock + `OJ_TEST_REDIS` env-gated
 
 **Interfaces:**
