@@ -1,2 +1,8 @@
-{ "name": "oj-sample", "private": true, "type": "module",
-  "dependencies": { "escape-goat": "4.0.0" } }
+{
+  "name": "oj-sample",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "escape-goat": "4.0.0"
+  }
+}
