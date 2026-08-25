@@ -102,6 +102,44 @@ declare global {
   // 默认（"default"）数据库实例。
   const db: DBInstance;
 
+  // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----
+  // 进程内 HTTP 派发助手，对标 Go Fiber app.Test：client.get/post/... 触发真实
+  // 路由 + 真实运行时 + 真实后端（零 TCP）。path 为相对 base 的路径（如 "/user/account"）。
+  interface ClientResp {
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+    upgrade: boolean;
+  }
+  interface ClientOptions {
+    headers?: Record<string, string>;
+    body?: string;
+  }
+  interface Client {
+    get(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    post(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    put(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    del(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    patch(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    head(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    options(path: string, opts?: ClientOptions): Promise<ClientResp>;
+    // 登录助手：POST /auth/login → 返回 access_token（失败抛错）。
+    login(username: string, password: string): Promise<string>;
+  }
+  const client: Client;
+
+  // 轻量测试框架（vitest 风格子集）：describe/it/expect/beforeEach。
+  function describe(name: string, fn: () => void): void;
+  function it(name: string, fn: () => void | Promise<void>): void;
+  function beforeEach(fn: () => void | Promise<void>): void;
+  function expect(actual: unknown): {
+    toBe(e: unknown): void;
+    toEqual(e: unknown): void;
+    toBeTruthy(): void;
+    toBeFalsy(): void;
+    toContain(sub: unknown): void;
+  };
+
   // 标记会话结束。
   function finish(): void;
   // CJS 同步 require（eval + 进程级缓存）。

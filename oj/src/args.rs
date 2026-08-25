@@ -12,6 +12,17 @@ pub struct ServerArgs {
     pub dir: Option<String>,
 }
 
+/// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
+pub struct TestArgs {
+    pub config: String,
+    /// None → 用 config 的 server.base（默认 /v1/api）。
+    pub base: Option<String>,
+    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    pub dir: Option<String>,
+    /// 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。默认 "tests"。
+    pub tests: Option<String>,
+}
+
 /// `oj build [module] [-d src] [-o dist] [--no-minify]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
     pub module: Option<String>,
@@ -25,6 +36,7 @@ pub struct BuildArgs {
 pub enum Command {
     Server(ServerArgs),
     Build(BuildArgs),
+    Test(TestArgs),
 }
 
 /// oj：目录镜像路由的 JS 服务与构建 CLI。
@@ -64,6 +76,22 @@ enum Commands {
         #[arg(long)]
         no_minify: bool,
     },
+    /// 跑 sample API 测试（无需启动 oj server；进程内真实运行时派发）
+    Test {
+        /// 配置文件路径（相对 CWD；server.host/port/root + db/redis）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
+        #[arg(short, long)]
+        base: Option<String>,
+        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
+        /// 默认：src 目录存在取 src，否则 dist
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 测试用例目录（默认 tests）；相对 config_dir（项目根）
+        #[arg(short, long)]
+        tests: Option<String>,
+    },
 }
 
 /// 解析 argv；非法参数/帮助/空参由 clap 打印并退出（exit 2）。
@@ -77,6 +105,9 @@ fn to_command(cli: Cli) -> Command {
         Commands::Server { config, base, dir } => Command::Server(ServerArgs { config, base, dir }),
         Commands::Build { module, dir, out, no_minify } => {
             Command::Build(BuildArgs { module, dir, out, minify: !no_minify })
+        }
+        Commands::Test { config, base, dir, tests } => {
+            Command::Test(TestArgs { config, base, dir, tests })
         }
     }
 }
