@@ -171,7 +171,7 @@ impl App {
         // 路由表：dev 启动内省 .route 声明；release 聚合 dist/manifests.yaml。
         let (table, failures) = if ts {
             for m in manifest::load_modules(&dir)? {
-                println!("module {} v{} — {}", m.name, m.version, m.desc);
+                eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
             }
             routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge.clone()))
         } else {
@@ -205,7 +205,7 @@ impl App {
                         mf.display()
                     ));
                 }
-                println!("module {} v{} — {}", m.name, m.version, m.desc);
+                eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
                 let rjs = mdir.join("routes.js");
                 let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
                 for e in routes::entries_from_value(&v) {
@@ -229,7 +229,7 @@ impl App {
             eprintln!("warn: {} route declaration(s) skipped (see errors above)", failures.len());
         }
         for r in table.listing() {
-            println!("  {:8} {}  <- {}", r.method.to_uppercase(), r.pattern, r.file.display());
+            eprintln!("  {:8} {}  <- {}", r.method.to_uppercase(), r.pattern, r.file.display());
         }
         let n = cfg.server.pool_size.max(1) as usize;
         let timeout = config::parse_duration(&cfg.server.timeout).ok();

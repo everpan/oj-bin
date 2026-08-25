@@ -21,6 +21,10 @@ pub struct TestArgs {
     pub dir: Option<String>,
     /// 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。默认 "tests"。
     pub tests: Option<String>,
+    /// 报告格式：human（默认，可读摘要）/ tap / junit / json，便于 CI 统一收口。
+    pub format: Option<String>,
+    /// 报告输出文件；省略则打到 stdout。machine 格式（tap/junit/json）配合此旗标落盘。
+    pub output: Option<String>,
 }
 
 /// `oj build [module] [-d src] [-o dist] [--no-minify]`（src → dist，生成 routes.js）。
@@ -91,6 +95,12 @@ enum Commands {
         /// 测试用例目录（默认 tests）；相对 config_dir（项目根）
         #[arg(short, long)]
         tests: Option<String>,
+        /// 报告格式：human（默认）/ tap / junit / json（CI 兼容）
+        #[arg(long)]
+        format: Option<String>,
+        /// 报告落盘文件；省略则打印到 stdout
+        #[arg(long)]
+        output: Option<String>,
     },
 }
 
@@ -106,8 +116,8 @@ fn to_command(cli: Cli) -> Command {
         Commands::Build { module, dir, out, no_minify } => {
             Command::Build(BuildArgs { module, dir, out, minify: !no_minify })
         }
-        Commands::Test { config, base, dir, tests } => {
-            Command::Test(TestArgs { config, base, dir, tests })
+        Commands::Test { config, base, dir, tests, format, output } => {
+            Command::Test(TestArgs { config, base, dir, tests, format, output })
         }
     }
 }

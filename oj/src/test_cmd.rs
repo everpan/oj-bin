@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use deno_core::{JsRuntime, ModuleLoader, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8};
 use mdm_base_rust::bridge::bridge_ext;
@@ -70,6 +71,8 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
     }
 
     // 钉线程：JsRuntime 是 !Send，必须待在同一 OS 线程。
+    let fmt = a.format.clone().unwrap_or_else(|| "human".into());
+    let out = a.output.clone();
     let handle = std::thread::Builder::new()
         .name("oj-test".into())
         .spawn(move || {
@@ -79,7 +82,7 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
                 let app = App::from_config(cfg, &config_dir, dir, base, ts).await?;
-                run_on_runtime(app, &files).await
+                run_on_runtime(app, &files, &fmt, out.as_deref()).await
             })
         })
         .map_err(|e| format!("spawn test thread: {e}"))?;
@@ -90,7 +93,14 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
 }
 
 /// 在专用 runtime 上加载并跑全部测试文件。
-async fn run_on_runtime(app: App, files: &[PathBuf]) -> Result<i32, String> {
+/// format: human（默认，可读摘要）/ tap / junit / json；output: 报告落盘文件（省略=stdout）。
+async fn run_on_runtime(
+    app: App,
+    files: &[PathBuf],
+    format: &str,
+    output: Option<&str>,
+) -> Result<i32, String> {
+    let start = Instant::now();
     let stable = app.stable();
     let loader = stable.loader.clone();
     let module_loader: Option<Rc<dyn ModuleLoader>> = loader.map(|inner| {
@@ -165,18 +175,140 @@ async fn run_on_runtime(app: App, files: &[PathBuf]) -> Result<i32, String> {
     let summary: TestSummary =
         serde_json::from_str(&json).map_err(|e| format!("deserialize summary: {e}"))?;
 
-    // 打印 TAP / vitest 风格摘要。
-    println!("oj test: {} files, {} tests", files.len(), summary.total);
-    for t in &summary.tests {
-        let tag = if t.ok { "ok  " } else { "FAIL" };
-        let suite = t.suite.as_deref().unwrap_or("");
-        println!("  {tag}  {suite} > {}", t.name);
-        if let Some(err) = &t.error {
-            for line in err.lines() {
-                println!("        {line}");
+    let elapsed = start.elapsed();
+    emit_report(format, output, &summary, files.len(), elapsed);
+    Ok(if summary.failed > 0 { 1 } else { 0 })
+}
+
+/// 按 format 输出报告。human 直接打印可读摘要；tap/junit/json 为 CI 机器可读格式，
+/// 经 --output 落盘或打到 stdout（machine 格式不在 stdout 混排人类摘要，避免破坏解析）。
+fn emit_report(
+    format: &str,
+    output: Option<&str>,
+    summary: &TestSummary,
+    files: usize,
+    elapsed: std::time::Duration,
+) {
+    let report = match format {
+        "tap" => to_tap(summary),
+        "junit" => to_junit(summary, elapsed),
+        "json" => serde_json::to_string_pretty(summary).unwrap_or_default(),
+        _ => {
+            // human（默认）：保留原有可读摘要。
+            println!("oj test: {} files, {} tests", files, summary.total);
+            for t in &summary.tests {
+                let tag = if t.ok { "ok  " } else { "FAIL" };
+                let suite = t.suite.as_deref().unwrap_or("");
+                println!("  {tag}  {suite} > {}", t.name);
+                if let Some(err) = &t.error {
+                    for line in err.lines() {
+                        println!("        {line}");
+                    }
+                }
             }
+            println!("result: {}/{} passed", summary.passed, summary.total);
+            return;
+        }
+    };
+
+    match output {
+        Some(path) => match std::fs::write(path, &report) {
+            Ok(()) => println!("oj test: report ({format}) written to {path}"),
+            Err(e) => eprintln!("oj test: write report {path}: {e}"),
+        },
+        None => println!("{report}"),
+    }
+}
+
+/// TAP 13：1..N + ok/not ok，失败附 YAML 诊断。
+fn to_tap(s: &TestSummary) -> String {
+    let mut out = String::new();
+    out.push_str("TAP version 13\n");
+    out.push_str(&format!("1..{}\n", s.total));
+    for (i, t) in s.tests.iter().enumerate() {
+        let n = i + 1;
+        let suite = t.suite.as_deref().unwrap_or("");
+        let desc = if suite.is_empty() {
+            t.name.clone()
+        } else {
+            format!("{suite} > {}", t.name)
+        };
+        if t.ok {
+            out.push_str(&format!("ok {n} - {desc}\n"));
+        } else {
+            out.push_str(&format!("not ok {n} - {desc}\n"));
+            out.push_str("  ---\n");
+            out.push_str("  error: |\n");
+            let err = t.error.as_deref().unwrap_or("(no message)");
+            for line in err.lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+            out.push_str("  ...\n");
         }
     }
-    println!("result: {}/{} passed", summary.passed, summary.total);
-    Ok(if summary.failed > 0 { 1 } else { 0 })
+    out
+}
+
+/// JUnit XML：按 suite 分组；文本做 XML 转义。time 用总耗时（秒，三位小数）。
+fn to_junit(s: &TestSummary, elapsed: std::time::Duration) -> String {
+    let time = format!("{:.3}", elapsed.as_secs_f64());
+    let mut suites: std::collections::BTreeMap<String, Vec<&TestResult>> =
+        std::collections::BTreeMap::new();
+    for t in &s.tests {
+        suites
+            .entry(t.suite.clone().unwrap_or_else(|| "root".into()))
+            .or_default()
+            .push(t);
+    }
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(&format!(
+        "<testsuites name=\"oj-test\" tests=\"{}\" failures=\"{}\" errors=\"0\" time=\"{}\">\n",
+        s.total, s.failed, time
+    ));
+    for (name, cases) in &suites {
+        let fails = cases.iter().filter(|c| !c.ok).count();
+        out.push_str(&format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" time=\"{}\">\n",
+            escape_xml(name),
+            cases.len(),
+            fails,
+            time
+        ));
+        for c in cases {
+            out.push_str(&format!(
+                "    <testcase name=\"{}\" classname=\"{}\">\n",
+                escape_xml(&c.name),
+                escape_xml(name)
+            ));
+            if !c.ok {
+                let msg = c.error.as_deref().unwrap_or("(failed)");
+                out.push_str(&format!(
+                    "      <failure message=\"{}\">{}</failure>\n",
+                    escape_xml(msg.lines().next().unwrap_or(msg)),
+                    escape_xml(msg)
+                ));
+            }
+            out.push_str("    </testcase>\n");
+        }
+        out.push_str("  </testsuite>\n");
+    }
+    out.push_str("</testsuites>\n");
+    out
+}
+
+/// 最小 XML 转义（& < > " '）。
+fn escape_xml(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            '\'' => o.push_str("&apos;"),
+            _ => o.push(c),
+        }
+    }
+    o
 }
