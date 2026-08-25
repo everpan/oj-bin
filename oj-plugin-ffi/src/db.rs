@@ -9,6 +9,10 @@ use crate::{FfiFuture, RVec, RString};
 #[repr(C)]
 pub struct DataAccessorVtable {
     /// 建立连接（cfg = DSN 字符串）。ok 值 = `{"handle": u64}` JSON。
+    ///
+    /// 注意（M-3）：connect **只**收到 DSN 字符串，**不**接收宿主 config_dir；
+    /// 因此依赖「相对路径解析」的 DSN 语义（如相对 data 目录）仅内置后端支持，
+    /// 插件须始终使用绝对/完整 DSN 或自带路径解析。
     pub connect: extern "C" fn(cfg: RString) -> FfiFuture,
     /// 参数化查询。params = JSON 数组；ok 值 = JSON 行数组（每行 JSON 对象）。
     pub query: extern "C" fn(handle: u64, sql: RString, params: RString) -> FfiFuture,

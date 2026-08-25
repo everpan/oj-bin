@@ -226,6 +226,15 @@ fn install_panic_hook() {
 /// 当前正在 init 的插件名（panic 归因上下文）。
 static CURRENT_PLUGIN: Mutex<Option<String>> = Mutex::new(None);
 
+/// M-2：RAII 守卫——持有期间 CURRENT_PLUGIN 指向当前插件，Drop 时复位。
+/// 即使 init 期宿主 panic（如 cfg_for 失败），也能自动恢复，避免残留旧名导致后续归因错。
+struct CurrentPluginGuard;
+impl Drop for CurrentPluginGuard {
+    fn drop(&mut self) {
+        *CURRENT_PLUGIN.lock().unwrap() = None;
+    }
+}
+
 /// 宿主回调集（进程级单例）。
 pub fn host_context() -> RArc<HostContext> {
     static CTX: Mutex<Option<RArc<HostContext>>> = Mutex::new(None);
@@ -271,9 +280,11 @@ fn load_one(
     let probe = expected
         .map(|e| e.name.clone())
         .unwrap_or_else(|| file_stem_name(path));
+    // M-2：RAII 守卫管理 CURRENT_PLUGIN。即便下面 cfg_for / init_sym panic，
+    // 守卫 Drop 也会复位，避免残留旧名。
     *CURRENT_PLUGIN.lock().unwrap() = Some(probe.clone());
+    let _guard = CurrentPluginGuard;
     let r = init_sym(host, RString::from(cfg_for(&probe).as_str()));
-    *CURRENT_PLUGIN.lock().unwrap() = None;
 
     let descriptor = match std::result::Result::from(r) {
         Ok(d) => d,
