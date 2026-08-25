@@ -806,7 +806,7 @@ impl BusBackendRegistry {
 
 `build_broker(&cfg)` 保留为薄包装 = `BusBackendRegistry::builtin().connect(&cfg).await`（签名不变，调用点零改动）。`op_bus_kind` 返回值语义不变（当前选中后端的 kind 字符串）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test]
@@ -833,19 +833,19 @@ fn duplicate_kind_fails() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust bus_backend -- --skip infinite_loop`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**——`LocalBusBackend`/`KafkaBusBackend`/`RabbitMqBusBackend` 各实现 `BusBackend::connect`（Kafka/RabbitMQ 的 connect 体 = 现 broker/kafka.rs、broker/rabbitmq.rs 构造逻辑上移，feature gate 保留）；`build_broker` 改薄包装。
+- [x] **Step 3: 实现**——`LocalBusBackend`/`KafkaBusBackend`/`RabbitMqBusBackend` 各实现 `BusBackend::connect`（Kafka/RabbitMQ 的 connect 体 = 现 broker/kafka.rs、broker/rabbitmq.rs 构造逻辑上移，feature gate 保留）；`build_broker` 改薄包装。
 
-- [ ] **Step 4: 跑测试确认通过 + 回归**（broker/mod.rs 既有三测试不动应仍绿；`op_bus_kind` 语义回归）
+- [x] **Step 4: 跑测试确认通过 + 回归**（broker/mod.rs 既有三测试不动应仍绿；`op_bus_kind` 语义回归）
 
 Run: `cargo test --workspace --features rabbitmq -- --skip infinite_loop`（kafka 视本机 librdkafka 而定，不可用则注明并跑 default+rabbitmq）
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -858,8 +858,8 @@ unix@vip.qq.com ai"
 
 ### Task 2.2: 阶段 2 任务状态更新
 
-- [ ] **Step 1: 勾选 Task 2.1 复选框**
-- [ ] **Step 2: 进度提交**
+- [x] **Step 1: 勾选 Task 2.1 复选框**
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
