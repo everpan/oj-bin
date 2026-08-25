@@ -596,7 +596,7 @@ impl BlobRegistry {
 }
 ```
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[test]
@@ -626,19 +626,19 @@ async fn registry_multi_backend_and_duplicate_fails() {
 
 （注意：现状配置解析器是 serde_yaml 还是 toml——先 `grep -n "from_str\|serde_yaml\|toml" src/config.rs` 确认，测试样例用现状格式。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**——BlobRegistry 去掉"仅 default"限制（改为直接包 NamedRegistry）；config 新增 `blob_backends` 段（旧 `[blob]` 段保留映射为 default，向后兼容）；server_cmd.rs 装配：遍历配置逐个构造（local root 相对 config_dir 绝对化、s3 走 `S3Blob::new` 现状校验），配置声明的名字全部成功注册，缺一 → `blob backend '<name>': ...` 启动期报错。
+- [x] **Step 3: 实现**——BlobRegistry 去掉"仅 default"限制（改为直接包 NamedRegistry）；config 新增 `blob_backends` 段（旧 `[blob]` 段保留映射为 default，向后兼容）；server_cmd.rs 装配：遍历配置逐个构造（local root 相对 config_dir 绝对化、s3 走 `S3Blob::new` 现状校验），配置声明的名字全部成功注册，缺一 → `blob backend '<name>': ...` 启动期报错。
 
-- [ ] **Step 4: 跑测试确认通过 + 回归**
+- [x] **Step 4: 跑测试确认通过 + 回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -683,21 +683,21 @@ pub async fn op_blob_get(state: Rc<RefCell<OpState>>, #[string] name: String, #[
 
 op 取数：`blobs.get(&name)` → None 时：name == "default" 报 `blob not configured`（旧文案），否则报 `blob backend '<name>' not configured`（首次调用期报错，spec §2）。
 
-- [ ] **Step 1: 写失败测试**——op 层：注册 `default`+`img` 两后端，JS 调 `blob("img").put/get` 命中 img 后端、`blob.put`（无 name）命中 default、`blob("ghost").get` 报 `blob backend 'ghost' not configured`。
+- [x] **Step 1: 写失败测试**——op 层：注册 `default`+`img` 两后端，JS 调 `blob("img").put/get` 命中 img 后端、`blob.put`（无 name）命中 default、`blob("ghost").get` 报 `blob backend 'ghost' not configured`。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
 Expected: FAIL（op 参数不匹配）
 
-- [ ] **Step 3: 实现**——五 op 加 name 参数 + bootstrap.js 工厂装配（上方代码）。
+- [x] **Step 3: 实现**——五 op 加 name 参数 + bootstrap.js 工厂装配（上方代码）。
 
-- [ ] **Step 4: 跑测试确认通过 + 回归**（重点：既有 blob 测试不经 name 的旧调用经 default 兼容层仍绿）
+- [x] **Step 4: 跑测试确认通过 + 回归**（重点：既有 blob 测试不经 name 的旧调用经 default 兼容层仍绿）
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -717,7 +717,7 @@ unix@vip.qq.com ai"
 - Consumes: Task 1.1 的注册表 + 注册名。
 - Produces: 裁决规则（spec §2）——HTTP 下载路由仅服务名为 `default` 的后端；`LocalBlob` 在注册名 ≠ "default" 时 `url()` 报 `blob url() is only available for the 'default' backend (use get() or an s3 presign)`；s3 presign 不受影响。实现形态：`BlobRegistry::register` 把注册名透传给后端（`LocalBlob` 增 `name: String` 字段，`S3Blob` 忽略）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test]
@@ -734,19 +734,19 @@ async fn download_route_serves_default_only() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**——LocalBlob 增 name 字段（`LocalBlob::new` 保留 = name "default" 委托 `named`）；routes.rs 下载路由从 `StableState.blobs.get("default")` 取后端（现状若从 Extras.blob 取则改道）。
+- [x] **Step 3: 实现**——LocalBlob 增 name 字段（`LocalBlob::new` 保留 = name "default" 委托 `named`）；routes.rs 下载路由从 `StableState.blobs.get("default")` 取后端（现状若从 Extras.blob 取则改道）。
 
-- [ ] **Step 4: 跑测试确认通过 + 回归**
+- [x] **Step 4: 跑测试确认通过 + 回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -757,8 +757,8 @@ unix@vip.qq.com ai"
 
 ### Task 1.4: 阶段 1 任务状态更新
 
-- [ ] **Step 1: 勾选 Task 1.1-1.3 复选框**
-- [ ] **Step 2: 进度提交**
+- [x] **Step 1: 勾选 Task 1.1-1.3 复选框**
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
