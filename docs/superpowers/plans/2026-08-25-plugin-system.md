@@ -1622,11 +1622,11 @@ unix@vip.qq.com ai"
 
 ### Task 6.2: 代码 review
 
-- [ ] **Step 1: 调用 superpowers:requesting-code-review**——对本计划全部产出做完成度 review（重点：ffi.rs 全部 unsafe 的审计清单两项「Library 句柄不 drop」「panic=unwind profile」、适配器层转发正确性、插件互不可见边界、spec §6 fail fast 清单逐条对应）。
+- [x] **Step 1: 调用 superpowers:requesting-code-review**——对本计划全部产出做完成度 review（重点：ffi.rs 全部 unsafe 的审计清单两项「Library 句柄不 drop」「panic=unwind profile」、适配器层转发正确性、插件互不可见边界、spec §6 fail fast 清单逐条对应）。**注：本环境子代理不可用（模型解析恒报 `k3`），review 内联完成**——审计两项达标、§6 fail-fast 矩阵全对应、测试实证 44 过（唯一失败为无关的 CDP 依赖项）；Important 2 项 + Minor 4 项，详见 `docs/plugin-system-handover.md` §3。
 
-- [ ] **Step 2: 吸收 review 意见**——按 superpowers:receiving-code-review 处理；修复项各自 TDD 提交。
+- [x] **Step 2: 吸收 review 意见**——按 superpowers:receiving-code-review 处理；修复项各自 TDD 提交。**接手清单见 `docs/plugin-system-handover.md` §5 接手点 A**：I-1（bus subscribe 僵尸注册 + 竞态）已修复（SUBSCRIBE_GATE + 失败回滚 + 双 TDD 测试）；I-2（运行期 vtable 未包 catch_unwind）选「插件侧全量补 shim」——oj-plugin-ffi 新增 catch_unwind 安全 FfiFuture 工厂（spawn_ffi_future/catch_future/catch_void/catch_value），七插件 vtable 方法全量包；M-1（drop 按归属清理）、M-2（CURRENT_PLUGIN RAII 守卫）、M-3（connect 收不到 config_dir 文档）、M-4（加载错误分类关键词）均已落。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git commit -m "fix(review): 插件系统完成度 review 意见吸收
@@ -1636,12 +1636,13 @@ unix@vip.qq.com ai"
 
 ### Task 6.3: 收尾
 
-- [ ] **Step 1: 全量最终回归**
+- [x] **Step 1: 全量最终回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
+Actual: 全绿（143 bridge + 17 plugin_loader + 各插件单测 + kv-redis 真 redis roundtrip 经新 helper 全过）。
 
-- [ ] **Step 2: 勾选 Task 6.1-6.3 复选框 + 计划终态提交**
+- [x] **Step 2: 勾选 Task 6.1-6.3 复选框 + 计划终态提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
@@ -1650,4 +1651,4 @@ git commit -m "docs(plan): 插件系统计划全部落地——阶段 0-6 收官
 unix@vip.qq.com ai"
 ```
 
-- [ ] **Step 3: spec 状态头更新**——`docs/superpowers/specs/2026-08-25-plugin-system-design.md` 状态改「已实现」并提交。
+- [x] **Step 3: spec 状态头更新**——`docs/superpowers/specs/2026-08-25-plugin-system-design.md` 状态改「已实现」并提交。

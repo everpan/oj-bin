@@ -1,7 +1,7 @@
 # 插件系统设计：JS 绑定层全量插件化（cdylib 动态库装配）
 
-> 状态：经六专家评审（44 条确认发现）+ 架构师终审（SOLID/DRY、扩展性、架构遗漏三维，
-> 1 major + 6 minor）两轮修订完毕，待用户审阅。
+> 状态：已实现（阶段 0-6 全落地；review 意见 I-1/I-2/M-1..M-4 已全部吸收，全量回归绿，
+> 见 `docs/plugin-system-handover.md` §5 接手点 A/B 与 `docs/superpowers/plans/2026-08-25-plugin-system.md` 阶段 6）。
 > 本文是 `docs/plugin-architecture.md`（下称"原案"）的评审修订版。原案 §1 现状分析继续有效；
 > 冲突处以本文为准。与原案最大分歧：原案 §6 否决运行时 `.so`，本版经评审改采 cdylib 动态库——
 > 否决理由中两条（`Extension` 非 repr(C)、V8 线程亲和）因"ops 全部留在 core"而失效。
