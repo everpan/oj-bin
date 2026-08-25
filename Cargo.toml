@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj", "oj-plugin-ffi", "tests/plugins/mini"]
+members = ["server", "oj", "oj-plugin-ffi", "oj-es", "tests/plugins/mini"]
 default-members = ["."]
 
 [package]
@@ -58,3 +58,8 @@ tempfile = "3"
 [[bench]]
 name = "bridge"
 harness = false
+
+# 插件契约：所有 cdylib 插件必须 panic=unwind（oj_plugin_entry! 内建 catch_unwind
+# 收敛跨界 panic；任何下游 profile 不得覆盖为 abort）。
+[profile.release]
+panic = "unwind"

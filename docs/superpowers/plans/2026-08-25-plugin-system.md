@@ -1238,16 +1238,18 @@ oj_plugin_ffi::oj_plugin_entry!(init);
 fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> { /* ... */ }
 ```
 
-- [ ] **Step 1: 迁移 EsClient HTTP 实现**入 oj-es（url_for/valid_ident 中 url_for 随实现走、valid_ident 留在 core op 层）；core es.rs 删 HTTP 细节，保留 trait + ops。
+- [x] **Step 1: 迁移 EsClient HTTP 实现**入 oj-es（url_for/valid_ident 中 url_for 随实现走、valid_ident 留在 core op 层）；core es.rs 删 HTTP 细节，保留 trait + ops。
+  > 注：core es.rs 的 HTTP 细节**删除随 Task 3.7 装配接线一并做**——`oj/src/server_cmd.rs` 当前仍构造 `EsClient`（3.7 才切插件路径），此步先删会破坏编译；oj-es 已持有完整迁入实现。
 
-- [ ] **Step 2: 写插件内单测**——vtable 三方法经插件自建 runtime 执行（mock http 或用 `OJ_TEST_ES` env-gated 真连，沿用 core 既有 es 测试的 env 约定迁移）。
+- [x] **Step 2: 写插件内单测**——vtable 三方法经插件自建 runtime 执行（httptest mock http；PLUGIN 单例经 init 建立，`EsClientInner` 直测与 vtable 直测分离避免单例竞争）。
 
-- [ ] **Step 3: 编译验证产物**
+- [x] **Step 3: 编译验证产物**
 
 Run: `cargo build -p oj-es && ls target/debug/liboj_es.*`
 Expected: 产出 `.dylib`（本机 macOS）/`.so`
+实际：`target/debug/liboj_es.dylib`（4 单测绿，`[profile.release] panic="unwind"` 因非 root 被忽略 → 提升至 workspace root）
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add oj-es/ Cargo.toml Cargo.lock src/bridge/es.rs

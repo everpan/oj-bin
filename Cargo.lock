@@ -3157,6 +3157,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-es"
+version = "0.1.0"
+dependencies = [
+ "httptest",
+ "oj-plugin-ffi",
+ "reqwest 0.13.1",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "oj-plugin-ffi"
 version = "0.1.0"
 dependencies = [
