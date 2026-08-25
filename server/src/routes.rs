@@ -85,10 +85,14 @@ pub fn method_name(m: &str) -> Option<&'static str> {
     }
 }
 
+/// 归一化文件标识：路由表内每个唯一 api 文件一个 id，消除 (file, method) 的 PathBuf 重复存储。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId(pub u32);
+
 /// 单 pattern 下某方法的归宿：文件 / 冲突（请求期 500）。
 #[derive(Clone)]
 pub enum Entry {
-    File(PathBuf),
+    File(FileId),
     Conflict(String),
 }
 
@@ -100,22 +104,25 @@ pub enum Lookup {
     NotFound,
 }
 
-/// 启动打印行（method × pattern × file）。
+/// 启动打印行（method × pattern × file_id）。
 #[derive(Clone)]
 pub struct RouteRow {
     pub method: String,
     pub pattern: String,
-    pub file: PathBuf,
+    pub file: FileId,
 }
 
 /// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
 /// 405 判定 O(1)（命中 pattern 但方法缺席），“冲突哨兵”即映射里的 Conflict 变体。
+/// files 为文件表：FileId → 唯一绝对路径，消除 (file, method) 的 PathBuf 重复存储。
 #[derive(Clone)]
 pub struct RouteTable {
     matcher: matchit::Router<HashMap<String, Entry>>,
-    /// 挂了 .route 的 (file, js 方法名)：dev 兜底不得复活其目录镜像 URL。
-    replaced: std::collections::HashSet<(PathBuf, String)>,
+    /// 挂了 .route 的 (file_id, js 方法名)：dev 兜底不得复活其目录镜像 URL。
+    replaced: std::collections::HashSet<(FileId, String)>,
     rows: Vec<RouteRow>,
+    /// 文件表：FileId → 唯一绝对路径（去重存储，供 file_path / 分组输出复用）。
+    files: Vec<PathBuf>,
 }
 
 const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
@@ -135,6 +142,7 @@ impl RouteTable {
             matcher: matchit::Router::new(),
             replaced: std::collections::HashSet::new(),
             rows: Vec::new(),
+            files: Vec::new(),
         };
         for file in api_files(root, ts) {
             let decls = match introspect(&file) {
@@ -162,7 +170,8 @@ impl RouteTable {
                     Some(r) => format!("{dir_base}/{r}"),                // 相对
                 };
                 if route.is_some() {
-                    t.replaced.insert((file.clone(), method.clone()));
+                    let fid = t.intern(&file);
+                    t.replaced.insert((fid, method.clone()));
                 }
                 t.register(&mut failures, &method, &pattern, &file);
             }
@@ -177,6 +186,7 @@ impl RouteTable {
             matcher: matchit::Router::new(),
             replaced: std::collections::HashSet::new(),
             rows: Vec::new(),
+            files: Vec::new(),
         };
         let mut failures = Vec::new();
         for e in entries {
@@ -201,37 +211,48 @@ impl RouteTable {
         (t, failures)
     }
 
+    /// 文件去重：相同路径复用同一 FileId；否则追加到 files 表。
+    fn intern(&mut self, file: &Path) -> FileId {
+        if let Some(i) = self.files.iter().position(|p| p == file) {
+            return FileId(i as u32);
+        }
+        let id = FileId(self.files.len() as u32);
+        self.files.push(file.to_path_buf());
+        id
+    }
+
     /// 注册一行：新 pattern 建方法映射；已有 pattern 合并方法；
     /// 同 (pattern, method) 二次声明 → Conflict（请求期 500）；matchit 拒绝 → 记 failures。
     fn register(&mut self, failures: &mut Vec<String>, method: &str, pattern: &str, file: &Path) {
+        let fid = self.intern(file);
         match self.matcher.at_mut(pattern) {
             Ok(m) => match m.value.get(method) {
                 Some(Entry::File(a)) => {
                     let msg = format!(
                         "route conflict: {method} {pattern} declared in {} and {}",
-                        a.display(),
+                        self.files[a.0 as usize].display(),
                         file.display()
                     );
                     *m.value.get_mut(method).unwrap() = Entry::Conflict(msg.clone());
                     failures.push(msg);
                 }
                 _ => {
-                    m.value.insert(method.to_string(), Entry::File(file.to_path_buf()));
+                    m.value.insert(method.to_string(), Entry::File(fid));
                     self.rows.push(RouteRow {
                         method: method.to_string(),
                         pattern: pattern.to_string(),
-                        file: file.to_path_buf(),
+                        file: fid,
                     });
                 }
             },
             Err(_) => {
                 let mut map = HashMap::new();
-                map.insert(method.to_string(), Entry::File(file.to_path_buf()));
+                map.insert(method.to_string(), Entry::File(fid));
                 match self.matcher.insert(pattern.to_string(), map) {
                     Ok(()) => self.rows.push(RouteRow {
                         method: method.to_string(),
                         pattern: pattern.to_string(),
-                        file: file.to_path_buf(),
+                        file: fid,
                     }),
                     // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
                     Err(e) => failures.push(format!(
@@ -256,7 +277,10 @@ impl RouteTable {
             Some(Entry::File(f)) => {
                 let pairs = m.params.iter().map(|(k, v)| (k.to_string(), v.to_string()));
                 match decode_params(pairs) {
-                    Some(params) => Lookup::Hit { file: f.clone(), params },
+                    Some(params) => Lookup::Hit {
+                        file: self.files[f.0 as usize].clone(),
+                        params,
+                    },
                     None => Lookup::NotFound, // 走私参数 → 404（§6.1-4）
                 }
             }
@@ -267,11 +291,45 @@ impl RouteTable {
 
     /// dev 兜底守卫：该 (file, 方法) 是否已挂 .route（目录镜像被替换）。
     pub fn is_replaced(&self, file: &Path, js_method: &str) -> bool {
-        self.replaced.contains(&(file.to_path_buf(), js_method.to_string()))
+        match self.id_of(file) {
+            Some(id) => self.replaced.contains(&(id, js_method.to_string())),
+            None => false,
+        }
+    }
+
+    /// 路径 → FileId（仅当路径已入表）；dev 兜底比对用，未入表返回 None。
+    fn id_of(&self, file: &Path) -> Option<FileId> {
+        self.files
+            .iter()
+            .position(|p| p == file)
+            .map(|i| FileId(i as u32))
     }
 
     pub fn listing(&self) -> &[RouteRow] {
         &self.rows
+    }
+
+    /// FileId → 绝对路径（lookup 已把 Hit 解析为 PathBuf；此处供 banner / is_replaced 复用）。
+    pub fn file_path(&self, id: FileId) -> &Path {
+        &self.files[id.0 as usize]
+    }
+
+    /// 按文件分组输出（FileId 分组）：同一 api 文件的多个谓词归到一行文件头下，
+    /// 避免 (method × pattern) 散落成多行。返回 [(FileId, &Path, [(METHOD, pattern)])]。
+    pub fn grouped(&self) -> Vec<(FileId, &Path, Vec<(String, String)>)> {
+        let mut out: Vec<(FileId, &Path, Vec<(String, String)>)> = Vec::new();
+        for row in &self.rows {
+            let path = &self.files[row.file.0 as usize];
+            match out.iter_mut().find(|(id, _, _)| *id == row.file) {
+                Some(slot) => slot.2.push((row.method.to_uppercase(), row.pattern.clone())),
+                None => out.push((
+                    row.file,
+                    path,
+                    vec![(row.method.to_uppercase(), row.pattern.clone())],
+                )),
+            }
+        }
+        out
     }
 }
 
@@ -526,9 +584,9 @@ mod tests {
         }
         // 挂 .route 后目录镜像不再注册（替换语义）
         assert!(matches!(t.lookup("/v1/api/user/account", "GET"), Lookup::NotFound));
-        let file = t.listing().iter().find(|r| r.method == "get").unwrap().file.clone();
-        assert!(t.is_replaced(&file, "get"));
-        assert!(!t.is_replaced(&file, "post"));
+        let id = t.listing().iter().find(|r| r.method == "get").unwrap().file;
+        assert!(t.is_replaced(t.file_path(id), "get"));
+        assert!(!t.is_replaced(t.file_path(id), "post"));
     }
 
     #[test]

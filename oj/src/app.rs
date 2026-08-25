@@ -228,8 +228,11 @@ impl App {
         if !failures.is_empty() {
             eprintln!("warn: {} route declaration(s) skipped (see errors above)", failures.len());
         }
-        for r in table.listing() {
-            eprintln!("  {:8} {}  <- {}", r.method.to_uppercase(), r.pattern, r.file.display());
+        for (_, file, methods) in table.grouped() {
+            eprintln!("  {}:", file.display());
+            for (method, pattern) in methods {
+                eprintln!("    {:8} {}", method, pattern);
+            }
         }
         let n = cfg.server.pool_size.max(1) as usize;
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
