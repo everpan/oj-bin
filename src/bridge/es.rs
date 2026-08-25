@@ -29,6 +29,47 @@ impl EsClient {
     }
 }
 
+/// es 轴后端契约（spec §2：先抽 trait，HTTP 实现 EsClient 为首个后端；
+/// 阶段 3 起 cdylib 插件经 FFI 适配器实现本 trait）。
+#[async_trait::async_trait]
+pub trait EsBackend: Send + Sync {
+    async fn search(&self, index: &str, dsl: serde_json::Value) -> super::BridgeResult<serde_json::Value>;
+    async fn index_doc(&self, index: &str, id: &str, doc: serde_json::Value) -> super::BridgeResult<serde_json::Value>;
+    async fn delete_doc(&self, index: &str, id: &str) -> super::BridgeResult<serde_json::Value>;
+}
+
+/// 响应直通（BridgeResult 版）：2xx → JSON 体；非 2xx → Err（带 ES 返回体便于排障）。
+async fn es_resp_b(resp: reqwest::Response, what: &str) -> super::BridgeResult<serde_json::Value> {
+    let status = resp.status();
+    if status.is_success() {
+        resp.json()
+            .await
+            .map_err(|e| format!("{what}: parse response: {e}").into())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(format!("{what}: HTTP {status}: {body}").into())
+    }
+}
+
+#[async_trait::async_trait]
+impl EsBackend for EsClient {
+    async fn search(&self, index: &str, dsl: serde_json::Value) -> super::BridgeResult<serde_json::Value> {
+        let url = url_for(&self.endpoint, index, None);
+        let resp = self.http.post(&url).json(&dsl).send().await.map_err(|e| format!("es search: {e}"))?;
+        es_resp_b(resp, "es search").await
+    }
+    async fn index_doc(&self, index: &str, id: &str, doc: serde_json::Value) -> super::BridgeResult<serde_json::Value> {
+        let url = url_for(&self.endpoint, index, Some(id));
+        let resp = self.http.put(&url).json(&doc).send().await.map_err(|e| format!("es index: {e}"))?;
+        es_resp_b(resp, "es index").await
+    }
+    async fn delete_doc(&self, index: &str, id: &str) -> super::BridgeResult<serde_json::Value> {
+        let url = url_for(&self.endpoint, index, Some(id));
+        let resp = self.http.delete(&url).send().await.map_err(|e| format!("es del: {e}"))?;
+        es_resp_b(resp, "es del").await
+    }
+}
+
 /// index/id 白名单：字母数字下划线连字符（防路径注入）。
 fn valid_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -44,25 +85,12 @@ fn url_for(endpoint: &str, index: &str, id: Option<&str>) -> String {
     }
 }
 
-fn client(state: &OpState) -> Result<Arc<EsClient>, JsErrorBox> {
+fn backend(state: &OpState) -> Result<Arc<dyn EsBackend>, JsErrorBox> {
     state
         .borrow::<Arc<StableState>>()
         .es
         .clone()
         .ok_or_else(|| JsErrorBox::generic("es not configured (config es: section missing)"))
-}
-
-/// 响应直通：2xx → JSON 体；非 2xx → Err（带 ES 返回体便于排障）。
-async fn es_resp(resp: reqwest::Response, what: &str) -> Result<serde_json::Value, JsErrorBox> {
-    let status = resp.status();
-    if status.is_success() {
-        resp.json()
-            .await
-            .map_err(|e| JsErrorBox::generic(format!("{what}: parse response: {e}")))
-    } else {
-        let body = resp.text().await.unwrap_or_default();
-        Err(JsErrorBox::generic(format!("{what}: HTTP {status}: {body}")))
-    }
 }
 
 /// es.search(index, dsl)：POST `/{index}/_search`，返回 ES 响应体。
@@ -73,19 +101,11 @@ pub async fn op_es_search(
     #[string] index: String,
     #[serde] dsl: serde_json::Value,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let es = client(&state.borrow())?;
+    let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
         return Err(JsErrorBox::generic(format!("es search: invalid index {index:?}")));
     }
-    let url = url_for(&es.endpoint, &index, None);
-    let resp = es
-        .http
-        .post(&url)
-        .json(&dsl)
-        .send()
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("es search: {e}")))?;
-    es_resp(resp, "es search").await
+    es.search(&index, dsl).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// es.index(index, id, doc)：PUT `/{index}/_doc/{id}?refresh=true`（实时可查）。
@@ -97,22 +117,14 @@ pub async fn op_es_index(
     #[string] id: String,
     #[serde] doc: serde_json::Value,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let es = client(&state.borrow())?;
+    let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
         return Err(JsErrorBox::generic(format!("es index: invalid index {index:?}")));
     }
     if !valid_ident(&id) {
         return Err(JsErrorBox::generic(format!("es index: invalid id {id:?}")));
     }
-    let url = url_for(&es.endpoint, &index, Some(&id));
-    let resp = es
-        .http
-        .put(&url)
-        .json(&doc)
-        .send()
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("es index: {e}")))?;
-    es_resp(resp, "es index").await
+    es.index_doc(&index, &id, doc).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// es.del(index, id)：DELETE `/{index}/_doc/{id}?refresh=true`（幂等：缺失返回 404 体）。
@@ -123,21 +135,14 @@ pub async fn op_es_del(
     #[string] index: String,
     #[string] id: String,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let es = client(&state.borrow())?;
+    let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
         return Err(JsErrorBox::generic(format!("es del: invalid index {index:?}")));
     }
     if !valid_ident(&id) {
         return Err(JsErrorBox::generic(format!("es del: invalid id {id:?}")));
     }
-    let url = url_for(&es.endpoint, &index, Some(&id));
-    let resp = es
-        .http
-        .delete(&url)
-        .send()
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("es del: {e}")))?;
-    es_resp(resp, "es del").await
+    es.delete_doc(&index, &id).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 #[cfg(test)]
@@ -218,6 +223,41 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["data"]["err"].as_str().unwrap().contains("invalid id"), "{v}");
+    }
+
+    /// op 层经 EsBackend trait 分发：Stub 实现即生效（不触网）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ops_dispatch_via_es_backend_trait() {
+        struct Stub;
+        #[async_trait::async_trait]
+        impl EsBackend for Stub {
+            async fn search(&self, index: &str, _dsl: Value) -> crate::bridge::BridgeResult<Value> {
+                Ok(serde_json::json!({"stub": index}))
+            }
+            async fn index_doc(&self, _: &str, _: &str, _: Value) -> crate::bridge::BridgeResult<Value> {
+                unreachable!()
+            }
+            async fn delete_doc(&self, _: &str, _: &str) -> crate::bridge::BridgeResult<Value> {
+                unreachable!()
+            }
+        }
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras { es: Some(Arc::new(Stub)), ..Default::default() },
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => { const r = await es.search("idx", { q: 1 }); json.ok(r); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["stub"], serde_json::json!("idx"), "{v}");
     }
 
     /// 真 ES roundtrip：env `OJ_TEST_ES` 给 endpoint（如 http://127.0.0.1:9200）。

@@ -134,7 +134,7 @@ pub async fn start(
         Some(c) => return Err(format!("blob.driver must be local|s3, got {:?}", c.driver)),
     };
     // ES（OJ-6）：config es: 块存在即注入 EsClient；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
-    let es: Option<Arc<EsClient>> = cfg.es.as_ref().map(|c| Arc::new(EsClient::new(c.endpoint.clone())));
+    let es: Option<Arc<dyn mdm_base_rust::bridge::EsBackend>> = cfg.es.as_ref().map(|c| Arc::new(EsClient::new(c.endpoint.clone())) as Arc<dyn mdm_base_rust::bridge::EsBackend>);
     // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
     // 缺省进程内 Bus；池内所有 Bridge 注入同一 Arc<dyn EventBroker>，WS 订阅与任意 handler 发布互通。
     let bus = build_broker(&cfg.broker)

@@ -48,7 +48,7 @@ pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
 pub use bus::{Bus, EventBroker};
-pub use es::EsClient;
+pub use es::{EsBackend, EsClient};
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
@@ -84,7 +84,7 @@ pub struct StableState {
     /// server 装配共享一个跨连接广播；缺省每 Bridge 自带进程内 Bus。
     pub bus: Arc<dyn bus::EventBroker>,
     /// ES 客户端（OJ-6）：es 配置存在时注入；否则 es.* 报 "es not configured"。
-    pub es: Option<Arc<es::EsClient>>,
+    pub es: Option<Arc<dyn es::EsBackend>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -94,7 +94,7 @@ pub struct Extras {
     /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus（进程内）。
     pub bus: Option<Arc<dyn bus::EventBroker>>,
     /// Some = ES 客户端；None = es.* 未配置报错。
-    pub es: Option<Arc<es::EsClient>>,
+    pub es: Option<Arc<dyn es::EsBackend>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
