@@ -1337,14 +1337,14 @@ pub async fn assemble_plugins(cfg: &Config, config_dir: &Path, registries: &mut 
     -> Result<Vec<PluginInfo>, String>;
 ```
 
-- [ ] **Step 1: 写失败测试**——清单显式给出且文件缺失 → 启动报错；清单同名两次 → fail fast；缺省扫描零目录 → 仅内置后端正常启动；扫描到坏插件 → fail fast；配置声明 `[es]` 但插件未装 → 启动期报错（"配置声明了能力但插件未装"闸门）。
+- [x] **Step 1: 写失败测试**——清单显式给出且文件缺失 → 启动报错；清单同名两次 → fail fast；缺省扫描零目录 → 仅内置后端正常启动；扫描到坏插件 → fail fast；配置声明 `[es]` 但插件未装 → 启动期报错（"配置声明了能力但插件未装"闸门）。
 
-- [ ] **Step 2: 跑测试确认失败** → **Step 3: 实现接线** → **Step 4: 全量回归**
+- [x] **Step 2: 跑测试确认失败** → **Step 3: 实现接线** → **Step 4: 全量回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
-Expected: 全绿
+Expected: 全绿（实测全绿；oj 51 项中 60s 为既有 `registry_connect_dispatches_by_scheme` sqlx 连接超时，非本任务引入）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1355,8 +1355,8 @@ unix@vip.qq.com ai"
 
 ### Task 3.8: 阶段 3 任务状态更新
 
-- [ ] **Step 1: 勾选 Task 3.1-3.7 复选框**
-- [ ] **Step 2: 进度提交**
+- [x] **Step 1: 勾选 Task 3.1-3.7 复选框**
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
