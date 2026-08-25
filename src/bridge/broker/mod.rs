@@ -1,18 +1,9 @@
-//! 分布式事件 broker 工厂与具体实现。
+//! 分布式事件 broker 工厂（本地 Bus 保留；Kafka/RabbitMQ 已迁插件，Task 4.3）。
 //!
-//! 统一契约在 `super::bus::EventBroker`：进程内 `Bus` 与分布式 `KafkaBroker` /
-//! `RabbitMqBroker` 皆实现之，经 `build_broker` 按配置构造为 `Arc<dyn EventBroker>`
-//! 注入 `StableState.bus`。新增 broker 只需加一个 feature-gated 模块并在 `build_broker`
-//! 补分支（OCP）。
-//!
-//! Kafka / RabbitMQ 实现经 Cargo feature 可选编译（默认构建不含其客户端依赖）：
-//! `cargo build --features kafka` / `--features rabbitmq`。未启用 feature 却声明对应
-//! `kind` → 装配期明确报错（而非静默退化）。
-
-#[cfg(feature = "kafka")]
-pub mod kafka;
-#[cfg(feature = "rabbitmq")]
-pub mod rabbitmq;
+//! 统一契约在 `super::bus::EventBroker`：进程内 `Bus` 与插件 `FfiEventBroker`
+//! （oj-bus-kafka / oj-bus-rabbitmq）皆实现之，经 `BusBackendRegistry` 按 kind 装配。
+//! `build_broker` 保持签名（薄包装 builtin()），供缺省/测试零插件场景；真实装配在
+//! server_cmd 经 Registries.bus（内置 local + 插件工厂）连接。
 
 use std::sync::Arc;
 
@@ -21,7 +12,7 @@ use super::BridgeResult;
 use crate::config::BrokerCfg;
 
 /// 按配置构造事件 broker（薄包装：BusBackendRegistry::builtin().connect，签名不变，
-/// 调用点零改动）。kind 查表语义见 `super::bus_backend`。
+/// 调用点零改动；仅内置 local——插件 broker 场景走装配期 Registries.bus）。
 pub async fn build_broker(cfg: &Option<BrokerCfg>) -> BridgeResult<Arc<dyn EventBroker>> {
     super::bus_backend::BusBackendRegistry::builtin().connect(cfg).await
 }

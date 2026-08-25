@@ -5,11 +5,13 @@
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
 pub mod blob;
+pub mod bus;
 pub mod db;
 pub mod es;
 pub mod future;
 
 pub use blob::BlobBackendVtable;
+pub use bus::EventBrokerVtable;
 pub use db::DataAccessorVtable;
 pub use es::EsBackendVtable;
 pub use future::FfiFuture;
@@ -23,7 +25,8 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 唯一硬门禁：严格相等才允许加载（spec §3）。
 /// 2 = Task 4.1 起（PluginRegistrations 增 db 槽位 + DataAccessorVtable）。
 /// 3 = Task 4.2 起（PluginRegistrations 增 blob 槽位 + BlobBackendVtable）。
-pub const ABI_VERSION: u32 = 3;
+/// 4 = Task 4.3 起（PluginRegistrations 增 bus 槽位 + EventBrokerVtable + HostContext 增 deliver）。
+pub const ABI_VERSION: u32 = 4;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -50,7 +53,7 @@ pub struct PluginDescriptor {
     pub register: extern "C" fn() -> PluginRegistrations,
 }
 
-/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。blob/bus/kv 槽位随 4.2-4.4 加入，
+/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。kv 槽位随 4.4 加入，
 /// 加字段 = ABI bump）。db 槽位 = 单个插件自带 vtable（schemes 由 vtable 自我声明），
 /// 多 db 插件并存：宿主遍历各插件读各自 db 槽（scheme 交集冲突在注册时 fail fast）。
 #[stabby::stabby]
@@ -59,11 +62,17 @@ pub struct PluginRegistrations {
     pub es: *const EsBackendVtable,
     pub db: *const DataAccessorVtable,
     pub blob: *const BlobBackendVtable,
+    pub bus: *const EventBrokerVtable,
 }
 
 impl PluginRegistrations {
     pub fn none() -> Self {
-        Self { es: std::ptr::null(), db: std::ptr::null(), blob: std::ptr::null() }
+        Self {
+            es: std::ptr::null(),
+            db: std::ptr::null(),
+            blob: std::ptr::null(),
+            bus: std::ptr::null(),
+        }
     }
 
     pub fn es(&self) -> Option<&'static EsBackendVtable> {
@@ -77,6 +86,10 @@ impl PluginRegistrations {
     pub fn blob(&self) -> Option<&'static BlobBackendVtable> {
         unsafe { self.blob.as_ref() }
     }
+
+    pub fn bus(&self) -> Option<&'static EventBrokerVtable> {
+        unsafe { self.bus.as_ref() }
+    }
 }
 
 /// 宿主回调集（RArc 共享所有权传入，进程级有效；不提供 registry lookup——插件互不可见）。
@@ -85,7 +98,9 @@ impl PluginRegistrations {
 pub struct HostContext {
     /// 日志上送：插件日志经此回调进宿主 tracing。level: 0=trace 1=debug 2=info 3=warn 4=error。
     pub log: extern "C" fn(level: u8, msg: RString),
-    // bus deliver 回调在 Task 4.3 加入（加回调 = ABI bump，本期一次设计好预留位）。
+    /// 消息上送（Task 4.3）：bus 插件订阅循环收到消息经此回调非阻塞投递宿主
+    /// （宿主按 topic 扇出到本地订阅通道；插件线程调用，须返回快）。
+    pub deliver: extern "C" fn(topic: RString, payload: RString),
 }
 
 /// 插件入口两符号（由宏生成，禁止手写 #[no_mangle] 绕过，spec §3）：

@@ -81,10 +81,19 @@ pub(crate) fn workspace_root() -> PathBuf {
 // ---- core 侧适配器层（spec §3）：每轴一个 FfiXxxBackend，插件永不直接产 dyn Trait 跨界 ----
 
 use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
-use crate::bridge::{BlobBackend, BlobServed, BridgeResult, DbBackend, EsBackend};
-use oj_plugin_ffi::{BlobBackendVtable, DataAccessorVtable, EsBackendVtable, FfiFuture, RBytes, RString};
+use crate::bridge::{
+    BlobBackend, BlobServed, BridgeResult, BusBackend, DbBackend, EsBackend, EventBroker,
+};
+use crate::config::BrokerCfg;
+use oj_plugin_ffi::{
+    BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture, RBytes,
+    RString,
+};
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + yield_now；take→free→state 置 null）。
 /// poll 返回 -1 时也 take（错误细节在 take 的 Err 里）。
@@ -398,6 +407,119 @@ impl BlobBackend for FfiBlobBackend {
 impl Drop for FfiBlobBackend {
     fn drop(&mut self) {
         (self.vtable.close)(self.handle);
+    }
+}
+
+// ---- bus 轴适配器（Task 4.3）：FfiBusBackend（工厂）→ FfiEventBroker（经 deliver 扇出）----
+
+/// bus 插件 deliver 回调的本地扇出目标（topic → WS 订阅通道）。
+/// 进程内一次一个 bus broker（键选式单后端）；跨 actor 池/全部 WS 连接的共享语义
+/// 经此全局目标表保持（Task 0.5 回归）。deliver 回调签名无 handle——插件消费循环
+/// 只按 topic 上送，宿主按 topic 路由（UnboundedSender 不过 FFI 边界，spec §3）。
+pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Vec<UnboundedSender<String>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// host 侧 deliver 回调（HostContext.deliver 指向此）：非阻塞投递，满/closed 惰性清理。
+/// 语义 = Bus::publish 的本地扇出（payload 原样转发；按 topic 去重注册）。
+pub(crate) extern "C" fn host_deliver(topic: RString, payload: RString) {
+    let (topic, payload) = (topic[..].to_string(), payload[..].to_string());
+    let mut g = DELIVER_TARGETS.lock().unwrap();
+    if let Some(list) = g.get_mut(&topic) {
+        list.retain(|tx| tx.send(payload.clone()).is_ok());
+        if list.is_empty() {
+            g.remove(&topic);
+        }
+    }
+}
+
+/// bus 工厂适配器：实现 core BusBackend（kind 键选式），connect 经 vtable + FfiFuture。
+pub struct FfiBusBackend {
+    /// broker 类型标识（插件名去 "bus-" 前缀；如 "bus-kafka" → "kafka"）。
+    kind: &'static str,
+    vtable: &'static EventBrokerVtable,
+}
+
+impl FfiBusBackend {
+    pub fn new(name: impl Into<String>, vtable: &'static EventBrokerVtable) -> Self {
+        let name = name.into();
+        let kind = name.strip_prefix("bus-").unwrap_or(&name).to_string();
+        let kind: &'static str = Box::leak(kind.into_boxed_str()); // 每插件一次，进程期存活
+        Self { kind, vtable }
+    }
+}
+
+#[async_trait::async_trait]
+impl BusBackend for FfiBusBackend {
+    fn kind(&self) -> &str {
+        self.kind
+    }
+    async fn connect(&self, cfg: &BrokerCfg) -> BridgeResult<Arc<dyn EventBroker>> {
+        let cfg_json = serde_json::to_string(cfg).map_err(|e| ffi_err("bus cfg serialize", e))?;
+        let fut = (self.vtable.connect)(RString::from(cfg_json.as_str()));
+        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("bus connect", e))?;
+        let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|e| ffi_err("bus connect decode", e))?
+            .get("handle")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| ffi_err("bus connect", "missing handle"))?;
+        Ok(Arc::new(FfiEventBroker::new(self.kind, handle, self.vtable)))
+    }
+}
+
+/// broker 适配器：实现 core EventBroker。subscribe 本地注册 tx + 每 topic 至多一个
+/// 插件消费循环（vtable.subscribe 幂等去重）；插件收到消息经 host.deliver 上送 →
+/// 全局 DELIVER_TARGETS 按 topic 扇出（跨 actor/WS 共享语义与内置 Bus 一致）。
+pub struct FfiEventBroker {
+    kind: &'static str,
+    handle: u64,
+    vtable: &'static EventBrokerVtable,
+}
+
+impl FfiEventBroker {
+    pub fn new(kind: &'static str, handle: u64, vtable: &'static EventBrokerVtable) -> Self {
+        Self { kind, handle, vtable }
+    }
+}
+
+#[async_trait::async_trait]
+impl EventBroker for FfiEventBroker {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn publish(&self, topic: &str, data: &Value) -> BridgeResult<usize> {
+        let frame = json!({ "topic": topic, "data": data }).to_string();
+        let fut =
+            (self.vtable.publish)(self.handle, RString::from(topic), RString::from(frame.as_str()));
+        await_ffi(fut).await.map_err(|e| ffi_err("bus publish", e))?;
+        Ok(0) // 远程 broker 经网络投递，本地 fan-out 恒 0（语义对齐 core Kafka/Rabbit）。
+    }
+
+    async fn subscribe(&self, topic: &str, tx: UnboundedSender<String>) -> BridgeResult<()> {
+        // 本地注册（同 channel 去重）；仅当该 topic 首次出现时起插件消费循环。
+        let start_consumer = {
+            let mut g = DELIVER_TARGETS.lock().unwrap();
+            let list = g.entry(topic.to_string()).or_default();
+            let is_new_topic = list.is_empty();
+            if !list.iter().any(|t| t.same_channel(&tx)) {
+                list.push(tx);
+            }
+            is_new_topic
+        };
+        if start_consumer {
+            let fut = (self.vtable.subscribe)(self.handle, RString::from(topic));
+            await_ffi(fut).await.map_err(|e| ffi_err("bus subscribe", e))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FfiEventBroker {
+    fn drop(&mut self) {
+        (self.vtable.close)(self.handle);
+        // 清理本 broker 注册的本地目标（topic 扇出表进程级共享；进程退出即回收）。
+        DELIVER_TARGETS.lock().unwrap().clear();
     }
 }
 
@@ -806,5 +928,137 @@ mod adapter_tests {
         BLOB_CLOSED.store(0, AtomicOrdering::SeqCst);
         drop(FfiBlobBackend::new(42, mock_blob_vtable()));
         assert_eq!(BLOB_CLOSED.load(AtomicOrdering::SeqCst), 42);
+    }
+
+    // ---- bus 轴 mock vtable（Task 4.3；publish 转发 + deliver 扇出 + Drop close）----
+
+    use crate::bridge::{BusBackend, EventBroker};
+    use crate::config::BrokerCfg;
+
+    static BUS_CONNECTED_CFG: Mutex<String> = Mutex::new(String::new());
+    static BUS_PUBLISHED: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static BUS_SUBSCRIBES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+    static BUS_CLOSED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn mock_bus_connect(cfg: RString) -> FfiFuture {
+        *BUS_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
+        ready(Ok(br#"{"handle":42}"#.to_vec()))
+    }
+    extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
+        *BUS_PUBLISHED.lock().unwrap() = (handle, topic[..].to_string(), data[..].to_string());
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_bus_subscribe(handle: u64, topic: RString) -> FfiFuture {
+        BUS_SUBSCRIBES.lock().unwrap().push((handle, topic[..].to_string()));
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_bus_close(handle: u64) {
+        BUS_CLOSED.store(handle, AtomicOrdering::SeqCst);
+    }
+
+    fn mock_bus_vtable() -> &'static EventBrokerVtable {
+        Box::leak(Box::new(EventBrokerVtable {
+            connect: mock_bus_connect,
+            publish: mock_bus_publish,
+            subscribe: mock_bus_subscribe,
+            close: mock_bus_close,
+        }))
+    }
+
+    fn deliver_clear() {
+        DELIVER_TARGETS.lock().unwrap().clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_backend_kind_and_connect() {
+        let _g = T_LOCK.lock().unwrap();
+        let be = FfiBusBackend::new("bus-kafka", mock_bus_vtable());
+        assert_eq!(be.kind(), "kafka");
+        let cfg = BrokerCfg { kind: "kafka".into(), brokers: vec!["b1:9092".into()], ..Default::default() };
+        let broker = be.connect(&cfg).await.unwrap();
+        assert_eq!(broker.kind(), "kafka");
+        // 插件收到的 cfg JSON = BrokerCfg 序列化（brokers 数组）。
+        let c = BUS_CONNECTED_CFG.lock().unwrap().clone();
+        assert!(c.contains("b1:9092") && c.contains("kind"), "{c}");
+        drop(broker);
+        assert_eq!(BUS_CLOSED.load(AtomicOrdering::SeqCst), 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_publish_forwards_topic_and_frame_returns_zero() {
+        let _g = T_LOCK.lock().unwrap();
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let n = broker.publish("news", &serde_json::json!({"a": 1})).await.unwrap();
+        assert_eq!(n, 0); // 远程 broker 本地 fan-out 恒 0
+        let (h, topic, data) = BUS_PUBLISHED.lock().unwrap().clone();
+        assert_eq!(h, 42);
+        assert_eq!(topic, "news");
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(v["data"]["a"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_subscribe_registers_tx_and_deliver_fans_out() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        BUS_SUBSCRIBES.lock().unwrap().clear();
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("t", tx).await.unwrap();
+        // vtable.subscribe 只起一次（每 topic 至多一个消费循环）。
+        assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 1);
+        // 模拟插件消费循环经 host.deliver 上送 → 扇出到本地 tx。
+        host_deliver(RString::from("t"), RString::from(r#"{"topic":"t","data":{"v":42}}"#));
+        let frame = rx.try_recv().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["data"]["v"], 42);
+        // 关闭接收端 → 后续 deliver 惰性清理（不 panic）。
+        drop(rx);
+        host_deliver(RString::from("t"), RString::from(r#"{}"#));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_subscribe_dedupes_same_channel_and_single_consumer_per_topic() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        BUS_SUBSCRIBES.lock().unwrap().clear();
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("t", tx.clone()).await.unwrap();
+        broker.subscribe("t", tx).await.unwrap(); // 同 channel 去重
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("u", tx2).await.unwrap(); // 不同 topic → 新消费
+        assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2); // t 一次 + u 一次
+    }
+
+    #[test]
+    fn bus_drop_closes_handle() {
+        let _g = T_LOCK.lock().unwrap();
+        BUS_CLOSED.store(0, AtomicOrdering::SeqCst);
+        drop(FfiEventBroker::new("kafka", 42, mock_bus_vtable()));
+        assert_eq!(BUS_CLOSED.load(AtomicOrdering::SeqCst), 42);
+    }
+
+    /// FFI broker 下"同一实例跨 actor/WS 共享"回归（Task 0.5 的插件 broker 形态）：
+    /// 两个 Bridge 注入同一 FfiEventBroker，A 侧订阅、B 侧发布；远端经 deliver 回调
+    /// 把消息扇回 → A 侧 tx 收到（全局 DELIVER_TARGETS 保持跨实例共享语义）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ffi_broker_shared_across_bridges() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        BUS_SUBSCRIBES.lock().unwrap().clear();
+        let broker = Arc::new(FfiEventBroker::new("kafka", 42, mock_bus_vtable()));
+        // A 侧订阅（如 WS 连接 A）。
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("t", tx).await.unwrap();
+        // B 侧发布（同一实例）→ vtable.publish 转发（记录）。
+        broker.publish("t", &serde_json::json!({"v": 7})).await.unwrap();
+        let (h, topic, _) = BUS_PUBLISHED.lock().unwrap().clone();
+        assert_eq!((h, topic.as_str()), (42, "t"));
+        // 模拟远端回程：插件消费循环经 host.deliver 上送 → A 侧 tx 收到（跨实例仍成立）。
+        host_deliver(RString::from("t"), RString::from(r#"{"topic":"t","data":{"v":7}}"#));
+        let frame = rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["data"]["v"], 7, "{v}");
     }
 }

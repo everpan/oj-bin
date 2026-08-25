@@ -228,7 +228,7 @@ extern "C" fn close(handle: u64) {
 static ES_VTABLE: EsBackendVtable = EsBackendVtable { search, index_doc, delete_doc, close };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: &ES_VTABLE, db: std::ptr::null(), blob: std::ptr::null() }
+    PluginRegistrations { es: &ES_VTABLE, db: std::ptr::null(), blob: std::ptr::null(), bus: std::ptr::null() }
 }
 
 // ---- 入口 ----
@@ -285,9 +285,10 @@ mod tests {
     use serde_json::Value;
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
+extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log })
+        RArc::new(HostContext { log: test_log, deliver: test_deliver })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询；插件任务跑在插件

@@ -2875,12 +2875,10 @@ dependencies = [
  "deno_error",
  "futures",
  "httptest",
- "lapin",
  "libloading",
  "notify",
  "object_store",
  "oj-plugin-ffi",
- "rdkafka",
  "redis",
  "reqwest 0.13.1",
  "sea-query",
@@ -3164,6 +3162,30 @@ dependencies = [
  "object_store",
  "oj-plugin-ffi",
  "reqwest 0.13.1",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oj-bus-kafka"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "oj-plugin-ffi",
+ "rdkafka",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "oj-bus-rabbitmq"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "lapin",
+ "oj-plugin-ffi",
  "serde",
  "serde_json",
  "tokio",

@@ -274,7 +274,7 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: &VTABLE }
+    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: &VTABLE, bus: std::ptr::null() }
 }
 
 // ---- 入口 ----
@@ -402,9 +402,10 @@ mod tests {
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
+extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log })
+        RArc::new(HostContext { log: test_log, deliver: test_deliver })
     }
 
     fn rbytes(b: &[u8]) -> RBytes {

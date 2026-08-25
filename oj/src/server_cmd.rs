@@ -8,14 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mdm_base_rust::bridge::plugin_loader::{
-    LoadedPlugin, PluginManifestEntry, blob_backend_connect, db_backend, es_backend, host_context,
-    load_manifest, load_scanned, resolve_plugins_dir,
+    LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
+    host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras, InMemoryKV, LoaderShared,
-    PluginInfo, SchemaRegistry,
+    Bridge, BusBackendRegistry, DataAccessor, DbBackendRegistry, Dialect, EsBackend, Extras,
+    InMemoryKV, LoaderShared, PluginInfo, SchemaRegistry,
 };
-use mdm_base_rust::bridge::broker::build_broker;
 use mdm_base_rust::config::{self, Config};
 use mdm_server::actor::JsActor;
 use mdm_server::routes;
@@ -142,7 +141,11 @@ pub async fn start(
     };
     // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
     // 缺省进程内 Bus；池内所有 Bridge 注入同一 Arc<dyn EventBroker>，WS 订阅与任意 handler 发布互通。
-    let bus = build_broker(&cfg.broker)
+    // 插件 bus 工厂（kafka/rabbitmq，Task 4.3）已在 build_registries 注册；未装插件而声明
+    // 对应 kind → "unknown broker kind" 明确报错（不再退化/报 feature 指引）。
+    let bus = registries
+        .bus
+        .connect(&cfg.broker)
         .await
         .map_err(|e| format!("broker: {e}"))?;
     // 路由表：dev 启动内省 .route 声明（设计 §2）；release 聚合 dist/manifests.yaml（spec §3）。
@@ -336,7 +339,7 @@ pub async fn connect_dbs(
 }
 
 /// 装配产物：插件注册的后端槽位（es 键选单后端 + db 认领式注册表 + blob 键选
-/// 单后端 vtable 槽；bus/kv 随 4.3-4.4）。
+/// 单后端 vtable 槽 + bus 键选注册表；kv 随 4.4）。
 #[derive(Default)]
 pub struct Registries {
     pub es: Option<Arc<dyn EsBackend>>,
@@ -344,6 +347,8 @@ pub struct Registries {
     /// 插件 blob vtable（Task 4.2：单槽位，多 blob 插件注册冲突 fail fast；s3 驱动
     /// 经它 connect，装配期逐后端调用）。
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
+    /// bus 键选注册表（Task 4.3：内置 local + 插件 kafka/rabbitmq 工厂；kind 冲突 fail fast）。
+    pub bus: BusBackendRegistry,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -363,6 +368,8 @@ fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
 /// db 为认领式：内置 sqlite/memory 打底 + 每个插件 db 工厂注册（scheme 交集冲突 → fail fast）。
 /// blob 为键选式单后端 vtable 槽：多个 blob 插件冲突 fail fast；「s3 驱动但无 blob 插件」
 /// 在 assemble_blobs 逐后端判定（driver != local 且无插件 → fail fast）。
+/// bus 为键选式注册表：内置 local 打底 + 每个插件 bus 工厂注册（kind 冲突 fail fast；
+/// kafka/rabbitmq kind 未装插件 → "unknown broker kind" 明确报错）。
 fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries, String> {
     let es_plugins: Vec<&LoadedPlugin> =
         loaded.iter().filter(|p| p.registrations.es.is_some()).collect();
@@ -386,7 +393,13 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register blob backend".to_string());
     }
     let blob = blob_plugins.first().and_then(|p| p.registrations.blob);
-    Ok(Registries { es, dbs, blob })
+    let mut bus = BusBackendRegistry::builtin();
+    for p in loaded {
+        if let Some(be) = bus_backend(p) {
+            bus.register(be).map_err(|e| format!("plugins bus register: {e}"))?;
+        }
+    }
+    Ok(Registries { es, dbs, blob, bus })
 }
 
 /// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
@@ -998,5 +1011,72 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(e.contains("bucket required"), "{e}");
+    }
+
+    /// 编译 oj-bus-kafka 产物路径（全进程一次；rdkafka 首次编译慢，OnceLock 缓存）。
+    fn bus_kafka_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-bus-kafka"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-bus-kafka");
+            assert!(status.success(), "oj-bus-kafka build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_bus_kafka.{ext}"))
+        })
+        .clone()
+    }
+
+    /// 真实 oj-bus-kafka 插件装配 → Registries.bus 注册 kind "kafka"（kind 由插件名
+    /// 去 "bus-" 前缀推断）。connect 需真 broker，此处只验证注册与 kind 键选。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bus_plugin_wires_kind() {
+        let t = tmpdir("sc-busplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(bus_kafka_plugin_artifact(), pdir.join(plugin_file("bus-kafka"))).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins = Some(vec!["bus-kafka".into()]);
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "bus-kafka");
+        let kinds = r.bus.kinds();
+        assert!(kinds.iter().any(|k| k == "kafka"), "kind not registered: {kinds:?}");
+        // 本地 kind 仍内置
+        assert!(kinds.iter().any(|k| k == "local"), "{kinds:?}");
+    }
+
+    /// broker.kind=kafka 但插件未装 → "unknown broker kind"（列出已知 kind，快速失败）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn kafka_declared_without_plugin_unknown_kind() {
+        let t = tmpdir("sc-busplug-none");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+            kind: "kafka".into(),
+            ..Default::default()
+        };
+        let e = r
+            .bus
+            .connect(&Some(broker_cfg))
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("unknown broker kind 'kafka'"), "{e}");
     }
 }

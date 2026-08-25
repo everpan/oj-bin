@@ -155,7 +155,8 @@ pub struct EsCfg {
 /// - kafka：`brokers`（逗号分隔 bootstrap servers，必需）、`group`（消费组，默认 "oj-bus"）、
 ///   `topic_prefix`（物理 topic 前缀，可选）。
 /// - rabbitmq：`url`（amqp URL，或取 `brokers[0]`）、`topic_prefix`（交换名，默认 "oj-bus"）。
-#[derive(Debug, Deserialize, Default)]
+// Serialize：装配层经 cfg JSON 透传给 bus 插件（Task 4.3，spec §3 按值传入）。
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct BrokerCfg {
     pub kind: String,

@@ -57,12 +57,13 @@ pub struct PluginManifestEntry {
     pub semver_pin: Option<String>,
 }
 
-/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；bus/kv 槽位随 4.3-4.4 加入）。
+/// init 后宿主取得的各轴工厂槽位（未实现轴为 None；kv 槽位随 4.4 加入）。
 #[derive(Default)]
 pub struct Registrations {
     pub es: Option<&'static oj_plugin_ffi::EsBackendVtable>, // Task 3.3 起填
     pub db: Option<&'static oj_plugin_ffi::DataAccessorVtable>, // Task 4.1 起填
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>, // Task 4.2 起填
+    pub bus: Option<&'static oj_plugin_ffi::EventBrokerVtable>, // Task 4.3 起填
 }
 
 pub struct LoadedPlugin {
@@ -118,6 +119,15 @@ pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBack
     loaded.registrations.db.map(|vt| {
         Arc::new(super::ffi::FfiDbBackend::new(&loaded.descriptor.name[..], vt))
             as Arc<dyn crate::bridge::DbBackend>
+    })
+}
+
+/// 从已加载插件的 bus 注册槽构造 core 工厂（kind 由插件名去 "bus-" 前缀推断，
+/// Task 4.3；connect 时经 vtable 产 FfiEventBroker）。
+pub fn bus_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::BusBackend>> {
+    loaded.registrations.bus.map(|vt| {
+        Arc::new(super::ffi::FfiBusBackend::new(&loaded.descriptor.name[..], vt))
+            as Arc<dyn crate::bridge::BusBackend>
     })
 }
 
@@ -202,7 +212,8 @@ static CURRENT_PLUGIN: Mutex<Option<String>> = Mutex::new(None);
 pub fn host_context() -> RArc<HostContext> {
     static CTX: Mutex<Option<RArc<HostContext>>> = Mutex::new(None);
     let mut g = CTX.lock().unwrap();
-    g.get_or_insert_with(|| RArc::new(HostContext { log: host_log })).clone()
+    g.get_or_insert_with(|| RArc::new(HostContext { log: host_log, deliver: super::ffi::host_deliver }))
+        .clone()
 }
 
 extern "C" fn host_log(level: u8, msg: RString) {
@@ -283,7 +294,8 @@ fn load_one(
 
     // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
     let raw = (descriptor.register)();
-    let registrations = Registrations { es: raw.es(), db: raw.db(), blob: raw.blob() };
+    let registrations =
+        Registrations { es: raw.es(), db: raw.db(), blob: raw.blob(), bus: raw.bus() };
 
     Ok(LoadedPlugin { descriptor, registrations })
 }

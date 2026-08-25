@@ -11,6 +11,7 @@ extern "C" fn no_registrations() -> PluginRegistrations {
 }
 
 extern "C" fn noop_log(_level: u8, _msg: RString) {}
+extern "C" fn noop_deliver(_topic: RString, _payload: RString) {}
 
 fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
     assert_eq!(&cfg[..], "{}");
@@ -32,7 +33,7 @@ fn entry_macro_generates_two_symbols_and_abi_matches() {
 
 #[test]
 fn init_roundtrip_ok() {
-    let host = RArc::new(HostContext { log: noop_log });
+    let host = RArc::new(HostContext { log: noop_log, deliver: noop_deliver });
     let r = oj_plugin_init(host, RString::from("{}"));
     match std::result::Result::from(r) {
         Ok(d) => {
