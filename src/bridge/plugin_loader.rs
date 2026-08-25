@@ -220,7 +220,11 @@ fn load_one(
         }
     }
 
-    Ok(LoadedPlugin { descriptor, registrations: Registrations::default() })
+    // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
+    let raw = (descriptor.register)();
+    let registrations = Registrations { es: raw.es() };
+
+    Ok(LoadedPlugin { descriptor, registrations })
 }
 
 fn file_stem_name(path: &Path) -> String {

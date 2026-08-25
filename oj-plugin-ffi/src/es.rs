@@ -3,6 +3,7 @@
 
 use crate::{FfiFuture, RString};
 
+#[stabby::stabby]
 #[repr(C)]
 pub struct EsBackendVtable {
     pub search: extern "C" fn(handle: u64, index: RString, body: RString) -> FfiFuture,

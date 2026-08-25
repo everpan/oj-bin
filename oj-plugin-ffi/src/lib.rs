@@ -39,6 +39,27 @@ pub struct PluginDescriptor {
     pub abi_version: u32,
     /// 构建指纹（诊断用，不匹配仅告警）。
     pub fingerprint: RString,
+    /// 注册回调：宿主在 init 返回后立即调用取得各轴 vtable 槽位（spec §3，
+    /// 全部工厂注册须在 init 调用窗口内完成——槽位指向的静态表在 init 时就绪）。
+    pub register: extern "C" fn() -> PluginRegistrations,
+}
+
+/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。db/blob/bus/kv 槽位随阶段 4 加入，
+/// 加字段 = ABI bump）。
+#[stabby::stabby]
+#[repr(C)]
+pub struct PluginRegistrations {
+    pub es: *const EsBackendVtable,
+}
+
+impl PluginRegistrations {
+    pub fn none() -> Self {
+        Self { es: std::ptr::null() }
+    }
+
+    pub fn es(&self) -> Option<&'static EsBackendVtable> {
+        unsafe { self.es.as_ref() }
+    }
 }
 
 /// 宿主回调集（RArc 共享所有权传入，进程级有效；不提供 registry lookup——插件互不可见）。

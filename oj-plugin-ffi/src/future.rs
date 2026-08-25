@@ -8,6 +8,7 @@
 use crate::{RBytes, RResult, RString};
 use std::ffi::c_void;
 
+#[stabby::stabby]
 #[repr(C)]
 pub struct FfiFuture {
     /// 插件侧共享状态（opaque）。
