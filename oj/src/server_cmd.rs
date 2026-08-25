@@ -116,23 +116,15 @@ pub async fn start(
         }
         None => None,
     };
-    // blob（OJ-5）：config blob: 段存在即启用。local root 相对 config_dir 绝对化；
-    // s3 bucket/region 缺失 fail-fast（S3Blob::new 内校验）。
-    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> = match &cfg.blob {
+    // blob（OJ-5 + 命名多后端）：blob: 段存在即启用；backends.<name> 命名多后端，
+    // 旧平铺格式 = default 单后端（entries() 归一）。配置声明即必须装配成功（fail fast）。
+    let blobs: Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> = match &cfg.blob {
         None => None,
-        Some(c) if c.driver == "local" => {
-            let root = Path::new(&c.root);
-            let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
-            Some(Arc::new(
-                mdm_base_rust::bridge::LocalBlob::new(&root, &base)
-                    .map_err(|e| format!("blob: {e}"))?,
-            ))
-        }
-        Some(c) if c.driver == "s3" => Some(Arc::new(
-            mdm_base_rust::bridge::S3Blob::new(c).map_err(|e| format!("blob: {e}"))?,
-        )),
-        Some(c) => return Err(format!("blob.driver must be local|s3, got {:?}", c.driver)),
+        Some(section) => Some(assemble_blobs(section, config_dir, &base)?),
     };
+    // 下载路由仅服务名为 default 的后端（spec §2 裁决；Task 1.3 钉死字节一致回归）。
+    let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> =
+        blobs.as_ref().and_then(|r| r.default());
     // ES（OJ-6）：config es: 块存在即注入 EsClient；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
     let es: Option<Arc<dyn mdm_base_rust::bridge::EsBackend>> = cfg.es.as_ref().map(|c| Arc::new(EsClient::new(c.endpoint.clone())) as Arc<dyn mdm_base_rust::bridge::EsBackend>);
     // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
@@ -150,7 +142,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blobs: blob_registry(blob.clone()), es: es.clone(), bus: Some(bus.clone()) },
+                Extras { blobs: blobs.clone(), es: es.clone(), bus: Some(bus.clone()) },
             )
         }
     };
@@ -271,15 +263,32 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("resolve {s}: no addresses"))
 }
 
-/// 单后端 blob 装配为注册表（阶段 0：至多一个 "default"）。
-fn blob_registry(
-    blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>>,
-) -> Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> {
-    blob.map(|b| {
-        let mut r = mdm_base_rust::bridge::blob::BlobRegistry::new();
-        r.register("default", b).map_err(|e| format!("blob registry: {e}")).unwrap();
-        Arc::new(r)
-    })
+/// blob 命名多后端装配：逐条目构造（local root 相对 config_dir 绝对化；
+/// s3 字段校验在 S3Blob::new）；配置声明即必须成功注册，缺一启动期报错（fail fast，spec §2）。
+fn assemble_blobs(
+    section: &config::BlobSection,
+    config_dir: &Path,
+    base: &str,
+) -> Result<Arc<mdm_base_rust::bridge::blob::BlobRegistry>, String> {
+    let mut r = mdm_base_rust::bridge::blob::BlobRegistry::new();
+    for (name, c) in section.entries()? {
+        let backend: Arc<dyn mdm_base_rust::bridge::BlobBackend> = match c.driver.as_str() {
+            "local" => {
+                let root = Path::new(&c.root);
+                let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
+                Arc::new(
+                    mdm_base_rust::bridge::LocalBlob::new(&root, base)
+                        .map_err(|e| format!("blob '{name}': {e}"))?,
+                )
+            }
+            "s3" => Arc::new(
+                mdm_base_rust::bridge::S3Blob::new(&c).map_err(|e| format!("blob '{name}': {e}"))?,
+            ),
+            other => return Err(format!("blob '{name}': driver must be local|s3, got {other:?}")),
+        };
+        r.register(&name, backend).map_err(|e| format!("blob '{name}': {e}"))?;
+    }
+    Ok(Arc::new(r))
 }
 
 /// 逐 db 开库（server/build 共用）：经注册表按 scheme 认领，错误文案带库名。
@@ -394,6 +403,23 @@ mod tests {
         }
         // 未知 scheme 拒绝
         assert!(reg.connect("oracle://x", &t.0).await.is_err());
+    }
+
+    #[test]
+    fn assemble_blobs_multi_local_and_unknown_driver() {
+        let t = tmpdir("sc-blob");
+        let section: config::BlobSection =
+            serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
+                .unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api").unwrap();
+        assert!(r.default().is_some() && r.get("img").is_some());
+        // local root 相对 config_dir 绝对化并创建
+        assert!(t.0.join("a").is_dir() && t.0.join("b").is_dir());
+        // 未知 driver：错误带后端名
+        let bad: config::BlobSection =
+            serde_yaml::from_str("backends:\n  x:\n    driver: ghost\n").unwrap();
+        let e = assemble_blobs(&bad, &t.0, "/v1/api").err().unwrap_or_default();
+        assert!(e.contains("'x'") && e.contains("ghost"), "{e}");
     }
 
     #[tokio::test]

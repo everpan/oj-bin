@@ -243,8 +243,7 @@ impl BlobBackend for S3Blob {
     }
 }
 
-/// blob 轴注册表（键选式，spec §2）。阶段 0 仅支持名为 "default" 的至多一个后端；
-/// 阶段 1 放开命名多后端。注册全部发生在装配期（&mut self），装进 Arc 后不可变。
+/// blob 轴注册表（键选式，命名多后端，spec §2）。注册全部发生在装配期（&mut self），装进 Arc 后不可变。
 pub struct BlobRegistry {
     inner: crate::bridge::NamedRegistry<dyn BlobBackend>,
 }
@@ -254,13 +253,9 @@ impl BlobRegistry {
     pub fn new() -> Self {
         Self { inner: crate::bridge::NamedRegistry::new() }
     }
-    /// 阶段 0：name 必须 == "default"，否则 Err；重名 fail fast（NamedRegistry 语义）。
+    /// 任意名字可注册；重名 fail fast（NamedRegistry 语义）。
+    /// 配置声明了名字但装配时无对应后端 → 启动期报错（装配层职责，spec §2）。
     pub fn register(&mut self, name: &str, b: Arc<dyn BlobBackend>) -> BridgeResult<()> {
-        if name != "default" {
-            return Err(
-                format!("blob registry: only 'default' backend is supported (got '{name}')").into(),
-            );
-        }
         self.inner.register(name, b)
     }
     pub fn default(&self) -> Option<Arc<dyn BlobBackend>> {
@@ -356,19 +351,18 @@ pub async fn op_blob_content_type(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn blob_registry_default_only_in_phase0() {
+    fn blob_registry_multi_backend_and_duplicate_fails() {
         let root = std::env::temp_dir().join(format!("oj-blobreg-{}", std::process::id()));
         let mk = || Arc::new(LocalBlob::new(&root, "/v1/api").unwrap()) as Arc<dyn BlobBackend>;
         let mut r = BlobRegistry::new();
         assert!(r.default().is_none());
-        // 阶段 0：仅 default 可注册
         r.register("default", mk()).unwrap();
+        r.register("img", mk()).unwrap();
         assert!(r.default().is_some());
-        assert_eq!(r.names(), vec!["default".to_string()]);
-        // 非 default 拒绝（阶段 1 放开）
-        assert!(r.register("img", mk()).is_err());
+        assert!(r.get("img").is_some());
+        assert_eq!(r.names(), vec!["default".to_string(), "img".to_string()]);
         // 重名 fail fast
-        assert!(r.register("default", mk()).is_err());
+        assert!(r.register("img", mk()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -37,7 +37,7 @@ impl Default for ServerCfg {
 }
 
 /// 对象存储（OJ-5）：driver local|s3；local root 相对 config 目录。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BlobCfg {
     pub driver: String,
@@ -49,6 +49,80 @@ pub struct BlobCfg {
     pub secret_key: Option<String>,
     /// MinIO 等路径风格访问。
     pub path_style: bool,
+}
+
+/// blob 段（spec §2 命名多后端）：平铺字段 = 旧单后端语法糖（等价 backends.default）；
+/// `backends` 命名多后端。两者并存且平铺非默认 → 歧义报错（fail fast）。
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct BlobSection {
+    pub driver: String,
+    pub root: String,
+    pub endpoint: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub path_style: bool,
+    /// 命名多后端：`blob.backends.<name>`。
+    pub backends: HashMap<String, BlobCfg>,
+}
+
+impl Default for BlobSection {
+    /// 平铺默认值与 BlobCfg 对齐（driver "local"/root "uploads"），
+    /// 否则无法区分「未写平铺」与「写了默认平铺」（entries 歧义判定依赖）。
+    fn default() -> Self {
+        let d = BlobCfg::default();
+        Self {
+            driver: d.driver,
+            root: d.root,
+            endpoint: None,
+            bucket: None,
+            region: None,
+            access_key: None,
+            secret_key: None,
+            path_style: false,
+            backends: HashMap::new(),
+        }
+    }
+}
+
+impl BlobSection {
+    /// 归一为命名后端表：backends 非空优先（平铺非默认并存 → Err 歧义）；
+    /// 否则平铺字段 = default 单后端（旧格式兼容）。
+    pub fn entries(&self) -> Result<HashMap<String, BlobCfg>, String> {
+        let d = BlobCfg::default();
+        let flat_used = self.driver != d.driver
+            || self.root != d.root
+            || self.endpoint.is_some()
+            || self.bucket.is_some()
+            || self.region.is_some()
+            || self.access_key.is_some()
+            || self.secret_key.is_some()
+            || self.path_style;
+        if !self.backends.is_empty() {
+            if flat_used {
+                return Err(
+                    "blob: flat fields and backends: are mutually exclusive (use backends.default for the default backend)"
+                        .into(),
+                );
+            }
+            return Ok(self.backends.clone());
+        }
+        Ok(HashMap::from([(
+            "default".to_string(),
+            BlobCfg {
+                driver: self.driver.clone(),
+                root: self.root.clone(),
+                endpoint: self.endpoint.clone(),
+                bucket: self.bucket.clone(),
+                region: self.region.clone(),
+                access_key: self.access_key.clone(),
+                secret_key: self.secret_key.clone(),
+                path_style: self.path_style,
+            },
+        )]))
+    }
 }
 
 impl Default for BlobCfg {
@@ -145,7 +219,7 @@ pub struct Config {
     /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
     pub auth: Option<AuthCfg>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
-    pub blob: Option<BlobCfg>,
+    pub blob: Option<BlobSection>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
     pub es: Option<EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
@@ -238,6 +312,59 @@ mod tests {
         std::fs::write(dir.join("cfg.yaml"), "tenant:\n  enable: true\n  header_key: X-ACCT\n").unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_backends_named_sections_parse() {
+        let dir = std::env::temp_dir().join(format!("ojcfgbb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "blob:\n",
+                "  backends:\n",
+                "    default:\n",
+                "      driver: local\n",
+                "      root: uploads\n",
+                "    img:\n",
+                "      driver: s3\n",
+                "      bucket: b\n",
+                "      region: r\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let entries = c.blob.expect("some").entries().unwrap();
+        assert!(entries.contains_key("default") && entries.contains_key("img"));
+        assert_eq!(entries["img"].bucket.as_deref(), Some("b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_flat_and_backends_coexist_is_ambiguous_error() {
+        let dir = std::env::temp_dir().join(format!("ojcfgab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "blob:\n  driver: s3\n  bucket: b\n  region: r\n  backends:\n    default:\n      driver: local\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let e = c.blob.expect("some").entries().err().unwrap_or_default();
+        assert!(e.contains("mutually exclusive"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_flat_legacy_maps_to_default_entry() {
+        let dir = std::env::temp_dir().join(format!("ojcfglg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg.yaml"), "blob:\n  driver: local\n  root: up2\n").unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let entries = c.blob.expect("some").entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries["default"].root, "up2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
