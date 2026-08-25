@@ -20,32 +20,10 @@ use super::bus::EventBroker;
 use super::BridgeResult;
 use crate::config::BrokerCfg;
 
-/// 按配置构造事件 broker。
-///
-/// - `None` 或 `kind` 为空 / "local" → 进程内 `Bus`（零配置、默认行为，保持现状）。
-/// - "kafka" / "rabbitmq" → 对应实现；若未启用对应 feature → Err（装配 fail-fast）。
+/// 按配置构造事件 broker（薄包装：BusBackendRegistry::builtin().connect，签名不变，
+/// 调用点零改动）。kind 查表语义见 `super::bus_backend`。
 pub async fn build_broker(cfg: &Option<BrokerCfg>) -> BridgeResult<Arc<dyn EventBroker>> {
-    match cfg {
-        None => Ok(Arc::new(super::bus::Bus::new())),
-        Some(c) => match c.kind.as_str() {
-            "" | "local" => Ok(Arc::new(super::bus::Bus::new())),
-            #[cfg(feature = "kafka")]
-            "kafka" => Ok(Arc::new(kafka::KafkaBroker::new(c).await?)),
-            #[cfg(feature = "rabbitmq")]
-            "rabbitmq" => Ok(Arc::new(rabbitmq::RabbitMqBroker::new(c).await?)),
-            #[cfg(not(feature = "kafka"))]
-            "kafka" => Err(
-                "broker kind 'kafka' requires the 'kafka' cargo feature (build with --features kafka)"
-                    .into(),
-            ),
-            #[cfg(not(feature = "rabbitmq"))]
-            "rabbitmq" => Err(
-                "broker kind 'rabbitmq' requires the 'rabbitmq' cargo feature (build with --features rabbitmq)"
-                    .into(),
-            ),
-            other => Err(format!("unknown broker kind: {other}").into()),
-        },
-    }
+    super::bus_backend::BusBackendRegistry::builtin().connect(cfg).await
 }
 
 #[cfg(test)]
