@@ -1196,21 +1196,21 @@ impl EsBackend for FfiEsBackend {
 impl Drop for FfiEsBackend { fn drop(&mut self) { (self.vtable.close)(self.handle); } }
 ```
 
-- [ ] **Step 1: 写失败测试（vtable mock）**——构造一个 Rust 函数指针填充的假 vtable（search 返回固定 JSON、close 置 AtomicBool），断言：FfiEsBackend.search 转发参数正确并反序列化返回值；Drop 时 close 被调；FfiFuture 返回 error 时映射为 BridgeResult::Err。
+- [x] **Step 1: 写失败测试（vtable mock）**——构造一个 Rust 函数指针填充的假 vtable（search 返回固定 JSON、close 置 AtomicBool），断言：FfiEsBackend.search 转发参数正确并反序列化返回值；Drop 时 close 被调；FfiFuture 返回 error 时映射为 BridgeResult::Err。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p mdm-base-rust ffi -- --skip infinite_loop`
 Expected: FAIL
 
-- [ ] **Step 3: 实现** + `await_ffi` 桥（轮询/oneshot 形态按 S.2 记录）
+- [x] **Step 3: 实现** + `await_ffi` 桥（轮询/oneshot 形态按 S.2 记录）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p mdm-base-rust ffi -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
