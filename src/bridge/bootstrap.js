@@ -103,14 +103,16 @@ globalThis.kv = {
   incr: (key) => op_kv_incr(String(key)),
 };
 
-// ----- blob: object storage (put/get/del/url; contentType via http blob route) -----
-globalThis.blob = {
-  put: (key, bytes, ct) => op_blob_put(String(key), bytes, ct === undefined ? null : String(ct)),
-  get: (key) => op_blob_get(String(key)),
-  del: (key) => op_blob_del(String(key)),
-  url: (key) => op_blob_url(String(key)),
-  contentType: (key) => op_blob_content_type(String(key)),
-};
+// ----- blob: object storage (blob(name) named multi-backend; bare call = blob("default")) -----
+globalThis.blob = (name) => ({
+  put: (key, bytes, ct) => op_blob_put(String(name), String(key), bytes, ct === undefined ? null : String(ct)),
+  get: (key) => op_blob_get(String(name), String(key)),
+  del: (key) => op_blob_del(String(name), String(key)),
+  url: (key) => op_blob_url(String(name), String(key)),
+  contentType: (key) => op_blob_content_type(String(name), String(key)),
+});
+// back-compat: blob.put(...) === blob("default").put(...)
+Object.assign(globalThis.blob, globalThis.blob("default"));
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 globalThis.ws = {

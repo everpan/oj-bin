@@ -277,23 +277,29 @@ pub fn registry_with_default(b: Arc<dyn BlobBackend>) -> Arc<BlobRegistry> {
     Arc::new(r)
 }
 
-fn backend(state: &OpState) -> Result<Arc<dyn BlobBackend>, JsErrorBox> {
-    state
-        .borrow::<Arc<StableState>>()
-        .blobs
-        .default()
-        .ok_or_else(|| JsErrorBox::generic("blob not configured (config blob: section missing)"))
+/// 按名取后端（spec §2）：default 缺失保留旧文案；其余名字缺失报「blob backend '<name>'
+/// not configured」（首次调用期报错——配置声明但装配失败在启动期已被 assemble_blobs 拦住）。
+fn backend_named(state: &OpState, name: &str) -> Result<Arc<dyn BlobBackend>, JsErrorBox> {
+    let reg = &state.borrow::<Arc<StableState>>().blobs;
+    reg.get(name).ok_or_else(|| {
+        JsErrorBox::generic(if name == "default" {
+            "blob not configured (config blob: section missing)".to_string()
+        } else {
+            format!("blob backend '{name}' not configured (config blob.backends.{name} missing)")
+        })
+    })
 }
 
 /// blob.put(key, bytes, contentType?)。
 #[op2]
 pub async fn op_blob_put(
     state: Rc<RefCell<OpState>>,
+    #[string] name: String,
     #[string] key: String,
     #[buffer] bytes: JsBuffer,
     #[string] content_type: Option<String>,
 ) -> Result<bool, JsErrorBox> {
-    let b = { backend(&state.borrow())? };
+    let b = { backend_named(&state.borrow(), &name)? };
     b.put(&key, &bytes, content_type.as_deref())
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
@@ -305,9 +311,10 @@ pub async fn op_blob_put(
 #[buffer]
 pub async fn op_blob_get(
     state: Rc<RefCell<OpState>>,
+    #[string] name: String,
     #[string] key: String,
 ) -> Result<Vec<u8>, JsErrorBox> {
-    let b = { backend(&state.borrow())? };
+    let b = { backend_named(&state.borrow(), &name)? };
     b.get(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
@@ -315,9 +322,10 @@ pub async fn op_blob_get(
 #[op2]
 pub async fn op_blob_del(
     state: Rc<RefCell<OpState>>,
+    #[string] name: String,
     #[string] key: String,
 ) -> Result<bool, JsErrorBox> {
-    let b = { backend(&state.borrow())? };
+    let b = { backend_named(&state.borrow(), &name)? };
     b.del(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))?;
     Ok(true)
 }
@@ -327,9 +335,10 @@ pub async fn op_blob_del(
 #[string]
 pub async fn op_blob_url(
     state: Rc<RefCell<OpState>>,
+    #[string] name: String,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
-    let b = { backend(&state.borrow())? };
+    let b = { backend_named(&state.borrow(), &name)? };
     b.url(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
@@ -338,9 +347,10 @@ pub async fn op_blob_url(
 #[string]
 pub async fn op_blob_content_type(
     state: Rc<RefCell<OpState>>,
+    #[string] name: String,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
-    let b = { backend(&state.borrow())? };
+    let b = { backend_named(&state.borrow(), &name)? };
     let ct = b
         .content_type(&key)
         .await
@@ -470,6 +480,55 @@ mod tests {
             path_style: true,
         };
         assert!(S3Blob::new(&missing_region).is_err());
+    }
+
+    /// blob(name) 工厂：命名分发 + default 兼容旧调用 + 未配置名首次调用期报错（spec §2）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_named_factory_dispatch() {
+        let root_d = tmp_root();
+        let root_i = tmp_root();
+        let mut reg = BlobRegistry::new();
+        reg.register("default", Arc::new(LocalBlob::new(&root_d, "/v1/api").unwrap())).unwrap();
+        reg.register("img", Arc::new(LocalBlob::new(&root_i, "/v1/api").unwrap())).unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras { blobs: Some(Arc::new(reg)), ..Default::default() },
+        );
+        // 命名分发：img 与 default 互不串（同名 key 不同内容）
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    await blob("img").put("k.txt", new Uint8Array([73, 77, 71]), "text/plain");
+                    await blob.put("k.txt", new Uint8Array([68, 69, 70]), "text/plain");
+                    const img = Array.from(await blob("img").get("k.txt")).join(",");
+                    const def = Array.from(await blob.get("k.txt")).join(",");
+                    json.ok({ img, def });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["img"], "73,77,71", "{v}");
+        assert_eq!(v["data"]["def"], "68,69,70", "{v}");
+        assert!(root_i.join("k.txt").is_file() && root_d.join("k.txt").is_file());
+        // 未配置名：首次调用期报错（name 入文案）
+        let cap = b
+            .run_with(
+                r#"(async () => { await blob("ghost").get("k"); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("blob backend 'ghost' not configured"), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]
