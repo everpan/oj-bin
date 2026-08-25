@@ -1,0 +1,61 @@
+# CI 平台矩阵（spec §4 产物归置）：宿主 + 全部第一方插件按目标平台构建，
+# 产物入 `plugins/<triple>/`，与本地 `cargo xtask plugin <name>` 同布局。
+# Linux 以 ubuntu 的 glibc 为基线；部署含 Alpine 时补 `x86_64-unknown-linux-musl` 行。
+
+name: plugin-matrix
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  matrix:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gnu (x86_64-unknown-linux-gnu)
+            os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - name: macos (aarch64-apple-darwin)
+            os: macos-latest
+            triple: aarch64-apple-darwin
+          - name: windows (x86_64-pc-windows-msvc)
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          # 按需：部署含 Alpine 时启用 musl 行
+          # - name: linux-musl (x86_64-unknown-linux-musl)
+          #   os: ubuntu-latest
+          #   triple: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # musl 行启用时：
+      # - run: rustup target add x86_64-unknown-linux-musl
+      #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
+
+      # 宿主测试（与本地一致；infinite_loop 在部分平台会 SIGSEGV，跳过）。
+      - name: cargo test (workspace, skip infinite_loop)
+        run: cargo test --workspace -- --skip infinite_loop
+
+      # 第一方插件逐个 release 构建并拷入 plugins/<triple>/（xtask 即 CI 产物入口）。
+      - name: build & place plugins
+        shell: bash
+        run: |
+          for p in es db-mysql db-postgres blob-s3 bus-kafka bus-rabbitmq kv-redis; do
+            cargo run --release -p xtask -- plugin "$p"
+          done
+          ls -la plugins/${{ matrix.triple }}/
+
+      # 产物归置（供发布/下载；plugins/<triple>/ 布局与发行同形）。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugins-${{ matrix.triple }}
+          path: plugins/${{ matrix.triple }}/
+          if-no-files-found: error

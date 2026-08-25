@@ -26,8 +26,6 @@ sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "macros",
     "any",
-    "mysql",
-    "postgres",
     "sqlite",
     "json",
 ] }
