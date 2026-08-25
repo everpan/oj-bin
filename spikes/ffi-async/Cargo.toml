@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["plugin", "host"]
+
+[profile.dev]
+panic = "unwind"
