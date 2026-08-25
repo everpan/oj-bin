@@ -28,6 +28,7 @@ mod fetch;
 mod accessor_sqlx;
 mod bus;
 pub mod blob;
+pub mod broker;
 mod http;
 mod inspector;
 mod json;
@@ -44,7 +45,7 @@ mod ws;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
-pub use bus::Bus;
+pub use bus::{Bus, EventBroker};
 pub use es::EsClient;
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
@@ -75,8 +76,9 @@ pub struct StableState {
     pub loader: Option<Arc<module_loader::LoaderShared>>,
     /// 可选能力扩展（OJ-5 blob / OJ-6 bus/es）：单一扩展点，后续只加字段。
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
-    /// 订阅发布总线（OJ-6）：server 装配共享一个 Bus 跨连接广播；缺省每 Bridge 自带空 Bus。
-    pub bus: Arc<bus::Bus>,
+    /// 事件总线（统一契约 `EventBroker`）：进程内 `Bus` 或分布式 Kafka/RabbitMQ；
+    /// server 装配共享一个跨连接广播；缺省每 Bridge 自带进程内 Bus。
+    pub bus: Arc<dyn bus::EventBroker>,
     /// ES 客户端（OJ-6）：es 配置存在时注入；否则 es.* 报 "es not configured"。
     pub es: Option<Arc<es::EsClient>>,
 }
@@ -85,8 +87,8 @@ pub struct StableState {
 #[derive(Default)]
 pub struct Extras {
     pub blob: Option<Arc<dyn blob::BlobBackend>>,
-    /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus。
-    pub bus: Option<Arc<bus::Bus>>,
+    /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus（进程内）。
+    pub bus: Option<Arc<dyn bus::EventBroker>>,
     /// Some = ES 客户端；None = es.* 未配置报错。
     pub es: Option<Arc<es::EsClient>>,
 }
@@ -153,6 +155,7 @@ deno_core::extension!(
         blob::op_blob_content_type,
         bus::op_bus_publish,
         bus::op_bus_subscribe,
+        bus::op_bus_kind,
         es::op_es_search,
         es::op_es_index,
         es::op_es_del,
@@ -827,6 +830,22 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["data"]["err"].as_str().unwrap().contains("WebSocket"), "{v}");
+    }
+
+    /// bus.kind()：进程内总线返回 "local"（分布式实现经 feature 启用）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bus_kind_op_returns_local() {
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"(async () => { const k = await bus.kind(); json.ok({ k }); })().catch((e) => json.fail(500, String(e)));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["k"], "local");
     }
 
     #[tokio::test(flavor = "current_thread")]

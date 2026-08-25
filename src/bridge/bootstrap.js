@@ -14,6 +14,7 @@ import {
   op_blob_content_type,
   op_bus_publish,
   op_bus_subscribe,
+  op_bus_kind,
   op_db_exec,
   op_db_has,
   op_db_query,
@@ -118,9 +119,12 @@ globalThis.ws = {
 };
 
 // ----- bus: publish/subscribe (WS sessions subscribe; any handler publishes broadcast frames) -----
+// kind() reports the active broker type ("local" | "kafka" | "rabbitmq") so handlers
+// can detect distributed-event capability.
 globalThis.bus = {
   publish: (topic, data) => op_bus_publish(String(topic), data === undefined ? null : data),
   subscribe: (topic) => op_bus_subscribe(String(topic)),
+  kind: () => op_bus_kind(),
 };
 
 // ----- es: Elasticsearch thin client (search/index/del; es not configured errors) -----

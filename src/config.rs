@@ -73,6 +73,24 @@ pub struct EsCfg {
     pub endpoint: String,
 }
 
+/// 事件 broker（分布式事件总线）：`broker:` 块存在即按 `kind` 启用对应实现。
+/// 缺省（无 `broker:` 段）= 进程内 `Bus`（零配置、保持现状）。
+///
+/// - `kind`：`"local"`（默认）/ `"kafka"` / `"rabbitmq"`。
+/// - kafka：`brokers`（逗号分隔 bootstrap servers，必需）、`group`（消费组，默认 "oj-bus"）、
+///   `topic_prefix`（物理 topic 前缀，可选）。
+/// - rabbitmq：`url`（amqp URL，或取 `brokers[0]`）、`topic_prefix`（交换名，默认 "oj-bus"）。
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct BrokerCfg {
+    pub kind: String,
+    #[serde(default)]
+    pub brokers: Vec<String>,
+    pub url: Option<String>,
+    pub group: Option<String>,
+    pub topic_prefix: Option<String>,
+}
+
 /// 多租户注入（OJ-3）：enable 后 handle() 从 header 提取租户 id 注入 http.tenantId。
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -130,6 +148,8 @@ pub struct Config {
     pub blob: Option<BlobCfg>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
     pub es: Option<EsCfg>,
+    /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
+    pub broker: Option<BrokerCfg>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -303,6 +323,33 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cfg.yaml"), "server: [broken").unwrap();
         assert!(load_from(&dir, Some("cfg.yaml")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broker_cfg_defaults_and_parse() {
+        // 未配置 → None（退化为进程内 Bus）
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.broker.is_none());
+        // broker: 段存在 → Some(kind/brokers/...)；缺省 brokers 为空、prefix None
+        let dir = std::env::temp_dir().join(format!("ojcfgbr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "broker:\n  kind: kafka\n  brokers: [127.0.0.1:9092, k2:9092]\n  topic_prefix: ev\n  group: g1\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let b = c.broker.expect("some");
+        assert_eq!(b.kind, "kafka");
+        assert_eq!(b.brokers, vec!["127.0.0.1:9092", "k2:9092"]);
+        assert_eq!(b.topic_prefix.as_deref(), Some("ev"));
+        assert_eq!(b.group.as_deref(), Some("g1"));
+        assert!(b.url.is_none());
+        // 空段缺省
+        let d = BrokerCfg::default();
+        assert_eq!(d.kind, "");
+        assert!(d.brokers.is_empty() && d.url.is_none() && d.group.is_none() && d.topic_prefix.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
