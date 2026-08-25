@@ -29,6 +29,10 @@ pub(crate) unsafe fn load_forget(path: &Path) -> Result<&'static Library, Plugin
 }
 
 /// loader 原始错误文本 → 错误分类（透出原文，spec §4）。
+///
+/// 启发式：仅按关键词粗分「平台不匹配」与「依赖解析失败」两类（macOS 文本文件等
+/// 非库文件会落到 DependencyResolution）。分类不影响 fail-fast 结论，仅影响报错文案，
+/// 故边界近似可接受（M-4 注明）。
 fn classify_load_error(path: &Path, e: impl std::fmt::Display) -> PluginLoadError {
     let text = e.to_string();
     let lower = text.to_lowercase();
@@ -39,6 +43,8 @@ fn classify_load_error(path: &Path, e: impl std::fmt::Display) -> PluginLoadErro
         || lower.contains("elf class")
         || lower.contains("wrong elf")
         || lower.contains("glibc")
+        || lower.contains("image") // macOS 非库文件（如文本/脚本）dlopen 报错含 "image"
+        || lower.contains("file too short") // 截断/非 ELF 文件
         || lower.contains("%1 is not a valid win32")
     {
         PluginLoadError::PlatformMismatch { path: path.to_path_buf(), detail: text }
@@ -92,8 +98,10 @@ use oj_plugin_ffi::{
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + yield_now；take→free→state 置 null）。
 /// poll 返回 -1 时也 take（错误细节在 take 的 Err 里）。
@@ -470,15 +478,25 @@ impl BusBackend for FfiBusBackend {
 /// broker 适配器：实现 core EventBroker。subscribe 本地注册 tx + 每 topic 至多一个
 /// 插件消费循环（vtable.subscribe 幂等去重）；插件收到消息经 host.deliver 上送 →
 /// 全局 DELIVER_TARGETS 按 topic 扇出（跨 actor/WS 共享语义与内置 Bus 一致）。
+///
+/// I-1 修复（接手点 A-1）：subscribe 全程持 `SUBSCRIBE_GATE`，vtable 失败回滚刚注册的
+/// 本通道（杜绝僵尸注册），且并发首次订阅同一新 topic 不再各自起消费循环（rabbitmq
+/// 每订阅者独享队列的重复投递）。drop 仅清本 broker 注册的目标（M-1）。
 pub struct FfiEventBroker {
     kind: &'static str,
     handle: u64,
     vtable: &'static EventBrokerVtable,
+    /// 本 broker 在 DELIVER_TARGETS 中注册的 (topic, sender)，drop 按归属清理（M-1）。
+    subs: StdMutex<Vec<(String, UnboundedSender<String>)>>,
 }
+
+/// 首次订阅新 topic 的并发门禁：保证 vtable.subscribe 的「注册 + 起消费循环」原子，
+/// 避免并发首次订阅同一新 topic 各起一个消费循环（rabbitmq 重复投递），并配合失败回滚。
+static SUBSCRIBE_GATE: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 impl FfiEventBroker {
     pub fn new(kind: &'static str, handle: u64, vtable: &'static EventBrokerVtable) -> Self {
-        Self { kind, handle, vtable }
+        Self { kind, handle, vtable, subs: StdMutex::new(Vec::new()) }
     }
 }
 
@@ -497,20 +515,40 @@ impl EventBroker for FfiEventBroker {
     }
 
     async fn subscribe(&self, topic: &str, tx: UnboundedSender<String>) -> BridgeResult<()> {
-        // 本地注册（同 channel 去重）；仅当该 topic 首次出现时起插件消费循环。
-        let start_consumer = {
+        // 全程持门禁：vtable.subscribe 是「本地注册 + 起消费循环」的原子单元；
+        // 失败回滚刚注册的通道，避免僵尸注册导致该 topic 静默丢失。
+        let _gate = SUBSCRIBE_GATE.lock().await;
+        let (is_new_topic, inserted) = {
             let mut g = DELIVER_TARGETS.lock().unwrap();
             let list = g.entry(topic.to_string()).or_default();
             let is_new_topic = list.is_empty();
-            if !list.iter().any(|t| t.same_channel(&tx)) {
-                list.push(tx);
-            }
-            is_new_topic
+            // 同 channel 去重（同一 tx 重复订阅不重复注册）。
+            let inserted = if !list.iter().any(|t| t.same_channel(&tx)) {
+                list.push(tx.clone());
+                true
+            } else {
+                false
+            };
+            (is_new_topic, inserted)
         };
-        if start_consumer {
+        if is_new_topic {
             let fut = (self.vtable.subscribe)(self.handle, RString::from(topic));
-            await_ffi(fut).await.map_err(|e| ffi_err("bus subscribe", e))?;
+            if let Err(e) = await_ffi(fut).await {
+                // 回滚：仅移除本次刚注册的本通道（列表空则删整条 topic），
+                // 不误伤其他订阅者。
+                if inserted {
+                    let mut g = DELIVER_TARGETS.lock().unwrap();
+                    if let Some(list) = g.get_mut(topic) {
+                        list.retain(|t| !t.same_channel(&tx));
+                        if list.is_empty() {
+                            g.remove(topic);
+                        }
+                    }
+                }
+                return Err(ffi_err("bus subscribe", e));
+            }
         }
+        self.subs.lock().unwrap().push((topic.to_string(), tx));
         Ok(())
     }
 }
@@ -518,8 +556,17 @@ impl EventBroker for FfiEventBroker {
 impl Drop for FfiEventBroker {
     fn drop(&mut self) {
         (self.vtable.close)(self.handle);
-        // 清理本 broker 注册的本地目标（topic 扇出表进程级共享；进程退出即回收）。
-        DELIVER_TARGETS.lock().unwrap().clear();
+        // M-1：仅清本 broker 注册的目标，不再整表清空（避免误伤其他 broker 订阅）。
+        let registered = std::mem::take(&mut *self.subs.lock().unwrap());
+        let mut g = DELIVER_TARGETS.lock().unwrap();
+        for (topic, tx) in registered {
+            if let Some(list) = g.get_mut(&topic) {
+                list.retain(|t| !t.same_channel(&tx));
+                if list.is_empty() {
+                    g.remove(&topic);
+                }
+            }
+        }
     }
 }
 
@@ -996,6 +1043,9 @@ mod adapter_tests {
     static BUS_PUBLISHED: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
     static BUS_SUBSCRIBES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     static BUS_CLOSED: AtomicU64 = AtomicU64::new(0);
+    /// TDD 开关：置位时 mock_bus_subscribe 先记录（模拟消费循环已起）再返回 Err，
+    /// 用于验证 I-1 失败回滚（无僵尸注册）。
+    static BUS_SUBSCRIBE_FAIL: AtomicBool = AtomicBool::new(false);
 
     extern "C" fn mock_bus_connect(cfg: RString) -> FfiFuture {
         *BUS_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
@@ -1006,7 +1056,11 @@ mod adapter_tests {
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_bus_subscribe(handle: u64, topic: RString) -> FfiFuture {
+        // 先记录（模拟插件侧已起消费循环），再按开关返回失败。
         BUS_SUBSCRIBES.lock().unwrap().push((handle, topic[..].to_string()));
+        if BUS_SUBSCRIBE_FAIL.swap(false, AtomicOrdering::SeqCst) {
+            return ready(Err("injected subscribe failure".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_bus_close(handle: u64) {
@@ -1086,6 +1140,52 @@ mod adapter_tests {
         let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
         broker.subscribe("u", tx2).await.unwrap(); // 不同 topic → 新消费
         assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2); // t 一次 + u 一次
+    }
+
+    /// I-1 TDD：首次订阅 vtable 失败 → 返回 Err 且无僵尸注册（host_deliver 后通道空）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_subscribe_failure_rolls_back_no_zombie() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        BUS_SUBSCRIBES.lock().unwrap().clear();
+        BUS_SUBSCRIBE_FAIL.store(false, AtomicOrdering::SeqCst);
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        BUS_SUBSCRIBE_FAIL.store(true, AtomicOrdering::SeqCst); // 注入失败
+        let res = broker.subscribe("t", tx).await;
+        assert!(res.is_err(), "subscribe must propagate vtable error");
+        // 无僵尸：回滚后该 topic 不应仍注册，host_deliver 不应扇出到通道。
+        host_deliver(RString::from("t"), RString::from(r#"{"x":1}"#));
+        assert!(rx.try_recv().is_err(), "zombie subscription must not deliver");
+        let g = DELIVER_TARGETS.lock().unwrap();
+        let empty = match g.get("t") {
+            None => true,
+            Some(list) => list.is_empty(),
+        };
+        assert!(empty, "rolled-back topic must leave no deliver target");
+    }
+
+    /// I-1 TDD：失败重试成功 → 消费循环被重新起（BUS_SUBSCRIBES 记录两次）+ 扇出可达。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_subscribe_retries_after_failure_and_fanout() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        BUS_SUBSCRIBES.lock().unwrap().clear();
+        BUS_SUBSCRIBE_FAIL.store(false, AtomicOrdering::SeqCst);
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // 首次失败（回滚本地注册，但插件侧消费循环已起 → 记一次）。
+        BUS_SUBSCRIBE_FAIL.store(true, AtomicOrdering::SeqCst);
+        assert!(broker.subscribe("t", tx.clone()).await.is_err());
+        // 重试成功。
+        BUS_SUBSCRIBE_FAIL.store(false, AtomicOrdering::SeqCst);
+        assert!(broker.subscribe("t", tx).await.is_ok());
+        // 消费循环被重新起：两次 subscribe 各记一次。
+        assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2);
+        // 扇出可达：host.deliver 经 DELIVER_TARGETS 扇到本通道。
+        host_deliver(RString::from("t"), RString::from(r#"{"x":1}"#));
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame, r#"{"x":1}"#);
     }
 
     #[test]
