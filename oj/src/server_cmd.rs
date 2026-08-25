@@ -150,7 +150,7 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blob: blob.clone(), es: es.clone(), bus: Some(bus.clone()) },
+                Extras { blobs: blob_registry(blob.clone()), es: es.clone(), bus: Some(bus.clone()) },
             )
         }
     };
@@ -269,6 +269,17 @@ fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("resolve {s}: {e}"))?
         .next()
         .ok_or_else(|| format!("resolve {s}: no addresses"))
+}
+
+/// 单后端 blob 装配为注册表（阶段 0：至多一个 "default"）。
+fn blob_registry(
+    blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>>,
+) -> Option<Arc<mdm_base_rust::bridge::blob::BlobRegistry>> {
+    blob.map(|b| {
+        let mut r = mdm_base_rust::bridge::blob::BlobRegistry::new();
+        r.register("default", b).map_err(|e| format!("blob registry: {e}")).unwrap();
+        Arc::new(r)
+    })
 }
 
 /// 逐 db 开库（server/build 共用）：经注册表按 scheme 认领，错误文案带库名。

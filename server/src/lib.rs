@@ -537,7 +537,7 @@ pub(crate) mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blob: Some(blob2.clone()), ..Default::default() },
+                Extras { blobs: Some(mdm_base_rust::bridge::blob::registry_with_default(blob2.clone())), ..Default::default() },
             )
         });
         let base = base.to_string();

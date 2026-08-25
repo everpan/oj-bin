@@ -243,11 +243,50 @@ impl BlobBackend for S3Blob {
     }
 }
 
+/// blob 轴注册表（键选式，spec §2）。阶段 0 仅支持名为 "default" 的至多一个后端；
+/// 阶段 1 放开命名多后端。注册全部发生在装配期（&mut self），装进 Arc 后不可变。
+pub struct BlobRegistry {
+    inner: crate::bridge::NamedRegistry<dyn BlobBackend>,
+}
+
+impl BlobRegistry {
+    // 不走 derive(Default)：getter default() 与 Default::default() 撞名。
+    pub fn new() -> Self {
+        Self { inner: crate::bridge::NamedRegistry::new() }
+    }
+    /// 阶段 0：name 必须 == "default"，否则 Err；重名 fail fast（NamedRegistry 语义）。
+    pub fn register(&mut self, name: &str, b: Arc<dyn BlobBackend>) -> BridgeResult<()> {
+        if name != "default" {
+            return Err(
+                format!("blob registry: only 'default' backend is supported (got '{name}')").into(),
+            );
+        }
+        self.inner.register(name, b)
+    }
+    pub fn default(&self) -> Option<Arc<dyn BlobBackend>> {
+        self.inner.get("default")
+    }
+    pub fn get(&self, name: &str) -> Option<Arc<dyn BlobBackend>> {
+        self.inner.get(name)
+    }
+    pub fn names(&self) -> Vec<String> {
+        self.inner.names().map(str::to_string).collect()
+    }
+}
+
+/// 装配/测试共用：单个后端注册为 "default" 的注册表。
+pub fn registry_with_default(b: Arc<dyn BlobBackend>) -> Arc<BlobRegistry> {
+    let mut r = BlobRegistry::new();
+    // 全新空注册表注册 default 必成功。
+    r.register("default", b).unwrap();
+    Arc::new(r)
+}
+
 fn backend(state: &OpState) -> Result<Arc<dyn BlobBackend>, JsErrorBox> {
     state
         .borrow::<Arc<StableState>>()
-        .blob
-        .clone()
+        .blobs
+        .default()
         .ok_or_else(|| JsErrorBox::generic("blob not configured (config blob: section missing)"))
 }
 
@@ -316,6 +355,23 @@ pub async fn op_blob_content_type(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blob_registry_default_only_in_phase0() {
+        let root = std::env::temp_dir().join(format!("oj-blobreg-{}", std::process::id()));
+        let mk = || Arc::new(LocalBlob::new(&root, "/v1/api").unwrap()) as Arc<dyn BlobBackend>;
+        let mut r = BlobRegistry::new();
+        assert!(r.default().is_none());
+        // 阶段 0：仅 default 可注册
+        r.register("default", mk()).unwrap();
+        assert!(r.default().is_some());
+        assert_eq!(r.names(), vec!["default".to_string()]);
+        // 非 default 拒绝（阶段 1 放开）
+        assert!(r.register("img", mk()).is_err());
+        // 重名 fail fast
+        assert!(r.register("default", mk()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     use serde_json::Value;
@@ -470,7 +526,7 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blob: Some(Arc::new(local)), ..Default::default() },
+            Extras { blobs: Some(registry_with_default(Arc::new(local))), ..Default::default() },
         );
         let cap = b
             .run_with(

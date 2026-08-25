@@ -144,6 +144,43 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 同一 broker 实例跨两个 Bridge 注入：经 B 的 JS 发布，A 侧订阅通道收到
+    /// （"同一已连接 broker 实例跨 actor 池与全部 WS 连接共享"语义回归，spec §2）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_broker_broadcasts_across_bridges() {
+        use crate::bridge::{Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry};
+        let bus = crate::bridge::broker::build_broker(&None).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        bus.subscribe("t", tx).await.unwrap();
+
+        let mk = |bus: &Arc<dyn EventBroker>| {
+            Bridge::with_dbs_and_loader(
+                std::collections::HashMap::from([(
+                    "default".to_string(),
+                    Arc::new(InMemoryAccessor::new()) as Arc<dyn crate::bridge::DataAccessor>,
+                )]),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                Extras { bus: Some(bus.clone()), ..Default::default() },
+            )
+        };
+        let _a = mk(&bus); // A 持同一实例（池内另一 actor）
+        let b = mk(&bus); // B 经 JS 发布
+        let cap = b
+            .run_with(
+                r#"(async () => { const n = await bus.publish("t", { v: 42 }); json.ok({ n }); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+        let got = rx.recv().await.unwrap();
+        assert!(got.contains("42"), "{got}");
+    }
+
     #[test]
     fn publish_to_subscriber_and_unknown_topic() {
         let bus = Bus::new();

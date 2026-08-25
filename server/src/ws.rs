@@ -318,7 +318,7 @@ mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blob: None, bus: Some(bus_actor.clone()), ..Default::default() },
+                Extras { blobs: None, bus: Some(bus_actor.clone()), ..Default::default() },
             )
         });
         let make_bridge = {
@@ -331,7 +331,7 @@ mod tests {
                     SchemaRegistry::new(),
                     false,
                     Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                    Extras { blob: None, bus: Some(bus.clone()), ..Default::default() },
+                    Extras { blobs: None, bus: Some(bus.clone()), ..Default::default() },
                 )
             }
         };
@@ -456,7 +456,7 @@ mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blob: None, bus: Some(bus2.clone()), ..Default::default() },
+                Extras { blobs: None, bus: Some(bus2.clone()), ..Default::default() },
             )
         };
         let addr = spawn(

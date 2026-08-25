@@ -78,8 +78,8 @@ pub struct StableState {
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
     pub loader: Option<Arc<module_loader::LoaderShared>>,
-    /// 可选能力扩展（OJ-5 blob / OJ-6 bus/es）：单一扩展点，后续只加字段。
-    pub blob: Option<Arc<dyn blob::BlobBackend>>,
+    /// blob 注册表（阶段 0 单后端形态：至多一个 "default"；阶段 1 命名多后端）。
+    pub blobs: Arc<blob::BlobRegistry>,
     /// 事件总线（统一契约 `EventBroker`）：进程内 `Bus` 或分布式 Kafka/RabbitMQ；
     /// server 装配共享一个跨连接广播；缺省每 Bridge 自带进程内 Bus。
     pub bus: Arc<dyn bus::EventBroker>,
@@ -90,7 +90,8 @@ pub struct StableState {
 /// bridge 可选能力注入（构造期一次）。
 #[derive(Default)]
 pub struct Extras {
-    pub blob: Option<Arc<dyn blob::BlobBackend>>,
+    /// None = 零后端（blob.* 报 notConfigured）。
+    pub blobs: Option<Arc<blob::BlobRegistry>>,
     /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus（进程内）。
     pub bus: Option<Arc<dyn bus::EventBroker>>,
     /// Some = ES 客户端；None = es.* 未配置报错。
@@ -261,7 +262,7 @@ impl Bridge {
                 .unwrap_or_default(),
             registry: Arc::new(registry),
             loader,
-            blob: extras.blob,
+            blobs: extras.blobs.unwrap_or_else(|| Arc::new(blob::BlobRegistry::new())),
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
             es: extras.es,
         });
@@ -618,7 +619,7 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blob: Some(Arc::new(local)), ..Default::default() },
+            Extras { blobs: Some(crate::bridge::blob::registry_with_default(Arc::new(local))), ..Default::default() },
         );
         let cap = b
             .run_with(
@@ -1037,7 +1038,7 @@ mod tests {
             client: Default::default(),
             registry: Arc::new(SchemaRegistry::new()),
             loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
-            blob: None,
+            blobs: Arc::new(blob::BlobRegistry::new()),
             bus: Arc::new(bus::Bus::new()),
             es: None,
         });
