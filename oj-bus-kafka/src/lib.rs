@@ -10,7 +10,7 @@
 use futures::StreamExt;
 use oj_plugin_ffi::{
     ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RBytes, RResult, RString,
+    RArc, RResult, RString,
 };
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -18,7 +18,6 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -60,63 +59,7 @@ fn state() -> &'static BusPluginState {
     PLUGIN.get().expect("oj-bus-kafka: init not called")
 }
 
-// ---- FfiFuture 桥（spike S.2 定稿；同 db/blob 插件）----
-
-struct CallState {
-    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-    result: Option<Result<Vec<u8>, String>>,
-}
-
-extern "C" fn poll(state: *mut c_void) -> i32 {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    if let Some(r) = &s.result {
-        return if r.is_ok() { 1 } else { -1 };
-    }
-    match s.rx.try_recv() {
-        Ok(r) => {
-            let code = if r.is_ok() { 1 } else { -1 };
-            s.result = Some(r);
-            code
-        }
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => 0,
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => -1,
-    }
-}
-
-extern "C" fn take(state: *mut c_void) -> RResult<RBytes, RString> {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    match s.result.take() {
-        Some(Ok(bytes)) => {
-            let mut v = RBytes::new();
-            for b in bytes {
-                v.push(b);
-            }
-            RResult::Ok(v)
-        }
-        Some(Err(e)) => RResult::Err(RString::from(e.as_str())),
-        None => RResult::Err(RString::from("take before ready or twice")),
-    }
-}
-
-extern "C" fn free(state: *mut c_void) {
-    if !state.is_null() {
-        drop(unsafe { Box::from_raw(state as *mut CallState) });
-    }
-}
-
-/// 起一个 FfiFuture：异步工作 spawn 到插件 runtime，oneshot 收结果。
-fn spawn_call(fut: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static) -> FfiFuture {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state().rt.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
-    FfiFuture {
-        state: Box::into_raw(Box::new(CallState { rx, result: None })).cast(),
-        poll,
-        take,
-        free,
-    }
-}
+// ---- FfiFuture 桥（统一走 oj-plugin-ffi 的 catch_unwind 安全工厂：spawn_ffi_future / catch_future）----
 
 // ---- kafka 逻辑（迁自 core broker/kafka.rs，语义对齐）----
 
@@ -226,29 +169,43 @@ impl BusPluginState {
 // ---- vtable（同步签名返回 FfiFuture；connect 产 handle，close 释放）----
 
 extern "C" fn connect(cfg: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move {
-        let cfg: BrokerCfgJson =
-            serde_json::from_str(&cfg[..]).map_err(|e| format!("kafka: bad cfg: {e}"))?;
-        let broker = Arc::new(KafkaBroker::new(&cfg)?);
-        let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
-        st.brokers.lock().unwrap().insert(handle, broker);
-        Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            let cfg: BrokerCfgJson =
+                serde_json::from_str(&cfg[..]).map_err(|e| format!("kafka: bad cfg: {e}"))?;
+            let broker = Arc::new(KafkaBroker::new(&cfg)?);
+            let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
+            st.brokers.lock().unwrap().insert(handle, broker);
+            Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+        })
     })
 }
 
 extern "C" fn publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_publish(handle, &topic[..], &data[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_publish(handle, &topic[..], &data[..]).await },
+        )
+    })
 }
 
 extern "C" fn subscribe(handle: u64, topic: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_subscribe(handle, &topic[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_subscribe(handle, &topic[..]).await },
+        )
+    })
 }
 
 extern "C" fn close(handle: u64) {
-    state().brokers.lock().unwrap().remove(&handle);
+    oj_plugin_ffi::catch_void(|| {
+        state().brokers.lock().unwrap().remove(&handle);
+    })
 }
 
 static VTABLE: EventBrokerVtable = EventBrokerVtable {
@@ -259,7 +216,18 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: std::ptr::null(), bus: &VTABLE, kv: std::ptr::null() }
+    oj_plugin_ffi::catch_value(
+        || {
+            PluginRegistrations {
+                es: std::ptr::null(),
+                db: std::ptr::null(),
+                blob: std::ptr::null(),
+                bus: &VTABLE,
+                kv: std::ptr::null(),
+            }
+        },
+        PluginRegistrations::none(),
+    )
 }
 
 // ---- 入口 ----

@@ -10,10 +10,9 @@
 
 use oj_plugin_ffi::{
     ABI_VERSION, EsBackendVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RBytes, RResult, RString,
+    RArc, RResult, RString,
 };
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 /// 迁入的 es HTTP 客户端（原 core `EsClient`，唯一改动：不再实现 core trait）。
@@ -47,65 +46,7 @@ fn state() -> &'static EsPluginState {
     PLUGIN.get().expect("oj-es: init not called")
 }
 
-// ---- FfiFuture 桥（S.2 定稿：oneshot 接结果，poll 消费式暂存）----
-
-/// 共享状态：插件 runtime 上的任务经 oneshot 回传结果；poll 收到后暂存（try_recv 消费式）。
-struct EsCallState {
-    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-    result: Option<Result<Vec<u8>, String>>,
-}
-
-extern "C" fn poll(state: *mut c_void) -> i32 {
-    let s = unsafe { &mut *(state as *mut EsCallState) };
-    if let Some(r) = &s.result {
-        return if r.is_ok() { 1 } else { -1 };
-    }
-    match s.rx.try_recv() {
-        Ok(r) => {
-            let code = if r.is_ok() { 1 } else { -1 };
-            s.result = Some(r);
-            code
-        }
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => 0,
-        // sender 被 drop 却没 send（任务 panic）→ 视为 error
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => -1,
-    }
-}
-
-extern "C" fn take(state: *mut c_void) -> RResult<RBytes, RString> {
-    let s = unsafe { &mut *(state as *mut EsCallState) };
-    match s.result.take() {
-        Some(Ok(bytes)) => {
-            let mut v = RBytes::new();
-            for b in bytes {
-                v.push(b);
-            }
-            RResult::Ok(v)
-        }
-        Some(Err(e)) => RResult::Err(RString::from(e.as_str())),
-        None => RResult::Err(RString::from("take before ready or twice")),
-    }
-}
-
-extern "C" fn free(state: *mut c_void) {
-    if !state.is_null() {
-        drop(unsafe { Box::from_raw(state as *mut EsCallState) });
-    }
-}
-
-/// 起一个 FfiFuture：把异步工作 spawn 到插件 runtime，oneshot 收结果。
-fn spawn_call(fut: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static) -> FfiFuture {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state().rt.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
-    FfiFuture {
-        state: Box::into_raw(Box::new(EsCallState { rx, result: None })).cast(),
-        poll,
-        take,
-        free,
-    }
-}
+// ---- FfiFuture 桥（统一走 oj-plugin-ffi 的 catch_unwind 安全工厂：spawn_ffi_future / catch_future）----
 
 // ---- 迁移自 core es.rs 的 HTTP 实现 ----
 
@@ -207,28 +148,55 @@ impl EsPluginState {
 // ---- vtable 三方法 + close（同步签名返回 FfiFuture）----
 
 extern "C" fn search(handle: u64, index: RString, body: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_search(handle, &index[..], &body[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_search(handle, &index[..], &body[..]).await
+        })
+    })
 }
 
 extern "C" fn index_doc(handle: u64, index: RString, id: RString, body: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_index(handle, &index[..], &id[..], &body[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_index(handle, &index[..], &id[..], &body[..]).await },
+        )
+    })
 }
 
 extern "C" fn delete_doc(handle: u64, index: RString, id: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_delete(handle, &index[..], &id[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_delete(handle, &index[..], &id[..]).await },
+        )
+    })
 }
 
 extern "C" fn close(handle: u64) {
-    state().clients.lock().unwrap().remove(&handle);
+    oj_plugin_ffi::catch_void(|| {
+        state().clients.lock().unwrap().remove(&handle);
+    })
 }
 
 static ES_VTABLE: EsBackendVtable = EsBackendVtable { search, index_doc, delete_doc, close };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: &ES_VTABLE, db: std::ptr::null(), blob: std::ptr::null(), bus: std::ptr::null(), kv: std::ptr::null() }
+    oj_plugin_ffi::catch_value(
+        || {
+            PluginRegistrations {
+                es: &ES_VTABLE,
+                db: std::ptr::null(),
+                blob: std::ptr::null(),
+                bus: std::ptr::null(),
+                kv: std::ptr::null(),
+            }
+        },
+        PluginRegistrations::none(),
+    )
 }
 
 // ---- 入口 ----

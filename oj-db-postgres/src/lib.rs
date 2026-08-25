@@ -8,14 +8,13 @@
 
 use oj_plugin_ffi::{
     ABI_VERSION, DataAccessorVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RBytes, RResult, RString, RVec,
+    RArc, RResult, RString, RVec,
 };
 use sqlx::any::{Any, AnyArguments, AnyRow};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
 use sqlx::{Column, Row};
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -67,62 +66,7 @@ fn state() -> &'static DbPluginState {
     PLUGIN.get().expect("oj-db-postgres: init not called")
 }
 
-// ---- FfiFuture 桥（spike S.2 定稿）----
-
-struct CallState {
-    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-    result: Option<Result<Vec<u8>, String>>,
-}
-
-extern "C" fn poll(state: *mut c_void) -> i32 {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    if let Some(r) = &s.result {
-        return if r.is_ok() { 1 } else { -1 };
-    }
-    match s.rx.try_recv() {
-        Ok(r) => {
-            let code = if r.is_ok() { 1 } else { -1 };
-            s.result = Some(r);
-            code
-        }
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => 0,
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => -1,
-    }
-}
-
-extern "C" fn take(state: *mut c_void) -> RResult<RBytes, RString> {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    match s.result.take() {
-        Some(Ok(bytes)) => {
-            let mut v = RBytes::new();
-            for b in bytes {
-                v.push(b);
-            }
-            RResult::Ok(v)
-        }
-        Some(Err(e)) => RResult::Err(RString::from(e.as_str())),
-        None => RResult::Err(RString::from("take before ready or twice")),
-    }
-}
-
-extern "C" fn free(state: *mut c_void) {
-    if !state.is_null() {
-        drop(unsafe { Box::from_raw(state as *mut CallState) });
-    }
-}
-
-fn spawn_call(fut: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static) -> FfiFuture {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state().rt.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
-    FfiFuture {
-        state: Box::into_raw(Box::new(CallState { rx, result: None })).cast(),
-        poll,
-        take,
-        free,
-    }
-}
+// ---- FfiFuture 桥（统一走 oj-plugin-ffi 的 catch_unwind 安全工厂：spawn_ffi_future / catch_future）----
 
 // ---- sqlx 逻辑（迁移自 core accessor_sqlx.rs，与 oj-db-mysql 逐字同构）----
 
@@ -332,69 +276,118 @@ impl DbPluginState {
 // ---- vtable ----
 
 extern "C" fn connect(cfg: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move {
-        let dsn = cfg[..].to_string();
-        let client = Client::connect(&dsn).await?;
-        let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
-        st.clients.lock().unwrap().insert(handle, Arc::new(client));
-        Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            let dsn = cfg[..].to_string();
+            let client = Client::connect(&dsn).await?;
+            let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
+            st.clients.lock().unwrap().insert(handle, Arc::new(client));
+            Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+        })
     })
 }
 
 extern "C" fn query(handle: u64, sql: RString, params: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_query(handle, &sql[..], &params[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_query(handle, &sql[..], &params[..]).await },
+        )
+    })
 }
 
 extern "C" fn exec(handle: u64, sql: RString, params: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_exec(handle, &sql[..], &params[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_exec(handle, &sql[..], &params[..]).await },
+        )
+    })
 }
 
 extern "C" fn begin(handle: u64) -> FfiFuture {
-    let st = state();
-    spawn_call(async move {
-        let c = st.client(handle)?;
-        let tx_id = c.begin().await?;
-        Ok(format!(r#"{{"tx_id":{tx_id}}}"#).into_bytes())
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            let c = st.client(handle)?;
+            let tx_id = c.begin().await?;
+            Ok(format!(r#"{{"tx_id":{tx_id}}}"#).into_bytes())
+        })
     })
 }
 
 extern "C" fn tx_query(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_tx_query(handle, tx_id, &sql[..], &params[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_tx_query(handle, tx_id, &sql[..], &params[..]).await },
+        )
+    })
 }
 
 extern "C" fn tx_exec(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_tx_exec(handle, tx_id, &sql[..], &params[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_tx_exec(handle, tx_id, &sql[..], &params[..]).await },
+        )
+    })
 }
 
 extern "C" fn tx_commit(handle: u64, tx_id: u64) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.client(handle)?.tx_commit(tx_id).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.client(handle)?.tx_commit(tx_id).await },
+        )
+    })
 }
 
 extern "C" fn tx_rollback(handle: u64, tx_id: u64) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.client(handle)?.tx_rollback(tx_id).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.client(handle)?.tx_rollback(tx_id).await },
+        )
+    })
 }
 
 extern "C" fn dialect(handle: u64) -> RString {
-    let d = state().client(handle).map(|c| c.dialect).unwrap_or(Dialect::Sqlite);
-    RString::from(dialect_str(d))
+    oj_plugin_ffi::catch_value(
+        || {
+            let d = state().client(handle).map(|c| c.dialect).unwrap_or(Dialect::Sqlite);
+            RString::from(dialect_str(d))
+        },
+        RString::from("unknown"),
+    )
 }
 
 extern "C" fn close(handle: u64) {
-    state().clients.lock().unwrap().remove(&handle);
+    oj_plugin_ffi::catch_void(|| {
+        state().clients.lock().unwrap().remove(&handle);
+    })
 }
 
 extern "C" fn schemes() -> RVec<RString> {
-    let mut v = RVec::new();
-    v.push(RString::from("postgres://"));
-    v.push(RString::from("postgresql://"));
-    v
+    oj_plugin_ffi::catch_value(
+        || {
+            let mut v = RVec::new();
+            v.push(RString::from("postgres://"));
+            v.push(RString::from("postgresql://"));
+            v
+        },
+        {
+            let v = RVec::new();
+            v
+        },
+    )
 }
 
 static VTABLE: DataAccessorVtable = DataAccessorVtable {
@@ -412,7 +405,18 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: &VTABLE, blob: std::ptr::null(), bus: std::ptr::null(), kv: std::ptr::null() }
+    oj_plugin_ffi::catch_value(
+        || {
+            PluginRegistrations {
+                es: std::ptr::null(),
+                db: &VTABLE,
+                blob: std::ptr::null(),
+                bus: std::ptr::null(),
+                kv: std::ptr::null(),
+            }
+        },
+        PluginRegistrations::none(),
+    )
 }
 
 // ---- 入口 ----

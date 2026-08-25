@@ -18,7 +18,6 @@ use oj_plugin_ffi::{
 use reqwest::Method;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -64,63 +63,7 @@ fn state() -> &'static BlobPluginState {
     PLUGIN.get().expect("oj-blob-s3: init not called")
 }
 
-// ---- FfiFuture 桥（spike S.2 定稿；同 db 插件）----
-
-struct CallState {
-    rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>,
-    result: Option<Result<Vec<u8>, String>>,
-}
-
-extern "C" fn poll(state: *mut c_void) -> i32 {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    if let Some(r) = &s.result {
-        return if r.is_ok() { 1 } else { -1 };
-    }
-    match s.rx.try_recv() {
-        Ok(r) => {
-            let code = if r.is_ok() { 1 } else { -1 };
-            s.result = Some(r);
-            code
-        }
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => 0,
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => -1,
-    }
-}
-
-extern "C" fn take(state: *mut c_void) -> RResult<RBytes, RString> {
-    let s = unsafe { &mut *(state as *mut CallState) };
-    match s.result.take() {
-        Some(Ok(bytes)) => {
-            let mut v = RBytes::new();
-            for b in bytes {
-                v.push(b);
-            }
-            RResult::Ok(v)
-        }
-        Some(Err(e)) => RResult::Err(RString::from(e.as_str())),
-        None => RResult::Err(RString::from("take before ready or twice")),
-    }
-}
-
-extern "C" fn free(state: *mut c_void) {
-    if !state.is_null() {
-        drop(unsafe { Box::from_raw(state as *mut CallState) });
-    }
-}
-
-/// 起一个 FfiFuture：异步工作 spawn 到插件 runtime，oneshot 收结果。
-fn spawn_call(fut: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static) -> FfiFuture {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state().rt.spawn(async move {
-        let _ = tx.send(fut.await);
-    });
-    FfiFuture {
-        state: Box::into_raw(Box::new(CallState { rx, result: None })).cast(),
-        poll,
-        take,
-        free,
-    }
-}
+// ---- FfiFuture 桥（统一走 oj-plugin-ffi 的 catch_unwind 安全工厂：spawn_ffi_future / catch_future）----
 
 // ---- s3 逻辑（迁自 core S3Blob + blob.rs 的 key 校验，语义对齐）----
 
@@ -216,51 +159,69 @@ fn build_store(c: &S3Cfg) -> Result<Arc<AmazonS3>, String> {
 // ---- vtable（同步签名返回 FfiFuture；connect 产 handle，close 释放）----
 
 extern "C" fn connect(name: RString, cfg: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move {
-        let cfg: S3Cfg = serde_json::from_str(&cfg[..]).map_err(|e| format!("blob s3: bad cfg: {e}"))?;
-        let store = build_store(&cfg)?;
-        let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
-        st.stores.lock().unwrap().insert(handle, store);
-        let _ = &name; // 注册名透传（url 裁决保留签名）；s3 presign 对所有名字可用
-        Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            let cfg: S3Cfg =
+                serde_json::from_str(&cfg[..]).map_err(|e| format!("blob s3: bad cfg: {e}"))?;
+            let store = build_store(&cfg)?;
+            let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
+            st.stores.lock().unwrap().insert(handle, store);
+            let _ = &name; // 注册名透传（url 裁决保留签名）；s3 presign 对所有名字可用
+            Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
+        })
     })
 }
 
 extern "C" fn put(handle: u64, key: RString, bytes: RBytes, _content_type: RString) -> FfiFuture {
-    let st = state();
-    let mut b = Vec::with_capacity(bytes.len());
-    for x in &bytes {
-        b.push(*x);
-    }
-    spawn_call(async move { st.do_put(handle, &key[..], &b).await })
+    oj_plugin_ffi::catch_future(|| {
+        let mut b = Vec::with_capacity(bytes.len());
+        for x in &bytes {
+            b.push(*x);
+        }
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_put(handle, &key[..], &b).await })
+    })
 }
 
 extern "C" fn get(handle: u64, key: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_get(handle, &key[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_get(handle, &key[..]).await })
+    })
 }
 
 extern "C" fn del(handle: u64, key: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_del(handle, &key[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_del(handle, &key[..]).await })
+    })
 }
 
 extern "C" fn url(handle: u64, key: RString) -> FfiFuture {
-    let st = state();
-    spawn_call(async move { st.do_url(handle, &key[..]).await })
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_url(handle, &key[..]).await })
+    })
 }
 
 /// content_type：S3 侧对象自身元数据负责 → 恒 None（空串）。key 校验语义与 core 对齐。
 extern "C" fn content_type(_handle: u64, key: RString) -> FfiFuture {
-    spawn_call(async move {
-        os_path(&key[..])?;
-        Ok(b"".to_vec())
+    oj_plugin_ffi::catch_future(|| {
+        oj_plugin_ffi::spawn_ffi_future(
+            &state().rt,
+            async move {
+                os_path(&key[..])?;
+                Ok(b"".to_vec())
+            },
+        )
     })
 }
 
 extern "C" fn close(handle: u64) {
-    state().stores.lock().unwrap().remove(&handle);
+    oj_plugin_ffi::catch_void(|| {
+        state().stores.lock().unwrap().remove(&handle);
+    })
 }
 
 static VTABLE: BlobBackendVtable = BlobBackendVtable {
@@ -274,7 +235,18 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
 };
 
 extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: std::ptr::null(), blob: &VTABLE, bus: std::ptr::null(), kv: std::ptr::null() }
+    oj_plugin_ffi::catch_value(
+        || {
+            PluginRegistrations {
+                es: std::ptr::null(),
+                db: std::ptr::null(),
+                blob: &VTABLE,
+                bus: std::ptr::null(),
+                kv: std::ptr::null(),
+            }
+        },
+        PluginRegistrations::none(),
+    )
 }
 
 // ---- 入口 ----

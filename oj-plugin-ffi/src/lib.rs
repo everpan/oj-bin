@@ -16,6 +16,8 @@ pub use bus::EventBrokerVtable;
 pub use db::DataAccessorVtable;
 pub use es::EsBackendVtable;
 pub use future::FfiFuture;
+// I-2：跨边界安全的 FfiFuture 工厂与 vtable 方法包装宏（spec §3 统一 catch_unwind）。
+pub use future::{catch_future, catch_value, catch_void, ready_err, spawn_ffi_future};
 pub use kv::KVStoreVtable;
 
 pub type RString = stabby::string::String;
