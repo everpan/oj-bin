@@ -5,7 +5,7 @@ use super::ffi;
 use oj_plugin_ffi::{ABI_VERSION, HOST_FINGERPRINT, HostContext, PluginDescriptor, RArc, RString};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 /// 七类加载失败（spec §4），各自独立错误文案。
 #[derive(Debug)]
@@ -100,6 +100,15 @@ impl From<&LoadedPlugin> for PluginInfo {
             host_abi_version: ABI_VERSION,
         }
     }
+}
+
+/// 从已加载插件的 es 注册槽构造 core 适配器（handle 0 = 单 es endpoint 约定）。
+/// spec §3 适配器层：插件产 vtable，core 侧 `FfiEsBackend` 包装成 core trait 供 op 消费；
+/// 构造放 core（ffi 模块 pub(crate)，unsafe 不外泄），装配层只经此安全入口。
+pub fn es_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::EsBackend>> {
+    loaded.registrations.es.map(|vt| {
+        Arc::new(super::ffi::FfiEsBackend::new(0, vt)) as Arc<dyn crate::bridge::EsBackend>
+    })
 }
 
 /// 加载路径四级解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >

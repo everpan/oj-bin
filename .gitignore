@@ -3,3 +3,5 @@ target/
 .vscode/
 .claude/
 .superpowers/
+# 编译产物（插件源码在 oj-*/ 各 crate；plugins/<triple> 由 cargo xtask plugin 产出）。
+plugins/

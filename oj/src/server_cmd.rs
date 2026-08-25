@@ -1,15 +1,19 @@
 //! oj server 装配：config → 逐 db 开库（仅 sqlite）→ seed → manifest 校验 →
 //! actor 池 → axum serve。start() 返回 (addr, join_handle)，main 与测试共用。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mdm_base_rust::bridge::plugin_loader::{
+    LoadedPlugin, PluginManifestEntry, es_backend, host_context, load_manifest, load_scanned,
+    resolve_plugins_dir,
+};
 use mdm_base_rust::bridge::{
-    Bridge, DataAccessor, Dialect, EsClient, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
-    SqlxAccessor,
+    Bridge, DataAccessor, Dialect, EsBackend, Extras, InMemoryKV, LoaderShared, PluginInfo,
+    SchemaRegistry, SqlxAccessor,
 };
 use mdm_base_rust::bridge::broker::build_broker;
 use mdm_base_rust::config::{self, Config};
@@ -125,8 +129,14 @@ pub async fn start(
     // 下载路由仅服务名为 default 的后端（spec §2 裁决；Task 1.3 钉死字节一致回归）。
     let blob: Option<Arc<dyn mdm_base_rust::bridge::BlobBackend>> =
         blobs.as_ref().and_then(|r| r.default());
-    // ES（OJ-6）：config es: 块存在即注入 EsClient；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
-    let es: Option<Arc<dyn mdm_base_rust::bridge::EsBackend>> = cfg.es.as_ref().map(|c| Arc::new(EsClient::new(c.endpoint.clone())) as Arc<dyn mdm_base_rust::bridge::EsBackend>);
+    // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
+    // es 后端 = es 插件（cfg es: 声明且已装，经 FfiEsBackend 适配 core trait）；
+    // 「配置声明了能力但插件未装」→ 启动期 fail-fast（§2 闸门）。
+    let mut registries = Registries::default();
+    let plugins = assemble_plugins(&cfg, config_dir, &mut registries)
+        .await
+        .map_err(|e| format!("plugins: {e}"))?;
+    let es: Option<Arc<dyn EsBackend>> = registries.es;
     // 共享事件总线（OJ-6 + 分布式）：config `broker:` 段按 kind 选择实现（local/kafka/rabbitmq），
     // 缺省进程内 Bus；池内所有 Bridge 注入同一 Arc<dyn EventBroker>，WS 订阅与任意 handler 发布互通。
     let bus = build_broker(&cfg.broker)
@@ -142,7 +152,12 @@ pub async fn start(
                 SchemaRegistry::new(),
                 false,
                 Some(loader.clone()),
-                Extras { blobs: blobs.clone(), es: es.clone(), bus: Some(bus.clone()) },
+                Extras {
+                    blobs: blobs.clone(),
+                    es: es.clone(),
+                    bus: Some(bus.clone()),
+                    plugins: plugins.clone(),
+                },
             )
         }
     };
@@ -306,6 +321,79 @@ pub async fn connect_dbs(
         dbs.insert(name.clone(), acc);
     }
     Ok(dbs)
+}
+
+/// 装配产物：插件注册的后端槽位（阶段 3 仅 es 轴；db/blob/bus/kv 随阶段 4 加入）。
+#[derive(Default)]
+pub struct Registries {
+    pub es: Option<Arc<dyn EsBackend>>,
+}
+
+/// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
+/// cfg 按值传入，插件须持久化时自行持有副本）。阶段 3：es 插件 cfg = {"endpoint"}。
+fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
+    if name == "es" {
+        if let Some(es) = &cfg.es {
+            return serde_json::json!({ "endpoint": es.endpoint }).to_string();
+        }
+    }
+    "{}".to_string()
+}
+
+/// 注册：插件后端（插件先于内置）→ 内置后端（阶段 3 无 db/blob/bus/kv 插件，内置原样）。
+/// es 为键选式单后端：cfg es: 声明 + 恰好一个 es 插件 → FfiEsBackend(handle 0)；
+/// 「配置声明了能力但插件未装」→ fail fast（§2 闸门）；多个 es 注册冲突 → fail fast。
+fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries, String> {
+    let es_plugins: Vec<&LoadedPlugin> =
+        loaded.iter().filter(|p| p.registrations.es.is_some()).collect();
+    if cfg.es.is_some() && es_plugins.is_empty() {
+        return Err("config declares [es] but no es plugin loaded (run `cargo xtask plugin es`)"
+            .to_string());
+    }
+    if es_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register es backend".to_string());
+    }
+    let es = es_plugins.first().and_then(|p| es_backend(p));
+    Ok(Registries { es })
+}
+
+/// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
+/// → 身份核对 → semver 对照 → 注册（插件先于内置）→ 内置后端注册。
+/// 缺省扫描且目录不存在/为空 → 零插件（仅内置后端，不报错，除非 §2 闸门触发）。
+pub async fn assemble_plugins(
+    cfg: &Config,
+    config_dir: &Path,
+    registries: &mut Registries,
+) -> Result<Vec<PluginInfo>, String> {
+    let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
+        .map_err(|e| format!("plugins dir: {e}"))?;
+    let host = host_context();
+    let cfg_for = |name: &str| -> String { plugin_cfg_json(cfg, name) };
+    let loaded = match dir {
+        Some(dir) if cfg.plugins.is_some() => {
+            // 清单严格模式：按名去重 → fail fast；缺文件/校验失败 → fail fast。
+            let names = cfg.plugins.as_ref().unwrap();
+            let mut seen = HashSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    return Err(format!("plugins manifest: duplicate plugin '{name}'"));
+                }
+            }
+            let entries: Vec<PluginManifestEntry> = names
+                .iter()
+                .map(|name| PluginManifestEntry { name: name.clone(), semver_pin: None })
+                .collect();
+            load_manifest(&dir, &entries, host, &cfg_for)
+                .map_err(|e| format!("plugins manifest: {e}"))?
+        }
+        Some(dir) => {
+            // 缺省扫描：目录为空 → 零插件；扫描到损坏插件 → fail fast（不静默跳过）。
+            load_scanned(&dir, host).map_err(|e| format!("plugins scan: {e}"))?
+        }
+        None => Vec::new(),
+    };
+    *registries = build_registries(cfg, &loaded)?;
+    Ok(loaded.iter().map(PluginInfo::from).collect())
 }
 
 #[cfg(test)]
@@ -614,5 +702,141 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["data"][0]["v"], "a", "{v}");
+    }
+
+    // ----- 插件装配（spec §5）：全部经 cfg.plugins_dir 注入（每测试独立 Config，
+    // 无全局 env 竞争；OAT_PLUGINS_DIR 只留给真实部署路径）。 -----
+
+    use std::sync::OnceLock;
+
+    fn host_triple() -> String {
+        let out = std::process::Command::new("rustc").arg("-vV").output().unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("host: "))
+            .unwrap()
+            .to_string()
+    }
+
+    /// 插件存放文件名（= loader plugin_file_name）。
+    fn plugin_file(name: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!("{name}.dll")
+        } else if cfg!(target_os = "macos") {
+            format!("lib{name}.dylib")
+        } else {
+            format!("lib{name}.so")
+        }
+    }
+
+    /// 编译 oj-es 产物路径（全进程一次，oj-es 已有 debug 构建，命中缓存）。
+    fn es_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-es"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-es");
+            assert!(status.success(), "oj-es build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug").join(format!("{prefix}oj_es.{ext}"))
+        })
+        .clone()
+    }
+
+    fn es_cfg(endpoint: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.es = Some(config::EsCfg { endpoint: endpoint.to_string() });
+        cfg
+    }
+
+    /// 清单显式给出但文件缺失 → fail fast。
+    #[tokio::test(flavor = "current_thread")]
+    async fn manifest_missing_file_fails_fast() {
+        let t = tmpdir("sc-man");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins = Some(vec!["ghost".into()]);
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        assert!(e.contains("plugin file missing"), "{e}");
+    }
+
+    /// 清单同名两次 → fail fast（去重闸门先于加载）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn manifest_duplicate_fails_fast() {
+        let t = tmpdir("sc-dup");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins = Some(vec!["es".into(), "es".into()]);
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        assert!(e.contains("duplicate plugin 'es'"), "{e}");
+    }
+
+    /// 缺省扫描空目录 → 零插件、仅内置后端（es 未配置，不触发 §2 闸门）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_empty_dir_yields_only_builtin() {
+        let t = tmpdir("sc-empty");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert!(plugins.is_empty());
+        assert!(r.es.is_none());
+    }
+
+    /// 扫描到损坏插件 → fail fast（不静默跳过）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn scan_bad_plugin_fails_fast() {
+        let t = tmpdir("sc-bad");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join(plugin_file("broken")), b"not a real dylib").unwrap();
+        let mut cfg = Config::default();
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        assert!(e.contains("plugins scan"), "{e}");
+    }
+
+    /// 配置声明 [es] 但插件未装 → 启动期报错（§2 闸门）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn es_declared_without_plugin_fails_startup() {
+        let t = tmpdir("sc-esgate");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
+        let mut cfg = es_cfg("http://127.0.0.1:1");
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        assert!(e.contains("no es plugin loaded"), "{e}");
+    }
+
+    /// 全链路：真实 oj-es 插件装配 → es 后端经 FfiEsBackend 接线（handle 0）+ 自省信息。
+    #[tokio::test(flavor = "current_thread")]
+    async fn es_plugin_wires_backend() {
+        let t = tmpdir("sc-esplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(es_plugin_artifact(), pdir.join(plugin_file("es"))).unwrap();
+        let mut cfg = es_cfg("http://127.0.0.1:1");
+        cfg.plugins_dir = Some(t.0.clone());
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "es");
+        assert!(r.es.is_some(), "es backend must be wired from the plugin");
     }
 }

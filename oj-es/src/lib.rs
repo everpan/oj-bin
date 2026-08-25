@@ -233,7 +233,24 @@ extern "C" fn register() -> PluginRegistrations {
 
 // ---- 入口 ----
 
+/// 插件 descriptor（常量字段，重入/复用路径共用）。
+fn descriptor() -> PluginDescriptor {
+    PluginDescriptor {
+        name: RString::from("es"),
+        semver: RString::from("0.1.0"),
+        abi_version: ABI_VERSION,
+        fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
+        register,
+    }
+}
+
 fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
+    // 同进程二次 init（多装配/测试重载同一 dylib）：cfg 以首次为准，直接复用 descriptor。
+    // 生产每进程每插件一次装配，此分支不触发；状态（PLUGIN/runtime/客户端）只建一次。
+    if PLUGIN.get().is_some() {
+        return RResult::Ok(descriptor());
+    }
+
     let cfg_v: serde_json::Value = serde_json::from_str(&cfg[..]).unwrap_or(serde_json::json!({}));
     let endpoint = cfg_v.get("endpoint").and_then(|v| v.as_str()).map(str::to_string);
 
@@ -245,17 +262,10 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
         }
     }
     let st = EsPluginState { rt: runtime(), clients: Mutex::new(clients) };
-    if PLUGIN.set(st).is_err() {
-        return RResult::Err(RString::from("oj-es: init called twice"));
-    }
+    // 并发重入：另一线程已建好 → 复用。
+    let _ = PLUGIN.set(st);
 
-    RResult::Ok(PluginDescriptor {
-        name: RString::from("es"),
-        semver: RString::from("0.1.0"),
-        abi_version: ABI_VERSION,
-        fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
-    })
+    RResult::Ok(descriptor())
 }
 
 /// 插件自建 tokio runtime（跨 FFI 不共享宿主 tokio，规避 TLS 双副本，S.2 定稿）。

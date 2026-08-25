@@ -2,7 +2,7 @@
 //! 旧三层 env 叠加已删（预案即单文件）。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -224,6 +224,11 @@ pub struct Config {
     pub es: Option<EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
     pub broker: Option<BrokerCfg>,
+    /// plugins 清单（显式给出 → 严格按清单装配，缺文件/版本不符 fail fast；
+    /// None = 缺省扫描 plugins_dir 全部加载）。
+    pub plugins: Option<Vec<String>>,
+    /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > workspace 后备）。
+    pub plugins_dir: Option<PathBuf>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。

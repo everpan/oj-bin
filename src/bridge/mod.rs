@@ -52,7 +52,7 @@ pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, S3Blob, valid_key};
 pub use bus::{Bus, EventBroker};
-pub use es::{EsBackend, EsClient};
+pub use es::EsBackend;
 pub use envelope::{fail, ok, status_code};
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore, RedisKV};
