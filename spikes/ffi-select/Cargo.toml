@@ -1,0 +1,6 @@
+[workspace]
+members = ["plugin-stabby", "plugin-abistable", "host"]
+
+# spike 独立 workspace：不进主 workspace members，不污染主依赖树。
+[profile.dev]
+panic = "unwind" # 插件必须 unwind（spec §3 panic 纪律）；cdylib 默认即 unwind，显式钉死
