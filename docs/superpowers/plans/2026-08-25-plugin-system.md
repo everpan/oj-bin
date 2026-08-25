@@ -1403,9 +1403,9 @@ pub struct DataAccessorVtable {
 // = drop 自带回滚"的 FFI 保留，spec §3 FfiFuture drop 条）。
 ```
 
-- [ ] **Step 1: 写失败测试（vtable mock）**——FfiDataAccessor 全方法转发；FfiTxSession drop → tx_rollback 被调（AtomicU64 记录）；commit 后 drop 不再 rollback。
+- [x] **Step 1: 写失败测试（vtable mock）**——FfiDataAccessor 全方法转发；FfiTxSession drop → tx_rollback 被调（AtomicU64 记录）；commit 后 drop 不再 rollback。
 
-- [ ] **Step 2: 跑测试确认失败** → **Step 3: 实现适配器 + 两插件 crate**（插件内嵌各自 sqlx DataAccessor 实现，插件边界内可用 `sqlx::Any` 单方言 feature；共享逻辑抽插件侧公共 crate 或接受复制——决策在此步做并记录 commit message）→ **Step 4: 测试通过 + env-gated 真连测试**（`OJ_TEST_MYSQL=mysql://… cargo test -p oj-db-mysql`）→ **Step 5: 接线**（DbBackendRegistry 注册 FFI 版 mysql/postgres 工厂，内置 SqliteBackend/MemoryBackend 保留）→ **Step 6: Commit**
+- [x] **Step 2: 跑测试确认失败** → **Step 3: 实现适配器 + 两插件 crate**（插件内嵌各自 sqlx DataAccessor 实现，插件边界内可用 `sqlx::Any` 单方言 feature；共享逻辑抽插件侧公共 crate 或接受复制——决策在此步做并记录 commit message）→ **Step 4: 测试通过 + env-gated 真连测试**（`OJ_TEST_MYSQL=mysql://… cargo test -p oj-db-mysql`）→ **Step 5: 接线**（DbBackendRegistry 注册 FFI 版 mysql/postgres 工厂，内置 SqliteBackend/MemoryBackend 保留）→ **Step 6: Commit**
 
 ```bash
 git commit -m "feat(db): db 轴 FFI——tx 句柄化 + oj-db-mysql/oj-db-postgres cdylib
@@ -1435,8 +1435,8 @@ pub struct BlobBackendVtable {
 }
 ```
 
-- [ ] **Step 1: vtable mock 失败测试**（五方法转发 + Drop close）
-- [ ] **Step 2: 确认失败** → **Step 3: 实现适配器 + oj-blob-s3**（S3Blob 从 core blob.rs 迁入插件）→ **Step 4: 测试通过 + `OJ_TEST_S3` 回归** → **Step 5: 接线**（BlobRegistry 的 s3 工厂改经 FFI）→ **Step 6: Commit**
+- [x] **Step 1: vtable mock 失败测试**（五方法转发 + Drop close）
+- [x] **Step 2: 确认失败** → **Step 3: 实现适配器 + oj-blob-s3**（S3Blob 从 core blob.rs 迁入插件）→ **Step 4: 测试通过 + `OJ_TEST_S3` 回归** → **Step 5: 接线**（BlobRegistry 的 s3 工厂改经 FFI）→ **Step 6: Commit**
 
 ```bash
 git commit -m "feat(blob): blob 轴 FFI——oj-blob-s3 cdylib，local 留内置
@@ -1466,8 +1466,8 @@ pub struct EventBrokerVtable {
 }
 ```
 
-- [ ] **Step 1: vtable mock 失败测试**（publish 转发；subscribe 后模拟插件调 deliver → host 侧 UnboundedSender 收到——host 侧 deliver 实现 = `tx.send(...)` 非阻塞投递）
-- [ ] **Step 2: 确认失败** → **Step 3: 实现**（Kafka/RabbitMQ broker 从 core broker/ 迁插件；core 保留 local Bus 内置）→ **Step 4: 测试通过 + 共享语义回归**（FFI broker 下"同一实例跨 actor/WS 共享"仍成立——Task 0.5 回归测试在插件 broker 配置下重跑）→ **Step 5: 接线**（BusBackendRegistry 的 kafka/rabbitmq kind 改经 FFI）→ **Step 6: Commit**
+- [x] **Step 1: vtable mock 失败测试**（publish 转发；subscribe 后模拟插件调 deliver → host 侧 UnboundedSender 收到——host 侧 deliver 实现 = `tx.send(...)` 非阻塞投递）
+- [x] **Step 2: 确认失败** → **Step 3: 实现**（Kafka/RabbitMQ broker 从 core broker/ 迁插件；core 保留 local Bus 内置）→ **Step 4: 测试通过 + 共享语义回归**（FFI broker 下"同一实例跨 actor/WS 共享"仍成立——Task 0.5 回归测试在插件 broker 配置下重跑）→ **Step 5: 接线**（BusBackendRegistry 的 kafka/rabbitmq kind 改经 FFI）→ **Step 6: Commit**
 
 ```bash
 git commit -m "feat(bus): bus 轴 FFI——deliver 回调注入 + kafka/rabbitmq cdylib
@@ -1497,7 +1497,7 @@ pub struct KVStoreVtable {
 
 （方法面以 core `KVStore` trait 现状为准——先看 src/bridge/kv.rs:19 的完整方法列表再定稿 vtable，缺的方法补齐，签名形态同上。）
 
-- [ ] **Step 1: vtable mock 失败测试** → **Step 2: 确认失败** → **Step 3: 实现**（RedisKV 迁插件）→ **Step 4: 测试通过 + `OJ_TEST_REDIS` 回归** → **Step 5: 接线**（redis.default 配置改经 FFI，未配仍 InMemoryKV）→ **Step 6: Commit**
+- [x] **Step 1: vtable mock 失败测试** → **Step 2: 确认失败** → **Step 3: 实现**（RedisKV 迁插件）→ **Step 4: 测试通过 + `OJ_TEST_REDIS` 回归** → **Step 5: 接线**（redis.default 配置改经 FFI，未配仍 InMemoryKV）→ **Step 6: Commit**
 
 ```bash
 git commit -m "feat(kv): kv 轴 FFI——oj-kv-redis cdylib，InMemoryKV 内置兜底
@@ -1512,21 +1512,21 @@ unix@vip.qq.com ai"
 - Create/Modify: `.github/workflows/*.yml`（或现状 CI 配置——先 `ls .github/workflows/` 确认）
 - Test: `cargo tree` 验证
 
-- [ ] **Step 1: core 依赖收敛**——sqlx features 收敛 `["runtime-tokio","macros","sqlite","json"]`（去掉 any/mysql/postgres——确认 SqliteBackend 不经 `sqlx::Any` 而是直连 `SqlitePool`，否则保留 any 仅 sqlite 驱动）；redis/rdkafka/lapin 从 core dependencies 移除。
+- [x] **Step 1: core 依赖收敛**——sqlx features 收敛 `["runtime-tokio","macros","any","sqlite","json"]`（SqliteBackend 经 `sqlx::Any`（SqlxAccessor），保留 any 仅 sqlite 驱动；去掉 mysql/postgres）；redis/rdkafka/lapin 从 core dependencies 移除。
 
-- [ ] **Step 2: 瘦身验证**
+- [x] **Step 2: 瘦身验证**
 
 Run: `cargo tree -p mdm-base-rust -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'`
 Expected: 无输出（core 二进制不再链接这些驱动）
 
-- [ ] **Step 3: 全量回归**
+- [x] **Step 3: 全量回归**
 
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
 
-- [ ] **Step 4: CI 平台矩阵**——宿主 + 全部第一方插件按矩阵构建（`x86_64-unknown-linux-gnu`（最旧受支持 glibc 镜像为基线）/ 按需 `x86_64-unknown-linux-musl` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`），产物归置 `plugins/<triple>/` 布局；Windows 构建优先 vendored 依赖。
+- [x] **Step 4: CI 平台矩阵**——宿主 + 全部第一方插件按矩阵构建（`x86_64-unknown-linux-gnu`（最旧受支持 glibc 镜像为基线）/ 按需 `x86_64-unknown-linux-musl` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`），产物归置 `plugins/<triple>/` 布局；Windows 构建优先 vendored 依赖。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -1537,8 +1537,8 @@ unix@vip.qq.com ai"
 
 ### Task 4.6: 阶段 4 任务状态更新
 
-- [ ] **Step 1: 勾选 Task 4.1-4.5 复选框**
-- [ ] **Step 2: 进度提交**
+- [x] **Step 1: 勾选 Task 4.1-4.5 复选框**
+- [x] **Step 2: 进度提交**
 
 ```bash
 git add docs/superpowers/plans/2026-08-25-plugin-system.md
