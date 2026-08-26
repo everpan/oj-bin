@@ -5,6 +5,7 @@ pub mod auth;
 pub mod logging;
 pub mod routes;
 pub mod ws;
+pub mod certificate;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -466,12 +467,27 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use super::*;
     use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, LocalBlob, SchemaRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Helper for tests: create a minimal AppState
+    pub(crate) fn dummy_app_state() -> AppState {
+        AppState {
+            table: RouteTable::default(),
+            fallback: None,
+            actor: make_actor(PathBuf::from("."), false),
+            timeout: None,
+            static_root: None,
+            pipeline: Pipeline::default(),
+            base: "/v1/api".to_string(),
+            certificate_status: CertificateStatus::Valid,
+            certificate_valid_until: None,
+        }
+    }
 
     pub(crate) struct TempRoutes(pub(crate) PathBuf);
     pub(crate) fn routes(files: &[(&str, &str)]) -> TempRoutes {
@@ -496,7 +512,7 @@ pub mod tests {
     }
 
     /// 带 oj 模块加载器的 actor（project_root = 路由根：api 文件全在其下，clamp 可达）。
-    pub(crate) fn actor(root: PathBuf, ts: bool) -> JsActor {
+    pub(crate) fn make_actor(root: PathBuf, ts: bool) -> JsActor {
         JsActor::new(move || {
             Bridge::with_dbs_and_loader(
                 HashMap::new(),
@@ -531,7 +547,7 @@ pub mod tests {
         let base = base.to_string();
         tokio::spawn(async move {
             serve_with_listener(
-                listener, &base, dir.clone(), ts, table, actor(dir, ts), timeout, None, pipeline,
+                listener, &base, dir.clone(), ts, table, make_actor(dir, ts), timeout, None, pipeline,
             )
             .await
             .unwrap();
@@ -1083,7 +1099,7 @@ pub mod tests {
         let (dir, table, site) = (t.0.clone(), build_table(&t.0, true, "/v1/api"), s.0.clone());
         tokio::spawn(async move {
             serve_with_listener(
-                listener, "/v1/api", dir.clone(), true, table, actor(dir, true), None, Some(site),
+                listener, "/v1/api", dir.clone(), true, table, make_actor(dir, true), None, Some(site),
                 Pipeline::default(),
             )
             .await
@@ -1142,25 +1158,44 @@ pub mod tests {
 
     }
 
-    /// 创建用于测试的最小 AppState
-    pub fn dummy_app_state() -> AppState {
-        AppState {
-            table: RouteTable::default(),
-            fallback: None,
-            actor: JsActor::new(|| panic!("dummy actor")),
-            timeout: None,
-            static_root: None,
-            pipeline: Pipeline::default(),
-            base: "/v1/api".to_string(),
-            certificate_status: CertificateStatus::Valid,
-            certificate_valid_until: None,
-        }
-    }
-
+    
     #[tokio::test]
     async fn test_appstate_has_certificate_fields() {
         let state = dummy_app_state();
         let _ = &state.certificate_status;
         let _ = &state.certificate_valid_until;
+    }
+
+    #[tokio::test]
+    async fn test_load_certificate_returns_err_for_invalid_key() {
+        use tempfile::NamedTempFile;
+        use base64::{engine::general_purpose, Engine};
+
+        // Create temporary files for key and certificate
+        let key_file = NamedTempFile::new().expect("Failed to create temp file for key");
+        let cert_file = NamedTempFile::new().expect("Failed to create temp file for cert");
+
+        // Write an invalid PEM key (not a real key)
+        std::fs::write(key_file.path(), "-----BEGIN PUBLIC KEY-----\ninvalidkey\n-----END PUBLIC KEY-----\n")
+            .expect("Failed to write key");
+
+        // Create a simple JWS with dummy payload
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"nbf":1000000000,"exp":2000000000}"#);
+        let signature = general_purpose::URL_SAFE_NO_PAD.encode("signature");
+        let jws = format!("{}.{}.{}", header, payload, signature);
+        std::fs::write(cert_file.path(), jws).expect("Failed to write cert");
+
+        // Create config pointing to our temporary files
+        let cfg = mdm_base_rust::config::ServerCfg {
+            public_key_path: key_file.path().to_string_lossy().into_owned(),
+            certificate_path: cert_file.path().to_string_lossy().into_owned(),
+            grace_days: Some(30),
+            ..mdm_base_rust::config::ServerCfg::default()
+        };
+
+        // Call load_certificate - should return Err because the key is invalid
+        let res = certificate::load_certificate(&cfg).await;
+        assert!(res.is_err(), "Expected error due to invalid key, got {:?}", res);
     }
 
