@@ -8,7 +8,7 @@
 ## 1. 工作区结构（宿主 + 契约 crate + 插件）
 
 ```
-Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "crates/plugins/*", "xtask"]
+Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
 src/                  # crate: only-js（lib + bench）——核心执行层
 ├── lib.rs            # 导出 bridge + config
 ├── main.rs           # bench 入口（criterion harness，非服务）
@@ -52,11 +52,11 @@ oj/                   # crate: oj（CLI 入口）
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/routes.js/锁/tgz）
 └── server_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
 oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION）
-crates/plugins/       # 第一方插件统一目录（cdylib）
+plugins/             # 第一方插件统一目录（cdylib）
   oj-es/ oj-db-mysql/ oj-db-postgres/ oj-blob-s3/   # es/db/blob 轴
   oj-bus-kafka/ oj-bus-rabbitmq/ oj-kv-redis/       # bus/kv 轴
-xtask/                # crate: cargo xtask plugin <name> 构建 + 拷入 plugins/<triple>/
-plugins/<triple>/     # 装配产物目录（CI 平台矩阵归置；本地 xtask 写入）
+tools/xtask/          # crate: cargo xtask bin/plugin/build 构建 + 归置到 bin/
+bin/                  # 编译产物目录（bin/oj + bin/plugins/<triple>/，CI 平台矩阵与本地 xtask 写入）
 ```
 
 依赖分层：`bridge`（纯执行，不依赖 HTTP 框架）← `server`（axum 路由 + actor）← `cli`（装配）；
@@ -67,8 +67,8 @@ plugins/<triple>/     # 装配产物目录（CI 平台矩阵归置；本地 xtas
 ## 2. 构建与测试
 
 ```bash
-cargo build                                   # debug
-cargo build --release                         # release（产物在 target/release/oj）
+cargo build                                   # release（.cargo/config.toml 将 build 别名为 --profile release；禁止 debug）
+cargo build --release                         # 等价 release
 cargo test -p oj                              # 单测 + e2e
 cargo test -p mdm-server                      # server 单测
 cargo test --workspace -- --skip infinite_loop # 全部（infinite_loop 在部分平台 SIGSEGV，跳过）
@@ -76,13 +76,15 @@ cargo run -p oj -- server -c sample/config.yaml -d sample/src        # dev（按
 cargo run -p oj -- build -d sample/src -o sample/dist
 cargo bench -p only-js                  # bridge 基准（**必须 release**）
 
-# 插件（Task 4.1-4.4：外部后端全部 cdylib 化）
-cargo xtask plugin es                          # 编译 oj-es（release）+ 拷入 plugins/<triple>/
+# 插件（Task 4.1-4.4：外部后端全部 cdylib 化；产物归置 bin/plugins/<triple>/）
+cargo xtask bin                                # 构建 oj（release）→ bin/oj
+cargo xtask plugin es                          # 编译 oj-es（release）+ 拷入 bin/plugins/<triple>/
 cargo xtask plugin db-mysql db-postgres        # db 轴
 cargo xtask plugin blob-s3                     # blob 轴
 cargo xtask plugin bus-kafka bus-rabbitmq      # bus 轴
 cargo xtask plugin kv-redis                    # kv 轴
 cargo xtask plugin <name> --check              # PluginLoader 预检（ABI/身份/semver/符号）
+cargo xtask build                              # oj + 全部插件 → bin/
 
 # 覆盖率（需 cargo-llvm-cov；deno_core V8 需用 llvm-cov 而非内置 --coverage）
 cargo llvm-cov --workspace --summary-only
@@ -320,8 +322,9 @@ panic=unwind profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装�
 消费（构造放 core，装配层只经安全入口）。
 
 **装配语义**（`plugin_loader.rs`，spec §5）：
-- 路径四级解析：`OJ_PLUGINS_DIR` > `config plugins_dir` > `<exe>/plugins` > workspace 后备，
-  相对路径相对 config 目录，最终目录 = `<plugins_dir>/<host-triple>/`。
+- 路径四级解析：`OJ_PLUGINS_DIR` > `config plugins_dir` > `<exe>/plugins`（bin/oj 旁即 `bin/plugins`）
+  > `<workspace_root>/bin/plugins`（与 xtask 产物归置同形），相对路径相对 config 目录，
+  最终目录 = `<plugins_dir>/<host-triple>/`。
 - 双模式：`plugins:` 清单显式给出 → 严格按名装配（缺文件/身份不符/`@semver` pin 不符 fail
   fast）；缺省 → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。
 - 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` 输出
@@ -340,6 +343,6 @@ panic=unwind profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装�
 
 **升级回滚**（部署侧）：插件替换用 `.new`/`.bak` 原子换名；`cargo xtask plugin --check` 预检；
 ABI bump 部署顺序 = 先升插件到新 ABI 并验证，再升宿主（或同版本原子升级）。平台矩阵与
-`plugins/<triple>/` 布局见 `.github/workflows/plugin-matrix.yml`。
+`bin/plugins/<triple>/` 布局见 `.github/workflows/plugin-matrix.yml`。
 
 **第三方插件**：见 `docs/plugin-development.md`（FFI 契约、ABI 纪律、入口宏、panic 归因）。

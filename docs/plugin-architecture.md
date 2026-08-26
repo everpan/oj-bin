@@ -128,11 +128,11 @@ only-js/        core: bridge_ext(核心 ops) + Plugin trait + BridgeBuilder
     db_backend.rs     ← 新增：DbBackend trait + DbBackendRegistry + 内置后端
     db.rs             → 收敛为 DataAccessor/TxSession/InMemoryAccessor（方言无关）
 oj-blob/              crate: BlobBackend + LocalBlob + S3Blob + op_blob_* + 自己的 bootstrap 片段
-crates/plugins/oj-kv-redis/          crate: RedisKV + op_kv_*(redis 变体) + bootstrap（挂 globalThis.redis）
-crates/plugins/oj-es/                crate: EsClient + op_es_* + bootstrap（挂 globalThis.es）
+plugins/oj-kv-redis/          crate: RedisKV + op_kv_*(redis 变体) + bootstrap（挂 globalThis.redis）
+plugins/oj-es/                crate: EsClient + op_es_* + bootstrap（挂 globalThis.es）
 oj-db-sqlite/         crate: SqliteBackend + (Plugin 注册)
-crates/plugins/oj-db-mysql/          crate: MySqlBackend + (Plugin 注册，feature-gate sqlx/mysql)
-crates/plugins/oj-db-postgres/       crate: PostgresBackend + (Plugin 注册，feature-gate sqlx/postgres)
+plugins/oj-db-mysql/          crate: MySqlBackend + (Plugin 注册，feature-gate sqlx/mysql)
+plugins/oj-db-postgres/       crate: PostgresBackend + (Plugin 注册，feature-gate sqlx/postgres)
 ```
 
 ---

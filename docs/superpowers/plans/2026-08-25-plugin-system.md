@@ -1135,7 +1135,7 @@ pub struct PluginManifestEntry {
 pub(crate) unsafe fn load_forget(path: &Path) -> Result<&'static libloading::Library, PluginLoadError>;
 ```
 
-- [x] **Step 1: 准备测试插件**——`tests/plugins/` 加一个 mini cdylib crate（`oj-plugin-ffi` 的 `oj_plugin_entry!`，init 返回固定 descriptor），xtask 或 build.rs 在测试前编译并拷到 `target/test-plugins/<triple>/`。（此夹具后续全部加载测试复用。）
+- [x] **Step 1: 准备测试插件**——`tests/plugins/` 加一个 mini cdylib crate（`oj-plugin-ffi` 的 `oj_plugin_entry!`，init 返回固定 descriptor），xtask 或 build.rs 在测试前编译并拷到 `target/test-bin/plugins/<triple>/`。（此夹具后续全部加载测试复用。）
 
 - [x] **Step 2: 写失败测试**——路径解析四级优先级各一例（env 覆盖 toml、toml 覆盖 exe 旁、显式不存在报错、默认不存在为零插件）；清单模式文件缺失 → `FileMissing`；ABI 不符 → `AbiMismatch`（测试插件编译时用环境变量覆盖其报告版本）；身份不符 → `IdentityMismatch`；扫描模式空目录 → 零插件、坏插件 → Err。
 
@@ -1222,7 +1222,7 @@ unix@vip.qq.com ai"
 ### Task 3.4: oj-es cdylib 插件
 
 **Files:**
-- Create: `crates/plugins/oj-es/Cargo.toml`（`crate-type = ["cdylib"]`、`panic = "unwind"` 显式声明）、`crates/plugins/oj-es/src/lib.rs`
+- Create: `plugins/oj-es/Cargo.toml`（`crate-type = ["cdylib"]`、`panic = "unwind"` 显式声明）、`plugins/oj-es/src/lib.rs`
 - Modify: `Cargo.toml`（workspace members）
 - Test: oj-es 内（单测）+ 阶段 6 全链路验收
 
@@ -1231,7 +1231,7 @@ unix@vip.qq.com ai"
 - Produces: cdylib 产物 `liboj_es.so/.dylib` / `oj_es.dll`；插件侧结构：
 
 ```rust
-// crates/plugins/oj-es/src/lib.rs
+// plugins/oj-es/src/lib.rs
 struct EsPluginState { rt: tokio::runtime::Runtime, clients: Mutex<HashMap<u64, EsClientInner>>, next: AtomicU64 }
 // init：建 runtime（Task S.2 形态），解析 cfg JSON（endpoint），注册 es vtable 工厂
 oj_plugin_ffi::oj_plugin_entry!(init);
@@ -1252,7 +1252,7 @@ Expected: 产出 `.dylib`（本机 macOS）/`.so`
 - [x] **Step 4: Commit**
 
 ```bash
-git add crates/plugins/oj-es/ Cargo.toml Cargo.lock src/bridge/es.rs
+git add plugins/oj-es/ Cargo.toml Cargo.lock src/bridge/es.rs
 git commit -m "feat(oj-es): 首个 cdylib 插件——es HTTP 实现迁入，插件自建 tokio runtime
 
 unix@vip.qq.com ai"
@@ -1268,11 +1268,11 @@ unix@vip.qq.com ai"
 - Produces:
 
 ```
-cargo xtask plugin <name>        # 编译 oj-<name>（release）+ 拷入 仓库根 ./plugins/<host-triple>/
+cargo xtask plugin <name>        # 编译 oj-<name>（release）+ 拷入 仓库根 bin/plugins/<host-triple>/
 cargo xtask plugin <name> --check # loader dry-run：ABI/semver/符号预检，不注册不驻留
 ```
 
-- [x] **Step 1: 实现**——`std::process::Command` 调 `cargo build -p oj-<name> --release`；产物名按平台映射（`liboj_<name>.so|dylib` / `oj_<name>.dll`，`-`→`_`）；host triple 用 `rustc -vV` 解析；拷贝目标 = 仓库根 `./plugins/<triple>/`（与 dev 后备查找对应，spec §4）。`--check` 复用 Task 3.2 的 PluginLoader（加载→校验→**不 forget 直接 drop 句柄仅用于 dry-run**？——不：dry-run 在子进程里跑，forget 无妨，复用同一入口保证预检与真实加载一致）。
+- [x] **Step 1: 实现**——`std::process::Command` 调 `cargo build -p oj-<name> --release`；产物名按平台映射（`liboj_<name>.so|dylib` / `oj_<name>.dll`，`-`→`_`）；host triple 用 `rustc -vV` 解析；拷贝目标 = 仓库根 `bin/plugins/<triple>/`（与 dev 后备查找对应，spec §4）。`--check` 复用 Task 3.2 的 PluginLoader（加载→校验→**不 forget 直接 drop 句柄仅用于 dry-run**？——不：dry-run 在子进程里跑，forget 无妨，复用同一入口保证预检与真实加载一致）。
   > 命名约定落地：编译产物（crate `oj-<name>` → `liboj_<name>.*`）拷贝时**改名**为 loader 的 `plugin_file_name(name)`（`lib<name>.*`，descriptor.name 对齐，同 plugin_loader 测试对 mini 的做法）；xtask 内复制该命名（loader 的 `plugin_file_name` 是 pub(crate)）。
 
 - [x] **Step 2: 自验**
@@ -1285,7 +1285,7 @@ Expected: `libes.dylib` 就位；`cargo xtask plugin es --check` 退出码 0
 
 ```bash
 git add xtask/ .cargo/ Cargo.toml
-git commit -m "feat(xtask): cargo xtask plugin——单独编译 + 拷入 ./plugins/<triple>/ + --check 预检
+git commit -m "feat(xtask): cargo xtask plugin——单独编译 + 拷入 bin/plugins/<triple>/ + --check 预检
 
 unix@vip.qq.com ai"
 ```
@@ -1376,7 +1376,7 @@ unix@vip.qq.com ai"
 **Files:**
 - Modify: `oj-plugin-ffi/src/lib.rs`（db vtable + tx 句柄族，ABI_VERSION bump 到 2，全部已出插件同步重编）
 - Modify: `src/bridge/ffi.rs`（FfiDataAccessor 适配器）
-- Create: `crates/plugins/oj-db-mysql/`、`crates/plugins/oj-db-postgres/`（cdylib）
+- Create: `plugins/oj-db-mysql/`、`plugins/oj-db-postgres/`（cdylib）
 - Test: ffi.rs mock + `OJ_TEST_MYSQL`/`OJ_TEST_PG` env-gated 集成测试
 
 **Interfaces:**
@@ -1408,7 +1408,7 @@ pub struct DataAccessorVtable {
 - [x] **Step 2: 跑测试确认失败** → **Step 3: 实现适配器 + 两插件 crate**（插件内嵌各自 sqlx DataAccessor 实现，插件边界内可用 `sqlx::Any` 单方言 feature；共享逻辑抽插件侧公共 crate 或接受复制——决策在此步做并记录 commit message）→ **Step 4: 测试通过 + env-gated 真连测试**（`OJ_TEST_MYSQL=mysql://… cargo test -p oj-db-mysql`）→ **Step 5: 接线**（DbBackendRegistry 注册 FFI 版 mysql/postgres 工厂，内置 SqliteBackend/MemoryBackend 保留）→ **Step 6: Commit**
 
 ```bash
-git commit -m "feat(db): db 轴 FFI——tx 句柄化 + crates/plugins/oj-db-mysql + crates/plugins/oj-db-postgres cdylib
+git commit -m "feat(db): db 轴 FFI——tx 句柄化 + plugins/oj-db-mysql + plugins/oj-db-postgres cdylib
 
 unix@vip.qq.com ai"
 ```
@@ -1417,7 +1417,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（blob vtable）、`src/bridge/ffi.rs`（FfiBlobBackend）
-- Create: `crates/plugins/oj-blob-s3/`（cdylib；LocalBlob 留 core 内置）
+- Create: `plugins/oj-blob-s3/`（cdylib；LocalBlob 留 core 内置）
 - Test: ffi.rs mock + `OJ_TEST_S3` env-gated
 
 **Interfaces:**
@@ -1448,7 +1448,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（bus vtable + HostContext 增 deliver 回调 = ABI bump）、`src/bridge/ffi.rs`（FfiEventBroker）
-- Create: `crates/plugins/oj-bus-kafka/`、`crates/plugins/oj-bus-rabbitmq/`（cdylib）
+- Create: `plugins/oj-bus-kafka/`、`plugins/oj-bus-rabbitmq/`（cdylib）
 - Test: ffi.rs mock + env-gated kafka/rabbitmq 集成测试
 
 **Interfaces:**
@@ -1479,7 +1479,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `oj-plugin-ffi`（kv vtable）、`src/bridge/ffi.rs`（FfiKVStore）
-- Create: `crates/plugins/oj-kv-redis/`（cdylib；InMemoryKV 留 core 内置兜底）
+- Create: `plugins/oj-kv-redis/`（cdylib；InMemoryKV 留 core 内置兜底）
 - Test: ffi.rs mock + `OJ_TEST_REDIS` env-gated
 
 **Interfaces:**
@@ -1524,13 +1524,13 @@ Expected: 无输出（core 二进制不再链接这些驱动）
 Run: `cargo test --workspace -- --skip infinite_loop`
 Expected: 全绿
 
-- [x] **Step 4: CI 平台矩阵**——宿主 + 全部第一方插件按矩阵构建（`x86_64-unknown-linux-gnu`（最旧受支持 glibc 镜像为基线）/ 按需 `x86_64-unknown-linux-musl` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`），产物归置 `plugins/<triple>/` 布局；Windows 构建优先 vendored 依赖。
+- [x] **Step 4: CI 平台矩阵**——宿主 + 全部第一方插件按矩阵构建（`x86_64-unknown-linux-gnu`（最旧受支持 glibc 镜像为基线）/ 按需 `x86_64-unknown-linux-musl` / `aarch64-apple-darwin` / `x86_64-pc-windows-msvc`），产物归置 `bin/plugins/<triple>/` 布局；Windows 构建优先 vendored 依赖。
 
 - [x] **Step 5: Commit**
 
 ```bash
 git add -A
-git commit -m "build(core): 瘦身收敛 sqlite-only + CI 平台矩阵产物归置 plugins/<triple>/
+git commit -m "build(core): 瘦身收敛 sqlite-only + CI 平台矩阵产物归置 bin/plugins/<triple>/
 
 unix@vip.qq.com ai"
 ```
@@ -1557,7 +1557,7 @@ unix@vip.qq.com ai"
 - Modify: `docs/dev-manual.md`、`docs/user-manual.md`
 - Create: `docs/plugin-development.md`（第三方插件开发指南）
 
-- [x] **Step 1: 写文档**——清单与扫描双模式语义、目录布局 `plugins/<triple>/`、升级回滚流程（`.new`/`.bak` + `cargo xtask plugin --check` + ABI bump 部署顺序）、FFI 契约（oj-plugin-ffi 类型面、ABI_VERSION 纪律、契约演进总则）、第三方插件开发指南（插件须自包含或显式声明系统依赖、panic=unwind、入口宏用法）、panic 归因流程（panic hook 输出 + symbols/ 目录）。
+- [x] **Step 1: 写文档**——清单与扫描双模式语义、目录布局 `bin/plugins/<triple>/`、升级回滚流程（`.new`/`.bak` + `cargo xtask plugin --check` + ABI bump 部署顺序）、FFI 契约（oj-plugin-ffi 类型面、ABI_VERSION 纪律、契约演进总则）、第三方插件开发指南（插件须自包含或显式声明系统依赖、panic=unwind、入口宏用法）、panic 归因流程（panic hook 输出 + symbols/ 目录）。
 
 - [x] **Step 2: Commit**
 

@@ -10,16 +10,36 @@ use std::sync::{Arc, Mutex, Once};
 /// 七类加载失败（spec §4），各自独立错误文案。
 #[derive(Debug)]
 pub enum PluginLoadError {
-    FileMissing { path: PathBuf },
+    FileMissing {
+        path: PathBuf,
+    },
     /// 含 glibc 基线不满足。
-    PlatformMismatch { path: PathBuf, detail: String },
+    PlatformMismatch {
+        path: PathBuf,
+        detail: String,
+    },
     /// 透出 loader 原始错误。
-    DependencyResolution { path: PathBuf, loader_text: String },
-    AbiMismatch { plugin: u32, host: u32 },
-    SymbolMissing { path: PathBuf, symbol: &'static str },
-    IdentityMismatch { expected: String, actual: String },
+    DependencyResolution {
+        path: PathBuf,
+        loader_text: String,
+    },
+    AbiMismatch {
+        plugin: u32,
+        host: u32,
+    },
+    SymbolMissing {
+        path: PathBuf,
+        symbol: &'static str,
+    },
+    IdentityMismatch {
+        expected: String,
+        actual: String,
+    },
     /// init 返回错误或 panic。
-    InitFailed { name: String, detail: String },
+    InitFailed {
+        name: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for PluginLoadError {
@@ -30,16 +50,30 @@ impl fmt::Display for PluginLoadError {
                 write!(f, "plugin platform mismatch: {} ({detail})", path.display())
             }
             Self::DependencyResolution { path, loader_text } => {
-                write!(f, "plugin dependency resolution failed: {} ({loader_text})", path.display())
+                write!(
+                    f,
+                    "plugin dependency resolution failed: {} ({loader_text})",
+                    path.display()
+                )
             }
             Self::AbiMismatch { plugin, host } => {
-                write!(f, "plugin ABI mismatch: plugin={plugin} host={host} (rebuild plugin against oj-plugin-ffi ABI {host})")
+                write!(
+                    f,
+                    "plugin ABI mismatch: plugin={plugin} host={host} (rebuild plugin against oj-plugin-ffi ABI {host})"
+                )
             }
             Self::SymbolMissing { path, symbol } => {
-                write!(f, "plugin symbol missing: {} (symbol `{symbol}`)", path.display())
+                write!(
+                    f,
+                    "plugin symbol missing: {} (symbol `{symbol}`)",
+                    path.display()
+                )
             }
             Self::IdentityMismatch { expected, actual } => {
-                write!(f, "plugin identity mismatch: expected '{expected}', got '{actual}'")
+                write!(
+                    f,
+                    "plugin identity mismatch: expected '{expected}', got '{actual}'"
+                )
             }
             Self::InitFailed { name, detail } => {
                 write!(f, "plugin init failed: {name} ({detail})")
@@ -64,7 +98,7 @@ pub struct Registrations {
     pub db: Option<&'static oj_plugin_ffi::DataAccessorVtable>, // Task 4.1 起填
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>, // Task 4.2 起填
     pub bus: Option<&'static oj_plugin_ffi::EventBrokerVtable>, // Task 4.3 起填
-    pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>, // Task 4.4 起填
+    pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>,   // Task 4.4 起填
 }
 
 pub struct LoadedPlugin {
@@ -118,8 +152,10 @@ pub fn es_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::EsBack
 /// 从已加载插件的 db 注册槽构造 core 工厂（scheme 由插件 vtable 自报，Task 4.1）。
 pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBackend>> {
     loaded.registrations.db.map(|vt| {
-        Arc::new(super::ffi::FfiDbBackend::new(&loaded.descriptor.name[..], vt))
-            as Arc<dyn crate::bridge::DbBackend>
+        Arc::new(super::ffi::FfiDbBackend::new(
+            &loaded.descriptor.name[..],
+            vt,
+        )) as Arc<dyn crate::bridge::DbBackend>
     })
 }
 
@@ -127,8 +163,10 @@ pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBack
 /// Task 4.3；connect 时经 vtable 产 FfiEventBroker）。
 pub fn bus_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::BusBackend>> {
     loaded.registrations.bus.map(|vt| {
-        Arc::new(super::ffi::FfiBusBackend::new(&loaded.descriptor.name[..], vt))
-            as Arc<dyn crate::bridge::BusBackend>
+        Arc::new(super::ffi::FfiBusBackend::new(
+            &loaded.descriptor.name[..],
+            vt,
+        )) as Arc<dyn crate::bridge::BusBackend>
     })
 }
 
@@ -140,7 +178,9 @@ pub async fn kv_backend_connect(
 ) -> Result<Arc<dyn crate::bridge::KVStore>, String> {
     let cfg_json = serde_json::json!({ "url": url }).to_string();
     let fut = (vt.connect)(RString::from(cfg_json.as_str()));
-    let bytes = super::ffi::await_ffi(fut).await.map_err(|e| format!("kv connect: {e}"))?;
+    let bytes = super::ffi::await_ffi(fut)
+        .await
+        .map_err(|e| format!("kv connect: {e}"))?;
     let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|e| format!("kv connect decode: {e}"))?
         .get("handle")
@@ -157,7 +197,9 @@ pub async fn blob_backend_connect(
     cfg_json: &str,
 ) -> Result<Arc<dyn crate::bridge::BlobBackend>, String> {
     let fut = (vt.connect)(RString::from(name), RString::from(cfg_json));
-    let bytes = super::ffi::await_ffi(fut).await.map_err(|e| format!("blob connect: {e}"))?;
+    let bytes = super::ffi::await_ffi(fut)
+        .await
+        .map_err(|e| format!("blob connect: {e}"))?;
     let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|e| format!("blob connect decode: {e}"))?
         .get("handle")
@@ -167,8 +209,8 @@ pub async fn blob_backend_connect(
         as Arc<dyn crate::bridge::BlobBackend>)
 }
 
-/// 加载路径四级解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >
-/// <exe>/plugins > build.rs dev 后备（workspace root 常量）。
+/// 加载路径解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >
+/// <exe>/plugins > <workspace_root>/bin/plugins（与 xtask 产物归置同形）。
 /// relative 一律相对 oj.toml 所在目录（config_dir）。返回最终目录 = <plugins_dir>/<host-triple>/。
 /// 显式配置 1/2 而目录不存在 → Err；默认 3/4 不存在 → Ok(None)（零插件）。
 pub fn resolve_plugins_dir(
@@ -176,7 +218,11 @@ pub fn resolve_plugins_dir(
     toml_plugins_dir: Option<&Path>,
 ) -> Result<Option<PathBuf>, String> {
     let abs = |p: &Path| {
-        if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            config_dir.join(p)
+        }
     };
     let explicit = match std::env::var_os("OJ_PLUGINS_DIR") {
         Some(v) => Some(abs(Path::new(&v))),
@@ -196,7 +242,7 @@ pub fn resolve_plugins_dir(
             candidates.push(dir.join("plugins"));
         }
     }
-    candidates.push(ffi::workspace_root().join("plugins"));
+    candidates.push(ffi::workspace_root().join("bin").join("plugins"));
     for base in candidates {
         let dir = base.join(ffi::triple());
         if dir.is_dir() {
@@ -239,8 +285,13 @@ impl Drop for CurrentPluginGuard {
 pub fn host_context() -> RArc<HostContext> {
     static CTX: Mutex<Option<RArc<HostContext>>> = Mutex::new(None);
     let mut g = CTX.lock().unwrap();
-    g.get_or_insert_with(|| RArc::new(HostContext { log: host_log, deliver: super::ffi::host_deliver }))
-        .clone()
+    g.get_or_insert_with(|| {
+        RArc::new(HostContext {
+            log: host_log,
+            deliver: super::ffi::host_deliver,
+        })
+    })
+    .clone()
 }
 
 extern "C" fn host_log(level: u8, msg: RString) {
@@ -264,17 +315,31 @@ fn load_one(
     install_panic_hook();
     let lib = unsafe { ffi::load_forget(path)? };
 
-    let abi_sym = unsafe { lib.get::<extern "C" fn() -> u32>(b"oj_plugin_abi_version") }
-        .map_err(|_| PluginLoadError::SymbolMissing { path: path.to_path_buf(), symbol: "oj_plugin_abi_version" })?;
+    let abi_sym =
+        unsafe { lib.get::<extern "C" fn() -> u32>(b"oj_plugin_abi_version") }.map_err(|_| {
+            PluginLoadError::SymbolMissing {
+                path: path.to_path_buf(),
+                symbol: "oj_plugin_abi_version",
+            }
+        })?;
     let plugin_abi = abi_sym();
     if plugin_abi != ABI_VERSION {
-        return Err(PluginLoadError::AbiMismatch { plugin: plugin_abi, host: ABI_VERSION });
+        return Err(PluginLoadError::AbiMismatch {
+            plugin: plugin_abi,
+            host: ABI_VERSION,
+        });
     }
 
     let init_sym = unsafe {
-        lib.get::<extern "C" fn(RArc<HostContext>, RString) -> oj_plugin_ffi::RResult<PluginDescriptor, RString>>(b"oj_plugin_init")
+        lib.get::<extern "C" fn(
+            RArc<HostContext>,
+            RString,
+        ) -> oj_plugin_ffi::RResult<PluginDescriptor, RString>>(b"oj_plugin_init")
     }
-    .map_err(|_| PluginLoadError::SymbolMissing { path: path.to_path_buf(), symbol: "oj_plugin_init" })?;
+    .map_err(|_| PluginLoadError::SymbolMissing {
+        path: path.to_path_buf(),
+        symbol: "oj_plugin_init",
+    })?;
 
     // cfg 键 = 清单名或文件 stem（去 lib 前缀）。
     let probe = expected
@@ -288,19 +353,29 @@ fn load_one(
 
     let descriptor = match std::result::Result::from(r) {
         Ok(d) => d,
-        Err(e) => return Err(PluginLoadError::InitFailed { name: probe, detail: e[..].to_string() }),
+        Err(e) => {
+            return Err(PluginLoadError::InitFailed {
+                name: probe,
+                detail: e[..].to_string(),
+            });
+        }
     };
 
     // 硬门禁第二道：descriptor 内报告的 abi 也必须等值（防御插件绕过宏手写符号）。
     if descriptor.abi_version != ABI_VERSION {
-        return Err(PluginLoadError::AbiMismatch { plugin: descriptor.abi_version, host: ABI_VERSION });
+        return Err(PluginLoadError::AbiMismatch {
+            plugin: descriptor.abi_version,
+            host: ABI_VERSION,
+        });
     }
 
     // 指纹比对：不符仅告警不 fail（spec §3）。
     if &descriptor.fingerprint[..] != HOST_FINGERPRINT {
         eprintln!(
             "[oj-plugin] fingerprint mismatch: plugin '{}' built with [{}], host [{}]",
-            &descriptor.name[..], &descriptor.fingerprint[..], HOST_FINGERPRINT
+            &descriptor.name[..],
+            &descriptor.fingerprint[..],
+            HOST_FINGERPRINT
         );
     }
 
@@ -331,7 +406,10 @@ fn load_one(
         kv: raw.kv(),
     };
 
-    Ok(LoadedPlugin { descriptor, registrations })
+    Ok(LoadedPlugin {
+        descriptor,
+        registrations,
+    })
 }
 
 fn file_stem_name(path: &Path) -> String {
@@ -356,7 +434,10 @@ pub fn load_manifest(
 
 /// 扫描装配（缺省模式）：加载 dir 下全部符合命名约定的库文件（文件名排序保确定性）；
 /// 目录不存在/为空 → Ok(vec![])；扫描到但校验失败 → Err（不静默跳过，spec §5）。
-pub fn load_scanned(dir: &Path, host: RArc<HostContext>) -> Result<Vec<LoadedPlugin>, PluginLoadError> {
+pub fn load_scanned(
+    dir: &Path,
+    host: RArc<HostContext>,
+) -> Result<Vec<LoadedPlugin>, PluginLoadError> {
     if !dir.is_dir() {
         return Ok(vec![]);
     }

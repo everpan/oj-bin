@@ -191,7 +191,10 @@ pub struct TenantCfg {
 
 impl Default for TenantCfg {
     fn default() -> Self {
-        Self { enable: false, header_key: "X-TENANT-ID".into() }
+        Self {
+            enable: false,
+            header_key: "X-TENANT-ID".into(),
+        }
     }
 }
 
@@ -243,7 +246,7 @@ pub struct Config {
     /// plugins 清单（显式给出 → 严格按清单装配，缺文件/版本不符 fail fast；
     /// None = 缺省扫描 plugins_dir 全部加载）。
     pub plugins: Option<Vec<String>>,
-    /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > workspace 后备）。
+    /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }
 
@@ -265,7 +268,8 @@ pub fn load_from(dir: &Path, explicit: Option<&str>) -> Result<Config, String> {
             full
         }
     };
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -330,7 +334,11 @@ mod tests {
         assert!(!c.tenant.enable && c.tenant.header_key == "X-TENANT-ID");
         let dir = std::env::temp_dir().join(format!("ojcfgt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cfg.yaml"), "tenant:\n  enable: true\n  header_key: X-ACCT\n").unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "tenant:\n  enable: true\n  header_key: X-ACCT\n",
+        )
+        .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
         let _ = std::fs::remove_dir_all(&dir);
@@ -381,7 +389,11 @@ mod tests {
     fn blob_flat_legacy_maps_to_default_entry() {
         let dir = std::env::temp_dir().join(format!("ojcfglg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cfg.yaml"), "blob:\n  driver: local\n  root: up2\n").unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "blob:\n  driver: local\n  root: up2\n",
+        )
+        .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         let entries = c.blob.expect("some").entries().unwrap();
         assert_eq!(entries.len(), 1);
@@ -432,7 +444,11 @@ mod tests {
         // es: 段存在 → Some(endpoint)；endpoint 原样保留（尾斜杠由 EsClient.url_for 剪除）
         let dir = std::env::temp_dir().join(format!("ojcfge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cfg.yaml"), "es:\n  endpoint: http://127.0.0.1:9200/\n").unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "es:\n  endpoint: http://127.0.0.1:9200/\n",
+        )
+        .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         let e = c.es.expect("some");
         assert_eq!(e.endpoint, "http://127.0.0.1:9200/");
@@ -497,7 +513,12 @@ mod tests {
         // 空段缺省
         let d = BrokerCfg::default();
         assert_eq!(d.kind, "");
-        assert!(d.brokers.is_empty() && d.url.is_none() && d.group.is_none() && d.topic_prefix.is_none());
+        assert!(
+            d.brokers.is_empty()
+                && d.url.is_none()
+                && d.group.is_none()
+                && d.topic_prefix.is_none()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

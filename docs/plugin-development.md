@@ -122,7 +122,8 @@ oj_plugin_ffi::oj_plugin_entry!(init);
 ## 8. 构建与调试
 
 ```bash
-# 本地构建 + 拷入 plugins/<host-triple>/（xtask 用 release）
+# 本地构建 + 拷入 bin/plugins/<host-triple>/（xtask 用 release）
+cargo xtask bin                                # 主程序 → bin/oj
 cargo xtask plugin <name>
 cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/符号）
 
@@ -130,7 +131,7 @@ cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/�
 cargo run -p oj -- serve ...
 ```
 
-**panic 归因**：panic hook 已输出插件名 + 宿主指纹。若需源码级调试，在 `plugins/<triple>/`
+**panic 归因**：panic hook 已输出插件名 + 宿主指纹。若需源码级调试，在 `bin/plugins/<triple>/`
 旁保留对应构建的符号文件（`symbols/` 目录），`lldb`/`gdb` 附加后 `bt` 定位。
 
 ## 9. 第一方插件清单（参照模板）
@@ -143,4 +144,4 @@ cargo run -p oj -- serve ...
 | `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
 | `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
 
-> 所有第一方插件源码统一位于 `crates/plugins/`；构建产物（cdylib）归置 `plugins/<triple>/`，由 `.gitignore` 忽略。
+> 所有第一方插件源码统一位于 `plugins/`；构建产物（cdylib）归置 `bin/plugins/<triple>/`，由 `.gitignore` 忽略。

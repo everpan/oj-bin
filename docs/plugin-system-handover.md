@@ -87,8 +87,9 @@ session_forwards_cdp_and_close` 需真 Chrome CDP 端点，与本工作无关。
 - **加载失败分类**（`PluginLoadError` 七变体，各自独立文案）：FileMissing /
   PlatformMismatch（含 glibc）/ DependencyResolution / AbiMismatch / SymbolMissing /
   IdentityMismatch（含 semver pin 不符）/ InitFailed。
-- **四级路径解析**：`OJ_PLUGINS_DIR` > `oj.toml plugins_dir` > `<exe>/plugins` >
-  build.rs dev 后备；显式配置缺目录 → Err，缺省缺目录 → 零插件。
+- **四级路径解析**：`OJ_PLUGINS_DIR` > `oj.toml plugins_dir` > `<exe>/plugins`（bin/oj 旁即
+  `bin/plugins`）> `<workspace_root>/bin/plugins`（与 xtask 产物归置同形）；显式配置缺目录 →
+  Err，缺省缺目录 → 零插件。
 
 ## 5. 剩余工作（接手清单）
 
@@ -205,15 +206,15 @@ Task 6.2 Step 3 提交 `fix(review): 插件系统完成度 review 意见吸收`�
 | 加载器（路径解析/清单/扫描/七分类） | `src/bridge/plugin_loader.rs` + `tests.rs` |
 | 装配层（清单去重/冲突 fail-fast/§2 闸门） | `oj/src/server_cmd.rs`（`assemble_plugins`/`build_registries`） |
 | 插件自省 op | `src/bridge/plugins_op.rs` |
-| 插件 cdylib | `crates/plugins/oj-es` `crates/plugins/oj-db-mysql` `crates/plugins/oj-db-postgres` `crates/plugins/oj-blob-s3` `crates/plugins/oj-bus-kafka` `crates/plugins/oj-bus-rabbitmq` `crates/plugins/oj-kv-redis` |
+| 插件 cdylib | `plugins/oj-es` `plugins/oj-db-mysql` `plugins/oj-db-postgres` `plugins/oj-blob-s3` `plugins/oj-bus-kafka` `plugins/oj-bus-rabbitmq` `plugins/oj-kv-redis` |
 | 测试夹具插件 | `tests/plugins/mini` |
-| 构建产物归置 | `cargo xtask plugin <name>` → `./plugins/<host-triple>/` |
+| 构建产物归置 | `cargo xtask bin` → `bin/oj`；`cargo xtask plugin <name>` → `bin/plugins/<host-triple>/` |
 
 ## 8. 常用命令
 
 ```bash
 cargo test -p only-js <过滤词>                 # 单测（推荐按模块过滤）
 cargo test --workspace -- --skip infinite_loop       # 全套回归（Task 6.3）
-cargo xtask plugin <name>                            # 单独编译 + 拷入 plugins/<triple>/
+cargo xtask plugin <name>                            # 单独编译 + 拷入 bin/plugins/<triple>/
 cargo build -p oj-es                                 # 改插件后手动重建 cdylib
 ```

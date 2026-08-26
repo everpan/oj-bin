@@ -28,7 +28,7 @@
 Layer 3  装配层    oj / server：解析配置 → PluginLoader 定位/加载/校验 → 工厂注册 → builder
 Layer 2  插件层    oj-db-mysql / oj-db-postgres / oj-blob-s3 / oj-bus-kafka
                    / oj-bus-rabbitmq / oj-es / oj-kv-redis   —— cdylib crate，
-                   只依赖 oj-plugin-ffi + 各自后端 SDK，可单独编译、独立仓库（源码位于 `crates/plugins/`；构建产物归置 `plugins/<triple>/`）
+                   只依赖 oj-plugin-ffi + 各自后端 SDK，可单独编译、独立仓库（源码位于 `plugins/`；构建产物归置 `bin/plugins/<triple>/`）
 Layer 1  框架层    core：五个注册表 + PluginLoader + ffi.rs（全部 unsafe 收敛于此）
 契约层   oj-plugin-ffi（独立 crate）：稳定 ABI 数据容器、vtable 定义、FfiFuture、
                    HostContext、PluginDescriptor、入口符号宏（内建 panic 收敛）、ABI_VERSION
@@ -155,7 +155,7 @@ plugins/
   `oj_db_mysql.dll`（`-` 转 `_`，前缀/后缀按平台）；映射双向成立，扫描零新增概念；
   **宿主不维护已知插件名单**，任何合法名字均按约定映射（第三方插件不动 core 由此成立）；
 - **保存路径**：CI 归置发行；本地 `cargo xtask plugin <name>` 一条命令完成单独编译 +
-  拷入**仓库根 `./plugins/<host-triple>/`**（与发行布局同形，cargo clean 安全）；
+  拷入**仓库根 `bin/plugins/<host-triple>/`**（与发行布局同形，cargo clean 安全）；
 - **加载路径解析顺序**（先命中先赢；相对路径一律相对 oj.toml 所在目录解析）：
   1. 环境变量 `OJ_PLUGINS_DIR`（仅开发期，生产部署不应设置——见 §6 信任边界）；
   2. `oj.toml` 的 `plugins_dir`；
@@ -244,7 +244,7 @@ plugins/
 - **阶段 3 — 契约 crate + FFI 边界 + 首个 cdylib 试点**：`oj-plugin-ffi`（入口宏内建
   panic 收敛、FfiFuture、句柄化 tx、deliver 回调）+ `PluginLoader`（加载即 forget、
   四级路径解析、错误分类）+ **core 侧适配器层**（ffi.rs 内每轴 `FfiXxxBackend`
-  实现 core trait、转发 vtable）+ `cargo xtask plugin`（拷贝目标 = 仓库根 `./plugins/<triple>/`，
+  实现 core trait、转发 vtable）+ `cargo xtask plugin`（拷贝目标 = 仓库根 `bin/plugins/<triple>/`，
   与 dev 后备查找对应）+ `oj-es` 改造为 cdylib 走通全链路 + `op_plugins` 自省 op
   （列插件名/semver/ABI/指纹）。**硬验收**：插件 cdylib 内真实执行 sqlx 连接查询 +
   reqwest 请求 + `tokio::time::sleep` 不 panic；host op → FFI 同步方法 → 插件 runtime

@@ -182,9 +182,10 @@ only-js/
   oj/                  CLI binary: server / build / test subcommands (orchestration entry)
   server/              axum HTTP service: route lookup → run handler → write back Capture
   oj-plugin-ffi/       C-ABI contract shared by host and plugins (strict ABI_VERSION gate)
-  crates/plugins/      cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
+  plugins/             cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
                        / oj-bus-{kafka,rabbitmq} / oj-kv-redis
-  xtask/               plugin build / copy / preflight tooling
+  tools/xtask/         plugin build / copy / preflight tooling (outputs to bin/)
+  bin/                 build output: bin/oj (main) + bin/plugins/<triple>/ (plugin cdylibs)
   sample/              runnable example project (config.yaml + src/ + dist/)
   docs/                design and manuals
 ```
@@ -207,7 +208,7 @@ wraps the plugin vtable as a core backend; a panic inside a plugin is contained 
 ## Common development commands
 
 ```bash
-cargo build --workspace                  # build all members (incl. plugins)
+cargo build --workspace                  # build all members (release; output to bin/)
 cargo test                               # root crate unit tests
 cargo test --workspace                   # full test run (incl. oj e2e)
 cargo fmt --check                        # formatting gate
@@ -215,8 +216,10 @@ cargo clippy --all-targets -D warnings   # lint gate
 cargo bench                              # criterion benchmarks
 
 cargo run -p oj -- test -c sample/config.yaml    # run *.test.ts in-process (no server needed)
-cargo xtask plugin <name>                        # build plugin and copy into plugins/<triple>/
-cargo xtask plugin <name> --check                # plugin preflight (ABI / identity / semver / symbols)
+cargo xtask bin                                 # build oj and copy into bin/oj
+cargo xtask plugin <name>                       # build plugin and copy into bin/plugins/<triple>/
+cargo xtask plugin <name> --check               # plugin preflight (ABI / identity / semver / symbols)
+cargo xtask build                               # build oj + all plugins into bin/
 ```
 
 For async tests use `tokio::test(flavor = "current_thread")` — `JsRuntime` is `!Send`.

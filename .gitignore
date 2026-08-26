@@ -4,8 +4,9 @@ target/
 .claude/
 .superpowers/
 .codebuddy/
-# 运行时插件产物（插件源码现统一在 crates/plugins/*；plugins/<triple> 由 cargo xtask plugin 产出，整目录忽略）。
-plugins/
+# 编译产物统一归置到 bin/（主程序 oj + 插件 cdylib 构件 bin/plugins/<triple>），
+# 由 cargo xtask bin / plugin / build 产出，整目录忽略。
+bin/
 # 服务端按天滚动日志目录（默认 ./logs，可在 server.logs_dir 配置）。
 logs/
 CLAUDE.md

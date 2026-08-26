@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj", "oj-plugin-ffi", "crates/plugins/oj-es", "crates/plugins/oj-db-mysql", "crates/plugins/oj-db-postgres", "crates/plugins/oj-blob-s3", "crates/plugins/oj-bus-kafka", "crates/plugins/oj-bus-rabbitmq", "crates/plugins/oj-kv-redis", "xtask", "tests/plugins/mini"]
+members = ["server", "oj", "oj-plugin-ffi", "plugins/oj-es", "plugins/oj-db-mysql", "plugins/oj-db-postgres", "plugins/oj-blob-s3", "plugins/oj-bus-kafka", "plugins/oj-bus-rabbitmq", "plugins/oj-kv-redis", "tools/xtask", "tests/plugins/mini"]
 default-members = ["."]
 
 [package]
@@ -10,7 +10,7 @@ edition = "2024"
 # 无可选 feature：kafka/rabbitmq 事件 broker 已迁插件（Task 4.3，oj-bus-kafka /
 # oj-bus-rabbitmq cdylib 各自携带 rdkafka/lapin 客户端，core 不再依赖）。
 
-[dependencies]
+[dependencies]  
 async-trait = "0.1"
 base64 = "0.21"
 deno_core = "0.410"

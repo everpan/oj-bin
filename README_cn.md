@@ -166,9 +166,10 @@ only-js/
   oj/                  CLI 二进制：server / build / test 子命令（编排入口）
   server/              axum HTTP 服务：路由查找 → 执行 handler → 写回 Capture
   oj-plugin-ffi/       宿主与插件共享的 C-ABI 契约（ABI_VERSION 严格相等门禁）
-  crates/plugins/      cdylib 插件：oj-es / oj-db-{mysql,postgres} / oj-blob-s3
+  plugins/             cdylib 插件：oj-es / oj-db-{mysql,postgres} / oj-blob-s3
                        / oj-bus-{kafka,rabbitmq} / oj-kv-redis
-  xtask/               插件构建 / 拷贝 / 预检工具
+  tools/xtask/         插件构建 / 拷贝 / 预检工具（产物归置到 bin/）
+  bin/                 编译产物：bin/oj（主程序）+ bin/plugins/<triple>/（插件 cdylib）
   sample/              可跑的示例项目（config.yaml + src/ + dist/）
   docs/                设计与手册
 ```
@@ -189,7 +190,7 @@ fetch / http / ws）各自一个模块。
 ## 开发常用命令
 
 ```bash
-cargo build --workspace                  # 构建全部成员（含插件）
+cargo build --workspace                  # 构建全部成员（release，产物归置到 bin/）
 cargo test                               # 根 crate 单元测试
 cargo test --workspace                   # 全量测试（含 oj e2e）
 cargo fmt --check                        # 格式门禁
@@ -197,8 +198,10 @@ cargo clippy --all-targets -D warnings   # lint 门禁
 cargo bench                              # criterion 基准
 
 cargo run -p oj -- test -c sample/config.yaml    # 进程内跑 *.test.ts（无需起服务）
-cargo xtask plugin <name>                        # 构建插件并拷入 plugins/<triple>/
-cargo xtask plugin <name> --check                # 插件预检（ABI / 身份 / semver / 符号）
+cargo xtask bin                                 # 构建 oj 并拷入 bin/oj
+cargo xtask plugin <name>                       # 构建插件并拷入 bin/plugins/<triple>/
+cargo xtask plugin <name> --check               # 插件预检（ABI / 身份 / semver / 符号）
+cargo xtask build                               # 构建 oj + 全部插件到 bin/
 ```
 
 异步测试请用 `tokio::test(flavor = "current_thread")`——`JsRuntime` 是 `!Send` 的。

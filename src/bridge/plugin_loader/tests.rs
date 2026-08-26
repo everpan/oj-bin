@@ -81,10 +81,15 @@ fn resolve_explicit_missing_is_err() {
 fn resolve_default_missing_is_none() {
     let _g = ENV_LOCK.lock().unwrap();
     unsafe { std::env::remove_var("OJ_PLUGINS_DIR") };
-    // <exe>/plugins 与 workspace/plugins 均不存在时为零插件。
-    // 测试进程 exe 在 target/debug/deps，workspace root 无 plugins 目录（若日后有了需改此测试）。
+    // <exe>/plugins 与 <workspace_root>/bin/plugins 均不存在时为零插件。
+    // 测试进程 exe 在 target/debug/deps，workspace root 的 bin/plugins 无构件（若日后有了需改此测试）。
     let got = resolve_plugins_dir(Path::new("/nonexistent-cfg"), None).unwrap();
-    if ffi::workspace_root().join("plugins").join(ffi::triple()).is_dir() {
+    if ffi::workspace_root()
+        .join("bin")
+        .join("plugins")
+        .join(ffi::triple())
+        .is_dir()
+    {
         return; // 环境已有默认目录则跳过
     }
     assert_eq!(got, None);
@@ -96,7 +101,10 @@ fn resolve_default_missing_is_none() {
 fn manifest_load_ok() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: None,
+    }];
     let loaded = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(&loaded[0].descriptor.name[..], "mini");
@@ -106,7 +114,10 @@ fn manifest_load_ok() {
 #[test]
 fn manifest_file_missing() {
     let dir = mini_plugin_dir();
-    let manifest = vec![PluginManifestEntry { name: "ghost".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "ghost".into(),
+        semver_pin: None,
+    }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
     assert!(matches!(err, PluginLoadError::FileMissing { .. }), "{err}");
 }
@@ -118,7 +129,10 @@ fn manifest_abi_mismatch() {
     // 夹具读宿主进程 env 伪造 descriptor.abi_version（oj_plugin_abi_version 符号仍为真值，
     // 走第二道 descriptor 门禁）。
     unsafe { std::env::set_var("MINI_FAKE_ABI", "999") };
-    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: None,
+    }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
     unsafe { std::env::remove_var("MINI_FAKE_ABI") };
     match err {
@@ -137,20 +151,31 @@ fn manifest_identity_mismatch() {
     let dir = mini_plugin_dir();
     let impostor = dir.join(ffi::plugin_file_name("impostor"));
     std::fs::copy(dir.join(ffi::plugin_file_name("mini")), &impostor).unwrap();
-    let manifest = vec![PluginManifestEntry { name: "impostor".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "impostor".into(),
+        semver_pin: None,
+    }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
     std::fs::remove_file(&impostor).ok();
-    assert!(matches!(err, PluginLoadError::IdentityMismatch { .. }), "{err}");
+    assert!(
+        matches!(err, PluginLoadError::IdentityMismatch { .. }),
+        "{err}"
+    );
 }
 
 #[test]
 fn manifest_semver_pin_mismatch() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let manifest =
-        vec![PluginManifestEntry { name: "mini".into(), semver_pin: Some("9.9.9".into()) }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: Some("9.9.9".into()),
+    }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
-    assert!(matches!(err, PluginLoadError::IdentityMismatch { .. }), "{err}");
+    assert!(
+        matches!(err, PluginLoadError::IdentityMismatch { .. }),
+        "{err}"
+    );
 }
 
 /// init 期 panic → 宿主分类为 InitFailed（入口宏 catch_unwind 收敛，宿主进程不终止），
@@ -160,7 +185,10 @@ fn init_panic_is_classified_error() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
     unsafe { std::env::set_var("MINI_PANIC", "1") };
-    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: None,
+    }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
     unsafe { std::env::remove_var("MINI_PANIC") };
     match err {
@@ -206,7 +234,10 @@ fn panic_hook_attribution_line_emitted() {
 fn panic_hook_emit_helper() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let manifest = vec![PluginManifestEntry { name: "mini".into(), semver_pin: None }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: None,
+    }];
     let r = std::panic::catch_unwind(|| {
         let _ = load_manifest(&dir, &manifest, host_context(), &|_| panic!("cfg boom"));
     });
@@ -217,8 +248,10 @@ fn panic_hook_emit_helper() {
 fn manifest_semver_pin_ok() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let manifest =
-        vec![PluginManifestEntry { name: "mini".into(), semver_pin: Some("0.1.0".into()) }];
+    let manifest = vec![PluginManifestEntry {
+        name: "mini".into(),
+        semver_pin: Some("0.1.0".into()),
+    }];
     assert!(load_manifest(&dir, &manifest, host_context(), &no_cfg).is_ok());
 }
 

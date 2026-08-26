@@ -1,2 +1,8 @@
 [alias]
-xtask = "run --quiet --package xtask --"
+# xtask 自身务必走 release：否则 cargo run 会以 debug 构建 xtask（连带 only-js / V8
+# 走 debug），而 debug 的 rusty_v8 静态库不可用（CLAUDE.md 明令禁止 debug 构建）。
+xtask = "run --quiet --package xtask --release --"
+# 注：cargo 不允许用 alias 覆盖内建子命令（如 build），故无法在配置层把
+# `cargo build` 强制为 release。项目约定「禁止 debug 构建」：所有脚本/CI/工具
+# （deploy.sh、plugin-matrix.yml、cargo xtask）一律走 --release；日常开发也只
+# 使用 `cargo build --release`（或 `cargo xtask build`）。

@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+description = "开发工具：独立编译插件 + 拷入 bin/plugins/<triple>/ + --check 预检"
+
+[dependencies]
+only-js = { path = "../.." }
