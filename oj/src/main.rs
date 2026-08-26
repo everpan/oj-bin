@@ -86,6 +86,9 @@ mod tests {
             config: "no-such-config.yaml".into(),
             base: None,
             dir: None,
+            cert_path: None,
+            key_path: None,
+            grace_days: None,
         }))
         .await;
         assert_eq!(code, 1);

@@ -4,12 +4,19 @@
 use clap::{Parser, Subcommand};
 
 /// server 子命令参数。
+#[derive(Debug, Clone, Default)]
 pub struct ServerArgs {
     pub config: String,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
     /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定（server_cmd）。
     pub dir: Option<String>,
+    /// JWS 证书路径；Some 覆盖 config 的 server.certificate_path。
+    pub cert_path: Option<String>,
+    /// PEM 公钥路径；Some 覆盖 config 的 server.public_key_path。
+    pub key_path: Option<String>,
+    /// 证书过期后宽限天数；Some 覆盖 config 的 server.grace_days（默认 30）。
+    pub grace_days: Option<u64>,
 }
 
 /// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
@@ -61,12 +68,20 @@ enum Commands {
         /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
-        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：src 目录存在取 src，否则 dist
-        #[arg(short, long)]
-        dir: Option<String>,
-    },
-    /// 构建模块产物（src → dist：版本目录 / routes.js / tgz）
+    /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
+    /// 默认：src 目录存在取 src，否则 dist
+    #[arg(short, long)]
+    dir: Option<String>,
+    /// JWS 证书路径（覆盖 config 的 server.certificate_path）
+    #[arg(long)]
+    cert_path: Option<String>,
+    /// PEM 公钥路径（覆盖 config 的 server.public_key_path）
+    #[arg(long)]
+    key_path: Option<String>,
+    /// 证书过期后宽限天数（覆盖 config 的 server.grace_days，默认 30）
+    #[arg(long)]
+    grace_days: Option<u64>,
+    },    /// 构建模块产物（src → dist：版本目录 / routes.js / tgz）
     Build {
         /// 目标模块名（src 首层子目录）；省略 = 全部模块
         module: Option<String>,
@@ -112,7 +127,16 @@ pub fn parse_from(argv: impl IntoIterator<Item = impl Into<std::ffi::OsString> +
 /// Cli → 领域参数（server.dir 的 dev 条件默认在此落地）。
 fn to_command(cli: Cli) -> Command {
     match cli.command {
-        Commands::Server { config, base, dir } => Command::Server(ServerArgs { config, base, dir }),
+        Commands::Server { config, base, dir, cert_path, key_path, grace_days } => {
+            Command::Server(ServerArgs {
+                config,
+                base,
+                dir,
+                cert_path,
+                key_path,
+                grace_days,
+            })
+        }
         Commands::Build { module, dir, out, no_minify } => {
             Command::Build(BuildArgs { module, dir, out, minify: !no_minify })
         }

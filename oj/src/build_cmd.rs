@@ -10,7 +10,7 @@ use std::sync::Arc;
 use mdm_base_rust::bridge::{
     transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
 };
-use mdm_server::routes;
+use server::routes;
 
 use crate::args::BuildArgs;
 

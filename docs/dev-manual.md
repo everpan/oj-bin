@@ -216,6 +216,52 @@ RBAC 等真需求出现再议（YAGNI）。
   参数化值（sea-query）。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
 
+## 5.1 证书驱动的 GET 限制（运行时校验）
+
+生产可开启基于非对称加密（RSA-2048 + RS256 JWS）的证书校验，对过期证书做 GET 限流：
+
+- **有效期内 / 未配置证书**：正常服务（`certificate_status = valid`）。
+- **宽限期内（默认 30 天，可配 `grace_days`）**：所有 **GET** 请求返回 `403`，
+  JSON 体 `{"error":"certificate expired","detail":"grace period: N days remaining"}`；其余方法正常。
+- **宽限期结束后**：启动期 `from_config` 检测即 `ERROR` 并中止进程（`process::exit`）；
+  运行中（热替换成过期证书）则 GET 持续 `403`（服务不中断，运维可替换证书恢复）。
+- **热加载**：`notify` 监听公钥/证书文件变更（事件驱动，不轮询 mtime），原子更新
+  `AppState` 内共享状态（`Arc<RwLock>`），重载失败保留旧状态。
+
+### 配置（`config.yaml`）
+
+```yaml
+server:
+  public_key_path: "./config/public_key.pem"   # SPKI PEM 公钥（仅验签，私钥不落服务器）
+  certificate_path: "./config/certificate.jws" # JWS：Base64URL(Header).Base64URL(Payload).Base64URL(Signature)
+  grace_days: 30                               # 默认 30；缩窄可加速告警
+```
+
+### CLI 覆盖
+
+```sh
+oj server -c config.yaml --cert-path ./config/certificate.jws --key-path ./config/public_key.pem --grace-days 15
+```
+
+### 证书格式（JWS）
+
+```
+Header : {"alg":"RS256","typ":"JWT"}        # alg 仅接受 RS256（拒绝 alg=none 降级）
+Payload: {"nbf": <unix>, "exp": <unix>}     # nbf 生效、exp 过期（秒）
+Signature: RSASSA-PKCS1-v1_5(SHA256, Header.Payload)  用私钥签名
+```
+
+### 监控
+
+`GET {base}/health` 返回证书状态（即便进入宽限/过期仍可访问，便于探测）：
+
+```json
+{ "status": "OK", "certificate_status": "valid|grace|expired",
+  "certificate_expiry": "2027-01-01T00:00:00Z", "grace_remaining_secs": 123456 }
+```
+
+（设计背景见 `docs/superpowers/specs/2026-08-26-certificate-design.md`。）
+
 ## 6. deno_core 0.410 关键 API 差异
 
 （比 0.409 有破坏性变化，见 memory `deno-core-409-api-quirks` 的对照。）

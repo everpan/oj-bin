@@ -12,6 +12,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.21"
 deno_core = "0.410"
 deno_error = "0.7"
 libloading = "0.8"
@@ -40,10 +41,13 @@ object_store = { version = "0.11", features = ["aws"] }
 
 [dev-dependencies]
 criterion = "0.5"
+rand = "0.8"
+ring = "0.17"
+oj = { path = "oj" }
+server = { path = "server" }
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "test-util"] }
 httptest = "0.16"
 tempfile = "3"
-server = { path = "server" }
 
 [[bench]]
 name = "bridge"

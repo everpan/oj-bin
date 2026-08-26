@@ -20,8 +20,18 @@ use crate::app::App;
 use crate::args::ServerArgs;
 
 pub async fn run(a: ServerArgs) -> Result<(), String> {
-    let (cfg, config_dir, dir, ts, base) =
+    let (mut cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
+    // CLI 覆盖：证书路径与宽限天数（若有）。
+    if let Some(p) = a.cert_path {
+        cfg.server.certificate_path = p;
+    }
+    if let Some(p) = a.key_path {
+        cfg.server.public_key_path = p;
+    }
+    if let Some(d) = a.grace_days {
+        cfg.server.grace_days = Some(d);
+    }
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
     server::logging::init(&logs_dir);
@@ -568,9 +578,13 @@ mod tests {
 
     #[tokio::test]
     async fn server_root_missing_dir_fails_fast() {
+        // dir 指向不存在的子目录（相对 tmpdir），使模块扫描为空、顺利走到 server.root
+        // 校验；此前用绝对 "src" 会 canonicalize 到 oj/src（含无 manifest 的 test_ext），
+        // 在抵达 server.root 检查前就于模块扫描阶段报错，掩盖了本测试真正要验证的逻辑。
+        let t = tmpdir("sc-root-missing");
         let mut cfg = Config::default();
         cfg.server.root = Some("no-such-dir".into());
-        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
             .await
             .err()
             .unwrap_or_default();

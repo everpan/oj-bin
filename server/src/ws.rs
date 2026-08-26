@@ -336,7 +336,7 @@ mod tests {
             }
         };
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), actor, None, None, crate::Pipeline::default()).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), actor, None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
                 "/ws/bus",
                 handler,
                 std::time::Duration::from_secs(1),
@@ -364,7 +364,7 @@ mod tests {
     async fn ws_echo_roundtrip_on_pinned_thread() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None, None, crate::Pipeline::default()).merge(echo_route()),
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(echo_route()),
         )
         .await;
         let mut c = WsClient::connect(addr, "/ws").await;
@@ -379,7 +379,7 @@ mod tests {
         let handler = t.0.join("WS.js");
         std::fs::write(&handler, r#"json.ok({ pong: true });"#).unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None, None, crate::Pipeline::default()).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
                 "/ws/js",
                 handler.clone(),
                 std::time::Duration::from_secs(1),
@@ -407,7 +407,7 @@ mod tests {
         let handler = t.0.join("WS.js");
         std::fs::write(&handler, r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#).unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None, None, crate::Pipeline::default()).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
                 "/ws/close",
                 handler,
                 std::time::Duration::from_secs(1),
@@ -469,6 +469,8 @@ mod tests {
                 None,
                 None,
                 crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
             )
             .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
         )
@@ -518,6 +520,8 @@ mod tests {
                 None,
                 None,
                 crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
             )
             .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
         )
@@ -535,7 +539,7 @@ mod tests {
     async fn js_route_missing_handler_closes_quietly() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::actor(t.0.clone(), true), None, None, crate::Pipeline::default()).merge(js_route(
+            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
                 "/ws/missing",
                 t.0.join("nope.js"),
                 std::time::Duration::from_secs(1),

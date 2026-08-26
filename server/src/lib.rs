@@ -6,10 +6,11 @@ pub mod logging;
 pub mod routes;
 pub mod ws;
 pub mod certificate;
+pub mod certificate_watcher;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
@@ -50,10 +51,10 @@ pub struct AppState {
     pipeline: Pipeline,
     /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
     base: String,
-    /// 当前证书状态
-    pub certificate_status: CertificateStatus,
-    /// 证书有效期截止时间
-    pub certificate_valid_until: Option<std::time::SystemTime>,
+    /// 当前证书状态（热加载共享，可用 RwLock 原子更新）
+    pub certificate_status: Arc<RwLock<CertificateStatus>>,
+    /// 证书有效期截止时间（热加载共享）
+    pub certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -91,9 +92,13 @@ pub fn app(
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
     pipeline: Pipeline,
+    certificate_status: Arc<RwLock<CertificateStatus>>,
+    certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
 ) -> Router {
     let dir = dir.into();
+    let health_path = format!("{}/health", base.trim_end_matches('/'));
     Router::new()
+        .route(&health_path, axum::routing::get(health_handler))
         .fallback(any(handle))
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
         .layer(axum::middleware::from_fn(crate::logging::log_requests))
@@ -107,9 +112,40 @@ pub fn app(
             static_root,
             pipeline,
             base: base.to_string(),
-            certificate_status: CertificateStatus::Valid,
-            certificate_valid_until: None,
+            certificate_status,
+            certificate_valid_until,
         })
+}
+
+/// 健康检查：返回服务状态与证书状态（供监控轮询）。
+/// 此路由在证书 GET 限制之前注册，故即使证书进入宽限期/失效仍可访问，
+/// 以便 Prometheus/Grafana 及时发现。
+async fn health_handler(State(st): State<AppState>) -> Response {
+    let status_guard = st.certificate_status.read().expect("certificate_status lock poisoned");
+    let (status_str, grace_remaining_secs) = match &*status_guard {
+        CertificateStatus::Valid => ("valid", None),
+        CertificateStatus::Grace { remaining_secs } => ("grace", Some(*remaining_secs)),
+        CertificateStatus::Expired => ("expired", None),
+    };
+    let expiry = st
+        .certificate_valid_until
+        .read()
+        .expect("certificate_valid_until lock poisoned")
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+        .unwrap_or_default();
+    drop(status_guard);
+    let body = serde_json::json!({
+        "status": "OK",
+        "certificate_status": status_str,
+        "certificate_expiry": expiry,
+        "grace_remaining_secs": grace_remaining_secs,
+    });
+    let mut r = Response::new(axum::body::Body::from(serde_json::to_vec(&body).unwrap()));
+    r.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    r
 }
 
 /// 绑定监听并服务。
@@ -142,7 +178,22 @@ pub async fn serve_with_listener(
     static_root: Option<PathBuf>,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
-    serve_router(listener, app(base, dir, ts, table, actor, timeout, static_root, pipeline)).await
+    serve_router(
+        listener,
+        app(
+            base,
+            dir,
+            ts,
+            table,
+            actor,
+            timeout,
+            static_root,
+            pipeline,
+            Arc::new(RwLock::new(CertificateStatus::Valid)),
+            Arc::new(RwLock::new(None)),
+        ),
+    )
+    .await
 }
 
 /// 已绑定监听 + 完整 Router 服务（oj server 生产路径：app().merge(ws) 后经此起服务）。
@@ -161,6 +212,20 @@ async fn handle(
     body: axum::body::Bytes,
 ) -> Response {
     let verb = method.as_str();
+
+    // Certificate validation: restrict GET requests when certificate is expired or in grace period
+    if verb == "GET" {
+        match &*st.certificate_status.read().expect("certificate_status lock poisoned") {
+            CertificateStatus::Expired => {
+                return fail_response(403, "certificate expired: service unavailable");
+            }
+            CertificateStatus::Grace { remaining_secs: _ } => {
+                return fail_response(403, "certificate expired: service available in grace period, but GET requests are restricted");
+            }
+            CertificateStatus::Valid => {}
+        }
+    }
+
     // 内置 auth 路由（{base}/auth/*）：先于路由表（login/refresh/logout，POST only）。
     if let Some(auth) = st.pipeline.auth.clone()
         && let Some(rest) = crate::routes::normalize(uri.path())
@@ -484,8 +549,8 @@ pub(crate) mod tests {
             static_root: None,
             pipeline: Pipeline::default(),
             base: "/v1/api".to_string(),
-            certificate_status: CertificateStatus::Valid,
-            certificate_valid_until: None,
+            certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
+            certificate_valid_until: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -959,6 +1024,94 @@ pub(crate) mod tests {
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 500"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_reports_cert_status() {
+        use crate::CertificateStatus;
+        // 默认未配置证书 → Valid
+        let resp = crate::health_handler(axum::extract::State(dummy_app_state())).await;
+        let body = body_text(resp).await;
+        assert!(body.contains("\"certificate_status\":\"valid\""), "{body}");
+
+        // 注入 Grace 状态后，health 应反映 grace 与剩余秒数
+        let s = dummy_app_state();
+        *s.certificate_status.write().unwrap() = CertificateStatus::Grace { remaining_secs: 86_400 };
+        let resp2 = crate::health_handler(axum::extract::State(s)).await;
+        let body2 = body_text(resp2).await;
+        assert!(body2.contains("\"certificate_status\":\"grace\""), "{body2}");
+        assert!(body2.contains("\"grace_remaining_secs\":86400"), "{body2}");
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// 构造指定证书状态的 AppState，用于 GET 限制测试。
+    fn state_with_cert(status: CertificateStatus) -> AppState {
+        let s = dummy_app_state();
+        *s.certificate_status.write().unwrap() = status;
+        s
+    }
+
+    #[tokio::test]
+    async fn get_blocked_when_cert_expired() {
+        let st = state_with_cert(CertificateStatus::Expired);
+        let resp = crate::handle(
+            axum::extract::State(st),
+            axum::http::Method::GET,
+            axum::http::Uri::from_static("/v1/api/foo"),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "GET must be 403 when cert expired");
+        assert!(body_text(resp).await.contains("certificate expired"), "error body should explain cert expiry");
+    }
+
+    #[tokio::test]
+    async fn get_blocked_when_cert_grace() {
+        let st = state_with_cert(CertificateStatus::Grace { remaining_secs: 86_400 });
+        let resp = crate::handle(
+            axum::extract::State(st),
+            axum::http::Method::GET,
+            axum::http::Uri::from_static("/v1/api/foo"),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "GET must be 403 in grace period");
+        assert!(body_text(resp).await.contains("grace period"), "error body should mention grace period");
+    }
+
+    #[tokio::test]
+    async fn non_get_allowed_when_cert_expired() {
+        // 仅 GET 受限；POST 等即便证书过期也应继续走到路由层（此处无路由 → 404，但非 403）。
+        let st = state_with_cert(CertificateStatus::Expired);
+        let resp = crate::handle(
+            axum::extract::State(st),
+            axum::http::Method::POST,
+            axum::http::Uri::from_static("/v1/api/foo"),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), axum::http::StatusCode::FORBIDDEN, "non-GET must not be blocked by cert");
+    }
+
+    #[tokio::test]
+    async fn get_allowed_when_cert_valid() {
+        let st = state_with_cert(CertificateStatus::Valid);
+        let resp = crate::handle(
+            axum::extract::State(st),
+            axum::http::Method::GET,
+            axum::http::Uri::from_static("/v1/api/foo"),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await;
+        assert_ne!(resp.status(), axum::http::StatusCode::FORBIDDEN, "valid cert must not block GET");
     }
 
     // ----- 路径参数路由 e2e -----

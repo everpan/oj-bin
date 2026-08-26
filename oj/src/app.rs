@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,6 +28,9 @@ use mdm_base_rust::config::{self, Config};
 use server::actor::JsActor;
 use server::routes;
 use server::ws;
+use server::certificate::load_certificate_at;
+use server::certificate_watcher::{spawn_watcher, SharedCertStatus, SharedCertValidUntil};
+use server::CertificateStatus;
 use tokio::task::JoinHandle;
 
 use crate::manifest;
@@ -247,6 +250,45 @@ impl App {
             }
             None => None,
         };
+        // 加载并校验证书：未配置证书路径 → 视为未启用（状态 Valid，不做任何 GET 限制）。
+        let cert_status: SharedCertStatus;
+        let cert_valid_until: SharedCertValidUntil;
+        if server::certificate::is_enabled(&cfg.server) {
+            let (status, valid_until) = load_certificate_at(&cfg.server, &config_dir)?;
+            match &status {
+                CertificateStatus::Expired => {
+                    tracing::error!(
+                        "certificate has expired and grace period elapsed — service will not start"
+                    );
+                    return Err("certificate expired".into());
+                }
+                CertificateStatus::Grace { remaining_secs } => {
+                    tracing::warn!(
+                        "certificate expired, {} days grace period remaining — service starting",
+                        remaining_secs / 86_400
+                    );
+                }
+                CertificateStatus::Valid => {
+                    tracing::info!("certificate loaded: valid");
+                }
+            }
+            cert_status = Arc::new(RwLock::new(status));
+            cert_valid_until = Arc::new(RwLock::new(valid_until));
+            // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
+            spawn_watcher(
+                cert_status.clone(),
+                cert_valid_until.clone(),
+                cfg.server.clone(),
+                config_dir.to_path_buf(),
+            );
+        } else {
+            tracing::info!(
+                "certificate check disabled (no public_key_path/certificate_path configured)"
+            );
+            cert_status = Arc::new(RwLock::new(CertificateStatus::Valid));
+            cert_valid_until = Arc::new(RwLock::new(None));
+        }
+
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             auth,
@@ -260,7 +302,7 @@ impl App {
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
         );
-        let router = server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline)
+        let router = server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline, cert_status, cert_valid_until)
             .merge(ws_router);
         // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
         let stable = Arc::new(StableState {

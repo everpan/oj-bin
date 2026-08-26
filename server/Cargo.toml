@@ -24,7 +24,8 @@ getrandom = "0.2"
 multer = "3"
 ring = "0.17"
 base64 = "0.21"
+notify = "8"
 
 [dev-dependencies]
 serde_json = "1"
-    tempfile = "3"
+tempfile = "3"
