@@ -158,11 +158,12 @@ impl KillSwitch {
 impl Drop for KillSwitch {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // armed 状态下 Bridge 被丢弃（如请求中途 panic）：清空 isolate 句柄，
-        // 避免看门狗在 isolate 已析构后误 terminate（SIGSEGV 隐患）。
-        *self.slot.lock().unwrap() = None;
-        if let Some(h) = self.thread.lock().unwrap().take() {
-            let _ = h.join();
+        // Take the thread handle out of the mutex, releasing the lock on the mutex.
+        let thread_handle = self.thread.lock().unwrap().take();
+        if let Some(handle) = thread_handle {
+            let _ = handle.join();
         }
+        // Now that the thread has joined, we can safely set the slot to None.
+        *self.slot.lock().unwrap() = None;
     }
 }
