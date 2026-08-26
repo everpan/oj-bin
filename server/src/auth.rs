@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mdm_base_rust::bridge::{DataAccessor, KVStore};
-use mdm_base_rust::config::AuthCfg;
+use only_js::bridge::{DataAccessor, KVStore};
+use only_js::config::AuthCfg;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -62,9 +62,9 @@ impl Auth {
         {
             return Err(format!("auth.user_table '{}' invalid ([A-Za-z0-9_]{{1,64}})", cfg.user_table));
         }
-        let access = mdm_base_rust::config::parse_duration(&cfg.access_token_duration)
+        let access = only_js::config::parse_duration(&cfg.access_token_duration)
             .map_err(|e| format!("auth.access_token_duration: {e}"))?;
-        let refresh = mdm_base_rust::config::parse_duration(&cfg.refresh_token_duration)
+        let refresh = only_js::config::parse_duration(&cfg.refresh_token_duration)
             .map_err(|e| format!("auth.refresh_token_duration: {e}"))?;
         Ok(Self {
             enc: jsonwebtoken::EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
@@ -212,7 +212,7 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{InMemoryAccessor, InMemoryKV};
+    use only_js::bridge::{InMemoryAccessor, InMemoryKV};
 
     fn auth_cfg() -> AuthCfg {
         AuthCfg {
@@ -259,7 +259,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn login_refresh_logout_flow() {
-        let db = mdm_base_rust::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
         let hash = bcrypt::hash("pw123", 4).unwrap();
         db.exec_with_params(
             "create table users (id integer primary key, username text, password_hash text, roles text)",

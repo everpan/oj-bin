@@ -25,7 +25,7 @@ pub struct SqlxAccessor {
 impl SqlxAccessor {
     /// 从连接串构池（sqlite:///path、postgres://..、mysql://..）。
     /// Any 驱动须先安装（幂等，调用方无感知）；sqlite 每连接独立库（尤其 `:memory:`），
-    /// 单连接亦对齐 Go 的 `SetMaxOpenConns(1)` 写锁语义。
+    /// 单连接写锁语义对齐 `SetMaxOpenConns(1)`。
     pub async fn connect(url: &str) -> BridgeResult<Self> {
         sqlx::any::install_default_drivers();
         let mut opts = PoolOptions::<Any>::new();

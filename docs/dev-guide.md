@@ -1,6 +1,6 @@
 # 开发手册（Developer Guide）
 
-`mdm-base-rust` —— 基于 Rust + `deno_core` 的嵌入式 JS 后端运行时。JS handler 通过一组注入的
+`only-js` —— 基于 Rust + `deno_core` 的嵌入式 JS 后端运行时。JS handler 通过一组注入的
 全局对象（`json` / `db` / `DB` / `http` / `redis` / `log` / `fetch` / `finish`）编写业务逻辑，
 Rust 侧捕获统一信封响应，供上层 HTTP server 写回。
 
@@ -130,7 +130,7 @@ db.table("order")
 
 ```rust
 use std::sync::Arc;
-use mdm_base_rust::bridge::{
+use only_js::bridge::{
     Bridge, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
 };
 
@@ -143,7 +143,7 @@ let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, inspect);
 
 // 开发期启用 inspector：起 WS 服务（chrome://inspect）。
 if inspect {
-    mdm_base_rust::bridge::start_inspector(&b, "127.0.0.1:9229".parse().unwrap());
+    only_js::bridge::start_inspector(&b, "127.0.0.1:9229".parse().unwrap());
 }
 
 let cap = b.run_with(r#"
@@ -170,7 +170,7 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 `SqlxAccessor` 已实现 `DataAccessor`，以 `sqlx::any::Pool<Any>` 驱动无关接入 MySQL/PostgreSQL/SQLite。
 
 ```rust
-use mdm_base_rust::bridge::SqlxAccessor;
+use only_js::bridge::SqlxAccessor;
 
 let db = SqlxAccessor::arc("postgres://user:pass@localhost/mdm").await?;
 // 或 sqlite
@@ -195,7 +195,7 @@ handler 源码的加载策略由环境变量决定：
   无需失效模块图或清理旧状态。
 
 ```rust
-use mdm_base_rust::bridge::HandlerStore;
+use only_js::bridge::HandlerStore;
 
 // 开发：FS + 热重载
 let b = /* ... */;

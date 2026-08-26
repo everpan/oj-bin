@@ -1,4 +1,4 @@
-//! bridge 各模块性能测试（对应 Go 版的 bench 测试）。
+//! bridge 各模块性能测试。
 //!
 //! 两层口径：
 //!   - rust/*   —— 纯 Rust 层（信封序列化、trait 实现），无 JS 开销
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use mdm_base_rust::bridge::{Bridge, DataAccessor, InMemoryAccessor, InMemoryKV, KVStore, RequestInfo};
+use only_js::bridge::{Bridge, DataAccessor, InMemoryAccessor, InMemoryKV, KVStore, RequestInfo};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -49,7 +49,7 @@ fn bench_rust(c: &mut Criterion) {
 
     let data = json!({"user": {"id": 1, "name": "ever"}, "tags": ["a", "b"]});
     group.bench_function("envelope.ok", |b| {
-        b.iter(|| mdm_base_rust::bridge::ok(&data))
+        b.iter(|| only_js::bridge::ok(&data))
     });
 
     let kv = InMemoryKV::new();

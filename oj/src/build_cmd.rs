@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mdm_base_rust::bridge::{
+use only_js::bridge::{
     transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
 };
 use server::routes;
@@ -184,10 +184,10 @@ async fn introspect_module_files(
     files: &[(PathBuf, bool)],
 ) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
     let root = src.parent().unwrap_or(src).to_path_buf();
-    let mut dbs: HashMap<String, Arc<dyn mdm_base_rust::bridge::DataAccessor>> = HashMap::new();
+    let mut dbs: HashMap<String, Arc<dyn only_js::bridge::DataAccessor>> = HashMap::new();
     dbs.insert(
         "default".into(),
-        mdm_base_rust::bridge::DbBackendRegistry::builtin()
+        only_js::bridge::DbBackendRegistry::builtin()
             .connect("sqlite::memory:", &root)
             .await
             .map_err(|e| format!("open build db: {e}"))?,

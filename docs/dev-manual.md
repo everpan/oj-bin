@@ -2,14 +2,14 @@
 
 面向要在本仓库上继续开发的工程师。先读 `docs/user-manual.md` 了解对外行为，再读本文了解内部实现。
 
-> 历史：早期 Go 版（`devserver`）与 deno_core 0.409 时代的文档见 `docs/dev-guide.md`，已过时，
-> 仅作参考。本文描述的是当前 `oj server`（deno_core 0.410）架构。
+> 历史：早期文档见 `docs/dev-guide.md`，已过时，仅作参考。本文描述的是当前
+> `oj server`（deno_core 0.410）架构。
 
 ## 1. 工作区结构（宿主 + 契约 crate + 插件）
 
 ```
 Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "crates/plugins/*", "xtask"]
-src/                  # crate: mdm-base-rust（lib + bench）——核心执行层
+src/                  # crate: only-js（lib + bench）——核心执行层
 ├── lib.rs            # 导出 bridge + config
 ├── main.rs           # bench 入口（criterion harness，非服务）
 ├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + db/redis/blob/es/broker/plugins 映射
@@ -74,7 +74,7 @@ cargo test -p mdm-server                      # server 单测
 cargo test --workspace -- --skip infinite_loop # 全部（infinite_loop 在部分平台 SIGSEGV，跳过）
 cargo run -p oj -- server -c sample/config.yaml -d sample/src        # dev（按目录自动判定）
 cargo run -p oj -- build -d sample/src -o sample/dist
-cargo bench -p mdm-base-rust                  # bridge 基准（**必须 release**）
+cargo bench -p only-js                  # bridge 基准（**必须 release**）
 
 # 插件（Task 4.1-4.4：外部后端全部 cdylib 化）
 cargo xtask plugin es                          # 编译 oj-es（release）+ 拷入 plugins/<triple>/
@@ -91,8 +91,8 @@ cargo llvm-cov --workspace --summary-only
 OJ_TEST_REDIS=redis://127.0.0.1:6379/1 cargo test --workspace -- --ignored
 ```
 
-> 注：mdm-base-rust 全套测试已修复为可跑：当前 `cargo test --workspace` 全绿，
-> 合计 **206 通过 + 3 忽略**（细节见 §7）。mdm-base-rust 覆盖率：**行 92.66% / 区域 91.39%**（>90%）。
+> 注：only-js 全套测试已修复为可跑：当前 `cargo test --workspace` 全绿，
+> 合计 **206 通过 + 3 忽略**（细节见 §7）。only-js 覆盖率：**行 92.66% / 区域 91.39%**（>90%）。
 > 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
 > `v8::IsolateHandle`，见 §3）。
 
@@ -294,7 +294,7 @@ Signature: RSASSA-PKCS1-v1_5(SHA256, Header.Payload)  用私钥签名
   - `OJ_TEST_KAFKA_BROKERS=b1:9092,b2:9092` → `oj-bus-kafka`；`OJ_TEST_RABBITMQ_URL=…` →
     `oj-bus-rabbitmq`
   - 运行：`cargo test --workspace -- --skip infinite_loop`（env-gated 测试未设 env 即内联跳过）。
-- 当前计数（`--skip infinite_loop` 全绿）：`mdm-base-rust` lib **150** + bin **2**、
+- 当前计数（`--skip infinite_loop` 全绿）：`only-js` lib **150** + bin **2**、
   `mdm-server` **52**、`oj` lib **59** + bin **3**、`e2e` **15**（E2E_LOCK 串行锁避免端口/文件冲突）；
   插件 crate：es **3**、db-mysql/postgres **各 2**、blob-s3 **3**、bus-kafka/rabbitmq **各 2**、
   kv-redis **2**、ffi 契约 **1 + 入口测试 2**、mini 夹具 **1**。

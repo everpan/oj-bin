@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use deno_core::{JsRuntime, ModuleLoader, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8};
-use mdm_base_rust::bridge::bridge_ext;
-use mdm_base_rust::bridge::OjModuleLoader;
+use only_js::bridge::bridge_ext;
+use only_js::bridge::OjModuleLoader;
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::app::{App, ClientTransport};

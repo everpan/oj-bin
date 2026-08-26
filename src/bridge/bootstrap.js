@@ -1,6 +1,6 @@
-// ext:bridge_ext/bootstrap.js -- JS SDK globals (port of Go bridge.go Apply).
+// ext:bridge_ext/bootstrap.js -- JS SDK globals.
 // Rust ops do I/O and state; this file shapes the JS-side API
-// (equivalent of the goja map[string]any bindings).
+// (exposes the op_* bindings as JS globals).
 //
 // Globals: json / db / DB / http / redis / log / fetch / finish / __ojRequire
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()

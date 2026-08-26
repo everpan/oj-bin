@@ -1,4 +1,4 @@
-//! KV 全局对象：内置内存 KV 抽象（移植自 Go kv.go），作为未声明 redis.default 的兜底。
+//! KV 全局对象：内置内存 KV 抽象，作为未声明 redis.default 的兜底。
 //! 真 Redis 已迁入 oj-kv-redis 插件（Task 4.4）；本模块只留 InMemoryKV 与 trait。
 
 use std::cell::RefCell;

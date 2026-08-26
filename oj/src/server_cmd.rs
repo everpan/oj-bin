@@ -7,14 +7,14 @@ use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mdm_base_rust::bridge::plugin_loader::{
+use only_js::bridge::plugin_loader::{
     LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
     host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
-use mdm_base_rust::bridge::{
+use only_js::bridge::{
     BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo,
 };
-use mdm_base_rust::config::{self, Config};
+use only_js::config::{self, Config};
 
 use crate::app::App;
 use crate::args::ServerArgs;
@@ -131,15 +131,15 @@ pub async fn assemble_blobs(
     config_dir: &Path,
     base: &str,
     blob_vt: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
-) -> Result<Arc<mdm_base_rust::bridge::blob::BlobRegistry>, String> {
-    let mut r = mdm_base_rust::bridge::blob::BlobRegistry::new();
+) -> Result<Arc<only_js::bridge::blob::BlobRegistry>, String> {
+    let mut r = only_js::bridge::blob::BlobRegistry::new();
     for (name, c) in section.entries()? {
-        let backend: Arc<dyn mdm_base_rust::bridge::BlobBackend> = match c.driver.as_str() {
+        let backend: Arc<dyn only_js::bridge::BlobBackend> = match c.driver.as_str() {
             "local" => {
                 let root = Path::new(&c.root);
                 let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
                 Arc::new(
-                    mdm_base_rust::bridge::LocalBlob::named(&name, &root, base)
+                    only_js::bridge::LocalBlob::named(&name, &root, base)
                         .map_err(|e| format!("blob '{name}': {e}"))?,
                 )
             }
@@ -163,7 +163,7 @@ pub async fn assemble_blobs(
 /// 逐 db 开库（server/build 共用）：经注册表按 scheme 认领，错误文案带库名。
 pub async fn connect_dbs(
     cfg_db: &HashMap<String, String>,
-    registry: &mdm_base_rust::bridge::DbBackendRegistry,
+    registry: &only_js::bridge::DbBackendRegistry,
     config_dir: &Path,
 ) -> Result<HashMap<String, Arc<dyn DataAccessor>>, String> {
     let mut dbs = HashMap::new();
@@ -294,7 +294,7 @@ pub async fn assemble_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdm_base_rust::bridge::plugin_loader::kv_backend_connect;
+    use only_js::bridge::plugin_loader::kv_backend_connect;
 
     struct Tmp(PathBuf);
     fn tmpdir(tag: &str) -> Tmp {
@@ -374,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn registry_connect_dispatches_by_scheme() {
         let t = tmpdir("sc-dsn");
-        let reg = mdm_base_rust::bridge::DbBackendRegistry::builtin();
+        let reg = only_js::bridge::DbBackendRegistry::builtin();
         // sqlite：相对路径归一为 config_dir 下绝对路径并建空库
         reg.connect("sqlite://db.sqlite", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
         assert!(t.0.join("db.sqlite").is_file());
@@ -401,7 +401,7 @@ mod tests {
         r.default().unwrap().put("k", b"DEF", None).await.unwrap();
         r.get("img").unwrap().put("k", b"IMG", None).await.unwrap();
         match r.default().unwrap().serve("k").await.unwrap() {
-            mdm_base_rust::bridge::BlobServed::Bytes(bytes, _) => assert_eq!(bytes, b"DEF"),
+            only_js::bridge::BlobServed::Bytes(bytes, _) => assert_eq!(bytes, b"DEF"),
             _ => panic!("local must inline-serve"),
         }
     }
@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn connect_dbs_two_engines_and_unknown_named() {
         let t = tmpdir("sc-cdb");
-        let reg = mdm_base_rust::bridge::DbBackendRegistry::builtin();
+        let reg = only_js::bridge::DbBackendRegistry::builtin();
         let mut m = HashMap::new();
         m.insert("default".to_string(), "sqlite::memory:".to_string());
         m.insert("aux".to_string(), "memory://aux".to_string());
@@ -944,7 +944,7 @@ mod tests {
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
         assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
-        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+        let broker_cfg = only_js::config::BrokerCfg {
             kind: "kafka".into(),
             ..Default::default()
         };
@@ -1048,7 +1048,7 @@ mod tests {
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
-        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+        let broker_cfg = only_js::config::BrokerCfg {
             kind: "kafka".into(),
             brokers: brokers.split(',').map(|s| s.trim().to_string()).collect(),
             group: Some("oj-shared".into()),
@@ -1098,7 +1098,7 @@ mod tests {
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
-        let broker_cfg = mdm_base_rust::config::BrokerCfg {
+        let broker_cfg = only_js::config::BrokerCfg {
             kind: "rabbitmq".into(),
             url: Some(url),
             topic_prefix: Some(format!("ojshare-r-{}", std::process::id())),

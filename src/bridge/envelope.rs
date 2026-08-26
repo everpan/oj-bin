@@ -1,6 +1,6 @@
-//! {code,msg,data} 统一信封（移植自 Go envelope.go）。
+//! {code,msg,data} 统一信封。
 //!
-//! Go 版的 FromError/HTTPError 留给 server 层做错误映射时再移植。
+//! 错误映射（FromError/HTTPError 语义）由 server 层负责。
 
 use serde_json::Value;
 

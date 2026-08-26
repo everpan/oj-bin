@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use mdm_base_rust::config::ServerCfg;
+use only_js::config::ServerCfg;
 use notify::{Event, RecursiveMode, Watcher};
 
 use crate::certificate::{load_certificate_at, CertificateStatus};

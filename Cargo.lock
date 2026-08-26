@@ -2882,39 +2882,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdm-base-rust"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.21.7",
- "criterion",
- "deno_ast",
- "deno_core",
- "deno_error",
- "futures",
- "httptest",
- "libloading",
- "notify",
- "object_store",
- "oj",
- "oj-plugin-ffi",
- "rand 0.8.7",
- "reqwest 0.13.1",
- "ring",
- "sea-query",
- "serde",
- "serde_json",
- "serde_yaml",
- "server",
- "sqlx",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3149,8 +3116,8 @@ dependencies = [
  "deno_core",
  "deno_error",
  "flate2",
- "mdm-base-rust",
  "oj-plugin-ffi",
+ "only-js",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
@@ -3267,6 +3234,39 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "only-js"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "criterion",
+ "deno_ast",
+ "deno_core",
+ "deno_error",
+ "futures",
+ "httptest",
+ "libloading",
+ "notify",
+ "object_store",
+ "oj",
+ "oj-plugin-ffi",
+ "rand 0.8.7",
+ "reqwest 0.13.1",
+ "ring",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "server",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "oorandom"
@@ -4493,9 +4493,9 @@ dependencies = [
  "getrandom 0.2.17",
  "jsonwebtoken",
  "matchit",
- "mdm-base-rust",
  "multer",
  "notify",
+ "only-js",
  "percent-encoding",
  "ring",
  "serde",
@@ -6794,7 +6794,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
- "mdm-base-rust",
+ "only-js",
 ]
 
 [[package]]

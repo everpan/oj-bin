@@ -1,4 +1,4 @@
-//! WebSocket 层（P5a echo + P5b JS 帧循环，移植 Go internal/bridge/ws.go）。
+//! WebSocket 层（P5a echo + P5b JS 帧循环）。
 //!
 //! Go 模式：WS 路由注册在 catch-all 之前；每连接独占 VM（不进 HTTP 池）；
 //! Reader/Processor/Writer 三任务流水线，msgChan/respChan 各 cap 64（背压保护）。
@@ -13,14 +13,14 @@ use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
-use mdm_base_rust::bridge::{Bridge, RequestInfo};
+use only_js::bridge::{Bridge, RequestInfo};
 
 /// 挂载最小 echo 路由（GET /ws）——P5a 链路验证用。
 pub fn echo_route() -> axum::Router {
     axum::Router::new().route("/ws", axum::routing::get(upgrade))
 }
 
-/// 挂载 JS handler 帧循环路由（对齐 Go RegisterWSJS）：每帧执行 handler_file，
+/// 挂载 JS handler 帧循环路由：每帧执行 handler_file，
 /// json.ok 信封与 ws.send 逐帧写回；timeout 为单帧熔断（超时丢弃该帧，连接继续）。
 pub fn js_route(
     path: &str,
@@ -128,9 +128,9 @@ async fn conn_on_pinned(
         .expect("spawn ws-js thread");
 }
 
-/// 三任务流水线（对齐 Go HandleWSConnection）：
+/// 三任务流水线：
 /// Reader(stream→msgChan) / Processor(串行 JS) / Writer(respChan→sink)，chan 各 cap 64。
-/// 读 handler 失败（文件缺失等）→ 直接结束（连接关闭，不 panic，对齐 Go）。
+/// 读 handler 失败（文件缺失等）→ 直接结束（连接关闭，不 panic）。
 async fn frame_loop(
     socket: WebSocket,
     handler_file: PathBuf,
@@ -138,7 +138,7 @@ async fn frame_loop(
     make: Arc<dyn Fn() -> Bridge + Send + Sync>,
 ) {
     // 统一转译管线：WS.ts 类型标注可用（.js 原样），mtime 缓存与模块加载共享。
-    let source = match mdm_base_rust::bridge::transpile::cached_transpile(&handler_file) {
+    let source = match only_js::bridge::transpile::cached_transpile(&handler_file) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ws compile {}: {e}", handler_file.display());
@@ -202,7 +202,7 @@ async fn frame_loop(
         match bridge.run_ws(&source, req, timeout).await {
             Ok(o) => {
                 for s in o.sends {
-                    let _ = resp_tx.try_send(s); // 满则丢弃（对齐 Go select+default）
+                    let _ = resp_tx.try_send(s); // 满则丢弃
                 }
                 if !o.capture.body.is_empty() {
                     let _ = resp_tx.try_send(String::from_utf8_lossy(&o.capture.body).into_owned());
@@ -223,7 +223,7 @@ async fn frame_loop(
 mod tests {
     use super::*;
     use crate::app;
-    use mdm_base_rust::bridge::{InMemoryAccessor, InMemoryKV};
+    use only_js::bridge::{InMemoryAccessor, InMemoryKV};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 裸 TCP WebSocket 客户端：upgrade → 掩码文本帧 → 读回帧。
@@ -299,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn ws_bus_subscribe_receives_http_publish() {
         use crate::actor::JsActor;
-        use mdm_base_rust::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
         let t = crate::tests::routes(&[(
             "pub/api.ts",
@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_routes_mount_directory_ws() {
         use crate::actor::JsActor;
-        use mdm_base_rust::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
         let t = crate::tests::routes(&[
             (
@@ -494,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn mirror_routes_root_ws() {
         use crate::actor::JsActor;
-        use mdm_base_rust::bridge::{Extras, SchemaRegistry};
+        use only_js::bridge::{Extras, SchemaRegistry};
         use std::collections::HashMap;
         let t = crate::tests::routes(&[(
             "WS.ts",

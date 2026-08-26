@@ -1,4 +1,4 @@
-//! json.ok/fail/header 绑定（移植自 Go json.go）。
+//! json.ok/fail/header 绑定。
 
 use deno_core::{OpState, op2};
 

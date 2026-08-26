@@ -1,4 +1,4 @@
-//! http 请求上下文绑定（移植自 Go http.go），只读，懒加载（每次访问从 ReqState 取最新）。
+//! http 请求上下文绑定，只读，懒加载（每次访问从 ReqState 取最新）。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -74,7 +74,7 @@ pub async fn op_http_file(state: Rc<RefCell<OpState>>, #[smi] i: i32) -> Result<
         .ok_or_else(|| JsErrorBox::generic(format!("no such file: {i}")))
 }
 
-/// 移植 Go 的 exportBytes：空为 null，能解析为 JSON 则解析，否则按 UTF-8 字符串。
+/// exportBytes：空为 null，能解析为 JSON 则解析，否则按 UTF-8 字符串。
 fn export_bytes(b: &[u8]) -> Value {
     if b.is_empty() {
         return Value::Null;

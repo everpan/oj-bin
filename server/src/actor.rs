@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use mdm_base_rust::bridge::{Bridge, Capture, RequestInfo};
+use only_js::bridge::{Bridge, Capture, RequestInfo};
 use tokio::sync::{mpsc, oneshot};
 
 /// 一次 handler 执行请求。
@@ -36,14 +36,14 @@ pub struct RunFail {
     pub timeout: bool,
 }
 
-impl From<mdm_base_rust::bridge::RunError> for RunFail {
-    fn from(e: mdm_base_rust::bridge::RunError) -> Self {
+impl From<only_js::bridge::RunError> for RunFail {
+    fn from(e: only_js::bridge::RunError) -> Self {
         match e {
-            mdm_base_rust::bridge::RunError::Timeout => Self {
+            only_js::bridge::RunError::Timeout => Self {
                 msg: "handler execution timed out".into(),
                 timeout: true,
             },
-            mdm_base_rust::bridge::RunError::Core(e) => Self {
+            only_js::bridge::RunError::Core(e) => Self {
                 msg: e.to_string(),
                 timeout: false,
             },
@@ -181,7 +181,7 @@ impl JsActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{InMemoryAccessor, InMemoryKV};
+    use only_js::bridge::{InMemoryAccessor, InMemoryKV};
     use serde_json::{Value, json};
 
     fn actor() -> JsActor {

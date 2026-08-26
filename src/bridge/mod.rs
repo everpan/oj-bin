@@ -1,4 +1,4 @@
-//! bridge：注入到 deno_core JsRuntime 的 JS SDK 全局对象（移植自 Go internal/bridge，goja → deno_core）。
+//! bridge：注入到 deno_core JsRuntime 的 JS SDK 全局对象（JS 全局由 bootstrap.js 装配）。
 //! 按绑定类型分文件组织：
 //!   - json.rs     —— json.ok/fail/header 统一信封与返回头
 //!   - db.rs       —— db.query/exec 与 DB(name) 命名实例（异步 op，支持绑定参数）
@@ -237,7 +237,7 @@ impl Bridge {
         )
     }
 
-    /// 全量命名 DB 构造期注入（对齐 Go buildServer 的 DBAccessors + default 回落）。
+    /// 全量命名 DB 构造期注入（DBAccessors + default 回落）。
     /// 须在构造期给定全量：StableState 一经 runtime 池共享即不可变。
     pub fn with_dbs(
         dbs: HashMap<String, Arc<dyn DataAccessor>>,
@@ -258,7 +258,7 @@ impl Bridge {
         loader: Option<Arc<module_loader::LoaderShared>>,
         extras: Extras,
     ) -> Self {
-        // 防御：无 "default" 键时取任一实例补位（对齐 Go buildServer；JS 侧 db = DB("default")）。
+        // 防御：无 "default" 键时取任一实例补位（JS 侧 db = DB("default")）。
         if !dbs.contains_key("default")
             && let Some(first) = dbs.values().next().cloned()
         {
@@ -389,7 +389,7 @@ impl Bridge {
     }
 
     /// 带超时熔断的执行：到期经 V8 terminate_execution 终止（跨线程安全），
-    /// 该 runtime 不归还池，返回 `RunError::Timeout`（对齐 Go 408 语义）。
+    /// 该 runtime 不归还池，返回 `RunError::Timeout`（408 语义）。
     pub async fn run_with_timeout(
         &self,
         source: &str,
@@ -736,7 +736,7 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["n"], 1, "{v}");
 
-        // 无 "default" 键 → 回落第一个实例（对齐 Go buildServer 防御）。
+        // 无 "default" 键 → 回落第一个实例（防御）。
         let only = Arc::new(InMemoryAccessor::new());
         only.seed([json!({"id": 2, "name": "neo"})]);
         let b2 = Bridge::with_dbs(

@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::actor::JsActor;
 use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
-use mdm_base_rust::bridge::{fail, BlobBackend, BlobServed, RequestInfo, UploadedFile};
+use only_js::bridge::{fail, BlobBackend, BlobServed, RequestInfo, UploadedFile};
 use serde_json::json;
 
 /// 证书状态
@@ -81,7 +81,7 @@ impl Default for Pipeline {
     }
 }
 
-/// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
+/// 构造 axum 应用：catch-all fallback（`All("/*")` 语义）。
 #[allow(clippy::too_many_arguments)]
 pub fn app(
     base: &str,
@@ -347,7 +347,7 @@ async fn handle(
             };
             match st.actor.run_module(file, m, req, st.timeout).await {
                 Ok(cap) => capture_response(cap),
-                // 超时熔断 → 408（对齐 Go dev server）。
+                // 超时熔断 → 408。
                 Err(e) if e.timeout => fail_response(408, &e.msg),
                 Err(e) => fail_response(500, &e.msg),
             }
@@ -391,7 +391,7 @@ fn decode_blob_key(s: &str) -> Option<String> {
         .map(|seg| percent_encoding::percent_decode_str(seg).decode_utf8().ok())
         .collect::<Option<Vec<_>>>()?
         .join("/");
-    mdm_base_rust::bridge::valid_key(&decoded).then_some(decoded)
+    only_js::bridge::valid_key(&decoded).then_some(decoded)
 }
 
 /// 静态文件解析：uri.path()（仍 percent-encoded）逐段解码后拼 root；
@@ -451,7 +451,7 @@ fn file_response(file: &Path, body: Vec<u8>) -> Response {
 }
 
 /// Capture → axum Response（status/headers/body 原样回写）。
-fn capture_response(cap: mdm_base_rust::bridge::Capture) -> Response {
+fn capture_response(cap: only_js::bridge::Capture) -> Response {
     let mut r = Response::new(axum::body::Body::from(cap.body));
     *r.status_mut() = StatusCode::from_u16(cap.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     for (k, v) in cap.headers {
@@ -469,7 +469,7 @@ fn capture_response(cap: mdm_base_rust::bridge::Capture) -> Response {
 fn auth_json(r: Result<Value, String>) -> Response {
     match r {
         Ok(data) => {
-            let mut resp = Response::new(axum::body::Body::from(mdm_base_rust::bridge::ok(&data)));
+            let mut resp = Response::new(axum::body::Body::from(only_js::bridge::ok(&data)));
             resp.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_static("application/json"),
@@ -534,7 +534,7 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, LocalBlob, SchemaRegistry};
+    use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, LocalBlob, SchemaRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -638,7 +638,7 @@ pub(crate) mod tests {
                 SchemaRegistry::new(),
                 false,
                 Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blobs: Some(mdm_base_rust::bridge::blob::registry_with_default(blob2.clone())), ..Default::default() },
+                Extras { blobs: Some(only_js::bridge::blob::registry_with_default(blob2.clone())), ..Default::default() },
             )
         });
         let base = base.to_string();
@@ -861,7 +861,7 @@ pub(crate) mod tests {
             ),
         ]);
         // auth 自带库：users 表 + demo 用户（bcrypt cost 4 提速）。
-        let db = mdm_base_rust::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
         let hash = bcrypt::hash("pw", 4).unwrap();
         db.exec_with_params(
             "create table users (id integer primary key, username text, password_hash text, roles text)",
@@ -877,13 +877,13 @@ pub(crate) mod tests {
         .unwrap();
         let auth = Arc::new(
             crate::auth::Auth::new(
-                &mdm_base_rust::config::AuthCfg {
+                &only_js::config::AuthCfg {
                     jwt_secret: "test-secret".into(),
                     anonymous_paths: vec!["/health".into()],
                     ..Default::default()
                 },
                 db,
-                Arc::new(mdm_base_rust::bridge::InMemoryKV::new()),
+                Arc::new(only_js::bridge::InMemoryKV::new()),
             )
             .unwrap(),
         );
@@ -1337,11 +1337,11 @@ pub(crate) mod tests {
         std::fs::write(cert_file.path(), jws).expect("Failed to write cert");
 
         // Create config pointing to our temporary files
-        let cfg = mdm_base_rust::config::ServerCfg {
+        let cfg = only_js::config::ServerCfg {
             public_key_path: key_file.path().to_string_lossy().into_owned(),
             certificate_path: cert_file.path().to_string_lossy().into_owned(),
             grace_days: Some(30),
-            ..mdm_base_rust::config::ServerCfg::default()
+            ..only_js::config::ServerCfg::default()
         };
 
         // Call load_certificate - should return Err because the key is invalid

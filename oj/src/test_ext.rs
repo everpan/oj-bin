@@ -65,8 +65,8 @@ pub async fn op_client_dispatch(
     // 2) 重置每请求状态（ReqState 在 OpState），防跨请求串号。
     {
         let mut g = state.borrow_mut();
-        let rs = g.borrow_mut::<mdm_base_rust::bridge::ReqState>();
-        rs.reset(mdm_base_rust::bridge::RequestInfo::default());
+        let rs = g.borrow_mut::<only_js::bridge::ReqState>();
+        rs.reset(only_js::bridge::RequestInfo::default());
     }
     // 3) base 拼接（与 app() 路由单一事实来源一致，修正 #7）。
     let uri = format!("{}{}", t.base(), path);

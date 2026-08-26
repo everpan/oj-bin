@@ -1,8 +1,8 @@
-//! db/DB(name) 数据访问绑定（移植自 Go db.go + accessor.go）。
+//! db/DB(name) 数据访问绑定。
 //!
-//! 与 Go 版一致：db === DB("default")（引用相等由 bootstrap.js 侧的实例缓存保证），
+//! db === DB("default")（引用相等由 bootstrap.js 侧的实例缓存保证），
 //! 未配置的名字 DB(name) 返回 undefined。实例存在性检查在 Rust 侧（op_db_has）。
-//! Go DataAccessor 的可变参数 args ...any 在 bridge 层从未被使用，故本版只传 SQL。
+//! DataAccessor 的可变参数 args ...any 在 bridge 层从未被使用，故本版只传 SQL。
 //!
 //! 安全性：新增 `query_with_params` / `exec_with_params` 以支持绑定参数，杜绝 JS 侧字符串拼接
 //! （原始 `query(sql)` 仅保留为无参便捷形式；真实 SQL 实现应优先用 *_with_params 或 query.rs 构造器）。

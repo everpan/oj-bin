@@ -1,8 +1,8 @@
-//! fetch(url, options?) HTTP 客户端绑定（移植自 Go fetch.go：fiber.Client → reqwest）。
+//! fetch(url, options?) HTTP 客户端绑定（基于 reqwest）。
 //!
-//! 与 Go 版一致：op 返回缓冲后的完整响应，Response 对象（json()/text()/arrayBuffer()/
+//! op 返回缓冲后的完整响应，Response 对象（json()/text()/arrayBuffer()/
 //! clone()/body.getReader()）由 bootstrap.js 在 JS 侧组装。
-//! 当前限制：不支持 signal/AbortController（同 Go 版）。
+//! 当前限制：不支持 signal/AbortController。
 // ponytail: body 以字节数组+文本两份经 serde 传给 JS（大 body 有一次多余拷贝）；
 // 真在意带宽时改用 #[buffer] 或 resource 句柄。
 
@@ -56,7 +56,7 @@ pub async fn op_fetch(
     }
     if let Some(b) = body {
         req = req.body(b);
-        // 用户未显式设置 Content-Type 时自动推断（与 Go 版一致）。
+        // 用户未显式设置 Content-Type 时自动推断。
         if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
             req = req.header("Content-Type", "text/plain;charset=UTF-8");
         }

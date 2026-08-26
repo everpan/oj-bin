@@ -330,7 +330,7 @@ git commit -m "feat: expose certificate status via health endpoint"
 
 ### Task 7: Update configuration structs & CLI parsing
 **Files:**
-- Modify: `mdm_base_rust/config.rs` (add `public_key_path`, `certificate_path`, `grace_days` to `ServerCfg`)
+- Modify: `only_js/config.rs` (add `public_key_path`, `certificate_path`, `grace_days` to `ServerCfg`)
 - Modify: `oj/src/args.rs` (add CLI flags `--cert-path`, `--key-path`, `--grace-days`)
 
 **Interfaces:**
@@ -362,7 +362,7 @@ fn test_config_parses_cert_paths() {
   `cargo test --test config_cert_test::test_config_parses_cert_paths -v`
 - [ ] **Step 5: Commit**
 ```bash
-git add mdm_base_rust/config.rs oj/src/args.rs tests/config_cert_test.rs
+git add only_js/config.rs oj/src/args.rs tests/config_cert_test.rs
 git commit -m "feat: add certificate path & grace_day config + CLI flags"
 ```
 

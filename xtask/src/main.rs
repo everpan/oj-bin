@@ -6,7 +6,7 @@
 //! --check 在本子进程跑，PluginLoader 的 forget 语义无碍（进程退出即回收）；
 //! 复用 Task 3.2 同一加载入口保证预检与真实装配一致。
 
-use mdm_base_rust::bridge::plugin_loader::{host_context, load_manifest, PluginManifestEntry};
+use only_js::bridge::plugin_loader::{host_context, load_manifest, PluginManifestEntry};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

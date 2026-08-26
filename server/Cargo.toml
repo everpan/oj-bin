@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mdm-base-rust = { path = ".." }
+only-js = { path = ".." }
 axum = { version = "0.8", features = ["ws"] }
 matchit = "0.8"
 percent-encoding = "2.3"

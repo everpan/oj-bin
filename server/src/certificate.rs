@@ -9,7 +9,7 @@
 
 pub use crate::CertificateStatus;
 use base64::{engine::general_purpose, Engine};
-use mdm_base_rust::config::ServerCfg;
+use only_js::config::ServerCfg;
 use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use serde_json::Value;
 use std::path::{Path, PathBuf};

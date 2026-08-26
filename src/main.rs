@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use mdm_base_rust::bridge::{
+use only_js::bridge::{
     Bridge, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
 };
 
 /// 演示：构造 Bridge（含 schema 白名单 + runtime 池 + 可选 inspector），跑业务 JS、
-/// 读捕获响应。等价于 Go 版 bridge_test.go 的 runScript。
+/// 读捕获响应。
 ///
 /// `inspect_addr` 为 `Some` 时启用 DevTools inspector 并在该地址起 WS 服务。
 #[tokio::main(flavor = "current_thread")]
@@ -32,7 +32,7 @@ pub async fn run_demo(inspect_addr: Option<SocketAddr>) -> Result<(), Box<dyn st
     if let Some(addr) = inspect_addr {
         // 后台 WS 服务存活到 demo 运行结束；随后中止以释放 inspector 引用，
         // 避免 pooled runtime 析构时仍持有 JsRuntimeInspector（deno_core 断言）。
-        insp_handle = Some(mdm_base_rust::bridge::start_inspector(&b, addr));
+        insp_handle = Some(only_js::bridge::start_inspector(&b, addr));
     }
 
     let cap = b

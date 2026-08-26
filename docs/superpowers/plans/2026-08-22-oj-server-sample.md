@@ -54,7 +54,7 @@ sample/                       # T11 全量（config/seed/manifest/api.ts/dist/ve
 
 **Files:**
 - Create: `../../../oj/Cargo.toml`, `../../../oj/src/main.rs`, `../../../oj/src/args.rs`（含 tests）
-- Modify: `/Users/ever/git/golang/mdm-base-rust/Cargo.toml`（members 加 `"cli"`）
+- Modify: `/Users/ever/git/golang/only-js/Cargo.toml`（members 加 `"cli"`）
 
 **Interfaces:**
 - Produces: `oj::args::{Command, ServerArgs}`；`Command::Server(ServerArgs { config: String, base: String, dir: String, dev: bool })`、`Command::Build(Vec<String>)`、`Command::None`；`parse(&[String]) -> Command`。T11 消费 `ServerArgs`。
@@ -69,7 +69,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mdm-base-rust = { path = ".." }
+only-js = { path = ".." }
 mdm-server = { path = "../server" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -317,7 +317,7 @@ mod tests {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust config`
+Run: `cargo test -p only-js config`
 Expected: 编译失败（新字段/签名不存在）。
 
 - [ ] **Step 3: 重写实现**
@@ -397,7 +397,7 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
 
 - [ ] **Step 4: 跑测试确认通过 + workspace 检查 + 提交**
 
-Run: `cargo test -p mdm-base-rust && cargo test --workspace`
+Run: `cargo test -p only-js && cargo test --workspace`
 Expected: config 4 测绿；workspace 绿。
 
 ```bash
@@ -624,7 +624,7 @@ unix@vip.qq.com ai"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust http_param_and_kv`
+Run: `cargo test -p only-js http_param_and_kv`
 Expected: FAIL（`kv`/`http.param` undefined → ReferenceError → 500 或 body 断言失败）。
 
 - [ ] **Step 3: 实现**
@@ -676,7 +676,7 @@ globalThis.kv = {
 
 - [ ] **Step 4: 跑测试确认通过 + 提交**
 
-Run: `cargo test -p mdm-base-rust`
+Run: `cargo test -p only-js`
 Expected: 全绿（含新测）。
 
 ```bash
@@ -700,7 +700,7 @@ unix@vip.qq.com ai"
 
 - [ ] **Step 1: 加依赖**
 
-Run: `cargo add deno_ast -p mdm-base-rust --features transpile`
+Run: `cargo add deno_ast -p only-js --features transpile`
 （版本由解析器定；与 deno_core 无版本耦合。）
 
 - [ ] **Step 2: 写失败测试**
@@ -751,7 +751,7 @@ mod tests {
 
 - [ ] **Step 3: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust transpile`
+Run: `cargo test -p only-js transpile`
 Expected: 编译失败。
 
 - [ ] **Step 4: 实现**
@@ -827,7 +827,7 @@ pub fn transpile_src(path: &Path, src: &str) -> Result<String, String> {
 
 - [ ] **Step 5: 跑测试确认通过 + 提交**
 
-Run: `cargo test -p mdm-base-rust`
+Run: `cargo test -p only-js`
 Expected: 全绿。
 
 ```bash
@@ -909,7 +909,7 @@ mod tests {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust module_loader`
+Run: `cargo test -p only-js module_loader`
 Expected: 编译失败。
 
 - [ ] **Step 3: 实现**
@@ -1069,7 +1069,7 @@ pub fn wrap_cjs(src: &str) -> String {
 
 - [ ] **Step 4: 跑测试确认通过 + 提交**
 
-Run: `cargo test -p mdm-base-rust`
+Run: `cargo test -p only-js`
 Expected: 全绿。
 
 ```bash
@@ -1123,7 +1123,7 @@ unix@vip.qq.com ai"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust module_loader`
+Run: `cargo test -p only-js module_loader`
 Expected: `resolve_bare` 未定义，编译失败。
 
 - [ ] **Step 3: 实现**
@@ -1240,7 +1240,7 @@ pub fn op_resolve_cjs(
 
 - [ ] **Step 4: 跑测试确认通过 + 提交**
 
-Run: `cargo test -p mdm-base-rust`
+Run: `cargo test -p only-js`
 Expected: 全绿。
 
 ```bash
@@ -1349,7 +1349,7 @@ unix@vip.qq.com ai"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust run_module`
+Run: `cargo test -p only-js run_module`
 Expected: 编译失败（`with_dbs_and_loader`/`run_module` 未定义）。
 
 - [ ] **Step 3: 实现**
@@ -1441,7 +1441,7 @@ module_loader: loader.map(|l| {
 
 - [ ] **Step 4: 跑测试确认通过（R1 spike 就此闭环）+ 提交**
 
-Run: `cargo test -p mdm-base-rust`
+Run: `cargo test -p only-js`
 Expected: 全绿（含 4 个新测）。若 408 测试挂：先确认 KillSwitch arm 时序（driver 加载也在熔断窗口内——加载阶段被 terminate 也应产生 Timeout），修正 disarm 判定。
 
 ```bash
@@ -1707,8 +1707,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mdm_base_rust::bridge::{Bridge, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor};
-use mdm_base_rust::config::{self, Config};
+use only_js::bridge::{Bridge, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor};
+use only_js::config::{self, Config};
 use mdm_server::actor::JsActor;
 use mdm_server::routes;
 
@@ -1766,7 +1766,7 @@ pub async fn start(
     let dir = dir.canonicalize().unwrap_or(dir);
     let loader = Arc::new(LoaderShared { project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()), ts });
     let kv = Arc::new(InMemoryKV::new());
-    let dbs: HashMap<String, Arc<dyn mdm_base_rust::bridge::DataAccessor>> =
+    let dbs: HashMap<String, Arc<dyn only_js::bridge::DataAccessor>> =
         dbs.into_iter().map(|(k, v)| (k, v as _)).collect();
     let n = cfg.server.pool_size.max(1) as usize;
     let timeout = config::parse_duration(&cfg.server.timeout).ok();
@@ -2119,8 +2119,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use oj::server_cmd;
-use mdm_base_rust::bridge::transpile::transpile_hits;
-use mdm_base_rust::config::Config;
+use only_js::bridge::transpile::transpile_hits;
+use only_js::config::Config;
 
 fn sample() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample").canonicalize().unwrap()
@@ -2254,7 +2254,7 @@ async fn uc14_transpile_cache_and_hot_reload() {
     let _ = std::fs::remove_dir_all(&t);
 }
 ```
-（`oj::server_cmd` 与 `mdm_base_rust::bridge::transpile` 需 pub 可达：`../../../oj/src/main.rs` 加 `pub mod server_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
+（`oj::server_cmd` 与 `only_js::bridge::transpile` 需 pub 可达：`../../../oj/src/main.rs` 加 `pub mod server_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
 
 - [ ] **Step 2: 跑测试确认通过（允许的失败逐个修）**
 

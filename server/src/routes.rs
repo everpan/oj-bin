@@ -413,7 +413,7 @@ pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> 
 /// 嵌套 runtime 会 panic，故换线程）。CLI 与测试共用。
 /// ponytail: 每文件起线程；文件数极大时改单线程批处理。
 pub fn bridge_introspector(
-    make: impl Fn() -> mdm_base_rust::bridge::Bridge + Send + Sync + 'static,
+    make: impl Fn() -> only_js::bridge::Bridge + Send + Sync + 'static,
 ) -> impl Fn(&Path) -> Result<Vec<(String, Option<String>)>, String> {
     let make = std::sync::Arc::new(make);
     move |f: &Path| {
@@ -437,7 +437,7 @@ pub fn bridge_introspector(
 /// 读模块 default 导出（release 直载 dist/routes.js）：独立线程 + current_thread rt，
 /// 与 bridge_introspector 同构（Bridge !Send，不可在异步上下文嵌套建 runtime）。
 pub fn bridge_default_reader(
-    make: impl Fn() -> mdm_base_rust::bridge::Bridge + Send + Sync + 'static,
+    make: impl Fn() -> only_js::bridge::Bridge + Send + Sync + 'static,
 ) -> impl Fn(&Path) -> Result<serde_json::Value, String> {
     let make = std::sync::Arc::new(make);
     move |f: &Path| {

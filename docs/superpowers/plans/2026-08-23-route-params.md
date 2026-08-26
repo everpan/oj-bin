@@ -12,7 +12,7 @@
 
 - 不新增 lockfile 外依赖；`matchit`/`percent-encoding`/`form_urlencoded` 仅在 `server/Cargo.toml` 声明。
 - 用户侧 `.route` 语法 = matchit 原生 `{name}` / `{*name}`，**零翻译层**。
-- 每任务 TDD：先写失败测试→跑→实现→跑过→commit。测试命令 `cargo test -p mdm-server`、`cargo test -p mdm-base-rust bridge`。
+- 每任务 TDD：先写失败测试→跑→实现→跑过→commit。测试命令 `cargo test -p mdm-server`、`cargo test -p only-js bridge`。
 - 注释风格对齐仓库：中文、模块头 `//!`、ponytail 简化处标注 `// ponytail:`。
 - 现有契约不得回归：`//`、`..`、`\`、`\0` → 404；`/a` 与 `/a/` 等价；path 存在但 verb 未注册 → 405；超时 408。
 - 每任务结束全量 `cargo test --workspace` 绿后再 commit。
@@ -421,7 +421,7 @@ async fn introspect_top_level_loop_times_out() {
 ```
 （`api_fixture`/`test_bridge_with_loader` 按现有 mod.rs 测试 helper 实情命名调整；若无直接可复用的，参照 :754 的 run_module 测试构造方式写最小 fixture。）
 
-- [ ] **Step 2: 跑测试确认编译失败** Run: `cargo test -p mdm-base-rust bridge::tests::introspect`
+- [ ] **Step 2: 跑测试确认编译失败** Run: `cargo test -p only-js bridge::tests::introspect`
 
 - [ ] **Step 3: 实现**（结构完全镜像 `run_module`，仅 driver 体与返回不同）
 
@@ -456,7 +456,7 @@ pub async fn introspect_module(&self, api_path: &std::path::Path) -> Result<serd
 }
 ```
 
-- [ ] **Step 4: 跑测试过** `cargo test -p mdm-base-rust bridge`
+- [ ] **Step 4: 跑测试过** `cargo test -p only-js bridge`
 - [ ] **Step 5: Commit** `git commit -am "feat(bridge): introspect_module reuses run_module pipeline (TDD)"`
 
 ---
@@ -586,10 +586,10 @@ Run: `cargo test -p mdm-server`
 
 - [ ] **Step 3: 实现**
 
-`routes.rs` 追加（server 已依赖 mdm-base-rust 与 serde_json）：
+`routes.rs` 追加（server 已依赖 only-js 与 serde_json）：
 
 ```rust
-use mdm_base_rust::bridge::Bridge;
+use only_js::bridge::Bridge;
 
 /// 内省结果 Value（Task 3 约定：仅函数导出的方法，null=未挂）→ decls。
 pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> {

@@ -7,7 +7,7 @@ mod cert_fixture;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use cert_fixture::{TEST_RSA_PKCS8_B64, TEST_RSA_PUBLIC_PEM};
-use mdm_base_rust::config::ServerCfg;
+use only_js::config::ServerCfg;
 use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use serde_json::json;

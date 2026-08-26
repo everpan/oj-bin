@@ -7,7 +7,7 @@
 
 ## 1. 这是什么
 
-把 `mdm-base-rust` 的五个后端轴（db/blob/bus/kv/es）从编译期写死改造为
+把 `only-js` 的五个后端轴（db/blob/bus/kv/es）从编译期写死改造为
 **cdylib 动态库插件系统**：core 持 op + 注册表，插件为纯工厂 `.so/.dylib/.dll`，
 启动期 libloading 装配。四层：装配层（`oj/src/server_cmd.rs`）→ 插件层（`oj-*` cdylib）
 → 框架层（core：五注册表 + PluginLoader + `ffi.rs` 全部 unsafe）→ 契约层（`oj-plugin-ffi`）。
@@ -212,7 +212,7 @@ Task 6.2 Step 3 提交 `fix(review): 插件系统完成度 review 意见吸收`�
 ## 8. 常用命令
 
 ```bash
-cargo test -p mdm-base-rust <过滤词>                 # 单测（推荐按模块过滤）
+cargo test -p only-js <过滤词>                 # 单测（推荐按模块过滤）
 cargo test --workspace -- --skip infinite_loop       # 全套回归（Task 6.3）
 cargo xtask plugin <name>                            # 单独编译 + 拷入 plugins/<triple>/
 cargo build -p oj-es                                 # 改插件后手动重建 cdylib

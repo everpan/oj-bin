@@ -45,9 +45,9 @@
 
 最初 5.45 ms/req 不是 JS/op 路径开销：本机装有系统代理（127.0.0.1:7890，Clash 系），
 reqwest 默认读取 macOS 系统代理配置，且回环例外（`127.*`）未生效——回环流量被送进
-Go 实现的代理进程（服务器端看到的 `User-Agent: Go-http-client/1.1` 即代理转发证据），
-每请求一次新建代理连接。修复：Bridge 的 reqwest Client 改 `no_proxy`（对齐 Go fiber
-client 不走系统代理的行为），纯 reqwest 回环验证从 1.9 ms/req 降至 65 µs/req。
+本机代理进程（服务器端看到的 `User-Agent: Go-http-client/1.1` 即代理转发证据），
+每请求一次新建代理连接。修复：Bridge 的 reqwest Client 改 `no_proxy`（不走系统代理），
+纯 reqwest 回环验证从 1.9 ms/req 降至 65 µs/req。
 需要代理支持时按配置注入 `Proxy`（见 `mod.rs` 中 ponytail 注释）。
 
 ## 解读
@@ -57,8 +57,6 @@ client 不走系统代理的行为），纯 reqwest 回环验证从 1.9 ms/req �
 - **序列化是主要变量成本**：信封 marshal 已从 op 路径中消除（单遍写 buffer）；
   db.query 的行数据 serde_v8 物化（约 270 ns/行级对象）在真实 SQL 实现接入后仍是
   主要开销，如需再压可评估 `#[buffer]`/resource 句柄直传。
-- 与 Go/goja 版的同口径对比（异步 op 快 12–34x，每请求固定开销快 12.4x）
-  见 [comparison.md](comparison.md)。
 
 ## 复现
 

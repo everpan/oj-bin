@@ -18,7 +18,7 @@
 - 产物布局 `plugins/<target-triple>/lib<name>.{so,dylib}` / `<name>.dll`；加载路径四级：`OJ_PLUGINS_DIR` > `oj.toml plugins_dir` > `<exe>/plugins` > build.rs dev 后备；相对路径一律相对 oj.toml 所在目录（spec §4）。
 - 注册冲突（重名/scheme 交集）一律启动期 fail fast，无静默降级（spec §6）。
 - **每步可编译、全测试绿**；TDD：先写失败测试再实现；每任务结束 commit，提交信息尾注 `unix@vip.qq.com ai`。
-- 测试命令约定：`cargo test -p mdm-base-rust <过滤词>`。**已知存量问题**：`bridge::tests::infinite_loop_times_out_and_bridge_survives`（src/bridge/mod.rs:995）在 master 上即 SIGSEGV，与本计划无关——跑全套测试一律加 `-- --skip infinite_loop`。
+- 测试命令约定：`cargo test -p only-js <过滤词>`。**已知存量问题**：`bridge::tests::infinite_loop_times_out_and_bridge_survives`（src/bridge/mod.rs:995）在 master 上即 SIGSEGV，与本计划无关——跑全套测试一律加 `-- --skip infinite_loop`。
 - env-gated 集成测试（`OJ_TEST_S3`/`OJ_TEST_ES`/`OJ_TEST_REDIS`/`OJ_TEST_MYSQL`/`OJ_TEST_PG`）保留，未设 env 时 skip。
 - **每阶段最后一个任务 = 更新任务状态**：勾选本阶段全部复选框、git commit 进度（消息尾注同上）。正式验收与 review 集中在阶段 6，中间阶段只做工程纪律级的编译+测试绿。
 
@@ -113,14 +113,14 @@ mod tests {
 
 - [x] **Step 2: 跑测试确认编译失败**
 
-Run: `cargo test -p mdm-base-rust named_registry`
+Run: `cargo test -p only-js named_registry`
 Expected: FAIL（`named_registry` 模块不存在）
 
 - [x] **Step 3: 实现**（上方 Produces 代码全文写入，mod.rs 加 `pub mod named_registry; pub use named_registry::NamedRegistry;`）
 
 - [x] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p mdm-base-rust named_registry -- --skip infinite_loop`
+Run: `cargo test -p only-js named_registry -- --skip infinite_loop`
 Expected: 2 passed
 
 - [x] **Step 5: Commit**
@@ -307,14 +307,14 @@ mod tests {
 
 - [x] **Step 3: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust db_backend`
+Run: `cargo test -p only-js db_backend`
 Expected: FAIL（模块不存在）
 
 - [x] **Step 4: 实现** `db_backend.rs`（上方代码 + `normalize_sqlite_dsn` 从 `resolve_dsn` 提炼；`SqlxAccessor::arc` 签名见 accessor_sqlx.rs:29 `pub async fn connect(url: &str)` 的包装——沿用现状）
 
 - [x] **Step 5: 跑测试确认通过**
 
-Run: `cargo test -p mdm-base-rust db_backend -- --skip infinite_loop`
+Run: `cargo test -p only-js db_backend -- --skip infinite_loop`
 Expected: 4 passed
 
 - [x] **Step 6: Commit**
@@ -355,7 +355,7 @@ Expected: FAIL
 - [x] **Step 4: 实现**——server_cmd.rs 的 db 循环改为：
 
 ```rust
-let registry = mdm_base_rust::bridge::db_backend::DbBackendRegistry::builtin();
+let registry = only_js::bridge::db_backend::DbBackendRegistry::builtin();
 let mut dbs = connect_dbs(&cfg.db, &registry, config_dir).await?;
 ```
 
@@ -364,9 +364,9 @@ let mut dbs = connect_dbs(&cfg.db, &registry, config_dir).await?;
 ```rust
 pub async fn connect_dbs(
     cfg_db: &std::collections::HashMap<String, String>,
-    registry: &mdm_base_rust::bridge::db_backend::DbBackendRegistry,
+    registry: &only_js::bridge::db_backend::DbBackendRegistry,
     config_dir: &std::path::Path,
-) -> Result<std::collections::HashMap<String, std::sync::Arc<mdm_base_rust::bridge::DataAccessor>>, String> {
+) -> Result<std::collections::HashMap<String, std::sync::Arc<only_js::bridge::DataAccessor>>, String> {
     let mut dbs = std::collections::HashMap::new();
     for (name, dsn) in cfg_db {
         let acc = registry.connect(dsn, config_dir).await
@@ -381,7 +381,7 @@ build_cmd.rs:186-189 的 `SqlxAccessor::arc("sqlite::memory:")` 改为 `DbBacken
 
 - [x] **Step 5: 跑测试确认通过 + 全量回归**
 
-Run: `cargo test -p oj -- --skip infinite_loop && cargo test -p mdm-base-rust -- --skip infinite_loop`
+Run: `cargo test -p oj -- --skip infinite_loop && cargo test -p only-js -- --skip infinite_loop`
 Expected: 全绿
 
 - [x] **Step 6: Commit**
@@ -439,14 +439,14 @@ async fn ops_dispatch_via_es_backend_trait() {
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust es:: -- --skip infinite_loop`
+Run: `cargo test -p only-js es:: -- --skip infinite_loop`
 Expected: FAIL（`EsBackend` 未定义）
 
 - [x] **Step 3: 实现**——三 op 改为：取 `Arc<dyn EsBackend>` → 校验 `valid_ident`（留在 op 层，防注入是 op 职责）→ 调 trait 方法。`StableState.es` 与 `Extras.es` 类型改 `Option<Arc<dyn EsBackend>>`；`oj/src/server_cmd.rs:141` 的 `Arc<EsClient>` 注入处加 `as Arc<dyn EsBackend>`  coercion。op 内错误文案 `es not configured` 保持不变。
 
 - [x] **Step 4: 跑测试确认通过 + 全量回归**
 
-Run: `cargo test -p mdm-base-rust es:: -- --skip infinite_loop && cargo test -p mdm-base-rust -- --skip infinite_loop`
+Run: `cargo test -p only-js es:: -- --skip infinite_loop && cargo test -p only-js -- --skip infinite_loop`
 Expected: 全绿（含 `OJ_TEST_ES` 未设时 skip）
 
 - [x] **Step 5: Commit**
@@ -523,7 +523,7 @@ Expected: blob.rs 五个 op 的取数点 + server_cmd.rs 装配段 + 测试夹�
 /// （"跨 actor 池与全部 WS 连接共享"语义回归，spec §2 Extras 迁移）。
 #[tokio::test]
 async fn shared_broker_broadcasts_across_bridges() {
-    let bus = mdm_base_rust::bridge::broker::build_broker(&None).await.unwrap();
+    let bus = only_js::bridge::broker::build_broker(&None).await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     bus.subscribe("t", tx).await.unwrap();
     // 用同一 bus 构造第二个 Bridge（沿用既有 Bridge 测试夹具），经其 op_bus_publish 发布
@@ -628,7 +628,7 @@ async fn registry_multi_backend_and_duplicate_fails() {
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
+Run: `cargo test -p only-js blob -- --skip infinite_loop`
 Expected: FAIL
 
 - [x] **Step 3: 实现**——BlobRegistry 去掉"仅 default"限制（改为直接包 NamedRegistry）；config 新增 `blob_backends` 段（旧 `[blob]` 段保留映射为 default，向后兼容）；server_cmd.rs 装配：遍历配置逐个构造（local root 相对 config_dir 绝对化、s3 走 `S3Blob::new` 现状校验），配置声明的名字全部成功注册，缺一 → `blob backend '<name>': ...` 启动期报错。
@@ -687,7 +687,7 @@ op 取数：`blobs.get(&name)` → None 时：name == "default" 报 `blob not co
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
+Run: `cargo test -p only-js blob -- --skip infinite_loop`
 Expected: FAIL（op 参数不匹配）
 
 - [x] **Step 3: 实现**——五 op 加 name 参数 + bootstrap.js 工厂装配（上方代码）。
@@ -736,7 +736,7 @@ async fn download_route_serves_default_only() {
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust blob -- --skip infinite_loop`
+Run: `cargo test -p only-js blob -- --skip infinite_loop`
 Expected: FAIL
 
 - [x] **Step 3: 实现**——LocalBlob 增 name 字段（`LocalBlob::new` 保留 = name "default" 委托 `named`）；routes.rs 下载路由从 `StableState.blobs.get("default")` 取后端（现状若从 Extras.blob 取则改道）。
@@ -835,7 +835,7 @@ fn duplicate_kind_fails() {
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust bus_backend -- --skip infinite_loop`
+Run: `cargo test -p only-js bus_backend -- --skip infinite_loop`
 Expected: FAIL
 
 - [x] **Step 3: 实现**——`LocalBusBackend`/`KafkaBusBackend`/`RabbitMqBusBackend` 各实现 `BusBackend::connect`（Kafka/RabbitMQ 的 connect 体 = 现 broker/kafka.rs、broker/rabbitmq.rs 构造逻辑上移，feature gate 保留）；`build_broker` 改薄包装。
@@ -1141,14 +1141,14 @@ pub(crate) unsafe fn load_forget(path: &Path) -> Result<&'static libloading::Lib
 
 - [x] **Step 3: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust plugin_loader -- --skip infinite_loop`
+Run: `cargo test -p only-js plugin_loader -- --skip infinite_loop`
 Expected: FAIL
 
 - [x] **Step 4: 实现**——`resolve_plugins_dir`（build.rs 捕获 workspace root：`println!("cargo:rustc-env=OJ_WORKSPACE_ROOT={}", ...)`）；`load_forget` + 两模式加载（含**指纹比对：不符仅 eprintln 告警不 fail**，spec §3）；**宿主 panic hook 安装**（装配首个插件前安装一次，输出当前插件上下文与构建指纹用于归因，spec §3）；Windows 分支用 `load_with_flags(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)`（cfg(windows)，本期编译过关即可，实测归 CI）。
 
 - [x] **Step 5: 跑测试确认通过**
 
-Run: `cargo test -p mdm-base-rust plugin_loader ffi -- --skip infinite_loop`
+Run: `cargo test -p only-js plugin_loader ffi -- --skip infinite_loop`
 Expected: 全绿
 
 - [x] **Step 6: Commit**
@@ -1200,14 +1200,14 @@ impl Drop for FfiEsBackend { fn drop(&mut self) { (self.vtable.close)(self.handl
 
 - [x] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p mdm-base-rust ffi -- --skip infinite_loop`
+Run: `cargo test -p only-js ffi -- --skip infinite_loop`
 Expected: FAIL
 
 - [x] **Step 3: 实现** + `await_ffi` 桥（轮询/oneshot 形态按 S.2 记录）
 
 - [x] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p mdm-base-rust ffi -- --skip infinite_loop`
+Run: `cargo test -p only-js ffi -- --skip infinite_loop`
 Expected: 全绿
 
 - [x] **Step 5: Commit**
@@ -1516,7 +1516,7 @@ unix@vip.qq.com ai"
 
 - [x] **Step 2: 瘦身验证**
 
-Run: `cargo tree -p mdm-base-rust -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'`
+Run: `cargo tree -p only-js -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'`
 Expected: 无输出（core 二进制不再链接这些驱动）
 
 - [x] **Step 3: 全量回归**
@@ -1594,7 +1594,7 @@ unix@vip.qq.com ai"
 
 - [x] **Step 2: 全链路集成测试**——host op → FFI 同步方法 → 插件 runtime 异步执行 → FfiFuture 完成 → host 拿结果，五轴各至少一条链路。
 
-- [x] **Step 3: 瘦身验收**——`cargo tree -p mdm-base-rust -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'` 无输出。
+- [x] **Step 3: 瘦身验收**——`cargo tree -p only-js -e normal | grep -Ei 'mysql|postgres|redis|rdkafka|lapin'` 无输出。
 
 - [x] **Step 4: blob 裁决验收**——非 default local 后端 `url()` 报指定文案；default 下载路由字节一致回归。
 

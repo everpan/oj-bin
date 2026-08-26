@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use mdm_base_rust::bridge::transpile::transpile_hits;
-use mdm_base_rust::config::Config;
+use only_js::bridge::transpile::transpile_hits;
+use only_js::config::Config;
 use oj::args::BuildArgs;
 use oj::server_cmd;
 

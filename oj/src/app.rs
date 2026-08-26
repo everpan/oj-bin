@@ -18,13 +18,13 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::util::ServiceExt;
-use mdm_base_rust::bridge::plugin_loader::kv_backend_connect;
-use mdm_base_rust::bridge::{
+use only_js::bridge::plugin_loader::kv_backend_connect;
+use only_js::bridge::{
     Bridge, Dialect, EsBackend, Extras, InMemoryKV, KVStore, LoaderShared, SchemaRegistry,
 };
-use mdm_base_rust::bridge::blob::{BlobBackend, BlobRegistry};
-use mdm_base_rust::bridge::{EventBroker, StableState};
-use mdm_base_rust::config::{self, Config};
+use only_js::bridge::blob::{BlobBackend, BlobRegistry};
+use only_js::bridge::{EventBroker, StableState};
+use only_js::config::{self, Config};
 use server::actor::JsActor;
 use server::routes;
 use server::ws;
@@ -328,9 +328,9 @@ impl App {
         match tokio::time::timeout(DISPATCH_TIMEOUT, router.oneshot(req)).await {
             Ok(resp) => resp.expect("oneshot dispatch is infallible"),
             Err(_) => {
-                // 超时：返回 408 信封（对齐 Go dev server）。
+                // 超时：返回 408 信封。
                 let mut r = axum::http::Response::new(Body::from(
-                    mdm_base_rust::bridge::fail(408, "dispatch timed out", &serde_json::Value::Null).0,
+                    only_js::bridge::fail(408, "dispatch timed out", &serde_json::Value::Null).0,
                 ));
                 *r.status_mut() = StatusCode::REQUEST_TIMEOUT;
                 r

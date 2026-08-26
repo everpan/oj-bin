@@ -3,7 +3,7 @@ members = ["server", "oj", "oj-plugin-ffi", "crates/plugins/oj-es", "crates/plug
 default-members = ["."]
 
 [package]
-name = "mdm-base-rust"
+name = "only-js"
 version = "0.1.0"
 edition = "2024"
 

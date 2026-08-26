@@ -1,7 +1,6 @@
 # bridge —— deno_core JS SDK 桥接模块
 
-移植自 Go 版 `mdm-base/internal/bridge`（goja → deno_core 0.409），向 V8 JsRuntime 注入
-JS SDK 全局对象，供 JS handler 编写业务逻辑，Rust 侧捕获统一信封响应。
+向 V8 JsRuntime 注入 JS SDK 全局对象，供 JS handler 编写业务逻辑，Rust 侧捕获统一信封响应。
 
 ## 架构
 
@@ -27,29 +26,8 @@ JS SDK 全局对象，供 JS handler 编写业务逻辑，Rust 侧捕获统一�
 - **RuntimePool**：复用 `JsRuntime`（V8 isolate 1~10ms 开销），idle 上限 `DEFAULT_MAX_IDLE=16`。
   "快照"等价于已加载 `bootstrap.js` 的预热 runtime——bootstrap 仅编译一次，后续请求只执行 handler 源码。
   **仅成功执行（已轮询 event loop）的 runtime 才归还**；失败的可能 isolate 损坏，直接 drop。
-- **异步模型**：Go 版"后台 goroutine + RunOnLoop 回切解析 Promise"由 `#[op2] async fn`
-  天然替代——op 直接返回 JS Promise，由 deno_core event loop 驱动，无需手写回切。
-- **JS 侧 API 形状**由 `bootstrap.js`（扩展入口）装配，等价于 goja 版的 `map[string]any` 绑定。
-
-## 文件对照
-
-| Rust | Go | 内容 |
-|---|---|---|
-| `src/bridge/mod.rs` | bridge.go | Bridge 装配骨架、StableState/ReqState、扩展注册、RuntimePool、响应捕获 |
-| `src/bridge/envelope.rs` | envelope.go | `{code,msg,data}` 统一信封、状态码映射 |
-| `src/bridge/json.rs` | json.go | `json.ok/fail/header` |
-| `src/bridge/db.rs` | db.go + accessor.go | `DataAccessor` trait、内存 fake、`db.query/exec`、`DB(name)` |
-| `src/bridge/query.rs` | — | 安全查询构造器（sea-query + SchemaRegistry 白名单，参数化值） |
-| `src/bridge/registry.rs` | — | `SchemaRegistry` 表/列白名单（SQL 注入根治点） |
-| `src/bridge/accessor_sqlx.rs` | — | `SqlxAccessor`：sqlx Any 驱动实现 `DataAccessor` |
-| `src/bridge/runtime.rs` | — | `RuntimePool`：复用 JsRuntime（预热=快照等价） |
-| `src/bridge/loader.rs` | — | `HandlerStore`：handler 源码加载 + 热重载（FS / 嵌入） |
-| `src/bridge/inspector.rs` | — | DevTools inspector WS 桥（deno_core 自带 `JsRuntimeInspector`） |
-| `src/bridge/fetch.rs` | fetch.go | `fetch(url, options)`（fiber.Client → reqwest） |
-| `src/bridge/http.rs` | http.go | `http.*` 只读请求上下文 |
-| `src/bridge/kv.rs` | kv.go | `KVStore` trait、内存实现、`redis.get/set` |
-| `src/bridge/log.rs` | log.go | `log.debug/info/warn/error`（zap → tracing） |
-| `src/bridge/bootstrap.js` | bridge.go `Apply` | JS 全局对象装配、`DB(name)` 引用缓存、Response 组装、查询构造器 |
+- **异步模型**：op 以 `#[op2] async fn` 直接返回 JS Promise，由 deno_core event loop 驱动，无需手写回切。
+- **JS 侧 API 形状**由 `bootstrap.js`（扩展入口）装配，将 `op_*` 暴露为 `globalThis` 上的全局对象。
 
 ## JS API
 
@@ -122,9 +100,9 @@ const r2   = resp.clone();
 const { done, value } = await resp.body.getReader().read(); // 缓冲模拟：首读全量，再读 done
 ```
 
-未设置 Content-Type 且有 body 时自动补 `text/plain;charset=UTF-8`。不支持 AbortController（同 Go 版）。
-HTTP 客户端为单个共享 reqwest Client（连接池复用），`no_proxy`——不走系统代理，对齐
-Go fiber client 行为；需要代理支持时按配置注入 `Proxy`（见 `src/bridge/mod.rs` 注释）。
+未设置 Content-Type 且有 body 时自动补 `text/plain;charset=UTF-8`。不支持 AbortController。
+HTTP 客户端为单个共享 reqwest Client（连接池复用），`no_proxy`——不走系统代理；
+需要代理支持时按配置注入 `Proxy`（见 `src/bridge/mod.rs` 注释）。
 
 > 注意：reqwest 默认会读取 macOS 系统代理配置，本机有代理软件时连回环地址都会被
 > 拦截转发（实测 65 µs/req 劣化到 1.9 ms/req）。这是 `no_proxy` 的直接原因。
@@ -139,7 +117,7 @@ finish(); // 等价于 json.ok/fail 的 SignalDone 语义，但不写响应
 
 ```rust
 use std::sync::Arc;
-use mdm_base_rust::bridge::{
+use only_js::bridge::{
     Bridge, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
 };
 
@@ -193,16 +171,6 @@ pub trait KVStore: Send + Sync {                   // 后续真实 Redis 以同�
 
 `BridgeResult<T> = Result<T, Box<dyn Error + Send + Sync>>`，op 层转为 `JsErrorBox` 抛给 JS。
 `SqlxAccessor`（accessor_sqlx.rs）已实现 `DataAccessor`，以 `Pool<Any>` 驱动无关接入真实 MySQL/PG/SQLite。
-
-## 与 Go 版的差异
-
-- **Promise**：goja 需手工 NewPromise + RunOnLoop 回切；deno_core async op 直接返回 Promise。
-- **错误**：op 错误类型用 `deno_error::JsErrorBox`（anyhow 不再被 op2 接受）。
-- **per-request 状态**：`ReqState`（请求上下文 + 响应捕获）存入 `OpState`，每次 `run_with`
-  借出 runtime 时 `reset(req)`；`StableState`（kv/dbs/client/registry）为 `Arc` 跨请求共享。
-  故 `Bridge` 可池化复用 `JsRuntime`（`RuntimePool`），无需每请求新建 isolate。
-- **未移植**：`ws`（Go 版即占位）、`Redis(name)` 真实实例、`XORM(name)` ORM——server 层
-  需要时按 `DB(name)` 既有模式接入 redis/sqlx。
 
 ## 测试与性能
 

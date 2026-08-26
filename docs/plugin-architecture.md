@@ -2,7 +2,7 @@
 
 > 状态：方案（未执行）。目标：把后端能力（blob、minio/s3、redis、ES、SQL 方言）以插件方式加载，
 > 实现编译期/启动期可选、可装卸、可扩展，且不与现有 200+ 测试冲突。
-> 本方案是对既有代码现状的改造计划，所有文件行号基于当前 `mdm-base-rust` 工作区。
+> 本方案是对既有代码现状的改造计划，所有文件行号基于当前 `only-js` 工作区。
 
 ---
 
@@ -121,7 +121,7 @@ impl Plugin for SqliteDbPlugin {
 ## 4. 工作区布局（改造后）
 
 ```
-mdm-base-rust/        core: bridge_ext(核心 ops) + Plugin trait + BridgeBuilder
+only-js/        core: bridge_ext(核心 ops) + Plugin trait + BridgeBuilder
                       + StableState(含 db_backends 字段) + DbBackend/Registry + MemoryBackend
   src/bridge/
     ext.rs            ← 新增：Plugin trait + BridgeBuilder + StableStateBuilder

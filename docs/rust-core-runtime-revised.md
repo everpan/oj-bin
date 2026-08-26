@@ -1,6 +1,6 @@
 # 方案评审与修订：Rust 嵌入式 JS 后端
 
-本文档基于 `docs/rust-core-runtime.md`（原始方案）与现有代码库 `/Users/ever/git/golang/mdm-base-rust`
+本文档基于 `docs/rust-core-runtime.md`（原始方案）与现有代码库 `/Users/ever/git/golang/only-js`
 （已实现 `deno_core` 桥接 + 内存 fake 数据层）的现状，组织 **4 位专家评审**（Rust/V8 嵌入、
 安全、后端架构/ORM、DevEx/工具链）并据此修订。
 

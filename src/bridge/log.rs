@@ -1,6 +1,6 @@
-//! log 结构化日志绑定（移植自 Go log.go：zap SugaredLogger → tracing）。
+//! log 结构化日志绑定（基于 tracing）。
 //!
-//! JS 用法与 Go 版一致（msg + 交替键值对）：
+//! JS 用法（msg + 交替键值对）：
 //!
 //! ```js
 //! log.info("user login", "user_id", uid, "ip", ip);
