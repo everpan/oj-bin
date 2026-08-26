@@ -10,10 +10,21 @@ crate-type = ["cdylib"]
 [dependencies]
 oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
 futures = "0.3"
-rdkafka = { version = "0.36", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time"] }
+
+# rdkafka 默认特性（ssl/sasl/zstd/lz4/libz）需要 OpenSSL/zlib/SASL 等原生库。
+# Windows CI 不提供这些库，且 Windows 非部署目标，故 Windows 仅保留 `tokio`，
+# 由 rdkafka-sys 用 cmake 从源码构建 librdkafka（关闭全部外部依赖）即可编译通过。
+# Linux/macOS（部署目标）保留默认特性以启用 SSL/SASL。
+[target.'cfg(not(windows))'.dependencies]
+rdkafka = { version = "0.36", features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+# cmake-build 显式开启：Windows 无系统 pkg-config，必须由 rdkafka-sys 用 cmake 从源码构建
+# librdkafka；关闭 ssl/sasl/zstd/lz4/libz 后无需任何外部原生库，windows-latest（自带 cmake + MSVC）即可编译。
+rdkafka = { version = "0.36", features = ["tokio", "cmake-build"], default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }
