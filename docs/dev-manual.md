@@ -94,7 +94,7 @@ OJ_TEST_REDIS=redis://127.0.0.1:6379/1 cargo test --workspace -- --ignored
 ```
 
 > 注：only-js 全套测试已修复为可跑：当前 `cargo test --workspace` 全绿，
-> 合计 **206 通过 + 3 忽略**（细节见 §7）。only-js 覆盖率：**行 92.66% / 区域 91.39%**（>90%）。
+> 合计 **204 通过 + 3 忽略**（细节见 §7；根 crate 不再含演示二进制，原 2 个 demo 测试已随 `src/main.rs` 移除）。only-js 覆盖率：**行 92.66% / 区域 91.39%**（>90%）。
 > 曾有的 `infinite_loop_times_out_and_bridge_survives` SIGSEGV 已于 0bdfa86 修复（看门狗改用
 > `v8::IsolateHandle`，见 §3）。另：`only-js` 测试二进制曾在 glibc 进程退出时 SIGSEGV
 > （每 `Bridge` 各泄漏一个看门狗线程，退出时与 V8 平台析构相互干扰），已于 b79f697 修复——

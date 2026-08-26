@@ -76,12 +76,27 @@ pub(crate) fn is_plugin_file(path: &Path) -> bool {
     }
 }
 
+/// 宿主目标 triple（与 xtask 的 `rustc -vV` host 一致），用于拼出插件目录
+/// `<plugins>/<triple>/`。原先由 build.rs 烧入 `OJ_TARGET_TRIPLE`，现改为运行时按
+/// `std::env::consts` 重建——生产环境未必有 rustc，故不调用 `rustc -vV`；放置侧（xtask）
+/// 与发现侧（plugin_loader）同为当前宿主 triple，保持一致。
 pub(crate) fn triple() -> &'static str {
-    env!("OJ_TARGET_TRIPLE")
+    static T: LazyLock<String> = LazyLock::new(|| {
+        let arch = std::env::consts::ARCH;
+        match std::env::consts::OS {
+            "macos" => format!("{arch}-apple-darwin"),
+            "windows" => format!("{arch}-pc-windows-msvc"),
+            "linux" => format!("{arch}-unknown-linux-gnu"),
+            other => format!("{arch}-unknown-{other}-gnu"),
+        }
+    });
+    T.as_str()
 }
 
+/// 工作区根目录：原先由 build.rs 烧入 `OJ_WORKSPACE_ROOT`（= 根 crate 的
+/// CARGO_MANIFEST_DIR），现直接用内置的 `CARGO_MANIFEST_DIR`（无需 build.rs）。
 pub(crate) fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("OJ_WORKSPACE_ROOT"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 // ---- core 侧适配器层（spec §3）：每轴一个 FfiXxxBackend，插件永不直接产 dyn Trait 跨界 ----

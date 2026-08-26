@@ -160,8 +160,9 @@ plugins/
   1. 环境变量 `OJ_PLUGINS_DIR`（仅开发期，生产部署不应设置——见 §6 信任边界）；
   2. `oj.toml` 的 `plugins_dir`；
   3. `<可执行文件目录>/plugins`；
-  4. dev 后备：build.rs 捕获 workspace root 编译期写入常量，指向 `<workspace>/plugins`
-     （dev 构建下 `cargo xtask plugin` + `cargo run` 零环境变量闭环）；
+  4. dev 后备：`workspace_root()` 取自 `CARGO_MANIFEST_DIR`（根 crate manifest 目录 =
+     `<workspace>`），不再依赖 build.rs，指向 `<workspace>/bin/plugins`
+     （dev 构建下 `cargo xtask plugin` 零环境变量闭环）；
   最终目录 = `<plugins_dir>/<宿主 target-triple>/`；显式配置了 1/2 而目录不存在 → 报错；
   走默认 3/4 而目录不存在 → 视为零插件；
 - **Windows**：以绝对路径 + `load_with_flags(LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
