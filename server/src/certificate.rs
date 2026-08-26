@@ -2,7 +2,7 @@ use mdm_base_rust::config::ServerCfg;
 use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 use std::{fs, time::{SystemTime, UNIX_EPOCH, Duration}};
 use serde_json::Value;
-use base64::{engine::general_purpose, Engine};
+use base64::engine::general_purpose;
 
 /// 证书状态
 #[derive(Clone, Debug)]
@@ -42,7 +42,7 @@ pub async fn load_certificate(cfg: &ServerCfg) -> Result<(CertificateStatus, Opt
 
     // 4. 验证签名 (RS256)
     let signing_input = format!("{}.{}", parts[0], parts[1]);
-    (&RSA_PKCS1_2048_8192_SHA256).verify(&pub_key, signing_input.as_bytes(), &signature)
+    pub_key.verify(signing_input.as_bytes(), &signature)
         .map_err(|_| "signature verification failed".to_string())?;
 
     // 5. 解析 payload JSON

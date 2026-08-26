@@ -24,6 +24,12 @@ pub struct ServerCfg {
     /// 不存在则自动创建。每日滚动 + 每次启动一个新文件（文件名带启动时间到秒）。
     #[serde(default)]
     pub logs_dir: Option<String>,
+    /// 公钥路径（PEM 格式，用于验证证书签名）
+    pub public_key_path: String,
+    /// 证书路径（JWS 格式，包含荷载）
+    pub certificate_path: String,
+    /// 宽限期（天数），证书过期后仍可接受的额外时间
+    pub grace_days: Option<u64>,
 }
 
 impl Default for ServerCfg {
@@ -37,6 +43,9 @@ impl Default for ServerCfg {
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
             logs_dir: None,
+            public_key_path: "".into(),
+            certificate_path: "".into(),
+            grace_days: Some(30),
         }
     }
 }

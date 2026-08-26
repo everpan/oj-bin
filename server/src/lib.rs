@@ -1156,9 +1156,6 @@ pub(crate) mod tests {
         takes_send::<AppState>();
     }
 
-    }
-
-    
     #[tokio::test]
     async fn test_appstate_has_certificate_fields() {
         let state = dummy_app_state();
@@ -1198,4 +1195,5 @@ pub(crate) mod tests {
         let res = certificate::load_certificate(&cfg).await;
         assert!(res.is_err(), "Expected error due to invalid key, got {:?}", res);
     }
+}
 
