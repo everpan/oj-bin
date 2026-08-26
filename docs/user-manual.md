@@ -27,7 +27,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>]
+oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>] [--grace-days <n>]
 oj build  [module] [-d src] [-o dist] [--no-minify]
 ```
 
@@ -39,6 +39,9 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
+| `--cert-path` | 无（未配置则不启用证书校验） | （server）JWS 证书路径，覆盖 `server.certificate_path` |
+| `--key-path` | 无 | （server）PEM 公钥路径，覆盖 `server.public_key_path` |
+| `--grace-days` | `server.grace_days`（默认 30） | （server）证书过期后宽限天数，覆盖 `server.grace_days` |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
   读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
@@ -72,6 +75,9 @@ server:
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
   root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
+  public_key_path: "./config/public_key.pem"   # 证书校验公钥（PEM）；与 certificate_path 都配齐即启用校验
+  certificate_path: "./config/certificate.jws"  # JWS 证书（Base64URL(Header).Payload.Signature）
+  grace_days: 30           # 证书过期后宽限天数（默认 30；缩窄可加速告警）
 db:
   default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # 需 oj-db-mysql 插件
@@ -111,6 +117,11 @@ blob:
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
 - `server.root`：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
+- `server.public_key_path` / `server.certificate_path` / `server.grace_days`：配齐前两者即启用
+  **证书驱动 GET 限制**（RSA-2048 + RS256 JWS）。有效期内 / 未配置 → 正常；过期进入宽限期
+  （默认 30 天，可配 `grace_days`）→ 所有 GET 返回 `403`（其余方法正常），替换证书即恢复；
+  宽限期结束再启动 → 进程退出（不服务）。证书 / 公钥文件被覆盖即**热加载**（notify 事件驱动）。
+  详见 `dev-manual.md` §5.1。
 - 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
   可重复执行；**注意**：seed 内不得有分号字面量）。
 

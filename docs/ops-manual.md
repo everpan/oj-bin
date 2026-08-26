@@ -67,6 +67,14 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
     `secret_key` 可选。MinIO/自建 S3 用 `path_style: true`（默认 virtual-hosted 风格，
     自建对象存储通常不支持）。`blob.url()` 走 GET presign 15min；下载路由 302 跳转。
     生产密钥经环境/密钥管理注入，勿硬编码进 config.yaml。
+- **证书校验** `server.public_key_path` / `server.certificate_path` / `server.grace_days`：两者都配齐即
+  启用基于非对称加密（RSA-2048 + RS256 JWS）的**证书驱动 GET 限制**（详见 `dev-manual.md` §5.1）：
+  - 有效期内 / 未配置 → 正常服务。
+  - 过期进入宽限期（默认 30 天，可配 `grace_days`）→ 所有 **GET** 返回 `403`
+    （JSON `{"error":"certificate expired",...}`），其余方法正常；服务不中断，运维替换证书即恢复。
+  - 宽限期结束后再启动 → 记 `ERROR` 后进程退出（exit 1），不提供服务。
+  - 证书 / 公钥文件被覆盖即**热加载**（notify 事件驱动，不轮询 mtime），原子更新证书状态；
+    重载失败保留旧状态并记 `warn`。`GET {base}/health` 实时返回 `certificate_status` 供监控。
 
 ## 4. 热重载语义
 
@@ -74,6 +82,9 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 - **release 模式**：跑编译好的 `.js`，同样按 mtime 失效（dist 更新即生效，无需重启）——
   但**版本目录布局下换版本需重启**：`dist/manifests.yaml` 仅启动时读取，运行中改锁指向
   新版本目录不会生效。同版本重建（清场重写同目录）靠 mtime 失效即时生效。
+- **证书 / 公钥文件**：`public_key_path` / `certificate_path` 指向的文件被覆盖即**热加载**
+  （notify 事件驱动，不轮询 mtime），原子更新证书状态（valid ↔ grace ↔ expired）；重载失败
+  保留旧状态并记 `warn`。这与 `config.yaml` 不同——证书轮换**无需重启**。
 - **不触发热重载**：`config.yaml`（重启生效）、`seed.sql`（仅启动重放）、`manifest.yaml` 新增/删除
   模块（重启生效）、`node_modules` 新增包（重启生效，已加载包缓存于进程）。
 
@@ -132,6 +143,11 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | `es not configured` 报错 | JS 调 `es.*` 但 config 无 `es:` 段 | 加 `es.endpoint`；或确认业务不该用 ES |
 | `es search/index/del: invalid index` | index/id 含白名单（`[a-zA-Z0-9_-]+`）外字符 | 校验入参；index/id 不可含 `/`、`.` |
 | `es …: HTTP 4xx/5xx: …` | ES 端错误（索引缺失/DSL 错/ES 未起），直通返回体 | 看返回体排障；`es.index` 自带 refresh=true，写完即可查 |
+| 启动报 `certificate expired` / `certificate has expired and grace period elapsed` | 证书已过期且宽限期结束（`exp` + `grace_days` 仍早于现在） | 换新证书（重签使 `exp` 晚于现在）后重启；调大 `grace_days` 仅延长宽限、不改 `exp` |
+| GET 全部 403 `certificate expired` | 运行中证书被热加载切到 grace / expired（或启动即处该状态） | 替换证书文件（热加载即时生效）；查 `GET {base}/health` 的 `certificate_status` |
+| 启动报 `invalid public key` / `signature verification failed` | 公钥 PEM 非法，或 JWS 签名与公钥不匹配 | 核对密钥对一致、签名算法为 RS256；用同一私钥重签 JWS |
+| 启动报 `invalid JWS format` | `certificate.jws` 不是三段 `Base64URL(Header).Payload.Signature` | 按 `Header.Payload.Signature` 重新生成 JWS |
+| 启动报 `certificate not configured` | 仅配了 `public_key_path` 或 `certificate_path` 之一 | 两个路径都配齐才启用校验（都不配 = 不校验） |
 
 ## 8. 回滚与恢复
 

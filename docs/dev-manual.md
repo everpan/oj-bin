@@ -260,7 +260,7 @@ Signature: RSASSA-PKCS1-v1_5(SHA256, Header.Payload)  用私钥签名
   "certificate_expiry": "2027-01-01T00:00:00Z", "grace_remaining_secs": 123456 }
 ```
 
-（设计背景见 `docs/superpowers/specs/2026-08-26-certificate-design.md`。）
+（设计背景见 `docs/superpowers/specs/2026-08-26-certificate-design.md`；运维排障与证书生命周期见 `ops-manual.md` §3 / §4 / §7。）
 
 ## 6. deno_core 0.410 关键 API 差异
 
