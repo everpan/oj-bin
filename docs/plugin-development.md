@@ -69,6 +69,13 @@ struct CallState {
   **不依赖宿主 crate**，可脱离宿主 workspace 单独编译、独立仓库发版。
 - 系统级依赖（如 rdkafka 的 librdkafka、openssl）要么静态/vendored 链接，要么在插件
   README **显式声明**运行环境要求（部署侧 glibc 基线见 CI 矩阵）。
+- **Windows 上 `oj-bus-kafka` 的构建特例**：`rdkafka` 默认特性（ssl/sasl/zstd/lz4/libz）
+  依赖 OpenSSL/zlib/SASL 等原生库，Windows CI runner 不提供，曾导致 `rdkafka-sys` 构建失败。
+  现 `plugins/oj-bus-kafka/Cargo.toml` 以 `[target.'cfg(windows)'.dependencies]` 关闭 rdkafka
+  默认特性、仅保留 `tokio` 并显式开启 `cmake-build`：`rdkafka-sys` 用 cmake 从源码构建
+  librdkafka（不链接任何外部库），`windows-latest`（自带 cmake + MSVC）即可编译。Windows 非
+  部署目标，故该平台 kafka 插件不携带 SSL/SASL；Linux/macOS（部署目标）保留完整默认特性。
+  插件源码仅用核心异步 API（`ClientConfig`/`StreamConsumer`/`FutureProducer`/`Message`），无需改动。
 - 共享逻辑不抽公共运行时——复制可接受的（决策记录：接受复制）。
 
 ## 6. panic=unwind（禁止 abort）
