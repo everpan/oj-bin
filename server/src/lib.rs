@@ -23,6 +23,17 @@ use crate::routes::{Lookup, RouteTable, Routes};
 use mdm_base_rust::bridge::{fail, BlobBackend, BlobServed, RequestInfo, UploadedFile};
 use serde_json::json;
 
+/// 证书状态
+#[derive(Clone, Debug)]
+pub enum CertificateStatus {
+    /// 证书有效
+    Valid,
+    /// 证书宽限期内，剩余秒数
+    Grace { remaining_secs: u64 },
+    /// 证书已过期
+    Expired,
+}
+
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +49,10 @@ pub struct AppState {
     pipeline: Pipeline,
     /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
     base: String,
+    /// 当前证书状态
+    pub certificate_status: CertificateStatus,
+    /// 证书有效期截止时间
+    pub certificate_valid_until: Option<std::time::SystemTime>,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -91,6 +106,8 @@ pub fn app(
             static_root,
             pipeline,
             base: base.to_string(),
+            certificate_status: CertificateStatus::Valid,
+            certificate_valid_until: None,
         })
 }
 
@@ -449,7 +466,7 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
     use mdm_base_rust::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, LocalBlob, SchemaRegistry};
     use std::sync::Arc;
@@ -1122,4 +1139,28 @@ pub(crate) mod tests {
         takes_send::<JsActor>();
         takes_send::<AppState>();
     }
-}
+
+    }
+
+    /// 创建用于测试的最小 AppState
+    pub fn dummy_app_state() -> AppState {
+        AppState {
+            table: RouteTable::default(),
+            fallback: None,
+            actor: JsActor::new(|| panic!("dummy actor")),
+            timeout: None,
+            static_root: None,
+            pipeline: Pipeline::default(),
+            base: "/v1/api".to_string(),
+            certificate_status: CertificateStatus::Valid,
+            certificate_valid_until: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_appstate_has_certificate_fields() {
+        let state = dummy_app_state();
+        let _ = &state.certificate_status;
+        let _ = &state.certificate_valid_until;
+    }
+

@@ -127,6 +127,17 @@ pub struct RouteTable {
 
 const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
 
+impl Default for RouteTable {
+    fn default() -> Self {
+        Self {
+            matcher: matchit::Router::new(),
+            replaced: std::collections::HashSet::new(),
+            rows: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+}
+
 impl RouteTable {
     /// 建表：内省闭包按文件返回 Vec<(方法, .route 或 None)>；返回 (表, 失败/冲突清单)。
     /// 纯逻辑（依赖倒置：不依赖 JS 运行时），CLI/测试注入真实或假内省。
