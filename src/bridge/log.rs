@@ -12,7 +12,11 @@ use deno_core::op2;
 /// fast：仅基础类型参数，无 V8 引用 / 无异步。
 #[op2(fast)]
 pub fn op_log(level: u8, #[string] msg: &str, #[string] fields: String) {
-    let fields = if fields.is_empty() { "{}" } else { fields.as_str() };
+    let fields = if fields.is_empty() {
+        "{}"
+    } else {
+        fields.as_str()
+    };
     match level {
         0 => tracing::debug!(target: "js", %msg, fields = %fields),
         1 => tracing::info!(target: "js", %msg, fields = %fields),

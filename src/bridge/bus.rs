@@ -21,7 +21,8 @@ use super::{BridgeResult, ReqState, StableState};
 /// 订阅发布总线：topic → 订阅者发送器列表（去重注册，按发送失败惰性清理）。
 #[derive(Default)]
 pub struct Bus {
-    topics: Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    topics:
+        Mutex<std::collections::HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl Bus {
@@ -127,7 +128,9 @@ pub async fn op_bus_subscribe(
             .subscribe(&topic, tx)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
-        None => Err(JsErrorBox::generic("bus.subscribe requires a WebSocket connection")),
+        None => Err(JsErrorBox::generic(
+            "bus.subscribe requires a WebSocket connection",
+        )),
     }
 }
 
@@ -148,7 +151,9 @@ mod tests {
     /// （"同一已连接 broker 实例跨 actor 池与全部 WS 连接共享"语义回归，spec §2）。
     #[tokio::test(flavor = "current_thread")]
     async fn shared_broker_broadcasts_across_bridges() {
-        use crate::bridge::{Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry};
+        use crate::bridge::{
+            Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
+        };
         let bus = crate::bridge::broker::build_broker(&None).await.unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bus.subscribe("t", tx).await.unwrap();
@@ -163,7 +168,10 @@ mod tests {
                 SchemaRegistry::new(),
                 false,
                 None,
-                Extras { bus: Some(bus.clone()), ..Default::default() },
+                Extras {
+                    bus: Some(bus.clone()),
+                    ..Default::default()
+                },
             )
         };
         let _a = mk(&bus); // A 持同一实例（池内另一 actor）

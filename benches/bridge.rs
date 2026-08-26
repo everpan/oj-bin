@@ -1,4 +1,4 @@
-//! bridge 各模块性能测试。
+#![allow(clippy::doc_overindented_list_items)]
 //!
 //! 两层口径：
 //!   - rust/*   —— 纯 Rust 层（信封序列化、trait 实现），无 JS 开销
@@ -48,15 +48,11 @@ fn bench_rust(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let data = json!({"user": {"id": 1, "name": "ever"}, "tags": ["a", "b"]});
-    group.bench_function("envelope.ok", |b| {
-        b.iter(|| only_js::bridge::ok(&data))
-    });
+    group.bench_function("envelope.ok", |b| b.iter(|| only_js::bridge::ok(&data)));
 
     let kv = InMemoryKV::new();
     rt.block_on(kv.set("k", "v")).unwrap();
-    group.bench_function("kv.get", |b| {
-        b.iter(|| rt.block_on(kv.get("k")).unwrap())
-    });
+    group.bench_function("kv.get", |b| b.iter(|| rt.block_on(kv.get("k")).unwrap()));
     group.bench_function("kv.set", |b| {
         b.iter(|| rt.block_on(kv.set("k", "v")).unwrap())
     });
@@ -102,26 +98,33 @@ fn bench_js(c: &mut Criterion) {
     });
 
     let bridge = new_bridge();
-    rt.block_on(bridge.run_with(r#"redis.set("k", "v");"#, req())).unwrap();
-    let script = format!("(async () => {{ for (let i = 0; i < {N}; i++) await redis.get(\"k\"); }})()");
+    rt.block_on(bridge.run_with(r#"redis.set("k", "v");"#, req()))
+        .unwrap();
+    let script =
+        format!("(async () => {{ for (let i = 0; i < {N}; i++) await redis.get(\"k\"); }})()");
     group.bench_function("redis.get", |b| {
         b.iter(|| rt.block_on(bridge.run_with(&script, req())).unwrap())
     });
 
     let bridge = new_bridge();
-    let script = format!("(async () => {{ for (let i = 0; i < {N}; i++) await redis.set(\"k\", \"v\"); }})()");
+    let script = format!(
+        "(async () => {{ for (let i = 0; i < {N}; i++) await redis.set(\"k\", \"v\"); }})()"
+    );
     group.bench_function("redis.set", |b| {
         b.iter(|| rt.block_on(bridge.run_with(&script, req())).unwrap())
     });
 
     let bridge = new_bridge();
-    let script = format!("(async () => {{ for (let i = 0; i < {N}; i++) await db.query(\"select 1\"); }})()");
+    let script = format!(
+        "(async () => {{ for (let i = 0; i < {N}; i++) await db.query(\"select 1\"); }})()"
+    );
     group.bench_function("db.query", |b| {
         b.iter(|| rt.block_on(bridge.run_with(&script, req())).unwrap())
     });
 
     let bridge = new_bridge();
-    let script = format!("(async () => {{ for (let i = 0; i < {N}; i++) await db.exec(\"update x\"); }})()");
+    let script =
+        format!("(async () => {{ for (let i = 0; i < {N}; i++) await db.exec(\"update x\"); }})()");
     group.bench_function("db.exec", |b| {
         b.iter(|| rt.block_on(bridge.run_with(&script, req())).unwrap())
     });
@@ -140,7 +143,9 @@ fn bench_js(c: &mut Criterion) {
                 body
             );
             loop {
-                let Ok((mut s, _)) = listener.accept().await else { break };
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
                 let resp = resp.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];

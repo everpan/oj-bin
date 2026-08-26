@@ -159,21 +159,38 @@ impl BusPluginState {
             .map_err(|e| format!("rabbitmq queue declare: {e}"))?;
         let queue_name = queue.name().as_str().to_string();
         channel
-            .queue_bind(&queue_name, &b.exchange, topic, QueueBindOptions::default(), FieldTable::default())
+            .queue_bind(
+                &queue_name,
+                &b.exchange,
+                topic,
+                QueueBindOptions::default(),
+                FieldTable::default(),
+            )
             .await
             .map_err(|e| format!("rabbitmq queue bind {topic}: {e}"))?;
         let mut consumer = channel
-            .basic_consume(&queue_name, "", BasicConsumeOptions::default(), FieldTable::default())
+            .basic_consume(
+                &queue_name,
+                "",
+                BasicConsumeOptions::default(),
+                FieldTable::default(),
+            )
             .await
             .map_err(|e| format!("rabbitmq consume {topic}: {e}"))?;
-        let host = HOST.get().cloned().expect("oj-bus-rabbitmq: init before subscribe");
+        let host = HOST
+            .get()
+            .cloned()
+            .expect("oj-bus-rabbitmq: init before subscribe");
         let logical = topic.to_string();
         tokio::spawn(async move {
             while let Some(delivery) = consumer.next().await {
                 if let Ok(delivery) = delivery {
                     let payload = String::from_utf8_lossy(&delivery.data).to_string();
                     delivery.ack(BasicAckOptions::default()).await.ok();
-                    (host.deliver)(RString::from(logical.as_str()), RString::from(payload.as_str()));
+                    (host.deliver)(
+                        RString::from(logical.as_str()),
+                        RString::from(payload.as_str()),
+                    );
                 }
             }
         });
@@ -200,10 +217,9 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
 extern "C" fn publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_publish(handle, &topic[..], &data[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_publish(handle, &topic[..], &data[..]).await
+        })
     })
 }
 
@@ -232,14 +248,12 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
 
 extern "C" fn register() -> PluginRegistrations {
     oj_plugin_ffi::catch_value(
-        || {
-            PluginRegistrations {
-                es: std::ptr::null(),
-                db: std::ptr::null(),
-                blob: std::ptr::null(),
-                bus: &VTABLE,
-                kv: std::ptr::null(),
-            }
+        || PluginRegistrations {
+            es: std::ptr::null(),
+            db: std::ptr::null(),
+            blob: std::ptr::null(),
+            bus: &VTABLE,
+            kv: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
@@ -326,7 +340,9 @@ mod tests {
         };
         assert_eq!(&desc.name[..], "bus-rabbitmq");
 
-        let bytes = drive(&mut connect(RString::from(cfg.as_str()))).await.expect("connect");
+        let bytes = drive(&mut connect(RString::from(cfg.as_str())))
+            .await
+            .expect("connect");
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
             .as_u64()
             .unwrap();
@@ -352,7 +368,10 @@ mod tests {
     extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询）。

@@ -8,9 +8,9 @@
 //! 未配置证书路径（两者皆空）→ 视为未启用，返回 `Valid`，不做任何限制。
 
 pub use crate::CertificateStatus;
-use base64::{engine::general_purpose, Engine};
+use base64::{Engine, engine::general_purpose};
 use only_js::config::ServerCfg;
-use ring::signature::{UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::{
@@ -26,7 +26,11 @@ pub fn is_enabled(cfg: &ServerCfg) -> bool {
 /// 相对路径按 `config_dir` 绝对化（容器/K8s ConfigMap 挂载友好）。
 pub fn resolve_path(raw: &str, config_dir: &Path) -> PathBuf {
     let p = Path::new(raw);
-    if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) }
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
+    }
 }
 
 /// 加载并验证证书。
@@ -56,12 +60,14 @@ pub fn load_certificate_at(
     let cert_path = resolve_path(&cfg.certificate_path, config_dir);
 
     // 1. 读取公钥 PEM
-    let key_data = fs::read(&key_path).map_err(|e| format!("read key {}: {e}", key_path.display()))?;
-    let pub_key = load_verification_key(&key_data).map_err(|e| format!("invalid public key: {e}"))?;
+    let key_data =
+        fs::read(&key_path).map_err(|e| format!("read key {}: {e}", key_path.display()))?;
+    let pub_key =
+        load_verification_key(&key_data).map_err(|e| format!("invalid public key: {e}"))?;
 
     // 2. 读取 JWS 证书字符串
-    let cert_str =
-        fs::read_to_string(&cert_path).map_err(|e| format!("read cert {}: {e}", cert_path.display()))?;
+    let cert_str = fs::read_to_string(&cert_path)
+        .map_err(|e| format!("read cert {}: {e}", cert_path.display()))?;
     let parts: Vec<&str> = cert_str.trim().split('.').collect();
     if parts.len() != 3 {
         return Err("invalid JWS format: expected 3 dot-separated parts".into());
@@ -112,7 +118,9 @@ pub fn load_certificate_at(
     } else {
         let grace_end = exp + grace_secs;
         if now < grace_end {
-            CertificateStatus::Grace { remaining_secs: grace_end - now }
+            CertificateStatus::Grace {
+                remaining_secs: grace_end - now,
+            }
         } else {
             CertificateStatus::Expired
         }
@@ -135,7 +143,11 @@ fn load_verification_key(pem: &[u8]) -> Result<UnparsedPublicKey<Vec<u8>>, Strin
         .decode(der_b64)
         .map_err(|e| format!("base64: {e}"))?;
     // `BEGIN PUBLIC KEY` = SPKI 包装；ring 需要裸 RSAPublicKey，故剥去 AlgorithmIdentifier。
-    let der = if pem_str.contains("BEGIN PUBLIC KEY") { spki_to_pkcs1(&der)? } else { der };
+    let der = if pem_str.contains("BEGIN PUBLIC KEY") {
+        spki_to_pkcs1(&der)?
+    } else {
+        der
+    };
     Ok(UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, der))
 }
 
@@ -186,7 +198,10 @@ impl<'a> DerReader<'a> {
         if n == 0 || n > 4 {
             return Err("DER: unsupported length encoding".into());
         }
-        let bytes = self.buf.get(self.pos..self.pos + n).ok_or("DER: truncated length")?;
+        let bytes = self
+            .buf
+            .get(self.pos..self.pos + n)
+            .ok_or("DER: truncated length")?;
         self.pos += n;
         Ok(bytes.iter().fold(0usize, |acc, b| (acc << 8) | *b as usize))
     }

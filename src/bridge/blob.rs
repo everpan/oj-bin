@@ -3,7 +3,9 @@
 //! local 驱动的 content_type：object_store LocalFileSystem 不持久化 attributes——
 //! 显式给的写 sidecar（`<key>.ct`），否则按扩展名推断。
 
+#![allow(clippy::new_without_default, clippy::collapsible_if, clippy::redundant_closure, clippy::type_complexity)]
 use std::cell::RefCell;
+
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +15,7 @@ use deno_core::{JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload};
 
 use super::{BridgeResult, StableState};
 
@@ -40,13 +42,15 @@ pub enum BlobServed {
 pub fn valid_key(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with('/')
-        && key.split('/').all(|s| {
-            !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0'])
-        })
+        && key
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0']))
 }
 
 fn os_path(key: &str) -> Result<Path, String> {
-    valid_key(key).then(|| Path::from(key)).ok_or_else(|| format!("invalid blob key '{key}'"))
+    valid_key(key)
+        .then(|| Path::from(key))
+        .ok_or_else(|| format!("invalid blob key '{key}'"))
 }
 
 /// 扩展名 → Content-Type（下载路由用；罕见类型回落 octet-stream）。
@@ -95,7 +99,8 @@ impl LocalBlob {
     pub fn named(name: &str, root: &std::path::Path, base_url: &str) -> BridgeResult<Self> {
         std::fs::create_dir_all(root).map_err(|e| format!("blob root {}: {e}", root.display()))?;
         Ok(Self {
-            store: LocalFileSystem::new_with_prefix(root).map_err(|e| format!("blob root {}: {e}", root.display()))?,
+            store: LocalFileSystem::new_with_prefix(root)
+                .map_err(|e| format!("blob root {}: {e}", root.display()))?,
             root: root.to_path_buf(),
             base_url: base_url.trim_end_matches('/').to_string(),
             name: name.to_string(),
@@ -134,8 +139,15 @@ impl BlobBackend for LocalBlob {
 
     async fn get(&self, key: &str) -> BridgeResult<Vec<u8>> {
         let path = os_path(key)?;
-        let r = self.store.get(&path).await.map_err(|e| format!("blob get: {e}"))?;
-        Ok(r.bytes().await.map_err(|e| format!("blob get: {e}"))?.to_vec())
+        let r = self
+            .store
+            .get(&path)
+            .await
+            .map_err(|e| format!("blob get: {e}"))?;
+        Ok(r.bytes()
+            .await
+            .map_err(|e| format!("blob get: {e}"))?
+            .to_vec())
     }
 
     async fn del(&self, key: &str) -> BridgeResult<()> {
@@ -164,11 +176,17 @@ impl BlobBackend for LocalBlob {
 
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
         os_path(key)?;
-        Ok(std::fs::read_to_string(self.ct_path(key)).ok().filter(|s| !s.is_empty()).or_else(|| infer_content_type(key)))
+        Ok(std::fs::read_to_string(self.ct_path(key))
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| infer_content_type(key)))
     }
 
     async fn serve(&self, key: &str) -> BridgeResult<BlobServed> {
-        Ok(BlobServed::Bytes(self.get(key).await?, self.content_type(key).await?))
+        Ok(BlobServed::Bytes(
+            self.get(key).await?,
+            self.content_type(key).await?,
+        ))
     }
 }
 
@@ -179,10 +197,13 @@ pub struct BlobRegistry {
     inner: crate::bridge::NamedRegistry<dyn BlobBackend>,
 }
 
+#[allow(clippy::new_without_default)]
 impl BlobRegistry {
     // 不走 derive(Default)：getter default() 与 Default::default() 撞名。
     pub fn new() -> Self {
-        Self { inner: crate::bridge::NamedRegistry::new() }
+        Self {
+            inner: crate::bridge::NamedRegistry::new(),
+        }
     }
     /// 任意名字可注册；重名 fail fast（NamedRegistry 语义）。
     /// 配置声明了名字但装配时无对应后端 → 启动期报错（装配层职责，spec §2）。
@@ -246,7 +267,9 @@ pub async fn op_blob_get(
     #[string] key: String,
 ) -> Result<Vec<u8>, JsErrorBox> {
     let b = { backend_named(&state.borrow(), &name)? };
-    b.get(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))
+    b.get(&key)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// blob.del(key)（幂等）。
@@ -257,7 +280,9 @@ pub async fn op_blob_del(
     #[string] key: String,
 ) -> Result<bool, JsErrorBox> {
     let b = { backend_named(&state.borrow(), &name)? };
-    b.del(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    b.del(&key)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
     Ok(true)
 }
 
@@ -270,7 +295,9 @@ pub async fn op_blob_url(
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
     let b = { backend_named(&state.borrow(), &name)? };
-    b.url(&key).await.map_err(|e| JsErrorBox::generic(e.to_string()))
+    b.url(&key)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// blob.contentType(key) → content-type 字符串；缺失/无 sidecar/无法推断扩展名时返回空串。
@@ -329,15 +356,28 @@ mod tests {
     async fn local_roundtrip_and_traversal_rejected() {
         let root = tmp_root();
         let b = LocalBlob::new(&root, "/v1/api").unwrap();
-        b.put("a/b.png", b"PNGDATA", Some("image/png")).await.unwrap();
+        b.put("a/b.png", b"PNGDATA", Some("image/png"))
+            .await
+            .unwrap();
         assert_eq!(b.get("a/b.png").await.unwrap(), b"PNGDATA".to_vec());
         assert_eq!(b.url("a/b.png").await.unwrap(), "/v1/api/blob/a/b.png");
-        assert_eq!(b.content_type("a/b.png").await.unwrap().as_deref(), Some("image/png"));
+        assert_eq!(
+            b.content_type("a/b.png").await.unwrap().as_deref(),
+            Some("image/png")
+        );
         // 显式非常规 ct 走 sidecar；无 ct 回落扩展名推断
-        b.put("x.bin", b"B", Some("application/x-foo")).await.unwrap();
-        assert_eq!(b.content_type("x.bin").await.unwrap().as_deref(), Some("application/x-foo"));
+        b.put("x.bin", b"B", Some("application/x-foo"))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.content_type("x.bin").await.unwrap().as_deref(),
+            Some("application/x-foo")
+        );
         b.put("y.png", b"P", None).await.unwrap();
-        assert_eq!(b.content_type("y.png").await.unwrap().as_deref(), Some("image/png"));
+        assert_eq!(
+            b.content_type("y.png").await.unwrap().as_deref(),
+            Some("image/png")
+        );
         b.del("a/b.png").await.unwrap();
         assert!(b.get("a/b.png").await.is_err());
         for bad in ["../x", "a/../b", "", "/abs", "a//b", "a\\b"] {
@@ -352,7 +392,10 @@ mod tests {
         assert_eq!(infer_content_type("a.JPG"), Some("image/jpeg".into()));
         assert_eq!(infer_content_type("a.svg"), Some("image/svg+xml".into()));
         assert_eq!(infer_content_type("a.pdf"), Some("application/pdf".into()));
-        assert_eq!(infer_content_type("a.json"), Some("application/json".into()));
+        assert_eq!(
+            infer_content_type("a.json"),
+            Some("application/json".into())
+        );
         assert_eq!(infer_content_type("a.mp4"), Some("video/mp4".into()));
         assert_eq!(infer_content_type("a.unknown"), None);
     }
@@ -362,8 +405,16 @@ mod tests {
     async fn local_blob_url_errors_when_not_default() {
         let root = tmp_root();
         let b = LocalBlob::named("img", &root, "/v1/api").unwrap();
-        let e = b.url("k").await.err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(e.contains("only available for the 'default' backend"), "{e}");
+        let e = b
+            .url("k")
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            e.contains("only available for the 'default' backend"),
+            "{e}"
+        );
         // default 名不受影响
         let d = LocalBlob::new(&root, "/v1/api").unwrap();
         assert_eq!(d.url("k").await.unwrap(), "/v1/api/blob/k");
@@ -375,15 +426,23 @@ mod tests {
         let root_d = tmp_root();
         let root_i = tmp_root();
         let mut reg = BlobRegistry::new();
-        reg.register("default", Arc::new(LocalBlob::new(&root_d, "/v1/api").unwrap())).unwrap();
-        reg.register("img", Arc::new(LocalBlob::new(&root_i, "/v1/api").unwrap())).unwrap();
+        reg.register(
+            "default",
+            Arc::new(LocalBlob::new(&root_d, "/v1/api").unwrap()),
+        )
+        .unwrap();
+        reg.register("img", Arc::new(LocalBlob::new(&root_i, "/v1/api").unwrap()))
+            .unwrap();
         let b = Bridge::with_dbs_and_loader(
             std::collections::HashMap::new(),
             Arc::new(InMemoryKV::new()),
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blobs: Some(Arc::new(reg)), ..Default::default() },
+            Extras {
+                blobs: Some(Arc::new(reg)),
+                ..Default::default()
+            },
         );
         // 命名分发：img 与 default 互不串（同名 key 不同内容）
         let cap = b
@@ -415,14 +474,22 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("blob backend 'ghost' not configured"), "{v}");
+        assert!(
+            v["data"]["err"]
+                .as_str()
+                .unwrap()
+                .contains("blob backend 'ghost' not configured"),
+            "{v}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_serve_returns_bytes_and_content_type() {
         let root = tmp_root();
         let b = LocalBlob::new(&root, "/v1/api").unwrap();
-        b.put("d/e.txt", b"hello", Some("text/plain")).await.unwrap();
+        b.put("d/e.txt", b"hello", Some("text/plain"))
+            .await
+            .unwrap();
         // serve 直出字节 + content_type
         let sv = b.serve("d/e.txt").await.unwrap();
         match sv {
@@ -446,7 +513,10 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blobs: Some(registry_with_default(Arc::new(local))), ..Default::default() },
+            Extras {
+                blobs: Some(registry_with_default(Arc::new(local))),
+                ..Default::default()
+            },
         );
         let cap = b
             .run_with(

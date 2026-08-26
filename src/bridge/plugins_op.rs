@@ -1,8 +1,8 @@
 //! plugins 自省 op（spec §4 升级核对、§2 注册表自省并入）。
 //! JS 侧 `plugins()` → 已加载插件 [{name, semver, abi_version, fingerprint, host_abi_version}]。
 
-use crate::bridge::plugin_loader::PluginInfo;
 use crate::bridge::StableState;
+use crate::bridge::plugin_loader::PluginInfo;
 use deno_core::{OpState, op2};
 use std::sync::Arc;
 
@@ -16,7 +16,9 @@ pub fn op_plugins(state: &mut OpState) -> Vec<PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry};
+    use crate::bridge::{
+        Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
+    };
     use serde_json::Value;
 
     fn info(name: &str) -> PluginInfo {
@@ -38,7 +40,10 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { plugins: vec![info("es"), info("kv")], ..Default::default() },
+            Extras {
+                plugins: vec![info("es"), info("kv")],
+                ..Default::default()
+            },
         );
         let cap = b
             .run_with(
@@ -54,14 +59,21 @@ mod tests {
         assert_eq!(arr[0]["semver"], "0.1.0");
         assert_eq!(arr[0]["abi_version"], 1);
         assert_eq!(arr[0]["fingerprint"], "test-fingerprint");
-        assert_eq!(arr[0]["host_abi_version"], oj_plugin_ffi::ABI_VERSION, "{v}");
+        assert_eq!(
+            arr[0]["host_abi_version"],
+            oj_plugin_ffi::ABI_VERSION,
+            "{v}"
+        );
         assert_eq!(arr[1]["name"], "kv");
     }
 
     /// 零插件 → 空数组（host ABI 由 op 类型与装配层携行，见上例）。
     #[tokio::test(flavor = "current_thread")]
     async fn plugins_empty_when_none_loaded() {
-        let b = Bridge::new(Arc::new(InMemoryAccessor::new()), Arc::new(InMemoryKV::new()));
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
         let cap = b
             .run_with(
                 r#"(async () => { json.ok(plugins()); })().catch((e) => json.ok({ err: String(e) }));"#,

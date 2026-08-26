@@ -12,7 +12,8 @@ pub fn write_tgz(src_dir: &Path, out: &Path, prefix: &str) -> Result<(), String>
     let mut tar = tar::Builder::new(gz);
     for rel in &files {
         let mut hdr = tar::Header::new_gnu();
-        let data = std::fs::read(src_dir.join(rel)).map_err(|e| format!("read {}: {e}", rel.display()))?;
+        let data =
+            std::fs::read(src_dir.join(rel)).map_err(|e| format!("read {}: {e}", rel.display()))?;
         hdr.set_size(data.len() as u64);
         hdr.set_mode(0o644);
         hdr.set_mtime(0);
@@ -23,7 +24,8 @@ pub fn write_tgz(src_dir: &Path, out: &Path, prefix: &str) -> Result<(), String>
         tar.append_data(&mut hdr, &name, data.as_slice())
             .map_err(|e| format!("tar append {name}: {e}"))?;
     }
-    tar.into_inner().and_then(|g| g.finish().map(|_| ()))
+    tar.into_inner()
+        .and_then(|g| g.finish().map(|_| ()))
         .map_err(|e| format!("finish tgz: {e}"))
 }
 
@@ -60,7 +62,11 @@ mod tests {
         let b = d.join("b.tgz");
         write_tgz(&src, &a, "user-0.1.0").unwrap();
         write_tgz(&src, &b, "user-0.1.0").unwrap();
-        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "同输入两次打包必须字节一致");
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "同输入两次打包必须字节一致"
+        );
         // 解包验证前缀与元数据
         let f = std::fs::File::open(&a).unwrap();
         let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
@@ -72,7 +78,10 @@ mod tests {
             assert!(n.starts_with("user-0.1.0/"), "{n}");
             names.push(n);
         }
-        assert!(names.iter().any(|n| n == "user-0.1.0/routes.js"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n == "user-0.1.0/routes.js"),
+            "{names:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

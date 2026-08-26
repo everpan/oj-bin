@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use only_js::bridge::{
-    transpile, Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry,
-};
+use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, transpile};
 use server::routes;
 
 use crate::args::BuildArgs;
@@ -27,7 +25,10 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             crate::manifest::validate_module(m)?;
             let mf = src.join(m).join("manifest.yaml");
             if !mf.is_file() {
-                return Err(format!("module {m:?}: no manifest.yaml under {}", src.display()));
+                return Err(format!(
+                    "module {m:?}: no manifest.yaml under {}",
+                    src.display()
+                ));
             }
             view.insert(m.clone(), crate::manifest::parse_one(&mf)?.version);
             vec![m.clone()]
@@ -63,7 +64,10 @@ fn q(s: &str) -> String {
 
 /// rel 路径的目录段（正斜杠；模块根下为 ""）。
 fn rel_dir(rel: &Path) -> String {
-    rel.parent().unwrap_or(Path::new("")).to_string_lossy().replace('\\', "/")
+    rel.parent()
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// 单模块构建：清场同名版本目录 → 落盘 → 内省产 routes.js → lock upsert → tgz。
@@ -105,18 +109,28 @@ async fn build_one(
     // 2. 落盘：全部 .ts 原路径换 .js 扩展（api.ts 同名 api.js，仅多一步剥 .route）；
     //    补相对 import 后缀后按需 minify；manifest.yaml 原样复制。
     for (rel, is_api) in &files {
-        let dir = rel.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(""));
+        let dir = rel
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(""));
         let dst_dir = vdir.join(dir);
-        std::fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
+        std::fs::create_dir_all(&dst_dir)
+            .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
         if rel.extension().is_some_and(|e| e == "yaml") {
             let dst = dst_dir.join(rel.file_name().unwrap());
-            std::fs::copy(mdir.join(rel), &dst).map_err(|e| format!("copy {}: {e}", dst.display()))?;
+            std::fs::copy(mdir.join(rel), &dst)
+                .map_err(|e| format!("copy {}: {e}", dst.display()))?;
         } else {
             let js = transpile::cached_transpile(&mdir.join(rel))
                 .map_err(|e| format!("transpile {}: {e}", rel.display()))?;
             let stripped; // 生命周期：strip 产物要活过 fix_relative_imports 调用
             let js = fix_relative_imports(
-                if *is_api { stripped = strip_route_decls(&js); &stripped } else { &js },
+                if *is_api {
+                    stripped = strip_route_decls(&js);
+                    &stripped
+                } else {
+                    &js
+                },
                 module,
                 &m.version,
                 &rel_dir(rel),
@@ -128,7 +142,12 @@ async fn build_one(
             } else {
                 js
             };
-            let name = rel.with_extension("js").file_name().unwrap().to_string_lossy().into_owned();
+            let name = rel
+                .with_extension("js")
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let dst = dst_dir.join(&name);
             std::fs::write(&dst, js).map_err(|e| format!("write {}: {e}", dst.display()))?;
         }
@@ -140,7 +159,11 @@ async fn build_one(
     let n_api = decls.len();
     let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
     for (dir, rows) in decls {
-        let file = if dir.is_empty() { "api.js".to_string() } else { format!("{dir}/api.js") };
+        let file = if dir.is_empty() {
+            "api.js".to_string()
+        } else {
+            format!("{dir}/api.js")
+        };
         for (method, route) in rows {
             js.push_str(&format!(
                 "  {{ method: {}, pattern: {}, file: {} }},\n",
@@ -200,7 +223,10 @@ async fn introspect_module_files(
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
                 Extras::default(),
             )
         }
@@ -254,7 +280,11 @@ fn strip_route_decls(src: &str) -> String {
         .lines()
         .filter(|l| {
             let t = l.trim_start();
-            !(t.contains('=') && t.split(|c: char| c.is_whitespace() || c == '=').next().unwrap_or("").ends_with(".route"))
+            !(t.contains('=')
+                && t.split(|c: char| c.is_whitespace() || c == '=')
+                    .next()
+                    .unwrap_or("")
+                    .ends_with(".route"))
         })
         .collect();
     let mut out = kept.join("\n");
@@ -309,7 +339,9 @@ fn fix_relative_imports(
             })?;
             format!("{m_t}-{v_t}")
         };
-        let to = std::iter::once(target_dir).chain(segs[1..].iter().cloned()).collect();
+        let to = std::iter::once(target_dir)
+            .chain(segs[1..].iter().cloned())
+            .collect();
         let new_spec = product_spec(module, version, rel_dir, to);
         out.push(format!("{}{}{}{}", &l[..i + 5], quote, new_spec, &s[end..]));
     }
@@ -320,7 +352,12 @@ fn fix_relative_imports(
 /// `..` 越过 src 根 / 解析到 src 根本身都报错（无第一段 → 既非模块内也非跨模块）。
 fn resolve_spec(spec: &str, module: &str, rel_dir: &str) -> Result<Vec<String>, String> {
     let mut segs = vec![module.to_string()];
-    segs.extend(rel_dir.split('/').filter(|s| !s.is_empty()).map(str::to_string));
+    segs.extend(
+        rel_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    );
     for part in spec.split('/') {
         match part {
             "." | "" => {}
@@ -345,7 +382,12 @@ fn resolve_spec(spec: &str, module: &str, rel_dir: &str) -> Result<Vec<String>, 
 /// 无上溯时必须带 `./` 前缀（ESM 裸 specifier 会被当包名解析）。
 fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>) -> String {
     let from: Vec<String> = std::iter::once(format!("{module}-{version}"))
-        .chain(rel_dir.split('/').filter(|s| !s.is_empty()).map(str::to_string))
+        .chain(
+            rel_dir
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        )
         .collect();
     let mut i = 0;
     while i < from.len() && i < to.len() && from[i] == to[i] {
@@ -357,7 +399,11 @@ fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>)
     let mut parts: Vec<String> = vec!["..".into(); from.len() - i];
     parts.extend(to[i..].iter().cloned());
     let joined = parts.join("/");
-    if i == from.len() { format!("./{joined}") } else { joined }
+    if i == from.len() {
+        format!("./{joined}")
+    } else {
+        joined
+    }
 }
 
 /// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块名段。
@@ -389,7 +435,9 @@ fn relative_import_specifiers(src: &str) -> Vec<String> {
     for l in src.lines() {
         let Some(i) = l.find("from ") else { continue };
         let rest = &l[i + 5..];
-        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
         let s = &rest[1..];
         let Some(end) = s.find(q) else { continue };
         let spec = &s[..end];
@@ -422,10 +470,7 @@ fn guard_no_api_imports(files: &[(String, String)]) -> Result<(), String> {
     if bad.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "api.ts 不可被模块内 import：\n{}",
-            bad.join("\n")
-        ))
+        Err(format!("api.ts 不可被模块内 import：\n{}", bad.join("\n")))
     }
 }
 
@@ -462,7 +507,9 @@ mod tests {
 
     /// 版本视图 {b: 0.2.0}。
     fn view_b() -> std::collections::BTreeMap<String, String> {
-        [("b".to_string(), "0.2.0".to_string())].into_iter().collect()
+        [("b".to_string(), "0.2.0".to_string())]
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -480,19 +527,35 @@ mod tests {
         let out = fix("export { v } from \"../b/util.ts\";\n", "", &view_b());
         assert!(out.contains("\"../b-0.2.0/util.js\""), "{out}");
         // 模块内绕出再绕回（../../a/y/g 从 x/ 出发）→ 产物路径不悬空
-        let out = fix("import { v } from \"../../a/y/g\";\n", "x", &Default::default());
+        let out = fix(
+            "import { v } from \"../../a/y/g\";\n",
+            "x",
+            &Default::default(),
+        );
         assert!(out.contains("\"../y/g.js\""), "{out}");
     }
 
     #[test]
     fn cross_module_import_without_version_fails_fast() {
         // ② 视图缺 b → Err 报目标模块并提示先构建
-        let e = fix_relative_imports("import { v } from \"../b/util\";\n", "a", "0.1.0", "", &Default::default())
-            .unwrap_err();
+        let e = fix_relative_imports(
+            "import { v } from \"../b/util\";\n",
+            "a",
+            "0.1.0",
+            "",
+            &Default::default(),
+        )
+        .unwrap_err();
         assert!(e.contains("b") && e.contains("oj build"), "{e}");
         // 逃出 src/ → Err
-        let e = fix_relative_imports("import { v } from \"../../b/util\";\n", "a", "0.1.0", "", &view_b())
-            .unwrap_err();
+        let e = fix_relative_imports(
+            "import { v } from \"../../b/util\";\n",
+            "a",
+            "0.1.0",
+            "",
+            &view_b(),
+        )
+        .unwrap_err();
         assert!(e.contains("src"), "{e}");
     }
 
@@ -501,12 +564,18 @@ mod tests {
         // 镜像行：模块名 + 目录段
         assert_eq!(rel_pattern("user", "account", None), "user/account");
         assert_eq!(rel_pattern("user", "", None), "user");
-        assert_eq!(rel_pattern("user", "profile/detail", None), "user/profile/detail");
+        assert_eq!(
+            rel_pattern("user", "profile/detail", None),
+            "user/profile/detail"
+        );
         // 相对 .route 声明
         assert_eq!(rel_pattern("user", "item", Some("{id}")), "user/item/{id}");
         assert_eq!(rel_pattern("user", "", Some("{id}")), "user/{id}");
         // 根级声明（/ 开头）：剥首斜杠，不加模块段
-        assert_eq!(rel_pattern("user", "item", Some("/v2/user/{id}")), "v2/user/{id}");
+        assert_eq!(
+            rel_pattern("user", "item", Some("/v2/user/{id}")),
+            "v2/user/{id}"
+        );
         // 空 route 视同未挂
         assert_eq!(rel_pattern("user", "item", Some("")), "user/item");
     }
@@ -514,17 +583,29 @@ mod tests {
     #[test]
     fn import_specifier_extraction() {
         let src = "import { v } from \"../_shared/validate\";\nimport x from './a.js';\nimport p from \"pkg\";\nexport { v } from \"./b\";\nconst s = 1;";
-        assert_eq!(relative_import_specifiers(src), vec!["../_shared/validate", "./a.js", "./b"]);
+        assert_eq!(
+            relative_import_specifiers(src),
+            vec!["../_shared/validate", "./a.js", "./b"]
+        );
     }
 
     #[test]
     fn guard_rejects_api_imports() {
         let files = vec![
-            ("_shared/util.ts".into(), "import { g } from \"../account/api\";\n".into()),
-            ("account/api.ts".into(), "import { v } from \"../_shared/validate\";\n".into()),
+            (
+                "_shared/util.ts".into(),
+                "import { g } from \"../account/api\";\n".into(),
+            ),
+            (
+                "account/api.ts".into(),
+                "import { v } from \"../_shared/validate\";\n".into(),
+            ),
         ];
         let e = guard_no_api_imports(&files).unwrap_err();
-        assert!(e.contains("_shared/util.ts") && e.contains("../account/api"), "{e}");
+        assert!(
+            e.contains("_shared/util.ts") && e.contains("../account/api"),
+            "{e}"
+        );
         // 无违规
         assert!(guard_no_api_imports(&[("x.ts".into(), "import m from \"pkg\";".into())]).is_ok());
     }
@@ -533,7 +614,11 @@ mod tests {
     fn only_file(dir: &std::path::Path) -> String {
         let mut it = std::fs::read_dir(dir).unwrap();
         let name = it.next().unwrap().unwrap().file_name();
-        assert!(it.next().is_none(), "expected exactly one file in {}", dir.display());
+        assert!(
+            it.next().is_none(),
+            "expected exactly one file in {}",
+            dir.display()
+        );
         name.to_string_lossy().into_owned()
     }
 
@@ -543,13 +628,28 @@ mod tests {
         for d in ["user/item", "user/_shared", "other/list"] {
             std::fs::create_dir_all(src.join(d)).unwrap();
         }
-        std::fs::write(src.join("user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n").unwrap();
-        std::fs::write(src.join("other/manifest.yaml"), "name: other\ndesc: d\nversion: 0.9.0\n").unwrap();
-        std::fs::write(src.join("user/_shared/validate.ts"), "export const v = 1;\n").unwrap();
+        std::fs::write(
+            src.join("user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("other/manifest.yaml"),
+            "name: other\ndesc: d\nversion: 0.9.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("user/_shared/validate.ts"),
+            "export const v = 1;\n",
+        )
+        .unwrap();
         std::fs::write(src.join("user/item/api.ts"),
             "import { v } from \"../_shared/validate\";\nfunction get(){ json.ok({v}); }\nget.route = \"{id}\";\nexport default { get };\n").unwrap();
-        std::fs::write(src.join("other/list/api.ts"),
-            "function get(){ json.ok({}); }\nexport default { get };\n").unwrap();
+        std::fs::write(
+            src.join("other/list/api.ts"),
+            "function get(){ json.ok({}); }\nexport default { get };\n",
+        )
+        .unwrap();
     }
 
     fn build_args(t: &std::path::Path, module: Option<&str>) -> BuildArgs {
@@ -574,21 +674,21 @@ mod tests {
 
         let routes = std::fs::read_to_string(vd.join("routes.js")).unwrap();
         assert!(routes.contains("\"user/item/{id}\""), "{routes}"); // pattern 无 base 含模块段
-        assert!(routes.contains("\"item/api.js\""), "{routes}");    // file 含目录段
+        assert!(routes.contains("\"item/api.js\""), "{routes}"); // file 含目录段
         assert!(!routes.contains("/v1/api"), "{routes}");
 
         let item_js = std::fs::read_to_string(vd.join("item/api.js")).unwrap();
-        assert!(!item_js.contains(".route"), "{item_js}");          // .route 已剥
+        assert!(!item_js.contains(".route"), "{item_js}"); // .route 已剥
         assert!(item_js.contains("\"../_shared/validate.js\""), "{item_js}"); // import 后缀已补
-        assert!(!item_js.contains('\n'), "{item_js}");              // 默认 minify：单行
+        assert!(!item_js.contains('\n'), "{item_js}"); // 默认 minify：单行
 
-        assert!(vd.join("manifest.yaml").is_file());               // 原样复制
-        assert!(vd.join("_shared/validate.js").is_file());         // 非 api 原路径
+        assert!(vd.join("manifest.yaml").is_file()); // 原样复制
+        assert!(vd.join("_shared/validate.js").is_file()); // 非 api 原路径
         assert!(!item_js.contains("sourceMappingURL"), "{item_js}"); // minify 剥内联 sourcemap
 
         let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
         assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
-        assert!(!lock.contains_key("other"));                       // 单模块构建不动他人
+        assert!(!lock.contains_key("other")); // 单模块构建不动他人
         assert!(t.join("dist/user-0.1.0.tgz").is_file());
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -601,14 +701,24 @@ mod tests {
         src_fixture(&t);
         run(&build_args(&t, Some("user"))).await.unwrap();
         let snap = |p: &std::path::Path| std::fs::read(p).unwrap();
-        let (js1, tgz1) = (snap(&t.join("dist/user-0.1.0/item/api.js")), snap(&t.join("dist/user-0.1.0.tgz")));
+        let (js1, tgz1) = (
+            snap(&t.join("dist/user-0.1.0/item/api.js")),
+            snap(&t.join("dist/user-0.1.0.tgz")),
+        );
         // 内容未变 → 重建字节一致（转译 + minify 确定性，落点 tgz）
         run(&build_args(&t, Some("user"))).await.unwrap();
         assert_eq!(snap(&t.join("dist/user-0.1.0/item/api.js")), js1);
-        assert_eq!(snap(&t.join("dist/user-0.1.0.tgz")), tgz1, "同输入两次构建 tgz 必须字节一致");
+        assert_eq!(
+            snap(&t.join("dist/user-0.1.0.tgz")),
+            tgz1,
+            "同输入两次构建 tgz 必须字节一致"
+        );
         // 内容变更 → 产物更新，目录内仍恰好 1 个 api.js（同版本清场）
-        std::fs::write(t.join("src/user/item/api.ts"),
-            "function get(){ json.ok({v:2}); }\nget.route = \"{id}\";\nexport default { get };\n").unwrap();
+        std::fs::write(
+            t.join("src/user/item/api.ts"),
+            "function get(){ json.ok({v:2}); }\nget.route = \"{id}\";\nexport default { get };\n",
+        )
+        .unwrap();
         run(&build_args(&t, Some("user"))).await.unwrap();
         let js2 = snap(&t.join("dist/user-0.1.0/item/api.js"));
         assert_ne!(js2, js1);
@@ -626,7 +736,7 @@ mod tests {
         a.minify = false;
         run(&a).await.unwrap();
         let js = std::fs::read_to_string(t.join("dist/user-0.1.0/item/api.js")).unwrap();
-        assert!(js.contains('\n'), "{js}");               // 未压缩：多行可读
+        assert!(js.contains('\n'), "{js}"); // 未压缩：多行可读
         assert!(js.contains("function get"), "{js}");
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -636,9 +746,20 @@ mod tests {
         let t = std::env::temp_dir().join(format!("oj-build-guard-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         std::fs::create_dir_all(t.join("src/user/_shared")).unwrap();
-        std::fs::write(t.join("src/user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n").unwrap();
-        std::fs::write(t.join("src/user/_shared/x.ts"), "import { g } from \"../item/api\";\n").unwrap();
-        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/_shared/x.ts"),
+            "import { g } from \"../item/api\";\n",
+        )
+        .unwrap();
+        let e = run(&build_args(&t, Some("user")))
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("不可被"), "{e}"); // 守卫专属文案（"api" 子串近似恒真）
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -684,7 +805,10 @@ mod tests {
         let t = std::env::temp_dir().join(format!("oj-build-ver-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         one_module(&t, "user", "0..1");
-        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        let e = run(&build_args(&t, Some("user")))
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("illegal version") && e.contains("0..1"), "{e}");
         assert!(!t.join("dist/manifests.yaml").is_file());
         let _ = std::fs::remove_dir_all(&t);
@@ -711,7 +835,10 @@ mod tests {
         one_module(&t, "a", "1-x");
         std::fs::create_dir_all(t.join("dist")).unwrap();
         std::fs::write(t.join("dist/manifests.yaml"), "a-1: x\n").unwrap();
-        let e = run(&build_args(&t, Some("a"))).await.err().unwrap_or_default();
+        let e = run(&build_args(&t, Some("a")))
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("collision") && e.contains("a-1-x"), "{e}");
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -740,9 +867,16 @@ mod tests {
         src_fixture(&t);
         std::fs::create_dir_all(t.join("dist")).unwrap();
         std::fs::write(t.join("dist/manifests.yaml"), "user: [unclosed\n").unwrap();
-        let e = run(&build_args(&t, Some("user"))).await.err().unwrap_or_default();
+        let e = run(&build_args(&t, Some("user")))
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("manifests.yaml"), "{e}");
-        assert!(std::fs::read_to_string(t.join("dist/manifests.yaml")).unwrap().contains("unclosed"));
+        assert!(
+            std::fs::read_to_string(t.join("dist/manifests.yaml"))
+                .unwrap()
+                .contains("unclosed")
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 }

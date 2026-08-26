@@ -12,10 +12,10 @@ use oj_plugin_ffi::{
     ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
     RArc, RResult, RString,
 };
+use rdkafka::Message;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +143,10 @@ impl BusPluginState {
         consumer
             .subscribe(&[&physical])
             .map_err(|e| format!("kafka subscribe {physical}: {e}"))?;
-        let host = HOST.get().cloned().expect("oj-bus-kafka: init before subscribe");
+        let host = HOST
+            .get()
+            .cloned()
+            .expect("oj-bus-kafka: init before subscribe");
         let logical = topic.to_string();
         // 将 consumer 移入任务：MessageStream 借用 consumer，须同生命周期存活于任务内。
         tokio::spawn(async move {
@@ -154,7 +157,10 @@ impl BusPluginState {
                         let Some(p) = m.payload() else { continue };
                         let payload = String::from_utf8_lossy(p).to_string();
                         // 宿主按逻辑 topic 扇出；非阻塞投递（宿主 tx.send）。
-                        (host.deliver)(RString::from(logical.as_str()), RString::from(payload.as_str()));
+                        (host.deliver)(
+                            RString::from(logical.as_str()),
+                            RString::from(payload.as_str()),
+                        );
                     }
                     Err(e) => {
                         eprintln!("[oj-bus-kafka] consume error on {physical}: {e}");
@@ -185,10 +191,9 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
 extern "C" fn publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_publish(handle, &topic[..], &data[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_publish(handle, &topic[..], &data[..]).await
+        })
     })
 }
 
@@ -217,14 +222,12 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
 
 extern "C" fn register() -> PluginRegistrations {
     oj_plugin_ffi::catch_value(
-        || {
-            PluginRegistrations {
-                es: std::ptr::null(),
-                db: std::ptr::null(),
-                blob: std::ptr::null(),
-                bus: &VTABLE,
-                kv: std::ptr::null(),
-            }
+        || PluginRegistrations {
+            es: std::ptr::null(),
+            db: std::ptr::null(),
+            blob: std::ptr::null(),
+            bus: &VTABLE,
+            kv: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
@@ -279,7 +282,10 @@ mod tests {
     fn kafka_requires_brokers() {
         let cfg = BrokerCfgJson::default();
         assert!(KafkaBroker::new(&cfg).is_err());
-        let cfg = BrokerCfgJson { brokers: vec!["127.0.0.1:9092".into()], ..Default::default() };
+        let cfg = BrokerCfgJson {
+            brokers: vec!["127.0.0.1:9092".into()],
+            ..Default::default()
+        };
         // 仅 brokers 可构造（rdkafka create 离线构造；连接按需）。
         assert!(KafkaBroker::new(&cfg).is_ok());
     }
@@ -309,7 +315,9 @@ mod tests {
         };
         assert_eq!(&desc.name[..], "bus-kafka");
 
-        let bytes = drive(&mut connect(RString::from(cfg.as_str()))).await.expect("connect");
+        let bytes = drive(&mut connect(RString::from(cfg.as_str())))
+            .await
+            .expect("connect");
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
             .as_u64()
             .unwrap();
@@ -338,7 +346,10 @@ mod tests {
     extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询）。

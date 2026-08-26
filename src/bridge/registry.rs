@@ -110,13 +110,22 @@ mod tests {
         let mut cols = std::collections::HashMap::new();
         cols.insert(
             "a".to_string(),
-            ColumnDef { name: "a".to_string(), sortable: true },
+            ColumnDef {
+                name: "a".to_string(),
+                sortable: true,
+            },
         );
         cols.insert(
             "b".to_string(),
-            ColumnDef { name: "b".to_string(), sortable: false },
+            ColumnDef {
+                name: "b".to_string(),
+                sortable: false,
+            },
         );
-        let td = TableDef { columns: cols, primary_key: None };
+        let td = TableDef {
+            columns: cols,
+            primary_key: None,
+        };
         assert!(td.is_sortable("a"));
         assert!(!td.is_sortable("b"));
         assert!(!td.is_sortable("missing"));

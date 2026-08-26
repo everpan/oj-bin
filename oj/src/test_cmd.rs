@@ -6,14 +6,18 @@
 //! `Arc<dyn ClientTransport>`（即 App）。逐个加载 *.test.ts 注册用例 → `__runTests()`
 //! 跑全部 → 读 `__testSummary` 打印 TAP/vitest 风格摘要。返回退出码（修正 #13：不在运行时内 exit）。
 
+#![allow(clippy::explicit_counter_loop)]
+
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use deno_core::{JsRuntime, ModuleLoader, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8};
-use only_js::bridge::bridge_ext;
+use deno_core::{
+    JsRuntime, ModuleLoader, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8,
+};
 use only_js::bridge::OjModuleLoader;
+use only_js::bridge::bridge_ext;
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::app::{App, ClientTransport};
@@ -103,9 +107,8 @@ async fn run_on_runtime(
     let start = Instant::now();
     let stable = app.stable();
     let loader = stable.loader.clone();
-    let module_loader: Option<Rc<dyn ModuleLoader>> = loader.map(|inner| {
-        Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>
-    });
+    let module_loader: Option<Rc<dyn ModuleLoader>> =
+        loader.map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
 
     let mut rt = JsRuntime::new(RuntimeOptions {
         extensions: vec![bridge_ext::init(stable.clone()), oj_test_ext::init()],
@@ -140,8 +143,7 @@ async fn run_on_runtime(
     }
 
     // 运行全部已注册用例（client 调用在此触发真实 oneshot 派发）。
-    let run_spec =
-        ModuleSpecifier::parse("file:///oj/test/__run.js").map_err(|e| e.to_string())?;
+    let run_spec = ModuleSpecifier::parse("file:///oj/test/__run.js").map_err(|e| e.to_string())?;
     let run_code = "await globalThis.__runTests();\n";
     let id = rt
         .load_side_es_module_from_code(&run_spec, run_code)

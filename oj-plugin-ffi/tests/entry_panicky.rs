@@ -16,7 +16,10 @@ oj_plugin_entry!(init);
 #[test]
 fn init_panic_converges_to_err_not_unwind() {
     assert_eq!(oj_plugin_abi_version(), ABI_VERSION);
-    let host = RArc::new(HostContext { log: noop_log, deliver: noop_deliver });
+    let host = RArc::new(HostContext {
+        log: noop_log,
+        deliver: noop_deliver,
+    });
     let r = oj_plugin_init(host, RString::from("{}"));
     match std::result::Result::from(r) {
         Err(e) => assert!(e[..].contains("panic"), "{e}"),

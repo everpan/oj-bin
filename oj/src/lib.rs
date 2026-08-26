@@ -2,9 +2,9 @@
 //! 纯 bin crate 的 `pub mod` 对外不可见，故 lib + bin 双 target）。
 pub mod app;
 pub mod args;
-pub mod test_cmd;
-pub mod test_ext;
 pub mod build_cmd;
 pub mod manifest;
 pub mod pack;
 pub mod server_cmd;
+pub mod test_cmd;
+pub mod test_ext;

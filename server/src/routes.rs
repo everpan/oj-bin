@@ -1,4 +1,5 @@
-//! 目录镜像路由：URL = base 之后的目录路径 → `<root>/<path>/api.(ts|js)`。
+#![allow(clippy::type_complexity, clippy::collapsible_if, clippy::redundant_closure)]
+
 //! 任意深度；无 api 文件的目录不是路由（可作纯工具代码目录）。
 
 use std::collections::HashMap;
@@ -16,7 +17,11 @@ impl Routes {
     pub fn new(base: &str, root: impl Into<PathBuf>, ts: bool) -> Self {
         // 归一 base：保证前后各一个 '/'（"/v1/api" 与 "/v1/api/" 等价）。
         let base = format!("/{}/", base.trim_matches('/'));
-        Self { base, root: root.into(), ts }
+        Self {
+            base,
+            root: root.into(),
+            ts,
+        }
     }
 
     /// 解析 HTTP 路径 → api 文件绝对路径；目录不存在/越界/非文件 → None。
@@ -27,12 +32,16 @@ impl Routes {
             return None;
         }
         // 安全：拒绝空段与越界段（目录穿越按 404 处理）。
-        if rel.split('/').any(|s| {
-            s.is_empty() || s == ".." || s == "." || s.contains('\\') || s.contains('\0')
-        }) {
+        if rel
+            .split('/')
+            .any(|s| s.is_empty() || s == ".." || s == "." || s.contains('\\') || s.contains('\0'))
+        {
             return None;
         }
-        let file = self.root.join(rel).join(if self.ts { "api.ts" } else { "api.js" });
+        let file = self
+            .root
+            .join(rel)
+            .join(if self.ts { "api.ts" } else { "api.js" });
         file.is_file().then_some(file)
     }
 }
@@ -47,7 +56,10 @@ pub fn normalize(path: &str) -> Option<String> {
     if t.is_empty() {
         return Some("/".into());
     }
-    if t[1..].split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+    if t[1..]
+        .split('/')
+        .any(|s| s.is_empty() || s == "." || s == "..")
+    {
         return None;
     }
     Some(t.to_string())
@@ -61,7 +73,9 @@ pub fn decode_params(
 ) -> Option<HashMap<String, String>> {
     let mut out = HashMap::new();
     for (k, raw) in pairs {
-        let v = percent_encoding::percent_decode_str(&raw).decode_utf8().ok()?;
+        let v = percent_encoding::percent_decode_str(&raw)
+            .decode_utf8()
+            .ok()?;
         let smuggled = !raw.contains('/') && v.contains('/');
         if v == "." || v == ".." || v.contains('\\') || v.contains('\0') || smuggled {
             return None;
@@ -98,7 +112,10 @@ pub enum Entry {
 
 /// 查表结果四态（handle 据此映射 200/500/405/404）。
 pub enum Lookup {
-    Hit { file: PathBuf, params: HashMap<String, String> },
+    Hit {
+        file: PathBuf,
+        params: HashMap<String, String>,
+    },
     Conflict(String),
     MethodNotAllowed,
     NotFound,
@@ -169,7 +186,11 @@ impl RouteTable {
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/");
-            let dir_base = if rel.is_empty() { format!("/{b}") } else { format!("/{b}/{rel}") };
+            let dir_base = if rel.is_empty() {
+                format!("/{b}")
+            } else {
+                format!("/{b}/{rel}")
+            };
             for (method, route) in decls {
                 if !METHODS.contains(&method.as_str()) {
                     continue;
@@ -202,12 +223,21 @@ impl RouteTable {
         let mut failures = Vec::new();
         for e in entries {
             if !METHODS.contains(&e.method.as_str()) {
-                failures.push(format!("routes.js: unknown method {} {}", e.method, e.pattern));
+                failures.push(format!(
+                    "routes.js: unknown method {} {}",
+                    e.method, e.pattern
+                ));
                 continue;
             }
             let legal_file = |f: &str| {
                 !f.is_empty()
-                    && !f.split('/').any(|s| s.is_empty() || s == ".." || s == "." || s.contains('\\') || s.contains('\0'))
+                    && !f.split('/').any(|s| {
+                        s.is_empty()
+                            || s == ".."
+                            || s == "."
+                            || s.contains('\\')
+                            || s.contains('\0')
+                    })
             };
             if !legal_file(&e.file) {
                 failures.push(format!("routes.js: illegal file path {}", e.file));
@@ -332,7 +362,9 @@ impl RouteTable {
         for row in &self.rows {
             let path = &self.files[row.file.0 as usize];
             match out.iter_mut().find(|(id, _, _)| *id == row.file) {
-                Some(slot) => slot.2.push((row.method.to_uppercase(), row.pattern.clone())),
+                Some(slot) => slot
+                    .2
+                    .push((row.method.to_uppercase(), row.pattern.clone())),
                 None => out.push((
                     row.file,
                     path,
@@ -354,7 +386,9 @@ fn api_files(root: &Path, ts: bool) -> Vec<PathBuf> {
 }
 
 pub(crate) fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -483,10 +517,18 @@ mod tests {
     fn mirrors_directory_tree_any_depth() {
         let root = fixture(&["user/account/api.ts", "user/profile/detail/api.ts"]);
         let r = Routes::new("/v1/api", &root, true);
-        assert_eq!(r.resolve("/v1/api/user/account/"), Some(root.join("user/account/api.ts")));
-        assert_eq!(r.resolve("/v1/api/user/account"), Some(root.join("user/account/api.ts")));
-        assert_eq!(r.resolve("/v1/api/user/profile/detail/"),
-                   Some(root.join("user/profile/detail/api.ts")));
+        assert_eq!(
+            r.resolve("/v1/api/user/account/"),
+            Some(root.join("user/account/api.ts"))
+        );
+        assert_eq!(
+            r.resolve("/v1/api/user/account"),
+            Some(root.join("user/account/api.ts"))
+        );
+        assert_eq!(
+            r.resolve("/v1/api/user/profile/detail/"),
+            Some(root.join("user/profile/detail/api.ts"))
+        );
     }
 
     #[test]
@@ -504,8 +546,16 @@ mod tests {
     #[test]
     fn release_mode_maps_api_js() {
         let root = fixture(&["user/account/api.js"]);
-        assert!(Routes::new("/v1/api", &root, false).resolve("/v1/api/user/account/").is_some());
-        assert!(Routes::new("/v1/api", &root, true).resolve("/v1/api/user/account/").is_none());
+        assert!(
+            Routes::new("/v1/api", &root, false)
+                .resolve("/v1/api/user/account/")
+                .is_some()
+        );
+        assert!(
+            Routes::new("/v1/api", &root, true)
+                .resolve("/v1/api/user/account/")
+                .is_none()
+        );
     }
 
     #[test]
@@ -520,8 +570,14 @@ mod tests {
 
     #[test]
     fn normalize_guards_and_trims() {
-        assert_eq!(normalize("/v1/api/user/account/"), Some("/v1/api/user/account".into()));
-        assert_eq!(normalize("/v1/api/user/account"), Some("/v1/api/user/account".into()));
+        assert_eq!(
+            normalize("/v1/api/user/account/"),
+            Some("/v1/api/user/account".into())
+        );
+        assert_eq!(
+            normalize("/v1/api/user/account"),
+            Some("/v1/api/user/account".into())
+        );
         assert_eq!(normalize("/"), Some("/".into()));
         assert_eq!(normalize("/v1/api//dbl"), None); // 空段（missing_or_traversal_is_none 契约）
         assert_eq!(normalize("/v1/api/../etc"), None); // 穿越段
@@ -557,28 +613,36 @@ mod tests {
                     f.to_string(),
                     vec![(
                         m.to_string(),
-                        if r.is_empty() { None } else { Some(r.to_string()) },
+                        if r.is_empty() {
+                            None
+                        } else {
+                            Some(r.to_string())
+                        },
                     )],
                 )
             })
             .collect();
-        RouteTable::build(
-            "/v1/api",
-            &root,
-            true,
-            |p: &Path| {
-                let key = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
-                Ok(m.get(&key).cloned().unwrap_or_default())
-            },
-        )
+        RouteTable::build("/v1/api", &root, true, |p: &Path| {
+            let key = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+            Ok(m.get(&key).cloned().unwrap_or_default())
+        })
     }
 
     #[test]
     fn table_registers_relative_and_rooted() {
-        let (t, f) = tbl(&["user/account/api.ts"], &[("user/account/api.ts", "get", "")]);
+        let (t, f) = tbl(
+            &["user/account/api.ts"],
+            &[("user/account/api.ts", "get", "")],
+        );
         assert!(f.is_empty(), "{f:?}");
-        assert!(matches!(t.lookup("/v1/api/user/account", "GET"), Lookup::Hit { .. }));
-        assert!(matches!(t.lookup("/v1/api/user/account", "POST"), Lookup::MethodNotAllowed));
+        assert!(matches!(
+            t.lookup("/v1/api/user/account", "GET"),
+            Lookup::Hit { .. }
+        ));
+        assert!(matches!(
+            t.lookup("/v1/api/user/account", "POST"),
+            Lookup::MethodNotAllowed
+        ));
         assert!(matches!(t.lookup("/v1/api/none", "GET"), Lookup::NotFound));
         // 根级 api.ts：dir_base = base 本身（无尾斜杠）
         let (t2, f2) = tbl(&["api.ts"], &[("api.ts", "get", "")]);
@@ -588,13 +652,19 @@ mod tests {
 
     #[test]
     fn table_param_extraction_and_route_suffix() {
-        let (t, _) = tbl(&["user/account/api.ts"], &[("user/account/api.ts", "get", "{id}")]);
+        let (t, _) = tbl(
+            &["user/account/api.ts"],
+            &[("user/account/api.ts", "get", "{id}")],
+        );
         match t.lookup("/v1/api/user/account/42", "GET") {
             Lookup::Hit { params, .. } => assert_eq!(params["id"], "42"),
             _ => panic!("expected hit"),
         }
         // 挂 .route 后目录镜像不再注册（替换语义）
-        assert!(matches!(t.lookup("/v1/api/user/account", "GET"), Lookup::NotFound));
+        assert!(matches!(
+            t.lookup("/v1/api/user/account", "GET"),
+            Lookup::NotFound
+        ));
         let id = t.listing().iter().find(|r| r.method == "get").unwrap().file;
         assert!(t.is_replaced(t.file_path(id), "get"));
         assert!(!t.is_replaced(t.file_path(id), "post"));
@@ -602,22 +672,39 @@ mod tests {
 
     #[test]
     fn table_rooted_route_ignores_dir() {
-        let (t, _) =
-            tbl(&["legacy/compat/api.ts"], &[("legacy/compat/api.ts", "get", "/v2/user/{id}")]);
-        assert!(matches!(t.lookup("/v1/api/v2/user/42", "GET"), Lookup::Hit { .. }));
-        assert!(matches!(t.lookup("/v1/api/legacy/compat", "GET"), Lookup::NotFound));
+        let (t, _) = tbl(
+            &["legacy/compat/api.ts"],
+            &[("legacy/compat/api.ts", "get", "/v2/user/{id}")],
+        );
+        assert!(matches!(
+            t.lookup("/v1/api/v2/user/42", "GET"),
+            Lookup::Hit { .. }
+        ));
+        assert!(matches!(
+            t.lookup("/v1/api/legacy/compat", "GET"),
+            Lookup::NotFound
+        ));
     }
 
     #[test]
     fn table_duplicate_is_conflict_500() {
         let (t, f) = tbl(
             &["a/api.ts", "b/api.ts"],
-            &[("a/api.ts", "get", "/user/{id}"), ("b/api.ts", "get", "/user/{id}")],
+            &[
+                ("a/api.ts", "get", "/user/{id}"),
+                ("b/api.ts", "get", "/user/{id}"),
+            ],
         );
         assert!(f.iter().any(|s| s.contains("route conflict")), "{f:?}");
-        assert!(matches!(t.lookup("/v1/api/user/1", "GET"), Lookup::Conflict(_)));
+        assert!(matches!(
+            t.lookup("/v1/api/user/1", "GET"),
+            Lookup::Conflict(_)
+        ));
         // 冲突 pattern 的其它 verb 仍 405 语义
-        assert!(matches!(t.lookup("/v1/api/user/1", "POST"), Lookup::MethodNotAllowed));
+        assert!(matches!(
+            t.lookup("/v1/api/user/1", "POST"),
+            Lookup::MethodNotAllowed
+        ));
     }
 
     #[test]
@@ -651,8 +738,14 @@ mod tests {
         );
         assert_eq!(f.len(), 2, "{f:?}");
         assert!(f[0].contains("invalid route"), "{f:?}");
-        assert!(matches!(t.lookup("/v1/api/a/42.json", "GET"), Lookup::NotFound));
-        assert!(matches!(t.lookup("/v1/api/b/v1.2", "GET"), Lookup::NotFound));
+        assert!(matches!(
+            t.lookup("/v1/api/a/42.json", "GET"),
+            Lookup::NotFound
+        ));
+        assert!(matches!(
+            t.lookup("/v1/api/b/v1.2", "GET"),
+            Lookup::NotFound
+        ));
     }
 
     #[test]
@@ -676,15 +769,24 @@ mod tests {
             }
         });
         assert_eq!(f.len(), 1);
-        assert!(matches!(t.lookup("/v1/api/good", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(
+            t.lookup("/v1/api/good", "GET"),
+            Lookup::Hit { .. }
+        ));
         assert!(matches!(t.lookup("/v1/api/bad", "GET"), Lookup::NotFound));
     }
 
     #[test]
     fn table_unmapped_verb_405_when_path_exists() {
         let (t, _) = tbl(&["u/api.ts"], &[("u/api.ts", "get", "")]);
-        assert!(matches!(t.lookup("/v1/api/u", "TRACE"), Lookup::MethodNotAllowed));
-        assert!(matches!(t.lookup("/v1/api/none", "TRACE"), Lookup::NotFound));
+        assert!(matches!(
+            t.lookup("/v1/api/u", "TRACE"),
+            Lookup::MethodNotAllowed
+        ));
+        assert!(matches!(
+            t.lookup("/v1/api/none", "TRACE"),
+            Lookup::NotFound
+        ));
     }
 
     #[test]
@@ -694,7 +796,10 @@ mod tests {
         assert!(matches!(t.lookup("/v1/api/u", "GET"), Lookup::Hit { .. }));
         let (t2, _) = tbl(&["v/api.ts"], &[("v/api.ts", "get", "  ")]);
         // 非空但仅空白：作为字面 pattern 注册（不特判，文档写明空串视同未挂）
-        assert!(matches!(t2.lookup("/v1/api/v/  ", "GET"), Lookup::Hit { .. }));
+        assert!(matches!(
+            t2.lookup("/v1/api/v/  ", "GET"),
+            Lookup::Hit { .. }
+        ));
     }
 
     // ----- release 直载（routes.js）-----
@@ -714,7 +819,7 @@ mod tests {
                 es("post", "/a/{id}", "a/api.js"), // 跨方法合并
                 es("get", "/a/{id}", "b/api.js"),  // 同 (pattern, method) → 冲突（请求期 500）
                 es("get", "/bad/{*x}tail", "c/api.js"), // matchit 拒绝 → failure
-                es("brew", "/a", "d/api.js"),           // 未知方法 → failure
+                es("brew", "/a", "d/api.js"),      // 未知方法 → failure
             ],
         );
         assert_eq!(failures.len(), 3, "{failures:?}");
@@ -723,7 +828,9 @@ mod tests {
         assert!(matches!(t.lookup("/a/1", "PUT"), Lookup::MethodNotAllowed));
         // 无冲突表：Hit 的 file 相对 root 解析
         let (t2, _) = RouteTable::from_entries(&root, &[es("get", "/a/{id}", "a/api.js")]);
-        let Lookup::Hit { file, .. } = t2.lookup("/a/1", "GET") else { panic!() };
+        let Lookup::Hit { file, .. } = t2.lookup("/a/1", "GET") else {
+            panic!()
+        };
         assert_eq!(file, PathBuf::from("/r/a/api.js"));
         // release 无 fs 兜底：表外路径 404
         assert!(matches!(t.lookup("/nope", "GET"), Lookup::NotFound));
@@ -745,17 +852,27 @@ mod tests {
     #[test]
     fn from_entries_rejects_traversal_and_bad_pattern() {
         let root = PathBuf::from("/r");
-        let es = |m: &str, p: &str, f: &str| RouteEntry { method: m.into(), pattern: p.into(), file: f.into() };
-        let (t, failures) = RouteTable::from_entries(&root, &[
-            es("get", "/a/{id}", "../etc/passwd"),   // 穿越
-            es("get", "/a/{id}", "a/../b.js"),        // 中段 ..
-            es("get", "/a/{id}", "a\\b.js"),          // 反斜杠
-            es("get", "/a//x", "a/api.js"),           // pattern 空段
-            es("get", "a/x", "a/api.js"),             // pattern 无首斜杠
-            es("get", "/a/{id}", "a/api.js"),         // 合法行仍注册
-        ]);
+        let es = |m: &str, p: &str, f: &str| RouteEntry {
+            method: m.into(),
+            pattern: p.into(),
+            file: f.into(),
+        };
+        let (t, failures) = RouteTable::from_entries(
+            &root,
+            &[
+                es("get", "/a/{id}", "../etc/passwd"), // 穿越
+                es("get", "/a/{id}", "a/../b.js"),     // 中段 ..
+                es("get", "/a/{id}", "a\\b.js"),       // 反斜杠
+                es("get", "/a//x", "a/api.js"),        // pattern 空段
+                es("get", "a/x", "a/api.js"),          // pattern 无首斜杠
+                es("get", "/a/{id}", "a/api.js"),      // 合法行仍注册
+            ],
+        );
         assert_eq!(failures.len(), 5, "{failures:?}");
-        assert!(failures.iter().all(|f| f.contains("illegal")), "{failures:?}");
+        assert!(
+            failures.iter().all(|f| f.contains("illegal")),
+            "{failures:?}"
+        );
         assert!(matches!(t.lookup("/a/1", "GET"), Lookup::Hit { .. }));
     }
 }

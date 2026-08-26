@@ -79,14 +79,19 @@ impl RedisKV {
     async fn del(&self, key: &str) -> Result<(), String> {
         use redis::AsyncCommands;
         let mut c = self.conn.clone();
-        let _: i64 = c.del(key).await.map_err(|e| -> String { format!("redis del: {e}") })?;
+        let _: i64 = c
+            .del(key)
+            .await
+            .map_err(|e| -> String { format!("redis del: {e}") })?;
         Ok(())
     }
 
     async fn expire(&self, key: &str, ttl_secs: u64) -> Result<bool, String> {
         use redis::AsyncCommands;
         let mut c = self.conn.clone();
-        c.expire(key, ttl_secs as i64).await.map_err(|e| format!("redis expire: {e}"))
+        c.expire(key, ttl_secs as i64)
+            .await
+            .map_err(|e| format!("redis expire: {e}"))
     }
 
     async fn incr(&self, key: &str) -> Result<i64, String> {
@@ -159,10 +164,9 @@ extern "C" fn get(handle: u64, key: RString) -> FfiFuture {
 extern "C" fn set(handle: u64, key: RString, value: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_set(handle, &key[..], &value[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_set(handle, &key[..], &value[..]).await
+        })
     })
 }
 
@@ -176,10 +180,9 @@ extern "C" fn del(handle: u64, key: RString) -> FfiFuture {
 extern "C" fn expire(handle: u64, key: RString, ttl_secs: u64) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_expire(handle, &key[..], ttl_secs).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_expire(handle, &key[..], ttl_secs).await
+        })
     })
 }
 
@@ -283,33 +286,60 @@ mod tests {
         };
         let _ = std::result::Result::from(init(host(), RString::from("{}")));
         let cfg = serde_json::json!({ "url": url }).to_string();
-        let bytes = drive(&mut connect(RString::from(cfg.as_str()))).await.expect("connect");
+        let bytes = drive(&mut connect(RString::from(cfg.as_str())))
+            .await
+            .expect("connect");
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
             .as_u64()
             .unwrap();
 
         let k = format!("oj-test/{}", std::process::id());
-        drive(&mut set(handle, RString::from(k.as_str()), RString::from("v")))
+        drive(&mut set(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("v"),
+        ))
+        .await
+        .expect("set");
+        let got = drive(&mut get(handle, RString::from(k.as_str())))
             .await
-            .expect("set");
-        let got = drive(&mut get(handle, RString::from(k.as_str()))).await.expect("get");
+            .expect("get");
         let v: Option<String> = serde_json::from_slice(&got).unwrap();
         assert_eq!(v.as_deref(), Some("v"));
 
         // INCR 于非数字值 → Err；置 1 后 incr → 2。
-        assert!(drive(&mut incr(handle, RString::from(k.as_str()))).await.is_err());
-        drive(&mut set(handle, RString::from(k.as_str()), RString::from("1")))
+        assert!(
+            drive(&mut incr(handle, RString::from(k.as_str())))
+                .await
+                .is_err()
+        );
+        drive(&mut set(
+            handle,
+            RString::from(k.as_str()),
+            RString::from("1"),
+        ))
+        .await
+        .expect("set1");
+        let n = drive(&mut incr(handle, RString::from(k.as_str())))
             .await
-            .expect("set1");
-        let n = drive(&mut incr(handle, RString::from(k.as_str()))).await.expect("incr");
+            .expect("incr");
         assert_eq!(serde_json::from_slice::<i64>(&n).unwrap(), 2);
 
         // 整秒 TTL：EXPIRE 10 → true；del 后 get None。
-        let b = drive(&mut expire(handle, RString::from(k.as_str()), 10)).await.expect("expire");
+        let b = drive(&mut expire(handle, RString::from(k.as_str()), 10))
+            .await
+            .expect("expire");
         assert!(serde_json::from_slice::<bool>(&b).unwrap());
-        drive(&mut del(handle, RString::from(k.as_str()))).await.expect("del");
-        let got = drive(&mut get(handle, RString::from(k.as_str()))).await.expect("get2");
-        assert_eq!(serde_json::from_slice::<Option<String>>(&got).unwrap(), None);
+        drive(&mut del(handle, RString::from(k.as_str())))
+            .await
+            .expect("del");
+        let got = drive(&mut get(handle, RString::from(k.as_str())))
+            .await
+            .expect("get2");
+        assert_eq!(
+            serde_json::from_slice::<Option<String>>(&got).unwrap(),
+            None
+        );
 
         close(handle);
     }
@@ -318,7 +348,10 @@ mod tests {
     extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询）。

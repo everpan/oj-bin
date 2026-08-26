@@ -79,7 +79,10 @@ fn state() -> &'static DbPluginState {
 // ---- sqlx 逻辑（迁移自 core accessor_sqlx.rs，绑定/行转换逐字对齐）----
 
 /// 将单个 JSON 值绑定到 sqlx 语句（按类型选择可 Encode 的具体类型）。
-fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &serde_json::Value) -> Query<'q, Any, AnyArguments> {
+fn bind_value<'q>(
+    q: Query<'q, Any, AnyArguments>,
+    v: &serde_json::Value,
+) -> Query<'q, Any, AnyArguments> {
     match v {
         serde_json::Value::Null => q.bind(None::<String>),
         serde_json::Value::Bool(b) => q.bind(*b),
@@ -180,7 +183,8 @@ impl Client {
             .execute(&self.pool)
             .await
             .map_err(|e| format!("db exec: {e}"))?;
-        serde_json::to_vec(&(res.rows_affected() as i64)).map_err(|e| format!("db exec serialize: {e}"))
+        serde_json::to_vec(&(res.rows_affected() as i64))
+            .map_err(|e| format!("db exec serialize: {e}"))
     }
 
     async fn begin(&self) -> Result<u64, String> {
@@ -190,7 +194,12 @@ impl Client {
             .await
             .map_err(|e| format!("db tx begin: {e}"))?;
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst) + 1;
-        self.txs.lock().unwrap().insert(id, Arc::new(Tx { tx: tokio::sync::Mutex::new(Some(tx)) }));
+        self.txs.lock().unwrap().insert(
+            id,
+            Arc::new(Tx {
+                tx: tokio::sync::Mutex::new(Some(tx)),
+            }),
+        );
         Ok(id)
     }
 
@@ -203,10 +212,17 @@ impl Client {
             .ok_or_else(|| format!("db: unknown tx {tx_id}"))
     }
 
-    async fn tx_query(&self, tx_id: u64, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+    async fn tx_query(
+        &self,
+        tx_id: u64,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Vec<u8>, String> {
         let tx = self.tx(tx_id)?;
         let mut g = tx.tx.lock().await;
-        let Some(t) = g.as_mut() else { return Err("tx finished".into()) };
+        let Some(t) = g.as_mut() else {
+            return Err("tx finished".into());
+        };
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -219,10 +235,17 @@ impl Client {
             .map_err(|e| format!("db tx query serialize: {e}"))
     }
 
-    async fn tx_exec(&self, tx_id: u64, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+    async fn tx_exec(
+        &self,
+        tx_id: u64,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> Result<Vec<u8>, String> {
         let tx = self.tx(tx_id)?;
         let mut g = tx.tx.lock().await;
-        let Some(t) = g.as_mut() else { return Err("tx finished".into()) };
+        let Some(t) = g.as_mut() else {
+            return Err("tx finished".into());
+        };
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -231,20 +254,37 @@ impl Client {
             .execute(&mut **t)
             .await
             .map_err(|e| format!("db tx exec: {e}"))?;
-        serde_json::to_vec(&(res.rows_affected() as i64)).map_err(|e| format!("db tx exec serialize: {e}"))
+        serde_json::to_vec(&(res.rows_affected() as i64))
+            .map_err(|e| format!("db tx exec serialize: {e}"))
     }
 
     async fn tx_commit(&self, tx_id: u64) -> Result<Vec<u8>, String> {
-        let tx = self.txs.lock().unwrap().remove(&tx_id).ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
-        let Some(t) = tx.tx.lock().await.take() else { return Err("tx finished".into()) };
+        let tx = self
+            .txs
+            .lock()
+            .unwrap()
+            .remove(&tx_id)
+            .ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
+        let Some(t) = tx.tx.lock().await.take() else {
+            return Err("tx finished".into());
+        };
         t.commit().await.map_err(|e| format!("db tx commit: {e}"))?;
         Ok(b"".to_vec())
     }
 
     async fn tx_rollback(&self, tx_id: u64) -> Result<Vec<u8>, String> {
-        let tx = self.txs.lock().unwrap().remove(&tx_id).ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
-        let Some(t) = tx.tx.lock().await.take() else { return Err("tx finished".into()) };
-        t.rollback().await.map_err(|e| format!("db tx rollback: {e}"))?;
+        let tx = self
+            .txs
+            .lock()
+            .unwrap()
+            .remove(&tx_id)
+            .ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
+        let Some(t) = tx.tx.lock().await.take() else {
+            return Err("tx finished".into());
+        };
+        t.rollback()
+            .await
+            .map_err(|e| format!("db tx rollback: {e}"))?;
         Ok(b"".to_vec())
     }
 }
@@ -271,13 +311,25 @@ impl DbPluginState {
         self.client(handle)?.exec(sql, &p).await
     }
 
-    async fn do_tx_query(&self, handle: u64, tx_id: u64, sql: &str, params: &str) -> Result<Vec<u8>, String> {
+    async fn do_tx_query(
+        &self,
+        handle: u64,
+        tx_id: u64,
+        sql: &str,
+        params: &str,
+    ) -> Result<Vec<u8>, String> {
         let p: Vec<serde_json::Value> =
             serde_json::from_str(params).map_err(|e| format!("db tx_query: bad params: {e}"))?;
         self.client(handle)?.tx_query(tx_id, sql, &p).await
     }
 
-    async fn do_tx_exec(&self, handle: u64, tx_id: u64, sql: &str, params: &str) -> Result<Vec<u8>, String> {
+    async fn do_tx_exec(
+        &self,
+        handle: u64,
+        tx_id: u64,
+        sql: &str,
+        params: &str,
+    ) -> Result<Vec<u8>, String> {
         let p: Vec<serde_json::Value> =
             serde_json::from_str(params).map_err(|e| format!("db tx_exec: bad params: {e}"))?;
         self.client(handle)?.tx_exec(tx_id, sql, &p).await
@@ -302,20 +354,18 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
 extern "C" fn query(handle: u64, sql: RString, params: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_query(handle, &sql[..], &params[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_query(handle, &sql[..], &params[..]).await
+        })
     })
 }
 
 extern "C" fn exec(handle: u64, sql: RString, params: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_exec(handle, &sql[..], &params[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_exec(handle, &sql[..], &params[..]).await
+        })
     })
 }
 
@@ -333,20 +383,18 @@ extern "C" fn begin(handle: u64) -> FfiFuture {
 extern "C" fn tx_query(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_tx_query(handle, tx_id, &sql[..], &params[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_tx_query(handle, tx_id, &sql[..], &params[..]).await
+        })
     })
 }
 
 extern "C" fn tx_exec(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_tx_exec(handle, tx_id, &sql[..], &params[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_tx_exec(handle, tx_id, &sql[..], &params[..]).await
+        })
     })
 }
 
@@ -363,17 +411,19 @@ extern "C" fn tx_commit(handle: u64, tx_id: u64) -> FfiFuture {
 extern "C" fn tx_rollback(handle: u64, tx_id: u64) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.client(handle)?.tx_rollback(tx_id).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.client(handle)?.tx_rollback(tx_id).await
+        })
     })
 }
 
 extern "C" fn dialect(handle: u64) -> RString {
     oj_plugin_ffi::catch_value(
         || {
-            let d = state().client(handle).map(|c| c.dialect).unwrap_or(Dialect::Sqlite);
+            let d = state()
+                .client(handle)
+                .map(|c| c.dialect)
+                .unwrap_or(Dialect::Sqlite);
             RString::from(dialect_str(d))
         },
         RString::from("unknown"),
@@ -416,14 +466,12 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
 
 extern "C" fn register() -> PluginRegistrations {
     oj_plugin_ffi::catch_value(
-        || {
-            PluginRegistrations {
-                es: std::ptr::null(),
-                db: &VTABLE,
-                blob: std::ptr::null(),
-                bus: std::ptr::null(),
-                kv: std::ptr::null(),
-            }
+        || PluginRegistrations {
+            es: std::ptr::null(),
+            db: &VTABLE,
+            blob: std::ptr::null(),
+            bus: std::ptr::null(),
+            kv: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
@@ -498,52 +546,98 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        drive(&mut exec(handle, RString::from("create table if not exists oj_plugin_t (id int primary key, v text)"), RString::from("[]")))
-            .await
-            .expect("create");
+        drive(&mut exec(
+            handle,
+            RString::from("create table if not exists oj_plugin_t (id int primary key, v text)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("create");
 
-        drive(&mut exec(handle, RString::from("insert into oj_plugin_t (id, v) values (?, ?)"), RString::from(r#"[1,"hi"]"#)))
-            .await
-            .expect("insert");
+        drive(&mut exec(
+            handle,
+            RString::from("insert into oj_plugin_t (id, v) values (?, ?)"),
+            RString::from(r#"[1,"hi"]"#),
+        ))
+        .await
+        .expect("insert");
 
-        let rows = drive(&mut query(handle, RString::from("select v from oj_plugin_t where id = ?"), RString::from(r#"[1]"#)))
-            .await
-            .expect("query");
+        let rows = drive(&mut query(
+            handle,
+            RString::from("select v from oj_plugin_t where id = ?"),
+            RString::from(r#"[1]"#),
+        ))
+        .await
+        .expect("query");
         let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
         assert_eq!(v[0]["v"], serde_json::json!("hi"), "{v}");
 
         // 事务 commit
         let bytes = drive(&mut begin(handle)).await.expect("begin");
-        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["tx_id"].as_u64().unwrap();
-        drive(&mut tx_exec(handle, tx_id, RString::from("insert into oj_plugin_t (id, v) values (?, ?)"), RString::from(r#"[2,"tx"]"#)))
+        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        drive(&mut tx_exec(
+            handle,
+            tx_id,
+            RString::from("insert into oj_plugin_t (id, v) values (?, ?)"),
+            RString::from(r#"[2,"tx"]"#),
+        ))
+        .await
+        .expect("tx insert");
+        drive(&mut tx_commit(handle, tx_id))
             .await
-            .expect("tx insert");
-        drive(&mut tx_commit(handle, tx_id)).await.expect("tx commit");
+            .expect("tx commit");
 
         // 事务 rollback
         let bytes = drive(&mut begin(handle)).await.expect("begin2");
-        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["tx_id"].as_u64().unwrap();
-        drive(&mut tx_exec(handle, tx_id, RString::from("insert into oj_plugin_t (id, v) values (?, ?)"), RString::from(r#"[3,"rb"]"#)))
+        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        drive(&mut tx_exec(
+            handle,
+            tx_id,
+            RString::from("insert into oj_plugin_t (id, v) values (?, ?)"),
+            RString::from(r#"[3,"rb"]"#),
+        ))
+        .await
+        .expect("tx insert2");
+        drive(&mut tx_rollback(handle, tx_id))
             .await
-            .expect("tx insert2");
-        drive(&mut tx_rollback(handle, tx_id)).await.expect("tx rollback");
+            .expect("tx rollback");
 
-        let rows = drive(&mut query(handle, RString::from("select count(*) c from oj_plugin_t where id in (1,2,3)"), RString::from("[]")))
-            .await
-            .expect("count");
+        let rows = drive(&mut query(
+            handle,
+            RString::from("select count(*) c from oj_plugin_t where id in (1,2,3)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("count");
         let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
-        assert_eq!(v[0]["c"], serde_json::json!(2), "rolled back row must be absent: {v}");
+        assert_eq!(
+            v[0]["c"],
+            serde_json::json!(2),
+            "rolled back row must be absent: {v}"
+        );
 
         close(handle);
-        drive(&mut query(handle, RString::from("select 1"), RString::from("[]"))).await
-            .expect_err("unknown handle after close");
+        drive(&mut query(
+            handle,
+            RString::from("select 1"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect_err("unknown handle after close");
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询）。

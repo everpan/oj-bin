@@ -7,14 +7,16 @@
 
 use std::sync::Arc;
 
-use super::bus::EventBroker;
 use super::BridgeResult;
+use super::bus::EventBroker;
 use crate::config::BrokerCfg;
 
 /// 按配置构造事件 broker（薄包装：BusBackendRegistry::builtin().connect，签名不变，
 /// 调用点零改动；仅内置 local——插件 broker 场景走装配期 Registries.bus）。
 pub async fn build_broker(cfg: &Option<BrokerCfg>) -> BridgeResult<Arc<dyn EventBroker>> {
-    super::bus_backend::BusBackendRegistry::builtin().connect(cfg).await
+    super::bus_backend::BusBackendRegistry::builtin()
+        .connect(cfg)
+        .await
 }
 
 #[cfg(test)]

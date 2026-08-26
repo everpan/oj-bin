@@ -71,13 +71,15 @@ fn state() -> &'static BlobPluginState {
 fn valid_key(key: &str) -> bool {
     !key.is_empty()
         && !key.starts_with('/')
-        && key.split('/').all(|s| {
-            !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0'])
-        })
+        && key
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != ".." && !s.contains(['\\', '\0']))
 }
 
 fn os_path(key: &str) -> Result<Path, String> {
-    valid_key(key).then(|| Path::from(key)).ok_or_else(|| format!("invalid blob key '{key}'"))
+    valid_key(key)
+        .then(|| Path::from(key))
+        .ok_or_else(|| format!("invalid blob key '{key}'"))
 }
 
 impl BlobPluginState {
@@ -101,8 +103,15 @@ impl BlobPluginState {
 
     async fn do_get(&self, handle: u64, key: &str) -> Result<Vec<u8>, String> {
         let path = os_path(key)?;
-        let r = self.store(handle)?.get(&path).await.map_err(|e| format!("blob get: {e}"))?;
-        Ok(r.bytes().await.map_err(|e| format!("blob get: {e}"))?.to_vec())
+        let r = self
+            .store(handle)?
+            .get(&path)
+            .await
+            .map_err(|e| format!("blob get: {e}"))?;
+        Ok(r.bytes()
+            .await
+            .map_err(|e| format!("blob get: {e}"))?
+            .to_vec())
     }
 
     async fn do_del(&self, handle: u64, key: &str) -> Result<Vec<u8>, String> {
@@ -153,7 +162,9 @@ fn build_store(c: &S3Cfg) -> Result<Arc<AmazonS3>, String> {
     if let Some(k) = c.secret_key.as_deref().filter(|s| !s.is_empty()) {
         b = b.with_secret_access_key(k);
     }
-    Ok(Arc::new(b.build().map_err(|e| format!("blob s3 build: {e}"))?))
+    Ok(Arc::new(
+        b.build().map_err(|e| format!("blob s3 build: {e}"))?,
+    ))
 }
 
 // ---- vtable（同步签名返回 FfiFuture；connect 产 handle，close 释放）----
@@ -180,7 +191,10 @@ extern "C" fn put(handle: u64, key: RString, bytes: RBytes, _content_type: RStri
             b.push(*x);
         }
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move { st.do_put(handle, &key[..], &b).await })
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_put(handle, &key[..], &b).await },
+        )
     })
 }
 
@@ -208,13 +222,10 @@ extern "C" fn url(handle: u64, key: RString) -> FfiFuture {
 /// content_type：S3 侧对象自身元数据负责 → 恒 None（空串）。key 校验语义与 core 对齐。
 extern "C" fn content_type(_handle: u64, key: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
-        oj_plugin_ffi::spawn_ffi_future(
-            &state().rt,
-            async move {
-                os_path(&key[..])?;
-                Ok(b"".to_vec())
-            },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&state().rt, async move {
+            os_path(&key[..])?;
+            Ok(b"".to_vec())
+        })
     })
 }
 
@@ -236,14 +247,12 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
 
 extern "C" fn register() -> PluginRegistrations {
     oj_plugin_ffi::catch_value(
-        || {
-            PluginRegistrations {
-                es: std::ptr::null(),
-                db: std::ptr::null(),
-                blob: &VTABLE,
-                bus: std::ptr::null(),
-                kv: std::ptr::null(),
-            }
+        || PluginRegistrations {
+            es: std::ptr::null(),
+            db: std::ptr::null(),
+            blob: &VTABLE,
+            bus: std::ptr::null(),
+            kv: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
@@ -330,7 +339,10 @@ mod tests {
             return;
         };
         let p: Vec<&str> = dsn.split('|').collect();
-        assert!(p.len() >= 5, "OJ_TEST_S3 = endpoint|bucket|region|access|secret|path_style");
+        assert!(
+            p.len() >= 5,
+            "OJ_TEST_S3 = endpoint|bucket|region|access|secret|path_style"
+        );
         let cfg = serde_json::json!({
             "driver": "s3",
             "root": "",
@@ -348,9 +360,12 @@ mod tests {
         };
         assert_eq!(&desc.name[..], "blob-s3");
 
-        let bytes = drive(&mut connect(RString::from("default"), RString::from(cfg.as_str())))
-            .await
-            .expect("connect");
+        let bytes = drive(&mut connect(
+            RString::from("default"),
+            RString::from(cfg.as_str()),
+        ))
+        .await
+        .expect("connect");
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
             .as_u64()
             .unwrap();
@@ -364,21 +379,37 @@ mod tests {
         ))
         .await
         .expect("put");
-        let got = drive(&mut get(handle, RString::from(key.as_str()))).await.expect("get");
+        let got = drive(&mut get(handle, RString::from(key.as_str())))
+            .await
+            .expect("get");
         assert_eq!(got, b"hello-s3");
-        let u = drive(&mut url(handle, RString::from(key.as_str()))).await.expect("url");
-        assert!(String::from_utf8(u).unwrap().starts_with("http"), "presigned url");
-        drive(&mut del(handle, RString::from(key.as_str()))).await.expect("del");
-        assert!(drive(&mut get(handle, RString::from(key.as_str()))).await.is_err());
+        let u = drive(&mut url(handle, RString::from(key.as_str())))
+            .await
+            .expect("url");
+        assert!(
+            String::from_utf8(u).unwrap().starts_with("http"),
+            "presigned url"
+        );
+        drive(&mut del(handle, RString::from(key.as_str())))
+            .await
+            .expect("del");
+        assert!(
+            drive(&mut get(handle, RString::from(key.as_str())))
+                .await
+                .is_err()
+        );
 
         close(handle);
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     fn rbytes(b: &[u8]) -> RBytes {

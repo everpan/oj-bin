@@ -4,20 +4,31 @@
 //! - 插件必须 panic=unwind profile（契约 crate 文档约束）；
 //! - 符号签名必须与 oj-plugin-ffi 契约一致（ABI_VERSION 门禁兜底）。
 
-use crate::bridge::plugin_loader::PluginLoadError;
+#![allow(clippy::collapsible_if)]
 use libloading::Library;
+use crate::bridge::plugin_loader::PluginLoadError;
+
 use std::path::{Path, PathBuf};
 
 /// 唯一 dlopen 点。加载成功立即泄漏句柄（进程期存活）。
 pub(crate) unsafe fn load_forget(path: &Path) -> Result<&'static Library, PluginLoadError> {
     if !path.is_file() {
-        return Err(PluginLoadError::FileMissing { path: path.to_path_buf() });
+        return Err(PluginLoadError::FileMissing {
+            path: path.to_path_buf(),
+        });
     }
     #[cfg(windows)]
     let loaded = {
-        use libloading::os::windows::{Library as WinLibrary, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32};
-        unsafe { WinLibrary::load_with_flags(path, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) }
-            .map(Library::from)
+        use libloading::os::windows::{
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, Library as WinLibrary,
+        };
+        unsafe {
+            WinLibrary::load_with_flags(
+                path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }
+        .map(Library::from)
     };
     #[cfg(not(windows))]
     let loaded = unsafe { Library::new(path) };
@@ -47,9 +58,15 @@ fn classify_load_error(path: &Path, e: impl std::fmt::Display) -> PluginLoadErro
         || lower.contains("file too short") // 截断/非 ELF 文件
         || lower.contains("%1 is not a valid win32")
     {
-        PluginLoadError::PlatformMismatch { path: path.to_path_buf(), detail: text }
+        PluginLoadError::PlatformMismatch {
+            path: path.to_path_buf(),
+            detail: text,
+        }
     } else {
-        PluginLoadError::DependencyResolution { path: path.to_path_buf(), loader_text: text }
+        PluginLoadError::DependencyResolution {
+            path: path.to_path_buf(),
+            loader_text: text,
+        }
     }
 }
 
@@ -112,11 +129,11 @@ use oj_plugin_ffi::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::sync::Mutex as StdMutex;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + yield_now；take→free→state 置 null）。
 /// poll 返回 -1 时也 take（错误细节在 take 的 Err 里）。
@@ -174,7 +191,11 @@ impl FfiEsBackend {
 impl EsBackend for FfiEsBackend {
     async fn search(&self, index: &str, dsl: serde_json::Value) -> BridgeResult<serde_json::Value> {
         let body = serde_json::to_string(&dsl).map_err(|e| ffi_err("serialize", e))?;
-        let fut = (self.vtable.search)(self.handle, RString::from(index), RString::from(body.as_str()));
+        let fut = (self.vtable.search)(
+            self.handle,
+            RString::from(index),
+            RString::from(body.as_str()),
+        );
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("search", e))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("search decode", e))
     }
@@ -197,8 +218,7 @@ impl EsBackend for FfiEsBackend {
     }
 
     async fn delete_doc(&self, index: &str, id: &str) -> BridgeResult<serde_json::Value> {
-        let fut =
-            (self.vtable.delete_doc)(self.handle, RString::from(index), RString::from(id));
+        let fut = (self.vtable.delete_doc)(self.handle, RString::from(index), RString::from(id));
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("delete_doc", e))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("delete_doc decode", e))
     }
@@ -222,8 +242,15 @@ pub struct FfiDbBackend {
 impl FfiDbBackend {
     /// 构造即调 vtable.schemes() 读认领列表（装配期一次）。
     pub fn new(name: impl Into<String>, vtable: &'static DataAccessorVtable) -> Self {
-        let schemes: Vec<String> = (vtable.schemes)().iter().map(|s| s[..].to_string()).collect();
-        Self { name: name.into(), schemes, vtable }
+        let schemes: Vec<String> = (vtable.schemes)()
+            .iter()
+            .map(|s| s[..].to_string())
+            .collect();
+        Self {
+            name: name.into(),
+            schemes,
+            vtable,
+        }
     }
 }
 
@@ -260,7 +287,9 @@ impl FfiDataAccessor {
 }
 
 /// JSON 数组 → 参数化绑定载荷（Value 边界；插件侧反序列化绑定）。
-fn params_json(params: &[serde_json::Value]) -> Result<RString, Box<dyn std::error::Error + Send + Sync>> {
+fn params_json(
+    params: &[serde_json::Value],
+) -> Result<RString, Box<dyn std::error::Error + Send + Sync>> {
     let s = serde_json::to_string(params).map_err(|e| ffi_err("db serialize", e))?;
     Ok(RString::from(s.as_str()))
 }
@@ -286,7 +315,11 @@ impl DataAccessor for FfiDataAccessor {
         Ok(Box::new(FfiTxSession::new(self.handle, tx_id, self.vtable)))
     }
 
-    async fn query_with_params(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<Vec<Row>> {
+    async fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> BridgeResult<Vec<Row>> {
         let p = params_json(params)?;
         let fut = (self.vtable.query)(self.handle, RString::from(sql), p);
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db query", e))?;
@@ -319,7 +352,12 @@ pub struct FfiTxSession {
 
 impl FfiTxSession {
     fn new(handle: u64, tx_id: u64, vtable: &'static DataAccessorVtable) -> Self {
-        Self { handle, tx_id, vtable, finished: AtomicBool::new(false) }
+        Self {
+            handle,
+            tx_id,
+            vtable,
+            finished: AtomicBool::new(false),
+        }
     }
 }
 
@@ -328,7 +366,9 @@ impl TxSession for FfiTxSession {
     async fn query(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<Vec<Row>> {
         let p = params_json(params)?;
         let fut = (self.vtable.tx_query)(self.handle, self.tx_id, RString::from(sql), p);
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db tx_query", e))?;
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("db tx_query", e))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db tx_query decode", e))
     }
 
@@ -341,14 +381,18 @@ impl TxSession for FfiTxSession {
 
     async fn commit(&self) -> BridgeResult<()> {
         let fut = (self.vtable.tx_commit)(self.handle, self.tx_id);
-        await_ffi(fut).await.map_err(|e| ffi_err("db tx_commit", e))?;
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("db tx_commit", e))?;
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn rollback(&self) -> BridgeResult<()> {
         let fut = (self.vtable.tx_rollback)(self.handle, self.tx_id);
-        await_ffi(fut).await.map_err(|e| ffi_err("db tx_rollback", e))?;
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("db tx_rollback", e))?;
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -417,7 +461,9 @@ impl BlobBackend for FfiBlobBackend {
 
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
         let fut = (self.vtable.content_type)(self.handle, RString::from(key));
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("blob content_type", e))?;
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob content_type", e))?;
         let s = String::from_utf8(bytes).map_err(|e| ffi_err("blob content_type decode", e))?;
         Ok((!s.is_empty()).then_some(s))
     }
@@ -480,13 +526,19 @@ impl BusBackend for FfiBusBackend {
     async fn connect(&self, cfg: &BrokerCfg) -> BridgeResult<Arc<dyn EventBroker>> {
         let cfg_json = serde_json::to_string(cfg).map_err(|e| ffi_err("bus cfg serialize", e))?;
         let fut = (self.vtable.connect)(RString::from(cfg_json.as_str()));
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("bus connect", e))?;
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("bus connect", e))?;
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| ffi_err("bus connect decode", e))?
             .get("handle")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| ffi_err("bus connect", "missing handle"))?;
-        Ok(Arc::new(FfiEventBroker::new(self.kind, handle, self.vtable)))
+        Ok(Arc::new(FfiEventBroker::new(
+            self.kind,
+            handle,
+            self.vtable,
+        )))
     }
 }
 
@@ -511,7 +563,12 @@ static SUBSCRIBE_GATE: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::n
 
 impl FfiEventBroker {
     pub fn new(kind: &'static str, handle: u64, vtable: &'static EventBrokerVtable) -> Self {
-        Self { kind, handle, vtable, subs: StdMutex::new(Vec::new()) }
+        Self {
+            kind,
+            handle,
+            vtable,
+            subs: StdMutex::new(Vec::new()),
+        }
     }
 }
 
@@ -523,9 +580,14 @@ impl EventBroker for FfiEventBroker {
 
     async fn publish(&self, topic: &str, data: &Value) -> BridgeResult<usize> {
         let frame = json!({ "topic": topic, "data": data }).to_string();
-        let fut =
-            (self.vtable.publish)(self.handle, RString::from(topic), RString::from(frame.as_str()));
-        await_ffi(fut).await.map_err(|e| ffi_err("bus publish", e))?;
+        let fut = (self.vtable.publish)(
+            self.handle,
+            RString::from(topic),
+            RString::from(frame.as_str()),
+        );
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("bus publish", e))?;
         Ok(0) // 远程 broker 经网络投递，本地 fan-out 恒 0（语义对齐 core Kafka/Rabbit）。
     }
 
@@ -687,12 +749,18 @@ mod adapter_tests {
 
     fn ready(r: Result<Vec<u8>, String>) -> FfiFuture {
         let state = Box::into_raw(Box::new(ReadyState { result: Some(r) }));
-        FfiFuture { state: state.cast(), poll: mock_poll, take: mock_take, free: mock_free }
+        FfiFuture {
+            state: state.cast(),
+            poll: mock_poll,
+            take: mock_take,
+            free: mock_free,
+        }
     }
 
     /// 共享 statics 串行化（并行测试互踩 FAIL_NEXT/LAST_SEARCH）。
     static T_LOCK: Mutex<()> = Mutex::new(());
-    static LAST_SEARCH: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static LAST_SEARCH: Mutex<(u64, String, String)> =
+        Mutex::new((0, String::new(), String::new()));
     static CLOSED: AtomicBool = AtomicBool::new(false);
     static FAIL_NEXT: AtomicBool = AtomicBool::new(false);
     static FREED: AtomicU64 = AtomicU64::new(0);
@@ -758,7 +826,10 @@ mod adapter_tests {
     async fn index_and_delete_roundtrip() {
         let _g = T_LOCK.lock().unwrap();
         let b = FfiEsBackend::new(1, mock_vtable());
-        let v = b.index_doc("i", "7", serde_json::json!({"a":1})).await.unwrap();
+        let v = b
+            .index_doc("i", "7", serde_json::json!({"a":1}))
+            .await
+            .unwrap();
         assert_eq!(v["result"], "created");
         let v = b.delete_doc("i", "7").await.unwrap();
         assert_eq!(v["result"], "deleted");
@@ -782,7 +853,10 @@ mod adapter_tests {
         let before = FREED.load(Ordering::SeqCst);
         {
             let _g = FfiGuard(Some(FfiFuture {
-                state: Box::into_raw(Box::new(ReadyState { result: Some(Ok(vec![])) })).cast(),
+                state: Box::into_raw(Box::new(ReadyState {
+                    result: Some(Ok(vec![])),
+                }))
+                .cast(),
                 poll: mock_poll,
                 take: mock_take,
                 free: counting_free,
@@ -873,10 +947,16 @@ mod adapter_tests {
         let be = FfiDbBackend::new("db-mysql", mock_db_vtable());
         assert_eq!(be.name(), "db-mysql");
         assert_eq!(be.schemes(), vec!["mysql://", "mariadb://"]);
-        let da = be.connect("mysql://u:p@h/d", std::path::Path::new("/tmp")).await.unwrap();
+        let da = be
+            .connect("mysql://u:p@h/d", std::path::Path::new("/tmp"))
+            .await
+            .unwrap();
         assert_eq!(*DB_CONNECTED_CFG.lock().unwrap(), "mysql://u:p@h/d");
         assert_eq!(da.dialect(), Dialect::Postgres);
-        assert_eq!(da.query_with_params("select 1", &[]).await.unwrap()[0]["c"], serde_json::json!(1));
+        assert_eq!(
+            da.query_with_params("select 1", &[]).await.unwrap()[0]["c"],
+            serde_json::json!(1)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -884,7 +964,10 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let da = FfiDataAccessor::new(42, mock_db_vtable());
         let rows = da
-            .query_with_params("select ? as c", &[serde_json::json!(1), serde_json::json!("x")])
+            .query_with_params(
+                "select ? as c",
+                &[serde_json::json!(1), serde_json::json!("x")],
+            )
             .await
             .unwrap();
         assert_eq!(rows[0]["c"], serde_json::json!(1));
@@ -945,7 +1028,12 @@ mod adapter_tests {
     extern "C" fn mock_blob_connect(_name: RString, _cfg: RString) -> FfiFuture {
         ready(Ok(br#"{"handle":42}"#.to_vec()))
     }
-    extern "C" fn mock_blob_put(handle: u64, key: RString, bytes: RBytes, ct: RString) -> FfiFuture {
+    extern "C" fn mock_blob_put(
+        handle: u64,
+        key: RString,
+        bytes: RBytes,
+        ct: RString,
+    ) -> FfiFuture {
         let mut b = Vec::with_capacity(bytes.len());
         for x in &bytes {
             b.push(*x);
@@ -995,7 +1083,10 @@ mod adapter_tests {
         let b = FfiBlobBackend::new(42, mock_blob_vtable());
         b.put("a/b.png", b"hello", Some("image/png")).await.unwrap();
         let (h, key, bytes, ct) = BLOB_PUT.lock().unwrap().clone();
-        assert_eq!((h, key.as_str(), bytes.as_slice()), (42, "a/b.png", &b"hello"[..]));
+        assert_eq!(
+            (h, key.as_str(), bytes.as_slice()),
+            (42, "a/b.png", &b"hello"[..])
+        );
         assert_eq!(ct, "image/png");
         // None ct → 空串过线
         b.put("x", b"y", None).await.unwrap();
@@ -1028,7 +1119,10 @@ mod adapter_tests {
         assert_eq!(b.url("k").await.unwrap(), "https://b.s3/presign");
         let (h, key) = BLOB_URL.lock().unwrap().clone();
         assert_eq!((h, key.as_str()), (42, "k"));
-        assert_eq!(b.content_type("k").await.unwrap(), Some("image/png".to_string()));
+        assert_eq!(
+            b.content_type("k").await.unwrap(),
+            Some("image/png".to_string())
+        );
         // 空串 → None
         BLOB_CT_EMPTY.store(true, AtomicOrdering::SeqCst);
         assert_eq!(b.content_type("k2").await.unwrap(), None);
@@ -1038,7 +1132,9 @@ mod adapter_tests {
     async fn blob_serve_redirects_to_url() {
         let _g = T_LOCK.lock().unwrap();
         let b = FfiBlobBackend::new(42, mock_blob_vtable());
-        assert!(matches!(b.serve("k").await.unwrap(), BlobServed::Redirect(u) if u == "https://b.s3/presign"));
+        assert!(
+            matches!(b.serve("k").await.unwrap(), BlobServed::Redirect(u) if u == "https://b.s3/presign")
+        );
     }
 
     #[test]
@@ -1055,7 +1151,8 @@ mod adapter_tests {
     use crate::config::BrokerCfg;
 
     static BUS_CONNECTED_CFG: Mutex<String> = Mutex::new(String::new());
-    static BUS_PUBLISHED: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static BUS_PUBLISHED: Mutex<(u64, String, String)> =
+        Mutex::new((0, String::new(), String::new()));
     static BUS_SUBSCRIBES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     static BUS_CLOSED: AtomicU64 = AtomicU64::new(0);
     /// TDD 开关：置位时 mock_bus_subscribe 先记录（模拟消费循环已起）再返回 Err，
@@ -1072,7 +1169,10 @@ mod adapter_tests {
     }
     extern "C" fn mock_bus_subscribe(handle: u64, topic: RString) -> FfiFuture {
         // 先记录（模拟插件侧已起消费循环），再按开关返回失败。
-        BUS_SUBSCRIBES.lock().unwrap().push((handle, topic[..].to_string()));
+        BUS_SUBSCRIBES
+            .lock()
+            .unwrap()
+            .push((handle, topic[..].to_string()));
         if BUS_SUBSCRIBE_FAIL.swap(false, AtomicOrdering::SeqCst) {
             return ready(Err("injected subscribe failure".into()));
         }
@@ -1100,7 +1200,11 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let be = FfiBusBackend::new("bus-kafka", mock_bus_vtable());
         assert_eq!(be.kind(), "kafka");
-        let cfg = BrokerCfg { kind: "kafka".into(), brokers: vec!["b1:9092".into()], ..Default::default() };
+        let cfg = BrokerCfg {
+            kind: "kafka".into(),
+            brokers: vec!["b1:9092".into()],
+            ..Default::default()
+        };
         let broker = be.connect(&cfg).await.unwrap();
         assert_eq!(broker.kind(), "kafka");
         // 插件收到的 cfg JSON = BrokerCfg 序列化（brokers 数组）。
@@ -1114,7 +1218,10 @@ mod adapter_tests {
     async fn bus_publish_forwards_topic_and_frame_returns_zero() {
         let _g = T_LOCK.lock().unwrap();
         let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
-        let n = broker.publish("news", &serde_json::json!({"a": 1})).await.unwrap();
+        let n = broker
+            .publish("news", &serde_json::json!({"a": 1}))
+            .await
+            .unwrap();
         assert_eq!(n, 0); // 远程 broker 本地 fan-out 恒 0
         let (h, topic, data) = BUS_PUBLISHED.lock().unwrap().clone();
         assert_eq!(h, 42);
@@ -1134,7 +1241,10 @@ mod adapter_tests {
         // vtable.subscribe 只起一次（每 topic 至多一个消费循环）。
         assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 1);
         // 模拟插件消费循环经 host.deliver 上送 → 扇出到本地 tx。
-        host_deliver(RString::from("t"), RString::from(r#"{"topic":"t","data":{"v":42}}"#));
+        host_deliver(
+            RString::from("t"),
+            RString::from(r#"{"topic":"t","data":{"v":42}}"#),
+        );
         let frame = rx.try_recv().unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["data"]["v"], 42);
@@ -1171,7 +1281,10 @@ mod adapter_tests {
         assert!(res.is_err(), "subscribe must propagate vtable error");
         // 无僵尸：回滚后该 topic 不应仍注册，host_deliver 不应扇出到通道。
         host_deliver(RString::from("t"), RString::from(r#"{"x":1}"#));
-        assert!(rx.try_recv().is_err(), "zombie subscription must not deliver");
+        assert!(
+            rx.try_recv().is_err(),
+            "zombie subscription must not deliver"
+        );
         let g = DELIVER_TARGETS.lock().unwrap();
         let empty = match g.get("t") {
             None => true,
@@ -1224,11 +1337,17 @@ mod adapter_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         broker.subscribe("t", tx).await.unwrap();
         // B 侧发布（同一实例）→ vtable.publish 转发（记录）。
-        broker.publish("t", &serde_json::json!({"v": 7})).await.unwrap();
+        broker
+            .publish("t", &serde_json::json!({"v": 7}))
+            .await
+            .unwrap();
         let (h, topic, _) = BUS_PUBLISHED.lock().unwrap().clone();
         assert_eq!((h, topic.as_str()), (42, "t"));
         // 模拟远端回程：插件消费循环经 host.deliver 上送 → A 侧 tx 收到（跨实例仍成立）。
-        host_deliver(RString::from("t"), RString::from(r#"{"topic":"t","data":{"v":7}}"#));
+        host_deliver(
+            RString::from("t"),
+            RString::from(r#"{"topic":"t","data":{"v":7}}"#),
+        );
         let frame = rx.recv().await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["data"]["v"], 7, "{v}");
@@ -1311,10 +1430,18 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let kv = FfiKVStore::new(42, mock_kv_vtable());
         // 500ms → 1s（Redis EXPIRE 不接受 0s——与 InMemoryKV 毫秒语义对齐）。
-        assert!(kv.expire("k", std::time::Duration::from_millis(500)).await.unwrap());
+        assert!(
+            kv.expire("k", std::time::Duration::from_millis(500))
+                .await
+                .unwrap()
+        );
         let (h, key, secs) = KV_EXPIRE.lock().unwrap().clone();
         assert_eq!((h, key.as_str(), secs), (42, "k", 1));
-        assert!(kv.expire("k", std::time::Duration::from_secs(2)).await.unwrap());
+        assert!(
+            kv.expire("k", std::time::Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
         assert_eq!(KV_EXPIRE.lock().unwrap().2, 2);
     }
 

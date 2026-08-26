@@ -19,7 +19,10 @@ impl<T: ?Sized> Default for NamedRegistry<T> {
 
 impl<T: ?Sized> NamedRegistry<T> {
     pub fn new() -> Self {
-        Self { items: HashMap::new(), order: Vec::new() }
+        Self {
+            items: HashMap::new(),
+            order: Vec::new(),
+        }
     }
     /// 重名 → Err（插件 vs 插件、插件 vs 内置均不允许覆盖，spec §2 注册冲突语义）。
     pub fn register(&mut self, name: &str, item: Arc<T>) -> BridgeResult<()> {

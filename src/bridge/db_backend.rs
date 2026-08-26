@@ -60,7 +60,11 @@ impl DbBackendRegistry {
         Ok(())
     }
     /// 无认领 → 未知 scheme 报错（列出已知 scheme 便于排障）。
-    pub async fn connect(&self, dsn: &str, config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
+    pub async fn connect(
+        &self,
+        dsn: &str,
+        config_dir: &Path,
+    ) -> BridgeResult<Arc<dyn DataAccessor>> {
         for b in &self.backends {
             if b.schemes().iter().any(|s| dsn.starts_with(s.as_str())) {
                 return b.connect(dsn, config_dir).await;
@@ -108,7 +112,11 @@ impl DbBackend for MemoryBackend {
 /// （自 oj/src/server_cmd.rs 的 resolve_dsn 提炼，语义逐行对齐。）
 pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String> {
     let rest = dsn.strip_prefix("sqlite://").or_else(|| {
-        if dsn == "sqlite::memory:" { Some("") } else { None }
+        if dsn == "sqlite::memory:" {
+            Some("")
+        } else {
+            None
+        }
     });
     let Some(rest) = rest else {
         return Err(format!("not a sqlite dsn (got '{dsn}')").into());
@@ -120,7 +128,11 @@ pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String
         return Ok(dsn.to_string());
     }
     let p = Path::new(rest);
-    let p: PathBuf = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
+    let p: PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
+    };
     if !p.is_file() {
         std::fs::write(&p, b"").map_err(|e| format!("create db file {}: {e}", p.display()))?;
     }
@@ -154,8 +166,12 @@ mod tests {
     async fn builtin_connects_sqlite_memory_and_memory() {
         let r = DbBackendRegistry::builtin();
         let dir = std::path::Path::new("/tmp");
-        r.connect("sqlite::memory:", dir).await.unwrap_or_else(|e| panic!("{e}"));
-        r.connect("memory://x", dir).await.unwrap_or_else(|e| panic!("{e}"));
+        r.connect("sqlite::memory:", dir)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        r.connect("memory://x", dir)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         // Task 4.1：mysql/postgres 已迁插件，内置只剩 sqlite/memory。
         assert_eq!(r.backend_names(), ["sqlite", "memory"]);
     }
@@ -205,7 +221,13 @@ mod tests {
         // 缺文件建零长空库
         assert!(std::path::Path::new(path).is_file(), "{dsn}");
         // 内存与特殊形式直通
-        assert_eq!(normalize_sqlite_dsn("sqlite::memory:", &t.0).unwrap(), "sqlite::memory:");
-        assert_eq!(normalize_sqlite_dsn("sqlite://", &t.0).unwrap(), "sqlite::memory:");
+        assert_eq!(
+            normalize_sqlite_dsn("sqlite::memory:", &t.0).unwrap(),
+            "sqlite::memory:"
+        );
+        assert_eq!(
+            normalize_sqlite_dsn("sqlite://", &t.0).unwrap(),
+            "sqlite::memory:"
+        );
     }
 }

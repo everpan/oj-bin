@@ -30,11 +30,14 @@ pub fn js_route(
 ) -> axum::Router {
     let file = handler_file.into();
     let make = Arc::new(make_bridge);
-    axum::Router::new().route(path, axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
-        let file = file.clone();
-        let make = make.clone();
-        async move { ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make)) }
-    }))
+    axum::Router::new().route(
+        path,
+        axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
+            let file = file.clone();
+            let make = make.clone();
+            async move { ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make)) }
+        }),
+    )
 }
 
 /// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/WS.ts（优先）/WS.js → GET {base}/<dir>/ws；
@@ -57,7 +60,11 @@ pub fn mirror_routes(
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         // rel 为空 = 根级 WS.ts → {base}/ws（不得拼成 {base}//ws 双斜杠）。
-        let path = if rel.is_empty() { format!("{base}ws") } else { format!("{base}{rel}/ws") };
+        let path = if rel.is_empty() {
+            format!("{base}ws")
+        } else {
+            format!("{base}{rel}/ws")
+        };
         if !seen.insert(path.clone()) {
             continue; // 同目录 WS.ts 与 WS.js 并存：先到者（.ts）胜
         }
@@ -317,8 +324,15 @@ mod tests {
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blobs: None, bus: Some(bus_actor.clone()), ..Default::default() },
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus_actor.clone()),
+                    ..Default::default()
+                },
             )
         });
         let make_bridge = {
@@ -330,13 +344,32 @@ mod tests {
                     Arc::new(InMemoryKV::new()),
                     SchemaRegistry::new(),
                     false,
-                    Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                    Extras { blobs: None, bus: Some(bus.clone()), ..Default::default() },
+                    Some(Arc::new(LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    Extras {
+                        blobs: None,
+                        bus: Some(bus.clone()),
+                        ..Default::default()
+                    },
                 )
             }
         };
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), actor, None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                actor,
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .merge(js_route(
                 "/ws/bus",
                 handler,
                 std::time::Duration::from_secs(1),
@@ -357,14 +390,30 @@ mod tests {
         .await;
         let frame = c.read_text().await;
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v, serde_json::json!({"topic": "news", "data": {"a": 1}}), "{v}");
+        assert_eq!(
+            v,
+            serde_json::json!({"topic": "news", "data": {"a": 1}}),
+            "{v}"
+        );
     }
 
     #[tokio::test]
     async fn ws_echo_roundtrip_on_pinned_thread() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(echo_route()),
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .merge(echo_route()),
         )
         .await;
         let mut c = WsClient::connect(addr, "/ws").await;
@@ -379,7 +428,19 @@ mod tests {
         let handler = t.0.join("WS.js");
         std::fs::write(&handler, r#"json.ok({ pong: true });"#).unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .merge(js_route(
                 "/ws/js",
                 handler.clone(),
                 std::time::Duration::from_secs(1),
@@ -405,9 +466,25 @@ mod tests {
     async fn js_route_ws_send_order_and_close() {
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("WS.js");
-        std::fs::write(&handler, r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#).unwrap();
+        std::fs::write(
+            &handler,
+            r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#,
+        )
+        .unwrap();
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .merge(js_route(
                 "/ws/close",
                 handler,
                 std::time::Duration::from_secs(1),
@@ -424,7 +501,11 @@ mod tests {
         // close 后连接终止：Close 帧或 EOF（不 panic）。
         let mut buf = [0u8; 64];
         let n = c.0.read(&mut buf).await.unwrap();
-        assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes: {:x?}", &buf[..n]);
+        assert!(
+            n == 0 || buf[0] == 0x88,
+            "expected close, got {n} bytes: {:x?}",
+            &buf[..n]
+        );
     }
 
     /// 生产挂载（与 oj server 装配同构）：<root>/<dir>/WS.ts 目录镜像 → GET {base}/<dir>/ws；
@@ -455,8 +536,15 @@ mod tests {
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blobs: None, bus: Some(bus2.clone()), ..Default::default() },
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus2.clone()),
+                    ..Default::default()
+                },
             )
         };
         let addr = spawn(
@@ -472,7 +560,12 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
             )
-            .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
+            .merge(mirror_routes(
+                "/v1/api",
+                &t.0,
+                std::time::Duration::from_secs(2),
+                make,
+            )),
         )
         .await;
 
@@ -487,7 +580,11 @@ mod tests {
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
-        assert_eq!(v, serde_json::json!({"topic": "news", "data": {"a": 1}}), "{v}");
+        assert_eq!(
+            v,
+            serde_json::json!({"topic": "news", "data": {"a": 1}}),
+            "{v}"
+        );
     }
 
     /// 根级 WS.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
@@ -496,10 +593,7 @@ mod tests {
         use crate::actor::JsActor;
         use only_js::bridge::{Extras, SchemaRegistry};
         use std::collections::HashMap;
-        let t = crate::tests::routes(&[(
-            "WS.ts",
-            "json.ok({ root: true });\n",
-        )]);
+        let t = crate::tests::routes(&[("WS.ts", "json.ok({ root: true });\n")]);
         let make = move || {
             Bridge::with_dbs_and_loader(
                 HashMap::new(),
@@ -523,7 +617,12 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
             )
-            .merge(mirror_routes("/v1/api", &t.0, std::time::Duration::from_secs(2), make)),
+            .merge(mirror_routes(
+                "/v1/api",
+                &t.0,
+                std::time::Duration::from_secs(2),
+                make,
+            )),
         )
         .await;
 
@@ -539,7 +638,19 @@ mod tests {
     async fn js_route_missing_handler_closes_quietly() {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
-            app("/v1/api", t.0.clone(), true, crate::tests::build_table(&t.0, true, "/v1/api"), crate::tests::make_actor(t.0.clone(), true), None, None, crate::Pipeline::default(), Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)), Arc::new(std::sync::RwLock::new(None))).merge(js_route(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+            )
+            .merge(js_route(
                 "/ws/missing",
                 t.0.join("nope.js"),
                 std::time::Duration::from_secs(1),
@@ -552,6 +663,10 @@ mod tests {
         // 服务端发 Close 帧（0x88）后关连接：读到 Close 或 EOF 均算干净终止，不 panic。
         let mut buf = [0u8; 64];
         let n = c.0.read(&mut buf).await.unwrap();
-        assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes: {:x?}", &buf[..n]);
+        assert!(
+            n == 0 || buf[0] == 0x88,
+            "expected close, got {n} bytes: {:x?}",
+            &buf[..n]
+        );
     }
 }

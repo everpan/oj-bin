@@ -87,7 +87,9 @@ impl KVStore for InMemoryKV {
 
     async fn incr(&self, key: &str) -> BridgeResult<i64> {
         let mut g = self.mu.write().unwrap();
-        let entry = g.entry(key.to_string()).or_insert_with(|| ("0".into(), None));
+        let entry = g
+            .entry(key.to_string())
+            .or_insert_with(|| ("0".into(), None));
         let n: i64 = entry
             .0
             .parse()
@@ -270,10 +272,7 @@ mod tests {
     async fn default_expire_incr_unsupported() {
         use crate::bridge::Bridge;
         let kv = Arc::new(PlainKV(Default::default()));
-        let b = Bridge::new(
-            Arc::new(InMemoryAccessor::new()),
-            kv as Arc<dyn KVStore>,
-        );
+        let b = Bridge::new(Arc::new(InMemoryAccessor::new()), kv as Arc<dyn KVStore>);
         let cap = b
             .run_with(
                 r#"(async () => {
@@ -285,7 +284,10 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("not supported"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("not supported"),
+            "{v}"
+        );
 
         let cap = b
             .run_with(
@@ -295,6 +297,9 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("not supported"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("not supported"),
+            "{v}"
+        );
     }
 }

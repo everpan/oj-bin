@@ -42,7 +42,10 @@ pub fn cached_transpile(path: &Path) -> Result<String, String> {
     } else {
         raw
     };
-    cache().lock().unwrap().insert(path.to_path_buf(), (mtime, out.clone()));
+    cache()
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), (mtime, out.clone()));
     Ok(out)
 }
 
@@ -144,10 +147,13 @@ mod tests {
     fn minify_is_single_line_and_strips_comments() {
         let src = "// 注释\nimport { v } from \"./a.js\";\nfunction get() { json.ok({ v }); }\nget.route = \"{id}\";\nexport default { get };\n//# sourceMappingURL=data:application/json;base64,AAA\n";
         let out = minify_js(Path::new("m.js"), src).unwrap();
-        assert!(!out.trim_end().contains('\n'), "{out}");   // 单行（允尾换行）
-        assert!(!out.contains("//"), "{out}");              // 注释全剥（含 sourcemap 行）
-        assert!(out.contains("from\"./a.js\""), "{out}");   // 语句/空白压缩
-        assert!(out.contains("json.ok({v})") || out.contains("json.ok({ v })"), "{out}");
+        assert!(!out.trim_end().contains('\n'), "{out}"); // 单行（允尾换行）
+        assert!(!out.contains("//"), "{out}"); // 注释全剥（含 sourcemap 行）
+        assert!(out.contains("from\"./a.js\""), "{out}"); // 语句/空白压缩
+        assert!(
+            out.contains("json.ok({v})") || out.contains("json.ok({ v })"),
+            "{out}"
+        );
         // 同输入同输出（构建确定性依赖）
         assert_eq!(minify_js(Path::new("m.js"), src).unwrap(), out);
     }
@@ -157,8 +163,11 @@ mod tests {
         let _g = TRANSPILE_TEST_LOCK.lock().unwrap();
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir();
-        let p = dir.join(format!("oj-tr-{}-{}.ts", std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let p = dir.join(format!(
+            "oj-tr-{}-{}.ts",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::write(&p, "const a: number = 1;\n").unwrap();
         let before = transpile_hits();
         let s1 = cached_transpile(&p).unwrap();

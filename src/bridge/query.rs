@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
-use sea_query::{Alias, Expr, ExprTrait, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv};
+use sea_query::{
+    Alias, Expr, ExprTrait, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -81,11 +83,7 @@ const LIMIT_DEFAULT: u32 = 100;
 const LIMIT_MAX: u32 = 1000;
 
 fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsErrorBox> {
-    Ok(state
-        .borrow()
-        .borrow::<Arc<StableState>>()
-        .registry
-        .clone())
+    Ok(state.borrow().borrow::<Arc<StableState>>().registry.clone())
 }
 
 fn to_qv(v: &Value) -> Qv {
@@ -112,10 +110,18 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
     Ok(match op {
         Op::Eq => c.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
         Op::Ne => c.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
-        Op::Gt => c.gt(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("gt needs value"))?)),
-        Op::Gte => c.gte(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("gte needs value"))?)),
-        Op::Lt => c.lt(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("lt needs value"))?)),
-        Op::Lte => c.lte(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("lte needs value"))?)),
+        Op::Gt => c.gt(rhs(val
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("gt needs value"))?)),
+        Op::Gte => c.gte(rhs(val
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("gte needs value"))?)),
+        Op::Lt => c.lt(rhs(val
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("lt needs value"))?)),
+        Op::Lte => c.lte(rhs(val
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("lte needs value"))?)),
         Op::In => {
             let arr = val
                 .as_ref()
@@ -153,13 +159,20 @@ pub async fn op_db_query_build(
 
     // 列白名单校验（空 = SELECT *）。
     let cols: Vec<Alias> = if req.columns.is_empty() {
-        table.columns.keys().map(|c| Alias::new(c.clone())).collect()
+        table
+            .columns
+            .keys()
+            .map(|c| Alias::new(c.clone()))
+            .collect()
     } else {
         req.columns
             .iter()
             .map(|c| {
                 if !table.has_column(c) {
-                    Err(JsErrorBox::generic(format!("unknown column '{c}' on '{}'", req.table)))
+                    Err(JsErrorBox::generic(format!(
+                        "unknown column '{c}' on '{}'",
+                        req.table
+                    )))
                 } else {
                     Ok(Alias::new(c.clone()))
                 }
@@ -223,10 +236,7 @@ pub async fn op_db_query_build(
 }
 
 /// 按方言出 SQL（sea-query QueryBuilder 非 dyn 兼容，match 分发三实现）。
-fn build_select(
-    d: Dialect,
-    q: &sea_query::SelectStatement,
-) -> (String, sea_query::Values) {
+fn build_select(d: Dialect, q: &sea_query::SelectStatement) -> (String, sea_query::Values) {
     match d {
         Dialect::Sqlite => q.build(SqliteQueryBuilder),
         Dialect::MySql => q.build(sea_query::MysqlQueryBuilder),
@@ -300,8 +310,7 @@ mod tests {
     fn query_req_defaults_to_default_db() {
         let req: QueryReq = serde_json::from_str(r#"{"table":"user"}"#).unwrap();
         assert_eq!(req.db, "default");
-        let req: QueryReq =
-            serde_json::from_str(r#"{"db":"other","table":"user"}"#).unwrap();
+        let req: QueryReq = serde_json::from_str(r#"{"db":"other","table":"user"}"#).unwrap();
         assert_eq!(req.db, "other");
     }
 
@@ -352,12 +361,30 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn comparison_ops_filter_rows() {
         let b = seeded_bridge().await;
-        assert_eq!(count_where(&b, r#"{field:"age",op:"gt",value:15}"#).await, 3);
-        assert_eq!(count_where(&b, r#"{field:"age",op:"gte",value:20}"#).await, 3);
-        assert_eq!(count_where(&b, r#"{field:"age",op:"lt",value:20}"#).await, 1);
-        assert_eq!(count_where(&b, r#"{field:"age",op:"lte",value:10}"#).await, 1);
-        assert_eq!(count_where(&b, r#"{field:"age",op:"ne",value:20}"#).await, 3);
-        assert_eq!(count_where(&b, r#"{field:"age",op:"eq",value:10}"#).await, 1);
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"gt",value:15}"#).await,
+            3
+        );
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"gte",value:20}"#).await,
+            3
+        );
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"lt",value:20}"#).await,
+            1
+        );
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"lte",value:10}"#).await,
+            1
+        );
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"ne",value:20}"#).await,
+            3
+        );
+        assert_eq!(
+            count_where(&b, r#"{field:"age",op:"eq",value:10}"#).await,
+            1
+        );
         assert_eq!(
             count_where(&b, r#"{field:"age",op:"in",value:[10,30]}"#).await,
             2
@@ -373,7 +400,10 @@ mod tests {
             3
         );
         // 布尔值走 to_qv 的 bool 分支
-        assert_eq!(count_where(&b, r#"{field:"ok",op:"eq",value:true}"#).await, 2);
+        assert_eq!(
+            count_where(&b, r#"{field:"ok",op:"eq",value:true}"#).await,
+            2
+        );
         // 对象值走 to_qv 的 other 分支（sqlite 接受其字符串化）
         assert!(count_where(&b, r#"{field:"name",op:"eq",value:{a:1}}"#).await <= 4);
     }
@@ -404,7 +434,10 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400);
-        assert!(v["msg"].as_str().unwrap().contains("unknown column 'nope'"), "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("unknown column 'nope'"),
+            "{v}"
+        );
 
         let cap = b
             .run(r#"db.table("t").select(["name"]).where({field:"nope",op:"eq",value:1}).all().then(r => json.ok({})).catch(e => json.fail(400, String(e)));"#)
@@ -412,6 +445,12 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400);
-        assert!(v["msg"].as_str().unwrap().contains("unknown column 'nope' in where"), "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("unknown column 'nope' in where"),
+            "{v}"
+        );
     }
 }

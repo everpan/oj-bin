@@ -36,7 +36,10 @@ impl SqlxAccessor {
             .connect(url)
             .await
             .map_err(|e| format!("sqlx connect: {e}"))?;
-        Ok(Self { pool, dialect: dialect_of(url) })
+        Ok(Self {
+            pool,
+            dialect: dialect_of(url),
+        })
     }
 
     /// 便捷构造 Arc 句柄。
@@ -89,7 +92,9 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(ordinal) {
         return Some(match v {
-            Some(f) => serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null),
+            Some(f) => serde_json::Number::from_f64(f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             None => Value::Null,
         });
     }
@@ -181,7 +186,9 @@ impl DataAccessor for SqlxAccessor {
             .begin()
             .await
             .map_err(|e| format!("sqlx tx begin: {e}"))?;
-        Ok(Box::new(SqlxTx { tx: tokio::sync::Mutex::new(Some(tx)) }))
+        Ok(Box::new(SqlxTx {
+            tx: tokio::sync::Mutex::new(Some(tx)),
+        }))
     }
 
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
@@ -224,26 +231,32 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tx_commit_and_rollback_roundtrip() {
-        let db = SqlxAccessor::arc("sqlite::memory:")
-            .await
-            .expect("connect");
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
         db.exec_with_params("create table t (id integer primary key, v text)", &[])
             .await
             .unwrap();
         // commit 路径
         let tx = db.begin().await.unwrap();
-        tx.exec("insert into t (v) values (?)", &[json!("a")]).await.unwrap();
+        tx.exec("insert into t (v) values (?)", &[json!("a")])
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(
-            db.query_with_params("select count(*) c from t", &[]).await.unwrap()[0]["c"],
+            db.query_with_params("select count(*) c from t", &[])
+                .await
+                .unwrap()[0]["c"],
             json!(1)
         );
         // rollback 路径
         let tx = db.begin().await.unwrap();
-        tx.exec("insert into t (v) values (?)", &[json!("b")]).await.unwrap();
+        tx.exec("insert into t (v) values (?)", &[json!("b")])
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
         assert_eq!(
-            db.query_with_params("select count(*) c from t", &[]).await.unwrap()[0]["c"],
+            db.query_with_params("select count(*) c from t", &[])
+                .await
+                .unwrap()[0]["c"],
             json!(1)
         );
         // 已完结的 tx 再用 → 错误（"tx finished"）
@@ -315,9 +328,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tx_query_and_typed_columns() {
-        let db = SqlxAccessor::arc("sqlite::memory:")
-            .await
-            .expect("connect");
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
         db.exec_with_params(
             "create table q (id integer primary key, b integer, f real, blobf blob, t text)",
             &[],
@@ -341,10 +352,7 @@ mod tests {
         assert_eq!(rows[0]["t"], json!("hi"));
 
         // bind_value 的 other 分支：绑定对象（Any 接受其字符串化）
-        let r = tx
-            .query("select ? as v", &[json!({"x": 1})])
-            .await
-            .unwrap();
+        let r = tx.query("select ? as v", &[json!({"x": 1})]).await.unwrap();
         assert_eq!(r[0]["v"], json!("{\"x\":1}"));
 
         tx.commit().await.unwrap();
@@ -354,25 +362,37 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bad_sql_errors_and_tx_exec() {
-        let db = SqlxAccessor::arc("sqlite::memory:")
-            .await
-            .expect("connect");
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
         // query_with_params 错误路径
-        assert!(db.query_with_params("select * from nope", &[]).await.is_err());
-        assert!(db.exec_with_params("insert into nope (x) values (1)", &[]).await.is_err());
+        assert!(
+            db.query_with_params("select * from nope", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            db.exec_with_params("insert into nope (x) values (1)", &[])
+                .await
+                .is_err()
+        );
 
         db.exec_with_params("create table e (id integer primary key, v text)", &[])
             .await
             .unwrap();
         let tx = db.begin().await.unwrap();
-        assert!(tx.exec("insert into e (v) values (?)", &[json!("a")]).await.is_ok());
+        assert!(
+            tx.exec("insert into e (v) values (?)", &[json!("a")])
+                .await
+                .is_ok()
+        );
         // 事务内查询错误路径
         assert!(tx.query("select * from missing", &[]).await.is_err());
         tx.commit().await.unwrap();
 
         // begin 后 rollback 再查不到
         let tx = db.begin().await.unwrap();
-        tx.exec("insert into e (v) values (?)", &[json!("b")]).await.unwrap();
+        tx.exec("insert into e (v) values (?)", &[json!("b")])
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
         let n = db
             .query_with_params("select count(*) c from e", &[])

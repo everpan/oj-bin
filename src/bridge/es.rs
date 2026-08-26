@@ -19,14 +19,25 @@ use super::StableState;
 /// 实现本 trait；core 不再有内置 HTTP 后端）。
 #[async_trait::async_trait]
 pub trait EsBackend: Send + Sync {
-    async fn search(&self, index: &str, dsl: serde_json::Value) -> super::BridgeResult<serde_json::Value>;
-    async fn index_doc(&self, index: &str, id: &str, doc: serde_json::Value) -> super::BridgeResult<serde_json::Value>;
+    async fn search(
+        &self,
+        index: &str,
+        dsl: serde_json::Value,
+    ) -> super::BridgeResult<serde_json::Value>;
+    async fn index_doc(
+        &self,
+        index: &str,
+        id: &str,
+        doc: serde_json::Value,
+    ) -> super::BridgeResult<serde_json::Value>;
     async fn delete_doc(&self, index: &str, id: &str) -> super::BridgeResult<serde_json::Value>;
 }
 
 /// index/id 白名单：字母数字下划线连字符（防路径注入）。
 fn valid_ident(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn backend(state: &OpState) -> Result<Arc<dyn EsBackend>, JsErrorBox> {
@@ -47,9 +58,13 @@ pub async fn op_es_search(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
-        return Err(JsErrorBox::generic(format!("es search: invalid index {index:?}")));
+        return Err(JsErrorBox::generic(format!(
+            "es search: invalid index {index:?}"
+        )));
     }
-    es.search(&index, dsl).await.map_err(|e| JsErrorBox::generic(e.to_string()))
+    es.search(&index, dsl)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// es.index(index, id, doc)：PUT `/{index}/_doc/{id}?refresh=true`（实时可查）。
@@ -63,12 +78,16 @@ pub async fn op_es_index(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
-        return Err(JsErrorBox::generic(format!("es index: invalid index {index:?}")));
+        return Err(JsErrorBox::generic(format!(
+            "es index: invalid index {index:?}"
+        )));
     }
     if !valid_ident(&id) {
         return Err(JsErrorBox::generic(format!("es index: invalid id {id:?}")));
     }
-    es.index_doc(&index, &id, doc).await.map_err(|e| JsErrorBox::generic(e.to_string()))
+    es.index_doc(&index, &id, doc)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// es.del(index, id)：DELETE `/{index}/_doc/{id}?refresh=true`（幂等：缺失返回 404 体）。
@@ -81,18 +100,24 @@ pub async fn op_es_del(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let es = backend(&state.borrow())?;
     if !valid_ident(&index) {
-        return Err(JsErrorBox::generic(format!("es del: invalid index {index:?}")));
+        return Err(JsErrorBox::generic(format!(
+            "es del: invalid index {index:?}"
+        )));
     }
     if !valid_ident(&id) {
         return Err(JsErrorBox::generic(format!("es del: invalid id {id:?}")));
     }
-    es.delete_doc(&index, &id).await.map_err(|e| JsErrorBox::generic(e.to_string()))
+    es.delete_doc(&index, &id)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry};
+    use crate::bridge::{
+        Bridge, Extras, InMemoryAccessor, InMemoryKV, RequestInfo, SchemaRegistry,
+    };
     use serde_json::Value;
 
     #[test]
@@ -113,7 +138,12 @@ mod tests {
         async fn search(&self, _: &str, _: Value) -> crate::bridge::BridgeResult<Value> {
             Err("must not call search".into())
         }
-        async fn index_doc(&self, _: &str, _: &str, _: Value) -> crate::bridge::BridgeResult<Value> {
+        async fn index_doc(
+            &self,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> crate::bridge::BridgeResult<Value> {
             Err("must not call index_doc".into())
         }
         async fn delete_doc(&self, _: &str, _: &str) -> crate::bridge::BridgeResult<Value> {
@@ -124,7 +154,10 @@ mod tests {
     /// 未配置 → "es not configured"；配置但非法 index/id → 校验拒绝（不发后端请求）。
     #[tokio::test(flavor = "current_thread")]
     async fn es_ops_error_when_unconfigured_or_invalid() {
-        let b = Bridge::new(Arc::new(InMemoryAccessor::new()), Arc::new(InMemoryKV::new()));
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
         let cap = b
             .run_with(
                 r#"(async () => { await es.search("idx", { q: 1 }); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
@@ -133,7 +166,13 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("es not configured"), "{v}");
+        assert!(
+            v["data"]["err"]
+                .as_str()
+                .unwrap()
+                .contains("es not configured"),
+            "{v}"
+        );
 
         // 配置（MustNotCall 后端）——非法 index/id 在触达后端前被拒。
         let b2 = Bridge::with_dbs_and_loader(
@@ -142,7 +181,10 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { es: Some(Arc::new(MustNotCall)), ..Default::default() },
+            Extras {
+                es: Some(Arc::new(MustNotCall)),
+                ..Default::default()
+            },
         );
         let cap = b2
             .run_with(
@@ -152,7 +194,10 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("invalid index"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("invalid index"),
+            "{v}"
+        );
 
         // 非法 id 同被拒（index 路径）。
         let cap = b2
@@ -163,7 +208,10 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("invalid id"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("invalid id"),
+            "{v}"
+        );
     }
 
     /// op 层经 EsBackend trait 分发：Stub 实现即生效（不触网）。
@@ -175,7 +223,12 @@ mod tests {
             async fn search(&self, index: &str, _dsl: Value) -> crate::bridge::BridgeResult<Value> {
                 Ok(serde_json::json!({"stub": index}))
             }
-            async fn index_doc(&self, _: &str, _: &str, _: Value) -> crate::bridge::BridgeResult<Value> {
+            async fn index_doc(
+                &self,
+                _: &str,
+                _: &str,
+                _: Value,
+            ) -> crate::bridge::BridgeResult<Value> {
                 unreachable!()
             }
             async fn delete_doc(&self, _: &str, _: &str) -> crate::bridge::BridgeResult<Value> {
@@ -188,7 +241,10 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { es: Some(Arc::new(Stub)), ..Default::default() },
+            Extras {
+                es: Some(Arc::new(Stub)),
+                ..Default::default()
+            },
         );
         let cap = b
             .run_with(

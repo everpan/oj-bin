@@ -21,17 +21,17 @@
 //!
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
+mod accessor_sqlx;
+pub mod blob;
+pub mod broker;
+mod bus;
+pub mod bus_backend;
 mod db;
 pub mod db_backend;
 mod envelope;
 mod es;
 mod fetch;
 pub(crate) mod ffi;
-mod accessor_sqlx;
-mod bus;
-pub mod bus_backend;
-pub mod blob;
-pub mod broker;
 mod http;
 mod inspector;
 mod json;
@@ -48,20 +48,20 @@ mod runtime;
 pub mod transpile;
 mod ws;
 
-pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
 pub use bus::{Bus, EventBroker};
-pub use es::EsBackend;
+pub use bus_backend::{BusBackend, BusBackendRegistry};
+pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
+pub use db_backend::{DbBackend, DbBackendRegistry};
 pub use envelope::{fail, ok, status_code};
+pub use es::EsBackend;
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
-pub use plugin_loader::PluginInfo;
-pub use bus_backend::{BusBackend, BusBackendRegistry};
-pub use db_backend::{DbBackend, DbBackendRegistry};
 pub use named_registry::NamedRegistry;
+pub use plugin_loader::PluginInfo;
 pub use registry::SchemaRegistry;
 
 use std::cell::RefCell;
@@ -69,8 +69,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::{JsRuntime, OpState, op2};
 use deno_core::error::CoreError;
+use deno_core::{JsRuntime, OpState, op2};
 
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
 pub type BridgeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -273,7 +273,9 @@ impl Bridge {
                 .unwrap_or_default(),
             registry: Arc::new(registry),
             loader,
-            blobs: extras.blobs.unwrap_or_else(|| Arc::new(blob::BlobRegistry::new())),
+            blobs: extras
+                .blobs
+                .unwrap_or_else(|| Arc::new(blob::BlobRegistry::new())),
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
             es: extras.es,
             plugins: extras.plugins,
@@ -422,7 +424,11 @@ impl Bridge {
         let capture = Self::read_capture(&rt);
         Self::finalize_tx(&rt).await;
         self.pool.checkin(rt);
-        Ok(WsOutcome { capture, sends, close })
+        Ok(WsOutcome {
+            capture,
+            sends,
+            close,
+        })
     }
 
     /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
@@ -510,7 +516,9 @@ impl Bridge {
         static DRV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = DRV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/driver/{n}.js"))
-            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
+            .map_err(|e| {
+            RunError::Core(CoreError::from(std::io::Error::other(e.to_string())))
+        })?;
         let mut rt = self.checkout_armed(req, timeout);
         // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
         // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
@@ -519,7 +527,8 @@ impl Bridge {
         let result: Result<(), CoreError> = async {
             let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
             let eval = rt.mod_evaluate(id);
-            rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
+            rt.run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await?;
             eval.await?;
             Ok(())
         }
@@ -598,7 +607,10 @@ mod tests {
         let cap = b
             .run_with(
                 r#"json.ok({ t: http.tenantId === undefined ? null : http.tenantId });"#,
-                RequestInfo { tenant_id: Some("t-9".into()), ..Default::default() },
+                RequestInfo {
+                    tenant_id: Some("t-9".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -631,7 +643,10 @@ mod tests {
             SchemaRegistry::new(),
             false,
             None,
-            Extras { blobs: Some(crate::bridge::blob::registry_with_default(Arc::new(local))), ..Default::default() },
+            Extras {
+                blobs: Some(crate::bridge::blob::registry_with_default(Arc::new(local))),
+                ..Default::default()
+            },
         );
         let cap = b
             .run_with(
@@ -778,7 +793,11 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert_eq!(v["data"], json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}), "{v}");
+        assert_eq!(
+            v["data"],
+            json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}),
+            "{v}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -846,7 +865,10 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("WebSocket"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("WebSocket"),
+            "{v}"
+        );
     }
 
     /// bus.kind()：进程内总线返回 "local"（分布式实现经 feature 启用）。
@@ -891,7 +913,11 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert_eq!(v["data"], json!({"name": "a.png", "ct": "image/png", "size": 3, "n": 3, "b0": 1}), "{v}");
+        assert_eq!(
+            v["data"],
+            json!({"name": "a.png", "ct": "image/png", "size": 3, "n": 3, "b0": 1}),
+            "{v}"
+        );
         // 无文件时取越界索引 → 报错
         let cap = b
             .run_with(
@@ -901,22 +927,29 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["err"].as_str().unwrap().contains("no such file"), "{v}");
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("no such file"),
+            "{v}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn tx_commit_visible_and_throw_rolls_back() {
-        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
         db.exec_with_params("create table t (id integer primary key, v text)", &[])
             .await
             .unwrap();
         let b = Bridge::new(db, Arc::new(InMemoryKV::new()));
         // 提交可见
         let cap = b
-            .run(r#"db.tx(async (tx) => { await tx.exec("insert into t (v) values (?)", ["x"]); })
+            .run(
+                r#"db.tx(async (tx) => { await tx.exec("insert into t (v) values (?)", ["x"]); })
                 .then(() => db.query("select count(*) c from t"))
                 .then((r) => json.ok(r[0]))
-                .catch((e) => json.fail(500, String(e)));"#)
+                .catch((e) => json.fail(500, String(e)));"#,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
@@ -933,20 +966,30 @@ mod tests {
         assert!(v["data"]["err"].as_str().unwrap().contains("boom"), "{v}");
         // 嵌套 begin 报错
         let cap = b
-            .run(r#"db.tx(async () => { await db.tx(async () => {}); })
+            .run(
+                r#"db.tx(async () => { await db.tx(async () => {}); })
                 .then(() => json.fail(500, "nested should fail"))
-                .catch((e) => json.ok({ msg: String(e) }));"#)
+                .catch((e) => json.ok({ msg: String(e) }));"#,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["msg"].as_str().unwrap().contains("already active"), "{v}");
+        assert!(
+            v["data"]["msg"]
+                .as_str()
+                .unwrap()
+                .contains("already active"),
+            "{v}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn builder_in_tx_shares_connection_and_rolls_back() {
         // 构造器（SELECT-only）在 tx 内必须走同一事务连接：能读到未提交行；
         // 回滚后行不可见。（sqlite 单连接池下，若 builder 误走 pool 会死锁到超时。）
-        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
         db.exec_with_params("create table t (id integer primary key, v text)", &[])
             .await
             .unwrap();
@@ -962,7 +1005,13 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["data"]["msg"].as_str().unwrap().contains("force rollback: 1"), "{v}");
+        assert!(
+            v["data"]["msg"]
+                .as_str()
+                .unwrap()
+                .contains("force rollback: 1"),
+            "{v}"
+        );
         assert_eq!(v["data"]["c"], 0, "z must be rolled back: {v}");
     }
 
@@ -989,7 +1038,11 @@ mod tests {
 
         // 第二帧：sends/close 不串号（ReqState 重置）。
         let o2 = b
-            .run_ws(r#"json.ok({});"#, RequestInfo::default(), std::time::Duration::from_secs(1))
+            .run_ws(
+                r#"json.ok({});"#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
             .await
             .unwrap();
         assert!(o2.sends.is_empty());
@@ -1035,10 +1088,19 @@ mod tests {
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         for (rel, content) in [
-            ("node_modules/cjspkg/package.json", r#"{"name":"cjspkg","main":"main.js"}"#),
+            (
+                "node_modules/cjspkg/package.json",
+                r#"{"name":"cjspkg","main":"main.js"}"#,
+            ),
             // 嵌套 require：dep 经 __ojRequire 的 resolved.path 再解析。
-            ("node_modules/cjspkg/main.js", "module.exports = { n: 1, dep: require(\"cjspkg-dep\").d };\n"),
-            ("node_modules/cjspkg-dep/index.js", "module.exports = { d: 2 };\n"),
+            (
+                "node_modules/cjspkg/main.js",
+                "module.exports = { n: 1, dep: require(\"cjspkg-dep\").d };\n",
+            ),
+            (
+                "node_modules/cjspkg-dep/index.js",
+                "module.exports = { d: 2 };\n",
+            ),
         ] {
             let p = root.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1049,7 +1111,10 @@ mod tests {
             dbs: HashMap::new(),
             client: Default::default(),
             registry: Arc::new(SchemaRegistry::new()),
-            loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
+            loader: Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: false,
+            })),
             blobs: Arc::new(blob::BlobRegistry::new()),
             bus: Arc::new(bus::Bus::new()),
             es: None,
@@ -1061,12 +1126,13 @@ mod tests {
         let src = format!(
             r#"const c = __ojRequire("cjspkg", {referrer:?}); json.ok({{ n: c.n, dep: c.dep }});"#
         );
-        runtime::run_to_completion(&mut rt, "handler.js", src).await.unwrap();
+        runtime::run_to_completion(&mut rt, "handler.js", src)
+            .await
+            .unwrap();
         let v: Value = {
             let op_state = runtime::op_state(&rt);
             let g = op_state.borrow();
-            serde_json::from_slice(&g.borrow::<ReqState>().response.clone().unwrap())
-                .unwrap()
+            serde_json::from_slice(&g.borrow::<ReqState>().response.clone().unwrap()).unwrap()
         };
         pool.checkin(rt);
         let _ = std::fs::remove_dir_all(&root);
@@ -1095,7 +1161,10 @@ mod tests {
             Arc::new(InMemoryKV::new()),
             SchemaRegistry::new(),
             false,
-            Some(Arc::new(LoaderShared { project_root: root.to_path_buf(), ts: true })),
+            Some(Arc::new(LoaderShared {
+                project_root: root.to_path_buf(),
+                ts: true,
+            })),
             Extras::default(),
         )
     }
@@ -1125,7 +1194,12 @@ mod tests {
         ]);
         let b = module_bridge(&root);
         let cap = b
-            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .unwrap();
         assert_eq!(cap.status, 200);
@@ -1139,7 +1213,12 @@ mod tests {
         let (root, api) = mod_fx(&[("u/f/api.ts", "export default { get() { json.ok({}); } };\n")]);
         let b = module_bridge(&root);
         let cap = b
-            .run_module(&api, "del", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .run_module(
+                &api,
+                "del",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .unwrap();
         assert_eq!(cap.status, 405, "{}", String::from_utf8_lossy(&cap.body));
@@ -1149,10 +1228,18 @@ mod tests {
     async fn infinite_module_handler_times_out_and_bridge_survives() {
         let _t = transpile_serial();
         // R1 spike：ESM/TLA 模型下 KillSwitch 复验。
-        let (root, api) = mod_fx(&[("u/f/api.ts", "export default { get() { while (true) {} } };\n")]);
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "export default { get() { while (true) {} } };\n",
+        )]);
         let b = module_bridge(&root);
         let r = b
-            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_millis(200))
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_millis(200),
+            )
             .await;
         assert!(matches!(r, Err(RunError::Timeout)), "got: {r:?}");
         let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
@@ -1172,11 +1259,21 @@ mod tests {
         )]);
         let b = module_bridge(&root);
         let cap1 = b
-            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .unwrap();
         let cap2 = b
-            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .unwrap();
         assert_eq!(cap1.status, 200);
@@ -1215,10 +1312,15 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn introspect_top_level_loop_times_out() {
         let _t = transpile_serial();
-        let (root, api) =
-            mod_fx(&[("loop/api.ts", "while (true) {}\nexport default { get() {} };\n")]);
+        let (root, api) = mod_fx(&[(
+            "loop/api.ts",
+            "while (true) {}\nexport default { get() {} };\n",
+        )]);
         let b = module_bridge(&root);
-        assert!(matches!(b.introspect_module(&api).await, Err(RunError::Timeout)));
+        assert!(matches!(
+            b.introspect_module(&api).await,
+            Err(RunError::Timeout)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1249,7 +1351,12 @@ mod tests {
         let (root, api) = mod_fx(&[("u/f/api.ts", "function {{{{\nexport default {};\n")]);
         let b = module_bridge(&root);
         let e = b
-            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
             .await
             .unwrap_err();
         assert!(e.to_string().contains("api.ts"), "{}", e.to_string());
@@ -1260,11 +1367,23 @@ mod tests {
         // 两次请求相继执行，验证每请求状态被正确重置（req 不串号）。
         let (b, _) = new_bridge();
         let cap1 = b
-            .run_with(r#"json.ok({ m: http.method });"#, RequestInfo { method: "GET".into(), ..Default::default() })
+            .run_with(
+                r#"json.ok({ m: http.method });"#,
+                RequestInfo {
+                    method: "GET".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let cap2 = b
-            .run_with(r#"json.ok({ m: http.method });"#, RequestInfo { method: "PUT".into(), ..Default::default() })
+            .run_with(
+                r#"json.ok({ m: http.method });"#,
+                RequestInfo {
+                    method: "PUT".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let v1: Value = serde_json::from_slice(&cap1.body).unwrap();

@@ -15,15 +15,26 @@ pub struct Manifest {
 /// module 白名单：非空、[A-Za-z0-9_-]，禁路径字符与 ..（进路径拼接，信任边界）。
 pub fn validate_module(m: &str) -> Result<(), String> {
     let ok = !m.is_empty()
-        && m.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if ok { Ok(()) } else { Err(format!("illegal module name {m:?}")) }
+        && m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("illegal module name {m:?}"))
+    }
 }
 
 /// version 白名单：非空、[A-Za-z0-9.]，拒连续点（兼容 0.1.0-beta 缺横线也放行——含 '-'）。
 pub fn validate_version(v: &str) -> Result<(), String> {
-    let ok = !v.is_empty() && !v.contains("..")
-        && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
-    if ok { Ok(()) } else { Err(format!("illegal version {v:?}")) }
+    let ok = !v.is_empty()
+        && !v.contains("..")
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("illegal version {v:?}"))
+    }
 }
 
 /// 单个 manifest.yaml → Manifest（load_modules 复用此解析，DRY）。
@@ -44,7 +55,10 @@ pub fn load_lock(path: &Path) -> Result<std::collections::BTreeMap<String, Strin
 }
 
 /// 原子写（tmp + rename）。ponytail: 多进程并发构建的读-改-写竞争不做锁，标 ceiling。
-pub fn save_lock(path: &Path, lock: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+pub fn save_lock(
+    path: &Path,
+    lock: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
     let yaml = serde_yaml::to_string(lock).map_err(|e| format!("serialize lock: {e}"))?;
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, yaml).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -74,7 +88,9 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
         if m.name != dirname {
             return Err(format!(
                 "manifest name {:?} != directory name {:?} (in {})",
-                m.name, dirname, p.display()
+                m.name,
+                dirname,
+                p.display()
             ));
         }
         out.push(m);
@@ -112,12 +128,18 @@ mod tests {
     #[test]
     fn loads_and_validates() {
         let d = tmp("mf-ok");
-        write(d.0.join("user/manifest.yaml"), "name: user\ndesc: d\nversion: 0.1.0\n");
+        write(
+            d.0.join("user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        );
         let ms = load_modules(&d.0).unwrap();
         assert_eq!(ms[0].name, "user");
 
         let bad = tmp("mf-bad");
-        write(bad.0.join("order/manifest.yaml"), "name: orderr\ndesc: d\nversion: 0.1.0\n");
+        write(
+            bad.0.join("order/manifest.yaml"),
+            "name: orderr\ndesc: d\nversion: 0.1.0\n",
+        );
         let e = load_modules(&bad.0).unwrap_err();
         assert!(e.contains("orderr") && e.contains("order"), "{e}");
 

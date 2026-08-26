@@ -2,27 +2,27 @@
 
 pub mod actor;
 pub mod auth;
+pub mod certificate;
+pub mod certificate_watcher;
 pub mod logging;
 pub mod routes;
 pub mod ws;
-pub mod certificate;
-pub mod certificate_watcher;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::any;
-use axum::Router;
 use serde_json::Value;
 
 use crate::actor::JsActor;
 use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
-use only_js::bridge::{fail, BlobBackend, BlobServed, RequestInfo, UploadedFile};
+use only_js::bridge::{BlobBackend, BlobServed, RequestInfo, UploadedFile, fail};
 use serde_json::json;
 
 /// 证书状态
@@ -103,7 +103,9 @@ pub fn app(
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
         .layer(axum::middleware::from_fn(crate::logging::log_requests))
         // 超 2x max_upload 的请求在 axum 层直接被拒（裸 413）；handle() 内再做信封 413。
-        .layer(axum::extract::DefaultBodyLimit::max((pipeline.max_upload * 2) as usize))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            (pipeline.max_upload * 2) as usize,
+        ))
         .with_state(AppState {
             table,
             fallback: ts.then(|| Routes::new(base, dir, ts)),
@@ -121,7 +123,10 @@ pub fn app(
 /// 此路由在证书 GET 限制之前注册，故即使证书进入宽限期/失效仍可访问，
 /// 以便 Prometheus/Grafana 及时发现。
 async fn health_handler(State(st): State<AppState>) -> Response {
-    let status_guard = st.certificate_status.read().expect("certificate_status lock poisoned");
+    let status_guard = st
+        .certificate_status
+        .read()
+        .expect("certificate_status lock poisoned");
     let (status_str, grace_remaining_secs) = match &*status_guard {
         CertificateStatus::Valid => ("valid", None),
         CertificateStatus::Grace { remaining_secs } => ("grace", Some(*remaining_secs)),
@@ -162,7 +167,18 @@ pub async fn serve(
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_listener(listener, base, dir, ts, table, actor, timeout, static_root, pipeline).await
+    serve_with_listener(
+        listener,
+        base,
+        dir,
+        ts,
+        table,
+        actor,
+        timeout,
+        static_root,
+        pipeline,
+    )
+    .await
 }
 
 /// 已绑定监听上服务（测试/T11：先 bind 端口 0 再读 local_addr）。
@@ -215,12 +231,19 @@ async fn handle(
 
     // Certificate validation: restrict GET requests when certificate is expired or in grace period
     if verb == "GET" {
-        match &*st.certificate_status.read().expect("certificate_status lock poisoned") {
+        match &*st
+            .certificate_status
+            .read()
+            .expect("certificate_status lock poisoned")
+        {
             CertificateStatus::Expired => {
                 return fail_response(403, "certificate expired: service unavailable");
             }
             CertificateStatus::Grace { remaining_secs: _ } => {
-                return fail_response(403, "certificate expired: service available in grace period, but GET requests are restricted");
+                return fail_response(
+                    403,
+                    "certificate expired: service available in grace period, but GET requests are restricted",
+                );
             }
             CertificateStatus::Valid => {}
         }
@@ -228,8 +251,10 @@ async fn handle(
 
     // 内置 auth 路由（{base}/auth/*）：先于路由表（login/refresh/logout，POST only）。
     if let Some(auth) = st.pipeline.auth.clone()
-        && let Some(rest) = crate::routes::normalize(uri.path())
-            .and_then(|p| p.strip_prefix(&format!("{}/auth/", st.base)).map(|s| s.to_string()))
+        && let Some(rest) = crate::routes::normalize(uri.path()).and_then(|p| {
+            p.strip_prefix(&format!("{}/auth/", st.base))
+                .map(|s| s.to_string())
+        })
     {
         return match (verb, rest.as_str()) {
             ("POST", "login") => {
@@ -265,8 +290,9 @@ async fn handle(
                 if let Some(ct) = ct {
                     r.headers_mut().insert(
                         axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_str(&ct)
-                            .unwrap_or(axum::http::HeaderValue::from_static("application/octet-stream")),
+                        axum::http::HeaderValue::from_str(&ct).unwrap_or(
+                            axum::http::HeaderValue::from_static("application/octet-stream"),
+                        ),
                     );
                 }
                 r
@@ -288,7 +314,9 @@ async fn handle(
     let path_no_base = crate::routes::normalize(uri.path())
         .and_then(|p| p.strip_prefix(st.base.as_str()).map(|s| s.to_string()));
     let run = |file: PathBuf, params: HashMap<String, String>| {
-        let m = crate::routes::method_name(verb).expect("checked by caller").to_string();
+        let m = crate::routes::method_name(verb)
+            .expect("checked by caller")
+            .to_string();
         let query = parse_query(uri.query());
         let path_no_base = path_no_base.clone();
         async move {
@@ -358,7 +386,7 @@ async fn handle(
             Lookup::Hit { file, params } => return run(file, params).await,
             Lookup::Conflict(msg) => return fail_response(500, &msg),
             Lookup::MethodNotAllowed => {
-                return fail_response(405, &format!("method {verb} not allowed"))
+                return fail_response(405, &format!("method {verb} not allowed"));
             }
             Lookup::NotFound => {}
         }
@@ -402,7 +430,9 @@ fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
     let mut p = root.to_path_buf();
     if !rel.is_empty() {
         for seg in rel.split('/') {
-            let s = percent_encoding::percent_decode_str(seg).decode_utf8().ok()?;
+            let s = percent_encoding::percent_decode_str(seg)
+                .decode_utf8()
+                .ok()?;
             if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']) {
                 return None;
             }
@@ -417,7 +447,13 @@ fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
 
 /// 扩展名 → Content-Type（常见集，未知 = octet-stream——ponytail: 嫌少再加）。
 fn mime_of(p: &Path) -> &'static str {
-    match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css",
         "js" | "mjs" => "text/javascript",
@@ -490,8 +526,12 @@ fn fail_response(code: i32, msg: &str) -> Response {
 
 /// `a=1&b=2` → map（application/x-www-form-urlencoded 解码，+ → 空格、%xx → 字节）。
 fn parse_query(q: Option<&str>) -> HashMap<String, String> {
-    q.map(|s| form_urlencoded::parse(s.as_bytes()).map(|(k, v)| (k.into_owned(), v.into_owned())).collect())
-        .unwrap_or_default()
+    q.map(|s| {
+        form_urlencoded::parse(s.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// content-type 是否 multipart/form-data。
@@ -523,9 +563,17 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
         let content_type = f.content_type().map(|s| s.to_string());
         let bytes = f.bytes().await.unwrap_or_default().to_vec();
         if filename.is_empty() {
-            fields.insert(name, Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+            fields.insert(
+                name,
+                Value::String(String::from_utf8_lossy(&bytes).into_owned()),
+            );
         } else {
-            files.push(UploadedFile { field: name, filename, content_type, bytes });
+            files.push(UploadedFile {
+                field: name,
+                filename,
+                content_type,
+                bytes,
+            });
         }
     }
     (serde_json::to_vec(&fields).unwrap_or_default(), files)
@@ -584,7 +632,10 @@ pub(crate) mod tests {
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                Some(Arc::new(LoaderShared { project_root: root.clone(), ts })),
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts,
+                })),
                 Extras::default(),
             )
         })
@@ -612,7 +663,15 @@ pub(crate) mod tests {
         let base = base.to_string();
         tokio::spawn(async move {
             serve_with_listener(
-                listener, &base, dir.clone(), ts, table, make_actor(dir, ts), timeout, None, pipeline,
+                listener,
+                &base,
+                dir.clone(),
+                ts,
+                table,
+                make_actor(dir, ts),
+                timeout,
+                None,
+                pipeline,
             )
             .await
             .unwrap();
@@ -637,15 +696,32 @@ pub(crate) mod tests {
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                Some(Arc::new(LoaderShared { project_root: root.clone(), ts: true })),
-                Extras { blobs: Some(only_js::bridge::blob::registry_with_default(blob2.clone())), ..Default::default() },
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: Some(only_js::bridge::blob::registry_with_default(blob2.clone())),
+                    ..Default::default()
+                },
             )
         });
         let base = base.to_string();
-        let pipeline = Pipeline { blob: Some(blob), ..Default::default() };
+        let pipeline = Pipeline {
+            blob: Some(blob),
+            ..Default::default()
+        };
         tokio::spawn(async move {
             serve_with_listener(
-                listener, &base, dir.clone(), true, table, actor, None, None, pipeline,
+                listener,
+                &base,
+                dir.clone(),
+                true,
+                table,
+                actor,
+                None,
+                None,
+                pipeline,
             )
             .await
             .unwrap();
@@ -665,13 +741,20 @@ pub(crate) mod tests {
                     Arc::new(InMemoryKV::new()),
                     SchemaRegistry::new(),
                     false,
-                    Some(Arc::new(LoaderShared { project_root: root.clone(), ts })),
+                    Some(Arc::new(LoaderShared {
+                        project_root: root.clone(),
+                        ts,
+                    })),
                     Extras::default(),
                 )
             }
         };
-        let (t, failures) =
-            crate::routes::RouteTable::build(base, &root, ts, crate::routes::bridge_introspector(make));
+        let (t, failures) = crate::routes::RouteTable::build(
+            base,
+            &root,
+            ts,
+            crate::routes::bridge_introspector(make),
+        );
         if !failures.is_empty() {
             eprintln!("build_table failures: {failures:?}");
         }
@@ -698,7 +781,10 @@ pub(crate) mod tests {
             t.0.clone(),
             true,
             None,
-            Pipeline { tenant_header: Some("X-TENANT-ID".into()), ..Default::default() },
+            Pipeline {
+                tenant_header: Some("X-TENANT-ID".into()),
+                ..Default::default()
+            },
         )
         .await;
         let ok = raw_http(
@@ -706,13 +792,19 @@ pub(crate) mod tests {
             "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nX-TENANT-ID: acme\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("\"t\":\"acme\""), "{ok}");
+        assert!(
+            ok.starts_with("HTTP/1.1 200") && ok.contains("\"t\":\"acme\""),
+            "{ok}"
+        );
         let miss = raw_http(
             addr,
             "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(miss.starts_with("HTTP/1.1 400") && miss.contains("X-TENANT-ID"), "{miss}");
+        assert!(
+            miss.starts_with("HTTP/1.1 400") && miss.contains("X-TENANT-ID"),
+            "{miss}"
+        );
         // 未启用 → 无注入也无 400
         let addr2 = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let plain = raw_http(
@@ -720,7 +812,10 @@ pub(crate) mod tests {
             "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"), "{plain}");
+        assert!(
+            plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"),
+            "{plain}"
+        );
     }
 
     /// multipart：文本字段并入 body、文件进 http.files + http.file(i) 取字节；
@@ -750,7 +845,9 @@ pub(crate) mod tests {
             )
         };
         let r = raw_http(addr, &mp(&[1, 2, 3], "hi")).await;
-        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
         assert!(r.starts_with("HTTP/1.1 200"), "1: {r}");
         assert_eq!(v["data"]["name"], "a.png", "{v}");
         assert_eq!(v["data"]["n"], 3, "{v}");
@@ -761,7 +858,9 @@ pub(crate) mod tests {
             13
         );
         let r = raw_http(addr, &j).await;
-        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
         assert!(r.starts_with("HTTP/1.1 200"), "2: {r}");
         assert_eq!(v["data"]["name"], serde_json::Value::Null, "{v}");
         assert_eq!(v["data"]["note"], "hi", "{v}");
@@ -771,7 +870,10 @@ pub(crate) mod tests {
             t.0.clone(),
             true,
             None,
-            Pipeline { max_upload: 8, ..Default::default() },
+            Pipeline {
+                max_upload: 8,
+                ..Default::default()
+            },
         )
         .await;
         let r = raw_http(
@@ -779,7 +881,10 @@ pub(crate) mod tests {
             "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"a\":123456}",
         )
         .await;
-        assert!(r.starts_with("HTTP/1.1 413") && r.contains("upload too large"), "3: {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 413") && r.contains("upload too large"),
+            "3: {r}"
+        );
     }
 
     /// blob 下载路由（local）：api 上传 → {base}/blob/k 200 bytes 一致 → del 404 →
@@ -809,14 +914,20 @@ pub(crate) mod tests {
             mp.len()
         );
         let r = raw_http(addr, &req).await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"n\":7"), "upload: {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("\"n\":7"),
+            "upload: {r}"
+        );
         // 下载：bytes 一致 + Content-Type 按扩展名推断
         let r = raw_http(
             addr,
             "GET /v1/api/blob/a.png HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("image/png") && r.ends_with("PNGDATA"), "get: {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("image/png") && r.ends_with("PNGDATA"),
+            "get: {r}"
+        );
         // 非 GET 不走 blob 路由
         let r = raw_http(
             addr,
@@ -861,7 +972,9 @@ pub(crate) mod tests {
             ),
         ]);
         // auth 自带库：users 表 + demo 用户（bcrypt cost 4 提速）。
-        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
         let hash = bcrypt::hash("pw", 4).unwrap();
         db.exec_with_params(
             "create table users (id integer primary key, username text, password_hash text, roles text)",
@@ -892,13 +1005,18 @@ pub(crate) mod tests {
             t.0.clone(),
             true,
             None,
-            Pipeline { auth: Some(auth), ..Default::default() },
+            Pipeline {
+                auth: Some(auth),
+                ..Default::default()
+            },
         )
         .await;
         let get = |p: &str, token: Option<&str>| {
             format!(
                 "GET {p} HTTP/1.1\r\nHost: t\r\n{}Connection: close\r\n\r\n",
-                token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default()
+                token
+                    .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                    .unwrap_or_default()
             )
         };
         // 1) 无 token 访问 /me → 401
@@ -919,11 +1037,18 @@ pub(crate) mod tests {
         // 4) login 成功 → Bearer 访问 /me → 200 且 user.id=="1"、roles==["admin"]
         let r = raw_http(addr, &login_req(r#"{"username":"demo","password":"pw"}"#)).await;
         assert!(r.starts_with("HTTP/1.1 200"), "4a: {r}");
-        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
         let at = v["data"]["access_token"].as_str().unwrap().to_string();
         let rt1 = v["data"]["refresh_token"].as_str().unwrap().to_string();
         let r = raw_http(addr, &get("/v1/api/me/", Some(&at))).await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"id\":\"1\"") && r.contains("\"roles\":[\"admin\"]"), "4b: {r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200")
+                && r.contains("\"id\":\"1\"")
+                && r.contains("\"roles\":[\"admin\"]"),
+            "4b: {r}"
+        );
         // 5) 篡改 token → 401
         let r = raw_http(addr, &get("/v1/api/me/", Some(&format!("{at}x")))).await;
         assert!(r.starts_with("HTTP/1.1 401"), "5: {r}");
@@ -937,7 +1062,9 @@ pub(crate) mod tests {
         )
         .await;
         assert!(r.starts_with("HTTP/1.1 200"), "6a: {r}");
-        let v: Value = serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes()).unwrap();
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
         let at2 = v["data"]["access_token"].as_str().unwrap().to_string();
         let rt2 = v["data"]["refresh_token"].as_str().unwrap().to_string();
         let r = raw_http(addr, &get("/v1/api/me/", Some(&at2))).await;
@@ -1003,9 +1130,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn handler_timeout_returns_408_envelope() {
-        let t = routes(&[("u/f/api.ts", "export default { get() { while (true) {} } };")]);
-        let addr =
-            spawn_server("/v1/api", t.0.clone(), true, Some(std::time::Duration::from_millis(200))).await;
+        let t = routes(&[(
+            "u/f/api.ts",
+            "export default { get() { while (true) {} } };",
+        )]);
+        let addr = spawn_server(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .await;
         let resp = raw_http(
             addr,
             "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
@@ -1036,15 +1171,22 @@ pub(crate) mod tests {
 
         // 注入 Grace 状态后，health 应反映 grace 与剩余秒数
         let s = dummy_app_state();
-        *s.certificate_status.write().unwrap() = CertificateStatus::Grace { remaining_secs: 86_400 };
+        *s.certificate_status.write().unwrap() = CertificateStatus::Grace {
+            remaining_secs: 86_400,
+        };
         let resp2 = crate::health_handler(axum::extract::State(s)).await;
         let body2 = body_text(resp2).await;
-        assert!(body2.contains("\"certificate_status\":\"grace\""), "{body2}");
+        assert!(
+            body2.contains("\"certificate_status\":\"grace\""),
+            "{body2}"
+        );
         assert!(body2.contains("\"grace_remaining_secs\":86400"), "{body2}");
     }
 
     async fn body_text(resp: axum::response::Response) -> String {
-        let b = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&b).into_owned()
     }
 
@@ -1066,13 +1208,22 @@ pub(crate) mod tests {
             axum::body::Bytes::new(),
         )
         .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "GET must be 403 when cert expired");
-        assert!(body_text(resp).await.contains("certificate expired"), "error body should explain cert expiry");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "GET must be 403 when cert expired"
+        );
+        assert!(
+            body_text(resp).await.contains("certificate expired"),
+            "error body should explain cert expiry"
+        );
     }
 
     #[tokio::test]
     async fn get_blocked_when_cert_grace() {
-        let st = state_with_cert(CertificateStatus::Grace { remaining_secs: 86_400 });
+        let st = state_with_cert(CertificateStatus::Grace {
+            remaining_secs: 86_400,
+        });
         let resp = crate::handle(
             axum::extract::State(st),
             axum::http::Method::GET,
@@ -1081,8 +1232,15 @@ pub(crate) mod tests {
             axum::body::Bytes::new(),
         )
         .await;
-        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "GET must be 403 in grace period");
-        assert!(body_text(resp).await.contains("grace period"), "error body should mention grace period");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "GET must be 403 in grace period"
+        );
+        assert!(
+            body_text(resp).await.contains("grace period"),
+            "error body should mention grace period"
+        );
     }
 
     #[tokio::test]
@@ -1097,7 +1255,11 @@ pub(crate) mod tests {
             axum::body::Bytes::new(),
         )
         .await;
-        assert_ne!(resp.status(), axum::http::StatusCode::FORBIDDEN, "non-GET must not be blocked by cert");
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "non-GET must not be blocked by cert"
+        );
     }
 
     #[tokio::test]
@@ -1111,7 +1273,11 @@ pub(crate) mod tests {
             axum::body::Bytes::new(),
         )
         .await;
-        assert_ne!(resp.status(), axum::http::StatusCode::FORBIDDEN, "valid cert must not block GET");
+        assert_ne!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "valid cert must not block GET"
+        );
     }
 
     // ----- 路径参数路由 e2e -----
@@ -1163,8 +1329,16 @@ pub(crate) mod tests {
         )]);
         let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let ok = raw_http(addr, &get(addr, "/v1/api/file/a/b/c")).await;
-        assert!(ok.starts_with("HTTP/1.1 200") && ok.contains("a/b/c"), "{ok}");
-        for path in ["/v1/api/file", "/v1/api/file/", "/v1/api//file/a", "/v1/api/file/%2e%2e"] {
+        assert!(
+            ok.starts_with("HTTP/1.1 200") && ok.contains("a/b/c"),
+            "{ok}"
+        );
+        for path in [
+            "/v1/api/file",
+            "/v1/api/file/",
+            "/v1/api//file/a",
+            "/v1/api/file/%2e%2e",
+        ] {
             let r = raw_http(addr, &get(addr, path)).await;
             assert!(r.starts_with("HTTP/1.1 404"), "{path}: {r}");
         }
@@ -1201,7 +1375,10 @@ pub(crate) mod tests {
         ]);
         let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let r = raw_http(addr, &get(addr, "/v1/api/user/9")).await;
-        assert!(r.starts_with("HTTP/1.1 500") && r.contains("route conflict"), "{r}");
+        assert!(
+            r.starts_with("HTTP/1.1 500") && r.contains("route conflict"),
+            "{r}"
+        );
     }
 
     #[tokio::test]
@@ -1252,7 +1429,14 @@ pub(crate) mod tests {
         let (dir, table, site) = (t.0.clone(), build_table(&t.0, true, "/v1/api"), s.0.clone());
         tokio::spawn(async move {
             serve_with_listener(
-                listener, "/v1/api", dir.clone(), true, table, make_actor(dir, true), None, Some(site),
+                listener,
+                "/v1/api",
+                dir.clone(),
+                true,
+                table,
+                make_actor(dir, true),
+                None,
+                Some(site),
                 Pipeline::default(),
             )
             .await
@@ -1264,30 +1448,60 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn serves_static_index_files_and_content_types() {
         let (addr, _keep) = spawn_static(
-            &[("u/f/api.ts", "export default { get() { json.ok({ api: true }); } };")],
-            &[("index.html", "<h1>hi</h1>"), ("css/app.css", "body{}"), ("v1/api/u", "STATIC")],
+            &[(
+                "u/f/api.ts",
+                "export default { get() { json.ok({ api: true }); } };",
+            )],
+            &[
+                ("index.html", "<h1>hi</h1>"),
+                ("css/app.css", "body{}"),
+                ("v1/api/u", "STATIC"),
+            ],
         )
         .await;
         // / → index.html + text/html
-        let r = raw_http(addr, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/html") && r.contains("<h1>hi</h1>"), "{r}");
+        let r = raw_http(
+            addr,
+            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("text/html") && r.contains("<h1>hi</h1>"),
+            "{r}"
+        );
         // 普通文件 + Content-Type；目录 → index.html
         let r = raw_http(addr, &get(addr, "/css/app.css")).await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("text/css"), "{r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("text/css"),
+            "{r}"
+        );
         // API 优先于静态：同名路径走路由表
         let r = raw_http(addr, &get(addr, "/v1/api/u/f/")).await;
-        assert!(r.starts_with("HTTP/1.1 200") && r.contains("\"api\":true") && !r.contains("STATIC"), "{r}");
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("\"api\":true") && !r.contains("STATIC"),
+            "{r}"
+        );
     }
 
     #[tokio::test]
     async fn static_guards_traversal_missing_and_verbs() {
         let (addr, _keep) = spawn_static(&[], &[("index.html", "x")]).await;
-        for path in ["/../etc/passwd", "/a%2e%2e/b", "/..%2fetc", "/nope.txt", "/css//x"] {
+        for path in [
+            "/../etc/passwd",
+            "/a%2e%2e/b",
+            "/..%2fetc",
+            "/nope.txt",
+            "/css//x",
+        ] {
             let r = raw_http(addr, &get(addr, path)).await;
             assert!(r.starts_with("HTTP/1.1 404"), "{path}: {r}");
         }
         // 非 GET/HEAD 不走静态
-        let r = raw_http(addr, "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let r = raw_http(
+            addr,
+            "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
@@ -1296,7 +1510,12 @@ pub(crate) mod tests {
         let root = Path::new("/srv");
         // %2F 走私（解码后含 /）、点段、反斜杠、NUL、空段 → None
         for p in [
-            "/..%2fetc%2fpasswd", "/%2e%2e/x", "/a/b%2Fc", "/a%5Cb", "/a%00b", "/a//b",
+            "/..%2fetc%2fpasswd",
+            "/%2e%2e/x",
+            "/a/b%2Fc",
+            "/a%5Cb",
+            "/a%00b",
+            "/a//b",
         ] {
             assert_eq!(resolve_static(root, p), None, "{p}");
         }
@@ -1318,20 +1537,24 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_load_certificate_returns_err_for_invalid_key() {
+        use base64::{Engine, engine::general_purpose};
         use tempfile::NamedTempFile;
-        use base64::{engine::general_purpose, Engine};
 
         // Create temporary files for key and certificate
         let key_file = NamedTempFile::new().expect("Failed to create temp file for key");
         let cert_file = NamedTempFile::new().expect("Failed to create temp file for cert");
 
         // Write an invalid PEM key (not a real key)
-        std::fs::write(key_file.path(), "-----BEGIN PUBLIC KEY-----\ninvalidkey\n-----END PUBLIC KEY-----\n")
-            .expect("Failed to write key");
+        std::fs::write(
+            key_file.path(),
+            "-----BEGIN PUBLIC KEY-----\ninvalidkey\n-----END PUBLIC KEY-----\n",
+        )
+        .expect("Failed to write key");
 
         // Create a simple JWS with dummy payload
         let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
-        let payload = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"nbf":1000000000,"exp":2000000000}"#);
+        let payload =
+            general_purpose::URL_SAFE_NO_PAD.encode(r#"{"nbf":1000000000,"exp":2000000000}"#);
         let signature = general_purpose::URL_SAFE_NO_PAD.encode("signature");
         let jws = format!("{}.{}.{}", header, payload, signature);
         std::fs::write(cert_file.path(), jws).expect("Failed to write cert");
@@ -1346,7 +1569,10 @@ pub(crate) mod tests {
 
         // Call load_certificate - should return Err because the key is invalid
         let res = certificate::load_certificate(&cfg).await;
-        assert!(res.is_err(), "Expected error due to invalid key, got {:?}", res);
+        assert!(
+            res.is_err(),
+            "Expected error due to invalid key, got {:?}",
+            res
+        );
     }
 }
-

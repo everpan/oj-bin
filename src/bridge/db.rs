@@ -112,7 +112,9 @@ impl InMemoryAccessor {
 #[async_trait]
 impl DataAccessor for InMemoryAccessor {
     async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
-        Ok(Box::new(InMemoryTx { inner: self.inner.clone() }))
+        Ok(Box::new(InMemoryTx {
+            inner: self.inner.clone(),
+        }))
     }
 
     async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
@@ -374,8 +376,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn commit_without_active_tx_errors() {
-        use deno_core::OpState;
         use crate::bridge::ReqState;
+        use deno_core::OpState;
         // 无活跃事务时收尾（take_tx 缺失分支）→ 直接报 "no active transaction"。
         // commit/rollback 共用 take_tx，仅需 ReqState，不依赖任何 DataAccessor。
         let mut op_state = OpState::new(None::<deno_core::OpStackTraceCallback>);
@@ -384,7 +386,10 @@ mod tests {
         let r = take_tx(&state, "default");
         assert!(r.is_err(), "expected error when no tx active");
         assert!(
-            r.err().unwrap().to_string().contains("no active transaction"),
+            r.err()
+                .unwrap()
+                .to_string()
+                .contains("no active transaction"),
             "expected no-active-tx error"
         );
     }
@@ -405,15 +410,23 @@ mod tests {
         );
         // 在 default 上开事务，再于事务内查询 other → 拒绝。
         let cap = b
-            .run(r#"
+            .run(
+                r#"
                 db.tx(async () => {
                   await DB("other").query("select 1");
                 }).then(() => json.ok({})).catch(e => json.fail(409, String(e)));
-            "#)
+            "#,
+            )
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 409, "{v}");
-        assert!(v["msg"].as_str().unwrap().contains("transaction active on db 'default'"), "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("transaction active on db 'default'"),
+            "{v}"
+        );
     }
 }

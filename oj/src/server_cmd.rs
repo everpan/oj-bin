@@ -1,6 +1,7 @@
 //! oj server 装配：config → 逐 db 开库（仅 sqlite）→ seed → manifest 校验 →
 //! actor 池 → axum serve。start() 返回 (addr, join_handle)，main 与测试共用。
 
+#![allow(clippy::collapsible_if)]
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
@@ -11,9 +12,7 @@ use only_js::bridge::plugin_loader::{
     LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
     host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
-use only_js::bridge::{
-    BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo,
-};
+use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo};
 use only_js::config::{self, Config};
 
 use crate::app::App;
@@ -56,13 +55,20 @@ pub fn load_app_config(
 ) -> Result<(Config, PathBuf, PathBuf, bool, String), String> {
     let config_path = PathBuf::from(config);
     let config_dir = config_dir_of(&config_path);
-    let cfg = config::load_from(&config_dir, config_path.file_name().and_then(|s| s.to_str()))
-        .map_err(|e| format!("load config: {e}"))?;
+    let cfg = config::load_from(
+        &config_dir,
+        config_path.file_name().and_then(|s| s.to_str()),
+    )
+    .map_err(|e| format!("load config: {e}"))?;
     // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
     // 默认目录：src 存在取 src，否则 dist。
-    let dir = dir_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| if Path::new("src").is_dir() { "src".into() } else { "dist".into() });
+    let dir = dir_override.map(|s| s.to_string()).unwrap_or_else(|| {
+        if Path::new("src").is_dir() {
+            "src".into()
+        } else {
+            "dist".into()
+        }
+    });
     let dir_path = Path::new(&dir);
     if !dir_path.is_dir() {
         return Err(format!(
@@ -104,7 +110,6 @@ pub async fn start(
     app.serve(addr).await
 }
 
-
 /// config 文件的父目录（即 project_root）。bare 文件名（`parent()==""`）回落当前目录，
 /// 避免 config_dir 为空 → `canonicalize("")` 失败 → project_root 钳制静默失效。
 fn config_dir_of(config_path: &Path) -> PathBuf {
@@ -137,7 +142,11 @@ pub async fn assemble_blobs(
         let backend: Arc<dyn only_js::bridge::BlobBackend> = match c.driver.as_str() {
             "local" => {
                 let root = Path::new(&c.root);
-                let root = if root.is_absolute() { root.to_path_buf() } else { config_dir.join(root) };
+                let root = if root.is_absolute() {
+                    root.to_path_buf()
+                } else {
+                    config_dir.join(root)
+                };
                 Arc::new(
                     only_js::bridge::LocalBlob::named(&name, &root, base)
                         .map_err(|e| format!("blob '{name}': {e}"))?,
@@ -153,9 +162,14 @@ pub async fn assemble_blobs(
                     .await
                     .map_err(|e| format!("blob '{name}': {e}"))?
             }
-            other => return Err(format!("blob '{name}': driver must be local|s3, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "blob '{name}': driver must be local|s3, got {other:?}"
+                ));
+            }
         };
-        r.register(&name, backend).map_err(|e| format!("blob '{name}': {e}"))?;
+        r.register(&name, backend)
+            .map_err(|e| format!("blob '{name}': {e}"))?;
     }
     Ok(Arc::new(r))
 }
@@ -213,11 +227,15 @@ fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
 /// bus 为键选式注册表：内置 local 打底 + 每个插件 bus 工厂注册（kind 冲突 fail fast；
 /// kafka/rabbitmq kind 未装插件 → "unknown broker kind" 明确报错）。
 fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries, String> {
-    let es_plugins: Vec<&LoadedPlugin> =
-        loaded.iter().filter(|p| p.registrations.es.is_some()).collect();
+    let es_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.es.is_some())
+        .collect();
     if cfg.es.is_some() && es_plugins.is_empty() {
-        return Err("config declares [es] but no es plugin loaded (run `cargo xtask plugin es`)"
-            .to_string());
+        return Err(
+            "config declares [es] but no es plugin loaded (run `cargo xtask plugin es`)"
+                .to_string(),
+        );
     }
     if es_plugins.len() > 1 {
         return Err("plugins conflict: multiple plugins register es backend".to_string());
@@ -226,11 +244,14 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     let mut dbs = DbBackendRegistry::builtin();
     for p in loaded {
         if let Some(be) = db_backend(p) {
-            dbs.register(be).map_err(|e| format!("plugins db register: {e}"))?;
+            dbs.register(be)
+                .map_err(|e| format!("plugins db register: {e}"))?;
         }
     }
-    let blob_plugins: Vec<&LoadedPlugin> =
-        loaded.iter().filter(|p| p.registrations.blob.is_some()).collect();
+    let blob_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.blob.is_some())
+        .collect();
     if blob_plugins.len() > 1 {
         return Err("plugins conflict: multiple plugins register blob backend".to_string());
     }
@@ -238,18 +259,27 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     let mut bus = BusBackendRegistry::builtin();
     for p in loaded {
         if let Some(be) = bus_backend(p) {
-            bus.register(be).map_err(|e| format!("plugins bus register: {e}"))?;
+            bus.register(be)
+                .map_err(|e| format!("plugins bus register: {e}"))?;
         }
     }
     // kv 键选式单 vtable 槽（Task 4.4）：多 kv 插件冲突 fail fast；redis.default 声明
     // 但无 kv 插件 → 在 start() 装配 kv 时 fail fast（未声明走 InMemoryKV，不进插件）。
-    let kv_plugins: Vec<&LoadedPlugin> =
-        loaded.iter().filter(|p| p.registrations.kv.is_some()).collect();
+    let kv_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.kv.is_some())
+        .collect();
     if kv_plugins.len() > 1 {
         return Err("plugins conflict: multiple plugins register kv backend".to_string());
     }
     let kv = kv_plugins.first().and_then(|p| p.registrations.kv);
-    Ok(Registries { es, dbs, blob, bus, kv })
+    Ok(Registries {
+        es,
+        dbs,
+        blob,
+        bus,
+        kv,
+    })
 }
 
 /// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
@@ -276,7 +306,10 @@ pub async fn assemble_plugins(
             }
             let entries: Vec<PluginManifestEntry> = names
                 .iter()
-                .map(|name| PluginManifestEntry { name: name.clone(), semver_pin: None })
+                .map(|name| PluginManifestEntry {
+                    name: name.clone(),
+                    semver_pin: None,
+                })
                 .collect();
             load_manifest(&dir, &entries, host, &cfg_for)
                 .map_err(|e| format!("plugins manifest: {e}"))?
@@ -318,9 +351,18 @@ mod tests {
     fn config_dir_never_empty() {
         // bare 文件名回落当前目录（project_root 钳制不因空路径失效）。
         assert_eq!(config_dir_of(Path::new("config.yaml")), PathBuf::from("."));
-        assert_eq!(config_dir_of(Path::new("./config.yaml")), PathBuf::from("."));
-        assert_eq!(config_dir_of(Path::new("sub/config.yaml")), PathBuf::from("sub"));
-        assert_eq!(config_dir_of(Path::new("/abs/config.yaml")), PathBuf::from("/abs"));
+        assert_eq!(
+            config_dir_of(Path::new("./config.yaml")),
+            PathBuf::from(".")
+        );
+        assert_eq!(
+            config_dir_of(Path::new("sub/config.yaml")),
+            PathBuf::from("sub")
+        );
+        assert_eq!(
+            config_dir_of(Path::new("/abs/config.yaml")),
+            PathBuf::from("/abs")
+        );
     }
 
     #[test]
@@ -340,10 +382,16 @@ mod tests {
         let mut cfg = Config::default();
         cfg.db.insert("default".into(), "sqlite::memory:".into());
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"\"\n").unwrap());
-        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
-            .await
-            .err()
-            .unwrap_or_default();
+        let e = start(
+            cfg,
+            Path::new("/tmp"),
+            PathBuf::from("src"),
+            "/v1/api".into(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("jwt_secret"), "{e}");
     }
 
@@ -363,11 +411,18 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_dsn_scheme() {
         let mut cfg = Config::default();
-        cfg.db.insert("default".into(), "oracle://u:p@localhost/test".into());
-        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
-            .await
-            .err()
-            .unwrap_or_default();
+        cfg.db
+            .insert("default".into(), "oracle://u:p@localhost/test".into());
+        let e = start(
+            cfg,
+            Path::new("/tmp"),
+            PathBuf::from("src"),
+            "/v1/api".into(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("scheme"), "{e}");
     }
 
@@ -376,14 +431,25 @@ mod tests {
         let t = tmpdir("sc-dsn");
         let reg = only_js::bridge::DbBackendRegistry::builtin();
         // sqlite：相对路径归一为 config_dir 下绝对路径并建空库
-        reg.connect("sqlite://db.sqlite", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
+        reg.connect("sqlite://db.sqlite", &t.0)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(t.0.join("db.sqlite").is_file());
-        reg.connect("sqlite::memory:", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
-        reg.connect("memory://m", &t.0).await.unwrap_or_else(|e| panic!("{e}"));
+        reg.connect("sqlite::memory:", &t.0)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        reg.connect("memory://m", &t.0)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         // Task 4.1：mysql/postgres 已迁插件，内置不再认领 → 缺装时明确 unknown db scheme
         // （快速失败不触网——原测试真连 127.0.0.1:1 每个 ~30s 超时，本版消除）。
         for unclaimed in ["mysql://u:p@127.0.0.1:1/app", "postgres://127.0.0.1:1/app"] {
-            let e = reg.connect(unclaimed, &t.0).await.err().map(|e| e.to_string()).unwrap_or_default();
+            let e = reg
+                .connect(unclaimed, &t.0)
+                .await
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             assert!(e.contains("unknown db scheme"), "{e}");
         }
         // 未知 scheme 拒绝
@@ -397,7 +463,9 @@ mod tests {
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api", None).await.unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None)
+            .await
+            .unwrap();
         r.default().unwrap().put("k", b"DEF", None).await.unwrap();
         r.get("img").unwrap().put("k", b"IMG", None).await.unwrap();
         match r.default().unwrap().serve("k").await.unwrap() {
@@ -412,14 +480,19 @@ mod tests {
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api", None).await.unwrap();
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None)
+            .await
+            .unwrap();
         assert!(r.default().is_some() && r.get("img").is_some());
         // local root 相对 config_dir 绝对化并创建
         assert!(t.0.join("a").is_dir() && t.0.join("b").is_dir());
         // 未知 driver：错误带后端名
         let bad: config::BlobSection =
             serde_yaml::from_str("backends:\n  x:\n    driver: ghost\n").unwrap();
-        let e = assemble_blobs(&bad, &t.0, "/v1/api", None).await.err().unwrap_or_default();
+        let e = assemble_blobs(&bad, &t.0, "/v1/api", None)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("'x'") && e.contains("ghost"), "{e}");
     }
 
@@ -431,7 +504,10 @@ mod tests {
             "backends:\n  default:\n    driver: s3\n    bucket: b\n    region: r\n",
         )
         .unwrap();
-        let e = assemble_blobs(&section, &t.0, "/v1/api", None).await.err().unwrap_or_default();
+        let e = assemble_blobs(&section, &t.0, "/v1/api", None)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("requires the oj-blob-s3 plugin"), "{e}");
     }
 
@@ -447,7 +523,10 @@ mod tests {
         // 未知 scheme：库名出现在错误里
         let mut bad = HashMap::new();
         bad.insert("mydb".to_string(), "oracle://x".to_string());
-        let e = connect_dbs(&bad, &reg, &t.0).await.err().unwrap_or_default();
+        let e = connect_dbs(&bad, &reg, &t.0)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("mydb"), "{e}");
         assert!(e.contains("unknown db scheme"), "{e}");
     }
@@ -456,11 +535,21 @@ mod tests {
     async fn manifest_mismatch_blocks_startup() {
         let t = tmpdir("sc-md");
         std::fs::create_dir_all(t.0.join("src/user")).unwrap();
-        std::fs::write(t.0.join("src/user/manifest.yaml"), "name: x\ndesc: d\nversion: 0.1.0\n").unwrap();
-        let e = start(Config::default(), &t.0, t.0.join("src"), "/v1/api".into(), true)
-            .await
-            .err()
-            .unwrap_or_default();
+        std::fs::write(
+            t.0.join("src/user/manifest.yaml"),
+            "name: x\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        let e = start(
+            Config::default(),
+            &t.0,
+            t.0.join("src"),
+            "/v1/api".into(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("name"), "{e}");
     }
 
@@ -488,14 +577,23 @@ mod tests {
         let t = rel_fixture(&[
             ("dist/manifests.yaml", "user: 0.1.0\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
-            ("dist/user-0.1.0/routes.js",
-             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n"),
-            ("dist/user-0.1.0/item/api-x.js", "export default { get() { json.ok({ v: 1 }); } };\n"),
+            (
+                "dist/user-0.1.0/routes.js",
+                "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n",
+            ),
+            (
+                "dist/user-0.1.0/item/api-x.js",
+                "export default { get() { json.ok({ v: 1 }); } };\n",
+            ),
         ]);
         let mut cfg = Config::default();
         cfg.server.port = 0; // 随机端口（默认 778 并行测试会撞）
-        let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
-        let r = reqwest::get(format!("http://{addr}/v1/api/user/item/7")).await.unwrap();
+        let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .unwrap();
+        let r = reqwest::get(format!("http://{addr}/v1/api/user/item/7"))
+            .await
+            .unwrap();
         assert_eq!(r.status(), 200); // pattern 无 base → 聚合拼 /v1/api/user/item/{id}
     }
 
@@ -503,22 +601,67 @@ mod tests {
     async fn release_fail_fast_paths() {
         // a) 无 manifests.yaml
         let t = rel_fixture(&[("dist/user-0.1.0/manifest.yaml", MANI)]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
-        assert!(e.contains("manifests.yaml") || e.contains("oj build"), "{e}");
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
+        assert!(
+            e.contains("manifests.yaml") || e.contains("oj build"),
+            "{e}"
+        );
         // b) 锁指向不存在版本
-        let t = rel_fixture(&[("dist/manifests.yaml", "user: 9.9.9\n"), ("dist/user-0.1.0/manifest.yaml", MANI)]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let t = rel_fixture(&[
+            ("dist/manifests.yaml", "user: 9.9.9\n"),
+            ("dist/user-0.1.0/manifest.yaml", MANI),
+        ]);
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("9.9.9"), "{e}");
         // c) version 注入
         let t = rel_fixture(&[("dist/manifests.yaml", "user: ../../etc\n")]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("version") || e.contains("illegal"), "{e}");
         // d) manifest name 不符
         let t = rel_fixture(&[
             ("dist/manifests.yaml", "user: 0.1.0\n"),
-            ("dist/user-0.1.0/manifest.yaml", "name: other\ndesc: d\nversion: 0.1.0\n"),
+            (
+                "dist/user-0.1.0/manifest.yaml",
+                "name: other\ndesc: d\nversion: 0.1.0\n",
+            ),
         ]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("name"), "{e}");
     }
 
@@ -530,7 +673,16 @@ mod tests {
             ("dist/user-0.1.0/manifest.yaml", MANI),
             ("dist/user-0.1.0/routes.js", "export default [ "),
         ]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("routes.js"), "{e}");
     }
 
@@ -540,15 +692,37 @@ mod tests {
         let t = rel_fixture(&[
             ("dist/manifests.yaml", "user: 0.1.0\nother: 0.9.0\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
-            ("dist/user-0.1.0/routes.js",
-             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n"),
-            ("dist/user-0.1.0/item/api-x.js", "export default { get() { json.ok({}); } };\n"),
-            ("dist/other-0.9.0/manifest.yaml", "name: other\ndesc: d\nversion: 0.9.0\n"),
-            ("dist/other-0.9.0/routes.js",
-             "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-y.js\" } ];\n"),
-            ("dist/other-0.9.0/item/api-y.js", "export default { get() { json.ok({}); } };\n"),
+            (
+                "dist/user-0.1.0/routes.js",
+                "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-x.js\" } ];\n",
+            ),
+            (
+                "dist/user-0.1.0/item/api-x.js",
+                "export default { get() { json.ok({}); } };\n",
+            ),
+            (
+                "dist/other-0.9.0/manifest.yaml",
+                "name: other\ndesc: d\nversion: 0.9.0\n",
+            ),
+            (
+                "dist/other-0.9.0/routes.js",
+                "export default [ { method: \"get\", pattern: \"user/item/{id}\", file: \"item/api-y.js\" } ];\n",
+            ),
+            (
+                "dist/other-0.9.0/item/api-y.js",
+                "export default { get() { json.ok({}); } };\n",
+            ),
         ]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("conflict"), "{e}");
     }
 
@@ -559,7 +733,16 @@ mod tests {
             ("dist/manifests.yaml", "user: [unclosed\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
         ]);
-        let e = start(Config::default(), &t, t.join("dist"), "/v1/api".into(), false).await.err().unwrap_or_default();
+        let e = start(
+            Config::default(),
+            &t,
+            t.join("dist"),
+            "/v1/api".into(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
         assert!(e.contains("unclosed") || e.contains("parse"), "{e}");
     }
 
@@ -570,7 +753,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.server.port = 0; // 随机端口
         cfg.server.root = Some(".".into()); // 相对 config_dir
-        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true).await.unwrap();
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .unwrap();
         let r = reqwest::get(format!("http://{addr}/")).await.unwrap();
         assert_eq!(r.status(), 200);
         assert!(r.text().await.unwrap().contains("site"));
@@ -602,8 +787,13 @@ mod tests {
         .unwrap();
         let mut cfg = Config::default();
         cfg.server.port = 0; // 随机端口
-        cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", t.0.display()));
-        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true).await.unwrap();
+        cfg.db.insert(
+            "default".into(),
+            format!("sqlite://{}/db.sqlite", t.0.display()),
+        );
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .unwrap();
         // 直接打一个临时 api.ts 验证全链路。
         std::fs::create_dir_all(t.0.join("src/u/f")).unwrap();
         std::fs::write(
@@ -611,7 +801,9 @@ mod tests {
             "export default { get() { db.query(\"select v from t where id = ?\", [1]).then(r => json.ok(r)); } };\n",
         )
         .unwrap();
-        let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/")).await.unwrap();
+        let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["data"][0]["v"], "a", "{v}");
@@ -623,7 +815,10 @@ mod tests {
     use std::sync::OnceLock;
 
     fn host_triple() -> String {
-        let out = std::process::Command::new("rustc").arg("-vV").output().unwrap();
+        let out = std::process::Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .unwrap();
         String::from_utf8(out.stdout)
             .unwrap()
             .lines()
@@ -661,14 +856,17 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_es.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_es.{ext}"))
         })
         .clone()
     }
 
     fn es_cfg(endpoint: &str) -> Config {
         let mut cfg = Config::default();
-        cfg.es = Some(config::EsCfg { endpoint: endpoint.to_string() });
+        cfg.es = Some(config::EsCfg {
+            endpoint: endpoint.to_string(),
+        });
         cfg
     }
 
@@ -681,7 +879,10 @@ mod tests {
         cfg.plugins = Some(vec!["ghost".into()]);
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("plugin file missing"), "{e}");
     }
 
@@ -694,7 +895,10 @@ mod tests {
         cfg.plugins = Some(vec!["es".into(), "es".into()]);
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("duplicate plugin 'es'"), "{e}");
     }
 
@@ -721,7 +925,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("plugins scan"), "{e}");
     }
 
@@ -733,7 +940,10 @@ mod tests {
         let mut cfg = es_cfg("http://127.0.0.1:1");
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r).await.err().unwrap_or_default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("no es plugin loaded"), "{e}");
     }
 
@@ -771,7 +981,8 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_db_mysql.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_db_mysql.{ext}"))
         })
         .clone()
     }
@@ -792,7 +1003,10 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "db-mysql");
         let names = r.dbs.backend_names();
-        assert!(names.iter().any(|n| *n == "db-mysql"), "factory not registered: {names:?}");
+        assert!(
+            names.iter().any(|n| *n == "db-mysql"),
+            "factory not registered: {names:?}"
+        );
         // 未认领 scheme 仍 unknown（插件没声明 oracle）→ 快速失败
         let e = r
             .dbs
@@ -814,8 +1028,14 @@ mod tests {
         let mut r = Registries::default();
         assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         let mut m = std::collections::HashMap::new();
-        m.insert("mydb".to_string(), "mysql://u:p@127.0.0.1:1/app".to_string());
-        let e = connect_dbs(&m, &r.dbs, &t.0).await.err().unwrap_or_default();
+        m.insert(
+            "mydb".to_string(),
+            "mysql://u:p@127.0.0.1:1/app".to_string(),
+        );
+        let e = connect_dbs(&m, &r.dbs, &t.0)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("mydb"), "{e}");
         assert!(e.contains("unknown db scheme"), "{e}");
     }
@@ -838,7 +1058,8 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_blob_s3.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_blob_s3.{ext}"))
         })
         .clone()
     }
@@ -886,7 +1107,8 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_bus_kafka.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_bus_kafka.{ext}"))
         })
         .clone()
     }
@@ -909,7 +1131,8 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_bus_rabbitmq.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_bus_rabbitmq.{ext}"))
         })
         .clone()
     }
@@ -921,7 +1144,11 @@ mod tests {
         let t = tmpdir("sc-busplug");
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
-        std::fs::copy(bus_kafka_plugin_artifact(), pdir.join(plugin_file("bus-kafka"))).unwrap();
+        std::fs::copy(
+            bus_kafka_plugin_artifact(),
+            pdir.join(plugin_file("bus-kafka")),
+        )
+        .unwrap();
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins = Some(vec!["bus-kafka".into()]);
@@ -930,7 +1157,10 @@ mod tests {
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "bus-kafka");
         let kinds = r.bus.kinds();
-        assert!(kinds.iter().any(|k| k == "kafka"), "kind not registered: {kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k == "kafka"),
+            "kind not registered: {kinds:?}"
+        );
         // 本地 kind 仍内置
         assert!(kinds.iter().any(|k| k == "local"), "{kinds:?}");
     }
@@ -976,7 +1206,8 @@ mod tests {
             } else {
                 ("lib", "so")
             };
-            root.join("target/debug").join(format!("{prefix}oj_kv_redis.{ext}"))
+            root.join("target/debug")
+                .join(format!("{prefix}oj_kv_redis.{ext}"))
         })
         .clone()
     }
@@ -988,7 +1219,11 @@ mod tests {
         let t = tmpdir("sc-kvplug");
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
-        std::fs::copy(kv_redis_plugin_artifact(), pdir.join(plugin_file("kv-redis"))).unwrap();
+        std::fs::copy(
+            kv_redis_plugin_artifact(),
+            pdir.join(plugin_file("kv-redis")),
+        )
+        .unwrap();
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins = Some(vec!["kv-redis".into()]);
@@ -1012,7 +1247,8 @@ mod tests {
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
-        cfg.redis.insert("default".into(), "redis://127.0.0.1:1/".into());
+        cfg.redis
+            .insert("default".into(), "redis://127.0.0.1:1/".into());
         let mut r = Registries::default();
         assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert!(r.kv.is_none());
@@ -1041,7 +1277,11 @@ mod tests {
         let t = tmpdir("sc-busshare-k");
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
-        std::fs::copy(bus_kafka_plugin_artifact(), pdir.join(plugin_file("bus-kafka"))).unwrap();
+        std::fs::copy(
+            bus_kafka_plugin_artifact(),
+            pdir.join(plugin_file("bus-kafka")),
+        )
+        .unwrap();
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins = Some(vec!["bus-kafka".into()]);
@@ -1062,7 +1302,10 @@ mod tests {
         broker.subscribe(&topic, tx1).await.unwrap();
         broker.subscribe(&topic, tx2).await.unwrap(); // 同 topic 第二通道（不新起消费）
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 等消费就绪
-        broker.publish(&topic, &serde_json::json!({ "v": 9 })).await.unwrap();
+        broker
+            .publish(&topic, &serde_json::json!({ "v": 9 }))
+            .await
+            .unwrap();
         let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
             .await
             .expect("shared receive 1 timeout")
@@ -1091,7 +1334,11 @@ mod tests {
         let t = tmpdir("sc-busshare-r");
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
-        std::fs::copy(bus_rabbitmq_plugin_artifact(), pdir.join(plugin_file("bus-rabbitmq"))).unwrap();
+        std::fs::copy(
+            bus_rabbitmq_plugin_artifact(),
+            pdir.join(plugin_file("bus-rabbitmq")),
+        )
+        .unwrap();
         let mut cfg = Config::default();
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins = Some(vec!["bus-rabbitmq".into()]);
@@ -1111,7 +1358,10 @@ mod tests {
         broker.subscribe(&topic, tx1).await.unwrap();
         broker.subscribe(&topic, tx2).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        broker.publish(&topic, &serde_json::json!({ "v": 11 })).await.unwrap();
+        broker
+            .publish(&topic, &serde_json::json!({ "v": 11 }))
+            .await
+            .unwrap();
         let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
             .await
             .expect("shared receive 1 timeout")

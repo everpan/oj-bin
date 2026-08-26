@@ -12,8 +12,8 @@ use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 // 0.410：`modules` 模块私有，loader 相关类型全部经 crate 根再导出（lib.rs:137-160）。
 use deno_core::{
-    ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleResolveResponse,
-    ModuleSource, ModuleSourceCode, ModuleType, ResolutionKind,
+    ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleResolveResponse, ModuleSource,
+    ModuleSourceCode, ModuleType, ResolutionKind,
 };
 
 use super::StableState;
@@ -159,7 +159,11 @@ pub fn resolve_bare(spec: &str, from_dir: &Path, root: &Path) -> Result<PathBuf,
     } else {
         parts[0].to_string()
     };
-    let sub: Vec<&str> = if pkg.contains('/') { parts.split_off(2) } else { parts.split_off(1) };
+    let sub: Vec<&str> = if pkg.contains('/') {
+        parts.split_off(2)
+    } else {
+        parts.split_off(1)
+    };
 
     let mut tried = Vec::new();
     let mut dir = Some(from_dir);
@@ -209,7 +213,10 @@ fn pkg_entry(pkg_dir: &Path) -> Result<PathBuf, String> {
     if idx.is_file() {
         return Ok(idx);
     }
-    Err(format!("package '{}' has no entry (module/main/index.js)", pkg_dir.display()))
+    Err(format!(
+        "package '{}' has no entry (module/main/index.js)",
+        pkg_dir.display()
+    ))
 }
 
 /// 版本化 specifier：file://<abs>?v=<mtime nanos>（mtime 变 → 新模块 → 热重载）。
@@ -220,8 +227,8 @@ pub fn versioned_specifier(path: &Path) -> Result<ModuleSpecifier, String> {
     let nanos = mtime
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| format!("bad mtime on {}: {e}", path.display()))?;
-    let abs = std::fs::canonicalize(path)
-        .map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
+    let abs =
+        std::fs::canonicalize(path).map_err(|e| format!("canonicalize {}: {e}", path.display()))?;
     let mut url = ModuleSpecifier::from_file_path(abs)
         .map_err(|_| format!("cannot build file url from {}", path.display()))?;
     url.set_query(Some(&format!("v={}", nanos.as_nanos())));
@@ -237,14 +244,20 @@ fn ensure_within(p: &Path, root: &Path) -> Result<(), String> {
     if cp.starts_with(&cr) {
         Ok(())
     } else {
-        Err(format!("module path {} escapes project root {}", p.display(), root.display()))
+        Err(format!(
+            "module path {} escapes project root {}",
+            p.display(),
+            root.display()
+        ))
     }
 }
 
 /// CJS 启发式：无 ESM 顶层语法且是 .js/.cjs（node_modules 包）。
 /// ponytail: 启发式覆盖主流简单包；误判时报错信息可定位（module is not defined）。
 pub fn looks_cjs(src: &str) -> bool {
-    !src.contains("export ") && !src.contains("export{") && !src.contains("import ")
+    !src.contains("export ")
+        && !src.contains("export{")
+        && !src.contains("import ")
         && !src.contains("import(")
 }
 
@@ -273,7 +286,9 @@ pub fn op_resolve_cjs(
         .loader
         .as_ref()
         .map(|l| l.project_root.clone())
-        .ok_or_else(|| JsErrorBox::generic("project root not configured (loader wiring pending)"))?;
+        .ok_or_else(|| {
+            JsErrorBox::generic("project root not configured (loader wiring pending)")
+        })?;
     let from = Path::new(&referrer)
         .parent()
         .unwrap_or(Path::new("."))
@@ -313,9 +328,21 @@ mod tests {
         ]);
         let dir = root.join("user/account");
         let ts = true;
-        assert!(resolve_relative(&dir, "../_shared/validate", ts).unwrap().ends_with("validate.ts"));
-        assert!(resolve_relative(&dir, "../_shared/mod", ts).unwrap().ends_with("mod/index.ts"));
-        assert!(resolve_relative(&dir, "../plain", ts).unwrap().ends_with("plain.js"));
+        assert!(
+            resolve_relative(&dir, "../_shared/validate", ts)
+                .unwrap()
+                .ends_with("validate.ts")
+        );
+        assert!(
+            resolve_relative(&dir, "../_shared/mod", ts)
+                .unwrap()
+                .ends_with("mod/index.ts")
+        );
+        assert!(
+            resolve_relative(&dir, "../plain", ts)
+                .unwrap()
+                .ends_with("plain.js")
+        );
         let err = resolve_relative(&dir, "../nope", ts).unwrap_err();
         assert!(err.contains("tried"), "{err}");
     }
@@ -333,21 +360,46 @@ mod tests {
     fn bare_resolves_node_modules() {
         let root = fx(&[
             ("node_modules/escape-goat/index.js", "export const x = 1;\n"),
-            ("node_modules/escape-goat/package.json",
-             r#"{"name":"escape-goat","version":"4.0.0","type":"module"}"#),
-            ("node_modules/cjspkg/main.js", "module.exports = { n: 1 };\n"),
-            ("node_modules/cjspkg/package.json",
-             r#"{"name":"cjspkg","version":"1.0.0","main":"main.js"}"#),
-            ("node_modules/withmod/pkg/lib/util.js", "export const u = 1;\n"),
-            ("node_modules/withmod/pkg/package.json", r#"{"name":"withmod"}"#),
+            (
+                "node_modules/escape-goat/package.json",
+                r#"{"name":"escape-goat","version":"4.0.0","type":"module"}"#,
+            ),
+            (
+                "node_modules/cjspkg/main.js",
+                "module.exports = { n: 1 };\n",
+            ),
+            (
+                "node_modules/cjspkg/package.json",
+                r#"{"name":"cjspkg","version":"1.0.0","main":"main.js"}"#,
+            ),
+            (
+                "node_modules/withmod/pkg/lib/util.js",
+                "export const u = 1;\n",
+            ),
+            (
+                "node_modules/withmod/pkg/package.json",
+                r#"{"name":"withmod"}"#,
+            ),
         ]);
         let from = root.join("src/user");
         // ESM 包：type:module → index.js。
-        assert!(resolve_bare("escape-goat", &from, &root).unwrap().ends_with("escape-goat/index.js"));
+        assert!(
+            resolve_bare("escape-goat", &from, &root)
+                .unwrap()
+                .ends_with("escape-goat/index.js")
+        );
         // CJS 包：main 字段。
-        assert!(resolve_bare("cjspkg", &from, &root).unwrap().ends_with("cjspkg/main.js"));
+        assert!(
+            resolve_bare("cjspkg", &from, &root)
+                .unwrap()
+                .ends_with("cjspkg/main.js")
+        );
         // subpath 直映射。
-        assert!(resolve_bare("withmod/pkg/lib/util.js", &from, &root).unwrap().ends_with("lib/util.js"));
+        assert!(
+            resolve_bare("withmod/pkg/lib/util.js", &from, &root)
+                .unwrap()
+                .ends_with("lib/util.js")
+        );
         // 不存在 → 错误含提示。
         let e = resolve_bare("nope-pkg", &from, &root).unwrap_err();
         assert!(e.contains("node_modules"), "{e}");
@@ -364,14 +416,20 @@ mod tests {
         ]);
         let root = base.join("proj");
         let loader = OjModuleLoader {
-            inner: Arc::new(LoaderShared { project_root: root.clone(), ts: true }),
+            inner: Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            }),
         };
-        let referrer =
-            ModuleSpecifier::from_file_path(root.join("src/user/mod.js")).unwrap().to_string();
+        let referrer = ModuleSpecifier::from_file_path(root.join("src/user/mod.js"))
+            .unwrap()
+            .to_string();
         // 根内相对导入不受影响。
         assert!(loader.resolve_inner("./mod.js", &referrer).is_ok());
         // lexical `..` 越过项目根 → 钳制报错（而非解析成功）。
-        let e = loader.resolve_inner("../../../escape.js", &referrer).unwrap_err();
+        let e = loader
+            .resolve_inner("../../../escape.js", &referrer)
+            .unwrap_err();
         assert!(e.contains("escapes project root"), "{e}");
     }
 
@@ -382,8 +440,14 @@ mod tests {
         assert!(!looks_cjs("import x from 'y';\nmodule.exports = x;\n"));
         let wrapped = wrap_cjs("module.exports = { a: 1 };\n", "/nm/p/main.js");
         assert!(wrapped.contains("__oj_cjs_module"), "{wrapped}");
-        assert!(wrapped.contains("export default __oj_cjs_module.exports"), "{wrapped}");
+        assert!(
+            wrapped.contains("export default __oj_cjs_module.exports"),
+            "{wrapped}"
+        );
         // require 绑定模块自身路径（嵌套 require 的 referrer）。
-        assert!(wrapped.contains(r#"__ojRequire(n, "/nm/p/main.js")"#), "{wrapped}");
+        assert!(
+            wrapped.contains(r#"__ojRequire(n, "/nm/p/main.js")"#),
+            "{wrapped}"
+        );
     }
 }

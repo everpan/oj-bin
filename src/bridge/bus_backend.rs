@@ -26,7 +26,9 @@ pub struct BusBackendRegistry {
 
 impl BusBackendRegistry {
     pub fn new() -> Self {
-        Self { inner: NamedRegistry::new() }
+        Self {
+            inner: NamedRegistry::new(),
+        }
     }
     /// 内置：local 零依赖（kafka/rabbitmq 经插件工厂注册进装配期 registry，Task 4.3）。
     pub fn builtin() -> Self {
@@ -43,7 +45,11 @@ impl BusBackendRegistry {
     pub async fn connect(&self, cfg: &Option<BrokerCfg>) -> BridgeResult<Arc<dyn EventBroker>> {
         let empty = BrokerCfg::default();
         let c = cfg.as_ref().unwrap_or(&empty);
-        let kind = if c.kind.is_empty() { "local" } else { c.kind.as_str() };
+        let kind = if c.kind.is_empty() {
+            "local"
+        } else {
+            c.kind.as_str()
+        };
         match self.inner.get(kind) {
             Some(b) => b.connect(c).await,
             None => {
@@ -83,8 +89,14 @@ mod tests {
         let r = BusBackendRegistry::builtin();
         let b = r.connect(&None).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(b.kind(), "local");
-        let cfg = BrokerCfg { kind: "local".into(), ..Default::default() };
-        let b2 = r.connect(&Some(cfg)).await.unwrap_or_else(|e| panic!("{e}"));
+        let cfg = BrokerCfg {
+            kind: "local".into(),
+            ..Default::default()
+        };
+        let b2 = r
+            .connect(&Some(cfg))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(b2.kind(), "local");
         assert!(r.kinds().contains(&"local".to_string()));
         // Task 4.3：kafka/rabbitmq 已迁插件，内置不再注册（缺装 → unknown kind）。
@@ -94,7 +106,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unknown_kind_errors_with_known_list() {
         let r = BusBackendRegistry::builtin();
-        let cfg = BrokerCfg { kind: "nats".into(), ..Default::default() };
+        let cfg = BrokerCfg {
+            kind: "nats".into(),
+            ..Default::default()
+        };
         let msg = match r.connect(&Some(cfg)).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("unknown kind must fail"),
@@ -107,7 +122,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn kafka_without_plugin_reports_unknown_kind() {
         let r = BusBackendRegistry::builtin();
-        let cfg = BrokerCfg { kind: "kafka".into(), ..Default::default() };
+        let cfg = BrokerCfg {
+            kind: "kafka".into(),
+            ..Default::default()
+        };
         let msg = match r.connect(&Some(cfg)).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("kafka without plugin must fail"),

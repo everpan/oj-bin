@@ -33,7 +33,10 @@ fn entry_macro_generates_two_symbols_and_abi_matches() {
 
 #[test]
 fn init_roundtrip_ok() {
-    let host = RArc::new(HostContext { log: noop_log, deliver: noop_deliver });
+    let host = RArc::new(HostContext {
+        log: noop_log,
+        deliver: noop_deliver,
+    });
     let r = oj_plugin_init(host, RString::from("{}"));
     match std::result::Result::from(r) {
         Ok(d) => {

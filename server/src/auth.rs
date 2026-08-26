@@ -31,7 +31,10 @@ pub struct Auth {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 32 随机字节 hex = 不透明 refresh token。
@@ -49,18 +52,32 @@ fn session_key(token: &str) -> String {
 
 impl Auth {
     /// 构造：alg 解析 + user_table 标识符白名单 + duration 解析（fail-fast）。
-    pub fn new(cfg: &AuthCfg, db: Arc<dyn DataAccessor>, kv: Arc<dyn KVStore>) -> Result<Self, String> {
+    pub fn new(
+        cfg: &AuthCfg,
+        db: Arc<dyn DataAccessor>,
+        kv: Arc<dyn KVStore>,
+    ) -> Result<Self, String> {
         let alg = match cfg.signing_method.as_str() {
             "HS256" => jsonwebtoken::Algorithm::HS256,
             "HS384" => jsonwebtoken::Algorithm::HS384,
             "HS512" => jsonwebtoken::Algorithm::HS512,
-            other => return Err(format!("auth.signing_method '{other}' not supported (HS256|HS384|HS512)")),
+            other => {
+                return Err(format!(
+                    "auth.signing_method '{other}' not supported (HS256|HS384|HS512)"
+                ));
+            }
         };
         if cfg.user_table.is_empty()
             || cfg.user_table.len() > 64
-            || !cfg.user_table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !cfg
+                .user_table
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
-            return Err(format!("auth.user_table '{}' invalid ([A-Za-z0-9_]{{1,64}})", cfg.user_table));
+            return Err(format!(
+                "auth.user_table '{}' invalid ([A-Za-z0-9_]{{1,64}})",
+                cfg.user_table
+            ));
         }
         let access = only_js::config::parse_duration(&cfg.access_token_duration)
             .map_err(|e| format!("auth.access_token_duration: {e}"))?;
@@ -193,7 +210,13 @@ impl Auth {
 
     async fn session_put(&self, token: &str, uid: &str) {
         let exp = now_unix() + self.refresh.as_secs();
-        let _ = self.kv.set(&session_key(token), &json!({ "uid": uid, "exp": exp }).to_string()).await;
+        let _ = self
+            .kv
+            .set(
+                &session_key(token),
+                &json!({ "uid": uid, "exp": exp }).to_string(),
+            )
+            .await;
     }
 
     async fn session_get(&self, token: &str) -> Option<String> {
@@ -201,7 +224,6 @@ impl Auth {
         let v: Value = serde_json::from_str(&raw).ok()?;
         (v["exp"].as_u64().unwrap_or(0) > now_unix())
             .then(|| v["uid"].as_str().map(|s| s.to_string()))?
-
     }
 
     async fn session_del(&self, token: &str) {
@@ -238,8 +260,14 @@ mod tests {
         assert_eq!((c.sub.as_str(), c.roles.len()), ("7", 1));
         assert!(a.verify_access(&format!("{t}x")).is_err());
         // 过期：手工签一个 exp 在过去的 token
-        let claims = Claims { sub: "7".into(), roles: vec![], iat: 100, exp: 101 };
-        let past = jsonwebtoken::encode(&jsonwebtoken::Header::new(a.alg), &claims, &a.enc).unwrap();
+        let claims = Claims {
+            sub: "7".into(),
+            roles: vec![],
+            iat: 100,
+            exp: 101,
+        };
+        let past =
+            jsonwebtoken::encode(&jsonwebtoken::Header::new(a.alg), &claims, &a.enc).unwrap();
         assert!(a.verify_access(&past).is_err());
     }
 
@@ -248,18 +276,25 @@ mod tests {
         let mut a = test_auth();
         a.anon = vec!["/health".into(), "/pub/*".into()];
         assert!(a.is_anonymous("/health") && a.is_anonymous("/pub/x"));
-        assert!(!a.is_anonymous("/health/x") && !a.is_anonymous("/pub") && !a.is_anonymous("/other"));
+        assert!(
+            !a.is_anonymous("/health/x") && !a.is_anonymous("/pub") && !a.is_anonymous("/other")
+        );
     }
 
     // ----- Task 4.3：login/refresh/logout（真实 sqlite）-----
 
     fn auth_cfg_db() -> AuthCfg {
-        AuthCfg { jwt_secret: "test-secret".into(), ..Default::default() }
+        AuthCfg {
+            jwt_secret: "test-secret".into(),
+            ..Default::default()
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn login_refresh_logout_flow() {
-        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
         let hash = bcrypt::hash("pw123", 4).unwrap();
         db.exec_with_params(
             "create table users (id integer primary key, username text, password_hash text, roles text)",
@@ -277,14 +312,22 @@ mod tests {
         // 密码错 → 401 语义（Err）
         assert!(a.login("u", "wrong").await.is_err());
         // 用户不存在 → 同报（不区分）
-        assert_eq!(a.login("nope", "x").await.unwrap_err(), "invalid credentials");
+        assert_eq!(
+            a.login("nope", "x").await.unwrap_err(),
+            "invalid credentials"
+        );
         // 成功 → 双 token + user
         let v = a.login("u", "pw123").await.unwrap();
         assert!(v["access_token"].is_string() && v["refresh_token"].is_string());
         assert_eq!(v["user"]["roles"][0], "admin");
         assert_eq!(v["expires_in"], 60);
         // access token 可验签
-        assert_eq!(a.verify_access(v["access_token"].as_str().unwrap()).unwrap().sub, "1");
+        assert_eq!(
+            a.verify_access(v["access_token"].as_str().unwrap())
+                .unwrap()
+                .sub,
+            "1"
+        );
         // refresh 轮换：旧 refresh 二次使用失败
         let r1 = v["refresh_token"].as_str().unwrap().to_string();
         let v2 = a.refresh(&r1).await.unwrap();

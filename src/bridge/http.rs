@@ -64,7 +64,10 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
 /// async + #[buffer] 返回（sync buffer-return 在 fast-call 路径卡死；与 blob ops 同款契约）。
 #[op2]
 #[buffer]
-pub async fn op_http_file(state: Rc<RefCell<OpState>>, #[smi] i: i32) -> Result<Vec<u8>, JsErrorBox> {
+pub async fn op_http_file(
+    state: Rc<RefCell<OpState>>,
+    #[smi] i: i32,
+) -> Result<Vec<u8>, JsErrorBox> {
     let s = state.borrow();
     let r = s.borrow::<ReqState>();
     r.req

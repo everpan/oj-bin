@@ -38,9 +38,10 @@ impl RuntimePool {
         Self {
             make: Box::new(move || {
                 // 模块加载器取 StableState.loader（单一事实来源；devserver 旧路径 None → 不配）。
-                let module_loader = stable.loader.clone().map(|inner| {
-                    Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>
-                });
+                let module_loader = stable
+                    .loader
+                    .clone()
+                    .map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
                 JsRuntime::new(RuntimeOptions {
                     extensions: vec![bridge_ext::init(stable.clone())],
                     inspector: inspect,

@@ -4,18 +4,18 @@
 
 mod cert_fixture;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cert_fixture::{TEST_RSA_PKCS8_B64, TEST_RSA_PUBLIC_PEM};
 use only_js::config::ServerCfg;
 use ring::rand::SystemRandom;
-use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde_json::json;
+use server::CertificateStatus;
 use server::certificate::load_certificate_at;
 use server::certificate_watcher::{
-    reload_certificate, spawn_watcher, SharedCertStatus, SharedCertValidUntil,
+    SharedCertStatus, SharedCertValidUntil, reload_certificate, spawn_watcher,
 };
-use server::CertificateStatus;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
@@ -23,7 +23,9 @@ use tempfile::NamedTempFile;
 /// 用测试私钥为给定 (nbf, exp) 生成已签名的 JWS，写入临时文件。
 /// 返回临时文件句柄（须保持存活，否则文件被删除）与对应路径。
 fn write_signed_cert(nbf: u64, exp: u64) -> (NamedTempFile, NamedTempFile, String, String) {
-    let pkcs8 = base64::engine::general_purpose::STANDARD.decode(TEST_RSA_PKCS8_B64).unwrap();
+    let pkcs8 = base64::engine::general_purpose::STANDARD
+        .decode(TEST_RSA_PKCS8_B64)
+        .unwrap();
     let key_pair = RsaKeyPair::from_pkcs8(&pkcs8).expect("load test key");
     let rng = SystemRandom::new();
 
@@ -65,7 +67,8 @@ fn now_secs() -> u64 {
 #[test]
 fn load_valid_cert() {
     let (_kf, _cf, k, c) = write_signed_cert(now_secs() - 100, now_secs() + 1000);
-    let (status, valid) = load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
+    let (status, valid) =
+        load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
     assert!(matches!(status, CertificateStatus::Valid));
     assert!(valid.is_some());
 }
@@ -74,7 +77,8 @@ fn load_valid_cert() {
 fn load_grace_cert() {
     // 过期 10 秒，宽限 30 天 → Grace
     let (_kf, _cf, k, c) = write_signed_cert(now_secs() - 2000, now_secs() - 10);
-    let (status, _valid) = load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
+    let (status, _valid) =
+        load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
     match status {
         CertificateStatus::Grace { remaining_secs } => {
             assert!(remaining_secs > 0 && remaining_secs <= 30 * 86_400);
@@ -87,7 +91,8 @@ fn load_grace_cert() {
 fn load_expired_cert() {
     // 过期远超 30 天宽限期 → Expired
     let (_kf, _cf, k, c) = write_signed_cert(now_secs() - 40 * 86_400, now_secs() - 35 * 86_400);
-    let (status, _valid) = load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
+    let (status, _valid) =
+        load_certificate_at(&cfg_with(&k, &c, 30), std::path::Path::new(".")).unwrap();
     assert!(matches!(status, CertificateStatus::Expired));
 }
 
@@ -103,11 +108,14 @@ fn load_rejects_wrong_alg() {
     let cert_file = NamedTempFile::new().unwrap();
     std::fs::write(key_file.path(), TEST_RSA_PUBLIC_PEM).unwrap();
     std::fs::write(cert_file.path(), jws).unwrap();
-    let res = load_certificate_at(&cfg_with(
-        &key_file.path().to_string_lossy(),
-        &cert_file.path().to_string_lossy(),
-        30,
-    ), std::path::Path::new("."));
+    let res = load_certificate_at(
+        &cfg_with(
+            &key_file.path().to_string_lossy(),
+            &cert_file.path().to_string_lossy(),
+            30,
+        ),
+        std::path::Path::new("."),
+    );
     assert!(res.is_err());
 }
 
@@ -119,10 +127,16 @@ fn watcher_picks_up_replaced_cert() {
     let valid_until: SharedCertValidUntil = Arc::new(RwLock::new(None));
 
     let cfg = cfg_with(&k, &c, 30);
-    spawn_watcher(status.clone(), valid_until.clone(), cfg.clone(), std::path::Path::new(".").to_path_buf());
+    spawn_watcher(
+        status.clone(),
+        valid_until.clone(),
+        cfg.clone(),
+        std::path::Path::new(".").to_path_buf(),
+    );
 
     // 用 rename 原子覆盖证书为「已过期且宽限期结束」（rename 事件最可靠）。
-    let (_ekf, _ecf, _ek, expired_cert) = write_signed_cert(now_secs() - 40 * 86_400, now_secs() - 35 * 86_400);
+    let (_ekf, _ecf, _ek, expired_cert) =
+        write_signed_cert(now_secs() - 40 * 86_400, now_secs() - 35 * 86_400);
     let new_content = std::fs::read(&expired_cert).unwrap();
     let tmp = NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &new_content).unwrap();

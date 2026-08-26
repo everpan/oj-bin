@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use only_js::config::ServerCfg;
 use notify::{Event, RecursiveMode, Watcher};
+use only_js::config::ServerCfg;
 
-use crate::certificate::{load_certificate_at, CertificateStatus};
+use crate::certificate::{CertificateStatus, load_certificate_at};
 
 /// 派生证书状态类型别名，避免调用处重复书写。
 pub type SharedCertStatus = Arc<RwLock<CertificateStatus>>;
@@ -31,7 +31,9 @@ pub fn reload_certificate(
     match load_certificate_at(cfg, config_dir) {
         Ok((s, v)) => {
             *status.write().expect("certificate_status lock poisoned") = s.clone();
-            *valid_until.write().expect("certificate_valid_until lock poisoned") = v;
+            *valid_until
+                .write()
+                .expect("certificate_valid_until lock poisoned") = v;
             log_status(&s);
         }
         Err(e) => tracing::warn!("certificate reload failed (keeping previous state): {e}"),
@@ -91,10 +93,16 @@ pub fn spawn_watcher(
         };
 
         if let Err(e) = watcher.watch(&cert_path, RecursiveMode::NonRecursive) {
-            tracing::warn!("certificate watcher: cannot watch cert {}: {e}", cert_path.display());
+            tracing::warn!(
+                "certificate watcher: cannot watch cert {}: {e}",
+                cert_path.display()
+            );
         }
         if let Err(e) = watcher.watch(&key_path, RecursiveMode::NonRecursive) {
-            tracing::warn!("certificate watcher: cannot watch key {}: {e}", key_path.display());
+            tracing::warn!(
+                "certificate watcher: cannot watch key {}: {e}",
+                key_path.display()
+            );
         }
         // 保持 watcher 句柄存活：线程 parked，直到进程退出。
         std::thread::park();

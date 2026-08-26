@@ -1,9 +1,11 @@
 //! FfiFuture：repr(C) future 句柄，插件侧 runtime 驱动的 oneshot 共享状态。
 //! 形态经 spike S.2 实证定稿（spikes/ffi-async/NOTES.md）：
+//!
 //! - poll：非阻塞查询 0 pending / 1 ready / -1 error（错误细节在 take 的 Err 里取）。
 //! - take：ready 后调一次取结果；宿主 take→free 后必须 state 置 null（防 Drop 二次 free）。
 //! - free：释放 state，null 安全；宿主 drop 句柄 = 放弃结果，插件任务允许跑完，不保证取消。
-//! 插件侧注意：tokio oneshot try_recv 是消费式的，poll 取到值必须暂存进 state。
+
+//!   插件侧注意：tokio oneshot try_recv 是消费式的，poll 取到值必须暂存进 state。
 //!
 //! I-2 修复（spec §3）：所有 vtable 方法经 [`catch_future`]/[`catch_void`] 包装，
 //! 同步 panic 收敛为错误 future / 静默丢弃，不再跨界展开（UB）。poll/take/free
@@ -116,7 +118,11 @@ pub fn ready_err(msg: impl Into<String>) -> FfiFuture {
     let (tx, rx) = tokio::sync::oneshot::channel();
     drop(tx); // 已 closed → poll 直接读 result 而非 0（pending）
     FfiFuture {
-        state: Box::into_raw(Box::new(FfiTask { rx, result: Some(Err(msg.into())) })).cast(),
+        state: Box::into_raw(Box::new(FfiTask {
+            rx,
+            result: Some(Err(msg.into())),
+        }))
+        .cast(),
         poll: task_poll,
         take: task_take,
         free: task_free,

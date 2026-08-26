@@ -45,7 +45,10 @@ pub fn spawn(inspector: Rc<JsRuntimeInspector>, addr: SocketAddr) -> tokio::task
 }
 
 /// 单条 DevTools 连接的消息桥接：WS 文本 <-> local session。
-async fn session_loop(inspector: Rc<JsRuntimeInspector>, ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+async fn session_loop(
+    inspector: Rc<JsRuntimeInspector>,
+    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
@@ -97,7 +100,10 @@ mod tests {
     async fn spawn_bind_failure_logs_and_returns() {
         // rt/insp 必须在 LocalSet 之外创建，且 LocalSet（持有 spawned 任务里的 insp clone）
         // 必须在 rt 之前释放，否则 JsRuntime drop 断言 "inspector must be dropped before runtime"。
-        let rt = JsRuntime::new(RuntimeOptions { inspector: true, ..Default::default() });
+        let rt = JsRuntime::new(RuntimeOptions {
+            inspector: true,
+            ..Default::default()
+        });
         let insp = rt.inspector();
         let ls = tokio::task::LocalSet::new();
         ls.run_until(async {
@@ -113,7 +119,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_forwards_cdp_and_close() {
-        let rt = JsRuntime::new(RuntimeOptions { inspector: true, ..Default::default() });
+        let rt = JsRuntime::new(RuntimeOptions {
+            inspector: true,
+            ..Default::default()
+        });
         let insp = rt.inspector();
         // 取空闲端口后释放，交给 spawn 重新绑定。
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -125,14 +134,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
 
             let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
-            ws.send(Message::Text(r#"{"id":1,"method":"Runtime.enable"}"#.into()))
-                .await
-                .unwrap();
+            ws.send(Message::Text(
+                r#"{"id":1,"method":"Runtime.enable"}"#.into(),
+            ))
+            .await
+            .unwrap();
             // 期望收到 CDP 响应/事件（带超时防挂死）。
             let got = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
             assert!(got.is_ok(), "expected a CDP frame from inspector");
             let msg = got.unwrap().unwrap().unwrap();
-            assert!(matches!(msg, Message::Text(_)), "expected text frame: {msg:?}");
+            assert!(
+                matches!(msg, Message::Text(_)),
+                "expected text frame: {msg:?}"
+            );
 
             // Close → session_loop 走 Close 分支并中止 pump。
             ws.send(Message::Close(None)).await.unwrap();

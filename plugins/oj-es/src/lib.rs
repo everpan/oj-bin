@@ -27,7 +27,10 @@ impl EsClientInner {
     fn new(endpoint: String) -> Self {
         Self {
             endpoint,
-            http: reqwest::Client::builder().no_proxy().build().unwrap_or_default(),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -54,7 +57,9 @@ fn state() -> &'static EsPluginState {
 async fn es_resp_b(resp: reqwest::Response, what: &str) -> Result<serde_json::Value, String> {
     let status = resp.status();
     if status.is_success() {
-        resp.json().await.map_err(|e| format!("{what}: parse response: {e}"))
+        resp.json()
+            .await
+            .map_err(|e| format!("{what}: parse response: {e}"))
     } else {
         let body = resp.text().await.unwrap_or_default();
         Err(format!("{what}: HTTP {status}: {body}"))
@@ -159,20 +164,18 @@ extern "C" fn search(handle: u64, index: RString, body: RString) -> FfiFuture {
 extern "C" fn index_doc(handle: u64, index: RString, id: RString, body: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_index(handle, &index[..], &id[..], &body[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_index(handle, &index[..], &id[..], &body[..]).await
+        })
     })
 }
 
 extern "C" fn delete_doc(handle: u64, index: RString, id: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
-        oj_plugin_ffi::spawn_ffi_future(
-            &st.rt,
-            async move { st.do_delete(handle, &index[..], &id[..]).await },
-        )
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_delete(handle, &index[..], &id[..]).await
+        })
     })
 }
 
@@ -182,18 +185,21 @@ extern "C" fn close(handle: u64) {
     })
 }
 
-static ES_VTABLE: EsBackendVtable = EsBackendVtable { search, index_doc, delete_doc, close };
+static ES_VTABLE: EsBackendVtable = EsBackendVtable {
+    search,
+    index_doc,
+    delete_doc,
+    close,
+};
 
 extern "C" fn register() -> PluginRegistrations {
     oj_plugin_ffi::catch_value(
-        || {
-            PluginRegistrations {
-                es: &ES_VTABLE,
-                db: std::ptr::null(),
-                blob: std::ptr::null(),
-                bus: std::ptr::null(),
-                kv: std::ptr::null(),
-            }
+        || PluginRegistrations {
+            es: &ES_VTABLE,
+            db: std::ptr::null(),
+            blob: std::ptr::null(),
+            bus: std::ptr::null(),
+            kv: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
@@ -220,7 +226,10 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     }
 
     let cfg_v: serde_json::Value = serde_json::from_str(&cfg[..]).unwrap_or(serde_json::json!({}));
-    let endpoint = cfg_v.get("endpoint").and_then(|v| v.as_str()).map(str::to_string);
+    let endpoint = cfg_v
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     // get_or_init：并发 init 时闭包只跑一次，竞争方阻塞后复用——不重复建 runtime，
     // 避免 `let _ = set(st)` 在竞争下把败者的 tokio Runtime 从 async 上下文 drop 崩溃。
@@ -229,10 +238,16 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
         if let Some(ep) = endpoint.as_deref() {
             if !ep.is_empty() {
                 clients.insert(0, EsClientInner::new(ep.to_string()));
-                (host.log)(2, RString::from(format!("oj-es: es backend ready, endpoint {ep}")));
+                (host.log)(
+                    2,
+                    RString::from(format!("oj-es: es backend ready, endpoint {ep}")),
+                );
             }
         }
-        EsPluginState { rt: runtime(), clients: Mutex::new(clients) }
+        EsPluginState {
+            rt: runtime(),
+            clients: Mutex::new(clients),
+        }
     });
 
     RResult::Ok(descriptor())
@@ -255,10 +270,13 @@ mod tests {
     use serde_json::Value;
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     fn host() -> RArc<HostContext> {
-        RArc::new(HostContext { log: test_log, deliver: test_deliver })
+        RArc::new(HostContext {
+            log: test_log,
+            deliver: test_deliver,
+        })
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询；插件任务跑在插件
@@ -285,8 +303,14 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
 
     #[test]
     fn url_for_trims_trailing_slash() {
-        assert_eq!(url_for("http://localhost:9200", "user", None), "http://localhost:9200/user/_search");
-        assert_eq!(url_for("http://localhost:9200/", "user", None), "http://localhost:9200/user/_search");
+        assert_eq!(
+            url_for("http://localhost:9200", "user", None),
+            "http://localhost:9200/user/_search"
+        );
+        assert_eq!(
+            url_for("http://localhost:9200/", "user", None),
+            "http://localhost:9200/user/_search"
+        );
         assert_eq!(
             url_for("http://localhost:9200", "user", Some("d1")),
             "http://localhost:9200/user/_doc/d1?refresh=true"
@@ -323,7 +347,9 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
         let c = EsClientInner::new(server.url("/").to_string());
         let v: Value = serde_json::from_slice(&c.search("user", "{}").await.unwrap()).unwrap();
         assert_eq!(v["hits"]["total"]["value"], 3, "{v}");
-        let v: Value = serde_json::from_slice(&c.index_doc("user", "d1", r#"{"a":1}"#).await.unwrap()).unwrap();
+        let v: Value =
+            serde_json::from_slice(&c.index_doc("user", "d1", r#"{"a":1}"#).await.unwrap())
+                .unwrap();
         assert_eq!(v["result"], "created", "{v}");
         let v: Value = serde_json::from_slice(&c.delete_doc("user", "d1").await.unwrap()).unwrap();
         assert_eq!(v["result"], "deleted", "{v}");
@@ -399,9 +425,14 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["hits"]["total"]["value"], 3, "{v}");
 
-        let bytes = drive(index_doc(0, RString::from("user"), RString::from("d1"), RString::from(r#"{"a":1}"#)))
-            .await
-            .expect("index_doc");
+        let bytes = drive(index_doc(
+            0,
+            RString::from("user"),
+            RString::from("d1"),
+            RString::from(r#"{"a":1}"#),
+        ))
+        .await
+        .expect("index_doc");
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["result"], "created", "{v}");
 
@@ -412,7 +443,9 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
         assert_eq!(v["result"], "deleted", "{v}");
 
         // 未知 handle → 错误（装配期外调用兜底）。
-        let e = drive(search(999, RString::from("user"), RString::from("{}"))).await.unwrap_err();
+        let e = drive(search(999, RString::from("user"), RString::from("{}")))
+            .await
+            .unwrap_err();
         assert!(e.contains("unknown handle 999"), "{e}");
 
         // 硬验收（spec §8 阶段 3）：插件自建 runtime 真实执行 sqlx 连接查询（内嵌
@@ -476,8 +509,14 @@ extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
     #[test]
     fn runtime_phase_panic_is_contained() {
         let rt = runtime();
-        let err = rt.block_on(rt.spawn(async { panic!("oj-es runtime boom") })).unwrap_err();
-        let payload = err.into_panic().downcast_ref::<&str>().copied().unwrap_or("?");
+        let err = rt
+            .block_on(rt.spawn(async { panic!("oj-es runtime boom") }))
+            .unwrap_err();
+        let payload = err
+            .into_panic()
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or("?");
         assert!(payload.contains("oj-es runtime boom"), "payload: {payload}");
     }
 }

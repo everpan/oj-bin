@@ -42,14 +42,9 @@ pub async fn op_fetch(
     if url.is_empty() {
         return Err(JsErrorBox::generic("fetch: url is required"));
     }
-    let client = state
-        .borrow()
-        .borrow::<Arc<StableState>>()
-        .client
-        .clone();
+    let client = state.borrow().borrow::<Arc<StableState>>().client.clone();
 
-    let method = reqwest::Method::from_bytes(method.as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut req = client.request(method, &url);
     for (k, v) in &headers {
         req = req.header(k, v);
@@ -57,7 +52,10 @@ pub async fn op_fetch(
     if let Some(b) = body {
         req = req.body(b);
         // 用户未显式设置 Content-Type 时自动推断。
-        if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+        if !headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"))
+        {
             req = req.header("Content-Type", "text/plain;charset=UTF-8");
         }
     }
@@ -71,8 +69,7 @@ pub async fn op_fetch(
     let mut hdrs = HashMap::new();
     for (k, v) in resp.headers() {
         let val = v.to_str().unwrap_or_default();
-        hdrs
-            .entry(k.as_str().to_string())
+        hdrs.entry(k.as_str().to_string())
             .and_modify(|e: &mut String| {
                 e.push_str(", ");
                 e.push_str(val);
@@ -164,7 +161,10 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400);
-        assert!(v["msg"].as_str().unwrap().contains("url is required"), "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("url is required"),
+            "{v}"
+        );
 
         // 端口 1 无监听 → 连接拒绝
         let cap = b

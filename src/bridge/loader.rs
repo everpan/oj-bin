@@ -74,7 +74,9 @@ impl HandlerStore {
                     tracing::debug!(target: "handler", name = %name, "loaded");
                     map.insert(name, src);
                 }
-                Err(err) => tracing::warn!(target: "handler", %err, path = %path.display(), "read failed"),
+                Err(err) => {
+                    tracing::warn!(target: "handler", %err, path = %path.display(), "read failed")
+                }
             }
         }
         map
@@ -198,7 +200,9 @@ mod tests {
         let dir = unique_dir("fromenv");
         std::fs::write(dir.join("e.js"), "e").unwrap();
         let prev = std::env::var("MDM_HANDLER_DIR").ok();
-        unsafe { std::env::set_var("MDM_HANDLER_DIR", &dir); }
+        unsafe {
+            std::env::set_var("MDM_HANDLER_DIR", &dir);
+        }
         let store = HandlerStore::from_env();
         assert_eq!(store.get("e").as_deref(), Some("e"));
         assert_eq!(store.dir(), Some(dir.as_path()));

@@ -12,12 +12,8 @@ pub struct BlobBackendVtable {
     /// 建立后端（name = 注册名，cfg = JSON 配置）。ok 值 = `{"handle": u64}` JSON。
     pub connect: extern "C" fn(name: RString, cfg: RString) -> FfiFuture,
     /// ok 值 = 空（成功）；content_type 空串 = 无显式 ct。
-    pub put: extern "C" fn(
-        handle: u64,
-        key: RString,
-        bytes: RBytes,
-        content_type: RString,
-    ) -> FfiFuture,
+    pub put:
+        extern "C" fn(handle: u64, key: RString, bytes: RBytes, content_type: RString) -> FfiFuture,
     /// ok 值 = 原始字节。
     pub get: extern "C" fn(handle: u64, key: RString) -> FfiFuture,
     /// 幂等删除；ok 值 = 空。

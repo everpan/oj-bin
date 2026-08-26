@@ -16,7 +16,12 @@ pub fn op_json_ok(state: &mut OpState, #[string] data_json: String) {
 
 /// json.fail(code, msg, data?)：写失败信封，code<=0 映射 500。
 #[op2]
-pub fn op_json_fail(state: &mut OpState, code: i32, #[string] msg: String, #[serde] data: serde_json::Value) {
+pub fn op_json_fail(
+    state: &mut OpState,
+    code: i32,
+    #[string] msg: String,
+    #[serde] data: serde_json::Value,
+) {
     let s = state.borrow_mut::<ReqState>();
     let (body, status) = envelope::fail(code, &msg, &data);
     s.response = Some(body);
@@ -30,8 +35,5 @@ pub fn op_json_header(state: &mut OpState, #[string] name: String, #[string] val
     if name.is_empty() {
         return;
     }
-    state
-        .borrow_mut::<ReqState>()
-        .headers
-        .insert(name, value);
+    state.borrow_mut::<ReqState>().headers.insert(name, value);
 }

@@ -6,18 +6,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use only_js::bridge::transpile::transpile_hits;
-use only_js::config::Config;
 use oj::args::BuildArgs;
 use oj::server_cmd;
+use only_js::bridge::transpile::transpile_hits;
+use only_js::config::Config;
 
 fn lock() -> MutexGuard<'static, ()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
-    L.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    L.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn sample() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../sample")
+        .canonicalize()
+        .unwrap()
 }
 
 async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
@@ -32,7 +37,10 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     let mut cfg: Config =
         serde_yaml::from_str(&std::fs::read_to_string(root.join("config.yaml")).unwrap()).unwrap();
     cfg.server.port = 0;
-    cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", tmp.display()));
+    cfg.db.insert(
+        "default".into(),
+        format!("sqlite://{}/db.sqlite", tmp.display()),
+    );
     // e2e 是 v0.1 UC 验收（不带租户头/不登录）；sample 的 tenant/auth 留给手工冒烟，
     // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
     cfg.tenant = Default::default();
@@ -54,7 +62,9 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         .unwrap();
         dist
     };
-    let (addr, h) = server_cmd::start(cfg, &root, dir, "/v1/api".into(), dev).await.unwrap();
+    let (addr, h) = server_cmd::start(cfg, &root, dir, "/v1/api".into(), dev)
+        .await
+        .unwrap();
     (addr, h, tmp)
 }
 
@@ -70,7 +80,9 @@ async fn req(
         format!("http://{addr}{path}"),
     );
     if let Some(b) = body {
-        r = r.header("content-type", "application/json").body(b.to_string());
+        r = r
+            .header("content-type", "application/json")
+            .body(b.to_string());
     }
     let resp = r.send().await.unwrap();
     let status = resp.status().as_u16();
@@ -126,7 +138,13 @@ async fn uc2_uc3_crud_params_body() {
     assert_eq!(s, 200);
     assert_eq!(v["data"][0]["name"], "neo", "{v}");
     // PUT 改名后 GET 验证。
-    let _ = req(addr, "PUT", "/v1/api/user/account/", Some(r#"{"id":1,"name":"neo2"}"#)).await;
+    let _ = req(
+        addr,
+        "PUT",
+        "/v1/api/user/account/",
+        Some(r#"{"id":1,"name":"neo2"}"#),
+    )
+    .await;
     let (_, v) = req(addr, "GET", "/v1/api/user/account/?id=1", None).await;
     assert_eq!(v["data"][0]["name"], "neo2", "{v}");
     let (s, _) = req(addr, "DELETE", "/v1/api/user/account/?id=2", None).await;
@@ -196,7 +214,11 @@ async fn uc14_transpile_cache_and_hot_reload() {
     let t = std::env::temp_dir().join(format!("oj-hot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&t);
     std::fs::create_dir_all(t.join("src/u/f")).unwrap();
-    std::fs::write(t.join("src/u/manifest.yaml"), "name: u\ndesc: d\nversion: 0.1.0\n").unwrap();
+    std::fs::write(
+        t.join("src/u/manifest.yaml"),
+        "name: u\ndesc: d\nversion: 0.1.0\n",
+    )
+    .unwrap();
     std::fs::write(
         t.join("src/u/f/api.ts"),
         "export default { get() { json.ok({ v: 1 }); } };\n",
@@ -206,8 +228,9 @@ async fn uc14_transpile_cache_and_hot_reload() {
     cfg.server.port = 0;
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     std::fs::write(t.join("seed.sql"), "").unwrap();
-    let (addr, _h) =
-        server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true).await.unwrap();
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
     let before = transpile_hits();
     for _ in 0..3 {
         let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
@@ -260,7 +283,10 @@ const MANIFEST: &str = "name: u\ndesc: d\nversion: 0.1.0\n";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc7_manifest_mismatch_blocks_startup() {
     let _g = lock();
-    let t = tmp_project(&[("src/order/manifest.yaml", "name: orderr\ndesc: d\nversion: 0.1.0\n")]);
+    let t = tmp_project(&[(
+        "src/order/manifest.yaml",
+        "name: orderr\ndesc: d\nversion: 0.1.0\n",
+    )]);
     let e = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
         .await
         .err()
@@ -282,7 +308,10 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
              detail.route = \"{id}\";\n\
              export default { get: detail };\n",
         ),
-        ("src/u/list/api.ts", "export default { get() { json.ok({ all: true }); } };\n"),
+        (
+            "src/u/list/api.ts",
+            "export default { get() { json.ok({ all: true }); } };\n",
+        ),
     ]);
     let a = BuildArgs {
         module: Some("u".into()),
@@ -312,8 +341,9 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         "0.1.0"
     );
     // release 全链路：聚合 dist/manifests.yaml 锁定版本服务（spec §3）
-    let (addr, _h) =
-        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+        .await
+        .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/item/3", None).await;
     assert_eq!(s, 200, "{v}"); // .route 行：{id} 参数 + _shared import 生效
     assert_eq!(v["data"]["id"], 3, "{v}");
@@ -328,15 +358,24 @@ async fn build_then_release_serves_end_to_end() {
     let _g = lock();
     // 夹具：两个模块（user 0.1.0 带 .route、other 0.9.0 纯镜像）
     let t = tmp_project(&[
-        ("src/user/manifest.yaml", "name: user\ndesc: d\nversion: 0.1.0\n"),
+        (
+            "src/user/manifest.yaml",
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        ),
         (
             "src/user/item/api.ts",
             "function get() { json.ok({ id: Number(http.param(\"id\", 0)) }); }\n\
              get.route = \"{id}\";\n\
              export default { get };\n",
         ),
-        ("src/other/manifest.yaml", "name: other\ndesc: d\nversion: 0.9.0\n"),
-        ("src/other/l/api.ts", "export default { get() { json.ok({ m: 1 }); } };\n"),
+        (
+            "src/other/manifest.yaml",
+            "name: other\ndesc: d\nversion: 0.9.0\n",
+        ),
+        (
+            "src/other/l/api.ts",
+            "export default { get() { json.ok({ m: 1 }); } };\n",
+        ),
     ]);
     oj::build_cmd::run(&BuildArgs {
         module: None,
@@ -350,8 +389,9 @@ async fn build_then_release_serves_end_to_end() {
     let lock = oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
     assert_eq!(lock.len(), 2, "{lock:?}");
     assert_eq!(lock["other"], "0.9.0");
-    let (addr, _h) =
-        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+        .await
+        .unwrap();
     // /v1/api/user/item/3 命中 .route 行；/v1/api/other/l 命中镜像行
     let (s, v) = req(addr, "GET", "/v1/api/user/item/3", None).await;
     assert_eq!(s, 200, "{v}");
@@ -371,14 +411,18 @@ async fn release_mode_loads_routes_js_without_introspection() {
     let t = tmp_project(&[
         ("dist/manifests.yaml", "u: 0.1.0\n"),
         ("dist/u-0.1.0/manifest.yaml", MANIFEST),
-        ("dist/u-0.1.0/f/api.js", "export default { get() { json.ok({ v: 1 }); } };\n"),
+        (
+            "dist/u-0.1.0/f/api.js",
+            "export default { get() { json.ok({ v: 1 }); } };\n",
+        ),
         (
             "dist/u-0.1.0/routes.js",
             "export default [ { method: \"get\", pattern: \"u/f/{id}\", file: \"f/api.js\" } ];\n",
         ),
     ]);
-    let (addr, _h) =
-        server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false).await.unwrap();
+    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+        .await
+        .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/7", None).await;
     assert_eq!(s, 200);
     assert_eq!(v["data"]["v"], 1, "{v}");
@@ -405,7 +449,10 @@ async fn uc10_404_and_405_and_traversal() {
     let _g = lock();
     let t = tmp_project(&[
         ("src/u/manifest.yaml", MANIFEST),
-        ("src/u/f/api.ts", "export default { get() { json.ok({}); } };\n"),
+        (
+            "src/u/f/api.ts",
+            "export default { get() { json.ok({}); } };\n",
+        ),
     ]);
     let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
         .await
@@ -443,8 +490,14 @@ async fn uc12_timeout_408_server_survives() {
     let _g = lock();
     let t = tmp_project(&[
         ("src/u/manifest.yaml", MANIFEST),
-        ("src/u/loop/api.ts", "export default { get() { while (true) {} } };\n"),
-        ("src/u/ok/api.ts", "export default { get() { json.ok({ alive: true }); } };\n"),
+        (
+            "src/u/loop/api.ts",
+            "export default { get() { while (true) {} } };\n",
+        ),
+        (
+            "src/u/ok/api.ts",
+            "export default { get() { json.ok({ alive: true }); } };\n",
+        ),
     ]);
     let mut cfg = base_cfg();
     cfg.server.timeout = "300ms".into();

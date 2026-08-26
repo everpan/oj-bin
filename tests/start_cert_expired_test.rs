@@ -5,13 +5,13 @@
 
 mod cert_fixture;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cert_fixture::{TEST_RSA_PKCS8_B64, TEST_RSA_PUBLIC_PEM};
 use oj::args::ServerArgs;
 use oj::server_cmd;
-use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use ring::rand::SystemRandom;
+use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
@@ -19,7 +19,9 @@ use tempfile::NamedTempFile;
 /// 写出「已过期、宽限期 0」的真实签名 JWS 证书 + 对应公钥。
 /// 返回临时文件句柄（须保持存活）与对应路径。
 fn expired_cert_files() -> (NamedTempFile, NamedTempFile, String, String) {
-    let pkcs8 = base64::engine::general_purpose::STANDARD.decode(TEST_RSA_PKCS8_B64).unwrap();
+    let pkcs8 = base64::engine::general_purpose::STANDARD
+        .decode(TEST_RSA_PKCS8_B64)
+        .unwrap();
     let key_pair = RsaKeyPair::from_pkcs8(&pkcs8).expect("load test key");
     let rng = SystemRandom::new();
 
@@ -31,9 +33,8 @@ fn expired_cert_files() -> (NamedTempFile, NamedTempFile, String, String) {
     let exp = now - 1000; // 已过期 1000 秒，grace_days=0 → 宽限期结束
 
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(
-        serde_json::to_string(&json!({ "nbf": nbf, "exp": exp })).unwrap(),
-    );
+    let payload =
+        URL_SAFE_NO_PAD.encode(serde_json::to_string(&json!({ "nbf": nbf, "exp": exp })).unwrap());
     let signing_input = format!("{}.{}", header, payload);
     let mut sig = vec![0u8; key_pair.public().modulus_len()];
     key_pair
@@ -72,7 +73,10 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     })
     .await;
 
-    assert!(result.is_err(), "server must refuse to start when cert expired");
+    assert!(
+        result.is_err(),
+        "server must refuse to start when cert expired"
+    );
     let msg = result.unwrap_err();
     assert!(
         msg.contains("certificate"),

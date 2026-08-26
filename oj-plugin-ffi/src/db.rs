@@ -3,7 +3,7 @@
 //! `schemes` 是工厂级属性（无 handle）：插件自我声明认领的 DSN scheme 前缀，
 //! 宿主装配 DbBackendRegistry 时据此路由（spec §2 认领式；不硬编码 scheme 白名单）。
 
-use crate::{FfiFuture, RVec, RString};
+use crate::{FfiFuture, RString, RVec};
 
 #[stabby::stabby]
 #[repr(C)]
@@ -20,7 +20,8 @@ pub struct DataAccessorVtable {
     pub exec: extern "C" fn(handle: u64, sql: RString, params: RString) -> FfiFuture,
     /// 开启事务。ok 值 = `{"tx_id": u64}` JSON。
     pub begin: extern "C" fn(handle: u64) -> FfiFuture,
-    pub tx_query: extern "C" fn(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture,
+    pub tx_query:
+        extern "C" fn(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture,
     pub tx_exec: extern "C" fn(handle: u64, tx_id: u64, sql: RString, params: RString) -> FfiFuture,
     pub tx_commit: extern "C" fn(handle: u64, tx_id: u64) -> FfiFuture,
     pub tx_rollback: extern "C" fn(handle: u64, tx_id: u64) -> FfiFuture,

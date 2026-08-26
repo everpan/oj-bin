@@ -83,23 +83,33 @@ impl JsActor {
                     rt.block_on(async move {
                         while let Some(job) = rx.recv().await {
                             let (out, resp) = match job {
-                                Job::Source { source, req, timeout, resp } => {
+                                Job::Source {
+                                    source,
+                                    req,
+                                    timeout,
+                                    resp,
+                                } => {
                                     let out = match timeout {
                                         Some(t) => bridge
                                             .run_with_timeout(&source, req, t)
                                             .await
                                             .map_err(RunFail::from),
-                                        None => bridge
-                                            .run_with(&source, req)
-                                            .await
-                                            .map_err(|e| RunFail {
+                                        None => bridge.run_with(&source, req).await.map_err(|e| {
+                                            RunFail {
                                                 msg: e.to_string(),
                                                 timeout: false,
-                                            }),
+                                            }
+                                        }),
                                     };
                                     (out, resp)
                                 }
-                                Job::Module { path, method, req, timeout, resp } => {
+                                Job::Module {
+                                    path,
+                                    method,
+                                    req,
+                                    timeout,
+                                    resp,
+                                } => {
                                     let t = timeout.unwrap_or(NO_TIMEOUT_SENTINEL);
                                     let out = bridge
                                         .run_module(&path, &method, req, t)
@@ -228,15 +238,12 @@ mod tests {
     // 池：多线程轮询分发，所有 job 均被执行。
     #[tokio::test]
     async fn pool_runs_all_jobs() {
-        let pool = JsActor::pool(
-            3,
-            || {
-                Bridge::new(
-                    std::sync::Arc::new(InMemoryAccessor::new()),
-                    std::sync::Arc::new(InMemoryKV::new()),
-                )
-            },
-        );
+        let pool = JsActor::pool(3, || {
+            Bridge::new(
+                std::sync::Arc::new(InMemoryAccessor::new()),
+                std::sync::Arc::new(InMemoryKV::new()),
+            )
+        });
         let jobs: Vec<_> = (0..9)
             .map(|i| {
                 let p = pool.clone();

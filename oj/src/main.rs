@@ -40,7 +40,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("oj-main-{}-{}-{}", name, std::process::id(), std::sync::atomic::AtomicUsize::new(0).fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let d = std::env::temp_dir().join(format!(
+            "oj-main-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::sync::atomic::AtomicUsize::new(0)
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -50,8 +56,16 @@ mod tests {
     async fn build_ok_returns_zero() {
         let d = tmp("build-ok");
         std::fs::create_dir_all(d.join("src/u")).unwrap();
-        std::fs::write(d.join("src/u/manifest.yaml"), "name: u\ndesc: d\nversion: 0.1.0\n").unwrap();
-        std::fs::write(d.join("src/u/api.ts"), "export default { get() { json.ok({}); } };\n").unwrap();
+        std::fs::write(
+            d.join("src/u/manifest.yaml"),
+            "name: u\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("src/u/api.ts"),
+            "export default { get() { json.ok({}); } };\n",
+        )
+        .unwrap();
         let a = BuildArgs {
             module: None,
             dir: d.join("src").display().to_string(),

@@ -8,33 +8,35 @@
 //!   占位处理，不跑帧循环（修正 #3）。
 //! - 外层 `timeout` 包裹防止 handler 死循环挂死测试 task（修正 #10）。
 
+#![allow(clippy::needless_borrow)]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use tower::util::ServiceExt;
+use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
     Bridge, Dialect, EsBackend, Extras, InMemoryKV, KVStore, LoaderShared, SchemaRegistry,
 };
-use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::{EventBroker, StableState};
 use only_js::config::{self, Config};
+use server::CertificateStatus;
 use server::actor::JsActor;
+use server::certificate::load_certificate_at;
+use server::certificate_watcher::{SharedCertStatus, SharedCertValidUntil, spawn_watcher};
 use server::routes;
 use server::ws;
-use server::certificate::load_certificate_at;
-use server::certificate_watcher::{spawn_watcher, SharedCertStatus, SharedCertValidUntil};
-use server::CertificateStatus;
 use tokio::task::JoinHandle;
+use tower::util::ServiceExt;
 
 use crate::manifest;
-use crate::server_cmd::{assemble_blobs, assemble_plugins, connect_dbs, Registries};
+use crate::server_cmd::{Registries, assemble_blobs, assemble_plugins, connect_dbs};
 
 /// 进程内 HTTP 派发契约：测试运行时把 `Arc<App>` 注入 OpState，JS `client` 全局经
 /// `op_client_dispatch` 调它。trait 必须 `Send+Sync+'static` 且方法用 `async_trait`
@@ -77,7 +79,9 @@ impl App {
         // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
         let dir = dir.canonicalize().unwrap_or(dir);
         let loader = Arc::new(LoaderShared {
-            project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
+            project_root: config_dir
+                .canonicalize()
+                .unwrap_or_else(|_| config_dir.to_path_buf()),
             ts,
         });
         // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
@@ -95,7 +99,7 @@ impl App {
                 None => {
                     return Err("config declares redis.default but no kv plugin loaded \
                                 (run `cargo xtask plugin kv-redis`)"
-                        .to_string())
+                        .to_string());
                 }
             },
             None => Arc::new(InMemoryKV::new()),
@@ -119,7 +123,9 @@ impl App {
                 let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
                 if let Some(db) = dbs.get("default") {
                     for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
+                        db.exec_with_params(stmt, &[])
+                            .await
+                            .map_err(|e| format!("seed: {e}"))?;
                     }
                 }
             } else {
@@ -129,10 +135,13 @@ impl App {
         // 鉴权。
         let auth = match &cfg.auth {
             Some(a) if a.jwt_secret.trim().is_empty() => {
-                return Err("auth.jwt_secret must not be empty".into())
+                return Err("auth.jwt_secret must not be empty".into());
             }
             Some(a) => {
-                let db = dbs.get("default").ok_or("auth requires db 'default'")?.clone();
+                let db = dbs
+                    .get("default")
+                    .ok_or("auth requires db 'default'")?
+                    .clone();
                 Some(Arc::new(
                     server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?,
                 ))
@@ -176,10 +185,19 @@ impl App {
             for m in manifest::load_modules(&dir)? {
                 eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
             }
-            routes::RouteTable::build(&base, &dir, ts, routes::bridge_introspector(make_bridge.clone()))
+            routes::RouteTable::build(
+                &base,
+                &dir,
+                ts,
+                routes::bridge_introspector(make_bridge.clone()),
+            )
         } else {
-            let lock = manifest::load_lock(&dir.join("manifests.yaml"))
-                .map_err(|e| format!("release mode: {}: {e}", dir.join("manifests.yaml").display()))?;
+            let lock = manifest::load_lock(&dir.join("manifests.yaml")).map_err(|e| {
+                format!(
+                    "release mode: {}: {e}",
+                    dir.join("manifests.yaml").display()
+                )
+            })?;
             if lock.is_empty() {
                 return Err(format!(
                     "release mode: {} missing or empty — run `oj build` first",
@@ -229,7 +247,10 @@ impl App {
             eprintln!("error: route: {f}");
         }
         if !failures.is_empty() {
-            eprintln!("warn: {} route declaration(s) skipped (see errors above)", failures.len());
+            eprintln!(
+                "warn: {} route declaration(s) skipped (see errors above)",
+                failures.len()
+            );
         }
         for (_, file, methods) in table.grouped() {
             eprintln!("  {}:", file.display());
@@ -245,8 +266,15 @@ impl App {
         let static_root = match &cfg.server.root {
             Some(r) => {
                 let p = Path::new(r);
-                let p = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
-                Some(p.canonicalize().map_err(|e| format!("server.root {}: {e}", p.display()))?)
+                let p = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    config_dir.join(p)
+                };
+                Some(
+                    p.canonicalize()
+                        .map_err(|e| format!("server.root {}: {e}", p.display()))?,
+                )
             }
             None => None,
         };
@@ -302,8 +330,19 @@ impl App {
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
         );
-        let router = server::app(&base, dir, ts, table, actor, timeout, static_root, pipeline, cert_status, cert_valid_until)
-            .merge(ws_router);
+        let router = server::app(
+            &base,
+            dir,
+            ts,
+            table,
+            actor,
+            timeout,
+            static_root,
+            pipeline,
+            cert_status,
+            cert_valid_until,
+        )
+        .merge(ws_router);
         // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
         let stable = Arc::new(StableState {
             kv: kv.clone(),
@@ -314,12 +353,19 @@ impl App {
                 .unwrap_or_default(),
             registry: Arc::new(SchemaRegistry::new()),
             loader: Some(loader.clone()),
-            blobs: blobs.clone().unwrap_or_else(|| Arc::new(BlobRegistry::new())),
+            blobs: blobs
+                .clone()
+                .unwrap_or_else(|| Arc::new(BlobRegistry::new())),
             bus: bus.clone(),
             es: es.clone(),
             plugins: Vec::new(),
         });
-        Ok(App { router, bus, stable, base })
+        Ok(App {
+            router,
+            bus,
+            stable,
+            base,
+        })
     }
 
     /// 进程内 dispatch：克隆 router + oneshot（零 TCP）。外层 timeout 防 hang（修正 #10）。

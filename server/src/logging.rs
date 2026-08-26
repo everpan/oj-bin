@@ -14,9 +14,9 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 static INITED: AtomicBool = AtomicBool::new(false);
 
@@ -41,28 +41,28 @@ pub fn init(logs_dir: &Path) {
         return;
     }
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // 文件层（无颜色），每次启动一个新文件，跨天按天滚动；失败则降级为仅 stderr。
-    let file_layer: Option<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>> =
-        match build_file_writer(logs_dir) {
-            Ok(w) => {
-                let (nb, guard) = tracing_appender::non_blocking(w);
-                // 保活 worker 线程：丢弃 guard 使其常驻进程生命周期，避免日志丢失。
-                std::mem::forget(guard);
-                Some(Box::new(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(nb)
-                        .with_ansi(false)
-                        .with_target(false),
-                ))
-            }
-            Err(e) => {
-                eprintln!("warn: log file init failed ({e}); logging to stderr only");
-                None
-            }
-        };
+    let file_layer: Option<
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+    > = match build_file_writer(logs_dir) {
+        Ok(w) => {
+            let (nb, guard) = tracing_appender::non_blocking(w);
+            // 保活 worker 线程：丢弃 guard 使其常驻进程生命周期，避免日志丢失。
+            std::mem::forget(guard);
+            Some(Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(nb)
+                    .with_ansi(false)
+                    .with_target(false),
+            ))
+        }
+        Err(e) => {
+            eprintln!("warn: log file init failed ({e}); logging to stderr only");
+            None
+        }
+    };
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
