@@ -91,33 +91,54 @@ pub fn op_state(rt: &JsRuntime) -> Rc<RefCell<deno_core::OpState>> {
 /// 超时熔断开关：arm 记录 v8::IsolateHandle + deadline；看门狗线程到期跨线程 terminate。
 /// IsolateHandle 是 V8 提供的跨线程终止官方途径（Send+Sync，内部 Arc<IsolateHandleInner>），
 /// 持有真实 isolate 指针且自带生命周期管理——不必（也不能）手存裸指针。
+///
+/// 生命周期与 `Bridge` 绑定：看门狗线程仅持 `Weak<KillSwitch>`，`Bridge` 析构触发本结构
+/// `Drop` 时置位 `stop` 并 join 线程——进程退出 / 单测结束均无残留线程。此前每条测试各泄漏
+/// 一个看门狗线程，glibc 进程退出时这些仍在自旋的线程与 V8 平台析构相互干扰，导致 SIGSEGV
+/// （macOS 容错更强，故仅 Linux CI 暴露）。若 `Bridge` 在 armed 状态下被丢弃（请求中途
+/// panic），`Drop` 会先清空 slot 中的 isolate 句柄，杜绝看门狗在 isolate 已析构后误
+/// `terminate_execution`（同样会 SIGSEGV）。
 /// 每个 Bridge 一个实例（对应一个 JS actor 线程，串行执行故单槽足够）。
 #[derive(Default)]
 pub struct KillSwitch {
     slot: Mutex<Option<(v8::IsolateHandle, Instant)>>,
     fired: AtomicBool,
+    /// Drop 时置位，通知看门狗线程退出（避免线程泄漏）。
+    stop: AtomicBool,
+    /// 看门狗线程句柄；Drop 时 join 回收（仅用于生命周期管理，不参与熔断逻辑）。
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl KillSwitch {
-    /// 创建并启动看门狗线程（进程生命周期，25ms 轮询粒度）。
+    /// 创建并启动看门狗线程（随 `Bridge` 生命周期，25ms 轮询粒度）。
     pub fn spawn() -> Arc<Self> {
         let sw = Arc::new(Self::default());
-        let t = sw.clone();
-        std::thread::Builder::new()
+        // 线程只持 Weak：避免强引用环使 Drop 永不触发（→ 线程泄漏且无法 join）。
+        let weak = Arc::downgrade(&sw);
+        let handle = std::thread::Builder::new()
             .name("js-watchdog".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(25));
-                let g = t.slot.lock().unwrap();
-                if let Some((handle, deadline)) = g.as_ref()
-                    && Instant::now() >= *deadline
-                    && !t.fired.load(Ordering::Relaxed)
-                {
-                    // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
-                    handle.terminate_execution();
-                    t.fired.store(true, Ordering::Relaxed);
+            .spawn(move || {
+                while let Some(sw) = weak.upgrade() {
+                    if sw.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                    if sw.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let g = sw.slot.lock().unwrap();
+                    if let Some((h, deadline)) = g.as_ref()
+                        && Instant::now() >= *deadline
+                        && !sw.fired.load(Ordering::Relaxed)
+                    {
+                        // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
+                        h.terminate_execution();
+                        sw.fired.store(true, Ordering::Relaxed);
+                    }
                 }
             })
             .expect("spawn js-watchdog");
+        *sw.thread.lock().unwrap() = Some(handle);
         sw
     }
 
@@ -130,5 +151,17 @@ impl KillSwitch {
     pub(crate) fn disarm(&self) -> bool {
         *self.slot.lock().unwrap() = None;
         self.fired.swap(false, Ordering::Relaxed)
+    }
+}
+
+impl Drop for KillSwitch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // armed 状态下 Bridge 被丢弃（如请求中途 panic）：清空 isolate 句柄，
+        // 避免看门狗在 isolate 已析构后误 terminate（SIGSEGV 隐患）。
+        *self.slot.lock().unwrap() = None;
+        if let Some(h) = self.thread.lock().unwrap().take() {
+            let _ = h.join();
+        }
     }
 }
