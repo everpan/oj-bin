@@ -1,7 +1,7 @@
 //! 集成测试：gen/renew 产物用 rsa 独立解码 + 验签（与生成路径不对称，可捕格式错误）。
 
 use base64::Engine;
-use oj_cert::{GenOpts, MIN_BITS, r#gen};
+use oj_cert::{GenOpts, MIN_BITS, RenewOpts, r#gen, renew};
 use rsa::RsaPublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
@@ -94,5 +94,57 @@ fn rejects_bad_params() {
     })
     .unwrap_err();
     assert!(e.contains("bits must be"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn renews_with_moved_exp_and_same_key() {
+    let dir = tmpdir("renew");
+    r#gen(&GenOpts {
+        out_dir: dir.clone(),
+        bits: MIN_BITS,
+        nbf: 1_000_000,
+        exp: 1_000_100,
+    })
+    .unwrap();
+    let new_exp = 3_000_000_u64;
+    let out = renew(&RenewOpts {
+        key_path: dir.join("private.pem"),
+        out_dir: Some(dir.clone()),
+        nbf: 1_000_000,
+        exp: new_exp,
+    })
+    .unwrap();
+    assert_eq!(out, dir.join("cert.jws"));
+    let pub_pem = std::fs::read_to_string(dir.join("public.pem")).unwrap();
+    verify_jws(
+        &pub_pem,
+        &std::fs::read_to_string(&out).unwrap(),
+        1_000_000,
+        new_exp,
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn renew_rejects_bad_exp_and_missing_key() {
+    let dir = tmpdir("renew-bad");
+    let e = renew(&RenewOpts {
+        key_path: dir.join("no.pem"),
+        out_dir: None,
+        nbf: 100,
+        exp: 100,
+    })
+    .unwrap_err();
+    assert!(e.contains("exp must be greater"), "{e}");
+    let e = renew(&RenewOpts {
+        key_path: dir.join("no.pem"),
+        out_dir: None,
+        nbf: 100,
+        exp: 200,
+    })
+    .unwrap_err();
+    assert!(e.contains("read key"), "{e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
