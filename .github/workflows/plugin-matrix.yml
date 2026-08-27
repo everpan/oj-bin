@@ -36,6 +36,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。
+      # cmake crate 用 find_vs_version 探测最新 VS：镜像若装 VS2026 会生成 cmake 3.29
+      # 不认识的 "Visual Studio 18 2026" → "Could not create named generator"。
+      # 钉死 VisualStudioVersion=17.0（等价 VS2022 vcvars 环境语义），cmake/cc crate
+      # 即统一指向 VS2022 → "Visual Studio 17 2022"（cmake 3.29 支持，windows 镜像自带）。
+      - name: Pin VisualStudioVersion for rdkafka-sys cmake generator
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: echo "VisualStudioVersion=17.0" >> "$GITHUB_ENV"
+
       # musl 行启用时：
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。

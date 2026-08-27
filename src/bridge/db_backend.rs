@@ -108,24 +108,27 @@ impl DbBackend for MemoryBackend {
 }
 
 /// sqlite DSN 归一：相对路径相对 config_dir 绝对化（缺文件建零长空库，
-/// sqlx 默认 create_if_missing=false）；内存与 `:memory:`/`//` 特殊形式直通。
+/// sqlx 默认 create_if_missing=false）；内存与 `//` 特殊形式直通。
+/// 绝对路径统一以 `sqlite:`（单冒号）承载并转正斜杠——`sqlite://C:\...`
+/// 经 Any 驱动内部 Url 解析会把盘符吞成 host（`sqlite://C/...`），sqlite 随之
+/// 按相对路径开库失败（SQLITE_CANTOPEN，code 14）；单冒号形式下 Url 不解析
+/// authority，盘符与路径原样保留。
 /// （自 oj/src/server_cmd.rs 的 resolve_dsn 提炼，语义逐行对齐。）
 pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String> {
-    let rest = dsn.strip_prefix("sqlite://").or_else(|| {
-        if dsn == "sqlite::memory:" {
-            Some("")
-        } else {
-            None
-        }
-    });
+    let rest = dsn
+        .strip_prefix("sqlite://")
+        .or_else(|| dsn.strip_prefix("sqlite:"));
     let Some(rest) = rest else {
         return Err(format!("not a sqlite dsn (got '{dsn}')").into());
     };
     if rest.is_empty() {
         return Ok("sqlite::memory:".into()); // sqlite://（空）视作内存
     }
-    if rest.starts_with(':') || rest.starts_with("//") {
-        return Ok(dsn.to_string());
+    if rest.starts_with(':') {
+        return Ok("sqlite::memory:".into()); // sqlite::memory: / sqlite://:memory:
+    }
+    if rest.starts_with("//") {
+        return Ok(dsn.to_string()); // sqlite:////abs/path 直通
     }
     let p = Path::new(rest);
     let p: PathBuf = if p.is_absolute() {
@@ -136,7 +139,8 @@ pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String
     if !p.is_file() {
         std::fs::write(&p, b"").map_err(|e| format!("create db file {}: {e}", p.display()))?;
     }
-    Ok(format!("sqlite://{}", p.display()))
+    let fwd = p.to_string_lossy().replace('\\', "/");
+    Ok(format!("sqlite:{fwd}"))
 }
 
 #[cfg(test)]
@@ -215,11 +219,13 @@ mod tests {
     fn sqlite_relative_path_resolves_against_config_dir() {
         let t = tmpdir("sqlite-rel");
         let dsn = normalize_sqlite_dsn("sqlite://app.db", &t.0).unwrap();
-        let path = dsn.trim_start_matches("sqlite://");
-        assert!(std::path::Path::new(path).is_absolute(), "{dsn}");
-        assert!(path.starts_with(t.0.to_str().unwrap()), "{dsn}");
+        // 绝对路径以 sqlite:（单冒号）承载，经 Url 不丢盘符（Windows）
+        let path = dsn.strip_prefix("sqlite:").unwrap();
+        let pp = std::path::Path::new(path);
+        assert!(pp.is_absolute(), "{dsn}");
+        assert!(pp.starts_with(&t.0), "{dsn}");
         // 缺文件建零长空库
-        assert!(std::path::Path::new(path).is_file(), "{dsn}");
+        assert!(pp.is_file(), "{dsn}");
         // 内存与特殊形式直通
         assert_eq!(
             normalize_sqlite_dsn("sqlite::memory:", &t.0).unwrap(),
@@ -227,6 +233,10 @@ mod tests {
         );
         assert_eq!(
             normalize_sqlite_dsn("sqlite://", &t.0).unwrap(),
+            "sqlite::memory:"
+        );
+        assert_eq!(
+            normalize_sqlite_dsn("sqlite://:memory:", &t.0).unwrap(),
             "sqlite::memory:"
         );
     }

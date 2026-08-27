@@ -30,8 +30,19 @@ fn mini_plugin_dir() -> PathBuf {
             .join(format!("{prefix}oj_plugin_test_mini.{ext}"));
         let dir = root.join("target/test-plugins").join(ffi::triple());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(&built, dir.join(ffi::plugin_file_name("mini")))
-            .expect("copy test plugin artifact");
+        let dst = dir.join(ffi::plugin_file_name("mini"));
+        // 幂等拷贝：dest 已存在且不旧于源则跳过。Windows 上已加载的 dll 不可覆写，
+        // 并行测试/子进程场景（父进程持有 mini.dll 时 helper 子进程重跑本函数）会撞
+        // sharing violation（ERROR_SHARING_VIOLATION，code 32）。
+        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
+        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
+        let outdated = match (dst_modified, src_modified) {
+            (Ok(d), Ok(s)) => d < s,
+            _ => true,
+        };
+        if outdated {
+            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
+        }
         dir
     })
     .clone()
@@ -147,16 +158,21 @@ fn manifest_abi_mismatch() {
 #[test]
 fn manifest_identity_mismatch() {
     let _g = ENV_LOCK.lock().unwrap();
-    // 文件名按"冒名者"复制一份，descriptor.name 仍是 mini → IdentityMismatch。
-    let dir = mini_plugin_dir();
-    let impostor = dir.join(ffi::plugin_file_name("impostor"));
-    std::fs::copy(dir.join(ffi::plugin_file_name("mini")), &impostor).unwrap();
+    // 独立临时目录摆"冒名者"，不复用共享插件目录：残留文件会污染
+    // scan_loads_mini 的计数断言（shared dir 会被所有测试共享）。
+    let base = mini_plugin_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let impostor = tmp.path().join(ffi::plugin_file_name("impostor"));
+    std::fs::copy(
+        base.join(ffi::plugin_file_name("mini")),
+        &impostor,
+    )
+    .unwrap();
     let manifest = vec![PluginManifestEntry {
         name: "impostor".into(),
         semver_pin: None,
     }];
-    let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
-    std::fs::remove_file(&impostor).ok();
+    let err = load_manifest(tmp.path(), &manifest, host_context(), &no_cfg).unwrap_err();
     assert!(
         matches!(err, PluginLoadError::IdentityMismatch { .. }),
         "{err}"
