@@ -92,9 +92,15 @@ fn plugin_file_name(name: &str) -> String {
 /// `-p` 构建与 `--workspace` 构建间不同，会导致 v8 被按不同 fingerprint 重编，进而 rusty_v8
 /// 静态库（target/release/gn_out/obj/librusty_v8.a）找不到。`--workspace` 构建是权威的
 /// release 构建路径（CLAUDE.md 亦以 `cargo build --workspace --release` 为准）。
+///
+/// 必须带 `--exclude xtask`：xtask 经 `cargo run -p xtask` 启动后是**运行中的进程**，其 exe
+/// 在 Windows 上被锁定；而 `-p` 与 `--workspace` 的 feature 归一化不同会使 cargo 认为 xtask
+/// 需要 relink，进而尝试删除运行中的 xtask.exe → "Access is denied (os error 5)"。xtask 自身
+/// 也不是发行产物（bin/ 只放 oj + 插件），排除后其余成员的归一化不受影响（xtask 未对共享
+/// 依赖启用额外 feature）。
 fn build_workspace_release() -> Result<(), String> {
     let status = Command::new("cargo")
-        .args(["build", "--workspace", "--release"])
+        .args(["build", "--workspace", "--exclude", "xtask", "--release"])
         .status()
         .map_err(|e| format!("spawn cargo build --workspace --release: {e}"))?;
     if !status.success() {
