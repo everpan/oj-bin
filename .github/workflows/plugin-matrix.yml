@@ -50,6 +50,14 @@ jobs:
         shell: bash
         run: echo "CMAKE_GENERATOR=NMake Makefiles" >> "$GITHUB_ENV"
 
+      # Git for Windows 自带 GNU `link.exe`（usr/bin），会在 MSVC 的 link.exe 之前被 rustc
+      # 选中，导致链接失败（"missing operand after ..."）。构建前移除该冲突文件，
+      # 让 rustc 落到 msvc-dev-cmd 注入的 MSVC link.exe。
+      - name: Remove Git's link.exe (shadows MSVC linker)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
       # musl 行启用时：
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
