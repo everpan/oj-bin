@@ -47,8 +47,10 @@ fn expired_cert_files() -> (NamedTempFile, NamedTempFile, String, String) {
     std::fs::write(key_file.path(), TEST_RSA_PUBLIC_PEM).unwrap();
     std::fs::write(cert_file.path(), jws).unwrap();
 
-    let key_path = key_file.path().to_string_lossy().into_owned();
-    let cert_path = cert_file.path().to_string_lossy().into_owned();
+    // Windows 临时路径含反斜杠（如 C:\Users\...）；YAML 双引号标量里 \U、\A 等会被
+    // 当作转义序列解析失败。统一转正斜杠——Windows 同样认 / 路径，且 YAML 不再报错。
+    let key_path = key_file.path().to_string_lossy().replace('\\', "/");
+    let cert_path = cert_file.path().to_string_lossy().replace('\\', "/");
     (key_file, cert_file, key_path, cert_path)
 }
 
