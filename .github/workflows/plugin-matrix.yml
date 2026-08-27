@@ -1,5 +1,6 @@
-# CI 平台矩阵（spec §4 产物归置）：宿主 + 全部第一方插件按目标平台构建，
-# 产物入 `bin/plugins/<triple>/`，与本地 `cargo xtask plugin <name>` 同布局。
+# CI 平台矩阵（spec §4 产物归置）：宿主 release 可执行（oj）+ 全部第一方插件按目标平台
+# 构建。宿主二进制入 `bin/<triple>/`，插件入 `bin/plugins/<triple>/`，与本地
+# `cargo xtask plugin <name>` 同布局。全部以 --release 构建（无 debug 构建）。
 # Linux 以 ubuntu 的 glibc 为基线；部署含 Alpine 时补 `x86_64-unknown-linux-musl` 行。
 
 name: plugin-matrix
@@ -53,9 +54,18 @@ jobs:
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
 
-      # 宿主测试（与本地一致；infinite_loop 在部分平台会 SIGSEGV，跳过）。
-      - name: cargo test (workspace, skip infinite_loop)
-        run: cargo test --workspace -- --skip infinite_loop
+      # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建；infinite_loop 在部分平台会 SIGSEGV，跳过）。
+      - name: cargo test --release (workspace, skip infinite_loop)
+        run: cargo test --workspace --release -- --skip infinite_loop
+
+      # 宿主 release 可执行（oj），与插件同 triple 构建，随产物一并上传。
+      - name: build host release binary (oj)
+        run: cargo build --release -p oj
+      - name: place host binary
+        shell: bash
+        run: |
+          mkdir -p "bin/${{ matrix.triple }}"
+          cp "target/release/oj${{ (matrix.os == 'windows-latest' && '.exe') || '' }}" "bin/${{ matrix.triple }}/"
 
       # 第一方插件逐个 release 构建并拷入 bin/plugins/<triple>/（xtask 即 CI 产物入口）。
       - name: build & place plugins
@@ -66,7 +76,12 @@ jobs:
           done
           ls -la bin/plugins/${{ matrix.triple }}/
 
-      # 产物归置（供发布/下载；bin/plugins/<triple>/ 布局与发行同形）。
+      # 产物归置（供发布/下载）：宿主二进制与插件各自按 triple 上传，布局与发行同形。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.triple }}
+          path: bin/${{ matrix.triple }}/
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: plugins-${{ matrix.triple }}
