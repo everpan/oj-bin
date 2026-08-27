@@ -1,0 +1,19 @@
+# 设置默认行为，让 Git 自动处理文本文件
+* text=auto
+
+# 强制指定类型的文件使用 LF 换行符（推荐用于脚本、代码文件）
+*.py text eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf
+
+# 强制 Windows 批处理文件使用 CRLF
+*.bat text eol=crlf
+
+# 声明二进制文件，Git 不应修改它们
+*.png binary
+*.jpg binary
+*.ico binary
