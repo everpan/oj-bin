@@ -280,11 +280,24 @@ mod tests {
     }
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询；插件任务跑在插件
-    /// runtime，测试 runtime 的 yield_now 让出即可被并发调度）。
+    /// runtime，测试 runtime 让出即可被并发调度）。
+    ///
+    /// 以真实墙钟时间为界轮询（`tokio::time::sleep` + 截止期），而非固定次数忙等：
+    /// release 下 `yield_now` 自旋极快，原 10w 次循环会在插件 rt 的 reqwest 请求完成前
+    /// 耗尽预算并误报 "ffi drive timeout"（debug 下循环够慢才侥幸通过）。墙钟等待不受
+    /// 优化影响，且给插件 rt 真实调度时间。
     async fn drive(fut: FfiFuture) -> Result<Vec<u8>, String> {
-        for _ in 0..100_000 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             match (fut.poll)(fut.state) {
-                0 => tokio::task::yield_now().await,
+                0 => {
+                    if tokio::time::Instant::now() >= deadline {
+                        // 超时：释放 state 后返回（避免 FfiTask 泄漏）。
+                        (fut.free)(fut.state);
+                        return Err("ffi drive timeout".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                }
                 code => {
                     let r = (fut.take)(fut.state);
                     (fut.free)(fut.state);
@@ -298,7 +311,6 @@ mod tests {
                 }
             }
         }
-        Err("ffi drive timeout".into())
     }
 
     #[test]
