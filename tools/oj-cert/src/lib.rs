@@ -64,7 +64,7 @@ fn write_private(path: &Path, key: &RsaPrivateKey) -> Result<(), String> {
     let pem = key
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| format!("encode pkcs8: {e}"))?;
-    std::fs::write(path, pem.to_string()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    std::fs::write(path, &pem).map_err(|e| format!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -85,13 +85,20 @@ pub fn r#gen(opts: &GenOpts) -> Result<PathBuf, String> {
     if opts.exp <= opts.nbf {
         return Err("exp must be greater than nbf".into());
     }
+    let key_out = opts.out_dir.join("private.pem");
+    if key_out.exists() {
+        return Err(format!(
+            "refusing to overwrite existing {}: use renew to extend expiry, or move/delete the old keypair first",
+            key_out.display()
+        ));
+    }
     std::fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("mkdir {}: {e}", opts.out_dir.display()))?;
     let key =
         RsaPrivateKey::new(&mut OsRng, opts.bits as usize).map_err(|e| format!("keygen: {e}"))?;
     let signing = SigningKey::<Sha256>::new(key.clone());
     let out = |name: &str| opts.out_dir.join(name);
-    write_private(&out("private.pem"), &key)?;
+    write_private(&key_out, &key)?;
     let pub_pem = key
         .to_public_key()
         .to_public_key_pem(LineEnding::LF)

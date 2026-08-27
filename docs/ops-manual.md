@@ -143,7 +143,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | `es not configured` 报错 | JS 调 `es.*` 但 config 无 `es:` 段 | 加 `es.endpoint`；或确认业务不该用 ES |
 | `es search/index/del: invalid index` | index/id 含白名单（`[a-zA-Z0-9_-]+`）外字符 | 校验入参；index/id 不可含 `/`、`.` |
 | `es …: HTTP 4xx/5xx: …` | ES 端错误（索引缺失/DSL 错/ES 未起），直通返回体 | 看返回体排障；`es.index` 自带 refresh=true，写完即可查 |
-| 启动报 `certificate expired` / `certificate has expired and grace period elapsed` | 证书已过期且宽限期结束（`exp` + `grace_days` 仍早于现在） | 重签续期：构建 `cargo build -p oj-cert --release`（工具在 `tools/oj-cert`，不随发行包）后 `oj-cert renew -k private.pem` 使 `exp` 晚于现在，替换证书文件后重启（运行中替换则热重载即时生效）；调大 `grace_days` 仅延长宽限、不改 `exp` |
+| 启动报 `certificate expired` / `certificate has expired and grace period elapsed` | 证书已过期且宽限期结束（`exp` + `grace_days` 仍早于现在） | 重签续期：构建 `cargo build -p oj-cert --release`（工具在 `tools/oj-cert`，不随发行包）后 `target/release/oj-cert renew -k private.pem` 使 `exp` 晚于现在，替换证书文件后重启（运行中替换则热重载即时生效）；调大 `grace_days` 仅延长宽限、不改 `exp` |
 | GET 全部 403 `certificate expired` | 运行中证书被热加载切到 grace / expired（或启动即处该状态） | 替换证书文件（热加载即时生效）；查 `GET {base}/health` 的 `certificate_status` |
 | 启动报 `invalid public key` / `signature verification failed` | 公钥 PEM 非法，或 JWS 签名与公钥不匹配 | 核对密钥对一致、签名算法为 RS256；用同一私钥重签 JWS |
 | 启动报 `invalid JWS format` | `certificate.jws` 不是三段 `Base64URL(Header).Payload.Signature` | 按 `Header.Payload.Signature` 重新生成 JWS |

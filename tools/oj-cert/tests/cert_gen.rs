@@ -98,6 +98,26 @@ fn rejects_bad_params() {
 }
 
 #[test]
+fn gen_refuses_to_overwrite_existing_private_key() {
+    let dir = tmpdir("gen-guard");
+    let opts = GenOpts {
+        out_dir: dir.clone(),
+        bits: MIN_BITS,
+        nbf: 1,
+        exp: 2,
+    };
+    r#gen(&opts).unwrap();
+    let original = std::fs::read_to_string(dir.join("private.pem")).unwrap();
+    let e = r#gen(&opts).unwrap_err();
+    assert!(e.contains("refusing to overwrite"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("private.pem")).unwrap(),
+        original
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn renews_with_moved_exp_and_same_key() {
     let dir = tmpdir("renew");
     r#gen(&GenOpts {
