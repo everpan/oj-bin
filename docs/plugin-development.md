@@ -141,6 +141,20 @@ cargo run -p oj -- serve ...
 **panic 归因**：panic hook 已输出插件名 + 宿主指纹。若需源码级调试，在 `bin/plugins/<triple>/`
 旁保留对应构建的符号文件（`symbols/` 目录），`lldb`/`gdb` 附加后 `bt` 定位。
 
+### 8.1 Windows 构建踩坑记录
+
+**xtask.exe 被锁（Access is denied, os error 5）**（2026-08-28，已修复）：
+`cargo run -p xtask -- plugin <name>` 以 `-p` 归一化链接并启动 `xtask.exe`；xtask 内部再调
+`cargo build --workspace --release` 时，`--workspace` 与 `-p` 的 feature 归一化不同，cargo 会
+认为 xtask 需要 relink，尝试删除**运行中的** `xtask.exe` —— Windows 锁定运行中的 exe，报
+`os error 5`。修复：xtask 的 `build_workspace_release()` 固定带 `--exclude xtask`
+（`tools/xtask/src/main.rs`）。**不可移除**该参数：运行中的程序不得要求 cargo 重编自身；
+xtask 也不是发行产物（`bin/` 只放 oj + 插件），排除不影响其余成员的 feature 归一化。
+
+**LNK4098（defaultlib 'libcmt.lib' conflicts）警告**：良性，无需处理。预编译 rusty_v8
+静态库按 `/MT`（静态 CRT）构建，与 Rust 默认 `/MD`（动态 CRT）混链产生该警告，链接实际
+成功。勿为消音加 `/NODEFAULTLIB:libcmt` —— 会改变 CRT 解析方式，风险大于噪音。
+
 ## 9. 第一方插件清单（参照模板）
 
 | 插件 | 轴 | 驱动 | 迁移来源 |
