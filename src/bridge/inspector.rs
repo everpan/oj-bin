@@ -131,16 +131,27 @@ mod tests {
         let ls = tokio::task::LocalSet::new();
         ls.run_until(async {
             spawn(insp.clone(), addr);
-            tokio::time::sleep(Duration::from_millis(80)).await;
-
-            let (mut ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+            // 后台任务里的 bind 与本 async 同处 current_thread，但要等 LocalSet 轮到
+            // 它才发生。固定 sleep 在高负载（整套并行跑 V8 用例）下不够 → 误报
+            // ConnectionRefused。改为重试连接直至就绪（deadline 兜底防挂死）。
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut ws = loop {
+                match connect_async(format!("ws://{addr}")).await {
+                    Ok((ws, _)) => break ws,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("inspector did not come up at {addr}: {e}"),
+                }
+            };
             ws.send(Message::Text(
                 r#"{"id":1,"method":"Runtime.enable"}"#.into(),
             ))
             .await
             .unwrap();
-            // 期望收到 CDP 响应/事件（带超时防挂死）。
-            let got = tokio::time::timeout(Duration::from_secs(3), ws.next()).await;
+            // 期望收到 CDP 响应/事件（带超时防挂死；高负载下调度抖动可吃掉数秒，
+            // 与 oj-es drive 同理给足墙钟预算）。
+            let got = tokio::time::timeout(Duration::from_secs(30), ws.next()).await;
             assert!(got.is_ok(), "expected a CDP frame from inspector");
             let msg = got.unwrap().unwrap().unwrap();
             assert!(
