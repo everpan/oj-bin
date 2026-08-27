@@ -623,7 +623,13 @@ mod tests {
             })
             .collect();
         RouteTable::build("/v1/api", &root, true, |p: &Path| {
-            let key = p.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+            // 跨平台：file 路径在 Windows 用反斜杠，而 decls 的 key 用正斜杠，
+            // 统一转正斜杠再查表，否则 Windows 下 key 不匹配 → 整表空注册。
+            let key = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             Ok(m.get(&key).cloned().unwrap_or_default())
         })
     }
