@@ -5,8 +5,8 @@
 //! - 符号签名必须与 oj-plugin-ffi 契约一致（ABI_VERSION 门禁兜底）。
 
 #![allow(clippy::collapsible_if)]
-use libloading::Library;
 use crate::bridge::plugin_loader::PluginLoadError;
+use libloading::Library;
 
 use std::path::{Path, PathBuf};
 

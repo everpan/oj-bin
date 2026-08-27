@@ -1,4 +1,8 @@
-#![allow(clippy::type_complexity, clippy::collapsible_if, clippy::redundant_closure)]
+#![allow(
+    clippy::type_complexity,
+    clippy::collapsible_if,
+    clippy::redundant_closure
+)]
 
 //! 任意深度；无 api 文件的目录不是路由（可作纯工具代码目录）。
 

@@ -3,7 +3,12 @@
 //! local 驱动的 content_type：object_store LocalFileSystem 不持久化 attributes——
 //! 显式给的写 sidecar（`<key>.ct`），否则按扩展名推断。
 
-#![allow(clippy::new_without_default, clippy::collapsible_if, clippy::redundant_closure, clippy::type_complexity)]
+#![allow(
+    clippy::new_without_default,
+    clippy::collapsible_if,
+    clippy::redundant_closure,
+    clippy::type_complexity
+)]
 use std::cell::RefCell;
 
 use std::path::PathBuf;

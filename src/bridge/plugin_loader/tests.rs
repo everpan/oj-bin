@@ -163,11 +163,7 @@ fn manifest_identity_mismatch() {
     let base = mini_plugin_dir();
     let tmp = tempfile::tempdir().unwrap();
     let impostor = tmp.path().join(ffi::plugin_file_name("impostor"));
-    std::fs::copy(
-        base.join(ffi::plugin_file_name("mini")),
-        &impostor,
-    )
-    .unwrap();
+    std::fs::copy(base.join(ffi::plugin_file_name("mini")), &impostor).unwrap();
     let manifest = vec![PluginManifestEntry {
         name: "impostor".into(),
         semver_pin: None,

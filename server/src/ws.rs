@@ -667,9 +667,9 @@ mod tests {
         let mut buf = [0u8; 64];
         let res = c.0.read(&mut buf).await;
         let clean = match res {
-            Ok(0) => true,             // 对端优雅关闭（EOF / FIN）
-            Ok(_n) => buf[0] == 0x88,  // 收到 WebSocket Close 帧
-            Err(_) => true,            // 对端重置（ConnectionReset 等）→ 连接已终止
+            Ok(0) => true,            // 对端优雅关闭（EOF / FIN）
+            Ok(_n) => buf[0] == 0x88, // 收到 WebSocket Close 帧
+            Err(_) => true,           // 对端重置（ConnectionReset 等）→ 连接已终止
         };
         assert!(clean, "expected close or reset, got {res:?}");
     }
