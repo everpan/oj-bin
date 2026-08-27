@@ -15,8 +15,6 @@ pub struct ServerArgs {
     pub cert_path: Option<String>,
     /// PEM 公钥路径；Some 覆盖 config 的 server.public_key_path。
     pub key_path: Option<String>,
-    /// 证书过期后宽限天数；Some 覆盖 config 的 server.grace_days（默认 30）。
-    pub grace_days: Option<u64>,
 }
 
 /// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
@@ -78,9 +76,6 @@ enum Commands {
         /// PEM 公钥路径（覆盖 config 的 server.public_key_path）
         #[arg(long)]
         key_path: Option<String>,
-        /// 证书过期后宽限天数（覆盖 config 的 server.grace_days，默认 30）
-        #[arg(long)]
-        grace_days: Option<u64>,
     },
     /// 构建模块产物（src → dist：版本目录 / routes.js / tgz）
     Build {
@@ -136,14 +131,12 @@ fn to_command(cli: Cli) -> Command {
             dir,
             cert_path,
             key_path,
-            grace_days,
         } => Command::Server(ServerArgs {
             config,
             base,
             dir,
             cert_path,
             key_path,
-            grace_days,
         }),
         Commands::Build {
             module,
@@ -253,6 +246,8 @@ mod tests {
         assert!(cli(&["server", "--nope"]).is_err());
         // --dev 已删：模式由 -d 目录自动判定（server_cmd::is_release）
         assert!(cli(&["server", "--dev"]).is_err());
+        // --grace-days 已删：宽限天数仅由 config 的 server.grace_days 提供
+        assert!(cli(&["server", "--grace-days", "30"]).is_err());
         // 空参 → 帮助（arg_required_else_help）
         assert_eq!(
             cli(&[]).unwrap_err().kind(),

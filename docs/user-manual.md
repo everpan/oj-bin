@@ -27,7 +27,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>] [--grace-days <n>]
+oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>]
 oj build  [module] [-d src] [-o dist] [--no-minify]
 ```
 
@@ -41,7 +41,6 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
 | `--cert-path` | 无（未配置则不启用证书校验） | （server）JWS 证书路径，覆盖 `server.certificate_path` |
 | `--key-path` | 无 | （server）PEM 公钥路径，覆盖 `server.public_key_path` |
-| `--grace-days` | `server.grace_days`（默认 30） | （server）证书过期后宽限天数，覆盖 `server.grace_days` |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
   读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。

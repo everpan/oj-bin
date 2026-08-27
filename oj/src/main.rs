@@ -102,7 +102,6 @@ mod tests {
             dir: None,
             cert_path: None,
             key_path: None,
-            grace_days: None,
         }))
         .await;
         assert_eq!(code, 1);

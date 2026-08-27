@@ -244,7 +244,7 @@ server:
 ### CLI 覆盖
 
 ```sh
-oj server -c config.yaml --cert-path ./config/certificate.jws --key-path ./config/public_key.pem --grace-days 15
+oj server -c config.yaml --cert-path ./config/certificate.jws --key-path ./config/public_key.pem
 ```
 
 ### 证书格式（JWS）

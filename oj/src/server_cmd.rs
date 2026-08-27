@@ -21,15 +21,12 @@ use crate::args::ServerArgs;
 pub async fn run(a: ServerArgs) -> Result<(), String> {
     let (mut cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
-    // CLI 覆盖：证书路径与宽限天数（若有）。
+    // CLI 覆盖：证书路径（若有）。
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
     }
     if let Some(p) = a.key_path {
         cfg.server.public_key_path = p;
-    }
-    if let Some(d) = a.grace_days {
-        cfg.server.grace_days = Some(d);
     }
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
