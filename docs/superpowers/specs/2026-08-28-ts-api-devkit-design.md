@@ -15,13 +15,13 @@ oj 的业务逻辑以 JS/TS handler（`api.ts` / `WS.ts`）编写，开发面分
    业务项目中对照手册开发 api 模块。
 3. 交付物落在 **`bin/` 随版本打包发布**（`scripts/deploy.sh` 产物链）。
 4. 顺带把 `sample/global.d.ts` 补齐到 v0.2 实际 API（当前缺 `http.tenantId/user/files/file`、
-   `blob`、`bus`、`es`、`db.tx`、`kv.expire/incr` 等）。
+   `blob`、`bus`、`es`、`db.tx`、`kv.expire/incr` 等），并**随包发布**（用户裁决 2026-08-28：
+   `global.d.ts` 也一起发布）。
 
 ### 非目标
 
 - 不改运行时行为、不改 CLI、不动现有 docs（`user-manual.md` 等保持原位，仅新增指针）。
 - 不做手册版本号戳记（版本由 tarball 名 `oj-v<version>` 携带）。
-- `global.d.ts` 不进发布包（用户裁决：仅补齐 `sample/` 内文件）。
 - 不内置到 oj 二进制（纯数据交付物，`bin/devkit/` 目录级拷贝）。
 
 ## 2. 交付物布局与发布链
@@ -31,14 +31,21 @@ docs/devkit/                  # 源（git tracked）
 ├── README.md                 # 是什么 / 怎么安装到业务项目 / 怎么更新
 ├── SKILL.md                  # agent 入口（frontmatter: name/description）
 └── api-manual.md             # 完备大手册（唯一事实源）
+sample/global.d.ts            # 全局对象 TS 声明源（单一事实源，仍在 sample/）
 
-cargo xtask build  ──►  bin/devkit/          # 目录级拷贝（bin/ 已被 .gitignore 覆盖）
-scripts/deploy.sh  ──►  dist/oj-v<version>.tar.gz 内 devkit/{README.md,SKILL.md,api-manual.md}
+cargo xtask build  ──►  bin/devkit/           # docs/devkit 拷贝 + 从 sample/ 拾取 global.d.ts
+scripts/deploy.sh  ──►  dist/oj-v<version>.tar.gz 内
+                        devkit/{README.md,SKILL.md,api-manual.md,global.d.ts}
 ```
 
-下游安装：`devkit/` 整目录拷入业务项目 `.claude/skills/oj-api-dev/`；SKILL.md 以**同目录
-相对路径**引用 `api-manual.md`（不依赖仓库结构，天然可移植）。本仓库自身 agent 使用时
-拷贝/软链 `docs/devkit/` 到 `.claude/skills/oj-api-dev/`（`.claude/` 被 gitignore，不入库）。
+`global.d.ts` 的**源**保留在 `sample/global.d.ts`（sample 的编辑器提示与 L2 vitest 依赖它），
+xtask 拷贝时一并拾取进 `bin/devkit/`——仓库内不存两份，无漂移。
+
+下游安装：`SKILL.md`、`api-manual.md`（README 视情况）拷入业务项目
+`.claude/skills/oj-api-dev/`；`global.d.ts` 拷入业务项目源码根获得全局对象类型提示。
+SKILL.md 以**同目录相对路径**引用 `api-manual.md`（不依赖仓库结构，天然可移植）。
+本仓库自身 agent 使用时拷贝/软链 `docs/devkit/` 到 `.claude/skills/oj-api-dev/`
+（`.claude/` 被 gitignore，不入库）。
 
 ## 3. api-manual.md 章节结构（12 章）
 
@@ -88,10 +95,11 @@ scripts/deploy.sh  ──►  dist/oj-v<version>.tar.gz 内 devkit/{README.md,SK
 ## 5. 构建链集成
 
 - `tools/xtask/src/main.rs`：仅 `build` 子命令（全量归置）在插件拷贝后新增
-  `copy_devkit()`（约 10 行：`fs::copy_dir_all(docs/devkit, bin/devkit)`；源缺失报错退出）。
+  `copy_devkit()`（约 12 行：`fs::copy_dir_all(docs/devkit, bin/devkit)` +
+  `fs::copy(sample/global.d.ts, bin/devkit/global.d.ts)`；任一源缺失报错退出）。
   `bin` / `plugin` 单体子命令**不**拷贝（避免单插件构建拖文档）。
 - `scripts/deploy.sh`：装配 `TEMP_DIR` 时加 `cp -R "${PROJECT_ROOT}/bin/devkit" "${TEMP_DIR}/devkit"`；
-  产物校验处补 `bin/devkit/api-manual.md` 存在性检查。
+  产物校验处补 `bin/devkit/api-manual.md` 与 `bin/devkit/global.d.ts` 存在性检查。
 - `CLAUDE.md`：docs 列表处加一行指针（`docs/devkit/` = 业务项目开发者手册 + skill 源，
   经 `cargo xtask build` 归置到 `bin/devkit/` 随包发布）。
 
@@ -111,8 +119,9 @@ scripts/deploy.sh  ──►  dist/oj-v<version>.tar.gz 内 devkit/{README.md,SK
 
 ## 7. 验收方式
 
-1. `cargo xtask build` 后 `bin/devkit/{README.md,SKILL.md,api-manual.md}` 齐全且内容与源一致。
-2. `bash scripts/deploy.sh` 产出的 tarball 解包含 `devkit/` 三件（手工验证一次）。
+1. `cargo xtask build` 后 `bin/devkit/{README.md,SKILL.md,api-manual.md,global.d.ts}` 齐全，
+   前三件与 `docs/devkit/` 内容一致，`global.d.ts` 与 `sample/global.d.ts` 一致。
+2. `bash scripts/deploy.sh` 产出的 tarball 解包含 `devkit/` 四件（手工验证一次）。
 3. 手册一致性核对：第 5 章每条 API 对照 user-manual §9 与 `bootstrap.js` 挂载（spec 附录
    清单逐项打勾，见 §8）。
 4. SKILL.md 可被 Claude Code 识别：拷入 `.claude/skills/oj-api-dev/` 后 `/oj-api-dev` 可触发。
