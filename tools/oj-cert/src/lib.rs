@@ -14,6 +14,35 @@ use std::path::{Path, PathBuf};
 /// ring `RSA_PKCS1_2048_8192_SHA256` 验签下限。
 pub const MIN_BITS: u32 = 2048;
 
+/// 生成 RSA 密钥对（bits 下限 MIN_BITS）。
+pub fn keygen(bits: u32) -> Result<RsaPrivateKey, String> {
+    if bits < MIN_BITS {
+        return Err(format!("bits must be >= {MIN_BITS}"));
+    }
+    RsaPrivateKey::new(&mut OsRng, bits as usize).map_err(|e| format!("keygen: {e}"))
+}
+
+/// RS256 JWS 三段串（b64url no-pad，与 server 加载端 split('.') 对齐）。
+pub fn sign_jws(key: &RsaPrivateKey, nbf: u64, exp: u64) -> String {
+    jws(&SigningKey::<Sha256>::new(key.clone()), nbf, exp)
+}
+
+/// 私钥 → PKCS#8 PEM 文本。
+pub fn private_pem(key: &RsaPrivateKey) -> Result<String, String> {
+    let pem = key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| format!("encode pkcs8: {e}"))?;
+    // `as_bytes()` 对 String / SecretDocument 均成立，免依赖 pkcs8 具体版本返回类型。
+    Ok(String::from_utf8_lossy(pem.as_bytes()).into_owned())
+}
+
+/// 公钥 → SPKI PEM 文本（loader 兼容）。
+pub fn public_pem(key: &RsaPrivateKey) -> Result<String, String> {
+    key.to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| format!("encode spki: {e}"))
+}
+
 /// 生成参数（gen）。
 #[derive(Debug, Clone)]
 pub struct GenOpts {
@@ -67,9 +96,7 @@ fn jws(signing_key: &SigningKey<Sha256>, nbf: u64, exp: u64) -> String {
 
 /// 私钥落盘：PKCS#8 PEM；unix 下 chmod 600。
 fn write_private(path: &Path, key: &RsaPrivateKey) -> Result<(), String> {
-    let pem = key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| format!("encode pkcs8: {e}"))?;
+    let pem = private_pem(key)?;
     std::fs::write(path, &pem).map_err(|e| format!("write {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
@@ -85,9 +112,6 @@ fn write_private(path: &Path, key: &RsaPrivateKey) -> Result<(), String> {
 /// 注：`gen` 是 edition 2024 保留字，定义须写作 `r#gen`（公开名仍为 `gen`，
 /// 调用方以 `oj_cert::r#gen` 引用）。
 pub fn r#gen(opts: &GenOpts) -> Result<PathBuf, String> {
-    if opts.bits < MIN_BITS {
-        return Err(format!("bits must be >= {MIN_BITS}"));
-    }
     if opts.exp <= opts.nbf {
         return Err("exp must be greater than nbf".into());
     }
@@ -100,17 +124,12 @@ pub fn r#gen(opts: &GenOpts) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("mkdir {}: {e}", opts.out_dir.display()))?;
-    let key =
-        RsaPrivateKey::new(&mut OsRng, opts.bits as usize).map_err(|e| format!("keygen: {e}"))?;
-    let signing = SigningKey::<Sha256>::new(key.clone());
+    let key = keygen(opts.bits)?;
     let out = |name: &str| opts.out_dir.join(name);
     write_private(&key_out, &key)?;
-    let pub_pem = key
-        .to_public_key()
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| format!("encode spki: {e}"))?;
-    std::fs::write(out("public.pem"), pub_pem).map_err(|e| format!("write public.pem: {e}"))?;
-    std::fs::write(out("cert.jws"), jws(&signing, opts.nbf, opts.exp))
+    std::fs::write(out("public.pem"), public_pem(&key)?)
+        .map_err(|e| format!("write public.pem: {e}"))?;
+    std::fs::write(out("cert.jws"), sign_jws(&key, opts.nbf, opts.exp))
         .map_err(|e| format!("write cert.jws: {e}"))?;
     Ok(out("cert.jws"))
 }
@@ -145,7 +164,7 @@ pub fn renew(opts: &RenewOpts) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::days_to_expiry;
+    use super::{days_to_expiry, keygen, sign_jws};
 
     /// `--days` 是有效天数（×86400），不是秒——回归护栏：曾把天数当秒导致
     /// `--days 365` 只签 6 分钟的证书。
@@ -154,5 +173,26 @@ mod tests {
         assert_eq!(days_to_expiry(1_000_000, 1), 1_000_000 + 86_400);
         assert_eq!(days_to_expiry(1_000_000, 365), 1_000_000 + 365 * 86_400);
         assert_eq!(days_to_expiry(0, 0), 0);
+    }
+
+    #[test]
+    fn keygen_rejects_small_bits() {
+        assert!(keygen(1024).is_err());
+        assert!(keygen(0).is_err());
+    }
+
+    #[test]
+    fn sign_jws_is_three_parts_with_nbf_exp_payload() {
+        let key = keygen(2048).unwrap();
+        let j = sign_jws(&key, 1_000, 2_000);
+        let parts: Vec<&str> = j.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let s = String::from_utf8(payload).unwrap();
+        assert!(s.contains("\"nbf\"") && s.contains("1000"), "{s}");
+        assert!(s.contains("\"exp\"") && s.contains("2000"), "{s}");
     }
 }
