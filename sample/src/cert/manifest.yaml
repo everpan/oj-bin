@@ -1,0 +1,3 @@
+name: "cert"
+desc: "证书管理：JWS 证书生成、renew、备注（admin）"
+version: "0.1.0"
