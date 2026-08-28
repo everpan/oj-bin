@@ -42,6 +42,9 @@ interface DBInstance {
   exec(sql: string, params?: unknown[]): Promise<number>;
   // 安全查询构造器（标识符白名单 + 参数化值）。
   table(name: string): QueryBuilder;
+  // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
+  // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
+  tx(fn: (tx: DBInstance) => unknown): Promise<unknown>;
 }
 
 // json.* ：统一响应信封 + 响应头。
@@ -58,8 +61,31 @@ interface HttpApi {
   query: Record<string, string>;
   headers: Record<string, string>;
   body: any;
-  // 取路由参数或 query 参数（字符串）；缺失时回退 def（默认 ""）。
-  param(name: string, def?: string): string;
+  // 取路由参数或 query 参数：路径参数优先，query 兜底，均缺失返回 def 原值。
+  param(name: string, def?: unknown): any;
+  // 租户 id（tenant 启用时从租户头提取；未启用为 null）。
+  tenantId: string | null;
+  // 已验签用户（auth 启用且通过 Bearer 守卫；否则 null）。
+  user: AuthUser | null;
+  // multipart 上传文件元信息（非 multipart 为空数组）。
+  files: UploadedFileMeta[];
+  // 取第 i 个上传文件的字节（越界报错 no such file）。
+  file(i: number): Promise<Uint8Array>;
+}
+
+// 已验签用户（JWT claims）。
+interface AuthUser {
+  id: string | number;
+  roles: string[];
+  claims: Record<string, Json>;
+}
+
+// multipart 上传文件元信息。
+interface UploadedFileMeta {
+  field: string;
+  filename: string;
+  content_type: string;
+  size: number;
 }
 
 // log.* ：结构化日志（zap SugaredLogger 风格：msg + 交替键值对）。
@@ -70,19 +96,49 @@ interface Logger {
   error(msg: string, ...kv: unknown[]): void;
 }
 
-// redis.* / kv.* ：内置内存 KV（M0）。
+// redis.* / kv.* ：KV 存储（redis.default 配置即真 Redis，否则进程内存 KV）。
 interface KVApi {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<boolean>;
-}
-interface KVWithDel extends KVApi {
   del(key: string): Promise<boolean>;
+  // 设过期（秒）。真 Redis 走 EXPIRE；内存 KV 惰性过期。
+  expire(key: string, ttlSec: number): Promise<boolean>;
+  // 自增返回新值（键不存在从 0 起）。
+  incr(key: string): Promise<number>;
 }
 
 // ws.* ：WebSocket 帧循环控制。
 interface WSApi {
   send(data: string): void;
   close(): void;
+}
+
+// blob.* ：对象存储（可调用取命名实例：blob("media").put(...)；裸调用 blob.put(...) 等价 default）。
+interface BlobApi {
+  (name?: string): BlobApi;
+  put(key: string, bytes: Uint8Array, contentType?: string): Promise<boolean>;
+  get(key: string): Promise<Uint8Array>;
+  // 幂等：不存在视为成功。
+  del(key: string): Promise<boolean>;
+  // local = {base}/blob/{key}；s3 = presigned URL（15min）。
+  url(key: string): Promise<string>;
+  // 缺失 sidecar 且无法按扩展名推断时返回空串。
+  contentType(key: string): Promise<string>;
+}
+
+// bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；
+// subscribe 仅 WS 会话内可用（HTTP 路径报错）；kind 报告活跃 broker 类型。
+interface BusApi {
+  publish(topic: string, data?: unknown): Promise<number>;
+  subscribe(topic: string): Promise<void>;
+  kind(): string;
+}
+
+// es.* ：Elasticsearch 薄客户端（直通 ES 响应体；未配置调用报 es not configured）。
+interface EsApi {
+  search(index: string, dsl?: unknown): Promise<Json>;
+  index(index: string, id: string, doc?: unknown): Promise<Json>;
+  del(index: string, id: string): Promise<Json>;
 }
 
 declare global {
@@ -93,9 +149,12 @@ declare global {
   const json: JsonApi;
   const http: HttpApi;
   const log: Logger;
-  const kv: KVWithDel;
+  const kv: KVApi;
   const redis: KVApi;
   const ws: WSApi;
+  const blob: BlobApi;
+  const bus: BusApi;
+  const es: EsApi;
 
   // 命名数据库实例；未配置的名字返回 undefined。
   function DB(name: string): DBInstance | undefined;
@@ -145,10 +204,25 @@ declare global {
   // CJS 同步 require（eval + 进程级缓存）。
   function __ojRequire(name: string, referrerPath?: string): any;
   // 浏览器兼容的 fetch（url 必填，options 同 RequestInit 的常用子集）。
-  function fetch(
-    url: string,
-    options?: { method?: string; headers?: Record<string, string>; body?: string | null },
-  ): Promise<any>;
+  function fetch(url: string, options?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string | Uint8Array | null;
+  }): Promise<OjFetchResponse>;
+  // 已加载插件自省：[{name, semver, abi, fingerprint, ...}] + 宿主 ABI。
+  function plugins(): any[];
+}
+
+// fetch 返回的 Response（浏览器风格子集）。
+interface OjFetchResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  json(): Promise<Json | null>;
+  text(): Promise<string>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  clone(): OjFetchResponse;
 }
 
 export {};
