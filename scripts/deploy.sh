@@ -11,7 +11,7 @@ set -euo pipefail
 # The build+placement is delegated to cargo xtask (tools/xtask):
 #   cargo xtask build       # oj + all plugins -> bin/
 #
-# Output: dist/oj-v<version>.tar.gz (containing oj and plugins/<triple>/).
+# Output: dist/oj-v<version>.tar.gz (containing oj, plugins/<triple>/, and devkit/).
 
 # Configuration
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -53,6 +53,14 @@ fi
 mkdir -p "${TEMP_DIR}"
 cp "${BIN}" "${TEMP_DIR}/${BINARY_NAME}"
 cp -R "${TRIPLE_DIR}" "${TEMP_DIR}/plugins/"
+
+# Ship DevKit (manual + skill + global.d.ts) alongside the binary.
+DEVKIT="${PROJECT_ROOT}/bin/devkit"
+if [[ ! -f "${DEVKIT}/api-manual.md" || ! -f "${DEVKIT}/global.d.ts" ]]; then
+  echo "Error: devkit artifacts missing under ${DEVKIT} (run: cargo xtask build)"
+  exit 1
+fi
+cp -R "${DEVKIT}" "${TEMP_DIR}/devkit/"
 chmod +x "${TEMP_DIR}/${BINARY_NAME}"
 
 # Create tarball

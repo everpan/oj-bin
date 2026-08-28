@@ -8,6 +8,7 @@
 //! 所有产物统一归置到 <repo>/bin/：
 //!   - 主程序 oj            -> bin/oj
 //!   - 插件 cdylib 构件     -> bin/plugins/<host-triple>/
+//!   - DevKit 文档        -> bin/devkit/（docs/devkit + sample/global.d.ts）
 //!
 //! 发行布局与插件加载器默认发现路径（<exe>/plugins、<workspace_root>/bin/plugins）同形。
 //!
@@ -16,7 +17,7 @@
 
 use only_js::bridge::plugin_loader::{PluginManifestEntry, host_context, load_manifest};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// 全部第一方插件名（与 plugins/ 下 crate 对应）。
@@ -137,6 +138,41 @@ fn build_and_copy(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 递归拷贝目录（std 的 `fs::copy_dir_all` 尚未稳定，此处最小实现）。
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 归置 devkit（docs/devkit 三件 + sample/global.d.ts）-> bin/devkit/。
+/// 仅 `build` 全量归置时调用；`bin`/`plugin` 单体子命令不拖文档。
+fn copy_devkit() -> Result<(), String> {
+    let src_dir = root().join("docs").join("devkit");
+    let dst_dir = bin_dir().join("devkit");
+    // 旧拷贝整体替换，避免残留已从源里删除的文件。
+    if dst_dir.exists() {
+        fs::remove_dir_all(&dst_dir).map_err(|e| format!("rm -rf {}: {e}", dst_dir.display()))?;
+    }
+    copy_dir_all(&src_dir, &dst_dir)
+        .map_err(|e| format!("copy {} -> {}: {e}", src_dir.display(), dst_dir.display()))?;
+    let dts_src = root().join("sample").join("global.d.ts");
+    let dts_dst = dst_dir.join("global.d.ts");
+    fs::copy(&dts_src, &dts_dst)
+        .map_err(|e| format!("copy {} -> {}: {e}", dts_src.display(), dts_dst.display()))?;
+    println!("copied devkit -> {}", dst_dir.display());
+    Ok(())
+}
+
 /// 预检：经 PluginLoader（与真实装配同一入口）加载校验。cfg 传 `{}`（端点配置校验在
 /// 服务器装配层做，此处只验证可加载性）。
 fn check(name: &str) -> Result<(), String> {
@@ -176,7 +212,7 @@ fn main() -> Result<(), String> {
             for p in PLUGINS {
                 build_and_copy(p)?;
             }
-            Ok(())
+            copy_devkit()
         }
         "plugin" => {
             if args.len() < 3 {
