@@ -156,6 +156,7 @@ pub async fn op_db_query_build(
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+    super::guard::check_table(&state, &req.table)?; // 表归属守卫（§5.3）
 
     // 列白名单校验（空 = SELECT *）。
     let cols: Vec<Alias> = if req.columns.is_empty() {
@@ -269,16 +270,19 @@ fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
     })
 }
 
-/// 按名取 DataAccessor（默认 default；后续可扩展命名实例）。
+/// 按名取 DataAccessor（默认 default）。模块 db 绑定在此收敛重定向：
+/// manifest 声明 `db: <name>` 的模块，其字面 "default" 调用落到命名库（§5.3）；
+/// 显式 DB("name") 不受影响。tx 以 JS 可见名记账，仅 accessor 解析被重定向。
 pub(crate) fn lookup(
     state: &Rc<RefCell<OpState>>,
     name: &str,
 ) -> Result<Arc<dyn DataAccessor>, JsErrorBox> {
+    let name = super::guard::bound_db(state, name);
     state
         .borrow()
         .borrow::<Arc<StableState>>()
         .dbs
-        .get(name)
+        .get(&name)
         .cloned()
         .ok_or_else(|| JsErrorBox::generic(format!("db: instance '{name}' not configured")))
 }

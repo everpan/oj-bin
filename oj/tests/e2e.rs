@@ -65,14 +65,28 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
             dir: root.join("src").display().to_string(),
             out: dist.display().to_string(),
             minify: true,
+            check: false,
         })
         .await
         .unwrap();
         dist
     };
-    let (addr, h) = server_cmd::start(cfg, &root, dir, "/v1/api".into(), dev)
-        .await
-        .unwrap();
+    let (addr, h) = {
+        // release 语义（README 部署故事）：build 后先 `oj migrate` 再 server——
+        // release verify 门禁要求账本与产物齐平，空库首启必须先显式迁移。
+        if !dev {
+            let acc = only_js::bridge::DbBackendRegistry::builtin()
+                .connect(cfg.db.get("default").unwrap(), &root)
+                .await
+                .unwrap();
+            oj::migrate::apply_all(Some(&acc), &dir, false, false)
+                .await
+                .unwrap();
+        }
+        server_cmd::start(cfg, &root, dir, "/v1/api".into(), dev)
+            .await
+            .unwrap()
+    };
     (addr, h, tmp)
 }
 
@@ -341,6 +355,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
         minify: true,
+        check: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     // routes.js：.route 行 + 镜像行（pattern 无 base 含模块段，file 为同名产物）
@@ -405,6 +420,7 @@ async fn build_then_release_serves_end_to_end() {
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
         minify: true,
+        check: false,
     })
     .await
     .unwrap();

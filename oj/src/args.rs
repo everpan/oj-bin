@@ -32,13 +32,34 @@ pub struct TestArgs {
     pub output: Option<String>,
 }
 
-/// `oj build [module] [-d src] [-o dist] [--no-minify]`（src → dist，生成 routes.js）。
+/// `oj build [module] [-d src] [-o dist] [--no-minify] [--check]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
     pub module: Option<String>,
     pub dir: String,
     pub out: String,
     /// 转译产物 minify（单行、剥注释）。默认开；`--no-minify` 排障逃生门。
     pub minify: bool,
+    /// 只跑结构检查（S002–S007）不落盘（§5.2 CI 门禁 / 本地快查）。
+    pub check: bool,
+}
+
+/// `oj migrate [-c config] [-d dir] [--baseline] [--module M]`。
+pub struct MigrateArgs {
+    pub config: String,
+    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    pub dir: Option<String>,
+    /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
+    pub baseline: bool,
+    /// 只迁移指定模块。
+    pub module: Option<String>,
+}
+
+/// `oj fixture [-c config] [-d dir] [--module M]`。
+pub struct FixtureArgs {
+    pub config: String,
+    pub dir: Option<String>,
+    /// 只灌指定模块。
+    pub module: Option<String>,
 }
 
 /// 解析结果（错误/帮助/空参由 clap 处理，不会走到这里）。
@@ -46,6 +67,16 @@ pub enum Command {
     Server(ServerArgs),
     Build(BuildArgs),
     Test(TestArgs),
+    Migrate(MigrateArgs),
+    Fixture(FixtureArgs),
+    SchemaDiff(SchemaDiffArgs),
+}
+
+/// `oj schema diff [-c config] [-d dir]`：声明 vs 实库只读对账（D001/D002，§5.1）。
+pub struct SchemaDiffArgs {
+    pub config: String,
+    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    pub dir: Option<String>,
 }
 
 /// oj：目录镜像路由的 JS 服务与构建 CLI。
@@ -90,6 +121,9 @@ enum Commands {
         /// 产物不 minify（默认 minify；排障逃生门，得到多行可读产物）
         #[arg(long)]
         no_minify: bool,
+        /// 只跑结构检查（S002–S007），不写任何产物（CI 门禁）
+        #[arg(long)]
+        check: bool,
     },
     /// 跑 sample API 测试（无需启动 oj server；进程内真实运行时派发）
     Test {
@@ -112,6 +146,52 @@ enum Commands {
         /// 报告落盘文件；省略则打印到 stdout
         #[arg(long)]
         output: Option<String>,
+    },
+    /// 应用模块迁移到最新（migrations/*.sql → default 库；部署 = build && migrate && server）
+    Migrate {
+        /// 配置文件路径（相对 CWD；db 段提供目标库）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
+        /// 默认：src 目录存在取 src，否则 dist
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
+        #[arg(long)]
+        baseline: bool,
+        /// 只迁移指定模块（src 首层子目录 / dist 模块名）
+        module: Option<String>,
+    },
+    /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）
+    Fixture {
+        /// 配置文件路径（相对 CWD；db 段提供目标库）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 只灌指定模块
+        module: Option<String>,
+    },
+    /// 声明式 schema 运维
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCmd,
+    },
+}
+
+/// `oj schema <sub>`：现有仅 diff（漂移对账）。
+#[derive(Debug, Subcommand)]
+pub enum SchemaCmd {
+    /// 声明式 schema 与实库只读对账（D001 漂移 / D002 未声明表；有差异退 1）
+    Diff {
+        /// 配置文件路径（相对 CWD；db 段提供目标库）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
+        /// 默认：src 目录存在取 src，否则 dist
+        #[arg(short, long)]
+        dir: Option<String>,
     },
 }
 
@@ -143,11 +223,13 @@ fn to_command(cli: Cli) -> Command {
             dir,
             out,
             no_minify,
+            check,
         } => Command::Build(BuildArgs {
             module,
             dir,
             out,
             minify: !no_minify,
+            check,
         }),
         Commands::Test {
             config,
@@ -164,6 +246,29 @@ fn to_command(cli: Cli) -> Command {
             format,
             output,
         }),
+        Commands::Migrate {
+            config,
+            dir,
+            baseline,
+            module,
+        } => Command::Migrate(MigrateArgs {
+            config,
+            dir,
+            baseline,
+            module,
+        }),
+        Commands::Fixture {
+            config,
+            dir,
+            module,
+        } => Command::Fixture(FixtureArgs {
+            config,
+            dir,
+            module,
+        }),
+        Commands::Schema {
+            command: SchemaCmd::Diff { config, dir },
+        } => Command::SchemaDiff(SchemaDiffArgs { config, dir }),
     }
 }
 

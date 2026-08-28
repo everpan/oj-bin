@@ -24,6 +24,15 @@ deno_error = "0.7"
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 tracing = "0.1"
+# 迁移引擎（spec §11.2，D4）：零驱动 core（default-features=false），经 OjConn 适配器
+# 复用 DataAccessor（方言 SQL 由根 crate 统一承担，refinery 只吃字符串）。
+# time 为 refinery 账本 applied_on 解析所需（已在依赖树，显式声明防漂移）。
+refinery-core = { version = "0.9", default-features = false, features = ["int8-versions"] }
+time = "0.3"
+# schema.yaml → DDL 生成（§4.7）：与根 crate 同为 1.0（依赖树单版本，构造器已用）。
+sea-query = "1.0"
+# S004 deps 版本范围匹配（§5.1）：refinery 已带入 1.0（依赖树零新增节点）。
+semver = "1"
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }

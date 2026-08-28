@@ -3,8 +3,13 @@
 pub mod app;
 pub mod args;
 pub mod build_cmd;
+pub mod checks;
 pub mod manifest;
+pub mod migrate;
+pub mod migrate_cmd;
 pub mod pack;
+pub mod schema;
+pub mod seed;
 pub mod server_cmd;
 pub mod test_cmd;
 pub mod test_ext;

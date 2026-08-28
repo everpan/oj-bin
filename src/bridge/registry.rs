@@ -18,6 +18,8 @@ pub struct TableDef {
     pub columns: HashMap<String, ColumnDef>,
     /// 主键列名（用于 find_by_id / update / delete 的 WHERE 键）。
     pub primary_key: Option<String>,
+    /// 归属模块（schema.yaml 声明来源；None = 未声明表，守卫不设防）。
+    pub owner: Option<String>,
 }
 
 impl TableDef {
@@ -46,6 +48,23 @@ impl SchemaRegistry {
 
     /// 声明一张表及其列（列名列表；主键为可选首参之外的显式字段）。
     pub fn table(mut self, name: &str, pk: Option<&str>, columns: &[&str]) -> Self {
+        self.declare(None, name, pk, columns);
+        self
+    }
+
+    /// 带归属模块的声明（schema.yaml 装配路径；`table()` 即 owner=None）。
+    pub fn table_owned(
+        mut self,
+        owner: &str,
+        name: &str,
+        pk: Option<&str>,
+        columns: &[&str],
+    ) -> Self {
+        self.declare(Some(owner.to_string()), name, pk, columns);
+        self
+    }
+
+    fn declare(&mut self, owner: Option<String>, name: &str, pk: Option<&str>, columns: &[&str]) {
         let mut cols = HashMap::new();
         for c in columns {
             cols.insert(
@@ -68,9 +87,14 @@ impl SchemaRegistry {
             TableDef {
                 columns: cols,
                 primary_key: pk,
+                owner,
             },
         );
-        self
+    }
+
+    /// 表归属模块（None = 未声明 / 未归属）。
+    pub fn owner_of(&self, table: &str) -> Option<&str> {
+        self.tables.get(table).and_then(|t| t.owner.as_deref())
     }
 
     /// 取表定义；未知表返回 None（调用方应拒绝）。
@@ -103,6 +127,11 @@ mod tests {
         assert!(t.has_column("name"));
         assert!(!t.has_column("password_hash"));
         assert_eq!(t.primary_key.as_deref(), Some("id"));
+        // owner：table() 无归属，table_owned 带归属（守卫依据）。
+        assert_eq!(r.owner_of("user"), None);
+        let r2 = SchemaRegistry::new().table_owned("order", "orders", Some("id"), &["id"]);
+        assert_eq!(r2.owner_of("orders"), Some("order"));
+        assert_eq!(r2.owner_of("missing"), None);
     }
 
     #[test]
@@ -125,6 +154,7 @@ mod tests {
         let td = TableDef {
             columns: cols,
             primary_key: None,
+            owner: None,
         };
         assert!(td.is_sortable("a"));
         assert!(!td.is_sortable("b"));

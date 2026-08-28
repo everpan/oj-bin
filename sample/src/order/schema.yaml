@@ -1,0 +1,11 @@
+# 声明式表结构（§4.2 / D1-C）：orders 归 order 模块独占。
+# order/list 现以裸 SQL join user 模块的 account 表（演示用）——已在本模块
+# manifest.yaml deps 声明依赖；演进方向见 spec §3-D2（契约调用 / 读模型 / 只读视图）。
+tables:
+  orders:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      no: { type: text, null: false }
+      account_id: { type: integer, null: false }
+      amount: { type: double, null: false }

@@ -1,0 +1,15 @@
+# 声明式表结构（§4.2 / D1-C）：certs 归 cert 模块独占。
+tables:
+  certs:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      name: { type: text, null: false }
+      note: { type: text, null: false }
+      public_pem: { type: text, null: false }
+      private_pem: { type: text, null: false }
+      cert_jws: { type: text, null: false }
+      nbf: { type: integer, null: false }
+      exp: { type: integer, null: false }
+      created_at: { type: integer, null: false }
+      updated_at: { type: integer, null: false }

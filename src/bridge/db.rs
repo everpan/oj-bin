@@ -288,6 +288,7 @@ pub async fn op_db_query(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<Vec<Row>, JsErrorBox> {
     let params = params.unwrap_or_default();
+    super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     match resolve_target(&state, &name)? {
         Target::Pool(da) => da
             .query_with_params(&sql, &params)
@@ -313,6 +314,7 @@ pub async fn op_db_exec(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<i64, JsErrorBox> {
     let params = params.unwrap_or_default();
+    super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     match resolve_target(&state, &name)? {
         Target::Pool(da) => da
             .exec_with_params(&sql, &params)

@@ -26,6 +26,8 @@ const DEFAULT_MAX_IDLE: usize = 16;
 pub struct RuntimePool {
     /// 构造新 runtime 的工厂（捕获共享的 StableState）。
     make: Box<dyn Fn() -> JsRuntime>,
+    /// 共享稳定状态句柄（§5.3：run_module 按模块目录解析执行上下文用）。
+    stable: Arc<StableState>,
     /// 空闲 runtime 列表。
     idle: RefCell<Vec<JsRuntime>>,
     /// 空闲上限。
@@ -36,6 +38,7 @@ impl RuntimePool {
     /// 用共享的稳定状态构造池。inspect=是否启用 DevTools inspector。
     pub fn new(stable: Arc<StableState>, inspect: bool) -> Self {
         Self {
+            stable: stable.clone(),
             make: Box::new(move || {
                 // 模块加载器取 StableState.loader（单一事实来源；devserver 旧路径 None → 不配）。
                 let module_loader = stable
@@ -52,6 +55,11 @@ impl RuntimePool {
             idle: RefCell::new(Vec::new()),
             max_idle: DEFAULT_MAX_IDLE,
         }
+    }
+
+    /// 共享稳定状态句柄（只读）。
+    pub fn stable(&self) -> &Arc<StableState> {
+        &self.stable
     }
 
     /// 借出一个 runtime（优先复用空闲，否则新建）。

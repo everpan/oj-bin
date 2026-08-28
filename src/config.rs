@@ -35,6 +35,15 @@ pub struct ServerCfg {
     pub certificate_path: String,
     /// 宽限期（天数），证书过期后仍可接受的额外时间
     pub grace_days: Option<u64>,
+    /// 启动迁移门禁（§4.6）：auto=启动即 apply 待应用迁移；verify=只校验
+    /// （账本落后/存在待应用 → fail-fast）；off=不做迁移。缺省按模式取值：
+    /// dev=auto、release=verify（部署 = `oj build && oj migrate && oj server`）。
+    #[serde(default)]
+    pub migrate_on_start: Option<String>,
+    /// 表归属守卫模式（§5.3）：warn（默认，违规仅告警）| deny（违规拒绝执行）。
+    /// 非法值装配期 fail-fast。
+    #[serde(default)]
+    pub ownership_guard: Option<String>,
 }
 
 impl Default for ServerCfg {
@@ -53,6 +62,8 @@ impl Default for ServerCfg {
             public_key_path: "".into(),
             certificate_path: "".into(),
             grace_days: Some(30),
+            migrate_on_start: None,
+            ownership_guard: None,
         }
     }
 }

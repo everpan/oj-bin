@@ -10,6 +10,15 @@ pub struct Manifest {
     pub version: String,
     #[serde(default)]
     pub config: serde_yaml::Value,
+    /// 绑定命名库（§5.3）：模块字面 "default" 的 db 调用重定向到该库；None = 用 default。
+    #[serde(default)]
+    pub db: Option<String>,
+    /// 本模块拥有的表名（schema.yaml 存在时冗余校验：不一致 fail-fast；§5.2）。
+    #[serde(default)]
+    pub tables: Vec<String>,
+    /// 依赖模块（键 = 模块名）：归属守卫放行依据 + S004 依赖存在性检查。
+    #[serde(default)]
+    pub deps: std::collections::HashMap<String, String>,
 }
 
 /// module 白名单：非空、[A-Za-z0-9_-]，禁路径字符与 ..（进路径拼接，信任边界）。
@@ -96,6 +105,37 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
         out.push(m);
     }
     Ok(out)
+}
+
+/// 模块发现（迁移门禁 / fixture / `oj migrate` 共用）：dev（ts）= 首层子目录
+/// （load_modules 已保证 name==目录名）；release = 锁 `dist/manifests.yaml`
+/// {m: v} → `<dir>/<m>-<v>/`。返回 (模块名, 模块目录)，按模块名排序。
+pub fn discover(dir: &Path, ts: bool) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    if ts {
+        let mut out: Vec<_> = load_modules(dir)?
+            .into_iter()
+            .map(|m| {
+                let p = dir.join(&m.name);
+                (m.name, p)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    } else {
+        load_lock(&dir.join("manifests.yaml"))?
+            .into_iter()
+            .map(|(m, v)| {
+                let p = dir.join(format!("{m}-{v}"));
+                if !p.is_dir() {
+                    return Err(format!(
+                        "lock points to missing version dir: {}（先 oj build）",
+                        p.display()
+                    ));
+                }
+                Ok((m, p))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +235,41 @@ mod tests {
         let m = parse_one(&d.0.join("m.yaml")).unwrap();
         assert_eq!((m.name.as_str(), m.version.as_str()), ("user", "0.1.0"));
         assert!(parse_one(&d.0.join("none.yaml")).is_err());
+    }
+
+    #[test]
+    fn discover_dev_and_release_layouts() {
+        let d = tmp("disc");
+        // dev：首层目录（name==目录名），按名排序。
+        write(
+            d.0.join("user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        );
+        write(
+            d.0.join("order/manifest.yaml"),
+            "name: order\ndesc: d\nversion: 0.1.0\n",
+        );
+        let ms = discover(&d.0, true).unwrap();
+        assert_eq!(
+            ms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["order", "user"]
+        );
+        // release：锁 → 版本目录；锁指向缺失目录 → Err。
+        write(
+            d.0.join("dist/order-0.1.0/manifest.yaml"),
+            "name: order\ndesc: d\nversion: 0.1.0\n",
+        );
+        std::fs::write(
+            d.0.join("dist/manifests.yaml"),
+            "order: 0.1.0\nghost: 9.9.9\n",
+        )
+        .unwrap();
+        let e = discover(&d.0.join("dist"), false).unwrap_err();
+        assert!(e.contains("ghost-9.9.9"), "{e}");
+        std::fs::write(d.0.join("dist/manifests.yaml"), "order: 0.1.0\n").unwrap();
+        let ms = discover(&d.0.join("dist"), false).unwrap();
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].0, "order");
+        assert!(ms[0].1.ends_with("order-0.1.0"));
     }
 }

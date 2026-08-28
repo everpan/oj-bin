@@ -1,0 +1,17 @@
+# 框架级共有表上收 _platform 伪模块（§3-D2 层 4 / §4.8）：归属图单源，杜绝「散在根 seed」。
+tables:
+  tenant:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      guid: { type: text, null: false }
+      en_name: { type: text, null: false }
+      cn_name: { type: text, null: false }
+      dsn_key: { type: text, null: false }
+  users:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      username: { type: text, null: false }
+      password_hash: { type: text, null: false }
+      roles: { type: text, null: false }

@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode};
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
-    Bridge, Dialect, EsBackend, Extras, InMemoryKV, KVStore, LoaderShared, SchemaRegistry,
+    Bridge, EsBackend, Extras, InMemoryKV, KVStore, LoaderShared, ModuleCtx, SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, StableState};
 use only_js::config::{self, Config};
@@ -71,6 +71,7 @@ impl App {
         dir: PathBuf,
         base: String,
         ts: bool,
+        fixtures: bool,
     ) -> Result<App, String> {
         // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
         for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
@@ -124,21 +125,77 @@ impl App {
         let blob: Option<Arc<dyn BlobBackend>> = blobs.as_ref().and_then(|r| r.default());
         // 逐 db 开库（未知 scheme 注册表 fail-fast）。
         let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
-        // 项目根 seed.sql（仅 sqlite 库重放）。
-        let seed = config_dir.join("seed.sql");
-        if seed.is_file() {
-            if dbs.get("default").map(|d| d.dialect()) == Some(Dialect::Sqlite) {
-                let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
-                if let Some(db) = dbs.get("default") {
-                    for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        db.exec_with_params(stmt, &[])
-                            .await
-                            .map_err(|e| format!("seed: {e}"))?;
+        // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
+        // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
+        let gate =
+            cfg.server
+                .migrate_on_start
+                .as_deref()
+                .unwrap_or(if ts { "auto" } else { "verify" });
+        match gate {
+            "auto" => crate::migrate::apply_all(dbs.get("default"), &dir, ts, false).await?,
+            "verify" => crate::migrate::verify_all(dbs.get("default"), &dir, ts).await?,
+            "off" => {}
+            other => {
+                return Err(format!(
+                    "server.migrate_on_start: illegal value {other:?} (auto|verify|off)"
+                ));
+            }
+        }
+        // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
+        let ownership_deny = match cfg.server.ownership_guard.as_deref() {
+            None | Some("warn") => false,
+            Some("deny") => true,
+            Some(other) => {
+                return Err(format!(
+                    "server.ownership_guard: illegal value {other:?} (warn|deny)"
+                ));
+            }
+        };
+        // §4.8 归属图 + SchemaRegistry 复活：discover 全模块 → schema.yaml + manifest(db/deps)
+        // → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx map
+        //（键 = 模块目录绝对路径，run_module 祖先命中注入）。gate=auto 时逐模块
+        // reconcile（§D1：安全前向只进 apply 路径，迁移后补声明漂移）。
+        let mut registry = SchemaRegistry::new();
+        let mut module_map: std::collections::HashMap<String, ModuleCtx> =
+            std::collections::HashMap::new();
+        for (name, mdir) in manifest::discover(&dir, ts)? {
+            let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
+            if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
+                for (t, pk, cols) in f.registry_tables() {
+                    if registry.has_table(t) {
+                        return Err(format!(
+                            "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
+                            registry.owner_of(t).unwrap_or("?")
+                        ));
+                    }
+                    registry = registry.table_owned(&name, t, pk, &cols);
+                }
+                if gate == "auto" {
+                    let acc = dbs
+                        .get("default")
+                        .ok_or("schema.yaml requires db 'default'")?;
+                    for l in crate::schema::reconcile(acc.as_ref(), &name, &f).await? {
+                        eprintln!("schema: {l}");
                     }
                 }
-            } else {
-                eprintln!("warn: seed.sql skipped (default db is not sqlite)");
             }
+            module_map.insert(
+                mdir.to_string_lossy().into_owned(),
+                ModuleCtx {
+                    name: name.clone(),
+                    deps: Arc::new(mf.deps.keys().cloned().collect()),
+                    db: mf.db.clone(),
+                },
+            );
+        }
+        let modules = Arc::new(module_map);
+        // 种子重放（P0）：根 seed.sql（deprecated）→ 各模块 schema.sql/seed.sql（§8-1）。
+        crate::seed::replay_all(dbs.get("default"), config_dir, &dir).await?;
+        // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
+        if fixtures {
+            let modules = crate::manifest::discover(&dir, ts)?;
+            crate::migrate_cmd::load_fixtures(dbs.get("default"), &modules).await?;
         }
         // 鉴权。
         let auth = match &cfg.auth {
@@ -172,11 +229,13 @@ impl App {
                 bus.clone(),
             );
             let blobs = blobs.clone();
+            let (registry, modules, ownership_deny) =
+                (registry.clone(), modules.clone(), ownership_deny);
             move || {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
                     kv.clone(),
-                    SchemaRegistry::new(),
+                    registry.clone(),
                     false,
                     Some(loader.clone()),
                     Extras {
@@ -184,6 +243,8 @@ impl App {
                         es: es.clone(),
                         bus: Some(bus.clone()),
                         plugins: Vec::new(),
+                        modules: modules.clone(),
+                        ownership_deny,
                     },
                 )
             }
@@ -350,7 +411,7 @@ impl App {
                 .no_proxy()
                 .build()
                 .unwrap_or_default(),
-            registry: Arc::new(SchemaRegistry::new()),
+            registry: Arc::new(registry),
             loader: Some(loader.clone()),
             blobs: blobs
                 .clone()
@@ -358,6 +419,9 @@ impl App {
             bus: bus.clone(),
             es: es.clone(),
             plugins: Vec::new(),
+            modules,
+            ownership_deny,
+            sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {
             router,

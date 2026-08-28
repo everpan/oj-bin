@@ -33,6 +33,7 @@ mod envelope;
 mod es;
 mod fetch;
 pub(crate) mod ffi;
+pub mod guard;
 mod http;
 mod inspector;
 mod json;
@@ -68,13 +69,25 @@ pub use registry::SchemaRegistry;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use deno_core::error::CoreError;
 use deno_core::{JsRuntime, OpState, op2};
 
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
 pub type BridgeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// 模块执行上下文（P2 §5.3）：manifest 的 db/deps 声明 + 模块名。
+/// 装配期从 manifest.yaml 汇总，按模块目录绝对路径存入 StableState.modules；
+/// 派发时 `run_module` 经 api_path 祖先目录命中后写入 `ReqState.module`。
+#[derive(Clone)]
+pub struct ModuleCtx {
+    pub name: String,
+    /// manifest deps 声明的模块名集合（跨模块表访问守卫的放行依据）。
+    pub deps: Arc<std::collections::HashSet<String>>,
+    /// manifest db 绑定：Some(name) → 模块的 "default" 库调用重定向到该命名库。
+    pub db: Option<String>,
+}
 
 /// StableState：跨请求共享、创建后不可变（内部句柄均为 Arc）。
 pub struct StableState {
@@ -94,6 +107,12 @@ pub struct StableState {
     pub es: Option<Arc<dyn es::EsBackend>>,
     /// 已装配插件自省信息（op_plugins 输出源；装配层注入）。
     pub plugins: Vec<PluginInfo>,
+    /// 模块执行上下文（键 = 模块目录绝对路径；P2 §5.3）。空 = 无模块上下文（守卫不设防）。
+    pub modules: Arc<HashMap<String, ModuleCtx>>,
+    /// 表归属守卫模式（P2 §5.3）：false=warn（默认，日志告警）；true=deny（违规拒绝）。
+    pub ownership_deny: bool,
+    /// 裸 SQL 表名提取 memo（守卫热路径缓存；键 = SQL 原文）。
+    pub sql_memo: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -107,6 +126,10 @@ pub struct Extras {
     pub es: Option<Arc<dyn es::EsBackend>>,
     /// 已装配插件自省信息（op_plugins 数据源；装配层注入）。
     pub plugins: Vec<PluginInfo>,
+    /// 模块执行上下文（§5.3；缺省空表 = 守卫不设防）。
+    pub modules: Arc<HashMap<String, ModuleCtx>>,
+    /// 表归属守卫 deny 模式（缺省 false = warn）。
+    pub ownership_deny: bool,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -124,6 +147,8 @@ pub struct ReqState {
     pub ws_sends: Vec<String>,
     /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
     pub ws_close: bool,
+    /// 本请求所属模块名（§5.3 执行上下文；run_module 按目录命中注入；None = 无上下文）。
+    pub module: Option<String>,
 }
 
 impl ReqState {
@@ -137,6 +162,7 @@ impl ReqState {
         self.tx = None;
         self.ws_sends.clear();
         self.ws_close = false;
+        self.module = None;
     }
 }
 
@@ -282,6 +308,9 @@ impl Bridge {
             bus: extras.bus.unwrap_or_else(|| Arc::new(bus::Bus::new())),
             es: extras.es,
             plugins: extras.plugins,
+            modules: extras.modules,
+            ownership_deny: extras.ownership_deny,
+            sql_memo: Mutex::new(HashMap::new()),
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -311,7 +340,7 @@ impl Bridge {
 
     /// 带请求上下文执行。
     pub async fn run_with(&self, source: &str, req: RequestInfo) -> Result<Capture, CoreError> {
-        let mut rt = self.checkout_reset(req);
+        let mut rt = self.checkout_reset(req, None);
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         // 仅成功执行（已轮询 event loop）的 runtime 才归还；失败的可能 isolate 损坏，直接丢弃。
         match result {
@@ -328,12 +357,14 @@ impl Bridge {
     // ----- 执行管道复用辅助 -----
 
     /// 借出 runtime 并重置 per-request 状态（不武装看门狗）。
-    fn checkout_reset(&self, req: RequestInfo) -> JsRuntime {
+    fn checkout_reset(&self, req: RequestInfo, module: Option<&str>) -> JsRuntime {
         let rt = self.pool.checkout();
         {
             let op_state = runtime::op_state(&rt);
             let mut g = op_state.borrow_mut();
-            g.borrow_mut::<ReqState>().reset(req);
+            let rs = g.borrow_mut::<ReqState>();
+            rs.reset(req);
+            rs.module = module.map(|s| s.to_string());
         }
         rt
     }
@@ -341,8 +372,13 @@ impl Bridge {
     /// 借出 runtime、重置状态并武装看门狗（KillSwitch）。
     /// 用 v8::IsolateHandle（Send+Sync 跨线程句柄）而非裸指针：OwnedIsolate 包装地址 ≠ 真实
     /// isolate 指针，手转裸指针再跨线程 terminate 会解引用垃圾地址（SIGSEGV）。
-    fn checkout_armed(&self, req: RequestInfo, timeout: std::time::Duration) -> JsRuntime {
-        let mut rt = self.checkout_reset(req);
+    fn checkout_armed(
+        &self,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+        module: Option<&str>,
+    ) -> JsRuntime {
+        let mut rt = self.checkout_reset(req, module);
         let handle = rt.v8_isolate().thread_safe_handle();
         self.kill.arm(handle, timeout);
         rt
@@ -411,7 +447,7 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<WsOutcome, RunError> {
-        let mut rt = self.checkout_armed(req, timeout);
+        let mut rt = self.checkout_armed(req, timeout, None);
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         if self.kill.disarm() {
             // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
@@ -460,7 +496,19 @@ impl Bridge {
              if (typeof fn !== \"function\") json.fail(405, {msg_lit});\n\
              else await fn();\n"
         );
-        self.run_side_driver(req, code, timeout).await
+        // §5.3 执行上下文：api_path 祖先目录命中模块目录 → 本请求归该模块
+        // （归属守卫 / bound_db 重定向依据；Map 键 = 模块目录绝对路径，装配期注入）。
+        let stable = self.pool.stable();
+        let mut module: Option<&str> = None;
+        let mut anc = api_path.parent();
+        while let Some(d) = anc {
+            if let Some(ctx) = stable.modules.get(&d.to_string_lossy().into_owned()) {
+                module = Some(ctx.name.as_str());
+                break;
+            }
+            anc = d.parent();
+        }
+        self.run_side_driver(req, code, timeout, module).await
     }
 
     /// 启动期内省：import api 模块、读 default[method].route，经 json.ok 信封回传 data
@@ -482,7 +530,7 @@ impl Bridge {
              json.ok(out);\n"
         );
         let cap = self
-            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT)
+            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
             .await?;
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
         Ok(v["data"].clone())
@@ -500,7 +548,7 @@ impl Bridge {
              json.ok(m.default === undefined ? null : m.default);\n"
         );
         let cap = self
-            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT)
+            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
             .await?;
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
         Ok(v["data"].clone())
@@ -515,6 +563,7 @@ impl Bridge {
         req: RequestInfo,
         code: String,
         timeout: std::time::Duration,
+        module: Option<&str>,
     ) -> Result<Capture, RunError> {
         static DRV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = DRV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -522,7 +571,7 @@ impl Bridge {
             .map_err(|e| {
             RunError::Core(CoreError::from(std::io::Error::other(e.to_string())))
         })?;
-        let mut rt = self.checkout_armed(req, timeout);
+        let mut rt = self.checkout_armed(req, timeout, module);
         // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
         // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
         // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
@@ -1122,6 +1171,9 @@ mod tests {
             bus: Arc::new(bus::Bus::new()),
             es: None,
             plugins: Vec::new(),
+            modules: Arc::new(HashMap::new()),
+            ownership_deny: false,
+            sql_memo: Mutex::new(HashMap::new()),
         });
         let pool = runtime::RuntimePool::new(stable, false);
         let mut rt = pool.checkout();
@@ -1159,16 +1211,38 @@ mod tests {
     }
 
     fn module_bridge(root: &std::path::Path) -> Bridge {
-        Bridge::with_dbs_and_loader(
-            HashMap::new(),
-            Arc::new(InMemoryKV::new()),
+        module_bridge_ex(
+            root,
             SchemaRegistry::new(),
+            Arc::new(HashMap::new()),
+            false,
+            HashMap::new(),
+        )
+    }
+
+    /// 带归属上下文的模块 bridge：modules 键 = 模块目录绝对路径（§5.3 装配形态）。
+    /// dbs：命名库表（None = 空，走 Bridge 默认补 default）。
+    fn module_bridge_ex(
+        root: &std::path::Path,
+        registry: SchemaRegistry,
+        modules: Arc<HashMap<String, ModuleCtx>>,
+        ownership_deny: bool,
+        dbs: HashMap<String, Arc<dyn DataAccessor>>,
+    ) -> Bridge {
+        Bridge::with_dbs_and_loader(
+            dbs,
+            Arc::new(InMemoryKV::new()),
+            registry,
             false,
             Some(Arc::new(LoaderShared {
                 project_root: root.to_path_buf(),
                 ts: true,
             })),
-            Extras::default(),
+            Extras {
+                modules,
+                ownership_deny,
+                ..Default::default()
+            },
         )
     }
 
@@ -1393,5 +1467,111 @@ mod tests {
         let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
         assert_eq!(v1["data"]["m"], "GET");
         assert_eq!(v2["data"]["m"], "PUT");
+    }
+
+    /// §5.3 集成：run_module 目录命中注入模块上下文 → 表归属守卫生效。
+    /// registry：secret 属 other；模块 m 未声明 deps → warn 放行 / deny 拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ownership_guard_deny_blocks_cross_table_and_warn_allows() {
+        let _t = transpile_serial();
+        let (root, api, mods, reg) = {
+            let (root, api) = mod_fx(&[(
+                "m/api.ts",
+                "export default { get() { db.query(\"select * from secret\")\n\
+                 \x20 .then((r) => json.ok({ n: r.length }))\n\
+                 \x20 .catch((e) => json.fail(500, String(e))); } };\n",
+            )]);
+            let reg = SchemaRegistry::new().table_owned("other", "secret", Some("id"), &["id"]);
+            let mods = Arc::new(HashMap::from([(
+                root.join("m").to_string_lossy().into_owned(),
+                ModuleCtx {
+                    name: "m".into(),
+                    deps: Arc::new(std::collections::HashSet::new()),
+                    db: None,
+                },
+            )]));
+            (root, api, mods, reg)
+        };
+        // deny：跨模块表访问被拒（raw SQL 提取到 secret，owner=other ∉ {m} ∪ deps）。
+        let dbs = HashMap::from([(
+            "default".to_string(),
+            Arc::new(InMemoryAccessor::new()) as Arc<dyn DataAccessor>,
+        )]);
+        let b = module_bridge_ex(&root, reg.clone(), mods.clone(), true, dbs);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("ownership"), "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("deps"), "{v}");
+        // warn：放行（默认模式不破坏既有行为）。
+        let dbs = HashMap::from([(
+            "default".to_string(),
+            Arc::new(InMemoryAccessor::new()) as Arc<dyn DataAccessor>,
+        )]);
+        let b = module_bridge_ex(&root, reg, mods, false, dbs);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bound_db_redirects_default_for_bound_module() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "m/api.ts",
+            "export default { get() { db.query(\"select * from user\")\n\
+             \x20 .then((r) => json.ok({ viaDefault: r[0].db }))\n\
+             \x20 .catch((e) => json.fail(500, String(e))); } };\n",
+        )]);
+        let def = Arc::new(InMemoryAccessor::new());
+        def.seed([serde_json::json!({"db": "default"})]);
+        let analytics = Arc::new(InMemoryAccessor::new());
+        analytics.seed([serde_json::json!({"db": "analytics"})]);
+        let mods = Arc::new(HashMap::from([(
+            root.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: Some("analytics".into()),
+            },
+        )]));
+        let b = module_bridge_ex(
+            &root,
+            SchemaRegistry::new(),
+            mods,
+            false,
+            HashMap::from([
+                ("default".to_string(), def as Arc<dyn DataAccessor>),
+                ("analytics".to_string(), analytics as Arc<dyn DataAccessor>),
+            ]),
+        );
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // 字面 "default" 被重定向到绑定的 analytics 库。
+        assert_eq!(v["data"]["viaDefault"], "analytics", "{v}");
     }
 }

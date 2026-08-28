@@ -50,6 +50,12 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             return Err(format!("version dir collision: {vd}"));
         }
     }
+    // 检查体系（§5.2）：构建即检查，S002–S006 违规 fail build；--check 只校验不落盘。
+    crate::checks::run(&src, &names, &view)?;
+    if a.check {
+        println!("oj build --check: {} module(s) OK", names.len());
+        return Ok(());
+    }
     for name in &names {
         build_one(&src, &out, name, &view, a.minify).await?;
     }
@@ -116,7 +122,7 @@ async fn build_one(
         let dst_dir = vdir.join(dir);
         std::fs::create_dir_all(&dst_dir)
             .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
-        if rel.extension().is_some_and(|e| e == "yaml") {
+        if rel.extension().is_some_and(|e| e == "yaml" || e == "sql") {
             let dst = dst_dir.join(rel.file_name().unwrap());
             std::fs::copy(mdir.join(rel), &dst)
                 .map_err(|e| format!("copy {}: {e}", dst.display()))?;
@@ -260,12 +266,21 @@ fn walk(root: &Path, dir: &Path, acc: &mut Vec<(PathBuf, bool)>) -> Result<(), S
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
         if p.is_dir() {
+            if name == "fixtures" {
+                continue; // 演示数据不进产物（spec §4.5/P0），由 oj fixture 灌入
+            }
             walk(root, &p, acc)?;
         } else {
-            let name = e.file_name().to_string_lossy().into_owned();
             let is_api = name == "api.ts";
-            if is_api || name.ends_with(".ts") || name == "manifest.yaml" {
+            // P0 白名单扩展：模块自带 SQL（seed/schema/migrations）与 schema.yaml 进 dist。
+            if is_api
+                || name.ends_with(".ts")
+                || name == "manifest.yaml"
+                || name == "schema.yaml"
+                || name.ends_with(".sql")
+            {
                 acc.push((p.strip_prefix(root).unwrap().to_path_buf(), is_api));
             }
         }
@@ -658,6 +673,7 @@ mod tests {
             dir: t.join("src").display().to_string(),
             out: t.join("dist").display().to_string(),
             minify: true,
+            check: false,
         }
     }
 
@@ -855,6 +871,56 @@ mod tests {
         let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
         assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
         assert_eq!(lock.get("other").map(String::as_str), Some("0.9.0")); // spec §6：保留
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// P0 白名单：模块 seed.sql / schema.yaml / migrations/*.sql 原样进 dist；
+    /// fixtures/ 整目录排除（演示数据不随产物发布）。
+    #[tokio::test]
+    async fn build_copies_module_sql_and_excludes_fixtures() {
+        let t = std::env::temp_dir().join(format!("oj-build-sql-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        one_module(&t, "user", "0.1.0");
+        // S005：tables 声明与 schema.yaml 一致（build 内嵌检查）。
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\ntables: [account]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/seed.sql"),
+            "INSERT OR IGNORE INTO account VALUES (1, 'neo');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/schema.yaml"),
+            "tables:\n  account:\n    pk: id\n    columns:\n      id: { type: integer }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(t.join("src/user/migrations")).unwrap();
+        std::fs::write(
+            t.join("src/user/migrations/0001__init.sql"),
+            "CREATE TABLE account (id, name);\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(t.join("src/user/fixtures")).unwrap();
+        std::fs::write(
+            t.join("src/user/fixtures/demo.sql"),
+            "INSERT INTO account VALUES (9);\n",
+        )
+        .unwrap();
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        let vd = t.join("dist/user-0.1.0");
+        // 原样 copy（字节一致）
+        assert_eq!(
+            std::fs::read(vd.join("seed.sql")).unwrap(),
+            b"INSERT OR IGNORE INTO account VALUES (1, 'neo');\n"
+        );
+        assert!(vd.join("schema.yaml").is_file());
+        assert!(vd.join("migrations/0001__init.sql").is_file());
+        // fixtures 整目录不进产物
+        assert!(!vd.join("fixtures").exists());
         let _ = std::fs::remove_dir_all(&t);
     }
 

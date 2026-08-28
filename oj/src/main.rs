@@ -24,6 +24,27 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::Migrate(a) => match oj::migrate_cmd::run_migrate(&a).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj migrate: {e}");
+                1
+            }
+        },
+        Command::Fixture(a) => match oj::migrate_cmd::run_fixture(&a).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj fixture: {e}");
+                1
+            }
+        },
+        Command::SchemaDiff(a) => match oj::migrate_cmd::run_schema_diff(&a).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj schema diff: {e}");
+                1
+            }
+        },
     }
 }
 
@@ -71,6 +92,7 @@ mod tests {
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,
+            check: false,
         };
         let code = run_command(Command::Build(a)).await;
         assert_eq!(code, 0);
@@ -88,6 +110,7 @@ mod tests {
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,
+            check: false,
         };
         let code = run_command(Command::Build(a)).await;
         assert_eq!(code, 1);

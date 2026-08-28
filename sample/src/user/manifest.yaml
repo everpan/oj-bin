@@ -1,3 +1,5 @@
 name: "user"
 desc: "用户信息相关，记录账号、地址等个人信息"
 version: "0.1.0"
+tables:            # 与 schema.yaml 双向一致（S005，§4.2）
+  - account

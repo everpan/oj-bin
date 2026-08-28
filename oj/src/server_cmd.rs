@@ -38,7 +38,7 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         cfg.server.logs_keep_files as usize,
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
-    let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts).await?;
+    let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false).await?;
     let (bound, h) = app.serve(addr).await?;
     println!(
         "oj server listening on http://{bound}{} (dir={}, {})",
@@ -109,7 +109,7 @@ pub async fn start(
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
-    let app = App::from_config(cfg, config_dir, dir, base, ts).await?;
+    let app = App::from_config(cfg, config_dir, dir, base, ts, false).await?;
     app.serve(addr).await
 }
 
@@ -463,7 +463,7 @@ mod tests {
         let e = start(
             cfg,
             Path::new("/tmp"),
-            PathBuf::from("src"),
+            t.0.join("src"),
             "/v1/api".into(),
             true,
         )
@@ -495,7 +495,7 @@ mod tests {
         let e = start(
             cfg,
             Path::new("/tmp"),
-            PathBuf::from("src"),
+            t.0.join("src"),
             "/v1/api".into(),
             true,
         )
@@ -676,6 +676,110 @@ mod tests {
         assert_eq!(r.status(), 200); // pattern 无 base → 聚合拼 /v1/api/user/item/{id}
     }
 
+    /// P1 迁移门禁（§4.6）：dev 默认 auto（启动即 apply）；release 默认 verify
+    /// （账本落后 M004 拒启 + 指引命令；apply 后放行）；off 逃生门；非法值 fail-fast。
+    #[tokio::test]
+    async fn migrate_gate_auto_verify_off() {
+        let t = tmpdir("sc-gate");
+        std::fs::create_dir_all(t.0.join("src/u/migrations")).unwrap();
+        std::fs::write(
+            t.0.join("src/u/manifest.yaml"),
+            "name: u\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.0.join("src/u/migrations/0001__init.sql"),
+            "CREATE TABLE g (x);",
+        )
+        .unwrap();
+        let db = format!("sqlite://{}/db.sqlite", t.0.display());
+        // a) dev auto：启动即迁移（表已建）。
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert("default".into(), db.clone());
+        let _ = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .unwrap();
+        let acc = only_js::bridge::DbBackendRegistry::builtin()
+            .connect(&db, &t.0)
+            .await
+            .unwrap();
+        let rows = acc
+            .query("select name from sqlite_master where type='table' and name='g'")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "dev auto gate must apply migrations");
+        // b) release verify：空库 + 产物带迁移 → M004 拒启（文案含命令）。
+        const UMANI: &str = "name: u\ndesc: d\nversion: 0.1.0\n";
+        let dist = rel_fixture(&[
+            ("dist/manifests.yaml", "u: 0.1.0\n"),
+            ("dist/u-0.1.0/manifest.yaml", UMANI),
+            ("dist/u-0.1.0/routes.js", "export default [];\n"),
+            (
+                "dist/u-0.1.0/migrations/0001__init.sql",
+                "CREATE TABLE g (x);",
+            ),
+        ]);
+        let db2 = format!("sqlite://{}/rel.sqlite", t.0.display());
+        let dist = dist.join("dist"); // rel_fixture 返回父目录
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert("default".into(), db2.clone());
+        let e = start(cfg, &t.0, dist.clone(), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("M004") && e.contains("oj migrate"), "{e}");
+        // c) 显式 apply（oj migrate 等价）→ verify 放行。
+        let acc = only_js::bridge::DbBackendRegistry::builtin()
+            .connect(&db2, &t.0)
+            .await
+            .unwrap();
+        oj_migrate_apply(&dist, &acc).await;
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert("default".into(), db2);
+        let _ = start(cfg, &t.0, dist, "/v1/api".into(), false)
+            .await
+            .unwrap();
+        // d) off 逃生门：空库 + 迁移不执行也不拒启。
+        let dist2 = rel_fixture(&[
+            ("dist/manifests.yaml", "u: 0.1.0\n"),
+            ("dist/u-0.1.0/manifest.yaml", UMANI),
+            ("dist/u-0.1.0/routes.js", "export default [];\n"),
+            (
+                "dist/u-0.1.0/migrations/0001__init.sql",
+                "CREATE TABLE g (x);",
+            ),
+        ])
+        .join("dist");
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert(
+            "default".into(),
+            format!("sqlite://{}/off.sqlite", t.0.display()),
+        );
+        cfg.server.migrate_on_start = Some("off".into());
+        let _ = start(cfg, &t.0, dist2, "/v1/api".into(), false)
+            .await
+            .unwrap();
+        // e) 非法值 fail-fast。
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.migrate_on_start = Some("nope".into());
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("illegal value"), "{e}");
+    }
+
+    /// 测试辅助：release 布局 apply_all（等价 `oj migrate -d dist`）。
+    async fn oj_migrate_apply(dist: &Path, acc: &Arc<dyn DataAccessor>) {
+        crate::migrate::apply_all(Some(acc), dist, false, false)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn release_fail_fast_paths() {
         // a) 无 manifests.yaml
@@ -844,6 +948,77 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["data"][0]["v"], "a", "{v}");
+    }
+
+    /// P0：模块种子重放——src/u/seed.sql 建表插数，handler 查得到。
+    #[tokio::test]
+    async fn module_seeds_replayed_and_served() {
+        let t = tmpdir("sc-mseed");
+        std::fs::create_dir_all(t.0.join("src/u")).unwrap();
+        std::fs::write(
+            t.0.join("src/u/manifest.yaml"),
+            "name: u\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.0.join("src/u/seed.sql"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);\n\
+             INSERT OR IGNORE INTO t (id, v) VALUES (1, 'mod');\n",
+        )
+        .unwrap();
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert(
+            "default".into(),
+            format!("sqlite://{}/db.sqlite", t.0.display()),
+        );
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(t.0.join("src/u/f")).unwrap();
+        std::fs::write(
+            t.0.join("src/u/f/api.ts"),
+            "export default { get() { db.query(\"select v from t where id = ?\", [1]).then(r => json.ok(r)); } };\n",
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["data"][0]["v"], "mod", "{v}");
+    }
+
+    /// P0：S002——根 seed 与模块 seed 建同一张表 → 启动 fail-fast。
+    #[tokio::test]
+    async fn s002_seed_conflict_blocks_startup() {
+        let t = tmpdir("sc-s002");
+        std::fs::create_dir_all(t.0.join("src/u")).unwrap();
+        std::fs::write(
+            t.0.join("src/u/manifest.yaml"),
+            "name: u\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(t.0.join("seed.sql"), "CREATE TABLE IF NOT EXISTS t (id);").unwrap();
+        std::fs::write(
+            t.0.join("src/u/seed.sql"),
+            "CREATE TABLE IF NOT EXISTS t (id);",
+        )
+        .unwrap();
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.port = 0;
+        cfg.db.insert(
+            "default".into(),
+            format!("sqlite://{}/db.sqlite", t.0.display()),
+        );
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("S002") && e.contains("t") && e.contains("下一步"),
+            "{e}"
+        );
     }
 
     // ----- 插件装配（spec §5）：全部经 cfg.plugins_dir 注入（每测试独立 Config，

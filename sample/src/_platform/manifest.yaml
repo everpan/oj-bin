@@ -1,0 +1,6 @@
+name: _platform
+desc: 框架级共有表（tenant 多租户 / users 鉴权）——普通模块、无路由（spec §4.1/§7-1）
+version: 0.1.0
+tables:
+  - tenant
+  - users
