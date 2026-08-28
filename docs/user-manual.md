@@ -27,8 +27,11 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>]
-oj build  [module] [-d src] [-o dist] [--no-minify]
+oj server  [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>]
+oj build   [module] [-d src] [-o dist] [--no-minify] [--check]
+oj migrate [-c config.yaml] [-d <src|dist>] [--baseline] [--module M]
+oj fixture [-c config.yaml] [-d <src|dist>] [--module M]
+oj schema diff [-c config.yaml] [-d <src|dist>]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -41,6 +44,9 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
 | `--cert-path` | 无 | （server）JWS 证书路径，覆盖 `server.certificate_path`（证书必配，此参数可满足） |
 | `--key-path` | 无 | （server）PEM 公钥路径，覆盖 `server.public_key_path`（证书必配，此参数可满足） |
+| `--check` | 关 | （build）只跑结构检查（S002–S006）不写任何产物；有违规 exit 1（CI 门禁） |
+| `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
+| `--module` | 无 | （migrate / fixture）只处理指定模块 |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
   读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
@@ -53,6 +59,15 @@ oj build  [module] [-d src] [-o dist] [--no-minify]
   - 跨模块相对导入（如 order 引 `../../user/_shared/validate`）构建期改写为指向
     目标模块版本目录的相对路径；目标模块未构建过则报错（先 `oj build user`）。
   - 产出确定性 tgz：`dist/<module>-<version>.tgz`（同输入字节一致），用于整体发布。
+  - **构建即检查**：build 内嵌结构检查 S002–S006（违规 fail build，一次报全）；
+    `--check` 只校验不落盘（CI 门禁）。规则见 §5.3。
+- `oj migrate`：把各模块 `migrations/*.sql` 按序应用到 default 库（账本
+  `_oj_migrations_<module>`），并对声明 `schema.yaml` 的模块做收敛（§5.1）；
+  `--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
+- `oj fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
+- `oj schema diff`：声明式 schema 与实库**只读对账**——D001 缺表/缺列/多列（改名或删除
+  须手写迁移）/缺索引，D002 实库有而未声明的表；有漂移打印报告并 exit 1（发布前巡检）。
+  类型漂移不比对（手写迁移场景人工核对）。
 - release 模式启动时按 `dist/manifests.yaml` 逐模块加载各版本目录的 `routes.js` 聚合路由；
   锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错（提示先 `oj build`）。
 - `-b` 已不是 build 参数（pattern 不含 base）；误用时显式报错退出。
@@ -77,6 +92,10 @@ server:
   public_key_path: "./config/public_key.pem"   # 证书校验公钥（PEM，必配）
   certificate_path: "./config/certificate.jws"  # JWS 证书（Base64URL(Header).Payload.Signature，必配）
   grace_days: 30           # 证书过期后宽限天数（默认 30；缩窄可加速告警）
+  migrate_on_start: auto   # 迁移门禁（§5.2）：auto（dev 默认，启动即应用）
+                           # | verify（release 默认，账本落后拒启，先 oj migrate）| off
+  ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）
+                           # | deny（未声明 deps 的跨模块表访问拒绝执行）
 db:
   default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # 需 oj-db-mysql 插件
@@ -126,6 +145,11 @@ blob:
   §5.1 与 `ops-manual.md` §3/§7。
 - 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
   可重复执行；**注意**：seed 内不得有分号字面量）。
+- `server.migrate_on_start`：启动迁移门禁。`auto`（dev 默认）启动即应用迁移与 schema 收敛；
+  `verify`（release 默认）校验账本，落后即拒启（M004，报错附 `oj migrate` 命令）；`off` 逃生门
+  （迁移完全归 `oj migrate` / 运维）。非法值 fail-fast。
+- `server.ownership_guard`：表归属守卫（§5.3）。`warn`（默认）跨模块表访问仅告警；
+  `deny` 未声明 `deps` 的跨模块表访问拒绝执行（500，报错附修复指引）。
 
 ## 4. 项目目录结构
 
@@ -136,6 +160,10 @@ blob:
 ├── src/                 # dev 服务目录（release 用 dist/，结构相同）
 │   ├── user/            # 首层子目录 = 模块名
 │   │   ├── manifest.yaml
+│   │   ├── schema.yaml           # 声明式表结构（可选，§5.1）
+│   │   ├── migrations/           # 手写 DDL 演进 0001__init.sql …（可选，§5.2）
+│   │   ├── seed.sql              # 幂等种子，随启动重放（可选）
+│   │   ├── fixtures/             # 演示数据，仅 oj test / oj fixture 灌入（可选）
 │   │   ├── _shared/validate.ts   # 无 api 文件 → 纯工具代码目录，不产生路由
 │   │   ├── account/api.ts        # → /v1/api/user/account/
 │   │   ├── profile/api.ts        # → /v1/api/user/profile/
@@ -155,6 +183,7 @@ dist/
 ├── manifests.yaml              # 模块 → 锁定版本（release 按此加载）
 ├── user-0.1.0/                 # 版本目录 = <module>-<version>
 │   ├── manifest.yaml           # 原样复制
+│   ├── schema.yaml / migrations/ / seed.sql   # 数据层文件原样进包（release 迁移按此执行）
 │   ├── routes.js               # 本模块路由表
 │   ├── _shared/validate.js     # 非 api.ts：原路径换 .js（minified）
 │   ├── account/api.js          # api.ts：原名原目录（minified）
@@ -168,14 +197,67 @@ dist/
 - 任意深度的子目录中放 `api.ts`（dev）/ `api.js`（release），即成为一条路由。
 - 没有 `api` 文件的目录不是路由，可作共享工具代码目录（如 `_shared`）。
 
-## 5. manifest.yaml（模块清单）
+## 5. manifest.yaml 与模块数据层
 
 ```yaml
 name: "user"        # 必须等于父目录名（强约束，否则启动失败）
 desc: "用户信息相关，记录账号、地址等个人信息"
-version: "0.1.0"
+version: "0.1.0"    # semver；build 版本目录与 deps 范围匹配（S004）的依据
+tables:             # 本模块拥有的表名；须与 schema.yaml 完全一致（S005）
+  - account
+deps:               # 依赖的其他模块 → semver 范围；声明后才可访问其表（§5.3）
+  order: "^0.1.0"
 # config: {}        # 可选，本模块的其他设置
 ```
+
+### 5.1 schema.yaml（声明式表结构，声明为源）
+
+```yaml
+tables:
+  account:
+    pk: id                      # 可选；主键列须在 columns 声明
+    columns:
+      id: { type: integer, autoincrement: true }   # integer/bigint/text/boolean/double/blob
+      name: { type: text, null: false }            # null 缺省 = 可空
+    indexes:
+      idx_account_name: [name]
+```
+
+启动 / `oj migrate` 时自动收敛到声明（**安全前向**：缺表 CREATE、缺可空列 ALTER ADD、
+缺索引 CREATE INDEX）；无法安全推导的一律 fail-fast 并打印手写迁移模板——NOT NULL 列新增
+（存量行无值）、疑似改名（缺新列 + 多旧列）。同一份声明同时喂**归属图**（表 → 模块，
+同表双声明拒启，S002）与 `SchemaRegistry`（`db.table()` 构造器列白名单）。超出六种基础
+类型或需数据回填的演进 → 写 `migrations/`。
+
+### 5.2 migrations/（手写 DDL 演进）与 seed / fixtures
+
+`migrations/{seq:04}__{desc}[.{sqlite|mysql|postgres}].sql`：按 seq 升序每条应用一次，
+账本表 `_oj_migrations_<module>` 记录；带方言后缀只在该方言库执行。文件名空洞、乱序、
+desc 与账本不一致 → 报错（S007）。应用入口三处：
+
+- dev 默认 `migrate_on_start: auto`（启动即应用）；
+- release 默认 `verify`（账本落后拒启，M004；先 `oj migrate`）；`off` 逃生门；
+- 显式 `oj migrate [--baseline] [--module M]`；`--baseline` 把 ≤head 的迁移全部记为
+  已应用而不执行（存量库接入）。
+
+模块级 `seed.sql`：幂等参考数据，随启动重放——禁 DDL、INSERT 须幂等（`OR IGNORE` /
+`ON CONFLICT` / `OR REPLACE`）、只写本模块与 deps 模块的表（S006 校验）。
+`fixtures/`：演示数据，仅 `oj test` / `oj fixture` 灌入（不进发布产物、不记账本）。
+
+### 5.3 检查体系与表归属
+
+跨模块表访问必须显式声明：模块 SQL（.ts 源码内字符串 + seed.sql）引用他模块的表而
+manifest `deps` 未声明 → **S003** 拦截（`oj build` 内建，一次报全；`--check` 只查不落盘，
+CI 门禁），运行时按 `server.ownership_guard` 处置（`warn` 告警 / `deny` 拒绝执行并附
+修复指引）。误报逃生门：SQL 注释 `/* oj:allow-table=x,y */`。规则速览：
+
+| 层 | 规则 | 内容 |
+|---|---|---|
+| 结构（build 内建） | S001–S007 | manifest 合法性；表归属单射；跨模块依赖声明；deps 版本范围；tables 与 schema.yaml 一致；seed 纪律；迁移文件序列 |
+| 漂移（`oj schema diff`） | D001 / D002 | 声明 vs 实库缺表/缺列/多列/缺索引；实库有而未声明的表 |
+
+> 边界语义：归属图取自**部署目录内**各模块的 schema.yaml——模块未部署时其表无主，
+> 运行时不设防（部分部署/灰度属设计语义），静态 S003 在构建侧兜底。
 
 ## 6. 编写 api.ts
 
@@ -449,7 +531,7 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - **order/account**：建单时 `escapeHtml` 转义单号（裸 specifier `escape-goat`，vendored 在
   `node_modules/`）；按 `account_id` 查单。
 - **order/list**：跨模块相对导入 `../../user/_shared/validate`（`requireRole`）+ `orders`/`account`
-  join 联查。
+  join 联查；manifest `deps: { user: "^0.1.0" }` 是跨模块表访问的声明演示（§5.3）。
 - **order/detail**：`kv` 读穿缓存（命中返回 `cached:true`，未命中查库并回填）。
 - **user/item**：路径参数路由（`detail.route = "{id}"`，§7.1）——`/v1/api/user/item/1` 查账号，
   镜像路径 404（替换语义）。

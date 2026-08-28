@@ -56,10 +56,18 @@ cargo build                                                   # first build pull
 # dev: run .ts sources directly (no manifests.yaml in dir → auto dev/ts, file changes apply live)
 cargo run -p oj -- server -c sample/config.yaml -d sample/src
 
-# release: build the artifacts first, then run dist/ (manifests.yaml present → auto release/js)
-cargo run -p oj -- build  -d sample/src -o sample/dist
-cargo run -p oj -- server -c sample/config.yaml -d sample/dist
+# release: build the artifacts first, apply migrations, then run dist/
+# (manifests.yaml present → auto release/js; migrate is required by the verify gate)
+cargo run -p oj -- build   -d sample/src -o sample/dist
+cargo run -p oj -- migrate -c sample/config.yaml -d sample/dist
+cargo run -p oj -- server  -c sample/config.yaml -d sample/dist
 ```
+
+Modules own their data layer: a per-module `schema.yaml` (declarative tables, the source of
+truth), `migrations/*.sql` (hand-written DDL evolution with a per-module ledger), and
+`seed.sql`/`fixtures/`. `oj build --check` runs the structural checks (table ownership,
+cross-module deps, seed discipline) without writing artifacts, and `oj schema diff` reports
+drift between declarations and the live database.
 
 On startup it prints the module list and route table, then:
 
@@ -250,6 +258,7 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | `docs/plugin-architecture.md` / `docs/plugin-development.md` | plugin architecture and development |
 | `docs/route-params-design.md` | path-param routing design |
 | `docs/testing.md` | testing conventions |
+| `docs/migration.md` | migration runbook (schema.yaml / migrations / ledger / guards) |
 | `docs/ops-manual.md` | operations |
 | `docs/benchmarks.md` | performance data |
 | `sample/README.md` | example project notes |

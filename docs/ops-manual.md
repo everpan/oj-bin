@@ -1,6 +1,7 @@
 # oj server 运维手册
 
-面向部署、发布、排障。功能面见 `docs/user-manual.md`，实现面见 `docs/dev-manual.md`。
+面向部署、发布、排障。功能面见 `docs/user-manual.md`，实现面见 `docs/dev-manual.md`，
+模块数据层与迁移运维见 `docs/migration.md`。
 
 ## 1. 构建与发布
 
@@ -17,10 +18,14 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
    `dist/<module>-<version>/`（产物保留 src 目录结构与原名，如 `account/api.js`，
    默认 minify 成单行）、锁文件 `dist/manifests.yaml` 与确定性发布包
    `dist/<module>-<version>.tgz`（同输入重复打包字节一致，可校验完整性）。
-   排障需要可读产物时加 `--no-minify` 重建。
-3. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
+   排障需要可读产物时加 `--no-minify` 重建。CI 可在构建前跑 `oj build --check`
+   （只跑结构检查 S002–S006 不落盘，违规 exit 1）。
+3. `oj migrate -c config.yaml -d dist`——应用各模块 `migrations/*.sql` 并按 `schema.yaml`
+   收敛（release 默认 `migrate_on_start: verify` 门禁要求账本不落后，**先迁移后启动**）；
+   存量库接入用 `--baseline`。发布前可跑 `oj schema diff` 做声明 vs 实库对账（漂移 exit 1）。
+4. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
    `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
-4. 目标机解包，`./oj server -c config.yaml -d dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
+5. 目标机解包，`./oj server -c config.yaml -d dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
 
 ## 2. 运行
 
@@ -153,6 +158,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 启动报 `invalid JWS format` | `certificate.jws` 不是三段 `Base64URL(Header).Payload.Signature` | 按 `Header.Payload.Signature` 重新生成 JWS |
 | 启动报 `certificate is mandatory but not configured` | 证书必配（无逃生口）但 `public_key_path`/`certificate_path` 缺任一 | 两个路径都配齐；**没有任何开关可跳过证书校验**——若实例连不上证书，需生成并挂载（见 §3 证书校验） |
 | 启动报 `certificate is mandatory … public_key_path is required` / `… certificate_path is required` | 仅配了 `public_key_path` 或 `certificate_path` 之一（缺任一门禁即拒绝，无部分配置状态） | 两个路径都配齐 |
+| 启动报 `M004: 模块 … 有 N 个待应用迁移 … verify 模式拒启` | release 默认 `migrate_on_start: verify`，迁移账本 `_oj_migrations_<module>` 落后于 dist 内迁移文件 | 先 `oj migrate -c config.yaml -d dist` 再启动；`off` 是逃生门（迁移归运维，不推荐常态） |
+| `oj schema diff` 报 D001/D002 退出 1 | 声明（schema.yaml）与实库漂移——手工改库、漏迁移、删除列未走迁移 | 按 diff 报告逐条补迁移或修正声明；发布前跑一次作巡检 |
+| 启动/build 报 `S002–S006` | 结构检查违规：表归属冲突（S002）、跨模块表未声明 deps（S003）、deps 版本不满足（S004）、tables 与 schema.yaml 不一致（S005）、seed 纪律（S006） | 按报错「下一步」修复；只查不落盘用 `oj build --check` |
 
 ## 8. 回滚与恢复
 
