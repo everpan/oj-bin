@@ -31,11 +31,12 @@ async function post(): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     const exp = now + days * 86400;
     const m = await cert.generate(bits, now, exp);
-    await db.exec(
-      "insert into certs (name, note, public_pem, private_pem, cert_jws, nbf, exp, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    // 单条 RETURNING 原子取 id：全池共享一条 sqlite 连接，exec 后再查
+    // last_insert_rowid() 可能读到并发插入的 id。
+    const rows = await db.query(
+      "insert into certs (name, note, public_pem, private_pem, cert_jws, nbf, exp, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
       [name, (b.note ?? "").slice(0, 2000), m.public_pem, m.private_pem, m.cert_jws, now, exp, now, now],
     );
-    const rows = await db.query("select last_insert_rowid() as id", []);
     json.ok({ id: rows[0]?.id, name });
   } catch (e) {
     json.fail(500, String(e));

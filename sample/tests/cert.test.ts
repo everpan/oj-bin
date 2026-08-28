@@ -18,6 +18,20 @@ describe("cert", () => {
     expect(r.status).toBe(403);
   });
 
+  it("user role gets 403 on remaining endpoints", async () => {
+    // 403 门禁须先于任何查询：id=1 不存在也应 403
+    const calls = [
+      () => client.get("/cert/", { headers: USER }),
+      () => client.get("/cert/item/?id=1", { headers: USER }),
+      () => client.patch("/cert/item/", { headers: USER, body: JSON.stringify({ id: 1, note: "x" }) }),
+      () => client.del("/cert/item/?id=1", { headers: USER }),
+      () => client.post("/cert/renew/", { headers: USER, body: JSON.stringify({ id: 1, days: 30 }) }),
+    ];
+    for (const call of calls) {
+      expect((await call()).status).toBe(403);
+    }
+  });
+
   it("admin create → list valid → note → renew → delete", async () => {
     // 创建
     const created = await client.post("/cert/", {
