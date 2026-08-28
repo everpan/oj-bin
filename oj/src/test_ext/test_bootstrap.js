@@ -10,8 +10,11 @@ function buildClient() {
   const c = {};
   for (const m of METHODS) {
     // opts: { headers?: Record<string,string>, body?: string }
+    // SDK name "del" maps to the wire method "DELETE" (routes::method_name
+    // only maps real HTTP verbs; uppercasing "del" yields the unmapped "DEL").
+    const wire = m === "del" ? "DELETE" : m.toUpperCase();
     c[m] = (path, opts = {}) =>
-      op_client_dispatch(m.toUpperCase(), path, opts.headers ?? {}, opts.body ?? "");
+      op_client_dispatch(wire, path, opts.headers ?? {}, opts.body ?? "");
   }
   // login helper: POST built-in /auth/login -> returns data.access_token.
   // usage: const token = await client.login("demo", "demo1234");
