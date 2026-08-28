@@ -11,6 +11,9 @@
   再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧
 - config.yaml `server.root: dist`：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
   /user-0.1.0.tgz 可直接访问；dist 无 index.html 故 / 为 404）
+- 证书必配（不可绕过）：sample 自带自签示例证书 `config/{public.pem,cert.jws}`
+  （私钥 `config/private.pem` 仅示例用，**严禁用于生产**；过期后用
+  `cargo run -p oj-cert -- renew -k sample/config/private.pem` 重签）
 - dist/ 为 oj build 产物（保留原名原结构，默认 minify），可再生，勿手改
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由 seed.sql 初始化（幂等），已 gitignore

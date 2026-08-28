@@ -45,6 +45,12 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
     cfg.tenant = Default::default();
     cfg.auth = None;
+    // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
+    let n = server::test_support::now_secs();
+    let (cert, key) =
+        server::test_support::write_cert(&tmp, n.saturating_sub(3600), n + 365 * 86_400);
+    cfg.server.certificate_path = cert.display().to_string();
+    cfg.server.public_key_path = key.display().to_string();
     let dir = if dev {
         root.join("src")
     } else {
@@ -226,6 +232,12 @@ async fn uc14_transpile_cache_and_hot_reload() {
     .unwrap();
     let mut cfg = Config::default();
     cfg.server.port = 0;
+    // 证书必配（无逃生口）：生成真实签名证书并配好两路径。
+    let n = server::test_support::now_secs();
+    let (cert, key) =
+        server::test_support::write_cert(&t, n.saturating_sub(3600), n + 365 * 86_400);
+    cfg.server.certificate_path = cert.display().to_string();
+    cfg.server.public_key_path = key.display().to_string();
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     std::fs::write(t.join("seed.sql"), "").unwrap();
     let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
@@ -270,10 +282,15 @@ fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
     t
 }
 
-/// 最小可用配置（port 0 随机端口；default 内存库）。
-fn base_cfg() -> Config {
+/// 最小可用配置（port 0 随机端口；default 内存库；证书必配 → 在项目目录生成真实证书）。
+fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
+    let n = server::test_support::now_secs();
+    let (cert, key) =
+        server::test_support::write_cert(dir, n.saturating_sub(3600), n + 365 * 86_400);
+    cfg.server.certificate_path = cert.display().to_string();
+    cfg.server.public_key_path = key.display().to_string();
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     cfg
 }
@@ -287,7 +304,7 @@ async fn uc7_manifest_mismatch_blocks_startup() {
         "src/order/manifest.yaml",
         "name: orderr\ndesc: d\nversion: 0.1.0\n",
     )]);
-    let e = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let e = server_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
         .await
         .err()
         .unwrap_or_default();
@@ -341,7 +358,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         "0.1.0"
     );
     // release 全链路：聚合 dist/manifests.yaml 锁定版本服务（spec §3）
-    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/item/3", None).await;
@@ -389,7 +406,7 @@ async fn build_then_release_serves_end_to_end() {
     let lock = oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
     assert_eq!(lock.len(), 2, "{lock:?}");
     assert_eq!(lock["other"], "0.9.0");
-    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
         .await
         .unwrap();
     // /v1/api/user/item/3 命中 .route 行；/v1/api/other/l 命中镜像行
@@ -420,7 +437,7 @@ async fn release_mode_loads_routes_js_without_introspection() {
             "export default [ { method: \"get\", pattern: \"u/f/{id}\", file: \"f/api.js\" } ];\n",
         ),
     ]);
-    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/7", None).await;
@@ -436,7 +453,7 @@ async fn release_mode_loads_routes_js_without_introspection() {
 async fn release_mode_without_routes_js_fails_fast() {
     let _g = lock();
     let t = tmp_project(&[("dist/u/manifest.yaml", MANIFEST)]);
-    let e = server_cmd::start(base_cfg(), &t, t.join("dist"), "/v1/api".into(), false)
+    let e = server_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
         .await
         .err()
         .unwrap_or_default();
@@ -454,7 +471,7 @@ async fn uc10_404_and_405_and_traversal() {
             "export default { get() { json.ok({}); } };\n",
         ),
     ]);
-    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
         .await
         .unwrap();
     let (s, _) = req(addr, "GET", "/v1/api/none/here/", None).await;
@@ -476,7 +493,7 @@ async fn uc11_compile_error_envelope() {
         ("src/u/manifest.yaml", MANIFEST),
         ("src/u/f/api.ts", "function {{{{\nexport default {};\n"),
     ]);
-    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
@@ -499,7 +516,7 @@ async fn uc12_timeout_408_server_survives() {
             "export default { get() { json.ok({ alive: true }); } };\n",
         ),
     ]);
-    let mut cfg = base_cfg();
+    let mut cfg = base_cfg(&t);
     cfg.server.timeout = "300ms".into();
     let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await

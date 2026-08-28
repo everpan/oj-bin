@@ -76,6 +76,14 @@ impl App {
         for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
             eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
         }
+        // 证书必配门禁（无逃生口）：两个证书路径必须都配齐才启动，否则 fail-fast。
+        // 证书校验不可被 config 或 CLI 关闭——任何绕过都会违背证书强制校验的初衷。
+        if !cfg.server.cert_paths_configured() {
+            return Err("certificate is mandatory but not configured \
+                 (set server.public_key_path + server.certificate_path; \
+                 no config or flag can skip certificate validation)"
+                .to_string());
+        }
         // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
         let dir = dir.canonicalize().unwrap_or(dir);
         let loader = Arc::new(LoaderShared {
@@ -278,44 +286,35 @@ impl App {
             }
             None => None,
         };
-        // 加载并校验证书：未配置证书路径 → 视为未启用（状态 Valid，不做任何 GET 限制）。
-        let cert_status: SharedCertStatus;
-        let cert_valid_until: SharedCertValidUntil;
-        if server::certificate::is_enabled(&cfg.server) {
-            let (status, valid_until) = load_certificate_at(&cfg.server, &config_dir)?;
-            match &status {
-                CertificateStatus::Expired => {
-                    tracing::error!(
-                        "certificate has expired and grace period elapsed — service will not start"
-                    );
-                    return Err("certificate expired".into());
-                }
-                CertificateStatus::Grace { remaining_secs } => {
-                    tracing::warn!(
-                        "certificate expired, {} days grace period remaining — service starting",
-                        remaining_secs / 86_400
-                    );
-                }
-                CertificateStatus::Valid => {
-                    tracing::info!("certificate loaded: valid");
-                }
+        // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
+        // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
+        let (status, valid_until) = load_certificate_at(&cfg.server, &config_dir)?;
+        match &status {
+            CertificateStatus::Expired => {
+                tracing::error!(
+                    "certificate has expired and grace period elapsed — service will not start"
+                );
+                return Err("certificate expired".into());
             }
-            cert_status = Arc::new(RwLock::new(status));
-            cert_valid_until = Arc::new(RwLock::new(valid_until));
-            // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
-            spawn_watcher(
-                cert_status.clone(),
-                cert_valid_until.clone(),
-                cfg.server.clone(),
-                config_dir.to_path_buf(),
-            );
-        } else {
-            tracing::info!(
-                "certificate check disabled (no public_key_path/certificate_path configured)"
-            );
-            cert_status = Arc::new(RwLock::new(CertificateStatus::Valid));
-            cert_valid_until = Arc::new(RwLock::new(None));
+            CertificateStatus::Grace { remaining_secs } => {
+                tracing::warn!(
+                    "certificate expired, {} days grace period remaining — service starting",
+                    remaining_secs / 86_400
+                );
+            }
+            CertificateStatus::Valid => {
+                tracing::info!("certificate loaded: valid");
+            }
         }
+        let cert_status: SharedCertStatus = Arc::new(RwLock::new(status));
+        let cert_valid_until: SharedCertValidUntil = Arc::new(RwLock::new(valid_until));
+        // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
+        spawn_watcher(
+            cert_status.clone(),
+            cert_valid_until.clone(),
+            cfg.server.clone(),
+            config_dir.to_path_buf(),
+        );
 
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),

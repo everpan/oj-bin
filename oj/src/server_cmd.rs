@@ -21,7 +21,8 @@ use crate::args::ServerArgs;
 pub async fn run(a: ServerArgs) -> Result<(), String> {
     let (mut cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
-    // CLI 覆盖：证书路径（若有）。
+    // CLI 覆盖：证书路径（若有）。强制证书门禁在 App::from_config（统一装配点）判定，
+    // CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
     }
@@ -338,6 +339,29 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         Tmp(d)
     }
+
+    /// 证书必配门禁下，测试须自带有效证书：在 `dir`（随测试存活的临时目录）生成
+    /// 真实签名 JWS，返回配好两路径的 Config。有效期 [now-1h, now+1y] → 启动时 Valid。
+    fn cert_cfg(dir: &Path) -> Config {
+        let mut cfg = Config::default();
+        let n = server::test_support::now_secs();
+        let (cert, key) =
+            server::test_support::write_cert(dir, n.saturating_sub(3600), n + 365 * 86_400);
+        cfg.server.certificate_path = cert.display().to_string();
+        cfg.server.public_key_path = key.display().to_string();
+        cfg
+    }
+
+    /// 同 `cert_cfg`，但证书已过期（宽限期 0）→ 启动应被证书门禁拒绝。
+    fn expired_cert_cfg(dir: &Path) -> Config {
+        let mut cfg = cert_cfg(dir);
+        cfg.server.grace_days = Some(0);
+        let n = server::test_support::now_secs();
+        let (cert, key) = server::test_support::write_cert(dir, n - 2000, n - 1000);
+        cfg.server.certificate_path = cert.display().to_string();
+        cfg.server.public_key_path = key.display().to_string();
+        cfg
+    }
     impl Drop for Tmp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -373,10 +397,62 @@ mod tests {
         assert!(resolve_base(None, "///").is_err());
     }
 
+    /// 证书必配：未配置证书路径 → 启动 fail-fast（任何方式都无法绕过）；配齐有效证书 →
+    /// 正常启动；证书过期 → 启动拒绝。
+    #[tokio::test]
+    async fn certificate_mandatory_gate() {
+        let t = tmpdir("sc-cert");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
+        // a) 未配置任何证书路径 → 拒绝启动。
+        let e = start(
+            Config::default(),
+            &t.0,
+            t.0.join("src"),
+            "/v1/api".into(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
+        assert!(
+            e.contains("certificate is mandatory") && e.contains("public_key_path"),
+            "{e}"
+        );
+        // b) 只配一个路径 → 仍拒绝（缺任一不算就绪）。
+        let mut cfg = Config::default();
+        cfg.server.public_key_path = "/nonexistent/key.pem".into();
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("certificate is mandatory"), "{e}");
+        // c) 配齐有效证书 → 启动成功（随机端口）。
+        let mut cfg = cert_cfg(&t.0);
+        cfg.server.host = "127.0.0.1".into(); // 沙箱环境 localhost 解析受限，绑定回环更稳
+        cfg.server.port = 0;
+        let r = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .unwrap();
+        assert!(r.0.port() != 0);
+        // d) 证书过期（宽限期 0）→ 拒绝启动。
+        let e = start(
+            expired_cert_cfg(&t.0),
+            &t.0,
+            t.0.join("src"),
+            "/v1/api".into(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_default();
+        assert!(e.contains("certificate expired"), "{e}");
+    }
+
     /// auth 配了但 jwt_secret 空 → 装配 fail-fast（不静默跳过鉴权）。
     #[tokio::test]
     async fn empty_jwt_secret_fails_fast() {
-        let mut cfg = Config::default();
+        let t = tmpdir("sc-jwt");
+        let mut cfg = cert_cfg(&t.0);
         cfg.db.insert("default".into(), "sqlite::memory:".into());
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"\"\n").unwrap());
         let e = start(
@@ -407,7 +483,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unknown_dsn_scheme() {
-        let mut cfg = Config::default();
+        let t = tmpdir("sc-dsn2");
+        let mut cfg = cert_cfg(&t.0);
         cfg.db
             .insert("default".into(), "oracle://u:p@localhost/test".into());
         let e = start(
@@ -538,7 +615,7 @@ mod tests {
         )
         .unwrap();
         let e = start(
-            Config::default(),
+            cert_cfg(&t.0),
             &t.0,
             t.0.join("src"),
             "/v1/api".into(),
@@ -583,7 +660,7 @@ mod tests {
                 "export default { get() { json.ok({ v: 1 }); } };\n",
             ),
         ]);
-        let mut cfg = Config::default();
+        let mut cfg = cert_cfg(&t);
         cfg.server.port = 0; // 随机端口（默认 778 并行测试会撞）
         let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into(), false)
             .await
@@ -598,16 +675,10 @@ mod tests {
     async fn release_fail_fast_paths() {
         // a) 无 manifests.yaml
         let t = rel_fixture(&[("dist/user-0.1.0/manifest.yaml", MANI)]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(
             e.contains("manifests.yaml") || e.contains("oj build"),
             "{e}"
@@ -617,29 +688,17 @@ mod tests {
             ("dist/manifests.yaml", "user: 9.9.9\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
         ]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("9.9.9"), "{e}");
         // c) version 注入
         let t = rel_fixture(&[("dist/manifests.yaml", "user: ../../etc\n")]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("version") || e.contains("illegal"), "{e}");
         // d) manifest name 不符
         let t = rel_fixture(&[
@@ -649,16 +708,10 @@ mod tests {
                 "name: other\ndesc: d\nversion: 0.1.0\n",
             ),
         ]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("name"), "{e}");
     }
 
@@ -670,16 +723,10 @@ mod tests {
             ("dist/user-0.1.0/manifest.yaml", MANI),
             ("dist/user-0.1.0/routes.js", "export default [ "),
         ]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("routes.js"), "{e}");
     }
 
@@ -710,16 +757,10 @@ mod tests {
                 "export default { get() { json.ok({}); } };\n",
             ),
         ]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("conflict"), "{e}");
     }
 
@@ -730,16 +771,10 @@ mod tests {
             ("dist/manifests.yaml", "user: [unclosed\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
         ]);
-        let e = start(
-            Config::default(),
-            &t,
-            t.join("dist"),
-            "/v1/api".into(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("unclosed") || e.contains("parse"), "{e}");
     }
 
@@ -747,7 +782,7 @@ mod tests {
     async fn server_root_serves_static_relative_to_config_dir() {
         let t = tmpdir("sc-root");
         std::fs::write(t.0.join("index.html"), "<h1>site</h1>").unwrap();
-        let mut cfg = Config::default();
+        let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0; // 随机端口
         cfg.server.root = Some(".".into()); // 相对 config_dir
         let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
@@ -764,7 +799,7 @@ mod tests {
         // 校验；此前用绝对 "src" 会 canonicalize 到 oj/src（含无 manifest 的 test_ext），
         // 在抵达 server.root 检查前就于模块扫描阶段报错，掩盖了本测试真正要验证的逻辑。
         let t = tmpdir("sc-root-missing");
-        let mut cfg = Config::default();
+        let mut cfg = cert_cfg(&t.0);
         cfg.server.root = Some("no-such-dir".into());
         let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
             .await
@@ -782,7 +817,7 @@ mod tests {
              INSERT OR IGNORE INTO t (id, v) VALUES (1, 'a');\n",
         )
         .unwrap();
-        let mut cfg = Config::default();
+        let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0; // 随机端口
         cfg.db.insert(
             "default".into(),
@@ -1242,7 +1277,7 @@ mod tests {
     async fn redis_declared_without_kv_plugin_fails_fast() {
         let t = tmpdir("sc-kvplug-none");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
-        let mut cfg = Config::default();
+        let mut cfg = cert_cfg(&t.0);
         cfg.plugins_dir = Some(t.0.clone());
         cfg.redis
             .insert("default".into(), "redis://127.0.0.1:1/".into());

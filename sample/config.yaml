@@ -5,6 +5,10 @@ server:
   root: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务）
   # logs_dir: "logs"   # 访问日志目录（按天滚动，每次启动新建文件，文件名带启动秒级时间）
                      #  绝对路径直接用；相对路径相对本文件目录；省略 = 本文件目录下 ./logs
+  # 证书必配（无逃生口）：不配两个路径即启动报错。此处为示例自签证书（有效期 1 年，
+  # 私钥仅示例用，勿用于生产）；生产用 `tools/oj-cert` 生成并妥善保管私钥。
+  public_key_path: "./config/public.pem"
+  certificate_path: "./config/cert.jws"
 db:
   default: "sqlite://db.sqlite"
   test: "sqlite://db_test.sqlite"

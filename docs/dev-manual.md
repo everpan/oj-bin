@@ -222,9 +222,10 @@ RBAC 等真需求出现再议（YAGNI）。
 
 ## 5.1 证书驱动的 GET 限制（运行时校验）
 
-生产可开启基于非对称加密（RSA-2048 + RS256 JWS）的证书校验，对过期证书做 GET 限流：
+基于非对称加密（RSA-2048 + RS256 JWS）的证书校验**强制开启、不可绕过**：未配齐两个
+证书路径即启动报错退出——没有任何 config/CLI 开关可跳过（防止误跑无证书校验的实例）。
 
-- **有效期内 / 未配置证书**：正常服务（`certificate_status = valid`）。
+- **有效期内**：正常服务（`certificate_status = valid`）。
 - **宽限期内（默认 30 天，可配 `grace_days`）**：所有 **GET** 请求返回 `403`，
   JSON 体 `{"error":"certificate expired","detail":"grace period: N days remaining"}`；其余方法正常。
 - **宽限期结束后**：启动期 `from_config` 检测即 `ERROR` 并中止进程（`process::exit`）；
@@ -236,10 +237,22 @@ RBAC 等真需求出现再议（YAGNI）。
 
 ```yaml
 server:
-  public_key_path: "./config/public_key.pem"   # SPKI PEM 公钥（仅验签，私钥不落服务器）
-  certificate_path: "./config/certificate.jws" # JWS：Base64URL(Header).Base64URL(Payload).Base64URL(Signature)
+  public_key_path: "./config/public_key.pem"   # SPKI PEM 公钥（仅验签，私钥不落服务器；必配）
+  certificate_path: "./config/certificate.jws" # JWS：Base64URL(Header).Base64URL(Payload).Base64URL(Signature)；必配
   grace_days: 30                               # 默认 30；缩窄可加速告警
 ```
+
+两个路径缺任一即启动报错退出——**证书必配且不可绕过**（没有任何 config/CLI 开关可跳过
+证书校验；`--cert-path`/`--key-path` 仅覆盖路径、不豁免校验）。
+
+### 生成与续期（`tools/oj-cert`）
+
+```sh
+cargo run -p oj-cert -- gen -o config --days 365   # 生成 private.pem / public.pem / cert.jws
+cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私钥重签续期（公钥不变）
+```
+
+生成路径与上方 `server.*` 契约一致；私钥**仅签发端保管**，服务器只放 `public.pem` + `cert.jws`。
 
 ### CLI 覆盖
 

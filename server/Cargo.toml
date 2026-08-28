@@ -3,6 +3,10 @@ name = "server"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# test_support 模块仅随测试编译；oj 的 dev-deps 需经它装配测试证书。
+test-support = []
+
 [dependencies]
 only-js = { path = ".." }
 axum = { version = "0.8", features = ["ws"] }

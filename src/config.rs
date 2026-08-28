@@ -50,6 +50,14 @@ impl Default for ServerCfg {
     }
 }
 
+impl ServerCfg {
+    /// 证书必配门禁判据：两个路径都配齐才算就绪（缺任一 → 装配拒绝启动）。
+    /// 证书校验无任何开关——config 或 CLI 都无法绕过。
+    pub fn cert_paths_configured(&self) -> bool {
+        !self.public_key_path.trim().is_empty() && !self.certificate_path.trim().is_empty()
+    }
+}
+
 /// 对象存储（OJ-5）：driver local|s3；local root 相对 config 目录。
 // Serialize：装配层经 cfg JSON 透传给 oj-blob-s3 插件（Task 4.2，spec §3 按值传入）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -341,6 +349,38 @@ mod tests {
         .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 证书强制必配：未配置 public_key_path / certificate_path → `cert_paths_configured`
+    /// 为 false（装配层据此拒绝启动，任何方式都无法绕过——config 无开关、CLI 无逃生口）。
+    #[test]
+    fn certificate_mandatory_no_escape_hatch() {
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(!c.server.cert_paths_configured());
+        // 显式在 config 里写 require_cert: false 也不再生效（字段已删除，YAML 忽略）：
+        let dir = std::env::temp_dir().join(format!("ojcfgc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "server:\n  require_cert: false\n  public_key_path: \"\"\n  certificate_path: \"\"\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert!(
+            !c.server.cert_paths_configured(),
+            "no config can disable the requirement"
+        );
+        // 配齐两个路径才算就绪；缺任一不算。
+        let mut c2 = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert!(!c2.server.cert_paths_configured());
+        c2.server.public_key_path = "k.pem".into();
+        assert!(
+            !c2.server.cert_paths_configured(),
+            "one path alone is not enough"
+        );
+        c2.server.certificate_path = "c.jws".into();
+        assert!(c2.server.cert_paths_configured());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
