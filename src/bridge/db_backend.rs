@@ -129,7 +129,7 @@ fn strip_verbatim(p: &Path) -> PathBuf {
 /// 经 Any 驱动内部 Url 解析会把盘符吞成 host（`sqlite://C/...`），sqlite 随之
 /// 按相对路径开库失败（SQLITE_CANTOPEN，code 14）；单冒号形式下 Url 不解析
 /// authority，盘符与路径原样保留。
-/// （自 oj/src/server_cmd.rs 的 resolve_dsn 提炼，语义逐行对齐。）
+/// （全仓唯一 sqlite DSN 归一入口：dev/release 均经 DbBackendRegistry::connect 走这里。）
 pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String> {
     let rest = dsn
         .strip_prefix("sqlite://")

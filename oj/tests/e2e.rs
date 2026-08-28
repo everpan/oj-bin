@@ -47,10 +47,12 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     cfg.auth = None;
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = server::test_support::now_secs();
-    let (cert, key) =
-        server::test_support::write_cert(&tmp, n.saturating_sub(3600), n + 365 * 86_400);
-    cfg.server.certificate_path = cert.display().to_string();
-    cfg.server.public_key_path = key.display().to_string();
+    server::test_support::write_cert_into(
+        &mut cfg.server,
+        &tmp,
+        n.saturating_sub(3600),
+        n + 365 * 86_400,
+    );
     let dir = if dev {
         root.join("src")
     } else {
@@ -234,10 +236,12 @@ async fn uc14_transpile_cache_and_hot_reload() {
     cfg.server.port = 0;
     // 证书必配（无逃生口）：生成真实签名证书并配好两路径。
     let n = server::test_support::now_secs();
-    let (cert, key) =
-        server::test_support::write_cert(&t, n.saturating_sub(3600), n + 365 * 86_400);
-    cfg.server.certificate_path = cert.display().to_string();
-    cfg.server.public_key_path = key.display().to_string();
+    server::test_support::write_cert_into(
+        &mut cfg.server,
+        &t,
+        n.saturating_sub(3600),
+        n + 365 * 86_400,
+    );
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     std::fs::write(t.join("seed.sql"), "").unwrap();
     let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
@@ -287,10 +291,12 @@ fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
     let n = server::test_support::now_secs();
-    let (cert, key) =
-        server::test_support::write_cert(dir, n.saturating_sub(3600), n + 365 * 86_400);
-    cfg.server.certificate_path = cert.display().to_string();
-    cfg.server.public_key_path = key.display().to_string();
+    server::test_support::write_cert_into(
+        &mut cfg.server,
+        dir,
+        n.saturating_sub(3600),
+        n + 365 * 86_400,
+    );
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     cfg
 }

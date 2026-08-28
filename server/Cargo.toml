@@ -19,7 +19,6 @@ futures-util = "0.3.34"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 chrono = "0.4"
 jsonwebtoken = "9"
 bcrypt = "0.15"
@@ -29,6 +28,10 @@ multer = "3"
 ring = "0.17"
 base64 = "0.21"
 notify = "8"
+
+# 终端镜像落盘（logging）：pipe/dup2 重定向 stdout/stderr。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = "1"

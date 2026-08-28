@@ -1,8 +1,9 @@
 //! 测试支撑：证书必配（无逃生口）后，测试需自带真实签名的 JWS 证书。
 //!
-//! 用固定测试密钥对（`tests/cert_fixture.rs` 同源）对 `{nbf,exp}` 生成 RS256 JWS
-//! 并落盘，返回临时文件句柄（保持存活）与路径。供 `oj`（server_cmd/app/e2e）与
-//! `server` 自身测试装配证书使用。生成路径与 `server/src/certificate.rs` 契约一致。
+//! 用固定测试密钥对对 `{nbf,exp}` 生成 RS256 JWS 并落盘。本模块是全仓唯一
+//! 测试证书夹具（key 常量 + 签名 + 装配），供 `oj`（server_cmd/e2e）与
+//! 根 crate（certificate_load / start_cert_expired，经 dev-dep 的
+//! `features = ["test-support"]`）复用。生成路径与 `server/src/certificate.rs` 契约一致。
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,7 +13,7 @@ use serde_json::json;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 测试私钥（PKCS#8 DER，base64）——与根 crate `tests/cert_fixture.rs` 同源。
+/// 测试私钥（PKCS#8 DER，base64）——全仓唯一定义（勿在他处复制）。
 pub const TEST_RSA_PKCS8_B64: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDT8ZDGpkXI6dx55tXPtlfTOqKHCu2w3vs9j6XvhGIKacp+qX0uQp1FqBgU8OqRXmYJTKAE7weRykCZToBoJhlO5Dlang1/JtGc7pAu/xQHfNpb+U16hbIbu1JUkC6J9b3jSb/gVS1DNjviPQXkiVGR1sUunBgMTRva/7h2RC8fZ01YzcEukE70flv+7tFzaSY1zwH6zynOdzoRrJDbQItqqbyw9tDxcjIE2lZUjJi9haFNEL+rAqBqomdlWajpZ8kWudhuHoWFA0S0aq2MdgYa30uZsqzUE9yWdGTBzlD0XLlBBJ4u+Dxm9d5v2VexhRpWsst1sCZ6zKrNix3uwb6DAgMBAAECggEAVtxatD8yvHuzwzXqjL0zUztlnqjI70MDfqBfpkEAGTpwJeb6ibn9UK3qaLKvv7ILaWZA8qSv2n0kanA0yfpLRvzb0JqT93eGUqWm68vYfpUZvLX4ne0rKJhlzohkul+/WeZAwATIjxIsCrVts9LfXkDCAS8x3+C+OMuy4q1hDqH9r/q5Yaqjd9xV/BGIkdz4GNNXt3qeOwufXb64ukdbsCdt7f11wTMim9rvQqsz1IbPHhDx6Jy+o/FKr//z3JvQswH2Xv/WsntvIGKRoo0yx4brkL6dku2lx+37wCK8iYal1qQe4WEhvrCN7qbFmeG5tNz6neIE/t0wBVIKumCsYQKBgQDp+r3gwDftIjiXKSDblyBrYzplNAerwJnwiYhiVkujSifMqU8rr2NaH88nQPlnX3Ari4UhmfI6bhLbgyZ6OyQDGeKZa4aEQiM8dtSPui05GsTlW9poPmHdBNZNUkkI2wW3qaaw8gmHU9YDKHUSyP89vJdLXrg7ICQkhBc/ltLsEQKBgQDn4+pA3VO15E660GBV2JJBF2HpFd3OzmDLqwZfez5V+rcLg5h5ZgBbjz9nj/3XxEp56bDAX7WyUNsVzE9givutEKtGW+2giPUK9W2bxCuQtVLhdwCD7w7paaVM23A67w61SnM27c3JAZpnTPODEw7KqwdFPEvaTceiu54Nq/TlUwKBgQCZABy/5hHsH8+PkRZqYYWSk11xJjfJ6PUA5H5ph3KIgYpK+3/I2jSGj3xfd85e+XqZDu/sjAVojegI4Nb9YMTovjl+B2D8BV+TP0U6Aw1lZQrRzGGifwBxjaMxBpi5kLdJZUeaN3thocG1aPQ9Z2/4h+ULJRIln5viwPmO3GpqcQKBgDEBb44JuBkmiKTeSJ2byTzMTjrODjQYVUh1ekFPcFsHQwvB4cU2EzlGSqX+Pi0NJJgjFOFy2Jk4kTRIGzZR6OIoNaoG328fwnlwaJuUl4hbaYqQdaFsMgCN/QsDDPLHdppFg5fGJckm95SBJK08p9GY106AcZ9O9LOlZr+I6ZZVAoGAGFdJ6JvCaJU6bL+moTaksuC5Fsxxt8brMK7mMQM5eUFVJUgDJJ2ETd+cUBj3e4u4e65pDwuqtjoBfWweCjWkdtn3gSzbLcYHbTRWyYUwfNTMzKDMtf9QpfaDSQxHJyS2Kx2wFgVjyMdcgM6xq9rQNOKHfy7Lj/inrwqAoVABBjs=";
 
 /// 上述私钥对应的 SPKI PEM 公钥（loader 验签用）。
@@ -49,4 +50,12 @@ pub fn write_cert(dir: &Path, nbf: u64, exp: u64) -> (std::path::PathBuf, std::p
     std::fs::write(&cert, jws).expect("write cert.jws");
     std::fs::write(&key, TEST_RSA_PUBLIC_PEM).expect("write public.pem");
     (cert, key)
+}
+
+/// 一步装配：在 `dir` 生成 `[nbf, exp)` 的真实签名证书，并把两个路径写入 `cfg`。
+/// 证书必配门禁后所有启动测试的公共前置（server_cmd tests / e2e 复用，勿再各写一份）。
+pub fn write_cert_into(cfg: &mut only_js::config::ServerCfg, dir: &Path, nbf: u64, exp: u64) {
+    let (cert, key) = write_cert(dir, nbf, exp);
+    cfg.certificate_path = cert.display().to_string();
+    cfg.public_key_path = key.display().to_string();
 }

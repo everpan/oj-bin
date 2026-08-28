@@ -30,8 +30,13 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         cfg.server.public_key_path = p;
     }
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
+    // 大小滚动参数 server.logs_max_bytes / logs_keep_files。
     let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
-    server::logging::init(&logs_dir);
+    server::logging::init(
+        &logs_dir,
+        cfg.server.logs_max_m,
+        cfg.server.logs_keep_files as usize,
+    );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts).await?;
     let (bound, h) = app.serve(addr).await?;
@@ -345,21 +350,21 @@ mod tests {
     fn cert_cfg(dir: &Path) -> Config {
         let mut cfg = Config::default();
         let n = server::test_support::now_secs();
-        let (cert, key) =
-            server::test_support::write_cert(dir, n.saturating_sub(3600), n + 365 * 86_400);
-        cfg.server.certificate_path = cert.display().to_string();
-        cfg.server.public_key_path = key.display().to_string();
+        server::test_support::write_cert_into(
+            &mut cfg.server,
+            dir,
+            n.saturating_sub(3600),
+            n + 365 * 86_400,
+        );
         cfg
     }
 
     /// 同 `cert_cfg`，但证书已过期（宽限期 0）→ 启动应被证书门禁拒绝。
     fn expired_cert_cfg(dir: &Path) -> Config {
-        let mut cfg = cert_cfg(dir);
+        let mut cfg = Config::default();
         cfg.server.grace_days = Some(0);
         let n = server::test_support::now_secs();
-        let (cert, key) = server::test_support::write_cert(dir, n - 2000, n - 1000);
-        cfg.server.certificate_path = cert.display().to_string();
-        cfg.server.public_key_path = key.display().to_string();
+        server::test_support::write_cert_into(&mut cfg.server, dir, n - 2000, n - 1000);
         cfg
     }
     impl Drop for Tmp {

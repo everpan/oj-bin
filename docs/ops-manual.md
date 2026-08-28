@@ -152,7 +152,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 启动报 `invalid public key` / `signature verification failed` | 公钥 PEM 非法，或 JWS 签名与公钥不匹配 | 核对密钥对一致、签名算法为 RS256；用同一私钥重签 JWS |
 | 启动报 `invalid JWS format` | `certificate.jws` 不是三段 `Base64URL(Header).Payload.Signature` | 按 `Header.Payload.Signature` 重新生成 JWS |
 | 启动报 `certificate is mandatory but not configured` | 证书必配（无逃生口）但 `public_key_path`/`certificate_path` 缺任一 | 两个路径都配齐；**没有任何开关可跳过证书校验**——若实例连不上证书，需生成并挂载（见 §3 证书校验） |
-| 启动报 `certificate not configured` | 仅配了 `public_key_path` 或 `certificate_path` 之一 | 两个路径都配齐才通过必配门禁 |
+| 启动报 `certificate is mandatory … public_key_path is required` / `… certificate_path is required` | 仅配了 `public_key_path` 或 `certificate_path` 之一（缺任一门禁即拒绝，无部分配置状态） | 两个路径都配齐 |
 
 ## 8. 回滚与恢复
 

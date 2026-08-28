@@ -663,13 +663,20 @@ mod tests {
         // 服务端发 Close 帧（0x88）后关连接：读到 Close、EOF 均算干净终止，不 panic。
         // Windows 上，缺失 handler 时服务端丢弃连接且入站 "any" 仍留在接收缓冲区，
         // 关闭会触发 TCP RST（而非 FIN），read 返回 Err(ConnectionReset) 而非 Ok(0)，
-        // 同样表示连接已被对端干净终止（非服务端 panic），故一并视为通过。
+        // 同样表示连接已被对端干净终止。只接受传输层终止类错误——其他错误（如
+        // 服务端 panic 之外的意外 IO 失败）仍应让测试失败，保住本用例的回归护栏。
         let mut buf = [0u8; 64];
         let res = c.0.read(&mut buf).await;
-        let clean = match res {
+        let clean = match &res {
             Ok(0) => true,            // 对端优雅关闭（EOF / FIN）
             Ok(_n) => buf[0] == 0x88, // 收到 WebSocket Close 帧
-            Err(_) => true,           // 对端重置（ConnectionReset 等）→ 连接已终止
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
         };
         assert!(clean, "expected close or reset, got {res:?}");
     }

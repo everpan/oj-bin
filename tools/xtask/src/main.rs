@@ -101,7 +101,17 @@ fn plugin_file_name(name: &str) -> String {
 /// 依赖启用额外 feature）。
 fn build_workspace_release() -> Result<(), String> {
     let status = Command::new("cargo")
-        .args(["build", "--workspace", "--exclude", "xtask", "--release"])
+        // --exclude oj-cert：独立签名工具（tools/，不随发行包、不进 bin/），无需随
+        // 每次 xtask 构建连带编译 rsa/clap 依赖树。
+        .args([
+            "build",
+            "--workspace",
+            "--exclude",
+            "xtask",
+            "--exclude",
+            "oj-cert",
+            "--release",
+        ])
         .status()
         .map_err(|e| format!("spawn cargo build --workspace --release: {e}"))?;
     if !status.success() {

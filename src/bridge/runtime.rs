@@ -184,12 +184,17 @@ mod tests {
     fn drop_while_watchdog_holds_last_ref_does_not_self_join() {
         use std::sync::atomic::Ordering as AtomicOrdering;
         let caught = Arc::new(AtomicBool::new(false));
-        let prev = std::panic::take_hook();
+        // prev 挂 Arc：hook 内转发原 hook（不吞并行测试的 panic 诊断），结束后再装回。
+        let prev: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+            std::sync::Arc::from(std::panic::take_hook());
         {
             let caught = caught.clone();
+            let prev = prev.clone();
             std::panic::set_hook(Box::new(move |info| {
                 if info.to_string().contains("failed to join thread") {
                     caught.store(true, AtomicOrdering::Relaxed);
+                } else {
+                    prev(info);
                 }
             }));
         }
@@ -200,7 +205,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         std::thread::sleep(Duration::from_millis(100));
-        std::panic::set_hook(prev);
+        let prev_restore = prev.clone();
+        std::panic::set_hook(Box::new(move |info| prev_restore(info)));
         assert!(
             !caught.load(AtomicOrdering::Relaxed),
             "js-watchdog self-join panic (EDEADLK) is back"

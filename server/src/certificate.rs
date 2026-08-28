@@ -5,7 +5,7 @@
 //! - Payload：至少含 `nbf`（生效）与 `exp`（过期）Unix 秒
 //! - Signature：私钥对 `Header.Payload` 的 RS256 签名
 //!
-//! 未配置证书路径（两者皆空）→ 视为未启用，返回 `Valid`，不做任何限制。
+//! 证书必配（无逃生口）：两路径缺任一即加载报错，绝不回退为「未启用 = Valid」。
 
 pub use crate::CertificateStatus;
 use base64::{Engine, engine::general_purpose};
@@ -17,11 +17,6 @@ use std::{
     fs,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-/// 证书功能是否启用：公钥与证书路径任一非空即启用（缺另一半 → 加载时报错，fail fast）。
-pub fn is_enabled(cfg: &ServerCfg) -> bool {
-    !cfg.public_key_path.trim().is_empty() || !cfg.certificate_path.trim().is_empty()
-}
 
 /// 相对路径按 `config_dir` 绝对化（容器/K8s ConfigMap 挂载友好）。
 pub fn resolve_path(raw: &str, config_dir: &Path) -> PathBuf {
@@ -35,7 +30,7 @@ pub fn resolve_path(raw: &str, config_dir: &Path) -> PathBuf {
 
 /// 加载并验证证书。
 ///
-/// 返回 `(状态, 证书 exp 时刻)`；未启用证书时返回 `(Valid, None)`。
+/// 返回 `(状态, 证书 exp 时刻)`；两路径缺任一即报错（证书必配，无 fail-open）。
 pub async fn load_certificate(
     cfg: &ServerCfg,
 ) -> Result<(CertificateStatus, Option<SystemTime>), String> {
@@ -47,14 +42,11 @@ pub fn load_certificate_at(
     cfg: &ServerCfg,
     config_dir: &Path,
 ) -> Result<(CertificateStatus, Option<SystemTime>), String> {
-    if !is_enabled(cfg) {
-        return Ok((CertificateStatus::Valid, None));
-    }
     if cfg.public_key_path.trim().is_empty() {
-        return Err("server.public_key_path is required when certificate_path is set".into());
+        return Err("server.public_key_path is required (certificate is mandatory)".into());
     }
     if cfg.certificate_path.trim().is_empty() {
-        return Err("server.certificate_path is required when public_key_path is set".into());
+        return Err("server.certificate_path is required (certificate is mandatory)".into());
     }
     let key_path = resolve_path(&cfg.public_key_path, config_dir);
     let cert_path = resolve_path(&cfg.certificate_path, config_dir);

@@ -42,9 +42,9 @@ object_store = { version = "0.14.1", features = ["aws"] }
 [dev-dependencies]
 criterion = "0.8.2"
 rand = "0.10.2"
-ring = "0.17"
 oj = { path = "oj" }
-server = { path = "server" }
+# test-support：复用 server::test_support 的测试证书夹具（全仓唯一定义，勿再拷贝密钥对）。
+server = { path = "server", features = ["test-support"] }
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "test-util"] }
 httptest = "0.16"
 tempfile = "3"

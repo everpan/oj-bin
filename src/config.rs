@@ -21,9 +21,14 @@ pub struct ServerCfg {
     /// 上传体积上限（字节；超出 413）。axum 层再乘 2 做硬顶。
     pub max_upload_bytes: u64,
     /// 日志目录：绝对路径原样；相对 → 相对 config 目录；未配置 → config 目录下的 ./logs。
-    /// 不存在则自动创建。每日滚动 + 每次启动一个新文件（文件名带启动时间到秒）。
+    /// 不存在则自动创建。每次启动一个新文件 `server-<启动秒>_<pid>.log`，终端输出完整镜像落盘。
     #[serde(default)]
     pub logs_dir: Option<String>,
+    /// 单个日志文件大小上限（单位 M；超过滚动为 `base.1.log` 依次后移）。
+    /// 小于 100 时按 100 生效（下限钳制在应用侧 logging::init）。
+    pub logs_max_m: u64,
+    /// 日志文件保留个数（含活动文件，超出删除；最小生效值 2）。
+    pub logs_keep_files: u32,
     /// 公钥路径（PEM 格式，用于验证证书签名）
     pub public_key_path: String,
     /// 证书路径（JWS 格式，包含荷载）
@@ -43,6 +48,8 @@ impl Default for ServerCfg {
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
             logs_dir: None,
+            logs_max_m: 100,
+            logs_keep_files: 10,
             public_key_path: "".into(),
             certificate_path: "".into(),
             grace_days: Some(30),
@@ -446,6 +453,8 @@ mod tests {
         let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
         assert!(c.blob.is_none());
         assert_eq!(ServerCfg::default().max_upload_bytes, 10 * 1024 * 1024);
+        assert_eq!(ServerCfg::default().logs_max_m, 100);
+        assert_eq!(ServerCfg::default().logs_keep_files, 10);
         let dir = std::env::temp_dir().join(format!("ojcfgbl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

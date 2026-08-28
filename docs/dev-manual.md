@@ -227,7 +227,7 @@ RBAC 等真需求出现再议（YAGNI）。
 
 - **有效期内**：正常服务（`certificate_status = valid`）。
 - **宽限期内（默认 30 天，可配 `grace_days`）**：所有 **GET** 请求返回 `403`，
-  JSON 体 `{"error":"certificate expired","detail":"grace period: N days remaining"}`；其余方法正常。
+  标准信封 `{"code":403,"msg":"certificate expired: service available in grace period, but GET requests are restricted","data":null}`；其余方法正常。
 - **宽限期结束后**：启动期 `from_config` 检测即 `ERROR` 并中止进程（`process::exit`）；
   运行中（热替换成过期证书）则 GET 持续 `403`（服务不中断，运维可替换证书恢复）。
 - **热加载**：`notify` 监听公钥/证书文件变更（事件驱动，不轮询 mtime），原子更新
