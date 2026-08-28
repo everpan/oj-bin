@@ -10,3 +10,21 @@ INSERT OR IGNORE INTO tenant (id, guid, en_name, cn_name, dsn_key) VALUES (2, "A
 
 CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, roles TEXT NOT NULL DEFAULT '[]');
 INSERT OR IGNORE INTO users (id, username, password_hash, roles) VALUES (1, 'demo', '$2b$10$aKN7gpFP.dhK7Il8sc19neUPaziSONYdsfks1xm0H2COzkp2vlqV2', '["admin"]');
+
+CREATE TABLE IF NOT EXISTS certs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  public_pem TEXT NOT NULL,
+  private_pem TEXT NOT NULL,
+  cert_jws TEXT NOT NULL,
+  nbf INTEGER NOT NULL,
+  exp INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+-- trinity：user 角色测试账号（password_hash 与 demo 行相同，即密码 demo1234；
+-- 仅供 403 用例，样例数据勿用于生产）。
+INSERT OR IGNORE INTO users (id, username, password_hash, roles)
+  VALUES (2, 'trinity',
+    '$2b$10$aKN7gpFP.dhK7Il8sc19neUPaziSONYdsfks1xm0H2COzkp2vlqV2', '["user"]');
