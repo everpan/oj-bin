@@ -15,6 +15,8 @@ import {
   op_bus_publish,
   op_bus_subscribe,
   op_bus_kind,
+  op_cert_gen,
+  op_cert_renew,
   op_db_exec,
   op_db_has,
   op_db_query,
@@ -245,4 +247,11 @@ globalThis.__ojRequire = (name, referrerPath) => {
     __ojReqCache.set(key, m.exports);
   }
   return __ojReqCache.get(key);
+};
+
+// ----- cert: JWS certificate issue/renew (RSA keygen + RS256 signing live in Rust) -----
+// generate -> {private_pem, public_pem, cert_jws}; renew -> new cert_jws (same public key).
+globalThis.cert = {
+  generate: (bits, nbf, exp) => op_cert_gen(bits | 0, nbf, exp),
+  renew: (privatePem, nbf, exp) => op_cert_renew(String(privatePem), nbf, exp),
 };

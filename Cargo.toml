@@ -16,8 +16,12 @@ base64 = "0.23.1"
 deno_core = "0.410"
 deno_error = "0.7"
 libloading = "0.9.0"
+oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
+# cert.renew 在本 crate 内解析 PKCS#8 PEM（from_pkcs8_pem 需 pem feature）；
+# 版本/feature 与 tools/oj-cert 对齐（workspace 统一解析为同一份 rsa）。
+rsa = { version = "0.9", features = ["pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml 0.9 已 deprecated 但功能完备；

@@ -26,6 +26,7 @@ pub mod blob;
 pub mod broker;
 mod bus;
 pub mod bus_backend;
+pub mod cert;
 mod db;
 pub mod db_backend;
 mod envelope;
@@ -179,6 +180,8 @@ deno_core::extension!(
         log::op_log,
         module_loader::op_resolve_cjs,
         ws::op_ws_send,
+        cert::op_cert_gen,
+        cert::op_cert_renew,
         ws::op_ws_close,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",

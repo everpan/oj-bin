@@ -134,6 +134,18 @@ interface BusApi {
   kind(): Promise<string>;
 }
 
+// cert.* ：JWS 证书生成/重签（RSA + RS256 在 Rust 侧；纯内存，不落盘）。
+interface CertApi {
+  // 生成密钥对并签发 JWS。bits >= 2048；nbf/exp 为 Unix 秒，exp 必须 > nbf。
+  generate(
+    bits: number,
+    nbf: number,
+    exp: number,
+  ): Promise<{ private_pem: string; public_pem: string; cert_jws: string }>;
+  // 用现有 PKCS#8 私钥重签续期（公钥不变），返回新 cert.jws 串。
+  renew(privatePem: string, nbf: number, exp: number): Promise<string>;
+}
+
 // es.* ：Elasticsearch 薄客户端（直通 ES 响应体；未配置调用报 es not configured）。
 interface EsApi {
   search(index: string, dsl?: unknown): Promise<Json>;
@@ -160,6 +172,7 @@ declare global {
   function DB(name: string): DBInstance | undefined;
   // 默认（"default"）数据库实例。
   const db: DBInstance;
+  const cert: CertApi;
 
   // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----
   // 进程内 HTTP 派发助手，对标 Go Fiber app.Test：client.get/post/... 触发真实
