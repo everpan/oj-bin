@@ -160,10 +160,50 @@ impl Drop for KillSwitch {
         self.stop.store(true, Ordering::Relaxed);
         // Take the thread handle out of the mutex, releasing the lock on the mutex.
         let thread_handle = self.thread.lock().unwrap().take();
-        if let Some(handle) = thread_handle {
+        // Drop 可能由看门狗线程自身触发：循环体持有的 upgrade() 强引用可能是最后一份
+        // （Bridge 已先析构），此时 join 自己会 EDEADLK panic。线程随即因
+        // weak.upgrade() == None 退出，跳过 join 即可。
+        if let Some(handle) = thread_handle
+            && handle.thread().id() != std::thread::current().id()
+        {
             let _ = handle.join();
         }
         // Now that the thread has joined, we can safely set the slot to None.
         *self.slot.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：Bridge 析构后，看门狗循环体持有的 upgrade() 强引用成为最后一份时，
+    /// KillSwitch::drop 在看门狗线程上执行并 join 自己 → EDEADLK panic。
+    /// 通过全局 panic hook 捕获该 panic；修复后不应触发。
+    #[test]
+    fn drop_while_watchdog_holds_last_ref_does_not_self_join() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        let caught = Arc::new(AtomicBool::new(false));
+        let prev = std::panic::take_hook();
+        {
+            let caught = caught.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                if info.to_string().contains("failed to join thread") {
+                    caught.store(true, AtomicOrdering::Relaxed);
+                }
+            }));
+        }
+        {
+            let _sw = KillSwitch::spawn();
+            // 等 50ms：看门狗 25ms 轮询，此刻几乎必然处于循环体中持有强引用；
+            // 主线程随后 drop 自己的 Arc，让最后一份引用落在看门狗线程上。
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        std::panic::set_hook(prev);
+        assert!(
+            !caught.load(AtomicOrdering::Relaxed),
+            "js-watchdog self-join panic (EDEADLK) is back"
+        );
     }
 }
