@@ -594,7 +594,8 @@ json.ok(plugins());
 | handler 死循环 / 超时 | 408 | `{"code":408,"msg":"handler execution timed out","data":null}` |
 | 上传超 `max_upload_bytes` | 413 | `{"code":413,"msg":"upload too large","data":null}` |
 | blob 不存在 | 404 | `{"code":404,"msg":"blob not found","data":null}` |
-| 证书过期进宽限期（仅 GET） | 403 | `{"error":"certificate expired","detail":"grace period: N days remaining"}` |
+| 证书过期进宽限期（仅 GET） | 403 | `{"code":403,"msg":"certificate expired: service available in grace period, but GET requests are restricted","data":null}` |
+| 证书已过期（Expired，仅 GET，运行中热替换所致） | 403 | `{"code":403,"msg":"certificate expired: service unavailable","data":null}` |
 | 租户头缺失/为空（`tenant.enable`） | 400 | `missing tenant header: X-TENANT-ID` |
 | Bearer 缺失/无效/过期（`auth:` 启用） | 401 | `missing or invalid bearer token` |
 
