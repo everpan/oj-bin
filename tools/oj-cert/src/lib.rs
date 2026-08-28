@@ -47,6 +47,12 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// `--days`（有效天数）→ `exp` 的 Unix 秒偏移：`days * 86400`。
+/// CLI 层（main.rs）据此把「N 天」翻译成过期时间戳，避免把天数误当秒数。
+pub fn days_to_expiry(now: u64, days: u64) -> u64 {
+    now + days * 86_400
+}
+
 /// JWS 三段拼接（b64url no-pad，与 server 加载端 split('.') 对齐）。
 fn jws(signing_key: &SigningKey<Sha256>, nbf: u64, exp: u64) -> String {
     use base64::Engine;
@@ -135,4 +141,18 @@ pub fn renew(opts: &RenewOpts) -> Result<PathBuf, String> {
     )
     .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::days_to_expiry;
+
+    /// `--days` 是有效天数（×86400），不是秒——回归护栏：曾把天数当秒导致
+    /// `--days 365` 只签 6 分钟的证书。
+    #[test]
+    fn days_are_days_not_seconds() {
+        assert_eq!(days_to_expiry(1_000_000, 1), 1_000_000 + 86_400);
+        assert_eq!(days_to_expiry(1_000_000, 365), 1_000_000 + 365 * 86_400);
+        assert_eq!(days_to_expiry(0, 0), 0);
+    }
 }

@@ -2,6 +2,8 @@
 //!
 //!   oj-cert gen   -o <dir> [--days 365] [--bits 2048] [--nbf <unix>] [--exp <unix>]
 //!   oj-cert renew -k <private.pem> [-o <dir>] [--days 365] [--exp <unix>]
+//!
+//! `--days` 为**有效天数**（exp = now + days*86400），缺省 365 天。
 
 use clap::{Parser, Subcommand};
 use oj_cert::{GenOpts, RenewOpts};
@@ -21,7 +23,7 @@ enum Cmd {
         /// 输出目录
         #[arg(short, long)]
         out: PathBuf,
-        /// 有效天数（exp = now + days；--nbf/--exp 显式值优先）
+        /// 有效天数（exp = now + days*86400；--nbf/--exp 显式值优先）
         #[arg(long, default_value_t = 365)]
         days: u64,
         /// RSA 位数（下限 2048）
@@ -30,7 +32,7 @@ enum Cmd {
         /// 生效时间（Unix 秒；缺省 now）
         #[arg(long)]
         nbf: Option<u64>,
-        /// 过期时间（Unix 秒；缺省 now + days）
+        /// 过期时间（Unix 秒；缺省 now + days 天）
         #[arg(long)]
         exp: Option<u64>,
     },
@@ -42,10 +44,10 @@ enum Cmd {
         /// cert.jws 输出目录（缺省 = 私钥所在目录）
         #[arg(short, long)]
         out: Option<PathBuf>,
-        /// 有效天数（exp = now + days；--exp 显式值优先）
+        /// 有效天数（exp = now + days*86400；--exp 显式值优先）
         #[arg(long, default_value_t = 365)]
         days: u64,
-        /// 过期时间（Unix 秒；缺省 now + days）
+        /// 过期时间（Unix 秒；缺省 now + days 天）
         #[arg(long)]
         exp: Option<u64>,
     },
@@ -65,7 +67,7 @@ fn main() {
             out_dir: out,
             bits,
             nbf: nbf.unwrap_or(now),
-            exp: exp.unwrap_or(now + days),
+            exp: exp.unwrap_or(oj_cert::days_to_expiry(now, days)),
         }),
         Cmd::Renew {
             key,
@@ -77,7 +79,7 @@ fn main() {
             out_dir: out,
             // renew 无 --nbf：避免误缩已生效窗口（spec 决策）。
             nbf: now,
-            exp: exp.unwrap_or(now + days),
+            exp: exp.unwrap_or(oj_cert::days_to_expiry(now, days)),
         }),
     };
     match result {
