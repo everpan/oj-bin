@@ -122,8 +122,8 @@ interface BlobApi {
   del(key: string): Promise<boolean>;
   // local = {base}/blob/{key}；s3 = presigned URL（15min）。
   url(key: string): Promise<string>;
-  // 缺失 sidecar 且无法按扩展名推断时返回空串。
-  contentType(key: string): Promise<string>;
+  // local 缺失 sidecar 且无法按扩展名推断时返回空串；s3 无 Content-Type 时返回 null。
+  contentType(key: string): Promise<string | null>;
 }
 
 // bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；
@@ -131,7 +131,7 @@ interface BlobApi {
 interface BusApi {
   publish(topic: string, data?: unknown): Promise<number>;
   subscribe(topic: string): Promise<void>;
-  kind(): string;
+  kind(): Promise<string>;
 }
 
 // es.* ：Elasticsearch 薄客户端（直通 ES 响应体；未配置调用报 es not configured）。
@@ -207,9 +207,9 @@ declare global {
   function fetch(url: string, options?: {
     method?: string;
     headers?: Record<string, string>;
-    body?: string | Uint8Array | null;
+    body?: string | null;
   }): Promise<OjFetchResponse>;
-  // 已加载插件自省：[{name, semver, abi, fingerprint, ...}] + 宿主 ABI。
+  // 已加载插件自省：[{name, semver, abi_version, fingerprint, host_abi_version}]。
   function plugins(): any[];
 }
 
@@ -221,7 +221,7 @@ interface OjFetchResponse {
   headers: Record<string, string>;
   json(): Promise<Json | null>;
   text(): Promise<string>;
-  arrayBuffer(): Promise<ArrayBuffer>;
+  arrayBuffer(): Promise<Uint8Array>;
   clone(): OjFetchResponse;
 }
 

@@ -1,6 +1,6 @@
 # oj TS API 开发手册
 
-适用版本：v0.2（与仓库 oj/Cargo.toml 同步）
+适用版本：API 面 v0.2（二进制版本号见 `oj/Cargo.toml`）
 
 本手册面向**用 oj 框架开发业务项目**的开发者与 AI agent：如何组织模块、编写
 `api.ts` / `WS.ts` handler、使用注入的全局对象、写测试、配服务、构建发布与日常运维。
@@ -157,7 +157,7 @@ version: "0.1.0"
 # config: {}        # 可选，本模块的其他设置
 ```
 
-`name` ≠ 目录名 → 启动报 `manifest name mismatch` 退出（防止模块名与路由脱节）。
+`name` ≠ 目录名 → 启动报 `manifest name "x" != directory name "y"` 退出（防止模块名与路由脱节）。
 
 ### seed.sql（可选）
 
@@ -471,7 +471,7 @@ auth 会话也在同一 Redis（多实例共享的前提）；未配置时均为
 | `blob.get` | `get(key: string): Promise<Uint8Array>` | 读对象（不存在报错） |
 | `blob.del` | `del(key: string): Promise<boolean>` | 删对象（幂等：不存在视为成功） |
 | `blob.url` | `url(key: string): Promise<string>` | 下载地址：local = `{base}/blob/{key}`；s3 = presigned URL（15min） |
-| `blob.contentType` | `contentType(key: string): Promise<string>` | Content-Type（local 读 sidecar / 按扩展名推断；缺失且无法推断返回空串） |
+| `blob.contentType` | `contentType(key: string): Promise<string \| null>` | Content-Type（local 读 sidecar / 按扩展名推断；缺失且无法推断返回空串；s3 无 Content-Type 返回 `null`） |
 
 **上传四件套完整例子**（摘自 `sample/src/upload/api.ts`）：
 
@@ -501,10 +501,10 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 |---|---|---|
 | `bus.publish` | `publish(topic: string, data?: unknown): Promise<number>` | 广播 JSON 帧 `{"topic":…,"data":…}` 给订阅该 topic 的**全部 WS 会话**，返回接收方数（无订阅返回 0） |
 | `bus.subscribe` | `subscribe(topic: string): Promise<void>` | 当前 WS 会话订阅 topic（**HTTP 路径调用报错**——订阅对象是连接本身） |
-| `bus.kind` | `kind(): string` | 活跃 broker 类型：`"local"` / `"kafka"` / `"rabbitmq"` |
+| `bus.kind` | `kind(): Promise<string>` | 活跃 broker 类型：`"local"` / `"kafka"` / `"rabbitmq"`（异步 op，判等须 `await`） |
 
 方向约定：**HTTP handler 发布，WS 会话订阅**。订阅在连接断开自动清除；同一会话重复订阅
-幂等去重。`bus.kind()` v0.2 经异步 op 实现，建议按 `await bus.kind()` 消费。
+幂等去重。`bus.kind()` 为异步，返回 `Promise<string>`，判等须 `await bus.kind()`。
 
 ```ts
 // HTTP 发布（任意 api.ts）
@@ -542,7 +542,7 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 ### fetch —— HTTP 客户端
 
 签名：`fetch(url: string, options?: { method?: string; headers?: Record<string, string>;
-body?: string | Uint8Array | null }): Promise<OjFetchResponse>`。
+body?: string | null }): Promise<OjFetchResponse>`。
 
 返回浏览器风格 Response 子集：`ok / status / statusText / headers / json() / text() /
 arrayBuffer() / clone()`。注意 v0.2 的 body 以字符串发送（非字符串值会被 `String()`
@@ -568,7 +568,7 @@ if (r.ok) {
 ### plugins —— 插件自省
 
 签名：`plugins(): any[]`。返回已加载插件清单
-`[{name, semver, abi, fingerprint, ...}]` + 宿主 ABI——用于升级核对窗口
+`[{name, semver, abi_version, fingerprint, host_abi_version}]`——用于升级核对窗口
 （第 11 章插件升级）。
 
 ```ts
@@ -932,7 +932,7 @@ broker:
 | config 声明 `es:` 但无 es 插件 | fail fast 退出 |
 | `-d` 目录不存在 | 启动即报错 |
 | 首层子目录缺 `manifest.yaml` | `missing manifest.yaml` 退出 |
-| `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name mismatch` 退出 |
+| `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出 |
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
 | `server.root` 目录不存在 | 启动报错退出 |
@@ -1052,7 +1052,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 症状 | 原因 | 处置 |
 |---|---|---|
 | 启动报 `missing manifest.yaml` | 首层子目录缺清单或残留空目录 | 补齐 / 删除空目录 |
-| 启动报 `manifest name mismatch` | `name` ≠ 目录名 | 对齐 |
+| 启动报 `manifest name "x" != directory name "y"` | `name` ≠ 目录名 | 对齐 |
 | 启动报 `manifests.yaml … run oj build first` | release 锁缺失/损坏/指向不存在版本 | 跑 `oj build <module>` |
 | 404 | 无对应 api 文件，或穿越/非法段 | 核对路径与 `-b` 前缀；release 确认模块在锁内 |
 | 405 `method 'del' not exported` | DELETE 请求但没导出 `del`（不是 `delete`） | 改导出名 |
