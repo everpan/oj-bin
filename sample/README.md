@@ -1,13 +1,13 @@
 # oj sample — user/order/file
 
-  cargo run -p oj -- server -c sample/config.yaml -d sample/src         # dev（TS，热重载；启动自动迁移）
+  cargo run -p oj -- server -c sample/config.yaml --api-path sample/src         # dev（TS，热重载；启动自动迁移）
   curl http://localhost:9778/v1/api/user/account/?id=1
 
   cargo run -p oj -- build -d sample/src -o sample/dist            # 构建（版本目录+migrations+锁+tgz）
   cargo run -p oj -- build --check -d sample/src                   # 结构检查（S002–S006，CI 门禁，不落盘）
   cargo run -p oj -- migrate -c sample/config.yaml -d sample/dist  # release 部署先迁移（verify 门禁要求）
   cargo run -p oj -- schema diff -c sample/config.yaml             # 声明 vs 实库对账（漂移 exit 1）
-  cargo run -p oj -- server -c sample/config.yaml -d sample/dist   # release（按锁聚合；账本落后拒启）
+  cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist   # release（按锁聚合；账本落后拒启）
 
 - 路由 = 目录镜像：src/user/profile/detail/api.ts → /v1/api/user/profile/detail/
 - 声明式表结构：每模块 `schema.yaml`（§4.2）声明表/列/索引 → 归属图（表→模块单射，
@@ -23,7 +23,7 @@
   auto（dev 默认）| verify（release 默认，账本落后拒启）| off
 - WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/WS.ts 订阅 news），
   再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧
-- config.yaml `server.root: dist`：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
+- config.yaml `server.app_path: dist`（CLI `--app-path` 可覆盖）：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
   /user-0.1.0.tgz 可直接访问；dist 无 index.html 故 / 为 404）
 - 证书必配（不可绕过）：sample 自带自签示例证书 `config/{public.pem,cert.jws}`
   （私钥 `config/private.pem` 仅示例用，**严禁用于生产**；过期后用

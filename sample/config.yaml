@@ -9,7 +9,7 @@ server:
                      # sample 各模块 tables/deps 已声明齐（oj build --check 全绿），
                      # 演示取 deny：跨模块取数必须显式 deps（P3 评估结论）。
   ownership_guard: deny
-  root: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务）
+  app_path: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务；CLI --app-path 可覆盖）
   # logs_dir: "logs"   # 日志目录（终端输出镜像落盘；文件名 server-<启动秒>_<pid>.log）
   # logs_max_m: 100            # 单个日志文件大小上限（单位 M，<100 按 100 生效），超过滚动
   # logs_keep_files: 10        # 日志文件保留个数（含活动文件，超出删除）

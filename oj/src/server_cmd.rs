@@ -20,9 +20,12 @@ use crate::args::ServerArgs;
 
 pub async fn run(a: ServerArgs) -> Result<(), String> {
     let (mut cfg, config_dir, dir, ts, base) =
-        load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
-    // CLI 覆盖：证书路径（若有）。强制证书门禁在 App::from_config（统一装配点）判定，
-    // CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
+        load_app_config(&a.config, a.api_path.as_deref(), a.base.as_deref())?;
+    // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
+    // （统一装配点）判定，CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
+    if let Some(p) = a.app_path {
+        cfg.server.app_path = Some(p);
+    }
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
     }
@@ -888,12 +891,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_root_serves_static_relative_to_config_dir() {
+    async fn server_app_path_serves_static_relative_to_config_dir() {
         let t = tmpdir("sc-root");
         std::fs::write(t.0.join("index.html"), "<h1>site</h1>").unwrap();
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0; // 随机端口
-        cfg.server.root = Some(".".into()); // 相对 config_dir
+        cfg.server.app_path = Some(".".into()); // 相对 config_dir
         let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
             .await
             .unwrap();
@@ -903,18 +906,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_root_missing_dir_fails_fast() {
-        // dir 指向不存在的子目录（相对 tmpdir），使模块扫描为空、顺利走到 server.root
+    async fn server_app_path_missing_dir_fails_fast() {
+        // dir 指向不存在的子目录（相对 tmpdir），使模块扫描为空、顺利走到 server.app_path
         // 校验；此前用绝对 "src" 会 canonicalize 到 oj/src（含无 manifest 的 test_ext），
-        // 在抵达 server.root 检查前就于模块扫描阶段报错，掩盖了本测试真正要验证的逻辑。
+        // 在抵达 server.app_path 检查前就于模块扫描阶段报错，掩盖了本测试真正要验证的逻辑。
         let t = tmpdir("sc-root-missing");
         let mut cfg = cert_cfg(&t.0);
-        cfg.server.root = Some("no-such-dir".into());
+        cfg.server.app_path = Some("no-such-dir".into());
         let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
             .await
             .err()
             .unwrap_or_default();
-        assert!(e.contains("server.root"), "{e}");
+        assert!(e.contains("server.app_path"), "{e}");
     }
 
     #[tokio::test]
@@ -1075,11 +1078,12 @@ mod tests {
     }
 
     fn es_cfg(endpoint: &str) -> Config {
-        let mut cfg = Config::default();
-        cfg.es = Some(config::EsCfg {
-            endpoint: endpoint.to_string(),
-        });
-        cfg
+        Config {
+            es: Some(config::EsCfg {
+                endpoint: endpoint.to_string(),
+            }),
+            ..Default::default()
+        }
     }
 
     /// 清单显式给出但文件缺失 → fail fast。
@@ -1087,9 +1091,11 @@ mod tests {
     async fn manifest_missing_file_fails_fast() {
         let t = tmpdir("sc-man");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins = Some(vec!["ghost".into()]);
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins: Some(vec!["ghost".into()]),
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let e = assemble_plugins(&cfg, &t.0, &mut r)
             .await
@@ -1103,9 +1109,11 @@ mod tests {
     async fn manifest_duplicate_fails_fast() {
         let t = tmpdir("sc-dup");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins = Some(vec!["es".into(), "es".into()]);
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins: Some(vec!["es".into(), "es".into()]),
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let e = assemble_plugins(&cfg, &t.0, &mut r)
             .await
@@ -1119,8 +1127,10 @@ mod tests {
     async fn scan_empty_dir_yields_only_builtin() {
         let t = tmpdir("sc-empty");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert!(plugins.is_empty());
@@ -1134,8 +1144,10 @@ mod tests {
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::write(pdir.join(plugin_file("broken")), b"not a real dylib").unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let e = assemble_plugins(&cfg, &t.0, &mut r)
             .await
@@ -1207,16 +1219,18 @@ mod tests {
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::copy(db_plugin_artifact(), pdir.join(plugin_file("db-mysql"))).unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["db-mysql".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["db-mysql".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "db-mysql");
         let names = r.dbs.backend_names();
         assert!(
-            names.iter().any(|n| *n == "db-mysql"),
+            names.contains(&"db-mysql"),
             "factory not registered: {names:?}"
         );
         // 未认领 scheme 仍 unknown（插件没声明 oracle）→ 快速失败
@@ -1235,8 +1249,10 @@ mod tests {
     async fn db_declared_without_plugin_unknown_scheme() {
         let t = tmpdir("sc-dbplug-none");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         let mut m = std::collections::HashMap::new();
@@ -1284,9 +1300,11 @@ mod tests {
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::copy(blob_plugin_artifact(), pdir.join(plugin_file("blob-s3"))).unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["blob-s3".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["blob-s3".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
@@ -1361,9 +1379,11 @@ mod tests {
             pdir.join(plugin_file("bus-kafka")),
         )
         .unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["bus-kafka".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["bus-kafka".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
@@ -1382,8 +1402,10 @@ mod tests {
     async fn kafka_declared_without_plugin_unknown_kind() {
         let t = tmpdir("sc-busplug-none");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         let broker_cfg = only_js::config::BrokerCfg {
@@ -1436,9 +1458,11 @@ mod tests {
             pdir.join(plugin_file("kv-redis")),
         )
         .unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["kv-redis".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["kv-redis".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
@@ -1494,9 +1518,11 @@ mod tests {
             pdir.join(plugin_file("bus-kafka")),
         )
         .unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["bus-kafka".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["bus-kafka".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
@@ -1551,9 +1577,11 @@ mod tests {
             pdir.join(plugin_file("bus-rabbitmq")),
         )
         .unwrap();
-        let mut cfg = Config::default();
-        cfg.plugins_dir = Some(t.0.clone());
-        cfg.plugins = Some(vec!["bus-rabbitmq".into()]);
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            plugins: Some(vec!["bus-rabbitmq".into()]),
+            ..Default::default()
+        };
         let mut r = Registries::default();
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);

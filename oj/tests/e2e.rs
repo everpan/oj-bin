@@ -3,6 +3,9 @@
 //! transpile_hits 是进程级计数，sibling 测试并发转译会污染 uc14 的
 //! delta==1 断言（T9 教训），故全体用例串行：E2E_LOCK 全程持有。
 
+// lock() 的 std MutexGuard 有意全程持有（见下：E2E 全用例串行），横跨 await 是设计而非疏漏。
+#![allow(clippy::await_holding_lock)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 

@@ -331,8 +331,8 @@ impl App {
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
-        // 静态站点根：相对 config_dir 绝对化（缺失目录 fail-fast）。
-        let static_root = match &cfg.server.root {
+        // 静态站点根（server.app_path，CLI --app-path 可覆盖）：相对 config_dir 绝对化（缺失目录 fail-fast）。
+        let static_root = match &cfg.server.app_path {
             Some(r) => {
                 let p = Path::new(r);
                 let p = if p.is_absolute() {
@@ -342,7 +342,7 @@ impl App {
                 };
                 Some(
                     p.canonicalize()
-                        .map_err(|e| format!("server.root {}: {e}", p.display()))?,
+                        .map_err(|e| format!("server.app_path {}: {e}", p.display()))?,
                 )
             }
             None => None,

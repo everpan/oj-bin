@@ -10,11 +10,11 @@
 cargo build                     # 构建（debug）
 
 # dev：直接跑 .ts 源码（目录无 manifests.yaml → 自动 dev/ts）
-cargo run -p oj -- server -c sample/config.yaml -d sample/src
+cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
 
 # release：先构建再跑产物 dist/（目录有 manifests.yaml → 自动 release/js）
 cargo run -p oj -- build -d sample/src -o sample/dist
-cargo run -p oj -- server -c sample/config.yaml -d sample/dist
+cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
 ```
 
 启动时会打印模块清单与路由表，然后：
@@ -27,7 +27,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server  [-c config.yaml] [-b /v1/api] [-d <src|dist>] [--cert-path <jws>] [--key-path <pem>]
+oj server  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>]
 oj build   [module] [-d src] [-o dist] [--no-minify] [--check]
 oj migrate [-c config.yaml] [-d <src|dist>] [--baseline] [--module M]
 oj fixture [-c config.yaml] [-d <src|dist>] [--module M]
@@ -133,7 +133,7 @@ blob:
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
   （未装 → "unknown broker kind"）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
-- `server.root`：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
+- `server.app_path`（CLI `--app-path` 覆盖）：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
 - `server.public_key_path` / `server.certificate_path` / `server.grace_days`：
   **证书必配且不可绕过**——两个路径缺任一即启动报错退出（无任何 config/CLI 开关可跳过
@@ -310,7 +310,7 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 - 尾斜杠有无皆可。
 - 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
 - **解析顺序**：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
-  静态站点（`server.root`，仅 GET/HEAD，见 §3）→ 404。API 永远优先于静态文件。
+  静态站点（`server.app_path`，仅 GET/HEAD，见 §3）→ 404。API 永远优先于静态文件。
 
 ### 7.1 路径参数路由（`.route`）
 
@@ -552,5 +552,5 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
 - `.tsx`/`.mts` 不转译（直通 V8）。
-- 静态站点（`server.root`）无 SPA 回退（未知路径不回落 `index.html`）、无目录列表、
+- 静态站点（`server.app_path`）无 SPA 回退（未知路径不回落 `index.html`）、无目录列表、
   无 Range/ETag/缓存头；未知扩展名按 `application/octet-stream` 下载。

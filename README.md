@@ -54,13 +54,13 @@ and have the host absorb everything else" is**. The trade-offs here differ marke
 cargo build                                                   # first build pulls the prebuilt V8
 
 # dev: run .ts sources directly (no manifests.yaml in dir → auto dev/ts, file changes apply live)
-cargo run -p oj -- server -c sample/config.yaml -d sample/src
+cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
 
 # release: build the artifacts first, apply migrations, then run dist/
 # (manifests.yaml present → auto release/js; migrate is required by the verify gate)
 cargo run -p oj -- build   -d sample/src -o sample/dist
 cargo run -p oj -- migrate -c sample/config.yaml -d sample/dist
-cargo run -p oj -- server  -c sample/config.yaml -d sample/dist
+cargo run -p oj -- server  -c sample/config.yaml --api-path sample/dist
 ```
 
 Modules own their data layer: a per-module `schema.yaml` (declarative tables, the source of

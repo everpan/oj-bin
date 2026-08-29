@@ -25,13 +25,13 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
    存量库接入用 `--baseline`。发布前可跑 `oj schema diff` 做声明 vs 实库对账（漂移 exit 1）。
 4. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
    `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
-5. 目标机解包，`./oj server -c config.yaml -d dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
+5. 目标机解包，`./oj server -c config.yaml --api-path dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
 
 ## 2. 运行
 
 ```bash
-./oj server -c config.yaml -d dist            # release
-./oj server -c config.yaml -d src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
+./oj server -c config.yaml --api-path dist            # release
+./oj server -c config.yaml --api-path src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
 ```
 
 启动时打印模块清单 + 路由表，可据此核对发布是否完整。
@@ -45,7 +45,7 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
   临时调试可用 `-b` 覆盖。空前缀（空串/纯斜杠）启动即报错。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
-- **静态站点** `server.root`：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
+- **静态站点** `server.app_path`（CLI `--app-path` 可覆盖）：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
   （目录 → `index.html`）；目录缺失启动即报错。前置站点产物（如 oj build 的 dist）放独立目录。
 - **DB** `db.<name> = "<DSN>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。
   v0.2 多库混用：`sqlite://`（缺文件自动建空库）/`mysql://`/`postgres://`（透传，连不上启动
@@ -111,7 +111,7 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 生产建议用 `RUST_LOG` 控制级别：
 
 ```bash
-RUST_LOG=oj=info ./oj server -c config.yaml -d dist
+RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 ```
 
 ## 7. 排障表
@@ -123,7 +123,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml -d dist
 | 启动报 `manifests.yaml … run oj build first` | release 下锁文件缺失/损坏，或指向不存在的版本目录 | 跑 `oj build <module>`；锁被手工改坏时按报错修 |
 | 启动报「version dir collision」 | 两个 (module, version) 组合拼出同一目录名（如 `a`/`1-x` 与 `a-1`/`x`） | 改 version 命名避开 |
 | 404 | 路由无对应 `api.ts/js`，或目录穿越/非法段 | 核对路径与 `-b` 前缀；release 先确认模块在锁内 |
-| 启动报 `server.root …` | 静态根目录不存在（相对 config 目录解析） | 建目录或改路径；不配 `root` 即关闭静态服务 |
+| 启动报 `server.app_path …` | 静态根目录不存在（相对 config 目录解析） | 建目录或改路径；不配 `app_path` 即关闭静态服务 |
 | 静态文件 404 | 文件不存在 / 目录缺 `index.html` / 非 GET/HEAD / 无 SPA 回退（v0.1） | 核对文件；SPA 场景先经前置反代补写回退 |
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |

@@ -43,11 +43,11 @@ toB 项目的实施过程中，往往需要 `低代码` 来快速交付。市场
 cargo build                                                   # 首次构建会拉取预编译 V8
 
 # dev：直接跑 .ts 源码（目录内无 manifests.yaml → 自动判定 dev/ts，改文件即生效）
-cargo run -p oj -- server -c sample/config.yaml -d sample/src
+cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
 
 # release：先构建产物，再跑 dist/（目录内有 manifests.yaml → 自动判定 release/js）
 cargo run -p oj -- build  -d sample/src -o sample/dist
-cargo run -p oj -- server -c sample/config.yaml -d sample/dist
+cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
 ```
 
 启动时会打印模块清单与路由表，然后：

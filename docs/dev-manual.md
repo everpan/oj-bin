@@ -111,7 +111,7 @@ OJ_TEST_REDIS=redis://127.0.0.1:6379/1 cargo test --workspace -- --ignored
 ```
 HTTP 请求
   └─ server/lib.rs handle：依次 路由表 lookup（matchit）→ dev 目录镜像兜底（routes.rs）
-     → 静态站点（server.root，仅 GET/HEAD）→ 404
+     → 静态站点（server.app_path，仅 GET/HEAD）→ 404
        └─ 命中 api 文件 → 交给 JsActor
             └─ server/actor.rs：线程化执行（Send bridge 工厂），池化 JsRuntime
                  └─ bridge/loader.rs：生成 per-request TLA driver 模块

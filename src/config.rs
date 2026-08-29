@@ -1,4 +1,4 @@
-//! oj 配置（cli2.md 预案 schema）：server(host/port/root) + db/redis 的 URL 风格 DSN map。
+//! oj 配置（cli2.md 预案 schema）：server(host/port/app_path) + db/redis 的 URL 风格 DSN map。
 //! 旧三层 env 叠加已删（预案即单文件）。
 
 use std::collections::HashMap;
@@ -14,7 +14,8 @@ pub struct ServerCfg {
     /// API 基础路由前缀（如 "/v1/api"）；CLI `-b` 显式给出时覆盖。
     pub base: String,
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
-    pub root: Option<String>,
+    /// CLI `--app-path` 显式给出时覆盖（与 oj server 的旗标同名）。
+    pub app_path: Option<String>,
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
@@ -52,7 +53,7 @@ impl Default for ServerCfg {
             host: "localhost".into(),
             port: 778,
             base: "/v1/api".into(),
-            root: None,
+            app_path: None,
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
@@ -324,7 +325,7 @@ mod tests {
         let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
         assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 778));
         assert_eq!(c.server.base, "/v1/api");
-        assert!(c.server.root.is_none());
+        assert!(c.server.app_path.is_none());
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);
         assert_eq!(c.server.pool_size, 4);
         assert!(c.db.is_empty() && c.redis.is_empty());
@@ -341,14 +342,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ojcfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("cfg.yaml"), concat!(
-            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  root: public\n  timeout: 5s\n  pool_size: 2\n",
+            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  app_path: public\n  timeout: 5s\n  pool_size: 2\n",
             "db:\n  default: sqlite://db.sqlite\n",
             "redis:\n  default: redis://127.0.0.1:6379/1\n",
         )).unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert_eq!(c.server.host, "0.0.0.0");
         assert_eq!(c.server.base, "/xapi");
-        assert_eq!(c.server.root.as_deref(), Some("public"));
+        assert_eq!(c.server.app_path.as_deref(), Some("public"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

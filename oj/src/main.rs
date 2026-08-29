@@ -122,7 +122,8 @@ mod tests {
         let code = run_command(Command::Server(oj::args::ServerArgs {
             config: "no-such-config.yaml".into(),
             base: None,
-            dir: None,
+            api_path: None,
+            app_path: None,
             cert_path: None,
             key_path: None,
         }))

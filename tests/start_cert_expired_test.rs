@@ -31,7 +31,7 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
 
     let result = server_cmd::run(ServerArgs {
         config: config_file.path().to_string_lossy().into_owned(),
-        dir: Some(service_dir.to_string_lossy().into_owned()),
+        api_path: Some(service_dir.to_string_lossy().into_owned()),
         ..Default::default()
     })
     .await;

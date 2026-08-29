@@ -48,7 +48,7 @@ pub struct AppState {
     actor: JsActor,
     /// 单请求超时（None = 不限时）。
     timeout: Option<std::time::Duration>,
-    /// 静态站点根（config server.root）；None → 不开静态服务。
+    /// 静态站点根（config server.app_path / CLI --app-path）；None → 不开静态服务。
     static_root: Option<PathBuf>,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
     pipeline: Pipeline,
@@ -404,7 +404,7 @@ async fn handle(
             None => return fail_response(405, &format!("method {verb} not mapped")),
         }
     }
-    // 静态站点兜底（server.root）：API 优先，GET/HEAD only。
+    // 静态站点兜底（server.app_path）：API 优先，GET/HEAD only。
     if let Some(root) = st.static_root.as_deref()
         && matches!(verb, "GET" | "HEAD")
         && let Some(file) = resolve_static(root, uri.path())
@@ -1418,7 +1418,7 @@ pub(crate) mod tests {
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
-    // ----- 静态站点（server.root）-----
+    // ----- 静态站点（server.app_path）-----
 
     /// 返回 (addr, 夹具)：夹具须在测试内持有（TempRoutes Drop 会删目录）。
     async fn spawn_static(

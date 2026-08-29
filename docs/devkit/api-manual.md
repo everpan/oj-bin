@@ -93,8 +93,8 @@ export default {
 ### 启动与验证
 
 ```bash
-./bin/oj server -c config.yaml -d src
-# 仓库内等价：cargo run -p oj -- server -c config.yaml -d src
+./bin/oj server -c config.yaml --api-path src
+# 仓库内等价：cargo run -p oj -- server -c config.yaml --api-path src
 ```
 
 `server` 按 `-d` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
@@ -112,7 +112,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 
 ```bash
 ./bin/oj build -d src -o dist        # 生成 dist/<module>-<version>/ + manifests.yaml 锁 + tgz
-./bin/oj server -c config.yaml -d dist
+./bin/oj server -c config.yaml --api-path dist
 ```
 
 构建细节见第 10 章；完整可跑样例见仓库 `sample/`（`sample/README.md`）。
@@ -278,7 +278,7 @@ export default { get: detail };
   `routes.js`**（第 10 章）。
 
 解析顺序：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
-静态站点（`server.root`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
+静态站点（`server.app_path`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
 ### WS.ts（WebSocket 帧循环）
@@ -937,7 +937,7 @@ broker:
 | `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出 |
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
-| `server.root` 目录不存在 | 启动报错退出 |
+| `server.app_path` 目录不存在 | 启动报错退出 |
 
 ## 10. 构建与发布
 
@@ -968,7 +968,7 @@ broker:
 
 ### release 加载语义
 
-`server -d dist`（含 `manifests.yaml` → 自动 release）按锁逐模块加载各版本目录的
+`server --api-path dist`（含 `manifests.yaml` → 自动 release）按锁逐模块加载各版本目录的
 `routes.js` 聚合路由；锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错
 （提示先 `oj build`）。**目录镜像路由在 release 不存在**——路由只认 routes.js，
 所以发布前必须 `oj build`。
@@ -989,7 +989,7 @@ oj-v<version>/
 ```
 
 目标机部署：解包 → 项目目录放 `config.yaml` + `dist/` + `seed.sql`（可选）+
-vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml -d dist`。
+vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml --api-path dist`。
 启动时打印模块清单 + 路由表，可据此核对发布是否完整。
 
 ## 11. 运维要点
@@ -1044,7 +1044,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365
 handler 内 `log.debug/info/warn/error(msg, ...kv)`。生产用 `RUST_LOG` 控制级别：
 
 ```bash
-RUST_LOG=oj=info ./oj server -c config.yaml -d dist
+RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 ```
 
 访问日志目录见第 9 章 `logs_dir`。
