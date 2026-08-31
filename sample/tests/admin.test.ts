@@ -75,3 +75,47 @@ describe("admin role", () => {
     expect(none.data.length).toBe(0);
   });
 });
+
+describe("admin menu", () => {
+  it("GET /menu-list → 8 条种子菜单，keepAlive 为 boolean，order 可缺省", async () => {
+    const token = await client.login("demo", "demo1234");
+    const r = await client.get("/menu-list", {
+      headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
+    });
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe(0);
+    expect(body.data.total).toBe(8);
+    const root = body.data.list[0];
+    expect(root.id).toBe(100);
+    expect(root.parentId).toBe("");
+    expect(root.keepAlive).toBe(true);
+    expect(root.order).toBe(100);
+    const leaf = body.data.list[1];
+    expect(leaf.parentId).toBe(100);
+    expect(leaf.order).toBe(undefined);   // sort 为 NULL → order 缺省（对齐 mock）
+  });
+
+  it("menu-item POST→PUT→DELETE 闭环（DELETE body 为裸数字）", async () => {
+    const token = await client.login("demo", "demo1234");
+    const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
+    const created = JSON.parse((await client.post("/menu-item", {
+      headers: h,
+      body: JSON.stringify({ parentId: 100, menuType: 0, name: "system:menu.audit", path: "/system/audit", component: "/system/audit", icon: "AuditOutlined", keepAlive: true, status: 1 }),
+    })).body);
+    expect(created.code).toBe(0);
+    const id = created.data.id;
+    expect(id > 0).toBeTruthy();
+
+    const updated = JSON.parse((await client.put("/menu-item", {
+      headers: h,
+      body: JSON.stringify({ id, parentId: 100, menuType: 0, name: "system:menu.audit2", path: "/system/audit2", component: "/system/audit2", icon: "AuditOutlined", keepAlive: false, status: 1 }),
+    })).body);
+    expect(updated.data.name).toBe("system:menu.audit2");
+    expect(updated.data.keepAlive).toBe(false);
+
+    const deleted = JSON.parse((await client.del("/menu-item", {
+      headers: h, body: String(id),
+    })).body);
+    expect(deleted.code).toBe(0);
+  });
+});
