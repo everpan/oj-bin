@@ -10,9 +10,9 @@ oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑�
 部署排障细节见 `docs/ops-manual.md`。本手册随版本包 `devkit/` 一同发布；
 API 签名以同目录 `global.d.ts` 为类型权威。
 
-目录：1 快速开始 / 2 项目结构与模块约定 / 3 编写 api.ts / 4 导入解析 /
-5 全局对象 API 参考 / 6 响应信封与错误码 / 7 鉴权与多租户 / 8 测试 /
-9 配置 config.yaml / 10 构建与发布 / 11 运维要点 / 12 安全红线与已知限制
+目录：1 快速开始 / 2 项目结构与模块约定 / 3 模块数据层 / 4 编写 api.ts /
+5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
+10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制
 
 ## 1. 快速开始
 
@@ -115,7 +115,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 ./bin/oj server -c config.yaml --api-path dist
 ```
 
-构建细节见第 10 章；完整可跑样例见仓库 `sample/`（`sample/README.md`）。
+构建细节见第 11 章；完整可跑样例见仓库 `sample/`（`sample/README.md`）。
 
 ## 2. 项目结构与模块约定
 
@@ -125,11 +125,14 @@ curl 'http://localhost:9778/v1/api/hello/'
 
 ```
 <project>/
-├── config.yaml          # 服务配置（第 9 章）
+├── config.yaml          # 服务配置（第 10 章）
 ├── seed.sql             # 可选，启动时对 default 库重放
-├── src/                 # dev 服务目录（release 用 dist/，见第 10 章）
+├── src/                 # dev 服务目录（release 用 dist/，见第 11 章）
 │   ├── user/            # 首层子目录 = 模块名
 │   │   ├── manifest.yaml          # 模块清单（必配）
+│   │   ├── schema.yaml            # 声明式表结构（有表模块必配，第 3 章）
+│   │   ├── migrations/            # 手写迁移 {seq:04}__{desc}[.方言].sql
+│   │   ├── fixtures/              # 演示数据，仅 oj test / oj fixture 灌入
 │   │   ├── _shared/validate.ts    # 无 api 文件 → 纯工具代码目录，不产生路由
 │   │   ├── account/api.ts         # → {base}/user/account/
 │   │   ├── profile/api.ts         # → {base}/user/profile/
@@ -137,8 +140,8 @@ curl 'http://localhost:9778/v1/api/hello/'
 │   └── order/
 │       ├── manifest.yaml
 │       └── list/api.ts            # → {base}/order/list/
-├── tests/               # L1 测试（*.test.ts，第 8 章）
-└── node_modules/        # 裸 specifier 解析起点（第 4 章）
+├── tests/               # L1 测试（*.test.ts，第 9 章）
+└── node_modules/        # 裸 specifier 解析起点（第 5 章）
 ```
 
 约束：
@@ -146,7 +149,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 - **首层子目录 = 模块**，每个必须有 `manifest.yaml`；缺失启动失败。
 - 任意深度的子目录放 `api.ts`（dev）/ `api.js`（release）即成为一条路由；
   没有 `api` 文件的目录不是路由，可作共享工具目录（如 `_shared/`）。
-- 同目录可放 `WS.ts` 产生一条 WebSocket 路由（第 3 章）。
+- 同目录可放 `WS.ts` 产生一条 WebSocket 路由（第 4 章）。
 
 ### manifest.yaml（模块清单）
 
@@ -154,6 +157,8 @@ curl 'http://localhost:9778/v1/api/hello/'
 name: "user"        # 必须等于父目录名（强校验，否则启动失败）
 desc: "用户信息相关，记录账号、地址等个人信息"
 version: "0.1.0"
+# tables: [account]   # 有表模块必配：拥有的表清单（与 schema.yaml 双向一致 S005）
+# deps: { user: "^0.1.0" }  # 跨模块表访问声明（ownership_guard 校验依据）
 # config: {}        # 可选，本模块的其他设置
 ```
 
@@ -177,9 +182,79 @@ dist/
 └── …                     # 多版本目录可共存
 ```
 
-版本目录内部结构、锁语义与发布流程见第 10 章。
+版本目录内部结构、锁语义与发布流程见第 11 章。
 
-## 3. 编写 api.ts
+## 3. 模块数据层
+
+> 何时读我：模块要建表、改表、跨模块取数、接存量库时。
+> 运维视角的完整 runbook 见 `docs/migration.md`；本章只写开发要点。
+
+### 心智模型
+
+- **声明为源**：每模块可选 `schema.yaml` 声明自己拥有的表。启动 / `oj migrate` 时自动
+  收敛到声明（**安全前向**：缺表 CREATE、缺可空列 ALTER ADD、缺索引 CREATE INDEX）。
+- **演进靠迁移**：无法安全推导的变更（NOT NULL 列新增、疑似改名、类型变更、数据回填）
+  一律 fail-fast 并打印迁移模板——手写 `migrations/{seq:04}__{desc}[.{sqlite|mysql|postgres}].sql`。
+- **账本记账**：`_oj_migrations_<module>` 记录每模块已应用的迁移；带方言后缀的文件只在
+  对应方言库执行。
+- **表归属**：schema.yaml 喂归属图（表 → 模块，同表双声明拒启 S002）与 `SchemaRegistry`
+  （`db.table()` 列白名单）；跨模块表访问须 manifest `deps:` 声明。
+
+### schema.yaml
+
+```yaml
+tables:
+  account:
+    pk: id                                    # 可选；主键列须在 columns 声明（仅单列）
+    columns:
+      id: { type: integer, autoincrement: true }
+      name: { type: text, null: false }
+      role: { type: text }
+```
+
+- 列类型最小集：`integer | bigint | text | boolean | double | blob`；`null` 缺省可空。
+- 与 manifest `tables:` 双向一致（S005）：声明了表就要进 manifest，反之亦然。
+
+### 三层 SQL 文件
+
+| 文件 | 时机 | 纪律 |
+|---|---|---|
+| `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations_<module>`；序列空洞/乱序 S007 报错 |
+| `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006） |
+| `fixtures/*.sql` | 仅 `oj test` / `oj fixture` 灌入 | 演示/测试数据，不进 release 产物 |
+
+### 命令
+
+| 命令 | 用途 |
+|---|---|
+| `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
+| `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
+| `oj build --check` | 只跑结构检查 S001–S007 不落盘（CI 门禁） |
+
+### 门禁配置（第 10 章 server 表）
+
+- `server.migrate_on_start`：`auto`（dev 默认，启动即应用）/ `verify`（release 默认，
+  账本落后拒启 M004，报错附 `oj migrate` 命令）/ `off`。
+- `server.ownership_guard`：`warn`（默认，跨模块表访问仅告警）/ `deny`（未声明 deps
+  拒绝执行，500 附修复指引）。灰度建议：先 warn 观察日志，声明补齐后切 deny。
+- **无主表语义**：模块未部署时其表无主，运行时不设防（部分部署/灰度属设计语义）。
+
+### 跨模块取数（deps）
+
+```yaml
+# manifest.yaml
+deps:
+  user: "^0.1.0"     # 模块名 → 版本范围；裸 SQL join 对方表前必须声明
+```
+
+误报逃生门：SQL 注释 `/* oj:allow-table=x,y */`。
+
+### 回滚
+
+schema 回滚**没有自动机制**（refinery 语义，只前向）：破坏性变更前备份数据文件；
+反向变更手写新 seq 迁移前向执行。应用回滚 = `dist/manifests.yaml` 指回旧版本目录 + 重启。
+
+## 4. 编写 api.ts
 
 > 何时读我：写第一个 handler 时。
 
@@ -227,12 +302,12 @@ export default {
 };
 ```
 
-两种写法等价可用；同一文件可混用。响应一律经 `json.ok` / `json.fail` 收口（第 6 章）。
+两种写法等价可用；同一文件可混用。响应一律经 `json.ok` / `json.fail` 收口（第 7 章）。
 
 ### 请求体 http.body
 
 解析规则：空 body → `null`；能按 JSON 解析 → 对象/数组；否则 → UTF-8 字符串。
-multipart 请求时 `http.body` 是文本字段对象（`{name: value}`），文件走 `http.files`（第 5 章）。
+multipart 请求时 `http.body` 是文本字段对象（`{name: value}`），文件走 `http.files`（第 6 章）。
 
 ```ts
 const b = http.body as { name?: string };
@@ -275,7 +350,7 @@ export default { get: detail };
   由 handler 自行校验扩展名。
 - TS 项目把 `global.d.ts` 拷进源码根即可获得 `Function.route` 声明，编辑器不报错。
 - `oj build` 会把 `.route` 从产物中剥离——**release 下路由事实唯一来源是构建生成的
-  `routes.js`**（第 10 章）。
+  `routes.js`**（第 11 章）。
 
 解析顺序：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
 静态站点（`server.app_path`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
@@ -294,9 +369,9 @@ json.ok({ subscribed: true });
 ```
 
 注意：release 下 root=dist，WS URL 含模块版本段（如 `…/news-0.1.0/ws`）——v0.2 已知限制
-（第 12 章）。bus 的发布/订阅方向约定见第 5 章 bus 小节。
+（第 13 章）。bus 的发布/订阅方向约定见第 6 章 bus 小节。
 
-## 4. 导入解析
+## 5. 导入解析
 
 > 何时读我：import 报错或想抽公共代码时。
 
@@ -332,7 +407,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 
 所有解析结果被**钳制在 project root 内**——`..` 逃逸直接报错。
 
-## 5. 全局对象 API 参考
+## 6. 全局对象 API 参考
 
 > 何时读我：写任何 handler 期间，查签名与语义。
 
@@ -356,7 +431,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
-| 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 8 章 |
+| 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
 ### json —— 信封与响应头
 
@@ -380,7 +455,7 @@ json.header("X-Request-Id", "abc");
 | `http.method` | `string` | 请求方法（`GET`/`POST`/…） |
 | `http.query` | `Record<string, string>` | query 参数对象（form-urlencoded 解码：`+`→空格、`%XX`） |
 | `http.headers` | `Record<string, string>` | 请求头对象 |
-| `http.body` | `any` | 请求体（解析规则见第 3 章） |
+| `http.body` | `any` | 请求体（解析规则见第 4 章） |
 | `http.params` | `Record<string, string>` | 路径参数对象（已 percent-decode；目录镜像路由下恒空） |
 | `http.param` | `param(name: string, def?: unknown): any` | **路径参数优先，query 兜底**，均缺失返回 `def` 原值 |
 | `http.tenantId` | `string \| null` | 租户 id（`tenant.enable` 时从租户头提取；未启用为 `null`） |
@@ -493,7 +568,7 @@ export default {
 
 下载走内置公开路由 `GET {base}/blob/{key}`（免鉴权、不落业务表；local 直出字节 +
 Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
-（第 12 章路径安全）。上传体积上限 `server.max_upload_bytes`（超限 413）。
+（第 13 章路径安全）。上传体积上限 `server.max_upload_bytes`（超限 413）。
 
 ### bus —— 订阅发布
 
@@ -511,7 +586,7 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 const n = await bus.publish("news", { text: "hi" });
 json.ok({ receivers: n });
 
-// WS 订阅（WS.ts 内，见第 3 章 WS.ts 小节）
+// WS 订阅（WS.ts 内，见第 4 章 WS.ts 小节）
 bus.subscribe("news");
 ```
 
@@ -537,7 +612,7 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 | `log.error` | `error(msg: string, ...kv: unknown[]): void` |
 
 键值对交替传参（zap SugaredLogger 风格）：`log.info("order created", "id", id, "amount", amount)`。
-输出经 `tracing-subscriber` 结构化打印（第 11 章日志）。
+输出经 `tracing-subscriber` 结构化打印（第 12 章日志）。
 
 ### fetch —— HTTP 客户端
 
@@ -563,7 +638,7 @@ if (r.ok) {
 | `ws.send` | `send(data: string): void` | 向当前连接发一帧（HTTP 路径下 no-op） |
 | `ws.close` | `close(): void` | 结束当前连接 |
 
-仅在 `WS.ts` 帧循环内有意义（第 3 章）。
+仅在 `WS.ts` 帧循环内有意义（第 4 章）。
 
 ### plugins —— 插件自省
 
@@ -575,7 +650,7 @@ if (r.ok) {
 json.ok(plugins());
 ```
 
-## 6. 响应信封与错误码
+## 7. 响应信封与错误码
 
 > 何时读我：设计错误返回或排查非 200 时。
 
@@ -603,7 +678,7 @@ json.ok(plugins());
 500 服务器内部错误。`json.fail` 的 `msg` 会原样进入信封，勿把内部细节（堆栈、SQL）
 透给客户端。
 
-## 7. 鉴权与多租户
+## 8. 鉴权与多租户
 
 > 何时读我：接口要登录态或多租户隔离时。
 
@@ -639,7 +714,7 @@ CREATE TABLE IF NOT EXISTS users (
 ```
 
 auth 段其余字段（`jwt_secret` 生产必改且空串启动 fail-fast、`signing_method`、
-access/refresh 时长）见第 9 章配置表。
+access/refresh 时长）见第 10 章配置表。
 
 ```ts
 // 受保护路由：读验签后的用户身份（sample/src/auth_demo/me/api.ts）
@@ -660,7 +735,7 @@ tenant:
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
 供 handler 做数据隔离。**框架不自动改写 SQL**——行级过滤归业务（自行在查询里带
-tenant 条件）。启用期间测试请求也必须带头（第 8 章两约束）。
+tenant 条件）。启用期间测试请求也必须带头（第 9 章两约束）。
 
 ### auth_demo 走读（sample）
 
@@ -670,7 +745,7 @@ tenant 条件）。启用期间测试请求也必须带头（第 8 章两约束�
 `/auth_demo/me/` → refresh 轮换 → logout 失效。sample 同时开了 tenant，
 curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/README.md`）。
 
-## 8. 测试
+## 9. 测试
 
 > 何时读我：写模块测试或搭 CI 时。
 
@@ -802,7 +877,7 @@ steps:
 依赖管理：L2 的 vitest 声明在 `test/package.json` 的 `devDependencies`，与运行时依赖
 （如 `escape-goat`）隔离——被测物不携带测试工具。
 
-## 9. 配置 config.yaml
+## 10. 配置 config.yaml
 
 > 何时读我：起服务前定配置，或排查启动 fail-fast 时。
 
@@ -818,7 +893,7 @@ steps:
 | `base` | `"/v1/api"` | API 基础路由前缀；CLI `-b` 显式给出时覆盖；空前缀（空串/纯斜杠）拒绝启动 |
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
-| `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 12 章） |
+| `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
 | `root` | 无 | 静态站点根目录；**省略 = 不开静态服务**。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 SPA 回退/Range/ETag |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
@@ -826,6 +901,8 @@ steps:
 | `public_key_path` | **必配** | 证书校验公钥（SPKI PEM；仅验签，私钥不落服务器） |
 | `certificate_path` | **必配** | JWS 证书（`Base64URL(Header).Payload.Signature`，RS256） |
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
+| `migrate_on_start` | `auto`（dev）/ `verify`（release） | 迁移门禁：auto 启动即应用；verify 账本落后拒启（M004，先 `oj migrate`）；`off` 迁移完全归运维 |
+| `ownership_guard` | `"warn"` | 表归属守卫：`warn` 跨模块表访问仅告警；`deny` 未声明 deps 拒绝执行（500 附修复指引） |
 
 ### db —— 命名库（多库混用）
 
@@ -891,7 +968,7 @@ broker:
 
 ### tenant / auth
 
-字段与语义见第 7 章（tenant 默认关闭、header 默认 `X-TENANT-ID`；auth 的
+字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`；auth 的
 `jwt_secret`（空串启动 fail-fast，生产必改）、`signing_method`（HS256|HS384|HS512，
 默认 HS256）、`access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
 `anonymous_paths`、`user_table`（默认 users））。
@@ -917,7 +994,7 @@ broker:
 - 宽限期结束再启动 → 记 ERROR 后进程退出（不服务）。
 - 证书 / 公钥文件被覆盖即**热加载**（notify 事件驱动，无需重启）。
 
-证书生成/续期见第 1 章与第 11 章。
+证书生成/续期见第 1 章与第 12 章。
 
 ### fail-fast 行为清单（启动即退，不等第一个请求）
 
@@ -938,8 +1015,10 @@ broker:
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
 | `server.app_path` 目录不存在 | 启动报错退出 |
+| 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
+| release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
 
-## 10. 构建与发布
+## 11. 构建与发布
 
 > 何时读我：dev 跑通后要交付时。
 
@@ -950,6 +1029,8 @@ broker:
 ./bin/oj build user -d src -o dist     # 单模块
 ./bin/oj build user --no-minify        # 排障：多行可读产物（含内联 sourcemap）
 ```
+
+`oj build` 内建结构检查 S001–S007（manifest 合法性/表归属/deps/tables 一致/seed 纪律/迁移序列），违规 fail build；`oj build --check` 只查不落盘，作 CI 门禁。
 
 每个模块构建为版本目录 `dist/<module>-<version>/`（版本读自模块 `manifest.yaml`；
 同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
@@ -992,7 +1073,7 @@ oj-v<version>/
 vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml --api-path dist`。
 启动时打印模块清单 + 路由表，可据此核对发布是否完整。
 
-## 11. 运维要点
+## 12. 运维要点
 
 > 何时读我：服务跑起来之后的证书/日志/排障/升级。
 
@@ -1029,6 +1110,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365
 | `config.yaml` | 否（重启生效） |
 | `seed.sql` | 否（仅启动重放） |
 | `manifest.yaml` 新增/删除模块 | 否（重启生效） |
+| schema.yaml / migrations 变更 | 否（重启或 oj migrate 生效；dev auto 在下次启动收敛） |
 | `node_modules` 新增包 | 否（已加载包缓存于进程，重启生效） |
 
 ### 超时与资源
@@ -1047,7 +1129,7 @@ handler 内 `log.debug/info/warn/error(msg, ...kv)`。生产用 `RUST_LOG` 控�
 RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 ```
 
-访问日志目录见第 9 章 `logs_dir`。
+访问日志目录见第 10 章 `logs_dir`。
 
 ### 排障表（高频条目）
 
@@ -1062,7 +1144,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |
 | 413 | 超 `max_upload_bytes` | 调上限或压缩上传 |
 | GET 全部 403 `certificate expired` | 证书进入宽限/过期 | 替换证书文件（热加载即时生效）；查 `{base}/health` |
-| 启动报 `certificate …` 系列错误 | 缺路径/密钥不匹配/JWS 格式错 | 见第 9 章证书门禁；`oj-cert` 重签 |
+| 启动报 `certificate …` 系列错误 | 缺路径/密钥不匹配/JWS 格式错 | 见第 10 章证书门禁；`oj-cert` 重签 |
 | 启动报 `redis 'default': …` | Redis 不可达（fail-fast） | 起 Redis 或核对 URL；不想依赖就注释掉 `redis:` 段 |
 | 400 `missing tenant header` | `tenant.enable` 且未带租户头 | 客户端补 header |
 | 401 `missing or invalid bearer token` | auth 启用且路径不匿名 | 走 `/auth/login` 换 token |
@@ -1072,6 +1154,9 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | `GET {base}/…/ws` 404 | release 未重新 build，或 URL 含版本段 | 先 `oj build`；release URL 为 `…/news-0.1.0/ws` |
 | 改 `api.ts` 不生效 | release 下 dist 未更新 / 换版本未重启 | 同步 dist；必要时重启 |
 | `blob not configured` / `es not configured` | config 无对应段 | 加 `blob:` / `es.endpoint` |
+| 启动报 M004 / 迁移账本落后 | release verify 门禁：有迁移未应用 | 先 `oj migrate -c config.yaml -d dist` 再启动 |
+| 500 报跨模块表访问被拒 | `ownership_guard: deny` 且未声明 deps | manifest 补 `deps:`；或临时 SQL 注释 `/* oj:allow-table=x */` |
+| `oj schema diff` exit 1 | 声明与实库漂移（D001/D002） | 按输出对齐 schema.yaml 或补迁移；存量库用 `oj migrate --baseline` |
 
 完整排障表见 `docs/ops-manual.md` §7。
 
@@ -1080,14 +1165,14 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 - 插件替换用 `.new` / `.bak` **原子换名**；升级前 `cargo xtask plugin <name> --check`
   预检（ABI / 身份 / semver / 符号）。
 - **ABI bump 部署顺序：先升插件到新 ABI 并验证，再升宿主**（或同版本原子升级）。
-  升级窗口内可用 `plugins()` 自省核对（第 5 章）。
+  升级窗口内可用 `plugins()` 自省核对（第 6 章）。
 - 多版本共存回滚（代码）：`dist/` 内旧版本目录不被构建清除，回滚单模块 =
   把 `dist/manifests.yaml` 该模块指回旧版本 + 重启 server（锁仅启动时读）。
 - 回滚（二进制）：换回上一版打包产物；保持二进制与 `dist/` 同版本发布。
 - 升级前备份 sqlite 数据文件（`db.default` 路径）；配了 Redis/ES 的实例，它们的可用性
   进入启动契约（fail-fast），发布/巡检时先确认可达。
 
-## 12. 安全红线与已知限制
+## 13. 安全红线与已知限制
 
 > 何时读我：任何写 SQL / 拼路径 / 处理上传的时刻；发布前自查。
 
@@ -1119,7 +1204,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   参数化查询与类型转换，**勿拼接文件路径 / URL**。
 - blob key 白名单：按 `/` 分段，`.` / `..` / `\` / NUL / 空段拒绝。下载路由
   `{base}/blob/{key}` **公开免鉴权**——不要把需鉴权的对象放进去。
-- import 解析结果钳制在 project root 内，`..` 逃逸报错（第 4 章）。
+- import 解析结果钳制在 project root 内，`..` 逃逸报错（第 5 章）。
 
 ### v0.2 已知限制全表
 
@@ -1136,6 +1221,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
+| schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
+| fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
 
 ### 常见陷阱清单
 
