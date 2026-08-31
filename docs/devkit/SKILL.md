@@ -14,7 +14,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
-4. **测试**：先 L2 vitest 测逻辑（快），再 L1 `oj test` 测端到端（真）。两层都绿才算完（§8）。
+4. **测试**：先 L2 vitest 测逻辑（快），再 L1 `oj test` 测端到端（真）。两层都绿才算完（§9）。
 5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§10）。
 
 ## 红线（不可违反）
@@ -33,7 +33,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 - [ ] 目录映射核对：`src/<模块>/<路径>/api.ts` ↔ `GET {base}/<模块>/<路径>/`
 - [ ] 方法名映射核对（特别是 `del`）
 - [ ] 用了 `.route`？→ 确认镜像路径已按替换语义放弃；确认 build 会剥 `.route`
-- [ ] 响应全部走 `json.ok`/`json.fail`；错误码符合 §6 场景表
+- [ ] 响应全部走 `json.ok`/`json.fail`；错误码符合 §7 场景表
 - [ ] SQL 全部参数化；动态标识符全部走构造器
 - [ ] L2 + L1 测试跑过并全绿
 

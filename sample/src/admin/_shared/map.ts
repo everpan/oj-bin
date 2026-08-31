@@ -44,6 +44,8 @@ export function paged(all: any[], pageSize: number, current: number): any {
   };
 }
 
+export const MENU_COLS = "id, parent_id, menu_type, name, path, component, sort, icon, current_active_menu, iframe_link, keep_alive, external_link, hide_in_menu, ignore_access, status, create_time, update_time";
+
 export function pageArgs(): { pageSize: number; current: number } {
   return {
     pageSize: Number(http.param("pageSize", 10)) || 10,

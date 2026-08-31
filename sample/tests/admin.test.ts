@@ -42,6 +42,11 @@ describe("admin role", () => {
     expect(updated.data.name).toBe("运营2");
     expect(updated.data.status).toBe(0);
 
+    const invalidPut = JSON.parse((await client.put("/role-item", {
+      headers: h, body: JSON.stringify({ id, name: "", code: "ops" }),
+    })).body);
+    expect(invalidPut.code).toBe(400);
+
     const deleted = JSON.parse((await client.del("/role-item", {
       headers: h, body: String(id),
     })).body);
@@ -183,6 +188,11 @@ describe("admin menu", () => {
     })).body);
     expect(updated.data.name).toBe("system:menu.audit2");
     expect(updated.data.keepAlive).toBe(false);
+
+    const invalidPut = JSON.parse((await client.put("/menu-item", {
+      headers: h, body: JSON.stringify({ id, name: "" }),
+    })).body);
+    expect(invalidPut.code).toBe(400);
 
     const deleted = JSON.parse((await client.del("/menu-item", {
       headers: h, body: String(id),
