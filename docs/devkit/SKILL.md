@@ -15,7 +15,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
 4. **测试**：先 L2 vitest 测逻辑（快），再 L1 `oj test` 测端到端（真）。两层都绿才算完（§9）。
-5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§10）。
+5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§11）。
 
 ## 红线（不可违反）
 
