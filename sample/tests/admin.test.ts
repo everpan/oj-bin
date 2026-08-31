@@ -117,6 +117,36 @@ describe("admin user/notify", () => {
   });
 });
 
+describe("admin home", () => {
+  it("GET /home/pie → 5 个品类", async () => {
+    const token = await client.login("demo", "demo1234");
+    const r = await client.get("/home/pie?by=month", {
+      headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
+    });
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe(0);
+    expect(body.data.length).toBe(5);
+    expect(body.data[0].code).toBe("electronics");
+    expect(typeof body.data[0].value).toBe("number");
+  });
+
+  it("POST /home/line week/month/year/其他 → 7/当天数/累计天数/[]", async () => {
+    const token = await client.login("demo", "demo1234");
+    const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
+    const week = JSON.parse((await client.post("/home/line", { headers: h, body: JSON.stringify({ range: "week" }) })).body);
+    expect(week.data.length).toBe(7);
+    const month = JSON.parse((await client.post("/home/line", { headers: h, body: JSON.stringify({ range: "month" }) })).body);
+    expect(month.data.length).toBe(new Date().getDate());
+    const year = JSON.parse((await client.post("/home/line", { headers: h, body: JSON.stringify({ range: "year" }) })).body);
+    const now = new Date();
+    let days = 0;
+    for (let m = 0; m < now.getMonth(); m++) days += new Date(now.getFullYear(), m + 1, 0).getDate();
+    expect(year.data.length).toBe(days);
+    const other = JSON.parse((await client.post("/home/line", { headers: h, body: JSON.stringify({ range: "nope" }) })).body);
+    expect(other.data.length).toBe(0);
+  });
+});
+
 describe("admin menu", () => {
   it("GET /menu-list → 8 条种子菜单，keepAlive 为 boolean，order 可缺省", async () => {
     const token = await client.login("demo", "demo1234");
