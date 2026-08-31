@@ -76,6 +76,47 @@ describe("admin role", () => {
   });
 });
 
+describe("admin user/notify", () => {
+  it("GET /user-info → demo 用户，roles 含 admin", async () => {
+    const token = await client.login("demo", "demo1234");
+    const r = await client.get("/user-info", {
+      headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
+    });
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe(0);
+    expect(body.data.username).toBe("demo");
+    expect(body.data.roles).toContain("admin");
+  });
+
+  it("GET /get-async-routes → admin 绑定的菜单组成路由树（/system 带子节点）", async () => {
+    const token = await client.login("demo", "demo1234");
+    const r = await client.get("/get-async-routes", {
+      headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
+    });
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe(0);
+    expect(body.data.length).toBe(1);              // 只有 /system 一棵（menu_type 3 的按钮不下发）
+    const sys = body.data[0];
+    expect(sys.path).toBe("/system");
+    expect(sys.handle.title).toBe("system:menu.system");
+    expect(sys.handle.order).toBe(100);
+    expect(sys.children.length).toBe(4);           // user/role/menu/dept
+    expect(sys.children[0].component).toBe("/system/user");
+  });
+
+  it("GET /notifications → 4 条，isRead 为 boolean", async () => {
+    const token = await client.login("demo", "demo1234");
+    const r = await client.get("/notifications", {
+      headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
+    });
+    const body = JSON.parse(r.body);
+    expect(body.data.length).toBe(4);
+    expect(body.data[0].isRead).toBe(true);
+    expect(body.data[1].isRead).toBe(false);
+    expect(body.data[0].title).toBe("收到了 14 份新周报");
+  });
+});
+
 describe("admin menu", () => {
   it("GET /menu-list → 8 条种子菜单，keepAlive 为 boolean，order 可缺省", async () => {
     const token = await client.login("demo", "demo1234");
