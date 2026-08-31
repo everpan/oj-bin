@@ -1,0 +1,48 @@
+# 声明式表结构：归属图 + SchemaRegistry 列白名单的源（规范见 docs/migration.md）。
+# 列类型最小集：integer | bigint | text | boolean | double | blob
+tables:
+  role:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      name: { type: text, null: false }
+      code: { type: text, null: false }
+      status: { type: integer, null: false }   # 1 启用 0 停用
+      remark: { type: text }
+      create_time: { type: bigint, null: false }   # ms 时间戳
+      update_time: { type: bigint, null: false }
+  menu:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      parent_id: { type: integer, null: false }    # 根为 0
+      menu_type: { type: integer, null: false }    # 0 菜单 1 iframe 2 外链 3 按钮
+      name: { type: text, null: false }
+      path: { type: text }
+      component: { type: text }
+      sort: { type: integer }                      # 前端字段名 order（SQL 关键字避让）
+      icon: { type: text }
+      current_active_menu: { type: text }
+      iframe_link: { type: text }
+      keep_alive: { type: integer, null: false }   # 0/1，输出映射 boolean
+      external_link: { type: text }
+      hide_in_menu: { type: integer, null: false }
+      ignore_access: { type: integer, null: false }
+      status: { type: integer, null: false }
+      create_time: { type: bigint, null: false }
+      update_time: { type: bigint, null: false }
+  role_menu:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      role_id: { type: integer, null: false }
+      menu_id: { type: integer, null: false }
+  notification:
+    pk: id
+    columns:
+      id: { type: integer, autoincrement: true }
+      avatar: { type: text }
+      date: { type: text, null: false }
+      is_read: { type: integer, null: false }      # 0/1，输出映射 boolean
+      message: { type: text }
+      title: { type: text, null: false }

@@ -1,0 +1,10 @@
+name: "admin"
+desc: "react-antd-admin 前端接口的后端移植：角色/菜单/通知/首页图表/动态路由"
+version: "0.1.0"
+tables:            # 与 schema.yaml 双向一致（S005）
+  - role
+  - menu
+  - role_menu
+  - notification
+deps:              # user-info 读 _platform.users（ownership_guard: deny 下必须声明）
+  _platform: "^0.1.0"
