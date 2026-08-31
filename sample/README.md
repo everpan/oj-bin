@@ -13,8 +13,8 @@
 - 声明式表结构：每模块 `schema.yaml`（§4.2）声明表/列/索引 → 归属图（表→模块单射，
   同表双声明拒启）+ SchemaRegistry 列白名单（`db.table()` 构造器可用）。
   安全前向（缺表 CREATE / 缺可空列 ALTER / 缺索引）在 dev 启动与 `oj migrate` 自动收敛；
-  NOT NULL 新增、疑似改名 fail-fast 并打印迁移模板。sample 四模块（_platform/user/
-  order/cert）均已声明
+  NOT NULL 新增、疑似改名 fail-fast 并打印迁移模板。sample 五模块（_platform/user/
+  order/cert/admin）均已声明
 - 表归属守卫：SQL 里出现的他模块表须在 manifest `deps:` 声明（order → user 即演示）；
   `server.ownership_guard: warn`（默认，仅告警）| `deny`（违规拒绝执行）
 - 迁移：每模块 `migrations/{seq:04}__{desc}[.方言].sql`（DDL 演进，账本
