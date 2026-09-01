@@ -14,6 +14,9 @@ server:
   # logs_max_m: 100            # 单个日志文件大小上限（单位 M，<100 按 100 生效），超过滚动
   # logs_keep_files: 10        # 日志文件保留个数（含活动文件，超出删除）
                      #  绝对路径直接用；相对路径相对本文件目录；省略 = 本文件目录下 ./logs
+  # console_log: false         # 终端输出（默认 false = 只落盘；true = 额外回写终端，
+                     #  CLI --console-log 同效，与配置取「或」）。日志级别另由
+                     #  RUST_LOG 环境变量控制（如 RUST_LOG=oj=debug），配置里不能配。
   # 证书必配（无逃生口）：不配两个路径即启动报错。此处为示例自签证书（有效期 1 年，
   # 私钥仅示例用，勿用于生产）；生产用 `tools/oj-cert` 生成并妥善保管私钥。
   public_key_path: "./config/public.pem"

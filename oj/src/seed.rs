@@ -108,6 +108,12 @@ fn quoted(s: &str, q: char) -> Option<(&str, &str)> {
     Some((&s[1..e], &s[e + 1..]))
 }
 
+/// 诊断文案里的路径：统一以 `/` 分隔。Windows 原生分隔符 `\` 会让同一条报错在
+/// 跨平台下不可比对（测试按 `模块/seed.sql` 断言）。
+fn show(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 /// `;` 朴素切分 + 去空（继承 §2.1 约束：语句内不得含分号字面量）。
 fn split_statements(text: &str) -> Vec<&str> {
     text.split(';')
@@ -158,7 +164,7 @@ pub async fn replay_all(
     files.extend(modules.iter().map(|(_, p)| p.clone()));
     let mut texts = Vec::new();
     for p in &files {
-        let t = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+        let t = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", show(p)))?;
         texts.push((p.clone(), t));
     }
     // S002 冲突检查：表 → 首见文件；重复即 fail-fast（不执行任何语句）。
@@ -170,8 +176,8 @@ pub async fn replay_all(
                     "S002: 表 `{name}` 被多处建表：{} 与 {}\n  \
                      原因：模块自治要求 表→模块 单射（§8-1），不静默合并。\n  \
                      下一步：保留唯一归属处的建表与数据，删除另一处后重试。",
-                    prev.display(),
-                    p.display()
+                    show(prev),
+                    show(p)
                 ));
             }
             owner.insert(leak_str(name), p.as_path());
@@ -187,7 +193,7 @@ pub async fn replay_all(
         for stmt in split_statements(t) {
             db.exec_with_params(stmt, &[])
                 .await
-                .map_err(|e| format!("seed {}: {e}", p.display()))?;
+                .map_err(|e| format!("seed {}: {e}", show(p)))?;
         }
     }
     Ok(())

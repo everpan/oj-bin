@@ -1,0 +1,161 @@
+# 发行打包 + GitHub Release（spec：docs/superpowers/specs/2026-09-01-release-packaging-design.md）
+#
+# 三平台矩阵各自调用 scripts/ 下的打包脚本（单一真相来源，本地与 CI 产物同形）：
+#   ubuntu / macos -> bash scripts/deploy.sh     -> dist/oj-v<ver>-<triple>.tar.gz
+#   windows        -> cmd  scripts\deploy.bat    -> dist/oj-v<ver>-<triple>.zip
+#
+# 全部以 --release 构建（无 debug 构建，见 CLAUDE.md）。
+#
+# 触发：
+#   - 打 tag 推送（v*）自动发布正式 Release
+#   - 手工 workflow_dispatch（默认发布为草稿，人工核对后再点发布）
+#
+# 矩阵与 .github/workflows/plugin-matrix.yml 保持一致；musl 行按需启用。
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签（如 v0.1.0）；留空则用 v + oj/Cargo.toml 的 version'
+        required: false
+      draft:
+        description: '发布为草稿（true = 人工核对产物后再点发布）'
+        required: false
+        default: 'true'
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gnu (x86_64-unknown-linux-gnu)
+            os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - name: macos (aarch64-apple-darwin)
+            os: macos-latest
+            triple: aarch64-apple-darwin
+          - name: windows (x86_64-pc-windows-msvc)
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          # 按需：部署含 Alpine 时启用 musl 行
+          # - name: linux-musl (x86_64-unknown-linux-musl)
+          #   os: ubuntu-latest
+          #   triple: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。
+      # 镜像只装 VS2026，cmake 3.29 不认识其 "Visual Studio 18 2026" 生成器；若改钉
+      # VS2022 又找不到实例。故改用 NMake Makefiles 生成器（与 VS 版本解耦），并由
+      # msvc-dev-cmd 注入 MSVC 工具链（cl/nmake 入 PATH），避免生成器名与 cmake
+      # 版本错配 → "Could not create named generator" / "could not find instance"。
+      - name: Set up MSVC toolchain (cl/nmake) for rdkafka-sys cmake build
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Pin cmake generator for rdkafka-sys (NMake, version-agnostic)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: echo "CMAKE_GENERATOR=NMake Makefiles" >> "$GITHUB_ENV"
+
+      # Git for Windows 自带 GNU `link.exe`（usr/bin），会在 MSVC 的 link.exe 之前被 rustc
+      # 选中，导致链接失败（"missing operand after ..."）。构建前移除该冲突文件，
+      # 让 rustc 落到 msvc-dev-cmd 注入的 MSVC link.exe。
+      - name: Remove Git's link.exe (shadows MSVC linker)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
+
+      # 发布前跑全量测试（release 模式，与 plugin-matrix 同；infinite_loop 在部分平台会
+      # SIGSEGV，跳过）。
+      - name: cargo test --release (workspace, skip infinite_loop)
+        run: cargo test --workspace --release -- --skip infinite_loop
+
+      # 打包：调用 scripts/ 下与本地同款的脚本（脚本内自带 cargo xtask build）。
+      - name: package (unix)
+        if: matrix.os != 'windows-latest'
+        run: bash scripts/deploy.sh
+      # Windows 走 bat（cmd.exe）。必须显式 shell: cmd —— windows runner 的默认
+      # shell 是 pwsh，.bat 在 pwsh 下不会被 cmd 解释。
+      - name: package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: cmd
+        run: call scripts\deploy.bat
+
+      - name: list package
+        shell: bash
+        run: ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # 三平台产物合并到同一目录（各平台文件名含 triple，不会互相覆盖）。
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: resolve tag
+        id: tag
+        run: |
+          cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="v${cargo_version}"
+          fi
+          # 版本一致性门禁：tag 必须与 oj/Cargo.toml 的 version 对得上，否则会发出
+          # 「tag v0.2.0 里装着 0.1.0 的包」这种产物。
+          if [ "${tag#v}" != "$cargo_version" ]; then
+            echo "::error::tag '${tag}' 与 oj/Cargo.toml 的 version '${cargo_version}' 不一致；先改 Cargo.toml 或换 tag" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: ${tag}"
+
+      # 用 gh CLI（runner 预装、第一方）而非第三方 action：不引入额外供应链依赖。
+      # GITHUB_TOKEN 在 permissions.contents=write 下可建 Release。
+      - name: create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          args=()
+          # 手工触发且 draft=true 时发草稿；tag 推送直接发正式版。
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.draft }}" = "true" ]; then
+            args+=(--draft)
+          fi
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --generate-notes \
+            "${args[@]}" \
+            dist/*

@@ -32,6 +32,9 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     let result = server_cmd::run(ServerArgs {
         config: config_file.path().to_string_lossy().into_owned(),
         api_path: Some(service_dir.to_string_lossy().into_owned()),
+        // 测试必须留终端输出：server_cmd::run 会装 fd 级 tee，console 关闭时连
+        // libtest 自身的汇总行与 panic 信息都会被吞进日志文件，CI 里看不到失败原因。
+        console_log: true,
         ..Default::default()
     })
     .await;

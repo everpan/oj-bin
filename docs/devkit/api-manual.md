@@ -99,7 +99,9 @@ export default {
 
 `server` 按 `-d` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
 release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码，按需转译，改文件即生效）。
-启动行会打印判定结果（`dev/ts` / `release/js`）与模块清单、路由表。
+启动行会把判定结果（`dev/ts` / `release/js`）与模块清单、路由表写进日志。
+**终端默认静默（`server.console_log` 缺省 false）**——启动时会打一行日志路径的提示，
+随后一切输出只落盘；需要终端同时输出时加 `--console-log` 或配 `server.console_log: true`。
 
 验证信封返回：
 
@@ -898,6 +900,7 @@ steps:
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） | |
+| `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）；`true` = 额外回写终端。CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警** | |
 | `public_key_path` | **必配** | 证书校验公钥（SPKI PEM；仅验签，私钥不落服务器） |
 | `certificate_path` | **必配** | JWS 证书（`Base64URL(Header).Payload.Signature`，RS256） |
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
@@ -1054,24 +1057,33 @@ broker:
 （提示先 `oj build`）。**目录镜像路由在 release 不存在**——路由只认 routes.js，
 所以发布前必须 `oj build`。
 
-### 发行包布局与 deploy.sh
+### 发行包布局与打包脚本
+
+按平台选用脚本（两者产物布局一致，仅归档格式不同）：
 
 ```bash
-bash scripts/deploy.sh     # 构建（release）+ 打包 → dist/oj-v<version>.tar.gz
+bash scripts/deploy.sh     # macOS / Linux → dist/oj-v<version>-<triple>.tar.gz
+scripts\deploy.bat         # Windows (cmd) → dist/oj-v<version>-<triple>.zip
 ```
 
-包内容（解包后）：
+`<triple>` 取自 `rustc -vV` 的 host 行（如 `aarch64-apple-darwin`、
+`x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`），与插件加载器的发现路径
+`<exe>/plugins/<triple>/` 同形。版本取自 `oj/Cargo.toml`。每个包附带同名
+`.sha256` 校验文件。
+
+包内容（解包后，根路径 = 包名）：
 
 ```
-oj-v<version>/
-├── oj                    # 主程序（独立二进制，deno_core 内嵌，无运行时依赖）
-├── plugins/<host-triple>/# 插件 cdylib（oj-es、oj-db-*、oj-kv-redis、oj-blob-s3、oj-bus-*）
+oj-v<version>-<triple>/
+├── oj                    # 主程序（Windows 上为 oj.exe；独立二进制，deno_core 内嵌）
+├── plugins/<triple>/     # 插件 cdylib（oj-es、oj-db-*、oj-kv-redis、oj-blob-s3、oj-bus-*）
 └── devkit/               # 本手册 + SKILL.md + global.d.ts（agent/编辑器类型提示）
 ```
 
 目标机部署：解包 → 项目目录放 `config.yaml` + `dist/` + `seed.sql`（可选）+
 vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml --api-path dist`。
-启动时打印模块清单 + 路由表，可据此核对发布是否完整。
+启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整（终端默认静默：
+`tail -f logs/server-*.log`，或启动时加 `--console-log`）。
 
 ## 12. 运维要点
 

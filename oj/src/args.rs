@@ -18,6 +18,9 @@ pub struct ServerArgs {
     pub cert_path: Option<String>,
     /// PEM 公钥路径；Some 覆盖 config 的 server.public_key_path。
     pub key_path: Option<String>,
+    /// `--console-log`：true → 打开终端输出（默认关闭，只落盘）。
+    /// 打开 config 的 server.console_log 之外的另一条通路（两者为「或」）。
+    pub console_log: bool,
 }
 
 /// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
@@ -115,6 +118,10 @@ enum Commands {
         /// PEM 公钥路径（覆盖 config 的 server.public_key_path）
         #[arg(long)]
         key_path: Option<String>,
+        /// 打开终端输出；**默认关闭**（只落盘至 server.logs_dir）。
+        /// 非 unix 平台无落盘，终端输出强制保留。
+        #[arg(long = "console-log")]
+        console_log: bool,
     },
     /// 构建模块产物（src → dist：版本目录 / routes.js / tgz）
     Build {
@@ -220,6 +227,7 @@ fn to_command(cli: Cli) -> Command {
             app_path,
             cert_path,
             key_path,
+            console_log,
         } => Command::Server(ServerArgs {
             config,
             base,
@@ -227,6 +235,7 @@ fn to_command(cli: Cli) -> Command {
             app_path,
             cert_path,
             key_path,
+            console_log,
         }),
         Commands::Build {
             module,

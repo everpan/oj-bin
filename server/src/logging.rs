@@ -8,6 +8,10 @@
 //! 设计：tracing 只保留控制台层（其输出经 tee 落盘，不再单设文件层）；镜像线程与
 //! fd 按进程生命周期泄漏（对齐 non_blocking guard 的 mem::forget 惯例），不做优雅关闭 ——
 //! 进程退出瞬间管道尾部字节可能丢，终端侧始终完整。init 幂等，重复调用安全。
+//!
+//! 终端输出默认关闭（`server.console_log` / CLI `--console-log` 打开）：关闭时镜像线程
+//! 不回写原终端，输出只落盘。注意 tracing 控制台层写的是 **stderr**，故开关同时静默
+//! fd 1 与 fd 2；非 unix 平台没有落盘，此时强制保留终端输出并告警（否则日志会彻底消失）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,15 +43,21 @@ pub fn resolve_logs_dir(logs_dir: Option<&str>, config_dir: &Path) -> PathBuf {
 
 /// 初始化全局 tracing subscriber + 终端镜像（幂等；失败仅告警，不影响主流程）。
 /// `logs_max_m`：单文件大小上限（单位 M，<100 按 100 生效）；`logs_keep_files`：保留个数。
-pub fn init(logs_dir: &Path, logs_max_m: u64, logs_keep_files: usize) {
+/// `console`：false → 输出只落盘，终端保持干净（同时静默 stdout 与 stderr，因为
+/// tracing 控制台层写的是 stderr）。非 unix 平台无落盘，此时该参数被忽略。
+pub fn init(logs_dir: &Path, logs_max_m: u64, logs_keep_files: usize, console: bool) {
     if INITED.swap(true, Ordering::SeqCst) {
         return;
     }
 
     // 先装终端镜像：此后一切终端输出同步落盘；失败则降级为仅终端。
     #[cfg(unix)]
-    if let Err(e) = install_terminal_tee(logs_dir, effective_max_bytes(logs_max_m), logs_keep_files)
-    {
+    if let Err(e) = install_terminal_tee(
+        logs_dir,
+        effective_max_bytes(logs_max_m),
+        logs_keep_files,
+        console,
+    ) {
         eprintln!("warn: log file init failed ({e}); logging to terminal only");
     }
     #[cfg(not(unix))]
@@ -56,7 +66,13 @@ pub fn init(logs_dir: &Path, logs_max_m: u64, logs_keep_files: usize) {
         eprintln!(
             "warn: file logging is unix-only; server.logs_dir/logs_max_m/logs_keep_files are ignored on this platform"
         );
-        let _ = (logs_dir, logs_max_m, logs_keep_files);
+        // 此处无落盘，关终端等于丢日志 —— 强制保留终端输出，并说明原因。
+        if !console {
+            eprintln!(
+                "warn: console output kept: file logging is unix-only, so there is nowhere else to log on this platform"
+            );
+        }
+        let _ = (logs_dir, logs_max_m, logs_keep_files, console);
     }
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -82,8 +98,17 @@ fn effective_max_bytes(logs_max_m: u64) -> u64 {
 /// 终端镜像：把 stdout / stderr 各自重定向到独立管道，由后台线程逐块写回原终端
 /// 与日志文件（两条独立管道，避免合并后终端侧 stdout/stderr 目标被重复写）。
 /// 两线程共享同一 [`LogWriter`]，滚动由互斥锁串行化。
+/// `console`：true → 额外回写原终端（默认关闭，见 `init`）。
+///
+/// 公开仅为 `server/tests/log_tee.rs` 集成测试：tee 是进程级的，必须独占一个测试
+/// 二进制（装在单元测试里会污染同二进制其余用例的输出，见该文件头部说明）。
 #[cfg(unix)]
-fn install_terminal_tee(logs_dir: &Path, max_bytes: u64, keep: usize) -> std::io::Result<()> {
+pub fn install_terminal_tee(
+    logs_dir: &Path,
+    max_bytes: u64,
+    keep: usize,
+    console: bool,
+) -> std::io::Result<()> {
     use std::sync::{Arc, Mutex};
 
     std::fs::create_dir_all(logs_dir)?;
@@ -96,14 +121,19 @@ fn install_terminal_tee(logs_dir: &Path, max_bytes: u64, keep: usize) -> std::io
         chrono::Local::now().format("%Y%m%d-%H%M%S"),
         std::process::id()
     ));
+    // 静默前先喊一声：此后终端就什么都不显示了，用户必须知道日志去了哪。
+    // 这行必须在 redirect_fd 之前打印，否则会被自己的管道吞掉。
+    if !console {
+        eprintln!("note: console log off; logging to {}.log", base.display());
+    }
     // 滚动语义要求活动文件 + 至少一个后移位（keep<2 无法滚动，钳到 2）。
     let writer = Arc::new(Mutex::new(LogWriter::new(base, max_bytes, keep.max(2))));
 
     // SAFETY: 纯 fd 操作：原始 stdout/stderr 先 dup 保存；各自管道写端替换 fd 1/2；
     // 读端与保存的 fd 全部移交镜像线程，按进程生命周期泄漏。
     unsafe {
-        redirect_fd(1, libc::dup(1), writer.clone())?;
-        redirect_fd(2, libc::dup(2), writer)?;
+        redirect_fd(1, libc::dup(1), writer.clone(), console)?;
+        redirect_fd(2, libc::dup(2), writer, console)?;
     }
     Ok(())
 }
@@ -142,6 +172,7 @@ unsafe fn redirect_fd(
     fd: i32,
     console: i32,
     writer: std::sync::Arc<std::sync::Mutex<LogWriter>>,
+    echo_console: bool,
 ) -> std::io::Result<()> {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: 纯 fd 操作，见 install_terminal_tee 总注。dup2 生效后任何失败都必须把
@@ -159,7 +190,7 @@ unsafe fn redirect_fd(
         libc::close(write_fd);
         match std::thread::Builder::new()
             .name(format!("log-tee-{fd}"))
-            .spawn(move || mirror_loop(read_fd, console, writer))
+            .spawn(move || mirror_loop(read_fd, console, writer, echo_console))
         {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -172,9 +203,15 @@ unsafe fn redirect_fd(
     }
 }
 
-/// 镜像循环：管道 → 原终端 + 共享 [`LogWriter`]（去 ANSI、超限滚动）。
+/// 镜像循环：管道 → 原终端（`echo_console` 为 true 时）+ 共享 [`LogWriter`]
+/// （去 ANSI、超限滚动）。关终端时仍必须把管道读空，否则写端攒满 64K 后进程永久阻塞。
 #[cfg(unix)]
-fn mirror_loop(read_fd: i32, console: i32, writer: std::sync::Arc<std::sync::Mutex<LogWriter>>) {
+fn mirror_loop(
+    read_fd: i32,
+    console: i32,
+    writer: std::sync::Arc<std::sync::Mutex<LogWriter>>,
+    echo_console: bool,
+) {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
@@ -186,7 +223,9 @@ fn mirror_loop(read_fd: i32, console: i32, writer: std::sync::Arc<std::sync::Mut
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let _ = console_w.write_all(&buf[..n]);
+                if echo_console {
+                    let _ = console_w.write_all(&buf[..n]);
+                }
                 if let Ok(mut w) = writer.lock() {
                     w.write(&buf[..n]);
                 }
@@ -323,45 +362,6 @@ pub async fn log_requests(req: Request, next: Next) -> Response {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn tee_mirrors_and_rotates() {
-        // 单测试串行完成镜像与滚动断言：tee 安装会全局重定向 fd 1/2，
-        // 并行第二个安装会把先前管道误当终端（读写成环），故只装一次。
-        // 64B 小阈值：100M 下限只在 init 读 config 时套用，测试路径可绕开。
-        let dir = tempfile::tempdir().unwrap();
-        install_terminal_tee(dir.path(), 64, 3).unwrap();
-        // 直接写标准句柄：绕过 libtest 的 set_output_capture（宏级捕获到不了 fd 层）。
-        let _ = std::io::stdout().write_all(b"TEE-OUT-MARK\n");
-        let _ = std::io::stderr().write_all(b"TEE-ERR-MARK\n");
-        // 镜像线程异步落盘，轮询等待（终端侧同步可见，文件侧允许小延迟）。
-        for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let all = read_all(dir.path());
-            if all.contains("TEE-OUT-MARK") && all.contains("TEE-ERR-MARK") {
-                assert!(!all.contains("\x1b["), "ANSI codes must be stripped");
-                break;
-            }
-        }
-        // 续写跨过 64B 阈值 → 滚动出 .1.log，且总数钳在 keep=3。
-        for i in 0..30u32 {
-            let _ = std::io::stderr().write_all(format!("rot-{i:02}-0123456789\n").as_bytes());
-        }
-        for _ in 0..100 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let files: Vec<_> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            if files.iter().any(|f| f.ends_with(".1.log")) {
-                assert_eq!(files.len(), 3, "{files:?}");
-                return;
-            }
-        }
-        panic!("tee did not mirror + rotate at small threshold");
-    }
 
     #[test]
     fn effective_max_bytes_floors_at_100m() {

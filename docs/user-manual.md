@@ -17,7 +17,12 @@ cargo run -p oj -- build -d sample/src -o sample/dist
 cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
 ```
 
-启动时会打印模块清单与路由表，然后：
+启动时把模块清单与路由表写入日志（终端默认静默，见下），然后：
+
+```bash
+tail -f sample/logs/server-*.log              # 默认：日志只落盘
+# 或启动时加 --console-log / 配置 server.console_log: true 让终端也输出
+```
 
 ```bash
 curl 'http://localhost:9778/v1/api/user/account/?id=1'

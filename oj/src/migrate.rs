@@ -612,26 +612,29 @@ mod tests {
     #[test]
     fn s007_gaps_duplicates_and_dialect_mismatch() {
         let d = tmpdir("s007");
-        let mig = d.join("migrations");
+        // 每个场景用各自的目录，而不是复用 `migrations` 后删除重建：Windows 的删除
+        // 是延迟的（delete-on-close），残留句柄（索引器/杀软）会让紧随其后的重建
+        // 失败。不删就不需要等。
         // 空洞：缺 0002。
+        let mig = d.join("gap/migrations");
         write(&mig.join("0001__a.sql"), "x;");
         write(&mig.join("0003__c.sql"), "x;");
         let e = load_migrations(&mig, Dialect::Sqlite).unwrap_err();
         assert!(e.contains("S007") && e.contains("0003"), "{e}");
         // 通用文件同 seq 重复。
-        std::fs::remove_dir_all(&mig).unwrap();
+        let mig = d.join("dup/migrations");
         write(&mig.join("0001__a.sql"), "x;");
         write(&mig.join("0001__b.sql"), "x;");
         let e = load_migrations(&mig, Dialect::Sqlite).unwrap_err();
         assert!(e.contains("不一致"), "{e}");
         // 方言对 desc 不一致。
-        std::fs::remove_dir_all(&mig).unwrap();
+        let mig = d.join("dialect-pair/migrations");
         write(&mig.join("0001__a.sql"), "x;");
         write(&mig.join("0001__b.pg.sql"), "x;");
         let e = load_migrations(&mig, Dialect::Sqlite).unwrap_err();
         assert!(e.contains("S007"), "{e}");
         // 非法文件名。
-        std::fs::remove_dir_all(&mig).unwrap();
+        let mig = d.join("bad-name/migrations");
         write(&mig.join("init.sql"), "x;");
         let e = load_migrations(&mig, Dialect::Sqlite).unwrap_err();
         assert!(e.contains("文件名不合法"), "{e}");

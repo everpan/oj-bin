@@ -30,6 +30,10 @@ pub struct ServerCfg {
     pub logs_max_m: u64,
     /// 日志文件保留个数（含活动文件，超出删除；最小生效值 2）。
     pub logs_keep_files: u32,
+    /// 终端输出开关（**默认 false = 只落盘**，终端保持干净）。true → 额外回写终端
+    /// （stdout 与 stderr 一起，因为 tracing 控制台层写的是 stderr）。
+    /// CLI `--console-log` 可打开。非 unix 平台无落盘，此时强制保留终端输出。
+    pub console_log: bool,
     /// 公钥路径（PEM 格式，用于验证证书签名）
     pub public_key_path: String,
     /// 证书路径（JWS 格式，包含荷载）
@@ -60,6 +64,7 @@ impl Default for ServerCfg {
             logs_dir: None,
             logs_max_m: 100,
             logs_keep_files: 10,
+            console_log: false,
             public_key_path: "".into(),
             certificate_path: "".into(),
             grace_days: Some(30),

@@ -34,7 +34,15 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
 ./oj server -c config.yaml --api-path src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
 ```
 
-启动时打印模块清单 + 路由表，可据此核对发布是否完整。
+启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整。
+
+```bash
+tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
+./oj server -c config.yaml --api-path dist --console-log   # 终端也输出
+```
+
+日志级别另由 `RUST_LOG` 环境变量控制（如 `RUST_LOG=oj=debug`），配置里不能配。
+落盘基于 fd 重定向，**仅 unix**：Windows 上不写日志文件，终端输出强制保留并告警。
 
 ## 3. 配置管理
 

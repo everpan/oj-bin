@@ -175,8 +175,16 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(transpile_hits(), before + 1, "second call must hit cache");
         // 内容变更 → mtime 变 → 重转译。
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 不用 sleep 干等 mtime 自己跳一跳：NTFS 的 LastWriteTime 约 15.6ms 一跳，
+        // 固定 sleep 落在边界上就是 flaky。改成写完后显式把 mtime 推后，让失效
+        // 判定的输入是确定的（set_modified 必须在 write 之后，否则被 write 覆盖）。
         std::fs::write(&p, "const b: number = 2;\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(1))
+            .unwrap();
         let s3 = cached_transpile(&p).unwrap();
         assert!(s3.contains("const b"), "{s3}");
         assert_eq!(transpile_hits(), before + 2);

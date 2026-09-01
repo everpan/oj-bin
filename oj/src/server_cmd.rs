@@ -35,10 +35,14 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     // 大小滚动参数 server.logs_max_bytes / logs_keep_files。
     let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
+    // 终端输出默认关闭（只落盘）；config 的 server.console_log 或 CLI `--console-log`
+    // 任一打开即打开（「或」而非「覆盖」——两个入口都是「打开」语义，没有「关闭」的一方）。
+    let console = cfg.server.console_log || a.console_log;
     server::logging::init(
         &logs_dir,
         cfg.server.logs_max_m,
         cfg.server.logs_keep_files as usize,
+        console,
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false).await?;

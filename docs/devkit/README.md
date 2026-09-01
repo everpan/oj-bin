@@ -1,7 +1,7 @@
 # oj DevKit——TS API 开发手册 + agent skill
 
 面向用 oj 框架开发业务项目的开发者与 AI agent。本目录是发布交付物
-（`oj-v<version>.tar.gz` 内 `devkit/`），由仓库 `docs/devkit/` 经
+（`oj-v<version>-<triple>.tar.gz` / `.zip` 内 `devkit/`），由仓库 `docs/devkit/` 经
 `cargo xtask build` 归置到 `bin/devkit/` 产出。
 
 | 文件 | 用途 |
