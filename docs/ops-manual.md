@@ -102,8 +102,13 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
 - **证书 / 公钥文件**：`public_key_path` / `certificate_path` 指向的文件被覆盖即**热加载**
   （notify 事件驱动，不轮询 mtime），原子更新证书状态（valid ↔ grace ↔ expired）；重载失败
   保留旧状态并记 `warn`。这与 `config.yaml` 不同——证书轮换**无需重启**。
-- **不触发热重载**：`config.yaml`（重启生效）、`seed.sql`（仅启动重放）、`manifest.yaml` 新增/删除
-  模块（重启生效）、`node_modules` 新增包（重启生效，已加载包缓存于进程）。
+- **`ext_boot.js`（可选）**：**不热重载**，改动后必须重启进程。装配期冻结
+  `file://…?v=<mtime>` 并打印 `ext_boot: loaded <绝对路径> (<spec>)`，这行日志是核对
+  「跑的是不是改过的那份」的唯一依据（池常驻，运行期新建的 runtime 才会重新读盘，
+  故改文件不重启会出现池内新旧混杂）。
+- **不触发热重载**：`config.yaml`（重启生效）、`ext_boot.js`（重启生效，见上）、`seed.sql`
+  （仅启动重放）、`manifest.yaml` 新增/删除模块（重启生效）、`node_modules` 新增包
+  （重启生效，已加载包缓存于进程）。
 
 ## 5. 超时与资源
 
@@ -140,6 +145,12 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
 | 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
 | `redis` 数据不跨实例 | `redis.default` 未配置 → 进程内存 KV | 配真 Redis（配置即真连，多实例共享会话/KV） |
+| 启动报 `ext_boot: …` 且拒绝启动 | `ext_boot.js` 语法错/导入失败/顶层 await 抛错（启动期预热即 fail-fast） | 看报错定位；改完重启 |
+| 启动未打印 `ext_boot: loaded` 但文件已放好 | 文件不在 **config.yaml 同目录**，或名字不是 `ext_boot.js` | 挪到 config 同级；确认文件名 |
+| 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec | 重启进程 |
+| 运行期偶发 500，msg 含 `ext_boot` | boot 依赖了外部服务（抖动）或文件被删/替换 | boot 改为幂等无外部依赖；恢复文件后重启 |
+| `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数 | 加一句 `export {};` |
+| `ext_boot.js` 里 `import "ext:core/ops"` 失败 | deno_core 硬拦（`ext:` 只允许从 `ext:`/`node:` 导入），设计如此 | 用已有全局组合；要新 op 属改 bootstrap |
 | 启动报 `redis 'default': …` 连接失败 | Redis 不可达/未起，fail-fast 直接退出（不静默退回内存） | 起 Redis 或核对 URL/网络；**不想依赖 Redis 就把 `redis:` 段注释掉** |
 | 非 `default` 的 redis 键无效 | 仅 `redis.default` 被使用，其余 warn 忽略 | 核对命名；只配 `default` |
 | `bus.publish` 收不到广播 | bus 是**进程内**广播，跨实例不互通（发布与 WS 订阅须在同一实例） | 确认发布与订阅同实例；多实例跨进程广播暂不支持 |

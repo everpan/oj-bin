@@ -161,6 +161,7 @@ blob:
 ```
 <project>/
 ├── config.yaml          # 服务配置
+├── ext_boot.js          # 可选，运行时创建期加载一次（扩展全局对象，见 §9）
 ├── seed.sql             # 可选，启动时对 default 库重放
 ├── src/                 # dev 服务目录（release 用 dist/，结构相同）
 │   ├── user/            # 首层子目录 = 模块名
@@ -178,7 +179,7 @@ blob:
 │       ├── account/api.ts        # → /v1/api/order/account/
 │       ├── list/api.ts           # → /v1/api/order/list/
 │       └── detail/api.ts         # → /v1/api/order/detail/
-└── node_modules/        # 裸 specifier 解析起点（见 §7 导入）
+└── node_modules/        # 裸 specifier 解析起点（见 §8 导入）
 ```
 
 `oj build` 后的 `dist/` 结构（release 服务目录，**与 src 布局不同**）：
@@ -397,6 +398,44 @@ axum 放开 pin 后可启用。
 
 SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 
+### 扩展全局对象（ext_boot.js）
+
+上表的全局由 `bootstrap.js` 在**编译期**嵌入二进制。若要在不重编 `oj` 的前提下增补全局
+（如 `json.page()`、`log.trace`），把 `ext_boot.js` 放在 **config.yaml 同级目录**：
+存在即加载，作为 bootstrap 的运行时补充。
+
+```js
+// ext_boot.js —— 每个新 JsRuntime 创建后执行一次（不是每个请求）
+export {};
+json.page = (rows, total) => json.ok({ list: rows, total });
+globalThis.APP_ENV = "prod";
+```
+
+要点：
+
+| 项 | 行为 |
+|---|---|
+| 位置 | `<config_dir>/ext_boot.js`（config.yaml 同目录）；不存在即不加载 |
+| 执行时机 | **每新建一个 JsRuntime 执行一次**，请求复用池中的 runtime 不重跑 |
+| 模块形态 | ESM，支持顶层 `await` 与 `import` 项目内模块（解析规则同 §8 导入） |
+| 副作用范围 | boot 期写的 `json.ok` 等每请求状态随后即被重置，不会泄漏到请求 |
+| 热重载 | **不做** —— 改动后须重启进程（启动日志会打印已冻结的路径与 `?v=`） |
+| `oj build` / `oj test` | 同样加载，保证 dev / build / release 行为一致 |
+| 失败 | 启动期加载失败 → 服务拒绝启动；运行期新建 runtime 失败 → 该请求报错，服务存活 |
+
+约束（都是硬边界，不是建议）：
+
+- **必须幂等且无外部副作用**。执行次数 = 模块数 + actor 池大小 + WS 连接数（每个 WS
+  连接一个 runtime），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
+- **只能用已有全局做组合，拿不到新能力**。`import "ext:core/ops"` 会被 deno_core 拒绝
+  （`ext:` 只允许从 `ext:`/`node:` 模块导入）；需要新 op 属于改 bootstrap，不走这条路。
+- **要用顶层 `await` 就得带一句 `export {};`**（或有真实 import/export）。否则文件会被
+  CJS 启发式包进非 async 函数，顶层 `await` 直接 SyntaxError。
+- **boot 里不要做长等待**。同步死循环会在 2s 后被熔断（该 runtime 丢弃）；
+  `await` 一个永不落定的 Promise 则由引擎直接报 `Top-level await promise never resolved`。
+- 注入的全局默认可写，handler 覆盖/删除后该 runtime 内后续请求都会受影响
+  （boot 不重跑）。需要防改就用 `Object.defineProperty(..., {writable:false})`。
+
 ### 事务（db.tx）
 
 ```js
@@ -557,5 +596,7 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
 - 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
 - `.tsx`/`.mts` 不转译（直通 V8）。
+- `ext_boot.js` 用顶层 `await` 须带 `export {};`（否则被 CJS 启发式包进非 async 函数）；
+  且拿不到 `ext:core/ops`，只能在已有全局上做组合（§9「扩展全局对象」）。
 - 静态站点（`server.app_path`）无 SPA 回退（未知路径不回落 `index.html`）、无目录列表、
   无 Range/ETag/缓存头；未知扩展名按 `application/octet-stream` 下载。

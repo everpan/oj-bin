@@ -10,7 +10,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 ## 工作流
 
 1. **读章**：新项目/新模块 → 手册 §2；写 handler → §4 + §6；用鉴权/租户 → §8；
-   写测试 → §9；配置问题 → §10；构建发布 → §11。
+   写测试 → §9；配置问题 → §10；构建发布 → §11。**要扩展全局对象（`json.page()`
+   之类）→ §6 末「ext_boot.js」，不要去改 handler。**
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
@@ -51,6 +52,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |
 | es/blob 调用报错 | config 未配置 `es.endpoint` / `blob:` 段，配置即启用 |
 | WS 连上但收不到广播 | 订阅只在 WS 会话内有效（`bus.subscribe` 在 HTTP 路径报错）；release 下 URL 含版本段 |
+| 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
+| `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |
+| `ext_boot.js` 副作用被放大成百上千次 | boot 每个新建 runtime 都跑（模块数 + `pool_size` + WS 连接数）——只做全局装配，别写库/发广播/打外部接口 |
 
 ## 手册
 

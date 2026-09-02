@@ -6,9 +6,9 @@
 
 | 文件 | 用途 |
 |---|---|
-| `api-manual.md` | 完备开发手册（12 章）：模块开发、全局对象 API、鉴权租户、测试、配置、构建发布、运维、安全红线 |
+| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 末 ext_boot.js 运行时扩展）、鉴权租户、测试、配置、构建发布、运维、安全红线 |
 | `SKILL.md` | Claude Code 等 agent 的 skill 入口：工作流、红线、checklist、陷阱速查，按章节号引用手册 |
-| `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示 |
+| `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示。来源为 `sample/global.d.ts`，经 `cargo xtask build` 与本目录文档一同归置到 `bin/devkit/` |
 
 ## 安装（业务项目）
 

@@ -187,6 +187,35 @@ local 直出字节 + Content-Type，s3 302 presign。`max_upload` 双闸：axum 
 角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的——路由级
 RBAC 等真需求出现再议（YAGNI）。
 
+#### ext_boot.js — bootstrap 的运行时补充
+
+`bootstrap.js` 编译期嵌入，改它要重编二进制。`ext_boot.js` 是**运行时**补充：装配期探测
+`<config_dir>/ext_boot.js`，冻结 `versioned_specifier`（`file://…?v=<mtime>`）存进
+`StableState.boot`；`RuntimePool::checkout` 内每个**新建**的 runtime 加载执行一次
+（`boot_runtime`：side module + `mod_evaluate` + `run_event_loop`，顺序同 `run_side_driver`）。
+用户侧用法见 `docs/user-manual.md` §9；设计与评审依据见
+`docs/superpowers/specs/2026-09-02-ext-boot-design.md`。
+
+实现时必须守住的不变量（每条都对应一个已踩过或已论证的坑）：
+
+- **boot 只在 `checkout` 一处调用**——它是唯一的借出入口，「借出的 runtime 一定已 boot」
+  才有单点保证。`oj test` 不走池（直接 `JsRuntime::new`），故单独补调一次。
+- **运行期 boot 失败返回 `RunError`，绝不 panic**。actor 线程在 `block_on` 里 panic 会
+  永久杀死该 worker，pool_size 个 actor 会被逐个耗尽。
+- **启动期必须显式 `prewarm`**（`App::from_config`，建表之前）。否则 boot 错误只能借
+  dev 内省间接暴露，而 `bridge_introspector` 会把线程 panic 吞成路由 failure，装配层只
+  warn 不致命 → 「路由全空、服务照常监听」。
+- **boot 期 arm 看门狗**（`BOOT_TIMEOUT`，2s）。同步死循环不归还执行器，
+  `tokio::time::timeout` 无效，只能靠 `terminate_execution`。且 `fired` 必须先于
+  `result` 判定，否则超时被 `Core` 分支抢先、误报 500 而非 408。
+- **失败的 runtime 兜底跑一轮 `run_event_loop` 再丢弃**——未轮询完 event loop 的 isolate
+  析构会触发 V8 句柄错误（本项目有 SIGSEGV 前科，见 `runtime.rs` 头注释）。
+- **`idle.borrow_mut()` 的 `RefMut` 必须在 await 前 drop**。别指望 lint：
+  `src/lib.rs` 是 `#![allow(clippy::all)]`，CI 也没跑 clippy。
+- **boot 拿不到 `ext:` 模块**：deno_core 在 loader resolve 之后还有
+  `validate_ext_module_import` 一道闸（`file://` referrer 永远过不去）。别去放行
+  `resolve_inner` 的 `ext` scheme——那对全部 handler 生效，且放行也无效。
+
 ### 4.4 kv.rs / bus.rs / es.rs — 外部状态与广播（OJ-6）
 
 - `kv.rs`：`KVStore` trait（get/set/del/expire/incr）双实现。**内置兜底** `InMemoryKV`

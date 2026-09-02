@@ -2,6 +2,11 @@
 //
 // 下面为 src/bridge/bootstrap.js 在运行时注入的全局对象提供类型声明，
 // 使 sample/src 中的业务代码在编辑器内不报 TS 错误。
+//
+// ext_boot.js（config.yaml 同目录，可选）在运行时补充的全局**不在本文件声明** ——
+// 它们是项目自定义的，框架无法预知。用 ext_boot.js 增补了全局（如 `json.page()`）后，
+// 在业务项目里另建一个 .d.ts 自行声明（并加进 tsconfig 的 include），否则编辑器报
+// TS2339 "Property 'page' does not exist"。运行时不受影响——类型只影响编辑器与 tsc。
 
 // JSON 反序列化后可能出现的值（SQL 行 / KV / fetch body 等）。
 type Json = string | number | boolean | null | Json[] | { [k: string]: Json };

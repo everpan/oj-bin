@@ -113,6 +113,25 @@ HTTP 客户端为单个共享 reqwest Client（连接池复用），`no_proxy`�
 finish(); // 等价于 json.ok/fail 的 SignalDone 语义，但不写响应
 ```
 
+### ext_boot.js —— 上面各全局的运行时补充
+
+上表全局由 `bootstrap.js` 编译期装配（改它要重编二进制）。`ext_boot.js` 是运行时补充：
+`<config_dir>/ext_boot.js` 存在即被每个**新建**的 JsRuntime 加载执行一次（ESM，支持顶层
+`await` 与 import 项目内模块），可在已有全局上做组合增补。
+
+```js
+// ext_boot.js
+export {};
+json.page = (rows, total) => json.ok({ list: rows, total });
+```
+
+三条硬边界：必须幂等（执行次数 = 模块数 + actor 池大小 + WS 连接数）；拿不到
+`ext:core/ops`（deno_core 拒绝 `file://` → `ext:` 导入），需要新 op 属改 bootstrap；
+用顶层 `await` 须带 `export {};`，否则被 CJS 启发式包进非 async 函数。
+
+完整用法与约束见 `docs/user-manual.md` §9「扩展全局对象」，设计与评审依据见
+`docs/superpowers/specs/2026-09-02-ext-boot-design.md`。
+
 ## Rust API
 
 ```rust

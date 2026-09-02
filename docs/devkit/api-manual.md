@@ -128,6 +128,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 ```
 <project>/
 ├── config.yaml          # 服务配置（第 10 章）
+├── ext_boot.js          # 可选，运行时创建期加载一次（扩展全局对象，§6 末）
 ├── seed.sql             # 可选，启动时对 default 库重放
 ├── src/                 # dev 服务目录（release 用 dist/，见第 11 章）
 │   ├── user/            # 首层子目录 = 模块名
@@ -652,6 +653,43 @@ if (r.ok) {
 json.ok(plugins());
 ```
 
+### ext_boot.js —— 运行时补充全局对象
+
+上表全局由 `bootstrap.js` 在**编译期**装配，改它要重编 `oj`。`ext_boot.js` 是运行时补充：
+放在 **config.yaml 同级目录**即被加载，可在已有全局上做组合增补（如 `json.page()`、
+`log.trace`），不重编二进制。
+
+```js
+// ext_boot.js —— 每个新建的 JsRuntime 执行一次（不是每个请求）
+export {};
+json.page = (rows, total) => json.ok({ list: rows, total });
+globalThis.APP_ENV = "prod";
+```
+
+| 项 | 行为 |
+|---|---|
+| 位置 | `<config_dir>/ext_boot.js`（config.yaml 同目录）；不存在即不加载 |
+| 执行时机 | **每新建一个 JsRuntime 执行一次**；请求复用池中的 runtime 不重跑 |
+| 模块形态 | ESM，支持顶层 `await` 与 `import` 项目内模块（解析规则同第 5 章） |
+| 副作用范围 | boot 期写的 `json.ok` 等每请求状态随后即被重置，不会泄漏到请求 |
+| 热重载 | **不做**——改动后须重启进程（启动日志打印已冻结的路径与 `?v=`） |
+| `oj build` / `oj test` | 同样加载，保证 dev / build / release 行为一致 |
+| 失败 | 启动期失败 → 服务拒绝启动；运行期新建 runtime 失败 → 该请求报错、服务存活 |
+
+四条硬边界（不是建议）：
+
+- **必须幂等且无外部副作用**。执行次数 = 模块数 + `pool_size` + WS 连接数（每个 WS 连接
+  一个 runtime），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
+- **只能组合已有全局，拿不到新能力**。`import "ext:core/ops"` 会被 deno_core 拒绝
+  （`ext:` 只允许从 `ext:`/`node:` 模块导入）；需要新 op 属于改 bootstrap，不走这条路。
+- **用顶层 `await` 必须带一句 `export {};`**（或有真实 import/export）。否则文件被 CJS
+  启发式（§5 CJS 互操作）判定为 CJS、包进非 async 函数，顶层 `await` 直接 SyntaxError。
+- **boot 里不做长等待**。同步死循环 2s 后被熔断（该 runtime 丢弃）；
+  `await` 永不落定的 Promise 由引擎直接报 `Top-level await promise never resolved`。
+
+注入的全局默认可写，handler 覆盖/删除后该 runtime 内后续请求都受影响（boot 不重跑）。
+需要防改就用 `Object.defineProperty(..., {writable: false, configurable: false})`。
+
 ## 7. 响应信封与错误码
 
 > 何时读我：设计错误返回或排查非 200 时。
@@ -1020,6 +1058,7 @@ broker:
 | `server.app_path` 目录不存在 | 启动报错退出 |
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
+| `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
 
 ## 11. 构建与发布
 
@@ -1124,6 +1163,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365
 | `manifest.yaml` 新增/删除模块 | 否（重启生效） |
 | schema.yaml / migrations 变更 | 否（重启或 oj migrate 生效；dev auto 在下次启动收敛） |
 | `node_modules` 新增包 | 否（已加载包缓存于进程，重启生效） |
+| `ext_boot.js` | **否**——装配期冻结 `file://…?v=<mtime>`，改了必须重启。启动日志会打印 `ext_boot: loaded <绝对路径> (<spec>)`，这是核对「跑的是不是改过的那份」的唯一依据 |
 
 ### 超时与资源
 
@@ -1169,6 +1209,12 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | 启动报 M004 / 迁移账本落后 | release verify 门禁：有迁移未应用 | 先 `oj migrate -c config.yaml -d dist` 再启动 |
 | 500 报跨模块表访问被拒 | `ownership_guard: deny` 且未声明 deps | manifest 补 `deps:`；或临时 SQL 注释 `/* oj:allow-table=x */` |
 | `oj schema diff` exit 1 | 声明与实库漂移（D001/D002） | 按输出对齐 schema.yaml 或补迁移；存量库用 `oj migrate --baseline` |
+| 启动报 `ext_boot: …` 并拒启 | ext_boot.js 语法错/导入失败/顶层 await 抛错 | 看报错定位；改完重启 |
+| 启动没打印 `ext_boot: loaded` | 文件不在 config.yaml 同目录，或文件名不是 `ext_boot.js` | 挪到 config 同级；核对文件名 |
+| 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec | 重启进程 |
+| `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数 | 加一句 `export {};` |
+| `ext_boot.js` 里 `import "ext:core/ops"` 失败 | deno_core 硬拦，设计如此 | 用已有全局组合；要新 op 属改 bootstrap |
+| 运行期偶发 500 且 msg 含 `ext_boot` | boot 依赖外部服务抖动，或文件被删/替换 | boot 改为幂等无外部依赖；恢复文件后重启 |
 
 完整排障表见 `docs/ops-manual.md` §7。
 
@@ -1235,6 +1281,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
+| `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
+| `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |
+| `ext_boot.js` 不做热重载 | 装配期冻结 spec，改动必须重启；池内可能新旧混杂 |
 
 ### 常见陷阱清单
 
@@ -1249,3 +1298,6 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - `redis.default` 配置即真连且 fail-fast——CI/离线环境注释掉该段即用内存 KV。
 - 每请求至多一个 `db.tx`；漏 await 会在请求结束时自动回滚并打 warn。
 - `beforeEach` 是单一全局钩子，跨 `describe` 被覆盖——多 describe 文件在各 `it` 内联准备。
+- `ext_boot.js` 里别写库/发广播/打外部接口——执行次数是「模块数 + `pool_size` + WS 连接数」，
+  副作用按此放大；boot 只做全局装配。
+- `ext_boot.js` 顶层 `await` 忘了 `export {};` → 看起来莫名的 SyntaxError（CJS 启发式误判）。
