@@ -65,6 +65,8 @@ pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
 pub use named_registry::NamedRegistry;
 pub use plugin_loader::PluginInfo;
 pub use registry::SchemaRegistry;
+// boot_runtime 供 oj 的 test 运行时复用（`oj test` 不走 RuntimePool，直接建 JsRuntime）。
+pub use runtime::{BOOT_TIMEOUT, boot_runtime};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -113,6 +115,9 @@ pub struct StableState {
     pub ownership_deny: bool,
     /// 裸 SQL 表名提取 memo（守卫热路径缓存；键 = SQL 原文）。
     pub sql_memo: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
+    /// 每个新 JsRuntime 创建后加载执行一次（见 `runtime::RuntimePool::checkout`）。
+    pub boot: Option<String>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -130,6 +135,8 @@ pub struct Extras {
     pub modules: Arc<HashMap<String, ModuleCtx>>,
     /// 表归属守卫 deny 模式（缺省 false = warn）。
     pub ownership_deny: bool,
+    /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
+    pub boot: Option<String>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -310,14 +317,17 @@ impl Bridge {
             plugins: extras.plugins,
             modules: extras.modules,
             ownership_deny: extras.ownership_deny,
+            boot: extras.boot,
             sql_memo: Mutex::new(HashMap::new()),
         });
-        let pool = runtime::RuntimePool::new(stable.clone(), inspect);
+        // KillSwitch 先于池构造：池在 boot 期要 arm 它（TLA 死循环的唯一兜底）。
+        let kill = runtime::KillSwitch::spawn();
+        let pool = runtime::RuntimePool::new(stable.clone(), inspect, kill.clone());
         Self {
             pool,
             handlers: HandlerStore::from_env(),
             inspect,
-            kill: runtime::KillSwitch::spawn(),
+            kill,
         }
     }
 
@@ -340,7 +350,11 @@ impl Bridge {
 
     /// 带请求上下文执行。
     pub async fn run_with(&self, source: &str, req: RequestInfo) -> Result<Capture, CoreError> {
-        let mut rt = self.checkout_reset(req, None);
+        // boot 失败（含超时）→ CoreError：run_with 无超时语义，不引入 RunError。
+        let mut rt = match self.checkout_reset(req, None).await {
+            Ok(rt) => rt,
+            Err(e) => return Err(CoreError::from(std::io::Error::other(e.to_string()))),
+        };
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         // 仅成功执行（已轮询 event loop）的 runtime 才归还；失败的可能 isolate 损坏，直接丢弃。
         match result {
@@ -357,8 +371,14 @@ impl Bridge {
     // ----- 执行管道复用辅助 -----
 
     /// 借出 runtime 并重置 per-request 状态（不武装看门狗）。
-    fn checkout_reset(&self, req: RequestInfo, module: Option<&str>) -> JsRuntime {
-        let rt = self.pool.checkout();
+    /// boot 失败 → `RunError`（绝不 panic：调用方可能在 actor 请求线程上，panic 会
+    /// 永久杀死该 worker）。
+    async fn checkout_reset(
+        &self,
+        req: RequestInfo,
+        module: Option<&str>,
+    ) -> Result<JsRuntime, RunError> {
+        let rt = self.pool.checkout().await?;
         {
             let op_state = runtime::op_state(&rt);
             let mut g = op_state.borrow_mut();
@@ -366,22 +386,45 @@ impl Bridge {
             rs.reset(req);
             rs.module = module.map(|s| s.to_string());
         }
-        rt
+        Ok(rt)
     }
 
     /// 借出 runtime、重置状态并武装看门狗（KillSwitch）。
     /// 用 v8::IsolateHandle（Send+Sync 跨线程句柄）而非裸指针：OwnedIsolate 包装地址 ≠ 真实
     /// isolate 指针，手转裸指针再跨线程 terminate 会解引用垃圾地址（SIGSEGV）。
-    fn checkout_armed(
+    async fn checkout_armed(
         &self,
         req: RequestInfo,
         timeout: std::time::Duration,
         module: Option<&str>,
-    ) -> JsRuntime {
-        let mut rt = self.checkout_reset(req, module);
+    ) -> Result<JsRuntime, RunError> {
+        let mut rt = self.checkout_reset(req, module).await?;
         let handle = rt.v8_isolate().thread_safe_handle();
         self.kill.arm(handle, timeout);
-        rt
+        Ok(rt)
+    }
+
+    /// 启动期预热：借出一个 runtime（从而跑完 ext_boot）并归还，失败返回 `Err`。
+    ///
+    /// 用途：把 boot 的错误前移到装配期。**必须显式调用** —— 运行期首次 checkout 才 boot，
+    /// 若只依赖启动期内省的间接失败，线程 panic 会被 `routes::bridge_introspector` 的
+    /// `join()` 吞成路由 failure，而路由 failure 在装配层只 warn 不致命（路由全空、服务照常监听）。
+    pub async fn prewarm(&self) -> Result<(), RunError> {
+        let rt = self.checkout_reset(RequestInfo::default(), None).await?;
+        self.pool.checkin(rt);
+        Ok(())
+    }
+
+    /// 取 inspector 句柄（`inspect=true` 构造时有效；否则 None）：借出一个 runtime（已完成
+    /// boot）取句柄后立即归还。
+    pub async fn inspector(&self) -> Option<Rc<deno_core::JsRuntimeInspector>> {
+        if !self.inspect {
+            return None;
+        }
+        let rt = self.pool.checkout().await.ok()?;
+        let insp = rt.inspector();
+        self.pool.checkin(rt);
+        Some(insp)
     }
 
     /// 请求收尾：未完结的活跃事务保底回滚（checkin 前调用；错误吞掉只告警，
@@ -447,7 +490,7 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<WsOutcome, RunError> {
-        let mut rt = self.checkout_armed(req, timeout, None);
+        let mut rt = self.checkout_armed(req, timeout, None).await?;
         let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
         if self.kill.disarm() {
             // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
@@ -571,7 +614,7 @@ impl Bridge {
             .map_err(|e| {
             RunError::Core(CoreError::from(std::io::Error::other(e.to_string())))
         })?;
-        let mut rt = self.checkout_armed(req, timeout, module);
+        let mut rt = self.checkout_armed(req, timeout, module).await?;
         // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
         // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
         // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
@@ -627,15 +670,17 @@ impl std::fmt::Display for RunError {
 
 /// 启动 DevTools inspector：借一个 runtime 取其 inspector 句柄并起 WS 服务。
 /// 仅当 `inspect=true` 构造时有效；addr 形如 `127.0.0.1:9229`。
-pub fn start_inspector(bridge: &Bridge, addr: std::net::SocketAddr) -> tokio::task::JoinHandle<()> {
-    if !bridge.inspect {
-        tracing::warn!(target: "inspector", "inspector not enabled at construction");
-        return tokio::task::spawn_local(async {});
+pub async fn start_inspector(
+    bridge: &Bridge,
+    addr: std::net::SocketAddr,
+) -> tokio::task::JoinHandle<()> {
+    match bridge.inspector().await {
+        Some(insp) => inspector::spawn(insp, addr),
+        None => {
+            tracing::warn!(target: "inspector", "inspector not enabled at construction");
+            tokio::task::spawn_local(async {})
+        }
     }
-    let rt = bridge.pool.checkout();
-    let insp = rt.inspector();
-    runtime::RuntimePool::checkin(&bridge.pool, rt);
-    inspector::spawn(insp, addr)
 }
 
 // run_module 系测试持 TRANSPILE_TEST_LOCK 跨 await（current_thread 单线程，安全）。
@@ -1173,10 +1218,13 @@ mod tests {
             plugins: Vec::new(),
             modules: Arc::new(HashMap::new()),
             ownership_deny: false,
+            boot: None,
             sql_memo: Mutex::new(HashMap::new()),
         });
-        let pool = runtime::RuntimePool::new(stable, false);
-        let mut rt = pool.checkout();
+        // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
+        let pool =
+            runtime::RuntimePool::new(stable, false, Arc::new(runtime::KillSwitch::default()));
+        let mut rt = pool.checkout().await.unwrap();
         let referrer = root.join("src/handler.js");
         let src = format!(
             r#"const c = __ojRequire("cjspkg", {referrer:?}); json.ok({{ n: c.n, dep: c.dep }});"#
@@ -1573,5 +1621,227 @@ mod tests {
         assert_eq!(v["code"], 0, "{v}");
         // 字面 "default" 被重定向到绑定的 analytics 库。
         assert_eq!(v["data"]["viaDefault"], "analytics", "{v}");
+    }
+
+    // ===== ext_boot（v2）=====
+
+    /// 造带 ext_boot 的 Bridge：`files` 写入临时项目根，boot spec 由
+    /// `versioned_specifier` 冻结（同装配期）。返回 (Bridge, 项目根, 共享 KV)。
+    fn boot_fx(files: &[(&str, &str)]) -> (Bridge, std::path::PathBuf, Arc<InMemoryKV>) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "oj-boot-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        for (rel, content) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        let boot = Some(
+            module_loader::versioned_specifier(&root.join("ext_boot.js"))
+                .unwrap()
+                .to_string(),
+        );
+        let kv = Arc::new(InMemoryKV::new());
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            kv.clone(),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                boot,
+                ..Default::default()
+            },
+        );
+        (b, root, kv)
+    }
+
+    /// boot 设置全局 → handler 可见。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_sets_global_visible_to_handler() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "globalThis.foo = 1;\n")]);
+        let cap = b
+            .run_with(
+                r#"json.ok({ foo: globalThis.foo });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["foo"], 1, "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// boot import 项目内模块（走 OjModuleLoader：相对导入 + 扩展名补全）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_imports_project_module() {
+        let _t = transpile_serial();
+        let (b, root, _kv) = boot_fx(&[
+            (
+                "ext_boot.js",
+                "import { tag } from \"./shared/util\";\nglobalThis.tag = tag;\n",
+            ),
+            ("shared/util.ts", "export const tag: string = \"booted\";\n"),
+        ]);
+        let cap = b
+            .run_with(
+                r#"json.ok({ tag: globalThis.tag });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["tag"], "booted", "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 每 runtime 一次、不每请求一次：跨 runtime 共享的 KV 计数在复用空闲池时不再增长。
+    /// （模块级 `let` 是 per-isolate 的，区分不了「没重跑」与「重跑了但重置」。）
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_runs_once_per_runtime_not_per_request() {
+        // `export {};` 是 ESM 标记：无 import/export 的 boot 会被 `looks_cjs` 判为 CJS
+        // 并包进非 async 函数 → 顶层 await 直接 SyntaxError（见设计文档 D-9）。
+        let (b, root, kv) = boot_fx(&[(
+            "ext_boot.js",
+            "export {};\nawait kv.incr(\"boot_n\");\nglobalThis.foo = 1;\n",
+        )]);
+        b.run_with(r#"json.ok(1);"#, RequestInfo::default())
+            .await
+            .unwrap();
+        assert_eq!(kv.get("boot_n").await.unwrap().as_deref(), Some("1"));
+        // 第二次请求命中空闲池（同一 runtime）→ 不重跑 boot。
+        b.run_with(r#"json.ok(2);"#, RequestInfo::default())
+            .await
+            .unwrap();
+        assert_eq!(kv.get("boot_n").await.unwrap().as_deref(), Some("1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// boot 执行于 ReqState.reset 之前：boot 期误调 json.ok 写入的是随后被重置的状态。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_envelope_write_is_reset() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "json.ok({ from: \"boot\" });\n")]);
+        let cap = b
+            .run_with(r#"json.ok({ from: "handler" });"#, RequestInfo::default())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["from"], "handler", "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// boot 失败 → Err 而非 panic，且 Bridge 仍可用（运行期在 actor 线程上，panic 会杀死 worker）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_failure_is_err_not_panic() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "this is not javascript(((\n")]);
+        let e = b
+            .run_with(r#"json.ok(1);"#, RequestInfo::default())
+            .await
+            .unwrap_err();
+        assert!(!e.to_string().is_empty(), "{e}");
+        // 进程存活：修好文件后新的 runtime 能起来（boot 每次新建 runtime 都重跑）。
+        std::fs::write(root.join("ext_boot.js"), "globalThis.foo = 7;\n").unwrap();
+        let cap = b
+            .run_with(
+                r#"json.ok({ foo: globalThis.foo });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["foo"], 7, "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// boot 顶层死循环：KillSwitch 兜底 → Timeout，不永久挂起。
+    /// （`tokio::time::timeout` 在此无效：isolate 不归还执行器，只能 terminate_execution。
+    /// 相对的，`await new Promise(()=>{})` 这类「永不到达」的 TLA 由 deno_core 在事件循环
+    /// 排空时立即报 "Top-level await promise never resolved"，并不挂起。）
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_infinite_loop_yields_timeout() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "export {};\nwhile (true) {}\n")]);
+        let e = b
+            .run_with_timeout(
+                r#"json.ok(1);"#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, RunError::Timeout), "{e:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 运行期 ext_boot.js 被删：装配期冻结的是 spec，`load` 阶段才读盘 → 报错而非 panic。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_file_removed_at_runtime_yields_error() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "globalThis.foo = 1;\n")]);
+        std::fs::remove_file(root.join("ext_boot.js")).unwrap();
+        let e = b
+            .run_with(r#"json.ok(1);"#, RequestInfo::default())
+            .await
+            .unwrap_err();
+        assert!(!e.to_string().is_empty(), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CJS 写法的 boot 无全局副作用（`looks_cjs` 启发式把它包装成 ESM，
+    /// `module.exports` 变成 default 导出）—— 记录行为，防「配了却静默没生效」。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cjs_boot_has_no_global_effect() {
+        let (b, root, _kv) = boot_fx(&[("ext_boot.js", "module.exports = { foo: 1 };\n")]);
+        let cap = b
+            .run_with(
+                r#"json.ok({ foo: globalThis.foo === undefined ? null : globalThis.foo });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["foo"], Value::Null, "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归锁：ext_boot **拿不到** `ext:core/ops`。
+    /// deno_core 在 loader resolve 之后还有 `validate_ext_module_import` 一道闸，
+    /// `file://` referrer 永远过不去 —— 别再尝试放行 `ext:` scheme（放行也无效，
+    /// 反而会给所有 handler 开一条宽松分支）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_cannot_import_ext_core_ops() {
+        let (b, root, _kv) = boot_fx(&[(
+            "ext_boot.js",
+            "await import(\"ext:core/ops\");\nglobalThis.foo = 1;\n",
+        )]);
+        let e = b
+            .run_with(r#"json.ok(1);"#, RequestInfo::default())
+            .await
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("ext:") || msg.contains("unsupported scheme"),
+            "expected deno_core to reject the ext: import, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 无 boot（现网默认）：`Extras::default()` 行为零变化。
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_boot_is_noop() {
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"json.ok({ foo: globalThis.foo === undefined ? null : globalThis.foo });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["foo"], Value::Null, "{v}");
     }
 }

@@ -120,6 +120,13 @@ async fn run_on_runtime(
     rt.op_state()
         .borrow_mut()
         .put(Arc::new(app) as Arc<dyn ClientTransport>);
+    // ext_boot：`oj test` 不走 RuntimePool（直接建 JsRuntime），故在此补跑一次，
+    // 否则 *.test.ts 看不到 boot 注入的全局，与生产行为分叉。
+    if let Some(spec) = stable.boot.as_deref() {
+        only_js::bridge::boot_runtime(&mut rt, spec)
+            .await
+            .map_err(|e| format!("ext_boot: {e}"))?;
+    }
 
     // 逐个加载 *.test.ts（side esm），执行其顶层 describe/it 完成用例注册。
     let mut seq: u64 = 0;

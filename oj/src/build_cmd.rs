@@ -213,6 +213,8 @@ async fn introspect_module_files(
     files: &[(PathBuf, bool)],
 ) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
     let root = src.parent().unwrap_or(src).to_path_buf();
+    // ext_boot：与 dev 同源探测（src 父目录 = 项目根），保证 dev/build/release 三处一致。
+    let boot = crate::app::ext_boot_spec(&root)?;
     let mut dbs: HashMap<String, Arc<dyn only_js::bridge::DataAccessor>> = HashMap::new();
     dbs.insert(
         "default".into(),
@@ -233,7 +235,10 @@ async fn introspect_module_files(
                     project_root: root.clone(),
                     ts: true,
                 })),
-                Extras::default(),
+                Extras {
+                    boot: boot.clone(),
+                    ..Default::default()
+                },
             )
         }
     };

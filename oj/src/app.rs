@@ -62,6 +62,37 @@ pub struct App {
 /// dispatch 外层超时（handler 死循环 KillSwitch 兜底 server.timeout，这里再兜底测试 task）。
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 探测 `<dir>/ext_boot.js`：不存在 → None（静默）；存在但 stat/canonicalize 失败 → Err（fail-fast）。
+/// 命中时冻结 `?v=<mtime>` 并打印绝对路径 —— 改动后须重启进程，这行日志是唯一的核对依据。
+pub fn ext_boot_spec(dir: &Path) -> Result<Option<String>, String> {
+    let p = dir.join("ext_boot.js");
+    if !p.is_file() {
+        return Ok(None);
+    }
+    let spec = only_js::bridge::versioned_specifier(&p).map_err(|e| format!("ext_boot.js: {e}"))?;
+    eprintln!("ext_boot: loaded {} ({spec})", p.display());
+    Ok(Some(spec.to_string()))
+}
+
+/// 启动期预热 boot：建一个 runtime 跑完 ext_boot，失败即 `Err`。
+/// 与 `routes::bridge_introspector` 同构（独立线程 + current_thread runtime）——`Bridge`
+/// 是 `!Send`，而 `App::from_config` 跑在 multi_thread 主 runtime 上（future 须 Send），
+/// 不可在其中直接 await bridge。
+fn prewarm_boot(make_bridge: impl Fn() -> Bridge + Send + Sync + 'static) -> Result<(), String> {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("prewarm runtime");
+        let b = make_bridge();
+        rt.block_on(async { b.prewarm().await })
+            .map_err(|e| format!("ext_boot: {e}"))
+    })
+    .join()
+    .unwrap_or_else(|_| Err("ext_boot: prewarm thread panicked".to_string()))
+    .map_err(|e| format!("{e} (edit ext_boot.js, then restart the process)"))
+}
+
 impl App {
     /// 装配并构造（原 `start` 逻辑搬入）。唯一构造一处 `StableState`，同时被 actor 工厂与
     /// 测试运行时引用，保证 db/bus/kv 跨家族为同一组 Arc（修正 #2）。
@@ -93,6 +124,9 @@ impl App {
                 .unwrap_or_else(|_| config_dir.to_path_buf()),
             ts,
         });
+        // ext_boot：运行时创建期加载一次（bootstrap 的动态补充）。
+        // specifier 在此冻结 `?v=<mtime>`：改文件须重启进程（池常驻，不做热重载）。
+        let boot = ext_boot_spec(config_dir)?;
         // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
         let mut registries = Registries::default();
         let _plugins = assemble_plugins(&cfg, config_dir, &mut registries)
@@ -231,6 +265,8 @@ impl App {
             let blobs = blobs.clone();
             let (registry, modules, ownership_deny) =
                 (registry.clone(), modules.clone(), ownership_deny);
+            // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
+            let boot = boot.clone();
             move || {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -245,10 +281,18 @@ impl App {
                         plugins: Vec::new(),
                         modules: modules.clone(),
                         ownership_deny,
+                        boot: boot.clone(),
                     },
                 )
             }
         };
+        // ext_boot 预热：建 runtime 并跑完 boot，失败即 `Err`（真·启动失败）。
+        // 必须前移到建表之前 —— 否则 boot 错误只能借 dev 内省的间接失败暴露，而
+        // `bridge_introspector` 会把线程 panic 吞成路由 failure（装配层只 warn 不致命，
+        // 结果「路由全空、服务照常监听」）。
+        if boot.is_some() {
+            prewarm_boot(make_bridge.clone())?;
+        }
         // 路由表：dev 启动内省 .route 声明；release 聚合 dist/manifests.yaml。
         let (table, failures) = if ts {
             for m in manifest::load_modules(&dir)? {
@@ -421,6 +465,7 @@ impl App {
             plugins: Vec::new(),
             modules,
             ownership_deny,
+            boot: boot.clone(),
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {
@@ -479,5 +524,27 @@ impl ClientTransport for App {
     }
     fn base(&self) -> &str {
         App::base(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 无 ext_boot.js（现网默认）→ None（静默）；存在 → 冻结 `?v=<mtime>`。
+    #[test]
+    fn ext_boot_spec_absent_vs_present() {
+        let dir = std::env::temp_dir().join(format!("oj-bootspec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(ext_boot_spec(&dir).unwrap().is_none());
+
+        let p = dir.join("ext_boot.js");
+        std::fs::write(&p, "globalThis.foo = 1;\n").unwrap();
+        let spec = ext_boot_spec(&dir).unwrap().unwrap();
+        assert!(spec.starts_with("file://"), "{spec}");
+        assert!(spec.contains("?v="), "{spec}");
+        assert!(spec.contains("ext_boot.js"), "{spec}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
