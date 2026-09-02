@@ -94,7 +94,7 @@ fn to_qv(v: &Value) -> Qv {
             if let Some(i) = n.as_i64() {
                 Qv::BigInt(Some(i))
             } else if let Some(f) = n.as_f64() {
-                Qv::Float(Some(f as f32))
+                Qv::Double(Some(f))
             } else {
                 Qv::String(None)
             }

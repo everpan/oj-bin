@@ -299,7 +299,7 @@ impl Bridge {
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
-                .unwrap_or_default(),
+                .expect("build reqwest client"),
             registry: Arc::new(registry),
             loader,
             blobs: extras
