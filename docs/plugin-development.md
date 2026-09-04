@@ -29,14 +29,19 @@ FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装�
 | `FfiFuture` | `{ state, poll, take, free }` 异步句柄（见 §4） |
 | `HostContext` | 宿主回调集：`log(level, msg)`、`deliver(topic, payload)` |
 | `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, register }` |
-| `PluginRegistrations` | 各轴 vtable 槽位：`es / db / blob / bus / kv`（未提供 = null） |
+| `PluginRegistrations` | 各轴 vtable 槽位：`es / db / blob / bus / kv / auth`（未提供 = null） |
 
-各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv}.rs`。方法签名形态：
+各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
 同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
+
+**auth 轴特例**（`AuthGuardVtable`，唯一同步轴，不返回 `FfiFuture`）：`verify(path_no_base,
+authorization) -> RResult<RString, RString>`，ok 值 JSON `null` = 匿名路径放行、对象 =
+注入 `http.user`（`{"id","roles","claims"}`），Err = 401 消息。请求级热路径，参考第一方
+`plugins/oj-auth`。
 
 ## 3. ABI_VERSION 纪律
 
-- `ABI_VERSION` 当前 **5**。任何 `repr(C)` 类型字段变更（加槽位、改签名、增 HostContext
+- `ABI_VERSION` 当前 **6**。任何 `repr(C)` 类型字段变更（加槽位、改签名、增 HostContext
   回调）= **必须 bump**。向后兼容配置演进走 **cfg JSON 字段**（新增可选键不 bump）。
 - 宿主严格 `plugin_abi == ABI_VERSION` 才加载；不相等 → `plugin ABI mismatch: plugin=N host=M`。
 - 插件构建须对当前 `oj-plugin-ffi` 版本；升级宿主与插件顺序：**先升插件到新 ABI 并验证，
@@ -114,7 +119,8 @@ fn descriptor() -> PluginDescriptor {
 // register() 返回各轴 vtable 槽位（无 = null）
 extern "C" fn register() -> PluginRegistrations {
     PluginRegistrations { es: std::ptr::null(), db: &VTABLE, blob: std::ptr::null(),
-                          bus: std::ptr::null(), kv: std::ptr::null() }
+                          bus: std::ptr::null(), kv: std::ptr::null(),
+                          auth: std::ptr::null() }
 }
 
 oj_plugin_ffi::oj_plugin_entry!(init);
@@ -164,5 +170,6 @@ xtask 也不是发行产物（`bin/` 只放 oj + 插件），排除不影响其�
 | `oj-blob-s3` | blob | object_store aws | core `bridge/blob.rs` S3Blob |
 | `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
 | `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
+| `oj-auth` | auth | jsonwebtoken | core `bridge/auth.rs`（守卫；auth 端点已 JS 化） |
 
 > 所有第一方插件源码统一位于 `plugins/`；构建产物（cdylib）归置 `bin/plugins/<triple>/`，由 `.gitignore` 忽略。

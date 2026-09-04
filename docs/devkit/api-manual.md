@@ -722,27 +722,36 @@ globalThis.APP_ENV = "prod";
 
 > 何时读我：接口要登录态或多租户隔离时。
 
-### auth：块存在即启用（两层能力）
+### auth：块存在即启用（oj-auth 守卫 + JS 端点）
 
-config `auth:` 段存在即同时启用：**内置路由** + **Bearer 守卫**。
+config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插件在前置管线完成）与
+**`jwt` / `bcrypt` 全局注入**（供 JS 侧实现登录端点）。`jwt_secret` 配了却为空串 →
+启动 fail-fast（不静默跳过）。
 
-**内置路由**（`{base}/auth/*`，POST only，不占业务模块名空间）：
+**auth 端点是业务路由，不是内置路由**：`login` / `refresh` / `logout` 由普通 JS 模块实现
+（sample 提供参考实现 `sample/src/auth/`，目录镜像路由 `POST /auth/login|refresh|logout`）：
+`db` 查用户表、`bcrypt.verify` 校验密码、`jwt.sign` 签发 access token，refresh 为不透明
+随机串 + KV session（轮换）。框架不内置这些路由——业务可整模块替换或改名。
 
-| 路由 | 请求体 | 响应 data |
+| 端点（sample/src/auth/） | 请求体 | 响应 data |
 |---|---|---|
 | `POST /auth/login` | `{"username","password"}` | `{"access_token","refresh_token","expires_in"(秒),"user":{"id","roles"}}` |
 | `POST /auth/refresh` | `{"refresh_token"}` | 同上（**轮换**：旧 refresh 立即失效） |
 | `POST /auth/logout` | `{"refresh_token"}` | `null`（删 refresh session；access 到期前仍有效） |
 
-**Bearer 守卫**：`{base}` 内非匿名路径必须带 `Authorization: Bearer <access_token>`
-（缺失 / 验签失败 / 过期 → 401）。通过后 handler 里读 `http.user`
-（`{id, roles, claims}`）。登录失败统一报 `invalid credentials`（不区分用户不存在/密码错）。
+因为是普通业务路由，这三个路径**必须在 `auth.anonymous_paths` 里显式匿名**，否则会被
+自己的 Bearer 守卫拦成 401。
+
+**Bearer 守卫**：路由表命中后、进 handler 前，oj-auth 插件对非匿名路径验签
+`Authorization: Bearer <access_token>`（缺失 / 验签失败 / 过期 → 401）。通过后 handler 里读
+`http.user`（`{id, roles, claims}`）。登录失败统一报 `invalid credentials`（不区分用户
+不存在/密码错）。
 
 **匿名路径** `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，尾 `/*` 为**一层**通配
-（`/pub/*` 命中 `/pub/x` 但不命中 `/pub`）。`{base}` 之外的路径（静态站点、`/auth/*` 内置路由）
-不设防。
+（`/pub/*` 命中 `/pub/x` 但不命中 `/pub`）。`{base}` 之外的路径（静态站点）不设防。
 
-**用户表** `auth.user_table`（默认 `users`）最小 schema：
+**用户表是业务约定，没有配置项**：框架不管用户表（不存在 `auth.user_table`），JS 端点
+按约定查询 `users` 表（`_platform` 伪模块持有归属），最小 schema：
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -836,7 +845,7 @@ describe("user account", () => {
 | API | 说明 |
 |---|---|
 | `client.get/post/put/del/patch/head/options(path, opts?)` | 进程内派发；`opts = { headers?, body? }`，返回 `ClientResp { status, headers, body, upgrade }`；`path` 相对 base（如 `"/user/account"`） |
-| `client.login(username, password)` | POST 内置 `/auth/login` → 返回 `access_token`（失败抛错；自身无需认证头） |
+| `client.login(username, password, headers?)` | POST 业务路由 `/auth/login`（sample/src/auth/）→ 返回 `access_token`（失败抛错；`headers` 透传，如租户头） |
 | `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` | vitest 风格子集 |
 | `expect(actual)` | `.toBe / .toEqual / .toBeTruthy / .toBeFalsy / .toContain` |
 | `finish()` | 标记会话结束 |
@@ -1012,7 +1021,7 @@ broker:
 字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`；auth 的
 `jwt_secret`（空串启动 fail-fast，生产必改）、`signing_method`（HS256|HS384|HS512，
 默认 HS256）、`access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
-`anonymous_paths`、`user_table`（默认 users））。
+`anonymous_paths`——无 `user_table` 配置，用户表是业务约定）。
 
 ### plugins / plugins_dir —— 插件装配（双模式）
 

@@ -257,7 +257,14 @@ impl crate::bridge::auth::AuthGuard for FfiAuthGuard {
             Ok(json) => {
                 let v: serde_json::Value = serde_json::from_str(&json[..])
                     .map_err(|e| format!("auth plugin returned bad json: {e}"))?;
-                Ok(if v.is_null() { None } else { Some(v) })
+                // 契约：null = 匿名放行，object = http.user；标量/数组视为坏插件输出。
+                if v.is_null() {
+                    Ok(None)
+                } else if v.is_object() {
+                    Ok(Some(v))
+                } else {
+                    Err("auth plugin returned non-object user".to_string())
+                }
             }
             Err(e) => Err(e[..].to_string()),
         }

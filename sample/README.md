@@ -29,5 +29,7 @@
   （私钥 `config/private.pem` 仅示例用，**严禁用于生产**；过期后用
   `cargo run -p oj-cert -- renew -k sample/config/private.pem` 重签）
 - dist/ 为 oj build 产物（保留原名原结构，默认 minify），可再生，勿手改
+- 注意：sample/dist/ 尚未包含 auth 模块（release 模式启动三个 auth 端点 404）；
+  需要时 `oj build` 重新生成
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由迁移 + seed.sql 初始化（均幂等），已 gitignore

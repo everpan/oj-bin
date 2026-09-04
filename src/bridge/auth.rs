@@ -22,6 +22,9 @@ mod tests {
         if p == "/health" {
             return oj_plugin_ffi::RResult::Ok("null".into());
         }
+        if a == "Bearer scalar" {
+            return oj_plugin_ffi::RResult::Ok("42".into());
+        }
         if a == "Bearer good" {
             return oj_plugin_ffi::RResult::Ok(r#"{"id":"1","roles":["admin"]}"#.into());
         }
@@ -41,5 +44,7 @@ mod tests {
         assert_eq!(u["id"], "1");
         assert!(g.verify("/me", Some("Bearer bad")).is_err());
         assert!(g.verify("/me", None).is_err());
+        // 契约外形状：非 object（标量）→ Err，不注入 http.user。
+        assert!(g.verify("/me", Some("Bearer scalar")).is_err());
     }
 }
