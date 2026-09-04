@@ -4,6 +4,7 @@
 //! - stabby 72 注意：`RResult` 的 Ok/Err 是关联函数（构造用 `RResult::Ok(v)`），
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
+pub mod auth;
 pub mod blob;
 pub mod bus;
 pub mod db;
@@ -11,6 +12,7 @@ pub mod es;
 pub mod future;
 pub mod kv;
 
+pub use auth::AuthGuardVtable;
 pub use blob::BlobBackendVtable;
 pub use bus::EventBrokerVtable;
 pub use db::DataAccessorVtable;
@@ -31,7 +33,8 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 3 = Task 4.2 起（PluginRegistrations 增 blob 槽位 + BlobBackendVtable）。
 /// 4 = Task 4.3 起（PluginRegistrations 增 bus 槽位 + EventBrokerVtable + HostContext 增 deliver）。
 /// 5 = Task 4.4 起（PluginRegistrations 增 kv 槽位 + KVStoreVtable）。
-pub const ABI_VERSION: u32 = 5;
+/// 6 = auth 解耦起（PluginRegistrations 增 auth 槽位 + AuthGuardVtable）。
+pub const ABI_VERSION: u32 = 6;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -68,7 +71,8 @@ pub struct PluginRegistrations {
     pub db: *const DataAccessorVtable,
     pub blob: *const BlobBackendVtable,
     pub bus: *const EventBrokerVtable,
-    pub kv: *const KVStoreVtable, // Task 4.4 起
+    pub kv: *const KVStoreVtable,     // Task 4.4 起
+    pub auth: *const AuthGuardVtable, // Task auth-1 起
 }
 
 impl PluginRegistrations {
@@ -79,6 +83,7 @@ impl PluginRegistrations {
             blob: std::ptr::null(),
             bus: std::ptr::null(),
             kv: std::ptr::null(),
+            auth: std::ptr::null(),
         }
     }
 
@@ -100,6 +105,10 @@ impl PluginRegistrations {
 
     pub fn kv(&self) -> Option<&'static KVStoreVtable> {
         unsafe { self.kv.as_ref() }
+    }
+
+    pub fn auth(&self) -> Option<&'static AuthGuardVtable> {
+        unsafe { self.auth.as_ref() }
     }
 }
 
