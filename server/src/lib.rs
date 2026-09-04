@@ -1,7 +1,6 @@
 //! mdm-server：HTTP 层。目录镜像路由（routes）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
 
 pub mod actor;
-pub mod auth;
 pub mod certificate;
 pub mod certificate_watcher;
 pub mod logging;
@@ -23,10 +22,8 @@ use axum::routing::any;
 use serde_json::Value;
 
 use crate::actor::JsActor;
-use crate::auth::Auth;
 use crate::routes::{Lookup, RouteTable, Routes};
-use only_js::bridge::{BlobBackend, BlobServed, RequestInfo, UploadedFile, fail};
-use serde_json::json;
+use only_js::bridge::{AuthGuard, BlobBackend, BlobServed, RequestInfo, UploadedFile, fail};
 
 /// 证书状态
 #[derive(Clone, Debug)]
@@ -65,8 +62,8 @@ pub struct AppState {
 pub struct Pipeline {
     /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
     pub tenant_header: Option<String>,
-    /// Some = 鉴权启用：内置 {base}/auth/* 路由 + Bearer 守卫 + http.user。
-    pub auth: Option<Arc<Auth>>,
+    /// Some = 鉴权启用：Bearer 守卫 + http.user（实现由 oj-auth 插件提供）。
+    pub auth: Option<Arc<dyn AuthGuard>>,
     /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
     pub max_upload: u64,
     /// Some = blob 启用：`{base}/blob/{key}` 公开下载（local 直出 / s3 302 presign）。
@@ -252,35 +249,6 @@ async fn handle(
         }
     }
 
-    // 内置 auth 路由（{base}/auth/*）：先于路由表（login/refresh/logout，POST only）。
-    if let Some(auth) = st.pipeline.auth.clone()
-        && let Some(rest) = crate::routes::normalize(uri.path()).and_then(|p| {
-            p.strip_prefix(&format!("{}/auth/", st.base))
-                .map(|s| s.to_string())
-        })
-    {
-        return match (verb, rest.as_str()) {
-            ("POST", "login") => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-                let (u, p) = (
-                    v["username"].as_str().unwrap_or_default().to_string(),
-                    v["password"].as_str().unwrap_or_default().to_string(),
-                );
-                auth_json(auth.login(&u, &p).await)
-            }
-            ("POST", "refresh") => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-                let t = v["refresh_token"].as_str().unwrap_or_default().to_string();
-                auth_json(auth.refresh(&t).await)
-            }
-            ("POST", "logout") => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or_default();
-                let t = v["refresh_token"].as_str().unwrap_or_default().to_string();
-                auth_json(auth.logout(&t).await.map(|_| Value::Null))
-            }
-            _ => fail_response(405, "auth route not found"),
-        };
-    }
     // 内置 blob 下载路由（{base}/blob/{key}，公开 GET，先于路由表）。
     if verb == "GET"
         && let Some(blob) = st.pipeline.blob.as_ref()
@@ -323,18 +291,17 @@ async fn handle(
         let query = parse_query(uri.query());
         let path_no_base = path_no_base.clone();
         async move {
-            // 前置管线：鉴权（base 内非匿名路径必须带有效 Bearer → 401；通过 → http.user）。
+            // 前置管线：鉴权（base 内非匿名路径必须过守卫 → 401；Ok(None) = 匿名放行）。
             let user = match (st.pipeline.auth.as_ref(), path_no_base.as_deref()) {
-                (Some(auth), Some(p)) if !auth.is_anonymous(p) => {
-                    let Some(claims) = headers
+                (Some(guard), Some(p)) => {
+                    let header = headers
                         .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.strip_prefix("Bearer "))
-                        .and_then(|t| auth.verify_access(t).ok())
-                    else {
-                        return fail_response(401, "missing or invalid bearer token");
-                    };
-                    Some(json!({ "id": claims.sub, "roles": claims.roles, "claims": claims }))
+                        .and_then(|v| v.to_str().ok());
+                    match guard.verify(p, header) {
+                        Ok(Some(u)) => Some(u),
+                        Ok(None) => None,
+                        Err(msg) => return fail_response(401, &msg),
+                    }
                 }
                 _ => None,
             };
@@ -502,21 +469,6 @@ fn capture_response(cap: only_js::bridge::Capture) -> Response {
         }
     }
     r
-}
-
-/// 内置 auth 路由响应：Ok(data) → ok 信封 200；Err(msg) → 401 信封。
-fn auth_json(r: Result<Value, String>) -> Response {
-    match r {
-        Ok(data) => {
-            let mut resp = Response::new(axum::body::Body::from(only_js::bridge::ok(&data)));
-            resp.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/json"),
-            );
-            resp
-        }
-        Err(msg) => fail_response(401, &msg),
-    }
 }
 
 /// 统一失败信封。
@@ -909,9 +861,8 @@ pub(crate) mod tests {
         let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
         let addr = spawn_blob("/v1/api", t.0.clone(), blob).await;
         // 上传 a.png（PNGDATA 7B）
-        let mp = format!(
-            "--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--X-BND--\r\n"
-        );
+        let mp = "--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA\r\n--X-BND--\r\n"
+            .to_string();
         let req = format!(
             "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{mp}",
             mp.len()
@@ -961,9 +912,26 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// auth 全链路：401/匿名/login/Bearer 注入/篡改/refresh 轮换/logout。
+    /// Stub 守卫：/health 匿名；Bearer good → user；其余 Err。
+    struct StubGuard;
+    impl only_js::bridge::AuthGuard for StubGuard {
+        fn verify(&self, path: &str, auth: Option<&str>) -> Result<Option<Value>, String> {
+            if path == "/health" {
+                return Ok(None);
+            }
+            match auth {
+                Some("Bearer good") => Ok(Some(serde_json::json!({
+                    "id": "1", "roles": ["admin"],
+                    "claims": {"sub": "1", "roles": ["admin"], "iat": 0, "exp": 0},
+                }))),
+                _ => Err("missing or invalid bearer token".into()),
+            }
+        }
+    }
+
+    /// 守卫管线：401 / 匿名放行 / http.user 注入；内置 /auth/* 路由已删除（404）。
     #[tokio::test]
-    async fn auth_full_pipeline() {
+    async fn auth_guard_pipeline() {
         let t = routes(&[
             (
                 "me/api.ts",
@@ -974,42 +942,13 @@ pub(crate) mod tests {
                 "export default { get() { json.ok({ ok: 1 }); } };",
             ),
         ]);
-        // auth 自带库：users 表 + demo 用户（bcrypt cost 4 提速）。
-        let db = only_js::bridge::SqlxAccessor::arc("sqlite::memory:")
-            .await
-            .unwrap();
-        let hash = bcrypt::hash("pw", 4).unwrap();
-        db.exec_with_params(
-            "create table users (id integer primary key, username text, password_hash text, roles text)",
-            &[],
-        )
-        .await
-        .unwrap();
-        db.exec_with_params(
-            "insert into users (username, password_hash, roles) values ('demo', ?, ?)",
-            &[serde_json::json!(hash), serde_json::json!(r#"["admin"]"#)],
-        )
-        .await
-        .unwrap();
-        let auth = Arc::new(
-            crate::auth::Auth::new(
-                &only_js::config::AuthCfg {
-                    jwt_secret: "test-secret".into(),
-                    anonymous_paths: vec!["/health".into()],
-                    ..Default::default()
-                },
-                db,
-                Arc::new(only_js::bridge::InMemoryKV::new()),
-            )
-            .unwrap(),
-        );
         let addr = spawn_pipeline(
             "/v1/api",
             t.0.clone(),
             true,
             None,
             Pipeline {
-                auth: Some(auth),
+                auth: Some(Arc::new(StubGuard)),
                 ..Default::default()
             },
         )
@@ -1018,79 +957,31 @@ pub(crate) mod tests {
             format!(
                 "GET {p} HTTP/1.1\r\nHost: t\r\n{}Connection: close\r\n\r\n",
                 token
-                    .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                    .map(|t| format!("Authorization: {t}\r\n"))
                     .unwrap_or_default()
             )
         };
-        // 1) 无 token 访问 /me → 401
+        // 无 token → 401；坏 token → 401
         let r = raw_http(addr, &get("/v1/api/me/", None)).await;
-        assert!(r.starts_with("HTTP/1.1 401"), "1: {r}");
-        // 2) /health 匿名 → 200
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        let r = raw_http(addr, &get("/v1/api/me/", Some("Bearer bad"))).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "{r}");
+        // 匿名路径放行
         let r = raw_http(addr, &get("/v1/api/health/", None)).await;
-        assert!(r.starts_with("HTTP/1.1 200"), "2: {r}");
-        // 3) login 错密码 → 401
-        let login_req = |body: &str| {
-            format!(
-                "POST /v1/api/auth/login HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        };
-        let r = raw_http(addr, &login_req(r#"{"username":"demo","password":"x"}"#)).await;
-        assert!(r.starts_with("HTTP/1.1 401"), "3: {r}");
-        // 4) login 成功 → Bearer 访问 /me → 200 且 user.id=="1"、roles==["admin"]
-        let r = raw_http(addr, &login_req(r#"{"username":"demo","password":"pw"}"#)).await;
-        assert!(r.starts_with("HTTP/1.1 200"), "4a: {r}");
-        let v: Value =
-            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
-                .unwrap();
-        let at = v["data"]["access_token"].as_str().unwrap().to_string();
-        let rt1 = v["data"]["refresh_token"].as_str().unwrap().to_string();
-        let r = raw_http(addr, &get("/v1/api/me/", Some(&at))).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // 注入 http.user
+        let r = raw_http(addr, &get("/v1/api/me/", Some("Bearer good"))).await;
         assert!(
-            r.starts_with("HTTP/1.1 200")
-                && r.contains("\"id\":\"1\"")
-                && r.contains("\"roles\":[\"admin\"]"),
-            "4b: {r}"
+            r.starts_with("HTTP/1.1 200") && r.contains("\"id\":\"1\""),
+            "{r}"
         );
-        // 5) 篡改 token → 401
-        let r = raw_http(addr, &get("/v1/api/me/", Some(&format!("{at}x")))).await;
-        assert!(r.starts_with("HTTP/1.1 401"), "5: {r}");
-        // 6) refresh → 新 access 可用
+        // 内置 auth 路由已删除：无对应业务模块 → 404（不再是 200/405）
         let r = raw_http(
             addr,
-            &format!(
-                "POST /v1/api/auth/refresh HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt1}\"}}",
-                format!("{{\"refresh_token\":\"{rt1}\"}}").len()
-            ),
+            "POST /v1/api/auth/login HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
         )
         .await;
-        assert!(r.starts_with("HTTP/1.1 200"), "6a: {r}");
-        let v: Value =
-            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
-                .unwrap();
-        let at2 = v["data"]["access_token"].as_str().unwrap().to_string();
-        let rt2 = v["data"]["refresh_token"].as_str().unwrap().to_string();
-        let r = raw_http(addr, &get("/v1/api/me/", Some(&at2))).await;
-        assert!(r.starts_with("HTTP/1.1 200"), "6b: {r}");
-        // 7) logout 后 refresh 旧 token → 401
-        let r = raw_http(
-            addr,
-            &format!(
-                "POST /v1/api/auth/logout HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt2}\"}}",
-                format!("{{\"refresh_token\":\"{rt2}\"}}").len()
-            ),
-        )
-        .await;
-        assert!(r.starts_with("HTTP/1.1 200"), "7a: {r}");
-        let r = raw_http(
-            addr,
-            &format!(
-                "POST /v1/api/auth/refresh HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"refresh_token\":\"{rt2}\"}}",
-                format!("{{\"refresh_token\":\"{rt2}\"}}").len()
-            ),
-        )
-        .await;
-        assert!(r.starts_with("HTTP/1.1 401"), "7b: {r}");
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
     #[tokio::test]

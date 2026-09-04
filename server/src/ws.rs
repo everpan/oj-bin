@@ -610,7 +610,7 @@ mod tests {
                 t.0.clone(),
                 true,
                 crate::tests::build_table(&t.0, true, "/v1/api"),
-                JsActor::pool(1, make.clone()),
+                JsActor::pool(1, make),
                 None,
                 None,
                 crate::Pipeline::default(),
