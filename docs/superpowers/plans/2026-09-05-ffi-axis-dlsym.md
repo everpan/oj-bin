@@ -603,6 +603,7 @@ unix@vip.qq.com ai"
 - `docs/plugin-development.md`：ABI_VERSION 6→7（auth 计划 Task 8 已把 5 改 6——本计划再顶到 7）；删 PluginRegistrations/register 表述，改「`oj_plugin_entry!(init, kv => &VT)` 逐轴声明 + `oj_plugin_axis_<name>` 符号 + 缺符号 = 不提供该轴 + 加轴零破坏（ABI 规则表：既有轴形状变更才 bump）」；补「插件自有配置：`config.yaml` 的 `plugins.<name>` 开放段，宿主透传不解释，schema 插件自校验」与「自描述：descriptor.desc 必填，经 `GET {base}/plugins` 公开」。
 - `docs/plugin-architecture.md`：注册机制章节同口径改写（探测流程：abi 门禁 → init → AXES 逐轴 dlsym；自描述收集与查询端点）。
 - `docs/builtin-api-auth.md`：内置接口总览表加一行 `GET {base}/plugins`（公共，插件自描述清单）。
+- `docs/devkit/api-manual.md`：831 行附近存量示例 `client.login("demo","demo1234")` 补第三参租户头（auth+tenant 用例与同节约束对齐；auth 计划复审遗留，随本任务 docs 重写一并修 + `cargo xtask build` 刷新 bin/devkit）。
 - `CLAUDE.md`（本地文件，不入库）：插件系统段落同步（ABI 7、按轴符号、plugins 开放段、自描述端点）。
 
 - [ ] **Step 3: 全量门禁**
