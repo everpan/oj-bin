@@ -52,11 +52,13 @@ tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（�
   enable: true
   header_key: "X-TENANT-ID"
 
-auth:   # JWT 鉴权（v0.2）：块存在即启用——内置 /v1/api/auth/{login,refresh,logout} + Bearer 守卫
+auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/auth/，jwt 原语注入）
   jwt_secret: "change-me"        # 生产必改；空串启动 fail-fast
   signing_method: "HS256"        # HS256 | HS384 | HS512
   access_token_duration: "60s"   # access token 有效期（s/m/h/d）
   refresh_token_duration: "720h" # refresh session 有效期（轮换制）
   anonymous_paths:               # 免鉴权路径（去 /v1/api 前缀；尾 /* 为一层通配）
     - "/health"
-  user_table: "users"            # 最小列：id, username, password_hash, roles(JSON 数组串)
+    - "/auth/login"              # auth 端点已是业务路由，须显式匿名
+    - "/auth/refresh"
+    - "/auth/logout"
