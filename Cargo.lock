@@ -3242,6 +3242,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-auth"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "oj-plugin-ffi",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oj-blob-s3"
 version = "0.1.0"
 dependencies = [
