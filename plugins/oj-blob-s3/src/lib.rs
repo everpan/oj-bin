@@ -253,6 +253,7 @@ extern "C" fn register() -> PluginRegistrations {
             blob: &VTABLE,
             bus: std::ptr::null(),
             kv: std::ptr::null(),
+            auth: std::ptr::null(),
         },
         PluginRegistrations::none(),
     )
