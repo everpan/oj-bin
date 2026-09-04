@@ -18,6 +18,9 @@ struct Claims {
 
 #[derive(serde::Deserialize)]
 struct GuardCfg {
+    /// 扫描模式 init cfg = "{}"（auth 未声明）→ 空 secret 守卫仍可建（fail-closed：
+    /// 任何 Bearer 都验签失败）；装配层注入真实 cfg（清单/扫描同一路径）。
+    #[serde(default)]
     jwt_secret: String,
     #[serde(default = "default_alg")]
     signing_method: String,

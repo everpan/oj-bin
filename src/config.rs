@@ -241,8 +241,6 @@ pub struct AuthCfg {
     pub refresh_token_duration: String,
     /// 免鉴权路径（去 base 后）；结尾 "/*" = 一层前缀通配。
     pub anonymous_paths: Vec<String>,
-    /// 用户表名（login 查询用；标识符白名单校验）。
-    pub user_table: String,
 }
 
 impl Default for AuthCfg {
@@ -253,7 +251,6 @@ impl Default for AuthCfg {
             access_token_duration: "60s".into(),
             refresh_token_duration: "720h".into(),
             anonymous_paths: Vec::new(),
-            user_table: "users".into(),
         }
     }
 }
@@ -536,7 +533,6 @@ mod tests {
         assert_eq!(a.signing_method, "HS256");
         assert_eq!(a.access_token_duration, "60s");
         assert_eq!(a.refresh_token_duration, "720h");
-        assert_eq!(a.user_table, "users");
         assert!(a.anonymous_paths.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

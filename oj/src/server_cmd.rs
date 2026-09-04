@@ -215,6 +215,9 @@ pub struct Registries {
     /// kv 键选单 vtable 槽（Task 4.4：redis.default 声明 → 经插件 connect；
     /// 未声明仍 InMemoryKV 内置兜底；多 kv 插件注册冲突 fail fast）。
     pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>,
+    /// auth 键选单 vtable 槽（auth 解耦：cfg [auth] 声明 → 必须恰有一个 auth 插件，
+    /// 缺失/多插件冲突都 fail fast；未声明时插件槽位不进 Pipeline）。
+    pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -223,6 +226,16 @@ fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
     if name == "es" {
         if let Some(es) = &cfg.es {
             return serde_json::json!({ "endpoint": es.endpoint }).to_string();
+        }
+    }
+    if name == "auth" {
+        if let Some(a) = &cfg.auth {
+            return serde_json::json!({
+                "jwt_secret": a.jwt_secret,
+                "signing_method": a.signing_method,
+                "anonymous_paths": a.anonymous_paths,
+            })
+            .to_string();
         }
     }
     "{}".to_string()
@@ -283,12 +296,29 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register kv backend".to_string());
     }
     let kv = kv_plugins.first().and_then(|p| p.registrations.kv);
+    // auth 键选式单 vtable 槽（auth 解耦）：cfg [auth] 声明但无 auth 插件 → fail fast
+    // （§2 闸门，鉴权不许静默失守）；多 auth 插件注册冲突 → fail fast。
+    let auth_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.auth.is_some())
+        .collect();
+    if cfg.auth.is_some() && auth_plugins.is_empty() {
+        return Err(
+            "config declares [auth] but no auth plugin loaded (run `cargo xtask plugin auth`)"
+                .to_string(),
+        );
+    }
+    if auth_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register auth guard".to_string());
+    }
+    let auth = auth_plugins.first().and_then(|p| p.registrations.auth);
     Ok(Registries {
         es,
         dbs,
         blob,
         bus,
         kv,
+        auth,
     })
 }
 
@@ -326,7 +356,9 @@ pub async fn assemble_plugins(
         }
         Some(dir) => {
             // 缺省扫描：目录为空 → 零插件；扫描到损坏插件 → fail fast（不静默跳过）。
-            load_scanned(&dir, host).map_err(|e| format!("plugins scan: {e}"))?
+            // cfg_for 同样传入：cfg 键 = 文件 stem（auth/es 等按名注入真实 cfg，
+            // 其余插件得 "{}"），与清单模式同一取值路径。
+            load_scanned(&dir, host, &cfg_for).map_err(|e| format!("plugins scan: {e}"))?
         }
         None => Vec::new(),
     };
@@ -1498,6 +1530,94 @@ mod tests {
             .unwrap_or_default();
         assert!(e.contains("no kv plugin loaded"), "{e}");
         assert!(e.contains("cargo xtask plugin kv-redis"), "{e}");
+    }
+
+    /// 编译 oj-auth 产物路径（全进程一次）。
+    fn auth_plugin_artifact() -> PathBuf {
+        static ONCE: OnceLock<PathBuf> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-auth"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-auth");
+            assert!(status.success(), "oj-auth build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            root.join("target/debug")
+                .join(format!("{prefix}oj_auth.{ext}"))
+        })
+        .clone()
+    }
+
+    /// auth 声明但无 auth 插件 → fail-fast（§2 闸门，不静默放行）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_plugin_required_when_configured() {
+        let t = tmpdir("sc-authgate");
+        std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
+        let mut cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
+        cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"x\"\n").unwrap());
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("no auth plugin loaded"), "{e}");
+    }
+
+    /// 全链路：真实 oj-auth 插件装配 → Registries.auth 槽就位；经 FfiAuthGuard
+    /// 验签测试签发的 JWT（sign 用 jsonwebtoken）：匿名路径放行、有效 token 出 user、
+    /// 坏 token / 缺 token 拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_plugin_wires_guard_and_verifies_jwt() {
+        let t = tmpdir("sc-authplug");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(auth_plugin_artifact(), pdir.join(plugin_file("auth"))).unwrap();
+        let mut cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
+        cfg.auth = Some(
+            serde_yaml::from_str("jwt_secret: \"oj-test-secret\"\nanonymous_paths:\n  - /health\n")
+                .unwrap(),
+        );
+        let mut r = Registries::default();
+        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let vt = r
+            .auth
+            .expect("auth vtable slot must be wired from the plugin");
+        let guard = only_js::bridge::plugin_loader::auth_guard_from_vtable(vt);
+        // 匿名路径 → None（放行，无 token 也行）
+        assert!(guard.verify("/health", None).unwrap().is_none());
+        // 有效 token → user（sub → id）
+        let now = server::test_support::now_secs();
+        let claims = serde_json::json!({
+            "sub": "u1", "roles": ["admin"], "iat": now, "exp": now + 3600
+        });
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"oj-test-secret"),
+        )
+        .unwrap();
+        let user = guard
+            .verify("/items", Some(&format!("Bearer {token}")))
+            .unwrap()
+            .expect("valid token must yield user");
+        assert_eq!(user["id"], "u1");
+        // 坏 token / 缺 token → Err（401 语义）
+        assert!(guard.verify("/items", Some("Bearer nope")).is_err());
+        assert!(guard.verify("/items", None).is_err());
     }
 
     /// 硬验收（Task 6.1 Step 5）：真 kafka 插件 broker 下 Task 0.5 共享语义回归

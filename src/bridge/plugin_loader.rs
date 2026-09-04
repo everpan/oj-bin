@@ -448,9 +448,12 @@ pub fn load_manifest(
 
 /// 扫描装配（缺省模式）：加载 dir 下全部符合命名约定的库文件（文件名排序保确定性）；
 /// 目录不存在/为空 → Ok(vec![])；扫描到但校验失败 → Err（不静默跳过，spec §5）。
+/// cfg_for 与清单模式共用：cfg 键 = 文件 stem（去 lib 前缀），auth/es 等按名注入
+/// 真实 cfg，其余插件得 "{}"（否则扫描到的 cfg 型插件只能拿空 cfg 静默降级）。
 pub fn load_scanned(
     dir: &Path,
     host: RArc<HostContext>,
+    cfg_for: &dyn Fn(&str) -> String,
 ) -> Result<Vec<LoadedPlugin>, PluginLoadError> {
     if !dir.is_dir() {
         return Ok(vec![]);
@@ -466,7 +469,7 @@ pub fn load_scanned(
     files.sort();
     let mut out = Vec::with_capacity(files.len());
     for path in files {
-        out.push(load_one(&path, None, host.clone(), &|_| "{}".to_string())?);
+        out.push(load_one(&path, None, host.clone(), cfg_for)?);
     }
     Ok(out)
 }

@@ -3224,6 +3224,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "flate2",
+ "jsonwebtoken",
  "oj-plugin-ffi",
  "only-js",
  "refinery-core",

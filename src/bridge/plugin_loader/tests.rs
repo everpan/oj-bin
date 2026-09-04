@@ -272,13 +272,18 @@ fn manifest_semver_pin_ok() {
 #[test]
 fn scan_empty_dir_is_zero_plugins() {
     let base = tempfile::tempdir().unwrap();
-    let loaded = load_scanned(base.path(), host_context()).unwrap();
+    let loaded = load_scanned(base.path(), host_context(), &|_| "{}".to_string()).unwrap();
     assert!(loaded.is_empty());
 }
 
 #[test]
 fn scan_missing_dir_is_zero_plugins() {
-    let loaded = load_scanned(Path::new("/nonexistent-plugins-dir"), host_context()).unwrap();
+    let loaded = load_scanned(
+        Path::new("/nonexistent-plugins-dir"),
+        host_context(),
+        &|_| "{}".to_string(),
+    )
+    .unwrap();
     assert!(loaded.is_empty());
 }
 
@@ -286,7 +291,7 @@ fn scan_missing_dir_is_zero_plugins() {
 fn scan_loads_mini() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let loaded = load_scanned(&dir, host_context()).unwrap();
+    let loaded = load_scanned(&dir, host_context(), &|_| "{}".to_string()).unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(&loaded[0].descriptor.name[..], "mini");
 }
@@ -296,7 +301,7 @@ fn scan_bad_plugin_is_err_not_skipped() {
     let base = tempfile::tempdir().unwrap();
     let bad = base.path().join(ffi::plugin_file_name("bad"));
     std::fs::write(&bad, b"not a real shared library").unwrap();
-    let err = load_scanned(base.path(), host_context()).unwrap_err();
+    let err = load_scanned(base.path(), host_context(), &|_| "{}".to_string()).unwrap_err();
     // loader 拒绝（分类为 PlatformMismatch 或 DependencyResolution 均可，关键是不静默跳过）。
     assert!(
         matches!(

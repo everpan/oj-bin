@@ -22,7 +22,7 @@ use axum::http::{Request, StatusCode};
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
-    Bridge, EsBackend, Extras, InMemoryKV, KVStore, LoaderShared, ModuleCtx, SchemaRegistry,
+    Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, StableState};
 use only_js::config::{self, Config};
@@ -231,22 +231,24 @@ impl App {
             let modules = crate::manifest::discover(&dir, ts)?;
             crate::migrate_cmd::load_fixtures(dbs.get("default"), &modules).await?;
         }
-        // 鉴权。
-        let auth = match &cfg.auth {
+        // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
+        // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
+        let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
             Some(a) if a.jwt_secret.trim().is_empty() => {
                 return Err("auth.jwt_secret must not be empty".into());
             }
-            Some(a) => {
-                let db = dbs
-                    .get("default")
-                    .ok_or("auth requires db 'default'")?
-                    .clone();
-                Some(Arc::new(
-                    server::auth::Auth::new(a, db, kv.clone()).map_err(|e| format!("auth: {e}"))?,
-                ))
-            }
+            Some(_) => registries
+                .auth
+                .map(only_js::bridge::plugin_loader::auth_guard_from_vtable),
             None => None,
         };
+        let jwt: Option<Arc<JwtCfg>> = cfg
+            .auth
+            .as_ref()
+            .map(only_js::bridge::JwtCfg::from_auth_cfg)
+            .transpose()
+            .map_err(|e| format!("auth: {e}"))?
+            .map(Arc::new);
         // 共享事件总线。
         let bus = registries
             .bus
@@ -267,6 +269,7 @@ impl App {
                 (registry.clone(), modules.clone(), ownership_deny);
             // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
             let boot = boot.clone();
+            let jwt = jwt.clone();
             move || {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -282,8 +285,8 @@ impl App {
                         modules: modules.clone(),
                         ownership_deny,
                         boot: boot.clone(),
-                        // Task 6 接线：JwtCfg::from_auth_cfg(cfg.auth) 注入。
-                        jwt: None,
+                        // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
+                        jwt: jwt.clone(),
                     },
                 )
             }
@@ -468,7 +471,7 @@ impl App {
             modules,
             ownership_deny,
             boot: boot.clone(),
-            jwt: None, // Task 6 接线：与 make_bridge 的 Extras.jwt 同源。
+            jwt: jwt.clone(), // 与 make_bridge 的 Extras.jwt 同源。
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {
