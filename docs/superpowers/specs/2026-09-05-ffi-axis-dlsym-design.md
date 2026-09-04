@@ -162,6 +162,32 @@ fn plugin_cfg(cfg: &Config, name: &str) -> String
 | cfg 适配（仅第一方） | 轴适配器表加一行；第三方则用户写 `config.plugins.<name>` |
 | 存量插件 | **零改动、零重编译、ABI 不 bump** |
 
+## 插件自描述与查询（2026-09-05 用户需求，同批落地）
+
+### 需求
+
+插件自描述 name / version / description；宿主加载时收集；提供 API 可查询。
+
+### 设计
+
+- **自描述进 descriptor**：`PluginDescriptor` 增 `pub desc: RString`（人类可读描述，
+  插件作者填写；`name`/`semver`/`abi_version`/`fingerprint` 既有）。恰好 ABI 7 正在
+  变更 descriptor（删 register），`desc` 搭车零额外成本。各第一方插件取其 Cargo.toml
+  的 `description` 文案。
+- **host 加载时收集**：`assemble_plugins` 装配完成后聚合 `Vec<PluginInfo>`
+  （`PluginInfo` 增 `description: String`，From<&LoadedPlugin> 同步）。
+  两条消费路径：
+  1. `Extras.plugins`（既有通道，op_plugins / JS `globalThis.plugins()` 的数据源）——
+     修掉生产装配传 `Vec::new()` 的既有缺口，`oj server` 从此返回真实清单；
+  2. `AppState.plugins`（新增）——供内置查询端点。
+- **查询 API**：内置 `GET {base}/plugins`（axum route，先于 catch-all fallback 注册），
+  返回 ok 信封 `{code:0, data:[{name, version, description, abi_version, fingerprint}...]}`。
+  定位与 `/health` 一致的**公共基础设施端点**：不走 Bearer 守卫、不受证书 GET 限制
+  （监控/运维用途），GET only；`{base}/plugins` 为保留路径（同名业务路由被遮蔽，
+  文档明示）。
+- **不改 FFI 机制**：自描述走 descriptor（init 返回），不新增符号；按轴 dlsym 不携带
+  元数据。
+
 ## 已知取舍
 
 - 符号名含轴名 → 轴标识受 C 标识符约束（本就如此：现有轴名全为小写单词）。
