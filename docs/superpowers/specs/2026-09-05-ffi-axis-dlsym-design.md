@@ -1,7 +1,7 @@
 # FFI 插件注册解耦设计：按轴 dlsym，消灭 PluginRegistrations
 
 日期：2026-09-05
-状态：已确认（方案 B：按轴导出符号）
+状态：已确认（方案 B：按轴导出符号 + 插件配置通用化，2026-09-05 用户补充插件配置需求）
 前置：auth 解耦计划（docs/superpowers/plans/2026-09-05-auth-decouple.md）收尾后另起计划实施
 
 ## 背景与问题
@@ -98,15 +98,69 @@ fail-fast 规则全部不变。
 3. `src/bridge/plugin_loader.rs`：`AXES` 探测表 + dlsym 装配；`LoadedPlugin.registrations`
    改由探测结果构建（保留宿主侧聚合，下游 `es_backend`/`db_backend`/`auth_guard` 等
    包装器不动）。
-4. `tools/xtask` `--check` 预检：符号存在性探测替代读 register 返回值。
-5. `.github/workflows/plugin-matrix.yml`、CLAUDE.md/docs（plugin-architecture.md、
+4. 插件配置：`src/config.rs` 增 `plugins: Option<HashMap<String, serde_json::Value>>`
+   开放段；`oj/src/server_cmd.rs` 的 `plugin_cfg_json` 泛化为三级回落的 `plugin_cfg`
+   （开放 map → 轴适配器表 → `{}`），适配器表与探测表同处声明。
+5. `tools/xtask` `--check` 预检：符号存在性探测替代读 register 返回值。
+6. `.github/workflows/plugin-matrix.yml`、CLAUDE.md/docs（plugin-architecture.md、
    plugin-development.md）同步。
 
 ## 测试
 
 - `tests/plugins/mini` 扩展三种夹具：全轴、单轴、零轴（零轴应可加载但无任何注册）。
 - 加载器单测：缺符号 = `None`；缺 `oj_plugin_init` / 版本不符仍 fail-fast（既有路径回归）。
+- 配置解析单测：三级回落逐级生效；`plugins.<name>` 透传不被宿主改写；scan 模式以
+  文件 stem 命中 cfg 键。
 - e2e：`cargo xtask build` 后 oj server 正常装配全部第一方插件（既有 workspace 测试覆盖）。
+
+## 插件配置（与按轴 dlsym 同批落地）
+
+### 问题
+
+配置面与旧注册面是**同一个闭集问题**：`plugin_cfg_json(cfg, name)` 在宿主代码里按插件名
+逐个硬编码（`"es" → endpoint`、`"auth" → jwt_secret/...`）。加一个需要配置的插件 =
+宿主源码改 `plugin_cfg_json`。auth 解耦 Task 6 还暴露了 scan 模式的鸡生蛋问题：init 需要
+cfg，而宿主在 init 前不知道插件名。
+
+### 设计：配置不进 FFI 契约，进宿主解析规则
+
+FFI 层**零变更**：`oj_plugin_init(host, cfg: RString)` 仍是唯一配置入口（JSON 字符串载荷）；
+轴符号（`oj_plugin_axis_*`）不带配置。配置演化继续走 JSON 加字段（既有 ABI 规则）。
+
+宿主侧把 `plugin_cfg_json` 泛化为单一解析函数，三级回落：
+
+```rust
+/// cfg 解析（装配期一次，与 AXES 探测表同处声明）：
+/// 1) config.plugins.<name>   —— 开放式 map，宿主原样透传，不做任何字段解释
+///    （第三方插件的正规通道；schema 由插件自定义）
+/// 2) 已知轴适配器            —— 第一方顶层段（auth:/es:/blob:/broker:/redis.default）
+///    由宿主按轴适配成 cfg（现 plugin_cfg_json 各分支收拢为与 AXES 同表的一张
+///    axis → adapter 映射；顶层段仍是能力开关，宿主消费其做装配门禁，
+///    插件相关字段经适配器透传）
+/// 3) "{}"                     —— 无任何声明
+fn plugin_cfg(cfg: &Config, name: &str) -> String
+```
+
+- **schema 归插件所有**：插件在 `init` 里解析并校验 cfg，非法即 `RResult::Err`
+  fail-fast（oj-auth 的 `GuardCfg` 已是先例）。宿主只保证 JSON 可序列化，永不解释
+  不认识的字段。
+- **命名契约（鸡生蛋的解法）**：插件文件 stem == descriptor name == cfg 键。xtask 落盘
+  已按 descriptor 命名（`libauth.dylib`），scan 模式以文件 stem 为 probe 键注入 cfg
+  （沿 Task 6 `cfg_for` 现状，本文档化为正式契约）。
+- **第一方顶层段的去留**：`auth:/es:/blob:/broker:/redis:` 保留——它们同时是宿主的
+  能力开关与核心侧状态来源（如 `auth:` 供 `Extras.jwt` 与守卫装配门禁），不是纯插件
+  配置。新增插件一律走 `config.plugins.<name>`，宿主零代码。
+
+### 与按轴 dlsym 的协同
+
+加一个「新轴 + 新插件 + 插件配置」的完整成本：
+
+| 步骤 | 改动 |
+|---|---|
+| 新 vtable 类型 | oj-plugin-ffi 加一个文件 |
+| 宿主探测 | `AXES` 表加一行 |
+| cfg 适配（仅第一方） | 轴适配器表加一行；第三方则用户写 `config.plugins.<name>` |
+| 存量插件 | **零改动、零重编译、ABI 不 bump** |
 
 ## 已知取舍
 
