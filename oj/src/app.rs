@@ -282,6 +282,8 @@ impl App {
                         modules: modules.clone(),
                         ownership_deny,
                         boot: boot.clone(),
+                        // Task 6 接线：JwtCfg::from_auth_cfg(cfg.auth) 注入。
+                        jwt: None,
                     },
                 )
             }
@@ -466,6 +468,7 @@ impl App {
             modules,
             ownership_deny,
             boot: boot.clone(),
+            jwt: None, // Task 6 接线：与 make_bridge 的 Extras.jwt 同源。
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {

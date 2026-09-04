@@ -42,6 +42,13 @@ import {
   op_log,
   op_plugins,
   op_resolve_cjs as __oj_resolve_cjs,
+  op_bcrypt_hash,
+  op_bcrypt_verify,
+  op_jwt_durations,
+  op_jwt_sign,
+  op_jwt_verify,
+  op_random_hex,
+  op_sha256_hex,
   op_ws_send,
   op_ws_close,
 } from "ext:core/ops";
@@ -255,3 +262,23 @@ globalThis.cert = {
   generate: (bits, nbf, exp) => op_cert_gen(bits | 0, nbf, exp),
   renew: (privatePem, nbf, exp) => op_cert_renew(String(privatePem), nbf, exp),
 };
+
+// ----- jwt: sign/verify (secret/alg/durations injected at assembly; not configured errors) -----
+globalThis.jwt = {
+  sign: (claims) => op_jwt_sign(claims === undefined ? null : claims),
+  verify: (token) => op_jwt_verify(String(token)),
+  get accessDuration() { return op_jwt_durations().access; },
+  get refreshDuration() { return op_jwt_durations().refresh; },
+};
+
+// ----- bcrypt: password hashing (spawn_blocking on Rust side) -----
+globalThis.bcrypt = {
+  hash: (password, cost) => op_bcrypt_hash(String(password), cost === undefined ? null : cost | 0),
+  verify: (password, hash) => op_bcrypt_verify(String(password), String(hash)),
+};
+
+// ----- crypto: sha256/random helpers (merge, keep native getRandomValues if present) -----
+globalThis.crypto = Object.assign(globalThis.crypto || {}, {
+  sha256Hex: (s) => op_sha256_hex(String(s)),
+  randomHex: (n) => op_random_hex(n === undefined ? null : n | 0),
+});

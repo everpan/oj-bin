@@ -27,6 +27,7 @@ pub mod broker;
 mod bus;
 pub mod bus_backend;
 pub mod cert;
+mod crypto;
 mod db;
 pub mod db_backend;
 mod envelope;
@@ -54,6 +55,7 @@ pub use accessor_sqlx::SqlxAccessor;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
 pub use bus::{Bus, EventBroker};
 pub use bus_backend::{BusBackend, BusBackendRegistry};
+pub use crypto::JwtCfg;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use db_backend::{DbBackend, DbBackendRegistry};
 pub use envelope::{fail, ok, status_code};
@@ -118,6 +120,8 @@ pub struct StableState {
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     /// 每个新 JsRuntime 创建后加载执行一次（见 `runtime::RuntimePool::checkout`）。
     pub boot: Option<String>,
+    /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
+    pub jwt: Option<Arc<JwtCfg>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -137,6 +141,8 @@ pub struct Extras {
     pub ownership_deny: bool,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     pub boot: Option<String>,
+    /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
+    pub jwt: Option<Arc<JwtCfg>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -215,6 +221,13 @@ deno_core::extension!(
         ws::op_ws_send,
         cert::op_cert_gen,
         cert::op_cert_renew,
+        crypto::op_jwt_sign,
+        crypto::op_jwt_verify,
+        crypto::op_jwt_durations,
+        crypto::op_bcrypt_hash,
+        crypto::op_bcrypt_verify,
+        crypto::op_sha256_hex,
+        crypto::op_random_hex,
         ws::op_ws_close,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
@@ -318,6 +331,7 @@ impl Bridge {
             modules: extras.modules,
             ownership_deny: extras.ownership_deny,
             boot: extras.boot,
+            jwt: extras.jwt,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // KillSwitch 先于池构造：池在 boot 期要 arm 它（TLA 死循环的唯一兜底）。
@@ -1237,6 +1251,7 @@ mod tests {
             modules: Arc::new(HashMap::new()),
             ownership_deny: false,
             boot: None,
+            jwt: None,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。

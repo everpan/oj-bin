@@ -13,8 +13,12 @@ edition = "2024"
 [dependencies]  
 async-trait = "0.1"
 base64 = "0.23.1"
+# jwt/bcrypt/crypto 原语（auth 解耦 Task 1：核心只留原语，业务语义在 JS/插件）。
+bcrypt = "0.15"
 deno_core = "0.410"
 deno_error = "0.7"
+getrandom = "0.2"
+jsonwebtoken = "9"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
@@ -27,6 +31,7 @@ serde_json = "1"
 # serde_yaml 0.9 已 deprecated 但功能完备；
 serde_yaml = "0.9"
 sea-query = "1.0"
+sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "macros",
