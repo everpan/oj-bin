@@ -4,6 +4,18 @@ use deno_core::{OpState, op2};
 
 use super::{ReqState, envelope};
 
+/// json.ok/fail 默认补 content-type: application/json；JS 侧 json.header 已显式设置的优先（大小写不敏感）。
+fn ensure_json_content_type(s: &mut ReqState) {
+    if !s
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"))
+    {
+        s.headers
+            .insert("content-type".into(), "application/json".into());
+    }
+}
+
 /// json.ok(data)：写成功信封（status=200）并标记会话完成。
 /// data 由 JS 侧 JSON.stringify 为 JSON 文本传入（fast op，避免 serde_v8 反序列化 + 二次序列化）。
 #[op2(fast)]
@@ -11,6 +23,7 @@ pub fn op_json_ok(state: &mut OpState, #[string] data_json: String) {
     let s = state.borrow_mut::<ReqState>();
     s.response = Some(envelope::ok_raw(&data_json));
     s.status = 200;
+    ensure_json_content_type(s);
     s.done = true;
 }
 
@@ -26,6 +39,7 @@ pub fn op_json_fail(
     let (body, status) = envelope::fail(code, &msg, &data);
     s.response = Some(body);
     s.status = status;
+    ensure_json_content_type(s);
     s.done = true;
 }
 

@@ -790,11 +790,29 @@ mod tests {
 
         assert_eq!(cap.status, 200);
         assert_eq!(cap.headers.get("X-Handler").unwrap(), "test");
+        assert_eq!(cap.headers.get("content-type").unwrap(), "application/json");
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(
             v,
             json!({"code": 0, "msg": "ok", "data": {"injected": true, "method": "POST"}})
         );
+
+        // json.header 显式设置的 content-type 优先，不被默认值覆盖。
+        let cap = b
+            .run_with(
+                r#"
+                json.header("Content-Type", "application/problem+json");
+                json.ok(null);
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cap.headers.get("Content-Type").unwrap(),
+            "application/problem+json"
+        );
+        assert!(!cap.headers.contains_key("content-type"));
     }
 
     #[tokio::test(flavor = "current_thread")]

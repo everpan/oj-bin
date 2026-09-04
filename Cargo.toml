@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "only-js"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 
 # 无可选 feature：kafka/rabbitmq 事件 broker 已迁插件（Task 4.3，oj-bus-kafka /
