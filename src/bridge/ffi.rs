@@ -230,6 +230,40 @@ impl Drop for FfiEsBackend {
     }
 }
 
+// ---- auth 轴适配器（Task auth-1）：同步 vtable 转发，无 FfiFuture ----
+
+/// auth 守卫适配器：实现 core AuthGuard，经同步 vtable 转发（无 FfiFuture）。
+pub struct FfiAuthGuard {
+    vtable: &'static oj_plugin_ffi::AuthGuardVtable,
+}
+
+impl FfiAuthGuard {
+    pub fn new(vtable: &'static oj_plugin_ffi::AuthGuardVtable) -> Self {
+        Self { vtable }
+    }
+}
+
+impl crate::bridge::auth::AuthGuard for FfiAuthGuard {
+    fn verify(
+        &self,
+        path_no_base: &str,
+        authorization: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let r = (self.vtable.verify)(
+            RString::from(path_no_base),
+            RString::from(authorization.unwrap_or("")),
+        );
+        match std::result::Result::from(r) {
+            Ok(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json[..])
+                    .map_err(|e| format!("auth plugin returned bad json: {e}"))?;
+                Ok(if v.is_null() { None } else { Some(v) })
+            }
+            Err(e) => Err(e[..].to_string()),
+        }
+    }
+}
+
 // ---- db 轴适配器（Task 4.1）：FfiDbBackend（工厂）→ FfiDataAccessor（连接）→ FfiTxSession（事务）----
 
 /// db 工厂适配器：实现 core DbBackend，scheme 由插件 vtable 自我声明（spec §2 认领式）。

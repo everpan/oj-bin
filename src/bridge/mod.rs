@@ -22,6 +22,7 @@
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
 mod accessor_sqlx;
+pub mod auth;
 pub mod blob;
 pub mod broker;
 mod bus;
@@ -52,6 +53,7 @@ pub mod transpile;
 mod ws;
 
 pub use accessor_sqlx::SqlxAccessor;
+pub use auth::AuthGuard;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
 pub use bus::{Bus, EventBroker};
 pub use bus_backend::{BusBackend, BusBackendRegistry};

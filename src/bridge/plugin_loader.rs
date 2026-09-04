@@ -99,6 +99,7 @@ pub struct Registrations {
     pub blob: Option<&'static oj_plugin_ffi::BlobBackendVtable>, // Task 4.2 起填
     pub bus: Option<&'static oj_plugin_ffi::EventBrokerVtable>, // Task 4.3 起填
     pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>,   // Task 4.4 起填
+    pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>, // Task auth-1 起
 }
 
 pub struct LoadedPlugin {
@@ -138,6 +139,18 @@ impl From<&LoadedPlugin> for PluginInfo {
             host_abi_version: ABI_VERSION,
         }
     }
+}
+
+/// 从 auth vtable 构造 core 守卫（oj 装配直接消费注册槽时使用）。
+pub fn auth_guard_from_vtable(
+    vt: &'static oj_plugin_ffi::AuthGuardVtable,
+) -> Arc<dyn crate::bridge::AuthGuard> {
+    Arc::new(super::ffi::FfiAuthGuard::new(vt))
+}
+
+/// 从已加载插件的 auth 注册槽构造 core 守卫（Task auth-1：实现迁入 oj-auth cdylib 插件）。
+pub fn auth_guard(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::AuthGuard>> {
+    loaded.registrations.auth.map(auth_guard_from_vtable)
 }
 
 /// 从已加载插件的 es 注册槽构造 core 适配器（handle 0 = 单 es endpoint 约定）。
@@ -404,6 +417,7 @@ fn load_one(
         blob: raw.blob(),
         bus: raw.bus(),
         kv: raw.kv(),
+        auth: raw.auth(),
     };
 
     Ok(LoadedPlugin {
