@@ -2,7 +2,7 @@
 
 describe("admin role", () => {
   it("GET /role-list → 分页包装 + 种子角色（camelCase）", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/role-list", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -17,7 +17,7 @@ describe("admin role", () => {
   });
 
   it("GET /role-list 过滤 name → 只剩匹配项", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/role-list?name=" + encodeURIComponent("普通"), {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -27,7 +27,7 @@ describe("admin role", () => {
   });
 
   it("role-item POST→PUT→DELETE 闭环（DELETE body 为裸数字）", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
     const created = JSON.parse((await client.post("/role-item", {
       headers: h, body: JSON.stringify({ name: "运营", code: "ops", status: 1, remark: "r" }),
@@ -59,7 +59,7 @@ describe("admin role", () => {
   });
 
   it("GET /role-menu → 精简菜单树（根无 parentId）", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/role-menu", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -71,7 +71,7 @@ describe("admin role", () => {
   });
 
   it("GET /menu-by-role-id?id=1 → 8 个 id；id=2 → []", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
     const all = JSON.parse((await client.get("/menu-by-role-id?id=1", { headers: h })).body);
     expect(all.data.length).toBe(8);
@@ -83,7 +83,7 @@ describe("admin role", () => {
 
 describe("admin user/notify", () => {
   it("GET /user-info → demo 用户，roles 含 admin", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/user-info", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -94,7 +94,7 @@ describe("admin user/notify", () => {
   });
 
   it("GET /get-async-routes → admin 绑定的菜单组成路由树（/system 带子节点）", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/get-async-routes", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -110,7 +110,7 @@ describe("admin user/notify", () => {
   });
 
   it("GET /notifications → 4 条，isRead 为 boolean", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/notifications", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -124,7 +124,7 @@ describe("admin user/notify", () => {
 
 describe("admin home", () => {
   it("GET /home/pie → 5 个品类", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/home/pie?by=month", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -136,7 +136,7 @@ describe("admin home", () => {
   });
 
   it("POST /home/line week/month/year/其他 → 7/当天数/累计天数/[]", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
     const week = JSON.parse((await client.post("/home/line", { headers: h, body: JSON.stringify({ range: "week" }) })).body);
     expect(week.data.length).toBe(7);
@@ -154,7 +154,7 @@ describe("admin home", () => {
 
 describe("admin menu", () => {
   it("GET /menu-list → 8 条种子菜单，keepAlive 为 boolean，order 可缺省", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/menu-list", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -172,7 +172,7 @@ describe("admin menu", () => {
   });
 
   it("menu-item POST→PUT→DELETE 闭环（DELETE body 为裸数字）", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const h = { Authorization: "Bearer " + token, "X-TENANT-ID": "default" };
     const created = JSON.parse((await client.post("/menu-item", {
       headers: h,

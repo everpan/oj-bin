@@ -2,7 +2,7 @@
 
 describe("user account", () => {
   it("lists accounts (auth + tenant) → 200 array", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -13,7 +13,7 @@ describe("user account", () => {
   });
 
   it("creates an account via POST → 200 created", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.post("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
       body: JSON.stringify({ name: "tank", role: "user" }),
@@ -24,7 +24,7 @@ describe("user account", () => {
   });
 
   it("rejects invalid role → 400", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.post("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
       body: JSON.stringify({ name: "x", role: "king" }),
@@ -33,7 +33,7 @@ describe("user account", () => {
   });
 
   it("OPTIONS reports supported methods → 200", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.options("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });

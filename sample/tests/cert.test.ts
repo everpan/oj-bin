@@ -6,8 +6,8 @@ const USER = { Authorization: "", "X-TENANT-ID": "default" };
 
 describe("cert", () => {
   beforeEach(async () => {
-    ADMIN.Authorization = "Bearer " + (await client.login("demo", "demo1234"));
-    USER.Authorization = "Bearer " + (await client.login("trinity", "demo1234"));
+    ADMIN.Authorization = "Bearer " + (await client.login("demo", "demo1234", { "X-TENANT-ID": "default" }));
+    USER.Authorization = "Bearer " + (await client.login("trinity", "demo1234", { "X-TENANT-ID": "default" }));
   });
 
   it("user role gets 403 on create", async () => {

@@ -200,8 +200,8 @@ declare global {
     patch(path: string, opts?: ClientOptions): Promise<ClientResp>;
     head(path: string, opts?: ClientOptions): Promise<ClientResp>;
     options(path: string, opts?: ClientOptions): Promise<ClientResp>;
-    // 登录助手：POST /auth/login → 返回 access_token（失败抛错）。
-    login(username: string, password: string): Promise<string>;
+    // 登录助手：POST /auth/login → 返回 access_token（失败抛错）。headers 透传（如租户头）。
+    login(username: string, password: string, headers?: Record<string, string>): Promise<string>;
   }
   const client: Client;
 

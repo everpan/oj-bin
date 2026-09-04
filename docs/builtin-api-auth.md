@@ -1,7 +1,8 @@
 # 内置 API 与鉴权逻辑（新人向）
 
 本文梳理 `only-js` 服务层**内置接口**（不走业务路由表、由 Rust 直接处理的端点）及
-auth 鉴权全链路。代码依据：`server/src/lib.rs` 的 `handle()`、`server/src/auth.rs`、
+auth 鉴权全链路。代码依据：`server/src/lib.rs` 的 `handle()`、`src/bridge/auth.rs`
+（`AuthGuard` trait）、`plugins/oj-auth`（守卫插件）、`sample/src/auth/`（JS 端点）、
 `src/config.rs`。
 
 ## 一、内置接口总览
@@ -11,16 +12,18 @@ auth 鉴权全链路。代码依据：`server/src/lib.rs` 的 `handle()`、`serv
 | 端点 | 方法 | 鉴权 | 说明 | 代码位置 |
 |---|---|---|---|---|
 | `{base}/health` | GET | 无 | 健康检查 + 证书状态（证书过期/宽限期仍可访问，供监控） | `lib.rs` `health_handler` |
-| `{base}/auth/login` | POST | 无 | 登录：用户名+密码 → 双 token | `lib.rs` → `auth.rs::login` |
-| `{base}/auth/refresh` | POST | 无 | refresh 轮换：旧换新，旧立即失效 | `auth.rs::refresh` |
-| `{base}/auth/logout` | POST | 无 | 登出：删 session | `auth.rs::logout` |
 | `{base}/blob/{key}` | GET | 无（公开） | blob 下载：local 直出字节 / s3 302 presign | `lib.rs` blob 分支 |
 | 静态站点 | GET/HEAD | 无 | `server.app_path` 配的目录，优先级最低 | `resolve_static` |
 
 其余所有请求进入**业务路由**：路由表命中 → 前置管线（鉴权/租户/上传）→ JS handler。
 
-开启方式：`config.yaml` 里 `auth:` 非空才挂 auth 路由和 Bearer 守卫；`blob:` 非空才挂
-下载路由。`auth` 配了但 `jwt_secret` 为空 → 启动 fail-fast，不静默跳过。
+`{base}/auth/login|refresh|logout` **不再是内置路由**：它们是普通业务路由，由 JS 模块
+`sample/src/auth/` 实现（`db` 查用户表、`bcrypt.verify` 校验、`jwt` 原语签发双 token），
+鉴权则由 `oj-auth` 插件守卫在前置管线完成（验签 + `anonymous_paths` 匹配）。auth 端点
+自身须在 `auth.anonymous_paths` 里显式匿名（如 `/auth/login`）。
+
+开启方式：`config.yaml` 里 `auth:` 非空才装配 `oj-auth` 守卫（`auth` 配了但 `jwt_secret`
+为空 → 启动 fail-fast，不静默跳过）；`blob:` 非空才挂下载路由。
 
 ## 二、请求处理总流程（`handle()` 的分支优先级）
 
@@ -28,9 +31,7 @@ auth 鉴权全链路。代码依据：`server/src/lib.rs` 的 `handle()`、`serv
 flowchart TD
     A[请求进入 axum catch-all] --> B{GET 且证书过期/宽限期?}
     B -- 是 --> B1[403 信封<br/>health 路由除外]
-    B -- 否 --> C{路径是 base/auth/* 且已启用 auth?}
-    C -- 是 --> C1[login/refresh/logout<br/>POST only, 其余 405]
-    C -- 否 --> D{GET 且路径是 base/blob/key?}
+    B -- 否 --> D{GET 且路径是 base/blob/key?}
     D -- 是 --> D1[blob 下载<br/>local 直出 / s3 302]
     D -- 否 --> E{路由表 lookup 命中?}
     E -- 冲突 --> E1[500 route conflict]
@@ -42,7 +43,7 @@ flowchart TD
     H -- 是 --> H1[返回静态文件<br/>带穿越防护]
     H -- 否 --> I[404 no route matched]
 
-    F --> F1{auth 启用且路径非匿名?}
+    F --> F1{auth 启用且路径非匿名?<br/>oj-auth 插件守卫}
     F1 -- 是 --> F2{Bearer token 验签通过?}
     F2 -- 否 --> F3[401]
     F2 -- 是 --> F4[注入 http.user]
@@ -53,59 +54,63 @@ flowchart TD
     F6 --> F8{body 超 max_upload?}
     F8 -- 是 --> F9[413]
     F8 -- 否 --> F10[multipart 解析<br/>文本入 body, 文件入 http.files]
-    F10 --> F11[JsActor.run_module 执行 JS handler]
+    F10 --> F11[JsActor.run_module 执行 JS handler<br/>login/refresh/logout 也是这条路径]
     F11 --> F12{结果}
     F12 -- Capture --> F13[按 status/headers/body 回写]
     F12 -- 超时 --> F14[408]
     F12 -- 其他错误 --> F15[500]
 ```
 
-## 三、登录时序（`POST /auth/login`）
+## 三、登录时序（`POST /auth/login`，JS 业务实现）
 
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant S as handle/auth 路由
-    participant DB as 用户表 (auth.user_table)
+    participant G as oj-auth 守卫（匿名放行 /auth/login）
+    participant J as JS handler (sample/src/auth/login)
+    participant DB as 用户表 (_platform.users)
     participant KV as KV (session 存储)
 
-    C->>S: POST {username, password}
-    S->>DB: select id, password_hash, roles where username = ?
-    DB-->>S: 用户行
-    Note over S: 用户不存在或 bcrypt 校验失败<br/>统一报 "invalid credentials"<br/>不泄露用户是否存在
-    S->>S: 签 access token (JWT: sub/roles/iat/exp)
-    S->>S: 生成 refresh token (32 随机字节 hex, 不透明串)
-    S->>KV: set AUTH-SESSION:sha256(refresh)<br/>{uid, exp=now+refresh时长}
-    S-->>C: 200 ok 信封<br/>{access_token, refresh_token, expires_in, user}
+    C->>G: POST {username, password}
+    G->>J: 匿名路径放行，进入业务 handler
+    J->>DB: select id, password_hash, roles where username = ?
+    DB-->>J: 用户行
+    Note over J: 用户不存在或 bcrypt 校验失败<br/>统一报 "invalid credentials"<br/>不泄露用户是否存在
+    J->>J: jwt.sign 签 access token (sub/roles/iat/exp)
+    J->>J: 生成 refresh token (32 随机字节 hex, 不透明串)
+    J->>KV: set AUTH-SESSION:sha256(refresh)<br/>{uid, exp=now+refresh时长}
+    J-->>C: 200 ok 信封<br/>{access_token, refresh_token, expires_in, user}
 ```
 
-## 四、Refresh 轮换（`POST /auth/refresh`）
+## 四、Refresh 轮换（`POST /auth/refresh`，JS 业务实现）
 
 ```mermaid
 sequenceDiagram
     participant C as 客户端
-    participant S as Auth
+    participant G as oj-auth 守卫（匿名放行 /auth/refresh）
+    participant J as JS handler (sample/src/auth/refresh)
     participant DB as 用户表
     participant KV as KV
 
-    C->>S: POST {refresh_token}
-    S->>KV: get AUTH-SESSION:sha256(token)
+    C->>G: POST {refresh_token}
+    G->>J: 匿名路径放行，进入业务 handler
+    J->>KV: get AUTH-SESSION:sha256(token)
     alt session 不存在或已过期 (惰性判定 exp)
-        S-->>C: 401 invalid or expired refresh token
+        J-->>C: 401 invalid or expired refresh token
     else 有效
-        S->>DB: select roles where id = uid
-        Note over S: session 只存 uid, roles 重查库取最新
-        S->>KV: del 旧 session (旧 refresh 立即失效, 一次一用)
-        S->>S: 签新 token 对 + 落新 session
-        S-->>C: 200 新 {access_token, refresh_token, ...}
+        J->>DB: select roles where id = uid
+        Note over J: session 只存 uid, roles 重查库取最新
+        J->>KV: del 旧 session (旧 refresh 立即失效, 一次一用)
+        J->>J: 签新 token 对 + 落新 session
+        J-->>C: 200 新 {access_token, refresh_token, ...}
     end
 ```
 
-## 五、业务请求的 Bearer 守卫
+## 五、业务请求的 Bearer 守卫（oj-auth 插件）
 
 ```mermaid
 flowchart TD
-    A[业务请求] --> B{auth 已启用?}
+    A[业务请求] --> B{auth 已启用?<br/>装配了 oj-auth 守卫?}
     B -- 否 --> Z[直接进 handler]
     B -- 是 --> C{路径去 base 后<br/>命中 anonymous_paths?}
     C -- 是 --> Z
@@ -115,19 +120,21 @@ flowchart TD
     F --> Z
 ```
 
-匿名路径匹配规则（`is_anonymous`）：精确匹配，或尾部 `/*` 做**一层**前缀通配——
-`/pub/*` 命中 `/pub/x`，不命中 `/pub` 本身。
+匿名路径匹配规则（oj-auth 插件内）：精确匹配，或尾部 `/*` 做**一层**前缀通配——
+`/pub/*` 命中 `/pub/x`，不命中 `/pub` 本身。宿主通过 `AuthGuard` trait（`src/bridge/auth.rs`）
+以 FFI 调用插件，返回 `http.user`（JSON）或错误串。
 
 ## 六、关键认知
 
 1. **双 token 模型**：access 是 JWT（无服务端状态，logout 后到期前仍有效，已知取舍）；
    refresh 是不透明随机串，服务端 session 存 KV，键 = `AUTH-SESSION:` + sha256(token)，
    可吊销、一次一用（轮换）。
-2. **内置路由优先于业务路由**：`auth/*` 和 `blob/*` 在路由表查找之前被拦截，业务代码
-   无法用同名路径覆盖它们。
-3. **用户表约定**：`auth.user_table`（默认 `users`）需有
-   `id / username / password_hash(bcrypt) / roles(JSON 数组字符串)` 四列；表名过白名单
-   校验（`[A-Za-z0-9_]{1,64}`），查询全部走绑定参数。
+2. **守卫在路由表命中后的前置管线执行；auth 端点是普通业务路由**：`/auth/*` 不再被
+   内置拦截，业务代码可用同名路径覆盖/改写它（如 `sample/src/auth/`）；`blob/{key}`
+   仍由 Rust 在路由表之前直接处理。
+3. **用户表约定**：`users` 表（`_platform` 伪模块持有归属）需有
+   `id / username / password_hash(bcrypt) / roles(JSON 数组字符串)` 四列；JS 端点
+   查询全部走绑定参数。
 4. **鉴权只设防 base 之内**：路径不在 `base` 前缀下（`path_no_base = None`）时不做
    Bearer 检查，交给后续静态/404 分支。
 5. **信封统一**：成功走 `{code,msg,data}` ok 信封；所有失败（401/400/405/413/408/500）
@@ -142,4 +149,3 @@ flowchart TD
 | `access_token_duration` | `60s` | access token 有效期 |
 | `refresh_token_duration` | `720h` | refresh token / session 有效期 |
 | `anonymous_paths` | `[]` | 免鉴权路径（去 base 后），尾部 `/*` 一层通配 |
-| `user_table` | `users` | 用户表名（标识符白名单校验） |

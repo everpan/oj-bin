@@ -61,7 +61,7 @@ cargo run -p oj -- test -c sample/config.yaml -d sample/src \
 ```ts
 describe("user account", () => {
   it("lists accounts (auth + tenant)", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
@@ -77,14 +77,16 @@ describe("user account", () => {
 
 - `client.<get|post|put|del|patch|head|options>(path, opts?)` —— `opts = { headers?, body? }`，
   返回 `ClientResp { status, headers, body, upgrade }`。`path` 为**相对 base** 的路径，如 `/user/account`。
-- `client.login(username, password)` —— POST 内置 `/auth/login`，返回 `access_token`。
+- `client.login(username, password, headers?)` —— POST `/auth/login`（headers 透传给请求，
+  如 `{ "X-TENANT-ID": "default" }`），返回 `access_token`。
 - `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` / `expect(actual).toBe|toEqual|toBeTruthy|toBeFalsy|toContain`。
 
 **两个必知约束（由 config 决定）**
 
-1. **多租户**：config 启用 `tenant` 后，每个请求都必须带 `X-TENANT-ID` 头，否则 400。
-2. **鉴权**：config 启用 `auth` 后，除匿名路径（`/health`）外都要带 `Authorization: Bearer <token>`，
-   否则 401。`client.login` 仅用于拿 token，自身不需要这两个头。
+1. **多租户**：config 启用 `tenant` 后，每个请求（含 login/refresh/logout）都必须带
+   `X-TENANT-ID` 头，否则 400——`client.login` 的第三个参数就是干这个的。
+2. **鉴权**：config 启用 `auth` 后，除匿名路径（`/health` 与 `anonymous_paths` 配的
+   `/auth/*`）外都要带 `Authorization: Bearer <token>`，否则 401。`client.login` 仅用于拿 token。
 
 > `beforeEach` 注册的是单一全局钩子，跨多个 `describe` 会被覆盖；多 describe 文件建议在各 `it`
 > 内联准备（如每个用例自己 `client.login`），避免互相干扰。

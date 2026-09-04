@@ -454,9 +454,10 @@ await db.tx(async (tx) => {
 
 ### JWT 鉴权（auth）
 
-配置 `auth:` 块存在即启用两层能力：
+配置 `auth:` 块存在即启用两层能力：**端点**（JS 业务实现，可改写/覆盖）与
+**Bearer 守卫**（oj-auth 插件，前置管线统一执行）。
 
-**内置路由**（`{base}/auth/*`，POST only，不占业务模块名空间）：
+**端点**（普通业务路由，由 `sample/src/auth/` JS 模块实现；业务代码可用同名路径改写）：
 
 | 路由 | 请求体 | 响应 data |
 |---|---|---|
@@ -464,12 +465,13 @@ await db.tx(async (tx) => {
 | `POST /auth/refresh` | `{"refresh_token"}` | 同上（**轮换**：旧 refresh 立即失效） |
 | `POST /auth/logout` | `{"refresh_token"}` | `null`（删 refresh session；access 到期前仍有效） |
 
-**Bearer 守卫**：`{base}` 内非匿名路径必须带 `Authorization: Bearer <access_token>`
-（缺失/验签失败/过期 → 401）；通过后 handler 里读 `http.user`（`{id, roles, claims}`）。
+**Bearer 守卫**（oj-auth 插件）：`{base}` 内非匿名路径必须带
+`Authorization: Bearer <access_token>`（缺失/验签失败/过期 → 401）；通过后 handler 里读
+`http.user`（`{id, roles, claims}`）。
 
 - 匿名路径 `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，尾 `/*` 一层通配
-  （`/pub/*` 命中 `/pub/x` 不命中 `/pub`）。
-- 用户表 `auth.user_table`（默认 `users`）最小 schema：
+  （`/pub/*` 命中 `/pub/x` 不命中 `/pub`）。auth 端点自身是业务路由，须在此显式匿名。
+- 用户表 `users`（`_platform` 伪模块持有归属）最小 schema：
   `id, username, password_hash(bcrypt), roles(JSON 数组串，如 '["admin"]')`。
 - 登录失败统一报 `invalid credentials`（不区分用户不存在/密码错）。
 - `{base}` 之外的路径（静态站点等）不设防。

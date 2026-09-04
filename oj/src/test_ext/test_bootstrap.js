@@ -16,10 +16,11 @@ function buildClient() {
     c[m] = (path, opts = {}) =>
       op_client_dispatch(wire, path, opts.headers ?? {}, opts.body ?? "");
   }
-  // login helper: POST built-in /auth/login -> returns data.access_token.
-  // usage: const token = await client.login("demo", "demo1234");
-  c.login = async (username, password) => {
+  // login helper: POST /auth/login -> returns data.access_token.
+  // usage: const token = await client.login("demo", "demo1234", {"X-TENANT-ID": "default"});
+  c.login = async (username, password, headers) => {
     const r = await c.post("/auth/login", {
+      headers: headers || {},
       body: JSON.stringify({ username, password }),
     });
     if (r.status !== 200) throw new Error("login failed: " + r.status);

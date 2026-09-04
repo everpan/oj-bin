@@ -10,7 +10,7 @@ describe("news", () => {
   });
 
   it("publish with auth + tenant → 200 published", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.post("/news", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
       body: JSON.stringify({ text: "breaking" }),

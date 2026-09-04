@@ -3,7 +3,7 @@
 
 describe("tenant", () => {
   it("missing tenant header → 400", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/auth_demo/health", {
       headers: { Authorization: "Bearer " + token },
     });
@@ -11,7 +11,7 @@ describe("tenant", () => {
   });
 
   it("empty tenant header → 400", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/auth_demo/health", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "" },
     });
@@ -19,7 +19,7 @@ describe("tenant", () => {
   });
 
   it("valid tenant header → 200", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/auth_demo/health", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });
