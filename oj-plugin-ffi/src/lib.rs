@@ -34,7 +34,8 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 4 = Task 4.3 起（PluginRegistrations 增 bus 槽位 + EventBrokerVtable + HostContext 增 deliver）。
 /// 5 = Task 4.4 起（PluginRegistrations 增 kv 槽位 + KVStoreVtable）。
 /// 6 = auth 解耦起（PluginRegistrations 增 auth 槽位 + AuthGuardVtable）。
-pub const ABI_VERSION: u32 = 6;
+/// 7 = 按轴 dlsym（删 PluginRegistrations/register，加轴自此零破坏）。
+pub const ABI_VERSION: u32 = 7;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -56,60 +57,8 @@ pub struct PluginDescriptor {
     pub abi_version: u32,
     /// 构建指纹（诊断用，不匹配仅告警）。
     pub fingerprint: RString,
-    /// 注册回调：宿主在 init 返回后立即调用取得各轴 vtable 槽位（spec §3，
-    /// 全部工厂注册须在 init 调用窗口内完成——槽位指向的静态表在 init 时就绪）。
-    pub register: extern "C" fn() -> PluginRegistrations,
-}
-
-/// 各轴 vtable 槽位（repr(C)；null = 该插件不提供此轴。加字段 = ABI bump）。
-/// db 槽位 = 单个插件自带 vtable（schemes 由 vtable 自我声明），
-/// 多 db 插件并存：宿主遍历各插件读各自 db 槽（scheme 交集冲突在注册时 fail fast）。
-#[stabby::stabby]
-#[repr(C)]
-pub struct PluginRegistrations {
-    pub es: *const EsBackendVtable,
-    pub db: *const DataAccessorVtable,
-    pub blob: *const BlobBackendVtable,
-    pub bus: *const EventBrokerVtable,
-    pub kv: *const KVStoreVtable,     // Task 4.4 起
-    pub auth: *const AuthGuardVtable, // Task auth-1 起
-}
-
-impl PluginRegistrations {
-    pub fn none() -> Self {
-        Self {
-            es: std::ptr::null(),
-            db: std::ptr::null(),
-            blob: std::ptr::null(),
-            bus: std::ptr::null(),
-            kv: std::ptr::null(),
-            auth: std::ptr::null(),
-        }
-    }
-
-    pub fn es(&self) -> Option<&'static EsBackendVtable> {
-        unsafe { self.es.as_ref() }
-    }
-
-    pub fn db(&self) -> Option<&'static DataAccessorVtable> {
-        unsafe { self.db.as_ref() }
-    }
-
-    pub fn blob(&self) -> Option<&'static BlobBackendVtable> {
-        unsafe { self.blob.as_ref() }
-    }
-
-    pub fn bus(&self) -> Option<&'static EventBrokerVtable> {
-        unsafe { self.bus.as_ref() }
-    }
-
-    pub fn kv(&self) -> Option<&'static KVStoreVtable> {
-        unsafe { self.kv.as_ref() }
-    }
-
-    pub fn auth(&self) -> Option<&'static AuthGuardVtable> {
-        unsafe { self.auth.as_ref() }
-    }
+    /// 人类可读描述（插件作者自述；host 收集并在 GET {base}/plugins 公开）。
+    pub desc: RString,
 }
 
 /// 宿主回调集（RArc 共享所有权传入，进程级有效；不提供 registry lookup——插件互不可见）。
@@ -123,14 +72,18 @@ pub struct HostContext {
     pub deliver: extern "C" fn(topic: RString, payload: RString),
 }
 
-/// 插件入口两符号（由宏生成，禁止手写 #[no_mangle] 绕过，spec §3）：
-///   oj_plugin_abi_version() -> u32
-///   oj_plugin_init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString>
-/// 宏内建 catch_unwind(AssertUnwindSafe(..))，panic 映射为 RResult 错误。
-/// 插件 crate 必须保留 panic=unwind（profile 不得覆盖为 abort）。
+/// 插件入口宏：生成 oj_plugin_abi_version / oj_plugin_init（catch_unwind 收敛）/
+/// 每轴一个 `oj_plugin_axis_<name>` 导出符号（返回静态 vtable 指针，擦除为 *const c_void）。
+/// 用法：
+///   oj_plugin_entry!(init);                                          // 零轴
+///   oj_plugin_entry!(init, kv => &KV_VTABLE);                        // 单轴
+///   oj_plugin_entry!(init, kv => &KV_VTABLE, auth => &AUTH_VTABLE);  // 多轴
+/// 轴标识写入符号前强制小写（宿主探测表全小写）；未提供的轴不导出符号 = 不提供该轴。
+/// 注意：vtable 方法须在实现侧以 catch_value/catch_future 收敛 panic——宿主对
+/// vtable 方法无 catch_unwind（本宏只保护 init）。
 #[macro_export]
 macro_rules! oj_plugin_entry {
-    ($init:expr) => {
+    ($init:expr $(, $axis:ident => $vtable:expr)* $(,)?) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn oj_plugin_abi_version() -> u32 {
             $crate::ABI_VERSION
@@ -152,6 +105,15 @@ macro_rules! oj_plugin_entry {
                 }
             }
         }
+
+        $(
+            ::paste::paste! {
+                #[unsafe(no_mangle)]
+                pub extern "C" fn [<oj_plugin_axis_ $axis:lower>]() -> *const ::core::ffi::c_void {
+                    $vtable as *const _ as *const ::core::ffi::c_void
+                }
+            }
+        )*
     };
 }
 
@@ -162,5 +124,45 @@ mod tests {
     #[test]
     fn host_fingerprint_is_nonempty() {
         assert!(HOST_FINGERPRINT.contains("oj-plugin-ffi"));
+    }
+
+    // 假 vtable：只需静态可寻址，不需要真实字段全贯通（贯通由 loader 测试覆盖）。
+    #[repr(C)]
+    struct FakeVt {
+        _pad: u8,
+    }
+    static FAKE_A: FakeVt = FakeVt { _pad: 0 };
+    static FAKE_B: FakeVt = FakeVt { _pad: 1 };
+
+    // 每次展开都生成 oj_plugin_abi_version / oj_plugin_init 两个 no_mangle 符号，
+    // 同一二进制只能展开一次 → 此处用多轴用法（abi/init/轴符号一次全覆盖）；
+    // 零轴用法由 tests/entry_good.rs（独立测试二进制）覆盖。
+    // 假轴名 fakea/fakeb 避免撞真轴/宿主符号。
+    mod macro_smoke {
+        use super::{FAKE_A, FAKE_B, FakeVt};
+
+        oj_plugin_entry!(
+            test_axes_init,
+            fakea => &FAKE_A,
+            fakeb => &FAKE_B
+        );
+
+        fn test_axes_init(
+            _: crate::RArc<crate::HostContext>,
+            _: crate::RString,
+        ) -> crate::RResult<crate::PluginDescriptor, crate::RString> {
+            unreachable!()
+        }
+
+        #[test]
+        fn axis_symbols_export_vtable_pointers() {
+            type Sym = unsafe extern "C" fn() -> *const std::ffi::c_void;
+            let a: Sym = oj_plugin_axis_fakea;
+            let b: Sym = oj_plugin_axis_fakeb;
+            unsafe {
+                assert_eq!(a(), &FAKE_A as *const FakeVt as *const std::ffi::c_void);
+                assert_eq!(b(), &FAKE_B as *const FakeVt as *const std::ffi::c_void);
+            }
+        }
     }
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+paste = "1"
 stabby = "72"
 # 仅用于提供跨边界安全（catch_unwind 包裹）的 FfiFuture 工厂；与宿主侧 tokio 同版本。
 tokio = { version = "1", features = ["rt", "sync"] }
