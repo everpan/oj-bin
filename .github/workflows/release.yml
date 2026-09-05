@@ -31,7 +31,26 @@ permissions:
   contents: write
 
 jobs:
+  # 格式与 lint 门禁（CLAUDE.md：CI 使用 -D warnings）。平台无关，单实例跑一次即可，
+  # 不放进三平台矩阵重复执行。
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --workspace --all-targets -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   package:
+    needs: [lint]
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
