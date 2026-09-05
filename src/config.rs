@@ -219,6 +219,8 @@ pub struct BrokerCfg {
 pub struct TenantCfg {
     pub enable: bool,
     pub header_key: String,
+    /// 浏览器跳转腿豁免（去 base 后路径；尾 "/*" 一层通配）——OIDC 回跳带不了自定义头。
+    pub anonymous_paths: Vec<String>,
 }
 
 impl Default for TenantCfg {
@@ -226,6 +228,7 @@ impl Default for TenantCfg {
         Self {
             enable: false,
             header_key: "X-TENANT-ID".into(),
+            anonymous_paths: Vec::new(),
         }
     }
 }
@@ -255,6 +258,38 @@ impl Default for AuthCfg {
     }
 }
 
+/// RP 客户端注册：tenant → 外部 IdP（issuer + 凭证）。
+#[derive(Debug, Deserialize, Clone)]
+pub struct OidcRpCfg {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(default = "default_oidc_scope")]
+    pub scope: String,
+}
+
+fn default_oidc_scope() -> String {
+    "openid".into()
+}
+
+/// OP 侧 client 白名单：redirect_uri 精确串 + 租户绑定。
+#[derive(Debug, Deserialize, Clone)]
+pub struct OidcClientCfg {
+    pub secret: String,
+    pub redirect_uris: Vec<String>,
+    pub tenant: String,
+}
+
+/// OIDC（spec 2026-09-05 §3.1）：段存在即启用；private_key_path 相对 config 目录。
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct OidcSection {
+    pub issuer: String,
+    pub private_key_path: String,
+    pub rp: HashMap<String, OidcRpCfg>,
+    pub clients: HashMap<String, OidcClientCfg>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -266,6 +301,8 @@ pub struct Config {
     pub tenant: TenantCfg,
     /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
     pub auth: Option<AuthCfg>,
+    /// None = 不启用 OIDC。
+    pub oidc: Option<OidcSection>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
     pub blob: Option<BlobSection>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
@@ -537,6 +574,42 @@ mod tests {
         assert_eq!(a.refresh_token_duration, "720h");
         assert!(a.anonymous_paths.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oidc_section_and_tenant_anonymous_paths_parse() {
+        let c: Config = serde_yaml::from_str(
+            "oidc:\n\
+             \x20 issuer: \"https://idp.example\"\n\
+             \x20 private_key_path: \"config/oidc.pem\"\n\
+             \x20 rp:\n\
+             \x20   acme:\n\
+             \x20     issuer: \"https://acme.example\"\n\
+             \x20     client_id: \"cid\"\n\
+             \x20     client_secret: \"sec\"\n\
+             \x20 clients:\n\
+             \x20   web:\n\
+             \x20     secret: \"s2\"\n\
+             \x20     redirect_uris: [\"http://x/cb\"]\n\
+             \x20     tenant: \"acme\"\n\
+             tenant:\n\
+             \x20 enable: true\n\
+             \x20 anonymous_paths: [\"/oidc/*\"]\n",
+        )
+        .unwrap();
+        let o = c.oidc.as_ref().unwrap();
+        assert_eq!(o.issuer, "https://idp.example");
+        assert_eq!(o.rp["acme"].client_id, "cid");
+        assert_eq!(o.rp["acme"].scope, "openid"); // 缺省 scope
+        assert_eq!(o.clients["web"].redirect_uris[0], "http://x/cb");
+        assert_eq!(c.tenant.anonymous_paths, vec!["/oidc/*".to_string()]);
+    }
+
+    #[test]
+    fn oidc_section_absent_is_none_and_tenant_anon_defaults_empty() {
+        let c: Config = serde_yaml::from_str("tenant:\n  enable: true\n").unwrap();
+        assert!(c.oidc.is_none());
+        assert!(c.tenant.anonymous_paths.is_empty());
     }
 
     #[test]
