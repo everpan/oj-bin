@@ -24,7 +24,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
   绝不来自 JS 字符串拼接；值**只**通过绑定参数（`db.query("... where id = ?", [id])`）。
 - **方法名**：DELETE 的方法名是 `del`，不是 `delete`（`get/post/put/del/patch/head/options`）。
 - **信封**：业务响应只经 `json.ok(data)` / `json.fail(code, msg, data?)` 写回，
-  HTTP 状态 = `code`（0→200）。
+  HTTP 状态 = `code`（0→200）；标准协议端点（对外契约 JSON）可用 `json.raw(data)`
+  出裸 JSON 200（§6）。
 - 路径参数（`http.param`）已 percent-decode，仅用于参数化查询与类型转换，
   **勿拼接文件路径 / URL**。
 

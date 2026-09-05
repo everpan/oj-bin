@@ -173,6 +173,13 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | `es …: HTTP 4xx/5xx: …` | ES 端错误（索引缺失/DSL 错/ES 未起），直通返回体 | 看返回体排障；`es.index` 自带 refresh=true，写完即可查 |
 | 启动报 `certificate expired` / `certificate has expired and grace period elapsed` | 证书已过期且宽限期结束（`exp` + `grace_days` 仍早于现在） | 重签续期：构建 `cargo build -p oj-cert --release`（工具在 `tools/oj-cert`，不随发行包）后 `target/release/oj-cert renew -k private.pem` 使 `exp` 晚于现在，替换证书文件后重启（运行中替换则热重载即时生效）；调大 `grace_days` 仅延长宽限、不改 `exp` |
 | GET 全部 403 `certificate expired` | 运行中证书被热加载切到 grace / expired（或启动即处该状态） | 替换证书文件（热加载即时生效）；查 `GET {base}/health` 的 `certificate_status` |
+| `oidc not configured` 报错 | JS 调 `oidc.*` 但 config 无 `oidc:` 段（或缺私钥路径未通过启动校验） | 加 `oidc:` 段（`issuer` + `private_key_path`），见 `docs/oidc-integration.md` |
+| 启动报 `oidc: issuer must not be empty` / `parse pkcs8 pem` | `oidc:` 段存在但 issuer/私钥路径为空，或私钥不是 PKCS#8 PEM（fail-fast） | 补 issuer；用 `openssl genpkey -algorithm RSA …` 或 `oj-cert gen` 重新生成私钥 |
+| `/oidc/login` → 502 `discovery failed` | `oidc.rp.<tenant>.issuer` 不可达 / 无 discovery 端点 /  issuer 写错 | `curl <issuer>/.well-known/openid-configuration` 自查；网络/代理核对 |
+| `/oidc/callback` → 401 `invalid or expired state` | state 已消费（一次一用）或超 10 分钟，或 KV 多实例不共享 | 从 `/oidc/login` 重新起流程；多实例部署必须配共享 KV（Redis） |
+| `/oidc/callback` → 401 `id_token verification failed` / `claims mismatch` | IdP 轮换密钥（kid 不匹配）、token 被篡改，或 nonce/iss/aud 与快照不符 | 核对 issuer 逐字一致；重登；确认 IdP 签名算法为 RS256 |
+| authorize → 400 `redirect_uri not registered` | 跳转地址不在 `oidc.clients.<id>.redirect_uris` 精确白名单 | 白名单为精确串匹配（scheme/host/端口/路径全同），补注册或改地址 |
+| OP 登录后 `/idp/authorize` 仍 401 `login required` | `IDP_SESSION` cookie 未带上（跨域丢失/过期/Path 不符）或 OP 会话 KV 过期 | 带 cookie 重试（curl `-b`）；会话 TTL 取 `auth.refresh_token_duration` |
 | 启动报 `invalid public key` / `signature verification failed` | 公钥 PEM 非法，或 JWS 签名与公钥不匹配 | 核对密钥对一致、签名算法为 RS256；用同一私钥重签 JWS |
 | 启动报 `invalid JWS format` | `certificate.jws` 不是三段 `Base64URL(Header).Payload.Signature` | 按 `Header.Payload.Signature` 重新生成 JWS |
 | 启动报 `certificate is mandatory but not configured` | 证书必配（无逃生口）但 `public_key_path`/`certificate_path` 缺任一 | 两个路径都配齐；**没有任何开关可跳过证书校验**——若实例连不上证书，需生成并挂载（见 §3 证书校验） |

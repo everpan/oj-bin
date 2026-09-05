@@ -8,7 +8,8 @@
 ┌──────────────── JS handler ───────────────┐
 │  json / db / DB / http / kv / redis       │
 │  / blob / bus / es / ws / cert / jwt      │
-│  / bcrypt / crypto / fetch / log / finish │
+│  / bcrypt / crypto / oidc / fetch / log   │
+│  / finish                                 │
 │        (bootstrap.js 装配，全参考见        │
 │         devkit/api-manual.md)             │
 └───────────────── op 调用 ────────────────┘
@@ -40,6 +41,7 @@
 json.ok(data)              // {code:0, msg:"ok", data} → status 200，标记会话完成
 json.fail(code, msg, data) // code<=0 映射 500
 json.header(name, value)   // 设置返回头（覆盖语义），空名忽略
+json.raw(data)             // 裸 JSON 200（无信封外壳），标准协议端点用（OP discovery/token 等）
 ```
 
 信封在 Rust 侧单遍序列化（不构中间 `Value` 树，直接写 buffer），marshal 成本约 70 ns。
@@ -115,6 +117,19 @@ HTTP 客户端为单个共享 reqwest Client（连接池复用），构造时固
 
 > 注意：reqwest 默认会读取 macOS 系统代理配置，本机有代理软件时连回环地址都会被
 > 拦截转发——这是 `no_proxy` 的直接原因。
+
+### oidc —— RS256 签发/验签原语（`oidc:` 配置段启用）
+
+```js
+const jws = oidc.sign({ iss, sub, aud, iat, exp, nonce });  // RS256 紧凑 JWS（header 带 kid）
+const claims = oidc.verify(token);               // 本机公钥验签
+const remote = oidc.verify(token, jwks);         // 远端 JWKS 按 kid 匹配（RP 验外部 IdP）
+const keys = oidc.jwks();                        // 本机公钥 JWKS
+oidc.issuer; oidc.rp; oidc.clients;              // 配置只读透出
+```
+
+算法锁定 RS256、leeway 0、验 exp；密钥只在 Rust 侧持有。语义与配置见
+`devkit/api-manual.md` §6/§10，OP/RP 实现见 `oidc-implementation.md`。
 
 ### finish —— 标记会话完成
 

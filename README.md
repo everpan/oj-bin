@@ -32,7 +32,7 @@ and have the host absorb everything else" is**. The trade-offs here differ marke
   deterministic `.tgz` for publishing.
 - **Safety rails sink into Rust**: dynamic SQL identifiers (table/column names) can only come
   from the Rust-side `SchemaRegistry` allowlist, and values only go through bound parameters —
-  even a business-side mistake can't assemble an injection. Multi-tenancy, JWT auth, certificate
+  even a business-side mistake can't assemble an injection. Multi-tenancy, JWT auth, OIDC (built-in OP + RP), certificate
   validation, and static path-traversal guards all live in the host, not in business discipline.
 - **Zero-config routing**: the directory mirror *is* the route — no registration code to write
   (see below).
@@ -178,6 +178,11 @@ tenant:       # multi-tenancy: request must carry header_key, value injected as 
 auth:         # JWT: built-in /v1/api/auth/{login,refresh,logout} + Bearer guard
   jwt_secret: "change-me"
   anonymous_paths: ["/health"]
+oidc:         # optional: built-in OP (idp) + RP — standard OIDC code flow + PKCE S256 + RS256
+  issuer: "http://localhost:9778/v1/api/idp"
+  private_key_path: "./config/oidc_rs256.pem"
+  rp: { default: { issuer: "http://localhost:9778/v1/api/idp", client_id: "app", client_secret: "...", scope: "openid" } }
+  clients: { app: { secret: "...", redirect_uris: ["http://localhost:9778/v1/api/oidc/callback"], tenant: "default" } }
 ```
 
 ---
@@ -191,7 +196,7 @@ only-js/
   server/              axum HTTP service: route lookup → run handler → write back Capture
   oj-plugin-ffi/       C-ABI contract shared by host and plugins (strict ABI_VERSION gate)
   plugins/             cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
-                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis
+                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth
   tools/xtask/         plugin build / copy / preflight tooling (outputs to bin/)
   bin/                 build output: bin/oj (main) + bin/plugins/<triple>/ (plugin cdylibs)
   sample/              runnable example project (config.yaml + src/ + dist/)

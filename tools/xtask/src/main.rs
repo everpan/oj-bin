@@ -166,7 +166,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 归置 devkit（docs/devkit 三件 + sample/global.d.ts）-> bin/devkit/。
+/// 归置 devkit（docs/devkit 三件 + docs/oidc-{integration,implementation}.md +
+/// sample/global.d.ts）-> bin/devkit/。
 /// 仅 `build` 全量归置时调用；`bin`/`plugin` 单体子命令不拖文档。
 fn copy_devkit() -> Result<(), String> {
     let src_dir = root().join("docs").join("devkit");
@@ -177,6 +178,12 @@ fn copy_devkit() -> Result<(), String> {
     }
     copy_dir_all(&src_dir, &dst_dir)
         .map_err(|e| format!("copy {} -> {}: {e}", src_dir.display(), dst_dir.display()))?;
+    // OIDC 手册随包分发（api-manual §8 引用了它们；文件名保持与仓库 docs/ 一致）。
+    for name in ["oidc-integration.md", "oidc-implementation.md"] {
+        let src = root().join("docs").join(name);
+        fs::copy(&src, dst_dir.join(name))
+            .map_err(|e| format!("copy {} -> devkit: {e}", src.display()))?;
+    }
     let dts_src = root().join("sample").join("global.d.ts");
     let dts_dst = dst_dir.join("global.d.ts");
     fs::copy(&dts_src, &dts_dst)
