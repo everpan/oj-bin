@@ -2,7 +2,7 @@
 //! actor 池 → axum serve。start() 返回 (addr, join_handle)，main 与测试共用。
 
 #![allow(clippy::collapsible_if)]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -221,24 +221,36 @@ pub struct Registries {
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
-/// cfg 按值传入，插件须持久化时自行持有副本）。阶段 3：es 插件 cfg = {"endpoint"}。
-fn plugin_cfg_json(cfg: &Config, name: &str) -> String {
-    if name == "es" {
-        if let Some(es) = &cfg.es {
-            return serde_json::json!({ "endpoint": es.endpoint }).to_string();
-        }
+/// cfg 按值传入，插件须持久化时自行持有副本）。
+/// 第一方轴适配器清单（实际适配分支在 plugin_cfg 的 match；此表供测试与
+/// plugin_loader::AXES 对账，防止两表失步——适配器打空）。加新第一方轴时在此登记。
+#[cfg(test)]
+const ADAPTER_AXES: &[&str] = &["es", "auth"];
+
+/// cfg 回落：plugins.<name> 非空对象原样透传 → 轴适配器 → "{}"。
+/// schema 归插件所有：插件在 init 校验，非法即 Err fail-fast（宿主不解释字段）。
+fn plugin_cfg(cfg: &Config, name: &str) -> String {
+    if let Some(v) = cfg.plugins.get(name)
+        && v.as_object().is_some_and(|o| !o.is_empty())
+    {
+        return v.to_string();
     }
-    if name == "auth" {
-        if let Some(a) = &cfg.auth {
-            return serde_json::json!({
+    match name {
+        "es" => match &cfg.es {
+            Some(es) => serde_json::json!({ "endpoint": es.endpoint }).to_string(),
+            None => "{}".to_string(),
+        },
+        "auth" => match &cfg.auth {
+            Some(a) => serde_json::json!({
                 "jwt_secret": a.jwt_secret,
                 "signing_method": a.signing_method,
                 "anonymous_paths": a.anonymous_paths,
             })
-            .to_string();
-        }
+            .to_string(),
+            None => "{}".to_string(),
+        },
+        _ => "{}".to_string(),
     }
-    "{}".to_string()
 }
 
 /// 注册：插件后端（插件先于内置）→ 内置后端。
@@ -322,9 +334,9 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     })
 }
 
-/// spec §5 全流程：解析 plugins_dir → 清单严格/缺省扫描 → 去重 → 逐个加载校验
+/// spec §5 全流程：解析 plugins_dir → 严格（plugins map 键）/缺省扫描 → 逐个加载校验
 /// → 身份核对 → semver 对照 → 注册（插件先于内置）→ 内置后端注册。
-/// 缺省扫描且目录不存在/为空 → 零插件（仅内置后端，不报错，除非 §2 闸门触发）。
+/// 空 map/目录不存在/为空 → 扫描模式零插件（仅内置后端，不报错，除非 §2 闸门触发）。
 pub async fn assemble_plugins(
     cfg: &Config,
     config_dir: &Path,
@@ -333,19 +345,14 @@ pub async fn assemble_plugins(
     let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();
-    let cfg_for = |name: &str| -> String { plugin_cfg_json(cfg, name) };
+    let cfg_for = |name: &str| -> String { plugin_cfg(cfg, name) };
     let loaded = match dir {
-        Some(dir) if cfg.plugins.is_some() => {
-            // 清单严格模式：按名去重 → fail fast；缺文件/校验失败 → fail fast。
-            let names = cfg.plugins.as_ref().unwrap();
-            let mut seen = HashSet::new();
-            for name in names {
-                if !seen.insert(name) {
-                    return Err(format!("plugins manifest: duplicate plugin '{name}'"));
-                }
-            }
-            let entries: Vec<PluginManifestEntry> = names
-                .iter()
+        Some(dir) if !cfg.plugins.is_empty() => {
+            // 严格模式（spec「plugins: 统一语义」）：map 键即清单——只装配列出的插件；
+            // 键由 HashMap 保证唯一（旧 list 去重闸门随类型收编）。缺文件/校验失败 → fail fast。
+            let entries: Vec<PluginManifestEntry> = cfg
+                .plugins
+                .keys()
                 .map(|name| PluginManifestEntry {
                     name: name.clone(),
                     semver_pin: None,
@@ -409,6 +416,49 @@ mod tests {
     impl Drop for Tmp {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// cfg 回落链（spec「plugins: 统一语义」）：非空对象透传 → 轴适配器 → {}；
+    /// 空对象不抢占透传优先级（否则 auth: {} 会切断顶层段 cfg 流）。
+    #[test]
+    fn plugin_cfg_fallback_chain() {
+        let auth_yaml = "jwt_secret: \"s\"\n";
+        let mut cfg = Config {
+            auth: Some(serde_yaml::from_str(auth_yaml).unwrap()),
+            ..Default::default()
+        };
+        // 1) 非空对象：原样透传（宿主不改写、不增删字段；键序不判——serde_json 保序）
+        cfg.plugins.insert(
+            "auth".into(),
+            serde_json::json!({ "jwt_secret": "override", "extra_field": 42 }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg, "auth")).unwrap();
+        assert_eq!(v["jwt_secret"], "override");
+        assert_eq!(v["extra_field"], 42);
+        assert_eq!(v.as_object().map(|o| o.len()), Some(2));
+        // 2) 无条目 → 轴适配器（auth 分支既有行为不变）；未知插件 → {}
+        let mut cfg2 = Config {
+            auth: Some(serde_yaml::from_str(auth_yaml).unwrap()),
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
+        assert_eq!(v["jwt_secret"], "s");
+        assert_eq!(plugin_cfg(&cfg2, "vendor-thing"), "{}");
+        // 3) 空对象：跳过透传 → 仍轴适配器
+        cfg2.plugins.insert("auth".into(), serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
+        assert_eq!(v["jwt_secret"], "s");
+    }
+
+    /// 适配器轴必须是宿主探测轴的子集（两表失步 = 适配器永远打空）。
+    #[test]
+    fn cfg_adapters_subset_of_probed_axes() {
+        for name in ADAPTER_AXES {
+            assert!(
+                only_js::bridge::plugin_loader::AXES.contains(name),
+                "{name}"
+            );
         }
     }
 
@@ -1122,40 +1172,22 @@ mod tests {
         }
     }
 
-    /// 清单显式给出但文件缺失 → fail fast。
+    /// plugins 键声明但文件缺失 → fail fast。
     #[tokio::test(flavor = "current_thread")]
     async fn manifest_missing_file_fails_fast() {
         let t = tmpdir("sc-man");
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
-        let cfg = Config {
-            plugins: Some(vec!["ghost".into()]),
+        let mut cfg = Config {
             plugins_dir: Some(t.0.clone()),
             ..Default::default()
         };
+        cfg.plugins.insert("ghost".into(), serde_json::json!({}));
         let mut r = Registries::default();
         let e = assemble_plugins(&cfg, &t.0, &mut r)
             .await
             .err()
             .unwrap_or_default();
         assert!(e.contains("plugin file missing"), "{e}");
-    }
-
-    /// 清单同名两次 → fail fast（去重闸门先于加载）。
-    #[tokio::test(flavor = "current_thread")]
-    async fn manifest_duplicate_fails_fast() {
-        let t = tmpdir("sc-dup");
-        std::fs::create_dir_all(t.0.join(host_triple())).unwrap();
-        let cfg = Config {
-            plugins: Some(vec!["es".into(), "es".into()]),
-            plugins_dir: Some(t.0.clone()),
-            ..Default::default()
-        };
-        let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
-            .await
-            .err()
-            .unwrap_or_default();
-        assert!(e.contains("duplicate plugin 'es'"), "{e}");
     }
 
     /// 缺省扫描空目录 → 零插件、仅内置后端（es 未配置，不触发 §2 闸门）。
@@ -1223,6 +1255,47 @@ mod tests {
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
     }
 
+    /// plugins: 一段三用（spec「plugins: 统一语义」）：map 键即严格清单——键 ∈ 装配
+    /// 结果（空对象值只影响 cfg 透传、不影响加载）；map 外插件不装配；空 map = 扫描模式。
+    #[tokio::test(flavor = "current_thread")]
+    async fn plugins_map_keys_drive_strict_load() {
+        let t = tmpdir("sc-mapkeys");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(es_plugin_artifact(), pdir.join(plugin_file("es"))).unwrap();
+        // 1) 键 = 清单：{"es": {}} → 只装配 es，es 后端照常接线。
+        let mut cfg = es_cfg("http://127.0.0.1:1");
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins.insert("es".into(), serde_json::json!({}));
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "es");
+        assert!(r.es.is_some(), "es backend must be wired from the plugin");
+        // 2) map 外插件不装配：es 在盘上但键只有 ghost → 严格模式缺 ghost fail fast
+        //    （扫描模式此时会装配 es， fail 即证明走的是清单路径）。
+        let mut cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
+        cfg.plugins.insert("ghost".into(), serde_json::json!({}));
+        let mut r = Registries::default();
+        let e = assemble_plugins(&cfg, &t.0, &mut r)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("plugin file missing"), "{e}");
+        // 3) 空 map = 扫描模式：同一目录照旧扫描装配。
+        let cfg = Config {
+            plugins_dir: Some(t.0.clone()),
+            ..Default::default()
+        };
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "es");
+    }
+
     /// 编译 oj-db-mysql 产物路径（全进程一次；sqlx 首次编译慢，OnceLock 缓存）。
     fn db_plugin_artifact() -> PathBuf {
         static ONCE: OnceLock<PathBuf> = OnceLock::new();
@@ -1257,7 +1330,7 @@ mod tests {
         std::fs::copy(db_plugin_artifact(), pdir.join(plugin_file("db-mysql"))).unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["db-mysql".into()]),
+            plugins: HashMap::from([("db-mysql".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();
@@ -1338,7 +1411,7 @@ mod tests {
         std::fs::copy(blob_plugin_artifact(), pdir.join(plugin_file("blob-s3"))).unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["blob-s3".into()]),
+            plugins: HashMap::from([("blob-s3".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();
@@ -1417,7 +1490,7 @@ mod tests {
         .unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["bus-kafka".into()]),
+            plugins: HashMap::from([("bus-kafka".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();
@@ -1496,7 +1569,7 @@ mod tests {
         .unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["kv-redis".into()]),
+            plugins: HashMap::from([("kv-redis".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();
@@ -1644,7 +1717,7 @@ mod tests {
         .unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["bus-kafka".into()]),
+            plugins: HashMap::from([("bus-kafka".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();
@@ -1703,7 +1776,7 @@ mod tests {
         .unwrap();
         let cfg = Config {
             plugins_dir: Some(t.0.clone()),
-            plugins: Some(vec!["bus-rabbitmq".into()]),
+            plugins: HashMap::from([("bus-rabbitmq".into(), serde_json::json!({}))]),
             ..Default::default()
         };
         let mut r = Registries::default();

@@ -272,9 +272,11 @@ pub struct Config {
     pub es: Option<EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
     pub broker: Option<BrokerCfg>,
-    /// plugins 清单（显式给出 → 严格按清单装配，缺文件/版本不符 fail fast；
-    /// None = 缺省扫描 plugins_dir 全部加载）。
-    pub plugins: Option<Vec<String>>,
+    /// 插件声明（spec「plugins: 统一语义」一段三用）：键 = 要加载的插件名（非空即
+    /// 严格模式，只装配列出的插件，沿用清单门禁）；值 = 插件 cfg，非空对象原样透传，
+    /// 空对象跳过透传回落轴适配器。缺省/空 map = 扫描模式（加载 plugins_dir 全部）。
+    /// 旧 list 写法 `plugins: [a, b]` 废弃（解析报错 fail-fast）。
+    pub plugins: HashMap<String, serde_json::Value>,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }
