@@ -53,11 +53,13 @@ pub fn op_json_header(state: &mut OpState, #[string] name: String, #[string] val
 }
 
 /// json.raw(data)：裸 JSON 200（无信封）。OP 对外端点说标准 OIDC JSON 用。
+/// 同 ok/fail：未显式设置 content-type 时默认补 application/json。
 #[op2(fast)]
 pub fn op_json_raw(state: &mut OpState, #[string] data_json: String) {
     let s = state.borrow_mut::<ReqState>();
     s.response = Some(data_json.into_bytes());
     s.status = 200;
+    ensure_json_content_type(s);
     s.done = true;
 }
 
@@ -81,8 +83,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cap.status, 200);
+        // 未显式 json.header 时默认补 content-type（同 ok/fail 语义）。
+        assert_eq!(cap.headers.get("content-type").unwrap(), "application/json");
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["bare"], true);
         assert!(v.get("code").is_none());
+    }
+
+    /// json.header 显式设置的 content-type 优先，不被默认值覆盖。
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_raw_keeps_explicit_content_type() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let cap = b
+            .run_with(
+                r#"json.header("Content-Type", "application/jwt"); json.raw({ a: 1 });"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.headers.get("Content-Type").unwrap(), "application/jwt");
+        assert!(!cap.headers.contains_key("content-type"));
     }
 }
