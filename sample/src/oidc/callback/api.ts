@@ -5,7 +5,8 @@ export default {
   async get() {
     const state = String(http.query.state ?? "");
     const key = "OJ-OIDC:STATE:" + state;
-    // 一次一用：先 del 再判（CSRF/重放共用此闸）。
+    // 一次一用：先 del 再判（CSRF/重放共用此闸）。重放必落空；并发窗口由 PKCE/state
+    // 绑定兜底（redis 后端可换 GETDEL）。
     const raw = await kv.get(key);
     if (raw !== null) await kv.del(key);
     const snap = raw ? JSON.parse(raw) : null;
@@ -45,6 +46,10 @@ export default {
     }
     const jres = await fetch(disc.jwks_uri).catch(() => null);
     const jwks = jres && jres.ok ? await jres.json().catch(() => null) : null;
+    if (!jwks) {
+      json.fail(502, "jwks fetch failed");
+      return;
+    }
     let claims: Record<string, unknown>;
     try {
       claims = oidc.verify(String(tokens.id_token), jwks);

@@ -836,8 +836,10 @@ tenant:
 ```
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
-供 handler 做数据隔离。`tenant.anonymous_paths`（语义同 `auth.anonymous_paths`）豁免
-缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；已带的头仍照常注入。
+供 handler 做数据隔离。`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 尾
+`/*`」形式，但 tenant 匹配是**严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；
+oj-auth 插件实现为多层前缀），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
+已带的头仍照常注入。
 **框架不自动改写 SQL**——行级过滤归业务（自行在查询里带
 tenant 条件）。启用期间测试请求也必须带头（第 9 章两约束）。
 

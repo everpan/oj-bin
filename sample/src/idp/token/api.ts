@@ -15,7 +15,7 @@ export default {
       return;
     }
     const key = "OJ-OIDC:CODE:" + String(f.code ?? "");
-    // 一次一用：先 del 再判（并发/重放都落空）。
+    // 一次一用：先 del 再判。重放必落空；并发窗口由 PKCE/state 绑定兜底（redis 后端可换 GETDEL）。
     const raw = await kv.get(key);
     if (raw !== null) await kv.del(key);
     const code = raw ? JSON.parse(raw) : null;
@@ -25,6 +25,10 @@ export default {
     }
     if (code.redirect_uri !== f.redirect_uri) {
       json.fail(400, "redirect_uri mismatch");
+      return;
+    }
+    if (code.client_id !== f.client_id) {
+      json.fail(401, "code was issued to another client");
       return;
     }
     // PKCE：S256(verifier) == 挑战。

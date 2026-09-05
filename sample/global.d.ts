@@ -170,6 +170,24 @@ interface JwtApi {
   readonly refreshDuration: number;
 }
 
+// oidc.* ：内置 OP/RP（RS256 私钥只在 Rust 侧；issuer/rp/clients 由 config oidc: 注入；
+// 未配置段调用报 oidc not configured）。verify 传 jwks 时按其 RS256 kid 匹配验签，
+// 不传（或 null）回落本地私钥；篡改/过期/无匹配钥直接抛错。
+interface OidcApi {
+  // claims 至少含 iss/sub/aud/iat/exp。返回签名 token。
+  sign(claims: Record<string, unknown>): string;
+  // 验签 + exp；jwks 可选（缺省用本地钥）。
+  verify(token: string, jwks?: unknown): Record<string, unknown>;
+  // 本地公钥 JWKS（keys[0].kid/kty/alg/n/e）。
+  jwks(): unknown;
+  // config oidc.issuer（getter 惰性求值）。
+  readonly issuer: string;
+  // RP 侧 tenant → IdP 配置。
+  readonly rp: Record<string, { issuer: string; client_id: string; client_secret: string; scope: string }>;
+  // OP 侧客户端白名单。
+  readonly clients: Record<string, { secret: string; redirect_uris: string[]; tenant: string }>;
+}
+
 // bcrypt.* ：密码哈希（Rust 侧 spawn_blocking，CPU 密集不卡 isolate）。
 interface BcryptApi {
   hash(password: string, cost?: number): Promise<string>;
@@ -198,6 +216,7 @@ declare global {
   const db: DBInstance;
   const cert: CertApi;
   const jwt: JwtApi;
+  const oidc: OidcApi;
   const bcrypt: BcryptApi;
 
   // crypto 增补（bootstrap 对原生 crypto 做 Object.assign 合并，原生成员保留）：

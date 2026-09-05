@@ -8,7 +8,7 @@ export default {
       [String(b.username ?? "")],
     );
     const row = rows[0];
-    // 用户不存在与密码错同报（不泄露用户存在性，对齐 auth/login）。
+    // 与 auth/login 同款组合判定（demo 语义：不存在与密码错同报）。
     if (!row || !(await bcrypt.verify(String(b.password ?? ""), <string>row.password_hash || ""))) {
       json.fail(401, "invalid credentials");
       return;
@@ -22,7 +22,10 @@ export default {
     await kv.expire("OJ-IDP:SESS:" + sid, ttl);
     // Cookie Path 取 issuer 的路径段（登录会话只在 OP 端点内可见）。
     const path = oidc.issuer.replace(/^https?:\/\/[^/]+/, "");
-    json.header("Set-Cookie", `IDP_SESSION=${sid}; HttpOnly; Path=${path}; Max-Age=${ttl}`);
+    json.header(
+      "Set-Cookie",
+      `IDP_SESSION=${sid}; HttpOnly; Path=${path}; Max-Age=${ttl}; SameSite=Lax`,
+    );
     json.ok({ uid: String(row.id) });
   },
 };

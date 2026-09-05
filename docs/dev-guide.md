@@ -476,8 +476,10 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符
   白名单 + 参数化值（sea-query）——见 §4 红线。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
-- **租户跳转腿豁免**：`tenant.anonymous_paths`（语义同 `auth.anonymous_paths`）命中路径免
-  "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；已带的头仍照常注入。
+- **租户跳转腿豁免**：`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 尾 `/*`」
+  形式，但 tenant 匹配是**严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；
+  oj-auth 插件实现为多层前缀），命中路径免 "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；
+  已带的头仍照常注入。
 
 ### 11.2 证书驱动的 GET 限制（运行时校验）
 

@@ -376,6 +376,27 @@ mod tests {
         assert_eq!(v["data"]["kid"].as_str().unwrap().len(), 16);
     }
 
+    /// JWKS 里 kid 对但 kty 非 RSA（如 EC）：不得静默回落本地钥，必须抛错（负路径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_with_wrong_kty_jwks_throws() {
+        let v = run_with_oidc(
+            r#"(async () => {
+              const now = Math.floor(Date.now() / 1000);
+              const tok = oidc.sign({ iss: oidc.issuer, sub: "u1", aud: "a", iat: now, exp: now + 3600 });
+              const kid = oidc.jwks().keys[0].kid;
+              let msg = "no-throw";
+              try { oidc.verify(tok, { keys: [{ kty: "EC", kid, alg: "RS256" }] }); } catch (e) { msg = String(e); }
+              json.ok(msg);
+            })().catch((e) => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(
+            v["data"].as_str().unwrap().contains("no RS256 key for kid"),
+            "{v}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn verify_rejects_tampered_expired_and_wrong_alg() {
         let v = run_with_oidc(
