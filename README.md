@@ -253,7 +253,7 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | Doc | Content |
 |---|---|
 | `docs/user-manual.md` | full `oj` CLI and `config.yaml` reference |
-| `docs/dev-guide.md` / `docs/dev-manual.md` | developer manuals (incl. adding a new op) |
+| `docs/dev-guide.md` | developer manuals (incl. adding a new op) |
 | `docs/bridge.md` | JS globals and module cross-reference |
 | `docs/plugin-architecture.md` / `docs/plugin-development.md` | plugin architecture and development |
 | `docs/route-params-design.md` | path-param routing design |
@@ -263,5 +263,5 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | `docs/benchmarks.md` | performance data |
 | `sample/README.md` | example project notes |
 
-> Parts of `docs/dev-guide.md` describe an earlier in-process `Bridge` API and the initial
-> plugin plan; for commands and structure this file and the code are authoritative.
+> `docs/dev-guide.md` merges the daily-development manual and the internal
+> implementation walkthrough; for commands and structure this file and the code are authoritative.

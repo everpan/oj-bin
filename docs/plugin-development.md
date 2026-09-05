@@ -3,7 +3,7 @@
 插件系统把外部分布式后端（db 方言、blob 驱动、bus 消息、kv 存储、es 引擎）抽为
 **动态链接库**，宿主按平台目录扫描/按清单装配。本文档面向第三方插件作者：
 FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装配语义见
-`dev-manual.md` §9，配置见 `user-manual.md` §3。
+`dev-guide.md` §13，配置见 `user-manual.md` §3。
 
 ## 1. 一句话模型
 

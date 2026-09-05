@@ -1,7 +1,7 @@
 # 插件化架构方案（blob / s3 / redis / ES / db 按方言）
 
 > 状态：历史方案（进程内 `Plugin` trait 路线**未执行**，已被 cdylib + C-ABI FFI 方案取代）。
-> 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-manual.md` §9 与
+> 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-guide.md` §13 与
 > `docs/plugin-development.md`，注册机制见下方 §0。
 
 ## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 7）
@@ -191,7 +191,7 @@ plugins/oj-db-postgres/       crate: PostgresBackend + (Plugin 注册，feature-
   `MemoryBackend` 留在 core（测试/dev 默认）。
 
 - **阶段 5 — 配置驱动发现 + 文档**：`oj`/`server` 按配置发现插件清单 → `builder.plugin(...)`；
-  更新 `dev-manual.md`/`user-manual.md`（插件清单、feature 开关、`OJ_TEST_*` 与 db 方言测试）。
+  更新 `dev-guide.md`/`user-manual.md`（插件清单、feature 开关、`OJ_TEST_*` 与 db 方言测试）。
 
 ---
 

@@ -138,7 +138,7 @@ blob:
   非空对象原样透传、空对象 = 回落轴适配器，字符串/列表等非对象值视为未提供，静默回落到
   轴适配器/默认来源；**缺省/空 map = 扫描模式**，加载 `<plugins_dir>/<平台目录>/` 全部（缺省平台
   目录 = 当前编译目标 triple）。旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。目录
-  布局与升级回滚见 `dev-manual.md` §9、`plugin-development.md`。
+  布局与升级回滚见 `dev-guide.md` §13、`plugin-development.md`。
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
   （未装 → "unknown broker kind"）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
@@ -150,8 +150,8 @@ blob:
   **证书驱动 GET 限制**（RSA-2048 + RS256 JWS）：有效期内正常；过期进入宽限期（默认
   30 天，可配 `grace_days`）→ 所有 GET 返回 `403`（其余方法正常），替换证书即恢复；
   宽限期结束再启动 → 进程退出（不服务）。证书 / 公钥文件被覆盖即**热加载**（notify
-  事件驱动）。证书生成/续期用 `tools/oj-cert`（`gen` / `renew`），详见 `dev-manual.md`
-  §5.1 与 `ops-manual.md` §3/§7。
+  事件驱动）。证书生成/续期用 `tools/oj-cert`（`gen` / `renew`），详见 `dev-guide.md` §11.2
+  与 `ops-manual.md` §3/§7。
 - 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
   可重复执行；**注意**：seed 内不得有分号字面量）。
 - `server.migrate_on_start`：启动迁移门禁。`auto`（dev 默认）启动即应用迁移与 schema 收敛；

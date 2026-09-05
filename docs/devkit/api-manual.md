@@ -6,7 +6,7 @@
 `api.ts` / `WS.ts` handler、使用注入的全局对象、写测试、配服务、构建发布与日常运维。
 oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑以 TS handler 编写，
 运行时注入 `json` / `db` / `http` / `kv` / `blob` / `bus` / `es` 等全局对象，
-统一以 `{code,msg,data}` 信封写回 HTTP。仓库内部实现见 `docs/dev-manual.md`，
+统一以 `{code,msg,data}` 信封写回 HTTP。仓库内部实现见 `docs/dev-guide.md`，
 部署排障细节见 `docs/ops-manual.md`。本手册随版本包 `devkit/` 一同发布；
 API 签名以同目录 `global.d.ts` 为类型权威。
 

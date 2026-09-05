@@ -1,6 +1,6 @@
 # oj server 运维手册
 
-面向部署、发布、排障。功能面见 `docs/user-manual.md`，实现面见 `docs/dev-manual.md`，
+面向部署、发布、排障。功能面见 `docs/user-manual.md`，实现面见 `docs/dev-guide.md`，
 模块数据层与迁移运维见 `docs/migration.md`。
 
 ## 1. 构建与发布
@@ -84,8 +84,8 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
   **证书必配且不可绕过**——两个路径缺任一即启动报错退出（exit 1），没有任何 config/CLI
   开关可跳过证书校验；`--cert-path`/`--key-path` 仅覆盖路径、不豁免校验。证书生成/续期
   用 `tools/oj-cert`（`cargo run -p oj-cert -- gen -o config` 首次签发、
-  `renew -k config/private.pem` 到期续签，详见 `dev-manual.md` §5.1）。配齐后启用基于
-  非对称加密（RSA-2048 + RS256 JWS）的**证书驱动 GET 限制**（详见 `dev-manual.md` §5.1）：
+  `renew -k config/private.pem` 到期续签，详见 `dev-guide.md` §11.2）。配齐后启用基于
+  非对称加密（RSA-2048 + RS256 JWS）的**证书驱动 GET 限制**（详见 `dev-guide.md` §11.2）：
   - 有效期内 → 正常服务。
   - 过期进入宽限期（默认 30 天，可配 `grace_days`）→ 所有 **GET** 返回 `403`
     （JSON `{"error":"certificate expired",...}`），其余方法正常；服务不中断，运维替换证书即恢复。
