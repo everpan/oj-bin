@@ -220,7 +220,6 @@ fn check(name: &str) -> Result<(), String> {
             "auth" => p.registrations.auth.is_some(),
             _ => unreachable!("AXES 与 check 汇总分支不同步"),
         })
-        .map(|a| &a[..])
         .collect();
     println!(
         "ok: {} {} (abi {}) — {}",
