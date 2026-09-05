@@ -19,8 +19,9 @@ export default {
       return;
     }
     // 通用 discovery：endpoints 不硬编码（对接任意标准 IdP）。
-    const res = await fetch(rp.issuer + "/.well-known/openid-configuration");
-    const disc = res.ok ? await res.json() : null;
+    // 网络错（DNS/拒连）与非 JSON 响应一律折叠进 502，不外抛（spec §7）。
+    const res = await fetch(rp.issuer + "/.well-known/openid-configuration").catch(() => null);
+    const disc = res && res.ok ? await res.json().catch(() => null) : null;
     if (!disc || !disc.authorization_endpoint) {
       json.fail(502, "discovery failed");
       return;
