@@ -49,4 +49,5 @@
 - 302 一律 `-i` 手动接力 Location；state/code 一次一用（重放 401），跳转腿免租户头靠
   `tenant.anonymous_paths`（`/oidc/*`、`/idp/*`），对接外部 IdP 只改 config `oidc.rp`
 - 已知限制：OP `sub` = users.id 字符串 → 自托管 OIDC 登录 JIT 新建本地账号
-  （username = sub，占位 hash 不可密码登录），不合并原 demo 行
+  （username = `oidc:<tenant>:<sub>`，占位 hash 不可密码登录，与本地口令账号天然隔离），
+  不合并原 demo 行

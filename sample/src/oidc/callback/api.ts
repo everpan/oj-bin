@@ -66,16 +66,18 @@ export default {
       json.fail(401, "id_token aud mismatch");
       return;
     }
-    // JIT 本地映射：sub → users 行；无则建（'!oidc' 非法占位 hash 不可密码登录——
-    // bcrypt.verify 对非法 hash 恒 false，零 schema 变更）。
+    // JIT 本地映射：本地行 username 按 tenant+sub 命名空间隔离（全局 users.username
+    // 若直接用 sub，多 IdP 会账号混淆/接管）。无则建（'!oidc' 非法占位 hash 不可密码
+    // 登录——bcrypt.verify 对非法 hash 恒 false，零 schema 变更）。
     const sub = String(claims.sub);
-    let rows = await db.query("select id, roles from users where username = ?", [sub]);
+    const localName = "oidc:" + snap.tenant + ":" + sub;
+    let rows = await db.query("select id, roles from users where username = ?", [localName]);
     if (!rows.length) {
       await db.exec(
         "insert into users (username, password_hash, roles) values (?, ?, '[]')",
-        [sub, "!oidc"],
+        [localName, "!oidc"],
       );
-      rows = await db.query("select id, roles from users where username = ?", [sub]);
+      rows = await db.query("select id, roles from users where username = ?", [localName]);
     }
     let roles: string[] = [];
     try {

@@ -724,8 +724,9 @@ async fn oidc_full_chain_login_bridge_and_tenant() {
     let body: serde_json::Value = r5.json().await.unwrap();
     assert_eq!(s5, 200, "{body}");
     assert_eq!(body["code"], 0, "{body}");
-    // JIT 按 sub（= OP 会话 uid 字符串 "1"）查 users.username 未命中 → 现建行
-    // （demo 行 username 是 'demo'），故桥接会话是 id 2 / roles [] 的 JIT 行。
+    // JIT 按 `oidc:default:1`（tenant+sub 命名空间，sub = OP 会话 uid "1"）查
+    // users.username 未命中 → 现建行（demo 行 username 是 'demo'），故桥接会话是
+    // id 2 / roles [] 的 JIT 行。
     assert_eq!(body["data"]["user"]["id"], "2", "{body}");
     let access = body["data"]["access_token"].as_str().unwrap().to_string();
     // 6) 桥接会话打受保护路由（租户头恢复强制；http.user = access token claims）。
