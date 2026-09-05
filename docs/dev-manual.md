@@ -2,16 +2,15 @@
 
 面向要在本仓库上继续开发的工程师。先读 `docs/user-manual.md` 了解对外行为，再读本文了解内部实现。
 
-> 历史：早期文档见 `docs/dev-guide.md`，已过时，仅作参考。本文描述的是当前
-> `oj server`（deno_core 0.410）架构。
+> 分工：`docs/dev-guide.md` 是面向日常开发的 Rust 侧手册（环境/嵌入/扩展 op），
+> 本文是 `oj server`（deno_core 0.410）内部实现走读，两者均已与代码同步。
 
 ## 1. 工作区结构（宿主 + 契约 crate + 插件）
 
 ```
 Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
-src/                  # crate: only-js（lib + bench）——核心执行层
+src/                  # crate: only-js（lib）——核心执行层
 ├── lib.rs            # 导出 bridge + config
-├── main.rs           # bench 入口（criterion harness，非服务）
 ├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + db/redis/blob/es/broker/plugins 映射
 └── bridge/           # JS 运行时与 SDK（无 axum/http 依赖，纯执行层）
     ├── mod.rs        # 模块聚合、bridge 工厂（Send）
