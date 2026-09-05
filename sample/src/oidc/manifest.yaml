@@ -1,0 +1,5 @@
+name: "oidc"
+desc: "RP（OIDC Relying Party）：login/callback/logout，通用 discovery 对接任意标准 IdP，会话桥接复用 auth/_shared"
+version: "0.1.0"
+deps:
+  _platform: "^0.1.0"

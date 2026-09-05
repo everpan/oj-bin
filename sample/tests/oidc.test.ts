@@ -8,6 +8,16 @@ function headerOf(r: { headers: Record<string, string> }, name: string): string 
   return k === undefined ? "" : String(r.headers[k]);
 }
 
+// RP（Task 8）：tenant 路由 + discovery + state/nonce/PKCE。302 跳转腿在进程内不可达
+// （oj test 无 TCP listener，fetch 自身 discovery 必失败），完整链路归 Rust e2e（Task 10）。
+describe("oidc login (RP)", () => {
+  it("rejects unknown tenant", async () => {
+    const r = await client.get("/oidc/login?tenant=nope");
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.body).msg).toBe("unknown tenant");
+  });
+});
+
 describe("idp discovery/jwks", () => {
   it("exposes bare discovery document with RS256 + code", async () => {
     const r = await client.get("/idp/.well-known/openid-configuration");
