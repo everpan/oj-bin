@@ -3229,6 +3229,7 @@ dependencies = [
  "only-js",
  "refinery-core",
  "reqwest 0.13.1",
+ "rsa",
  "sea-query",
  "semver",
  "serde",
