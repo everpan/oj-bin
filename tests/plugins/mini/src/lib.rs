@@ -3,13 +3,8 @@
 //! （供宿主侧 init panic 围堵测试——入口宏 catch_unwind 收敛为 RResult::Err）。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, HostContext, PluginDescriptor, PluginRegistrations, RArc, RResult, RString,
-    oj_plugin_entry,
+    ABI_VERSION, HostContext, PluginDescriptor, RArc, RResult, RString, oj_plugin_entry,
 };
-
-extern "C" fn no_registrations() -> PluginRegistrations {
-    PluginRegistrations::none()
-}
 
 fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RString> {
     if std::env::var("MINI_PANIC").is_ok() {
@@ -24,7 +19,7 @@ fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RS
         semver: RString::from("0.1.0"),
         abi_version: abi,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register: no_registrations,
+        desc: RString::from("loader 测试夹具（零轴）"),
     })
 }
 

@@ -48,6 +48,47 @@ fn mini_plugin_dir() -> PathBuf {
     .clone()
 }
 
+/// mini-kv 编译产物目录（复用 mini_plugin_dir 的按需编译 + 幂等拷贝模式，
+/// 包名/产物名替换为 oj-plugin-test-mini-kv / mini-kv）。与 mini 分目录存放：
+/// 共享目录会让 scan_loads_mini 的「目录内恰一个插件」计数断言翻倍。
+fn mini_kv_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = ffi::workspace_root();
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "oj-plugin-test-mini-kv"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for test plugin");
+        assert!(status.success(), "test plugin build failed");
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        let built = root
+            .join("target/debug")
+            .join(format!("{prefix}oj_plugin_test_mini_kv.{ext}"));
+        let dir = root.join("target/test-plugins-kv").join(ffi::triple());
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join(ffi::plugin_file_name("mini-kv"));
+        // 幂等拷贝：dest 已存在且不旧于源则跳过（同 mini_plugin_dir，Windows dll 覆写坑）。
+        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
+        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
+        let outdated = match (dst_modified, src_modified) {
+            (Ok(d), Ok(s)) => d < s,
+            _ => true,
+        };
+        if outdated {
+            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
+        }
+        dir
+    })
+    .clone()
+}
+
 fn no_cfg(_: &str) -> String {
     "{}".to_string()
 }
@@ -294,6 +335,33 @@ fn scan_loads_mini() {
     let loaded = load_scanned(&dir, host_context(), &|_| "{}".to_string()).unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(&loaded[0].descriptor.name[..], "mini");
+}
+
+// ---- 按轴探测（dlsym）----
+
+/// mini（零轴）：加载成功但所有轴 None；mini-kv（单轴）：kv 有、auth 无。
+#[test]
+fn probe_finds_declared_axis_and_misses_undeclared() {
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+    unsafe { std::env::remove_var("MINI_PANIC") };
+    let mini = super::load_one(
+        &mini_plugin_dir().join(ffi::plugin_file_name("mini")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mini.registrations.kv.is_none());
+    let mkv = super::load_one(
+        &mini_kv_plugin_dir().join(ffi::plugin_file_name("mini-kv")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mkv.registrations.kv.is_some());
+    assert!(mkv.registrations.auth.is_none());
 }
 
 #[test]

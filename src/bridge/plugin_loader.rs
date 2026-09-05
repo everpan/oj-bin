@@ -409,21 +409,46 @@ fn load_one(
         }
     }
 
-    // init 窗口内取注册槽位（spec §3：descriptor 内注册回调指针）。
-    let raw = (descriptor.register)();
-    let registrations = Registrations {
-        es: raw.es(),
-        db: raw.db(),
-        blob: raw.blob(),
-        bus: raw.bus(),
-        kv: raw.kv(),
-        auth: raw.auth(),
-    };
+    // init 后按轴 dlsym 探测（spec「按轴 dlsym」）：句柄已泄漏进程期存活，
+    // vtable 指针永久有效，探测后不持有 lib 引用。
+    let registrations = unsafe { probe_axes(lib) };
 
     Ok(LoadedPlugin {
         descriptor,
         registrations,
     })
+}
+
+/// 宿主认识的轴（加新轴 = 此表加一行 + 对应 vtable 类型 + Registrations 加字段；
+/// 插件零感知、零重编译——spec「按轴 dlsym」）。
+pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth"];
+
+/// init 成功后逐轴 dlsym：`oj_plugin_axis_<name>() -> *const c_void`。
+/// 缺符号或返回 null = 不提供该轴（非错误）。
+unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
+    let mut r = Registrations::default();
+    for axis in AXES {
+        let sym = format!("oj_plugin_axis_{axis}");
+        let Ok(f) = (unsafe {
+            lib.get::<unsafe extern "C" fn() -> *const std::ffi::c_void>(sym.as_bytes())
+        }) else {
+            continue;
+        };
+        let vt = unsafe { f() };
+        if vt.is_null() {
+            continue;
+        }
+        match *axis {
+            "es" => r.es = Some(unsafe { &*(vt as *const oj_plugin_ffi::EsBackendVtable) }),
+            "db" => r.db = Some(unsafe { &*(vt as *const oj_plugin_ffi::DataAccessorVtable) }),
+            "blob" => r.blob = Some(unsafe { &*(vt as *const oj_plugin_ffi::BlobBackendVtable) }),
+            "bus" => r.bus = Some(unsafe { &*(vt as *const oj_plugin_ffi::EventBrokerVtable) }),
+            "kv" => r.kv = Some(unsafe { &*(vt as *const oj_plugin_ffi::KVStoreVtable) }),
+            "auth" => r.auth = Some(unsafe { &*(vt as *const oj_plugin_ffi::AuthGuardVtable) }),
+            _ => unreachable!("AXES 与 probe_axes 分支不同步"),
+        }
+    }
+    r
 }
 
 fn file_stem_name(path: &Path) -> String {
