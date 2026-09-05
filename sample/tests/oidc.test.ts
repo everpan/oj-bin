@@ -1,6 +1,8 @@
 // L1 OP 骨架测试：discovery / jwks 对外裸 JSON（json.raw），标准 OIDC 客户端可直接消费。
 // 运行：oj test -c sample/config.yaml -d sample/src -t tests
 
+import { b64uFromHex } from "../src/auth/_shared/util";
+
 function headerOf(r: { headers: Record<string, string> }, name: string): string {
   const k = Object.keys(r.headers).find((h) => h.toLowerCase() === name.toLowerCase());
   return k === undefined ? "" : String(r.headers[k]);
@@ -73,5 +75,86 @@ describe("idp login/authorize", () => {
     const loc = headerOf(ok, "location");
     expect(loc).toContain("code=");
     expect(loc).toContain("state=st1");
+  });
+});
+
+describe("idp token/userinfo (full code flow in-process)", () => {
+  it("exchanges code for RS256 tokens; replay rejected; userinfo reads sub/tenant", async () => {
+    const verifier = crypto.randomHex(32);
+    const challenge = b64uFromHex(crypto.sha256Hex(verifier));
+    const cookie = await idpCookie();
+    const cb = encodeURIComponent("http://localhost:9778/v1/api/oidc/callback");
+    const ar = await client.get(
+      `/idp/authorize?response_type=code&client_id=sample-rp&redirect_uri=${cb}` +
+        `&scope=openid&state=st2&nonce=n2&code_challenge=${challenge}&code_challenge_method=S256`,
+      { headers: { Cookie: cookie } },
+    );
+    expect(ar.status).toBe(302);
+    const loc = headerOf(ar, "location");
+    const code = loc.split("code=")[1].split("&")[0];
+    const tokenBody =
+      `grant_type=authorization_code&code=${code}&client_id=sample-rp` +
+      `&client_secret=rp-secret&redirect_uri=${cb}&code_verifier=${verifier}`;
+    const tr = await client.post("/idp/token", {
+      body: tokenBody,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    expect(tr.status).toBe(200);
+    const tok = JSON.parse(tr.body); // 裸 JSON（json.raw）
+    expect(tok.access_token).toBeTruthy();
+    expect(tok.id_token).toBeTruthy();
+    expect(tok.token_type).toBe("Bearer");
+    // code 一次一用：重放 401。
+    const replay = await client.post("/idp/token", {
+      body: tokenBody,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    expect(replay.status).toBe(401);
+    // PKCE 错 verifier → 401（拿新 code 试）。
+    // userinfo：access_token 验签后读 sub/tenant。
+    const ui = await client.get("/idp/userinfo", {
+      headers: { Authorization: "Bearer " + tok.access_token },
+    });
+    expect(ui.status).toBe(200);
+    const u = JSON.parse(ui.body);
+    expect(String(u.sub)).toBeTruthy();
+    expect(u.tenant).toBe("default");
+    const bad = await client.get("/idp/userinfo", { headers: { Authorization: "Bearer junk" } });
+    expect(bad.status).toBe(401);
+  });
+
+  it("rejects wrong PKCE verifier, redirect_uri mismatch and bad client secret", async () => {
+    const newCode = async () => {
+      const verifier = crypto.randomHex(32);
+      const challenge = b64uFromHex(crypto.sha256Hex(verifier));
+      const cookie = await idpCookie();
+      const cb = encodeURIComponent("http://localhost:9778/v1/api/oidc/callback");
+      const ar = await client.get(
+        `/idp/authorize?response_type=code&client_id=sample-rp&redirect_uri=${cb}` +
+          `&scope=openid&state=s&nonce=n&code_challenge=${challenge}&code_challenge_method=S256`,
+        { headers: { Cookie: cookie } },
+      );
+      expect(ar.status).toBe(302);
+      return headerOf(ar, "location").split("code=")[1].split("&")[0];
+    };
+    const cb = encodeURIComponent("http://localhost:9778/v1/api/oidc/callback");
+    const post = (code: string, extra: string) =>
+      client.post("/idp/token", {
+        body: `grant_type=authorization_code&code=${code}&client_id=sample-rp&redirect_uri=${cb}${extra}`,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+    expect((await post(await newCode(), "&client_secret=rp-secret&code_verifier=wrong")).status).toBe(401);
+    expect(
+      (
+        await post(
+          await newCode(),
+          "&client_secret=rp-secret&redirect_uri=" + encodeURIComponent("http://evil/cb") + "&code_verifier=whatever",
+        )
+      ).status,
+    ).toBe(400);
+
+    expect(
+      (await post(await newCode(), "&client_secret=nope&code_verifier=whatever")).status,
+    ).toBe(401);
   });
 });
