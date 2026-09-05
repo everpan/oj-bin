@@ -44,6 +44,7 @@ mod loader;
 mod log;
 mod module_loader;
 mod named_registry;
+mod oidc;
 pub mod plugin_loader;
 mod plugins_op;
 mod query;
@@ -124,6 +125,8 @@ pub struct StableState {
     pub boot: Option<String>,
     /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
     pub jwt: Option<Arc<JwtCfg>>,
+    /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
+    pub oidc: Option<Arc<oidc::OidcState>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -145,6 +148,8 @@ pub struct Extras {
     pub boot: Option<String>,
     /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
     pub jwt: Option<Arc<JwtCfg>>,
+    /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
+    pub oidc: Option<Arc<oidc::OidcState>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -334,6 +339,7 @@ impl Bridge {
             ownership_deny: extras.ownership_deny,
             boot: extras.boot,
             jwt: extras.jwt,
+            oidc: extras.oidc,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // KillSwitch 先于池构造：池在 boot 期要 arm 它（TLA 死循环的唯一兜底）。
@@ -1254,6 +1260,7 @@ mod tests {
             ownership_deny: false,
             boot: None,
             jwt: None,
+            oidc: None,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。

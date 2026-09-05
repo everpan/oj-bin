@@ -292,6 +292,8 @@ impl App {
                         boot: boot.clone(),
                         // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
                         jwt: jwt.clone(),
+                        // OIDC 配置态：装配接线在后续任务（config.oidc → OidcState::from_section）。
+                        oidc: None,
                     },
                 )
             }
@@ -478,6 +480,7 @@ impl App {
             ownership_deny,
             boot: boot.clone(),
             jwt: jwt.clone(), // 与 make_bridge 的 Extras.jwt 同源。
+            oidc: None,       // 装配接线在后续任务。
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {
