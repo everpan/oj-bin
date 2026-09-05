@@ -23,7 +23,9 @@ use serde_json::Value;
 
 use crate::actor::JsActor;
 use crate::routes::{Lookup, RouteTable, Routes};
-use only_js::bridge::{AuthGuard, BlobBackend, BlobServed, RequestInfo, UploadedFile, fail};
+use only_js::bridge::{
+    AuthGuard, BlobBackend, BlobServed, PluginInfo, RequestInfo, UploadedFile, fail,
+};
 
 /// 证书状态
 #[derive(Clone, Debug)]
@@ -55,6 +57,8 @@ pub struct AppState {
     pub certificate_status: Arc<RwLock<CertificateStatus>>,
     /// 证书有效期截止时间（热加载共享）
     pub certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
+    /// 已装配插件自描述清单（`{base}/plugins` 数据源；装配层注入）。
+    pub plugins: Arc<Vec<PluginInfo>>,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -94,11 +98,17 @@ pub fn app(
     pipeline: Pipeline,
     certificate_status: Arc<RwLock<CertificateStatus>>,
     certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
+    plugins: Arc<Vec<PluginInfo>>,
 ) -> Router {
     let dir = dir.into();
-    let health_path = format!("{}/health", base.trim_end_matches('/'));
+    let base = base.trim_end_matches('/');
+    let health_path = format!("{base}/health");
+    // 公共基础设施端点（先于 fallback 的真实 route）：不走 Bearer 守卫 / 证书 GET 门禁，
+    // 与 /health 同位（匿名可访问），保留路径遮蔽同名业务路由。
+    let plugins_path = format!("{base}/plugins");
     Router::new()
         .route(&health_path, axum::routing::get(health_handler))
+        .route(&plugins_path, axum::routing::get(plugins_handler))
         .fallback(any(handle))
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
         .layer(axum::middleware::from_fn(crate::logging::log_requests))
@@ -116,6 +126,7 @@ pub fn app(
             base: base.to_string(),
             certificate_status,
             certificate_valid_until,
+            plugins,
         })
 }
 
@@ -146,6 +157,18 @@ async fn health_handler(State(st): State<AppState>) -> Response {
         "grace_remaining_secs": grace_remaining_secs,
     });
     let mut r = Response::new(axum::body::Body::from(serde_json::to_vec(&body).unwrap()));
+    r.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    r
+}
+
+/// 插件清单查询（公共基础设施端点，与 /health 同位：监控/运维可匿名访问）。
+/// 返回装配插件的自描述（name/version/description/abi/fingerprint）。
+async fn plugins_handler(State(st): State<AppState>) -> Response {
+    let data = serde_json::to_value(&*st.plugins).unwrap_or_else(|_| Value::Null);
+    let mut r = Response::new(axum::body::Body::from(only_js::bridge::ok(&data)));
     r.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/json"),
@@ -207,6 +230,7 @@ pub async fn serve_with_listener(
             pipeline,
             Arc::new(RwLock::new(CertificateStatus::Valid)),
             Arc::new(RwLock::new(None)),
+            Arc::default(),
         ),
     )
     .await
@@ -554,6 +578,7 @@ pub(crate) mod tests {
             base: "/v1/api".to_string(),
             certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
             certificate_valid_until: Arc::new(RwLock::new(None)),
+            plugins: Arc::default(),
         }
     }
 
@@ -1075,6 +1100,28 @@ pub(crate) mod tests {
             "{body2}"
         );
         assert!(body2.contains("\"grace_remaining_secs\":86400"), "{body2}");
+    }
+
+    /// GET {base}/plugins：公共查询端点——返回装配插件的自描述清单（ok 信封）。
+    #[tokio::test]
+    async fn plugins_endpoint_lists_self_descriptions() {
+        let mut st = dummy_app_state();
+        // 注入自描述（AppState.plugins 为 Arc<Vec<PluginInfo>>）。
+        st.plugins = Arc::new(vec![only_js::bridge::PluginInfo {
+            name: "auth".into(),
+            semver: "0.1.0".into(),
+            abi_version: 7,
+            fingerprint: "fp".into(),
+            description: "auth guard".into(),
+            host_abi_version: 0,
+        }]);
+        // handler 以 route 形态挂在 base 下，直接调（base 前缀拼接的路径校验在集成层）。
+        let resp = crate::plugins_handler(axum::extract::State(st)).await;
+        let body = body_text(resp).await;
+        assert!(body.contains("\"code\":0"), "{body}");
+        assert!(body.contains("\"name\":\"auth\""), "{body}");
+        assert!(body.contains("\"description\":\"auth guard\""), "{body}");
+        assert!(body.contains("\"abi_version\":7"), "{body}");
     }
 
     async fn body_text(resp: axum::response::Response) -> String {

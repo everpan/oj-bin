@@ -1,5 +1,6 @@
 //! plugins 自省 op（spec §4 升级核对、§2 注册表自省并入）。
-//! JS 侧 `plugins()` → 已加载插件 [{name, semver, abi_version, fingerprint, host_abi_version}]。
+//! JS 侧 `plugins()` → 已加载插件 [{name, semver, abi_version, fingerprint, description,
+//! host_abi_version}]。
 
 use crate::bridge::StableState;
 use crate::bridge::plugin_loader::PluginInfo;
@@ -27,6 +28,7 @@ mod tests {
             semver: "0.1.0".into(),
             abi_version: 1,
             fingerprint: "test-fingerprint".into(),
+            description: "test plugin".into(),
             host_abi_version: oj_plugin_ffi::ABI_VERSION,
         }
     }

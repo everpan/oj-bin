@@ -368,6 +368,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(js_route(
                 "/ws/bus",
@@ -412,6 +413,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(echo_route()),
         )
@@ -439,6 +441,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(js_route(
                 "/ws/js",
@@ -483,6 +486,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(js_route(
                 "/ws/close",
@@ -559,6 +563,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(mirror_routes(
                 "/v1/api",
@@ -616,6 +621,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(mirror_routes(
                 "/v1/api",
@@ -649,6 +655,7 @@ mod tests {
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
             )
             .merge(js_route(
                 "/ws/missing",

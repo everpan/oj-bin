@@ -128,10 +128,14 @@ impl App {
         // specifier 在此冻结 `?v=<mtime>`：改文件须重启进程（池常驻，不做热重载）。
         let boot = ext_boot_spec(config_dir)?;
         // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
+        // 自描述清单（PluginInfo）同时喂 Extras/StableState.plugins（JS 内省）与
+        // `GET {base}/plugins`（AppState）。
         let mut registries = Registries::default();
-        let _plugins = assemble_plugins(&cfg, config_dir, &mut registries)
-            .await
-            .map_err(|e| format!("plugins: {e}"))?;
+        let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
+            assemble_plugins(&cfg, config_dir, &mut registries)
+                .await
+                .map_err(|e| format!("plugins: {e}"))?,
+        );
         // KV：redis.default 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
         // 未声明 → InMemoryKV 内置兜底。
         let kv: Arc<dyn KVStore> = match cfg.redis.get("default") {
@@ -268,6 +272,7 @@ impl App {
             let (registry, modules, ownership_deny) =
                 (registry.clone(), modules.clone(), ownership_deny);
             // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
+            let plugins = (*plugin_infos).clone();
             let boot = boot.clone();
             let jwt = jwt.clone();
             move || {
@@ -281,7 +286,7 @@ impl App {
                         blobs: blobs.clone(),
                         es: es.clone(),
                         bus: Some(bus.clone()),
-                        plugins: Vec::new(),
+                        plugins: plugins.clone(),
                         modules: modules.clone(),
                         ownership_deny,
                         boot: boot.clone(),
@@ -450,6 +455,7 @@ impl App {
             pipeline,
             cert_status,
             cert_valid_until,
+            plugin_infos.clone(),
         )
         .merge(ws_router);
         // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
@@ -467,7 +473,7 @@ impl App {
                 .unwrap_or_else(|| Arc::new(BlobRegistry::new())),
             bus: bus.clone(),
             es: es.clone(),
-            plugins: Vec::new(),
+            plugins: (*plugin_infos).clone(),
             modules,
             ownership_deny,
             boot: boot.clone(),
