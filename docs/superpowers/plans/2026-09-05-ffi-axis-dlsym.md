@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 插件注册面从定长 `PluginRegistrations` 结构体改为按轴导出符号（`oj_plugin_axis_<name>`），加新轴时存量插件零改动、零重编译、ABI 不 bump；同批落地插件配置通用化（`plugins.<name>` 开放段 + 三级回落）与插件自描述查询（descriptor.desc + host 收集 + `GET {base}/plugins`）。
+**Goal:** 插件注册面从定长 `PluginRegistrations` 结构体改为按轴导出符号（`oj_plugin_axis_<name>`），加新轴时存量插件零改动、零重编译、ABI 不 bump；同批落地插件配置通用化（`plugins:` 一段三用：键=严格清单/值=透传 cfg/空对象=回落，2026-09-05 用户裁定）与插件自描述查询（descriptor.desc + host 收集 + `GET {base}/plugins`）。
 
 **Architecture:** 见 `docs/superpowers/specs/2026-09-05-ffi-axis-dlsym-design.md`。FFI 契约：`oj_plugin_abi_version` / `oj_plugin_init` 保留，`PluginDescriptor` 删 `register`，`PluginRegistrations` 整体删除；宿主 `load_one` 在 init 后对已知轴逐个 dlsym 探测。本次 ABI 6→7 是最后一次破坏性迁移。
 
@@ -378,25 +378,33 @@ unix@vip.qq.com ai"
 
 ---
 
-### Task 4: 插件配置通用化（plugins 开放段 + 三级回落）
+### Task 4: 插件配置通用化（`plugins:` 一段三用：键=严格清单 / 值=透传 cfg / 空对象=回落）
+
+> 2026-09-05 用户裁定：旧 `plugins: [name...]` 严格清单与新增配置开放段**合并为统一
+> 机制**（spec「插件配置」节「`plugins:` 统一语义」），不再引入 `plugins_list`。
 
 **Files:**
-- Modify: `src/config.rs`（`Config.plugins` 开放段）
-- Modify: `oj/src/server_cmd.rs`（`plugin_cfg_json` → `plugin_cfg` 三级回落 + 子集断言测试）
+- Modify: `src/config.rs`（`Config.plugins` 类型 `Option<Vec<String>>` → `HashMap<String, serde_json::Value>`）
+- Modify: `oj/src/server_cmd.rs`（`plugin_cfg_json` → `plugin_cfg`；严格清单改由 map 键驱动 + 子集断言测试）
 
 **Interfaces:**
-- Produces: `Config.plugins: HashMap<String, serde_json::Value>`（serde default）；`fn plugin_cfg(cfg: &Config, name: &str) -> String`（语义：`plugins.<name>` 原样透传 → 已知轴适配器 → `{}`）。
+- Produces:
+  - `Config.plugins: HashMap<String, serde_json::Value>`（serde default；键 = descriptor name）
+  - `fn plugin_cfg(cfg: &Config, name: &str) -> String`（语义：`plugins.<name>` **非空对象**原样透传 → 已知轴适配器 → `{}`；空对象/缺值跳过透传）
+  - 严格模式：`plugins:` 非空 → 只加载其键列出的插件（沿用既有清单门禁：缺文件/ABI 不符 fail-fast）；缺省 → 扫描模式（行为不变）
 - Consumes: `plugin_loader::AXES`（Task 2 pub）。
+- **Schema 破坏（已裁定接受）**：旧列表写法 `plugins: [a, b]` 解析报错 fail-fast；仓库内零使用。
 
 - [ ] **Step 1: 写失败测试**（server_cmd.rs tests 追加）
 
 ```rust
-    /// cfg 三级回落（spec「插件配置」）：开放段透传 → 轴适配器 → {}。
+    /// cfg 回落链（spec「plugins: 统一语义」）：非空对象透传 → 轴适配器 → {}；
+    /// 空对象不抢占透传优先级（否则 auth: {} 会切断顶层段 cfg 流）。
     #[test]
     fn plugin_cfg_fallback_chain() {
         let mut cfg = Config::default();
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"s\"\n").unwrap());
-        // 1) 开放段优先且原样透传（宿主不改写字段）
+        // 1) 非空对象：原样透传（宿主不改写字段）
         cfg.plugins.insert(
             "auth".into(),
             serde_json::json!({ "jwt_secret": "override", "extra_field": 42 }),
@@ -405,13 +413,18 @@ unix@vip.qq.com ai"
             plugin_cfg(&cfg, "auth"),
             r#"{"extra_field":42,"jwt_secret":"override"}"#
         );
-        // 2) 无开放段 → 轴适配器（auth 分支既有行为不变）
+        // 2) 空对象：跳过透传 → 轴适配器（auth 分支既有行为不变）
         let mut cfg2 = Config::default();
         cfg2.auth = Some(serde_yaml::from_str("jwt_secret: \"s\"\n").unwrap());
+        cfg2.plugins.insert("auth".into(), serde_json::json!({}));
         let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
         assert_eq!(v["jwt_secret"], "s");
-        // 3) 未知插件 → {}
-        assert_eq!(plugin_cfg(&cfg2, "vendor-thing"), "{}");
+        // 3) 无条目 → 轴适配器；未知插件 → {}
+        let mut cfg3 = Config::default();
+        cfg3.auth = cfg2.auth.clone();
+        let v3: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg3, "auth")).unwrap();
+        assert_eq!(v3["jwt_secret"], "s");
+        assert_eq!(plugin_cfg(&cfg3, "vendor-thing"), "{}");
     }
 
     /// 适配器轴必须是宿主探测轴的子集（两表失步 = 适配器永远打空）。
@@ -421,24 +434,38 @@ unix@vip.qq.com ai"
             assert!(only_js::bridge::plugin_loader::AXES.contains(name), "{name}");
         }
     }
+
+    /// plugins: 非空 = 严格模式：键即加载清单（装配层只装配列出的插件）。
+    /// 沿用既有清单装配测试模式（参考本文件 463 行附近 / es_plugin_wires_backend）。
+    #[test]
+    fn plugins_map_keys_drive_strict_load() {
+        // plugins: {"auth": {}} → 严格模式：仅 auth 参与装配判定；
+        // 缺插件 → 既有 fail-fast 文案（auth 配置声明但无插件）。
+        // plugins: 空 map / 缺省 → 扫描模式（既有 scan_loads_* 测试语义不变）。
+        // 实现落点：assemble_plugins 的清单分支改为从 cfg.plugins 键构建
+        // PluginManifestEntry（沿用旧 Vec<String> 清单路径的门禁与错误文案）。
+    }
 ```
 
-（断言串按 serde_json 键序可能带空格差异——若 `to_string()` 键序不定，改为解析回 `Value` 后逐字段断言。）
+（断言串按 serde_json 键序可能带空格差异——若 `to_string()` 键序不定，改为解析回 `Value` 后逐字段断言。第三个测试为行为占位：具体断言参照旧清单模式既有测试写法落地，核心是「map 键 ∈ 装配结果、map 外插件不装配、缺插件 fail-fast」。）
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release -p oj plugin_cfg 2>&1 | tail -5`
-Expected: FAIL（`Config.plugins` / `plugin_cfg` / `ADAPTER_AXES` 不存在）
+Expected: FAIL（类型/函数未变）
 
 - [ ] **Step 3: 实现**
 
-`src/config.rs`（`Config` 已 `#[serde(default)]`，直接加字段）：
+`src/config.rs`（`Config` 已 `#[serde(default)]`；**替换**既有 `pub plugins: Option<Vec<String>>` 字段，约 277 行）：
 
 ```rust
-    /// 插件自有配置（开放式；键 = descriptor name == 插件文件 stem）。
-    /// 值 = 任意 JSON，宿主原样透传给插件 init，不做字段解释（spec「插件配置」）。
+    /// 插件声明（spec「plugins: 统一语义」）：键 = 要加载的插件（非空即严格模式，
+    /// 沿用清单门禁）；值 = 插件 cfg，非空对象原样透传，空对象回落轴适配器。
+    /// 缺省 = 扫描模式（加载 plugins_dir 全部）。旧 list 写法废弃（解析报错 fail-fast）。
     pub plugins: HashMap<String, serde_json::Value>,
 ```
+
+同步清理旧字段的消费点（`oj/src/server_cmd.rs` 约 338-340 行的清单分支）：严格模式改为从 `cfg.plugins` 键构建 `PluginManifestEntry`（沿用旧路径的门禁与错误文案）；`cfg.plugins` 为空 map = 扫描模式。
 
 `oj/src/server_cmd.rs`：
 
@@ -447,10 +474,12 @@ Expected: FAIL（`Config.plugins` / `plugin_cfg` / `ADAPTER_AXES` 不存在）
 /// 在此加分支，并保持 keys ⊆ plugin_loader::AXES（下方测试锁死）。
 const ADAPTER_AXES: &[&str] = &["es", "auth"];
 
-/// cfg 三级回落：plugins.<name> 原样透传 → 轴适配器 → "{}"。
+/// cfg 回落：plugins.<name> 非空对象原样透传 → 轴适配器 → "{}"。
 /// schema 归插件所有：插件在 init 校验，非法即 Err fail-fast（宿主不解释字段）。
 fn plugin_cfg(cfg: &Config, name: &str) -> String {
-    if let Some(v) = cfg.plugins.get(name) {
+    if let Some(v) = cfg.plugins.get(name)
+        && v.as_object().is_some_and(|o| !o.is_empty())
+    {
         return v.to_string();
     }
     match name {
@@ -472,18 +501,18 @@ fn plugin_cfg(cfg: &Config, name: &str) -> String {
 }
 ```
 
-原 `plugin_cfg_json` 的全部调用点改为 `plugin_cfg`（grep 确认无残留）。注意保持 Task 6（auth 计划）既有行为：`scan` 模式 cfg_for 按 stem 命中、auth 未声明时传 `"{}"`（oj-auth 侧 jwt_secret `#[serde(default)]` 承接）。
+原 `plugin_cfg_json` 的全部调用点改为 `plugin_cfg`（grep 确认无残留）。注意保持 auth 计划既有行为：`scan` 模式 cfg_for 按 stem 命中、auth 未声明时传 `"{}"`（oj-auth 侧 jwt_secret `#[serde(default)]` 承接）。config.rs 相关文档/测试里旧 `plugins:` list 表述同步清理。
 
 - [ ] **Step 4: 测试 + 门禁（oj + only-js）**
 
-Run: `cargo test --release -p oj plugin_cfg -p oj 2>&1 | tail -3 && cargo test --release -p oj cfg_adapters && cargo fmt --check && cargo clippy -p oj -p only-js --all-targets -- -D warnings`
+Run: `cargo test --release -p oj plugin_cfg && cargo test --release -p oj cfg_adapters && cargo test --release -p oj plugins_map_keys && cargo fmt --check && cargo clippy -p oj -p only-js --all-targets -- -D warnings`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/config.rs oj/src/server_cmd.rs
-git commit -m "feat(config): 插件自有配置 plugins.<name> 开放段 + cfg 三级回落
+git commit -m "feat(config)!: plugins 一段三用（键=严格清单/值=透传cfg/空对象回落），废弃 list 写法
 
 unix@vip.qq.com ai"
 ```
@@ -600,11 +629,11 @@ unix@vip.qq.com ai"
 
 - [ ] **Step 2: docs 同步**
 
-- `docs/plugin-development.md`：ABI_VERSION 6→7（auth 计划 Task 8 已把 5 改 6——本计划再顶到 7）；删 PluginRegistrations/register 表述，改「`oj_plugin_entry!(init, kv => &VT)` 逐轴声明 + `oj_plugin_axis_<name>` 符号 + 缺符号 = 不提供该轴 + 加轴零破坏（ABI 规则表：既有轴形状变更才 bump）」；补「插件自有配置：`config.yaml` 的 `plugins.<name>` 开放段，宿主透传不解释，schema 插件自校验」与「自描述：descriptor.desc 必填，经 `GET {base}/plugins` 公开」。
+- `docs/plugin-development.md`：ABI_VERSION 6→7（auth 计划 Task 8 已把 5 改 6——本计划再顶到 7）；删 PluginRegistrations/register 表述，改「`oj_plugin_entry!(init, kv => &VT)` 逐轴声明 + `oj_plugin_axis_<name>` 符号 + 缺符号 = 不提供该轴 + 加轴零破坏（ABI 规则表：既有轴形状变更才 bump）」；补「插件配置：`plugins:` 一段三用（键=严格清单/值=透传 cfg/空对象=回落适配器；旧 list 写法废弃）」与「自描述：descriptor.desc 必填，经 `GET {base}/plugins` 公开」。
 - `docs/plugin-architecture.md`：注册机制章节同口径改写（探测流程：abi 门禁 → init → AXES 逐轴 dlsym；自描述收集与查询端点）。
 - `docs/builtin-api-auth.md`：内置接口总览表加一行 `GET {base}/plugins`（公共，插件自描述清单）。
 - `docs/devkit/api-manual.md`：831 行附近存量示例 `client.login("demo","demo1234")` 补第三参租户头（auth+tenant 用例与同节约束对齐；auth 计划复审遗留，随本任务 docs 重写一并修 + `cargo xtask build` 刷新 bin/devkit）。
-- `CLAUDE.md`（本地文件，不入库）：插件系统段落同步（ABI 7、按轴符号、plugins 开放段、自描述端点）。
+- `CLAUDE.md`（本地文件，不入库）：插件系统段落同步（ABI 7、按轴符号、plugins 一段三用、自描述端点；config 注释里「plugins 清单（显式给出…）」旧表述同步为统一语义）。
 
 - [ ] **Step 3: 全量门禁**
 
@@ -630,6 +659,6 @@ unix@vip.qq.com ai"
 
 ## Self-Review 记录
 
-- Spec 覆盖：契约瘦身/宏/desc 字段 → Task 1；探测/夹具 → Task 2；迁移（含 desc 填写）→ Task 3；插件配置三级回落/开放段/命名契约 → Task 4；自描述收集 + 查询端点 → Task 5；预检/docs/CI → Task 6。
+- Spec 覆盖：契约瘦身/宏/desc 字段 → Task 1；探测/夹具 → Task 2；迁移（含 desc 填写）→ Task 3；插件配置（统一语义：一段三用/回落链/命名契约）→ Task 4；自描述收集 + 查询端点 → Task 5；预检/docs/CI → Task 6。
 - 类型一致性：`oj_plugin_axis_<name>() -> *const c_void`（Task 1 定义、Task 2 消费）；`AXES` pub（Task 2 定义、Task 4 断言）；`plugin_cfg(cfg, name) -> String`（Task 4 定义、Task 6 check 复用）；`PluginDescriptor.desc: RString`（Task 1 定义、Task 2/3 填写、Task 5 经 PluginInfo.description 暴露）；`Registrations` 镜像字段全程不变。
 - 已知风险：① Task 1-3 之间 workspace 分层不可编译（破坏性契约变更固有；按序连续执行）；② mini-kv 假 vtable 的 FfiFuture/ready_err 签名以 future.rs 现状为准；③ serde_json 键序断言可能需解析回 Value 比对（Task 4 已注明）；④ `GET {base}/plugins` 为保留路径会遮蔽同名业务路由（spec 已声明，docs 落点 Task 6）。

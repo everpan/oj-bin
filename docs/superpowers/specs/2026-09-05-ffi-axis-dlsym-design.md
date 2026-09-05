@@ -127,17 +127,32 @@ cfg，而宿主在 init 前不知道插件名。
 FFI 层**零变更**：`oj_plugin_init(host, cfg: RString)` 仍是唯一配置入口（JSON 字符串载荷）；
 轴符号（`oj_plugin_axis_*`）不带配置。配置演化继续走 JSON 加字段（既有 ABI 规则）。
 
-宿主侧把 `plugin_cfg_json` 泛化为单一解析函数，三级回落：
+#### `plugins:` 统一语义（2026-09-05 用户裁定：一段三用）
+
+```yaml
+plugins:
+  auth:                      # 键 = 要加载的插件（严格模式清单）
+    jwt_secret: "override"   # 值 = 该插件的 cfg，非空对象原样透传（可选）
+  kv-redis: {}               # 空对象 = 不传自定义 cfg，回落轴适配器/默认来源
+```
+
+1. **键即加载清单**：`plugins:` 存在 → 严格模式，只加载列出的插件（缺文件/ABI 不符
+   fail-fast，沿用既有门禁）；`plugins:` 缺省 → 扫描模式（加载 plugins_dir 全部，dev
+   便捷，行为不变）。旧 `plugins: [name, ...]` 列表写法**废弃并入**（值类型 list → map
+   的 schema 破坏，解析 fail-fast 不静默；仓库内零使用）。
+2. **值即插件配置**：非空对象 → 宿主原样透传，不做任何字段解释（第三方插件正规通道，
+   schema 归插件自定义）。
+3. **空对象回落**：`{}`/缺值 → 轴适配器 → `"{}"`。空对象不抢占透传优先级，否则
+   `auth: {}` 这类「只要清单不要覆盖」的写法会切断第一方顶层段（`auth:` 等）的 cfg 流。
+
+宿主侧解析函数（`plugin_cfg_json` 泛化）：
 
 ```rust
-/// cfg 解析（装配期一次，与 AXES 探测表同处声明）：
-/// 1) config.plugins.<name>   —— 开放式 map，宿主原样透传，不做任何字段解释
-///    （第三方插件的正规通道；schema 由插件自定义）
-/// 2) 已知轴适配器            —— 第一方顶层段（auth:/es:/blob:/broker:/redis.default）
-///    由宿主按轴适配成 cfg（现 plugin_cfg_json 各分支收拢为与 AXES 同表的一张
-///    axis → adapter 映射；顶层段仍是能力开关，宿主消费其做装配门禁，
-///    插件相关字段经适配器透传）
-/// 3) "{}"                     —— 无任何声明
+/// cfg 解析（装配期一次）：
+/// 1) config.plugins.<name> 非空对象 —— 原样透传（宿主不改写字段）
+/// 2) 已知轴适配器                   —— 第一方顶层段（auth:/es:/blob:/broker:/redis.default）
+///    按轴适配成 cfg（与 AXES 探测表对应，子集关系有测试锁死；顶层段仍是能力开关）
+/// 3) "{}"                           —— 无任何声明
 fn plugin_cfg(cfg: &Config, name: &str) -> String
 ```
 
