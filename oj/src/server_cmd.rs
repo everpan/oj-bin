@@ -350,7 +350,9 @@ pub async fn assemble_plugins(
         Some(dir) if !cfg.plugins.is_empty() => {
             // 严格模式（spec「plugins: 统一语义」）：map 键即清单——只装配列出的插件；
             // 键由 HashMap 保证唯一（旧 list 去重闸门随类型收编）。缺文件/校验失败 → fail fast。
-            let entries: Vec<PluginManifestEntry> = cfg
+            // 键序先按名字排序：HashMap 遍历序逐进程漂移，装配结果/GET {base}/plugins
+            // 输出会随之不稳。
+            let mut entries: Vec<PluginManifestEntry> = cfg
                 .plugins
                 .keys()
                 .map(|name| PluginManifestEntry {
@@ -358,6 +360,7 @@ pub async fn assemble_plugins(
                     semver_pin: None,
                 })
                 .collect();
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
             load_manifest(&dir, &entries, host, &cfg_for)
                 .map_err(|e| format!("plugins manifest: {e}"))?
         }
@@ -1294,6 +1297,26 @@ mod tests {
         let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
+    }
+
+    /// 严格清单装配顺序确定：HashMap 键序逐进程漂移，entries 排序后按名字序装配，
+    /// Vec<PluginInfo> 输出跨进程稳定（GET {base}/plugins 可比对）。插入序故意逆字母序。
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_manifest_loads_in_name_order() {
+        let t = tmpdir("sc-manorder");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(es_plugin_artifact(), pdir.join(plugin_file("es"))).unwrap();
+        std::fs::copy(auth_plugin_artifact(), pdir.join(plugin_file("auth"))).unwrap();
+        let mut cfg = es_cfg("http://127.0.0.1:1");
+        cfg.plugins_dir = Some(t.0.clone());
+        cfg.plugins.insert("es".into(), serde_json::json!({}));
+        cfg.plugins
+            .insert("auth".into(), serde_json::json!({"jwt_secret": "x"}));
+        let mut r = Registries::default();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["auth", "es"]);
     }
 
     /// 编译 oj-db-mysql 产物路径（全进程一次；sqlx 首次编译慢，OnceLock 缓存）。

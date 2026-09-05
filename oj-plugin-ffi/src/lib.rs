@@ -5,6 +5,7 @@
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
 pub mod auth;
+pub mod axis;
 pub mod blob;
 pub mod bus;
 pub mod db;

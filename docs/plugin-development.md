@@ -35,9 +35,6 @@ FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装�
 各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
 同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
 
-各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
-同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
-
 **auth 轴特例**（`AuthGuardVtable`，唯一同步轴，不返回 `FfiFuture`）：`verify(path_no_base,
 authorization) -> RResult<RString, RString>`，ok 值 JSON `null` = 匿名路径放行、对象 =
 注入 `http.user`（`{"id","roles","claims"}`），Err = 401 消息。请求级热路径，参考第一方
@@ -130,10 +127,21 @@ fn descriptor() -> PluginDescriptor {
 
 // init 后宿主对 AXES 逐轴 dlsym：提供哪个轴就在宏尾声明哪个轴（轴标识强制小写）。
 // 缺轴声明 = 不导出该符号 = 不提供该轴；多轴用逗号并列。
-oj_plugin_ffi::oj_plugin_entry!(init, db => &VTABLE);
-// oj_plugin_ffi::oj_plugin_entry!(init, kv => &KV_VTABLE, auth => &AUTH_VTABLE);  // 多轴
-// oj_plugin_ffi::oj_plugin_entry!(init);                                          // 零轴（纯自描述）
+// vtable 一律经 oj_plugin_ffi::axis helper 传入（见下方红线）。
+oj_plugin_ffi::oj_plugin_entry!(init, db => oj_plugin_ffi::axis::db(&VTABLE));
+// oj_plugin_ffi::oj_plugin_entry!(
+//     init,
+//     kv => oj_plugin_ffi::axis::kv(&KV_VTABLE),
+//     auth => oj_plugin_ffi::axis::auth(&AUTH_VTABLE),
+// );  // 多轴
+// oj_plugin_ffi::oj_plugin_entry!(init);  // 零轴（纯自描述）
 ```
+
+- **红线：轴 ↔ vtable 类型配对由作者保证**。宏对 vtable 表达式是裸传擦除
+  （`as *const _ as *const c_void`），不检查类型——`auth => &KV_VTABLE` 这类复制粘贴
+  错误**能通过编译**，而宿主侧按轴转型 → 每请求热路径（auth verify）直接 **UB**。
+  **推荐一律用 `oj_plugin_ffi::axis` 的 helper 传 vtable**（上例形态）：每个 helper 只
+  接受该轴的 vtable 类型，写错编译不过。
 
 - 命名：插件 `descriptor.name` 决定存放文件名（`lib<name>.dylib` / `<name>.dll`）；crate 名
   `oj-<name>` → 构建产物 `liboj_<name>.<ext>`。扫描模式按文件名加载、严格清单模式按

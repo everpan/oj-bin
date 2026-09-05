@@ -134,8 +134,9 @@ blob:
 - `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`，需 **oj-es** 插件；缺失时调用
   报 `es not configured`。endpoint 尾斜杠自动剪除。
 - `plugins` / `plugins_dir`：插件装配。`plugins` 为 **map**，一段三用：键 = 要加载的插件名
-  （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，非空对象原样透传、空对象 = 回落
-  轴适配器；**缺省/空 map = 扫描模式**，加载 `<plugins_dir>/<平台目录>/` 全部（缺省平台
+  （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，**必须是 YAML 映射（对象）**——
+  非空对象原样透传、空对象 = 回落轴适配器，字符串/列表等非对象值视为未提供，静默回落到
+  轴适配器/默认来源；**缺省/空 map = 扫描模式**，加载 `<plugins_dir>/<平台目录>/` 全部（缺省平台
   目录 = 当前编译目标 triple）。旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。目录
   布局与升级回滚见 `dev-manual.md` §9、`plugin-development.md`。
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
