@@ -435,6 +435,7 @@ impl App {
 
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
+            tenant_anon: cfg.tenant.anonymous_paths.clone(),
             auth,
             max_upload: cfg.server.max_upload_bytes,
             blob: blob.clone(),

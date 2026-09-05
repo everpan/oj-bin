@@ -66,6 +66,8 @@ pub struct AppState {
 pub struct Pipeline {
     /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
     pub tenant_header: Option<String>,
+    /// 跳转腿豁免（tenant.anonymous_paths；命中则免租户头——OIDC 302 带不了自定义头）。
+    pub tenant_anon: Vec<String>,
     /// Some = 鉴权启用：Bearer 守卫 + http.user（实现由 oj-auth 插件提供）。
     pub auth: Option<Arc<dyn AuthGuard>>,
     /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
@@ -78,11 +80,25 @@ impl Default for Pipeline {
     fn default() -> Self {
         Self {
             tenant_header: None,
+            tenant_anon: Vec::new(),
             auth: None,
             max_upload: 10 * 1024 * 1024, // 10MiB
             blob: None,
         }
     }
+}
+
+/// 精确匹配或尾 "/*" 严格一层前缀通配（"/oidc/*" 命中 "/oidc/callback"，不命中
+/// 裸前缀 "/oidc" 与两层 "/oidc/a/b"；与 oj-auth is_anonymous 同为「精确或尾通配」
+/// 纯函数，此处按测试收紧为严格一层。插件不能依赖 server crate，两处各自持有，注释互指）。
+pub fn path_matches(list: &[String], path: &str) -> bool {
+    list.iter().any(|p| match p.strip_suffix("/*") {
+        Some(prefix) => match path.strip_prefix(prefix) {
+            Some(rest) => rest.starts_with('/') && !rest[1..].contains('/'),
+            None => false,
+        },
+        None => path == p,
+    })
 }
 
 /// 构造 axum 应用：catch-all fallback（`All("/*")` 语义）。
@@ -329,17 +345,25 @@ async fn handle(
                 }
                 _ => None,
             };
-            // 前置管线：租户提取（启用后缺失/空 → 400）。
+            // 前置管线：租户提取（启用后缺失/空 → 400；anonymous_paths 命中的跳转腿
+            // 豁免"缺失 400"——OIDC 302 带不了自定义头——但已带的头仍注入）。
             let tenant_id = match st.pipeline.tenant_header.as_deref() {
                 Some(key) => {
-                    let Some(tid) = headers
+                    let exempt = path_matches(
+                        &st.pipeline.tenant_anon,
+                        path_no_base.as_deref().unwrap_or(""),
+                    );
+                    match headers
                         .get(key)
                         .and_then(|v| v.to_str().ok())
                         .filter(|s| !s.is_empty())
-                    else {
-                        return fail_response(400, &format!("missing tenant header: {key}"));
-                    };
-                    Some(tid.to_string())
+                    {
+                        Some(tid) => Some(tid.to_string()),
+                        None if exempt => None,
+                        None => {
+                            return fail_response(400, &format!("missing tenant header: {key}"));
+                        }
+                    }
                 }
                 None => None,
             };
@@ -796,6 +820,61 @@ pub(crate) mod tests {
             plain.starts_with("HTTP/1.1 200") && plain.contains("\"t\":null"),
             "{plain}"
         );
+    }
+
+    /// tenant.anonymous_paths：命中豁免路径的跳转腿免租户头；未命中仍 400。
+    #[tokio::test]
+    async fn tenant_anonymous_paths_skip_header_requirement() {
+        let t = routes(&[(
+            "oidc/callback/api.ts",
+            "export default { get() { json.ok({ t: http.tenantId === undefined ? null : http.tenantId }); } };",
+        )]);
+        let addr = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline {
+                tenant_header: Some("X-TENANT-ID".into()),
+                tenant_anon: vec!["/oidc/*".into()],
+                ..Default::default()
+            },
+        )
+        .await;
+        // 命中 "/oidc/*"（一层）：/oidc/callback 免头，tenantId 为 null。
+        let exempt = raw_http(
+            addr,
+            "GET /v1/api/oidc/callback/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            exempt.starts_with("HTTP/1.1 200") && exempt.contains("\"t\":null"),
+            "{exempt}"
+        );
+        // 未命中路径仍强制租户头。
+        let miss = raw_http(
+            addr,
+            "GET /v1/api/oidc/callback/?x=1 HTTP/1.1\r\nHost: t\r\nX-TENANT-ID: acme\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            miss.starts_with("HTTP/1.1 200") && miss.contains("\"t\":\"acme\""),
+            "{miss}"
+        );
+    }
+
+    /// path_matches：精确、尾 "/*" 一层通配（不命中裸前缀、不命中两层）。
+    #[test]
+    fn path_matches_semantics() {
+        let l = vec!["/oidc/*".to_string(), "/idp/.well-known/*".to_string()];
+        assert!(crate::path_matches(&l, "/oidc/callback"));
+        assert!(!crate::path_matches(&l, "/oidc"));
+        assert!(!crate::path_matches(&l, "/oidc/a/b"));
+        assert!(crate::path_matches(
+            &l,
+            "/idp/.well-known/openid-configuration"
+        ));
+        assert!(crate::path_matches(&["/health".to_string()], "/health"));
     }
 
     /// multipart：文本字段并入 body、文件进 http.files + http.file(i) 取字节；
