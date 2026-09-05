@@ -6,3 +6,11 @@ xtask = "run --quiet --package xtask --release --"
 # `cargo build` 强制为 release。项目约定「禁止 debug 构建」：所有脚本/CI/工具
 # （deploy.sh、plugin-matrix.yml、cargo xtask）一律走 --release；日常开发也只
 # 使用 `cargo build --release`（或 `cargo xtask build`）。
+
+# Windows MSVC 统一静态 CRT：aws-lc-sys（rustls 默认 provider，经 reqwest/object_store
+# 引入）的 CMake 构建固定 /MT（libcmt），Rust 默认 /MD（msvcrt）与之混链触发
+# LNK4098（rustc 1.97 起默认显示链接器警告）。crt-static 使 cc/cmake 系原生构建
+# 随 rustc 设置对齐到 /MT，混链消失；发行物亦免装 VC 运行库（Deno 同款做法，
+# rusty_v8 预编译库即按 crt-static 构建）。
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
