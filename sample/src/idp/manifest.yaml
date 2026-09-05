@@ -1,3 +1,5 @@
 name: "idp"
 desc: "内置 OP（OIDC Provider）：discovery/jwks/authorize/login/token/userinfo，RS256（oidc 全局），标准对外裸 JSON"
 version: "0.1.0"
+deps:              # idp/login 读 _platform.users 校验口令（ownership_guard: deny 下必须声明）
+  _platform: "^0.1.0"

@@ -26,3 +26,52 @@ describe("idp discovery/jwks", () => {
     expect(body.keys[0].kid.length).toBe(16);
   });
 });
+
+async function idpCookie(): Promise<string> {
+  // op_client_dispatch 的 body 是 string（op #[string] 契约），须 JSON.stringify。
+  const r = await client.post("/idp/login", {
+    body: JSON.stringify({ username: "demo", password: "demo1234" }),
+  });
+  expect(r.status).toBe(200);
+  const setCookie = headerOf(r, "set-cookie");
+  expect(setCookie).toContain("IDP_SESSION=");
+  return setCookie.split(";")[0];
+}
+
+describe("idp login/authorize", () => {
+  it("login rejects bad credentials without leaking existence", async () => {
+    const r = await client.post("/idp/login", {
+      body: JSON.stringify({ username: "demo", password: "wrong" }),
+    });
+    expect(r.status).toBe(401);
+    expect(JSON.parse(r.body).msg).toBe("invalid credentials");
+  });
+
+  it("authorize enforces whitelist, PKCE and session; issues one-time code", async () => {
+    const noSess = await client.get("/idp/authorize?response_type=code&client_id=sample-rp&scope=openid");
+    expect(noSess.status).toBe(401);
+    expect(JSON.parse(noSess.body).msg).toBe("login required");
+    const cookie = await idpCookie();
+    const base =
+      "/idp/authorize?response_type=code&client_id=sample-rp" +
+      "&redirect_uri=" +
+      encodeURIComponent("http://localhost:9778/v1/api/oidc/callback") +
+      "&scope=openid&state=st1&nonce=n1&code_challenge=" +
+      "x".repeat(43) +
+      "&code_challenge_method=S256";
+    const badClient = await client.get(base.replace("sample-rp", "nope"), { headers: { Cookie: cookie } });
+    expect(badClient.status).toBe(400);
+    const badUri = await client.get(
+      base.replace(encodeURIComponent("http://localhost:9778/v1/api/oidc/callback"), encodeURIComponent("http://evil/cb")),
+      { headers: { Cookie: cookie } },
+    );
+    expect(badUri.status).toBe(400);
+    const noPkce = await client.get(base.split("&code_challenge")[0], { headers: { Cookie: cookie } });
+    expect(noPkce.status).toBe(400);
+    const ok = await client.get(base, { headers: { Cookie: cookie } });
+    expect(ok.status).toBe(302);
+    const loc = headerOf(ok, "location");
+    expect(loc).toContain("code=");
+    expect(loc).toContain("state=st1");
+  });
+});
