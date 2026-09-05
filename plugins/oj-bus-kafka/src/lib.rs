@@ -9,8 +9,8 @@
 
 use futures::StreamExt;
 use oj_plugin_ffi::{
-    ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RResult, RString,
+    ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, PluginDescriptor, RArc, RResult,
+    RString,
 };
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// 插件侧配置视图（= core config::BrokerCfg 的 JSON）。
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct BrokerCfgJson {
     kind: String,
@@ -30,18 +30,6 @@ struct BrokerCfgJson {
     url: Option<String>,
     group: Option<String>,
     topic_prefix: Option<String>,
-}
-
-impl Default for BrokerCfgJson {
-    fn default() -> Self {
-        Self {
-            kind: String::new(),
-            brokers: Vec::new(),
-            url: None,
-            group: None,
-            topic_prefix: None,
-        }
-    }
 }
 
 /// 插件共享状态（进程级单例，init 建立）。
@@ -220,20 +208,6 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
     close,
 };
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: std::ptr::null(),
-            db: std::ptr::null(),
-            blob: std::ptr::null(),
-            bus: &VTABLE,
-            kv: std::ptr::null(),
-            auth: std::ptr::null(),
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 // ---- 入口 ----
 
 fn descriptor() -> PluginDescriptor {
@@ -242,7 +216,9 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from(
+            "bus 轴 kafka cdylib 插件：rdkafka 迁自 core broker/kafka.rs（Task 4.3）",
+        ),
     }
 }
 
@@ -272,7 +248,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("oj-bus-kafka tokio runtime")
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, bus => &VTABLE);
 
 #[cfg(test)]
 mod tests {
@@ -312,7 +288,7 @@ mod tests {
         .to_string();
         let desc = match std::result::Result::from(init(host(), RString::from("{}"))) {
             Ok(d) => d,
-            Err(e) => panic!("init failed: {}", e[..].to_string()),
+            Err(e) => panic!("init failed: {}", &e[..]),
         };
         assert_eq!(&desc.name[..], "bus-kafka");
 

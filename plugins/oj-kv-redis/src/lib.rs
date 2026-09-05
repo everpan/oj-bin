@@ -9,8 +9,7 @@
 //! set/del = 空。跨线时长以秒计（宿主侧已向上取整，Redis EXPIRE 只认整秒）。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, FfiFuture, HostContext, KVStoreVtable, PluginDescriptor, PluginRegistrations,
-    RArc, RResult, RString,
+    ABI_VERSION, FfiFuture, HostContext, KVStoreVtable, PluginDescriptor, RArc, RResult, RString,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -209,20 +208,6 @@ static VTABLE: KVStoreVtable = KVStoreVtable {
     close,
 };
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: std::ptr::null(),
-            db: std::ptr::null(),
-            blob: std::ptr::null(),
-            bus: std::ptr::null(),
-            kv: &VTABLE,
-            auth: std::ptr::null(),
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 // ---- 入口 ----
 
 fn descriptor() -> PluginDescriptor {
@@ -231,7 +216,7 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from("kv 轴 redis cdylib 插件：RedisKV 迁自 core kv.rs（Task 4.4）"),
     }
 }
 
@@ -257,7 +242,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("oj-kv-redis tokio runtime")
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, kv => &VTABLE);
 
 #[cfg(test)]
 mod tests {
@@ -268,7 +253,7 @@ mod tests {
     async fn connect_refused_errors() {
         let desc = match std::result::Result::from(init(host(), RString::from("{}"))) {
             Ok(d) => d,
-            Err(e) => panic!("init failed: {}", e[..].to_string()),
+            Err(e) => panic!("init failed: {}", &e[..]),
         };
         assert_eq!(&desc.name[..], "kv-redis");
         let cfg = serde_json::json!({ "url": "redis://127.0.0.1:1/" }).to_string();

@@ -9,8 +9,7 @@
 //! handle 0（键选式单后端；未来多客户端经 cfg 加 endpoint 条目、handle 顺序分配）。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, EsBackendVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RResult, RString,
+    ABI_VERSION, EsBackendVtable, FfiFuture, HostContext, PluginDescriptor, RArc, RResult, RString,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -192,20 +191,6 @@ static ES_VTABLE: EsBackendVtable = EsBackendVtable {
     close,
 };
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: &ES_VTABLE,
-            db: std::ptr::null(),
-            blob: std::ptr::null(),
-            bus: std::ptr::null(),
-            kv: std::ptr::null(),
-            auth: std::ptr::null(),
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 // ---- 入口 ----
 
 /// 插件 descriptor（常量字段，重入/复用路径共用）。
@@ -215,7 +200,7 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from("es 轴 cdylib 插件：Elasticsearch HTTP 实现（迁自 core EsClient）"),
     }
 }
 
@@ -236,14 +221,12 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     // 避免 `let _ = set(st)` 在竞争下把败者的 tokio Runtime 从 async 上下文 drop 崩溃。
     PLUGIN.get_or_init(|| {
         let mut clients = HashMap::new();
-        if let Some(ep) = endpoint.as_deref() {
-            if !ep.is_empty() {
-                clients.insert(0, EsClientInner::new(ep.to_string()));
-                (host.log)(
-                    2,
-                    RString::from(format!("oj-es: es backend ready, endpoint {ep}")),
-                );
-            }
+        if let Some(ep) = endpoint.as_deref().filter(|ep| !ep.is_empty()) {
+            clients.insert(0, EsClientInner::new(ep.to_string()));
+            (host.log)(
+                2,
+                RString::from(format!("oj-es: es backend ready, endpoint {ep}")),
+            );
         }
         EsPluginState {
             rt: runtime(),
@@ -262,7 +245,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("oj-es tokio runtime")
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, es => &ES_VTABLE);
 
 #[cfg(test)]
 mod tests {
@@ -427,7 +410,7 @@ mod tests {
         let cfg = serde_json::json!({ "endpoint": server.url("/").to_string() }).to_string();
         let desc = match std::result::Result::from(init(host(), RString::from(cfg.as_str()))) {
             Ok(d) => d,
-            Err(e) => panic!("oj-es init failed: {}", e[..].to_string()),
+            Err(e) => panic!("oj-es init failed: {}", &e[..]),
         };
         assert_eq!(&desc.name[..], "es");
         assert_eq!(desc.abi_version, ABI_VERSION);

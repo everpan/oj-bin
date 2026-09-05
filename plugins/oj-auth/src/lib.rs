@@ -2,9 +2,7 @@
 //! login/refresh/logout 端点已 JS 化（sample/src/auth/），本插件无 db/kv 依赖。
 //! cfg 契约：init cfg = {"jwt_secret","signing_method","anonymous_paths":[...]} JSON。
 
-use oj_plugin_ffi::{
-    AuthGuardVtable, HostContext, PluginDescriptor, PluginRegistrations, RArc, RResult, RString,
-};
+use oj_plugin_ffi::{AuthGuardVtable, HostContext, PluginDescriptor, RArc, RResult, RString};
 use std::sync::OnceLock;
 
 /// access token 载荷（与 core bridge crypto.rs Claims 同形）。
@@ -106,20 +104,6 @@ extern "C" fn verify(path: RString, authorization: RString) -> RResult<RString, 
     )
 }
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: std::ptr::null(),
-            db: std::ptr::null(),
-            blob: std::ptr::null(),
-            bus: std::ptr::null(),
-            kv: std::ptr::null(),
-            auth: &VTABLE,
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
     let parsed: GuardCfg = match serde_json::from_str(&cfg[..]) {
         Ok(c) => c,
@@ -135,11 +119,13 @@ fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RSt
         semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: oj_plugin_ffi::ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from(
+            "auth 轴守卫 cdylib 插件：JWT 验签 + 匿名路径匹配（迁自 server/auth.rs）",
+        ),
     })
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, auth => &VTABLE);
 
 #[cfg(test)]
 mod tests {

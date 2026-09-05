@@ -7,8 +7,8 @@
 //! 句柄约定：connect 分配 handle；tx 分配 tx_id（每 client AtomicU64）。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, DataAccessorVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RResult, RString, RVec,
+    ABI_VERSION, DataAccessorVtable, FfiFuture, HostContext, PluginDescriptor, RArc, RResult,
+    RString, RVec,
 };
 use sqlx::any::{Any, AnyArguments, AnyRow};
 use sqlx::pool::{Pool, PoolOptions};
@@ -433,10 +433,7 @@ extern "C" fn schemes() -> RVec<RString> {
             v.push(RString::from("postgresql://"));
             v
         },
-        {
-            let v = RVec::new();
-            v
-        },
+        RVec::new(),
     )
 }
 
@@ -454,20 +451,6 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
     schemes,
 };
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: std::ptr::null(),
-            db: &VTABLE,
-            blob: std::ptr::null(),
-            bus: std::ptr::null(),
-            kv: std::ptr::null(),
-            auth: std::ptr::null(),
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 // ---- 入口 ----
 
 fn descriptor() -> PluginDescriptor {
@@ -476,7 +459,9 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from(
+            "db 轴 postgres cdylib 插件：sqlx Any 单方言（postgres）迁移自 core SqlxAccessor",
+        ),
     }
 }
 
@@ -502,7 +487,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("oj-db-postgres tokio runtime")
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, db => &VTABLE);
 
 #[cfg(test)]
 mod tests {
@@ -525,7 +510,7 @@ mod tests {
         let cfg = serde_json::json!({}).to_string();
         let desc = match std::result::Result::from(init(host(), RString::from(cfg.as_str()))) {
             Ok(d) => d,
-            Err(e) => panic!("init failed: {}", e[..].to_string()),
+            Err(e) => panic!("init failed: {}", &e[..]),
         };
         assert_eq!(&desc.name[..], "db-postgres");
 

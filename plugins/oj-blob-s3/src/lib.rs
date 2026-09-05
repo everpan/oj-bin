@@ -12,8 +12,8 @@ use object_store::path::Path;
 use object_store::signer::Signer;
 use object_store::{ObjectStore, PutPayload};
 use oj_plugin_ffi::{
-    ABI_VERSION, BlobBackendVtable, FfiFuture, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RBytes, RResult, RString,
+    ABI_VERSION, BlobBackendVtable, FfiFuture, HostContext, PluginDescriptor, RArc, RBytes,
+    RResult, RString,
 };
 use reqwest::Method;
 use serde::Deserialize;
@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// 插件侧配置视图（= core config::BlobCfg 的 JSON；serde 只取插件关心的字段）。
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
 struct S3Cfg {
     driver: String,
@@ -33,21 +33,6 @@ struct S3Cfg {
     access_key: Option<String>,
     secret_key: Option<String>,
     path_style: bool,
-}
-
-impl Default for S3Cfg {
-    fn default() -> Self {
-        Self {
-            driver: String::new(),
-            root: String::new(),
-            endpoint: None,
-            bucket: None,
-            region: None,
-            access_key: None,
-            secret_key: None,
-            path_style: false,
-        }
-    }
 }
 
 /// 插件共享状态（进程级单例，init 建立）。
@@ -245,20 +230,6 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
     close,
 };
 
-extern "C" fn register() -> PluginRegistrations {
-    oj_plugin_ffi::catch_value(
-        || PluginRegistrations {
-            es: std::ptr::null(),
-            db: std::ptr::null(),
-            blob: &VTABLE,
-            bus: std::ptr::null(),
-            kv: std::ptr::null(),
-            auth: std::ptr::null(),
-        },
-        PluginRegistrations::none(),
-    )
-}
-
 // ---- 入口 ----
 
 fn descriptor() -> PluginDescriptor {
@@ -267,7 +238,9 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        desc: RString::from(
+            "blob 轴 s3 cdylib 插件：object_store AmazonS3 迁自 core S3Blob（Task 4.2）",
+        ),
     }
 }
 
@@ -293,7 +266,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("oj-blob-s3 tokio runtime")
 }
 
-oj_plugin_ffi::oj_plugin_entry!(init);
+oj_plugin_ffi::oj_plugin_entry!(init, blob => &VTABLE);
 
 #[cfg(test)]
 mod tests {
@@ -357,7 +330,7 @@ mod tests {
         .to_string();
         let desc = match std::result::Result::from(init(host(), RString::from(cfg.as_str()))) {
             Ok(d) => d,
-            Err(e) => panic!("init failed: {}", e[..].to_string()),
+            Err(e) => panic!("init failed: {}", &e[..]),
         };
         assert_eq!(&desc.name[..], "blob-s3");
 
