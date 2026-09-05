@@ -1,0 +1,3 @@
+name: "idp"
+desc: "内置 OP（OIDC Provider）：discovery/jwks/authorize/login/token/userinfo，RS256（oidc 全局），标准对外裸 JSON"
+version: "0.1.0"

@@ -44,7 +44,7 @@ mod loader;
 mod log;
 mod module_loader;
 mod named_registry;
-mod oidc;
+pub mod oidc;
 pub mod plugin_loader;
 mod plugins_op;
 mod query;

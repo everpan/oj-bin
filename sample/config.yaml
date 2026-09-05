@@ -51,6 +51,10 @@ blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/bl
 tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
   enable: true
   header_key: "X-TENANT-ID"
+  anonymous_paths:               # 免租户头路径（OIDC 302 跳转腿带不了自定义头）
+    - "/oidc/*"
+    - "/idp/*"
+    - "/idp/.well-known/*"
 
 auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/auth/，jwt 原语注入）
   jwt_secret: "change-me"        # 生产必改；空串启动 fail-fast
@@ -62,3 +66,26 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/auth/login"              # auth 端点已是业务路由，须显式匿名
     - "/auth/refresh"
     - "/auth/logout"
+    - "/oidc/*"
+    - "/idp/*"
+    - "/idp/.well-known/*"
+
+oidc:   # OIDC（spec 2026-09-05）：同进程 OP + RP。demo 私钥与示例证书同性质，勿用于生产。
+  issuer: "http://localhost:9778/v1/api/idp"
+  private_key_path: "./config/oidc_rs256.pem"
+  rp:   # RP：tenant → IdP。default 自举本机 OP；acme 留外部 IdP 样例（注释）。
+    default:
+      issuer: "http://localhost:9778/v1/api/idp"
+      client_id: "sample-rp"
+      client_secret: "rp-secret"
+      scope: "openid profile"
+    # acme:
+    #   issuer: "https://idp.acme.example"
+    #   client_id: "..."
+    #   client_secret: "..."
+  clients:   # OP 侧 client 白名单（redirect_uri 精确串）
+    sample-rp:
+      secret: "rp-secret"
+      redirect_uris:
+        - "http://localhost:9778/v1/api/oidc/callback"
+      tenant: "default"

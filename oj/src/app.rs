@@ -253,6 +253,14 @@ impl App {
             .transpose()
             .map_err(|e| format!("auth: {e}"))?
             .map(Arc::new);
+        // oidc 原语配置注入（JS 端点 oidc.sign/verify/jwks 用）；与 jwt 同构，构造期 fail-fast。
+        let oidc = match &cfg.oidc {
+            Some(s) => Some(Arc::new(
+                only_js::bridge::oidc::OidcState::from_section(s, config_dir)
+                    .map_err(|e| format!("oidc: {e}"))?,
+            )),
+            None => None,
+        };
         // 共享事件总线。
         let bus = registries
             .bus
@@ -275,6 +283,7 @@ impl App {
             let plugins = (*plugin_infos).clone();
             let boot = boot.clone();
             let jwt = jwt.clone();
+            let oidc = oidc.clone();
             move || {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -292,8 +301,8 @@ impl App {
                         boot: boot.clone(),
                         // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
                         jwt: jwt.clone(),
-                        // OIDC 配置态：装配接线在后续任务（config.oidc → OidcState::from_section）。
-                        oidc: None,
+                        // oidc 原语配置（OIDC 解耦：JS 端点 oidc.sign/verify/jwks 数据源）。
+                        oidc: oidc.clone(),
                     },
                 )
             }
@@ -480,8 +489,8 @@ impl App {
             modules,
             ownership_deny,
             boot: boot.clone(),
-            jwt: jwt.clone(), // 与 make_bridge 的 Extras.jwt 同源。
-            oidc: None,       // 装配接线在后续任务。
+            jwt: jwt.clone(),   // 与 make_bridge 的 Extras.jwt 同源。
+            oidc: oidc.clone(), // 与 make_bridge 的 Extras.oidc 同源。
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {
