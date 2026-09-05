@@ -546,10 +546,16 @@ mod tests {
     }
 
     /// auth 配了但 jwt_secret 空 → 装配 fail-fast（不静默跳过鉴权）。
+    /// 插件目录隔离到临时夹具（就地编译 oj-auth）——不得依赖 workspace 的 bin/ 产物，
+    /// 否则 CI 检出（无 bin/plugins）会先撞「no auth plugin loaded」而非本测的目标错误。
     #[tokio::test]
     async fn empty_jwt_secret_fails_fast() {
         let t = tmpdir("sc-jwt");
+        let pdir = t.0.join(host_triple());
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::copy(auth_plugin_artifact(), pdir.join(plugin_file("auth"))).unwrap();
         let mut cfg = cert_cfg(&t.0);
+        cfg.plugins_dir = Some(t.0.clone());
         cfg.db.insert("default".into(), "sqlite::memory:".into());
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"\"\n").unwrap());
         let e = start(
