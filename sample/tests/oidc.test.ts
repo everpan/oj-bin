@@ -168,3 +168,16 @@ describe("idp token/userinfo (full code flow in-process)", () => {
     ).toBe(401);
   });
 });
+
+describe("oidc callback gates (L1: no self-fetch)", () => {
+  it("rejects invalid state", async () => {
+    const r = await client.get("/oidc/callback?code=x&state=bogus");
+    expect(r.status).toBe(401);
+    expect(JSON.parse(r.body).msg).toBe("invalid or expired state");
+  });
+  it("logout clears refresh session", async () => {
+    // op_client_dispatch 的 body 是 string（op #[string] 契约），须 JSON.stringify（Task 6 课）。
+    const r = await client.post("/oidc/logout", { body: JSON.stringify({ refresh_token: "junk" }) });
+    expect(r.status).toBe(200);
+  });
+});
