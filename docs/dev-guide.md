@@ -12,7 +12,8 @@
 （执行模型、关键模块深读、安全模型、设计权衡）。JS 全局对象完整参考见
 [devkit/api-manual.md](devkit/api-manual.md)（类型权威 `global.d.ts`），插件开发另见
 [plugin-development.md](plugin-development.md)，部署运维见 [ops-manual.md](ops-manual.md)，
-性能数据见 [benchmarks.md](benchmarks.md)。
+性能数据见 [benchmarks.md](benchmarks.md)，OIDC 实现走读与接入手册见
+[oidc-implementation.md](oidc-implementation.md) / [oidc-integration.md](oidc-integration.md)。
 
 ---
 

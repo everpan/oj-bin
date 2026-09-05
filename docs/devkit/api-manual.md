@@ -859,7 +859,8 @@ curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/
 `auth` token → `logout`）。OIDC 的 302 跳转腿带不了自定义头，故 demo 在
 `tenant.anonymous_paths` 里匿名 `/oidc/*`、`/idp/*`（键见第 10 章 tenant/auth）；
 `oidc.rp`/`oidc.clients` 配置驱动，对接外部 IdP 只改 config。curl 全链路见
-`sample/README.md` 的「OIDC 演示」。
+`sample/README.md` 的「OIDC 演示」；实现走读（含 mermaid 时序图）见
+`docs/oidc-implementation.md`，接入手册见 `docs/oidc-integration.md`。
 
 ## 9. 测试
 
