@@ -197,7 +197,7 @@ static ES_VTABLE: EsBackendVtable = EsBackendVtable {
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         name: RString::from("es"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
         desc: RString::from("es 轴 cdylib 插件：Elasticsearch HTTP 实现（迁自 core EsClient）"),

@@ -16,7 +16,7 @@ fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RS
         .unwrap_or(ABI_VERSION);
     RResult::Ok(PluginDescriptor {
         name: RString::from("mini"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: abi,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
         desc: RString::from("loader 测试夹具（零轴）"),

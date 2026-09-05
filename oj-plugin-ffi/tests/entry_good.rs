@@ -12,7 +12,7 @@ fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RSt
     assert_eq!(&cfg[..], "{}");
     RResult::Ok(PluginDescriptor {
         name: RString::from("test-plugin"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from("test"),
         desc: RString::from("a test plugin"),

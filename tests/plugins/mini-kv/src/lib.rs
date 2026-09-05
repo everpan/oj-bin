@@ -39,7 +39,7 @@ fn init(
 ) -> RResult<oj_plugin_ffi::PluginDescriptor, RString> {
     RResult::Ok(oj_plugin_ffi::PluginDescriptor {
         name: RString::from("mini-kv"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: oj_plugin_ffi::ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
         desc: RString::from("loader 测试夹具（单轴 kv）"),

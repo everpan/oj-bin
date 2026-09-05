@@ -239,7 +239,7 @@ static VTABLE: EventBrokerVtable = EventBrokerVtable {
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         name: RString::from("bus-rabbitmq"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
         desc: RString::from(

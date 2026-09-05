@@ -213,7 +213,7 @@ static VTABLE: KVStoreVtable = KVStoreVtable {
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         name: RString::from("kv-redis"),
-        semver: RString::from("0.1.0"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
         desc: RString::from("kv 轴 redis cdylib 插件：RedisKV 迁自 core kv.rs（Task 4.4）"),
