@@ -33,3 +33,20 @@
   需要时 `oj build` 重新生成
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由迁移 + seed.sql 初始化（均幂等），已 gitignore
+
+## OIDC 演示（src/idp = 同进程 OP，src/oidc = RP）
+
+  cargo run -p oj -- server -c sample/config.yaml --api-path sample/src   # 插件在 bin/plugins 自动发现，无需 OJ_PLUGINS_DIR
+  curl -s http://localhost:9778/v1/api/idp/.well-known/openid-configuration        # discovery：裸 JSON（json.raw，无信封）
+  curl -s -c /tmp/idp.jar -d '{"username":"demo","password":"demo1234"}' \
+    http://localhost:9778/v1/api/idp/login                                         # OP 登录 → IDP_SESSION cookie
+  curl -si "http://localhost:9778/v1/api/oidc/login?tenant=default" | grep -i '^location'   # RP login → 302 到 OP authorize
+  curl -si -b /tmp/idp.jar "<上一步 Location>" | grep -i '^location'                # authorize（会话门禁 + PKCE）→ 302 回 callback?code&state
+  curl -s "<上一步 Location>"                                                       # callback 换会话 → 信封 {code:0,data:{access_token,…}}
+  curl -s http://localhost:9778/v1/api/auth_demo/me/ \
+    -H "Authorization: Bearer <access_token>" -H 'X-TENANT-ID: default'            # 受保护路由（Bearer + 租户头）
+
+- 302 一律 `-i` 手动接力 Location；state/code 一次一用（重放 401），跳转腿免租户头靠
+  `tenant.anonymous_paths`（`/oidc/*`、`/idp/*`），对接外部 IdP 只改 config `oidc.rp`
+- 已知限制：OP `sub` = users.id 字符串 → 自托管 OIDC 登录 JIT 新建本地账号
+  （username = sub，占位 hash 不可密码登录），不合并原 demo 行

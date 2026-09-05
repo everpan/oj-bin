@@ -178,7 +178,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 
 | 全局 | 用途 | 关键点 |
 |---|---|---|
-| `json.ok(data)` / `json.fail(code,msg,data?)` / `json.header(n,v)` | 信封与响应头 | `code<=0` 映射 500；HTTP 状态 = `code` |
+| `json.ok(data)` / `json.fail(code,msg,data?)` / `json.header(n,v)` / `json.raw(data)` | 信封与响应头；`raw` = 裸 JSON 200（无信封，对外标准协议端点用） | `code<=0` 映射 500；HTTP 状态 = `code` |
 | `db` / `DB(name)` | 数据访问；`db === DB("default")` | 未配置的名字返回 `undefined` |
 | `db.query / exec / table / tx` | 原始 SQL / 安全构造器 / 事务 | 标识符走白名单、值参数化；`tx` 回调式，resolve 提交 throw 回滚 |
 | `http.method/params/query/headers/body/tenantId/user/files` | 只读请求上下文（懒 Proxy） | `param(name, def?)` 路径优先、query 兜底 |
@@ -191,6 +191,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `cert.generate/renew` | JWS 证书签发/续期（Rust RSA） | 纯内存，不落盘 |
 | `jwt.sign/verify` + `jwt.accessDuration/refreshDuration` | JWT 签发验签 | 密钥/时长装配期注入；claims 固定 `{sub,roles,iat,exp}` |
 | `bcrypt.hash/verify` | 密码哈希（`spawn_blocking`） | 不依赖 `auth:` 段 |
+| `oidc.sign/verify/jwks` + `oidc.issuer/rp/clients` | RS256 JWS 原语 + 装配期配置 | `oidc:` 段启用；私钥留在 Rust（`src/bridge/oidc.rs`） |
 | `crypto.sha256Hex / randomHex` | 摘要与随机数 | 与原生 `getRandomValues` 合并 |
 | `ws.send/close` | WS 帧循环控制 | 仅 WS 连接内有意义 |
 | `plugins()` | 已装配插件自省 | 同源 `GET {base}/plugins` |
@@ -475,6 +476,8 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符
   白名单 + 参数化值（sea-query）——见 §4 红线。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
+- **租户跳转腿豁免**：`tenant.anonymous_paths`（语义同 `auth.anonymous_paths`）命中路径免
+  "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；已带的头仍照常注入。
 
 ### 11.2 证书驱动的 GET 限制（运行时校验）
 

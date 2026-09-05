@@ -120,6 +120,19 @@ broker:
   # brokers: ["127.0.0.1:9092"]
 blob:
   # 可选：对象存储（driver local/s3，s3 需 oj-blob-s3 插件；完整键见 sample/config.yaml）
+tenant:                      # 可选：多租户头（缺段 = 不启用）
+  enable: true               # 启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
+  header_key: "X-TENANT-ID"
+  anonymous_paths:           # 免租户头路径（OIDC 302 跳转腿带不了自定义头；已带的头仍注入）
+    - "/oidc/*"
+oidc:
+  # 可选：段存在即启用 oidc 全局（RS256 sign/verify/jwks + issuer/rp/clients）
+  issuer: "http://localhost:9778/v1/api/idp"
+  private_key_path: "./config/oidc_rs256.pem"   # PKCS#8 PEM，相对 config 目录
+  rp:                        # RP 侧 tenant → IdP：issuer/client_id/client_secret/scope
+    default: { issuer: "…", client_id: "…", client_secret: "…", scope: "openid" }
+  clients:                   # OP 侧白名单：secret/redirect_uris（精确串）/tenant
+    sample-rp: { secret: "…", redirect_uris: ["…"], tenant: "default" }
 ```
 
 - `server` 字段全可省（都有默认值）。
@@ -159,6 +172,11 @@ blob:
   （迁移完全归 `oj migrate` / 运维）。非法值 fail-fast。
 - `server.ownership_guard`：表归属守卫（§5.3）。`warn`（默认）跨模块表访问仅告警；
   `deny` 未声明 `deps` 的跨模块表访问拒绝执行（500，报错附修复指引）。
+- `tenant.anonymous_paths`：与 `auth.anonymous_paths` 同构（去 `{base}` 前缀、尾 `/*` 一层
+  通配）的**跳转腿豁免**——命中路径不再因缺租户头 400（OIDC 302 场景），已带的头仍注入。
+- `oidc:`：缺段时调用报 `oidc not configured`；私钥只在 Rust 侧解析使用，
+  `client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读（与 `auth.jwt_secret` 同一信任级）。
+  内置 OP/RP 演示见 §11 与 `sample/README.md`「OIDC 演示」。
 
 ## 4. 项目目录结构
 
@@ -590,6 +608,8 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - **upload**：multipart 上传 → `blob.put` → 返回下载地址；`del` 删 blob（query `k`）。下载走内置
   `{base}/blob/{key}` 路由（§9 文件上传与 blob）。
 - **auth_demo**：JWT 鉴权演示（`/me` 受保护 / `/health` 匿名），login/refresh/logout 内置路由。
+- **idp / oidc**：内置 OP + RP 的 OIDC 演示（discovery/jwks/authorize/token/userinfo 出裸 JSON；
+  RP login→callback 换本地 token），curl 全链路见 `sample/README.md`「OIDC 演示」。
 
 跑法见 §1。验收用例见 `../oj/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 

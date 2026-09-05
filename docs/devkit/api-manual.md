@@ -417,7 +417,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（16 组）
+### 总表（17 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -436,6 +436,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
+| `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
@@ -446,6 +447,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.ok` | `ok(data?: unknown): void` | 成功信封 `{code:0,msg:"ok",data}`，HTTP 200 |
 | `json.fail` | `fail(code: number, msg: string, data?: unknown): void` | 失败信封，HTTP 状态 = `code`（`code<=0` 映射 500） |
 | `json.header` | `header(name: string, value: string): void` | 设置响应头（同名后写覆盖） |
+| `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
 
 ```ts
 json.ok({ created: true });
@@ -834,7 +836,9 @@ tenant:
 ```
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
-供 handler 做数据隔离。**框架不自动改写 SQL**——行级过滤归业务（自行在查询里带
+供 handler 做数据隔离。`tenant.anonymous_paths`（语义同 `auth.anonymous_paths`）豁免
+缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；已带的头仍照常注入。
+**框架不自动改写 SQL**——行级过滤归业务（自行在查询里带
 tenant 条件）。启用期间测试请求也必须带头（第 9 章两约束）。
 
 ### auth_demo 走读（sample）
@@ -844,6 +848,16 @@ tenant 条件）。启用期间测试请求也必须带头（第 9 章两约束�
 （`demo` / `demo1234`，角色 admin）。走读顺序：login 拿 token → 带 Bearer 打
 `/auth_demo/me/` → refresh 轮换 → logout 失效。sample 同时开了 tenant，
 curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/README.md`）。
+
+### OIDC 演示走读（sample：idp + oidc）
+
+`sample/src/idp/` 是同进程 **OP**（`/.well-known/openid-configuration`、`jwks.json`、
+`authorize`、`login`、`token`、`userinfo`——标准协议端点用 `json.raw` 出裸 JSON）；
+`sample/src/oidc/` 是 **RP**（`login` → 302 授权 → `callback` 换会话桥接成本地
+`auth` token → `logout`）。OIDC 的 302 跳转腿带不了自定义头，故 demo 在
+`tenant.anonymous_paths` 里匿名 `/oidc/*`、`/idp/*`（键见第 10 章 tenant/auth）；
+`oidc.rp`/`oidc.clients` 配置驱动，对接外部 IdP 只改 config。curl 全链路见
+`sample/README.md` 的「OIDC 演示」。
 
 ## 9. 测试
 
@@ -1069,10 +1083,26 @@ broker:
 
 ### tenant / auth
 
-字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`；auth 的
-`jwt_secret`（空串启动 fail-fast，生产必改）、`signing_method`（HS256|HS384|HS512，
-默认 HS256）、`access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
-`anonymous_paths`——无 `user_table` 配置，用户表是业务约定）。
+字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
+跳转腿豁免；auth 的 `jwt_secret`（空串启动 fail-fast，生产必改）、`signing_method`
+（HS256|HS384|HS512，默认 HS256）、`access_token_duration`（默认 60s）、
+`refresh_token_duration`（默认 720h）、`anonymous_paths`——无 `user_table` 配置，
+用户表是业务约定）。
+
+### oidc —— 内置 OP/RP 原语（段存在即启用）
+
+RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `oidc:` 段调用报
+`oidc not configured`。
+
+| 键 | 说明 |
+|---|---|
+| `issuer` | OP 标识/发现基址（如 `http://localhost:9778/v1/api/idp`） |
+| `private_key_path` | RS256 私钥（PKCS#8 PEM，相对 config 目录；demo 用 `sample/config/oidc_rs256.pem`，与示例证书同性质，勿用于生产） |
+| `rp` | RP 侧 `tenant → IdP` 映射：`issuer` / `client_id` / `client_secret` / `scope` |
+| `clients` | OP 侧 client 白名单：`secret` / `redirect_uris`（**精确串**，未命中绝不重定向）/ `tenant` |
+
+私钥只在 Rust 侧解析使用；`client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读——
+与 `auth.jwt_secret` 同一信任级（能跑 handler 即能拿鉴权密钥）。
 
 ### plugins / plugins_dir —— 插件装配（map 一段三用）
 
