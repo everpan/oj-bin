@@ -21,6 +21,9 @@ pub use future::FfiFuture;
 // I-2：跨边界安全的 FfiFuture 工厂与 vtable 方法包装宏（spec §3 统一 catch_unwind）。
 pub use future::{catch_future, catch_value, catch_void, ready_err, spawn_ffi_future};
 pub use kv::KVStoreVtable;
+// re-export：oj_plugin_entry! 展开内经 $crate::paste::paste! 拼接轴符号名，
+// 使用方（插件 crate）无需自带 paste 依赖。
+pub use paste;
 
 pub type RString = stabby::string::String;
 pub type RVec<T> = stabby::vec::Vec<T>;
@@ -107,7 +110,7 @@ macro_rules! oj_plugin_entry {
         }
 
         $(
-            ::paste::paste! {
+            $crate::paste::paste! {
                 #[unsafe(no_mangle)]
                 pub extern "C" fn [<oj_plugin_axis_ $axis:lower>]() -> *const ::core::ffi::c_void {
                     $vtable as *const _ as *const ::core::ffi::c_void

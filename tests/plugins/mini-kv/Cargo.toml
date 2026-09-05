@@ -8,5 +8,3 @@ crate-type = ["cdylib"]
 
 [dependencies]
 oj-plugin-ffi = { path = "../../../oj-plugin-ffi" }
-# oj_plugin_entry! 多轴展开内联 `::paste::paste!`，使用者须自带 paste 依赖。
-paste = "1"

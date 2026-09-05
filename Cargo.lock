@@ -3362,7 +3362,6 @@ name = "oj-plugin-test-mini-kv"
 version = "0.1.0"
 dependencies = [
  "oj-plugin-ffi",
- "paste",
 ]
 
 [[package]]
