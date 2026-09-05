@@ -417,7 +417,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（13 组）
+### 总表（16 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -434,6 +434,9 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
+| `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
+| `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
+| `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
 ### json —— 信封与响应头
@@ -646,11 +649,59 @@ if (r.ok) {
 ### plugins —— 插件自省
 
 签名：`plugins(): any[]`。返回已加载插件清单
-`[{name, semver, abi_version, fingerprint, host_abi_version}]`——用于升级核对窗口
-（第 11 章插件升级）。
+`[{name, semver, abi_version, fingerprint, description, host_abi_version}]`——用于升级核对窗口
+（第 11 章插件升级）；`description` 为插件作者自述。同一清单经内置端点
+`GET {base}/plugins` 公开（不走 Bearer，运维/监控用）。
 
 ```ts
 json.ok(plugins());
+```
+
+### jwt —— JWT 签发与验签（`auth:` 段启用）
+
+secret / 算法 / 有效期由 config `auth:` 段在装配期注入，handler 不接触密钥；
+`auth:` 未配置时调用报 `jwt not configured`。`iat` / `exp` 由 Rust 侧补（JS 不可控有效期），
+`exp` 取 access 时长。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `jwt.sign` | `sign(payload: { sub: string; roles?: string[] }): string` | 签发 access token（payload 至少含 `sub`，`roles` 缺省空数组） |
+| `jwt.verify` | `verify(token: string): { sub, roles, iat, exp }` | 验签 + 过期检查（leeway 0）；篡改 / 过期 / 算法不符直接抛错 |
+| `jwt.accessDuration` | `readonly number` | 配置的 access 有效期（秒；getter 惰性求值） |
+| `jwt.refreshDuration` | `readonly number` | 配置的 refresh 有效期（秒） |
+
+```ts
+const token = jwt.sign({ sub: user.id, roles: user.roles });   // 登录端点签发
+const claims = jwt.verify(token);                               // 受守卫保护的端点一般直接读 http.user
+```
+
+### bcrypt —— 密码哈希（始终可用）
+
+哈希与校验在 Rust 侧 `spawn_blocking` 执行，CPU 密集不卡 isolate；**不依赖 `auth:` 段，
+未配置鉴权也可用**（校验不需密钥）。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `bcrypt.hash` | `hash(password: string, cost?: number): Promise<string>` | 生成 bcrypt 哈希（cost 缺省库默认） |
+| `bcrypt.verify` | `verify(password: string, hash: string): Promise<boolean>` | 校验；非法 hash 返回 `false`（不抛错） |
+
+```ts
+const ok = await bcrypt.verify(password, row.password_hash);   // false = 口令不符或 hash 非法
+```
+
+### crypto —— 摘要与随机数（增补进原生 crypto）
+
+bootstrap 对原生 `crypto` 做 `Object.assign` 合并：原生成员（如 `getRandomValues`）保留，
+仅增补两个方法。**不依赖 `auth:` 段，始终可用。**
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
+| `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
+
+```ts
+const sessionKey = "AUTH-SESSION:" + crypto.sha256Hex(refreshToken);   // 见第 8 章轮换
+const token = crypto.randomHex();                                      // 64 字符不透明串
 ```
 
 ### ext_boot.js —— 运行时补充全局对象
@@ -725,8 +776,8 @@ globalThis.APP_ENV = "prod";
 ### auth：块存在即启用（oj-auth 守卫 + JS 端点）
 
 config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插件在前置管线完成）与
-**`jwt` / `bcrypt` 全局注入**（供 JS 侧实现登录端点）。`jwt_secret` 配了却为空串 →
-启动 fail-fast（不静默跳过）。
+**`jwt` / `bcrypt` 全局注入**（供 JS 侧实现登录端点，API 细节见第 6 章 jwt / bcrypt / crypto）。
+`jwt_secret` 配了却为空串 → 启动 fail-fast（不静默跳过）。
 
 **auth 端点是业务路由，不是内置路由**：`login` / `refresh` / `logout` 由普通 JS 模块实现
 （sample 提供参考实现 `sample/src/auth/`，目录镜像路由 `POST /auth/login|refresh|logout`）：
@@ -1023,10 +1074,26 @@ broker:
 默认 HS256）、`access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
 `anonymous_paths`——无 `user_table` 配置，用户表是业务约定）。
 
-### plugins / plugins_dir —— 插件装配（双模式）
+### plugins / plugins_dir —— 插件装配（map 一段三用）
 
-- `plugins:` 显式清单给出 → **严格按清单装配**（缺文件/身份不符/`@semver` pin 不符 fail fast）。
-- 省略 → 扫描插件目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。
+`plugins:` 为 **map**，一段三用：
+
+- **键 = 加载清单**：非空 map → 严格模式，只装配列出的插件（缺文件/身份不符/`@semver`
+  pin 不符 fail fast）。
+- **值 = 插件 cfg**：必须是 YAML 映射（对象）——非空对象**原样透传**为该插件 init cfg
+  （跳过回落，第三方插件正规通道）；空对象 `{}` = 不覆盖，回落轴适配器/默认来源；
+  字符串/列表等非对象值视为未提供，静默回落。
+- **缺省/空 map = 扫描模式**：加载插件目录全部（目录不存在/为空 = 零插件，仅内置后端）。
+  旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。
+
+```yaml
+plugins:
+  kv-redis: {}                     # 只要清单不要覆盖 → 回落轴适配器（顶层 redis: 段仍生效）
+  auth: { jwt_secret: "..." }      # 非空对象 = 原样透传，跳过回落
+```
+
+命名契约：插件文件 stem == descriptor name == `plugins:` 键（如 `libauth.dylib` ↔ `auth`）；
+扫描模式以文件 stem 命中配置键。
 
 `plugins_dir` 目录四级发现（先到先得），最终目录 = `<plugins_dir>/<host-triple>/`：
 
@@ -1034,6 +1101,9 @@ broker:
 2. config `plugins_dir`（相对 config 目录）
 3. `<exe>/plugins`（`bin/oj` 旁即 `bin/plugins`）
 4. `<workspace_root>/bin/plugins`
+
+已装配插件的清单可查：JS `plugins()`（第 6 章）与内置端点 `GET {base}/plugins`
+（公共端点，不走 Bearer；`plugins` 为保留路径，业务模块勿占用该目录名）。
 
 ### 证书三字段：必配不可绕过
 
