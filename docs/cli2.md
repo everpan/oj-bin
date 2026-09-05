@@ -21,9 +21,12 @@
       other: "redis://user:password@127.0.0.1:6379/2"
   ```
 
-  -b base 作为默认的服务基础路由，默认 /v1/api
-   
-  -d dir 以 `dir` 作为项目的服务目录，一个开发中(--dev)的服务目录如下
+  -b base 覆盖 API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
+
+  --api-path dir 以 `dir` 作为项目的服务目录（`src` 源码树或 `oj build` 产物 `dist`）；
+                 缺省时 src 目录存在取 src，否则 dist。模式自动判定：目录含
+                 `manifests.yaml` ⇒ release（服务预转译 JS，按锁聚合，不转译），
+                 否则 dev（按需转译 TS，notify 热重载）。一个开发中的服务目录如下
   ```
     dist   # 编译目录与src结构相同
     src    # 源码目录，首层子目录为模块名
@@ -36,6 +39,10 @@
         └── profile
         └── manifest.yaml # user 模块的清单
   ```
+
+  其他旗标：`--app-path <dir>`（静态站点目录）、`--cert-path` / `--key-path`（JWS 证书与
+  公钥路径）、`--console-log`（打开终端输出，默认只落盘 server.logs_dir）。
+
    每个模块目录下包含一个配置文件 manifest.yaml 用于记录该模型的相关清单，其案例结构如下
   ```yaml
     name: "user" # 与模块名文件夹同名，即父目录名，约束条件
@@ -44,9 +51,9 @@
     config: # 本模块的其他设置信息
   ```
 ### 访问规则
-   --dev 开发模式下
+   dev 模式下
    如果某个子文件夹中存在 `api.ts`, 如 `src/moduleA/featB/api.ts`, 则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行 `api.ts` 中导出的`get`方法
-   --release 发布模式下，一般是编译文件目录，如 `-d dist/` 下存在各模块版本目录 `moduleA-{VERSION}/`，server 按 `dist/manifests.yaml` 锁定的版本加载各 `routes.js` 聚合路由，则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行对应 `featB/api.js`（minified）中导出的`get`方法
+   release 模式下，一般是编译文件目录，如 `--api-path dist/` 下存在各模块版本目录 `moduleA-{VERSION}/`，server 按 `dist/manifests.yaml` 锁定的版本加载各 `routes.js` 聚合路由，则可以通过 `GET` `/v1/api/moduleA/featB/` 来执行对应 `featB/api.js`（minified）中导出的`get`方法
    其中 `DELETE` 映射为 `del` 方法
 
    `api.ts` 伪代码如下
@@ -60,10 +67,10 @@
     // 
     export default {get,post}
   ```
-   以上代码通过 `oj build moduleA` 命令来编译，制品存放在 `dist`，`build` 子命令为内置转译管线（swc）的包装。
+   以上代码通过 `oj build moduleA` 命令来编译，制品存放在 `dist`，`build` 子命令为内置转译管线（deno_ast/swc）的包装。
 
 ## build
-  开发者通过执行 `oj build user` 命令来编译 user 模块，`build` 子命令为内置转译管线（swc）的包装，基本过程如下
+  开发者通过执行 `oj build user` 命令来编译 user 模块，`build` 子命令为内置转译管线（deno_ast/swc）的包装，基本过程如下
       - 校验 user/manifest.yaml 中的模块名是否与根目录相同，即模块名必须严格相同, 其中 version 记录为 {VERSION}
       - 遍历所有子文件夹的 `api.ts`, 并将其路径提取，例如 `user/profile/detail/api.ts` `API_PATH='user/profile/detail'`
       - 从api.ts中export的方法中，提取 route，如 `get.route={id}`, 则可以依此作为生产 `routes.js` 的路由项数据 `{ method: "get", pattern: "user/profile/detail/{id}", file: "detail/api.js" }`；`file` 相对版本目录根，子目录下的 api.ts 形如 `detail/api.js`（产物保留原名与目录结构，api.ts → 同目录 `api.js`）
@@ -96,4 +103,52 @@
 ```
 
   `dist/manifests.yaml` 记录模块 → 版本的锁定关系（如 `user: 0.1.0`），每次构建 upsert 对应模块；版本升级后旧版本目录保留，可多版本共存，锁定文件始终指向当前版本。server release 模式按 `dist/manifests.yaml` 逐模块校验（白名单、版本目录存在、manifest name 与模块一致）后加载各 `routes.js` 聚合路由，任何校验失败即启动报错（fail-fast）。
+
+  `--check` 只跑结构检查（S002–S007：manifest 合法性 / 表归属单射 / 跨模块依赖声明 /
+  deps 版本范围 / tables 与 schema.yaml 一致 / seed 纪律 / 迁移文件序列），不写任何产物，
+  可作 CI 门禁。
+
+## test
+  进程内测试运行器：真实 deno_core 运行时 + 真实路由/鉴权/租户管线派发（零 TCP），
+  跑 `tests/*.test.ts`（注入 `client` 与 `describe/it/expect`），无需启动 oj server。
+
+```
+    oj test [-c config.yaml] [-b base] [-d dir] [-t tests] [--format human|tap|junit|json] [--output file]
+```
+      -c      配置文件，默认 `config.yaml`
+      -b      API 基础前缀覆盖（缺省用 config 的 server.base）
+      -d      服务目录 src 或 dist（缺省自动判定）
+      -t      测试用例目录，相对 config 目录，默认 `tests`
+      --format 报告格式：human（默认）/ tap / junit / json
+      --output 报告落盘文件；省略则打印到 stdout
+
+  退出码：全部通过 = 0，任一失败 = 1（可直接做 CI 门禁）。测试写法详见 `docs/testing.md`。
+
+## migrate
+  应用模块迁移到最新（各模块 `migrations/*.sql` → default 库；部署顺序 = build && migrate && server）。
+
+```
+    oj migrate [-c config.yaml] [-d dir] [--baseline] [module]
+```
+      -c        配置文件（db 段提供目标库）
+      -d        服务目录（缺省自动判定）
+      --baseline 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
+      module    只迁移指定模块
+
+## fixture
+  灌入模块 `fixtures/` 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
+
+```
+    oj fixture [-c config.yaml] [-d dir] [module]
+```
+
+## schema diff
+  声明式 schema（各模块 `schema.yaml`）与实库只读对账：D001 声明 vs 实库漂移
+  （缺表/缺列/多列/缺索引）、D002 实库有而未声明的表；有差异退出码 1。
+
+```
+    oj schema diff [-c config.yaml] [-d dir]
+```
+
+  迁移 / schema 的心智模型、门禁与回滚见 `docs/migration.md`。
 

@@ -1,5 +1,10 @@
 # Rust 版 CLI 实现预案（可行性分析 + 扩充版）
 
+> **已归档**：这是早期「进程内 devserver」时代的实施预案（P0–P6 已完成），文中所述
+> devserver / router / actor 架构已被 **`oj` CLI**（`oj/` crate：server / build / test /
+> migrate / fixture / schema）取代，仅作历史复盘保留。现行 CLI 用法见 [cli2.md](cli2.md)
+> 与 `oj/src/args.rs`。
+
 > **状态（2026-08-21）：P0–P6 全部完成**，双绿 root 19 + server 22（debug/release）。
 > 本文档保留计划原文与证伪更正的脉络（原稿 → 复核结论 → 实现记录），供复盘。
 

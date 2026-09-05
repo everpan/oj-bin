@@ -5,9 +5,12 @@
 ## 架构
 
 ```
-┌─────────────── JS handler ───────────────┐
-│  json / db / DB / http / redis / log     │
-│  / fetch / finish   (bootstrap.js 装配)  │
+┌──────────────── JS handler ───────────────┐
+│  json / db / DB / http / kv / redis       │
+│  / blob / bus / es / ws / cert / jwt      │
+│  / bcrypt / crypto / fetch / log / finish │
+│        (bootstrap.js 装配，全参考见        │
+│         devkit/api-manual.md)             │
 └───────────────── op 调用 ────────────────┘
                    │ #[op2]
 ┌──────────────────┴───────────────────────┐
@@ -72,12 +75,18 @@ http.headers // {} 请求头
 http.body    // 能解析为 JSON 则为对象/数组，否则为字符串；空为 null
 ```
 
-### redis —— M0 内存 KV（Promise）
+### kv / redis —— KV 存储（Promise，同一实现）
 
 ```js
-await redis.set("k", "v");   // true
-const v = await redis.get("k"); // string | null
+await kv.set("k", "v");        // true
+const v = await kv.get("k");   // string | null
+await kv.del("k");             // 幂等
+await kv.expire("k", 60);      // 相对秒数；键不存在 → false
+await kv.incr("k");            // 原子自增，缺失从 0 起
 ```
+
+`kv` 与 `redis` 是同一 KV 的两个名字。真 Redis 由 **oj-kv-redis 插件**提供；未装配时回落
+进程内内存 KV（`kv.rs` 的 `InMemoryKV`，联调用）。
 
 ### log —— 结构化日志（msg + 交替键值对，同 zap SugaredLogger）
 
@@ -101,11 +110,11 @@ const { done, value } = await resp.body.getReader().read(); // 缓冲模拟：�
 ```
 
 未设置 Content-Type 且有 body 时自动补 `text/plain;charset=UTF-8`。不支持 AbortController。
-HTTP 客户端为单个共享 reqwest Client（连接池复用），`no_proxy`——不走系统代理；
-需要代理支持时按配置注入 `Proxy`（见 `src/bridge/mod.rs` 注释）。
+HTTP 客户端为单个共享 reqwest Client（连接池复用），构造时固定 `no_proxy`——不走系统代理
+（macOS 系统代理会把连回环的请求也拦截转发，实测 65 µs/req 劣化到 1.9 ms/req）。
 
 > 注意：reqwest 默认会读取 macOS 系统代理配置，本机有代理软件时连回环地址都会被
-> 拦截转发（实测 65 µs/req 劣化到 1.9 ms/req）。这是 `no_proxy` 的直接原因。
+> 拦截转发——这是 `no_proxy` 的直接原因。
 
 ### finish —— 标记会话完成
 
@@ -151,8 +160,12 @@ let registry = SchemaRegistry::new()
 // 含注册表 + inspector 开关；inspect=true 时运行时启用 DevTools inspector。
 let mut b = Bridge::with_opts(db, kv, registry, false);
 
-// 命名实例（须在首次 checkout runtime 之前调用；StableState 一旦共享即不可变）。
-b.set_db_accessors([("reports".into(), reports_da)]);
+// 命名实例须构造期全量注入（StableState 一经 runtime 池共享即不可变；
+// 早期版本的 set_db_accessors 已删除——池化后 Arc::get_mut 必 panic）。
+let b = Bridge::with_dbs(
+    HashMap::from([("default".into(), default_da), ("reports".into(), reports_da)]),
+    kv, registry, false,
+);
 
 // 注入请求上下文并执行；run() 等价于 run_with(src, RequestInfo::default())。
 let cap = b.run_with(handler_js_source, RequestInfo {
@@ -194,17 +207,15 @@ pub trait KVStore: Send + Sync {                   // 后续真实 Redis 以同�
 ## 测试与性能
 
 ```bash
-cargo test        # 7 个单元测试（含本地 HTTP 服务器的 fetch 全链路、query 构造器、白名单校验）
-cargo test --doc  # 文档测试（deno_core 扩展宏自带的 doctest 为 ignored）
+cargo test --release --workspace   # 全部测试（根 crate 单测 + oj e2e + 插件）
 cargo build --benches && cargo bench   # criterion 性能测试（含吞吐统计），见 docs/benchmarks.md
-cargo run         # 演示：构造 Bridge、注入请求、跑业务 JS、读捕获响应
 ```
 
 当前量级（Apple Silicon，release）：异步 op 边界约 140 ns（redis/db.exec 7 M/s 级），
 json.ok 230 ns，db.query 413 ns，fetch 本地回环复用连接 30 µs/req（33.7 K/s）。
 详见 [benchmarks.md](benchmarks.md)（含优化前后对比与根因分析）。
 
-## deno_core 0.409 移植要点
+## deno_core 0.410 移植要点
 
 - `#[op2]` 无 `(async)` 标志，`async fn` 自动识别。
 - `#[serde]` 位置须写全限定 `serde_json::Value`；`Option<String>` 参数用 `#[string]`。
