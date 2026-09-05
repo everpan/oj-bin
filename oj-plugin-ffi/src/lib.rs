@@ -141,14 +141,24 @@ mod tests {
     // 每次展开都生成 oj_plugin_abi_version / oj_plugin_init 两个 no_mangle 符号，
     // 同一二进制只能展开一次 → 此处用多轴用法（abi/init/轴符号一次全覆盖）；
     // 零轴用法由 tests/entry_good.rs（独立测试二进制）覆盖。
-    // 假轴名 fakea/fakeb 避免撞真轴/宿主符号。
+    // 假轴名 fakea/fakeb 避免撞真轴/宿主符号；auth 臂走 axis::helper ——
+    // 文档推荐的裸传形态经宏展开编译钉死（宏改动时此形态静默失效即测试红）。
     mod macro_smoke {
         use super::{FAKE_A, FAKE_B, FakeVt};
+        use crate::{AuthGuardVtable, RResult, RString};
+
+        extern "C" fn stub_verify(_: RString, _: RString) -> RResult<RString, RString> {
+            unreachable!()
+        }
+        static AUTH_VT: AuthGuardVtable = AuthGuardVtable {
+            verify: stub_verify,
+        };
 
         oj_plugin_entry!(
             test_axes_init,
             fakea => &FAKE_A,
-            fakeb => &FAKE_B
+            fakeb => &FAKE_B,
+            auth => crate::axis::auth(&AUTH_VT)
         );
 
         fn test_axes_init(
@@ -163,9 +173,13 @@ mod tests {
             type Sym = unsafe extern "C" fn() -> *const std::ffi::c_void;
             let a: Sym = oj_plugin_axis_fakea;
             let b: Sym = oj_plugin_axis_fakeb;
+            let c: Sym = oj_plugin_axis_auth;
             unsafe {
                 assert_eq!(a(), &FAKE_A as *const FakeVt as *const std::ffi::c_void);
                 assert_eq!(b(), &FAKE_B as *const FakeVt as *const std::ffi::c_void);
+                // helper 形态：符号返回值 == helper 擦除结果（同址非空）
+                assert_eq!(c(), crate::axis::auth(&AUTH_VT));
+                assert!(!c().is_null());
             }
         }
     }
