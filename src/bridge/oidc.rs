@@ -147,6 +147,120 @@ impl OidcState {
     }
 }
 
+// ----- ops：oidc 全局原语（密钥不出 Rust：JS 只见 sign/verify/jwks/issuer/rp/clients） -----
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use deno_core::OpState;
+use deno_error::JsErrorBox;
+
+/// 取 OIDC 态（未配置 → 报错，同 jwt/es 的 not configured 语义）。
+fn oidc_of(state: &OpState) -> Result<std::sync::Arc<OidcState>, JsErrorBox> {
+    state
+        .borrow::<std::sync::Arc<crate::bridge::StableState>>()
+        .oidc
+        .clone()
+        .ok_or_else(|| JsErrorBox::generic("oidc not configured (config oidc: section missing)"))
+}
+
+fn verify_with(token: &str, key: &jsonwebtoken::DecodingKey) -> Result<serde_json::Value, String> {
+    let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    v.leeway = 0;
+    v.validate_exp = true;
+    v.validate_aud = false; // aud 由调用方（RP handler）按 client_id 自查
+    jsonwebtoken::decode::<serde_json::Value>(token, key, &v)
+        .map(|d| d.claims)
+        .map_err(|err| format!("oidc.verify: {err}"))
+}
+
+/// oidc.sign(claims)：RS256 紧凑 JWS，claims 原样签（OP 自控 iss/aud/exp/nonce）。
+#[deno_core::op2]
+#[string]
+pub fn op_oidc_sign(
+    state: Rc<RefCell<OpState>>,
+    #[serde] claims: serde_json::Value,
+) -> Result<String, JsErrorBox> {
+    let st = oidc_of(&state.borrow())?;
+    if !claims.is_object() {
+        return Err(JsErrorBox::generic("oidc.sign: claims must be an object"));
+    }
+    jsonwebtoken::encode(
+        // header 带 kid：RP 侧凭 jwks 按 kid 选钥（OIDC 惯例）。
+        &jsonwebtoken::Header {
+            kid: Some(st.kid().to_string()),
+            ..jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256)
+        },
+        &claims,
+        &jsonwebtoken::EncodingKey::from_rsa_pem(st.signing_pem().as_bytes())
+            .map_err(|e| JsErrorBox::generic(format!("oidc.sign: {e}")))?,
+    )
+    .map_err(|e| JsErrorBox::generic(format!("oidc.sign: {e}")))
+}
+
+/// oidc.verify(token, jwks?)：无 jwks 用本机公钥；有 jwks 按 kid 匹配（from_jwk）。
+/// 算法锁定 RS256（Validation::new 即白名单），leeway 0，验 exp。
+#[deno_core::op2]
+#[serde]
+pub fn op_oidc_verify(
+    state: Rc<RefCell<OpState>>,
+    #[string] token: String,
+    #[serde] jwks: Option<serde_json::Value>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let st = oidc_of(&state.borrow())?;
+    match jwks {
+        None => {
+            let (n, e) = st.n_e();
+            // jsonwebtoken 9：components 为 base64url 无填充串（与 jwks 暴露形态一致）。
+            let key = jsonwebtoken::DecodingKey::from_rsa_components(&b64u(&n), &b64u(&e))
+                .map_err(|e| JsErrorBox::generic(format!("oidc.verify: {e}")))?;
+            verify_with(&token, &key).map_err(JsErrorBox::generic)
+        }
+        Some(doc) => {
+            let header = jsonwebtoken::decode_header(&token)
+                .map_err(|e| JsErrorBox::generic(format!("oidc.verify: {e}")))?;
+            let kid = header
+                .kid
+                .ok_or_else(|| JsErrorBox::generic("oidc.verify: token header has no kid"))?;
+            let entry = doc["keys"]
+                .as_array()
+                .and_then(|keys| {
+                    keys.iter().find(|k| {
+                        k["kid"] == kid.as_str()
+                            && k["kty"] == "RSA"
+                            && (k["alg"] == "RS256" || k["alg"].is_null())
+                    })
+                })
+                .ok_or_else(|| {
+                    JsErrorBox::generic(format!("oidc.verify: no RS256 key for kid {kid}"))
+                })?;
+            let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(entry.clone())
+                .map_err(|e| JsErrorBox::generic(format!("oidc.verify: jwk parse: {e}")))?;
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|e| JsErrorBox::generic(format!("oidc.verify: {e}")))?;
+            verify_with(&token, &key).map_err(JsErrorBox::generic)
+        }
+    }
+}
+
+/// oidc 信息（issuer/jwks/rp/clients 一次取齐；bootstrap 侧拆成 getter）。
+#[deno_core::op2]
+#[serde]
+pub fn op_oidc_info(state: Rc<RefCell<OpState>>) -> Result<serde_json::Value, JsErrorBox> {
+    let st = oidc_of(&state.borrow())?;
+    Ok(serde_json::json!({
+        "issuer": st.issuer,
+        "jwks": st.jwks(),
+        "rp": st.rp.iter().map(|(k, v)| (k.clone(), serde_json::json!({
+            "issuer": v.issuer, "client_id": v.client_id,
+            "client_secret": v.client_secret, "scope": v.scope,
+        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+        "clients": st.clients.iter().map(|(k, v)| (k.clone(), serde_json::json!({
+            "secret": v.secret, "redirect_uris": v.redirect_uris, "tenant": v.tenant,
+        }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +321,107 @@ mod tests {
         let (n, e) = st.n_e();
         assert!(!n.is_empty() && !e.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 独立实例夹具：OidcState 不 Clone（含私钥）；每用例重读同一形态的 key 文件
+    /// 构造独立实例。原子计数防并行测试互踩同名临时目录。
+    fn make_state(dir_tag: &str) -> OidcState {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "oj-oidc-{dir_tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = write_key(&dir);
+        OidcState::from_section(&section(&dir, &key_path, "http://h/v1/api/idp"), &dir).unwrap()
+    }
+
+    /// 经完整 Bridge 跑一段 JS（Extras.oidc 注入），回传 json.ok 信封的 data。
+    async fn run_with_oidc(js: &str) -> serde_json::Value {
+        let b = crate::bridge::Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
+            crate::bridge::SchemaRegistry::new(),
+            false,
+            None,
+            crate::bridge::Extras {
+                oidc: Some(std::sync::Arc::new(make_state("op"))),
+                ..Default::default()
+            },
+        );
+        let cap = b
+            .run_with(js, crate::bridge::RequestInfo::default())
+            .await
+            .unwrap();
+        serde_json::from_slice(&cap.body).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sign_then_verify_roundtrip_local_and_jwks() {
+        let v = run_with_oidc(
+            r#"(async () => {
+              const now = Math.floor(Date.now() / 1000);
+              const claims = { iss: oidc.issuer, sub: "u1", aud: "sample-rp", iat: now, exp: now + 3600, nonce: "n1", tenant: "default" };
+              const tok = oidc.sign(claims);
+              const local = oidc.verify(tok);
+              const remote = oidc.verify(tok, oidc.jwks());
+              json.ok({ local, remote, kid: oidc.jwks().keys[0].kid });
+            })().catch((e) => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["local"]["sub"], "u1");
+        assert_eq!(v["data"]["remote"]["tenant"], "default");
+        assert_eq!(v["data"]["kid"].as_str().unwrap().len(), 16);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_rejects_tampered_expired_and_wrong_alg() {
+        let v = run_with_oidc(
+            r#"(async () => {
+              const now = Math.floor(Date.now() / 1000);
+              const good = oidc.sign({ iss: oidc.issuer, sub: "u1", aud: "a", iat: now, exp: now + 3600 });
+              // tamper the payload (re-encode the middle segment)
+              const parts = good.split(".");
+              const payload = JSON.parse(atobUrl(parts[1]));
+              payload.sub = "evil";
+              const b64u = (s) => { const B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"; let bin = ""; for (const c of s) bin += String.fromCharCode(c.charCodeAt(0)); const bytes = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i); let out = ""; for (let i = 0; i < bytes.length; i += 3) { const n = (bytes[i] << 16) | ((bytes[i+1] ?? 0) << 8) | (bytes[i+2] ?? 0); out += B[(n >> 18) & 63] + B[(n >> 12) & 63] + ((bytes[i+1] !== undefined) ? B[(n >> 6) & 63] : "") + ((bytes[i+2] !== undefined) ? B[n & 63] : ""); } return out; };
+              function atobUrl(s) { const B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"; let out = ""; let bits = 0, acc = 0; for (const c of s) { const v = B.indexOf(c); if (v < 0) continue; acc = (acc << 6) | v; bits += 6; if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xff); } } return out; }
+              const tampered = parts[0] + "." + b64u(JSON.stringify(payload)) + "." + parts[2];
+              const expired = oidc.sign({ iss: oidc.issuer, sub: "u1", aud: "a", iat: now - 7200, exp: now - 3600 });
+              const results = {};
+              try { oidc.verify(tampered); results.tampered = "ok"; } catch (e) { results.tampered = "err"; }
+              try { oidc.verify(expired); results.expired = "ok"; } catch (e) { results.expired = "err"; }
+              try { oidc.verify("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.aaaa"); results.wrong_alg = "ok"; } catch (e) { results.wrong_alg = "err"; }
+              json.ok(results);
+            })().catch((e) => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["tampered"], "err", "{v}");
+        assert_eq!(v["data"]["expired"], "err", "{v}");
+        assert_eq!(v["data"]["wrong_alg"], "err", "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_without_config_errors() {
+        let b = crate::bridge::Bridge::new(
+            std::sync::Arc::new(crate::bridge::InMemoryAccessor::new()),
+            std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => { try { oidc.sign({}); json.ok("no"); } catch (e) { json.ok(String(e)); } })()"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["data"].as_str().unwrap().contains("oidc not configured"),
+            "{v}"
+        );
     }
 
     #[test]

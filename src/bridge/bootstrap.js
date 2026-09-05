@@ -34,12 +34,16 @@ import {
   op_json_fail,
   op_json_header,
   op_json_ok,
+  op_json_raw,
   op_kv_get,
   op_kv_set,
   op_kv_del,
   op_kv_expire,
   op_kv_incr,
   op_log,
+  op_oidc_info,
+  op_oidc_sign,
+  op_oidc_verify,
   op_plugins,
   op_resolve_cjs as __oj_resolve_cjs,
   op_bcrypt_hash,
@@ -61,6 +65,9 @@ globalThis.json = {
   fail: (code, msg, data) =>
     op_json_fail(code | 0, String(msg), data === undefined ? null : data),
   header: (name, value) => op_json_header(String(name), String(value)),
+  // bare JSON 200 (no envelope); OP external endpoints speak standard OIDC JSON.
+  // Errors still go through fail() so callers can just test !res.ok on the envelope.
+  raw: (data) => op_json_raw(data === undefined ? "null" : JSON.stringify(data)),
 };
 
 // ----- http helpers: current request context (lazy proxy; fresh per request) -----
@@ -276,6 +283,19 @@ globalThis.bcrypt = {
   hash: (password, cost) => op_bcrypt_hash(String(password), cost === undefined ? null : cost | 0),
   verify: (password, hash) => op_bcrypt_verify(String(password), String(hash)),
 };
+
+// ----- oidc: RS256 sign/verify primitives + assembly-time config (keys stay in Rust) -----
+globalThis.oidc = (() => {
+  const info = () => op_oidc_info();
+  return {
+    sign: (claims) => op_oidc_sign(claims === undefined ? null : claims),
+    verify: (token, jwks) => op_oidc_verify(String(token), jwks === undefined ? null : jwks),
+    jwks: () => info().jwks,
+    get issuer() { return info().issuer; },
+    get rp() { return info().rp; },
+    get clients() { return info().clients; },
+  };
+})();
 
 // ----- crypto: sha256/random helpers (merge, keep native getRandomValues if present) -----
 globalThis.crypto = Object.assign(globalThis.crypto || {}, {

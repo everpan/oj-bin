@@ -51,3 +51,38 @@ pub fn op_json_header(state: &mut OpState, #[string] name: String, #[string] val
     }
     state.borrow_mut::<ReqState>().headers.insert(name, value);
 }
+
+/// json.raw(data)：裸 JSON 200（无信封）。OP 对外端点说标准 OIDC JSON 用。
+#[op2(fast)]
+pub fn op_json_raw(state: &mut OpState, #[string] data_json: String) {
+    let s = state.borrow_mut::<ReqState>();
+    s.response = Some(data_json.into_bytes());
+    s.status = 200;
+    s.done = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV};
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_raw_writes_bare_body_with_200() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let cap = b
+            .run_with(
+                r#"json.raw({ issuer: "x", bare: true });"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200);
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["bare"], true);
+        assert!(v.get("code").is_none());
+    }
+}
