@@ -13,9 +13,13 @@ auth 鉴权全链路。代码依据：`server/src/lib.rs` 的 `handle()`、`src/
 |---|---|---|---|---|
 | `{base}/health` | GET | 无 | 健康检查 + 证书状态（证书过期/宽限期仍可访问，供监控） | `lib.rs` `health_handler` |
 | `{base}/blob/{key}` | GET | 无（公开） | blob 下载：local 直出字节 / s3 302 presign | `lib.rs` blob 分支 |
+| `{base}/plugins` | GET | 无（公共） | 插件自描述清单：装配插件的 `{name, semver, abi_version, fingerprint, description, host_abi_version}`（ok 信封），供运维/监控辨识 | `lib.rs` `plugins_handler` |
 | 静态站点 | GET/HEAD | 无 | `server.app_path` 配的目录，优先级最低 | `resolve_static` |
 
 其余所有请求进入**业务路由**：路由表命中 → 前置管线（鉴权/租户/上传）→ JS handler。
+
+> `{base}/plugins` 是**保留路径**：内置路由先于路由表匹配，会遮蔽同名业务路由
+> （业务模块不要占用 `plugins` 目录名）。
 
 `{base}/auth/login|refresh|logout` **不再是内置路由**：它们是普通业务路由，由 JS 模块
 `sample/src/auth/` 实现（`db` 查用户表、`bcrypt.verify` 校验、`jwt` 原语签发双 token），

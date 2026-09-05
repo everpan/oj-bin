@@ -32,7 +32,7 @@ src/                  # crate: only-js（lib + bench）——核心执行层
     ├── es.rs         # EsBackend trait + 内置 reqwest 实现（oj-es 插件经 FfiEsBackend 适配）
     ├── blob.rs       # BlobBackend trait + LocalBlob 内置（s3 迁插件）
     ├── ffi.rs        # 全部 unsafe 收敛（load_forget dlopen）+ FfiXxxBackend 适配器层
-    ├── plugin_loader.rs # PluginLoader：四级路径解析 + 清单/扫描双模式 + ABI 门禁
+    ├── plugin_loader.rs # PluginLoader：四级路径解析 + 清单/扫描双模式 + ABI 门禁 + AXES 逐轴 dlsym
     ├── fetch.rs      # fetch op（reqwest 封装的 HTTP 客户端）
     ├── log.rs        # log op（结构化）
     ├── ws.rs         # ws.send/close ops
@@ -369,10 +369,16 @@ panic=unwind profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装�
 - 路径四级解析：`OJ_PLUGINS_DIR` > `config plugins_dir` > `<exe>/plugins`（bin/oj 旁即 `bin/plugins`）
   > `<workspace_root>/bin/plugins`（与 xtask 产物归置同形），相对路径相对 config 目录，
   最终目录 = `<plugins_dir>/<host-triple>/`。
-- 双模式：`plugins:` 清单显式给出 → 严格按名装配（缺文件/身份不符/`@semver` pin 不符 fail
-  fast）；缺省 → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。
-- 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` 输出
-  插件名/semver/ABI/指纹 + 宿主 ABI_VERSION（升级核对窗口）。
+- 双模式（`plugins:` 一段三用）：非空 map = 严格清单，只装配键列出的插件（缺文件/身份不符/
+  `@semver` pin 不符 fail fast），值为插件 cfg（非空对象原样透传，空对象 = 回落轴适配器）；
+  缺省/空 map → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。旧 list 写法
+  `plugins: [a, b]` 废弃（解析报错）。
+- 注册：abi 门禁（严格相等）→ `init` → 对 `AXES = [es, db, blob, bus, kv, auth]` 逐轴
+  `dlsym("oj_plugin_axis_<axis>")`，缺符号 = 不提供该轴；加轴零破坏（既有轴 vtable 形状
+  变更才 bump ABI）。
+- 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` / JS `plugins()` /
+  公共端点 `GET {base}/plugins` 输出插件名/semver/ABI/指纹/**自描述 desc** + 宿主
+  ABI_VERSION（升级核对窗口）。
 
 **五轴接线**（server_cmd `build_registries`）：
 - es 键选单后端；「cfg es 声明但无 es 插件」→ fail fast。

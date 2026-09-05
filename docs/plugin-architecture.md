@@ -1,8 +1,33 @@
 # 插件化架构方案（blob / s3 / redis / ES / db 按方言）
 
-> 状态：方案（未执行）。目标：把后端能力（blob、minio/s3、redis、ES、SQL 方言）以插件方式加载，
-> 实现编译期/启动期可选、可装卸、可扩展，且不与现有 200+ 测试冲突。
-> 本方案是对既有代码现状的改造计划，所有文件行号基于当前 `only-js` 工作区。
+> 状态：历史方案（进程内 `Plugin` trait 路线**未执行**，已被 cdylib + C-ABI FFI 方案取代）。
+> 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-manual.md` §9 与
+> `docs/plugin-development.md`，注册机制见下方 §0。
+
+## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 7）
+
+- **加载**：宿主启动期 `dlopen` 插件 cdylib（`src/bridge/plugin_loader.rs`，句柄进程期存活，
+  不 dlclose）。
+- **探测流程**：
+  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **7**）
+     **严格相等**才继续；不等 → fail fast（指纹不符仅告警）。
+  2. **init**——调 `oj_plugin_init(host, cfg)`（宏内 `catch_unwind` 收敛 panic 为
+     `RResult::Err`），插件建立 runtime/单例状态并返回 `PluginDescriptor`
+     `{ name, semver, abi_version, fingerprint, desc }`。
+  3. **AXES 逐轴 dlsym**——对探测表 `AXES = [es, db, blob, bus, kv, auth]` 逐轴
+     `dlsym("oj_plugin_axis_<axis>")`：查到符号 → 取静态 vtable 指针填入
+     `Registrations` 对应槽位；**缺符号 = 不提供该轴**（`None`）。因此**加轴零破坏**：
+     既有轴 vtable 形状不变就不需要 bump ABI。
+- **自描述收集与查询端点**：装配层把每个插件的 descriptor 转成
+  `PluginInfo { name, semver, abi_version, fingerprint, description, host_abi_version }`
+  存入 `AppState.plugins`，经公共端点 **`GET {base}/plugins`** 返回清单（ok 信封），
+  供运维/监控辨识当前进程装配了什么；JS 侧 `plugins()` 同源自省。
+- **插件配置**：`plugins:` 段一段三用（键 = 严格清单 / 值 = 透传 cfg（空对象回落轴适配器）/
+  缺省 = 扫描模式；旧 list 写法废弃），详见 `docs/plugin-development.md` §7.1。
+
+---
+
+> 以下为原方案文档（未执行的进程内路线，行号基于撰写时的工作区）。
 
 ---
 

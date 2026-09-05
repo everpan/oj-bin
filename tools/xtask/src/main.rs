@@ -2,7 +2,8 @@
 //!
 //!   cargo xtask bin                 编译 oj（release）+ 拷入 <repo>/bin/
 //!   cargo xtask plugin <name>      编译 oj-<name>（release）+ 拷入 <repo>/bin/plugins/<triple>/
-//!   cargo xtask plugin <name> --check   复用 PluginLoader 预检（ABI/身份/semver/符号）
+//!   cargo xtask plugin <name> --check   复用 PluginLoader 预检（ABI/身份/semver/按轴符号探测，
+//!                                       输出 desc 与 provided axes）
 //!   cargo xtask build              编译 oj + 全部第一方插件（release）并归置到 bin/
 //!
 //! 所有产物统一归置到 <repo>/bin/：
@@ -15,7 +16,7 @@
 //! --check 在本子进程跑，PluginLoader 的 forget 语义无碍（进程退出即回收）；
 //! 复用 Task 3.2 同一加载入口保证预检与真实装配一致。
 
-use only_js::bridge::plugin_loader::{PluginManifestEntry, host_context, load_manifest};
+use only_js::bridge::plugin_loader::{AXES, PluginManifestEntry, host_context, load_manifest};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -193,8 +194,8 @@ fn check(name: &str) -> Result<(), String> {
         semver_pin: None,
     }];
     let host = host_context();
-    // 预检只验证可加载性（ABI/身份/semver/符号）：需要装配期 cfg 的插件给占位值，
-    // 真实 cfg 由服务器装配层注入（server_cmd::plugin_cfg_json）。
+    // 预检只验证可加载性（ABI/身份/semver/按轴符号探测）：需要装配期 cfg 的插件给占位值，
+    // 真实 cfg 由服务器装配层注入（server_cmd::plugin_cfg）。
     let cfg_for = |name: &str| -> String {
         match name {
             "auth" => r#"{"jwt_secret":"precheck"}"#.to_string(),
@@ -203,13 +204,32 @@ fn check(name: &str) -> Result<(), String> {
     };
     let loaded = load_manifest(&dir, &manifest, host, &cfg_for)
         .map_err(|e| format!("precheck failed: {e}"))?;
-    let d = &loaded[0].descriptor;
+    let p = &loaded[0];
+    let d = &p.descriptor;
+    // registrations 由加载期 AXES 逐轴 dlsym 探测填充（plugin_loader::probe_axes），
+    // 此处只按 AXES 顺序汇总为可读清单。
+    let provided: Vec<&str> = AXES
+        .iter()
+        .copied()
+        .filter(|a| match *a {
+            "es" => p.registrations.es.is_some(),
+            "db" => p.registrations.db.is_some(),
+            "blob" => p.registrations.blob.is_some(),
+            "bus" => p.registrations.bus.is_some(),
+            "kv" => p.registrations.kv.is_some(),
+            "auth" => p.registrations.auth.is_some(),
+            _ => unreachable!("AXES 与 check 汇总分支不同步"),
+        })
+        .map(|a| &a[..])
+        .collect();
     println!(
-        "ok: {} {} (abi {})",
+        "ok: {} {} (abi {}) — {}",
         &d.name[..],
         &d.semver[..],
-        d.abi_version
+        d.abi_version,
+        &d.desc[..]
     );
+    println!("provided axes: [{}]", provided.join(", "));
     Ok(())
 }
 

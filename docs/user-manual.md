@@ -110,9 +110,10 @@ redis:
 es:
   # endpoint: "http://127.0.0.1:9200"     # 存在即启用 es.search/index/del，需 oj-es 插件
 plugins:
-  # - es                       # 显式清单（严格装配：缺文件/版本不符 fail fast）
-  # - db-mysql
-  # - kv-redis
+  # kv-redis: {}                    # 键 = 插件名；空对象 = 透传回落轴适配器
+  # auth: { jwt_secret: "..." }     # 非空对象 = 原样透传为该插件 cfg（跳过回落）
+  # 非空 map = 严格清单（只装配列出的插件，缺文件/版本不符 fail fast）
+  # 缺省/空 map = 扫描模式（加载 plugins_dir 全部）；旧 list 写法 [a, b] 已废弃
 plugins_dir: "plugins"        # 可选：插件目录（相对 config 目录；省略 = 扫描默认位置）
 broker:
   # kind: kafka               # 可选：分布式事件总线（local/kafka/rabbitmq；kafka/rabbitmq 需插件）
@@ -132,9 +133,11 @@ blob:
   "no kv plugin loaded"。`redis` 段缺失/全注释 → 进程内存 KV（`redis.*` 与 `kv.*` 同源）。
 - `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`，需 **oj-es** 插件；缺失时调用
   报 `es not configured`。endpoint 尾斜杠自动剪除。
-- `plugins` / `plugins_dir`：插件装配。`plugins` 显式给出 → 严格按清单装配（缺失 fail fast）；
-  省略 → 扫描 `<plugins_dir>/<平台目录>/`（缺省平台目录 = 当前编译目标 triple）。目录布局与
-  升级回滚见 `dev-manual.md` §9、`plugin-development.md`。
+- `plugins` / `plugins_dir`：插件装配。`plugins` 为 **map**，一段三用：键 = 要加载的插件名
+  （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，非空对象原样透传、空对象 = 回落
+  轴适配器；**缺省/空 map = 扫描模式**，加载 `<plugins_dir>/<平台目录>/` 全部（缺省平台
+  目录 = 当前编译目标 triple）。旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。目录
+  布局与升级回滚见 `dev-manual.md` §9、`plugin-development.md`。
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
   （未装 → "unknown broker kind"）。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。

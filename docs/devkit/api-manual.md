@@ -828,7 +828,7 @@ cargo run -p oj -- test -c config.yaml -d src --format junit --output l1.xml # C
 ```ts
 describe("user account", () => {
   it("lists accounts (auth + tenant)", async () => {
-    const token = await client.login("demo", "demo1234");
+    const token = await client.login("demo", "demo1234", { "X-TENANT-ID": "default" });
     const r = await client.get("/user/account", {
       headers: { Authorization: "Bearer " + token, "X-TENANT-ID": "default" },
     });

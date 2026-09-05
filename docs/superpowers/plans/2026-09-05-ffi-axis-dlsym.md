@@ -633,6 +633,7 @@ unix@vip.qq.com ai"
 - `docs/plugin-architecture.md`：注册机制章节同口径改写（探测流程：abi 门禁 → init → AXES 逐轴 dlsym；自描述收集与查询端点）。
 - `docs/builtin-api-auth.md`：内置接口总览表加一行 `GET {base}/plugins`（公共，插件自描述清单）。
 - `docs/devkit/api-manual.md`：831 行附近存量示例 `client.login("demo","demo1234")` 补第三参租户头（auth+tenant 用例与同节约束对齐；auth 计划复审遗留，随本任务 docs 重写一并修 + `cargo xtask build` 刷新 bin/devkit）。
+- `docs/user-manual.md`、`docs/dev-manual.md`：凡把 `plugins:` 记为 list 的表述（config 字段说明等）改为统一语义（一段三用；旧 list 写法废弃）——Task 4 已核实这两处欠账。
 - `CLAUDE.md`（本地文件，不入库）：插件系统段落同步（ABI 7、按轴符号、plugins 一段三用、自描述端点；config 注释里「plugins 清单（显式给出…）」旧表述同步为统一语义）。
 
 - [ ] **Step 3: 全量门禁**

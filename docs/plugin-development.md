@@ -7,14 +7,16 @@ FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装�
 
 ## 1. 一句话模型
 
-- 插件 = 一个 **cdylib**，导出两个符号（由入口宏生成，禁止手写 `#[no_mangle]` 绕过）。
+- 插件 = 一个 **cdylib**，导出 `oj_plugin_abi_version` + `oj_plugin_init`，以及**每提供一轴**
+  一个 `oj_plugin_axis_<name>` 符号（全部由入口宏生成，禁止手写 `#[no_mangle]` 绕过）。
 - 宿主与插件只通过 `oj-plugin-ffi` crate 的类型跨边界（**唯一允许**）；tokio/tracing 等
   运行时类型绝不过线。
 - `ABI_VERSION`（u32，**严格相等**）是唯一硬门禁；构建指纹（rustc/契约 crate 版本/triple）
   仅诊断，不匹配告警不拒绝。
-- 每个插件通过 `register()` 返回各轴 **vtable**（函数指针表）。宿主在 `init` 返回后立即
-  调用 `register` 取槽位——**所有工厂注册必须在 init 调用窗口内完成**（槽位指向的静态表
-  在 init 时就绪）。
+- 注册是**按轴 dlsym 探测**：宿主 `init` 返回后（abi 门禁通过）对探测表 `AXES`（es/db/
+  blob/bus/kv/auth）逐轴 `dlsym("oj_plugin_axis_<axis>")`——查到符号即该插件提供该轴
+  （符号返回静态 vtable 指针），**缺符号 = 不提供该轴**。vtable 指向的静态表在 init 时
+  就绪即可；加新轴/加插件不再改动共享槽位结构。
 
 ## 2. 契约 crate 类型面
 
@@ -28,8 +30,10 @@ FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装�
 | `RArc<T>` | stabby `Arc`（`HostContext` 的载体） |
 | `FfiFuture` | `{ state, poll, take, free }` 异步句柄（见 §4） |
 | `HostContext` | 宿主回调集：`log(level, msg)`、`deliver(topic, payload)` |
-| `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, register }` |
-| `PluginRegistrations` | 各轴 vtable 槽位：`es / db / blob / bus / kv / auth`（未提供 = null） |
+| `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, desc }`（见 §7 自描述） |
+
+各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
+同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
 
 各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
 同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
@@ -41,12 +45,19 @@ authorization) -> RResult<RString, RString>`，ok 值 JSON `null` = 匿名路径
 
 ## 3. ABI_VERSION 纪律
 
-- `ABI_VERSION` 当前 **6**。任何 `repr(C)` 类型字段变更（加槽位、改签名、增 HostContext
-  回调）= **必须 bump**。向后兼容配置演进走 **cfg JSON 字段**（新增可选键不 bump）。
+- `ABI_VERSION` 当前 **7**（按轴 dlsym 契约）。**加轴零破坏**——ABI 规则表：
+
+| 变更 | 是否 bump ABI |
+|------|--------------|
+| 新增一条轴（新 `oj_plugin_axis_<name>` 符号 + 新 vtable 类型） | **否**（探测式，缺符号 = 不提供） |
+| 既有轴 vtable 的 `repr(C)` 形状变更（加方法、改签名） | **是** |
+| `PluginDescriptor` / `HostContext` 字段变更 | **是** |
+| cfg JSON 新增可选键（schema 归插件所有） | **否**（向后兼容演进走 cfg 字段） |
+
 - 宿主严格 `plugin_abi == ABI_VERSION` 才加载；不相等 → `plugin ABI mismatch: plugin=N host=M`。
 - 插件构建须对当前 `oj-plugin-ffi` 版本；升级宿主与插件顺序：**先升插件到新 ABI 并验证，
   再升宿主**（或同版本原子升级）。`cargo xtask plugin <name> --check` 复用宿主 `PluginLoader`
-  做 ABI/身份/semver 预检。
+  做 ABI/身份/semver/按轴符号预检（输出 desc 与 provided axes）。
 
 ## 4. FfiFuture 异步桥（唯一异步路径）
 
@@ -92,14 +103,14 @@ struct CallState {
 - 宿主的 panic hook（装配首个插件前安装）：输出 `[oj-plugin] panic while loading plugin
   '<name>' (host fingerprint: …)` 后透传原始 panic。
 
-## 7. 入口宏用法
+## 7. 入口宏用法（按轴声明）
 
 ```rust
-use oj_plugin_ffi::{ABI_VERSION, HostContext, PluginDescriptor, PluginRegistrations,
-    RArc, RResult, RString, oj_plugin_entry};
+use oj_plugin_ffi::{ABI_VERSION, HostContext, PluginDescriptor, RArc, RResult, RString,
+    oj_plugin_entry};
 
 fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
-    // 幂等：重复 init 返回已有 descriptor（OnceLock 兜底）
+    // 幂等：重复 init 返回已有 descriptor（OnceLock/get_or_init 兜底）
     if PLUGIN.get().is_some() { return RResult::Ok(descriptor()); }
     // init 建立插件 runtime + 单例状态；cfg 为装配期配置（无则忽略）
     let _ = PLUGIN.set(state);
@@ -112,25 +123,46 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from("0.1.0"),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
-        register,
+        // 必填自描述：宿主收集后在 GET {base}/plugins 公开（运维/监控辨识用）。
+        desc: RString::from("db 轴 mysql 插件：sqlx 单方言连接工厂"),
     }
 }
 
-// register() 返回各轴 vtable 槽位（无 = null）
-extern "C" fn register() -> PluginRegistrations {
-    PluginRegistrations { es: std::ptr::null(), db: &VTABLE, blob: std::ptr::null(),
-                          bus: std::ptr::null(), kv: std::ptr::null(),
-                          auth: std::ptr::null() }
-}
-
-oj_plugin_ffi::oj_plugin_entry!(init);
+// init 后宿主对 AXES 逐轴 dlsym：提供哪个轴就在宏尾声明哪个轴（轴标识强制小写）。
+// 缺轴声明 = 不导出该符号 = 不提供该轴；多轴用逗号并列。
+oj_plugin_ffi::oj_plugin_entry!(init, db => &VTABLE);
+// oj_plugin_ffi::oj_plugin_entry!(init, kv => &KV_VTABLE, auth => &AUTH_VTABLE);  // 多轴
+// oj_plugin_ffi::oj_plugin_entry!(init);                                          // 零轴（纯自描述）
 ```
 
 - 命名：插件 `descriptor.name` 决定存放文件名（`lib<name>.dylib` / `<name>.dll`）；crate 名
-  `oj-<name>` → 构建产物 `liboj_<name>.<ext>`。扫描模式按文件名加载、清单模式按 `plugins`
-  列表核对名字与 `@semver` pin。
+  `oj-<name>` → 构建产物 `liboj_<name>.<ext>`。扫描模式按文件名加载、严格清单模式按
+  `plugins:` 键核对名字与 `@semver` pin。
 - 插件不得手写 `#[no_mangle] pub extern "C" fn oj_plugin_*` 绕过宏（descriptor 内 abi_version
   二次校验兜底）。
+- **自描述**：`descriptor.desc` 必填（一句人话，写清轴 + 驱动）。宿主在装配后收集全部插件
+  的 `{name, semver, abi_version, fingerprint, description}`，经公共端点
+  `GET {base}/plugins`（ok 信封）公开，供运维/监控辨识当前进程装配了什么。
+
+### 7.1 插件配置：`plugins:` 一段三用
+
+`config.yaml` 的 `plugins:` 段统一为 **map**（旧 list 写法 `plugins: [a, b]` 已废弃，
+解析报错 fail-fast）：
+
+```yaml
+plugins:
+  kv-redis: {}                        # 键 = 要加载的插件名；空对象 = 透传回落轴适配器
+  auth:
+    jwt_secret: "change-me"           # 非空对象 = 原样透传为该插件 init cfg（跳过回落）
+  my-plugin:
+    endpoint: "http://127.0.0.1:9200" # schema 归插件所有（init 校验，非法 Err fail-fast）
+```
+
+- **键 = 严格清单**：非空 map 只装配列出的插件（沿用清单门禁：缺文件/身份/`@semver`
+  pin 不符 fail fast）；**缺省/空 map = 扫描模式**（加载 `plugins_dir` 全部）。
+- **值 = cfg 透传**：非空对象原样透传给插件 `init(cfg)`；**空对象 `{}` = 跳过透传，回落
+  轴适配器**（第一方插件由宿主把对应 config 段映射成 cfg，如 es→`cfg.es`、auth→
+  `cfg.auth`；无适配器的轴回落 `"{}"`）。
 
 ## 8. 构建与调试
 
@@ -138,7 +170,7 @@ oj_plugin_ffi::oj_plugin_entry!(init);
 # 本地构建 + 拷入 bin/plugins/<host-triple>/（xtask 用 release）
 cargo xtask bin                                # 主程序 → bin/oj
 cargo xtask plugin <name>
-cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/符号）
+cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/按轴符号，打印 desc + provided axes）
 
 # 运行宿主（dev），加载扫描
 cargo run -p oj -- serve ...
