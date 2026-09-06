@@ -37,12 +37,20 @@ jobs:
           - name: linux-gnu (x86_64-unknown-linux-gnu)
             os: ubuntu-latest
             triple: x86_64-unknown-linux-gnu
+            # V8 `terminate_execution` 之后的 isolate 析构在「部分平台」曾 SIGSEGV
+            # （见 docs/plugin-system-handover.md §6、docs/review-2026-09-06.md P0-3）。
+            # 此前一律 `-- --skip infinite_loop` 全局跳过，等于长期掩盖这类真实缺陷。
+            # 现改为按平台开关：确证会崩的平台把 skip_infinite_loop 置 true 并注明复现方式；
+            # 未置的平台跑全量。当前三平台均为 false（macOS + release 本地实测通过）。
+            skip_infinite_loop: false
           - name: macos (aarch64-apple-darwin)
             os: macos-latest
             triple: aarch64-apple-darwin
+            skip_infinite_loop: false
           - name: windows (x86_64-pc-windows-msvc)
             os: windows-latest
             triple: x86_64-pc-windows-msvc
+            skip_infinite_loop: false
           # 按需：部署含 Alpine 时启用 musl 行
           # - name: linux-musl (x86_64-unknown-linux-musl)
           #   os: ubuntu-latest
@@ -80,9 +88,10 @@ jobs:
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
 
-      # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建；infinite_loop 在部分平台会 SIGSEGV，跳过）。
-      - name: cargo test --release (workspace, skip infinite_loop)
-        run: cargo test --workspace --release -- --skip infinite_loop
+      # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建）。
+      # infinite_loop 只在 skip_infinite_loop=true 的平台跳过（见 matrix 注释），不再全局跳过。
+      - name: cargo test --release (workspace)
+        run: cargo test --workspace --release ${{ matrix.skip_infinite_loop && '-- --skip infinite_loop' || '' }}
 
       # 宿主 release 可执行（oj），与插件同 triple 构建，随产物一并上传。
       - name: build host release binary (oj)
@@ -93,13 +102,14 @@ jobs:
           mkdir -p "bin/${{ matrix.triple }}"
           cp "target/release/oj${{ (matrix.os == 'windows-latest' && '.exe') || '' }}" "bin/${{ matrix.triple }}/"
 
-      # 第一方插件逐个 release 构建并拷入 bin/plugins/<triple>/（xtask 即 CI 产物入口）。
+      # 第一方插件：一次性构建全部并拷入 bin/plugins/<triple>/。
+      # 清单的单一真相来源是 `tools/xtask/src/main.rs` 的 PLUGINS —— CI 不硬编码副本。
+      # （此前此处硬编码了 7 个插件名，漏掉 `auth`，与 xtask 的 8 个失步：CI 产物里没有
+      #  oj-auth，而 sample 的鉴权守卫装配会 fail-fast。副本必然再次失步，故改为消费 xtask。）
       - name: build & place plugins
         shell: bash
         run: |
-          for p in es db-mysql db-postgres blob-s3 bus-kafka bus-rabbitmq kv-redis; do
-            cargo run --release -p xtask -- plugin "$p"
-          done
+          cargo run --release -p xtask -- build
           ls -la bin/plugins/${{ matrix.triple }}/
 
       # 产物归置（供发布/下载）：宿主二进制与插件各自按 triple 上传，布局与发行同形。
@@ -113,3 +123,47 @@ jobs:
           name: plugins-${{ matrix.triple }}
           path: bin/plugins/${{ matrix.triple }}/
           if-no-files-found: error
+
+  # sample 的 L1（oj test，进程内真实运行时）与 L2（vitest，纯 mock）此前**完全不在 CI 里**
+  # —— 端到端契约与 mock 单测无人守护，回归只能靠人工。本 job 补上这个缺口。
+  # 只跑单一平台：两层测试都不覆盖平台相关行为（平台相关由上面的 matrix 负责）。
+  sample-tests:
+    needs: [lint]
+    name: sample L1 + L2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 必须经 workspace 构建：`cargo build -p oj` 与 `--workspace` 的 feature 归一化不同，
+      # 会让 rusty_v8 按不同 fingerprint 重编并找不到静态库（见 tools/xtask/src/main.rs:95）。
+      # 用 `cargo xtask build` 同时拿到 oj 与全部第一方插件（sample 鉴权依赖 oj-auth，缺它
+      # 装配会 fail-fast）。插件清单的单一真相来源是 xtask 的 PLUGINS。
+      - name: build oj + plugins
+        run: cargo run --release -p xtask -- build
+
+      # 插件发现：<exe>/plugins/<host-triple>/ —— bin/oj + bin/plugins/ 正好命中，无需
+      # 设 OJ_PLUGINS_DIR。
+      - name: L1 — oj test (junit)
+        run: ./bin/oj test -c sample/config.yaml -d sample/src --format junit --output l1.xml
+
+      - name: L2 — vitest (pure mock unit)
+        working-directory: sample/unit
+        run: npm ci && npx vitest run
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l1-junit
+          path: l1.xml
+          if-no-files-found: warn
+
+# 已知前置条件（到期需处理）：`oj test` 走 `App::from_config`，会过**证书必配门禁**。
+# sample/config/{public.pem,cert.jws} 是随仓库提交的示例自签证书，exp ≈ 2027-08；
+# 过期后本 job 会因证书校验失败而红，届时用 tools/oj-cert 重签并提交新证书
+# （sample/config/private.pem 仅示例用，严禁用于生产）。

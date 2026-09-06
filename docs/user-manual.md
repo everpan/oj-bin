@@ -89,7 +89,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 ```yaml
 server:
   host: "localhost"       # 监听地址（默认 localhost）
-  port: 9778              # 监听端口（代码默认 778，但 macOS 特权端口不可用 → 用 ≥1024）
+  port: 9778              # 监听端口（代码默认即 9778）
   base: "/v1/api"         # API 基础路由前缀（CLI -b 显式给出时覆盖；空前缀拒绝）
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
@@ -621,7 +621,7 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - `build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules` 解析，发布物需自带）。
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
-- 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
+- 代码默认端口即 `9778`。若改用 <1024 的端口（如 `778`），在 macOS/Linux 属特权端口，需 root。
 - `.tsx`/`.mts` 不转译（直通 V8）。
 - `ext_boot.js` 用顶层 `await` 须带 `export {};`（否则被 CJS 启发式包进非 async 函数）；
   且拿不到 `ext:core/ops`，只能在已有全局上做组合（§9「扩展全局对象」）。

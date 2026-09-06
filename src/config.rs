@@ -55,7 +55,9 @@ impl Default for ServerCfg {
     fn default() -> Self {
         Self {
             host: "localhost".into(),
-            port: 778,
+            // 9778：与 README / sample/config.yaml / devkit 手册一致（此前为 778，
+            // 省缺 port 的用户会静默落到与文档不同的端口）。
+            port: 9778,
             base: "/v1/api".into(),
             app_path: None,
             timeout: "30s".into(),
@@ -364,7 +366,7 @@ mod tests {
     #[test]
     fn defaults_when_no_file() {
         let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
-        assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 778));
+        assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 9778));
         assert_eq!(c.server.base, "/v1/api");
         assert!(c.server.app_path.is_none());
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);

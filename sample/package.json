@@ -2,6 +2,12 @@
   "name": "oj-sample",
   "private": true,
   "type": "module",
+  "scripts": {
+    "unit:install": "npm --prefix unit ci",
+    "test:unit": "npm --prefix unit run test",
+    "test:api": "cargo run --release -p xtask -- build && ./bin/oj test -c config.yaml -d src",
+    "test": "npm run test:unit && npm run test:api"
+  },
   "dependencies": {
     "escape-goat": "4.0.0"
   }

@@ -1,5 +1,5 @@
 {
-  "name": "oj-sample-test",
+  "name": "oj-sample-unit",
   "private": true,
   "type": "module",
   "scripts": {

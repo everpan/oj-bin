@@ -60,12 +60,17 @@ jobs:
           - name: linux-gnu (x86_64-unknown-linux-gnu)
             os: ubuntu-latest
             triple: x86_64-unknown-linux-gnu
+            # 同 plugin-matrix.yml：V8 terminate_execution 后的 isolate 析构曾在某些平台
+            # SIGSEGV。按平台开关控制是否跳过 infinite_loop，默认跑全量（不再全局跳过）。
+            skip_infinite_loop: false
           - name: macos (aarch64-apple-darwin)
             os: macos-latest
             triple: aarch64-apple-darwin
+            skip_infinite_loop: false
           - name: windows (x86_64-pc-windows-msvc)
             os: windows-latest
             triple: x86_64-pc-windows-msvc
+            skip_infinite_loop: false
           # 按需：部署含 Alpine 时启用 musl 行
           # - name: linux-musl (x86_64-unknown-linux-musl)
           #   os: ubuntu-latest

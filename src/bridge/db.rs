@@ -16,7 +16,7 @@ use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use serde_json::Value;
 
-use super::{BridgeResult, Shared, StableState};
+use super::{BridgeResult, StableState};
 
 /// 数据访问返回的单行（JSON 对象）。
 pub type Row = Value;
@@ -329,10 +329,6 @@ pub async fn op_db_exec(
             .map_err(|e| JsErrorBox::generic(e.to_string())),
     }
 }
-
-/// 旧 `Shared` 类型兼容别名（部分模块仍引用）。
-#[allow(dead_code)]
-pub type _SharedCompat = Shared;
 
 #[cfg(test)]
 mod tests {

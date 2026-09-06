@@ -65,7 +65,7 @@ myproj/
 
 ```yaml
 server:
-  port: 9778                       # 代码默认 778 属特权端口，用 ≥1024
+  port: 9778                       # 监听端口（代码默认即 9778；<1024 属特权端口）
   public_key_path: "./config/public.pem"
   certificate_path: "./config/cert.jws"
 db:
@@ -930,38 +930,41 @@ describe("user account", () => {
 适用：API 端到端行为（路由/鉴权/租户/真实 DB/bus 广播/信封）与契约回归；
 代价是启动开销，适合 CI 与关键链路守护。
 
-### L2：vitest 纯 mock（`test/` 独立 npm 包）
+### L2：vitest 纯 mock（`unit/` 独立 npm 包）
 
 ```bash
-cd test && npm ci && npx vitest run
+cd sample && npm run test:unit    # 统一入口（等价 cd unit && npm ci && npx vitest run）
 ```
 
 结构：`mocks/oj-globals.ts` 提供 `installGlobals(opts?)`（把 `db/json/http/bus/log`
-换成可控桩，返回响应捕获 `{code,msg,data}`；`lastPublished()` 取 `bus.publish` 记录）；
+换成可控桩，返回响应捕获 `{code,msg,data}`；`lastPublished()` 取 `bus.publish` 记录，
+`lastSqlCalls()` 取 `db.query/exec` 的 SQL 与绑定参数——可断言 handler 走了哪个分支）；
 `invoke.ts` 提供 `invoke(handler, method, opts?)`（装桩 → 调 handler → flush 微任务 →
-返回 `{ ...capture, published }`）；测试文件直接 import 真实 `../src/.../api` 的 handler。
+返回 `{ ...capture, published }`）；`*.spec.ts` 直接 import 真实 `../src/.../api` 的 handler。
 
 ```ts
 import { describe, it, expect } from "vitest";
 import account from "../src/user/account/api";
 import { invoke } from "./invoke";
+import { lastSqlCalls } from "./mocks/oj-globals";
 
-describe("user/account (L2 mock)", () => {
-  it("get lists accounts from dbRows", async () => {
-    const r = await invoke(account, "get", { dbRows: [{ id: 1, name: "neo", role: "admin" }] });
-    expect(r.code).toBe(0);
-    expect(r.data[0].name).toBe("neo");
-  });
-
-  it("post rejects invalid role → 400", async () => {
-    const r = await invoke(account, "post", { body: { name: "x", role: "king" } });
+describe("user/account (L2 分支 + SQL)", () => {
+  it("post 缺 name → 400，且不落任何 SQL", async () => {
+    const r = await invoke(account, "post", { body: { role: "admin" } });
     expect(r.code).toBe(400);
+    expect(r.msg).toBe("name required");
+    expect(lastSqlCalls()).toEqual([]);
   });
 });
 ```
 
-适用：handler 纯逻辑单测（入参校验、响应塑形、bus 事件触发、纯函数）与 TDD 快速回归；
+适用：handler **内部分支**与边界（入参校验分支、默认值回落、纯函数如
+`requireRole`/`positiveId`/`lineLength` 的固定日期期望值）、「发出了什么 SQL」、
+bus 事件**内容**，以及 TDD 快速回归；
 局限：mock 不是真实后端，发现不了鉴权/租户/路由装配等集成层问题。
+
+> **与 L1 分工（避免双写）**：契约类断言（字段结构、分页包装、状态码、camelCase）只放
+> L1；分支类（输入 X 得 Y、边界、纯函数）只放 L2。判据见 `docs/modules/08-testing.md` §4。
 
 ### 选型与推荐组合
 
@@ -970,30 +973,19 @@ describe("user/account (L2 mock)", () => {
 | 运行时 | 真实 deno_core(v8) + axum | Node + vitest（无 v8） |
 | 后端 | 真实 DB/KV/bus | mock 桩 |
 | 速度 | 较慢（启动开销） | 极快 |
-| 覆盖 | 路由/鉴权/租户/DB/总线 | handler 逻辑 |
+| 覆盖 | 路由/鉴权/租户/DB/总线 | handler 内部分支与纯函数 |
 | 稳定性 | 受后端/配置影响 | 稳定、无副作用 |
 
 **推荐组合：开发期 L2 快速验证逻辑，CI 用 L1 守护端到端契约；两层都绿才有信心发布。**
 
-CI 示例（GitHub Actions 片段）：
+CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job）：
+`cargo run --release -p xtask -- build`（workspace 构建，产出 `bin/oj` + 全部第一方插件，
+勿用 `cargo build -p oj`——会按不同 feature 归一化重编 rusty_v8）→
+`./bin/oj test -c sample/config.yaml -d sample/src --format junit` → vitest。
 
-```yaml
-steps:
-  - name: L2 vitest
-    working-directory: sample/test
-    run: npm ci && npx vitest run
-  - name: L1 oj test (junit)
-    run: cargo run -p oj -- test -c sample/config.yaml -d sample/src --format junit --output l1.xml
-  - name: Upload L1 report
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: l1-junit
-      path: l1.xml
-```
-
-依赖管理：L2 的 vitest 声明在 `test/package.json` 的 `devDependencies`，与运行时依赖
-（如 `escape-goat`）隔离——被测物不携带测试工具。
+依赖管理：L2 的 vitest 声明在 `unit/package.json` 的 `devDependencies`，与运行时依赖
+（如 `escape-goat`）隔离——被测物不携带测试工具；统一入口在 `sample/package.json`
+（`npm run test` = `test:unit` + `test:api`）。
 
 ## 10. 配置 config.yaml
 
@@ -1007,7 +999,7 @@ steps:
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `host` | `"localhost"` | 监听地址 |
-| `port` | `778` | 代码默认属特权端口（<1024 需 root）；**生产用 ≥1024**（如 9778） |
+| `port` | `9778` | 监听端口；<1024 属特权端口（需 root），不要配成 `778` 之类 |
 | `base` | `"/v1/api"` | API 基础路由前缀；CLI `-b` 显式给出时覆盖；空前缀（空串/纯斜杠）拒绝启动 |
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
@@ -1386,7 +1378,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |
-| 端口 778 属特权端口 | 实际用 ≥1024（如 9778） |
+| 端口 <1024（如 778）属特权端口 | 需 root 才能 bind | 用 ≥1024（默认 `9778`） |
 | `.tsx` / `.mts` 不转译 | 直通 V8；统一用 `.ts` |
 | 静态站点无 SPA 回退 / 目录列表 / Range / ETag / 缓存头 | 未知路径不回落 `index.html`；未知扩展名按 `application/octet-stream`；SPA 回退经前置反代补 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |

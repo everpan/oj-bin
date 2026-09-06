@@ -48,7 +48,8 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
 
 `config.yaml` 全字段可省，均有默认。生产要点：
 
-- **端口**：代码默认 `778`，但属 macOS/Linux 特权端口（<1024），需 root；**生产用 ≥1024**（如 9778）。
+- **端口**：代码默认 `9778`（≥1024，无需 root）。若改用 <1024 的端口（如 `778`），
+  在 macOS/Linux 属特权端口，需 root。
 - **前缀** `server.base`：API 基础路由前缀（默认 `/v1/api`），随配置走版本管理；
   临时调试可用 `-b` 覆盖。空前缀（空串/纯斜杠）启动即报错。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
@@ -161,7 +162,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | 启动报 `auth.jwt_secret must not be empty` | auth 块配置了但 secret 为空串（fail-fast，不静默裸奔） | 填 secret |
 | 500 信封 `transaction already active` | 同一请求内嵌套 `db.tx`（每请求仅一个活跃事务） | 合并为一个 `db.tx` 回调，或先完结再开 |
 | 日志 `open transaction on db '…' rolled back at request end` | handler 未等待 `db.tx` 结束（漏 await / 中途 throw）即返回 | 修 handler：`await db.tx(...)`；数据已按未提交丢弃 |
-| 端口占用 | `778` 需 root | 换 ≥1024 端口 |
+| 端口占用 | 配了 <1024 的端口（如 `778`）需 root | 换 ≥1024 端口（默认 `9778`） |
 | 改 `api.ts` 不生效 | release 下 `dist/` 未更新 / 已加载包缓存 | 确认 dist 同步；必要时重启 |
 | 启动报 `blob.driver must be local\|s3` | config `blob.driver` 值非法 | 改成 local 或 s3 |
 | 启动报 `blob s3: bucket required` / `region required` | s3 驱动缺 `bucket`/`region`（fail-fast） | 补全；endpoint/密钥可省 |

@@ -243,7 +243,7 @@ pub fn resolve_plugins_dir(
     };
     let explicit = match std::env::var_os("OJ_PLUGINS_DIR") {
         Some(v) => Some(abs(Path::new(&v))),
-        None => toml_plugins_dir.map(|p| abs(p)),
+        None => toml_plugins_dir.map(abs),
     };
     if let Some(base) = explicit {
         let dir = base.join(ffi::triple());
@@ -254,10 +254,10 @@ pub fn resolve_plugins_dir(
         };
     }
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("plugins"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("plugins"));
     }
     candidates.push(ffi::workspace_root().join("bin").join("plugins"));
     for base in candidates {
@@ -397,19 +397,21 @@ fn load_one(
     }
 
     if let Some(entry) = expected {
-        if &descriptor.name[..] != entry.name {
+        let name = &descriptor.name[..];
+        let semver = &descriptor.semver[..];
+        if name != entry.name.as_str() {
             return Err(PluginLoadError::IdentityMismatch {
                 expected: entry.name.clone(),
-                actual: descriptor.name[..].to_string(),
+                actual: name.to_string(),
             });
         }
-        if let Some(pin) = &entry.semver_pin {
-            if &descriptor.semver[..] != pin {
-                return Err(PluginLoadError::IdentityMismatch {
-                    expected: format!("{}@{pin}", entry.name),
-                    actual: format!("{}@{}", entry.name, &descriptor.semver[..]),
-                });
-            }
+        if let Some(pin) = &entry.semver_pin
+            && semver != pin.as_str()
+        {
+            return Err(PluginLoadError::IdentityMismatch {
+                expected: format!("{}@{pin}", entry.name),
+                actual: format!("{}@{semver}", entry.name),
+            });
         }
     }
 

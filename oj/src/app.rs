@@ -22,7 +22,8 @@ use axum::http::{Request, StatusCode};
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
-    Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, SchemaRegistry,
+    Bridge, DataAccessor, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx,
+    SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, StableState};
 use only_js::config::{self, Config};
@@ -93,9 +94,174 @@ fn prewarm_boot(make_bridge: impl Fn() -> Bridge + Send + Sync + 'static) -> Res
     .map_err(|e| format!("{e} (edit ext_boot.js, then restart the process)"))
 }
 
+/// KV（装配第 6 步）：声明了 `redis.default` → 经 kv 插件 vtable connect（单例 fail-fast）；
+/// 未声明 → 内置 `InMemoryKV` 兜底。
+async fn connect_kv(cfg: &Config, registries: &Registries) -> Result<Arc<dyn KVStore>, String> {
+    match cfg.redis.get("default") {
+        Some(url) => match registries.kv {
+            Some(vt) => kv_backend_connect(vt, url)
+                .await
+                .map_err(|e| format!("redis 'default': {e}")),
+            None => Err("config declares redis.default but no kv plugin loaded \
+                 (run `cargo xtask plugin kv-redis`)"
+                .to_string()),
+        },
+        None => Ok(Arc::new(InMemoryKV::new()) as Arc<dyn KVStore>),
+    }
+}
+
+/// 表归属守卫模式（§5.3，装配第 10 步）：`warn`（默认，违规仅告警）| `deny`（违规拒绝）；
+/// 非法值 fail-fast。
+fn ownership_deny_of(cfg: &Config) -> Result<bool, String> {
+    match cfg.server.ownership_guard.as_deref() {
+        None | Some("warn") => Ok(false),
+        Some("deny") => Ok(true),
+        Some(other) => Err(format!(
+            "server.ownership_guard: illegal value {other:?} (warn|deny)"
+        )),
+    }
+}
+
+/// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
+/// manifest(db/deps) → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx
+/// map（键 = 模块目录绝对路径，run_module 祖先命中注入）。`gate == "auto"` 时逐模块
+/// reconcile（§D1：安全前向只进 apply 路径，迁移后补声明漂移）。
+async fn build_schema_and_modules(
+    dir: &Path,
+    ts: bool,
+    dbs: &std::collections::HashMap<String, Arc<dyn DataAccessor>>,
+    gate: &str,
+) -> Result<
+    (
+        SchemaRegistry,
+        Arc<std::collections::HashMap<String, ModuleCtx>>,
+    ),
+    String,
+> {
+    let mut registry = SchemaRegistry::new();
+    let mut module_map: std::collections::HashMap<String, ModuleCtx> =
+        std::collections::HashMap::new();
+    for (name, mdir) in manifest::discover(dir, ts)? {
+        let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
+        if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
+            for (t, pk, cols) in f.registry_tables() {
+                if registry.has_table(t) {
+                    return Err(format!(
+                        "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
+                        registry.owner_of(t).unwrap_or("?")
+                    ));
+                }
+                registry = registry.table_owned(&name, t, pk, &cols);
+            }
+            if gate == "auto" {
+                let acc = dbs
+                    .get("default")
+                    .ok_or("schema.yaml requires db 'default'")?;
+                for l in crate::schema::reconcile(acc.as_ref(), &name, &f).await? {
+                    eprintln!("schema: {l}");
+                }
+            }
+        }
+        module_map.insert(
+            mdir.to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: name.clone(),
+                deps: Arc::new(mf.deps.keys().cloned().collect()),
+                db: mf.db.clone(),
+            },
+        );
+    }
+    Ok((registry, Arc::new(module_map)))
+}
+
+/// jwt / oidc 原语配置（auth 与 OIDC 解耦后注入 bridge Extras 的两项）。
+type JwtOidcCfg = (
+    Option<Arc<JwtCfg>>,
+    Option<Arc<only_js::bridge::oidc::OidcState>>,
+);
+
+/// jwt / oidc 原语配置（装配第 14 步）。auth 与 OIDC 解耦：核心只留原语，端点在 JS；
+/// 装配期构造失败即 fail-fast。
+fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, String> {
+    let jwt = cfg
+        .auth
+        .as_ref()
+        .map(only_js::bridge::JwtCfg::from_auth_cfg)
+        .transpose()
+        .map_err(|e| format!("auth: {e}"))?
+        .map(Arc::new);
+    let oidc = match &cfg.oidc {
+        Some(s) => Some(Arc::new(
+            only_js::bridge::oidc::OidcState::from_section(s, config_dir)
+                .map_err(|e| format!("oidc: {e}"))?,
+        )),
+        None => None,
+    };
+    Ok((jwt, oidc))
+}
+
+/// 静态站点根（装配第 20 步）：`server.app_path`（CLI `--app-path` 可覆盖）相对 config_dir
+/// 绝对化；目录缺失 → fail-fast。
+fn resolve_static_root(cfg: &Config, config_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(r) = &cfg.server.app_path else {
+        return Ok(None);
+    };
+    let p = Path::new(r);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        config_dir.join(p)
+    };
+    let p = p
+        .canonicalize()
+        .map_err(|e| format!("server.app_path {}: {e}", p.display()))?;
+    Ok(Some(p))
+}
+
+/// 证书加载 + 校验 + 热加载 watcher（装配第 21 步）。启动期 `Expired`（宽限已过）→ 拒启；
+/// `Grace` 只告警；运行中过期由 watcher 切状态（handle 内仅限制 GET），服务不中断。
+fn load_cert_with_watcher(
+    cfg: &Config,
+    config_dir: &Path,
+) -> Result<(SharedCertStatus, SharedCertValidUntil), String> {
+    let (status, valid_until) = load_certificate_at(&cfg.server, config_dir)?;
+    match &status {
+        CertificateStatus::Expired => {
+            tracing::error!(
+                "certificate has expired and grace period elapsed — service will not start"
+            );
+            return Err("certificate expired".into());
+        }
+        CertificateStatus::Grace { remaining_secs } => {
+            tracing::warn!(
+                "certificate expired, {} days grace period remaining — service starting",
+                remaining_secs / 86_400
+            );
+        }
+        CertificateStatus::Valid => {
+            tracing::info!("certificate loaded: valid");
+        }
+    }
+    let cert_status: SharedCertStatus = Arc::new(RwLock::new(status));
+    let cert_valid_until: SharedCertValidUntil = Arc::new(RwLock::new(valid_until));
+    // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
+    spawn_watcher(
+        cert_status.clone(),
+        cert_valid_until.clone(),
+        cfg.server.clone(),
+        config_dir.to_path_buf(),
+    );
+    Ok((cert_status, cert_valid_until))
+}
+
 impl App {
     /// 装配并构造（原 `start` 逻辑搬入）。唯一构造一处 `StableState`，同时被 actor 工厂与
     /// 测试运行时引用，保证 db/bus/kv 跨家族为同一组 Arc（修正 #2）。
+    ///
+    /// 23 步的顺序即语义（见 [docs/modules/04-oj-cli.md]）；其中自成一体的步骤已抽为
+    /// 私有函数（connect_kv / ownership_deny_of / build_schema_and_modules /
+    /// build_jwt_and_oidc / resolve_static_root / load_cert_with_watcher）。
+    #[allow(clippy::too_many_lines)]
     pub async fn from_config(
         cfg: Config,
         config_dir: &Path,
@@ -138,19 +304,7 @@ impl App {
         );
         // KV：redis.default 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
         // 未声明 → InMemoryKV 内置兜底。
-        let kv: Arc<dyn KVStore> = match cfg.redis.get("default") {
-            Some(url) => match registries.kv {
-                Some(vt) => kv_backend_connect(vt, url)
-                    .await
-                    .map_err(|e| format!("redis 'default': {e}"))?,
-                None => {
-                    return Err("config declares redis.default but no kv plugin loaded \
-                                (run `cargo xtask plugin kv-redis`)"
-                        .to_string());
-                }
-            },
-            None => Arc::new(InMemoryKV::new()),
-        };
+        let kv: Arc<dyn KVStore> = connect_kv(&cfg, &registries).await?;
         let es: Option<Arc<dyn EsBackend>> = registries.es;
         // blob：blob 段存在即启用；未声明 → None。
         let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
@@ -181,53 +335,9 @@ impl App {
             }
         }
         // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
-        let ownership_deny = match cfg.server.ownership_guard.as_deref() {
-            None | Some("warn") => false,
-            Some("deny") => true,
-            Some(other) => {
-                return Err(format!(
-                    "server.ownership_guard: illegal value {other:?} (warn|deny)"
-                ));
-            }
-        };
-        // §4.8 归属图 + SchemaRegistry 复活：discover 全模块 → schema.yaml + manifest(db/deps)
-        // → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx map
-        //（键 = 模块目录绝对路径，run_module 祖先命中注入）。gate=auto 时逐模块
-        // reconcile（§D1：安全前向只进 apply 路径，迁移后补声明漂移）。
-        let mut registry = SchemaRegistry::new();
-        let mut module_map: std::collections::HashMap<String, ModuleCtx> =
-            std::collections::HashMap::new();
-        for (name, mdir) in manifest::discover(&dir, ts)? {
-            let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
-            if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
-                for (t, pk, cols) in f.registry_tables() {
-                    if registry.has_table(t) {
-                        return Err(format!(
-                            "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
-                            registry.owner_of(t).unwrap_or("?")
-                        ));
-                    }
-                    registry = registry.table_owned(&name, t, pk, &cols);
-                }
-                if gate == "auto" {
-                    let acc = dbs
-                        .get("default")
-                        .ok_or("schema.yaml requires db 'default'")?;
-                    for l in crate::schema::reconcile(acc.as_ref(), &name, &f).await? {
-                        eprintln!("schema: {l}");
-                    }
-                }
-            }
-            module_map.insert(
-                mdir.to_string_lossy().into_owned(),
-                ModuleCtx {
-                    name: name.clone(),
-                    deps: Arc::new(mf.deps.keys().cloned().collect()),
-                    db: mf.db.clone(),
-                },
-            );
-        }
-        let modules = Arc::new(module_map);
+        let ownership_deny = ownership_deny_of(&cfg)?;
+        // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
+        let (registry, modules) = build_schema_and_modules(&dir, ts, &dbs, gate).await?;
         // 种子重放（P0）：根 seed.sql（deprecated）→ 各模块 schema.sql/seed.sql（§8-1）。
         crate::seed::replay_all(dbs.get("default"), config_dir, &dir).await?;
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
@@ -246,21 +356,7 @@ impl App {
                 .map(only_js::bridge::plugin_loader::auth_guard_from_vtable),
             None => None,
         };
-        let jwt: Option<Arc<JwtCfg>> = cfg
-            .auth
-            .as_ref()
-            .map(only_js::bridge::JwtCfg::from_auth_cfg)
-            .transpose()
-            .map_err(|e| format!("auth: {e}"))?
-            .map(Arc::new);
-        // oidc 原语配置注入（JS 端点 oidc.sign/verify/jwks 用）；与 jwt 同构，构造期 fail-fast。
-        let oidc = match &cfg.oidc {
-            Some(s) => Some(Arc::new(
-                only_js::bridge::oidc::OidcState::from_section(s, config_dir)
-                    .map_err(|e| format!("oidc: {e}"))?,
-            )),
-            None => None,
-        };
+        let (jwt, oidc) = build_jwt_and_oidc(&cfg, config_dir)?;
         // 共享事件总线。
         let bus = registries
             .bus
@@ -397,50 +493,10 @@ impl App {
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
         // 静态站点根（server.app_path，CLI --app-path 可覆盖）：相对 config_dir 绝对化（缺失目录 fail-fast）。
-        let static_root = match &cfg.server.app_path {
-            Some(r) => {
-                let p = Path::new(r);
-                let p = if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    config_dir.join(p)
-                };
-                Some(
-                    p.canonicalize()
-                        .map_err(|e| format!("server.app_path {}: {e}", p.display()))?,
-                )
-            }
-            None => None,
-        };
+        let static_root = resolve_static_root(&cfg, config_dir)?;
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
-        let (status, valid_until) = load_certificate_at(&cfg.server, &config_dir)?;
-        match &status {
-            CertificateStatus::Expired => {
-                tracing::error!(
-                    "certificate has expired and grace period elapsed — service will not start"
-                );
-                return Err("certificate expired".into());
-            }
-            CertificateStatus::Grace { remaining_secs } => {
-                tracing::warn!(
-                    "certificate expired, {} days grace period remaining — service starting",
-                    remaining_secs / 86_400
-                );
-            }
-            CertificateStatus::Valid => {
-                tracing::info!("certificate loaded: valid");
-            }
-        }
-        let cert_status: SharedCertStatus = Arc::new(RwLock::new(status));
-        let cert_valid_until: SharedCertValidUntil = Arc::new(RwLock::new(valid_until));
-        // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
-        spawn_watcher(
-            cert_status.clone(),
-            cert_valid_until.clone(),
-            cfg.server.clone(),
-            config_dir.to_path_buf(),
-        );
+        let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),

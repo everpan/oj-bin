@@ -37,8 +37,9 @@
 cargo build --release        # 发布构建（等价 cargo build，按约定）
 cargo fmt --check            # 格式门禁（cargo fmt 自动修复）
 cargo clippy --all-targets -D warnings   # lint 门禁
-cargo test --release --workspace        # 全部测试（根 crate + oj e2e + 插件；CI 同款，
-                                        #   另加 -- --skip infinite_loop）
+cargo test --release --workspace        # 全部测试（根 crate + oj e2e + 插件；CI 同款。
+                                        #   个别平台 SIGSEGV 时才按 workflow 的
+                                        #   skip_infinite_loop 开关跳过，不再全局跳过）
 cargo test -p oj             # 单测 + e2e
 cargo test -p mdm-server     # server 单测
 cargo test -- --nocapture    # 看 tracing 输出
@@ -566,8 +567,9 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
   - `OJ_TEST_S3=endpoint|bucket|region|access|secret|path_style` → `oj-blob-s3`
   - `OJ_TEST_KAFKA_BROKERS=b1:9092,b2:9092` → `oj-bus-kafka`；
     `OJ_TEST_RABBITMQ_URL=…` → `oj-bus-rabbitmq`
-  - 运行：`cargo test --release --workspace -- --skip infinite_loop`（env-gated 测试未设
-    env 即内联跳过；`infinite_loop` 在部分平台 SIGSEGV，跳过）。
+  - 运行：`cargo test --release --workspace`（env-gated 测试未设 env 即内联跳过；
+    `infinite_loop` 曾在部分平台 SIGSEGV，CI 现按平台开关 `skip_infinite_loop` 控制，
+    默认跑全量，见 `.github/workflows/plugin-matrix.yml` 的 matrix 注释）。
 
 覆盖率经 `cargo llvm-cov --workspace --summary-only` 观测（目标行/区域 >90%）。
 
@@ -689,7 +691,8 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
 ## 16. 提交与 CI
 
 - 门禁：`cargo fmt --check` + `cargo clippy --all-targets -D warnings` +
-  `cargo test --release --workspace`（CI 额外 `-- --skip infinite_loop`）。
+  `cargo test --release --workspace`（+ sample 的 L1 `oj test` 与 L2 vitest，见
+  `sample-tests` job）。`infinite_loop` 曾全局 `--skip`，现已改为按平台开关，默认跑全量。
 - 纪律：改动后 **release 下测试与构建都要绿**才算完成；**TDD red-first**（先失败测试再
   最小实现）；commit 尾随 `unix@vip.qq.com ai`。
 - CI（`.github/workflows/`）：`release.yml`（linux-gnu / macos / windows 三平台测试 + 打包）

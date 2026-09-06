@@ -257,6 +257,9 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 
 | Doc | Content |
 |---|---|
+| `docs/modules/` | **模块说明索引**（每个 crate / 子系统的职责、边界、文件地图） |
+| `docs/review-2026-09-06.md` | 全模块代码与架构审查（含 P0/P1 清单与整改记录） |
+| `docs/archive/` | 归档的历史方案/预案（**不描述当前实现**，附「现在该读哪篇」指路表） |
 | `docs/user-manual.md` | full `oj` CLI and `config.yaml` reference |
 | `docs/dev-guide.md` | developer manuals (incl. adding a new op) |
 | `docs/bridge.md` | JS globals and module cross-reference |

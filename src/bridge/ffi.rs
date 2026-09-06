@@ -746,6 +746,11 @@ impl Drop for FfiKVStore {
 }
 
 #[cfg(test)]
+// `T_LOCK` 是**测试串行化**锁（保护进程级共享 statics：FAIL_NEXT / LAST_SEARCH / FREED），
+// 不是被 await 的临界区数据锁：这些用例跑在 `multi_thread` runtime 上，持锁跨 await 只是
+// 让同批用例排队，不会与其它 lock 形成环，故无死锁风险；改成 drop 再 await 反而会失去串行化。
+// 与 `oj/tests/e2e.rs`、`server/src/ws.rs` 的同类豁免同理（注释互指）。
+#[allow(clippy::await_holding_lock)]
 mod adapter_tests {
     use super::*;
     use oj_plugin_ffi::RBytes;

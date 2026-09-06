@@ -73,7 +73,6 @@ pub use registry::SchemaRegistry;
 // boot_runtime 供 oj 的 test 运行时复用（`oj test` 不走 RuntimePool，直接建 JsRuntime）。
 pub use runtime::{BOOT_TIMEOUT, boot_runtime};
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -185,9 +184,6 @@ impl ReqState {
         self.module = None;
     }
 }
-
-/// 历史兼容别名（部分旧调用可能引用 `Shared`）。
-pub type Shared = Rc<RefCell<StableState>>;
 
 deno_core::extension!(
     bridge_ext,
