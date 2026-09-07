@@ -104,6 +104,24 @@ jobs:
         shell: bash
         run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
 
+      # rdkafka-sys 经 cmake 编 librdkafka 默认 /MD（动态 CRT），而 rustc
+      # windows-msvc 默认静态 CRT（libcmt）→ 混链 1120（__imp__* 符号悬空）。
+      # 工具链文件强制 /MT，与 rustc / V8 静态库一致（同 plugin-matrix.yml）。
+      - name: Force static CRT for cmake builds (librdkafka)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: echo "CMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/scripts/msvc-static-crt.cmake" >> "$GITHUB_ENV"
+
+      # 先构建并归置全部插件，再跑 workspace 测试：oj/tests/oidc_e2e.rs 运行期从
+      # bin/plugins/<triple>/ dlopen oj-auth——fresh checkout 上若先跑测试，装配层
+      # 会 fail-fast（"config declares [auth] but no auth plugin loaded"）。
+      # 与 plugin-matrix.yml 同序；下方打包脚本内的 xtask build 二次执行是 no-op。
+      - name: build & place plugins
+        shell: bash
+        run: |
+          cargo run --release -p xtask -- build
+          ls -la bin/plugins/${{ matrix.triple }}/
+
       # 发布前跑全量测试（release 模式，与 plugin-matrix 同；infinite_loop 在部分平台会
       # SIGSEGV，跳过）。
       - name: cargo test --release (workspace, skip infinite_loop)
