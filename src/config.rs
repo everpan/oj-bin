@@ -316,6 +316,13 @@ pub struct Config {
     /// 空对象跳过透传回落轴适配器。缺省/空 map = 扫描模式（加载 plugins_dir 全部）。
     /// 旧 list 写法 `plugins: [a, b]` 废弃（解析报错 fail-fast）。
     pub plugins: HashMap<String, serde_json::Value>,
+    /// 命名 MQ 实例（spec 2026-09-07 §3）：kafkas.default = { brokers, group } →
+    /// Kafka("default")。值 JSON 透传给 mq 插件（kind 由装配层按段来源注入）。
+    /// 段缺省 = 不启用（registry 空 → Kafka/RabbitMQ(name) → undefined）。
+    #[serde(default)]
+    pub kafkas: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub rabbits: HashMap<String, serde_json::Value>,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }
@@ -444,6 +451,39 @@ mod tests {
         c2.server.certificate_path = "c.jws".into();
         assert!(c2.server.cert_paths_configured());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mq_named_sections_parse() {
+        // kafkas:/rabbits: 命名段（spec 2026-09-07 §3）：值 JSON 透传；缺省段 = 空 map。
+        let dir = std::env::temp_dir().join(format!("ojcfgmq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "kafkas:\n",
+                "  default:\n",
+                "    brokers: [b1:9092, b2:9092]\n",
+                "    group: g1\n",
+                "rabbits:\n",
+                "  default:\n",
+                "    url: amqp://x:5672\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.kafkas["default"]["brokers"].as_array().unwrap().len(), 2);
+        assert_eq!(c.kafkas["default"]["group"].as_str(), Some("g1"));
+        assert_eq!(c.rabbits["default"]["url"].as_str(), Some("amqp://x:5672"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 缺省：两段均为空 map（段存在即启用哲学的反面——不写不启用）。
+        let dir2 = std::env::temp_dir().join(format!("ojcfgmq2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("cfg.yaml"), "server: {}\n").unwrap();
+        let c2 = load_from(&dir2, Some("cfg.yaml")).unwrap();
+        assert!(c2.kafkas.is_empty() && c2.rabbits.is_empty());
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

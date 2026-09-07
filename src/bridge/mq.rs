@@ -44,6 +44,27 @@ impl MqInstance {
         }
     }
 
+    /// 装配期入口：connect(cfg) → 解析 handle → 构造 ffi 实例（oj 装配层消费；
+    /// 失败 = cfg 校验失败或插件拒绝 kind → 装配 fail-fast，spec §7）。
+    pub async fn ffi_connect(
+        kind: &'static str,
+        vt: &'static oj_plugin_ffi::MqVtable,
+        cfg_json: String,
+        backoff: std::time::Duration,
+    ) -> BridgeResult<Self> {
+        let out = super::ffi::await_ffi_poll(
+            (vt.connect)(oj_plugin_ffi::RString::from(cfg_json.as_str())),
+            backoff,
+        )
+        .await?;
+        let handle = serde_json::from_slice::<serde_json::Value>(&out)?["handle"]
+            .as_u64()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "mq connect: missing handle in result".into()
+            })?;
+        Ok(Self::ffi(kind, vt, handle, backoff))
+    }
+
     /// FFI 适配：vtable + handle → call 闭包（经 await_ffi_poll 长轮询退避，评审 F4）。
     /// cfg JSON 由装配层拼接（kind + 命名段透传值）。
     pub fn ffi(
@@ -399,7 +420,6 @@ mod tests {
 #[cfg(test)]
 mod js_global_tests {
     use super::MqInstance;
-    use super::tests::*;
     use crate::bridge::NamedRegistry;
     use crate::bridge::{Bridge, Extras, InMemoryKV, SchemaRegistry};
     use std::collections::HashMap;

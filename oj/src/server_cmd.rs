@@ -218,6 +218,9 @@ pub struct Registries {
     /// auth 键选单 vtable 槽（auth 解耦：cfg [auth] 声明 → 必须恰有一个 auth 插件，
     /// 缺失/多插件冲突都 fail fast；未声明时插件槽位不进 Pipeline）。
     pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>,
+    /// mq 命名客户端 vtable 表（spec 2026-09-07：插件名 bus-<kind> 路由；
+    /// kafkas:/rabbits: 段声明 → 按名找 vtable → connect 出命名实例）。
+    pub mq: Vec<(String, &'static oj_plugin_ffi::MqVtable)>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -324,6 +327,16 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register auth guard".to_string());
     }
     let auth = auth_plugins.first().and_then(|p| p.registrations.auth);
+    // mq 命名客户端（spec 2026-09-07）：收集所有提供 mq 轴的插件（名 + vtable）。
+    // 多插件同 kind 冲突在 build_mq_registries 按段路由时报错（错误文案带 kind）。
+    let mq: Vec<(String, &'static oj_plugin_ffi::MqVtable)> = loaded
+        .iter()
+        .filter_map(|p| {
+            p.registrations
+                .mq
+                .map(|vt| (p.descriptor.name[..].to_string(), vt))
+        })
+        .collect();
     Ok(Registries {
         es,
         dbs,
@@ -331,6 +344,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         bus,
         kv,
         auth,
+        mq,
     })
 }
 

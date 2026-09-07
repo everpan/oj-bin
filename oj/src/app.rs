@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use oj_plugin_ffi;
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
@@ -109,6 +110,68 @@ async fn connect_kv(cfg: &Config, registries: &Registries) -> Result<Arc<dyn KVS
         },
         None => Ok(Arc::new(InMemoryKV::new()) as Arc<dyn KVStore>),
     }
+}
+
+/// mq 插件名 → 服务的 kind（strip "bus-"；历史插件名 rabbitmq 归一为 rabbit，评审 F7）。
+fn mq_kind_of(desc_name: &str) -> Option<&'static str> {
+    match desc_name.strip_prefix("bus-")? {
+        "kafka" => Some("kafka"),
+        "rabbitmq" | "rabbit" => Some("rabbit"),
+        _ => None,
+    }
+}
+
+/// mq 命名实例装配（spec §3/§7）：kafkas:/rabbits: 段逐实例 connect（kind 注入 cfg）→
+/// MqInstance。段缺省 = 空 registry（JS 侧 undefined）。失败 fail-fast：
+/// 段声明但无对应 kind 插件 / 插件拒绝 cfg（kind 不符、参数缺失）/ 注册重名。
+async fn build_mq_registries(
+    cfg: &Config,
+    mq: &[(String, &'static oj_plugin_ffi::MqVtable)],
+) -> Result<
+    (
+        Arc<NamedRegistry<MqInstance>>,
+        Arc<NamedRegistry<MqInstance>>,
+    ),
+    String,
+> {
+    const BACKOFF: Duration = Duration::from_millis(10);
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for (name, _) in mq {
+        if let Some(k) = mq_kind_of(name) {
+            if kinds.contains(&k) {
+                return Err(format!(
+                    "plugins conflict: multiple mq plugins serve kind '{k}' ({name})"
+                ));
+            }
+            kinds.push(k);
+        }
+    }
+    let mut kafkas = NamedRegistry::new();
+    let mut rabbits = NamedRegistry::new();
+    for (section, key, kind, reg) in [
+        (&cfg.kafkas, "kafkas", "kafka", &mut kafkas),
+        (&cfg.rabbits, "rabbits", "rabbit", &mut rabbits),
+    ] {
+        if section.is_empty() {
+            continue;
+        }
+        let vt = mq
+            .iter()
+            .find_map(|(n, vt)| (mq_kind_of(n) == Some(kind)).then_some(*vt))
+            .ok_or_else(|| format!("config declares {key} but no mq plugin for kind '{kind}'"))?;
+        for (name, v) in section {
+            let mut obj = v.clone();
+            if let Some(o) = obj.as_object_mut() {
+                o.insert("kind".into(), serde_json::Value::String(kind.into()));
+            }
+            let inst = MqInstance::ffi_connect(kind, vt, obj.to_string(), BACKOFF)
+                .await
+                .map_err(|e| format!("{key}.{name}: {e}"))?;
+            reg.register(name, Arc::new(inst))
+                .map_err(|e| format!("mq register: {e}"))?;
+        }
+    }
+    Ok((Arc::new(kafkas), Arc::new(rabbits)))
 }
 
 /// 表归属守卫模式（§5.3，装配第 10 步）：`warn`（默认，违规仅告警）| `deny`（违规拒绝）；
@@ -364,9 +427,8 @@ impl App {
             .connect(&cfg.broker)
             .await
             .map_err(|e| format!("broker: {e}"))?;
-        // mq 命名实例（T7 装配注入；过渡期空表——Kafka/RabbitMQ(name) → undefined）。
-        let kafkas: Arc<NamedRegistry<MqInstance>> = Arc::new(NamedRegistry::new());
-        let rabbits: Arc<NamedRegistry<MqInstance>> = Arc::new(NamedRegistry::new());
+        // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
+        let (kafkas, rabbits) = build_mq_registries(&cfg, &registries.mq).await?;
         // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，Clone 即共享。
         let make_bridge = {
             let (dbs, kv, loader, es, bus) = (
@@ -555,10 +617,10 @@ impl App {
             modules,
             ownership_deny,
             boot: boot.clone(),
-            jwt: jwt.clone(),   // 与 make_bridge 的 Extras.jwt 同源。
-            oidc: oidc.clone(), // 与 make_bridge 的 Extras.oidc 同源。
-            kafkas: Arc::new(NamedRegistry::new()),
-            rabbits: Arc::new(NamedRegistry::new()),
+            jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
+            oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。
+            kafkas: kafkas.clone(),   // 与 make_bridge 的 Extras.kafkas 同源。
+            rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
             tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -640,5 +702,98 @@ mod tests {
         assert!(spec.contains("?v="), "{spec}");
         assert!(spec.contains("ext_boot.js"), "{spec}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod mq_assembly_tests {
+    use super::*;
+    use oj_plugin_ffi::{FfiFuture, MqVtable, RString};
+
+    // 假 mq vtable：connect 恒 {"handle":7}，call 回显 payload（装配测试零网络）。
+    extern "C" fn fake_connect(cfg: RString) -> FfiFuture {
+        let _ = cfg;
+        oj_plugin_ffi::ready_ok(br#"{"handle":7}"#)
+    }
+    extern "C" fn fake_call(_h: u64, m: RString, p: RString) -> FfiFuture {
+        let out = format!(r#"{{"method":"{}","payload":{}}}"#, &m[..], &p[..]);
+        oj_plugin_ffi::ready_ok(out.into_bytes())
+    }
+    extern "C" fn fake_close(_h: u64) {}
+    static FAKE_MQ: MqVtable = MqVtable {
+        connect: fake_connect,
+        call: fake_call,
+        close: fake_close,
+    };
+
+    fn mq_table(names: &[&str]) -> Vec<(String, &'static MqVtable)> {
+        names.iter().map(|n| (n.to_string(), &FAKE_MQ)).collect()
+    }
+
+    fn cfg_with(section: serde_json::Value, which: &str) -> Config {
+        let mut cfg = Config::default();
+        let map: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_value(section).unwrap();
+        if which == "kafkas" {
+            cfg.kafkas = map;
+        } else {
+            cfg.rabbits = map;
+        }
+        cfg
+    }
+
+    /// Given: kafkas.default 声明 + bus-kafka 插件；Then: registry 命名实例就位。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_kafkas_section_with_kafka_plugin_when_build_then_registered() {
+        let cfg = cfg_with(
+            serde_json::json!({ "default": { "brokers": ["b:9092"] } }),
+            "kafkas",
+        );
+        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]))
+            .await
+            .unwrap();
+        assert!(kafkas.get("default").is_some());
+        assert!(rabbits.get("default").is_none());
+        // kind 注入核验：cfg 透传含 kind=kafka（fake connect 忽略，仅验通路不 panic）
+    }
+
+    /// Given: kafkas 声明但无 kafka 插件；Then: fail-fast 文案带 kind（评审 F1/N2）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_kafkas_without_matching_plugin_when_build_then_err() {
+        let cfg = cfg_with(serde_json::json!({ "default": {} }), "kafkas");
+        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-rabbitmq"])).await else {
+            panic!("expected fail-fast");
+        };
+        assert!(e.contains("no mq plugin for kind 'kafka'"), "{e}");
+    }
+
+    /// Given: rabbits 声明只装 kafka 插件（负例，评审 N2）；Then: fail-fast。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_rabbits_with_only_kafka_plugin_when_build_then_err() {
+        let cfg = cfg_with(serde_json::json!({ "default": {} }), "rabbits");
+        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"])).await else {
+            panic!("expected fail-fast");
+        };
+        assert!(e.contains("no mq plugin for kind 'rabbit'"), "{e}");
+    }
+
+    /// Given: 两插件同名 kind 冲突；Then: fail-fast（评审 S5）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_duplicate_kind_plugins_when_build_then_err_conflict() {
+        let cfg = cfg_with(serde_json::json!({ "default": {} }), "kafkas");
+        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-kafka", "bus-kafka"])).await else {
+            panic!("expected fail-fast");
+        };
+        assert!(e.contains("multiple mq plugins serve kind 'kafka'"), "{e}");
+    }
+
+    /// Given: 两段都空；Then: 空 registry（不报错，JS undefined 语义）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_empty_sections_when_build_then_empty_registries() {
+        let cfg = Config::default();
+        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]))
+            .await
+            .unwrap();
+        assert!(kafkas.is_empty() && rabbits.is_empty());
     }
 }
