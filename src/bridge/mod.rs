@@ -253,6 +253,7 @@ deno_core::extension!(
         mq::op_mq_has,
         mq::op_mq_call,
         mq::op_tasks_stopping,
+        mq::op_tasks_sleep,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     esm = [dir "src/bridge", "bootstrap.js"],

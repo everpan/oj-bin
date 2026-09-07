@@ -31,6 +31,7 @@ import {
   op_mq_call,
   op_mq_has,
   op_tasks_stopping,
+  op_tasks_sleep,
   op_fetch,
   op_finish,
   op_http_info,
@@ -176,7 +177,11 @@ globalThis.Kafka = mqClient("kafka");
 globalThis.RabbitMQ = mqClient("rabbit");
 
 // ----- tasks: long-running task context (stopping flag; always false outside task bridges) -----
-globalThis.tasks = { stopping: () => op_tasks_stopping() };
+// sleep is the only legal wait inside task loops (no timer globals in this runtime).
+globalThis.tasks = {
+  stopping: () => op_tasks_stopping(),
+  sleep: (ms) => op_tasks_sleep(ms),
+};
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 globalThis.ws = {

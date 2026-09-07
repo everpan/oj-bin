@@ -70,6 +70,20 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/idp/*"
     - "/idp/.well-known/*"
 
+tasks:   # 长任务池（v0.1.6）：dir 相对 API 目录；sample/src/tasks/task_demo.ts 每秒心跳
+  dir: "tasks"
+  max: 64
+  stop_grace_secs: 30
+
+kafkas:   # 命名 Kafka（v0.1.6）：值透传 oj-bus-kafka；配好 brokers 即可用 Kafka("default")
+  # default:
+  #   brokers: ["127.0.0.1:9092"]
+  #   group: "sample"
+
+rabbits:   # 命名 RabbitMQ（v0.1.6）：值透传 oj-bus-rabbitmq；RabbitMQ("default")
+  # default:
+  #   url: "amqp://guest:guest@127.0.0.1:5672"
+
 oidc:   # OIDC（spec 2026-09-05）：同进程 OP + RP。demo 私钥与示例证书同性质，勿用于生产。
   issuer: "http://localhost:9778/v1/api/idp"
   private_key_path: "./config/oidc_rs256.pem"

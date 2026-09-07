@@ -175,6 +175,23 @@ demo（admin）200、trinity（user）实测 403。
 谁就在 manifest 里 `deps: _platform`——这是 oj 模块自治模型里「共享数据如何归属」
 的答案。
 
+## ⑪ src/tasks —— 长任务池（v0.1.6）
+
+- **task_demo.ts**：与 broker 无关的最小心跳任务——`while (!tasks.stopping()) {
+  await tasks.sleep(1000); log.info("demo tick"); }`。启动服务即随进程拉起：
+
+  ```
+  task: demo (task_demo.ts) → started
+  task: 1 task(s) → started
+  ```
+
+- 命名约定：`task_{name}.*` / `{name}_task.*`（递归扫描；其余文件是共享库，
+  不执行）。每任务一条专用线程 + 独立 V8 runtime；崩溃 1s→2s→…（cap 60s）
+  退避重启；Ctrl-C → `tasks.stopping()` 置位 → 宽限内自然收场（不退者被看门狗
+  强杀）→ `task: demo → stopped`。
+- 消费型任务（Kafka/RabbitMQ poll/commit/ack）配 `config.yaml` 的 `kafkas:`/
+  `rabbits:` 段使用；写法见 `docs/devkit/api-manual.md` §6「命名 MQ 客户端与长任务」。
+
 ---
 
 ## 特性 → 模块速查
@@ -195,6 +212,8 @@ demo（admin）200、trinity（user）实测 403。
 | multipart + blob 对象存储 | upload | `api.ts` |
 | `json.raw` 裸 JSON（协议端点） | idp | `.well-known/openid-configuration/api.ts` |
 | OIDC OP / RP 全流程 | idp · oidc | 见 README「OIDC 演示」 |
+| 长任务池 / `tasks.stopping/sleep` | src/tasks | `task_demo.ts` |
+| Kafka/RabbitMQ 命名客户端 | src/tasks + config | `kafkas:`/`rabbits:` 段（消费见 api-manual §6） |
 | seed.sql / schema.yaml / migrations | user · order · _platform | 各模块目录 |
 
 ## 数据层文件速览

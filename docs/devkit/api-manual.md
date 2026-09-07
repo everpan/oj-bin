@@ -422,7 +422,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（17 组）
+### 总表（19 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -435,6 +435,8 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `blob.put/get/del/url/contentType`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用） |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
+| `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
+| `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
 | `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
@@ -747,6 +749,69 @@ globalThis.APP_ENV = "prod";
 
 注入的全局默认可写，handler 覆盖/删除后该 runtime 内后续请求都受影响（boot 不重跑）。
 需要防改就用 `Object.defineProperty(..., {writable: false, configurable: false})`。
+
+### 命名 MQ 客户端与长任务（Kafka / RabbitMQ / tasks）
+
+> 何时读我：要接 Kafka/RabbitMQ 消费，或写 `src/tasks/` 下的长任务。
+
+**命名客户端**：`kafkas:`/`rabbits:` 段（config §10）每个键装配为一个实例，
+`Kafka("default")` / `RabbitMQ("default")` 取用（同名实例进程内同一对象；未配置的
+名返回 `undefined`）。底层经 oj-bus-kafka / oj-bus-rabbitmq 插件的 `mq` 轴。
+
+| 客户端 | 生产面 | 消费面（**仅任务上下文**） |
+|---|---|---|
+| `Kafka(name)` | `send(topic, {value, key?, headers?})` | `poll(topics, {max?, timeoutMs?})` → `{messages}`；`commit(m)`（按 m.offset+1 提交） |
+| `RabbitMQ(name)` | `publish(exchange, routingKey, value, {headers?})` | `poll(queues, {max?, timeoutMs?})`（= 循环 basic.get）；`ack(m)`；`nack(m, requeue?)` |
+| 两者 | `kind()` / `metadata()` | —— |
+
+消息形状（`OjMqMessage`）：`{topic, partition?, offset?, key?, value, headers?, ts?}`。
+
+**消费门禁（评审 M2）**：`poll/commit/ack/nack` 只在长任务上下文可用——HTTP/WS
+handler 里调用直接报错（消费会话归属任务实例，实例级单 poller，第二个并发 poll
+报 `instance busy`）。任务 = `src/tasks/`（`tasks.dir` 可改）下符合命名约定的文件：
+`task_{name}.ts/.js` 或 `{name}_task.ts/.js`（递归扫描；其余文件是共享库，不执行；
+同名双写、超 `max` 直接拒启）。每任务一条专用线程 + 独立 V8 runtime。
+
+**任务骨架**（顺序语义：poll → 处理 → commit；commit 按 offset+1，重复处理至
+少一次）：
+
+```ts
+export {};
+const k = Kafka("default");
+while (!tasks.stopping()) {
+  const { messages } = await k.poll(["orders"], { max: 100, timeoutMs: 1000 });
+  for (const m of messages) { /* 业务处理（幂等） */ }
+  if (messages.length) await k.commit(messages[messages.length - 1]);
+}
+```
+
+** RabbitMQ 拉取骨架**：
+
+```ts
+export {};
+const r = RabbitMQ("default");
+while (!tasks.stopping()) {
+  const { messages } = await r.poll(["q1"], { max: 10, timeoutMs: 1000 });
+  for (const m of messages) { /* 处理 */ await r.ack(m); }
+}
+```
+
+硬规则：
+
+- **运行时无 timer 全局**：`setTimeout/setInterval` 不可用；任务里等待一律
+  `await tasks.sleep(ms)`。
+- **任务文件是 ES 模块**：用顶层 `await` 必须带一句 `export {};`（否则按 CJS 包装
+  直接 SyntaxError，见 §5）。
+- **`timeoutMs` 与 `stop_grace_secs` 的互动（评审 N3）**：停机 flag 置位后任务有
+  `stop_grace_secs`（默认 30s）宽限自然收场；`timeoutMs` 应显著小于宽限（如 ≤1s），
+  否则任务在一次长 poll 中错过退出窗口，到点被看门狗强杀（记 Killed）。
+- **崩溃自动重启**：异常退出按 1s→2s→4s…（cap 60s）退避重启，成功运行 ≥60s 归零；
+  启动/重启/停机逐条落日志（`task: <name> … → started / stopped / crashed`）。
+- **热重载无**：改任务文件需重启进程（转译缓存按 mtime 自动失效）。
+- 与 `bus.*` 的关系：`bus` 是进程内/分布式**广播**（fire-and-forget），MQ 客户端是
+  **持久队列消费**（有 offset/ack 语义）。需要可靠逐条消费用后者。
+
+最小无 broker 示例见 `sample/src/tasks/task_demo.ts`（每秒心跳）。
 
 ## 7. 响应信封与错误码
 

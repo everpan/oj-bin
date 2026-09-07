@@ -281,8 +281,12 @@ declare global {
   // 消费方法（poll/commit/ack/nack）仅长任务上下文可用（HTTP/WS 内调用报错）。
   function Kafka(name: string): OjKafkaClient | undefined;
   function RabbitMQ(name: string): OjRabbitClient | undefined;
-  // 长任务上下文：检测停机信号（HTTP/WS 上下文恒 false）。
-  function tasks(): { stopping(): boolean };
+  // 长任务上下文（对象全局）：stopping = 停机信号（HTTP/WS 上下文恒 false）；
+  // sleep = 等待原语（本运行时无 timer 全局，setTimeout 不可用）。
+  const tasks: {
+    stopping(): boolean;
+    sleep(ms: number): Promise<void>;
+  };
 }
 
 interface OjMqMessage {

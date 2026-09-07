@@ -169,6 +169,15 @@ pub fn op_tasks_stopping(state: &mut OpState) -> bool {
         .is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
+/// 任务等待原语：tokio sleep（本 runtime 无 timer 全局——setTimeout 不可用；
+/// broker 无关的任务循环用 `await tasks.sleep(ms)` 合法睡眠）。
+#[op2]
+pub async fn op_tasks_sleep(#[number] ms: i64) {
+    if ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
+    }
+}
+
 /// 测试/本地用内存实例工厂：task 队列语义（send 入队、poll 出队）。
 /// 生产路径全部经 `MqInstance::ffi`（插件 vtable）。
 #[cfg(test)]
@@ -470,6 +479,23 @@ mod js_global_tests {
             "const k = Kafka(\"default\"); json.ok(k === Kafka(\"default\") && typeof k.send === \"function\");")
             .await;
         assert!(out.contains("true"), "{out}");
+    }
+
+    /// tasks.sleep：任务等待原语（本 runtime 无 timer 全局；broker 无关任务循环的
+    /// 合法睡眠）。await 后正常 resolve（run_with 经典 script：顶层只能 async IIFE）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_tasks_sleep_when_awaited_then_resolves() {
+        let t0 = std::time::Instant::now();
+        let out = run(
+            None,
+            "(async () => { await tasks.sleep(30); json.ok(typeof tasks.stopping === \"function\"); })()",
+        )
+        .await;
+        assert!(out.contains("true"), "{out}");
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(25),
+            "sleep too short"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

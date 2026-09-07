@@ -120,6 +120,17 @@ broker:
   # brokers: ["127.0.0.1:9092"]
 blob:
   # 可选：对象存储（driver local/s3，s3 需 oj-blob-s3 插件；完整键见 sample/config.yaml）
+kafkas:                       # 可选：命名 Kafka 实例（v0.1.6），需 oj-bus-kafka 插件
+  # default:
+  #   brokers: ["127.0.0.1:9092"]   # 值 JSON 原样透传插件
+  #   group: "sample"               # 消费组（任务 poll/commit 用）
+rabbits:                      # 可选：命名 RabbitMQ 实例（v0.1.6），需 oj-bus-rabbitmq 插件
+  # default:
+  #   url: "amqp://guest:guest@127.0.0.1:5672"
+tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默认值（目录不存在 = 无任务）
+  # dir: "tasks"              # 任务池目录（相对 API 目录：dev=src/、release=dist/；oj build 镜像）
+  # max: 64                   # 任务数上限（超出拒启；每任务=1 线程+1 V8 runtime）
+  # stop_grace_secs: 30       # 停机宽限：flag 置位后任务自然收场的窗口，到期看门狗强杀
 # tenant:                    # 可选：多租户头（缺段 = 不启用）
 #   enable: true             # 启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
 #   header_key: "X-TENANT-ID"
@@ -154,6 +165,16 @@ blob:
   布局与升级回滚见 `dev-guide.md` §13、`plugin-development.md`。
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
   （未装 → "unknown broker kind"）。
+- `kafkas:` / `rabbits:`：命名 MQ 实例（v0.1.6），键 = 实例名 → `Kafka("name")` /
+  `RabbitMQ("name")`；值 JSON 原样透传给 oj-bus-kafka / oj-bus-rabbitmq 插件（kind 由
+  装配层按段注入，插件不符即拒装）。段缺失 = 不启用（`Kafka(...)` 返回 `undefined`）。
+  消费方法仅任务上下文可用；任务写法与生命周期见 `devkit/api-manual.md` §6
+  「命名 MQ 客户端与长任务」。
+- `tasks:`：长任务池（v0.1.6）。`dir` 相对 API 目录（dev=`src/tasks`、release=`dist/tasks`，
+  `oj build` 自动转译镜像），文件命名 `task_{name}.*` / `{name}_task.*`（递归扫描，其余
+  文件是共享库）；每任务一条专用线程 + 独立 V8 runtime，异常退出指数退避重启；停机
+  序列 SIGINT/SIGTERM → `tasks.stopping()` 置位 → `stop_grace_secs` 宽限 → 看门狗强杀
+  → HTTP 排空 → 退出。启动/重启/停机逐条落日志。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
 - `server.app_path`（CLI `--app-path` 覆盖）：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
