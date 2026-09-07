@@ -159,7 +159,8 @@ struct PollReq {
     topics: Vec<String>,
     #[serde(default = "d_max")]
     max: usize,
-    #[serde(default = "d_timeout")]
+    // JS 面是 camelCase（timeoutMs）——rename 对齐；alias 兼容 snake_case 直调。
+    #[serde(rename = "timeoutMs", alias = "timeout_ms", default = "d_timeout")]
     timeout_ms: u64,
 }
 fn d_max() -> usize {
@@ -586,6 +587,22 @@ oj_plugin_ffi::oj_plugin_entry!(init, bus => &VTABLE, mq => oj_plugin_ffi::axis:
 
 #[cfg(test)]
 mod tests {
+    /// timeoutMs（camelCase JS 面）必须真正生效——评审 must-fix：此前 serde 静默丢弃。
+    #[test]
+    fn poll_req_accepts_js_camel_case_timeout() {
+        let req: PollReq =
+            serde_json::from_value(serde_json::json!({ "topics": ["t"], "timeoutMs": 1234 }))
+                .unwrap();
+        assert_eq!(req.timeout_ms, 1234);
+        // 缺省回落 d_timeout；snake alias 兼容。
+        let d: PollReq = serde_json::from_value(serde_json::json!({ "topics": ["t"] })).unwrap();
+        assert_eq!(d.timeout_ms, d_timeout());
+        let a: PollReq =
+            serde_json::from_value(serde_json::json!({ "topics": ["t"], "timeout_ms": 77 }))
+                .unwrap();
+        assert_eq!(a.timeout_ms, 77);
+    }
+
     use super::*;
 
     // ---- mq 面（TDD 先行用例；实现见 KafkaCore / MQ_VTABLE）----

@@ -274,29 +274,19 @@ pub enum TaskExit {
 }
 
 impl Bridge {
-    /// 任务常驻驱动（spec §6，评审 F3+F5）：ESM side-module 加载任务文件（走统一转译
-    /// 管线 + 相对导入），先 mod_evaluate 再驱动 event loop；不武装 handler 超时。
+    /// 任务常驻驱动（spec §6，评审 F3+F5）：任务文件**一律按 ESM side-module 加载**
+    ///（不走 looks_cjs 启发式——无 import/export 的任务文件、release minify 后无空格的
+    /// import 都会被它误伤），先 mod_evaluate 再驱动 event loop；不武装 handler 超时。
     /// flag 置位 → 任务循环检测退出（TLA 自然完成）；grace 到期仍不退 → 看门狗线程
     /// 跨线程 terminate_execution（紧 JS 循环会饿死本线程的协作式 select，只能靠它）
     /// → 再兜一轮 event loop → 丢弃 runtime（不归还池）。
-    /// CJS 风格任务文件（无 ESM 标记 + 顶层 await）→ 可诊断的 Crashed（评审 F3）。
+    /// CJS 写法（require/module.exports）在 ESM 语义下自然 ReferenceError → Crashed。
     pub async fn run_task(
         &self,
         path: &std::path::Path,
         flag: Arc<AtomicBool>,
         grace: std::time::Duration,
     ) -> TaskExit {
-        // ESM 标记检查在原始源码上做（转译可能吞掉空 `export {}`）。
-        let raw = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => return TaskExit::Crashed(format!("task read: {e}")),
-        };
-        if module_loader::looks_cjs(&raw) {
-            return TaskExit::Crashed(
-                "task file looks like CJS but uses top-level await; add an ESM marker                  (e.g. first line `export {};`) — task files are ES modules"
-                    .to_string(),
-            );
-        }
         let src = match transpile::cached_transpile(path) {
             Ok(s) => s,
             Err(e) => return TaskExit::Crashed(format!("task compile: {e}")),

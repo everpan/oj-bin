@@ -780,8 +780,15 @@ export {};
 const k = Kafka("default");
 while (!tasks.stopping()) {
   const { messages } = await k.poll(["orders"], { max: 100, timeoutMs: 1000 });
-  for (const m of messages) { /* 业务处理（幂等） */ }
-  if (messages.length) await k.commit(messages[messages.length - 1]);
+  // commit(offset+1) 只推进该消息所在分区——多分区主题必须按分区各提交一次
+  // （取该分区最大 offset 的消息提交），只提交最后一条会丢其余分区的进度。
+  const deepest = new Map(); // partition → 该分区最深的消息
+  for (const m of messages) {
+    /* 业务处理（幂等） */
+    const cur = deepest.get(m.partition);
+    if (!cur || m.offset > cur.offset) deepest.set(m.partition, m);
+  }
+  for (const m of deepest.values()) await k.commit(m);
 }
 ```
 
@@ -808,6 +815,8 @@ while (!tasks.stopping()) {
 - **崩溃自动重启**：异常退出按 1s→2s→4s…（cap 60s）退避重启，成功运行 ≥60s 归零；
   启动/重启/停机逐条落日志（`task: <name> … → started / stopped / crashed`）。
 - **热重载无**：改任务文件需重启进程（转译缓存按 mtime 自动失效）。
+- **消费会话 topic 固化**：kafka 首次 `poll` 按当时的 topics 建立订阅，其后换
+  topics 被忽略（会话不重建）；需换主题就换实例名。
 - 与 `bus.*` 的关系：`bus` 是进程内/分布式**广播**（fire-and-forget），MQ 客户端是
   **持久队列消费**（有 offset/ack 语义）。需要可靠逐条消费用后者。
 

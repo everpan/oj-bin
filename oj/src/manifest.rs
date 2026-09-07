@@ -75,7 +75,8 @@ pub fn save_lock(
 }
 
 /// 加载 dir 首层全部模块清单并校验 name==目录名。
-pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
+/// `skip`：保留目录名（如 tasks.dir 的任务池——非模块）；None = 不跳过。
+pub fn load_modules(dir: &Path, skip: Option<&str>) -> Result<Vec<Manifest>, String> {
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -89,9 +90,9 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
             continue;
         }
         let dirname = e.file_name().to_string_lossy().into_owned();
-        // 保留目录：长任务池（spec 2026-09-07 §6/T10）——非模块，由 tasks 监督器/
+        // 保留目录（任务池，spec 2026-09-07 §6/T10）——非模块，由 tasks 监督器/
         // build 镜像单独处理；其余目录缺 manifest.yaml 仍是错误。
-        if dirname == "tasks" {
+        if Some(dirname.as_str()) == skip {
             continue;
         }
         let mf = p.join("manifest.yaml");
@@ -117,7 +118,9 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
 /// {m: v} → `<dir>/<m>-<v>/`。返回 (模块名, 模块目录)，按模块名排序。
 pub fn discover(dir: &Path, ts: bool) -> Result<Vec<(String, std::path::PathBuf)>, String> {
     if ts {
-        let mut out: Vec<_> = load_modules(dir)?
+        // 任务池保留目录按约定默认跳过（tasks.dir 改名 + migrate 的组合不识别——
+        // build/serve 路径已按配置名跳过；ponytail: 命名场景把 migrate 也接配置再补）。
+        let mut out: Vec<_> = load_modules(dir, Some("tasks"))?
             .into_iter()
             .map(|m| {
                 let p = dir.join(&m.name);
@@ -177,7 +180,7 @@ mod tests {
             d.0.join("user/manifest.yaml"),
             "name: user\ndesc: d\nversion: 0.1.0\n",
         );
-        let ms = load_modules(&d.0).unwrap();
+        let ms = load_modules(&d.0, None).unwrap();
         assert_eq!(ms[0].name, "user");
 
         let bad = tmp("mf-bad");
@@ -185,12 +188,12 @@ mod tests {
             bad.0.join("order/manifest.yaml"),
             "name: orderr\ndesc: d\nversion: 0.1.0\n",
         );
-        let e = load_modules(&bad.0).unwrap_err();
+        let e = load_modules(&bad.0, None).unwrap_err();
         assert!(e.contains("orderr") && e.contains("order"), "{e}");
 
         let none = tmp("mf-none");
         write(none.0.join("x/keep.txt"), "");
-        let e2 = load_modules(&none.0).unwrap_err();
+        let e2 = load_modules(&none.0, None).unwrap_err();
         assert!(e2.contains("manifest.yaml"), "{e2}");
     }
 

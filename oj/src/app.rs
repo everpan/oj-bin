@@ -501,7 +501,7 @@ impl App {
         }
         // 路由表：dev 启动内省 .route 声明；release 聚合 dist/manifests.yaml。
         let (table, failures) = if ts {
-            for m in manifest::load_modules(&dir)? {
+            for m in manifest::load_modules(&dir, Some(&cfg.tasks.dir))? {
                 eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
             }
             routes::RouteTable::build(

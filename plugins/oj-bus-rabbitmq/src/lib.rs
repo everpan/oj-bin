@@ -115,7 +115,8 @@ struct PollReq {
     queues: Vec<String>,
     #[serde(default = "d_max")]
     max: usize,
-    #[serde(default = "d_timeout")]
+    // JS 面是 camelCase（timeoutMs）——rename 对齐；alias 兼容 snake_case 直调。
+    #[serde(rename = "timeoutMs", alias = "timeout_ms", default = "d_timeout")]
     timeout_ms: u64,
 }
 fn d_max() -> usize {
@@ -239,6 +240,10 @@ impl MqInstance {
                     Ok(None) => { /* 该队列空，继续下一队列 */ }
                     Err(e) => return Err(format!("rabbitmq get {queue}: {e}")),
                 }
+            }
+            // 整轮全空 → 小睡再战（审查 #5：空轮间热旋转打 AMQP RPC 烧 broker/网络）。
+            if msgs.is_empty() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
         Ok(serde_json::json!({ "messages": msgs })
@@ -501,7 +506,7 @@ extern "C" fn mq_call(handle: u64, method: RString, payload: RString) -> FfiFutu
                 // rabbit 无集群 metadata 概览 API 的轻量面：kind + 连接 URL 掩码。
                 // 返回固定形状即可（可选 method，spec §5）。
                 "metadata" => Ok(
-                    serde_json::json!({ "kind": "rabbit", "url": inst.core.url })
+                    serde_json::json!({ "kind": "rabbit", "url": mask_url(&inst.core.url) })
                         .to_string()
                         .into_bytes(),
                 ),
@@ -509,6 +514,21 @@ extern "C" fn mq_call(handle: u64, method: RString, payload: RString) -> FfiFutu
             }
         })
     })
+}
+
+/// 掩去 URL userinfo（amqp://user:pass@host → amqp://user:***@host；无 userinfo 原样）。
+/// metadata() 对外可见，密码不得回显（审查 #12）。
+fn mask_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((userinfo, host)) => {
+                let user = userinfo.split(':').next().unwrap_or("");
+                format!("{scheme}://{user}:***@{host}")
+            }
+            None => url.to_string(),
+        },
+        None => url.to_string(),
+    }
 }
 
 extern "C" fn mq_close(handle: u64) {
@@ -588,6 +608,29 @@ oj_plugin_ffi::oj_plugin_entry!(init, bus => &VTABLE, mq => oj_plugin_ffi::axis:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mask_url_hides_password_keeps_plain() {
+        assert_eq!(mask_url("amqp://u:p@h:1/v"), "amqp://u:***@h:1/v");
+        assert_eq!(mask_url("amqp://h:1"), "amqp://h:1");
+        assert_eq!(mask_url("bad"), "bad");
+    }
+
+    /// timeoutMs（camelCase JS 面）必须真正生效——评审 must-fix：此前 serde 静默丢弃。
+    #[test]
+    fn poll_req_accepts_js_camel_case_timeout() {
+        let req: PollReq =
+            serde_json::from_value(serde_json::json!({ "queues": ["q"], "timeoutMs": 1234 }))
+                .unwrap();
+        assert_eq!(req.timeout_ms, 1234);
+        // 缺省回落 d_timeout；snake alias 兼容。
+        let d: PollReq = serde_json::from_value(serde_json::json!({ "queues": ["q"] })).unwrap();
+        assert_eq!(d.timeout_ms, d_timeout());
+        let a: PollReq =
+            serde_json::from_value(serde_json::json!({ "queues": ["q"], "timeout_ms": 77 }))
+                .unwrap();
+        assert_eq!(a.timeout_ms, 77);
+    }
+
     use super::*;
 
     // ---- mq 面（TDD 先行用例）----

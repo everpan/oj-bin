@@ -171,7 +171,14 @@ fn task_loop(
             "task: {name} crashed, restart in {}s (attempt {attempt}) [{exit:?}]",
             backoff.as_secs().max(1)
         );
-        std::thread::sleep(backoff);
+        // 切片睡眠：退避期间停机 flag 置位即提前醒来（shutdown join 不被 60s cap 拖住，
+        // 审查 #6）；醒来后 run_task 对已置位 flag 立即 Stopped 收场。
+        let mut left = backoff;
+        while left > Duration::ZERO && !flag.load(Ordering::Relaxed) {
+            let step = left.min(Duration::from_millis(100));
+            std::thread::sleep(step);
+            left = left.saturating_sub(step);
+        }
         backoff = backoff.saturating_mul(2).min(Duration::from_secs(60));
     }
 }

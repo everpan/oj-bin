@@ -297,7 +297,7 @@ interface OjMqMessage {
   value: any;
   headers?: Record<string, string>;
   ts?: number;
-  deliveryTag?: number; // rabbit 专属：ack/nack 载荷原样回传
+  delivery_tag?: number; // rabbit 专属：ack/nack 载荷原样回传
 }
 
 interface OjKafkaClient {

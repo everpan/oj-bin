@@ -19,6 +19,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         .map_err(|e| format!("src dir '{}': {e}", a.dir))?;
     let out = PathBuf::from(&a.out);
     // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
+    let tasks_dir = tasks_dir_of(&a.config);
     let mut view = crate::manifest::load_lock(&out.join("manifests.yaml"))?;
     let mut names: Vec<String> = match &a.module {
         Some(m) => {
@@ -33,7 +34,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             view.insert(m.clone(), crate::manifest::parse_one(&mf)?.version);
             vec![m.clone()]
         }
-        None => crate::manifest::load_modules(&src)?
+        None => crate::manifest::load_modules(&src, Some(&tasks_dir))?
             .into_iter()
             .map(|m| {
                 view.insert(m.name.clone(), m.version);
@@ -60,7 +61,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         build_one(&src, &out, name, &view, a.minify).await?;
     }
     // tasks 目录转译镜像（T10，评审 F2）：非版本化资产，不进锁/tgz。
-    mirror_tasks(&src, &out, &tasks_dir_of(&a.config), a.minify)?;
+    mirror_tasks(&src, &out, &tasks_dir, a.minify)?;
     println!("oj build: {} module(s) → {}", names.len(), out.display());
     Ok(())
 }

@@ -160,8 +160,6 @@ pub(crate) async fn await_ffi(fut: FfiFuture) -> Result<Vec<u8>, String> {
 
 /// mq 长轮询版 await_ffi：Pending 时 sleep 退避（评审 F4——yield_now 空转烧满一核）。
 /// 其余语义（take→free→Guard Drop 只 free 不 take）与 await_ffi 完全一致。
-// 暂无生产调用方：P3 的 FfiMqInstance（Task 5）接入；先落地并有独立测试锁定语义。
-#[allow(dead_code)]
 pub(crate) async fn await_ffi_poll(
     fut: FfiFuture,
     backoff: std::time::Duration,

@@ -33,6 +33,18 @@ pub struct MqInstance {
     pub call: MqCall,
     /// 单活跃 poller 互斥（评审 M2；构造时建）。
     pub poller: tokio::sync::Mutex<()>,
+    /// Drop 兜底 close（spec §6 ④；ffi 构造的实例持有）：释放插件侧消费会话
+    /// （kafka 离开消费组 / rabbit ackers drop）。注册表随进程存活，Drop 在
+    /// 进程收尾触发——正常路径的显式 close 是 JS 侧职责，此为兜底。
+    pub(crate) closer: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Drop for MqInstance {
+    fn drop(&mut self) {
+        if let Some(close) = self.closer.take() {
+            close();
+        }
+    }
 }
 
 impl MqInstance {
@@ -41,6 +53,7 @@ impl MqInstance {
             kind,
             call,
             poller: tokio::sync::Mutex::new(()),
+            closer: None,
         }
     }
 
@@ -90,7 +103,9 @@ impl MqInstance {
                     .map_err(|e| format!("mq {kind}: bad result json: {e}").into())
             })
         });
-        Self::new(kind, call)
+        let mut inst = Self::new(kind, call);
+        inst.closer = Some(Arc::new(move || (vt.close)(handle)));
+        inst
     }
 }
 
@@ -238,6 +253,22 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+
+    /// Drop 兜底 close（spec §6 ④，评审统一审查 #3）：实例释放必须调一次 close。
+    #[test]
+    fn given_ffi_instance_when_dropped_then_close_invoked_once() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let mut inst = in_memory("kafka", queue);
+        inst.closer = Some({
+            let n = n.clone();
+            Arc::new(move || {
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        drop(inst);
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     pub(crate) fn registry_with(name: &str, kind: &'static str) -> Arc<NamedRegistry<MqInstance>> {
         let mut reg = NamedRegistry::new();
@@ -632,11 +663,9 @@ mod task_driver_tests {
     async fn given_cjs_style_task_when_run_then_crashed_with_guidance() {
         let dir = std::env::temp_dir().join(format!("ojtaskj-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = write_task(
-            &dir,
-            "task_cjs.ts",
-            "while (!tasks.stopping()) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 30 }); }\n",
-        );
+        // 真 CJS 写法（module.exports）按 ESM 加载 → 自然 ReferenceError → Crashed
+        // （spec F3：一律按 ESM 加载，不走 looks_cjs 启发式；失败仍可诊断）。
+        let path = write_task(&dir, "task_cjs.js", "module.exports = { run() {} };\n");
         let b = task_bridge(&dir);
         let out = b
             .run_task(
@@ -646,7 +675,7 @@ mod task_driver_tests {
             )
             .await;
         assert!(
-            matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("ESM")),
+            matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("module")),
             "{out:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

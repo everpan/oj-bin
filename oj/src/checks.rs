@@ -359,7 +359,7 @@ mod tests {
     }
 
     fn names(src: &Path) -> Vec<String> {
-        manifest::load_modules(src)
+        manifest::load_modules(src, None)
             .unwrap()
             .into_iter()
             .map(|m| m.name)
