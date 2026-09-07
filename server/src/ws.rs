@@ -40,8 +40,8 @@ pub fn js_route(
     )
 }
 
-/// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/WS.ts（优先）/WS.js → GET {base}/<dir>/ws；
-/// 根级 WS.ts → {base}/ws；无 WS 文件返回空 Router（merge 无副作用）。
+/// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/ws.ts（优先）/ws.js → GET {base}/<dir>/ws；
+/// 根级 ws.ts → {base}/ws；无 WS 文件返回空 Router（merge 无副作用）。
 /// release 下 root=dist，URL 含模块版本段（news-0.1.0/ws）——v0.2 已知限制，见 user-manual。
 pub fn mirror_routes(
     base: &str,
@@ -59,14 +59,14 @@ pub fn mirror_routes(
             .and_then(|p| p.strip_prefix(root).ok())
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        // rel 为空 = 根级 WS.ts → {base}/ws（不得拼成 {base}//ws 双斜杠）。
+        // rel 为空 = 根级 ws.ts → {base}/ws（不得拼成 {base}//ws 双斜杠）。
         let path = if rel.is_empty() {
             format!("{base}ws")
         } else {
             format!("{base}{rel}/ws")
         };
         if !seen.insert(path.clone()) {
-            continue; // 同目录 WS.ts 与 WS.js 并存：先到者（.ts）胜
+            continue; // 同目录 ws.ts 与 ws.js 并存：先到者（.ts）胜
         }
         let m = make.clone();
         router = router.merge(js_route(&path, file, timeout, move || m()));
@@ -74,12 +74,12 @@ pub fn mirror_routes(
     router
 }
 
-/// root 下全部 WS 处理器：WS.ts 全部在前（优先），WS.js 在后；各自排序保证注册序确定。
+/// root 下全部 WS 处理器：ws.ts 全部在前（优先），ws.js 在后；各自排序保证注册序确定。
 fn ws_files(root: &Path) -> Vec<PathBuf> {
     let mut ts = Vec::new();
-    crate::routes::walk_files(root, "WS.ts", &mut ts);
+    crate::routes::walk_files(root, "ws.ts", &mut ts);
     let mut js = Vec::new();
-    crate::routes::walk_files(root, "WS.js", &mut js);
+    crate::routes::walk_files(root, "ws.js", &mut js);
     ts.sort();
     js.sort();
     ts.extend(js);
@@ -144,7 +144,7 @@ async fn frame_loop(
     timeout: std::time::Duration,
     make: Arc<dyn Fn() -> Bridge + Send + Sync>,
 ) {
-    // 统一转译管线：WS.ts 类型标注可用（.js 原样），mtime 缓存与模块加载共享。
+    // 统一转译管线：ws.ts 类型标注可用（.js 原样），mtime 缓存与模块加载共享。
     let source = match only_js::bridge::transpile::cached_transpile(&handler_file) {
         Ok(s) => s,
         Err(e) => {
@@ -313,7 +313,7 @@ mod tests {
             "function post() { bus.publish(\"news\", { a: 1 }); json.ok({ sent: 1 }); }\n\
              export default { post };\n",
         )]);
-        let handler = t.0.join("WS.js");
+        let handler = t.0.join("ws.js");
         std::fs::write(&handler, r#"bus.subscribe("news"); json.ok({ sub: 1 });"#).unwrap();
         let bus = Arc::new(Bus::new());
         let root = t.0.clone();
@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn js_route_runs_handler_per_frame() {
         let t = crate::tests::routes(&[]);
-        let handler = t.0.join("WS.js");
+        let handler = t.0.join("ws.js");
         std::fs::write(&handler, r#"json.ok({ pong: true });"#).unwrap();
         let addr = spawn(
             app(
@@ -468,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn js_route_ws_send_order_and_close() {
         let t = crate::tests::routes(&[]);
-        let handler = t.0.join("WS.js");
+        let handler = t.0.join("ws.js");
         std::fs::write(
             &handler,
             r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#,
@@ -512,9 +512,9 @@ mod tests {
         );
     }
 
-    /// 生产挂载（与 oj server 装配同构）：<root>/<dir>/WS.ts 目录镜像 → GET {base}/<dir>/ws；
+    /// 生产挂载（与 oj server 装配同构）：<root>/<dir>/ws.ts 目录镜像 → GET {base}/<dir>/ws；
     /// app().merge(mirror_routes())，WS 工厂与 actor 共享 Bus → HTTP publish 广播到订阅连接。
-    /// WS.ts 经统一转译管线（类型标注可用）。
+    /// ws.ts 经统一转译管线（类型标注可用）。
     #[tokio::test]
     async fn mirror_routes_mount_directory_ws() {
         use crate::actor::JsActor;
@@ -527,7 +527,7 @@ mod tests {
                  export default { post };\n",
             ),
             (
-                "news/WS.ts",
+                "news/ws.ts",
                 "const n: number = 1;\nbus.subscribe(\"news\");\njson.ok({ sub: n });\n",
             ),
         ]);
@@ -592,13 +592,13 @@ mod tests {
         );
     }
 
-    /// 根级 WS.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
+    /// 根级 ws.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
     #[tokio::test]
     async fn mirror_routes_root_ws() {
         use crate::actor::JsActor;
         use only_js::bridge::{Extras, SchemaRegistry};
         use std::collections::HashMap;
-        let t = crate::tests::routes(&[("WS.ts", "json.ok({ root: true });\n")]);
+        let t = crate::tests::routes(&[("ws.ts", "json.ok({ root: true });\n")]);
         let make = move || {
             Bridge::with_dbs_and_loader(
                 HashMap::new(),
@@ -686,5 +686,110 @@ mod tests {
             ),
         };
         assert!(clean, "expected close or reset, got {res:?}");
+    }
+
+    /// 帧内 bus.publish（教学案例 sample/src/news/chat/ws.ts 的回归钉）：
+    /// 连接 A 订阅后，连接 B 发 {"text":..} 帧 → B 的帧内 publish → A 收广播帧，
+    /// B 自己（同主题订阅）也自收（自回声）。同时验证：
+    /// 1) publish 无上下文限制（fire-and-forget，不 await 也照常广播——
+    ///    run_event_loop 会把 op future 驱动完才捕获信封）；
+    /// 2) 帧代码经典 script 重跑安全：声明在块作用域内，第二帧不报重复声明；
+    /// 3) http.body 对 JSON 文本帧自动 parse 成对象。
+    #[tokio::test]
+    async fn ws_frame_publish_broadcasts_to_subscribers() {
+        use crate::actor::JsActor;
+        use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[
+            ("news/api.ts", "export default {};\n"),
+            (
+                "news/ws.ts",
+                r#"bus.subscribe("chat");
+{
+  const frame = http.body;
+  if (frame && frame.text) {
+    bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+    json.ok({ sent: true });
+  } else {
+    json.ok({ joined: true });
+  }
+}
+"#,
+            ),
+        ]);
+        let bus = Arc::new(Bus::new());
+        let root = t.0.clone();
+        let bus2 = bus.clone();
+        let make = move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus2.clone()),
+                    ..Default::default()
+                },
+            )
+        };
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                JsActor::pool(1, make.clone()),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(mirror_routes(
+                "/v1/api",
+                &t.0,
+                std::time::Duration::from_secs(2),
+                make,
+            )),
+        )
+        .await;
+
+        let broadcast = serde_json::json!({
+            "topic": "chat",
+            "data": {"from": "anon", "text": "hi"}
+        });
+        // 连接 A 进房（订阅在帧内完成）
+        let mut a = WsClient::connect(addr, "/v1/api/news/ws").await;
+        a.send_text("join").await;
+        assert!(a.read_text().await.contains("\"joined\":true"), "a join");
+        // 连接 B 进房后发聊天帧（JSON 文本 → http.body 自动 parse）
+        let mut b = WsClient::connect(addr, "/v1/api/news/ws").await;
+        b.send_text("join").await;
+        assert!(b.read_text().await.contains("\"joined\":true"), "b join");
+        b.send_text(r#"{"text":"hi"}"#).await;
+        // A 只会收到一条：广播帧（fire-and-forget publish 照常投递）
+        let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+        assert_eq!(v, broadcast, "a receives broadcast");
+        // B 收两条：回执信封 + 自己的广播（自回声），顺序不保证（Processor vs forwarder）
+        let f1 = c_frame(&mut b).await;
+        let f2 = c_frame(&mut b).await;
+        let frames = [f1, f2];
+        let got_broadcast = frames.contains(&broadcast);
+        let got_envelope = frames
+            .iter()
+            .any(|f| f["data"]["sent"] == serde_json::Value::Bool(true));
+        assert!(got_broadcast, "b self-echo broadcast");
+        assert!(got_envelope, "b envelope");
+    }
+
+    /// 读一帧并 parse 成 JSON（测试辅助）。
+    async fn c_frame(c: &mut WsClient) -> serde_json::Value {
+        serde_json::from_str(&c.read_text().await).unwrap()
     }
 }

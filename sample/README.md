@@ -23,7 +23,7 @@
   `_oj_migrations（module 列区分模块）`）；`seed.sql` 为幂等参考数据随启动重放；
   `fixtures/` 仅 `oj test` / `oj fixture` 灌入。`server.migrate_on_start`：
   auto（dev 默认）| verify（release 默认，账本落后拒启）| off
-- WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/WS.ts 订阅 news），
+- WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/ws.ts 订阅 news），
   再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧
 - config.yaml `server.app_path: dist`（CLI `--app-path` 可覆盖）：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
   /user-0.1.0.tgz 可直接访问；dist 无 index.html 故 / 为 404）

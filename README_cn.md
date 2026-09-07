@@ -123,12 +123,12 @@ sample/src/
     _shared/validate.ts      # 下划线前缀 = 私有，不成路由
   news/
     api.ts                   → /v1/api/news
-    WS.ts                    → /v1/api/news/ws          （WebSocket）
+    ws.ts                    → /v1/api/news/ws          （WebSocket）
 ```
 
 - **路径参数**：给 handler 挂 `.route` 即可替换目录镜像——
   `detail.route = "{id}"` 使 `/v1/api/user/item/{id}` 可达（此时 `/v1/api/user/item` 为 404）。
-- **WebSocket**：`WS.ts` 每收到一个文本帧执行一次。首帧 `bus.subscribe("news")` 订阅主题后，
+- **WebSocket**：`ws.ts` 每收到一个文本帧执行一次。首帧 `bus.subscribe("news")` 订阅主题后，
   任意 handler（含其它实例）的 `bus.publish("news", ...)` 都会广播到该连接。
 - **前缀**：`/v1/api` 来自 config 的 `server.base`，可用 `-b` 覆盖。
 

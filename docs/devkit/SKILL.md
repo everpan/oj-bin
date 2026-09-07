@@ -1,6 +1,6 @@
 ---
 name: oj-api-dev
-description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / WS.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、oj test。
+description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、oj test。
 ---
 
 # oj API 模块开发

@@ -139,13 +139,13 @@ sample/src/
     _shared/validate.ts      # leading underscore = private, not a route
   news/
     api.ts                   → /v1/api/news
-    WS.ts                    → /v1/api/news/ws          (WebSocket)
+    ws.ts                    → /v1/api/news/ws          (WebSocket)
 ```
 
 - **Path params**: attach `.route` to a handler to override the directory mirror —
   `detail.route = "{id}"` makes `/v1/api/user/item/{id}` reachable (and `/v1/api/user/item`
   returns 404 in that case).
-- **WebSocket**: `WS.ts` is executed once per received text frame. After the first frame does
+- **WebSocket**: `ws.ts` is executed once per received text frame. After the first frame does
   `bus.subscribe("news")`, any handler's `bus.publish("news", ...)` — including from other
   instances — broadcasts to that connection.
 - **Prefix**: `/v1/api` comes from config `server.base`, overridable with `-b`.

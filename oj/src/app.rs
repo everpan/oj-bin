@@ -505,7 +505,7 @@ impl App {
             max_upload: cfg.server.max_upload_bytes,
             blob: blob.clone(),
         };
-        // WS 目录镜像挂载（<dir>/WS.ts → {base}/<dir>/ws）。
+        // WS 目录镜像挂载（<dir>/ws.ts → {base}/<dir>/ws）。
         let ws_router = ws::mirror_routes(
             &base,
             &dir,

@@ -172,7 +172,7 @@ handler 是 ESM 源码（dev 模式 `.ts` 按需转译，release 模式服务 `o
 参数段不得混字面，`{*path}` 至少匹配一段）。handler **必须调用一次** `json.ok` / `json.fail` /
 `finish` 才能完成会话；顶层可直接 `await`（event loop 由 driver 泵至 Promise 落定）。
 
-同目录可放 `WS.ts` 产生一条 WebSocket 路由：连接升级后**客户端每个文本帧执行一次本文件**，
+同目录可放 `ws.ts` 产生一条 WebSocket 路由：连接升级后**客户端每个文本帧执行一次本文件**，
 帧内 `json.ok` 正常回信封；`bus.subscribe` 只在 WS 帧内有意义。
 
 JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签名以

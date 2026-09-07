@@ -3,7 +3,7 @@
 适用版本：API 面 v0.2（二进制版本号见 `oj/Cargo.toml`）
 
 本手册面向**用 oj 框架开发业务项目**的开发者与 AI agent：如何组织模块、编写
-`api.ts` / `WS.ts` handler、使用注入的全局对象、写测试、配服务、构建发布与日常运维。
+`api.ts` / `ws.ts` handler、使用注入的全局对象、写测试、配服务、构建发布与日常运维。
 oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑以 TS handler 编写，
 运行时注入 `json` / `db` / `http` / `kv` / `blob` / `bus` / `es` 等全局对象，
 统一以 `{code,msg,data}` 信封写回 HTTP。仓库内部实现见 `docs/dev-guide.md`，
@@ -151,7 +151,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 - **首层子目录 = 模块**，每个必须有 `manifest.yaml`；缺失启动失败。
 - 任意深度的子目录放 `api.ts`（dev）/ `api.js`（release）即成为一条路由；
   没有 `api` 文件的目录不是路由，可作共享工具目录（如 `_shared/`）。
-- 同目录可放 `WS.ts` 产生一条 WebSocket 路由（第 4 章）。
+- 同目录可放 `ws.ts` 产生一条 WebSocket 路由（第 4 章）。
 
 ### manifest.yaml（模块清单）
 
@@ -362,12 +362,14 @@ export default { get: detail };
 静态站点（`server.app_path`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
-### WS.ts（WebSocket 帧循环）
+### ws.ts（WebSocket 帧循环）
 
-目录内放 `WS.ts`（dev）/ `WS.js`（release，约定同 `api.ts`）即产生一条 WebSocket 路由
-`GET {base}/{...path}/ws`：`src/news/WS.ts` → `/v1/api/news/ws`；根级 `WS.ts` → `/v1/api/ws`。
-同目录 `WS.ts` 与 `WS.js` 并存时 `.ts` 优先。连接升级后，**客户端每个文本帧执行一次本文件**
-（帧内 `json.ok` 正常回信封；摘自 `sample/src/news/WS.ts`）：
+> 系统学习（心智模型 / 实现走读 / 鉴权现状 / 测试映射）见 [../websocket.md](../websocket.md)。
+
+目录内放 `ws.ts`（dev）/ `ws.js`（release，约定同 `api.ts`）即产生一条 WebSocket 路由
+`GET {base}/{...path}/ws`：`src/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
+同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。连接升级后，**客户端每个文本帧执行一次本文件**
+（帧内 `json.ok` 正常回信封；摘自 `sample/src/news/ws.ts`）：
 
 ```ts
 bus.subscribe("news");
@@ -597,7 +599,7 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 const n = await bus.publish("news", { text: "hi" });
 json.ok({ receivers: n });
 
-// WS 订阅（WS.ts 内，见第 4 章 WS.ts 小节）
+// WS 订阅（ws.ts 内，见第 4 章 ws.ts 小节）
 bus.subscribe("news");
 ```
 
@@ -649,7 +651,7 @@ if (r.ok) {
 | `ws.send` | `send(data: string): void` | 向当前连接发一帧（HTTP 路径下 no-op） |
 | `ws.close` | `close(): void` | 结束当前连接 |
 
-仅在 `WS.ts` 帧循环内有意义（第 4 章）。
+仅在 `ws.ts` 帧循环内有意义（第 4 章）。
 
 ### plugins —— 插件自省
 

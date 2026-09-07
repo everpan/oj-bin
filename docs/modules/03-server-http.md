@@ -71,8 +71,10 @@ actor 线程内跑 `current_thread` runtime，**串行**执行 job；并发度 =
 
 ## 5. WebSocket（`ws.rs`）
 
-- `mirror_routes`（:46）：`<root>/<dir>/WS.ts`（优先）/`WS.js` → `GET {base}/<dir>/ws`；
-  根级 `WS.ts` → `{base}/ws`。⚠️ release 下 root=dist，URL 含版本段（`news-0.1.0/ws`），
+> 逐行走读与 JS 侧用法见 [../websocket.md](../websocket.md)（教学文件）。
+
+- `mirror_routes`（:46）：`<root>/<dir>/ws.ts`（优先）/`ws.js` → `GET {base}/<dir>/ws`；
+  根级 `ws.ts` → `{base}/ws`。⚠️ release 下 root=dist，URL 含版本段（`news-0.1.0/ws`），
   v0.2 已知限制。
 - 每连接独占一个 VM（不进 HTTP 池），整个连接搬到专用 OS 线程；
   Reader / Processor（串行 JS）/ Writer 三任务流水线，`msgChan`/`respChan` 各 cap 64（背压）。

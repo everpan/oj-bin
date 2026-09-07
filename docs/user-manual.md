@@ -537,9 +537,9 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法�
 
 ### 订阅发布总线（bus）与 KV/ES（v0.2）
 
-**WS 目录镜像**：目录内放 `WS.ts`（dev）/ `WS.js`（release，同 `api.ts` 约定）即产生一条 WebSocket
-路由 `GET {base}/{...path}/ws`——`<root>/news/WS.ts` → `/v1/api/news/ws`；根级 `WS.ts` → `/v1/api/ws`。
-同目录 `WS.ts` 与 `WS.js` 并存时 `.ts` 优先。连接升级后，客户端每个文本帧执行一次本文件
+**WS 目录镜像**：目录内放 `ws.ts`（dev）/ `ws.js`（release，同 `api.ts` 约定）即产生一条 WebSocket
+路由 `GET {base}/{...path}/ws`——`<root>/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
+同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。连接升级后，客户端每个文本帧执行一次本文件
 （帧内 `json.ok` 正常回信封）。
 
 **bus**：进程内主题广播。`api.ts`（任意 HTTP 路径）`await bus.publish(topic, data)` 广播 JSON 帧
@@ -547,7 +547,7 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法�
 `bus.subscribe(topic)`（HTTP 路径调用报错，因为订阅对象是连接本身）。
 
 ```js
-// WS 会话入口（WS.ts：订阅在连接建帧时执行一次；TS 类型标注可用）
+// WS 会话入口（ws.ts：订阅在连接建帧时执行一次；TS 类型标注可用）
 bus.subscribe("news");
 json.ok({ subscribed: true });
 
@@ -561,7 +561,7 @@ export default {
 ```
 
 订阅在 WS 连接断开自动清除；同一会话重复订阅幂等去重。`bus.publish` 在无订阅时返回 0（广播消失）。
-sample 的 `sample/src/news/`（`api.ts` 发布 + `WS.ts` 订阅）是可运行的最小示例：先连
+sample 的 `sample/src/news/`（`api.ts` 发布 + `ws.ts` 订阅）是可运行的最小示例：先连
 `/v1/api/news/ws` 发任意一帧订阅，再 `POST /v1/api/news`，连接即收到 `{"topic":"news",…}` 广播帧。
 release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 已知限制。
 
