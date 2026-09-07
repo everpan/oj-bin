@@ -73,15 +73,15 @@ impl RabbitCore {
             .map_err(|e| format!("rabbitmq channel: {e}"))
     }
 
-    /// mq 面 send（payload：exchange/routingKey/value/headers；JS 层 RabbitMQ.publish）。
-    async fn send(
-        &self,
+    /// 在给定 channel 上 publish（mq 面 send；JS 层 RabbitMQ.publish——payload：
+    /// exchange/routingKey/value/headers。审查 #3：走复用 channel，不逐次新建即弃）。
+    async fn send_on(
+        channel: &lapin::Channel,
         exchange: &str,
         routing_key: &str,
         headers: &HashMap<String, String>,
         value: &Value,
     ) -> Result<Vec<u8>, String> {
-        let channel = self.channel().await?;
         let payload = value.to_string().into_bytes();
         let mut props = BasicProperties::default();
         if !headers.is_empty() {
@@ -169,6 +169,10 @@ struct MqInstance {
     poller: tokio::sync::Mutex<()>,
     /// 未确认投递：delivery_tag → Acker（ack/nack 载荷只回传 tag）。
     ackers: Mutex<HashMap<u64, Acker>>,
+    /// 复用 channel（统一审查 must-fix #3：lapin 2.5 的 Channel 无 Drop→close，
+    /// 每次 poll/send 新建即弃会泄漏连接上的 channel，最终打满 channel_max 被
+    /// broker 杀连接）。断线/失效时置 None 下次重建。
+    channel: tokio::sync::Mutex<Option<lapin::Channel>>,
 }
 
 impl MqInstance {
@@ -185,14 +189,29 @@ impl MqInstance {
             core,
             poller: tokio::sync::Mutex::new(()),
             ackers: Mutex::new(HashMap::new()),
+            channel: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// 取复用 channel：连接存活直接 clone（廉价句柄），断线/失效重建。
+    async fn reuse_channel(&self) -> Result<lapin::Channel, String> {
+        let mut g = self.channel.lock().await;
+        if let Some(ch) = g.as_ref() {
+            if ch.status().connected() {
+                return Ok(ch.clone());
+            }
+            *g = None;
+        }
+        let ch = self.core.channel().await?;
+        *g = Some(ch.clone());
+        Ok(ch)
     }
 
     /// poll：逐队列轮转 basic_get（每条一个 round-trip，评审 nit：非批量；prefetch 留升级），
     /// max 条或 timeout_ms 到期先到为准。no_ack=false → 手动 ack/nack。
     async fn poll(&self, req: PollReq) -> Result<Vec<u8>, String> {
         let _guard = self.poller.lock().await;
-        let channel = self.core.channel().await?;
+        let channel = self.reuse_channel().await?;
         let deadline = std::time::Instant::now() + Duration::from_millis(req.timeout_ms);
         let mut msgs: Vec<MqMessage> = Vec::new();
         'outer: while msgs.len() < req.max {
@@ -484,9 +503,15 @@ extern "C" fn mq_call(handle: u64, method: RString, payload: RString) -> FfiFutu
                 "send" => {
                     let req: SendPayload = serde_json::from_str(&payload[..])
                         .map_err(|e| format!("rabbitmq send: bad payload: {e}"))?;
-                    inst.core
-                        .send(&req.exchange, &req.routing_key, &req.headers, &req.value)
-                        .await
+                    let ch = inst.reuse_channel().await?;
+                    RabbitCore::send_on(
+                        &ch,
+                        &req.exchange,
+                        &req.routing_key,
+                        &req.headers,
+                        &req.value,
+                    )
+                    .await
                 }
                 "poll" => {
                     let req: PollReq = serde_json::from_str(&payload[..])

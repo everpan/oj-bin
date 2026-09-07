@@ -96,6 +96,31 @@ fn walk_ts_js(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+/// 全源引号定界扫描相对 specifier（mirror_tasks 专用，统一审查 #7）：覆盖
+/// `from "…"`、副作用 `import "…";`、`export * from "…"`、动态 `import("…")`——
+/// 行内 `from ` 口径漏前两类，release 任务运行期才炸模块解析。
+/// ponytail: 模板串/注释里长得像相对路径的字符串会误配，出现再按 AST 重写。
+fn all_relative_specifiers(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if (c == b'"' || c == b'\'')
+            && let Some(end) = src[i + 1..].find(c as char)
+        {
+            let spec = &src[i + 1..i + 1 + end];
+            if (spec.starts_with("./") || spec.starts_with("../")) && !spec.contains('\n') {
+                out.push(spec.to_string());
+            }
+            i += end + 2;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 /// tasks 池镜像（spec §6/T10）：`<src>/<tasks.dir>` → `<out>/<tasks.dir>`，递归。
 /// .ts → 转译 .js（相对 import `./x.ts` → `./x.js`）；.js → 原样转译直通；
 /// 其余扩展名跳过。目录不存在 = 跳过（空池）。
@@ -118,7 +143,7 @@ fn mirror_tasks(src: &Path, out: &Path, tasks_dir: &str, minify: bool) -> Result
         // 口径：无后缀补 .js、.ts 改 .js、.js/.mjs/.json 原样）。带引号整体替换防子串
         // 误伤（"./x" 是 "./x.ts" 的前缀）。
         let mut js = js;
-        for spec in relative_import_specifiers(&js) {
+        for spec in all_relative_specifiers(&js) {
             let new = if let Some(stem) = spec.strip_suffix(".ts") {
                 Some(format!("{stem}.js"))
             } else if !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json")
@@ -783,9 +808,10 @@ mod tests {
         std::fs::create_dir_all(t.join("src/tasks/_shared")).unwrap();
         std::fs::write(
             t.join("src/tasks/task_demo.ts"),
-            "import { tick } from \"./_shared/tick\";\nconst n: number = 1;\nwhile (true) { await Promise.resolve(tick(n)); }\n",
+            "import { tick } from \"./_shared/tick\";\nimport \"./_shared/side\";\nconst n: number = 1;\nwhile (true) { await Promise.resolve(tick(n)); }\n",
         )
         .unwrap();
+        std::fs::write(t.join("src/tasks/_shared/side.ts"), "export {};\n").unwrap();
         std::fs::write(
             t.join("src/tasks/_shared/tick.ts"),
             "export function tick(n: number): number { return n; }\n",
@@ -794,7 +820,10 @@ mod tests {
         run(&build_args(&t, None)).await.unwrap();
         let demo = std::fs::read_to_string(t.join("dist/tasks/task_demo.js")).unwrap();
         assert!(demo.contains("const n=1"), "{demo}"); // 类型已剥（转译产物，默认 minify）
-        assert!(demo.contains("\"./_shared/tick.js\""), "{demo}"); // 相对 import 已补 .js 后缀
+        assert!(
+            demo.contains("\"./_shared/tick.js\"") && demo.contains("\"./_shared/side.js\""),
+            "{demo}"
+        ); // 具名 + 副作用 import 均已补 .js 后缀（审查 #7）
         assert!(
             std::fs::read_to_string(t.join("dist/tasks/_shared/tick.js"))
                 .unwrap()

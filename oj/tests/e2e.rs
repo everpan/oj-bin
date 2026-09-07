@@ -556,3 +556,120 @@ async fn uc12_timeout_408_server_survives() {
     assert_eq!(v["data"]["alive"], true, "{v}");
     let _ = std::fs::remove_dir_all(&t);
 }
+
+/// 统一审查 #8（spec §8）：进程级停机 e2e——拉起 oj server 子进程，观察长任务
+/// 启动日志 → SIGTERM → 任务在 grace 内自然收场 → HTTP 排空 → 进程退出。
+/// 子进程用测试编译产物（CARGO_BIN_EXE_oj，cargo test 默认 profile——仅测试
+/// 脚手架，发布物门禁仍走 `cargo xtask build` 的 release）。无插件依赖：极简
+/// config 不声明 auth/oidc 等，纯任务池生命周期验收。
+#[tokio::test(flavor = "current_thread")]
+async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-sig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let root = sample();
+    // 极简 config：console_log 开（任务/停机日志镜像到子进程 stderr 可断言）；
+    // 证书复用 sample 的示例证书（绝对路径）；db 隔离到临时目录；tasks 默认目录。
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  console_log: true\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\ndb:\n  default: \"sqlite://{}/db.sqlite\"\ntasks:\n  dir: \"tasks\"\n",
+        root.join("config/public.pem").display(),
+        root.join("config/cert.jws").display(),
+        tmp.display(),
+    );
+    std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args([
+            "server",
+            "-c",
+            &tmp.join("config.yaml").display().to_string(),
+            "--api-path",
+            &root.join("src").display().to_string(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oj server child");
+
+    // stdout/stderr 各一线程收集进同一缓冲（task 日志走 eprintln = stderr）。
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut readers = Vec::new();
+    for stream in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ] {
+        let Some(stream) = stream else { continue };
+        let buf = out_buf.clone();
+        readers.push(std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stream).lines() {
+                match line {
+                    Ok(l) => buf.lock().unwrap().push_str(&format!("{l}\n")),
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    // 等 started（≤60s；首启含全 sample 转译）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if out_buf
+            .lock()
+            .unwrap()
+            .contains("task: 1 task(s) → started")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server/tasks not started in time:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(
+        out_buf
+            .lock()
+            .unwrap()
+            .contains("task: demo (task_demo.ts) → started"),
+        "{}",
+        out_buf.lock().unwrap()
+    );
+
+    // SIGTERM（unix 信号；windows 仅 ctrl_c 语义，本用例 cfg(unix) 语义下跳过不适平台）。
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGTERM");
+
+    // 等退出（≤ grace 30s + 收尾余量），断言停机序列日志。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let code = loop {
+        match child.try_wait().unwrap() {
+            Some(st) => break st,
+            None => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "server did not exit after SIGTERM:\n{}",
+                    out_buf.lock().unwrap()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert!(status.success(), "kill -TERM exit: {status}");
+    assert!(code.success(), "server exit: {code}");
+    let log = out_buf.lock().unwrap();
+    assert!(log.contains("shutdown: stop flag set"), "{log}");
+    assert!(log.contains("task: demo → stopped"), "{log}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}

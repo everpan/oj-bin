@@ -151,7 +151,10 @@ pub async fn op_mq_call(
         (inst, stable.tasks_flag.clone())
     };
     if GATED.contains(&method.as_str()) {
-        let in_task = flag.is_some_and(|f| f.load(Ordering::Relaxed));
+        // 任务上下文 = flag **存在**（任务 Bridge 专属注入）；flag 的**值**是停机
+        // 信号（与生产装配共用同一 Arc：初值 false，SIGINT/SIGTERM 置 true）——
+        // 统一审查 must-fix：此前误读为 load()==true，正常运行期消费全被拒。
+        let in_task = flag.is_some();
         if !in_task {
             return Err(JsErrorBox::generic(format!(
                 "mq.{method} requires a task context (long-running tasks only; use send/publish from HTTP/WS)"
@@ -270,6 +273,25 @@ mod tests {
         assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// 统一审查 must-fix 回归钉：任务 Bridge（flag 初值 false = 正常运行期）的
+    /// poll 必须放行——此前 `is_some_and(load)` 误把停机信号值当上下文判定，
+    /// 消费任务在正常运行期即被拒、无限 crash-loop。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_running_task_bridge_when_poll_then_allowed() {
+        let reg = registry_with("default", "kafka");
+        let b = bridge(Some(reg), Some(Arc::new(AtomicBool::new(false))));
+        let out = run(
+            &b,
+            &format!(
+                "{CALL}(\"kafka\",\"default\",\"poll\",{{topics:[\"t\"],timeoutMs:10}}).then(r => json.ok(r), e => json.fail(1, String(e)));"
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("\"messages\""), "{out}");
+        assert!(!out.contains("requires a task context"), "{out}");
+    }
+
     pub(crate) fn registry_with(name: &str, kind: &'static str) -> Arc<NamedRegistry<MqInstance>> {
         let mut reg = NamedRegistry::new();
         let queue = Arc::new(Mutex::new(Vec::new()));
@@ -354,9 +376,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn given_task_context_when_poll_then_allowed_and_recv() {
-        // Given: flag = Some(true)（任务 Bridge）+ 队列已有消息；Then: poll 收到并放行
+        // Given: flag = Some(false)（任务 Bridge；停机信号初值 false——统一审查
+        // must-fix：门禁只看 flag 是否存在，不看其值）+ 队列已有消息；Then: 放行
         let reg = registry_with("default", "kafka");
-        let b = bridge(Some(reg), Some(Arc::new(AtomicBool::new(true))));
+        let b = bridge(Some(reg), Some(Arc::new(AtomicBool::new(false))));
         // 预填队列：先 send 两帧（flag 对 send 无门禁）
         let _ = run(&b, &format!("{CALL}(\"kafka\",\"default\",\"send\",{{topic:\"t\",value:1}}).then(()=>json.ok());"))
             .await;
@@ -493,7 +516,7 @@ mod js_global_tests {
             Extras {
                 kafkas: reg.clone(),
                 rabbits: reg,
-                tasks_flag: Some(Arc::new(AtomicBool::new(true))),
+                tasks_flag: Some(Arc::new(AtomicBool::new(false))),
                 ..Default::default()
             },
         );
@@ -573,7 +596,7 @@ mod task_driver_tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    fn task_bridge(root: &std::path::Path) -> Bridge {
+    fn task_bridge(root: &std::path::Path, flag: Arc<AtomicBool>) -> Bridge {
         let mut reg = NamedRegistry::new();
         let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
         reg.register("default", Arc::new(super::in_memory("kafka", queue)))
@@ -589,7 +612,9 @@ mod task_driver_tests {
             })),
             Extras {
                 kafkas: Some(Arc::new(reg)),
-                tasks_flag: Some(Arc::new(AtomicBool::new(true))),
+                // StableState 的 flag 与 run_task 参数是**同一 Arc**（生产装配 app.rs
+                // 同款）：JS tasks.stopping() 读的就是停机信号本体。
+                tasks_flag: Some(flag),
                 ..Default::default()
             },
         )
@@ -611,8 +636,8 @@ mod task_driver_tests {
             "task_ok.js",
             "export {};\nwhile (!tasks.stopping()) { await Kafka('default').poll(['t'], { timeoutMs: 30 }); }\n",
         );
-        let b = task_bridge(&dir);
         let flag = Arc::new(AtomicBool::new(false));
+        let b = task_bridge(&dir, flag.clone());
         let setter_flag = flag.clone();
         // Bridge 是 !Send 不能 spawn——同 current_thread task 内 select 驱动：
         // setter 100ms 后置位，随后永久 pending（绝不赢过 run_task 的自然收场）。
@@ -643,13 +668,10 @@ mod task_driver_tests {
             "task_boom.ts",
             "export {};\nthrow new Error(\"boom\");\n",
         );
-        let b = task_bridge(&dir);
+        let flag = Arc::new(AtomicBool::new(false));
+        let b = task_bridge(&dir, flag.clone());
         let out = b
-            .run_task(
-                &path,
-                Arc::new(AtomicBool::new(false)),
-                std::time::Duration::from_millis(200),
-            )
+            .run_task(&path, flag, std::time::Duration::from_millis(200))
             .await;
         assert!(
             matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("boom")),
@@ -665,14 +687,11 @@ mod task_driver_tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 真 CJS 写法（module.exports）按 ESM 加载 → 自然 ReferenceError → Crashed
         // （spec F3：一律按 ESM 加载，不走 looks_cjs 启发式；失败仍可诊断）。
+        let flag = Arc::new(AtomicBool::new(false));
         let path = write_task(&dir, "task_cjs.js", "module.exports = { run() {} };\n");
-        let b = task_bridge(&dir);
+        let b = task_bridge(&dir, flag.clone());
         let out = b
-            .run_task(
-                &path,
-                Arc::new(AtomicBool::new(false)),
-                std::time::Duration::from_millis(200),
-            )
+            .run_task(&path, flag, std::time::Duration::from_millis(200))
             .await;
         assert!(
             matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("module")),
@@ -691,13 +710,10 @@ mod task_driver_tests {
             "task_stuck.ts",
             "export {};\nwhile (true) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 50 }); }\n",
         );
-        let b = task_bridge(&dir);
+        let flag = Arc::new(AtomicBool::new(true)); // 预置停机：看门狗 gate 立即起算
+        let b = task_bridge(&dir, flag.clone());
         let out = b
-            .run_task(
-                &path,
-                Arc::new(AtomicBool::new(true)),
-                std::time::Duration::from_millis(120),
-            )
+            .run_task(&path, flag, std::time::Duration::from_millis(120))
             .await;
         assert!(matches!(out, crate::bridge::TaskExit::Killed), "{out:?}");
         let _ = std::fs::remove_dir_all(&dir);
