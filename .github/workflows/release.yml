@@ -106,15 +106,14 @@ jobs:
 
       # rdkafka-sys 经 cmake 编 librdkafka 默认 /MD（动态 CRT），而 rustc
       # windows-msvc 默认静态 CRT（libcmt）→ 混链 1120（__imp__* 符号悬空）。
-      # 经 CMAKE_TOOLCHAIN_FILE 工具链文件强制 CMP0091/MultiThreaded 在 CI 实测
-      # 未生效（policy default 从 toolchain 作用域不可见，/MD 原样保留），故改在
-      # cl.exe 层面覆盖：cl 把 _CL_ 内容追加在完整命令行末尾，同类别旗标后者胜，
-      # /MT 必然压过 cmake 生成的 /MD——与 toolchain 是否加载无关。本 job 里唯一
-      # 的 cl 调用就是 librdkafka 的 NMake 构建，作用域刚好。
+      # 在 cl.exe 层面覆盖：_CL_ 由 cl 追加在完整命令行末尾，同类别旗标后者胜。
+      # 必须用 dash 形式 -MT（MSVC 两种前缀都认）：slash 形式 /MT 会被 MSYS
+      # （shell: bash）当 POSIX 绝对路径转换成 "C:/Program Files/Git/MT"，
+      # cl 视之为源文件 → C1083（CI 实测踩坑）。
       - name: Force static CRT for librdkafka (cl-level _CL_ override)
         if: matrix.os == 'windows-latest'
         shell: bash
-        run: echo "_CL_=/MT" >> "$GITHUB_ENV"
+        run: echo "_CL_=-MT" >> "$GITHUB_ENV"
 
       # 先构建并归置全部插件，再跑 workspace 测试：oj/tests/oidc_e2e.rs 运行期从
       # bin/plugins/<triple>/ dlopen oj-auth——fresh checkout 上若先跑测试，装配层

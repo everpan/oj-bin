@@ -86,13 +86,15 @@ jobs:
 
       # rdkafka-sys 经 cmake 编 librdkafka 默认 /MD（动态 CRT），而 rustc
       # windows-msvc 默认静态 CRT（libcmt）→ 混链 1120（__imp__* 符号悬空）。
-      # cl.exe 把 _CL_ 内容追加在完整命令行末尾，同类别旗标后者胜，/MT 必然
+      # cl.exe 把 _CL_ 内容追加在完整命令行末尾，同类别旗标后者胜，-MT 必然
       # 压过 cmake 生成的 /MD（toolchain 文件方案 CI 实测未生效，已废弃）。
-      # 本行内唯一的 cl 调用就是 librdkafka 的 NMake 构建，作用域刚好。
+      # 必须 dash 形式 -MT（MSVC 两种前缀都认）：slash 形式 /MT 会被 MSYS
+      # （shell: bash）当 POSIX 绝对路径转换成 "C:/Program Files/Git/MT"，
+      # cl 视之为源文件 → C1083（CI 实测踩坑）。
       - name: Force static CRT for librdkafka (cl-level _CL_ override)
         if: matrix.os == 'windows-latest'
         shell: bash
-        run: echo "_CL_=/MT" >> "$GITHUB_ENV"
+        run: echo "_CL_=-MT" >> "$GITHUB_ENV"
 
       # musl 行启用时：
       # - run: rustup target add x86_64-unknown-linux-musl
