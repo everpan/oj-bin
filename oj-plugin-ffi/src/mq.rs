@@ -2,8 +2,12 @@
 //! 方法面（kind/send/poll/commit/ack/nack/metadata/dlq）走 `call` 的 method 字符串
 //! 派发——加方法零 ABI 变更；只有 vtable 形状变更才 bump ABI_VERSION（本轴为新增，
 //! 既有轴零感知，ABI 保持 7）。
+//!
+//! 本模块同时携带 mq 的 **JSON 词汇表**（`MqMessage` 等 serde 结构，非 repr(C)、
+//! 不进 ABI）：宿主透传 JSON，插件侧按此编解码——词汇单一来源（DRY）。
 
 use crate::{FfiFuture, RString};
+use std::collections::HashMap;
 
 #[stabby::stabby]
 #[repr(C)]
@@ -16,4 +20,27 @@ pub struct MqVtable {
     pub call: extern "C" fn(handle: u64, method: RString, payload: RString) -> FfiFuture,
     /// 释放实例（退出消费组 / 关连接）。幂等；宿主 Drop 兜底也走此符号。
     pub close: extern "C" fn(handle: u64),
+}
+
+/// poll 返回的统一消息形态（spec §4）。
+/// kafka：topic/partition/offset 全填，commit(msg) 原样回传；rabbit：topic=queue、
+/// `delivery_tag` 关联 ack/nack（kafka 恒 None）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MqMessage {
+    /// kafka = topic；rabbit = queue。
+    pub topic: String,
+    #[serde(default)]
+    pub partition: Option<i32>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub ts: i64,
+    /// rabbit 专属：未确认投递的 delivery tag（ack/nack 载荷原样回传）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_tag: Option<u64>,
 }

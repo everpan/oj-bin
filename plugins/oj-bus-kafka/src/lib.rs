@@ -12,8 +12,8 @@
 
 use futures::StreamExt;
 use oj_plugin_ffi::{
-    ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, MqVtable, PluginDescriptor, RArc,
-    RResult, RString,
+    ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, MqMessage, MqVtable, PluginDescriptor,
+    RArc, RResult, RString,
 };
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
@@ -169,18 +169,7 @@ fn d_timeout() -> u64 {
     1000
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MqMessage {
-    topic: String,
-    partition: i32,
-    offset: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    key: Option<String>,
-    value: Value,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    headers: HashMap<String, String>,
-    ts: i64,
-}
+// MqMessage 使用契约 crate 的共享词汇表（oj_plugin_ffi::mq::MqMessage）。
 
 // ---- bus 面：push 扇出（既有语义零变化）----
 
@@ -293,12 +282,13 @@ impl MqInstance {
                     };
                     msgs.push(MqMessage {
                         topic: m.topic().to_string(),
-                        partition: m.partition(),
-                        offset: m.offset(),
+                        partition: Some(m.partition()),
+                        offset: Some(m.offset()),
                         key: m.key().map(|k| String::from_utf8_lossy(k).to_string()),
                         value,
                         headers,
                         ts,
+                        delivery_tag: None,
                     });
                 }
                 Ok(Err(e)) => return Err(format!("kafka poll: {e}")),
@@ -319,7 +309,7 @@ impl MqInstance {
             })?
         };
         let topic = msg.topic.clone();
-        let (partition, offset) = (msg.partition, msg.offset + 1);
+        let (partition, offset) = (msg.partition.unwrap_or(0), msg.offset.unwrap_or(0) + 1);
         tokio::task::spawn_blocking(move || {
             let mut tpl = TopicPartitionList::new();
             tpl.add_partition_offset(&topic, partition, Offset::Offset(offset))

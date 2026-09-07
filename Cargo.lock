@@ -3348,6 +3348,8 @@ name = "oj-plugin-ffi"
 version = "0.1.0"
 dependencies = [
  "paste",
+ "serde",
+ "serde_json",
  "stabby",
  "tokio",
 ]
