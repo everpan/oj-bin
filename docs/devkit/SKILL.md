@@ -69,6 +69,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 任务收不到消息就退了/killed | `timeoutMs` 应远小于 `stop_grace_secs`；被 killed = 宽限到期看门狗强杀（不响应 `tasks.stopping()`） |
 | 重启后整段消息重复消费 | commit 按 offset+1 推进该分区——多分区主题按分区各 commit 一次（at-least-once，处理须幂等） |
 | 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效） |
+| WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定） |
+| WS 第二帧报 Identifier already declared | 每帧重跑同一文件且同一 VM——顶层 `const`/`let` 二帧即重复声明，声明放进块作用域 `{}` |
+| WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |
 
 ## 手册
 

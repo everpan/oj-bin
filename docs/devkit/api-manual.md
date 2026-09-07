@@ -364,7 +364,8 @@ export default { get: detail };
 
 ### ws.ts（WebSocket 帧循环）
 
-> 系统学习（心智模型 / 实现走读 / 鉴权现状 / 测试映射）见 [../websocket.md](../websocket.md)。
+> 系统学习（心智模型 / 实现走读 / 鉴权现状 / 测试映射）见仓库 `docs/websocket.md`
+>（devkit 包内不含，仓库查看）。
 
 目录内放 `ws.ts`（dev）/ `ws.js`（release，约定同 `api.ts`）即产生一条 WebSocket 路由
 `GET {base}/{...path}/ws`：`src/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
@@ -378,6 +379,36 @@ json.ok({ subscribed: true });
 
 注意：release 下 root=dist，WS URL 含模块版本段（如 `…/news-0.1.0/ws`）——v0.2 已知限制
 （第 13 章）。bus 的发布/订阅方向约定见第 6 章 bus 小节。
+
+### 帧内发布：`ws.ts` 里直接 `bus.publish`
+
+`bus.publish` 没有上下文限制（只有 `bus.subscribe` 限 WS 连接），帧处理器可以直接当
+「广播泵」用。可运行案例 `sample/src/news/chat/ws.ts`——聊天室，任意连接发帧，
+所有订阅者收广播：
+
+```ts
+bus.subscribe("chat");   // 幂等（同通道去重），每帧重跑无害
+{
+  const frame = http.body;              // JSON 文本帧已自动 parse 成对象
+  if (frame && frame.text) {
+    bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+    json.ok({ sent: true });
+  } else {
+    json.ok({ joined: true });
+  }
+}
+```
+
+帧内发布特有的三条语义（系统学习见仓库 `docs/websocket.md`）：
+
+1. **自回声**：本连接若订阅了同一主题，会收到自己发布的广播帧（fan-out 不排除
+   自己）——按 `from` 字段客户端过滤，或发布到别的 topic。
+2. **顶层不能 `await`**：帧代码经 `execute_script` 执行（经典 script，非 ESM）。
+   不 `await` 也照常广播（event loop 会把 op future 驱动完才捕获信封）；要拿
+   `publish` 返回的「本地接收方数」，用 async IIFE 包住 `await bus.publish(...)`
+   （kafka/rabbitmq broker 下该数恒 0）。
+3. **声明放进块作用域**：同一连接的帧跑在**同一个 VM** 里，顶层 `const`/`let`
+   第二帧重跑会因重复声明报 `SyntaxError`——示例外层那对 `{}` 是必须的。
 
 ## 5. 导入解析
 
