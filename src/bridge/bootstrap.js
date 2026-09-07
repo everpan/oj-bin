@@ -28,6 +28,9 @@ import {
   op_es_search,
   op_es_index,
   op_es_del,
+  op_mq_call,
+  op_mq_has,
+  op_tasks_stopping,
   op_fetch,
   op_finish,
   op_http_info,
@@ -131,6 +134,13 @@ globalThis.blob = (name) => ({
 });
 // back-compat: blob.put(...) === blob("default").put(...)
 Object.assign(globalThis.blob, globalThis.blob("default"));
+
+// ----- internal: mq op passthrough (Kafka/RabbitMQ/tasks globals bind on top) -----
+globalThis.__ojMq = {
+  call: op_mq_call,
+  has: op_mq_has,
+  stopping: op_tasks_stopping,
+};
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 globalThis.ws = {

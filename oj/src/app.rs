@@ -20,10 +20,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
+use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
     Bridge, DataAccessor, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx,
-    SchemaRegistry,
+    NamedRegistry, SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, StableState};
 use only_js::config::{self, Config};
@@ -363,6 +364,9 @@ impl App {
             .connect(&cfg.broker)
             .await
             .map_err(|e| format!("broker: {e}"))?;
+        // mq 命名实例（T7 装配注入；过渡期空表——Kafka/RabbitMQ(name) → undefined）。
+        let kafkas: Arc<NamedRegistry<MqInstance>> = Arc::new(NamedRegistry::new());
+        let rabbits: Arc<NamedRegistry<MqInstance>> = Arc::new(NamedRegistry::new());
         // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，Clone 即共享。
         let make_bridge = {
             let (dbs, kv, loader, es, bus) = (
@@ -373,6 +377,8 @@ impl App {
                 bus.clone(),
             );
             let blobs = blobs.clone();
+            let kafkas = kafkas.clone();
+            let rabbits = rabbits.clone();
             let (registry, modules, ownership_deny) =
                 (registry.clone(), modules.clone(), ownership_deny);
             // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
@@ -399,6 +405,10 @@ impl App {
                         jwt: jwt.clone(),
                         // oidc 原语配置（OIDC 解耦：JS 端点 oidc.sign/verify/jwks 数据源）。
                         oidc: oidc.clone(),
+                        // mq 命名实例（T7 装配注入；此处空表兜底，编译占位）。
+                        kafkas: Some(kafkas.clone()),
+                        rabbits: Some(rabbits.clone()),
+                        tasks_flag: None,
                     },
                 )
             }
@@ -547,6 +557,9 @@ impl App {
             boot: boot.clone(),
             jwt: jwt.clone(),   // 与 make_bridge 的 Extras.jwt 同源。
             oidc: oidc.clone(), // 与 make_bridge 的 Extras.oidc 同源。
+            kafkas: Arc::new(NamedRegistry::new()),
+            rabbits: Arc::new(NamedRegistry::new()),
+            tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(App {

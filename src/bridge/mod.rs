@@ -43,6 +43,7 @@ mod kv;
 mod loader;
 mod log;
 mod module_loader;
+pub mod mq;
 mod named_registry;
 pub mod oidc;
 pub mod plugin_loader;
@@ -67,6 +68,7 @@ pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
 pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
+pub use mq::MqInstance;
 pub use named_registry::NamedRegistry;
 pub use plugin_loader::PluginInfo;
 pub use registry::SchemaRegistry;
@@ -75,6 +77,7 @@ pub use runtime::{BOOT_TIMEOUT, boot_runtime};
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use deno_core::error::CoreError;
@@ -117,6 +120,12 @@ pub struct StableState {
     pub modules: Arc<HashMap<String, ModuleCtx>>,
     /// 表归属守卫模式（P2 §5.3）：false=warn（默认，日志告警）；true=deny（违规拒绝）。
     pub ownership_deny: bool,
+    /// 命名 MQ 客户端（Kafka(name)/RabbitMQ(name) 数据源；spec 2026-09-07 §4）。
+    /// 段未配置 = 空 registry（op_mq_has 恒 false → JS 侧 undefined）。
+    pub kafkas: Arc<NamedRegistry<mq::MqInstance>>,
+    pub rabbits: Arc<NamedRegistry<mq::MqInstance>>,
+    /// 任务上下文标志（评审 M2/N：任务 Bridge 注 Some，HTTP/WS Bridge 注 None）。
+    pub tasks_flag: Option<Arc<AtomicBool>>,
     /// 裸 SQL 表名提取 memo（守卫热路径缓存；键 = SQL 原文）。
     pub sql_memo: Mutex<HashMap<String, Arc<Vec<String>>>>,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
@@ -149,6 +158,11 @@ pub struct Extras {
     pub jwt: Option<Arc<JwtCfg>>,
     /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
     pub oidc: Option<Arc<oidc::OidcState>>,
+    /// 命名 MQ 客户端（None = 空 registry，Kafka/RabbitMQ(name) → undefined）。
+    pub kafkas: Option<Arc<NamedRegistry<mq::MqInstance>>>,
+    pub rabbits: Option<Arc<NamedRegistry<mq::MqInstance>>>,
+    /// 任务上下文标志（Some 仅注入任务 Bridge，评审 M2）。
+    pub tasks_flag: Option<Arc<AtomicBool>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -236,6 +250,9 @@ deno_core::extension!(
         crypto::op_sha256_hex,
         crypto::op_random_hex,
         ws::op_ws_close,
+        mq::op_mq_has,
+        mq::op_mq_call,
+        mq::op_tasks_stopping,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     esm = [dir "src/bridge", "bootstrap.js"],
@@ -340,6 +357,13 @@ impl Bridge {
             boot: extras.boot,
             jwt: extras.jwt,
             oidc: extras.oidc,
+            kafkas: extras
+                .kafkas
+                .unwrap_or_else(|| Arc::new(NamedRegistry::new())),
+            rabbits: extras
+                .rabbits
+                .unwrap_or_else(|| Arc::new(NamedRegistry::new())),
+            tasks_flag: extras.tasks_flag,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // KillSwitch 先于池构造：池在 boot 期要 arm 它（TLA 死循环的唯一兜底）。
@@ -1271,6 +1295,9 @@ mod tests {
             boot: None,
             jwt: None,
             oidc: None,
+            kafkas: Arc::new(NamedRegistry::new()),
+            rabbits: Arc::new(NamedRegistry::new()),
+            tasks_flag: None,
             sql_memo: Mutex::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
