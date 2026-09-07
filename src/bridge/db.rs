@@ -403,7 +403,7 @@ mod tests {
                 ("other".to_string(), other as Arc<dyn DataAccessor>),
             ]),
             Arc::new(InMemoryKV::new()),
-            SchemaRegistry::new().table("t", Some("id"), &["id"]),
+            SchemaRegistry::new().table("t", &["id"], &["id"]),
             false,
         );
         // 在 default 上开事务，再于事务内查询 other → 拒绝。

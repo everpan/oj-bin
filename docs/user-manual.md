@@ -244,7 +244,7 @@ deps:               # 依赖的其他模块 → semver 范围；声明后才可�
 ```yaml
 tables:
   account:
-    pk: id                      # 可选；主键列须在 columns 声明
+    pk: id                      # 可选；主键列须在 columns 声明；联合主键写 pk: [a, b]
     columns:
       id: { type: integer, autoincrement: true }   # integer/bigint/text/boolean/double/blob
       name: { type: text, null: false }            # null 缺省 = 可空

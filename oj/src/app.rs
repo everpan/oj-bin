@@ -151,7 +151,7 @@ async fn build_schema_and_modules(
                         registry.owner_of(t).unwrap_or("?")
                     ));
                 }
-                registry = registry.table_owned(&name, t, pk, &cols);
+                registry = registry.table_owned(&name, t, &pk, &cols);
             }
             if gate == "auto" {
                 let acc = dbs

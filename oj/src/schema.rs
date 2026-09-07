@@ -83,11 +83,29 @@ impl ColumnSchema {
     }
 }
 
+/// YAML 主键形态归一：`pk: id`（单列）或 `pk: [a, b]`（联合主键）→ Vec（空 = 无主键）。
+fn pk_spec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Spec {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match <Spec as serde::Deserialize>::deserialize(d)? {
+        Spec::One(s) => vec![s],
+        Spec::Many(v) => v,
+    })
+}
+
 /// 单表声明。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TableSchema {
-    #[serde(default)]
-    pub pk: Option<String>,
+    /// 主键列（联合主键为多列；空 = 无主键）。YAML 接受 `pk: id` 或 `pk: [a, b]`。
+    #[serde(default, deserialize_with = "pk_spec")]
+    pub pk: Vec<String>,
     pub columns: BTreeMap<String, ColumnSchema>,
     #[serde(default)]
     pub indexes: HashMap<String, Vec<String>>,
@@ -117,12 +135,21 @@ impl SchemaFile {
             if !is_ident(t) {
                 return Err(format!("schema: 非法表名 {t:?}"));
             }
-            if let Some(pk) = &ts.pk {
-                if !is_ident(pk) {
-                    return Err(format!("schema: 表 {t:?} 非法主键 {pk:?}"));
+            for p in &ts.pk {
+                if !is_ident(p) {
+                    return Err(format!("schema: 表 {t:?} 非法主键 {p:?}"));
                 }
-                if !ts.columns.contains_key(pk) {
-                    return Err(format!("schema: 表 {t:?} 主键 {pk:?} 未在 columns 声明"));
+                if !ts.columns.contains_key(p) {
+                    return Err(format!("schema: 表 {t:?} 主键 {p:?} 未在 columns 声明"));
+                }
+            }
+            if ts.pk.len() > 1 {
+                for (c, cs) in &ts.columns {
+                    if cs.autoincrement {
+                        return Err(format!(
+                            "schema: 表 {t:?} 联合主键不支持 autoincrement（列 {c:?}）"
+                        ));
+                    }
                 }
             }
             for (c, cs) in &ts.columns {
@@ -130,7 +157,7 @@ impl SchemaFile {
                     return Err(format!("schema: 表 {t:?} 非法列名 {c:?}"));
                 }
                 ColType::parse(&cs.col_type).map_err(|e| format!("schema: 表 {t:?}.{c}: {e}"))?;
-                if cs.autoincrement && ts.pk.as_deref() != Some(c.as_str()) {
+                if cs.autoincrement && !ts.pk.iter().any(|p| p == c) {
                     return Err(format!(
                         "schema: 表 {t:?} 列 {c:?} autoincrement 仅允许主键列"
                     ));
@@ -164,14 +191,14 @@ impl SchemaFile {
         Self::parse(&text).map(Some)
     }
 
-    /// 归属图 + SchemaRegistry 喂料：(表名, 主键, 全部列名)。
-    pub fn registry_tables(&self) -> Vec<(&str, Option<&str>, Vec<&str>)> {
+    /// 归属图 + SchemaRegistry 喂料：(表名, 主键列（联合为多列，空=无）, 全部列名)。
+    pub fn registry_tables(&self) -> Vec<(&str, Vec<&str>, Vec<&str>)> {
         self.tables
             .iter()
             .map(|(name, t)| {
                 (
                     name.as_str(),
-                    t.pk.as_deref(),
+                    t.pk.iter().map(|s| s.as_str()).collect(),
                     t.columns.keys().map(|s| s.as_str()).collect(),
                 )
             })
@@ -208,12 +235,19 @@ macro_rules! render {
     };
 }
 
-/// CREATE TABLE（列级主键 / autoincrement / NOT NULL）。
+/// CREATE TABLE（单主键 = 列级 PRIMARY KEY；联合主键 = 表级 PRIMARY KEY (a, b)）。
 pub fn create_table_ddl(t: &TableSchema, name: &str, d: Dialect) -> String {
     let mut ct = sea_query::Table::create();
     ct.table(Alias::new(name));
     for (c, cs) in &t.columns {
-        ct.col(column_def(c, cs, t.pk.as_deref() == Some(c.as_str())));
+        ct.col(column_def(c, cs, t.pk.len() == 1 && t.pk[0] == *c));
+    }
+    if t.pk.len() > 1 {
+        let mut ix = sea_query::Index::create();
+        for c in &t.pk {
+            ix.col(Alias::new(c));
+        }
+        ct.primary_key(&mut ix);
     }
     render!(ct, d)
 }
@@ -366,6 +400,12 @@ pub async fn reconcile(
         }
         for m in &missing {
             let c = &t.columns[*m];
+            if t.pk.iter().any(|p| p == *m) {
+                return Err(format!(
+                    "schema: 表 {name:?} 主键列 {m:?} 在实库缺失，无法 ALTER ADD 补齐\
+                     （联合主键亦然，存量行无约束来源）。\n  下一步：手写迁移重建表"
+                ));
+            }
             if c.null == Some(false) {
                 return Err(format!(
                     "schema: 表 {name:?} 列 {m:?} 声明 NOT NULL 且实库缺失，无法安全推导\
@@ -461,8 +501,26 @@ tables:
         let f = user_schema();
         assert_eq!(f.tables.len(), 2);
         let acct = &f.tables["account"];
-        assert_eq!(acct.pk.as_deref(), Some("id"));
+        assert_eq!(acct.pk, vec!["id".to_string()]);
         assert_eq!(acct.indexes["idx_account_name"], vec!["name".to_string()]);
+        // 联合主键：字符串与数组两形态归一。
+        let comp = SchemaFile::parse(
+            "tables:\n  t:\n    pk: [account_id, no]\n    columns:\n      account_id: { type: bigint }\n      no: { type: text }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            comp.tables["t"].pk,
+            vec!["account_id".to_string(), "no".to_string()]
+        );
+        assert_eq!(
+            SchemaFile::parse(
+                "tables:\n  t:\n    pk: id\n    columns:\n      id: { type: integer }\n"
+            )
+            .unwrap()
+            .tables["t"]
+                .pk,
+            vec!["id".to_string()]
+        );
 
         // 未知类型
         let e = SchemaFile::parse("tables:\n  t:\n    columns:\n      a: { type: jsonb }\n")
@@ -480,6 +538,12 @@ tables:
         )
         .unwrap_err();
         assert!(e.contains("nope"), "{e}");
+        // 联合主键 + autoincrement → 拒绝
+        let e = SchemaFile::parse(
+            "tables:\n  t:\n    pk: [a, b]\n    columns:\n      a: { type: integer, autoincrement: true }\n      b: { type: text }\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("联合主键"), "{e}");
         // 非法表名 / 列名 / 索引名（信任边界：内省 SQL 内联）
         for yaml in [
             "tables:\n  bad-name:\n    columns:\n      a: { type: text }\n",
@@ -533,6 +597,39 @@ tables:
         );
         assert!(ix.contains("CREATE INDEX"), "{ix}");
         assert!(ix.contains("idx_account_name"), "{ix}");
+
+        // 联合主键：表级 PRIMARY KEY (a, b)，三方言渲染。
+        let comp = TableSchema {
+            pk: vec!["account_id".into(), "no".into()],
+            columns: BTreeMap::from([
+                (
+                    "account_id".to_string(),
+                    ColumnSchema {
+                        col_type: "bigint".into(),
+                        null: None,
+                        autoincrement: false,
+                    },
+                ),
+                (
+                    "no".to_string(),
+                    ColumnSchema {
+                        col_type: "text".into(),
+                        null: None,
+                        autoincrement: false,
+                    },
+                ),
+            ]),
+            indexes: HashMap::new(),
+        };
+        let sq = create_table_ddl(&comp, "order_item", Dialect::Sqlite);
+        let my = create_table_ddl(&comp, "order_item", Dialect::MySql);
+        let pg = create_table_ddl(&comp, "order_item", Dialect::Postgres);
+        for ddl in [&sq, &my, &pg] {
+            assert!(ddl.contains("PRIMARY KEY"), "{ddl}");
+        }
+        assert!(sq.contains("PRIMARY KEY (\"account_id\", \"no\")"), "{sq}");
+        assert!(my.contains("PRIMARY KEY (`account_id`, `no`)"), "{my}");
+        assert!(pg.contains("PRIMARY KEY (\"account_id\", \"no\")"), "{pg}");
     }
 
     async fn sqlite_acc() -> std::sync::Arc<dyn DataAccessor> {
@@ -597,6 +694,27 @@ tables:
             .unwrap_err();
         assert!(e.contains("NOT NULL"), "{e}");
         assert!(e.contains("migrations/"), "{e}");
+    }
+
+    /// 联合主键：reconcile 建表 + 幂等重跑；主键列实库缺失 → fail-fast。
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_composite_pk_creates_and_guards() {
+        let acc = sqlite_acc().await;
+        let f = SchemaFile::parse(
+            "tables:\n  oi:\n    pk: [account_id, no]\n    columns:\n      account_id: { type: bigint, null: false }\n      no: { type: text, null: false }\n      memo: { type: text }\n",
+        )
+        .unwrap();
+        let log = reconcile(acc.as_ref(), "m", &f).await.unwrap();
+        assert_eq!(log, vec!["[m] create table oi".to_string()], "{log:?}");
+        // 幂等：复跑零动作。
+        assert!(reconcile(acc.as_ref(), "m", &f).await.unwrap().is_empty());
+        // 主键列缺失 → fail-fast（不走 ALTER ADD）。
+        let acc2 = sqlite_acc().await;
+        acc2.exec_with_params("CREATE TABLE oi (account_id bigint)", &[])
+            .await
+            .unwrap();
+        let e = reconcile(acc2.as_ref(), "m", &f).await.unwrap_err();
+        assert!(e.contains("主键列") && e.contains("no"), "{e}");
     }
 
     /// `oj schema diff`（D001/D002）：缺表/缺列/多列与未声明表逐一报告。

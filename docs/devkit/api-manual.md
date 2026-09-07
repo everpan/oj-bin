@@ -210,7 +210,8 @@ dist/
 ```yaml
 tables:
   account:
-    pk: id                                    # 可选；主键列须在 columns 声明（仅单列）
+    pk: id                                    # 可选；主键列须在 columns 声明；联合主键写 pk: [a, b]
+                                              # （联合主键不支持 autoincrement；reconcile 对缺失主键列 fail-fast）
     columns:
       id: { type: integer, autoincrement: true }
       name: { type: text, null: false }

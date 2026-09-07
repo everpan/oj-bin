@@ -851,7 +851,7 @@ mod tests {
     async fn db_params_and_build() {
         let db = Arc::new(InMemoryAccessor::new());
         db.seed([json!({"id": 1, "name": "ever"})]);
-        let registry = SchemaRegistry::new().table("user", Some("id"), &["id", "name", "age"]);
+        let registry = SchemaRegistry::new().table("user", &["id"], &["id", "name", "age"]);
         let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
         // 结构化查询构造器（经 SchemaRegistry 白名单）。
         let cap = b
@@ -888,7 +888,7 @@ mod tests {
         let b = Bridge::with_dbs(
             HashMap::from([("default".to_string(), a as Arc<dyn DataAccessor>)]),
             Arc::new(InMemoryKV::new()),
-            SchemaRegistry::new().table("user", Some("id"), &["id", "name"]),
+            SchemaRegistry::new().table("user", &["id"], &["id", "name"]),
             false,
         );
         let cap = b
@@ -904,7 +904,7 @@ mod tests {
         let b2 = Bridge::with_dbs(
             HashMap::from([("only".to_string(), only as Arc<dyn DataAccessor>)]),
             Arc::new(InMemoryKV::new()),
-            SchemaRegistry::new().table("user", Some("id"), &["id", "name"]),
+            SchemaRegistry::new().table("user", &["id"], &["id", "name"]),
             false,
         );
         let cap = b2
@@ -1140,7 +1140,7 @@ mod tests {
         db.exec_with_params("create table t (id integer primary key, v text)", &[])
             .await
             .unwrap();
-        let reg = SchemaRegistry::new().table("t", Some("id"), &["id", "v"]);
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "v"]);
         let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), reg, false);
         let cap = b
             .run(r#"db.tx(async (tx) => {
@@ -1581,7 +1581,7 @@ mod tests {
                  \x20 .then((r) => json.ok({ n: r.length }))\n\
                  \x20 .catch((e) => json.fail(500, String(e))); } };\n",
             )]);
-            let reg = SchemaRegistry::new().table_owned("other", "secret", Some("id"), &["id"]);
+            let reg = SchemaRegistry::new().table_owned("other", "secret", &["id"], &["id"]);
             let mods = Arc::new(HashMap::from([(
                 root.join("m").to_string_lossy().into_owned(),
                 ModuleCtx {

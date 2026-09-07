@@ -345,7 +345,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let reg = SchemaRegistry::new().table("t", Some("id"), &["id", "name", "age", "tag", "ok"]);
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name", "age", "tag", "ok"]);
         Bridge::with_opts(db, Arc::new(InMemoryKV::new()), reg, false)
     }
 

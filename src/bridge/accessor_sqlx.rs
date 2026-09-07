@@ -293,7 +293,7 @@ mod tests {
         .await
         .unwrap();
 
-        let registry = SchemaRegistry::new().table("user", Some("id"), &["id", "name", "age"]);
+        let registry = SchemaRegistry::new().table("user", &["id"], &["id", "name", "age"]);
         let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
 
         // 结构化查询构造器（sea-query → 真实 sqlite，占位符须为 sqlite 方言）。
