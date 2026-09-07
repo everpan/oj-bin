@@ -81,7 +81,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use deno_core::error::CoreError;
-use deno_core::{JsRuntime, OpState, op2};
+use deno_core::{JsRuntime, OpState, PollEventLoopOptions, op2};
 
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
 pub type BridgeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -262,6 +262,109 @@ deno_core::extension!(
         state.put(ReqState::default());
     },
 );
+
+/// 任务驱动出口（spec §6）：Stopped = flag 置位后自然收场；Crashed = 顶层抛错/加载失败
+/// （监督重启信号）；Killed = grace 到期强杀（terminate + event loop 兜底，SIGSEGV 纪律）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskExit {
+    Stopped,
+    Crashed(String),
+    Killed,
+}
+
+impl Bridge {
+    /// 任务常驻驱动（spec §6，评审 F3+F5）：ESM side-module 加载任务文件（走统一转译
+    /// 管线 + 相对导入），先 mod_evaluate 再驱动 event loop；不武装 handler 超时。
+    /// flag 置位 → 任务循环检测退出（TLA 自然完成）；grace 到期仍不退 → 看门狗线程
+    /// 跨线程 terminate_execution（紧 JS 循环会饿死本线程的协作式 select，只能靠它）
+    /// → 再兜一轮 event loop → 丢弃 runtime（不归还池）。
+    /// CJS 风格任务文件（无 ESM 标记 + 顶层 await）→ 可诊断的 Crashed（评审 F3）。
+    pub async fn run_task(
+        &self,
+        path: &std::path::Path,
+        flag: Arc<AtomicBool>,
+        grace: std::time::Duration,
+    ) -> TaskExit {
+        // ESM 标记检查在原始源码上做（转译可能吞掉空 `export {}`）。
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => return TaskExit::Crashed(format!("task read: {e}")),
+        };
+        if module_loader::looks_cjs(&raw) {
+            return TaskExit::Crashed(
+                "task file looks like CJS but uses top-level await; add an ESM marker                  (e.g. first line `export {};`) — task files are ES modules"
+                    .to_string(),
+            );
+        }
+        let src = match transpile::cached_transpile(path) {
+            Ok(s) => s,
+            Err(e) => return TaskExit::Crashed(format!("task compile: {e}")),
+        };
+        // 入口不经 module loader（评审 F3：TS 转译会吞掉空 `export {}`，loader 的
+        // looks_cjs 会把入口误包成 CJS 绞杀 TLA）——直接以转译源 + 任务文件自身的
+        // versioned URL 走 side-module：TLA 保真，相对导入以任务目录解析，共享库照常。
+        let spec = match module_loader::versioned_specifier(path) {
+            Ok(s) => s,
+            Err(e) => return TaskExit::Crashed(format!("task spec: {e}")),
+        };
+        let mut rt = match self.checkout_reset(RequestInfo::default(), None).await {
+            Ok(rt) => rt,
+            Err(e) => return TaskExit::Crashed(e.to_string()),
+        };
+        let id = match rt
+            .load_side_es_module_from_code(&spec, format!("{src}\n"))
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => return TaskExit::Crashed(e.to_string()),
+        };
+        // 先武装看门狗再 mod_evaluate：TLA 紧循环（如 `while(true){ await poll() }`
+        // 且 op 同步就绪）会把 mod_evaluate 的初始 microtask checkpoint 饿死到永不
+        // 返回——宿主线程连 select 的协作分支都轮不到，停机 flag 只能由看门狗代盯，
+        // grace 到点由它跨线程 terminate（SIGSEGV 纪律：terminate 后本线程兜一轮
+        // event loop 再丢弃，绝不归还池）。
+        let handle = rt.v8_isolate().thread_safe_handle();
+        self.kill.arm_on_flag(handle, flag, grace);
+        let eval = rt.mod_evaluate(id);
+        // terminate 落在 isolate「未执行 JS」的窗口会被 V8 锁存，TLA promise 被
+        // 悬空——eval 可能永不 settle。故除自然驱动外，还需盯 fired：一旦看门狗
+        // 熔断即放弃等待，按 Killed 收场。
+        let natural = tokio::select! {
+            r = async {
+                let looped = rt.run_event_loop(PollEventLoopOptions::default()).await;
+                let evaled = eval.await;
+                looped.and(evaled)
+            } => Some(r),
+            _ = async {
+                while !self.kill.fired() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            } => None,
+        };
+        let fired = self.kill.disarm();
+        match natural {
+            // 熔断后的兜底轮加超时：被终止的 isolate 不保证 event loop 还能返回；
+            // 超时即放弃（runtime 反正要丢弃，绝不归还池——SIGSEGV 纪律）。
+            _ if fired => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    rt.run_event_loop(PollEventLoopOptions::default()),
+                )
+                .await;
+                TaskExit::Killed
+            }
+            Some(Err(e)) => {
+                let _ = rt.run_event_loop(PollEventLoopOptions::default()).await;
+                TaskExit::Crashed(e.to_string())
+            }
+            Some(Ok(())) => {
+                let _ = rt.run_event_loop(PollEventLoopOptions::default()).await;
+                TaskExit::Stopped
+            }
+            None => unreachable!("fired implies the fired-watch arm above"),
+        }
+    }
+}
 
 /// finish()：标记会话完成。
 #[op2(fast)]

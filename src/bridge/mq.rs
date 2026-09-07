@@ -188,14 +188,31 @@ pub(crate) fn in_memory(
                         Ok(serde_json::json!({ "sent": 1 }))
                     }
                     "poll" => {
-                        let mut q = queue.lock().unwrap();
-                        let n = q.len().min(payload["max"].as_u64().unwrap_or(100) as usize);
-                        let topic0 = payload["topics"][0].clone();
-                        let msgs: Vec<serde_json::Value> = q
-                            .drain(..n)
-                            .map(|v| serde_json::json!({ "topic": topic0, "value": v }))
-                            .collect();
-                        Ok(serde_json::json!({ "messages": msgs }))
+                        // 空且指定 timeoutMs → 真实等待（夹具语义对齐真实 Kafka poll；
+                        // 立即返回空会把任务 TLA 循环变成紧 promise 链，饿死 V8 的
+                        // microtask checkpoint——mod_evaluate 永不返回）。
+                        let mut waited = 0u64;
+                        loop {
+                            let msgs: Vec<serde_json::Value> = {
+                                let mut q = queue.lock().unwrap();
+                                let n =
+                                    q.len().min(payload["max"].as_u64().unwrap_or(100) as usize);
+                                let topic0 = payload["topics"][0].clone();
+                                q.drain(..n)
+                                    .map(|v| serde_json::json!({ "topic": topic0, "value": v }))
+                                    .collect()
+                            };
+                            if !msgs.is_empty() {
+                                break Ok(serde_json::json!({ "messages": msgs }));
+                            }
+                            let budget = payload["timeoutMs"].as_u64().unwrap_or(0).min(500);
+                            if waited >= budget {
+                                break Ok(serde_json::json!({ "messages": [] }));
+                            }
+                            let step = budget.saturating_sub(waited).min(10);
+                            waited += step;
+                            tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+                        }
                     }
                     "commit" | "ack" | "nack" => Ok(serde_json::json!({})),
                     _ => Err(format!("unsupported method: {method}").into()),
@@ -489,5 +506,145 @@ mod js_global_tests {
         )
         .await;
         assert!(out.contains("true"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod task_driver_tests {
+    use crate::bridge::{Bridge, Extras, InMemoryKV, NamedRegistry, SchemaRegistry};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn task_bridge(root: &std::path::Path) -> Bridge {
+        let mut reg = NamedRegistry::new();
+        let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+        reg.register("default", Arc::new(super::in_memory("kafka", queue)))
+            .unwrap();
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(crate::bridge::LoaderShared {
+                project_root: root.to_path_buf(),
+                ts: true,
+            })),
+            Extras {
+                kafkas: Some(Arc::new(reg)),
+                tasks_flag: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn write_task(dir: &std::path::Path, name: &str, src: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, src).unwrap();
+        p
+    }
+
+    /// TLA while 循环任务：flag 置位后自然退出 → Stopped（评审 F3 执行模型）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_tla_while_loop_task_when_flag_set_then_exits_stopped() {
+        let dir = std::env::temp_dir().join(format!("ojtask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_task(
+            &dir,
+            "task_ok.js",
+            "export {};\nwhile (!tasks.stopping()) { await Kafka('default').poll(['t'], { timeoutMs: 30 }); }\n",
+        );
+        let b = task_bridge(&dir);
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter_flag = flag.clone();
+        // Bridge 是 !Send 不能 spawn——同 current_thread task 内 select 驱动：
+        // setter 100ms 后置位，随后永久 pending（绝不赢过 run_task 的自然收场）。
+        let setter = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            setter_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::select! {
+                r = b.run_task(&path, flag, std::time::Duration::from_millis(200)) => r,
+                _ = setter => unreachable!("setter must not win"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(out, crate::bridge::TaskExit::Stopped), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 顶层 throw → Crashed（监督重启信号，评审 F3）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_task_throws_when_run_then_crashed_with_message() {
+        let dir = std::env::temp_dir().join(format!("ojtaskc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_task(
+            &dir,
+            "task_boom.ts",
+            "export {};\nthrow new Error(\"boom\");\n",
+        );
+        let b = task_bridge(&dir);
+        let out = b
+            .run_task(
+                &path,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+        assert!(
+            matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("boom")),
+            "{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CJS 风格任务（无 ESM 标记 + 顶层 await）→ 可诊断的 Crashed（而非句法炸裂）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_cjs_style_task_when_run_then_crashed_with_guidance() {
+        let dir = std::env::temp_dir().join(format!("ojtaskj-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_task(
+            &dir,
+            "task_cjs.ts",
+            "while (!tasks.stopping()) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 30 }); }\n",
+        );
+        let b = task_bridge(&dir);
+        let out = b
+            .run_task(
+                &path,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+        assert!(
+            matches!(&out, crate::bridge::TaskExit::Crashed(m) if m.contains("ESM")),
+            "{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// grace 到期仍不退出 → Killed（terminate + event loop 兜底，评审 F5/SIGSEGV 纪律）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_task_ignoring_flag_when_grace_expires_then_killed() {
+        let dir = std::env::temp_dir().join(format!("ojtaskk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_task(
+            &dir,
+            "task_stuck.ts",
+            "export {};\nwhile (true) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 50 }); }\n",
+        );
+        let b = task_bridge(&dir);
+        let out = b
+            .run_task(
+                &path,
+                Arc::new(AtomicBool::new(true)),
+                std::time::Duration::from_millis(120),
+            )
+            .await;
+        assert!(matches!(out, crate::bridge::TaskExit::Killed), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

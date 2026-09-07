@@ -191,3 +191,18 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 }
+
+#[cfg(test)]
+mod tla_probe_tests {
+    /// TS 转译对顶层 await 的保真性（任务驱动依赖，评审 F3）。
+    #[test]
+    fn ts_transpile_preserves_top_level_await() {
+        let dir = std::env::temp_dir().join(format!("ojtla-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("probe.ts");
+        std::fs::write(&p, "export {};\nwhile (!tasks.stopping()) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 30 }); }\n").unwrap();
+        let out = super::cached_transpile(&p).unwrap();
+        assert!(out.contains("await"), "TLA lost: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

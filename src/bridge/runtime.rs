@@ -176,14 +176,33 @@ pub fn op_state(rt: &JsRuntime) -> Rc<RefCell<deno_core::OpState>> {
 /// panic），`Drop` 会先清空 slot 中的 isolate 句柄，杜绝看门狗在 isolate 已析构后误
 /// `terminate_execution`（同样会 SIGSEGV）。
 /// 每个 Bridge 一个实例（对应一个 JS actor 线程，串行执行故单槽足够）。
-#[derive(Default)]
+/// 看门狗单槽的一次武装。`deadline` 到点即 terminate；`gate`（任务停机 flag + grace）
+/// 供「deadline 未设」时由看门狗代设——flag 置位可能发生在 mod_evaluate 同步自旋
+/// microtask 期间，宿主线程根本轮不到自己观察，只能由看门狗代盯。
+struct Arm {
+    handle: v8::IsolateHandle,
+    deadline: Option<Instant>,
+    gate: Option<(Arc<AtomicBool>, Duration)>,
+}
+
 pub struct KillSwitch {
-    slot: Mutex<Option<(v8::IsolateHandle, Instant)>>,
+    slot: Mutex<Option<Arm>>,
     fired: AtomicBool,
     /// Drop 时置位，通知看门狗线程退出（避免线程泄漏）。
     stop: AtomicBool,
     /// 看门狗线程句柄；Drop 时 join 回收（仅用于生命周期管理，不参与熔断逻辑）。
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Default for KillSwitch {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            fired: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            thread: Mutex::new(None),
+        }
+    }
 }
 
 impl KillSwitch {
@@ -203,13 +222,23 @@ impl KillSwitch {
                     if sw.stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let g = sw.slot.lock().unwrap();
-                    if let Some((h, deadline)) = g.as_ref()
-                        && Instant::now() >= *deadline
+                    let mut g = sw.slot.lock().unwrap();
+                    let Some(arm) = g.as_mut() else {
+                        continue;
+                    };
+                    // 代盯 gate：flag 置位且 deadline 未设 → 现在开始计 grace。
+                    if let Some((gate, grace)) = &arm.gate
+                        && arm.deadline.is_none()
+                        && gate.load(Ordering::Relaxed)
+                    {
+                        arm.deadline = Some(Instant::now() + *grace);
+                    }
+                    if let Some(deadline) = arm.deadline
+                        && Instant::now() >= deadline
                         && !sw.fired.load(Ordering::Relaxed)
                     {
                         // terminate_execution 是 V8 明确允许的跨线程调用（不要求进入 isolate）。
-                        h.terminate_execution();
+                        arm.handle.terminate_execution();
                         sw.fired.store(true, Ordering::Relaxed);
                     }
                 }
@@ -221,13 +250,40 @@ impl KillSwitch {
 
     pub(crate) fn arm(&self, handle: v8::IsolateHandle, timeout: Duration) {
         self.fired.store(false, Ordering::Relaxed);
-        *self.slot.lock().unwrap() = Some((handle, Instant::now() + timeout));
+        *self.slot.lock().unwrap() = Some(Arm {
+            handle,
+            deadline: Some(Instant::now() + timeout),
+            gate: None,
+        });
+    }
+
+    /// 任务常驻驱动专用：武装后由看门狗代盯停机 flag——flag 置位即起算 grace，
+    /// 到点跨线程 terminate。之所以不宿主自己盯：mod_evaluate 的初始 microtask
+    /// checkpoint 会被「TLA 紧循环 + 同步就绪 op」饿死到永不返回，宿主线程连
+    /// select 的协作分支都轮不到；强杀只能出自看门狗线程（评审 F5）。
+    pub(crate) fn arm_on_flag(
+        &self,
+        handle: v8::IsolateHandle,
+        gate: Arc<AtomicBool>,
+        grace: Duration,
+    ) {
+        self.fired.store(false, Ordering::Relaxed);
+        *self.slot.lock().unwrap() = Some(Arm {
+            handle,
+            deadline: None,
+            gate: Some((gate, grace)),
+        });
     }
 
     /// 关闭窗口；返回本窗口内是否触发过熔断。
     pub(crate) fn disarm(&self) -> bool {
         *self.slot.lock().unwrap() = None;
         self.fired.swap(false, Ordering::Relaxed)
+    }
+
+    /// 熔断是否已触发（不清位；供宿主线程观察后放弃等待被终止的 future）。
+    pub(crate) fn fired(&self) -> bool {
+        self.fired.load(Ordering::Relaxed)
     }
 }
 
