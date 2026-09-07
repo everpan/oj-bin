@@ -8,7 +8,7 @@ use std::ffi::c_void;
 
 use crate::{
     AuthGuardVtable, BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable,
-    KVStoreVtable,
+    KVStoreVtable, MqVtable,
 };
 
 pub fn es(vt: &'static EsBackendVtable) -> *const c_void {
@@ -32,6 +32,10 @@ pub fn kv(vt: &'static KVStoreVtable) -> *const c_void {
 }
 
 pub fn auth(vt: &'static AuthGuardVtable) -> *const c_void {
+    vt as *const _ as *const c_void
+}
+
+pub fn mq(vt: &'static MqVtable) -> *const c_void {
     vt as *const _ as *const c_void
 }
 

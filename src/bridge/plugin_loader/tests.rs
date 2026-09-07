@@ -93,6 +93,46 @@ fn no_cfg(_: &str) -> String {
     "{}".to_string()
 }
 
+/// mini-mq 编译产物目录（复用 mini_kv_plugin_dir 模式；与 mini/mini-kv 各占独立目录，
+/// 避免 scan 计数断言翻倍）。
+fn mini_mq_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = ffi::workspace_root();
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "oj-plugin-test-mini-mq"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for test plugin");
+        assert!(status.success(), "test plugin build failed");
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        let built = root
+            .join("target/debug")
+            .join(format!("{prefix}oj_plugin_test_mini_mq.{ext}"));
+        let dir = root.join("target/test-plugins-mq").join(ffi::triple());
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join(ffi::plugin_file_name("mini-mq"));
+        // 幂等拷贝：dest 已存在且不旧于源则跳过（同 mini_plugin_dir，Windows dll 覆写坑）。
+        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
+        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
+        let outdated = match (dst_modified, src_modified) {
+            (Ok(d), Ok(s)) => d < s,
+            _ => true,
+        };
+        if outdated {
+            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
+        }
+        dir
+    })
+    .clone()
+}
+
 // ---- 路径解析 ----
 
 #[test]
@@ -362,6 +402,66 @@ fn probe_finds_declared_axis_and_misses_undeclared() {
     .unwrap();
     assert!(mkv.registrations.kv.is_some());
     assert!(mkv.registrations.auth.is_none());
+}
+
+/// mini（零轴）：mq 槽 None；mini-mq（单轴 mq）：mq 槽 Some——加轴零破坏回归（ABI 7 不变）。
+#[test]
+fn probe_finds_mq_axis_and_zero_axis_mini_misses_it() {
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+    unsafe { std::env::remove_var("MINI_PANIC") };
+    let mini = super::load_one(
+        &mini_plugin_dir().join(ffi::plugin_file_name("mini")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mini.registrations.mq.is_none());
+    let mmq = super::load_one(
+        &mini_mq_plugin_dir().join(ffi::plugin_file_name("mini-mq")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mmq.registrations.mq.is_some());
+    assert_eq!(mmq.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
+}
+
+/// mini-mq call echo 契约冒烟：method + payload 原样回显（JSON in → JSON out）。
+#[tokio::test]
+async fn given_mini_mq_when_call_echo_then_method_and_payload_roundtrip() {
+    // ENV_LOCK 只护同步的 load_one（读 env 在装载期）；guard 须在 await 前释放
+    // （clippy await_holding_lock）。
+    let vt = {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+        unsafe { std::env::remove_var("MINI_PANIC") };
+        let mmq = super::load_one(
+            &mini_mq_plugin_dir().join(ffi::plugin_file_name("mini-mq")),
+            None,
+            host_context(),
+            &no_cfg,
+        )
+        .unwrap();
+        mmq.registrations.mq.unwrap()
+    };
+    let connected = crate::bridge::ffi::await_ffi((vt.connect)(RString::from("{}")))
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8(connected).unwrap(), r#"{"handle":1}"#);
+    let out = crate::bridge::ffi::await_ffi((vt.call)(
+        1,
+        RString::from("echo"),
+        RString::from(r#"{"a":1}"#),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        r#"{"method":"echo","payload":{"a":1}}"#
+    );
 }
 
 #[test]

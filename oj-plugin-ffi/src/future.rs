@@ -129,6 +129,22 @@ pub fn ready_err(msg: impl Into<String>) -> FfiFuture {
     }
 }
 
+/// 立即完成的 Ok FfiFuture（夹具 / 固定响应用；与 ready_err 同款即刻完结语义）。
+pub fn ready_ok(bytes: impl Into<Vec<u8>>) -> FfiFuture {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    drop(tx); // 已 closed → poll 直接读 result 而非 0（pending）
+    FfiFuture {
+        state: Box::into_raw(Box::new(FfiTask {
+            rx,
+            result: Some(Ok(bytes.into())),
+        }))
+        .cast(),
+        poll: task_poll,
+        take: task_take,
+        free: task_free,
+    }
+}
+
 /// 包 catch_unwind 的 vtable 方法包装（返回 FfiFuture）：同步 panic → 立即错误 future，
 /// 不再跨界展开（UB，spec §3）。用法：
 /// `extern "C" fn get(h: u64, k: RString) -> FfiFuture { catch_future(|| { ... }) }`
