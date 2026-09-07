@@ -192,7 +192,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
 
-    fn registry_with(name: &str, kind: &'static str) -> Arc<NamedRegistry<MqInstance>> {
+    pub(crate) fn registry_with(name: &str, kind: &'static str) -> Arc<NamedRegistry<MqInstance>> {
         let mut reg = NamedRegistry::new();
         let queue = Arc::new(Mutex::new(Vec::new()));
         reg.register(name, Arc::new(in_memory(kind, queue)))
@@ -218,7 +218,7 @@ mod tests {
         )
     }
 
-    async fn run(b: &Bridge, src: &str) -> Result<String, String> {
+    pub(crate) async fn run(b: &Bridge, src: &str) -> Result<String, String> {
         b.run_with(src, RequestInfo::default())
             .await
             .map(|c| String::from_utf8_lossy(&c.body).into_owned())
@@ -393,5 +393,81 @@ mod tests {
     ) -> oj_plugin_ffi::FfiFuture {
         let out = format!(r#"{{"payload":{}}}"#, &p[..]);
         oj_plugin_ffi::ready_ok(out.into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod js_global_tests {
+    use super::MqInstance;
+    use super::tests::*;
+    use crate::bridge::NamedRegistry;
+    use crate::bridge::{Bridge, Extras, InMemoryKV, SchemaRegistry};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    async fn run(reg: Option<Arc<NamedRegistry<MqInstance>>>, src: &str) -> String {
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                kafkas: reg.clone(),
+                rabbits: reg,
+                tasks_flag: Some(Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            },
+        );
+        b.run_with(src, crate::bridge::RequestInfo::default())
+            .await
+            .map(|c| String::from_utf8_lossy(&c.body).into_owned())
+            .unwrap()
+    }
+
+    /// Kafka(name) 同一性：两次调用同一对象（mqCache，评审 N2/D 同 dbCache 语义）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_named_kafka_when_lookup_twice_then_same_object() {
+        let out = run(Some(super::tests::registry_with("default", "kafka")),
+            "const k = Kafka(\"default\"); json.ok(k === Kafka(\"default\") && typeof k.send === \"function\");")
+            .await;
+        assert!(out.contains("true"), "{out}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_unconfigured_name_when_lookup_then_undefined() {
+        let out = run(
+            None,
+            "json.ok(Kafka(\"nope\") === undefined && RabbitMQ(\"nope\") === undefined);",
+        )
+        .await;
+        assert!(out.contains("true"), "{out}");
+    }
+
+    /// rabbit 面：publish 是 send 的命名（payload 带 exchange/routingKey），无 send/commit 暴露。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_rabbit_instance_when_publish_then_payload_shaped() {
+        let reg = super::tests::registry_with("default", "rabbit");
+        let out = run(
+            Some(reg),
+            "const r = RabbitMQ(\"default\"); \
+             json.ok(typeof r.send === \"undefined\" && typeof r.publish === \"function\" && typeof r.ack === \"function\");",
+        )
+        .await;
+        assert!(out.contains("true"), "{out}");
+    }
+
+    /// kafka 面：send/poll/commit 可用，publish/ack 不暴露。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_kafka_instance_when_probe_surface_then_kafka_shape() {
+        let reg = super::tests::registry_with("default", "kafka");
+        let out = run(
+            Some(reg),
+            "const k = Kafka(\"default\"); \
+             json.ok(typeof k.send === \"function\" && typeof k.poll === \"function\" && typeof k.commit === \"function\" && typeof k.publish === \"undefined\");",
+        )
+        .await;
+        assert!(out.contains("true"), "{out}");
     }
 }

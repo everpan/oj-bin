@@ -276,6 +276,41 @@ declare global {
   }): Promise<OjFetchResponse>;
   // 已加载插件自省：[{name, semver, abi_version, fingerprint, host_abi_version}]。
   function plugins(): any[];
+
+  // 命名 MQ 客户端（config kafkas:/rabbits: 段；未配置的名 → undefined）。
+  // 消费方法（poll/commit/ack/nack）仅长任务上下文可用（HTTP/WS 内调用报错）。
+  function Kafka(name: string): OjKafkaClient | undefined;
+  function RabbitMQ(name: string): OjRabbitClient | undefined;
+  // 长任务上下文：检测停机信号（HTTP/WS 上下文恒 false）。
+  function tasks(): { stopping(): boolean };
+}
+
+interface OjMqMessage {
+  topic: string;
+  partition?: number;
+  offset?: number;
+  key?: string;
+  value: any;
+  headers?: Record<string, string>;
+  ts?: number;
+  deliveryTag?: number; // rabbit 专属：ack/nack 载荷原样回传
+}
+
+interface OjKafkaClient {
+  kind(): Promise<string>;
+  send(topic: string, o: { key?: string; partition?: number; headers?: Record<string, string>; value: any }): Promise<{ sent: number }>;
+  poll(topics: string[], o?: { max?: number; timeoutMs?: number }): Promise<{ messages: OjMqMessage[] }>;
+  commit(m: OjMqMessage): Promise<Record<string, never>>;
+  metadata(): Promise<any>;
+}
+
+interface OjRabbitClient {
+  kind(): Promise<string>;
+  publish(exchange: string, routingKey: string, value: any, o?: { headers?: Record<string, string> }): Promise<{ sent: number }>;
+  poll(queues: string[], o?: { max?: number; timeoutMs?: number }): Promise<{ messages: OjMqMessage[] }>;
+  ack(m: OjMqMessage): Promise<Record<string, never>>;
+  nack(m: OjMqMessage, requeue?: boolean): Promise<Record<string, never>>;
+  metadata(): Promise<any>;
 }
 
 // fetch 返回的 Response（浏览器风格子集）。

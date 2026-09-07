@@ -142,6 +142,42 @@ globalThis.__ojMq = {
   stopping: op_tasks_stopping,
 };
 
+// ----- Kafka / RabbitMQ: named mq clients (per-name JS cache guarantees identity, like DB) -----
+// Kind-shaped surfaces: kafka = send/poll/commit; rabbit = publish(alias of send)/poll/ack/nack.
+// Consumers (poll/commit/ack/nack) are gated Rust-side to task contexts (long-running tasks).
+const mqCache = new Map();
+function mqClient(kind) {
+  return function (name) {
+    name = String(name);
+    const key = kind + " " + name;
+    if (!mqCache.has(key)) {
+      if (!op_mq_has(kind, name)) return undefined;
+      const inst = {
+        kind: () => op_mq_call(kind, name, "kind", null),
+        metadata: () => op_mq_call(kind, name, "metadata", null),
+      };
+      if (kind === "kafka") {
+        inst.send = (topic, o) => op_mq_call(kind, name, "send", { topic, ...(o || {}) });
+        inst.poll = (topics, o) => op_mq_call(kind, name, "poll", { topics, ...(o || {}) });
+        inst.commit = (m) => op_mq_call(kind, name, "commit", m);
+      } else {
+        inst.publish = (exchange, routingKey, value, o) =>
+          op_mq_call(kind, name, "send", { exchange, routingKey, value, ...(o || {}) });
+        inst.poll = (queues, o) => op_mq_call(kind, name, "poll", { queues, ...(o || {}) });
+        inst.ack = (m) => op_mq_call(kind, name, "ack", m);
+        inst.nack = (m, requeue) => op_mq_call(kind, name, "nack", { ...m, requeue: !!requeue });
+      }
+      mqCache.set(key, inst);
+    }
+    return mqCache.get(key);
+  };
+}
+globalThis.Kafka = mqClient("kafka");
+globalThis.RabbitMQ = mqClient("rabbit");
+
+// ----- tasks: long-running task context (stopping flag; always false outside task bridges) -----
+globalThis.tasks = { stopping: () => op_tasks_stopping() };
+
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 globalThis.ws = {
   send: (data) => op_ws_send(String(data)),
