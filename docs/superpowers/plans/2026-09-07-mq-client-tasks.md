@@ -30,6 +30,34 @@
 | P5 任务池 | T9 config tasks: + 监督器 | 生产级生命周期 |
 | P6 构建收尾 | T10 build 镜像；T11 文档示例；T12 v0.1.6+全量验证 | 发布就绪 |
 
+## 执行状态（2026-09-08 收官）
+
+**12/12 任务完成，v0.1.6 发布就绪；统一审查（架构师 + 开发专家双路）已收官。**
+
+| 阶段 | 状态 | 提交 |
+|---|---|---|
+| P1 契约层（T1+T2） | ✅ | `c382fc8`、`5d9d332` |
+| P2 插件层（T3+T4） | ✅ | `e74000f`、`55a1058` |
+| P3 宿主绑定（T5–T7） | ✅ | `334044e`、`17274b8`、`bfc72e2` |
+| P4 任务驱动（T8） | ✅ | `a5a21ce`（看门狗代盯 flag：mod_evaluate microtask 饿死 + TLA promise 悬空两层根因修复） |
+| P5 任务池（T9） | ✅ | `577dbbb`（全仓首个信号处理器：SIGINT/SIGTERM → flag → axum graceful → join） |
+| P6 收尾（T10–T12） | ✅ | `228fe74`、`19d05dc`、`9efe2a5` |
+| 统一审查处置 | ✅ | `eadd1ed`（架构师 11 项）、`a42ec4d`（开发专家 5 项） |
+
+**统一审查裁决要点**（两路均「需修后合入」，已全部处置）：
+
+- must：`timeoutMs` 被 serde 静默丢弃（rename+alias 修复 + 三态断言）；`looks_cjs`
+  预检违背 spec F3（撤除，任务一律 ESM）；消费门禁误读停机信号值（`is_some_and(load)`
+  → `is_some()`，正常运行期消费曾被全拒——夹具预置 true 掩盖，已矫正并加回归钉）；
+  rabbit channel 逐次新建泄漏（lapin 无 Drop→close，持久化复用 + 失效自愈）。
+- should：宿主 Drop 兜底 close（§6 ④）；load_modules 跳过目录参数化；rabbit 空轮
+  间歇；退避切片睡眠感知停机；多分区 commit 骨架修订；进程级 SIGTERM 停机 e2e 落地。
+- nit：过期 allow、`delivery_tag` 类型对齐、kafka topic 固化文档化、metadata URL
+  掩码、Killed/自然退出日志分列。
+
+**最终门禁**：fmt / clippy workspace `-D warnings` / `cargo test --workspace` 全绿
+（含进程级 SIGTERM e2e）/ `cargo xtask build`（release）通过。
+
 ---
 
 ### Task 1: mq 轴契约 + 宿主探测 + mini 夹具
@@ -45,7 +73,7 @@
 - Produces: `oj_plugin_ffi::MqVtable { connect, call, close }`；宿主 `Registrations.mq`；`probe_axes` 识别 `"mq"`；mini 插件导出 `oj_plugin_axis_mq`
 - call 约定：`call(handle, method, payload_json) -> FfiFuture`，ok 值 = 结果 JSON；未实现 method → Err(`unsupported method: <m>`)
 
-- [ ] **Step 1: 写失败测试（mini 夹具 mq 轴 + 宿主探测）**
+- [x] **Step 1: 写失败测试（mini 夹具 mq 轴 + 宿主探测）**
 
 ```rust
 // tests/plugins/mini 既有集成测试文件内追加（照现有用例风格，路径见文件内 mod tests）
@@ -77,12 +105,12 @@ async fn given_cancelled_await_when_dropped_then_plugin_state_freed_not_taken() 
 }
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p only-js --lib probe` 与 `cargo test -p only-js --test *mini*`
 Expected: FAIL（`MqVtable`/`registrations.mq` 不存在，编译错误即红）
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 // oj-plugin-ffi/src/mq.rs —— 镜像 src/bus.rs 的 EventBrokerVtable 形态
@@ -113,12 +141,12 @@ pub mq: Option<&'static oj_plugin_ffi::MqVtable>,
 
 mini 夹具：`oj_plugin_entry!(init, bus => &BUS_VT, mq => &MQ_VT)`，`MQ_VT` 三函数返回固定 JSON（connect→`{"handle":1}`、call→echo payload、close→空），函数体用 `catch_future` 包裹（同 mini 现有轴）。
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p only-js probe` + `cargo test -p only-js mini` + `cargo clippy -p only-js -p oj-plugin-ffi --all-targets -- -D warnings`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat(ffi): mq 轴契约（JSON method dispatch）+ 宿主探测 + mini 夹具，ABI 保持 7"
@@ -135,7 +163,7 @@ git add -A && git commit -m "feat(ffi): mq 轴契约（JSON method dispatch）+ 
 **Interfaces:**
 - Produces: `pub(crate) async fn await_ffi_poll(fut: FfiFuture, backoff: std::time::Duration) -> Result<Vec<u8>, String>`——poll→0 时 `tokio::time::sleep(backoff)` 再试；取结果/free 语义与 `await_ffi` 逐字一致（FfiGuard Drop 只 free 不 take）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test]
@@ -151,12 +179,12 @@ async fn given_slow_ffi_future_when_await_ffi_poll_then_no_busy_spin() {
 }
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 Run: `cargo test -p only-js await_ffi_poll`
 Expected: FAIL（函数不存在）
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// mq 长轮询版 await_ffi：Pending 时 sleep 退避（评审 F4——yield_now 空转烧核）。
@@ -182,12 +210,12 @@ pub(crate) async fn await_ffi_poll(fut: FfiFuture, backoff: std::time::Duration)
 }
 ```
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 Run: `cargo test -p only-js ffi` + clippy 同 Task 1
 Expected: PASS（既有 await_ffi 测试不回归）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat(ffi): await_ffi_poll 长轮询退避变体——mq poll 不烧核（评审 F4）"
@@ -219,7 +247,7 @@ git add -A && git commit -m "feat(ffi): await_ffi_poll 长轮询退避变体—�
 // 未知 method → Err(format!("unsupported method: {m}"))
 ```
 
-- [ ] **Step 1: 写失败测试（BDD）**
+- [x] **Step 1: 写失败测试（BDD）**
 
 ```rust
 #[test]
@@ -239,10 +267,10 @@ fn given_unknown_method_when_call_then_err_lists_unsupported() {
 // 既有 bus roundtrip / requires_brokers 用例零改动必须仍绿（回归护栏）
 ```
 
-- [ ] **Step 2: 跑红** → Run: `cargo test -p oj-bus-kafka`，Expected: 编译错（MQ_VTABLE 不存在）
-- [ ] **Step 3: 实现**（按实现要点 1-3 重构；bus 面行为零变化）
-- [ ] **Step 4: 跑绿** → Run: `cargo test -p oj-bus-kafka` + `cargo clippy -p oj-bus-kafka --all-targets -- -D warnings`；env-gated 用例在配 `OJ_TEST_KAFKA_BROKERS` 时本地跑一次
-- [ ] **Step 5: Commit** → `feat(kafka-plugin): KafkaCore + mq 轴 + bus close 泄漏修复（评审 S1/F7）`
+- [x] **Step 2: 跑红** → Run: `cargo test -p oj-bus-kafka`，Expected: 编译错（MQ_VTABLE 不存在）
+- [x] **Step 3: 实现**（按实现要点 1-3 重构；bus 面行为零变化）
+- [x] **Step 4: 跑绿** → Run: `cargo test -p oj-bus-kafka` + `cargo clippy -p oj-bus-kafka --all-targets -- -D warnings`；env-gated 用例在配 `OJ_TEST_KAFKA_BROKERS` 时本地跑一次
+- [x] **Step 5: Commit** → `feat(kafka-plugin): KafkaCore + mq 轴 + bus close 泄漏修复（评审 S1/F7）`
 
 ---
 
@@ -250,7 +278,7 @@ fn given_unknown_method_when_call_then_err_lists_unsupported() {
 
 **Files / Interfaces / Steps:** 与 Task 3 完全同构（文件 `plugins/oj-bus-rabbitmq/src/lib.rs`；Core 方法 `publish(exchange,routingKey,headers,value) / poll(queues,max,timeoutMs)=循环 basic.get / ack / nack(requeue)`；kind 自检 "rabbit"；mq handle 独立编号；既有 bus ack-on-receive 行为保持、close 修复同款）。
 
-- [ ] Step 1-5：同 Task 3 节奏（BDD：wrong-kind connect Err / env-gated `OJ_TEST_AMQP_URL` roundtrip / unsupported method / bus 回归零改动）
+- [x] Step 1-5：同 Task 3 节奏（BDD：wrong-kind connect Err / env-gated `OJ_TEST_AMQP_URL` roundtrip / unsupported method / bus 回归零改动）
 - Commit → `feat(rabbit-plugin): RabbitCore + mq 轴（评审 F7 同构）`
 
 ---
@@ -282,7 +310,7 @@ op_tasks_stopping() -> bool            // flag None/false → false
 // poller 互斥：Registry 内每实例带 tokio::sync::Mutex<()> poller 锁（构造于 MqInstance::new），第二个 poll try_send 失败 → JsError("instance busy")
 ```
 
-- [ ] **Step 1: 写失败测试（BDD，全部用 InMemoryMq——内存 Vec 队列实现同一 call 面）**
+- [x] **Step 1: 写失败测试（BDD，全部用 InMemoryMq——内存 Vec 队列实现同一 call 面）**
 
 ```rust
 #[test]
@@ -297,10 +325,10 @@ async fn given_task_context_when_two_concurrent_polls_then_second_busy() { /* fl
 fn given_kafka_and_rabbit_same_name_when_lookup_then_both_resolve() { /* Kafka("x") 与 RabbitMQ("x") 并存（双 registry） */ }
 ```
 
-- [ ] **Step 2: 跑红** → `cargo test -p only-js mq`，Expected: 编译错
-- [ ] **Step 3: 实现**（mq.rs 全量：`InMemoryMq`（测试注入用，pub(crate)）+ `FfiMqInstance::new(vt, handle)`（call 经 `await_ffi_poll`，Task 2 产出）+ 三 op + StableState/Extras 字段 + extension ops 数组追加三行）
-- [ ] **Step 4: 跑绿** → `cargo test -p only-js` + clippy
-- [ ] **Step 5: Commit** → `feat(mq): 宿主 mq.rs——双 registry、op 面、任务门禁、InMemoryMq`
+- [x] **Step 2: 跑红** → `cargo test -p only-js mq`，Expected: 编译错
+- [x] **Step 3: 实现**（mq.rs 全量：`InMemoryMq`（测试注入用，pub(crate)）+ `FfiMqInstance::new(vt, handle)`（call 经 `await_ffi_poll`，Task 2 产出）+ 三 op + StableState/Extras 字段 + extension ops 数组追加三行）
+- [x] **Step 4: 跑绿** → `cargo test -p only-js` + clippy
+- [x] **Step 5: Commit** → `feat(mq): 宿主 mq.rs——双 registry、op 面、任务门禁、InMemoryMq`
 
 ---
 
@@ -345,7 +373,7 @@ globalThis.tasks = { stopping: () => op_tasks_stopping() };
 ```
 - `global.d.ts` 补 `declare function Kafka(name: string): KafkaClient | undefined;` 等接口（含 MqMessage）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test]
@@ -359,7 +387,7 @@ async fn given_unconfigured_name_when_js_kafka_then_undefined() { /* run_with(`K
 async fn given_http_bridge_when_js_tasks_stopping_then_false() { /* flag=None → false */ }
 ```
 
-- [ ] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p only-js` + `bootstrap.js` ASCII 检查 `LC_ALL=C grep -nP '[^\x00-\x7F]' src/bridge/bootstrap.js` 为空）→ [ ] **Step 5: Commit** → `feat(bridge): Kafka/RabbitMQ/tasks JS 全局 + 类型声明`
+- [x] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p only-js` + `bootstrap.js` ASCII 检查 `LC_ALL=C grep -nP '[^\x00-\x7F]' src/bridge/bootstrap.js` 为空）→ [ ] **Step 5: Commit** → `feat(bridge): Kafka/RabbitMQ/tasks JS 全局 + 类型声明`
 
 ---
 
@@ -374,7 +402,7 @@ async fn given_http_bridge_when_js_tasks_stopping_then_false() { /* flag=None �
 - Produces: `async fn build_mq_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<(Arc<NamedRegistry<MqInstance>>, Arc<NamedRegistry<MqInstance>>), String>`
 - kind 路由（评审 F7）：在提供 mq 轴的插件里按 `descriptor.name` 推断——名字形如 `oj-bus-<kind>`（strip "oj-bus-"）；段声明的实例逐个 `connect(json({kind, ...cfg}))`；无对应 kind 插件 → `Err("kafkas: no mq plugin for kind 'kafka' (expected plugin 'oj-bus-kafka')")`；插件拒绝（kind 不符/参数缺失）→ fail-fast 带插件名
 
-- [ ] **Step 1: 写失败测试（BDD）**
+- [x] **Step 1: 写失败测试（BDD）**
 
 ```rust
 #[tokio::test]
@@ -387,7 +415,7 @@ async fn given_rabbits_only_kafka_plugin_loaded_when_assemble_then_fail_fast() {
 fn given_cfg_with_kafkas_rabbits_when_parse_then_hashmaps_filled() { /* config.rs 解析用例，镜像 plugins: 段既有测试 */ }
 ```
 
-- [ ] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(assemble): kafkas/rabbits 装配注入——kind 路由 + fail-fast`
+- [x] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(assemble): kafkas/rabbits 装配注入——kind 路由 + fail-fast`
 
 ---
 
@@ -413,7 +441,7 @@ impl Bridge {
 }
 ```
 
-- [ ] **Step 1: 写失败测试（BDD）**
+- [x] **Step 1: 写失败测试（BDD）**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -433,7 +461,7 @@ async fn given_cjs_style_task_file_when_run_then_still_tla_capable() {
 }
 ```
 
-- [ ] **Step 2: 跑红** → [ ] **Step 3: 实现**（run_task 镜像 `boot_runtime` 的 mod_evaluate/event_loop 顺序；`kill_after` = spawn 看门狗 sleep→arm，复用 KillSwitch，注意其 Drop join 语义 `runtime.rs:234-249`）→ [ ] **Step 4: 跑绿** → [ ] **Step 5: Commit** → `feat(runtime): 任务 ESM 常驻驱动 + Bridge::kill_after 停机面`
+- [x] **Step 2: 跑红** → [ ] **Step 3: 实现**（run_task 镜像 `boot_runtime` 的 mod_evaluate/event_loop 顺序；`kill_after` = spawn 看门狗 sleep→arm，复用 KillSwitch，注意其 Drop join 语义 `runtime.rs:234-249`）→ [ ] **Step 4: 跑绿** → [ ] **Step 5: Commit** → `feat(runtime): 任务 ESM 常驻驱动 + Bridge::kill_after 停机面`
 
 ---
 
@@ -457,7 +485,7 @@ pub async fn supervise(cfg: TasksCfg, root: PathBuf, make_bridge: impl Fn() -> B
 // ④ 到期 kill_after → 任务线程兜 event loop → drop ⑤ mq handle Drop→close ⑥ axum with_graceful_shutdown 同信号触发 ⑦ 退出
 ```
 
-- [ ] **Step 1: 写失败测试（BDD）**
+- [x] **Step 1: 写失败测试（BDD）**
 
 ```rust
 #[test]
@@ -478,7 +506,7 @@ async fn given_crashing_task_when_supervised_then_restarts_with_backoff() {
 async fn given_running_tasks_when_shutdown_flag_then_all_join_within_grace() { /* 优雅停机：flag 置位 → join 全部 → Stopped 日志 */ }
 ```
 
-- [ ] **Step 2: 跑红** → [ ] **Step 3: 实现**（`std::thread::Builder::name(format!("task-{name}"))` + current_thread runtime，同 routes.rs introspector 模式；信号处理用 `tokio::signal::ctrl_c` + `tokio::signal::unix::signal(SignalKind::terminate())`；每任务一行启动日志格式见 spec §6）→ [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(tasks): 长任务池监督器——命名扫描/退避重启/优雅停机/启动日志`
+- [x] **Step 2: 跑红** → [ ] **Step 3: 实现**（`std::thread::Builder::name(format!("task-{name}"))` + current_thread runtime，同 routes.rs introspector 模式；信号处理用 `tokio::signal::ctrl_c` + `tokio::signal::unix::signal(SignalKind::terminate())`；每任务一行启动日志格式见 spec §6）→ [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(tasks): 长任务池监督器——命名扫描/退避重启/优雅停机/启动日志`
 
 ---
 
@@ -491,7 +519,7 @@ async fn given_running_tasks_when_shutdown_flag_then_all_join_within_grace() { /
 **Interfaces:**
 - Produces: build 时把 `<api_root>/<tasks.dir>/` 下**全部** `.ts` 转译镜像到 `<out>/tasks/`（保名，含非任务共享库）；无 tasks 目录 → 跳过；**不进 tgz/manifests**（评审 F2 裁决：tasks 非版本化模块）
 
-- [ ] **Step 1: 写失败测试（BDD）**
+- [x] **Step 1: 写失败测试（BDD）**
 
 ```rust
 #[test]
@@ -502,7 +530,7 @@ fn given_src_with_tasks_when_build_then_dist_tasks_transpiled() {
 fn given_src_without_tasks_when_build_then_no_tasks_dir() { /* dist/tasks 不存在 */ }
 ```
 
-- [ ] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(build): tasks 目录转译镜像 → dist/tasks（评审 F2）`
+- [x] **Step 2: 跑红** → [ ] **Step 3: 实现** → [ ] **Step 4: 跑绿**（`cargo test -p oj`）→ [ ] **Step 5: Commit** → `feat(build): tasks 目录转译镜像 → dist/tasks（评审 F2）`
 
 ---
 
@@ -513,9 +541,9 @@ fn given_src_without_tasks_when_build_then_no_tasks_dir() { /* dist/tasks 不存
 - Modify: `docs/devkit/api-manual.md`（§6 全局总表加 Kafka/RabbitMQ/tasks + 新章「命名 MQ 客户端与长任务」，含顺序语义/超时互动一句）、`docs/user-manual.md`（config 参考 kafkas/rabbits/tasks）、`sample/MODULES.md`（任务池一节）
 - Test: 文档任务无自动化测试；验证 = `oj build` + `oj server` 启动日志出现 `task: demo (task_demo.ts) → started`
 
-- [ ] **Step 1: 写示例与文档（内容依 spec §4/§6 逐条落）**
-- [ ] **Step 2: 手工验证** → `cargo run -p oj -- server -c sample/config.yaml --api-path sample/src`（Ctrl-C 观察停机序列日志）
-- [ ] **Step 3: Commit** → `docs(mq): 命名 MQ 客户端与长任务池手册 + sample 任务示例`
+- [x] **Step 1: 写示例与文档（内容依 spec §4/§6 逐条落）**
+- [x] **Step 2: 手工验证** → `cargo run -p oj -- server -c sample/config.yaml --api-path sample/src`（Ctrl-C 观察停机序列日志）
+- [x] **Step 3: Commit** → `docs(mq): 命名 MQ 客户端与长任务池手册 + sample 任务示例`
 
 ---
 
@@ -524,8 +552,8 @@ fn given_src_without_tasks_when_build_then_no_tasks_dir() { /* dist/tasks 不存
 **Files:**
 - Modify: `oj/Cargo.toml`（version = "0.1.6"）、`Cargo.lock`（随构建刷新）
 
-- [ ] **Step 1: 版本 bump** → `oj/Cargo.toml` 0.1.6
-- [ ] **Step 2: 全量门禁** →
+- [x] **Step 1: 版本 bump** → `oj/Cargo.toml` 0.1.6
+- [x] **Step 2: 全量门禁** →
 
 ```bash
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -533,4 +561,4 @@ cargo build --workspace && cargo xtask build && cargo xtask plugin mini --check
 ```
 
 Expected: 全绿（统一审查在此产物上进行——用户裁决：阶段间不插审查，完成后一次审）
-- [ ] **Step 3: Commit** → `chore(release): oj 0.1.6——MQ 命名客户端 + 长任务池`
+- [x] **Step 3: Commit** → `chore(release): oj 0.1.6——MQ 命名客户端 + 长任务池`
