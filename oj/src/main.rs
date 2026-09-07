@@ -98,6 +98,7 @@ mod tests {
         .unwrap();
         let a = BuildArgs {
             module: None,
+            config: d.join("config.yaml").display().to_string(),
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,
@@ -116,6 +117,7 @@ mod tests {
         // foo 目录无 manifest.yaml → 构建失败。
         let a = BuildArgs {
             module: Some("foo".into()),
+            config: d.join("config.yaml").display().to_string(),
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,

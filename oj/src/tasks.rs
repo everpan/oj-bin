@@ -11,27 +11,20 @@ use std::time::{Duration, Instant};
 use only_js::bridge::TaskExit;
 use only_js::config::TasksCfg;
 
-/// 扫描任务池目录（评审用户裁决的命名约定）：
+/// 扫描任务池目录（评审用户裁决的命名约定，spec §6：递归扫描）：
 /// `task_{name}.{ts,js}` / `{name}_task.{ts,js}` → (name, path)；其余文件忽略
-/// （任务项目共享库）。同名双写（task_x + x_task）→ Err；数量超 max → Err。
-/// 结果按 name 排序（启动顺序确定）。
+/// （任务项目共享库，含子目录）。同名双写（task_x + x_task）→ Err；数量超
+/// max → Err。结果按 name 排序（启动顺序确定）。
 pub fn scan_tasks(dir: &Path, max: usize) -> Result<Vec<(String, PathBuf)>, String> {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
+    let mut files = Vec::new();
+    match walk_ts_js(dir, &mut files) {
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("read {}: {e}", dir.display())),
-    };
+        Err(e) => return Err(format!("scan {}: {e}", dir.display())),
+    }
     let mut out: Vec<(String, PathBuf)> = Vec::new();
-    for entry in rd {
-        let p = entry.map_err(|e| format!("readdir: {e}"))?.path();
-        if !p.is_file() {
-            continue;
-        }
+    for p in files {
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if !matches!(ext, "ts" | "js") {
-            continue;
-        }
         let name = if let Some(n) = stem.strip_prefix("task_") {
             n
         } else if let Some(n) = stem.strip_suffix("_task") {
@@ -55,6 +48,22 @@ pub fn scan_tasks(dir: &Path, max: usize) -> Result<Vec<(String, PathBuf)>, Stri
         ));
     }
     Ok(out)
+}
+
+/// 递归收集 dir 下全部 .ts/.js。
+fn walk_ts_js(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            walk_ts_js(&p, out)?;
+        } else if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("ts") | Some("js")
+        ) {
+            out.push(p);
+        }
+    }
+    Ok(())
 }
 
 /// 单任务线程句柄。
@@ -189,7 +198,7 @@ mod tests {
         }
     }
 
-    /// BDD：scan 只认 task_*/ *_task 约定文件，其余（含子目录/共享库）忽略。
+    /// BDD：scan 只认 task_*/ *_task 约定文件，其余（含子目录共享库）忽略；递归入池。
     #[test]
     fn given_dir_with_task_and_lib_files_when_scan_then_only_task_files_listed() {
         let d = tmpdir("scan");
@@ -200,10 +209,12 @@ mod tests {
         std::fs::write(pool.join("helpers.ts"), "export {};\n").unwrap();
         std::fs::create_dir_all(pool.join("_shared")).unwrap();
         std::fs::write(pool.join("_shared/x.ts"), "export {};\n").unwrap();
+        std::fs::create_dir_all(pool.join("nested/deep")).unwrap();
+        std::fs::write(pool.join("nested/deep/task_deep.ts"), "export {};\n").unwrap();
         let out = scan_tasks(&pool, 64).unwrap();
         assert_eq!(
             out.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-            vec!["audit", "orders"],
+            vec!["audit", "deep", "orders"],
             "{out:?}"
         );
         let _ = std::fs::remove_dir_all(&d);

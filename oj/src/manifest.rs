@@ -89,6 +89,11 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
             continue;
         }
         let dirname = e.file_name().to_string_lossy().into_owned();
+        // 保留目录：长任务池（spec 2026-09-07 §6/T10）——非模块，由 tasks 监督器/
+        // build 镜像单独处理；其余目录缺 manifest.yaml 仍是错误。
+        if dirname == "tasks" {
+            continue;
+        }
         let mf = p.join("manifest.yaml");
         if !mf.is_file() {
             return Err(format!("module '{dirname}' missing manifest.yaml"));

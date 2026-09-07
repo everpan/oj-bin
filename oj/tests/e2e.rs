@@ -65,6 +65,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         let _ = std::fs::remove_dir_all(&dist);
         oj::build_cmd::run(&oj::args::BuildArgs {
             module: None,
+            config: "config.yaml".into(),
             dir: root.join("src").display().to_string(),
             out: dist.display().to_string(),
             minify: true,
@@ -355,6 +356,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
     ]);
     let a = BuildArgs {
         module: Some("u".into()),
+        config: "config.yaml".into(),
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
         minify: true,
@@ -420,6 +422,7 @@ async fn build_then_release_serves_end_to_end() {
     ]);
     oj::build_cmd::run(&BuildArgs {
         module: None,
+        config: "config.yaml".into(),
         dir: t.join("src").display().to_string(),
         out: t.join("dist").display().to_string(),
         minify: true,

@@ -41,6 +41,8 @@ pub struct TestArgs {
 /// `oj build [module] [-d src] [-o dist] [--no-minify] [--check]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
     pub module: Option<String>,
+    /// 配置文件（读 tasks.dir 决定镜像目录名；缺文件回落默认 "tasks"）。
+    pub config: String,
     pub dir: String,
     pub out: String,
     /// 转译产物 minify（单行、剥注释）。默认开；`--no-minify` 排障逃生门。
@@ -127,6 +129,9 @@ enum Commands {
     Build {
         /// 目标模块名（src 首层子目录）；省略 = 全部模块
         module: Option<String>,
+        /// 配置文件（读 tasks.dir 决定镜像目录名；缺文件回落默认 "tasks"）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
         /// 源码目录
         #[arg(short, long, default_value = "src")]
         dir: String,
@@ -239,12 +244,14 @@ fn to_command(cli: Cli) -> Command {
         }),
         Commands::Build {
             module,
+            config,
             dir,
             out,
             no_minify,
             check,
         } => Command::Build(BuildArgs {
             module,
+            config,
             dir,
             out,
             minify: !no_minify,

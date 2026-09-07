@@ -59,7 +59,94 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     for name in &names {
         build_one(&src, &out, name, &view, a.minify).await?;
     }
+    // tasks 目录转译镜像（T10，评审 F2）：非版本化资产，不进锁/tgz。
+    mirror_tasks(&src, &out, &tasks_dir_of(&a.config), a.minify)?;
     println!("oj build: {} module(s) → {}", names.len(), out.display());
+    Ok(())
+}
+
+/// tasks 目录名：读配置的 `tasks.dir`（缺文件回落默认 "tasks"——build 不强制要求
+/// server 配置存在）。
+fn tasks_dir_of(config: &str) -> String {
+    let p = Path::new(config);
+    let dir = p
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
+        .map(|c| c.tasks.dir)
+        .unwrap_or_else(|_| "tasks".to_string())
+}
+
+/// 递归收集 dir 下全部 .ts/.js（相对 dir 的路径）。
+fn walk_ts_js(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in rd {
+        let p = entry.map_err(|e| format!("readdir: {e}"))?.path();
+        if p.is_dir() {
+            walk_ts_js(&p, out)?;
+        } else if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("ts") | Some("js")
+        ) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// tasks 池镜像（spec §6/T10）：`<src>/<tasks.dir>` → `<out>/<tasks.dir>`，递归。
+/// .ts → 转译 .js（相对 import `./x.ts` → `./x.js`）；.js → 原样转译直通；
+/// 其余扩展名跳过。目录不存在 = 跳过（空池）。
+fn mirror_tasks(src: &Path, out: &Path, tasks_dir: &str, minify: bool) -> Result<(), String> {
+    let from = src.join(tasks_dir);
+    if !from.is_dir() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    walk_ts_js(&from, &mut files)?;
+    let to = out.join(tasks_dir);
+    for f in &files {
+        let rel = f.strip_prefix(&from).unwrap_or(f);
+        let dst_dir = to.join(rel.parent().unwrap_or(Path::new("")));
+        std::fs::create_dir_all(&dst_dir)
+            .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
+        let js = transpile::cached_transpile(f)
+            .map_err(|e| format!("transpile {}: {e}", f.display()))?;
+        // 相对 import 落 .js 后缀（任务池内互导；行级、字面量，同 fix_relative_imports
+        // 口径：无后缀补 .js、.ts 改 .js、.js/.mjs/.json 原样）。带引号整体替换防子串
+        // 误伤（"./x" 是 "./x.ts" 的前缀）。
+        let mut js = js;
+        for spec in relative_import_specifiers(&js) {
+            let new = if let Some(stem) = spec.strip_suffix(".ts") {
+                Some(format!("{stem}.js"))
+            } else if !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json")
+            {
+                Some(format!("{spec}.js"))
+            } else {
+                None
+            };
+            if let Some(n) = new {
+                for q in ['"', '\''] {
+                    js = js.replace(&format!("{q}{spec}{q}"), &format!("{q}{n}{q}"));
+                }
+            }
+        }
+        let js = if minify {
+            transpile::minify_js(f, &js).map_err(|e| format!("minify {}: {e}", f.display()))?
+        } else {
+            js
+        };
+        let dst = dst_dir.join(rel.with_extension("js").file_name().unwrap());
+        std::fs::write(&dst, js).map_err(|e| format!("write {}: {e}", dst.display()))?;
+    }
+    if !files.is_empty() {
+        println!(
+            "oj build: tasks mirror ({} file(s)) → {}",
+            files.len(),
+            to.display()
+        );
+    }
     Ok(())
 }
 
@@ -675,11 +762,61 @@ mod tests {
     fn build_args(t: &std::path::Path, module: Option<&str>) -> BuildArgs {
         BuildArgs {
             module: module.map(str::to_string),
+            config: t.join("config.yaml").display().to_string(),
             dir: t.join("src").display().to_string(),
             out: t.join("dist").display().to_string(),
             minify: true,
             check: false,
         }
+    }
+
+    /// BDD（T10，评审 F2）：src/tasks 存在 → 全部 .ts 转译镜像到 dist/tasks/
+    /// （保目录结构、.ts→.js、相对 import 补 .js 后缀；共享库一并镜像）；
+    /// 不进 tgz/manifests（任务非版本化模块）。
+    #[tokio::test]
+    async fn given_src_with_tasks_when_build_then_dist_tasks_transpiled() {
+        let t = std::env::temp_dir().join(format!("oj-build-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("src/tasks/_shared")).unwrap();
+        std::fs::write(
+            t.join("src/tasks/task_demo.ts"),
+            "import { tick } from \"./_shared/tick\";\nconst n: number = 1;\nwhile (true) { await Promise.resolve(tick(n)); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/tasks/_shared/tick.ts"),
+            "export function tick(n: number): number { return n; }\n",
+        )
+        .unwrap();
+        run(&build_args(&t, None)).await.unwrap();
+        let demo = std::fs::read_to_string(t.join("dist/tasks/task_demo.js")).unwrap();
+        assert!(demo.contains("const n=1"), "{demo}"); // 类型已剥（转译产物，默认 minify）
+        assert!(demo.contains("\"./_shared/tick.js\""), "{demo}"); // 相对 import 已补 .js 后缀
+        assert!(
+            std::fs::read_to_string(t.join("dist/tasks/_shared/tick.js"))
+                .unwrap()
+                .contains("function tick(n)"),
+            "shared lib transpiled"
+        );
+        // 非版本化：不落锁、不打 tgz。
+        let lock = crate::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
+        assert!(!lock.contains_key("tasks"), "{lock:?}");
+        assert!(!t.join("dist/tasks.tgz").exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（T10）：无 src/tasks → 不产生 dist/tasks。
+    #[tokio::test]
+    async fn given_src_without_tasks_when_build_then_no_tasks_dir() {
+        let t = std::env::temp_dir().join(format!("oj-build-notasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        run(&build_args(&t, None)).await.unwrap();
+        assert!(!t.join("dist/tasks").exists());
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[tokio::test]
