@@ -1,6 +1,6 @@
 ---
 name: oj-api-dev
-description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、oj test。
+description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、Kafka/RabbitMQ 消费任务、tasks 长任务、oj test。
 ---
 
 # oj API 模块开发
@@ -12,6 +12,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 1. **读章**：新项目/新模块 → 手册 §2；写 handler → §4 + §6；用鉴权/租户 → §8；
    写测试 → §9；配置问题 → §10；构建发布 → §11。**要扩展全局对象（`json.page()`
    之类）→ §6 末「ext_boot.js」，不要去改 handler。**
+   **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
+   `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
@@ -28,6 +30,10 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
   出裸 JSON 200（§6）。
 - 路径参数（`http.param`）已 percent-decode，仅用于参数化查询与类型转换，
   **勿拼接文件路径 / URL**。
+- **消费门禁**：MQ 消费方法（`poll/commit/ack/nack`）**只在 `src/tasks/` 任务文件里
+  用**；HTTP/WS handler 里调用直接报错——HTTP 侧发消息用 `send`/`publish`。
+- **任务等待**：运行时无 timer 全局，`setTimeout/setInterval` 不可用；任务里等待
+  一律 `await tasks.sleep(ms)`，循环退出条件一律 `!tasks.stopping()`。
 
 ## 新模块 checklist
 
@@ -56,6 +62,13 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
 | `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |
 | `ext_boot.js` 副作用被放大成百上千次 | boot 每个新建 runtime 都跑（模块数 + `pool_size` + WS 连接数）——只做全局装配，别写库/发广播/打外部接口 |
+| `Kafka("x")` / `RabbitMQ("x")` 是 undefined | config `kafkas:`/`rabbits:` 段没配该实例名（或对应插件未装配） |
+| poll 报 "requires a task context" | 消费方法只能在 `src/tasks/` 任务文件里用；HTTP/WS 侧发消息用 `send`/`publish` |
+| 任务里 `setTimeout` 报 not defined | 运行时无 timer 全局——用 `await tasks.sleep(ms)` |
+| poll 报 "instance busy" | 同一实例已有活跃 poller（任务上下文单 poller）——别并发 poll |
+| 任务收不到消息就退了/killed | `timeoutMs` 应远小于 `stop_grace_secs`；被 killed = 宽限到期看门狗强杀（不响应 `tasks.stopping()`） |
+| 重启后整段消息重复消费 | commit 按 offset+1 推进该分区——多分区主题按分区各 commit 一次（at-least-once，处理须幂等） |
+| 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效） |
 
 ## 手册
 
@@ -64,4 +77,4 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
-（json/http/db/kv/blob/bus/es…）的完整类型。
+（json/http/db/kv/blob/bus/es/Kafka/RabbitMQ/tasks…）的完整类型。
