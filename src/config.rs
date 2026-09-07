@@ -292,6 +292,28 @@ pub struct OidcSection {
     pub clients: HashMap<String, OidcClientCfg>,
 }
 
+/// 长任务池配置（spec 2026-09-07 §6）。dir 相对 API 目录（dev=src/、release=dist/）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TasksCfg {
+    /// 任务池目录（相对 API 目录）。
+    pub dir: String,
+    /// 任务数上限（超过 = fail-fast，防误配打满机器）。
+    pub max: usize,
+    /// 停机宽限秒数：flag 置位后任务有此窗口自然收场，到期看门狗强杀。
+    pub stop_grace_secs: u64,
+}
+
+impl Default for TasksCfg {
+    fn default() -> Self {
+        Self {
+            dir: "tasks".into(),
+            max: 64,
+            stop_grace_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -323,6 +345,10 @@ pub struct Config {
     pub kafkas: HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub rabbits: HashMap<String, serde_json::Value>,
+    /// 长任务池（spec 2026-09-07 §6）：目录约定 task_{name}.* / {name}_task.*；
+    /// 缺省段 = 默认值（dir "tasks"，目录不存在 = 无任务，不报错）。
+    #[serde(default)]
+    pub tasks: TasksCfg,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }
@@ -451,6 +477,38 @@ mod tests {
         c2.server.certificate_path = "c.jws".into();
         assert!(c2.server.cert_paths_configured());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tasks_section_parse() {
+        // tasks: 段（spec §6）：dir / max / stop_grace_secs；缺省 = 内置默认。
+        let dir = std::env::temp_dir().join(format!("ojcfgtask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "tasks:\n",
+                "  dir: workers\n",
+                "  max: 8\n",
+                "  stop_grace_secs: 5\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.tasks.dir, "workers");
+        assert_eq!(c.tasks.max, 8);
+        assert_eq!(c.tasks.stop_grace_secs, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 缺省：默认值（dir "tasks" / max 64 / grace 30s）。
+        let dir2 = std::env::temp_dir().join(format!("ojcfgtask2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("cfg.yaml"), "server: {}\n").unwrap();
+        let c2 = load_from(&dir2, Some("cfg.yaml")).unwrap();
+        assert_eq!(c2.tasks.dir, "tasks");
+        assert_eq!(c2.tasks.max, 64);
+        assert_eq!(c2.tasks.stop_grace_secs, 30);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

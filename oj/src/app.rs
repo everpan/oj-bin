@@ -60,6 +60,10 @@ pub struct App {
     /// 与 actor 工厂共享同一组后端的 StableState，供测试运行时（bridge_ext）复用（修正 #2）。
     stable: Arc<StableState>,
     base: String,
+    /// 长任务停机 flag（spec §6）：信号处理器置位，任务 Bridge 经 Extras 注入。
+    tasks_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// 任务 Bridge 工厂（tasks_flag = Some(flag)；与 actor 工厂共享全部后端 Arc）。
+    make_task_bridge: Arc<dyn Fn() -> Bridge + Send + Sync>,
 }
 
 /// dispatch 外层超时（handler 死循环 KillSwitch 兜底 server.timeout，这里再兜底测试 task）。
@@ -429,8 +433,12 @@ impl App {
             .map_err(|e| format!("broker: {e}"))?;
         // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
         let (kafkas, rabbits) = build_mq_registries(&cfg, &registries.mq).await?;
-        // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，Clone 即共享。
-        let make_bridge = {
+        // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
+        // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。
+        let tasks_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
+        // Clone 即共享。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
+        let make_bridge_of = {
             let (dbs, kv, loader, es, bus) = (
                 dbs.clone(),
                 kv.clone(),
@@ -448,7 +456,7 @@ impl App {
             let boot = boot.clone();
             let jwt = jwt.clone();
             let oidc = oidc.clone();
-            move || {
+            move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
                     kv.clone(),
@@ -470,10 +478,19 @@ impl App {
                         // mq 命名实例（T7 装配注入；此处空表兜底，编译占位）。
                         kafkas: Some(kafkas.clone()),
                         rabbits: Some(rabbits.clone()),
-                        tasks_flag: None,
+                        tasks_flag,
                     },
                 )
             }
+        };
+        let make_bridge = {
+            let f = make_bridge_of.clone();
+            move || f(None)
+        };
+        let make_task_bridge: Arc<dyn Fn() -> Bridge + Send + Sync> = {
+            let f = make_bridge_of;
+            let flag = tasks_flag.clone();
+            Arc::new(move || f(Some(flag.clone())))
         };
         // ext_boot 预热：建 runtime 并跑完 boot，失败即 `Err`（真·启动失败）。
         // 必须前移到建表之前 —— 否则 boot 错误只能借 dev 内省的间接失败暴露，而
@@ -629,6 +646,8 @@ impl App {
             bus,
             stable,
             base,
+            tasks_flag,
+            make_task_bridge,
         })
     }
 
@@ -650,6 +669,16 @@ impl App {
 
     /// 绑定并服务（行为同原 `start`：`.merge(ws)` 已在 from_config 完成；port-0 随机端口）。
     pub async fn serve(self, addr: SocketAddr) -> Result<(SocketAddr, JoinHandle<()>), String> {
+        self.serve_graceful(addr, std::future::pending()).await
+    }
+
+    /// 绑定并服务 + 优雅停机（spec §6 ⑤）：`shutdown` resolve 后停止接受新连接、
+    /// 排空在途请求（与任务池停机同一信号触发）。
+    pub async fn serve_graceful(
+        self,
+        addr: SocketAddr,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(SocketAddr, JoinHandle<()>), String> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| format!("bind: {e}"))?;
@@ -657,9 +686,19 @@ impl App {
             .local_addr()
             .map_err(|e| format!("local_addr: {e}"))?;
         let h = tokio::spawn(async move {
-            let _ = server::serve_router(listener, self.router).await;
+            let _ = server::serve_router(listener, self.router, shutdown).await;
         });
         Ok((bound, h))
+    }
+
+    /// 长任务停机 flag（server_cmd 信号处理器置位）。
+    pub fn tasks_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.tasks_flag.clone()
+    }
+
+    /// 任务 Bridge 工厂（tasks_flag 已注入；监督器每任务一条线程独立建桥）。
+    pub fn make_task_bridge(&self) -> Arc<dyn Fn() -> Bridge + Send + Sync> {
+        self.make_task_bridge.clone()
     }
 
     /// 唯一 StableState（与 actor 共享后端），供测试运行时构造 bridge_ext。

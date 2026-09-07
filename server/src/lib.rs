@@ -248,16 +248,22 @@ pub async fn serve_with_listener(
             Arc::new(RwLock::new(None)),
             Arc::default(),
         ),
+        // 测试路径：永不触发的停机信号（保持原行为）。
+        std::future::pending(),
     )
     .await
 }
 
 /// 已绑定监听 + 完整 Router 服务（oj server 生产路径：app().merge(ws) 后经此起服务）。
+/// `shutdown` resolve 后停止接受新连接并排空在途请求（axum with_graceful_shutdown）。
 pub async fn serve_router(
     listener: tokio::net::TcpListener,
     router: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router).await
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 async fn handle(

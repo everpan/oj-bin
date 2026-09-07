@@ -45,15 +45,60 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         console,
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
+    let tasks_cfg = cfg.tasks.clone();
     let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false).await?;
-    let (bound, h) = app.serve(addr).await?;
+    // 长任务池（spec §6）：随服务拉起——扫描 <dir>/<tasks.dir>，空池/缺目录不报错；
+    // 重名/超 max fail-fast。停机 flag 由 App 持有，信号处理器置位。
+    let task_flag = app.tasks_flag();
+    let sup = crate::tasks::TaskSupervisor::spawn_all(
+        &tasks_cfg,
+        &dir,
+        app.make_task_bridge(),
+        task_flag.clone(),
+    )?;
+    // 全仓首个信号处理器（评审 F5/S2）：SIGINT/SIGTERM → 置停机 flag → HTTP 侧
+    // with_graceful_shutdown 同信号排空在途请求；任务线程在 grace 内自然收场
+    // （不退者由 run_task 内置看门狗强杀）。
+    let (bound, h) = app
+        .serve_graceful(addr, shutdown_signal(task_flag.clone()))
+        .await?;
     println!(
         "oj server listening on http://{bound}{} (dir={}, {})",
         base,
         dir.display(),
         if ts { "dev/ts" } else { "release/js" }
     );
-    h.await.map_err(|e| format!("server task: {e}"))
+    h.await.map_err(|e| format!("server task: {e}"))?;
+    // 任务线程收场（flag 已置位；join 为阻塞调用，移交 blocking 池）。
+    tokio::task::spawn_blocking(move || sup.shutdown())
+        .await
+        .map_err(|e| format!("tasks shutdown: {e}"))?;
+    Ok(())
+}
+
+/// 停机信号（spec §6 ①）：SIGINT（ctrl_c）与 SIGTERM 二选一（Windows 仅 ctrl_c）；
+/// 命中即置停机 flag（任务循环检测退出；HTTP 侧随之排空）。
+async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
+    eprintln!("shutdown: stop flag set — draining tasks and in-flight requests");
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 解析配置 + 目录模式（同 server）：读取 config.yaml，确定服务目录（src 优先 / dist 兜底）、
