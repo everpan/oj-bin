@@ -190,7 +190,8 @@ demo（admin）200、trinity（user）实测 403。
   退避重启；Ctrl-C → `tasks.stopping()` 置位 → 宽限内自然收场（不退者被看门狗
   强杀）→ `task: demo → stopped`。
 - 消费型任务（Kafka/RabbitMQ poll/commit/ack）配 `config.yaml` 的 `kafkas:`/
-  `rabbits:` 段使用；写法见 `docs/devkit/api-manual.md` §6「命名 MQ 客户端与长任务」。
+  `rabbits:` 段使用；教学走读见 `docs/mq-tasks.md`，写法见
+  `docs/devkit/api-manual.md` §6「命名 MQ 客户端与长任务」。
 
 ---
 

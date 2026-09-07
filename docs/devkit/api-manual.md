@@ -784,6 +784,8 @@ globalThis.APP_ENV = "prod";
 ### 命名 MQ 客户端与长任务（Kafka / RabbitMQ / tasks）
 
 > 何时读我：要接 Kafka/RabbitMQ 消费，或写 `src/tasks/` 下的长任务。
+> 教学走读（心智模型 / 实现分层 / 测试地图）见仓库 `docs/mq-tasks.md`
+>（devkit 包内不含，仓库查看）。
 
 **命名客户端**：`kafkas:`/`rabbits:` 段（config §10）每个键装配为一个实例，
 `Kafka("default")` / `RabbitMQ("default")` 取用（同名实例进程内同一对象；未配置的
