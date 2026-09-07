@@ -189,18 +189,31 @@ jobs:
 
       # 用 gh CLI（runner 预装、第一方）而非第三方 action：不引入额外供应链依赖。
       # GITHUB_TOKEN 在 permissions.contents=write 下可建 Release。
+      # 幂等：release 已存在（重跑 / 手工先发过）→ 覆盖上传产物而非 create 报错；
+      # 「手工发过草稿、随后正式推 tag」→ 草稿随本次 tag 推送转正。
       - name: create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          args=()
-          # 手工触发且 draft=true 时发草稿；tag 推送直接发正式版。
-          if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.draft }}" = "true" ]; then
-            args+=(--draft)
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已存在 → 覆盖上传产物"
+            gh release upload "$tag" --clobber dist/*
+            if [ "${{ github.event_name }}" = "push" ] &&
+               [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then
+              gh release edit "$tag" --draft=false
+              echo "草稿 $tag 已随 tag 推送转正"
+            fi
+          else
+            args=()
+            # 手工触发且 draft=true 时发草稿；tag 推送直接发正式版。
+            if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.draft }}" = "true" ]; then
+              args+=(--draft)
+            fi
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes \
+              "${args[@]}" \
+              dist/*
           fi
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ steps.tag.outputs.tag }}" \
-            --generate-notes \
-            "${args[@]}" \
-            dist/*
