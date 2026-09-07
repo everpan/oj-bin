@@ -189,23 +189,20 @@ jobs:
 
       # 用 gh CLI（runner 预装、第一方）而非第三方 action：不引入额外供应链依赖。
       # GITHUB_TOKEN 在 permissions.contents=write 下可建 Release。
-      # 幂等：release 已存在（重跑 / 手工先发过）→ 覆盖上传产物而非 create 报错；
-      # 「手工发过草稿、随后正式推 tag」→ 草稿随本次 tag 推送转正。
+      # 幂等语义（仓库启用了 immutable releases：发布后的 release 资产不可删/换，
+      # `gh release upload --clobber` 会 422 "Cannot delete asset from an immutable
+      # release"，故按 release 状态分派）：
+      #   - 不存在 → 创建（手工 dispatch + draft=true 发草稿；tag 推送直接正式版）
+      #   - 是草稿 → 覆盖上传产物（草稿可变）；tag 推送时随推送转正
+      #   - 已发布 → 产物不可改：三平台产物齐全即幂等成功（重跑场景）；缺失则报错，
+      #     提示删除该 release 与 tag 后重跑
       - name: create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "release $tag 已存在 → 覆盖上传产物"
-            gh release upload "$tag" --clobber dist/*
-            if [ "${{ github.event_name }}" = "push" ] &&
-               [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = "true" ]; then
-              gh release edit "$tag" --draft=false
-              echo "草稿 $tag 已随 tag 推送转正"
-            fi
-          else
+          if ! gh release view "$tag" >/dev/null 2>&1; then
             args=()
             # 手工触发且 draft=true 时发草稿；tag 推送直接发正式版。
             if [ "${{ github.event_name }}" != "push" ] && [ "${{ inputs.draft }}" = "true" ]; then
@@ -216,4 +213,23 @@ jobs:
               --generate-notes \
               "${args[@]}" \
               dist/*
+            exit 0
+          fi
+          draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+          if [ "$draft" != "true" ]; then
+            missing=$(comm -13 \
+              <(gh release view "$tag" --json assets --jq '.assets[].name' | sort) \
+              <(cd dist && ls | sort))
+            if [ -n "$missing" ]; then
+              echo "::error::release $tag 已发布且缺产物：$(echo "$missing" | tr '\n' ' ')。immutable release 不可覆盖——删除该 release 与 tag 后重跑本 workflow" >&2
+              exit 1
+            fi
+            echo "release $tag 已发布且产物齐全 → 幂等跳过"
+            exit 0
+          fi
+          echo "release $tag 为草稿 → 覆盖上传产物"
+          gh release upload "$tag" --clobber dist/*
+          if [ "${{ github.event_name }}" = "push" ]; then
+            gh release edit "$tag" --draft=false
+            echo "草稿 $tag 已随 tag 推送转正"
           fi
