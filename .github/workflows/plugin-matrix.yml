@@ -84,9 +84,30 @@ jobs:
         shell: bash
         run: rm -f "/c/Program Files/Git/usr/bin/link.exe"
 
+      # rdkafka-sys 经 cmake 编 librdkafka 默认 /MD（动态 CRT），而 rustc
+      # windows-msvc 默认静态 CRT（libcmt）→ 混链 1120（__imp__* 符号悬空）。
+      # 工具链文件强制 /MT，与 rustc / V8 静态库一致。cmake crate 认读该环境变量；
+      # 本行内唯一的 cmake 工程就是 librdkafka，作用域刚好。
+      - name: Force static CRT for cmake builds (librdkafka)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: echo "CMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/scripts/msvc-static-crt.cmake" >> "$GITHUB_ENV"
+
       # musl 行启用时：
       # - run: rustup target add x86_64-unknown-linux-musl
       #   且构建以 `cargo build -p oj-<name> --release --target x86_64-unknown-linux-musl`。
+
+      # 先构建并归置全部插件，再跑 workspace 测试：oj/tests/oidc_e2e.rs 等 e2e 在
+      # 运行期从 bin/plugins/<triple>/ dlopen oj-auth——fresh checkout 上若先跑测试，
+      # 装配层会 fail-fast（"config declares [auth] but no auth plugin loaded"）。
+      # 插件清单的单一真相来源是 `tools/xtask/src/main.rs` 的 PLUGINS——CI 不硬编码副本。
+      # （此前此处曾硬编码 7 个插件名，漏掉 `auth`，与 xtask 的 8 个失步。）
+      # xtask 构建与测试同为 --release，顺带预热 target/。
+      - name: build & place plugins
+        shell: bash
+        run: |
+          cargo run --release -p xtask -- build
+          ls -la bin/plugins/${{ matrix.triple }}/
 
       # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建）。
       # infinite_loop 只在 skip_infinite_loop=true 的平台跳过（见 matrix 注释），不再全局跳过。
@@ -101,16 +122,6 @@ jobs:
         run: |
           mkdir -p "bin/${{ matrix.triple }}"
           cp "target/release/oj${{ (matrix.os == 'windows-latest' && '.exe') || '' }}" "bin/${{ matrix.triple }}/"
-
-      # 第一方插件：一次性构建全部并拷入 bin/plugins/<triple>/。
-      # 清单的单一真相来源是 `tools/xtask/src/main.rs` 的 PLUGINS —— CI 不硬编码副本。
-      # （此前此处硬编码了 7 个插件名，漏掉 `auth`，与 xtask 的 8 个失步：CI 产物里没有
-      #  oj-auth，而 sample 的鉴权守卫装配会 fail-fast。副本必然再次失步，故改为消费 xtask。）
-      - name: build & place plugins
-        shell: bash
-        run: |
-          cargo run --release -p xtask -- build
-          ls -la bin/plugins/${{ matrix.triple }}/
 
       # 产物归置（供发布/下载）：宿主二进制与插件各自按 triple 上传，布局与发行同形。
       - uses: actions/upload-artifact@v4

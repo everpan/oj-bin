@@ -712,6 +712,16 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    /// 红线守护：bootstrap.js 必须 7-bit ASCII——deno_core 对 extension 代码做
+    /// 硬校验，注释里的非 ASCII 也会让整个 bridge 注册失败（全路由 500）。
+    #[test]
+    fn bootstrap_js_is_7bit_ascii() {
+        assert!(
+            include_str!("bootstrap.js").is_ascii(),
+            "bootstrap.js must stay 7-bit ASCII (deno_core rejects non-ASCII extension code)"
+        );
+    }
+
     fn new_bridge() -> (Bridge, Arc<InMemoryAccessor>) {
         let db = Arc::new(InMemoryAccessor::new());
         db.seed([json!({"id": 1, "name": "ever"})]);

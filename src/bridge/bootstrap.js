@@ -5,7 +5,7 @@
 // Globals: json / db / DB / http / redis / kv / log / fetch / finish / __ojRequire
 //   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
-// Not ported yet: Redis(name)（命名多 KV 后端）、XORM(name)。
+// Not ported yet: Redis(name) (named multi-KV-backend), XORM(name).
 
 import {
   op_blob_del,
