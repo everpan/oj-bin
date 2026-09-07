@@ -158,6 +158,33 @@ pub(crate) async fn await_ffi(fut: FfiFuture) -> Result<Vec<u8>, String> {
     }
 }
 
+/// mq 长轮询版 await_ffi：Pending 时 sleep 退避（评审 F4——yield_now 空转烧满一核）。
+/// 其余语义（take→free→Guard Drop 只 free 不 take）与 await_ffi 完全一致。
+// 暂无生产调用方：P3 的 FfiMqInstance（Task 5）接入；先落地并有独立测试锁定语义。
+#[allow(dead_code)]
+pub(crate) async fn await_ffi_poll(
+    fut: FfiFuture,
+    backoff: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let mut guard = FfiGuard(Some(fut));
+    loop {
+        let fut = guard.0.as_mut().expect("fut present until return");
+        match (fut.poll)(fut.state) {
+            0 => tokio::time::sleep(backoff).await,
+            code => {
+                let r = (fut.take)(fut.state);
+                (fut.free)(fut.state);
+                fut.state = std::ptr::null_mut(); // 防 guard Drop 二次 free
+                return match (code, std::result::Result::from(r)) {
+                    (1, Ok(b)) => Ok(b.iter().copied().collect()),
+                    (_, Ok(_)) => Err("ffi poll reported error but take succeeded".into()),
+                    (_, Err(e)) => Err(e[..].to_string()),
+                };
+            }
+        }
+    }
+}
+
 /// 宿主侧 FfiFuture 句柄守卫：state 非 null 时 Drop 只 free 不 take。
 pub(crate) struct FfiGuard(Option<FfiFuture>);
 
@@ -1506,5 +1533,80 @@ mod adapter_tests {
         KV_CLOSED.store(0, AtomicOrdering::SeqCst);
         drop(FfiKVStore::new(42, mock_kv_vtable()));
         assert_eq!(KV_CLOSED.load(AtomicOrdering::SeqCst), 42);
+    }
+}
+
+/// `await_ffi_poll`（mq 长轮询退避变体）测试：计数 pending 的假 future。
+#[cfg(test)]
+mod await_ffi_poll_tests {
+    use super::*;
+    use oj_plugin_ffi::{RBytes, RResult};
+    use std::ffi::c_void;
+    use std::time::Duration;
+
+    struct CountedState {
+        left: u32,
+    }
+
+    extern "C" fn counted_poll(state: *mut c_void) -> i32 {
+        let s = unsafe { &mut *(state as *mut CountedState) };
+        if s.left == 0 {
+            1
+        } else {
+            s.left -= 1;
+            0
+        }
+    }
+
+    extern "C" fn counted_take(state: *mut c_void) -> RResult<RBytes, RString> {
+        let s = unsafe { &*(state as *mut CountedState) };
+        let _ = s; // 只读；释放由 free 统一负责（await_ffi_poll take→free 配对）
+        let mut v = RBytes::new();
+        for b in b"ok" {
+            v.push(*b);
+        }
+        RResult::Ok(v)
+    }
+
+    extern "C" fn counted_free(state: *mut c_void) {
+        if !state.is_null() {
+            drop(unsafe { Box::from_raw(state as *mut CountedState) });
+        }
+    }
+
+    fn counted_future(left: u32) -> FfiFuture {
+        let state = Box::into_raw(Box::new(CountedState { left }));
+        FfiFuture {
+            state: state.cast(),
+            poll: counted_poll,
+            take: counted_take,
+            free: counted_free,
+        }
+    }
+
+    /// 20 次 pending × 10ms 退避：总耗时 ≥ 180ms 证明在睡眠而非 yield_now 空转。
+    #[tokio::test]
+    async fn given_many_pending_polls_when_await_ffi_poll_then_backs_off_not_spins() {
+        let t0 = std::time::Instant::now();
+        let out = await_ffi_poll(counted_future(20), Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(out, b"ok".to_vec());
+        assert!(
+            t0.elapsed().as_millis() >= 180,
+            "no backoff: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// 就绪 future 不额外睡眠（退避只发生在 pending 间隙）。
+    #[tokio::test]
+    async fn given_ready_future_when_await_ffi_poll_then_returns_without_sleep() {
+        let t0 = std::time::Instant::now();
+        let out = await_ffi_poll(counted_future(0), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(out, b"ok".to_vec());
+        assert!(t0.elapsed().as_millis() < 100, "{:?}", t0.elapsed());
     }
 }
