@@ -1,21 +1,23 @@
-//! 模块级种子重放（spec P0）：`<module>/schema.sql` + `<module>/seed.sql`。
-//! 语义与根 `seed.sql` 等同——幂等 SQL、仅 default 库且 sqlite、按 `;` 朴素切分
-//! （语句内不得含分号字面量，§2.1）——仅拆到模块；执行顺序：根（deprecated）→
-//! 各模块（目录名排序，schema 先于 seed）。
-//! S002：同一张表被两处 `CREATE TABLE`（根 vs 模块、模块 vs 模块）→ 启动 fail-fast，
-//! 不静默合并（§8-1）。fixtures/ 不重放（演示数据，P1 起由 `oj fixture` 灌入）。
+//! 模块级种子重放（spec P0）：`<module>/seed.sql`，三方言 default 库随启动重放。
+//! 幂等 SQL、按 `;` 朴素切分（语句内不得含分号字面量，§2.1）；执行顺序 = 模块目录名
+//! 排序。幂等写法以 sqlite 惯用法为源（`INSERT OR IGNORE`），引擎按目标方言自动改写
+//! 关键字（mysql → `INSERT IGNORE`、pg → 句尾 `ON CONFLICT DO NOTHING`）。
+//! 每条语句的执行与结果（受影响行数）记 tracing 日志（server 落 logs/，CLI 落 stderr）。
+//! S002：同一张表被两处 `CREATE TABLE` → 启动 fail-fast，不静默合并（§8-1）。
+//! fixtures/ 不重放（演示数据，由 `oj fixture` 灌入）。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use only_js::bridge::{DataAccessor, Dialect};
 
-/// 模块内种子文件（重放顺序 = 数组顺序：结构在前、数据在后）。
-const SEED_FILES: [&str; 2] = ["schema.sql", "seed.sql"];
+/// 模块种子文件名。
+const SEED_FILE: &str = "seed.sql";
 
-/// 收集 `dir` 首层各模块的种子文件（dev: `src/<m>/`，release: `dist/<m>-<v>/`），
-/// 按模块名排序、模块内按 SEED_FILES 顺序。返回 (模块标签=目录名, 文件路径)。
+/// 收集 `dir` 首层各模块的 `seed.sql`（dev: `src/<m>/`，release: `dist/<m>-<v>/`），
+/// 按模块名排序。返回 (模块标签=目录名, 文件路径)。
 pub fn collect(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -28,11 +30,9 @@ pub fn collect(dir: &Path) -> Vec<(String, PathBuf)> {
     dirs.sort();
     let mut out = Vec::new();
     for d in dirs {
-        for f in SEED_FILES {
-            let p = d.join(f);
-            if p.is_file() {
-                out.push((d.file_name().unwrap().to_string_lossy().into_owned(), p));
-            }
+        let p = d.join(SEED_FILE);
+        if p.is_file() {
+            out.push((d.file_name().unwrap().to_string_lossy().into_owned(), p));
         }
     }
     out
@@ -122,54 +122,59 @@ fn split_statements(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// 根 seed.sql 的 deprecation 文案（§8-1：并存期警告，指向迁移去处）。
-fn deprecation_note(tables: &[String]) -> String {
-    if tables.is_empty() {
-        "warn: root seed.sql 已废弃：内容为空，请直接删除（模块种子见 src/<module>/seed.sql）"
-            .to_string()
-    } else {
-        format!(
-            "warn: root seed.sql 已废弃：请将 {} 迁至对应模块的 seed.sql（同名表并存将报 S002）",
-            tables.join(", ")
-        )
+/// seed 幂等写法以 sqlite 惯用法为源：`INSERT OR IGNORE INTO …`。按目标方言改写
+/// 关键字：mysql → `INSERT IGNORE`；pg → 剥 `OR IGNORE`、句尾追加 `ON CONFLICT DO
+/// NOTHING`。其余形态（`OR REPLACE` / `ON CONFLICT` / `ON DUPLICATE KEY`）与非
+/// INSERT 语句一律原样透传——作者显式选择的方言写法不猜测改写。
+pub fn translate_insert<'a>(stmt: &'a str, d: Dialect) -> Cow<'a, str> {
+    if d == Dialect::Sqlite {
+        return Cow::Borrowed(stmt);
+    }
+    // 仅当语句以 INSERT 起头、紧跟空白 + OR IGNORE + 词边界时改写。
+    if !stmt
+        .get(..6)
+        .is_some_and(|h| h.eq_ignore_ascii_case("INSERT"))
+        || !stmt[6..].starts_with(|c: char| c.is_ascii_whitespace())
+    {
+        return Cow::Borrowed(stmt);
+    }
+    let after = stmt[6..].trim_start();
+    if !after
+        .get(..9)
+        .is_some_and(|h| h.eq_ignore_ascii_case("or ignore"))
+        || !after[9..].starts_with(|c: char| c.is_ascii_whitespace())
+    {
+        return Cow::Borrowed(stmt);
+    }
+    let rest = after[9..].trim_start();
+    match d {
+        Dialect::MySql => Cow::Owned(format!("INSERT IGNORE {rest}")),
+        _ => Cow::Owned(format!("INSERT {rest} ON CONFLICT DO NOTHING")),
     }
 }
 
-/// 启动重放（from_config 调用）：根 `config_dir/seed.sql`（deprecated）→ 模块种子。
-/// 无任何种子文件 → 静默返回；有种子但 default 库缺失/非 sqlite → warn 跳过
-/// （与今日根 seed 行为一致）。先全量冲突检查（S002）再执行——失败不落任何副作用。
-pub async fn replay_all(
-    default: Option<&Arc<dyn DataAccessor>>,
-    config_dir: &Path,
-    dir: &Path,
-) -> Result<(), String> {
-    let root_path = config_dir.join("seed.sql");
-    let has_root = root_path.is_file();
+/// 启动重放（from_config 调用）：各模块 `seed.sql`（目录名排序）。
+/// 无种子文件 → 静默返回；有种子但 default 库缺失 → warn 跳过。
+/// 三方言都重放（幂等靠 S006 门禁 + 方言改写 + SQL 自身）；先全量冲突检查（S002）
+/// 再执行——失败不落任何副作用。
+pub async fn replay_all(default: Option<&Arc<dyn DataAccessor>>, dir: &Path) -> Result<(), String> {
     let modules = collect(dir);
-    if !has_root && modules.is_empty() {
+    if modules.is_empty() {
         return Ok(());
     }
-    let db = match default {
-        Some(d) if d.dialect() == Dialect::Sqlite => d,
-        _ => {
-            eprintln!("warn: seed skipped (default db is not sqlite)");
-            return Ok(());
-        }
+    let Some(db) = default else {
+        tracing::warn!("seed skipped: no default db");
+        eprintln!("warn: seed skipped (no default db)");
+        return Ok(());
     };
-    // 读入全部文本（根在前）。
-    let mut files: Vec<PathBuf> = Vec::new();
-    if has_root {
-        files.push(root_path.clone());
-    }
-    files.extend(modules.iter().map(|(_, p)| p.clone()));
     let mut texts = Vec::new();
-    for p in &files {
+    for (name, p) in &modules {
         let t = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", show(p)))?;
-        texts.push((p.clone(), t));
+        texts.push((name.as_str(), p.clone(), t));
     }
     // S002 冲突检查：表 → 首见文件；重复即 fail-fast（不执行任何语句）。
     let mut owner: HashMap<&str, &Path> = HashMap::new();
-    for (p, t) in &texts {
+    for (_, p, t) in &texts {
         for name in create_tables(t) {
             if let Some(prev) = owner.get(name.as_str()) {
                 return Err(format!(
@@ -183,17 +188,29 @@ pub async fn replay_all(
             owner.insert(leak_str(name), p.as_path());
         }
     }
-    if has_root {
-        let root_tables = create_tables(&texts[0].1);
-        if !split_statements(&texts[0].1).is_empty() {
-            eprintln!("{}", deprecation_note(&root_tables));
-        }
-    }
-    for (p, t) in &texts {
-        for stmt in split_statements(t) {
-            db.exec_with_params(stmt, &[])
-                .await
-                .map_err(|e| format!("seed {}: {e}", show(p)))?;
+    for (name, p, t) in &texts {
+        for (i, stmt) in split_statements(t).into_iter().enumerate() {
+            let sql = translate_insert(stmt, db.dialect());
+            match db.exec_with_params(&sql, &[]).await {
+                Ok(rows) => tracing::info!(
+                    module = name,
+                    file = %show(p),
+                    seq = i,
+                    rows,
+                    stmt = %crate::migrate::log_snip(stmt),
+                    "seed ok"
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        module = name,
+                        file = %show(p),
+                        seq = i,
+                        stmt = %crate::migrate::log_snip(stmt),
+                        "seed failed: {e}"
+                    );
+                    return Err(format!("seed {}: {e}", show(p)));
+                }
+            }
         }
     }
     Ok(())
@@ -242,9 +259,39 @@ mod tests {
     }
 
     #[test]
-    fn deprecation_note_lists_tables() {
-        assert!(deprecation_note(&["account".into()]).contains("account"));
-        assert!(deprecation_note(&[]).contains("已废弃"));
+    fn translate_insert_rewrites_per_dialect() {
+        let s = "INSERT OR IGNORE INTO t (a) VALUES (1)";
+        assert_eq!(translate_insert(s, Dialect::Sqlite), s);
+        assert_eq!(
+            translate_insert(s, Dialect::MySql),
+            "INSERT IGNORE INTO t (a) VALUES (1)"
+        );
+        assert_eq!(
+            translate_insert(s, Dialect::Postgres),
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"
+        );
+        // 大小写不敏感；保留作者原文的其余部分。
+        assert_eq!(
+            translate_insert("insert or ignore into t values (1)", Dialect::MySql),
+            "INSERT IGNORE into t values (1)"
+        );
+        // 非 INSERT / 其他幂等形态 / 无词边界 → 原样透传。
+        assert_eq!(
+            translate_insert("UPDATE t SET a = 1", Dialect::Postgres),
+            "UPDATE t SET a = 1"
+        );
+        assert_eq!(
+            translate_insert("INSERT INTO t VALUES (1)", Dialect::MySql),
+            "INSERT INTO t VALUES (1)"
+        );
+        assert_eq!(
+            translate_insert("INSERT OR REPLACE INTO t VALUES (1)", Dialect::Postgres),
+            "INSERT OR REPLACE INTO t VALUES (1)"
+        );
+        assert_eq!(
+            translate_insert("INSERT OR IGNORED INTO t VALUES (1)", Dialect::MySql),
+            "INSERT OR IGNORED INTO t VALUES (1)"
+        );
     }
 
     /// 测试辅助：真 sqlite 内存库 + 项目夹具，跑 replay_all 后回读建表清单。
@@ -254,7 +301,7 @@ mod tests {
             .connect("sqlite::memory:", root)
             .await
             .map_err(|e| e.to_string())?;
-        replay_all(Some(&db), root, dir).await?;
+        replay_all(Some(&db), dir).await?;
         db.query_with_params(
             "select name from sqlite_master where type='table' order by name",
             &[],
@@ -269,11 +316,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn replays_root_then_modules_in_order() {
+    async fn replays_modules_in_order() {
         let t = std::env::temp_dir().join(format!("oj-seed-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
-        // 根 + 两个模块（user 建表插入；order 的 seed 引用 user 的表 → 模块顺序生效）
-        write(t.join("seed.sql"), "CREATE TABLE IF NOT EXISTS r (x);");
+        // 两个模块（user 建表插入；order 的 seed 引用 user 的表 → 模块顺序生效）
         write(
             t.join("src/user/seed.sql"),
             "CREATE TABLE IF NOT EXISTS account (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\
@@ -287,39 +333,19 @@ mod tests {
         let tables = replay(&t, &t.join("src")).await.unwrap();
         let names: Vec<&str> = tables.iter().filter_map(|r| r["name"].as_str()).collect();
         assert!(
-            names.contains(&"r") && names.contains(&"account") && names.contains(&"orders"),
+            names.contains(&"account") && names.contains(&"orders"),
             "{names:?}"
         );
         let _ = std::fs::remove_dir_all(&t);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn schema_sql_runs_before_seed_sql() {
-        let t = std::env::temp_dir().join(format!("oj-seed-order-{}", std::process::id()));
+    async fn no_default_db_skips_with_no_error() {
+        let t = std::env::temp_dir().join(format!("oj-seed-dial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
-        // seed.sql INSERT 依赖 schema.sql 建的表 → 顺序错即报错
-        write(t.join("src/u/schema.sql"), "CREATE TABLE m (x);");
-        write(t.join("src/u/seed.sql"), "INSERT INTO m VALUES (1);");
-        let tables = replay(&t, &t.join("src")).await.unwrap();
-        assert_eq!(tables.len(), 1, "{tables:?}");
-        let _ = std::fs::remove_dir_all(&t);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn s002_root_vs_module_conflict_fails_before_exec() {
-        let t = std::env::temp_dir().join(format!("oj-seed-s002a-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&t);
-        write(
-            t.join("seed.sql"),
-            "CREATE TABLE IF NOT EXISTS account (id);",
-        );
-        write(
-            t.join("src/user/seed.sql"),
-            "CREATE TABLE IF NOT EXISTS account (id);",
-        );
-        let e = replay(&t, &t.join("src")).await.unwrap_err();
-        assert!(e.contains("S002") && e.contains("account"), "{e}");
-        assert!(e.contains("seed.sql") && e.contains("下一步"), "{e}");
+        write(t.join("src/u/seed.sql"), "CREATE TABLE r (x);");
+        // 无 default 库 → warn 跳过（有库时三方言都重放，无方言豁免）。
+        replay_all(None, &t).await.unwrap();
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -347,16 +373,6 @@ mod tests {
         std::fs::create_dir_all(t.join("src/u")).unwrap();
         let tables = replay(&t, &t.join("src")).await.unwrap();
         assert!(tables.is_empty());
-        let _ = std::fs::remove_dir_all(&t);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn non_sqlite_default_skips_with_no_error() {
-        let t = std::env::temp_dir().join(format!("oj-seed-dial-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&t);
-        write(t.join("seed.sql"), "CREATE TABLE r (x);");
-        // InMemoryAccessor：dialect() 默认 Sqlite —— 换用无 default 库的 None 分支验证跳过。
-        replay_all(None, &t, &t.join("src")).await.unwrap();
         let _ = std::fs::remove_dir_all(&t);
     }
 }

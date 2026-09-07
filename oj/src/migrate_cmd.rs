@@ -134,10 +134,32 @@ pub async fn load_fixtures(
         for f in files {
             let t =
                 std::fs::read_to_string(&f).map_err(|e| format!("read {}: {e}", f.display()))?;
-            for stmt in t.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                acc.exec_with_params(stmt, &[])
-                    .await
-                    .map_err(|e| format!("fixture {name}/{}: {e}", f.display()))?;
+            for (i, stmt) in t
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .enumerate()
+            {
+                match acc.exec_with_params(stmt, &[]).await {
+                    Ok(rows) => tracing::info!(
+                        module = name,
+                        file = %f.display(),
+                        seq = i,
+                        rows,
+                        stmt = %crate::migrate::log_snip(stmt),
+                        "fixture ok"
+                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            module = name,
+                            file = %f.display(),
+                            seq = i,
+                            stmt = %crate::migrate::log_snip(stmt),
+                            "fixture failed: {e}"
+                        );
+                        return Err(format!("fixture {name}/{}: {e}", f.display()));
+                    }
+                }
                 n += 1;
             }
         }
@@ -218,7 +240,7 @@ mod tests {
         .await
         .unwrap();
         assert!(has_table(&t, "g").await);
-        assert!(has_table(&t, "_oj_migrations_m").await);
+        assert!(has_table(&t, "_oj_migrations").await);
         // 幂等：重跑不增不改。
         run_migrate(&MigrateArgs {
             config: t.join("config.yaml").display().to_string(),
@@ -262,7 +284,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!has_table(&t, "g").await, "baseline 不得执行迁移 SQL");
-        assert!(has_table(&t, "_oj_migrations_m").await, "baseline 必须记账");
+        assert!(has_table(&t, "_oj_migrations").await, "baseline 必须记账");
         let _ = std::fs::remove_dir_all(&t);
     }
 }

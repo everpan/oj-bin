@@ -315,10 +315,19 @@ async fn db_indexes(
 }
 
 async fn exec(acc: &dyn DataAccessor, sql: &str) -> Result<(), String> {
-    acc.exec_with_params(sql, &[])
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("exec `{sql}`: {e}"))
+    match acc.exec_with_params(sql, &[]).await {
+        Ok(rows) => {
+            tracing::info!(rows, stmt = %crate::migrate::log_snip(sql), "schema reconcile ok");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                stmt = %crate::migrate::log_snip(sql),
+                "schema reconcile failed: {e}"
+            );
+            Err(format!("exec `{sql}`: {e}"))
+        }
+    }
 }
 
 /// 声明 vs 实库收敛（幂等）：缺表 CREATE、缺可空列 ALTER ADD、缺索引 CREATE INDEX。

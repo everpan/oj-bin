@@ -67,7 +67,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
   - **构建即检查**：build 内嵌结构检查 S002–S006（违规 fail build，一次报全）；
     `--check` 只校验不落盘（CI 门禁）。规则见 §5.3。
 - `oj migrate`：把各模块 `migrations/*.sql` 按序应用到 default 库（账本
-  `_oj_migrations_<module>`），并对声明 `schema.yaml` 的模块做收敛（§5.1）；
+  `_oj_migrations（module 列区分模块）`），并对声明 `schema.yaml` 的模块做收敛（§5.1）；
   `--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
 - `oj fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
 - `oj schema diff`：声明式 schema 与实库**只读对账**——D001 缺表/缺列/多列（改名或删除
@@ -165,8 +165,9 @@ blob:
   宽限期结束再启动 → 进程退出（不服务）。证书 / 公钥文件被覆盖即**热加载**（notify
   事件驱动）。证书生成/续期用 `tools/oj-cert`（`gen` / `renew`），详见 `dev-guide.md` §11.2
   与 `ops-manual.md` §3/§7。
-- 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
-  可重复执行；**注意**：seed 内不得有分号字面量）。
+- 模块 `seed.sql` 启动时对 `default` 库重放（三方言；幂等写法写 sqlite 惯用法
+  `INSERT OR IGNORE`，引擎按方言自动改写；语句按 `;` 切分，**seed 内不得有分号
+  字面量**）。
 - `server.migrate_on_start`：启动迁移门禁。`auto`（dev 默认）启动即应用迁移与 schema 收敛；
   `verify`（release 默认）校验账本，落后即拒启（M004，报错附 `oj migrate` 命令）；`off` 逃生门
   （迁移完全归 `oj migrate` / 运维）。非法值 fail-fast。
@@ -185,7 +186,6 @@ blob:
 <project>/
 ├── config.yaml          # 服务配置
 ├── ext_boot.js          # 可选，运行时创建期加载一次（扩展全局对象，见 §9）
-├── seed.sql             # 可选，启动时对 default 库重放
 ├── src/                 # dev 服务目录（release 用 dist/，结构相同）
 │   ├── user/            # 首层子目录 = 模块名
 │   │   ├── manifest.yaml
@@ -260,8 +260,8 @@ tables:
 
 ### 5.2 migrations/（手写 DDL 演进）与 seed / fixtures
 
-`migrations/{seq:04}__{desc}[.{sqlite|mysql|postgres}].sql`：按 seq 升序每条应用一次，
-账本表 `_oj_migrations_<module>` 记录；带方言后缀只在该方言库执行。文件名空洞、乱序、
+`migrations/{seq:04}__{desc}[.{sqlite|mysql|pg}].sql`：按 seq 升序每条应用一次，
+账本表 `_oj_migrations（module 列区分模块）` 记录；带方言后缀只在该方言库执行。文件名空洞、乱序、
 desc 与账本不一致 → 报错（S007）。应用入口三处：
 
 - dev 默认 `migrate_on_start: auto`（启动即应用）；
@@ -269,8 +269,9 @@ desc 与账本不一致 → 报错（S007）。应用入口三处：
 - 显式 `oj migrate [--baseline] [--module M]`；`--baseline` 把 ≤head 的迁移全部记为
   已应用而不执行（存量库接入）。
 
-模块级 `seed.sql`：幂等参考数据，随启动重放——禁 DDL、INSERT 须幂等（`OR IGNORE` /
-`ON CONFLICT` / `OR REPLACE`）、只写本模块与 deps 模块的表（S006 校验）。
+模块级 `seed.sql`：幂等参考数据，随启动重放（三方言 `default` 库，无库则 warn 跳过）
+——禁 DDL、INSERT 须幂等（`OR IGNORE` / `ON CONFLICT` / `OR REPLACE` /
+`ON DUPLICATE KEY`，写法须匹配部署方言）、只写本模块与 deps 模块的表（S006 校验）。
 `fixtures/`：演示数据，仅 `oj test` / `oj fixture` 灌入（不进发布产物、不记账本）。
 
 ### 5.3 检查体系与表归属

@@ -47,7 +47,7 @@ db: default         # 可选：模块的 "default" 库重定向到该命名库
 基于 **refinery-core**：`OjConn` 把 `Arc<dyn DataAccessor>` 包进
 `AsyncTransaction` / `AsyncQuery`；契约只吃 SQL 字符串，跨得过 DataAccessor 边界。
 
-- **账本**：每模块一张 `_oj_migrations_<module>`（`ledger_name`，:276），version 模块内从 1 起。
+- **账本**：单表 `_oj_migrations`（module 列 + 复合主键 (module, version)），version 模块内从 1 起。
 - **文件名**：`{seq:04}__{desc}[.{dialect}].sql`；`desc` 限 `[A-Za-z0-9_]`。
 - `load_migrations`（:155，S007）：同 seq 有方言覆盖文件（`0001__init.pg.sql`）时按当前
   Dialect 只取其一，否则回落通用；**seq 必须 1..=n 连续**（空洞/乱序/重复 → S007）；
@@ -64,9 +64,11 @@ db: default         # 可选：模块的 "default" 库重定向到该命名库
 
 ## 4. `seed.rs` —— 种子重放（spec P0）
 
-- 顺序：根 `config_dir/seed.sql`（**deprecated**）→ 各模块（目录名排序，模块内
-  `SEED_FILES` 顺序：`schema.sql` 结构在前、`seed.sql` 数据在后）。
-- 语义：幂等 SQL、仅 `default` 库且 sqlite、`;` 朴素切分（语句内不得含分号字面量）。
+- 顺序：各模块（目录名排序）`seed.sql`；三方言 `default` 库（无 default 库 → warn 跳过）。
+- 语义：幂等 SQL、`;` 朴素切分（语句内不得含分号字面量）；幂等写法以 sqlite 惯用法
+  `INSERT OR IGNORE` 为源，`translate_insert` 按方言改写（mysql → `INSERT IGNORE`、
+  pg → 句尾 `ON CONFLICT DO NOTHING`；`OR REPLACE` 等其他形态不翻译）。
+- 每条语句的执行结果（module/file/seq/rows/stmt 截断）记 tracing 日志，便于回归定位。
 - **S002**：同一张表被两处 `CREATE TABLE` → 启动 fail-fast，不静默合并。
   `create_tables`（:44）识别 `IF NOT EXISTS`、引号（`"t"`/`` `t` ``/`[t]`）与 schema 限定。
 - 先全量冲突检查再执行 —— 失败不落任何副作用。
@@ -102,6 +104,5 @@ db: default         # 可选：模块的 "default" 库重定向到该命名库
 ## 7. 已知债
 
 - `manifest::save_lock` 无并发锁（多进程同时 `oj build` 有竞争），已标注 ceiling。
-- 根 `seed.sql` 处于 deprecated 并存期，仅靠告警文案引导迁移。
 - `checks.rs` 的规则号不连续（S004/S006 未在本文件实现或已并入他处），新人容易困惑；
   建议在文件头补一张「规则 → 落点」表（本表即为补齐）。

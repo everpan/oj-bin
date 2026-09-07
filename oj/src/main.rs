@@ -2,6 +2,15 @@ use oj::args::{self, Command};
 
 /// 执行解析后的命令，返回进程退出码（0 成功 / 1 业务错误）。
 pub async fn run_command(cmd: Command) -> i32 {
+    // 数据操作（migrate/fixture/seed/test 的语句重放）走 tracing 记录：非 server
+    // 命令在此挂 stderr 订阅器；server 命令由 server::logging 装配（终端镜像 +
+    // 落盘），不得抢 init（try_init 失败静默——重复 init 场景）。
+    if !matches!(cmd, Command::Server(_)) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     match cmd {
         Command::Build(a) => match oj::build_cmd::run(&a).await {
             Ok(()) => 0,

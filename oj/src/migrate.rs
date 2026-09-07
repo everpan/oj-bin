@@ -1,10 +1,11 @@
 //! 迁移引擎（spec §11.2，D4）：refinery-core 适配器。`OjConn` 把
 //! `Arc<dyn DataAccessor>` 包进 refinery 的 `AsyncTransaction`/`AsyncQuery`——
 //! 契约只吃 SQL 字符串，跨得过 DataAccessor 边界（§10）；方言决策集中于此。
-//! 账本：每模块一张 `_oj_migrations_<module>`（§11.3），version 模块内从 1 起。
-//! M001/M002 由 `abort_divergent`/`abort_missing` 承担；并发锁：pg 事务级
-//! `pg_advisory_xact_lock`、mysql 靠账本 version 主键冲突兜底（§4.6）。
+//! 账本：单表 `_oj_migrations`，module 列区分模块、复合主键 (module, version)，
+//! version 模块内从 1 起。M001/M002 由 `abort_divergent`/`abort_missing` 承担；
+//! 并发锁：pg 事务级 `pg_advisory_xact_lock`、mysql 靠账本复合主键冲突兜底（§4.6）。
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -50,6 +51,78 @@ fn lock_id_of(module: &str) -> i64 {
     h as i64
 }
 
+/// 账本表名（单表共享，module 列区分模块）。
+const LEDGER_TABLE: &str = "_oj_migrations";
+
+/// refinery 0.9.2 账本 INSERT 逐字形态（`insert_migration_query` 是 pub(crate)
+/// 不可覆写，经 execute 流入）——补上 module 列。形态对不上宁可响报（升级
+/// refinery 时显式失败），绝不静默写歪账本。
+const REFINERY_INSERT_HEAD: &str =
+    "INSERT INTO _oj_migrations (version, name, applied_on, checksum) VALUES (";
+
+/// refinery 0.9.2 账本 SELECT 逐字前缀（GET_APPLIED_MIGRATIONS_QUERY）。
+const REFINERY_SELECT_HEAD: &str =
+    "SELECT version, name, applied_on, checksum FROM _oj_migrations ORDER BY ";
+
+/// 单引号字面量转义（module 名来自磁盘目录/manifest，进内联 SQL 前兜底）。
+fn quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 日志里的语句截断：回归定位要看到 SQL，超长 DDL 截 200 字符。
+pub(crate) fn log_snip(s: &str) -> &str {
+    match s.char_indices().nth(200) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// mysql 无 `int8` 类型——账本 version 列按方言换写 TINYINT。上限每模块 127 个
+/// 迁移（signed TINYINT）；超限需人工改型（迁移 SQL 原样透传，作者自写自担）。
+fn mysql_ledger_ddl(s: &str) -> Cow<'_, str> {
+    if s.starts_with("CREATE TABLE IF NOT EXISTS _oj_migrations") {
+        Cow::Owned(s.replace("int8", "TINYINT"))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// 账本 INSERT → 补 module 列；其余语句（迁移 SQL 等）原样透传。
+fn tag_module<'a>(s: &'a str, module: &str) -> Result<Cow<'a, str>, MigrateError> {
+    if let Some(rest) = s.strip_prefix(REFINERY_INSERT_HEAD) {
+        Ok(Cow::Owned(format!(
+            "INSERT INTO {LEDGER_TABLE} (module, version, name, applied_on, checksum) \
+             VALUES ({}, {rest}",
+            quote_str(module)
+        )))
+    } else if s.starts_with("INSERT INTO ") && s[12..].starts_with(LEDGER_TABLE) {
+        Err(MigrateError(format!(
+            "refinery 账本 INSERT 形态不识别（升级 refinery 须同步 tag_module）: {s}"
+        )))
+    } else {
+        Ok(Cow::Borrowed(s))
+    }
+}
+
+/// 账本 SELECT → 注入 module 过滤（共享单表，各模块只见自己的行）。
+fn scope_module<'a>(query: &'a str, module: &str) -> Result<Cow<'a, str>, MigrateError> {
+    if let Some(rest) = query.strip_prefix(REFINERY_SELECT_HEAD) {
+        Ok(Cow::Owned(format!(
+            "SELECT version, name, applied_on, checksum FROM {LEDGER_TABLE} \
+             WHERE module = {} ORDER BY {rest}",
+            quote_str(module)
+        )))
+    } else if query.contains(LEDGER_TABLE) {
+        // 含 get_last_applied（WHERE version=(SELECT MAX..)，本项目未用）等形态：
+        // 响报而非静默跨模块读账本。
+        Err(MigrateError(format!(
+            "refinery 账本 SELECT 形态不识别（升级 refinery 须同步 scope_module）: {query}"
+        )))
+    } else {
+        Ok(Cow::Borrowed(query))
+    }
+}
+
 /// 适配器：refinery 把「整个迁移文件」「账本 INSERT」等作为字符串经 execute
 /// 传入；query 走池读账本（execute 内聚事务、外不持连接——sqlite 单连接
 /// 池下随后的 get_applied 不自阻塞，§11.2 注①）。
@@ -67,8 +140,11 @@ impl AsyncTransaction for OjConn {
         queries: T,
     ) -> Result<usize, MigrateError> {
         // refinery 把整个迁移文件当一条字符串传入，而 TxSession::exec 是单条
-        // 预编译语句 → 先按 ';' 拆分（§11.2 注）。
-        let stmts: Vec<&str> = queries.flat_map(split_stmts).collect();
+        // 预编译语句 → 先按 ';' 拆分（§11.2 注）；账本 INSERT 在此补 module 列。
+        let stmts: Vec<Cow<'a, str>> = queries
+            .flat_map(split_stmts)
+            .map(|s| tag_module(s, &self.module))
+            .collect::<Result<_, _>>()?;
         match self.acc.dialect() {
             // 事务性 DDL：BEGIN → 全部语句（含账本写入）→ COMMIT。
             Dialect::Sqlite | Dialect::Postgres => {
@@ -83,15 +159,46 @@ impl AsyncTransaction for OjConn {
                     .map_err(err)?;
                 }
                 for s in &stmts {
-                    tx.exec(s, &[]).await.map_err(err)?;
+                    match tx.exec(s, &[]).await {
+                        Ok(rows) => tracing::info!(
+                            module = %self.module,
+                            rows,
+                            stmt = %log_snip(s),
+                            "migrate ok"
+                        ),
+                        Err(e) => {
+                            tracing::error!(
+                                module = %self.module,
+                                stmt = %log_snip(s),
+                                "migrate failed: {e}"
+                            );
+                            return Err(err(e));
+                        }
+                    }
                 }
                 tx.commit().await.map_err(err)?;
             }
             // mysql DDL 隐式提交：BEGIN 会裂（grouped 必假，§11.2 注③）——
-            // 不 BEGIN，顺序执行；互斥靠账本 version 主键冲突兜底。
+            // 不 BEGIN，顺序执行；互斥靠账本复合主键冲突兜底。
             Dialect::MySql => {
                 for s in &stmts {
-                    self.acc.exec_with_params(s, &[]).await.map_err(err)?;
+                    let sql = mysql_ledger_ddl(s);
+                    match self.acc.exec_with_params(&sql, &[]).await {
+                        Ok(rows) => tracing::info!(
+                            module = %self.module,
+                            rows,
+                            stmt = %log_snip(&sql),
+                            "migrate ok"
+                        ),
+                        Err(e) => {
+                            tracing::error!(
+                                module = %self.module,
+                                stmt = %log_snip(&sql),
+                                "migrate failed: {e}"
+                            );
+                            return Err(err(e));
+                        }
+                    }
                 }
             }
         }
@@ -102,7 +209,8 @@ impl AsyncTransaction for OjConn {
 #[async_trait]
 impl AsyncQuery<Vec<Migration>> for OjConn {
     async fn query(&mut self, query: &str) -> Result<Vec<Migration>, MigrateError> {
-        let rows = self.acc.query_with_params(query, &[]).await.map_err(err)?;
+        let sql = scope_module(query, &self.module)?;
+        let rows = self.acc.query_with_params(&sql, &[]).await.map_err(err)?;
         rows.iter()
             .map(|r| {
                 let version = r["version"]
@@ -243,9 +351,9 @@ fn dialect_tag(d: Dialect) -> &'static str {
     }
 }
 
-/// 单模块迁移：账本 `_oj_migrations_<module>`，abort_divergent/abort_missing=true、
-/// grouped=false（mysql DDL 隐式提交下 grouped 必裂）、Target 由调用方给
-/// （Latest=正常迁移；Fake=`--baseline` 全量记账不执行，Q5）。
+/// 单模块迁移：账本 `_oj_migrations`（module 列区分模块），abort_divergent/
+/// abort_missing=true、grouped=false（mysql DDL 隐式提交下 grouped 必裂）、
+/// Target 由调用方给（Latest=正常迁移；Fake=`--baseline` 全量记账不执行，Q5）。
 pub async fn run_module(
     acc: Arc<dyn DataAccessor>,
     module: &str,
@@ -262,7 +370,7 @@ pub async fn run_module(
         /*abort_missing=*/ true,
         /*grouped=*/ false,
         target,
-        &ledger_name(module),
+        LEDGER_TABLE,
     )
     .await
     .map_err(|e| e.to_string())
@@ -270,21 +378,24 @@ pub async fn run_module(
 
 /// `AsyncMigrate` 全是 provided methods（§10：实现 2 个只吃 SQL 字符串的 trait 即得
 /// 整个迁移引擎）——空 impl 启用 `migrate()`/`get_applied_migrations()` 等。
-impl AsyncMigrate for OjConn {}
-
-/// 账本表名（每模块一张，§11.3）。pub 供 verify/运维指引复用。
-pub fn ledger_name(module: &str) -> String {
-    format!("_oj_migrations_{module}")
+/// assert 覆写为单表账本 DDL（refinery 默认模板是 version 单列主键，无 module 维度）。
+impl AsyncMigrate for OjConn {
+    fn assert_migrations_table_query(_migration_table_name: &str) -> String {
+        LEDGER_DDL.to_string()
+    }
 }
 
-/// 账本 DDL：与 refinery-core 0.9 `assert_migrations_table_query`（int8-versions
-/// feature）逐字同构——该函数 pub(crate) 不可复用，此处镜像；三方言均支持
-/// `CREATE TABLE IF NOT EXISTS`（refinery 模板用 `CREATE TABLE`，需先建版才用得上 IF NOT EXISTS）。
-const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS {t} (\
-         version int8 PRIMARY KEY, \
+/// 账本 DDL：列集与 refinery-core 0.9 `assert_migrations_table_query`
+/// （int8-versions feature）逐字同构，加 module 维度、复合主键 (module, version)；
+/// 三方言均支持 `CREATE TABLE IF NOT EXISTS`（refinery 模板用 `CREATE TABLE`，
+/// 需先建版才用得上 IF NOT EXISTS）。
+const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _oj_migrations (\
+         module VARCHAR(255) NOT NULL, \
+         version int8 NOT NULL, \
          name VARCHAR(255), \
          applied_on VARCHAR(255), \
-         checksum VARCHAR(255));";
+         checksum VARCHAR(255), \
+         PRIMARY KEY (module, version));";
 
 /// 单模块 apply（无迁移目录 → 0）。baseline=true → Target::Fake（记账不执行）。
 pub async fn apply_module(
@@ -326,11 +437,11 @@ pub async fn verify_module(
     };
     // get_applied_migrations 不建账本表（refinery 只在 migrate() 里 assert）——
     // 首启空库须先建，否则裸 "no such table" 错误外漏（§4.6 首启拒启语义靠 M004）。
-    conn.execute([LEDGER_DDL.replace("{t}", &ledger_name(module)).as_str()].into_iter())
+    conn.execute([LEDGER_DDL].into_iter())
         .await
         .map_err(|e| format!("module {module}: assert ledger: {e}"))?;
     let applied = conn
-        .get_applied_migrations(&ledger_name(module))
+        .get_applied_migrations(LEDGER_TABLE)
         .await
         .map_err(|e| e.to_string())?;
     let head = migs.last().unwrap().version();
@@ -451,7 +562,7 @@ mod tests {
 
     async fn ledger(acc: &Arc<dyn DataAccessor>, module: &str) -> Vec<(i64, String)> {
         acc.query(&format!(
-            "select version, name from _oj_migrations_{module} order by version"
+            "select version, name from _oj_migrations where module = '{module}' order by version"
         ))
         .await
         .unwrap()
@@ -490,6 +601,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r2.applied_migrations().len(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// mysql 账本 DDL 换 TINYINT；迁移 SQL 不受影响。
+    #[test]
+    fn mysql_ledger_ddl_swaps_int8_only_for_ledger() {
+        assert!(mysql_ledger_ddl(LEDGER_DDL).contains("TINYINT"));
+        assert_eq!(
+            mysql_ledger_ddl("CREATE TABLE t (x int8);"),
+            "CREATE TABLE t (x int8);"
+        );
+    }
+
+    /// 单表共享账本：两模块共表互不干扰，重跑 a 不把 b 的行当 missing/divergent。
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_ledger_isolates_modules() {
+        let d = tmpdir("shared");
+        let a = d.join("a/migrations");
+        write(&a.join("0001__alpha.sql"), "CREATE TABLE ta (x);");
+        let b = d.join("b/migrations");
+        write(&b.join("0001__beta.sql"), "CREATE TABLE tb (x);");
+        let acc = sqlite().await;
+        let ma = load_migrations(&a, Dialect::Sqlite).unwrap();
+        let mb = load_migrations(&b, Dialect::Sqlite).unwrap();
+        run_module(acc.clone(), "a", &ma, Target::Latest)
+            .await
+            .unwrap();
+        run_module(acc.clone(), "b", &mb, Target::Latest)
+            .await
+            .unwrap();
+        let n = acc
+            .query("select count(*) as n from _oj_migrations")
+            .await
+            .unwrap()[0]["n"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(n, 2, "单表账本应恰有 2 行: {n}");
+        assert_eq!(ledger(&acc, "a").await, vec![(1, "alpha".into())]);
+        // 幂等重跑：b 的账本行不得触发 a 的 M001/M002。
+        let r = run_module(acc.clone(), "a", &ma, Target::Latest)
+            .await
+            .unwrap();
+        assert_eq!(r.applied_migrations().len(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 

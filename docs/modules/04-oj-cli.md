@@ -35,7 +35,7 @@
 11. **归属图 + SchemaRegistry 复活**：`manifest::discover` → `schema.yaml` → `registry_tables`
     （S002 同表双声明 → Err）+ `ModuleCtx` map（键 = 模块目录绝对路径）；
     `gate == "auto"` 时逐模块 `schema::reconcile`（安全前向 DDL）；
-12. 种子重放 `seed::replay_all`（根 `seed.sql` deprecated → 各模块 `schema.sql`/`seed.sql`）；
+12. 种子重放 `seed::replay_all`（各模块 `seed.sql`，三方言，语句级 tracing 日志）；
 13. `fixtures=true`（仅 `oj test`）灌 `fixtures/*.sql`；
 14. 鉴权守卫来自 oj-auth 插件；`jwt` / `oidc` 原语配置注入 `Extras`；
 15. `bus`：`registries.bus.connect(&cfg.broker)`；

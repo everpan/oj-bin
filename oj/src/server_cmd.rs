@@ -1015,39 +1015,6 @@ mod tests {
         assert!(e.contains("server.app_path"), "{e}");
     }
 
-    #[tokio::test]
-    async fn seeds_and_serves_sqlite() {
-        let t = tmpdir("sc-seed");
-        std::fs::write(
-            t.0.join("seed.sql"),
-            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);\n\
-             INSERT OR IGNORE INTO t (id, v) VALUES (1, 'a');\n",
-        )
-        .unwrap();
-        let mut cfg = cert_cfg(&t.0);
-        cfg.server.port = 0; // 随机端口
-        cfg.db.insert(
-            "default".into(),
-            format!("sqlite://{}/db.sqlite", t.0.display()),
-        );
-        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
-            .await
-            .unwrap();
-        // 直接打一个临时 api.ts 验证全链路。
-        std::fs::create_dir_all(t.0.join("src/u/f")).unwrap();
-        std::fs::write(
-            t.0.join("src/u/f/api.ts"),
-            "export default { get() { db.query(\"select v from t where id = ?\", [1]).then(r => json.ok(r)); } };\n",
-        )
-        .unwrap();
-        let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v["data"][0]["v"], "a", "{v}");
-    }
-
     /// P0：模块种子重放——src/u/seed.sql 建表插数，handler 查得到。
     #[tokio::test]
     async fn module_seeds_replayed_and_served() {
@@ -1085,38 +1052,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["data"][0]["v"], "mod", "{v}");
-    }
-
-    /// P0：S002——根 seed 与模块 seed 建同一张表 → 启动 fail-fast。
-    #[tokio::test]
-    async fn s002_seed_conflict_blocks_startup() {
-        let t = tmpdir("sc-s002");
-        std::fs::create_dir_all(t.0.join("src/u")).unwrap();
-        std::fs::write(
-            t.0.join("src/u/manifest.yaml"),
-            "name: u\ndesc: d\nversion: 0.1.0\n",
-        )
-        .unwrap();
-        std::fs::write(t.0.join("seed.sql"), "CREATE TABLE IF NOT EXISTS t (id);").unwrap();
-        std::fs::write(
-            t.0.join("src/u/seed.sql"),
-            "CREATE TABLE IF NOT EXISTS t (id);",
-        )
-        .unwrap();
-        let mut cfg = cert_cfg(&t.0);
-        cfg.server.port = 0;
-        cfg.db.insert(
-            "default".into(),
-            format!("sqlite://{}/db.sqlite", t.0.display()),
-        );
-        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
-            .await
-            .err()
-            .unwrap_or_default();
-        assert!(
-            e.contains("S002") && e.contains("t") && e.contains("下一步"),
-            "{e}"
-        );
     }
 
     // ----- 插件装配（spec §5）：全部经 cfg.plugins_dir 注入（每测试独立 Config，

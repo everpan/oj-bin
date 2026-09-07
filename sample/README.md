@@ -18,7 +18,7 @@
 - 表归属守卫：SQL 里出现的他模块表须在 manifest `deps:` 声明（order → user 即演示）；
   `server.ownership_guard: warn`（默认，仅告警）| `deny`（违规拒绝执行）
 - 迁移：每模块 `migrations/{seq:04}__{desc}[.方言].sql`（DDL 演进，账本
-  `_oj_migrations_<module>`）；`seed.sql` 为幂等参考数据随启动重放；
+  `_oj_migrations（module 列区分模块）`）；`seed.sql` 为幂等参考数据随启动重放；
   `fixtures/` 仅 `oj test` / `oj fixture` 灌入。`server.migrate_on_start`：
   auto（dev 默认）| verify（release 默认，账本落后拒启）| off
 - WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/WS.ts 订阅 news），

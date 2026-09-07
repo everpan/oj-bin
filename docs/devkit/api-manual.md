@@ -129,7 +129,6 @@ curl 'http://localhost:9778/v1/api/hello/'
 <project>/
 ├── config.yaml          # 服务配置（第 10 章）
 ├── ext_boot.js          # 可选，运行时创建期加载一次（扩展全局对象，§6 末）
-├── seed.sql             # 可选，启动时对 default 库重放
 ├── src/                 # dev 服务目录（release 用 dist/，见第 11 章）
 │   ├── user/            # 首层子目录 = 模块名
 │   │   ├── manifest.yaml          # 模块清单（必配）
@@ -169,10 +168,13 @@ version: "0.1.0"
 
 ### seed.sql（可选）
 
-- 项目根存在即启动时对 `default` 库重放；**仅 default 库为 sqlite 时执行**
-  （mysql/pg 的建库迁移归运维）。
+- 模块 `seed.sql` 启动时对 `default` 库重放（**三方言**；建库结构演进归
+  `migrations/` / `schema.yaml`）。
 - 语句按 `;` 切分 → **语句内不得含分号字面量**。
-- 用 `INSERT OR IGNORE` 保证可重复执行（每次启动都重放）。
+- 幂等 INSERT 保证可重复执行（每次启动都重放）：写 sqlite 惯用法
+  `INSERT OR IGNORE INTO …`，引擎按目标方言自动改写（mysql → `INSERT IGNORE`、
+  pg → 句尾 `ON CONFLICT DO NOTHING`）；`OR REPLACE` / `ON CONFLICT` /
+  `ON DUPLICATE KEY` 不翻译。
 - `oj build` 不执行 seed（构建零磁盘副作用，db 用内存库）。
 
 ### dist 产物布局（预览）
@@ -198,7 +200,7 @@ dist/
   收敛到声明（**安全前向**：缺表 CREATE、缺可空列 ALTER ADD、缺索引 CREATE INDEX）。
 - **演进靠迁移**：无法安全推导的变更（NOT NULL 列新增、疑似改名、类型变更、数据回填）
   一律 fail-fast 并打印迁移模板——手写 `migrations/{seq:04}__{desc}[.{sqlite|mysql|postgres}].sql`。
-- **账本记账**：`_oj_migrations_<module>` 记录每模块已应用的迁移；带方言后缀的文件只在
+- **账本记账**：`_oj_migrations（module 列区分模块）` 记录每模块已应用的迁移；带方言后缀的文件只在
   对应方言库执行。
 - **表归属**：schema.yaml 喂归属图（表 → 模块，同表双声明拒启 S002）与 `SchemaRegistry`
   （`db.table()` 列白名单）；跨模块表访问须 manifest `deps:` 声明。
@@ -222,7 +224,7 @@ tables:
 
 | 文件 | 时机 | 纪律 |
 |---|---|---|
-| `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations_<module>`；序列空洞/乱序 S007 报错 |
+| `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations（module 列区分模块）`；序列空洞/乱序 S007 报错 |
 | `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006） |
 | `fixtures/*.sql` | 仅 `oj test` / `oj fixture` 灌入 | 演示/测试数据，不进 release 产物 |
 

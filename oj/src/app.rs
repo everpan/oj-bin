@@ -338,8 +338,8 @@ impl App {
         let ownership_deny = ownership_deny_of(&cfg)?;
         // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
         let (registry, modules) = build_schema_and_modules(&dir, ts, &dbs, gate).await?;
-        // 种子重放（P0）：根 seed.sql（deprecated）→ 各模块 schema.sql/seed.sql（§8-1）。
-        crate::seed::replay_all(dbs.get("default"), config_dir, &dir).await?;
+        // 种子重放（P0）：各模块 seed.sql（§8-1）。
+        crate::seed::replay_all(dbs.get("default"), &dir).await?;
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
             let modules = crate::manifest::discover(&dir, ts)?;
