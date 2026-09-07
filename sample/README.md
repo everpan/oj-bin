@@ -1,5 +1,7 @@
 # oj sample — user/order/file
 
+> 各模块导览（初学者按序学习 oj 特性）见 [MODULES.md](MODULES.md)。
+
   cargo run -p oj -- server -c sample/config.yaml --api-path sample/src         # dev（TS，热重载；启动自动迁移）
   curl http://localhost:9778/v1/api/user/account/?id=1
 
