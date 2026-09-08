@@ -571,11 +571,14 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     let root = sample();
     // 极简 config：console_log 开（任务/停机日志镜像到子进程 stderr 可断言）；
     // 证书复用 sample 的示例证书（绝对路径）；db 隔离到临时目录；tasks 默认目录。
+    // Windows 路径反斜杠在 YAML 双引号标量里是转义序列（\U → unknown escape），
+    // sqlite URL 同理不可用——统一转正斜杠（Windows 文件 API 均接受）。
+    let fwd = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
     let cfg = format!(
         "server:\n  host: \"127.0.0.1\"\n  port: 0\n  console_log: true\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\ndb:\n  default: \"sqlite://{}/db.sqlite\"\ntasks:\n  dir: \"tasks\"\n",
-        root.join("config/public.pem").display(),
-        root.join("config/cert.jws").display(),
-        tmp.display(),
+        fwd(&root.join("config/public.pem")),
+        fwd(&root.join("config/cert.jws")),
+        fwd(&tmp),
     );
     std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
 

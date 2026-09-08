@@ -784,9 +784,19 @@ mod tests {
 
     /// FfiFuture → 测试异步桥（等价 core await_ffi 的 poll 轮询）。
     async fn drive(fut: &mut FfiFuture) -> Result<Vec<u8>, String> {
-        for _ in 0..100_000 {
+        // 以真实墙钟时间为界轮询（同 oj-es 的 drive）：固定 10w 次 yield_now 在 CI
+        // 负载/优化下会在插件 rt 的任务完成前耗尽预算，误报 "ffi drive timeout"。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             match (fut.poll)(fut.state) {
-                0 => tokio::task::yield_now().await,
+                0 => {
+                    if std::time::Instant::now() >= deadline {
+                        (fut.free)(fut.state); // 超时也要释放 state（防 FfiTask 泄漏）
+                        fut.state = std::ptr::null_mut();
+                        return Err("ffi drive timeout".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                }
                 code => {
                     let r = (fut.take)(fut.state);
                     (fut.free)(fut.state);
@@ -799,6 +809,5 @@ mod tests {
                 }
             }
         }
-        Err("ffi drive timeout".into())
     }
 }
