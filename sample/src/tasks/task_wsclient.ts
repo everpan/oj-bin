@@ -5,8 +5,12 @@ export {};
 // （1s→2s→…cap 60s）→ 新实例重连。
 //
 //   cargo run -p oj --release -- server -c sample/config.yaml --api-path sample/src
-//   curl -X POST http://localhost:9778/v1/api/news -H 'X-TENANT-ID: t1' -d '{"text":"hi"}'
-//   → 任务日志：ws frame {"text":"hi"}；Ctrl-C → stopped（Stopped 出口 ws.close()）
+//   TOKEN=$(curl -s -X POST http://localhost:9778/v1/api/auth/login -H 'X-TENANT-ID: default' \
+//     -d '{"username":"demo","password":"demo1234"}' | jq -r '.data.access_token')
+//   curl -X POST http://localhost:9778/v1/api/news -H "Authorization: Bearer $TOKEN" \
+//     -H 'X-TENANT-ID: default' -d '{"text":"hi"}'
+//   → 任务日志：ws frame {"topic":"news","data":{"text":"hi"}}；Ctrl-C → stopped
+//   （WS 订阅路径 /news/ws 单独匿名——WHATWG WS 带不了 Authorization 头；发布仍需登录）
 //
 // 注意：wss:// 需宿主注入根证书（v0.1.7 未配，握手会失败）——见 api-manual「WebSocket」节。
 const url = "ws://localhost:9778/v1/api/news/ws";

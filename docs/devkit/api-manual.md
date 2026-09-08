@@ -710,7 +710,8 @@ ws.onmessage = (e) => log.info("frame " + e.data);
 三条硬约束（全部来自真实踩坑）：
 
 1. **WHATWG WebSocket 无法携带自定义头**（含 `Authorization`）——受 Bearer 守卫保护的
-   WS 路由只能列入 `anonymous_paths`，或改用应用层 token 透传（首帧握手）。
+   WS 路由需单独列入 `anonymous_paths`（案例做法：仅匿名 `/news/ws` 订阅路径，发布
+   `POST /news` 保持鉴权），或改用应用层 token 透传（首帧握手）。
 2. **URL 主机名要匹配服务端绑定语义**：服务端缺省监听 `[::1]`（IPv6 回环），写
    `127.0.0.1` 会 connection refused——用 `localhost`。
 3. **等帧必须与停机信号竞速**：挂在 `await` 上没人 wake，会拖到看门狗强杀记 `killed`；

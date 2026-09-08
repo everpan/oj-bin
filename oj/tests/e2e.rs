@@ -630,7 +630,8 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
         if out_buf
             .lock()
             .unwrap()
-            .contains("task: 1 task(s) → started")
+            .contains("task: 2 task(s) → started")
+        // demo + wsclient（v0.1.7 WS 案例）
         {
             break;
         }
@@ -677,6 +678,7 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     let log = out_buf.lock().unwrap();
     assert!(log.contains("shutdown: stop flag set"), "{log}");
     assert!(log.contains("task: demo → stopped"), "{log}");
+    assert!(log.contains("task: wsclient → stopped"), "{log}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
