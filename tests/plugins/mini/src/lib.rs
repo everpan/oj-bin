@@ -1,6 +1,7 @@
 //! 测试夹具插件：固定 descriptor；`MINI_FAKE_ABI` 运行时环境变量可伪造 abi_version
 //! （供宿主侧 AbiMismatch 门禁测试，无需重编译）；`MINI_PANIC` 使 init 期 panic
-//! （供宿主侧 init panic 围堵测试——入口宏 catch_unwind 收敛为 RResult::Err）。
+//! （供宿主侧 init panic 围堵测试——入口宏 catch_unwind 收敛为 RResult::Err）；
+//! `MINI_FAKE_FINGERPRINT` 可伪造构建指纹（供宿主侧「指纹不符仅告警不 fail」测试）。
 
 use oj_plugin_ffi::{
     ABI_VERSION, HostContext, PluginDescriptor, RArc, RResult, RString, oj_plugin_entry,
@@ -14,11 +15,13 @@ fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RS
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(ABI_VERSION);
+    let fingerprint = std::env::var("MINI_FAKE_FINGERPRINT")
+        .unwrap_or_else(|_| oj_plugin_ffi::HOST_FINGERPRINT.to_string());
     RResult::Ok(PluginDescriptor {
         name: RString::from("mini"),
         semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: abi,
-        fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
+        fingerprint: RString::from(fingerprint.as_str()),
         desc: RString::from("loader 测试夹具（零轴）"),
     })
 }

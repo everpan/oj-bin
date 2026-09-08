@@ -195,10 +195,9 @@ mod tests {
             panic!("bad cfg must fail")
         };
         assert!((&m[..]).contains("oj-auth cfg"), "{}", &m[..]);
-        let Err(m) = std::result::Result::from(init(
-            host(),
-            RString::from(r#"{"signing_method":"RS256"}"#),
-        )) else {
+        let Err(m) =
+            std::result::Result::from(init(host(), RString::from(r#"{"signing_method":"RS256"}"#)))
+        else {
             panic!("unsupported alg must fail")
         };
         assert!((&m[..]).contains("not supported"), "{}", &m[..]);

@@ -7,84 +7,66 @@ use std::sync::{Mutex, OnceLock};
 /// env 相关测试串行化（同进程并行测试会互踩环境变量）。
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// 编译夹具插件并拷贝到 target/test-plugins/<triple>/libmini.<ext>（全进程一次）。
+/// 编译夹具插件（debug profile）并把产物拷入 target/<subdir>/<triple>/<short_name> 库文件，
+/// 返回该目录。全进程每夹具只做一次；拷贝幂等（dest 不旧于 src 则跳过——Windows 上
+/// 已加载的 dll 不可覆写，并行测试/子进程场景重拷会撞 sharing violation，code 32）。
+fn fixture_plugin_dir(pkg: &str, artifact: &str, short_name: &str, subdir: &str) -> PathBuf {
+    let root = ffi::workspace_root();
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-p", pkg])
+        .current_dir(&root)
+        .status()
+        .expect("invoke cargo build for test plugin");
+    assert!(status.success(), "test plugin build failed: {pkg}");
+    let (prefix, ext) = if cfg!(target_os = "windows") {
+        ("", "dll")
+    } else if cfg!(target_os = "macos") {
+        ("lib", "dylib")
+    } else {
+        ("lib", "so")
+    };
+    let built = root
+        .join("target/debug")
+        .join(format!("{prefix}{artifact}.{ext}"));
+    let dir = root.join("target").join(subdir).join(ffi::triple());
+    std::fs::create_dir_all(&dir).unwrap();
+    let dst = dir.join(ffi::plugin_file_name(short_name));
+    let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
+    let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
+    let outdated = match (dst_modified, src_modified) {
+        (Ok(d), Ok(s)) => d < s,
+        _ => true,
+    };
+    if outdated {
+        std::fs::copy(&built, &dst).expect("copy test plugin artifact");
+    }
+    dir
+}
+
 fn mini_plugin_dir() -> PathBuf {
     static ONCE: OnceLock<PathBuf> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let root = ffi::workspace_root();
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "oj-plugin-test-mini"])
-            .current_dir(&root)
-            .status()
-            .expect("invoke cargo build for test plugin");
-        assert!(status.success(), "test plugin build failed");
-        let (prefix, ext) = if cfg!(target_os = "windows") {
-            ("", "dll")
-        } else if cfg!(target_os = "macos") {
-            ("lib", "dylib")
-        } else {
-            ("lib", "so")
-        };
-        let built = root
-            .join("target/debug")
-            .join(format!("{prefix}oj_plugin_test_mini.{ext}"));
-        let dir = root.join("target/test-plugins").join(ffi::triple());
-        std::fs::create_dir_all(&dir).unwrap();
-        let dst = dir.join(ffi::plugin_file_name("mini"));
-        // 幂等拷贝：dest 已存在且不旧于源则跳过。Windows 上已加载的 dll 不可覆写，
-        // 并行测试/子进程场景（父进程持有 mini.dll 时 helper 子进程重跑本函数）会撞
-        // sharing violation（ERROR_SHARING_VIOLATION，code 32）。
-        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
-        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
-        let outdated = match (dst_modified, src_modified) {
-            (Ok(d), Ok(s)) => d < s,
-            _ => true,
-        };
-        if outdated {
-            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
-        }
-        dir
+        fixture_plugin_dir(
+            "oj-plugin-test-mini",
+            "oj_plugin_test_mini",
+            "mini",
+            "test-plugins",
+        )
     })
     .clone()
 }
 
-/// mini-kv 编译产物目录（复用 mini_plugin_dir 的按需编译 + 幂等拷贝模式，
-/// 包名/产物名替换为 oj-plugin-test-mini-kv / mini-kv）。与 mini 分目录存放：
-/// 共享目录会让 scan_loads_mini 的「目录内恰一个插件」计数断言翻倍。
+/// mini-kv（单轴 kv 夹具）。与 mini 分目录存放：共享目录会让 scan_loads_mini 的
+/// 「目录内恰一个插件」计数断言翻倍。
 fn mini_kv_plugin_dir() -> PathBuf {
     static ONCE: OnceLock<PathBuf> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let root = ffi::workspace_root();
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "oj-plugin-test-mini-kv"])
-            .current_dir(&root)
-            .status()
-            .expect("invoke cargo build for test plugin");
-        assert!(status.success(), "test plugin build failed");
-        let (prefix, ext) = if cfg!(target_os = "windows") {
-            ("", "dll")
-        } else if cfg!(target_os = "macos") {
-            ("lib", "dylib")
-        } else {
-            ("lib", "so")
-        };
-        let built = root
-            .join("target/debug")
-            .join(format!("{prefix}oj_plugin_test_mini_kv.{ext}"));
-        let dir = root.join("target/test-plugins-kv").join(ffi::triple());
-        std::fs::create_dir_all(&dir).unwrap();
-        let dst = dir.join(ffi::plugin_file_name("mini-kv"));
-        // 幂等拷贝：dest 已存在且不旧于源则跳过（同 mini_plugin_dir，Windows dll 覆写坑）。
-        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
-        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
-        let outdated = match (dst_modified, src_modified) {
-            (Ok(d), Ok(s)) => d < s,
-            _ => true,
-        };
-        if outdated {
-            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
-        }
-        dir
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-kv",
+            "oj_plugin_test_mini_kv",
+            "mini-kv",
+            "test-plugins-kv",
+        )
     })
     .clone()
 }
@@ -93,42 +75,30 @@ fn no_cfg(_: &str) -> String {
     "{}".to_string()
 }
 
-/// mini-mq 编译产物目录（复用 mini_kv_plugin_dir 模式；与 mini/mini-kv 各占独立目录，
-/// 避免 scan 计数断言翻倍）。
+/// mini-mq（单轴 mq 夹具；与 mini/mini-kv 各占独立目录，避免 scan 计数断言翻倍）。
 fn mini_mq_plugin_dir() -> PathBuf {
     static ONCE: OnceLock<PathBuf> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let root = ffi::workspace_root();
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "oj-plugin-test-mini-mq"])
-            .current_dir(&root)
-            .status()
-            .expect("invoke cargo build for test plugin");
-        assert!(status.success(), "test plugin build failed");
-        let (prefix, ext) = if cfg!(target_os = "windows") {
-            ("", "dll")
-        } else if cfg!(target_os = "macos") {
-            ("lib", "dylib")
-        } else {
-            ("lib", "so")
-        };
-        let built = root
-            .join("target/debug")
-            .join(format!("{prefix}oj_plugin_test_mini_mq.{ext}"));
-        let dir = root.join("target/test-plugins-mq").join(ffi::triple());
-        std::fs::create_dir_all(&dir).unwrap();
-        let dst = dir.join(ffi::plugin_file_name("mini-mq"));
-        // 幂等拷贝：dest 已存在且不旧于源则跳过（同 mini_plugin_dir，Windows dll 覆写坑）。
-        let dst_modified = std::fs::metadata(&dst).and_then(|m| m.modified());
-        let src_modified = std::fs::metadata(&built).and_then(|m| m.modified());
-        let outdated = match (dst_modified, src_modified) {
-            (Ok(d), Ok(s)) => d < s,
-            _ => true,
-        };
-        if outdated {
-            std::fs::copy(&built, &dst).expect("copy test plugin artifact");
-        }
-        dir
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-mq",
+            "oj_plugin_test_mini_mq",
+            "mini-mq",
+            "test-plugins-mq",
+        )
+    })
+    .clone()
+}
+
+/// mini-nosym（无 oj 符号的普通 cdylib）：dlopen 成功但缺 `oj_plugin_abi_version`。
+fn mini_nosym_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-nosym",
+            "oj_plugin_test_mini_nosym",
+            "mini-nosym",
+            "test-plugins-nosym",
+        )
     })
     .clone()
 }
@@ -478,4 +448,204 @@ fn scan_bad_plugin_is_err_not_skipped() {
         ),
         "{err}"
     );
+}
+
+// ---- 自省 / 其余失败分类补测 ----
+
+/// 清掉 mini 行为开关（并行测试可能已 set，防互踩）。
+fn clear_mini_hooks() {
+    unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+    unsafe { std::env::remove_var("MINI_PANIC") };
+    unsafe { std::env::remove_var("MINI_FAKE_FINGERPRINT") };
+}
+
+/// Debug 自省形态（运维诊断用）：须点名插件名 / semver / abi_version。
+#[test]
+fn given_loaded_plugin_when_debug_format_then_names_plugin_semver_and_abi() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear_mini_hooks();
+    let loaded = super::load_one(
+        &mini_plugin_dir().join(ffi::plugin_file_name("mini")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    let dbg = format!("{loaded:?}");
+    assert!(dbg.contains("LoadedPlugin"), "{dbg}");
+    assert!(dbg.contains("mini"), "{dbg}");
+    assert!(dbg.contains("0.1.0"), "{dbg}");
+    assert!(dbg.contains("abi_version"), "{dbg}");
+}
+
+/// dlopen 成功但缺 ABI 符号（无 oj 符号的普通 cdylib）→ SymbolMissing 且点名符号；
+/// 这是不走入口宏的手写库的第一道门禁（spec §4 失败分类之三）。
+#[test]
+fn given_library_without_abi_symbol_when_load_then_symbol_missing() {
+    let dir = mini_nosym_plugin_dir();
+    let err = super::load_one(
+        &dir.join(ffi::plugin_file_name("mini-nosym")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap_err();
+    match err {
+        PluginLoadError::SymbolMissing { symbol, .. } => {
+            assert_eq!(symbol, "oj_plugin_abi_version");
+        }
+        other => panic!("expected SymbolMissing, got {other}"),
+    }
+}
+
+/// 指纹不符仅告警不 fail（spec §3）：夹具经 MINI_FAKE_FINGERPRINT 伪造指纹，
+/// 加载须成功且 descriptor 原样保留（宿主自报的指纹进 PluginInfo 供运维核对）。
+#[test]
+fn given_fingerprint_mismatch_when_load_then_warn_only_and_still_ok() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear_mini_hooks();
+    let dir = mini_plugin_dir();
+    unsafe { std::env::set_var("MINI_FAKE_FINGERPRINT", "rustc-999-bogus") };
+    let loaded = super::load_one(
+        &dir.join(ffi::plugin_file_name("mini")),
+        None,
+        host_context(),
+        &no_cfg,
+    );
+    unsafe { std::env::remove_var("MINI_FAKE_FINGERPRINT") };
+    let loaded = loaded.unwrap();
+    assert_eq!(&loaded.descriptor.name[..], "mini");
+    assert_eq!(&loaded.descriptor.fingerprint[..], "rustc-999-bogus");
+}
+
+// ---- 装配期 connect 适配（kv_backend_connect / blob_backend_connect）----
+
+use oj_plugin_ffi::{BlobBackendVtable, FfiFuture, KVStoreVtable};
+
+/// 断言 connect 为 Err 并取错误文案（Ok 型是非 Debug 的 Arc<dyn KVStore/BlobBackend>）。
+fn connect_err<T: ?Sized>(r: Result<Arc<T>, String>) -> String {
+    match r {
+        Ok(_) => panic!("expected connect failure"),
+        Err(e) => e,
+    }
+}
+
+/// kv 连接假 vtable：0=ok {"handle":9}；1=插件报错；2=非 JSON；3=缺 handle。
+static PL_KV_MODE: Mutex<u8> = Mutex::new(0);
+static PL_KV_GOT_CFG: Mutex<String> = Mutex::new(String::new());
+
+extern "C" fn pl_kv_connect(cfg: RString) -> FfiFuture {
+    *PL_KV_GOT_CFG.lock().unwrap() = cfg[..].to_string();
+    match *PL_KV_MODE.lock().unwrap() {
+        1 => oj_plugin_ffi::ready_err("kv down"),
+        2 => oj_plugin_ffi::ready_ok(b"gibberish".to_vec()),
+        3 => oj_plugin_ffi::ready_ok(br#"{}"#.to_vec()),
+        _ => oj_plugin_ffi::ready_ok(br#"{"handle":9}"#.to_vec()),
+    }
+}
+extern "C" fn pl_kv_stub_get(_h: u64, _k: RString) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_kv_stub_set(_h: u64, _k: RString, _v: RString) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_kv_stub_expire(_h: u64, _k: RString, _t: u64) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_kv_close(_h: u64) {}
+
+static PL_KV_VT: KVStoreVtable = KVStoreVtable {
+    connect: pl_kv_connect,
+    get: pl_kv_stub_get,
+    set: pl_kv_stub_set,
+    del: pl_kv_stub_get,
+    expire: pl_kv_stub_expire,
+    incr: pl_kv_stub_get,
+    close: pl_kv_close,
+};
+
+/// kv 装配期 connect 成功 + 三类失败（插件报错 / 非 JSON / 缺 handle）——
+/// 合为一个用例串行驱动：模式开关是进程级 static，并行用例会在 await 点互踩。
+#[tokio::test]
+async fn given_kv_vtable_when_backend_connect_then_cfg_forwarded_and_errs_name_the_stage() {
+    // 成功路径：url 以 `{"url":...}` JSON 过线，handle 提取成 FfiKVStore。
+    *PL_KV_MODE.lock().unwrap() = 0;
+    let store = kv_backend_connect(&PL_KV_VT, "redis://h:6379")
+        .await
+        .unwrap();
+    assert_eq!(
+        PL_KV_GOT_CFG.lock().unwrap().as_str(),
+        r#"{"url":"redis://h:6379"}"#
+    );
+    // store 是 core KVStore 形态（handle 已包进适配器；方法错误臂由假 vtable 兜底）。
+    assert!(store.get("k").await.is_err());
+    // 失败臂：各自错误文案点名阶段（spec §3 错误透传契约）。
+    *PL_KV_MODE.lock().unwrap() = 1;
+    let e = connect_err(kv_backend_connect(&PL_KV_VT, "redis://h").await);
+    assert!(e.contains("kv connect") && e.contains("kv down"), "{e}");
+    *PL_KV_MODE.lock().unwrap() = 2;
+    let e = connect_err(kv_backend_connect(&PL_KV_VT, "redis://h").await);
+    assert!(e.contains("kv connect decode"), "{e}");
+    *PL_KV_MODE.lock().unwrap() = 3;
+    let e = connect_err(kv_backend_connect(&PL_KV_VT, "redis://h").await);
+    assert!(e.contains("kv connect: missing handle"), "{e}");
+    *PL_KV_MODE.lock().unwrap() = 0;
+}
+
+/// blob 连接假 vtable：0=ok {"handle":8}；1=插件报错；2=非 JSON；3=缺 handle。
+static PL_BLOB_MODE: Mutex<u8> = Mutex::new(0);
+static PL_BLOB_GOT: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+extern "C" fn pl_blob_connect(name: RString, cfg: RString) -> FfiFuture {
+    *PL_BLOB_GOT.lock().unwrap() = (name[..].to_string(), cfg[..].to_string());
+    match *PL_BLOB_MODE.lock().unwrap() {
+        1 => oj_plugin_ffi::ready_err("s3 down"),
+        2 => oj_plugin_ffi::ready_ok(b"gibberish".to_vec()),
+        3 => oj_plugin_ffi::ready_ok(br#"{}"#.to_vec()),
+        _ => oj_plugin_ffi::ready_ok(br#"{"handle":8}"#.to_vec()),
+    }
+}
+extern "C" fn pl_blob_stub(_h: u64, _k: RString) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_blob_put(
+    _h: u64,
+    _k: RString,
+    _b: oj_plugin_ffi::RBytes,
+    _ct: RString,
+) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_blob_close(_h: u64) {}
+
+static PL_BLOB_VT: BlobBackendVtable = BlobBackendVtable {
+    connect: pl_blob_connect,
+    put: pl_blob_put,
+    get: pl_blob_stub,
+    del: pl_blob_stub,
+    url: pl_blob_stub,
+    content_type: pl_blob_stub,
+    close: pl_blob_close,
+};
+
+/// blob 装配期 connect 成功 + 三类失败（同 kv：合一个用例避免并行互踩模式开关）。
+/// 成功路径断言：后端名 + cfg JSON 按值原样过线（spec §3 有意的边界）。
+#[tokio::test]
+async fn given_blob_vtable_when_backend_connect_then_forwarded_and_errs_name_the_stage() {
+    *PL_BLOB_MODE.lock().unwrap() = 0;
+    blob_backend_connect(&PL_BLOB_VT, "s3", r#"{"bucket":"b"}"#)
+        .await
+        .unwrap();
+    let (name, cfg) = PL_BLOB_GOT.lock().unwrap().clone();
+    assert_eq!((name.as_str(), cfg.as_str()), ("s3", r#"{"bucket":"b"}"#));
+    *PL_BLOB_MODE.lock().unwrap() = 1;
+    let e = connect_err(blob_backend_connect(&PL_BLOB_VT, "s3", "{}").await);
+    assert!(e.contains("blob connect") && e.contains("s3 down"), "{e}");
+    *PL_BLOB_MODE.lock().unwrap() = 2;
+    let e = connect_err(blob_backend_connect(&PL_BLOB_VT, "s3", "{}").await);
+    assert!(e.contains("blob connect decode"), "{e}");
+    *PL_BLOB_MODE.lock().unwrap() = 3;
+    let e = connect_err(blob_backend_connect(&PL_BLOB_VT, "s3", "{}").await);
+    assert!(e.contains("blob connect: missing handle"), "{e}");
+    *PL_BLOB_MODE.lock().unwrap() = 0;
 }

@@ -836,10 +836,31 @@ mod adapter_tests {
     static FAIL_NEXT: AtomicBool = AtomicBool::new(false);
     static FREED: AtomicU64 = AtomicU64::new(0);
 
+    /// 模式开关守卫：置位 mock 的行为开关，作用域结束（含 panic）自动复位为 0，
+    /// 防止失败用例污染同轴后续用例。用法：`let _m = Mode::set(&ES_MODE, 2);`。
+    struct Mode<'a>(&'a Mutex<u8>);
+    impl Mode<'_> {
+        fn set(m: &'static Mutex<u8>, v: u8) -> Self {
+            *m.lock().unwrap() = v;
+            Self(m)
+        }
+    }
+    impl Drop for Mode<'_> {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = 0;
+        }
+    }
+
+    /// es 行为开关：2=search 返回非 JSON；3=index_doc 报错；4=delete_doc 报错。
+    static ES_MODE: Mutex<u8> = Mutex::new(0);
+
     extern "C" fn mock_search(handle: u64, index: RString, body: RString) -> FfiFuture {
         *LAST_SEARCH.lock().unwrap() = (handle, index[..].to_string(), body[..].to_string());
         if FAIL_NEXT.swap(false, Ordering::SeqCst) {
             return ready(Err("boom from plugin".into()));
+        }
+        if *ES_MODE.lock().unwrap() == 2 {
+            return ready(Ok(b"gibberish".to_vec()));
         }
         ready(Ok(br#"{"hits":[]}"#.to_vec()))
     }
@@ -850,10 +871,16 @@ mod adapter_tests {
         _id: RString,
         _body: RString,
     ) -> FfiFuture {
+        if *ES_MODE.lock().unwrap() == 3 {
+            return ready(Err("index boom".into()));
+        }
         ready(Ok(br#"{"result":"created"}"#.to_vec()))
     }
 
     extern "C" fn mock_delete_doc(_handle: u64, _index: RString, _id: RString) -> FfiFuture {
+        if *ES_MODE.lock().unwrap() == 4 {
+            return ready(Err("delete boom".into()));
+        }
         ready(Ok(br#"{"result":"deleted"}"#.to_vec()))
     }
 
@@ -948,20 +975,49 @@ mod adapter_tests {
     static DB_COMMITTED: AtomicU64 = AtomicU64::new(0);
     static DB_ROLLED_BACK: AtomicU64 = AtomicU64::new(0);
     static DB_CLOSED: AtomicU64 = AtomicU64::new(0);
+    /// db connect 行为开关：1=报错；2=非 JSON；3=缺 handle。
+    static DB_CONNECT_MODE: Mutex<u8> = Mutex::new(0);
+    /// begin 行为开关：1=报错；2=非 JSON；3=缺 tx_id。
+    static DB_BEGIN_MODE: Mutex<u8> = Mutex::new(0);
+    /// query/exec/tx_query/tx_exec 行为开关：1=报错；2=非 JSON。
+    static DB_CALL_MODE: Mutex<u8> = Mutex::new(0);
+    /// commit/rollback 行为开关：1=报错（记录 tx_id 后再报，模拟插件侧已动作）。
+    static DB_TX_END_MODE: Mutex<u8> = Mutex::new(0);
+    /// vtable 自报方言：0=postgres；1=mysql；2=未知方言。
+    static DB_DIALECT_MODE: Mutex<u8> = Mutex::new(0);
+
+    /// DB_CALL_MODE 驱动的 query 类返回体。
+    fn db_call_result(ok: &[u8]) -> FfiFuture {
+        match *DB_CALL_MODE.lock().unwrap() {
+            1 => ready(Err("call down".into())),
+            2 => ready(Ok(b"gibberish".to_vec())),
+            _ => ready(Ok(ok.to_vec())),
+        }
+    }
 
     extern "C" fn mock_db_connect(cfg: RString) -> FfiFuture {
         *DB_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
-        ready(Ok(br#"{"handle":42}"#.to_vec()))
+        match *DB_CONNECT_MODE.lock().unwrap() {
+            1 => ready(Err("db down".into())),
+            2 => ready(Ok(b"gibberish".to_vec())),
+            3 => ready(Ok(br#"{}"#.to_vec())),
+            _ => ready(Ok(br#"{"handle":42}"#.to_vec())),
+        }
     }
     extern "C" fn mock_db_query(handle: u64, sql: RString, params: RString) -> FfiFuture {
         *DB_QUERY.lock().unwrap() = (handle, sql[..].to_string(), params[..].to_string());
-        ready(Ok(br#"[{"c":1,"t":"a"}]"#.to_vec()))
+        db_call_result(br#"[{"c":1,"t":"a"}]"#)
     }
     extern "C" fn mock_db_exec(_h: u64, _s: RString, _p: RString) -> FfiFuture {
-        ready(Ok(br#"3"#.to_vec()))
+        db_call_result(br#"3"#)
     }
     extern "C" fn mock_db_begin(_handle: u64) -> FfiFuture {
-        ready(Ok(br#"{"tx_id":7}"#.to_vec()))
+        match *DB_BEGIN_MODE.lock().unwrap() {
+            1 => ready(Err("begin down".into())),
+            2 => ready(Ok(b"gibberish".to_vec())),
+            3 => ready(Ok(br#"{}"#.to_vec())),
+            _ => ready(Ok(br#"{"tx_id":7}"#.to_vec())),
+        }
     }
     extern "C" fn mock_db_tx_query(
         handle: u64,
@@ -970,21 +1026,31 @@ mod adapter_tests {
         params: RString,
     ) -> FfiFuture {
         *DB_TX_QUERY.lock().unwrap() = (handle, tx_id, sql[..].to_string(), params[..].to_string());
-        ready(Ok(br#"[{"c":9}]"#.to_vec()))
+        db_call_result(br#"[{"c":9}]"#)
     }
     extern "C" fn mock_db_tx_exec(_h: u64, _t: u64, _s: RString, _p: RString) -> FfiFuture {
-        ready(Ok(br#"1"#.to_vec()))
+        db_call_result(br#"1"#)
     }
     extern "C" fn mock_db_tx_commit(_h: u64, tx_id: u64) -> FfiFuture {
         DB_COMMITTED.store(tx_id, AtomicOrdering::SeqCst);
+        if *DB_TX_END_MODE.lock().unwrap() == 1 {
+            return ready(Err("commit down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_db_tx_rollback(_h: u64, tx_id: u64) -> FfiFuture {
         DB_ROLLED_BACK.store(tx_id, AtomicOrdering::SeqCst);
+        if *DB_TX_END_MODE.lock().unwrap() == 1 {
+            return ready(Err("rollback down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_db_dialect(_handle: u64) -> RString {
-        RString::from("postgres")
+        RString::from(match *DB_DIALECT_MODE.lock().unwrap() {
+            1 => "mysql",
+            2 => "weirddb",
+            _ => "postgres",
+        })
     }
     extern "C" fn mock_db_close(handle: u64) {
         DB_CLOSED.store(handle, AtomicOrdering::SeqCst);
@@ -1095,6 +1161,8 @@ mod adapter_tests {
     static BLOB_CT: Mutex<(u64, String)> = Mutex::new((0, String::new()));
     static BLOB_CLOSED: AtomicU64 = AtomicU64::new(0);
     static BLOB_CT_EMPTY: AtomicBool = AtomicBool::new(false);
+    /// blob 行为开关：1=报错；2=url/content_type 返回坏 UTF-8 字节。
+    static BLOB_MODE: Mutex<u8> = Mutex::new(0);
 
     extern "C" fn mock_blob_connect(_name: RString, _cfg: RString) -> FfiFuture {
         ready(Ok(br#"{"handle":42}"#.to_vec()))
@@ -1110,26 +1178,40 @@ mod adapter_tests {
             b.push(*x);
         }
         *BLOB_PUT.lock().unwrap() = (handle, key[..].to_string(), b, ct[..].to_string());
+        if *BLOB_MODE.lock().unwrap() == 1 {
+            return ready(Err("put down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_blob_get(handle: u64, key: RString) -> FfiFuture {
         *BLOB_GET.lock().unwrap() = (handle, key[..].to_string());
+        if *BLOB_MODE.lock().unwrap() == 1 {
+            return ready(Err("get down".into()));
+        }
         ready(Ok(b"blobdata".to_vec()))
     }
     extern "C" fn mock_blob_del(handle: u64, key: RString) -> FfiFuture {
         *BLOB_DEL.lock().unwrap() = (handle, key[..].to_string());
+        if *BLOB_MODE.lock().unwrap() == 1 {
+            return ready(Err("del down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_blob_url(handle: u64, key: RString) -> FfiFuture {
         *BLOB_URL.lock().unwrap() = (handle, key[..].to_string());
-        ready(Ok(b"https://b.s3/presign".to_vec()))
+        match *BLOB_MODE.lock().unwrap() {
+            1 => ready(Err("url down".into())),
+            2 => ready(Ok(vec![0xff, 0xfe])),
+            _ => ready(Ok(b"https://b.s3/presign".to_vec())),
+        }
     }
     extern "C" fn mock_blob_content_type(handle: u64, key: RString) -> FfiFuture {
         *BLOB_CT.lock().unwrap() = (handle, key[..].to_string());
-        if BLOB_CT_EMPTY.swap(false, AtomicOrdering::SeqCst) {
-            ready(Ok(b"".to_vec()))
-        } else {
-            ready(Ok(b"image/png".to_vec()))
+        match *BLOB_MODE.lock().unwrap() {
+            1 => ready(Err("ct down".into())),
+            2 => ready(Ok(vec![0xff, 0xfe])),
+            _ if BLOB_CT_EMPTY.swap(false, AtomicOrdering::SeqCst) => ready(Ok(b"".to_vec())),
+            _ => ready(Ok(b"image/png".to_vec())),
         }
     }
     extern "C" fn mock_blob_close(handle: u64) {
@@ -1229,13 +1311,25 @@ mod adapter_tests {
     /// TDD 开关：置位时 mock_bus_subscribe 先记录（模拟消费循环已起）再返回 Err，
     /// 用于验证 I-1 失败回滚（无僵尸注册）。
     static BUS_SUBSCRIBE_FAIL: AtomicBool = AtomicBool::new(false);
+    /// bus connect 行为开关：1=报错；2=非 JSON；3=缺 handle。
+    static BUS_CONNECT_MODE: Mutex<u8> = Mutex::new(0);
+    /// TDD 开关：置位时 publish 报错（插件侧投递失败透传）。
+    static BUS_PUBLISH_FAIL: AtomicBool = AtomicBool::new(false);
 
     extern "C" fn mock_bus_connect(cfg: RString) -> FfiFuture {
         *BUS_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
-        ready(Ok(br#"{"handle":42}"#.to_vec()))
+        match *BUS_CONNECT_MODE.lock().unwrap() {
+            1 => ready(Err("bus down".into())),
+            2 => ready(Ok(b"gibberish".to_vec())),
+            3 => ready(Ok(br#"{}"#.to_vec())),
+            _ => ready(Ok(br#"{"handle":42}"#.to_vec())),
+        }
     }
     extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
         *BUS_PUBLISHED.lock().unwrap() = (handle, topic[..].to_string(), data[..].to_string());
+        if BUS_PUBLISH_FAIL.swap(false, AtomicOrdering::SeqCst) {
+            return ready(Err("publish down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_bus_subscribe(handle: u64, topic: RString) -> FfiFuture {
@@ -1434,29 +1528,49 @@ mod adapter_tests {
     static KV_EXPIRE: Mutex<(u64, String, u64)> = Mutex::new((0, String::new(), 0));
     static KV_INCR: Mutex<(u64, String)> = Mutex::new((0, String::new()));
     static KV_CLOSED: AtomicU64 = AtomicU64::new(0);
+    /// kv 行为开关：1=报错；2=get/expire/incr 返回非 JSON。
+    static KV_MODE: Mutex<u8> = Mutex::new(0);
 
     extern "C" fn mock_kv_connect(_cfg: RString) -> FfiFuture {
         ready(Ok(br#"{"handle":42}"#.to_vec()))
     }
     extern "C" fn mock_kv_get(handle: u64, key: RString) -> FfiFuture {
         *KV_GET.lock().unwrap() = (handle, key[..].to_string());
-        ready(Ok(br#""blobdata""#.to_vec())) // JSON Option<String>
+        match *KV_MODE.lock().unwrap() {
+            1 => ready(Err("get down".into())),
+            2 => ready(Ok(b"{nope".to_vec())),
+            _ => ready(Ok(br#""blobdata""#.to_vec())), // JSON Option<String>
+        }
     }
     extern "C" fn mock_kv_set(handle: u64, key: RString, value: RString) -> FfiFuture {
         *KV_SET.lock().unwrap() = (handle, key[..].to_string(), value[..].to_string());
+        if *KV_MODE.lock().unwrap() == 1 {
+            return ready(Err("set down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_kv_del(handle: u64, key: RString) -> FfiFuture {
         *KV_DEL.lock().unwrap() = (handle, key[..].to_string());
+        if *KV_MODE.lock().unwrap() == 1 {
+            return ready(Err("del down".into()));
+        }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_kv_expire(handle: u64, key: RString, secs: u64) -> FfiFuture {
         *KV_EXPIRE.lock().unwrap() = (handle, key[..].to_string(), secs);
-        ready(Ok(b"true".to_vec()))
+        match *KV_MODE.lock().unwrap() {
+            1 => ready(Err("expire down".into())),
+            2 => ready(Ok(b"{nope".to_vec())),
+            _ => ready(Ok(b"true".to_vec())),
+        }
     }
     extern "C" fn mock_kv_incr(handle: u64, key: RString) -> FfiFuture {
         *KV_INCR.lock().unwrap() = (handle, key[..].to_string());
-        ready(Ok(b"42".to_vec()))
+        match *KV_MODE.lock().unwrap() {
+            1 => ready(Err("incr down".into())),
+            2 => ready(Ok(b"{nope".to_vec())),
+            _ => ready(Ok(b"42".to_vec())),
+        }
     }
     extern "C" fn mock_kv_close(handle: u64) {
         KV_CLOSED.store(handle, AtomicOrdering::SeqCst);
@@ -1532,6 +1646,449 @@ mod adapter_tests {
         drop(FfiKVStore::new(42, mock_kv_vtable()));
         assert_eq!(KV_CLOSED.load(AtomicOrdering::SeqCst), 42);
     }
+
+    // ---- auth 轴 mock vtable（Task auth-1；同步 RResult 直返，无 FfiFuture）----
+
+    /// auth verify 行为开关：0=对象用户；1=null（匿名放行）；2=标量；3=坏 JSON；4=Err。
+    static AUTH_MODE: Mutex<u8> = Mutex::new(0);
+    static AUTH_GOT: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+    extern "C" fn mock_auth_verify(
+        path: RString,
+        authorization: RString,
+    ) -> RResult<RString, RString> {
+        *AUTH_GOT.lock().unwrap() = (path[..].to_string(), authorization[..].to_string());
+        match *AUTH_MODE.lock().unwrap() {
+            1 => RResult::Ok(RString::from("null")),
+            2 => RResult::Ok(RString::from("5")),
+            3 => RResult::Ok(RString::from("{nope")),
+            4 => RResult::Err(RString::from("token expired")),
+            _ => RResult::Ok(RString::from(r#"{"id":"u1"}"#)),
+        }
+    }
+
+    fn mock_auth_vtable() -> &'static oj_plugin_ffi::AuthGuardVtable {
+        Box::leak(Box::new(oj_plugin_ffi::AuthGuardVtable {
+            verify: mock_auth_verify,
+        }))
+    }
+
+    // ---- 补测：await_ffi 协议边界 / auth 守卫契约 / 各轴错误臂 ----
+
+    use crate::bridge::AuthGuard;
+
+    /// 断言 BridgeResult 为 Err 并取错误文案（Ok 型多为非 Debug 的 dyn Trait 适配器，无法 unwrap_err）。
+    fn expect_err<T>(r: BridgeResult<T>) -> String {
+        match r {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// loader 错误文本 → 分类启发式的全关键词臂：平台/架构类逐词命中
+    /// PlatformMismatch，其余落 DependencyResolution（分类只影响文案，不影响 fail-fast）。
+    #[test]
+    fn given_loader_error_texts_when_classified_then_platform_or_dependency() {
+        let p = Path::new("/x/plugin.dylib");
+        for text in [
+            "architecture mismatch",
+            "incompatible architecture",
+            "mach-o, but wrong file type",
+            "wrong ELF class: ELFCLASS32",
+            "wrong ELF data format",
+            "version `GLIBC_2.38' not found",
+            "not a mach-o image",
+            "file too short",
+            "%1 is not a valid Win32 application",
+        ] {
+            assert!(
+                matches!(
+                    classify_load_error(p, text),
+                    PluginLoadError::PlatformMismatch { .. }
+                ),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            classify_load_error(p, "undefined symbol: _xyz"),
+            PluginLoadError::DependencyResolution { .. }
+        ));
+    }
+
+    /// es search 返回非 JSON → decode 错误臂；index_doc/delete_doc 插件报错 → 透传点名调用。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_es_error_variants_when_search_index_delete_then_errs_name_the_call() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiEsBackend::new(1, mock_vtable());
+        {
+            let _m = Mode::set(&ES_MODE, 2);
+            let e = b
+                .search("i", serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("search decode"), "{e}");
+        }
+        {
+            let _m = Mode::set(&ES_MODE, 3);
+            let e = b
+                .index_doc("i", "7", serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("index_doc") && e.contains("index boom"), "{e}");
+        }
+        {
+            let _m = Mode::set(&ES_MODE, 4);
+            let e = b.delete_doc("i", "7").await.unwrap_err().to_string();
+            assert!(e.contains("delete_doc") && e.contains("delete boom"), "{e}");
+        }
+    }
+
+    // ---- auth 守卫契约（匿名/用户/坏插件输出/拒签）----
+
+    #[test]
+    fn given_auth_plugin_returns_user_object_when_verify_then_user_parsed_and_header_forwarded() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&AUTH_MODE, 0);
+        let guard = FfiAuthGuard::new(mock_auth_vtable());
+        let user = guard.verify("/v1/api/u/", Some("Bearer tok1")).unwrap();
+        assert_eq!(user.unwrap()["id"], "u1");
+        let (path, authz) = AUTH_GOT.lock().unwrap().clone();
+        assert_eq!(
+            (path.as_str(), authz.as_str()),
+            ("/v1/api/u/", "Bearer tok1")
+        );
+    }
+
+    /// 匿名契约：插件回 null → Ok(None) 放行不注入；无 Authorization 头 → 空串过线。
+    #[test]
+    fn given_anonymous_path_when_verify_then_none_and_empty_authorization_forwarded() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&AUTH_MODE, 1);
+        let guard = FfiAuthGuard::new(mock_auth_vtable());
+        assert_eq!(guard.verify("/p", None).unwrap(), None);
+        let (_, authz) = AUTH_GOT.lock().unwrap().clone();
+        assert_eq!(authz, "");
+    }
+
+    /// 坏插件输出（标量 / 非 JSON）→ Err 点名契约违约，不静默当匿名放行。
+    #[test]
+    fn given_auth_plugin_speaks_gibberish_when_verify_then_contract_violation_errs() {
+        let _g = T_LOCK.lock().unwrap();
+        let guard = FfiAuthGuard::new(mock_auth_vtable());
+        let _m2 = Mode::set(&AUTH_MODE, 2);
+        let e = guard.verify("/p", None).unwrap_err();
+        assert!(e.contains("non-object user"), "{e}");
+        let _m3 = Mode::set(&AUTH_MODE, 3);
+        let e = guard.verify("/p", None).unwrap_err();
+        assert!(e.contains("auth plugin returned bad json"), "{e}");
+    }
+
+    /// 插件拒签（Err 臂）→ 错误文案原样透传（401 消息契约）。
+    #[test]
+    fn given_auth_plugin_rejects_when_verify_then_err_carries_plugin_message() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&AUTH_MODE, 4);
+        let guard = FfiAuthGuard::new(mock_auth_vtable());
+        let e = guard.verify("/p", Some("Bearer bad")).unwrap_err();
+        assert_eq!(e, "token expired");
+    }
+
+    // ---- db 轴错误臂 ----
+
+    /// db connect 三类失败：插件报错 / 非 JSON（decode）/ 缺 handle——文案点名阶段。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_db_connect_failures_when_connect_then_errs_name_the_stage() {
+        let _g = T_LOCK.lock().unwrap();
+        let be = FfiDbBackend::new("db-mysql", mock_db_vtable());
+        {
+            let _m = Mode::set(&DB_CONNECT_MODE, 1);
+            let e = expect_err(be.connect("dsn", std::path::Path::new("/tmp")).await);
+            assert!(e.contains("db connect") && e.contains("db down"), "{e}");
+        }
+        {
+            let _m = Mode::set(&DB_CONNECT_MODE, 2);
+            let e = expect_err(be.connect("dsn", std::path::Path::new("/tmp")).await);
+            assert!(e.contains("db connect decode"), "{e}");
+        }
+        {
+            let _m = Mode::set(&DB_CONNECT_MODE, 3);
+            let e = expect_err(be.connect("dsn", std::path::Path::new("/tmp")).await);
+            assert!(e.contains("db connect: missing handle"), "{e}");
+        }
+    }
+
+    /// begin 三类失败：插件报错 / 非 JSON（decode）/ 缺 tx_id。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_db_begin_failures_when_begin_then_errs_name_the_stage() {
+        let _g = T_LOCK.lock().unwrap();
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        {
+            let _m = Mode::set(&DB_BEGIN_MODE, 1);
+            let e = expect_err(da.begin().await);
+            assert!(e.contains("db begin") && e.contains("begin down"), "{e}");
+        }
+        {
+            let _m = Mode::set(&DB_BEGIN_MODE, 2);
+            let e = expect_err(da.begin().await);
+            assert!(e.contains("db begin decode"), "{e}");
+        }
+        {
+            let _m = Mode::set(&DB_BEGIN_MODE, 3);
+            let e = expect_err(da.begin().await);
+            assert!(e.contains("db begin: missing tx_id"), "{e}");
+        }
+    }
+
+    /// query/exec/tx_query/tx_exec 插件报错 → 文案点名具体调用。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_db_calls_fail_when_query_exec_tx_then_errs_name_the_call() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&DB_CALL_MODE, 1);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let e = da
+            .query_with_params("s", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("db query") && e.contains("call down"), "{e}");
+        let e = da.exec_with_params("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db exec"), "{e}");
+        let tx = da.begin().await.unwrap();
+        let e = tx.query("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db tx_query"), "{e}");
+        let e = tx.exec("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db tx_exec"), "{e}");
+    }
+
+    /// query/exec/tx_query/tx_exec 返回非 JSON → decode 错误臂。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_db_calls_return_gibberish_when_query_exec_tx_then_decode_errs() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&DB_CALL_MODE, 2);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let e = da
+            .query_with_params("s", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("db query decode"), "{e}");
+        let e = da.exec_with_params("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db exec decode"), "{e}");
+        let tx = da.begin().await.unwrap();
+        let e = tx.query("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db tx_query decode"), "{e}");
+        let e = tx.exec("s", &[]).await.unwrap_err().to_string();
+        assert!(e.contains("db tx_exec decode"), "{e}");
+    }
+
+    /// 方言自报映射：mysql → MySql；未知方言兜底 Sqlite（宿主不改插件契约）。
+    #[test]
+    fn given_dialect_variants_when_reported_then_mapped_with_sqlite_fallback() {
+        let _g = T_LOCK.lock().unwrap();
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        {
+            let _m = Mode::set(&DB_DIALECT_MODE, 1);
+            assert_eq!(da.dialect(), Dialect::MySql);
+        }
+        {
+            let _m = Mode::set(&DB_DIALECT_MODE, 2);
+            assert_eq!(da.dialect(), Dialect::Sqlite);
+        }
+    }
+
+    /// commit 失败 → Err 且事务视为未完结：drop 保底回滚仍触发（ReqState reset
+    /// 丢弃存活事务 = 保底回滚语义的 FFI 保留，见 FfiTxSession::drop）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_tx_commit_fails_when_dropped_then_guaranteed_rollback_still_fires() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_COMMITTED.store(0, AtomicOrdering::SeqCst);
+        DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
+        let _m = Mode::set(&DB_TX_END_MODE, 1);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let tx = da.begin().await.unwrap();
+        let e = tx.commit().await.unwrap_err().to_string();
+        assert!(
+            e.contains("db tx_commit") && e.contains("commit down"),
+            "{e}"
+        );
+        drop(tx);
+        assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 7);
+    }
+
+    /// rollback 失败 → Err 透传（finished 未置位，drop 会再补一次回滚尝试）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_tx_rollback_fails_when_rollback_then_err_names_rollback() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
+        let _m = Mode::set(&DB_TX_END_MODE, 1);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let tx = da.begin().await.unwrap();
+        let e = tx.rollback().await.unwrap_err().to_string();
+        assert!(
+            e.contains("db tx_rollback") && e.contains("rollback down"),
+            "{e}"
+        );
+    }
+
+    // ---- blob 轴错误臂 ----
+
+    /// blob 五方法插件报错 → 错误文案点名操作；serve 走 url → 错误透传。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_blob_plugin_down_when_put_get_del_serve_then_errs_name_the_operation() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&BLOB_MODE, 1);
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        let e = b.put("k", b"x", None).await.unwrap_err().to_string();
+        assert!(e.contains("blob put") && e.contains("put down"), "{e}");
+        let e = b.get("k").await.unwrap_err().to_string();
+        assert!(e.contains("blob get"), "{e}");
+        let e = b.del("k").await.unwrap_err().to_string();
+        assert!(e.contains("blob del"), "{e}");
+        let e = expect_err(b.serve("k").await);
+        assert!(e.contains("blob url"), "{e}");
+    }
+
+    /// url/content_type 返回坏 UTF-8 字节 → decode 错误臂。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_blob_gibberish_bytes_when_url_or_content_type_then_decode_errs() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&BLOB_MODE, 2);
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        let e = b.url("k").await.unwrap_err().to_string();
+        assert!(e.contains("blob url decode"), "{e}");
+        let e = b.content_type("k").await.unwrap_err().to_string();
+        assert!(e.contains("blob content_type decode"), "{e}");
+    }
+
+    // ---- bus 轴错误臂 ----
+
+    /// bus connect 三类失败：插件报错 / 非 JSON（decode）/ 缺 handle。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_bus_connect_failures_when_connect_then_errs_name_the_stage() {
+        let _g = T_LOCK.lock().unwrap();
+        let be = FfiBusBackend::new("bus-kafka", mock_bus_vtable());
+        let cfg = BrokerCfg {
+            kind: "kafka".into(),
+            brokers: vec![],
+            ..Default::default()
+        };
+        {
+            let _m = Mode::set(&BUS_CONNECT_MODE, 1);
+            let e = expect_err(be.connect(&cfg).await);
+            assert!(e.contains("bus connect") && e.contains("bus down"), "{e}");
+        }
+        {
+            let _m = Mode::set(&BUS_CONNECT_MODE, 2);
+            let e = expect_err(be.connect(&cfg).await);
+            assert!(e.contains("bus connect decode"), "{e}");
+        }
+        {
+            let _m = Mode::set(&BUS_CONNECT_MODE, 3);
+            let e = expect_err(be.connect(&cfg).await);
+            assert!(e.contains("bus connect: missing handle"), "{e}");
+        }
+    }
+
+    /// publish 插件报错 → 透传点名 bus publish（本地 fan-out 0 只在成功路径）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_bus_publish_fails_when_publish_then_err_names_publish() {
+        let _g = T_LOCK.lock().unwrap();
+        BUS_PUBLISH_FAIL.store(true, AtomicOrdering::SeqCst);
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let e = broker
+            .publish("t", &serde_json::json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("bus publish") && e.contains("publish down"),
+            "{e}"
+        );
+    }
+
+    /// kind 推断：插件名无 "bus-" 前缀时取全名（unwrap_or 臂）。
+    #[test]
+    fn given_backend_name_without_bus_prefix_when_new_then_kind_is_full_name() {
+        let _g = T_LOCK.lock().unwrap();
+        let be = FfiBusBackend::new("redis", mock_bus_vtable());
+        assert_eq!(be.kind(), "redis");
+    }
+
+    // ---- kv 轴错误臂 ----
+
+    /// kv 五方法插件报错 → 错误文案点名操作。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_kv_plugin_down_when_ops_then_errs_name_the_operation() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&KV_MODE, 1);
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        assert!(
+            kv.get("k")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv get")
+        );
+        assert!(
+            kv.set("k", "v")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv set")
+        );
+        assert!(
+            kv.del("k")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv del")
+        );
+        assert!(
+            kv.expire("k", std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv expire")
+        );
+        assert!(
+            kv.incr("k")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv incr")
+        );
+    }
+
+    /// kv get/expire/incr 返回非 JSON → decode 错误臂。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_kv_gibberish_when_get_expire_incr_then_decode_errs() {
+        let _g = T_LOCK.lock().unwrap();
+        let _m = Mode::set(&KV_MODE, 2);
+        let kv = FfiKVStore::new(42, mock_kv_vtable());
+        assert!(
+            kv.get("k")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv get decode")
+        );
+        assert!(
+            kv.expire("k", std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv expire decode")
+        );
+        assert!(
+            kv.incr("k")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("kv incr decode")
+        );
+    }
 }
 
 /// `await_ffi_poll`（mq 长轮询退避变体）测试：计数 pending 的假 future。
@@ -1606,5 +2163,60 @@ mod await_ffi_poll_tests {
             .unwrap();
         assert_eq!(out, b"ok".to_vec());
         assert!(t0.elapsed().as_millis() < 100, "{:?}", t0.elapsed());
+    }
+
+    // ---- poll=-1（错误码）但 take 结果各异的协议边界 ----
+
+    extern "C" fn err_poll(_state: *mut c_void) -> i32 {
+        -1
+    }
+    extern "C" fn ok_take(_state: *mut c_void) -> RResult<RBytes, RString> {
+        let mut v = RBytes::new();
+        for b in b"ok" {
+            v.push(*b);
+        }
+        RResult::Ok(v)
+    }
+    extern "C" fn err_take(_state: *mut c_void) -> RResult<RBytes, RString> {
+        RResult::Err(RString::from("late boom"))
+    }
+    fn code_future(take: extern "C" fn(*mut c_void) -> RResult<RBytes, RString>) -> FfiFuture {
+        FfiFuture {
+            state: std::ptr::null_mut(),
+            poll: err_poll,
+            take,
+            free: counted_free,
+        }
+    }
+
+    /// poll=-1 但 take=Ok → 协议违约兜底文案（不把成功结果误当错误细节）。
+    #[tokio::test]
+    async fn given_error_code_but_ok_take_when_await_ffi_then_reports_protocol_violation() {
+        let e = await_ffi(code_future(ok_take)).await.unwrap_err();
+        assert!(
+            e.contains("ffi poll reported error but take succeeded"),
+            "{e}"
+        );
+    }
+
+    /// await_ffi_poll 同款兜底（mq 长轮询变体保持同一协议语义）。
+    #[tokio::test]
+    async fn given_error_code_but_ok_take_when_await_ffi_poll_then_reports_protocol_violation() {
+        let e = await_ffi_poll(code_future(ok_take), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("ffi poll reported error but take succeeded"),
+            "{e}"
+        );
+    }
+
+    /// poll=-1 且 take=Err → 插件错误文案透传（await_ffi_poll 的错误臂）。
+    #[tokio::test]
+    async fn given_error_code_and_err_take_when_await_ffi_poll_then_err_carries_plugin_message() {
+        let e = await_ffi_poll(code_future(err_take), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(e, "late boom");
     }
 }

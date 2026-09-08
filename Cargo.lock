@@ -3376,6 +3376,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-plugin-test-mini-nosym"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4725,6 +4729,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.21.7",
  "chrono",
