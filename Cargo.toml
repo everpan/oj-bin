@@ -15,7 +15,7 @@ async-trait = "0.1"
 base64 = "0.23.1"
 # jwt/bcrypt/crypto 原语（auth 解耦 Task 1：核心只留原语，业务语义在 JS/插件）。
 bcrypt = "0.15"
-deno_core = "0.410"
+deno_core = "0.411"
 deno_error = "0.7"
 getrandom = "0.2"
 jsonwebtoken = "9"
