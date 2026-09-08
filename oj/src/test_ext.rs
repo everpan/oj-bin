@@ -108,3 +108,20 @@ deno_core::extension!(
     esm_entry_point = "ext:oj_test_ext/test_bootstrap.js",
     esm = [dir "src/test_ext", "test_bootstrap.js"],
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_multi_value_header_when_to_map_then_joined_comma_space() {
+        // 浏览器规范：同名多值头以 ", " 拼接（修正 #8 的业务约定）。
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("set-cookie", "a=1".parse().unwrap());
+        h.append("set-cookie", "b=2".parse().unwrap());
+        h.insert("x-single", "s".parse().unwrap());
+        let m = header_map_to_map(&h);
+        assert_eq!(m["set-cookie"], "a=1, b=2");
+        assert_eq!(m["x-single"], "s");
+    }
+}

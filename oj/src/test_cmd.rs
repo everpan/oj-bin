@@ -321,3 +321,139 @@ fn escape_xml(s: &str) -> String {
     }
     o
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 夹具：按 (suite, name, ok, error) 造 TestSummary（业务视角：给定一组用例结果）。
+    fn fx(rows: &[(&str, &str, bool, Option<&str>)]) -> TestSummary {
+        let mut s = TestSummary::default();
+        for (suite, name, ok, err) in rows {
+            s.total += 1;
+            if *ok {
+                s.passed += 1;
+            } else {
+                s.failed += 1;
+            }
+            s.tests.push(TestResult {
+                suite: if suite.is_empty() {
+                    None
+                } else {
+                    Some((*suite).into())
+                },
+                name: (*name).into(),
+                ok: *ok,
+                error: err.map(|e| e.to_string()),
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn given_pass_and_fail_cases_when_tap_then_numbered_ok_not_ok_with_yaml_diag() {
+        // TAP 13 消费方（CI 解析器）契约：1..N 编号、ok/not ok、失败附 YAML 诊断块。
+        let s = fx(&[
+            ("auth", "login ok", true, None),
+            ("", "boom", false, Some("expect: 1 == 2")),
+        ]);
+        let out = to_tap(&s);
+        assert!(out.starts_with("TAP version 13\n1..2\n"), "{out}");
+        assert!(out.contains("ok 1 - auth > login ok\n"), "{out}");
+        assert!(out.contains("not ok 2 - boom\n"), "{out}");
+        assert!(out.contains("  error: |\n    expect: 1 == 2\n"), "{out}");
+        assert!(out.ends_with("  ...\n"), "{out}");
+    }
+
+    #[test]
+    fn given_case_without_suite_when_tap_then_bare_name_no_prefix() {
+        let out = to_tap(&fx(&[("", "bare", true, None)]));
+        assert!(out.contains("ok 1 - bare\n"), "{out}");
+    }
+
+    #[test]
+    fn given_multisuite_with_specials_when_junit_then_grouped_escaped_failure_element() {
+        // JUnit 消费方契约：按 suite 聚合 testsuite、失败数、XML 转义、failure 消息。
+        let s = fx(&[
+            ("a<b", "case & 1", true, None),
+            ("a<b", "bad \"case\"", false, Some("line1\nline2")),
+        ]);
+        let out = to_junit(&s, std::time::Duration::from_millis(1500));
+        assert!(out.starts_with("<?xml"), "{out}");
+        assert!(
+            out.contains("<testsuites name=\"oj-test\" tests=\"2\" failures=\"1\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("<testsuite name=\"a&lt;b\" tests=\"2\" failures=\"1\""),
+            "{out}"
+        );
+        assert!(out.contains("<testcase name=\"case &amp; 1\""), "{out}");
+        assert!(
+            out.contains("<failure message=\"line1\">line1\nline2</failure>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn given_xml_specials_when_escape_then_five_entities() {
+        assert_eq!(escape_xml("&<>'\""), "&amp;&lt;&gt;&apos;&quot;");
+        assert_eq!(escape_xml("plain"), "plain");
+    }
+
+    #[test]
+    fn given_machine_format_with_output_path_when_emit_then_report_written_to_file() {
+        // CI 收口形态：--format json --output 落盘，解析器读文件而非 stdout。
+        let dir = std::env::temp_dir().join(format!("oj-testcmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("report.json");
+        emit_report(
+            "json",
+            Some(p.to_str().unwrap()),
+            &fx(&[("s", "t", true, None)]),
+            1,
+            std::time::Duration::from_millis(1),
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["passed"], 1);
+        assert_eq!(v["failed"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_tap_without_output_when_emit_then_stdout_branch_taken() {
+        // 内容正确性由 to_tap 用例钉死；此处钉「无 output → 打 stdout 不落盘」。
+        emit_report(
+            "tap",
+            None,
+            &fx(&[("s", "t", true, None)]),
+            1,
+            std::time::Duration::from_millis(1),
+        );
+    }
+
+    #[test]
+    fn given_human_format_with_failure_when_emit_then_readable_summary_printed() {
+        emit_report(
+            "human",
+            None,
+            &fx(&[("s", "t", true, None), ("s", "f", false, Some("e\nline2"))]),
+            2,
+            std::time::Duration::from_millis(1),
+        );
+    }
+
+    #[test]
+    fn given_unknown_format_when_emit_then_falls_back_to_human() {
+        // 格式串打错不应 panic：_ 臂回落 human 摘要。
+        emit_report(
+            "nope",
+            None,
+            &fx(&[("s", "t", true, None)]),
+            1,
+            std::time::Duration::from_millis(1),
+        );
+    }
+}

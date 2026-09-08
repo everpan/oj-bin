@@ -679,3 +679,31 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     assert!(log.contains("task: demo → stopped"), "{log}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// 覆盖率 spec 波1：`oj test` 进程内全链路——真实 V8 + `client` oneshot 派发
+/// （零 TCP）+ describe/it 框架 + json 报告落盘 + 退出码约定。
+/// sample L1 套件（7 文件 ~40 用例，auth/tenant 全开）全绿为门槛。
+#[tokio::test(flavor = "current_thread")]
+async fn given_sample_l1_suite_when_oj_test_then_all_pass_and_report_written() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-testrun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let report = tmp.join("report.json");
+    let code = oj::test_cmd::run(oj::args::TestArgs {
+        config: sample().join("config.yaml").display().to_string(),
+        base: None,
+        dir: Some(sample().join("src").display().to_string()),
+        tests: None,
+        format: Some("json".into()),
+        output: Some(report.display().to_string()),
+    })
+    .expect("oj test run");
+    assert_eq!(code, 0, "L1 套件必须全绿");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(v["failed"], 0, "{v}");
+    assert!(v["total"].as_u64().unwrap() >= 30, "套件规模骤降? {v}");
+    assert_eq!(v["passed"], v["total"]);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
