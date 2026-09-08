@@ -178,4 +178,47 @@ mod tests {
         let past = sign(&g, "1", &[], -60);
         assert!(g.verify("/me", &format!("Bearer {past}")).is_err());
     }
+
+    extern "C" fn nl(_level: u8, _msg: RString) {}
+    extern "C" fn nd(_topic: RString, _payload: RString) {}
+    fn host() -> RArc<HostContext> {
+        RArc::new(HostContext {
+            log: nl,
+            deliver: nd,
+        })
+    }
+
+    #[test]
+    fn init_rejects_bad_cfg_and_bad_alg_then_describes() {
+        // init 门禁语义：坏 cfg JSON → 点名 oj-auth cfg；不支持的方法 → not supported。
+        let Err(m) = std::result::Result::from(init(host(), RString::from("{bad json"))) else {
+            panic!("bad cfg must fail")
+        };
+        assert!((&m[..]).contains("oj-auth cfg"), "{}", &m[..]);
+        let Err(m) = std::result::Result::from(init(
+            host(),
+            RString::from(r#"{"signing_method":"RS256"}"#),
+        )) else {
+            panic!("unsupported alg must fail")
+        };
+        assert!((&m[..]).contains("not supported"), "{}", &m[..]);
+        // 合法 init（缺省 HS256）→ 自描述 descriptor。
+        let d = std::result::Result::from(init(host(), RString::from(r#"{"jwt_secret":"k"}"#)))
+            .unwrap();
+        assert_eq!(&d.name[..], "auth");
+    }
+
+    #[test]
+    fn hs384_and_hs512_signing_methods_accepted() {
+        for alg in ["HS384", "HS512"] {
+            assert!(
+                Guard::new(&GuardCfg {
+                    jwt_secret: "k".into(),
+                    signing_method: alg.into(),
+                    anonymous_paths: vec![],
+                })
+                .is_ok()
+            );
+        }
+    }
 }
