@@ -66,6 +66,10 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/auth/login"              # auth 端点已是业务路由，须显式匿名
     - "/auth/refresh"
     - "/auth/logout"
+    # news 发布 + WS 订阅匿名（task_wsclient 案例）：WHATWG WebSocket 无法携带
+    # Authorization 头，受保护路由只能匿名或走应用层 token 透传。
+    - "/news"
+    - "/news/*"
     - "/oidc/*"
     - "/idp/*"
     - "/idp/.well-known/*"

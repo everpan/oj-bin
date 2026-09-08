@@ -471,6 +471,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `log.debug / info / warn / error` | 结构化日志 |
 | `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
+| `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
@@ -685,6 +686,39 @@ if (r.ok) {
 | `ws.close` | `close(): void` | 结束当前连接 |
 
 仅在 `ws.ts` 帧循环内有意义（第 4 章）。
+
+### WebSocket —— 出站客户端（WHATWG，v0.1.7）
+
+标准 WHATWG `WebSocket`（deno 官方实现）：`new WebSocket(url)`、
+`onopen/onmessage/onclose/onerror`、`send/close`。**任务文件与 HTTP handler 均可用**，
+无 MQ 式 task 门禁（连接无 offset/ack 消费会话语义）。
+
+长任务里作消费端取数（`src/tasks/task_*.ts`，写法同「命名 MQ 客户端与长任务」，
+可运行案例 `sample/src/tasks/task_wsclient.ts`）：
+
+```ts
+const ws = new WebSocket("ws://localhost:9778/v1/api/news/ws");
+await new Promise((ok, err) => { ws.onopen = ok; ws.onerror = err; });
+ws.send("{}");                                  // 首帧：服务端 ws.ts 执行 bus.subscribe("news")
+ws.onmessage = (e) => log.info("frame " + e.data);
+```
+
+**重连 = 崩溃监督，不手写 reconnect**：`onerror`/`onclose` 后让任务抛错（或像案例那样
+在下一轮 `if (closed) throw`）→ `Crashed` → 监督器指数退避重启（1s→2s→…cap 60s）→
+新实例重连。停机时在 `stop_grace_secs` 内 `ws.close()` 自然收场（`Stopped`）。
+
+三条硬约束（全部来自真实踩坑）：
+
+1. **WHATWG WebSocket 无法携带自定义头**（含 `Authorization`）——受 Bearer 守卫保护的
+   WS 路由只能列入 `anonymous_paths`，或改用应用层 token 透传（首帧握手）。
+2. **URL 主机名要匹配服务端绑定语义**：服务端缺省监听 `[::1]`（IPv6 回环），写
+   `127.0.0.1` 会 connection refused——用 `localhost`。
+3. **等帧必须与停机信号竞速**：挂在 `await` 上没人 wake，会拖到看门狗强杀记 `killed`；
+   用 `Promise.race([wake, tasks.sleep(250)])`，轮询间隔 ≪ `stop_grace_secs`
+   （与 MQ poll 的 `timeoutMs` 纪律同源）。
+
+限制：v0.1.7 出站仅明文 `ws://`（wss 需宿主注入根证书，v0.1.8 与 deno_fetch 替换
+一并处理）。`oj test` 运行时同样挂载该全局。
 
 ### plugins —— 插件自省
 
