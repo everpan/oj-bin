@@ -1601,4 +1601,159 @@ pub(crate) mod tests {
             res
         );
     }
+
+    // ---------- 补覆盖：serve()（bind 版） / blob 302 重定向 / mime_of ----------
+
+    /// Given: 自由端口 + 合法路由；When: serve() 自行 bind 后收 GET；Then: 200 信封回包；
+    /// 且端口被占时 serve() 以 bind 错误快速失败（Err 腿，覆盖 `bind().await?` 传播）。
+    #[tokio::test]
+    async fn given_free_addr_when_serve_binds_then_requests_answered() {
+        let t = routes(&[(
+            "u/s/api.ts",
+            "export default { get() { json.ok({ ok: 1 }); } };",
+        )]);
+        let dir = t.0.clone();
+        let table = build_table(&dir, true, "/v1/api");
+        let actor = make_actor(dir.clone(), true);
+        // 用临时 listener 探一个自由端口，drop 后交给 serve() 自行 bind。
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let server = tokio::spawn(serve(
+            addr,
+            "/v1/api",
+            dir.clone(),
+            true,
+            table,
+            actor,
+            None,
+            None,
+            Pipeline::default(),
+        ));
+        // 轮询等 bind 完成（spawn 与本测试同一 current_thread 运行时，await 期间被驱动）。
+        let mut bound = false;
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                bound = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(bound, "serve() did not bind {addr}");
+        let r = raw_http(
+            addr,
+            "GET /v1/api/u/s/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("\"ok\":1"),
+            "{r}"
+        );
+        server.abort();
+
+        // Err 腿：端口已被占 → serve() 返回 Err（bind 冲突 fail-fast）。
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = held.local_addr().unwrap();
+        let err = serve(
+            taken,
+            "/v1/api",
+            t.0.clone(),
+            true,
+            RouteTable::default(),
+            make_actor(t.0.clone(), true),
+            None,
+            None,
+            Pipeline::default(),
+        )
+        .await;
+        assert!(err.is_err(), "expected bind-conflict error");
+    }
+
+    /// Given: serve 恒 302 的 blob 后端（模拟 s3 presign 直链）；When: GET {base}/blob/k；
+    /// Then: SEE_OTHER(303) + Location 直链（重定向分支，local 后端永远走不到）。
+    struct RedirectBlob;
+    #[async_trait::async_trait]
+    impl BlobBackend for RedirectBlob {
+        async fn put(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<&str>,
+        ) -> only_js::bridge::BridgeResult<()> {
+            Err("not used".into())
+        }
+        async fn get(&self, _: &str) -> only_js::bridge::BridgeResult<Vec<u8>> {
+            Err("not used".into())
+        }
+        async fn del(&self, _: &str) -> only_js::bridge::BridgeResult<()> {
+            Err("not used".into())
+        }
+        async fn url(&self, _: &str) -> only_js::bridge::BridgeResult<String> {
+            Ok(String::new())
+        }
+        async fn content_type(&self, _: &str) -> only_js::bridge::BridgeResult<Option<String>> {
+            Ok(None)
+        }
+        async fn serve(&self, _: &str) -> only_js::bridge::BridgeResult<BlobServed> {
+            Ok(BlobServed::Redirect(
+                "https://s3.example.com/presigned".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn given_redirecting_blob_when_get_blob_route_then_see_other_with_location() {
+        let t = routes(&[("u/api.ts", "export default { get() { json.ok({}); } };")]);
+        let addr = spawn_blob("/v1/api", t.0.clone(), Arc::new(RedirectBlob)).await;
+        let r = raw_http(
+            addr,
+            "GET /v1/api/blob/a.png HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 303"), "{r}");
+        // hyper 落盘的 header 名恒小写。
+        assert!(
+            r.to_ascii_lowercase()
+                .contains("location: https://s3.example.com/presigned"),
+            "{r}"
+        );
+    }
+
+    /// mime_of：常见扩展名映射 + 大小写归一 + 无扩展名/未知回落 octet-stream。
+    #[test]
+    fn given_common_extensions_when_mime_of_then_expected_content_types() {
+        let m = |n: &str| mime_of(Path::new(n));
+        assert_eq!(m("a.html"), "text/html; charset=utf-8");
+        assert_eq!(m("a.htm"), "text/html; charset=utf-8");
+        assert_eq!(m("a.css"), "text/css");
+        assert_eq!(m("a.js"), "text/javascript");
+        assert_eq!(m("a.MJS"), "text/javascript"); // 大小写归一
+        assert_eq!(m("a.json"), "application/json");
+        assert_eq!(m("a.map"), "application/json");
+        assert_eq!(m("a.txt"), "text/plain; charset=utf-8");
+        assert_eq!(m("a.md"), "text/plain; charset=utf-8");
+        assert_eq!(m("a.svg"), "image/svg+xml");
+        assert_eq!(m("a.PNG"), "image/png");
+        assert_eq!(m("a.jpeg"), "image/jpeg");
+        assert_eq!(m("a.gif"), "image/gif");
+        assert_eq!(m("a.webp"), "image/webp");
+        assert_eq!(m("a.avif"), "image/avif");
+        assert_eq!(m("a.ico"), "image/x-icon");
+        assert_eq!(m("a.wasm"), "application/wasm");
+        assert_eq!(m("a.woff"), "font/woff");
+        assert_eq!(m("a.woff2"), "font/woff2");
+        assert_eq!(m("a.ttf"), "font/ttf");
+        assert_eq!(m("a.xml"), "application/xml");
+        assert_eq!(m("a.yaml"), "application/yaml");
+        assert_eq!(m("a.yml"), "application/yaml");
+        assert_eq!(m("a.pdf"), "application/pdf");
+        assert_eq!(m("noext"), "application/octet-stream");
+        assert_eq!(m("a.xyz"), "application/octet-stream");
+    }
+
+    /// Send 静态断言：编译期已验证，此处调用覆盖函数本体（零运行时成本）。
+    #[test]
+    fn given_send_assertion_when_called_then_holds() {
+        _assert_send();
+    }
 }

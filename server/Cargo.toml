@@ -30,5 +30,7 @@ notify = "8"
 libc = "0.2"
 
 [dev-dependencies]
+# 测试 mock BlobBackend（#[async_trait] trait）所需；仅测试编译。
+async-trait = "0.1"
 serde_json = "1"
 tempfile = "3"
