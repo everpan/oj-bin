@@ -283,6 +283,10 @@ pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
         ext.ops = std::borrow::Cow::Borrowed(&[]);
         ext
     }
+    // deno_tls 启 rustls/aws_lc_rs，reqwest 系又启 ring——双 provider 并存时
+    // rustls 拒绝自动判定（ClientConfig::builder() 直接 panic）。显式钉死
+    // aws_lc_rs（deno_tls 保证该 feature 恒在；reqwest 走显式 provider 不受影响）。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     vec![
         deno_webidl::deno_webidl::init(),
         deno_web::deno_web::init(

@@ -4107,6 +4107,7 @@ dependencies = [
  "rand 0.10.2",
  "reqwest 0.13.1",
  "rsa",
+ "rustls",
  "sea-query",
  "serde",
  "serde_json",

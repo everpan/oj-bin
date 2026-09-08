@@ -25,6 +25,8 @@ deno_fetch = "0.282"
 deno_net = "0.250"
 deno_websocket = "0.263"
 deno_permissions = "0.117"
+# 显式安装 rustls CryptoProvider（ws_client_extensions）：deno_tls 锁同一版本
+rustls = "=0.23.40"
 # libc feature 门控 RealSys 的 EnvHomeDir（RuntimePermissionDescriptorParser 需要）
 sys_traits = { version = "0.1.28", features = ["libc", "real"] }
 getrandom = "0.2"
