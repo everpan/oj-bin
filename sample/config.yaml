@@ -55,6 +55,8 @@ tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（�
     - "/oidc/*"
     - "/idp/*"
     - "/idp/.well-known/*"
+    # WS 路由（<dir>/ws.ts）是 merge 进 Router 的真实路由，本就不经过这套
+    # 前置管线（连接天然匿名）——无需也不会出现在 anonymous_paths 里。
 
 auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/auth/，jwt 原语注入）
   jwt_secret: "change-me"        # 生产必改；空串启动 fail-fast
@@ -66,9 +68,8 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/auth/login"              # auth 端点已是业务路由，须显式匿名
     - "/auth/refresh"
     - "/auth/logout"
-    # 仅 WS 订阅路径匿名（task_wsclient 案例）：WHATWG WebSocket 无法携带
-    # Authorization 头；发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
-    - "/news/ws"
+    # WS 订阅路由（/news/ws）不在守卫面内（真实路由，不过前置管线）；
+    # 发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
     - "/oidc/*"
     - "/idp/*"
     - "/idp/.well-known/*"

@@ -194,13 +194,13 @@ mod tests {
         let Err(m) = std::result::Result::from(init(host(), RString::from("{bad json"))) else {
             panic!("bad cfg must fail")
         };
-        assert!((&m[..]).contains("oj-auth cfg"), "{}", &m[..]);
+        assert!(m[..].contains("oj-auth cfg"), "{}", &m[..]);
         let Err(m) =
             std::result::Result::from(init(host(), RString::from(r#"{"signing_method":"RS256"}"#)))
         else {
             panic!("unsupported alg must fail")
         };
-        assert!((&m[..]).contains("not supported"), "{}", &m[..]);
+        assert!(m[..].contains("not supported"), "{}", &m[..]);
         // 合法 init（缺省 HS256）→ 自描述 descriptor。
         let d = std::result::Result::from(init(host(), RString::from(r#"{"jwt_secret":"k"}"#)))
             .unwrap();

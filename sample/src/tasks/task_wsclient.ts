@@ -10,9 +10,9 @@ export {};
 //   curl -X POST http://localhost:9778/v1/api/news -H "Authorization: Bearer $TOKEN" \
 //     -H 'X-TENANT-ID: default' -d '{"text":"hi"}'
 //   → 任务日志：ws frame {"topic":"news","data":{"text":"hi"}}；Ctrl-C → stopped
-//   （WS 订阅路径 /news/ws 单独匿名——WHATWG WS 带不了 Authorization 头；发布仍需登录）
+//   （WS 订阅路由是真实路由、不经 Bearer/租户前置管线，连接天然匿名；发布仍需登录）
 //
-// 注意：wss:// 需宿主注入根证书（v0.1.7 未配，握手会失败）——见 api-manual「WebSocket」节。
+// wss:// 自 v0.1.8 起可用（webpki-roots 根集编译进二进制）。
 const url = "ws://localhost:9778/v1/api/news/ws";
 
 const frames: string[] = [];
