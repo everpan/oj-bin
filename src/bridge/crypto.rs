@@ -306,7 +306,7 @@ mod tests {
         }) else {
             panic!("RS256 must be rejected")
         };
-        assert!((&m[..]).contains("not supported"), "{}", &m[..]);
+        assert!(m[..].contains("not supported"), "{}", &m[..]);
 
         let Err(m) = JwtCfg::from_auth_cfg(&crate::config::AuthCfg {
             jwt_secret: "k".into(),
@@ -317,7 +317,7 @@ mod tests {
         }) else {
             panic!("bad duration must be rejected")
         };
-        assert!((&m[..]).contains("access_token_duration"), "{}", &m[..]);
+        assert!(m[..].contains("access_token_duration"), "{}", &m[..]);
 
         let ok = JwtCfg::from_auth_cfg(&crate::config::AuthCfg {
             jwt_secret: "k".into(),
