@@ -154,6 +154,8 @@ pub fn renew(opts: &RenewOpts) -> Result<PathBuf, String> {
             .unwrap_or_default(),
     };
     let path = dir.join("cert.jws");
+    // 与 gen 对齐：指定 out_dir 不存在时创建（gen 侧 create_dir_all 同语义）。
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     std::fs::write(
         &path,
         jws(&SigningKey::<Sha256>::new(key), opts.nbf, opts.exp),
