@@ -2003,6 +2003,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ---- prewarm / inspector / run_named / start_inspector ----
+
+    /// prewarm 借出 runtime 跑完 boot 后归还：返回 Ok，且池内 runtime 后续可正常服务。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_fresh_bridge_when_prewarm_then_ok_and_runtime_returns_to_pool() {
+        let (b, _) = new_bridge();
+        b.prewarm().await.unwrap();
+        // 归还后的 runtime 可继续执行（boot 只发生一次，不因 prewarm 丢失）。
+        let cap = b.run(r#"json.ok({ warm: true });"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["warm"], true);
+    }
+
+    /// inspect=false 构造：inspector() 直接短路返回 None（不 checkout runtime）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_inspect_disabled_when_inspector_then_none() {
+        let (b, _) = new_bridge();
+        assert!(!b.inspect());
+        assert!(b.inspector().await.is_none());
+    }
+
+    /// inspect=true 构造：inspector() 借出 runtime 取句柄后归还，池仍可用。
+    /// 句柄 Rc 须在 bridge 之前释放（JsRuntime drop 断言 inspector 先亡），
+    /// 声明顺序保证反序 drop：insp 先于 b。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_inspect_enabled_when_inspector_then_some_and_pool_reusable() {
+        let b = Bridge::with_opts(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            true,
+        );
+        assert!(b.inspect());
+        let insp = b.inspector().await.unwrap();
+        let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["alive"], true);
+        drop(insp);
+    }
+
+    /// run_named 打点 handler 缺失：NotFound（io::ErrorKind）点名报错。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_unknown_handler_when_run_named_then_not_found_names_it() {
+        let (b, _) = new_bridge();
+        let e = b.run_named("nope").await.unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("handler 'nope' not found"), "{msg}");
+    }
+
+    /// run_named 命中 HandlerStore：按名取源码并执行（热重载路径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_registered_handler_when_run_named_then_executes() {
+        let (mut b, _) = new_bridge();
+        b.set_handlers(HandlerStore::from_embedded(
+            [("greet".into(), r#"json.ok({ hi: 1 });"#.into())]
+                .into_iter()
+                .collect(),
+        ));
+        let cap = b.run_named("greet").await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["hi"], 1);
+    }
+
+    /// inspect=false 时 start_inspector 走 warn/noop 分支：句柄立即落定，不起服务。
+    /// spawn_local 要求 LocalSet 上下文（inspector.rs 同款）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_inspect_disabled_when_start_inspector_then_noop_returns() {
+        let (b, _) = new_bridge();
+        let ls = tokio::task::LocalSet::new();
+        ls.run_until(async {
+            let h = start_inspector(&b, "127.0.0.1:0".parse().unwrap()).await;
+            h.await.unwrap();
+        })
+        .await;
+    }
+
+    /// inspect=true 时 start_inspector 走 spawn 分支：把 inspector 交给 WS 服务。
+    /// 用特权端口（bind 必败）验证分支路由即可，起服务本体由 inspector.rs 用例覆盖。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_inspect_enabled_when_start_inspector_then_spawn_branch_taken() {
+        let b = Bridge::with_opts(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            true,
+        );
+        let ls = tokio::task::LocalSet::new();
+        ls.run_until(async {
+            // 端口 1 无绑定权限 → spawn 内 bind 失败即返回，句柄落定。
+            let h = start_inspector(&b, "0.0.0.0:1".parse().unwrap()).await;
+            h.await.unwrap();
+        })
+        .await;
+    }
+
     /// 无 boot（现网默认）：`Extras::default()` 行为零变化。
     #[tokio::test(flavor = "current_thread")]
     async fn no_boot_is_noop() {
