@@ -293,4 +293,72 @@ mod tests {
         );
         assert_eq!(v["data"]["hexLen"], 64);
     }
+
+    #[test]
+    fn from_auth_cfg_gates_alg_and_duration_failures() {
+        // 装配期门禁：不支持的方法 / 非法 duration 各自点名（fail-fast 在装配，不进运行时）。
+        let Err(m) = JwtCfg::from_auth_cfg(&crate::config::AuthCfg {
+            jwt_secret: "k".into(),
+            signing_method: "RS256".into(),
+            access_token_duration: "60s".into(),
+            refresh_token_duration: "720h".into(),
+            anonymous_paths: vec![],
+        }) else {
+            panic!("RS256 must be rejected")
+        };
+        assert!((&m[..]).contains("not supported"), "{}", &m[..]);
+
+        let Err(m) = JwtCfg::from_auth_cfg(&crate::config::AuthCfg {
+            jwt_secret: "k".into(),
+            signing_method: "HS256".into(),
+            access_token_duration: "soon".into(),
+            refresh_token_duration: "720h".into(),
+            anonymous_paths: vec![],
+        }) else {
+            panic!("bad duration must be rejected")
+        };
+        assert!((&m[..]).contains("access_token_duration"), "{}", &m[..]);
+
+        let ok = JwtCfg::from_auth_cfg(&crate::config::AuthCfg {
+            jwt_secret: "k".into(),
+            signing_method: "HS512".into(),
+            access_token_duration: "60s".into(),
+            refresh_token_duration: "720h".into(),
+            anonymous_paths: vec![],
+        })
+        .unwrap();
+        assert_eq!(ok.alg, "HS512");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jwt_sign_rejects_non_string_sub_and_hs512_roundtrips() {
+        // payload.sub 非字符串 → 点名报错；HS512 算法臂全链路（sign→verify）。
+        let mut cfg = (*jwt_cfg()).clone();
+        cfg.alg = "HS512".into();
+        let b = bridge(Some(Arc::new(cfg)));
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    let noSub = null;
+                    try { await jwt.sign({ roles: [] }); } catch (e) { noSub = String(e); }
+                    const t = await jwt.sign({ sub: "9", roles: ["r1", 2, "r2"] });
+                    const c = await jwt.verify(t);
+                    json.ok({ noSub, sub: c.sub, roles: c.roles });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["data"]["noSub"]
+                .as_str()
+                .unwrap()
+                .contains("must be a string"),
+            "{v}"
+        );
+        assert_eq!(v["data"]["sub"], "9", "{v}");
+        // 非 string roles 元素被过滤（对齐守卫插件解码契约）。
+        assert_eq!(v["data"]["roles"], serde_json::json!(["r1", "r2"]), "{v}");
+    }
 }
