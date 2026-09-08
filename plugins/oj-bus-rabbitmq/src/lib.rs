@@ -718,19 +718,29 @@ mod tests {
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
             .as_u64()
             .unwrap();
-        // 声明队列（mq 面消费既有具名队列；默认交换 direct 投递）
+        // 声明队列（mq 面消费既有具名队列；默认交换 direct 投递）。
+        // 队列须先存在：basic_get/publish 到不存在队列会 404/静默丢弃——mq 面
+        // 无 queue_declare 方法，测试自备：直接用 lapin 声明（不依赖外部 init）。
+        let queue = format!("oj-mq-{}", std::process::id());
+        let setup = lapin::Connection::connect(&url, lapin::ConnectionProperties::default())
+            .await
+            .expect("test rabbit conn");
+        setup
+            .create_channel()
+            .await
+            .expect("test rabbit channel")
+            .queue_declare(
+                queue.as_str(),
+                lapin::options::QueueDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .expect("declare queue");
         let send_payload = serde_json::json!({
-            "exchange": "", "routingKey": format!("oj-mq-{}", std::process::id()),
+            "exchange": "", "routingKey": queue,
             "value": {"n": 1},
         })
         .to_string();
-        // 队列须先存在：basic_get 到不存在队列会报错——先用 bus 通路无队列声明能力，
-        // 故 roundtrip 用默认交换 + 预声明：借 mq_call 不支持 queue_declare，
-        // 改为 rabbitmqctl 场景外直接 basic_get 空队列会 Err——本测试接受该顺序：
-        // 先 poll（空,Err 视为可接受）→ 由外部保证队列存在。
-        // 简化：发前先 poll 一次创建？basic_get 不创建队列。跳过声明，直接对
-        // "amq.default" 语义做最小验证：send 到默认交换（路由键=队列名）前，
-        // 队列由测试环境预先声明（CI rabbitmq-init 负责）。
         drive(&mut mq_call(
             handle,
             RString::from("send"),
@@ -738,7 +748,6 @@ mod tests {
         ))
         .await
         .expect("mq send");
-        let queue = format!("oj-mq-{}", std::process::id());
         let polled = drive(&mut mq_call(
             handle,
             RString::from("poll"),
