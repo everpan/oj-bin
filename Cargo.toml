@@ -25,6 +25,9 @@ deno_fetch = "0.282"
 deno_net = "0.250"
 deno_websocket = "0.263"
 deno_permissions = "0.117"
+# 根证书（v0.1.8）：create_default_root_cert_store（webpki-roots）注入 deno_fetch
+# Options.root_cert_store_provider，https fetch 与 wss 握手共用。
+deno_tls = "0.245"
 # 显式安装 rustls CryptoProvider（ws_client_extensions）：deno_tls 锁同一版本
 rustls = "=0.23.40"
 # libc feature 门控 RealSys 的 EnvHomeDir（RuntimePermissionDescriptorParser 需要）
@@ -34,7 +37,6 @@ jsonwebtoken = "9"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 # cert.renew 在本 crate 内解析 PKCS#8 PEM（from_pkcs8_pem 需 pem feature）；
 # 版本/feature 与 tools/oj-cert 对齐（workspace 统一解析为同一份 rsa）。
 rsa = { version = "0.9", features = ["pem"] }

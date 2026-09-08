@@ -619,10 +619,6 @@ impl App {
         let stable = Arc::new(StableState {
             kv: kv.clone(),
             dbs: dbs.clone(),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .unwrap_or_default(),
             registry: Arc::new(registry),
             loader: Some(loader.clone()),
             blobs: blobs

@@ -7,6 +7,7 @@
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
 // Not ported yet: Redis(name) (named multi-KV-backend), XORM(name).
 
+import { core, internals } from "ext:core/mod.js";
 import {
   op_blob_del,
   op_blob_get,
@@ -32,7 +33,6 @@ import {
   op_mq_has,
   op_tasks_stopping,
   op_tasks_sleep,
-  op_fetch,
   op_finish,
   op_http_info,
   op_http_file,
@@ -65,6 +65,44 @@ import {
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
 // bridge::ws_client_extensions; see api-manual "WebSocket" section.
 import { WebSocket as ojWsClient } from "ext:deno_websocket/01_websocket.js";
+
+// WHATWG fetch (deno_fetch ext, v0.1.8): real Response/Headers, streaming body,
+// AbortSignal. https/wss roots (webpki-roots) injected in ws_client_extensions.
+// 26_fetch.js / 03_abort_signal.js are classic-script chunks (lazy_loaded_js),
+// pulled via core.loadExtScript -- they are NOT ext: ESM modules.
+// 26_fetch.js unconditionally pulls ext:deno_telemetry (hosted by the deno CLI,
+// not shipped with deno_fetch); every touchpoint is gated on TRACING_ENABLED,
+// so a no-op stub short-circuits it without registering that extension.
+if (!internals.__telemetry) {
+  internals.__telemetry = {
+    TRACING_ENABLED: false,
+    builtinTracer: () => null,
+    ContextManager: { active: () => null },
+    enterSpan: () => null,
+    restoreSnapshot: () => {},
+    PROPAGATORS: [],
+  };
+}
+if (!internals.__telemetryUtil) {
+  internals.__telemetryUtil = {
+    updateSpanFromClientResponse: () => {},
+    updateSpanFromError: () => {},
+    updateSpanFromRequest: () => {},
+  };
+}
+// WHATWG URL/URLSearchParams (deno_web 00_url.js): fetch JS parses URLs via
+// `new URL(...)` -- the global would otherwise be undefined in this runtime.
+const { URL: ojURL, URLSearchParams: ojURLSearchParams } = core.loadExtScript(
+  "ext:deno_web/00_url.js",
+);
+globalThis.URL = ojURL;
+globalThis.URLSearchParams = ojURLSearchParams;
+const { fetch: ojFetch } = core.loadExtScript("ext:deno_fetch/26_fetch.js");
+globalThis.fetch = ojFetch;
+const { AbortController: ojAbortController } = core.loadExtScript(
+  "ext:deno_web/03_abort_signal.js",
+);
+globalThis.AbortController = ojAbortController;
 
 // ----- json: unified envelope + response headers -----
 globalThis.json = {
@@ -267,44 +305,6 @@ function queryBuilder(name, table) {
   };
   return api;
 }
-
-// ----- fetch: browser Fetch API compatible -----
-function buildResponse(raw) {
-  const bytes = new Uint8Array(raw.body);
-  let consumed = false;
-  return {
-    ok: raw.ok,
-    status: raw.status,
-    statusText: raw.statusText,
-    headers: raw.headers,
-    json: async () => (raw.bodyText ? JSON.parse(raw.bodyText) : null),
-    text: async () => raw.bodyText,
-    arrayBuffer: async () => bytes,
-    clone: () => buildResponse(raw),
-    body: {
-      getReader: () => ({
-        read: async () =>
-          consumed
-            ? { done: true, value: undefined }
-            : ((consumed = true), { done: false, value: bytes }),
-      }),
-    },
-  };
-}
-
-globalThis.fetch = async function (url, options = {}) {
-  if (!url) throw new Error("fetch: url is required");
-  const method = String(options.method || "GET").toUpperCase();
-  const headers = {};
-  if (options.headers) {
-    for (const k of Object.keys(options.headers)) {
-      headers[k] = String(options.headers[k]);
-    }
-  }
-  const body = options.body == null ? null : String(options.body);
-  const raw = await op_fetch(String(url), method, headers, body);
-  return buildResponse(raw);
-};
 
 // ----- finish: mark session done -----
 globalThis.finish = () => op_finish();

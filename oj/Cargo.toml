@@ -1,6 +1,6 @@
 [package]
 name = "oj"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 
 [dependencies]
@@ -22,7 +22,6 @@ tower = "0.5"
 deno_core = "0.411"
 deno_error = "0.7"
 async-trait = "0.1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 tracing = "0.1"
 # CLI 直跑 migrate/fixture 时的语句级 stderr 日志（server 走 server::logging 装配）。
 tracing-subscriber = "0.3"

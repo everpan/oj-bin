@@ -3,7 +3,7 @@
 //!   - json.rs     —— json.ok/fail/header 统一信封与返回头
 //!   - db.rs       —— db.query/exec 与 DB(name) 命名实例（异步 op，支持绑定参数）
 //!   - query.rs    —— 安全查询构造器（sea-query + SchemaRegistry 白名单，参数化值）
-//!   - fetch.rs    —— fetch(url, options?) HTTP 客户端（reqwest，异步 Promise）
+//!   - fetch       —— fetch 全局 = deno_fetch 扩展（WHATWG，见 ws_client_extensions）
 //!   - http.rs     —— http.* 请求上下文（只读，懒加载）
 //!   - kv.rs       —— redis 内存 KV 抽象（get/set，无 Redis 时联调用）
 //!   - log.rs      —— log.debug/info/warn/error 结构化日志（tracing）
@@ -33,7 +33,6 @@ mod db;
 pub mod db_backend;
 mod envelope;
 mod es;
-mod fetch;
 pub(crate) mod ffi;
 pub mod guard;
 mod http;
@@ -102,7 +101,6 @@ pub struct ModuleCtx {
 pub struct StableState {
     pub kv: Arc<dyn KVStore>,
     pub dbs: HashMap<String, Arc<dyn DataAccessor>>,
-    pub client: reqwest::Client,
     pub registry: Arc<SchemaRegistry>,
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
@@ -233,7 +231,6 @@ deno_core::extension!(
         es::op_es_index,
         es::op_es_del,
         plugins_op::op_plugins,
-        fetch::op_fetch,
         log::op_log,
         module_loader::op_resolve_cjs,
         oidc::op_oidc_sign,
@@ -272,21 +269,19 @@ deno_core::extension!(
     },
 );
 
-/// WS 客户端扩展面（v0.1.7，spec 2026-09-08）：deno_websocket 提供 WHATWG
-/// `WebSocket` 全局；其 JS 经 core.loadExtScript 依赖 deno_web / deno_webidl /
-/// deno_fetch / deno_net 的扩展 JS，故五个扩展一并注册、顺序即依赖序。
-/// v0.1.8 计划全量替换自研 fetch，届时 esm_only 剥离一并移除。
+/// 出站网络扩展面（v0.1.8，spec 2026-09-08）：deno_fetch 提供 WHATWG `fetch`
+/// 全局（bootstrap.js 从 ext:deno_fetch/26_fetch.js 导出挂载），deno_websocket
+/// 提供 WHATWG `WebSocket`；两者 JS 经 core.loadExtScript 依赖 deno_web /
+/// deno_webidl / deno_net 的扩展 JS，故五个扩展一并注册、顺序即依赖序。
+/// https fetch 与 wss 握手共用 FetchOptions 的根证书（op_ws_create 从 OpState
+/// 读取）——webpki-roots（Mozilla 根集）编译进二进制，零系统依赖。
 pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
-    /// deno_fetch 的 JS 是 deno_websocket 的运行时依赖，但其 `op_fetch` 与本仓
-    /// 自研 fetch op 同名——注册面保留 JS、剥掉 ops。
-    fn esm_only(mut ext: deno_core::Extension) -> deno_core::Extension {
-        ext.ops = std::borrow::Cow::Borrowed(&[]);
-        ext
-    }
     // deno_tls 启 rustls/aws_lc_rs，reqwest 系又启 ring——双 provider 并存时
     // rustls 拒绝自动判定（ClientConfig::builder() 直接 panic）。显式钉死
     // aws_lc_rs（deno_tls 保证该 feature 恒在；reqwest 走显式 provider 不受影响）。
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let roots: Arc<dyn deno_tls::RootCertStoreProvider> =
+        Arc::new(StaticRoots(deno_tls::create_default_root_cert_store()));
     vec![
         deno_webidl::deno_webidl::init(),
         deno_web::deno_web::init(
@@ -295,10 +290,22 @@ pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
             false, // enable_css_parser_features
             deno_web::InMemoryBroadcastChannel::default(),
         ),
-        esm_only(deno_fetch::deno_fetch::init(deno_fetch::Options::default())),
-        deno_net::deno_net::init(None, None), // v0.1.8: 第一参传 RootCertStoreProvider 启用 wss
+        deno_fetch::deno_fetch::init(deno_fetch::Options {
+            root_cert_store_provider: Some(roots),
+            ..Default::default()
+        }),
+        deno_net::deno_net::init(None, None),
         deno_websocket::deno_websocket::init(),
     ]
+}
+
+/// webpki-roots 根集的静态 provider（trait 只要求返回同一份引用）。
+struct StaticRoots(deno_tls::rustls::RootCertStore);
+
+impl deno_tls::RootCertStoreProvider for StaticRoots {
+    fn get_or_try_init(&self) -> Result<&deno_tls::rustls::RootCertStore, deno_error::JsErrorBox> {
+        Ok(&self.0)
+    }
 }
 
 /// 任务驱动出口（spec §6）：Stopped = flag 置位后自然收场；Crashed = 顶层抛错/加载失败
@@ -471,10 +478,6 @@ impl Bridge {
         let stable = Arc::new(StableState {
             kv,
             dbs,
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("build reqwest client"),
             registry: Arc::new(registry),
             loader,
             blobs: extras
@@ -1411,7 +1414,6 @@ mod tests {
         let stable = Arc::new(StableState {
             kv: Arc::new(InMemoryKV::new()),
             dbs: HashMap::new(),
-            client: Default::default(),
             registry: Arc::new(SchemaRegistry::new()),
             loader: Some(Arc::new(LoaderShared {
                 project_root: root.clone(),
@@ -2038,6 +2040,159 @@ mod tests {
             "expected deno_core to reject the ext: import, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- fetch（v0.1.8：deno_fetch / WHATWG 语义）----
+
+    fn fetch_bridge() -> Bridge {
+        Bridge::new(Arc::new(InMemoryAccessor::new()), Arc::new(InMemoryKV::new()))
+    }
+
+    /// 本地一次性 HTTP 服务器 + fetch 全链路：json()、ok/status、Headers
+    /// 大小写不敏感取值、AbortController 全局挂载。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_json_roundtrip_headers_and_abortcontroller() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await.unwrap();
+            let body = r#"{"hello":"world"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let b = fetch_bridge();
+        let src = format!(
+            r#"(async () => {{
+              const r = await fetch("http://{addr}/data", {{ method: "POST", body: "ping" }});
+              json.ok({{
+                status: r.status, ok: r.ok, data: await r.json(),
+                ct: r.headers.get("CONTENT-TYPE"),
+                aborts: typeof AbortController === "function",
+              }});
+            }})().catch((e) => json.fail(500, String(e)));"#
+        );
+        let cap = b.run(&src).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "fetch failed: {v}");
+        assert_eq!(v["data"]["status"], 200);
+        assert_eq!(v["data"]["ok"], true);
+        assert_eq!(v["data"]["data"], json!({"hello": "world"}));
+        assert!(v["data"]["ct"].as_str().unwrap().contains("json"));
+        assert_eq!(v["data"]["aborts"], true);
+    }
+
+    /// 错误面：空 URL → TypeError("Invalid URL…")；拒连 → TypeError（WHATWG
+    /// 把网络错折叠为 fetch rejection，不再有自研版的 "fetch: " 前缀）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_invalid_url_and_connection_refused_reject() {
+        let b = fetch_bridge();
+        let cap = b
+            .run(
+                r#"(async () => { await fetch(""); json.ok({}); })()
+                   .catch((e) => json.fail(400, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("Invalid URL"), "{v}");
+
+        // 端口 1 无监听 → 连接拒绝
+        let cap = b
+            .run(
+                r#"(async () => { await fetch("http://127.0.0.1:1/"); json.ok({}); })()
+                   .catch((e) => json.fail(502, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 502, "{v}");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("TypeError") || msg.contains("sending request"), "{v}");
+    }
+
+    /// 非 2xx 照常返回 Response（ok=false），body 走 text()。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_non_2xx_reports_status_and_text_body() {
+        use httptest::Expectation;
+        use httptest::Server;
+        use httptest::matchers::request;
+        use httptest::responders::*;
+
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::path("/fail"))
+                .respond_with(status_code(503).body("down")),
+        );
+        let b = fetch_bridge();
+        let cap = b
+            .run(&format!(
+                r#"(async () => {{
+                  const r = await fetch("{}", {{ method: "POST", body: "ping" }});
+                  json.ok({{ status: r.status, ok: r.ok, body: await r.text() }});
+                }})().catch((e) => json.fail(500, String(e)));"#,
+                server.url("/fail")
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["status"], 503);
+        assert_eq!(v["data"]["ok"], false);
+        assert_eq!(v["data"]["body"], "down");
+    }
+
+    /// WHATWG 语义：合法 token 的任意 method 原样发出（自研版会回退 GET）。
+    /// 手写 TCP 服务器直接断言请求行，钉死 wire 上的方法。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_arbitrary_token_method_sent_verbatim() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                head.starts_with("NOTAMETHOD /x HTTP/1.1"),
+                "method not sent verbatim: {head}"
+            );
+            let body = r#"{"ok":1}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let b = fetch_bridge();
+        let cap = b
+            .run(&format!(
+                r#"(async () => {{
+                  const r = await fetch("http://{addr}/x", {{ method: "NOTAMETHOD", body: "b" }});
+                  json.ok({{ status: r.status, body: await r.json() }});
+                }})().catch((e) => json.fail(500, String(e)));"#
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["status"], 200);
+        assert_eq!(v["data"]["body"], json!({"ok": 1}));
     }
 
     // ---- prewarm / inspector / run_named / start_inspector ----
