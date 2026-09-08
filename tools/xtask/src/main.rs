@@ -277,3 +277,76 @@ fn main() -> Result<(), String> {
     };
     result.map_err(|e| format!("xtask error: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_first_party_plugins_when_listed_then_covers_all_axes() {
+        // 业务约定：8 个第一方插件 = es/db×2/blob/bus×2/kv/auth 全轴覆盖。
+        assert_eq!(PLUGINS.len(), 8);
+        assert!(PLUGINS.contains(&"auth"));
+        assert!(PLUGINS.contains(&"bus-kafka"));
+    }
+
+    #[test]
+    fn given_host_rustc_when_triple_then_non_empty_and_matches_target_os() {
+        let t = host_triple();
+        assert!(!t.is_empty());
+        if cfg!(target_os = "macos") {
+            assert!(t.contains("apple"), "{t}");
+        } else if cfg!(target_os = "windows") {
+            assert!(t.contains("windows"), "{t}");
+        }
+    }
+
+    #[test]
+    fn given_artifact_and_file_names_when_resolved_then_platform_layout() {
+        // 与 PluginLoader plugin_file_name 同形：存放名以 descriptor.name 命名，
+        // 与 rustc 产物名（oj_<name>，- → _）解耦。
+        if cfg!(target_os = "macos") {
+            assert_eq!(build_artifact_name("kv-redis"), "liboj_kv_redis.dylib");
+            assert_eq!(plugin_file_name("kv-redis"), "libkv-redis.dylib");
+            assert_eq!(oj_exe_name(), "oj");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(build_artifact_name("kv-redis"), "oj_kv_redis.dll");
+            assert_eq!(plugin_file_name("kv-redis"), "kv-redis.dll");
+            assert_eq!(oj_exe_name(), "oj.exe");
+        } else {
+            assert_eq!(build_artifact_name("kv-redis"), "liboj_kv_redis.so");
+            assert_eq!(plugin_file_name("kv-redis"), "libkv-redis.so");
+            assert_eq!(oj_exe_name(), "oj");
+        }
+    }
+
+    #[test]
+    fn given_nested_tree_when_copy_dir_all_then_dirs_and_files_recursively_copied() {
+        let src = std::env::temp_dir().join(format!("oj-xtask-cp-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("oj-xtask-dst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::write(src.join("a/one.txt"), "1").unwrap();
+        std::fs::write(src.join("a/b/two.md"), "2").unwrap();
+        copy_dir_all(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("a/one.txt")).unwrap(), "1");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a/b/two.md")).unwrap(),
+            "2"
+        );
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    #[test]
+    fn given_repo_docs_when_copy_devkit_then_bin_devkit_fresh_with_oidc_and_dts() {
+        // 发行契约：devkit = docs/devkit 三件 + 两份 OIDC 手册 + sample/global.d.ts。
+        copy_devkit().unwrap();
+        let dk = bin_dir().join("devkit");
+        assert!(dk.join("global.d.ts").exists());
+        assert!(dk.join("oidc-integration.md").exists());
+        assert!(dk.join("oidc-implementation.md").exists());
+        assert!(dk.join("api-manual.md").exists());
+    }
+}
