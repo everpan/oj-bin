@@ -522,6 +522,148 @@ mod tests {
         assert_eq!(dialect_str(Dialect::Postgres), "postgres");
     }
 
+    /// 离线 sqlite 全路径 roundtrip（dev 构建统一出 sqlite 驱动，生产 cdylib 仍单方言）：
+    /// connect → DDL → 参数化 insert → query 行 JSON 形状 → 事务 rollback 不可见 /
+    /// commit 可见 → unknown handle/tx、bad SQL、bad params 各自点名 → dialect() 线名。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_sqlite_dsn_when_full_vtable_roundtrip_then_offline_green() {
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let dir = std::env::temp_dir().join(format!("oj-dbmys-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Any 默认 create_if_missing=false → 先 touch（0 字节即合法空库）。
+        std::fs::File::create(dir.join("t.db")).unwrap();
+        let dsn = format!("sqlite://{}/t.db", dir.display());
+
+        let bytes = drive(&mut connect(RString::from(dsn.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        drive(&mut exec(
+            h,
+            RString::from("create table if not exists t (id integer primary key, v text)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("ddl");
+        drive(&mut exec(
+            h,
+            RString::from("insert into t (id, v) values (?, ?)"),
+            RString::from(r#"[1,"hi"]"#),
+        ))
+        .await
+        .expect("insert");
+        let rows = drive(&mut query(
+            h,
+            RString::from("select id, v from t where id = ?"),
+            RString::from("[1]"),
+        ))
+        .await
+        .expect("query");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        assert_eq!(v[0]["id"], 1, "{v}");
+        assert_eq!(v[0]["v"], "hi", "{v}");
+
+        // 事务：rollback 后不可见。
+        let b = drive(&mut begin(h)).await.expect("begin");
+        let tx = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        drive(&mut tx_exec(
+            h,
+            tx,
+            RString::from("insert into t (id, v) values (?, ?)"),
+            RString::from(r#"[2,"tx"]"#),
+        ))
+        .await
+        .expect("tx insert");
+        drive(&mut tx_rollback(h, tx)).await.expect("rollback");
+        let rows = drive(&mut query(
+            h,
+            RString::from("select count(*) as n from t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("count");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rows).unwrap()[0]["n"],
+            1
+        );
+
+        // 事务：tx_query 可见未提交数据 → commit 后全局可见。
+        let b = drive(&mut begin(h)).await.expect("begin2");
+        let tx = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        drive(&mut tx_exec(
+            h,
+            tx,
+            RString::from("insert into t (id, v) values (?, ?)"),
+            RString::from(r#"[3,"tx2"]"#),
+        ))
+        .await
+        .expect("tx insert2");
+        let rows = drive(&mut tx_query(
+            h,
+            tx,
+            RString::from("select v from t where id = ?"),
+            RString::from("[3]"),
+        ))
+        .await
+        .expect("tx query");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rows).unwrap()[0]["v"],
+            "tx2"
+        );
+        drive(&mut tx_commit(h, tx)).await.expect("commit");
+        let rows = drive(&mut query(
+            h,
+            RString::from("select count(*) as n from t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("count2");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rows).unwrap()[0]["n"],
+            2
+        );
+
+        // 错误面各自点名。
+        let e = drive(&mut query(
+            999,
+            RString::from("select 1"),
+            RString::from("[]"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(e.contains("unknown handle"), "{e}");
+        let e = drive(&mut tx_commit(h, 777)).await.unwrap_err();
+        assert!(e.contains("unknown tx"), "{e}");
+        let e = drive(&mut exec(
+            h,
+            RString::from("definitely not sql"),
+            RString::from("[]"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(e.contains("db exec"), "{e}");
+        let e = drive(&mut query(
+            h,
+            RString::from("select 1"),
+            RString::from("not json"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(e.contains("bad params"), "{e}");
+
+        // dialect(): sqlite DSN → 线名 "sqlite"（占位符补全/幂立按键选依赖它）。
+        assert_eq!(&dialect(h)[..], "sqlite");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 无效 DSN 快速失败（不触网）：scheme 未知/畸形 URL 在 sqlx 解析期即报错。
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_dsn_fails_fast() {
