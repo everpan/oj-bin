@@ -287,4 +287,74 @@ mod tests {
         assert!(has_table(&t, "_oj_migrations").await, "baseline 必须记账");
         let _ = std::fs::remove_dir_all(&t);
     }
+
+    /// schema diff：无声明 / 声明与实库一致 → in sync（CI 门禁 Ok 臂）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_diff_in_sync_when_decls_match_or_absent() {
+        let t = project("diff");
+        // 无 schema.yaml：对账空集 → in sync。
+        run_schema_diff(&SchemaDiffArgs {
+            config: t.join("config.yaml").display().to_string(),
+            dir: Some(t.join("src").display().to_string()),
+        })
+        .await
+        .unwrap();
+        // 迁移建表后按迁移形状声明（类型不比对，§5.1）→ in sync。
+        std::fs::write(
+            t.join("src/m/schema.yaml"),
+            "tables:\n  g:\n    columns:\n      x: { type: text }\n",
+        )
+        .unwrap();
+        run_migrate(&MigrateArgs {
+            config: t.join("config.yaml").display().to_string(),
+            dir: Some(t.join("src").display().to_string()),
+            baseline: false,
+            module: None,
+        })
+        .await
+        .unwrap();
+        run_schema_diff(&SchemaDiffArgs {
+            config: t.join("config.yaml").display().to_string(),
+            dir: Some(t.join("src").display().to_string()),
+        })
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// schema diff：声明了实库没有的表 → D001 漂移 → Err（有差异退 1 的门禁语义）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_diff_flags_missing_table_as_drift() {
+        let t = project("drift");
+        run_migrate(&MigrateArgs {
+            config: t.join("config.yaml").display().to_string(),
+            dir: Some(t.join("src").display().to_string()),
+            baseline: false,
+            module: None,
+        })
+        .await
+        .unwrap();
+        // 迁移（含 reconcile）之后再补声明 ghost → 实库缺失 → 漂移。
+        std::fs::write(
+            t.join("src/m/schema.yaml"),
+            "tables:\n  g:\n    columns:\n      x: { type: text }\n  ghost:\n    columns:\n      y: { type: text }\n",
+        )
+        .unwrap();
+        let e = run_schema_diff(&SchemaDiffArgs {
+            config: t.join("config.yaml").display().to_string(),
+            dir: Some(t.join("src").display().to_string()),
+        })
+        .await
+        .unwrap_err();
+        // Err 摘要只带计数；明细行（D001 ghost 实库缺失）走 stdout 报告。
+        assert!(e.contains("漂移"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// fixtures 无 default 库 → warn 跳过（`oj test` 无 db 项目的共用路径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixtures_without_default_db_are_skipped() {
+        let n = load_fixtures(None, &[]).await.unwrap();
+        assert_eq!(n, 0);
+    }
 }

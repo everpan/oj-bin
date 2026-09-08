@@ -404,4 +404,77 @@ mod tests {
         );
         assert!(cli(&["server", "-c", "c.yaml"]).is_ok());
     }
+
+    #[test]
+    fn server_cert_key_console_overrides_map_through() {
+        // 证书三旗标是 config 的覆盖通道（Some → 覆盖 server.certificate_path 等）。
+        let Command::Server(a) = cmd(&[
+            "server",
+            "-c",
+            "c.yaml",
+            "--cert-path",
+            "cert.jws",
+            "--key-path",
+            "pub.pem",
+            "--console-log",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.cert_path.as_deref(), a.key_path.as_deref(), a.console_log),
+            (Some("cert.jws"), Some("pub.pem"), true)
+        );
+    }
+
+    #[test]
+    fn test_subcommand_maps_all_report_flags() {
+        let Command::Test(a) = cmd(&[
+            "test", "-c", "c.yaml", "-d", "src", "-t", "tests", "--format", "tap", "--output",
+            "r.tap",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                a.config.as_str(),
+                a.dir.as_deref(),
+                a.tests.as_deref(),
+                a.format.as_deref(),
+                a.output.as_deref()
+            ),
+            (
+                "c.yaml",
+                Some("src"),
+                Some("tests"),
+                Some("tap"),
+                Some("r.tap")
+            )
+        );
+    }
+
+    #[test]
+    fn migrate_baseline_and_module_positional() {
+        let Command::Migrate(a) = cmd(&["migrate", "--baseline", "user"]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.baseline, a.module.as_deref(), a.dir.as_deref()),
+            (true, Some("user"), None)
+        );
+    }
+
+    #[test]
+    fn fixture_and_schema_diff_map_config_dir() {
+        let Command::Fixture(a) = cmd(&["fixture", "-c", "c.yaml", "-d", "src"]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.config.as_str(), a.dir.as_deref()),
+            ("c.yaml", Some("src"))
+        );
+        let Command::SchemaDiff(a) = cmd(&["schema", "diff", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert_eq!((a.config.as_str(), a.dir.as_deref()), ("c.yaml", None));
+    }
 }
