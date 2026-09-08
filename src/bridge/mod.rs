@@ -2079,8 +2079,10 @@ mod tests {
         .await;
     }
 
-    /// inspect=true 时 start_inspector 走 spawn 分支：把 inspector 交给 WS 服务。
-    /// 用特权端口（bind 必败）验证分支路由即可，起服务本体由 inspector.rs 用例覆盖。
+    /// inspect=true 时 start_inspector 走 spawn 分支：Some → inspector::spawn 起服务。
+    /// 探自由端口让 bind 成功（spawn 分支真实进入；macOS 不限非特权低位端口，
+    /// 「特权端口必败」前提不成立且 accept 循环永不返回，await 句柄即挂死）。
+    /// 任务存活（accept 循环）即分支生效；随 LocalSet drop 收场。
     #[tokio::test(flavor = "current_thread")]
     async fn given_inspect_enabled_when_start_inspector_then_spawn_branch_taken() {
         let b = Bridge::with_opts(
@@ -2089,11 +2091,18 @@ mod tests {
             SchemaRegistry::new(),
             true,
         );
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
         let ls = tokio::task::LocalSet::new();
         ls.run_until(async {
-            // 端口 1 无绑定权限 → spawn 内 bind 失败即返回，句柄落定。
-            let h = start_inspector(&b, "0.0.0.0:1".parse().unwrap()).await;
-            h.await.unwrap();
+            let h = start_inspector(&b, addr).await;
+            // sleep 让 LocalSet 轮到 spawned 任务完成 bind。
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !h.is_finished(),
+                "inspector task should be alive in accept loop"
+            );
         })
         .await;
     }

@@ -680,9 +680,12 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// 覆盖率 spec 波1：`oj test` 进程内全链路——真实 V8 + `client` oneshot 派发
-/// （零 TCP）+ describe/it 框架 + json 报告落盘 + 退出码约定。
-/// sample L1 套件（7 文件 ~40 用例，auth/tenant 全开）全绿为门槛。
+/// 覆盖率 spec 波1：`oj test` 全链路——真实 V8 + `client` oneshot 派发（零 TCP）
+/// + describe/it 框架 + json 报告落盘 + 退出码约定。sample L1 套件（7 文件 ~40
+/// 用例，auth/tenant 全开）全绿为门槛。
+/// 子进程形态：插件单例（oj-auth GUARD 等 OnceLock）首次 init 后忽略后续 cfg，
+/// 同进程内先跑的 uc 测试会用空 secret 占住守卫 → L1 的 sample cfg 失效。子进程
+/// 隔离即生产语义（一次装配一个进程）；子进程同为插桩二进制，覆盖率照常入账。
 #[tokio::test(flavor = "current_thread")]
 async fn given_sample_l1_suite_when_oj_test_then_all_pass_and_report_written() {
     let _g = lock();
@@ -690,16 +693,25 @@ async fn given_sample_l1_suite_when_oj_test_then_all_pass_and_report_written() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let report = tmp.join("report.json");
-    let code = oj::test_cmd::run(oj::args::TestArgs {
-        config: sample().join("config.yaml").display().to_string(),
-        base: None,
-        dir: Some(sample().join("src").display().to_string()),
-        tests: None,
-        format: Some("json".into()),
-        output: Some(report.display().to_string()),
-    })
-    .expect("oj test run");
-    assert_eq!(code, 0, "L1 套件必须全绿");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args([
+            "test",
+            "-c",
+            &sample().join("config.yaml").display().to_string(),
+            "-d",
+            &sample().join("src").display().to_string(),
+            "--format",
+            "json",
+            "--output",
+            &report.display().to_string(),
+        ])
+        .output()
+        .expect("spawn oj test child");
+    assert!(
+        out.status.success(),
+        "L1 套件必须全绿（stderr: {}）",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(v["failed"], 0, "{v}");
