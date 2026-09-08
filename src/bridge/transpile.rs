@@ -197,6 +197,10 @@ mod tla_probe_tests {
     /// TS 转译对顶层 await 的保真性（任务驱动依赖，评审 F3）。
     #[test]
     fn ts_transpile_preserves_top_level_await() {
+        // 本测试也触发 .ts 转译 → 持 TRANSPILE_TEST_LOCK（模块注释：所有转译路径共用
+        // 此锁串行）。此前漏掉：并发给全局计数器 +1，污染 cache 测试的 delta 断言
+        // （偶发 16≠17），panic 时还毒化锁连锁炸掉同组测试。
+        let _g = super::TRANSPILE_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("ojtla-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("probe.ts");
