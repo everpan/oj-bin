@@ -30,8 +30,9 @@ deno_permissions = "0.117"
 deno_tls = "0.245"
 # 显式安装 rustls CryptoProvider（ws_client_extensions）：deno_tls 锁同一版本
 rustls = "=0.23.40"
-# libc feature 门控 RealSys 的 EnvHomeDir（RuntimePermissionDescriptorParser 需要）
-sys_traits = { version = "0.1.28", features = ["libc", "real"] }
+# RealSys 的 EnvHomeDir 由平台 feature 门控：unix 走 libc、windows 走 winapi
+# （deno_permissions 的 RuntimePermissionDescriptorParser 需要它）。
+sys_traits = { version = "0.1.28", features = ["libc", "real", "winapi"] }
 getrandom = "0.2"
 jsonwebtoken = "9"
 libloading = "0.9.0"
