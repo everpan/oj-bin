@@ -111,7 +111,13 @@ async fn run_on_runtime(
         loader.map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
 
     let mut rt = JsRuntime::new(RuntimeOptions {
-        extensions: vec![bridge_ext::init(stable.clone()), oj_test_ext::init()],
+        // bootstrap.js 顶部静态 import ext:deno_websocket/...，缺模块会让 boot
+        // 求值失败——与生产 runtime 同步拼装 WS 客户端扩展面。
+        extensions: only_js::bridge::ws_client_extensions()
+            .into_iter()
+            .chain(std::iter::once(bridge_ext::init(stable.clone())))
+            .chain(std::iter::once(oj_test_ext::init()))
+            .collect(),
         module_loader,
         ..Default::default()
     });

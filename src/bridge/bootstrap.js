@@ -59,8 +59,12 @@ import {
   op_random_hex,
   op_sha256_hex,
   op_ws_send,
-  op_ws_close,
+  op_ws_frame_close,
 } from "ext:core/ops";
+
+// Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
+// bridge::ws_client_extensions; see api-manual "WebSocket" section.
+import { WebSocket as ojWsClient } from "ext:deno_websocket/01_websocket.js";
 
 // ----- json: unified envelope + response headers -----
 globalThis.json = {
@@ -186,8 +190,12 @@ globalThis.tasks = {
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 globalThis.ws = {
   send: (data) => op_ws_send(String(data)),
-  close: () => op_ws_close(),
+  close: () => op_ws_frame_close(),
 };
+
+// ----- WebSocket: outbound WHATWG client (tasks + handlers; no task-context gate:
+// a connection carries no offset/ack consumer session, unlike MQ poll) -----
+globalThis.WebSocket = ojWsClient;
 
 // ----- bus: publish/subscribe (WS sessions subscribe; any handler publishes broadcast frames) -----
 // kind() reports the active broker type ("local" | "kafka" | "rabbitmq") so handlers

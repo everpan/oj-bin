@@ -249,7 +249,7 @@ deno_core::extension!(
         crypto::op_bcrypt_verify,
         crypto::op_sha256_hex,
         crypto::op_random_hex,
-        ws::op_ws_close,
+        ws::op_ws_frame_close,
         mq::op_mq_has,
         mq::op_mq_call,
         mq::op_tasks_stopping,
@@ -261,8 +261,41 @@ deno_core::extension!(
     state = |state, options| {
         state.put(options.stable.clone());
         state.put(ReqState::default());
+        // deno_websocket 的 op_ws_check_permission_and_cancel_handle 要求 OpState
+        // 里有 PermissionsContainer——出站 WS 与 fetch 同一信任边界（allow_all）。
+        // 放在 bridge_ext 的 state 闭包：HTTP 池 / 任务 / `oj test` 三路径统一生效。
+        state.put(deno_permissions::PermissionsContainer::allow_all(Arc::new(
+            deno_permissions::RuntimePermissionDescriptorParser::new(
+                sys_traits::impls::RealSys,
+            ),
+        )));
     },
 );
+
+/// WS 客户端扩展面（v0.1.7，spec 2026-09-08）：deno_websocket 提供 WHATWG
+/// `WebSocket` 全局；其 JS 经 core.loadExtScript 依赖 deno_web / deno_webidl /
+/// deno_fetch / deno_net 的扩展 JS，故五个扩展一并注册、顺序即依赖序。
+/// v0.1.8 计划全量替换自研 fetch，届时 esm_only 剥离一并移除。
+pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
+    /// deno_fetch 的 JS 是 deno_websocket 的运行时依赖，但其 `op_fetch` 与本仓
+    /// 自研 fetch op 同名——注册面保留 JS、剥掉 ops。
+    fn esm_only(mut ext: deno_core::Extension) -> deno_core::Extension {
+        ext.ops = std::borrow::Cow::Borrowed(&[]);
+        ext
+    }
+    vec![
+        deno_webidl::deno_webidl::init(),
+        deno_web::deno_web::init(
+            Arc::new(deno_web::BlobStore::default()),
+            None,  // maybe_location
+            false, // enable_css_parser_features
+            deno_web::InMemoryBroadcastChannel::default(),
+        ),
+        esm_only(deno_fetch::deno_fetch::init(deno_fetch::Options::default())),
+        deno_net::deno_net::init(None, None), // v0.1.8: 第一参传 RootCertStoreProvider 启用 wss
+        deno_websocket::deno_websocket::init(),
+    ]
+}
 
 /// 任务驱动出口（spec §6）：Stopped = flag 置位后自然收场；Crashed = 顶层抛错/加载失败
 /// （监督重启信号）；Killed = grace 到期强杀（terminate + event loop 兜底，SIGSEGV 纪律）。

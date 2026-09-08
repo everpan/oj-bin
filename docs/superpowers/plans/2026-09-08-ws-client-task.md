@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- 所有构建一律 `--release`（`.cargo/config.toml` 已别名，禁止 debug 构建用于仓库脚本）
+- 所有构建一律 `--release`（`.cargo/config.toml` 已别名，禁止 debug 构建用于仓库脚本）；**含验证命令**：`cargo test --release`、`cargo clippy --release --all-targets -- -D warnings`（dev 产物吃磁盘，已清禁）
 - `[profile.release] panic = "unwind"` 不得覆盖（插件 `catch_unwind` 依赖）
 - `src/bridge/bootstrap.js` 必须保持 7-bit ASCII
 - `JsRuntime` 是 `!Send`：池与测试一律 `current_thread` runtime

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use deno_core::{JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, v8};
 
 use super::module_loader::OjModuleLoader;
-use super::{RunError, StableState, bridge_ext};
+use super::{RunError, StableState, bridge_ext, ws_client_extensions};
 
 /// 池容量上限（空闲实例数）。设为 0 表示无上限（按需增长后保留）。
 const DEFAULT_MAX_IDLE: usize = 16;
@@ -68,7 +68,10 @@ impl RuntimePool {
             .clone()
             .map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
         JsRuntime::new(RuntimeOptions {
-            extensions: vec![bridge_ext::init(stable.clone())],
+            extensions: ws_client_extensions()
+                .into_iter()
+                .chain(std::iter::once(bridge_ext::init(stable.clone())))
+                .collect(),
             inspector: inspect,
             module_loader,
             ..Default::default()

@@ -17,6 +17,16 @@ base64 = "0.23.1"
 bcrypt = "0.15"
 deno_core = "0.411"
 deno_error = "0.7"
+# WS 客户端扩展面（v0.1.7）：deno_websocket 的 JS 经 core.loadExtScript 依赖
+# deno_web/deno_webidl/deno_fetch/deno_net 的扩展 JS，须一并注册（见 bridge::ws_client_extensions）。
+deno_web = "0.289"
+deno_webidl = "0.258"
+deno_fetch = "0.282"
+deno_net = "0.250"
+deno_websocket = "0.263"
+deno_permissions = "0.117"
+# libc feature 门控 RealSys 的 EnvHomeDir（RuntimePermissionDescriptorParser 需要）
+sys_traits = { version = "0.1.28", features = ["libc", "real"] }
 getrandom = "0.2"
 jsonwebtoken = "9"
 libloading = "0.9.0"
@@ -66,3 +76,9 @@ harness = false
 # 收敛跨界 panic；任何下游 profile 不得覆盖为 abort）。
 [profile.release]
 panic = "unwind"
+
+# 禁用 debug 产物（磁盘约束：deno 栈 dev 构建曾占 120G+）：无 debuginfo、无增量缓存。
+# 测试/门禁仍可跑 dev profile，但常规验证一律 --release（见 CLAUDE.md 命令节）。
+[profile.dev]
+debug = false
+incremental = false
