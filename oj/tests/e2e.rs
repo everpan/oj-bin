@@ -562,6 +562,9 @@ async fn uc12_timeout_408_server_survives() {
 /// 子进程用测试编译产物（CARGO_BIN_EXE_oj，cargo test 默认 profile——仅测试
 /// 脚手架，发布物门禁仍走 `cargo xtask build` 的 release）。无插件依赖：极简
 /// config 不声明 auth/oidc 等，纯任务池生命周期验收。
+// kill -TERM 是 POSIX 语义（Windows 无对应：Git Bash kill 打不进原生进程，
+// ctrl_c 语义另测）——按设计只在 unix 跑，Windows runner 直接编译排除。
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     let _g = lock();
