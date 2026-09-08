@@ -493,6 +493,24 @@ oj_plugin_ffi::oj_plugin_entry!(init, db => &VTABLE);
 mod tests {
     use super::*;
 
+    /// DSN 前缀 → 方言判定（占位符补全 / lock 句柄等都依赖它，错判即打错方言 SQL）。
+    #[test]
+    fn given_dsn_when_dialect_of_then_prefix_decides() {
+        assert_eq!(dialect_of("postgres://u:p@h/db"), Dialect::Postgres);
+        assert_eq!(dialect_of("postgresql://u:p@h/db"), Dialect::Postgres);
+        assert_eq!(dialect_of("mysql://u:p@h/db"), Dialect::MySql);
+        assert_eq!(dialect_of("sqlite://f.db"), Dialect::Sqlite);
+        assert_eq!(dialect_of("file.db"), Dialect::Sqlite);
+        assert_eq!(dialect_of(""), Dialect::Sqlite);
+    }
+
+    #[test]
+    fn given_dialect_when_str_then_wire_name() {
+        assert_eq!(dialect_str(Dialect::Sqlite), "sqlite");
+        assert_eq!(dialect_str(Dialect::MySql), "mysql");
+        assert_eq!(dialect_str(Dialect::Postgres), "postgres");
+    }
+
     /// 无效 DSN 快速失败（不触网）。
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_dsn_fails_fast() {
