@@ -13,6 +13,7 @@ pub mod es;
 pub mod future;
 pub mod kv;
 pub mod mq;
+pub mod path_util;
 
 pub use auth::AuthGuardVtable;
 pub use blob::BlobBackendVtable;

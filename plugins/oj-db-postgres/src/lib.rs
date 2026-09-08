@@ -522,11 +522,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Any 默认 create_if_missing=false → 先 touch（0 字节即合法空库）。
         std::fs::File::create(dir.join("t.db")).unwrap();
-        // 绝对路径走单冒号 `sqlite:` + 正斜杠：`sqlite://C:\...` 会被 sqlx Any 的
-        // Url 解析把盘符吞成 host → Windows 按相对路径开库，SQLITE_CANTOPEN(14)
-        // （同 src/bridge/db_backend.rs::normalize_sqlite_dsn 的结论）。
-        let db = dir.join("t.db");
-        let dsn = format!("sqlite:{}", db.to_string_lossy().replace('\\', "/"));
+        // 与宿主同一入口：绝对路径走单冒号 `sqlite:` + 正斜杠（Windows 盘符不会
+        // 被 Url 解析吞成 host），见 oj_plugin_ffi::path_util。
+        let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&dir.join("t.db"));
 
         let bytes = drive(&mut connect(RString::from(dsn.as_str())))
             .await

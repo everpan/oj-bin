@@ -4029,6 +4029,7 @@ dependencies = [
 name = "oj-plugin-ffi"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "paste",
  "serde",
  "serde_json",

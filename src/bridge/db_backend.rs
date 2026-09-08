@@ -107,22 +107,6 @@ impl DbBackend for MemoryBackend {
     }
 }
 
-/// 剥除 Windows verbatim 前缀：`\\?\D:\a\b` → `D:\a\b`；`\\?\UNC\server\share`
-/// → `\\server\share`（`\\.\` 设备路径同理）。这些前缀经反斜杠转正斜杠会变成
-/// `//?/`，污染 sqlite DSN（见 `normalize_sqlite_dsn`）。
-fn strip_verbatim(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    let stripped: &str = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        // verbatim UNC：还原为普通 UNC 共享路径
-        return PathBuf::from(format!("\\\\{rest}"));
-    } else if let Some(rest) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\\.\")) {
-        rest
-    } else {
-        &s
-    };
-    PathBuf::from(stripped)
-}
-
 /// sqlite DSN 归一：相对路径相对 config_dir 绝对化（缺文件建零长空库，
 /// sqlx 默认 create_if_missing=false）；内存与 `//` 特殊形式直通。
 /// 绝对路径统一以 `sqlite:`（单冒号）承载并转正斜杠——`sqlite://C:\...`
@@ -152,16 +136,11 @@ pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String
     } else {
         config_dir.join(p)
     };
-    // canonicalize 在 Windows 返回 verbatim 前缀 `\\?\D:\...`；其 `\\?\` 经
-    // 下面的反斜杠转正斜杠会变成 `//?/`，使生成的 DSN 形如 `sqlite://?/D:/...`，
-    // sqlx 把它解析成「空库名 + 一个名为路径的 query 参数」→ "unknown query
-    // parameter ... while parsing connection URL"。统一剥掉 verbatim 前缀。
-    let p = strip_verbatim(&p);
     if !p.is_file() {
         std::fs::write(&p, b"").map_err(|e| format!("create db file {}: {e}", p.display()))?;
     }
-    let fwd = p.to_string_lossy().replace('\\', "/");
-    Ok(format!("sqlite:{fwd}"))
+    // verbatim 前缀剥除 + 正斜杠归一（Windows 两处坑）见 path_util 文档。
+    Ok(oj_plugin_ffi::path_util::sqlite_file_dsn(&p))
 }
 
 #[cfg(test)]
