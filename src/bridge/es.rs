@@ -256,4 +256,80 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["stub"], serde_json::json!("idx"), "{v}");
     }
+
+    /// del：校验拒（非法 index）→ 后端分发（合法路径）→ 后端 Err 映射为 JS 可见消息。
+    #[tokio::test(flavor = "current_thread")]
+    async fn del_op_validates_dispatches_and_maps_backend_error() {
+        struct DelStub;
+        #[async_trait::async_trait]
+        impl EsBackend for DelStub {
+            async fn search(&self, _: &str, _: Value) -> crate::bridge::BridgeResult<Value> {
+                unreachable!()
+            }
+            async fn index_doc(
+                &self,
+                _: &str,
+                _: &str,
+                _: Value,
+            ) -> crate::bridge::BridgeResult<Value> {
+                unreachable!()
+            }
+            async fn delete_doc(
+                &self,
+                index: &str,
+                id: &str,
+            ) -> crate::bridge::BridgeResult<Value> {
+                if index == "boom" {
+                    Err("boom".into())
+                } else {
+                    Ok(serde_json::json!({ "deleted": index, "id": id }))
+                }
+            }
+        }
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                es: Some(Arc::new(DelStub)),
+                ..Default::default()
+            },
+        );
+        // 合法路径：分发到后端。
+        let cap = b
+            .run_with(
+                r#"(async () => { json.ok(await es.del("idx", "1")); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["deleted"], serde_json::json!("idx"), "{v}");
+        assert_eq!(v["data"]["id"], serde_json::json!("1"), "{v}");
+        // 非法 index：校验在前。
+        let cap = b
+            .run_with(
+                r#"(async () => { await es.del("bad/index", "1"); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["data"]["err"].as_str().unwrap().contains("invalid index"),
+            "{v}"
+        );
+        // 后端 Err：映射为 JS 可见消息。
+        let cap = b
+            .run_with(
+                r#"(async () => { await es.del("boom", "1"); json.ok({}); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["err"].as_str().unwrap().contains("boom"), "{v}");
+    }
 }
