@@ -333,8 +333,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn jwt_sign_rejects_non_string_sub_and_hs512_roundtrips() {
         // payload.sub 非字符串 → 点名报错；HS512 算法臂全链路（sign→verify）。
-        let mut cfg = (*jwt_cfg()).clone();
-        cfg.alg = "HS512".into();
+        let base = jwt_cfg();
+        let cfg = JwtCfg {
+            secret: base.secret.clone(),
+            alg: "HS512".into(),
+            access_secs: base.access_secs,
+            refresh_secs: base.refresh_secs,
+        };
         let b = bridge(Some(Arc::new(cfg)));
         let cap = b
             .run_with(
