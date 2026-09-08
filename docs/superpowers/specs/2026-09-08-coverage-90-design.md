@@ -2,6 +2,14 @@
 
 ## 执行进展（滚动更新）
 
+- **终态（2026-09-08）：行覆盖 87.82%**（23,169 行，missed 2,823）/ 区域 86.63% /
+  函数 80.45%。基线 79.44% → +8.4 点。全测试绿 + fmt/clippy 门禁过。
+- 未达 90% 的残余 = rabbitmq/kafka/blob-s3/kv-redis 插件 I/O 体（~1,160 行，
+  AMQP/Kafka/S3/RESP 无内嵌替身）+ 各文件散点（serde 数学上不可失败的臂、
+  平台特定 dlopen 关键词、锁毒化防御等）。离线天花板实测 ≈ 88%。
+- 顺带修出真 bug 三个：`renew` 不建 out_dir、sigterm e2e macOS 低位端口挂死、
+  L1 用例被插件单例毒化（GUARD OnceLock 首init生效语义）→ 子进程隔离。
+
 - 基线 79.44% → **84.18%**（lcov 实测 @ 波2中途）；目标 missed ≤ 2,023（lcov 口径 20,234 行）。
 - **关键解锁**：db 双插件的 `[dev-dependencies] sqlx + "sqlite"` 特性统一——测试构建给
   sqlx Any 装 sqlite 驱动（`install_default_drivers()` 按启用特性安装），生产 cdylib
