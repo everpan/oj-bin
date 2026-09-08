@@ -188,30 +188,24 @@ pub async fn replay_all(default: Option<&Arc<dyn DataAccessor>>, dir: &Path) -> 
             owner.insert(leak_str(name), p.as_path());
         }
     }
+    // 逐语句只在失败时响（error）；成功按文件合并为一条统计（含语句数）。
     for (name, p, t) in &texts {
+        let mut applied = 0usize;
         for (i, stmt) in split_statements(t).into_iter().enumerate() {
             let sql = translate_insert(stmt, db.dialect());
-            match db.exec_with_params(&sql, &[]).await {
-                Ok(rows) => tracing::info!(
+            if let Err(e) = db.exec_with_params(&sql, &[]).await {
+                tracing::error!(
                     module = name,
                     file = %show(p),
                     seq = i,
-                    rows,
                     stmt = %crate::migrate::log_snip(stmt),
-                    "seed ok"
-                ),
-                Err(e) => {
-                    tracing::error!(
-                        module = name,
-                        file = %show(p),
-                        seq = i,
-                        stmt = %crate::migrate::log_snip(stmt),
-                        "seed failed: {e}"
-                    );
-                    return Err(format!("seed {}: {e}", show(p)));
-                }
+                    "seed failed: {e}"
+                );
+                return Err(format!("seed {}: {e}", show(p)));
             }
+            applied += 1;
         }
+        tracing::info!(module = name, file = %show(p), stmts = applied, "seed ok");
     }
     Ok(())
 }

@@ -159,47 +159,35 @@ impl AsyncTransaction for OjConn {
                     .map_err(err)?;
                 }
                 for s in &stmts {
-                    match tx.exec(s, &[]).await {
-                        Ok(rows) => tracing::info!(
+                    // 逐语句只在失败时响（error）；成功统计合并到文件级一条。
+                    if let Err(e) = tx.exec(s, &[]).await {
+                        tracing::error!(
                             module = %self.module,
-                            rows,
                             stmt = %log_snip(s),
-                            "migrate ok"
-                        ),
-                        Err(e) => {
-                            tracing::error!(
-                                module = %self.module,
-                                stmt = %log_snip(s),
-                                "migrate failed: {e}"
-                            );
-                            return Err(err(e));
-                        }
+                            "migrate failed: {e}"
+                        );
+                        return Err(err(e));
                     }
                 }
                 tx.commit().await.map_err(err)?;
+                tracing::info!(module = %self.module, stmts = stmts.len(), "migrate ok");
             }
             // mysql DDL 隐式提交：BEGIN 会裂（grouped 必假，§11.2 注③）——
             // 不 BEGIN，顺序执行；互斥靠账本复合主键冲突兜底。
             Dialect::MySql => {
                 for s in &stmts {
+                    // 同 sqlite 臂：逐语句仅 error，成功统计文件级一条。
                     let sql = mysql_ledger_ddl(s);
-                    match self.acc.exec_with_params(&sql, &[]).await {
-                        Ok(rows) => tracing::info!(
+                    if let Err(e) = self.acc.exec_with_params(&sql, &[]).await {
+                        tracing::error!(
                             module = %self.module,
-                            rows,
                             stmt = %log_snip(&sql),
-                            "migrate ok"
-                        ),
-                        Err(e) => {
-                            tracing::error!(
-                                module = %self.module,
-                                stmt = %log_snip(&sql),
-                                "migrate failed: {e}"
-                            );
-                            return Err(err(e));
-                        }
+                            "migrate failed: {e}"
+                        );
+                        return Err(err(e));
                     }
                 }
+                tracing::info!(module = %self.module, stmts = stmts.len(), "migrate ok");
             }
         }
         Ok(stmts.len())
