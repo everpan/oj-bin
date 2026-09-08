@@ -164,7 +164,14 @@ pub fn renew(opts: &RenewOpts) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{days_to_expiry, keygen, sign_jws};
+    use super::{GenOpts, RenewOpts, days_to_expiry, r#gen, keygen, renew, sign_jws};
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oj-cert-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
 
     /// `--days` 是有效天数（×86400），不是秒——回归护栏：曾把天数当秒导致
     /// `--days 365` 只签 6 分钟的证书。
@@ -194,5 +201,76 @@ mod tests {
         let s = String::from_utf8(payload).unwrap();
         assert!(s.contains("\"nbf\"") && s.contains("1000"), "{s}");
         assert!(s.contains("\"exp\"") && s.contains("2000"), "{s}");
+    }
+
+    #[test]
+    fn gen_rejects_expiry_not_after_nbf_and_refuses_overwrite() {
+        // 门禁语义：exp<=nbf 拒；已有 private.pem 拒覆盖（续期唯一通道是 renew）。
+        let d = tmpdir("gen");
+        let e = r#gen(&GenOpts {
+            out_dir: d.clone(),
+            bits: 2048,
+            nbf: 1000,
+            exp: 1000,
+        })
+        .unwrap_err();
+        assert!(e.contains("exp must be greater"), "{e}");
+        r#gen(&GenOpts {
+            out_dir: d.clone(),
+            bits: 2048,
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap();
+        let e = r#gen(&GenOpts {
+            out_dir: d.clone(),
+            bits: 2048,
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap_err();
+        assert!(e.contains("refusing to overwrite"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn renew_rejects_missing_or_malformed_key_and_honors_out_dir() {
+        // 错误路径：缺文件 / 坏 PEM 各自点名；Some(out_dir) 覆盖默认（私钥所在目录）。
+        let d = tmpdir("ren");
+        let e = renew(&RenewOpts {
+            key_path: d.join("nope.pem"),
+            out_dir: None,
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap_err();
+        assert!(e.contains("read key"), "{e}");
+        std::fs::write(d.join("bad.pem"), "not a pem").unwrap();
+        let e = renew(&RenewOpts {
+            key_path: d.join("bad.pem"),
+            out_dir: None,
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap_err();
+        assert!(e.contains("parse private key"), "{e}");
+        // 合法 key + 指定 out_dir → cert.jws 落在指定目录。
+        r#gen(&GenOpts {
+            out_dir: d.join("kp"),
+            bits: 2048,
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap();
+        let p = renew(&RenewOpts {
+            key_path: d.join("kp/private.pem"),
+            out_dir: Some(d.join("out")),
+            nbf: 0,
+            exp: 100,
+        })
+        .unwrap();
+        assert_eq!(p, d.join("out/cert.jws"));
+        assert!(p.exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
