@@ -1,5 +1,25 @@
 # 测试覆盖率 90% 达标设计（2026-09-08）
 
+## 执行进展（滚动更新）
+
+- 基线 79.44% → **84.18%**（lcov 实测 @ 波2中途）；目标 missed ≤ 2,023（lcov 口径 20,234 行）。
+- **关键解锁**：db 双插件的 `[dev-dependencies] sqlx + "sqlite"` 特性统一——测试构建给
+  sqlx Any 装 sqlite 驱动（`install_default_drivers()` 按启用特性安装），生产 cdylib
+  不受影响仍单方言。vtable 全执行体（连接/DDL/参数化/事务/错误面）离线可测，
+  ~900 行解锁（此前仅 env-gated 真库可达）。
+- 兼修出真 bug 一个：`oj-cert renew` 指定不存在 out_dir 直接写盘失败（gen 会建目录），
+  已对齐修复。
+- 剩余大头：rabbitmq/kafka/s3/redis 插件 I/O 体（~1,160 行，离线不可达——AMQP/Kafka/S3
+  无内嵌替身，mini-RESP 基建风险大暂缓）；其余为散点错误臂。
+
+## 波 3 runbook（解锁最后百分点的环境矩阵）
+
+`/tmp/oj-testenv/docker-compose.yaml`（mysql/pg/redis/rabbitmq/minio+mc/kafka kraft 已定义），
+环境变量对应：`OJ_TEST_MYSQL` / `OJ_TEST_PG` / `OJ_TEST_REDIS` / `OJ_TEST_RABBITMQ_URL`
+/ `OJ_TEST_KAFKA_BROKERS` / `OJ_TEST_S3=endpoint|bucket|region|access|secret|path_style`。
+rabbitmq 的 mq roundtrip 已改为测试内 lapin 自声明队列（不再依赖外部 init）。
+
+
 ## 口径
 
 - workspace 聚合**行覆盖** ≥90%（`cargo llvm-cov --workspace --summary-only`）。
