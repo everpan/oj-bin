@@ -2045,7 +2045,10 @@ mod tests {
     // ---- fetch（v0.1.8：deno_fetch / WHATWG 语义）----
 
     fn fetch_bridge() -> Bridge {
-        Bridge::new(Arc::new(InMemoryAccessor::new()), Arc::new(InMemoryKV::new()))
+        Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        )
     }
 
     /// 本地一次性 HTTP 服务器 + fetch 全链路：json()、ok/status、Headers
@@ -2118,7 +2121,10 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 502, "{v}");
         let msg = v["msg"].as_str().unwrap();
-        assert!(msg.contains("TypeError") || msg.contains("sending request"), "{v}");
+        assert!(
+            msg.contains("TypeError") || msg.contains("sending request"),
+            "{v}"
+        );
     }
 
     /// 非 2xx 照常返回 Response（ok=false），body 走 text()。
