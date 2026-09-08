@@ -9,7 +9,8 @@
 - **js/\***：JS op 全链路（JS 调用 → op → Rust → Promise 解析）。每次 criterion 迭代在
   JS 循环内执行 100 次 op（fetch 为 20 次），表中"单次 op"为迭代均值 ÷ 次数。
 - `log.info` 的 tracing 输出到 `io::sink`：含格式化成本，不含真实 I/O。
-- `fetch` 打本地 loopback keep-alive 服务器，连接由 reqwest 连接池复用（稳态口径）。
+- `fetch` 打本地 loopback keep-alive 服务器，连接由 deno_fetch 内部 hyper 连接池复用
+  （稳态口径；v0.1.8 前为自研 reqwest Client）。
 - 每次迭代含一次脚本编译+执行（约 0.5 µs 基线），100 次 op 摊薄后约占 1–2%。
 
 ## 优化前后对比
@@ -48,7 +49,8 @@ reqwest 默认读取 macOS 系统代理配置，且回环例外（`127.*`）未�
 本机代理进程（服务器端看到的 `User-Agent: Go-http-client/1.1` 即代理转发证据），
 每请求一次新建代理连接。修复：Bridge 的 reqwest Client 改 `no_proxy`（不走系统代理），
 纯 reqwest 回环验证从 1.9 ms/req 降至 65 µs/req。
-需要代理支持时按配置注入 `Proxy`（见 `mod.rs` 中 ponytail 注释）。
+v0.1.8 起换 deno_fetch：其 `Options.proxy` 缺省 `None`，不读系统代理，该坑不复存在
+（上表 js/fetch 数据为自研版口径，仅供量级参考）。
 
 ## 解读
 

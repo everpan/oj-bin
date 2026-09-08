@@ -469,7 +469,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
-| `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
+| `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 开箱即用） |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
@@ -661,20 +661,27 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 键值对交替传参（zap SugaredLogger 风格）：`log.info("order created", "id", id, "amount", amount)`。
 输出经 `tracing-subscriber` 结构化打印（第 12 章日志）。
 
-### fetch —— HTTP 客户端
+### fetch —— HTTP 客户端（WHATWG，v0.1.8）
 
-签名：`fetch(url: string, options?: { method?: string; headers?: Record<string, string>;
-body?: string | null }): Promise<OjFetchResponse>`。
+标准 WHATWG `fetch`（deno 官方 deno_fetch 实现，v0.1.8 起整体替换自研 reqwest 版）：
+`fetch(url | Request, init?)` → 真 `Response`——`ok / status / statusText /
+headers: Headers / json() / text() / arrayBuffer() / body（ReadableStream）`。
+`Headers` 大小写不敏感：`r.headers.get("content-type")`。`method / headers /
+body / signal / redirect` 均按标准语义：body 支持 `string | Uint8Array`（不再限于
+字符串），字符串 body 默认 `Content-Type: text/plain;charset=UTF-8`，取消走
+`AbortController`（全局已挂载，如 `AbortSignal.timeout(5000)`）。
 
-返回浏览器风格 Response 子集：`ok / status / statusText / headers / json() / text() /
-arrayBuffer() / clone()`。注意 v0.2 的 body 以字符串发送（非字符串值会被 `String()`
-转换），二进制请求体请先自行编码（如 base64）。
+https/wss 开箱即用：webpki-roots 根集编译进二进制（`bridge::ws_client_extensions`
+注入 `FetchOptions`，https fetch 与 wss 握手共用）。网络错误折叠为 `TypeError`
+（`Invalid URL…` / `error sending request…`），非 2xx 照常返回 `Response`
+（`ok === false`），都不抛 HTTP 状态错。
 
 ```ts
-const r = await fetch("https://api.example.com/v1/ping", { method: "GET" });
+const r = await fetch("https://api.example.com/v1/ping", {
+  signal: AbortSignal.timeout(5000),
+});
 if (r.ok) {
-  const body = await r.json();
-  json.ok(body);
+  json.ok(await r.json());
 }
 ```
 
@@ -687,7 +694,7 @@ if (r.ok) {
 
 仅在 `ws.ts` 帧循环内有意义（第 4 章）。
 
-### WebSocket —— 出站客户端（WHATWG，v0.1.7）
+### WebSocket —— 出站客户端（WHATWG，v0.1.7 起）
 
 标准 WHATWG `WebSocket`（deno 官方实现）：`new WebSocket(url)`、
 `onopen/onmessage/onclose/onerror`、`send/close`。**任务文件与 HTTP handler 均可用**，
@@ -709,17 +716,19 @@ ws.onmessage = (e) => log.info("frame " + e.data);
 
 三条硬约束（全部来自真实踩坑）：
 
-1. **WHATWG WebSocket 无法携带自定义头**（含 `Authorization`）——受 Bearer 守卫保护的
-   WS 路由需单独列入 `anonymous_paths`（案例做法：仅匿名 `/news/ws` 订阅路径，发布
-   `POST /news` 保持鉴权），或改用应用层 token 透传（首帧握手）。
+1. **鉴权在应用层做，不在管线**：WS 路由（`<dir>/ws.ts`）是 merge 进 Router 的
+   **真实路由，不经过** fallback 的 Bearer/租户前置管线——连接天然匿名，
+   `anonymous_paths` 对它无效也不需要配（v0.1.8 起 sample 已删除该冗余条目）。
+   受保护数据的订阅要自行做首帧 token 握手，或把发布端点（`POST /news`）留在
+   鉴权面内。
 2. **URL 主机名要匹配服务端绑定语义**：服务端缺省监听 `[::1]`（IPv6 回环），写
    `127.0.0.1` 会 connection refused——用 `localhost`。
 3. **等帧必须与停机信号竞速**：挂在 `await` 上没人 wake，会拖到看门狗强杀记 `killed`；
    用 `Promise.race([wake, tasks.sleep(250)])`，轮询间隔 ≪ `stop_grace_secs`
    （与 MQ poll 的 `timeoutMs` 纪律同源）。
 
-限制：v0.1.7 出站仅明文 `ws://`（wss 需宿主注入根证书，v0.1.8 与 deno_fetch 替换
-一并处理）。`oj test` 运行时同样挂载该全局。
+wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj test` 运行时
+同样挂载该全局。出站客户端教学见 [docs/websocket.md](../websocket.md) §7。
 
 ### plugins —— 插件自省
 

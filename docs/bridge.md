@@ -97,26 +97,26 @@ log.info("user login", "user_id", uid, "ip", ip);
 log.error("db query failed", "sql", sql, "err", err);
 ```
 
-### fetch —— 浏览器 Fetch API 兼容（reqwest 实现）
+### fetch —— WHATWG fetch（deno_fetch 扩展，v0.1.8）
 
 ```js
 const resp = await fetch("https://api.example.com/data", {
   method: "POST", headers: { "X-A": "1" }, body: "ping",
+  signal: AbortSignal.timeout(5000),
 });
-resp.ok; resp.status; resp.statusText; resp.headers;
-const data = await resp.json();   // 空 body → null
+resp.ok; resp.status; resp.statusText;
+resp.headers.get("content-type");   // Headers 大小写不敏感
+const data = await resp.json();
 const text = await resp.text();
 const buf  = await resp.arrayBuffer(); // Uint8Array
-const r2   = resp.clone();
-const { done, value } = await resp.body.getReader().read(); // 缓冲模拟：首读全量，再读 done
+const { done, value } = await resp.body.getReader().read(); // 真 ReadableStream
 ```
 
-未设置 Content-Type 且有 body 时自动补 `text/plain;charset=UTF-8`。不支持 AbortController。
-HTTP 客户端为单个共享 reqwest Client（连接池复用），构造时固定 `no_proxy`——不走系统代理
-（macOS 系统代理会把连回环的请求也拦截转发，实测 65 µs/req 劣化到 1.9 ms/req）。
-
-> 注意：reqwest 默认会读取 macOS 系统代理配置，本机有代理软件时连回环地址都会被
-> 拦截转发——这是 `no_proxy` 的直接原因。
+标准 WHATWG 语义：body 支持 `string | Uint8Array`（字符串默认
+`text/plain;charset=UTF-8`）、`AbortController` 取消、非 2xx 照常返回 Response，
+网络错折叠为 `TypeError`。实现为 deno 官方 deno_fetch（内部 hyper 连接池复用），
+`Options.proxy = None`——不读系统代理（自研 reqwest 时代的 macOS 系统代理拦截
+回环问题随之消失）。https/wss 根证书 = webpki-roots，见 `ws_client_extensions`。
 
 ### oidc —— RS256 签发/验签原语（`oidc:` 配置段启用）
 

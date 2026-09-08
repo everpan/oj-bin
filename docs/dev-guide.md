@@ -19,12 +19,15 @@
 
 ## 1. 环境与构建
 
-- Rust toolchain（edition 2024）。`deno_core 0.410` 依赖 `rusty_v8`，首次编译需下载预编译 V8
+- Rust toolchain（edition 2024）。`deno_core 0.411` 依赖 `rusty_v8`，首次编译需下载预编译 V8
   静态库（网络受限时设 `V8_FROM_SOURCE=0` 让它走预编译包；**切勿**从源码编译 V8）。
 - 关键依赖（根 `Cargo.toml`）：
-  - `deno_core 0.410` / `deno_error 0.7` / `deno_ast 0.53`（TS 转译）。
+  - `deno_core 0.411` / `deno_error 0.7` / `deno_ast 0.53`（TS 转译）。
+  - deno 扩展族（WHATWG 面）：`deno_web / deno_webidl / deno_fetch / deno_net /
+    deno_websocket / deno_permissions / deno_tls`（v0.1.7 WS 客户端 + v0.1.8 fetch；
+    注册与坑见 `bridge::ws_client_extensions`）。
   - `sqlx 0.9`（any + sqlite + runtime-tokio）、`sea-query 1.0`（安全 SQL 构造器）。
-  - `reqwest 0.13`（rustls）、`tokio-tungstenite 0.30`、`notify 8`、`object_store 0.14`（aws）。
+  - `tokio-tungstenite 0.30`、`notify 8`、`object_store 0.14`（aws）。
   - `libloading 0.9`（插件 dlopen）。
 
 **禁止 debug 构建**：`.cargo/config.toml` 无法用 alias 覆盖内建 `build`，故 `cargo build`

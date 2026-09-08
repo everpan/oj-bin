@@ -1,8 +1,8 @@
 # WebSocket 教学（ws.ts 帧循环）
 
-> 面向两类读者：**要写 WS handler 的业务开发者**（§1–§3）与**要改 WS 实现的维护者**
-> （§4–§6）。JS 签名权威是 [devkit/api-manual.md](devkit/api-manual.md)（§4 `ws.ts` 小节、
-> §6 `ws`/`bus` 行）；维护者模块地图是 [modules/03-server-http.md](modules/03-server-http.md) §5。
+> 面向两类读者：**要写 WS handler 的业务开发者**（§1–§3、§7）与**要改 WS 实现的维护者**
+> （§4–§6、§7 末）。JS 签名权威是 [devkit/api-manual.md](devkit/api-manual.md)（§4 `ws.ts` 小节、
+> §6 `ws`/`WebSocket`/`fetch` 行）；维护者模块地图是 [modules/03-server-http.md](modules/03-server-http.md) §5。
 > 可运行示例全程以 `sample/src/news/` 为锚。
 
 ## 1. 心智模型：一个文件 = 一条 WS 路由 = 每帧执行一次
@@ -170,8 +170,9 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
   `forwarder.abort()` 收尾——否则 bus 订阅表里的发送端滞留，Writer 永不排空。
 
 **op 层**（`src/bridge/ws.rs`，仅两个）：`op_ws_send` 把字符串 push 进
-`ReqState.ws_sends`，`op_ws_close` 置位 `ReqState.ws_close`——都是「先收集、帧末统一
-执行」。HTTP 路径不读这两项，所以同一份 handler 代码在 HTTP 里调用 `ws.*` 等价 no-op。
+`ReqState.ws_sends`，`op_ws_frame_close` 置位 `ReqState.ws_close`——都是「先收集、帧末统一
+执行」（v0.1.7 起改名 `op_ws_frame_close`，避开 deno_websocket 的同名 op）。HTTP
+路径不读这两项，所以同一份 handler 代码在 HTTP 里调用 `ws.*` 等价 no-op。
 
 **失败语义**（表）：
 
@@ -210,3 +211,88 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 | `ws_frame_publish_broadcasts_to_subscribers` | §2 帧内发布：帧内 `publish` 广播到他连 + 自回声 + 块作用域重跑安全 |
 
 手测冒烟用 §3 的三条命令即可。
+
+## 7. 出站客户端：`new WebSocket`（v0.1.7 起）与 wss（v0.1.8 起）
+
+前六章都是「**别人连进来**」；这一章反过来——handler / 长任务作为 **WS 客户端**
+连出去取数。运行时注入标准 WHATWG `WebSocket` 全局（deno 官方 deno_websocket
+实现）：`new WebSocket(url)`、`onopen / onmessage / onerror / onclose`、`send / close`。
+任务文件与 HTTP handler 均可用（连接无 MQ poll 那样的 offset/ack 消费会话，故无
+task 门禁）。
+
+与服务端 `ws.ts` 的分工：
+
+| | 服务端（§1–§2 `ws.ts`） | 出站客户端（本节） |
+|---|---|---|
+| 方向 | 客户端连 oj | oj 连别人 |
+| 入口 | 目录镜像路由 `GET {base}/…/ws` | `new WebSocket(url)` 全局 |
+| 每帧执行 | 整个 `ws.ts` 文件重跑 | 你的 `onmessage` 回调 |
+| 发帧 | `ws.send` / `json.ok`（收集制） | `socket.send(str)`（直发） |
+| VM | 每连接独占一个 | 跑在所在 handler/任务的 VM 里 |
+
+### 7.1 可运行案例：`sample/src/tasks/task_wsclient.ts`
+
+任务连 **sample 自己**的 `/v1/api/news/ws` 订阅 "news"，收到 §2 那条
+`bus.publish` 广播链路的帧——一条命令链条跑通「入站 + 出站」两个半边：
+
+```bash
+cargo run -p oj --release -- server -c sample/config.yaml --api-path sample/src
+TOKEN=$(curl -s -X POST http://localhost:9778/v1/api/auth/login -H 'X-TENANT-ID: default' \
+  -d '{"username":"demo","password":"demo1234"}' | jq -r '.data.access_token')
+curl -X POST http://localhost:9778/v1/api/news -H "Authorization: Bearer $TOKEN" \
+  -H 'X-TENANT-ID: default' -d '{"text":"hi"}'
+# → 任务日志：ws frame {"topic":"news","data":{"text":"hi"}}；Ctrl-C → stopped
+```
+
+案例骨架（全文见 `sample/src/tasks/task_wsclient.ts`）与 MQ 消费任务
+（[mq-tasks.md](mq-tasks.md)）同构，但 **重连不用手写**：
+
+```ts
+const ws = new WebSocket(url);
+const opened = new Promise<void>((ok, err) => { ws.onopen = ok; ws.onerror = err; });
+ws.onmessage = (e) => { frames.push(String(e.data)); wake?.(); wake = null; };
+ws.onclose = () => { closed = "ws closed"; wake?.(); wake = null; };
+await opened;
+ws.send("{}");                    // 首帧：服务端 ws.ts 执行 bus.subscribe("news")
+while (!tasks.stopping()) {
+  if (closed) throw new Error(closed);   // 断连 → Crashed → 监督器重启 → 新实例重连
+  if (frames.length) { log.info("ws frame " + frames.shift()); continue; }
+  await Promise.race([new Promise(ok => (wake = ok)), tasks.sleep(250)]);
+}
+ws.close();                        // Stopped 出口：干净断连
+```
+
+**重连 = 崩溃监督**：`onerror`/`onclose` 置 `closed` → 下一轮抛错 → 任务
+`Crashed` → 监督器指数退避重启（1s→2s→…cap 60s）→ 新实例重新建连。你只需要
+「让断连可观测」，不需要 reconnect 循环。
+
+### 7.2 wss 与鉴权的真话
+
+- **wss**：v0.1.8 起 webpki-roots（Mozilla 根集）编译进二进制，经
+  `FetchOptions.root_cert_store_provider` 注入——https `fetch` 与 wss 握手共用
+  同一份（`op_ws_create` 从 OpState 读 `FetchOptions`）。`new WebSocket("wss://…")`
+  开箱即用，无系统证书依赖。
+- **鉴权**：WS 路由是真实路由、**不过** Bearer/租户前置管线（§3 红线），所以
+  `anonymous_paths` 对它无效也无需配置；而 WHATWG `WebSocket` 又带不了自定义头
+  （含 `Authorization`）——连第三方受保护 WS 端点时，token 只能走应用层：
+  首帧透传或子协议（`new WebSocket(url, protocols)`）。
+
+### 7.3 实现走读（维护者）
+
+装配点 `bridge::ws_client_extensions`（`src/bridge/mod.rs`）按依赖序注册五个
+deno 扩展：`deno_webidl → deno_web → deno_fetch → deno_net → deno_websocket`。
+deno_websocket 的 JS 是 ESM（bootstrap.js `import` 挂 `globalThis.WebSocket`）；
+而 fetch 相关 JS 是**经典脚本片**（`lazy_loaded_js`），只能经 `core.loadExtScript`
+拉取——bootstrap.js 由此挂载 `fetch / AbortController / URL / URLSearchParams`。
+三个嵌入坑（升级 deno_core 时先看这里）：
+
+1. `26_fetch.js` 无条件 `loadExtScript("ext:deno_telemetry/…")`（deno CLI 宿主才有
+   该扩展）——bootstrap 先垫 `internals.__telemetry{,Util}` no-op 桩，全部触点被
+   `TRACING_ENABLED` 门禁短路；
+2. `fetch` JS 依赖 `new URL`——`URL/URLSearchParams` 从 `deno_web/00_url.js` 拉;
+3. rustls 双 CryptoProvider（deno_tls 的 aws_lc_rs vs reqwest 系 ring）——装配时
+   显式 `install_default(aws_lc_rs)`，否则 `ClientConfig::builder()` panic。
+
+回归：`src/bridge/mod.rs` 的 `fetch_*` 4 用例（WHATWG 语义：真 Headers、TypeError
+文案、任意 token method 原样发出）与 `src/bridge/ws.rs` 的 `ws_client_tests`
+（`WebSocket` 全局挂载 + tokio-tungstenite 回环）。
