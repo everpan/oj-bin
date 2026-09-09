@@ -693,6 +693,83 @@ impl Bridge {
         })
     }
 
+    /// WS 会话建立：借出 runtime（不还池，交给 `WsSession` 持有）、注入连接期
+    /// driver——import ws.ts（default 导出钩子对象）→ 装 `__ws_hooks`/`__ws_call`
+    /// → 经 json.ok 回报钩子清单。四钩子全缺 → Err（一刀切契约：失败要显式）。
+    /// 钩子调用契约见 `WsSession::fire`；`__ws_call` 内建 try/catch → error() 兜底。
+    pub async fn ws_connect(&self, ws_file: &std::path::Path) -> Result<WsSession, RunError> {
+        let spec = module_loader::versioned_specifier(ws_file)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        let code = format!(
+            "const h = (await import(\"{spec}\")).default ?? {{}};\n\
+             const fns = {{}};\n\
+             for (const k of [\"connection\", \"message\", \"close\", \"error\"])\n\
+               fns[k] = typeof h[k] === \"function\" ? h[k] : null;\n\
+             globalThis.__ws_hooks = fns;\n\
+             globalThis.__ws_call = async (ev) => {{\n\
+               const fn = globalThis.__ws_hooks[ev];\n\
+               if (!fn) return;\n\
+               try {{ await fn(); }} catch (e) {{\n\
+                 const onErr = globalThis.__ws_hooks.error;\n\
+                 if (onErr && ev !== \"error\") await onErr(e); else throw e;\n\
+               }}\n\
+             }};\n\
+             json.ok({{ connection: !!fns.connection, message: !!fns.message,\n\
+                        close: !!fns.close, error: !!fns.error }});\n"
+        );
+        let driver_spec = deno_core::ModuleSpecifier::parse("file:///oj/ws_connect.js")
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
+        let mut rt = self
+            .checkout_armed(RequestInfo::default(), WS_CONNECT_TIMEOUT, None)
+            .await?;
+        // 顺序同 run_side_driver（0.410 签名）：mod_evaluate 先启动、驱动 event loop、
+        // 再 await 求值 future 取 TLA/import 错误。
+        let result: Result<(), CoreError> = async {
+            let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
+            let eval = rt.mod_evaluate(id);
+            rt.run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await?;
+            eval.await?;
+            Ok(())
+        }
+        .await;
+        if self.kill.disarm() {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Timeout); // runtime 丢弃（会话建立失败，无从交接）
+        }
+        if let Err(e) = result {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Core(e)); // 文件缺失/转译/求值错误原样带出
+        }
+        let cap = Self::read_capture(&rt);
+        Self::finalize_tx(&rt).await;
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
+        let d = &v["data"];
+        let has_hook = ["connection", "message", "close", "error"]
+            .iter()
+            .any(|k| d[k].as_bool() == Some(true));
+        if !has_hook {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Core(CoreError::from(std::io::Error::other(
+                format!(
+                    "ws handler '{}' must export at least one of \
+                     connection/message/close/error (via default export)",
+                    ws_file.display()
+                ),
+            ))));
+        }
+        Ok(WsSession {
+            rt,
+            kill: Arc::clone(&self.kill),
+        })
+    }
+
     /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
     /// KillSwitch/ReqState 复用 run_ws 的熔断与捕获路径；被熔断的 runtime 同样不归还池。
     pub async fn run_module(
@@ -824,12 +901,83 @@ impl Bridge {
 /// ponytail: 常量而非配置；真有 >2s 的合法顶层模块再加 server.introspect_timeout。
 pub const INTROSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// WS 会话连接阶段超时（模块加载 + 首次求值；与内省同量级）。
+pub const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// WS 帧执行结果：HTTP 捕获 + ws.send 集合 + ws.close 置位。
 #[derive(Debug, Default)]
 pub struct WsOutcome {
     pub capture: Capture,
     pub sends: Vec<String>,
     pub close: bool,
+}
+
+/// WS 驻留会话：每连接独占的 runtime（模块已加载、钩子已装配）。
+/// `!Send`：整条生命周期钉在 ws-js 线程的 current_thread runtime 上。
+/// **永不还池**——模块作用域持有连接状态，复用会串连接；连接结束直接 drop
+/// （fire 每次 drain event loop，正常路径 drop 前无悬挂句柄；超时毒化路径同
+/// run_ws：直接丢弃）。
+pub struct WsSession {
+    rt: JsRuntime,
+    kill: Arc<runtime::KillSwitch>,
+}
+
+// JsRuntime 非 Debug；测试 unwrap_err 需要 Debug（仅输出形态，不含 runtime 内部）。
+impl std::fmt::Debug for WsSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsSession").finish_non_exhaustive()
+    }
+}
+
+impl WsSession {
+    /// 触发一个生命周期事件（connection/message/close/error）：重置 per-event
+    /// 状态、武装看门狗、执行 `__ws_call(ev)`、收捕获。超时 → runtime 已被
+    /// terminate（毒化），返回 Timeout，调用方必须丢弃会话断连。
+    pub async fn fire(
+        &mut self,
+        ev: &str,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+    ) -> Result<WsOutcome, RunError> {
+        {
+            let op_state = runtime::op_state(&self.rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().reset(req);
+        }
+        let handle = self.rt.v8_isolate().thread_safe_handle();
+        self.kill.arm(handle, timeout);
+        // ev 为内部常量，仍走 JSON 字面量杜绝意外注入（同 run_module 的 method_lit）。
+        let ev_lit = serde_json::to_string(ev).unwrap_or_else(|_| "\"\"".into());
+        let result = match self
+            .rt
+            .execute_script("ws_event.js", format!("globalThis.__ws_call({ev_lit});"))
+        {
+            Ok(_) => {
+                self.rt
+                    .run_event_loop(deno_core::PollEventLoopOptions::default())
+                    .await
+            }
+            Err(e) => Err(CoreError::from(e)),
+        };
+        if self.kill.disarm() {
+            // 同 run_ws 超时路径：不 drain，runtime 丢弃。
+            return Err(RunError::Timeout);
+        }
+        result.map_err(RunError::Core)?;
+        let (sends, close) = {
+            let op_state = runtime::op_state(&self.rt);
+            let g = op_state.borrow();
+            let rs = g.borrow::<ReqState>();
+            (rs.ws_sends.clone(), rs.ws_close)
+        };
+        let capture = Bridge::read_capture(&self.rt);
+        Bridge::finalize_tx(&self.rt).await;
+        Ok(WsOutcome {
+            capture,
+            sends,
+            close,
+        })
+    }
 }
 
 /// handler 执行错误：区分超时熔断（408）与普通失败（500）。
@@ -2318,5 +2466,125 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["foo"], Value::Null, "{v}");
+    }
+
+    /// WsSession 构造桥（带模块加载器，ws 文件放临时目录）。
+    fn ws_session_bridge(root: &std::path::Path) -> Bridge {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.to_path_buf(),
+                ts: true,
+            })),
+            Extras::default(),
+        )
+    }
+
+    fn ws_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oj-wssess-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 生命周期：connection 恰好一次、message 每帧、close 收尾；模块作用域跨事件存活。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_session_lifecycle_hooks() {
+        let dir = ws_temp_dir("life");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"
+let n = 0;
+export default {
+  connection() { json.ok({ hello: 1 }); },
+  message() { n += 1; json.ok({ n }); },
+  close() { json.ok({ bye: n }); },
+};
+"#,
+        )
+        .unwrap();
+        let b = ws_session_bridge(&dir);
+        let mut sess = b.ws_connect(&ws_file).await.unwrap();
+        let o = sess
+            .fire(
+                "connection",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["hello"], 1);
+        for expect in [1, 2] {
+            let o = sess
+                .fire(
+                    "message",
+                    RequestInfo::default(),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
+            assert_eq!(v["data"]["n"], expect, "模块作用域跨事件存活");
+        }
+        let o = sess
+            .fire(
+                "close",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["bye"], 2);
+    }
+
+    /// 一刀切契约：无任何钩子导出 → ws_connect 报错（含指引文案）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_session_rejects_missing_hooks() {
+        let dir = ws_temp_dir("nohooks");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(&ws_file, "json.ok({});\n").unwrap();
+        let b = ws_session_bridge(&dir);
+        let e = b.ws_connect(&ws_file).await.unwrap_err();
+        assert!(
+            e.to_string().contains("connection/message/close/error"),
+            "{e}"
+        );
+    }
+
+    /// message 抛异常 → error(e) 接住 → fire 返回 Ok，连接不断；error 可用 ws.send 带出信息。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_session_error_hook_catches_frame_exception() {
+        let dir = ws_temp_dir("errhook");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"
+export default {
+  message() { throw new Error("boom"); },
+  error(e) { ws.send("err:" + e.message); },
+};
+"#,
+        )
+        .unwrap();
+        let b = ws_session_bridge(&dir);
+        let mut sess = b.ws_connect(&ws_file).await.unwrap();
+        let o = sess
+            .fire(
+                "message",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o.sends, vec!["err:boom".to_string()]);
+        assert!(
+            o.capture.body.is_empty(),
+            "返回值不自动包信封，异常也不产生信封"
+        );
     }
 }
