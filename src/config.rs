@@ -314,6 +314,28 @@ impl Default for TasksCfg {
     }
 }
 
+/// WS 运行时配置（spec 2026-09-09 帧池）。段缺省 = 全默认。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WsCfg {
+    /// 全局并发连接上限：超限 upgrade 直接 503；0 = 不限制。
+    pub max_connections: u64,
+    /// 每路由 Worker 数（无状态，可小于并发连接数）。
+    pub workers_per_route: usize,
+    /// 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役；调大吃暖启动收益）。
+    pub idle_linger_ms: u64,
+}
+
+impl Default for WsCfg {
+    fn default() -> Self {
+        Self {
+            max_connections: 1000,
+            workers_per_route: 2,
+            idle_linger_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -349,6 +371,9 @@ pub struct Config {
     /// 缺省段 = 默认值（dir "tasks"，目录不存在 = 无任务，不报错）。
     #[serde(default)]
     pub tasks: TasksCfg,
+    /// WS 运行时（spec 2026-09-09 帧池）：闸门 / Worker 数 / 空闲退役。
+    #[serde(default)]
+    pub ws: WsCfg,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }
@@ -405,6 +430,35 @@ mod tests {
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);
         assert_eq!(c.server.pool_size, 4);
         assert!(c.db.is_empty() && c.redis.is_empty());
+    }
+
+    #[test]
+    fn ws_section_defaults_and_override() {
+        let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
+        assert_eq!(
+            (
+                c.ws.max_connections,
+                c.ws.workers_per_route,
+                c.ws.idle_linger_ms
+            ),
+            (1000, 2, 0)
+        );
+        let dir = std::env::temp_dir().join(format!("oj-wscfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "ws:\n  max_connections: 5\n  workers_per_route: 3\n  idle_linger_ms: 60000\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert_eq!(
+            (
+                c.ws.max_connections,
+                c.ws.workers_per_route,
+                c.ws.idle_linger_ms
+            ),
+            (5, 3, 60000)
+        );
     }
 
     #[test]
