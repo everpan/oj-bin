@@ -2,6 +2,19 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.10（2026-09-09）
+
+**特性（breaking）**
+- WS 执行模型改「帧池」：每路由 W 个无状态 Worker（`ws.workers_per_route`，默认 2）从帧
+  队列拉帧执行——内存与连接数解耦（会话态 ≈2KB/连接 vs 独占 6.2MB），帧超时毒化半径
+  回归单连接。连接状态新增 `sess.state`（Rust 会话表持久，可 JSON 序列化）与 `sess.id`；
+  「模块作用域 = 连接状态」写法废弃（现为 Worker 本地只读缓存）。
+- 新增连接闸门 `ws.max_connections`（默认 1000，0=不限）：超限 upgrade 返 503。
+
+**实现**
+- bridge 新增 frame_pool（Scheduler per-conn 在飞=1 保序 / Worker 池 / 会话表 / 空池 linger
+  退役）；`op_ws_sess_set` + `ReqState.ws_sess` 回传会话态；每连接 ws-js 线程撤销。
+
 ## v0.1.9（2026-09-09）
 
 **特性（breaking）**
