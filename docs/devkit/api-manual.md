@@ -369,12 +369,38 @@ export default { get: detail };
 
 目录内放 `ws.ts`（dev）/ `ws.js`（release，约定同 `api.ts`）即产生一条 WebSocket 路由
 `GET {base}/{...path}/ws`：`src/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
-同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。连接升级后，**客户端每个文本帧执行一次本文件**
-（帧内 `json.ok` 正常回信封；摘自 `sample/src/news/ws.ts`）：
+同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。
+
+**契约（v0.1.9 起）**：default 导出生命周期钩子对象——模块每连接加载一次，钩子按事件触发：
 
 ```ts
-bus.subscribe("news");
-json.ok({ subscribed: true });
+export default {
+  connection() { /* 连接建立后恰好一次：bus.subscribe 在此 */ },
+  message()    { /* 每帧一次：http.body 读帧（JSON 自动 parse） */ },
+  error(e)     { /* 任一钩子抛异常时兜底，之后连接继续 */ },
+  close()      { /* 收尾恰好一次：客户端断 / socket 断 / ws.close() 三来源统一 */ },
+};
+```
+
+- 四钩子全部可选，但**至少导出一个**（全缺 → 连接建立即断）。
+- 钩子内用既有全局（`json`/`http`/`ws`/`bus`/…），与 HTTP handler 一致；**返回值一律忽略**，
+  回帧必须显式 `json.ok` / `ws.send`。
+- 模块作用域即连接状态（跨帧存活）；跨连接共享走 kv / bus。
+- 帧超时 = 必断连（钩子收不到该事件）；`error(e)` 是唯一带参钩子（e 为异常对象）。
+
+注意：客户端**主动断连**（先发 Close 帧）路径上，`close()` 钩子仍会触发（服务端副作用如
+kv 写入照常生效），但其 `ws.send` 离帧受 RFC 6455 关闭握手限制无法送达客户端——需要离帧
+可见时用服务端 `ws.close()` 收尾。
+
+运行案例（摘自 `sample/src/news/ws.ts`）：
+
+```ts
+export default {
+  connection() {
+    bus.subscribe("news");
+    json.ok({ subscribed: true });
+  },
+};
 ```
 
 注意：release 下 root=dist，WS URL 含模块版本段（如 `…/news-0.1.0/ws`）——v0.2 已知限制
@@ -387,28 +413,31 @@ json.ok({ subscribed: true });
 所有订阅者收广播：
 
 ```ts
-bus.subscribe("chat");   // 幂等（同通道去重），每帧重跑无害
-{
-  const frame = http.body;              // JSON 文本帧已自动 parse 成对象
-  if (frame && frame.text) {
-    bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
-    json.ok({ sent: true });
-  } else {
+// connection = 进房，订阅每连接一次；message = 每帧
+export default {
+  connection() {
+    bus.subscribe("chat");
     json.ok({ joined: true });
-  }
-}
+  },
+  message() {
+    const frame = http.body;              // JSON 文本帧已自动 parse 成对象
+    if (frame && frame.text) {
+      bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+      json.ok({ sent: true });
+    }
+  },
+};
 ```
 
 帧内发布特有的三条语义（系统学习见仓库 `docs/websocket.md`）：
 
 1. **自回声**：本连接若订阅了同一主题，会收到自己发布的广播帧（fan-out 不排除
    自己）——按 `from` 字段客户端过滤，或发布到别的 topic。
-2. **顶层不能 `await`**：帧代码经 `execute_script` 执行（经典 script，非 ESM）。
-   不 `await` 也照常广播（event loop 会把 op future 驱动完才捕获信封）；要拿
-   `publish` 返回的「本地接收方数」，用 async IIFE 包住 `await bus.publish(...)`
-   （kafka/rabbitmq broker 下该数恒 0）。
-3. **声明放进块作用域**：同一连接的帧跑在**同一个 VM** 里，顶层 `const`/`let`
-   第二帧重跑会因重复声明报 `SyntaxError`——示例外层那对 `{}` 是必须的。
+2. **钩子可直接 `await`**：钩子会被驱动至 Promise 落定才捕获回帧——要拿 `publish`
+   返回的「本地接收方数」，直接 `await bus.publish(...)`（kafka/rabbitmq broker 下
+   该数恒 0）。
+3. **模块作用域即连接状态**：模块每连接加载一次、按事件触发钩子，顶层 `const`/`let`
+   跨帧存活且不会重复声明（跨连接共享走 kv / bus）。
 
 ## 5. 导入解析
 
@@ -692,7 +721,7 @@ if (r.ok) {
 | `ws.send` | `send(data: string): void` | 向当前连接发一帧（HTTP 路径下 no-op） |
 | `ws.close` | `close(): void` | 结束当前连接 |
 
-仅在 `ws.ts` 帧循环内有意义（第 4 章）。
+仅在 `ws.ts` 钩子内有意义（第 4 章）。
 
 ### WebSocket —— 出站客户端（WHATWG，v0.1.7 起）
 
@@ -706,7 +735,7 @@ if (r.ok) {
 ```ts
 const ws = new WebSocket("ws://localhost:9778/v1/api/news/ws");
 await new Promise((ok, err) => { ws.onopen = ok; ws.onerror = err; });
-ws.send("{}");                                  // 首帧：服务端 ws.ts 执行 bus.subscribe("news")
+ws.send("{}");                                  // 连上即已订阅（connection 钩子）；此帧触发 message（无则 no-op）
 ws.onmessage = (e) => log.info("frame " + e.data);
 ```
 

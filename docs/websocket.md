@@ -5,7 +5,7 @@
 > §6 `ws`/`WebSocket`/`fetch` 行）；维护者模块地图是 [modules/03-server-http.md](modules/03-server-http.md) §5。
 > 可运行示例全程以 `sample/src/news/` 为锚。
 
-## 1. 心智模型：一个文件 = 一条 WS 路由 = 每帧执行一次
+## 1. 心智模型：一个文件 = 一条 WS 路由 = 生命周期钩子
 
 目录内放 **`ws.ts`**（dev 源码）或 **`ws.js`**（release 构建产物，`oj build` 自动生成），
 即产生一条 WebSocket 路由 `GET {base}/{...path}/ws`：
@@ -20,7 +20,7 @@ src/ws.ts        →  /v1/api/ws             （根级）
 | | `api.ts` | `ws.ts` |
 |---|---|---|
 | 触发 | HTTP 请求命中路由 | 连接升级后**客户端每个文本/二进制帧** |
-| 执行单元 | `default[method]()` 一个函数 | **整个文件**（顶层代码每帧重跑一遍） |
+| 执行单元 | `default[method]()` 一个函数 | `default` 导出的钩子（`connection` 一次 / `message` 每帧 / `close` 一次 / `error` 兜底） |
 | 回写 | `{code,msg,data}` 信封 HTTP 响应 | 信封文本帧 + `ws.send` 裸帧 |
 | 运行位置 | HTTP actor 池（`server.pool_size` 个 VM 排队复用） | **每连接独占一个 VM**（不进池，连接结束即弃） |
 
@@ -29,18 +29,22 @@ src/ws.ts        →  /v1/api/ws             （根级）
 
 ## 2. 写一个 handler：sample/news 逐行
 
-`sample/src/news/ws.ts` 全文只有两行：
+`sample/src/news/ws.ts` 的钩子主体：
 
 ```ts
-bus.subscribe("news");   // ① 订阅 "news" 主题（幂等，见下）
-json.ok({ subscribed: true });   // ② 回一帧标准信封 {"code":0,"data":{"subscribed":true}}
+export default {
+  connection() {
+    bus.subscribe("news");           // ① 订阅 "news" 主题（每连接恰好一次）
+    json.ok({ subscribed: true });   // ② 回一帧标准信封 {"code":0,"data":{"subscribed":true}}
+  },
+};
 ```
 
-- **① 每帧都会执行**，为什么不会重复订阅？——`Bus::subscribe`（`src/bridge/bus.rs:55`）
-  按发送端通道去重（`same_channel`）：同一连接的每帧携带的是同一个通道的克隆，
-  第二次起是 no-op。所以「顶层 subscribe」这个写法是安全的，不需要你自己记状态。
-- **②** 帧内 `json.ok`/`json.fail` 与 HTTP 语义一致：整段 `{code,msg,data}` 序列化成
-  **一个文本帧**写回。
+- **① 订阅挪进 `connection()`**：连接建立后恰好触发一次，天然不会重复订阅；
+  `Bus::subscribe`（`src/bridge/bus.rs:55`）按发送端通道去重（`same_channel`）的机制
+  保留——同主题二次订阅是 no-op，作为幂等保证。
+- **②** 钩子内 `json.ok`/`json.fail` 与 HTTP 语义一致：整段 `{code,msg,data}` 序列化成
+  **一个文本帧**写回（返回值一律忽略，回帧必须显式调用）。
 
 同一个目录的 `api.ts`（`POST /v1/api/news`）负责发布：
 
@@ -64,32 +68,37 @@ bus 后端可换（`local`/kafka/rabbitmq 插件），所以跨进程实例的 H
 
 两个执行期语义：
 
-- **单帧超时**：一帧卡死（如死循环）只熔断这一帧——该帧被丢弃、当帧的 VM 被丢弃，
-  **连接继续**（默认 30s，`oj/src/app.rs` 传给 `mirror_routes`）。
+- **单帧超时**：一个钩子卡死（如死循环）**必断连**——runtime 被 terminate 后已毒化、
+  丢弃，钩子收不到后续事件，连接被服务端关闭（默认 30s，`oj/src/app.rs` 传给
+  `mirror_routes`）。
 - **顺序契约**：写出顺序 = `ws.send` 按调用序 → 信封 → （后续广播帧）。广播帧与
   主动发送走同一条写出通道，天然保序（`server/src/ws.rs` Bus forwarder）。
 
 ### 帧内发布：`ws.ts` 里直接 `bus.publish`
 
 `bus.publish` 没有上下文限制（只有 `bus.subscribe` 限 WS 连接），所以帧处理器可以
-直接当「广播泵」用。可运行案例：`sample/src/news/chat/ws.ts`——聊天室，任意连接
-发帧，所有订阅者收广播：
+直接当「广播泵」用。可运行案例：`sample/src/news/chat/ws.ts`——聊天室，连上即进房
+（`connection()` 订阅，无需 join 帧），任意连接发帧，所有订阅者收广播：
 
 ```ts
-bus.subscribe("chat");   // 幂等（同通道去重），每帧重跑无害
-{
-  const frame = http.body;              // JSON 文本帧已自动 parse 成对象
-  if (frame && frame.text) {
-    bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
-    json.ok({ sent: true });
-  } else {
+// connection = 进房，订阅每连接一次；message = 每帧
+export default {
+  connection() {
+    bus.subscribe("chat");
     json.ok({ joined: true });
-  }
-}
+  },
+  message() {
+    const frame = http.body;              // JSON 文本帧已自动 parse 成对象
+    if (frame && frame.text) {
+      bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+      json.ok({ sent: true });
+    }
+  },
+};
 ```
 
 ```bash
-# 终端 1 / 2 各连一处，各发一帧 {"join":1}；任一终端再发 {"from":"neo","text":"hi"}
+# 终端 1 / 2 各连一处（连上即进房）；任一终端发 {"from":"neo","text":"hi"}
 websocat ws://localhost:9778/v1/api/news/chat/ws
 # → 两个终端都收到 {"topic":"chat","data":{"from":"neo","text":"hi"}}
 ```
@@ -98,12 +107,10 @@ websocat ws://localhost:9778/v1/api/news/chat/ws
 
 1. **自回声**：本连接若订阅了同一主题，会收到自己发布的广播帧（Bus fan-out 不排除
    自己）——按 `from` 字段客户端过滤，或发布到别的 topic。
-2. **顶层不能 `await`**：帧代码经 `execute_script` 执行（经典 script，非 ESM）。
-   不 await 也会照常广播（event loop 会把 op future 驱动完才捕获信封）；要拿
-   `publish` 返回的「本地接收方数」，用 async IIFE 包住 `await bus.publish(...)`
-   （kafka/rabbitmq 下该数恒 0）。
-3. **声明放进块作用域**：同一连接的帧跑在**同一个 VM** 里，顶层 `const`/`let`
-   第二帧重跑会因重复声明报 `SyntaxError`——示例外层那对 `{}` 是必须的。
+2. **钩子可直接 `await`**：钩子会被驱动至 Promise 落定才捕获回帧——要拿 `publish`
+   返回的「本地接收方数」，直接 `await bus.publish(...)`（kafka/rabbitmq 下该数恒 0）。
+3. **模块作用域即连接状态**：模块每连接加载一次、按事件触发钩子，顶层 `const`/`let`
+   跨帧存活且不会重复声明（跨连接共享走 kv / bus）。
 
 回归：`ws_frame_publish_broadcasts_to_subscribers`（§6）。
 
@@ -113,9 +120,8 @@ websocat ws://localhost:9778/v1/api/news/chat/ws
 # 终端 1：dev 模式启动（服务 src，按需转译）
 cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
 
-# 终端 2：连上并发任意一帧完成订阅（websocat 任选你顺手的客户端）
+# 终端 2：连上即完成订阅（connection() 钩子回报一帧信封；websocat 任选你顺手的客户端）
 websocat ws://localhost:9778/v1/api/news/ws
-# > hi
 # < {"code":0,"msg":"ok","data":{"subscribed":true}}
 
 # 终端 3：HTTP 发布（业务端点，需 Bearer + 租户头，token 获取见 sample/MODULES.md §④）
@@ -141,7 +147,7 @@ release 模式：先 `oj build`（`ws.ts` 随模块一起转译成 `dist/<mod>-<
 ```
 oj/src/app.rs            装配：mirror_routes(base, dir, timeout, make_bridge) merge 进 Router
 server/src/ws.rs         连接生命周期：upgrade → 钉线程 → 三任务流水线
-src/bridge/{mod,ws}.rs   帧执行：run_ws → ReqState 收集 → WsOutcome
+src/bridge/{mod,ws}.rs   帧执行：ws_connect → WsSession::fire（按事件）→ WsOutcome
 ```
 
 **挂载**（`server/src/ws.rs:46` `mirror_routes`）：递归扫 `ws.ts`（优先）/`ws.js`
@@ -162,9 +168,11 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 ```
 
 - **Reader**：文本/二进制帧 → `msgChan`；满了背压到 TCP 层（对端 send 变慢）。
-- **Processor**：每帧组一个 `RequestInfo { method: "WS", body: 帧字节, bus_tx }` 跑
-  `run_ws`；成功后把 `o.sends`（`ws.send` 收集）逐条、再把 `o.capture.body`（信封）
-  压进 `respChan`。`o.close` 置位则跳出循环。
+- **Processor**：升级后先 `sess.fire("connection", …)`，每帧组一个
+  `RequestInfo { method: "WS", body: 帧字节, bus_tx }` 触发 `message` 钩子（均经
+  `WsSession::fire`）；成功后把 `o.sends`（`ws.send` 收集）逐条、再把
+  `o.capture.body`（信封）压进 `respChan`。`o.close` 置位则跳出循环（断连前
+  `fire("close", …)` 收尾恰好一次）。
 - **Writer**：串行写回；`respChan` 排空后发 Close 帧。ping/pong 由 axum 自动处理。
 - **Bus forwarder**：把本连接订阅的广播帧转进同一条 `respChan`。连接结束时
   `forwarder.abort()` 收尾——否则 bus 订阅表里的发送端滞留，Writer 永不排空。
@@ -180,7 +188,7 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 |---|---|
 | handler 编译失败（文件缺失/语法错） | 发 Close 帧后结束连接，不 panic（`frame_loop` 开头） |
 | 单帧执行出错 | `eprintln` 记录，丢弃该帧，连接继续 |
-| 单帧超时 | 该帧 VM 被 terminate 后丢弃（不归还池），连接继续 |
+| 单帧超时 | runtime 被 terminate 后毒化丢弃（不归还池），**连接断开** |
 | 写出通道满（cap 64） | `try_send` 满则**丢弃该帧**（含 bus 广播帧），不阻塞不崩溃 |
 
 ## 5. 约定与红线
@@ -196,7 +204,7 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 
 ## 6. 测试
 
-`server/src/ws.rs` 的 7 个单测与本文件一一对应，改实现前先读、改完必跑
+`server/src/ws.rs` 的 11 个单测与本文件一一对应，改实现前先读、改完必跑
 （`cargo test -p server --lib ws`）：
 
 | 用例 | 教学点 |
@@ -208,7 +216,10 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 | `mirror_routes_root_ws` | 根级 `ws.ts` → `{base}/ws`（无双斜杠） |
 | `js_route_missing_handler_closes_quietly` | 编译失败 → 干净关闭 |
 | `ws_bus_subscribe_receives_http_publish` | `bus.subscribe` 幂等与广播帧形状 |
-| `ws_frame_publish_broadcasts_to_subscribers` | §2 帧内发布：帧内 `publish` 广播到他连 + 自回声 + 块作用域重跑安全 |
+| `ws_frame_publish_broadcasts_to_subscribers` | §2 帧内发布：帧内 `publish` 广播到他连 + 自回声 + 进房 = `connection` 钩子（无需 join 帧） |
+| `js_route_error_hook_keeps_connection_alive` | 契约：`error(e)` 兜底钩子异常，之后连接继续 |
+| `js_route_close_hook_fires_exactly_once` | 契约：`close()` 收尾恰好一次（客户端断 / `ws.close()` 统一） |
+| `js_route_no_hooks_disconnects` | 契约：全缺钩子 → 连接建立即断 |
 
 手测冒烟用 §3 的三条命令即可。
 
@@ -226,7 +237,7 @@ task 门禁）。
 |---|---|---|
 | 方向 | 客户端连 oj | oj 连别人 |
 | 入口 | 目录镜像路由 `GET {base}/…/ws` | `new WebSocket(url)` 全局 |
-| 每帧执行 | 整个 `ws.ts` 文件重跑 | 你的 `onmessage` 回调 |
+| 每帧执行 | 生命周期钩子（`message` 每帧） | 你的 `onmessage` 回调 |
 | 发帧 | `ws.send` / `json.ok`（收集制） | `socket.send(str)`（直发） |
 | VM | 每连接独占一个 | 跑在所在 handler/任务的 VM 里 |
 
@@ -253,7 +264,7 @@ const opened = new Promise<void>((ok, err) => { ws.onopen = ok; ws.onerror = err
 ws.onmessage = (e) => { frames.push(String(e.data)); wake?.(); wake = null; };
 ws.onclose = () => { closed = "ws closed"; wake?.(); wake = null; };
 await opened;
-ws.send("{}");                    // 首帧：服务端 ws.ts 执行 bus.subscribe("news")
+ws.send("{}");                    // 连上即已订阅（connection 钩子）；此帧触发 message（无则 no-op）
 while (!tasks.stopping()) {
   if (closed) throw new Error(closed);   // 断连 → Crashed → 监督器重启 → 新实例重连
   if (frames.length) { log.info("ws frame " + frames.shift()); continue; }
