@@ -595,12 +595,17 @@ impl App {
             blob: blob.clone(),
         };
         // WS 目录镜像挂载（<dir>/ws.ts → {base}/<dir>/ws）。
+        let ws_opts = server::ws::WsOptions {
+            max_connections: cfg.ws.max_connections,
+            workers_per_route: cfg.ws.workers_per_route,
+            idle_linger_ms: cfg.ws.idle_linger_ms,
+        };
         let ws_router = ws::mirror_routes(
             &base,
             &dir,
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
-            0, // 闸门接线在池化装配（v0.1.10 Task 6）落 config ws.max_connections
+            ws_opts,
         );
         let router = server::app(
             &base,

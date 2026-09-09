@@ -1,9 +1,10 @@
-//! WebSocket 层（P5a echo + P5b JS 帧循环）。
+//! WebSocket 层（P5a echo + P5b JS 帧循环，v0.1.10 帧池化）。
 //!
-//! Go 模式：WS 路由注册在 catch-all 之前；每连接独占 VM（不进 HTTP 池）；
-//! Reader/Processor/Writer 三任务流水线，msgChan/respChan 各 cap 64（背压保护）。
-//! Rust 的硬约束：`JsRuntime` !Send → 整条帧循环钉在专用线程的 current_thread runtime 上，
-//! axum 侧只完成 upgrade 后把 socket 整体移交（WebSocket: Send 可跨线程搬）。
+//! Go 模式：WS 路由注册在 catch-all 之前；Reader/Processor/Writer 三任务流水线，
+//! msgChan/respChan 各 cap 64（背压保护）。JS 帧经 RoutePool 调度（per-conn 串行
+//! 保序、W 个无状态 worker、毒化半径 = 1）——`JsRuntime` !Send 的约束沉到池的
+//! worker 线程（current_thread runtime），连接侧 frame_loop 全 Send 跑在 axum
+//! runtime 上，不再每连接起专用线程。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,8 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
-use only_js::bridge::{Bridge, RequestInfo, RunError, WsOutcome};
+use only_js::bridge::frame_pool::{FrameError, RoutePool};
+use only_js::bridge::{Bridge, WsOutcome};
 
 /// 全局 WS 并发连接闸门（config ws.max_connections；0 = 不限）。
 static WS_LIVE: AtomicU64 = AtomicU64::new(0);
@@ -34,34 +36,65 @@ fn gate_enter(max: u64) -> bool {
     }
 }
 
+/// 闸门计数守卫：连接无论正常收尾、panic 还是被取消（任务被 drop，如测试
+/// runtime 关停），结束时都递减 WS_LIVE——与 gate_enter 1:1 配对，不漏减。
+struct GateGuard;
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        WS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// WS 装配选项（来自 config ws 段；server 不依赖 config crate）。
+#[derive(Clone, Copy)]
+pub struct WsOptions {
+    /// 全局并发连接上限：超限 upgrade 直接 503；0 = 不限。
+    pub max_connections: u64,
+    /// 每路由 Worker 数（无状态，可小于并发连接数）。
+    pub workers_per_route: usize,
+    /// 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役）。
+    pub idle_linger_ms: u64,
+}
+
+impl Default for WsOptions {
+    fn default() -> Self {
+        Self {
+            max_connections: 1000,
+            workers_per_route: 2,
+            idle_linger_ms: 0,
+        }
+    }
+}
+
 /// 挂载最小 echo 路由（GET /ws）——P5a 链路验证用。
 pub fn echo_route() -> axum::Router {
     axum::Router::new().route("/ws", axum::routing::get(upgrade))
 }
 
-/// 挂载 JS handler 驻留会话路由：connection/message/close 按事件执行 handler_file，
-/// json.ok 信封与 ws.send 逐事件写回；timeout 为单事件熔断（超时必断连）；
-/// max_conns 为该路由的并发连接上限（0 = 不限），超限 upgrade 直接 503。
+/// 挂载 JS handler 驻留会话路由：connection/message/close 逐帧经 pool 调度
+/// （per-conn 串行保序），json.ok 信封与 ws.send 逐事件写回；
+/// timeout 为单事件熔断（池内看门狗，超时必断连）；
+/// opts.max_connections 为全局并发连接上限（0 = 不限），超限 upgrade 直接 503。
 pub fn js_route(
     path: &str,
-    handler_file: impl Into<PathBuf>,
     timeout: std::time::Duration,
-    make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
-    max_conns: u64,
+    pool: Arc<RoutePool>,
+    opts: WsOptions,
 ) -> axum::Router {
-    let file = handler_file.into();
-    let make = Arc::new(make_bridge);
     axum::Router::new().route(
         path,
         axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
-            let file = file.clone();
-            let make = make.clone();
+            let pool = pool.clone();
             async move {
-                if !gate_enter(max_conns) {
+                if !gate_enter(opts.max_connections) {
                     return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
                 // on_upgrade 在本 axum 版本直接返回 Response（非 future），故无 .await。
-                ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make))
+                ws.on_upgrade(move |socket| async move {
+                    // 连接真实结束（正常收尾/panic/任务取消）才递减闸门计数。
+                    let _gate = GateGuard;
+                    frame_loop(socket, pool, timeout).await;
+                })
             }
         }),
     )
@@ -75,7 +108,7 @@ pub fn mirror_routes(
     root: &Path,
     timeout: std::time::Duration,
     make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
-    max_conns: u64,
+    opts: WsOptions,
 ) -> axum::Router {
     let make = Arc::new(make_bridge);
     let base = format!("/{}/", base.trim_matches('/'));
@@ -96,8 +129,15 @@ pub fn mirror_routes(
         if !seen.insert(path.clone()) {
             continue; // 同目录 ws.ts 与 ws.js 并存：先到者（.ts）胜
         }
-        let m = make.clone();
-        router = router.merge(js_route(&path, file, timeout, move || m(), max_conns));
+        // 每路由一池：worker 数与空池保活来自 ws 配置段。
+        let pool = RoutePool::new(
+            file,
+            make.clone(),
+            timeout,
+            opts.workers_per_route,
+            opts.idle_linger_ms,
+        );
+        router = router.merge(js_route(&path, timeout, pool, opts));
     }
     router
 }
@@ -144,28 +184,6 @@ async fn upgrade(ws: axum::extract::WebSocketUpgrade) -> Response {
     ws.on_upgrade(echo_on_pinned)
 }
 
-/// JS 帧循环连接处理：搬到专用线程后跑三任务流水线。
-async fn conn_on_pinned(
-    socket: WebSocket,
-    handler_file: PathBuf,
-    timeout: std::time::Duration,
-    make: Arc<dyn Fn() -> Bridge + Send + Sync>,
-) {
-    std::thread::Builder::new()
-        .name("ws-js".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("ws-js runtime init");
-            rt.block_on(frame_loop(socket, handler_file, timeout, make));
-            // 连接真实结束才递减闸门计数（与 js_route 的 gate_enter 1:1 配对；
-            // conn_on_pinned 本体 spawn 后即返回，不能在这里递减）。
-            WS_LIVE.fetch_sub(1, Ordering::Relaxed);
-        })
-        .expect("spawn ws-js thread");
-}
-
 /// 事件结果写出：ws.send 集合先于信封帧（顺序契约，原 run_ws 消费端逐行等价）。
 fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
     for s in o.sends {
@@ -176,35 +194,19 @@ fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
     }
 }
 
-/// 三任务流水线：
-/// Reader(stream→msgChan) / Processor(串行 JS) / Writer(respChan→sink)，chan 各 cap 64。
-/// 读 handler 失败（文件缺失等）→ 直接结束（连接关闭，不 panic）。
-async fn frame_loop(
-    socket: WebSocket,
-    handler_file: PathBuf,
-    timeout: std::time::Duration,
-    make: Arc<dyn Fn() -> Bridge + Send + Sync>,
-) {
+/// 帧池连接循环（全 Send，跑在 axum runtime 上）：
+/// Reader(stream→msgChan) / Writer(respChan→sink) / Bus forwarder 三任务与 v0.1.9
+/// 逐字相同；事件循环把 connection/message/close 逐帧投给 pool（per-conn 串行、
+/// 会话状态由池的 Rust 会话表持有，worker 无状态可换人）。语义：
+/// Timeout = 必断连（V8 已 terminate，worker 弃会话）；Core = 丢帧继续；
+/// PoolClosed = 干净断连；客户端 Close/socket 断 = 正常收尾。
+/// 所有退出路径都先 detach（删会话条目 + 丢排队帧 + 空池退役计时）再收尾写出。
+async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>, _timeout: std::time::Duration) {
     let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
-    // bus 会话端：订阅注册用的发送端注入每事件 RequestInfo；收到的广播帧转写回 socket。
+    // bus 会话端：发送端经 attach 存入池会话表（worker publish 用）；收到的广播帧转写回 socket。
     let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<String>();
 
-    // Processor 前置：驻留会话按事件触发——connection（升级后恰好一次）→
-    // message（每帧）→ close（收尾恰好一次）。会话 runtime 永不还池，
-    // 连接结束随会话 drop（每连接独占 VM，与 Go 模式一致）。
-    // connect 失败（文件缺失/转译错/无钩子）→ 直接结束（连接关闭，不 panic）。
-    let bridge = make();
-    let mut sess = match bridge.ws_connect(&handler_file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ws connect {}: {e}", handler_file.display());
-            // 先发 Close 帧再丢弃，避免未读数据触发 TCP RST（客户端拿到干净关闭）。
-            let mut socket = socket;
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    };
     let (mut sink, mut stream) = socket.split();
 
     // Reader：读帧 → msgChan（满则背压至 TCP 层）。
@@ -222,16 +224,6 @@ async fn frame_loop(
         }
     });
 
-    // Writer：respChan → 串行写回；通道排空（连接结束）后发 Close 帧干净关闭。
-    let writer = tokio::spawn(async move {
-        while let Some(text) = resp_rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                return;
-            }
-        }
-        let _ = sink.send(Message::Close(None)).await;
-    });
-
     // Bus forwarder：订阅的广播帧 → 同一写出通道（与 ws.send 天然保序）。
     // 连接结束由 frame_loop abort 收尾——bus_tx 会滞留 Bus 表，不 abort 则 Writer 永不排空。
     let forwarder = tokio::spawn({
@@ -243,24 +235,38 @@ async fn frame_loop(
         }
     });
 
-    let mk_req = |body: Vec<u8>| RequestInfo {
-        method: "WS".into(),
-        body,
-        bus_tx: Some(bus_tx.clone()),
-        ..Default::default()
-    };
-    // 超时毒化后 runtime 已死：跳过后续一切 fire（含 close）。
+    // 预载失败（文件缺失/无钩子）已锁存 → attach 后 fire 恒 PoolClosed。
+    let handle = pool.attach(bus_tx);
+    // 超时毒化后该连接的会话已随 worker 丢弃：跳过后续一切 fire（含 close）。
     let mut alive = true;
-    match sess.fire("connection", mk_req(Vec::new()), timeout).await {
+    match handle.fire("connection", Vec::new()).await {
         Ok(o) => emit(&resp_tx, o),
-        Err(RunError::Timeout) => alive = false,
-        Err(e) => eprintln!("ws connection {}: {e}", handler_file.display()),
+        Err(FrameError::Timeout) => alive = false,
+        // 预载失败 → 干净断连（先发 Close 帧再丢弃，避免未读数据触发 TCP RST）。
+        Err(FrameError::PoolClosed) => {
+            let _ = sink.send(Message::Close(None)).await;
+            handle.detach();
+            return;
+        }
+        Err(e) => eprintln!("ws connection: {e:?}"),
     }
+
+    // Writer：respChan → 串行写回；通道排空（连接结束）后发 Close 帧干净关闭。
+    // （置后启动：PoolClosed 断连路径要在 sink 被 writer 接走前直发 Close。）
+    let writer = tokio::spawn(async move {
+        while let Some(text) = resp_rx.recv().await {
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+
     while alive {
         let Some(msg) = msg_rx.recv().await else {
             break; // 客户端 Close / socket 断
         };
-        match sess.fire("message", mk_req(msg), timeout).await {
+        match handle.fire("message", msg).await {
             Ok(o) => {
                 let closing = o.close;
                 emit(&resp_tx, o);
@@ -268,23 +274,29 @@ async fn frame_loop(
                     break;
                 }
             }
-            // 帧超时 = 必断连（V8 已 terminate，error() 救不了毒化的 VM）。
-            Err(RunError::Timeout) => {
-                eprintln!("ws frame timeout: {}", handler_file.display());
+            // 帧超时 = 必断连（V8 已 terminate，worker 已弃会话）。
+            Err(FrameError::Timeout) => {
+                eprintln!("ws frame timeout");
+                alive = false;
+                break;
+            }
+            // 池退役/预载失败锁存 → 干净断连。
+            Err(FrameError::PoolClosed) => {
                 alive = false;
                 break;
             }
             // error() 缺失或自身抛：丢帧继续（与「error 后连接继续」决策一致）。
-            Err(e) => eprintln!("ws frame error: {e}"),
+            Err(e) => eprintln!("ws frame error: {e:?}"),
         }
     }
     if alive {
         // close 恰好一次，尽力而为：钩子可 ws.send 离帧，失败只记日志。
-        match sess.fire("close", mk_req(Vec::new()), timeout).await {
+        match handle.fire("close", Vec::new()).await {
             Ok(o) => emit(&resp_tx, o),
-            Err(e) => eprintln!("ws close {}: {e}", handler_file.display()),
+            Err(e) => eprintln!("ws close: {e:?}"),
         }
     }
+    handle.detach(); // 所有退出路径汇合：删会话条目 + 丢排队帧 + 空池退役计时
     drop(resp_tx); // Writer 排空后自然退出
     forwarder.abort(); // 释放 bus_rx 与 resp_tx 克隆，Writer 才能排空退出
     let _ = writer.await;
@@ -350,6 +362,14 @@ mod tests {
         addr
     }
 
+    /// WS_LIVE 是进程级计数：ws e2e 用例并行跑时，彼些的在途连接会抬高读数
+    /// （gate 用例对「第 1 条连接须成功」最敏感）。凡起 WS 连接的用例先持此锁
+    /// 串行化，隔离进程级状态（单线程 runtime 各占一线程，无跨 await 死锁）。
+    fn ws_e2e_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// ws_connect 走 ESM import：bridge 必须带模块加载器（project_root 指向临时目录）。
     fn make_bridge(root: std::path::PathBuf) -> Bridge {
         use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
@@ -367,6 +387,19 @@ mod tests {
         )
     }
 
+    /// 测试用路由池：make_bridge 工厂（project_root = handler 所在目录）+
+    /// WsOptions::default 的 worker/linger。文件缺失用例传不存在的路径同样适用。
+    fn test_pool(file: &Path, timeout: std::time::Duration) -> Arc<RoutePool> {
+        let root = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        RoutePool::new(
+            file.to_path_buf(),
+            Arc::new(move || make_bridge(root.clone())),
+            timeout,
+            WsOptions::default().workers_per_route,
+            WsOptions::default().idle_linger_ms,
+        )
+    }
+
     async fn raw_http(addr: std::net::SocketAddr, req: &str) -> String {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(req.as_bytes()).await.unwrap();
@@ -379,6 +412,7 @@ mod tests {
     /// actor 与 ws make_bridge 共享同一 Bus（Extras.bus）——publish 广播到订阅的 WS 连接。
     #[tokio::test]
     async fn ws_bus_subscribe_receives_http_publish() {
+        let _e2e = ws_e2e_lock();
         use crate::actor::JsActor;
         use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
@@ -450,10 +484,15 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/bus",
-                handler,
                 std::time::Duration::from_secs(1),
-                make_bridge,
-                0,
+                RoutePool::new(
+                    handler,
+                    Arc::new(make_bridge),
+                    std::time::Duration::from_secs(1),
+                    WsOptions::default().workers_per_route,
+                    WsOptions::default().idle_linger_ms,
+                ),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -478,6 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn ws_echo_roundtrip_on_pinned_thread() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let addr = spawn(
             app(
@@ -504,6 +544,7 @@ mod tests {
     /// 移植 Go TestWSHandle_Connection_Simple：发帧 → JS 处理 → 信封回写。
     #[tokio::test]
     async fn js_route_runs_handler_per_frame() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -527,13 +568,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/js",
-                handler.clone(),
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -553,6 +590,7 @@ mod tests {
     /// 闸门：max=1 时第 2 条连接被拒（503），存量连接不受影响；max=0 不限。
     #[tokio::test]
     async fn gate_rejects_over_limit_with_503() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -576,13 +614,12 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/gate",
-                handler,
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions {
+                    max_connections: 1,
+                    ..WsOptions::default()
                 },
-                1,
             )),
         )
         .await;
@@ -608,6 +645,7 @@ mod tests {
     /// ws.send 先于信封写出、ws.close 结束连接（顺序契约）。
     #[tokio::test]
     async fn js_route_ws_send_order_and_close() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -631,13 +669,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/close",
-                handler,
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -662,6 +696,7 @@ mod tests {
     /// ws.ts 经统一转译管线（类型标注可用）。
     #[tokio::test]
     async fn mirror_routes_mount_directory_ws() {
+        let _e2e = ws_e2e_lock();
         use crate::actor::JsActor;
         use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
@@ -715,7 +750,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
-                0,
+                WsOptions::default(),
             )),
         )
         .await;
@@ -740,6 +775,7 @@ mod tests {
     /// 根级 ws.ts → GET {base}/ws（rel 为空时不得拼出 {base}//ws 双斜杠路径）。
     #[tokio::test]
     async fn mirror_routes_root_ws() {
+        let _e2e = ws_e2e_lock();
         use crate::actor::JsActor;
         use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
@@ -780,7 +816,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
-                0,
+                WsOptions::default(),
             )),
         )
         .await;
@@ -795,6 +831,7 @@ mod tests {
     /// 移植 Go TestWSHandle_Connection_MissingFile：handler 文件缺失不 panic，连接直接关闭。
     #[tokio::test]
     async fn js_route_missing_handler_closes_quietly() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let addr = spawn(
             app(
@@ -812,13 +849,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/missing",
-                t.0.join("nope.js"),
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&t.0.join("nope.js"), std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -854,6 +887,7 @@ mod tests {
     /// 3) http.body 对 JSON 文本帧自动 parse 成对象。
     #[tokio::test]
     async fn ws_frame_publish_broadcasts_to_subscribers() {
+        let _e2e = ws_e2e_lock();
         use crate::actor::JsActor;
         use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
@@ -916,7 +950,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
-                0,
+                WsOptions::default(),
             )),
         )
         .await;
@@ -955,6 +989,7 @@ mod tests {
     /// error() 兜底后连接继续：message 抛异常 → error(e) 经 ws.send 带出 → 下一帧仍正常处理。
     #[tokio::test]
     async fn js_route_error_hook_keeps_connection_alive() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -984,13 +1019,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/err",
-                handler,
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -1008,6 +1039,7 @@ mod tests {
     /// （服务端仍恰好 fire 一次 close，仅输出不可见）；故以三来源统一的 ws.close() 钉钩子。
     #[tokio::test]
     async fn js_route_close_hook_fires_exactly_once() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -1031,13 +1063,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/bye",
-                handler,
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -1053,6 +1081,7 @@ mod tests {
     /// 一刀切契约：无任何钩子导出 → 连接建立即断（Close 帧 / EOF），不静默空转。
     #[tokio::test]
     async fn js_route_no_hooks_disconnects() {
+        let _e2e = ws_e2e_lock();
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(&handler, r#"json.ok({});"#).unwrap(); // 无 default 导出
@@ -1072,13 +1101,9 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/nohooks",
-                handler,
                 std::time::Duration::from_secs(1),
-                {
-                    let root = t.0.clone();
-                    move || make_bridge(root.clone())
-                },
-                0,
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
             )),
         )
         .await;
@@ -1100,5 +1125,122 @@ mod tests {
             ),
         };
         assert!(clean, "expected close or reset, got {res:?}");
+    }
+
+    /// 帧池毒化半径 = 1（e2e）：连接 A 死循环帧 300ms 看门狗超时 → A 必断连；
+    /// 连接 B 照常收发（同池其他 worker/补员接帧，每连接独立 ConnHandle）。
+    #[tokio::test]
+    async fn frame_pool_timeout_isolates_connections() {
+        let _e2e = ws_e2e_lock();
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default {
+  message() {
+    if (http.body.boom) { const t = Date.now(); while (Date.now() - t < 60_000) {} }
+    json.ok({ ok: 1 });
+  },
+};"#,
+        )
+        .unwrap();
+        let timeout = std::time::Duration::from_millis(300);
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/iso",
+                timeout,
+                test_pool(&handler, timeout),
+                WsOptions::default(),
+            )),
+        )
+        .await;
+        let mut a = WsClient::connect(addr, "/ws/iso").await;
+        let mut b = WsClient::connect(addr, "/ws/iso").await;
+        // A：毒帧 → 300ms 超时断连（Close/EOF/RST 族，判定同 missing-file 用例）。
+        a.send_text(r#"{"boom":true}"#).await;
+        let mut buf = [0u8; 64];
+        let res = a.0.read(&mut buf).await;
+        let clean = match &res {
+            Ok(0) => true,
+            Ok(_n) => buf[0] == 0x88,
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+        };
+        assert!(clean, "expected poisoned conn to close, got {res:?}");
+        // B：毒化只波及执行它的 worker，B 照常收发。
+        b.send_text(r#"{"boom":false}"#).await;
+        let v: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+        assert_eq!(v["data"]["ok"], 1, "{v}");
+    }
+
+    /// 同连接保序（帧池 per-conn 串行调度钉）：三帧连发，回帧序必须 = 1,2,3。
+    /// handler 忙等 30ms 制造重叠窗口——若调度不按连接串行，后帧会在前帧写回
+    /// 会话状态前克隆到旧 state，断言即崩。注：本 runtime 无 timer 全局
+    /// （setTimeout 不可用），以 Date.now 忙等代替 brief 草图中的 await sleep。
+    #[tokio::test]
+    async fn frame_pool_preserves_per_connection_order() {
+        let _e2e = ws_e2e_lock();
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default {
+  message() {
+    const t = Date.now(); while (Date.now() - t < 30) {}
+    sess.state.n = (sess.state.n ?? 0) + 1;
+    json.ok({ n: sess.state.n });
+  },
+};"#,
+        )
+        .unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/order",
+                timeout,
+                test_pool(&handler, timeout),
+                WsOptions::default(),
+            )),
+        )
+        .await;
+        let mut c = WsClient::connect(addr, "/ws/order").await;
+        for _ in 0..3 {
+            c.send_text("go").await;
+        }
+        for expect in [1, 2, 3] {
+            let v: serde_json::Value = serde_json::from_str(&c.read_text().await).unwrap();
+            assert_eq!(v["data"]["n"], expect, "同连接回帧必须保序: {v}");
+        }
     }
 }
