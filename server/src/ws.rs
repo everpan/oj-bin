@@ -858,4 +858,151 @@ mod tests {
     async fn c_frame(c: &mut WsClient) -> serde_json::Value {
         serde_json::from_str(&c.read_text().await).unwrap()
     }
+
+    /// error() 兜底后连接继续：message 抛异常 → error(e) 经 ws.send 带出 → 下一帧仍正常处理。
+    #[tokio::test]
+    async fn js_route_error_hook_keeps_connection_alive() {
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default {
+  message() {
+    if (http.body.bad) throw new Error("boom");
+    json.ok({ ok: 1 });
+  },
+  error(e) { ws.send("err:" + e.message); },
+};"#,
+        )
+        .unwrap();
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/err",
+                handler,
+                std::time::Duration::from_secs(1),
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
+            )),
+        )
+        .await;
+        let mut c = WsClient::connect(addr, "/ws/err").await;
+        c.send_text(r#"{"bad":true}"#).await;
+        assert_eq!(c.read_text().await, "err:boom"); // 异常帧：error 兜底，无信封
+        c.send_text(r#"{"bad":false}"#).await;
+        let resp = c.read_text().await; // 连接继续：下一帧正常回信封
+        assert!(resp.contains("\"ok\":1"), "{resp}");
+    }
+
+    /// close 钩子恰好一次：ws.close() 触发收尾 → close() 执行、ws.send 离帧先于 Close 写出。
+    /// 注：不用客户端断连（Close 帧 / FIN）观察钩子离帧——axum/tungstenite 一旦收到对端
+    /// 关闭信号即拒绝一切出站数据帧（SendAfterClosing），close 钩子的离帧无法上线
+    /// （服务端仍恰好 fire 一次 close，仅输出不可见）；故以三来源统一的 ws.close() 钉钩子。
+    #[tokio::test]
+    async fn js_route_close_hook_fires_exactly_once() {
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default { message() { ws.close(); }, close() { ws.send("bye"); } };"#,
+        )
+        .unwrap();
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/bye",
+                handler,
+                std::time::Duration::from_secs(1),
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
+            )),
+        )
+        .await;
+        let mut c = WsClient::connect(addr, "/ws/bye").await;
+        c.send_text("go").await;
+        assert_eq!(c.read_text().await, "bye"); // close 钩子的离帧（恰好一条）
+        // 随后 Close 帧或 EOF（Writer 收尾），不 panic。
+        let mut buf = [0u8; 8];
+        let n = c.0.read(&mut buf).await.unwrap_or(0);
+        assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes");
+    }
+
+    /// 一刀切契约：无任何钩子导出 → 连接建立即断（Close 帧 / EOF），不静默空转。
+    #[tokio::test]
+    async fn js_route_no_hooks_disconnects() {
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(&handler, r#"json.ok({});"#).unwrap(); // 无 default 导出
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/nohooks",
+                handler,
+                std::time::Duration::from_secs(1),
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
+            )),
+        )
+        .await;
+        let mut c = WsClient::connect(addr, "/ws/nohooks").await;
+        c.send_text("any").await;
+        // ws_connect 失败 → 服务端发 Close 帧后关连接；传输层终止类错误同样算干净断连
+        // （Windows RST 语义，断言同 js_route_missing_handler_closes_quietly）。
+        let mut buf = [0u8; 64];
+        let res = c.0.read(&mut buf).await;
+        let clean = match &res {
+            Ok(0) => true,
+            Ok(_n) => buf[0] == 0x88,
+            Err(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+        };
+        assert!(clean, "expected close or reset, got {res:?}");
+    }
 }
