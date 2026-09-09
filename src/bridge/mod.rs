@@ -2587,4 +2587,52 @@ export default {
             "返回值不自动包信封，异常也不产生信封"
         );
     }
+
+    /// error 钩子缺失时帧异常重抛：fire 返回 Err（deno_core 终止/恢复路径），
+    /// 会话仍可用——下一帧正常处理（契约「丢帧继续」的 bridge 侧钉）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_session_uncaught_frame_error_keeps_session_usable() {
+        let dir = ws_temp_dir("norer");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"
+export default {
+  message() {
+    if (http.body.boom) throw new Error("boom-norer");
+    json.ok({ ok: 1 });
+  },
+};
+"#,
+        )
+        .unwrap();
+        let b = ws_session_bridge(&dir);
+        let mut sess = b.ws_connect(&ws_file).await.unwrap();
+        let e = sess
+            .fire(
+                "message",
+                RequestInfo {
+                    body: br#"{"boom":true}"#.to_vec(),
+                    ..Default::default()
+                },
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(!e.to_string().is_empty(), "重抛的异常经 RunError 带出: {e}");
+        // 会话未被毒化：下一帧照常回信封（连接继续契约的根基）。
+        let o = sess
+            .fire(
+                "message",
+                RequestInfo {
+                    body: br#"{"boom":false}"#.to_vec(),
+                    ..Default::default()
+                },
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["ok"], 1);
+    }
 }
