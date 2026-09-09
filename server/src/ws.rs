@@ -13,15 +13,15 @@ use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
-use only_js::bridge::{Bridge, RequestInfo};
+use only_js::bridge::{Bridge, RequestInfo, RunError, WsOutcome};
 
 /// 挂载最小 echo 路由（GET /ws）——P5a 链路验证用。
 pub fn echo_route() -> axum::Router {
     axum::Router::new().route("/ws", axum::routing::get(upgrade))
 }
 
-/// 挂载 JS handler 帧循环路由：每帧执行 handler_file，
-/// json.ok 信封与 ws.send 逐帧写回；timeout 为单帧熔断（超时丢弃该帧，连接继续）。
+/// 挂载 JS handler 驻留会话路由：connection/message/close 按事件执行 handler_file，
+/// json.ok 信封与 ws.send 逐事件写回；timeout 为单事件熔断（超时必断连）。
 pub fn js_route(
     path: &str,
     handler_file: impl Into<PathBuf>,
@@ -135,6 +135,16 @@ async fn conn_on_pinned(
         .expect("spawn ws-js thread");
 }
 
+/// 事件结果写出：ws.send 集合先于信封帧（顺序契约，原 run_ws 消费端逐行等价）。
+fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
+    for s in o.sends {
+        let _ = resp_tx.try_send(s); // 满则丢弃
+    }
+    if !o.capture.body.is_empty() {
+        let _ = resp_tx.try_send(String::from_utf8_lossy(&o.capture.body).into_owned());
+    }
+}
+
 /// 三任务流水线：
 /// Reader(stream→msgChan) / Processor(串行 JS) / Writer(respChan→sink)，chan 各 cap 64。
 /// 读 handler 失败（文件缺失等）→ 直接结束（连接关闭，不 panic）。
@@ -144,21 +154,26 @@ async fn frame_loop(
     timeout: std::time::Duration,
     make: Arc<dyn Fn() -> Bridge + Send + Sync>,
 ) {
-    // 统一转译管线：ws.ts 类型标注可用（.js 原样），mtime 缓存与模块加载共享。
-    let source = match only_js::bridge::transpile::cached_transpile(&handler_file) {
+    let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
+    // bus 会话端：订阅注册用的发送端注入每事件 RequestInfo；收到的广播帧转写回 socket。
+    let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<String>();
+
+    // Processor 前置：驻留会话按事件触发——connection（升级后恰好一次）→
+    // message（每帧）→ close（收尾恰好一次）。会话 runtime 永不还池，
+    // 连接结束随会话 drop（每连接独占 VM，与 Go 模式一致）。
+    // connect 失败（文件缺失/转译错/无钩子）→ 直接结束（连接关闭，不 panic）。
+    let bridge = make();
+    let mut sess = match bridge.ws_connect(&handler_file).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ws compile {}: {e}", handler_file.display());
+            eprintln!("ws connect {}: {e}", handler_file.display());
             // 先发 Close 帧再丢弃，避免未读数据触发 TCP RST（客户端拿到干净关闭）。
             let mut socket = socket;
             let _ = socket.send(Message::Close(None)).await;
             return;
         }
     };
-    let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
-    // bus 会话端：订阅注册用的发送端注入每帧 RequestInfo；收到的广播帧转写回 socket。
-    let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<String>();
     let (mut sink, mut stream) = socket.split();
 
     // Reader：读帧 → msgChan（满则背压至 TCP 层）。
@@ -197,28 +212,46 @@ async fn frame_loop(
         }
     });
 
-    // Processor：串行执行 JS（当前任务），每帧独立 ReqState，超时/出错丢弃该帧继续。
-    let bridge = make();
-    while let Some(msg) = msg_rx.recv().await {
-        let req = RequestInfo {
-            method: "WS".into(),
-            body: msg,
-            bus_tx: Some(bus_tx.clone()),
-            ..Default::default()
+    let mk_req = |body: Vec<u8>| RequestInfo {
+        method: "WS".into(),
+        body,
+        bus_tx: Some(bus_tx.clone()),
+        ..Default::default()
+    };
+    // 超时毒化后 runtime 已死：跳过后续一切 fire（含 close）。
+    let mut alive = true;
+    match sess.fire("connection", mk_req(Vec::new()), timeout).await {
+        Ok(o) => emit(&resp_tx, o),
+        Err(RunError::Timeout) => alive = false,
+        Err(e) => eprintln!("ws connection {}: {e}", handler_file.display()),
+    }
+    while alive {
+        let Some(msg) = msg_rx.recv().await else {
+            break; // 客户端 Close / socket 断
         };
-        match bridge.run_ws(&source, req, timeout).await {
+        match sess.fire("message", mk_req(msg), timeout).await {
             Ok(o) => {
-                for s in o.sends {
-                    let _ = resp_tx.try_send(s); // 满则丢弃
-                }
-                if !o.capture.body.is_empty() {
-                    let _ = resp_tx.try_send(String::from_utf8_lossy(&o.capture.body).into_owned());
-                }
-                if o.close {
+                let closing = o.close;
+                emit(&resp_tx, o);
+                if closing {
                     break;
                 }
             }
+            // 帧超时 = 必断连（V8 已 terminate，error() 救不了毒化的 VM）。
+            Err(RunError::Timeout) => {
+                eprintln!("ws frame timeout: {}", handler_file.display());
+                alive = false;
+                break;
+            }
+            // error() 缺失或自身抛：丢帧继续（与「error 后连接继续」决策一致）。
             Err(e) => eprintln!("ws frame error: {e}"),
+        }
+    }
+    if alive {
+        // close 恰好一次，尽力而为：钩子可 ws.send 离帧，失败只记日志。
+        match sess.fire("close", mk_req(Vec::new()), timeout).await {
+            Ok(o) => emit(&resp_tx, o),
+            Err(e) => eprintln!("ws close {}: {e}", handler_file.display()),
         }
     }
     drop(resp_tx); // Writer 排空后自然退出
@@ -230,7 +263,7 @@ async fn frame_loop(
 mod tests {
     use super::*;
     use crate::app;
-    use only_js::bridge::{InMemoryAccessor, InMemoryKV};
+    use only_js::bridge::InMemoryKV;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 裸 TCP WebSocket 客户端：upgrade → 掩码文本帧 → 读回帧。
@@ -286,10 +319,20 @@ mod tests {
         addr
     }
 
-    fn make_bridge() -> Bridge {
-        Bridge::new(
-            Arc::new(InMemoryAccessor::new()),
+    /// ws_connect 走 ESM import：bridge 必须带模块加载器（project_root 指向临时目录）。
+    fn make_bridge(root: std::path::PathBuf) -> Bridge {
+        use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
             Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root,
+                ts: true,
+            })),
+            Extras::default(),
         )
     }
 
@@ -314,7 +357,11 @@ mod tests {
              export default { post };\n",
         )]);
         let handler = t.0.join("ws.js");
-        std::fs::write(&handler, r#"bus.subscribe("news"); json.ok({ sub: 1 });"#).unwrap();
+        std::fs::write(
+            &handler,
+            r#"export default { connection() { bus.subscribe("news"); json.ok({ sub: 1 }); } };"#,
+        )
+        .unwrap();
         let bus = Arc::new(Bus::new());
         let root = t.0.clone();
         let bus_actor = bus.clone();
@@ -380,7 +427,6 @@ mod tests {
         .await;
 
         let mut c = WsClient::connect(addr, "/ws/bus").await;
-        c.send_text("subscribe").await;
         let env = c.read_text().await;
         assert!(env.contains("\"sub\":1"), "{env}");
         // HTTP 发布 → 广播到订阅的 WS 连接
@@ -428,7 +474,11 @@ mod tests {
     async fn js_route_runs_handler_per_frame() {
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
-        std::fs::write(&handler, r#"json.ok({ pong: true });"#).unwrap();
+        std::fs::write(
+            &handler,
+            r#"export default { message() { json.ok({ pong: true }); } };"#,
+        )
+        .unwrap();
         let addr = spawn(
             app(
                 "/v1/api",
@@ -447,7 +497,10 @@ mod tests {
                 "/ws/js",
                 handler.clone(),
                 std::time::Duration::from_secs(1),
-                make_bridge,
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
             )),
         )
         .await;
@@ -471,7 +524,7 @@ mod tests {
         let handler = t.0.join("ws.js");
         std::fs::write(
             &handler,
-            r#"ws.send("side"); json.ok({ done: 1 }); ws.close();"#,
+            r#"export default { message() { ws.send("side"); json.ok({ done: 1 }); ws.close(); } };"#,
         )
         .unwrap();
         let addr = spawn(
@@ -492,7 +545,10 @@ mod tests {
                 "/ws/close",
                 handler,
                 std::time::Duration::from_secs(1),
-                make_bridge,
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
             )),
         )
         .await;
@@ -528,7 +584,7 @@ mod tests {
             ),
             (
                 "news/ws.ts",
-                "const n: number = 1;\nbus.subscribe(\"news\");\njson.ok({ sub: n });\n",
+                "const n: number = 1;\nexport default {\n  connection() {\n    bus.subscribe(\"news\");\n    json.ok({ sub: n });\n  },\n};\n",
             ),
         ]);
         let bus = Arc::new(Bus::new());
@@ -575,7 +631,6 @@ mod tests {
         .await;
 
         let mut c = WsClient::connect(addr, "/v1/api/news/ws").await;
-        c.send_text("hi").await;
         let env = c.read_text().await;
         assert!(env.contains("\"sub\":1"), "{env}");
         // HTTP publish（run_module 生产路径）→ 订阅连接收广播帧
@@ -596,16 +651,23 @@ mod tests {
     #[tokio::test]
     async fn mirror_routes_root_ws() {
         use crate::actor::JsActor;
-        use only_js::bridge::{Extras, SchemaRegistry};
+        use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
         use std::collections::HashMap;
-        let t = crate::tests::routes(&[("ws.ts", "json.ok({ root: true });\n")]);
+        let t = crate::tests::routes(&[(
+            "ws.ts",
+            "export default { message() { json.ok({ root: true }); } };\n",
+        )]);
+        let root = t.0.clone();
         let make = move || {
             Bridge::with_dbs_and_loader(
                 HashMap::new(),
                 Arc::new(InMemoryKV::new()),
                 SchemaRegistry::new(),
                 false,
-                None,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
                 Extras::default(),
             )
         };
@@ -615,7 +677,7 @@ mod tests {
                 t.0.clone(),
                 true,
                 crate::tests::build_table(&t.0, true, "/v1/api"),
-                JsActor::pool(1, make),
+                JsActor::pool(1, make.clone()),
                 None,
                 None,
                 crate::Pipeline::default(),
@@ -661,7 +723,10 @@ mod tests {
                 "/ws/missing",
                 t.0.join("nope.js"),
                 std::time::Duration::from_secs(1),
-                make_bridge,
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
             )),
         )
         .await;
@@ -693,7 +758,7 @@ mod tests {
     /// B 自己（同主题订阅）也自收（自回声）。同时验证：
     /// 1) publish 无上下文限制（fire-and-forget，不 await 也照常广播——
     ///    run_event_loop 会把 op future 驱动完才捕获信封）；
-    /// 2) 帧代码经典 script 重跑安全：声明在块作用域内，第二帧不报重复声明；
+    /// 2) 模块作用域 = 连接状态；进房 = connection 钩子（无需 join 帧）；
     /// 3) http.body 对 JSON 文本帧自动 parse 成对象。
     #[tokio::test]
     async fn ws_frame_publish_broadcasts_to_subscribers() {
@@ -704,16 +769,19 @@ mod tests {
             ("news/api.ts", "export default {};\n"),
             (
                 "news/ws.ts",
-                r#"bus.subscribe("chat");
-{
-  const frame = http.body;
-  if (frame && frame.text) {
-    bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
-    json.ok({ sent: true });
-  } else {
+                r#"export default {
+  connection() {
+    bus.subscribe("chat");
     json.ok({ joined: true });
-  }
-}
+  },
+  message() {
+    const frame = http.body;
+    if (frame && frame.text) {
+      bus.publish("chat", { from: frame.from ?? "anon", text: frame.text });
+      json.ok({ sent: true });
+    }
+  },
+};
 "#,
             ),
         ]);
@@ -764,13 +832,11 @@ mod tests {
             "topic": "chat",
             "data": {"from": "anon", "text": "hi"}
         });
-        // 连接 A 进房（订阅在帧内完成）
+        // 连接 A 进房（进房 = connection 钩子，无需 join 帧）
         let mut a = WsClient::connect(addr, "/v1/api/news/ws").await;
-        a.send_text("join").await;
         assert!(a.read_text().await.contains("\"joined\":true"), "a join");
         // 连接 B 进房后发聊天帧（JSON 文本 → http.body 自动 parse）
         let mut b = WsClient::connect(addr, "/v1/api/news/ws").await;
-        b.send_text("join").await;
         assert!(b.read_text().await.contains("\"joined\":true"), "b join");
         b.send_text(r#"{"text":"hi"}"#).await;
         // A 只会收到一条：广播帧（fire-and-forget publish 照常投递）
