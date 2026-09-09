@@ -145,29 +145,22 @@ struct SessEntry {
     bus_tx: mpsc::UnboundedSender<String>,
 }
 
-/// 池控指令（Task 5 linger 退役扩展点；本任务仅保留通道形态）。
-#[allow(dead_code)]
-enum PoolCtl {
-    Respawn,
-}
-
-/// 单路由帧池：队列 + W Worker + 会话表。懒启动（首次 attach 起 Worker）。
+/// 单路由帧池：队列 + W Worker + 会话表。懒启动（首次 attach 起 Worker）；
+/// 空池 linger 退役；预载失败锁存（该文件视为永久不可用）。
 pub struct RoutePool {
     file: PathBuf,
     timeout: Duration,
     workers_max: usize,
-    /// Task 5 空池 linger 退役用；本任务仅存不用。
-    #[allow(dead_code)]
+    /// 空池 linger 退役：detach 后空置超过该时长则 close（0 = 立即）。
     linger_ms: u64,
     make: Arc<dyn Fn() -> Bridge + Send + Sync>,
     sched: Arc<Scheduler>,
     sessions: Mutex<HashMap<u64, SessEntry>>,
+    /// 预载失败锁存：Some(错误串) 后本池不再起 Worker，attach 的 fire 恒 PoolClosed。
+    failed: Mutex<Option<String>>,
     conn_seq: AtomicU64,
     live: AtomicUsize,
     poisoned: AtomicUsize,
-    /// Task 5 池控通道（linger 退役）；本任务仅保留通道形态。
-    #[allow(dead_code)]
-    ctl_tx: mpsc::UnboundedSender<PoolCtl>,
 }
 
 impl RoutePool {
@@ -178,8 +171,7 @@ impl RoutePool {
         workers_max: usize,
         linger_ms: u64,
     ) -> Arc<Self> {
-        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-        let pool = Arc::new(Self {
+        Arc::new(Self {
             file,
             timeout,
             workers_max,
@@ -187,30 +179,22 @@ impl RoutePool {
             make,
             sched: Scheduler::new(),
             sessions: Mutex::new(HashMap::new()),
+            failed: Mutex::new(None),
             conn_seq: AtomicU64::new(0),
             live: AtomicUsize::new(0),
             poisoned: AtomicUsize::new(0),
-            ctl_tx,
-        });
-        // 池控泵（独立轻线程，池生命周期与路由同长）。
-        std::thread::Builder::new()
-            .name("ws-pool-ctl".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("pool ctl rt");
-                rt.block_on(async {
-                    let mut rx = ctl_rx;
-                    while let Some(PoolCtl::Respawn) = rx.recv().await {}
-                });
-            })
-            .expect("spawn ws-pool-ctl");
-        pool
+        })
     }
 
     /// 注册会话（懒启动 worker）。永远成功；预载失败在 fire 时以 PoolClosed 显形。
     pub fn attach(self: &Arc<Self>, bus_tx: mpsc::UnboundedSender<String>) -> ConnHandle {
+        if self.failed.lock().unwrap().is_some() {
+            // 锁存：不再起 Worker；fire 经 sched closed 得 PoolClosed。
+            return ConnHandle {
+                pool: Arc::clone(self),
+                conn: 0,
+            };
+        }
         if self.live.load(Ordering::SeqCst) == 0 {
             self.sched.reopen();
         }
@@ -247,8 +231,8 @@ impl RoutePool {
                     .enable_all()
                     .build()
                     .expect("ws worker rt");
+                // live 的扣减在 worker_main 内部（退出即扣，先于 close 等副作用可见）。
                 let poisoned = rt.block_on(pool.clone().worker_main());
-                pool.live.fetch_sub(1, Ordering::SeqCst);
                 if poisoned {
                     pool.poisoned.fetch_add(1, Ordering::SeqCst);
                     // 补员：毒化 Worker 线程退出前直接再起一个（保持池容量）。
@@ -264,22 +248,27 @@ impl RoutePool {
         !self.sessions.lock().unwrap().is_empty()
     }
 
-    /// Worker 主循环：返回是否毒化退出。
+    /// Worker 主循环：返回是否毒化退出。live 在此扣减（每个退出路径恰一次）。
     async fn worker_main(self: Arc<Self>) -> bool {
         let bridge = (self.make)();
         // 预载：模块加载 + 钩子装配（复用 ws_connect；失败 → 本 Worker 不可用，
         // 排空队列让 fire 立刻拿到 PoolClosed——预载失败 = 该文件永久不可用，
-        // 退役整池是正确语义；新连接 attach 会 reopen，再失败再退役）。
+        // 退役整池是正确语义；锁存后 attach 不再起 Worker）。
         let mut sess = match bridge.ws_connect(&self.file).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("ws worker preload {}: {e}", self.file.display());
+                // 顺序即契约：先锁存（拦住新 attach），再扣 live，再关池（排空
+                // 存量帧）——fire 解析时 live 已归零，不存在「死而未报」的窗口。
+                *self.failed.lock().unwrap() = Some(e.to_string());
+                self.live.fetch_sub(1, Ordering::SeqCst);
                 self.sched.close();
                 return false;
             }
         };
         loop {
             let Some(f) = self.sched.pull().await else {
+                self.live.fetch_sub(1, Ordering::SeqCst);
                 return false;
             };
             let (state, bus_tx) = {
@@ -307,6 +296,7 @@ impl RoutePool {
                 Err(RunError::Timeout) => {
                     let _ = f.done.send(Err(FrameError::Timeout));
                     drop(sess); // runtime 已毒化，随 Worker 丢弃
+                    self.live.fetch_sub(1, Ordering::SeqCst);
                     return true;
                 }
                 Err(RunError::Core(e)) => {
@@ -393,10 +383,24 @@ impl ConnHandle {
         }
     }
 
-    /// 连接收尾：删会话表条目 + 丢排队帧 +（空池 linger 退役在 Task 5 接）。
+    /// 连接收尾：删会话表条目 + 丢排队帧 + 空池 linger 退役计时。
     pub fn detach(&self) {
         self.pool.sessions.lock().unwrap().remove(&self.conn);
         self.pool.sched.drop_conn(self.conn);
+        // 空池 → linger 计时（独立线程；linger=0 走 sleep(0)，同一路径）。
+        if self.pool.sessions.lock().unwrap().is_empty() {
+            let pool = Arc::clone(&self.pool);
+            std::thread::Builder::new()
+                .name("ws-retire".into())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(pool.linger_ms));
+                    // 复查仍空才退役：linger 期间来了新连接则继续服务。
+                    if pool.sessions.lock().unwrap().is_empty() {
+                        pool.sched.close();
+                    }
+                })
+                .expect("spawn ws-retire");
+        }
     }
 }
 
@@ -657,5 +661,60 @@ export default {
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["ok"], 1);
         h.detach();
+    }
+
+    /// 空池 linger 退役：detach 后（linger=0 立即）Worker 退出、live 归零；
+    /// 新连接 attach 复活（reopen + 重新起 Worker）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_retires_when_idle_after_linger() {
+        let dir = pool_dir("retire");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"export default { message() { json.ok({ ok: 1 }); } };"#,
+        )
+        .unwrap();
+        let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
+        let (btx, _) = mpsc::unbounded_channel();
+        let h = pool.attach(btx);
+        h.fire("message", vec![]).await.unwrap();
+        assert_eq!(pool.live_workers(), 1);
+        h.detach();
+        // linger=0：detach 后 Worker 异步退出（等一小会儿）
+        for _ in 0..50 {
+            if pool.live_workers() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(pool.live_workers(), 0, "空池立即退役");
+        // 新连接复活
+        let (btx2, _) = mpsc::unbounded_channel();
+        let h2 = pool.attach(btx2);
+        h2.fire("message", vec![]).await.unwrap();
+        h2.detach();
+    }
+
+    /// 预载失败锁存：fire 得 PoolClosed 后，后续 attach 不再反复起 Worker。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_preload_failure_latches_closed() {
+        let dir = pool_dir("preload-fail");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(&ws_file, "json.ok({});\n").unwrap(); // 无钩子 → 预载失败
+        let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
+        let (btx, _) = mpsc::unbounded_channel();
+        let h = pool.attach(btx);
+        assert!(matches!(
+            h.fire("message", vec![]).await,
+            Err(FrameError::PoolClosed)
+        ));
+        // 锁存：后续 attach 不再反复起 worker
+        let (btx2, _) = mpsc::unbounded_channel();
+        let h2 = pool.attach(btx2);
+        assert!(matches!(
+            h2.fire("message", vec![]).await,
+            Err(FrameError::PoolClosed)
+        ));
+        assert_eq!(pool.live_workers(), 0);
     }
 }
