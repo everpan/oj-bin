@@ -101,16 +101,18 @@ curl -H 'X-TENANT-ID: default' http://localhost:9778/v1/api/auth_demo/health/   
 
 > WebSocket 专题教学见 [../docs/websocket.md](../docs/websocket.md)。
 
-- `ws.ts`：**帧循环**文件——客户端连 `/v1/api/news/ws` 后每发一帧文本就执行一次；
-  首帧 `bus.subscribe("news")` 订阅主题。WS 也是普通路由文件，走同一转译管线。
-- `chat/ws.ts`：**帧内发布**聊天室——WS 帧里直接 `bus.publish`，任意连接发帧即广播
-  给所有订阅者（发 `{"join":1}` 进房，发 `{"from":"neo","text":"hi"}` 聊天）。三条帧内
-  发布语义（自回声 / 顶层无 await / 块作用域）见 [../docs/websocket.md](../docs/websocket.md) §2。
+- `ws.ts`：**生命周期钩子**文件（`export default { connection, message, close, error }`）——
+  客户端连 `/v1/api/news/ws` 后 `connection()` 触发一次：`bus.subscribe("news")` 订阅主题并回
+  欢迎帧；`message()` 每帧触发。模块作用域即连接状态，跨帧存活。WS 也是普通路由文件，
+  走同一转译管线。
+- `chat/ws.ts`：**帧内发布**聊天室——`connection()` 进房（订阅 "chat"，连上即完成，无需
+  join 帧），`message()` 每帧 `bus.publish`，任意连接发 `{"from":"neo","text":"hi"}`
+  即广播给所有订阅者（含自己——自回声）。发布语义见 [../docs/websocket.md](../docs/websocket.md) §2。
 - `api.ts`：`POST /v1/api/news` → `bus.publish("news", {...})` 广播到所有订阅连接
   （含其它实例——bus 后端可换 kafka/rabbitmq 插件）。
 
 ```bash
-# 终端 1：websocat ws://localhost:9778/v1/api/news/ws  （发任意一帧完成订阅）
+# 终端 1：websocat ws://localhost:9778/v1/api/news/ws  （连上即完成订阅，收到欢迎帧）
 # 终端 2：
 curl "${AUTH[@]}" -X POST -d '{"text":"hello oj"}' \
   http://localhost:9778/v1/api/news    # 终端 1 收到 {"topic":"news",...}
@@ -209,7 +211,7 @@ demo（admin）200、trinity（user）实测 403。
 | kv 缓存 / 会话存储 | order · auth | `detail/api.ts` · `_shared/session.ts` |
 | JWT 签发与校验（bcrypt/jwt/crypto） | auth | `login/api.ts` + `_shared/session.ts` |
 | `http.user` 身份 / 角色门禁 | auth_demo · admin · cert | `me/api.ts` · `cert/api.ts` |
-| WS 帧循环 + bus 发布订阅 | news | `ws.ts` + `api.ts` |
+| WS 生命周期钩子 + bus 发布订阅 | news | `ws.ts` + `api.ts` |
 | multipart + blob 对象存储 | upload | `api.ts` |
 | `json.raw` 裸 JSON（协议端点） | idp | `.well-known/openid-configuration/api.ts` |
 | OIDC OP / RP 全流程 | idp · oidc | 见 README「OIDC 演示」 |
