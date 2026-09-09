@@ -1,7 +1,9 @@
 //! ws.* 绑定：WebSocket 帧循环内 JS 主动控制。
 //!
-//! 仅两个 op：send(data) 收集到 ReqState.ws_sends（帧处理器结束后按序写出）、
-//! close() 置位 ReqState.ws_close（本帧结束后关连接）。HTTP 请求路径不读这两项（等价 nil 连接 no-op）。
+//! 三个 op：send(data) 收集到 ReqState.ws_sends（帧处理器结束后按序写出）、
+//! close() 置位 ReqState.ws_close（本帧结束后关连接）、sess_set(v) 由 dispatcher
+//! `finally` 把 `__sess` 快照交还 ReqState.ws_sess（帧池 sess.state 外置回传）。
+//! HTTP 请求路径不读这三项（等价 nil 连接 no-op）。
 
 use deno_core::{OpState, op2};
 
@@ -18,6 +20,12 @@ pub(crate) fn op_ws_send(state: &mut OpState, #[string] data: String) {
 #[op2(fast)]
 pub(crate) fn op_ws_frame_close(state: &mut OpState) {
     state.borrow_mut::<ReqState>().ws_close = true;
+}
+
+/// WS 帧收尾：dispatcher finally 把 __sess 快照交还（帧池状态外置回传）。
+#[op2]
+pub(crate) fn op_ws_sess_set(state: &mut OpState, #[serde] v: serde_json::Value) {
+    state.borrow_mut::<ReqState>().ws_sess = Some(v);
 }
 
 #[cfg(test)]
