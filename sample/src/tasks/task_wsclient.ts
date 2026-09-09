@@ -1,5 +1,6 @@
 export {};
-// WS 客户端任务案例（v0.1.7）：连本机 WS 服务端 /v1/api/news/ws，首帧订阅 "news"，
+// WS 客户端任务案例（v0.1.7）：连本机 WS 服务端 /v1/api/news/ws，连上即已订阅 "news"
+// （服务端 ws.ts connection 钩子），
 // 循环收取 bus.publish("news", ...) 的广播帧。写法同 Kafka/RabbitMQ 消费任务
 // （docs/mq-tasks.md），但重连不手写——断连即抛错 → Crashed → 监督器指数退避重启
 // （1s→2s→…cap 60s）→ 新实例重连。
@@ -36,7 +37,7 @@ ws.onclose = () => {
 };
 
 await opened;
-ws.send("{}"); // 首帧：服务端 ws.ts 执行 bus.subscribe("news")
+ws.send("{}"); // 探活帧：连上即已订阅（服务端 ws.ts connection 钩子）
 log.info("ws task connected " + url);
 
 while (!tasks.stopping()) {

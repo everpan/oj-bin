@@ -362,7 +362,7 @@ export default { get: detail };
 静态站点（`server.app_path`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
-### ws.ts（WebSocket 帧循环）
+### ws.ts（WebSocket 生命周期钩子）
 
 > 系统学习（心智模型 / 实现走读 / 鉴权现状 / 测试映射）见仓库 `docs/websocket.md`
 >（devkit 包内不含，仓库查看）。

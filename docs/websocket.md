@@ -1,4 +1,4 @@
-# WebSocket 教学（ws.ts 帧循环）
+# WebSocket 教学（ws.ts 生命周期钩子）
 
 > 面向两类读者：**要写 WS handler 的业务开发者**（§1–§3、§7）与**要改 WS 实现的维护者**
 > （§4–§6、§7 末）。JS 签名权威是 [devkit/api-manual.md](devkit/api-manual.md)（§4 `ws.ts` 小节、
@@ -162,7 +162,7 @@ src/bridge/{mod,ws}.rs   帧执行：ws_connect → WsSession::fire（按事件�
 **三任务流水线**（`frame_loop`，通道各 cap 64 做背压）：
 
 ```
-socket ──Reader──▶ msgChan(64) ──Processor(当前任务，串行 run_ws)──▶ respChan(64) ──Writer──▶ socket
+socket ──Reader──▶ msgChan(64) ──Processor(驻留会话，串行 fire)──▶ respChan(64) ──Writer──▶ socket
                                                        ▲
 bus 广播帧 ──────────────Bus forwarder（unbounded）────┘   （与 ws.send 同通道 → 保序）
 ```

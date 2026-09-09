@@ -70,7 +70,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 重启后整段消息重复消费 | commit 按 offset+1 推进该分区——多分区主题按分区各 commit 一次（at-least-once，处理须幂等） |
 | 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效） |
 | WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定） |
-| WS 第二帧报 Identifier already declared | 每帧重跑同一文件且同一 VM——顶层 `const`/`let` 二帧即重复声明，声明放进块作用域 `{}` |
+| （v0.1.9 已消除）旧帧循环的 const 重复声明 | 新契约为生命周期钩子：模块每连接加载一次，模块作用域跨帧安全——无需处理；旧写法已废弃，见 api-manual §ws.ts |
 | WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |
 
 ## 手册

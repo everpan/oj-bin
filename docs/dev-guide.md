@@ -200,7 +200,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `bcrypt.hash/verify` | 密码哈希（`spawn_blocking`） | 不依赖 `auth:` 段 |
 | `oidc.sign/verify/jwks` + `oidc.issuer/rp/clients` | RS256 JWS 原语 + 装配期配置 | `oidc:` 段启用；私钥留在 Rust（`src/bridge/oidc.rs`） |
 | `crypto.sha256Hex / randomHex` | 摘要与随机数 | 与原生 `getRandomValues` 合并 |
-| `ws.send/close` | WS 帧循环控制 | 仅 WS 连接内有意义 |
+| `ws.send/close` | WS 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op） | 仅 WS 连接内有意义 |
 | `plugins()` | 已装配插件自省 | 同源 `GET {base}/plugins` |
 | `finish()` | 标记会话完成但不写响应 | 少用 |
 
@@ -268,7 +268,7 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 
 执行族：`run` / `run_with` / `run_with_timeout`（超时返回 `RunError::Timeout`）/
 `run_named`（按 HandlerStore 名执行）/ `run_module`（按模块路径执行，oj server 主路径）/
-`run_ws`（WS 帧）/ `prewarm`。返回 `Capture { status, headers, body }`。
+`run_ws`（HTTP 超时执行；WS 改走 ws_connect/WsSession::fire）/ `prewarm`。返回 `Capture { status, headers, body }`。
 
 **状态模型（重要）**：
 

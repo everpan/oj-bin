@@ -112,7 +112,7 @@ interface KVApi {
   incr(key: string): Promise<number>;
 }
 
-// ws.* ：WebSocket 帧循环控制。
+// ws.* ：WebSocket 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）。
 interface WSApi {
   send(data: string): void;
   close(): void;
