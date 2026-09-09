@@ -7,13 +7,32 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use only_js::bridge::{Bridge, RequestInfo, RunError, WsOutcome};
+
+/// 全局 WS 并发连接闸门（config ws.max_connections；0 = 不限）。
+static WS_LIVE: AtomicU64 = AtomicU64::new(0);
+
+fn gate_enter(max: u64) -> bool {
+    loop {
+        let live = WS_LIVE.load(Ordering::Relaxed);
+        if max != 0 && live >= max {
+            return false;
+        }
+        if WS_LIVE
+            .compare_exchange(live, live + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
 
 /// 挂载最小 echo 路由（GET /ws）——P5a 链路验证用。
 pub fn echo_route() -> axum::Router {
@@ -21,12 +40,14 @@ pub fn echo_route() -> axum::Router {
 }
 
 /// 挂载 JS handler 驻留会话路由：connection/message/close 按事件执行 handler_file，
-/// json.ok 信封与 ws.send 逐事件写回；timeout 为单事件熔断（超时必断连）。
+/// json.ok 信封与 ws.send 逐事件写回；timeout 为单事件熔断（超时必断连）；
+/// max_conns 为该路由的并发连接上限（0 = 不限），超限 upgrade 直接 503。
 pub fn js_route(
     path: &str,
     handler_file: impl Into<PathBuf>,
     timeout: std::time::Duration,
     make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
+    max_conns: u64,
 ) -> axum::Router {
     let file = handler_file.into();
     let make = Arc::new(make_bridge);
@@ -35,7 +56,13 @@ pub fn js_route(
         axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
             let file = file.clone();
             let make = make.clone();
-            async move { ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make)) }
+            async move {
+                if !gate_enter(max_conns) {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                // on_upgrade 在本 axum 版本直接返回 Response（非 future），故无 .await。
+                ws.on_upgrade(move |socket| conn_on_pinned(socket, file, timeout, make))
+            }
         }),
     )
 }
@@ -48,6 +75,7 @@ pub fn mirror_routes(
     root: &Path,
     timeout: std::time::Duration,
     make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
+    max_conns: u64,
 ) -> axum::Router {
     let make = Arc::new(make_bridge);
     let base = format!("/{}/", base.trim_matches('/'));
@@ -69,7 +97,7 @@ pub fn mirror_routes(
             continue; // 同目录 ws.ts 与 ws.js 并存：先到者（.ts）胜
         }
         let m = make.clone();
-        router = router.merge(js_route(&path, file, timeout, move || m()));
+        router = router.merge(js_route(&path, file, timeout, move || m(), max_conns));
     }
     router
 }
@@ -131,6 +159,9 @@ async fn conn_on_pinned(
                 .build()
                 .expect("ws-js runtime init");
             rt.block_on(frame_loop(socket, handler_file, timeout, make));
+            // 连接真实结束才递减闸门计数（与 js_route 的 gate_enter 1:1 配对；
+            // conn_on_pinned 本体 spawn 后即返回，不能在这里递减）。
+            WS_LIVE.fetch_sub(1, Ordering::Relaxed);
         })
         .expect("spawn ws-js thread");
 }
@@ -422,6 +453,7 @@ mod tests {
                 handler,
                 std::time::Duration::from_secs(1),
                 make_bridge,
+                0,
             )),
         )
         .await;
@@ -501,6 +533,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;
@@ -515,6 +548,61 @@ mod tests {
         c.send_text("again").await;
         let resp2 = c.read_text().await;
         assert!(resp2.contains("pong"), "{resp2}");
+    }
+
+    /// 闸门：max=1 时第 2 条连接被拒（503），存量连接不受影响；max=0 不限。
+    #[tokio::test]
+    async fn gate_rejects_over_limit_with_503() {
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default { message() { json.ok({ pong: 1 }); } };"#,
+        )
+        .unwrap();
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/gate",
+                handler,
+                std::time::Duration::from_secs(1),
+                {
+                    let root = t.0.clone();
+                    move || make_bridge(root.clone())
+                },
+                1,
+            )),
+        )
+        .await;
+        let mut c1 = WsClient::connect(addr, "/ws/gate").await; // 第 1 条：占满
+        c1.send_text("hi").await;
+        assert!(c1.read_text().await.contains("\"pong\":1"));
+        // 第 2 条：upgrade 被拒（非 101）
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /ws/gate HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = s.read(&mut buf).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 503"),
+            "expected 503"
+        );
+        // 存量连接不受影响
+        c1.send_text("again").await;
+        assert!(c1.read_text().await.contains("\"pong\":1"));
     }
 
     /// ws.send 先于信封写出、ws.close 结束连接（顺序契约）。
@@ -549,6 +637,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;
@@ -626,6 +715,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
+                0,
             )),
         )
         .await;
@@ -690,6 +780,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
+                0,
             )),
         )
         .await;
@@ -727,6 +818,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;
@@ -824,6 +916,7 @@ mod tests {
                 &t.0,
                 std::time::Duration::from_secs(2),
                 make,
+                0,
             )),
         )
         .await;
@@ -897,6 +990,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;
@@ -943,6 +1037,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;
@@ -983,6 +1078,7 @@ mod tests {
                     let root = t.0.clone();
                     move || make_bridge(root.clone())
                 },
+                0,
             )),
         )
         .await;

@@ -600,6 +600,7 @@ impl App {
             &dir,
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
+            0, // 闸门接线在池化装配（v0.1.10 Task 6）落 config ws.max_connections
         );
         let router = server::app(
             &base,
