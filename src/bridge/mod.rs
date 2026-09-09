@@ -34,6 +34,9 @@ pub mod db_backend;
 mod envelope;
 mod es;
 pub(crate) mod ffi;
+// ponytail: Task 4 接入 RoutePool 消费者前，Scheduler/Frame 暂无 lib 侧调用方。
+#[allow(dead_code)]
+pub mod frame_pool;
 pub mod guard;
 mod http;
 mod inspector;
