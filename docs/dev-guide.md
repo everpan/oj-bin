@@ -80,7 +80,7 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（release
 Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
 src/                  # crate: only-js（lib）——核心执行层（纯 lib，无 bin、无 build.rs）
 ├── lib.rs            # 导出 bridge + config
-├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + db/redis/blob/es/broker/plugins 映射
+├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + ws{max_connections,workers_per_route,idle_linger_ms} + db/redis/blob/es/broker/plugins 映射
 └── bridge/           # JS 运行时与 SDK（无 axum/http 依赖，纯执行层）
     ├── mod.rs        # Bridge / StableState / ReqState / Capture + extension! 注册全部 op
     ├── bootstrap.js  # JS 全局对象装配（ESM，必须 7-bit ASCII）
@@ -99,7 +99,8 @@ src/                  # crate: only-js（lib）——核心执行层（纯 lib�
     ├── es.rs         # EsBackend trait + 内置 reqwest 实现（oj-es 插件经 FfiEsBackend 适配）
     ├── blob.rs       # BlobBackend trait + LocalBlob 内置（s3 迁插件）
     ├── cert.rs / crypto.rs / auth.rs / guard.rs   # cert 全局、jwt/bcrypt/crypto ops、鉴权
-    ├── fetch.rs / log.rs / ws.rs / inspector.rs   # fetch op、结构化日志、WS、DevTools 桥
+    ├── fetch.rs / log.rs / ws.rs / inspector.rs   # fetch op、结构化日志、WS op、DevTools 桥
+    ├── frame_pool.rs  # WS 帧池：Scheduler（per-conn 保序）+ W 无状态 Worker + Rust 会话表
     ├── ffi.rs        # 全部 unsafe 收敛（load_forget dlopen）+ FfiXxxBackend 适配器层
     └── plugin_loader.rs # PluginLoader：四级路径解析 + 清单/扫描双模式 + ABI 门禁 + AXES 逐轴 dlsym
 oj/                   # CLI 二进制：server / build / test / migrate / fixture / schema
@@ -116,7 +117,7 @@ server/               # crate: mdm-server（axum HTTP 层）
 ├── routes.rs         # directory-mirror URL → handler 映射
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 ├── certificate.rs    # 证书验签与状态判定（valid/grace/expired）
-└── ws.rs             # WebSocket + js_route/mirror_routes
+└── ws.rs             # WebSocket：闸门 + js_route/mirror_routes + frame_loop（帧池连接侧）
 oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=7）
 plugins/              # 8 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
                       #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth
@@ -178,7 +179,9 @@ handler 是 ESM 源码（dev 模式 `.ts` 按需转译，release 模式服务 `o
 同目录可放 `ws.ts` 产生一条 WebSocket 路由：连接升级后按**生命周期钩子**执行：
 `export default { connection, message, close, error }`（connection 一次、message 每帧、
 close 收尾，详见 [devkit/api-manual.md](devkit/api-manual.md) §ws.ts）；
-`bus.subscribe` 只在 WS 钩子内有意义。
+`bus.subscribe` 只在 WS 钩子内有意义。执行模型为**帧池**（v0.1.10）：每路由
+`ws.workers_per_route` 个无状态 Worker 共享执行，连接状态放 `sess.state`
+（可 JSON 序列化），`ws.max_connections` 闸门超限返 503。
 
 JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签名以
 [devkit/api-manual.md](devkit/api-manual.md) 与 `sample/global.d.ts` 为权威）：
@@ -268,7 +271,8 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 
 执行族：`run` / `run_with` / `run_with_timeout`（超时返回 `RunError::Timeout`）/
 `run_named`（按 HandlerStore 名执行）/ `run_module`（按模块路径执行，oj server 主路径）/
-`run_ws`（HTTP 超时执行；WS 改走 ws_connect/WsSession::fire）/ `prewarm`。返回 `Capture { status, headers, body }`。
+`run_ws`（HTTP 超时执行；WS 自 v0.1.10 改走帧池：`ws_connect` 预载钩子 + `frame_pool.rs`
+逐事件 `ws_event` 派发）/ `prewarm`。返回 `Capture { status, headers, body }`。
 
 **状态模型（重要）**：
 

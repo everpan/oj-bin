@@ -73,12 +73,16 @@ actor 线程内跑 `current_thread` runtime，**串行**执行 job；并发度 =
 
 > 逐行走读与 JS 侧用法见 [../websocket.md](../websocket.md)（教学文件）。
 
-- `mirror_routes`（:46）：`<root>/<dir>/ws.ts`（优先）/`ws.js` → `GET {base}/<dir>/ws`；
-  根级 `ws.ts` → `{base}/ws`。⚠️ release 下 root=dist，URL 含版本段（`news-0.1.0/ws`），
+- `mirror_routes`：`<root>/<dir>/ws.ts`（优先）/`ws.js` → `GET {base}/<dir>/ws`；
+  根级 `ws.ts` → `{base}/ws`；每文件一池（`RoutePool`，含 `ws.workers_per_route` /
+  `ws.idle_linger_ms`）。⚠️ release 下 root=dist，URL 含版本段（`news-0.1.0/ws`），
   v0.2 已知限制。
-- 每连接独占一个 VM（不进 HTTP 池），整个连接搬到专用 OS 线程；
-  Reader / Processor（串行 JS）/ Writer 三任务流水线，`msgChan`/`respChan` 各 cap 64（背压）。
-- 单帧超时 → 丢弃该帧、连接继续。
+- **帧池执行**（v0.1.10）：upgrade 先过 `ws.max_connections` 闸门（超限 503）；连接侧
+  `frame_loop` 全 Send 跑在 axum runtime——Reader / Writer / Bus forwarder 三任务流水线，
+  `msgChan`/`respChan` 各 cap 64（背压）；JS 帧交 `bridge::frame_pool` 的 W 个无状态
+  Worker 执行（per-conn 在飞=1 保序，会话状态 `sess.state` 外置 Rust 会话表）。
+- 单帧超时 → V8 terminate、**断开该连接**（毒化 Worker 由池补员，其它连接无感）；
+  普通帧错误 → 丢帧、连接继续。
 
 ## 6. 证书（`certificate.rs` / `certificate_watcher.rs`）
 

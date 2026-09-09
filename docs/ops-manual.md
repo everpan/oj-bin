@@ -54,6 +54,9 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
   临时调试可用 `-b` 覆盖。空前缀（空串/纯斜杠）启动即报错。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
+- **WS** `ws.max_connections`：全局并发连接闸门（默认 1000，0=不限），超限 upgrade 返 503。
+  内存与连接数解耦——V8 只驻留在每路由 `ws.workers_per_route` 个 Worker（默认 2），
+  高并发长连接按闸门做容量规划即可（每连接仅 ≈2KB 会话态）。
 - **静态站点** `server.app_path`（CLI `--app-path` 可覆盖）：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
   （目录 → `index.html`）；目录缺失启动即报错。前置站点产物（如 oj build 的 dist）放独立目录。
 - **DB** `db.<name> = "<DSN>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。

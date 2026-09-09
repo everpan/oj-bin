@@ -149,7 +149,8 @@ export {};
 json.page = (rows, total) => json.ok({ list: rows, total });
 ```
 
-三条硬边界：必须幂等（执行次数 = 模块数 + actor 池大小 + WS 连接数）；拿不到
+三条硬边界：必须幂等（执行次数 = 模块数 + actor 池大小 + WS Worker 数，每路由
+`ws.workers_per_route` 个）；拿不到
 `ext:core/ops`（deno_core 拒绝 `file://` → `ext:` 导入），需要新 op 属改 bootstrap；
 用顶层 `await` 须带 `export {};`，否则被 CJS 启发式包进非 async 函数。
 

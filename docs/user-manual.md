@@ -101,6 +101,10 @@ server:
                            # | verify（release 默认，账本落后拒启，先 oj migrate）| off
   ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）
                            # | deny（未声明 deps 的跨模块表访问拒绝执行）
+ws:                        # WebSocket 运行时（段缺省 = 全默认）
+  max_connections: 1000    # 全局并发连接闸门：超限 upgrade 返 503；0 = 不限
+  workers_per_route: 2     # 每路由无状态 Worker 数（共享执行该路由全部连接的帧）
+  idle_linger_ms: 0        # 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役）
 db:
   default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # 需 oj-db-mysql 插件
@@ -470,8 +474,8 @@ globalThis.APP_ENV = "prod";
 
 约束（都是硬边界，不是建议）：
 
-- **必须幂等且无外部副作用**。执行次数 = 模块数 + actor 池大小 + WS 连接数（每个 WS
-  连接一个 runtime），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
+- **必须幂等且无外部副作用**。执行次数 = 模块数 + actor 池大小 + WS Worker 数（每路由
+  `ws.workers_per_route` 个，与连接数无关），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
 - **只能用已有全局做组合，拿不到新能力**。`import "ext:core/ops"` 会被 deno_core 拒绝
   （`ext:` 只允许从 `ext:`/`node:` 模块导入）；需要新 op 属于改 bootstrap，不走这条路。
 - **要用顶层 `await` 就得带一句 `export {};`**（或有真实 import/export）。否则文件会被
@@ -563,8 +567,9 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段、段非法�
 同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。连接升级后，本文件按 **生命周期钩子** 执行：
 `export default { connection, message, close, error }`（至少导出一个钩子）——connection 在
 连接建立后恰好触发一次，message 每帧触发（帧内容经 `http.body` 读取），close/error 收尾与
-兜底；模块每连接加载一次，模块作用域即连接状态、跨帧存活。详见
-`docs/devkit/api-manual.md` §ws.ts。
+兜底。执行模型为**帧池**（v0.1.10）：每路由 `ws.workers_per_route` 个无状态 Worker 共享
+执行，连接状态放 `sess.state`（跨帧持久、按连接隔离，**须可 JSON 序列化**）；
+`ws.max_connections` 闸门超限返 503。详见 `docs/devkit/api-manual.md` §ws.ts。
 
 **bus**：进程内主题广播。`api.ts`（任意 HTTP 路径）`await bus.publish(topic, data)` 广播 JSON 帧
 `{"topic":…,"data":…}` 给全部订阅该主题的 **WebSocket 会话**（返回接收方数）；WS 会话在

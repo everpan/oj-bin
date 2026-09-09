@@ -5,7 +5,7 @@
 > §6 `ws`/`WebSocket`/`fetch` 行）；维护者模块地图是 [modules/03-server-http.md](modules/03-server-http.md) §5。
 > 可运行示例全程以 `sample/src/news/` 为锚。
 
-## 1. 心智模型：一个文件 = 一条 WS 路由 = 生命周期钩子
+## 1. 心智模型：一个文件 = 一条 WS 路由 = 生命周期钩子（帧池运行时）
 
 目录内放 **`ws.ts`**（dev 源码）或 **`ws.js`**（release 构建产物，`oj build` 自动生成），
 即产生一条 WebSocket 路由 `GET {base}/{...path}/ws`：
@@ -22,10 +22,15 @@ src/ws.ts        →  /v1/api/ws             （根级）
 | 触发 | HTTP 请求命中路由 | 连接升级后**客户端每个文本/二进制帧** |
 | 执行单元 | `default[method]()` 一个函数 | `default` 导出的钩子（`connection` 一次 / `message` 每帧 / `close` 一次 / `error` 兜底） |
 | 回写 | `{code,msg,data}` 信封 HTTP 响应 | 信封文本帧 + `ws.send` 裸帧 |
-| 运行位置 | HTTP actor 池（`server.pool_size` 个 VM 排队复用） | **每连接独占一个 VM**（不进池，连接结束即弃） |
+| 运行位置 | HTTP actor 池（`server.pool_size` 个 VM 排队复用） | **路由级帧池**（连接状态外置 Rust 会话表） |
+| Worker 池 | actor 即池，无独立 Worker 层 | **W 个无状态 Worker/路由**（`ws.workers_per_route`，默认 2）从帧队列拉帧执行 |
 
 帧进来时，注入的请求上下文是：`http.method === "WS"`、**`http.body` = 帧字节**
 （`Uint8Array`）；`http.query`/`http.headers` 为空对象（upgrade URL 未透传）。
+
+连接状态放 **`sess.state`**（跨帧持久、按连接隔离，**必须可 JSON 序列化**），
+`sess.id` 为连接 id；模块作用域只是 Worker 本地只读缓存——可变跨帧状态禁止放模块
+作用域。约束详见 §4「sess 会话状态与帧池约束」。
 
 ## 2. 写一个 handler：sample/news 逐行
 
@@ -68,9 +73,9 @@ bus 后端可换（`local`/kafka/rabbitmq 插件），所以跨进程实例的 H
 
 两个执行期语义：
 
-- **单帧超时**：一个钩子卡死（如死循环）**必断连**——runtime 被 terminate 后已毒化、
-  丢弃，钩子收不到后续事件，连接被服务端关闭（默认 30s，`oj/src/app.rs` 传给
-  `mirror_routes`）。
+- **单帧超时**：一个钩子卡死（如死循环）**必断连**——仅断**该连接**：runtime 被
+  terminate 后已毒化、Worker 随之弃置（池自动补员，其它连接无感），钩子收不到后续
+  事件，连接被服务端关闭（默认 30s，`oj/src/app.rs` 传给 `mirror_routes`）。
 - **顺序契约**：写出顺序 = `ws.send` 按调用序 → 信封 → （后续广播帧）。广播帧与
   主动发送走同一条写出通道，天然保序（`server/src/ws.rs` Bus forwarder）。
 
@@ -109,8 +114,9 @@ websocat ws://localhost:9778/v1/api/news/chat/ws
    自己）——按 `from` 字段客户端过滤，或发布到别的 topic。
 2. **钩子可直接 `await`**：钩子会被驱动至 Promise 落定才捕获回帧——要拿 `publish`
    返回的「本地接收方数」，直接 `await bus.publish(...)`（kafka/rabbitmq 下该数恒 0）。
-3. **模块作用域即连接状态**：模块每连接加载一次、按事件触发钩子，顶层 `const`/`let`
-   跨帧存活且不会重复声明（跨连接共享走 kv / bus）。
+3. **无状态也够用**：钩子共享该路由的 Worker 池，模块作用域只是 Worker 本地只读
+   缓存——可变跨帧状态放 `sess.state`（按连接隔离）或 kv/bus（跨连接）；聊天室本例
+   全靠 bus 广播，无需任何本地状态。
 
 回归：`ws_frame_publish_broadcasts_to_subscribers`（§6）。
 
@@ -145,72 +151,95 @@ release 模式：先 `oj build`（`ws.ts` 随模块一起转译成 `dist/<mod>-<
 涉及三层，自上而下：
 
 ```
-oj/src/app.rs            装配：mirror_routes(base, dir, timeout, make_bridge) merge 进 Router
-server/src/ws.rs         连接生命周期：upgrade → 钉线程 → 三任务流水线
-src/bridge/{mod,ws}.rs   帧执行：ws_connect → WsSession::fire（按事件）→ WsOutcome
+oj/src/app.rs             装配：mirror_routes(base, dir, timeout, make_bridge, opts) merge 进 Router
+server/src/ws.rs          连接生命周期：upgrade → 闸门 → 三任务流水线（全 Send，跑在 axum runtime）
+src/bridge/frame_pool.rs  帧调度：Scheduler（per-conn 在飞=1 保序）+ W Worker + Rust 会话表
+src/bridge/mod.rs         帧执行：ws_connect 预载钩子 → ws_event（每事件一次）→ WsOutcome
 ```
 
-**挂载**（`server/src/ws.rs:46` `mirror_routes`）：递归扫 `ws.ts`（优先）/`ws.js`
-（`ws_files`，同目录并存时 `.ts` 胜），每个文件一条 `GET …/ws` 路由。源码与
+**挂载**（`mirror_routes`）：递归扫 `ws.ts`（优先）/`ws.js`
+（`ws_files`，同目录并存时 `.ts` 胜），每个文件一条 `GET …/ws` 路由，**每个文件一池**
+（`RoutePool::new(file, make, timeout, workers_per_route, idle_linger_ms)`）。源码与
 `api.ts` 共用同一套 `transpile::cached_transpile`（mtime 缓存、TS 剥类型）。
 
-**线程模型**：`JsRuntime` 是 `!Send` 的，而 axum 的 upgrade future 在多线程 reactor
-上。所以 `conn_on_pinned` 把整个 socket 搬到**专用 OS 线程**（`ws-js`），线程内建
-`current_thread` runtime，连接的一生都在这条线程上。每连接 `make()` 一个独立
-`Bridge`（独占 VM，不走 HTTP actor 池），连接结束即整体丢弃——不存在归还与复用。
+**线程模型**：`JsRuntime` 是 `!Send` 的——这条约束沉到 Worker：每 Worker 一条专用
+OS 线程（`ws-worker`，内建 `current_thread` runtime），V8 只在 Worker 里跑钩子。
+连接侧 `frame_loop` 全 Send，直接跑在 axum 多线程 reactor 上，**不再每连接起专用
+线程**；连接只持有收发通道与会话表条目（`sess.state` ≈2KB 量级），内存与连接数解耦。
 
-**三任务流水线**（`frame_loop`，通道各 cap 64 做背压）：
+**三任务流水线**（`frame_loop`，通道各 cap 64 做背压；帧经路由池调度执行）：
 
 ```
-socket ──Reader──▶ msgChan(64) ──Processor(驻留会话，串行 fire)──▶ respChan(64) ──Writer──▶ socket
-                                                       ▲
-bus 广播帧 ──────────────Bus forwarder（unbounded）────┘   （与 ws.send 同通道 → 保序）
+socket ──Reader──▶ msgChan(64) ──▶ 帧队列 ──▶ W × Worker（帧队列拉取）──▶ respChan(64) ──Writer──▶ socket
+                                                ▲
+bus 广播帧 ────────────Bus forwarder（unbounded）┘        （与 ws.send 同通道 → 保序）
 ```
 
 - **Reader**：文本/二进制帧 → `msgChan`；满了背压到 TCP 层（对端 send 变慢）。
-- **Processor**：升级后先 `sess.fire("connection", …)`，每帧组一个
-  `RequestInfo { method: "WS", body: 帧字节, bus_tx }` 触发 `message` 钩子（均经
-  `WsSession::fire`）；成功后把 `o.sends`（`ws.send` 收集）逐条、再把
-  `o.capture.body`（信封）压进 `respChan`。`o.close` 置位则跳出循环（断连前
-  `fire("close", …)` 收尾恰好一次）。
+- **Worker（帧执行）**：升级后先 `fire("connection", …)`，每帧组一个
+  `RequestInfo { method: "WS", body: 帧字节, bus_tx }` 提交池。调度器 **per-conn
+  在飞=1**：同连接帧严格保序（在飞期间后续帧在 waiting 队列排队）。Worker 执行时从
+  Rust 会话表读出该连接的 `sess.state` 注入 JS，帧末把快照回写会话表（`op_ws_sess_set`）；
+  成功后把 `o.sends`（`ws.send` 收集）逐条、再把 `o.capture.body`（信封）压进
+  `respChan`。`o.close` 置位则跳出循环（断连前 `fire("close", …)` 收尾恰好一次）。
 - **Writer**：串行写回；`respChan` 排空后发 Close 帧。ping/pong 由 axum 自动处理。
-- **Bus forwarder**：把本连接订阅的广播帧转进同一条 `respChan`。连接结束时
-  `forwarder.abort()` 收尾——否则 bus 订阅表里的发送端滞留，Writer 永不排空。
+- **Bus forwarder**：把本连接订阅的广播帧转进同一条 `respChan`（订阅时 bus 发送端经
+  `attach` 存入该连接的会话表条目）。连接结束时 `forwarder.abort()` 收尾——否则 bus
+  订阅表里的发送端滞留，Writer 永不排空。
 
-**op 层**（`src/bridge/ws.rs`，仅两个）：`op_ws_send` 把字符串 push 进
-`ReqState.ws_sends`，`op_ws_frame_close` 置位 `ReqState.ws_close`——都是「先收集、帧末统一
-执行」（v0.1.7 起改名 `op_ws_frame_close`，避开 deno_websocket 的同名 op）。HTTP
-路径不读这两项，所以同一份 handler 代码在 HTTP 里调用 `ws.*` 等价 no-op。
+**op 层**（`src/bridge/ws.rs`，三个）：`op_ws_send` 把字符串 push 进
+`ReqState.ws_sends`，`op_ws_frame_close` 置位 `ReqState.ws_close`，`op_ws_sess_set` 由
+dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态外置回传）——
+都是「先收集、帧末统一执行」（v0.1.7 起 `op_ws_frame_close` 改名，避开 deno_websocket
+的同名 op）。HTTP 路径不读这些项，所以同一份 handler 代码在 HTTP 里调用 `ws.*`
+等价 no-op。
 
 **失败语义**（表）：
 
 | 情形 | 行为 |
 |---|---|
-| handler 编译失败（文件缺失/语法错） | 发 Close 帧后结束连接，不 panic（`frame_loop` 开头） |
+| handler 编译失败（文件缺失/语法错/全缺钩子） | Worker 预载失败**锁存**：该路由后续帧一律 PoolClosed → 发 Close 帧干净断连，不 panic（`frame_loop` 开头） |
 | 单帧执行出错 | `eprintln` 记录，丢弃该帧，连接继续 |
-| 单帧超时 | runtime 被 terminate 后毒化丢弃（不归还池），**连接断开** |
+| 单帧超时 | runtime 被 terminate 后毒化丢弃（不归还池），**该连接断开**；池自动补员，其它连接无感 |
 | 写出通道满（cap 64） | `try_send` 满则**丢弃该帧**（含 bus 广播帧），不阻塞不崩溃 |
+
+### sess 会话状态与帧池约束
+
+- **必须可 JSON 序列化**：`sess.state` 每帧以 JSON 快照往返 Rust 会话表——函数、
+  Symbol 等不可序列化值**静默丢失**；超大对象会放大每帧序列化成本（会话态 ≈2KB/连接
+  是设计锚点）。
+- **模块作用域 = Worker 本地只读缓存**：模块每 Worker 预载一次，W 个 Worker 各持
+  一份模块实例——顶层变量跨帧**写入不可依赖**（下一帧可能由别的 Worker 执行，读到
+  另一份副本）。可变跨帧状态一律 `sess.state`（连接级）或 kv/bus（路由级/跨连接）。
+- **毒化半径 = 1**：帧超时只终止执行该帧的 runtime 与 Worker，会话表条目随连接断开
+  清除，排队帧作废；池补员后其它连接照常服务。
+- **连接闸门**：`ws.max_connections` 为全局并发连接上限（默认 1000，0=不限），超限
+  upgrade 直接 503；`ws.idle_linger_ms`（默认 0）控制路由连接归零后 Worker 池的保活
+  时长，到期退役、新连接 attach 复活。
 
 ## 5. 约定与红线
 
 1. **文件名一律小写 `ws.ts` / `ws.js`**（`walk_files` 精确匹配文件名，大小写敏感；
    同目录并存 `.ts` 优先）。
 2. **WS 端点不过 HTTP 前置管线**（§3），鉴权在帧内自己做。
-3. **每连接一个 VM**：连接数 ≈ 常驻内存上限（每个 V8 isolate 数 MB 级），容量规划按
-   连接数而非 QPS。
-4. **别把帧处理移回 axum 线程**——`JsRuntime` `!Send`，现有钉线程 + 流水线是唯一
-   正确姿势（`docs/modules/00-overview.md` 红线 2）。
-5. 超时/出错的 VM 一律**丢弃不归还池**（全局红线 5，WS 的每帧独占 VM 天然满足）。
+3. **内存与连接数解耦**：V8 只驻留在 Worker（每路由 `ws.workers_per_route` 个），
+   每连接只持会话态（≈2KB 量级）；容量规划看 `ws.max_connections` 闸门，连接数不再
+   ≈ 常驻内存。
+4. **V8 只在 ws-worker 线程碰**——`JsRuntime` `!Send`；连接侧 `frame_loop` 已全 Send
+   跑在 axum runtime 上，但任何 JS 执行（含 `ws_connect` 预载）都必须发生在 Worker
+   线程（`docs/modules/00-overview.md` 红线 2）。
+5. 超时/出错的 VM 一律**丢弃不归还池**（全局红线 5）：毒化 Worker 连 runtime 一起
+   弃置，池自动补员。
 
 ## 6. 测试
 
-`server/src/ws.rs` 的 11 个单测与本文件一一对应，改实现前先读、改完必跑
+`server/src/ws.rs` 的 14 个单测与本文件一一对应，改实现前先读、改完必跑
 （`cargo test -p server --lib ws`）：
 
 | 用例 | 教学点 |
 |---|---|
 | `ws_echo_roundtrip_on_pinned_thread` | 裸 echo 链路（P5a），upgrade + 钉线程 |
-| `js_route_runs_handler_per_frame` | 每帧执行 + VM 复用（第二帧仍回信封） |
+| `js_route_runs_handler_per_frame` | 每帧执行（第二帧仍回信封） |
 | `js_route_ws_send_order_and_close` | §2 顺序契约：`ws.send` 先、信封后、`ws.close` 终连 |
 | `mirror_routes_mount_directory_ws` | §1 挂载 + bus 跨会话广播（HTTP publish → WS 收帧） |
 | `mirror_routes_root_ws` | 根级 `ws.ts` → `{base}/ws`（无双斜杠） |
@@ -220,6 +249,9 @@ bus 广播帧 ──────────────Bus forwarder（unbounde
 | `js_route_error_hook_keeps_connection_alive` | 契约：`error(e)` 兜底钩子异常，之后连接继续 |
 | `js_route_close_hook_fires_exactly_once` | 契约：`close()` 收尾恰好一次（客户端断 / `ws.close()` 统一） |
 | `js_route_no_hooks_disconnects` | 契约：全缺钩子 → 连接建立即断 |
+| `gate_rejects_over_limit_with_503` | §4 闸门：超限 upgrade 返 503，存量连接不受影响；0 = 不限 |
+| `frame_pool_timeout_isolates_connections` | §4 毒化半径 = 1：超时只断该连接，其它连接无感，`sess.state` 不串 |
+| `frame_pool_preserves_per_connection_order` | §4 per-conn 保序：同连接帧严格按序执行 |
 
 手测冒烟用 §3 的三条命令即可。
 
@@ -239,7 +271,7 @@ task 门禁）。
 | 入口 | 目录镜像路由 `GET {base}/…/ws` | `new WebSocket(url)` 全局 |
 | 每帧执行 | 生命周期钩子（`message` 每帧） | 你的 `onmessage` 回调 |
 | 发帧 | `ws.send` / `json.ok`（收集制） | `socket.send(str)`（直发） |
-| VM | 每连接独占一个 | 跑在所在 handler/任务的 VM 里 |
+| VM | 路由级帧池（W 个 Worker 共享执行） | 跑在所在 handler/任务的 VM 里 |
 
 ### 7.1 可运行案例：`sample/src/tasks/task_wsclient.ts`
 

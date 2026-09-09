@@ -371,7 +371,7 @@ export default { get: detail };
 `GET {base}/{...path}/ws`：`src/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
 同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。
 
-**契约（v0.1.9 起）**：default 导出生命周期钩子对象——模块每连接加载一次，钩子按事件触发：
+**契约（v0.1.9 起，钩子签名不变）**：default 导出生命周期钩子对象，按事件触发：
 
 ```ts
 export default {
@@ -382,11 +382,21 @@ export default {
 };
 ```
 
+**执行模型（v0.1.10 帧池）**：每路由 W 个无状态 Worker（`ws.workers_per_route`，默认 2）
+共享执行该路由所有连接的帧。连接状态放 `sess.state`（Rust 会话表持久，按连接隔离，
+**必须可 JSON 序列化**——函数等不可序列化值静默丢失）；`sess.id` 为连接 id。
+模块作用域 = Worker 本地只读缓存（W 份副本）：可变跨帧状态禁止放模块作用域，
+路由级可变状态用 kv/bus。
+
+帧超时断开**该连接**（毒化只影响执行帧的 Worker，池自动补员，其它连接无感）。
+`ws.max_connections`（默认 1000，0=不限）超限 upgrade 返 503。
+
 - 四钩子全部可选，但**至少导出一个**（全缺 → 连接建立即断）。
-- 钩子内用既有全局（`json`/`http`/`ws`/`bus`/…），与 HTTP handler 一致；**返回值一律忽略**，
+- 钩子内用既有全局（`json`/`http`/`ws`/`bus`/`sess`/…），与 HTTP handler 一致；**返回值一律忽略**，
   回帧必须显式 `json.ok` / `ws.send`。
-- 模块作用域即连接状态（跨帧存活）；跨连接共享走 kv / bus。
-- 帧超时 = 必断连（钩子收不到该事件）；`error(e)` 是唯一带参钩子（e 为异常对象）。
+- 可变跨帧状态一律放 `sess.state`（顶层 `const`/`let` 只是 Worker 本地只读缓存，
+  不可依赖其跨帧写入生效）；跨连接共享走 kv / bus。
+- 帧超时 = 断开该连接（钩子收不到该事件）；`error(e)` 是唯一带参钩子（e 为异常对象）。
 
 注意：客户端**主动断连**（先发 Close 帧）路径上，`close()` 钩子仍会触发（服务端副作用如
 kv 写入照常生效），但其 `ws.send` 离帧受 RFC 6455 关闭握手限制无法送达客户端——需要离帧
@@ -397,6 +407,7 @@ kv 写入照常生效），但其 `ws.send` 离帧受 RFC 6455 关闭握手限�
 ```ts
 export default {
   connection() {
+    sess.state.ready = true;   // 会话状态外置：跨帧持久、按连接隔离
     bus.subscribe("news");
     json.ok({ subscribed: true });
   },
@@ -436,8 +447,9 @@ export default {
 2. **钩子可直接 `await`**：钩子会被驱动至 Promise 落定才捕获回帧——要拿 `publish`
    返回的「本地接收方数」，直接 `await bus.publish(...)`（kafka/rabbitmq broker 下
    该数恒 0）。
-3. **模块作用域即连接状态**：模块每连接加载一次、按事件触发钩子，顶层 `const`/`let`
-   跨帧存活且不会重复声明（跨连接共享走 kv / bus）。
+3. **无状态也够用**：钩子共享该路由的 Worker 池，模块作用域只是只读缓存——可变跨帧
+   状态放 `sess.state`（按连接隔离）或 kv/bus（跨连接）；聊天室本例全靠 bus 广播，
+   无需任何本地状态。
 
 ## 5. 导入解析
 
@@ -482,7 +494,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（19 组）
+### 总表（20 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -500,6 +512,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `log.debug / info / warn / error` | 结构化日志 |
 | `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 开箱即用） |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
+| `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
@@ -720,8 +733,10 @@ if (r.ok) {
 |---|---|---|
 | `ws.send` | `send(data: string): void` | 向当前连接发一帧（HTTP 路径下 no-op） |
 | `ws.close` | `close(): void` | 结束当前连接 |
+| `sess.id` | `number`（只读） | 当前连接 id（路由内自 1 递增） |
+| `sess.state` | 读写属性 | 连接会话状态（Rust 会话表持久，按连接隔离）；**必须可 JSON 序列化**——函数等不可序列化值静默丢失 |
 
-仅在 `ws.ts` 钩子内有意义（第 4 章）。
+仅在 `ws.ts` 钩子内有意义（第 4 章 §ws.ts——帧池执行模型与 sess 约束）。
 
 ### WebSocket —— 出站客户端（WHATWG，v0.1.7 起）
 
@@ -842,8 +857,8 @@ globalThis.APP_ENV = "prod";
 
 四条硬边界（不是建议）：
 
-- **必须幂等且无外部副作用**。执行次数 = 模块数 + `pool_size` + WS 连接数（每个 WS 连接
-  一个 runtime），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
+- **必须幂等且无外部副作用**。执行次数 = 模块数 + `pool_size` + WS Worker 数（每路由
+  `ws.workers_per_route` 个，与连接数无关），在里面写库 / 发广播 / 打外部接口会被放大同样倍数。
 - **只能组合已有全局，拿不到新能力**。`import "ext:core/ops"` 会被 deno_core 拒绝
   （`ext:` 只允许从 `ext:`/`node:` 模块导入）；需要新 op 属于改 bootstrap，不走这条路。
 - **用顶层 `await` 必须带一句 `export {};`**（或有真实 import/export）。否则文件被 CJS
@@ -1262,6 +1277,19 @@ broker:
 缺省（无 `broker:` 段）= 进程内 Bus（跨实例不互通）。`kind: kafka`/`rabbitmq` 需对应
 插件，未装 → 启动报 `unknown broker kind`。
 
+### ws —— WebSocket 运行时（v0.1.10）
+
+```yaml
+ws:
+  # max_connections: 1000      # 全局并发连接闸门：超限 upgrade 返 503；0 = 不限
+  # workers_per_route: 2       # 每路由无状态 Worker 数（共享执行该路由全部连接的帧）
+  # idle_linger_ms: 0          # 路由连接归零后 Worker 池保活毫秒数（0 = 立即退役）
+```
+
+段缺省 = 全默认。语义：内存与连接数解耦——每连接只持会话态（sess.state ≈KB 级），
+V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker 由池补员）。
+执行模型详见第 4 章 §ws.ts。
+
 ### tenant / auth
 
 字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
@@ -1589,6 +1617,6 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - `redis.default` 配置即真连且 fail-fast——CI/离线环境注释掉该段即用内存 KV。
 - 每请求至多一个 `db.tx`；漏 await 会在请求结束时自动回滚并打 warn。
 - `beforeEach` 是单一全局钩子，跨 `describe` 被覆盖——多 describe 文件在各 `it` 内联准备。
-- `ext_boot.js` 里别写库/发广播/打外部接口——执行次数是「模块数 + `pool_size` + WS 连接数」，
-  副作用按此放大；boot 只做全局装配。
+- `ext_boot.js` 里别写库/发广播/打外部接口——执行次数是「模块数 + `pool_size` + WS Worker 数
+  （每路由 `ws.workers_per_route`）」，副作用按此放大；boot 只做全局装配。
 - `ext_boot.js` 顶层 `await` 忘了 `export {};` → 看起来莫名的 SyntaxError（CJS 启发式误判）。

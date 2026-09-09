@@ -70,7 +70,7 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 |---|---|---|---|
 | `run` / `run_with(src, req)` | 执行源码（旧路径/内嵌） | 无 | 丢弃 |
 | `run_named(name)` | 走 `HandlerStore` | 无 | 丢弃 |
-| `run_with_timeout` / `run_ws` | 带 `KillSwitch`；WS 额外带出 `sends` / `close` | 有 | 丢弃（不 checkin） |
+| `run_with_timeout` / `run_ws` | 带 `KillSwitch`；WS 额外带出 `sends` / `close`（生产 WS 自 v0.1.10 改走帧池 `ws_connect`+`ws_event`，`run_ws` 仅测试/内嵌用） | 有 | 丢弃（不 checkin） |
 | `run_module(api_path, method, req, timeout)` | **生产路径**：ESM 模块 + TLA driver | 有 | 丢弃 |
 | `introspect_module(api_path)` | 启动期读 `default[m].route` | 2s（`INTROSPECT_TIMEOUT`） | 丢弃 |
 | `read_module_default(path)` | release 直载 `routes.js` | 2s | 丢弃 |

@@ -102,8 +102,10 @@ curl -H 'X-TENANT-ID: default' http://localhost:9778/v1/api/auth_demo/health/   
 > WebSocket 专题教学见 [../docs/websocket.md](../docs/websocket.md)。
 
 - `ws.ts`：**生命周期钩子**文件（`export default { connection, message, close, error }`）——
-  客户端连 `/v1/api/news/ws` 后 `connection()` 触发一次：`bus.subscribe("news")` 订阅主题并回
-  欢迎帧；`message()` 每帧触发。模块作用域即连接状态，跨帧存活。WS 也是普通路由文件，
+  客户端连 `/v1/api/news/ws` 后 `connection()` 触发一次：`sess.state.ready` 演示会话状态
+  外置（跨帧持久、按连接隔离），`bus.subscribe("news")` 订阅主题并回欢迎帧；
+  `message()` 每帧触发。执行模型为帧池：每路由 W 个无状态 Worker 共享执行，可变跨帧
+  状态放 `sess.state`（模块作用域只是 Worker 本地只读缓存）。WS 也是普通路由文件，
   走同一转译管线。
 - `chat/ws.ts`：**帧内发布**聊天室——`connection()` 进房（订阅 "chat"，连上即完成，无需
   join 帧），`message()` 每帧 `bus.publish`，任意连接发 `{"from":"neo","text":"hi"}`

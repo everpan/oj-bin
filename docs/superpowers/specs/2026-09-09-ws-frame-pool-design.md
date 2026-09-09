@@ -25,7 +25,7 @@ v0.1.9 现状：每 WS 连接独占一个 JsRuntime + 专属线程。实测（�
 | 决策点 | 结论 | 依据 |
 |---|---|---|
 | 执行模型 | **每 ws 路由 → 帧队列 + W 个无状态 Worker**（各 1 线程 + 1 个暖 JsRuntime，路由模块预载） | 用户提出并拍板「帧池解耦」 |
-| 会话状态 | **Rust 侧会话表持有 `sess.state`（JSON）**；每帧注入 worker `__sess` 槽、done-op 带回写表；JS API 面（`sess.state`/`sess.id`）不变 | 状态外置是解开爆炸半径的前提 |
+| 会话状态 | **Rust 侧会话表持有 `sess.state`（JSON）**；每帧注入 worker `__sess` 槽、dispatcher `finally` 经 `op_ws_sess_set` 带回写表；JS API 面（`sess.state`/`sess.id`）不变 | 状态外置是解开爆炸半径的前提 |
 | 超时语义 | **每连接语义回归**：帧超时 → 该 Worker 毒化丢弃 + 该帧作废 + **该连接断开**（契约同 v0.1.9）；池异步补员，其它连接/帧无感 | terminate 只影响执行帧的 isolate |
 | 保序 | **per-conn 在飞 = 1**：同连接帧严格 FIFO 串行（WS 语义），不同连接的帧在 W 个 Worker 上真并行 | WS 保序要求 |
 | worker 生命周期 | 路由队列空 + 连接归零 + `ws.idle_linger_ms`（默认 0 = 立即退役）到期 → Worker 池消亡（runtime drop、线程退出）；毒化即时补员 | 「无会话则 runtime 消亡」规则在池模型下的映射 |
@@ -56,7 +56,7 @@ per ws 路由（ws.ts 文件）:
 
 - **选帧**：Worker 从队列取「其连接无在飞帧」的队头（调度器保证）。
 - **连接建立**：暖池窗口内 = 纯 Rust 登记（会话表条目 + Reader/Writer 启动），零模块加载；池为**懒启动**（首次 attach 时 spawn+boot 一次 ≈9ms），空池按 linger 退役后首个连接重建——「零加载」是 linger 窗口内的性质。
-- **dispatcher**（每 Worker 预载一次）：`__ws_hooks` + `__ws_call(conn, ev)`（尾部 `finally` 调 done-op）+ `__sess` 单槽代理。
+- **dispatcher**（每 Worker 预载一次）：`__ws_hooks` + `__ws_call(conn, ev)`（尾部 `finally` 调 `op_ws_sess_set`）+ `__sess` 单槽代理。
 
 ### JS 侧契约（v0.2）
 
@@ -113,7 +113,7 @@ ws:
 ## 验收基准
 
 - **内存平坦**：稳态 RSS 随连接数近线性 → 近平坦；1000 连接与 100 连接的稳态 RSS 差 ≤ 8 MB（会话表 2.2 KB/连接 + 余量）
-- 连接建立：无模块编译（对齐「纯登记」语义）
+- 连接建立：暖池（linger）窗口内无模块编译——「纯登记」是 linger 窗口内的性质（懒启动/退役重建的首次 attach 含 spawn+boot ≈9ms）
 - 语义：毒化半径钉、保序钉、外置钉、闸门钉全绿；「保持语义」清单全绿
 - 吞吐：W=2 时双连接帧处理可并行（并行钉）
 
