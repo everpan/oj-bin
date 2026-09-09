@@ -1,5 +1,11 @@
-// WS 帧循环（目录镜像路由 /v1/api/news/ws）：客户端每个文本帧执行一次本文件。
-// 首帧订阅 "news" 主题：此后任意 handler 的 bus.publish("news", ...) 广播到本连接
-// （含其它实例的 HTTP 发布）；帧内 json.ok 正常回信封。TS 语法可用（统一转译管线）。
-bus.subscribe("news");
-json.ok({ subscribed: true });
+// WS 生命周期契约（目录镜像路由 /v1/api/news/ws）：
+// export default { connection, message, close, error }——connection 在连接建立后
+// 恰好触发一次（bus.subscribe 在此，订阅每连接一次，不再每帧重复）；
+// message 每帧触发，帧内容经 http.body 读取（JSON 文本帧自动 parse）。
+// 模块作用域即连接状态，跨帧存活；跨连接共享走 kv / bus。TS 语法可用（统一转译管线）。
+export default {
+  connection() {
+    bus.subscribe("news");
+    json.ok({ subscribed: true });
+  },
+};

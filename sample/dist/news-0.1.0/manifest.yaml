@@ -1,0 +1,3 @@
+name: "news"
+desc: "订阅发布演示：POST /news 广播，WS 连接订阅"
+version: "0.1.0"

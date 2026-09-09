@@ -1,0 +1,1 @@
+export default{async post(){const b=http.body;await bus.publish("news",{text:b?.text??"hello"});json.ok({published:true});}};
