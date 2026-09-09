@@ -30,7 +30,7 @@ v0.1.9 现状：每 WS 连接独占一个 JsRuntime + 专属线程。实测（�
 | 保序 | **per-conn 在飞 = 1**：同连接帧严格 FIFO 串行（WS 语义），不同连接的帧在 W 个 Worker 上真并行 | WS 保序要求 |
 | worker 生命周期 | 路由队列空 + 连接归零 + `ws.idle_linger_ms`（默认 0 = 立即退役）到期 → Worker 池消亡（runtime drop、线程退出）；毒化即时补员 | 「无会话则 runtime 消亡」规则在池模型下的映射 |
 | 连接闸门 | **config 全局上限** `ws.max_connections`（默认 1000，0 = 不限），超限拒绝 upgrade 返 503 | 前轮拍板 |
-| 派发/完成信号 | 严格串行 per Worker（一次一帧）+ **done-op**（`op_ws_event_done`）带回 `{sends, close, capture, sess_state}`；`run_event_loop` 排空不再等价单事件完成 | ops 层仅新增此一个 op |
+| 派发/完成信号 | 严格串行 per Worker（一次一帧）；Worker 即执行者，帧完成自明（排空 event loop 后直读 ReqState 收 sends/close/capture）；`op_ws_sess_set` 由 dispatcher `finally` 把 `__sess` 回传 `ReqState.ws_sess` | ops 层仅新增此一个 op + `ReqState.ws_sess` 一个字段 |
 | 否决项（存档） | 每路由全共享 1 VM / K 会话分组（被帧池取代：组级毒化 + HOL 串行两项全劣）；WebWorker（deno_core 0.411 无；Deno 的也是每 worker 独立 isolate，不省内存）；多 context（JsRealm 已 pub(crate) 单 realm）；并发交错 op 键控（帧池下无必要——并行由多 Worker 天然提供） | 专家分析 + 用户决策 |
 | W 默认值 | `ws.workers_per_route` 默认 **2**（可配；吞吐随 W 近线性扩展） | 起步保守，按 CPU 调 |
 
@@ -46,7 +46,7 @@ per ws 路由（ws.ts 文件）:
     启动：checkout → 预载路由 ws.ts（装 __ws_hooks/__ws_call/__sess 槽）→ 就绪
     loop: 取 Frame → ReqState.reset(带 bus_tx) → 注入 __sess(JSON) →
           execute_script("__ws_call(conn_lit, ev_lit)") → 排空 event loop →
-          done-op 取回 {ws_sends, ws_close, capture, __sess 新值} →
+          直读 ReqState（sends/close/capture）+ __sess 经 op_ws_sess_set 回传 →
           回写 Rust 会话表 → done_tx 回连接侧 → 取下一帧
     毒化（看门狗 fired）：丢弃 runtime（红线：不还池）→ 该帧作废 + 该连接断开 →
           通知池补员（spawn 新 Worker，异步）
@@ -55,7 +55,7 @@ per ws 路由（ws.ts 文件）:
 ```
 
 - **选帧**：Worker 从队列取「其连接无在飞帧」的队头（调度器保证）。
-- **连接建立**：纯 Rust 登记（会话表条目 + Reader/Writer 启动），**零模块加载**——三模型中最快。
+- **连接建立**：暖池窗口内 = 纯 Rust 登记（会话表条目 + Reader/Writer 启动），零模块加载；池为**懒启动**（首次 attach 时 spawn+boot 一次 ≈9ms），空池按 linger 退役后首个连接重建——「零加载」是 linger 窗口内的性质。
 - **dispatcher**（每 Worker 预载一次）：`__ws_hooks` + `__ws_call(conn, ev)`（尾部 `finally` 调 done-op）+ `__sess` 单槽代理。
 
 ### JS 侧契约（v0.2）
