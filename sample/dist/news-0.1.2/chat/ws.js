@@ -1,0 +1,1 @@
+export default{connection(){sess.state.joined=true;bus.subscribe("chat");json.ok({joined:true});},message(){const frame=http.body;if(frame&&frame.text){bus.publish("chat",{from:frame.from??"anon",text:frame.text});json.ok({sent:true});}}};

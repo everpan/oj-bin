@@ -1,0 +1,1 @@
+export default{connection(){sess.state.ready=true;bus.subscribe("news");json.ok({subscribed:true});}};

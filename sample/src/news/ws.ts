@@ -1,10 +1,10 @@
-// WS 生命周期契约（目录镜像路由 /v1/api/news/ws）：
-// export default { connection, message, close, error }——connection 在连接建立后
-// 恰好触发一次（bus.subscribe 在此，订阅每连接一次，不再每帧重复）；
-// message 每帧触发，帧内容经 http.body 读取（JSON 文本帧自动 parse）。
-// 模块作用域即连接状态，跨帧存活；跨连接共享走 kv / bus。TS 语法可用（统一转译管线）。
+// WS 帧池契约（目录镜像路由 /v1/api/news/ws）：
+// export default { connection, message, close, error }——钩子语义与 v0.1.9 一致。
+// v0.1.10 起执行模型为「帧池」：路由级 W 个无状态 Worker 共享执行，连接状态放
+// sess.state（Rust 会话表持久，可 JSON 序列化）；模块作用域 = Worker 本地只读缓存。
 export default {
   connection() {
+    sess.state.ready = true; // 演示：会话状态外置（跨帧持久、按连接隔离）
     bus.subscribe("news");
     json.ok({ subscribed: true });
   },
