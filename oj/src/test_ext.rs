@@ -106,8 +106,24 @@ deno_core::extension!(
     oj_test_ext,
     ops = [op_client_dispatch],
     esm_entry_point = "ext:oj_test_ext/test_bootstrap.js",
-    esm = [dir "src/test_ext", "test_bootstrap.js"],
 );
+
+/// oj_test_ext 的 ESM 源（编译期内嵌；理由见 `only_js::bridge::bridge_ext_init` ——
+/// `esm = [dir ...]` 会把构建机绝对路径烧进二进制，非构建机上无法初始化 JsRuntime）。
+const OJ_TEST_ESM: &[deno_core::ExtensionFileSource] = &[deno_core::ExtensionFileSource::new(
+    "ext:oj_test_ext/test_bootstrap.js",
+    deno_core::ascii_str_include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/test_ext/test_bootstrap.js"
+    )),
+)];
+
+/// 构造 `oj_test_ext`（test_bootstrap.js 编进二进制）。
+pub fn oj_test_ext_init() -> deno_core::Extension {
+    let mut ext = oj_test_ext::init();
+    ext.esm_files = std::borrow::Cow::Borrowed(OJ_TEST_ESM);
+    ext
+}
 
 #[cfg(test)]
 mod tests {
@@ -123,5 +139,16 @@ mod tests {
         let m = header_map_to_map(&h);
         assert_eq!(m["set-cookie"], "a=1, b=2");
         assert_eq!(m["x-single"], "s");
+    }
+
+    /// 回归护栏：test_ext 的 ESM 源必须内嵌（不得依赖构建机路径）。
+    #[test]
+    fn oj_test_ext_esm_source_is_embedded() {
+        assert_eq!(OJ_TEST_ESM.len(), 1);
+        assert!(OJ_TEST_ESM.iter().all(|f| f.is_runtime_loadable()));
+        assert_eq!(
+            OJ_TEST_ESM[0].specifier,
+            "ext:oj_test_ext/test_bootstrap.js"
+        );
     }
 }

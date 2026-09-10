@@ -2,6 +2,25 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.12（2026-09-11）
+
+**修复**
+- **release 产物在非构建机无法初始化 JsRuntime**（`Failed to initialize a JsRuntime:
+  No such file or directory (os error 2)`，阻断级）。根因：deno_core 0.411 的
+  `include_js_files!` 系列宏一律以 `mode=loaded` 产出
+  `ExtensionFileSource::loaded_during_snapshot(spec, concat!(env!("CARGO_MANIFEST_DIR"), ...))`
+  ——把**构建机绝对路径**烧进二进制；本仓未启用 startup snapshot，运行期按该路径读盘，
+  非构建机上必然 ENOENT。受影响的不止自身 `src/bridge/bootstrap.js` 与
+  `oj/src/test_ext/test_bootstrap.js`，还有 deno_web / deno_fetch / deno_net /
+  deno_websocket / deno_webidl 五扩展共 40 个以绝对路径声明的 JS。
+- 修复：新增 `build.rs`（版本取自 `Cargo.lock`，源码目录取自 registry 或 `vendor/`）
+  把上述 deno_* 扩展 JS 构建期 `include_str!` 进二进制，运行期由
+  `bridge::patch_fs_loaded_sources` 覆写为 `Computed` 源；自身两个 bootstrap 经
+  `ascii_str_include!` 直嵌（去掉 `esm = [dir ...]` 声明）。所有 JsRuntime 入口
+  （HTTP 池 / 任务 / `oj test`）统一经 `bridge_ext_init` / `oj_test_ext_init` 取扩展。
+- 回归护栏：`ws_client_extensions()` 打补丁后不得再有 `!is_runtime_loadable()` 的源；
+  该用例对构建机路径零依赖，任意机器可跑（不依赖源文件是否存在）。
+
 ## v0.1.11（2026-09-10）
 
 **特性（breaking）**

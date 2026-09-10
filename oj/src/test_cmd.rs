@@ -17,13 +17,13 @@ use deno_core::{
     JsRuntime, ModuleLoader, ModuleSpecifier, PollEventLoopOptions, RuntimeOptions, v8,
 };
 use only_js::bridge::OjModuleLoader;
-use only_js::bridge::bridge_ext;
+use only_js::bridge::{bridge_ext_init, patch_fs_loaded_sources, ws_client_extensions};
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::app::{App, ClientTransport};
 use crate::args::TestArgs;
 use crate::server_cmd::load_app_config;
-use crate::test_ext::oj_test_ext;
+use crate::test_ext::oj_test_ext_init;
 
 /// Rust 侧测试结果汇总（serde_v8 从 JS `__testSummary` 反序列化）。
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -117,14 +117,17 @@ async fn run_on_runtime(
     let module_loader: Option<Rc<dyn ModuleLoader>> =
         loader.map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
 
+    // bootstrap.js 顶部静态 import ext:deno_websocket/...，缺模块会让 boot
+    // 求值失败——与生产 runtime 同步拼装 WS 客户端扩展面。
+    let mut extensions = ws_client_extensions();
+    extensions.push(bridge_ext_init(stable.clone()));
+    extensions.push(oj_test_ext_init());
+    // deno_* 扩展以构建机绝对路径声明 JS；进 runtime 前统一换为内嵌源码，
+    // 否则在非构建机上 JsRuntime 初始化即 ENOENT。
+    patch_fs_loaded_sources(&mut extensions);
+
     let mut rt = JsRuntime::new(RuntimeOptions {
-        // bootstrap.js 顶部静态 import ext:deno_websocket/...，缺模块会让 boot
-        // 求值失败——与生产 runtime 同步拼装 WS 客户端扩展面。
-        extensions: only_js::bridge::ws_client_extensions()
-            .into_iter()
-            .chain(std::iter::once(bridge_ext::init(stable.clone())))
-            .chain(std::iter::once(oj_test_ext::init()))
-            .collect(),
+        extensions,
         module_loader,
         ..Default::default()
     });

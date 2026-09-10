@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use deno_core::{JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, v8};
 
 use super::module_loader::OjModuleLoader;
-use super::{RunError, StableState, bridge_ext, ws_client_extensions};
+use super::{
+    RunError, StableState, bridge_ext_init, patch_fs_loaded_sources, ws_client_extensions,
+};
 
 /// 池容量上限（空闲实例数）。设为 0 表示无上限（按需增长后保留）。
 const DEFAULT_MAX_IDLE: usize = 16;
@@ -68,10 +70,14 @@ impl RuntimePool {
             .clone()
             .map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
         JsRuntime::new(RuntimeOptions {
-            extensions: ws_client_extensions()
-                .into_iter()
-                .chain(std::iter::once(bridge_ext::init(stable.clone())))
-                .collect(),
+            extensions: {
+                let mut extensions = ws_client_extensions();
+                extensions.push(bridge_ext_init(stable.clone()));
+                // deno_* 扩展以构建机绝对路径声明 JS；进 runtime 前统一换为内嵌源码，
+                // 否则在非构建机上 JsRuntime 初始化即 ENOENT。
+                patch_fs_loaded_sources(&mut extensions);
+                extensions
+            },
             inspector: inspect,
             module_loader,
             ..Default::default()

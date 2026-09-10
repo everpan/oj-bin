@@ -31,6 +31,7 @@ pub mod cert;
 mod crypto;
 mod db;
 pub mod db_backend;
+mod embedded_js;
 mod envelope;
 mod es;
 pub(crate) mod ffi;
@@ -62,6 +63,7 @@ pub use bus_backend::{BusBackend, BusBackendRegistry};
 pub use crypto::JwtCfg;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use db_backend::{DbBackend, DbBackendRegistry};
+pub use embedded_js::patch_fs_loaded_sources;
 pub use envelope::{fail, ok, status_code};
 pub use es::EsBackend;
 pub use http::{RequestInfo, UploadedFile};
@@ -259,7 +261,6 @@ deno_core::extension!(
         mq::op_tasks_sleep,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
-    esm = [dir "src/bridge", "bootstrap.js"],
     options = { stable: Arc<StableState> },
     state = |state, options| {
         state.put(options.stable.clone());
@@ -274,6 +275,27 @@ deno_core::extension!(
         )));
     },
 );
+
+/// bridge_ext 的 ESM 源（编译期内嵌）。
+///
+/// **不**用 `esm = [dir "src/bridge", "bootstrap.js"]`：deno_core 0.411 的 `dir` 形式会
+/// 把 `concat!(CARGO_MANIFEST_DIR, ...)` 的**构建机绝对路径**编进二进制，且产出
+/// `LoadedFromFsDuringSnapshot`；未启用 startup snapshot 时运行期按该路径读盘，在非
+/// 构建机上必然 ENOENT（"Failed to initialize a JsRuntime"）。内嵌后与机器无关。
+const BRIDGE_ESM: &[deno_core::ExtensionFileSource] = &[deno_core::ExtensionFileSource::new(
+    "ext:bridge_ext/bootstrap.js",
+    deno_core::ascii_str_include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bridge/bootstrap.js"
+    )),
+)];
+
+/// 构造 `bridge_ext`（bootstrap.js 编进二进制）。所有运行入口都应经此函数取扩展。
+pub fn bridge_ext_init(stable: Arc<StableState>) -> deno_core::Extension {
+    let mut ext = bridge_ext::init(stable);
+    ext.esm_files = std::borrow::Cow::Borrowed(BRIDGE_ESM);
+    ext
+}
 
 /// 出站网络扩展面（v0.1.8，spec 2026-09-08）：deno_fetch 提供 WHATWG `fetch`
 /// 全局（bootstrap.js 从 ext:deno_fetch/26_fetch.js 导出挂载），deno_websocket
@@ -1009,6 +1031,14 @@ mod tests {
             include_str!("bootstrap.js").is_ascii(),
             "bootstrap.js must stay 7-bit ASCII (deno_core rejects non-ASCII extension code)"
         );
+    }
+
+    /// 回归护栏：bridge_ext 的 ESM 源必须内嵌（不得依赖构建机路径）。见 `BRIDGE_ESM`。
+    #[test]
+    fn bridge_ext_esm_source_is_embedded() {
+        assert_eq!(BRIDGE_ESM.len(), 1);
+        assert!(BRIDGE_ESM.iter().all(|f| f.is_runtime_loadable()));
+        assert_eq!(BRIDGE_ESM[0].specifier, "ext:bridge_ext/bootstrap.js");
     }
 
     fn new_bridge() -> (Bridge, Arc<InMemoryAccessor>) {
