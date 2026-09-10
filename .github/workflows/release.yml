@@ -125,6 +125,17 @@ jobs:
           cargo run --release -p xtask -- build
           ls -la bin/plugins/${{ matrix.triple }}/
 
+      # 发行门禁（v0.1.12）：源文件缺席冒烟——把构建机才有的 JS 源临时改名后，暂存
+      # 二进制必须仍能完成 `oj build`。deno_core 0.411 的 dir 形式曾把扩展 JS 绝对
+      # 路径烧进二进制，非构建机上 JsRuntime 初始化即 ENOENT。打包脚本
+      # （deploy.sh / deploy.bat）内亦调用同一命令；此处显式执行以便 CI 留痕。
+      - name: release gate (off-build-machine smoke)
+        shell: bash
+        run: |
+          bin="bin/oj"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then bin="bin/oj.exe"; fi
+          cargo run --release -p xtask -- smoke --bin "$bin"
+
       # 发布前跑全量测试（release 模式，与 plugin-matrix 同；infinite_loop 在部分平台会
       # SIGSEGV，跳过）。
       - name: cargo test --release (workspace, skip infinite_loop)

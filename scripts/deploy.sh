@@ -87,6 +87,15 @@ chmod +x "${TEMP_DIR}/${BINARY_NAME}"
 cp -R "${TRIPLE_DIR}" "${TEMP_DIR}/plugins/"
 cp -R "${DEVKIT}/." "${TEMP_DIR}/devkit/"
 
+# 发布门禁（v0.1.12）：把「构建机才有的 JS 源」临时改名，用暂存二进制跑最小 `oj build`
+# —— deno_core 0.411 的 dir 形式曾把扩展 JS 的绝对路径烧进二进制，非构建机上 JsRuntime
+# 初始化即 ENOENT。任何残留的路径依赖都会在此失败；实现见 `cargo xtask smoke`。
+echo "release gate: off-build-machine smoke ..."
+if ! cargo xtask smoke --bin "${TEMP_DIR}/${BINARY_NAME}"; then
+  echo "Error: 发布门禁失败——产物依赖构建机路径，不可发布" >&2
+  exit 1
+fi
+
 # 打包
 ARCHIVE_NAME="${PACKAGE_NAME}.tar.gz"
 ARCHIVE="${DIST_DIR}/${ARCHIVE_NAME}"

@@ -134,6 +134,18 @@ if errorlevel 2 (
     exit /b 1
 )
 
+rem --- release gate (v0.1.12): hide build-machine-only JS sources, then run the
+rem staged binary's minimal "oj build". deno_core 0.411 once baked absolute
+rem extension-JS paths into the binary, so off-build-machine JsRuntime init
+rem failed with ENOENT. Any leftover path dependency fails here; see
+rem "cargo xtask smoke".
+echo release gate: off-build-machine smoke ...
+cargo xtask smoke --bin "%TMPDIR%\oj.exe"
+if errorlevel 1 (
+    echo ERROR: off-build-machine smoke failed: binary depends on build-machine paths 1>&2
+    exit /b 1
+)
+
 rem --- archive: tar.exe is bsdtar, built into Windows 10 17063+ / Server 2016+.
 rem -a picks the format from the .zip extension, so no external tool is needed.
 where tar >nul 2>nul

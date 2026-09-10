@@ -5,6 +5,8 @@
 //!   cargo xtask plugin <name> --check   复用 PluginLoader 预检（ABI/身份/semver/按轴符号探测，
 //!                                       输出 desc 与 provided axes）
 //!   cargo xtask build              编译 oj + 全部第一方插件（release）并归置到 bin/
+//!   cargo xtask smoke --bin <oj>   发行门禁：把构建机才有的 JS 源临时改名后跑最小
+//!                                  `oj build`，验证产物不依赖构建机绝对路径
 //!
 //! 所有产物统一归置到 <repo>/bin/：
 //!   - 主程序 oj            -> bin/oj
@@ -17,6 +19,7 @@
 //! 复用 Task 3.2 同一加载入口保证预检与真实装配一致。
 
 use only_js::bridge::plugin_loader::{AXES, PluginManifestEntry, host_context, load_manifest};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,6 +34,16 @@ const PLUGINS: &[&str] = &[
     "bus-rabbitmq",
     "kv-redis",
     "auth",
+];
+
+/// 以绝对路径声明扩展 JS 的依赖 crate（与根 crate `build.rs` 的 `CRATES` 同步）。
+/// `cargo xtask smoke` 需要把它们从磁盘上「拿走」，以模拟非构建机环境。
+const SMOKE_CRATES: [&str; 5] = [
+    "deno_web",
+    "deno_fetch",
+    "deno_net",
+    "deno_websocket",
+    "deno_webidl",
 ];
 
 fn root() -> PathBuf {
@@ -247,8 +260,179 @@ fn check(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 发行门禁：验证打包二进制在「构建机才有的 JS 源」缺席时仍能初始化 JsRuntime。
+///
+/// 手段：把 deno_* 依赖源码目录与两个自身 bootstrap 临时改名，跑一次最小 `oj build`
+/// （introspect 路径必然初始化 JsRuntime）——任何残留的 `LoadedFromFsDuringSnapshot`
+/// 依赖都会在此 ENOENT；内嵌实现不受影响。改动见 CHANGELIST v0.1.12。
+fn smoke(bin: &Path) -> Result<(), String> {
+    let bin = fs::canonicalize(bin).map_err(|e| format!("resolve {}: {e}", bin.display()))?;
+    if !bin.is_file() {
+        return Err(format!("smoke: 不是文件：{}", bin.display()));
+    }
+
+    let probe = env::temp_dir().join(format!("oj-smoke-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&probe);
+    let src = probe.join("src").join("web").join("hello");
+    fs::create_dir_all(&src).map_err(|e| format!("mkdir {}: {e}", src.display()))?;
+    fs::write(
+        src.join("api.ts"),
+        "export default { get() { json.ok({ ok: true }); } };\n",
+    )
+    .map_err(|e| format!("write api.ts: {e}"))?;
+    fs::write(
+        probe.join("src").join("web").join("manifest.yaml"),
+        "name: web\ndesc: probe\nversion: 0.1.0\n",
+    )
+    .map_err(|e| format!("write manifest.yaml: {e}"))?;
+
+    let targets = smoke_targets()?;
+    println!(
+        "smoke: hiding {} build-machine source path(s) ...",
+        targets.len()
+    );
+    // 守护在函数返回/panic 展开时无条件还原。
+    let _hider = SourceHider::new(targets)?;
+
+    let out = Command::new(&bin)
+        .current_dir(&probe)
+        .args(["build", "-d", "src", "-o", "out"])
+        .output()
+        .map_err(|e| format!("run {}: {e}", bin.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || !stdout.contains("module(s)") {
+        return Err(format!(
+            "发布门禁失败：{} 在「源文件缺席」环境无法完成 `oj build` —— 该产物仍依赖构建机路径。\n\
+             exit={:?}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}",
+            bin.display(),
+            out.status.code()
+        ));
+    }
+    let _ = fs::remove_dir_all(&probe);
+    println!(
+        "smoke ok: {} 在源文件缺席环境完成 `oj build`",
+        bin.display()
+    );
+    Ok(())
+}
+
+/// 门禁要临时隐藏的路径：两个自身 bootstrap + deno_* 依赖源码目录。
+fn smoke_targets() -> Result<Vec<PathBuf>, String> {
+    let mut targets = vec![
+        root().join("src").join("bridge").join("bootstrap.js"),
+        root()
+            .join("oj")
+            .join("src")
+            .join("test_ext")
+            .join("test_bootstrap.js"),
+    ];
+    let lock = fs::read_to_string(root().join("Cargo.lock"))
+        .map_err(|e| format!("read Cargo.lock: {e}"))?;
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".cargo"));
+    for krate in SMOKE_CRATES {
+        let version = lock_version(&lock, krate)
+            .ok_or_else(|| format!("Cargo.lock 中找不到 `{krate}` 的版本"))?;
+        let dir = find_crate_dir(&cargo_home, krate, &version)
+            .ok_or_else(|| format!("找不到 {krate}-{version} 源码目录（先 cargo fetch）"))?;
+        targets.push(dir);
+    }
+    Ok(targets)
+}
+
+/// 临时改名守护：Drop 时还原（含 panic 展开；进程被硬杀除外 —— `new` 会先做残留恢复）。
+struct SourceHider {
+    /// (原路径, 备份路径)
+    pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+impl SourceHider {
+    fn new(targets: Vec<PathBuf>) -> Result<Self, String> {
+        let mut pairs = Vec::new();
+        for orig in targets {
+            let bak = bak_path(&orig);
+            // 上次中断残留：先还原再隐藏，避免把仓库/registry 留在缺失状态。
+            if !orig.exists() && bak.exists() {
+                fs::rename(&bak, &orig).map_err(|e| format!("recover {}: {e}", orig.display()))?;
+                println!("smoke: recovered leftover {}", orig.display());
+            }
+            if !orig.exists() {
+                return Err(format!("smoke: 待隐藏路径不存在：{}", orig.display()));
+            }
+            fs::rename(&orig, &bak).map_err(|e| format!("hide {}: {e}", orig.display()))?;
+            pairs.push((orig, bak));
+        }
+        Ok(Self { pairs })
+    }
+}
+
+impl Drop for SourceHider {
+    fn drop(&mut self) {
+        for (orig, bak) in &self.pairs {
+            if bak.exists() {
+                let _ = fs::rename(bak, orig);
+            }
+        }
+    }
+}
+
+fn bak_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.oj-smoke-bak"))
+}
+
+/// 从 Cargo.lock 取版本（与根 crate `build.rs` 同款朴素解析，避免额外依赖）。
+fn lock_version(lock: &str, name: &str) -> Option<String> {
+    let needle = format!("name = \"{name}\"");
+    let mut lines = lock.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != needle {
+            continue;
+        }
+        for line in lines.by_ref() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("version = \"") {
+                return Some(rest.trim_end_matches('"').to_string());
+            }
+            if line.starts_with("[[package]]") {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// 依赖源码目录：优先 `vendor/`（cargo vendor），其次 CARGO_HOME registry（目录名带哈希）。
+fn find_crate_dir(cargo_home: &Path, krate: &str, version: &str) -> Option<PathBuf> {
+    let vendored = root().join("vendor").join(krate);
+    if vendored.is_dir() {
+        return Some(vendored);
+    }
+    let registry_src = cargo_home.join("registry").join("src");
+    let mut found = None;
+    for entry in fs::read_dir(registry_src).ok()?.flatten() {
+        let candidate = entry.path().join(format!("{krate}-{version}"));
+        if candidate.is_dir() {
+            found = Some(candidate);
+        }
+    }
+    found
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
 fn usage() -> ! {
-    eprintln!("usage: cargo xtask <bin | plugin <name> [--check] | build>");
+    eprintln!("usage: cargo xtask <bin | plugin <name> [--check] | build | smoke --bin <path>>");
     std::process::exit(2)
 }
 
@@ -278,6 +462,14 @@ fn main() -> Result<(), String> {
             } else {
                 build_and_copy(name)
             }
+        }
+        "smoke" => {
+            let bin = args
+                .iter()
+                .position(|a| a == "--bin")
+                .and_then(|i| args.get(i + 1))
+                .ok_or_else(|| "smoke requires --bin <path>".to_string())?;
+            smoke(Path::new(bin))
         }
         _ => {
             usage();
@@ -356,5 +548,39 @@ mod tests {
         assert!(dk.join("oidc-integration.md").exists());
         assert!(dk.join("oidc-implementation.md").exists());
         assert!(dk.join("api-manual.md").exists());
+    }
+
+    #[test]
+    fn given_hidden_paths_when_hider_drops_then_originals_restored() {
+        let dir = std::env::temp_dir().join(format!("oj-xtask-hide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bootstrap.js");
+        let sub = dir.join("deno_x-0.1.0");
+        std::fs::write(&file, "x").unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        {
+            let _hider = SourceHider::new(vec![file.clone(), sub.clone()]).unwrap();
+            assert!(!file.exists() && !sub.exists());
+            assert!(bak_path(&file).exists() && bak_path(&sub).exists());
+        }
+        assert!(file.exists() && sub.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_leftover_backup_when_hider_new_then_recovered_before_hiding() {
+        let dir = std::env::temp_dir().join(format!("oj-xtask-recover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bootstrap.js");
+        // 模拟上次中断：只剩 .oj-smoke-bak。
+        std::fs::write(bak_path(&file), "x").unwrap();
+        {
+            let _hider = SourceHider::new(vec![file.clone()]).unwrap();
+            assert!(!file.exists());
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

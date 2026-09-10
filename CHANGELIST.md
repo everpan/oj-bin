@@ -21,6 +21,12 @@
 - 回归护栏：`ws_client_extensions()` 打补丁后不得再有 `!is_runtime_loadable()` 的源；
   该用例对构建机路径零依赖，任意机器可跑（不依赖源文件是否存在）。
 
+**工具 / CI**
+- 发布门禁 `cargo xtask smoke --bin <oj>`：把两个 bootstrap 与 deno_* 依赖源码目录
+  临时改名后跑最小 `oj build`，任何残留的构建机路径依赖即失败（守护在返回/panic 时
+  无条件还原，并先恢复上次中断残留）。`scripts/deploy.sh` / `scripts/deploy.bat`
+  打包前串联，`release.yml` 三平台显式执行同一命令。
+
 ## v0.1.11（2026-09-10）
 
 **特性（breaking）**
