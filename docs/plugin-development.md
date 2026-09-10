@@ -180,8 +180,8 @@ cargo xtask bin                                # 主程序 → bin/oj
 cargo xtask plugin <name>
 cargo xtask plugin <name> --check   # PluginLoader 预检（ABI/身份/semver/按轴符号，打印 desc + provided axes）
 
-# 运行宿主（dev），加载扫描
-cargo run -p oj -- serve ...
+# 运行宿主（dev），加载扫描（config/api-path 相对 CWD）
+./bin/oj server -c config.yaml --api-path src
 ```
 
 **panic 归因**：panic hook 已输出插件名 + 宿主指纹。若需源码级调试，在 `bin/plugins/<triple>/`

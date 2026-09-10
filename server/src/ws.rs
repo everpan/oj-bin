@@ -38,6 +38,8 @@ fn gate_enter(max: u64) -> bool {
 
 /// 闸门计数守卫：连接无论正常收尾、panic 还是被取消（任务被 drop，如测试
 /// runtime 关停），结束时都递减 WS_LIVE——与 gate_enter 1:1 配对，不漏减。
+/// 以 Arc 双持：upgrade 失败（on_failed_upgrade）与连接结束（on_upgrade 闭包
+/// drop）两条路径共享一份计数，任一路径终结时 GateGuard 恰好 drop 一次。
 struct GateGuard;
 impl Drop for GateGuard {
     fn drop(&mut self) {
@@ -72,15 +74,10 @@ pub fn echo_route() -> axum::Router {
 }
 
 /// 挂载 JS handler 驻留会话路由：connection/message/close 逐帧经 pool 调度
-/// （per-conn 串行保序），json.ok 信封与 ws.send 逐事件写回；
-/// timeout 为单事件熔断（池内看门狗，超时必断连）；
+/// （per-conn 串行保序），json.ok 信封与 ws.send 逐事件写回；单事件熔断超时
+/// 由池内看门狗承担（RoutePool 构造时注入，超时必断连）；
 /// opts.max_connections 为全局并发连接上限（0 = 不限），超限 upgrade 直接 503。
-pub fn js_route(
-    path: &str,
-    timeout: std::time::Duration,
-    pool: Arc<RoutePool>,
-    opts: WsOptions,
-) -> axum::Router {
+pub fn js_route(path: &str, pool: Arc<RoutePool>, opts: WsOptions) -> axum::Router {
     axum::Router::new().route(
         path,
         axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
@@ -89,12 +86,18 @@ pub fn js_route(
                 if !gate_enter(opts.max_connections) {
                     return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                 }
-                // on_upgrade 在本 axum 版本直接返回 Response（非 future），故无 .await。
-                ws.on_upgrade(move |socket| async move {
-                    // 连接真实结束（正常收尾/panic/任务取消）才递减闸门计数。
-                    let _gate = GateGuard;
-                    frame_loop(socket, pool, timeout).await;
-                })
+                // 槽位归还两条路径共享一份 Arc<GateGuard>：upgrade 半路失败
+                // （客户端握手后即 RST，axum 走 on_failed_upgrade、永不 spawn
+                // on_upgrade 回调）与连接真实结束各持一个克隆，GateGuard 恰 drop
+                // 一次——缺了 failed 路径，反复 connect+RST 可永久打满闸门（DoS）。
+                let gate = Arc::new(GateGuard);
+                let failed_gate = Arc::clone(&gate);
+                ws.on_failed_upgrade(move |_err| drop(failed_gate))
+                    .on_upgrade(move |socket| async move {
+                        // 连接真实结束（正常收尾/panic/任务取消）才递减闸门计数。
+                        let _gate = gate;
+                        frame_loop(socket, pool).await;
+                    })
             }
         }),
     )
@@ -137,7 +140,7 @@ pub fn mirror_routes(
             opts.workers_per_route,
             opts.idle_linger_ms,
         );
-        router = router.merge(js_route(&path, timeout, pool, opts));
+        router = router.merge(js_route(&path, pool, opts));
     }
     router
 }
@@ -197,11 +200,12 @@ fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
 /// 帧池连接循环（全 Send，跑在 axum runtime 上）：
 /// Reader(stream→msgChan) / Writer(respChan→sink) / Bus forwarder 三任务与 v0.1.9
 /// 逐字相同；事件循环把 connection/message/close 逐帧投给 pool（per-conn 串行、
-/// 会话状态由池的 Rust 会话表持有，worker 无状态可换人）。语义：
+/// 会话状态由池的 Rust 会话表持有，worker 无状态可换人；单帧超时熔断在池内
+/// 看门狗，本函数不再持有 timeout）。语义：
 /// Timeout = 必断连（V8 已 terminate，worker 弃会话）；Core = 丢帧继续；
 /// PoolClosed = 干净断连；客户端 Close/socket 断 = 正常收尾。
 /// 所有退出路径都先 detach（删会话条目 + 丢排队帧 + 空池退役计时）再收尾写出。
-async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>, _timeout: std::time::Duration) {
+async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
     let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
     let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
     // bus 会话端：发送端经 attach 存入池会话表（worker publish 用）；收到的广播帧转写回 socket。
@@ -248,7 +252,7 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>, _timeout: std::time
             handle.detach();
             return;
         }
-        Err(e) => eprintln!("ws connection: {e:?}"),
+        Err(e) => eprintln!("ws connection: {e}"),
     }
 
     // Writer：respChan → 串行写回；通道排空（连接结束）后发 Close 帧干净关闭。
@@ -286,14 +290,14 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>, _timeout: std::time
                 break;
             }
             // error() 缺失或自身抛：丢帧继续（与「error 后连接继续」决策一致）。
-            Err(e) => eprintln!("ws frame error: {e:?}"),
+            Err(e) => eprintln!("ws frame error: {e}"),
         }
     }
     if alive {
         // close 恰好一次，尽力而为：钩子可 ws.send 离帧，失败只记日志。
         match handle.fire("close", Vec::new()).await {
             Ok(o) => emit(&resp_tx, o),
-            Err(e) => eprintln!("ws close: {e:?}"),
+            Err(e) => eprintln!("ws close: {e}"),
         }
     }
     handle.detach(); // 所有退出路径汇合：删会话条目 + 丢排队帧 + 空池退役计时
@@ -303,6 +307,9 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>, _timeout: std::time
 }
 
 #[cfg(test)]
+// ws_e2e_lock 故意持 std MutexGuard 跨 await：串行化 e2e 用例以隔离进程级
+// WS_LIVE；单线程 runtime 各占一线程，无跨 await 死锁（见 ws_e2e_lock 注释）。
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::app;
@@ -368,6 +375,22 @@ mod tests {
     fn ws_e2e_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 等 WS_LIVE 归零：上个用例的 serve 任务在其 runtime 关停时才归还槽位，可能
+    /// 滞后于锁释放落入本用例；straggler 只会递减，归零后持锁期间即稳定在 0。
+    /// 闸门用例（max_connections=1）对存量槽位敏感，归零是硬前提。
+    async fn ws_live_zero() {
+        for _ in 0..200 {
+            if WS_LIVE.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "WS_LIVE did not drain to 0 in 2s: {}",
+            WS_LIVE.load(Ordering::Relaxed)
+        );
     }
 
     /// ws_connect 走 ESM import：bridge 必须带模块加载器（project_root 指向临时目录）。
@@ -477,6 +500,7 @@ mod tests {
                 actor,
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -484,7 +508,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/bus",
-                std::time::Duration::from_secs(1),
                 RoutePool::new(
                     handler,
                     Arc::new(make_bridge),
@@ -528,6 +551,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -561,6 +585,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -568,7 +593,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/js",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -591,6 +615,8 @@ mod tests {
     #[tokio::test]
     async fn gate_rejects_over_limit_with_503() {
         let _e2e = ws_e2e_lock();
+        // 闸门是进程级计数：straggler 槽位未归零时「第 1 条连接」也会吃 503。
+        ws_live_zero().await;
         let t = crate::tests::routes(&[]);
         let handler = t.0.join("ws.js");
         std::fs::write(
@@ -607,6 +633,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -614,7 +641,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/gate",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions {
                     max_connections: 1,
@@ -642,6 +668,29 @@ mod tests {
         assert!(c1.read_text().await.contains("\"pong\":1"));
     }
 
+    /// upgrade 半路失败的槽位归还钉（v0.1.10 终审 Critical #1）：gate_enter 计数
+    /// 与 GateGuard 递减必须 1:1——Arc 双克隆（on_failed_upgrade / on_upgrade 各持
+    /// 一份）共享一个 Guard，两份克隆都 drop 后 WS_LIVE 恰好回到原值（不多减、
+    /// 不漏减）。真实握手失败需客户端 RST 竞态时序，集成层不可稳定复现；本钉锁死
+    /// 修复依赖的配对语义——若有人退回「只在 on_upgrade 闭包里 new GateGuard」，
+    /// failed 路径无对应克隆，本测试与 js_route 装配的共同前提即被破坏。
+    #[tokio::test]
+    async fn gate_slot_returned_exactly_once_via_shared_guard() {
+        let _e2e = ws_e2e_lock();
+        // 基线前等 straggler 槽位归零：上个用例释放锁后其 runtime 关停才归还，
+        // 迟来递减会把终值拉低（Windows 复现：left 0 right 1）。
+        ws_live_zero().await;
+        let before = WS_LIVE.load(Ordering::Relaxed);
+        assert!(gate_enter(u64::MAX));
+        assert_eq!(WS_LIVE.load(Ordering::Relaxed), before + 1);
+        let gate = Arc::new(GateGuard);
+        let failed_gate = Arc::clone(&gate);
+        drop(failed_gate); // on_failed_upgrade 路径先终结：Guard 仍被 gate 持有，不减
+        assert_eq!(WS_LIVE.load(Ordering::Relaxed), before + 1);
+        drop(gate); // 另一路径终结：Guard 唯一一次 drop，恰好减一
+        assert_eq!(WS_LIVE.load(Ordering::Relaxed), before);
+    }
+
     /// ws.send 先于信封写出、ws.close 结束连接（顺序契约）。
     #[tokio::test]
     async fn js_route_ws_send_order_and_close() {
@@ -662,6 +711,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -669,7 +719,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/close",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -740,6 +789,7 @@ mod tests {
                 JsActor::pool(1, make.clone()),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -806,6 +856,7 @@ mod tests {
                 JsActor::pool(1, make.clone()),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -842,6 +893,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -849,7 +901,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/missing",
-                std::time::Duration::from_secs(1),
                 test_pool(&t.0.join("nope.js"), std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -940,6 +991,7 @@ mod tests {
                 JsActor::pool(1, make.clone()),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1012,6 +1064,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1019,7 +1072,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/err",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -1056,6 +1108,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1063,7 +1116,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/bye",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -1094,6 +1146,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1101,7 +1154,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/nohooks",
-                std::time::Duration::from_secs(1),
                 test_pool(&handler, std::time::Duration::from_secs(1)),
                 WsOptions::default(),
             )),
@@ -1154,6 +1206,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1161,7 +1214,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/iso",
-                timeout,
                 test_pool(&handler, timeout),
                 WsOptions::default(),
             )),
@@ -1221,6 +1273,7 @@ mod tests {
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
                 None,
+                "/".to_string(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
@@ -1228,7 +1281,6 @@ mod tests {
             )
             .merge(js_route(
                 "/ws/order",
-                timeout,
                 test_pool(&handler, timeout),
                 WsOptions::default(),
             )),

@@ -268,8 +268,9 @@ fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, Str
     Ok((jwt, oidc))
 }
 
-/// 静态站点根（装配第 20 步）：`server.app_path`（CLI `--app-path` 可覆盖）相对 config_dir
-/// 绝对化；目录缺失 → fail-fast。
+/// 静态站点根（装配第 20 步）：config `server.app_path` 相对 config_dir 绝对化（CLI
+/// `--app-path` 覆盖值已在 server_cmd 按 CWD 预绝对化，此处见到的即绝对路径）；
+/// 目录缺失 → fail-fast。
 fn resolve_static_root(cfg: &Config, config_dir: &Path) -> Result<Option<PathBuf>, String> {
     let Some(r) = &cfg.server.app_path else {
         return Ok(None);
@@ -571,18 +572,32 @@ impl App {
                 failures.len()
             );
         }
-        for (_, file, methods) in table.grouped() {
-            eprintln!("  {}:", file.display());
-            for (method, pattern) in methods {
-                eprintln!("    {:8} {}", method, pattern);
+        // 路由清单：等宽三列平铺表（METHOD/PATH/FILE，列宽自适应），比
+        // 「文件头 + 缩进方法」紧凑易扫。顺序沿用 grouped() 的决定序。
+        let rows: Vec<(String, String, String)> = table
+            .grouped()
+            .into_iter()
+            .flat_map(|(_, file, ms)| {
+                let f = file.display().to_string();
+                ms.into_iter().map(move |(m, p)| (m, p, f.clone()))
+            })
+            .collect();
+        if !rows.is_empty() {
+            let wm = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(6);
+            let wp = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(4);
+            eprintln!("  {:<wm$}  {:<wp$}  FILE", "METHOD", "PATH");
+            for (m, p, f) in &rows {
+                eprintln!("  {m:<wm$}  {p:<wp$}  {f}");
             }
         }
         let n = cfg.server.pool_size.max(1) as usize;
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
-        // 静态站点根（server.app_path，CLI --app-path 可覆盖）：相对 config_dir 绝对化（缺失目录 fail-fast）。
+        // 静态站点根（server.app_path）：相对 config_dir 绝对化（CLI --app-path 已按 CWD 预绝对化）；缺失目录 fail-fast。
         let static_root = resolve_static_root(&cfg, config_dir)?;
+        // 静态站点前缀（server.app_prefix，默认 "/"）：归一 + 非法值 fail-fast。
+        let app_prefix = crate::server_cmd::resolve_app_prefix(&cfg.server.app_prefix)?;
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
@@ -615,6 +630,7 @@ impl App {
             actor,
             timeout,
             static_root,
+            app_prefix,
             pipeline,
             cert_status,
             cert_valid_until,

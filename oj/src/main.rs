@@ -22,7 +22,11 @@ pub async fn run_command(cmd: Command) -> i32 {
         Command::Server(a) => match oj::server_cmd::run(a).await {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("oj server: {e}");
+                let msg = format!("oj server: {e}");
+                // console 关闭时 fd 2 已被 tee 重定向，此行只落盘；再直写原终端，
+                // 让启动失败的最终原因在屏幕上立即可见（console 开启时镜像已回显，补写会重复）。
+                eprintln!("{msg}");
+                server::logging::echo_terminal(&msg);
                 1
             }
         },

@@ -17,14 +17,15 @@
 |---|---|---|
 | `host` | `"localhost"` | |
 | `port` | `9778` | 与 README / `sample/config.yaml` 一致；由 `config.rs` 的默认值单测钉死 |
-| `base` | `"/v1/api"` | API 前缀；CLI `-b` 覆盖；空前缀拒绝（避免全 404 静默坑） |
-| `app_path` | `None` | 静态站点根（相对 config 目录）；`None` = 不开静态服务 |
+| `api_prefix` | `"/v1/api"` | API 前缀；CLI `-b` 覆盖；空前缀拒绝（避免全 404 静默坑）。旧键 `base` 兼容（serde alias，并存报错） |
+| `app_prefix` | `"/"` | 静态站点前缀；`/` = 全路径兜底；非 `/` 时仅前缀下的 GET/HEAD 落静态（前缀剥除后解析），前缀外 404；API 永远优先。不以 `/` 开头 → fail-fast |
+| `app_path` | `None` | 静态站点根（相对 config 目录；CLI `--app-path` 相对 CWD）；`None` = 不开静态服务 |
 | `timeout` | `"30s"` | 单请求执行超时，超时 → 408 |
 | `pool_size` | `4` | JS 执行并发度（= actor 数） |
 | `max_upload_bytes` | `10 MiB` | 超出 → 信封 413；axum 层 2x 硬顶（裸 413） |
 | `logs_dir` | `None` → `<config>/logs` | 每次启动一个 `server-<秒>_<pid>.log` |
 | `logs_max_m` / `logs_keep_files` | `100` / `10` | 单文件上限（<100 按 100）/ 保留个数（最小 2） |
-| `console_log` | `false` | 默认只落盘，终端保持干净；`--console-log` 打开 |
+| `console_log` | `false` | 默认只落盘，终端保持干净；`--console-log` 打开。启动失败的最终退出原因无论开关都直写终端（`echo_terminal`） |
 | `public_key_path` / `certificate_path` | `""` | **证书必配**，两路径缺任一 → 装配拒绝启动 |
 | `grace_days` | `30` | 过期后宽限天数（期间服务起得来，但 GET 被限） |
 | `migrate_on_start` | `None` | `auto` / `verify` / `off`；缺省按模式取：dev=auto、release=verify |
@@ -58,7 +59,7 @@
 | `blob` 平铺/命名歧义 | `BlobSection::entries()` |
 | `auth.jwt_secret` 非空 | `oj/src/app.rs:241` |
 | `migrate_on_start` / `ownership_guard` 非法值 | `oj/src/app.rs:173-192` |
-| `server.base` 为空 | `oj/src/server_cmd.rs:95` |
+| `server.api_prefix` 为空 | `oj/src/server_cmd.rs:95` |
 | 模块名/版本白名单 | `oj/src/manifest.rs:25,37` |
 | schema.yaml 标识符白名单 `[A-Za-z_][A-Za-z0-9_]*` | `oj/src/schema.rs:103` |
 

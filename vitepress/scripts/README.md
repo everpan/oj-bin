@@ -1,6 +1,6 @@
 # 站点脚本
 
-两个脚本，都由 `docs/vitepress/package.json` 的 npm scripts 调用：
+两个脚本，都由 `vitepress/package.json` 的 npm scripts 调用：
 
 | 脚本 | 命令 | 作用 |
 |---|---|---|
@@ -44,6 +44,12 @@ VitePress 的页面必须落在 `srcDir`（这里是 `src/`）里。让站点直
 2. 跑 `pnpm run sync`；
 3. 若它是新分组，还要在 `.vitepress/config.mts` 的 `sidebar` 里加条目；
 4. 跑 `pnpm run verify` 确认无死链。
+
+**例外 —— sample 模块专题**：`sample/src/*/README.md` 无需登记，sync 时一层 glob 自动收录
+（路由 `/sample/<目录名>`，标题取 README 首个 `# ` 行；要定制 title/route 才在 `ENTRIES`
+显式登记，显式项优先）。全量模块清单（显式 + 自动）由 sync 写进
+`.vitepress/generated/sidebar.mjs` 的 `sampleModules` 导出，config.mts 的「示例实战」
+分组直接展开它——新增模块只丢一份 README.md，sync 后自动进站、自动上 sidebar。
 
 不想收录但要留指路的文档，写进 `EXCLUDED` 集合（链接会被改写到 `/appendix/history-index`），
 或在 `appendix/history-index.md` 里登记。

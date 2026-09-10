@@ -12,6 +12,8 @@
 //! 终端输出默认关闭（`server.console_log` / CLI `--console-log` 打开）：关闭时镜像线程
 //! 不回写原终端，输出只落盘。注意 tracing 控制台层写的是 **stderr**，故开关同时静默
 //! fd 1 与 fd 2；非 unix 平台没有落盘，此时强制保留终端输出并告警（否则日志会彻底消失）。
+//! 例外：静默时原始 stderr fd 有副本存档，[`echo_terminal`] 供进程退出前把致命原因
+//! 直写终端 —— 静默是让运行日志不打扰终端，不是把启动失败也藏起来。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +27,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 static INITED: AtomicBool = AtomicBool::new(false);
+/// console 关闭时 fd 已被 tee 重定向：终端被静默，原始 stderr fd 存于 CONSOLE_STDERR_FD。
+#[cfg(unix)]
+static TERMINAL_MUTED: AtomicBool = AtomicBool::new(false);
+/// 原始（tee 重定向前）stderr 的 fd 副本；-1 = 未保存。由镜像线程持有，不关闭。
+#[cfg(unix)]
+static CONSOLE_STDERR_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// 解析日志目录：绝对路径原样；相对 → 相对 config_dir；未配置 → config_dir/logs。
 pub fn resolve_logs_dir(logs_dir: Option<&str>, config_dir: &Path) -> PathBuf {
@@ -129,14 +137,47 @@ pub fn install_terminal_tee(
     // 滚动语义要求活动文件 + 至少一个后移位（keep<2 无法滚动，钳到 2）。
     let writer = Arc::new(Mutex::new(LogWriter::new(base, max_bytes, keep.max(2))));
 
+    // 原始终端 stderr 副本，供 echo_terminal 直写；dup 本身 unsafe，先于重定向取值。
+    let err_console = unsafe { libc::dup(2) };
     // SAFETY: 纯 fd 操作：原始 stdout/stderr 先 dup 保存；各自管道写端替换 fd 1/2；
     // 读端与保存的 fd 全部移交镜像线程，按进程生命周期泄漏。
     unsafe {
         redirect_fd(1, libc::dup(1), writer.clone(), console)?;
-        redirect_fd(2, libc::dup(2), writer, console)?;
+        redirect_fd(2, err_console, writer, console)?;
+    }
+    if !console {
+        // 两条 fd 均重定向成功且终端被静默：记下原始 stderr，供退出前直写致命错误。
+        TERMINAL_MUTED.store(true, Ordering::SeqCst);
+        CONSOLE_STDERR_FD.store(err_console, Ordering::SeqCst);
     }
     Ok(())
 }
+
+/// 把一行（通常为启动失败的退出原因）**直写原始终端** stderr，绕过 tee 管道。
+/// 仅 console 关闭（fd 已被重定向、终端被静默）时生效 —— 此时常规 `eprintln!` 只落盘，
+/// 用户在终端什么也看不到；console 开启时输出本就经镜像回显，不补写（避免重复）。
+#[cfg(unix)]
+pub fn echo_terminal(line: &str) {
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+
+    if !TERMINAL_MUTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let fd = CONSOLE_STDERR_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        return;
+    }
+    // 不取得 fd 所有权：该 fd 由镜像线程持有至进程结束，ManuallyDrop 防 File drop 时误关。
+    let mut w = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    let _ = w.write_all(format!("{line}\n").as_bytes());
+    let _ = w.flush();
+}
+
+/// 非 unix 平台无 fd 重定向，终端输出始终可见，无需补写。
+#[cfg(not(unix))]
+pub fn echo_terminal(_line: &str) {}
 
 /// 启动期清理：删掉 logs_dir 里超出 `keep` 的最旧历史日志（`server-*.log`，含滚动件）。
 #[cfg(unix)]

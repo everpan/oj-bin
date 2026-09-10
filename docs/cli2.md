@@ -21,12 +21,15 @@
       other: "redis://user:password@127.0.0.1:6379/2"
   ```
 
-  -b base 覆盖 API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
+  -b base 覆盖 API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
 
-  --api-path dir 以 `dir` 作为项目的服务目录（`src` 源码树或 `oj build` 产物 `dist`）；
-                 缺省时 src 目录存在取 src，否则 dist。模式自动判定：目录含
+  --api-path dir 以 `dir` 作为项目的服务目录（`src` 源码树或 `oj build` 产物 `dist`，
+                 相对 CWD）。模式自动判定：目录含
                  `manifests.yaml` ⇒ release（服务预转译 JS，按锁聚合，不转译），
-                 否则 dev（按需转译 TS，notify 热重载）。一个开发中的服务目录如下
+                 否则 dev（按需转译 TS，notify 热重载）。缺省时不开 API 功能 ——
+                 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
+                 至少显式指定其一，否则退出；两者皆指定则都必须存在，任一缺失退出；
+                 仅指定其一即只启用对应功能。一个开发中的服务目录如下
   ```
     dist   # 编译目录与src结构相同
     src    # 源码目录，首层子目录为模块名
@@ -40,8 +43,9 @@
         └── manifest.yaml # user 模块的清单
   ```
 
-  其他旗标：`--app-path <dir>`（静态站点目录）、`--cert-path` / `--key-path`（JWS 证书与
-  公钥路径）、`--console-log`（打开终端输出，默认只落盘 server.logs_dir）。
+  其他旗标：`--app-path <dir>`（静态站点目录，相对 CWD；config 中的 `server.app_path` 相对 config 目录）、`--cert-path` / `--key-path`（JWS 证书与
+  公钥路径）、`--console-log`（打开终端输出，默认只落盘 server.logs_dir；启动失败的
+  最终退出原因无论开关都直写终端）。
 
    每个模块目录下包含一个配置文件 manifest.yaml 用于记录该模型的相关清单，其案例结构如下
   ```yaml
@@ -116,7 +120,7 @@
     oj test [-c config.yaml] [-b base] [-d dir] [-t tests] [--format human|tap|junit|json] [--output file]
 ```
       -c      配置文件，默认 `config.yaml`
-      -b      API 基础前缀覆盖（缺省用 config 的 server.base）
+      -b      API 基础前缀覆盖（缺省用 config 的 server.api_prefix）
       -d      服务目录 src 或 dist（缺省自动判定）
       -t      测试用例目录，相对 config 目录，默认 `tests`
       --format 报告格式：human（默认）/ tap / junit / json

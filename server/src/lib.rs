@@ -49,6 +49,9 @@ pub struct AppState {
     timeout: Option<std::time::Duration>,
     /// 静态站点根（config server.app_path / CLI --app-path）；None → 不开静态服务。
     static_root: Option<PathBuf>,
+    /// 静态站点前缀（server.app_prefix，默认 "/"）。非 "/" 时仅该前缀下的 GET/HEAD
+    /// 落静态（前缀剥除后解析，前缀根 → index.html）；API 路由永远优先。
+    app_prefix: String,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
     pipeline: Pipeline,
     /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
@@ -111,6 +114,7 @@ pub fn app(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    app_prefix: String,
     pipeline: Pipeline,
     certificate_status: Arc<RwLock<CertificateStatus>>,
     certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
@@ -138,6 +142,7 @@ pub fn app(
             actor,
             timeout,
             static_root,
+            app_prefix,
             pipeline,
             base: base.to_string(),
             certificate_status,
@@ -243,6 +248,7 @@ pub async fn serve_with_listener(
             actor,
             timeout,
             static_root,
+            "/".to_string(),
             pipeline,
             Arc::new(RwLock::new(CertificateStatus::Valid)),
             Arc::new(RwLock::new(None)),
@@ -425,10 +431,13 @@ async fn handle(
             None => return fail_response(405, &format!("method {verb} not mapped")),
         }
     }
-    // 静态站点兜底（server.app_path）：API 优先，GET/HEAD only。
+    // 静态站点兜底（server.app_path + app_prefix）：API 优先，GET/HEAD only。
+    // 非 "/" 前缀时仅服务前缀下的请求（前缀剥除后解析；前缀根 → index.html），
+    // 前缀外的路径不走静态 —— 与「API 路由永远优先」同层保障。
     if let Some(root) = st.static_root.as_deref()
         && matches!(verb, "GET" | "HEAD")
-        && let Some(file) = resolve_static(root, uri.path())
+        && let Some(rel_path) = strip_app_prefix(&st.app_prefix, uri.path())
+        && let Some(file) = resolve_static(root, rel_path)
         && let Ok(body) = tokio::fs::read(&file).await
     {
         return file_response(&file, body);
@@ -449,6 +458,22 @@ fn decode_blob_key(s: &str) -> Option<String> {
 /// 静态文件解析：uri.path()（仍 percent-encoded）逐段解码后拼 root；
 /// 根/目录 → index.html；越界段（`.`/`..`/`\`/`/`/`\0`/空段，含解码后——
 /// `%2F` 走私等价穿越）→ None（404）。
+/// 请求路径 → 静态解析用的相对路径（剥 `app_prefix`）。
+/// 前缀 "/" → 原样（全路径兜底，行为与旧版一致）；非 "/" 前缀：精确命中前缀根
+/// → "/"（resolve_static 落 index.html），`前缀/...` → "/..."，前缀外（含仅前缀
+/// 更长串如 `/sitex`）→ None（404）。
+/// 自由函数（handle() 处 `st` 已被闭包部分移动，方法接收者会整借 `st`）。
+fn strip_app_prefix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    if prefix == "/" {
+        return Some(path);
+    }
+    if path == prefix {
+        return Some("/");
+    }
+    path.strip_prefix(prefix)
+        .filter(|rest| rest.starts_with('/'))
+}
+
 fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
     let rel = uri_path.strip_prefix('/')?.trim_end_matches('/');
     let mut p = root.to_path_buf();
@@ -604,6 +629,7 @@ pub(crate) mod tests {
             actor: make_actor(PathBuf::from("."), false),
             timeout: None,
             static_root: None,
+            app_prefix: "/".to_string(),
             pipeline: Pipeline::default(),
             base: "/v1/api".to_string(),
             certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
@@ -1545,6 +1571,18 @@ pub(crate) mod tests {
         ] {
             assert_eq!(resolve_static(root, p), None, "{p}");
         }
+    }
+
+    #[test]
+    fn strip_app_prefix_modes() {
+        // "/" = 全路径兜底（与旧版一致）。
+        assert_eq!(strip_app_prefix("/", "/a/b"), Some("/a/b"));
+        // 非 "/" 前缀：前缀根 → "/"；前缀下 → 剥除；前缀外 → None。
+        assert_eq!(strip_app_prefix("/site", "/site"), Some("/"));
+        assert_eq!(strip_app_prefix("/site", "/site/"), Some("/"));
+        assert_eq!(strip_app_prefix("/site", "/site/x/y"), Some("/x/y"));
+        assert_eq!(strip_app_prefix("/site", "/sitex"), None);
+        assert_eq!(strip_app_prefix("/site", "/other/x"), None);
     }
 
     // 静态断言：axum state 可跨线程（Send 边界）。

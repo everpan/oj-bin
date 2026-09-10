@@ -12,9 +12,15 @@ pub struct ServerCfg {
     pub host: String,
     pub port: u16,
     /// API 基础路由前缀（如 "/v1/api"）；CLI `-b` 显式给出时覆盖。
-    pub base: String,
+    /// 旧键名 `base` 仍可解析（serde alias），两键并存 → duplicate field 报错。
+    #[serde(alias = "base")]
+    pub api_prefix: String,
+    /// 静态站点前缀（默认 "/" = 全路径兜底）。非 "/" 时仅该前缀下的 GET/HEAD
+    /// 落静态目录（前缀剥除后解析；前缀根 → index.html），前缀外一律 404。
+    /// API 路由永远优先于静态兜底。
+    pub app_prefix: String,
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
-    /// CLI `--app-path` 显式给出时覆盖（与 oj server 的旗标同名）。
+    /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（server_cmd 预绝对化后写入）。
     pub app_path: Option<String>,
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
@@ -58,7 +64,8 @@ impl Default for ServerCfg {
             // 9778：与 README / sample/config.yaml / devkit 手册一致（此前为 778，
             // 省缺 port 的用户会静默落到与文档不同的端口）。
             port: 9778,
-            base: "/v1/api".into(),
+            api_prefix: "/v1/api".into(),
+            app_prefix: "/".into(),
             app_path: None,
             timeout: "30s".into(),
             pool_size: 4,
@@ -425,7 +432,8 @@ mod tests {
     fn defaults_when_no_file() {
         let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
         assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 9778));
-        assert_eq!(c.server.base, "/v1/api");
+        assert_eq!(c.server.api_prefix, "/v1/api");
+        assert_eq!(c.server.app_prefix, "/");
         assert!(c.server.app_path.is_none());
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);
         assert_eq!(c.server.pool_size, 4);
@@ -471,14 +479,17 @@ mod tests {
     fn parses_url_style_dsn_map() {
         let dir = std::env::temp_dir().join(format!("ojcfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // `base:` 为旧键名（serde alias）——本用例兼测旧配置兼容；新键 `api_prefix`
+        // 与旧键并存时 serde 报 duplicate field（防两处配置漂移）。
         std::fs::write(dir.join("cfg.yaml"), concat!(
-            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  app_path: public\n  timeout: 5s\n  pool_size: 2\n",
+            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  app_prefix: /site\n  app_path: public\n  timeout: 5s\n  pool_size: 2\n",
             "db:\n  default: sqlite://db.sqlite\n",
             "redis:\n  default: redis://127.0.0.1:6379/1\n",
         )).unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert_eq!(c.server.host, "0.0.0.0");
-        assert_eq!(c.server.base, "/xapi");
+        assert_eq!(c.server.api_prefix, "/xapi");
+        assert_eq!(c.server.app_prefix, "/site");
         assert_eq!(c.server.app_path.as_deref(), Some("public"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);

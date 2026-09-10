@@ -40,15 +40,20 @@ toB 项目的实施过程中，往往需要 `低代码` 来快速交付。市场
 ## 快速开始
 
 ```bash
-cargo build                                                   # 首次构建会拉取预编译 V8
+cargo xtask build            # 构建并归置 bin/oj + bin/plugins/<triple>/（release；首次拉取预编译 V8）
 
 # dev：直接跑 .ts 源码（目录内无 manifests.yaml → 自动判定 dev/ts，改文件即生效）
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
+./bin/oj server -c sample/config.yaml --api-path sample/src
 
 # release：先构建产物，再跑 dist/（目录内有 manifests.yaml → 自动判定 release/js）
-cargo run -p oj -- build  -d sample/src -o sample/dist
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
+./bin/oj build  -d sample/src -o sample/dist
+./bin/oj server -c sample/config.yaml --api-path sample/dist
 ```
+
+> 统一使用编译产物 **`bin/oj`** 运行示例与业务：它由 `cargo xtask build` 一次性产出
+> （含全部第一方插件 cdylib），运行期不依赖 cargo / Rust 工具链，同一产物在相同平台
+> 的不同环境间直接拷贝可用——比 `cargo run` 更可移植、行为更一致。命令路径参数相对
+> **当前工作目录**（CWD）；以下文档示例均默认在仓库根执行。
 
 启动时把模块清单与路由表写入日志（**终端默认静默**，只落盘；加 `--console-log`
 或配 `server.console_log: true` 可让终端也输出）：
@@ -63,6 +68,27 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ```
 
 > 网络受限时设 `V8_FROM_SOURCE=0` 强制走预编译包——**不要**从源码编译 V8。
+
+### 关于 `bin/oj`：统一的编译产物入口
+
+`cargo xtask build` 一次性产出 `bin/oj`（主程序）与 `bin/plugins/<host-triple>/`
+（全部第一方插件 cdylib）。**所有示例与业务运行统一走 `bin/oj`**：
+
+| 命令 | 作用 |
+|---|---|
+| `./bin/oj server -c <config> --api-path <src\|dist>` | 启动服务（目录无/有 `manifests.yaml` 自动判定 dev/ts、release/js） |
+| `./bin/oj build -d <src> -o <dist>` | 构建模块：转译 TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
+| `./bin/oj test -c <config>` | 进程内跑 `*.test.ts` 用例（无需起服务） |
+| `./bin/oj migrate / fixture / schema diff` | 迁移 / 演示数据 / schema 对账（详见 `docs/user-manual.md`） |
+
+- **可移植**：`bin/oj` + `bin/plugins/<triple>/` 即自包含发行单元——目标机无需
+  Rust / cargo / Node 工具链，整体拷贝即可运行（或直接用 `scripts/deploy.sh`
+  产出发行包）；`cargo build --workspace` 供开发期构建，产物同样归置到 `bin/`。
+- **一致**：文档示例、CI、生产共用同一入口，不随 cargo 调用方式与特性解析变化。
+- **路径语义**：CLI 的 `--api-path` / `--app-path` 相对**当前工作目录**（CWD）；
+  config 内的 `server.app_path` 相对 config 文件所在目录。
+- **准入门**：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式
+  指定其一，否则启动退出；两者皆指定时必须都存在。
 
 ---
 
@@ -130,7 +156,7 @@ sample/src/
   `detail.route = "{id}"` 使 `/v1/api/user/item/{id}` 可达（此时 `/v1/api/user/item` 为 404）。
 - **WebSocket**：`ws.ts` 每收到一个文本帧执行一次。首帧 `bus.subscribe("news")` 订阅主题后，
   任意 handler（含其它实例）的 `bus.publish("news", ...)` 都会广播到该连接。
-- **前缀**：`/v1/api` 来自 config 的 `server.base`，可用 `-b` 覆盖。
+- **前缀**：`/v1/api` 来自 config 的 `server.api_prefix`，可用 `-b` 覆盖。
 
 ---
 
@@ -142,8 +168,9 @@ sample/src/
 server:
   host: "localhost"
   port: 9778
-  base: "/v1/api"      # API 前缀
-  root: "dist"          # 静态站点根（省略 = 不开静态服务）
+  api_prefix: "/v1/api"  # API 前缀（旧键名 base 兼容）
+  app_path: "dist"      # 静态站点根（省略 = 不开静态服务；CLI --app-path 相对 CWD）
+  app_prefix: "/"       # 静态站点前缀（默认 / = 全路径兜底；如 "/site" 仅 /site/* 落静态）
   timeout: "30s"        # 单请求执行超时（熔断 → 408）
   pool_size: 4          # JS 执行并发度
 db:
@@ -202,7 +229,7 @@ cargo fmt --check                        # 格式门禁
 cargo clippy --all-targets -D warnings   # lint 门禁
 cargo bench                              # criterion 基准
 
-cargo run -p oj -- test -c sample/config.yaml    # 进程内跑 *.test.ts（无需起服务）
+./bin/oj test -c sample/config.yaml             # 进程内跑 *.test.ts（无需起服务）
 cargo xtask bin                                 # 构建 oj 并拷入 bin/oj
 cargo xtask plugin <name>                       # 构建插件并拷入 bin/plugins/<triple>/
 cargo xtask plugin <name> --check               # 插件预检（ABI / 身份 / semver / 符号）

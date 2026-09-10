@@ -49,5 +49,5 @@ features:
 3. **业务代码里能直接写 SQL 吗？** 能写，但表名/列名只能来自 `SchemaRegistry`（`db.table()` 构造器），
    值一律走绑定参数。裸 SQL 还有「表归属守卫」盯着跨模块访问。
 
-> 站点内容由 `docs/vitepress/scripts/sync-docs.mjs` 从仓库 `docs/` 与 `sample/` 同步生成，
+> 站点内容由 `vitepress/scripts/sync-docs.mjs` 从仓库 `docs/` 与 `sample/` 同步生成，
 > 每页顶部标注了生成日期与源文件。

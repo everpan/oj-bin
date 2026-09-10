@@ -122,15 +122,25 @@ fn build_workspace_release() -> Result<(), String> {
     Ok(())
 }
 
+/// 可执行产物的落盘拷贝：写临时文件后 rename 换 vnode。macOS 对已签名 Mach-O
+/// 的就地截断改写会使该 vnode 的代码签名缓存永久失效——execve 直接 SIGKILL
+/// （zsh: killed），而 codesign -v 读盘校验却通过，极难排查。
+fn copy_bin(src: &Path, dst: &Path) -> Result<(), String> {
+    let tmp = dst.with_extension("tmp");
+    fs::copy(src, &tmp)
+        .and_then(|_| fs::rename(&tmp, dst))
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    println!("copied {} -> {}", src.display(), dst.display());
+    Ok(())
+}
+
 /// 编译并拷贝主程序 oj -> bin/oj。
 fn build_bin() -> Result<(), String> {
     build_workspace_release()?;
     let src = root().join("target").join("release").join(oj_exe_name());
     let dst = bin_dir().join(oj_exe_name());
     fs::create_dir_all(bin_dir()).map_err(|e| format!("mkdir {}: {e}", bin_dir().display()))?;
-    fs::copy(&src, &dst)
-        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
-    println!("copied {} -> {}", src.display(), dst.display());
+    copy_bin(&src, &dst)?;
     Ok(())
 }
 
@@ -144,9 +154,7 @@ fn build_and_copy(name: &str) -> Result<(), String> {
         .join("release")
         .join(build_artifact_name(name));
     let dst = dst_dir.join(plugin_file_name(name));
-    fs::copy(&src, &dst)
-        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
-    println!("copied {} -> {}", src.display(), dst.display());
+    copy_bin(&src, &dst)?;
     Ok(())
 }
 

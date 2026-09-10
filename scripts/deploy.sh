@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 发行打包脚本（macOS / Linux）。Windows 用 scripts/deploy.ps1。
+# 发行打包脚本（macOS / Linux）。Windows 用 scripts/deploy.bat。
 # 构建（release）+ 打包 + 校验和，输入来自 cargo xtask 归置好的 bin/：
 #   bin/oj                  -> 主程序
 #   bin/plugins/<triple>/   -> 插件 cdylib

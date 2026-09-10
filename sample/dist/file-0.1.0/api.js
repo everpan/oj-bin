@@ -1,1 +1,0 @@
-function get(){json.ok({segs:http.param("path","").split("/")});}export default{get};

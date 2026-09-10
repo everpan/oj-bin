@@ -18,7 +18,7 @@ src/greeting/
 └── api.ts                 # 业务入口
 ```
 
-`src/greeting/api.ts` → `GET/POST/... /v1/api/greeting/`（前缀由 config 的 `server.base` 决定）。
+`src/greeting/api.ts` → `GET/POST/... /v1/api/greeting/`（前缀由 config 的 `server.api_prefix` 决定）。
 想再深一层就再建目录：`src/greeting/detail/api.ts` → `/v1/api/greeting/detail/`。
 **没有路由表文件**，目录镜像就是路由表。
 

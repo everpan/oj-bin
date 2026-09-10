@@ -23,8 +23,11 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         load_app_config(&a.config, a.api_path.as_deref(), a.base.as_deref())?;
     // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
     // （统一装配点）判定，CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
+    // 路径语义：CLI `--app-path` 相对 CWD（此处预绝对化）；config `server.app_path`
+    // 相对 config_dir（resolve_static_root 统一处理）。
     if let Some(p) = a.app_path {
-        cfg.server.app_path = Some(p);
+        let cwd = std::env::current_dir().map_err(|e| format!("resolve --app-path {p}: {e}"))?;
+        cfg.server.app_path = Some(absolutize_cwd(&cwd, &p));
     }
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
@@ -32,6 +35,28 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     if let Some(p) = a.key_path {
         cfg.server.public_key_path = p;
     }
+    // 准入门（admission_gate 三态）：api（--api-path）与静态（server.app_path /
+    // CLI --app-path）至少显式指定其一；皆指定则两者都必须存在；仅指定其一 →
+    // 只启用对应功能。
+    let api_specified = a.api_path.is_some();
+    admission_gate(
+        if api_specified {
+            Some(dir.as_path())
+        } else {
+            None
+        },
+        cfg.server.app_path.as_deref(),
+        &config_dir,
+    )?;
+    // 纯静态模式：api 功能未启用。from_config 需要看到「无 API 目录」（模块扫描
+    // NotFound = 空 = 无路由），而 load_app_config 的默认搜索可能已命中 src/，
+    // 故传必然缺失的占位路径，避免把搜到的 API 目录静默挂上来。
+    let dir = if api_specified {
+        dir
+    } else {
+        eprintln!("note: no --api-path — serving static site only");
+        config_dir.join(".oj-static-only")
+    };
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     // 大小滚动参数 server.logs_max_bytes / logs_keep_files。
     let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
@@ -66,7 +91,13 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         "oj server listening on http://{bound}{} (dir={}, {})",
         base,
         dir.display(),
-        if ts { "dev/ts" } else { "release/js" }
+        if !api_specified {
+            "static-only"
+        } else if ts {
+            "dev/ts"
+        } else {
+            "release/js"
+        }
     );
     h.await.map_err(|e| format!("server task: {e}"))?;
     // 任务线程收场（flag 已置位；join 为阻塞调用，移交 blocking 池）。
@@ -116,33 +147,129 @@ pub fn load_app_config(
     )
     .map_err(|e| format!("load config: {e}"))?;
     // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
-    // 默认目录：src 存在取 src，否则 dist。
-    let dir = dir_override.map(|s| s.to_string()).unwrap_or_else(|| {
-        if Path::new("src").is_dir() {
-            "src".into()
-        } else {
-            "dist".into()
+    // 默认目录：自 config 同级起步逐级向上搜索，每层 src 优先、dist 次之；
+    // 一路到根都没找到 → 回落 config_dir/src。
+    // 目录缺失不在此拦截：server 准入（api 与静态至少其一）由 run() 裁定，
+    // migrate/fixture/test 强依赖 api 目录、各自就地报错。from_config 对缺失
+    // 目录全程容忍（模块扫描 NotFound = 空 = 无模块，见 manifest::load_modules）。
+    let dir = dir_override.map(PathBuf::from).unwrap_or_else(|| {
+        let mut cur = Some(config_dir.as_path());
+        loop {
+            match cur {
+                Some(d) => {
+                    let src = d.join("src");
+                    if src.is_dir() {
+                        break src;
+                    }
+                    let dist = d.join("dist");
+                    if dist.is_dir() {
+                        break dist;
+                    }
+                    cur = d.parent();
+                }
+                None => break config_dir.join("src"),
+            }
         }
     });
-    let dir_path = Path::new(&dir);
-    if !dir_path.is_dir() {
-        return Err(format!(
-            "service dir not found: {dir}（src 源码树或 oj build 产物 dist）"
-        ));
-    }
-    let ts = !is_release(dir_path);
-    let base = resolve_base(base_override, &cfg.server.base)?;
-    Ok((cfg, config_dir, PathBuf::from(dir), ts, base))
+    let ts = !is_release(&dir);
+    let base = resolve_base(base_override, &cfg.server.api_prefix)?;
+    Ok((cfg, config_dir, dir, ts, base))
 }
 
-/// base 归源：CLI `-b` 显式给出 > config `server.base`（默认 /v1/api）。
+/// server 准入门（显式三态，无静默默认）：
+/// - api 与 app 都指定 → **两者都必须存在**，任一缺失 Err 退出（显式要求的能力
+///   缺失时静默降级是坑）；
+/// - 只指定其一 → 该目录必须存在，仅启用对应功能（api 缺席 = 纯静态；app 缺席 = 纯 API）；
+/// - 都未指定 → Err，提醒两者必须指定其一（不再自动搜索 src/dist 兜底）。
+///
+/// `api_dir`：Some = 指定了 `--api-path`（CLI）；`app_path`：Some = 指定了静态根
+/// （config `server.app_path` 或 CLI `--app-path`，相对路径按 config_dir 解析）。
+fn admission_gate(
+    api_dir: Option<&Path>,
+    app_path: Option<&str>,
+    config_dir: &Path,
+) -> Result<(), String> {
+    let app_dir = |p: &str| {
+        let pp = Path::new(p);
+        if pp.is_absolute() {
+            pp.to_path_buf()
+        } else {
+            config_dir.join(pp)
+        }
+    };
+    match (api_dir, app_path) {
+        (None, None) => Err(
+            "neither api path (--api-path) nor static site (server.app_path / --app-path) \
+             specified — one of them is required to start"
+                .to_string(),
+        ),
+        (None, Some(p)) => {
+            // 纯静态：app 目录必须存在。
+            let full = app_dir(p);
+            if full.is_dir() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "static site dir not found: {}（server.app_path / --app-path）",
+                    full.display()
+                ))
+            }
+        }
+        (Some(api), app) => {
+            // api 必须存在；app 若也指定，同样必须存在（否则启用了个寂寞）。
+            if !api.is_dir() {
+                return Err(format!(
+                    "api path not found: {}（src 源码树或 oj build 产物 dist）",
+                    api.display()
+                ));
+            }
+            if let Some(p) = app {
+                let full = app_dir(p);
+                if !full.is_dir() {
+                    return Err(format!(
+                        "static site dir not found: {}（server.app_path / --app-path）",
+                        full.display()
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 相对路径按 `base`（CWD）绝对化；绝对路径原样。供 CLI `--app-path` 使用。
+fn absolutize_cwd(base: &Path, p: &str) -> String {
+    let path = Path::new(p);
+    if path.is_absolute() {
+        p.to_owned()
+    } else {
+        base.join(path).to_string_lossy().into_owned()
+    }
+}
+
+/// api 前缀归源：CLI `-b` 显式给出 > config `server.api_prefix`（默认 /v1/api）。
 /// 空前缀拒绝（全 404 的静默坑）。
 fn resolve_base(cli: Option<&str>, cfg: &str) -> Result<String, String> {
     let b = cli.unwrap_or(cfg);
     if b.trim_matches('/').is_empty() {
-        return Err("base prefix must not be empty (-b / server.base)".into());
+        return Err("base prefix must not be empty (-b / server.api_prefix)".into());
     }
     Ok(b.to_string())
+}
+
+/// 静态站点前缀归一（`server.app_prefix`，默认 "/"）：必须以 `/` 开头；尾斜杠剪除；
+/// 剪完为空 → "/"（根）。非 "/" 前缀时静态兜底仅服务该前缀下的 GET/HEAD。
+/// 非法（不以 `/` 开头）→ Err fail-fast。
+pub fn resolve_app_prefix(cfg: &str) -> Result<String, String> {
+    if !cfg.starts_with('/') {
+        return Err(format!("server.app_prefix must start with '/': {cfg:?}"));
+    }
+    let trimmed = cfg.trim_end_matches('/');
+    Ok(if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 /// 模式判定：服务目录含 `manifests.yaml`（oj build 锁文件）→ release 产物树。
@@ -481,6 +608,39 @@ mod tests {
         }
     }
 
+    /// 回归钉：缺省服务目录自 config 同级起步逐级向上搜索（src 优先、dist 次之），
+    /// 而非 CWD——否则在仓库根（自带核心 crate 的 src/）跑 `-c sample/config.yaml`
+    /// 会把 src/bridge/ 当业务模块，报 "module 'bridge' missing manifest.yaml"。
+    #[test]
+    fn default_dir_searches_upward_from_config_dir() {
+        // 同级命中：src 优先于 dist。
+        let t = tmpdir("defdir");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
+        std::fs::create_dir_all(t.0.join("dist")).unwrap();
+        std::fs::write(t.0.join("config.yaml"), "{}\n").unwrap();
+        let cfg = t.0.join("config.yaml");
+        let (_, _, dir, ts, _) = load_app_config(cfg.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(dir, t.0.join("src"));
+        assert!(ts);
+
+        // 同级只有 dist → dist。
+        let t2 = tmpdir("defdir-dist");
+        std::fs::create_dir_all(t2.0.join("dist")).unwrap();
+        std::fs::write(t2.0.join("config.yaml"), "{}\n").unwrap();
+        let cfg2 = t2.0.join("config.yaml");
+        let (_, _, dir2, _, _) = load_app_config(cfg2.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(dir2, t2.0.join("dist"));
+
+        // config 下钻一层（sub/config.yaml），src 在父级 → 向上搜索命中。
+        let t3 = tmpdir("defdir-up");
+        std::fs::create_dir_all(t3.0.join("src")).unwrap();
+        std::fs::create_dir_all(t3.0.join("sub")).unwrap();
+        std::fs::write(t3.0.join("sub/config.yaml"), "{}\n").unwrap();
+        let cfg3 = t3.0.join("sub/config.yaml");
+        let (_, _, dir3, _, _) = load_app_config(cfg3.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(dir3, t3.0.join("src"));
+    }
+
     /// cfg 回落链（spec「plugins: 统一语义」）：非空对象透传 → 轴适配器 → {}；
     /// 空对象不抢占透传优先级（否则 auth: {} 会切断顶层段 cfg 流）。
     #[test]
@@ -543,14 +703,69 @@ mod tests {
     }
 
     #[test]
+    fn cli_app_path_resolves_against_cwd() {
+        // CLI --app-path：相对路径按 CWD（base）拼接；绝对路径原样透传。
+        // 以 Path 语义断言——Windows 下 join 产出 `\` 分隔符，字符串比较会误报。
+        let base = Path::new("/repo/root");
+        assert_eq!(
+            PathBuf::from(absolutize_cwd(base, "dist")),
+            base.join("dist")
+        );
+        // join 不做归一化，`..` 原样保留（由 resolve_static_root 的 canonicalize 收敛）。
+        assert_eq!(
+            PathBuf::from(absolutize_cwd(base, "../site")),
+            base.join("../site")
+        );
+        assert_eq!(
+            PathBuf::from(absolutize_cwd(base, "/abs/dist")),
+            PathBuf::from("/abs/dist")
+        );
+    }
+
+    #[test]
+    fn admission_gate_three_states() {
+        // 三态准入：皆指定 → 两者都必须存在；指定其一 → 该目录必须存在；
+        // 皆未指定 → Err 提醒必须指定其一。
+        let t = tmpdir("admit");
+        std::fs::create_dir(t.0.join("src")).unwrap();
+        std::fs::create_dir(t.0.join("site")).unwrap();
+        // 皆指定且都存在 → Ok。
+        assert!(admission_gate(Some(Path::new("src")), Some("site"), &t.0).is_ok());
+        // 皆指定但 api 缺失 → Err（两者都必须校验存在性）。
+        assert!(admission_gate(Some(Path::new("no-api")), Some("site"), &t.0).is_err());
+        // 皆指定但 app 缺失 → Err。
+        assert!(admission_gate(Some(Path::new("src")), Some("no-site"), &t.0).is_err());
+        // 仅 api：存在 → Ok，缺失 → Err。
+        assert!(admission_gate(Some(Path::new("src")), None, &t.0).is_ok());
+        assert!(admission_gate(Some(Path::new("no-api")), None, &t.0).is_err());
+        // 仅 app：存在 → Ok，缺失 → Err。
+        assert!(admission_gate(None, Some("site"), &t.0).is_ok());
+        assert!(admission_gate(None, Some("no-site"), &t.0).is_err());
+        // 皆未指定 → Err。
+        let e = admission_gate(None, None, &t.0).unwrap_err();
+        assert!(e.contains("--api-path"), "{e}");
+    }
+
+    #[test]
     fn base_precedence_and_empty_guard() {
-        // CLI -b > config server.base（config 默认 /v1/api 由 ServerCfg::default 兜底）
+        // CLI -b > config server.api_prefix（config 默认 /v1/api 由 ServerCfg::default 兜底）
         assert_eq!(resolve_base(None, "/xapi").unwrap(), "/xapi");
         assert_eq!(resolve_base(Some("/cli"), "/xapi").unwrap(), "/cli");
         assert_eq!(resolve_base(None, "/v1/api").unwrap(), "/v1/api");
         // 空前缀（仅斜杠）拒绝
         assert!(resolve_base(Some(""), "/xapi").is_err());
         assert!(resolve_base(None, "///").is_err());
+    }
+
+    #[test]
+    fn app_prefix_normalized() {
+        // 归一：尾斜杠剪除；剪完为空 → "/"；不以 / 开头 → Err。
+        assert_eq!(resolve_app_prefix("/").unwrap(), "/");
+        assert_eq!(resolve_app_prefix("/site").unwrap(), "/site");
+        assert_eq!(resolve_app_prefix("/site/").unwrap(), "/site");
+        assert_eq!(resolve_app_prefix("/a/b/").unwrap(), "/a/b");
+        let e = resolve_app_prefix("site").unwrap_err();
+        assert!(e.contains("must start with"), "{e}");
     }
 
     /// 证书必配：未配置证书路径 → 启动 fail-fast（任何方式都无法绕过）；配齐有效证书 →

@@ -54,6 +54,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 启动失败 manifest | `name` 与目录名不一致 |
 | postgres 占位符报错 | 该方言用 `$1`，不是 `?`（sqlite/mysql 才是 `?`） |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
+| 启动报 `neither api path … specified` / `api path not found` / `static site dir not found` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式指定其一，皆指定则两者都必须存在；CLI 路径相对 CWD，config 路径相对 config 目录 |
 | seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸） |
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |

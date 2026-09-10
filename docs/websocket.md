@@ -124,7 +124,7 @@ websocat ws://localhost:9778/v1/api/news/chat/ws
 
 ```bash
 # 终端 1：dev 模式启动（服务 src，按需转译）
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
+./bin/oj server -c sample/config.yaml --api-path sample/src
 
 # 终端 2：连上即完成订阅（connection() 钩子回报一帧信封；websocat 任选你顺手的客户端）
 websocat ws://localhost:9778/v1/api/news/ws
@@ -279,7 +279,7 @@ task 门禁）。
 `bus.publish` 广播链路的帧——一条命令链条跑通「入站 + 出站」两个半边：
 
 ```bash
-cargo run -p oj --release -- server -c sample/config.yaml --api-path sample/src
+./bin/oj server -c sample/config.yaml --api-path sample/src
 TOKEN=$(curl -s -X POST http://localhost:9778/v1/api/auth/login -H 'X-TENANT-ID: default' \
   -d '{"username":"demo","password":"demo1234"}' | jq -r '.data.access_token')
 curl -X POST http://localhost:9778/v1/api/news -H "Authorization: Bearer $TOKEN" \

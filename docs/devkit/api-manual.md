@@ -94,14 +94,17 @@ export default {
 
 ```bash
 ./bin/oj server -c config.yaml --api-path src
-# 仓库内等价：cargo run -p oj -- server -c config.yaml --api-path src
+# 仓库内：先 cargo xtask build 产出 bin/oj，再从仓库根执行同形命令
 ```
 
-`server` 按 `-d` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
+`server` 按 `--api-path` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
 release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码，按需转译，改文件即生效）。
-启动行会把判定结果（`dev/ts` / `release/js`）与模块清单、路由表写进日志。
+启动行会把判定结果（`dev/ts` / `release/js` / `static-only`）与模块清单、路由表写进日志。
 **终端默认静默（`server.console_log` 缺省 false）**——启动时会打一行日志路径的提示，
 随后一切输出只落盘；需要终端同时输出时加 `--console-log` 或配 `server.console_log: true`。
+**例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
+**准入门（三态，无静默默认）**：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
+至少显式指定其一，否则退出；两者皆指定 → 都必须存在；仅指定其一 → 只启用对应功能。
 
 验证信封返回：
 
@@ -323,7 +326,7 @@ if (!b.name) { json.fail(400, "name required"); return; }
 ### 路由：目录镜像与 `.route` 参数路由
 
 URL = `{base}/{module}/{...path}/{feature}/` → `<dir>/{module}/{...path}/{feature}/api.ts|js`。
-尾斜杠有无皆可；`{base}` 默认 `/v1/api`（`server.base` 可配）。
+尾斜杠有无皆可；`{base}` 默认 `/v1/api`（`server.api_prefix` 可配）。
 
 handler 函数挂 `.route` 属性即**替换**目录镜像路由，支持 matchit 语法
 （摘自 `sample/src/user/item/api.ts`）：
@@ -359,7 +362,7 @@ export default { get: detail };
   `routes.js`**（第 11 章）。
 
 解析顺序：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
-静态站点（`server.app_path`，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
+静态站点（`server.app_path`，`server.app_prefix` 前缀内（默认 `/`），仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
 ### ws.ts（WebSocket 生命周期钩子）
@@ -1077,14 +1080,14 @@ curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/
 默认 `tests`）。
 
 ```bash
-cargo run -p oj -- test -c sample/config.yaml -d sample/src                 # human 摘要
-cargo run -p oj -- test -c config.yaml -d src --format junit --output l1.xml # CI 报告
+./bin/oj test -c sample/config.yaml -d sample/src                 # human 摘要
+./bin/oj test -c config.yaml -d src --format junit --output l1.xml # CI 报告
 ```
 
 | 旗标 | 说明 |
 |---|---|
 | `-c/--config` | 配置文件（默认 `config.yaml`） |
-| `-b/--base` | API 基础前缀覆盖（默认用 config `server.base`） |
+| `-b/--base` | API 基础前缀覆盖（默认用 config `server.api_prefix`） |
 | `-d/--dir` | 源码目录 `src` 或产物 `dist`（默认自动判定） |
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |
@@ -1200,15 +1203,16 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job）�
 |---|---|---|
 | `host` | `"localhost"` | 监听地址 |
 | `port` | `9778` | 监听端口；<1024 属特权端口（需 root），不要配成 `778` 之类 |
-| `base` | `"/v1/api"` | API 基础路由前缀；CLI `-b` 显式给出时覆盖；空前缀（空串/纯斜杠）拒绝启动 |
+| `api_prefix` | `"/v1/api"` | API 基础路由前缀；CLI `-b` 显式给出时覆盖；空前缀（空串/纯斜杠）拒绝启动。旧键名 `base` 仍兼容（并存 → duplicate field 报错） |
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
 | `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
-| `root` | 无 | 静态站点根目录；**省略 = 不开静态服务**。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 SPA 回退/Range/ETag |
+| `app_path` | 无 | 静态站点根目录；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 SPA 回退/Range/ETag。**准入门**：`--api-path` 与本项至少显式指定其一，两者皆指定则都必须存在 |
+| `app_prefix` | `"/"` | 静态站点前缀；默认 `/` = 全路径兜底（与旧版一致）。设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；API 路由永远优先。必须以 `/` 开头，否则启动报错 |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） | |
-| `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）；`true` = 额外回写终端。CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警** | |
+| `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）；`true` = 额外回写终端。CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警**。启动失败的最终退出原因无论开关都直写终端（`echo_terminal`，原始 stderr fd 副本） | |
 | `public_key_path` | **必配** | 证书校验公钥（SPKI PEM；仅验签，私钥不落服务器） |
 | `certificate_path` | **必配** | JWS 证书（`Base64URL(Header).Payload.Signature`，RS256） |
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
@@ -1374,6 +1378,8 @@ plugins:
 | `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出 |
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
+| `neither api path … specified` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式指定其一 |
+| `api path not found: …` / `static site dir not found: …` | 指定了 api / 静态目录但不存在（皆指定时两者都必须存在） |
 | `server.app_path` 目录不存在 | 启动报错退出 |
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |

@@ -33,6 +33,17 @@ pub enum FrameError {
     PoolClosed,
 }
 
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Timeout => write!(f, "frame timeout"),
+            FrameError::Core(e) => write!(f, "{e}"),
+            FrameError::Dropped => write!(f, "frame dropped"),
+            FrameError::PoolClosed => write!(f, "ws pool closed"),
+        }
+    }
+}
+
 #[derive(Default)]
 struct SchedInner {
     ready: VecDeque<Frame>,
@@ -57,7 +68,7 @@ impl Scheduler {
     }
 
     pub(crate) fn submit(&self, f: Frame) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed {
             let _ = f.done.send(Err(FrameError::PoolClosed));
             return;
@@ -77,7 +88,7 @@ impl Scheduler {
         loop {
             let notified = self.notify.notified();
             {
-                let mut g = self.inner.lock().unwrap();
+                let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(f) = g.ready.pop_front() {
                     return Some(f);
                 }
@@ -91,7 +102,7 @@ impl Scheduler {
 
     /// Worker 执行完一帧：放行该连接的下一帧。
     pub(crate) fn complete(&self, conn: u64) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.in_flight.remove(&conn);
         if let Some(q) = g.waiting.get_mut(&conn)
             && let Some(f) = q.pop_front()
@@ -109,7 +120,7 @@ impl Scheduler {
 
     /// 连接 detach：排队帧作废；在飞帧让它自然跑完（complete 无后续可放）。
     pub(crate) fn drop_conn(&self, conn: u64) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(q) = g.waiting.remove(&conn) {
             for f in q {
                 let _ = f.done.send(Err(FrameError::Dropped));
@@ -119,7 +130,7 @@ impl Scheduler {
 
     /// 退役：拒绝新帧、排空存量（Worker pull→None 退出）。
     pub(crate) fn close(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         for f in g.ready.drain(..) {
             let _ = f.done.send(Err(FrameError::PoolClosed));
@@ -135,7 +146,7 @@ impl Scheduler {
 
     /// 复活（退役后新连接 attach）。
     pub(crate) fn reopen(&self) {
-        self.inner.lock().unwrap().closed = false;
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).closed = false;
     }
 }
 
@@ -188,7 +199,12 @@ impl RoutePool {
 
     /// 注册会话（懒启动 worker）。永远成功；预载失败在 fire 时以 PoolClosed 显形。
     pub fn attach(self: &Arc<Self>, bus_tx: mpsc::UnboundedSender<String>) -> ConnHandle {
-        if self.failed.lock().unwrap().is_some() {
+        if self
+            .failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             // 锁存：不再起 Worker；fire 经 sched closed 得 PoolClosed。
             return ConnHandle {
                 pool: Arc::clone(self),
@@ -199,13 +215,16 @@ impl RoutePool {
             self.sched.reopen();
         }
         let conn = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        self.sessions.lock().unwrap().insert(
-            conn,
-            SessEntry {
-                state: serde_json::Value::Null,
-                bus_tx,
-            },
-        );
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                conn,
+                SessEntry {
+                    state: serde_json::Value::Null,
+                    bus_tx,
+                },
+            );
         if self.live.load(Ordering::SeqCst) == 0 {
             for _ in 0..self.workers_max.max(1) {
                 self.spawn_worker();
@@ -227,17 +246,30 @@ impl RoutePool {
         std::thread::Builder::new()
             .name("ws-worker".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("ws worker rt");
-                // live 的扣减在 worker_main 内部（退出即扣，先于 close 等副作用可见）。
-                let poisoned = rt.block_on(pool.clone().worker_main());
-                if poisoned {
-                    pool.poisoned.fetch_add(1, Ordering::SeqCst);
-                    // 补员：毒化 Worker 线程退出前直接再起一个（保持池容量）。
-                    if pool.live.load(Ordering::SeqCst) == 0 && pool.has_sessions() {
-                        pool.spawn_worker();
+                // worker 闭包内任何 panic（rt 构建失败、ws_event 意外 panic 等）都收敛于此：
+                // 补扣 live + 补员，否则 live 永不递减 → attach 见 live != 0 不再起 Worker →
+                // 该路由永久死亡。worker_main 保证 fetch_sub 之后无可 panic 代码（锁均防
+                // 毒化），故 panic 只可能发生在扣减之前，这里补扣不会双重扣减。
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("ws worker rt");
+                    // live 的扣减在 worker_main 内部（退出即扣，先于 close 等副作用可见）。
+                    rt.block_on(pool.clone().worker_main())
+                }));
+                match r {
+                    Ok(poisoned) => {
+                        if poisoned {
+                            pool.poisoned.fetch_add(1, Ordering::SeqCst);
+                            // 补员：毒化 Worker 线程退出前直接再起一个（保持池容量）。
+                            respawn_if_needed(&pool);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ws worker panicked: {e:?}");
+                        pool.live.fetch_sub(1, Ordering::SeqCst);
+                        respawn_if_needed(&pool);
                     }
                 }
             })
@@ -245,7 +277,11 @@ impl RoutePool {
     }
 
     fn has_sessions(&self) -> bool {
-        !self.sessions.lock().unwrap().is_empty()
+        !self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Worker 主循环：返回是否毒化退出。live 在此扣减（每个退出路径恰一次）。
@@ -260,7 +296,7 @@ impl RoutePool {
                 eprintln!("ws worker preload {}: {e}", self.file.display());
                 // 顺序即契约：先锁存（拦住新 attach），再扣 live，再关池（排空
                 // 存量帧）——fire 解析时 live 已归零，不存在「死而未报」的窗口。
-                *self.failed.lock().unwrap() = Some(e.to_string());
+                *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
                 self.live.fetch_sub(1, Ordering::SeqCst);
                 self.sched.close();
                 return false;
@@ -272,7 +308,7 @@ impl RoutePool {
                 return false;
             };
             let (state, bus_tx) = {
-                let g = self.sessions.lock().unwrap();
+                let g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
                 match g.get(&f.conn) {
                     Some(e) => (e.state.clone(), Some(e.bus_tx.clone())),
                     None => (serde_json::Value::Null, None),
@@ -288,8 +324,16 @@ impl RoutePool {
             self.sched.complete(f.conn);
             match r {
                 Ok((outcome, new_state)) => {
-                    if let Some(e) = self.sessions.lock().unwrap().get_mut(&f.conn) {
-                        e.state = new_state;
+                    // new_state=None = dispatcher finally 回传失败（sess 不可 JSON 序列化，
+                    // op 调用抛错被 catch）——跳过写回保留旧状态，不得用 Null 整体清空。
+                    if let Some(ns) = new_state
+                        && let Some(e) = self
+                            .sessions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&f.conn)
+                    {
+                        e.state = ns;
                     }
                     let _ = f.done.send(Ok(outcome));
                 }
@@ -307,10 +351,20 @@ impl RoutePool {
     }
 }
 
+/// 补员判定（毒化/panic 退出共用）：仍有会话且容量未满则再起一个 Worker。
+/// 容量未满即补（非「归零才补」）——W>=2 时单个 Worker 退出后 live 仍 > 0，
+/// 「== 0 才补」会让池永久降容。
+fn respawn_if_needed(pool: &Arc<RoutePool>) {
+    if pool.live.load(Ordering::SeqCst) < pool.workers_max.max(1) && pool.has_sessions() {
+        pool.spawn_worker();
+    }
+}
+
 /// 单事件执行（`WsSession::fire` 的无状态化版本）：重置 per-event 状态、武装看门狗、
 /// 注入 __sess/__ws_conn → `__ws_call(conn, ev)` → 排空 event loop → 读 ReqState
 /// （sends/close/capture/ws_sess）。超时 → runtime 已被 terminate（毒化），
-/// 调用方必须丢弃会话断连。
+/// 调用方必须丢弃会话断连。state 回传为 Option：None = dispatcher finally 的
+/// op_ws_sess_set 未执行成功（sess 含不可 JSON 序列化值），调用方须保留旧状态。
 pub(crate) async fn ws_event(
     sess: &mut super::WsSession,
     conn: u64,
@@ -318,7 +372,7 @@ pub(crate) async fn ws_event(
     req: &RequestInfo,
     state: &serde_json::Value,
     timeout: Duration,
-) -> Result<(WsOutcome, serde_json::Value), RunError> {
+) -> Result<(WsOutcome, Option<serde_json::Value>), RunError> {
     {
         let op_state = super::runtime::op_state(&sess.rt);
         let mut g = op_state.borrow_mut();
@@ -355,7 +409,7 @@ pub(crate) async fn ws_event(
                 sends: rs.ws_sends.clone(),
                 close: rs.ws_close,
             },
-            rs.ws_sess.clone().unwrap_or(serde_json::Value::Null),
+            rs.ws_sess.clone(),
         )
     };
     super::Bridge::finalize_tx(&sess.rt).await;
@@ -385,17 +439,32 @@ impl ConnHandle {
 
     /// 连接收尾：删会话表条目 + 丢排队帧 + 空池 linger 退役计时。
     pub fn detach(&self) {
-        self.pool.sessions.lock().unwrap().remove(&self.conn);
+        self.pool
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.conn);
         self.pool.sched.drop_conn(self.conn);
         // 空池 → linger 计时（独立线程；linger=0 走 sleep(0)，同一路径）。
-        if self.pool.sessions.lock().unwrap().is_empty() {
+        if self
+            .pool
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
             let pool = Arc::clone(&self.pool);
             std::thread::Builder::new()
                 .name("ws-retire".into())
                 .spawn(move || {
                     std::thread::sleep(Duration::from_millis(pool.linger_ms));
                     // 复查仍空才退役：linger 期间来了新连接则继续服务。
-                    if pool.sessions.lock().unwrap().is_empty() {
+                    if pool
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                    {
                         pool.sched.close();
                     }
                 })
@@ -716,5 +785,149 @@ export default {
             Err(FrameError::PoolClosed)
         ));
         assert_eq!(pool.live_workers(), 0);
+    }
+
+    /// 毒化补员容量恢复钉（v0.1.10 终审 #2）：W=2 时一个 Worker 毒化退出后，池必须
+    /// 在有限时间内补回满容量（live 回到 2）——旧条件「live == 0 才补」下 W>=2 时
+    /// live 停在 1、池永久降容（本钉在旧代码下恒红；处方中的「W=1」笔误不触发旧
+    /// bug——W=1 时 live 恰归零、旧条件恰好成立，故钉在 W=2）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_respawns_to_full_capacity_after_poison() {
+        let dir = pool_dir("respawn2");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"
+export default {
+  message() {
+    if (http.body.boom) { const t = Date.now(); while (Date.now() - t < 60_000) {} }
+    json.ok({ ok: 1 });
+  },
+};
+"#,
+        )
+        .unwrap();
+        let pool = RoutePool::new(
+            ws_file,
+            ws_test_bridge(&dir),
+            Duration::from_millis(300),
+            2,
+            0,
+        );
+        let (b1, _) = mpsc::unbounded_channel();
+        let bad = pool.attach(b1);
+        assert_eq!(pool.live_workers(), 2);
+        let e = bad
+            .fire("message", br#"{"boom":true}"#.to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, FrameError::Timeout));
+        // 先等毒化落定：done 先于 live 扣减解析，直接等 live==2 会读到扣减前的
+        // 旧值而空过。poisoned 在 worker_main 返回后递增，此刻 live 必已扣减。
+        let mut seen = false;
+        for _ in 0..100 {
+            if pool.poisoned.load(Ordering::SeqCst) == 1 {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(seen, "毒化 Worker 必须退出（poisoned=1）");
+        // 再等补员：live 有限时间内回到满容量 2（旧代码停在 1）
+        let mut full = false;
+        for _ in 0..100 {
+            if pool.live_workers() == 2 {
+                full = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            full,
+            "毒化后必须补员回满容量 2，实际 {}",
+            pool.live_workers()
+        );
+        // 补员后新会话照常执行
+        let (b2, _) = mpsc::unbounded_channel();
+        let good = pool.attach(b2);
+        let o = good
+            .fire("message", br#"{"boom":false}"#.to_vec())
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&o.capture.body).contains("\"ok\":1"));
+        bad.detach();
+        good.detach();
+    }
+
+    /// worker panic 存活钉（v0.1.10 终审 #3）：make 闭包首次调用必 panic——修复前
+    /// 线程死亡、live 永不递减、attach 见 live != 0 不再补员，帧永久挂起；修复后
+    /// catch_unwind 收敛 + 补扣 live + 补员，帧由补员 Worker 正常执行。外层超时
+    /// 兜底：回归时表现为挂起而非断言失败，超时将其转为红。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_survives_worker_panic_and_respawns() {
+        let dir = pool_dir("panic");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"export default { message() { json.ok({ ok: 1 }); } };"#,
+        )
+        .unwrap();
+        let inner = ws_test_bridge(&dir);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let make: std::sync::Arc<dyn Fn() -> Bridge + Send + Sync> =
+            std::sync::Arc::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("test-injected worker panic");
+                }
+                inner()
+            });
+        let pool = RoutePool::new(ws_file, make, Duration::from_secs(1), 1, 0);
+        let (btx, _) = mpsc::unbounded_channel();
+        let h = pool.attach(btx);
+        let o = tokio::time::timeout(Duration::from_secs(10), h.fire("message", vec![]))
+            .await
+            .expect("worker panic 后池必须自愈，不得永久挂起")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&o.capture.body).contains("\"ok\":1"));
+        assert_eq!(pool.live_workers(), 1);
+        h.detach();
+    }
+
+    /// sess.state 不可序列化赋值不清空旧状态（v0.1.10 终审 #4）：帧2 给 sess.state
+    /// 写入 BigInt（serde_v8 无法序列化为 JSON Value → dispatcher finally 的
+    /// op_ws_sess_set 抛错被 catch → 无回传；函数属性会被 serde_v8 静默吞掉，
+    /// 不触发失败路径，故以 BigInt 为触发器），
+    /// 帧3 读回帧1 写入的状态必须仍在——旧实现 unwrap_or(Null) 写回会整体清空。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_non_serializable_sess_assignment_keeps_old_state() {
+        let dir = pool_dir("sess-keep");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"
+export default {
+  message() {
+    if (http.body.step === 1) sess.state.x = 1;
+    if (http.body.step === 2) sess.state.b = 1n;
+    json.ok({ x: sess.state.x ?? null });
+  },
+};
+"#,
+        )
+        .unwrap();
+        let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
+        let (btx, _) = mpsc::unbounded_channel();
+        let h = pool.attach(btx);
+        let o = h.fire("message", br#"{"step":1}"#.to_vec()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["x"], 1);
+        let o = h.fire("message", br#"{"step":2}"#.to_vec()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["x"], 1);
+        // 关键断言：不可序列化赋值的那一帧不得清空既有状态
+        let o = h.fire("message", br#"{"step":3}"#.to_vec()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["x"], 1, "不可序列化赋值后旧状态必须保留");
+        h.detach();
     }
 }

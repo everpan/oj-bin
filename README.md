@@ -51,17 +51,24 @@ and have the host absorb everything else" is**. The trade-offs here differ marke
 ## Quick Start
 
 ```bash
-cargo build                                                   # first build pulls the prebuilt V8
+cargo xtask build            # build and place bin/oj + bin/plugins/<triple>/ (release; first build pulls prebuilt V8)
 
 # dev: run .ts sources directly (no manifests.yaml in dir → auto dev/ts, file changes apply live)
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
+./bin/oj server -c sample/config.yaml --api-path sample/src
 
 # release: build the artifacts first, apply migrations, then run dist/
 # (manifests.yaml present → auto release/js; migrate is required by the verify gate)
-cargo run -p oj -- build   -d sample/src -o sample/dist
-cargo run -p oj -- migrate -c sample/config.yaml -d sample/dist
-cargo run -p oj -- server  -c sample/config.yaml --api-path sample/dist
+./bin/oj build   -d sample/src -o sample/dist
+./bin/oj migrate -c sample/config.yaml -d sample/dist
+./bin/oj server  -c sample/config.yaml --api-path sample/dist
 ```
+
+> Always run examples and business workloads through the compiled **`bin/oj`**: one
+> `cargo xtask build` produces it together with all first-party plugin cdylibs; at
+> runtime it needs no cargo / Rust toolchain, and the same artifact can be copied
+> verbatim between environments on the same platform — more portable and consistent
+> than `cargo run`. Path arguments are resolved against the **current working
+> directory** (CWD); doc examples below assume execution from the repo root.
 
 Modules own their data layer: a per-module `schema.yaml` (declarative tables, the source of
 truth), `migrations/*.sql` (hand-written DDL evolution with a per-module ledger), and
@@ -78,6 +85,32 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 > Under network restrictions set `V8_FROM_SOURCE=0` to force the prebuilt package — **do not**
 > compile V8 from source.
+
+### About `bin/oj`: the single compiled-artifact entry point
+
+`cargo xtask build` produces `bin/oj` (main binary) and `bin/plugins/<host-triple>/`
+(all first-party plugin cdylibs) in one go. **All examples and business workloads go
+through `bin/oj`:**
+
+| Command | Purpose |
+|---|---|
+| `./bin/oj server -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
+| `./bin/oj build -d <src> -o <dist>` | build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
+| `./bin/oj test -c <config>` | run `*.test.ts` in-process (no server needed) |
+| `./bin/oj migrate / fixture / schema diff` | migrations / demo data / schema diff (see `docs/user-manual.md`) |
+
+- **Portable**: `bin/oj` + `bin/plugins/<triple>/` is the self-contained distribution
+  unit — the target machine needs no Rust / cargo / Node toolchain; copy the tree and
+  run (or ship the package produced by `scripts/deploy.sh`). `cargo build --workspace`
+  is for development; its outputs land in `bin/` too.
+- **Consistent**: docs, CI and production all use the same entry point, independent of
+  how cargo is invoked or which features cargo resolves.
+- **Path semantics**: CLI `--api-path` / `--app-path` resolve against the **current
+  working directory** (CWD); `server.app_path` inside the config resolves against the
+  config file's directory.
+- **Admission gate**: `--api-path` and the static site (`server.app_path` /
+  `--app-path`) — at least one must be specified explicitly or the server exits; when
+  both are specified, both directories must exist.
 
 ---
 
@@ -148,7 +181,7 @@ sample/src/
 - **WebSocket**: `ws.ts` is executed once per received text frame. After the first frame does
   `bus.subscribe("news")`, any handler's `bus.publish("news", ...)` — including from other
   instances — broadcasts to that connection.
-- **Prefix**: `/v1/api` comes from config `server.base`, overridable with `-b`.
+- **Prefix**: `/v1/api` comes from config `server.api_prefix`, overridable with `-b`.
 
 ---
 
@@ -161,8 +194,9 @@ configuration (full reference in `docs/user-manual.md`).
 server:
   host: "localhost"
   port: 9778
-  base: "/v1/api"      # API prefix
-  root: "dist"          # static site root (omitted = no static serving)
+  api_prefix: "/v1/api"  # API prefix (legacy key `base` still accepted)
+  app_path: "dist"      # static site root (omitted = no static serving; CLI --app-path is CWD-relative)
+  app_prefix: "/"       # static site prefix (default / = catch-all; e.g. "/site" serves only /site/*)
   timeout: "30s"        # per-request execution timeout (blown → 408)
   pool_size: 4          # JS execution concurrency
 db:
@@ -228,7 +262,7 @@ cargo fmt --check                        # formatting gate
 cargo clippy --all-targets -D warnings   # lint gate
 cargo bench                              # criterion benchmarks
 
-cargo run -p oj -- test -c sample/config.yaml    # run *.test.ts in-process (no server needed)
+./bin/oj test -c sample/config.yaml             # run *.test.ts in-process (no server needed)
 cargo xtask bin                                 # build oj and copy into bin/oj
 cargo xtask plugin <name>                       # build plugin and copy into bin/plugins/<triple>/
 cargo xtask plugin <name> --check               # plugin preflight (ABI / identity / semver / symbols)

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 把仓库里的权威文档同步进 VitePress 站点（docs/vitepress/src）。
+// 把仓库里的权威文档同步进 VitePress 站点（vitepress/src）。
 //
 // 设计要点：
 // - 白名单显式登记（ENTRIES），绝不递归目录 —— sample/unit/node_modules 下有大量第三方 README。
@@ -14,8 +14,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const SITE = path.resolve(HERE, '..'); // docs/vitepress
-const ROOT = path.resolve(SITE, '../..'); // 仓库根
+const SITE = path.resolve(HERE, '..'); // vitepress/
+const ROOT = path.resolve(SITE, '..'); // 仓库根
 const SRC = path.join(SITE, 'src');
 
 /** 超过这个行数就按 `## ` 切页。 */
@@ -66,6 +66,24 @@ const ENTRIES = [
   { src: 'sample/src/idp/README.md', route: '/sample/idp', title: 'idp 模块（内置 OP）' },
   { src: 'sample/src/oidc/README.md', route: '/sample/oidc', title: 'oidc 模块（RP）' },
 ];
+
+// ---- sample 模块专题：sample/src/*/README.md 自动收录（一层 glob，不递归）----
+// 上面显式登记的优先（可定制 title/route）；未登记的按目录名补默认项，
+// title 取 README 首个 `# ` 标题。新增模块只丢一份 README.md 即自动进站。
+{
+  const sampleSrc = path.join(ROOT, 'sample', 'src');
+  const listed = new Set(ENTRIES.map((e) => e.src));
+  const auto = [];
+  for (const d of fs.readdirSync(sampleSrc, { withFileTypes: true })) {
+    if (!d.isDirectory() || d.name.startsWith('.') || d.name.startsWith('_')) continue;
+    const rel = `sample/src/${d.name}/README.md`;
+    if (listed.has(rel) || !fs.existsSync(path.join(sampleSrc, d.name, 'README.md'))) continue;
+    const h1 = fs.readFileSync(path.join(ROOT, rel), 'utf8').match(/^#\s+(.+)$/m);
+    auto.push({ src: rel, route: `/sample/${d.name}`, title: h1 ? h1[1].trim() : `${d.name} 模块` });
+  }
+  auto.sort((a, b) => a.src.localeCompare(b.src));
+  ENTRIES.push(...auto);
+}
 
 /** 未收录文档：指向「历史与未收录文档索引」。 */
 const EXCLUDED = new Set([
@@ -278,9 +296,14 @@ for (const e of ENTRIES) {
 // 生成 sidebar 数据（供 .vitepress/config.mts 引入）
 const genDir = path.join(SITE, '.vitepress', 'generated');
 fs.mkdirSync(genDir, { recursive: true });
+// 模块专题侧边栏：全部模块 README 条目（显式 + 自动），供 config.mts 展开。
+const sampleModules = ENTRIES
+  .filter((e) => /^sample\/src\/[^/]+\/README\.md$/.test(e.src))
+  .map((e) => ({ text: e.title, link: e.route }));
 fs.writeFileSync(
   path.join(genDir, 'sidebar.mjs'),
-  `// 由 scripts/sync-docs.mjs 生成，勿手改\nexport const splitNav = ${JSON.stringify(splitNav, null, 2)};\n`
+  `// 由 scripts/sync-docs.mjs 生成，勿手改\nexport const splitNav = ${JSON.stringify(splitNav, null, 2)};\n` +
+    `export const sampleModules = ${JSON.stringify(sampleModules, null, 2)};\n`
 );
 
 if (unresolved.length) {

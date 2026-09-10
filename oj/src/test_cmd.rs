@@ -46,6 +46,13 @@ struct TestResult {
 pub fn run(a: TestArgs) -> Result<i32, String> {
     let (cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())?;
+    // test 强依赖 api 目录（用例针对 handler；无「纯静态」形态）。
+    if !dir.is_dir() {
+        return Err(format!(
+            "service dir not found: {}（src 源码树或 oj build 产物 dist）",
+            dir.display()
+        ));
+    }
 
     // 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。
     let tests_dir = a.tests.clone().unwrap_or_else(|| "tests".into());

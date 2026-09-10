@@ -7,14 +7,14 @@
 ## 1. 快速开始
 
 ```bash
-cargo build                     # 构建（debug）
+cargo xtask build               # 产出 bin/oj + bin/plugins/<triple>/（release；一次构建处处可用）
 
 # dev：直接跑 .ts 源码（目录无 manifests.yaml → 自动 dev/ts）
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src
+./bin/oj server -c sample/config.yaml --api-path sample/src
 
 # release：先构建再跑产物 dist/（目录有 manifests.yaml → 自动 release/js）
-cargo run -p oj -- build -d sample/src -o sample/dist
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
+./bin/oj build -d sample/src -o sample/dist
+./bin/oj server -c sample/config.yaml --api-path sample/dist
 ```
 
 启动时把模块清单与路由表写入日志（终端默认静默，见下），然后：
@@ -23,6 +23,9 @@ cargo run -p oj -- server -c sample/config.yaml --api-path sample/dist
 tail -f sample/logs/server-*.log              # 默认：日志只落盘
 # 或启动时加 --console-log / 配置 server.console_log: true 让终端也输出
 ```
+
+启动失败的最终退出原因**总是直写终端**（console 关闭也不例外），便于立即调整；
+完整上下文仍在 `logs/` 日志文件中。
 
 ```bash
 curl 'http://localhost:9778/v1/api/user/account/?id=1'
@@ -42,8 +45,10 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `-c` | `config.yaml` | （server）配置文件路径（host/port/base/root/db/redis） |
-| `-b` | config `server.base`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
-| `-d` | `src` 存在取 `src`，否则 `dist` | 服务目录（server：模块树的根；build：源码目录） |
+| `-b` | config `server.api_prefix`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
+| `-d` | `src` 存在取 `src`，否则 `dist` | 服务目录（build/migrate/fixture/schema diff/test；server 用 `--api-path`，无缺省搜索） |
+| `--api-path` | 无 | （server）API 目录，相对 CWD；缺省 = 不开 API 功能（须配 `--app-path` / `server.app_path`，否则退出） |
+| `--app-path` | 无 | （server）静态站点目录，相对 CWD；覆盖 `server.app_path`（后者相对 config 目录） |
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障） |
@@ -79,10 +84,14 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 - 命令行由 clap 解析：短旗标均有长形式（`--config/--base/--dir/--out`），
   `-h/--help`、`-V/--version` 随时可用；空参自动打印帮助（exit 2），非法参数
   （未知旗标、多余位置参数、未知子命令）直接报错退出。
-- **模式自动判定**（server，无 `--dev` 旗标）：`-d` 目录含 `manifests.yaml`
-  （构建锁）→ release 跑 `.js`；否则 dev 跑 `.ts`（改文件即生效）。目录不存在
-  启动即报错。启动行会打印判定结果（`dev/ts` / `release/js`）。
-- 相对路径（`-c`/`-d`）相对**当前工作目录**（CWD），不是相对 config 所在目录。
+- **模式自动判定**（server）：`--api-path` 目录含 `manifests.yaml`
+  （构建锁）→ release 跑 `.js`；否则 dev 跑 `.ts`（改文件即生效）。指定的目录
+  不存在启动即报错。启动行会打印判定结果（`dev/ts` / `release/js` / `static-only`）。
+- **准入门（三态，无静默默认）**：api（`--api-path`）与静态（`server.app_path` /
+  `--app-path`）至少显式指定其一，否则退出并提醒；两者皆指定 → 都必须存在，任一
+  缺失退出；仅指定其一 → 只启用对应功能。
+- 相对路径（`-c`/`-d`/`--api-path`/CLI `--app-path`）相对**当前工作目录**（CWD），
+  不是相对 config 所在目录；config 中的 `server.app_path` 相对 config 目录。
 
 ## 3. 配置 config.yaml
 
@@ -90,10 +99,11 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 server:
   host: "localhost"       # 监听地址（默认 localhost）
   port: 9778              # 监听端口（代码默认即 9778）
-  base: "/v1/api"         # API 基础路由前缀（CLI -b 显式给出时覆盖；空前缀拒绝）
+  api_prefix: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖；空前缀拒绝；旧键 base 兼容）
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
-  root: "public"          # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
+  app_path: "public"      # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
+  app_prefix: "/"         # 静态站点前缀（默认 / = 全路径兜底；如 "/site" 则仅 /site/* 落静态）
   public_key_path: "./config/public_key.pem"   # 证书校验公钥（PEM，必配）
   certificate_path: "./config/certificate.jws"  # JWS 证书（Base64URL(Header).Payload.Signature，必配）
   grace_days: 30           # 证书过期后宽限天数（默认 30；缩窄可加速告警）
@@ -180,8 +190,14 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   序列 SIGINT/SIGTERM → `tasks.stopping()` 置位 → `stop_grace_secs` 宽限 → 看门狗强杀
   → HTTP 排空 → 退出。启动/重启/停机逐条落日志。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
-- `server.app_path`（CLI `--app-path` 覆盖）：静态站点服务。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
+- `server.app_path`（CLI `--app-path` 覆盖）：静态站点服务。config 配置相对 config 目录；CLI 显式给出时相对 CWD。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
   按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
+  静态站点前缀 `server.app_prefix`（默认 `/` = 全路径兜底）：设为如 `/site` 时仅
+  `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；
+  API 路由永远优先于静态兜底。
+  **准入门（三态，无静默默认）**：api（`--api-path`）与静态（`server.app_path` / `--app-path`）至少显式指定其一，否则退出；
+  两者皆指定 → 都必须存在，任一缺失退出；仅指定其一 → 只启用对应功能
+  （api 缺席 = 纯静态模式，无 API 路由，监听行标 `static-only`；app 缺席 = 纯 API）。
 - `server.public_key_path` / `server.certificate_path` / `server.grace_days`：
   **证书必配且不可绕过**——两个路径缺任一即启动报错退出（无任何 config/CLI 开关可跳过
   证书校验；CLI `--cert-path`/`--key-path` 可覆盖路径，但不能豁免校验）。配齐后启用

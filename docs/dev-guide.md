@@ -50,10 +50,11 @@ cargo build --benches        # 编译 criterion 基准（不跑）
 cargo bench                  # 跑基准（benches/bridge.rs，**必须 release**）
 cargo llvm-cov --workspace --summary-only   # 覆盖率（需 cargo-llvm-cov；V8 需 llvm-cov）
 
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src   # 启动服务（模式自动判定）
-cargo run -p oj -- build -d sample/src -o sample/dist                   # 构建模块产物
-cargo run -p oj -- test -c sample/config.yaml --format human            # 进程内 *.test.ts 运行器
-cargo run -p oj -- migrate / fixture / schema diff   # 迁移 / 演示数据 / schema 对账
+# 前提：cargo xtask build 产出 bin/oj（编译产物，跨环境一致，不依赖 cargo 调用方式）
+./bin/oj server -c sample/config.yaml --api-path sample/src   # 启动服务（模式自动判定）
+./bin/oj build -d sample/src -o sample/dist                   # 构建模块产物
+./bin/oj test -c sample/config.yaml --format human            # 进程内 *.test.ts 运行器
+./bin/oj migrate / fixture / schema diff   # 迁移 / 演示数据 / schema 对账
 # 子命令全表见 oj/src/args.rs 与 docs/cli2.md
 
 # 真服务集成测试（默认 #[ignore]，env 门控，见 §12）
@@ -323,7 +324,7 @@ let db2 = SqlxAccessor::connect("sqlite:///tmp/oj.db").await?;          // Self�
   `manifests.yaml` 版本锁），不转译。
 
 模式自动判定（`oj/src/server_cmd.rs` 的 `is_release`）：目录含 `dist/manifests.yaml` ⇒
-release，否则 dev。命令与构建产物见 `cargo run -p oj -- --help` 与 [cli2.md](cli2.md)。
+release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](cli2.md)。
 
 ### import 解析细节（module_loader.rs）
 

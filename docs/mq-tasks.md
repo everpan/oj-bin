@@ -97,7 +97,7 @@ value, headers?, ts?, delivery_tag? }`——`delivery_tag` 仅 rabbit（ack/nack
 
 ```bash
 # 无 broker 也能跑：config 不配 kafkas/rabbits，只有 task_demo 心跳任务
-cargo run -p oj -- server -c sample/config.yaml --api-path sample/src --console-log
+./bin/oj server -c sample/config.yaml --api-path sample/src --console-log
 ```
 
 启动日志逐行解读：

@@ -43,6 +43,7 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
 
 日志级别另由 `RUST_LOG` 环境变量控制（如 `RUST_LOG=oj=debug`），配置里不能配。
 落盘基于 fd 重定向，**仅 unix**：Windows 上不写日志文件，终端输出强制保留并告警。
+**例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
 
 ## 3. 配置管理
 
@@ -50,15 +51,18 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
 
 - **端口**：代码默认 `9778`（≥1024，无需 root）。若改用 <1024 的端口（如 `778`），
   在 macOS/Linux 属特权端口，需 root。
-- **前缀** `server.base`：API 基础路由前缀（默认 `/v1/api`），随配置走版本管理；
+- **前缀** `server.api_prefix`（旧键 `base` 兼容）：API 基础路由前缀（默认 `/v1/api`），随配置走版本管理；
   临时调试可用 `-b` 覆盖。空前缀（空串/纯斜杠）启动即报错。
 - **超时** `server.timeout`：单请求熔断阈值（`"30s"` 等）。设太大会放大死循环占用；设太小误杀慢查询。
 - **并发** `server.pool_size`：JS 执行线程数，等于并行请求上限。过高吃内存，过低排队。
 - **WS** `ws.max_connections`：全局并发连接闸门（默认 1000，0=不限），超限 upgrade 返 503。
   内存与连接数解耦——V8 只驻留在每路由 `ws.workers_per_route` 个 Worker（默认 2），
   高并发长连接按闸门做容量规划即可（每连接仅 ≈2KB 会话态）。
-- **静态站点** `server.app_path`（CLI `--app-path` 可覆盖）：静态文件根（相对 config 目录）。API 未命中的 GET/HEAD 落此目录
+- **静态站点** `server.app_path`（CLI `--app-path` 可覆盖）：静态文件根。config 配置相对 config 目录；CLI 显式给出时相对 CWD。API 未命中的 GET/HEAD 落此目录
   （目录 → `index.html`）；目录缺失启动即报错。前置站点产物（如 oj build 的 dist）放独立目录。
+  **准入门（三态，无静默默认）**：api（`--api-path`）与静态（`server.app_path` / `--app-path`）至少显式指定其一，否则退出；
+  两者皆指定 → 都必须存在，任一缺失退出；仅指定其一 → 只启用对应功能（api 缺席 = 纯静态模式，两者皆未指定 = 退出）。
+  静态站点前缀 `server.app_prefix`（默认 `/`）：设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析），前缀外 404；API 路由永远优先。
 - **DB** `db.<name> = "<DSN>"`：相对 config **所在目录**（`config_dir_of` 保证非空）。
   v0.2 多库混用：`sqlite://`（缺文件自动建空库）/`mysql://`/`postgres://`（透传，连不上启动
   fail-fast）。`sqlite::memory:` 仅测试用，重启即丢。**seed.sql 只对 sqlite 的 default 重放**，
@@ -140,7 +144,10 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | 启动报 `manifests.yaml … run oj build first` | release 下锁文件缺失/损坏，或指向不存在的版本目录 | 跑 `oj build <module>`；锁被手工改坏时按报错修 |
 | 启动报「version dir collision」 | 两个 (module, version) 组合拼出同一目录名（如 `a`/`1-x` 与 `a-1`/`x`） | 改 version 命名避开 |
 | 404 | 路由无对应 `api.ts/js`，或目录穿越/非法段 | 核对路径与 `-b` 前缀；release 先确认模块在锁内 |
-| 启动报 `server.app_path …` | 静态根目录不存在（相对 config 目录解析） | 建目录或改路径；不配 `app_path` 即关闭静态服务 |
+| 启动报 `server.app_path …` | 静态根目录不存在（config 配置相对 config 目录解析；CLI `--app-path` 相对 CWD） | 建目录或改路径；不配 `app_path` 且不给 `--app-path` 即关闭静态服务 |
+| 启动报 `api path not found: …` | `--api-path` 指定的目录不存在 | 改路径或建目录；两者皆指定时必须都存在（准入门三态） |
+| 启动报 `static site dir not found: …` | 指定了静态根但目录不存在 | 建目录或改路径 |
+| 启动报 `neither api path … specified` | `--api-path` 与静态站点皆未指定（server 无 src/dist 自动搜索兜底） | 显式指定其一：`--api-path` 或 `server.app_path` / `--app-path` |
 | 静态文件 404 | 文件不存在 / 目录缺 `index.html` / 非 GET/HEAD / 无 SPA 回退（v0.1） | 核对文件；SPA 场景先经前置反代补写回退 |
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |

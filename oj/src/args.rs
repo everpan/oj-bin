@@ -9,10 +9,10 @@ pub struct ServerArgs {
     pub config: String,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
-    /// 后端 API 目录（src 源码树或 oj build 产物 dist）。None → 默认目录
-    /// （src 存在取 src，否则 dist）；模式按目录内容自动判定（server_cmd）。
+    /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；模式按目录内容
+    /// 自动判定。None → server 不开 API 功能（须配置静态站点，否则拒绝启动）。
     pub api_path: Option<String>,
-    /// 静态站点目录；Some 覆盖 config 的 server.app_path。
+    /// 静态站点目录（相对 CWD）；Some 覆盖 config 的 server.app_path（后者相对 config 目录）。
     pub app_path: Option<String>,
     /// JWS 证书路径；Some 覆盖 config 的 server.certificate_path。
     pub cert_path: Option<String>,
@@ -28,7 +28,7 @@ pub struct TestArgs {
     pub config: String,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
-    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。默认 "tests"。
     pub tests: Option<String>,
@@ -54,7 +54,7 @@ pub struct BuildArgs {
 /// `oj migrate [-c config] [-d dir] [--baseline] [--module M]`。
 pub struct MigrateArgs {
     pub config: String,
-    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
     pub baseline: bool,
@@ -83,7 +83,7 @@ pub enum Command {
 /// `oj schema diff [-c config] [-d dir]`：声明 vs 实库只读对账（D001/D002，§5.1）。
 pub struct SchemaDiffArgs {
     pub config: String,
-    /// None → 默认目录（src 存在取 src，否则 dist）；模式按目录内容自动判定。
+    /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
 }
 
@@ -106,12 +106,13 @@ enum Commands {
         /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
-        /// 后端 API 目录（src 源码树或 oj build 产物 dist）；
+        /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；
         /// 模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 缺省：src 目录存在取 src，否则 dist
+        /// 缺省（server）：不开 API 功能 —— 未指定 --api-path 且未配置静态站点
+        /// （server.app_path / --app-path）则拒绝启动
         #[arg(long = "api-path")]
         api_path: Option<String>,
-        /// 静态站点目录（覆盖 config 的 server.app_path）
+        /// 静态站点目录（相对 CWD；覆盖 config 的 server.app_path，后者相对 config 目录）
         #[arg(long = "app-path")]
         app_path: Option<String>,
         /// JWS 证书路径（覆盖 config 的 server.certificate_path）
@@ -154,7 +155,7 @@ enum Commands {
         #[arg(short, long)]
         base: Option<String>,
         /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：src 目录存在取 src，否则 dist
+        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
         /// 测试用例目录（默认 tests）；相对 config_dir（项目根）
@@ -173,7 +174,7 @@ enum Commands {
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
         /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：src 目录存在取 src，否则 dist
+        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
         /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
@@ -209,7 +210,7 @@ pub enum SchemaCmd {
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
         /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：src 目录存在取 src，否则 dist
+        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
     },

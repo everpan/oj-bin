@@ -72,6 +72,13 @@
 ## 3. `server_cmd.rs` 其余职责
 
 - `load_app_config`（:61）：config 解析 + 目录/模式判定 + base 归源，`server` 与 `test` 共用。
+  目录缺失不在此拦截：server 准入由 `run()` 裁定，migrate/fixture/test 强依赖 api
+  目录、各自就地报错。
+- `admission_gate`：server 准入门三态 —— api（`--api-path`）与静态（`server.app_path` /
+  `--app-path`）至少显式指定其一（皆未指定 → Err）；皆指定 → 两者都必须存在；
+  仅指定其一 → 只启用对应功能（api 缺席 = 纯静态，占位缺失目录使模块扫描为空）。
+- `absolutize_cwd`：CLI `--app-path` 相对 CWD 绝对化（config 值相对 config_dir，
+  由 `resolve_static_root` 处理）。
 - `is_release(dir)`（:105）：目录含 `manifests.yaml` → release。
 - `assemble_blobs`（:144）：逐后端构造；`driver != local` 且无 blob 插件 → fail fast。
 - `connect_dbs`（:188）：经注册表按 scheme 认领，错误带库名。

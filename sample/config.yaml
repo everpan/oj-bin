@@ -1,7 +1,8 @@
 server:
   host: "localhost"
   port: 9778
-  base: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖）
+  api_prefix: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖；旧键名 base 仍兼容）
+  # app_prefix: "/"       # 静态站点前缀（默认 / = 全路径兜底）；如 "/site" 则仅 /site/* 落静态
   # migrate_on_start: auto   # 迁移门禁（§4.6）：auto（dev 默认，启动即应用）|
                      # verify（release 默认，账本落后拒启，先 oj migrate）| off
   # ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）|

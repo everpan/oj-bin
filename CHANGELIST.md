@@ -2,6 +2,37 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.11（2026-09-10）
+
+**特性（breaking）**
+- server 准入门三态（无静默默认）：api（`--api-path`）与静态站点（`server.app_path` /
+  `--app-path`）至少显式指定其一，皆未指定退出并提醒；皆指定则两者都必须存在，任一
+  缺失退出；仅指定其一 → 只启用对应功能（api 缺席 = 纯静态模式，监听行标 `static-only`）。
+  server 不再自动搜索 src/dist 兜底（test/migrate 保留搜索并对缺失目录就地报错）。
+- CLI 路径语义：`--app-path` / `--api-path` 相对 **CWD** 解析（config 内
+  `server.app_path` 仍相对 config 目录）。
+- config `server.base` → `server.api_prefix`（serde alias 兼容旧键，两键并存报
+  duplicate field 防漂移）；新增 `server.app_prefix`（默认 `/` = 全路径兜底）：非 `/`
+  时仅前缀下 GET/HEAD 落静态（前缀剥除解析，前缀根 → index.html），前缀外 404，
+  API 路由永远优先。
+
+**实现**
+- console 关闭时启动失败的最终退出原因仍直写终端：logging tee 保存原始 stderr fd
+  副本（`echo_terminal`），main 错误出口补写（console 开启时不补，避免重复）。
+- dev 缺省服务目录自 config 同级逐级向上搜索（每层 src 优先、dist 次之），不再相对
+  CWD 选址；xtask 可执行产物拷贝改 tmp+rename——就地覆盖触发 macOS vnode 签名
+  缓存毒化（execve 一律 SIGKILL）。
+
+**修复**
+- e2e 不再依赖仓库内 sample/dist（停止跟踪后 CI 新克隆静态根 fail-fast）。
+- ws 闸门用例稳定性：WS_LIVE 归零/平静基线后再断言，消除 straggler 槽位抖动。
+- vitepress 移动端根路径解析错位（ROOT 多上一级致 sync 失源）。
+
+**文档**
+- sample 运行入口统一为编译产物 `bin/oj`（docs / README / sample/README / CLAUDE.md
+  弃用 `cargo run`，README 新增 bin/oj 专节）；devkit 手册与 skill 同步（准入门 /
+  app_prefix / api_prefix / echo_terminal），vitepress 收录 sample 模块专题。
+
 ## v0.1.10（2026-09-09）
 
 **特性（breaking）**

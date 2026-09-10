@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitepress';
 import { withMermaid } from 'vitepress-plugin-mermaid';
-import { splitNav } from './generated/sidebar.mjs';
+import { splitNav, sampleModules } from './generated/sidebar.mjs';
 
 // 中文分词：minisearch 默认按空格切词，对中文无效，改用「单字 + 二元组」。
 const tokenize = (text: string) => {
@@ -125,11 +125,8 @@ export default withMermaid(defineConfig({
         items: [
           { text: 'sample 项目', link: '/sample/' },
           { text: '模块导览', link: '/sample/modules-tour' },
-          { text: 'auth（签发）', link: '/sample/auth' },
-          { text: 'auth_demo（受保护路由）', link: '/sample/auth-demo' },
-          { text: 'upload（上传）', link: '/sample/upload' },
-          { text: 'idp（内置 OP）', link: '/sample/idp' },
-          { text: 'oidc（RP）', link: '/sample/oidc' },
+          // 模块专题（sample/src/*/README.md）由 sync-docs.mjs 生成，勿手加。
+          ...sampleModules,
         ],
       },
       {

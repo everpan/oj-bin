@@ -39,7 +39,7 @@ oidc:
 IdP 侧注册（在 IdP 的管理台上做）：
 
 - redirect_uri 填你服务的**精确串**：`https://<host>/v1/api/oidc/callback`
-  （`server.base` 非默认时替换前缀）。
+  （`server.api_prefix` 非默认时替换前缀）。
 - 允许的 grant：`authorization_code`；强制 PKCE S256 最好（本 RP 永远发 PKCE）。
 - 签名算法 RS256。
 

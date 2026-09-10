@@ -22,6 +22,13 @@ async fn slim(
     module: Option<&str>,
 ) -> Result<Slim, String> {
     let (cfg, config_dir, dir, ts, _base) = load_app_config(config, dir_override, None)?;
+    // 迁移/fixtures 作用于 api 目录下的 SQL；强依赖 api 目录（无「纯静态」形态）。
+    if !dir.is_dir() {
+        return Err(format!(
+            "service dir not found: {}（src 源码树或 oj build 产物 dist）",
+            dir.display()
+        ));
+    }
     let mut registries = Registries::default();
     assemble_plugins(&cfg, &config_dir, &mut registries).await?;
     let dbs = connect_dbs(&cfg.db, &registries.dbs, &config_dir).await?;

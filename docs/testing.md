@@ -45,17 +45,17 @@ L1 测试目录由 `oj test -t/--tests <dir>` 指定，相对**配置文件所�
 
 ```bash
 # 默认 human 摘要
-cargo run -p oj -- test -c sample/config.yaml -d sample/src
+./bin/oj test -c sample/config.yaml -d sample/src
 
 # CI 报告（落盘 JUnit，给 GitHub Actions / GitLab 直接消费）
-cargo run -p oj -- test -c sample/config.yaml -d sample/src \
+./bin/oj test -c sample/config.yaml -d sample/src \
   --format junit --output l1-result.xml
 ```
 
 | 旗标 | 说明 |
 |---|---|
 | `-c/--config` | 配置文件（默认 `config.yaml`） |
-| `-b/--base` | API 基础前缀覆盖（默认用 config 的 `server.base`，如 `/v1/api`） |
+| `-b/--base` | API 基础前缀覆盖（默认用 config 的 `server.api_prefix`，如 `/v1/api`） |
 | `-d/--dir` | 源码目录 `src` 或产物 `dist`（默认自动判定） |
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |

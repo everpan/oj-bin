@@ -48,6 +48,10 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
     cfg.tenant = Default::default();
     cfg.auth = None;
+    // sample/config.yaml 的 app_path: "dist" 指向仓库内产物目录（已停止跟踪，CI
+    // 新克隆无此目录）——e2e UC 不覆盖静态兜底（静态归 server/server_cmd 单测），
+    // 显式关闭，避免 resolve_static_root 因目录缺失 fail-fast。
+    cfg.server.app_path = None;
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = server::test_support::now_secs();
     server::test_support::write_cert_into(
@@ -695,6 +699,10 @@ async fn given_sample_l1_suite_when_oj_test_then_all_pass_and_report_written() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let report = tmp.join("report.json");
+    // sample/dist 已停止跟踪（CI 新克隆无此目录）；子进程 `oj test` 读 sample
+    // config 且无 --app-path 覆盖手段，resolve_static_root 只要求目录存在，
+    // 现场补建即可（gitignore 内，本地常态本就存在；oj test 不做静态断言）。
+    std::fs::create_dir_all(sample().join("dist")).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
         .args([
             "test",
