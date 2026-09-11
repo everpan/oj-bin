@@ -133,6 +133,8 @@ postinstall（需消费方 `onlyBuiltDependencies: ["@oj-bin/oj"]`）、
 
 `publish` job（GitHub Release）**不动**。新增独立 job：
 
+草稿模式（workflow_dispatch + draft=true）下本 job 整体跳过（npm 包不可撤回，人工核对 GitHub Release 草稿后重新 dispatch 同 tag、draft=false 即可幂等补发）；tag 推送直发。
+
 ```yaml
 publish-npm:
   needs: package            # 与 publish 平级，不 needs publish——npm 失败不影响 Release 已先行创建

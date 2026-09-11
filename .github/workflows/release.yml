@@ -260,6 +260,9 @@ jobs:
   publish-npm:
     name: publish npm (@oj-bin)
     needs: package
+    # 草稿模式（dispatch + draft=true）不发 npm——npm 包不可撤回，人工核对 Release
+    # 后重新 dispatch 同 tag、draft=false，幂等补发。tag 推送（直发正式版）不受影响。
+    if: github.event_name == 'push' || inputs.draft != 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
