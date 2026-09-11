@@ -27,6 +27,51 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
    `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
 5. 目标机解包，`./oj server -c config.yaml --api-path dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
 
+### 1.1 npm 分发（`@oj-bin/*`）
+
+除 Release 归档外，另有一条 npm 渠道：`npm i @oj-bin/oj` 由 postinstall 把二进制落到
+用户项目 `./bin/`（`bin/oj`、`bin/plugins/<triple>/`、`bin/devkit/`）。
+
+**模板位置**（仅声明，不含发布逻辑）：
+
+| 路径 | 内容 |
+|---|---|
+| `npm/oj/` | 主包 `@oj-bin/oj` 模板（`__VERSION__` 占位 + 3 个平台 optionalDependencies）+ `postinstall.js` + `test/postinstall.test.js` |
+| `npm/platform/` | 平台子包 `@oj-bin/oj-<triple>` 模板（`__TRIPLE__`/`__OS__`/`__CPU__`；**禁止加 `exports` 字段**，见包内注释） |
+| `npm/README.md` | 两类包共用 README（发布时拷入包根） |
+
+发布逻辑的单一真相来源是 `scripts/npm-publish.sh`——CI（`release.yml` 的 `publish-npm`
+job）与本地手动发布走同一脚本。首选走 CI：打 tag 推送即自动发布，无需本地操作。
+
+**手动发布**（CI 不可用或需补发时）：
+
+```bash
+npm whoami        # 未登录则 npm login（脚本用本地 ~/.npmrc，无需 NPM_TOKEN）
+
+# dist/ 需备齐 oj-v<ver>-<triple>.tar.gz / .zip（CI package job 的 dist-* artifact，
+# 或本地 scripts/deploy.sh——后者仅产本机 triple）
+DRY_RUN=1 bash scripts/npm-publish.sh v0.1.13   # 演练：只装配+断言，不发布
+bash scripts/npm-publish.sh v0.1.13             # 真发（幂等，已发布的包自动 skip）
+```
+
+脚本内建门禁与顺序，无需人工操心：
+
+1. **版本一致性**——tag（去 `v`）必须等于 `oj/Cargo.toml` 的 version。
+2. **triple 校验**——未知 triple、同 `(os,cpu)` 撞车直接报错。
+3. **先子包后主包**——平台包逐个 publish，任一失败即退出，绝不发主包；装配时断言包根
+   有 `oj[.exe]`、`plugins/<triple>/`、`devkit/api-manual.md`。
+4. **发布后置信**——`npm view` 断言 os/cpu，下载 tarball 断言文件清单。
+
+三点注意：
+
+- **npm 包不可撤回**——先 `DRY_RUN=1` 过一遍。这也是 CI 草稿模式（dispatch +
+  `draft=true`）跳过 publish 的原因：人工核对 Release 后重新 dispatch 同 tag、`draft=false`
+  幂等补发。
+- 主包 optionalDependencies 与实际产物 triple 集**必须互为充要**，产物不全会直接报错；
+  完整发布通常还是下载 CI 全量 artifact 再本地跑脚本。
+- 启用 musl 目标前必须先定 libc 策略——`os`/`cpu` 无法区分 `gnu` 与 `musl`，
+  同 `(os,cpu)` 两个 triple 会在第 2 步撞车。
+
 ## 2. 运行
 
 ```bash
