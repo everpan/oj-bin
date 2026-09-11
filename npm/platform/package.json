@@ -1,0 +1,10 @@
+{
+  "name": "@oj-bin/oj-__TRIPLE__",
+  "version": "__VERSION__",
+  "description": "Prebuilt oj binary + plugins for __TRIPLE__. Optional platform package of @oj-bin/oj; do not install directly.",
+  "homepage": "https://github.com/everpan/only-js",
+  "repository": { "type": "git", "url": "git+https://github.com/everpan/only-js.git" },
+  "os": ["__OS__"],
+  "cpu": ["__CPU__"],
+  "_comment": "禁止添加 exports 字段——@oj-bin/oj 的 postinstall 用 require.resolve('@oj-bin/oj-<triple>/package.json') 定位本包；加 exports 而未导出 ./package.json 会在用户机器上抛 ERR_PACKAGE_PATH_NOT_EXPORTED。"
+}

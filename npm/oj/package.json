@@ -1,0 +1,16 @@
+{
+  "name": "@oj-bin/oj",
+  "version": "__VERSION__",
+  "description": "only-js (oj): low-code backend framework embedding a JS/TS runtime (V8) in Rust. Prebuilt binaries; install drops ./bin/oj + plugins + devkit into your project.",
+  "keywords": ["only-js", "oj", "low-code", "backend", "v8", "deno", "typescript"],
+  "homepage": "https://github.com/everpan/only-js",
+  "repository": { "type": "git", "url": "git+https://github.com/everpan/only-js.git" },
+  "engines": { "node": ">=16" },
+  "scripts": { "postinstall": "node postinstall.js" },
+  "optionalDependencies": {
+    "@oj-bin/oj-x86_64-unknown-linux-gnu": "__VERSION__",
+    "@oj-bin/oj-aarch64-apple-darwin": "__VERSION__",
+    "@oj-bin/oj-x86_64-pc-windows-msvc": "__VERSION__"
+  },
+  "files": ["postinstall.js", "README.md"]
+}
