@@ -49,6 +49,15 @@ jobs:
       - name: cargo clippy --workspace --all-targets -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: npm packaging tests (postinstall + dry-run publish)
+        run: |
+          node --test npm/oj/test/postinstall.test.js
+          bash scripts/npm-publish.test.sh
+
   package:
     needs: [lint]
     name: ${{ matrix.name }}
@@ -243,4 +252,94 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             gh release edit "$tag" --draft=false
             echo "草稿 $tag 已随 tag 推送转正"
+          fi
+
+  # npm 发布（@oj-bin/*）：独立 job——不用 continue-on-error（step 级 continue-on-error
+  # 下 job 结论仍绿，告警形同虚设）。失败 = workflow 红；GitHub Release 由 publish job
+  # 先行创建不受影响；幂等设计支持 Re-run failed jobs 只重跑本段。
+  publish-npm:
+    name: publish npm (@oj-bin)
+    needs: package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: resolve tag
+        id: tag
+        run: |
+          cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="v${cargo_version}"
+          fi
+          if [ "${tag#v}" != "$cargo_version" ]; then
+            echo "::error::tag '${tag}' 与 oj/Cargo.toml 的 version '${cargo_version}' 不一致" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: npm whoami (fail fast on bad NPM_TOKEN)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: publish @oj-bin packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash scripts/npm-publish.sh "${{ steps.tag.outputs.tag }}"
+
+  # 发布后置信：三平台真机 npm i + ./bin/oj --help。Windows postinstall 路径只有
+  # 真跑才能验证；registry 传播延迟靠 retry 消化。
+  smoke-npm:
+    name: smoke npm (${{ matrix.triple }})
+    needs: publish-npm
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  triple: x86_64-unknown-linux-gnu }
+          - { os: macos-latest,   triple: aarch64-apple-darwin }
+          - { os: windows-latest, triple: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: npm install from registry + run ./bin/oj --help
+        shell: bash
+        env:
+          VER: ${{ needs.publish-npm.outputs.version }}
+        run: |
+          set -e
+          d=$(mktemp -d) && cd "$d"
+          npm init -y >/dev/null
+          ok=0
+          for i in 1 2 3; do
+            if npm i "@oj-bin/oj@${VER}"; then ok=1; break; fi
+            echo "retry $i: registry propagation lag"; sleep 20
+          done
+          [[ $ok == 1 ]] || { echo "::error::npm i @oj-bin/oj@${VER} 失败"; exit 1; }
+          ls -la bin/
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            [[ -f bin/oj.exe ]] && ./bin/oj.exe --help
+          else
+            [[ -x bin/oj ]] && ./bin/oj --help
           fi
