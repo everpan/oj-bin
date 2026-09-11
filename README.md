@@ -63,6 +63,19 @@ cargo xtask build            # build and place bin/oj + bin/plugins/<triple>/ (r
 ./bin/oj server  -c sample/config.yaml --api-path sample/dist
 ```
 
+### Install prebuilt binaries via npm
+
+```bash
+npm i @oj-bin/oj     # drops ./bin/oj + bin/plugins/<triple>/ + bin/devkit/ into your project
+./bin/oj server -c sample/config.yaml --api-path sample/src
+```
+
+Prebuilt for linux-x64 (glibc) / macOS-arm64 / windows-x64; other platforms use
+[GitHub Releases](https://github.com/everpan/only-js/releases). Notes: pnpm ≥10 needs
+`onlyBuiltDependencies: ["@oj-bin/oj"]` in `pnpm-workspace.yaml`; with `--ignore-scripts`
+run `node node_modules/@oj-bin/oj/postinstall.js` manually; global install (`-g`) is not
+supported. China users may prefer `--registry=https://registry.npmmirror.com` (auto-mirrored).
+
 > Always run examples and business workloads through the compiled **`bin/oj`**: one
 > `cargo xtask build` produces it together with all first-party plugin cdylibs; at
 > runtime it needs no cargo / Rust toolchain, and the same artifact can be copied

@@ -103,10 +103,10 @@ npm 解析时按各子包 `os`/`cpu` 只安装匹配平台的一个；不匹配�
 
 1. **支持面检测（最先做，不满足即明确报错 + exit 0，不静默错装）**：
    - `npm_config_global === 'true'` → 报错：不支持全局安装，请项目内安装或去 GitHub Release；
-   - `npm_config_prefix` 与落盘根不一致（`--prefix` 场景）→ 同样报错。
+   - `npm_config_prefix` 与落盘根不一致（`--prefix` 场景；仅在 npm 标准布局（`up1==@oj-bin && up2==node_modules`）下生效，pnpm/berry 布局不套此启发式）→ 同样报错。
 2. `process.platform` + `process.arch` → triple（3 行映射表，同 §2.2）。
 3. 落盘根解析顺序：`INIT_CWD`（npm/pnpm/yarn classic 都设）→
-   `PROJECT_CWD`（yarn berry 不设 INIT_CWD，设这个）→ 启发式「主包上溯两级」
+   `PROJECT_CWD`（yarn berry 不设 INIT_CWD，设这个）→ 启发式「主包上溯三级（scoped 包多一层：`<root>/node_modules/@oj-bin/oj` → `<root>`）」
    （最后手段，npm 标准布局/workspaces hoisting 下碰巧对，berry PnP 下是错的
    ——但 berry 必设 PROJECT_CWD，走不到这步）。
 4. `require.resolve('@oj-bin/oj-<triple>/package.json')` 定位子包根（npm
