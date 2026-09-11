@@ -18,8 +18,8 @@ const TRIPLES = {
 const RELEASES = 'https://github.com/everpan/only-js/releases';
 const TAG = '[@oj-bin/oj]';
 
-function bail(msg) { // 装不上：醒目提示 + exit 0
-  fs.writeSync(2, `${TAG} WARN: ${msg}\n`);
+function bail(msg) { // 装不上：醒目提示 + exit 0；stderr 不可用也要保证 exit 0
+  try { fs.writeSync(2, `${TAG} WARN: ${msg}\n`); } catch {}
   process.exit(0);
 }
 
@@ -48,8 +48,19 @@ const installRoot = process.env.INIT_CWD || process.env.PROJECT_CWD || up3;
 // pnpm/.pnpm、berry PnP 布局不套此启发式（它们的 INIT_CWD/PROJECT_CWD 可信）。
 const up1 = path.basename(path.dirname(__dirname));
 const up2 = path.basename(path.dirname(path.dirname(__dirname)));
+let initCwdReal;
+let up3Real;
+if (process.env.INIT_CWD) {
+  try {
+    initCwdReal = fs.realpathSync(process.env.INIT_CWD);
+    up3Real = fs.realpathSync(up3);
+  } catch {
+    initCwdReal = path.resolve(process.env.INIT_CWD);
+    up3Real = up3;
+  }
+}
 if (process.env.INIT_CWD && up1 === '@oj-bin' && up2 === 'node_modules' &&
-  fs.realpathSync(process.env.INIT_CWD) !== fs.realpathSync(up3)) {
+  initCwdReal !== up3Real) {
   bail(`安装根（${up3}）与当前目录（${process.env.INIT_CWD}）不一致（--prefix 或 workspace 子目录安装）。\n` +
     `为避免装错位置已跳过。请进入目标项目目录重装，或手动执行：\n` +
     `  node ${path.join(__dirname, 'postinstall.js')}`);
