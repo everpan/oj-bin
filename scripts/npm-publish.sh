@@ -144,7 +144,8 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
       darwin) want='package/oj$|\.dylib$' ;;
       *)      want='package/oj$|\.so$' ;;
     esac
-    curl -fsSL "$tb" | tar -tzf - | grep -qE "$want" || { echo "::error::${pkg} tarball 文件清单断言失败" >&2; exit 1; }
+    list=$(curl -fsSL "$tb" | tar -tzf -) || { echo "::error::${pkg} tarball 获取/解压清单失败" >&2; exit 1; }
+    echo "$list" | grep -qE "$want" || { echo "::error::${pkg} tarball 文件清单断言失败" >&2; exit 1; }
     echo "verified ${pkg}@${VERSION} os=$os cpu=$cpu"
   done
 fi
