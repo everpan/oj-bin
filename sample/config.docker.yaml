@@ -1,0 +1,115 @@
+# Docker 运行专用配置：sample/config.yaml 的变体，仅两处不同——
+#   1. server.host = 0.0.0.0：容器内绑 localhost 宿主机访问不到（端口映射进的是容器网络栈）
+#   2. console_log = true：日志回写终端，`docker logs` / `docker compose logs` 可见
+# 其余语义与 sample/config.yaml 一致（demo 自签证书，勿用于生产）。
+# 用法见根目录 docker-compose.yml 或：
+#   docker run --rm -p 9778:9778 -v "$PWD:/app" oj -c config.docker.yaml --api-path src
+
+server:
+  host: "0.0.0.0"
+  port: 9778
+  api_prefix: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖；旧键名 base 仍兼容）
+  # app_prefix: "/"       # 静态站点前缀（默认 / = 全路径兜底）；如 "/site" 则仅 /site/* 落静态
+  # migrate_on_start: auto   # 迁移门禁（§4.6）：auto（dev 默认，启动即应用）|
+                     # verify（release 默认，账本落后拒启，先 oj migrate）| off
+  # ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）|
+                     # deny（未声明 deps 的跨模块表访问拒绝执行）。
+  ownership_guard: deny
+  app_path: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务；CLI --app-path 可覆盖）
+  # logs_dir: "logs"   # 日志目录（终端输出镜像落盘；文件名 server-<启动秒>_<pid>.log）
+  # logs_max_m: 100            # 单个日志文件大小上限（单位 M，<100 按 100 生效），超过滚动
+  # logs_keep_files: 10        # 日志文件保留个数（含活动文件，超出删除）
+                     #  绝对路径直接用；相对路径相对本文件目录；省略 = 本文件目录下 ./logs
+  console_log: true          # 终端输出（Docker 必须 true，否则 docker logs 看不到任何输出）
+  #  证书必配（无逃生口）：不配两个路径即启动报错。此处为示例自签证书（有效期 1 年，
+  #  私钥仅示例用，勿用于生产）；生产用 `tools/oj-cert` 生成并妥善保管私钥。
+  public_key_path: "./config/public.pem"
+  certificate_path: "./config/cert.jws"
+db:
+  default: "sqlite://db.sqlite"
+  test: "sqlite://db_test.sqlite"
+  # 多库混用（v0.2）：mysql/postgres DSN 原样透传，按名 DB("name") 取用。
+  # analytics: "mysql://user:pass@127.0.0.1:3306/app"
+  # warehouse: "postgres://127.0.0.1:5432/app"
+
+redis:
+  # v0.2: 配置存在即真连 Redis（启动 fail-fast，连不上直接报错退出）；注释/删除 → 内存 KV。
+  # 真连后 kv/redis 全局与 auth 会话共享同一 Redis（多实例水平扩展的前提）。
+  # default: "redis://127.0.0.1:6379/1"
+
+es:   # Elasticsearch（v0.2）：块存在即启用 es.search/index/del；endpoint 尾斜杠自动剪除
+  # endpoint: "http://127.0.0.1:9200"
+
+blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/blob/{key} 下载路由
+  driver: "local"   # local | s3（s3: endpoint/bucket/region/access_key/secret_key 必配 bucket/region）
+  root: "uploads"   # local 专用：存储根（相对本文件目录绝对化；需写权限）
+  # s3 示例（MinIO path_style 需 true）：
+  # driver: "s3"
+  # endpoint: "http://127.0.0.1:9000"
+  # bucket: "oj-blobs"
+  # region: "us-east-1"
+  # access_key: "minioadmin"
+  # secret_key: "minioadmin"
+  # path_style: true
+
+tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
+  enable: true
+  header_key: "X-TENANT-ID"
+  anonymous_paths:               # 免租户头路径（OIDC 302 跳转腿带不了自定义头）
+    - "/oidc/*"
+    - "/idp/*"
+    - "/idp/.well-known/*"
+    # WS 路由（<dir>/ws.ts）是 merge 进 Router 的真实路由，本就不经过这套
+    # 前置管线（连接天然匿名）——无需也不会出现在 anonymous_paths 里。
+
+auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/auth/，jwt 原语注入）
+  jwt_secret: "change-me"        # 生产必改；空串启动 fail-fast
+  signing_method: "HS256"        # HS256 | HS384 | HS512
+  access_token_duration: "60s"   # access token 有效期（s/m/h/d）
+  refresh_token_duration: "720h" # refresh session 有效期（轮换制）
+  anonymous_paths:               # 免鉴权路径（去 /v1/api 前缀；尾 /* 为一层通配）
+    - "/health"
+    - "/auth/login"              # auth 端点已是业务路由，须显式匿名
+    - "/auth/refresh"
+    - "/auth/logout"
+    # WS 订阅路由（/news/ws）不在守卫面内（真实路由，不过前置管线）；
+    # 发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
+    - "/oidc/*"
+    - "/idp/*"
+    - "/idp/.well-known/*"
+
+tasks:   # 长任务池（v0.1.6）：dir 相对 API 目录；sample/src/tasks/task_demo.ts 每秒心跳
+  dir: "tasks"
+  max: 64
+  stop_grace_secs: 30
+
+kafkas:   # 命名 Kafka（v0.1.6）：值透传 oj-bus-kafka；配好 brokers 即可用 Kafka("default")
+  # default:
+  #   brokers: ["127.0.0.1:9092"]
+  #   group: "sample"
+
+rabbits:   # 命名 RabbitMQ（v0.1.6）：值透传 oj-bus-rabbitmq；RabbitMQ("default")
+  # default:
+  #   url: "amqp://guest:guest@127.0.0.1:5672"
+
+oidc:   # OIDC（spec 2026-09-05）：同进程 OP + RP。demo 私钥与示例证书同性质，勿用于生产。
+  # 容器场景 issuer 须从宿主机可达的地址访问；此处保持 localhost 演示值，
+  # 跨机部署时改为宿主机 IP / 域名。
+  issuer: "http://localhost:9778/v1/api/idp"
+  private_key_path: "./config/oidc_rs256.pem"
+  rp:   # RP：tenant → IdP。default 自举本机 OP；acme 留外部 IdP 样例（注释）。
+    default:
+      issuer: "http://localhost:9778/v1/api/idp"
+      client_id: "sample-rp"
+      client_secret: "rp-secret"
+      scope: "openid profile"
+    # acme:
+    #   issuer: "https://idp.acme.example"
+    #   client_id: "..."
+    #   client_secret: "..."
+  clients:   # OP 侧 client 白名单（redirect_uri 精确串）
+    sample-rp:
+      secret: "rp-secret"
+      redirect_uris:
+        - "http://localhost:9778/v1/api/oidc/callback"
+      tenant: "default"

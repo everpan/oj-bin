@@ -1,0 +1,50 @@
+# 构建上下文瘦身：镜像构建只需要 Rust 源码 + tests/（workspace 成员）
+# + docs/ 与 sample/global.d.ts（devkit 素材）+ .cargo/（xtask alias）。
+# 与 Dockerfile 的 COPY . . 配套；新增顶层大目录时记得评估是否要排除。
+
+# VCS / CI / 本地工具
+.git
+.github
+.vscode
+.idea
+.DS_Store
+
+# 构建产物与缓存（全部可再生产物）
+target
+bin
+dist
+tmp
+**/dist
+
+# 非 Docker 构建链路的目录
+npm
+spikes
+scripts
+
+# Node 侧（sample 的 dev 依赖与 npm 发布链路）
+node_modules
+**/node_modules
+
+# sample：保留 global.d.ts（devkit 素材，xtask build 需要）与源码，
+# 只排掉体积/落盘类内容。
+# 注意：BuildKit 禁止「先排除整目录再 !  reopen 其中文件」
+# （报 changes out of order），故此处用定向排除而非 sample + !sample/global.d.ts。
+sample/node_modules
+sample/dist
+sample/logs
+sample/uploads
+sample/db*.sqlite
+sample/db*.sqlite-*
+sample/*.sqlite
+sample/*.sqlite-*
+sample/**/*.sqlite
+sample/**/*.sqlite-*
+
+# 运行期落盘数据（数据库 / 日志 / 上传）
+*.sqlite
+*.sqlite-*
+logs
+**/logs
+uploads
+**/uploads
+*.log

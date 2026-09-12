@@ -1,0 +1,20 @@
+# oj Docker 演示（sample）：构建镜像 + 挂载 sample/ 以 dev 模式运行（TS 按需转译 + 热重载）。
+#
+#   docker compose up --build          # 起服务（构建约需 20-40 分钟：V8 + 全 workspace release）
+#   curl "http://localhost:9778/v1/api/user/account/?id=1" -H "X-TENANT-ID: t1"
+#
+# 说明：
+#   - config.docker.yaml：sample/config.yaml 变体（host 0.0.0.0 + console_log true）
+#   - sqlite / logs / uploads 直接写回宿主机 sample/ 目录（容器以 root 运行，
+#     产生的文件属主为 root；按需用 user: "1000:1000" 覆盖）
+#   - 生产用法：把 command 换成你自己的业务目录挂载，见 Dockerfile 头部注释
+
+services:
+  oj:
+    build: .
+    image: oj-bin/oj:latest
+    ports:
+      - "9778:9778"
+    volumes:
+      - ./sample:/app
+    command: ["-c", "config.docker.yaml", "--api-path", "src"]
