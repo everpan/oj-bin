@@ -323,6 +323,8 @@ struct QueryReq {
     offset: Option<u32>,
     #[serde(default)]
     unions: Vec<UnionArm>,
+    #[serde(default)]
+    with: Vec<CteReq>,
 }
 
 /// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
@@ -340,6 +342,15 @@ enum UnionKind {
 struct UnionArm {
     #[serde(default)]
     kind: UnionKind,
+    query: Box<QueryReq>,
+}
+
+/// CTE（非递归；columns 必填——CTE 输出列即后续解析的白名单）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CteReq {
+    name: String,
+    columns: Vec<String>,
     query: Box<QueryReq>,
 }
 
@@ -412,36 +423,71 @@ fn apply_op<T: ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Result<SimpleExp
     })
 }
 
+/// 表来源：真实表（registry）或 CTE 虚拟表（声明列）。
+enum TableSrc<'a> {
+    Real(&'a TableDef),
+    Cte(&'a [String]),
+}
+
+impl TableSrc<'_> {
+    fn has_column(&self, col: &str) -> bool {
+        match self {
+            TableSrc::Real(t) => t.has_column(col),
+            TableSrc::Cte(cols) => cols.iter().any(|c| c == col),
+        }
+    }
+
+    /// 真实表按注册表类型判定；CTE 列无类型信息，声明即可排序。
+    fn is_sortable(&self, col: &str) -> bool {
+        match self {
+            TableSrc::Real(t) => t.is_sortable(col),
+            TableSrc::Cte(cols) => cols.iter().any(|c| c == col),
+        }
+    }
+
+    /// 全列名（select 省略 columns 时的展开清单）。
+    fn col_names(&self) -> Vec<&str> {
+        match self {
+            TableSrc::Real(t) => t.columns.keys().map(|s| s.as_str()).collect(),
+            TableSrc::Cte(cols) => cols.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
 /// 限定列解析上下文（select/where/orderBy/groupBy/having/join on 六处共用）。
 struct ColCtx<'a> {
     base_name: &'a str,
-    base: &'a TableDef,
-    joins: Vec<(&'a str, &'a TableDef)>,
+    base: TableSrc<'a>,
+    joins: Vec<(&'a str, TableSrc<'a>)>,
+    /// 顶层 with 声明（未参与 FROM 的直接引用也可解析列——由 SQL 侧报错兜底）。
+    ctes: Vec<(&'a str, TableSrc<'a>)>,
 }
 
 impl ColCtx<'_> {
-    /// 列引用 → 所属表定义：`"t.col"` 表段 ∈ {基表} ∪ {join 表}，列段对该表校验；
-    /// 非限定仅解析基表（不查 join 表——天然拒绝歧义，强制全限定名）。
-    fn table_of(&self, col: &str, site: &str) -> Result<&TableDef, JsErrorBox> {
+    /// 列引用 → 所属表来源：`"t.col"` 表段 ∈ {基表} ∪ {join 表} ∪ {CTE 名}，
+    /// 列段对该来源校验；非限定仅解析基表（不查 join 表——天然拒绝歧义，强制全限定名）。
+    fn table_of(&self, col: &str, site: &str) -> Result<&TableSrc<'_>, JsErrorBox> {
         match col.split_once('.') {
             Some((t, c)) => {
-                let td = if t == self.base_name {
-                    self.base
-                } else if let Some((_, td)) = self.joins.iter().find(|(n, _)| *n == t) {
-                    td
+                let ts = if t == self.base_name {
+                    &self.base
+                } else if let Some((_, ts)) = self.joins.iter().find(|(n, _)| *n == t) {
+                    ts
+                } else if let Some((_, ts)) = self.ctes.iter().find(|(n, _)| *n == t) {
+                    ts
                 } else {
                     return Err(JsErrorBox::generic(format!(
                         "unknown table '{t}' in {site}"
                     )));
                 };
-                if !td.has_column(c) {
+                if !ts.has_column(c) {
                     return Err(JsErrorBox::generic(format!(
                         "unknown column '{col}' in {site}"
                     )));
                 }
-                Ok(td)
+                Ok(ts)
             }
-            None if self.base.has_column(col) => Ok(self.base),
+            None if self.base.has_column(col) => Ok(&self.base),
             None => Err(JsErrorBox::generic(format!(
                 "unknown column '{col}' in {site}"
             ))),
@@ -486,7 +532,7 @@ fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorB
             "{site}: nested select must be select"
         )));
     }
-    if !req.unions.is_empty() {
+    if !req.unions.is_empty() || !req.with.is_empty() {
         return Err(JsErrorBox::generic(format!(
             "{site}: nested select does not accept with/unions (v1)"
         )));
@@ -648,12 +694,18 @@ fn cond_expr_having(
     )
 }
 
-/// op 前置守卫（两个 op 共用）：主表与 join 表 check_table；条件树（含 having）
-/// 内所有子查询/exists 的嵌套 req 递归过守卫（与 cond_expr 同构遍历）。
+/// op 前置守卫（两个 op 共用）：主表与 join 表 check_table（命中本层 CTE 名则跳过——
+/// 虚拟表无归属）；条件树（含 having）内所有子查询/exists 的嵌套 req 递归过守卫；
+/// 每个 cte.query 递归过守卫。
 fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
-    super::guard::check_table(state, &req.table)?;
+    let cte_name = |n: &str| req.with.iter().any(|c| c.name == n);
+    if !cte_name(&req.table) {
+        super::guard::check_table(state, &req.table)?;
+    }
     for j in &req.joins {
-        super::guard::check_table(state, &j.table)?;
+        if !cte_name(&j.table) {
+            super::guard::check_table(state, &j.table)?;
+        }
     }
     for c in &req.conditions {
         guard_nested(state, c)?;
@@ -663,6 +715,9 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
     }
     for u in &req.unions {
         guard_req(state, &u.query)?;
+    }
+    for c in &req.with {
+        guard_req(state, &c.query)?;
     }
     Ok(())
 }
@@ -728,6 +783,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if !req.unions.is_empty() {
                 return reject("insert", "unions");
             }
+            if !req.with.is_empty() {
+                return reject("insert", "with");
+            }
             if !req.columns.is_empty() {
                 return reject("insert", "columns");
             }
@@ -750,6 +808,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             }
             if !req.unions.is_empty() {
                 return reject("update/delete", "unions");
+            }
+            if !req.with.is_empty() {
+                return reject("update/delete", "with");
             }
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
@@ -777,33 +838,6 @@ fn build_statement(
     dialect: Dialect,
 ) -> Result<(String, Vec<Value>), JsErrorBox> {
     validate_verb(req)?;
-    let table = reg
-        .get(&req.table)
-        .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-    // join 表先行解析（自 join / 空 on / 未知表在此拒绝；DML 带 joins 已被矩阵拒绝）。
-    let mut join_defs: Vec<(&str, &TableDef)> = Vec::new();
-    for j in &req.joins {
-        if j.table == req.table {
-            return Err(JsErrorBox::generic(
-                "self join not supported (no table alias)",
-            ));
-        }
-        if j.on.is_empty() {
-            return Err(JsErrorBox::generic(format!(
-                "join '{}' needs non-empty on",
-                j.table
-            )));
-        }
-        let td = reg
-            .get(&j.table)
-            .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", j.table)))?;
-        join_defs.push((j.table.as_str(), td));
-    }
-    let ctx = ColCtx {
-        base_name: &req.table,
-        base: table,
-        joins: join_defs,
-    };
     let params_of =
         |(sql, values): (String, sea_query::Values)| -> Result<(String, Vec<Value>), JsErrorBox> {
             let params = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
@@ -811,11 +845,23 @@ fn build_statement(
         };
     match req.verb {
         Verb::Select => {
-            // 方言 build 只在最顶层做一次，参数由 sea-query 跨整棵语句树统一收集。
+            // WITH 先校验装配（名称/列形状/嵌套约束须先于主语句解析——CTE 基表
+            // 依赖声明合法），再方言 build；参数由 sea-query 跨整棵语句树统一收集。
+            let clause = if req.with.is_empty() {
+                None
+            } else {
+                Some(build_with_clause(req, reg, 0)?)
+            };
             let sel = build_select_stmt(req, reg, 0)?;
-            params_of(build_sql(dialect, &sel))
+            match clause {
+                None => params_of(build_sql(dialect, &sel)),
+                Some(c) => params_of(build_sql(dialect, &sel.with(c))),
+            }
         }
         Verb::Insert => {
+            let table = reg
+                .get(&req.table)
+                .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
             let keys: Vec<String> = req.values[0].keys().cloned().collect();
             for k in &keys {
                 if !table.has_column(k) {
@@ -840,6 +886,16 @@ fn build_statement(
             params_of(build_sql(dialect, &ins))
         }
         Verb::Update => {
+            // DML 带 joins/with 已被动词矩阵拒绝 → 条件上下文恒为真实基表、无联表。
+            let table = reg
+                .get(&req.table)
+                .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+            let ctx = ColCtx {
+                base_name: &req.table,
+                base: TableSrc::Real(table),
+                joins: Vec::new(),
+                ctes: Vec::new(),
+            };
             let mut up = Query::update();
             up.table(Alias::new(&req.table));
             for (k, v) in &req.sets {
@@ -862,6 +918,14 @@ fn build_statement(
             params_of(build_sql(dialect, &up))
         }
         Verb::Delete => {
+            let ctx = ColCtx {
+                base_name: &req.table,
+                base: TableSrc::Real(reg.get(&req.table).ok_or_else(|| {
+                    JsErrorBox::generic(format!("unknown table '{}'", req.table))
+                })?),
+                joins: Vec::new(),
+                ctes: Vec::new(),
+            };
             let mut del = Query::delete();
             del.from_table(Alias::new(&req.table));
             let mut leaves = 0usize;
@@ -886,11 +950,30 @@ fn build_select_stmt(
     reg: &SchemaRegistry,
     depth: u8,
 ) -> Result<SelectStatement, JsErrorBox> {
-    let table = reg
-        .get(&req.table)
-        .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-    // join 表先行解析（自 join / 空 on / 未知表在此拒绝）。
-    let mut join_defs: Vec<(&str, &TableDef)> = Vec::new();
+    // CTE 虚拟表集合（本层 with 声明；嵌套层 validate_nested 已保证为空）。
+    // WITH 名遮蔽同名真实表（SQL 语义）；CTE 名跳过 registry 解析。
+    let cte_cols = |name: &str| {
+        req.with
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.columns.as_slice())
+    };
+    let resolve = |name: &str| -> Result<TableSrc<'_>, JsErrorBox> {
+        if let Some(cols) = cte_cols(name) {
+            return Ok(TableSrc::Cte(cols));
+        }
+        Ok(TableSrc::Real(reg.get(name).ok_or_else(|| {
+            JsErrorBox::generic(format!("unknown table '{name}'"))
+        })?))
+    };
+    let ctes: Vec<(&str, TableSrc<'_>)> = req
+        .with
+        .iter()
+        .map(|c| (c.name.as_str(), TableSrc::Cte(c.columns.as_slice())))
+        .collect();
+    let base = resolve(&req.table)?;
+    // join 表先行解析（自 join / 空 on / 未知表在此拒绝；join 表可为 CTE 名）。
+    let mut join_defs: Vec<(&str, TableSrc<'_>)> = Vec::new();
     for j in &req.joins {
         if j.table == req.table {
             return Err(JsErrorBox::generic(
@@ -903,31 +986,25 @@ fn build_select_stmt(
                 j.table
             )));
         }
-        let td = reg
-            .get(&j.table)
-            .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", j.table)))?;
-        join_defs.push((j.table.as_str(), td));
+        join_defs.push((j.table.as_str(), resolve(&j.table)?));
     }
     let ctx = ColCtx {
         base_name: &req.table,
-        base: table,
+        base,
         joins: join_defs,
+        ctes,
     };
     let mut q = Query::select();
     // 聚合别名台账（alias → 原表达式），having 展开用（Task 11）。
     let mut agg_aliases: HashMap<String, SimpleExpr> = HashMap::new();
     if req.columns.is_empty() {
         // 全列；带 join 时全部限定为基表列（两表同名列如 id 歧义）。
+        let names = ctx.base.col_names();
         let cols: Vec<SimpleExpr> = if req.joins.is_empty() {
-            ctx.base
-                .columns
-                .keys()
-                .map(|c| col_simple_expr(c))
-                .collect()
+            names.iter().map(|c| col_simple_expr(c)).collect()
         } else {
-            ctx.base
-                .columns
-                .keys()
+            names
+                .iter()
                 .map(|c| col_simple_expr(&format!("{}.{c}", req.table)))
                 .collect()
         };
@@ -1118,6 +1195,33 @@ fn build_select_stmt(
         }
     }
     Ok(q)
+}
+
+/// 顶层 WITH 装配（build_select_stmt 不做 with 判断——嵌套嵌入只需要 SelectStatement；
+/// SelectStatement::with 消费 self 返回 WithQuery，由 build_statement 的 Select 臂包装）。
+/// name/columns 过别名形状校验；成员过 validate_nested（禁 with/unions/非 select）。
+fn build_with_clause(
+    req: &QueryReq,
+    reg: &SchemaRegistry,
+    depth: u8,
+) -> Result<sea_query::WithClause, JsErrorBox> {
+    let mut clause = sea_query::WithClause::new();
+    for c in &req.with {
+        check_alias(&c.name)?;
+        if c.columns.is_empty() {
+            return Err(JsErrorBox::generic("cte needs non-empty columns"));
+        }
+        for col in &c.columns {
+            check_alias(col)?;
+        }
+        validate_nested(&c.query, depth + 1, "cte")?;
+        let mut cte = sea_query::CommonTableExpression::new();
+        cte.table_name(Alias::new(&c.name));
+        cte.columns(c.columns.iter().map(Alias::new));
+        cte.query(build_select_stmt(&c.query, reg, depth + 1)?);
+        clause.cte(cte);
+    }
+    Ok(clause)
 }
 
 /// op_db_query_build：结构化查询 -> 参数化 SQL -> 执行。
@@ -1614,8 +1718,9 @@ mod tests {
             .table("b", &["id"], &["id", "aid", "label"]);
         let ctx = ColCtx {
             base_name: "a",
-            base: reg.get("a").unwrap(),
-            joins: vec![("b", reg.get("b").unwrap())],
+            base: TableSrc::Real(reg.get("a").unwrap()),
+            joins: vec![("b", TableSrc::Real(reg.get("b").unwrap()))],
+            ctes: Vec::new(),
         };
         assert!(ctx.check_col("name", "select").is_ok());
         assert!(ctx.check_col("b.label", "select").is_ok());
@@ -2174,5 +2279,80 @@ mod tests {
         )
         .to_string()
         .contains("update/delete does not accept columns"));
+    }
+
+    /// CTE：主表 = CTE 与 join CTE（声明列即白名单；真实执行验证）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cte_main_and_join() {
+        let b = seeded_bridge_2t().await;
+        // 主表 = CTE：r(aid,label) = b 中 aid=1 → 2 行
+        let cap = b
+            .run(
+                r#"db.table("r").with("r", ["aid","label"],
+        db.table("b").select(["aid","label"]).where({field:"aid",op:"eq",value:1}))
+      .select(["aid","label"]).orderBy([{field:"aid",dir:"asc"}]).all()
+      .then(r=>json.ok({n:r.length,first:r[0].label})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 2, "{v}");
+        assert_eq!(v["data"]["first"], "L1", "{v}");
+        // join CTE：a ⋈ r on a.id = r.aid → x × {L1,L2} = 2 行
+        let cap = b
+            .run(
+                r#"db.table("a").with("r", ["aid","label"],
+        db.table("b").select(["aid","label"]).where({field:"aid",op:"eq",value:1}))
+      .join("r", [{left:"a.id",right:"r.aid"}]).select(["a.name","r.label"]).all()
+      .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 2, "{v}");
+    }
+
+    /// CTE 负向：别名形状 / 空 columns / 未声明列 / 嵌套带 with / DML 带 with。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cte_rejections() {
+        let b = seeded_bridge_2t().await;
+        for (js, want) in [
+            // name 形状非法（既有 check_alias 锁定文案为 illegal alias，brief 写 invalid）
+            (
+                r#"db.table("r").with("0bad", ["aid"], db.table("b").select(["aid"])).select(["aid"]).all()"#,
+                "illegal alias",
+            ),
+            // columns 空
+            (
+                r#"db.table("r").with("r", [], db.table("b").select(["aid"])).select(["aid"]).all()"#,
+                "cte needs non-empty columns",
+            ),
+            // 引用未声明的 CTE 列
+            (
+                r#"db.table("r").with("r", ["aid"], db.table("b").select(["aid"])).select(["r.nope"]).all()"#,
+                "unknown column",
+            ),
+            // 嵌套 req 带 with
+            (
+                r#"db.table("a").select(["id"]).where({field:"id",op:"in",
+                 subquery:{table:"b",columns:["aid"],with:[{name:"x",columns:["aid"],
+                   query:{table:"b",columns:["aid"]}}]}}).all()"#,
+                "nested select does not accept with/unions",
+            ),
+            // insert 带 with（动词矩阵）
+            (
+                r#"db.table("a").insert({name:"z"}).with("r",["aid"],db.table("b").select(["aid"])).run()"#,
+                "insert does not accept with",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
     }
 }

@@ -354,7 +354,7 @@ globalThis.db = globalThis.DB("default");
 // module's bound db (snapshot `db` is only the JS-visible name it was created with).
 function builderFromReq(snap) {
   const req = Object.assign(
-    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [] },
+    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [], with: [] },
     snap,
   );
   req.db = String(req.db); req.table = String(req.table);
@@ -373,6 +373,7 @@ function builderFromReq(snap) {
     groupBy(cols) { req.group_by = (cols || []).map(String); return api; },
     having(cond) { req.having = unwrapTree(cond); return api; },
     union(other, kind) { req.unions.push({ kind: kind ? String(kind) : "distinct", query: unwrapSub(other) }); return api; },
+    with(name, columns, query) { req.with.push({ name: String(name), columns: (columns || []).map(String), query: unwrapSub(query) }); return api; },
     run() {
       if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
         throw new Error(req.verb + " requires where");
