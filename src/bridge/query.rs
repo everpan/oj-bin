@@ -41,11 +41,62 @@ enum Op {
 
 /// 单条过滤条件（列名 + 操作符 + 值）。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cond {
     field: String,
     op: Op,
     #[serde(default)]
     value: Option<Value>,
+}
+
+/// 嵌套条件树（对齐 xorm And/Or/Not）。不用 untagged（serde 在 untagged 内
+/// deny_unknown_fields 不生效，{field,op,value,or:[...]} 会被静默降级为 Leaf）——
+/// 手写 Deserialize 按键唯一分发，多余键显式报错。
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum CondTree {
+    Leaf(Cond),
+    And(Vec<CondTree>),
+    Or(Vec<CondTree>),
+    Not(Box<CondTree>),
+}
+
+impl<'de> Deserialize<'de> for CondTree {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let m = serde_json::Map::<String, Value>::deserialize(d)?;
+        let groups: Vec<&str> = ["and", "or", "not"]
+            .into_iter()
+            .filter(|k| m.contains_key(*k))
+            .collect();
+        if !groups.is_empty() {
+            let extra: Vec<&String> = m.keys().filter(|k| !groups.contains(&k.as_str())).collect();
+            if groups.len() != 1 || !extra.is_empty() {
+                return Err(Error::custom(format!(
+                    "condition group takes exactly one of and/or/not, unknown keys {extra:?}"
+                )));
+            }
+            let parse_vec = |v: &Value| -> Result<Vec<CondTree>, D::Error> {
+                let xs = Vec::<CondTree>::deserialize(v.clone()).map_err(Error::custom)?;
+                if xs.is_empty() {
+                    return Err(Error::custom("empty condition group"));
+                }
+                Ok(xs)
+            };
+            return match groups[0] {
+                "and" => Ok(CondTree::And(parse_vec(&m["and"])?)),
+                "or" => Ok(CondTree::Or(parse_vec(&m["or"])?)),
+                _ => Ok(CondTree::Not(Box::new(
+                    CondTree::deserialize(m["not"].clone()).map_err(Error::custom)?,
+                ))),
+            };
+        }
+        let leaf = Cond::deserialize(Value::Object(m)).map_err(Error::custom)?;
+        Ok(CondTree::Leaf(leaf))
+    }
 }
 
 /// 排序项。
@@ -493,5 +544,29 @@ mod tests {
                 .contains("unknown column 'nope' in where"),
             "{v}"
         );
+    }
+
+    #[test]
+    fn cond_tree_deserialize_dispatch_and_errors() {
+        // 叶子向后兼容
+        let t: CondTree = serde_json::from_str(r#"{"field":"a","op":"eq","value":1}"#).unwrap();
+        assert!(matches!(t, CondTree::Leaf(_)));
+        // and / or / not
+        let t: CondTree = serde_json::from_str(
+            r#"{"or":[{"field":"a","op":"eq","value":1},{"not":{"field":"b","op":"isnull"}}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(t, CondTree::Or(ref xs) if xs.len() == 2));
+        // 空组 → Err
+        let e = serde_json::from_str::<CondTree>(r#"{"and":[]}"#).unwrap_err();
+        assert!(e.to_string().contains("empty condition group"), "{e}");
+        // 多余键（leaf 形状 + or）→ Err，不静默吞
+        let e = serde_json::from_str::<CondTree>(r#"{"field":"a","op":"eq","value":1,"or":[]}"#)
+            .unwrap_err();
+        assert!(e.to_string().contains("unknown keys"), "{e}");
+        // 组键多于一个 → Err
+        assert!(serde_json::from_str::<CondTree>(r#"{"and":[],"or":[]}"#).is_err());
+        // 空对象 → Err
+        assert!(serde_json::from_str::<CondTree>(r#"{}"#).is_err());
     }
 }
