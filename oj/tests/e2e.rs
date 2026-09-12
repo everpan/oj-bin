@@ -729,3 +729,97 @@ async fn given_sample_l1_suite_when_oj_test_then_all_pass_and_report_written() {
     assert_eq!(v["passed"], v["total"]);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// 查询构造器全链路（v0.1.14）：schema.yaml 声明 a/b 两表（gate=auto 自动建表）
+/// → HTTP POST 走 db.table().insert().run()（值经绑定参数）→ HTTP GET 走
+/// join + select 全链路；白名单外的列名在 op 侧拒绝（500 信封）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_query_builder_join_and_insert() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/schema.yaml",
+            "tables:\n\
+             \x20 a:\n\
+             \x20   pk: id\n\
+             \x20   columns:\n\
+             \x20     id: { type: integer, autoincrement: true }\n\
+             \x20     name: { type: text }\n\
+             \x20 b:\n\
+             \x20   pk: id\n\
+             \x20   columns:\n\
+             \x20     id: { type: integer, autoincrement: true }\n\
+             \x20     aid: { type: integer, null: false }\n\
+             \x20     label: { type: text }\n",
+        ),
+        (
+            "src/u/api/api.ts",
+            "function get(): void {\n\
+             \x20 db.table(\"a\")\n\
+             \x20   .join(\"b\", [{ left: \"a.id\", right: \"b.aid\" }])\n\
+             \x20   .select([\"a.name\", \"b.label\"])\n\
+             \x20   .all()\n\
+             \x20   .then((rows) => json.ok(rows));\n\
+             }\n\
+             \n\
+             function post(): void {\n\
+             \x20 const b = http.body as { name?: string };\n\
+             \x20 db.table(\"a\").insert(b).run().then((n) => json.ok({ n }));\n\
+             }\n\
+             \n\
+             function put(): void {\n\
+             \x20 const b = http.body as { aid?: number; label?: string };\n\
+             \x20 db.table(\"b\").insert({ aid: b.aid ?? 0, label: b.label ?? \"\" }).run().then((n) => json.ok({ n }));\n\
+             }\n\
+             \n\
+             export default { get, post, put };\n",
+        ),
+    ]);
+    // 文件库（内存库跨连接不可见，种子须落盘可查）。
+    let mut cfg = base_cfg(&t);
+    cfg.db.insert(
+        "default".into(),
+        format!("sqlite://{}/db.sqlite", t.display()),
+    );
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    // insert a×2（builder DML 返回受影响行数）。
+    let (s, v) = req(addr, "POST", "/v1/api/u/api/", Some(r#"{"name":"n1"}"#)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    let (s, v) = req(addr, "POST", "/v1/api/u/api/", Some(r#"{"name":"n2"}"#)).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    // insert b（aid=1 → 只有 n1 有 b 行）。
+    let (s, v) = req(
+        addr,
+        "PUT",
+        "/v1/api/u/api/",
+        Some(r#"{"aid":1,"label":"L1"}"#),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    // join 全链路：a ⋈ b on a.id=b.aid，n2 被 inner join 过滤。
+    let (s, v) = req(addr, "GET", "/v1/api/u/api/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"].as_array().map(|a| a.len()), Some(1), "{v}");
+    assert_eq!(v["data"][0]["name"], "n1", "{v}");
+    assert_eq!(v["data"][0]["label"], "L1", "{v}");
+    // 白名单外列名（evil）在 op 侧拒绝：500 信封 + 未落行。
+    let (s, v) = req(
+        addr,
+        "POST",
+        "/v1/api/u/api/",
+        Some(r#"{"name":"n3","evil":1}"#),
+    )
+    .await;
+    assert_eq!(s, 500, "{v}");
+    assert!(v["msg"].as_str().unwrap_or("").contains("evil"), "{v}");
+    let (s, v) = req(addr, "GET", "/v1/api/u/api/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"].as_array().map(|a| a.len()), Some(1), "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
