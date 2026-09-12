@@ -60,6 +60,32 @@ export const get_route = "{id}";   // 可选：路径参数路由
 export { get };
 ```
 
+handler 也支持 **async 写法**——`db.*` 全部返回 Promise，运行时会等 Promise 落定再捕获
+信封（sample 的 admin 模块即此风格，多数人觉得更好读）：
+
+```ts
+async function get(): Promise<void> {
+  try {
+    const rows = await db.table("account")
+      .select(["id", "name"])
+      .where({ field: "role", op: "eq", value: "admin" })
+      .orderBy([{ field: "id", dir: "desc" }])
+      .limit(10)
+      .all();
+    json.ok(rows);
+  } catch (e) {
+    json.fail(500, String(e));
+  }
+}
+
+export const get_route = "{id}";
+export { get };
+```
+
+两种写法等价，选一种贯穿整个模块即可。async 的额外好处：多个 db 调用按顺序
+`await`（读起来像同步代码），整个函数共享一个 `try/catch`，不用每步 `.catch`。
+事务（§4）的 `db.tx(async (tx) => {...})` 只能用 async 写。
+
 ### 4) 跑起来
 
 ```bash
