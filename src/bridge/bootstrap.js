@@ -328,7 +328,7 @@ globalThis.db = globalThis.DB("default");
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})
 //          .orderBy([{field:"id",dir:"desc"}]).limit(10).all()
 function queryBuilder(name, table) {
-  const req = { db: name, table, columns: [], conditions: [], order_by: [], limit: null, offset: null };
+  const req = { db: name, table, columns: [], conditions: [], order_by: [], joins: [], limit: null, offset: null };
   const api = {
     select(cols) { req.columns = (cols || []).map(String); return api; },
     where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
@@ -339,6 +339,7 @@ function queryBuilder(name, table) {
     insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => ({ ...r })); return api; },
     update(sets) { req.verb = "update"; req.sets = { ...sets }; return api; },
     delete() { req.verb = "delete"; return api; },
+    join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
     run() {
       if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
         throw new Error(req.verb + " requires where");

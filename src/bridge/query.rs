@@ -106,6 +106,31 @@ struct OrderBy {
     dir: Option<String>,
 }
 
+/// join 种类（right 不做：sqlite 旧版本不支持且无用例）。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum JoinKind {
+    #[default]
+    Inner,
+    Left,
+}
+
+/// on 条件：列对列等值（无 op 字段，deny_unknown_fields 防自以为能写 op）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnPair {
+    left: String,
+    right: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Join {
+    table: String,
+    #[serde(default)]
+    kind: JoinKind,
+    on: Vec<OnPair>,
+}
+
 /// 查询动词（serde default = select，旧线格式零迁移）。
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +155,8 @@ struct QueryReq {
     values: Vec<serde_json::Map<String, Value>>,
     #[serde(default)]
     sets: serde_json::Map<String, Value>,
+    #[serde(default)]
+    joins: Vec<Join>,
     #[serde(default)]
     columns: Vec<String>,
     #[serde(default)]
@@ -252,13 +279,18 @@ impl ColCtx<'_> {
     }
 }
 
-/// 列引用 → 列表达式（qualified → (table, col) 元组）。
+/// 列引用 → ColumnRef（qualified → (table, col) 元组；join on 的列对列等值也用它）。
+fn col_ref(col: &str) -> sea_query::ColumnRef {
+    match col.split_once('.') {
+        Some((t, c)) => (Alias::new(t), Alias::new(c)).into(),
+        None => Alias::new(col).into(),
+    }
+}
+
+/// 列引用 → 列表达式。
 /// 注：sea-query 1.0 起 `SimpleExpr` 即 `Expr` 的类型别名，无需转换。
 fn col_simple_expr(col: &str) -> SimpleExpr {
-    match col.split_once('.') {
-        Some((t, c)) => Expr::col((Alias::new(t), Alias::new(c))),
-        None => Expr::col(Alias::new(col)),
-    }
+    Expr::col(col_ref(col))
 }
 
 const COND_DEPTH_MAX: usize = 8;
@@ -304,9 +336,13 @@ fn cond_expr(
     }
 }
 
-/// op 前置守卫（两个 op 共用）：主表 check_table（Phase 5 扩展 join 表）。
+/// op 前置守卫（两个 op 共用）：主表与 join 表 check_table。
 fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
-    super::guard::check_table(state, &req.table)
+    super::guard::check_table(state, &req.table)?;
+    for j in &req.joins {
+        super::guard::check_table(state, &j.table)?;
+    }
+    Ok(())
 }
 
 /// 动词×字段兼容矩阵（op 侧权威——fromJSON 可完全绕过 JS 链层）。
@@ -335,8 +371,14 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if req.limit.is_some() || req.offset.is_some() {
                 return reject("insert", "limit/offset");
             }
+            if !req.joins.is_empty() {
+                return reject("insert", "joins");
+            }
         }
         Verb::Update | Verb::Delete => {
+            if !req.joins.is_empty() {
+                return reject("update/delete", "joins");
+            }
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
             }
@@ -366,11 +408,29 @@ fn build_statement(
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-    // 本 Task joins 恒为空；join 表 Task 9 填入。
+    // join 表先行解析（自 join / 空 on / 未知表在此拒绝；DML 带 joins 已被矩阵拒绝）。
+    let mut join_defs: Vec<(&str, &TableDef)> = Vec::new();
+    for j in &req.joins {
+        if j.table == req.table {
+            return Err(JsErrorBox::generic(
+                "self join not supported (no table alias)",
+            ));
+        }
+        if j.on.is_empty() {
+            return Err(JsErrorBox::generic(format!(
+                "join '{}' needs non-empty on",
+                j.table
+            )));
+        }
+        let td = reg
+            .get(&j.table)
+            .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", j.table)))?;
+        join_defs.push((j.table.as_str(), td));
+    }
     let ctx = ColCtx {
         base_name: &req.table,
         base: table,
-        joins: vec![],
+        joins: join_defs,
     };
     let params_of =
         |(sql, values): (String, sea_query::Values)| -> Result<(String, Vec<Value>), JsErrorBox> {
@@ -466,6 +526,19 @@ fn build_select_body(
         q.exprs(req.columns.iter().map(|c| col_simple_expr(c)));
     }
     q.from(Alias::new(&req.table));
+    for j in &req.joins {
+        let mut on = sea_query::Condition::all();
+        for p in &j.on {
+            ctx.check_col(&p.left, "join on")?;
+            ctx.check_col(&p.right, "join on")?;
+            on = on.add(col_simple_expr(&p.left).equals(col_ref(&p.right)));
+        }
+        let jt = match j.kind {
+            JoinKind::Inner => sea_query::JoinType::InnerJoin,
+            JoinKind::Left => sea_query::JoinType::LeftJoin,
+        };
+        q.join(jt, Alias::new(&j.table), on);
+    }
     let mut leaves = 0usize;
     for c in &req.conditions {
         q.and_where(cond_expr(c, ctx, 1, &mut leaves)?);
@@ -680,6 +753,93 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "query failed: {v}");
         v["data"]["n"].as_u64().unwrap() as usize
+    }
+
+    /// 两表夹具：a(2 行) × b(3 行，aid 指向 a.id)，验证 join 装配真实参与执行。
+    async fn seeded_bridge_2t() -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table a (id integer primary key, name text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "create table b (id integer primary key, aid integer, label text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (n,) in [("x",), ("y",)] {
+            db.exec_with_params("insert into a (name) values (?)", &[json!(n)])
+                .await
+                .unwrap();
+        }
+        for (aid, l) in [(1, "L1"), (1, "L2"), (3, "L3")] {
+            db.exec_with_params(
+                "insert into b (aid, label) values (?, ?)",
+                &[json!(aid), json!(l)],
+            )
+            .await
+            .unwrap();
+        }
+        let reg = SchemaRegistry::new()
+            .table("a", &["id"], &["id", "name"])
+            .table("b", &["id"], &["id", "aid", "label"]);
+        Bridge::with_opts(db, Arc::new(InMemoryKV::new()), reg, false)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn join_inner_left_and_rejections() {
+        let b = seeded_bridge_2t().await;
+        // inner join：a(id=1 x, 2 y) × b(aid=1 ×2) → 2 行
+        let cap = b
+            .run(
+                r#"db.table("a").join("b", [{left:"a.id",right:"b.aid"}])
+        .select(["a.name","b.label"]).all()
+        .then(r=>json.ok({n:r.length, first:r[0].label})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 2, "{v}");
+        // left join：3 行（x×2, y×1 NULL label）
+        let cap = b
+            .run(
+                r#"db.table("a").join("b", [{left:"a.id",right:"b.aid"}], "left")
+        .select(["a.name","b.label"]).orderBy([{field:"a.id",dir:"asc"}]).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 3, "{v}");
+        // join 表未知 / 自 join / on 列未知 / 非限定列命中 join 表
+        for (js, want) in [
+            (
+                r#"db.table("a").join("nope",[{left:"a.id",right:"nope.aid"}]).select(["a.id"]).all()"#,
+                "unknown table 'nope'",
+            ),
+            (
+                r#"db.table("a").join("a",[{left:"a.id",right:"a.id"}]).select(["a.id"]).all()"#,
+                "self join not supported",
+            ),
+            (
+                r#"db.table("a").join("b",[{left:"a.id",right:"b.nope"}]).select(["a.id"]).all()"#,
+                "unknown column 'b.nope'",
+            ),
+            (
+                r#"db.table("a").join("b",[{left:"a.id",right:"b.aid"}]).select(["label"]).all()"#,
+                "unknown column 'label'",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -938,6 +1098,11 @@ mod tests {
                 .to_string()
                 .contains("insert does not accept limit")
         );
+        assert!(bad(
+            r#"{"table":"t","verb":"insert","values":[{"a":1}],"joins":[{"table":"b","on":[{"left":"a.id","right":"b.aid"}]}]}"#
+        )
+        .to_string()
+        .contains("insert does not accept joins"));
         // update：空 sets / 无 where / limit
         assert!(
             bad(
