@@ -37,12 +37,12 @@ JS 侧 bootstrap.js 扩链式层；条件对象纯 JS 实现零新 op。Spec：
   - `fn build_statement(req: &QueryReq, reg: &SchemaRegistry, dialect: Dialect) -> Result<(String, Vec<Value>), JsErrorBox>`
   - `fn build_sql<S: sea_query::QueryStatementBuilder>(d: Dialect, q: &S) -> (String, sea_query::Values)`（build_select 的泛化改名）
 
-- [ ] **Step 1: 确认重构前基线**
+- [x] **Step 1: 确认重构前基线**
 
 Run: `cargo test --release query:: -- --nocapture 2>&1 | tail -5`
 Expected: 既有 5 个 query 测试全 PASS。
 
-- [ ] **Step 2: 最小重构**
+- [x] **Step 2: 最小重构**
 
 `src/bridge/query.rs` 中：
 
@@ -152,12 +152,12 @@ pub async fn op_db_query_build(
 其测试 `placeholder_per_dialect` 改用 `build_sql`（同名保留、内部改调 `build_sql` 即可，
 测试不动）。
 
-- [ ] **Step 3: 回归全绿 + 门禁**
+- [x] **Step 3: 回归全绿 + 门禁**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -176,7 +176,7 @@ unix@vip.qq.com ai"
 - Consumes: Task 1 的 `guard_req` / `build_statement`。
 - Produces: JS `queryBuilder.toSQL() -> { sql: string, params: any[] }`；Rust `op_db_query_sql`（**同步**，不 tx 路由）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `src/bridge/query.rs` 测试模块追加：
 
@@ -201,12 +201,12 @@ async fn to_sql_returns_dialect_sql_and_params_without_executing() {
 
 （断言以种子数据为准：age>=18 命中 3 行，`n = 3`。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release to_sql_returns 2>&1 | tail -3`
 Expected: FAIL（`toSQL is not a function` / op 未注册）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `src/bridge/query.rs`：
 
@@ -239,12 +239,12 @@ pub fn op_db_query_sql(
     toSQL() { return op_db_query_sql(req); },
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --release query:: 2>&1 | tail -3`
 Expected: 全 PASS（含新测试，n=3）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/mod.rs src/bridge/bootstrap.js
@@ -255,7 +255,7 @@ unix@vip.qq.com ai"
 
 ### Phase 1 收尾：更新与总结
 
-- [ ] 勾掉 Phase 1 全部 checkbox；`git log --oneline -2` 核对两个提交；总结「两段拆分 + toSQL 就绪，后续阶段只扩 build_statement 与 JS 链层」。
+- [x] 勾掉 Phase 1 全部 checkbox；`git log --oneline -2` 核对两个提交；总结「两段拆分 + toSQL 就绪，后续阶段只扩 build_statement 与 JS 链层」。
 
 ---
 
@@ -273,7 +273,7 @@ unix@vip.qq.com ai"
   - 约定：组键 `and`/`or`/`not` 恰一；叶子必须含 `field`；多余键/空组/形状错误均精确报错。
 - 注意：本 Task 不改 `QueryReq.conditions` 类型（Task 4 接线），只交付可单测的类型。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[test]
@@ -301,12 +301,12 @@ fn cond_tree_deserialize_dispatch_and_errors() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release cond_tree_deserialize 2>&1 | tail -3`
 Expected: FAIL（CondTree 未定义，编译错误）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// 嵌套条件树（对齐 xorm And/Or/Not）。不用 untagged（serde 在 untagged 内
@@ -364,12 +364,12 @@ impl<'de> Deserialize<'de> for CondTree {
 
 （`Cond` 上补 `#[serde(deny_unknown_fields)]`——leaf 路径走 Cond 的 derive，多余键即报错。）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test --release cond_tree_deserialize 2>&1 | tail -3`
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -391,7 +391,7 @@ unix@vip.qq.com ai"
   - `fn cond_expr(t: &CondTree, table: &TableDef, depth: usize, leaves: &mut usize) -> Result<SimpleExpr, JsErrorBox>`
   - 语义：`where()` 多次调用 = 顶层 AND；空组在 Deserialize 已拒 ⇒ 任何 CondTree 叶子 ≥ 1（DML 守卫 Phase 4 复用此性质）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -426,12 +426,12 @@ async fn nested_condition_tree_filters_and_limits() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release nested_condition_tree 2>&1 | tail -3`
 Expected: FAIL（`{or:[...]}` 无法反序列化为旧 `Cond`）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 const COND_DEPTH_MAX: usize = 8;
@@ -492,12 +492,12 @@ fn cond_expr(
 
 `registry.rs` 的 `TableDef` 已在 crate 可见（`use super::registry::{SchemaRegistry, TableDef};` 补 import）。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归**
+- [x] **Step 4: 跑测试确认通过 + 旧回归**
 
 Run: `cargo test --release query:: 2>&1 | tail -3`
 Expected: 全 PASS（含既有 `comparison_ops_filter_rows` 等——旧 `{field,op,value}` 线格式兼容）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -508,7 +508,7 @@ unix@vip.qq.com ai"
 
 ### Phase 2 收尾：更新与总结
 
-- [ ] 勾掉 Phase 2 checkbox；`git log --oneline -2` 核对；总结「条件树 op 侧就绪，JS 条件对象只是这棵树的生产者」。
+- [x] 勾掉 Phase 2 checkbox；`git log --oneline -2` 核对；总结「条件树 op 侧就绪，JS 条件对象只是这棵树的生产者」。
 
 ---
 
@@ -526,7 +526,7 @@ unix@vip.qq.com ai"
   - 条件对象方法：`tree()` / `and(...)` / `or(...)` / `not()`（不可变，返回新对象）/ `fields()` / `has(field)`
   - `where(cond)` 接受条件对象或裸 JSON 树（`.tree()` 解包进 req）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `src/bridge/query.rs` 测试模块追加：
 
@@ -559,12 +559,12 @@ async fn cond_object_compose_inspect_and_equivalent_exec() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release cond_object 2>&1 | tail -3`
 Expected: FAIL（`db.and is not a function`）。
 
-- [ ] **Step 3: 最小实现（bootstrap.js，注释全英文）**
+- [x] **Step 3: 最小实现（bootstrap.js，注释全英文）**
 
 在 `const dbCache = new Map();` 之前插入：
 
@@ -609,12 +609,12 @@ function condFactories() {
     where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
 ```
 
-- [ ] **Step 4: 跑测试确认通过 + ASCII 门禁**
+- [x] **Step 4: 跑测试确认通过 + ASCII 门禁**
 
 Run: `cargo test --release cond_object 2>&1 | tail -3 && LC_ALL=C grep -P '[^\x00-\x7F]' src/bridge/bootstrap.js; echo ASCII-OK`
 Expected: PASS；grep 无输出。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/bootstrap.js src/bridge/query.rs
@@ -625,7 +625,7 @@ unix@vip.qq.com ai"
 
 ### Phase 3 收尾：更新与总结
 
-- [ ] 勾掉 Phase 3 checkbox；`git log --oneline -1` 核对；总结「条件对象就位，多租户守卫 `has("tenant_id")` 可用」。
+- [x] 勾掉 Phase 3 checkbox；`git log --oneline -1` 核对；总结「条件对象就位，多租户守卫 `has("tenant_id")` 可用」。
 
 ---
 
