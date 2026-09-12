@@ -453,6 +453,18 @@ db.table("account").select([
 
 ### 9.4 CTE（非递归 WITH）
 
+**概念**：CTE（Common Table Expression，公用表表达式）就是**给一段子查询起个名字**，
+让它在**这一条语句内**可以被当成表来用。SQL 形态是
+`WITH 名字(列, ...) AS (子查询) 主查询`。心智模型：**语句级的临时视图**——不是建表、
+不落盘、语句结束就消失；相当于"先把这部分结果算出来存个名，主查询再拿这个名字当表查"。
+
+什么时候需要它：
+
+- **可读性**：嵌套子查询套到第三层就读不动了，把每层拆成具名步骤，像读流水账。
+- **自 join 替代**：构造器拒绝同表自 join（无别名机制，见 §6），把同一张表用 CTE
+  复制一份出来就能 join。
+- **复用**：一个定义，主查询里可以当基表、也可以进 join 条件引用它。
+
 ```ts
 const adults = db.table("account")
   .select(["id", "name"]).where(leaf("age", "gte", 18));
@@ -464,11 +476,26 @@ db.table("adults")
   .all();
 ```
 
-- `columns` **必填**：CTE 输出列就是后续引用它的白名单（`cte needs non-empty columns`）。
-- CTE 名不查 schema 注册表（虚拟表无归属），但名字与列名过别名形状校验；
-  **WITH 名遮蔽同名真实表**（SQL 语义）。
-- 成员查询过嵌套约束（仅 select、禁嵌套 with/unions）。
-- WITH 校验先于主语句表解析——基表直接用 CTE 名的写法合法。
+**原理（渲染与安全模型）**：上面这条链渲染为（`.toSQL()` 随时可验证）：
+
+```sql
+WITH "adults" ("id", "name") AS
+  (SELECT "id", "name" FROM "account" WHERE "age" >= ?)
+SELECT "id", "name" FROM "adults" WHERE "name" LIKE ?
+```
+
+- 执行时成员 SELECT 先算出一个结果集，主查询把它当普通表引用；至于引擎内联还是
+  物化这个中间结果是优化细节，语义不变、不落盘。
+- **为什么 `columns` 必填**：引擎不推断 CTE 的输出列形状，**声明的列就是它对外发布的
+  契约**（`cte needs non-empty columns`）。后续一切对 `adults` 的列引用都按这份清单
+  过白名单——成员查询里摸不到的列，引用侧同样摸不到，白名单防线在这里不打折。
+- **非递归**：不支持 `WITH RECURSIVE`（树形/图遍历请用应用层循环或裸 SQL）。
+- CTE 是**虚拟表**，不查 schema 注册表、无归属模块（归属守卫递归查它的成员查询）；
+  但名字与列名仍过别名形状校验（`illegal alias 'x'`）。
+- **WITH 名遮蔽同名真实表**（标准 SQL 语义）：本语句内 `adults` 指 CTE 而非同名实体表。
+- **校验顺序**：WITH 先于主语句表解析——所以基表直接写 CTE 名是合法写法。
+- 成员查询受嵌套约束：仅 select、禁再嵌 with/unions（`nested select does not accept
+  with/unions (v1)`），嵌套深度计入 `REQ_NEST_MAX`（§9.1）。
 
 ---
 
