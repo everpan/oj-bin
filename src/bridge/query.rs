@@ -250,6 +250,26 @@ struct QueryReq {
     limit: Option<u32>,
     #[serde(default)]
     offset: Option<u32>,
+    #[serde(default)]
+    unions: Vec<UnionArm>,
+}
+
+/// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UnionKind {
+    #[default]
+    Distinct,
+    All,
+}
+
+/// union 成员臂：kind + 嵌套 select req（显式列 + 禁排序分页，构造期校验）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnionArm {
+    #[serde(default)]
+    kind: UnionKind,
+    query: Box<QueryReq>,
 }
 
 fn default_db() -> String {
@@ -383,7 +403,7 @@ const COND_LEAF_MAX: usize = 64;
 const REQ_NEST_MAX: u8 = 4;
 
 /// 嵌套 select 通用约束（site 用于报错定位：subquery/exists/union/cte）。
-/// with/unions 的禁带判断由 Task 16/18 落地字段后各自补上。
+/// with 的禁带判断由 Task 18 落地字段后补上（unions 已落地）。
 fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox> {
     if depth >= REQ_NEST_MAX {
         return Err(JsErrorBox::generic(format!(
@@ -393,6 +413,11 @@ fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorB
     if req.verb != Verb::Select {
         return Err(JsErrorBox::generic(format!(
             "{site}: nested select must be select"
+        )));
+    }
+    if !req.unions.is_empty() {
+        return Err(JsErrorBox::generic(format!(
+            "{site}: nested select does not accept with/unions (v1)"
         )));
     }
     Ok(())
@@ -565,6 +590,9 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
     if let Some(h) = &req.having {
         guard_nested(state, h)?;
     }
+    for u in &req.unions {
+        guard_req(state, &u.query)?;
+    }
     Ok(())
 }
 
@@ -626,6 +654,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if req.having.is_some() {
                 return reject("insert", "having");
             }
+            if !req.unions.is_empty() {
+                return reject("insert", "unions");
+            }
         }
         Verb::Update | Verb::Delete => {
             if !req.joins.is_empty() {
@@ -639,6 +670,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             }
             if req.having.is_some() {
                 return reject("update/delete", "having");
+            }
+            if !req.unions.is_empty() {
+                return reject("update/delete", "unions");
             }
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
@@ -917,10 +951,49 @@ fn build_select_stmt(
         };
         q.order_by_expr(col_simple_expr(&o.field), dir);
     }
-    let limit = Ord::min(req.limit.unwrap_or(LIMIT_DEFAULT), LIMIT_MAX);
-    q.limit(limit as u64);
+    // 显式 limit 一律 clamp 后生效；隐式 LIMIT_DEFAULT 只给顶层——union 成员括号内
+    // 禁 LIMIT（SQLite 复合项语法），嵌套子查询也不该被隐式截断。
+    if let Some(l) = req
+        .limit
+        .map(|l| Ord::min(l, LIMIT_MAX))
+        .or((depth == 0).then_some(LIMIT_DEFAULT))
+    {
+        q.limit(l as u64);
+    }
     if let Some(off) = req.offset {
         q.offset(off as u64);
+    }
+    // union 臂：基查询与成员都须显式列、列数一致；成员禁排序/分页；
+    // 嵌套约束（深度/动词/禁 unions）过 validate_nested，成员复用本函数构造。
+    if !req.unions.is_empty() {
+        if req.columns.is_empty() {
+            return Err(JsErrorBox::generic("union requires explicit columns"));
+        }
+        for arm in &req.unions {
+            validate_nested(&arm.query, depth + 1, "union")?;
+            let m = &arm.query;
+            if m.columns.is_empty() {
+                return Err(JsErrorBox::generic("union requires explicit columns"));
+            }
+            if m.columns.len() != req.columns.len() {
+                return Err(JsErrorBox::generic(format!(
+                    "union column count mismatch: {} vs {}",
+                    req.columns.len(),
+                    m.columns.len()
+                )));
+            }
+            if !m.order_by.is_empty() || m.limit.is_some() || m.offset.is_some() {
+                return Err(JsErrorBox::generic(
+                    "union member does not accept order_by/limit/offset",
+                ));
+            }
+            let member = build_select_stmt(m, reg, depth + 1)?;
+            let ty = match arm.kind {
+                UnionKind::All => sea_query::UnionType::All,
+                UnionKind::Distinct => sea_query::UnionType::Distinct,
+            };
+            q.union(ty, member);
+        }
     }
     Ok(q)
 }
@@ -1790,5 +1863,86 @@ mod tests {
                 .contains("nested select too deep"),
             "{v}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_all_and_distinct() {
+        let b = seeded_bridge_2t().await;
+        // a.name {x,y} ∪ b.label {L1,L2,L3}：all=5 行，distinct=5 行（无重叠）
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name"])
+            .union(db.table("b").select(["label"]), "all").all()
+            .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 5, "{v}");
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name"])
+            .union(db.table("b").select(["label"]).where({field:"aid",op:"eq",value:1})).all()
+            .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 4, "{v}"); // 2 + 2(L1,L2)
+        // toSQL 含 UNION ALL（同步 op，直接进 json.ok）
+        let cap = b
+            .run(
+                r#"json.ok(db.table("a").select(["name"])
+            .union(db.table("b").select(["label"]), "all").toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["data"]["sql"].as_str().unwrap().contains("UNION ALL"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_rejections() {
+        let b = seeded_bridge_2t().await;
+        for (js, want) in [
+            // 列数不一致
+            (
+                r#"db.table("a").select(["id","name"]).union(db.table("b").select(["label"])).all()"#,
+                "union column count mismatch",
+            ),
+            // 成员带 limit
+            (
+                r#"db.table("a").select(["name"]).union(db.table("b").select(["label"]).limit(1)).all()"#,
+                "union member does not accept order_by/limit/offset",
+            ),
+            // 基查询隐式列（union 必须显式 columns）
+            (
+                r#"db.table("a").union(db.table("b").select(["label"])).all()"#,
+                "union requires explicit columns",
+            ),
+            // union 套 union（嵌套禁 unions）
+            (
+                r#"db.table("a").select(["name"]).union(db.table("b").select(["label"])
+             .union(db.table("b").select(["label"]))).all()"#,
+                "nested select does not accept with/unions",
+            ),
+            // insert 带 unions（动词矩阵）
+            (
+                r#"db.table("a").insert({name:"z"}).union(db.table("b").select(["label"])).run()"#,
+                "insert does not accept unions",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
     }
 }
