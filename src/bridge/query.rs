@@ -106,6 +106,17 @@ struct OrderBy {
     dir: Option<String>,
 }
 
+/// 查询动词（serde default = select，旧线格式零迁移）。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Verb {
+    #[default]
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
 /// 一次查询构建请求（结构化，非 SQL 字符串）。
 #[derive(Debug, Clone, Deserialize)]
 struct QueryReq {
@@ -113,6 +124,12 @@ struct QueryReq {
     #[serde(default = "default_db")]
     db: String,
     table: String,
+    #[serde(default)]
+    verb: Verb,
+    #[serde(default)]
+    values: Vec<serde_json::Map<String, Value>>,
+    #[serde(default)]
+    sets: serde_json::Map<String, Value>,
     #[serde(default)]
     columns: Vec<String>,
     #[serde(default)]
@@ -211,7 +228,9 @@ fn cond_expr(
         CondTree::Leaf(c) => {
             *leaves += 1;
             if *leaves > COND_LEAF_MAX {
-                return Err(JsErrorBox::generic("condition tree too large (max 64 leaves)"));
+                return Err(JsErrorBox::generic(
+                    "condition tree too large (max 64 leaves)",
+                ));
             }
             if !table.has_column(&c.field) {
                 return Err(JsErrorBox::generic(format!(
@@ -245,12 +264,59 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
     super::guard::check_table(state, &req.table)
 }
 
+/// 动词×字段兼容矩阵（op 侧权威——fromJSON 可完全绕过 JS 链层）。
+fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
+    let reject =
+        |verb: &str, f: &str| Err(JsErrorBox::generic(format!("{verb} does not accept {f}")));
+    match req.verb {
+        Verb::Select => {
+            if !req.values.is_empty() {
+                return reject("select", "values");
+            }
+            if !req.sets.is_empty() {
+                return reject("select", "sets");
+            }
+        }
+        Verb::Insert => {
+            if req.values.is_empty() {
+                return Err(JsErrorBox::generic("insert needs at least one row"));
+            }
+            if !req.conditions.is_empty() {
+                return reject("insert", "where");
+            }
+            if !req.order_by.is_empty() {
+                return reject("insert", "orderBy");
+            }
+            if req.limit.is_some() || req.offset.is_some() {
+                return reject("insert", "limit/offset");
+            }
+        }
+        Verb::Update | Verb::Delete => {
+            if req.verb == Verb::Update && req.sets.is_empty() {
+                return Err(JsErrorBox::generic("update needs non-empty sets"));
+            }
+            // 空 and/or 组在 CondTree Deserialize 已拒 → 非空即叶子 ≥ 1。
+            if req.conditions.is_empty() {
+                return Err(JsErrorBox::generic(format!(
+                    "{:?} requires where (leaf count >= 1)",
+                    req.verb
+                )));
+            }
+            if req.limit.is_some() || req.offset.is_some() {
+                return reject("update/delete", "limit/offset");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 纯构造：白名单校验 → sea-query → 方言 SQL + JSON 参数（不触 OpState/连接/tx）。
 fn build_statement(
     req: &QueryReq,
     reg: &SchemaRegistry,
     dialect: Dialect,
 ) -> Result<(String, Vec<Value>), JsErrorBox> {
+    validate_verb(req)?;
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
@@ -570,22 +636,40 @@ mod tests {
         let n = count_where(&b, r#"{not:{field:"tag",op:"eq",value:"x"}}"#).await;
         assert_eq!(n, 1); // b (d has null tag, SQL NOT excludes unknown)
         // 深度 9 → too deep
-        let cap = b.run(r#"let c={field:"age",op:"eq",value:1}; for(let i=0;i<9;i++) c={and:[c]};
+        let cap = b
+            .run(
+                r#"let c={field:"age",op:"eq",value:1}; for(let i=0;i<9;i++) c={and:[c]};
             db.table("t").select(["name"]).where(c).all()
-              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["msg"].as_str().unwrap().contains("too deep"), "{v}");
         // 65 叶 → too large
-        let cap = b.run(r#"const xs=[]; for(let i=0;i<65;i++) xs.push({field:"age",op:"gt",value:i});
+        let cap = b
+            .run(
+                r#"const xs=[]; for(let i=0;i<65;i++) xs.push({field:"age",op:"gt",value:i});
             db.table("t").select(["name"]).where({and:xs}).all()
-              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["msg"].as_str().unwrap().contains("too large"), "{v}");
         // 空组（JS 直塞）→ empty condition group
-        let cap = b.run(r#"db.table("t").select(["name"]).where({and:[]}).all()
-            .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).where({and:[]}).all()
+            .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert!(v["msg"].as_str().unwrap().contains("empty condition group"), "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("empty condition group"),
+            "{v}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -666,5 +750,64 @@ mod tests {
         assert_eq!(v["data"]["fields"], json!(["age", "ok", "tag"]), "{v}");
         assert_eq!(v["data"]["has"], true, "{v}");
         assert_eq!(v["data"]["immutable"], true, "{v}");
+    }
+
+    #[test]
+    fn verb_matrix_enforced_op_side() {
+        let bad = |req: &str| validate_verb(&serde_json::from_str(req).unwrap()).unwrap_err();
+        // select 拒 values/sets
+        assert!(
+            bad(r#"{"table":"t","values":[{"a":1}]}"#)
+                .to_string()
+                .contains("select does not accept values")
+        );
+        // insert：空 values / 带 where / 带 limit
+        assert!(
+            bad(r#"{"table":"t","verb":"insert"}"#)
+                .to_string()
+                .contains("at least one row")
+        );
+        assert!(bad(
+            r#"{"table":"t","verb":"insert","values":[{"a":1}],"conditions":[{"field":"a","op":"eq","value":1}]}"#
+        )
+        .to_string()
+        .contains("insert does not accept where"));
+        assert!(
+            bad(r#"{"table":"t","verb":"insert","values":[{"a":1}],"limit":5}"#)
+                .to_string()
+                .contains("insert does not accept limit")
+        );
+        // update：空 sets / 无 where / limit
+        assert!(
+            bad(
+                r#"{"table":"t","verb":"update","conditions":[{"field":"a","op":"eq","value":1}]}"#
+            )
+            .to_string()
+            .contains("non-empty sets")
+        );
+        assert!(
+            bad(r#"{"table":"t","verb":"update","sets":{"a":1}}"#)
+                .to_string()
+                .contains("requires where")
+        );
+        assert!(bad(
+            r#"{"table":"t","verb":"update","sets":{"a":1},"conditions":[{"field":"a","op":"eq","value":1}],"limit":5}"#
+        )
+        .to_string()
+        .contains("limit/offset"));
+        // delete：无 where
+        assert!(
+            bad(r#"{"table":"t","verb":"delete"}"#)
+                .to_string()
+                .contains("requires where")
+        );
+        // 合法形态 Ok
+        assert!(validate_verb(
+            &serde_json::from_str(
+                r#"{"table":"t","verb":"delete","conditions":[{"field":"a","op":"eq","value":1}]}"#
+            )
+            .unwrap()
+        )
+        .is_ok());
     }
 }
