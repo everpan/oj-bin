@@ -15,8 +15,8 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use sea_query::{
-    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, Query, SelectStatement, SimpleExpr,
-    SqliteQueryBuilder, Value as Qv,
+    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, OverStatement, Query, SelectStatement,
+    SimpleExpr, SqliteQueryBuilder, Value as Qv,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -179,13 +179,71 @@ struct AggSpec {
     r#as: Option<String>,
 }
 
-/// select 列：列名（可限定 "t.col"）或聚合 {fn, field?, as?}。
-/// 手写 Deserialize 按值类型分发——untagged 会吞内部错误（{fn:"median"} 只剩
-/// "did not match any variant"，unknown variant 文案不可见）。
+/// case 列 `{case:{when,else?}, as}`（searched case only；then/else 只允许 JSON 值，
+/// 走绑定参数）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseSpec {
+    case: CaseBody,
+    #[serde(rename = "as")]
+    r#as: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseBody {
+    when: Vec<CaseWhen>,
+    #[serde(default, rename = "else")]
+    r#else: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseWhen {
+    cond: CondTree,
+    then: Value,
+}
+
+/// 窗口函数（frame 不做）。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WinFn {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+/// 窗口列 `{window:{fn, partition_by?, order_by?}, as}`。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowSpec {
+    window: WindowBody,
+    #[serde(rename = "as")]
+    r#as: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowBody {
+    #[serde(rename = "fn")]
+    r#fn: WinFn,
+    #[serde(default)]
+    partition_by: Vec<String>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
+}
+
+/// select 列：列名（可限定 "t.col"）、聚合 {fn, field?, as?}、case 列 {case, as}、
+/// 窗口列 {window, as}。
+/// 手写 Deserialize 按值类型/键分发——untagged 会吞内部错误（{fn:"median"} 只剩
+/// "did not match any variant"，unknown variant 文案不可见）；对象键互不重叠
+/// （fn / case / window），按键分发精确且保留各 spec 的原生报错。
 #[derive(Debug, Clone)]
 enum ColSpec {
     Name(String),
     Agg(AggSpec),
+    Case(CaseSpec),
+    Window(WindowSpec),
 }
 
 impl<'de> Deserialize<'de> for ColSpec {
@@ -196,11 +254,24 @@ impl<'de> Deserialize<'de> for ColSpec {
         use serde::de::Error;
         match Value::deserialize(d)? {
             Value::String(s) => Ok(ColSpec::Name(s)),
-            v @ Value::Object(_) => serde_json::from_value::<AggSpec>(v)
-                .map(ColSpec::Agg)
-                .map_err(Error::custom),
+            v @ Value::Object(_) => {
+                let m = v.as_object().expect("object");
+                if m.contains_key("case") {
+                    return serde_json::from_value::<CaseSpec>(v)
+                        .map(ColSpec::Case)
+                        .map_err(Error::custom);
+                }
+                if m.contains_key("window") {
+                    return serde_json::from_value::<WindowSpec>(v)
+                        .map(ColSpec::Window)
+                        .map_err(Error::custom);
+                }
+                serde_json::from_value::<AggSpec>(v)
+                    .map(ColSpec::Agg)
+                    .map_err(Error::custom)
+            }
             _ => Err(Error::custom(
-                "column must be a string or an aggregate object {fn, field?, as?}",
+                "column must be a string or an object {fn|case|window, ...}",
             )),
         }
     }
@@ -657,10 +728,16 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if !req.unions.is_empty() {
                 return reject("insert", "unions");
             }
+            if !req.columns.is_empty() {
+                return reject("insert", "columns");
+            }
         }
         Verb::Update | Verb::Delete => {
             if !req.joins.is_empty() {
                 return reject("update/delete", "joins");
+            }
+            if !req.columns.is_empty() {
+                return reject("update/delete", "columns");
             }
             if req.distinct {
                 return reject("update/delete", "distinct");
@@ -895,6 +972,51 @@ fn build_select_stmt(
                     } else {
                         q.expr(e);
                     }
+                }
+                ColSpec::Case(c) => {
+                    if c.case.when.is_empty() {
+                        return Err(JsErrorBox::generic("case needs non-empty when"));
+                    }
+                    check_alias(&c.r#as)?;
+                    let mut case = sea_query::CaseStatement::new();
+                    for w in &c.case.when {
+                        let mut leaves = 0usize;
+                        let e = cond_expr(&w.cond, &ctx, reg, depth, 1, &mut leaves)?;
+                        case = case.case(
+                            sea_query::Condition::all().add(e),
+                            Expr::val(to_qv(&w.then)),
+                        );
+                    }
+                    if let Some(e) = &c.case.r#else {
+                        case = case.finally(Expr::val(to_qv(e)));
+                    }
+                    q.expr_as(case, Alias::new(&c.r#as));
+                }
+                ColSpec::Window(w) => {
+                    check_alias(&w.r#as)?;
+                    let name = match w.window.r#fn {
+                        WinFn::RowNumber => "ROW_NUMBER",
+                        WinFn::Rank => "RANK",
+                        WinFn::DenseRank => "DENSE_RANK",
+                    };
+                    let mut win = sea_query::WindowStatement::new();
+                    for c in &w.window.partition_by {
+                        ctx.check_col(c, "window partition_by")?;
+                        win.add_partition_by(col_simple_expr(c));
+                    }
+                    for o in &w.window.order_by {
+                        ctx.check_col(&o.field, "window order_by")?;
+                        let dir = match o.dir.as_deref() {
+                            Some("desc") => Order::Desc,
+                            _ => Order::Asc,
+                        };
+                        win.order_by_columns([(Alias::new(&o.field), dir)]);
+                    }
+                    q.expr_window_as(
+                        sea_query::Func::cust(Alias::new(name)),
+                        win.take(),
+                        Alias::new(&w.r#as),
+                    );
                 }
             }
         }
@@ -1944,5 +2066,113 @@ mod tests {
             let v: Value = serde_json::from_slice(&cap.body).unwrap();
             assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn case_and_window_columns() {
+        let b = seeded_bridge_2t().await;
+        // case：id=1 → "one"，否则 "other"（a: id=1 x, id=2 y → 按序 one/other）
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name",
+        {case:{when:[{cond:{field:"id",op:"eq",value:1},then:"one"}],else:"other"},as:"tag"}
+      ]).orderBy([{field:"id",dir:"asc"}]).all()
+      .then(r=>json.ok({tags:r.map(x=>x.tag)})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["tags"], json!(["one", "other"]), "{v}");
+        // window：row_number over (order by id desc) → y=1, x=2
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name",
+        {window:{fn:"row_number",order_by:[{field:"id",dir:"desc"}]},as:"rn"}
+      ]).all()
+      .then(r=>json.ok({rows:r})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let rows = v["data"]["rows"].as_array().unwrap();
+        let rn_of = |n: &str| {
+            rows.iter().find(|r| r["name"] == n).unwrap()["rn"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(rn_of("y"), 1, "{v}");
+        assert_eq!(rn_of("x"), 2, "{v}");
+        // partition_by：b 表按 aid 分区编号
+        let cap = b
+            .run(
+                r#"db.table("b").select(["label",
+        {window:{fn:"rank",partition_by:["aid"],order_by:[{field:"id",dir:"asc"}]},as:"rk"}
+      ]).all()
+      .then(r=>json.ok({rows:r})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn case_window_rejections() {
+        let b = seeded_bridge_2t().await;
+        for (js, want) in [
+            // 别名形状非法（brief 负向用例把 as 误写进 case 内部，按权威形状
+            // {case:{when},as} 调整——与正向用例一致）
+            (
+                r#"db.table("a").select([{case:{when:[{cond:{field:"id",op:"eq",value:1},then:1}]},as:"0bad"}]).all()"#,
+                "illegal alias",
+            ),
+            // window fn 非枚举值
+            (
+                r#"db.table("a").select([{window:{fn:"ntile",order_by:[]},as:"x"}]).all()"#,
+                "unknown variant",
+            ),
+            // having 引用 window 别名（case/window 别名不进 having 台账）
+            (
+                r#"db.table("a").select([{window:{fn:"row_number"},as:"rn"}]).groupBy(["id"])
+             .having({field:"rn",op:"eq",value:1}).all()"#,
+                "unknown column",
+            ),
+            // 空 when（.run 为真值使 && 链求值到 select——不触达 insert 语义；
+            // brief 同样把 as 误写进 case 内部，按权威形状调整）
+            (
+                r#"db.table("a").insert({name:"z"}).run && db.table("a").select([{case:{when:[]},as:"x"}]).all()"#,
+                "case needs non-empty when",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
+    }
+
+    /// 动词矩阵：columns 仅 select（case/window 是 columns 元素级能力，DML 一并拦）。
+    #[test]
+    fn verb_matrix_rejects_columns_on_dml() {
+        let bad = |req: &str| validate_verb(&serde_json::from_str(req).unwrap()).unwrap_err();
+        assert!(
+            bad(r#"{"table":"t","verb":"insert","values":[{"a":1}],"columns":["a"]}"#)
+                .to_string()
+                .contains("insert does not accept columns")
+        );
+        assert!(bad(
+            r#"{"table":"t","verb":"update","sets":{"a":1},"conditions":[{"field":"a","op":"eq","value":1}],"columns":["a"]}"#
+        )
+        .to_string()
+        .contains("update/delete does not accept columns"));
+        assert!(bad(
+            r#"{"table":"t","verb":"delete","conditions":[{"field":"a","op":"eq","value":1}],"columns":["a"]}"#
+        )
+        .to_string()
+        .contains("update/delete does not accept columns"));
     }
 }
