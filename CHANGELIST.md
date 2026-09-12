@@ -2,6 +2,66 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.14（2026-09-12）
+
+**特性**
+- `db.table` 查询构造器（对齐 xorm builder / sea-query，单 op 扩展 + toSQL）：`select` 等价 +
+  `toSQL` 只构造不执行（`op_db_query_sql`，含方言占位符 + 参数）；嵌套条件树
+  `and/or/not` 递归编译（深度 8 / 叶子 64 上限）+ JS 条件对象（工厂 / 不可变组合 / tree /
+  fields / has，零新 op）；`Verb` 动词 + 动词×字段兼容矩阵（op 侧权威校验）；DML
+  `insert/update/delete`（tx 路由 + 返回行数 + `run()` 终执行）；`join` 联表（inner/left，
+  限定列校验，自 join 拒绝，join 表过归属守卫）；聚合列（fn 枚举 + `distinct`）+ `groupBy`
+  + `having`（聚合别名 op 侧展开，PG 方言兼容）；`toJSON/fromJSON` 序列化（快照复原可继续链 /
+  执行）；`where` 子查询（`in` / 标量比较）+ `exists` + 嵌套 `select` 地基
+  （`REQ_NEST_MAX=4`）；`union/union all`（显式列 + 列数校验 + 成员禁排序分页，嵌套禁
+  unions）；`case` 列 + 窗口函数列（`row_number/rank/dense_rank`，别名不过 having 台账）；
+  非递归 `CTE`（`with`，虚拟表列白名单，CTE 名跳过归属守卫）。
+- `oj server --daemon` 后台运行（unix `setsid` 重 `exec` / windows `DETACHED_PROCESS`）。
+
+**实现**
+- `op_db_query_build` 拆 `guard_req` + `build_statement` 两段（`select` 等价）；`ColCtx`
+  限定列解析（六处共用，`apply_op` 泛化）；`CondTree` 手写 `Deserialize`（按键唯一分发，
+  空组 / 多键精确报错）。
+
+**修复**
+- `fix(query)`：守卫遍历 `CASE` 列内嵌套 `req`（F-1）+ 嵌套 `offset` 门禁 + `when` 数上限
+  （统一审查修复）。
+
+**文档 / 杂项**
+- `docs(spec)`：`db.table` 设计（方案 A 单 op 扩展 + toSQL / 条件对象 / 序列化简 / 双评审
+  架构+实现修订）；分阶段实施计划（7 Phase / 14 Task，TDD）。
+- `docs(v0.1.14)`：`db.table` 构造器文档（DML / 条件树 / 条件对象 / join / 聚合 / toSQL /
+  序列化）。
+- `docs(db-guide)`：新人手册——配置 + JS 全量 `db` API + 边界红线；「写第一个 handler」补
+  `async/await` 等价写法（sample admin 风格）；CTE 概念与原理解读（临时视图心智模型 /
+  渲染形态 / 声明列契约 / 遮蔽与校验顺序）。
+- `docs`：运维手册补 npm 分发段（`@oj-bin/*` 手动发布 + 内建门禁）。
+- `build(deps)`：oj 测试依赖 `jsonwebtoken` 11.0.0（oj-auth 与根测试仍 9.3.1，树内双版本）。
+- `test(e2e)`：query builder join + insert 走 HTTP 全链路。
+- `build(docker)`：多阶段构建 + distroless runtime，glibc 2.31 基线。
+
+## v0.1.13（2026-09-11）
+
+**特性**
+- **npm 分发**：`@oj-bin/oj` 主包 + 平台子包模板与 npmjs 展示页；`postinstall` 落盘
+  `./bin`（支持面检测 + 原子替换 + `exit 0` 语义）；`npm-publish.sh` 装配 / 幂等发布 /
+  门禁 / 置信断言 + dry-run 自检。
+
+**实现**
+- `fix(npm/postinstall)`：加固 bail 输出与 `INIT_CWD` 哨兵，避免击穿 `exit 0`。
+- `fix(npm)`：避免 tarball 清单 `grep` 命中即退导致 `tar` 收 `SIGPIPE` 假失败。
+
+**CI**
+- `ci(release)`：新增 `publish-npm` + `smoke-npm`——npm 双发（失败标红不阻塞 Release）；
+  `publish-npm` 草稿模式跳过（npm 不可撤回，人工核对后幂等补发）；发布门禁——源文件缺席
+  冒烟（`deploy.sh` / `deploy.bat` / `release.yml`）。
+
+**文档**
+- `docs`：npm 分发方案 spec（平台子包 + optionalDependencies，双发不阻塞）→ spec 评审修订
+  （改 scoped `@oj-bin/oj`、独立 `publish-npm` job、`postinstall` 加固）→ 实施计划
+  （5 任务）→ 全分支终审报告归档（可合入，零 must-fix）；npm 安装段入 README（spec 同步
+  `postinstall` 两处实现级修正）。
+
 ## v0.1.12（2026-09-11）
 
 **修复**
