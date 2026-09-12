@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::db::Dialect;
-use super::registry::SchemaRegistry;
+use super::registry::{SchemaRegistry, TableDef};
 use super::{BridgeResult, DataAccessor, StableState};
 
 /// 过滤操作符（类型化枚举，拒绝未知 `$op`）。
@@ -52,7 +52,6 @@ struct Cond {
 /// 嵌套条件树（对齐 xorm And/Or/Not）。不用 untagged（serde 在 untagged 内
 /// deny_unknown_fields 不生效，{field,op,value,or:[...]} 会被静默降级为 Leaf）——
 /// 手写 Deserialize 按键唯一分发，多余键显式报错。
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum CondTree {
     Leaf(Cond),
@@ -117,7 +116,7 @@ struct QueryReq {
     #[serde(default)]
     columns: Vec<String>,
     #[serde(default)]
-    conditions: Vec<Cond>,
+    conditions: Vec<CondTree>,
     #[serde(default)]
     order_by: Vec<OrderBy>,
     #[serde(default)]
@@ -195,6 +194,52 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
     })
 }
 
+const COND_DEPTH_MAX: usize = 8;
+const COND_LEAF_MAX: usize = 64;
+
+/// 条件树 → SimpleExpr（Phase 5 把 table 参数换成 ColCtx 以支持限定列）。
+fn cond_expr(
+    t: &CondTree,
+    table: &TableDef,
+    depth: usize,
+    leaves: &mut usize,
+) -> Result<SimpleExpr, JsErrorBox> {
+    if depth > COND_DEPTH_MAX {
+        return Err(JsErrorBox::generic("condition tree too deep (max 8)"));
+    }
+    match t {
+        CondTree::Leaf(c) => {
+            *leaves += 1;
+            if *leaves > COND_LEAF_MAX {
+                return Err(JsErrorBox::generic("condition tree too large (max 64 leaves)"));
+            }
+            if !table.has_column(&c.field) {
+                return Err(JsErrorBox::generic(format!(
+                    "unknown column '{}' in where",
+                    c.field
+                )));
+            }
+            build_expr(&c.field, c.op, &c.value)
+        }
+        CondTree::And(xs) | CondTree::Or(xs) => {
+            let mut cond = if matches!(t, CondTree::And(_)) {
+                sea_query::Condition::all()
+            } else {
+                sea_query::Condition::any()
+            };
+            for x in xs {
+                cond = cond.add(cond_expr(x, table, depth + 1, leaves)?);
+            }
+            Ok(SimpleExpr::from(cond))
+        }
+        CondTree::Not(x) => {
+            let mut cond = sea_query::Condition::all();
+            cond = cond.add(cond_expr(x, table, depth + 1, leaves)?);
+            Ok(SimpleExpr::from(cond.not()))
+        }
+    }
+}
+
 /// op 前置守卫（两个 op 共用）：主表 check_table（Phase 5 扩展 join 表）。
 fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
     super::guard::check_table(state, &req.table)
@@ -233,14 +278,9 @@ fn build_statement(
     };
     let mut q = Query::select();
     q.columns(cols).from(Alias::new(&req.table));
+    let mut leaves = 0usize;
     for c in &req.conditions {
-        if !table.has_column(&c.field) {
-            return Err(JsErrorBox::generic(format!(
-                "unknown column '{}' in where",
-                c.field
-            )));
-        }
-        q.and_where(build_expr(&c.field, c.op, &c.value)?);
+        q.and_where(cond_expr(c, table, 1, &mut leaves)?);
     }
     for o in &req.order_by {
         if !table.is_sortable(&o.field) {
@@ -515,6 +555,37 @@ mod tests {
         assert_eq!(v["code"], 0, "{v}");
         assert!(v["data"]["sql"].as_str().unwrap().contains('?'), "{v}"); // sqlite placeholder
         assert_eq!(v["data"]["n"], 3); // age>=18 -> 3 rows (20,30,40)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_condition_tree_filters_and_limits() {
+        let b = seeded_bridge().await;
+        // or：age>=20 (b,c,d) or name like 'a%' (a) → 4
+        let n = count_where(
+            &b,
+            r#"{or:[{field:"age",op:"gte",value:20},{field:"name",op:"like",value:"a%"}]}"#,
+        )
+        .await;
+        assert_eq!(n, 4);
+        let n = count_where(&b, r#"{not:{field:"tag",op:"eq",value:"x"}}"#).await;
+        assert_eq!(n, 1); // b (d has null tag, SQL NOT excludes unknown)
+        // 深度 9 → too deep
+        let cap = b.run(r#"let c={field:"age",op:"eq",value:1}; for(let i=0;i<9;i++) c={and:[c]};
+            db.table("t").select(["name"]).where(c).all()
+              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("too deep"), "{v}");
+        // 65 叶 → too large
+        let cap = b.run(r#"const xs=[]; for(let i=0;i<65;i++) xs.push({field:"age",op:"gt",value:i});
+            db.table("t").select(["name"]).where({and:xs}).all()
+              .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("too large"), "{v}");
+        // 空组（JS 直塞）→ empty condition group
+        let cap = b.run(r#"db.table("t").select(["name"]).where({and:[]}).all()
+            .then(r=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("empty condition group"), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]
