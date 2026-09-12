@@ -66,9 +66,13 @@ snap.limit = 50;               // 快照是普通对象，可直接改
 db.fromJSON(snap).all();       // 复原（db 名从快照内读）→ 继续链或直接执行
 ```
 
-链式方法对 DML 的约束（JS 层即报错，不等到 op）：
-- `update`/`delete` **必须** `where` 非空（防全表误改/误删，红线级守卫，op 侧同样强制）。
-- `insert` 不接受 `where/orderBy/limit`；`update`/`delete` 不接受 `limit/offset/groupBy`。
+链式方法对 DML 的约束（JS 层仅 DX 早抛；**所有动词×字段兼容性约束 op 侧为权威校验**，
+`fromJSON` 可完全绕过 JS 链层——以下每条 op 侧都强制）：
+- `update`/`delete` **必须**带 where 且**叶子数 ≥ 1**（`{and:[]}` 空组不算数，见条件树节）；
+  不接受 `limit/offset/groupBy/joins/having/distinct`。
+- `insert` 不接受 `where/orderBy/limit/groupBy/joins/having/distinct`；`values` 非空。
+- `update` 的 `sets` 非空（空 `UPDATE t SET` 是非法 SQL）。
+- `select` 不接受 `values/sets`。
 
 ## Rust 侧（`src/bridge/query.rs`）
 
@@ -77,31 +81,53 @@ db.fromJSON(snap).all();       // 复原（db 名从快照内读）→ 继续链
 ```rust
 struct QueryReq {
     db, table, columns, conditions, order_by, limit, offset,   // 现有
-    verb: Verb,            // select(默认)/insert/update/delete
+    verb: Verb,            // select(默认)/insert/update/delete；enum 需 impl Default + #[serde(default)]
     values: Vec<Map>,      // insert：行数组（单行也归一成数组）
     sets: Map,             // update：列 → 值
-    joins: Vec<Join>,      // {table, kind: inner(默认)|left|right, on: [{left, op(默认eq), right}]}
+    joins: Vec<Join>,      // {table, kind: inner(默认)|left, on: [{left, right}]}（列对列等值，
+                           // 无 op 字段；right join 砍掉——sqlite 旧版本不支持且无用例，需要再加）
     group_by: Vec<String>,
     having: Option<CondTree>,
     distinct: bool,
 }
 ```
 
-`columns` 元素从纯字符串扩展为 `String | {fn, field, as}`（untagged 反序列化）。
+`columns` 元素从纯字符串扩展为 `String | {fn, field, as}`（untagged，String 变体优先；
+后果轻——错键对象落 String 变体必然报错）。聚合变体字段是关键字：`r#fn` +
+`#[serde(rename = "fn")]`、`r#as` 同理。`fn` 是**类型化枚举**（serde lowercase：
+count/sum/avg/min/max，未知值报错 → `Func::{count,sum,avg,min,max}`），非自由字符串；
+`as` 别名只允许经 sea-query `Alias::new` 发射（引号包裹、绝不拼接），且 op 侧纵深校验形状
+`^[A-Za-z_][A-Za-z0-9_]*$`，非法直接 Err。count 的 `field` 可省略或为 `"*"` →
+`Expr::col(Asterisk)` 即 `COUNT(*)`；其余聚合函数 field 必填且过列白名单。
 
 ### 条件树（对齐 xorm And/Or/Not）
+**CondTree 不用 untagged**（serde 明示 `deny_unknown_fields` 在 untagged 内不生效：
+`{field,op,value,or:[...]}` 会误配 Leaf 并**静默丢弃 or**；全不配时报
+"did not match any variant" 无字段路径）——**手写 `Deserialize`**：先收
+`serde_json::Map`，按 `and`/`or`/`not`/`field` 键存在性唯一分发，多余键显式报错
+（约 30 行，换精确报错 + 防静默降级）：
+
 ```rust
-#[serde(untagged)] enum CondTree {
-    Leaf(Cond),                              // 现有 {field,op,value}
-    And { and: Vec<CondTree> },
-    Or  { or:  Vec<CondTree> },
-    Not { not: Box<CondTree> },
+enum CondTree {
+    Leaf(Cond),                 // 现有 {field,op,value}
+    And(Vec<CondTree>),         // {and: [...]}
+    Or(Vec<CondTree>),          // {or: [...]}
+    Not(Box<CondTree>),         // {not: {...}}
 }
 ```
 
-- 现有 `{field,op,value}` 叶子写法不变（向后兼容）；`where()` 多次调用 = 顶层 AND。
+- **向后兼容（写死）**：`conditions` 保持数组，元素逐个按 CondTree 解析，顶层多元素 = AND；
+  既有 handler 的 `{field,op,value}[]` 线格式不变。`where()` 多次调用 = 顶层 AND。
+- **空组语义**：`{and:[]}` / `{or:[]}` 直接 Err（`empty condition group`），不静默渲染为
+  「无 WHERE」——否则 update/delete 的防全表守卫可被空树绕过。同理 update/delete 的
+  守卫表述为**叶子数 ≥ 1**，与叶子上限同点检查。
 - 上限：**深度 ≤ 8、叶子总数 ≤ 64**，超出报 `condition tree too deep/too large`。
-- `having` 复用 CondTree；聚合别名（`as`）与分组列均允许作为 having 字段。
+- `in` 空数组：sea-query 渲染为 FALSE（select 返回空、delete 删零行——方向安全），
+  明示语义，不额外拒绝。
+- `having` 复用 CondTree；字段允许：白名单列、分组列、聚合别名。**别名引用在 op 侧
+  展开回聚合表达式再进 HAVING**（PG 不允许 HAVING 引用 SELECT 输出别名，展开消灭三方
+  言分叉）；别名与真实列同名时**白名单列优先、别名兜底**（与 PG 的 GROUP BY 歧义规则
+  同向）。
 
 ### 条件对象（JS 侧独立构造/组合/检查，对齐 xorm `Cond`）
 
@@ -110,6 +136,7 @@ struct QueryReq {
 
 - 工厂（挂在 db / DB(name) 实例上）：`leaf(field, op, value)`、`and(...)`、`or(...)`、
   `not(cond)`——参数接受普通 JSON 树或条件对象，返回条件对象。
+  （条件树本身是库无关的纯 JSON，挂 db 实例只是取用方便；快照/toJSON 语义同上。）
 - 组合：条件对象自带 `.and(c)` / `.or(c)` / `.not()`（返回新对象，不改原树——不可变，
   同一棵基树可派生多路条件，如「公共租户过滤 + 各业务追加」）。
 - 检查/输出：`.tree()` 返回普通 JSON 嵌套树；`.fields()` 收集全部叶子 field（去重，
@@ -121,53 +148,91 @@ struct QueryReq {
   `toJSON()` 返回深拷贝快照；`db.fromJSON(json)` 按快照内 `db`/`table` 复原 builder，
   复原后可继续链式调用或直接执行。用途：查询定义落盘/跨模块传递/模板化改参。
   形状校验不做 JS 侧重复——权威校验仍在 op（fromJSON 进非法树与手写非法树同罪同罚）。
+  **注意**：快照里的 `db` 是 JS 可见名（绑定模块下字面 `"default"`），复原时经
+  `guard::bound_db` 按**复原方**模块重定向——模块内闭环语义一致；快照跨模块传递会
+  按接收方重定向，属预期语义（与 tx 记账同约定），文档明示即可。
 - 上限（深度 8 / 叶子 64）仍在 op 侧统一强制——JS 层不重复计数，防绕过。
 
 ### 构造与执行
 
-- 抽纯函数 `build_statement(req, &TableMeta, dialect) -> Result<(String, Vec<Value>)>`：
-  校验（白名单/守卫输入）→ sea-query 构造 → 方言出 SQL + `value_to_json` 参数。
-  `op_db_query_build`（执行）与 `op_db_query_sql`（仅构造）共用。
-- 动词分发：`Query::select()` / `Query::insert()` / `Query::update()` / `Query::delete()`；
+- **两段拆分**：op 侧前置守卫函数 `guard_req(state, &req)`（`check_table` 主表 + 每个
+  join 表——`check_table` 要 `&Rc<RefCell<OpState>>`，纯函数给不了；两个 op 共用）；
+  纯函数 `build_statement(req: &QueryReq, reg: &SchemaRegistry, dialect: Dialect)
+  -> Result<(String, Vec<Value>)>`：白名单校验（含 join 表 `reg.get`）→ sea-query 构造 →
+  方言出 SQL + `value_to_json` 参数。`op_db_query_build`（执行）与 `op_db_query_sql`
+  （仅构造）共用两段。
+- **op 返回形态变更**：`op_db_query_build` 由 `Result<Vec<Value>>` 改为 `Result<Value>`
+  （select → rows 数组；insert/update/delete → 受影响行数 number）——op2 serde 返回必须
+  同一类型，JS 侧 `all()` 回数组、DML 链方法回 number。
+- 动词分发：`Query::select()` / `Query::insert()` / `Query::update()` / `Query::delete()`
+  （`build_select` 泛化为按动词 match 四类 statement 的 `build`）；
   select 走 `query_with_params`，insert/update/delete 走 `exec_with_params`（返回行数）。
-- join 表同样过 `reg.get` + `check_table` 守卫；`table.col` 引用拆两段分别校验。
+- **insert 用 `InsertStatement::values()`（返回 Result），禁 `values_panic`**——宿主代码
+  无 catch_unwind 保护，panic 会直接进 op 调用栈。
+- **DML 同走 `resolve_target` tx 路由**（与 select 同一条）：本库活跃 tx → `session.exec`，
+  他库 tx → Err——`db.tx(async tx => tx.table("t").insert(...))` 才能进事务。
+- join 表同样过 `reg.get` + `check_table` 守卫。**无表别名 ⇒ 自 join v1 不支持**。
+- **限定列引用通用规则**（select/where/orderBy/groupBy/having/join on 六处共用一个
+  `split_once('.')` helper）：`"表.列"` 形态 → 表段必须 ∈ {基表} ∪ {join 表}，列段对该表
+  的 TableDef 校验；非限定列只对基表解析——**join 存在时拒绝非限定列命中 join 表**
+  （消歧，强制写全限定名）。
 - DML 的列名（values/sets 的键）全部过白名单；值为任意 JSON → `to_qv` 绑定。
+- 多行 insert 行间键集不一致 → **Err 拒绝**（评审两案之一，另一案「并集补 Null」被否：
+  隐藏 NULL 插入有惊喜；且须拍平成 sea-query 的等长列模型，拒绝最简单）。
+  `insert([])` 空数组 → Err（`insert needs at least one row`）。
 - limit 默认 100 / 硬上限 1000 仅作用于 select（DML 无 limit）。
+- **已知上限（本 spec 不治）**：`to_qv(Null) = Qv::String(None)` 的 NULL 绑定在 Postgres
+  有类型推断风险（既有 eq-null 路径同缺陷，DML 把它扩散到 insert/update 值；根治需按列
+  元数据选 `None::<i64>` 等，超范围）。DML-null 测试只断 sqlite。
 
 ### toSQL op
 
 ```rust
-#[op2] #[serde] fn op_db_query_sql(state, req: QueryReq) -> Result<Value /* {sql, params} */>
+// 同步 op（构造全程是 OpState 同步借用，无 await，别加 async）
+#[op2] #[serde] fn op_db_query_sql(state, #[serde] req: QueryReq) -> Result<Value, JsErrorBox>
+// 返回 { sql, params }
 ```
 
-走与执行完全相同的 `build_statement`（含白名单与守卫校验），拿到 `(sql, params)` 直接返回，
-不触碰连接池/tx。方言取自目标命名库的 accessor（与执行所见一致）。
+走与执行完全相同的两段（`guard_req` + `build_statement`），拿到 `(sql, params)` 直接返回；
+**不做 tx 路由、不受活跃 tx 影响**。方言取 `lookup(&state, &req.db)?.dialect()`
+（含 bound_db 重定向，与执行所见一致）。
 
 ## 红线复核
 
 - 标识符只来自 SchemaRegistry 白名单：表名、select 列、where/having 字段、orderBy、
   groupBy、join 表与 on 列、insert/update 的键——全部逐一校验，JS 字符串不拼 SQL。
+- **新增标识符面收口**：聚合 `fn` 为类型化枚举（非字符串）；别名 `as` 只经 sea-query
+  `Alias::new` 引号发射 + op 侧形状正则 `^[A-Za-z_][A-Za-z0-9_]*$` 纵深校验。
 - 值只经绑定参数（`Expr::val` / insert values → sea-query Values → 参数数组）。
-- update/delete 无 where = op 侧 Err（JS 链层也拦）。
+- update/delete 必须带 where 且**叶子数 ≥ 1**（空 and/or 组直接 Err）= op 侧强制，
+  JS 链层仅 DX 早抛。
 - 表归属守卫 `check_table` 对所有动词生效（含 join 表）。
+- `bootstrap.js` 保持 **7-bit ASCII**（新增条件对象/链式方法的注释全英文）。
 
 ## 错误处理
 
-- 未知表/列/别名、非法 op、非法 join kind、超限条件树 → `JsErrorBox::generic`，
-  文案带具体名字（沿用现有风格）。
+- 未知表/列/别名、非法 op、非法 join kind、超限条件树、空条件组、动词×字段不兼容 →
+  `JsErrorBox::generic`，文案带具体名字（沿用现有风格）。
+- **反序列化错误消息质量**：`CondTree` 已改手写 `Deserialize`（按键唯一分发 + 多余键报错），
+  天然精确；`columns` 保留 untagged（String 变体优先——错键对象落 String 变体必然报错，
+  后果轻）。JS 链层对 where/having 入参做形状预检（便宜且只跑一次），与 DML 链层守卫同思路。
 - JS 链层只做形状约束（如 update 无 where 早抛），权威校验在 op。
 
 ## 测试（`src/bridge/query.rs` 既有测试模块内扩展）
 
-- 条件树：or/not/and 嵌套、深度与数量上限触发；现有单层条件回归。
+- 条件树：or/not/and 嵌套、深度与数量上限触发；**空 and/or 组 Err**；现有单层条件回归。
 - 条件对象：工厂组合（and/or/not/leaf）、不可变派生、tree()/fields()/has() 输出正确；
   where 接受条件对象与裸 JSON 树等价执行（同结果集）。
 - 序列化：toJSON 快照 → fromJSON 复原后执行，结果与原 builder 一致；快照改字段
   （如 limit）后生效；fromJSON 非法树被 op 拒绝（同手写非法树）。
-- DML：insert 单行/多行、update/delete 行数断言、无 where 被拒。
-- join：inner/left 结果集；on 列未过白名单报错。
-- 聚合：count/sum + groupBy + having；distinct。
+- DML：insert 单行/多行（**行间键集不一致 Err**）、update/delete 行数断言、
+  无 where / 空 where 组被拒、空 sets/空 values 被拒、动词×字段不兼容矩阵 op 侧全拦；
+  **DML 走 tx 路由**（tx 内 insert 提交可见/回滚消失）。
+- join：inner/left 结果集；on 列未过白名单报错；join 存在时非限定列命中 join 表被拒。
+- 聚合：count(*)/count(field)/sum + groupBy + having（**别名引用展开**在 PG 方言 SQL 里
+  不含别名字样）；distinct；别名形状非法 Err。
 - toSQL：三方言占位符（沿用 `placeholder_per_dialect` 形态）；toSQL 与执行结果一致
   （toSQL 出的 sql+params 直接喂 `db.query` 得相同行）。
 - 红线：insert/update 的键不在白名单报错；join 表归属守卫拦截。
-- e2e（`oj/tests/e2e.rs`）：一条 join + 一条 insert 走 HTTP 全链路。
+- **夹具扩展**：`seeded_bridge` 扩成两表（第二表入 SchemaRegistry）供 join 用例；
+  e2e（`oj/tests/e2e.rs`）的 schema.yaml 声明两张表，一条 join + 一条 insert 走 HTTP 全链路。
