@@ -58,6 +58,12 @@ db.table("user").delete().where({field:"id",op:"in",value:[1,2]});
 // SQL 输出（新增，不执行）
 db.table("user").select(["id"]).where({field:"age",op:"gt",value:18}).toSQL();
 // → { sql: "SELECT ... WHERE \"age\" > $1", params: [18] }   （占位符按目标库方言）
+
+// 序列化（新增）：req 本就是纯 JSON，toJSON 深拷贝快照、fromJSON 复原后可继续链/执行
+const q = db.table("user").select(["id"]).where(c);          // c = 条件对象（已解包进 req）
+const snap = q.toJSON();       // → { db, table, verb, columns, conditions, ... } 纯 JSON
+snap.limit = 50;               // 快照是普通对象，可直接改
+db.fromJSON(snap).all();       // 复原（db 名从快照内读）→ 继续链或直接执行
 ```
 
 链式方法对 DML 的约束（JS 层即报错，不等到 op）：
@@ -111,6 +117,10 @@ struct QueryReq {
   查询必须带 `tenant_id` 过滤，缺则拒执行）。
 - `.where(cond)` / `.having(cond)` 接受条件对象或普通 JSON 树；是对象则先 `.tree()`
   解包进 req。
+- `toJSON()` / `fromJSON(json)`：`queryBuilder` 的 req 本就是纯 JSON 对象——
+  `toJSON()` 返回深拷贝快照；`db.fromJSON(json)` 按快照内 `db`/`table` 复原 builder，
+  复原后可继续链式调用或直接执行。用途：查询定义落盘/跨模块传递/模板化改参。
+  形状校验不做 JS 侧重复——权威校验仍在 op（fromJSON 进非法树与手写非法树同罪同罚）。
 - 上限（深度 8 / 叶子 64）仍在 op 侧统一强制——JS 层不重复计数，防绕过。
 
 ### 构造与执行
@@ -152,6 +162,8 @@ struct QueryReq {
 - 条件树：or/not/and 嵌套、深度与数量上限触发；现有单层条件回归。
 - 条件对象：工厂组合（and/or/not/leaf）、不可变派生、tree()/fields()/has() 输出正确；
   where 接受条件对象与裸 JSON 树等价执行（同结果集）。
+- 序列化：toJSON 快照 → fromJSON 复原后执行，结果与原 builder 一致；快照改字段
+  （如 limit）后生效；fromJSON 非法树被 op 拒绝（同手写非法树）。
 - DML：insert 单行/多行、update/delete 行数断言、无 where 被拒。
 - join：inner/left 结果集；on 列未过白名单报错。
 - 聚合：count/sum + groupBy + having；distinct。
