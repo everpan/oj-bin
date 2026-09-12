@@ -171,22 +171,22 @@ fn to_qv(v: &Value) -> Qv {
     }
 }
 
-fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsErrorBox> {
-    let c = Expr::col(Alias::new(col));
+/// op 编译为谓词表达式（泛化：左操作数可为任意 ExprTrait——having 别名展开 Phase 6 复用）。
+fn apply_op<T: ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsErrorBox> {
     let rhs = |v: &Value| Expr::val(to_qv(v));
     Ok(match op {
-        Op::Eq => c.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
-        Op::Ne => c.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
-        Op::Gt => c.gt(rhs(val
+        Op::Eq => t.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
+        Op::Ne => t.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
+        Op::Gt => t.gt(rhs(val
             .as_ref()
             .ok_or_else(|| JsErrorBox::generic("gt needs value"))?)),
-        Op::Gte => c.gte(rhs(val
+        Op::Gte => t.gte(rhs(val
             .as_ref()
             .ok_or_else(|| JsErrorBox::generic("gte needs value"))?)),
-        Op::Lt => c.lt(rhs(val
+        Op::Lt => t.lt(rhs(val
             .as_ref()
             .ok_or_else(|| JsErrorBox::generic("lt needs value"))?)),
-        Op::Lte => c.lte(rhs(val
+        Op::Lte => t.lte(rhs(val
             .as_ref()
             .ok_or_else(|| JsErrorBox::generic("lte needs value"))?)),
         Op::In => {
@@ -195,7 +195,7 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| JsErrorBox::generic("in needs array value"))?;
             let vals: Vec<Expr> = arr.iter().map(rhs).collect();
-            c.is_in(vals)
+            t.is_in(vals)
         }
         Op::Like => {
             let v = val
@@ -205,19 +205,69 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            c.like(LikeExpr::new(pat))
+            t.like(LikeExpr::new(pat))
         }
-        Op::IsNull => c.is_null(),
+        Op::IsNull => t.is_null(),
     })
+}
+
+/// 限定列解析上下文（select/where/orderBy/groupBy/having/join on 六处共用）。
+struct ColCtx<'a> {
+    base_name: &'a str,
+    base: &'a TableDef,
+    joins: Vec<(&'a str, &'a TableDef)>,
+}
+
+impl ColCtx<'_> {
+    /// 列引用 → 所属表定义：`"t.col"` 表段 ∈ {基表} ∪ {join 表}，列段对该表校验；
+    /// 非限定仅解析基表（不查 join 表——天然拒绝歧义，强制全限定名）。
+    fn table_of(&self, col: &str, site: &str) -> Result<&TableDef, JsErrorBox> {
+        match col.split_once('.') {
+            Some((t, c)) => {
+                let td = if t == self.base_name {
+                    self.base
+                } else if let Some((_, td)) = self.joins.iter().find(|(n, _)| *n == t) {
+                    td
+                } else {
+                    return Err(JsErrorBox::generic(format!(
+                        "unknown table '{t}' in {site}"
+                    )));
+                };
+                if !td.has_column(c) {
+                    return Err(JsErrorBox::generic(format!(
+                        "unknown column '{col}' in {site}"
+                    )));
+                }
+                Ok(td)
+            }
+            None if self.base.has_column(col) => Ok(self.base),
+            None => Err(JsErrorBox::generic(format!(
+                "unknown column '{col}' in {site}"
+            ))),
+        }
+    }
+
+    fn check_col(&self, col: &str, site: &str) -> Result<(), JsErrorBox> {
+        self.table_of(col, site).map(|_| ())
+    }
+}
+
+/// 列引用 → 列表达式（qualified → (table, col) 元组）。
+/// 注：sea-query 1.0 起 `SimpleExpr` 即 `Expr` 的类型别名，无需转换。
+fn col_simple_expr(col: &str) -> SimpleExpr {
+    match col.split_once('.') {
+        Some((t, c)) => Expr::col((Alias::new(t), Alias::new(c))),
+        None => Expr::col(Alias::new(col)),
+    }
 }
 
 const COND_DEPTH_MAX: usize = 8;
 const COND_LEAF_MAX: usize = 64;
 
-/// 条件树 → SimpleExpr（Phase 5 把 table 参数换成 ColCtx 以支持限定列）。
+/// 条件树 → SimpleExpr（列引用经 ColCtx 支持限定列）。
 fn cond_expr(
     t: &CondTree,
-    table: &TableDef,
+    ctx: &ColCtx<'_>,
     depth: usize,
     leaves: &mut usize,
 ) -> Result<SimpleExpr, JsErrorBox> {
@@ -232,13 +282,8 @@ fn cond_expr(
                     "condition tree too large (max 64 leaves)",
                 ));
             }
-            if !table.has_column(&c.field) {
-                return Err(JsErrorBox::generic(format!(
-                    "unknown column '{}' in where",
-                    c.field
-                )));
-            }
-            build_expr(&c.field, c.op, &c.value)
+            ctx.check_col(&c.field, "where")?;
+            apply_op(col_simple_expr(&c.field), c.op, &c.value)
         }
         CondTree::And(xs) | CondTree::Or(xs) => {
             let mut cond = if matches!(t, CondTree::And(_)) {
@@ -247,13 +292,13 @@ fn cond_expr(
                 sea_query::Condition::any()
             };
             for x in xs {
-                cond = cond.add(cond_expr(x, table, depth + 1, leaves)?);
+                cond = cond.add(cond_expr(x, ctx, depth + 1, leaves)?);
             }
             Ok(SimpleExpr::from(cond))
         }
         CondTree::Not(x) => {
             let mut cond = sea_query::Condition::all();
-            cond = cond.add(cond_expr(x, table, depth + 1, leaves)?);
+            cond = cond.add(cond_expr(x, ctx, depth + 1, leaves)?);
             Ok(SimpleExpr::from(cond.not()))
         }
     }
@@ -321,13 +366,19 @@ fn build_statement(
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+    // 本 Task joins 恒为空；join 表 Task 9 填入。
+    let ctx = ColCtx {
+        base_name: &req.table,
+        base: table,
+        joins: vec![],
+    };
     let params_of =
         |(sql, values): (String, sea_query::Values)| -> Result<(String, Vec<Value>), JsErrorBox> {
             let params = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
             Ok((sql, params))
         };
     match req.verb {
-        Verb::Select => build_select_body(req, table, dialect),
+        Verb::Select => build_select_body(req, &ctx, dialect),
         Verb::Insert => {
             let keys: Vec<String> = req.values[0].keys().cloned().collect();
             for k in &keys {
@@ -367,7 +418,7 @@ fn build_statement(
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, table, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 up.and_where(e);
@@ -381,7 +432,7 @@ fn build_statement(
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, table, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 del.and_where(e);
@@ -391,41 +442,38 @@ fn build_statement(
     }
 }
 
-/// select 构造段（列白名单、条件、order_by、limit/offset）——Task 1 产出原样抽出。
+/// select 构造段（列白名单经 ColCtx、条件、order_by、limit/offset）。
 fn build_select_body(
     req: &QueryReq,
-    table: &TableDef,
+    ctx: &ColCtx<'_>,
     dialect: Dialect,
 ) -> Result<(String, Vec<Value>), JsErrorBox> {
-    let cols: Vec<Alias> = if req.columns.is_empty() {
-        table
+    let mut q = Query::select();
+    if req.columns.is_empty() {
+        let cols: Vec<Alias> = ctx
+            .base
             .columns
             .keys()
             .map(|c| Alias::new(c.clone()))
-            .collect()
+            .collect();
+        q.columns(cols);
     } else {
-        req.columns
-            .iter()
-            .map(|c| {
-                if !table.has_column(c) {
-                    Err(JsErrorBox::generic(format!(
-                        "unknown column '{c}' on '{}'",
-                        req.table
-                    )))
-                } else {
-                    Ok(Alias::new(c.clone()))
-                }
-            })
-            .collect::<Result<_, _>>()?
-    };
-    let mut q = Query::select();
-    q.columns(cols).from(Alias::new(&req.table));
+        // site 复刻既有报错文案形态 `unknown column '<c>' on '<table>'`（既有测试锁定）。
+        let site = format!("on '{}'", req.table);
+        for c in &req.columns {
+            ctx.check_col(c, &site)?;
+        }
+        q.exprs(req.columns.iter().map(|c| col_simple_expr(c)));
+    }
+    q.from(Alias::new(&req.table));
     let mut leaves = 0usize;
     for c in &req.conditions {
-        q.and_where(cond_expr(c, table, 1, &mut leaves)?);
+        q.and_where(cond_expr(c, ctx, 1, &mut leaves)?);
     }
     for o in &req.order_by {
-        if !table.is_sortable(&o.field) {
+        let td = ctx.table_of(&o.field, "orderBy")?;
+        let bare = o.field.rsplit('.').next().unwrap_or(&o.field);
+        if !td.is_sortable(bare) {
             return Err(JsErrorBox::generic(format!(
                 "column '{}' not sortable",
                 o.field
@@ -435,7 +483,7 @@ fn build_select_body(
             Some("desc") => Order::Desc,
             _ => Order::Asc,
         };
-        q.order_by(Alias::new(&o.field), dir);
+        q.order_by_expr(col_simple_expr(&o.field), dir);
     }
     let limit = Ord::min(req.limit.unwrap_or(LIMIT_DEFAULT), LIMIT_MAX);
     q.limit(limit as u64);
@@ -845,6 +893,24 @@ mod tests {
         assert_eq!(v["data"]["fields"], json!(["age", "ok", "tag"]), "{v}");
         assert_eq!(v["data"]["has"], true, "{v}");
         assert_eq!(v["data"]["immutable"], true, "{v}");
+    }
+
+    #[test]
+    fn col_ctx_qualified_and_unqualified_rules() {
+        let reg = SchemaRegistry::new()
+            .table("a", &["id"], &["id", "name"])
+            .table("b", &["id"], &["id", "aid", "label"]);
+        let ctx = ColCtx {
+            base_name: "a",
+            base: reg.get("a").unwrap(),
+            joins: vec![("b", reg.get("b").unwrap())],
+        };
+        assert!(ctx.check_col("name", "select").is_ok());
+        assert!(ctx.check_col("b.label", "select").is_ok());
+        assert!(ctx.check_col("a.id", "where").is_ok());
+        assert!(ctx.check_col("label", "select").is_err()); // 非限定不解析 join 表
+        assert!(ctx.check_col("b.nope", "select").is_err());
+        assert!(ctx.check_col("c.id", "select").is_err()); // 表段不在 {a, b}
     }
 
     #[test]
