@@ -21,6 +21,10 @@ pub struct ServerArgs {
     /// `--console-log`：true → 打开终端输出（默认关闭，只落盘）。
     /// 打开 config 的 server.console_log 之外的另一条通路（两者为「或」）。
     pub console_log: bool,
+    /// `--daemon`：true → 后台运行：re-exec 自身脱离终端
+    /// （unix setsid / windows DETACHED_PROCESS，stdio 重定向空设备），
+    /// 父进程打印子 pid 后即退出。
+    pub daemon: bool,
 }
 
 /// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
@@ -125,6 +129,10 @@ enum Commands {
         /// 非 unix 平台无落盘，终端输出强制保留。
         #[arg(long = "console-log")]
         console_log: bool,
+        /// 后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），
+        /// stdio 重定向空设备；日志照常落 server.logs_dir，父进程打印子 pid 后退出
+        #[arg(long = "daemon")]
+        daemon: bool,
     },
     /// 构建模块产物（src → dist：版本目录 / routes.js / tgz）
     Build {
@@ -234,6 +242,7 @@ fn to_command(cli: Cli) -> Command {
             cert_path,
             key_path,
             console_log,
+            daemon,
         } => Command::Server(ServerArgs {
             config,
             base,
@@ -242,6 +251,7 @@ fn to_command(cli: Cli) -> Command {
             cert_path,
             key_path,
             console_log,
+            daemon,
         }),
         Commands::Build {
             module,
@@ -306,6 +316,20 @@ mod tests {
 
     fn cmd(argv: &[&str]) -> Command {
         to_command(Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied())).unwrap())
+    }
+
+    #[test]
+    fn server_daemon_flag_maps_through() {
+        // --daemon 长旗标映射进 ServerArgs；短 -d 仍拒绝（--dir 已删，不回收短旗标）。
+        let Command::Server(a) = cmd(&["server", "-c", "c.yaml", "--daemon"]) else {
+            panic!()
+        };
+        assert!(a.daemon);
+        let Command::Server(a) = cmd(&["server", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert!(!a.daemon);
+        assert!(Cli::try_parse_from(["oj", "server", "-c", "c.yaml", "-d"]).is_err());
     }
 
     #[test]

@@ -86,6 +86,17 @@ tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
 ./oj server -c config.yaml --api-path dist --console-log   # 终端也输出
 ```
 
+后台运行（无 systemd/supervisor 时的轻量守护）：
+
+```bash
+./oj server -c config.yaml --api-path dist --daemon
+# → oj server daemonized (pid 12345)；父进程即退，子进程脱离终端继续跑
+kill 12345                       # 停机：SIGTERM 走优雅停机（排空在途请求与任务）
+```
+
+`--daemon` 下 stdio 重定向到空设备，启动失败的真因看 `logs/server-*.log`
+（unix 走 setsid 脱离控制终端；Windows 走 DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP）。
+
 日志级别另由 `RUST_LOG` 环境变量控制（如 `RUST_LOG=oj=debug`），配置里不能配。
 落盘基于 fd 重定向，**仅 unix**：Windows 上不写日志文件，终端输出强制保留并告警。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。

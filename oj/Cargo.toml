@@ -35,6 +35,10 @@ sea-query = "1.0"
 # S004 deps 版本范围匹配（§5.1）：refinery 已带入 1.0（依赖树零新增节点）。
 semver = "1"
 
+# --daemon 后台化：setsid 脱离控制终端（unix 专属；依赖树已有 libc，零新增节点）。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 # 正向用例签发测试 JWT，验证 oj-auth 守卫验签链路（与根 crate/插件同为 9，依赖树单版本）。

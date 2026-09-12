@@ -142,6 +142,7 @@ mod tests {
             cert_path: None,
             key_path: None,
             console_log: false,
+            daemon: false,
         }))
         .await;
         assert_eq!(code, 1);

@@ -103,6 +103,8 @@ release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码�
 **终端默认静默（`server.console_log` 缺省 false）**——启动时会打一行日志路径的提示，
 随后一切输出只落盘；需要终端同时输出时加 `--console-log` 或配 `server.console_log: true`。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
+**后台运行**：加 `--daemon` 脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向
+空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`。
 **准入门（三态，无静默默认）**：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
 至少显式指定其一，否则退出；两者皆指定 → 都必须存在；仅指定其一 → 只启用对应功能。
 

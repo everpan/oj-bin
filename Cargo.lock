@@ -3907,6 +3907,7 @@ dependencies = [
  "deno_error",
  "flate2",
  "jsonwebtoken",
+ "libc",
  "oj-plugin-ffi",
  "only-js",
  "refinery-core",

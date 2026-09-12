@@ -19,6 +19,11 @@ use crate::app::App;
 use crate::args::ServerArgs;
 
 pub async fn run(a: ServerArgs) -> Result<(), String> {
+    // --daemon：re-exec 自身（剥掉 --daemon）脱离终端后父进程即退；
+    // 子进程日志照常落 server.logs_dir（console 默认关闭）。
+    if a.daemon {
+        return daemonize();
+    }
     let (mut cfg, config_dir, dir, ts, base) =
         load_app_config(&a.config, a.api_path.as_deref(), a.base.as_deref())?;
     // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
@@ -105,6 +110,67 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         .await
         .map_err(|e| format!("tasks shutdown: {e}"))?;
     Ok(())
+}
+
+/// 后台运行入口（unix 分支）：re-exec 自身，剥掉 --daemon（避免子进程递归 daemon 化），
+/// setsid 脱离控制终端（终端关闭的 SIGHUP 不再波及），stdio 重定向 /dev/null。
+/// 父进程 spawn 成功即打印子 pid 返回；启动失败的真因见 server.logs_dir 落盘日志。
+#[cfg(unix)]
+fn daemonize() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().map_err(|e| format!("daemon: current_exe: {e}"))?;
+    let null =
+        std::fs::File::open("/dev/null").map_err(|e| format!("daemon: open /dev/null: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(strip_daemon_flag(std::env::args_os().skip(1)))
+        .stdin(null)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Safety: setsid 是 async-signal-safe 的单调用，fork 后的子进程里只做这一件事。
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = cmd.spawn().map_err(|e| format!("daemon: spawn: {e}"))?;
+    println!("oj server daemonized (pid {})", child.id());
+    Ok(())
+}
+
+/// re-exec 参数剥离 --daemon（长旗标独占，无短形式，精确匹配即安全）。
+fn strip_daemon_flag(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    args.into_iter().filter(|a| a != "--daemon").collect()
+}
+
+/// Windows 后台运行：DETACHED_PROCESS（不分配/不挂控制台，stdio 已重定向 null）
+/// + CREATE_NEW_PROCESS_GROUP（父控制台的 Ctrl+C 事件不再波及子进程）。
+#[cfg(windows)]
+fn daemonize() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let exe = std::env::current_exe().map_err(|e| format!("daemon: current_exe: {e}"))?;
+    let child = std::process::Command::new(exe)
+        .args(strip_daemon_flag(std::env::args_os().skip(1)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("daemon: spawn: {e}"))?;
+    println!("oj server daemonized (pid {})", child.id());
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn daemonize() -> Result<(), String> {
+    Err("--daemon 仅支持 unix / windows 平台".to_string())
 }
 
 /// 停机信号（spec §6 ①）：SIGINT（ctrl_c）与 SIGTERM 二选一（Windows 仅 ctrl_c）；
@@ -606,6 +672,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// re-exec 剥旗标：--daemon 精确移除，其余参数（含值）原样保留。
+    #[test]
+    fn strip_daemon_flag_drops_only_daemon() {
+        use std::ffi::OsString;
+        let out = strip_daemon_flag(
+            ["server", "-c", "c.yaml", "--daemon", "--api-path", "src"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert_eq!(
+            out,
+            ["server", "-c", "c.yaml", "--api-path", "src"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        // 无 --daemon 时原样透传。
+        let out = strip_daemon_flag(["server", "-c", "c.yaml"].into_iter().map(OsString::from));
+        assert_eq!(out.len(), 3);
     }
 
     /// 回归钉：缺省服务目录自 config 同级起步逐级向上搜索（src 优先、dist 次之），

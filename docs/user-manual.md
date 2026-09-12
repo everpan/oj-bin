@@ -35,7 +35,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ## 2. 命令与参数
 
 ```
-oj server  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>]
+oj server  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
 oj build   [module] [-d src] [-o dist] [--no-minify] [--check]
 oj migrate [-c config.yaml] [-d <src|dist>] [--baseline] [--module M]
 oj fixture [-c config.yaml] [-d <src|dist>] [--module M]
@@ -57,6 +57,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 | `--check` | 关 | （build）只跑结构检查（S002–S006）不写任何产物；有违规 exit 1（CI 门禁） |
 | `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
 | `--module` | 无 | （migrate / fixture）只处理指定模块 |
+| `--daemon` | 关 | （server）后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`（SIGTERM 走优雅停机） |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
   读取；同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
