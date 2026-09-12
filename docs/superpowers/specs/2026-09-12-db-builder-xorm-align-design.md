@@ -48,11 +48,11 @@ db.table("user").where(c).all();           // where 接受条件对象或普通 
 db.table("a").join("b", [{left:"a.id", right:"b.aid"}], "left")
   .select(["a.id","b.name"]).all();
 
-// DML（新增）
-db.table("user").insert({name:"neo", age:1});              // 单行
-db.table("user").insert([{name:"a"},{name:"b"}]);          // 多行
-db.table("user").update({age:2}).where({field:"id",op:"eq",value:1});
-db.table("user").delete().where({field:"id",op:"in",value:[1,2]});
+// DML（新增，.run() 终执行）
+db.table("user").insert({name:"neo", age:1}).run();          // 单行
+db.table("user").insert([{name:"a"},{name:"b"}]).run();      // 多行
+db.table("user").update({age:2}).where({field:"id",op:"eq",value:1}).run();
+db.table("user").delete().where({field:"id",op:"in",value:[1,2]}).run();
 // DML 一律返回受影响行数（exec 语义）。
 
 // SQL 输出（新增，不执行）

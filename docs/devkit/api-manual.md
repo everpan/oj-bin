@@ -570,7 +570,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
-| `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；四方法与 `db` 同签名 |
+| `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
 
@@ -585,13 +585,108 @@ const rows = await db.table("account")
   .all();                                          // → Promise<Json[]>
 ```
 
-- `WhereCond`：`{ field: string; op?: string; value?: unknown; and?; or? }`。
-  v0.2 服务端支持的操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/
-  like / isnull`；未知操作符直接报错；`and`/`or` 嵌套字段 v0.2 未展开（多 where 即 AND）。
+- `WhereCond`：`{ field: string; op?: string; value?: unknown }`。
+  操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/ like / isnull`；未知操作符直接报错。
 - `OrderByItem`：`{ field: string; dir?: "asc" | "desc" | null }`。
-- 表名/列名经 SchemaRegistry 白名单校验（启动内省所得）——未知表/列报错；
-  排序列另有可排序白名单。`limit` 缺省 100、硬上限 1000。
+- **红线**：标识符（表/列/别名）只来自 SchemaRegistry 白名单（启动内省所得），值一律经绑定参数——
+  SQL 注入面为零；未知表/列报错，排序列另有可排序白名单。`limit` 缺省 100、硬上限 1000。
 - 构造器自动按库方言出 SQL（sqlite/mysql/postgres），业务无需手写方言差异。
+
+**条件树（where 嵌套）**：
+
+```ts
+await db.table("account").where({
+  and: [
+    { field: "age", op: "gte", value: 18 },
+    { or: [
+      { field: "role", op: "eq", value: "admin" },
+      { field: "tag", op: "isnull" },
+    ]},
+  ],
+}).all();            // → WHERE age >= ? AND (role = ? OR tag IS NULL)
+```
+
+- 树节点四形：叶子 `{field, op, value?}`、`{and:[...]}`、`{or:[...]}`、`{not:{...}}`。
+- 深度上限 8、叶子数上限 64（超限报 `condition tree too deep/large`）；空 `and`/`or` 组直接拒绝。
+
+**条件对象（JS 侧组合/复用）**：`db.leaf(field, op, value)` / `db.and(...)` / `db.or(...)` /
+`db.not(c)` 工厂产出条件对象；`where`/`having` 同时接受条件对象或普通 JSON 树。
+
+```ts
+const scope = db.and(
+  db.leaf("tenant_id", "eq", tid),
+  db.leaf("deleted", "eq", 0),
+);
+const rows = await db.table("account").where(scope).all();
+if (!scope.has("tenant_id")) throw new Error("tenant scope required");  // 多租户守卫
+```
+
+- 条件对象**不可变**：`c.and(x)` / `c.or(x)` / `c.not()` 返回新对象，不改 `c`。
+- `.tree()` 取纯 JSON 树；`.fields()` 取去重字段名列表；`.has(f)` 判断是否涉及某字段。
+
+**join 联表**：
+
+```ts
+await db.table("account")
+  .join("user", [{ left: "account.user_id", right: "user.id" }], "left")
+  .select(["account.id", "user.name"])
+  .all();
+```
+
+- `on` 只支持列对列等值（`{left, right}` 数组，非空）；`kind` 省略为 `inner`，可选 `left`。
+- 列可写 `"表.列"`（表 ∈ 基表 ∪ join 表）或裸列名（**只解析基表**——歧义天然拒绝，联表查询建议全限定）。
+- join 表同样过租户/所有权守卫；**自 join 不支持**（无表别名）。
+
+**聚合 / groupBy / having / distinct**：
+
+```ts
+await db.table("order")
+  .select([
+    "user_id",
+    { fn: "sum", field: "amount", as: "total" },
+    { fn: "count" },                       // count(*) 可省 field
+  ])
+  .groupBy(["user_id"])
+  .having({ field: "total", op: "gt", value: 100 })
+  .all();
+```
+
+- 聚合列 `{ fn: "count"|"sum"|"avg"|"min"|"max", field?: string, as?: string }`；
+  别名形状 `^[A-Za-z_][A-Za-z0-9_]*$`（违例报 `illegal alias`）。
+- `having` 白名单列优先，未命中按 select 聚合别名展开（`unknown column '...' in having`）——
+  PG 不允许 HAVING 引用输出别名，展开消灭方言分叉；orderBy 不支持聚合别名（仍走列白名单）。
+- `.distinct()` 去重（仅 select）。
+
+**DML：insert / update / delete**（`.run()` 终执行，返回受影响行数；`.all()` 仅 select）：
+
+```ts
+await db.table("user").insert({ name: "neo", age: 1 }).run();        // 单行
+await db.table("user").insert([{ name: "a" }, { name: "b" }]).run(); // 多行（键集须一致）
+await db.table("user").update({ age: 2 }).where({ field: "id", op: "eq", value: 1 }).run();
+await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).run();
+```
+
+- **红线**：`update`/`delete` 必须带 where 且叶子数 ≥ 1。JS 链层早抛（`update requires where`），
+  op 侧同样强制——`fromJSON` 可完全绕过 JS 链层，故动词×字段矩阵为 **op 侧权威校验**。
+- 动词×字段矩阵：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/having`，
+  `values` 非空且多行键集一致；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`，
+  `update` 的 `sets` 非空；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
+- insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
+- `db.tx` 内构造的 DML 自动走事务同连接（见下）。
+
+**toSQL / toJSON / fromJSON**：
+
+```ts
+db.table("user").select(["id"]).where({ field: "age", op: "gt", value: 18 }).toSQL();
+// → { sql: "SELECT ... WHERE \"age\" > $1", params: [18] }  （占位符按目标库方言；不执行）
+
+const snap = db.table("user").select(["id"]).where(scope).toJSON(); // 纯 JSON 快照，可直接改
+snap.limit = 50;
+await db.fromJSON(snap).all();   // 复原后继续链/执行；tx 回调对象上同样有 fromJSON
+```
+
+- 快照里的 `db` 字段只是**创建时的 JS 可见名**；`fromJSON` 复原的实例绑定**复原方的 bound db**
+  （快照可跨模块传递而不泄漏源模块的库绑定）；tx 内执行自动走事务同连接。
 
 **事务 `db.tx`**：
 
@@ -604,8 +699,8 @@ await db.tx(async (tx) => {
 ```
 
 - 回调正常返回 → **提交**；throw / reject → **回滚**并把原错误抛给 handler。
-- `tx` 与 `db` 的 `query / exec / table` **同签名**——事务内自动走同一连接，
-  无需改写其余代码。
+- `tx` 与 `db` 的 `query / exec / table / fromJSON` 及条件工厂（`leaf/and/or/not`）
+  **同签名**——事务内自动走同一连接，无需改写其余代码（回调对象不含 `tx`——嵌套事务被拒）。
 - 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错 `transaction already active`；
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 `await` 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
