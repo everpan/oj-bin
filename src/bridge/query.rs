@@ -144,21 +144,21 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
     })
 }
 
-/// op_db_query_build：结构化查询 -> 参数化 SQL -> DataAccessor.query_with_params。
-/// 标识符（表/列）全部经 SchemaRegistry 白名单校验；值参数化。
-#[op2]
-#[serde]
-pub async fn op_db_query_build(
-    state: Rc<RefCell<OpState>>,
-    #[serde] req: QueryReq,
-) -> Result<Vec<Value>, JsErrorBox> {
-    let reg = registry(&state)?;
+/// op 前置守卫（两个 op 共用）：主表 check_table（Phase 5 扩展 join 表）。
+fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
+    super::guard::check_table(state, &req.table)
+}
+
+/// 纯构造：白名单校验 → sea-query → 方言 SQL + JSON 参数（不触 OpState/连接/tx）。
+fn build_statement(
+    req: &QueryReq,
+    reg: &SchemaRegistry,
+    dialect: Dialect,
+) -> Result<(String, Vec<Value>), JsErrorBox> {
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-    super::guard::check_table(&state, &req.table)?; // 表归属守卫（§5.3）
-
-    // 列白名单校验（空 = SELECT *）。
+    // —— 以下从 op_db_query_build 原样搬入：列白名单、条件、order_by、limit/offset ——
     let cols: Vec<Alias> = if req.columns.is_empty() {
         table
             .columns
@@ -180,10 +180,8 @@ pub async fn op_db_query_build(
             })
             .collect::<Result<_, _>>()?
     };
-
     let mut q = Query::select();
     q.columns(cols).from(Alias::new(&req.table));
-
     for c in &req.conditions {
         if !table.has_column(&c.field) {
             return Err(JsErrorBox::generic(format!(
@@ -193,7 +191,6 @@ pub async fn op_db_query_build(
         }
         q.and_where(build_expr(&c.field, c.op, &c.value)?);
     }
-
     for o in &req.order_by {
         if !table.is_sortable(&o.field) {
             return Err(JsErrorBox::generic(format!(
@@ -207,18 +204,27 @@ pub async fn op_db_query_build(
         };
         q.order_by(Alias::new(&o.field), dir);
     }
-
     let limit = Ord::min(req.limit.unwrap_or(LIMIT_DEFAULT), LIMIT_MAX);
     q.limit(limit as u64);
     if let Some(off) = req.offset {
         q.offset(off as u64);
     }
+    let (sql, values) = build_sql(dialect, &q);
+    let params: Vec<Value> = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
+    Ok((sql, params))
+}
 
-    let (sql, values) = build_select(lookup(&state, &req.db)?.dialect(), &q);
-    let params: Vec<Value> = values
-        .into_iter()
-        .map(|v| value_to_json(&v))
-        .collect::<Result<_, _>>()?;
+/// op_db_query_build：结构化查询 -> 参数化 SQL -> DataAccessor.query_with_params。
+/// 标识符（表/列）全部经 SchemaRegistry 白名单校验；值参数化。
+#[op2]
+#[serde]
+pub async fn op_db_query_build(
+    state: Rc<RefCell<OpState>>,
+    #[serde] req: QueryReq,
+) -> Result<Vec<Value>, JsErrorBox> {
+    let reg = registry(&state)?;
+    guard_req(&state, &req)?;
+    let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
 
     // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
     match super::db::resolve_target(&state, &req.db)? {
@@ -236,8 +242,8 @@ pub async fn op_db_query_build(
     }
 }
 
-/// 按方言出 SQL（sea-query QueryBuilder 非 dyn 兼容，match 分发三实现）。
-fn build_select(d: Dialect, q: &sea_query::SelectStatement) -> (String, sea_query::Values) {
+/// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。
+fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, sea_query::Values) {
     match d {
         Dialect::Sqlite => q.build(SqliteQueryBuilder),
         Dialect::MySql => q.build(sea_query::MysqlQueryBuilder),
@@ -302,7 +308,7 @@ mod tests {
             let mut q = sea_query::Query::select();
             q.column(Alias::new("name")).from(Alias::new("user"));
             q.and_where(Expr::col(Alias::new("id")).eq(1));
-            build_select(d, &q).0
+            build_sql(d, &q).0
         };
         assert!(sql_of(Dialect::Sqlite).contains('?'));
         assert!(sql_of(Dialect::MySql).contains('?'));
