@@ -705,6 +705,80 @@ await db.tx(async (tx) => {
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 `await` 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
 
+**子查询 / exists**（where 与 having 通用）：
+
+```ts
+await db.table("user")
+  .select(["id", "name"])
+  .where({ field: "id", op: "in", subquery: db.table("order")
+      .select(["user_id"]).where({ field: "amount", op: "gt", value: 100 }) })
+  .all();          // → WHERE id IN (SELECT user_id FROM order WHERE amount > ?)
+
+await db.table("user").select(["id"]).where({
+  exists: db.table("order").select(["user_id"])
+    .where({ field: "amount", op: "gt", value: 100 }),
+}).all();          // → WHERE EXISTS (SELECT user_id FROM order WHERE amount > ?)（非关联）
+```
+
+- 叶子操作符 `in/eq/ne/gt/gte/lt/lte` 接受 `subquery`（builder 或纯 JSON 请求）：
+  `in` 渲染 `IN (SELECT ...)`，其余渲染标量子查询 `col = (SELECT ...)`。
+- `value` 与 `subquery` 互斥（`value and subquery are mutually exclusive`）；
+  `isnull`/`like` 不接受子查询。`{ exists: <子查询> }` 节点不得携带其他键。
+- 子查询同样过租户/所有权守卫；嵌套约束见下。
+
+**union / union all**（排序/分页仅顶层）：
+
+```ts
+await db.table("vip").select(["id", "name"])
+  .union(db.table("black").select(["id", "name"]))            // 缺省 distinct
+  .union(db.table("tmp").select(["id", "name"]), "all")       // union all
+  .orderBy([{ field: "id", dir: "asc" }])
+  .all();
+```
+
+- 主查询与成员都须**显式列**（`union requires explicit columns`）且列数一致；
+  成员禁 order_by/limit/offset（`union member does not accept order_by/limit/offset`）。
+- 成员同样过租户守卫；`intersect`/`except` 不做。
+
+**case 列 / 窗口函数列**（select 列的对象形）：
+
+```ts
+await db.table("account").select([
+  "id",
+  { case: { when: [
+      { cond: { field: "balance", op: "lt", value: 0 }, then: "debt" },
+      { cond: { field: "vip", op: "eq", value: 1 }, then: "vip" },
+    ], else: "normal" }, as: "level" },          // → CASE WHEN ... THEN ? ... ELSE ? END
+  { window: { fn: "row_number", partition_by: ["user_id"],
+      order_by: [{ field: "amount", dir: "desc" }] }, as: "rn" },
+]).all();
+```
+
+- case：searched case；`cond` 与 where 条件树同形；`then`/`else` **只允许 JSON 值**（绑定参数，
+  不接受列名/标识符）；`as` 必填过别名形状。
+- window：`fn ∈ row_number / rank / dense_rank`；`partition_by` 列过白名单；frame 不做；`as` 必填。
+
+**with CTE**（非递归，仅顶层）：
+
+```ts
+await db.table("rich")
+  .with("rich", ["user_id", "total"], db.table("order")
+    .select(["user_id", { fn: "sum", field: "amount", as: "total" }]).groupBy(["user_id"]))
+  .select(["user_id", "total"])
+  .all();          // → WITH rich(user_id, total) AS (SELECT ...) SELECT ... FROM rich
+```
+
+- `.with(name, columns, query)`：`name`/`columns` 过别名形状（`illegal alias '...'`）；
+  `columns` 必填非空（`cte needs non-empty columns`）——**声明的输出列即后续解析的白名单**。
+- 基表/join 表名命中 CTE 名时跳过 registry 表校验（CTE 无 owner）；CTE 查询递归过守卫。
+
+**嵌套通用约束**（子查询 / exists / union 成员 / CTE 一致）：
+
+- 层数上限 4（`<site>: nested select too deep`，site 为出错位置）；嵌套必须 select
+  （`<site>: nested select must be select`）；嵌套禁 with/unions
+  （`<site>: nested select does not accept with/unions (v1)`）。
+- 隐式默认 `limit 100` 只作用于**顶层**查询；嵌套/成员不隐式截断（显式 limit 一律生效）。
+
 ### kv / redis —— KV 存储
 
 | API | 签名 | 说明 |
