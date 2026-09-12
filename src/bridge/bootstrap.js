@@ -336,6 +336,18 @@ function queryBuilder(name, table) {
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
     all() { return op_db_query_build(req); },
+    insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => ({ ...r })); return api; },
+    update(sets) { req.verb = "update"; req.sets = { ...sets }; return api; },
+    delete() { req.verb = "delete"; return api; },
+    run() {
+      if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
+        throw new Error(req.verb + " requires where");
+      }
+      if (req.verb === "insert" && req.values.length === 0) {
+        throw new Error("insert needs at least one row");
+      }
+      return op_db_query_build(req);
+    },
     toSQL() { return op_db_query_sql(req); },
   };
   return api;

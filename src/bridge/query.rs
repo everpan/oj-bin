@@ -311,6 +311,7 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
 }
 
 /// 纯构造：白名单校验 → sea-query → 方言 SQL + JSON 参数（不触 OpState/连接/tx）。
+/// 动词分发：select/insert/update/delete 四分支平级，列一律白名单校验、值一律参数化。
 fn build_statement(
     req: &QueryReq,
     reg: &SchemaRegistry,
@@ -320,7 +321,82 @@ fn build_statement(
     let table = reg
         .get(&req.table)
         .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-    // —— 以下从 op_db_query_build 原样搬入：列白名单、条件、order_by、limit/offset ——
+    let params_of =
+        |(sql, values): (String, sea_query::Values)| -> Result<(String, Vec<Value>), JsErrorBox> {
+            let params = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
+            Ok((sql, params))
+        };
+    match req.verb {
+        Verb::Select => build_select_body(req, table, dialect),
+        Verb::Insert => {
+            let keys: Vec<String> = req.values[0].keys().cloned().collect();
+            for k in &keys {
+                if !table.has_column(k) {
+                    return Err(JsErrorBox::generic(format!(
+                        "unknown column '{k}' in insert values"
+                    )));
+                }
+            }
+            let mut ins = Query::insert();
+            ins.into_table(Alias::new(&req.table))
+                .columns(keys.iter().map(Alias::new));
+            for row in &req.values {
+                if row.len() != keys.len() || !row.keys().all(|k| keys.contains(k)) {
+                    return Err(JsErrorBox::generic(
+                        "insert rows must share identical key sets",
+                    ));
+                }
+                let vals: Vec<Expr> = keys.iter().map(|k| Expr::val(to_qv(&row[k]))).collect();
+                ins.values(vals)
+                    .map_err(|e| JsErrorBox::generic(format!("insert values: {e}")))?;
+            }
+            params_of(build_sql(dialect, &ins))
+        }
+        Verb::Update => {
+            let mut up = Query::update();
+            up.table(Alias::new(&req.table));
+            for (k, v) in &req.sets {
+                if !table.has_column(k) {
+                    return Err(JsErrorBox::generic(format!(
+                        "unknown column '{k}' in update sets"
+                    )));
+                }
+                up.value(Alias::new(k), Expr::val(to_qv(v)));
+            }
+            let mut leaves = 0usize;
+            for e in req
+                .conditions
+                .iter()
+                .map(|c| cond_expr(c, table, 1, &mut leaves))
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                up.and_where(e);
+            }
+            params_of(build_sql(dialect, &up))
+        }
+        Verb::Delete => {
+            let mut del = Query::delete();
+            del.from_table(Alias::new(&req.table));
+            let mut leaves = 0usize;
+            for e in req
+                .conditions
+                .iter()
+                .map(|c| cond_expr(c, table, 1, &mut leaves))
+                .collect::<Result<Vec<_>, _>>()?
+            {
+                del.and_where(e);
+            }
+            params_of(build_sql(dialect, &del))
+        }
+    }
+}
+
+/// select 构造段（列白名单、条件、order_by、limit/offset）——Task 1 产出原样抽出。
+fn build_select_body(
+    req: &QueryReq,
+    table: &TableDef,
+    dialect: Dialect,
+) -> Result<(String, Vec<Value>), JsErrorBox> {
     let cols: Vec<Alias> = if req.columns.is_empty() {
         table
             .columns
@@ -371,31 +447,50 @@ fn build_statement(
     Ok((sql, params))
 }
 
-/// op_db_query_build：结构化查询 -> 参数化 SQL -> DataAccessor.query_with_params。
+/// op_db_query_build：结构化查询 -> 参数化 SQL -> 执行。
+/// select → rows 数组；DML → 受影响行数 number。DML 同走 resolve_target：
+/// 本库活跃 tx → 会话 exec，无 tx → 池 exec_with_params，他库 tx → 报错。
 /// 标识符（表/列）全部经 SchemaRegistry 白名单校验；值参数化。
 #[op2]
 #[serde]
 pub async fn op_db_query_build(
     state: Rc<RefCell<OpState>>,
     #[serde] req: QueryReq,
-) -> Result<Vec<Value>, JsErrorBox> {
+) -> Result<serde_json::Value, JsErrorBox> {
     let reg = registry(&state)?;
     guard_req(&state, &req)?;
     let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
+    let is_select = req.verb == Verb::Select;
 
     // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
     match super::db::resolve_target(&state, &req.db)? {
-        super::db::Target::Pool(da) => da
-            .query_with_params(&sql, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
-        super::db::Target::Tx(t) => t
-            .session
-            .lock()
-            .await
-            .query(&sql, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
+        super::db::Target::Pool(da) => {
+            if is_select {
+                da.query_with_params(&sql, &params)
+                    .await
+                    .map(Value::Array)
+                    .map_err(|e| JsErrorBox::generic(e.to_string()))
+            } else {
+                da.exec_with_params(&sql, &params)
+                    .await
+                    .map(Value::from)
+                    .map_err(|e| JsErrorBox::generic(e.to_string()))
+            }
+        }
+        super::db::Target::Tx(t) => {
+            let s = t.session.lock().await;
+            if is_select {
+                s.query(&sql, &params)
+                    .await
+                    .map(Value::Array)
+                    .map_err(|e| JsErrorBox::generic(e.to_string()))
+            } else {
+                s.exec(&sql, &params)
+                    .await
+                    .map(Value::from)
+                    .map_err(|e| JsErrorBox::generic(e.to_string()))
+            }
+        }
     }
 }
 
@@ -809,5 +904,76 @@ mod tests {
             .unwrap()
         )
         .is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dml_insert_update_delete_and_tx_routing() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"(async () => {
+                   const ins = await db.table("t").insert([{name:"e",age:50},{name:"f",age:60}]).run();
+                   const upd = await db.table("t").update({age:55}).where({field:"name",op:"eq",value:"e"}).run();
+                   const del = await db.table("t").delete().where({field:"name",op:"eq",value:"f"}).run();
+                   const n = await db.table("t").select(["name"]).all().then(r => r.length);
+                   // tx 路由：tx 内 insert 回滚后不可见
+                   let txErr = false;
+                   try { await db.tx(async (tx) => { await tx.table("t").insert({name:"g",age:1}).run(); throw new Error("boom"); }); }
+                   catch (e) { txErr = true; }
+                   const g = await db.table("t").select(["name"]).where({field:"name",op:"eq",value:"g"}).all();
+                   json.ok({ ins, upd, del, n, txErr, g: g.length });
+                 })().catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["ins"], 2, "{v}");
+        assert_eq!(v["data"]["upd"], 1, "{v}");
+        assert_eq!(v["data"]["del"], 1, "{v}");
+        assert_eq!(v["data"]["n"], 5, "{v}"); // 4 种子 + e - f + e 留下 = 5
+        assert_eq!(v["data"]["txErr"], true, "{v}");
+        assert_eq!(v["data"]["g"], 0, "{v}"); // 回滚
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dml_rejects_bad_shapes() {
+        let b = seeded_bridge().await;
+        // 行间键集不一致
+        let cap = b
+            .run(
+                r#"db.table("t").insert([{name:"x"},{name:"y",age:1}]).run()
+        .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"].as_str().unwrap().contains("identical key sets"),
+            "{v}"
+        );
+        // 键不在白名单
+        let cap = b
+            .run(
+                r#"db.table("t").insert({nope:1}).run()
+        .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"].as_str().unwrap().contains("unknown column 'nope'"),
+            "{v}"
+        );
+        // JS 链层早抛：update 无 where（run() 同步 throw，须在 async 上下文才能被 catch）
+        let cap = b
+            .run(
+                r#"(async () => db.table("t").update({age:1}).run())()
+        .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("requires where"), "{v}");
     }
 }
