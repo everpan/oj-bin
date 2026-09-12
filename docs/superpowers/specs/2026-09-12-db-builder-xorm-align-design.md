@@ -32,6 +32,18 @@ db.table("user").select(["id", "name"])
   .all();                                  // 执行 → rows
 db.table("user").select([{fn:"count", field:"id", as:"n"}]).all();
 
+// 条件独立构造 / 组合 / 检查（对齐 xorm Cond；纯 JS 实现，零新 op）
+const c0 = db.and(
+  { field: "tenant_id", op: "eq", value: 7 },
+  { field: "age", op: "gte", value: 18 },
+);
+const c = c0.or({ field: "tag", op: "isnull" });   // 增条件（不可变：返回新树，c0 不变）
+c.tree();                                  // 输出嵌套树（普通 JSON，可复制/落日志）
+c.fields();                                // → ["tenant_id","age","tag"]（去重，叶子序）
+c.has("tenant_id");                        // → true（检查必要字段过滤是否到位）
+db.table("user").where(c).all();           // where 接受条件对象或普通 JSON 树
+// db.or(...) / db.not(...) / db.leaf(field,op,value) 同形工厂。
+
 // join（on 只支持列对列等值，"表.列" 两段都过白名单）
 db.table("a").join("b", [{left:"a.id", right:"b.aid"}], "left")
   .select(["a.id","b.name"]).all();
@@ -72,7 +84,6 @@ struct QueryReq {
 `columns` 元素从纯字符串扩展为 `String | {fn, field, as}`（untagged 反序列化）。
 
 ### 条件树（对齐 xorm And/Or/Not）
-
 ```rust
 #[serde(untagged)] enum CondTree {
     Leaf(Cond),                              // 现有 {field,op,value}
@@ -85,6 +96,22 @@ struct QueryReq {
 - 现有 `{field,op,value}` 叶子写法不变（向后兼容）；`where()` 多次调用 = 顶层 AND。
 - 上限：**深度 ≤ 8、叶子总数 ≤ 64**，超出报 `condition tree too deep/too large`。
 - `having` 复用 CondTree；聚合别名（`as`）与分组列均允许作为 having 字段。
+
+### 条件对象（JS 侧独立构造/组合/检查，对齐 xorm `Cond`）
+
+条件树本质是 JSON，组合与检查**纯 JS 实现，零新 op**（`bootstrap.js` 内实现，op 侧
+收到的还是同一棵树，`CondTree` schema 不变）：
+
+- 工厂（挂在 db / DB(name) 实例上）：`leaf(field, op, value)`、`and(...)`、`or(...)`、
+  `not(cond)`——参数接受普通 JSON 树或条件对象，返回条件对象。
+- 组合：条件对象自带 `.and(c)` / `.or(c)` / `.not()`（返回新对象，不改原树——不可变，
+  同一棵基树可派生多路条件，如「公共租户过滤 + 各业务追加」）。
+- 检查/输出：`.tree()` 返回普通 JSON 嵌套树；`.fields()` 收集全部叶子 field（去重，
+  深度优先序）；`.has(field)` 判断某字段过滤是否存在（典型用法：守卫层校验多租户
+  查询必须带 `tenant_id` 过滤，缺则拒执行）。
+- `.where(cond)` / `.having(cond)` 接受条件对象或普通 JSON 树；是对象则先 `.tree()`
+  解包进 req。
+- 上限（深度 8 / 叶子 64）仍在 op 侧统一强制——JS 层不重复计数，防绕过。
 
 ### 构造与执行
 
@@ -123,6 +150,8 @@ struct QueryReq {
 ## 测试（`src/bridge/query.rs` 既有测试模块内扩展）
 
 - 条件树：or/not/and 嵌套、深度与数量上限触发；现有单层条件回归。
+- 条件对象：工厂组合（and/or/not/leaf）、不可变派生、tree()/fields()/has() 输出正确；
+  where 接受条件对象与裸 JSON 树等价执行（同结果集）。
 - DML：insert 单行/多行、update/delete 行数断言、无 where 被拒。
 - join：inner/left 结果集；on 列未过白名单报错。
 - 聚合：count/sum + groupBy + having；distinct。
