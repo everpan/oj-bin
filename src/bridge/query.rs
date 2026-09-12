@@ -519,6 +519,9 @@ const COND_LEAF_MAX: usize = 64;
 /// 嵌套 select 最大层数（子查询/exists 共用；顶层为 0）。
 const REQ_NEST_MAX: u8 = 4;
 
+/// 单个 CASE 列的 when 子句上限。
+const CASE_WHEN_MAX: usize = 16;
+
 /// 嵌套 select 通用约束（site 用于报错定位：subquery/exists/union/cte）。
 /// with 的禁带判断由 Task 18 落地字段后补上（unions 已落地）。
 fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox> {
@@ -535,6 +538,13 @@ fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorB
     if !req.unions.is_empty() || !req.with.is_empty() {
         return Err(JsErrorBox::generic(format!(
             "{site}: nested select does not accept with/unions (v1)"
+        )));
+    }
+    // 嵌套无隐式 LIMIT 兜底（Task 16 起），offset 无 limit 会渲染裸 OFFSET——
+    // 嵌套分页本无意义，要求成对出现，把 DB 语法错提前为校验错（F-2）。
+    if req.limit.is_none() && req.offset.is_some() {
+        return Err(JsErrorBox::generic(format!(
+            "{site}: nested select offset requires limit"
         )));
     }
     Ok(())
@@ -712,6 +722,14 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
     }
     if let Some(h) = &req.having {
         guard_nested(state, h)?;
+    }
+    // CASE 列的 when 条件可携带 subquery/exists 嵌套 req——同样递归过守卫（F-1）。
+    for col in &req.columns {
+        if let ColSpec::Case(c) = col {
+            for w in &c.case.when {
+                guard_nested(state, &w.cond)?;
+            }
+        }
     }
     for u in &req.unions {
         guard_req(state, &u.query)?;
@@ -1054,10 +1072,16 @@ fn build_select_stmt(
                     if c.case.when.is_empty() {
                         return Err(JsErrorBox::generic("case needs non-empty when"));
                     }
+                    if c.case.when.len() > CASE_WHEN_MAX {
+                        return Err(JsErrorBox::generic(format!(
+                            "case when count exceeds {CASE_WHEN_MAX}"
+                        )));
+                    }
                     check_alias(&c.r#as)?;
                     let mut case = sea_query::CaseStatement::new();
+                    // 所有 when 共享每棵条件树 64 叶预算（F-3：原每 when 独立预算）。
+                    let mut leaves = 0usize;
                     for w in &c.case.when {
-                        let mut leaves = 0usize;
                         let e = cond_expr(&w.cond, &ctx, reg, depth, 1, &mut leaves)?;
                         case = case.case(
                             sea_query::Condition::all().add(e),
@@ -2258,6 +2282,71 @@ mod tests {
             let v: Value = serde_json::from_slice(&cap.body).unwrap();
             assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
         }
+    }
+
+    /// 统一审查 F-2/F-3：嵌套 offset 必须与 limit 成对；CASE when 数上限。
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_offset_and_case_when_caps() {
+        let b = seeded_bridge_2t().await;
+        for (js, want) in [
+            // 嵌套 offset 无 limit：原渲染裸 OFFSET（DB 语法错），现校验期拒绝
+            (
+                r#"db.table("a").select(["name"]).where({field:"id",op:"in",
+             subquery:db.table("b").select(["aid"]).offset(1)}).all()"#,
+                "nested select offset requires limit",
+            ),
+            // 成对出现则合法（正向对照）
+            (
+                r#"db.table("a").select(["name"]).where({field:"id",op:"in",
+             subquery:db.table("b").select(["aid"]).limit(1).offset(1)}).all()"#,
+                "CODE0",
+            ),
+            // CASE when 数 17 > 16
+            (
+                r#"db.table("a").select([{case:{when:[
+               {cond:{field:"id",op:"eq",value:1},then:1},{cond:{field:"id",op:"eq",value:2},then:2},
+               {cond:{field:"id",op:"eq",value:3},then:3},{cond:{field:"id",op:"eq",value:4},then:4},
+               {cond:{field:"id",op:"eq",value:5},then:5},{cond:{field:"id",op:"eq",value:6},then:6},
+               {cond:{field:"id",op:"eq",value:7},then:7},{cond:{field:"id",op:"eq",value:8},then:8},
+               {cond:{field:"id",op:"eq",value:9},then:9},{cond:{field:"id",op:"eq",value:10},then:10},
+               {cond:{field:"id",op:"eq",value:11},then:11},{cond:{field:"id",op:"eq",value:12},then:12},
+               {cond:{field:"id",op:"eq",value:13},then:13},{cond:{field:"id",op:"eq",value:14},then:14},
+               {cond:{field:"id",op:"eq",value:15},then:15},{cond:{field:"id",op:"eq",value:16},then:16},
+               {cond:{field:"id",op:"eq",value:17},then:17}],else:0},as:"x"}]).all()"#,
+                "case when count exceeds 16",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            if want == "CODE0" {
+                assert_eq!(v["code"], 0, "{v}");
+            } else {
+                assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+            }
+        }
+    }
+
+    /// 统一审查 F-4：值含引号/反斜杠/换行/制表符经绑定参数往返无损。
+    #[tokio::test(flavor = "current_thread")]
+    async fn special_char_values_round_trip() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"const v = "o'brien\\x\n\ty\"z";
+             db.table("t").insert({name:v}).run()
+               .then(() => db.table("t").where({field:"name",op:"eq",value:v}).all())
+               .then((rows) => json.ok({hit: rows.length === 1 && rows[0].name === v}))
+               .catch((e) => json.fail(400, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["hit"], json!(true), "{v}");
     }
 
     /// 动词矩阵：columns 仅 select（case/window 是 columns 元素级能力，DML 一并拦）。

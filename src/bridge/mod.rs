@@ -1951,6 +1951,52 @@ mod tests {
         assert_eq!(v["code"], 0, "{v}");
     }
 
+    /// F-1 回归（统一审查）：CASE WHEN 条件内的子查询同样过归属守卫——
+    /// guard_req 必须遍历 req.columns，deny 模式下嵌套他模块表被拒。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ownership_guard_covers_case_when_subquery() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "m/api.ts",
+            "export default { get() { db.table(\"t\").select([\"name\",\n\
+             \x20 { case: { when: [{ cond: { field: \"id\", op: \"in\",\n\
+             \x20   subquery: db.table(\"secret\").select([\"id\"]) }, then: 1 }],\n\
+             \x20   else: 0 }, as: \"c\" }]).all()\n\
+             \x20 .then((r) => json.ok(r)).catch((e) => json.fail(500, String(e))); } };\n",
+        )]);
+        let reg = SchemaRegistry::new()
+            .table_owned("m", "t", &["id"], &["id", "name"])
+            .table_owned("other", "secret", &["id"], &["id"]);
+        let mods = Arc::new(HashMap::from([(
+            root.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        // deny：CASE 内嵌套 secret（owner=other ∉ {m} ∪ deps）必须被拒。
+        let dbs = HashMap::from([(
+            "default".to_string(),
+            Arc::new(InMemoryAccessor::new()) as Arc<dyn DataAccessor>,
+        )]);
+        let b = module_bridge_ex(&root, reg, mods, true, dbs);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"].as_str().unwrap_or_default().contains("ownership"),
+            "{v}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn bound_db_redirects_default_for_bound_module() {
         let _t = transpile_serial();

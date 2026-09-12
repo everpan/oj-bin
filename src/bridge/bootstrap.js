@@ -359,7 +359,17 @@ function builderFromReq(snap) {
   );
   req.db = String(req.db); req.table = String(req.table);
   const api = {
-    select(cols) { req.columns = (cols || []).map((c) => (typeof c === "string" ? String(c) : { ...c })); return api; },
+    select(cols) {
+      req.columns = (cols || []).map((c) => {
+        if (typeof c === "string") return String(c);
+        // deep-unwrap case when conds (condObj/builder, same as where/having)
+        if (c && c.case && c.case.when) {
+          return { ...c, case: { ...c.case, when: c.case.when.map((w) => ({ ...w, cond: unwrapTree(w.cond) })) } };
+        }
+        return { ...c };
+      });
+      return api;
+    },
     where(cond) { req.conditions.push(unwrapTree(cond)); return api; },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
