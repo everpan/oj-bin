@@ -15,7 +15,8 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use sea_query::{
-    Alias, Expr, ExprTrait, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv,
+    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder,
+    Value as Qv,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -226,6 +227,10 @@ struct QueryReq {
     #[serde(default)]
     distinct: bool,
     #[serde(default)]
+    group_by: Vec<String>,
+    #[serde(default)]
+    having: Option<CondTree>,
+    #[serde(default)]
     conditions: Vec<CondTree>,
     #[serde(default)]
     order_by: Vec<OrderBy>,
@@ -362,10 +367,10 @@ fn col_simple_expr(col: &str) -> SimpleExpr {
 const COND_DEPTH_MAX: usize = 8;
 const COND_LEAF_MAX: usize = 64;
 
-/// 条件树 → SimpleExpr（列引用经 ColCtx 支持限定列）。
-fn cond_expr(
+/// 条件树 → SimpleExpr（树形递归一份，叶子解析由 site 注入）。
+fn cond_expr_generic(
     t: &CondTree,
-    ctx: &ColCtx<'_>,
+    leaf: &mut dyn FnMut(&Cond) -> Result<SimpleExpr, JsErrorBox>,
     depth: usize,
     leaves: &mut usize,
 ) -> Result<SimpleExpr, JsErrorBox> {
@@ -380,8 +385,7 @@ fn cond_expr(
                     "condition tree too large (max 64 leaves)",
                 ));
             }
-            ctx.check_col(&c.field, "where")?;
-            apply_op(col_simple_expr(&c.field), c.op, &c.value)
+            leaf(c)
         }
         CondTree::And(xs) | CondTree::Or(xs) => {
             let mut cond = if matches!(t, CondTree::And(_)) {
@@ -390,16 +394,60 @@ fn cond_expr(
                 sea_query::Condition::any()
             };
             for x in xs {
-                cond = cond.add(cond_expr(x, ctx, depth + 1, leaves)?);
+                cond = cond.add(cond_expr_generic(x, leaf, depth + 1, leaves)?);
             }
             Ok(SimpleExpr::from(cond))
         }
         CondTree::Not(x) => {
             let mut cond = sea_query::Condition::all();
-            cond = cond.add(cond_expr(x, ctx, depth + 1, leaves)?);
+            cond = cond.add(cond_expr_generic(x, leaf, depth + 1, leaves)?);
             Ok(SimpleExpr::from(cond.not()))
         }
     }
+}
+
+/// 条件树 → SimpleExpr（where 叶子：白名单列，限定列经 ColCtx 支持联表）。
+fn cond_expr(
+    t: &CondTree,
+    ctx: &ColCtx<'_>,
+    depth: usize,
+    leaves: &mut usize,
+) -> Result<SimpleExpr, JsErrorBox> {
+    cond_expr_generic(
+        t,
+        &mut |c| {
+            ctx.check_col(&c.field, "where")?;
+            apply_op(col_simple_expr(&c.field), c.op, &c.value)
+        },
+        depth,
+        leaves,
+    )
+}
+
+/// 条件树 → SimpleExpr（having 叶子：白名单列优先，未命中查聚合别名台账展开——
+/// PG 不允许 HAVING 引用 select 输出别名，展开消灭方言分叉）。
+fn cond_expr_having(
+    t: &CondTree,
+    ctx: &ColCtx<'_>,
+    aliases: &HashMap<String, SimpleExpr>,
+    depth: usize,
+    leaves: &mut usize,
+) -> Result<SimpleExpr, JsErrorBox> {
+    cond_expr_generic(
+        t,
+        &mut |c| {
+            if ctx.check_col(&c.field, "having").is_ok() {
+                apply_op(col_simple_expr(&c.field), c.op, &c.value)
+            } else {
+                let e = aliases.get(&c.field).ok_or_else(|| {
+                    JsErrorBox::generic(format!("unknown column '{}' in having", c.field))
+                })?;
+                apply_op(Expr::expr(e.clone()), c.op, &c.value)
+            }
+        },
+        depth,
+        leaves,
+    )
 }
 
 /// op 前置守卫（两个 op 共用）：主表与 join 表 check_table。
@@ -443,6 +491,12 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if req.distinct {
                 return reject("insert", "distinct");
             }
+            if !req.group_by.is_empty() {
+                return reject("insert", "groupBy");
+            }
+            if req.having.is_some() {
+                return reject("insert", "having");
+            }
         }
         Verb::Update | Verb::Delete => {
             if !req.joins.is_empty() {
@@ -450,6 +504,12 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             }
             if req.distinct {
                 return reject("update/delete", "distinct");
+            }
+            if !req.group_by.is_empty() {
+                return reject("update/delete", "groupBy");
+            }
+            if req.having.is_some() {
+                return reject("update/delete", "having");
             }
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
@@ -663,6 +723,22 @@ fn build_select_body(
     let mut leaves = 0usize;
     for c in &req.conditions {
         q.and_where(cond_expr(c, ctx, 1, &mut leaves)?);
+    }
+    for g in &req.group_by {
+        ctx.check_col(g, "groupBy")?;
+    }
+    if !req.group_by.is_empty() {
+        q.group_by_columns(req.group_by.iter().map(|g| match g.split_once('.') {
+            Some((t, c)) => (Alias::new(t), Alias::new(c)).into_column_ref(),
+            None => Alias::new(g).into_column_ref(),
+        }));
+    }
+    if let Some(h) = &req.having {
+        let mut leaves = 0;
+        let e = cond_expr_having(h, ctx, &agg_aliases, 1, &mut leaves)?;
+        let mut cond = sea_query::Condition::all();
+        cond = cond.add(e);
+        q.cond_having(cond);
     }
     for o in &req.order_by {
         let td = ctx.table_of(&o.field, "orderBy")?;
@@ -1363,5 +1439,56 @@ mod tests {
             let v: Value = serde_json::from_slice(&cap.body).unwrap();
             assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_by_having_with_alias_expansion() {
+        let b = seeded_bridge().await;
+        // 按 tag 分组 count>1 → tag=x (2 行)
+        let cap = b
+            .run(
+                r#"db.table("t").select(["tag", {fn:"count",as:"n"}])
+                   .groupBy(["tag"]).having({field:"n",op:"gt",value:1})
+                   .orderBy([{field:"tag",dir:"asc"}]).all()
+                   .then(r => json.ok({ rows: r.length, tag: r[0].tag, n: r[0].n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["rows"], 1, "{v}");
+        assert_eq!(v["data"]["tag"], "x", "{v}");
+        assert_eq!(v["data"]["n"], 2, "{v}");
+        // having 用白名单列（列优先于别名）
+        let cap = b
+            .run(
+                r#"db.table("t").select(["tag", {fn:"sum",field:"age",as:"n"}])
+                   .groupBy(["tag"]).having({field:"age",op:"gt",value:0})
+                   .all().then(r => json.ok({ n: r.length })).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // having 引用未知别名/列 → 报错
+        let cap = b.run(r#"db.table("t").select(["tag"]).groupBy(["tag"]).having({field:"zz",op:"eq",value:1}).all()
+            .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("unknown column 'zz' in having"),
+            "{v}"
+        );
+        // 别名展开的 SQL 不含别名字样（方言验证：展开后 HAVING 引用原聚合表达式）
+        let cap = b.run(r#"json.ok(db.table("t").select([{fn:"count",as:"n"}]).groupBy(["tag"]).having({field:"n",op:"gt",value:1}).toSQL());"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let sql = v["data"]["sql"].as_str().unwrap().to_string();
+        assert!(
+            sql.contains("COUNT(") && !sql.contains("HAVING \"n\""),
+            "{sql}"
+        );
     }
 }
