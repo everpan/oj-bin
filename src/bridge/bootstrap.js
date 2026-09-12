@@ -256,12 +256,44 @@ globalThis.es = {
 globalThis.plugins = () => op_plugins();
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----
+// ----- condition tree factory (pure JSON tree; compose/inspect in JS, zero new ops) -----
+function unwrapCond(c) { return c && typeof c.tree === "function" ? c.tree() : c; }
+function condObj(tree) {
+  const api = {
+    tree: () => tree,
+    and: (...cs) => condObj({ and: [tree, ...cs.map(unwrapCond)] }),
+    or: (...cs) => condObj({ or: [tree, ...cs.map(unwrapCond)] }),
+    not: () => condObj({ not: tree }),
+    fields: () => {
+      const out = [];
+      (function walk(t) {
+        if (t && typeof t === "object") {
+          if (t.field !== undefined) out.push(String(t.field));
+          for (const k of ["and", "or"]) if (Array.isArray(t[k])) t[k].forEach(walk);
+          if (t.not) walk(t.not);
+        }
+      })(tree);
+      return [...new Set(out)];
+    },
+    has(f) { return api.fields().includes(String(f)); },
+  };
+  return api;
+}
+function condFactories() {
+  return {
+    leaf: (field, op, value) => condObj({ field: String(field), op: String(op), value }),
+    and: (...cs) => condObj({ and: cs.map(unwrapCond) }),
+    or: (...cs) => condObj({ or: cs.map(unwrapCond) }),
+    not: (c) => condObj({ not: unwrapCond(c) }),
+  };
+}
 const dbCache = new Map();
 globalThis.DB = function (name) {
   name = String(name);
   if (!dbCache.has(name)) {
     if (!op_db_has(name)) return undefined;
     dbCache.set(name, {
+      ...condFactories(),
       // raw SQL + bound params (params optional).
       query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
       exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
@@ -274,6 +306,7 @@ globalThis.DB = function (name) {
         await op_db_tx_begin(name);
         try {
           const out = await fn({
+            ...condFactories(),
             query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
             exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
             table: (t) => queryBuilder(name, String(t)),
@@ -298,7 +331,7 @@ function queryBuilder(name, table) {
   const req = { db: name, table, columns: [], conditions: [], order_by: [], limit: null, offset: null };
   const api = {
     select(cols) { req.columns = (cols || []).map(String); return api; },
-    where(cond) { req.conditions.push(cond); return api; },
+    where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },

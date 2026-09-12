@@ -640,4 +640,31 @@ mod tests {
         // 空对象 → Err
         assert!(serde_json::from_str::<CondTree>(r#"{}"#).is_err());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cond_object_compose_inspect_and_equivalent_exec() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"const base = db.and({field:"age",op:"gte",value:18}, {field:"ok",op:"eq",value:1});
+                   const c = base.or({field:"tag",op:"isnull"});
+                   const bare = {or:[{and:[{field:"age",op:"gte",value:18},{field:"ok",op:"eq",value:1}]},{field:"tag",op:"isnull"}]};
+                   Promise.all([
+                     db.table("t").select(["name"]).where(c).all(),
+                     db.table("t").select(["name"]).where(bare).all(),
+                   ]).then(([a, b2]) => json.ok({
+                     eq: a.length === b2.length && a.length === 2,
+                     fields: c.fields(), has: c.has("age") && !c.has("zz"),
+                     immutable: base.fields().length === 2,
+                   })).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["eq"], true, "{v}");
+        assert_eq!(v["data"]["fields"], json!(["age", "ok", "tag"]), "{v}");
+        assert_eq!(v["data"]["has"], true, "{v}");
+        assert_eq!(v["data"]["immutable"], true, "{v}");
+    }
 }
