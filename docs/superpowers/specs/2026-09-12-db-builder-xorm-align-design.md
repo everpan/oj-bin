@@ -236,3 +236,62 @@ enum CondTree {
 - 红线：insert/update 的键不在白名单报错；join 表归属守卫拦截。
 - **夹具扩展**：`seeded_bridge` 扩成两表（第二表入 SchemaRegistry）供 join 用例；
   e2e（`oj/tests/e2e.rs`）的 schema.yaml 声明两张表，一条 join + 一条 insert 走 HTTP 全链路。
+
+## 追加：Phase 8 —— sea-query 开放能力的安全 DSL 暴露（2026-09-12 用户确认）
+
+范围裁决（用户确认）：**扩展现有安全 DSL**——sea-query 的更多构造能力以 JSON 请求形态
+暴露，标识符仍全部过 SchemaRegistry 白名单，值仍只经绑定参数；不引入细粒度 statement
+句柄绑定。v1 纳入五块：**子查询、UNION、CASE 列、窗口函数列、CTE**。全部仅 select 动词
+可用，叠加进既有动词×字段矩阵（op 侧权威）。
+
+### 嵌套请求通用约束（五块共用）
+
+- 嵌套 select 以 `Box<QueryReq>` 递归承载（serde 递归经 Box 天然支持）；嵌套层：
+  verb 必须 select、**禁止再带 `with`/`unions`**（防组合爆炸，v1），嵌套深度
+  `REQ_NEST_MAX = 4`（子查询/union 成员/cte 查询共用同一计数）。
+- 嵌套 req 递归过同一套白名单校验与归属守卫（`guard_req` 同步递归）。
+- 参数收集：嵌套 SelectStatement 直接嵌入父语句，整棵树**一次性 build**，参数顺序由
+  sea-query 统一收集——不做逐子查询参数合并。
+
+### 子查询（where 值位置 + exists）
+
+- `Cond` 增 `subquery: Option<Box<QueryReq>>`：`{field, op, subquery}`，op ∈
+  in/eq/ne/gt/gte/lt/lte；`in` → `in_subquery`，比较 op → `col.op(select)`（标量子查询）。
+  `value` 与 `subquery` 互斥（同现 Err）；isnull 不接受 subquery。
+- `CondTree` 手写 Deserialize 增 `exists` 键：`{exists: <select-req>}` → `Expr::exists`，
+  计入叶子数（叶子上限同约束）。
+- **不做 from 子查询**：派生表列无白名单可依，破坏标识符收口。
+
+### UNION
+
+- `unions: [{kind: "all"|"distinct"(默认), query: <select-req>}]`；Intersect/Except 砍掉
+  （mysql 8.0.30 之前不支持，无用例）。
+- 仅顶层 select；union 时**基查询与成员都必须显式 columns** 且列数一致（op 侧校验，
+  否则 DB 报错信息差）；成员禁 order_by/limit/offset（方言分叉，排序分页只对整体生效）。
+- JS：`.union(otherBuilder, kind?)`。
+
+### CASE 列 / 窗口函数列（select columns 新变体）
+
+- case：`{case:{when:[{cond:<CondTree>, then:<JSON 标量>}], else:<JSON 标量,可省>},
+  as:"x"}`——searched case only；cond 过 cond_expr 白名单；then/else **只允许值**
+  （绑定参数），不允许列引用（v1）；`as` 必填过 `check_alias`。
+- window：`{window:{fn:"row_number"|"rank"|"dense_rank", partition_by:[..] 可省,
+  order_by:[{field,dir}] 可省}, as:"x"}`——fn 为类型化枚举 → 固定 `Func::custom`
+  名（非自由字符串，红线不破）；partition/order 列过 ColCtx 白名单；frame 不做（YAGNI）。
+- 两者别名**不进** having 别名账本（having 引用 case/window 别名直接 Err）。
+
+### CTE（非递归 WITH）
+
+- `with: [{name, columns:[..], query:<select-req>}]`（deny_unknown_fields）；name/columns
+  过标识符形状校验；columns **必填**（CTE 输出列即白名单来源）；recursive 不做。
+- 表解析：with 存在时，可引用表集合 = registry 表 ∪ CTE 名；CTE 表的列集合 = 声明的
+  columns。主表与 join 表都允许是 CTE 名；CTE 名**不过** `check_table` 归属守卫
+  （非真实表，无 owner 可言），registry 表照常。
+- JS：`.with(name, columns, builder)`。
+
+### 红线复核（Phase 8）
+
+- 新增标识符面：CTE name/columns、case/window 别名、window fn 枚举——全部白名单/形状
+  校验或类型化枚举，无自由字符串拼 SQL。
+- 嵌套 req 的值仍只经绑定参数；子查询/union/cte 的表与列递归过同一白名单与归属守卫。
+- 深度上限 REQ_NEST_MAX=4 防嵌套爆炸；叶子/深度上限在嵌套 req 内各自独立计数。

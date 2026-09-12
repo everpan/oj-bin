@@ -1851,7 +1851,8 @@ unix@vip.qq.com ai"
   必须 where」「标识符白名单」）
 - Modify: `docs/superpowers/specs/2026-09-12-db-builder-xorm-align-design.md`（JS 示例的 DML
   两行补 `.run()` 终执行——示例与实现对齐）
-- Modify: `oj/Cargo.toml`（version 0.1.13 → 0.1.14）
+
+（版本 bump 不在本任务——Phase 8 追加后统一由 Task 19 收口。）
 
 - [ ] **Step 1: 文档更新**
 
@@ -1868,6 +1869,827 @@ db.table("user").update({age:2}).where({field:"id",op:"eq",value:1}).run();
 db.table("user").delete().where({field:"id",op:"in",value:[1,2]}).run();
 ```
 
+- [ ] **Step 2: 全量门禁**
+
+Run:
+```bash
+cargo fmt --check 2>&1 | tail -2
+cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2
+cargo test --release --workspace 2>&1 | grep -E "test result|error" | tail -10
+cargo build --workspace 2>&1 | tail -2
+cargo xtask smoke --bin bin/oj 2>&1 | tail -2
+```
+Expected: fmt/clippy 干净，workspace 测试全绿，构建归置 bin/，smoke 过。
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add docs/devkit/api-manual.md docs/superpowers/specs/2026-09-12-db-builder-xorm-align-design.md
+git commit -m "docs(v0.1.14): db.table 构造器文档（DML/条件树/条件对象/join/聚合/toSQL/序列化）
+
+unix@vip.qq.com ai"
+```
+
+### Phase 7 收尾：更新与总结
+
+- [ ] 勾掉 Phase 1-7 checkbox；`git log --oneline` 核对；总结 Phase 1-7 落地内容。
+
+---
+
+## Phase 8：sea-query 扩展面（子查询 / UNION / CASE / 窗口 / CTE）
+
+依据 spec「追加：Phase 8」节。五块全部仅 select 可用；嵌套 req 通用约束集中在 Task 15
+落地（`REQ_NEST_MAX` + `validate_nested` + `build_select_stmt` 抽取），后续任务复用。
+
+### Task 15：嵌套 select 地基 + where 子查询 + exists
+
+**Files:**
+- Modify: `src/bridge/query.rs`（build_select_stmt 抽取、Cond 增 subquery、CondTree 增
+  Exists、cond_expr 增 reg/depth 参数、validate_nested、REQ_NEST_MAX）、
+  `src/bridge/bootstrap.js`（`__req` 内部字段 + `unwrapSub`/`unwrapTree`）
+- Test: `src/bridge/query.rs` 测试模块
+
+**Interfaces:**
+- Consumes: Task 4 的 `cond_expr` 递归编译、Task 8 的 `ColCtx`、Task 7 的 select 构造分支。
+- Produces:
+  - `const REQ_NEST_MAX: u8 = 4`
+  - `fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox>`——
+    depth >= REQ_NEST_MAX → Err `"nested select too deep"`；verb != Select → Err；
+    `!req.with.is_empty() || !req.unions.is_empty()` → Err `"<site>: nested select does not
+    accept with/unions (v1)"`（with/unions 字段在 Task 16/18 才加入 QueryReq——本任务先写
+    全判断，字段先于本任务落地会导致编译错，故本任务只判断 verb/depth，with/unions 判断
+    由 Task 16/18 各自补上）
+  - `fn build_select_stmt(req: &QueryReq, reg: &SchemaRegistry, depth: u8)
+    -> Result<SelectStatement, JsErrorBox>`——Task 7 select 分支的构造主体原样平移；
+    `build_statement` 的 select 臂改为 `build_select_stmt(req, reg, 0)` 再 build
+  - `Cond.subquery: Option<Box<QueryReq>>`、`CondTree::Exists(Box<QueryReq>)`
+    （手写 Deserialize 增 `"exists"` 键分发）
+  - cond_expr 系列签名增 `reg: &SchemaRegistry, depth: u8`（Task 11 的 having 变体同步）
+  - JS：builder api 挂 `__req`（内部字段）；`unwrapSub(v)` 取 builder 快照
+
+- [ ] **Step 1: 写失败测试**
+
+夹具用 Task 9 的 `seeded_bridge_2t`（a: id/name；b: id/aid/label）：
+
+```rust
+#[tokio::test(flavor = "current_thread")]
+async fn subquery_where_and_exists() {
+    let b = seeded_bridge_2t().await;
+    // in 子查询：b 中 label=L1 的 aid={1} → a.id ∈ {1} → 1 行 x
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .where({field:"id",op:"in",subquery:db.table("b").select(["aid"])
+            .where({field:"label",op:"eq",value:"L1"})}).all()
+        .then(r=>json.ok({n:r.length,name:r[0].name})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    assert_eq!(v["data"]["name"], "x", "{v}");
+    // 标量 eq 子查询：aid of L3 = 3，a 无 id=3 → 0 行；改 L1 → 1 行
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .where({field:"id",op:"eq",subquery:db.table("b").select(["aid"])
+            .where({field:"label",op:"eq",value:"L1"}).limit(1)}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 1, "{v}");
+    // exists（非关联）：b 有 L2 → a 全量 2 行
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .where({exists:db.table("b").select(["aid"]).where({field:"label",op:"eq",value:"L2"})}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 2, "{v}");
+    // 裸 JSON 树等价（不走 builder 包装）
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .where({field:"id",op:"in",subquery:{table:"b",columns:["aid"],
+            conditions:[{field:"label",op:"eq",value:"L1"}]}}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 1, "{v}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn subquery_rejections() {
+    let b = seeded_bridge_2t().await;
+    for (js, want) in [
+        // value 与 subquery 同现
+        (r#"db.table("a").where({field:"id",op:"in",value:[1],subquery:{table:"b",columns:["aid"]}}).all()"#,
+         "value and subquery are mutually exclusive"),
+        // isnull 不接受 subquery
+        (r#"db.table("a").where({field:"id",op:"isnull",subquery:{table:"b",columns:["aid"]}}).all()"#,
+         "isnull does not accept subquery"),
+        // 嵌套 req 动词非 select
+        (r#"db.table("a").where({field:"id",op:"in",subquery:{table:"b",verb:"delete",columns:["aid"],
+             conditions:[{field:"aid",op:"eq",value:1}]}}).all()"#,
+         "nested select"),
+        // 嵌套 req 未知列（递归过白名单）
+        (r#"db.table("a").where({field:"id",op:"in",subquery:{table:"b",columns:["nope"]}}).all()"#,
+         "unknown column"),
+    ] {
+        let cap = b.run(&format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#)).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+    }
+    // 深度超限：5 层 exists 嵌套（REQ_NEST_MAX=4）
+    let mut js = String::from(r#"db.table("a").select(["id"])"#);
+    let mut inner = String::from(r#"{table:"b",columns:["aid"]}"#);
+    for _ in 0..5 {
+        inner = format!(r#"{{table:"b",columns:["aid"],conditions:[{{exists:{inner}}}]}}"#);
+    }
+    js.push_str(&format!(r#".where({{exists:{inner}}}).all()"#));
+    let cap = b.run(&format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#)).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert!(v["msg"].as_str().unwrap().contains("nested select too deep"), "{v}");
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --release subquery_ 2>&1 | tail -3`
+Expected: FAIL（`subquery` 未知键 / exists 不识别 / `__req` undefined）。
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+const REQ_NEST_MAX: u8 = 4;
+
+/// 嵌套 select 通用约束（site 用于报错定位：subquery/union/cte）。
+fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox> {
+    if depth >= REQ_NEST_MAX {
+        return Err(JsErrorBox::generic(format!("{site}: nested select too deep")));
+    }
+    if req.verb != Verb::Select {
+        return Err(JsErrorBox::generic(format!("{site}: nested select must be select")));
+    }
+    Ok(())
+}
+```
+
+`Cond` 增字段：
+
+```rust
+    #[serde(default)]
+    subquery: Option<Box<QueryReq>>,
+```
+
+`CondTree` 增变体 `Exists(Box<QueryReq>)`；手写 Deserialize 分发链加：
+`map.contains_key("exists")` → 其余键集合必须为空 → `CondTree::Exists(Box::new(
+serde_json::from_value(map.remove("exists")...)?))`（沿用既有「键唯一分发 + 多余键报错」
+写法）。叶子计数：Exists 计 1 叶；深度计数：Exists 的子 req 内部条件树独立计数，
+但嵌套层数由 REQ_NEST_MAX 管。
+
+`build_select_stmt` 抽取：build_statement 的 `Verb::Select` 臂中「从 from 到 build 之前」
+的构造主体平移为：
+
+```rust
+/// 构造 select 语句（含 join/where/group/having/order/limit）；depth 为嵌套层数。
+fn build_select_stmt(
+    req: &QueryReq,
+    reg: &SchemaRegistry,
+    depth: u8,
+) -> Result<SelectStatement, JsErrorBox> {
+    // …现有 select 构造主体原样平移，cond_expr 调用点增传 reg/depth…
+}
+```
+
+`build_statement` 的 Select 臂改为 `build_select_stmt(req, reg, 0)?` 然后照常
+`.build(builder)` + `value_to_json`（方言 build 只在最顶层做一次，参数由 sea-query
+统一收集——嵌套语句不单独 build）。
+
+`cond_expr`（含 Task 11 的 having 变体）签名增 `reg: &SchemaRegistry, depth: u8`；
+Leaf 分支增 subquery 处理：
+
+```rust
+// Leaf 内，apply_op 之前：
+if let Some(sub) = &leaf.subquery {
+    if leaf.op == Op::IsNull {
+        return Err(JsErrorBox::generic("isnull does not accept subquery"));
+    }
+    if leaf.value.is_some() {
+        return Err(JsErrorBox::generic("value and subquery are mutually exclusive"));
+    }
+    validate_nested(sub, depth + 1, "subquery")?;
+    let col = ctx.col_simple_expr(&leaf.field, "where")?;   // 沿用 Task 8 限定列解析
+    let sel = build_select_stmt(sub, reg, depth + 1)?;
+    return Ok(match leaf.op {
+        Op::In => Expr::expr(col).in_subquery(sel),
+        Op::Eq => Expr::expr(col).eq(sel),
+        Op::Ne => Expr::expr(col).ne(sel),
+        Op::Gt => Expr::expr(col).gt(sel),
+        Op::Gte => Expr::expr(col).gte(sel),
+        Op::Lt => Expr::expr(col).lt(sel),
+        Op::Lte => Expr::expr(col).lte(sel),
+        Op::Like | Op::IsNull => unreachable!("checked above"),
+    });
+}
+```
+
+（`ExprTrait` 的 `eq/ne/gt/gte/lt/lte/in_subquery` 均接受 `R: Into<Expr>`，
+`SelectStatement: Into<Expr>`——比较 op 渲染为 `col = (SELECT ...)` 标量子查询。）
+
+Exists 分支：
+
+```rust
+CondTree::Exists(sub) => {
+    validate_nested(sub, depth + 1, "exists")?;
+    Ok(Expr::exists(build_select_stmt(sub, reg, depth + 1)?))
+}
+```
+
+`guard_req` 递归：主表/join 表守卫之后，遍历条件树内所有 subquery/exists 的嵌套 req
+递归 `guard_req`（抽小函数 `guard_nested(state, tree)` 与 cond_expr 同构遍历）。
+
+`bootstrap.js`：
+
+```js
+    // Internal: expose req for subquery/union/cte embedding (not documented API).
+    api.__req = req;
+```
+
+模块级 helper（queryBuilder 外）：
+
+```js
+  function unwrapSub(v) {
+    return v && v.__req ? JSON.parse(JSON.stringify(v.__req)) : v;
+  }
+  function unwrapTree(t) {
+    if (!t || typeof t !== "object" || Array.isArray(t)) return t;
+    if (t.__req) return unwrapTree(unwrapSub(t));
+    const o = {};
+    for (const k of Object.keys(t)) {
+      if (k === "and" || k === "or") o[k] = t[k].map(unwrapTree);
+      else if (k === "not" || k === "subquery" || k === "exists") o[k] = unwrapTree(unwrapSub(t[k]));
+      else o[k] = t[k];
+    }
+    return o;
+  }
+```
+
+where/having 的入参统一过 `unwrapTree`（条件对象 `.tree()` 路径不变——condObj 的
+tree 已是纯 JSON；where 接收到的普通对象里可能嵌 builder）。
+
+- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+
+Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
+Expected: 全 PASS，clippy 零警告。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bridge/query.rs src/bridge/bootstrap.js
+git commit -m "feat(query): where 子查询（in/标量比较）+ exists + 嵌套 select 地基（REQ_NEST_MAX=4）
+
+unix@vip.qq.com ai"
+```
+
+### Task 16：UNION / UNION ALL
+
+**Files:**
+- Modify: `src/bridge/query.rs`（UnionKind/UnionArm + select 构造 + validate_verb/validate_nested
+  扩展）、`src/bridge/bootstrap.js`（`.union()`）
+- Test: `src/bridge/query.rs` 测试模块
+
+**Interfaces:**
+- Consumes: Task 15 的 `build_select_stmt`/`validate_nested`/`unwrapSub`。
+- Produces:
+  - `struct UnionArm { kind: UnionKind(all|distinct，默认 distinct), query: Box<QueryReq> }`
+  - `QueryReq.unions: Vec<UnionArm>`（serde default）
+  - JS `.union(otherBuilder, kind?)`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test(flavor = "current_thread")]
+async fn union_all_and_distinct() {
+    let b = seeded_bridge_2t().await;
+    // a.name {x,y} ∪ b.label {L1,L2,L3}：all=5 行，distinct=5 行（无重叠）
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .union(db.table("b").select(["label"]), "all").all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 5, "{v}");
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .union(db.table("b").select(["label"]).where({field:"aid",op:"eq",value:1})).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 4, "{v}");   // 2 + 2(L1,L2)
+    // toSQL 含 UNION ALL
+    let cap = b.run(r#"db.table("a").select(["name"])
+        .union(db.table("b").select(["label"]), "all").toSQL()
+        .then(r=>json.ok({sql:r.sql})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert!(v["data"]["sql"].as_str().unwrap().contains("UNION ALL"), "{v}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn union_rejections() {
+    let b = seeded_bridge_2t().await;
+    for (js, want) in [
+        // 列数不一致
+        (r#"db.table("a").select(["id","name"]).union(db.table("b").select(["label"])).all()"#,
+         "union column count mismatch"),
+        // 成员带 limit
+        (r#"db.table("a").select(["name"]).union(db.table("b").select(["label"]).limit(1)).all()"#,
+         "union member does not accept order_by/limit/offset"),
+        // 基查询隐式列（union 必须显式 columns）
+        (r#"db.table("a").union(db.table("b").select(["label"])).all()"#,
+         "union requires explicit columns"),
+        // union 套 union（嵌套禁 unions）
+        (r#"db.table("a").select(["name"]).union(db.table("b").select(["label"])
+             .union(db.table("b").select(["label"]))).all()"#,
+         "nested select does not accept with/unions"),
+        // insert 带 unions（动词矩阵）
+        (r#"db.table("a").insert({name:"z"}).union(db.table("b").select(["label"])).run()"#,
+         "insert does not accept unions"),
+    ] {
+        let cap = b.run(&format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#)).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --release union_ 2>&1 | tail -3`
+Expected: FAIL（`.union is not a function`）。
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+/// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum UnionKind {
+    #[default]
+    Distinct,
+    All,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnionArm {
+    #[serde(default)]
+    kind: UnionKind,
+    query: Box<QueryReq>,
+}
+```
+
+`QueryReq` 增 `#[serde(default)] unions: Vec<UnionArm>`。
+`validate_verb`：Insert/Update/Delete 各加 `unions` 拒绝（`"insert does not accept unions"`
+等，沿用既有 reject 风格）；`validate_nested` 补 `!req.unions.is_empty()` →
+`"<site>: nested select does not accept with/unions (v1)"`。
+
+`build_select_stmt` 内（limit 之后、返回之前）：
+
+```rust
+    if !req.unions.is_empty() {
+        if req.columns.is_empty() {
+            return Err(JsErrorBox::generic("union requires explicit columns"));
+        }
+        for arm in &req.unions {
+            validate_nested(&arm.query, depth + 1, "union")?;
+            let m = &arm.query;
+            if m.columns.is_empty() {
+                return Err(JsErrorBox::generic("union requires explicit columns"));
+            }
+            if m.columns.len() != req.columns.len() {
+                return Err(JsErrorBox::generic(format!(
+                    "union column count mismatch: {} vs {}",
+                    req.columns.len(),
+                    m.columns.len()
+                )));
+            }
+            if !m.order_by.is_empty() || m.limit.is_some() || m.offset.is_some() {
+                return Err(JsErrorBox::generic(
+                    "union member does not accept order_by/limit/offset",
+                ));
+            }
+            let member = build_select_stmt(m, reg, depth + 1)?;
+            let ty = match arm.kind {
+                UnionKind::All => sea_query::UnionType::All,
+                UnionKind::Distinct => sea_query::UnionType::Distinct,
+            };
+            q.union(ty, member);
+        }
+    }
+```
+
+`guard_req`：对每个 `arm.query` 递归 `guard_req`。
+
+`bootstrap.js`：
+
+```js
+    union(other, kind) { req.unions.push({ kind: kind ? String(kind) : "distinct", query: unwrapSub(other) }); return api; },
+```
+
+req 初始值加 `unions: []`。
+
+- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+
+Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
+Expected: 全 PASS，clippy 零警告。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bridge/query.rs src/bridge/bootstrap.js
+git commit -m "feat(query): union/union all（显式列 + 列数校验 + 成员禁排序分页，嵌套禁 unions）
+
+unix@vip.qq.com ai"
+```
+
+### Task 17：CASE 列 + 窗口函数列
+
+**Files:**
+- Modify: `src/bridge/query.rs`（ColSpec 增 Case/Window 变体 + select 列构造 + 动词矩阵
+  扩展）、`src/bridge/bootstrap.js`（无新增链方法——columns 数组元素直写对象，零改动）
+- Test: `src/bridge/query.rs` 测试模块
+
+**Interfaces:**
+- Consumes: Task 10 的 `ColSpec`（untagged String 优先）/`check_alias`/agg_aliases 账本、
+  Task 15 的 `cond_expr(reg, depth)`。
+- Produces:
+  - `ColSpec::Case(CaseSpec)`：`{case:{when:[{cond:CondTree, then:Value}], else:Value 可省},
+    as:String}`（`#[serde(rename_all)]` 不需要；`else` 用 `#[serde(default,
+    rename = "else")] r#else: Option<Value>`）
+  - `ColSpec::Window(WindowSpec)`：`{window:{fn:WinFn(row_number|rank|dense_rank),
+    partition_by:[String] 默认 [], order_by:[OrderBy] 默认 []}, as:String}`
+  - case/window 别名**不进** agg_aliases；having/groupBy 引用 → Err
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test(flavor = "current_thread")]
+async fn case_and_window_columns() {
+    let b = seeded_bridge_2t().await;
+    // case：id=1 → "one"，否则 "other"
+    let cap = b.run(r#"db.table("a").select(["name",
+        {case:{when:[{cond:{field:"id",op:"eq",value:1},then:"one"}],else:"other"},as:"tag"}
+      ]).orderBy([{field:"id",dir:"asc"}]).all()
+      .then(r=>json.ok({tags:r.map(x=>x.tag)})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["tags"], json!(["one", "other"]), "{v}");
+    // window：row_number over (order by id desc) → y=1, x=2
+    let cap = b.run(r#"db.table("a").select(["name",
+        {window:{fn:"row_number",order_by:[{field:"id",dir:"desc"}]},as:"rn"}
+      ]).orderBy([{field:"rn"...}])"#);   // 占位——见下行真实断言
+    let cap = b.run(r#"db.table("a").select(["name",
+        {window:{fn:"row_number",order_by:[{field:"id",dir:"desc"}]},as:"rn"}
+      ]).all()
+      .then(r=>json.ok({rows:r})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    let rows = v["data"]["rows"].as_array().unwrap();
+    let rn_of = |n: &str| rows.iter().find(|r| r["name"] == n).unwrap()["rn"].as_i64().unwrap();
+    assert_eq!(rn_of("y"), 1, "{v}");
+    assert_eq!(rn_of("x"), 2, "{v}");
+    // partition_by：b 表按 aid 分区编号
+    let cap = b.run(r#"db.table("b").select(["label",
+        {window:{fn:"rank",partition_by:["aid"],order_by:[{field:"id",dir:"asc"}]},as:"rk"}
+      ]).all()
+      .then(r=>json.ok({rows:r})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn case_window_rejections() {
+    let b = seeded_bridge_2t().await;
+    for (js, want) in [
+        // 别名形状非法
+        (r#"db.table("a").select([{case:{when:[{cond:{field:"id",op:"eq",value:1},then:1}],as:"0bad"}}]).all()"#,
+         "invalid alias"),
+        // window fn 非枚举值
+        (r#"db.table("a").select([{window:{fn:"ntile",order_by:[]},as:"x"}]).all()"#,
+         "unknown variant"),
+        // having 引用 window 别名
+        (r#"db.table("a").select([{window:{fn:"row_number"},as:"rn"}]).groupBy(["id"])
+             .having({field:"rn",op:"eq",value:1}).all()"#,
+         "unknown column"),
+        // insert 带 case 列（动词矩阵：columns 非 select 拒绝——若矩阵已拦 columns 整体，
+        // 此条断言以实际报错为准调整 want）
+        (r#"db.table("a").insert({name:"z"}).run && db.table("a").select([{case:{when:[],as:"x"}}]).all()"#,
+         "case needs non-empty when"),
+    ] {
+        let cap = b.run(&format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#)).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --release case_ 2>&1 | tail -3; cargo test --release window 2>&1 | tail -3`
+Expected: FAIL（列对象不识别 → untagged 落 String 变体报 unknown column）。
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+/// case 列（searched case only；then/else 只允许 JSON 值，走绑定参数）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseSpec {
+    when: Vec<CaseWhen>,
+    #[serde(default, rename = "else")]
+    r#else: Option<Value>,
+    #[serde(rename = "as")]
+    r#as: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseWhen {
+    cond: CondTree,
+    then: Value,
+}
+
+/// 窗口函数（frame 不做）。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WinFn {
+    RowNumber,
+    Rank,
+    DenseRank,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowSpec {
+    #[serde(rename = "fn")]
+    r#fn: WinFn,
+    #[serde(default)]
+    partition_by: Vec<String>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
+    #[serde(rename = "as")]
+    r#as: String,
+}
+```
+
+`ColSpec` untagged 枚举按序追加变体（String → Agg → Case → Window，键互不重叠）。
+select 列构造处增两臂：
+
+```rust
+ColSpec::Case(c) => {
+    if c.when.is_empty() {
+        return Err(JsErrorBox::generic("case needs non-empty when"));
+    }
+    check_alias(&c.r#as)?;
+    let mut case = sea_query::CaseStatement::new();
+    for w in &c.when {
+        let cond = cond_expr(&w.cond, ctx, reg, depth)?;   // 复用 where 条件编译
+        case = case.case(sea_query::Condition::all().add(cond), to_qv(&w.then));
+    }
+    if let Some(e) = &c.r#else {
+        case = case.finally(to_qv(e));
+    }
+    q.expr_as(case, Alias::new(&c.r#as));
+}
+ColSpec::Window(w) => {
+    check_alias(&w.r#as)?;
+    let name = match w.r#fn {
+        WinFn::RowNumber => "ROW_NUMBER",
+        WinFn::Rank => "RANK",
+        WinFn::DenseRank => "DENSE_RANK",
+    };
+    let mut win = sea_query::WindowStatement::new();
+    for c in &w.partition_by {
+        ctx.check_col(c, "window partition_by")?;
+        win.add_partition_by(col_simple_expr(c));
+    }
+    for o in &w.order_by {
+        ctx.check_col(&o.field, "window order_by")?;
+        win.order_by_columns([(Alias::new(&o.field), parse_order_dir(o)?)]);
+    }
+    q.expr_window_as(sea_query::Func::cust(Alias::new(name)), win.take(), Alias::new(&w.r#as));
+}
+```
+
+（`to_qv`/`parse_order_dir` 用既有 helper 名——若现有代码把 JSON→sea-query Value 的转换
+与 orderBy dir 解析叫别的名字，沿用现有的；`case.case()` 的 `C: IntoCondition` 由
+`Condition::all().add(simple)` 满足。agg_aliases 账本**不登记** case/window 别名；
+having 别名展开查不到 → 自然落 `unknown column`。）
+
+动词矩阵：case/window 是 `columns` 元素级能力，DML 本就不接受 columns 语义外的输入——
+若 validate_verb 目前不拦 select 以外的 columns，补：`verb != Select &&
+!req.columns.is_empty()` → Err。
+
+`bootstrap.js` 零改动（columns 数组元素本就透传对象）。
+
+- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+
+Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
+Expected: 全 PASS，clippy 零警告。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bridge/query.rs
+git commit -m "feat(query): case 列 + 窗口函数列（row_number/rank/dense_rank，别名不过 having 账本）
+
+unix@vip.qq.com ai"
+```
+
+### Task 18：CTE（非递归 WITH）
+
+**Files:**
+- Modify: `src/bridge/query.rs`（CteReq + WithQuery 装配 + 表解析支持虚拟表 + guard_req
+  跳过 CTE 名）、`src/bridge/bootstrap.js`（`.with()`）
+- Test: `src/bridge/query.rs` 测试模块
+
+**Interfaces:**
+- Consumes: Task 15 的 `build_select_stmt`/`validate_nested`/`unwrapSub`、Task 8 的 ColCtx。
+- Produces:
+  - `struct CteReq { name: String, columns: Vec<String>, query: Box<QueryReq> }`
+    （deny_unknown_fields）
+  - `QueryReq.with: Vec<CteReq>`（serde default）
+  - ColCtx 扩 `ctes: Vec<(&str, &[String])>`；限定列解析顺序：基表 → join 表 → CTE 名
+  - JS `.with(name, columns, builder)`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[tokio::test(flavor = "current_thread")]
+async fn cte_main_and_join() {
+    let b = seeded_bridge_2t().await;
+    // 主表 = CTE：r(aid,label) = b 中 aid=1 → 2 行
+    let cap = b.run(r#"db.table("r").with("r", ["aid","label"],
+        db.table("b").select(["aid","label"]).where({field:"aid",op:"eq",value:1}))
+      .select(["aid","label"]).orderBy([{field:"aid",dir:"asc"}]).all()
+      .then(r=>json.ok({n:r.length,first:r[0].label})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 2, "{v}");
+    assert_eq!(v["data"]["first"], "L1", "{v}");
+    // join CTE：a ⋈ r on a.id = r.aid → x × {L1,L2} = 2 行
+    let cap = b.run(r#"db.table("a").with("r", ["aid","label"],
+        db.table("b").select(["aid","label"]).where({field:"aid",op:"eq",value:1}))
+      .join("r", [{left:"a.id",right:"r.aid"}]).select(["a.name","r.label"]).all()
+      .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["data"]["n"], 2, "{v}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cte_rejections() {
+    let b = seeded_bridge_2t().await;
+    for (js, want) in [
+        // name 形状非法
+        (r#"db.table("r").with("0bad", ["aid"], db.table("b").select(["aid"])).select(["aid"]).all()"#,
+         "invalid alias"),
+        // columns 空
+        (r#"db.table("r").with("r", [], db.table("b").select(["aid"])).select(["aid"]).all()"#,
+         "cte needs non-empty columns"),
+        // 引用未声明的 CTE 列
+        (r#"db.table("r").with("r", ["aid"], db.table("b").select(["aid"])).select(["r.nope"]).all()"#,
+         "unknown column"),
+        // 嵌套 req 带 with
+        (r#"db.table("a").select(["id"]).where({field:"id",op:"in",
+             subquery:{table:"b",columns:["aid"],with:[{name:"x",columns:["aid"],
+               query:{table:"b",columns:["aid"]}}]}}).all()"#,
+         "nested select does not accept with/unions"),
+        // insert 带 with（动词矩阵）
+        (r#"db.table("a").insert({name:"z"}).with("r",["aid"],db.table("b").select(["aid"])).run()"#,
+         "insert does not accept with"),
+    ] {
+        let cap = b.run(&format!(r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#)).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+    }
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cargo test --release cte_ 2>&1 | tail -3`
+Expected: FAIL（`.with is not a function`）。
+
+- [ ] **Step 3: 最小实现**
+
+```rust
+/// CTE（非递归；columns 必填——CTE 输出列即后续解析的白名单）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CteReq {
+    name: String,
+    columns: Vec<String>,
+    query: Box<QueryReq>,
+}
+```
+
+`QueryReq` 增 `#[serde(default)] with: Vec<CteReq>`。
+`validate_verb`：Insert/Update/Delete 各加 `with` 拒绝；`validate_nested` 补
+`!req.with.is_empty()` 判断（与 unions 同一报错文案）。
+
+表解析虚拟化：`build_select_stmt` 开头在 join_defs 之后构建 cte 表集合，ColCtx 增字段：
+
+```rust
+// ColCtx 增：ctes: Vec<(&'a str, &'a [String])>——(cte 名, 声明列)
+// check_col 限定列解析顺序：base_name → joins → ctes；CTE 命中按声明列校验。
+```
+
+基表来源：`req.table` 命中 CTE 名时，`base` 不再从 `reg.get` 取——引入轻量枚举：
+
+```rust
+/// 表来源：真实表（registry）或 CTE 虚拟表（声明列）。
+enum TableSrc<'a> {
+    Real(&'a TableDef),
+    Cte(&'a [String]),
+}
+
+impl TableSrc<'_> {
+    fn has_column(&self, col: &str) -> bool {
+        match self {
+            TableSrc::Real(t) => t.has_column(col),
+            TableSrc::Cte(cols) => cols.iter().any(|c| c == col),
+        }
+    }
+}
+```
+
+`ColCtx.base: TableDef` 引用处改 `TableSrc`（join 表的 join_defs 同步允许 CTE 名——
+`join()` 的表参数本就 `Alias::new`，无需改；`q.from(Alias::new(&req.table))` 对 CTE 名
+同样成立）。
+
+`guard_req`：主表与 join 表**命中 CTE 名则跳过** `check_table`（非真实表，无 owner），
+其余照常；每个 `cte.query` 递归 `guard_req`。
+
+`build_select_stmt` 返回前装配（with 非空时改走 WithQuery）：
+
+```rust
+    if req.with.is_empty() {
+        return Ok(q);   // 原路径
+    }
+    let mut clause = sea_query::WithClause::new();
+    for c in &req.with {
+        check_alias(&c.name)?;
+        if c.columns.is_empty() {
+            return Err(JsErrorBox::generic("cte needs non-empty columns"));
+        }
+        for col in &c.columns {
+            check_alias(col)?;
+        }
+        validate_nested(&c.query, depth + 1, "cte")?;
+        let mut cte = sea_query::CommonTableExpression::new();
+        cte.table_name(Alias::new(&c.name));
+        cte.columns(c.columns.iter().map(Alias::new));
+        cte.query(build_select_stmt(&c.query, reg, depth + 1)?);
+        clause.cte(cte);
+    }
+    Ok(q.with(clause))   // 注意返回类型变化：见下
+}
+```
+
+返回类型处理：`SelectStatement::with` 消费 self 返回 `WithQuery`——`build_select_stmt`
+签名改为返回 `sea_query::QueryStatementBuilder` 无法直接做枚举，定义：
+
+```rust
+/// 顶层可 build 的 select（含可选 WITH 包装）。
+enum TopSelect {
+    Plain(SelectStatement),
+    With(Box<sea_query::WithQuery>),
+}
+```
+
+`build_select_stmt` 保持返回 `SelectStatement`（嵌套嵌入只需要它）；**顶层** with 装配
+挪到 `build_statement` 的 Select 臂：`let stmt = build_select_stmt(req, reg, 0)?;`
+→ with 非空则 `TopSelect::With(Box::new(stmt.with(clause)))` 再分别 `.build(builder)`。
+即：with 的校验与 clause 构建函数 `build_with_clause(req, reg) -> Result<WithClause>`
+放 `build_statement` 侧调用，`build_select_stmt` 内不做 with 判断。
+
+`bootstrap.js`：
+
+```js
+    with(name, columns, query) { req.with.push({ name: String(name), columns: (columns || []).map(String), query: unwrapSub(query) }); return api; },
+```
+
+req 初始值加 `with: []`。
+
+- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+
+Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
+Expected: 全 PASS，clippy 零警告。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/bridge/query.rs src/bridge/bootstrap.js
+git commit -m "feat(query): 非递归 CTE（with，虚拟表列白名单，CTE 名跳过归属守卫）
+
+unix@vip.qq.com ai"
+```
+
+### Task 19：Phase 8 文档 + 版本 0.1.14 + 全量门禁
+
+**Files:**
+- Modify: `docs/devkit/api-manual.md`（`db.table` 子节补：子查询/exists、union、case/
+  window 列、with CTE——各一段示例 + 约束一句；嵌套通用约束一节：REQ_NEST_MAX=4、
+  嵌套禁 with/unions、嵌套必须 select）
+- Modify: `oj/Cargo.toml`（version 0.1.13 → 0.1.14）
+
+- [ ] **Step 1: 文档更新**
+
+api-manual.md `db.table` 子节（Task 14 已扩）末尾追加 Phase 8 五块：示例用 spec
+「追加：Phase 8」节的 JSON 形态（链式示例以 bootstrap.js 实有方法为准：`.union()`/
+`.with()`/columns 对象元素/where 子查询）。
+
 - [ ] **Step 2: 版本 bump**
 
 `oj/Cargo.toml`：`version = "0.1.13"` → `version = "0.1.14"`。
@@ -1881,21 +2703,23 @@ cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2
 cargo test --release --workspace 2>&1 | grep -E "test result|error" | tail -10
 cargo build --workspace 2>&1 | tail -2
 cargo xtask smoke --bin bin/oj 2>&1 | tail -2
+LC_ALL=C grep -P '[^\x00-\x7F]' src/bridge/bootstrap.js
 ```
-Expected: fmt/clippy 干净，workspace 测试全绿，构建归置 bin/，smoke 过。
+Expected: fmt/clippy 干净，workspace 测试全绿，构建归置 bin/，smoke 过，ASCII grep 无输出。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/devkit/api-manual.md docs/superpowers/specs/2026-09-12-db-builder-xorm-align-design.md oj/Cargo.toml
-git commit -m "feat(v0.1.14): db.table 构造器对齐 xorm builder（DML/条件树/条件对象/join/聚合/toSQL/序列化）
+git add docs/devkit/api-manual.md oj/Cargo.toml Cargo.lock
+git commit -m "feat(v0.1.14): sea-query 扩展面（子查询/union/case/window/cte）+ 版本 0.1.14
 
 unix@vip.qq.com ai"
 ```
 
-### Phase 7 收尾：更新与总结
+### Phase 8 收尾：更新与总结
 
-- [ ] 勾掉全部 checkbox；总结 v0.1.14 全貌（7 阶段提交序列 + 门禁状态）。
+- [ ] 勾掉 Phase 8 checkbox；`git log --oneline` 核对；总结「sea-query 开放能力以安全 DSL
+  暴露完毕，v0.1.14 收口」。
 
 ---
 
