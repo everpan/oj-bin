@@ -15,8 +15,8 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use sea_query::{
-    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder,
-    Value as Qv,
+    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, Query, SelectStatement, SimpleExpr,
+    SqliteQueryBuilder, Value as Qv,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,7 +26,7 @@ use super::registry::{SchemaRegistry, TableDef};
 use super::{BridgeResult, DataAccessor, StableState};
 
 /// 过滤操作符（类型化枚举，拒绝未知 `$op`）。
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Op {
     Eq,
@@ -41,7 +41,7 @@ enum Op {
     IsNull,
 }
 
-/// 单条过滤条件（列名 + 操作符 + 值）。
+/// 单条过滤条件（列名 + 操作符 + 值；subquery 见 Phase 8——值/子查询互斥在编译期报）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cond {
@@ -49,6 +49,8 @@ struct Cond {
     op: Op,
     #[serde(default)]
     value: Option<Value>,
+    #[serde(default)]
+    subquery: Option<Box<QueryReq>>,
 }
 
 /// 嵌套条件树（对齐 xorm And/Or/Not）。不用 untagged（serde 在 untagged 内
@@ -60,6 +62,8 @@ enum CondTree {
     And(Vec<CondTree>),
     Or(Vec<CondTree>),
     Not(Box<CondTree>),
+    /// EXISTS (SELECT ...)——嵌套 select，层数由 REQ_NEST_MAX 管。
+    Exists(Box<QueryReq>),
 }
 
 impl<'de> Deserialize<'de> for CondTree {
@@ -94,6 +98,14 @@ impl<'de> Deserialize<'de> for CondTree {
                     CondTree::deserialize(m["not"].clone()).map_err(Error::custom)?,
                 ))),
             };
+        }
+        if m.contains_key("exists") {
+            if m.len() != 1 {
+                return Err(Error::custom("exists takes no other keys"));
+            }
+            return Ok(CondTree::Exists(Box::new(
+                QueryReq::deserialize(m["exists"].clone()).map_err(Error::custom)?,
+            )));
         }
         let leaf = Cond::deserialize(Value::Object(m)).map_err(Error::custom)?;
         Ok(CondTree::Leaf(leaf))
@@ -367,10 +379,72 @@ fn col_simple_expr(col: &str) -> SimpleExpr {
 const COND_DEPTH_MAX: usize = 8;
 const COND_LEAF_MAX: usize = 64;
 
-/// 条件树 → SimpleExpr（树形递归一份，叶子解析由 site 注入）。
+/// 嵌套 select 最大层数（子查询/exists 共用；顶层为 0）。
+const REQ_NEST_MAX: u8 = 4;
+
+/// 嵌套 select 通用约束（site 用于报错定位：subquery/exists/union/cte）。
+/// with/unions 的禁带判断由 Task 16/18 落地字段后各自补上。
+fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox> {
+    if depth >= REQ_NEST_MAX {
+        return Err(JsErrorBox::generic(format!(
+            "{site}: nested select too deep"
+        )));
+    }
+    if req.verb != Verb::Select {
+        return Err(JsErrorBox::generic(format!(
+            "{site}: nested select must be select"
+        )));
+    }
+    Ok(())
+}
+
+/// 叶子内的子查询编译（where/having 叶子共用）：无 subquery → None。
+/// op ∈ in/eq/ne/gt/gte/lt/lte；value 与 subquery 互斥；isnull/like 不接受。
+fn leaf_subquery(
+    c: &Cond,
+    ctx: &ColCtx<'_>,
+    reg: &SchemaRegistry,
+    sel_depth: u8,
+    site: &str,
+) -> Result<Option<SimpleExpr>, JsErrorBox> {
+    let Some(sub) = c.subquery.as_deref() else {
+        return Ok(None);
+    };
+    if c.op == Op::IsNull {
+        return Err(JsErrorBox::generic("isnull does not accept subquery"));
+    }
+    if c.op == Op::Like {
+        return Err(JsErrorBox::generic("like does not accept subquery"));
+    }
+    if c.value.is_some() {
+        return Err(JsErrorBox::generic(
+            "value and subquery are mutually exclusive",
+        ));
+    }
+    validate_nested(sub, sel_depth + 1, "subquery")?;
+    ctx.check_col(&c.field, site)?;
+    let col = col_simple_expr(&c.field);
+    let sel = build_select_stmt(sub, reg, sel_depth + 1)?;
+    // ExprTrait 的 eq/ne/gt/gte/lt/lte 接受 R: Into<Expr>（SelectStatement 可转）；
+    // in 走 in_subquery——比较 op 渲染为 `col = (SELECT ...)` 标量子查询。
+    Ok(Some(match c.op {
+        Op::In => Expr::expr(col).in_subquery(sel),
+        Op::Eq => Expr::expr(col).eq(sel),
+        Op::Ne => Expr::expr(col).ne(sel),
+        Op::Gt => Expr::expr(col).gt(sel),
+        Op::Gte => Expr::expr(col).gte(sel),
+        Op::Lt => Expr::expr(col).lt(sel),
+        Op::Lte => Expr::expr(col).lte(sel),
+        Op::Like | Op::IsNull => unreachable!("rejected above"),
+    }))
+}
+
+/// 条件树 → SimpleExpr（树形递归一份，叶子解析由 site 注入；exists 臂由调用方注入——
+/// 子查询编译需要 reg/嵌套层数，闭包捕获而非泛化参数）。
 fn cond_expr_generic(
     t: &CondTree,
     leaf: &mut dyn FnMut(&Cond) -> Result<SimpleExpr, JsErrorBox>,
+    exists: &mut dyn FnMut(&QueryReq) -> Result<SimpleExpr, JsErrorBox>,
     depth: usize,
     leaves: &mut usize,
 ) -> Result<SimpleExpr, JsErrorBox> {
@@ -387,6 +461,15 @@ fn cond_expr_generic(
             }
             leaf(c)
         }
+        CondTree::Exists(sub) => {
+            *leaves += 1;
+            if *leaves > COND_LEAF_MAX {
+                return Err(JsErrorBox::generic(
+                    "condition tree too large (max 64 leaves)",
+                ));
+            }
+            exists(sub)
+        }
         CondTree::And(xs) | CondTree::Or(xs) => {
             let mut cond = if matches!(t, CondTree::And(_)) {
                 sea_query::Condition::all()
@@ -394,30 +477,40 @@ fn cond_expr_generic(
                 sea_query::Condition::any()
             };
             for x in xs {
-                cond = cond.add(cond_expr_generic(x, leaf, depth + 1, leaves)?);
+                cond = cond.add(cond_expr_generic(x, leaf, exists, depth + 1, leaves)?);
             }
             Ok(SimpleExpr::from(cond))
         }
         CondTree::Not(x) => {
             let mut cond = sea_query::Condition::all();
-            cond = cond.add(cond_expr_generic(x, leaf, depth + 1, leaves)?);
+            cond = cond.add(cond_expr_generic(x, leaf, exists, depth + 1, leaves)?);
             Ok(SimpleExpr::from(cond.not()))
         }
     }
 }
 
-/// 条件树 → SimpleExpr（where 叶子：白名单列，限定列经 ColCtx 支持联表）。
+/// 条件树 → SimpleExpr（where 叶子：白名单列，限定列经 ColCtx 支持联表；
+/// sel_depth 为嵌套 select 层数，随子查询/exists 递归 +1）。
 fn cond_expr(
     t: &CondTree,
     ctx: &ColCtx<'_>,
+    reg: &SchemaRegistry,
+    sel_depth: u8,
     depth: usize,
     leaves: &mut usize,
 ) -> Result<SimpleExpr, JsErrorBox> {
     cond_expr_generic(
         t,
         &mut |c| {
+            if let Some(e) = leaf_subquery(c, ctx, reg, sel_depth, "where")? {
+                return Ok(e);
+            }
             ctx.check_col(&c.field, "where")?;
             apply_op(col_simple_expr(&c.field), c.op, &c.value)
+        },
+        &mut |sub| {
+            validate_nested(sub, sel_depth + 1, "exists")?;
+            Ok(Expr::exists(build_select_stmt(sub, reg, sel_depth + 1)?))
         },
         depth,
         leaves,
@@ -425,17 +518,22 @@ fn cond_expr(
 }
 
 /// 条件树 → SimpleExpr（having 叶子：白名单列优先，未命中查聚合别名台账展开——
-/// PG 不允许 HAVING 引用 select 输出别名，展开消灭方言分叉）。
+/// PG 不允许 HAVING 引用 select 输出别名，展开消灭方言分叉；subquery/exists 同 where）。
 fn cond_expr_having(
     t: &CondTree,
     ctx: &ColCtx<'_>,
     aliases: &HashMap<String, SimpleExpr>,
+    reg: &SchemaRegistry,
+    sel_depth: u8,
     depth: usize,
     leaves: &mut usize,
 ) -> Result<SimpleExpr, JsErrorBox> {
     cond_expr_generic(
         t,
         &mut |c| {
+            if let Some(e) = leaf_subquery(c, ctx, reg, sel_depth, "having")? {
+                return Ok(e);
+            }
             if ctx.check_col(&c.field, "having").is_ok() {
                 apply_op(col_simple_expr(&c.field), c.op, &c.value)
             } else {
@@ -445,18 +543,49 @@ fn cond_expr_having(
                 apply_op(Expr::expr(e.clone()), c.op, &c.value)
             }
         },
+        &mut |sub| {
+            validate_nested(sub, sel_depth + 1, "exists")?;
+            Ok(Expr::exists(build_select_stmt(sub, reg, sel_depth + 1)?))
+        },
         depth,
         leaves,
     )
 }
 
-/// op 前置守卫（两个 op 共用）：主表与 join 表 check_table。
+/// op 前置守卫（两个 op 共用）：主表与 join 表 check_table；条件树（含 having）
+/// 内所有子查询/exists 的嵌套 req 递归过守卫（与 cond_expr 同构遍历）。
 fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
     super::guard::check_table(state, &req.table)?;
     for j in &req.joins {
         super::guard::check_table(state, &j.table)?;
     }
+    for c in &req.conditions {
+        guard_nested(state, c)?;
+    }
+    if let Some(h) = &req.having {
+        guard_nested(state, h)?;
+    }
     Ok(())
+}
+
+/// 条件树遍历，嵌套 req 递归 guard_req。
+fn guard_nested(state: &Rc<RefCell<OpState>>, t: &CondTree) -> Result<(), JsErrorBox> {
+    match t {
+        CondTree::Leaf(c) => {
+            if let Some(sub) = &c.subquery {
+                guard_req(state, sub)?;
+            }
+            Ok(())
+        }
+        CondTree::And(xs) | CondTree::Or(xs) => {
+            for x in xs {
+                guard_nested(state, x)?;
+            }
+            Ok(())
+        }
+        CondTree::Not(x) => guard_nested(state, x),
+        CondTree::Exists(sub) => guard_req(state, sub),
+    }
 }
 
 /// 动词×字段兼容矩阵（op 侧权威——fromJSON 可完全绕过 JS 链层）。
@@ -570,7 +699,11 @@ fn build_statement(
             Ok((sql, params))
         };
     match req.verb {
-        Verb::Select => build_select_body(req, &ctx, dialect),
+        Verb::Select => {
+            // 方言 build 只在最顶层做一次，参数由 sea-query 跨整棵语句树统一收集。
+            let sel = build_select_stmt(req, reg, 0)?;
+            params_of(build_sql(dialect, &sel))
+        }
         Verb::Insert => {
             let keys: Vec<String> = req.values[0].keys().cloned().collect();
             for k in &keys {
@@ -610,7 +743,7 @@ fn build_statement(
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, &ctx, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, reg, 0, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 up.and_where(e);
@@ -624,7 +757,7 @@ fn build_statement(
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, &ctx, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, reg, 0, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 del.and_where(e);
@@ -634,12 +767,41 @@ fn build_statement(
     }
 }
 
-/// select 构造段（列白名单经 ColCtx、条件、order_by、limit/offset）。
-fn build_select_body(
+/// 构造 select 语句（含 join/where/group/having/order/limit）；depth 为嵌套层数。
+/// 顶层（depth=0）由 build_statement 调用后统一 build；嵌套层被子查询/exists 复用，
+/// 不单独 build（参数由 sea-query 跨整棵语句树统一收集）。
+fn build_select_stmt(
     req: &QueryReq,
-    ctx: &ColCtx<'_>,
-    dialect: Dialect,
-) -> Result<(String, Vec<Value>), JsErrorBox> {
+    reg: &SchemaRegistry,
+    depth: u8,
+) -> Result<SelectStatement, JsErrorBox> {
+    let table = reg
+        .get(&req.table)
+        .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+    // join 表先行解析（自 join / 空 on / 未知表在此拒绝）。
+    let mut join_defs: Vec<(&str, &TableDef)> = Vec::new();
+    for j in &req.joins {
+        if j.table == req.table {
+            return Err(JsErrorBox::generic(
+                "self join not supported (no table alias)",
+            ));
+        }
+        if j.on.is_empty() {
+            return Err(JsErrorBox::generic(format!(
+                "join '{}' needs non-empty on",
+                j.table
+            )));
+        }
+        let td = reg
+            .get(&j.table)
+            .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", j.table)))?;
+        join_defs.push((j.table.as_str(), td));
+    }
+    let ctx = ColCtx {
+        base_name: &req.table,
+        base: table,
+        joins: join_defs,
+    };
     let mut q = Query::select();
     // 聚合别名台账（alias → 原表达式），having 展开用（Task 11）。
     let mut agg_aliases: HashMap<String, SimpleExpr> = HashMap::new();
@@ -722,7 +884,7 @@ fn build_select_body(
     }
     let mut leaves = 0usize;
     for c in &req.conditions {
-        q.and_where(cond_expr(c, ctx, 1, &mut leaves)?);
+        q.and_where(cond_expr(c, &ctx, reg, depth, 1, &mut leaves)?);
     }
     for g in &req.group_by {
         ctx.check_col(g, "groupBy")?;
@@ -735,7 +897,7 @@ fn build_select_body(
     }
     if let Some(h) = &req.having {
         let mut leaves = 0;
-        let e = cond_expr_having(h, ctx, &agg_aliases, 1, &mut leaves)?;
+        let e = cond_expr_having(h, &ctx, &agg_aliases, reg, depth, 1, &mut leaves)?;
         let mut cond = sea_query::Condition::all();
         cond = cond.add(e);
         q.cond_having(cond);
@@ -760,9 +922,7 @@ fn build_select_body(
     if let Some(off) = req.offset {
         q.offset(off as u64);
     }
-    let (sql, values) = build_sql(dialect, &q);
-    let params: Vec<Value> = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
-    Ok((sql, params))
+    Ok(q)
 }
 
 /// op_db_query_build：结构化查询 -> 参数化 SQL -> 执行。
@@ -1524,5 +1684,111 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["msg"].as_str().unwrap().contains("requires where"), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subquery_where_and_exists() {
+        let b = seeded_bridge_2t().await;
+        // in 子查询：b 中 label=L1 的 aid={1} → a.id ∈ {1} → 1 行 x
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name"])
+        .where({field:"id",op:"in",subquery:db.table("b").select(["aid"])
+            .where({field:"label",op:"eq",value:"L1"})}).all()
+        .then(r=>json.ok({n:r.length,name:r[0].name})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+        assert_eq!(v["data"]["name"], "x", "{v}");
+        // 标量 eq 子查询：aid of L1 = 1 → a.id = 1 → 1 行
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name"])
+        .where({field:"id",op:"eq",subquery:db.table("b").select(["aid"])
+            .where({field:"label",op:"eq",value:"L1"}).limit(1)}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+        // exists（非关联）：b 有 L2 → a 全量 2 行
+        let cap = b.run(r#"db.table("a").select(["name"])
+        .where({exists:db.table("b").select(["aid"]).where({field:"label",op:"eq",value:"L2"})}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 2, "{v}");
+        // 裸 JSON 树等价（不走 builder 包装）
+        let cap = b
+            .run(
+                r#"db.table("a").select(["name"])
+        .where({field:"id",op:"in",subquery:{table:"b",columns:["aid"],
+            conditions:[{field:"label",op:"eq",value:"L1"}]}}).all()
+        .then(r=>json.ok({n:r.length})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subquery_rejections() {
+        let b = seeded_bridge_2t().await;
+        for (js, want) in [
+            // value 与 subquery 同现
+            (
+                r#"db.table("a").where({field:"id",op:"in",value:[1],subquery:{table:"b",columns:["aid"]}}).all()"#,
+                "value and subquery are mutually exclusive",
+            ),
+            // isnull 不接受 subquery
+            (
+                r#"db.table("a").where({field:"id",op:"isnull",subquery:{table:"b",columns:["aid"]}}).all()"#,
+                "isnull does not accept subquery",
+            ),
+            // 嵌套 req 动词非 select
+            (
+                r#"db.table("a").where({field:"id",op:"in",subquery:{table:"b",verb:"delete",columns:["aid"],
+                 conditions:[{field:"aid",op:"eq",value:1}]}}).all()"#,
+                "nested select",
+            ),
+            // 嵌套 req 未知列（递归过白名单）
+            (
+                r#"db.table("a").where({field:"id",op:"in",subquery:{table:"b",columns:["nope"]}}).all()"#,
+                "unknown column",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
+        // 深度超限：5 层 exists 嵌套（REQ_NEST_MAX=4）
+        let mut js = String::from(r#"db.table("a").select(["id"])"#);
+        let mut inner = String::from(r#"{table:"b",columns:["aid"]}"#);
+        for _ in 0..5 {
+            inner = format!(r#"{{table:"b",columns:["aid"],conditions:[{{exists:{inner}}}]}}"#);
+        }
+        js.push_str(&format!(r#".where({{exists:{inner}}}).all()"#));
+        let cap = b
+            .run(&format!(
+                r#"{js}.then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("nested select too deep"),
+            "{v}"
+        );
     }
 }

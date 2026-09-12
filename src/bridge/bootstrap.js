@@ -258,6 +258,25 @@ globalThis.plugins = () => op_plugins();
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----
 // ----- condition tree factory (pure JSON tree; compose/inspect in JS, zero new ops) -----
 function unwrapCond(c) { return c && typeof c.tree === "function" ? c.tree() : c; }
+// builder -> plain req snapshot (subquery/exists embedding passes builders where a
+// tree is expected); non-builders pass through untouched.
+function unwrapSub(v) {
+  return v && v.__req ? JSON.parse(JSON.stringify(v.__req)) : v;
+}
+// deep-unwrap a condition tree: condObj -> plain tree, builders -> req snapshots,
+// recursing into and/or arrays and not/subquery/exists slots.
+function unwrapTree(t) {
+  t = unwrapCond(t);
+  if (!t || typeof t !== "object" || Array.isArray(t)) return t;
+  if (t.__req) return unwrapTree(unwrapSub(t));
+  const o = {};
+  for (const k of Object.keys(t)) {
+    if (k === "and" || k === "or") o[k] = t[k].map(unwrapTree);
+    else if (k === "not" || k === "subquery" || k === "exists") o[k] = unwrapTree(unwrapSub(t[k]));
+    else o[k] = t[k];
+  }
+  return o;
+}
 function condObj(tree) {
   const api = {
     tree: () => tree,
@@ -341,7 +360,7 @@ function builderFromReq(snap) {
   req.db = String(req.db); req.table = String(req.table);
   const api = {
     select(cols) { req.columns = (cols || []).map((c) => (typeof c === "string" ? String(c) : { ...c })); return api; },
-    where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
+    where(cond) { req.conditions.push(unwrapTree(cond)); return api; },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
@@ -352,7 +371,7 @@ function builderFromReq(snap) {
     join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
     distinct() { req.distinct = true; return api; },
     groupBy(cols) { req.group_by = (cols || []).map(String); return api; },
-    having(cond) { req.having = unwrapCond(cond); return api; },
+    having(cond) { req.having = unwrapTree(cond); return api; },
     run() {
       if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
         throw new Error(req.verb + " requires where");
@@ -364,6 +383,8 @@ function builderFromReq(snap) {
     },
     toSQL() { return op_db_query_sql(req); },
     toJSON() { return JSON.parse(JSON.stringify(req)); },
+    // Internal: expose req for subquery/union/cte embedding (not documented API).
+    __req: req,
   };
   return api;
 }
