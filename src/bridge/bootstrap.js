@@ -328,9 +328,9 @@ globalThis.db = globalThis.DB("default");
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})
 //          .orderBy([{field:"id",dir:"desc"}]).limit(10).all()
 function queryBuilder(name, table) {
-  const req = { db: name, table, columns: [], conditions: [], order_by: [], joins: [], limit: null, offset: null };
+  const req = { db: name, table, columns: [], conditions: [], order_by: [], joins: [], limit: null, offset: null, distinct: false };
   const api = {
-    select(cols) { req.columns = (cols || []).map(String); return api; },
+    select(cols) { req.columns = (cols || []).map((c) => (typeof c === "string" ? String(c) : { ...c })); return api; },
     where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
@@ -340,6 +340,7 @@ function queryBuilder(name, table) {
     update(sets) { req.verb = "update"; req.sets = { ...sets }; return api; },
     delete() { req.verb = "delete"; return api; },
     join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
+    distinct() { req.distinct = true; return api; },
     run() {
       if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
         throw new Error(req.verb + " requires where");

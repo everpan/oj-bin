@@ -8,6 +8,7 @@
 //!   - limit 默认 100、硬上限 1000。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -142,6 +143,69 @@ enum Verb {
     Delete,
 }
 
+/// 聚合函数（类型化枚举，非自由字符串——红线）。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AggFn {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// 聚合列参数（deny_unknown_fields 拒绝多余键）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AggSpec {
+    #[serde(rename = "fn")]
+    r#fn: AggFn,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(rename = "as", default)]
+    r#as: Option<String>,
+}
+
+/// select 列：列名（可限定 "t.col"）或聚合 {fn, field?, as?}。
+/// 手写 Deserialize 按值类型分发——untagged 会吞内部错误（{fn:"median"} 只剩
+/// "did not match any variant"，unknown variant 文案不可见）。
+#[derive(Debug, Clone)]
+enum ColSpec {
+    Name(String),
+    Agg(AggSpec),
+}
+
+impl<'de> Deserialize<'de> for ColSpec {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        match Value::deserialize(d)? {
+            Value::String(s) => Ok(ColSpec::Name(s)),
+            v @ Value::Object(_) => serde_json::from_value::<AggSpec>(v)
+                .map(ColSpec::Agg)
+                .map_err(Error::custom),
+            _ => Err(Error::custom(
+                "column must be a string or an aggregate object {fn, field?, as?}",
+            )),
+        }
+    }
+}
+
+/// 别名形状纵深校验（发射只经 Alias::new 引号包裹，正则再挡一层）。
+fn check_alias(a: &str) -> Result<(), JsErrorBox> {
+    let ok = !a.is_empty()
+        && a.bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(JsErrorBox::generic(format!("illegal alias '{a}'")))
+    }
+}
+
 /// 一次查询构建请求（结构化，非 SQL 字符串）。
 #[derive(Debug, Clone, Deserialize)]
 struct QueryReq {
@@ -158,7 +222,9 @@ struct QueryReq {
     #[serde(default)]
     joins: Vec<Join>,
     #[serde(default)]
-    columns: Vec<String>,
+    columns: Vec<ColSpec>,
+    #[serde(default)]
+    distinct: bool,
     #[serde(default)]
     conditions: Vec<CondTree>,
     #[serde(default)]
@@ -374,10 +440,16 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if !req.joins.is_empty() {
                 return reject("insert", "joins");
             }
+            if req.distinct {
+                return reject("insert", "distinct");
+            }
         }
         Verb::Update | Verb::Delete => {
             if !req.joins.is_empty() {
                 return reject("update/delete", "joins");
+            }
+            if req.distinct {
+                return reject("update/delete", "distinct");
             }
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
@@ -509,21 +581,70 @@ fn build_select_body(
     dialect: Dialect,
 ) -> Result<(String, Vec<Value>), JsErrorBox> {
     let mut q = Query::select();
+    // 聚合别名台账（alias → 原表达式），having 展开用（Task 11）。
+    let mut agg_aliases: HashMap<String, SimpleExpr> = HashMap::new();
     if req.columns.is_empty() {
-        let cols: Vec<Alias> = ctx
-            .base
-            .columns
-            .keys()
-            .map(|c| Alias::new(c.clone()))
-            .collect();
-        q.columns(cols);
+        // 全列；带 join 时全部限定为基表列（两表同名列如 id 歧义）。
+        let cols: Vec<SimpleExpr> = if req.joins.is_empty() {
+            ctx.base
+                .columns
+                .keys()
+                .map(|c| col_simple_expr(c))
+                .collect()
+        } else {
+            ctx.base
+                .columns
+                .keys()
+                .map(|c| col_simple_expr(&format!("{}.{c}", req.table)))
+                .collect()
+        };
+        q.exprs(cols);
     } else {
         // site 复刻既有报错文案形态 `unknown column '<c>' on '<table>'`（既有测试锁定）。
         let site = format!("on '{}'", req.table);
-        for c in &req.columns {
-            ctx.check_col(c, &site)?;
+        for spec in &req.columns {
+            match spec {
+                ColSpec::Name(c) => {
+                    ctx.check_col(c, &site)?;
+                    q.expr(col_simple_expr(c));
+                }
+                ColSpec::Agg(a) => {
+                    let AggSpec { r#fn, field, r#as } = a;
+                    let arg: SimpleExpr = match (r#fn, field.as_deref()) {
+                        (AggFn::Count, None) | (AggFn::Count, Some("*")) => {
+                            Expr::col(sea_query::Asterisk)
+                        }
+                        (_, None) => {
+                            return Err(JsErrorBox::generic(
+                                "aggregate needs field (only count allows omission)",
+                            ));
+                        }
+                        (_, Some(f)) => {
+                            ctx.check_col(f, &site)?;
+                            col_simple_expr(f)
+                        }
+                    };
+                    let e: SimpleExpr = match r#fn {
+                        AggFn::Count => sea_query::Func::count(arg),
+                        AggFn::Sum => sea_query::Func::sum(arg),
+                        AggFn::Avg => sea_query::Func::avg(arg),
+                        AggFn::Min => sea_query::Func::min(arg),
+                        AggFn::Max => sea_query::Func::max(arg),
+                    }
+                    .into();
+                    if let Some(a) = r#as {
+                        check_alias(a)?;
+                        agg_aliases.insert(a.clone(), e.clone());
+                        q.expr_as(e, Alias::new(a));
+                    } else {
+                        q.expr(e);
+                    }
+                }
+            }
         }
-        q.exprs(req.columns.iter().map(|c| col_simple_expr(c)));
+    }
+    if req.distinct {
+        q.distinct();
     }
     q.from(Alias::new(&req.table));
     for j in &req.joins {
@@ -1206,5 +1327,41 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(v["msg"].as_str().unwrap().contains("requires where"), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aggregate_columns_alias_and_distinct() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"Promise.all([
+                     db.table("t").select([{fn:"count",as:"n"}]).all(),
+                     db.table("t").select([{fn:"sum",field:"age",as:"total"}]).all(),
+                     db.table("t").select(["tag"]).distinct().all(),
+                   ]).then(([c, s, d]) => json.ok({ n: c[0].n, total: s[0].total, d: d.length }))
+                     .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 4, "{v}");
+        assert_eq!(v["data"]["total"], 100, "{v}"); // 10+20+30+40
+        assert_eq!(v["data"]["d"], 3, "{v}"); // x, y, NULL
+        // 非法别名 / 未知 fn / sum 缺 field
+        for (sel, want) in [
+            (r#"[{fn:"count",as:"1bad"}]"#, "illegal alias"),
+            (r#"[{fn:"median",field:"age"}]"#, "unknown variant"),
+            (r#"[{fn:"sum"}]"#, "aggregate needs field"),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"db.table("t").select({sel}).all().then(()=>json.ok({{}})).catch(e=>json.fail(400,String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
     }
 }
