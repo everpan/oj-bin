@@ -299,6 +299,8 @@ globalThis.DB = function (name) {
       exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
+      // rebuild a builder from a toJSON() snapshot (continues the chain on this db).
+      fromJSON: (snap) => builderFromReq(snap),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.
@@ -310,6 +312,7 @@ globalThis.DB = function (name) {
             query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
             exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
             table: (t) => queryBuilder(name, String(t)),
+            fromJSON: (snap) => builderFromReq(snap),
           });
           await op_db_tx_commit(name);
           return out;
@@ -327,8 +330,15 @@ globalThis.db = globalThis.DB("default");
 // ----- safe query builder (fluent, structured) -----
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})
 //          .orderBy([{field:"id",dir:"desc"}]).limit(10).all()
-function queryBuilder(name, table) {
-  const req = { db: name, table, columns: [], conditions: [], group_by: [], having: null, order_by: [], joins: [], limit: null, offset: null, distinct: false };
+// builderFromReq(snap) rebuilds a builder from a plain req snapshot (see db.fromJSON);
+// snapshots are opaque req objects: identity/db binding is re-pointed at the restoring
+// module's bound db (snapshot `db` is only the JS-visible name it was created with).
+function builderFromReq(snap) {
+  const req = Object.assign(
+    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false },
+    snap,
+  );
+  req.db = String(req.db); req.table = String(req.table);
   const api = {
     select(cols) { req.columns = (cols || []).map((c) => (typeof c === "string" ? String(c) : { ...c })); return api; },
     where(cond) { req.conditions.push(unwrapCond(cond)); return api; },
@@ -353,8 +363,12 @@ function queryBuilder(name, table) {
       return op_db_query_build(req);
     },
     toSQL() { return op_db_query_sql(req); },
+    toJSON() { return JSON.parse(JSON.stringify(req)); },
   };
   return api;
+}
+function queryBuilder(name, table) {
+  return builderFromReq({ db: name, table });
 }
 
 // ----- finish: mark session done -----

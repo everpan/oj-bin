@@ -1491,4 +1491,38 @@ mod tests {
             "{sql}"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn to_json_from_json_roundtrip() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"(async () => {
+                   const c = db.and({field:"age",op:"gte",value:18});
+                   const q = db.table("t").select(["name"]).where(c).limit(10);
+                   const snap = q.toJSON();
+                   snap.limit = 1;
+                   const via = await db.fromJSON(snap).all();
+                   const direct = await db.table("t").select(["name"]).where(c).limit(1).all();
+                   json.ok({ same: via.length === direct.length && via[0].name === direct[0].name,
+                             plain: typeof snap.conditions[0].and !== "undefined" });
+                 })().catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["same"], true, "{v}");
+        assert_eq!(v["data"]["plain"], true, "{v}"); // 条件对象已解包为纯 JSON
+        // fromJSON 非法树被拒（同手写非法树：delete 无 where → JS 链层同步早抛，须 async 包裹）
+        let cap = b
+            .run(
+                r#"(async () => db.fromJSON({table:"t",verb:"delete"}).run())()
+                   .then(()=>json.ok({})).catch(e=>json.fail(400,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["msg"].as_str().unwrap().contains("requires where"), "{v}");
+    }
 }
