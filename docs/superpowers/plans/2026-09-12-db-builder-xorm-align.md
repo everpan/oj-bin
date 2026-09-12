@@ -649,7 +649,7 @@ unix@vip.qq.com ai"
   - delete：必须 where 非空（`update/delete requires where`）；拒 limit/offset
   - （空 and/or 组已在 Deserialize 拒 ⇒ conditions 非空即叶子 ≥ 1）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[test]
@@ -672,12 +672,12 @@ fn verb_matrix_enforced_op_side() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release verb_matrix 2>&1 | tail -3`
 Expected: FAIL（编译错误：validate_verb/verb 未定义）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// 查询动词（serde default = select，旧线格式零迁移）。
@@ -756,12 +756,12 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
 
 （`build_statement` 首行插入 `validate_verb(req)?;`。）
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归**
+- [x] **Step 4: 跑测试确认通过 + 旧回归**
 
 Run: `cargo test --release query:: 2>&1 | tail -3`
 Expected: 全 PASS（verb 缺省 select，旧测试零迁移）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -783,7 +783,7 @@ unix@vip.qq.com ai"
   - JS：`.insert(objOrRows)` / `.update(sets)` / `.delete()` 返回 api；`.run()` 终执行（DML）；`.all()` 不变
   - DML 同走 `resolve_target`（本库 tx → `session.exec`，他库 tx → Err）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -837,12 +837,12 @@ async fn dml_rejects_bad_shapes() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release dml_ 2>&1 | tail -3`
 Expected: FAIL（`.insert is not a function` 等）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `build_statement` 动词分发（select 段保持，新增三分支；白名单键校验 + 键集一致 + `values()` Result，禁 `values_panic`）：
 
@@ -998,12 +998,12 @@ pub async fn op_db_query_build(
     },
 ```
 
-- [ ] **Step 4: 跑测试确认通过 + 全量回归**
+- [x] **Step 4: 跑测试确认通过 + 全量回归**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo test --release 2>&1 | tail -3`
 Expected: 全 PASS（含旧 select 链路、`dml_` 两测试）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -1014,7 +1014,7 @@ unix@vip.qq.com ai"
 
 ### Phase 4 收尾：更新与总结
 
-- [ ] 勾掉 Phase 4 checkbox；`git log --oneline -2` 核对；总结「DML 落地，op 返回形态已换 Result<Value>，DML 进 tx」。
+- [x] 勾掉 Phase 4 checkbox；`git log --oneline -2` 核对；总结「DML 落地，op 返回形态已换 Result<Value>，DML 进 tx」。
 
 ---
 
@@ -1033,7 +1033,7 @@ unix@vip.qq.com ai"
   - `fn col_simple_expr(col: &str) -> SimpleExpr`（qualified → `Expr::col((Alias, Alias))`）
   - 规则：`"t.col"` → 表段 ∈ {基表} ∪ {join 表}，列段对该表校验；非限定 → 仅基表（join 存在时拒绝命中 join 表——非限定根本不查 join 表，天然拒绝歧义）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[test]
@@ -1055,12 +1055,12 @@ fn col_ctx_qualified_and_unqualified_rules() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release col_ctx 2>&1 | tail -3`
 Expected: FAIL（ColCtx 未定义）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// 限定列解析（select/where/orderBy/groupBy/having/join on 六处共用）。
@@ -1153,14 +1153,14 @@ fn apply_op<T: sea_query::ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Resul
 或 `q.column(col_ref)`——qualified 时用元组）。`ExprTrait` 需 `use sea_query::ExprTrait`（已存在）。
 `Expr::col(Alias).eq(...)` 旧调用点替换为 `apply_op(col_simple_expr(...), ...)`。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归**
+- [x] **Step 4: 跑测试确认通过 + 旧回归**
 
 Run: `cargo test --release query:: 2>&1 | tail -3`
 Expected: 全 PASS（旧单层条件/排序/未知列报错文案保持——既有测试 `unknown column 'nope' in where` 仍过，site 参数用 "where"）。
 
 注意：既有 `unknown_column_in_select_and_where_errors` 断言文案 `unknown column 'nope' on 't'`——select 段改 ColCtx 后 site 用 `format!("on '{}'", req.table)` 或保留旧文案，以既有测试不改为准（site = `"on 't'"` 形态可由调用点拼）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -1183,7 +1183,7 @@ unix@vip.qq.com ai"
   - 矩阵扩展：insert/update/delete 拒 joins
   - guard_req 扩展：每个 join 表过 `check_table`
 
-- [ ] **Step 1: 写失败测试（两表夹具）**
+- [x] **Step 1: 写失败测试（两表夹具）**
 
 `seeded_bridge` 旁加：
 
@@ -1240,12 +1240,12 @@ async fn join_inner_left_and_rejections() {
     assert!(bad(r#"{"table":"t","verb":"insert","values":[{"a":1}],"joins":[{"table":"b","on":[{"left":"a.id","right":"b.aid"}]}]}"#).to_string().contains("insert does not accept joins"));
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release join_ 2>&1 | tail -3`
 Expected: FAIL（`.join is not a function`）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// join 种类（right 不做：sqlite 旧版本不支持且无用例）。
@@ -1342,12 +1342,12 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
 
 req 初始值加 `joins: []`。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -1358,7 +1358,7 @@ unix@vip.qq.com ai"
 
 ### Phase 5 收尾：更新与总结
 
-- [ ] 勾掉 Phase 5 checkbox；`git log --oneline -2` 核对；总结「join 落地，限定列六处统一走 ColCtx」。
+- [x] 勾掉 Phase 5 checkbox；`git log --oneline -2` 核对；总结「join 落地，限定列六处统一走 ColCtx」。
 
 ---
 
@@ -1380,7 +1380,7 @@ unix@vip.qq.com ai"
   - 矩阵扩展：insert/update/delete 拒 distinct
   - 别名台账：`build_statement` 收集 `HashMap<String, SimpleExpr>`（alias → 聚合表达式），Task 11 having 用
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -1417,12 +1417,12 @@ async fn aggregate_columns_alias_and_distinct() {
 
 （未知 fn 的 serde 文案是 "unknown variant"；若 op2 包装吃掉前缀，断言放宽为含 `median` 字样。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release aggregate_ 2>&1 | tail -3`
 Expected: FAIL（distinct/聚合列不支持）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// 聚合函数（类型化枚举，非自由字符串——红线）。
@@ -1530,12 +1530,12 @@ fn check_alias(a: &str) -> Result<(), JsErrorBox> {
 
 注意：`Func::count(arg)` 返回 `FunctionCall`，`.into()` 转 SimpleExpr（`From<FunctionCall> for SimpleExpr` 存在；若类型不匹配用 `SimpleExpr::FunctionCall(fc)`）。`q.expr(...)`/`q.exprs(...)` 接受 `Into<SimpleExpr>`。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归**
+- [x] **Step 4: 跑测试确认通过 + 旧回归**
 
 Run: `cargo test --release query:: 2>&1 | tail -3`
 Expected: 全 PASS（旧 `select(["name"])` 字符串列兼容——untagged String 变体）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -1558,7 +1558,7 @@ unix@vip.qq.com ai"
   - JS `.groupBy(cols)` / `.having(cond)`（接受条件对象）
   - 矩阵扩展：insert/update/delete 拒 groupBy/having
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -1603,12 +1603,12 @@ async fn group_by_having_with_alias_expansion() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release group_by_having 2>&1 | tail -3`
 Expected: FAIL（`.groupBy is not a function`）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `QueryReq` 增 `#[serde(default)] group_by: Vec<String>`、`#[serde(default)] having: Option<CondTree>`。
 
@@ -1686,12 +1686,12 @@ select 分支末尾（order_by 之前）：
     having(cond) { req.having = unwrapCond(cond); return api; },
 ```
 
-- [ ] **Step 4: 跑测试确认通过 + 全量回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 全量回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS（含 PG 方言别名展开断言），clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -1702,7 +1702,7 @@ unix@vip.qq.com ai"
 
 ### Phase 6 收尾：更新与总结
 
-- [ ] 勾掉 Phase 6 checkbox；`git log --oneline -2` 核对；总结「聚合/分组/having 落地，别名展开消灭方言分叉」。
+- [x] 勾掉 Phase 6 checkbox；`git log --oneline -2` 核对；总结「聚合/分组/having 落地，别名展开消灭方言分叉」。
 
 ---
 
@@ -1720,7 +1720,7 @@ unix@vip.qq.com ai"
   - `db.fromJSON(snap)` → 按 snap 内 `db`/`table` 复原 builder，可继续链/执行
   - 已知语义（文档级）：快照 `db` 是 JS 可见名，复原时按**复原方**模块 bound_db 重定向
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -1751,12 +1751,12 @@ async fn to_json_from_json_roundtrip() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release to_json_from_json 2>&1 | tail -3`
 Expected: FAIL（`.toJSON is not a function`）。
 
-- [ ] **Step 3: 最小实现（bootstrap.js）**
+- [x] **Step 3: 最小实现（bootstrap.js）**
 
 `queryBuilder` 重构：
 
@@ -1782,12 +1782,12 @@ DB 缓存对象与 tx 回调对象各加：
       fromJSON: (snap) => builderFromReq(snap),
 ```
 
-- [ ] **Step 4: 跑测试确认通过 + 全量回归**
+- [x] **Step 4: 跑测试确认通过 + 全量回归**
 
 Run: `cargo test --release 2>&1 | tail -3 && LC_ALL=C grep -P '[^\x00-\x7F]' src/bridge/bootstrap.js; echo ASCII-OK`
 Expected: 全 PASS；ASCII 无输出。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/bootstrap.js src/bridge/query.rs
@@ -1806,7 +1806,7 @@ unix@vip.qq.com ai"
 - Consumes: 全链路（HTTP → 路由 → bridge → query.rs）。
 - Produces: e2e 用例 `e2e_query_builder_join_and_insert`。
 
-- [ ] **Step 1: 写失败/新用例**
+- [x] **Step 1: 写失败/新用例**
 
 `oj/tests/e2e.rs` 追加（fixture 写法照搬既有用例的 tmpdir/config/start 段，替换模块内容）：
 
@@ -1828,12 +1828,12 @@ async fn e2e_query_builder_join_and_insert() {
 `db` 用 `sqlite://` 临时文件 DSN 并先经 `db.exec` 建表插种子，或借 module seed.sql 机制——
 参照 `server_cmd.rs` 测试 `module_seeds_replayed_and_served` 的 seed.sql 形态。）
 
-- [ ] **Step 2: 跑通**
+- [x] **Step 2: 跑通**
 
 Run: `cargo test --release -p oj --test e2e e2e_query_builder 2>&1 | tail -3`
 Expected: PASS。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add oj/tests/e2e.rs
@@ -1854,7 +1854,7 @@ unix@vip.qq.com ai"
 
 （版本 bump 不在本任务——Phase 8 追加后统一由 Task 19 收口。）
 
-- [ ] **Step 1: 文档更新**
+- [x] **Step 1: 文档更新**
 
 api-manual.md 的 `db.table` 行扩为新子节（同文件既有格式），含 spec「JS API」节的全部示例
 （DML 示例以 `.run()` 收尾）+ 条件对象用法（含多租户守卫 `has("tenant_id")` 示例）+
@@ -1869,7 +1869,7 @@ db.table("user").update({age:2}).where({field:"id",op:"eq",value:1}).run();
 db.table("user").delete().where({field:"id",op:"in",value:[1,2]}).run();
 ```
 
-- [ ] **Step 2: 全量门禁**
+- [x] **Step 2: 全量门禁**
 
 Run:
 ```bash
@@ -1881,7 +1881,7 @@ cargo xtask smoke --bin bin/oj 2>&1 | tail -2
 ```
 Expected: fmt/clippy 干净，workspace 测试全绿，构建归置 bin/，smoke 过。
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/devkit/api-manual.md docs/superpowers/specs/2026-09-12-db-builder-xorm-align-design.md
@@ -1892,7 +1892,7 @@ unix@vip.qq.com ai"
 
 ### Phase 7 收尾：更新与总结
 
-- [ ] 勾掉 Phase 1-7 checkbox；`git log --oneline` 核对；总结 Phase 1-7 落地内容。
+- [x] 勾掉 Phase 1-7 checkbox；`git log --oneline` 核对；总结 Phase 1-7 落地内容。
 
 ---
 
