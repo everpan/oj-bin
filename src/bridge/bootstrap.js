@@ -23,6 +23,7 @@ import {
   op_db_has,
   op_db_query,
   op_db_query_build,
+  op_db_query_sql,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -302,6 +303,7 @@ function queryBuilder(name, table) {
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
     all() { return op_db_query_build(req); },
+    toSQL() { return op_db_query_sql(req); },
   };
   return api;
 }

@@ -242,6 +242,20 @@ pub async fn op_db_query_build(
     }
 }
 
+/// toSQL：与执行完全相同的两段（guard_req + build_statement），只构造不执行；
+/// 不做 tx 路由、不受活跃 tx 影响。同步 op（全程 OpState 同步借用，无 await）。
+#[op2]
+#[serde]
+pub fn op_db_query_sql(
+    state: Rc<RefCell<OpState>>,
+    #[serde] req: QueryReq,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let reg = registry(&state)?;
+    guard_req(&state, &req)?;
+    let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
+    Ok(serde_json::json!({ "sql": sql, "params": params }))
+}
+
 /// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。
 fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, sea_query::Values) {
     match d {
@@ -433,6 +447,23 @@ mod tests {
         assert_eq!(v["code"], 0, "{v}");
         // 降序 40,30,20,10 → offset 1 limit 2 → 30,20
         assert_eq!(v["data"]["ages"], json!([30, 20]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn to_sql_returns_dialect_sql_and_params_without_executing() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"const s = db.table("t").select(["name"]).where({field:"age",op:"gte",value:18}).toSQL();
+                   db.query(s.sql, s.params).then(rows => json.ok({ sql: s.sql, n: rows.length }))
+                     .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["sql"].as_str().unwrap().contains('?'), "{v}"); // sqlite placeholder
+        assert_eq!(v["data"]["n"], 3); // age>=18 -> 3 rows (20,30,40)
     }
 
     #[tokio::test(flavor = "current_thread")]

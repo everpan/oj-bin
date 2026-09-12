@@ -226,6 +226,7 @@ deno_core::extension!(
         db::op_db_tx_commit,
         db::op_db_tx_rollback,
         query::op_db_query_build,
+        query::op_db_query_sql,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,
