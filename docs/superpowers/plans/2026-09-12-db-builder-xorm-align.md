@@ -1927,7 +1927,7 @@ unix@vip.qq.com ai"
   - cond_expr 系列签名增 `reg: &SchemaRegistry, depth: u8`（Task 11 的 having 变体同步）
   - JS：builder api 挂 `__req`（内部字段）；`unwrapSub(v)` 取 builder 快照
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 夹具用 Task 9 的 `seeded_bridge_2t`（a: id/name；b: id/aid/label）：
 
@@ -2000,12 +2000,12 @@ async fn subquery_rejections() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release subquery_ 2>&1 | tail -3`
 Expected: FAIL（`subquery` 未知键 / exists 不识别 / `__req` undefined）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 const REQ_NEST_MAX: u8 = 4;
@@ -2125,12 +2125,12 @@ CondTree::Exists(sub) => {
 where/having 的入参统一过 `unwrapTree`（条件对象 `.tree()` 路径不变——condObj 的
 tree 已是纯 JSON；where 接收到的普通对象里可能嵌 builder）。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -2153,7 +2153,7 @@ unix@vip.qq.com ai"
   - `QueryReq.unions: Vec<UnionArm>`（serde default）
   - JS `.union(otherBuilder, kind?)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -2206,12 +2206,12 @@ async fn union_rejections() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release union_ 2>&1 | tail -3`
 Expected: FAIL（`.union is not a function`）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
@@ -2282,12 +2282,12 @@ struct UnionArm {
 
 req 初始值加 `unions: []`。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -2314,7 +2314,7 @@ unix@vip.qq.com ai"
     partition_by:[String] 默认 [], order_by:[OrderBy] 默认 []}, as:String}`
   - case/window 别名**不进** agg_aliases；having/groupBy 引用 → Err
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -2375,12 +2375,12 @@ async fn case_window_rejections() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release case_ 2>&1 | tail -3; cargo test --release window 2>&1 | tail -3`
 Expected: FAIL（列对象不识别 → untagged 落 String 变体报 unknown column）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// case 列（searched case only；then/else 只允许 JSON 值，走绑定参数）。
@@ -2474,12 +2474,12 @@ having 别名展开查不到 → 自然落 `unknown column`。）
 
 `bootstrap.js` 零改动（columns 数组元素本就透传对象）。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs
@@ -2504,7 +2504,7 @@ unix@vip.qq.com ai"
   - ColCtx 扩 `ctes: Vec<(&str, &[String])>`；限定列解析顺序：基表 → join 表 → CTE 名
   - JS `.with(name, columns, builder)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[tokio::test(flavor = "current_thread")]
@@ -2556,12 +2556,12 @@ async fn cte_rejections() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test --release cte_ 2>&1 | tail -3`
 Expected: FAIL（`.with is not a function`）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// CTE（非递归；columns 必填——CTE 输出列即后续解析的白名单）。
@@ -2662,12 +2662,12 @@ enum TopSelect {
 
 req 初始值加 `with: []`。
 
-- [ ] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
+- [x] **Step 4: 跑测试确认通过 + 旧回归 + clippy**
 
 Run: `cargo test --release query:: 2>&1 | tail -3 && cargo clippy --release --all-targets -- -D warnings 2>&1 | tail -2`
 Expected: 全 PASS，clippy 零警告。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/bridge/query.rs src/bridge/bootstrap.js
@@ -2684,17 +2684,17 @@ unix@vip.qq.com ai"
   嵌套禁 with/unions、嵌套必须 select）
 - Modify: `oj/Cargo.toml`（version 0.1.13 → 0.1.14）
 
-- [ ] **Step 1: 文档更新**
+- [x] **Step 1: 文档更新**
 
 api-manual.md `db.table` 子节（Task 14 已扩）末尾追加 Phase 8 五块：示例用 spec
 「追加：Phase 8」节的 JSON 形态（链式示例以 bootstrap.js 实有方法为准：`.union()`/
 `.with()`/columns 对象元素/where 子查询）。
 
-- [ ] **Step 2: 版本 bump**
+- [x] **Step 2: 版本 bump**
 
 `oj/Cargo.toml`：`version = "0.1.13"` → `version = "0.1.14"`。
 
-- [ ] **Step 3: 全量门禁**
+- [x] **Step 3: 全量门禁**
 
 Run:
 ```bash
@@ -2707,7 +2707,7 @@ LC_ALL=C grep -P '[^\x00-\x7F]' src/bridge/bootstrap.js
 ```
 Expected: fmt/clippy 干净，workspace 测试全绿，构建归置 bin/，smoke 过，ASCII grep 无输出。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/devkit/api-manual.md oj/Cargo.toml Cargo.lock
@@ -2718,11 +2718,11 @@ unix@vip.qq.com ai"
 
 ### Phase 8 收尾：更新与总结
 
-- [ ] 勾掉 Phase 8 checkbox；`git log --oneline` 核对；总结「sea-query 开放能力以安全 DSL
+- [x] 勾掉 Phase 8 checkbox；`git log --oneline` 核对；总结「sea-query 开放能力以安全 DSL
   暴露完毕，v0.1.14 收口」。
 
 ---
 
 ## 全部阶段完成后：统一审查
 
-- [ ] 派发统一审查（对照 spec 逐节核对实现 + 红线复核 + 测试覆盖核对），按审查意见修复后收尾。
+- [x] 派发统一审查（对照 spec 逐节核对实现 + 红线复核 + 测试覆盖核对），按审查意见修复后收尾。
