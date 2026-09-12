@@ -3347,6 +3347,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "11.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.2.17",
+ "js-sys",
+ "pem",
+ "serde",
+ "serde_json",
+ "signature",
+ "simple_asn1",
+ "zeroize",
+]
+
+[[package]]
 name = "junction"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3906,7 +3923,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "flate2",
- "jsonwebtoken",
+ "jsonwebtoken 11.0.0",
  "libc",
  "oj-plugin-ffi",
  "only-js",
@@ -3931,7 +3948,7 @@ dependencies = [
 name = "oj-auth"
 version = "0.1.0"
 dependencies = [
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "oj-plugin-ffi",
  "serde",
  "serde_json",
@@ -4100,7 +4117,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "httptest",
- "jsonwebtoken",
+ "jsonwebtoken 9.3.1",
  "libloading 0.9.0",
  "notify",
  "object_store 0.14.1",
@@ -8050,6 +8067,20 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"

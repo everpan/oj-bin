@@ -41,8 +41,8 @@ libc = "0.2"
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
-# 正向用例签发测试 JWT，验证 oj-auth 守卫验签链路（与根 crate/插件同为 9，依赖树单版本）。
-jsonwebtoken = "9"
+# 正向用例签发测试 JWT，验证 oj-auth 守卫验签链路（oj 用 11.0.0；oj-auth 与根测试仍 9.3.1，树内双版本）。
+jsonwebtoken = "11.0.0"
 # OIDC e2e：现场生成 RS256 测试密钥（与根 crate 同 0.9，pem 导出 PKCS#8，依赖树单版本）。
 rsa = { version = "0.9", features = ["pem"] }
 # 测试装配需要生成真实签名 JWS 证书（证书必配、无逃生口后，测试必须自带有效证书）。
