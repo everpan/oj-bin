@@ -779,7 +779,8 @@ fn apply_tenant(
         return Ok(());
     }
     let cte_name = |n: &str| req.with.iter().any(|c| c.name == n);
-    let scoped = |name: &str| !cte_name(name) && reg.get(name).is_some_and(|t| t.is_tenant_scoped());
+    let scoped =
+        |name: &str| !cte_name(name) && reg.get(name).is_some_and(|t| t.is_tenant_scoped());
     // 本层受约束表（基表 + join 表；用于 tid=None 判定与写侧校验）。
     let mut touched = vec![];
     if scoped(&req.table) {
@@ -831,14 +832,14 @@ fn apply_tenant(
         }
         // update 写侧逃逸：sets 显式 tenant_id 必须等于当前租户（比 insert 更隐蔽，
         // update({tenant_id:"victim"}) 会把本租户行迁移到他租户）。
-        if req.verb == Verb::Update && scoped(&req.table) {
-            if let Some(v) = req.sets.get("tenant_id") {
-                if tid.is_none() || v.as_str() != tid {
-                    return Err(JsErrorBox::generic(format!(
-                        "tenant guard: update sets.tenant_id not allowed (got {v})"
-                    )));
-                }
-            }
+        if req.verb == Verb::Update
+            && scoped(&req.table)
+            && let Some(v) = req.sets.get("tenant_id")
+            && (tid.is_none() || v.as_str() != tid)
+        {
+            return Err(JsErrorBox::generic(format!(
+                "tenant guard: update sets.tenant_id not allowed (got {v})"
+            )));
         }
         // join 表：tenant 条件进 ON 子句（Join.tenant_id，build_select_stmt 消费）。
         if let Some(tid) = tid {
@@ -2692,9 +2693,15 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "{v}");
         assert_eq!(v["data"]["names"], json!(["a1", "a2"]), "{v}");
-        assert!(v["data"]["sql"].as_str().unwrap().contains("tenant_id"), "{v}");
         assert!(
-            v["data"]["params"].as_array().unwrap().contains(&json!("t1")),
+            v["data"]["sql"].as_str().unwrap().contains("tenant_id"),
+            "{v}"
+        );
+        assert!(
+            v["data"]["params"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("t1")),
             "{v}"
         );
     }
@@ -2724,7 +2731,11 @@ mod tests {
             .await
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
-        assert_eq!((&v["data"]["n"], &v["data"]["tid"]), (&json!(1), &json!("t1")), "{v}");
+        assert_eq!(
+            (&v["data"]["n"], &v["data"]["tid"]),
+            (&json!(1), &json!("t1")),
+            "{v}"
+        );
         // 显式不符 → 报错
         let cap = b
             .run_with(
@@ -2769,7 +2780,10 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400, "{v}");
         assert!(
-            v["msg"].as_str().unwrap().contains("sets.tenant_id not allowed"),
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("sets.tenant_id not allowed"),
             "{v}"
         );
     }
@@ -2860,7 +2874,13 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400, "{v}");
-        assert!(v["msg"].as_str().unwrap().contains("require tenant context"), "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("require tenant context"),
+            "{v}"
+        );
         // asSystem → 放行（看到全部 3 行）
         let cap = b
             .run(

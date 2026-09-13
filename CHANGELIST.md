@@ -2,6 +2,23 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.15（2026-09-13）
+
+**CI**
+- `ci(release)`：新增 `guard` 去重 job——`gh release create` 会把刚建的 tag 推回远端再次命中
+  `push: tags` 触发整条流水线重跑（并自动把草稿转正），浪费三平台构建/测试资源。`guard` 在
+  tag push 且对应 release 已存在时（即「自己推的 tag」）输出 `skip=true`，`lint`/`package` 加
+  `needs: [guard]` + `if: needs.guard.outputs.skip != 'true'`，下游 `publish`/`publish-npm`/
+  `smoke-npm` 级联跳过；真实 tag 推送与人工核对后重发仍走全量。
+
+**文档 / 杂项**
+- db：文档与 sample 全面改写为 `db.table(...)` 构造器语法，替代原生 `db.query` 参数化查询——
+  `docs/`（db-guide / user-manual / dev-guide / bridge / testing / cli2 / route-params-design
+  / devkit SKILL & api-manual / superpowers plans & specs / MODULES）+ `sample/src/**/api.ts`
+  （account / item / profile / order-{account,detail,list} / auth-{login,refresh} / idp/login /
+  oidc/callback / cert/* / admin/*）。构造器不支持的列别名 / `RETURNING id` /
+  `last_insert_rowid` / 动态列清单 / join 别名等场景保留原生查询（注释标明）。
+
 ## v0.1.14（2026-09-12）
 
 **特性**
