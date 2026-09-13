@@ -2,10 +2,11 @@ import { positiveId, requireRole } from "../_shared/validate";
 
 function get(): void {
   const id = Number(http.param("id", 0));
-  const rows = id > 0
-    ? db.query("select id, name, role from account where id = ?", [id])
-    : db.query("select id, name, role from account", []);
-  rows.then((r) => json.ok(r)).catch((e) => json.fail(500, String(e)));
+  const q = db.table("account").select(["id", "name", "role"]);
+  (id > 0 ? q.where({ field: "id", op: "eq", value: id }) : q)
+    .all()
+    .then((r) => json.ok(r))
+    .catch((e) => json.fail(500, String(e)));
 }
 
 function post(): void {
@@ -13,7 +14,8 @@ function post(): void {
   if (!b.name) { json.fail(400, "name required"); return; }
   const role = (() => { try { return requireRole(b.role ?? "user"); } catch (e) { return ""; } })();
   if (!role) { json.fail(400, "role must be admin|user"); return; }
-  db.exec("insert into account (name, role) values (?, ?)", [b.name, role])
+  db.table("account").insert({ name: b.name, role })
+    .run()
     .then(() => json.ok({ created: true }))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -22,14 +24,16 @@ function put(): void {
   const b = http.body as { id?: number; name?: string };
   const id = (() => { try { return positiveId(b.id); } catch { return 0; } })();
   if (!id || !b.name) { json.fail(400, "id and name required"); return; }
-  db.exec("update account set name = ? where id = ?", [b.name, id])
+  db.table("account").update({ name: b.name }).where({ field: "id", op: "eq", value: id })
+    .run()
     .then(() => json.ok({ updated: true }))
     .catch((e) => json.fail(500, String(e)));
 }
 
 function del(): void {
   const id = positiveId(http.param("id", 0));
-  db.exec("delete from account where id = ?", [id])
+  db.table("account").delete().where({ field: "id", op: "eq", value: id })
+    .run()
     .then(() => json.ok({ deleted: true }))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -37,7 +41,8 @@ function del(): void {
 function patch(): void {
   const b = http.body as { id?: number; role?: string };
   const role = requireRole(b.role);
-  db.exec("update account set role = ? where id = ?", [role, positiveId(b.id)])
+  db.table("account").update({ role }).where({ field: "id", op: "eq", value: positiveId(b.id) })
+    .run()
     .then(() => json.ok({ patched: true }))
     .catch((e) => json.fail(500, String(e)));
 }

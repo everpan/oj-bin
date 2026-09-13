@@ -31,11 +31,45 @@ permissions:
   contents: write
 
 jobs:
+  # 去重闸：gh release create 会把刚建的 tag 推回远端，再次命中 push: tags 触发整条
+  # 流水线（并自动把草稿转正），造成一次毫无意义的全量重跑。本 job 在 tag push 且
+  # 对应 release 已存在时（即「自己推的 tag」）输出 skip=true，让重型 job 直接跳过。
+  guard:
+    name: release guard (dedupe tag-push re-trigger)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      skip: ${{ steps.meta.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="v${cargo_version}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # 自己推的 tag → 对应 release 已存在 → 跳过重型构建/测试。
+          if [ "${{ github.event_name }}" = "push" ] && gh release view "$tag" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # 格式与 lint 门禁（CLAUDE.md：CI 使用 -D warnings）。平台无关，单实例跑一次即可，
   # 不放进三平台矩阵重复执行。
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    needs: [guard]
+    if: needs.guard.outputs.skip != 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +93,8 @@ jobs:
           bash scripts/npm-publish.test.sh
 
   package:
-    needs: [lint]
+    needs: [guard, lint]
+    if: needs.guard.outputs.skip != 'true'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:

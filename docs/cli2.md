@@ -64,7 +64,7 @@
   ```ts
     import 'xxx/xxxxx/xx' // 导入需要模块
     function get(){
-        let r = db.query("select * from user where id = ?", http.param("id",0))
+        let r = db.table("user").where({ field: "id", op: "eq", value: http.param("id", 0) }).all()
         json.ok(r)
     }
     function post(){}

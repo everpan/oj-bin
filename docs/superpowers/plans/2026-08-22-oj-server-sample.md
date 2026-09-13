@@ -1685,7 +1685,7 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
         // 直接打一个临时 api.ts 验证全链路。
         std::fs::create_dir_all(t.join("src/u/f")).unwrap();
         std::fs::write(t.join("src/u/f/api.ts"),
-            "export default { get() { db.query(\"select v from t where id = ?\", [1]).then(r => json.ok(r)); } };\n").unwrap();
+            "export default { get() { db.table(\"t\").select([\"v\"]).where({ field: \"id\", op: \"eq\", value: 1 }).all().then(r => json.ok(r)); } };\n").unwrap();
         let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let v: serde_json::Value = resp.json().await.unwrap();
@@ -1931,8 +1931,8 @@ import { positiveId, requireRole } from "../_shared/validate";
 function get(): void {
   const id = Number(http.param("id", 0));
   const rows = id > 0
-    ? db.query("select id, name, role from account where id = ?", [id])
-    : db.query("select id, name, role from account", []);
+    ? db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id }).all()
+    : db.table("account").select(["id", "name", "role"]).all();
   rows.then((r) => json.ok(r)).catch((e) => json.fail(500, String(e)));
 }
 
@@ -1984,7 +1984,7 @@ export default { get, post, put, del, patch, head, options };
 ```ts
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id }).all()
     .then((r) => json.ok(r[0] ?? null))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -2035,7 +2035,7 @@ function post(): void {
 
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, no, account_id, amount from orders where account_id = ?", [id])
+  db.table("orders").select(["id", "no", "account_id", "amount"]).where({ field: "account_id", op: "eq", value: id }).all()
     .then((r) => json.ok(r))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -2048,6 +2048,7 @@ import { requireRole } from "../../user/_shared/validate";
 
 function get(): void {
   const role = requireRole(http.param("role", "admin")); // 跨模块相对导入（UC-13）
+  // 多表 join + 列别名（a.name as account_name）builder 不支持，保留裸 query
   db.query(
     `select o.id, o.no, o.amount, a.name as account_name, a.role
      from orders o join account a on a.id = o.account_id
@@ -2071,7 +2072,7 @@ function get(): void {
       json.ok({ cached: true, data: JSON.parse(hit) });
       return;
     }
-    db.query("select id, no, account_id, amount from orders where id = ?", [Number(id)])
+    db.table("orders").select(["id", "no", "account_id", "amount"]).where({ field: "id", op: "eq", value: Number(id) }).all()
       .then((rows) => {
         const row = rows[0] ?? null;
         kv.set(key(id), JSON.stringify(row)).then(() =>

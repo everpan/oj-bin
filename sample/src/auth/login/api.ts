@@ -3,10 +3,10 @@ import { issueTokens } from "../_shared/session";
 export default {
   async post() {
     const body = http.body || {};
-    const rows = await db.query(
-      "select id, password_hash, roles from users where username = ?",
-      [String(body.username ?? "")],
-    );
+    const rows = await db.table("users")
+      .select(["id", "password_hash", "roles"])
+      .where({ field: "username", op: "eq", value: String(body.username ?? "") })
+      .all();
     const row = rows[0];
     // 用户不存在与密码错同报（不泄露用户存在性）。
     if (!row || !(await bcrypt.verify(String(body.password ?? ""), row.password_hash || ""))) {

@@ -124,7 +124,7 @@ npx vitest run  # 等价于 npm test
 
 - `mocks/oj-globals.ts`：`installGlobals(opts?)` 把运行时注入的 `db/json/http/bus/log` 替换为
   可控桩，返回本次响应捕获 `{ code, msg, data }`；`lastPublished()` 取 `bus.publish` 记录，
-  `lastSqlCalls()` 取 `db.query/exec` 的 SQL + 绑定参数记录（可断言 handler 走了哪个分支）。
+  `lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/构造器）与绑定参数记录（可断言 handler 走了哪个分支）。
 - `invoke.ts`：`invoke(handler, method, opts?)` 装好 mock 全局 → 调用 `handler[method]()` →
   flush 微任务 → 返回 `{ ...capture, published }`。
 - `*.spec.ts`：直接 import 真实 `../src/.../api` 的 handler，调用 `invoke` 并断言。
@@ -147,8 +147,8 @@ describe("user/account (L2 分支 + SQL)", () => {
 });
 ```
 
-> 业务 handler 内部用 `db.query(...).then(json.ok)` 走微任务，故 `invoke` 已 `setTimeout(0)` flush，
-> 断言前响应已落定。
+> 业务 handler 内部用 `db.table(...).all().then(json.ok)` / `db.query(...).then(json.ok)` 走微任务，
+> 故 `invoke` 已 `setTimeout(0)` flush，断言前响应已落定。
 
 ### 适用场景
 

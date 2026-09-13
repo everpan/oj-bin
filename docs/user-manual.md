@@ -341,7 +341,8 @@ import { requireRole } from "../_shared/validate";  // 相对导入
 
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, name from account where id = ?", [id])
+  db.table("account").select(["id", "name"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => json.ok(r))
     .catch((e) => json.fail(500, String(e)));
 }

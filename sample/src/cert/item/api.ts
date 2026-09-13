@@ -6,10 +6,10 @@ async function get(): Promise<void> {
   const id = Number(http.param("id", 0));
   if (!Number.isInteger(id) || id <= 0) { json.fail(400, "id required"); return; }
   try {
-    const rows = await db.query(
-      "select id, name, note, public_pem, private_pem, cert_jws, nbf, exp, created_at, updated_at from certs where id = ?",
-      [id],
-    );
+    const rows = await db.table("certs")
+      .select(["id", "name", "note", "public_pem", "private_pem", "cert_jws", "nbf", "exp", "created_at", "updated_at"])
+      .where({ field: "id", op: "eq", value: id })
+      .all();
     if (!rows.length) { json.fail(404, "cert not found"); return; }
     const r = rows[0];
     json.ok({ ...r, status: statusOf(r.nbf as number, r.exp as number, Math.floor(Date.now() / 1000)) });
@@ -25,11 +25,10 @@ async function patch(): Promise<void> {
   const id = Number(b.id ?? 0);
   if (!Number.isInteger(id) || id <= 0) { json.fail(400, "id required"); return; }
   try {
-    const n = await db.exec("update certs set note = ?, updated_at = ? where id = ?", [
-      String(b.note ?? "").slice(0, 2000),
-      Math.floor(Date.now() / 1000),
-      id,
-    ]);
+    const n = await db.table("certs")
+      .update({ note: String(b.note ?? "").slice(0, 2000), updated_at: Math.floor(Date.now() / 1000) })
+      .where({ field: "id", op: "eq", value: id })
+      .run();
     if (!n) { json.fail(404, "cert not found"); return; }
     json.ok({ updated: true });
   } catch (e) {
@@ -43,7 +42,7 @@ async function del(): Promise<void> {
   const id = Number(http.param("id", 0));
   if (!Number.isInteger(id) || id <= 0) { json.fail(400, "id required"); return; }
   try {
-    const n = await db.exec("delete from certs where id = ?", [id]);
+    const n = await db.table("certs").delete().where({ field: "id", op: "eq", value: id }).run();
     if (!n) { json.fail(404, "cert not found"); return; }
     json.ok({ deleted: true });
   } catch (e) {

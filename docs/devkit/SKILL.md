@@ -23,7 +23,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 ## 红线（不可违反）
 
 - **SQL 注入**：动态标识符（表名/列名）**只**来自 `db.table()` 查询构造器（白名单），
-  绝不来自 JS 字符串拼接；值**只**通过绑定参数（`db.query("... where id = ?", [id])`）。
+  绝不来自 JS 字符串拼接；值**只**通过绑定参数（`db.query("... where id = ?", [id])` 或构造器的 `value`）。
 - **方法名**：DELETE 的方法名是 `del`，不是 `delete`（`get/post/put/del/patch/head/options`）。
 - **信封**：业务响应只经 `json.ok(data)` / `json.fail(code, msg, data?)` 写回，
   HTTP 状态 = `code`（0→200）；标准协议端点（对外契约 JSON）可用 `json.raw(data)`

@@ -3,10 +3,10 @@ import { nowSecs } from "../../auth/_shared/util";
 export default {
   async post() {
     const b = http.body || {};
-    const rows = await db.query(
-      "select id, password_hash from users where username = ?",
-      [String(b.username ?? "")],
-    );
+    const rows = await db.table("users")
+      .select(["id", "password_hash"])
+      .where({ field: "username", op: "eq", value: String(b.username ?? "") })
+      .all();
     const row = rows[0];
     // 与 auth/login 同款组合判定（demo 语义：不存在与密码错同报）。
     if (!row || !(await bcrypt.verify(String(b.password ?? ""), <string>row.password_hash || ""))) {

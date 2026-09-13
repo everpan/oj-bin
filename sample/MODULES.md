@@ -46,7 +46,7 @@ AUTH=(-H "Authorization: Bearer $TOKEN" -H 'X-TENANT-ID: default')
 | `manifest.yaml` | 模块身份：name/desc/version + `tables: [account]`（表归属声明，与 schema.yaml 双向一致 S005） |
 | `schema.yaml` | 声明式表结构：account 表的列/主键/索引——启动时自动收敛，不用手写 CREATE |
 | `seed.sql` | 幂等种子（`INSERT OR IGNORE`），每次启动重放：neo / trinity 两个账号 |
-| `account/api.ts` | 完整 get/post/put：`db.query(sql, params)` 值走绑定参数（防注入红线），`json.ok` / `json.fail` 信封 |
+| `account/api.ts` | 完整 get/post/put：`db.table(...)` 构造器 + 绑定参数（select/where/insert/update/delete，防注入红线），`json.ok` / `json.fail` 信封 |
 | `item/api.ts` | 路径参数：`detail.route = "{id}"` → `/v1/api/user/item/{id}`，`http.param("id")` 取值 |
 | `profile/detail/api.ts` | 目录任意深度嵌套成三层路由，仅 4 行 |
 | `_shared/validate.ts` | 模块内共享工具（`requireRole`），被本模块和 order 模块同时 import |

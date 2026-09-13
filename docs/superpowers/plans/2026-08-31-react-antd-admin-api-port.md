@@ -333,15 +333,16 @@ async function get(): Promise<void> {
   const status = String(http.param("status", ""));
   const code = String(http.param("code", ""));
   const { pageSize, current } = pageArgs();
-  let sql = "select id, name, code, status, remark, create_time, update_time from role";
-  const conds: string[] = [];
-  const params: unknown[] = [];
-  if (name) { conds.push("name like ?"); params.push("%" + name + "%"); }
-  if (status !== "") { conds.push("status = ?"); params.push(Number(status)); }
-  if (code) { conds.push("code = ?"); params.push(code); }
-  if (conds.length) sql += " where " + conds.join(" and ");
-  sql += " order by id";
-  const rows: any[] = await db.query(sql, params);
+  const wheres: any[] = [];
+  if (name) wheres.push({ field: "name", op: "like", value: "%" + name + "%" });
+  if (status !== "") wheres.push({ field: "status", op: "eq", value: Number(status) });
+  if (code) wheres.push({ field: "code", op: "eq", value: code });
+  const q = db.table("role")
+    .select(["id", "name", "code", "status", "remark", "create_time", "update_time"])
+    .orderBy([{ field: "id", dir: "asc" }]);
+  const rows: any[] = wheres.length
+    ? await q.where({ and: wheres }).all()
+    : await q.all();
   const all = rows.map(mapRole);
   json.ok(paged(all, pageSize, current));
 }
@@ -358,6 +359,7 @@ async function post(): Promise<void> {
   const b = http.body as { name?: string; code?: string; status?: number; remark?: string } | null;
   if (!b || !b.name || !b.code) { json.fail(400, "name and code required"); return; }
   const now = Date.now();
+  // builder 不支持 INSERT ... RETURNING id，保留裸 query
   const rows: any[] = await db.query(
     "insert into role (name, code, status, remark, create_time, update_time) values (?, ?, ?, ?, ?, ?) returning id",
     [b.name, b.code, b.status ?? 1, b.remark ?? "", now, now],
@@ -375,8 +377,10 @@ async function put(): Promise<void> {
     [b?.name ?? "", b?.code ?? "", b?.status ?? 1, b?.remark ?? "", now, id],
   );
   if (n === 0) { json.fail(404, "no such role"); return; }
-  const rows: any[] = await db.query(
-    "select id, name, code, status, remark, create_time, update_time from role where id = ?", [id]);
+  const rows: any[] = await db.table("role")
+    .select(["id", "name", "code", "status", "remark", "create_time", "update_time"])
+    .where({ field: "id", op: "eq", value: id })
+    .all();
   json.ok(mapRole(rows[0]));
 }
 
@@ -399,7 +403,10 @@ export default { post, put, del };
 
 ```ts
 async function get(): Promise<void> {
-  const rows: any[] = await db.query("select id, parent_id, menu_type, name from menu order by id", []);
+  const rows: any[] = await db.table("menu")
+    .select(["id", "parent_id", "menu_type", "name"])
+    .orderBy([{ field: "id", dir: "asc" }])
+    .all();
   json.ok(rows.map((m) => {
     const item: any = { id: m.id, menuType: m.menu_type, name: m.name };
     if (m.parent_id !== 0) item.parentId = m.parent_id;
@@ -416,8 +423,11 @@ export default { get };
 async function get(): Promise<void> {
   const id = Number(http.param("id", 0));
   if (!(id > 0)) { json.fail(400, "id required"); return; }
-  const rows: any[] = await db.query(
-    "select menu_id from role_menu where role_id = ? order by menu_id", [id]);
+  const rows: any[] = await db.table("role_menu")
+    .select(["menu_id"])
+    .where({ field: "role_id", op: "eq", value: id })
+    .orderBy([{ field: "menu_id", dir: "asc" }])
+    .all();
   json.ok(rows.map((r) => r.menu_id));
 }
 get.route = "/menu-by-role-id";
@@ -511,6 +521,7 @@ const COLS = "id, parent_id, menu_type, name, path, component, sort, icon, curre
 
 async function get(): Promise<void> {
   const { pageSize, current } = pageArgs();
+  // builder 不支持动态列列表（COLS 来自 JS 变量），保留裸 query
   const rows: any[] = await db.query("select " + COLS + " from menu order by id", []);
   json.ok(paged(rows.map(mapMenu), pageSize, current));
 }
@@ -529,6 +540,7 @@ async function post(): Promise<void> {
   const b = http.body as any;
   if (!b || !b.name) { json.fail(400, "name required"); return; }
   const now = Date.now();
+  // builder 不支持 INSERT ... RETURNING id，保留裸 query
   const rows: any[] = await db.query(
     "insert into menu (parent_id, menu_type, name, path, component, sort, icon, current_active_menu, iframe_link, keep_alive, external_link, hide_in_menu, ignore_access, status, create_time, update_time) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
     [Number(b.parentId) || 0, b.menuType ?? 0, b.name, b.path ?? "", b.component ?? "",
@@ -552,9 +564,10 @@ async function put(): Promise<void> {
      b.status ?? 1, now, id],
   );
   if (n === 0) { json.fail(404, "no such menu"); return; }
-  const rows: any[] = await db.query(
-    "select id, parent_id, menu_type, name, path, component, sort, icon, current_active_menu, iframe_link, keep_alive, external_link, hide_in_menu, ignore_access, status, create_time, update_time from menu where id = ?",
-    [id]);
+  const rows: any[] = await db.table("menu")
+    .select(["id", "parent_id", "menu_type", "name", "path", "component", "sort", "icon", "current_active_menu", "iframe_link", "keep_alive", "external_link", "hide_in_menu", "ignore_access", "status", "create_time", "update_time"])
+    .where({ field: "id", op: "eq", value: id })
+    .all();
   json.ok(mapMenu(rows[0]));
 }
 
@@ -655,7 +668,10 @@ Expected: 3 个新用例 FAIL，其余绿。
 async function get(): Promise<void> {
   const u = http.user;
   if (!u) { json.fail(401, "unauthorized"); return; }
-  const rows: any[] = await db.query("select username from users where id = ?", [u.id]);
+  const rows: any[] = await db.table("users")
+    .select(["username"])
+    .where({ field: "id", op: "eq", value: u.id })
+    .all();
   json.ok({
     id: String(u.id),
     username: rows.length ? rows[0].username : "",
@@ -682,21 +698,28 @@ async function get(): Promise<void> {
   const roles: string[] = u.roles ?? [];
   let menuIds: number[] = [];
   if (roles.length) {
-    const ph = roles.map(() => "?").join(",");
-    const roleRows: any[] = await db.query("select id from role where code in (" + ph + ")", roles);
+    const roleRows: any[] = await db.table("role")
+      .select(["id"])
+      .where({ field: "code", op: "in", value: roles })
+      .all();
     const rids = roleRows.map((r) => r.id);
     if (rids.length) {
-      const ph2 = rids.map(() => "?").join(",");
-      const binds: any[] = await db.query(
-        "select menu_id from role_menu where role_id in (" + ph2 + ")", rids);
+      const binds: any[] = await db.table("role_menu")
+        .select(["menu_id"])
+        .where({ field: "role_id", op: "in", value: rids })
+        .all();
       menuIds = binds.map((b) => b.menu_id);
     }
   }
   if (!menuIds.length) { json.ok([]); return; }
-  const ph3 = menuIds.map(() => "?").join(",");
-  const rows: any[] = await db.query(
-    "select id, parent_id, name, path, component, sort, icon, keep_alive, iframe_link, external_link from menu where menu_type in (0, 1, 2) and id in (" + ph3 + ") order by id",
-    menuIds);
+  const rows: any[] = await db.table("menu")
+    .select(["id", "parent_id", "name", "path", "component", "sort", "icon", "keep_alive", "iframe_link", "external_link"])
+    .where({ and: [
+      { field: "menu_type", op: "in", value: [0, 1, 2] },
+      { field: "id", op: "in", value: menuIds },
+    ]})
+    .orderBy([{ field: "id", dir: "asc" }])
+    .all();
 
   const nodes = new Map<number, any>();
   for (const m of rows) {
@@ -731,8 +754,10 @@ export default { get };
 
 ```ts
 async function get(): Promise<void> {
-  const rows: any[] = await db.query(
-    "select avatar, date, is_read, message, title from notification order by id", []);
+  const rows: any[] = await db.table("notification")
+    .select(["avatar", "date", "is_read", "message", "title"])
+    .orderBy([{ field: "id", dir: "asc" }])
+    .all();
   json.ok(rows.map((n) => ({
     avatar: n.avatar ?? "",
     date: n.date,

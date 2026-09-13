@@ -111,8 +111,10 @@ handler 契约（`user/account/api.ts` 骨架）：
 import { requireRole } from "../_shared/validate";
 
 function get() {
-  const rows = db.query("select id, name, role from account where id = ?",
-                        [http.param("id", 0)]);
+  const rows = db.table("account")
+    .select(["id", "name", "role"])
+    .where({ field: "id", op: "eq", value: http.param("id", 0) })
+    .all();
   json.ok(rows);
 }
 function post() {

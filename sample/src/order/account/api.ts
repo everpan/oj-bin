@@ -7,15 +7,16 @@ function post(): void {
     return;
   }
   const no = escapeHtml(String(b.no)); // 裸 specifier 参与请求处理（UC-15）
-  db.exec("insert into orders (no, account_id, amount) values (?, ?, ?)",
-          [no, b.account_id, b.amount])
+  db.table("orders").insert({ no, account_id: b.account_id, amount: b.amount })
+    .run()
     .then(() => json.ok({ created: true, no }))
     .catch((e) => json.fail(500, String(e)));
 }
 
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, no, account_id, amount from orders where account_id = ?", [id])
+  db.table("orders").select(["id", "no", "account_id", "amount"]).where({ field: "account_id", op: "eq", value: id })
+    .all()
     .then((r) => json.ok(r))
     .catch((e) => json.fail(500, String(e)));
 }
