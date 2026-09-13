@@ -299,6 +299,7 @@ pub async fn op_db_query(
 ) -> Result<Vec<Row>, JsErrorBox> {
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
+    super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
     match resolve_target(&state, &name)? {
         Target::Pool(da) => da
             .query_with_params(&sql, &params)
@@ -325,6 +326,7 @@ pub async fn op_db_exec(
 ) -> Result<i64, JsErrorBox> {
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
+    super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
     match resolve_target(&state, &name)? {
         Target::Pool(da) => da
             .exec_with_params(&sql, &params)

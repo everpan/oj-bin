@@ -544,7 +544,8 @@ mod tests {
 
     #[test]
     fn tenant_sql_guard_parse() {
-        let c: Config = serde_yaml::from_str("tenant:\n  enable: true\n  sql_guard: true\n").unwrap();
+        let c: Config =
+            serde_yaml::from_str("tenant:\n  enable: true\n  sql_guard: true\n").unwrap();
         assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Deny);
         let c: Config = serde_yaml::from_str("tenant:\n  sql_guard: warn\n").unwrap();
         assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Warn);
@@ -558,7 +559,10 @@ mod tests {
         let c: Config =
             serde_yaml::from_str("tenant:\n  sql_guard: true\n  shared_allow: [dict, geo]\n")
                 .unwrap();
-        assert_eq!(c.tenant.shared_allow, vec!["dict".to_string(), "geo".to_string()]);
+        assert_eq!(
+            c.tenant.shared_allow,
+            vec!["dict".to_string(), "geo".to_string()]
+        );
         assert!(serde_yaml::from_str::<Config>("tenant:\n  sql_guard: bogus\n").is_err());
     }
 
