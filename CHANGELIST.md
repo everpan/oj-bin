@@ -2,6 +2,24 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## Unreleased
+
+**特性**
+- `tenant.sql_guard` 多租户 SQL 防护（false（默认，不改写 SQL）| `"warn"` 注入+告警 |
+  `true`/`"deny"` 注入+拦截）：`db.table()` 构造器自动注入租户条件——select 基表限定列
+  注入、join 进 ON 子句（不影响 left join 语义）、条件树/子查询/union/with 递归、
+  insert 强制当前租户值（mismatch 报错）、update/delete 自动收窄、sets 显式改
+  tenant_id 拒绝（防行迁移越权）；裸 SQL（`db.query`/`db.exec`）查「完全遗漏 tenant_id」
+  warn 告警 / deny 拦截（Deny 另要求参数数组含当前租户值；DML/DDL 未识别表 fail-closed），
+  双引号/反引号标识符保留以兼容 toSQL 回放。逃生口 `db.asSystem()`：请求级 system 标志
+  （ReqState 重置即失效）+ 服务端审计日志。schema.yaml 表级 `tenant: false` 共享表声明
+  （缺省 true）+ config `tenant.shared_allow` 白名单交集生效（fail-closed），
+  `validate_tenant` 挂三处：server 启动 / `oj build`（checks）/ `oj migrate`；
+  `enable=false` 而 guard 非 Off 启动 warn。新人白话文档 `docs/tenant-guide.md`；
+  api-manual 第 8/10 章同步。**已知边界**：租户头为客户端自报，防伪造须 JWT claims
+  绑定（规划见设计文档 §7，另立任务）；裸 SQL 字面检查为 best-effort（只防完全遗漏）。
+  设计/评审：`docs/superpowers/specs/2026-09-13-tenant-sql-guard-design.md`。
+
 ## v0.1.15（2026-09-13）
 
 **CI**
