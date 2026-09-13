@@ -134,6 +134,8 @@ pub struct StableState {
     pub modules: Arc<HashMap<String, ModuleCtx>>,
     /// 表归属守卫模式（P2 §5.3）：false=warn（默认，日志告警）；true=deny（违规拒绝）。
     pub ownership_deny: bool,
+    /// 多租户 SQL 防护模式（tenant.sql_guard；Off=不设防）。
+    pub sql_guard: SqlGuard,
     /// 命名 MQ 客户端（Kafka(name)/RabbitMQ(name) 数据源；spec 2026-09-07 §4）。
     /// 段未配置 = 空 registry（op_mq_has 恒 false → JS 侧 undefined）。
     pub kafkas: Arc<NamedRegistry<mq::MqInstance>>,
@@ -166,6 +168,8 @@ pub struct Extras {
     pub modules: Arc<HashMap<String, ModuleCtx>>,
     /// 表归属守卫 deny 模式（缺省 false = warn）。
     pub ownership_deny: bool,
+    /// 多租户 SQL 防护模式（缺省 Off = 不设防）。
+    pub sql_guard: SqlGuard,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     pub boot: Option<String>,
     /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
@@ -199,6 +203,9 @@ pub struct ReqState {
     pub ws_sess: Option<serde_json::Value>,
     /// 本请求所属模块名（§5.3 执行上下文；run_module 按目录命中注入；None = 无上下文）。
     pub module: Option<String>,
+    /// db.asSystem() 逃生口：本请求以系统身份绕过租户防护（reset 即失效；
+    /// sql_guard 活跃时调用处记审计日志）。默认 false。
+    pub system: bool,
 }
 
 impl ReqState {
@@ -214,6 +221,7 @@ impl ReqState {
         self.ws_close = false;
         self.ws_sess = None;
         self.module = None;
+        self.system = false;
     }
 }
 
@@ -530,6 +538,7 @@ impl Bridge {
             plugins: extras.plugins,
             modules: extras.modules,
             ownership_deny: extras.ownership_deny,
+            sql_guard: extras.sql_guard,
             boot: extras.boot,
             jwt: extras.jwt,
             oidc: extras.oidc,
@@ -1600,6 +1609,7 @@ mod tests {
             plugins: Vec::new(),
             modules: Arc::new(HashMap::new()),
             ownership_deny: false,
+            sql_guard: SqlGuard::Off,
             boot: None,
             jwt: None,
             oidc: None,

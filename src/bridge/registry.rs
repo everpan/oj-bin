@@ -20,12 +20,20 @@ pub struct TableDef {
     pub primary_key: Vec<String>,
     /// 归属模块（schema.yaml 声明来源；None = 未声明表，守卫不设防）。
     pub owner: Option<String>,
+    /// 共享表标记（schema.yaml `tenant: false` 且过 config tenant.shared_allow 白名单；
+    /// 默认 false = 受租户约束）。sql_guard 注入的豁免依据。
+    pub shared: bool,
 }
 
 impl TableDef {
     /// 校验列名是否在白名单内。
     pub fn has_column(&self, name: &str) -> bool {
         self.columns.contains_key(name)
+    }
+
+    /// 多租户注入候选：非共享表且含 tenant_id 列。
+    pub fn is_tenant_scoped(&self) -> bool {
+        !self.shared && self.has_column("tenant_id")
     }
 
     /// 校验列是否允许排序。
@@ -58,7 +66,31 @@ impl SchemaRegistry {
         self
     }
 
+    /// 带 shared 标记的归属声明（sql_guard 装配路径；shared = 共享表白名单生效）。
+    pub fn table_owned_shared(
+        mut self,
+        owner: &str,
+        name: &str,
+        pk: &[&str],
+        columns: &[&str],
+        shared: bool,
+    ) -> Self {
+        self.declare_shared(Some(owner.to_string()), name, pk, columns, shared);
+        self
+    }
+
     fn declare(&mut self, owner: Option<String>, name: &str, pk: &[&str], columns: &[&str]) {
+        self.declare_shared(owner, name, pk, columns, false);
+    }
+
+    fn declare_shared(
+        &mut self,
+        owner: Option<String>,
+        name: &str,
+        pk: &[&str],
+        columns: &[&str],
+        shared: bool,
+    ) {
         let mut cols = HashMap::new();
         for c in columns {
             cols.insert(
@@ -81,6 +113,7 @@ impl SchemaRegistry {
                 columns: cols,
                 primary_key: pk.iter().map(|s| s.to_string()).collect(),
                 owner,
+                shared,
             },
         );
     }
@@ -130,6 +163,13 @@ mod tests {
         let r2 = SchemaRegistry::new().table_owned("order", "orders", &["id"], &["id"]);
         assert_eq!(r2.owner_of("orders"), Some("order"));
         assert_eq!(r2.owner_of("missing"), None);
+        // shared 标记：默认 false=受租户约束；含 tenant_id 列才构成注入候选。
+        assert!(!r2.get("orders").unwrap().is_tenant_scoped());
+        let r3 = SchemaRegistry::new()
+            .table("tt", &["id"], &["id", "tenant_id", "name"])
+            .table_owned_shared("m", "sh", &["id"], &["id", "name"], true);
+        assert!(r3.get("tt").unwrap().is_tenant_scoped());
+        assert!(!r3.get("sh").unwrap().is_tenant_scoped());
     }
 
     #[test]
@@ -153,6 +193,7 @@ mod tests {
             columns: cols,
             primary_key: Vec::new(),
             owner: None,
+            shared: false,
         };
         assert!(td.is_sortable("a"));
         assert!(!td.is_sortable("b"));
