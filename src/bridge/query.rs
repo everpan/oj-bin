@@ -143,6 +143,10 @@ struct Join {
     #[serde(default)]
     kind: JoinKind,
     on: Vec<OnPair>,
+    /// 多租户防护注入（apply_tenant 填充，build_select_stmt 消费；JS 链层不可设）。
+    /// 进 ON 子句而非 WHERE——LEFT JOIN 注入 WHERE 会静默变 INNER JOIN（评审 P2-9）。
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 /// 查询动词（serde default = select，旧线格式零迁移）。
@@ -760,6 +764,139 @@ fn guard_nested(state: &Rc<RefCell<OpState>>, t: &CondTree) -> Result<(), JsErro
     }
 }
 
+/// 多租户防护预变换（guard_req 之后、build_statement 之前；op_db_query_build 与
+/// op_db_query_sql 两 op 同步注入——toSQL 产物离开 AST 后经 db.query 直跑时防护才成立）。
+/// 形状递归照抄 guard_req：joins/条件树子查询/exists/union 臂/cte/case-when 全覆盖。
+/// tid=None：Deny 对受约束表 Err；Warn 告警放行（软过渡，不注入）。system=请求级逃生口。
+fn apply_tenant(
+    req: &mut QueryReq,
+    reg: &SchemaRegistry,
+    tid: Option<&str>,
+    guard: super::SqlGuard,
+    system: bool,
+) -> Result<(), JsErrorBox> {
+    if system {
+        return Ok(());
+    }
+    let cte_name = |n: &str| req.with.iter().any(|c| c.name == n);
+    let scoped = |name: &str| !cte_name(name) && reg.get(name).is_some_and(|t| t.is_tenant_scoped());
+    // 本层受约束表（基表 + join 表；用于 tid=None 判定与写侧校验）。
+    let mut touched = vec![];
+    if scoped(&req.table) {
+        touched.push(req.table.clone());
+    }
+    for j in &req.joins {
+        if scoped(&j.table) {
+            touched.push(j.table.clone());
+        }
+    }
+    if !touched.is_empty() {
+        match tid {
+            Some(tid) => match req.verb {
+                Verb::Select | Verb::Update | Verb::Delete => {
+                    // 限定列注入：join 场景下裸 tenant_id 会撞歧义（两表同名列）。
+                    req.conditions.push(CondTree::Leaf(Cond {
+                        field: format!("{}.tenant_id", req.table),
+                        op: Op::Eq,
+                        value: Some(Value::String(tid.into())),
+                        subquery: None,
+                    }));
+                }
+                Verb::Insert => {
+                    for row in &mut req.values {
+                        match row.get("tenant_id") {
+                            Some(v) if v.as_str() != Some(tid) => {
+                                return Err(JsErrorBox::generic(format!(
+                                    "tenant guard: insert tenant_id mismatch (got {v}, want {tid:?})"
+                                )));
+                            }
+                            _ => {
+                                row.insert("tenant_id".into(), Value::String(tid.into()));
+                            }
+                        }
+                    }
+                }
+            },
+            None => {
+                let msg = format!(
+                    "tenant guard: table(s) {touched:?} require tenant context \
+                     (missing tenant header; use db.asSystem() for system tasks)"
+                );
+                if guard == super::SqlGuard::Deny {
+                    return Err(JsErrorBox::generic(msg));
+                }
+                // Warn：整层不注入、告警放行（软过渡），继续递归让嵌套层各自告警。
+                eprintln!("warn: {msg}");
+            }
+        }
+        // update 写侧逃逸：sets 显式 tenant_id 必须等于当前租户（比 insert 更隐蔽，
+        // update({tenant_id:"victim"}) 会把本租户行迁移到他租户）。
+        if req.verb == Verb::Update && scoped(&req.table) {
+            if let Some(v) = req.sets.get("tenant_id") {
+                if tid.is_none() || v.as_str() != tid {
+                    return Err(JsErrorBox::generic(format!(
+                        "tenant guard: update sets.tenant_id not allowed (got {v})"
+                    )));
+                }
+            }
+        }
+        // join 表：tenant 条件进 ON 子句（Join.tenant_id，build_select_stmt 消费）。
+        if let Some(tid) = tid {
+            for j in &mut req.joins {
+                if scoped(&j.table) && j.tenant_id.is_none() {
+                    j.tenant_id = Some(tid.to_string());
+                }
+            }
+        }
+    }
+    // 递归：条件树（含 having/case-when）内子查询 + union 臂 + cte。
+    for c in &mut req.conditions {
+        apply_tenant_tree(c, reg, tid, guard)?;
+    }
+    if let Some(h) = &mut req.having {
+        apply_tenant_tree(h, reg, tid, guard)?;
+    }
+    for col in &mut req.columns {
+        if let ColSpec::Case(c) = col {
+            for w in &mut c.case.when {
+                apply_tenant_tree(&mut w.cond, reg, tid, guard)?;
+            }
+        }
+    }
+    for u in &mut req.unions {
+        apply_tenant(&mut u.query, reg, tid, guard, false)?;
+    }
+    for c in &mut req.with {
+        apply_tenant(&mut c.query, reg, tid, guard, false)?;
+    }
+    Ok(())
+}
+
+/// 条件树遍历，嵌套 req 递归 apply_tenant（与 guard_nested 同构镜像演进）。
+fn apply_tenant_tree(
+    t: &mut CondTree,
+    reg: &SchemaRegistry,
+    tid: Option<&str>,
+    guard: super::SqlGuard,
+) -> Result<(), JsErrorBox> {
+    match t {
+        CondTree::Leaf(c) => {
+            if let Some(sub) = &mut c.subquery {
+                apply_tenant(sub, reg, tid, guard, false)?;
+            }
+            Ok(())
+        }
+        CondTree::And(xs) | CondTree::Or(xs) => {
+            for x in xs {
+                apply_tenant_tree(x, reg, tid, guard)?;
+            }
+            Ok(())
+        }
+        CondTree::Not(x) => apply_tenant_tree(x, reg, tid, guard),
+        CondTree::Exists(sub) => apply_tenant(sub, reg, tid, guard, false),
+    }
+}
+
 /// 动词×字段兼容矩阵（op 侧权威——fromJSON 可完全绕过 JS 链层）。
 fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
     let reject =
@@ -1133,6 +1270,12 @@ fn build_select_stmt(
             ctx.check_col(&p.right, "join on")?;
             on = on.add(col_simple_expr(&p.left).equals(col_ref(&p.right)));
         }
+        // 多租户防护注入（apply_tenant 填充）：join 表 tenant_id 进 ON 子句。
+        if let Some(tid) = &j.tenant_id {
+            on = on.add(
+                col_simple_expr(&format!("{}.tenant_id", j.table)).eq(Expr::val(tid.as_str())),
+            );
+        }
         let jt = match j.kind {
             JoinKind::Inner => sea_query::JoinType::InnerJoin,
             JoinKind::Left => sea_query::JoinType::LeftJoin,
@@ -1260,6 +1403,8 @@ pub async fn op_db_query_build(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let reg = registry(&state)?;
     guard_req(&state, &req)?;
+    let mut req = req;
+    apply_tenant_guard(&state, &mut req, &reg)?;
     let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
     let is_select = req.verb == Verb::Select;
 
@@ -1305,8 +1450,29 @@ pub fn op_db_query_sql(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let reg = registry(&state)?;
     guard_req(&state, &req)?;
+    let mut req = req;
+    apply_tenant_guard(&state, &mut req, &reg)?;
     let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
     Ok(serde_json::json!({ "sql": sql, "params": params }))
+}
+
+/// 两构造器 op 共用的租户预变换：读 StableState.sql_guard + ReqState（tenant_id/system），
+/// Off 或 system 逃生口直接放行。
+fn apply_tenant_guard(
+    state: &Rc<RefCell<OpState>>,
+    req: &mut QueryReq,
+    reg: &SchemaRegistry,
+) -> Result<(), JsErrorBox> {
+    let g = state.borrow();
+    let guard = g.borrow::<Arc<StableState>>().sql_guard;
+    if guard == super::SqlGuard::Off {
+        return Ok(());
+    }
+    let (tid, system) = {
+        let rs = g.borrow::<super::ReqState>();
+        (rs.req.tenant_id.clone(), rs.system)
+    };
+    apply_tenant(req, reg, tid.as_deref(), guard, system)
 }
 
 /// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。
@@ -2443,5 +2609,295 @@ mod tests {
             let v: Value = serde_json::from_slice(&cap.body).unwrap();
             assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
         }
+    }
+
+    // ----- 多租户 sql_guard：apply_tenant 注入（Task 3） -----
+
+    use crate::bridge::{Extras, RequestInfo, SqlGuard};
+
+    /// 租户夹具：t（受约束，tenant_id 列）+ s（共享表）+ 两租户种子。
+    async fn guarded_bridge() -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params(
+            "create table t (id integer primary key, name text, tenant_id text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.exec_with_params("create table s (id integer primary key, name text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "create table u (id integer primary key, label text, tenant_id text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (n, tid) in [("a1", "t1"), ("a2", "t1"), ("b1", "t2")] {
+            db.exec_with_params(
+                "insert into t (name, tenant_id) values (?, ?)",
+                &[json!(n), json!(tid)],
+            )
+            .await
+            .unwrap();
+        }
+        // u：id=1 属 t1，id=3 属 t2（join 语义验证用）。
+        for (id, l, tid) in [(1, "ua", "t1"), (3, "ub", "t2")] {
+            db.exec_with_params(
+                "insert into u (id, label, tenant_id) values (?, ?, ?)",
+                &[json!(id), json!(l), json!(tid)],
+            )
+            .await
+            .unwrap();
+        }
+        let reg = SchemaRegistry::new()
+            .table("t", &["id"], &["id", "name", "tenant_id"])
+            .table("u", &["id"], &["id", "label", "tenant_id"])
+            .table_owned_shared("m", "s", &["id"], &["id", "name"], true);
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                sql_guard: SqlGuard::Deny,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn req_t1() -> RequestInfo {
+        RequestInfo {
+            tenant_id: Some("t1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// select：构造器查询自动收窄到当前租户；toSQL 产物含注入条件与参数。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_select_scoped() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const rows = await db.table("t").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                     const s = db.table("t").select(["name"]).toSQL();
+                     json.ok({ names: rows.map(r => r.name), sql: s.sql, params: s.params });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["names"], json!(["a1", "a2"]), "{v}");
+        assert!(v["data"]["sql"].as_str().unwrap().contains("tenant_id"), "{v}");
+        assert!(
+            v["data"]["params"].as_array().unwrap().contains(&json!("t1")),
+            "{v}"
+        );
+    }
+
+    /// insert：强制写入当前租户；显式传不符 tenant_id 报错；显式传相符放行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_insert_forces_tid_and_rejects_mismatch() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"db.table("t").insert({name:"a3"}).run()
+                     .then(() => json.ok({})).catch(e => json.fail(400, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // 强制写入生效：新行带 t1
+        let cap = b
+            .run_with(
+                r#"db.table("t").select(["name","tenant_id"]).where({field:"name",op:"eq",value:"a3"}).all()
+                     .then(r => json.ok({n: r.length, tid: r[0].tenant_id}))
+                     .catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["data"]["n"], &v["data"]["tid"]), (&json!(1), &json!("t1")), "{v}");
+        // 显式不符 → 报错
+        let cap = b
+            .run_with(
+                r#"db.table("t").insert({name:"x", tenant_id:"t2"}).run()
+                     .then(() => json.ok({})).catch(e => json.fail(400, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("tenant_id mismatch"),
+            "{v}"
+        );
+    }
+
+    /// update：sets.tenant_id 写侧逃逸一律报错；where 自动收窄（改不到他租户行）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_update_sets_tid_rejected_and_where_narrowed() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"db.table("t").update({name:"zz"}).where({field:"name",op:"eq",value:"b1"}).run()
+                     .then(n => json.ok({n})).catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 0, "t1 租户不应改到 t2 的行: {v}");
+        // sets.tenant_id → 报错
+        let cap = b
+            .run_with(
+                r#"(async () => db.table("t").update({tenant_id:"t2"}).where({field:"name",op:"eq",value:"a1"}).run())()
+                     .then(() => json.ok({})).catch(e => json.fail(400, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("sets.tenant_id not allowed"),
+            "{v}"
+        );
+    }
+
+    /// delete：自动收窄——t1 删不到 t2 的行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_delete_narrowed() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"db.table("t").delete().where({field:"name",op:"eq",value:"b1"}).run()
+                     .then(n => json.ok({n})).catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(0)), "{v}");
+    }
+
+    /// join：join 表同样受约束，条件进 ON（LEFT JOIN 他租户行出现 NULL，不变 INNER）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_join_injects_on_clause() {
+        let b = guarded_bridge().await;
+        // LEFT JOIN：t1 基表 {a1(id1), a2(id2)}；u 行 id1=t1(ua) / id3=t2(ub)。
+        // ON 注入 u.tenant_id='t1' → a2 的 label 为 NULL（LEFT 语义保留）。
+        let cap = b
+            .run_with(
+                r#"db.table("t").join("u", [{left:"t.id",right:"u.id"}], "left")
+                     .select(["t.name","u.label"]).orderBy([{field:"t.id",dir:"asc"}]).all()
+                     .then(r => json.ok({rows: r})).catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["rows"],
+            json!([{"name": "a1", "label": "ua"}, {"name": "a2", "label": null}]),
+            "{v}"
+        );
+        // toSQL 层面：条件在 ON 区段而非 WHERE。
+        let cap = b
+            .run_with(
+                r#"json.ok(db.table("t").join("u", [{left:"t.id",right:"u.id"}], "left").select(["t.name"]).toSQL());"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let sql = v["data"]["sql"].as_str().unwrap().to_string();
+        let on_part = sql.split("WHERE").next().unwrap_or("");
+        assert!(on_part.contains("tenant_id"), "ON 区段应含注入条件: {sql}");
+    }
+
+    /// 子查询递归：in-subquery 同样收窄到当前租户。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_subquery_recursion() {
+        let b = guarded_bridge().await;
+        // 子查询查 t2 租户的行名 b1——注入后子查询只回 t1 行 → 外层 in 空集。
+        let cap = b
+            .run_with(
+                r#"db.table("t").select(["name"])
+                     .where({field:"name",op:"in",subquery:db.table("t").select(["name"]).where({field:"tenant_id",op:"eq",value:"t2"})})
+                     .all()
+                     .then(r => json.ok({n: r.length})).catch(e => json.fail(500, String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 0, "子查询应被收窄到 t1，t2 行不可见: {v}");
+    }
+
+    /// tid=None：Deny 拒绝；asSystem 逃生口放行；Warn 模式放行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_none_denied_and_as_system_escapes() {
+        let b = guarded_bridge().await;
+        // Deny + None → 拒
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).all()
+                     .then(r => json.ok({n: r.length})).catch(e => json.fail(400, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("require tenant context"), "{v}");
+        // asSystem → 放行（看到全部 3 行）
+        let cap = b
+            .run(
+                r#"db.asSystem().table("t").select(["name"]).all()
+                     .then(r => json.ok({n: r.length})).catch(e => json.fail(400, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(3)), "{v}");
+        // 共享表不受约束：None 也放行
+        let cap = b
+            .run(
+                r#"db.table("s").select(["name"]).all()
+                     .then(r => json.ok({n: r.length})).catch(e => json.fail(400, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+    }
+
+    /// 共享表（TableDef.shared=true）：有 tenant_id 列也不注入。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_shared_table_untouched() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"json.ok(db.table("s").select(["name"]).toSQL());"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            !v["data"]["sql"].as_str().unwrap().contains("tenant_id"),
+            "{v}"
+        );
     }
 }
