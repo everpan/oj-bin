@@ -100,6 +100,19 @@ pub struct ModuleCtx {
     pub db: Option<String>,
 }
 
+/// 多租户 SQL 防护模式（tenant.sql_guard；装配期冻结进 StableState，首 run 前不可变）。
+/// 反序列化在 config.rs（接受 bool true/false 与字符串 "off"/"warn"/"deny"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqlGuard {
+    /// 不启用（默认）。
+    #[default]
+    Off,
+    /// 仅告警（软过渡：注入照做、缺失/逃逸口不拒绝，eprintln 告警）。
+    Warn,
+    /// 缺租户条件即拒绝（fail-closed）。
+    Deny,
+}
+
 /// StableState：跨请求共享、创建后不可变（内部句柄均为 Arc）。
 pub struct StableState {
     pub kv: Arc<dyn KVStore>,
