@@ -52,7 +52,8 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         }
     }
     // 检查体系（§5.2）：构建即检查，S002–S006 违规 fail build；--check 只校验不落盘。
-    crate::checks::run(&src, &names, &view)?;
+    // sql_guard 活跃时追加 tenant 声明校验（schema.yaml 缺 tenant_id 列 fail build）。
+    crate::checks::run(&src, &names, &view, sql_guard_of_config(&a.config))?;
     if a.check {
         println!("oj build --check: {} module(s) OK", names.len());
         return Ok(());
@@ -68,6 +69,19 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
 
 /// tasks 目录名：读配置的 `tasks.dir`（缺文件回落默认 "tasks"——build 不强制要求
 /// server 配置存在）。
+/// 构建期 sql_guard 模式（与 server 装配同一配置源；配置缺失/非法时宽容为 Off，
+/// tenant 声明校验仅在此模式下追加——S* 检查本身不依赖 config）。
+fn sql_guard_of_config(config: &str) -> only_js::bridge::SqlGuard {
+    let p = Path::new(config);
+    let dir = p
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
+        .map(|c| c.tenant.sql_guard)
+        .unwrap_or(only_js::bridge::SqlGuard::Off)
+}
+
 fn tasks_dir_of(config: &str) -> String {
     let p = Path::new(config);
     let dir = p

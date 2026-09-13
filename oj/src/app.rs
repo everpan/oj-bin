@@ -212,6 +212,8 @@ async fn build_schema_and_modules(
     ts: bool,
     dbs: &std::collections::HashMap<String, Arc<dyn DataAccessor>>,
     gate: &str,
+    guard: SqlGuard,
+    shared_allow: &[String],
 ) -> Result<
     (
         SchemaRegistry,
@@ -225,14 +227,26 @@ async fn build_schema_and_modules(
     for (name, mdir) in manifest::discover(dir, ts)? {
         let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
         if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
-            for (t, pk, cols) in f.registry_tables() {
+            if guard != SqlGuard::Off {
+                f.validate_tenant(&name)?;
+                for st in f.shared_tables() {
+                    if !shared_allow.iter().any(|a| a == st) {
+                        eprintln!(
+                            "warn: [{name}] 共享表声明 {st:?} 未列入 tenant.shared_allow，按受租户约束处理（tenant_id 列校验将生效）"
+                        );
+                    }
+                }
+            }
+            for (t, pk, cols, tenant_flag) in f.registry_tables() {
                 if registry.has_table(t) {
                     return Err(format!(
                         "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
                         registry.owner_of(t).unwrap_or("?")
                     ));
                 }
-                registry = registry.table_owned(&name, t, &pk, &cols);
+                // 共享表 = 显式 tenant:false 且列于 shared_allow 白名单（交集，fail-closed）。
+                let shared = !tenant_flag && shared_allow.iter().any(|a| a == t);
+                registry = registry.table_owned_shared(&name, t, &pk, &cols, shared);
             }
             if gate == "auto" {
                 let acc = dbs
@@ -420,7 +434,9 @@ impl App {
         let ownership_deny = ownership_deny_of(&cfg)?;
         let sql_guard = sql_guard_of(&cfg);
         // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
-        let (registry, modules) = build_schema_and_modules(&dir, ts, &dbs, gate).await?;
+        let (registry, modules) =
+            build_schema_and_modules(&dir, ts, &dbs, gate, sql_guard, &cfg.tenant.shared_allow)
+                .await?;
         // 种子重放（P0）：各模块 seed.sql（§8-1）。
         crate::seed::replay_all(dbs.get("default"), &dir).await?;
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
