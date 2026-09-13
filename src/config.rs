@@ -230,6 +230,14 @@ pub struct TenantCfg {
     pub header_key: String,
     /// 浏览器跳转腿豁免（去 base 后路径；尾 "/*" 一层通配）——OIDC 回跳带不了自定义头。
     pub anonymous_paths: Vec<String>,
+    /// 多租户 SQL 防护（默认 off=false；true=deny 缺租户条件即拒；"warn"=仅告警软过渡）。
+    /// 反序列化在 config.rs（三态共用 bridge::SqlGuard 一个类型）。
+    #[serde(default)]
+    pub sql_guard: crate::bridge::SqlGuard,
+    /// 共享表白名单：schema.yaml 标 `tenant: false` 的表须在此列出才生效（fail-closed；
+    /// 空 = 共享表声明被忽略，仍按受租户约束校验 tenant_id 列）。
+    #[serde(default)]
+    pub shared_allow: Vec<String>,
 }
 
 impl Default for TenantCfg {
@@ -238,6 +246,28 @@ impl Default for TenantCfg {
             enable: false,
             header_key: "X-TENANT-ID".into(),
             anonymous_paths: Vec::new(),
+            sql_guard: crate::bridge::SqlGuard::Off,
+            shared_allow: Vec::new(),
+        }
+    }
+}
+
+/// SqlGuard 三态反序列化：bool（true=Deny/false=Off）或字符串 off|warn|deny。
+impl<'de> serde::Deserialize<'de> for crate::bridge::SqlGuard {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_yaml::Value::deserialize(d)? {
+            serde_yaml::Value::Bool(false) => Ok(crate::bridge::SqlGuard::Off),
+            serde_yaml::Value::Bool(true) => Ok(crate::bridge::SqlGuard::Deny),
+            serde_yaml::Value::String(s) => match s.as_str() {
+                "off" | "false" => Ok(crate::bridge::SqlGuard::Off),
+                "warn" => Ok(crate::bridge::SqlGuard::Warn),
+                "deny" => Ok(crate::bridge::SqlGuard::Deny),
+                other => Err(Error::custom(format!(
+                    "tenant.sql_guard: illegal value {other:?} (true|false|warn|deny)"
+                ))),
+            },
+            _ => Err(Error::custom("tenant.sql_guard: expected bool or string")),
         }
     }
 }
@@ -510,6 +540,26 @@ mod tests {
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert!(c.tenant.enable && c.tenant.header_key == "X-ACCT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tenant_sql_guard_parse() {
+        let c: Config = serde_yaml::from_str("tenant:\n  enable: true\n  sql_guard: true\n").unwrap();
+        assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Deny);
+        let c: Config = serde_yaml::from_str("tenant:\n  sql_guard: warn\n").unwrap();
+        assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Warn);
+        let c: Config = serde_yaml::from_str("tenant:\n  sql_guard: deny\n").unwrap();
+        assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Deny);
+        let c: Config = serde_yaml::from_str("tenant:\n  sql_guard: off\n").unwrap();
+        assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Off);
+        let c: Config = serde_yaml::from_str("tenant: {}\n").unwrap();
+        assert_eq!(c.tenant.sql_guard, crate::bridge::SqlGuard::Off);
+        assert_eq!(c.tenant.shared_allow, Vec::<String>::new());
+        let c: Config =
+            serde_yaml::from_str("tenant:\n  sql_guard: true\n  shared_allow: [dict, geo]\n")
+                .unwrap();
+        assert_eq!(c.tenant.shared_allow, vec!["dict".to_string(), "geo".to_string()]);
+        assert!(serde_yaml::from_str::<Config>("tenant:\n  sql_guard: bogus\n").is_err());
     }
 
     /// 证书强制必配：未配置 public_key_path / certificate_path → `cert_paths_configured`
