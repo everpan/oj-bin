@@ -109,6 +109,13 @@ pub struct TableSchema {
     pub columns: BTreeMap<String, ColumnSchema>,
     #[serde(default)]
     pub indexes: HashMap<String, Vec<String>>,
+    /// 多租户：false = 共享表声明（须同时在 config tenant.shared_allow 白名单内才生效）。
+    #[serde(default = "default_true")]
+    pub tenant: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// schema.yaml 顶层：`tables: { <name>: {...} }`。BTreeMap 保证 DDL 产出顺序稳定。
@@ -191,8 +198,9 @@ impl SchemaFile {
         Self::parse(&text).map(Some)
     }
 
-    /// 归属图 + SchemaRegistry 喂料：(表名, 主键列（联合为多列，空=无）, 全部列名)。
-    pub fn registry_tables(&self) -> Vec<(&str, Vec<&str>, Vec<&str>)> {
+    /// 归属图 + SchemaRegistry 喂料：(表名, 主键列（联合为多列，空=无）, 全部列名,
+    /// tenant 标志（false = 共享表声明）)。
+    pub fn registry_tables(&self) -> Vec<(&str, Vec<&str>, Vec<&str>, bool)> {
         self.tables
             .iter()
             .map(|(name, t)| {
@@ -200,8 +208,31 @@ impl SchemaFile {
                     name.as_str(),
                     t.pk.iter().map(|s| s.as_str()).collect(),
                     t.columns.keys().map(|s| s.as_str()).collect(),
+                    t.tenant,
                 )
             })
+            .collect()
+    }
+
+    /// sql_guard 声明期校验：tenant=true（默认）的表必须含 tenant_id 列。
+    pub fn validate_tenant(&self, module: &str) -> Result<(), String> {
+        for (name, t) in &self.tables {
+            if t.tenant && !t.columns.contains_key("tenant_id") {
+                return Err(format!(
+                    "schema: [{module}] 表 {name:?} 缺 tenant_id 列（tenant.sql_guard 启用中；\
+                     共享表请显式 tenant: false 并加入 config tenant.shared_allow）"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 共享表声明清单（tenant: false 的表）。
+    pub fn shared_tables(&self) -> Vec<&str> {
+        self.tables
+            .iter()
+            .filter(|(_, t)| !t.tenant)
+            .map(|(n, _)| n.as_str())
             .collect()
     }
 }
@@ -620,6 +651,7 @@ tables:
                 ),
             ]),
             indexes: HashMap::new(),
+            tenant: true,
         };
         let sq = create_table_ddl(&comp, "order_item", Dialect::Sqlite);
         let my = create_table_ddl(&comp, "order_item", Dialect::MySql);
@@ -737,6 +769,48 @@ tables:
         assert!(has("ghost"), "{r:?}"); // 声明有实库无
         assert!(has("gone"), "{r:?}"); // 实库有声明无
         assert!(has("D002") && has("rogue"), "{r:?}");
+    }
+
+    #[test]
+    fn tenant_flag_defaults_true_and_parse() {
+        // 缺省 = true（多租户默认收紧）。
+        let f = SchemaFile::parse(
+            "tables:\n  t:\n    columns:\n      id: { type: integer }\n      tenant_id: { type: text }\n",
+        )
+        .unwrap();
+        assert!(f.tables["t"].tenant);
+        // 显式 false = 共享表声明。
+        let f = SchemaFile::parse(
+            "tables:\n  s:\n    tenant: false\n    columns:\n      id: { type: integer }\n",
+        )
+        .unwrap();
+        assert!(!f.tables["s"].tenant);
+        assert_eq!(f.shared_tables(), vec!["s"]);
+
+        // validate_tenant：tenant=true 缺 tenant_id 列 → Err；含列 → Ok；false 豁免。
+        let bad = SchemaFile::parse("tables:\n  t:\n    columns:\n      id: { type: integer }\n")
+            .unwrap();
+        let e = bad.validate_tenant("user").unwrap_err();
+        assert!(
+            e.contains("tenant_id") && e.contains("user") && e.contains("t"),
+            "{e}"
+        );
+        let ok = SchemaFile::parse(
+            "tables:\n  t:\n    columns:\n      id: { type: integer }\n      tenant_id: { type: text }\n",
+        )
+        .unwrap();
+        assert!(ok.validate_tenant("user").is_ok());
+        assert!(f.validate_tenant("user").is_ok()); // 共享表无需 tenant_id
+
+        // registry_tables 末位 = tenant 标志。
+        let f = SchemaFile::parse(
+            "tables:\n  a:\n    columns:\n      id: { type: integer }\n      tenant_id: { type: text }\n  b:\n    tenant: false\n    columns:\n      id: { type: integer }\n",
+        )
+        .unwrap();
+        let r = f.registry_tables();
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().any(|(n, _, _, t)| *n == "a" && *t));
+        assert!(r.iter().any(|(n, _, _, t)| *n == "b" && !*t));
     }
 
     #[test]
