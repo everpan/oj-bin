@@ -14,6 +14,7 @@ use crate::server_cmd::{Registries, assemble_plugins, connect_dbs, load_app_conf
 struct Slim {
     default: Arc<dyn DataAccessor>,
     modules: Vec<(String, PathBuf)>,
+    sql_guard: only_js::bridge::SqlGuard,
 }
 
 async fn slim(
@@ -44,7 +45,11 @@ async fn slim(
         }
         modules.retain(|(n, _)| n == m);
     }
-    Ok(Slim { default, modules })
+    Ok(Slim {
+        default,
+        modules,
+        sql_guard: cfg.tenant.sql_guard,
+    })
 }
 
 /// `oj migrate [-c config] [-d dir] [--baseline] [--module M]`：
@@ -68,6 +73,9 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         total += n;
         // schema.yaml 安全前向收敛（§D1：reconcile 只进 apply 路径，迁移后补声明漂移）。
         if let Some(f) = crate::schema::SchemaFile::load(mdir)? {
+            if s.sql_guard != only_js::bridge::SqlGuard::Off {
+                f.validate_tenant(name)?;
+            }
             for l in crate::schema::reconcile(s.default.as_ref(), name, &f).await? {
                 println!("oj migrate: {l}");
             }

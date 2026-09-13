@@ -15,7 +15,12 @@ use crate::manifest::{self, Manifest};
 /// 旁目录缺 manifest.yaml 不在此报——S001 归 load_modules/既有路径）。
 /// view = 跨模块版本视图（dist/manifests.yaml 锁 ∪ src 各模块 manifest，build 已构造）。
 /// 返回全部违规（一次给全，不逐条 fail-fast——CI 修复体验）。
-pub fn run(src: &Path, names: &[String], view: &BTreeMap<String, String>) -> Result<(), String> {
+pub fn run(
+    src: &Path,
+    names: &[String],
+    view: &BTreeMap<String, String>,
+    guard: only_js::bridge::SqlGuard,
+) -> Result<(), String> {
     let mut v: Vec<String> = Vec::new();
 
     // 归属图：表 → 拥有模块（各模块 schema.yaml）+ manifest/schema 快照。
@@ -28,6 +33,9 @@ pub fn run(src: &Path, names: &[String], view: &BTreeMap<String, String>) -> Res
             manifests.insert(name.clone(), manifest::parse_one(&mf)?);
         }
         if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
+            if guard != only_js::bridge::SqlGuard::Off {
+                f.validate_tenant(&name)?;
+            }
             for t in f.tables.keys() {
                 if let Some(prev) = owner.insert(t.clone(), name.clone())
                     && (names.contains(&prev) || names.contains(&name))
@@ -374,7 +382,15 @@ mod tests {
             "function get(){ return db.query(\"select * from orders\"); }\nexport default { get };\n",
         );
         let view = BTreeMap::from([("user".into(), "0.1.0".into())]);
-        assert!(run(&t.join("src"), &names(&t.join("src")), &view).is_ok());
+        assert!(
+            run(
+                &t.join("src"),
+                &names(&t.join("src")),
+                &view,
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -386,7 +402,13 @@ mod tests {
             "import x from \"../user/api\";\nfunction get(){ return db.query('select * from account join orders using (id)'); }\nexport default { get };\n",
         );
         let view = BTreeMap::new();
-        let e = run(&t.join("src"), &names(&t.join("src")), &view).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &names(&t.join("src")),
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(
             e.contains("S003") && e.contains("account") && e.contains("user"),
             "{e}"
@@ -398,7 +420,15 @@ mod tests {
             &t.join("src/order/list/api.ts"),
             "function get(){ return db.query('select * from account /* oj:allow-table=account */'); }\nexport default { get };\n",
         );
-        assert!(run(&t.join("src"), &names(&t.join("src")), &view).is_ok());
+        assert!(
+            run(
+                &t.join("src"),
+                &names(&t.join("src")),
+                &view,
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -409,7 +439,13 @@ mod tests {
             &t.join("src/order/seed.sql"),
             "INSERT OR IGNORE INTO account VALUES (1);\n",
         );
-        let e = run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("S006") && e.contains("account"), "{e}");
         // deps 声明后放行（S003/S006 共用判定）。
         write(
@@ -417,7 +453,15 @@ mod tests {
             &manifest("order", "tables: [orders]\ndeps:\n  user: \"^0.1.0\"\n"),
         );
         let view = BTreeMap::from([("user".into(), "0.1.0".into())]);
-        assert!(run(&t.join("src"), &["order".to_string()], &view).is_ok());
+        assert!(
+            run(
+                &t.join("src"),
+                &["order".to_string()],
+                &view,
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -429,23 +473,55 @@ mod tests {
             &manifest("order", "tables: [orders]\ndeps:\n  user: \"^0.2.0\"\n"),
         );
         let view = BTreeMap::from([("user".into(), "0.1.0".into())]);
-        let e = run(&t.join("src"), &["order".to_string()], &view).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("S004") && e.contains("^0.2.0"), "{e}");
         // 范围满足 → 过。
         let view = BTreeMap::from([("user".into(), "0.2.1".into())]);
-        assert!(run(&t.join("src"), &["order".to_string()], &view).is_ok());
+        assert!(
+            run(
+                &t.join("src"),
+                &["order".to_string()],
+                &view,
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
         // 依赖缺失 / 目标版本非 semver / range 非法。
-        let e = run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("不在 dist/manifests.yaml"), "{e}");
         let view = BTreeMap::from([("user".into(), "legacy".into())]);
-        let e = run(&t.join("src"), &["order".to_string()], &view).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("不可解析"), "{e}");
         write(
             &t.join("src/order/manifest.yaml"),
             &manifest("order", "tables: [orders]\ndeps:\n  user: \"latest\"\n"),
         );
         let view = BTreeMap::from([("user".into(), "0.1.0".into())]);
-        let e = run(&t.join("src"), &["order".to_string()], &view).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("非法"), "{e}");
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -457,13 +533,25 @@ mod tests {
             &t.join("src/order/manifest.yaml"),
             &manifest("order", "tables: [orders, ghost]\n"),
         );
-        let e = run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("S005") && e.contains("ghost"), "{e}");
         write(
             &t.join("src/order/manifest.yaml"),
             &manifest("order", "tables: []\n"),
         );
-        let e = run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("S005") && e.contains("orders"), "{e}");
         let _ = std::fs::remove_dir_all(&t);
     }
@@ -475,7 +563,13 @@ mod tests {
             &t.join("src/order/seed.sql"),
             "CREATE TABLE x (a);\nINSERT INTO orders VALUES (1);\nINSERT OR IGNORE INTO orders VALUES (2);\nINSERT INTO account VALUES (1);\n-- DROP TABLE y\n",
         );
-        let e = run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).unwrap_err();
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(e.contains("S006") && e.contains("CREATE"), "{e}");
         assert!(e.contains("非幂等"), "{e}");
         assert!(e.contains("account") && e.contains("user"), "{e}");
@@ -496,8 +590,22 @@ mod tests {
             &t.join("src/other/schema.yaml"),
             "tables:\n  account:\n    pk: id\n    columns:\n      id: { type: integer }\n",
         );
-        assert!(run(&t.join("src"), &["order".to_string()], &BTreeMap::new()).is_ok());
-        let e = run(&t.join("src"), &names(&t.join("src")), &BTreeMap::new()).unwrap_err();
+        assert!(
+            run(
+                &t.join("src"),
+                &["order".to_string()],
+                &BTreeMap::new(),
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
+        let e = run(
+            &t.join("src"),
+            &names(&t.join("src")),
+            &BTreeMap::new(),
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
         assert!(
             e.contains("S002") && e.contains("user") && e.contains("other"),
             "{e}"
