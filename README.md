@@ -136,7 +136,8 @@ exactly once to end the session.
 ```ts
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => (r.length ? json.ok(r[0]) : json.fail(404, "no such account")))
     .catch((e) => json.fail(500, String(e)));
 }

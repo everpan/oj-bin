@@ -7,21 +7,28 @@ async function get(): Promise<void> {
   const roles: string[] = u.roles ?? [];
   let menuIds: number[] = [];
   if (roles.length) {
-    const ph = roles.map(() => "?").join(",");
-    const roleRows: any[] = await db.query("select id from role where code in (" + ph + ")", roles);
+    const roleRows: any[] = await db.table("role")
+      .select(["id"])
+      .where({ field: "code", op: "in", value: roles })
+      .all();
     const rids = roleRows.map((r) => r.id);
     if (rids.length) {
-      const ph2 = rids.map(() => "?").join(",");
-      const binds: any[] = await db.query(
-        "select menu_id from role_menu where role_id in (" + ph2 + ")", rids);
+      const binds: any[] = await db.table("role_menu")
+        .select(["menu_id"])
+        .where({ field: "role_id", op: "in", value: rids })
+        .all();
       menuIds = binds.map((b) => b.menu_id);
     }
   }
   if (!menuIds.length) { json.ok([]); return; }
-  const ph3 = menuIds.map(() => "?").join(",");
-  const rows: any[] = await db.query(
-    "select id, parent_id, name, path, component, sort, icon, keep_alive, iframe_link, external_link from menu where menu_type in (0, 1, 2) and id in (" + ph3 + ") order by id",
-    menuIds);
+  const rows: any[] = await db.table("menu")
+    .select(["id", "parent_id", "name", "path", "component", "sort", "icon", "keep_alive", "iframe_link", "external_link"])
+    .where({ and: [
+      { field: "menu_type", op: "in", value: [0, 1, 2] },
+      { field: "id", op: "in", value: menuIds },
+    ] })
+    .orderBy([{ field: "id", dir: "asc" }])
+    .all();
 
   const nodes = new Map<number, any>();
   for (const m of rows) {

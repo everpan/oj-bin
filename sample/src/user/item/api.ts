@@ -6,7 +6,8 @@ function detail(): void {
     json.fail(400, "id required");
     return;
   }
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => (r.length ? json.ok(r[0]) : json.fail(404, "no such account")))
     .catch((e) => json.fail(500, String(e)));
 }

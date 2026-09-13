@@ -6,6 +6,7 @@ async function post(): Promise<void> {
   const b = http.body as any;
   if (!b || !b.name) { json.fail(400, "name required"); return; }
   const now = Date.now();
+  // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
   const rows: any[] = await db.query(
     "insert into menu (parent_id, menu_type, name, path, component, sort, icon, current_active_menu, iframe_link, keep_alive, external_link, hide_in_menu, ignore_access, status, create_time, update_time) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
     [Number(b.parentId) || 0, b.menuType ?? 0, b.name, b.path ?? "", b.component ?? "",
@@ -22,17 +23,28 @@ async function put(): Promise<void> {
   if (!(id > 0)) { json.fail(400, "id required"); return; }
   if (!b || !b.name?.trim()) { json.fail(400, "name required"); return; }
   const now = Date.now();
-  const n = await db.exec(
-    "update menu set parent_id = ?, menu_type = ?, name = ?, path = ?, component = ?, sort = ?, icon = ?, current_active_menu = ?, iframe_link = ?, keep_alive = ?, external_link = ?, hide_in_menu = ?, ignore_access = ?, status = ?, update_time = ? where id = ?",
-    [Number(b.parentId) || 0, b.menuType ?? 0, b.name ?? "", b.path ?? "", b.component ?? "",
-     b.order ?? null, b.icon ?? "", b.currentActiveMenu ?? "", b.iframeLink ?? "",
-     bool(b.keepAlive), b.externalLink ?? "", bool(b.hideInMenu), bool(b.ignoreAccess),
-     b.status ?? 1, now, id],
-  );
+  const n = await db.table("menu").update({
+    parent_id: Number(b.parentId) || 0,
+    menu_type: b.menuType ?? 0,
+    name: b.name ?? "",
+    path: b.path ?? "",
+    component: b.component ?? "",
+    sort: b.order ?? null,
+    icon: b.icon ?? "",
+    current_active_menu: b.currentActiveMenu ?? "",
+    iframe_link: b.iframeLink ?? "",
+    keep_alive: bool(b.keepAlive),
+    external_link: b.externalLink ?? "",
+    hide_in_menu: bool(b.hideInMenu),
+    ignore_access: bool(b.ignoreAccess),
+    status: b.status ?? 1,
+    update_time: now,
+  }).where({ field: "id", op: "eq", value: id }).run();
   if (n === 0) { json.fail(404, "no such menu"); return; }
-  const rows: any[] = await db.query(
-    "select " + MENU_COLS + " from menu where id = ?",
-    [id]);
+  const rows: any[] = await db.table("menu")
+    .select(MENU_COLS.split(",").map((c) => c.trim()))
+    .where({ field: "id", op: "eq", value: id })
+    .all();
   json.ok(mapMenu(rows[0]));
 }
 
@@ -42,8 +54,8 @@ async function del(): Promise<void> {
   let found = true;
   try {
     await db.tx(async (tx: any) => {
-      await tx.exec("delete from role_menu where menu_id = ?", [id]);
-      const n = await tx.exec("delete from menu where id = ?", [id]);
+      await tx.table("role_menu").delete().where({ field: "menu_id", op: "eq", value: id }).run();
+      const n = await tx.table("menu").delete().where({ field: "id", op: "eq", value: id }).run();
       if (n === 0) { found = false; throw new Error("no such menu"); }
     });
   } catch (_e) {

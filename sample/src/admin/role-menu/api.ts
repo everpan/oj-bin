@@ -1,5 +1,8 @@
 async function get(): Promise<void> {
-  const rows: any[] = await db.query("select id, parent_id, menu_type, name from menu order by id", []);
+  const rows: any[] = await db.table("menu")
+    .select(["id", "parent_id", "menu_type", "name"])
+    .orderBy([{ field: "id", dir: "asc" }])
+    .all();
   json.ok(rows.map((m) => {
     const item: any = { id: m.id, menuType: m.menu_type, name: m.name };
     if (m.parent_id !== 0) item.parentId = m.parent_id;

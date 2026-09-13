@@ -231,7 +231,7 @@ await db.table("order")
 
 - **标识符**（表名/列名）**绝不**来自 JS 字符串拼接——只能来自 `SchemaRegistry` 白名单
   （经 `db.table(...)` 构造器）。
-- **值**通过绑定参数传递：`db.query("... where id = $1", [id])` 或构造器的 `value`。
+- **值**通过绑定参数传递：构造器的 `value`（`db.table("user").where({ field: "id", op: "eq", value: id })`）或原生 `db.query("... where id = $1", [id])`。
 - 占位符风格随底层驱动而定：`$1`（Postgres）/ `?`（MySQL、SQLite）。
 
 ---

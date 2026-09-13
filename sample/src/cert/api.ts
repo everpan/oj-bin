@@ -4,10 +4,10 @@ import { isAdmin, parseDays, statusOf } from "./_shared/guard";
 async function get(): Promise<void> {
   if (!isAdmin()) { json.fail(403, "admin only"); return; }
   try {
-    const rows = await db.query(
-      "select id, name, note, public_pem, cert_jws, nbf, exp, created_at, updated_at from certs order by id",
-      [],
-    );
+    const rows = await db.table("certs")
+      .select(["id", "name", "note", "public_pem", "cert_jws", "nbf", "exp", "created_at", "updated_at"])
+      .orderBy([{ field: "id", dir: "asc" }])
+      .all();
     const now = Math.floor(Date.now() / 1000);
     json.ok(rows.map((r) => ({ ...r, status: statusOf(r.nbf as number, r.exp as number, now) })));
   } catch (e) {
@@ -33,6 +33,7 @@ async function post(): Promise<void> {
     const m = await cert.generate(bits, now, exp);
     // 单条 RETURNING 原子取 id：全池共享一条 sqlite 连接，exec 后再查
     // last_insert_rowid() 可能读到并发插入的 id。
+    // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
     const rows = await db.query(
       "insert into certs (name, note, public_pem, private_pem, cert_jws, nbf, exp, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
       [name, (b.note ?? "").slice(0, 2000), m.public_pem, m.private_pem, m.cert_jws, now, exp, now, now],

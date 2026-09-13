@@ -49,8 +49,9 @@ json.raw(data)             // 裸 JSON 200（无信封外壳），标准协议�
 ### db / DB(name) —— 数据访问（Promise）
 
 ```js
-// 原始 SQL + 绑定参数（参数防注入，推荐）。
-const rows = await db.query("select * from user where id = $1", [1]); // Row[]（JSON 对象数组）
+// 安全构造器 + 绑定参数（值参数化，标识符走白名单，推荐）。
+const rows = await db.table("user").where({ field: "id", op: "eq", value: 1 }).all(); // Row[]（JSON 对象数组）
+// 构造器不覆盖的语句才退回原生参数化执行：
 const n = await db.exec("update user set age = $1 where id = $2", [19, 1]); // 受影响行数
 
 // 安全查询构造器（标识符白名单 + 值参数化，强烈推荐）。

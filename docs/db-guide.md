@@ -184,10 +184,11 @@ where（构造器条件对象自带 `.has("tenant_id")` 检查，见 [§5.3](#53
 
 ## 3. 原生参数化查询（query / exec）
 
-适合已有 SQL、聚合报表、构造器不覆盖的语句：
+适合构造器不覆盖的语句（聚合报表、方言特有语法）；简单增删改查优先用构造器（见 [§5](#5-查询构造器从最小查询到组合)）：
 
 ```ts
-const rows = await db.query("select id, name from account where role = ?", ["admin"]);
+const rows = await db.table("account").select(["id", "name"]).where({ field: "role", op: "eq", value: "admin" }).all();
+// 构造器不覆盖的语句才退回原生参数化执行：
 const n = await db.exec("update account set role = ? where id = ?", ["user", 7]);
 ```
 

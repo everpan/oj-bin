@@ -71,13 +71,16 @@ export default {
     // 登录——bcrypt.verify 对非法 hash 恒 false，零 schema 变更）。
     const sub = String(claims.sub);
     const localName = "oidc:" + snap.tenant + ":" + sub;
-    let rows = await db.query("select id, roles from users where username = ?", [localName]);
+    let rows = await db.table("users")
+      .select(["id", "roles"])
+      .where({ field: "username", op: "eq", value: localName })
+      .all();
     if (!rows.length) {
-      await db.exec(
-        "insert into users (username, password_hash, roles) values (?, ?, '[]')",
-        [localName, "!oidc"],
-      );
-      rows = await db.query("select id, roles from users where username = ?", [localName]);
+      await db.table("users").insert({ username: localName, password_hash: "!oidc", roles: "[]" }).run();
+      rows = await db.table("users")
+        .select(["id", "roles"])
+        .where({ field: "username", op: "eq", value: localName })
+        .all();
     }
     let roles: string[] = [];
     try {

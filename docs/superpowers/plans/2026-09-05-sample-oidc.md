@@ -1196,10 +1196,10 @@ import { nowSecs } from "../../auth/_shared/util";
 export default {
   async post() {
     const b = http.body || {};
-    const rows = await db.query(
-      "select id, password_hash from users where username = ?",
-      [String(b.username ?? "")],
-    );
+    const rows = await db.table("users")
+      .select(["id", "password_hash"])
+      .where({ field: "username", op: "eq", value: String(b.username ?? "") })
+      .all();
     const row = rows[0];
     // 用户不存在与密码错同报（不泄露用户存在性，对齐 auth/login）。
     if (!row || !(await bcrypt.verify(String(b.password ?? ""), <string>row.password_hash || ""))) {
@@ -1713,13 +1713,19 @@ export default {
     // JIT 本地映射：sub → users 行；无则建（'!oidc' 非法占位 hash 不可密码登录——
     // bcrypt.verify 对非法 hash 恒 false，零 schema 变更）。
     const sub = String(claims.sub);
-    let rows = await db.query("select id, roles from users where username = ?", [sub]);
+    let rows = await db.table("users")
+      .select(["id", "roles"])
+      .where({ field: "username", op: "eq", value: sub })
+      .all();
     if (!rows.length) {
       await db.exec(
         "insert into users (username, password_hash, roles) values (?, ?, '[]')",
         [sub, "!oidc"],
       );
-      rows = await db.query("select id, roles from users where username = ?", [sub]);
+      rows = await db.table("users")
+        .select(["id", "roles"])
+        .where({ field: "username", op: "eq", value: sub })
+        .all();
     }
     let roles: string[] = [];
     try {

@@ -4,6 +4,7 @@ async function post(): Promise<void> {
   const b = http.body as { name?: string; code?: string; status?: number; remark?: string } | null;
   if (!b || !b.name || !b.code) { json.fail(400, "name and code required"); return; }
   const now = Date.now();
+  // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
   const rows: any[] = await db.query(
     "insert into role (name, code, status, remark, create_time, update_time) values (?, ?, ?, ?, ?, ?) returning id",
     [b.name, b.code, b.status ?? 1, b.remark ?? "", now, now],
@@ -17,13 +18,18 @@ async function put(): Promise<void> {
   if (!(id > 0)) { json.fail(400, "id required"); return; }
   if (!b || !b.name?.trim() || !b.code?.trim()) { json.fail(400, "name and code required"); return; }
   const now = Date.now();
-  const n = await db.exec(
-    "update role set name = ?, code = ?, status = ?, remark = ?, update_time = ? where id = ?",
-    [b.name, b.code, b.status ?? 1, b.remark ?? "", now, id],
-  );
+  const n = await db.table("role").update({
+    name: b.name,
+    code: b.code,
+    status: b.status ?? 1,
+    remark: b.remark ?? "",
+    update_time: now,
+  }).where({ field: "id", op: "eq", value: id }).run();
   if (n === 0) { json.fail(404, "no such role"); return; }
-  const rows: any[] = await db.query(
-    "select id, name, code, status, remark, create_time, update_time from role where id = ?", [id]);
+  const rows: any[] = await db.table("role")
+    .select(["id", "name", "code", "status", "remark", "create_time", "update_time"])
+    .where({ field: "id", op: "eq", value: id })
+    .all();
   json.ok(mapRole(rows[0]));
 }
 
@@ -33,8 +39,8 @@ async function del(): Promise<void> {
   let found = true;
   try {
     await db.tx(async (tx: any) => {
-      await tx.exec("delete from role_menu where role_id = ?", [id]);
-      const n = await tx.exec("delete from role where id = ?", [id]);
+      await tx.table("role_menu").delete().where({ field: "role_id", op: "eq", value: id }).run();
+      const n = await tx.table("role").delete().where({ field: "id", op: "eq", value: id }).run();
       if (n === 0) { found = false; throw new Error("no such role"); }
     });
   } catch (_e) {

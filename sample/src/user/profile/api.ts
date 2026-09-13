@@ -1,6 +1,7 @@
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => json.ok(r[0] ?? null))
     .catch((e) => json.fail(500, String(e)));
 }

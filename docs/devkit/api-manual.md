@@ -294,7 +294,8 @@ runtime 会泵 event loop 直到所有 Promise 落定后再写回响应（摘自
 ```ts
 function get(): void {
   const id = Number(http.param("id", 0));
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => json.ok(r))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -337,7 +338,8 @@ handler 函数挂 `.route` 属性即**替换**目录镜像路由，支持 matchi
 function detail(): void {
   const id = Number(http.param("id", 0));
   if (!(id > 0)) { json.fail(400, "id required"); return; }
-  db.query("select id, name, role from account where id = ?", [id])
+  db.table("account").select(["id", "name", "role"]).where({ field: "id", op: "eq", value: id })
+    .all()
     .then((r) => (r.length ? json.ok(r[0]) : json.fail(404, "no such account")))
     .catch((e) => json.fail(500, String(e)));
 }
@@ -1312,7 +1314,7 @@ cd sample && npm run test:unit    # 统一入口（等价 cd unit && npm ci && n
 
 结构：`mocks/oj-globals.ts` 提供 `installGlobals(opts?)`（把 `db/json/http/bus/log`
 换成可控桩，返回响应捕获 `{code,msg,data}`；`lastPublished()` 取 `bus.publish` 记录，
-`lastSqlCalls()` 取 `db.query/exec` 的 SQL 与绑定参数——可断言 handler 走了哪个分支）；
+`lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/构造器）与绑定参数——可断言 handler 走了哪个分支）；
 `invoke.ts` 提供 `invoke(handler, method, opts?)`（装桩 → 调 handler → flush 微任务 →
 返回 `{ ...capture, published }`）；`*.spec.ts` 直接 import 真实 `../src/.../api` 的 handler。
 
@@ -1734,7 +1736,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 
 - **动态标识符（表名/列名）只来自 `db.table()` 查询构造器**（SchemaRegistry 白名单），
   **绝不来自 JS 字符串**。
-- **值只通过绑定参数传递**（`db.query("... where id = ?", [id])`），**绝不字符串拼接**。
+- **值只通过绑定参数传递**（`db.query("... where id = ?", [id])` 或构造器的 `value`），**绝不字符串拼接**。
 
 ```ts
 // 正确：标识符走构造器，值走绑定参数

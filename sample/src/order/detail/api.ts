@@ -7,7 +7,8 @@ function get(): void {
       json.ok({ cached: true, data: JSON.parse(hit) });
       return;
     }
-    db.query("select id, no, account_id, amount from orders where id = ?", [Number(id)])
+    db.table("orders").select(["id", "no", "account_id", "amount"]).where({ field: "id", op: "eq", value: Number(id) })
+      .all()
       .then((rows) => {
         const row = rows[0] ?? null;
         kv.set(key(id), JSON.stringify(row)).then(() =>

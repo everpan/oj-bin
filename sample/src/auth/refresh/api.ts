@@ -11,7 +11,7 @@ export default {
       return;
     }
     // session 只存 uid——roles 重查库取最新。
-    const rows = await db.query("select roles from users where id = ?", [sess.uid]);
+    const rows = await db.table("users").select(["roles"]).where({ field: "id", op: "eq", value: sess.uid }).all();
     let roles: string[] = [];
     try { roles = JSON.parse((rows[0] || {}).roles || "[]"); } catch { roles = []; }
     // 轮换：先删旧 session（旧 refresh 立即失效，一次一用）再签新对。

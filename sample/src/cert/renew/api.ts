@@ -9,15 +9,15 @@ async function post(): Promise<void> {
   const days = parseDays(b.days);
   if (!days) { json.fail(400, "days must be integer 1..=3650"); return; }
   try {
-    const rows = await db.query("select private_pem from certs where id = ?", [id]);
+    const rows = await db.table("certs").select(["private_pem"]).where({ field: "id", op: "eq", value: id }).all();
     if (!rows.length) { json.fail(404, "cert not found"); return; }
     const now = Math.floor(Date.now() / 1000);
     const exp = now + days * 86400;
     const certJws = await cert.renew(String(rows[0].private_pem), now, exp);
-    const n = await db.exec(
-      "update certs set cert_jws = ?, nbf = ?, exp = ?, updated_at = ? where id = ?",
-      [certJws, now, exp, now, id],
-    );
+    const n = await db.table("certs")
+      .update({ cert_jws: certJws, nbf: now, exp, updated_at: now })
+      .where({ field: "id", op: "eq", value: id })
+      .run();
     if (!n) { json.fail(404, "cert not found"); return; }
     json.ok({ renewed: true, nbf: now, exp });
   } catch (e) {
