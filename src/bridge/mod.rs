@@ -241,6 +241,7 @@ deno_core::extension!(
         kv::op_kv_expire,
         kv::op_kv_incr,
         db::op_db_has,
+        db::op_db_as_system,
         db::op_db_query,
         db::op_db_exec,
         db::op_db_tx_begin,

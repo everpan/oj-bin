@@ -278,6 +278,16 @@ pub async fn op_db_tx_rollback(
     Ok(true)
 }
 
+/// db.asSystem()：本请求以系统身份绕过租户防护（请求级，ReqState 重置即失效；
+/// 每次调用记审计日志）。多租户 sql_guard 下的显式逃生口——系统任务/跨租户报表用，
+/// 业务 handler 不得使用。
+#[op2(fast)]
+pub fn op_db_as_system(state: &mut OpState) -> bool {
+    state.borrow_mut::<super::ReqState>().system = true;
+    eprintln!("warn: db.asSystem() invoked (tenant guard bypass for this request)");
+    true
+}
+
 /// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
 #[op2]
 #[serde]

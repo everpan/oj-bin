@@ -21,6 +21,7 @@ import {
   op_cert_renew,
   op_db_exec,
   op_db_has,
+  op_db_as_system,
   op_db_query,
   op_db_query_build,
   op_db_query_sql,
@@ -318,6 +319,9 @@ globalThis.DB = function (name) {
       exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
+      // system escape hatch (tenant sql_guard): this request bypasses tenant
+      // injection/checks. Explicit + audited; business handlers must not use it.
+      asSystem: () => { op_db_as_system(); return dbCache.get(name); },
       // rebuild a builder from a toJSON() snapshot (continues the chain on this db).
       fromJSON: (snap) => builderFromReq(snap),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
@@ -332,6 +336,7 @@ globalThis.DB = function (name) {
             exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
             table: (t) => queryBuilder(name, String(t)),
             fromJSON: (snap) => builderFromReq(snap),
+            asSystem: () => { op_db_as_system(); return dbCache.get(name); },
           });
           await op_db_tx_commit(name);
           return out;
