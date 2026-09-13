@@ -2,7 +2,7 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
-## Unreleased
+## v0.1.15（2026-09-13）
 
 **特性**
 - `tenant.sql_guard` 多租户 SQL 防护（false（默认，不改写 SQL）| `"warn"` 注入+告警 |
@@ -20,18 +20,6 @@
   绑定（规划见设计文档 §7，另立任务）；裸 SQL 字面检查为 best-effort（只防完全遗漏）。
   设计/评审：`docs/superpowers/specs/2026-09-13-tenant-sql-guard-design.md`。
 
-**修复（集中审查）**
-- guard：`Join.tenant_id` serde 预设可被 `db.fromJSON` 投毒（绕过 JS 链层直喂 serde，
-  评审 P0）——`apply_tenant` 改为对受约束 join 表**无条件覆盖**注入值，JS 预设永不生效；
-  tokens() 此前整段跳过 `"…"`/`` `…` `` 引用标识符 → `FROM "t"` 对表提取失明（裸 SQL
-  守卫静默放行）——引用标识符内容现在成词，`"t"` 形态可见（toSQL 回放从 vacuous pass
-  变为真校验）。附回归用例：fromJSON 投毒覆盖 + 引用标识符单元/行为用例。
-- oidc_e2e：夹具 `_platform` 补 schema.yaml（users 表声明）——v0.1.15 将 idp/login
-  改写为 `db.table()` 构造器后，表须经 SchemaRegistry 白名单（registry 来自
-  schema.yaml，seed.sql 只建物理表），夹具缺声明致 login 500、set-cookie 缺失 panic。
-
-## v0.1.15（2026-09-13）
-
 **CI**
 - `ci(release)`：新增 `guard` 去重 job——`gh release create` 会把刚建的 tag 推回远端再次命中
   `push: tags` 触发整条流水线重跑（并自动把草稿转正），浪费三平台构建/测试资源。`guard` 在
@@ -46,6 +34,16 @@
   （account / item / profile / order-{account,detail,list} / auth-{login,refresh} / idp/login /
   oidc/callback / cert/* / admin/*）。构造器不支持的列别名 / `RETURNING id` /
   `last_insert_rowid` / 动态列清单 / join 别名等场景保留原生查询（注释标明）。
+
+**修复（集中审查）**
+- guard：`Join.tenant_id` serde 预设可被 `db.fromJSON` 投毒（绕过 JS 链层直喂 serde，
+  评审 P0）——`apply_tenant` 改为对受约束 join 表**无条件覆盖**注入值，JS 预设永不生效；
+  tokens() 此前整段跳过 `"…"`/`` `…` `` 引用标识符 → `FROM "t"` 对表提取失明（裸 SQL
+  守卫静默放行）——引用标识符内容现在成词，`"t"` 形态可见（toSQL 回放从 vacuous pass
+  变为真校验）。附回归用例：fromJSON 投毒覆盖 + 引用标识符单元/行为用例。
+- oidc_e2e：夹具 `_platform` 补 schema.yaml（users 表声明）——本版本内 idp/login 改写
+  为 `db.table()` 构造器后，表须经 SchemaRegistry 白名单（registry 来自
+  schema.yaml，seed.sql 只建物理表），夹具缺声明致 login 500、set-cookie 缺失 panic。
 
 ## v0.1.14（2026-09-12）
 
