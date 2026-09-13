@@ -115,7 +115,14 @@ async fn oidc_full_chain_login_bridge_and_tenant() {
     std::fs::create_dir_all(src.join("_platform")).unwrap();
     std::fs::write(
         src.join("_platform/manifest.yaml"),
-        "name: _platform\ndesc: users\nversion: 0.1.0\n",
+        "name: _platform\ndesc: users\nversion: 0.1.0\ntables:\n  - users\n",
+    )
+    .unwrap();
+    // idp/login（v0.1.15 起用 db.table 构造器）要求 users 进 SchemaRegistry 白名单
+    // （registry 来自 schema.yaml 声明，seed.sql 只建物理表）。
+    std::fs::write(
+        src.join("_platform/schema.yaml"),
+        "tables:\n  users:\n    pk: id\n    columns:\n      id: { type: integer, autoincrement: true }\n      username: { type: text, null: false }\n      password_hash: { type: text, null: false }\n      roles: { type: text, null: false }\n",
     )
     .unwrap();
     std::fs::write(

@@ -26,6 +26,9 @@
   tokens() 此前整段跳过 `"…"`/`` `…` `` 引用标识符 → `FROM "t"` 对表提取失明（裸 SQL
   守卫静默放行）——引用标识符内容现在成词，`"t"` 形态可见（toSQL 回放从 vacuous pass
   变为真校验）。附回归用例：fromJSON 投毒覆盖 + 引用标识符单元/行为用例。
+- oidc_e2e：夹具 `_platform` 补 schema.yaml（users 表声明）——v0.1.15 将 idp/login
+  改写为 `db.table()` 构造器后，表须经 SchemaRegistry 白名单（registry 来自
+  schema.yaml，seed.sql 只建物理表），夹具缺声明致 login 500、set-cookie 缺失 panic。
 
 ## v0.1.15（2026-09-13）
 
