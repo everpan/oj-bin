@@ -27,7 +27,7 @@ use only_js::bridge::{
     Bridge, DataAccessor, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx,
     NamedRegistry, SchemaRegistry,
 };
-use only_js::bridge::{EventBroker, StableState};
+use only_js::bridge::{EventBroker, SqlGuard, StableState};
 use only_js::config::{self, Config};
 use server::CertificateStatus;
 use server::actor::JsActor;
@@ -188,6 +188,19 @@ fn ownership_deny_of(cfg: &Config) -> Result<bool, String> {
             "server.ownership_guard: illegal value {other:?} (warn|deny)"
         )),
     }
+}
+
+/// 多租户 SQL 防护模式（tenant.sql_guard）：enable=false 而 guard 非 Off → warn
+/// （防误以为已防护）；非法值已在 config 反序列化期 fail-fast。
+fn sql_guard_of(cfg: &Config) -> SqlGuard {
+    let g = cfg.tenant.sql_guard;
+    if !cfg.tenant.enable && g != SqlGuard::Off {
+        eprintln!(
+            "warn: tenant.sql_guard {g:?} 生效中但 tenant.enable=false \
+             （http.tenantId 恒为 None，防护形同虚设）"
+        );
+    }
+    g
 }
 
 /// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
@@ -405,6 +418,7 @@ impl App {
         }
         // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
         let ownership_deny = ownership_deny_of(&cfg)?;
+        let sql_guard = sql_guard_of(&cfg);
         // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
         let (registry, modules) = build_schema_and_modules(&dir, ts, &dbs, gate).await?;
         // 种子重放（P0）：各模块 seed.sql（§8-1）。
@@ -471,6 +485,7 @@ impl App {
                         plugins: plugins.clone(),
                         modules: modules.clone(),
                         ownership_deny,
+                        sql_guard,
                         boot: boot.clone(),
                         // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
                         jwt: jwt.clone(),
@@ -651,6 +666,7 @@ impl App {
             plugins: (*plugin_infos).clone(),
             modules,
             ownership_deny,
+            sql_guard,
             boot: boot.clone(),
             jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
             oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。
