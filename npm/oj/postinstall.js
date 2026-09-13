@@ -107,7 +107,9 @@ function installTree(srcDir, rel) {
 
 let copied = 0;
 try {
-  for (const entry of ['oj', 'oj.exe', 'plugins', 'devkit']) {
+  // Linux glibc 发行包额外带来 oj.bin（真实 ELF，由 oj 启动器调用）与 lib/（跟随发布的
+// glibc 运行时）；macOS / Windows 子包不含这两项，existsSync 为 false 时自动跳过。
+for (const entry of ['oj', 'oj.bin', 'oj.exe', 'plugins', 'devkit', 'lib']) {
     const s = path.join(subRoot, entry);
     if (!fs.existsSync(s)) continue;
     if (fs.statSync(s).isDirectory()) installTree(s, entry);

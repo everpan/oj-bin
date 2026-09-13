@@ -29,6 +29,10 @@ function makeFixture(triple, { withSub = true } = {}) {
     fs.writeFileSync(path.join(sub, 'package.json'),
       JSON.stringify({ name: `@oj-bin/oj-${triple}`, version: '9.9.9' }));
     fs.writeFileSync(path.join(sub, 'oj'), 'oj-v1\n');
+    fs.writeFileSync(path.join(sub, 'oj.bin'), 'oj-bin-v1\n');
+    fs.mkdirSync(path.join(sub, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(sub, 'lib', 'ld-linux-x86-64.so.2'), 'fake-ld\n');
+    fs.writeFileSync(path.join(sub, 'lib', 'libc.so.6'), 'fake-libc\n');
     fs.writeFileSync(path.join(sub, 'plugins', triple, 'libx.so'), 'fake\n');
     fs.writeFileSync(path.join(sub, 'devkit', 'api-manual.md'), '# fake\n');
   }
@@ -49,6 +53,8 @@ test('happy path：落盘 bin/oj + plugins/<triple>/ + devkit/', { skip: !TRIPLE
   const r = run(root);
   assert.strictEqual(r.status, 0, r.stdout + r.stderr);
   assert.ok(fs.existsSync(path.join(root, 'bin', 'oj')));
+  assert.ok(fs.existsSync(path.join(root, 'bin', 'oj.bin')));
+  assert.ok(fs.existsSync(path.join(root, 'bin', 'lib', 'ld-linux-x86-64.so.2')));
   assert.ok(fs.existsSync(path.join(root, 'bin', 'plugins', TRIPLE, 'libx.so')));
   assert.ok(fs.existsSync(path.join(root, 'bin', 'devkit', 'api-manual.md')));
   if (process.platform !== 'win32') {
