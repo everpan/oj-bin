@@ -20,6 +20,13 @@
   绑定（规划见设计文档 §7，另立任务）；裸 SQL 字面检查为 best-effort（只防完全遗漏）。
   设计/评审：`docs/superpowers/specs/2026-09-13-tenant-sql-guard-design.md`。
 
+**修复（集中审查）**
+- guard：`Join.tenant_id` serde 预设可被 `db.fromJSON` 投毒（绕过 JS 链层直喂 serde，
+  评审 P0）——`apply_tenant` 改为对受约束 join 表**无条件覆盖**注入值，JS 预设永不生效；
+  tokens() 此前整段跳过 `"…"`/`` `…` `` 引用标识符 → `FROM "t"` 对表提取失明（裸 SQL
+  守卫静默放行）——引用标识符内容现在成词，`"t"` 形态可见（toSQL 回放从 vacuous pass
+  变为真校验）。附回归用例：fromJSON 投毒覆盖 + 引用标识符单元/行为用例。
+
 ## v0.1.15（2026-09-13）
 
 **CI**

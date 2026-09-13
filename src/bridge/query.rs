@@ -143,7 +143,8 @@ struct Join {
     #[serde(default)]
     kind: JoinKind,
     on: Vec<OnPair>,
-    /// 多租户防护注入（apply_tenant 填充，build_select_stmt 消费；JS 链层不可设）。
+    /// 多租户防护注入（apply_tenant 无条件覆盖——fromJSON 喂入的 JS 预设值不可信；
+    /// build_select_stmt 消费）。
     /// 进 ON 子句而非 WHERE——LEFT JOIN 注入 WHERE 会静默变 INNER JOIN（评审 P2-9）。
     #[serde(default)]
     tenant_id: Option<String>,
@@ -842,9 +843,11 @@ fn apply_tenant(
             )));
         }
         // join 表：tenant 条件进 ON 子句（Join.tenant_id，build_select_stmt 消费）。
+        // 无条件覆盖：fromJSON 可绕过 JS 链层直接喂 serde，JS 预设值绝不可信
+        // （评审 P0——is_none() 放行会让攻击者选定他租户 ON 条件）。
         if let Some(tid) = tid {
             for j in &mut req.joins {
-                if scoped(&j.table) && j.tenant_id.is_none() {
+                if scoped(&j.table) {
                     j.tenant_id = Some(tid.to_string());
                 }
             }
@@ -2838,6 +2841,42 @@ mod tests {
         let sql = v["data"]["sql"].as_str().unwrap().to_string();
         let on_part = sql.split("WHERE").next().unwrap_or("");
         assert!(on_part.contains("tenant_id"), "ON 区段应含注入条件: {sql}");
+    }
+
+    /// fromJSON 投毒回归（评审 P0）：快照 join 里预设 tenant_id:"t2" 必须被无条件
+    /// 覆盖为当前租户——fromJSON 绕过 JS 链层直喂 serde，预设值绝不可信。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_join_preset_tenant_id_overridden() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"json.ok(db.fromJSON({
+                     table: "t", verb: "select", columns: ["t.name"],
+                     joins: [{ table: "u", kind: "left",
+                               on: [{left: "t.id", right: "u.id"}],
+                               tenant_id: "t2" }],
+                     order_by: [{field: "t.id", dir: "asc"}] }).toSQL());"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // 基表 + join 两处绑定都必须是当前租户 t1（尾随 limit 参数不计）；"t2" 不得出现。
+        assert_eq!(
+            v["data"]["params"].as_array().unwrap().first(),
+            Some(&json!("t1")),
+            "{v}"
+        );
+        assert_eq!(
+            v["data"]["params"].as_array().unwrap().get(1),
+            Some(&json!("t1")),
+            "{v}"
+        );
+        assert!(
+            !v["data"]["sql"].as_str().unwrap().contains("t2"),
+            "他租户值泄漏进 SQL: {v}"
+        );
     }
 
     /// 子查询递归：in-subquery 同样收窄到当前租户。

@@ -18,7 +18,8 @@ use deno_error::JsErrorBox;
 
 use super::{ModuleCtx, ReqState, StableState};
 
-/// 词法切分（best-effort）：返回标识符/关键字词序列，跳过字符串字面量与 `--`、`/* */` 注释。
+/// 词法切分（best-effort）：返回标识符/关键字词序列，跳过字符串字面量与 `--`、`/* */`
+/// 注释；`"…"`/`` `…` `` 引用标识符的内容**成词**（表名 `"t"` 必须可见）。
 /// 词 = 字母数字 `_` `.` `,` 连续段（`.` 保留以便 `db.table` 只取表段；`,` 保留以便
 /// from_list 识别逗号连接表——extract_tables 的 fail-closed 语义依赖）。
 fn tokens(sql: &str) -> Vec<&str> {
@@ -29,15 +30,17 @@ fn tokens(sql: &str) -> Vec<&str> {
     while i < b.len() {
         let c = b[i];
         match c {
-            b'\'' | b'"' | b'`' => {
-                // 引用串/引用标识符：跳到配对闭合（'' 双写与 \ 转义都跳过）。
-                let q = c;
+            b'\'' => {
+                // 字符串字面量：跳到配对闭合（'' 双写与 \ 转义都跳过），内容不成词。
+                if let Some(s) = start.take() {
+                    out.push(&sql[s..i]);
+                }
                 i += 1;
                 while i < b.len() {
                     if b[i] == b'\\' {
                         i += 2;
-                    } else if b[i] == q {
-                        if i + 1 < b.len() && b[i + 1] == q {
+                    } else if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
                             i += 2; // SQL 双写转义 ''
                         } else {
                             i += 1;
@@ -47,6 +50,31 @@ fn tokens(sql: &str) -> Vec<&str> {
                         i += 1;
                     }
                 }
+                start = None;
+            }
+            q @ (b'"' | b'`') => {
+                // 引用标识符（ANSI "…" / MySQL `…`）：内容**成词**——
+                // `FROM "t"` 的表名必须对 extract_tables 可见（评审：静默跳过 = 守卫失明）。
+                if let Some(s) = start.take() {
+                    out.push(&sql[s..i]);
+                }
+                i += 1;
+                let cs = i;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                    } else if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2; // 双写转义 ""
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.push(&sql[cs..i.min(b.len())]);
+                i += 1; // 跳过闭合引号（未闭合时已到尾）
                 start = None;
             }
             b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
@@ -526,6 +554,26 @@ mod tests {
     }
 
     #[test]
+    fn quoted_identifiers_are_visible() {
+        // 引用标识符（评审回归）：此前 "t" 整段被跳过 → extract_tables 失明 →
+        // 守卫对 `FROM "t"` 形态放行。现在内容成词。
+        assert_eq!(extract_tables(r#"select * from "t" where x = 1"#), ["t"]);
+        assert_eq!(extract_tables("select * from `t`"), ["t"]);
+        assert_eq!(extract_tables(r#"insert into "t" (id) values (1)"#), ["t"]);
+        // join/INTO 后的引用表名同样可见。
+        assert_eq!(
+            extract_tables(r#"select * from "t" join "u" on t.id = u.id"#),
+            ["t", "u"]
+        );
+        // 引号内的 tenant_id 条件对 mentions 语义可见（tokens 层）。
+        let words = tokens(r#"select * from "t" where "tenant_id" = ?"#);
+        assert!(words.contains(&"tenant_id"), "{words:?}");
+        // 字符串字面量内容依旧不成词（转义/双写不破词法）。
+        let words = tokens("select * from t where tag = 'tenant_id'");
+        assert!(!words.contains(&"tenant_id"), "{words:?}");
+    }
+
+    #[test]
     fn strip_literals_keeps_quoted_identifiers() {
         // 单引号串与注释内容被剥除 → 不再匹配 tenant_id。
         assert!(!strip_literals("select * from t where tag = 'tenant_id'").contains("'tenant_id'"));
@@ -701,6 +749,13 @@ mod tests {
                 .unwrap();
             let v: Value = serde_json::from_slice(&cap.body).unwrap();
             assert_eq!(v["code"], 0, "{v}");
+            // 12) 引用标识符形态（评审回归）：FROM "t" 不许令守卫失明。
+            let v = run_sql(&b, req_t1(), r#""select * from \"t\"""#, &[]).await;
+            assert_eq!(v["code"], 400, "{v}");
+            assert!(
+                v["msg"].as_str().unwrap().contains("lacks tenant_id"),
+                "{v}"
+            );
         }
 
         #[tokio::test(flavor = "current_thread")]
