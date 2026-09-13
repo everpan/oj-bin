@@ -572,6 +572,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
+| `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.16，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
@@ -1209,6 +1210,8 @@ export default {
 tenant:
   enable: true
   header_key: "X-TENANT-ID"   # 默认即此名
+  sql_guard: deny             # 多租户 SQL 防护：false（默认，不改写 SQL）| "warn" | "deny"/true
+  shared_allow: [dict]        # 共享表白名单（schema.yaml 里 tenant: false 的表须在此列出才生效）
 ```
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
@@ -1216,8 +1219,15 @@ tenant:
 `/*`」形式，但 tenant 匹配是**严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；
 oj-auth 插件实现为多层前缀），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
 已带的头仍照常注入。
-**框架不自动改写 SQL**——行级过滤归业务（自行在查询里带
-tenant 条件）。启用期间测试请求也必须带头（第 9 章两约束）。
+
+**`sql_guard`（v0.1.16 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
+`db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制
+当前租户、update/delete 自动收窄、sets 显式改 tenant_id 拒绝；裸 SQL 查「完全遗漏 tenant_id」
+warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
+（共享表 `tenant: false` + `shared_allow` 双声明豁免），server 启动 / `oj build` /
+`oj migrate` 三处校验。跨租户操作（对账、运营报表）走 `db.asSystem()`（请求级、打审计日志）。
+新人向白话文档见 `docs/tenant-guide.md`；**注意租户头目前是客户端自报，防伪造需 JWT claims
+绑定（规划见设计文档 §7）**。
 
 ### auth_demo 走读（sample）
 
@@ -1470,7 +1480,9 @@ V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker �
 ### tenant / auth
 
 字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
-跳转腿豁免；auth 的 `jwt_secret`（空串启动 fail-fast，生产必改）、`signing_method`
+跳转腿豁免；v0.1.16 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
+白名单——语义与建表要求见第 8 章与 `docs/tenant-guide.md`；auth 的 `jwt_secret`（空串
+启动 fail-fast，生产必改）、`signing_method`
 （HS256|HS384|HS512，默认 HS256）、`access_token_duration`（默认 60s）、
 `refresh_token_duration`（默认 720h）、`anonymous_paths`——无 `user_table` 配置，
 用户表是业务约定）。
