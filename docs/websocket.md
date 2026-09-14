@@ -25,12 +25,32 @@ src/ws.ts        →  /v1/api/ws             （根级）
 | 运行位置 | HTTP actor 池（`server.pool_size` 个 VM 排队复用） | **路由级帧池**（连接状态外置 Rust 会话表） |
 | Worker 池 | actor 即池，无独立 Worker 层 | **W 个无状态 Worker/路由**（`ws.workers_per_route`，默认 2）从帧队列拉帧执行 |
 
-帧进来时，注入的请求上下文是：`http.method === "WS"`、**`http.body` = 帧字节**
-（`Uint8Array`）；`http.query`/`http.headers` 为空对象（upgrade URL 未透传）。
+帧进来时，注入的请求上下文是：`http.method === "WS"`、`http.body` = 帧 JSON 解析结果
+（文本帧 JSON 自动 parse；解析失败为 UTF-8 字符串）；`http.query`/`http.headers` 为空对象
+（upgrade URL 未透传）。**二进制帧（v0.1.16）** `http.body` 为 `null`（不做 UTF-8 有损转换），
+原始字节一律 `await http.bodyBytes()`（文本帧同样可用）——见 §1.1。
 
 连接状态放 **`sess.state`**（跨帧持久、按连接隔离，**必须可 JSON 序列化**），
 `sess.id` 为连接 id；模块作用域只是 Worker 本地只读缓存——可变跨帧状态禁止放模块
 作用域。约束详见 §4「sess 会话状态与帧池约束」。
+
+### 1.1 二进制帧（v0.1.16）
+
+出侧 `ws.send(data)` 的帧型由参数类型决定：`string` → Text 帧（0x1），`Uint8Array` →
+Binary 帧（0x2）。入侧 Binary 帧 `http.body` 为 `null`，字节走 `http.bodyBytes()`。回显示例
+（可运行模块 `sample/src/echo-bin/`，L1 测试 `sample/tests/ws-bin.test.ts` 用 `client.ws`
+收发帧）：
+
+```ts
+export default {
+  async message() {
+    ws.send(await http.bodyBytes()); // 原字节原帧型（send 收 Uint8Array → Binary 帧）
+  },
+};
+```
+
+`sess.state` 仍必须可 JSON 序列化——Yjs awareness 等二进制状态走 base64 字符串或 kv
+（见 api-manual §13）。
 
 ## 2. 写一个 handler：sample/news 逐行
 
@@ -233,7 +253,7 @@ dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态
 
 ## 6. 测试
 
-`server/src/ws.rs` 的 14 个单测与本文件一一对应，改实现前先读、改完必跑
+`server/src/ws.rs` 的单测与本文件一一对应，改实现前先读、改完必跑
 （`cargo test -p server --lib ws`）：
 
 | 用例 | 教学点 |
@@ -245,6 +265,8 @@ dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态
 | `mirror_routes_root_ws` | 根级 `ws.ts` → `{base}/ws`（无双斜杠） |
 | `js_route_missing_handler_closes_quietly` | 编译失败 → 干净关闭 |
 | `ws_bus_subscribe_receives_http_publish` | `bus.subscribe` 幂等与广播帧形状 |
+| `js_route_ws_binary_echo_roundtrip` | §1.1 二进制帧往返：Binary 入 → `bodyBytes()` → Binary 出，字节相等（v0.1.16） |
+| `ws_bus_binary_publish_reaches_subscriber` | §1.1 bus 二进制：`publish(topic, Uint8Array)` → 订阅者收 Binary 帧原字节（v0.1.16） |
 | `ws_frame_publish_broadcasts_to_subscribers` | §2 帧内发布：帧内 `publish` 广播到他连 + 自回声 + 进房 = `connection` 钩子（无需 join 帧） |
 | `js_route_error_hook_keeps_connection_alive` | 契约：`error(e)` 兜底钩子异常，之后连接继续 |
 | `js_route_close_hook_fires_exactly_once` | 契约：`close()` 收尾恰好一次（客户端断 / `ws.close()` 统一） |

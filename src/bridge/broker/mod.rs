@@ -31,7 +31,12 @@ mod tests {
         let b = build_broker(&None).await.unwrap();
         assert_eq!(b.kind(), "local");
         // 经统一契约可发布（无订阅者返回 0）。
-        assert_eq!(b.publish("t", &json!(1)).await.unwrap(), 0);
+        assert_eq!(
+            b.publish("t", &crate::bridge::BusPayload::Json(json!(1)))
+                .await
+                .unwrap(),
+            0
+        );
 
         let cfg = BrokerCfg {
             kind: "local".into(),

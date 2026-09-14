@@ -5,14 +5,26 @@
 //! `finally` 把 `__sess` 快照交还 ReqState.ws_sess（帧池 sess.state 外置回传）。
 //! HTTP 请求路径不读这三项（等价 nil 连接 no-op）。
 
-use deno_core::{OpState, op2};
+use deno_core::{JsBuffer, OpState, op2};
 
-use super::ReqState;
+use super::{ReqState, WsSend};
 
 /// ws.send(data)：记录一次主动发送（Processor 按序推给 Writer）。
 #[op2(fast)]
 pub(crate) fn op_ws_send(state: &mut OpState, #[string] data: String) {
-    state.borrow_mut::<ReqState>().ws_sends.push(data);
+    state
+        .borrow_mut::<ReqState>()
+        .ws_sends
+        .push(WsSend::Text(data));
+}
+
+/// ws.send(Uint8Array)：二进制帧收集（v0.1.16；Writer 按 opcode 0x2 写出）。
+#[op2]
+pub(crate) fn op_ws_send_bin(state: &mut OpState, #[buffer] data: JsBuffer) {
+    state
+        .borrow_mut::<ReqState>()
+        .ws_sends
+        .push(WsSend::Binary(data.to_vec()));
 }
 
 /// ws.close()：请求关闭当前连接。

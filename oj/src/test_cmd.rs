@@ -132,10 +132,17 @@ async fn run_on_runtime(
         ..Default::default()
     });
 
-    // 注入 ClientTransport（App 自身）。op_client_dispatch 经 OpState 取用。
-    rt.op_state()
-        .borrow_mut()
-        .put(Arc::new(app) as Arc<dyn ClientTransport>);
+    // 注入 ClientTransport（App 自身）。op_client_dispatch 经 OpState 取用；
+    // Arc<App> 另存一份给 client.ws（op_client_ws_* 惰性 axum::serve 走 router()）。
+    let app = Arc::new(app);
+    {
+        let op_state = rt.op_state();
+        let mut st = op_state.borrow_mut();
+        st.put(app.clone());
+        st.put(app as Arc<dyn ClientTransport>);
+        // client.ws 状态（连接表 + 最后一帧槽位 + 惰性端口）。
+        st.put(crate::test_ext::ClientWs::default());
+    }
     // ext_boot：`oj test` 不走 RuntimePool（直接建 JsRuntime），故在此补跑一次，
     // 否则 *.test.ts 看不到 boot 注入的全局，与生产行为分叉。
     if let Some(spec) = stable.boot.as_deref() {

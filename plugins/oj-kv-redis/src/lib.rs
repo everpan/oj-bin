@@ -247,6 +247,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, kv => &VTABLE);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oj_plugin_ffi::RBytes;
 
     /// 连接拒绝 → Err（装配 fail-fast 路径；端口 1 无监听）。
     #[tokio::test(flavor = "current_thread")]
@@ -331,7 +332,7 @@ mod tests {
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

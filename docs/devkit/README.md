@@ -13,12 +13,13 @@
 ## 安装（业务项目）
 
 ```sh
-# agent 用：拷入项目的 Claude Code skill 目录
+# npm 安装（v0.1.13 起）：postinstall 把对应平台的 oj / plugins / devkit/ 落盘 <项目根>/bin/
+npm i @oj-bin/oj
 mkdir -p .claude/skills/oj-api-dev
-cp devkit/SKILL.md devkit/api-manual.md .claude/skills/oj-api-dev/
+cp bin/devkit/SKILL.md bin/devkit/api-manual.md .claude/skills/oj-api-dev/   # agent 用
+cp bin/devkit/global.d.ts .                                                  # 类型提示
 
-# 类型提示：拷进项目源码根（与 src/ 平级即可）
-cp devkit/global.d.ts .
+# 或从发行包解包后取 devkit/，路径同上
 ```
 
 安装后 agent 里说"用 oj-api-dev 开发 xxx 模块"，或 Claude Code 里 `/oj-api-dev` 触发。

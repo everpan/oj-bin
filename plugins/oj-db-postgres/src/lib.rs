@@ -492,6 +492,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, db => &VTABLE);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oj_plugin_ffi::RBytes;
 
     /// DSN 前缀 → 方言判定（占位符补全 / lock 句柄等都依赖它，错判即打错方言 SQL）。
     #[test]
@@ -765,7 +766,7 @@ mod tests {
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

@@ -19,6 +19,8 @@ pub(crate) struct Frame {
     pub conn: u64,
     pub ev: &'static str,
     pub body: Vec<u8>,
+    /// 帧型（v0.1.16）：WS binary 帧 true → `RequestInfo.body_binary`。
+    pub binary: bool,
     pub done: oneshot::Sender<Result<WsOutcome, FrameError>>,
 }
 
@@ -153,7 +155,7 @@ impl Scheduler {
 /// Rust 侧会话表条目：sess.state 真身 + 该连接 bus 发送端。
 struct SessEntry {
     state: serde_json::Value,
-    bus_tx: mpsc::UnboundedSender<String>,
+    bus_tx: mpsc::UnboundedSender<super::WsSend>,
 }
 
 /// 单路由帧池：队列 + W Worker + 会话表。懒启动（首次 attach 起 Worker）；
@@ -198,7 +200,7 @@ impl RoutePool {
     }
 
     /// 注册会话（懒启动 worker）。永远成功；预载失败在 fire 时以 PoolClosed 显形。
-    pub fn attach(self: &Arc<Self>, bus_tx: mpsc::UnboundedSender<String>) -> ConnHandle {
+    pub fn attach(self: &Arc<Self>, bus_tx: mpsc::UnboundedSender<super::WsSend>) -> ConnHandle {
         if self
             .failed
             .lock()
@@ -317,6 +319,7 @@ impl RoutePool {
             let req = RequestInfo {
                 method: "WS".into(),
                 body: f.body,
+                body_binary: f.binary,
                 bus_tx,
                 ..Default::default()
             };
@@ -423,12 +426,19 @@ pub struct ConnHandle {
 }
 
 impl ConnHandle {
-    pub async fn fire(&self, ev: &'static str, body: Vec<u8>) -> Result<WsOutcome, FrameError> {
+    /// 投一帧给池（binary = WS binary 帧；connection/close 事件传 (Vec::new(), false)）。
+    pub async fn fire(
+        &self,
+        ev: &'static str,
+        body: Vec<u8>,
+        binary: bool,
+    ) -> Result<WsOutcome, FrameError> {
         let (tx, rx) = oneshot::channel();
         self.pool.sched.submit(Frame {
             conn: self.conn,
             ev,
             body,
+            binary,
             done: tx,
         });
         match rx.await {
@@ -475,7 +485,7 @@ impl ConnHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry};
+    use super::super::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, WsSend};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -517,6 +527,7 @@ mod tests {
                 conn,
                 ev: "message",
                 body: vec![],
+                binary: false,
                 done: tx,
             },
             rx,
@@ -584,22 +595,22 @@ export default {
         );
         let (btx, _brx) = tokio::sync::mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        let o = h.fire("connection", vec![]).await.unwrap();
+        let o = h.fire("connection", vec![], false).await.unwrap();
         assert!(String::from_utf8_lossy(&o.capture.body).contains("\"hello\":1"));
         for expect in [1, 2] {
-            let o = h.fire("message", vec![]).await.unwrap();
+            let o = h.fire("message", vec![], false).await.unwrap();
             let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
             assert_eq!(v["data"]["n"], expect, "sess.state 跨帧持久（Rust 会话表）");
             assert_eq!(v["data"]["gid"], 1, "sess.id = 连接 id");
         }
-        let o = h.fire("close", vec![]).await.unwrap();
+        let o = h.fire("close", vec![], false).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["bye"], 2, "close 收尾可见累计状态");
         // 第二条连接：状态互不可见（同池隔离）
         let (btx2, _brx2) = tokio::sync::mpsc::unbounded_channel();
         let h2 = pool.attach(btx2);
-        h2.fire("connection", vec![]).await.unwrap();
-        let o = h2.fire("message", vec![]).await.unwrap();
+        h2.fire("connection", vec![], false).await.unwrap();
+        let o = h2.fire("message", vec![], false).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["n"], 1, "会话表按 conn 隔离");
         h.detach();
@@ -637,13 +648,13 @@ export default {
         let bad = pool.attach(b1);
         let good = pool.attach(b2);
         let e = bad
-            .fire("message", br#"{"boom":true}"#.to_vec())
+            .fire("message", br#"{"boom":true}"#.to_vec(), false)
             .await
             .unwrap_err();
         assert!(matches!(e, FrameError::Timeout));
         // 毒化半径=1：另一连接照常（补员或第二 worker 接帧）
         let o = good
-            .fire("message", br#"{"boom":false}"#.to_vec())
+            .fire("message", br#"{"boom":false}"#.to_vec(), false)
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&o.capture.body).contains("\"ok\":1"));
@@ -660,7 +671,7 @@ export default {
         let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
         let (btx, _brx) = tokio::sync::mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        let e = h.fire("message", vec![]).await.unwrap_err();
+        let e = h.fire("message", vec![], false).await.unwrap_err();
         assert!(matches!(e, FrameError::PoolClosed), "{e:?}");
         h.detach();
     }
@@ -684,8 +695,8 @@ export default {
         let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
         let (btx, _brx) = tokio::sync::mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        let o = h.fire("message", vec![]).await.unwrap();
-        assert_eq!(o.sends, vec!["err:boom".to_string()]);
+        let o = h.fire("message", vec![], false).await.unwrap();
+        assert_eq!(o.sends, vec![WsSend::Text("err:boom".to_string())]);
         assert!(
             o.capture.body.is_empty(),
             "返回值不自动包信封，异常也不产生信封"
@@ -715,7 +726,7 @@ export default {
         let (btx, _brx) = tokio::sync::mpsc::unbounded_channel();
         let h = pool.attach(btx);
         let e = h
-            .fire("message", br#"{"boom":true}"#.to_vec())
+            .fire("message", br#"{"boom":true}"#.to_vec(), false)
             .await
             .unwrap_err();
         assert!(
@@ -724,7 +735,7 @@ export default {
         );
         // 会话未被毒化：下一帧照常回信封（连接继续契约的根基）。
         let o = h
-            .fire("message", br#"{"boom":false}"#.to_vec())
+            .fire("message", br#"{"boom":false}"#.to_vec(), false)
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
@@ -746,7 +757,7 @@ export default {
         let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
         let (btx, _) = mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        h.fire("message", vec![]).await.unwrap();
+        h.fire("message", vec![], false).await.unwrap();
         assert_eq!(pool.live_workers(), 1);
         h.detach();
         // linger=0：detach 后 Worker 异步退出（等一小会儿）
@@ -760,7 +771,7 @@ export default {
         // 新连接复活
         let (btx2, _) = mpsc::unbounded_channel();
         let h2 = pool.attach(btx2);
-        h2.fire("message", vec![]).await.unwrap();
+        h2.fire("message", vec![], false).await.unwrap();
         h2.detach();
     }
 
@@ -774,14 +785,14 @@ export default {
         let (btx, _) = mpsc::unbounded_channel();
         let h = pool.attach(btx);
         assert!(matches!(
-            h.fire("message", vec![]).await,
+            h.fire("message", vec![], false).await,
             Err(FrameError::PoolClosed)
         ));
         // 锁存：后续 attach 不再反复起 worker
         let (btx2, _) = mpsc::unbounded_channel();
         let h2 = pool.attach(btx2);
         assert!(matches!(
-            h2.fire("message", vec![]).await,
+            h2.fire("message", vec![], false).await,
             Err(FrameError::PoolClosed)
         ));
         assert_eq!(pool.live_workers(), 0);
@@ -818,7 +829,7 @@ export default {
         let bad = pool.attach(b1);
         assert_eq!(pool.live_workers(), 2);
         let e = bad
-            .fire("message", br#"{"boom":true}"#.to_vec())
+            .fire("message", br#"{"boom":true}"#.to_vec(), false)
             .await
             .unwrap_err();
         assert!(matches!(e, FrameError::Timeout));
@@ -851,7 +862,7 @@ export default {
         let (b2, _) = mpsc::unbounded_channel();
         let good = pool.attach(b2);
         let o = good
-            .fire("message", br#"{"boom":false}"#.to_vec())
+            .fire("message", br#"{"boom":false}"#.to_vec(), false)
             .await
             .unwrap();
         assert!(String::from_utf8_lossy(&o.capture.body).contains("\"ok\":1"));
@@ -884,7 +895,7 @@ export default {
         let pool = RoutePool::new(ws_file, make, Duration::from_secs(1), 1, 0);
         let (btx, _) = mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        let o = tokio::time::timeout(Duration::from_secs(10), h.fire("message", vec![]))
+        let o = tokio::time::timeout(Duration::from_secs(10), h.fire("message", vec![], false))
             .await
             .expect("worker panic 后池必须自愈，不得永久挂起")
             .unwrap();
@@ -918,14 +929,23 @@ export default {
         let pool = RoutePool::new(ws_file, ws_test_bridge(&dir), Duration::from_secs(1), 1, 0);
         let (btx, _) = mpsc::unbounded_channel();
         let h = pool.attach(btx);
-        let o = h.fire("message", br#"{"step":1}"#.to_vec()).await.unwrap();
+        let o = h
+            .fire("message", br#"{"step":1}"#.to_vec(), false)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["x"], 1);
-        let o = h.fire("message", br#"{"step":2}"#.to_vec()).await.unwrap();
+        let o = h
+            .fire("message", br#"{"step":2}"#.to_vec(), false)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["x"], 1);
         // 关键断言：不可序列化赋值的那一帧不得清空既有状态
-        let o = h.fire("message", br#"{"step":3}"#.to_vec()).await.unwrap();
+        let o = h
+            .fire("message", br#"{"step":3}"#.to_vec(), false)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["x"], 1, "不可序列化赋值后旧状态必须保留");
         h.detach();

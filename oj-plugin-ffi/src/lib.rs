@@ -42,7 +42,9 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 5 = Task 4.4 起（PluginRegistrations 增 kv 槽位 + KVStoreVtable）。
 /// 6 = auth 解耦起（PluginRegistrations 增 auth 槽位 + AuthGuardVtable）。
 /// 7 = 按轴 dlsym（删 PluginRegistrations/register，加轴自此零破坏）。
-pub const ABI_VERSION: u32 = 7;
+/// 8 = bus 字节载荷起（EventBrokerVtable.publish data 与 HostContext.deliver payload
+///     RString→RBytes，ws 二进制帧透传，v0.1.16）。
+pub const ABI_VERSION: u32 = 8;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -76,7 +78,8 @@ pub struct HostContext {
     pub log: extern "C" fn(level: u8, msg: RString),
     /// 消息上送（Task 4.3）：bus 插件订阅循环收到消息经此回调非阻塞投递宿主
     /// （宿主按 topic 扇出到本地订阅通道；插件线程调用，须返回快）。
-    pub deliver: extern "C" fn(topic: RString, payload: RString),
+    /// ABI 8 起 payload 为字节（RBytes，bus 二进制载荷透传，v0.1.16）。
+    pub deliver: extern "C" fn(topic: RString, payload: RBytes),
 }
 
 /// 插件入口宏：生成 oj_plugin_abi_version / oj_plugin_init（catch_unwind 收敛）/

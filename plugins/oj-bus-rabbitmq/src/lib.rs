@@ -21,7 +21,7 @@ use lapin::types::{AMQPValue, FieldTable};
 use lapin::{Connection, ConnectionProperties, ExchangeKind, acker::Acker};
 use oj_plugin_ffi::{
     ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, MqMessage, MqVtable, PluginDescriptor,
-    RArc, RResult, RString,
+    RArc, RBytes, RResult, RString,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -30,6 +30,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+/// &[u8] → RBytes（stabby 无 From<&[u8]>，逐元素 push；与宿主侧同名助手同款）。
+fn to_rbytes(bytes: &[u8]) -> RBytes {
+    let mut v = RBytes::new();
+    for b in bytes {
+        v.push(*b);
+    }
+    v
+}
 
 /// 插件侧配置视图（= core config::BrokerCfg 的 JSON + mq 的 kind 注入）。
 #[derive(Deserialize, Default)]
@@ -74,15 +83,14 @@ impl RabbitCore {
     }
 
     /// 在给定 channel 上 publish（mq 面 send；JS 层 RabbitMQ.publish——payload：
-    /// exchange/routingKey/value/headers。审查 #3：走复用 channel，不逐次新建即弃）。
+    /// exchange/routingKey/value|value_b64/headers。审查 #3：走复用 channel，不逐次新建即弃）。
     async fn send_on(
         channel: &lapin::Channel,
         exchange: &str,
         routing_key: &str,
         headers: &HashMap<String, String>,
-        value: &Value,
+        payload: &[u8],
     ) -> Result<Vec<u8>, String> {
-        let payload = value.to_string().into_bytes();
         let mut props = BasicProperties::default();
         if !headers.is_empty() {
             let mut ft = FieldTable::default();
@@ -99,7 +107,7 @@ impl RabbitCore {
                 exchange,
                 routing_key,
                 BasicPublishOptions::default(),
-                &payload,
+                payload,
                 props,
             )
             .await
@@ -240,6 +248,20 @@ impl MqInstance {
                         let value = serde_json::from_slice(&d.data).unwrap_or_else(|_| {
                             Value::String(String::from_utf8_lossy(&d.data).into_owned())
                         });
+                        // 非 UTF-8 载荷（二进制透传，v0.1.16）→ base64，value 置 null。
+                        let value_b64 = if std::str::from_utf8(&d.data).is_err()
+                            && serde_json::from_slice::<Value>(&d.data).is_err()
+                        {
+                            use base64::Engine as _;
+                            Some(base64::engine::general_purpose::STANDARD.encode(&d.data))
+                        } else {
+                            None
+                        };
+                        let value = if value_b64.is_some() {
+                            Value::Null
+                        } else {
+                            value
+                        };
                         let ts = d.properties.timestamp().unwrap_or(0) as i64;
                         self.ackers
                             .lock()
@@ -251,6 +273,7 @@ impl MqInstance {
                             offset: None,
                             key: None,
                             value,
+                            value_b64,
                             headers,
                             ts,
                             delivery_tag: Some(d.delivery_tag),
@@ -340,17 +363,16 @@ impl BusPluginState {
             .ok_or_else(|| format!("mq: unknown handle {handle}"))
     }
 
-    async fn do_publish(&self, handle: u64, topic: &str, data: &str) -> Result<Vec<u8>, String> {
+    async fn do_publish(&self, handle: u64, topic: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         let b = self.broker(handle)?;
         let channel = b.core.channel().await?;
-        let payload = data.as_bytes().to_vec();
         // 投递到 topic 交换，路由键 = topic；不阻塞等待 broker confirm（与 core 一致）。
         channel
             .basic_publish(
                 &b.exchange,
                 topic,
                 BasicPublishOptions::default(),
-                &payload,
+                data,
                 BasicProperties::default(),
             )
             .await
@@ -406,11 +428,11 @@ impl BusPluginState {
                     _ = stop.changed() => break,   // close(handle) 显式停（评审 S1）
                     msg = consumer.next() => match msg {
                         Some(Ok(delivery)) => {
-                            let payload = String::from_utf8_lossy(&delivery.data).to_string();
+                            // 原始字节上送（ABI 8；JSON 信封/二进制帧型由宿主侧判定）。
                             delivery.ack(BasicAckOptions::default()).await.ok();
                             (host.deliver)(
                                 RString::from(logical.as_str()),
-                                RString::from(payload.as_str()),
+                                to_rbytes(&delivery.data),
                             );
                         }
                         Some(Err(_)) => break,
@@ -439,7 +461,7 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
     })
 }
 
-extern "C" fn publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
+extern "C" fn publish(handle: u64, topic: RString, data: RBytes) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
         oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
@@ -503,13 +525,22 @@ extern "C" fn mq_call(handle: u64, method: RString, payload: RString) -> FfiFutu
                 "send" => {
                     let req: SendPayload = serde_json::from_str(&payload[..])
                         .map_err(|e| format!("rabbitmq send: bad payload: {e}"))?;
+                    // value_b64（v0.1.16）→ 解码字节为 AMQP payload；否则 value JSON 序列化。
+                    let payload_bytes: Vec<u8> = if let Some(b64) = &req.value_b64 {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| format!("rabbitmq send: bad value_b64: {e}"))?
+                    } else {
+                        req.value.unwrap_or(Value::Null).to_string().into_bytes()
+                    };
                     let ch = inst.reuse_channel().await?;
                     RabbitCore::send_on(
                         &ch,
                         &req.exchange,
                         &req.routing_key,
                         &req.headers,
-                        &req.value,
+                        &payload_bytes,
                     )
                     .await
                 }
@@ -576,7 +607,12 @@ struct SendPayload {
     routing_key: String,
     #[serde(default)]
     headers: HashMap<String, String>,
-    value: Value,
+    /// 文本/JSON 载荷（value_b64 存在时可省）。
+    #[serde(default)]
+    value: Option<Value>,
+    /// 二进制载荷（base64，v0.1.16）：设置时 AMQP payload = 解码字节。
+    #[serde(default)]
+    value_b64: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -825,7 +861,7 @@ mod tests {
         drive(&mut publish(
             handle,
             RString::from(topic.as_str()),
-            RString::from(r#"{"topic":"t","data":{"hi":1}}"#),
+            to_rbytes(br#"{"topic":"t","data":{"hi":1}}"#),
         ))
         .await
         .expect("publish");
@@ -835,7 +871,7 @@ mod tests {
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

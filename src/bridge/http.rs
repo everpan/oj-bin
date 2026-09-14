@@ -26,6 +26,9 @@ pub struct RequestInfo {
     pub query: HashMap<String, String>,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// 帧型标志（v0.1.16）：WS binary 帧为 true——`http.body` 置 null（丢弃 lossy
+    /// 文本），原始字节走 `http.bodyBytes()`；HTTP 请求恒 false。
+    pub body_binary: bool,
     /// 租户 id（tenant.enable 时由 handle() 从 header 提取注入；否则 None）。
     pub tenant_id: Option<String>,
     /// 已验签用户（auth 启用且非匿名路径：{id, roles, claims}；否则 None）。
@@ -33,7 +36,7 @@ pub struct RequestInfo {
     /// 上传文件（multipart 解析结果；非 multipart 为空）。
     pub files: Vec<UploadedFile>,
     /// WS 会话的 bus 发送端（bus.subscribe 注册用；HTTP 请求为 None）。
-    pub bus_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub bus_tx: Option<tokio::sync::mpsc::UnboundedSender<super::WsSend>>,
 }
 
 use std::collections::HashMap;
@@ -48,7 +51,12 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
         "params": s.req.params,
         "query": s.req.query,
         "headers": s.req.headers,
-        "body": export_bytes(&s.req.body),
+        // binary 帧：body 置 null（lossy 文本是损坏数据，不给误用面），字节走 op_http_body_bytes。
+        "body": if s.req.body_binary {
+            Value::Null
+        } else {
+            export_bytes(&s.req.body)
+        },
         "tenantId": s.req.tenant_id,
         "user": s.req.user,
         "files": s.req.files.iter().map(|f| json!({
@@ -75,6 +83,17 @@ pub async fn op_http_file(
         .get(i as usize)
         .map(|f| f.bytes.clone())
         .ok_or_else(|| JsErrorBox::generic(format!("no such file: {i}")))
+}
+
+/// http.bodyBytes()：当前请求/帧的原始字节（WS 文本与二进制帧都可用；HTTP 请求
+/// 即原始 body）。async + #[buffer] 返回（sync buffer-return 在 fast-call 路径卡死；
+/// 与 op_http_file 同款契约）。
+#[op2]
+#[buffer]
+pub async fn op_http_body_bytes(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErrorBox> {
+    let s = state.borrow();
+    let r = s.borrow::<ReqState>();
+    Ok(r.req.body.clone())
 }
 
 /// exportBytes：空为 null，能解析为 JSON 则解析，否则按 UTF-8 字符串。
