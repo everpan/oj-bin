@@ -398,6 +398,7 @@ async fn handle(
                     .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
                     .collect(),
                 body: body_bytes,
+                body_binary: false,
                 tenant_id,
                 user,
                 files,

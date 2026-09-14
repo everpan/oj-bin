@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
-use deno_core::{OpState, op2};
+use deno_core::{JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 
 use crate::app::ClientTransport;
@@ -102,9 +102,218 @@ pub async fn op_client_dispatch(
     })
 }
 
+// ----- client.ws：L1 WS 帧测试面（v0.1.16）-----
+//
+// oneshot 派发止步于 101 upgrade，收发不了帧；这里起真服务：首次 open 时
+// 127.0.0.1:0 bind + `axum::serve(app.router())`（tokio::spawn，与测试共用
+// current_thread 运行时——op await 点位让路，顺序 JS 调用无死锁），客户端走
+// tokio-tungstenite 连 `ws://127.0.0.1:{port}{base}{path}`。连接与「最后一帧」
+// 槽位挂在 OpState；发送/读帧 op 先把流从表里取出、await 完再放回（修正 #4
+// 借位纪律：不持 Ref 跨 await）。
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Default)]
+pub struct ClientWs {
+    /// 惰性服务端口（None = 尚未起 serve）。
+    port: Option<u16>,
+    conns: HashMap<u64, WsStream>,
+    /// op_client_ws_next 读到的最后一帧字节（binary, bytes），op_client_ws_last_bytes 取走。
+    last: HashMap<u64, (bool, Vec<u8>)>,
+    next_id: u64,
+}
+
+/// op_client_ws_next 结果：None（超时无帧）由 Option 表达；frame=false = 对端关闭。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ClientWsNext {
+    pub frame: bool,
+    pub binary: bool,
+}
+
+/// 取出连接（借位纪律：await 前从 OpState 表里 remove，完事再 insert 回）。
+fn take_conn(state: &Rc<RefCell<OpState>>, id: u64) -> Result<WsStream, JsErrorBox> {
+    let mut g = state.borrow_mut();
+    g.borrow_mut::<ClientWs>()
+        .conns
+        .remove(&id)
+        .ok_or_else(|| JsErrorBox::generic(format!("client.ws: no connection #{id}")))
+}
+
+fn put_conn(state: &Rc<RefCell<OpState>>, id: u64, c: WsStream) {
+    state
+        .borrow_mut()
+        .borrow_mut::<ClientWs>()
+        .conns
+        .insert(id, c);
+}
+
+#[op2]
+#[serde]
+pub async fn op_client_ws_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] path: String,
+) -> Result<u64, JsErrorBox> {
+    let app: Arc<crate::app::App> = state.borrow().borrow::<Arc<crate::app::App>>().clone();
+    let base = app.base().to_string();
+    // 惰性端口：首次 open 才 bind + serve（None → Some）。
+    let port = {
+        let g = state.borrow();
+        g.borrow::<ClientWs>().port
+    };
+    let port = match port {
+        Some(p) => p,
+        None => {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("client.ws bind: {e}")))?;
+            let p = listener
+                .local_addr()
+                .map_err(|e| JsErrorBox::generic(e.to_string()))?
+                .port();
+            let router = app.router();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            state.borrow_mut().borrow_mut::<ClientWs>().port = Some(p);
+            eprintln!("[oj test] client.ws serving on 127.0.0.1:{p}");
+            p
+        }
+    };
+    let url = format!("ws://127.0.0.1:{port}{base}{path}");
+    let (stream, _) = tokio_tungstenite::connect_async(url.clone())
+        .await
+        .map_err(|e| JsErrorBox::generic(format!("client.ws connect {url}: {e}")))?;
+    let mut g = state.borrow_mut();
+    let ws = g.borrow_mut::<ClientWs>();
+    ws.next_id += 1;
+    let id = ws.next_id;
+    ws.conns.insert(id, stream);
+    Ok(id)
+}
+
+#[op2]
+pub async fn op_client_ws_send(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] id: u64,
+    #[string] text: String,
+) -> Result<(), JsErrorBox> {
+    let mut c = take_conn(&state, id)?;
+    let r = c.send(Message::text(text.clone())).await;
+    put_conn(&state, id, c);
+    r.map_err(|e| JsErrorBox::generic(format!("client.ws send: {e}")))
+}
+
+#[op2]
+pub async fn op_client_ws_send_bin(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] id: u64,
+    #[buffer] data: JsBuffer,
+) -> Result<(), JsErrorBox> {
+    let mut c = take_conn(&state, id)?;
+    let r = c.send(Message::Binary(data.to_vec().into())).await;
+    put_conn(&state, id, c);
+    r.map_err(|e| JsErrorBox::generic(format!("client.ws send: {e}")))
+}
+
+#[op2]
+#[serde]
+pub async fn op_client_ws_next(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] id: u64,
+    #[bigint] timeout_ms: u64,
+) -> Result<Option<ClientWsNext>, JsErrorBox> {
+    let mut c = take_conn(&state, id)?;
+    let wait = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), c.next()).await;
+    let res = match wait {
+        // 超时：流放回，返回 None（无帧，不视为关闭）。
+        Err(_elapsed) => {
+            put_conn(&state, id, c);
+            return Ok(None);
+        }
+        // 流结束（对端关闭）：不再放回。
+        Ok(None) => {
+            state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
+            return Ok(Some(ClientWsNext {
+                frame: false,
+                binary: false,
+            }));
+        }
+        Ok(Some(Err(e))) => {
+            state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
+            return Err(JsErrorBox::generic(format!("client.ws recv: {e}")));
+        }
+        Ok(Some(Ok(msg))) => match msg {
+            Message::Text(t) => (false, t.as_bytes().to_vec()),
+            Message::Binary(b) => (true, b.to_vec()),
+            // Ping/Pong 控制帧直接继续等（timeout 已耗掉一部分，简化：靠上层重试）。
+            Message::Close(_) => {
+                state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
+                return Ok(Some(ClientWsNext {
+                    frame: false,
+                    binary: false,
+                }));
+            }
+            other => {
+                put_conn(&state, id, c);
+                return Err(JsErrorBox::generic(format!(
+                    "client.ws: unexpected frame {other:?}"
+                )));
+            }
+        },
+    };
+    let (binary, bytes) = res;
+    {
+        let mut g = state.borrow_mut();
+        g.borrow_mut::<ClientWs>().last.insert(id, (binary, bytes));
+    }
+    put_conn(&state, id, c);
+    Ok(Some(ClientWsNext {
+        frame: true,
+        binary,
+    }))
+}
+
+#[op2]
+#[buffer]
+pub async fn op_client_ws_last_bytes(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] id: u64,
+) -> Result<Vec<u8>, JsErrorBox> {
+    let g = state.borrow();
+    let ws = g.borrow::<ClientWs>();
+    ws.last
+        .get(&id)
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| JsErrorBox::generic("client.ws: no frame buffered (call next() first)"))
+}
+
+#[op2]
+pub async fn op_client_ws_close(
+    state: Rc<RefCell<OpState>>,
+    #[bigint] id: u64,
+) -> Result<(), JsErrorBox> {
+    if let Ok(mut c) = take_conn(&state, id) {
+        let _ = c.send(Message::Close(None)).await;
+    }
+    Ok(())
+}
+
 deno_core::extension!(
     oj_test_ext,
-    ops = [op_client_dispatch],
+    ops = [
+        op_client_dispatch,
+        op_client_ws_open,
+        op_client_ws_send,
+        op_client_ws_send_bin,
+        op_client_ws_next,
+        op_client_ws_last_bytes,
+        op_client_ws_close,
+    ],
     esm_entry_point = "ext:oj_test_ext/test_bootstrap.js",
 );
 

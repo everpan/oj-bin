@@ -2,7 +2,15 @@
 // Injects: globalThis.client (HTTP dispatch helper) + a tiny describe/it/expect/beforeEach framework.
 // Test files (*.test.ts) call client.get/post/... which trigger op_client_dispatch -> App oneshot.
 
-import { op_client_dispatch } from "ext:core/ops";
+import {
+  op_client_dispatch,
+  op_client_ws_open,
+  op_client_ws_send,
+  op_client_ws_send_bin,
+  op_client_ws_next,
+  op_client_ws_last_bytes,
+  op_client_ws_close,
+} from "ext:core/ops";
 
 const METHODS = ["get", "post", "put", "del", "patch", "head", "options"];
 
@@ -26,6 +34,33 @@ function buildClient() {
     if (r.status !== 200) throw new Error("login failed: " + r.status);
     const data = JSON.parse(r.body).data;
     return data.access_token;
+  };
+  // WS frame testing (v0.1.16): client.ws("/mod/ws") -> { send, next, close }.
+  // next(ms) -> {binary, data} | {closed: true} | null (timeout, no frame).
+  c.ws = (path) => {
+    let idP = null;
+    return {
+      send: async (data) => {
+        idP ??= op_client_ws_open(path);
+        const id = await idP;
+        if (typeof data === "string") return op_client_ws_send(id, data);
+        return op_client_ws_send_bin(id, data);
+      },
+      next: async (ms = 1000) => {
+        const id = await idP;
+        const n = await op_client_ws_next(id, ms);
+        if (n === null) return null; // timeout, no frame
+        if (!n.frame) return { closed: true };
+        const bytes = await op_client_ws_last_bytes(id);
+        return n.binary
+          ? { binary: true, data: bytes }
+          : { binary: false, data: new TextDecoder().decode(bytes) };
+      },
+      close: async () => {
+        const id = await idP;
+        return op_client_ws_close(id);
+      },
+    };
   };
   return c;
 }

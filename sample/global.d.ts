@@ -66,6 +66,8 @@ interface HttpApi {
   query: Record<string, string>;
   headers: Record<string, string>;
   body: any;
+  // WS Binary 帧时 body 为 null；原始帧字节走 bodyBytes()（v0.1.16，文本帧亦可用）。
+  bodyBytes(): Promise<Uint8Array>;
   // 取路由参数或 query 参数：路径参数优先，query 兜底，均缺失返回 def 原值。
   param(name: string, def?: unknown): any;
   // 租户 id（tenant 启用时从租户头提取；未启用为 null）。
@@ -113,8 +115,9 @@ interface KVApi {
 }
 
 // ws.* ：WebSocket 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）。
+// send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array → Binary 帧(0x2)（v0.1.16）。
 interface WSApi {
-  send(data: string): void;
+  send(data: string | Uint8Array): void;
   close(): void;
 }
 
@@ -134,6 +137,7 @@ interface BlobApi {
 // bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；
 // subscribe 仅 WS 会话内可用（HTTP 路径报错）；kind 报告活跃 broker 类型。
 interface BusApi {
+  // data 为 Uint8Array/ArrayBuffer → Binary 帧原字节（不包信封，v0.1.16）；其余 → JSON 信封 Text 帧。
   publish(topic: string, data?: unknown): Promise<number>;
   subscribe(topic: string): Promise<void>;
   kind(): Promise<string>;
@@ -239,7 +243,19 @@ declare global {
     headers?: Record<string, string>;
     body?: string;
   }
+  // WS 帧测试面（v0.1.16）：path 形如 "/echo-bin/ws"（相对 base）。
+  interface TestWsFrame {
+    binary: boolean;
+    data: string | Uint8Array;
+  }
+  interface TestWs {
+    send(data: string | Uint8Array): Promise<void>;
+    // 下一帧：{binary, data}；对端关闭 {closed: true}；超时无帧 null（默认 1000ms）。
+    next(ms?: number): Promise<TestWsFrame | { closed: true } | null>;
+    close(): Promise<void>;
+  }
   interface Client {
+    ws(path: string): TestWs;
     get(path: string, opts?: ClientOptions): Promise<ClientResp>;
     post(path: string, opts?: ClientOptions): Promise<ClientResp>;
     put(path: string, opts?: ClientOptions): Promise<ClientResp>;
@@ -295,6 +311,9 @@ interface OjMqMessage {
   offset?: number;
   key?: string;
   value: any;
+  // 非 UTF-8 载荷时 value 为 null，value_b64 为 base64 字符串（v0.1.16）；生产侧传
+  // Uint8Array 亦编码进 value_b64（record 载荷 = 原始字节）。
+  value_b64?: string;
   headers?: Record<string, string>;
   ts?: number;
   delivery_tag?: number; // rabbit 专属：ack/nack 载荷原样回传

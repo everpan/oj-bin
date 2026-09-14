@@ -246,6 +246,7 @@ fn check(name: &str) -> Result<(), String> {
             "bus" => p.registrations.bus.is_some(),
             "kv" => p.registrations.kv.is_some(),
             "auth" => p.registrations.auth.is_some(),
+            "mq" => p.registrations.mq.is_some(),
             _ => unreachable!("AXES 与 check 汇总分支不同步"),
         })
         .collect();

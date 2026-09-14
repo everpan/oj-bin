@@ -120,14 +120,15 @@ pub(crate) fn workspace_root() -> PathBuf {
 
 use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
 use crate::bridge::{
-    BlobBackend, BlobServed, BridgeResult, BusBackend, DbBackend, EsBackend, EventBroker, KVStore,
+    BlobBackend, BlobServed, BridgeResult, BusBackend, BusPayload, DbBackend, EsBackend,
+    EventBroker, KVStore, WsSend,
 };
 use crate::config::BrokerCfg;
 use oj_plugin_ffi::{
     BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture,
     KVStoreVtable, RBytes, RString,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -552,19 +553,37 @@ impl Drop for FfiBlobBackend {
 /// 经此全局目标表保持（Task 0.5 回归）。deliver 回调签名无 handle——插件消费循环
 /// 只按 topic 上送，宿主按 topic 路由（UnboundedSender 不过 FFI 边界，spec §3）。
 pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, Vec<UnboundedSender<String>>>>,
+    std::sync::Mutex<HashMap<String, Vec<UnboundedSender<WsSend>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// host 侧 deliver 回调（HostContext.deliver 指向此）：非阻塞投递，满/closed 惰性清理。
 /// 语义 = Bus::publish 的本地扇出（payload 原样转发；按 topic 去重注册）。
-pub(crate) extern "C" fn host_deliver(topic: RString, payload: RString) {
-    let (topic, payload) = (topic[..].to_string(), payload[..].to_string());
+/// 帧型判定（v0.1.16 wire 约定，与 FfiEventBroker::publish 的封装对称）：payload 为
+/// UTF-8 且是含 topic/data 两键的 JSON 对象 → 信封文本帧；否则 → 二进制帧原字节。
+pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
+    let raw = payload[..].to_vec();
+    let frame = envelope_or_binary(&raw);
     let mut g = DELIVER_TARGETS.lock().unwrap();
-    if let Some(list) = g.get_mut(&topic) {
-        list.retain(|tx| tx.send(payload.clone()).is_ok());
+    if let Some(list) = g.get_mut(&topic[..]) {
+        list.retain(|tx| tx.send(frame.clone()).is_ok());
         if list.is_empty() {
-            g.remove(&topic);
+            g.remove(&topic[..]);
         }
+    }
+}
+
+/// bus 帧型判定（启发式，详见 host_deliver 注释）：`{"topic":…,"data":…}` JSON
+/// 对象 → Text(envelope 原文)；其余 → Binary 原字节。误判面 = 二进制载荷恰为该
+/// 形状的 JSON（无害：以文本帧投递，客户端按 topic 过滤）。
+pub(crate) fn envelope_or_binary(raw: &[u8]) -> WsSend {
+    match std::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    {
+        Some(v) if v.is_object() && v.get("topic").is_some() && v.get("data").is_some() => {
+            WsSend::Text(String::from_utf8_lossy(raw).into_owned())
+        }
+        _ => WsSend::Binary(raw.to_vec()),
     }
 }
 
@@ -620,7 +639,7 @@ pub struct FfiEventBroker {
     handle: u64,
     vtable: &'static EventBrokerVtable,
     /// 本 broker 在 DELIVER_TARGETS 中注册的 (topic, sender)，drop 按归属清理（M-1）。
-    subs: StdMutex<Vec<(String, UnboundedSender<String>)>>,
+    subs: StdMutex<Vec<(String, UnboundedSender<WsSend>)>>,
 }
 
 /// 首次订阅新 topic 的并发门禁：保证 vtable.subscribe 的「注册 + 起消费循环」原子，
@@ -644,20 +663,23 @@ impl EventBroker for FfiEventBroker {
         self.kind
     }
 
-    async fn publish(&self, topic: &str, data: &Value) -> BridgeResult<usize> {
-        let frame = json!({ "topic": topic, "data": data }).to_string();
-        let fut = (self.vtable.publish)(
-            self.handle,
-            RString::from(topic),
-            RString::from(frame.as_str()),
-        );
+    async fn publish(&self, topic: &str, data: &BusPayload) -> BridgeResult<usize> {
+        // wire 约定（v0.1.16）：JSON → `{"topic","data"}` 信封 UTF-8（旧生产者兼容）；
+        // 字节 → 原样透传。消费侧 host_deliver 按同款启发式还原帧型。
+        let payload = match data {
+            BusPayload::Json(v) => json!({ "topic": topic, "data": v })
+                .to_string()
+                .into_bytes(),
+            BusPayload::Bytes(b) => b.clone(),
+        };
+        let fut = (self.vtable.publish)(self.handle, RString::from(topic), to_rbytes(&payload));
         await_ffi(fut)
             .await
             .map_err(|e| ffi_err("bus publish", e))?;
         Ok(0) // 远程 broker 经网络投递，本地 fan-out 恒 0（语义对齐 core Kafka/Rabbit）。
     }
 
-    async fn subscribe(&self, topic: &str, tx: UnboundedSender<String>) -> BridgeResult<()> {
+    async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()> {
         // 全程持门禁：vtable.subscribe 是「本地注册 + 起消费循环」的原子单元；
         // 失败回滚刚注册的通道，避免僵尸注册导致该 topic 静默丢失。
         let _gate = SUBSCRIBE_GATE.lock().await;
@@ -1304,8 +1326,8 @@ mod adapter_tests {
     use crate::config::BrokerCfg;
 
     static BUS_CONNECTED_CFG: Mutex<String> = Mutex::new(String::new());
-    static BUS_PUBLISHED: Mutex<(u64, String, String)> =
-        Mutex::new((0, String::new(), String::new()));
+    static BUS_PUBLISHED: Mutex<(u64, String, Vec<u8>)> =
+        Mutex::new((0, String::new(), Vec::new()));
     static BUS_SUBSCRIBES: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     static BUS_CLOSED: AtomicU64 = AtomicU64::new(0);
     /// TDD 开关：置位时 mock_bus_subscribe 先记录（模拟消费循环已起）再返回 Err，
@@ -1325,8 +1347,8 @@ mod adapter_tests {
             _ => ready(Ok(br#"{"handle":42}"#.to_vec())),
         }
     }
-    extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
-        *BUS_PUBLISHED.lock().unwrap() = (handle, topic[..].to_string(), data[..].to_string());
+    extern "C" fn mock_bus_publish(handle: u64, topic: RString, data: RBytes) -> FfiFuture {
+        *BUS_PUBLISHED.lock().unwrap() = (handle, topic[..].to_string(), data[..].to_vec());
         if BUS_PUBLISH_FAIL.swap(false, AtomicOrdering::SeqCst) {
             return ready(Err("publish down".into()));
         }
@@ -1384,14 +1406,15 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
         let n = broker
-            .publish("news", &serde_json::json!({"a": 1}))
+            .publish("news", &BusPayload::Json(serde_json::json!({"a": 1})))
             .await
             .unwrap();
         assert_eq!(n, 0); // 远程 broker 本地 fan-out 恒 0
         let (h, topic, data) = BUS_PUBLISHED.lock().unwrap().clone();
         assert_eq!(h, 42);
         assert_eq!(topic, "news");
-        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        // JSON 载荷 → wire = {"topic","data"} 信封 UTF-8。
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
         assert_eq!(v["data"]["a"], 1);
     }
 
@@ -1408,14 +1431,30 @@ mod adapter_tests {
         // 模拟插件消费循环经 host.deliver 上送 → 扇出到本地 tx。
         host_deliver(
             RString::from("t"),
-            RString::from(r#"{"topic":"t","data":{"v":42}}"#),
+            to_rbytes(br#"{"topic":"t","data":{"v":42}}"#),
         );
         let frame = rx.try_recv().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let WsSend::Text(env) = frame else {
+            panic!("envelope payload must deliver as text frame");
+        };
+        let v: serde_json::Value = serde_json::from_str(&env).unwrap();
         assert_eq!(v["data"]["v"], 42);
         // 关闭接收端 → 后续 deliver 惰性清理（不 panic）。
         drop(rx);
-        host_deliver(RString::from("t"), RString::from(r#"{}"#));
+        host_deliver(RString::from("t"), to_rbytes(br#"{}"#));
+    }
+
+    /// 非 UTF-8 载荷（不可为信封）→ Binary 帧原字节透传（v0.1.16 bus 字节化）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_deliver_non_utf8_payload_arrives_as_binary_frame() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        broker.subscribe("t", tx).await.unwrap();
+        let raw = vec![0x00, 0xA9, 0xFF, 0xFE]; // 非法 UTF-8
+        host_deliver(RString::from("t"), to_rbytes(&raw));
+        assert_eq!(rx.try_recv().unwrap(), WsSend::Binary(raw));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1445,7 +1484,7 @@ mod adapter_tests {
         let res = broker.subscribe("t", tx).await;
         assert!(res.is_err(), "subscribe must propagate vtable error");
         // 无僵尸：回滚后该 topic 不应仍注册，host_deliver 不应扇出到通道。
-        host_deliver(RString::from("t"), RString::from(r#"{"x":1}"#));
+        host_deliver(RString::from("t"), to_rbytes(br#"{"x":1}"#));
         assert!(
             rx.try_recv().is_err(),
             "zombie subscription must not deliver"
@@ -1476,9 +1515,10 @@ mod adapter_tests {
         // 消费循环被重新起：两次 subscribe 各记一次。
         assert_eq!(BUS_SUBSCRIBES.lock().unwrap().len(), 2);
         // 扇出可达：host.deliver 经 DELIVER_TARGETS 扇到本通道。
-        host_deliver(RString::from("t"), RString::from(r#"{"x":1}"#));
+        host_deliver(RString::from("t"), to_rbytes(br#"{"x":1}"#));
         let frame = rx.recv().await.unwrap();
-        assert_eq!(frame, r#"{"x":1}"#);
+        // {"x":1} 非信封 → 原字节按 Binary 帧透传（启发式约定）。
+        assert_eq!(frame, WsSend::Binary(br#"{"x":1}"#.to_vec()));
     }
 
     #[test]
@@ -1503,7 +1543,7 @@ mod adapter_tests {
         broker.subscribe("t", tx).await.unwrap();
         // B 侧发布（同一实例）→ vtable.publish 转发（记录）。
         broker
-            .publish("t", &serde_json::json!({"v": 7}))
+            .publish("t", &BusPayload::Json(serde_json::json!({"v": 7})))
             .await
             .unwrap();
         let (h, topic, _) = BUS_PUBLISHED.lock().unwrap().clone();
@@ -1511,10 +1551,12 @@ mod adapter_tests {
         // 模拟远端回程：插件消费循环经 host.deliver 上送 → A 侧 tx 收到（跨实例仍成立）。
         host_deliver(
             RString::from("t"),
-            RString::from(r#"{"topic":"t","data":{"v":7}}"#),
+            to_rbytes(br#"{"topic":"t","data":{"v":7}}"#),
         );
-        let frame = rx.recv().await.unwrap();
-        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let WsSend::Text(env) = rx.recv().await.unwrap() else {
+            panic!("envelope payload must deliver as text frame");
+        };
+        let v: serde_json::Value = serde_json::from_str(&env).unwrap();
         assert_eq!(v["data"]["v"], 7, "{v}");
     }
 
@@ -1998,7 +2040,7 @@ mod adapter_tests {
         BUS_PUBLISH_FAIL.store(true, AtomicOrdering::SeqCst);
         let broker = FfiEventBroker::new("kafka", 42, mock_bus_vtable());
         let e = broker
-            .publish("t", &serde_json::json!({}))
+            .publish("t", &BusPayload::Json(serde_json::json!({})))
             .await
             .unwrap_err()
             .to_string();

@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use only_js::bridge::frame_pool::{FrameError, RoutePool};
-use only_js::bridge::{Bridge, WsOutcome};
+use only_js::bridge::{Bridge, WsOutcome, WsSend};
 
 /// 全局 WS 并发连接闸门（config ws.max_connections；0 = 不限）。
 static WS_LIVE: AtomicU64 = AtomicU64::new(0);
@@ -188,12 +188,14 @@ async fn upgrade(ws: axum::extract::WebSocketUpgrade) -> Response {
 }
 
 /// 事件结果写出：ws.send 集合先于信封帧（顺序契约，原 run_ws 消费端逐行等价）。
-fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
+fn emit(resp_tx: &mpsc::Sender<WsSend>, o: WsOutcome) {
     for s in o.sends {
         let _ = resp_tx.try_send(s); // 满则丢弃
     }
     if !o.capture.body.is_empty() {
-        let _ = resp_tx.try_send(String::from_utf8_lossy(&o.capture.body).into_owned());
+        let _ = resp_tx.try_send(WsSend::Text(
+            String::from_utf8_lossy(&o.capture.body).into_owned(),
+        ));
     }
 }
 
@@ -206,23 +208,23 @@ fn emit(resp_tx: &mpsc::Sender<String>, o: WsOutcome) {
 /// PoolClosed = 干净断连；客户端 Close/socket 断 = 正常收尾。
 /// 所有退出路径都先 detach（删会话条目 + 丢排队帧 + 空池退役计时）再收尾写出。
 async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
-    let (msg_tx, mut msg_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (resp_tx, mut resp_rx) = mpsc::channel::<String>(64);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, bool)>(64);
+    let (resp_tx, mut resp_rx) = mpsc::channel::<WsSend>(64);
     // bus 会话端：发送端经 attach 存入池会话表（worker publish 用）；收到的广播帧转写回 socket。
-    let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<String>();
+    let (bus_tx, mut bus_rx) = mpsc::unbounded_channel::<WsSend>();
 
     let (mut sink, mut stream) = socket.split();
 
-    // Reader：读帧 → msgChan（满则背压至 TCP 层）。
+    // Reader：读帧 → msgChan（帧型随行：Text=false / Binary=true；满则背压至 TCP 层）。
     tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
-            let bytes = match msg {
-                Message::Text(t) => t.as_bytes().to_vec(),
-                Message::Binary(b) => b.to_vec(),
+            let frame = match msg {
+                Message::Text(t) => (t.as_bytes().to_vec(), false),
+                Message::Binary(b) => (b.to_vec(), true),
                 Message::Close(_) => break,
                 _ => continue, // ping/pong 自动处理
             };
-            if msg_tx.send(bytes).await.is_err() {
+            if msg_tx.send(frame).await.is_err() {
                 break;
             }
         }
@@ -243,7 +245,7 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
     let handle = pool.attach(bus_tx);
     // 超时毒化后该连接的会话已随 worker 丢弃：跳过后续一切 fire（含 close）。
     let mut alive = true;
-    match handle.fire("connection", Vec::new()).await {
+    match handle.fire("connection", Vec::new(), false).await {
         Ok(o) => emit(&resp_tx, o),
         Err(FrameError::Timeout) => alive = false,
         // 预载失败 → 干净断连（先发 Close 帧再丢弃，避免未读数据触发 TCP RST）。
@@ -255,11 +257,15 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
         Err(e) => eprintln!("ws connection: {e}"),
     }
 
-    // Writer：respChan → 串行写回；通道排空（连接结束）后发 Close 帧干净关闭。
+    // Writer：respChan → 串行写回（Text/Binary 按帧型）；通道排空（连接结束）后发 Close 帧干净关闭。
     // （置后启动：PoolClosed 断连路径要在 sink 被 writer 接走前直发 Close。）
     let writer = tokio::spawn(async move {
-        while let Some(text) = resp_rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
+        while let Some(frame) = resp_rx.recv().await {
+            let msg = match frame {
+                WsSend::Text(t) => Message::Text(t.into()),
+                WsSend::Binary(b) => Message::Binary(b.into()),
+            };
+            if sink.send(msg).await.is_err() {
                 return;
             }
         }
@@ -267,10 +273,10 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
     });
 
     while alive {
-        let Some(msg) = msg_rx.recv().await else {
+        let Some((bytes, binary)) = msg_rx.recv().await else {
             break; // 客户端 Close / socket 断
         };
-        match handle.fire("message", msg).await {
+        match handle.fire("message", bytes, binary).await {
             Ok(o) => {
                 let closing = o.close;
                 emit(&resp_tx, o);
@@ -295,7 +301,7 @@ async fn frame_loop(socket: WebSocket, pool: Arc<RoutePool>) {
     }
     if alive {
         // close 恰好一次，尽力而为：钩子可 ws.send 离帧，失败只记日志。
-        match handle.fire("close", Vec::new()).await {
+        match handle.fire("close", Vec::new(), false).await {
             Ok(o) => emit(&resp_tx, o),
             Err(e) => eprintln!("ws close: {e}"),
         }
@@ -338,24 +344,38 @@ mod tests {
             Self(s)
         }
 
-        /// 客户端帧必须掩码：FIN+text, MASK|len, 4 字节 mask, XOR payload。
-        async fn send_text(&mut self, payload: &str) {
+        /// 客户端帧必须掩码：FIN|opcode, MASK|len, 4 字节 mask, XOR payload。
+        async fn send_frame(&mut self, opcode: u8, bytes: &[u8]) {
             let mask = [0x37u8, 0xfa, 0x21, 0x3d];
-            let bytes = payload.as_bytes();
-            let mut frame = vec![0x81, 0x80 | bytes.len() as u8];
+            let mut frame = vec![0x80 | opcode, 0x80 | bytes.len() as u8];
             frame.extend_from_slice(&mask);
             frame.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
             self.0.write_all(&frame).await.unwrap();
         }
 
+        async fn send_text(&mut self, payload: &str) {
+            self.send_frame(0x01, payload.as_bytes()).await;
+        }
+
+        /// 客户端二进制帧（opcode 0x2）。
+        async fn send_binary(&mut self, payload: &[u8]) {
+            self.send_frame(0x02, payload).await;
+        }
+
         /// 读一个服务端帧（不掩码；小 payload 单字节长度足够本测试）。
-        async fn read_text(&mut self) -> String {
+        async fn read_frame(&mut self) -> (u8, Vec<u8>) {
             let mut hdr = [0u8; 2];
             self.0.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(hdr[0] & 0x0f, 0x01, "not a text frame: {:x?}", hdr);
+            let opcode = hdr[0] & 0x0f;
             let len = (hdr[1] & 0x7f) as usize;
             let mut payload = vec![0u8; len];
             self.0.read_exact(&mut payload).await.unwrap();
+            (opcode, payload)
+        }
+
+        async fn read_text(&mut self) -> String {
+            let (opcode, payload) = self.read_frame().await;
+            assert_eq!(opcode, 0x01, "not a text frame: {opcode:x}");
             String::from_utf8(payload).unwrap()
         }
     }
@@ -609,6 +629,151 @@ mod tests {
         c.send_text("again").await;
         let resp2 = c.read_text().await;
         assert!(resp2.contains("pong"), "{resp2}");
+    }
+
+    /// v0.1.16 二进制帧往返：客户端发 Binary 帧（含非 UTF-8 字节）→ handler
+    /// `ws.send(await http.bodyBytes())` 回显 → 客户端收 Binary 帧（opcode 0x2）
+    /// 字节相等（无损；文本信封不掺和）。
+    #[tokio::test]
+    async fn js_route_ws_binary_echo_roundtrip() {
+        let _e2e = ws_e2e_lock();
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default { async message() { ws.send(await http.bodyBytes()); } };"#,
+        )
+        .unwrap();
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                crate::tests::make_actor(t.0.clone(), true),
+                None,
+                None,
+                "/".to_string(),
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/bin",
+                test_pool(&handler, std::time::Duration::from_secs(1)),
+                WsOptions::default(),
+            )),
+        )
+        .await;
+
+        let mut c = WsClient::connect(addr, "/ws/bin").await;
+        c.send_binary(&[1, 2, 3, 0x00, 0xFF, 0xFE]).await;
+        let (opcode, payload) = c.read_frame().await;
+        assert_eq!(opcode, 0x02, "echo must ride a binary frame");
+        assert_eq!(payload, vec![1, 2, 3, 0x00, 0xFF, 0xFE]);
+    }
+
+    /// v0.1.16 bus 二进制：HTTP handler `bus.publish(topic, new Uint8Array([...]))` →
+    /// 订阅的 WS 连接收 Binary 帧（原字节；Bytes 载荷不包 {"topic","data"} 信封）。
+    #[tokio::test]
+    async fn ws_bus_binary_publish_reaches_subscriber() {
+        let _e2e = ws_e2e_lock();
+        use crate::actor::JsActor;
+        use only_js::bridge::{Bus, Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[(
+            "pub/api.ts",
+            "function post() { bus.publish(\"bin\", new Uint8Array([0, 159, 255])); json.ok({ sent: 1 }); }\n\
+             export default { post };\n",
+        )]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default { connection() { bus.subscribe("bin"); json.ok({ sub: 1 }); } };"#,
+        )
+        .unwrap();
+        let bus = Arc::new(Bus::new());
+        let root = t.0.clone();
+        let bus_actor = bus.clone();
+        let actor = JsActor::pool(1, move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras {
+                    blobs: None,
+                    bus: Some(bus_actor.clone()),
+                    ..Default::default()
+                },
+            )
+        });
+        let make_bridge = {
+            let root = t.0.clone();
+            let bus = bus.clone();
+            move || {
+                Bridge::with_dbs_and_loader(
+                    HashMap::new(),
+                    Arc::new(InMemoryKV::new()),
+                    SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    Extras {
+                        blobs: None,
+                        bus: Some(bus.clone()),
+                        ..Default::default()
+                    },
+                )
+            }
+        };
+        let addr = spawn(
+            app(
+                "/v1/api",
+                t.0.clone(),
+                true,
+                crate::tests::build_table(&t.0, true, "/v1/api"),
+                actor,
+                None,
+                None,
+                "/".to_string(),
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+            )
+            .merge(js_route(
+                "/ws/binbus",
+                RoutePool::new(
+                    handler,
+                    Arc::new(make_bridge),
+                    std::time::Duration::from_secs(1),
+                    WsOptions::default().workers_per_route,
+                    WsOptions::default().idle_linger_ms,
+                ),
+                WsOptions::default(),
+            )),
+        )
+        .await;
+
+        let mut c = WsClient::connect(addr, "/ws/binbus").await;
+        let env = c.read_text().await;
+        assert!(env.contains("\"sub\":1"), "{env}");
+        raw_http(
+            addr,
+            "POST /v1/api/pub HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let (opcode, payload) = c.read_frame().await;
+        assert_eq!(opcode, 0x02, "bus Bytes payload must ride a binary frame");
+        assert_eq!(payload, vec![0, 159, 255]);
     }
 
     /// 闸门：max=1 时第 2 条连接被拒（503），存量连接不受影响；max=0 不限。

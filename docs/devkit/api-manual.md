@@ -326,6 +326,19 @@ const b = http.body as { name?: string };
 if (!b.name) { json.fail(400, "name required"); return; }
 ```
 
+**二进制帧（v0.1.16，仅 WS `message` 钩子）**：客户端发 Binary 帧时 `http.body` 为
+`null`（不做 UTF-8 有损转换），原始字节一律走 `http.bodyBytes()`（文本帧同样可用，
+返回原始帧字节）：
+
+```ts
+// ws.ts：二进制回显（可运行案例 sample/src/echo-bin/ws.ts）
+export default {
+  async message() {
+    ws.send(await http.bodyBytes()); // Uint8Array 原字节 → Binary 帧（0x2）
+  },
+};
+```
+
 ### 路由：目录镜像与 `.route` 参数路由
 
 URL = `{base}/{module}/{...path}/{feature}/` → `<dir>/{module}/{...path}/{feature}/api.ts|js`。
@@ -551,7 +564,8 @@ json.header("X-Request-Id", "abc");
 | `http.method` | `string` | 请求方法（`GET`/`POST`/…） |
 | `http.query` | `Record<string, string>` | query 参数对象（form-urlencoded 解码：`+`→空格、`%XX`） |
 | `http.headers` | `Record<string, string>` | 请求头对象 |
-| `http.body` | `any` | 请求体（解析规则见第 4 章） |
+| `http.body` | `any` | 请求体（解析规则见第 4 章）；WS Binary 帧时为 `null` |
+| `http.bodyBytes` | `bodyBytes(): Promise<Uint8Array>` | 原始请求体字节（WS 帧场景 v0.1.16 起；HTTP 大体亦可经此取字节） |
 | `http.params` | `Record<string, string>` | 路径参数对象（已 percent-decode；目录镜像路由下恒空） |
 | `http.param` | `param(name: string, def?: unknown): any` | **路径参数优先，query 兜底**，均缺失返回 `def` 原值 |
 | `http.tenantId` | `string \| null` | 租户 id（`tenant.enable` 时从租户头提取；未启用为 `null`） |
@@ -572,7 +586,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
-| `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.16，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
+| `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
@@ -840,7 +854,7 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `bus.publish` | `publish(topic: string, data?: unknown): Promise<number>` | 广播 JSON 帧 `{"topic":…,"data":…}` 给订阅该 topic 的**全部 WS 会话**，返回接收方数（无订阅返回 0） |
+| `bus.publish` | `publish(topic: string, data?: unknown \| Uint8Array): Promise<number>` | 广播给订阅该 topic 的**全部 WS 会话**，返回接收方数（无订阅返回 0）：JSON 数据 → Text 帧 `{"topic":…,"data":…}`；Uint8Array/ArrayBuffer → **Binary 帧原字节**（不包信封，v0.1.16 起，wire 约定见第 13 章） |
 | `bus.subscribe` | `subscribe(topic: string): Promise<void>` | 当前 WS 会话订阅 topic（**HTTP 路径调用报错**——订阅对象是连接本身） |
 | `bus.kind` | `kind(): Promise<string>` | 活跃 broker 类型：`"local"` / `"kafka"` / `"rabbitmq"`（异步 op，判等须 `await`） |
 
@@ -908,7 +922,7 @@ if (r.ok) {
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `ws.send` | `send(data: string): void` | 向当前连接发一帧（HTTP 路径下 no-op） |
+| `ws.send` | `send(data: string \| Uint8Array): void` | 向当前连接发一帧：string → Text 帧（0x1），Uint8Array → Binary 帧（0x2，v0.1.16 起）；HTTP 路径下 no-op |
 | `ws.close` | `close(): void` | 结束当前连接 |
 | `sess.id` | `number`（只读） | 当前连接 id（路由内自 1 递增） |
 | `sess.state` | 读写属性 | 连接会话状态（Rust 会话表持久，按连接隔离）；**必须可 JSON 序列化**——函数等不可序列化值静默丢失 |
@@ -1058,11 +1072,13 @@ globalThis.APP_ENV = "prod";
 
 | 客户端 | 生产面 | 消费面（**仅任务上下文**） |
 |---|---|---|
-| `Kafka(name)` | `send(topic, {value, key?, headers?})` | `poll(topics, {max?, timeoutMs?})` → `{messages}`；`commit(m)`（按 m.offset+1 提交） |
-| `RabbitMQ(name)` | `publish(exchange, routingKey, value, {headers?})` | `poll(queues, {max?, timeoutMs?})`（= 循环 basic.get）；`ack(m)`；`nack(m, requeue?)` |
+| `Kafka(name)` | `send(topic, {value, key?, headers?})`；`value` 传 Uint8Array/ArrayBuffer → **base64 编码进 `value_b64`**，record 载荷 = 原始字节（v0.1.16） | `poll(topics, {max?, timeoutMs?})` → `{messages}`；`commit(m)`（按 m.offset+1 提交） |
+| `RabbitMQ(name)` | `publish(exchange, routingKey, value, {headers?})`（`value` 二进制语义同 Kafka） | `poll(queues, {max?, timeoutMs?})`（= 循环 basic.get）；`ack(m)`；`nack(m, requeue?)` |
 | 两者 | `kind()` / `metadata()` | —— |
 
-消息形状（`OjMqMessage`）：`{topic, partition?, offset?, key?, value, headers?, ts?}`。
+消息形状（`OjMqMessage`）：`{topic, partition?, offset?, key?, value, value_b64?, headers?, ts?}`。
+载荷为 UTF-8 时 `value` 是解析后的 JSON（解析失败为字符串）；**非 UTF-8 载荷** → `value` 为
+`null`、`value_b64` 为 base64 字符串（v0.1.16 起，自行 `atob`/解码还原字节）。
 
 **消费门禁（评审 M2）**：`poll/commit/ack/nack` 只在长任务上下文可用——HTTP/WS
 handler 里调用直接报错（消费会话归属任务实例，实例级单 poller，第二个并发 poll
@@ -1220,7 +1236,7 @@ tenant:
 oj-auth 插件实现为多层前缀），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
 已带的头仍照常注入。
 
-**`sql_guard`（v0.1.16 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
+**`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制
 当前租户、update/delete 自动收窄、sets 显式改 tenant_id 拒绝；裸 SQL 查「完全遗漏 tenant_id」
 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
@@ -1301,6 +1317,7 @@ describe("user account", () => {
 |---|---|
 | `client.get/post/put/del/patch/head/options(path, opts?)` | 进程内派发；`opts = { headers?, body? }`，返回 `ClientResp { status, headers, body, upgrade }`；`path` 相对 base（如 `"/user/account"`） |
 | `client.login(username, password, headers?)` | POST 业务路由 `/auth/login`（sample/src/auth/）→ 返回 `access_token`（失败抛错；`headers` 透传，如租户头） |
+| `client.ws(path)`（v0.1.16） | WS 帧测试面：`send(string\|Uint8Array)` / `next(ms?) → {binary,data}\|{closed:true}\|null` / `close()`；首次使用惰性起 127.0.0.1:0 本地服务（真实路由 + 帧循环）。用例见 `sample/tests/ws-bin.test.ts` |
 | `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` | vitest 风格子集 |
 | `expect(actual)` | `.toBe / .toEqual / .toBeTruthy / .toBeFalsy / .toContain` |
 | `finish()` | 标记会话结束 |
@@ -1480,7 +1497,7 @@ V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker �
 ### tenant / auth
 
 字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
-跳转腿豁免；v0.1.16 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
+跳转腿豁免；v0.1.15 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
 白名单——语义与建表要求见第 8 章与 `docs/tenant-guide.md`；auth 的 `jwt_secret`（空串
 启动 fail-fast，生产必改）、`signing_method`
 （HS256|HS384|HS512，默认 HS256）、`access_token_duration`（默认 60s）、
@@ -1633,6 +1650,24 @@ oj-v<version>-<triple>/
 vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml --api-path dist`。
 启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整（终端默认静默：
 `tail -f logs/server-*.log`，或启动时加 `--console-log`）。
+
+### npm 分发（@oj-bin/*，v0.1.13）
+
+除 tarball 外还有 npm 渠道，最终布局与解包一致：
+
+```bash
+npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-bin/oj-<triple>
+```
+
+- `postinstall` 按当前平台取子包内容落盘 `<项目根>/bin/`（`oj` / `plugins/<triple>/` /
+  `devkit/` / `lib`），原子替换（rename，可覆盖运行中的旧二进制）；**不支持全局安装**
+  （没有确定的项目根，装全局直接报错）。被 `--omit=optional` / `ignore-scripts` 排除
+  时 fail-fast 并提示。
+- 发布由仓库 `scripts/npm-publish.sh` 单一来源：装配 + 幂等（`npm view` 已发布即
+  skip）+ 门禁（tag 与 Cargo.toml 版本一致性、同 `(os,cpu)` 撞车、包根布局断言）+
+  发布后置信断言（os/cpu/tarball 文件清单）；`DRY_RUN=1` 只装配断言不发布，本地自检用。
+- npm 包不可撤回：CI 上 release 草稿期不发 npm（人工核对 release 后幂等补发），
+  版本一经发布不可复用——改代码必须递增版本。
 
 ## 12. 运维要点
 
@@ -1788,6 +1823,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
+| bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
+| WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
@@ -1808,6 +1845,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - `redis.default` 配置即真连且 fail-fast——CI/离线环境注释掉该段即用内存 KV。
 - 每请求至多一个 `db.tx`；漏 await 会在请求结束时自动回滚并打 warn。
 - `beforeEach` 是单一全局钩子，跨 `describe` 被覆盖——多 describe 文件在各 `it` 内联准备。
+- WS Binary 帧 `http.body` 是 `null` 不是乱码——取字节用 `http.bodyBytes()`（v0.1.16）。
+- `ws.send` 的帧型由**参数类型**决定：string → Text、Uint8Array → Binary——回显二进制协议时
+  别把字节先 decode 成 string 再发（帧型就变了）。
 - `ext_boot.js` 里别写库/发广播/打外部接口——执行次数是「模块数 + `pool_size` + WS Worker 数
   （每路由 `ws.workers_per_route`）」，副作用按此放大；boot 只做全局装配。
 - `ext_boot.js` 顶层 `await` 忘了 `export {};` → 看起来莫名的 SyntaxError（CJS 启发式误判）。

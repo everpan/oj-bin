@@ -2,6 +2,44 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.16（2026-09-14）
+
+**特性**
+- WS 二进制帧支持（Plane 协同文档/Yjs 场景解锁；PRD
+  `plane/docs/ever/prd/oj-feature-request-ws-binary.md`）。入侧：客户端 Binary 帧（opcode 0x2）
+  原字节透传，`http.body` 为 `null`（不再 `from_utf8_lossy` 产生垃圾），新增
+  `http.bodyBytes(): Promise<Uint8Array>`（文本帧同样可用，返回原始帧字节）。出侧：
+  `ws.send(data)` 接受 `string | Uint8Array`——string → Text 帧（0x1）、Uint8Array →
+  Binary 帧（0x2），帧型由参数类型决定。`sess.state` 语义不变（必须可 JSON 序列化；
+  Yjs awareness 等二进制状态走 base64 或 kv，见 api-manual §13）。
+- bus 字节化（ABI 7 → 8，**需同步重编全部插件**）：`bus.publish(topic, data)` data 传
+  `Uint8Array`/`ArrayBuffer` → 订阅 WS 会话收 Binary 帧（原字节，不包信封）；JSON 数据行为
+  不变（`{"topic","data"}` Text 帧）。wire 约定：JSON → record payload = 信封 UTF-8；
+  字节 → record payload = 原始字节；消费侧启发式（UTF-8 且为含 topic+data 的 JSON 对象 →
+  文本信封，否则二进制透传）。FFI `EventBrokerVtable.publish` data 与 `HostContext.deliver`
+  payload 改 `RBytes`（stabby Vec<u8>）；oj-bus-kafka / oj-bus-rabbitmq 消费循环去 lossy
+  直通字节。
+- 命名 MQ 二进制载荷（零 ABI，`OjMqMessage` 词汇表扩展）：`Kafka("x").send(topic,
+  {value: new Uint8Array(...)})` / `RabbitMQ("x").publish(..., uint8array, ...)` → base64 进
+  `value_b64`，record 载荷 = 原始字节；poll 侧非 UTF-8 载荷 → `value = null` +
+  `value_b64`（base64 字符串）。
+- `oj test` L1 WS 帧测试面 `client.ws(path)`：首次使用惰性起 127.0.0.1:0 本地服务
+  （真实路由 + 真实帧循环），`send(string|Uint8Array)` / `next(ms?) → {binary,data} |
+  {closed:true} | null` / `close()`。可运行用例 `sample/tests/ws-bin.test.ts`（模块
+  `sample/src/echo-bin/`：二进制回显，字节相等 + 非 UTF-8 无损）。
+
+**文档**
+- 新设计文档 `docs/superpowers/specs/2026-09-14-ws-binary-frame-design.md`（WsSend 统一
+  枚举、bus wire 约定与启发式边界、ABI 8 清单）。
+- api-manual §4（ws.ts 二进制帧小节 + bodyBytes 示例）、§6（http/ws/bus 表、命名 MQ
+  value_b64、client.ws 行）、§9（client.ws）、§13（bus wire 约定与启发式边界、二进制
+  状态建议）；SKILL.md 陷阱 +2；websocket.md §1.1 二进制帧 + 修正 http.body 旧表述；
+  global.d.ts（WSApi.send 联合类型、http.bodyBytes、OjMqMessage.value_b64、TestWs）。
+
+**CI/插件**
+- `cargo xtask plugin <name> --check` 门禁随 ABI 8 生效；旧 ABI 7 cdylib 报
+  `plugin ABI mismatch: plugin=7 host=8`——`cargo xtask build` 重编即可。
+
 ## v0.1.15（2026-09-13）
 
 **特性**

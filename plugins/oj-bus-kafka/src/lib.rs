@@ -13,7 +13,7 @@
 use futures::StreamExt;
 use oj_plugin_ffi::{
     ABI_VERSION, EventBrokerVtable, FfiFuture, HostContext, MqMessage, MqVtable, PluginDescriptor,
-    RArc, RResult, RString,
+    RArc, RBytes, RResult, RString,
 };
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
@@ -37,6 +37,15 @@ struct BrokerCfgJson {
     url: Option<String>,
     group: Option<String>,
     topic_prefix: Option<String>,
+}
+
+/// &[u8] → RBytes（stabby 无 From<&[u8]>，逐元素 push；与宿主侧同名助手同款）。
+fn to_rbytes(bytes: &[u8]) -> RBytes {
+    let mut v = RBytes::new();
+    for b in bytes {
+        v.push(*b);
+    }
+    v
 }
 
 // ---- KafkaCore：共底层 driver（连接/生产/cfg 解析；bus 与 mq 两面共享）----
@@ -89,9 +98,17 @@ impl KafkaCore {
     }
 
     /// mq 面 send（唯一发送 method；rabbit 的 publish 同型不同 payload，见 oj-bus-rabbitmq）。
+    /// value_b64（v0.1.16）→ 解码字节为 payload；否则 value JSON 序列化为 payload。
     async fn send(&self, req: SendReq) -> Result<Vec<u8>, String> {
-        let payload = req.value.to_string();
-        let mut record = FutureRecord::to(&req.topic).payload(payload.as_str());
+        let payload: Vec<u8> = if let Some(b64) = &req.value_b64 {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("kafka send {}: bad value_b64: {e}", req.topic))?
+        } else {
+            req.value.unwrap_or(Value::Null).to_string().into_bytes()
+        };
+        let mut record = FutureRecord::to(&req.topic).payload(payload.as_slice());
         record = match &req.key {
             Some(k) => record.key(k.as_str()),
             None => record,
@@ -151,7 +168,12 @@ struct SendReq {
     partition: Option<i32>,
     #[serde(default)]
     headers: HashMap<String, String>,
-    value: Value,
+    /// 文本/JSON 载荷（value_b64 存在时可省）。
+    #[serde(default)]
+    value: Option<Value>,
+    /// 二进制载荷（base64，v0.1.16）：设置时 record payload = 解码字节。
+    #[serde(default)]
+    value_b64: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -277,6 +299,22 @@ impl MqInstance {
                         }),
                         None => Value::Null,
                     };
+                    let value_b64 = m.payload().and_then(|p| {
+                        // 非 UTF-8 载荷（二进制透传，v0.1.16）→ base64，value 置 null。
+                        if std::str::from_utf8(p).is_err()
+                            && serde_json::from_slice::<Value>(p).is_err()
+                        {
+                            use base64::Engine as _;
+                            Some(base64::engine::general_purpose::STANDARD.encode(p))
+                        } else {
+                            None
+                        }
+                    });
+                    let value = if value_b64.is_some() {
+                        Value::Null
+                    } else {
+                        value
+                    };
                     let ts = match m.timestamp() {
                         Timestamp::CreateTime(ms) | Timestamp::LogAppendTime(ms) => ms,
                         Timestamp::NotAvailable => 0,
@@ -287,6 +325,7 @@ impl MqInstance {
                         offset: Some(m.offset()),
                         key: m.key().map(|k| String::from_utf8_lossy(k).to_string()),
                         value,
+                        value_b64,
                         headers,
                         ts,
                         delivery_tag: None,
@@ -362,7 +401,7 @@ impl BusPluginState {
             .ok_or_else(|| format!("mq: unknown handle {handle}"))
     }
 
-    async fn do_publish(&self, handle: u64, topic: &str, data: &str) -> Result<Vec<u8>, String> {
+    async fn do_publish(&self, handle: u64, topic: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         let b = self.bus_broker(handle)?;
         let physical = b.topic_of(topic);
         b.core
@@ -403,11 +442,10 @@ impl BusPluginState {
                     msg = stream.next() => match msg {
                         Some(Ok(m)) => {
                             let Some(p) = m.payload() else { continue };
-                            let payload = String::from_utf8_lossy(p).to_string();
-                            // 宿主按逻辑 topic 扇出；非阻塞投递（宿主 tx.send）。
+                            // 原始字节上送（ABI 8；JSON 信封/二进制帧型由宿主侧判定）。
                             (host.deliver)(
                                 RString::from(logical.as_str()),
-                                RString::from(payload.as_str()),
+                                to_rbytes(p),
                             );
                         }
                         Some(Err(e)) => {
@@ -438,7 +476,7 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
     })
 }
 
-extern "C" fn publish(handle: u64, topic: RString, data: RString) -> FfiFuture {
+extern "C" fn publish(handle: u64, topic: RString, data: RBytes) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let st = state();
         oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
@@ -761,7 +799,7 @@ mod tests {
         drive(&mut publish(
             handle,
             RString::from(topic.as_str()),
-            RString::from(r#"{"topic":"t","data":{"hi":1}}"#),
+            to_rbytes(br#"{"topic":"t","data":{"hi":1}}"#),
         ))
         .await
         .expect("publish");
@@ -773,7 +811,7 @@ mod tests {
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

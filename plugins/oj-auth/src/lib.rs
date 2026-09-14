@@ -130,6 +130,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, auth => &VTABLE);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oj_plugin_ffi::RBytes;
 
     fn guard() -> Guard {
         Guard::new(&GuardCfg {
@@ -180,7 +181,7 @@ mod tests {
     }
 
     extern "C" fn nl(_level: u8, _msg: RString) {}
-    extern "C" fn nd(_topic: RString, _payload: RString) {}
+    extern "C" fn nd(_topic: RString, _payload: RBytes) {}
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {
             log: nl,

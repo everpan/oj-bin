@@ -1,6 +1,6 @@
 [package]
 name = "oj"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 
 [dependencies]
@@ -19,6 +19,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"]
 # 测试框架（L1）：进程内 dispatch + 真实 deno_core 运行时内跑 TS 用例。
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
+# client.ws（L1 帧测试面）：惰性 127.0.0.1:0 axum::serve + tokio-tungstenite 客户端
+# （与根 crate/server 同版本，依赖树单版本）。
+tokio-tungstenite = "0.30"
+futures-util = "0.3.34"
 deno_core = "0.411"
 deno_error = "0.7"
 async-trait = "0.1"

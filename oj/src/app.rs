@@ -760,6 +760,11 @@ impl App {
     pub fn base(&self) -> &str {
         &self.base
     }
+
+    /// 路由表副本（client.ws 惰性本地 `axum::serve` 用；oneshot 派发覆盖不到 WS 帧循环）。
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
 }
 
 #[async_trait]

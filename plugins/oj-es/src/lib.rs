@@ -253,8 +253,10 @@ mod tests {
     use httptest::{Expectation, Server, matchers::*, responders::*};
     use serde_json::Value;
 
+    use oj_plugin_ffi::RBytes;
+
     extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RString) {}
+    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
 
     fn host() -> RArc<HostContext> {
         RArc::new(HostContext {

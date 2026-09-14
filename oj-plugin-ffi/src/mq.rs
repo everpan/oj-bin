@@ -36,6 +36,10 @@ pub struct MqMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub value: serde_json::Value,
+    /// 二进制载荷（v0.1.16）：record 载荷非 UTF-8 时置 value=null 并经 base64 透传；
+    /// send 侧对称接受 value_b64（解码字节作为 record 载荷）。JSON 词汇表字段，不进 ABI。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_b64: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     #[serde(default)]

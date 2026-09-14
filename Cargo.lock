@@ -3917,7 +3917,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "async-trait",
  "axum",
@@ -3925,6 +3925,7 @@ dependencies = [
  "deno_core",
  "deno_error",
  "flate2",
+ "futures-util",
  "jsonwebtoken 11.0.0",
  "libc",
  "oj-plugin-ffi",
@@ -3941,6 +3942,7 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -3972,6 +3974,7 @@ dependencies = [
 name = "oj-bus-kafka"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "futures",
  "oj-plugin-ffi",
  "rdkafka",
@@ -3984,6 +3987,7 @@ dependencies = [
 name = "oj-bus-rabbitmq"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "futures",
  "lapin",
  "oj-plugin-ffi",

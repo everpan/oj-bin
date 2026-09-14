@@ -2018,6 +2018,14 @@ mod tests {
         assert!(guard.verify("/items", None).is_err());
     }
 
+    /// JSON publish → 订阅通道必收 text 信封帧（bus Bytes 载荷才会走 Binary）。
+    fn env_text(f: only_js::bridge::WsSend) -> String {
+        match f {
+            only_js::bridge::WsSend::Text(s) => s,
+            other => panic!("json publish must deliver text frame, got {other:?}"),
+        }
+    }
+
     /// 硬验收（Task 6.1 Step 5）：真 kafka 插件 broker 下 Task 0.5 共享语义回归
     /// （env-gated，`OJ_TEST_KAFKA_BROKERS` 给逗号分隔 bootstrap servers；未设置 → 跳过）。
     /// 同一 broker 实例（一个 FfiEventBroker，单消费循环/每 topic）上两个订阅通道
@@ -2063,7 +2071,10 @@ mod tests {
         broker.subscribe(&topic, tx2).await.unwrap(); // 同 topic 第二通道（不新起消费）
         tokio::time::sleep(std::time::Duration::from_millis(500)).await; // 等消费就绪
         broker
-            .publish(&topic, &serde_json::json!({ "v": 9 }))
+            .publish(
+                &topic,
+                &only_js::bridge::BusPayload::Json(serde_json::json!({ "v": 9 })),
+            )
             .await
             .unwrap();
         let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
@@ -2074,10 +2085,12 @@ mod tests {
             .await
             .expect("shared receive 2 timeout")
             .expect("channel 2 closed");
-        let v1: serde_json::Value = serde_json::from_str(&f1).unwrap();
-        assert_eq!(v1["data"]["v"], 9, "{f1}");
-        let v2: serde_json::Value = serde_json::from_str(&f2).unwrap();
-        assert_eq!(v2["data"]["v"], 9, "{f2}");
+        let t1 = env_text(f1);
+        let v1: serde_json::Value = serde_json::from_str(&t1).unwrap();
+        assert_eq!(v1["data"]["v"], 9, "{t1}");
+        let t2 = env_text(f2);
+        let v2: serde_json::Value = serde_json::from_str(&t2).unwrap();
+        assert_eq!(v2["data"]["v"], 9, "{t2}");
     }
 
     /// 硬验收（Task 6.1 Step 5）：真 rabbitmq 插件 broker 下 Task 0.5 共享语义回归
@@ -2121,7 +2134,10 @@ mod tests {
         broker.subscribe(&topic, tx2).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         broker
-            .publish(&topic, &serde_json::json!({ "v": 11 }))
+            .publish(
+                &topic,
+                &only_js::bridge::BusPayload::Json(serde_json::json!({ "v": 11 })),
+            )
             .await
             .unwrap();
         let f1 = tokio::time::timeout(std::time::Duration::from_secs(10), rx1.recv())
@@ -2132,9 +2148,11 @@ mod tests {
             .await
             .expect("shared receive 2 timeout")
             .expect("channel 2 closed");
-        let v1: serde_json::Value = serde_json::from_str(&f1).unwrap();
-        assert_eq!(v1["data"]["v"], 11, "{f1}");
-        let v2: serde_json::Value = serde_json::from_str(&f2).unwrap();
-        assert_eq!(v2["data"]["v"], 11, "{f2}");
+        let t1 = env_text(f1);
+        let v1: serde_json::Value = serde_json::from_str(&t1).unwrap();
+        assert_eq!(v1["data"]["v"], 11, "{t1}");
+        let t2 = env_text(f2);
+        let v2: serde_json::Value = serde_json::from_str(&t2).unwrap();
+        assert_eq!(v2["data"]["v"], 11, "{t2}");
     }
 }

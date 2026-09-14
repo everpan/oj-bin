@@ -58,7 +58,7 @@ mod ws;
 pub use accessor_sqlx::SqlxAccessor;
 pub use auth::AuthGuard;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
-pub use bus::{Bus, EventBroker};
+pub use bus::{Bus, BusPayload, EventBroker};
 pub use bus_backend::{BusBackend, BusBackendRegistry};
 pub use crypto::JwtCfg;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
@@ -195,7 +195,7 @@ pub struct ReqState {
     /// 活跃事务（db.tx；每请求至多一个，reset 时丢弃 = drop 自带回滚）。
     pub tx: Option<Arc<db::ActiveTx>>,
     /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
-    pub ws_sends: Vec<String>,
+    pub ws_sends: Vec<WsSend>,
     /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
     pub ws_close: bool,
     /// WS 帧收尾（帧池 spec 2026-09-09）：dispatcher `finally` 把 `__sess` 快照交还
@@ -235,6 +235,7 @@ deno_core::extension!(
         json::op_json_raw,
         http::op_http_info,
         http::op_http_file,
+        http::op_http_body_bytes,
         kv::op_kv_get,
         kv::op_kv_set,
         kv::op_kv_del,
@@ -255,6 +256,7 @@ deno_core::extension!(
         blob::op_blob_url,
         blob::op_blob_content_type,
         bus::op_bus_publish,
+        bus::op_bus_publish_bin,
         bus::op_bus_subscribe,
         bus::op_bus_kind,
         es::op_es_search,
@@ -267,6 +269,7 @@ deno_core::extension!(
         oidc::op_oidc_verify,
         oidc::op_oidc_info,
         ws::op_ws_send,
+        ws::op_ws_send_bin,
         cert::op_cert_gen,
         cert::op_cert_renew,
         crypto::op_jwt_sign,
@@ -971,8 +974,17 @@ pub const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug, Default)]
 pub struct WsOutcome {
     pub capture: Capture,
-    pub sends: Vec<String>,
+    pub sends: Vec<WsSend>,
     pub close: bool,
+}
+
+/// 一条待写出帧（v0.1.16 二进制支持）：ws.send 文本 / 二进制与 bus 广播帧共用同一
+/// 管道（ws_sends → WsOutcome → server resp 通道 → Writer），帧类型在此定型：
+/// Text → WebSocket text 帧；Binary → WebSocket binary 帧（opcode 0x2）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum WsSend {
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 /// WS 驻留会话：每连接独占的 runtime（模块已加载、钩子已装配）。
@@ -1320,7 +1332,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn bus_subscribe_publish_and_http_rejects() {
         let (b, _) = new_bridge();
-        let (bus_tx, mut bus_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (bus_tx, mut bus_rx) = tokio::sync::mpsc::unbounded_channel::<WsSend>();
         // 帧 1：WS 会话订阅（RequestInfo.bus_tx 注入）
         let o1 = b
             .run_ws(
@@ -1342,10 +1354,11 @@ mod tests {
             .unwrap();
         let v2: Value = serde_json::from_slice(&o2.capture.body).unwrap();
         assert_eq!(v2["data"]["n"], 1, "{v2}");
-        // 订阅方收到 {"topic","data"} JSON 帧
-        let frame = bus_rx.try_recv().unwrap();
-        let v: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v, json!({"topic": "news", "data": {"a": 1}}), "{v}");
+        // 订阅方收到 {"topic","data"} JSON text 帧
+        assert_eq!(
+            bus_rx.try_recv().unwrap(),
+            WsSend::Text(json!({"topic": "news", "data": {"a": 1}}).to_string())
+        );
         // HTTP 上下文（bus_tx None）订阅 → 报错（msg 含 WebSocket）
         let cap = b
             .run_with(
@@ -1521,7 +1534,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(o.sends, vec!["side-a".to_string(), "side-b".to_string()]);
+        assert_eq!(
+            o.sends,
+            vec![
+                WsSend::Text("side-a".to_string()),
+                WsSend::Text("side-b".to_string())
+            ]
+        );
         assert!(o.close);
         let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
         assert_eq!(v["data"]["ok1"], true, "{v}");

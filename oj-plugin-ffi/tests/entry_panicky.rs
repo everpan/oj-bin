@@ -1,11 +1,11 @@
 //! 入口宏测试（panic 插件）：init 内 panic 经宏包装收敛为 RResult::Err，不 unwind 跨界。
 
 use oj_plugin_ffi::{
-    ABI_VERSION, HostContext, PluginDescriptor, RArc, RResult, RString, oj_plugin_entry,
+    ABI_VERSION, HostContext, PluginDescriptor, RArc, RBytes, RResult, RString, oj_plugin_entry,
 };
 
 extern "C" fn noop_log(_level: u8, _msg: RString) {}
-extern "C" fn noop_deliver(_topic: RString, _payload: RString) {}
+extern "C" fn noop_deliver(_topic: RString, _payload: RBytes) {}
 
 fn init(_host: RArc<HostContext>, _cfg: RString) -> RResult<PluginDescriptor, RString> {
     panic!("init boom")

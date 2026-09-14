@@ -15,6 +15,7 @@ import {
   op_blob_url,
   op_blob_content_type,
   op_bus_publish,
+  op_bus_publish_bin,
   op_bus_subscribe,
   op_bus_kind,
   op_cert_gen,
@@ -38,6 +39,7 @@ import {
   op_finish,
   op_http_info,
   op_http_file,
+  op_http_body_bytes,
   op_json_fail,
   op_json_header,
   op_json_ok,
@@ -61,6 +63,7 @@ import {
   op_random_hex,
   op_sha256_hex,
   op_ws_send,
+  op_ws_send_bin,
   op_ws_frame_close,
 } from "ext:core/ops";
 
@@ -131,6 +134,8 @@ globalThis.http = new Proxy({}, {
       };
     }
     if (p === "file") return (i) => op_http_file(i | 0);
+    // raw bytes of the current request / WS frame (text and binary frames alike).
+    if (p === "bodyBytes") return () => op_http_body_bytes();
     return httpInfo()[p];
   },
 });
@@ -190,6 +195,28 @@ globalThis.__ojMq = {
 // ----- Kafka / RabbitMQ: named mq clients (per-name JS cache guarantees identity, like DB) -----
 // Kind-shaped surfaces: kafka = send/poll/commit; rabbit = publish(alias of send)/poll/ack/nack.
 // Consumers (poll/commit/ack/nack) are gated Rust-side to task contexts (long-running tasks).
+// Binary payloads: value as Uint8Array/ArrayBuffer rides as value_b64 (base64, v0.1.16);
+// poll messages with non-UTF-8 payloads come back with value_b64 set (value = null).
+function b64FromBytes(u8) {
+  const T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < u8.length; i += 3) {
+    const b0 = u8[i], b1 = u8[i + 1], b2 = u8[i + 2];
+    out += T[b0 >> 2];
+    out += T[((b0 & 3) << 4) | (b1 === undefined ? 0 : b1 >> 4)];
+    out += b1 === undefined ? "=" : T[((b1 & 15) << 2) | (b2 === undefined ? 0 : b2 >> 6)];
+    out += b2 === undefined ? "=" : T[b2 & 63];
+  }
+  return out;
+}
+function mqArgs(o) {
+  if (o && o.value instanceof ArrayBuffer) return mqArgs({ ...o, value: new Uint8Array(o.value) });
+  if (o && ArrayBuffer.isView(o.value)) {
+    const { value, ...rest } = o;
+    return { ...rest, value_b64: b64FromBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) };
+  }
+  return o || {};
+}
 const mqCache = new Map();
 function mqClient(kind) {
   return function (name) {
@@ -202,12 +229,12 @@ function mqClient(kind) {
         metadata: () => op_mq_call(kind, name, "metadata", null),
       };
       if (kind === "kafka") {
-        inst.send = (topic, o) => op_mq_call(kind, name, "send", { topic, ...(o || {}) });
+        inst.send = (topic, o) => op_mq_call(kind, name, "send", { topic, ...mqArgs(o) });
         inst.poll = (topics, o) => op_mq_call(kind, name, "poll", { topics, ...(o || {}) });
         inst.commit = (m) => op_mq_call(kind, name, "commit", m);
       } else {
         inst.publish = (exchange, routingKey, value, o) =>
-          op_mq_call(kind, name, "send", { exchange, routingKey, value, ...(o || {}) });
+          op_mq_call(kind, name, "send", { exchange, routingKey, ...mqArgs({ value, ...(o || {}) }) });
         inst.poll = (queues, o) => op_mq_call(kind, name, "poll", { queues, ...(o || {}) });
         inst.ack = (m) => op_mq_call(kind, name, "ack", m);
         inst.nack = (m, requeue) => op_mq_call(kind, name, "nack", { ...m, requeue: !!requeue });
@@ -228,8 +255,12 @@ globalThis.tasks = {
 };
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
+// send: string -> text frame; Uint8Array/ArrayBuffer -> binary frame (opcode 0x2, v0.1.16).
 globalThis.ws = {
-  send: (data) => op_ws_send(String(data)),
+  send: (data) =>
+    typeof data === "string"
+      ? op_ws_send(data)
+      : op_ws_send_bin(data instanceof ArrayBuffer ? new Uint8Array(data) : data),
   close: () => op_ws_frame_close(),
 };
 
@@ -241,7 +272,12 @@ globalThis.WebSocket = ojWsClient;
 // kind() reports the active broker type ("local" | "kafka" | "rabbitmq") so handlers
 // can detect distributed-event capability.
 globalThis.bus = {
-  publish: (topic, data) => op_bus_publish(String(topic), data === undefined ? null : data),
+  // Uint8Array/ArrayBuffer -> binary broadcast (raw bytes to subscribers, v0.1.16);
+  // anything else -> JSON envelope {"topic","data"} text frame.
+  publish: (topic, data) =>
+    data instanceof ArrayBuffer || ArrayBuffer.isView(data)
+      ? op_bus_publish_bin(String(topic), data instanceof ArrayBuffer ? new Uint8Array(data) : data)
+      : op_bus_publish(String(topic), data === undefined ? null : data),
   subscribe: (topic) => op_bus_subscribe(String(topic)),
   kind: () => op_bus_kind(),
 };
