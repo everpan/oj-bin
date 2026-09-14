@@ -44,7 +44,9 @@ Binary 帧（0x2）。入侧 Binary 帧 `http.body` 为 `null`，字节走 `http
 ```ts
 export default {
   async message() {
-    ws.send(await http.bodyBytes()); // 原字节原帧型（send 收 Uint8Array → Binary 帧）
+    const text = http.body; // 二进制帧为 null
+    ws.send(text === null ? await http.bodyBytes() : text);
+    // Uint8Array → Binary 帧；string → Text 帧
   },
 };
 ```
