@@ -21,7 +21,7 @@ src/ws.ts        →  /v1/api/ws             （根级）
 |---|---|---|
 | 触发 | HTTP 请求命中路由 | 连接升级后**客户端每个文本/二进制帧** |
 | 执行单元 | `default[method]()` 一个函数 | `default` 导出的钩子（`connection` 一次 / `message` 每帧 / `close` 一次 / `error` 兜底） |
-| 回写 | `{code,msg,data}` 信封 HTTP 响应 | 信封文本帧 + `ws.send` 裸帧 |
+| 回写 | `{code,msg,data}` 信封 HTTP 响应 | 信封 Text 帧 + `ws.send` 裸帧（Text/Binary 由参数类型定，§1.1） |
 | 运行位置 | HTTP actor 池（`server.pool_size` 个 VM 排队复用） | **路由级帧池**（连接状态外置 Rust 会话表） |
 | Worker 池 | actor 即池，无独立 Worker 层 | **W 个无状态 Worker/路由**（`ws.workers_per_route`，默认 2）从帧队列拉帧执行 |
 
@@ -86,7 +86,7 @@ bus 后端可换（`local`/kafka/rabbitmq 插件），所以跨进程实例的 H
 | 调用 | 效果 |
 |---|---|
 | `json.ok(data?)` / `json.fail(code,msg,data?)` | 回一个信封文本帧（每帧最多一个） |
-| `ws.send(data)` | 额外发**裸文本帧**（先于信封写出，可多次） |
+| `ws.send(data)` | 额外发**裸帧**（先于信封写出，可多次）：`string` → Text 帧（0x1）、`Uint8Array` → Binary 帧（0x2，v0.1.16） |
 | `ws.close()` | 本帧处理完后服务端发 Close 帧，连接干净关闭 |
 | `bus.subscribe(topic)` | 订阅主题（仅 WS 上下文可用；HTTP handler 里调用直接报错） |
 | 其余全局 `db`/`kv`/`http`/`log`/… | 照常可用；TS 类型标注走统一转译管线 |
@@ -195,7 +195,8 @@ socket ──Reader──▶ msgChan(64) ──▶ 帧队列 ──▶ W × Work
 bus 广播帧 ────────────Bus forwarder（unbounded）┘        （与 ws.send 同通道 → 保序）
 ```
 
-- **Reader**：文本/二进制帧 → `msgChan`；满了背压到 TCP 层（对端 send 变慢）。
+- **Reader**：文本/二进制帧 → `(bytes, binary)` 二元组进 `msgChan`（帧型自 reader 起随
+  `Frame.binary` 传播到 `RequestInfo.body_binary`，v0.1.16）；满了背压到 TCP 层（对端 send 变慢）。
 - **Worker（帧执行）**：升级后先 `fire("connection", …)`，每帧组一个
   `RequestInfo { method: "WS", body: 帧字节, bus_tx }` 提交池。调度器 **per-conn
   在飞=1**：同连接帧严格保序（在飞期间后续帧在 waiting 队列排队）。Worker 执行时从
@@ -207,8 +208,11 @@ bus 广播帧 ────────────Bus forwarder（unbounded）�
   `attach` 存入该连接的会话表条目）。连接结束时 `forwarder.abort()` 收尾——否则 bus
   订阅表里的发送端滞留，Writer 永不排空。
 
-**op 层**（`src/bridge/ws.rs`，三个）：`op_ws_send` 把字符串 push 进
-`ReqState.ws_sends`，`op_ws_frame_close` 置位 `ReqState.ws_close`，`op_ws_sess_set` 由
+**op 层**（`src/bridge/ws.rs`，四个）：`op_ws_send` / `op_ws_send_bin`（v0.1.16，字节入参）
+分别 push `WsSend::Text` / `WsSend::Binary` 进 `ReqState.ws_sends`（统一枚举，全文一线：
+`ws_sends` → `WsOutcome.sends` → resp 通道 → Writer match 帧型；bus 通道与 DELIVER_TARGETS
+同型——bus 二进制见 spec `docs/superpowers/specs/2026-09-14-ws-binary-frame-design.md`），
+`op_ws_frame_close` 置位 `ReqState.ws_close`，`op_ws_sess_set` 由
 dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态外置回传）——
 都是「先收集、帧末统一执行」（v0.1.7 起 `op_ws_frame_close` 改名，避开 deno_websocket
 的同名 op）。HTTP 路径不读这些项，所以同一份 handler 代码在 HTTP 里调用 `ws.*`

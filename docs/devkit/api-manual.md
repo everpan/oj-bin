@@ -396,7 +396,7 @@ export default { get: detail };
 ```ts
 export default {
   connection() { /* 连接建立后恰好一次：bus.subscribe 在此 */ },
-  message()    { /* 每帧一次：http.body 读帧（JSON 自动 parse） */ },
+  message()    { /* 每帧一次：http.body 读帧（JSON 自动 parse；Binary 帧 → null，字节走 http.bodyBytes()） */ },
   error(e)     { /* 任一钩子抛异常时兜底，之后连接继续 */ },
   close()      { /* 收尾恰好一次：客户端断 / socket 断 / ws.close() 三来源统一 */ },
 };
