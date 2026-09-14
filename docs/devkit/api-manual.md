@@ -331,10 +331,12 @@ if (!b.name) { json.fail(400, "name required"); return; }
 返回原始帧字节）：
 
 ```ts
-// ws.ts：二进制回显（可运行案例 sample/src/echo-bin/ws.ts）
+// ws.ts：帧型忠实回显（可运行案例 sample/src/echo-bin/ws.ts）
 export default {
   async message() {
-    ws.send(await http.bodyBytes()); // Uint8Array 原字节 → Binary 帧（0x2）
+    const text = http.body; // 二进制帧为 null
+    ws.send(text === null ? await http.bodyBytes() : text);
+    // Uint8Array → Binary 帧（0x2）；string → Text 帧（0x1）
   },
 };
 ```
@@ -1317,7 +1319,7 @@ describe("user account", () => {
 |---|---|
 | `client.get/post/put/del/patch/head/options(path, opts?)` | 进程内派发；`opts = { headers?, body? }`，返回 `ClientResp { status, headers, body, upgrade }`；`path` 相对 base（如 `"/user/account"`） |
 | `client.login(username, password, headers?)` | POST 业务路由 `/auth/login`（sample/src/auth/）→ 返回 `access_token`（失败抛错；`headers` 透传，如租户头） |
-| `client.ws(path)`（v0.1.16） | WS 帧测试面：`send(string\|Uint8Array)` / `next(ms?) → {binary,data}\|{closed:true}\|null` / `close()`；首次使用惰性起 127.0.0.1:0 本地服务（真实路由 + 帧循环）。用例见 `sample/tests/ws-bin.test.ts` |
+| `client.ws(path)`（v0.1.16） | WS 帧测试面：`send(string\|Uint8Array)` / `next(ms?) → {binary,data}\|{closed:true}\|null` / `close()`；首次使用惰性起 127.0.0.1:0 本地服务（真实路由 + 帧循环）。**`send`/`next`/`close` 任一个都能建连**——`next()` 可单独读服务端主动推的首帧（connection 钩子 `ws.send` / bus 广播），不必先 `send`；文本帧 `data` 为 string（运行时无 `TextDecoder`，测试面自带 UTF-8 解码）。用例见 `sample/tests/ws-bin.test.ts` |
 | `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` | vitest 风格子集 |
 | `expect(actual)` | `.toBe / .toEqual / .toBeTruthy / .toBeFalsy / .toContain` |
 | `finish()` | 标记会话结束 |

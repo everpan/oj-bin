@@ -12,6 +12,37 @@ import {
   op_client_ws_close,
 } from "ext:core/ops";
 
+// deno_web is not registered in the test ext -> no TextDecoder/TextEncoder/atob.
+// Minimal UTF-8 decoder for text frames (handles 1-4 byte sequences + surrogate pairs).
+// Kept here (not in a module) because this file is the only JS always present in `oj test`.
+function utf8Decode(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; ) {
+    const b = bytes[i];
+    let cp, n;
+    if (b < 0x80) {
+      cp = b;
+      n = 1;
+    } else if (b < 0xe0) {
+      cp = b & 0x1f;
+      n = 2;
+    } else if (b < 0xf0) {
+      cp = b & 0x0f;
+      n = 3;
+    } else {
+      cp = b & 0x07;
+      n = 4;
+    }
+    for (let k = 1; k < n && i + k < bytes.length; k++) cp = (cp << 6) | (bytes[i + k] & 0x3f);
+    i += n;
+    out +=
+      cp > 0xffff
+        ? String.fromCharCode(0xd800 + ((cp - 0x10000) >> 10), 0xdc00 + ((cp - 0x10000) & 0x3ff))
+        : String.fromCharCode(cp);
+  }
+  return out;
+}
+
 const METHODS = ["get", "post", "put", "del", "patch", "head", "options"];
 
 function buildClient() {
@@ -39,24 +70,30 @@ function buildClient() {
   // next(ms) -> {binary, data} | {closed: true} | null (timeout, no frame).
   c.ws = (path) => {
     let idP = null;
+    // Lazy connect: first use of send / next / close opens the socket. next() MUST be able
+    // to open on its own -- a server-initiated frame (ws.send inside the connection hook, or
+    // a bus broadcast) is sent before the client says anything, and a next()-first reader
+    // used to call op_client_ws_next(null) -> `TypeError: expected u64`.
+    // NOTE: this file is embedded via deno_core::ascii_str_include! -- keep it ASCII-only.
+    const conn = () => (idP ??= op_client_ws_open(path));
     return {
       send: async (data) => {
-        idP ??= op_client_ws_open(path);
-        const id = await idP;
+        const id = await conn();
         if (typeof data === "string") return op_client_ws_send(id, data);
         return op_client_ws_send_bin(id, data);
       },
       next: async (ms = 1000) => {
-        const id = await idP;
+        const id = await conn();
         const n = await op_client_ws_next(id, ms);
         if (n === null) return null; // timeout, no frame
         if (!n.frame) return { closed: true };
         const bytes = await op_client_ws_last_bytes(id);
         return n.binary
           ? { binary: true, data: bytes }
-          : { binary: false, data: new TextDecoder().decode(bytes) };
+          : { binary: false, data: utf8Decode(bytes) };
       },
       close: async () => {
+        if (idP === null) return; // never connected -- nothing to close
         const id = await idP;
         return op_client_ws_close(id);
       },

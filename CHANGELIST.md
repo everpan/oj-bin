@@ -29,6 +29,16 @@
   `sample/src/echo-bin/`：二进制回显，字节相等 + 非 UTF-8 无损）。
 
 **修复**
+- `oj test` 的 `client.ws(path)` **服务端主动推帧读不到**：隧道只在 `send()` 内惰性建立，
+  `next()` 拿 `null` 句柄调 `op_client_ws_next` → `TypeError: expected u64`。而 connection
+  钩子里的 `ws.send`（连接即推送）与 bus 广播都发生在客户端开口之前 → 首帧必丢。改为
+  `send`/`next`/`close` 共用一个惰性建连、`close()` 未建连即空操作；补回归用例
+  `ws server-push`（读 `/news/ws` 的连接钩子帧）。
+- `client.ws(path).next()` 的**文本帧解码恒抛** `ReferenceError: TextDecoder is not
+  defined`：test ext 不注册 deno_web，运行时无 `TextDecoder`（同 G① 的 `atob` 缺口）。
+  原实现依赖 `new TextDecoder()`，而样例只读过二进制帧故从未暴露；现自带最小 UTF-8 解码
+  （1–4 字节含代理对），并把 `sample/src/echo-bin/ws.ts` 改为**帧型忠实回显**使其可覆盖
+  （文本帧→文本帧、二进制帧→二进制帧），补用例断言 `"ping ✓ 汉字 😀"` 原样往返。
 - blob-s3 插件：**明文 http 端点下整个 s3 驱动不可用**。object_store 默认 `allow_http=false`
   → reqwest 客户端 `https_only(true)`，于是 `endpoint: "http://…"`（= `sample/config.yaml`
   自带的 MinIO 示例）在「建请求」阶段即报 `builder error for url (…)`（0 retries / 微秒级），
