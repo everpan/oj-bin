@@ -449,7 +449,7 @@ axum 放开 pin 后可启用。
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
-| `db.tx(async (tx) => { … })` | 事务：回调 resolve 提交 / throw 回滚再抛；`tx.query/exec/table` 同连接执行 |
+| `db.tx(async (tx) => { … })` | 事务：回调 resolve 提交 / throw 回滚再抛；`tx.table(...)` 与 `db` 同签名、同连接（构造器与租户防护在事务内同样生效） |
 | `DB(name)` | 命名库实例（`db === DB("default")`） |
 | `kv.get/set/del(key)` | KV：`redis.default` 配置 → 真 Redis，否则进程内存 KV |
 | `kv.expire(key, ttlSec)` / `kv.incr(key)` | 过期（秒→ms 入 op）与自增（缺省 Redis 时内存实现） |
@@ -506,9 +506,16 @@ globalThis.APP_ENV = "prod";
 ### 事务（db.tx）
 
 ```js
+// 转账 50：先读余额再写（构造器 sets 只接受常量，见下方说明）
 await db.tx(async (tx) => {
-  const n = await tx.exec("update account set balance = balance - ? where id = ?", [50, 1]);
-  await tx.exec("update account set balance = balance + ? where id = ?", [50, 2]);
+  const from = await tx.table("account").select(["id", "balance"])
+    .where({ field: "id", op: "eq", value: 1 }).all();
+  const to = await tx.table("account").select(["id", "balance"])
+    .where({ field: "id", op: "eq", value: 2 }).all();
+  await tx.table("account").update({ balance: from[0].balance - 50 })
+    .where({ field: "id", op: "eq", value: 1 }).run();
+  await tx.table("account").update({ balance: to[0].balance + 50 })
+    .where({ field: "id", op: "eq", value: 2 }).run();
   const rows = await tx.table("account").select(["id", "balance"]).all(); // 同连接读未提交
 });
 ```
@@ -517,7 +524,12 @@ await db.tx(async (tx) => {
 - 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错（`transaction already active`）；
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 await 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
-- `tx` 与 `db` 的 `query/exec/table` 同签名——事务内自动走同一连接，无需改写其余代码。
+- `tx` 与 `db` 的 `table/query/exec/fromJSON` 同签名——事务内自动走同一连接，
+  无需改写其余代码。**事务内优先用构造器**：租户条件在「走池 / 走会话」判定之前注入，
+  `tx.table(...)` 与 `db.table(...)` 的改写完全一致；裸 SQL（`tx.query`）只有
+  「文本里有没有 `tenant_id`」的 best-effort 检查。
+- 构造器的 `sets` 只接受常量值——`balance = balance - ?` 这类表达式更新要么先读后写
+  （如上），要么保留裸 SQL（唯一允许的裸 SQL 场景，务必自带 `tenant_id` 条件）。
 
 ### JWT 鉴权（auth）
 

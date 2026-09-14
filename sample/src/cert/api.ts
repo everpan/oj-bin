@@ -31,13 +31,19 @@ async function post(): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     const exp = now + days * 86400;
     const m = await cert.generate(bits, now, exp);
-    // 单条 RETURNING 原子取 id：全池共享一条 sqlite 连接，exec 后再查
-    // last_insert_rowid() 可能读到并发插入的 id。
-    // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
-    const rows = await db.query(
-      "insert into certs (name, note, public_pem, private_pem, cert_jws, nbf, exp, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
-      [name, (b.note ?? "").slice(0, 2000), m.public_pem, m.private_pem, m.cert_jws, now, exp, now, now],
-    );
+    // insert + returning：单条 RETURNING 原子取 id（pg/sqlite 一次往返，
+    // 规避 exec 后再查 last_insert_rowid() 的并发串号）。
+    const rows = await db.table("certs").insert({
+      name,
+      note: (b.note ?? "").slice(0, 2000),
+      public_pem: m.public_pem,
+      private_pem: m.private_pem,
+      cert_jws: m.cert_jws,
+      nbf: now,
+      exp,
+      created_at: now,
+      updated_at: now,
+    }).returning(["id"]).run() as unknown as { id: number }[];
     json.ok({ id: rows[0]?.id, name });
   } catch (e) {
     json.fail(500, String(e));

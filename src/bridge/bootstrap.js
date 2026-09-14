@@ -395,7 +395,7 @@ globalThis.db = globalThis.DB("default");
 // module's bound db (snapshot `db` is only the JS-visible name it was created with).
 function builderFromReq(snap) {
   const req = Object.assign(
-    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [], with: [] },
+    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [], with: [], returning: [] },
     snap,
   );
   req.db = String(req.db); req.table = String(req.table);
@@ -417,6 +417,11 @@ function builderFromReq(snap) {
     offset(n) { req.offset = n | 0; return api; },
     all() { return op_db_query_build(req); },
     insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => ({ ...r })); return api; },
+    // Insert returning clause (whitelisted columns, e.g. ["id"]): run() then resolves
+    // to a row array [{id: n}] instead of the affected-row count. pg/sqlite render a
+    // single sea-query RETURNING statement; mysql has no RETURNING and takes
+    // LAST_INSERT_ID() in a second step on the same connection (use db.tx for safety).
+    returning(cols) { req.returning = (cols || []).map(String); return api; },
     update(sets) { req.verb = "update"; req.sets = { ...sets }; return api; },
     delete() { req.verb = "delete"; return api; },
     join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
