@@ -26,6 +26,16 @@
   tag push 且对应 release 已存在时（即「自己推的 tag」）输出 `skip=true`，`lint`/`package` 加
   `needs: [guard]` + `if: needs.guard.outputs.skip != 'true'`，下游 `publish`/`publish-npm`/
   `smoke-npm` 级联跳过；真实 tag 推送与人工核对后重发仍走全量。
+- `fix(ci)`：上条 guard 把 `publish-npm` 一并级联跳过（`needs: package` 在重爬 run 里被
+  取消），且重爬 run 无 dist 产物可供 `npm-publish.sh` 使用——`publish-npm` 改为只依赖
+  `guard`，产物按 run 类型二选一：首发 run 用本次构建产物；重爬/转正 run（skip=true）
+  从 release 资产 `gh release download` 取同款产物，照旧走幂等 publish（已发布即 skip）。
+  新增 `release: types: [published]` 触发：草稿（dispatch draft=true）不发 npm，人工核对
+  点「发布」转正那一刻由 release 事件接续补发 npm（guard 对 release 事件输出 skip=true，
+  重型 job 全跳）——草稿门禁由此真实生效；tag 重爬 run 退化为幂等空跑。
+  `publish-npm` 加 job 级 `concurrency: npm-<tag>`（不取消、排队）：转正瞬间 release run
+  与重爬 push run 并发双发 npm，publish_pkg 虽幂等（npm view + 409 re-view），但 409 后
+  re-view 撞上 registry 传播延迟可能误判失败，按 tag 串行化硬消除该窗口。
 
 **文档 / 杂项**
 - db：文档与 sample 全面改写为 `db.table(...)` 构造器语法，替代原生 `db.query` 参数化查询——
