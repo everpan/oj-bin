@@ -204,8 +204,9 @@ const n = await db.exec("update account set role = ? where id = ?", ["user", 7])
 
 ```ts
 const out = await db.tx(async (tx) => {
-  await tx.exec("insert into account (name, role) values (?, ?)", ["neo", "user"]);
-  const rows = await tx.table("account").where({ field: "name", op: "eq", value: "neo" }).all();
+  await tx.table("account").insert({ name: "neo", role: "user" }).run();
+  const rows = await tx.table("account").select(["id", "name"])
+    .where({ field: "name", op: "eq", value: "neo" }).all();
   if (rows.length === 0) throw new Error("gone");   // throw/reject → 自动回滚
   return rows;
 });                                                  // 正常 resolve → 自动 commit
@@ -216,6 +217,10 @@ const out = await db.tx(async (tx) => {
 - 事务期间（包括构造器 `.run()/.all()`）同库操作自动骑到事务会话；
   **碰别的库**报错：`transaction active on db 'x' (finish it before touching db 'y')`。
 - 不支持嵌套：`transaction already active (nested tx not supported)`。
+- **构造器在事务里同样受多租户防护**：租户条件在「走池 / 走会话」判定之前注入，
+  所以 `tx.table(...)` 与 `db.table(...)` 的改写完全一致（select 收窄、insert 强制写
+  当前租户、update/delete 收窄）。裸 SQL 只有「文本里有没有 tenant_id」的 best-effort
+  检查——事务里也请优先用构造器。
 
 ---
 
@@ -338,9 +343,9 @@ await db.table("account").delete()
 
 | 动词 | 允许 | 拒绝（报 `X does not accept Y`） |
 |---|---|---|
-| select | where/joins/columns/groupBy/having/orderBy/limit/offset/distinct/unions/with | values, sets |
-| insert | values（≥1 行） | where, orderBy, limit/offset, joins, distinct, groupBy, having, unions, with, columns |
-| update | sets（非空）+ where（≥1 叶子） | joins, columns, distinct, groupBy, having, unions, with, limit/offset |
+| select | where/joins/columns/groupBy/having/orderBy/limit/offset/distinct/unions/with | values, sets, returning |
+| insert | values（≥1 行）、returning | where, orderBy, limit/offset, joins, distinct, groupBy, having, unions, with, columns |
+| update | sets（非空）+ where（≥1 叶子） | joins, columns, distinct, groupBy, having, unions, with, limit/offset, returning |
 | delete | where（≥1 叶子） | 同 update + sets |
 
 insert 行数组必须**键集完全一致**（`insert rows must share identical key sets`）；
@@ -348,7 +353,23 @@ insert 行数组必须**键集完全一致**（`insert rows must share identical
 update/delete 无 where 在 JS 侧提前抛（`update requires where`），绕过 JS 层时 op 侧
 兜底（`Update requires where (leaf count >= 1)`）。
 
-**返回形态**：select → 行数组；insert/update/delete → 受影响行数（number）。
+**返回形态**：select → 行数组；insert/update/delete → 受影响行数（number）；
+insert 带 `.returning([...])` → 行数组。
+
+```ts
+// 取回自增主键：替代原先的「insert ... returning id」裸 SQL
+const rows = await db.table("account").insert({ name: "neo", role: "user" })
+  .returning(["id"]).run();
+const id = rows[0].id;
+```
+
+- `.returning(["id"])` 只有 insert 接受（其它动词报 `<verb> does not accept returning`），
+  列过白名单。
+- pg / sqlite：渲染 `INSERT ... RETURNING "id"`，**单语句一次往返**（不再需要
+  「exec 之后查 `last_insert_rowid()`」这种会串号的写法）。
+- mysql：方言无 RETURNING，只接受**单列**，在同一连接上两步取 `LAST_INSERT_ID()`
+  ——并发请放 `db.tx` 内。
+
 同一 `resolve_target` 路由：有活跃事务走会话，否则走池——DML 与查询天然同事务。
 
 ---

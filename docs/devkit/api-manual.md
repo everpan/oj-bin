@@ -693,6 +693,20 @@ await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).
 - insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
 - `db.tx` 内构造的 DML 自动走事务同连接（见下）。
 
+**insert 取回主键 `.returning([...])`**（`run()` 改返回行数组，不返回行数）：
+
+```ts
+const rows = await db.table("user").insert({ name: "neo", age: 1 }).returning(["id"]).run();
+// → [{ id: 7 }]；无 returning 时 run() 仍返回受影响行数 number
+```
+
+- 只 `insert` 接受（`select/update/delete` 报 `<verb> does not accept returning`），列过
+  白名单（`unknown column '<c>' in insert returning`，限定名不适用）。
+- pg / sqlite：sea-query 渲染 `INSERT ... RETURNING "id"`，**单语句一次往返**取回——
+  替代原先「exec 后再查 `last_insert_rowid()` 可能读到并发插入」的裸 SQL 写法。
+- mysql：方言无 RETURNING，`returning` 只接受**单列**；op 在同一执行目标上两步
+  （insert + `SELECT LAST_INSERT_ID()`），**并发下请放进 `db.tx`** 保证同连接。
+
 **toSQL / toJSON / fromJSON**：
 
 ```ts
@@ -710,9 +724,16 @@ await db.fromJSON(snap).all();   // 复原后继续链/执行；tx 回调对象�
 **事务 `db.tx`**：
 
 ```ts
+// 转账 50：构造器 sets 只接受常量 → 先读余额再写
 await db.tx(async (tx) => {
-  await tx.exec("update account set balance = balance - ? where id = ?", [50, 1]);
-  await tx.exec("update account set balance = balance + ? where id = ?", [50, 2]);
+  const from = await tx.table("account").select(["id", "balance"])
+    .where({ field: "id", op: "eq", value: 1 }).all();
+  const to = await tx.table("account").select(["id", "balance"])
+    .where({ field: "id", op: "eq", value: 2 }).all();
+  await tx.table("account").update({ balance: from[0].balance - 50 })
+    .where({ field: "id", op: "eq", value: 1 }).run();
+  await tx.table("account").update({ balance: to[0].balance + 50 })
+    .where({ field: "id", op: "eq", value: 2 }).run();
   const rows = await tx.table("account").select(["id", "balance"]).all(); // 同连接读未提交
 });
 ```
@@ -723,6 +744,10 @@ await db.tx(async (tx) => {
 - 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错 `transaction already active`；
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 `await` 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
+- **多租户防护在事务内同样生效**：租户注入（select 收窄 / insert 强制写当前租户 /
+  update/delete 收窄 / `sets.tenant_id` 拒绝）发生在**路由之前**，与「走池还是走会话」
+  正交——`tx.table(...)` 与 `db.table(...)` 得到完全相同的改写。裸 SQL（`tx.query`）
+  只有 best-effort 文本检查，事务内也应优先构造器。
 
 **子查询 / exists**（where 与 having 通用）：
 

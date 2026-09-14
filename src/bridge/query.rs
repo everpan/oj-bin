@@ -15,8 +15,8 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use sea_query::{
-    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, OverStatement, Query, SelectStatement,
-    SimpleExpr, SqliteQueryBuilder, Value as Qv,
+    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, OverStatement, Query, ReturningClause,
+    SelectStatement, SimpleExpr, SqliteQueryBuilder, Value as Qv,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -308,6 +308,11 @@ struct QueryReq {
     values: Vec<serde_json::Map<String, Value>>,
     #[serde(default)]
     sets: serde_json::Map<String, Value>,
+    /// insert 返回列（白名单列；默认空 = 与既有行为一致，只回受影响行数）。
+    /// pg/sqlite 渲染 sea-query `RETURNING` 单语句取回；mysql 无 RETURNING，
+    /// 由 op 侧在同一目标（事务会话或池）上两步取 `LAST_INSERT_ID()`。
+    #[serde(default)]
+    returning: Vec<String>,
     #[serde(default)]
     joins: Vec<Join>,
     #[serde(default)]
@@ -913,6 +918,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if !req.sets.is_empty() {
                 return reject("select", "sets");
             }
+            if !req.returning.is_empty() {
+                return reject("select", "returning");
+            }
         }
         Verb::Insert => {
             if req.values.is_empty() {
@@ -955,6 +963,9 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             }
             if !req.columns.is_empty() {
                 return reject("update/delete", "columns");
+            }
+            if !req.returning.is_empty() {
+                return reject("update/delete", "returning");
             }
             if req.distinct {
                 return reject("update/delete", "distinct");
@@ -1041,6 +1052,31 @@ fn build_statement(
                 let vals: Vec<Expr> = keys.iter().map(|k| Expr::val(to_qv(&row[k]))).collect();
                 ins.values(vals)
                     .map_err(|e| JsErrorBox::generic(format!("insert values: {e}")))?;
+            }
+            // returning 列：白名单校验（限定名自然被 has_column 拒）→ 渲染 RETURNING。
+            // mysql 无 RETURNING：只接受单列，由 op 侧在同一目标上两步取 LAST_INSERT_ID()。
+            if !req.returning.is_empty() {
+                for c in &req.returning {
+                    if !table.has_column(c) {
+                        return Err(JsErrorBox::generic(format!(
+                            "unknown column '{c}' in insert returning"
+                        )));
+                    }
+                }
+                if dialect == Dialect::MySql {
+                    if req.returning.len() != 1 {
+                        return Err(JsErrorBox::generic(
+                            "mysql returning accepts exactly one column (no RETURNING support)",
+                        ));
+                    }
+                } else {
+                    ins.returning(ReturningClause::Columns(
+                        req.returning
+                            .iter()
+                            .map(|c| Alias::new(c).into_column_ref())
+                            .collect(),
+                    ));
+                }
             }
             params_of(build_sql(dialect, &ins))
         }
@@ -1395,9 +1431,40 @@ fn build_with_clause(
     Ok(clause)
 }
 
+/// 执行目标（池 / 事务会话）的统一出口。
+/// mysql 无 RETURNING：取自增 id 必须在**同一目标**上连发 insert + SELECT
+/// LAST_INSERT_ID()（两条语句非原子，池路径下建议放进 db.tx 以免并发串号）。
+enum Exec<'a> {
+    Pool(&'a Arc<dyn DataAccessor>),
+    Tx(tokio::sync::MutexGuard<'a, Box<dyn super::db::TxSession>>),
+}
+
+impl Exec<'_> {
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>, String> {
+        match self {
+            Exec::Pool(da) => da
+                .query_with_params(sql, params)
+                .await
+                .map_err(|e| e.to_string()),
+            Exec::Tx(s) => s.query(sql, params).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn exec(&self, sql: &str, params: &[Value]) -> Result<i64, String> {
+        match self {
+            Exec::Pool(da) => da
+                .exec_with_params(sql, params)
+                .await
+                .map_err(|e| e.to_string()),
+            Exec::Tx(s) => s.exec(sql, params).await.map_err(|e| e.to_string()),
+        }
+    }
+}
+
 /// op_db_query_build：结构化查询 -> 参数化 SQL -> 执行。
-/// select → rows 数组；DML → 受影响行数 number。DML 同走 resolve_target：
-/// 本库活跃 tx → 会话 exec，无 tx → 池 exec_with_params，他库 tx → 报错。
+/// select → rows 数组；insert 带 returning → rows 数组（pg/sqlite 走 sea-query
+/// RETURNING 单语句；mysql 同目标两步）；其余 DML → 受影响行数 number。
+/// 路由同 db.rs：本库活跃 tx → 会话，否则池，他库 tx → 报错。
 /// 标识符（表/列）全部经 SchemaRegistry 白名单校验；值参数化。
 #[op2]
 #[serde]
@@ -1409,38 +1476,37 @@ pub async fn op_db_query_build(
     guard_req(&state, &req)?;
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;
-    let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
-    let is_select = req.verb == Verb::Select;
+    let dialect = lookup(&state, &req.db)?.dialect();
+    let (sql, params) = build_statement(&req, &reg, dialect)?;
+    // 返回行的两种形态：select，或 insert + returning。
+    let rows = req.verb == Verb::Select || (req.verb == Verb::Insert && !req.returning.is_empty());
+    let last_id = rows && dialect == Dialect::MySql; // mysql 无 RETURNING → 两步
+    let err = |e: String| JsErrorBox::generic(e);
 
     // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
-    match super::db::resolve_target(&state, &req.db)? {
-        super::db::Target::Pool(da) => {
-            if is_select {
-                da.query_with_params(&sql, &params)
-                    .await
-                    .map(Value::Array)
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))
-            } else {
-                da.exec_with_params(&sql, &params)
-                    .await
-                    .map(Value::from)
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))
-            }
-        }
-        super::db::Target::Tx(t) => {
-            let s = t.session.lock().await;
-            if is_select {
-                s.query(&sql, &params)
-                    .await
-                    .map(Value::Array)
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))
-            } else {
-                s.exec(&sql, &params)
-                    .await
-                    .map(Value::from)
-                    .map_err(|e| JsErrorBox::generic(e.to_string()))
-            }
-        }
+    let target = super::db::resolve_target(&state, &req.db)?;
+    let ex = match &target {
+        super::db::Target::Pool(da) => Exec::Pool(da),
+        super::db::Target::Tx(t) => Exec::Tx(t.session.lock().await),
+    };
+    if rows && !last_id {
+        ex.query(&sql, &params).await.map(Value::Array).map_err(err)
+    } else if last_id {
+        ex.exec(&sql, &params).await.map_err(err)?;
+        let r = ex
+            .query("SELECT LAST_INSERT_ID() AS id", &[])
+            .await
+            .map_err(err)?;
+        let v = r
+            .first()
+            .and_then(|row| row.get("id"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut obj = serde_json::Map::new();
+        obj.insert(req.returning[0].clone(), v);
+        Ok(Value::Array(vec![Value::Object(obj)]))
+    } else {
+        ex.exec(&sql, &params).await.map(Value::from).map_err(err)
     }
 }
 
@@ -2540,6 +2606,101 @@ mod tests {
         .contains("update/delete does not accept columns"));
     }
 
+    /// returning：仅 insert 接受；pg/sqlite 渲染 RETURNING，mysql 不渲染（两步取 id）。
+    #[test]
+    fn returning_verb_matrix_and_dialect_rendering() {
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let sql_of = |req: &str, d: Dialect| {
+            let req: QueryReq = serde_json::from_str(req).unwrap();
+            build_statement(&req, &reg, d).map(|(s, _)| s)
+        };
+        let ins = r#"{"table":"t","verb":"insert","values":[{"name":"a"}],"returning":["id"]}"#;
+        assert!(sql_of(ins, Dialect::Sqlite).unwrap().contains("RETURNING"));
+        assert!(
+            sql_of(ins, Dialect::Postgres)
+                .unwrap()
+                .contains("RETURNING")
+        );
+        // mysql 无 RETURNING：由 op 侧两条语句取 LAST_INSERT_ID()。
+        assert!(!sql_of(ins, Dialect::MySql).unwrap().contains("RETURNING"));
+        // 未知列 / 限定名（白名单按素名查，自然被拒）
+        let bad = r#"{"table":"t","verb":"insert","values":[{"name":"a"}],"returning":["nope"]}"#;
+        assert!(
+            sql_of(bad, Dialect::Sqlite)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown column 'nope' in insert returning")
+        );
+        // mysql 多列 → 拒
+        let bad =
+            r#"{"table":"t","verb":"insert","values":[{"name":"a"}],"returning":["id","name"]}"#;
+        assert!(
+            sql_of(bad, Dialect::MySql)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly one column")
+        );
+        // 动词矩阵：select / update / delete 一律拒
+        assert!(
+            sql_of(r#"{"table":"t","returning":["id"]}"#, Dialect::Sqlite)
+                .unwrap_err()
+                .to_string()
+                .contains("select does not accept returning")
+        );
+        let upd = r#"{"table":"t","verb":"update","sets":{"name":"x"},
+            "conditions":[{"field":"id","op":"eq","value":1}],"returning":["id"]}"#;
+        assert!(
+            sql_of(upd, Dialect::Sqlite)
+                .unwrap_err()
+                .to_string()
+                .contains("update/delete does not accept returning")
+        );
+    }
+
+    /// insert + returning：池路径与事务路径都能取回自增 id；事务回滚后不可见。
+    #[tokio::test(flavor = "current_thread")]
+    async fn insert_returning_id_in_pool_and_tx() {
+        let b = seeded_bridge().await;
+        // 池路径：RETURNING 单语句取回 id（sqlite）
+        let cap = b
+            .run(
+                r#"db.table("t").insert({name:"r1",age:1}).returning(["id"]).run()
+                   .then(r => json.ok({rows:r})).catch(e => json.fail(500,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["rows"][0]["id"].as_i64().unwrap() > 0, "{v}");
+        // 事务路径：同一会话取 id；throw 回滚后该行不可见
+        let cap = b
+            .run(
+                r#"(async () => {
+                     const id = await db.tx(async (tx) => {
+                       const r = await tx.table("t").insert({name:"r2",age:2}).returning(["id"]).run();
+                       return r[0].id;
+                     });
+                     let gone = null;
+                     try {
+                       await db.tx(async (tx) => {
+                         await tx.table("t").insert({name:"r3",age:3}).returning(["id"]).run();
+                         throw new Error("boom");
+                       });
+                     } catch (e) { gone = String(e); }
+                     const left = await db.table("t").select(["name"])
+                       .where({field:"name",op:"in",value:["r2","r3"]}).all();
+                     json.ok({id, gone, names: left.map(x => x.name)});
+                   })().catch(e => json.fail(500,String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["id"].as_i64().unwrap() > 0, "{v}");
+        assert_eq!(v["data"]["gone"], json!("Error: boom"), "{v}");
+        assert_eq!(v["data"]["names"], json!(["r2"]), "{v}"); // r3 已回滚
+    }
+
     /// CTE：主表 = CTE 与 join CTE（声明列即白名单；真实执行验证）。
     #[tokio::test(flavor = "current_thread")]
     async fn cte_main_and_join() {
@@ -2956,6 +3117,62 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(
             !v["data"]["sql"].as_str().unwrap().contains("tenant_id"),
+            "{v}"
+        );
+    }
+
+    /// 租户防护对事务同样生效：注入发生在 resolve_target 之前，与走池/走会话正交。
+    /// 事务内 select 收窄到当前租户、insert 强制写当前租户（含 returning）、
+    /// update 改不到他租户的行、回滚不留痕。
+    #[tokio::test(flavor = "current_thread")]
+    async fn tenant_guard_applies_inside_tx() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const out = await db.tx(async (tx) => {
+                       const rows = await tx.table("t").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                       const r = await tx.table("t").insert({name:"a3"}).returning(["id"]).run();
+                       return { names: rows.map(x => x.name), id: r[0].id };
+                     });
+                     const after = await db.table("t").select(["name","tenant_id"])
+                       .where({field:"name",op:"eq",value:"a3"}).all();
+                     json.ok({ out, tid: after.length ? after[0].tenant_id : null });
+                   })().catch(e => json.fail(500,String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // t2 的 b1 在事务内同样不可见
+        assert_eq!(v["data"]["out"]["names"], json!(["a1", "a2"]), "{v}");
+        assert_eq!(v["data"]["tid"], json!("t1"), "insert 未注入租户: {v}");
+        assert!(v["data"]["out"]["id"].as_i64().unwrap() > 0, "{v}");
+        // 事务内 update 收窄 + 回滚不留痕
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.tx(async (tx) => {
+                       const n = await tx.table("t").update({name:"zz"}).where({field:"name",op:"eq",value:"b1"}).run();
+                       if (n !== 0) throw new Error("leaked to other tenant");
+                       await tx.table("t").insert({name:"gone"}).run();
+                       throw new Error("boom");
+                     }).catch(() => {});
+                     const left = await db.table("t").select(["name"])
+                       .where({field:"name",op:"eq",value:"gone"}).all();
+                     const b1 = await db.asSystem().table("t").select(["name"])
+                       .where({field:"name",op:"eq",value:"b1"}).all();
+                     json.ok({ gone: left.length, b1: b1[0].name });
+                   })().catch(e => json.fail(500,String(e)));"#,
+                req_t1(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(
+            (&v["data"]["gone"], &v["data"]["b1"]),
+            (&json!(0), &json!("b1")),
             "{v}"
         );
     }

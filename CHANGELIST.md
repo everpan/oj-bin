@@ -2,6 +2,31 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.17（2026-09-15）
+
+**特性**
+- 构造器 `insert` 取回自增主键：`db.table("t").insert({...}).returning(["id"]).run()` →
+  行数组 `[{id: n}]`（不带 `returning` 时仍返回受影响行数）。列过白名单
+  （`unknown column '<c>' in insert returning`），仅 insert 接受——动词×字段矩阵在 op 侧
+  权威校验，`select/update/delete` 报 `<verb> does not accept returning`。
+  pg / sqlite 由 sea-query 渲染单条 `RETURNING` 语句、**一次往返**；mysql 方言无
+  RETURNING，只接受**单列**，在同一执行目标上两步取 `LAST_INSERT_ID()`（非原子，并发请放
+  `db.tx` 内）。`toSQL()` 产物同步带 RETURNING。
+
+**加固**
+- 补「事务 × 多租户」回归（此前只有池路径用例）：租户注入发生在 `resolve_target`
+  **之前**，与「走池还是走会话」正交——`tx.table(...)` 与 `db.table(...)` 的改写完全一致
+  （事务内 select 收窄到当前租户、insert 强制写当前租户、update 改不到他租户的行、
+  回滚不留痕）。
+
+**文档 / 杂项**
+- sample 三处 `insert ... returning id` 裸 SQL 改为构造器（admin/menu-item、
+  admin/role-item、cert）——此前这些裸插入在 `sql_guard=warn` 下会静默写入无 `tenant_id`
+  的行（裸 SQL 只查「文本里有没有 tenant_id」，不注入）。
+- api-manual（DML：returning 小节；事务：租户防护说明）、db-guide（§4 事务改用构造器、
+  §7 DML returning）、global.d.ts（QueryBuilder 补 insert/update/delete/run/returning/toSQL
+  声明——此前只声明到 select/all）。
+
 ## v0.1.16（2026-09-14）
 
 **特性**

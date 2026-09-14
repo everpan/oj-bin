@@ -6,14 +6,26 @@ async function post(): Promise<void> {
   const b = http.body as any;
   if (!b || !b.name) { json.fail(400, "name required"); return; }
   const now = Date.now();
-  // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
-  const rows: any[] = await db.query(
-    "insert into menu (parent_id, menu_type, name, path, component, sort, icon, current_active_menu, iframe_link, keep_alive, external_link, hide_in_menu, ignore_access, status, create_time, update_time) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
-    [Number(b.parentId) || 0, b.menuType ?? 0, b.name, b.path ?? "", b.component ?? "",
-     b.order ?? null, b.icon ?? "", b.currentActiveMenu ?? "", b.iframeLink ?? "",
-     bool(b.keepAlive), b.externalLink ?? "", bool(b.hideInMenu), bool(b.ignoreAccess),
-     b.status ?? 1, now, now],
-  );
+  // insert + returning：单条 RETURNING 原子取回主键（pg/sqlite），列经白名单、
+  // 值经绑定参数，裸 SQL 不再需要。
+  const rows = await db.table("menu").insert({
+    parent_id: Number(b.parentId) || 0,
+    menu_type: b.menuType ?? 0,
+    name: b.name,
+    path: b.path ?? "",
+    component: b.component ?? "",
+    sort: b.order ?? null,
+    icon: b.icon ?? "",
+    current_active_menu: b.currentActiveMenu ?? "",
+    iframe_link: b.iframeLink ?? "",
+    keep_alive: bool(b.keepAlive),
+    external_link: b.externalLink ?? "",
+    hide_in_menu: bool(b.hideInMenu),
+    ignore_access: bool(b.ignoreAccess),
+    status: b.status ?? 1,
+    create_time: now,
+    update_time: now,
+  }).returning(["id"]).run() as unknown as { id: number }[];
   json.ok({ id: rows[0].id, created: true });
 }
 

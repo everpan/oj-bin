@@ -343,11 +343,9 @@ fn sql_tables(d: Dialect) -> String {
             "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()"
                 .into()
         }
-        Dialect::Postgres => {
-            "SELECT table_name::text FROM information_schema.tables \
+        Dialect::Postgres => "SELECT table_name::text FROM information_schema.tables \
              WHERE table_schema = 'public'"
-                .into()
-        }
+            .into(),
     }
 }
 

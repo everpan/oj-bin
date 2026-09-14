@@ -4,11 +4,16 @@ async function post(): Promise<void> {
   const b = http.body as { name?: string; code?: string; status?: number; remark?: string } | null;
   if (!b || !b.name || !b.code) { json.fail(400, "name and code required"); return; }
   const now = Date.now();
-  // builder 不支持 RETURNING，保留裸 query 原子取回生成的主键
-  const rows: any[] = await db.query(
-    "insert into role (name, code, status, remark, create_time, update_time) values (?, ?, ?, ?, ?, ?) returning id",
-    [b.name, b.code, b.status ?? 1, b.remark ?? "", now, now],
-  );
+  // insert + returning：单条 RETURNING 原子取回主键（pg/sqlite），列经白名单、
+  // 值经绑定参数，裸 SQL 不再需要。
+  const rows = await db.table("role").insert({
+    name: b.name,
+    code: b.code,
+    status: b.status ?? 1,
+    remark: b.remark ?? "",
+    create_time: now,
+    update_time: now,
+  }).returning(["id"]).run() as unknown as { id: number }[];
   json.ok({ ...mapRole({ ...b, status: b.status ?? 1, remark: b.remark ?? "", create_time: now, update_time: now }), id: rows[0].id });
 }
 

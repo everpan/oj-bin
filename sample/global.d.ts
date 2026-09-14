@@ -31,12 +31,22 @@ interface OrderByItem {
 
 // db.table(name) 返回的安全查询构造器（流式、结构化）。
 interface QueryBuilder {
-  select(cols?: string[]): QueryBuilder;
+  select(cols?: (string | object)[]): QueryBuilder;
   where(cond: WhereCond): QueryBuilder;
   orderBy(items?: OrderByItem[]): QueryBuilder;
   limit(n: number): QueryBuilder;
   offset(n: number): QueryBuilder;
   all(): Promise<Json[]>;
+  // DML：动词由 insert/update/delete 声明，run() 终执行（返回受影响行数）。
+  // insert + returning(["id"]) 时 run() 改返回行数组 [{ id: n }]——
+  // pg/sqlite 是单条 RETURNING 语句；mysql 同连接两步取 LAST_INSERT_ID()（建议放 db.tx）。
+  insert(rows: object | object[]): QueryBuilder;
+  update(sets: object): QueryBuilder;
+  delete(): QueryBuilder;
+  returning(cols?: string[]): QueryBuilder;
+  run(): Promise<number | Row[]>;
+  // 只构造不执行（与 .all()/.run() 完全相同的校验管线）。
+  toSQL(): { sql: string; params: unknown[] };
 }
 
 // DB(name) 返回的命名数据库实例。
