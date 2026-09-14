@@ -323,47 +323,52 @@ async fn q(acc: &dyn DataAccessor, sql: &str) -> Result<Vec<String>, String> {
 }
 
 /// 实库全部表名。
-async fn db_tables(acc: &dyn DataAccessor, d: Dialect) -> Result<HashSet<String>, String> {
-    let sql: String = match d {
+///
+/// PG 三处内省查询都**必须显式 `::text`**：`information_schema.*` 的标识符列与
+/// `pg_indexes.*name` 的类型是 `name`（sql_identifier 域），sqlx Any 驱动解不了这个 OID
+/// —— `Any driver does not support the Postgres type PgTypeInfo(Name)`。
+/// **失败是行数相关的**：`public` 里没有行时不会触发解码，于是「空库第一次跑没事、
+/// 第二次（表已建出）就崩」，看起来像玄学。转成 text 是唯一的绕过方式（Any 驱动的类型
+/// 映射表是 sqlx 生成的，加不了 Name）。MySQL/SQLite 无需转换。
+/// PG 三处内省查询都**必须显式 `::text`**：`information_schema.*` 的标识符列与
+/// `pg_indexes.*name` 的类型是 `name`（sql_identifier 域），sqlx Any 驱动解不了这个 OID
+/// —— `Any driver does not support the Postgres type PgTypeInfo(Name)`。
+/// **失败是行数相关的**：`public` 里没有行时不会触发解码，于是「空库第一次跑没事、
+/// 第二次（表已建出）就崩」，看起来像玄学。转成 text 是唯一的绕过方式（Any 驱动的类型
+/// 映射表是 sqlx 生成的，加不了 Name）。MySQL/SQLite 的标识符列本身是 varchar/text，无需转换。
+fn sql_tables(d: Dialect) -> String {
+    match d {
         Dialect::Sqlite => "SELECT name FROM sqlite_master WHERE type = 'table'".into(),
         Dialect::MySql => {
             "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()"
                 .into()
         }
         Dialect::Postgres => {
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'".into()
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = 'public'"
+                .into()
         }
-    };
-    Ok(q(acc, &sql).await?.into_iter().collect())
+    }
 }
 
 /// 表的全部列名（表名已过 is_ident 白名单——pragma/info 查询无法绑定参数处内联）。
-async fn db_columns(
-    acc: &dyn DataAccessor,
-    d: Dialect,
-    table: &str,
-) -> Result<HashSet<String>, String> {
-    let sql = match d {
+fn sql_columns(d: Dialect, table: &str) -> String {
+    match d {
         Dialect::Sqlite => format!("SELECT name FROM pragma_table_info('{table}')"),
         Dialect::MySql => format!(
             "SELECT column_name FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = '{table}'"
         ),
         Dialect::Postgres => format!(
-            "SELECT column_name FROM information_schema.columns \
+            "SELECT column_name::text FROM information_schema.columns \
              WHERE table_schema = 'public' AND table_name = '{table}'"
         ),
-    };
-    Ok(q(acc, &sql).await?.into_iter().collect())
+    }
 }
 
 /// 表的全部索引名。
-async fn db_indexes(
-    acc: &dyn DataAccessor,
-    d: Dialect,
-    table: &str,
-) -> Result<HashSet<String>, String> {
-    let sql = match d {
+fn sql_indexes(d: Dialect, table: &str) -> String {
+    match d {
         Dialect::Sqlite => {
             format!("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '{table}'")
         }
@@ -372,11 +377,31 @@ async fn db_indexes(
              WHERE table_schema = DATABASE() AND table_name = '{table}'"
         ),
         Dialect::Postgres => format!(
-            "SELECT indexname FROM pg_indexes \
+            "SELECT indexname::text FROM pg_indexes \
              WHERE schemaname = 'public' AND tablename = '{table}'"
         ),
-    };
-    Ok(q(acc, &sql).await?.into_iter().collect())
+    }
+}
+
+/// 实库全部表名。
+async fn db_tables(acc: &dyn DataAccessor, d: Dialect) -> Result<HashSet<String>, String> {
+    Ok(q(acc, &sql_tables(d)).await?.into_iter().collect())
+}
+
+async fn db_columns(
+    acc: &dyn DataAccessor,
+    d: Dialect,
+    table: &str,
+) -> Result<HashSet<String>, String> {
+    Ok(q(acc, &sql_columns(d, table)).await?.into_iter().collect())
+}
+
+async fn db_indexes(
+    acc: &dyn DataAccessor,
+    d: Dialect,
+    table: &str,
+) -> Result<HashSet<String>, String> {
+    Ok(q(acc, &sql_indexes(d, table)).await?.into_iter().collect())
 }
 
 async fn exec(acc: &dyn DataAccessor, sql: &str) -> Result<(), String> {
@@ -668,6 +693,32 @@ tables:
         only_js::bridge::SqlxAccessor::arc("sqlite::memory:")
             .await
             .unwrap()
+    }
+
+    /// PG 内省 SQL 的不变量：三处标识符列必须 `::text`。
+    ///
+    /// 这是**不需要驱动的**检查 —— PG 的连接实现在 `oj-db-postgres` cdylib 插件里，crate 内
+    /// 测试连不上 PG（`no driver found for URL scheme "postgres"`），所以这里钉的是「SQL 里
+    /// 有没有那个 cast」这个会被人手改掉的东西。真实行为（`public` 有行时内省可见、
+    /// `oj migrate` 可重跑、`oj schema diff` 不再假漂移）由 `apps/api-oj/tools/g2b-verify.sh`
+    /// 对真 PG 跑 —— 那边才有插件与容器。
+    ///
+    /// 背景：`name` 类型解码失败**只在返回行时触发**，空库看不出来，所以这个 bug 长期潜伏。
+    #[test]
+    fn pg_introspection_sql_casts_identifiers_to_text() {
+        for sql in [
+            sql_tables(Dialect::Postgres),
+            sql_columns(Dialect::Postgres, "t"),
+            sql_indexes(Dialect::Postgres, "t"),
+        ] {
+            assert!(
+                sql.contains("::text"),
+                "PG 内省查询缺 `::text`（name 类型解不了）：{sql}"
+            );
+        }
+        // sqlite/mysql 的标识符列不是 name 类型，不该有（也无害，但别误改）。
+        assert!(!sql_tables(Dialect::Sqlite).contains("::text"));
+        assert!(!sql_tables(Dialect::MySql).contains("::text"));
     }
 
     #[tokio::test(flavor = "current_thread")]
