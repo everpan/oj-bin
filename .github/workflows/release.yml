@@ -9,6 +9,7 @@
 # 触发：
 #   - 打 tag 推送（v*）自动发布正式 Release
 #   - 手工 workflow_dispatch（默认发布为草稿，人工核对后再点发布）
+#   - Release 发布（含草稿人工转正那一刻）→ 只跑 npm 发布/校验，重型 job 全跳
 #
 # 矩阵与 .github/workflows/plugin-matrix.yml 保持一致；musl 行按需启用。
 
@@ -26,6 +27,8 @@ on:
         default: 'true'
   push:
     tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -48,7 +51,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "release" ]; then
             tag="${GITHUB_REF_NAME}"
           elif [ -n "${{ inputs.tag }}" ]; then
             tag="${{ inputs.tag }}"
@@ -56,8 +59,11 @@ jobs:
             tag="v${cargo_version}"
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          # 自己推的 tag → 对应 release 已存在 → 跳过重型构建/测试。
-          if [ "${{ github.event_name }}" = "push" ] && gh release view "$tag" >/dev/null 2>&1; then
+          # 跳过重型 job 的两种情形（publish-npm 只依赖本 job，skip=true 下仍会跑）：
+          #   - release 事件（草稿人工转正等）→ release 已在，只补 npm；
+          #   - 自己推的 tag（gh release create 把 tag 推回远端的重爬）→ release 已在。
+          # publish-npm 在 skip=true 下从 release 资产取产物，幂等校验/补发 npm。
+          if [ "${{ github.event_name }}" = "release" ] || { [ "${{ github.event_name }}" = "push" ] && gh release view "$tag" >/dev/null 2>&1; }; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -292,29 +298,37 @@ jobs:
   # npm 发布（@oj-bin/*）：独立 job——不用 continue-on-error（step 级 continue-on-error
   # 下 job 结论仍绿，告警形同虚设）。失败 = workflow 红；GitHub Release 由 publish job
   # 先行创建不受影响；幂等设计支持 Re-run failed jobs 只重跑本段。
+  #
+  # 只依赖 guard，不依赖 package，产物按 run 类型二选一：
+  #   - 首发 run（skip=false，dispatch draft=false / 真实 tag 推送）：用本次构建产物；
+  #   - 草稿转正（release: published，即人工点发布的手动确认）与 tag 重爬 run
+  #     （skip=true）：package 未跑、无 actions 产物 → 从 release 资产拉首发 run
+  #     上传的 dist/*，照旧走 npm-publish.sh 幂等 publish（已发布即 skip）。
+  #   注：dispatch draft=true 的首发 run 不发 npm（下方 if 的 draft 门禁）；草稿人工
+  #   转正才触发 release 事件接续。gh release create 用 GITHUB_TOKEN，其触发的
+  #   release/push 事件被 GitHub 抑制，不会造成额外重跑。
   publish-npm:
     name: publish npm (@oj-bin)
-    needs: package
-    # 草稿模式（dispatch + draft=true）不发 npm——npm 包不可撤回，人工核对 Release
-    # 后重新 dispatch 同 tag、draft=false，幂等补发。tag 推送（直发正式版）不受影响。
-    if: github.event_name == 'push' || inputs.draft != 'true'
+    needs: [guard]
+    if: github.event_name == 'release' || github.event_name == 'push' || inputs.draft != 'true'
     runs-on: ubuntu-latest
+    # 草稿转正时 release 事件 run 与 tag 重爬 push run 几乎同时到达，二者都会跑本
+    # job。按 tag 做 job 级串行化：后到者排队，轮到时 publish_pkg 幂等 skip，硬消除
+    # 双 npm publish 竞态（409 re-view 撞上 registry 传播延迟会误判失败）。排队等而非
+    # 取消（cancel-in-progress=false）：不得误杀正在 npm publish 中的那一个。
+    concurrency:
+      group: npm-${{ needs.guard.outputs.tag }}
+      cancel-in-progress: false
     outputs:
       version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: dist-*
-          path: dist
-          merge-multiple: true
-
       - name: resolve tag
         id: tag
         run: |
           cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "release" ]; then
             tag="${GITHUB_REF_NAME}"
           elif [ -n "${{ inputs.tag }}" ]; then
             tag="${{ inputs.tag }}"
@@ -327,6 +341,23 @@ jobs:
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # 首发 run（skip=false）：下载本次 package job 的构建产物。
+      - uses: actions/download-artifact@v4
+        if: needs.guard.outputs.skip != 'true'
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      # 重爬 run / 草稿转正 run（skip=true，release 已在）：产物直接取自 release
+      # 资产，免重跑三平台构建。npm-publish.sh 内的布局/版本断言天然校验资产完整性。
+      - name: download dist from release assets
+        if: needs.guard.outputs.skip == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "${{ steps.tag.outputs.tag }}" --dir dist
 
       - uses: actions/setup-node@v4
         with:
