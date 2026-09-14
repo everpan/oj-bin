@@ -28,6 +28,15 @@
   {closed:true} | null` / `close()`。可运行用例 `sample/tests/ws-bin.test.ts`（模块
   `sample/src/echo-bin/`：二进制回显，字节相等 + 非 UTF-8 无损）。
 
+**修复**
+- blob-s3 插件：**明文 http 端点下整个 s3 驱动不可用**。object_store 默认 `allow_http=false`
+  → reqwest 客户端 `https_only(true)`，于是 `endpoint: "http://…"`（= `sample/config.yaml`
+  自带的 MinIO 示例）在「建请求」阶段即报 `builder error for url (…)`（0 retries / 微秒级），
+  put/get/url 全废；https 端点不受影响。现按端点 scheme 显式 `with_allow_http(true)`，并补
+  **离线**回归测试 `http_endpoint_reaches_network_not_url_builder`（打本机必然关闭的端口，
+  只断言错误类别 = 网络阶段而非建请求阶段）——env-gated 的 `real_s3_roundtrip_via_vtable`
+  从不进 CI，正是这个 100% 断链漏进发布物的原因。
+
 **文档**
 - 新设计文档 `docs/superpowers/specs/2026-09-14-ws-binary-frame-design.md`（WsSend 统一
   枚举、bus wire 约定与启发式边界、ABI 8 清单）。

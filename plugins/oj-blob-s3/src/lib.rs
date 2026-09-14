@@ -139,6 +139,12 @@ fn build_store(c: &S3Cfg) -> Result<Arc<AmazonS3>, String> {
         // 默认 virtual-hosted 风格；path_style（MinIO/自建）切回。
         .with_virtual_hosted_style_request(!c.path_style);
     if let Some(e) = c.endpoint.as_deref().filter(|s| !s.is_empty()) {
+        // object_store 默认 allow_http=false → reqwest 客户端 https_only(true)，
+        // 明文端点会在「建请求」阶段被拒（builder error for url，0 retries）。
+        // sample/config.yaml 的 MinIO 示例就是 http 端点 → 按 scheme 显式放开。
+        if e.starts_with("http://") {
+            b = b.with_allow_http(true);
+        }
         b = b.with_endpoint(e);
     }
     if let Some(k) = c.access_key.as_deref().filter(|s| !s.is_empty()) {
@@ -294,6 +300,35 @@ mod tests {
             ..Default::default()
         };
         assert!(build_store(&ok).is_ok());
+    }
+
+    /// http 端点的离线回归闸：明文端点必须走到**网络**阶段（连不上 → 报错里含 connect/sending），
+    /// 而不是「建请求」阶段被拒。后者 = object_store 默认 `allow_http=false` →
+    /// reqwest `https_only(true)` → `builder error for url`，正是 MinIO 明文端点全废的那个
+    /// 100% 断链（详见 plane/apps/api-oj/docs/poc-report.md §G④-a）。
+    /// 不联网：打本机一个必然关闭的端口，只断言错误**类别**。
+    #[tokio::test]
+    async fn http_endpoint_reaches_network_not_url_builder() {
+        let cfg = S3Cfg {
+            driver: "s3".into(),
+            endpoint: Some("http://127.0.0.1:1".into()),
+            bucket: Some("b".into()),
+            region: Some("us-east-1".into()),
+            access_key: Some("k".into()),
+            secret_key: Some("s".into()),
+            path_style: true,
+            ..Default::default()
+        };
+        let store = build_store(&cfg).expect("build");
+        let err = store
+            .put(&os_path("x.txt").unwrap(), PutPayload::from(b"x".to_vec()))
+            .await
+            .expect_err("closed port must fail")
+            .to_string();
+        assert!(
+            !err.contains("builder error"),
+            "http 端点被建请求阶段拒绝（allow_http 未放开）: {err}"
+        );
     }
 
     #[test]
