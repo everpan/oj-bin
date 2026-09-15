@@ -159,6 +159,12 @@ pub(crate) async fn await_ffi(fut: FfiFuture) -> Result<Vec<u8>, String> {
     }
 }
 
+/// `await_ffi_poll` 的轮询间隔（给 mail 的 `submit` 用）：2ms 的折中取值 —— 比
+/// `yield_now` 空转（原实现，SMTP 往返可达 30s ⇒ 烧满一核）低五个量级的 CPU，
+/// 又只给每次投递加 ≤2ms 的固定尾延迟（相对 SMTP 往返可忽略）。
+/// mq 的取值（10ms）与它的长轮询语义绑定，留在调用点（`oj/src/app.rs` 的 `BACKOFF`）。
+pub(crate) const FFI_POLL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// mq 长轮询版 await_ffi：Pending 时 sleep 退避（评审 F4——yield_now 空转烧满一核）。
 /// 其余语义（take→free→Guard Drop 只 free 不 take）与 await_ffi 完全一致。
 pub(crate) async fn await_ffi_poll(
