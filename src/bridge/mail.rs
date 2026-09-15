@@ -949,6 +949,9 @@ pub async fn op_mail_profiles(
 }
 
 #[cfg(test)]
+// 全局 deliver 槽是进程级的，用例须串行；同批用例排队，不与其它的锁形成环（同
+// `ffi.rs::adapter_tests` 的豁免理由）。改成 drop 再 await 反而会失去串行化。
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use crate::bridge::{
@@ -960,9 +963,12 @@ mod tests {
     use std::time::Duration;
 
     /// 全局 deliver 槽是进程级的：本模块用例串行化（同 `ffi.rs::adapter_tests` 手法）。
-    /// 同批用例排队，不与其它的锁形成环。
-    #[allow(clippy::await_holding_lock)]
     static T_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 取共享锁：用例 panic 后锁被毒化，后续用例取 `into_inner()` 继续（不连锁失败）。
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        T_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // ---------- 假后端（无插件依赖） ----------
 
@@ -1018,7 +1024,7 @@ mod tests {
     /// （deliver 路由已由构造期挂上）。
     #[tokio::test(flavor = "current_thread")]
     async fn bridge_injects_mail_backend_and_routes_deliver() {
-        let _g = T_LOCK.lock().unwrap();
+        let _g = lock();
         let bus = Arc::new(Bus::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         bus.subscribe(MAIL_RESULT_TOPIC, tx);
@@ -1056,7 +1062,7 @@ mod tests {
     /// 未配置（StableState.mail = None）→ 路由明确「未接管」，不 panic（结果丢弃）。
     #[tokio::test(flavor = "current_thread")]
     async fn route_deliver_without_backend_is_false() {
-        let _g = T_LOCK.lock().unwrap();
+        let _g = lock();
         let _b = Bridge::new(
             Arc::new(InMemoryAccessor::new()),
             Arc::new(InMemoryKV::new()),
@@ -1675,5 +1681,208 @@ mod tests {
         let fwd: Value = serde_json::from_str(&sent[1].1).unwrap();
         assert_eq!(fwd["subject"], "override");
         assert_eq!(fake.sent.lock().unwrap().len(), 2, "失败路不触达后端");
+    }
+
+    // ---------- 6.5：JS 全局（Mail / mail）端到端 ----------
+
+    /// 带 mail（+ 可选 blob/loader）的 Bridge：JS 侧经全局 `mail.*` 打全套 op。
+    fn mail_bridge(
+        fake: Arc<dyn MailBackend>,
+        blobs: Option<Arc<BlobRegistry>>,
+        root: Option<PathBuf>,
+    ) -> Bridge {
+        use crate::bridge::LoaderShared;
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            root.map(|project_root| {
+                Arc::new(LoaderShared {
+                    project_root,
+                    ts: true,
+                })
+            }),
+            Extras {
+                mail: Some(fake),
+                blobs,
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn run_js(b: &Bridge, src: &str) -> Value {
+        let cap = b
+            .run_with(src, crate::bridge::RequestInfo::default())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        serde_json::from_slice(&cap.body)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&cap.body)))
+    }
+
+    /// `mail.send`（全局）：JS 对象 → JSON → 宿主校验/附件解析 → 插件；信封原样回 JS。
+    /// 同批覆盖：`sendSync`/`enqueue` 的引擎开关、`Mail(key)` 实例 profile、CRLF 剥离。
+    #[tokio::test(flavor = "current_thread")]
+    async fn js_mail_send_and_instance_methods_hit_ops() {
+        use crate::bridge::blob::{BlobBackend, LocalBlob};
+        let _g = lock();
+        let dir = tmpdir("js");
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("reports")).unwrap();
+        std::fs::write(proj.join("reports/x.pdf"), b"%PDF-1.7 body").unwrap();
+        let blob_root = dir.join("blobs");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let lb = LocalBlob::new(&blob_root, "/v1/api").unwrap();
+        BlobBackend::put(&lb, "r2d2", b"BLOBBYTES", None)
+            .await
+            .unwrap();
+
+        let cfg = MailConfig::new(HashMap::from([
+            ("default".to_string(), {
+                let mut p = whitelisted_config().profile("default").unwrap().clone();
+                p.allowed_recipients.push("@partner.com".into());
+                p
+            }),
+            (
+                "alerts".to_string(),
+                MailProfileCfg {
+                    allowed_from: vec!["alert@x.com".into()],
+                    allowed_recipients: vec!["@x.com".into()],
+                },
+            ),
+        ]));
+        let fake = FakeMail::new(cfg, Arc::new(Bus::new()));
+        let b = mail_bridge(
+            fake.clone(),
+            Some(crate::bridge::blob::registry_with_default(Arc::new(lb))),
+            Some(proj),
+        );
+        let v = run_js(
+            &b,
+            r#"(async () => {
+                const r = await mail.send({
+                  from: "noreply@x.com", to: ["a@x.com"],
+                  subject: "hi\r\nBcc: evil@y.com",
+                  headers: { "X-Custom": "v\r\nX-Injected: 1" },
+                  text: "body",
+                  attachments: [
+                    { filename: "b.pdf", path: "reports/x.pdf" },
+                    { filename: "a.bin", blobKey: "r2d2", mime: "application/x-custom" },
+                  ],
+                });
+                const s = await mail.sendSync({ from: "noreply@x.com", to: ["c@partner.com"], text: "x" });
+                const j = await mail.enqueue({ from: "noreply@x.com", to: ["a@x.com"], text: "x" });
+                const a = await new Mail("alerts").send({ from: "alert@x.com", to: ["a@x.com"], text: "x" });
+                json.ok({ r, s, j, a });
+              })().catch((e) => json.ok({ err: String(e) }));
+              "#,
+        )
+        .await;
+        assert!(v["data"].get("err").is_none(), "{v}");
+        for k in ["r", "s", "j", "a"] {
+            assert_eq!(v["data"][k]["code"], 0, "{k}: {v}");
+        }
+        assert_eq!(v["data"]["j"]["data"]["jobId"], "j-stub");
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4);
+        // 附件：下标序 + 字节 + MIME（显式优先 / 扩展名嗅探）。
+        assert_eq!(sent[0].2.len(), 2);
+        assert_eq!(sent[0].2[0].filename, "b.pdf");
+        assert_eq!(sent[0].2[0].bytes, b"%PDF-1.7 body");
+        assert_eq!(sent[0].2[0].mime, "application/pdf");
+        assert_eq!(sent[0].2[1].filename, "a.bin");
+        assert_eq!(sent[0].2[1].bytes, b"BLOBBYTES");
+        assert_eq!(sent[0].2[1].mime, "application/x-custom");
+        // CRLF 剥离在宿主侧完成（插件拿到的是消毒后的请求）。
+        let fwd: Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(fwd["subject"], "hiBcc: evil@y.com");
+        assert_eq!(fwd["headers"]["X-Custom"], "vX-Injected: 1");
+        // 引擎开关按方法覆写；profile key 按实例走。
+        let f1: Value = serde_json::from_str(&sent[1].1).unwrap();
+        assert_eq!(
+            (f1["sync"].as_bool(), f1["enqueue_only"].as_bool()),
+            (Some(true), Some(false))
+        );
+        let f2: Value = serde_json::from_str(&sent[2].1).unwrap();
+        assert_eq!(
+            (f2["sync"].as_bool(), f2["enqueue_only"].as_bool()),
+            (Some(false), Some(true))
+        );
+        assert_eq!(sent[3].0, "alerts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 校验失败经 JS 拿到 `{code:5}`（resolve，不抛）；`mail not configured` 才抛异常。
+    #[tokio::test(flavor = "current_thread")]
+    async fn js_mail_validation_envelope_and_not_configured_throw() {
+        let _g = lock();
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let b = mail_bridge(fake.clone(), None, None);
+        let v = run_js(
+            &b,
+            r#"(async () => {
+                const bad = await mail.send({ from: "noreply@x.com", to: ["b@evil.com"], text: "x" });
+                const raw = await mail.sendRaw({ from: "noreply@x.com", to: ["a@x.com"] });
+                json.ok({ bad, raw });
+              })().catch((e) => json.ok({ err: String(e) }));
+              "#,
+        )
+        .await;
+        assert_eq!(v["data"]["bad"]["code"], 5, "{v}");
+        assert!(
+            v["data"]["bad"]["msg"]
+                .as_str()
+                .unwrap()
+                .contains("allowed_recipients"),
+            "{v}"
+        );
+        assert_eq!(v["data"]["raw"]["code"], 5, "{v}");
+        assert!(fake.sent.lock().unwrap().is_empty());
+
+        // 未配置（无 smtp/插件）→ 抛明确错误（不 panic、不静默）。
+        let plain = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let v = run_js(
+            &plain,
+            r#"(async () => { await mail.send({ from: "a@x.com", to: ["b@x.com"], text: "x" }); json.ok({}); })()
+                 .catch((e) => json.ok({ err: String(e) }));
+              "#,
+        )
+        .await;
+        assert!(
+            v["data"]["err"]
+                .as_str()
+                .unwrap()
+                .contains("mail not configured"),
+            "{v}"
+        );
+    }
+
+    /// `mail.result(id)`（异步上送结果）+ `Mail.profiles()`（非密钥面）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn js_mail_result_and_profiles() {
+        let _g = lock();
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let b = mail_bridge(fake.clone(), None, None);
+        // 插件 worker 上送完成结果 → 宿主存下（供 enqueue 的调用方回查）。
+        deliver_to_host(MAIL_RESULT_TOPIC, ENVELOPE);
+        let v = run_js(
+            &b,
+            r#"(async () => {
+                const r = await mail.result("j1");
+                const miss = await mail.result("nope");
+                const p = await Mail.profiles();
+                json.ok({ r, miss, p });
+              })().catch((e) => json.ok({ err: String(e) }));
+              "#,
+        )
+        .await;
+        assert_eq!(v["data"]["r"]["code"], 0, "{v}");
+        assert_eq!(v["data"]["r"]["messageId"], "m1");
+        assert!(v["data"]["r"].get("subject").is_none(), "{v}");
+        assert_eq!(v["data"]["miss"], Value::Null);
+        assert_eq!(v["data"]["p"], json!(["default"]));
     }
 }

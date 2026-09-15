@@ -3,7 +3,7 @@
 // (exposes the op_* bindings as JS globals).
 //
 // Globals: json / db / DB / http / redis / kv / log / fetch / finish / __ojRequire
-//   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto
+//   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto / mail
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
 // Not ported yet: Redis(name) (named multi-KV-backend), XORM(name).
 
@@ -50,6 +50,12 @@ import {
   op_kv_expire,
   op_kv_incr,
   op_log,
+  op_mail_enqueue,
+  op_mail_profiles,
+  op_mail_result,
+  op_mail_send,
+  op_mail_send_raw,
+  op_mail_send_sync,
   op_oidc_info,
   op_oidc_sign,
   op_oidc_verify,
@@ -288,6 +294,26 @@ globalThis.es = {
   index: (index, id, doc) => op_es_index(String(index), String(id), doc === undefined ? null : doc),
   del: (index, id) => op_es_del(String(index), String(id)),
 };
+
+// ----- mail / Mail(key): SMTP send (host validates + resolves attachment bytes; the
+// oj-mail plugin owns transports/queue). All methods resolve the {code,msg,data} envelope
+// -- validation failures come back as {code:5} (no throw); only "mail not configured"
+// throws. Delivery errors: 1 network, 2 smtp 5xx, 3 auth, 4 queue full, 5 bad input.
+// enqueue() resolves {code:0,data:{jobId}} and the real completion is published on the
+// bus topic "mail.result" as the flat {jobId,code,msg,messageId} (no to/subject).
+// attachments[i]: {filename, blobKey|path, mime?} -- blobKey rides the blob registry,
+// path must stay inside the project root.
+globalThis.Mail = class {
+  constructor(key = "default") { this.key = key; }
+  send(m) { return op_mail_send(this.key, JSON.stringify(m)); }
+  sendSync(m) { return op_mail_send_sync(this.key, JSON.stringify(m)); }
+  enqueue(m) { return op_mail_enqueue(this.key, JSON.stringify(m)); }
+  result(id) { return op_mail_result(this.key, String(id)); }
+  sendRaw(o) { return op_mail_send_raw(this.key, JSON.stringify(o)); }
+  static profiles() { return op_mail_profiles(); }
+};
+const ojMailDefault = new Mail("default");
+globalThis.mail = ojMailDefault;
 
 // ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
 globalThis.plugins = () => op_plugins();
