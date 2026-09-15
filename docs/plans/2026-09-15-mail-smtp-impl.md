@@ -1860,3 +1860,55 @@ api-manual「第 6 章 mail 小节」等声明均与代码实测相符。
 
 （顺序即任务书的「安全补缺 → 门禁/文档 → 版本递增」；`CHANGELIST.md` 的 v0.1.19 段落在阶段 7
 已写定，本次核对无误故未改动。）
+
+---
+
+## 统一审查修复（阶段 9：四位评审 → 两批修复）
+
+全部阶段完成后做了统一审查（架构师 / 实现工程师 / 安全工程师 / 代码质量，四位并行，
+区间 `82e7c92..HEAD`）。交叉确认后按「正确性 → 安全」两批修复。
+
+### 批次 A（正确性 / 健壮性）
+
+| 项 | 问题 | 修法 |
+|---|---|---|
+| A1 | **`enqueue` 返回裸 `{"jobId"}`**，与三层公开契约（`global.d.ts`/bootstrap.js/手册/api-manual）承诺的 `{code:0,data:{jobId}}` 不符 → 用户 `res.data.jobId` TypeError，且拿不到 jobId 就无法 `mail.result()` 回查 | 引擎改回统一信封；宿主对无 `code` 字段的返回做纵深防御包装；补**真插件** `enqueue` e2e（宿主用例用 FakeMail 掩盖了该差异） |
+| A2 | `await_ffi`（`yield_now` 空转）在 SMTP 长耗时下烧满该 isolate 的 current_thread | 改用 `await_ffi_poll`（与 mq 同解） |
+| A3 | worker 帧 drop 顺序不成立 → transport 可能在**无 runtime 上下文**析构（lettre `pool` Drop 时 `tokio::spawn`）→ panic/abort | worker 块内发退出信号**之前**显式 `drop(targets/deliver/rx)` |
+| A4 | graceful drain 生产不可达（仅测试调用，`allow(dead_code)`）→ 停机丢在途邮件，CHANGELIST 承诺落空 | 接线到停机路径 |
+| A5 | `plugins.mail` 与顶层 `smtp:` 并存时**静默遮蔽**后者（改白名单/凭据不生效） | 装配期 fail-fast |
+| A6 | JS 可见面宣称错误码 2/3（未实现）；死变量 `hint`；raw Subject 注释矛盾；`queue full` 英文文案；`host_deliver` 告警不分成因 | 逐项订正 |
+
+提交：`62e876f`（A1）、`d60f719`（A3+A4）、`69685ac`（A2）、`ba8db9f`（A5）、`b54bbf4`+`d7f4a0f`（A6）。
+
+### 批次 B（安全）
+
+| 项 | 问题 | 修法 |
+|---|---|---|
+| B1 | **白名单裸 `ends_with` 可被绕过**：`noreply@x.com` 放行 `evil-noreply@x.com`；`["x.com"]` 放行 `a@evilx.com`；`[""]` 使白名单**等于关闭**（唯一越权控制点失守） | 条目仅 `user@domain`（地址全等）或 `@domain`（域全等，无子域通配）；装配期校验并 fail-fast（点名非法条目）；三组负例回归 |
+| B2 | 附件无大小上限 + async op 内 `std::fs::read` 阻塞 isolate（project root 内任意大文件 × 队列 256 → 内存 DoS，且可读 `config.yaml` 里的密钥） | `max_attachment_bytes`/`max_total_attachment_bytes` 上限（超限 `code:5`）+ `tokio::fs::read`；**`SmtpSection` 须显式声明新全局键**（`flatten` 会把数值键当 profile 解析，此点曾致 e2e 7 红） |
+| B3 | 结果通道可枚举/可覆写：`result()` 忽略 key 无归属、jobId 可猜、宿主不剥调用方 jobId、`put` 同 id 覆盖 | `MailOwner{profile,module,tenant}`；jobId 由宿主生成（不可猜）并剥离入参；`reserve/complete/get(owner)` 不覆盖 |
+| B4 | 正文裸 CR 未中和 → SMTP smuggling 半开 | 正文（`text`/`html`/raw 正文）行尾一律归一 CRLF；**头区裸 CR 拒绝** |
+| B5 | `headers`/raw 可放行 `Sender`/`Return-Path`/`Reply-To`（弱 spoof）；`sendRaw`+结构化 `headers` 被静默忽略 | 补入禁覆盖/剥离清单；raw 带 headers 改 fail-loud |
+| B6 | 白名单错误回显整份清单；`messageId` 含 MTA 原文；`tls:none` 无告警；文档未声明可重试性 | 文案只回「未命中+profile 名」；`sanitize_message_id`；走网络时启动告警；文档明确「`code≠0` 一律不得自动重试」 |
+
+提交：`4e03666`（B1）、`ca54111`（B2），B3–B6 合并为一个提交（按 controller 决策 A）。
+
+### 门禁（修复后复跑，全绿）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | OK |
+| `cargo clippy --release --all-targets -- -D warnings` | 0 warning |
+| `cargo test --release --workspace` | 全 ok / 0 failed（only-js 369、oj 163、e2e 18） |
+| `cargo xtask plugin mail --check` | `ok: mail 0.1.0 (abi 8)` / `provided axes: [mail]` |
+| `cargo xtask smoke --bin bin/oj` | smoke ok |
+
+### 遗留（显式延后，已登记进 `docs/mail-smtp.md` §9 与设计文档 §13）
+
+- 跨进程/分布式 `mail.result`（`deliver` 是同步 `extern "C"`，宿主无法在其中 await）；
+- XOAuth2 刷新（首版静态 token，refresh-only fail-loud）；
+- per-来源限流（仅全局队列 `code:4`）；
+- 错误码 2(5xx)/3(鉴权) 未实现 → 上层**不得**按 code 自动重试（已写入文档）；
+- `tls:none` 未做内网 CIDR 校验（已有显式开关 + 启动告警）；
+- B3 归属能力边界：owner 只到 profile+模块+租户，跨模块回查不支持（跨模块通知走 `bus.subscribe("mail.result")`）。

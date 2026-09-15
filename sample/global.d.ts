@@ -278,8 +278,9 @@ interface MailApi {
   // 同步 transport（插件 worker 内阻塞投递）。
   sendSync(m: MailSendRequest): Promise<MailEnvelope>;
   // 入队即回 {code:0,data:{jobId}}；真实完成经 bus topic "mail.result" 上送。
+  // jobId 由宿主生成（不可猜；调用方传入的 jobId 被剥离）。
   enqueue(m: MailSendRequest): Promise<MailEnvelope>;
-  // 查宿主侧结果（未命中/已过期 → null）。
+  // 查宿主侧结果（未命中/已过期/**非本归属** → null；归属 = 本实例的 profile + 模块 + 租户）。
   result(jobId: string): Promise<Json | null>;
   // 原始 MIME 投递。
   sendRaw(o: MailRawRequest): Promise<MailEnvelope>;

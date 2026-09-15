@@ -182,6 +182,18 @@ const jobId = r.data.jobId;                       // 统一信封：{code,msg,da
 > （原表宣称 `2`/`3` 可用，与实现不符）。已达成的映射为 `0` 成功 / `1` 连接·网络·超时·
 > 投递失败 / `4` 队列满 / `5` 入参·白名单·附件校验（阶段 8 已逐条补回归。
 
+> **实现期订正（统一审查批次 B，2026-09-15）**：
+> 1. 本节「`code`」表仍未变的映射见上；另**明确**：`code != 0` **一律不得自动重试**
+>    —— `2`/`3` 未实现时，永久失败（5xx/鉴权）与瞬时失败（连接/超时）同归 `1`，
+>    从 `code` 分不出可重试性（未新增 `data.retryable`，理由见 `docs/mail-smtp.md` §3）。
+> 2. 「白名单（fail-closed）」的**匹配语义**（B1）由「后缀匹配」订正为**全等**：
+>    条目只能是完整地址（地址全等）或 `@domain`（域全等），大小写不敏感，**不做子域通配**；
+>    条目格式在装配期校验（空串/裸域/首尾空白 → 配置解析失败），空表仍 = 拒绝。
+> 3. 新增**附件上限**（B2）：单件 `smtp.max_attachment_bytes`（默认 10 MiB）与单封合计
+>    `smtp.max_total_attachment_bytes`（默认 25 MiB），超限 `code:5`；`path` 路先取长度再读，
+>    读盘改为 `tokio::fs`（不阻塞 isolate）。原设计 §9 只说「字节由宿主解析」，未设上限。
+> 4. 背压文案与队列语义不变（A 批次已订正）。
+
 - `code`：连接/网络→`1`、5xx→`2`（**未实现**）、鉴权→`3`（**未实现**）、队列满→`4`、地址/白名单校验→`5`。`data:{jobId,messageId?}`。
 - **CRLF 注入防护**：`subject`/`headers`/地址先剥 `\r\n`；`from/to/cc/bcc` 经 `lettre::Address` 强校验，非法即 `code:5`。
 - **白名单（fail-closed）**：`from` 匹配 `allowed_from` 后缀、`to/cc/bcc` 匹配 `allowed_recipients` 后缀，否则 `code:5`；**空表即拒绝**（缺省不放行）。
@@ -202,6 +214,22 @@ const jobId = r.data.jobId;                       // 统一信封：{code,msg,da
 >    只是对用户表现为无理由的 `code:5`。raw 路与宿主**逐条一致**（同为 `Address`）。
 >    已钉进回归：`plugins/oj-mail/src/message.rs` 的
 >    `host_accepted_addresses_are_accepted_by_plugin_or_listed_as_known_split`。
+
+> **实现期订正（统一审查批次 B，2026-09-15）**：本节的安全要求按 B 批次落地/收窄：
+> 1. **白名单**（本节「越权」条）：由「后缀匹配」改为**全等**（完整地址全等 / `@domain`
+>    域全等，无子域通配）；条目格式装配期 fail-fast（B1）。
+> 2. **头注入**（本节「头注入」条）：正文/`raw` 的**裸 CR 一律归一 CRLF**（B4，与裸 LF
+>    同处置）—— 裸 CR 是 SMTP smuggling 半开面（`X\r.\r\n` 可让对端提前结束 DATA）；
+>    `raw` **头区**的裸 CR 仍**拒绝**（归一 = 凭空造头）。
+> 3. **`headers` 禁覆盖清单**（本节「头注入」条）由 From/To/Cc/Bcc/Subject 扩为含
+>    `Sender`/`Return-Path`/`Reply-To`（B5）；`raw` 与结构化 `headers` 由「静默忽略」
+>    改 fail-loud。
+> 4. **结果通道**（本节「bus 反馈泄露」条）：jobId 由宿主生成（随机前缀，不可猜）、
+>    调用方传入值剥离；宿主先登记票、插件只能填充一次（不可覆写）；`mail.result` 按
+>    「profile + 模块 + 租户」归属过滤（B3）。**残留限制**：bus 扇出仍对所有订阅者可见
+>    （payload 已脱敏）+ 归属拿不到「具体 handler/用户」粒度 —— 见 `docs/mail-smtp.md` §9。
+> 5. **`none` TLS 的内网 CIDR**（本节末条）：仍未实现；**缓解** = 启动时对每个走网络的
+>    明文 profile 打 warn 级告警（经 `HostContext.log`，含 profile 与 host:port）（B6）。
 
 - 凭据仅在 `config.yaml` →（插件 cfg）`MailProfile`；**不进 JS 自省**（`op_mail_profiles` 只列 key）。
 - **头注入**：CRLF 剥离 + `lettre::Address` 强校验（§10）。

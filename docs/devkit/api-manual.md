@@ -962,8 +962,8 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 | `new Mail(key)` | `Mail(key?: string)` | profile 实例；`key` = `smtp:` 段里的 profile 名（缺省 `"default"`），未声明的 key 报错（不回落 default） |
 | `mail.send` | `send(m: SendRequest): Promise<Envelope>` | 异步 transport；resolve 投递结果信封 |
 | `mail.sendSync` | `sendSync(m: SendRequest): Promise<Envelope>` | 同步 transport（插件 worker 内 `spawn_blocking` 投递） |
-| `mail.enqueue` | `enqueue(m: SendRequest): Promise<Envelope>` | 入队即回 `{code:0,data:{jobId}}`；真实完成经 `mail.result` 与 bus 上送 |
-| `mail.result` | `result(jobId: string): Promise<Json \| null>` | 查宿主侧结果（未命中/已过期 → `null`；结果按 `jobId` 全局索引） |
+| `mail.enqueue` | `enqueue(m: SendRequest): Promise<Envelope>` | 入队即回 `{code:0,data:{jobId}}`；真实完成经 `mail.result` 与 bus 上送。**jobId 由宿主生成**（调用方传入值被剥离） |
+| `mail.result` | `result(jobId: string): Promise<Json \| null>` | 查宿主侧结果（未命中/已过期/**非本归属** → `null`）。归属 = `new Mail(key)` 的 key + 模块 + 租户：跨 profile/模块/租户都拿不到（用 bus `mail.result` 做跨模块通知） |
 | `mail.sendRaw` | `sendRaw(o: SendRawRequest): Promise<Envelope>` | 原始 MIME 投递（`raw` 原文 + 结构化 `from`/`to` 作信封；与 `attachments` 互斥） |
 | `Mail.profiles` | `Mail.profiles(): Promise<string[]>` | 已配置 profile 名清单（**非密钥面**） |
 
@@ -1003,7 +1003,10 @@ attachments: [
 | `1` | 网络/连接/超时，**以及一切投递期失败**（含 SMTP 5xx/鉴权失败；原始错误只出脱敏分类文案）；亦含「投递未能送达插件」 |
 | `2` / `3` | **当前未启用**：首版不细分 SMTP 5xx（`2`）与鉴权失败（`3`），两类均归 `1`（保持 `msg` 脱敏、不泄露 SMTP 对话）。按错误码分支的代码请以 `code !== 0` 判失败 |
 | `4` | 队列满（背压，`enqueue` 亦回同一 jobId） |
-| `5` | 入参校验失败（地址非法/白名单未命中/缺正文/附件形态错/路径越界/未知 profile） |
+| `5` | 入参校验失败（地址非法/白名单未命中/缺正文/附件形态错/路径越界/超限/未知 profile） |
+
+**`code !== 0` 一律不得自动重试**：`2`/`3` 未启用，永久失败（SMTP 5xx / 鉴权）与瞬时失败
+（连接/超时）都归 `1`，从 `code` 分不出可重试性；自动重试会把永久失败反复重投。
 
 **白名单是唯一控制点，且 fail-closed**：`allowed_from`/`allowed_recipients` 为**全等**匹配
 （大小写不敏感），**空表 = 拒绝**——不写白名单就发不出任何信。
