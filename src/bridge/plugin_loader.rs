@@ -101,6 +101,7 @@ pub struct Registrations {
     pub kv: Option<&'static oj_plugin_ffi::KVStoreVtable>,   // Task 4.4 起填
     pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>, // Task auth-1 起
     pub mq: Option<&'static oj_plugin_ffi::MqVtable>,        // mq 命名客户端（spec 2026-09-07）
+    pub mail: Option<&'static oj_plugin_ffi::MailAxis>,      // mail 投递（spec 2026-09-15）
 }
 
 pub struct LoadedPlugin {
@@ -428,7 +429,7 @@ fn load_one(
 
 /// 宿主认识的轴（加新轴 = 此表加一行 + 对应 vtable 类型 + Registrations 加字段；
 /// 插件零感知、零重编译——spec「按轴 dlsym」）。
-pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq"];
+pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail"];
 
 /// init 成功后逐轴 dlsym：`oj_plugin_axis_<name>() -> *const c_void`。
 /// 缺符号或返回 null = 不提供该轴（非错误）。
@@ -453,6 +454,7 @@ unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
             "kv" => r.kv = Some(unsafe { &*(vt as *const oj_plugin_ffi::KVStoreVtable) }),
             "auth" => r.auth = Some(unsafe { &*(vt as *const oj_plugin_ffi::AuthGuardVtable) }),
             "mq" => r.mq = Some(unsafe { &*(vt as *const oj_plugin_ffi::MqVtable) }),
+            "mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailAxis) }),
             _ => unreachable!("AXES 与 probe_axes 分支不同步"),
         }
     }
