@@ -5,15 +5,23 @@
 //! 依赖倒置：本模块只对外暴露 [`MailBackend`] trait，`oj_plugin_ffi` 的 vtable 细节
 //! 收敛在 [`FfiMailBackend`]（装配层只构造它，不碰 FFI 类型）。
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
+use lettre::Address;
 use oj_plugin_ffi::{MailAttachment, MailVtable, RBytes, RString};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
+use super::blob::BlobRegistry;
 use super::bus::BusPayload;
+use super::module_loader::ensure_within;
 use super::{BridgeResult, EventBroker};
 
 /// 结果上送 topic：插件 `HostContext.deliver(MAIL_RESULT_TOPIC, <信封 JSON>)`。
@@ -352,6 +360,594 @@ impl MailBackend for FfiMailBackend {
     }
 }
 
+// ---------- 宿主侧入参校验（权威层；插件侧同款校验是纵深防御） ----------
+
+/// 请求头里由结构化字段决定的名字：自定义头**不得**覆盖（否则信封可由报头派生，
+/// 绕过收件人白名单）。与插件 `message.rs::STRUCTURED_HEADERS` 同清单。
+const STRUCTURED_HEADERS: [&str; 5] = ["from", "to", "cc", "bcc", "subject"];
+
+/// CRLF **剥离**（design §10「先剥 `\r\n`」）：头字段里的换行没有合法语义，
+/// 删除即消除头注入（`subject: "a\r\nBcc: x"` → `"aBcc: x"`）。
+/// 地址另走 [`validate_address`]——那里是**拒绝**（地址无「含换行的合法值」）。
+/// 正文（`text`/`html`）与 `raw` 原文不在此列：换行在正文里有语义（design §7）。
+pub fn strip_crlf(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
+/// 地址强校验：与插件/lettre 信封**同一解析器**（`lettre::Address`），
+/// 保证宿主放行 ≡ 插件放行（口径不分裂）。
+pub fn validate_address(s: &str) -> Result<Address, String> {
+    if s.contains(['\r', '\n']) {
+        return Err("地址含换行（CRLF 注入）".to_string());
+    }
+    s.parse::<Address>().map_err(|e| e.to_string())
+}
+
+/// 后缀匹配（大小写不敏感；`@x.com` 命中 `a@x.com`）。
+fn suffix_match(list: &[String], addr: &str) -> bool {
+    let a = addr.to_lowercase();
+    list.iter().any(|s| a.ends_with(&s.to_lowercase()))
+}
+
+/// profile 白名单（design §10）：`from` 命中 `allowed_from`，全部收件人
+/// （to/cc/bcc）命中 `allowed_recipients`。
+/// **空表 = 拒绝**（fail-closed）：白名单是「越权发送」的唯一控制点，
+/// 缺省放行等于默认开成开放中继；与本特性 `tls: none` 需显式许可同一取向。
+pub fn check_whitelist(from: &str, rcpts: &[String], cfg: &MailProfileCfg) -> Result<(), String> {
+    if !suffix_match(&cfg.allowed_from, from) {
+        return Err(format!(
+            "from '{from}' 不在 allowed_from 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或改用允许的发件人）",
+            cfg.allowed_from
+        ));
+    }
+    for r in rcpts {
+        if !suffix_match(&cfg.allowed_recipients, r) {
+            return Err(format!(
+                "收件人 '{r}' 不在 allowed_recipients 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或去掉该收件人）",
+                cfg.allowed_recipients
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 可选字符串字段：缺失/`null` → None；给了别的类型 → Err（明确拒绝，不静默丢弃）。
+fn opt_str(obj: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
+    match obj.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("mail: {field} 必须是字符串")),
+    }
+}
+
+/// 地址数组字段（`to`/`cc`/`bcc`）：缺失 = 空表；非数组/非字符串/地址非法 → Err。
+fn address_list(obj: &Map<String, Value>, field: &str) -> Result<Vec<Address>, String> {
+    let Some(v) = obj.get(field) else {
+        return Ok(Vec::new());
+    };
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = v
+        .as_array()
+        .ok_or_else(|| format!("mail: {field} 必须是字符串数组"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, a) in arr.iter().enumerate() {
+        let s = a
+            .as_str()
+            .ok_or_else(|| format!("mail: {field}[{i}] 必须是字符串"))?;
+        out.push(validate_address(s).map_err(|e| {
+            format!("mail: {field}[{i}] 地址非法：{e}（下一步：改为 user@domain 形式）")
+        })?);
+    }
+    Ok(out)
+}
+
+/// 自定义报头规范化：名字与值均剥 CRLF；禁止覆盖结构化头（防白名单绕过）。
+fn normalize_headers(obj: &mut Map<String, Value>) -> Result<(), String> {
+    let Some(h) = obj.get("headers") else {
+        return Ok(());
+    };
+    if h.is_null() {
+        obj.remove("headers");
+        return Ok(());
+    }
+    let m = h
+        .as_object()
+        .ok_or_else(|| "mail: headers 必须是对象（名 → 值）".to_string())?;
+    let mut out = Map::new();
+    for (k, v) in m {
+        let name = strip_crlf(k);
+        let val = v
+            .as_str()
+            .ok_or_else(|| format!("mail: headers['{name}'] 必须是字符串"))?;
+        if STRUCTURED_HEADERS
+            .iter()
+            .any(|s| name.eq_ignore_ascii_case(s))
+        {
+            return Err(format!(
+                "mail: headers 不允许覆盖 {name}（From/To/Cc/Bcc/Subject 由 From/to/cc/bcc/subject 决定；下一步：换一个自定义头名）"
+            ));
+        }
+        out.insert(name, Value::String(strip_crlf(val)));
+    }
+    obj.insert("headers".to_string(), Value::Object(out));
+    Ok(())
+}
+
+// ---------- 附件引用（引用式 → 字节） ----------
+
+/// 附件字节来源：`blobKey`（blob 后端）或 `path`（项目根内本地文件）——**二选一**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttSrc {
+    /// `blob` 字段给后端名（缺省 "default"），`key` 为 blobKey。
+    Blob { name: String, key: String },
+    /// 项目根相对路径（绝对路径亦可，但必须落在项目根内）。
+    Path(PathBuf),
+}
+
+/// 一条附件引用（宿主据此取字节；`filename`/`mime` 供展示）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub filename: String,
+    /// 显式 MIME（`None` = 由扩展名/字节嗅探决定）。
+    pub mime: Option<String>,
+    pub src: AttSrc,
+}
+
+/// 解析 `attachments[]`：每个元素必须且只能给 `blobKey`/`path` 之一（与插件同款判定），
+/// 且必须有非空 `filename`（插件 `AttachmentRef.filename` 为必填）。
+/// 非数组 / 元素非对象 / 字段类型错 → Err（文案给下一步）。
+pub fn parse_attachment_refs(v: &Value) -> Result<Vec<AttachmentRef>, String> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "mail: attachments 必须是数组".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, a) in arr.iter().enumerate() {
+        let o = a.as_object().ok_or_else(|| {
+            format!("mail: attachments[{i}] 必须是对象（{{filename, blobKey|path}}）")
+        })?;
+        let filename = match o.get("filename") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return Err(format!("mail: attachments[{i}].filename 必须是字符串")),
+        };
+        if filename.is_empty() {
+            return Err(format!(
+                "mail: attachments[{i}] 缺少 filename（下一步：给出收件人可见的文件名）"
+            ));
+        }
+        let mime = match o.get("mime") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(format!("mail: attachments[{i}].mime 必须是字符串")),
+        };
+        let blob_key = o
+            .get("blobKey")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let path = o
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        let src = match (blob_key, path) {
+            (Some(k), None) => AttSrc::Blob {
+                name: o
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default")
+                    .to_string(),
+                key: k.to_string(),
+            },
+            (None, Some(p)) => AttSrc::Path(PathBuf::from(p)),
+            _ => {
+                return Err(format!(
+                    "mail: attachments[{i}] 必须且只能给 blobKey 或 path 之一（下一步：二选一）"
+                ));
+            }
+        };
+        out.push(AttachmentRef {
+            filename,
+            mime,
+            src,
+        });
+    }
+    Ok(out)
+}
+
+/// MIME 决议：**显式优先** → 扩展名 → 字节嗅探 → `application/octet-stream`
+/// （design §9；与插件 `DEFAULT_MIME` 同兜底）。
+pub fn resolve_mime(explicit: Option<&str>, name: &str, bytes: &[u8]) -> String {
+    if let Some(m) = explicit.filter(|m| !m.is_empty()) {
+        return m.to_string();
+    }
+    if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
+        && let Some(m) = mime_by_ext(&ext.to_ascii_lowercase())
+    {
+        return m.to_string();
+    }
+    if let Some(m) = mime_by_magic(bytes) {
+        return m.to_string();
+    }
+    "application/octet-stream".to_string()
+}
+
+fn mime_by_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "pdf" => "application/pdf",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "md" => "text/markdown",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "eml" => "message/rfc822",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => return None,
+    })
+}
+
+/// 魔数嗅探（扩展名缺失/未知时的兜底；覆盖最常见的二进制族）。
+fn mime_by_magic(bytes: &[u8]) -> Option<&'static str> {
+    const SIGS: [(&[u8], &str); 6] = [
+        (b"%PDF-", "application/pdf"),
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"PK\x03\x04", "application/zip"),
+    ];
+    SIGS.iter()
+        .find(|(sig, _)| bytes.starts_with(sig))
+        .map(|(_, m)| *m)
+        .or_else(|| bytes.starts_with(b"\x1f\x8b").then_some("application/gzip"))
+}
+
+/// 附件解析：按引用取字节 → `ParsedAttachment`（**下标与 refs 严格一致**）。
+///
+/// - `blobKey`：经 `StableState.blobs` 注册表（本地/S3 统一）；后端缺失/键缺失 → Err 给下一步。
+/// - `path`：`ensure_within` 钳制到项目根（符号链接经 canonical 化覆盖），
+///   并**按返回的 canonical 句柄读盘**（校验路径 ≡ 读盘路径，design §9 TOCTOU）。
+async fn resolve_attachments(
+    blobs: &BlobRegistry,
+    root: Option<&Path>,
+    refs: &[AttachmentRef],
+) -> Result<Vec<ParsedAttachment>, String> {
+    let mut out = Vec::with_capacity(refs.len());
+    for (i, r) in refs.iter().enumerate() {
+        let (bytes, hint) = match &r.src {
+            AttSrc::Blob { name, key } => {
+                let b = blobs.get(name).ok_or_else(|| {
+                    format!(
+                        "mail: attachments[{i}] 的 blob 后端 '{name}' not configured（下一步：在 config 里配置 blob.backends.{name}）"
+                    )
+                })?;
+                let bytes = b.get(key).await.map_err(|e| {
+                    format!(
+                        "mail: attachments[{i}] 读取 blobKey '{key}' 失败：{e}（下一步：确认键存在且当前后端可读）"
+                    )
+                })?;
+                (bytes, key.clone())
+            }
+            AttSrc::Path(p) => {
+                let root = root.ok_or_else(|| {
+                    format!(
+                        "mail: attachments[{i}] 的 path 附件需要 project root（loader 未配置；dev/release 均由 --api-path 提供）（下一步：改用 blobKey）"
+                    )
+                })?;
+                let full = if p.is_absolute() {
+                    p.clone()
+                } else {
+                    root.join(p)
+                };
+                let canon = ensure_within(&full, root).map_err(|e| {
+                    format!(
+                        "mail: attachments[{i}] 附件路径非法：{e}（下一步：把附件放到项目根内，或用 blobKey）"
+                    )
+                })?;
+                let bytes = std::fs::read(&canon).map_err(|e| {
+                    format!(
+                        "mail: attachments[{i}] 读取 {} 失败：{e}（下一步：确认文件存在且可读）",
+                        canon.display()
+                    )
+                })?;
+                (bytes, canon.display().to_string())
+            }
+        };
+        let mime = resolve_mime(r.mime.as_deref(), &r.filename, &bytes);
+        let _ = &hint;
+        out.push(ParsedAttachment {
+            filename: r.filename.clone(),
+            mime,
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+// ---------- 编排：校验 → 附件 → submit ----------
+
+/// 投递模式（`Mail` 的四个方法 → 引擎开关 + 校验差异）。
+/// **宿主权威**：op 覆写 req 里的 `sync`/`enqueue_only`，JS 侧串用无效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailMode {
+    /// 异步 transport，future resolve = 投递结果。
+    Send,
+    /// 同步 transport（插件 worker 内 `spawn_blocking`）。
+    Sync,
+    /// 入队即返回 `{jobId}`，真实完成经 `deliver` 上送。
+    Enqueue,
+    /// 原始 MIME（`raw`）+ 结构化 `from`/`to` 作信封；与 `attachments` 互斥。
+    Raw,
+}
+
+fn code5(msg: &str) -> Value {
+    json!({ "code": 5, "msg": msg, "data": {} })
+}
+
+/// 校验并**就地规范化**请求；成功返回附件引用表（供字节解析）。
+///
+/// 规范化内容：CRLF 剥离（subject/headers）、地址规范化（lettre 解析后的规范写法）、
+/// 开关由 op 覆写、`headers` 重建（剥 CRLF + 禁覆盖结构化头）。
+fn validate_request(
+    key: &str,
+    req: &mut Value,
+    cfg: &MailConfig,
+    mode: MailMode,
+) -> Result<Vec<AttachmentRef>, String> {
+    let raw_mode = mode == MailMode::Raw;
+    let obj = req
+        .as_object_mut()
+        .ok_or_else(|| "mail: 请求必须是对象（{from, to, text|html}）".to_string())?;
+    let prof = cfg.profile(key).ok_or_else(|| {
+        format!(
+            "mail: unknown mail profile '{key}'（已知：{:?}）（下一步：改用已配置的 profile key）",
+            cfg.profile_keys()
+        )
+    })?;
+
+    // 地址：强校验（拒绝非法/含换行）→ 规范化写回。
+    let from = opt_str(obj, "from")?
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "mail: 缺少 from（发件人）（下一步：给出 user@domain 形式）".to_string())?;
+    let from = validate_address(&from)
+        .map_err(|e| format!("mail: from 地址非法：{e}（下一步：改为 user@domain 形式）"))?;
+    let to = address_list(obj, "to")?;
+    let cc = address_list(obj, "cc")?;
+    let bcc = address_list(obj, "bcc")?;
+    if to.is_empty() {
+        return Err(
+            "mail: 缺少收件人 to（至少一个；只抄送请同时给 to）（下一步：补 to）".to_string(),
+        );
+    }
+    let rcpts: Vec<String> = to
+        .iter()
+        .chain(cc.iter())
+        .chain(bcc.iter())
+        .map(|a| a.to_string())
+        .collect();
+    let from_norm: &str = from.as_ref();
+    check_whitelist(from_norm, &rcpts, prof)?;
+    obj.insert("from".into(), Value::String(from_norm.to_string()));
+    for (field, list) in [("to", &to), ("cc", &cc), ("bcc", &bcc)] {
+        let v: Vec<Value> = list.iter().map(|a| Value::String(a.to_string())).collect();
+        obj.insert(field.into(), Value::Array(v));
+    }
+
+    // 主题（剥离）与报头（剥离 + 禁覆盖）；正文原样（正文换行有语义）。
+    if let Some(s) = opt_str(obj, "subject")? {
+        obj.insert("subject".into(), Value::String(strip_crlf(&s)));
+    }
+    let text = opt_str(obj, "text")?;
+    let html = opt_str(obj, "html")?;
+    normalize_headers(obj)?;
+
+    // raw 与结构化路互斥：非 raw 模式不得夹带 raw（否则插件静默走原始 MIME 路）。
+    let raw = opt_str(obj, "raw")?;
+    match (raw_mode, raw) {
+        (true, None) => {
+            return Err(
+                "mail: sendRaw 需要 raw（RFC5322 原文）（下一步：把原文放进 raw 字段）".to_string(),
+            );
+        }
+        (true, Some(r)) if r.is_empty() => {
+            return Err("mail: sendRaw 的 raw 不能为空（下一步：给出完整原文）".to_string());
+        }
+        (false, Some(r)) if !r.is_empty() => {
+            return Err(
+                "mail: 非 sendRaw 调用不得带 raw（下一步：改用 mail.sendRaw，或去掉 raw）"
+                    .to_string(),
+            );
+        }
+        (false, _) => {
+            obj.remove("raw"); // 空串/缺省：清掉，避免插件误入原始 MIME 路
+        }
+        (true, Some(_)) => {}
+    }
+
+    // 附件：raw 路不解析（与原文互斥）；结构化路按下标解析。
+    if raw_mode {
+        let has_atts = obj
+            .get("attachments")
+            .is_some_and(|a| !a.is_null() && a.as_array().is_none_or(|arr| !arr.is_empty()));
+        if has_atts {
+            return Err(
+                "mail: sendRaw 与 attachments 互斥（raw 原文自带内容）（下一步：去掉 attachments 或改用 send）"
+                    .to_string(),
+            );
+        }
+        obj.remove("attachments");
+        return Ok(Vec::new());
+    }
+    let refs = parse_attachment_refs(obj.get("attachments").unwrap_or(&Value::Null))?;
+    // 与插件 build_message 同款：text 与 html 都缺且无附件 → 缺正文。
+    if text.is_none() && html.is_none() && refs.is_empty() {
+        return Err(
+            "mail: 缺少正文（text 与 html 至少给一个，或带附件）（下一步：补 text/html）"
+                .to_string(),
+        );
+    }
+    Ok(refs)
+}
+
+/// 一次投递的完整宿主流程（op 与测试共用编排）：
+/// 校验（权威层）→ 附件字节解析 → `submit`。
+///
+/// 返回**结果信封**（与插件同款 `{code,msg,data}`）：校验/解析失败 → `{code:5}`，
+/// FFI 层失败 → `{code:1}`（连接/网络类）。即 JS 侧 `mail.*` 一律 resolve 信封，
+/// 不因邮件内容问题抛异常；仅「未配置 mail」在 op 层抛（见 `op_mail_send`）。
+pub async fn handle_send(
+    backend: Arc<dyn MailBackend>,
+    blobs: Arc<BlobRegistry>,
+    project_root: Option<&Path>,
+    key: &str,
+    req_json: &str,
+    mode: MailMode,
+) -> Value {
+    let mut req: Value = match serde_json::from_str(req_json) {
+        Ok(v) => v,
+        Err(e) => return code5(&format!("mail: 请求不是合法 JSON：{e}")),
+    };
+    let refs = {
+        let cfg = backend.config();
+        match validate_request(key, &mut req, cfg, mode) {
+            Ok(r) => r,
+            Err(e) => return code5(&e),
+        }
+    };
+    let atts = match resolve_attachments(&blobs, project_root, &refs).await {
+        Ok(a) => a,
+        Err(e) => return code5(&e),
+    };
+    if let Some(o) = req.as_object_mut() {
+        o.insert("sync".into(), Value::Bool(mode == MailMode::Sync));
+        o.insert(
+            "enqueue_only".into(),
+            Value::Bool(mode == MailMode::Enqueue),
+        );
+    }
+    match backend.submit(key, req.to_string(), atts).await {
+        Ok(env) => env,
+        Err(e) => json!({
+            "code": 1,
+            "msg": format!("mail: 投递未能送达插件（{e}）（下一步：确认 oj-mail 插件已装配、profile 名正确）"),
+            "data": {},
+        }),
+    }
+}
+
+// ---------- JS 侧入口（ops） ----------
+
+/// op 层依赖三元组：mail 后端 / blob 注册表 / 项目根（path 附件钳制基准）。
+type MailDeps = (Arc<dyn MailBackend>, Arc<BlobRegistry>, Option<PathBuf>);
+
+fn mail_deps(state: &OpState) -> Result<MailDeps, JsErrorBox> {
+    let st = state.borrow::<Arc<super::StableState>>();
+    let backend = st.mail.clone().ok_or_else(|| {
+        JsErrorBox::generic(
+            "mail not configured (config smtp: section missing, or oj-mail plugin not loaded)",
+        )
+    })?;
+    Ok((
+        backend,
+        st.blobs.clone(),
+        st.loader.as_ref().map(|l| l.project_root.clone()),
+    ))
+}
+
+async fn op_send(
+    state: Rc<RefCell<OpState>>,
+    key: String,
+    req_json: String,
+    mode: MailMode,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let (backend, blobs, root) = mail_deps(&state.borrow())?;
+    Ok(handle_send(backend, blobs, root.as_deref(), &key, &req_json, mode).await)
+}
+
+/// mail.send(m)：异步 transport，resolve 投递结果信封。
+#[op2]
+#[serde]
+pub async fn op_mail_send(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] req_json: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    op_send(state, key, req_json, MailMode::Send).await
+}
+
+/// mail.sendSync(m)：同步 transport（插件 worker 内 spawn_blocking）。
+#[op2]
+#[serde]
+pub async fn op_mail_send_sync(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] req_json: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    op_send(state, key, req_json, MailMode::Sync).await
+}
+
+/// mail.enqueue(m)：入队即返回 `{jobId}`；真实完成经 `mail.result` 上送。
+#[op2]
+#[serde]
+pub async fn op_mail_enqueue(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] req_json: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    op_send(state, key, req_json, MailMode::Enqueue).await
+}
+
+/// mail.sendRaw(o)：原始 MIME 投递（`raw` + 结构化 `from`/`to` 作信封）。
+#[op2]
+#[serde]
+pub async fn op_mail_send_raw(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+    #[string] req_json: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    op_send(state, key, req_json, MailMode::Raw).await
+}
+
+/// mail.result(id)：查宿主侧存储的异步结果（未命中/已过期 → `null`）。
+/// `key` 保留形参仅为对齐 `Mail` 实例方法签名：结果按 `jobId` 全局索引（与 profile 无关）。
+#[op2]
+#[serde]
+pub async fn op_mail_result(
+    state: Rc<RefCell<OpState>>,
+    #[string] _key: String,
+    #[string] job_id: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let (backend, ..) = mail_deps(&state.borrow())?;
+    Ok(backend.router().get(&job_id).unwrap_or(Value::Null))
+}
+
+/// mail.profiles()：已配置的 profile 名清单（**非密钥面**：凭据/连接字段不进 JS）。
+#[op2]
+#[serde]
+pub async fn op_mail_profiles(
+    state: Rc<RefCell<OpState>>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let (backend, ..) = mail_deps(&state.borrow())?;
+    Ok(json!(backend.config().profile_keys()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +1252,428 @@ mod tests {
             MailConfig::from_value(&json!({"a": {"allowed_from": [1, 2]}})).is_err(),
             "allowed_from 必须是字符串数组"
         );
+    }
+
+    // ---------- 6.4：入参校验（纯函数，宿主权威层） ----------
+
+    #[test]
+    fn strip_crlf_removes_header_injection() {
+        assert_eq!(strip_crlf("hi\r\nBcc: evil@x.com"), "hiBcc: evil@x.com");
+        assert_eq!(strip_crlf("a\nb\rc"), "abc");
+        assert_eq!(strip_crlf("clean"), "clean");
+    }
+
+    #[test]
+    fn address_validation_uses_lettre_parser() {
+        assert!(validate_address("a@x.com").is_ok());
+        assert!(validate_address("not-an-addr").is_err());
+        assert!(validate_address("").is_err());
+        assert!(validate_address("a@x.com>b@y.com").is_err());
+        // CRLF 一律拒（地址无「合法换行」语义，不同于 subject 的剥离）。
+        assert!(validate_address("a@x.com\r\nBcc: b@y.com").is_err());
+        assert!(validate_address("a@x.com\n").is_err());
+    }
+
+    #[test]
+    fn whitelist_is_suffix_based_and_fail_closed() {
+        let p = MailProfileCfg {
+            allowed_from: vec!["noreply@x.com".into()],
+            allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
+        };
+        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p).is_ok());
+        assert!(check_whitelist("noreply@x.com", &["a@partner.com".into()], &p).is_ok());
+        // 大小写不敏感（域名大小写无语义）。
+        assert!(check_whitelist("NoReply@X.com", &["A@X.com".into()], &p).is_ok());
+        let e = check_whitelist("evil@y.com", &["a@x.com".into()], &p).unwrap_err();
+        assert!(
+            e.contains("allowed_from") && e.contains("evil@y.com"),
+            "{e}"
+        );
+        let e = check_whitelist(
+            "noreply@x.com",
+            &["a@x.com".into(), "b@evil.com".into()],
+            &p,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("allowed_recipients") && e.contains("b@evil.com"),
+            "{e}"
+        );
+        // 空表 = 拒绝（fail-closed，同 `tls: none` 的显式许可思路）。
+        let empty = MailProfileCfg::default();
+        let e = check_whitelist("a@x.com", &["b@x.com".into()], &empty).unwrap_err();
+        assert!(e.contains("allowed_from"), "{e}");
+        let no_rcpt = MailProfileCfg {
+            allowed_from: vec!["@x.com".into()],
+            ..Default::default()
+        };
+        let e = check_whitelist("a@x.com", &["b@x.com".into()], &no_rcpt).unwrap_err();
+        assert!(e.contains("allowed_recipients"), "{e}");
+    }
+
+    // ---------- 6.4：附件引用解析 ----------
+
+    #[test]
+    fn attachment_refs_require_exactly_one_source() {
+        let refs = parse_attachment_refs(&json!([
+            {"filename": "a.pdf", "blobKey": "r2d2"},
+            {"filename": "b.pdf", "path": "reports/b.pdf", "mime": "application/pdf", "blob": "img"},
+        ]))
+        .unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs[0].src,
+            AttSrc::Blob {
+                name: "default".into(),
+                key: "r2d2".into()
+            }
+        );
+        assert_eq!(refs[0].mime, None);
+        assert_eq!(refs[1].mime.as_deref(), Some("application/pdf"));
+        assert_eq!(refs[1].src, AttSrc::Path("reports/b.pdf".into()));
+        // 缺省（无 attachments / null）= 空表。
+        assert!(parse_attachment_refs(&Value::Null).unwrap().is_empty());
+        // 两个来源都给 / 都不给 / 缺 filename / 非对象 / 空 key → 全部拒绝。
+        for bad in [
+            json!([{"filename": "a", "blobKey": "k", "path": "p"}]),
+            json!([{"filename": "a"}]),
+            json!([{"blobKey": "k"}]),
+            json!([{"filename": "", "blobKey": "k"}]),
+            json!([{"filename": "a", "blobKey": ""}]),
+            json!(["nope"]),
+            json!({"filename": "a"}),
+        ] {
+            assert!(parse_attachment_refs(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn mime_resolution_prefers_explicit_then_ext_then_magic() {
+        assert_eq!(
+            resolve_mime(Some("application/x-custom"), "a.bin", b"%PDF-1.7"),
+            "application/x-custom"
+        );
+        assert_eq!(resolve_mime(None, "r.pdf", b"whatever"), "application/pdf");
+        assert_eq!(resolve_mime(None, "r.PDF", b""), "application/pdf");
+        assert_eq!(resolve_mime(None, "n.csv", b""), "text/csv");
+        // 扩展名未知 → 字节嗅探。
+        assert_eq!(resolve_mime(None, "x.dat", b"%PDF-1.7"), "application/pdf");
+        assert_eq!(
+            resolve_mime(None, "x.dat", b"\x89PNG\r\n\x1a\n"),
+            "image/png"
+        );
+        // 都不认识 → 兜底（插件侧同款默认）。
+        assert_eq!(
+            resolve_mime(None, "x.dat", b"hello"),
+            "application/octet-stream"
+        );
+    }
+
+    // ---------- 6.4：附件字节解析（blob / path） ----------
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "oj-mail-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_attachments_reads_blob_and_path_in_declared_order() {
+        use crate::bridge::blob::{self, BlobBackend, LocalBlob};
+        let dir = tmpdir("att");
+        let blob_root = dir.join("blobs");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let lb = LocalBlob::new(&blob_root, "/v1/api").unwrap();
+        lb.put("r2d2", b"BLOBBYTES", Some("application/pdf"))
+            .await
+            .unwrap();
+        let reg = blob::registry_with_default(Arc::new(lb));
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("reports")).unwrap();
+        std::fs::write(proj.join("reports/x.pdf"), b"%PDF-1.7 file").unwrap();
+
+        let refs = parse_attachment_refs(&json!([
+            {"filename": "b.pdf", "path": "reports/x.pdf"},
+            {"filename": "a.pdf", "blobKey": "r2d2", "mime": "application/custom"},
+        ]))
+        .unwrap();
+        let atts = resolve_attachments(&reg, Some(&proj), &refs).await.unwrap();
+        assert_eq!(atts.len(), 2);
+        // 下标严格对齐（插件按下标取字节）。
+        assert_eq!(atts[0].filename, "b.pdf");
+        assert_eq!(atts[0].bytes, b"%PDF-1.7 file");
+        assert_eq!(atts[0].mime, "application/pdf"); // 扩展名嗅探
+        assert_eq!(atts[1].filename, "a.pdf");
+        assert_eq!(atts[1].bytes, b"BLOBBYTES");
+        assert_eq!(atts[1].mime, "application/custom"); // 显式优先
+
+        // `../` 越界 → 拒绝（文案给下一步）。
+        let esc =
+            parse_attachment_refs(&json!([{"filename": "e", "path": "../outside.txt"}])).unwrap();
+        let e = resolve_attachments(&reg, Some(&proj), &esc)
+            .await
+            .unwrap_err();
+        assert!(e.contains("附件路径") && e.contains("下一步"), "{e}");
+        // 无 project root（loader 未配置）→ path 附件拒绝。
+        let e = resolve_attachments(&reg, None, &refs).await.unwrap_err();
+        assert!(e.contains("project root"), "{e}");
+        // blob 后端未配置 / 键缺失 → 明确错误。
+        let missing =
+            parse_attachment_refs(&json!([{"filename": "m", "blobKey": "nope"}])).unwrap();
+        let e = resolve_attachments(&reg, None, &missing).await.unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        let empty = blob::BlobRegistry::new();
+        let e = resolve_attachments(&empty, None, &missing)
+            .await
+            .unwrap_err();
+        assert!(e.contains("not configured"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- 6.4：编排（校验 → 附件 → submit） ----------
+
+    fn whitelisted_config() -> MailConfig {
+        MailConfig::new(HashMap::from([(
+            "default".to_string(),
+            MailProfileCfg {
+                allowed_from: vec!["noreply@x.com".into()],
+                allowed_recipients: vec!["@x.com".into()],
+            },
+        )]))
+    }
+
+    fn empty_blobs() -> Arc<crate::bridge::blob::BlobRegistry> {
+        Arc::new(crate::bridge::blob::BlobRegistry::new())
+    }
+
+    /// 正常路：校验通过 → CRLF 剥离 → 地址规范化 → 开关按 op 覆写 → 原样转发给插件。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_normalizes_and_dispatches() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let req = json!({
+            "from": "noreply@x.com",
+            "to": ["a@x.com"],
+            "subject": "hi\r\nBcc: evil@y.com",
+            "headers": {"X-Custom": "v\r\nX-Injected: 1"},
+            "text": "body\r\nline2",
+            "sync": true,          // JS 侧串用：宿主按 op 覆写
+            "enqueue_only": true,
+        })
+        .to_string();
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &req,
+            MailMode::Send,
+        )
+        .await;
+        assert_eq!(env["code"], 0);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "default");
+        let fwd: Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(fwd["subject"], "hiBcc: evil@y.com"); // 剥离而非拒绝（design §10）
+        assert_eq!(fwd["headers"]["X-Custom"], "vX-Injected: 1");
+        assert_eq!(fwd["text"], "body\r\nline2"); // 正文不剥（正文换行有语义）
+        assert_eq!(fwd["sync"], false, "宿主按 op 覆写开关");
+        assert_eq!(fwd["enqueue_only"], false);
+        assert_eq!(fwd["to"][0], "a@x.com");
+    }
+
+    /// 各 mode 的引擎开关：sendSync → sync、enqueue → enqueue_only（两者互斥不叠加）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_sets_engine_flags_per_mode() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let req = json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"}).to_string();
+        let expect = [
+            (MailMode::Send, false, false),
+            (MailMode::Sync, true, false),
+            (MailMode::Enqueue, false, true),
+        ];
+        for (mode, _, _) in expect {
+            handle_send(fake.clone(), empty_blobs(), None, "default", &req, mode).await;
+        }
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3);
+        let flags: Vec<(bool, bool)> = sent
+            .iter()
+            .map(|(_, r, _)| {
+                let v: Value = serde_json::from_str(r).unwrap();
+                (
+                    v["sync"].as_bool().unwrap(),
+                    v["enqueue_only"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let want: Vec<(bool, bool)> = expect.iter().map(|(_, s, e)| (*s, *e)).collect();
+        assert_eq!(flags, want);
+    }
+
+    /// 校验失败一律 `{code:5}` 信封（不 throw）：地址非法 / 白名单未命中 / 未知 profile /
+    /// 缺收件人 / 头名越权 / 附件形态错 / 路径越界。校验优先于后端调用（后端不被触达）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_rejects_with_code5_and_never_touches_backend() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let proj = tmpdir("escape");
+        let cases: Vec<(Value, &str)> = vec![
+            (
+                json!({"from": "not-an-addr", "to": ["a@x.com"], "text": "x"}),
+                "from",
+            ),
+            (
+                json!({"from": "evil@y.com", "to": ["a@x.com"], "text": "x"}),
+                "allowed_from",
+            ),
+            (
+                json!({"from": "noreply@x.com", "to": ["b@evil.com"], "text": "x"}),
+                "allowed_recipients",
+            ),
+            (
+                json!({"from": "noreply@x.com", "to": [], "text": "x"}),
+                "to",
+            ),
+            (json!({"from": "noreply@x.com", "to": ["a@x.com"]}), "正文"),
+            (
+                json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x",
+                       "headers": {"Subject": "hijack"}}),
+                "headers",
+            ),
+            (
+                json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x",
+                       "attachments": [{"filename": "a", "blobKey": "k", "path": "p"}]}),
+                "blobKey",
+            ),
+            (
+                json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x",
+                       "attachments": [{"filename": "a", "path": "../escape.pdf"}]}),
+                "附件路径",
+            ),
+        ];
+        for (req, needle) in cases {
+            let env = handle_send(
+                fake.clone(),
+                empty_blobs(),
+                Some(&proj),
+                "default",
+                &req.to_string(),
+                MailMode::Send,
+            )
+            .await;
+            assert_eq!(env["code"], 5, "{req} → {env}");
+            assert!(
+                env["msg"].as_str().unwrap().contains(needle),
+                "{req} → {env}"
+            );
+        }
+        // 未知 profile（不回落 default：错配的 profile 名必须显式失败）。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "nope",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"}).to_string(),
+            MailMode::Send,
+        )
+        .await;
+        assert_eq!(env["code"], 5, "{env}");
+        assert!(env["msg"].as_str().unwrap().contains("nope"), "{env}");
+        // 非对象请求 / 非法 JSON。
+        for bad in [json!([1, 2]).to_string(), "{not json".to_string()] {
+            let env = handle_send(
+                fake.clone(),
+                empty_blobs(),
+                None,
+                "default",
+                &bad,
+                MailMode::Send,
+            )
+            .await;
+            assert_eq!(env["code"], 5, "{bad} → {env}");
+        }
+        // 一次后端都没触达（校验在前）。
+        assert!(fake.sent.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// sendRaw：`raw` 必填且与 `attachments` 互斥；正文/主题不参与校验；from/to 仍校验。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_raw_requires_raw_and_forbids_attachments() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let req = json!({
+            "from": "noreply@x.com",
+            "to": ["a@x.com"],
+            "raw": "Subject: s\r\nFrom: spoof@evil.com\r\n\r\nbody\r\n",
+        })
+        .to_string();
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &req,
+            MailMode::Raw,
+        )
+        .await;
+        assert_eq!(env["code"], 0);
+        let sent = fake.sent.lock().unwrap().clone();
+        let fwd: Value = serde_json::from_str(&sent[0].1).unwrap();
+        // raw 原文（含换行）原样转发：冲突头剥离是插件的职责。
+        assert!(fwd["raw"].as_str().unwrap().contains("spoof@evil.com"));
+        assert_eq!(fwd["sync"], false);
+        assert_eq!(fwd["enqueue_only"], false);
+
+        // 缺 raw。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"]}).to_string(),
+            MailMode::Raw,
+        )
+        .await;
+        assert_eq!(env["code"], 5);
+        assert!(env["msg"].as_str().unwrap().contains("raw"), "{env}");
+        // raw 与附件互斥。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "raw": "X: 1\r\n\r\nb",
+                    "attachments": [{"filename": "a", "blobKey": "k"}]})
+            .to_string(),
+            MailMode::Raw,
+        )
+        .await;
+        assert_eq!(env["code"], 5);
+        assert!(
+            env["msg"].as_str().unwrap().contains("attachments"),
+            "{env}"
+        );
+        // 结构化 subject 非空 → 覆盖原文 Subject（design §7：结构化为准）。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "subject": "override",
+                    "raw": "Subject: orig\r\n\r\nb"})
+            .to_string(),
+            MailMode::Raw,
+        )
+        .await;
+        assert_eq!(env["code"], 0);
+        let sent = fake.sent.lock().unwrap().clone();
+        let fwd: Value = serde_json::from_str(&sent[1].1).unwrap();
+        assert_eq!(fwd["subject"], "override");
+        assert_eq!(fake.sent.lock().unwrap().len(), 2, "失败路不触达后端");
     }
 }
