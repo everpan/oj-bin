@@ -1631,7 +1631,128 @@ $ python3 -c "d=open('src/bridge/bootstrap.js','rb').read(); print(sum(1 for b i
 5. **`HostContext.log` 上送**（阶段 5 遗留）不在本阶段范围，仍未接。
 
 ### 阶段 7 小结
-（待填）
+
+**结论：端到端可用 —— `smtp:` 段 → `plugin_cfg` 适配器 → 插件 init → 宿主 `build_mail_backend`
+→ `Extras.mail`/`StableState.mail` → JS 全局 `Mail`/`mail` → vtable `submit` → 引擎队列 +
+worker → 真 `.eml` 落盘，全链打通；CI 单一真相源（xtask `PLUGINS`）与文档齐。
+`oj-plugin-ffi` 零改动、`ABI_VERSION` 保持 8；`bootstrap.js` 未动（全局在阶段 6 已挂）。
+`oj/Cargo.toml` version **未动**（版本递增提交 = 发布点，归阶段 8）。**
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `src/config.rs` | `SmtpSection`（`:313`）/`SmtpProfileCfg`（`:330`）/`SmtpXOAuth2Cfg`（`:373`）；`Config.smtp`（`:475`）。**一段两用**：整段 `Serialize` 给插件（空字段 `skip_serializing_if` **省略而非 `null`**——插件侧 `ProfileCfg` 是强类型 `Deserialize`，`null` 直接报错），宿主另经 `MailConfig::from_value` 只吸收 `allowed_*`。 |
+| `oj/src/server_cmd.rs` | `Registries.mail`（`:465`）+ `build_registries` 的单槽探测与多插件冲突 fail-fast（`:596-602`）；`ADAPTER_AXES` 追加 `"mail"`（`:473`）；`plugin_cfg` 增 `"mail"` 适配器臂（`:503`）并提 `pub(crate)`（`:481`，宿主校验面与插件 cfg 同源）。 |
+| `oj/src/app.rs` | `build_mail_backend`（`:313`）；`from_config` 注入两处——`Extras.mail`（`:558`，actor/内省/WS 桥共用）与 `StableState.mail`（`:738`，测试运行时），同一 `Arc`、`bus` 与 `Extras.bus` 同实例（`:506`）。 |
+| `sample/config.yaml` | `smtp:` 段 + `mock` profile（`:52` 起）：`file_transport` 落盘通道 + **显式** `allowed_from`/`allowed_recipients` + `tls: none`/`allow_none_tls: true`；另附注释掉的 `default` 真连样例。 |
+| `oj/tests/mail_e2e.rs`（新增） | 真装配 e2e：`eml_dir:36`（进程内共用落盘目录）/`write_project:81`（config.yaml + `mail` 模块 + 附件）/`boot:147`（`App::from_config`）；两条用例：正例 `:188`、白名单负例 `:234`。 |
+| `tools/xtask/src/main.rs` | `PLUGINS` 追加 `"mail"`（`:37`）；守护断言 `len()==8 → 9`（`:487`）。 |
+| 文档 | `CHANGELIST.md` 新增 v0.1.19 段；`docs/devkit/api-manual.md`（总表 + 「mail」小节）；`docs/user-manual.md` §3；`README.md`；`sample/global.d.ts`（阶段 6 漏掉的类型面）；`docs/devkit/{README,SKILL}.md`；阶段 1 小结 §5 的 6 处陈旧 `AXES` 散文清单。 |
+
+#### 2. 装配点（全链）
+
+```
+config.yaml(smtp:) → only_js::config::SmtpSection
+  → oj/src/server_cmd.rs:503  plugin_cfg("mail")   ← 与 plugins.mail 透传同一回落链
+  → 插件 oj_plugin_init(host, cfg)  ← 同一份 JSON（含凭据，建 transport）
+  → oj/src/server_cmd.rs:602  Registries.mail
+  → oj/src/app.rs:313         build_mail_backend（MailConfig::from_value + FfiMailBackend::new）
+  → oj/src/app.rs:558 Extras.mail  /  oj/src/app.rs:738 StableState.mail
+  → src/bridge/bootstrap.js  globalThis.Mail / mail
+  → src/bridge/mail.rs:815   handle_send（宿主权威校验 → 附件字节 → submit）
+  → plugins/oj-mail vtable submit → MailEngine（有界队列 + worker）→ lettre transport
+```
+
+#### 3. 测试与 RED→GREEN 证据（一律 `--release`）
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| 7.1 配置 RED | `cargo test --release -p only-js --lib config::tests::smtp` | **编译失败** `E0609 no field 'smtp' on type 'config::Config'`（3 处） |
+| 7.1 配置 GREEN | 同上 | **22 passed**（新增 2：多 profile 解析 + 过线 JSON 形态；空段 = `Some` 且序列化 `{}`） |
+| 7.1 适配器 RED | `cargo test --release -p oj --lib server_cmd::tests::plugin_cfg` | **FAILED** `assertion left != right failed: left "{}" right "{}"` |
+| 7.1 适配器 GREEN | 同上 | **2 passed**（另 `cfg_adapters_subset_of_probed_axes` 随 `ADAPTER_AXES` 覆盖 mail） |
+| 7.1 装配 RED | `cargo test --release -p oj --lib mail_assembly` | **编译失败** `E0425 cannot find function 'build_mail_backend'`（5 处） |
+| 7.1 装配 GREEN | 同上 | **3 passed**（注入 + 未配/空段/缺插件 → `None` + 白名单形态错 → 装配期 Err） |
+| 7.2 e2e RED ① | `cargo test --release -p oj --test mail_e2e` | **FAILED. 0 passed; 2 failed** —— `code:5 unknown mail profile 'default'（已知：["mock"]）`（夹具最初用全局 `mail`，profile 名不匹配） |
+| 7.2 e2e RED ② | 同上 | 修夹具后仍 **FAILED. 1 passed; 1 failed** —— `code:1 ffi mail submit: oj-mail: submit not implemented (阶段 2 骨架)`：`bin/plugins` 里的 `libmail.dylib` 是阶段 2 产物，而 **`cargo xtask plugin <name> --check` 只预检不构建**（`main.rs:458`） |
+| 7.2 e2e GREEN | `cargo xtask plugin mail` 后同上 | **2 passed** |
+| 门禁 | `cargo fmt --check` / `cargo clippy --release --all-targets -- -D warnings` | exit 0（0 warning） |
+| 门禁 | `cargo xtask plugin mail --check` | exit 0：`ok: mail 0.1.0 (abi 8)` / `provided axes: [mail]` |
+| 回归 | `cargo test --release -p oj` | 160（lib）+ 3（main）+ 18（e2e）+ **2（mail_e2e）** + 1（oidc_e2e），0 failed |
+| 回归 | `cargo test --release --workspace` | exit 0；31 个测试目标 **745 passed / 0 failed**（唯一 panic 行为 `mini` 夹具的 `entry_panicky` 用例，设计如此） |
+
+**变异验证（2 条，均被 e2e 抓住 —— 证明用例绑住了行为，非恒真）**：
+
+| 变异 | 结果 |
+|---|---|
+| A. 宿主丢附件字节（`mail.rs:343` → `RBytes::from(&[][..])`） | **FAILED. 1 passed; 1 failed**（正例的「原始字节在场 / base64 不在」断言） |
+| B. `check_whitelist` fail-open（`mail.rs:396` 插入 `return Ok(())`） | **FAILED. 1 passed; 1 failed**（负例 code 0 ≠ 5，且 `.eml` 计数断言同时抓到越权信落盘） |
+
+（变异后均已 `cp` 还原并复核 `git diff` 为空、重跑 GREEN。）
+
+#### 4. e2e 关键断言（正例）
+
+- 信封：`code == 0`、`msg == "ok"`、`data.messageId` 非空（投递凭据）、`data.jobId` 非空；
+- 落盘：`<messageId>.eml` 存在（**按投递凭据命名 → 多封信/并发不串**），含
+  `From: noreply@x.com`、`To: a@x.com`、`Subject: oj mail e2e`、`hello from e2e`；
+- 附件：`note.txt` + 原始字节 `OJ-MAIL-E2E-ATTACHMENT-PAYLOAD-42` 在场，其 base64
+  `T0otTUFJTC1FMkUtQVRUQUNITUVOVC1QQVlMT0FELTQy` **不在**（未 base64 化成文本流）；
+- 装配：`app.stable().mail.is_some()`（`Extras.mail` 与 `StableState.mail` 两处注入的证据——
+  后者来自 `from_config`，前者由 actor 桥经 `Extras` 拿到）；
+- 负例：`?from=evil%40y.com` → `code:5`、`msg` 含 `allowed_from` 与 `evil@y.com`，
+  且落盘 `.eml` **数量不变**（宿主权威校验拦下，未触达插件）。
+
+#### 5. 决策与偏差（需 controller 确认）
+
+1. **`smtp:` 声明但未装 `oj-mail` → 不阻断启动**（`build_mail_backend` 返回 `None`，
+   `mail.*` 调用报 `mail not configured`）。任务书明确「插件未加载时为 `None`」，故**未**照
+   es/auth 的 §2 闸门 fail-fast；理由：mail 缺插件不构成**安全失守**（auth/es 是守门/数据面能力），
+   且阶段 6 的 op 错误文案本就同时点名「段缺失 / 插件未装」两种成因。**若要收紧为闸门，
+   阶段 8 加一行即可**（`cfg.smtp.is_some() && registries.mail.is_none()` → `Err`）。
+2. **宿主校验面与插件 cfg 同源**：`build_mail_backend` 吃 `plugin_cfg(cfg,"mail")` 的**同一份 JSON**
+   （而非各自解析 `cfg.smtp`），于是 `plugins.mail` 透传路径下宿主也拿得到 `allowed_*`——
+   否则会出现「插件有 profile、宿主无白名单 → 一律拒绝」的两边分叉。为此 `plugin_cfg` 提 `pub(crate)`。
+3. **`plugin_cfg("mail")` 过线 JSON 里保留 `allowed_*`**（插件 schema 无此字段，`Deserialize`
+   未 deny unknown → 被插件忽略）。这是决策 2 的前提，已在测试里断言其**必须存在**。
+4. **路径更正**：任务书写 `oj/src/config.rs`，实际配置类型在**根 crate** `src/config.rs`
+   （`only_js::config`，`oj` 经 `only_js::config` 引用）。未新建 `oj/src/config.rs`。
+5. **`build_cmd.rs` 内省处不注入 mail**：该处 `Extras` 是 `{ boot, ..Default::default() }` ——
+   `oj build` 内省**不加载任何插件**（es/blob/bus/auth 同样缺席），只读 `.route` 声明，
+   故 `mail` 保持缺省 `None`；阶段 6 也**未**在 `build_cmd.rs` 留 `mail: None` 占位
+   （grep 证实占位只在 `app.rs` 两处）。
+6. **`file_transport` 目录须先存在**（lettre 不建目录）：sample 沿用 design §4 的
+   `/tmp/oj-mail-eml` 并在注释里点明 `mkdir -p`。另 **design §4 的 `mock` 样例省了
+   `host`/`port`/`tls`/`mechanism`，实测插件 `ProfileCfg` 这四个字段必填**（`file_transport`
+   走同一 `Deserialize`），故 sample 的 `mock` 写全（只是不联网）。
+7. **`oj-mail` 引擎是进程级单例**（插件 `MAIL_ENGINE: OnceLock`，**首次 init 钉死
+   `file_transport` 目录**）→ `mail_e2e.rs` 用**单独测试目标** + 进程内串行 + 两用例共用同一
+   落盘目录（与 `oidc_e2e.rs` 独立目标的理由同类）。另记：`cargo xtask plugin <name> --check`
+   只预检不构建，改了插件源码须显式跑 `cargo xtask plugin mail`（本次 RED ② 即踩此坑）。
+8. **文档面比 Task 7.3 清单略有扩大**（均为「列举了全局/配置/插件清单」的同步）：
+   `sample/global.d.ts`（阶段 6 挂全局时漏了类型面，而 api-manual 声称 d.ts 是类型权威）、
+   `docs/devkit/{README,SKILL}.md` 全局清单、`docs/user-manual.md` §3 配置参考（新顶层段）、
+   阶段 1 小结 §5 **明列归阶段 7** 的 6 处陈旧 `AXES` 散文清单（并订正过期行号 `:428`→`:432`）。
+   `CLAUDE.md` 被 `.gitignore` 忽略（`git check-ignore` 证实）→ 其订正**仅本地生效、不入提交**。
+9. **CI**：只改 `tools/xtask/src/main.rs` 的 `PLUGINS`（+ 守护断言 8→9）；
+   `.github/workflows/*.yml` **未动**（不硬编码插件名，注释明记「硬编码曾漏 auth」的教训）。
+
+#### 6. 提交
+
+| SHA | 信息 |
+|---|---|
+| `185c0a3` | `feat(server): mail 装配（smtp: 段 + plugin_cfg 适配器 + Extras.mail 注入）` |
+| `4756ecd` | `test(mail): FileTransport 端到端（真装配 + 真 .eml 落盘）` |
+| `cfeee76` | `docs(mail): CHANGELIST/api-manual/README + xtask PLUGINS 覆盖` |
+
+#### 7. 遗留 / 交给阶段 8
+
+1. §5 决策 1 若收紧为「声明即闸门」，加装配期 `Err` + 回归用例（一行改动）。
+2. 「宿主放行 ≡ 插件放行」的地址口径回归（阶段 6 §8.2 遗留）→ Task 8.1 用例。
+3. `HostContext.log` 上送仍未接（阶段 5 遗留，不在本特性范围）。
+4. `mail.result` 跨进程反馈（分布式 bus）仍限本地扇出（阶段 6 §8.4 记录，YAGNI）。
+5. `oj build` 内省桥无 mail（同无 es/blob/bus/auth）——若将来 handler 在**内省期**就用 mail，
+   需给 `build_cmd` 的内省 `Extras` 补插件装配（当前无此需求）。
 
 ### 阶段 8 小结
 （待填）
