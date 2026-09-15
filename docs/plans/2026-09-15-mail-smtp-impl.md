@@ -1056,7 +1056,103 @@ EXIT=0
 
 
 ### 阶段 3 小结
-（待填）
+
+**结论：配置 → profile 通路可用（tls 三模式 + `none` fail-closed + xoauth2 静态令牌），
+`build_profiles` 的 provider 时序与 `pool` 运行时约束均落实并有测试钉死；`submit` 仍显式报错（阶段 4）。**
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `plugins/oj-mail/src/config.rs`（新增） | `MailConfig`（`workers`=4 / `queue_capacity`=256 / `#[serde(flatten)] profiles: HashMap<String, ProfileCfg>`——**顶层每个剩余键即 profile**，写错的键会因缺必填字段报错而非被忽略）、`TlsMode{tls,starttls,none}`、`Mechanism{login,xoauth2}`、`ProfileCfg`（host/port/tls/allow_none_tls/mechanism/user/pass/xoauth2/timeout=30/file_transport）、`XOAuth2Cfg`。`MailConfig::parse` + `ProfileCfg::validate`：`tls: "none"` 未显式 `allow_none_tls: true` → Err（文案点明开关）；`login` 只给半份凭据 → Err（半份凭据必是笔误）；`xoauth2` 缺 user/凭据块 → Err。 |
+| `plugins/oj-mail/src/config.rs` | `XOAuth2Cfg::static_token()`：只给 `refresh_token`（或 `access_token` 为空串）→ `Err("xoauth2 刷新暂未支持，请提供 access_token")`（fail-loud，不静默降级为无凭据投递）。 |
+| `plugins/oj-mail/src/lib.rs` | `install_crypto_provider()`（幂等，忽略 `Err(已装)`）；`build_profiles()`（**首语句**装 provider → 逐 profile 复校验 + 构建，错误串含 profile 名）；`AsyncMailTransport{Smtp,File}` / `SyncMailTransport{Smtp,File}` 形态枚举 + `MailProfile{async_transport,sync_transport}`（`Arc`）；`build_tls()`（tls→`Wrapper`、starttls→`Required`、none→`None`）；`credentials()`（login→`Credentials::new`+`vec![Login]`；xoauth2→静态 token + `vec![Xoauth2]`；两者皆缺=无认证中继，不下发认证机制）；`init` 改为**解析并校验配置**（坏配置 → `Err` 让装载失败）+ 存入 `OnceLock<MailConfig>` 供阶段 4。 |
+| `src/bridge/mod.rs:339` | 阶段 0 遗留 2：订正过时注释（原文称「reqwest 系又启 ring」——实测全图 rustls 只启用 `aws_lc_rs`）。**仅注释**。 |
+
+#### 2. 跑过的测试与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --release -p oj-mail builds_file_transport_profile_after_installing_provider` | **1 passed; 0 failed**（含真投递：写出 `.eml` 并读回校验原文；sync 路同验） |
+| `cargo test --release -p oj-mail` | **22 passed; 0 failed**（`config::tests` 10 + `tests` 12） |
+| `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | exit 0，0 warning |
+| `cargo fmt --check` | exit 0 |
+| `cargo xtask plugin mail --check` | 见 §5（ABI 8 / 身份 / 符号） |
+
+TDD 节奏：Task 3.1 先落测试跑出 `E0599 no associated function 'parse'`（13 处），再实现转绿；
+Task 3.2 先落测试跑出 `E0308`（SMTP/file 两路 `send_raw` 的 Ok 类型不同）/ `E0277`（`MailProfile`
+未实现 `Debug`，改测试侧 helper `expect_build_err`），再实现转绿。
+
+#### 3. provider 时序（硬约束 1）如何保证
+
+- **结构性保证**：`build_profiles` 的第一条语句是 `install_crypto_provider()`，其后才可能触碰
+  `build_tls` → `TlsParameters::new`（lettre 的 `relay`/`starttls_relay` 内部同样先调它；
+  该调用**立即**构建 rustls `ClientConfig`）。代码位置单一，无需跨函数推断。
+- **可观测证据**：新增 `provider_install_is_on_build_path_in_fresh_process`——**子进程**
+  （`current_exe --exact <child>`，rustls 默认 provider 是进程级全局、**无卸载 API**，只有新进程
+  才能观测起点）断言「起点无默认 provider → 调 `build_profiles` → 默认 provider 已装，且
+  `kx_groups[0]` 与 `aws_lc_rs::default_provider()` **指针相等**（与框架 `ws_client_extensions`
+  同源实例）」。该子进程机制经**变异验证**：把子进程断言写反 → 父用例即失败（证明 env 传递与
+  真断言确实生效，不是空跑）。
+- **诚实边界**：单进程内**无法**反证「install 晚于 transport 构建」——方案 B 下 lettre 自带
+  aws-lc-rs 回落，漏装既不 panic 也仍能建 ClientConfig（rustls 也没提供「provider 未装」的可观测
+  信号）。故此处钉的是「install 在构建路径上 + 落 aws-lc-rs 同源实例」，顺序由代码结构保证。
+- 另一条硬约束 1 的行为面用例 `tls_relay_profile_builds_after_provider_install` 走隐式 TLS 全路径
+  构建，**无 panic**、返回 `Smtp` 形态 profile。
+
+#### 4. `pool` 运行时约束（硬约束 2）如何保证
+
+- 所有触碰 SMTP transport 的用例一律 `#[tokio::test(flavor = "multi_thread")]`（池 Drop 要
+  `tokio::spawn`）；file 通道无池，同样在 runtime 内跑，不与无 runtime `fn` 混。
+- **`init` 刻意不建 transport**（与任务书「init 调 build_profiles」的最小差异，见 §5.3）：`init`
+  是插件装载期的**同步**调用，未必处于 tokio runtime 上下文；若在此建 transport，`init` 返回时
+  transport 立即被 Drop → 无 runtime 即 abort。故 `init` 只解析/校验/存配置，transport 的
+  创建/使用/销毁统一归阶段 4 的 `MailEngine`（自建 multi_thread runtime，在其内调 `build_profiles`）。
+- 子进程用例里显式 `Builder::new_multi_thread().enable_all()` + `rt.block_on(...)` + 在 runtime 内
+  `drop(profiles)`，即生产侧调用形态的缩影。
+
+#### 5. lettre 0.11.23 实际 API 与计划稿的偏差（均按实测落地，未弱化断言）
+
+1. **`Credentials::from_xoauth2` 不存在**（任务书指定）。读 `lettre-0.11.23/src/transport/smtp/
+   authentication.rs`：只有 `Credentials::new(username, secret)` + `From<(S,T)>`；XOAUTH2 的
+   `Mechanism::Xoauth2::response` 直接用 `secret` 作 Bearer token。故实现为
+   `Credentials::new(user, access_token)` **并且**显式
+   `.authentication(vec![Mechanism::Xoauth2])`（否则 lettre 默认机制是 PLAIN+LOGIN，会拿 token
+   当口令使）。语义与任务书一致（仅静态 token；只给 refresh_token → 明确 Err）。
+2. **file transport 是两套独立类型**：`lettre::transport::file::FileTransport`（impl `Transport`，
+   Ok=`String` id）与 `AsyncFileTransport<E: Executor>`（impl `AsyncTransport`）。二者**不是**同一
+   泛型的两态，故 `MailProfile` 无法用单一 `Arc<SmtpTransport>` 字段同时承载，改为
+   `AsyncMailTransport{Smtp,File}` / `SyncMailTransport{Smtp,File}` 枚举 + `send_raw` 派发
+   （信封 = `lettre::address::Envelope`）。`SmtpTransport` 的 Ok 是 `Response`（多行应答）、
+   file 的 Ok 是落盘 id，已在派发处归一为 `String`（SMTP=应答文本，file=id，即阶段 5 结果信封的素材）。
+3. `init` 不建 transport（见 §4）——任务书原文允许「可先调用它但暂不持有引擎」，此处取**更保守**的
+   一种：连建都不建，把构建留在 `MailEngine` 的 runtime 内。
+4. 测试目录用 `std::env::temp_dir()/oj-mail-test-<pid>-<tag>`（任务书示例写死 `/tmp/oj-mail-eml`）：
+   避免并发/重复跑互相覆盖，跑完 `remove_dir_all`，不污染 `sample/`。
+5. 补了两条 fail-loud 校验（任务书未要求、但属「配置是系统边界」的正常校验）：`login` 半份凭据、
+   `access_token` 空串。
+6. `build_profiles` 会**再次**调用 `ProfileCfg::validate`（规则不写第二份）：`MailConfig` 的字段是
+   `pub` 且实现 `Deserialize`，直接 `serde_json::from_str` 的配置会绕过 `parse`——用例
+   `build_profiles_revalidates_plaintext_bypassing_parse` 钉死这条防线。
+
+#### 6. 提交粒度偏差（有实证）
+
+计划要求 Task 3.1 / Task 3.2 各一次提交。实测**不可行**：`config.rs` 的类型字段（`ProfileCfg` 的
+`host`/`port`/`tls`/… ）在 `build_profiles` 消费它们之前**无人读取**——`mod config;` 是私有模块，
+`pub` 字段不豁免 dead-code 分析。把「只落 `config.rs` + `mod config;`」的中间态跑门禁，实测
+`cargo clippy --release -p oj-mail --all-targets -- -D warnings` 报 **10 条 dead-code 错误**
+（`could not compile oj-mail (lib) due to 10 previous errors`），即中间提交**不绿**。
+故本阶段落**一次代码提交**（配置解析与 transport 构建互为因果、本就是一个可编译单元）
+\+ 一次文档提交（本小结），而非按任务书硬拆。
+
+#### 7. 遗留 / 转下阶段
+
+1. `submit` 仍是显式骨架错误（`not implemented`），阶段 4 接 `MailEngine`（有界队列 + worker），
+   在自建 runtime 内调 `build_profiles`，并从 `MAIL_CFG` 取 `workers`/`queue_capacity`。
+2. xoauth2 **刷新流程**（`refresh_token` → 换 token）未实现，当前 fail-loud；如需支持单列任务。
+3. `file_transport` 的落盘 id 无 `.json` 信封（未启 lettre `file-transport-envelope` feature）；
+   e2e（阶段 7）若需校验信封内容，届时再评估是否加 feature。
+4. 阶段 7 的配置登记：`plugin_cfg`/`config.rs` 的 `mail` 段、`xtask PLUGINS` 见阶段 1 小结 §6。
 
 ### 阶段 4 小结
 （待填）
