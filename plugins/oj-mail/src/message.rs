@@ -6,9 +6,15 @@
 //!   `headers`/`attachments` → `lettre::Message`（text+html → `multipart/alternative`；
 //!   有附件 → 外层 `multipart/mixed`）。信封（MAIL FROM / RCPT TO）由 lettre 从报头派生
 //!   （To ∪ Cc ∪ Bcc；`Bcc` 报头在派生后按 lettre 默认丢弃 → 收件人可见性正确）。
-//! - **原文投递**（[`build_raw`]）：`raw` 是调用方自备的 RFC5322 原文，**字节原样**送出，
-//!   仅剥离冲突头（见下）。**不**经 lettre 的 MIME 组装 —— `Message::body` 会按「最优编码」
-//!   重编码（行 ≥76 字节即改用 quoted-printable/base64），已编码的 multipart 原文会被改烂。
+//! - **原文投递**（[`build_raw`]）：`raw` 是调用方自备的 RFC5322 原文，由本模块拼出最终字节。
+//!   **只剥离信封头 `From`/`To`/`Cc`/`Bcc`**（信封的权威来源是结构化 `from`/`to`，原文里这些
+//!   头留着就能造出双收件人 / 发件人 spoof，含折行续行一并丢弃）；`Subject` **保留**（非信封
+//!   字段，剥它只会丢主题），但做 CRLF 校验，且**结构化 `subject` 非空时覆盖原文 Subject**。
+//!   其余头与正文逐字节保留（仅行尾归一 CRLF，见 [`build_raw`] 的说明）。**不**经 lettre 的
+//!   MIME 组装 —— `Message::body` 会按「最优编码」重编码正文（行 ≥76 字节即改用
+//!   quoted-printable/base64），已编码的 multipart 原文会被改烂。
+//!
+//! 决策依据：设计 §7/§11（2026-09-15 controller 决策 —— `Subject` 非信封字段，不剥离）。
 //!
 //! ## 附件对齐契约（宿主 ↔ 插件）
 //!
@@ -31,15 +37,22 @@
 //! 覆盖 `From`/`To`/`Cc`/`Bcc`/`Subject` —— 否则可绕过宿主的收件人白名单（信封由报头派生）。
 
 use lettre::address::{Address, Envelope};
-use lettre::message::header::{ContentType, HeaderName, HeaderValue};
+use lettre::message::header::{ContentType, HeaderName, HeaderValue, Headers, Subject};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart};
 use oj_plugin_ffi::MailAttachment;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// raw 路必须剥离的冲突头（**大小写不敏感**）：信封/主题的权威来源是结构化字段，
-/// 原文里的这些头留着就能造出「双收件人 / 发件人 spoof / 主题错配」。
-const CONFLICTING_HEADERS: [&str; 5] = ["from", "to", "cc", "bcc", "subject"];
+/// raw 路必须剥离的**信封头**（**大小写不敏感**）：信封（MAIL FROM / RCPT TO）的权威来源是
+/// 结构化 `from`/`to`，原文里这些头留着就能造出「双收件人 / 发件人 spoof」。
+///
+/// `Subject` **不在**此列：它不是信封字段，剥掉只会让邮件丢主题；原文 Subject 的注入面由
+/// CRLF 校验覆盖（见 [`build_raw`]）。
+const ENVELOPE_HEADERS: [&str; 4] = ["from", "to", "cc", "bcc"];
+
+/// 结构化字段权威、**不允许** `headers` 覆盖的头（含 `Subject`：主题由 `subject` 决定）。
+/// 组装路的信封是 lettre **由报头派生**的，允许覆盖 = 绕过宿主收件人白名单的面。
+const STRUCTURED_HEADERS: [&str; 5] = ["from", "to", "cc", "bcc", "subject"];
 
 /// 附件未给 MIME 且宿主未解析出时的兜底类型。
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -269,7 +282,7 @@ fn mailbox(src: &str, field: &str) -> Result<Mailbox, String> {
 fn custom_header(name: &str, value: &str) -> Result<HeaderValue, String> {
     ensure_no_crlf(name, "headers 名称")?;
     ensure_no_crlf(value, "headers 值")?;
-    if CONFLICTING_HEADERS
+    if STRUCTURED_HEADERS
         .iter()
         .any(|h| name.eq_ignore_ascii_case(h))
     {
@@ -285,10 +298,18 @@ fn custom_header(name: &str, value: &str) -> Result<HeaderValue, String> {
     Ok(HeaderValue::new(n, value.to_string()))
 }
 
-/// raw 路：剥离冲突头后的**最终 RFC5322 字节**（信封由调用方另行交给 transport）。
+/// raw 路：剥离信封头后的**最终 RFC5322 字节**（信封由调用方另行交给 transport）。
 ///
-/// 与 [`build_message`] 不同，这里不经 lettre 组装：原文（除冲突头与行尾）逐字节保留。
+/// 与 [`build_message`] 不同，这里不经 lettre 组装：原文（除信封头与行尾）逐字节保留。
 /// 失败一律 `Err(原因 + 下一步)`（由 `engine` 映射为 `code:5`）。
+///
+/// ## 头语义（设计 §7/§11，2026-09-15 决策）
+///
+/// - `From`/`To`/`Cc`/`Bcc`：**一律剥离**（含折行续行），报头改由结构化信封重建 —— 防双收件人 /
+///   发件人 spoof；SMTP 信封（MAIL FROM / RCPT TO）本就只认结构化 `from`/`to`。
+/// - `Subject`：**保留**（非信封字段）。`subject` 非空 ⇒ 以它为准**覆盖**（原文 Subject 行连同
+///   其折行续行整行丢弃，最终只有一个 Subject 头）；`subject` 为空 ⇒ 原文 Subject 原样保留。
+/// - 其余头与正文逐字节保留，但原文 Subject 值要过 CRLF 校验（裸 CR = 头注入面 ⇒ `Err`）。
 ///
 /// ## 为什么不让 lettre 组装 raw
 ///
@@ -305,6 +326,7 @@ fn custom_header(name: &str, value: &str) -> Result<HeaderValue, String> {
 pub fn build_raw(
     envelope: &Envelope,
     raw: &str,
+    subject: &str,
     atts: &[MailAttachment],
 ) -> Result<Vec<u8>, String> {
     // vtable 契约：raw 给定时宿主不解析附件（atts 必为空）。非空 = 调用方把两条路混用了。
@@ -317,14 +339,20 @@ pub fn build_raw(
     let from = envelope
         .from()
         .ok_or_else(|| "raw 路缺少信封发件人（MAIL FROM）：请给出结构化 from".to_string())?;
+    if !subject.is_empty() {
+        ensure_no_crlf(subject, "subject")?;
+    }
     let (head, body) = split_head_body(raw);
 
     let mut out = String::with_capacity(raw.len() + 96);
-    // 报头自结构化信封重建（原文的 From/To/Cc/Bcc/Subject 已剥离 → 不存在双收件人/spoof）。
+    // 报头自结构化信封重建（原文的 From/To/Cc/Bcc 已剥离 → 不存在双收件人/spoof）。
     out.push_str(&format!("From: {from}\r\n"));
     let rcpt: Vec<String> = envelope.to().iter().map(Address::to_string).collect();
     out.push_str(&format!("To: {}\r\n", rcpt.join(", ")));
-    for line in kept_header_lines(head) {
+    if !subject.is_empty() {
+        out.push_str(&subject_header(subject));
+    }
+    for line in kept_header_lines(head, subject.is_empty())? {
         out.push_str(line);
         if !line.ends_with('\n') {
             out.push('\n'); // 无空行的「全是头」原文：补上行尾，别把正文粘到最后一个头上
@@ -335,32 +363,59 @@ pub fn build_raw(
     Ok(normalize_crlf(&out).into_bytes())
 }
 
-/// 头部区中**保留**的行（含原行尾）：剥离冲突头，其余头（及其折行续行）原样保留。
+/// 用 lettre 的头编码器产出 `Subject: <encoded>\r\n`（RFC2047 编码 + 折行都由 lettre 负责）。
 ///
-/// 折行（continuation，行首为空格/TAB）归属**上一个头**：上一个头被剥离时，它的续行一并
+/// 复用 `Headers` 而非手写编码：与组装路同一套实现，避免出现第二份 RFC2047 逻辑。
+fn subject_header(value: &str) -> String {
+    let mut headers = Headers::new();
+    headers.set(Subject::from(value.to_string()));
+    headers.to_string()
+}
+
+/// 头部区中**保留**的行（含原行尾）：剥离信封头，其余头（及其折行续行）原样保留。
+///
+/// 折行（continuation，行首为空格/TAB）归属**上一个头**：上一个头被丢弃时，它的续行一并
 /// 丢弃 —— 否则续行会变成无主行（既可能被收件端当成前一个保留头的续行，也可能孤零零
 /// 触发解析错误）。
-fn kept_header_lines(head: &str) -> Vec<&str> {
+///
+/// `keep_subject` = 结构化 `subject` 为空：为真时原文 Subject（含折行续行）保留并要求通过
+/// CRLF 校验；为假时原文 Subject 整段丢弃（让结构化值成为唯一的 Subject）。
+fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String> {
     let mut kept = Vec::new();
     let mut keep_prev = false;
+    let mut prev_is_subject = false;
     for line in head.split_inclusive('\n') {
         let bare = bare_line(line);
         if bare.starts_with(' ') || bare.starts_with('\t') {
             if keep_prev {
+                if prev_is_subject {
+                    // 续行同样可能夹带裸 CR（行扫描只认 `\n`）—— 保留它就等于保留注入面。
+                    ensure_no_crlf(bare, "raw Subject")?;
+                }
                 kept.push(line);
             }
             continue;
         }
-        // `Name: value` → 取 `Name`；无冒号的行无从判定冲突，按「保留」处理（不猜不吞）。
+        // `Name: value` → 取 `Name`；无冒号的行无从判定，按「保留」处理（不猜不吞）。
         let name = bare.split(':').next().unwrap_or(bare);
-        keep_prev = !CONFLICTING_HEADERS
-            .iter()
-            .any(|h| name.eq_ignore_ascii_case(h));
+        prev_is_subject = name.eq_ignore_ascii_case("subject");
+        keep_prev = if prev_is_subject {
+            if keep_subject {
+                ensure_no_crlf(bare, "raw Subject")?;
+                true
+            } else {
+                false
+            }
+        } else {
+            !ENVELOPE_HEADERS
+                .iter()
+                .any(|h| name.eq_ignore_ascii_case(h))
+        };
         if keep_prev {
             kept.push(line);
         }
     }
-    kept
+    Ok(kept)
 }
 
 /// 头部区与正文的分界 = 首个空行。返回 `(头部区, 正文)`；无空行 ⇒ 全是头、无正文。
@@ -661,25 +716,36 @@ mod tests {
         assert!(e.from().is_some());
     }
 
-    // ---- Task 5.2：raw 冲突头剥离 ----
+    // ---- Task 5.2：raw 信封头剥离（controller 决策 2026-09-15：**只剥信封头**，Subject 保留）----
 
+    /// raw 路的剥离范围 = **信封头** `From`/`To`/`Cc`/`Bcc`（大小写不敏感）；`Subject` 不是信封
+    /// 字段，**保留**（剥它只会让邮件丢主题），其折行续行同样保留；其余头与正文不动。
     #[test]
-    fn raw_strips_from_to_cc_bcc_subject_case_insensitively() {
-        let raw = "From: evil@x\nTo: victim@x\nSUBJECT: spoof-subject\nCc: c@x\nX-Keep: 1\n\nbody";
-        let m = build_raw(&envelope(), raw, &[]).expect("剥离");
+    fn raw_strips_envelope_headers_but_keeps_subject_and_body() {
+        let raw = "FROM: evil@x\nTo: victim@x\nCc: c@x\nBCC: b@x\nSUBJECT: raw-sub\n  folded\nX-Keep: 1\n\nbody";
+        let m = build_raw(&envelope(), raw, "", &[]).expect("剥离");
         let s = String::from_utf8(m).expect("UTF-8");
+        let low = s.to_lowercase();
         assert!(
-            s.contains("X-Keep: 1") && s.contains("body"),
-            "其余头与正文保留: {s}"
+            low.contains("subject: raw-sub") && s.contains("folded"),
+            "原文 Subject（含折行续行）必须保留: {s}"
+        );
+        assert_eq!(
+            low.matches("subject:").count(),
+            1,
+            "结构化为空时不得凭空多出 Subject 头: {s}"
         );
         assert!(
             !s.contains("evil@x") && !s.contains("victim@x"),
-            "原文冲突头已剥离: {s}"
+            "原文信封头已剥离: {s}"
         );
-        assert!(!s.contains("c@x"), "原文 Cc 已剥离: {s}");
         assert!(
-            !s.to_lowercase().contains("subject:"),
-            "原文 Subject 行（含大小写变体）必须整行剥离: {s}"
+            !s.contains("c@x") && !s.contains("b@x"),
+            "原文 Cc/Bcc 已剥离: {s}"
+        );
+        assert!(
+            s.contains("X-Keep: 1") && s.contains("body"),
+            "其余头与正文保留: {s}"
         );
         assert!(
             s.contains("From: from@example.com") && s.contains("To: to@example.com"),
@@ -687,10 +753,60 @@ mod tests {
         );
     }
 
+    /// 原文 `Subject` 里的裸 CR（行扫描不会把它当行界，但它是头注入面）必须按既有 CRLF 口径拒绝。
+    #[test]
+    fn raw_rejects_crlf_injection_in_raw_subject() {
+        let raw = "Subject: a\rBcc: victim@x\n\nbody";
+        let e = build_raw(&envelope(), raw, "", &[]).expect_err("原文 Subject 含 CR 必须 Err");
+        assert!(e.contains("CR/LF"), "错误须点明头注入: {e}");
+    }
+
+    /// 结构化 `subject` 非空 ⇒ **覆盖**原文 Subject：最终只有一个 Subject 头，值 = 结构化值，
+    /// 原文 Subject 行连同其折行续行整行丢弃。
+    #[test]
+    fn raw_structured_subject_overrides_raw_subject() {
+        let raw = "Subject: raw-sub\n  folded-leak\nX-Keep: 1\n\nbody";
+        let s = String::from_utf8(build_raw(&envelope(), raw, "struct-sub", &[]).expect("组装"))
+            .expect("UTF-8");
+        let low = s.to_lowercase();
+        assert!(
+            s.contains("Subject: struct-sub"),
+            "结构化 subject 生效: {s}"
+        );
+        assert!(
+            !s.contains("raw-sub") && !s.contains("folded-leak"),
+            "原文 Subject 及其折行续行必须整段丢弃: {s}"
+        );
+        assert_eq!(
+            low.matches("subject:").count(),
+            1,
+            "最终只能有一个 Subject 头: {s}"
+        );
+        assert!(s.contains("X-Keep: 1") && s.contains("body"), "{s}");
+    }
+
+    /// 结构化 `subject` 含 CR/LF 同样拒绝（头注入纵深防线）；非 ASCII 值由 lettre 做 RFC2047 编码。
+    #[test]
+    fn raw_rejects_crlf_in_structured_subject_and_encodes_non_ascii() {
+        let e = build_raw(&envelope(), "X-Keep: 1\n\nbody", "s\r\nBcc: victim@x", &[])
+            .expect_err("结构化 subject 含 CRLF 必须 Err");
+        assert!(e.contains("CR/LF"), "{e}");
+
+        let s = String::from_utf8(
+            build_raw(&envelope(), "X-Keep: 1\n\nbody", "结构主题", &[]).expect("组装"),
+        )
+        .expect("UTF-8");
+        assert!(
+            s.contains("Subject: =?utf-8?") && !s.contains("结构主题"),
+            "非 ASCII 主题应经 RFC2047 编码: {s}"
+        );
+    }
+
     #[test]
     fn raw_strips_folded_continuation_of_stripped_header_only() {
         let raw = "X-Fold: a\n  keep-me\nFrom: evil@x\n\tleak-me\nX-Two: 2\n\nbody";
-        let s = String::from_utf8(build_raw(&envelope(), raw, &[]).expect("剥离")).expect("UTF-8");
+        let s =
+            String::from_utf8(build_raw(&envelope(), raw, "", &[]).expect("剥离")).expect("UTF-8");
         assert!(
             s.contains("X-Fold: a") && s.contains("keep-me"),
             "保留头的折行保留: {s}"
@@ -702,7 +818,8 @@ mod tests {
     #[test]
     fn raw_normalizes_lone_lf_to_crlf_and_keeps_body_otherwise_verbatim() {
         let raw = "X-A: 1\n\nline1\n.\nline2";
-        let s = String::from_utf8(build_raw(&envelope(), raw, &[]).expect("剥离")).expect("UTF-8");
+        let s =
+            String::from_utf8(build_raw(&envelope(), raw, "", &[]).expect("剥离")).expect("UTF-8");
         assert!(s.contains("X-A: 1\r\n"), "头行归一为 CRLF: {s}");
         assert!(
             !s.contains("\n.\n"),
@@ -717,6 +834,7 @@ mod tests {
         let e = build_raw(
             &envelope(),
             "X-A: 1\n\nb",
+            "",
             &[att("a.pdf", "application/pdf", b"x")],
         )
         .expect_err("raw 与附件互斥");
@@ -724,15 +842,15 @@ mod tests {
 
         let senderless = Envelope::new(None, vec![addr("to@example.com")]).expect("信封");
         assert!(
-            build_raw(&senderless, "X-A: 1\n\nb", &[]).is_err(),
+            build_raw(&senderless, "X-A: 1\n\nb", "", &[]).is_err(),
             "缺发件人必须 Err"
         );
     }
 
     #[test]
     fn raw_without_blank_line_keeps_headers_and_empty_body() {
-        let s =
-            String::from_utf8(build_raw(&envelope(), "X-A: 1", &[]).expect("剥离")).expect("UTF-8");
+        let s = String::from_utf8(build_raw(&envelope(), "X-A: 1", "", &[]).expect("剥离"))
+            .expect("UTF-8");
         assert!(
             s.contains("X-A: 1\r\n\r\n"),
             "无空行时按「全是头、空正文」处理: {s}"

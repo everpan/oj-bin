@@ -30,8 +30,10 @@ pub struct MailVtable {
     ///   - `enqueue_only: bool`：`true` 时本 future 只立即回 `{"jobId":"..."}`（入队即返回，
     ///     真实投递结果经 `HostContext.deliver("mail.result", ...)` 上送）；`false` 时本
     ///     future 的 resolve 值就是投递结果信封；
-    ///   - `raw: Option<String>`：给定时按**原始 MIME** 投递（此时 `subject`/`text`/`html`
-    ///     等组装字段被忽略，与 `req` 其余字段冲突的头由宿主剥离）；
+    ///   - `raw: Option<String>`：给定时按**原始 MIME** 投递（`text`/`html`/`headers` 等组装
+    ///     字段被忽略）。原文的 `From`/`To`/`Cc`/`Bcc` 头一律剥离（信封只认结构化
+    ///     `from`/`to`，防双收件人/spoof）；`Subject` **保留**，但结构化 `subject` 非空时以它
+    ///     为准覆盖；行尾归一 CRLF，正文其余字节原样送出（design §7/§11）；
     ///   - 其余组装字段（`from`/`to[]`/`cc[]`/`bcc[]`/`subject`/`text?`/`html?`/`headers{}`/`jobId`）。
     /// - `atts` = 附件表（**与 `raw` 互斥**：`raw` 给定时宿主不解析附件，`atts` 为空）。
     ///   字节是宿主解析好的**原始字节**，插件直接喂 lettre，不做 base64 往返。
