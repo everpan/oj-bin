@@ -1282,15 +1282,17 @@ drop runtime）。本期 `submit` 只走「原始 MIME」路（`raw`），消息
 ### 阶段 5 小结
 
 **结论：`req.raw` 与结构化组装两条投递路都落地，附件字节从 vtable 原样消费（无 base64 往返），
-raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSION` 保持 8。**
-`cargo test --release -p oj-mail` **54 passed / 0 failed**；`fmt` 与 `clippy --all-targets -D warnings` 均 exit 0。
+raw **只剥信封头**（`From`/`To`/`Cc`/`Bcc`，含折叠头归属）、`Subject` 保留/结构化非空则覆盖
+（§9 修正）；`oj-plugin-ffi` 仅注释同步（`repr(C)` 零改动）、`ABI_VERSION` 保持 8。**
+`cargo test --release -p oj-mail` **58 passed / 0 failed**（含 §9 的 Subject 语义修正）；`fmt` 与
+`clippy --all-targets -D warnings` 均 exit 0。
 
 #### 1. 改了什么
 
 | 文件 | 要点 |
 |---|---|
 | `plugins/oj-mail/src/message.rs`（新增，`mod message;`） | `SendRequest`/`AttachmentRef`（serde，含 `blobKey` rename）；`envelope_of`（结构化 `from`/`to` → 信封，从阶段 4 的 `deliver_input` 抽出）；`build_message`（结构化 → `lettre::Message`）；`build_raw`（raw → 剥离冲突头后的最终字节）；辅助 `align_attachments`/`attachment_part`/`mailbox`/`custom_header`/`ensure_no_crlf`/`kept_header_lines`/`split_head_body`/`bare_line`/`normalize_crlf`。 |
-| `plugins/oj-mail/src/engine.rs` | `Req` 改为「引擎开关（`sync`/`enqueue_only`/`jobId`）+ `#[serde(flatten)] message: SendRequest`」；`deliver_input` 由 raw-only 改为两路分派（`:496`）；raw 分支拒结构化 cc/bcc（`:501`）与附件（refs/bytes 两侧）；raw 分支调 `build_raw`（`:515`）；组装分支调 `build_message` 并用 lettre 派生的信封（`:518`）。新增 5 条用例（`:864` 起）。 |
+| `plugins/oj-mail/src/engine.rs` | `Req` 改为「引擎开关（`sync`/`enqueue_only`/`jobId`）+ `#[serde(flatten)] message: SendRequest`」；`deliver_input` 由 raw-only 改为两路分派（`:497`）；raw 分支拒结构化 cc/bcc（`:502`）与附件（refs/bytes 两侧）；raw 分支调 `build_raw`（`:517`，传结构化 `subject`）；组装分支调 `build_message` 并用 lettre 派生的信封（`:520`）。新增 6 条用例（`:864` 起）。 |
 | `plugins/oj-mail/src/lib.rs` | 模块头更新（两条路都落地）；入口守卫用例的 req 由 `{}` 改为合法形态（理由见 §7.3）。 |
 
 组装规则（`build_message`，`:122`）：`text`+`html` → `MultiPart::alternative_plain_html`；仅其一 →
@@ -1306,7 +1308,8 @@ raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSIO
 | `cargo test --release -p oj-mail --lib path_`（实现前，RED） | **FAILED. 1 passed; 4 failed** —— 信封 `{"code":5,...,"msg":"阶段 5：…未实现"}` |
 | `cargo test --release -p oj-mail --lib attachment_count`（实现前，RED） | **FAILED. 0 passed; 2 failed**（message + engine 两侧） |
 | `cargo test --release -p oj-mail`（5.1 后） | **47 passed; 0 failed** |
-| `cargo test --release -p oj-mail`（5.2 后，最终） | **54 passed; 0 failed**（`config` 10 + `engine` 15 + `message` 17 + lib 12） |
+| `cargo test --release -p oj-mail`（5.2 后） | **54 passed; 0 failed**（`config` 10 + `engine` 15 + `message` 17 + lib 12） |
+| `cargo test --release -p oj-mail`（**§9 修正后，当前**） | **58 passed; 0 failed**（新增 4 条 Subject 语义用例） |
 | `cargo fmt --check` / `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | 均 exit 0（0 warning） |
 | `cargo xtask plugin mail --check` | `ok: mail 0.1.0 (abi 8)` / `provided axes: [mail]` |
 | `grep -n "ABI_VERSION: u32" oj-plugin-ffi/src/lib.rs` | `49:pub const ABI_VERSION: u32 = 8;`（未改） |
@@ -1339,15 +1342,23 @@ raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSIO
 5. 顺带校验引用**必须且只能给 `blobKey`/`path` 之一**（`Err` 点明二选一）—— 既是对契约的
    fail-loud 检查，也让这两个宿主侧字段真的被读（否则 `-D warnings` 下 `dead_code`）。
 
-#### 4. raw 冲突头剥离（含折叠头）怎么实现的（`message.rs:305`/`:343`）
+#### 4. raw 信封头剥离（含折叠头）与 Subject 语义怎么实现的（`message.rs:326`/`:383`/`:369`）
 
+- **剥离范围 = 信封头** `From`/`To`/`Cc`/`Bcc`（`ENVELOPE_HEADERS`，`message.rs:51`）：
+  信封（MAIL FROM / RCPT TO）的权威来源是结构化 `from`/`to`，原文里这些头留着就能造出
+  双收件人 / 发件人 spoof。
+- **`Subject` 保留**（controller 决策 2026-09-15，见 §9）：它不是信封字段，剥掉只会让邮件丢
+  主题；注入面由 CRLF 校验覆盖（`message.rs:393`/`:404`：原文 Subject 行与其折行续行都要过
+  `ensure_no_crlf`，裸 CR ⇒ `Err`）。`subject` **非空** ⇒ 以结构化值为准**覆盖**：原文 Subject
+  整段（含续行）丢弃，由 `subject_header`（`message.rs:369`，走 lettre `Headers` 复用同一套
+  RFC2047 编码 + 折行）产出唯一一个 `Subject:` 头；`subject` 为空 ⇒ 原文 Subject 原样保留。
 - **分界**：`split_head_body` 用 `split_inclusive('\n')` 找**首个空行**（兼容 `\r\n` 与 `\n`），
   之前为头部区、之后为正文；无空行 ⇒ 按「全是头、空正文」处理（正文为空串，不猜）。
 - **逐行状态机**（`kept_header_lines`）：行首为空格/TAB ⇒ **折行续行**，归属上一个头 ——
   `keep_prev` 为真才保留，否则一并丢弃（否则被剥头的续行会变成无主行，可能被收件端当成前一个
-  保留头的续行，或触发解析错误）。否则取 `名: 值` 的名（`split(':').next()`），与
-  `CONFLICTING_HEADERS`（`from`/`to`/`cc`/`bcc`/`subject`）做 `eq_ignore_ascii_case` 比较。
-  缺 `:` 的行无从判定冲突 ⇒ 按「保留」处理（raw 是原样透传，不额外否定调用方自己的 MIME）。
+  保留头的续行，或触发解析错误）。否则取 `名: 值` 的名（`split(':').next()`）：名为 `subject`
+  走上面的保留/覆盖分支，其余名与 `ENVELOPE_HEADERS` 做 `eq_ignore_ascii_case` 比较。
+  缺 `:` 的行无从判定 ⇒ 按「保留」处理（raw 是原样透传，不额外否定调用方自己的 MIME）。
 - **报头重建**：`From:`/`To:` 由结构化信封生成（`envelope.from()` / `envelope.to()`），
   信封（MAIL FROM / RCPT TO）用显式 `.envelope(envelope.clone())` 等价物 —— 即 `engine` 传下去
   的那一份，与原文报头**彻底解耦**（原文 `To:` 换成什么都没用，RCPT TO 只认结构化 `to`）。
@@ -1366,30 +1377,32 @@ raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSIO
 
 | 位置 | 触发 |
 |---|---|
-| `engine.rs:501` | raw 路给结构化 `cc`/`bcc`（无报头可放：静默丢件/泄露 Bcc 都不可接受） |
-| `engine.rs:507` | raw 与附件互斥（refs 侧）；`message.rs:311` 同判据（bytes 侧，vtable 契约兜底） |
-| `engine.rs:514` | `envelope_of` 失败（缺 `to`、`from`/`to[i]` 地址非法、含 CR/LF） |
-| `engine.rs:515` | `build_raw` 失败（`envelope` 无发件人、附件非空） |
-| `engine.rs:518` | `build_message` 失败（见下逐条） |
-| `message.rs:205` / `:215` / `:226` | 附件数量不匹配（下标对齐失败）/ 引用来源不是「blobKey/path 二选一」/ 缺 filename |
-| `message.rs:126` / `:163` | `to` 为空 / 缺少正文（`text`/`html` 都空且无附件） |
-| `message.rs:262` | `from`/`to[i]`/`cc[i]`/`bcc[i]` 地址非法或含 CR/LF（`mailbox` 共用，字段名由调用点传入） |
-| `message.rs:107` / `:113` | `envelope_of` 的 `from` / `to[i]` 地址非法或含 CR/LF |
-| `message.rs:142` | `subject` 含 CR/LF |
-| `message.rs:270` / `:271` / `:277` | `headers` 名含 CR/LF / 值含 CR/LF / 覆盖 `From`/`To`/`Cc`/`Bcc`/`Subject` |
-| `message.rs:251` | 附件 `mime` 非法 |
+| `engine.rs:502` | raw 路给结构化 `cc`/`bcc`（无报头可放：静默丢件/泄露 Bcc 都不可接受） |
+| `engine.rs:508` | raw 与附件互斥（refs 侧）；`message.rs:333` 同判据（bytes 侧，vtable 契约兜底） |
+| `engine.rs:515` | `envelope_of` 失败（缺 `to`、`from`/`to[i]` 地址非法、含 CR/LF） |
+| `engine.rs:517` | `build_raw` 失败（`envelope` 无发件人、附件非空、原文/结构化 Subject 含 CRLF） |
+| `engine.rs:520` | `build_message` 失败（见下逐条） |
+| `message.rs:218` / `:228` / `:239` | 附件数量不匹配（下标对齐失败）/ 引用来源不是「blobKey/path 二选一」/ 缺 filename |
+| `message.rs:139` / `:176` | `to` 为空 / 缺少正文（`text`/`html` 都空且无附件） |
+| `message.rs:275` | `from`/`to[i]`/`cc[i]`/`bcc[i]` 地址非法或含 CR/LF（`mailbox` 共用，字段名由调用点传入） |
+| `message.rs:120` / `:126` | `envelope_of` 的 `from` / `to[i]` 地址非法或含 CR/LF |
+| `message.rs:155` / `:393` / `:404` | 结构化 `subject` 含 CR/LF / 保留的原文 Subject 行及其折行续行含 CR（头注入） |
+| `message.rs:283` / `:284` / `:290` | `headers` 名含 CR/LF / 值含 CR/LF / 覆盖 `From`/`To`/`Cc`/`Bcc`/`Subject` |
+| `message.rs:264` | 附件 `mime` 非法 |
 
 两处**不属于** `code:5` 的失败（属 req 形态错误，沿用阶段 4 口径在 `submit` 期即 FFI `Err`，
 不占队列槽位）：`Req` 反序列化失败（`engine.rs:270`，含缺 `from`）与未知 profile（`engine.rs:279`）；
 `deliver_one` 侧的同名兜底在 `engine.rs:451`。
 
-#### 6. 变异验证（3 条，证明新断言真在钉行为）
+#### 6. 变异验证（5 条，证明新断言真在钉行为）
 
 | 变异 | 期望红的用例 | 实测 |
 |---|---|---|
-| `CONFLICTING_HEADERS` 的 `"subject"` 改成 `"subjex"` | `raw_strips_from_to_cc_bcc_subject_case_insensitively` | **首次 FAILED 的只有 engine 落盘用例** ⇒ 暴露消息侧断言过弱（原 raw 的 `SUBJECT: s` 与其它断言无交集）→ 已加强（见 §7.8）；复验同变异下**两条都 FAILED** |
+| `CONFLICTING_HEADERS` 的 `"subject"` 改成 `"subjex"`（旧口径下的表） | `raw_strips_from_to_cc_bcc_subject_case_insensitively` | **首次 FAILED 的只有 engine 落盘用例** ⇒ 暴露消息侧断言过弱（原 raw 的 `SUBJECT: s` 与其它断言无交集）→ 已加强（见 §7.8）；复验同变异下**两条都 FAILED** |
 | 折行续行改为无条件保留 | `raw_strips_folded_continuation_of_stripped_header_only` | **FAILED**（输出里出现 `leak-me`） |
 | 删掉 `align_attachments` 的长度校验 | `rejects_attachment_count_mismatch` + `attachment_count_mismatch_returns_code5` | **双双 FAILED**（2 failed） |
+| `kept_header_lines(head, true)`（原文 Subject 永不丢弃 ⇒ 覆盖语义失效） | `raw_structured_subject_overrides_raw_subject`（message + engine 两条） | **双双 FAILED**（2 failed，见 §9） |
+| `ENVELOPE_HEADERS` 加回 `"subject"`（回到旧口径） | `raw_strips_envelope_headers_but_keeps_subject_and_body` | **FAILED**（见 §9） |
 
 #### 7. 与任务书/计划的偏差（均有实测依据，未弱化任何断言）
 
@@ -1415,25 +1428,80 @@ raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSIO
    设计 §10/§11「宿主剥离」之外的纵深防线（插件是 MIME 输出的最后一环）。
 6. **附件引用必须恰给 `blobKey`/`path` 之一**：契约完整性检查，同时避免 `blob_key`/`path`
    成为「只写不读」字段（cdylib + 私有模块下会 `dead_code` 报错）。
-7. **raw 的 `Subject` 剥离后不重生**（已知行为，非 bug）：spec §11 明列剥离 `Subject`，而
-   `build_raw` 的入参只有信封（示例签名），没有结构化 `subject` 的位置 ⇒ 结构化 `subject`
-   在 raw 路被忽略。**归阶段 6/8 决策**（见 §8.1）。
+7. **`build_raw` 增加 `subject` 形参**（原为 `(envelope, raw, atts)`）：覆盖语义要求把结构化主题
+   传进来。**已按 controller 决策落地**：`subject` 非空 ⇒ 覆盖原文 Subject，为空 ⇒ 保留原文
+   （见 §9；本节原「raw 结构化 subject 被忽略」的偏差已闭环）。
 8. **提交粒度**：按任务书拆成两次 feat 提交（5.1 / 5.2），另加一次测试加强（`3599b47`，变异
    验证暴露的弱断言）与一次小结提交。5.1 的中间态是「组装路已通、raw 仍原文直通」，两种状态
    都跑了全量门禁（47 / 54 绿），不是为了拆分而拆分。
 
 #### 8. 遗留 / 转下阶段
 
-1. **raw 路主题语义待定**（§7.7）：`sendRaw` 若需要主题，阶段 6 的宿主可在过线前把结构化
-   `subject` 注入 raw 原文（宿主本就要做 CRLF 剥离，顺带做），或在阶段 8 扩展 `build_raw`
-   的签名收一个 `subject`。**当前行为（已知）**：raw 路的结构化 `subject` 被忽略，原文的
-   `Subject:` 被剥离 —— 已在 `message.rs` 模块头写明，不留暗坑。
+1. ~~**raw 路主题语义待定**~~ → **已闭环**（§9）：`subject` 非空覆盖原文 Subject，为空保留原文；
+   已按此实现并落盘验证。
 2. **`attachments` 的 mime 嗅探在宿主**（阶段 6）：插件只认 `atts[i].mime`/显式 `mime`，
    `path`/`blobKey` 的解析、越界与白名单校验全在宿主 `src/bridge/mail.rs`。
 3. **诊断细节**：阶段 4 遗留的「lettre 原始错误只出分类文案」未变；`HostContext.log` 上送
    归阶段 6。
 4. `Message` 组装路的日期/`Message-ID` 由 lettre 补齐（`date_now`/`hostname`），宿主无需干预；
    file transport 落盘 id 仍与 `messageId` 同源（阶段 4 既有断言继续守着）。
+
+#### 9. 阶段 5 修正记录（2026-09-15，controller 决策：raw 路的 `Subject` 语义）
+
+**决策**（覆盖本节早先「raw 一律剥离 `Subject`」的口径，设计文档 §7/§11 已同步）：
+raw 路**只剥离信封头 `From`/`To`/`Cc`/`Bcc`**；`Subject` **保留**（非信封字段，剥它只会丢主题；
+注入风险由 CRLF 校验覆盖）。若结构化 `subject` 非空 ⇒ 以它为准**覆盖**原文 Subject；为空 ⇒ 保留原文。
+
+**改动**：`message.rs` 拆出两个常量（`ENVELOPE_HEADERS` 4 项用于剥离 / `STRUCTURED_HEADERS` 5 项用于
+`headers` 覆盖禁令，`message.rs:51`/`:55`）；`build_raw` 收 `subject: &str` 形参（`:326`），新增
+`subject_header`（`:369`，复用 lettre `Headers` 做 RFC2047 编码）；`kept_header_lines` 改为
+`(head, keep_subject) -> Result<...>`（`:383`，Subject 行及其折行续行在保留时须过 CRLF 校验）；
+`engine.rs` 传 `&m.subject`（`:517`）；`oj-plugin-ffi/src/mail.rs` 的 vtable 文档注释同步
+（**仅注释**，`repr(C)` 未动，`ABI_VERSION` 仍 8，`cargo xtask plugin mail --check` → `ok … (abi 8)`）。
+
+**TDD 证据**：
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| RED（先改断言，实现未动） | `cargo test --release -p oj-mail --lib raw_` | **FAILED. 6 passed; 2 failed** —— `raw_strips_envelope_headers_but_keeps_subject_and_body`（"原文 Subject（含折行续行）必须保留"）、`raw_rejects_crlf_injection_in_raw_subject`（旧口径下被静默剥离 ⇒ 无 `Err`） |
+| GREEN（实现后） | `cargo test --release -p oj-mail` | **58 passed; 0 failed** |
+| 变异 A：`kept_header_lines(head, true)` | `--lib raw_` | **FAILED. 9 passed; 2 failed**（message + engine 两条 override 用例） |
+| 变异 B：`ENVELOPE_HEADERS` 加回 `"subject"` | `--lib raw_` | **FAILED. 10 passed; 1 failed**（`raw_strips_envelope_headers_but_keeps_subject_and_body`） |
+| 门禁 | `cargo fmt --check` / `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | 均 exit 0 |
+
+**落盘 `.eml` 实证**（`file_engine` 读回，`^M` = CRLF；三条均为 `raw_path_*` 用例产出）：
+
+```
+# 案例 A：raw 含 "From: evil@x / To: victim@x / Subject: raw-sub"，结构化 subject 为空
+#          ⇒ 信封头被剥、Subject 保留（位置即原文顺序：在 X-Keep 之前）
+From: from@example.com
+To: to@example.com
+Subject: raw-sub
+X-Keep: 1
+
+body
+
+# 案例 B：raw 含 "Subject: raw-sub\n  folded-leak"，结构化 subject="struct-sub"
+#          ⇒ 覆盖：只有一个 Subject，原文 Subject 与折行续行都不残留
+From: from@example.com
+To: to@example.com
+Subject: struct-sub
+X-Keep: 1
+
+body
+
+# 案例 B2：结构化 subject="结构主题"（非 ASCII）⇒ RFC2047 编码后覆盖
+From: from@example.com
+To: to@example.com
+Subject: =?utf-8?b?57uT5p6E5Li76aKY?=
+
+body
+```
+
+**一致性**：与设计文档 §7（`docs/plans/2026-09-15-mail-smtp-design.md:132`）「剥离 `From/To/Cc/Bcc`；
+保留 `raw` 的 `Subject`；结构化 `subject` 非空则覆盖；行尾归一 CRLF」与 §11（同文件 `:161`
+「`Subject` 保留但做 CRLF 校验，结构化 `subject` 非空则覆盖」）**逐条对应**；§8 数据流与 §12 测试策略
+无冲突。唯一额外动作是 FFI vtable 的**注释**同步（原文「`subject` 等组装字段被忽略」在决策后已不成立）。
 
 
 ### 阶段 6 小结
