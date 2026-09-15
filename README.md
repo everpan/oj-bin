@@ -234,8 +234,8 @@ smtp:         # present → enables mail.* (needs the oj-mail plugin); one key p
     mechanism: "login"    # login (user+pass) | xoauth2 (user + xoauth2.access_token)
     user: "api@example.com"
     pass: "change-me"
-    allowed_from: ["noreply@x.com"]              # whitelists are fail-closed: empty = reject
-    allowed_recipients: ["@x.com", "@partner.com"]
+    allowed_from: ["noreply@x.com"]              # exact match; whitelists are fail-closed (empty = reject)
+    allowed_recipients: ["@x.com", "@partner.com"]  # "@domain" = exact domain, no subdomain wildcard
 tenant:       # multi-tenancy: request must carry header_key, value injected as http.tenantId
   enable: true
   header_key: "X-TENANT-ID"

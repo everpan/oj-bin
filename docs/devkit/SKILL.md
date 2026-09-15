@@ -89,7 +89,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | `oj build` 报「扩展名不会进产物」 | 本地导入目标是 `.js`/`.json`——产物只转译 `.ts`，改目标为 `.ts` 或内联 |
 | `oj build` 报「manifest.yaml 只能出现在模块根」 | 子目录里多了 `manifest.yaml`——它会被当成 `#` 别名的新锚点，删掉即可 |
 | `mail.send` 报 `mail not configured` | 未配顶层 `smtp:` 段，或 `oj-mail` 插件未加载（`cargo xtask plugin mail`） |
-| `mail.send` 返回 `code:5`（白名单） | `allowed_from`/`allowed_recipients` **空表 fail-closed**——显式列出；或发件人/收件人不匹配后缀 |
+| `mail.send` 返回 `code:5`（白名单） | `allowed_from`/`allowed_recipients` **空表 fail-closed**——显式列出；或发件人/收件人**未全等命中**条目（条目只能是完整地址或 `@domain`，不做子域通配） |
 | `mail.send` 返回 `code:5`（附件路径） | `{path}` 越出 project root（`ensure_within` 拒绝）——用仓内相对路径或改 `{blobKey}` |
 | `enqueue` 拿不到结果 | 返回的是 `{code:0,data:{jobId}}`——取 `res.data.jobId`；完成经 `bus.subscribe("mail.result")` |
 | `mail.enqueue` 返回 `code:4` | 队列满（背压）：调大 `smtp.queue_capacity` / `workers`，或降低并发 |

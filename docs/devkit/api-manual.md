@@ -1003,8 +1003,14 @@ attachments: [
 | `4` | 队列满（背压，`enqueue` 亦回同一 jobId） |
 | `5` | 入参校验失败（地址非法/白名单未命中/缺正文/附件形态错/路径越界/未知 profile） |
 
-**白名单是唯一控制点，且 fail-closed**：`allowed_from`/`allowed_recipients` 为后缀匹配
+**白名单是唯一控制点，且 fail-closed**：`allowed_from`/`allowed_recipients` 为**全等**匹配
 （大小写不敏感），**空表 = 拒绝**——不写白名单就发不出任何信。
+
+- 条目两种合法写法：**完整地址**（`noreply@x.com`，只命中该地址自身，**不**命中
+  `evil-noreply@x.com`）与 **`@domain`**（`@x.com`，只命中域全等，**不**命中子域
+  `a@sub.x.com`；子域须显式写 `@sub.x.com`）。**不做**子域通配。
+- 条目格式在启动期校验：空串、裸域（`x.com`）、首尾空白一律让配置解析失败
+  （不会退化成「静默不命中」）。
 
 异步反馈（`enqueue` 的双通道之一）：真实完成经 bus topic `mail.result` 扇出**扁平结果**
 （`{jobId, code, msg, messageId?}`，**不含**收件人/主题）：
