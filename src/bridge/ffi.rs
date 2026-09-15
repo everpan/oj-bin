@@ -577,7 +577,7 @@ pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
         // 两种失败成因分开告警（A6）：排障方向不同 —— 「没配 mail」是部署问题，
         // 「载荷非法」是插件上送的内容不符合结果信封契约。
         match super::mail::route_deliver(&raw) {
-            super::mail::DeliverRoute::Routed(_) => {}
+            super::mail::DeliverRoute::Routed => {}
             super::mail::DeliverRoute::NotConfigured => {
                 eprintln!("warn: mail.result 上送但 mail 未配置（结果丢弃）");
             }
