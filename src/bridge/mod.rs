@@ -336,9 +336,11 @@ pub fn bridge_ext_init(stable: Arc<StableState>) -> deno_core::Extension {
 /// https fetch 与 wss 握手共用 FetchOptions 的根证书（op_ws_create 从 OpState
 /// 读取）——webpki-roots（Mozilla 根集）编译进二进制，零系统依赖。
 pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
-    // deno_tls 启 rustls/aws_lc_rs，reqwest 系又启 ring——双 provider 并存时
-    // rustls 拒绝自动判定（ClientConfig::builder() 直接 panic）。显式钉死
-    // aws_lc_rs（deno_tls 保证该 feature 恒在；reqwest 走显式 provider 不受影响）。
+    // 全图 rustls 只启用 aws_lc_rs（deno_tls、hyper-rustls 的 aws-lc-rs、reqwest 的
+    // __rustls-aws-lc-rs），**无 ring**；但 provider 是进程级单例，显式钉死 aws_lc_rs
+    // 才能消除「谁先建 ClientConfig 谁定 provider」的竞态（default 未装时 rustls 拒绝
+    // 自动判定，ClientConfig::builder() 直接 panic）。oj-mail 插件同样装 aws_lc_rs，
+    // 两处落在同一实例上。
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let roots: Arc<dyn deno_tls::RootCertStoreProvider> =
         Arc::new(StaticRoots(deno_tls::create_default_root_cert_store()));
