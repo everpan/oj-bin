@@ -210,7 +210,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
-lettre = { version = "0.11", default-features = false, features = ["builder","smtp-transport","tokio1","tokio1-rustls-tls","rustls-tls","hostname","pool","file-transport"] }
+# 方案 B（阶段 0 定稿）：不用 tokio1-rustls-tls/rustls-tls（会强拉 rustls/ring，与框架 aws-lc-rs 冲突）
+lettre = { version = "0.11", default-features = false, features = ["builder","smtp-transport","tokio1","tokio1-rustls","rustls-no-provider","webpki-roots","aws-lc-rs","hostname","pool","file-transport"] }
 rustls = "=0.23.40"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -316,9 +317,12 @@ Expected: FAIL
 
 **Step 2: 实现**（init 内先 install，再建 transport）
 
+> **阶段 0 实测硬约束**：`relay()` 会**立即**构建 ClientConfig，故 provider 安装**必须早于**任何 transport 构建（纯 `rustls-no-provider` 未装时先 `relay()` 直接 panic）。
+> **`pool` 运行时约束**：lettre 的 `pool` 在 transport `Drop` 里 `tokio::spawn`，无 runtime 上下文 drop 即 abort → transport 的**创建/使用/销毁都必须在该插件自己的 tokio runtime 内**（用 `rt.enter()` 或 `rt.block_on` 构建）。单测不得在纯同步 `fn` 里裸建 transport。
+
 ```rust
 fn init_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default(); // 幂等
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default(); // 幂等；须早于 relay()
 }
 fn build_profile(c: &ProfileCfg) -> Result<MailProfile, String> {
     // file_transport：AsyncFileTransport/SmtpTransport::builder_dangerous 指向目录（测试用）
@@ -728,8 +732,8 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
 
 #### 7. 遗留 / 需决策
 
-1. **阶段 2 落地时 Task 2.1 的 `plugins/oj-mail/Cargo.toml` 须改用方案 B 的 feature 列表**
-   （计划正文原稿仍是 `tokio1-rustls-tls` + `rustls-tls`，阶段 2 执行时同步修订）。
+1. ~~阶段 2 Cargo 改用方案 B~~ —— **已采纳（controller 决策）**：Task 2.1 的 Cargo feature 列表、
+   阶段 3 Task 3.2 的 provider 顺序/`pool` 运行时约束、设计文档 §13 均已同步为方案 B。
 2. `src/bridge/mod.rs:339-341` 的注释称「reqwest 系又启 ring」——实测根 crate 图中
    rustls **未启用 ring**（reqwest 0.13 走 `__rustls-aws-lc-rs`），该注释已过时。
    属阶段 3 范围（provider 注释订正），阶段 0 未改代码以免越界。

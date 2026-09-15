@@ -177,7 +177,9 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 - **新增轴零 ABI 变更**：既有插件**无需重编**；`plugin-matrix.yml` 增 `oj-mail` 构建/预检；`bin/plugins/<triple>/` 归置。
 - **`probe_axes` 同步**：`AXES` / `probe_axes` 分支 / `Registrations` 字段必须同加 `"mail"`（:456 `unreachable!` 保护；漏一处即 panic 或轴不可见）。
 - **rustls provider 时序**：插件 init 须先 `install_default`；验证与 `ws_client_extensions` 不 panic。
-- **lettre 版本**：新增 `lettre`（`rustls`+`tokio1` feature），须与 `rustls = "=0.23.40"` / aws-lc-rs 同 provider；实现前先最小编译验证。
+- **lettre 依赖（阶段 0 spike 定稿，方案 B）**：`lettre 0.11`（实测 0.11.23）+ `rustls = "=0.23.40"` 单一版本（无 ring）。feature 集必须为 `builder, smtp-transport, tokio1, tokio1-rustls, rustls-no-provider, webpki-roots, aws-lc-rs, hostname, pool, file-transport`——**不得用 `rustls-tls`/`tokio1-rustls-tls`**（其 `rustls-tls = ["webpki-roots","rustls","ring"]` 会强拉 `rustls/ring`，与框架 aws-lc-rs 形成双 provider）。
+- **provider 安装顺序（硬约束）**：`relay()` 立即构建 ClientConfig → 插件 init 必须**先** `install_default(aws_lc_rs)` **再**建 transport。
+- **`pool` 运行时约束**：lettre `pool` 在 transport `Drop` 时 `tokio::spawn` → transport 的**创建/使用/销毁都必须在该插件自己的 tokio runtime 内**（否则析构期 abort）。
 - `deliver("mail.result")` 与既有 bus 订阅扇出的路由约定需对齐（宿主统一路由：存结果 + 扇出）。
 
 ## 14. 里程碑
