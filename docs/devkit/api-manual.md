@@ -991,6 +991,8 @@ attachments: [
 - `path` 必须落在**项目根**内（`../` 越界即拒；符号链接经 canonical 化覆盖，读盘用同一
   canonical 句柄防 TOCTOU）。
 - MIME 三源决议：显式 `mime` → 文件扩展名 → 字节嗅探 → `application/octet-stream`。
+- **大小上限**（`smtp.max_attachment_bytes` 默认 10 MiB / `smtp.max_total_attachment_bytes`
+  默认 25 MiB）：超限 `code:5`；`path` 路先看长度，超限文件不读进内存。
 - `sendRaw` 与 `attachments` **互斥**（原文自带内容）。
 
 信封与错误码：所有方法都 resolve 信封（**只有「未配置 mail」抛异常**）：
@@ -1029,6 +1031,8 @@ bus.subscribe("mail.result");
 smtp:
   workers: 4
   queue_capacity: 256
+  max_attachment_bytes: 10485760        # 单附件上限（字节，默认 10 MiB；超限 → code:5）
+  max_total_attachment_bytes: 26214400  # 单封附件合计上限（字节，默认 25 MiB）
   default:
     host: smtp.example.com
     port: 465
