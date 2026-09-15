@@ -364,11 +364,14 @@ pub fn versioned_specifier(path: &Path) -> Result<ModuleSpecifier, String> {
 /// project_root 钳制：解析结果 canonical 化后必须仍在 root 内。
 /// lexical `..` 归一化可组合出根外路径（specifier 来自项目文件，属纵深防御）。
 /// 双侧 canonical 化对齐符号链接（如 macOS 的 /var → /private/var），避免误伤。
-fn ensure_within(p: &Path, root: &Path) -> Result<(), String> {
+///
+/// 返回**已 canonical 化的句柄**：调用方（mail `{path}` 附件）按它读盘，
+/// 避免「校验用的路径 ≠ 读盘用的路径」被符号链接替换（design §9 TOCTOU）。
+pub(crate) fn ensure_within(p: &Path, root: &Path) -> Result<PathBuf, String> {
     let cp = std::fs::canonicalize(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
     let cr = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if cp.starts_with(&cr) {
-        Ok(())
+        Ok(cp)
     } else {
         Err(format!(
             "module path {} escapes project root {}",
@@ -727,6 +730,31 @@ mod tests {
             .resolve_inner("../../../escape.js", &referrer)
             .unwrap_err();
         assert!(e.contains("escapes project root"), "{e}");
+    }
+
+    /// `ensure_within`（mail 附件 `{path}` 钳制复用）：根内路径放行且**返回 canonical 句柄**
+    /// （调用方按它读盘，规避「校验用的路径 ≠ 读盘用的路径」的 TOCTOU 面）；
+    /// 词法 `..` 越界 / 根外绝对路径一律拒绝。
+    #[test]
+    fn ensure_within_returns_canonical_and_rejects_escape() {
+        let (root, _deep) = alias_fx("within");
+        let inside = root.join("src/m1/_shared/validate.ts");
+        let got = ensure_within(&inside, &root).unwrap();
+        assert!(got.is_absolute(), "{}", got.display());
+        assert_eq!(got, inside.canonicalize().unwrap());
+        // 根外（上跳 + 兄弟文件）→ 拒绝。
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("oj-within-escape-{}.txt", std::process::id()));
+        std::fs::write(&outside, b"x").unwrap();
+        let e = ensure_within(&outside, &root).unwrap_err();
+        assert!(e.contains("escapes project root"), "{e}");
+        // 不存在的路径同样拒绝（canonicalize 失败即 Err，不会放行）。
+        assert!(ensure_within(&root.join("nope.txt"), &root).is_err());
+        assert!(ensure_within(std::path::Path::new("/etc/hosts"), &root).is_err());
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
