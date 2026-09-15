@@ -752,9 +752,11 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
 | `oj-plugin-ffi/src/mail.rs`（新增） | `MailAttachment{filename: RString, mime: RString, bytes: RBytes}`、`MailVtable{submit: extern "C" fn(key, req, atts) -> FfiFuture}`（均 `#[stabby::stabby] #[repr(C)]`）。附件字节由宿主解析后**原样过线**，不经 JSON/base64；方法面演进走 req JSON 字段（同 mq 的 JSON dispatch 思路）。模块注释写明契约形态与 ABI 立场。 |
 | `oj-plugin-ffi/src/lib.rs` | `pub mod mail;` + `pub use mail::{MailAttachment, MailVtable};`（按字母序插在 `kv`/`mq` 之间）。`ABI_VERSION` **未改**。 |
 | `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailVtable) -> *const c_void`；`use crate::{…, MailVtable}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailVtable) -> *const c_void = axis::mail;` 编译期配对断言。复审期一并补上历史缺口 `axis::mq` 的同形断言。 |
-| `src/bridge/plugin_loader.rs` | 三处同改：`AXES`（:432）追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailVtable))`；`Registrations`（:104）增 `pub mail: Option<&'static oj_plugin_ffi::MailVtable>`。 |
-| `src/bridge/plugin_loader/tests.rs` | 新增 `axes_and_registrations_wire_mail`（初版名 `axes_includes_mail_and_probe_branch_is_wired` **名不符实**——实际不覆盖 `probe_axes` 臂；复审期改名并在注释中说明该局限）。 |
-| `tools/xtask/src/main.rs` | **复审修复**（见 §6）：`AXES` 的第 4 个消费点（`check()` 的汇总 match）此前漏改且含 `unreachable!` → 所有插件预检 panic；改为 `axis_present() -> Option<bool>` + 普通 `Err`，并加表驱动守护测试。 |
+| `src/bridge/plugin_loader.rs` | 三处同改：`AXES`（:432）追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailVtable))`；`Registrations`（:104）增 `pub mail: Option<&'static oj_plugin_ffi::MailVtable>`。质量评审 I-2 另加 `impl Registrations::provides`（:469，轴→槽位映射单一事实源）。 |
+| `src/bridge/plugin_loader/tests.rs` | 测试演变：`axes_includes_mail_and_probe_branch_is_wired`（名不符实）→ `axes_and_registrations_wire_mail` → **质量评审 I-2 删掉其中的恒真断言**，改为 one-hot `given_only_mail_slot_set_when_provides_then_only_mail_is_true` + `given_axes_table_when_provides_then_every_axis_has_a_branch`；另加 I-1 的 `probe_finds_mail_axis_and_zero_axis_mini_misses_it`。 |
+| `tests/plugins/mini-mail/`（新增） | 质量评审 I-1：单轴 mail cdylib 夹具（仿 `mini-mq`），导出 `oj_plugin_axis_mail`，供 `probe_axes` 的 `"mail"` 臂做行为级覆盖；已入 workspace `members`。 |
+| `tools/xtask/src/main.rs` | **复审修复**（见 §6）：`AXES` 的第 4 个消费点（`check()` 的汇总 match）此前漏改且含 `unreachable!` → 所有插件预检 panic。先改为 `axis_present() -> Option<bool>` + 普通 `Err`；**质量评审 I-2 治本**：删掉本地映射，改调 `Registrations::provides`（不再跨 crate 复制映射）。 |
+| `src/bridge/ffi.rs` | 质量评审 M-5：订正 `to_rbytes` 的陈旧注释（只改注释，实现未动）。 |
 
 TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`/`axis::mail`/`Registrations.mail` 未定义），再最小实现转绿。
 
@@ -762,11 +764,12 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 
 | 命令 | 结果 |
 |---|---|
-| `cargo test --release -p oj-plugin-ffi mail_attachment` | **1 passed; 0 failed** |
+| `cargo test --release -p oj-plugin-ffi mail_attachment` | **1 passed; 0 failed**（M-3 后测试名 `mail_attachment_holds_raw_bytes`） |
 | `cargo test --release -p oj-plugin-ffi` | **6 passed**（lib）+ 2（entry_good）+ 1（entry_panicky），0 failed |
-| `cargo test --release -p only-js axes_and_registrations_wire_mail` | **1 passed; 0 failed** |
+| `cargo test --release -p only-js probe_finds_mail_axis` | **1 passed; 0 failed**（I-1：mini-mail 夹具跑通 dlsym→转型→填槽） |
+| `cargo test --release -p only-js provides` | **2 passed; 0 failed**（I-2 one-hot + 分支完整性） |
 | `cargo test --release -p only-js plugin` | **36 passed; 0 failed**（既有探测/清单/扫描/适配器用例无回归） |
-| `cargo test --release -p xtask` | **8 passed; 0 failed**（含复审新增的守护测试） |
+| `cargo test --release -p xtask` | **7 passed; 0 failed**（守护测试已迁至 plugin_loader 侧，故由 8 减为 7） |
 | `cargo xtask plugin <n> --check`（8 个第一方插件） | 全部 **exit=0，零 panic**（修复前 `es --check` 在 `main.rs:250` panic） |
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --release -p oj-plugin-ffi -p only-js -p xtask --all-targets -- -D warnings` | exit 0，**0 warning / 0 error** |
@@ -780,8 +783,8 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 
 #### 4. 与计划/指令的偏差（均已按「不弱化断言」处置）
 
-1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `impl<T: Copy, Alloc: IAlloc + Default> From<&[T]> for stabby::vec::Vec<T, Alloc>`（`stabby-abi 72.1.16`，`src/alloc/vec.rs:552`）：`RBytes::from(&[0u8, 159, 255][..])`。**断言未动**（`bytes.len() == 3` + filename 回环）。
-   > 订正：本小结初版称「`src/bridge/ffi.rs:493` 注释即此先例」——**引用错误**。该行注释实为「stabby 无 `From<&[u8]>`，逐元素 push」，与实测**语义相反**（`RBytes::from(&[u8][..])` 实测可编译）。见 §7 遗留 3。
+1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `impl<T: Copy, Alloc: IAlloc + Default> From<&[T]> for stabby::vec::Vec<T, Alloc>`（`stabby-abi 72.1.16`，`src/alloc/vec.rs:552`）：`RBytes::from(&[0u8, 159, 255][..])`。断言本身**未被弱化**（质量评审 M-3 后进一步**加强**为逐位相等，见 §8）。
+   > 订正：本小结初版称「`src/bridge/ffi.rs:493` 注释即此先例」——**引用错误**。该行注释实为「stabby 无 `From<&[u8]>`，逐元素 push」，与实测**语义相反**（`RBytes::from(&[u8][..])` 实测可编译）。该注释已由质量评审 M-5 订正（见 §8）。
 2. **无既有单元测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/server_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言，追加 `mail` 自然满足，未改动。
    但**漏判了一个非测试消费点**（`tools/xtask` 内联在 `check()` 里的汇总 match）——这正是本次复审抓到的回归，见 §6。
 
@@ -792,14 +795,30 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 | # | 位置 | 性质 | 漏改后果 |
 |---|---|---|---|
 | 1 | `src/bridge/plugin_loader.rs:432` `pub const AXES` | 定义（单一事实源） | 轴完全不可见 |
-| 2 | `src/bridge/plugin_loader.rs:435-460` `probe_axes` 的 `match *axis` | 功能性 | :458 `unreachable!` → **装载期 panic** |
+| 2 | `src/bridge/plugin_loader.rs:436-462` `probe_axes` 的 `match *axis` | 功能性（dlsym 转型填槽） | :458 `unreachable!` → **装载期 panic** |
 | 3 | `src/bridge/plugin_loader.rs:104` `Registrations` 槽位字段 | 功能性 | 编译失败（`probe_axes` 的赋值目标缺失） |
-| 4 | `tools/xtask/src/main.rs:224` `axis_present()` 的 `match axis` | 功能性（预检展示） | 修复后 = 普通 `Err`；由 §6 守护测试红 |
+| 4 | `src/bridge/plugin_loader.rs:469` `impl Registrations::provides` 的 `match axis` | 功能性（轴→槽位映射的**单一事实源**） | one-hot / 分支完整性守护测试红；`xtask --check` 给普通 `Err` |
 | 5 | `oj/src/server_cmd.rs:469` `ADAPTER_AXES` | **`#[cfg(test)]` 对账清单，非功能注册表** | 不 panic、不报错（见下） |
 
+- **第 4 项是 I-2 治本后的形态**：轴→槽位映射收归 `Registrations::provides`，与 `probe_axes`
+  **同文件相邻**（`plugin_loader.rs:436` 与 `:469`），加轴时可直接对照改。`tools/xtask` 不再
+  维护本地副本（曾各自维护一份 → 加轴漏改即回归），改为调用 `provides`。
 - **第 5 项是陷阱**：`ADAPTER_AXES` 带 `#[cfg(test)]`，**只在测试里存在**，登记它本身不产生任何运行期效果；它唯一的作用是被 `cfg_adapters_subset_of_probed_axes` 用来断言 `ADAPTER_AXES ⊆ AXES`（**子集**方向）。所以新增轴**不必**改它，改了也没有功能变化。真正决定插件 cfg 的是 `plugin_cfg` 的 `match name`（`oj/src/server_cmd.rs:479`）。
-- 另有 4 处**文档散文清单**（已因 `mq` 陈旧，同样缺 `mail`），属文档同步、非门禁：`CLAUDE.md:159`、`docs/dev-guide.md:620`、`docs/plugin-architecture.md:17`、`docs/plugin-development.md:16`。归阶段 7 统一订正（§7 遗留 2）。
-- **两处 `unreachable!` 的处置**：`probe_axes` 的保留（有 `Registrations` 编译期兜底 + 装载期 fail-fast 语义，属有意设计）；`xtask` 的已换为 `Option`/`Err` + 守护测试。
+- **文档散文清单共 6 处**（均已因 `mq` 陈旧，同样缺 `mail`），属文档同步、非门禁。
+  权威枚举方式：`grep -rn '\bAXES\b' docs/ CLAUDE.md`。当前需阶段 7 订正的 6 处：
+
+  | # | 位置 | 现状问题 |
+  |---|---|---|
+  | 1 | `CLAUDE.md:159` | `AXES = [es, db, blob, bus, kv, auth]`——缺 `mq`/`mail` |
+  | 2 | `docs/dev-guide.md:620` | 同上 |
+  | 3 | `docs/plugin-architecture.md:17` | 同上 |
+  | 4 | `docs/plugin-development.md:16` | `AXES`（es/db/blob/bus/kv/auth）——缺 `mq`/`mail` |
+  | 5 | `docs/modules/05-ffi-and-plugins.md:51` | `AXES = [...]` 同上，且带行号注释 `// :428` |
+  | 6 | `docs/modules/00-overview.md:111` | 引用 `AXES`（`src/bridge/plugin_loader.rs:428`）——**行号已过期**（现 :432） |
+
+  另有 `docs/superpowers/**`、`docs/plans/**`、`docs/review-2026-09-06.md` 中的历史记录性
+  引用——属**史实**（记录当时的轴表），**不订正**。
+- **两处 `unreachable!` 的处置**：`probe_axes` 的保留（有 `Registrations` 编译期兜底 + 装载期 fail-fast 语义，属有意设计）；`xtask` 的已随 I-2 直接消除（改调 `provides` 的 `Option`）。
 
 #### 6. 复审修复记录（规格评审发现的回归）
 
@@ -853,18 +872,84 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 
 #### 7. 遗留 / 需决策
 
-1. **`probe_axes` 的 `"mail"` 臂尚无端到端证据**。新测试只锁「`AXES` 含 mail + `Registrations` 有槽位」；
-   `unreachable!` 分支要真正被走过，需有插件导出 `oj_plugin_axis_mail` 符号——现实插件在阶段 2。
-   建议阶段 2 仿 `mini-mq` 加 `mini-mail` 夹具（或用真 `oj-mail`）补一条 `probe_finds_mail_axis` 回归
-   （新用例注释已注明此局限）。
-2. **文档散文里的 `AXES` 清单已陈旧**（缺 `mq`，现又缺 `mail`）：`CLAUDE.md:159`、
-   `docs/dev-guide.md:620`、`docs/plugin-architecture.md:17`、`docs/plugin-development.md:16`。
-   非门禁、不影响运行，归阶段 7 文档任务统一订正（避免本阶段越界扩大文档漂移面）。
-3. **`src/bridge/ffi.rs:493` 注释与实测不符**：`to_rbytes` 注释称「stabby 无 `From<&[u8]>`」，
-   但 `RBytes::from(&[u8][..])` 实测可编译（`stabby-abi` 的 `From<&[T]>`）。函数实现本身无害
-   （逐元素 push 等价），仅注释陈旧易误导。属既有代码，本阶段未改；可顺手订正。
+1. ~~**`probe_axes` 的 `"mail"` 臂尚无端到端证据**~~ —— **已由质量评审 I-1 关闭**：
+   新增 `tests/plugins/mini-mail` 夹具（导出 `oj_plugin_axis_mail`）+
+   `probe_finds_mail_axis_and_zero_axis_mini_misses_it` 做行为级覆盖（见 §8）。
+2. **文档散文里的 `AXES` 清单已陈旧**（缺 `mq`，现又缺 `mail`）：**共 6 处**，逐条见 §5 表。
+   权威枚举：`grep -rn '\bAXES\b' docs/ CLAUDE.md`。非门禁、不影响运行，归阶段 7 文档任务
+   统一订正（避免本阶段越界扩大文档漂移面）；`docs/superpowers/**` 等历史记录不订正。
+3. ~~**`src/bridge/ffi.rs:493` 注释与实测不符**~~ —— **已由质量评审 M-5 订正**：注释改为
+   说明逐元素 push 等价于 `RBytes::from(&bytes[..])`（`stabby-abi` 的 `From<&[T]>`），
+   并注明早先「无 `From<&[u8]>`」的说法与实测相反。**只改注释**，`to_rbytes` 实现未动
+   （避免动 blob 既有路径）。
 4. 阶段 0 小结遗留项 2（`src/bridge/mod.rs:339-341` 关于 reqwest 启 ring 的过时注释）与
    3（测试夹具 debug profile 产物占用）**本阶段仍未处理**，仍按原归属。
+5. **夹具测试的产物新鲜度依赖 mtime**（本阶段实测踩到一次）：`fixture_plugin_dir`
+   （`src/bridge/plugin_loader/tests.rs:13`）按 `dst < src` 判断是否重拷。手工改夹具源码后
+   若源文件 mtime 比 `target/debug` 产物旧（例如 `mv` 还原备份），cargo 不重编、拷贝逻辑也
+   认为不旧 → 测试会用到**上一次**的旧 `.dylib` 并给出误导性失败。属既有测试基建行为，
+   本阶段未改；此处记录以免下次误判为代码 bug（处置：`touch` 夹具源码或删
+   `target/test-plugins-*`）。
+
+#### 8. 质量评审修复记录（2026-09-15，第二轮）
+
+按 controller 决策逐条落地。命令一律 `--release`，未 push。
+
+**I-1（Important）——`probe_axes` 的 `"mail"` 臂补行为级覆盖。**
+- 新增 `tests/plugins/mini-mail/`（`Cargo.toml` + `src/lib.rs`）：单轴 mail 夹具，
+  `oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VT))`，`submit` 用
+  `ready_ok(b"{}")`；已加入根 `Cargo.toml` 的 workspace `members`（挨着 `mini-mq`）。
+- `src/bridge/plugin_loader/tests.rs`：加 `mini_mail_plugin_dir()`（独立
+  `test-plugins-mail` 目录，避免 scan 计数断言翻倍）与
+  `probe_finds_mail_axis_and_zero_axis_mini_misses_it`（mini → `mail` None；
+  mini-mail → `mail` Some 且 `abi_version == ABI_VERSION`）。
+- **非空验证**：把夹具宏轴标识临时改成 `mailx`（符号变 `oj_plugin_axis_mailx`）→
+  用例 **FAILED** `assertion failed: mmail.registrations.mail.is_some()`；还原后 GREEN。
+  `nm` 确认夹具导出 `_oj_plugin_abi_version` / `_oj_plugin_axis_mail` / `_oj_plugin_init`。
+  该用例端到端钉住 `probe_axes` 臂 + `axis::mail` helper + 符号名三者的配对。
+
+**I-2（Important，治本）——轴映射迁至 `Registrations::provides` + one-hot 守护。**
+- `src/bridge/plugin_loader.rs`：紧邻 `AXES`/`probe_axes` 加
+  `impl Registrations { pub fn provides(&self, axis: &str) -> Option<bool> }`——轴→槽位映射
+  的**单一事实源**；未知轴返回 `None`（不用 `unreachable!`，漏改后果是可读报错而非 panic）。
+- `tools/xtask/src/main.rs`：删 `axis_present`，`check()` 改调 `p.registrations.provides(a)`，
+  `None` → 普通 `Err`「AXES 与 provides 判定不同步，请同步：未知轴 '<a>'」；本地守护测试与
+  `Registrations` import 一并删除（能力由 `plugin_loader` 侧承担，避免重复悬空）。
+- `src/bridge/plugin_loader/tests.rs`：守护测试迁入并**升级为 one-hot**：
+  - `given_only_mail_slot_set_when_provides_then_only_mail_is_true`——真实静态 `MailVtable`
+    哨兵（`submit` 体 `unreachable!()`），只置 `mail` 槽，`for a in AXES` 断言
+    `provides(a) == Some(a == "mail")`。**删除了恒真的
+    `Registrations::default().mail.is_none()`**（原断言永远为真，钉不住任何东西）。
+  - `given_axes_table_when_provides_then_every_axis_has_a_branch`——每轴都有分支 +
+    未知轴得 `None`。
+- **捕获能力实证**：把 `"mail" => self.mail.is_some()` 临时改成 `self.mq.is_some()` →
+  one-hot 用例 **FAILED**「`axis mail 判定错配` left: `Some(false)` right: `Some(true)`」；
+  而**较弱的**分支完整性用例同一 bug 下仍 **ok**（`provides("mail")` 返回 `Some(false)` 而非
+  `None`）——证明 one-hot 严格更强，正是为抓这类 `is_some` 复制粘贴错而设。还原后两者皆 ok。
+
+**M-1（必做）——`MailAxis` → `MailVtable` 全仓更名。** 对齐既有 7 轴 `*Vtable` 命名；
+改 `oj-plugin-ffi/src/{mail,lib,axis}.rs`、`src/bridge/plugin_loader.rs` 与两份 plans 文档
+（共 25 处）。轴标识仍是小写 `mail`，导出符号 `oj_plugin_axis_mail` **不变**，Rust 类型名
+不进 ABI 字符串 → `ABI_VERSION` 保持 8。
+
+**M-2（必做）——`submit` doc 补全。** 写明 `key` = `smtp` 配置里的 profile 名、**未知 key → Err**
+（不回落 default），`req` 的 `sync` / `enqueue_only` / `raw` 语义，以及 `atts` 与 `raw` 互斥、
+`atts` 是宿主解析好的原始字节。
+
+**M-3（必做）——附件测试加强并改名。** `mail_attachment_roundtrips_bytes_without_base64` →
+`mail_attachment_holds_raw_bytes`；断言改为 `assert_eq!(a.bytes.as_slice(), &[0u8, 159, 255][..])`
+（逐位相等，比原 `len() == 3` 强），去掉多余的 `filename.clone()`（保留一句
+`&a.filename[..] == "a.pdf"`）。
+
+**M-4（必做）——`AXES` 文档散文清单补全。** 由 4 处更正为 **6 处**（补入
+`docs/modules/05-ffi-and-plugins.md:51`、`docs/modules/00-overview.md:111`，后者另带**过期行号**
+`:428`），并写明权威枚举方式 `grep -rn '\bAXES\b' docs/ CLAUDE.md`；见 §5。本阶段**只更新清单
+文字**，未改这些散文（避免越界）。
+
+**M-5（必做）——订正 `src/bridge/ffi.rs:493` 陈旧注释。** 只改注释，`to_rbytes` 实现未动。
+
+复核结论：本阶段新增/修改的**每一处运行期功能行**均有测试——`probe_axes` 的 `"mail"` 臂由
+I-1 夹具覆盖，`provides` 由 I-2 one-hot + 分支完整性覆盖。
 
 
 ### 阶段 2 小结
