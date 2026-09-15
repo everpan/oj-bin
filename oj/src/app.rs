@@ -515,6 +515,8 @@ impl App {
                         kafkas: Some(kafkas.clone()),
                         rabbits: Some(rabbits.clone()),
                         tasks_flag,
+                        // mail 后端（阶段 7 由 smtp: 段 + oj-mail 插件装配）。
+                        mail: None,
                     },
                 )
             }
@@ -694,6 +696,7 @@ impl App {
             rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
             tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mail: None, // 阶段 7：与 make_bridge 的 Extras.mail 同源。
         });
         Ok(App {
             router,

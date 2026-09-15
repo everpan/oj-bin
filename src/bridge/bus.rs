@@ -85,6 +85,12 @@ pub trait EventBroker: Send + Sync {
     async fn publish(&self, topic: &str, data: &BusPayload) -> BridgeResult<usize>;
     /// 注册本地订阅通道（tx）。
     async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()>;
+    /// 同步本地扇出一帧（不经网络）。用于**非 async 上下文**——插件线程上的
+    /// `HostContext.deliver`（`extern "C"`）把上送结果转给本地订阅者时调用。
+    /// 返回本地投递成功数；默认 0 = 本 broker 无本地扇出面。
+    fn publish_local(&self, _topic: &str, _data: &BusPayload) -> usize {
+        0
+    }
     /// broker 类型标识。
     fn kind(&self) -> &'static str {
         "unknown"
@@ -102,6 +108,9 @@ impl EventBroker for Bus {
     async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()> {
         Bus::subscribe(self, topic, tx);
         Ok(())
+    }
+    fn publish_local(&self, topic: &str, data: &BusPayload) -> usize {
+        Bus::publish(self, topic, data)
     }
 }
 
