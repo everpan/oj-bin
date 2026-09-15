@@ -1,7 +1,7 @@
 # 设计文档：lettre SMTP 绑定（v0.1.19，插件实现）
 
 - 日期：2026-09-15（初稿）→ v2（三方评审）→ v3（自洽性总检）→ **v4（实现期定稿，随阶段 0–6 落地同步）**
-- 状态：阶段 0–6 已实现（阶段 7 装配/e2e、阶段 8 加固验收待做）；本文档与实现同步
+- 状态：阶段 0–7 已实现（阶段 8 加固验收待做）；本文档与实现同步
 - 实现形态：**cdylib 插件 `oj-mail`**（非内建 op），新增 `mail` 轴。
 
 ## 0. 版本修订
@@ -82,6 +82,10 @@ smtp:
 ```
 
 - **插件**经 `oj_plugin_init(host, cfg)` 的 `cfg` 拿到 `smtp:` 段（含凭据）构建 transport。
+- **阶段 7 实测订正**：上面 `mock:` 样例省了 `host`/`port`/`tls`/`mechanism`，但插件
+  `ProfileCfg` 这四个字段**必填**（`file_transport` 走同一 `Deserialize`）——`smtp.mock`
+  必须写全（可照 `sample/config.yaml`；`tls: none` 仍须 `allow_none_tls: true`，只是不联网）。
+  另 `file_transport` 目录**须先存在**（lettre 不建目录）。
 - **宿主**另解析 `smtp:` 的**非密钥面**（profile keys、`allowed_*`、`tls`/`allow_none_tls`、host/port）作**前置校验**用；凭据不落宿主 JS 面。
 - 二者读同一段配置（宿主校验、插件投递），职责不重叠。
 
