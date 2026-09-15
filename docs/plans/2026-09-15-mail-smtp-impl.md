@@ -1280,7 +1280,161 @@ drop runtime）。本期 `submit` 只走「原始 MIME」路（`raw`），消息
 
 
 ### 阶段 5 小结
-（待填）
+
+**结论：`req.raw` 与结构化组装两条投递路都落地，附件字节从 vtable 原样消费（无 base64 往返），
+raw 冲突头剥离含折叠头归属；`/oj-plugin-ffi` 零改动、`ABI_VERSION` 保持 8。**
+`cargo test --release -p oj-mail` **54 passed / 0 failed**；`fmt` 与 `clippy --all-targets -D warnings` 均 exit 0。
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `plugins/oj-mail/src/message.rs`（新增，`mod message;`） | `SendRequest`/`AttachmentRef`（serde，含 `blobKey` rename）；`envelope_of`（结构化 `from`/`to` → 信封，从阶段 4 的 `deliver_input` 抽出）；`build_message`（结构化 → `lettre::Message`）；`build_raw`（raw → 剥离冲突头后的最终字节）；辅助 `align_attachments`/`attachment_part`/`mailbox`/`custom_header`/`ensure_no_crlf`/`kept_header_lines`/`split_head_body`/`bare_line`/`normalize_crlf`。 |
+| `plugins/oj-mail/src/engine.rs` | `Req` 改为「引擎开关（`sync`/`enqueue_only`/`jobId`）+ `#[serde(flatten)] message: SendRequest`」；`deliver_input` 由 raw-only 改为两路分派（`:496`）；raw 分支拒结构化 cc/bcc（`:501`）与附件（refs/bytes 两侧）；raw 分支调 `build_raw`（`:515`）；组装分支调 `build_message` 并用 lettre 派生的信封（`:518`）。新增 5 条用例（`:864` 起）。 |
+| `plugins/oj-mail/src/lib.rs` | 模块头更新（两条路都落地）；入口守卫用例的 req 由 `{}` 改为合法形态（理由见 §7.3）。 |
+
+组装规则（`build_message`，`:122`）：`text`+`html` → `MultiPart::alternative_plain_html`；仅其一 →
+`SinglePart::plain`/`html`；有附件 → 外层 `MultiPart::mixed()` 包住正文段 + 各附件段（只发附件也合法）；
+两版正文与附件都没有 → `Err`。**信封不显式设置**：交给 lettre 由报头派生（To ∪ Cc ∪ Bcc，
+`Bcc` 报头在派生后按 lettre 默认丢弃 → Bcc 收得到、互不可见），故 `cc`/`bcc` 是真投递而非装饰。
+
+#### 2. 跑过的测试与结果（一律 `--release`）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --release -p oj-mail --lib message::tests`（实现前，RED） | **FAILED. 3 passed; 14 failed** —— 全部报 `阶段 5：结构化组装未实现` |
+| `cargo test --release -p oj-mail --lib path_`（实现前，RED） | **FAILED. 1 passed; 4 failed** —— 信封 `{"code":5,...,"msg":"阶段 5：…未实现"}` |
+| `cargo test --release -p oj-mail --lib attachment_count`（实现前，RED） | **FAILED. 0 passed; 2 failed**（message + engine 两侧） |
+| `cargo test --release -p oj-mail`（5.1 后） | **47 passed; 0 failed** |
+| `cargo test --release -p oj-mail`（5.2 后，最终） | **54 passed; 0 failed**（`config` 10 + `engine` 15 + `message` 17 + lib 12） |
+| `cargo fmt --check` / `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | 均 exit 0（0 warning） |
+| `cargo xtask plugin mail --check` | `ok: mail 0.1.0 (abi 8)` / `provided axes: [mail]` |
+| `grep -n "ABI_VERSION: u32" oj-plugin-ffi/src/lib.rs` | `49:pub const ABI_VERSION: u32 = 8;`（未改） |
+| `git diff 06209d0 --stat -- oj-plugin-ffi/` | **空**（本阶段零改动 FFI 契约） |
+
+**RED 的一处坑（记录以免误判为死锁）**：首次实现前直接跑全量 `cargo test` 会**永久悬挂** ——
+阶段 4 的 `full_queue_returns_code4_without_blocking` 用 0 许可闸门桩，靠「worker 真走到
+`send`」才放行；组装桩返回 `Err` 时 worker 不调 `send`，`started.recv().await` 永不返回
+（`sample` 实锤：主线程阻塞在 libtest 的 CompletedTest 通道，worker 线程名即该用例）。
+故 RED 一律**定向过滤**跑（`--lib <filter>`），不跑全量。
+
+真实投递证据（读回落盘 `.eml`，非只断言函数返回值）：`assemble_path_*` 用例断言落盘内容含
+`multipart/mixed` + `multipart/alternative` + 附件名/类型，且**不含** `%PDF-1.4` 的 base64
+（`JVBERi0xLjQ`）；`raw_path_*` 用例断言落盘内容无 `evil@x`/`victim@x`/原文 Subject、有
+`X-Keep` 与正文、`From:`/`To:` 由结构化信封重建。
+
+#### 3. 附件「下标对齐 + 长度校验」怎么实现的（`message.rs:199`）
+
+契约写进模块头（宿主 ↔ 插件的对齐表）与 `oj-plugin-ffi/src/mail.rs` 的既有注释口径一致：
+`attachments[i]` 是**引用**，宿主按下标把解析结果放进 `atts[i]`。插件侧 `align_attachments`：
+
+1. **长度必须相等**：`req.attachments.len() != atts.len()` ⇒ `Err`，文案同时给出两个数量与
+   下一步（「逐个检查 attachments[i] 的 blobKey/path 是否存在且可读」）。下标错位无法从字节
+   反推（长度相同时错位不可检测），静默错配会把 A 的字节挂到 B 的名字上 → 宁可整封拒投。
+2. **字节**一律取 `atts[i].bytes`（`RBytes` → `&[u8]` → `Attachment::body(Vec<u8>, ..)`），
+   全程不落 JSON/base64；ASCII 内容走 7bit 原样送出（实测落盘 `.eml` 里就是 `%PDF-1.4` 原文）。
+3. **MIME**：`atts[i].mime` 非空优先（宿主已按「显式 `mime` 优先，否则嗅探」填好），空则回落
+   `attachments[i].mime`，再空则 `application/octet-stream`；非法 mime ⇒ `Err`。
+4. **文件名**：`attachments[i].filename` 优先，空则回落 `atts[i].filename`，两处都空 ⇒ `Err`。
+5. 顺带校验引用**必须且只能给 `blobKey`/`path` 之一**（`Err` 点明二选一）—— 既是对契约的
+   fail-loud 检查，也让这两个宿主侧字段真的被读（否则 `-D warnings` 下 `dead_code`）。
+
+#### 4. raw 冲突头剥离（含折叠头）怎么实现的（`message.rs:305`/`:343`）
+
+- **分界**：`split_head_body` 用 `split_inclusive('\n')` 找**首个空行**（兼容 `\r\n` 与 `\n`），
+  之前为头部区、之后为正文；无空行 ⇒ 按「全是头、空正文」处理（正文为空串，不猜）。
+- **逐行状态机**（`kept_header_lines`）：行首为空格/TAB ⇒ **折行续行**，归属上一个头 ——
+  `keep_prev` 为真才保留，否则一并丢弃（否则被剥头的续行会变成无主行，可能被收件端当成前一个
+  保留头的续行，或触发解析错误）。否则取 `名: 值` 的名（`split(':').next()`），与
+  `CONFLICTING_HEADERS`（`from`/`to`/`cc`/`bcc`/`subject`）做 `eq_ignore_ascii_case` 比较。
+  缺 `:` 的行无从判定冲突 ⇒ 按「保留」处理（raw 是原样透传，不额外否定调用方自己的 MIME）。
+- **报头重建**：`From:`/`To:` 由结构化信封生成（`envelope.from()` / `envelope.to()`），
+  信封（MAIL FROM / RCPT TO）用显式 `.envelope(envelope.clone())` 等价物 —— 即 `engine` 传下去
+  的那一份，与原文报头**彻底解耦**（原文 `To:` 换成什么都没用，RCPT TO 只认结构化 `to`）。
+- **不经 lettre 组装**（关键决定）：`MessageBuilder::body` 会按「最优编码」重编码正文
+  （`email_encoding::body::chooser::line_too_long` 在**行 ≥76 字节**时就改用 quoted-printable/
+  base64；base64 分块恰好 76 列 → 必然触发），而原文的 `Content-Type: multipart/...;boundary=`
+  报头是**原样保留**的 ⇒ 输出会变成「multipart 报头 + base64 正文」，收件端解析不出任何 part。
+  而强制「原样」的另一条路 `Body::new_with_encoding` 在编码不合法时是 `expect` **panic**
+  （`lettre-0.11.23/src/message/body.rs:190`），在 worker 里 panic 不可接受。故 raw 路自己拼字节。
+- **行尾归一 CRLF**（正文除行尾外逐字节保留）：lettre 的送出侧只做点填充
+  （`transport/smtp/client/mod.rs:74` 的 `ClientCodec`），**不做**行尾归一，且只在 `\r\n` 之后
+  才认「行首」—— 裸 LF 之后的行首 `.` 不会被填充，中间 MTA 可据此提前结束 DATA、把余下内容
+  当 SMTP 命令执行（smuggling）。JS 侧传来的 raw 天然是 LF，故必须自己归一。
+
+#### 5. `code:5`（入参/契约校验）映射点
+
+| 位置 | 触发 |
+|---|---|
+| `engine.rs:501` | raw 路给结构化 `cc`/`bcc`（无报头可放：静默丢件/泄露 Bcc 都不可接受） |
+| `engine.rs:507` | raw 与附件互斥（refs 侧）；`message.rs:311` 同判据（bytes 侧，vtable 契约兜底） |
+| `engine.rs:514` | `envelope_of` 失败（缺 `to`、`from`/`to[i]` 地址非法、含 CR/LF） |
+| `engine.rs:515` | `build_raw` 失败（`envelope` 无发件人、附件非空） |
+| `engine.rs:518` | `build_message` 失败（见下逐条） |
+| `message.rs:205` / `:215` / `:226` | 附件数量不匹配（下标对齐失败）/ 引用来源不是「blobKey/path 二选一」/ 缺 filename |
+| `message.rs:126` / `:163` | `to` 为空 / 缺少正文（`text`/`html` 都空且无附件） |
+| `message.rs:262` | `from`/`to[i]`/`cc[i]`/`bcc[i]` 地址非法或含 CR/LF（`mailbox` 共用，字段名由调用点传入） |
+| `message.rs:107` / `:113` | `envelope_of` 的 `from` / `to[i]` 地址非法或含 CR/LF |
+| `message.rs:142` | `subject` 含 CR/LF |
+| `message.rs:270` / `:271` / `:277` | `headers` 名含 CR/LF / 值含 CR/LF / 覆盖 `From`/`To`/`Cc`/`Bcc`/`Subject` |
+| `message.rs:251` | 附件 `mime` 非法 |
+
+两处**不属于** `code:5` 的失败（属 req 形态错误，沿用阶段 4 口径在 `submit` 期即 FFI `Err`，
+不占队列槽位）：`Req` 反序列化失败（`engine.rs:270`，含缺 `from`）与未知 profile（`engine.rs:279`）；
+`deliver_one` 侧的同名兜底在 `engine.rs:451`。
+
+#### 6. 变异验证（3 条，证明新断言真在钉行为）
+
+| 变异 | 期望红的用例 | 实测 |
+|---|---|---|
+| `CONFLICTING_HEADERS` 的 `"subject"` 改成 `"subjex"` | `raw_strips_from_to_cc_bcc_subject_case_insensitively` | **首次 FAILED 的只有 engine 落盘用例** ⇒ 暴露消息侧断言过弱（原 raw 的 `SUBJECT: s` 与其它断言无交集）→ 已加强（见 §7.8）；复验同变异下**两条都 FAILED** |
+| 折行续行改为无条件保留 | `raw_strips_folded_continuation_of_stripped_header_only` | **FAILED**（输出里出现 `leak-me`） |
+| 删掉 `align_attachments` 的长度校验 | `rejects_attachment_count_mismatch` + `attachment_count_mismatch_returns_code5` | **双双 FAILED**（2 failed） |
+
+#### 7. 与任务书/计划的偏差（均有实测依据，未弱化任何断言）
+
+1. **`build_raw` 返回 `Vec<u8>`（最终字节）而非 `lettre::Message`**：任务书示例用例是
+   `build_raw(..).unwrap().formatted()`。改用 `Message` 无法做到「原文原样」——`MessageBuilder::body`
+   会重编码正文（行 ≥76 字节即 QP/base64）而原文报头保留（见 §4），实测依据是
+   `email_encoding-0.4.2/src/body/chooser.rs` 的 `line_too_long` 与
+   `lettre-0.11.23/src/message/body.rs:190` 的 `expect("invalid encoding")` panic 面。
+   故示例用例的绑定行改为 `String::from_utf8(build_raw(&envelope(), raw, &[]).unwrap())`，
+   **断言一条未动**（X-Keep/body 保留、evil/victim 消失），并新增运行期用例读回落盘 `.eml` 佐证。
+2. **`SendRequest.subject` 加 `#[serde(default)]`**（任务书给必填 `String`）：design §5 的
+   `sendRaw(o)` 只传 `from`/`to`/`raw`，必填会把 raw 路堵死；阶段 4 的 `req_raw` 夹具同样不带
+   subject，必填会让**全部**既有引擎用例解析失败。
+3. **`from` 保持必填**：缺 `from` 现在是 `submit` 期的 FFI `Err`（`missing field \`from\``）而非
+   `code:5` 信封 —— 与 vtable 文档「req 形态错误 → Err」一致；连带把
+   `vtable_submit_fails_loud_without_matching_profile` 的 req 从 `{}` 改为合法形态（该用例要钉的是
+   profile 守卫，`{}` 会被 JSON 形态分支先拦下，测不到目标分支）。用例注释已写明这条。
+4. **raw 路的结构化 `cc`/`bcc` 直接 fail-loud**（任务书未提）：raw 的报头由原文承载、而原文
+   Cc/Bcc 会被剥离 ⇒ 结构化 cc/bcc 无处安放。静默丢件与塞进 `To:`（泄露 Bcc）都不可接受。
+   design §5 的 `sendRaw` 本就只传 `from`/`to`/`raw`，与此一致。
+5. **`headers` 禁止覆盖 `From`/`To`/`Cc`/`Bcc`/`Subject`，且值/名/地址拒 CR/LF**（任务书未提）：
+   组装路的信封是 lettre **由报头派生**的，允许覆盖 = 绕过宿主收件人白名单的面；CRLF 拒绝是
+   设计 §10/§11「宿主剥离」之外的纵深防线（插件是 MIME 输出的最后一环）。
+6. **附件引用必须恰给 `blobKey`/`path` 之一**：契约完整性检查，同时避免 `blob_key`/`path`
+   成为「只写不读」字段（cdylib + 私有模块下会 `dead_code` 报错）。
+7. **raw 的 `Subject` 剥离后不重生**（已知行为，非 bug）：spec §11 明列剥离 `Subject`，而
+   `build_raw` 的入参只有信封（示例签名），没有结构化 `subject` 的位置 ⇒ 结构化 `subject`
+   在 raw 路被忽略。**归阶段 6/8 决策**（见 §8.1）。
+8. **提交粒度**：按任务书拆成两次 feat 提交（5.1 / 5.2），另加一次测试加强（`3599b47`，变异
+   验证暴露的弱断言）与一次小结提交。5.1 的中间态是「组装路已通、raw 仍原文直通」，两种状态
+   都跑了全量门禁（47 / 54 绿），不是为了拆分而拆分。
+
+#### 8. 遗留 / 转下阶段
+
+1. **raw 路主题语义待定**（§7.7）：`sendRaw` 若需要主题，阶段 6 的宿主可在过线前把结构化
+   `subject` 注入 raw 原文（宿主本就要做 CRLF 剥离，顺带做），或在阶段 8 扩展 `build_raw`
+   的签名收一个 `subject`。**当前行为（已知）**：raw 路的结构化 `subject` 被忽略，原文的
+   `Subject:` 被剥离 —— 已在 `message.rs` 模块头写明，不留暗坑。
+2. **`attachments` 的 mime 嗅探在宿主**（阶段 6）：插件只认 `atts[i].mime`/显式 `mime`，
+   `path`/`blobKey` 的解析、越界与白名单校验全在宿主 `src/bridge/mail.rs`。
+3. **诊断细节**：阶段 4 遗留的「lettre 原始错误只出分类文案」未变；`HostContext.log` 上送
+   归阶段 6。
+4. `Message` 组装路的日期/`Message-ID` 由 lettre 补齐（`date_now`/`hostname`），宿主无需干预；
+   file transport 落盘 id 仍与 `messageId` 同源（阶段 4 既有断言继续守着）。
+
 
 ### 阶段 6 小结
 （待填）
