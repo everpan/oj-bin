@@ -441,15 +441,42 @@ fn probe_finds_mail_axis_and_zero_axis_mini_misses_it() {
     assert_eq!(mmail.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
 }
 
-/// mail 轴已登记进宿主：`AXES` 含 "mail" 且 `Registrations` 有对应槽位。
-/// （`probe_axes` 的 `"mail"` 臂由 `probe_finds_mail_axis_and_zero_axis_mini_misses_it`
-/// 用 mini-mail 夹具做行为级覆盖。）
+/// `Registrations::provides` 的 one-hot 守护：只把 mail 槽置 `Some`，`provides` 必须
+/// **仅**对 "mail" 为 true。能捕获 `"mail" => self.mq.is_some()` 这类复制粘贴错
+/// （轴名与槽位错配）——那种错在 `probe_axes` 里是 UB 转型、在纯 is_some 断言下无从察觉。
+/// 哨兵 `submit` 体 `unreachable!()`：`provides` 只做 `is_some()`，不会调用方法。
 #[test]
-fn axes_and_registrations_wire_mail() {
+fn given_only_mail_slot_set_when_provides_then_only_mail_is_true() {
+    extern "C" fn submit(
+        _: oj_plugin_ffi::RString,
+        _: oj_plugin_ffi::RString,
+        _: oj_plugin_ffi::RVec<oj_plugin_ffi::MailAttachment>,
+    ) -> oj_plugin_ffi::FfiFuture {
+        unreachable!("provides 只做 is_some()，不调用 vtable 方法")
+    }
+    static MAIL_VT: oj_plugin_ffi::MailVtable = oj_plugin_ffi::MailVtable { submit };
+
+    // mail 必须在 AXES 里，否则下面的循环覆盖不到它（本断言非恒真）。
     assert!(AXES.contains(&"mail"));
-    // Registrations 含 mail 字段（编译期即可断言）
+    let r = Registrations {
+        mail: Some(&MAIL_VT),
+        ..Default::default()
+    };
+    for a in AXES {
+        assert_eq!(r.provides(a), Some(*a == "mail"), "axis {a} 判定错配");
+    }
+}
+
+/// `AXES` 每项都必须有 `provides` 分支（加轴漏改 → 本测试红，而不是等到
+/// `cargo xtask plugin <name> --check` 才发现）。未知轴须返回 `None`（而非 panic），
+/// `check()` 据此给普通 Err。
+#[test]
+fn given_axes_table_when_provides_then_every_axis_has_a_branch() {
     let r = Registrations::default();
-    assert!(r.mail.is_none());
+    for a in AXES {
+        assert!(r.provides(a).is_some(), "axis {a} 缺 provides 分支");
+    }
+    assert_eq!(r.provides("no-such-axis"), None);
 }
 
 /// mini-mq call echo 契约冒烟：method + payload 原样回显（JSON in → JSON out）。
