@@ -14,13 +14,15 @@ type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
 // 数据库查询返回的一行（列名 -> 值）。
 type Row = Record<string, Json>;
 
-// db.table(...).where(cond) 的单个条件。
+// db.table(...).where(cond) 的单个条件。叶子用 field/op/value；组合用 and/or/not
+// （也可经 db.leaf/db.and/db.or/db.not 构造）——故 field 可缺省（纯组合节点）。
 interface WhereCond {
-  field: string;
-  op?: string; // eq/neq/gt/gte/lt/lte/like/in/... 依服务端支持
+  field?: string;
+  op?: string; // eq/neq/gt/gte/lt/lte/like/in/nin/null/notnull/... 依服务端支持
   value?: unknown;
   and?: WhereCond[];
   or?: WhereCond[];
+  not?: WhereCond;
 }
 
 // db.table(...).orderBy(items) 的单个排序项。
@@ -44,9 +46,23 @@ interface QueryBuilder {
   update(sets: object): QueryBuilder;
   delete(): QueryBuilder;
   returning(cols?: string[]): QueryBuilder;
+  // JOIN：on = 左右列对；kind 缺省 "inner"（left/right/... 依服务端支持）。
+  join(
+    table: string,
+    on: { left: string; right: string }[],
+    kind?: string,
+  ): QueryBuilder;
+  // DISTINCT / GROUP BY / HAVING / UNION / CTE（WITH）。
+  distinct(): QueryBuilder;
+  groupBy(cols?: string[]): QueryBuilder;
+  having(cond: WhereCond): QueryBuilder;
+  union(other: QueryBuilder, kind?: string): QueryBuilder;
+  with(name: string, columns: string[], query: QueryBuilder): QueryBuilder;
   run(): Promise<number | Row[]>;
   // 只构造不执行（与 .all()/.run() 完全相同的校验管线）。
   toSQL(): { sql: string; params: unknown[] };
+  // 序列化当前构造成员（可经 db.fromJSON 复原继续链式调用）。
+  toJSON(): object;
 }
 
 // DB(name) 返回的命名数据库实例。
@@ -57,6 +73,16 @@ interface DBInstance {
   exec(sql: string, params?: unknown[]): Promise<number>;
   // 安全查询构造器（标识符白名单 + 参数化值）。
   table(name: string): QueryBuilder;
+  // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
+  leaf(field: string, op: string, value?: unknown): WhereCond;
+  and(...conds: WhereCond[]): WhereCond;
+  or(...conds: WhereCond[]): WhereCond;
+  not(cond: WhereCond): WhereCond;
+  // 从 toJSON() 快照复原构造器（继续链式调用）。
+  fromJSON(snap: object): QueryBuilder;
+  // 系统逃生通道（tenant sql_guard）：本请求绕过租户注入/校验。显式且被审计，
+  // 业务 handler 不得使用。
+  asSystem(): DBInstance;
   // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
   // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
   tx(fn: (tx: DBInstance) => unknown): Promise<unknown>;
@@ -67,6 +93,8 @@ interface JsonApi {
   ok(data?: unknown): void;
   fail(code: number, msg: string, data?: unknown): void;
   header(name: string, value: string): void;
+  // 裸 JSON 200（不套信封）：标准协议端点（如 OIDC）用；错误仍走 fail()。
+  raw(data?: unknown): void;
 }
 
 // http.* ：当前请求上下文（只读，懒加载，per-request 最新）。
@@ -407,6 +435,13 @@ interface OjRabbitClient {
   nack(m: OjMqMessage, requeue?: boolean): Promise<Record<string, never>>;
   metadata(): Promise<any>;
 }
+
+// oj 的导入别名 `#x`（本模块根）/ `#/m/x`（src 根）是「引用方所在模块」相对的，
+// tsconfig 的 `paths` 无法表达模块相对解析，只能枚举模块目录（见 tsconfig.json），
+// 因此仅能命中**已存在**的文件。无法静态定位的别名（如尚未创建的 `#_shared/view`）
+// 由 `types/oj-modules.d.ts`（非模块，真 ambient `declare module "#*"`）兜底为 `any`
+// 而非报 TS2307；已存在、能被 `paths` 命中的别名仍走真实文件类型。运行时由 oj 的
+// loader 解析，本文件与该兜底只影响编辑器 / tsc。
 
 // fetch 返回的 Response（浏览器风格子集）。
 interface OjFetchResponse {

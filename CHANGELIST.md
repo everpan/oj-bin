@@ -39,6 +39,19 @@
     副本）；`cargo xtask plugin mail --check` 可预检。JS 类型面见 `docs/devkit/api-manual.md`
     第 6 章 mail 小节。
 
+**修复**
+- **IDE 类型：`#` 别名报 TS2307、`QueryBuilder`/`json` 声明滞后**（`sample/global.d.ts`、
+  `sample/tsconfig.json`、`sample/types/oj-modules.d.ts`）：
+  - `QueryBuilder` 补 `join`（`{left,right}[]` + kind）/`distinct`/`groupBy`/`having`/`union`/`with`/`toJSON`；
+    `DBInstance` 补 `leaf`/`and`/`or`/`not`/`fromJSON`/`asSystem`；`JsonApi` 补 `raw`（裸 JSON 200）；
+    `WhereCond.field` 改可选并补 `not`（纯组合节点，与运行期 `condObj` 一致）。
+  - **`#` 别名 TS2307**：`#x`/`#/m/x` 是「引用方模块」相对，TS `paths` 只能静态枚举模块目录，
+    未创建或不在枚举内的别名（如 `#_shared/view`）报 TS2307。修法：新增**非模块** `.d.ts`
+    （`sample/types/oj-modules.d.ts`）内的 `declare module "#*";` 作真 ambient 兜底——命中真实
+    文件仍走真类型，未命中降级为 `any`（放在模块化的 `global.d.ts` 里无效，`paths` 命中时
+    ambient 也被忽略，均为实测）。该文件随 devkit 分发（`copy_devkit` 增归置 + 守卫测试），
+    业务项目须与 `global.d.ts` 一并拷入并纳入 tsconfig `include`（`docs/devkit/README.md`）。
+
 **行为变更（升级注意）**
 - **新增顶层 `smtp:` 段**：此前该键被忽略，现在会被解析——若旧配置里恰好有同名且**非映射**
   的键（如 `smtp: false`），启动会解析失败；改名或删掉即可。不写该段则行为完全不变

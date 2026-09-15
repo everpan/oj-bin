@@ -189,6 +189,7 @@ specifier 分支，不改解析主流程。
 | 扫描器统一（缺口） | 主构建路径补上副作用/动态 import 改写（原先只有 tasks 镜像覆盖） |
 | api.ts 守卫（缺口） | 扩展到别名 specifier（§6.3） |
 | 编辑器对齐 | `sample/tsconfig.json` 补 `paths`：`"#/*": ["./src/*"]` + `"#*": [各模块 /*]`（tsconfig 每个 pattern 只允许一个 `*`，故模块根形式只能逐模块列出、按序 best-effort；值须带 `./` 前缀——无 `baseUrl` 时非相对值会被 vite/esbuild 警告；**不放 `baseUrl`**，以免改变裸包解析）。**手维护**：新增模块时同步 `#*` 列表（不自动生成——build 改用户配置文件风险大于收益） |
+| 编辑器兜底（TS2307） | `paths` 只命中**已存在**的文件；`#` 别名是「引用方模块」相对，`paths` 无法表达 → 未创建/不在枚举内的 `#` 导入报 TS2307。修法：**非模块** `.d.ts`（`sample/types/oj-modules.d.ts`）里 `declare module "#*";` 作 ambient 兜底（放在 `global.d.ts` 里无效——模块文件的 `declare module` 是 augmentation，且 `paths` 命中时 ambient 被忽略；实测：命中真实文件仍走真类型，未命中降级为 `any` 不再报错）。该文件随 devkit 分发（`copy_devkit`），业务项目须拷入并纳入 tsconfig `include` |
 | L2 单测对齐 | `sample/unit/vitest.config.ts`：`resolveId` 插件镜像同规则。L2 跑在 vite 解析器上，被 spec 直接 import 的模块内文件一旦用别名，不经镜像即按 Node `package.json#imports` 解释 `#` 而解析失败 |
 
 ## 9. 边界与非目标

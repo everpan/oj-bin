@@ -189,7 +189,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// 归置 devkit（docs/devkit 三件 + docs/oidc-{integration,implementation}.md +
-/// sample/global.d.ts）-> bin/devkit/。
+/// sample/global.d.ts + sample/types/oj-modules.d.ts）-> bin/devkit/。
+/// `oj-modules.d.ts` 是**非模块**的 ambient 兜底（`declare module "#*"`），为 `#` 导入
+/// 别名提供兜底——必须与 global.d.ts 一并分发，否则业务项目编辑器仍会对无法静态
+/// 定位的 `#` 导入报 TS2307。
 /// 仅 `build` 全量归置时调用；`bin`/`plugin` 单体子命令不拖文档。
 fn copy_devkit() -> Result<(), String> {
     let src_dir = root().join("docs").join("devkit");
@@ -210,6 +213,16 @@ fn copy_devkit() -> Result<(), String> {
     let dts_dst = dst_dir.join("global.d.ts");
     fs::copy(&dts_src, &dts_dst)
         .map_err(|e| format!("copy {} -> {}: {e}", dts_src.display(), dts_dst.display()))?;
+    // `#` 别名兜底（非模块 .d.ts，不能并入 global.d.ts——模块文件里的 ambient 失效）。
+    let alias_src = root().join("sample").join("types").join("oj-modules.d.ts");
+    let alias_dst = dst_dir.join("oj-modules.d.ts");
+    fs::copy(&alias_src, &alias_dst).map_err(|e| {
+        format!(
+            "copy {} -> {}: {e}",
+            alias_src.display(),
+            alias_dst.display()
+        )
+    })?;
     println!("copied devkit -> {}", dst_dir.display());
     Ok(())
 }
@@ -541,10 +554,12 @@ mod tests {
 
     #[test]
     fn given_repo_docs_when_copy_devkit_then_bin_devkit_fresh_with_oidc_and_dts() {
-        // 发行契约：devkit = docs/devkit 三件 + 两份 OIDC 手册 + sample/global.d.ts。
+        // 发行契约：devkit = docs/devkit 三件 + 两份 OIDC 手册 + sample/global.d.ts
+        // + sample/types/oj-modules.d.ts（`#` 别名 ambient 兜底，须一并分发）。
         copy_devkit().unwrap();
         let dk = bin_dir().join("devkit");
         assert!(dk.join("global.d.ts").exists());
+        assert!(dk.join("oj-modules.d.ts").exists());
         assert!(dk.join("oidc-integration.md").exists());
         assert!(dk.join("oidc-implementation.md").exists());
         assert!(dk.join("api-manual.md").exists());

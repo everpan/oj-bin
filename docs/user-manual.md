@@ -189,7 +189,8 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   除 `workers`/`queue_capacity` 外**每个键都是一个 profile**（键 = `Mail(key)` / `mail.send`
   的 profile 名，未声明的 key 报错）。白名单**后缀匹配且 fail-closed（空表 = 拒绝）**；
   `tls: none` 须显式 `allow_none_tls: true`；`file_transport: <dir>` 给定则不发网络、`.eml`
-  落该目录（目录须先存在，测试/归档通道）。API 与错误码见 `devkit/api-manual.md` §6「mail」。
+  落该目录（目录须先存在，测试/归档通道）。API 与错误码见 `devkit/api-manual.md` §6「mail」；
+  完整手册（架构/附件与 `sendRaw` 语义/反馈通道/安全/运维/已知限制）见 `docs/mail-smtp.md`。
 - `plugins` / `plugins_dir`：插件装配。`plugins` 为 **map**，一段三用：键 = 要加载的插件名
   （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，**必须是 YAML 映射（对象）**——
   非空对象原样透传、空对象 = 回落轴适配器，字符串/列表等非对象值视为未提供，静默回落到
