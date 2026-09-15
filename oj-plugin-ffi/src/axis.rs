@@ -8,7 +8,7 @@ use std::ffi::c_void;
 
 use crate::{
     AuthGuardVtable, BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable,
-    KVStoreVtable, MailAxis, MqVtable,
+    KVStoreVtable, MailVtable, MqVtable,
 };
 
 pub fn es(vt: &'static EsBackendVtable) -> *const c_void {
@@ -39,7 +39,7 @@ pub fn mq(vt: &'static MqVtable) -> *const c_void {
     vt as *const _ as *const c_void
 }
 
-pub fn mail(vt: &'static MailAxis) -> *const c_void {
+pub fn mail(vt: &'static MailVtable) -> *const c_void {
     vt as *const _ as *const c_void
 }
 
@@ -62,7 +62,7 @@ mod tests {
         let _: fn(&'static KVStoreVtable) -> *const c_void = axis::kv;
         let _: fn(&'static AuthGuardVtable) -> *const c_void = axis::auth;
         let _: fn(&'static MqVtable) -> *const c_void = axis::mq;
-        let _: fn(&'static MailAxis) -> *const c_void = axis::mail;
+        let _: fn(&'static MailVtable) -> *const c_void = axis::mail;
     }
 
     /// 运行期抽查：helper 返回的裸指针与引用同址且非空。auth 是唯一单字段 vtable，

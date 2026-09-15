@@ -31,8 +31,8 @@
 - **插件（`plugins/oj-mail`，cdylib）**：持有 `lettre`、连接池（transport）、**有界队列 + worker 池**、实际投递；经 `FfiFuture`/`deliver` 回传结果。**不直接访问宿主 blob/bus**（`HostContext` 不提供）。
 
 **新增轴**
-- `oj-plugin-ffi`：增 `MailAxis` repr(C) vtable + `MailAttachment` repr(C)；`plugin_loader` 增 `axis::mail` 类型配对 helper；`AXES` 增 `"mail"` + `probe_axes` 分支 + `Registrations` 字段。**不 bump `ABI_VERSION`**（新增轴零破坏，保持 8）。
-- `plugins/oj-mail`：实现 `MailAxis`，`oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE))`。
+- `oj-plugin-ffi`：增 `MailVtable` repr(C) vtable + `MailAttachment` repr(C)；`plugin_loader` 增 `axis::mail` 类型配对 helper；`AXES` 增 `"mail"` + `probe_axes` 分支 + `Registrations` 字段。**不 bump `ABI_VERSION`**（新增轴零破坏，保持 8）。
+- `plugins/oj-mail`：实现 `MailVtable`，`oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE))`。
 - 宿主 `src/bridge/mail.rs`：`#[op2]` `op_mail_send/send_sync/enqueue/result/send_raw`，经 `StableState.mail`（`Arc<dyn MailBackend>`，包装 vtable）调用；`bootstrap.js` 挂载 `Mail`/`mail`。
 - `StableState` 与 `Extras` **各增字段** `mail: Option<Arc<dyn MailBackend>>`（`mod.rs:123/164`），在 `with_dbs_and_loader` 注入（首次 run 前）；**不进 `ReqState`**。
 
@@ -104,7 +104,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 **`oj-plugin-ffi`（契约）**
 - `MailAttachment`（repr(C)）：`{ filename: RString, mime: RString, bytes: RBytes }`——**字节由宿主解析后传入**，不经 JSON/base64。
-- `MailAxis`（repr(C)）：`submit(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture`。`req` JSON 含 `{ sync, enqueue_only, raw?, from, to[], cc[], bcc[], subject, text?, html?, headers{}, jobId }`。
+- `MailVtable`（repr(C)）：`submit(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture`。`req` JSON 含 `{ sync, enqueue_only, raw?, from, to[], cc[], bcc[], subject, text?, html?, headers{}, jobId }`。
   - `submit` 返回 `FfiFuture`（`catch_future` 包装）；`send` 语义：future resolve = 投递结果信封；`enqueue` 语义：future 立即 resolve `{jobId}`，真实完成经 `HostContext.deliver`。
 - `AXES` 增 `"mail"`（同步 `probe_axes` 分支 + `Registrations.mail` 字段）；`axis::mail` helper；**ABI 不变（8）**。
 
@@ -115,7 +115,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 - init 建 transport 前 `rustls::crypto::CryptoProvider::install_default(aws_lc_rs::default_provider())`（幂等）。
 
 **`src/bridge/mail.rs`（宿主）**
-- `MailBackend` trait 包装 `MailAxis` vtable；`StableState.mail` 持有。
+- `MailBackend` trait 包装 `MailVtable` vtable；`StableState.mail` 持有。
 - ops：校验（CRLF/地址/白名单）→ 解析附件（`StableState.blobs.get(name)?.get(key).await` / `ensure_within`+`fs::read`，复用已 canonicalize 句柄防 TOCTOU）→ 组装 `MailAttachment` → `submit` → `send` await FfiFuture 回信封。
 - 宿主侧 `MailResultStore`（`DashMap<job_id, Envelope>` + 限长/TTL）：`deliver("mail.result")` 路由到「存结果 + 本地 bus 扇出（供 JS `bus.subscribe`）」；`op_mail_result` 读它。需 `bus` 分布式时由宿主 `EventBroker::publish("mail.result", &BusPayload::Json(..)).await`。
 - `MailConfig`（非密钥面）供校验与 profile 列举。
@@ -184,4 +184,4 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 ## 14. 里程碑
 
-纳入 **v0.1.20**：①`oj-plugin-ffi` 增 `MailAxis`/`MailAttachment` + `AXES`/`probe_axes`/`Registrations` 加 `"mail"` + `axis::mail`（ABI 保持 8）；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。
+纳入 **v0.1.20**：①`oj-plugin-ffi` 增 `MailVtable`/`MailAttachment` + `AXES`/`probe_axes`/`Registrations` 加 `"mail"` + `axis::mail`（ABI 保持 8）；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。

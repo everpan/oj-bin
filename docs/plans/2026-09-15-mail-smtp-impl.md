@@ -4,7 +4,7 @@
 
 **Goal:** 以 cdylib 插件 `oj-mail` 新增 `mail` 轴，向 JS 提供 `Mail`/`mail` 全局，支持多 profile 的同步/异步 SMTP 发送、队列线程池与双通道反馈。
 
-**Architecture:** 宿主（核心 `src/bridge/`）负责配置装配、入参校验、附件字节解析、bus 发布、结果存储与 JS 全局挂载；插件（`plugins/oj-mail`）持 `lettre`、连接池、有界队列 + worker 池并实际投递；二者经 `oj-plugin-ffi` 的 `MailAxis`（repr(C) + `FfiFuture`）契约通信。
+**Architecture:** 宿主（核心 `src/bridge/`）负责配置装配、入参校验、附件字节解析、bus 发布、结果存储与 JS 全局挂载；插件（`plugins/oj-mail`）持 `lettre`、连接池、有界队列 + worker 池并实际投递；二者经 `oj-plugin-ffi` 的 `MailVtable`（repr(C) + `FfiFuture`）契约通信。
 
 **Tech Stack:** Rust 2024 · deno_core `#[op2]` · `oj-plugin-ffi`（stabby repr(C) + `FfiFuture`）· `lettre`（rustls/tokio1）· `rustls = "=0.23.40"` + aws-lc-rs · tokio。
 
@@ -19,7 +19,7 @@
   - 单测：`cargo test --release -p <crate> <filter>`
   - 门禁：`cargo fmt --check` + `cargo clippy --release --all-targets -- -D warnings`
   - 插件：`cargo xtask plugin mail` / `cargo xtask plugin mail --check`
-- **SOLID 落地**：`MailAxis`（接口）与 `oj-mail`（实现）分离；宿主 `MailBackend` trait 隔离 FFI 细节（依赖倒置）；每个 profile 一个 `MailProfile`（单一职责）；校验/附件解析/发送/存储各自独立函数（可组合）。
+- **SOLID 落地**：`MailVtable`（接口）与 `oj-mail`（实现）分离；宿主 `MailBackend` trait 隔离 FFI 细节（依赖倒置）；每个 profile 一个 `MailProfile`（单一职责）；校验/附件解析/发送/存储各自独立函数（可组合）。
 - **每阶段收尾**：跑本阶段全部测试 + `fmt`/`clippy`；`TaskUpdate` 标记完成；在计划文件末尾追加「阶段小结」（改了什么、测试结果、遗留）。
 - **提交粒度**：每任务一次 `git commit`（中文信息，`type(scope): …`）。
 
@@ -74,11 +74,11 @@ cargo test --release -p oj --lib             # 基线绿
 
 ## 阶段 1：FFI 契约（`oj-plugin-ffi`）
 
-### Task 1.1：`MailAttachment` + `MailAxis` repr(C) 类型
+### Task 1.1：`MailAttachment` + `MailVtable` repr(C) 类型
 
 **Files:**
 - Create: `oj-plugin-ffi/src/mail.rs`
-- Modify: `oj-plugin-ffi/src/lib.rs`（`pub mod mail;` + `pub use mail::{MailAxis, MailAttachment};`）
+- Modify: `oj-plugin-ffi/src/lib.rs`（`pub mod mail;` + `pub use mail::{MailVtable, MailAttachment};`）
 
 **Step 1: 写失败测试**（`oj-plugin-ffi/src/mail.rs` 底部 `#[cfg(test)]`）
 
@@ -114,7 +114,7 @@ pub struct MailAttachment {
 /// 真实完成经 `HostContext.deliver("mail.result", ...)` 上送。
 #[stabby::stabby]
 #[repr(C)]
-pub struct MailAxis {
+pub struct MailVtable {
     pub submit: extern "C" fn(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture,
 }
 ```
@@ -130,7 +130,7 @@ pub struct MailAxis {
 **Step 1: 失败测试**（追加到现有 `helpers_bind_exact_vtable_types`）
 
 ```rust
-let _: fn(&'static MailAxis) -> *const c_void = axis::mail;
+let _: fn(&'static MailVtable) -> *const c_void = axis::mail;
 ```
 
 Run: `cargo test --release -p oj-plugin-ffi helpers_bind_exact_vtable`
@@ -139,9 +139,9 @@ Expected: FAIL（`axis::mail` 不存在）
 **Step 2: 实现**
 
 ```rust
-pub fn mail(vt: &'static MailAxis) -> *const c_void { vt as *const _ as *const c_void }
+pub fn mail(vt: &'static MailVtable) -> *const c_void { vt as *const _ as *const c_void }
 ```
-并在 `use crate::{...}` 补 `MailAxis`。
+并在 `use crate::{...}` 补 `MailVtable`。
 
 **Step 3: 跑测试** → PASS。 **Step 4: 提交**
 
@@ -169,9 +169,9 @@ Expected: FAIL
 ```rust
 pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail"];
 // probe_axes match 增：
-"mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailAxis) }),
+"mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailVtable) }),
 // Registrations 增字段：
-pub mail: Option<&'static oj_plugin_ffi::MailAxis>,
+pub mail: Option<&'static oj_plugin_ffi::MailVtable>,
 ```
 
 **Step 3: 跑测试** → PASS；再跑 `cargo test --release -p only-js plugin`。
@@ -231,7 +231,7 @@ Expected: FAIL（插件未构建/缺符号）
 ```rust
 //! oj-mail：mail 轴 cdylib 插件（lettre SMTP）。宿主负责配置/校验/附件字节解析/bus；
 //! 本插件负责连接池、有界队列 + worker 池、投递，经 FfiFuture/deliver 回传。
-use oj_plugin_ffi::{MailAxis, PluginDescriptor, RResult, RString, FfiFuture, RVec, MailAttachment, HOST_FINGERPRINT};
+use oj_plugin_ffi::{MailVtable, PluginDescriptor, RResult, RString, FfiFuture, RVec, MailAttachment, HOST_FINGERPRINT};
 
 fn init(_host: oj_plugin_ffi::RArc<oj_plugin_ffi::HostContext>, cfg: RString)
     -> RResult<PluginDescriptor, RString> {
@@ -250,7 +250,7 @@ extern "C" fn submit(_key: RString, _req: RString, _atts: RVec<MailAttachment>) 
     oj_plugin_ffi::ready_err("oj-mail: submit not implemented")
 }
 
-static MAIL_VTABLE: MailAxis = MailAxis { submit };
+static MAIL_VTABLE: MailVtable = MailVtable { submit };
 
 oj_plugin_ffi::oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE));
 ```
@@ -749,10 +749,10 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
 
 | 文件 | 要点 |
 |---|---|
-| `oj-plugin-ffi/src/mail.rs`（新增） | `MailAttachment{filename: RString, mime: RString, bytes: RBytes}`、`MailAxis{submit: extern "C" fn(key, req, atts) -> FfiFuture}`（均 `#[stabby::stabby] #[repr(C)]`）。附件字节由宿主解析后**原样过线**，不经 JSON/base64；方法面演进走 req JSON 字段（同 mq 的 JSON dispatch 思路）。模块注释写明契约形态与 ABI 立场。 |
-| `oj-plugin-ffi/src/lib.rs` | `pub mod mail;` + `pub use mail::{MailAttachment, MailAxis};`（按字母序插在 `kv`/`mq` 之间）。`ABI_VERSION` **未改**。 |
-| `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailAxis) -> *const c_void`；`use crate::{…, MailAxis}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailAxis) -> *const c_void = axis::mail;` 编译期配对断言。复审期一并补上历史缺口 `axis::mq` 的同形断言。 |
-| `src/bridge/plugin_loader.rs` | 三处同改：`AXES`（:432）追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailAxis))`；`Registrations`（:104）增 `pub mail: Option<&'static oj_plugin_ffi::MailAxis>`。 |
+| `oj-plugin-ffi/src/mail.rs`（新增） | `MailAttachment{filename: RString, mime: RString, bytes: RBytes}`、`MailVtable{submit: extern "C" fn(key, req, atts) -> FfiFuture}`（均 `#[stabby::stabby] #[repr(C)]`）。附件字节由宿主解析后**原样过线**，不经 JSON/base64；方法面演进走 req JSON 字段（同 mq 的 JSON dispatch 思路）。模块注释写明契约形态与 ABI 立场。 |
+| `oj-plugin-ffi/src/lib.rs` | `pub mod mail;` + `pub use mail::{MailAttachment, MailVtable};`（按字母序插在 `kv`/`mq` 之间）。`ABI_VERSION` **未改**。 |
+| `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailVtable) -> *const c_void`；`use crate::{…, MailVtable}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailVtable) -> *const c_void = axis::mail;` 编译期配对断言。复审期一并补上历史缺口 `axis::mq` 的同形断言。 |
+| `src/bridge/plugin_loader.rs` | 三处同改：`AXES`（:432）追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailVtable))`；`Registrations`（:104）增 `pub mail: Option<&'static oj_plugin_ffi::MailVtable>`。 |
 | `src/bridge/plugin_loader/tests.rs` | 新增 `axes_and_registrations_wire_mail`（初版名 `axes_includes_mail_and_probe_branch_is_wired` **名不符实**——实际不覆盖 `probe_axes` 臂；复审期改名并在注释中说明该局限）。 |
 | `tools/xtask/src/main.rs` | **复审修复**（见 §6）：`AXES` 的第 4 个消费点（`check()` 的汇总 match）此前漏改且含 `unreachable!` → 所有插件预检 panic；改为 `axis_present() -> Option<bool>` + 普通 `Err`，并加表驱动守护测试。 |
 

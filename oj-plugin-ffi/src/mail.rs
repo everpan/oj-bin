@@ -20,7 +20,7 @@ pub struct MailAttachment {
 /// 真实完成经 `HostContext.deliver("mail.result", ...)` 上送。
 #[stabby::stabby]
 #[repr(C)]
-pub struct MailAxis {
+pub struct MailVtable {
     pub submit: extern "C" fn(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture,
 }
 
