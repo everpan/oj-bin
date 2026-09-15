@@ -490,7 +490,9 @@ impl FfiBlobBackend {
     }
 }
 
-/// Vec<u8> → RBytes（stabby 无 From<&[u8]>，逐元素 push）。
+/// Vec<u8> → RBytes（逐元素 push；等价于 `RBytes::from(&bytes[..])`——stabby-abi 实现了
+/// `impl<T: Copy, Alloc: IAlloc + Default> From<&[T]> for Vec<T, Alloc>`。此处保留逐元素
+/// 形态仅为不动 blob 既有路径；早先「stabby 无 From<&[u8]>」的注释与实测不符，已订正）。
 fn to_rbytes(bytes: &[u8]) -> RBytes {
     let mut v = RBytes::new();
     for b in bytes {
