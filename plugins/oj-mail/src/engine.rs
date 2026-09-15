@@ -19,11 +19,12 @@
 //!
 //! ## 分期边界
 //!
-//! 消息组装（text/html/headers/附件 MIME）与附件字节消费归**阶段 5**；本阶段 worker
-//! 只走「原始 MIME」路（req 的 `raw`），缺 `raw` 时显式报错，绝不空信假装成功。
+//! 消息组装（text/html/headers/附件 MIME）与附件字节消费归**阶段 5**（`message.rs`）：
+//! worker 投递前按 `req.raw` 有无二选一 —— 有 `raw` → 原文，无 → 结构化组装。
 
+use crate::message::{SendRequest, build_message, envelope_of};
 use crate::{build_profiles, config::MailConfig};
-use lettre::address::{Address, Envelope};
+use lettre::address::Envelope;
 use oj_plugin_ffi::{FfiFuture, MailAttachment, ready_err, ready_ok, spawn_ffi_future};
 use serde::Deserialize;
 use serde_json::json;
@@ -116,9 +117,9 @@ impl MailTarget {
 struct Job {
     /// profile 名（`smtp.profiles` 的键）；未知则投递失败（不回落 default）。
     key: String,
-    /// 宿主过线的 req JSON 原文（本阶段只用其 `raw`/`from`/`to`/`sync`/`enqueue_only`/`jobId`）。
+    /// 宿主过线的 req JSON 原文（worker 侧重新解析；见 [`Req`]）。
     req: String,
-    /// 宿主已解析好的附件原始字节（阶段 5 消费；本阶段仅校验「与 raw 互斥」）。
+    /// 宿主已解析好的附件原始字节（阶段 5 消费：按下标与 `attachments` 对齐）。
     atts: Vec<MailAttachment>,
     /// `send` 语义下的结果回传口；`enqueue_only` 时为 `None`（完成经 `deliver` 上送）。
     respond: Option<oneshot::Sender<Result<String, String>>>,
@@ -130,7 +131,7 @@ struct Job {
     sync: bool,
 }
 
-/// 本阶段的**最小** req 视图（组装字段归阶段 5）。
+/// req 视图 = 引擎侧开关（`sync`/`enqueue_only`/`jobId`）+ 组装字段（[`SendRequest`]）。
 #[derive(Deserialize)]
 struct Req {
     #[serde(default)]
@@ -138,18 +139,12 @@ struct Req {
     /// 兼容 `enqueueOnly` 写法（宿主/JS 两侧命名习惯不同，两个都收）。
     #[serde(default, alias = "enqueueOnly")]
     enqueue_only: bool,
-    /// RFC5322 原文（本阶段唯一支持的投递形态）。
-    #[serde(default)]
-    raw: Option<String>,
-    /// 信封发件人。
-    #[serde(default)]
-    from: Option<String>,
-    /// 信封收件人（宿主保证为数组；给单个字符串会因缺 `to` 而 fail-loud，不静默丢件）。
-    #[serde(default)]
-    to: Vec<String>,
     /// 作业号（缺省由引擎生成；`jobId` 为契约字段，`job_id` 作兼容别名）。
     #[serde(default, rename = "jobId", alias = "job_id")]
     job_id: Option<String>,
+    /// 消息组装字段（`from`/`to`/`cc`/`bcc`/`subject`/`text`/`html`/`headers`/`attachments`/`raw`）。
+    #[serde(flatten)]
+    message: SendRequest,
 }
 
 /// 引擎：有界队列 + N worker + 结果回传/上送 + 可 drain 的停机。
@@ -492,44 +487,28 @@ async fn deliver_one(job: &Job, targets: &HashMap<String, MailTarget>) -> String
     }
 }
 
-/// 由 req 组装投递入参：信封取结构化 `from`/`to`，正文取 `raw`。
+/// 由 req 组装投递入参（**阶段 5 的两条路**，错误码一律 `code:5`）：
 ///
-/// **本阶段边界**：消息组装（text/html/headers/附件 MIME）归阶段 5；此处只走「原始 MIME」
-/// 路（`raw`），缺 `raw` 时**显式报错**，绝不空信假装成功。错误码一律 `code:5`（入参/契约）。
+/// - `req.raw` 有 → 原文路：信封由结构化 `from`/`to` 生成（与原文报头**解耦**，防双收件人），
+///   正文按原文字节投递；
+/// - 否则 → 结构化组装：`build_message` 出 [`lettre::Message`]，信封由 lettre 按其报头派生
+///   （To ∪ Cc ∪ Bcc，且 `Bcc` 报头已丢弃）。
 fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8>), (i32, String)> {
-    let Some(raw) = req.raw.as_deref() else {
-        return Err((
-            CODE_VALIDATION,
-            "阶段 5 未实现消息组装：请提供 raw（RFC5322 原文）".to_string(),
-        ));
-    };
-    // vtable 契约（`oj-plugin-ffi/src/mail.rs`）：`raw` 给定时宿主不解析附件（atts 必为空）。
-    if !atts.is_empty() {
-        return Err((
-            CODE_VALIDATION,
-            "raw 与附件互斥：raw 给定时附件必须为空".to_string(),
-        ));
+    let m = &req.message;
+    if let Some(raw) = m.raw.as_deref() {
+        // vtable 契约：raw 给定时宿主不解析附件（atts 必为空）。非空 = 调用方把两条路混用了。
+        if !m.attachments.is_empty() || !atts.is_empty() {
+            return Err((
+                CODE_VALIDATION,
+                "raw 与附件互斥：raw 给定时附件必须为空（vtable 契约：宿主不为 raw 解析附件）"
+                    .to_string(),
+            ));
+        }
+        let envelope = envelope_of(&m.from, &m.to).map_err(|e| (CODE_VALIDATION, e))?;
+        return Ok((envelope, raw.as_bytes().to_vec()));
     }
-    let from = req
-        .from
-        .as_deref()
-        .ok_or((CODE_VALIDATION, "请求缺少 from（信封发件人）".to_string()))?;
-    if req.to.is_empty() {
-        return Err((CODE_VALIDATION, "请求缺少 to（信封收件人）".to_string()));
-    }
-    let from: Address = from
-        .parse()
-        .map_err(|e| (CODE_VALIDATION, format!("from 地址非法: {e}")))?;
-    let mut to = Vec::with_capacity(req.to.len());
-    for t in &req.to {
-        to.push(
-            t.parse()
-                .map_err(|e| (CODE_VALIDATION, format!("to 地址非法: {e}")))?,
-        );
-    }
-    let envelope =
-        Envelope::new(Some(from), to).map_err(|e| (CODE_VALIDATION, format!("信封非法: {e}")))?;
-    Ok((envelope, raw.as_bytes().to_vec()))
+    let msg = build_message(m, atts).map_err(|e| (CODE_VALIDATION, e))?;
+    Ok((msg.envelope().clone(), msg.formatted()))
 }
 
 /// 成功信封：`{code:0,msg:"ok",data:{jobId,messageId}}`（`messageId` = 投递凭据）。
@@ -567,6 +546,7 @@ fn next_job_id() -> String {
 mod tests {
     use super::*;
     use crate::testutil::{drive, temp_dir};
+    use oj_plugin_ffi::{RBytes, RString};
     use serde_json::Value;
     use tokio::sync::Semaphore;
 
@@ -584,6 +564,68 @@ mod tests {
             v["jobId"] = json!(id);
         }
         v.to_string()
+    }
+
+    /// 结构化组装路的最小合法 req（**无** `raw`）；`attachment` 决定是否声明附件引用。
+    fn req_assemble(job_id: &str, attachment: bool) -> String {
+        let mut v = json!({
+            "from": "from@example.com",
+            "to": ["to@example.com"],
+            "subject": "组装主题",
+            "text": "hi",
+            "html": "<b>hi</b>",
+            "jobId": job_id,
+        });
+        if attachment {
+            v["attachments"] = json!([{ "filename": "a.pdf", "blobKey": "k1" }]);
+        }
+        v.to_string()
+    }
+
+    /// 宿主解析结果形态的附件（原始字节，非 base64）。
+    fn att_bytes(filename: &str, mime: &str, bytes: &[u8]) -> MailAttachment {
+        MailAttachment {
+            filename: RString::from(filename),
+            mime: RString::from(mime),
+            bytes: RBytes::from(bytes),
+        }
+    }
+
+    /// file transport 引擎（免网络；`.eml` 落到 `dir`）。
+    fn file_engine(dir: &std::path::Path) -> MailEngine {
+        let cfg = MailConfig::parse(&format!(
+            r#"{{"workers":1,"queue_capacity":4,"default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login","file_transport":"{}"}}}}"#,
+            dir.display()
+        ))
+        .expect("cfg");
+        MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎")
+    }
+
+    /// 经队列真投递一封，读回 file transport 落盘的 `.eml` 原文（`messageId` = 文件名主干）。
+    async fn submit_and_read_eml(
+        eng: &MailEngine,
+        req: &str,
+        atts: Vec<MailAttachment>,
+        dir: &std::path::Path,
+    ) -> String {
+        let mut fut = eng.submit(PROFILE, req, atts);
+        let out = drive(&mut fut).await.expect("submit 必须回结果信封");
+        let v: Value = serde_json::from_slice(&out).expect("信封是 JSON");
+        assert_eq!(v["code"], CODE_OK, "信封: {v}");
+        let id = v["data"]["messageId"].as_str().expect("messageId");
+        let eml = dir.join(format!("{id}.eml"));
+        std::fs::read_to_string(&eml).unwrap_or_else(|e| panic!("读 {eml:?} 失败: {e}"))
+    }
+
+    /// 投递一封并回其失败信封（`code != 0` 的用例）。
+    async fn submit_expect_fail(eng: &MailEngine, req: &str, atts: Vec<MailAttachment>) -> Value {
+        let mut fut = eng.submit(PROFILE, req, atts);
+        let out = drive(&mut fut)
+            .await
+            .expect("校验失败也须回信封（不是 FFI Err）");
+        let v: Value = serde_json::from_slice(&out).expect("信封是 JSON");
+        assert_ne!(v["code"], CODE_OK, "必须失败，实际: {v}");
+        v
     }
 
     fn targets_with(t: MailTarget) -> HashMap<String, MailTarget> {
@@ -805,29 +847,74 @@ mod tests {
         assert_eq!(v["data"]["jobId"], "j-兜底");
     }
 
-    /// 阶段 4 只支持 `raw` 路：缺 `raw`（组装归阶段 5）必须 fail-loud，绝不发空信。
+    // ---- 阶段 5：两条投递路（结构化组装 / raw 原文）----
+
+    /// 结构化组装路：text+html+附件 → `multipart/alternative`（备选体）套在 `mixed` 里，
+    /// 附件名/类型来自请求与宿主，**字节来自 vtable `atts` 且不被 base64 化**（ASCII 内容
+    /// 走 7bit）。断言读的是**真落盘的 `.eml`**，证明组装结果确实过了队列与 transport。
     #[tokio::test(flavor = "multi_thread")]
-    async fn missing_raw_fails_loud_and_raw_excludes_atts() {
-        let job = Job {
-            key: PROFILE.to_string(),
-            req: json!({"from": "f@example.com", "to": ["t@example.com"]}).to_string(),
-            atts: Vec::new(),
-            respond: None,
-            enqueue_only: false,
-            job_id: "j-no-raw".to_string(),
-            sync: false,
-        };
-        let v: Value = serde_json::from_slice(
-            deliver_one(&job, &targets_with(ok_target(Duration::from_secs(1))))
-                .await
-                .as_bytes(),
-        )
-        .unwrap();
+    async fn assemble_path_sends_multipart_with_host_resolved_attachment_bytes() {
+        let dir = temp_dir("engine-assemble");
+        let eng = file_engine(&dir);
+        let atts = vec![att_bytes("a.pdf", "application/pdf", b"%PDF-1.4")];
+        let eml = submit_and_read_eml(&eng, &req_assemble("j-asm-1", true), atts, &dir).await;
+
+        assert!(eml.contains("multipart/alternative"), "备选体缺失: {eml}");
+        assert!(
+            eml.contains("multipart/mixed"),
+            "有附件应有 mixed 外层: {eml}"
+        );
+        assert!(eml.contains("a.pdf"), "附件名缺失: {eml}");
+        assert!(eml.contains("application/pdf"), "附件类型缺失: {eml}");
+        assert!(
+            !eml.contains("JVBERi0xLjQ"),
+            "附件字节不得被 base64 化成文本流: {eml}"
+        );
+        assert!(
+            eml.contains("hi") && eml.contains("<b>hi</b>"),
+            "两版正文都在: {eml}"
+        );
+        assert!(
+            eml.contains("To: to@example.com"),
+            "信封/报头应对齐 to: {eml}"
+        );
+    }
+
+    /// 附件下标对齐失败（请求声明 N 个、宿主解析出 M 个）必须 `code:5` fail-loud，
+    /// 绝不静默把没字节的附件发出去（`message.rs` 的对齐契约）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attachment_count_mismatch_returns_code5() {
+        let (sink, _delivered) = collector();
+        let mut eng =
+            MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 4, sink)
+                .expect("引擎");
+        let v = submit_expect_fail(&eng, &req_assemble("j-mismatch", true), vec![]).await;
         assert_eq!(v["code"], CODE_VALIDATION, "信封: {v}");
         assert!(
-            v["msg"].as_str().unwrap().contains("raw"),
-            "错误须点明缺 raw: {v}"
+            v["msg"].as_str().unwrap().contains("附件"),
+            "msg 须点明附件对齐失败: {v}"
         );
+        assert_eq!(v["data"]["jobId"], "j-mismatch");
+        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+    }
+
+    /// 无 `raw` 且无正文 → `code:5`（**替换**阶段 4 的「缺 raw 未实现组装」）：不许发空信。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assemble_path_without_body_returns_code5() {
+        let (sink, _delivered) = collector();
+        let mut eng =
+            MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 4, sink)
+                .expect("引擎");
+        let req = json!({"from": "f@example.com", "to": ["t@example.com"], "jobId": "j-nobody"})
+            .to_string();
+        let v = submit_expect_fail(&eng, &req, vec![]).await;
+        assert_eq!(v["code"], CODE_VALIDATION, "信封: {v}");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(
+            msg.contains("text") && msg.contains("html"),
+            "msg 须给下一步: {v}"
+        );
+        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
     }
 
     /// 真 SMTP 路（不连网即失败）：端口 1 无监听 → `code:1`（网络/连接类），
