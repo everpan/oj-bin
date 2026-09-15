@@ -12,6 +12,7 @@ pub mod db;
 pub mod es;
 pub mod future;
 pub mod kv;
+pub mod mail;
 pub mod mq;
 pub mod path_util;
 
@@ -24,6 +25,7 @@ pub use future::FfiFuture;
 // I-2：跨边界安全的 FfiFuture 工厂与 vtable 方法包装宏（spec §3 统一 catch_unwind）。
 pub use future::{catch_future, catch_value, catch_void, ready_err, ready_ok, spawn_ffi_future};
 pub use kv::KVStoreVtable;
+pub use mail::{MailAttachment, MailAxis};
 pub use mq::{MqMessage, MqVtable};
 // re-export：oj_plugin_entry! 展开内经 $crate::paste::paste! 拼接轴符号名，
 // 使用方（插件 crate）无需自带 paste 依赖。
