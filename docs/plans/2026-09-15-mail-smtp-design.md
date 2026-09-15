@@ -7,8 +7,9 @@
 ## 0. 版本修订
 
 **v3（自洽性校正，按代码事实）**
-- `ABI_VERSION` **实为 8**（`oj-plugin-ffi/src/lib.rs:47`），故 bump **8→9**（v2 误写 7→8）。
-- `AXES` **当前含 `mq`**（`plugin_loader.rs:431`：`["es","db","blob","bus","kv","auth","mq"]`），增 `"mail"` 并**同步 `probe_axes` 分支**（否则 :456 `unreachable!`）。
+- **新增轴零 ABI 变更**：CLAUDE.md 明示「加轴零破坏，既有轴 vtable 形状变更才 bump ABI」，`mq` 轴即先例（其注释：新增轴，ABI 保持 7）。故 `mail` 轴**不 bump `ABI_VERSION`**（保持 8）——v2/v3 早稿的「8→9」有误。
+- `ABI_VERSION` **当前为 8**（`oj-plugin-ffi/src/lib.rs:47`）。
+- `AXES` **当前含 `mq`**（`plugin_loader.rs:431`：`["es","db","blob","bus","kv","auth","mq"]`），增 `"mail"` 并**同步 `probe_axes` 分支**（否则 :456 `unreachable!`）与 `Registrations` 加字段。
 - **插件无宿主后端访问**：`HostContext` 只有 `log`+`deliver`（`lib.rs:76-83`）。故 **附件字节解析在宿主**（`StableState.blobs` / `ensure_within`+`fs::read`），以 `RBytes` 经 FFI 传插件；**bus 发布在宿主**。删除 v2「插件读 blob / 插件持 bus」。
 - **异步契约用 `FfiFuture`**（`oj-plugin-ffi/src/future.rs`：poll/take/free + `catch_future`），非 `deliver` 通用回传；`deliver` 仅作插件→宿主的**结果上送**通道。
 
@@ -30,7 +31,7 @@
 - **插件（`plugins/oj-mail`，cdylib）**：持有 `lettre`、连接池（transport）、**有界队列 + worker 池**、实际投递；经 `FfiFuture`/`deliver` 回传结果。**不直接访问宿主 blob/bus**（`HostContext` 不提供）。
 
 **新增轴**
-- `oj-plugin-ffi`：增 `MailAxis` repr(C) vtable + `MailAttachment` repr(C)；`AXES` 增 `"mail"`；`plugin_loader` 增 `axis::mail` 类型配对 helper；**`ABI_VERSION` 8→9**。
+- `oj-plugin-ffi`：增 `MailAxis` repr(C) vtable + `MailAttachment` repr(C)；`plugin_loader` 增 `axis::mail` 类型配对 helper；`AXES` 增 `"mail"` + `probe_axes` 分支 + `Registrations` 字段。**不 bump `ABI_VERSION`**（新增轴零破坏，保持 8）。
 - `plugins/oj-mail`：实现 `MailAxis`，`oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE))`。
 - 宿主 `src/bridge/mail.rs`：`#[op2]` `op_mail_send/send_sync/enqueue/result/send_raw`，经 `StableState.mail`（`Arc<dyn MailBackend>`，包装 vtable）调用；`bootstrap.js` 挂载 `Mail`/`mail`。
 - `StableState` 与 `Extras` **各增字段** `mail: Option<Arc<dyn MailBackend>>`（`mod.rs:123/164`），在 `with_dbs_and_loader` 注入（首次 run 前）；**不进 `ReqState`**。
@@ -105,7 +106,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 - `MailAttachment`（repr(C)）：`{ filename: RString, mime: RString, bytes: RBytes }`——**字节由宿主解析后传入**，不经 JSON/base64。
 - `MailAxis`（repr(C)）：`submit(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture`。`req` JSON 含 `{ sync, enqueue_only, raw?, from, to[], cc[], bcc[], subject, text?, html?, headers{}, jobId }`。
   - `submit` 返回 `FfiFuture`（`catch_future` 包装）；`send` 语义：future resolve = 投递结果信封；`enqueue` 语义：future 立即 resolve `{jobId}`，真实完成经 `HostContext.deliver`。
-- `AXES` 增 `"mail"`（同步 `probe_axes` 分支）；`ABI_VERSION` 8→9；`axis::mail` helper。
+- `AXES` 增 `"mail"`（同步 `probe_axes` 分支 + `Registrations.mail` 字段）；`axis::mail` helper；**ABI 不变（8）**。
 
 **`plugins/oj-mail`（实现）**
 - 反序列化 `req`；`Message::builder()` 组装 MIME（附件直接取 `MailAttachment.bytes`）。
@@ -173,12 +174,12 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 ## 13. 风险 / 待决
 
-- **ABI 8→9**：所有既有插件须同步重编；`plugin-matrix.yml` 须覆盖 `oj-mail`；`bin/plugins/<triple>/` 归置。
-- **`probe_axes` 同步**：`AXES` 与 `probe_axes` 分支必须同加 `"mail"`（:456 `unreachable!` 保护）。
+- **新增轴零 ABI 变更**：既有插件**无需重编**；`plugin-matrix.yml` 增 `oj-mail` 构建/预检；`bin/plugins/<triple>/` 归置。
+- **`probe_axes` 同步**：`AXES` / `probe_axes` 分支 / `Registrations` 字段必须同加 `"mail"`（:456 `unreachable!` 保护；漏一处即 panic 或轴不可见）。
 - **rustls provider 时序**：插件 init 须先 `install_default`；验证与 `ws_client_extensions` 不 panic。
 - **lettre 版本**：新增 `lettre`（`rustls`+`tokio1` feature），须与 `rustls = "=0.23.40"` / aws-lc-rs 同 provider；实现前先最小编译验证。
 - `deliver("mail.result")` 与既有 bus 订阅扇出的路由约定需对齐（宿主统一路由：存结果 + 扇出）。
 
 ## 14. 里程碑
 
-纳入 **v0.1.20**：①`oj-plugin-ffi` 增 `MailAxis`/`MailAttachment` + `AXES`/`probe_axes` 加 `"mail"` + `axis::mail` + ABI 8→9；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。
+纳入 **v0.1.20**：①`oj-plugin-ffi` 增 `MailAxis`/`MailAttachment` + `AXES`/`probe_axes`/`Registrations` 加 `"mail"` + `axis::mail`（ABI 保持 8）；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。
