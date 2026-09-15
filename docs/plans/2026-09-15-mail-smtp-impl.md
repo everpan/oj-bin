@@ -959,7 +959,101 @@ I-1 夹具覆盖，`provides` 由 I-2 one-hot + 分支完整性覆盖。
 
 
 ### 阶段 2 小结
-（待填）
+
+**结论：`oj-mail` 骨架落地——可构建、可预检、`mail` 轴符号可见；`ABI_VERSION` 保持 8。**
+本阶段只落骨架：`submit` 一律显式报错（fail-loud），配置解析/transport/队列/投递在阶段 3-5 补齐。
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `plugins/oj-mail/Cargo.toml`（新增） | `crate-type = ["cdylib"]`；依赖按**阶段 0 定稿的方案 B**：lettre `0.11` + `default-features = false` + `tokio1-rustls` / `rustls-no-provider` / `webpki-roots` / `aws-lc-rs` / `builder` / `smtp-transport` / `tokio1` / `hostname` / `pool` / `file-transport`，**不用** `rustls-tls` / `tokio1-rustls-tls`（经 lettre 的 `ring = ["rustls?/ring"]` 强拉第二 provider）；另 `rustls = "=0.23.40"` + serde/serde_json/tokio。feature 列表带注释写明弃用理由。 |
+| `plugins/oj-mail/src/lib.rs`（新增） | `init` 返回 descriptor（身份 = `mail`，见 §5）；`submit` 恒 `ready_err("oj-mail: submit not implemented (阶段 2 骨架)")`；`static MAIL_VTABLE: MailVtable`；`oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE))`——经 `axis::mail` helper 传 vtable，**类型错配编译期失败**（宏裸传无此检查）。附 2 个单测（§2 末）。 |
+| `Cargo.toml`（根） | `members` 增 `"plugins/oj-mail"`（紧随 `"plugins/oj-auth"`）。`Cargo.lock` 同步（新增 lettre v0.11.23 / nom v8.0.0 / quoted_printable v0.5.2 等）。 |
+| `docs/plans/2026-09-15-mail-smtp-impl.md` | 本小结。 |
+
+未触碰 `oj-plugin-ffi/**`（`git diff --stat oj-plugin-ffi/` 空）——`ABI_VERSION` 与所有既有轴 repr(C) 形状零变更。
+
+#### 2. 命令与结果（一律 `--release`）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo build --release -p oj-mail` | `Finished release profile`，exit 0（lettre v0.11.23 / tokio-rustls v0.26.4 解析成功） |
+| `cargo tree -p oj-mail -i ring` | `warning: nothing to print` → **ring 不在依赖图**（方案 B 生效，与框架 aws-lc-rs 同源） |
+| `cargo tree -p oj-mail -i rustls` | 单一 `rustls v0.23.40`（lettre + tokio-rustls + 本 crate 共用，无第二版本） |
+| `nm -gU target/release/liboj_mail.dylib \| grep oj_plugin` | 三符号齐：`_oj_plugin_abi_version` / `_oj_plugin_axis_mail` / `_oj_plugin_init` |
+| `cargo xtask plugin mail` | exit 0；`liboj_mail.dylib → bin/plugins/aarch64-apple-darwin/libmail.dylib` |
+| `cargo xtask plugin mail --check` | **exit 0**（输出见 §3） |
+| `cargo test --release -p oj-mail` | **2 passed; 0 failed** |
+| `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | exit 0，**0 warning / 0 error** |
+| `cargo fmt --check` | exit 0 |
+
+两个单测（任务书写"暂无测试可先占位"，此处补齐——本阶段唯一的运行期行为是「fail-loud + 身份」，两者都值得钉死）：
+
+- `descriptor_name_is_plugin_name_not_crate_name`——identity / semver / abi / fingerprint 四项断言（正是 §5 那个规格笔误的守护）。
+- `submit_fails_loud_until_implemented`——骨架期 `submit` 必须 `Err` 且信息可读（绝不静默回 Ok 让宿主以为投递成功）；阶段 3-5 随实现更新为真投递断言。
+
+#### 3. `--check` 实际输出（GREEN 证据）
+
+```text
+$ cargo xtask plugin mail --check
+ok: mail 0.1.0 (abi 8) — mail 轴：lettre SMTP 发送（多 profile + 连接池/队列线程池）
+provided axes: [mail]
+EXIT=0
+```
+
+含 **ABI=8**（`abi 8`）与 **provided axes: [mail]**（宿主 `AXES` 逐轴 dlsym 探测结果，经 `Registrations::provides` 汇总）。
+
+#### 4. TDD RED→GREEN 记录
+
+| # | RED 形态 | 实际报错 |
+|---|---|---|
+| 1 | crate 不存在 | `cargo build --release -p oj-mail` → `error: package ID specification 'oj-mail' did not match any packages` |
+| 2 | 产物未归置 | `cargo xtask plugin mail --check` → `Error: "xtask error: precheck failed: plugin file missing: .../bin/plugins/aarch64-apple-darwin/libmail.dylib"`，exit 1 |
+| 3 | **身份写错**（规格笔误） | 同上 → `Error: "xtask error: precheck failed: plugin identity mismatch: expected 'mail', got 'oj-mail'"`，exit 1；改为 `"mail"` 后 GREEN |
+| 4 | 守护测试非空验证 | 临时把 descriptor 改回 `"oj-mail"` → `cargo test --release -p oj-mail descriptor_name` **FAILED**（`left: "oj-mail" / right: "mail"`）；还原后 GREEN |
+
+#### 5. 与任务书/计划稿的偏差（1 处，已按实测修正）
+
+**`descriptor.name` 必须是 `"mail"` 而非任务书模板写的 `"oj-mail"`。**
+
+- 复现：照任务书模板写 `name: RString::from("oj-mail")` → `cargo xtask plugin mail --check` 报
+  `plugin identity mismatch: expected 'mail', got 'oj-mail'`（exit 1），即**本阶段的硬验收无法通过**。
+- 根因（读码确认，非猜测）：`PluginLoader::load_one` 以清单键做**严格相等**校验
+  （`src/bridge/plugin_loader.rs:404` 的 `if name != entry.name.as_str()`）；清单键来自
+  `cargo xtask plugin <name>` 的 `<name>`（此处 `mail`），落盘文件名同样由它派生
+  （`ffi::plugin_file_name("mail")` = `libmail.dylib`）。二者是**插件名**，与 crate 名 `oj-mail` 无关。
+- 约定核对（本次 `grep` 实测全 8 个既有插件，无一例外 = crate 名去 `oj-` 前缀）：
+  `oj-es → "es"`、`oj-auth → "auth"`、`oj-db-mysql → "db-mysql"`、`oj-blob-s3 → "blob-s3"`、
+  `oj-bus-kafka → "bus-kafka"`、`oj-bus-rabbitmq → "bus-rabbitmq"`、`oj-kv-redis → "kv-redis"`。
+  插件名还是**功能性**的：`plugin_loader::bus_backend` 即按名去 `bus-` 前缀推断 broker kind。
+- 处置：descriptor 改为 `"mail"`，并在源码注释写明「身份 = 插件名，不是 crate 名（`plugin_loader.rs:404`）」+
+  守护测试 §2。**未弱化任何断言**，属修正规格笔误；计划稿 Task 2.1 Step 3 的同款模板同步按此口径理解。
+
+另：任务书给 `ready_err` 的用法与 `oj-plugin-ffi/src/future.rs:117` 实际签名
+（`fn ready_err(msg: impl Into<String>) -> FfiFuture`）一致，**无需调整**。
+
+#### 6. 需登记位置的调查结论（本阶段只做调查，除已列者不动）
+
+| 位置 | 性质 | 本阶段处置 / 依据 |
+|---|---|---|
+| `tools/xtask/src/main.rs:28` `PLUGINS`（8 项） | `cargo xtask build` 的插件清单——**CI 与 sample-tests job 的插件归置都走它** | **未登记**（归 Task 7.3）。`cargo xtask plugin mail` 不查该表，本阶段验收不受影响；且另有 `given_first_party_plugins_when_listed_then_covers_all_axes` 断言 `PLUGINS.len() == 8` 且注释为「8 个第一方插件 = es/db×2/blob/bus×2/kv/auth 全轴覆盖」，加 `mail` 须连带改该断言与注释 → 越出本阶段范围。 |
+| `.github/workflows/plugin-matrix.yml` | CI 平台矩阵 | **无需改动**——**发现与计划稿 Task 7.3 的描述不符**：该文件**不含插件名清单**（注释明写「插件清单的单一真相来源是 `tools/xtask/src/main.rs` 的 PLUGINS——CI 不硬编码副本」，并记有「此前硬编码 7 个、漏 `auth`，与 xtask 失步」的历史教训）。故阶段 7 只需改 `PLUGINS`，**不应对本文件增插件名**（否则正是重蹈该文件已明令禁止的硬编码失步）。 |
+| `oj/src/server_cmd.rs:479` `plugin_cfg` 的 `match name` | 插件 cfg 适配器（`mail` 现落 `_ => "{}"`） | **未登记**（归 Task 7.1）。 |
+| `oj/src/server_cmd.rs:469` `ADAPTER_AXES` | `#[cfg(test)]` 对账清单，**非功能注册表** | 同上（阶段 1 小结 §5 已论证：登记它本身无运行期效果）。 |
+| `oj/src/config.rs` 顶层 `smtp:` 段 | 宿主类型化读配置 | 归 Task 7.1。 |
+| `plugins:` 段严格清单 | **不是白名单**：`assemble_plugins` 在 `cfg.plugins` 非空时切「严格清单模式」（只装配列出的插件），属运行期配置选择，无待登记的硬编码清单 | 无需登记；但阶段 2 骨架联调若临时用 `plugins: { mail: … }`，须注意会顺带进严格模式（阶段 1 小结 §6 已列）。 |
+| `src/bridge/plugin_loader.rs`（`AXES` / `probe_axes` / `Registrations` / `provides`） | 轴表 4 个消费点 | **阶段 1 已完成**（含 `"mail"`），本阶段零改动。 |
+
+#### 7. 遗留 / 转下阶段
+
+1. **阶段 3 起实现 `submit`**：`init` 内先 `install_default(aws_lc_rs)` 再建 transport（阶段 0 实测硬约束：
+   `relay()` 立即构建 ClientConfig），且 transport 的**创建/使用/销毁必须在本插件自己的 tokio runtime 内**
+   （lettre `pool` 在 Drop 里 `tokio::spawn`，无 runtime 上下文即 abort）。
+2. `PLUGINS`（xtask）与 `plugin_cfg` / `config.rs` 的 `mail` 登记归**阶段 7**（§6）。
+3. **计划稿 Task 7.3 对 `plugin-matrix.yml` 的描述与实测不符**（§6），阶段 7 执行时按实测收敛
+   （只改 `PLUGINS`，不给 CI 加插件名副本）。
+
 
 ### 阶段 3 小结
 （待填）
