@@ -1755,4 +1755,108 @@ config.yaml(smtp:) → only_js::config::SmtpSection
    需给 `build_cmd` 的内省 `Extras` 补插件装配（当前无此需求）。
 
 ### 阶段 8 小结
-（待填）
+
+**结论：设计 §10/§11 的 10 项安全点逐条审计完毕 —— 7 项本已覆盖（阶段 3–7 用例），
+3 项缺失已按 TDD 补齐并逐条变异验证；全量门禁（fmt / clippy / workspace test / 插件预检 /
+`xtask build` / `xtask smoke`）全绿；`oj` 版本 **0.1.18 → 0.1.19**（= 发布点，
+`ABI_VERSION` 保持 8）。审计中实测出**三处「设计声明 vs 实现」偏差（D1/D2/D3）**，
+按本阶段硬约束（不改实现语义）**只登记 + 订正文档**，已同步用户面手册与设计文档。**
+
+#### 1. 安全审计表（10 点 → 覆盖位置 / 新增用例）
+
+| # | 设计条款（§10/§11） | 覆盖位置（`文件:行` = 现有用例；**粗体** = 本阶段新增） |
+|---|---|---|
+| 1 | **CRLF 注入**：`subject`/`headers` 剥离；`from/to/cc/bcc` 经 `lettre::Address` 强校验（非法 → `code:5`） | 已覆盖：`src/bridge/mail.rs:1266`（`strip_crlf` 剥离语义）、`:1273`（地址走 lettre 解析器、CRLF 一律拒）、`:1488` 所在的 `handle_send_normalizes_and_dispatches`（subject/headers 剥离去向 + 正文不剥）、`plugins/oj-mail/src/message.rs:652`（subject/头名/头值/地址四类 CRLF）、`:837`/`:869`（raw 原文 Subject 的 CRLF 拒绝）、`oj/tests/mail_e2e.rs:188`（真装配下 `Subject` 过线）。**新增** `src/bridge/mail.rs:1616`（to/cc/bcc 非法 + **CRLF 注入地址 → 拒绝**，逐字段点名，`code:5`） |
+| 2 | **白名单 fail-closed**：空表拒；`from`/`to` 不匹配后缀 → `code:5` | 已覆盖：`src/bridge/mail.rs:1284`（后缀匹配、大小写不敏感、**空表即拒**）、`:1528`（from/to 越界 → `code:5` 且**不触达后端**）、`oj/tests/mail_e2e.rs:234`（真装配下 `from` 越界 → `code:5` 且**不落盘**）。**新增** `src/bridge/mail.rs:1697`（**cc/bcc** 越界 → `code:5` + 正向对照） |
+| 3 | **`tls: none` 门禁**：未显式 `allow_none_tls: true` → 配置解析失败（插件侧） | 已覆盖：`plugins/oj-mail/src/config.rs:203`（未显式许可 → 解析失败，文案点明开关 + profile 名）、`:187`（三模式可解析）、`:274`（login 半份凭据）、`plugins/oj-mail/src/lib.rs:500`（**绕过 `parse` 直接 `Deserialize` 也复校验**）、`:587`（`init` fail-loud）。⚠️ **偏差 D2**：§11 的「且 host 为内网 CIDR」未实现 → 登记待做 |
+| 4 | **`none`/`sendRaw` 冲突头**：raw 剥 `From/To/Cc/Bcc`，保留/覆盖 `Subject`；raw 与 `attachments` 互斥 | 已覆盖：`plugins/oj-mail/src/message.rs:803`（剥信封头、保 Subject 含折行续行、重建结构化头）、`:846`（结构化 subject 覆盖）、`:885`/`:898`（折行与 CRLF 归一）、`:912`（raw+附件 / 缺 from 拒）；`engine.rs:897`/`:935`（端到端同款）、`:1017`（raw 拒 cc/bcc/附件）；宿主 `src/bridge/mail.rs:1755`（`sendRaw` 必填 raw、与附件互斥、subject 覆盖、开关覆写） |
+| 5 | **附件 `{path}` 越界**（`../` 逃逸 project root）→ `code:5` | 已覆盖：`src/bridge/mail.rs:1392`（`../` 越界 + 无 project root + blob 后端/键缺失）、`:1528`（`../escape.pdf` → `code:5`）；`src/bridge/module_loader.rs:739`（`ensure_within` 返回 **canonical 句柄**、越界/不存在/系统路径拒）。**新增** `src/bridge/module_loader.rs:766`（**符号链接逃逸**：根内链接→根外文件、根内链接→根外目录再穿透） |
+| 6 | **附件下标对齐**：数量不一致 → `code:5`；字节非 base64（原始字节进 MIME） | 已覆盖：`plugins/oj-mail/src/message.rs:545`（数量不一致拒）、`:517`（multipart 且断言附件 base64 形态**不在**文中）；`engine.rs:980`（数量不一致 → `code:5`）、`:866`（宿主字节按下标进 MIME）；宿主 `src/bridge/mail.rs:1118`（`RVec` 下标原序 + 非 UTF-8 字节原样过线）、`:1392`（按声明序解析）；`oj/tests/mail_e2e.rs:188`（真 `.eml` 含原始字节、base64 形态不在） |
+| 7 | **错误码映射**：连接/网络→`1`、5xx→`2`、鉴权→`3`、队列满→`4`、校验→`5` | 部分覆盖：`1` = `plugins/oj-mail/src/engine.rs:1070`（连接拒绝）+ **新增** `:1088`（异步超时）/`:1115`（同步路超时）；`4` = `engine.rs:715`（满队列非阻塞 `code:4`）；`5` = `engine.rs:980`/`:997`、`message.rs:545`、`src/bridge/mail.rs:1528`/`:1616`/`:1665`。⚠️ **偏差 D1**：`2`（5xx）/`3`（鉴权）**未实现、当前不可达**（`engine.rs:43` 已把设计口子收窄为 `0/1/4/5`）→ 登记待做 |
+| 8 | **反馈脱敏**：`mail.result` payload 不含 `to`/`subject` | 已覆盖：`src/bridge/mail.rs:1076`（`flatten_result` 白名单构造四个字段）、`:1026` 所在的 `bridge_injects_mail_backend_and_routes_deliver`（bus 扇出帧仅 4 键、显式断言无 `to`/`subject`）、`:2007`（JS `mail.result` 回读无 subject）；插件 `engine.rs:755`（上送帧不含收件人/主题）。**新增** `engine.rs:1153`（信封**严格** `{code,msg,data:{jobId}}`，无口令/令牌/用户名/认证对话） |
+| 9 | **`headers` 不得覆盖** `From/To/Cc/Bcc/Subject`（防白名单绕过） | 已覆盖：`plugins/oj-mail/src/message.rs:632`（插件侧 5 个名字 + `Bcc`/`FROM` 等变体）；宿主 `src/bridge/mail.rs:1528`（`Subject` 一例）。**新增** `src/bridge/mail.rs:1665`（宿主侧 **11 个大小写变体**全拒，点明头名） |
+| 10 | **未配置 mail** → 明确错误（`mail not configured`），不 panic | 已覆盖：`src/bridge/mail.rs:1959`（JS 侧抛 `mail not configured`，不静默）、`:1064`（无后端时 `deliver` 返回 `false`、丢弃不 panic）、`:1234`（配置形态错在装配期报错） |
+
+**点 5 的「宿主放行 ≡ 插件放行」口径对账**（阶段 7 §7 遗留 2）：**新增**
+`plugins/oj-mail/src/message.rs:732`，首跑即 **RED**，实测出既有分裂 → 见下 D3。
+
+#### 2. 新增用例（7 条）与变异验证
+
+| 用例 | 位置 | 变异（证明用例真绑住行为） | 结果 |
+|---|---|---|---|
+| `handle_send_rejects_illegal_addresses_in_every_recipient_field` | `src/bridge/mail.rs:1616` | A3：`address_list` 不再拒绝非法地址（静默丢弃该收件人） | **FAILED** ✓（既有 `handle_send_rejects_with_code5_…` 亦 FAILED） |
+| `handle_send_rejects_headers_covering_structured_fields` | `src/bridge/mail.rs:1665` | A1：`normalize_headers` 的 `eq_ignore_ascii_case` 退化为精确匹配 | **FAILED** ✓ |
+| `handle_send_gates_cc_and_bcc_against_allowed_recipients` | `src/bridge/mail.rs:1697` | A2：`check_whitelist` 只喂 `to`（丢 cc/bcc） | **FAILED** ✓ |
+| `ensure_within_rejects_symlink_escape` | `src/bridge/module_loader.rs:766` | A4：`ensure_within` 恒放行（`if cp.starts_with(&cr)` → `if true`） | **FAILED** ✓（既有 `ensure_within_returns_canonical_…` 亦 FAILED） |
+| `host_accepted_addresses_are_accepted_by_plugin_or_listed_as_known_split` | `plugins/oj-mail/src/message.rs:732` | B1：`mailbox()` 去掉 CRLF 前置拒；B2：raw 路收件人改走 `Mailbox` | **FAILED** ✓（两次各自 RED） |
+| `async_delivery_timeout_returns_network_code` | `plugins/oj-mail/src/engine.rs:1088` | B5：异步超时文案退化为「投递失败」 | **FAILED** ✓ |
+| `sync_delivery_timeout_returns_network_code` | `plugins/oj-mail/src/engine.rs:1115` | B4：同步超时改判 `code:5` | **FAILED** ✓ |
+| `failure_envelope_never_carries_credentials` | `plugins/oj-mail/src/engine.rs:1153` | B3：信封带上 lettre 原始错误细节 | **FAILED** ✓（既有 `smtp_connection_refused_returns_network_code` 亦 FAILED） |
+
+（8 条 ÷ 7 个目标：超时按异步/同步两条分支各一条用例。变异共 7 次，**全部被对应新用例抓住**；
+每次变异后 `git checkout --` 还原并复核 `git diff` 为空、重跑 GREEN（插件 62 passed / 宿主
+`mail::tests` 23 passed、`module_loader::tests` 12 passed）。）
+
+#### 3. 全量门禁（实测输出，一律 `--release`）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `cargo fmt --check` | **exit 0** |
+| 2 | `cargo clippy --release --all-targets -- -D warnings` | **exit 0**（0 warning；首跑曾报一次 `couldn't read src/bridge/bootstrap.js: No such file`——文件与 `git status` 均正常，重跑即绿，判为瞬时文件系统/沙箱抖动） |
+| 3 | `cargo test --release --workspace` | **exit 0**；31 个测试目标 / 36 条 `test result: ok`；**753 passed / 0 failed**（阶段 7 基线 745 → +8）。唯一的 `panicked` 行是 `tests/plugins/mini` 的 by-design panic 路径用例。含 `mail_e2e` **2 passed**、`oidc_e2e` 1 passed |
+| 4 | `cargo xtask plugin mail --check` | **exit 0**：`ok: mail 0.1.0 (abi 8) — mail 轴：lettre SMTP 发送（多 profile + 连接池/队列线程池）` / `provided axes: [mail]` |
+| 5 | `cargo xtask build` | **exit 0**：`bin/oj` + 8 个第一方插件 cdylib（含 `libmail.dylib`）+ `bin/devkit` 全部归置 |
+| 6 | `cargo xtask smoke --bin bin/oj` | **exit 0**：`smoke: hiding 7 build-machine source path(s) ...` / `smoke ok: …/bin/oj 在源文件缺席环境完成 oj build` |
+| 7 | 版本递增后复跑 1–6 | 全部仍 **exit 0**；`./bin/oj --version` → **`oj 0.1.19`** |
+
+#### 4. 版本号（发布点）
+
+| 项 | before → after |
+|---|---|
+| `oj/Cargo.toml` | `version = "0.1.18"` → **`"0.1.19"`** |
+| `Cargo.lock` | `name = "oj"` 块 `0.1.18` → **`0.1.19`**（1 行，`cargo metadata` 同步） |
+
+`CHANGELIST.md` 的 v0.1.19 段落**逐条核对后与实现一致、无需订正**：它未声称 `code:2/3`
+可用（故与 D1 不冲突）、未声称 `none` TLS 的内网 CIDR 约束（故与 D2 不冲突）、
+也未声称「宿主地址集 ≡ 插件地址集」（故与 D3 不冲突）；`lettre` 依赖形态
+（`default-features = false`，只取 `Address`）、`ABI_VERSION` 保持 8、`PLUGINS` 增 `mail`、
+api-manual「第 6 章 mail 小节」等声明均与代码实测相符。
+**真正与实现不符的是用户面手册**（`docs/mail-smtp.md` §3、`docs/devkit/api-manual.md` §6
+原表宣称 `2`/`3` 可用）→ 已在本次订正（见 §5）。
+
+#### 5. 已知偏差（本阶段新登记，均只订正文档、未改实现语义）
+
+| 代号 | 偏差 | 处置 |
+|---|---|---|
+| **D1** | 设计 §10 的 `5xx→2`、`鉴权→3` **未实现**：连接/网络/超时/一切投递期失败统一归 `1`（`plugins/oj-mail/src/engine.rs:43` 已把 §10 收窄为 `0/1/4/5`），故 `2`/`3` 不可达 | 设计 §10 加「实现期订正」块；`docs/mail-smtp.md` §3 与 `docs/devkit/api-manual.md` §6 错误码表改为「`2`/`3` 当前未启用、均归 `1`，判失败用 `code !== 0`」。待做：解析 lettre 错误分类（且保持 `msg` 脱敏）+ 模拟 SMTP server 用例 |
+| **D2** | 设计 §11 的「`tls: none` 需 `allow_none_tls: true` **且 host 为内网 CIDR**」：后半句**未实现**，只校验显式 `allow_none_tls` | 设计 §11 加订正块 + `docs/mail-smtp.md` §9 已知限制加行。待做（会改配置语义：需 IP/CIDR 解析 + 域名 `localhost` 的解析口径，单列任务） |
+| **D3** | **地址接受集两侧不互相包含**（本阶段对账用例首跑实测）：宿主 `lettre::Address` 放行而结构化路 `lettre::Mailbox` 拒的形态 → 投递期 `code:5`。命中样本：引号本地部 `"quoted local"@x.com`、域字面量 `user@[127.0.0.1]`。反方向（`显示名 <user@x.com>`：`Mailbox` 收 / `Address` 拒）由宿主权威前置门先拒，安全 | 方向为「插件比宿主更严」→ **无越权面**（信封派生地址必然先过宿主白名单后缀匹配），仅是用户侧「没道理的 `code:5`」。已把两侧边界**列表化钉死**在 `plugins/oj-mail/src/message.rs:732`（`KNOWN_SPLIT`）+ 设计 §11 订正块。待做：两侧统一解析器 |
+
+#### 6. 遗留（承接设计 §13 与阶段 7 §7）
+
+**设计 §13 显式延后项（本次未动，维持延后）**
+1. **跨进程/分布式 `mail.result`**：`HostContext.deliver` 是同步 `extern "C"`，宿主无法在其中
+   `await` 分布式 `EventBroker::publish` → 首版仅**本地** `bus` 扇出（已由 `mail.rs:1026` 用例钉住）。
+2. **XOAuth2 token 刷新**：首版仅静态 `access_token`；`refresh_token`-only **fail-loud**
+   （`config.rs:297` 用例钉住，绝不静默降级为无凭据投递）。
+3. **per-来源限流**：仅全局有界队列 + `code:4`（`engine.rs:715`），令牌桶按模块/租户待做。
+
+**本阶段新登记**：D1 / D2 / D3（见 §5，均待做）。
+
+**阶段 7 结转**
+4. `HostContext.log` 上送仍未接（阶段 5 遗留，不在本特性范围）。
+5. 「声明 `smtp:` 但未装 `oj-mail`」**有意不阻断启动**（缺插件不构成安全失守，
+   `mail.*` 报 `mail not configured`）；若日后要收紧为装配期闸门，一行 + 一条用例即可。
+6. `oj build` 内省桥无 mail（同无 es/blob/bus/auth）；若 handler 在**内省期**就用 mail，
+   需给 `build_cmd` 的内省 `Extras` 补插件装配（当前无此需求）。
+
+#### 7. 提交
+
+| SHA | 信息 |
+|---|---|
+| `7a9fc93` | `test(mail): 阶段 8 安全回归补缺（超时/地址/白名单/头覆盖/符号链接/脱敏）` |
+| 见 `git log`（本文档提交后） | `docs(mail): 阶段 8 安全审计订正 + 小结（错误码 2/3 与 none-CIDR 未实现登记）` |
+| 见 `git log`（同上） | `chore(release): v0.1.19（mail 轴 + IDE 类型修复）` |
+
+（顺序即任务书的「安全补缺 → 门禁/文档 → 版本递增」；`CHANGELIST.md` 的 v0.1.19 段落在阶段 7
+已写定，本次核对无误故未改动。）
