@@ -1,4 +1,4 @@
-import { positiveId, requireRole } from "../_shared/validate";
+import { positiveId, requireRole } from "#_shared/validate";
 
 function get(): void {
   const id = Number(http.param("id", 0));

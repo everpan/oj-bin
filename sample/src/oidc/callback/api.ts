@@ -1,5 +1,5 @@
-import { issueTokens } from "../../auth/_shared/session";
-import { nowSecs } from "../../auth/_shared/util";
+import { issueTokens } from "#/auth/_shared/session";
+import { nowSecs } from "#/auth/_shared/util";
 
 export default {
   async get() {

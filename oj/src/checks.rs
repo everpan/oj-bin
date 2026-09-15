@@ -1,4 +1,4 @@
-//! 结构层静态检查（§5.1 S002–S007；S001 由 `manifest::load_modules` 承担，
+//! 结构层静态检查（§5.1 S002–S008；S001 由 `manifest::load_modules` 承担，
 //! S007 由 `migrate::load_migrations` 承担）。`oj build` 内嵌全部 S*（fail build），
 //! `oj build --check` 只校验不落盘（CI 门禁）。
 //!
@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+use only_js::bridge::import_scan::specifier_spans;
 
 use crate::manifest::{self, Manifest};
 
@@ -45,6 +47,35 @@ pub fn run(
             }
             schemas.insert(name, f);
         }
+    }
+
+    // S008（项目级）：别名锚点必须唯一——manifest.yaml 只允许出现在模块根
+    // （`src/<m>/manifest.yaml`）。嵌套的会被 `#` 别名的「向上最近 manifest.yaml」
+    // 规则当作锚点，静默改写整个子树的语义。
+    for f in nested_manifests(src)? {
+        v.push(format!(
+            "S008: src/{f}: manifest.yaml 只能出现在模块根（src/<module>/manifest.yaml）\n  \
+             原因：`#` 别名以「向上最近的 manifest.yaml」为模块根锚点，嵌套声明会改写该子树内\
+             所有别名的语义（`#/m/x` 的 src 根也随之失效）\n  \
+             下一步：删除该嵌套 manifest.yaml（子目录用 `src/<module>/<子目录>/…` 组织）"
+        ));
+    }
+
+    // S008（项目级）：别名与 Node `package.json#imports` 共用 `#` 命名空间。项目若声明了
+    // `#` 开头的 imports 键，Node/esbuild 等工具（如 L2 单测链路）会按自己的规则解析，
+    // 与 oj 别名分叉 → fail-fast，避免静默走偏。
+    if let Some(root) = src.parent()
+        && let Ok(text) = std::fs::read_to_string(root.join("package.json"))
+        && let Ok(pj) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(im) = pj.get("imports").and_then(|i| i.as_object())
+        && let Some(k) = im.keys().find(|k| k.starts_with('#'))
+    {
+        v.push(format!(
+            "S008: {}: package.json 的 imports 键 {k:?} 与 oj 导入别名（`#x` / `#/m/x`）\
+             共用 `#` 命名空间\n  下一步：移除该 imports 键（路径锚定改用别名约定），\
+             或把 imports 键改名以避开 `#` 前缀",
+            root.join("package.json").display()
+        ));
     }
 
     for name in names {
@@ -94,6 +125,58 @@ pub fn run(
                     continue;
                 }
                 v.push(s003(f, name, &table, o, deps));
+            }
+        }
+
+        // S008：导入别名（`#` 本模块根 / `#/` src 根）——目标必须存在；跨模块引用必须
+        // 在 manifest.deps 声明。扫描器与改写器同一实现（`build_cmd::specifier_spans`），
+        // 避免检查放行而构建改写不了的分叉。
+        // 说明：deps 门禁只约束**别名**这一新语法，不追溯既有相对跨模块引用
+        // （追溯会让既有项目升级后 build 直接失败）。
+        for f in &files {
+            if !f.extension().is_some_and(|e| e == "ts") {
+                continue;
+            }
+            let text =
+                std::fs::read_to_string(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+            let dir = f.parent().unwrap_or(&mdir).to_path_buf();
+            for (_, _, spec) in specifier_spans(&text) {
+                if !spec.starts_with('#') {
+                    continue;
+                }
+                match only_js::bridge::resolve_alias(&spec, &dir, src, true) {
+                    Err(e) => v.push(format!(
+                        "S008: {}: 别名 {spec} 无法解析\n  {e}\n  \
+                         下一步：改用相对路径，或修正别名目标（`#x` 相对本模块根、\
+                         `#/m/x` 相对 src 根，且必须在模块内的文件里使用）",
+                        f.display()
+                    )),
+                    Ok(file) => {
+                        let target = file
+                            .strip_prefix(src)
+                            .ok()
+                            .and_then(|r| r.components().next())
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+                        if let Some(t) = target
+                            && t != *name
+                            && !deps.contains_key(&t)
+                        {
+                            let hint = if deps.is_empty() {
+                                String::new()
+                            } else {
+                                let mut ks: Vec<&str> = deps.keys().map(String::as_str).collect();
+                                ks.sort_unstable();
+                                format!("（现有 deps 只含：{}）", ks.join(", "))
+                            };
+                            v.push(format!(
+                                "S008: {}: 别名 {spec} 跨模块引用 {t:?}，模块 {name:?} 未声明依赖{hint}\n  \
+                                 下一步：manifest.yaml 补 deps: {{ {t}: \"^<版本>\" }}，\
+                                 或把共享代码放进本模块（`#x` 即可，无需声明）",
+                                f.display()
+                            ));
+                        }
+                    }
+                }
             }
         }
 
@@ -224,7 +307,7 @@ fn s003(
     )
 }
 
-/// 模块内全部 .ts 相对路径（S003 扫描面；fixtures/ 不在产物面不查）。
+/// 模块内全部 .ts 相对路径（S003/S008 扫描面；fixtures/ 与 node_modules/ 不在产物面）。
 fn collect_ts(mdir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![mdir.to_path_buf()];
@@ -235,7 +318,10 @@ fn collect_ts(mdir: &Path) -> Vec<PathBuf> {
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
-                if e.file_name() != "fixtures" {
+                // node_modules 与运行期口径一致地排除：运行期不对 node_modules 内的文件
+                // 启用别名语义，检查若扫进去会比运行时更严（第三方包源码里出现 `#x` →
+                // 误报 S008 让构建失败）。
+                if e.file_name() != "fixtures" && e.file_name() != "node_modules" {
                     stack.push(p);
                 }
             } else if p.extension().is_some_and(|e| e == "ts") {
@@ -245,6 +331,39 @@ fn collect_ts(mdir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// 模块子树内**非模块根**的 manifest.yaml（相对 src 的路径，确定性排序）。
+/// 模块根 = `src/<m>/manifest.yaml`；其下再出现 manifest.yaml 会让 `#` 别名的锚点
+/// （「向上最近的 manifest.yaml」）指向该嵌套目录 → 子树内所有别名的语义被静默改写，
+/// 且 src 根锚点（`#/m/x`）随之失效。这是锚点唯一性的硬前提，故 fail-fast。
+fn nested_manifests(src: &Path) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for (_, mdir) in scan_modules(src)? {
+        let mut stack = vec![mdir.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if e.file_name() != "node_modules" {
+                        stack.push(p);
+                    }
+                } else if e.file_name() == "manifest.yaml" && d != mdir {
+                    out.push(
+                        p.strip_prefix(src)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// 语句首词（跳过 `--` 行注释与空白；大小写归一）。
@@ -609,6 +728,125 @@ mod tests {
         assert!(
             e.contains("S002") && e.contains("user") && e.contains("other"),
             "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// S008：别名目标必须存在；跨模块别名必须声明 deps（既有相对跨模块引用不追溯）。
+    #[test]
+    fn s008_alias_target_exists_and_cross_module_needs_deps() {
+        let t = fixture("s008");
+        let view = BTreeMap::from([("user".into(), "0.1.0".into())]);
+        write(
+            &t.join("src/order/_shared/util.ts"),
+            "export const u = 1;\n",
+        );
+        // 本模块别名（含索引目录与显式后缀）→ 过
+        write(
+            &t.join("src/order/_shared/mod/index.ts"),
+            "export const m = 1;\n",
+        );
+        write(
+            &t.join("src/order/list/api.ts"),
+            "import { u } from \"#_shared/util\";\nimport { m } from \"#_shared/mod\";\nimport { u2 } from \"#_shared/util.ts\";\nexport default {};\n",
+        );
+        for n in ["order", "user"] {
+            assert!(
+                run(
+                    &t.join("src"),
+                    &[n.to_string()],
+                    &view,
+                    only_js::bridge::SqlGuard::Off
+                )
+                .is_ok(),
+                "{n}"
+            );
+        }
+        // 目标不存在 → S008（含探针候选清单）
+        write(
+            &t.join("src/order/list/api.ts"),
+            "import { u } from \"#_shared/nope\";\nexport default {};\n",
+        );
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
+        assert!(e.contains("S008") && e.contains("tried"), "{e}");
+        // 跨模块别名未声明 deps → S008（给下一步）
+        write(
+            &t.join("src/user/_shared/validate.ts"),
+            "export const v = 1;\n",
+        );
+        write(
+            &t.join("src/order/list/api.ts"),
+            "import { v } from \"#/user/_shared/validate\";\nexport default {};\n",
+        );
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("S008") && e.contains("deps") && e.contains("user") && e.contains("下一步"),
+            "{e}"
+        );
+        // 声明 deps 后放行（S004 同时校验范围）
+        write(
+            &t.join("src/order/manifest.yaml"),
+            &manifest("order", "tables: [orders]\ndeps:\n  user: \"^0.1.0\"\n"),
+        );
+        assert!(
+            run(
+                &t.join("src"),
+                &["order".to_string()],
+                &view,
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
+        );
+        // 未知模块名首段 → S008（列出实际存在的模块）
+        write(
+            &t.join("src/order/list/api.ts"),
+            "import { v } from \"#/nope/x\";\nexport default {};\n",
+        );
+        let e = run(
+            &t.join("src"),
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+        )
+        .unwrap_err();
+        assert!(e.contains("S008") && e.contains("nope"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// S008 边界（有意的不对称，防回归）：deps 门禁只约束**别名**新语法，
+    /// 既有**相对**跨模块引用不追溯——否则既有项目升级后 build 直接失败。
+    /// 相对写法的 release 版本绑定仍由构建期 view 保证。
+    #[test]
+    fn s008_does_not_gate_relative_cross_module_imports() {
+        let t = fixture("s008rel");
+        write(
+            &t.join("src/user/_shared/validate.ts"),
+            "export const v = 1;\n",
+        );
+        write(
+            &t.join("src/order/list/api.ts"),
+            "import { v } from \"../../user/_shared/validate\";\nexport default {};\n",
+        );
+        assert!(
+            run(
+                &t.join("src"),
+                &["order".to_string()],
+                &BTreeMap::new(),
+                only_js::bridge::SqlGuard::Off
+            )
+            .is_ok()
         );
         let _ = std::fs::remove_dir_all(&t);
     }

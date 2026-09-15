@@ -1,4 +1,4 @@
-import { mapMenu, paged, pageArgs, MENU_COLS } from "../_shared/map";
+import { mapMenu, paged, pageArgs, MENU_COLS } from "#_shared/map";
 
 async function get(): Promise<void> {
   const { pageSize, current } = pageArgs();

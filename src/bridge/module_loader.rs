@@ -65,6 +65,10 @@ impl OjModuleLoader {
         let ref_dir = referrer_dir(referrer)?;
         let p = if specifier.starts_with("./") || specifier.starts_with("../") {
             resolve_relative(&ref_dir, specifier, self.inner.ts)?
+        } else if specifier.starts_with('#') && !under_node_modules(&ref_dir) {
+            // 别名（`#` 模块根 / `#/` src 根）。node_modules 内的文件不启用——那是
+            // 第三方包自己的 `#`（Node package.json#imports）语义，不劫持。
+            resolve_alias(specifier, &ref_dir, &self.inner.project_root, self.inner.ts)?
         } else {
             resolve_bare(specifier, &ref_dir, &self.inner.project_root)?
         };
@@ -145,6 +149,110 @@ pub fn resolve_relative(base_dir: &Path, spec: &str, ts: bool) -> Result<PathBuf
         base_dir.display(),
         tried.join(", ")
     ))
+}
+
+/// 模块根：referrer 所在目录**向上最近的含 manifest.yaml 的祖先目录**（上溯以
+/// project_root 为界——模块只可能落在它内部，同时避免为越界路径走到文件系统根）。
+/// 锚点由文件自身位置派生，故 dev（`src/<m>/`）、release 产物（`dist/<m>-<v>/`，
+/// manifest.yaml 原样复制）、tasks 镜像（无）三处语义自动一致，无需把 api 根路径
+/// 穿透到各装配点。find 不到 = 该文件不在任何模块内（tasks 池 / tests 目录）。
+pub fn module_root_of(from_dir: &Path, root: &Path) -> Option<PathBuf> {
+    let mut cur = Some(from_dir);
+    while let Some(d) = cur {
+        if !d.starts_with(root) {
+            break;
+        }
+        if d.join("manifest.yaml").is_file() {
+            return Some(d.to_path_buf());
+        }
+        if d == root {
+            break;
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// 路径是否落在 node_modules 内（第三方包文件）。
+fn under_node_modules(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+/// 别名解析：`#<path>` = 本模块根锚点；`#/<path>` = src 根锚点（首段须为模块目录名）。
+/// 后缀探针与相对导入同口径（复用 resolve_relative）。别名路径禁 `..`/空段/`\`
+/// ——纵深防御：别名不得借路径段逃逸锚点，也不与「相对导入逃逸即报错」语义分叉。
+pub fn resolve_alias(
+    spec: &str,
+    from_dir: &Path,
+    root: &Path,
+    ts: bool,
+) -> Result<PathBuf, String> {
+    // release（ts=false）下别名不应存在：`oj build` 已把它们实化为版本目录相对路径，并断言
+    // 产物内无残留 `#`。走到这里若"半可解析"（同模块命中、跨模块悬空）比直接报错更坏。
+    if !ts {
+        return Err(format!(
+            "cannot resolve alias '{spec}': release 产物不应含 `#` 别名（`oj build` 会实化为\
+             相对路径）\n  下一步：重新 oj build；若该 specifier 来自 tests/ 或任务池，\
+             改用相对路径（别名只能在模块内的文件里使用）"
+        ));
+    }
+    let rest = &spec[1..]; // 去过 '#'；调用方已保证非空
+    let from_src_root = rest.starts_with('/');
+    let rel = if from_src_root { &rest[1..] } else { rest };
+    let segs: Vec<&str> = rel.split('/').collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") || rel.contains('\\') {
+        return Err(format!(
+            "cannot resolve alias '{spec}': 别名路径不得含空段/`.`/`..`/`\\`（锚点已固定，无需上溯）"
+        ));
+    }
+    let module_root = module_root_of(from_dir, root).ok_or_else(|| {
+        format!(
+            "cannot resolve alias '{spec}' from '{}': 逐级上溯未找到模块根（manifest.yaml）\
+             ——别名只能在模块内的文件里使用（tests 目录与 tasks 池在模块外，请用相对路径）；\
+             上溯以 project root（{}）为界，--api-path 在 project root 之外时同样不可用",
+            from_dir.display(),
+            root.display()
+        )
+    })?;
+    let anchor = if from_src_root {
+        let src_root = module_root.parent().ok_or_else(|| {
+            format!(
+                "module root {} has no parent (src root)",
+                module_root.display()
+            )
+        })?;
+        let first = segs[0];
+        if !src_root.join(first).join("manifest.yaml").is_file() {
+            let known = module_names(src_root);
+            return Err(format!(
+                "cannot resolve alias '{spec}': 首段 {first:?} 不是模块目录（{} 下无 {first}/manifest.yaml）{}\n  \
+                 下一步：改用已存在的模块名，或把共享代码放进某个模块",
+                src_root.display(),
+                if known.is_empty() {
+                    String::new()
+                } else {
+                    format!("；现有模块：[{}]", known.join(", "))
+                }
+            ));
+        }
+        src_root.to_path_buf()
+    } else {
+        module_root
+    };
+    resolve_relative(&anchor, &segs.join("/"), ts)
+}
+
+/// src 根下含 manifest.yaml 的目录名（别名报错提示用；仅在错误路径调用）。
+fn module_names(src_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(src_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("manifest.yaml").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
 }
 
 /// 裸 specifier 解析（Node 算法简化版）：
@@ -345,6 +453,148 @@ mod tests {
         );
         let err = resolve_relative(&dir, "../nope", ts).unwrap_err();
         assert!(err.contains("tried"), "{err}");
+    }
+
+    /// 别名夹具：两个模块（m1 / user），m1 下挖 8 层深目录模拟真实 handler。
+    fn alias_fx(tag: &str) -> (PathBuf, PathBuf) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "oj-alias-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mf = |n: &str| format!("name: {n}\ndesc: d\nversion: 0.1.0\n");
+        let files: Vec<(String, String)> = vec![
+            ("src/m1/manifest.yaml".into(), mf("m1")),
+            (
+                "src/m1/_shared/validate.ts".into(),
+                "export const v = 1;\n".into(),
+            ),
+            (
+                "src/m1/_shared/mod/index.ts".into(),
+                "export const x = 1;\n".into(),
+            ),
+            ("src/user/manifest.yaml".into(), mf("user")),
+            (
+                "src/user/_shared/util.ts".into(),
+                "export const u = 1;\n".into(),
+            ),
+        ];
+        for (rel, content) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        let deep = root.join("src/m1/a/b/c/d/e/f/g");
+        std::fs::create_dir_all(&deep).unwrap();
+        (root, deep)
+    }
+
+    #[test]
+    fn alias_resolves_module_root_and_src_root() {
+        let (root, deep) = alias_fx("ok");
+        // 本模块根锚点：与目录深度无关。
+        assert!(
+            resolve_alias("#_shared/validate", &deep, &root, true)
+                .unwrap()
+                .ends_with("src/m1/_shared/validate.ts")
+        );
+        // 显式后缀（用户原话的 `import 'xxx.ts'` 形态）。
+        assert!(
+            resolve_alias("#_shared/validate.ts", &deep, &root, true)
+                .unwrap()
+                .ends_with("validate.ts")
+        );
+        // 目录索引。
+        assert!(
+            resolve_alias("#_shared/mod", &deep, &root, true)
+                .unwrap()
+                .ends_with("mod/index.ts")
+        );
+        // src 根锚点（跨模块）。
+        assert!(
+            resolve_alias("#/user/_shared/util", &deep, &root, true)
+                .unwrap()
+                .ends_with("src/user/_shared/util.ts")
+        );
+        // 深目录与模块根等价（同模块）。
+        assert_eq!(
+            resolve_alias("#_shared/validate", &deep, &root, true).unwrap(),
+            resolve_alias("#_shared/validate", &root.join("src/m1"), &root, true).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alias_errors_are_actionable() {
+        let (root, deep) = alias_fx("err");
+        // 未知模块名 → 列出实际存在的模块 + 下一步。
+        let e = resolve_alias("#/nope/x", &deep, &root, true).unwrap_err();
+        assert!(
+            e.contains("nope") && e.contains("m1") && e.contains("下一步"),
+            "{e}"
+        );
+        // 目标不存在 → 列出尝试过的候选（resolve_relative 口径）。
+        let e = resolve_alias("#_shared/nope", &deep, &root, true).unwrap_err();
+        assert!(e.contains("tried"), "{e}");
+        // 别名路径不得含空段 / `.` / `..` / `\`（纵深防御）。
+        for bad in ["#../x", "#/user/../x", "#//x", "#_shared//x", "#a\\b", "#."] {
+            let e = resolve_alias(bad, &deep, &root, true).unwrap_err();
+            assert!(e.contains("不得含"), "{bad}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn alias_requires_module_ancestor() {
+        // 模块外（tests 目录 / tasks 池）无 manifest.yaml 祖先 → 明确报错并给下一步。
+        let root = fx(&[("tests/x.test.ts", "export const x = 1;\n")]);
+        let outside = root.join("tests");
+        assert!(module_root_of(&outside, &root).is_none());
+        let e = resolve_alias("#_shared/validate", &outside, &root, true).unwrap_err();
+        assert!(e.contains("manifest.yaml") && e.contains("相对路径"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_inner_enables_alias_only_outside_node_modules() {
+        let (root, deep) = alias_fx("nm");
+        let loader = OjModuleLoader {
+            inner: Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            }),
+        };
+        let referrer = |p: &Path| ModuleSpecifier::from_file_path(p).unwrap().to_string();
+        // 模块内文件：`#` 走别名，且经 ensure_within + ?v= 版本化。
+        let url = loader
+            .resolve_inner("#_shared/validate", &referrer(&deep.join("api.ts")))
+            .unwrap();
+        assert!(
+            url.as_str().contains("m1/_shared/validate.ts") && url.as_str().contains("?v="),
+            "{url}"
+        );
+        // node_modules 内的文件不启用别名（第三方包自己的 package.json#imports 语义）
+        // → 回落裸 specifier 解析，报错文案指向 node_modules 而非别名。
+        let nm = root.join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        let e = loader
+            .resolve_inner("#foo", &referrer(&nm.join("index.js")))
+            .unwrap_err();
+        assert!(e.contains("node_modules"), "{e}");
+        assert!(!e.contains("逐级上溯未找到模块根"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// release（ts=false）下别名一律拒绝：`oj build` 已实化，走到这里说明产物不干净或
+    /// 用法越界（tests/ 与任务池）。半可解析（同模块命中、跨模块悬空）比直接报错更坏。
+    #[test]
+    fn alias_rejected_in_release_mode() {
+        let (root, deep) = alias_fx("rel");
+        let e = resolve_alias("#_shared/validate", &deep, &root, false).unwrap_err();
+        assert!(e.contains("release") && e.contains("oj build"), "{e}");
+        assert!(e.contains("相对路径"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

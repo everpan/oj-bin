@@ -331,6 +331,13 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
 - `resolve_inner`：已是绝对 `file://` URL 直接返回（**不再 `ensure_within`**，这是信任模型：
   内部生成的 specifier 可信，外部请求体/路径才需钳制）。
 - `resolve_relative`：`./` `../` + 补全 `.ts`→`.js`→`/index.ts`→`/index.js` + 词法归一化 `..`。
+- `resolve_alias`：导入别名。`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**；模块根由
+  `module_root_of` 从引用方目录向上找最近的 `manifest.yaml` 祖先（以 project_root 为界）
+  派生——因此 dev（`src/<m>/`）与 release 产物（`dist/<m>-<v>/`，manifest 原样复制）语义
+  天然一致，不需要把 api 根路径穿透到装配点。别名路径禁 `..`/空段；引用方在 `node_modules`
+  内不启用（不劫持第三方包的 `package.json#imports` 语义）；模块外（tests 目录 / 任务池）
+  无锚点 → 明确报错。`oj build` 侧用**同一份探针**实化（见 `build_cmd::resolve_to_segs`），
+  故 dev/release 命中同一文件。
 - `resolve_bare`：裸 specifier 从当前文件目录逐级向上找 `node_modules/<pkg>`（至 project
   root），按 `package.json` `module`→`main`→`index.js` 取入口，支持 `@scope/name` 与子路径。
 - `wrap_cjs` / `looks_cjs` / `op_resolve_cjs`：CJS 互操作（`module.exports`→`default`，

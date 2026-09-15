@@ -124,10 +124,20 @@ npx vitest run  # 等价于 npm test
 
 - `mocks/oj-globals.ts`：`installGlobals(opts?)` 把运行时注入的 `db/json/http/bus/log` 替换为
   可控桩，返回本次响应捕获 `{ code, msg, data }`；`lastPublished()` 取 `bus.publish` 记录，
-  `lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/构造器）与绑定参数记录（可断言 handler 走了哪个分支）。
+  `lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/**构造器**）与绑定参数记录（可断言 handler 走了哪个分支）。
+- `mocks/query-builder.ts`：`db.table(...)` 的构造器桩，**镜像** `src/bridge/bootstrap.js` 的
+  `builderFromReq` API 面（select/where/orderBy/limit/offset/insert/update/delete/returning/
+  all/run/toSQL，含 `update|delete` 无 where 即抛的守卫）。SQL 按**规范形**渲染（小写关键字、
+  `col, col`、`?` 占位）——真实渲染是 sea-query 按方言产出，mock 不复刻方言细节；保留的信号是
+  「handler 选了哪张表/哪些列/什么过滤条件/绑定参数」，故 spec 断言的是规范形而非某个方言真身。
+  未覆盖的形态（树形 or/and、子查询、join、聚合列）**直接抛错**，避免静默渲染出错误字符串。
 - `invoke.ts`：`invoke(handler, method, opts?)` 装好 mock 全局 → 调用 `handler[method]()` →
   flush 微任务 → 返回 `{ ...capture, published }`。
 - `*.spec.ts`：直接 import 真实 `../src/.../api` 的 handler，调用 `invoke` 并断言。
+- `vitest.config.ts`：把 oj 的**导入别名**（`#x` 本模块根 / `#/m/x` src 根）镜像成
+  `resolveId` 插件。L2 跑在 vite 解析器上，与 oj 运行时是两套；不镜像的话，被 spec 直接
+  import 的模块内文件一旦用了别名，vitest 会按 Node 的 `package.json#imports` 解释 `#` 并报
+  解析失败。规则与 `src/bridge/module_loader.rs::resolve_alias` 同源（含后缀探针顺序）。
 
 ### 测试文件写法
 

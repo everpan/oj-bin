@@ -1,4 +1,4 @@
-import { requireRole } from "../../user/_shared/validate";
+import { requireRole } from "#/user/_shared/validate";
 
 function get(): void {
   const role = requireRole(http.param("role", "admin")); // 跨模块相对导入（UC-13）

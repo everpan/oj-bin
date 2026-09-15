@@ -1,4 +1,4 @@
-import { issueTokens, nowSecs, sessionKey } from "../_shared/session";
+import { issueTokens, nowSecs, sessionKey } from "#_shared/session";
 
 export default {
   async post() {

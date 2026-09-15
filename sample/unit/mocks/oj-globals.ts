@@ -6,6 +6,10 @@
 // 路由、鉴权、租户、真实 DB、统一信封、HTTP 状态码一律归 L1（`sample/tests/`，oj test）——
 // 判据与去重规则见 docs/modules/08-testing.md §4。
 
+import { tableBuilder } from "./query-builder";
+export type { SqlCall } from "./query-builder";
+import type { SqlCall } from "./query-builder";
+
 export interface ResponseCapture {
   code: number;
   msg: string;
@@ -26,12 +30,6 @@ let published: Array<{ topic: string; msg: any }> = [];
 // 模块级 SQL 调用记录：L2 可断言 handler 走了哪个分支（如「带 id 的查询 / 不带 id 的列表」），
 // 「发出了什么 SQL」在 L1 里只能经响应间接观察，是本层的独特价值。
 let sqlCalls: SqlCall[] = [];
-
-export interface SqlCall {
-  fn: "query" | "exec";
-  sql: string;
-  params?: any[];
-}
 
 export function installGlobals(opts: GlobalsOptions = {}): ResponseCapture {
   published = [];
@@ -70,13 +68,21 @@ export function installGlobals(opts: GlobalsOptions = {}): ResponseCapture {
 
   (globalThis as any).db = {
     query: async (sql: string, params?: any[]) => {
-      sqlCalls.push({ fn: "query", sql, params });
+      sqlCalls.push({ fn: "query", sql, params: params ?? [] });
       return opts.dbRows ?? [];
     },
     exec: async (sql: string, params?: any[]) => {
-      sqlCalls.push({ fn: "exec", sql, params });
+      sqlCalls.push({ fn: "exec", sql, params: params ?? [] });
       return 1;
     },
+    // 构造器面（db.table(...)）：与 bootstrap.js 的 builderFromReq 同 API 形；
+    // 渲染与覆盖范围见 mocks/query-builder.ts。
+    table: (name: string) =>
+      tableBuilder(
+        String(name),
+        (call) => sqlCalls.push(call),
+        () => opts.dbRows ?? [],
+      ),
   };
 
   (globalThis as any).log = { debug() {}, info() {}, warn() {}, error() {} };

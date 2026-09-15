@@ -477,6 +477,42 @@ export default {
 
 > 何时读我：import 报错或想抽公共代码时。
 
+### 别名导入（共享库推荐写法）
+
+`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**（`m` = 模块目录名）。与目录深度无关，
+目录搬动不用改引用：
+
+```ts
+// src/user/profile/detail/api.ts —— 无论嵌套多深，写法完全一样
+import { positiveId } from "#_shared/validate";        // → src/user/_shared/validate.ts
+import { v } from "#_shared";                          // → src/user/_shared/index.ts（目录索引）
+import { p } from "#_shared/validate.ts";              // 显式后缀
+import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必须是模块目录名
+```
+
+规则与边界：
+
+- 后缀补全与相对导入同序；别名路径禁 `..` / 空段。
+- **只能在模块内的文件里用**：模块根由**文件自身位置**派生（从所在目录向上最近的
+  `manifest.yaml` 祖先），`src/tests` 用例目录与任务池在模块外 → 没有锚点，继续用相对路径。
+  运行期与构建期**共用同一份探针**（`resolve_relative` / `resolve_alias`），所以 dev 与
+  release 对同一 specifier 必然命中同一文件（含目录索引）。
+- **跨模块别名需声明依赖**：`manifest.yaml` 的 `deps` 缺目标模块 → `oj build` 报 S008
+  （与表归属 S003 同一套归属图）。既有**相对**跨模块引用不追溯（升级不破坏）。
+- release：build 期实化为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本；
+  产物内不含 `#`（落盘后有两道断言：单文件无残留别名 + 本次产出目录内本地 specifier 都必须落到
+  已落盘文件）。任务池是非版本化资产 → 别名一律拒绝，且池内 import 不得越池根。
+- 约束：`manifest.yaml` 只能出现在模块根（嵌套会改写别名锚点 → S008）；release 模式不解析
+  别名（`ts=false` 直接报错）。
+- **本地导入目标必须是 `.ts`**：`./x.js` / `./d.json` 在产物里没有对应文件（只转译 `.ts`）→
+  `oj build` fail-fast（此前静默悬空，release 运行期才炸）。
+- 编辑器/测试工具对齐：`tsconfig.json` 的 `paths` 镜像
+  （`"#/*": ["./src/*"]` + `"#*": [各模块 /*]`，值须带 `./` 前缀——无 `baseUrl` 时非相对值会被
+  vite/esbuild 警告；见 `sample/tsconfig.json`）；L2 vitest 走
+  `sample/unit/vitest.config.ts` 的 `resolveId` 插件（同规则镜像）。
+- `#` 与 Node `package.json#imports` 共用命名空间：项目若声明 `#` 开头的 imports 键，
+  `oj build` 直接失败（避免 Node/vite 与 oj 两套解析器分叉）。
+
 ### 相对导入
 
 `./x`、`../x` 自动补全，顺序：`.ts` → `.js` → `/index.ts` → `/index.js`。
@@ -485,12 +521,12 @@ export default {
 import { positiveId, requireRole } from "../_shared/validate";   // → ../_shared/validate.ts
 ```
 
-**跨模块相对导入**（如 `order` 引 `user` 的工具）：dev 下直接可跑；build 时改写为指向
-目标模块版本目录的相对路径——目标模块未构建过则报错，先 `oj build user` 再
-`oj build order`（摘自 `sample/src/order/list/api.ts`）：
+**跨模块相对导入**（如 `idp` 引 `auth` 的工具）：dev 下直接可跑；build 时改写为指向
+目标模块版本目录的相对路径——目标模块未构建过则报错，先 `oj build auth` 再
+`oj build idp`（摘自 `sample/src/idp/login/api.ts`）：
 
 ```ts
-import { requireRole } from "../../user/_shared/validate";
+import { nowSecs } from "../../auth/_shared/util";
 ```
 
 ### 裸 specifier（node_modules）

@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use only_js::bridge::import_scan::{
+    is_alias, is_local, is_relative, rewrite_specifiers, specifier_spans,
+};
 use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, transpile};
 use server::routes;
 
@@ -63,6 +66,17 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     }
     // tasks 目录转译镜像（T10，评审 F2）：非版本化资产，不进锁/tgz。
     mirror_tasks(&src, &out, &tasks_dir, a.minify)?;
+    // 产物自洽断言：只扫**本次构建产出**的目录，本地 specifier 必须都能落到已落盘文件
+    // （跨模块目标此时也已由本次构建产出，或来自锁指向的既有版本目录）。
+    let mut roots: Vec<PathBuf> = names
+        .iter()
+        .filter_map(|m| view.get(m).map(|v| out.join(format!("{m}-{v}"))))
+        .collect();
+    let tdir = out.join(&tasks_dir);
+    if tdir.is_dir() {
+        roots.push(tdir);
+    }
+    assert_dist_consistent(&roots)?;
     println!("oj build: {} module(s) → {}", names.len(), out.display());
     Ok(())
 }
@@ -110,31 +124,80 @@ fn walk_ts_js(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// 全源引号定界扫描相对 specifier（mirror_tasks 专用，统一审查 #7）：覆盖
-/// `from "…"`、副作用 `import "…";`、`export * from "…"`、动态 `import("…")`——
-/// 行内 `from ` 口径漏前两类，release 任务运行期才炸模块解析。
-/// ponytail: 模板串/注释里长得像相对路径的字符串会误配，出现再按 AST 重写。
-fn all_relative_specifiers(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if (c == b'"' || c == b'\'')
-            && let Some(end) = src[i + 1..].find(c as char)
-        {
-            let spec = &src[i + 1..i + 1 + end];
-            if (spec.starts_with("./") || spec.starts_with("../")) && !spec.contains('\n') {
-                out.push(spec.to_string());
-            }
-            i += end + 2;
-            continue;
+// specifier 扫描/改写（`specifier_spans` / `rewrite_specifiers` / `is_local`|`is_alias`
+// |`is_relative`）在 core `only_js::bridge::import_scan`：**唯一实现**，与 `oj/src/checks.rs`
+// 的 S008 共用（避免「检查放行、构建改不动」的分叉），同 `bridge::guard::extract_tables` 先例。
+
+/// 残留别名断言（单文件）：别名必须全部实化（产物内不得再有 `#` specifier）。
+/// 把「扫描器漏检」从**运行期静默炸**降级为**构建期显式失败**——字符级扫描天花板的兜底。
+/// 覆盖面更广的产物自洽断言见 `assert_dist_consistent`。
+fn assert_no_aliases(js: &str, what: &str) -> Result<(), String> {
+    for (_, _, spec) in specifier_spans(js) {
+        if is_alias(&spec) {
+            return Err(format!(
+                "{what}: 别名未实化（改写器漏检）：{spec:?}\n  \
+                 下一步：改用相对路径绕过，并报此缺陷（扫描器未覆盖该写法）"
+            ));
         }
-        i += 1;
     }
-    out
+    Ok(())
 }
 
+/// 产物自洽断言：每一个**本地** specifier 都必须能落到已落盘的文件。
+/// 单文件的别名断言只护别名，漏改写的**相对** specifier（扫描器未覆盖的写法，如正则
+/// 字面量导致错位）此前会静默进产物、release 运行期才炸；这里把整类问题收敛为构建期失败。
+///
+/// `roots` = **本次构建产出的目录**（各模块版本目录 + tasks 镜像），不扫整个 `dist`：
+/// 陈旧的他人产物（旧版 oj 构建、或已不存在的模块）不该让本次构建失败。
+fn assert_dist_consistent(roots: &[PathBuf]) -> Result<(), String> {
+    let mut stack: Vec<PathBuf> = roots.to_vec();
+    let mut bad: Vec<String> = Vec::new();
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !p.extension().is_some_and(|x| x == "js") {
+                continue;
+            }
+            let js =
+                std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            let dir = p.parent().unwrap_or(Path::new(""));
+            for (_, _, spec) in specifier_spans(&js) {
+                if !is_local(&spec) {
+                    continue;
+                }
+                if is_alias(&spec) {
+                    bad.push(format!("  {}: 别名未实化 {spec:?}", p.display()));
+                    continue;
+                }
+                let target = dir.join(&spec);
+                if !target.is_file() && !target.join("index.js").is_file() {
+                    bad.push(format!(
+                        "  {}: {spec:?} → {} 不存在",
+                        p.display(),
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "构建产物自洽检查失败（import 目标未落盘；release 会在运行期才炸）：\n{}\n  \
+             下一步：把这些 specifier 改成 `.ts` 目标的本地导入（只有 .ts 会被转译落盘），\
+             或确认构建器覆盖了该写法（报此缺陷）",
+            bad.join("\n")
+        ))
+    }
+}
 /// tasks 池镜像（spec §6/T10）：`<src>/<tasks.dir>` → `<out>/<tasks.dir>`，递归。
 /// .ts → 转译 .js（相对 import `./x.ts` → `./x.js`）；.js → 原样转译直通；
 /// 其余扩展名跳过。目录不存在 = 跳过（空池）。
@@ -153,25 +216,39 @@ fn mirror_tasks(src: &Path, out: &Path, tasks_dir: &str, minify: bool) -> Result
             .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
         let js = transpile::cached_transpile(f)
             .map_err(|e| format!("transpile {}: {e}", f.display()))?;
-        // 相对 import 落 .js 后缀（任务池内互导；行级、字面量，同 fix_relative_imports
-        // 口径：无后缀补 .js、.ts 改 .js、.js/.mjs/.json 原样）。带引号整体替换防子串
-        // 误伤（"./x" 是 "./x.ts" 的前缀）。
-        let mut js = js;
-        for spec in all_relative_specifiers(&js) {
-            let new = if let Some(stem) = spec.strip_suffix(".ts") {
-                Some(format!("{stem}.js"))
+        // 相对 import 落 .js 后缀（任务池内互导）。两条硬边界：
+        // ① 别名一律拒绝——任务池是非版本化资产（不进锁 / 不打 tgz，只镜像到 dist/tasks），
+        //    无力绑定模块版本；
+        // ② 相对 import 不得越过任务池根——池外目标（尤其跨模块）在产物里必然不存在，
+        //    此前会静默悬空到运行期。
+        let depth = rel.parent().map(|p| p.components().count()).unwrap_or(0);
+        let pool = to.display().to_string();
+        let js = rewrite_specifiers(&js, |spec| {
+            if is_alias(spec) {
+                return Err(format!(
+                    "tasks: 别名 {spec:?} 不受支持（任务池非版本化，无法绑定模块版本）\n  \
+                     下一步：改用相对路径，或把共享代码放进模块内"
+                ));
+            }
+            if !is_relative(spec) {
+                return Ok(None);
+            }
+            if spec.split('/').take_while(|s| *s == "..").count() > depth {
+                return Err(format!(
+                    "tasks: import {spec:?} 越过任务池根（产物只镜像 {pool}，非版本化资产）\n  \
+                     下一步：把目标文件放进任务池内（如 {tasks_dir}/_shared/），\
+                     或把逻辑内联进任务文件"
+                ));
+            }
+            if let Some(stem) = spec.strip_suffix(".ts") {
+                Ok(Some(format!("{stem}.js")))
             } else if !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json")
             {
-                Some(format!("{spec}.js"))
+                Ok(Some(format!("{spec}.js")))
             } else {
-                None
-            };
-            if let Some(n) = new {
-                for q in ['"', '\''] {
-                    js = js.replace(&format!("{q}{spec}{q}"), &format!("{q}{n}{q}"));
-                }
+                Ok(None)
             }
-        }
+        })?;
         let js = if minify {
             transpile::minify_js(f, &js).map_err(|e| format!("minify {}: {e}", f.display()))?
         } else {
@@ -256,8 +333,9 @@ async fn build_one(
         } else {
             let js = transpile::cached_transpile(&mdir.join(rel))
                 .map_err(|e| format!("transpile {}: {e}", rel.display()))?;
-            let stripped; // 生命周期：strip 产物要活过 fix_relative_imports 调用
-            let js = fix_relative_imports(
+            let stripped; // 生命周期：strip 产物要活过 fix_import_specifiers 调用
+            let js = fix_import_specifiers(
+                src,
                 if *is_api {
                     stripped = strip_route_decls(&js);
                     &stripped
@@ -268,13 +346,17 @@ async fn build_one(
                 &m.version,
                 &rel_dir(rel),
                 view,
-            )?;
+                // 报错带违规文件路径（三要素：文件 + 原因 + 下一步；原因带候选清单）
+            )
+            .map_err(|e| format!("{}: {e}", rel.display()))?;
             let js = if minify {
                 transpile::minify_js(&mdir.join(rel), &js)
                     .map_err(|e| format!("minify {}: {e}", rel.display()))?
             } else {
                 js
             };
+            // 残留别名断言：对**最终产物**（minify 之后）校验，别名必须已全部实化。
+            assert_no_aliases(&js, &rel.display().to_string())?;
             let name = rel
                 .with_extension("js")
                 .file_name()
@@ -400,8 +482,11 @@ fn walk(root: &Path, dir: &Path, acc: &mut Vec<(PathBuf, bool)>) -> Result<(), S
         let p = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         if p.is_dir() {
-            if name == "fixtures" {
-                continue; // 演示数据不进产物（spec §4.5/P0），由 oj fixture 灌入
+            // 演示数据不进产物（spec §4.5/P0），由 oj fixture 灌入；
+            // node_modules 与运行期解析口径一致地排除（运行期 resolve_inner 不对
+            // node_modules 内的文件启用别名/本地语义），否则会把第三方源码打进产物。
+            if name == "fixtures" || name == "node_modules" {
+                continue;
             }
             walk(root, &p, acc)?;
         } else {
@@ -439,41 +524,26 @@ fn strip_route_decls(src: &str) -> String {
     out
 }
 
-/// 静态 import/export-from 的相对裸 specifier 改写为 dist 产物路径（spec §2.4）：
+/// 本地 specifier（相对 / 别名）改写为 dist 产物路径（spec §2.4）：
 /// 归一解析后仍在 `src/<m>/` 内 → 模块内重算相对路径（版本目录布局下原 specifier
 /// 上溯会落到无版本段的 `dist/<m>/…` 悬空）；越界 → 跨模块，查版本视图得 v_t，
 /// 指向 `dist/<m_t>-<v_t>/`，视图缺 m_t fail-fast。
-/// ponytail: 逐行、仅 `from "…"` 字面量；动态 import / 别名出现时再补。
-fn fix_relative_imports(
+/// npm 裸包名不改写（交运行期 resolve_bare）。**全部**本地 specifier 都过探针校验
+/// （含 `.js`/`.json` 等非 `.ts` 目标 → 直接报错，见 `resolve_to_segs`）——
+/// 「dev 能跑、release 悬空」不再有静默通道。
+fn fix_import_specifiers(
+    src_root: &Path,
     src: &str,
     module: &str,
     version: &str,
     rel_dir: &str,
     view: &std::collections::BTreeMap<String, String>,
 ) -> Result<String, String> {
-    let mut out = Vec::new();
-    for l in src.lines() {
-        let Some(i) = l.find("from ") else {
-            out.push(l.to_string());
-            continue;
-        };
-        let rest = &l[i + 5..];
-        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-            out.push(l.to_string());
-            continue;
-        };
-        let s = &rest[1..];
-        let Some(end) = s.find(quote) else {
-            out.push(l.to_string());
-            continue;
-        };
-        let spec = &s[..end];
-        let bare = !spec.ends_with(".js") && !spec.ends_with(".mjs") && !spec.ends_with(".json");
-        if !(spec.starts_with("./") || spec.starts_with("../")) || !bare {
-            out.push(l.to_string());
-            continue;
+    rewrite_specifiers(src, |spec| {
+        if !is_local(spec) {
+            return Ok(None);
         }
-        let segs = resolve_spec(spec, module, rel_dir)?;
+        let segs = resolve_to_segs(src_root, module, rel_dir, spec)?;
         let target_dir = if segs[0] == module {
             format!("{module}-{version}")
         } else {
@@ -489,44 +559,55 @@ fn fix_relative_imports(
         let to = std::iter::once(target_dir)
             .chain(segs[1..].iter().cloned())
             .collect();
-        let new_spec = product_spec(module, version, rel_dir, to);
-        out.push(format!("{}{}{}{}", &l[..i + 5], quote, new_spec, &s[end..]));
-    }
-    Ok(out.join("\n") + "\n")
+        Ok(Some(product_spec(module, version, rel_dir, to)))
+    })
 }
 
-/// 归一解析相对 specifier（相对 `src/<module>/<rel_dir>/`）为 src 下段列表。
-/// `..` 越过 src 根 / 解析到 src 根本身都报错（无第一段 → 既非模块内也非跨模块）。
-fn resolve_spec(spec: &str, module: &str, rel_dir: &str) -> Result<Vec<String>, String> {
-    let mut segs = vec![module.to_string()];
-    segs.extend(
-        rel_dir
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-    );
-    for part in spec.split('/') {
-        match part {
-            "." | "" => {}
-            ".." => {
-                if segs.pop().is_none() {
-                    return Err(format!(
-                        "relative import {spec:?} escapes src/ (from {module}/{rel_dir})"
-                    ));
-                }
-            }
-            p => segs.push(p.to_string()),
-        }
-    }
+/// 本地 specifier → src_root 下的段列表（**末段为真实文件名**）。
+/// 相对导入与别名**共用运行期的同一份探针**（`resolve_relative` / `resolve_alias`），
+/// 于是 dev 与 release 对同一 specifier 必然命中同一文件——「dev 能跑、release 悬空」
+/// 的一类缺陷在结构上被消掉（此前构建期只做字符串补后缀，命中不了目录索引）。
+fn resolve_to_segs(
+    src_root: &Path,
+    module: &str,
+    rel_dir: &str,
+    spec: &str,
+) -> Result<Vec<String>, String> {
+    let from_dir = if rel_dir.is_empty() {
+        src_root.join(module)
+    } else {
+        src_root.join(module).join(rel_dir)
+    };
+    let file = if is_alias(spec) {
+        only_js::bridge::resolve_alias(spec, &from_dir, src_root, true)?
+    } else {
+        only_js::bridge::resolve_relative(&from_dir, spec, true)?
+    };
+    let rel = file
+        .strip_prefix(src_root)
+        .map_err(|_| format!("import {spec:?} escapes src/ (from {module}/{rel_dir})"))?;
+    let segs: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
     if segs.is_empty() {
-        return Err(format!("relative import {spec:?} resolves to src/ root"));
+        return Err(format!("import {spec:?} resolves to src/ root"));
+    }
+    // 只有 .ts 会被转译落盘（collect_module 白名单）：目标若是 .js/.json 等，dev 能跑
+    // 但产物里没有该文件——此前静默产出悬空 specifier，release 才炸。这里 fail-fast。
+    if !file.extension().is_some_and(|e| e == "ts") {
+        return Err(format!(
+            "import {spec:?} → {} 的扩展名不会进产物（只有 .ts 被转译落盘）\n  \
+             下一步：把该文件改成 .ts，或把内容内联/搬进 .ts 模块",
+            file.display()
+        ));
     }
     Ok(segs)
 }
 
 /// 产物相对 specifier：从 `dist/<module>-<version>/<rel_dir>/`（当前产物文件位置）到
-/// `to`（首段为目标版本目录）的相对路径；末段 `.ts` 改 `.js`、无后缀补 `.js`；
-/// 无上溯时必须带 `./` 前缀（ESM 裸 specifier 会被当包名解析）。
+/// `to`（首段为目标版本目录）的相对路径；`.ts` 改 `.js`（其余后缀原样——探针给的是
+/// 真实文件名，不再猜后缀）；无上溯时必须带 `./` 前缀（ESM 裸 specifier 会被当包名解析）。
 fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>) -> String {
     let from: Vec<String> = std::iter::once(format!("{module}-{version}"))
         .chain(
@@ -541,8 +622,10 @@ fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>)
         i += 1;
     }
     let last = to.len() - 1;
-    let stem = to[last].strip_suffix(".ts").unwrap_or(&to[last]);
-    to[last] = format!("{stem}.js");
+    to[last] = match to[last].strip_suffix(".ts") {
+        Some(stem) => format!("{stem}.js"),
+        None => to[last].clone(),
+    };
     let mut parts: Vec<String> = vec!["..".into(); from.len() - i];
     parts.extend(to[i..].iter().cloned());
     let joined = parts.join("/");
@@ -575,33 +658,19 @@ fn rel_pattern(module: &str, rel_dir: &str, route: Option<&str>) -> String {
     }
 }
 
-/// 静态 import/export-from 的相对 specifier（与 fix_relative_imports 同口径：行级、字面量）。
-/// ponytail: 动态 import()/别名出现时再补。
-fn relative_import_specifiers(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for l in src.lines() {
-        let Some(i) = l.find("from ") else { continue };
-        let rest = &l[i + 5..];
-        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-            continue;
-        };
-        let s = &rest[1..];
-        let Some(end) = s.find(q) else { continue };
-        let spec = &s[..end];
-        if spec.starts_with("./") || spec.starts_with("../") {
-            out.push(spec.to_string());
-        }
-    }
-    out
-}
-
 /// api.ts 只许作路由入口（spec §2.5）：它是 routes.js 的聚合单元而非可复用模块，
 /// 被导入会把路由副作用（.route 声明、默认导出的 handler 表）拖进普通模块。
 /// 目标 basename（剥扩展）== "api" 即拒绝——宁枉勿纵，报错给全部违规。
+/// 扫描面 = 全部**本地** specifier（相对 + 别名）：`#user/item/api`、`#/user/item/api`
+/// 与相对写法同等拦截（此前只看相对写法，换个前缀即可绕过）。
+/// npm 裸包名不在守卫面（`import x from "pkg/api"` 是包内子路径，不是本项目的 api.ts）。
 fn guard_no_api_imports(files: &[(String, String)]) -> Result<(), String> {
     let mut bad = Vec::new();
     for (rel, src) in files {
-        for spec in relative_import_specifiers(src) {
+        for (_, _, spec) in specifier_spans(src) {
+            if !is_local(&spec) {
+                continue;
+            }
             let target = spec.rsplit('/').next().unwrap_or("");
             let stem = target
                 .strip_suffix(".ts")
@@ -634,22 +703,49 @@ mod tests {
         assert!(out.contains("x.route"), "{out}"); // 读取不剥
     }
 
-    /// 测试辅助：默认上下文（模块 a 0.1.0、rel_dir item、空版本视图）。
-    fn fix(src: &str, rel_dir: &str, view: &std::collections::BTreeMap<String, String>) -> String {
-        fix_relative_imports(src, "a", "0.1.0", rel_dir, view).unwrap()
+    /// 测试辅助：搭一棵真实 src 树（改写要探盘，字符串单测已不成立）。
+    /// 返回 (src 根, 临时根)。
+    fn fix_fixture(tag: &str, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let t = std::env::temp_dir().join(format!(
+            "oj-fix-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&t);
+        let src = t.join("src");
+        for (rel, content) in files {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        (src, t)
     }
 
-    #[test]
-    fn fix_imports_appends_js_to_relative_only() {
-        let src = "import { v } from \"../_shared/validate\";\nimport x from \"./a.js\";\nimport y from \"pkg\";\nimport m from \"./m.mjs\";\nimport j from \"./d.json\";\nexport { v } from \"./b\";\nconst s = \"from \\\"./nope\\\"\";\n";
-        let out = fix(src, "item", &Default::default());
-        assert!(out.contains("\"../_shared/validate.js\""), "{out}");
-        assert!(out.contains("\"./a.js\""), "{out}");
-        assert!(out.contains("from \"pkg\""), "{out}");
-        assert!(out.contains("\"./m.mjs\""), "{out}"); // 已带后缀不动（.mjs/.json 不误加 .js）
-        assert!(out.contains("\"./d.json\""), "{out}");
-        assert!(out.contains("\"./b.js\""), "{out}");
-        assert!(out.contains("from \\\"./nope\\\""), "{out}"); // 引号未开 → 不动
+    /// 测试辅助：模块 a（0.1.0）+ b（0.2.0）双模块夹具，覆盖索引目录/别名/跨模块。
+    fn two_modules(tag: &str) -> (PathBuf, PathBuf) {
+        fix_fixture(
+            tag,
+            &[
+                ("a/manifest.yaml", "name: a\ndesc: d\nversion: 0.1.0\n"),
+                ("b/manifest.yaml", "name: b\ndesc: d\nversion: 0.2.0\n"),
+                ("b/util.ts", "export const v = 1;\n"),
+                ("a/_shared/validate.ts", "export const v = 1;\n"),
+                ("a/_shared/mod/index.ts", "export const x = 1;\n"),
+                ("a/y/g.ts", "export const g = 1;\n"),
+                ("a/sub/_shared/deep.ts", "export const d = 1;\n"),
+            ],
+        )
+    }
+
+    /// 测试辅助：在模块 a 的某目录下改写（模块 a 0.1.0、给定版本视图）。
+    fn fix_in(
+        src_root: &Path,
+        src: &str,
+        rel_dir: &str,
+        view: &std::collections::BTreeMap<String, String>,
+    ) -> String {
+        fix_import_specifiers(src_root, src, "a", "0.1.0", rel_dir, view).unwrap()
     }
 
     /// 版本视图 {b: 0.2.0}。
@@ -660,32 +756,186 @@ mod tests {
     }
 
     #[test]
+    fn relative_imports_rewritten_to_product_paths() {
+        let (src_root, t) = fix_fixture(
+            "rel",
+            &[
+                ("a/manifest.yaml", "name: a\ndesc: d\nversion: 0.1.0\n"),
+                ("a/_shared/validate.ts", "export const v = 1;\n"),
+                ("a/_shared/deep.ts", "export const d = 1;\n"),
+            ],
+        );
+        let src = "import { v } from \"../_shared/validate\";\nimport p from \"pkg\";\nexport { v } from \"../_shared/validate.ts\";\nconst s = \"from \\\"../_shared/validate\\\"\";\n";
+        let out = fix_in(&src_root, src, "item", &Default::default());
+        assert!(out.contains("\"../_shared/validate.js\""), "{out}");
+        assert!(out.contains("from \"pkg\""), "{out}"); // npm 裸包名不动
+        // 普通字符串里的 `from "…"` 不动（非导入位置——此前行级口径会误伤）
+        assert!(
+            out.contains(r#"const s = "from \"../_shared/validate\"";"#),
+            "{out}"
+        );
+        // 深层目录：跨目录上溯仍正确
+        let out = fix_in(
+            &src_root,
+            "import { d } from \"../../../_shared/deep\";\n",
+            "item/x/y",
+            &Default::default(),
+        );
+        assert!(out.contains("\"../../../_shared/deep.js\""), "{out}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 非 `.ts` 本地目标（`.js`/`.json`）不进产物（collect_module 白名单只收 `.ts`），
+    /// 此前会静默产出悬空 specifier、release 才炸 → 现构建期 fail-fast。
+    #[test]
+    fn non_ts_local_target_fails_the_build() {
+        let (src_root, t) = fix_fixture(
+            "ext",
+            &[
+                ("a/manifest.yaml", "name: a\ndesc: d\nversion: 0.1.0\n"),
+                ("a/item/plain.js", "export const p = 1;\n"),
+                ("a/plain.js", "export const p = 1;\n"),
+                ("a/item/d.json", "{}\n"),
+            ],
+        );
+        for spec in ["./plain.js", "./d.json", "#plain.js"] {
+            let e = fix_import_specifiers(
+                &src_root,
+                &format!("import x from \"{spec}\";\n"),
+                "a",
+                "0.1.0",
+                "item",
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(e.contains("不会进产物") && e.contains(spec), "{spec}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 产物自洽断言：漏改写的**本地** specifier（扫描器未覆盖的写法）必须在构建期暴露，
+    /// 而不是留到 release 运行期才炸。
+    #[test]
+    fn dist_consistency_assertion_catches_dangling_local_specifier() {
+        let t = std::env::temp_dir().join(format!("oj-dist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let vdir = t.join("dist/m-0.1.0");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(
+            vdir.join("api.js"),
+            "import x from \"./missing.js\";\nimport y from \"pkg\";\n",
+        )
+        .unwrap();
+        // 裸包名不在自洽面（运行期 node_modules 解析）
+        assert!(assert_dist_consistent(std::slice::from_ref(&vdir)).is_err());
+        std::fs::write(vdir.join("missing.js"), "export const x = 1;\n").unwrap();
+        assert!(assert_dist_consistent(std::slice::from_ref(&vdir)).is_ok());
+        // 残留别名同样被兜住
+        std::fs::write(vdir.join("api.js"), "import x from \"#_shared/a\";\n").unwrap();
+        let e = assert_dist_consistent(std::slice::from_ref(&vdir)).unwrap_err();
+        assert!(e.contains("别名未实化"), "{e}");
+        // 未参与本次构建的目录不扫（陈旧产物不该让本次构建失败）
+        assert!(assert_dist_consistent(&[]).is_ok());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 回归：目录索引导入（`../_shared/mod` → `_shared/mod/index.ts`）。
+    /// 修复前构建期只做字符串补后缀 → 产出悬空的 `../_shared/mod.js`（dev 能跑、release 炸）。
+    #[test]
+    fn directory_index_import_maps_to_index_js() {
+        let (src_root, t) = two_modules("index");
+        let out = fix_in(
+            &src_root,
+            "import { x } from \"../_shared/mod\";\n",
+            "item",
+            &Default::default(),
+        );
+        assert!(out.contains("\"../_shared/mod/index.js\""), "{out}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 别名实化：`#` 模块根 / `#/` src 根，产物内只剩相对 specifier。
+    #[test]
+    fn alias_imports_materialized_to_product_paths() {
+        let (src_root, t) = two_modules("alias");
+        let src = "import { v } from \"#_shared/validate\";\nimport { d } from \"#_shared/mod\";\nimport { u } from \"#/b/util\";\n";
+        let out = fix_in(&src_root, src, "item/x/y", &view_b());
+        // 本模块根锚点：与深度无关地落到同模块版本目录
+        assert!(out.contains("\"../../../_shared/validate.js\""), "{out}");
+        // 索引目录
+        assert!(out.contains("\"../../../_shared/mod/index.js\""), "{out}");
+        // src 根锚点 → 跨模块按 view 钉版本目录
+        assert!(out.contains("\"../../../../b-0.2.0/util.js\""), "{out}");
+        assert!(!out.contains('#'), "{out}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 副作用 import 与动态 import 一并改写（修复前只有行级 `from ` 口径会漏）。
+    #[test]
+    fn side_effect_and_dynamic_imports_are_rewritten() {
+        let (src_root, t) = two_modules("dyn");
+        let src = "import \"#_shared/validate\";\nconst m = await import(\"#_shared/mod\");\nimport(\"../_shared/validate\");\nconst route = `#/dashboard`;\n";
+        let out = fix_in(&src_root, src, "item", &Default::default());
+        assert!(out.contains("import \"../_shared/validate.js\""), "{out}");
+        assert!(out.contains("import(\"../_shared/mod/index.js\")"), "{out}");
+        assert!(!out.contains("#_shared"), "{out}");
+        // 模板串里的 `#/…` 形状文本不动（非导入位置；hash 路由等业务字符串常见）
+        assert!(out.contains("`#/dashboard`"), "{out}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
     fn cross_module_import_rewrites_to_versioned_path() {
+        let (src_root, t) = two_modules("xmod");
         // ① 模块根出发：../b/util → dist/b-0.2.0/util.js
-        let out = fix("import { v } from \"../b/util\";\n", "", &view_b());
+        let out = fix_in(
+            &src_root,
+            "import { v } from \"../b/util\";\n",
+            "",
+            &view_b(),
+        );
         assert!(out.contains("\"../b-0.2.0/util.js\""), "{out}");
         // ①' 子目录出发：../../b/util → 同样落到 dist/b-0.2.0/
-        let out = fix("import { v } from \"../../b/util\";\n", "sub", &view_b());
+        let out = fix_in(
+            &src_root,
+            "import { v } from \"../../b/util\";\n",
+            "sub",
+            &view_b(),
+        );
         assert!(out.contains("\"../../b-0.2.0/util.js\""), "{out}");
         // ③ 嵌套 rel_dir：src/a/x/y/f.ts 导入 ../../../b/util
-        let out = fix("import { v } from \"../../../b/util\";\n", "x/y", &view_b());
+        let out = fix_in(
+            &src_root,
+            "import { v } from \"../../../b/util\";\n",
+            "x/y",
+            &view_b(),
+        );
         assert!(out.contains("\"../../../b-0.2.0/util.js\""), "{out}");
         // 显式 .ts 后缀目标 → .js
-        let out = fix("export { v } from \"../b/util.ts\";\n", "", &view_b());
+        let out = fix_in(
+            &src_root,
+            "export { v } from \"../b/util.ts\";\n",
+            "",
+            &view_b(),
+        );
         assert!(out.contains("\"../b-0.2.0/util.js\""), "{out}");
         // 模块内绕出再绕回（../../a/y/g 从 x/ 出发）→ 产物路径不悬空
-        let out = fix(
+        let out = fix_in(
+            &src_root,
             "import { v } from \"../../a/y/g\";\n",
             "x",
             &Default::default(),
         );
         assert!(out.contains("\"../y/g.js\""), "{out}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]
     fn cross_module_import_without_version_fails_fast() {
+        let (src_root, t) = two_modules("nover");
         // ② 视图缺 b → Err 报目标模块并提示先构建
-        let e = fix_relative_imports(
+        let e = fix_import_specifiers(
+            &src_root,
             "import { v } from \"../b/util\";\n",
             "a",
             "0.1.0",
@@ -694,16 +944,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("b") && e.contains("oj build"), "{e}");
-        // 逃出 src/ → Err
-        let e = fix_relative_imports(
-            "import { v } from \"../../b/util\";\n",
+        // 别名跨模块同样受版本门禁（`#/b/…` 与相对写法等价）
+        let e = fix_import_specifiers(
+            &src_root,
+            "import { v } from \"#/b/util\";\n",
+            "a",
+            "0.1.0",
+            "",
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(e.contains("b") && e.contains("oj build"), "{e}");
+        // 目标不存在 → Err 含尝试过的候选（探针口径）
+        let e = fix_import_specifiers(
+            &src_root,
+            "import { v } from \"../b/nope\";\n",
             "a",
             "0.1.0",
             "",
             &view_b(),
         )
         .unwrap_err();
-        assert!(e.contains("src"), "{e}");
+        assert!(e.contains("tried"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     #[test]
@@ -728,12 +991,12 @@ mod tests {
     }
 
     #[test]
-    fn import_specifier_extraction() {
-        let src = "import { v } from \"../_shared/validate\";\nimport x from './a.js';\nimport p from \"pkg\";\nexport { v } from \"./b\";\nconst s = 1;";
-        assert_eq!(
-            relative_import_specifiers(src),
-            vec!["../_shared/validate", "./a.js", "./b"]
-        );
+    fn residual_alias_fails_the_build() {
+        // 残留断言（扫描器天花板兜底）：产物里还有 `#` specifier → 显式失败
+        assert!(assert_no_aliases("import x from \"#_shared/a\";\n", "m/api.js").is_err());
+        assert!(assert_no_aliases("import x from \"./a.js\";\n", "m/api.js").is_ok());
+        // 注释里的 `#` 不算（非导入位置）
+        assert!(assert_no_aliases("// import x from \"#a\"\n", "m/api.js").is_ok());
     }
 
     #[test]
@@ -755,6 +1018,39 @@ mod tests {
         );
         // 无违规
         assert!(guard_no_api_imports(&[("x.ts".into(), "import m from \"pkg\";".into())]).is_ok());
+    }
+
+    /// 别名写法不得绕过 api.ts 禁令（此前守卫只看相对 specifier，换个前缀即可溜过）。
+    #[test]
+    fn guard_rejects_api_imports_via_alias() {
+        let files = vec![
+            (
+                "_shared/util.ts".into(),
+                "import { g } from \"#item/api\";\n".into(),
+            ),
+            (
+                "account/api.ts".into(),
+                "import { g } from \"#/user/item/api\";\n".into(),
+            ),
+        ];
+        let e = guard_no_api_imports(&files).unwrap_err();
+        assert!(
+            e.contains("_shared/util.ts") && e.contains("#item/api"),
+            "{e}"
+        );
+        assert!(e.contains("#/user/item/api"), "{e}");
+        // npm 包内子路径 `pkg/api` 不在守卫面（那是第三方包的入口，不是本项目的 api.ts）
+        assert!(
+            guard_no_api_imports(&[("x.ts".into(), "import a from \"pkg/api\";".into())]).is_ok()
+        );
+        // 名字含 api 但不是 api.ts（api-helper）不误伤
+        assert!(
+            guard_no_api_imports(&[(
+                "x.ts".into(),
+                "import a from \"#_shared/api-helper\";".into()
+            )])
+            .is_ok()
+        );
     }
 
     /// 测试辅助：目录下唯一文件的文件名（String）。
@@ -892,6 +1188,129 @@ mod tests {
         assert_eq!(lock.get("user").map(String::as_str), Some("0.1.0"));
         assert!(!lock.contains_key("other")); // 单模块构建不动他人
         assert!(t.join("dist/user-0.1.0.tgz").is_file());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD：别名端到端——同一份源码跑 `oj build`，产物内**只剩相对 specifier**，
+    /// 本模块别名落同版本目录、跨模块别名按锁钉到目标版本目录。
+    #[tokio::test]
+    async fn alias_build_materializes_to_versioned_relative_paths() {
+        let t = std::env::temp_dir().join(format!("oj-build-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("src/other/_shared")).unwrap();
+        std::fs::write(t.join("src/other/_shared/util.ts"), "export const u = 1;\n").unwrap();
+        // S008：别名跨模块引用必须声明 deps（这正是本用例要顺带钉住的门禁）
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\ndeps:\n  other: \"^0.9.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/item/api.ts"),
+            "import { v } from \"#_shared/validate\";\nimport { u } from \"#/other/_shared/util\";\nfunction get(){ json.ok({v,u}); }\nget.route = \"{id}\";\nexport default { get };\n",
+        )
+        .unwrap();
+        run(&build_args(&t, None)).await.unwrap();
+
+        let item = std::fs::read_to_string(t.join("dist/user-0.1.0/item/api.js")).unwrap();
+        assert!(item.contains("\"../_shared/validate.js\""), "{item}");
+        assert!(
+            item.contains("\"../../other-0.9.0/_shared/util.js\""),
+            "{item}"
+        );
+        assert!(!item.contains('#'), "{item}");
+        // 全产物扫描：任何落盘 .js 都不得残留别名
+        let mut stack = vec![t.join("dist")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "js") {
+                    let js = std::fs::read_to_string(&p).unwrap();
+                    assert!(
+                        assert_no_aliases(&js, &p.display().to_string()).is_ok(),
+                        "{js}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD：跨模块别名未声明 deps → S008 拦住构建（fail build，报错给下一步）。
+    #[tokio::test]
+    async fn build_rejects_cross_module_alias_without_deps() {
+        let t = std::env::temp_dir().join(format!("oj-build-nodeps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("src/other/_shared")).unwrap();
+        std::fs::write(t.join("src/other/_shared/util.ts"), "export const u = 1;\n").unwrap();
+        std::fs::write(
+            t.join("src/user/item/api.ts"),
+            "import { u } from \"#/other/_shared/util\";\nfunction get(){ json.ok({u}); }\nexport default { get };\n",
+        )
+        .unwrap();
+        let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
+        assert!(
+            e.contains("S008") && e.contains("other") && e.contains("deps"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD：tasks 池 import 越过池根（跨模块/池外目标）→ 产物里必然不存在，fail build。
+    #[tokio::test]
+    async fn build_rejects_tasks_import_escaping_pool() {
+        let t = std::env::temp_dir().join(format!("oj-build-tesc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("src/tasks")).unwrap();
+        std::fs::write(
+            t.join("src/tasks/task_esc.ts"),
+            "import { v } from \"../../../user/_shared/validate\";\nwhile (true) { await Promise.resolve(v); }\n",
+        )
+        .unwrap();
+        let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
+        assert!(e.contains("越过任务池根") && e.contains("_shared"), "{e}");
+        // 池内互导（含子目录）仍然合法
+        std::fs::create_dir_all(t.join("src/tasks/_shared")).unwrap();
+        std::fs::write(
+            t.join("src/tasks/_shared/tick.ts"),
+            "export const tick = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/tasks/task_esc.ts"),
+            "import { tick } from \"./_shared/tick\";\nwhile (true) { await Promise.resolve(tick); }\n",
+        )
+        .unwrap();
+        run(&build_args(&t, None)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD：tasks 池是**非版本化**资产（不进锁 / 不打 tgz）→ 别名一律拒绝，fail build。
+    #[tokio::test]
+    async fn build_rejects_alias_in_tasks_pool() {
+        let t = std::env::temp_dir().join(format!("oj-build-talias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        std::fs::create_dir_all(t.join("src/tasks")).unwrap();
+        std::fs::write(
+            t.join("src/tasks/task_alias.ts"),
+            "import { v } from \"#_shared/validate\";\nwhile (true) { await Promise.resolve(v); }\n",
+        )
+        .unwrap();
+        let e = run(&build_args(&t, None)).await.err().unwrap_or_default();
+        assert!(
+            e.contains("别名") && e.contains("非版本化") && e.contains("#_shared/validate"),
+            "{e}"
+        );
         let _ = std::fs::remove_dir_all(&t);
     }
 
