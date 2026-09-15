@@ -3,3 +3,6 @@ desc: "内置 OP（OIDC Provider）：discovery/jwks/authorize/login/token/useri
 version: "0.1.0"
 deps:              # idp/login 读 _platform.users 校验口令（ownership_guard: deny 下必须声明）
   _platform: "^0.1.0"
+  # token 用 `#/auth/_shared/util` 别名跨模块引用 → S008 要求声明
+  # （login/authorize 仍是相对写法，不追溯）
+  auth: "^0.1.0"

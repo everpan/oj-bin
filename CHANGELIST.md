@@ -2,6 +2,86 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.18（2026-09-15）
+
+**特性**
+- 导入别名 `#x`（**本模块根**）/ `#/m/x`（**src 根**，首段 = 模块目录名）：共享库不再按目录
+  深度数 `../`。`src/m1/a/b/c/d/e/f/g/api.ts` 引 `m1/_shared/xxx.ts` 写 `#_shared/xxx`
+  （显式后缀 `#_shared/xxx.ts` 与目录索引 `#_shared` 同样支持），跨模块写
+  `#/user/_shared/validate`。
+  - **锚点由文件自身位置派生**：从引用方目录向上找最近的 `manifest.yaml` 祖先 = 模块根，
+    其父目录 = src 根。于是 dev（`src/<m>/`）、release 产物（`dist/<m>-<v>/`，manifest
+    原样复制）、tasks 镜像三处语义天然一致，**无需把 api 根路径穿透到装配点**（`LoaderShared`
+    形状零变更；引用方在 `node_modules` 内不启用，不劫持第三方包的 `package.json#imports`）。
+  - 模块外（`tests/` 用例目录、任务池）无锚点 → 明确报错并给下一步。
+  - **release 语义**：`oj build` 期实化为版本目录相对路径（跨模块目标按
+    `dist/manifests.yaml` 锁钉版本），产物内**不含** `#`。任务池非版本化 → 别名一律拒绝。
+  - **S008**（`oj build` 内嵌，`--check` 同跑）：别名目标必须存在；`#/其他模块/…` 必须在
+    `manifest.yaml` 声明 `deps`（跨模块代码耦合纳入与表归属 S003 同一套归属图）。既有
+    **相对**跨模块引用不追溯——追溯会让既有项目升级后 build 直接失败。
+  - **产物自洽断言**（两道）：每个产物文件内不得残留 `#`（`assert_no_aliases`）；构建末尾扫
+    **本次产出的目录**（各模块版本目录 + tasks 镜像）内**任何**本地 specifier 都必须落到已落盘
+    文件（`assert_dist_consistent`）——「dev 能跑、release 悬空」这类问题从运行期静默炸变成
+    构建期显式失败。不扫整个 `dist`：陈旧的他模块产物不该让本次构建失败。
+  - `#` 与 Node `package.json#imports` 共用命名空间：项目声明了 `#` 开头的 imports 键 →
+    S008 fail-fast（避免 Node/vite 与 oj 两套解析器分叉）。
+  - 编辑器/测试工具对齐：`sample/tsconfig.json` 补 `paths`（`"#/*": ["./src/*"]` +
+    `"#*": [各模块 /*]`；值须带 `./` 前缀，否则无 `baseUrl` 时 vite/esbuild 会告警；
+    不放 `baseUrl` 以免改变裸包解析）；L2 单测新增
+    `sample/unit/vitest.config.ts`（`resolveId` 插件镜像同规则，否则被 spec 直接 import 的
+    模块内文件用了别名即解析失败）。
+
+**修复**
+- **目录索引导入在 release 悬空**：`import x from "../_shared"`（= `_shared/index.ts`）dev 能跑，
+  build 却因改写只做「末段补 `.js`」而产出 `../_shared.js`（不存在的文件）。构建期改为
+  **探到真实文件**后产出 `_shared/index.js`。
+- **构建期改写口径与运行期分叉**：主构建路径此前是行级 `from "…"` 口径，漏**副作用**
+  `import "…"` 与**动态** `import("…")`（tasks 镜像用的是另一个更全的扫描器）。现将两侧
+  归一到唯一扫描器 `bridge::import_scan::specifier_spans`（跳过注释/普通字符串与模板串，
+  返回字节 span，支持一行多 specifier；build 与 checks 共用，同 `bridge::guard::extract_tables` 先例）。
+- **`api.ts` 导入禁令可被前缀绕过**：守卫此前只扫相对 specifier，`#item/api`、
+  `#/user/item/api` 可溜过。现扫全部本地 specifier（npm 包内子路径 `pkg/api` 不在守卫面）。
+- 构建期与运行期**共用同一份解析探针**（`resolve_relative` / `resolve_alias`），
+  「dev 能跑、release 悬空」的一类缺陷在结构上被消掉。
+- **L2 db mock 缺构造器面**：v0.1.17 起 sample 多处改用 `db.table(...)` 构造器，而
+  `sample/unit/mocks` 只实现了 `db.query`/`exec` → `npm run test:unit` 在 HEAD 即 2 例失败
+  （`db.table is not a function`）。新增 `mocks/query-builder.ts` 镜像 `bootstrap.js` 的
+  `builderFromReq` API 面（select/where/orderBy/limit/offset/insert/update/delete/returning/
+  all/run/toSQL + `update|delete` 无 where 即抛的守卫），SQL 按规范形渲染（小写、`col, col`、
+  `?` 占位；真实渲染由 sea-query 按方言产出，mock 不复刻方言），未覆盖形态直接抛错。
+  L2 12/12 恢复绿。
+
+**行为变更（升级注意）**
+- **本地 import 目标必须是 `.ts`**：`import "./x.js"` / `import "./d.json"` 这类**非 `.ts` 目标**
+  在产物里没有对应文件（`collect_module` 只转译 `.ts`），此前会静默产出悬空 specifier、
+  release 才炸；现 `oj build` 直接失败并给出下一步。若你的项目依赖该写法，请把目标改成 `.ts`
+  （或把内容内联）。
+- **`manifest.yaml` 只允许出现在模块根**（`src/<module>/manifest.yaml`）：嵌套声明会让 `#` 别名的
+  锚点（向上最近的 `manifest.yaml`）指向嵌套目录，静默改写整棵子树的别名语义 → 现 fail-fast。
+- **tasks 池 import 不得越过池根**（跨模块相对导入等）：任务池是非版本化资产，只镜像
+  `dist/<tasks.dir>/`，池外目标在产物里必然不存在 → 现 fail-fast（此前静默悬空）。
+- **release 模式不再解析别名**：`resolve_alias` 在 `ts=false` 时直接报错（产物本不该含 `#`；
+  此前同模块别名会"半可解析"、跨模块悬空，语义不一致）。
+
+**评审修订（开发 / 架构双专家，处置记录见 spec §12）**
+- 修：**拼接实参的动态 import 被误改**（`import("./locales/" + lang)`）——`import(`/`require(`
+  形态要求实参为孤立字面量（闭合引号后只能跟 `)` / `,`），`from` 形态不允许 `(`（排除
+  `Array.from("./x")` 这类方法调用）。这是本特性引入的回归，已由 core 单测钉住。
+- 修：**检查比运行期更严**——`checks::collect_ts` 与 `build_cmd::walk` 此前不跳过 `node_modules`
+  （运行期明确跳过），第三方源码可致 S008 误报、甚至被打进产物；两个 walker 现与
+  `resolve_inner` 口径一致。
+- 修：**扫描器下移到 core** `src/bridge/import_scan.rs`（build 与 S008 共用唯一实现），
+  解掉「结构检查层依赖构建管线」的分层倒挂（同 `bridge::guard::extract_tables` 先例）。
+- 修：构建期改写报错补上**违规文件路径**（此前只报目录、无下一步）。
+
+**文档 / 杂项**
+- sample 迁移为两种写法并存（别名：`user/account`、`admin/menu-list`、`cert/renew`、
+  `auth/refresh`、`order/list`、`idp/token`、`oidc/callback`；相对：`admin/role-item`、
+  `cert/item`、`idp/login`、`idp/authorize`、`oidc/login`、`oidc/logout`）；
+  `idp`/`oidc` 的 `manifest.yaml` 补 `deps.auth`（S008 要求）。
+- 手册：user-manual §4/§8、api-manual §5、dev-guide §7、sample/MODULES.md 补别名规则与边界
+  （含「只能在模块内用」与「跨模块需声明 deps」）。
+
 ## v0.1.17（2026-09-15）
 
 **特性**

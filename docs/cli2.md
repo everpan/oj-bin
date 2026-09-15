@@ -80,6 +80,8 @@
       - 从api.ts中export的方法中，提取 route，如 `get.route={id}`, 则可以依此作为生产 `routes.js` 的路由项数据 `{ method: "get", pattern: "user/profile/detail/{id}", file: "detail/api.js" }`；`file` 相对版本目录根，子目录下的 api.ts 形如 `detail/api.js`（产物保留原名与目录结构，api.ts → 同目录 `api.js`）
       - pattern 无首斜杠、不含 base，以模块名段开头（`/` 开头的根级声明则剥首斜杠、不加模块段）
       - 全部 .ts 按原路径换 .js 扩展落盘（api.ts 同名 `api.js`，仅多一步剥 `.route` 声明），manifest.yaml 原样复制；跨模块相对导入（如 order 导入 `../user/_shared/validate`）构建期改写为指向目标模块版本目录的相对路径
+     - 导入别名（`#_shared/x` 本模块根 / `#/user/_shared/x` src 根）同批**实化**为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本；落盘后断言产物内无残留 `#` specifier（漏检即构建失败）
+     - 改写用与 dev 运行期**同一份解析探针**（含 `.ts` → `.js` → `/index.ts` 补全），故 `import x from "../_shared"` 这类目录索引导入在 dev 与 release 命中同一文件（此前 release 会改写成不存在的 `_shared.js`）
       - 转译产物默认 minify（单行、剥注释——含内联 sourcemap），`--no-minify` 可关闭以得到可读产物排障
       - 最后将形成若干 `dist/user-{VERSION}/`（如 `detail/api.js`、`_shared/validate.js`）以及 `dist/user-{VERSION}/routes.js`, routes.js 中包含若干路由项数据
       - 同时形成压缩包文件 `dist/user-{VERSION}.tgz`, 用于整体发布（内容确定，同输入重复打包结果一致）

@@ -38,6 +38,7 @@ pub(crate) mod ffi;
 pub mod frame_pool;
 pub mod guard;
 mod http;
+pub mod import_scan;
 mod inspector;
 mod json;
 mod kv;
@@ -69,7 +70,11 @@ pub use es::EsBackend;
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
-pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
+// resolve_relative / resolve_alias 一并导出：oj build 的导入实化用**同一份探针**，
+// 使 dev 与 release 对同一 specifier 命中同一文件（dev 能跑 release 炸的一类缺陷）。
+pub use module_loader::{
+    LoaderShared, OjModuleLoader, resolve_alias, resolve_relative, versioned_specifier,
+};
 pub use mq::MqInstance;
 pub use named_registry::NamedRegistry;
 pub use plugin_loader::PluginInfo;

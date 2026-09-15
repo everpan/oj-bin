@@ -1,4 +1,4 @@
-import { isAdmin, parseDays } from "../_shared/guard";
+import { isAdmin, parseDays } from "#_shared/guard";
 
 // POST {id, days?=365} ：读库中私钥重签，公钥与 private_pem 不变。
 async function post(): Promise<void> {

@@ -1,4 +1,4 @@
-import { b64uFromHex, nowSecs, parseForm } from "../../auth/_shared/util";
+import { b64uFromHex, nowSecs, parseForm } from "#/auth/_shared/util";
 
 const TOKEN_TTL = 3600;
 

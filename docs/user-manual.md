@@ -267,6 +267,8 @@ dist/
 - **首层子目录 = 模块**，每个都必须有 `manifest.yaml`；缺了启动失败。
 - 任意深度的子目录中放 `api.ts`（dev）/ `api.js`（release），即成为一条路由。
 - 没有 `api` 文件的目录不是路由，可作共享工具代码目录（如 `_shared`）。
+- 其他模块/深层目录要引用共享工具代码时用**别名**（`#_shared/validate`，与目录深度无关），
+  详见 §8 导入。
 
 ## 5. manifest.yaml 与模块数据层
 
@@ -416,6 +418,27 @@ axum 放开 pin 后可启用。
 
 ## 8. 导入（import）
 
+- **别名导入**（共享库推荐写法，与目录深度无关，目录搬动不用改引用）：
+  - `#x` 锚在**本模块根**：`src/user/profile/detail/api.ts` 里
+    `import { v } from "#_shared/validate"` → `src/user/_shared/validate.ts`；
+    也支持显式后缀 `#_shared/validate.ts` 与目录索引 `#_shared`。
+  - `#/m/x` 锚在 **src 根**（跨模块，首段必须是模块目录名）：
+    `import { v } from "#/user/_shared/validate"` → `src/user/_shared/validate.ts`。
+  - 后缀补全与相对导入同序（`.ts` → `.js` → `/index.ts` → `/index.js`）；别名路径禁
+    `..`、空段。
+  - **只能在模块内的文件里使用**：`tests/` 用例目录、任务池（`src/tasks/`）都在模块外，
+    没有模块根可锚定，继续用相对路径。
+  - 跨模块别名必须在 `manifest.yaml` 声明 `deps`（`oj build` 的 S008 门禁）；判定
+    跨模块相对引用不追溯（既有写法升级后不会突然构建失败）。
+  - release：`oj build` 把别名**实化**为版本目录相对路径，产物内不含 `#`；跨模块目标
+    按 `dist/manifests.yaml` 锁钉版本。任务池是非版本化资产，**不允许**用别名。
+  - `#` 与 Node `package.json#imports` 共用命名空间：项目声明了 `#` 开头的 imports 键时
+    `oj build` 直接失败（避免 Node/vite 与 oj 两套解析器分叉）。
+  - 约束：`manifest.yaml` **只能出现在模块根**（嵌套声明会改写别名锚点，`oj build` 报 S008）；
+    release 模式不解析别名（产物由构建期实化）。
+- **本地导入的目标必须是 `.ts`**：`import "./x.js"`、`import "./d.json"` 这类非 `.ts` 目标在
+  release 产物里没有对应文件（只有 `.ts` 会被转译落盘），`oj build` 会直接失败并给出下一步。
+  任务池（`src/tasks/`）的 import 还不得越过池根（只镜像 `dist/tasks/`）。
 - **相对导入** `./x`、`../x`：自动补全 `.ts` → `.js` → `/index.ts` → `/index.js`。
 - **裸 specifier** `import "escape-goat"`：从当前文件目录逐级向上找 `node_modules/<pkg>`
   （至 project root），按 `package.json` 的 `module` → `main` → `index.js` 取入口；支持
