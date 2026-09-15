@@ -61,6 +61,7 @@ mod tests {
         let _: fn(&'static EventBrokerVtable) -> *const c_void = axis::bus;
         let _: fn(&'static KVStoreVtable) -> *const c_void = axis::kv;
         let _: fn(&'static AuthGuardVtable) -> *const c_void = axis::auth;
+        let _: fn(&'static MqVtable) -> *const c_void = axis::mq;
         let _: fn(&'static MailAxis) -> *const c_void = axis::mail;
     }
 
