@@ -40,6 +40,35 @@ pub const DEFAULT_RESULT_CAP: usize = 1024;
 /// 结果存储默认 TTL：异步投递结果只对近期查询有意义，过期惰性清理。
 pub const DEFAULT_RESULT_TTL: Duration = Duration::from_secs(3600);
 
+/// 单附件默认上限（B2）：10 MiB。
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// 单封信全部附件合计默认上限（B2）：25 MiB（有界队列容量 256，故合计上限必须有）。
+pub const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// 附件字节上限（B2，来自 `smtp:` 顶层键 `max_attachment_bytes` / `max_total_attachment_bytes`，
+/// 与 `workers`/`queue_capacity` 同级；缺省见 [`DEFAULT_MAX_ATTACHMENT_BYTES`] /
+/// [`DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES`]）。
+///
+/// **为什么必须有**：附件字节由**宿主**读盘后经**有界队列**（容量 256）交给插件，
+/// 无上限时 project root 内任意大文件（含 `config.yaml` —— 里面有 `jwt_secret` / smtp
+/// 口令）都能被一次调用读进内存并被队列放大成内存 DoS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentLimits {
+    /// 单个附件上限（字节）。
+    pub max_attachment_bytes: usize,
+    /// 单封信全部附件**合计**上限（字节）。
+    pub max_total_bytes: usize,
+}
+
+impl Default for AttachmentLimits {
+    fn default() -> Self {
+        Self {
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+        }
+    }
+}
+
 /// 宿主解析后的附件（**原始字节**，不进 JS、不走 base64）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAttachment {
@@ -91,9 +120,21 @@ pub struct MailProfileCfg {
 
 /// 宿主侧 mail 配置：只承载前置校验与 profile 列举所需字段。
 /// `smpt` 段的并发/连接/凭据字段一概不落宿主（design §4/§11）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailConfig {
     profiles: HashMap<String, MailProfileCfg>,
+    limits: AttachmentLimits,
+}
+
+impl Default for MailConfig {
+    /// 手写而非 derive：附件上限的默认值必须是 [`AttachmentLimits::default`]
+    /// （derive 会给 0，等于「所有附件一律拒绝」）。
+    fn default() -> Self {
+        Self {
+            profiles: HashMap::new(),
+            limits: AttachmentLimits::default(),
+        }
+    }
 }
 
 impl MailConfig {
@@ -102,16 +143,33 @@ impl MailConfig {
         Self::default()
     }
 
-    /// 显式构造（装配/测试用）。
+    /// 显式构造（装配/测试用）；附件上限取默认值（[`Self::with_limits`] 可覆盖）。
     pub fn new(profiles: HashMap<String, MailProfileCfg>) -> Self {
-        Self { profiles }
+        Self {
+            profiles,
+            limits: AttachmentLimits::default(),
+        }
+    }
+
+    /// 显式构造 + 附件上限（测试/装配用）。
+    pub fn with_limits(
+        profiles: HashMap<String, MailProfileCfg>,
+        limits: AttachmentLimits,
+    ) -> Self {
+        Self { profiles, limits }
+    }
+
+    /// 附件字节上限（`resolve_attachments` 的判据）。
+    pub fn attachment_limits(&self) -> AttachmentLimits {
+        self.limits
     }
 
     /// 从 `smtp:` 段的 JSON 构建（插件的同一段 cfg）。
-    /// 只吸收每个 profile 的 `allowed_from`/`allowed_recipients`；`workers`/`queue_capacity`
-    /// 与连接字段（host/port/user/pass…）被忽略；形态错误（非对象 profile、非字符串数组）
-    /// 与**白名单条目格式非法**（空串/缺 `@`/首尾空白）都立即报错——配置写错在装配期暴露，
-    /// 而非静默变成「无白名单」或「白名单悄悄不命中」（见 [`parse_whitelist_entry`]）。
+    /// 只吸收每个 profile 的 `allowed_from`/`allowed_recipients` 与顶层的附件上限；
+    /// `workers`/`queue_capacity` 与连接字段（host/port/user/pass…）被忽略；形态错误
+    /// （非对象 profile、非字符串数组、附件上限非正整数）与**白名单条目格式非法**
+    /// （空串/缺 `@`/首尾空白）都立即报错——配置写错在装配期暴露，而非静默变成
+    /// 「无白名单」「白名单悄悄不命中」或「附件上限为 0」（见 [`parse_whitelist_entry`]）。
     pub fn from_value(v: &Value) -> BridgeResult<Self> {
         let obj = v
             .as_object()
@@ -120,8 +178,12 @@ impl MailConfig {
             })?;
         let mut profiles = HashMap::new();
         for (name, pv) in obj {
-            if name == "workers" || name == "queue_capacity" {
-                continue; // 并发参数（插件侧消费）
+            if name == "workers"
+                || name == "queue_capacity"
+                || name == "max_attachment_bytes"
+                || name == "max_total_attachment_bytes"
+            {
+                continue; // 并发参数（插件侧消费）与附件上限（下方单独解析）
             }
             let po = pv
                 .as_object()
@@ -138,7 +200,21 @@ impl MailConfig {
                 },
             );
         }
-        Ok(Self { profiles })
+        Ok(Self {
+            profiles,
+            limits: AttachmentLimits {
+                max_attachment_bytes: positive_bytes(
+                    obj.get("max_attachment_bytes"),
+                    "max_attachment_bytes",
+                    DEFAULT_MAX_ATTACHMENT_BYTES,
+                )?,
+                max_total_bytes: positive_bytes(
+                    obj.get("max_total_attachment_bytes"),
+                    "max_total_attachment_bytes",
+                    DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+                )?,
+            },
+        })
     }
 
     pub fn profile(&self, key: &str) -> Option<&MailProfileCfg> {
@@ -151,6 +227,26 @@ impl MailConfig {
         ks.sort();
         ks
     }
+}
+
+/// 顶层字节上限键（`smtp.max_attachment_bytes` / `smtp.max_total_attachment_bytes`）：
+/// 缺失 → 默认值；给了非整数或 0 → **装配期报错**（0 等于「附件一律拒绝」，只会是笔误；
+/// 非整数是写法错误，二者都不静默取默认）。
+fn positive_bytes(v: Option<&Value>, field: &str, default: usize) -> BridgeResult<usize> {
+    let Some(v) = v else {
+        return Ok(default);
+    };
+    let n = v
+        .as_u64()
+        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("smtp.{field} 必须是正整数（字节数）（下一步：写成如 10485760）").into()
+        })?;
+    if n == 0 {
+        return Err(
+            format!("smtp.{field} 必须 ≥ 1（0 等于禁止一切附件；下一步：写成字节数）").into(),
+        );
+    }
+    Ok(n as usize)
 }
 
 fn str_list(v: Option<&Value>, profile: &str, field: &str) -> BridgeResult<Vec<String>> {
@@ -815,10 +911,14 @@ fn mime_by_magic(bytes: &[u8]) -> Option<&'static str> {
 /// - `blobKey`：经 `StableState.blobs` 注册表（本地/S3 统一）；后端缺失/键缺失 → Err 给下一步。
 /// - `path`：`ensure_within` 钳制到项目根（符号链接经 canonical 化覆盖），
 ///   并**按返回的 canonical 句柄读盘**（校验路径 ≡ 读盘路径，design §9 TOCTOU）。
+/// - **上限（B2）**：单附件与单封合计都按 `limits` 判定，超限 → Err（`code:5`）。
+///   读盘走 `tokio::fs`（`spawn_blocking`），不阻塞 isolate 的 `current_thread`；
+///   path 路先 `metadata` 拿长度，超限即拒（不把大文件读进内存）。
 async fn resolve_attachments(
     blobs: &BlobRegistry,
     root: Option<&Path>,
     refs: &[AttachmentRef],
+    limits: AttachmentLimits,
 ) -> Result<Vec<ParsedAttachment>, String> {
     let mut out = Vec::with_capacity(refs.len());
     for (i, r) in refs.iter().enumerate() {
@@ -851,7 +951,20 @@ async fn resolve_attachments(
                         "mail: attachments[{i}] 附件路径非法：{e}（下一步：把附件放到项目根内，或用 blobKey）"
                     )
                 })?;
-                std::fs::read(&canon).map_err(|e| {
+                // 先看长度再读：超限的文件不进内存（读盘本身也走阻塞池，不占 isolate 线程）。
+                let len = tokio::fs::metadata(&canon)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "mail: attachments[{i}] 读取 {} 失败：{e}（下一步：确认文件存在且可读）",
+                            canon.display()
+                        )
+                    })?
+                    .len();
+                if len > limits.max_attachment_bytes as u64 {
+                    return Err(over_single_limit(i, &r.filename, len, limits));
+                }
+                tokio::fs::read(&canon).await.map_err(|e| {
                     format!(
                         "mail: attachments[{i}] 读取 {} 失败：{e}（下一步：确认文件存在且可读）",
                         canon.display()
@@ -859,6 +972,27 @@ async fn resolve_attachments(
                 })?
             }
         };
+        // blob 字节只有拿到才知道长度（后端无 size 接口）→ 在此判；path 路此处是二道防线
+        // （metadata 与 read 之间文件可能变大）。
+        if bytes.len() > limits.max_attachment_bytes {
+            return Err(over_single_limit(
+                i,
+                &r.filename,
+                bytes.len() as u64,
+                limits,
+            ));
+        }
+        let total: usize = out
+            .iter()
+            .map(|a: &ParsedAttachment| a.bytes.len())
+            .sum::<usize>()
+            .saturating_add(bytes.len());
+        if total > limits.max_total_bytes {
+            return Err(format!(
+                "mail: attachments[{i}]（{}）加入后附件合计 {total} 字节，超过单封上限 {} 字节（smtp.max_total_attachment_bytes）（下一步：减小附件或减少数量，或调大 smtp.max_total_attachment_bytes）",
+                r.filename, limits.max_total_bytes
+            ));
+        }
         let mime = resolve_mime(r.mime.as_deref(), &r.filename, &bytes);
         out.push(ParsedAttachment {
             filename: r.filename.clone(),
@@ -867,6 +1001,14 @@ async fn resolve_attachments(
         });
     }
     Ok(out)
+}
+
+/// 单附件超限文案（一处定义：metadata 预判与字节复核共用）。
+fn over_single_limit(i: usize, filename: &str, len: u64, limits: AttachmentLimits) -> String {
+    format!(
+        "mail: attachments[{i}]（{filename}）{len} 字节超过单附件上限 {} 字节（smtp.max_attachment_bytes）（下一步：换更小的附件，或调大 smtp.max_attachment_bytes）",
+        limits.max_attachment_bytes
+    )
 }
 
 // ---------- 编排：校验 → 附件 → submit ----------
@@ -1019,7 +1161,8 @@ pub async fn handle_send(
             Err(e) => return code5(&e),
         }
     };
-    let atts = match resolve_attachments(&blobs, project_root, &refs).await {
+    let limits = backend.config().attachment_limits();
+    let atts = match resolve_attachments(&blobs, project_root, &refs, limits).await {
         Ok(a) => a,
         Err(e) => return code5(&e),
     };
@@ -1956,7 +2099,9 @@ mod tests {
             {"filename": "a.pdf", "blobKey": "r2d2", "mime": "application/custom"},
         ]))
         .unwrap();
-        let atts = resolve_attachments(&reg, Some(&proj), &refs).await.unwrap();
+        let atts = resolve_attachments(&reg, Some(&proj), &refs, AttachmentLimits::default())
+            .await
+            .unwrap();
         assert_eq!(atts.len(), 2);
         // 下标严格对齐（插件按下标取字节）。
         assert_eq!(atts[0].filename, "b.pdf");
@@ -1969,24 +2114,153 @@ mod tests {
         // `../` 越界 → 拒绝（文案给下一步）。
         let esc =
             parse_attachment_refs(&json!([{"filename": "e", "path": "../outside.txt"}])).unwrap();
-        let e = resolve_attachments(&reg, Some(&proj), &esc)
+        let e = resolve_attachments(&reg, Some(&proj), &esc, AttachmentLimits::default())
             .await
             .unwrap_err();
         assert!(e.contains("附件路径") && e.contains("下一步"), "{e}");
         // 无 project root（loader 未配置）→ path 附件拒绝。
-        let e = resolve_attachments(&reg, None, &refs).await.unwrap_err();
+        let e = resolve_attachments(&reg, None, &refs, AttachmentLimits::default())
+            .await
+            .unwrap_err();
         assert!(e.contains("project root"), "{e}");
         // blob 后端未配置 / 键缺失 → 明确错误。
         let missing =
             parse_attachment_refs(&json!([{"filename": "m", "blobKey": "nope"}])).unwrap();
-        let e = resolve_attachments(&reg, None, &missing).await.unwrap_err();
+        let e = resolve_attachments(&reg, None, &missing, AttachmentLimits::default())
+            .await
+            .unwrap_err();
         assert!(e.contains("nope"), "{e}");
         let empty = blob::BlobRegistry::new();
-        let e = resolve_attachments(&empty, None, &missing)
+        let e = resolve_attachments(&empty, None, &missing, AttachmentLimits::default())
             .await
             .unwrap_err();
         assert!(e.contains("not configured"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2：附件上限（单附件 + 单封合计）必须**先于**入队放大生效：超限即 `code:5`，
+    /// 文案给下一步；path 路先看长度不读盘（`tokio::fs::metadata`），blob 路拿到字节即判。
+    /// 正向对照：正常大小的附件仍通过（防「一刀切拒绝」也被判绿）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_attachments_enforces_per_file_and_total_limits() {
+        use crate::bridge::blob::{self, BlobBackend, LocalBlob};
+        let dir = tmpdir("limits");
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("reports")).unwrap();
+        // 上限设为 8 字节，便于用小文件覆盖所有分支。
+        let limits = AttachmentLimits {
+            max_attachment_bytes: 8,
+            max_total_bytes: 12,
+        };
+        std::fs::write(proj.join("reports/ok.txt"), b"12345678").unwrap(); // == 上限：通过
+        std::fs::write(proj.join("reports/big.txt"), b"123456789").unwrap(); // 超 1 字节
+        std::fs::write(proj.join("reports/a.txt"), b"12345678").unwrap();
+        std::fs::write(proj.join("reports/b.txt"), b"12345678").unwrap();
+        let blob_root = dir.join("blobs");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let lb = LocalBlob::new(&blob_root, "/v1/api").unwrap();
+        BlobBackend::put(&lb, "big-blob", b"123456789", None)
+            .await
+            .unwrap();
+        let reg = blob::registry_with_default(Arc::new(lb));
+
+        // 单附件上限：path 路。
+        let one = parse_attachment_refs(&json!([{"filename": "b.txt", "path": "reports/big.txt"}]))
+            .unwrap();
+        let e = resolve_attachments(&reg, Some(&proj), &one, limits)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("attachments[0]") && e.contains("9") && e.contains("8"),
+            "错误须点名附件与两侧字节数：{e}"
+        );
+        assert!(
+            e.contains("max_attachment_bytes") && e.contains("下一步"),
+            "错误须给配置键与下一步：{e}"
+        );
+        // 单附件上限：blob 路（长度只有拿到字节才知道）。
+        let one =
+            parse_attachment_refs(&json!([{"filename": "b.bin", "blobKey": "big-blob"}])).unwrap();
+        let e = resolve_attachments(&reg, Some(&proj), &one, limits)
+            .await
+            .unwrap_err();
+        assert!(e.contains("max_attachment_bytes"), "{e}");
+
+        // 单封合计上限：两个都在单件上限内（8+8），但合计 16 > 12 → 第二个即拒。
+        let two = parse_attachment_refs(&json!([
+            {"filename": "a.txt", "path": "reports/a.txt"},
+            {"filename": "b.txt", "path": "reports/b.txt"},
+        ]))
+        .unwrap();
+        let e = resolve_attachments(&reg, Some(&proj), &two, limits)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("attachments[1]") && e.contains("max_total_attachment_bytes"),
+            "错误须点名越界的那一个附件与合计上限键：{e}"
+        );
+        assert!(e.contains("下一步"), "{e}");
+
+        // 正向对照：边界值（== 上限）与合计不超限时必须通过。
+        let ok = parse_attachment_refs(&json!([
+            {"filename": "a.txt", "path": "reports/a.txt"},
+            {"filename": "ok.bin", "blobKey": "ok"},
+        ]))
+        .unwrap();
+        let lb = LocalBlob::new(&blob_root, "/v1/api").unwrap();
+        BlobBackend::put(&lb, "ok", b"1234", None).await.unwrap();
+        let reg = blob::registry_with_default(Arc::new(lb));
+        let atts = resolve_attachments(&reg, Some(&proj), &ok, limits)
+            .await
+            .unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0].bytes, b"12345678");
+        assert_eq!(atts[1].bytes, b"1234");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B2：附件上限是**装配期**配置（`smtp.max_attachment_bytes` /
+    /// `max_total_attachment_bytes`，与 `workers` 同级）：缺省取默认，非正整数即报错
+    /// （0 等于禁止一切附件；写成字符串/负数都是写法错误，不静默取默认）。
+    #[test]
+    fn mail_config_parses_and_validates_attachment_limits() {
+        let base = json!({"default": {"allowed_from": ["@x.com"]}});
+        let cfg = MailConfig::from_value(&base).unwrap();
+        assert_eq!(
+            cfg.attachment_limits(),
+            AttachmentLimits {
+                max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+                max_total_bytes: DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES,
+            }
+        );
+        assert_eq!(DEFAULT_MAX_ATTACHMENT_BYTES, 10 * 1024 * 1024);
+
+        let mut v = base.clone();
+        v["max_attachment_bytes"] = json!(1024);
+        v["max_total_attachment_bytes"] = json!(2048);
+        let cfg = MailConfig::from_value(&v).unwrap();
+        assert_eq!(
+            cfg.attachment_limits(),
+            AttachmentLimits {
+                max_attachment_bytes: 1024,
+                max_total_bytes: 2048,
+            }
+        );
+        // 上限键**不是** profile（不会因「缺 host」而被当 profile 解析失败）。
+        assert_eq!(cfg.profile_keys(), vec!["default"]);
+
+        for bad in [json!(0), json!(-1), json!("1024"), json!(1.5)] {
+            let mut v = base.clone();
+            v["max_attachment_bytes"] = bad.clone();
+            let e = format!(
+                "{}",
+                MailConfig::from_value(&v).expect_err("非法附件上限必须让装配期失败")
+            );
+            assert!(
+                e.contains("max_attachment_bytes") && e.contains("下一步"),
+                "{bad} → {e}"
+            );
+        }
     }
 
     // ---------- 6.4：编排（校验 → 附件 → submit） ----------
@@ -2039,6 +2313,74 @@ mod tests {
         assert_eq!(fwd["sync"], false, "宿主按 op 覆写开关");
         assert_eq!(fwd["enqueue_only"], false);
         assert_eq!(fwd["to"][0], "a@x.com");
+    }
+
+    /// B2（编排面）：超限附件经 `mail.*` 拿到 `{code:5}`（resolve，不 throw），且**不触达
+    /// 插件**（上限在宿主读盘处生效，故队列里不会出现这封信）；正常附件仍原样过线。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_rejects_oversized_attachment_with_code5() {
+        let dir = tmpdir("limit-send");
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(proj.join("reports")).unwrap();
+        std::fs::write(proj.join("reports/ok.txt"), b"12345678").unwrap();
+        std::fs::write(proj.join("reports/big.txt"), b"123456789").unwrap();
+        let cfg = MailConfig::with_limits(
+            HashMap::from([(
+                "default".to_string(),
+                MailProfileCfg {
+                    allowed_from: vec!["noreply@x.com".into()],
+                    allowed_recipients: vec!["@x.com".into()],
+                },
+            )]),
+            AttachmentLimits {
+                max_attachment_bytes: 8,
+                max_total_bytes: 16,
+            },
+        );
+        let fake = FakeMail::new(cfg, Arc::new(Bus::new()));
+
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            Some(&proj),
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x",
+            "attachments": [
+                {"filename": "a.txt", "path": "reports/ok.txt"},
+                {"filename": "b.txt", "path": "reports/big.txt"}
+            ]})
+            .to_string(),
+            MailMode::Send,
+        )
+        .await;
+        assert_eq!(env["code"], 5, "{env}");
+        let msg = env["msg"].as_str().unwrap();
+        assert!(
+            msg.contains("max_attachment_bytes") && msg.contains("下一步"),
+            "{env}"
+        );
+        assert!(
+            fake.sent.lock().unwrap().is_empty(),
+            "超限信不得触达插件（上限在宿主读盘处生效）"
+        );
+
+        // 正向对照：同配置下正常附件照常过线（字节与下标不变）。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            Some(&proj),
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x",
+                    "attachments": [{"filename": "a.txt", "path": "reports/ok.txt"}]})
+            .to_string(),
+            MailMode::Send,
+        )
+        .await;
+        assert_eq!(env["code"], 0, "{env}");
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].2[0].bytes, b"12345678");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 各 mode 的引擎开关：sendSync → sync、enqueue → enqueue_only（两者互斥不叠加）。

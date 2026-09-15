@@ -52,9 +52,12 @@ blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/bl
 smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 mail.* 全局
         # 一段两用：整段交 oj-mail 插件建 transport（host/port/tls/凭据只走插件、
         # 不进宿主）；宿主只取每个 profile 的 allowed_from/allowed_recipients 做前置
-        # 白名单校验（**空表 = 拒绝**，fail-closed）。
+        # 白名单校验（**空表 = 拒绝**，fail-closed）与顶层的附件上限。
   workers: 4            # worker 线程数（省略 = 4；每个 worker 串行投递队列里的信）
   queue_capacity: 256   # 有界队列容量（满即背压 → 信封 code:4，不无界堆积；省略 = 256）
+  # 附件上限（B2：宿主读盘后经有界队列持有，无上限即内存 DoS 面；省略 = 10 MiB / 25 MiB）
+  max_attachment_bytes: 10485760        # 单附件上限（字节）
+  max_total_attachment_bytes: 26214400  # 单封全部附件合计上限（字节）
   mock:                 # 键即 profile 名（= mail.send(key, …) 的 key；默认 profile 名 "default"）
     host: "localhost"   # file_transport 下不发网络，host/port 仅为满足插件 schema
     port: 25

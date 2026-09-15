@@ -14,8 +14,12 @@
 //! }
 //! ```
 //!
-//! 顶层除 `workers`/`queue_capacity` 外的**每个键都是一个 profile**（键即 `submit` 的
-//! `key`）——未知/写错的顶层键会因缺少必填字段而在解析期报错，而非静默忽略。
+//! 顶层除 `workers`/`queue_capacity`/`max_attachment_bytes`/`max_total_attachment_bytes` 外的
+//! **每个键都是一个 profile**（键即 `submit` 的 `key`）——未知/写错的顶层键会因缺少必填字段
+//! 而在解析期报错，而非静默忽略。
+//!
+//! 附件上限键由**宿主**强制（字节由宿主读盘解析后经 FFI 传入，插件不做第二次判定）；
+//! 此处声明它们只为不被当作 profile 解析。
 //!
 //! **fail-closed**：`tls: "none"`（明文，凭据与邮件可被截获）必须显式写
 //! `allow_none_tls: true` 才被接受；缺省即拒绝。
@@ -23,7 +27,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// 顶层配置：并发参数 + 全部 profile。
+/// 顶层配置：并发参数 + 附件上限 + 全部 profile。
 #[derive(Debug, Clone, Deserialize)]
 pub struct MailConfig {
     /// worker 线程数（每个 worker 串行投递队列里的信）。
@@ -32,6 +36,13 @@ pub struct MailConfig {
     /// 有界队列容量（满即背压，不无界堆积）。
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
+    /// 单附件字节上限（**宿主强制**：字节由宿主读盘解析后经 FFI 传入，故判据在宿主
+    /// `resolve_attachments`；本字段在此声明只为让它**不被当成 profile 解析**）。
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: usize,
+    /// 单封信全部附件合计上限（字节，同上是宿主强制）。
+    #[serde(default = "default_max_total_attachment_bytes")]
+    pub max_total_attachment_bytes: usize,
     /// profile 名 → 配置。**键即 `mail.submit(key, ...)` 的 key**（未知 key 显式报错）。
     #[serde(flatten)]
     pub profiles: HashMap<String, ProfileCfg>,
@@ -121,6 +132,16 @@ fn default_workers() -> usize {
 
 fn default_queue_capacity() -> usize {
     256
+}
+
+/// 与宿主 `DEFAULT_MAX_ATTACHMENT_BYTES` 同值（10 MiB）。
+fn default_max_attachment_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+/// 与宿主 `DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES` 同值（25 MiB）。
+fn default_max_total_attachment_bytes() -> usize {
+    25 * 1024 * 1024
 }
 
 fn default_timeout() -> u64 {
@@ -230,6 +251,29 @@ mod tests {
         assert!(!p.allow_none_tls);
         assert!(p.user.is_none() && p.pass.is_none());
         assert!(p.file_transport.is_none());
+    }
+
+    /// B2：附件上限键（宿主强制）是**顶层键而非 profile**，解析期必须认得（否则会因
+    /// 「缺 host」被当 profile 拒掉，配置一加就启动失败）。
+    #[test]
+    fn attachment_limit_keys_are_top_level_not_profiles() {
+        let c = MailConfig::parse(
+            r#"{"max_attachment_bytes":1024,"max_total_attachment_bytes":2048,
+                "default":{"host":"h","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.max_attachment_bytes, 1024);
+        assert_eq!(c.max_total_attachment_bytes, 2048);
+        assert_eq!(c.profiles.len(), 1, "上限键不得被当成 profile");
+        assert!(c.profiles.contains_key("default"));
+
+        // 缺省 = 与宿主同值的 10 MiB / 25 MiB。
+        let c = MailConfig::parse(
+            r#"{"default":{"host":"h","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.max_attachment_bytes, 10 * 1024 * 1024);
+        assert_eq!(c.max_total_attachment_bytes, 25 * 1024 * 1024);
     }
 
     /// 多 profile：键即 profile 名，互不干扰。

@@ -150,6 +150,28 @@ interface MailSendRequest {
 - `mime` 显式优先，否则按扩展名/字节嗅探。
 - **下标对齐契约**：宿主按 `attachments` 顺序生成字节数组，插件按同下标取用；**数量必须一致**（不一致 → `code:5`，防错配）。
 - 路径校验与读盘使用**同一 canonical 句柄**（避免 TOCTOU）。
+- **读盘不阻塞 isolate**：走 `tokio::fs`（内部 `spawn_blocking`）；`path` 路先取文件长度，
+  超限的文件**不会被读进内存**。
+
+### 大小上限（`code:5`）
+
+| 配置键（`smtp:` 顶层） | 默认 | 含义 |
+|---|---|---|
+| `max_attachment_bytes` | `10485760`（10 MiB） | **单个**附件上限 |
+| `max_total_attachment_bytes` | `26214400`（25 MiB） | 单封信**全部附件合计**上限 |
+
+```yaml
+smtp:
+  max_attachment_bytes: 10485760        # 单附件上限（字节）
+  max_total_attachment_bytes: 26214400  # 单封合计上限（字节）
+  default: { ... }
+```
+
+- 两个键都是**正整数**（0 / 负数 / 字符串在启动期即报错，不静默取默认）。
+- 超限 → `{code:5}`，文案点名哪个附件、两侧字节数与对应配置键。
+- **为什么必须有**：附件字节由宿主读盘后经**有界队列**（默认容量 256）交给插件 —— 无上限时
+  project root 内任意大文件（含 `config.yaml`，里面有 `jwt_secret` / smtp 口令）都能被一次
+  调用读入内存并被队列放大成内存 DoS。上限是对**单件**与**单封合计**两道。
 
 ## 5. `sendRaw` 语义（防双收件人/spoof）
 
@@ -205,7 +227,9 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 mai
 | 跨进程（分布式 bus）`mail.result` | 仅本地扇出；需宿主持 runtime handle 后异步发布（待做） |
 | XOAuth2 token 刷新 | 首版仅静态 `access_token`；`refresh_token`-only fail-loud（待做） |
 | per-来源限流 | 仅全局有界队列 + `code:4`；令牌桶按模块/租户待做 |
-| 自动重试 / bounce / DKIM | 不做（交中继/上层） |
+| 自动重试 / bounce / DKIM | 不做（交中继/上层）；**`code≠0` 一律不得自动重试**（§3） |
+| 附件上限 | 有：单件 `max_attachment_bytes`（默认 10 MiB）+ 单封合计 `max_total_attachment_bytes`（默认 25 MiB），超限 `code:5`（§4）。**无**「按 profile 分别设限」与「按 MIME 白名单」 |
+| 附件字节的内存峰值 | 上限只约束**单件/单封**大小；`blobKey` 路由后端取字节时仍会先分配整块（后端无 size 接口，拿不到就判不了） |
 | `pool` 生命周期 | lettre `pool` 在 transport 构建与 Drop 时 `tokio::spawn` → 必须全程在插件自身 runtime 内（已保证） |
 | SMTP 错误细分（`code:2`/`3`） | 未启用：5xx 与鉴权失败均归 `1`（§3）。细分要解析 lettre 错误分类，且需在 `msg` 脱敏前提下做（待做） |
 | `tls: none` 的「内网 CIDR」约束 | 未实现：当前只校验显式 `allow_none_tls: true`（设计 §11 曾要求 host 落在内网网段，待做） |
