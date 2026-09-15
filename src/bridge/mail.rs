@@ -82,9 +82,10 @@ pub trait MailBackend: Send + Sync {
 /// 单个 profile 的**非密钥**校验面（design §4：凭据只进插件）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailProfileCfg {
-    /// 发件人白名单（后缀匹配；空表 = 拒绝，fail-closed）。
+    /// 发件人白名单（条目 = 完整地址或 `@domain`，**全等**匹配；空表 = 拒绝，fail-closed）。
+    /// 条目格式在装配期校验（见 [`parse_whitelist_entry`]）。
     pub allowed_from: Vec<String>,
-    /// 收件人白名单（to/cc/bcc 后缀匹配；空表 = 拒绝，fail-closed）。
+    /// 收件人白名单（to/cc/bcc 同上；空表 = 拒绝，fail-closed）。
     pub allowed_recipients: Vec<String>,
 }
 
@@ -109,7 +110,8 @@ impl MailConfig {
     /// 从 `smtp:` 段的 JSON 构建（插件的同一段 cfg）。
     /// 只吸收每个 profile 的 `allowed_from`/`allowed_recipients`；`workers`/`queue_capacity`
     /// 与连接字段（host/port/user/pass…）被忽略；形态错误（非对象 profile、非字符串数组）
-    /// 立即报错——配置写错在装配期暴露，而非静默变成「无白名单」。
+    /// 与**白名单条目格式非法**（空串/缺 `@`/首尾空白）都立即报错——配置写错在装配期暴露，
+    /// 而非静默变成「无白名单」或「白名单悄悄不命中」（见 [`parse_whitelist_entry`]）。
     pub fn from_value(v: &Value) -> BridgeResult<Self> {
         let obj = v
             .as_object()
@@ -127,8 +129,8 @@ impl MailConfig {
             profiles.insert(
                 name.clone(),
                 MailProfileCfg {
-                    allowed_from: str_list(po.get("allowed_from"), name, "allowed_from")?,
-                    allowed_recipients: str_list(
+                    allowed_from: whitelist_list(po.get("allowed_from"), name, "allowed_from")?,
+                    allowed_recipients: whitelist_list(
                         po.get("allowed_recipients"),
                         name,
                         "allowed_recipients",
@@ -483,25 +485,114 @@ pub fn validate_address(s: &str) -> Result<Address, String> {
     s.parse::<Address>().map_err(|e| e.to_string())
 }
 
-/// 后缀匹配（大小写不敏感；`@x.com` 命中 `a@x.com`）。
-fn suffix_match(list: &[String], addr: &str) -> bool {
-    let a = addr.to_lowercase();
-    list.iter().any(|s| a.ends_with(&s.to_lowercase()))
+/// 白名单条目（B1）的两种**合法**形态（不做子域通配、不做裸后缀匹配）。
+///
+/// | 写法 | 语义 | 命中 | 不命中 |
+/// |---|---|---|---|
+/// | `@x.com` | 收件人**域全等** | `a@x.com` | `a@sub.x.com`（子域须显式写 `@sub.x.com`） |
+/// | `noreply@x.com` | 与地址**全等**（大小写不敏感） | `noreply@x.com` | `evil-noreply@x.com` |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WhitelistEntry {
+    /// `@domain`：域全等（小写）。
+    Domain(String),
+    /// 完整地址：地址全等（小写）。
+    Address(String),
+}
+
+/// 解析并**校验**一条白名单条目。装配期（[`MailConfig::from_value`]）与匹配期
+/// （[`whitelist_hit`]）用**同一函数** ⇒ 条目语义只有一份定义，不会解析/匹配口径分裂。
+///
+/// 非法形态一律拒绝（历史三处绕过：裸后缀让 `noreply@x.com` 放行 `evil-noreply@x.com`、
+/// 漏写 `@` 的条目放行跨域 `a@evilx.com`、空条目 `ends_with("")` 恒真把白名单关掉）：
+/// - 空串 / 只有空白：空条目会命中一切；
+/// - 含首尾空白：`" noreply@x.com"` 与 `"noreply@x.com "` 都是配置笔误，且会导致
+///   「配置里看着对、实际不命中」；
+/// - 不以 `@` 开头且不含 `@`：没有 `@` 就没有域边界，无从做全等；
+/// - `@` 后为空（`"@"`）或域/地址不是合法地址：交给 `lettre::Address`（与投递侧同一
+///   解析器，避免「宿主放行 / 插件拒绝」的分裂）。
+///
+/// 返回值是**原因**（不含位置与下一步）：用户面文案由调用方补上 profile/字段/下标与
+/// 下一步（见 [`whitelist_list`]）。
+pub fn parse_whitelist_entry(raw: &str) -> Result<WhitelistEntry, String> {
+    if raw.trim() != raw {
+        return Err("含首尾空白".to_string());
+    }
+    if raw.is_empty() {
+        return Err("空串（空条目会命中一切 = 白名单失效）".to_string());
+    }
+    if let Some(domain) = raw.strip_prefix('@') {
+        if domain.is_empty() {
+            return Err("'@' 后缺少域".to_string());
+        }
+        // `@domain` 的域校验复用同一解析器：造一个探针地址交给 lettre 判定。
+        validate_address(&format!("probe@{domain}"))
+            .map_err(|e| format!("域 '{domain}' 非法：{e}"))?;
+        return Ok(WhitelistEntry::Domain(domain.to_ascii_lowercase()));
+    }
+    if !raw.contains('@') {
+        return Err(
+            "缺少 '@'：须为完整地址（user@domain）或 @domain 形式（裸域/裸后缀会放行同域仿冒与跨域收件）"
+                .to_string(),
+        );
+    }
+    validate_address(raw).map_err(|e| format!("不是合法地址：{e}"))?;
+    Ok(WhitelistEntry::Address(raw.to_lowercase()))
+}
+
+/// 单条条目与地址是否命中（大小写不敏感）。`addr` 须是已规范化的地址。
+fn entry_matches(entry: &WhitelistEntry, addr: &str) -> bool {
+    match entry {
+        WhitelistEntry::Domain(d) => addr
+            .rsplit_once('@')
+            .is_some_and(|(_, dom)| dom.eq_ignore_ascii_case(d)),
+        WhitelistEntry::Address(a) => addr.eq_ignore_ascii_case(a),
+    }
+}
+
+/// 白名单命中判定：逐条解析后做**全等**比较。
+///
+/// 非法条目视为「不命中」（fail-closed）——装配期已 fail-fast，这里只兜底
+/// `MailConfig::new` 直接构造（绕过解析）的情形，绝不因条目写错而放宽匹配。
+fn whitelist_hit(list: &[String], addr: &str) -> bool {
+    list.iter()
+        .any(|raw| matches!(parse_whitelist_entry(raw), Ok(e) if entry_matches(&e, addr)))
+}
+
+/// 白名单条目清单（配置期）：类型校验 + **逐条格式校验**（fail-fast）。
+///
+/// 格式非法在装配期即报错（点名 profile/字段/下标/条目原文 + 下一步），而不是等到发信
+/// 时表现为「白名单没生效」——那会把配置错误伪装成权限问题。
+fn whitelist_list(v: Option<&Value>, profile: &str, field: &str) -> BridgeResult<Vec<String>> {
+    let out = str_list(v, profile, field)?;
+    for (i, raw) in out.iter().enumerate() {
+        parse_whitelist_entry(raw).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!(
+                "smtp.{profile}.{field}[{i}] 条目 {raw:?} 非法：{e}（下一步：写成完整地址 user@domain，或 @domain 形式）"
+            )
+            .into()
+        })?;
+    }
+    Ok(out)
 }
 
 /// profile 白名单（design §10）：`from` 命中 `allowed_from`，全部收件人
 /// （to/cc/bcc）命中 `allowed_recipients`。
+///
+/// 匹配语义见 [`WhitelistEntry`]：条目要么是 `@domain`（域全等），要么是完整地址
+/// （地址全等）——**没有**后缀/子域通配，故 `noreply@x.com` 不会放行
+/// `evil-noreply@x.com`，`@x.com` 不会放行 `a@evilx.com` 或 `a@sub.x.com`。
+///
 /// **空表 = 拒绝**（fail-closed）：白名单是「越权发送」的唯一控制点，
 /// 缺省放行等于默认开成开放中继；与本特性 `tls: none` 需显式许可同一取向。
 pub fn check_whitelist(from: &str, rcpts: &[String], cfg: &MailProfileCfg) -> Result<(), String> {
-    if !suffix_match(&cfg.allowed_from, from) {
+    if !whitelist_hit(&cfg.allowed_from, from) {
         return Err(format!(
             "from '{from}' 不在 allowed_from 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或改用允许的发件人）",
             cfg.allowed_from
         ));
     }
     for r in rcpts {
-        if !suffix_match(&cfg.allowed_recipients, r) {
+        if !whitelist_hit(&cfg.allowed_recipients, r) {
             return Err(format!(
                 "收件人 '{r}' 不在 allowed_recipients 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或去掉该收件人）",
                 cfg.allowed_recipients
@@ -1639,7 +1730,7 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_is_suffix_based_and_fail_closed() {
+    fn whitelist_is_exact_and_fail_closed() {
         let p = MailProfileCfg {
             allowed_from: vec!["noreply@x.com".into()],
             allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
@@ -1673,6 +1764,105 @@ mod tests {
         };
         let e = check_whitelist("a@x.com", &["b@x.com".into()], &no_rcpt).unwrap_err();
         assert!(e.contains("allowed_recipients"), "{e}");
+    }
+
+    /// B1：白名单是**唯一**越权控制点，故匹配必须是「域全等 / 地址全等」——
+    /// 裸后缀（`ends_with`）三处绕过逐一钉死（先红）：
+    /// ① `noreply@x.com` 放行同域仿冒 `evil-noreply@x.com`；
+    /// ② 漏写 `@` 的条目（`x.com`）放行跨域 `a@evilx.com`；
+    /// ③ 空条目 `""`（`ends_with("")` 恒真）= 白名单等于关闭。
+    /// 另钉「不做子域通配」：`@x.com` **不**命中 `a@sub.x.com`（子域须显式 `@sub.x.com`）。
+    #[test]
+    fn whitelist_blocks_the_three_suffix_bypasses() {
+        let p = MailProfileCfg {
+            allowed_from: vec!["noreply@x.com".into()],
+            allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
+        };
+        // 正向对照（防「一刀切全拒」也被判绿）。
+        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p).is_ok());
+        assert!(
+            check_whitelist("NoReply@X.COM", &["a@PARTNER.com".into()], &p).is_ok(),
+            "大小写不敏感（域名/本地部大小写无语义）"
+        );
+
+        // ① 同域仿冒发件人：条目是完整地址 ⇒ 必须全等，不得后缀命中。
+        let e = check_whitelist("evil-noreply@x.com", &["a@x.com".into()], &p).unwrap_err();
+        assert!(e.contains("allowed_from"), "{e}");
+
+        // ② 漏写 `@` 的条目：既不命中 `a@evilx.com`，也不命中任何地址（fail-closed）。
+        let bare = MailProfileCfg {
+            allowed_from: vec!["noreply@x.com".into()],
+            allowed_recipients: vec!["x.com".into()],
+        };
+        let e = check_whitelist("noreply@x.com", &["a@evilx.com".into()], &bare).unwrap_err();
+        assert!(e.contains("allowed_recipients"), "{e}");
+        assert!(
+            check_whitelist("noreply@x.com", &["a@x.com".into()], &bare).is_err(),
+            "裸域条目不得退化成后缀匹配（连本域也不放行）"
+        );
+
+        // ③ 空条目 = 白名单关闭：任何地址都不命中。
+        let blank = MailProfileCfg {
+            allowed_from: vec!["".into()],
+            allowed_recipients: vec!["@x.com".into()],
+        };
+        let e = check_whitelist("anyone@anywhere.com", &["a@x.com".into()], &blank).unwrap_err();
+        assert!(e.contains("allowed_from"), "{e}");
+
+        // 子域**不**通配：`@x.com` 只覆盖本域；子域要显式列出。
+        assert!(
+            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &p).is_err(),
+            "@x.com 不得命中子域 a@sub.x.com"
+        );
+        let sub = MailProfileCfg {
+            allowed_from: vec!["noreply@x.com".into()],
+            allowed_recipients: vec!["@sub.x.com".into()],
+        };
+        assert!(
+            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &sub).is_ok(),
+            "显式 @sub.x.com 必须命中"
+        );
+        assert!(
+            check_whitelist("noreply@x.com", &["a@x.com".into()], &sub).is_err(),
+            "@sub.x.com 是域全等，不覆盖父域"
+        );
+    }
+
+    /// B1：条目格式在**装配期**校验（fail-fast）——非法条目让配置解析失败，而不是等到发信
+    /// 时才退化成「不命中」（那样运维只看到 code:5，不知是自己写错了白名单）。
+    /// 错误须点名：profile、字段、第几条、条目原文、原因、下一步。
+    #[test]
+    fn mail_config_rejects_malformed_whitelist_entries() {
+        let cases: [(&str, &str); 5] = [
+            ("", "空"),
+            ("x.com", "'@'"),
+            (" noreply@x.com", "空白"),
+            ("@", "域"),
+            ("not an address", "'@'"),
+        ];
+        for (bad, needle) in cases {
+            let v = json!({"default": {"allowed_from": ["noreply@x.com", bad]}});
+            let e = format!(
+                "{}",
+                MailConfig::from_value(&v).expect_err("非法白名单条目必须让装配期失败")
+            );
+            assert!(
+                e.contains("default") && e.contains("allowed_from[1]"),
+                "错误须点名 profile 与下标：{e}"
+            );
+            assert!(e.contains(needle), "错误须给出原因（{needle}）：{e}");
+            assert!(e.contains("下一步"), "错误须给下一步：{e}");
+        }
+        // 合法两形态：完整地址 与 `@domain`。
+        let ok = json!({"default": {
+            "allowed_from": ["noreply@x.com"],
+            "allowed_recipients": ["@x.com", "@partner.com"]
+        }});
+        let cfg = MailConfig::from_value(&ok).expect("合法白名单条目必须通过");
+        assert_eq!(
+            cfg.profile("default").unwrap().allowed_recipients,
+            vec!["@x.com", "@partner.com"]
+        );
     }
 
     // ---------- 6.4：附件引用解析 ----------

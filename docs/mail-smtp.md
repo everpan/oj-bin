@@ -37,8 +37,8 @@ smtp:
     # mechanism: xoauth2 时（首版仅静态 token）：
     # xoauth2: { access_token: "ya29..." }   # 只给 refresh_token → fail-loud
     timeout: 30           # 单封发送超时（秒，默认 30）
-    allowed_from: ["noreply@x.com"]                  # 发件人白名单（后缀）
-    allowed_recipients: ["@x.com", "@partner.com"]   # 收件人白名单（后缀）
+    allowed_from: ["noreply@x.com"]                  # 发件人白名单（完整地址 = 全等匹配）
+    allowed_recipients: ["@x.com", "@partner.com"]   # 收件人白名单（@domain = 域全等；不含子域）
   alerts:                 # 第二个 profile（复用同一队列/线程池）
     host: smtp.other.com
     port: 587
@@ -60,6 +60,7 @@ smtp:
 ### 门禁（fail-closed）
 
 - **白名单**：`allowed_from`/`allowed_recipients` **空表即拒绝**（防开放中继）。缺省不放行。
+  条目语义与格式要求见下「白名单语义」。
 - **`tls: none`**：必须显式 `allow_none_tls: true`，否则配置解析失败。
 - **密钥**：只在配置文件与插件内；**不进 JS**（`Mail.profiles()` 仅列 profile 名）。
 - **`file_transport` 目录须先存在**（lettre 不自动建目录）。
@@ -67,6 +68,24 @@ smtp:
   且会**静默胜出**，同时写会让 `smtp:` 里的改动（白名单/凭据等）不生效。装配期即报错
   （文案 `pick one`）。`plugins: {mail: {}}`（空对象）不算冲突：它是「回落 `smtp:` 适配器」
   的写法。
+
+### 白名单语义（**全等**匹配，不做子域通配）
+
+白名单是「越权发送」的**唯一**控制点，因此条目一律**全等**比较（大小写不敏感），
+不做裸后缀/子域通配：
+
+| 条目写法 | 语义 | 命中 | **不**命中 |
+|---|---|---|---|
+| `noreply@x.com` | 完整地址：与 `from`（或收件人）**全等** | `noreply@x.com`、`NoReply@X.COM` | `evil-noreply@x.com`（同域仿冒） |
+| `@x.com` | `@domain`：收件人**域全等** | `a@x.com` | `a@sub.x.com`、`a@evilx.com` |
+
+- **子域不通配**：`@x.com` 只覆盖本域；要收子域须显式写 `@sub.x.com`（本版**不**支持
+  `@.x.com` 这类子域记号）。`@sub.x.com` 同样不覆盖父域 `@x.com`。
+- **条目格式要求**（装配期校验，写错即启动失败而不是静默不命中）：非空、无首尾空白，
+  且必须是「完整地址（含 `@`）」或「`@domain`」两者之一；`""`、`x.com`（裸域）、`@`、
+  `" a@x.com"`（首尾空白）都会被拒绝。错误文案点名
+  `smtp.<profile>.<字段>[<下标>]` 与下一步。
+- `allowed_from` 只比 `from`；`allowed_recipients` 比 `to ∪ cc ∪ bcc` 的**每一个**地址。
 
 ## 3. JS API
 
@@ -155,6 +174,9 @@ bus.subscribe("mail.result");   // 回调收到 { jobId, code, msg, messageId }
 ## 7. 安全清单
 
 - 白名单 fail-closed（§2）；`tls:none` 显式门禁。
+- **白名单匹配是「全等」而非后缀**（§2）：完整地址只命中自身（`noreply@x.com` **不**命中
+  `evil-noreply@x.com`）；`@domain` 只命中该域本身（不命中子域、不命中 `evilx.com`）；
+  空条目/裸域条目在装配期即被拒绝（历史实现里 `ends_with("")` 会让白名单恒真）。
 - **CRLF 注入**：`subject`/`headers` 剥离 CRLF；`from/to/cc/bcc` 经 `lettre::Address` **强校验**（非法即 `code:5`）。正文/`raw` 原文不剥（换行有语义）。
 - **`headers` 不得覆盖** `From/To/Cc/Bcc/Subject`（否则可绕过白名单）。
 - **附件路径** 经 `ensure_within`（双侧 canonicalize，覆盖符号链接）。

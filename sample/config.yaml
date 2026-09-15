@@ -62,8 +62,8 @@ smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 ma
     allow_none_tls: true
     mechanism: login
     file_transport: "/tmp/oj-mail-eml"   # 本地落盘通道：目录**须先存在**（mkdir -p /tmp/oj-mail-eml）
-    allowed_from: ["noreply@x.com"]              # 发件人白名单（后缀匹配）
-    allowed_recipients: ["@x.com"]               # 收件人白名单（to/cc/bcc 后缀匹配）
+    allowed_from: ["noreply@x.com"]              # 发件人白名单（完整地址 = 全等匹配）
+    allowed_recipients: ["@x.com"]               # 收件人白名单（@domain = 域全等；不含子域）
   # default:            # 真连 SMTP 的样例（示例值；凭据勿提交进仓库）
   #   host: "smtp.example.com"
   #   port: 465
