@@ -117,7 +117,8 @@ fn write_project(t: &Tmp) -> PathBuf {
         "name: mail\ndesc: mail e2e\ndependencies: []\nversion: 0.1.0\n",
     )
     .unwrap();
-    // `?from=` 可换发件人（负例用）；`json.raw` 只回 mail 信封本身，断言无需拆两层。
+    // `?from=` 可换发件人（负例用）；`?mode=enqueue` 走 enqueue 路（A1：统一信封 + 回查）；
+    // `json.raw` 只回 mail 信封本身，断言无需拆两层。
     // profile key 走 `Mail("mock")`：钉住「键即 profile」的路由（与 smtp.mock 对应）。
     std::fs::write(
         src.join("mail/api.ts"),
@@ -126,6 +127,21 @@ fn write_project(t: &Tmp) -> PathBuf {
             "  async get() {\n",
             "    const from = String(http.query.from ?? \"noreply@x.com\");\n",
             "    const m = new Mail(\"mock\");\n",
+            "    if (String(http.query.mode ?? \"\") === \"enqueue\") {\n",
+            "      // 入队即回（统一信封，非裸 jobId）；随后用同队列的 send 作**屏障**：\n",
+            "      // workers=1 + FIFO ⇒ send 的结果 resolve 时，enqueue 那封必然已完成并上送\n",
+            "      // 宿主结果存储 ⇒ 下面的 result(jobId) 必命中（不依赖 sleep/时间竞态）。\n",
+            "      const enq = await m.enqueue({\n",
+            "        from, to: [\"a@x.com\"], subject: \"enq\", text: \"enqueued\",\n",
+            "      });\n",
+            "      const jobId = enq?.data?.jobId;\n",
+            "      const barrier = await m.send({\n",
+            "        from, to: [\"a@x.com\"], subject: \"barrier\", text: \"barrier\",\n",
+            "      });\n",
+            "      const res = await m.result(jobId);\n",
+            "      json.raw({ enq, barrier, jobId, jobIdType: typeof jobId, res });\n",
+            "      return;\n",
+            "    }\n",
             "    const res = await m.send({\n",
             "      from,\n",
             "      to: [\"a@x.com\"],\n",
@@ -245,6 +261,61 @@ async fn mail_send_from_outside_whitelist_returns_code5() {
     assert!(msg.contains("allowed_from"), "{env}");
     assert!(msg.contains("evil@y.com"), "{env}");
     assert_eq!(eml_count(), before, "越权信不得落盘：{env}");
+}
+
+/// Given: 同一**真装配**（真 oj-mail 插件，非 FakeMail）+ `mail.enqueue`；
+/// Then: ① `enqueue` 回**统一信封**（`code:0`、`data.jobId` 是字符串、**顶层无裸 jobId**）；
+/// ② 同队列的 `send` 作屏障后，`mail.result(jobId)` 命中该 job 的完成结果（`code:0` + `messageId`）
+/// —— A1 的核心：拿得到 jobId 才回查得到结果（裸形态会让 `res.data.jobId` TypeError）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mail_enqueue_returns_envelope_and_result_is_queryable() {
+    let _g = lock();
+    let t = tmp_project();
+    let src = write_project(&t);
+    let app = boot(&t, &src).await;
+
+    let before = eml_count();
+    let (status, v) = get(&app, "/v1/api/mail/?mode=enqueue").await;
+    assert_eq!(status, 200, "{v}");
+
+    // ① enqueue 的立即回执 = 统一信封（**非**裸 `{jobId}`）。
+    let enq = &v["enq"];
+    assert_eq!(enq["code"], 0, "enqueue 必须回统一信封：{v}");
+    assert_eq!(enq["msg"], "ok", "{v}");
+    assert_eq!(
+        v["jobIdType"], "string",
+        "data.jobId 必须是字符串（用户按手册写 res.data.jobId）：{v}"
+    );
+    assert!(
+        enq.get("jobId").is_none(),
+        "顶层不得回裸 jobId（契约是 data.jobId）：{v}"
+    );
+    let mut top: Vec<&str> = enq
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    top.sort_unstable();
+    assert_eq!(top, ["code", "data", "msg"], "{v}");
+
+    // 屏障：send 的结果 resolve ⇒ 先入队的 enqueue 那封已完成并上送宿主。
+    assert_eq!(v["barrier"]["code"], 0, "屏障 send 必须成功：{v}");
+
+    // ② mail.result(jobId) 取到完成结果（含投递凭据 messageId）→ 真落盘。
+    let res = &v["res"];
+    let job_id = v["jobId"].as_str().expect("jobId");
+    assert_eq!(res["jobId"], job_id, "结果须按同一 jobId 索引：{v}");
+    assert_eq!(res["code"], 0, "结果信封：{v}");
+    let message_id = res["messageId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("结果必须带投递凭据 messageId：{v}"));
+    let eml_path = eml_dir().join(format!("{message_id}.eml"));
+    let eml = std::fs::read_to_string(&eml_path)
+        .unwrap_or_else(|e| panic!("{} 未落盘（{e}）", eml_path.display()));
+    assert!(eml.contains("enqueued"), "enqueue 那封的正文：{eml}");
+    // 两封（enqueue + 屏障 send）都落盘。
+    assert_eq!(eml_count(), before + 2, "{v}");
 }
 
 fn eml_count() -> usize {

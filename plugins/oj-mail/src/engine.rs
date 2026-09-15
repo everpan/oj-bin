@@ -263,7 +263,8 @@ impl MailEngine {
     ///
     /// 三种返回：
     /// - `send` 语义 → 等 oneshot 的 `FfiFuture`（由引擎 runtime 驱动，不占调用线程）；
-    /// - `enqueue` 语义 → 立即 `{"jobId":"..."}`（真实完成经 `deliver` 上送）；
+    /// - `enqueue` 语义 → 立即回**统一信封** `{"code":0,"msg":"ok","data":{"jobId":"..."}}`
+    ///   （真实完成经 `deliver` 上送；**不是**裸 `{jobId}`，见 [`enqueued_envelope`]）；
     /// - 队列满 → 立即 `{"code":4,...}` 信封（**背压**，绝不阻塞）。
     pub fn submit(&self, key: &str, req: &str, atts: Vec<MailAttachment>) -> FfiFuture {
         // req 形态错误 / 未知 profile = 调用方契约错误 → FFI 层 Err（fail-loud，不占队列槽位）。
@@ -301,7 +302,7 @@ impl MailEngine {
         // 队列满时甚至永久等待。
         match tx.try_send(job) {
             Ok(()) => match rx {
-                None => ready_ok(json!({ "jobId": job_id }).to_string()),
+                None => ready_ok(enqueued_envelope(&job_id)),
                 Some(rx) => spawn_ffi_future(rt, async move {
                     rx.await
                         .map_err(|_| "mail: 投递任务未回传结果（引擎停机？）".to_string())?
@@ -527,6 +528,17 @@ fn ok_envelope(job_id: &str, message_id: &str) -> String {
         .to_string()
 }
 
+/// `enqueue` 语义的**立即**回执：与 `send` 路**同形**的统一信封
+/// `{code:0,msg:"ok",data:{jobId}}`（无 `messageId` —— 投递尚未发生，故不写该键）。
+///
+/// 刻意**不**回裸 `{jobId}`：三层公开契约一致承诺 `res.data.jobId`
+/// （`sample/global.d.ts`、`docs/devkit/api-manual.md`、`docs/mail-smtp.md` §6）；
+/// 裸形态会让用户按手册写 `res.data.jobId` 直接 TypeError，且拿不到 jobId 就无法
+/// `mail.result()` 回查。
+fn enqueued_envelope(job_id: &str) -> String {
+    json!({"code": CODE_OK, "msg": "ok", "data": {"jobId": job_id}}).to_string()
+}
+
 /// 失败信封：**只回分类文案 + jobId**（脱敏：无收件人/主题/SMTP 对话）。
 fn fail_envelope(job_id: &str, code: i32, msg: &str) -> String {
     json!({"code": code, "msg": msg, "data": {"jobId": job_id}}).to_string()
@@ -749,7 +761,8 @@ mod tests {
         );
     }
 
-    /// TDD-3：`enqueue_only` 立即回 `{"jobId":...}`；真实完成经 sink 上送 `mail.result`
+    /// TDD-3：`enqueue_only` 立即回**统一信封** `{code:0,msg:"ok",data:{jobId}}`（**非**裸
+    /// `{jobId}` —— 三层公开契约都承诺 `res.data.jobId`）；真实完成经 sink 上送 `mail.result`
     /// （信封含**同** jobId、code 0，且**不含**收件人/主题）。
     #[tokio::test(flavor = "multi_thread")]
     async fn enqueue_delivers_completion_via_sink() {
@@ -760,8 +773,18 @@ mod tests {
 
         let mut fut = eng.submit(PROFILE, &req_raw(Some("j-enq-1"), true), vec![]);
         let v: Value =
-            serde_json::from_slice(&drive(&mut fut).await.expect("enqueue 回 jobId")).unwrap();
-        assert_eq!(v["jobId"], "j-enq-1", "enqueue 立即回 jobId: {v}");
+            serde_json::from_slice(&drive(&mut fut).await.expect("enqueue 回统一信封")).unwrap();
+        // 严格形态：顶层只有 code/msg/data，data 只有 jobId（**没有**裸 `jobId` 顶层键）。
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort_unstable();
+        assert_eq!(top, ["code", "data", "msg"], "enqueue 必须是统一信封: {v}");
+        assert_eq!(v["code"], CODE_OK, "enqueue 立即回执: {v}");
+        assert_eq!(v["msg"], "ok", "{v}");
+        assert_eq!(v["data"]["jobId"], "j-enq-1", "enqueue 立即回 jobId: {v}");
+        assert!(
+            v["data"].get("messageId").is_none(),
+            "投递尚未发生，不得写 messageId: {v}"
+        );
 
         let (topic, payload) = tokio::time::timeout(Duration::from_secs(5), delivered.recv())
             .await

@@ -326,6 +326,19 @@ impl FfiMailBackend {
     }
 }
 
+/// 纵深防御：把插件返回的 JSON 收敛为**统一信封** `{code,msg,data}`。
+///
+/// 契约要求插件回信封（`plugins/oj-mail` 的 `engine.rs` 已统一），但宿主不能把这条契约
+/// 当成对**第三方/旧版**插件的保证：顶层无 `code` 的形态（如历史上的裸 `{"jobId":…}`
+/// 或裸 data）一律包成 `{code:0,msg:"ok",data:<原值>}`，使 JS 侧契约
+/// （`res.data.jobId`）不因插件形态差异而 TypeError，也让 `mail.result(jobId)` 拿得到 id。
+fn ensure_envelope(v: Value) -> Value {
+    match v.as_object() {
+        Some(o) if o.contains_key("code") => v,
+        _ => json!({ "code": 0, "msg": "ok", "data": v }),
+    }
+}
+
 #[async_trait]
 impl MailBackend for FfiMailBackend {
     async fn submit(
@@ -348,7 +361,12 @@ impl MailBackend for FfiMailBackend {
         let bytes = super::ffi::await_ffi(fut)
             .await
             .map_err(|e| format!("ffi mail submit: {e}"))?;
-        serde_json::from_slice(&bytes).map_err(|e| format!("ffi mail submit decode: {e}").into())
+        let v: Value = serde_json::from_slice(&bytes).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("ffi mail submit decode: {e}").into()
+            },
+        )?;
+        Ok(ensure_envelope(v))
     }
 
     fn config(&self) -> &MailConfig {
@@ -1112,15 +1130,77 @@ mod tests {
 
     // ---------- 6.2：vtable 适配器 ----------
 
+    /// 假 vtable 用的 **ready** FfiFuture 状态（poll/take/free 三指针，与 `ffi.rs`
+    /// 适配器测试同款）；`FREED` 记录 free 次数（句柄必须释放）。
+    /// `FREED` 是进程级静态：用它做断言的用例须持 [`lock`]（串行化，取增量）。
+    struct ReadyState(Option<Result<Vec<u8>, String>>);
+    static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn ready_poll(state: *mut std::ffi::c_void) -> i32 {
+        let s = unsafe { &mut *(state as *mut ReadyState) };
+        match &s.0 {
+            Some(Ok(_)) => 1,
+            Some(Err(_)) => -1,
+            None => 0,
+        }
+    }
+
+    extern "C" fn ready_take(
+        state: *mut std::ffi::c_void,
+    ) -> oj_plugin_ffi::RResult<oj_plugin_ffi::RBytes, oj_plugin_ffi::RString> {
+        let s = unsafe { &mut *(state as *mut ReadyState) };
+        match s.0.take() {
+            Some(Ok(b)) => oj_plugin_ffi::RResult::Ok(oj_plugin_ffi::RBytes::from(&b[..])),
+            Some(Err(e)) => oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from(e.as_str())),
+            None => oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from("not ready")),
+        }
+    }
+
+    extern "C" fn ready_free(state: *mut std::ffi::c_void) {
+        if !state.is_null() {
+            FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(unsafe { Box::from_raw(state as *mut ReadyState) });
+        }
+    }
+
+    fn ready_future(r: Result<Vec<u8>, String>) -> oj_plugin_ffi::FfiFuture {
+        oj_plugin_ffi::FfiFuture {
+            state: Box::into_raw(Box::new(ReadyState(Some(r)))).cast(),
+            poll: ready_poll,
+            take: ready_take,
+            free: ready_free,
+        }
+    }
+
+    /// 单方法假 vtable 的返回体（用例串行「设置 → 立即调用」，无并发窗口）。
+    static SUBMIT_BODY: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    extern "C" fn body_submit(
+        _key: oj_plugin_ffi::RString,
+        _req: oj_plugin_ffi::RString,
+        _atts: oj_plugin_ffi::RVec<oj_plugin_ffi::MailAttachment>,
+    ) -> oj_plugin_ffi::FfiFuture {
+        ready_future(Ok(SUBMIT_BODY.lock().unwrap().clone()))
+    }
+
+    /// 构造「`submit` 恒返回 `body`」的假 vtable。
+    fn vtable_returning(body: &[u8]) -> &'static MailVtable {
+        *SUBMIT_BODY.lock().unwrap() = body.to_vec();
+        Box::leak(Box::new(MailVtable {
+            submit: body_submit,
+        }))
+    }
+
     /// 适配器把宿主办的 `Vec<ParsedAttachment>` 按**下标原序**填进 `RVec<MailAttachment>`
     /// （插件按 index 对齐，数量/顺序错位即 code:5），并把 future 结果（信封 JSON）解回。
     #[tokio::test(flavor = "current_thread")]
     async fn ffi_mail_backend_forwards_key_and_ordered_attachments() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _g = lock(); // FREED 是进程级静态：本用例取增量，须与用它的用例串行
         /// 假 vtable 记录的一次调用：key / req / 附件（filename, mime, bytes）。
         type Seen = (String, String, Vec<(String, String, Vec<u8>)>);
         static SEEN: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
-        static FREED: AtomicUsize = AtomicUsize::new(0);
+        let freed_before = FREED.load(Ordering::SeqCst);
 
         extern "C" fn fake_submit(
             key: oj_plugin_ffi::RString,
@@ -1138,46 +1218,9 @@ mod tests {
             SEEN.lock()
                 .unwrap()
                 .push((key[..].to_string(), req[..].to_string(), got));
-            ready(Ok(
+            ready_future(Ok(
                 br#"{"code":0,"msg":"sent","data":{"jobId":"j9","messageId":"m9"}}"#.to_vec(),
             ))
-        }
-
-        // 与 ffi.rs 适配器测试同款的 ready FfiFuture（poll/take/free 三指针）。
-        struct Ready(Option<Result<Vec<u8>, String>>);
-        extern "C" fn poll(state: *mut std::ffi::c_void) -> i32 {
-            let s = unsafe { &mut *(state as *mut Ready) };
-            match &s.0 {
-                Some(Ok(_)) => 1,
-                Some(Err(_)) => -1,
-                None => 0,
-            }
-        }
-        extern "C" fn take(
-            state: *mut std::ffi::c_void,
-        ) -> oj_plugin_ffi::RResult<oj_plugin_ffi::RBytes, oj_plugin_ffi::RString> {
-            let s = unsafe { &mut *(state as *mut Ready) };
-            match s.0.take() {
-                Some(Ok(b)) => oj_plugin_ffi::RResult::Ok(oj_plugin_ffi::RBytes::from(&b[..])),
-                Some(Err(e)) => {
-                    oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from(e.as_str()))
-                }
-                None => oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from("not ready")),
-            }
-        }
-        extern "C" fn free(state: *mut std::ffi::c_void) {
-            if !state.is_null() {
-                FREED.fetch_add(1, Ordering::SeqCst);
-                drop(unsafe { Box::from_raw(state as *mut Ready) });
-            }
-        }
-        fn ready(r: Result<Vec<u8>, String>) -> oj_plugin_ffi::FfiFuture {
-            oj_plugin_ffi::FfiFuture {
-                state: Box::into_raw(Box::new(Ready(Some(r)))).cast(),
-                poll,
-                take,
-                free,
-            }
         }
 
         let vt: &'static MailVtable = Box::leak(Box::new(MailVtable {
@@ -1223,7 +1266,53 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(FREED.load(Ordering::SeqCst), 1, "future 句柄须 free");
+        assert_eq!(
+            FREED.load(Ordering::SeqCst),
+            freed_before + 1,
+            "future 句柄须 free（本用例增量 1）"
+        );
+    }
+
+    /// A1 **纵深防御**：插件回**裸**载荷（旧版/第三方形态，如 `{"jobId":"j-bare"}`）时，
+    /// 宿主必须包成统一信封 —— JS 侧 `res.data.jobId` 契约不因插件形态差异而 TypeError，
+    /// 且 `mail.result(jobId)` 拿得到 id。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ffi_mail_backend_wraps_bare_plugin_payload_into_envelope() {
+        let _g = lock(); // 与用 FREED 的用例串行（同一 ready future 脚手架）
+        let cases: [(&'static [u8], &str); 3] = [
+            // 历史上的裸 `{jobId}`（A1 修复前的插件形态）。
+            (br#"{"jobId":"j-bare"}"#, "j-bare"),
+            // 裸标量/数组同样不崩（data 原样收纳）。
+            (br#""naked""#, "naked"),
+            (br#"[1,2]"#, "arr"),
+        ];
+        for (body, tag) in cases {
+            let vt = vtable_returning(body);
+            let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+            let env = b
+                .submit("default", "{}".to_string(), vec![])
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(env["code"], 0, "{tag}: 裸载荷须包成成功信封: {env}");
+            assert_eq!(env["msg"], "ok", "{tag}: {env}");
+            match tag {
+                "j-bare" => assert_eq!(env["data"]["jobId"], "j-bare", "{env}"),
+                "naked" => assert_eq!(env["data"], "naked", "{env}"),
+                _ => assert_eq!(env["data"], json!([1, 2]), "{env}"),
+            }
+        }
+        // 已是信封的形态**原样透传**（不重复包裹）。
+        let vt = vtable_returning(br#"{"code":5,"msg":"boom","data":{}}"#);
+        let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+        let env = b
+            .submit("default", "{}".to_string(), vec![])
+            .await
+            .expect("信封");
+        assert_eq!(
+            env,
+            json!({"code": 5, "msg": "boom", "data": {}}),
+            "已有 code 的信封不得被二次包裹"
+        );
     }
 
     // ---------- 6.2：宿主侧配置（非密钥面） ----------
