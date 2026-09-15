@@ -1212,7 +1212,7 @@ drop runtime）。本期 `submit` 只走「原始 MIME」路（`raw`），消息
   `send` 语义的 await 点在 `spawn_ffi_future` 的引擎任务里，不占调用线程。
 - drain / 销毁：`engine.rs:328`（`shutdown`：take-drop `tx` → std 通道收 `workers` 个退出信号（同步等待，
   不用 `block_on`）→ `dispose`）、`:365`（幂等 `dispose`）、`:407`（`dispose`：`rt.enter()` 下 drop targets
-  → `rt.shutdown_background()`）、`:371`（`Drop`：同序但不等待在途）。
+  → `rt.shutdown_background()`）、`:372`（`Drop`：同序但不等待在途）。
 - 宿主接线：`lib.rs:42`（`MAIL_ENGINE`）、`:251`（`init`：先校验后幂等）、`:283`（`submit` 委派）、
   `:74`（`into_target`）、`:67`（`profile.timeout`）。
 
