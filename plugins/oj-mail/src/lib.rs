@@ -8,11 +8,12 @@
 //!
 //! 阶段 3 已落：配置解析（`config.rs`，tls 三模式 + `none` fail-closed）与 profile 的
 //! transport 构建（`build_profiles`）。阶段 4 已落：`engine.rs` 的有界队列 + worker 池 +
-//! `FfiFuture` 回传 + 背压（`try_send`）+ graceful drain；本阶段 worker 只走「原始 MIME」
-//! 路（req 的 `raw`），消息组装归阶段 5。
+//! `FfiFuture` 回传 + 背压（`try_send`）+ graceful drain。阶段 5 已落：`message.rs` 的
+//! 请求反序列化 + 结构化 multipart 组装 + `raw` 原文（剥离冲突头）两条投递路。
 
 mod config;
 mod engine;
+mod message;
 #[cfg(test)]
 mod testutil;
 
@@ -320,13 +321,18 @@ mod tests {
     /// fail-loud，绝不静默成功。对「其它用例先行 init」免疫：无论 `MAIL_ENGINE` 是否已装，
     /// 该 key 都不存在 → 必 Err（`init 未调用` / `未知 smtp profile`）。
     ///
+    /// Note（阶段 5）：req 必须是**合法形态**（`from`/`to` 是契约必填，见 `message::SendRequest`）
+    /// ——req 形态错误在 `submit` 期就以 FFI `Err` 返回（先于 profile 判定），那测的是另一条分支。
+    ///
     /// 说明：vtable → 引擎 → 真 transport 的端到端覆盖由 `engine::tests`（真 file transport
     /// 落盘）与阶段 7 的 `oj test` e2e 承担；进程级单例不适合按用例换配置，故此处只钉入口守卫。
     #[tokio::test(flavor = "multi_thread")]
     async fn vtable_submit_fails_loud_without_matching_profile() {
         let mut fut = submit(
             RString::from("不存在的-profile"),
-            RString::from("{}"),
+            RString::from(
+                r#"{"from":"f@example.com","to":["t@example.com"],"raw":"X-Keep: 1\n\nbody"}"#,
+            ),
             RVec::new(),
         );
         let e = drive(&mut fut).await.expect_err("无匹配 profile 必须 Err");
