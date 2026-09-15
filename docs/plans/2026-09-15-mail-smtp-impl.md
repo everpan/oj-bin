@@ -742,7 +742,50 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
    因此 `target/debug` 已有约 **5.6G** 存量产物。
 
 ### 阶段 1 小结
-（待填）
+
+**结论：`mail` 轴契约（vtable 类型 + 类型配对 helper + 宿主探测表）就绪，`ABI_VERSION` 保持 8。**
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `oj-plugin-ffi/src/mail.rs`（新增） | `MailAttachment{filename: RString, mime: RString, bytes: RBytes}`、`MailAxis{submit: extern "C" fn(key, req, atts) -> FfiFuture}`（均 `#[stabby::stabby] #[repr(C)]`）。附件字节由宿主解析后**原样过线**，不经 JSON/base64；方法面演进走 req JSON 字段（同 mq 的 JSON dispatch 思路）。模块注释写明契约形态与 ABI 立场。 |
+| `oj-plugin-ffi/src/lib.rs` | `pub mod mail;` + `pub use mail::{MailAttachment, MailAxis};`（按字母序插在 `kv`/`mq` 之间）。`ABI_VERSION` **未改**。 |
+| `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailAxis) -> *const c_void`；`use crate::{…, MailAxis}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailAxis) -> *const c_void = axis::mail;` 编译期配对断言。 |
+| `src/bridge/plugin_loader.rs` | 三处同改：`AXES` 追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailAxis))`；`Registrations` 增 `pub mail: Option<&'static oj_plugin_ffi::MailAxis>`。 |
+| `src/bridge/plugin_loader/tests.rs` | 新增 `axes_includes_mail_and_probe_branch_is_wired`（`AXES` 含 mail + `Registrations::default().mail.is_none()`）。 |
+
+TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`/`axis::mail`/`Registrations.mail` 未定义），再最小实现转绿。
+
+#### 2. 跑过的测试与结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --release -p oj-plugin-ffi mail_attachment` | **1 passed; 0 failed** |
+| `cargo test --release -p oj-plugin-ffi` | **6 passed**（lib）+ 2（entry_good）+ 1（entry_panicky），0 failed |
+| `cargo test --release -p only-js axes_includes_mail` | **1 passed; 0 failed** |
+| `cargo test --release -p only-js plugin` | **36 passed; 0 failed**（既有探测/清单/扫描/适配器用例无回归） |
+| `cargo fmt --check` | exit 0 |
+| `cargo clippy --release -p oj-plugin-ffi -p only-js --all-targets -- -D warnings` | exit 0，**0 warning / 0 error** |
+
+#### 3. ABI 保持 8 的证据
+
+- `grep -n ABI_VERSION oj-plugin-ffi/src/lib.rs` → `49:pub const ABI_VERSION: u32 = 8;`（未改；本阶段**未触碰**该行）。
+- 未改动任何既有轴的 repr(C) vtable 形状：`mail.rs` 为纯新增文件，`lib.rs` 仅加模块与 re-export，`axis.rs` 仅加 helper 与断言。
+- 宿主侧仅**追加**探测表项/分支/槽位（`Registrations` 是宿主内部结构，非 FFI 类型、不进 ABI）。
+- 沿用 mq 轴先例与 CLAUDE.md 红线「加轴零破坏——既有轴 vtable 形状变更才需要 bump ABI」；存量插件零感知、零重编译。
+
+#### 4. 与计划/指令的偏差（均已按「不弱化断言」处置）
+
+1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `From<&[T]>`（`src/bridge/ffi.rs:493` 注释即此先例）：`RBytes::from(&[0u8, 159, 255][..])`。**断言未动**（`bytes.len() == 3` + filename 回环）。
+2. **无既有测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/server_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言（`ADAPTER_AXES = [es, auth]`），追加 `mail` 自然满足，未改动。
+
+#### 5. 遗留 / 需决策
+
+1. **`probe_axes` 的 `"mail"` 分支尚无端到端证据**。新测试只锁「`AXES` 含 mail + `Registrations` 有槽位」；`unreachable!` 分支要真正被走过，需有插件导出 `oj_plugin_axis_mail` 符号——现实插件在阶段 2。建议阶段 2 仿 `mini-mq` 加 `mini-mail` 夹具（或用真 `oj-mail`）补一条 `probe_finds_mail_axis` 回归，与 `probe_finds_mq_axis_and_zero_axis_mini_misses_it` 同形。
+2. **`helpers_bind_exact_vtable_types` 历史缺口（本阶段引入前既有）**：`axis::mq` 有 helper（`axis.rs:38`）却**未**进该配对断言列表；本次只按任务追加了 `mail`，未越界补 `mq`。是否一并补上由你定——补是零风险（纯编译期断言），但属阶段外改动。
+3. 阶段 0 小结遗留项 2（`src/bridge/mod.rs:339-341` 关于 reqwest 启 ring 的过时注释）与 3（测试夹具 debug profile 产物占用）**本阶段未处理**，仍按原归属。
+
 
 ### 阶段 2 小结
 （待填）
