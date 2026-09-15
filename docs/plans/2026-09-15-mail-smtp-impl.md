@@ -1505,7 +1505,128 @@ body
 
 
 ### 阶段 6 小结
-（待填）
+
+**结论：宿主侧 mail 能力全部落地 —— ops（6 个）、StableState/Extras 注入、权威校验、附件
+字节解析、结果存储 + `deliver` 路由、`Mail`/`mail` JS 全局。`oj-plugin-ffi` 零改动、
+`ABI_VERSION` 保持 8；`bootstrap.js` 保持 7-bit ASCII（0 个非 ASCII 字节）。
+`cargo test --release -p only-js` = **350 + 5 + 1 passed / 0 failed**（lib 由 330 → 350，
+新增 20 条全为本阶段用例；既有 336 无回归）；`-p oj --lib` 156 passed；
+`fmt --check` 与 `clippy --release --all-targets -- -D warnings` 均 exit 0。**
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `src/bridge/mail.rs`（新增，约 940 行 + 700 行测试） | `MailBackend` trait（`:45`，`submit`/`config`/`router`）+ `FfiMailBackend` 适配器（`:312`）；`MailConfig`/`MailProfileCfg`（`:65`，仅非密钥面）；`MailResultStore`（`:156`，限长 + TTL）；`flatten_result`（`:222`）；`MailResultRouter`（`:244`，存 + 同步扇出）；进程级 deliver 槽（`:287`/`:291`/`:297`）；校验（`strip_crlf:373`/`validate_address:379`/`check_whitelist:396`/`normalize_headers:447`）；附件（`parse_attachment_refs:501`/`resolve_mime:564`/`resolve_attachments:627`）；编排 `handle_send:815` + 6 个 op（`:878` 起）。 |
+| `src/bridge/mod.rs` | `mod mail;` + `bridge_ext` 注册 6 个 mail op（`:271` 起）；`StableState.mail`（`:161`）与 `Extras.mail`（`:189`）字段；构造期 `install_mail_deliver`（`:570`）。 |
+| `src/bridge/bus.rs` | `EventBroker::publish_local`（默认 0；`Bus` 实现为 `Bus::publish`）——`deliver` 回调是插件线程上的 `extern "C"`，不能 await。 |
+| `src/bridge/ffi.rs` | `host_deliver` 对 `mail.result` 早退到宿主路由（`:565` 起）；抽出 `fanout_targets`（`:583`）供 `FfiEventBroker::publish_local`（`:707`）复用。 |
+| `src/bridge/module_loader.rs` | `ensure_within` → `pub(crate)` 且**返回 canonical 句柄**（`:367`）；调用点仅丢弃返回值。 |
+| `Cargo.toml` | 新增 `lettre = { version = "0.11", default-features = false }`（**只用 `lettre::Address`**；不拉 smtp-transport/rustls/native-tls，`cargo tree -i rustls` 仍单一 `0.23.40`）。 |
+| `oj/src/app.rs` | 两处结构体字面量补 `mail: None`（阶段 7 装配入口）。 |
+| `src/bridge/bootstrap.js` | 导入 6 个 op + 挂 `globalThis.Mail` / `globalThis.mail`（`:298` 起）。 |
+
+#### 2. 测试与 RED→GREEN 证据（一律 `--release`）
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| 6.1 RED | `cargo test --release -p only-js --lib ensure_within` | **编译失败** `E0599 method not found in '()'` / `E0308 expected '()', found 'PathBuf'`（旧签名返回 `()`） |
+| 6.1 GREEN | 同上 | **1 passed**（canonical 句柄 + `../` 越界/不存在/根外绝对路径三拒绝） |
+| 6.2/6.3 RED | `--lib mail` | **编译失败**：`cannot find type 'MailConfig'/'MailResultRouter'/'ParsedAttachment'`、`cannot find trait 'MailBackend'`、`cannot find value 'MAIL_RESULT_TOPIC'` |
+| 6.2/6.3 GREEN | `--lib mail` | **7 passed**（注入/路由/扇出/限长/TTL/覆盖/扁平化/配置面/vtable 适配） |
+| 6.4 RED | `--lib mail` | **编译失败**：`cannot find function 'strip_crlf'/'validate_address'/'check_whitelist'`… |
+| 6.4 GREEN | `--lib bridge::mail` | **17 passed** |
+| 6.5 RED | `--lib bridge::mail::tests::js_mail` | **FAILED. 0 passed; 3 failed** —— `ReferenceError: mail is not defined` |
+| 6.5 GREEN | `--lib bridge::mail` | **20 passed**（全量 lib 350） |
+| 门禁 | `fmt --check` / `clippy --release --all-targets -- -D warnings` | exit 0（0 warning） |
+| 回归 | `cargo test --release -p only-js` / `-p oj --lib` | 350+5+1 passed / 156 passed，均 0 failed |
+
+**变异验证（3 条，均被现有用例抓住 —— 证明用例真的绑住了行为，非恒真）**：
+
+| 变异 | 结果 |
+|---|---|
+| A. `strip_crlf` 退化为 `s.to_string()` | **FAILED. 17 passed; 3 failed**（`strip_crlf_removes_header_injection`、`handle_send_normalizes_and_dispatches`、JS 端到端） |
+| B. 白名单空表放行（fail-open） | **FAILED. 0 passed; 1 failed**（`whitelist_is_suffix_based_and_fail_closed`） |
+| C. 附件解析结果倒序（下标错位） | **FAILED. 17 passed; 3 failed**（指向解析顺序 3 条用例） |
+
+#### 3. `FfiFuture` 宿主侧驱动方式
+
+**完全复用既有适配器**：`FfiMailBackend::submit`（`mail.rs:330`）调
+`super::ffi::await_ffi(fut)`——与 `FfiEsBackend`（`ffi.rs:225` 起）、`FfiBlobBackend`、
+`FfiDataAccessor`、`FfiEventBroker::publish` **同一份** poll + `yield_now` 驱动，
+经 `FfiGuard` 持有（await 被取消时 Drop 只 `free` 不 `take`，插件任务允许跑完）。
+没有任何新增的跨线程手段：`JsRuntime` 的 `current_thread` 语义与
+「插件 worker 在插件自己的 `multi_thread` runtime」的原分工不变。
+
+#### 4. 校验口径与设计取向（本轮新增的 5 个决策，需 controller 确认）
+
+1. **CRLF 一律「剥离」而非拒绝**（`strip_crlf`，`mail.rs:373`）：design §10 原文即「先剥 `\r\n`」，
+   计划 Task 6.3 的样例断言也是 `sanitize_header("a\r\nBcc: x") == "aBcc: x"`。**地址例外**：
+   `from/to/cc/bcc` 走**拒绝**（`validate_address`，地址没有「含换行的合法值」）；
+   插件侧 `ensure_no_crlf` 是拒绝，两边不冲突——宿主先把头字段消毒，插件看到的永远是干净的。
+   正文（`text`/`html`）与 `raw` 原文**不剥**（换行在正文有语义；raw 的冲突头剥离是插件职责）。
+2. **白名单空表 = 拒绝（fail-closed）**：`allowed_from`/`allowed_recipients` 缺省不放行任何收件人。
+   理由：白名单是「越权发送」的唯一控制点，缺省放行等于把每封邮件都变成开放中继；与本特性
+   `tls: none` 需显式许可同一取向。**影响阶段 7**：`sample/config.yaml` 的 `smtp.mock` profile
+   必须显式写 `allowed_from`/`allowed_recipients`，否则 FileTransport e2e 会（正确地）被拒。
+3. **返回信封 vs 抛异常**：`mail.send/sendSync/enqueue/sendRaw` **一律 resolve** 结果信封
+   （校验/附件/JSON 形态错误 → `{code:5}`；FFI 层失败 → `{code:1,msg:"投递未能送达插件"}），
+   与插件同款 `{code,msg,data}` 形态，JS 侧不需要 try/catch 就能统一判码；**只有「未配置 mail」
+   抛异常**（与 `es not configured` 一致）。
+4. **`enqueue` 的返回值是信封**（`{code:0,data:{jobId}}`，不是裸 `jobId`）：与 send/sendSync
+   同形态；design §5 的 `const jobId = await mail.enqueue(...)` 属示意写法，api-manual（阶段 7.3）
+   按 `res.data.jobId` 写并与 `mail.result(jobId)` 配对。
+5. **宿主按 op 覆写 `sync`/`enqueue_only`**（`handle_send`，`mail.rs:848`）：JS 侧在 `send()` 里
+   夹带 `sync:true` 不会改变 transport 选择（否则 `send`/`sendSync` 的区分形同虚设）。
+
+#### 5. 附件顺序对齐与越界拒绝的实证
+
+- **下标对齐**：宿主 `resolve_attachments` 按 `refs` 原序 push（`mail.rs:627`），
+  `FfiMailBackend::submit` 按同序 push 进 `RVec<MailAttachment>`（`:337`）；用例断言
+  `attachments=[{path:b.pdf},{blobKey:a.bin}]` 时 `atts[0].filename=="b.pdf"`、
+  `atts[1].filename=="a.bin"`（含 blob 侧非 UTF-8 字节 `BLOBBYTES` 原样过线、显式 mime 覆盖嗅探值），
+  JS 端到端用例同断言；变异 C 证明错序必被抓。
+- **越界拒绝**：`{path}` 先 `ensure_within(p, project_root)`（双侧 canonicalize，覆盖符号链接），
+  **并按返回的 canonical 句柄 `fs::read`**（校验路径 ≡ 读盘路径，design §9 TOCTOU）；
+  `../outside.txt` → `{code:5}`「附件路径非法：… escapes project root（下一步：把附件放到项目根内）」
+  （`resolve_attachments_reads_blob_and_path_in_declared_order`）；`module_loader` 用例另证
+  `../` 与根外绝对路径被拒。无 loader（无 project root）时 `{path}` 附件明确报错。
+
+#### 6. `bootstrap.js` 7-bit ASCII 证据
+
+```bash
+$ python3 -c "d=open('src/bridge/bootstrap.js','rb').read(); print(sum(1 for b in d if b>127), len(d))"
+0 23023
+```
+
+且 `BRIDGE_ESM` 用 `ascii_str_include!` 内嵌（非 ASCII 会**编译期**失败）——本阶段
+`cargo build/clippy/test` 全部通过即第二重证据。JS 侧注释一律英文。
+
+#### 7. 提交
+
+| SHA | 信息 |
+|---|---|
+| `028f73e` | `refactor(loader): ensure_within 提 pub(crate) 并返回 canonical 句柄` |
+| `3111477` | `feat(bridge): MailBackend + StableState/Extras.mail + 结果存储与 deliver 路由` |
+| `497fcd5` | `feat(bridge): mail ops + 宿主权威校验 + 附件字节解析` |
+| `3f6b57a` | `feat(bridge): Mail/mail JS 全局（7-bit ASCII）` |
+
+#### 8. 遗留 / 交给阶段 7（不阻塞本阶段）
+
+1. **装配**（Task 7.1）：`oj/src/app.rs` 两处仍为 `mail: None`；需按 `smtp:` 段 + `oj-mail` 插件
+   构造 `MailConfig::from_value(&cfg)` + `FfiMailBackend::new(vtable, config, bus)` 注入 `Extras.mail`
+   （`bus` 必须与 `Extras.bus` 同一实例，否则 `mail.result` 扇出到不了 JS 订阅者）。
+   注意 `oj/src/app.rs:676` 的 `StableState` 字面量（测试运行时注入路径）也要同源注入。
+2. **宿主校验与插件一致性回归**：插件 `message.rs::envelope_of` 对 `from/to` 用 `Address` 解析
+   （不接受 `Name <a@b>` 显示名），宿主同用 `Address` —— 阶段 8 用一条 e2e 固化「宿主放行 ≡ 插件放行」。
+3. **`headers` 名字校验**：宿主只做「剥 CRLF + 禁覆盖结构化头」，ASCII/`:`/空格等合法性仍由插件
+   `HeaderName::new_from_ascii` 兜底（纵深防御，未在宿主重复）。
+4. **`mail.result` 结果只存不推远端 broker**：`route` 走 `publish_local`（同步本地扇出）。
+   分布式 bus（kafka/rabbit）下 JS `bus.subscribe("mail.result")` 走 `FfiEventBroker::publish_local`
+   → `DELIVER_TARGETS`，本地订阅者可收；**跨进程**订阅者收不到（设计 §6 的
+   `EventBroker::publish(...).await` 需 async 上下文，而 `deliver` 回调是同步 `extern "C"`）。
+   phase 8 若要跨进程反馈，需另立「异步转发任务」方案（当前 YAGNI，已记录）。
+5. **`HostContext.log` 上送**（阶段 5 遗留）不在本阶段范围，仍未接。
 
 ### 阶段 7 小结
 （待填）
