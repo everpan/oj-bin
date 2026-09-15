@@ -1,0 +1,661 @@
+# Mail SMTP（lettre）插件 Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: 用 superpowers:executing-plans 逐任务执行本计划。每阶段结束更新任务状态（TaskUpdate）并写「阶段小结」。
+
+**Goal:** 以 cdylib 插件 `oj-mail` 新增 `mail` 轴，向 JS 提供 `Mail`/`mail` 全局，支持多 profile 的同步/异步 SMTP 发送、队列线程池与双通道反馈。
+
+**Architecture:** 宿主（核心 `src/bridge/`）负责配置装配、入参校验、附件字节解析、bus 发布、结果存储与 JS 全局挂载；插件（`plugins/oj-mail`）持 `lettre`、连接池、有界队列 + worker 池并实际投递；二者经 `oj-plugin-ffi` 的 `MailAxis`（repr(C) + `FfiFuture`）契约通信。
+
+**Tech Stack:** Rust 2024 · deno_core `#[op2]` · `oj-plugin-ffi`（stabby repr(C) + `FfiFuture`）· `lettre`（rustls/tokio1）· `rustls = "=0.23.40"` + aws-lc-rs · tokio。
+
+**设计依据:** `docs/plans/2026-09-15-mail-smtp-design.md`（v3）。
+
+---
+
+## 全局约定（每个任务都遵守）
+
+- **TDD 循环**：先写失败测试 → 跑测试确认失败（记下报错） → 写最小实现 → 跑测试确认通过 → 提交。
+- **命令**（项目禁 debug）：
+  - 单测：`cargo test --release -p <crate> <filter>`
+  - 门禁：`cargo fmt --check` + `cargo clippy --release --all-targets -- -D warnings`
+  - 插件：`cargo xtask plugin mail` / `cargo xtask plugin mail --check`
+- **SOLID 落地**：`MailAxis`（接口）与 `oj-mail`（实现）分离；宿主 `MailBackend` trait 隔离 FFI 细节（依赖倒置）；每个 profile 一个 `MailProfile`（单一职责）；校验/附件解析/发送/存储各自独立函数（可组合）。
+- **每阶段收尾**：跑本阶段全部测试 + `fmt`/`clippy`；`TaskUpdate` 标记完成；在计划文件末尾追加「阶段小结」（改了什么、测试结果、遗留）。
+- **提交粒度**：每任务一次 `git commit`（中文信息，`type(scope): …`）。
+
+---
+
+## 阶段 0：准备与基线（先验编译，防返工）
+
+### Task 0.1：验证 `lettre` + `rustls 0.23.40` + aws-lc-rs 兼容（spike）
+
+**Files:**
+- Modify: `plugins/oj-mail/Cargo.toml`（临时最小 crate，或先建后删的 `tools/spike-mail`）
+
+**Step 1: 建最小 crate 并加依赖**
+
+```toml
+[dependencies]
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "rustls-tls", "hostname", "pool"] }
+rustls = "=0.23.40"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+**Step 2: 写最小发送代码并编译**
+
+```rust
+// 仅编译期验证：不真发信
+fn _spike() {
+    let _t = lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay("smtp.example.com")
+        .unwrap()
+        .build();
+}
+```
+
+Run: `cargo build --release -p <spike-crate>`
+Expected: 编译通过。**若报 `rustls` 版本冲突 / `CryptoProvider` 相关错误** → 用 `cargo tree -i rustls` 核对，必要时 `cargo update -p rustls --precise 0.23.40` 收敛；若 provider 冲突（ring vs aws-lc-rs），确认 lettre 走 aws-lc-rs。
+
+**Step 3: 记录结论到本计划「阶段 0 小结」并提交**
+
+```bash
+git add -A && git commit -m "chore(mail): spike 验证 lettre+rustls0.23.40 兼容"
+```
+
+### Task 0.2：建隔离 worktree 与基线
+
+```bash
+cargo test --release -p only-js --lib        # 基线绿
+cargo test --release -p oj --lib             # 基线绿
+```
+
+**阶段 0 小结**（追加）：lettre 版本与 feature 定稿；rustls provider 结论；基线测试数。
+
+---
+
+## 阶段 1：FFI 契约（`oj-plugin-ffi`）
+
+### Task 1.1：`MailAttachment` + `MailAxis` repr(C) 类型
+
+**Files:**
+- Create: `oj-plugin-ffi/src/mail.rs`
+- Modify: `oj-plugin-ffi/src/lib.rs`（`pub mod mail;` + `pub use mail::{MailAxis, MailAttachment};`）
+
+**Step 1: 写失败测试**（`oj-plugin-ffi/src/mail.rs` 底部 `#[cfg(test)]`）
+
+```rust
+#[test]
+fn mail_attachment_roundtrips_bytes_without_base64() {
+    let a = MailAttachment { filename: RString::from("a.pdf"), mime: RString::from("application/pdf"), bytes: RBytes::from(vec![0u8, 159, 255]) };
+    assert_eq!(a.bytes.len(), 3);            // 字节原样，不编码
+    assert_eq!(std::convert::Into::<String>::into(a.filename.clone()), "a.pdf");
+}
+```
+
+Run: `cargo test --release -p oj-plugin-ffi mail_attachment`
+Expected: FAIL（`MailAttachment` 未定义，编译失败）
+
+**Step 2: 最小实现**
+
+```rust
+//! mail 轴 vtable（新增轴，ABI 不变——spec「加轴零破坏」）。
+use crate::{FfiFuture, RBytes, RString, RVec};
+
+/// 附件：宿主解析后的**原始字节**（非 base64），插件直接喂 lettre。
+#[stabby::stabby]
+#[repr(C)]
+pub struct MailAttachment {
+    pub filename: RString,
+    pub mime: RString,
+    pub bytes: RBytes,
+}
+
+/// mail 轴：`submit` 统一入口，行为由 req JSON 的 `sync`/`enqueue_only`/`raw` 决定。
+/// ok 值 = 结果信封 JSON；`enqueue_only` 时 future 立即回 `{"jobId": "..."}`，
+/// 真实完成经 `HostContext.deliver("mail.result", ...)` 上送。
+#[stabby::stabby]
+#[repr(C)]
+pub struct MailAxis {
+    pub submit: extern "C" fn(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture,
+}
+```
+
+**Step 3: 跑测试** → PASS。
+
+**Step 4: 提交** `feat(ffi): 新增 mail 轴 vtable + MailAttachment`
+
+### Task 1.2：`axis::mail` 类型配对 helper
+
+**Files:** Modify: `oj-plugin-ffi/src/axis.rs`
+
+**Step 1: 失败测试**（追加到现有 `helpers_bind_exact_vtable_types`）
+
+```rust
+let _: fn(&'static MailAxis) -> *const c_void = axis::mail;
+```
+
+Run: `cargo test --release -p oj-plugin-ffi helpers_bind_exact_vtable`
+Expected: FAIL（`axis::mail` 不存在）
+
+**Step 2: 实现**
+
+```rust
+pub fn mail(vt: &'static MailAxis) -> *const c_void { vt as *const _ as *const c_void }
+```
+并在 `use crate::{...}` 补 `MailAxis`。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交**
+
+### Task 1.3：宿主 `AXES` / `probe_axes` / `Registrations` 加 `mail`（**不 bump ABI**）
+
+**Files:** Modify: `src/bridge/plugin_loader.rs`
+
+**Step 1: 失败测试**（`src/bridge/plugin_loader/tests.rs` 或同文件 tests）
+
+```rust
+#[test]
+fn axes_includes_mail_and_probe_branch_is_wired() {
+    assert!(AXES.contains(&"mail"));
+    // Registrations 含 mail 字段（编译期即可断言）
+    let r = Registrations::default();
+    assert!(r.mail.is_none());
+}
+```
+
+Run: `cargo test --release -p only-js axes_includes_mail`
+Expected: FAIL
+
+**Step 2: 实现**（三处同改，缺一即 panic/不可见）
+
+```rust
+pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail"];
+// probe_axes match 增：
+"mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailAxis) }),
+// Registrations 增字段：
+pub mail: Option<&'static oj_plugin_ffi::MailAxis>,
+```
+
+**Step 3: 跑测试** → PASS；再跑 `cargo test --release -p only-js plugin`。
+
+**Step 4: 确认 ABI 未变**
+
+Run: `grep -n ABI_VERSION oj-plugin-ffi/src/lib.rs`
+Expected: 仍为 `8`（新增轴零破坏，不 bump）。
+
+**Step 5: 提交** `feat(plugin): 宿主 AXES/probe_axes/Registrations 支持 mail 轴（ABI 不变）`
+
+**阶段 1 小结**：契约类型、helper、宿主轴表就绪；ABI 保持 8。
+
+---
+
+## 阶段 2：插件骨架 `oj-mail`
+
+### Task 2.1：crate 骨架 + `oj_plugin_entry!` + descriptor
+
+**Files:**
+- Create: `plugins/oj-mail/Cargo.toml`
+- Create: `plugins/oj-mail/src/lib.rs`
+- Modify: `Cargo.toml`（`members` 增 `"plugins/oj-mail"`）
+
+**Step 1: Cargo.toml**（镜像 `plugins/oj-kv-redis/Cargo.toml`）
+
+```toml
+[package]
+name = "oj-mail"
+version = "0.1.0"
+edition = "2024"
+description = "mail 轴：lettre SMTP 发送（队列线程池 + FfiFuture）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
+lettre = { version = "0.11", default-features = false, features = ["builder","smtp-transport","tokio1","tokio1-rustls-tls","rustls-tls","hostname","pool","file-transport"] }
+rustls = "=0.23.40"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread","sync","time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread","sync","time","macros"] }
+```
+
+**Step 2: 失败测试** — 插件侧无宿主测试框架，改用「符号存在 + 预检」：
+
+Run: `cargo xtask plugin mail --check`
+Expected: FAIL（插件未构建/缺符号）
+
+**Step 3: 最小实现 lib.rs**
+
+```rust
+//! oj-mail：mail 轴 cdylib 插件（lettre SMTP）。宿主负责配置/校验/附件字节解析/bus；
+//! 本插件负责连接池、有界队列 + worker 池、投递，经 FfiFuture/deliver 回传。
+use oj_plugin_ffi::{MailAxis, PluginDescriptor, RResult, RString, FfiFuture, RVec, MailAttachment, HOST_FINGERPRINT};
+
+fn init(_host: oj_plugin_ffi::RArc<oj_plugin_ffi::HostContext>, cfg: RString)
+    -> RResult<PluginDescriptor, RString> {
+    // 阶段 3 起在此解析 cfg 建 MailEngine
+    let _ = cfg;
+    Ok(PluginDescriptor {
+        name: RString::from("oj-mail"),
+        semver: RString::from(env!("CARGO_PKG_VERSION")),
+        abi_version: oj_plugin_ffi::ABI_VERSION,
+        fingerprint: RString::from(HOST_FINGERPRINT),
+        desc: RString::from("mail 轴：lettre SMTP 发送（多 profile + 队列线程池）"),
+    })
+}
+
+extern "C" fn submit(_key: RString, _req: RString, _atts: RVec<MailAttachment>) -> FfiFuture {
+    oj_plugin_ffi::ready_err("oj-mail: submit not implemented")
+}
+
+static MAIL_VTABLE: MailAxis = MailAxis { submit };
+
+oj_plugin_ffi::oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VTABLE));
+```
+
+**Step 4: 跑预检** → `cargo xtask plugin mail --check` PASS（ABI 8 / 身份 / semver / 符号齐）。
+
+**Step 5: 提交** `feat(mail): oj-mail 插件骨架（cdylib + mail 轴符号）`
+
+**阶段 2 小结**：插件可构建、可预检、`mail` 轴符号可见。
+
+---
+
+## 阶段 3：配置解析与 transport 构建（插件）
+
+### Task 3.1：`MailConfig` 解析 + `MailProfile` 构建（含 tls 三模式）
+
+**Files:** Create: `plugins/oj-mail/src/config.rs`（`mod config;` 接入 lib.rs）
+
+**Step 1: 失败测试**
+
+```rust
+#[test]
+fn parses_profiles_and_tls_modes() {
+    let cfg = r#"{"workers":2,"queue_capacity":8,"default":{"host":"h","port":465,"tls":"tls","mechanism":"login","user":"u","pass":"p","timeout":5}}"#;
+    let c = MailConfig::parse(cfg).unwrap();
+    assert_eq!(c.workers, 2);
+    assert_eq!(c.profiles["default"].port, 465);
+    assert_eq!(c.profiles["default"].tls, TlsMode::Tls);
+    assert!(MailConfig::parse(r#"{"default":{"host":"h","port":25,"tls":"none"}}"#).is_err()); // none 未显式允许
+}
+```
+
+Run: `cargo test --release -p oj-mail parses_profiles_and_tls_modes`
+Expected: FAIL
+
+**Step 2: 实现**
+
+```rust
+#[derive(Deserialize)] pub struct MailConfig { #[serde(default = "default_workers")] pub workers: usize, #[serde(default = "default_cap")] pub queue_capacity: usize, #[serde(flatten)] pub profiles: HashMap<String, ProfileCfg> }
+#[derive(Deserialize, Clone, PartialEq)] #[serde(rename_all="lowercase")] pub enum TlsMode { Tls, Starttls, None }
+#[derive(Deserialize, Clone)] pub struct ProfileCfg { pub host: String, pub port: u16, pub tls: TlsMode, #[serde(default)] pub allow_none_tls: bool, pub mechanism: Mechanism, pub user: Option<String>, pub pass: Option<String>, pub xoauth2: Option<XOAuth2Cfg>, #[serde(default = "default_timeout")] pub timeout: u64, #[serde(default)] pub file_transport: Option<String> }
+```
+`parse` 内：`tls == None && !allow_none_tls` → Err（fail-closed）。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(mail): 配置解析与 tls 模式（none 需显式允许）`
+
+### Task 3.2：transport 构建 + rustls provider install 时序
+
+**Files:** Modify: `plugins/oj-mail/src/lib.rs`（`build_profiles`）
+
+**Step 1: 失败测试**（用 FileTransport 免网络）
+
+```rust
+#[test]
+fn builds_profiles_and_installs_rustls_provider() {
+    init_provider(); // 幂等
+    let p = build_profile(&demo_cfg_with_file_transport()).unwrap();
+    assert!(p.async.is_some() || p.sync.is_some());
+}
+```
+
+Run: `cargo test --release -p oj-mail builds_profiles_and_installs_rustls_provider`
+Expected: FAIL
+
+**Step 2: 实现**（init 内先 install，再建 transport）
+
+```rust
+fn init_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default(); // 幂等
+}
+fn build_profile(c: &ProfileCfg) -> Result<MailProfile, String> {
+    // file_transport：AsyncFileTransport/SmtpTransport::builder_dangerous 指向目录（测试用）
+    // tls=tls：AsyncSmtpTransport::relay(host)?.port(port).tls(Tls::Wrapper(...))
+    // tls=starttls：Tls::Required(...)；none：Tls::None（仅 allow_none_tls）
+    // credentials：login → Credentials::new(user, pass)；xoauth2 → Credentials::from_xoauth2
+}
+```
+
+**Step 3: 跑测试** → PASS（验证不 panic「no provider」）。 **Step 4: 提交** `feat(mail): transport 构建 + rustls provider 时序`
+
+**阶段 3 小结**：配置→profile 通路可用；provider 时序经测试钉死。
+
+---
+
+## 阶段 4：有界队列 + worker 池 + FfiFuture + 背压 + drain（插件）
+
+### Task 4.1：`MailEngine`（有界 mpsc + N worker），`submit` 经 FfiFuture 回结果
+
+**Files:** Create: `plugins/oj-mail/src/engine.rs`
+
+**Step 1: 失败测试**
+
+```rust
+#[tokio::test(flavor="multi_thread", worker_threads=2)]
+async fn submit_through_queue_resolves_with_envelope() {
+    let eng = MailEngine::new(test_profile(), 2, 8);
+    let out = eng.submit_blocking("default", req_json_ok(), vec![]).await.unwrap();
+    assert_eq!(out["code"], 0);
+}
+```
+
+Run: `cargo test --release -p oj-mail submit_through_queue`
+Expected: FAIL
+
+**Step 2: 实现**
+
+```rust
+pub struct MailEngine { tx: tokio::sync::mpsc::Sender<Job>, rt: tokio::runtime::Runtime }
+// Job { key, req, atts, respond: Option<oneshot::Sender<Envelope>>, enqueue_only, job_id }
+// new(): 建 multi_thread Runtime；起 workers 个循环 recv→build_message→timeout(send)→回传
+// submit→ FfiFuture（spawn_ffi_future 包装：oneshot 收结果）；enqueue_only 立即回 jobId
+```
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(mail): 有界队列 + worker 池（FfiFuture 回结果）`
+
+### Task 4.2：背压（`try_send` 满即回 code:4）+ graceful drain
+
+**Files:** Modify: `plugins/oj-mail/src/engine.rs`
+
+**Step 1: 失败测试**
+
+```rust
+#[tokio::test(flavor="multi_thread")]
+async fn full_queue_returns_code4_without_blocking() {
+    let eng = MailEngine::new(slow_profile(), 1, 1);
+    let _h1 = eng.enqueue_async("default", req_json_ok(), vec![]); // 占满
+    let e = eng.submit_now("default", req_json_ok(), vec![]).unwrap_err();
+    assert!(e.contains("\"code\":4") || e.contains("queue full"));
+}
+
+#[tokio::test(flavor="multi_thread")]
+async fn shutdown_drains_inflight_then_stops() {
+    let eng = MailEngine::new(test_profile(), 2, 8);
+    eng.enqueue_async("default", req_json_ok(), vec![]);
+    eng.shutdown(Duration::from_secs(5)); // 等在途完成，drop runtime
+}
+```
+
+Run: `cargo test --release -p oj-mail full_queue_returns_code4` / `shutdown_drains`
+Expected: FAIL
+
+**Step 2: 实现**：`tx.try_send` 失败 → 返回 `{"code":4,"msg":"queue full"}`；`shutdown`：发停机信号 → 等待 tx 关闭且 worker join → drop runtime。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(mail): 背压(try_send) 与 graceful drain`
+
+**阶段 4 小结**：队列/线程池/背压/drain 经测试钉死。
+
+---
+
+## 阶段 5：消息组装 + 附件 + sendRaw 冲突头（插件）
+
+### Task 5.1：`SendRequest` 反序列化 + multipart 组装（text/html/附件）
+
+**Files:** Create: `plugins/oj-mail/src/message.rs`
+
+**Step 1: 失败测试**
+
+```rust
+#[test]
+fn builds_multipart_with_html_and_attachment_bytes() {
+    let m = build_message(&req_with_html_and_att(), &[att("a.pdf","application/pdf",b"%PDF-1.4")]).unwrap();
+    let s = String::from_utf8(m.formatted()).unwrap();
+    assert!(s.contains("multipart/alternative") && s.contains("a.pdf"));
+    assert!(s.contains("JVBERi0xLjQ") == false); // 附件是原始字节，非 base64 文本流
+}
+```
+
+Run: `cargo test --release -p oj-mail builds_multipart`
+Expected: FAIL
+
+**Step 2: 实现**：`#[serde(rename="blobKey")]`；`Message::builder().from(addr?)...multipart(MultiPart::alternative().singlepart(text).singlepart(html))`；附件 `Attachment::new(filename).body(bytes, mime.parse().unwrap())`。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(mail): SendRequest 反序列化与 multipart 组装`
+
+### Task 5.2：`sendRaw` 剥离冲突头（防双收件人/spoof）
+
+**Files:** Modify: `plugins/oj-mail/src/message.rs`
+
+**Step 1: 失败测试**
+
+```rust
+#[test]
+fn raw_strips_from_to_cc_bcc_subject_headers() {
+    let raw = "From: evil@x\nTo: victim@x\nSubject: s\nX-Keep: 1\n\nbody";
+    let m = build_raw(&envelope_from_to(), raw, &[]).unwrap();
+    let s = String::from_utf8(m.formatted()).unwrap();
+    assert!(s.contains("X-Keep: 1") && s.contains("body"));
+    assert_eq!(s.matches("evil@x").count(), 0);           // 原文 From 被剥离
+    assert_eq!(s.matches("victim@x").count(), 0);         // 原文 To 被剥离（防双收件人）
+}
+```
+
+Run: `cargo test --release -p oj-mail raw_strips`
+Expected: FAIL
+
+**Step 2: 实现**：按行扫描 header 区（首个空行前），丢弃 `From/To/Cc/Bcc/Subject`（大小写不敏感），余下保留。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(mail): sendRaw 剥离冲突头`
+
+**阶段 5 小结**：消息组装与 raw 安全处理就绪。
+
+---
+
+## 阶段 6：宿主 ops + StableState + 校验 + 附件解析 + 结果存储 + JS 全局
+
+### Task 6.1：`ensure_within` 提为 `pub(crate)`
+
+**Files:** Modify: `src/bridge/module_loader.rs:367`
+
+**Step 1: 失败测试** — 在 `src/bridge/mail.rs` 先写引用它的测试（见 6.2），或直接改可见性后靠 6.2 覆盖。
+**Step 2: 实现**：`fn ensure_within` → `pub(crate) fn ensure_within`。
+**Step 3:** `cargo build --release -p only-js` PASS。
+**Step 4: 提交** `refactor(loader): ensure_within 提 pub(crate) 供 mail 附件钳制`
+
+### Task 6.2：`StableState`/`Extras` 增 `mail` 字段 + `MailBackend` 包装 + 构造注入
+
+**Files:** Modify: `src/bridge/mod.rs`
+
+**Step 1: 失败测试**
+
+```rust
+#[test]
+fn stable_state_exposes_mail_field() {
+    let b = Bridge::with_dbs_and_loader_in_memory_with_mail(Some(fake_mail_backend()));
+    // 或对 StableState 直接断言字段存在（编译期）
+}
+```
+
+Run: `cargo test --release -p only-js stable_state_exposes_mail`
+Expected: FAIL
+
+**Step 2: 实现**：`pub struct StableState { …, pub mail: Option<Arc<dyn MailBackend>> }`；`Extras` 同；`with_dbs_and_loader` 增参或 `Extras.mail` 透传；`MailBackend` trait（`send/enqueue/result` 语义经 vtable）。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(bridge): StableState/Extras 注入 mail 后端`
+
+### Task 6.3：`src/bridge/mail.rs` ops + bootstrap 全局
+
+**Files:** Create: `src/bridge/mail.rs`；Modify: `src/bridge/mod.rs`（`mod mail;` + extension ops 注册）、`src/bridge/bootstrap.js`
+
+**Step 1: 失败测试**（宿主侧纯函数优先——SOLID 可测）
+
+```rust
+#[test]
+fn strips_crlf_and_rejects_bad_address() {
+    assert_eq!(sanitize_header("a\r\nBcc: x"), "aBcc: x");
+    assert!(validate_addr("not-an-addr").is_err());
+}
+#[test]
+fn whitelist_enforced() {
+    let cfg = mail_cfg_with(allowed_from=["noreply@x.com"], allowed_recipients=["@x.com"]);
+    assert!(check_whitelist("noreply@x.com", &["a@x.com"], &cfg).is_ok());
+    assert!(check_whitelist("evil@y.com", &["a@x.com"], &cfg).is_err());
+}
+```
+
+Run: `cargo test --release -p only-js crlf` / `whitelist_enforced`
+Expected: FAIL
+
+**Step 2: 实现**
+- `#[op2(async)] fn op_mail_send(state, key, req_json) -> Result<serde_json::Value, JsErrorBox>`：取 `StableState.mail` → 校验 → 解析附件（`blobs.get(name)?.get(k).await` / `ensure_within`+`fs::read`）→ 造 `RVec<MailAttachment>` → `submit` → await。
+- `op_mail_send_sync`（`req.sync=true`）、`op_mail_enqueue`、`op_mail_result`、`op_mail_send_raw`、`op_mail_profiles`。
+- `MailResultStore`（`DashMap` + 限长/TTL）；`deliver("mail.result")` 路由：存 + 本地 bus 扇出。
+- `bootstrap.js`：
+
+```js
+globalThis.Mail = class {
+  constructor(key = "default") { this.key = key; }
+  send(m)     { return op_mail_send(this.key, JSON.stringify(m)); }
+  sendSync(m) { return op_mail_send_sync(this.key, JSON.stringify(m)); }
+  enqueue(m)  { return op_mail_enqueue(this.key, JSON.stringify(m)); }
+  result(id)  { return op_mail_result(this.key, id); }
+  sendRaw(o)  { return op_mail_send_raw(this.key, JSON.stringify(o)); }
+};
+globalThis.mail = new Mail("default");
+```
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(bridge): mail ops + Mail/mail 全局 + 校验/附件解析`
+
+**阶段 6 小结**：宿主侧 ops、校验、附件解析、结果存储、JS 全局就绪。
+
+---
+
+## 阶段 7：装配与端到端
+
+### Task 7.1：`server_cmd` 装配 mail 插件与后端注入
+
+**Files:** Modify: `oj/src/server_cmd.rs`（`assemble_plugins` / `build_registries`）、`oj/src/app.rs`（`Extras.mail`）、`oj/src/build_cmd.rs`（内省 `Extras`）
+
+**Step 1: 失败测试**
+
+```rust
+#[tokio::test]
+async fn server_assembles_mail_backend_from_plugins() {
+    // 用 sample 的 smtp.mock（file_transport）profile
+}
+```
+
+Run: `cargo test --release -p oj server_assembles_mail`
+Expected: FAIL
+
+**Step 2: 实现**：`plugins:` 段透传 `smtp:` cfg 给 `oj-mail`；宿主另解析非密钥面为 `MailConfig`；把 `Registrations.mail` 包成 `Arc<dyn MailBackend>` 注入 `Extras.mail`。
+
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(server): 装配 mail 插件与后端`
+
+### Task 7.2：FileTransport 端到端（`oj test` / `oj build` 冒烟）
+
+**Files:** Create: `oj/tests/mail_e2e.rs`；Modify: `sample/config.yaml`（`smtp.mock` profile）
+
+**Step 1: 失败测试**
+
+```rust
+#[tokio::test] async fn mail_send_writes_eml_and_returns_envelope() {
+    // 起内省/测试 bridge，注入 smtp.mock(file_transport=tempdir)
+    // await mail.send({from,to,subject,text}); 断言 tempdir 有 .eml 且含 Subject/To；信封 code==0
+}
+```
+
+Run: `cargo test --release -p oj --test mail_e2e`
+Expected: FAIL
+
+**Step 2: 实现/接线**（并按 `job_id` 命名 .eml 防并发竞态）。
+**Step 3: 跑测试** → PASS。 **Step 4: 提交** `test(mail): FileTransport 端到端`
+
+### Task 7.3：xtask/CI 覆盖 + CHANGELIST + 文档
+
+**Files:** Modify: `tools/xtask/src/main.rs`（插件列表含 mail）、`.github/workflows/plugin-matrix.yml`、`CHANGELIST.md`、`README.md`/`docs/devkit/api-manual.md`
+
+**Step 1:** `cargo xtask plugin mail --check` PASS。
+**Step 2:** `plugin-matrix.yml` 增 `oj-mail`。
+**Step 3:** CHANGELIST 记 v0.1.20 特性；api-manual 补 `Mail`/`mail` 用法。
+**Step 4: 提交** `docs(mail): CHANGELIST/api-manual/CI 覆盖`
+
+**阶段 7 小结**：端到端可用；CI 与文档齐。
+
+---
+
+## 阶段 8：加固与验收
+
+### Task 8.1：安全回归用例（注入/越权/脱敏/none TLS）
+
+**Files:** Modify: `src/bridge/mail.rs`（tests）、`oj/tests/mail_e2e.rs`
+
+用例：`subject`/`headers` 含 CRLF 被剥离；`to` 越出 `allowed_recipients` 拒（code:5）；`none` TLS 未显式允许拒；bus 反馈 payload 不含 `to/subject`；`{path}` 越界（`../`）拒。
+
+### Task 8.2：门禁与跨平台
+
+```bash
+cargo fmt --check
+cargo clippy --release --all-targets -- -D warnings
+cargo test --release --workspace
+cargo xtask smoke --bin bin/oj
+```
+Windows 路径复用既有 `strip_verbatim` 逻辑；确认无新增跨平台风险点。
+
+### Task 8.3：终审
+
+- 逐条对照 design v3 §10/§11 的安全项与本计划测试；
+- 三专家评审遗留项（Med）逐条确认已处置或显式延期并记录。
+
+**Step: 提交** `chore(mail): 安全回归与门禁验收`
+
+**阶段 8 小结**：门禁全绿；安全项闭合；遗留延期清单。
+
+---
+
+## 阶段汇总表
+
+| 阶段 | 交付 | 关键验收 |
+|---|---|---|
+| 0 | spike 结论 + 基线 | lettre+rustls0.23.40 编译通过 |
+| 1 | FFI 契约 + 宿主轴表 | `AXES` 含 mail；ABI 仍为 8 |
+| 2 | `oj-mail` 骨架 | `xtask plugin mail --check` 通过 |
+| 3 | 配置 + transport | tls 三模式；provider 时序测试 |
+| 4 | 队列/worker/背压/drain | 满队列 code:4；shutdown drain |
+| 5 | 消息组装 + raw | multipart + 冲突头剥离 |
+| 6 | 宿主 ops + 全局 | CRLF/白名单/附件解析测试 |
+| 7 | 装配 + e2e + 文档 | FileTransport e2e 绿；CI 覆盖 |
+| 8 | 加固 + 门禁 | workspace 全绿；安全项闭合 |
+
+---
+
+## 阶段小结（执行时逐条追加）
+
+### 阶段 0 小结
+（待填）
+
+### 阶段 1 小结
+（待填）
+
+### 阶段 2 小结
+（待填）
+
+### 阶段 3 小结
+（待填）
+
+### 阶段 4 小结
+（待填）
+
+### 阶段 5 小结
+（待填）
+
+### 阶段 6 小结
+（待填）
+
+### 阶段 7 小结
+（待填）
+
+### 阶段 8 小结
+（待填）
