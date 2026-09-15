@@ -1,4 +1,4 @@
-# 设计文档：lettre SMTP 绑定（v0.1.20，插件实现）
+# 设计文档：lettre SMTP 绑定（v0.1.19，插件实现）
 
 - 日期：2026-09-15（初稿）→ v2（依架构师/工程师/安全工程师评审）→ **v3（自洽性总检，按真实代码事实校正）**
 - 状态：已脑暴 + 三方评审 + 自洽复核，待实现
@@ -184,4 +184,4 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 ## 14. 里程碑
 
-纳入 **v0.1.20**：①`oj-plugin-ffi` 增 `MailVtable`/`MailAttachment` + `AXES`/`probe_axes`/`Registrations` 加 `"mail"` + `axis::mail`（ABI 保持 8）；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。
+纳入 **v0.1.19**：①`oj-plugin-ffi` 增 `MailVtable`/`MailAttachment` + `AXES`/`probe_axes`/`Registrations` 加 `"mail"` + `axis::mail`（ABI 保持 8）；②`plugins/oj-mail`（lettre + MailEngine + vtable）；③宿主 `src/bridge/mail.rs` ops + `StableState`/`Extras` 加 `mail` 字段 + `bootstrap.js` 挂载；④配置装配 + 附件宿主解析 + CRLF/白名单加固；⑤队列线程池双通道反馈 + 超时/背压/脱敏；⑥单测 + FileTransport e2e + `xtask plugin mail --check`。
