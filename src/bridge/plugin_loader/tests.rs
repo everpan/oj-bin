@@ -399,10 +399,11 @@ fn probe_finds_mq_axis_and_zero_axis_mini_misses_it() {
     assert_eq!(mmq.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
 }
 
-/// mail 轴已登记进宿主探测表：`AXES` 含 "mail" 且 `Registrations` 有对应槽位。
-/// 二者与 `probe_axes` 的 match 分支必须同加（:456 `unreachable!` 防两表失步）。
+/// mail 轴已登记进宿主：`AXES` 含 "mail" 且 `Registrations` 有对应槽位。
+/// 注意本用例**不覆盖** `probe_axes` 的 `"mail"` 臂——那需要真有插件导出
+/// `oj_plugin_axis_mail` 符号（见阶段 2 的 mail 夹具）。
 #[test]
-fn axes_includes_mail_and_probe_branch_is_wired() {
+fn axes_and_registrations_wire_mail() {
     assert!(AXES.contains(&"mail"));
     // Registrations 含 mail 字段（编译期即可断言）
     let r = Registrations::default();

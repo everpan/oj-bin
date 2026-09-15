@@ -751,9 +751,10 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
 |---|---|
 | `oj-plugin-ffi/src/mail.rs`（新增） | `MailAttachment{filename: RString, mime: RString, bytes: RBytes}`、`MailAxis{submit: extern "C" fn(key, req, atts) -> FfiFuture}`（均 `#[stabby::stabby] #[repr(C)]`）。附件字节由宿主解析后**原样过线**，不经 JSON/base64；方法面演进走 req JSON 字段（同 mq 的 JSON dispatch 思路）。模块注释写明契约形态与 ABI 立场。 |
 | `oj-plugin-ffi/src/lib.rs` | `pub mod mail;` + `pub use mail::{MailAttachment, MailAxis};`（按字母序插在 `kv`/`mq` 之间）。`ABI_VERSION` **未改**。 |
-| `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailAxis) -> *const c_void`；`use crate::{…, MailAxis}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailAxis) -> *const c_void = axis::mail;` 编译期配对断言。 |
-| `src/bridge/plugin_loader.rs` | 三处同改：`AXES` 追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailAxis))`；`Registrations` 增 `pub mail: Option<&'static oj_plugin_ffi::MailAxis>`。 |
-| `src/bridge/plugin_loader/tests.rs` | 新增 `axes_includes_mail_and_probe_branch_is_wired`（`AXES` 含 mail + `Registrations::default().mail.is_none()`）。 |
+| `oj-plugin-ffi/src/axis.rs` | `pub fn mail(&'static MailAxis) -> *const c_void`；`use crate::{…, MailAxis}`；`helpers_bind_exact_vtable_types` 追加 `let _: fn(&'static MailAxis) -> *const c_void = axis::mail;` 编译期配对断言。复审期一并补上历史缺口 `axis::mq` 的同形断言。 |
+| `src/bridge/plugin_loader.rs` | 三处同改：`AXES`（:432）追加 `"mail"`（末尾）；`probe_axes` 增 `"mail" => r.mail = Some(&*(vt as *const oj_plugin_ffi::MailAxis))`；`Registrations`（:104）增 `pub mail: Option<&'static oj_plugin_ffi::MailAxis>`。 |
+| `src/bridge/plugin_loader/tests.rs` | 新增 `axes_and_registrations_wire_mail`（初版名 `axes_includes_mail_and_probe_branch_is_wired` **名不符实**——实际不覆盖 `probe_axes` 臂；复审期改名并在注释中说明该局限）。 |
+| `tools/xtask/src/main.rs` | **复审修复**（见 §6）：`AXES` 的第 4 个消费点（`check()` 的汇总 match）此前漏改且含 `unreachable!` → 所有插件预检 panic；改为 `axis_present() -> Option<bool>` + 普通 `Err`，并加表驱动守护测试。 |
 
 TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`/`axis::mail`/`Registrations.mail` 未定义），再最小实现转绿。
 
@@ -763,28 +764,107 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 |---|---|
 | `cargo test --release -p oj-plugin-ffi mail_attachment` | **1 passed; 0 failed** |
 | `cargo test --release -p oj-plugin-ffi` | **6 passed**（lib）+ 2（entry_good）+ 1（entry_panicky），0 failed |
-| `cargo test --release -p only-js axes_includes_mail` | **1 passed; 0 failed** |
+| `cargo test --release -p only-js axes_and_registrations_wire_mail` | **1 passed; 0 failed** |
 | `cargo test --release -p only-js plugin` | **36 passed; 0 failed**（既有探测/清单/扫描/适配器用例无回归） |
+| `cargo test --release -p xtask` | **8 passed; 0 failed**（含复审新增的守护测试） |
+| `cargo xtask plugin <n> --check`（8 个第一方插件） | 全部 **exit=0，零 panic**（修复前 `es --check` 在 `main.rs:250` panic） |
 | `cargo fmt --check` | exit 0 |
-| `cargo clippy --release -p oj-plugin-ffi -p only-js --all-targets -- -D warnings` | exit 0，**0 warning / 0 error** |
+| `cargo clippy --release -p oj-plugin-ffi -p only-js -p xtask --all-targets -- -D warnings` | exit 0，**0 warning / 0 error** |
 
 #### 3. ABI 保持 8 的证据
 
 - `grep -n ABI_VERSION oj-plugin-ffi/src/lib.rs` → `49:pub const ABI_VERSION: u32 = 8;`（未改；本阶段**未触碰**该行）。
 - 未改动任何既有轴的 repr(C) vtable 形状：`mail.rs` 为纯新增文件，`lib.rs` 仅加模块与 re-export，`axis.rs` 仅加 helper 与断言。
 - 宿主侧仅**追加**探测表项/分支/槽位（`Registrations` 是宿主内部结构，非 FFI 类型、不进 ABI）。
-- 沿用 mq 轴先例与 CLAUDE.md 红线「加轴零破坏——既有轴 vtable 形状变更才需要 bump ABI」；存量插件零感知、零重编译。
+- 沿用 mq 轴先例与 CLAUDE.md 红线「加轴零破坏——既有轴 vtable 形状变更才需要 bump ABI」；存量插件零感知、零重编译（实测 8 个存量插件 ABI 8 预检全过）。
 
 #### 4. 与计划/指令的偏差（均已按「不弱化断言」处置）
 
-1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `From<&[T]>`（`src/bridge/ffi.rs:493` 注释即此先例）：`RBytes::from(&[0u8, 159, 255][..])`。**断言未动**（`bytes.len() == 3` + filename 回环）。
-2. **无既有测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/server_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言（`ADAPTER_AXES = [es, auth]`），追加 `mail` 自然满足，未改动。
+1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `impl<T: Copy, Alloc: IAlloc + Default> From<&[T]> for stabby::vec::Vec<T, Alloc>`（`stabby-abi 72.1.16`，`src/alloc/vec.rs:552`）：`RBytes::from(&[0u8, 159, 255][..])`。**断言未动**（`bytes.len() == 3` + filename 回环）。
+   > 订正：本小结初版称「`src/bridge/ffi.rs:493` 注释即此先例」——**引用错误**。该行注释实为「stabby 无 `From<&[u8]>`，逐元素 push」，与实测**语义相反**（`RBytes::from(&[u8][..])` 实测可编译）。见 §7 遗留 3。
+2. **无既有单元测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/server_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言，追加 `mail` 自然满足，未改动。
+   但**漏判了一个非测试消费点**（`tools/xtask` 内联在 `check()` 里的汇总 match）——这正是本次复审抓到的回归，见 §6。
 
-#### 5. 遗留 / 需决策
+#### 5. `AXES` 全消费点清单（阶段 2 起加轴请逐点核对）
 
-1. **`probe_axes` 的 `"mail"` 分支尚无端到端证据**。新测试只锁「`AXES` 含 mail + `Registrations` 有槽位」；`unreachable!` 分支要真正被走过，需有插件导出 `oj_plugin_axis_mail` 符号——现实插件在阶段 2。建议阶段 2 仿 `mini-mq` 加 `mini-mail` 夹具（或用真 `oj-mail`）补一条 `probe_finds_mail_axis` 回归，与 `probe_finds_mq_axis_and_zero_axis_mini_misses_it` 同形。
-2. **`helpers_bind_exact_vtable_types` 历史缺口（本阶段引入前既有）**：`axis::mq` 有 helper（`axis.rs:38`）却**未**进该配对断言列表；本次只按任务追加了 `mail`，未越界补 `mq`。是否一并补上由你定——补是零风险（纯编译期断言），但属阶段外改动。
-3. 阶段 0 小结遗留项 2（`src/bridge/mod.rs:339-341` 关于 reqwest 启 ring 的过时注释）与 3（测试夹具 debug profile 产物占用）**本阶段未处理**，仍按原归属。
+加一个轴需要同步的**全部**位置。前 4 项是功能性的（漏改会被守护测试或运行期捕获），第 5 项是陷阱：
+
+| # | 位置 | 性质 | 漏改后果 |
+|---|---|---|---|
+| 1 | `src/bridge/plugin_loader.rs:432` `pub const AXES` | 定义（单一事实源） | 轴完全不可见 |
+| 2 | `src/bridge/plugin_loader.rs:435-460` `probe_axes` 的 `match *axis` | 功能性 | :458 `unreachable!` → **装载期 panic** |
+| 3 | `src/bridge/plugin_loader.rs:104` `Registrations` 槽位字段 | 功能性 | 编译失败（`probe_axes` 的赋值目标缺失） |
+| 4 | `tools/xtask/src/main.rs:224` `axis_present()` 的 `match axis` | 功能性（预检展示） | 修复后 = 普通 `Err`；由 §6 守护测试红 |
+| 5 | `oj/src/server_cmd.rs:469` `ADAPTER_AXES` | **`#[cfg(test)]` 对账清单，非功能注册表** | 不 panic、不报错（见下） |
+
+- **第 5 项是陷阱**：`ADAPTER_AXES` 带 `#[cfg(test)]`，**只在测试里存在**，登记它本身不产生任何运行期效果；它唯一的作用是被 `cfg_adapters_subset_of_probed_axes` 用来断言 `ADAPTER_AXES ⊆ AXES`（**子集**方向）。所以新增轴**不必**改它，改了也没有功能变化。真正决定插件 cfg 的是 `plugin_cfg` 的 `match name`（`oj/src/server_cmd.rs:479`）。
+- 另有 4 处**文档散文清单**（已因 `mq` 陈旧，同样缺 `mail`），属文档同步、非门禁：`CLAUDE.md:159`、`docs/dev-guide.md:620`、`docs/plugin-architecture.md:17`、`docs/plugin-development.md:16`。归阶段 7 统一订正（§7 遗留 2）。
+- **两处 `unreachable!` 的处置**：`probe_axes` 的保留（有 `Registrations` 编译期兜底 + 装载期 fail-fast 语义，属有意设计）；`xtask` 的已换为 `Option`/`Err` + 守护测试。
+
+#### 6. 复审修复记录（规格评审发现的回归）
+
+**必修 1（回归）——`AXES` 第 4 个消费点未同步，xtask 预检对所有插件 panic。**
+
+- 复现证据（修复前）：`cargo xtask plugin es --check` →
+  `panicked at tools/xtask/src/main.rs:250:18: internal error: entered unreachable code: AXES 与 check 汇总分支不同步`。
+- 修复：把「轴 → 是否提供」从 `check()` 内联 match（末尾 `unreachable!`）抽成
+  `fn axis_present(axis: &str, r: &Registrations) -> Option<bool>`，未知轴返回 `None`；
+  `check()` 据 `None` 给**普通 `Err`**（`AXES 与 axis_present 判定不同步，请同步：未知轴 '<a>'`）。
+  即「漏改」的后果从**崩溃**降级为**可读报错**。
+- 防复发：新增表驱动守护测试 `given_axes_table_when_judged_then_every_axis_has_a_branch`
+  —— 遍历 `AXES` 断言每轴都有判定分支，并断言未知轴得 `None`（而非 panic）。
+- **RED→GREEN 证据**：先在 `axis_present` 中**故意不加** `"mail"` 臂 →
+  `cargo test --release -p xtask given_axes_table` **FAILED**：
+  `panicked at tools/xtask/src/main.rs:507: axis mail 缺判定分支`（证明守护测试真能抓到漏改）；
+  补 `"mail" => r.mail.is_some(),` 后 → **8 passed; 0 failed**。
+- 端到端证据：`cargo xtask plugin <n> --check` 对 `es / db-mysql / db-postgres / blob-s3 /
+  bus-kafka / bus-rabbitmq / kv-redis / auth` 8 个存量插件全部 `exit=0`，`provided axes` 正常输出
+  （如 `bus-kafka -> [bus, mq]`、`es -> [es]`），**零 panic**。
+
+**必修 2** —— `helpers_bind_exact_vtable_types` 补 `axis::mq`（见 §1 表）。
+
+**必修 3** —— 本小结订正三处：① `RBytes::from(&[T][..])` 的依据改为 `stabby-abi` 的真实 impl
+（原引 `src/bridge/ffi.rs:493` 语义相反，见 §4.1）；② 测试改名 `axes_and_registrations_wire_mail`；
+③ `unreachable!` 行号由 `:456` 订正为实际 **`:458`**。
+
+**必修 4** —— 见 §5 全消费点清单。
+
+**顺带确认：`ADAPTER_AXES` 未登记 `mail` 的行为与判断**（结论，本阶段不实现）：
+
+- **确认行为**：`ADAPTER_AXES` 是 `#[cfg(test)]` 的**测试专用对账清单**，「未登记 `mail`」本身
+  **没有**运行期后果。实际行为由 `plugin_cfg`（`oj/src/server_cmd.rs:473-495`）决定：`name = "mail"`
+  既不命中 `cfg.plugins` 透传分支，也不命中 `match name` 的 `"es"`/`"auth"` 臂 → 落 `_ => "{}"`，
+  即 **mail 插件拿到空 cfg，`smtp:` 配置不生效**。你的描述准确。
+- **判断：应当走「登记适配器」**（在 `plugin_cfg` 加 `"mail"` 臂读顶层 `smtp:` + `src/config.rs`
+  加顶层 `smtp:` 段），**而不是**让用户写 `plugins:` 透传。依据（读代码后）：
+  1. **设计文档就要求宿主读同一段**：`2026-09-15-mail-smtp-design.md` §4 把 `smtp:` 放**顶层**，并明确
+     「宿主另解析 `smtp:` 的**非密钥面**（profile keys、`allowed_*`、`tls`/`allow_none_tls`、host/port）
+     作前置校验用」——宿主必须**类型化**读到该段。走 `plugins:` 透传只有插件拿得到、宿主拿不到，
+     前置校验无法落地。`es:`/`auth:` 走适配器臂正是同一原因。
+  2. **`plugins:` 透传有副作用**：`assemble_plugins`（`oj/src/server_cmd.rs:602`）在
+     `!cfg.plugins.is_empty()` 时切**严格清单模式**——只装配键列出的插件。拿 `plugins: { mail: … }`
+     装配置，等于顺手把运维的插件装配模式切了：用户必须把所有要加载的插件都列进去，否则其余插件
+     静默不装。这个耦合是 `es:`/`auth:` 顶层段刻意避免的。
+  3. **只登记 `ADAPTER_AXES` 是假动作**：它 `#[cfg(test)]`、无功能。真正要改的是 `plugin_cfg` 的
+     `match name` 臂（`"mail" => match &cfg.smtp { Some(s) => …非密钥面…, None => "{}" }`）
+     + `src/config.rs` 的顶层 `smtp:` 段，**然后**把 `"mail"` 加进 `ADAPTER_AXES` 以让子集断言覆盖它。
+  4. **归属**：装配期工作（`plugin_cfg`/`config.rs`），按计划表归**阶段 7**。阶段 2 骨架联调可临时用
+     `plugins: { mail: … }`（注意会顺带进严格模式，须把其余待加载插件一并列出）。
+
+#### 7. 遗留 / 需决策
+
+1. **`probe_axes` 的 `"mail"` 臂尚无端到端证据**。新测试只锁「`AXES` 含 mail + `Registrations` 有槽位」；
+   `unreachable!` 分支要真正被走过，需有插件导出 `oj_plugin_axis_mail` 符号——现实插件在阶段 2。
+   建议阶段 2 仿 `mini-mq` 加 `mini-mail` 夹具（或用真 `oj-mail`）补一条 `probe_finds_mail_axis` 回归
+   （新用例注释已注明此局限）。
+2. **文档散文里的 `AXES` 清单已陈旧**（缺 `mq`，现又缺 `mail`）：`CLAUDE.md:159`、
+   `docs/dev-guide.md:620`、`docs/plugin-architecture.md:17`、`docs/plugin-development.md:16`。
+   非门禁、不影响运行，归阶段 7 文档任务统一订正（避免本阶段越界扩大文档漂移面）。
+3. **`src/bridge/ffi.rs:493` 注释与实测不符**：`to_rbytes` 注释称「stabby 无 `From<&[u8]>`」，
+   但 `RBytes::from(&[u8][..])` 实测可编译（`stabby-abi` 的 `From<&[T]>`）。函数实现本身无害
+   （逐元素 push 等价），仅注释陈旧易误导。属既有代码，本阶段未改；可顺手订正。
+4. 阶段 0 小结遗留项 2（`src/bridge/mod.rs:339-341` 关于 reqwest 启 ring 的过时注释）与
+   3（测试夹具 debug profile 产物占用）**本阶段仍未处理**，仍按原归属。
 
 
 ### 阶段 2 小结
