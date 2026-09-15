@@ -44,6 +44,7 @@ mod json;
 mod kv;
 mod loader;
 mod log;
+pub mod mail;
 mod module_loader;
 pub mod mq;
 mod named_registry;
@@ -157,6 +158,8 @@ pub struct StableState {
     pub jwt: Option<Arc<JwtCfg>>,
     /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
     pub oidc: Option<Arc<oidc::OidcState>>,
+    /// mail 后端（装配层按 smtp: 段 + oj-mail 插件注入）；None = mail.* 报 "mail not configured"。
+    pub mail: Option<Arc<dyn mail::MailBackend>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -182,6 +185,9 @@ pub struct Extras {
     pub jwt: Option<Arc<JwtCfg>>,
     /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
     pub oidc: Option<Arc<oidc::OidcState>>,
+    /// mail 后端（装配层构造 `mail::FfiMailBackend`）；None = mail.* 未配置报错。
+    /// 注入时构造期一并挂 `deliver("mail.result")` 路由（见 `mail::install_mail_deliver`）。
+    pub mail: Option<Arc<dyn mail::MailBackend>>,
     /// 命名 MQ 客户端（None = 空 registry，Kafka/RabbitMQ(name) → undefined）。
     pub kafkas: Option<Arc<NamedRegistry<mq::MqInstance>>>,
     pub rabbits: Option<Arc<NamedRegistry<mq::MqInstance>>>,
@@ -562,7 +568,13 @@ impl Bridge {
                 .unwrap_or_else(|| Arc::new(NamedRegistry::new())),
             tasks_flag: extras.tasks_flag,
             sql_memo: Mutex::new(HashMap::new()),
+            mail: extras.mail,
         });
+        // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
+        // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
+        if let Some(m) = &stable.mail {
+            mail::install_mail_deliver(m);
+        }
         // KillSwitch 先于池构造：池在 boot 期要 arm 它（TLA 死循环的唯一兜底）。
         let kill = runtime::KillSwitch::spawn();
         let pool = runtime::RuntimePool::new(stable.clone(), inspect, kill.clone());
@@ -1645,6 +1657,7 @@ mod tests {
             rabbits: Arc::new(NamedRegistry::new()),
             tasks_flag: None,
             sql_memo: Mutex::new(HashMap::new()),
+            mail: None,
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =

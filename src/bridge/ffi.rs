@@ -562,16 +562,39 @@ pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
 /// 语义 = Bus::publish 的本地扇出（payload 原样转发；按 topic 去重注册）。
 /// 帧型判定（v0.1.16 wire 约定，与 FfiEventBroker::publish 的封装对称）：payload 为
 /// UTF-8 且是含 topic/data 两键的 JSON 对象 → 信封文本帧；否则 → 二进制帧原字节。
+///
+/// `mail.result` 例外：走宿主 mail 路由（存结果 + 扁平化扇出），不经帧型启发式——
+/// 上送的是 `{code,msg,data:{jobId,…}}` 结果信封而非 bus 帧。
 pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
     let raw = payload[..].to_vec();
-    let frame = envelope_or_binary(&raw);
+    if &topic[..] == super::mail::MAIL_RESULT_TOPIC {
+        if !super::mail::route_deliver(&raw) {
+            eprintln!("warn: mail.result 上送但 mail 未配置（结果丢弃）");
+        }
+        return;
+    }
+    fanout_targets(&topic[..], envelope_or_binary(&raw));
+}
+
+/// 本地扇出一帧到 `DELIVER_TARGETS`（满/closed 惰性清理），返回投递成功数。
+/// `host_deliver` 与 `FfiEventBroker::publish_local` 共用（同步路径）。
+pub(crate) fn fanout_targets(topic: &str, frame: WsSend) -> usize {
     let mut g = DELIVER_TARGETS.lock().unwrap();
-    if let Some(list) = g.get_mut(&topic[..]) {
-        list.retain(|tx| tx.send(frame.clone()).is_ok());
+    let mut n = 0;
+    if let Some(list) = g.get_mut(topic) {
+        list.retain(|tx| {
+            if tx.send(frame.clone()).is_ok() {
+                n += 1;
+                true
+            } else {
+                false
+            }
+        });
         if list.is_empty() {
-            g.remove(&topic[..]);
+            g.remove(topic);
         }
     }
+    n
 }
 
 /// bus 帧型判定（启发式，详见 host_deliver 注释）：`{"topic":…,"data":…}` JSON
@@ -679,6 +702,16 @@ impl EventBroker for FfiEventBroker {
             .await
             .map_err(|e| ffi_err("bus publish", e))?;
         Ok(0) // 远程 broker 经网络投递，本地 fan-out 恒 0（语义对齐 core Kafka/Rabbit）。
+    }
+
+    /// 同步本地扇出：本 broker 的本地订阅者都注册在 `DELIVER_TARGETS`，此处按与
+    /// `publish` 相同的 wire 封装直接投递（供 `deliver` 回调等非 async 上下文）。
+    fn publish_local(&self, topic: &str, data: &BusPayload) -> usize {
+        let frame = match data {
+            BusPayload::Json(v) => WsSend::Text(json!({ "topic": topic, "data": v }).to_string()),
+            BusPayload::Bytes(b) => WsSend::Binary(b.clone()),
+        };
+        fanout_targets(topic, frame)
     }
 
     async fn subscribe(&self, topic: &str, tx: UnboundedSender<WsSend>) -> BridgeResult<()> {
