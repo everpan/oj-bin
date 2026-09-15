@@ -129,7 +129,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 `sendSync`：`req.sync=true`；worker 内 `spawn_blocking(move || sync_transport.send(msg))` 再 `.await`（不冻结 JsRuntime）。
 
-`sendRaw`：结构化 `from/to` 作信封；宿主在组装前**剥离 `raw` 中 `From/To/Cc/Bcc/Subject` 头行**（防双收件人/spoof），余下正文/头保留。
+`sendRaw`：结构化 `from/to` 作信封（权威，防双收件人/spoof）；**剥离 `raw` 中 `From/To/Cc/Bcc` 头行**（信封与原文解耦）。**保留 `raw` 的 `Subject`**（Subject 非信封字段，剥离只会丢主题；注入风险由 CRLF 拒绝覆盖）；若同时给了结构化 `subject`（非空）→ 以结构化为准覆盖原文 Subject。其余正文/头保留，行尾归一 CRLF（防 SMTP smuggling）。
 
 ## 8. 异步/线程模型与生命周期
 
@@ -158,7 +158,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 - 凭据仅在 `config.yaml` →（插件 cfg）`MailProfile`；**不进 JS 自省**（`op_mail_profiles` 只列 key）。
 - **头注入**：CRLF 剥离 + `lettre::Address` 强校验（§10）。
-- **sendRaw 冲突头**：宿主剥离原文 `From/To/Cc/Bcc/Subject`（§7）。
+- **sendRaw 冲突头**：剥离原文 `From/To/Cc/Bcc`（信封权威）；`Subject` 保留但做 CRLF 校验，结构化 `subject` 非空则覆盖（§7）。
 - **越权**：profile 级 `allowed_from`/`allowed_recipients`（宿主前置校验，§4/§10）。
 - **`none` TLS**：需 `allow_none_tls: true` 且 host 为内网 CIDR，否则拒。
 - **路径穿越/TOCTOU**：`ensure_within` + 复用句柄（§9）。
