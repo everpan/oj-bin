@@ -7,12 +7,17 @@
 //!   经 `HostContext.deliver("mail.result", ...)` 上送异步完成。
 //!
 //! 阶段 3 已落：配置解析（`config.rs`，tls 三模式 + `none` fail-closed）与 profile 的
-//! transport 构建（`build_profiles`）。队列与投递在阶段 4-5 补齐，`submit` 仍显式报错
-//! （fail-loud，绝不静默成功）。
+//! transport 构建（`build_profiles`）。阶段 4 已落：`engine.rs` 的有界队列 + worker 池 +
+//! `FfiFuture` 回传 + 背压（`try_send`）+ graceful drain；本阶段 worker 只走「原始 MIME」
+//! 路（req 的 `raw`），消息组装归阶段 5。
 
 mod config;
+mod engine;
+#[cfg(test)]
+mod testutil;
 
 use config::{MailConfig, Mechanism, ProfileCfg, TlsMode};
+use engine::{DeliverSink, MailEngine, MailTarget, SendFn, SyncSendFn};
 use lettre::address::Envelope;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism as LettreMechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -22,15 +27,19 @@ use lettre::{
 };
 use oj_plugin_ffi::{
     ABI_VERSION, FfiFuture, HOST_FINGERPRINT, HostContext, MailAttachment, MailVtable,
-    PluginDescriptor, RArc, RResult, RString, RVec,
+    PluginDescriptor, RArc, RBytes, RResult, RString, RVec,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// 已解析并校验过的插件配置（`init` 期定型；阶段 4 的 `MailEngine` 从此取
-/// `workers`/`queue_capacity` 与 profile 定义）。
-static MAIL_CFG: OnceLock<MailConfig> = OnceLock::new();
+/// 进程级引擎（`init` 装配，`submit` 取用）。
+///
+/// **为什么是 `OnceLock` 而不是每次 init 现建**：`init` 是装载期同步调用，
+/// 且同一插件可能被 init 多次（测试 / 重载）；若每次都新建引擎，败者会被就地 drop——
+/// 虽然 `MailEngine::dispose` 已能安全销毁（`shutdown_background`），但白建一遍
+/// transport 与线程池没有意义。幂等语义参见 `init`。
+static MAIL_ENGINE: OnceLock<MailEngine> = OnceLock::new();
 
 /// 异步 transport 形态：SMTP（连接池）或本地 `.eml` 落盘（免网络的测试/归档通道）。
 pub enum AsyncMailTransport {
@@ -54,6 +63,28 @@ pub struct MailProfile {
     pub async_transport: Arc<AsyncMailTransport>,
     /// 同步路（worker 内 `spawn_blocking`）。
     pub sync_transport: Arc<SyncMailTransport>,
+    /// 单次投递超时（秒配置已转 `Duration`；引擎据它包 `tokio::time::timeout`）。
+    pub timeout: Duration,
+}
+
+impl MailProfile {
+    /// 转引擎投递目标（超时 + 两路投递函数）。**注意**：投递闭包持有 transport 的 `Arc`，
+    /// 故 transport 的最终 Drop 发生在目标表销毁处——必须处于引擎 runtime 上下文内
+    /// （lettre `pool` 的 Drop 会 `tokio::spawn`，见 `engine.rs` 模块头）。
+    pub fn into_target(self) -> MailTarget {
+        let Self {
+            async_transport,
+            sync_transport,
+            timeout,
+        } = self;
+        let send: SendFn = Arc::new(move |env: Envelope, raw: Vec<u8>| {
+            let t = Arc::clone(&async_transport);
+            Box::pin(async move { t.send_raw(&env, &raw).await })
+        });
+        let send_sync: SyncSendFn =
+            Arc::new(move |env: Envelope, raw: Vec<u8>| sync_transport.send_raw(&env, &raw));
+        MailTarget::new(timeout, send, send_sync)
+    }
 }
 
 impl AsyncMailTransport {
@@ -104,9 +135,11 @@ fn install_crypto_provider() {
 /// 1. 首语句必须装 rustls 默认 provider，其后才可能触碰 transport 构建——
 ///    `TlsParameters::new`（`relay`/`starttls_relay` 内部亦调用它）会**立即**构建 rustls
 ///    `ClientConfig`，未装默认 provider 时直接 panic；
-/// 2. lettre 的 `pool` 会在 transport **Drop** 里 `tokio::spawn` 回收任务，故 transport 的
-///    创建/使用/销毁都必须处于 tokio runtime 上下文内——`init`（插件装载期的同步调用）
-///    不建 transport，由阶段 4 的 `MailEngine` 在自建 multi_thread runtime 内调用本函数。
+/// 2. lettre 的 `pool` 在 `Pool::new`（`transport/smtp/pool/async_impl.rs:56`，清理任务）
+///    与 `Pool::drop`（同文件 :262）**两处**都要 `E::spawn`（= `tokio::spawn`），故 transport
+///    的创建/使用/销毁都必须处于 tokio runtime 上下文内——`init`（插件装载期的同步调用）
+///    不建 transport，由 `MailEngine::new` 先 `rt.enter()` 再调本函数。
+///    （阶段 4 实测：无上下文时**构建期**就 panic "there is no reactor running"，不只是销毁期。）
 pub fn build_profiles(cfg: &MailConfig) -> Result<HashMap<String, MailProfile>, String> {
     install_crypto_provider(); // ← 硬约束 1：必须先于任何 transport 构建
     let mut profiles = HashMap::with_capacity(cfg.profiles.len());
@@ -129,6 +162,7 @@ fn build_profile(p: &ProfileCfg) -> Result<MailProfile, String> {
         return Ok(MailProfile {
             async_transport: Arc::new(AsyncMailTransport::File(AsyncFileTransport::new(dir))),
             sync_transport: Arc::new(SyncMailTransport::File(FileTransport::new(dir))),
+            timeout: Duration::from_secs(p.timeout),
         });
     }
 
@@ -156,6 +190,7 @@ fn build_profile(p: &ProfileCfg) -> Result<MailProfile, String> {
     Ok(MailProfile {
         async_transport: Arc::new(AsyncMailTransport::Smtp(a.build())),
         sync_transport: Arc::new(SyncMailTransport::Smtp(s.build())),
+        timeout,
     })
 }
 
@@ -199,34 +234,59 @@ fn credentials(p: &ProfileCfg) -> Result<(Option<Credentials>, Vec<LettreMechani
     }
 }
 
-fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
-    // 配置在装载期就解析并校验（fail-loud：坏配置让启动失败，而不是等第一封信才炸）。
-    // **不在此建 transport**：`init` 是同步调用（未必处于 tokio runtime 上下文），而 lettre
-    // `pool` 的 transport 一旦 Drop 就会 `tokio::spawn`（无 runtime → abort）。transport 的
-    // 创建/使用/销毁统一归阶段 4 的 `MailEngine`（自建 runtime，在其内调 `build_profiles`）。
-    let parsed = match MailConfig::parse(&cfg[..]) {
-        Ok(c) => c,
-        Err(e) => return RResult::Err(RString::from(e.as_str())),
-    };
-    let _ = MAIL_CFG.set(parsed); // 重复 init（测试/重载）保留首份，保持幂等
-
-    RResult::Ok(PluginDescriptor {
-        // 身份必须 = 插件名（crate 名去 `oj-` 前缀），**不是** crate 名 ——
-        // `PluginLoader::load_one` 以清单键做严格相等校验（`plugin_loader.rs:404`），
-        // 且落盘文件名 `lib<name>.dylib` 亦取该名；全 8 个既有插件同此约定
-        // （oj-kv-redis → "kv-redis"、oj-auth → "auth"…）。
+/// 插件自描述。身份必须 = 插件名（crate 名去 `oj-` 前缀），**不是** crate 名 ——
+/// `PluginLoader::load_one` 以清单键做严格相等校验（`plugin_loader.rs:404`），
+/// 且落盘文件名 `lib<name>.dylib` 亦取该名；全 8 个既有插件同此约定
+/// （oj-kv-redis → "kv-redis"、oj-auth → "auth"…）。
+fn descriptor() -> PluginDescriptor {
+    PluginDescriptor {
         name: RString::from("mail"),
         semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(HOST_FINGERPRINT),
         desc: RString::from("mail 轴：lettre SMTP 发送（多 profile + 连接池/队列线程池）"),
-    })
+    }
+}
+
+fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
+    // 配置在装载期就解析并校验（fail-loud：坏配置让启动失败，而不是等第一封信才炸）。
+    //
+    // **先校验、后查幂等**：坏配置的拒绝与「是否已装配过」无关 —— 若先查幂等再解析，
+    // 重复 init（测试并行 / 重载）会直接把坏配置当成功放行。
+    let parsed = match MailConfig::parse(&cfg[..]) {
+        Ok(c) => c,
+        Err(e) => return RResult::Err(RString::from(e.as_str())),
+    };
+    if MAIL_ENGINE.get().is_some() {
+        return RResult::Ok(descriptor()); // 重复 init 保留首个引擎，保持幂等
+    }
+
+    // 结果上送：生产转发 `HostContext.deliver`（测试注入收集器；见 `engine::DeliverSink`）。
+    let deliver = DeliverSink::new(move |topic: &str, payload: &[u8]| {
+        (host.deliver)(RString::from(topic), RBytes::from(payload));
+    });
+    // transport 与 worker 都在引擎自建 runtime 内装配（lettre `pool` 的 Drop 要 runtime 上下文）。
+    let engine = match MailEngine::new(&parsed, deliver) {
+        Ok(e) => e,
+        Err(e) => return RResult::Err(RString::from(e.as_str())),
+    };
+    // 竞争失败（已被别的 init 抢先）时 `set` 退回引擎 → 就地 drop：`dispose` 保证按序、
+    // 且在 async 上下文里也安全（见 `engine.rs` 模块头）。
+    let _ = MAIL_ENGINE.set(engine);
+
+    RResult::Ok(descriptor())
 }
 
 /// 统一投递入口（契约见 `oj-plugin-ffi/src/mail.rs` 的 `MailVtable::submit` 文档）。
-extern "C" fn submit(_key: RString, _req: RString, _atts: RVec<MailAttachment>) -> FfiFuture {
-    // 阶段 3-5 实现队列/worker 投递；未实现期显式报错（fail-loud，勿静默或假装成功）。
-    oj_plugin_ffi::ready_err("oj-mail: submit not implemented (阶段 2 骨架)")
+/// 入队/背压/回传全部由 [`MailEngine::submit`] 承担；此处只做「引擎未装配」的兜底与
+/// 跨边界 panic 收敛。
+extern "C" fn submit(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let Some(engine) = MAIL_ENGINE.get() else {
+            return oj_plugin_ffi::ready_err("oj-mail: init 未调用");
+        };
+        engine.submit(&key[..], &req[..], atts.into_iter().collect())
+    })
 }
 
 static MAIL_VTABLE: MailVtable = MailVtable { submit };
@@ -238,45 +298,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VT
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oj_plugin_ffi::RBytes;
-
-    extern "C" fn test_log(_level: u8, _msg: RString) {}
-    extern "C" fn test_deliver(_topic: RString, _payload: RBytes) {}
-
-    fn host() -> RArc<HostContext> {
-        RArc::new(HostContext {
-            log: test_log,
-            deliver: test_deliver,
-        })
-    }
-
-    /// FfiFuture → 测试异步桥（等价 core 侧 await_ffi 的 poll 轮询）。
-    /// 以真实墙钟为界，避免固定轮询次数在 CI 负载下误报超时。
-    async fn drive(fut: &mut FfiFuture) -> Result<Vec<u8>, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match (fut.poll)(fut.state) {
-                0 => {
-                    if std::time::Instant::now() >= deadline {
-                        (fut.free)(fut.state); // 超时也要释放 state（防 FfiTask 泄漏）
-                        fut.state = std::ptr::null_mut();
-                        return Err("ffi drive timeout".into());
-                    }
-                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-                }
-                code => {
-                    let r = (fut.take)(fut.state);
-                    (fut.free)(fut.state);
-                    fut.state = std::ptr::null_mut();
-                    return match (code, std::result::Result::from(r)) {
-                        (1, Ok(b)) => Ok(b.iter().copied().collect()),
-                        (_, Err(e)) => Err(e[..].to_string()),
-                        _ => Err("ffi drive timeout".into()),
-                    };
-                }
-            }
-        }
-    }
+    use crate::testutil::{drive, host, temp_dir};
 
     /// descriptor 身份必须是**插件名**（`mail`）而非 crate 名（`oj-mail`）：
     /// `PluginLoader::load_one` 以清单键做严格相等校验，落盘文件名亦取该名。
@@ -294,28 +316,30 @@ mod tests {
         assert_eq!(&desc.fingerprint[..], HOST_FINGERPRINT);
     }
 
-    /// 骨架期 `submit` 必须**显式失败**（fail-loud）：绝不静默返回 Ok 让宿主以为投递成功。
-    /// 阶段 3-5 落地后本用例随实现更新为真投递断言。
-    #[tokio::test(flavor = "current_thread")]
-    async fn submit_fails_loud_until_implemented() {
-        let _ = std::result::Result::from(init(host(), RString::from("{}")));
-        let mut fut = submit(RString::from("default"), RString::from("{}"), RVec::new());
-        let e = drive(&mut fut).await.expect_err("骨架期 submit 必须 Err");
-        assert!(e.contains("not implemented"), "错误须可读: {e}");
+    /// vtable `submit` 的入口守卫：**未装配引擎**（或已装配的配置里没有该 profile）时一律
+    /// fail-loud，绝不静默成功。对「其它用例先行 init」免疫：无论 `MAIL_ENGINE` 是否已装，
+    /// 该 key 都不存在 → 必 Err（`init 未调用` / `未知 smtp profile`）。
+    ///
+    /// 说明：vtable → 引擎 → 真 transport 的端到端覆盖由 `engine::tests`（真 file transport
+    /// 落盘）与阶段 7 的 `oj test` e2e 承担；进程级单例不适合按用例换配置，故此处只钉入口守卫。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vtable_submit_fails_loud_without_matching_profile() {
+        let mut fut = submit(
+            RString::from("不存在的-profile"),
+            RString::from("{}"),
+            RVec::new(),
+        );
+        let e = drive(&mut fut).await.expect_err("无匹配 profile 必须 Err");
+        assert!(
+            e.contains("init 未调用") || e.contains("未知 smtp profile"),
+            "错误须可读: {e}"
+        );
     }
 
     // ---- 阶段 3：transport 构建 ----
     //
     // 全部 `#[tokio::test(flavor = "multi_thread")]`：lettre `pool` 在 AsyncSmtpTransport
     // 的 `Drop` 里 `tokio::spawn`，无 runtime 上下文 drop 即 abort（硬约束 2）。
-
-    /// 每个测试用**独立**临时目录（进程号 + 标签），跑完自行清理，不污染 `sample/`。
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("oj-mail-test-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("建临时目录");
-        dir
-    }
 
     fn envelope() -> Envelope {
         Envelope::new(
