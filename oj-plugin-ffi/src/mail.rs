@@ -21,6 +21,20 @@ pub struct MailAttachment {
 #[stabby::stabby]
 #[repr(C)]
 pub struct MailVtable {
+    /// 投递一封信。
+    ///
+    /// - `key` = `smtp` 配置里的 profile 名；**未知 key → Err**（不回落 default，
+    ///   错配的 profile 名必须显式失败，避免静默发错邮件）。
+    /// - `req` = 请求 JSON，字段语义：
+    ///   - `sync: bool`：用同步 transport（worker 内 spawn_blocking）还是异步 transport；
+    ///   - `enqueue_only: bool`：`true` 时本 future 只立即回 `{"jobId":"..."}`（入队即返回，
+    ///     真实投递结果经 `HostContext.deliver("mail.result", ...)` 上送）；`false` 时本
+    ///     future 的 resolve 值就是投递结果信封；
+    ///   - `raw: Option<String>`：给定时按**原始 MIME** 投递（此时 `subject`/`text`/`html`
+    ///     等组装字段被忽略，与 `req` 其余字段冲突的头由宿主剥离）；
+    ///   - 其余组装字段（`from`/`to[]`/`cc[]`/`bcc[]`/`subject`/`text?`/`html?`/`headers{}`/`jobId`）。
+    /// - `atts` = 附件表（**与 `raw` 互斥**：`raw` 给定时宿主不解析附件，`atts` 为空）。
+    ///   字节是宿主解析好的**原始字节**，插件直接喂 lettre，不做 base64 往返。
     pub submit: extern "C" fn(key: RString, req: RString, atts: RVec<MailAttachment>) -> FfiFuture,
 }
 
@@ -29,13 +43,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mail_attachment_roundtrips_bytes_without_base64() {
+    fn mail_attachment_holds_raw_bytes() {
         let a = MailAttachment {
             filename: RString::from("a.pdf"),
             mime: RString::from("application/pdf"),
             bytes: RBytes::from(&[0u8, 159, 255][..]),
         };
-        assert_eq!(a.bytes.len(), 3); // 原始字节，非 base64
-        assert_eq!(String::from(a.filename.clone()), "a.pdf");
+        // 原始字节逐位相等（非 base64、非 UTF-8 假设）。
+        assert_eq!(a.bytes.as_slice(), &[0u8, 159, 255][..]);
+        assert_eq!(&a.filename[..], "a.pdf");
     }
 }
