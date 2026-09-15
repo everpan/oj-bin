@@ -87,7 +87,8 @@ pub struct SendRequest {
     pub cc: Vec<String>,
     #[serde(default)]
     pub bcc: Vec<String>,
-    /// 主题（raw 路的主题见模块头：原文 `Subject:` 会被剥离）。
+    /// 主题。raw 路见模块头 / [`build_raw`]：原文 `Subject:` **保留**（非信封字段），
+    /// 但本字段**非空时覆盖**它（最终只有一个 Subject 头）。
     #[serde(default)]
     pub subject: String,
     /// 纯文本正文。

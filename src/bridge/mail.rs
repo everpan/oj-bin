@@ -311,18 +311,32 @@ pub(crate) fn install_mail_deliver(b: &Arc<dyn MailBackend>) {
     *MAIL_DELIVER.lock().unwrap() = Some(Arc::downgrade(b));
 }
 
-/// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点。
-/// `true` = 有 mail 后端接管（存结果 + 扇出）；`false` = 未配置 mail（调用方决定是否告警）。
-pub(crate) fn route_deliver(payload: &[u8]) -> bool {
+/// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点结果（**细分两种失败**：告警文案要能
+/// 分辨「没配 mail」与「载荷非法」——两者都被丢弃，但排障方向完全不同）。
+pub(crate) enum DeliverRoute {
+    /// 有后端接管：已存结果并扇出给 n 个本地订阅者。
+    Routed(usize),
+    /// 未配置 mail（`StableState.mail` 为空，或弱引用已失效）。
+    NotConfigured,
+    /// 载荷不是可索引的完成结果（非 JSON，或缺 `jobId`/`code`/`msg`）。
+    BadPayload,
+}
+
+/// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点：`Routed` = 存结果 + 扇出；
+/// 其余两种成因见 [`DeliverRoute`]（调用方分别告警，不混为一句）。
+pub(crate) fn route_deliver(payload: &[u8]) -> DeliverRoute {
     let b = MAIL_DELIVER
         .lock()
         .unwrap()
         .as_ref()
         .and_then(Weak::upgrade);
     let Some(b) = b else {
-        return false;
+        return DeliverRoute::NotConfigured;
     };
-    b.router().route(payload).is_some()
+    match b.router().route(payload) {
+        Some(n) => DeliverRoute::Routed(n),
+        None => DeliverRoute::BadPayload,
+    }
 }
 
 // ---------- vtable 适配器 ----------
@@ -716,19 +730,18 @@ async fn resolve_attachments(
 ) -> Result<Vec<ParsedAttachment>, String> {
     let mut out = Vec::with_capacity(refs.len());
     for (i, r) in refs.iter().enumerate() {
-        let (bytes, hint) = match &r.src {
+        let bytes = match &r.src {
             AttSrc::Blob { name, key } => {
                 let b = blobs.get(name).ok_or_else(|| {
                     format!(
                         "mail: attachments[{i}] 的 blob 后端 '{name}' not configured（下一步：在 config 里配置 blob.backends.{name}）"
                     )
                 })?;
-                let bytes = b.get(key).await.map_err(|e| {
+                b.get(key).await.map_err(|e| {
                     format!(
                         "mail: attachments[{i}] 读取 blobKey '{key}' 失败：{e}（下一步：确认键存在且当前后端可读）"
                     )
-                })?;
-                (bytes, key.clone())
+                })?
             }
             AttSrc::Path(p) => {
                 let root = root.ok_or_else(|| {
@@ -746,17 +759,15 @@ async fn resolve_attachments(
                         "mail: attachments[{i}] 附件路径非法：{e}（下一步：把附件放到项目根内，或用 blobKey）"
                     )
                 })?;
-                let bytes = std::fs::read(&canon).map_err(|e| {
+                std::fs::read(&canon).map_err(|e| {
                     format!(
                         "mail: attachments[{i}] 读取 {} 失败：{e}（下一步：确认文件存在且可读）",
                         canon.display()
                     )
-                })?;
-                (bytes, canon.display().to_string())
+                })?
             }
         };
         let mime = resolve_mime(r.mime.as_deref(), &r.filename, &bytes);
-        let _ = &hint;
         out.push(ParsedAttachment {
             filename: r.filename.clone(),
             mime,
@@ -1144,15 +1155,53 @@ mod tests {
         assert_eq!(v["data"].as_object().unwrap().len(), 4, "{v}");
     }
 
-    /// 未配置（StableState.mail = None）→ 路由明确「未接管」，不 panic（结果丢弃）。
+    /// 未配置（StableState.mail = None）→ 路由明确报「未配置」（与「载荷非法」分开，
+    /// 告警文案据此区分）；不 panic（结果丢弃）。
     #[tokio::test(flavor = "current_thread")]
-    async fn route_deliver_without_backend_is_false() {
+    async fn route_deliver_without_backend_is_not_configured() {
         let _g = lock();
         let _b = Bridge::new(
             Arc::new(InMemoryAccessor::new()),
             Arc::new(InMemoryKV::new()),
         );
-        assert!(!route_deliver(ENVELOPE));
+        assert!(matches!(
+            route_deliver(ENVELOPE),
+            DeliverRoute::NotConfigured
+        ));
+    }
+
+    /// A6：**载荷非法** ≠ 「未配置」—— 有后端但 payload 不是结果信封（非 JSON / 缺
+    /// `jobId`/`code`/`msg`）时细分报 `BadPayload`，告警文案才能指向插件侧。
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_deliver_with_backend_but_bad_payload_is_bad_payload() {
+        let _g = lock();
+        let bus = Arc::new(Bus::new());
+        let fake = FakeMail::new(MailConfig::empty(), bus.clone());
+        let _b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                mail: Some(fake.clone()),
+                ..Default::default()
+            },
+        );
+        for bad in [
+            &b"not json"[..],
+            &br#"{"code":0,"msg":"ok","data":{}}"#[..], // 缺 jobId
+            &br#"{"data":{"jobId":"j"}}"#[..],          // 缺 code/msg
+        ] {
+            assert!(
+                matches!(route_deliver(bad), DeliverRoute::BadPayload),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 合法信封 → Routed（对照：不是所有载荷都被判非法）。
+        assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::Routed(_)));
+        assert!(fake.router().get("j1").is_some());
     }
 
     // ---------- 6.3：结果存储 + 扁平化 ----------
