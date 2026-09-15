@@ -38,6 +38,11 @@ jsonwebtoken = "9"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
+# mail 地址强校验（src/bridge/mail.rs）：宿主必须与插件**同一解析器**，否则出现
+# 「宿主放行、插件拒绝」或反过来的口径分裂。**关默认 feature**：只要 `lettre::Address`
+# （address 模块无 feature 门控），不引入 smtp-transport/rustls/native-tls——根 crate
+# 的 rustls 单一 provider（aws-lc-rs）不受影响（阶段 0 方案 B 的同一约束）。
+lettre = { version = "0.11", default-features = false }
 # cert.renew 在本 crate 内解析 PKCS#8 PEM（from_pkcs8_pem 需 pem feature）；
 # 版本/feature 与 tools/oj-cert 对齐（workspace 统一解析为同一份 rsa）。
 rsa = { version = "0.9", features = ["pem"] }
