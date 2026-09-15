@@ -1608,6 +1608,148 @@ mod tests {
         let _ = std::fs::remove_dir_all(&proj);
     }
 
+    /// 收件人地址非法一律 `{code:5}`：**to/cc/bcc 与 from 同一解析器**（`lettre::Address`，
+    /// 见 `address_list`），且错误**逐个字段点名**（`to[0]`/`cc[0]`/`bcc[0]`）便于定位。
+    /// 注意口径差异（design §10）：地址含 CRLF 是**拒绝**，不像 subject/headers 那样剥离
+    /// ——「含换行的合法地址」不存在，剥离只会把注入内容粘进地址。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_rejects_illegal_addresses_in_every_recipient_field() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let base = json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"});
+        let cases: Vec<(Value, &str, &str)> = vec![
+            (json!({"to": ["not-an-addr"]}), "to[0]", "地址非法"),
+            (json!({"cc": ["not-an-addr"]}), "cc[0]", "地址非法"),
+            (json!({"bcc": ["not-an-addr"]}), "bcc[0]", "地址非法"),
+            // CRLF 注入地址 → 拒绝（而非剥离成 a@x.comBcc: evil@y.com）。
+            (
+                json!({"to": ["a@x.com\r\nBcc: evil@y.com"]}),
+                "to[0]",
+                "地址非法",
+            ),
+            (json!({"cc": ["a@x.com\n"]}), "cc[0]", "地址非法"),
+            (json!({"bcc": ["a@x.com\r\n"]}), "bcc[0]", "地址非法"),
+            // 元素/字段类型错也走同一 code:5（不静默丢弃该收件人）。
+            (json!({"to": [1]}), "to[0]", "必须是字符串"),
+            (json!({"cc": "a@x.com"}), "cc", "必须是字符串数组"),
+            (json!({"bcc": [null]}), "bcc[0]", "必须是字符串"),
+        ];
+        for (patch, field, reason) in cases {
+            let mut req = base.clone();
+            for (k, v) in patch.as_object().unwrap() {
+                req[k] = v.clone();
+            }
+            let env = handle_send(
+                fake.clone(),
+                empty_blobs(),
+                None,
+                "default",
+                &req.to_string(),
+                MailMode::Send,
+            )
+            .await;
+            assert_eq!(env["code"], 5, "{req} → {env}");
+            let msg = env["msg"].as_str().unwrap();
+            assert!(msg.contains(field), "错误须点名 {field}：{env}");
+            assert!(msg.contains(reason), "错误须给出原因 {reason}：{env}");
+        }
+        assert!(
+            fake.sent.lock().unwrap().is_empty(),
+            "地址校验失败不得触达后端"
+        );
+    }
+
+    /// `headers` **不得覆盖结构化字段**（design §11：`From`/`To`/`Cc`/`Bcc`/`Subject` 决定
+    /// 信封与主题）。这条是白名单绕过面：若放行 `To`，收件人白名单只查结构化 `to`，而信封
+    /// 由报头派生即可把信发给任意人。宿主侧对五个名字（大小写不敏感）一律 `{code:5}`。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_rejects_headers_covering_structured_fields() {
+        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        for name in [
+            "From", "from", "FROM", "To", "to", "Cc", "cc", "Bcc", "bcc", "Subject", "subject",
+        ] {
+            let mut headers = serde_json::Map::new();
+            headers.insert(name.to_string(), Value::String("evil@y.com".into()));
+            let mut req = json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"});
+            req["headers"] = Value::Object(headers);
+
+            let env = handle_send(
+                fake.clone(),
+                empty_blobs(),
+                None,
+                "default",
+                &req.to_string(),
+                MailMode::Send,
+            )
+            .await;
+            assert_eq!(env["code"], 5, "headers 覆盖 {name} 必须拒：{env}");
+            let msg = env["msg"].as_str().unwrap();
+            assert!(
+                msg.contains("headers") && msg.contains(name),
+                "错误须点明头名 {name}：{env}"
+            );
+        }
+        assert!(fake.sent.lock().unwrap().is_empty());
+    }
+
+    /// 收件人白名单覆盖 **to ∪ cc ∪ bcc**（design §10）：任一字段越界即 `{code:5}`，且错误
+    /// 点名越界地址——防「只查 to、漏了 cc/bcc」的静默放行（Bcc 是典型绕过路径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_send_gates_cc_and_bcc_against_allowed_recipients() {
+        let cfg = MailConfig::new(HashMap::from([(
+            "default".to_string(),
+            MailProfileCfg {
+                allowed_from: vec!["noreply@x.com".into()],
+                allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
+            },
+        )]));
+        let fake = FakeMail::new(cfg, Arc::new(Bus::new()));
+
+        for (patch, bad) in [
+            (json!({"cc": ["c@evil.com"]}), "c@evil.com"),
+            (json!({"bcc": ["b@evil.com"]}), "b@evil.com"),
+        ] {
+            let mut req = json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"});
+            for (k, v) in patch.as_object().unwrap() {
+                req[k] = v.clone();
+            }
+            let env = handle_send(
+                fake.clone(),
+                empty_blobs(),
+                None,
+                "default",
+                &req.to_string(),
+                MailMode::Send,
+            )
+            .await;
+            assert_eq!(env["code"], 5, "{req} → {env}");
+            let msg = env["msg"].as_str().unwrap();
+            assert!(
+                msg.contains("allowed_recipients") && msg.contains(bad),
+                "错误须点名越界收件人 {bad}：{env}"
+            );
+        }
+        assert!(fake.sent.lock().unwrap().is_empty(), "越权信不得触达后端");
+
+        // 正向对照：cc/bcc 都在白名单内 → 放行，且三字段原样过线
+        // （防「一刀切拒绝 cc/bcc」的变异也被判绿）。
+        let req = json!({"from": "noreply@x.com", "to": ["a@x.com"],
+                         "cc": ["c@partner.com"], "bcc": ["b@x.com"], "text": "x"});
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &req.to_string(),
+            MailMode::Send,
+        )
+        .await;
+        assert_eq!(env["code"], 0, "{env}");
+        let sent = fake.sent.lock().unwrap().clone();
+        let fwd: Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(fwd["cc"][0], "c@partner.com");
+        assert_eq!(fwd["bcc"][0], "b@x.com");
+    }
+
     /// sendRaw：`raw` 必填且与 `attachments` 互斥；正文/主题不参与校验；from/to 仍校验。
     #[tokio::test(flavor = "current_thread")]
     async fn handle_send_raw_requires_raw_and_forbids_attachments() {

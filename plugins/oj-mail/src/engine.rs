@@ -1081,6 +1081,117 @@ mod tests {
         assert_eq!(v["msg"], "投递失败", "msg 须为脱敏分类文案: {v}");
     }
 
+    /// design §10「每 job `tokio::time::timeout(profile.timeout)`；超时 `code:1`」——**异步路**：
+    /// 投递挂住（闸门永不放行）→ future 在超时点 resolve `code:1`（既不无限等待，也不 panic
+    /// 整个 worker），msg 为脱敏分类文案。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_delivery_timeout_returns_network_code() {
+        let (target, _gate, mut started) = gated_target(Duration::from_millis(50));
+        let mut eng =
+            MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
+                .expect("引擎");
+        let mut fut = eng.submit(PROFILE, &req_raw(Some("j-timeout"), false), vec![]);
+        // 先确认 worker **已进入投递**（否则下面测到的可能只是「还没开始」而非超时）。
+        started.recv().await.expect("worker 应已进入投递");
+
+        let v: Value =
+            serde_json::from_slice(&drive(&mut fut).await.expect("超时必须回信封")).unwrap();
+        assert_eq!(v["code"], CODE_NETWORK, "超时归连接/网络类: {v}");
+        assert_eq!(v["data"]["jobId"], "j-timeout");
+        assert_eq!(
+            v["msg"], "投递超时",
+            "msg 须为脱敏分类文案（无 SMTP 对话）: {v}"
+        );
+        assert!(
+            eng.shutdown(Duration::from_secs(5)).is_ok(),
+            "超时后 worker 应能正常 drain"
+        );
+    }
+
+    /// 同步路同款（`deliver_one` 的 `spawn_blocking` 分支）：阻塞投递超过 `profile.timeout`
+    /// → 同样 `code:1`。`timeout` 只停止**等待**，池中已开始的阻塞调用会跑完（诚实边界，
+    /// 见 `deliver_one` 注释）——本用例末尾放行闸门，不留挂死的 blocking 线程。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_delivery_timeout_returns_network_code() {
+        // 阻塞闸门：`Mutex<Receiver>` 同时满足 Send + Sync（`Receiver` 只 Send）。
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let target = MailTarget::new(
+            Duration::from_millis(50),
+            // 本用例只走同步路（req.sync = true），异步路给立即成功的桩。
+            Arc::new(|_, _| Box::pin(async { Ok("unused".to_string()) })),
+            Arc::new(move |_, _| {
+                let _ = blocked.lock().expect("闸门锁").recv();
+                Err("blocked send".to_string())
+            }),
+        );
+        let mut eng =
+            MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
+                .expect("引擎");
+        let req = json!({
+            "from": "from@example.com", "to": ["to@example.com"],
+            "raw": "Subject: t\r\n\r\nbody", "sync": true, "jobId": "j-sync-timeout",
+        })
+        .to_string();
+
+        let mut fut = eng.submit(PROFILE, &req, vec![]);
+        let v: Value =
+            serde_json::from_slice(&drive(&mut fut).await.expect("超时必须回信封")).unwrap();
+        assert_eq!(v["code"], CODE_NETWORK, "同步路超时归连接/网络类: {v}");
+        assert_eq!(v["data"]["jobId"], "j-sync-timeout");
+        assert_eq!(v["msg"], "投递超时", "{v}");
+
+        let _ = release.send(()); // 放行阻塞线程
+        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+    }
+
+    /// design §10/§11「`msg` 脱敏（无账号/密码/令牌/SMTP 对话）」+「令牌不进信封」：
+    /// 带凭据的 profile 投递失败 → 信封里**不得**出现口令、令牌或用户名，且信封保持
+    /// **严格白名单形态**（`{code,msg,data:{jobId}}`，msg 为分类文案、无原始诊断细节）。
+    /// 凭据只在插件 cfg 里（不进 req），故信封一旦带凭据/对话即是回归。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_envelope_never_carries_credentials() {
+        const PASS: &str = "S3CRET-PASS-42";
+        const TOKEN: &str = "ya29.S3CRET-TOKEN-42";
+        const USER: &str = "mailer@example.com";
+        // 端口 1 无监听 → 真连接失败（凭据确实参与过认证路径，只是尚未发出即断）。
+        let cfg = MailConfig::parse(&format!(
+            r#"{{"workers":2,"queue_capacity":4,
+                 "login":{{"host":"127.0.0.1","port":1,"tls":"none","allow_none_tls":true,"mechanism":"login","user":"{USER}","pass":"{PASS}","timeout":5}},
+                 "oauth":{{"host":"127.0.0.1","port":1,"tls":"none","allow_none_tls":true,"mechanism":"xoauth2","user":"{USER}","xoauth2":{{"access_token":"{TOKEN}"}},"timeout":5}}}}"#
+        ))
+        .expect("cfg");
+        let eng = MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎");
+
+        for (profile, job) in [("login", "j-login"), ("oauth", "j-oauth")] {
+            let mut fut = eng.submit(profile, &req_raw(Some(job), false), vec![]);
+            let out = drive(&mut fut).await.expect("应回信封");
+            let v: Value = serde_json::from_slice(&out).expect("信封是 JSON");
+            assert_eq!(v["code"], CODE_NETWORK, "{profile}: {v}");
+            // 严格形态：只有 code/msg/data 三个键，data 只有 jobId —— 不得夹带诊断细节。
+            // （键序无关：serde_json 的 Map 后端可能是 BTreeMap，故排序后比对。）
+            let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+            top.sort_unstable();
+            assert_eq!(top, ["code", "data", "msg"], "{profile}: {v}");
+            let data: Vec<&str> = v["data"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(data, ["jobId"], "{profile}: {v}");
+            assert_eq!(v["msg"], "投递失败", "{profile} 的 msg 须为分类文案: {v}");
+
+            let text = String::from_utf8(out).expect("UTF-8");
+            for leaked in [PASS, TOKEN, USER, "AUTH", "LOGIN"] {
+                assert!(
+                    !text.contains(leaked),
+                    "{profile} 的信封泄露凭据/认证对话（{leaked}）: {text}"
+                );
+            }
+        }
+    }
+
     /// 生产路径构造「SMTP（pool）transport」引擎：建 transport 本身**不连网**（首次 send
     /// 才连），但该 transport 的 Drop 会 `tokio::spawn`（lettre `pool/async_impl.rs:262`）。
     ///
