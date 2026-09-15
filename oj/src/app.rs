@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oj_plugin_ffi;
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
+use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
@@ -295,6 +296,40 @@ fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, Str
     Ok((jwt, oidc))
 }
 
+/// mail 装配（装配第 N 步，spec 2026-09-15 §4）：顶层 `smtp:` 段 + oj-mail 插件 vtable
+/// → `Arc<dyn MailBackend>`（注入 `Extras.mail` 与 `StableState.mail`，两者同源）。
+///
+/// **一段两用、同源**：给插件的 cfg 与宿主校验面取自 `plugin_cfg(cfg, "mail")`
+/// **同一份 JSON**（`plugins.mail` 透传优先，其次顶层 `smtp:` 段）。宿主只吸收
+/// `allowed_from`/`allowed_recipients`（`MailConfig::from_value`），凭据不落宿主。
+/// 该 JSON 的形态错误（如 `allowed_from` 写了数字）在**装配期** fail-fast，
+/// 不静默退化成「无白名单 → 全部拒绝」。
+///
+/// `bus` 必须与 `Extras.bus` 同一实例：插件经 `deliver("mail.result")` 上送的结果
+/// 由宿主路由存下并扇出给同总线的 JS 订阅者。
+///
+/// 未配 `smtp:`（cfg 为空）或插件未加载 → `None`：`mail.*` 调用报
+/// "mail not configured"（与 es/auth 的「未配置」语义一致）。
+pub fn build_mail_backend(
+    cfg: &Config,
+    vtable: Option<&'static oj_plugin_ffi::MailVtable>,
+    bus: Arc<dyn EventBroker>,
+) -> Result<Option<Arc<dyn MailBackend>>, String> {
+    // 插件未加载（Registrations.mail 为空）→ 无投递能力，不挂后端。
+    let Some(vtable) = vtable else {
+        return Ok(None);
+    };
+    let json = crate::server_cmd::plugin_cfg(cfg, "mail");
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("smtp cfg: {e}"))?;
+    // 空 cfg（既无 `smtp:` 段也无 `plugins.mail` 透传）→ 视作未配置。
+    if value.as_object().is_none_or(|o| o.is_empty()) {
+        return Ok(None);
+    }
+    let mail_cfg = MailConfig::from_value(&value).map_err(|e| format!("smtp: {e}"))?;
+    Ok(Some(Arc::new(FfiMailBackend::new(vtable, mail_cfg, bus))))
+}
+
 /// 静态站点根（装配第 20 步）：config `server.app_path` 相对 config_dir 绝对化（CLI
 /// `--app-path` 覆盖值已在 server_cmd 按 CWD 预绝对化，此处见到的即绝对路径）；
 /// 目录缺失 → fail-fast。
@@ -466,6 +501,9 @@ impl App {
             .connect(&cfg.broker)
             .await
             .map_err(|e| format!("broker: {e}"))?;
+        // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
+        // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
+        let mail = build_mail_backend(&cfg, registries.mail, bus.clone())?;
         // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
         let (kafkas, rabbits) = build_mq_registries(&cfg, &registries.mq).await?;
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
@@ -491,6 +529,7 @@ impl App {
             let boot = boot.clone();
             let jwt = jwt.clone();
             let oidc = oidc.clone();
+            let mail = mail.clone();
             move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -515,8 +554,8 @@ impl App {
                         kafkas: Some(kafkas.clone()),
                         rabbits: Some(rabbits.clone()),
                         tasks_flag,
-                        // mail 后端（阶段 7 由 smtp: 段 + oj-mail 插件装配）。
-                        mail: None,
+                        // mail 后端（smtp: 段 + oj-mail 插件；未配置/未加载 = None）。
+                        mail: mail.clone(),
                     },
                 )
             }
@@ -696,7 +735,7 @@ impl App {
             rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
             tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
-            mail: None, // 阶段 7：与 make_bridge 的 Extras.mail 同源。
+            mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
         });
         Ok(App {
             router,
@@ -896,6 +935,182 @@ mod mq_assembly_tests {
             .await
             .unwrap();
         assert!(kafkas.is_empty() && rabbits.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mail_assembly_tests {
+    use super::*;
+    use oj_plugin_ffi::{FfiFuture, MailAttachment, MailVtable, RString, RVec};
+    use only_js::bridge::RequestInfo;
+    use only_js::bridge::mail::{MailMode, handle_send};
+
+    /// 假 mail vtable：submit 回固定信封（装配测试零网络、零插件）。jobId 回显 key，
+    /// 证明 profile 名确实过线（不是被适配器吞掉）。
+    extern "C" fn fake_submit(
+        key: RString,
+        _req: RString,
+        _atts: RVec<MailAttachment>,
+    ) -> FfiFuture {
+        oj_plugin_ffi::ready_ok(
+            format!(
+                r#"{{"code":0,"msg":"ok","data":{{"jobId":"j-{}"}}}}"#,
+                &key[..]
+            )
+            .into_bytes(),
+        )
+    }
+    static FAKE_MAIL: MailVtable = MailVtable {
+        submit: fake_submit,
+    };
+
+    /// 顶层 `smtp:` 段：多 profile（默认/本地落盘）+ 白名单 + 并发参数。
+    fn smtp_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.smtp = Some(
+            serde_yaml::from_str(
+                "workers: 2\n\
+                 queue_capacity: 8\n\
+                 default:\n  host: smtp.example.com\n  port: 465\n  tls: tls\n  \
+                 mechanism: login\n  user: u\n  pass: p\n  \
+                 allowed_from: [noreply@x.com]\n  allowed_recipients: [\"@x.com\"]\n\
+                 mock:\n  host: localhost\n  port: 25\n  tls: none\n  allow_none_tls: true\n  \
+                 mechanism: login\n  file_transport: /tmp/oj-mail-assembly-eml\n",
+            )
+            .unwrap(),
+        );
+        cfg
+    }
+
+    /// Given: 顶层 `smtp:` 段（多 profile + 白名单）+ oj-mail 插件在册；
+    /// When: 装配期构造 mail 后端；
+    /// Then: `Extras.mail` 注入可用后端 —— 宿主校验面与插件 cfg **同源**，
+    /// JS 全局 `mail.send` 走通「宿主校验 → vtable」全链（越白名单仍 code:5）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_smtp_configured_when_assemble_then_mail_backend_injected() {
+        let cfg = smtp_cfg();
+        let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
+        let mb = build_mail_backend(&cfg, Some(&FAKE_MAIL), bus)
+            .unwrap()
+            .expect("smtp 段 + 插件在册 → 必须注入 mail 后端");
+        // 非密钥面：profile 名单 / 白名单（宿主校验依据）。
+        assert_eq!(mb.config().profile_keys(), vec!["default", "mock"]);
+        let p = mb.config().profile("default").unwrap();
+        assert_eq!(p.allowed_from, vec!["noreply@x.com".to_string()]);
+        assert_eq!(p.allowed_recipients, vec!["@x.com".to_string()]);
+        // mock profile 未声明白名单 → 空表（fail-closed 的判定依据）。
+        assert!(mb.config().profile("mock").unwrap().allowed_from.is_empty());
+
+        // 经 Extras → StableState → JS 全局：装配产物真的能服务 `mail.*`。
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                mail: Some(mb.clone()),
+                ..Default::default()
+            },
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const ok = await mail.send({ from: "noreply@x.com", to: ["a@x.com"], text: "hi" });
+                    const bad = await new Mail("default").send({ from: "evil@y.com", to: ["a@x.com"], text: "hi" });
+                    json.ok({ ok, bad });
+                  })().catch((e) => json.ok({ err: String(e) }));
+                  "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"].get("err").is_none(), "{v}");
+        assert_eq!(v["data"]["ok"]["code"], 0, "{v}");
+        assert_eq!(v["data"]["ok"]["data"]["jobId"], "j-default", "{v}");
+        assert_eq!(v["data"]["bad"]["code"], 5, "{v}");
+        assert!(
+            v["data"]["bad"]["msg"]
+                .as_str()
+                .unwrap()
+                .contains("allowed_from"),
+            "{v}"
+        );
+
+        // 直接编排（同一后端）：白名单放行的那封同样到插件（key 过线）。
+        let env = handle_send(
+            mb.clone(),
+            Arc::new(BlobRegistry::new()),
+            None,
+            "mock",
+            &serde_json::json!({
+                "from": "anyone@localhost", "to": ["a@localhost"], "text": "x",
+            })
+            .to_string(),
+            MailMode::Send,
+        )
+        .await;
+        // mock profile 白名单为空 → fail-closed（即便 profile 存在也拒绝）。
+        assert_eq!(env["code"], 5, "{env}");
+        assert!(
+            env["msg"].as_str().unwrap().contains("allowed_from"),
+            "{env}"
+        );
+    }
+
+    /// Given: 未配 `smtp:`（或空段）／配了但插件未加载；
+    /// Then: 不挂后端（None）——`mail.*` 调用报 "mail not configured"
+    /// （与 es/auth 的「未配置」语义一致；不静默降级成空 profile 的谜之 code:5）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_no_smtp_or_no_plugin_when_assemble_then_no_backend() {
+        let bus = || -> Arc<dyn EventBroker> { Arc::new(only_js::bridge::Bus::new()) };
+        // 段缺省。
+        assert!(
+            build_mail_backend(&Config::default(), Some(&FAKE_MAIL), bus())
+                .unwrap()
+                .is_none()
+        );
+        // 空段（`smtp: {}`，零 profile）= 未配置。
+        let mut empty = Config::default();
+        empty.smtp = Some(Default::default());
+        assert!(
+            build_mail_backend(&empty, Some(&FAKE_MAIL), bus())
+                .unwrap()
+                .is_none()
+        );
+        // 配了段但 oj-mail 未加载（`Registrations.mail = None`）。
+        assert!(
+            build_mail_backend(&smtp_cfg(), None, bus())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Given: 配置写错（`allowed_from` 是数字数组，经 `plugins.mail` 透传进来）；
+    /// When: 装配；Then: **装配期** Err —— 不静默变成「无白名单 → 全部拒绝」。
+    /// （透传与 `smtp:` 适配器走同一份 JSON，故两条路的校验面同源。）
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_malformed_whitelist_when_assemble_then_err() {
+        let mut cfg = Config::default();
+        cfg.plugins.insert(
+            "mail".into(),
+            serde_json::json!({
+                "default": {
+                    "host": "h", "port": 25, "tls": "none", "allow_none_tls": true,
+                    "mechanism": "login", "allowed_from": [1, 2],
+                }
+            }),
+        );
+        let e = match build_mail_backend(
+            &cfg,
+            Some(&FAKE_MAIL),
+            Arc::new(only_js::bridge::Bus::new()),
+        ) {
+            Ok(_) => panic!("allowed_from 写错必须在装配期报错"),
+            Err(e) => e,
+        };
+        assert!(e.contains("allowed_from"), "{e}");
     }
 }
 

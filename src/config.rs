@@ -297,6 +297,88 @@ impl Default for AuthCfg {
     }
 }
 
+/// SMTP 投递（mail 轴，spec 2026-09-15）：段存在即启用 `mail.*` 全局（须配 oj-mail 插件）。
+///
+/// **一段两用**：整段序列化为 JSON 交给 `oj-mail` 插件建 transport（凭据只走插件、
+/// 不落宿主 JS 面）；宿主另经 `MailConfig::from_value` 只吸收每个 profile 的
+/// `allowed_from`/`allowed_recipients` 做前置白名单校验。二者读同一段配置
+/// （装配层把同一份 JSON 同时喂插件 cfg 与宿主校验面，避免两边分叉）。
+///
+/// 顶层除 `workers`/`queue_capacity` 外**每个键都是一个 profile**（键 = `Mail.b(key)` /
+/// `mail.send` 的 profile 名）；未声明的键即未知 profile → 调用返回 `{code:5}`。
+// Serialize：装配层原样透传给 oj-mail 插件（spec §3 按值传入；空字段省略而非 null
+// ——插件侧 `ProfileCfg` 是强类型 `Deserialize`，`null` 会直接报错）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SmtpSection {
+    /// worker 线程数（省略 = 插件默认 4）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<usize>,
+    /// 有界队列容量（省略 = 插件默认 256；满即背压，不无界堆积）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_capacity: Option<usize>,
+    /// profile 名 → 配置（`flatten` 收拢其余顶层键；键序不影响语义）。
+    #[serde(flatten)]
+    pub profiles: HashMap<String, SmtpProfileCfg>,
+}
+
+/// 单个 mail profile 的连接与投递配置（**镜像 `oj-mail` 插件 schema**：字段名/取值域一致，
+/// 宿主不解释连接字段，只保证类型化解析与「空字段省略」的过线形态）。
+/// 校验（`tls: none` 须显式 `allow_none_tls` 等）归插件 init：宿主不做第二套判断。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SmtpProfileCfg {
+    /// SMTP 服务器主机名（同时用作 TLS 证书校验域名）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// SMTP 端口。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// 加密模式：`tls`（隐式 TLS）| `starttls`（强制升级）| `none`（明文，须显式许可）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<String>,
+    /// 显式允许 `tls: none`（明文）。缺省 = 拒绝（fail-closed）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_none_tls: Option<bool>,
+    /// 认证机制：`login` | `xoauth2`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mechanism: Option<String>,
+    /// 认证用户名（无认证中继可省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// 认证口令（`mechanism: login` 用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass: Option<String>,
+    /// XOAUTH2 凭据（`mechanism: xoauth2` 用；本版仅静态 `access_token`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xoauth2: Option<SmtpXOAuth2Cfg>,
+    /// 单次 SMTP 命令超时（秒；省略 = 插件默认 30）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// 本地落盘目录：给定时**不发网络**，`.eml` 写进该目录（FileTransport：测试/归档通道）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_transport: Option<String>,
+    /// 发件人白名单（后缀匹配、大小写不敏感）。**空表 = 拒绝**（fail-closed）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_from: Vec<String>,
+    /// 收件人白名单（to/cc/bcc 后缀匹配）。**空表 = 拒绝**（fail-closed）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_recipients: Vec<String>,
+}
+
+/// XOAUTH2 凭据（`mechanism: xoauth2`）：本版只用静态 `access_token`；
+/// 只给 `refresh_token` 由插件 fail-loud（刷新流程未支持）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SmtpXOAuth2Cfg {
+    /// 静态访问令牌（submit 时作为 Bearer 使用）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    /// 刷新令牌（本版不消费，仅为给出明确报错而解析）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
 /// RP 客户端注册：tenant → 外部 IdP（issuer + 凭证）。
 #[derive(Debug, Deserialize, Clone)]
 pub struct OidcRpCfg {
@@ -388,6 +470,9 @@ pub struct Config {
     pub oidc: Option<OidcSection>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
     pub blob: Option<BlobSection>,
+    /// None = 不启用 mail（`mail.*` 全局报 "mail not configured"）；段存在即启用。
+    /// 段由 `oj-mail` 插件投递、宿主持白名单校验与附件解析（见 [`SmtpSection`]）。
+    pub smtp: Option<SmtpSection>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
     pub es: Option<EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
@@ -844,6 +929,123 @@ mod tests {
         std::fs::write(dir.join("cfg.yaml"), "server: [broken").unwrap();
         assert!(load_from(&dir, Some("cfg.yaml")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `smtp:` 段（mail 轴，spec 2026-09-15）：**一段两用**——整段序列化交给 `oj-mail`
+    /// 插件（含凭据）建 transport；宿主另只吸收非密钥面（`MailConfig::from_value`）。
+    /// 断言重点是「过线的 JSON 形态」：空字段必须**不出现**（`null` 会让插件的强类型
+    /// `Deserialize` 直接报错），凭据/白名单/并发参数原样带过去。
+    #[test]
+    fn smtp_section_parses_profiles_and_serializes_for_plugin() {
+        let dir = std::env::temp_dir().join(format!("ojcfgsmtp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "smtp:\n",
+                "  workers: 2\n",
+                "  queue_capacity: 8\n",
+                "  default:\n",
+                "    host: smtp.example.com\n",
+                "    port: 465\n",
+                "    tls: tls\n",
+                "    mechanism: login\n",
+                "    user: api@x.com\n",
+                "    pass: SECRET\n",
+                "    timeout: 30\n",
+                "    allowed_from: [noreply@x.com]\n",
+                "    allowed_recipients: [\"@x.com\", \"@partner.com\"]\n",
+                "  oauth:\n",
+                "    host: smtp.other.com\n",
+                "    port: 587\n",
+                "    tls: starttls\n",
+                "    mechanism: xoauth2\n",
+                "    user: api@y.com\n",
+                "    xoauth2: { access_token: \"ya29.TOKEN\" }\n",
+                "    allowed_from: [alert@y.com]\n",
+                "    allowed_recipients: [\"@y.com\"]\n",
+                "  mock:\n",
+                "    host: localhost\n",
+                "    port: 25\n",
+                "    tls: none\n",
+                "    allow_none_tls: true\n",
+                "    mechanism: login\n",
+                "    file_transport: /tmp/oj-mail-eml\n",
+                "    allowed_from: [noreply@x.com]\n",
+                "    allowed_recipients: [\"@x.com\"]\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let s = c.smtp.expect("smtp 段存在");
+        assert_eq!((s.workers, s.queue_capacity), (Some(2), Some(8)));
+        assert_eq!(s.profiles.len(), 3);
+        let d = &s.profiles["default"];
+        assert_eq!(d.host.as_deref(), Some("smtp.example.com"));
+        assert_eq!(d.port, Some(465));
+        assert_eq!(d.tls.as_deref(), Some("tls"));
+        assert_eq!(d.allow_none_tls, None); // 未写 = 默认拒绝（插件侧 fail-closed）
+        assert_eq!(d.mechanism.as_deref(), Some("login"));
+        assert_eq!(d.user.as_deref(), Some("api@x.com"));
+        assert_eq!(d.pass.as_deref(), Some("SECRET"));
+        assert_eq!(d.timeout, Some(30));
+        assert_eq!(d.allowed_from, vec!["noreply@x.com".to_string()]);
+        assert_eq!(
+            d.allowed_recipients,
+            vec!["@x.com".to_string(), "@partner.com".to_string()]
+        );
+        assert!(d.xoauth2.is_none() && d.file_transport.is_none());
+        let o = &s.profiles["oauth"];
+        assert_eq!(
+            o.xoauth2.as_ref().and_then(|x| x.access_token.as_deref()),
+            Some("ya29.TOKEN")
+        );
+        assert!(o.xoauth2.as_ref().unwrap().refresh_token.is_none());
+        let m = &s.profiles["mock"];
+        assert_eq!(m.file_transport.as_deref(), Some("/tmp/oj-mail-eml"));
+        assert_eq!(m.allow_none_tls, Some(true));
+
+        // 过线 JSON（= 给插件的 cfg）：键名与插件 schema 一致（workers/queue_capacity +
+        // 每个 profile 一个键），空字段省略而非 null。
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["workers"], 2);
+        assert_eq!(j["queue_capacity"], 8);
+        assert_eq!(j["default"]["host"], "smtp.example.com");
+        assert_eq!(j["default"]["pass"], "SECRET");
+        assert_eq!(j["default"]["timeout"], 30);
+        assert_eq!(j["mock"]["file_transport"], "/tmp/oj-mail-eml");
+        assert_eq!(j["mock"]["allow_none_tls"], true);
+        assert!(j["mock"].get("user").is_none(), "{j}");
+        assert!(j["mock"].get("pass").is_none(), "{j}");
+        assert!(j["default"].get("allow_none_tls").is_none(), "{j}");
+        assert!(j["default"].get("file_transport").is_none(), "{j}");
+        assert!(j["oauth"]["xoauth2"].get("refresh_token").is_none(), "{j}");
+        // `allowed_*` 属宿主校验面（插件忽略未知字段），但**必须在同一份过线 JSON 里**
+        // ——宿主与插件的配置面同源（`MailConfig::from_value` 吃同一份），否则两边分叉。
+        assert_eq!(j["default"]["allowed_from"][0], "noreply@x.com");
+        assert_eq!(j["default"]["allowed_recipients"][1], "@partner.com");
+
+        // 形态错误在**装配期**暴露（不静默变成「无白名单」）：port 非数字 / 段非映射。
+        std::fs::write(
+            dir.join("bad.yaml"),
+            "smtp:\n  default:\n    host: h\n    port: not-a-number\n",
+        )
+        .unwrap();
+        assert!(load_from(&dir, Some("bad.yaml")).is_err());
+        assert!(serde_yaml::from_str::<Config>("smtp: [1, 2]\n").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// smtp 段缺省 → None（`mail.*` 报未配置）；空段 `smtp: {}` → Some（零 profile，
+    /// 装配层按「空 cfg」处理为未配置）。
+    #[test]
+    fn smtp_section_absent_is_none_and_empty_is_some() {
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.smtp.is_none());
+        let c: Config = serde_yaml::from_str("smtp: {}\n").unwrap();
+        let s = c.smtp.expect("段存在");
+        assert!(s.profiles.is_empty());
+        assert_eq!(serde_json::to_value(&s).unwrap().to_string(), "{}");
     }
 
     #[test]
