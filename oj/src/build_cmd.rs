@@ -17,9 +17,14 @@ use crate::args::BuildArgs;
 
 /// 构建入口：单模块或全部（None）。内省器自带独立线程 runtime；async 仅因内存库初始化。
 pub async fn run(a: &BuildArgs) -> Result<(), String> {
-    let src = PathBuf::from(&a.dir)
-        .canonicalize()
-        .map_err(|e| format!("src dir '{}': {e}", a.dir))?;
+    // canonicalize 解析 8.3 短名（Windows `RUNNER~1` ↔ 长名）并归一；strip_verbatim 去
+    // `\\?\` 前缀，使后续所有本地路径（含 `resolve_to_segs` 的 `strip_prefix`、loader 的
+    // `module_root_of`）与 referrer 目录词法一致，避免 Windows 上别名解析误判「未找到模块根」。
+    let src = only_js::bridge::strip_verbatim(
+        &PathBuf::from(&a.dir)
+            .canonicalize()
+            .map_err(|e| format!("src dir '{}': {e}", a.dir))?,
+    );
     let out = PathBuf::from(&a.out);
     // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
     let tasks_dir = tasks_dir_of(&a.config);
@@ -421,15 +426,10 @@ async fn introspect_module_files(
     mdir: &Path,
     files: &[(PathBuf, bool)],
 ) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
-    // 与 dev 一致：project_root 走 canonicalize，使 `versioned_specifier` 给出的
-    // referrer 目录（Windows 带 `\\?\` verbatim 前缀）与 project_root 词法可比——
-    // `module_root_of` 的 `starts_with(project_root)` 否则在 Windows 上因前缀不一致
-    // 误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
-    let root = src
-        .parent()
-        .unwrap_or(src)
-        .canonicalize()
-        .unwrap_or_else(|_| src.parent().unwrap_or(src).to_path_buf());
+    // `src` 在 `run` 入口已 canonicalize + strip_verbatim（Windows 去 `\\?\` 前缀，长名），
+    // 故 project_root 与 loader 经 `versioned_specifier` 给出的 referrer 目录词法可比，
+    // `module_root_of` 不会再误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
+    let root = src.parent().unwrap_or(src).to_path_buf();
     // ext_boot：与 dev 同源探测（src 父目录 = 项目根），保证 dev/build/release 三处一致。
     let boot = crate::app::ext_boot_spec(&root)?;
     let mut dbs: HashMap<String, Arc<dyn only_js::bridge::DataAccessor>> = HashMap::new();
