@@ -298,7 +298,9 @@ globalThis.es = {
 // ----- mail / Mail(key): SMTP send (host validates + resolves attachment bytes; the
 // oj-mail plugin owns transports/queue). All methods resolve the {code,msg,data} envelope
 // -- validation failures come back as {code:5} (no throw); only "mail not configured"
-// throws. Delivery errors: 1 network, 2 smtp 5xx, 3 auth, 4 queue full, 5 bad input.
+// throws. Delivery errors: 1 network/timeout (and every delivery-time failure, incl.
+// SMTP 5xx and auth); 4 queue full; 5 bad input. 2 (smtp 5xx) and 3 (auth) are RESERVED
+// / not enabled -- both fold into 1, so test failures with `code !== 0`.
 // enqueue() resolves {code:0,data:{jobId}} and the real completion is published on the
 // bus topic "mail.result" as the flat {jobId,code,msg,messageId} (no to/subject).
 // attachments[i]: {filename, blobKey|path, mime?} -- blobKey rides the blob registry,

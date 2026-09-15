@@ -650,8 +650,13 @@ fn fail_envelope(job_id: &str, code: i32, msg: &str) -> String {
 }
 
 /// 背压信封（design §10：队列满 → `code:4`，`submit` 立即返回，不冻结调用方）。
+/// 文案与全链其余信封统一为中文（A6），并给下一步（`code:4` 语义不变）。
 fn queue_full_envelope(job_id: &str) -> String {
-    fail_envelope(job_id, CODE_QUEUE_FULL, "queue full")
+    fail_envelope(
+        job_id,
+        CODE_QUEUE_FULL,
+        "mail: 队列已满（背压：不阻塞调用方）（下一步：稍后重试，或调大 smtp.queue_capacity）",
+    )
 }
 
 /// 未知 profile 的文案（submit 期 fast-fail 与 worker 兜底**共用一处**，不写第二份判断）。
@@ -852,6 +857,12 @@ mod tests {
         let v: Value = serde_json::from_slice(&drive(&mut fut).await.expect("应回信封")).unwrap();
         assert_eq!(v["code"], CODE_QUEUE_FULL, "信封: {v}");
         assert_eq!(v["data"]["jobId"], "j-c");
+        // A6：文案与全链统一为中文（不再回英文 "queue full"），且指出下一步。
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("队列已满") && msg.contains("下一步"),
+            "背压文案须中文且给下一步：{v}"
+        );
 
         // 放行 A/B：队列被消费完 → drain 成功（也证明 A/B 确实在队列/在途，而非被丢弃）。
         gate.add_permits(2);

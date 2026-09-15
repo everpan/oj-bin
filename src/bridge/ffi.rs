@@ -574,8 +574,16 @@ pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
 pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
     let raw = payload[..].to_vec();
     if &topic[..] == super::mail::MAIL_RESULT_TOPIC {
-        if !super::mail::route_deliver(&raw) {
-            eprintln!("warn: mail.result 上送但 mail 未配置（结果丢弃）");
+        // 两种失败成因分开告警（A6）：排障方向不同 —— 「没配 mail」是部署问题，
+        // 「载荷非法」是插件上送的内容不符合结果信封契约。
+        match super::mail::route_deliver(&raw) {
+            super::mail::DeliverRoute::Routed(_) => {}
+            super::mail::DeliverRoute::NotConfigured => {
+                eprintln!("warn: mail.result 上送但 mail 未配置（结果丢弃）");
+            }
+            super::mail::DeliverRoute::BadPayload => {
+                eprintln!("warn: mail.result 载荷非法（缺 jobId/code/msg 或非 JSON）——结果丢弃");
+            }
         }
         return;
     }

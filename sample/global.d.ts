@@ -233,8 +233,10 @@ interface OidcApi {
 // mail / Mail(key) ：邮件投递（config smtp: 段 + oj-mail 插件启用；未配置调用报
 // mail not configured）。宿主做校验/附件解析，插件做投递；所有方法**都 resolve 信封**
 // （校验失败 = {code:5}，不抛），只有「未配置」抛异常。
-// code：0 成功（data.messageId 为投递凭据、data.jobId 为作业号）/ 1 网络/超时 /
-// 2 SMTP 5xx / 3 鉴权 / 4 队列满 / 5 入参校验（地址、白名单、正文、附件、profile）。
+// code：0 成功（data.messageId 为投递凭据、data.jobId 为作业号）/ 1 网络/超时（**以及
+// 一切投递期失败**，含 SMTP 5xx 与鉴权失败）/ 4 队列满 / 5 入参校验（地址、白名单、正文、
+// 附件、profile）。**2（SMTP 5xx）/ 3（鉴权）为保留未启用**：两类都归 1，判失败请用
+// `code !== 0`（见 docs/mail-smtp.md §3）。
 interface MailEnvelope {
   code: number;
   msg: string;

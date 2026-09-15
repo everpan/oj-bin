@@ -64,6 +64,17 @@
     isolate 的 `current_thread` runtime 空转烧满一核。改用 `await_ffi_poll`
     （`FFI_POLL_BACKOFF = 2ms` 退避；poll/take/free 与取消语义同 `await_ffi`），
     补用例钉住「pending 期间必须退避睡眠」（变异：换回 `await_ffi` ⇒ 20 次 pending 仅 409µs，红）。
+  - **文档↔实现漂移与死代码**（Minor）：
+    - `src/bridge/bootstrap.js`（注释，7-bit ASCII）与 `sample/global.d.ts` 曾把 `code:2`
+      （SMTP 5xx）/`code:3`（鉴权）写成可用；实际**保留未启用**（均归 `1`）→ 两处改为
+      「RESERVED / 保留未启用」，与 `docs/mail-smtp.md` §3 一致。
+    - `src/bridge/mail.rs` 的 `resolve_attachments` 删除死变量 `hint`（含 `let _ = &hint;`）。
+    - 插件 `message.rs` 的 `SendRequest.subject` 注释原说「raw 路原文 `Subject:` 会被剥离」，
+      与实现（**保留**，结构化非空时覆盖）矛盾 → 订正为与 `build_raw` 一致。
+    - 插件 `engine.rs` 的背压文案 `"queue full"` → 中文（「队列已满…下一步…」），
+      `code:4` 语义不变；用例改为钉住新文案。
+    - `src/bridge/ffi.rs` 的 `host_deliver` 原把「载荷非法」与「mail 未配置」都打成
+      「mail 未配置」→ 细分 `DeliverRoute`（`Routed`/`NotConfigured`/`BadPayload`）分开告警。
 - **IDE 类型：`#` 别名报 TS2307、`QueryBuilder`/`json` 声明滞后**（`sample/global.d.ts`、
   `sample/tsconfig.json`、`sample/types/oj-modules.d.ts`）：
   - `QueryBuilder` 补 `join`（`{left,right}[]` + kind）/`distinct`/`groupBy`/`having`/`union`/`with`/`toJSON`；
