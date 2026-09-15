@@ -43,8 +43,8 @@
     第 6 章 mail 小节。
 
 **修复**
-- **mail 统一审查批次 A：enqueue 契约 / worker 强引用释放顺序 / 停机 drain 可达 / 忙等**
-  - **`enqueue` 回统一信封**（Blocker）：插件引擎原回**裸** `{jobId}`，与三层公开契约
+- **mail：enqueue 契约 / worker 强引用释放顺序 / 停机 drain 可达 / 忙等**
+  - **`enqueue` 回统一信封**：插件引擎原回**裸** `{jobId}`，与三层公开契约
     （`global.d.ts`、`api-manual` §6、`mail-smtp.md` §6「`res.data.jobId`」）不符 ——
     用户按手册写 `res.data.jobId` 会 TypeError 且拿不到 jobId 去 `mail.result()` 回查。
     引擎改回 `{code:0,msg:"ok",data:{jobId}}`；宿主加**纵深防御**（插件返回顶层无 `code`
@@ -77,15 +77,15 @@
       `code:4` 语义不变；用例改为钉住新文案。
     - `src/bridge/ffi.rs` 的 `host_deliver` 原把「载荷非法」与「mail 未配置」都打成
       「mail 未配置」→ 细分 `DeliverRoute`（`Routed`/`NotConfigured`/`BadPayload`）分开告警。
-- **mail 统一审查批次 B：白名单匹配语义 / 附件上限 / 结果归属 / 裸 CR / 弱 spoof 头 / 文案**
-  - **白名单匹配语义可被绕过**（Blocker，B1）：原实现对条目做裸 `ends_with` 后缀匹配，三处
+- **mail：白名单匹配语义 / 附件上限 / 结果归属 / 裸 CR / 弱 spoof 头 / 文案**
+  - **白名单匹配语义可被绕过**：原实现对条目做裸 `ends_with` 后缀匹配，三处
     越权面：① `allowed_from: ["noreply@x.com"]` 放行同域仿冒 `evil-noreply@x.com`；
     ② 漏写 `@` 的条目（`["x.com"]`）放行跨域 `a@evilx.com`；③ `[""]`（空条目）令
     `ends_with("")` 恒真 = **白名单等于关闭**。改为**全等**匹配（条目只能是完整地址
     （地址全等）或 `@domain`（域全等），大小写不敏感；**不做子域通配**，子域须显式
     `@sub.x.com`），并在**装配期**逐条校验条目格式（空串/裸域/首尾空白 → 启动失败，
     文案点名 `smtp.<profile>.<字段>[<下标>]` + 下一步）；匹配期非法条目 fail-closed。
-  - **附件无大小上限 + 同步读盘**（Blocker，B2）：新增 `smtp.max_attachment_bytes`
+  - **附件无大小上限 + 同步读盘**：新增 `smtp.max_attachment_bytes`
     （默认 10 MiB）与 `smtp.max_total_attachment_bytes`（默认 25 MiB），超限 `code:5`；
     `path` 路先取长度再读（超限文件不进内存）；读盘 `std::fs::read` → `tokio::fs::read`
     （内部 spawn_blocking，不再阻塞 isolate 的 `current_thread`）；插件侧再复核一次
@@ -109,7 +109,7 @@
     From/To/Cc/Bcc/Subject 扩到含 `Sender`/`Return-Path`/`Reply-To`（宿主与插件同清单）；
     raw 路剥离清单增 `Sender`/`Return-Path`（`Reply-To` 保留：raw 是调用方自备原文、它不改变
     信封与发件人身份）；**raw 与结构化 `headers` 互斥**由「静默忽略」改为 fail-loud `code:5`。
-  - **文案与告警**（Minor，B6）：白名单未命中的文案不再 `{:?}` 回显**整份白名单**（换个
+  - **文案与告警**：白名单未命中的文案不再 `{:?}` 回显**整份白名单**（换个
     profile key 即可枚举他 profile 的内域/客户域），只回「未命中 + profile 名」+ 下一步；
     `messageId` 由 MTA 原始应答改为「队列号或截断到 64 字符」（去服务器指纹/队列信息）；
     `tls: none`（明文）的 profile 在启动时打 **warn 级**告警（含 profile 名与 host:port，
@@ -167,21 +167,21 @@
   ——与 es/auth 的「配置声明即 fail-fast」不同（mail 缺插件不构成安全失守，故意放行启动）。
   装插件：`cargo xtask plugin mail`。
 - **`file_transport` 目录须先存在**（lettre 不建目录）；非空 `allowed_*` 是发信前提。
-- **mail 双配置源互斥**（A5）：顶层 `smtp:` 与**非空** `plugins.mail` 同时出现时，
+- **mail 双配置源互斥**：顶层 `smtp:` 与**非空** `plugins.mail` 同时出现时，
   此前 `plugins.mail`（原样透传）会**静默胜出**（改 `smtp:` 里的白名单/凭据不生效）；
   现在**装配期直接报错**（`pick one`），启动即暴露。`plugins: {mail: {}}`（空对象）
   不受影响 —— 它是「回落 `smtp:` 适配器」的写法（也是本仓 e2e 夹具的形态）。
-- **白名单条目语义收紧**（B1，需核对配置）：匹配由「裸后缀」改为**全等** ——
+- **白名单条目语义收紧**（需核对配置）：匹配由「裸后缀」改为**全等** ——
   ① `@x.com` **不再**覆盖子域（要子域须显式写 `@sub.x.com`）；② 裸域/空条目/首尾空白
   现在让**启动失败**（此前空条目会让白名单恒真）。若原配置靠后缀匹配「顺带」覆盖了一批域，
   请逐条补全。
-- **`mail.result` 归属收窄 + jobId 形态变化**（B3）：enqueue 的 jobId 改由**宿主**生成
+- **`mail.result` 归属收窄 + jobId 形态变化**：enqueue 的 jobId 改由**宿主**生成
   （`<16 hex>-<序号>`，调用方传入值被忽略）；结果按「profile + 模块 + 租户」过滤 ——
   **跨模块回查不再可用**（改用 `bus.subscribe("mail.result")` 做通知）。
-- **附件默认上限**（B2）：单件 10 MiB / 单封合计 25 MiB，超限 `code:5`；确有更大附件需求
+- **附件默认上限**：单件 10 MiB / 单封合计 25 MiB，超限 `code:5`；确有更大附件需求
   请在 `smtp:` 顶层调 `max_attachment_bytes` / `max_total_attachment_bytes`。
-- **`sendRaw` 与 `headers` 互斥**（B5）：同时给会在宿主侧 `code:5`（此前静默忽略 `headers`）。
-- **正文裸 CR 归一为 CRLF**（B4）：`text`/`html`/`raw` 正文里的裸 `\r` 由「原样保留」改为
+- **`sendRaw` 与 `headers` 互斥**：同时给会在宿主侧 `code:5`（此前静默忽略 `headers`）。
+- **正文裸 CR 归一为 CRLF**：`text`/`html`/`raw` 正文里的裸 `\r` 由「原样保留」改为
   归一到 `\r\n`（防 SMTP smuggling）；raw **头区**含裸 CR 则直接 `code:5`。
 
 
