@@ -330,6 +330,20 @@ pub fn build_mail_backend(
     Ok(Some(Arc::new(FfiMailBackend::new(vtable, mail_cfg, bus))))
 }
 
+/// 停机排空的**逻辑**（[`App::drain_mail`] 的唯一实现；独立成函数便于单测）：
+/// 经 `MailBackend::drain`（控制报文）让插件停收新投递、等在途 job 跑完再销毁 transport。
+///
+/// 返回统一信封：`code:0`（`data.drained` 标记是否真排空）/ `code:1`（超时，在途可能被丢弃）；
+/// 后端调用失败也收敛为 `code:1` 信封（停机路径只告警，不阻断进程退出）。
+pub fn drain_mail_backend(mail: &Arc<dyn MailBackend>, timeout: Duration) -> serde_json::Value {
+    match mail.drain(timeout) {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({
+            "code": 1, "msg": format!("mail: drain 调用失败（{e}）"), "data": {"drained": false},
+        }),
+    }
+}
+
 /// 静态站点根（装配第 20 步）：config `server.app_path` 相对 config_dir 绝对化（CLI
 /// `--app-path` 覆盖值已在 server_cmd 按 CWD 预绝对化，此处见到的即绝对路径）；
 /// 目录缺失 → fail-fast。
@@ -764,14 +778,16 @@ impl App {
     }
 
     /// 绑定并服务（行为同原 `start`：`.merge(ws)` 已在 from_config 完成；port-0 随机端口）。
-    pub async fn serve(self, addr: SocketAddr) -> Result<(SocketAddr, JoinHandle<()>), String> {
+    /// `&self`（不消费 App）：停机路径还要用它做 `drain_mail`（在途邮件排空）。
+    pub async fn serve(&self, addr: SocketAddr) -> Result<(SocketAddr, JoinHandle<()>), String> {
         self.serve_graceful(addr, std::future::pending()).await
     }
 
     /// 绑定并服务 + 优雅停机（spec §6 ⑤）：`shutdown` resolve 后停止接受新连接、
-    /// 排空在途请求（与任务池停机同一信号触发）。
+    /// 排空在途请求（与任务池停机同一信号触发）。`&self`：调用方在服务停止后仍需
+    /// 用它做停机排空（`drain_mail`）。
     pub async fn serve_graceful(
-        self,
+        &self,
         addr: SocketAddr,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(SocketAddr, JoinHandle<()>), String> {
@@ -781,8 +797,9 @@ impl App {
         let bound = listener
             .local_addr()
             .map_err(|e| format!("local_addr: {e}"))?;
+        let router = self.router.clone(); // Router 克隆廉价（内部 Arc）
         let h = tokio::spawn(async move {
-            let _ = server::serve_router(listener, self.router, shutdown).await;
+            let _ = server::serve_router(listener, router, shutdown).await;
         });
         Ok((bound, h))
     }
@@ -790,6 +807,30 @@ impl App {
     /// 长任务停机 flag（server_cmd 信号处理器置位）。
     pub fn tasks_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.tasks_flag.clone()
+    }
+
+    /// 停机排空在途邮件（spec §6 ⑤「停机 graceful drain」）：SIGTERM/正常退出的停机路径调用
+    /// （HTTP 停收 + 任务收场**之后**，进程退出之前）。
+    ///
+    /// 控制报文 drain 是**同步**语义（会等至多 `timeout`）⇒ 放 blocking 池，不占 reactor 线程。
+    /// 失败只告警不阻断：停机路径的目标是「尽力送达」，不是「保证送达」。
+    pub async fn drain_mail(&self, timeout: Duration) {
+        let Some(mail) = self.stable.mail.clone() else {
+            return; // 未配 smtp / 未装 oj-mail：无可排空
+        };
+        match tokio::task::spawn_blocking(move || drain_mail_backend(&mail, timeout)).await {
+            Ok(v) if v["code"] == 0 && v["data"]["drained"] == true => {
+                eprintln!("mail: drain ok（在途投递已排空）");
+            }
+            Ok(v) => {
+                // 超时或后端不支持：如实告警（超时 ⇒ 在途邮件可能被丢弃）。
+                eprintln!(
+                    "warn: mail drain 未完成：{}（在途邮件可能被丢弃）",
+                    v["msg"].as_str().unwrap_or("未知原因")
+                );
+            }
+            Err(e) => eprintln!("warn: mail drain 任务异常：{e}"),
+        }
     }
 
     /// 任务 Bridge 工厂（tasks_flag 已注入；监督器每任务一条线程独立建桥）。
@@ -946,12 +987,23 @@ mod mail_assembly_tests {
     use only_js::bridge::mail::{MailMode, handle_send};
 
     /// 假 mail vtable：submit 回固定信封（装配测试零网络、零插件）。jobId 回显 key，
-    /// 证明 profile 名确实过线（不是被适配器吞掉）。
+    /// 证明 profile 名确实过线（不是被适配器吞掉）。控制报文（`__ctl`）回排空信封，
+    /// 并把收到的 req 记进 [`SEEN_REQS`]（A4 停机排空用）。
+    static SEEN_REQS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
     extern "C" fn fake_submit(
         key: RString,
-        _req: RString,
+        req: RString,
         _atts: RVec<MailAttachment>,
     ) -> FfiFuture {
+        let req = req[..].to_string();
+        let is_ctl = req.contains("__ctl");
+        SEEN_REQS.lock().unwrap().push(req);
+        if is_ctl {
+            return oj_plugin_ffi::ready_ok(
+                br#"{"code":0,"msg":"ok","data":{"drained":true,"workers":2}}"#.to_vec(),
+            );
+        }
         oj_plugin_ffi::ready_ok(
             format!(
                 r#"{{"code":0,"msg":"ok","data":{{"jobId":"j-{}"}}}}"#,
@@ -962,6 +1014,32 @@ mod mail_assembly_tests {
     }
     static FAKE_MAIL: MailVtable = MailVtable {
         submit: fake_submit,
+    };
+
+    /// 「控制报文却回 pending」的坏插件（A4：宿主必须 fail-loud，不挂死）。
+    extern "C" fn pending_submit(
+        _key: RString,
+        _req: RString,
+        _atts: RVec<MailAttachment>,
+    ) -> FfiFuture {
+        extern "C" fn poll(_s: *mut std::ffi::c_void) -> i32 {
+            0
+        }
+        extern "C" fn take(
+            _s: *mut std::ffi::c_void,
+        ) -> oj_plugin_ffi::RResult<oj_plugin_ffi::RBytes, RString> {
+            oj_plugin_ffi::RResult::Err(RString::from("not ready"))
+        }
+        extern "C" fn free(_s: *mut std::ffi::c_void) {}
+        FfiFuture {
+            state: std::ptr::null_mut(),
+            poll,
+            take,
+            free,
+        }
+    }
+    static PENDING_MAIL: MailVtable = MailVtable {
+        submit: pending_submit,
     };
 
     /// 顶层 `smtp:` 段：多 profile（默认/本地落盘）+ 白名单 + 并发参数。
@@ -1111,6 +1189,45 @@ mod mail_assembly_tests {
             Err(e) => e,
         };
         assert!(e.contains("allowed_from"), "{e}");
+    }
+
+    /// A4：停机排空 —— `drain_mail_backend` 必须把**控制报文**发给插件
+    /// （`{"__ctl":"drain","timeout_ms":N}`），并把插件的排空信封解回。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_mail_backend_when_drain_then_control_message_sent_and_envelope_returned() {
+        let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
+        let mb = build_mail_backend(&smtp_cfg(), Some(&FAKE_MAIL), bus)
+            .unwrap()
+            .expect("smtp 段 + 插件在册 → 后端就位");
+        SEEN_REQS.lock().unwrap().clear();
+
+        let v = drain_mail_backend(&mb, Duration::from_millis(1234));
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["drained"], true, "{v}");
+        assert_eq!(v["data"]["workers"], 2, "{v}");
+
+        let reqs = SEEN_REQS.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "停机排空只发一次控制报文");
+        let req: serde_json::Value = serde_json::from_str(&reqs[0]).unwrap();
+        assert_eq!(req["__ctl"], "drain", "{req}");
+        assert_eq!(req["timeout_ms"], 1234, "超时必须过线（插件据此等）：{req}");
+    }
+
+    /// A4：坏插件（控制报文回 pending）→ 排空失败收敛为 `code:1` 信封（停机路径只告警，
+    /// **不 panic、不挂死**、不阻断进程退出）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_broken_plugin_when_drain_then_failure_becomes_envelope() {
+        let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
+        let mb = build_mail_backend(&smtp_cfg(), Some(&PENDING_MAIL), bus)
+            .unwrap()
+            .expect("后端就位");
+        let v = drain_mail_backend(&mb, Duration::from_millis(10));
+        assert_eq!(v["code"], 1, "{v}");
+        assert_eq!(v["data"]["drained"], false, "{v}");
+        assert!(
+            v["msg"].as_str().unwrap().contains("drain 调用失败"),
+            "文案须点明排空失败：{v}"
+        );
     }
 }
 

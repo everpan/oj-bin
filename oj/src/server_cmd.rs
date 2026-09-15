@@ -109,8 +109,15 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     tokio::task::spawn_blocking(move || sup.shutdown())
         .await
         .map_err(|e| format!("tasks shutdown: {e}"))?;
+    // 停机 graceful drain（spec §6 ⑤）：HTTP 已停收、任务已收场后，排空在途邮件
+    // （插件侧停收 → 等在途 job 跑完 → 销毁 transport）。超时只告警，不阻断退出。
+    app.drain_mail(MAIL_DRAIN_TIMEOUT).await;
     Ok(())
 }
+
+/// 停机 mail drain 的总超时：在途投递本身已在插件侧受 `profile.timeout` 约束，
+/// 这里给 10s 上限 —— 足够跑完正常在途投递，又不会让 SIGTERM 后的退出过程长期挂住。
+const MAIL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 后台运行入口（unix 分支）：re-exec 自身，剥掉 --daemon（避免子进程递归 daemon 化），
 /// setsid 脱离控制终端（终端关闭的 SIGHUP 不再波及），stdio 重定向 /dev/null。

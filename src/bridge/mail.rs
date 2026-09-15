@@ -27,6 +27,14 @@ use super::{BridgeResult, EventBroker};
 /// 结果上送 topic：插件 `HostContext.deliver(MAIL_RESULT_TOPIC, <信封 JSON>)`。
 pub const MAIL_RESULT_TOPIC: &str = "mail.result";
 
+/// 控制报文键（vtable `submit` 的 `req` 顶层）：`{"__ctl":"drain","timeout_ms":N}`。
+/// **零 ABI 变更**的停机入口 —— `MailVtable` 形状不变，控制报文与业务 req 共用 `submit`；
+/// 与插件侧 `plugins/oj-mail/src/engine.rs` 的 `CTL_KEY`/`CTL_DRAIN` **逐字对齐**（跨进程契约：
+/// 宿主拼字符串、插件解析）。
+pub const CONTROL_KEY: &str = "__ctl";
+/// `__ctl` 取值：停机排空（graceful drain）。
+pub const CONTROL_DRAIN: &str = "drain";
+
 /// 结果存储默认限长（条）：超出淘汰最旧，防无界增长。
 pub const DEFAULT_RESULT_CAP: usize = 1024;
 /// 结果存储默认 TTL：异步投递结果只对近期查询有意义，过期惰性清理。
@@ -56,6 +64,17 @@ pub trait MailBackend: Send + Sync {
     fn config(&self) -> &MailConfig;
     /// 结果路由：`deliver(MAIL_RESULT_TOPIC, …)` 钩子与 `op_mail_result` 共用同一份存储。
     fn router(&self) -> &MailResultRouter;
+    /// 停机排空（生产停机路径调用）：让后端停收新投递、等在途 job 跑完再销毁 transport。
+    ///
+    /// **同步**语义（会阻塞调用线程至多 `timeout`）：调用方放 blocking 池。插件侧的
+    /// `drain` 在 FFI 调用内跑完才返回（见 `CONTROL_KEY` 契约），故这里不做异步等待。
+    /// 返回统一信封：`{code:0,data:{drained:true}}` = 已排空（或在途已跑完）；
+    /// `code:1` = 超时（已停收 + 已销毁，在途 job 可能被丢弃）。
+    ///
+    /// 默认实现 = 无可排空（第三方/无状态后端无需实现；`data.drained = false`）。
+    fn drain(&self, _timeout: Duration) -> BridgeResult<Value> {
+        Ok(json!({ "code": 0, "msg": "ok", "data": { "drained": false } }))
+    }
 }
 
 // ---------- 宿主侧配置（非密钥面） ----------
@@ -375,6 +394,52 @@ impl MailBackend for FfiMailBackend {
 
     fn router(&self) -> &MailResultRouter {
         &self.router
+    }
+
+    /// 控制报文 drain（零 ABI 变更：走 `submit` 的 `{"__ctl":"drain"}`）。
+    ///
+    /// 契约（见 [`CONTROL_KEY`] 与插件 `engine.rs` 的 ctl 分支）：插件在 FFI 调用内**同步**
+    /// 跑完 drain 并回**即可就绪**的 future ⇒ 这里只 poll 一次（不引入异步等待，也就不必
+    /// 依赖宿主 reactor）。插件若违反契约（返回 pending）→ fail-loud 报错，绝不挂死。
+    fn drain(&self, timeout: Duration) -> BridgeResult<Value> {
+        let req = json!({
+            CONTROL_KEY: CONTROL_DRAIN,
+            "timeout_ms": timeout.as_millis() as u64,
+        })
+        .to_string();
+        let fut = (self.vtable.submit)(
+            RString::from(""),
+            RString::from(req.as_str()),
+            oj_plugin_ffi::RVec::new(),
+        );
+        let code = (fut.poll)(fut.state);
+        if code == 0 {
+            // 契约违约：控制报文必须**同步**完成。未就绪 ⇒ 只 free（不 take：FFI 契约要求
+            // take 只在 ready 后调用），fail-loud —— 绝不挂死等它。
+            (fut.free)(fut.state);
+            return Err(
+                "ffi mail drain: 插件回了 pending（poll=0）——控制报文契约要求同步完成".into(),
+            );
+        }
+        let taken: Result<oj_plugin_ffi::RBytes, RString> =
+            std::result::Result::from((fut.take)(fut.state));
+        (fut.free)(fut.state); // FfiFuture 无 Drop：free 与 take 在这里配对
+        let bytes = match (code, taken) {
+            (1, Ok(b)) => b.iter().copied().collect::<Vec<u8>>(),
+            (_, Err(e)) => return Err(format!("ffi mail drain: {}", &e[..]).into()),
+            (c, Ok(_)) => {
+                return Err(format!(
+                    "ffi mail drain: poll={c} 却 take 成功 —— 插件违反 FfiFuture 协议"
+                )
+                .into());
+            }
+        };
+        let v: Value = serde_json::from_slice(&bytes).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("ffi mail drain decode: {e}").into()
+            },
+        )?;
+        Ok(ensure_envelope(v))
     }
 }
 
@@ -1191,11 +1256,92 @@ mod tests {
         }))
     }
 
+    /// 记录 fake `submit` 收到的 `(key, req)`（A4 控制报文用）。
+    static SEEN_SUBMIT: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    extern "C" fn record_submit(
+        key: oj_plugin_ffi::RString,
+        req: oj_plugin_ffi::RString,
+        _atts: oj_plugin_ffi::RVec<oj_plugin_ffi::MailAttachment>,
+    ) -> oj_plugin_ffi::FfiFuture {
+        SEEN_SUBMIT
+            .lock()
+            .unwrap()
+            .push((key[..].to_string(), req[..].to_string()));
+        ready_future(Ok(SUBMIT_BODY.lock().unwrap().clone()))
+    }
+
+    /// A4：`FfiMailBackend::drain` 必须发**控制报文** `{"__ctl":"drain","timeout_ms":N}`
+    /// （key 为空 —— 控制报文不占 profile），并把插件的排空信封解回。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ffi_mail_backend_drain_sends_control_message_and_decodes_envelope() {
+        let _g = lock(); // 与用 SUBMIT_BODY/SEEN_SUBMIT 的用例串行
+        let vt: &'static MailVtable = Box::leak(Box::new(MailVtable {
+            submit: record_submit,
+        }));
+        *SUBMIT_BODY.lock().unwrap() =
+            br#"{"code":0,"msg":"ok","data":{"drained":true,"workers":2}}"#.to_vec();
+        SEEN_SUBMIT.lock().unwrap().clear();
+
+        let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+        let env = b.drain(Duration::from_millis(2500)).expect("drain 信封");
+        assert_eq!(env["code"], 0, "{env}");
+        assert_eq!(env["data"]["drained"], true, "{env}");
+        assert_eq!(env["data"]["workers"], 2, "{env}");
+
+        let seen = SEEN_SUBMIT.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "控制报文只发一次");
+        assert_eq!(seen[0].0, "", "控制报文不占 profile key");
+        let req: Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(req[CONTROL_KEY], CONTROL_DRAIN, "{req}");
+        assert_eq!(req["timeout_ms"], 2500, "超时必须过线（插件据此等）：{req}");
+    }
+
+    /// A4 契约边界：插件回 **pending**（违反「控制报文同步完成」契约）或坏 JSON → 一律
+    /// fail-loud 报错，**绝不挂死**（drain 只有一次 poll，不做异步等待）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ffi_mail_backend_drain_fails_loud_on_pending_or_garbage() {
+        let _g = lock();
+        extern "C" fn pending_poll(_s: *mut std::ffi::c_void) -> i32 {
+            0
+        }
+        extern "C" fn pending_take(
+            _s: *mut std::ffi::c_void,
+        ) -> oj_plugin_ffi::RResult<oj_plugin_ffi::RBytes, oj_plugin_ffi::RString> {
+            oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from("not ready"))
+        }
+        extern "C" fn pending_free(_s: *mut std::ffi::c_void) {}
+        extern "C" fn pending_submit(
+            _k: oj_plugin_ffi::RString,
+            _r: oj_plugin_ffi::RString,
+            _a: oj_plugin_ffi::RVec<oj_plugin_ffi::MailAttachment>,
+        ) -> oj_plugin_ffi::FfiFuture {
+            oj_plugin_ffi::FfiFuture {
+                state: std::ptr::null_mut(),
+                poll: pending_poll,
+                take: pending_take,
+                free: pending_free,
+            }
+        }
+        let vt: &'static MailVtable = Box::leak(Box::new(MailVtable {
+            submit: pending_submit,
+        }));
+        let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+        let e = b.drain(Duration::from_millis(10)).unwrap_err().to_string();
+        assert!(e.contains("pending"), "pending 必须点名契约违约：{e}");
+
+        // 坏 JSON（非 UTF-8/非 JSON）→ decode 错误臂。
+        let vt = vtable_returning(b"{not json");
+        let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+        let e = b.drain(Duration::from_millis(10)).unwrap_err().to_string();
+        assert!(e.contains("ffi mail drain decode"), "{e}");
+    }
+
     /// 适配器把宿主办的 `Vec<ParsedAttachment>` 按**下标原序**填进 `RVec<MailAttachment>`
     /// （插件按 index 对齐，数量/顺序错位即 code:5），并把 future 结果（信封 JSON）解回。
     #[tokio::test(flavor = "current_thread")]
     async fn ffi_mail_backend_forwards_key_and_ordered_attachments() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::Ordering;
         let _g = lock(); // FREED 是进程级静态：本用例取增量，须与用它的用例串行
         /// 假 vtable 记录的一次调用：key / req / 附件（filename, mime, bytes）。
         type Seen = (String, String, Vec<(String, String, Vec<u8>)>);
