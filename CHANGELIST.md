@@ -85,6 +85,10 @@
   ——与 es/auth 的「配置声明即 fail-fast」不同（mail 缺插件不构成安全失守，故意放行启动）。
   装插件：`cargo xtask plugin mail`。
 - **`file_transport` 目录须先存在**（lettre 不建目录）；非空 `allowed_*` 是发信前提。
+- **mail 双配置源互斥**（A5）：顶层 `smtp:` 与**非空** `plugins.mail` 同时出现时，
+  此前 `plugins.mail`（原样透传）会**静默胜出**（改 `smtp:` 里的白名单/凭据不生效）；
+  现在**装配期直接报错**（`pick one`），启动即暴露。`plugins: {mail: {}}`（空对象）
+  不受影响 —— 它是「回落 `smtp:` 适配器」的写法（也是本仓 e2e 夹具的形态）。
 
 
 

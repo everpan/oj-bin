@@ -479,12 +479,44 @@ pub struct Registries {
 #[cfg(test)]
 const ADAPTER_AXES: &[&str] = &["es", "auth", "mail"];
 
+/// A5：mail 的**双配置源**闸门（装配期 fail-fast）。
+///
+/// `plugin_cfg` 对 mail 有两条来源：非空 `plugins.mail`（原样透传）与顶层 `smtp:` 段
+/// （适配器臂）；**前者静默胜出**。运维若在 `smtp:` 里改了白名单/凭据（或反之），改动会
+/// 悄无声息地不生效——典型的「静默遮蔽」。故两者**皆非空**时装配期直接报错，明确「二选一」，
+/// 与 es/kv「声明即校验」同一取向（配置写错在装配期暴露，不静默改变语义）。
+///
+/// 「非空」判定与 `plugin_cfg` 的选用条件逐条对齐：`plugins.mail` 是**非空对象**；
+/// `smtp:` 段则要求**有实质内容**（profile 或 `workers`/`queue_capacity`）——
+/// `smtp: {}`（空段）本来就被视作未配置，不算冲突（`plugins: {mail: {}}` 空对象同理，
+/// 它是「回落适配器」而非透传）。
+pub(crate) fn check_mail_cfg_sources(cfg: &Config) -> Result<(), String> {
+    let passthrough = cfg
+        .plugins
+        .get("mail")
+        .is_some_and(|v| v.as_object().is_some_and(|o| !o.is_empty()));
+    let smtp_nonempty = cfg.smtp.as_ref().is_some_and(|s| {
+        s.workers.is_some() || s.queue_capacity.is_some() || !s.profiles.is_empty()
+    });
+    if passthrough && smtp_nonempty {
+        return Err(
+            "config declares both a non-empty `smtp:` section and a non-empty `plugins.mail` \
+             entry: pick one (`smtp:` is the standard form; `plugins.mail` is a raw passthrough \
+             that silently wins over `smtp:` and bypasses its typed parsing)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// cfg 回落：plugins.<name> 非空对象原样透传 → 轴适配器 → "{}"。
 /// schema 归插件所有：插件在 init 校验，非法即 Err fail-fast（宿主不解释字段）。
 /// **唯一例外**：`"mail"` 的适配器产物同时是**宿主**的白名单校验面（`MailConfig::from_value`
 /// 吃同一份 JSON）——故 white-list/并发/凭据字段必须一并过线，两条路（透传与适配器）
 /// 都得让宿主看得见 `allowed_*`，否则宿主与插件配置面分叉。
 /// `pub(crate)`：`app::build_mail_backend` 复用同一份产物（单一真相源）。
+///
+/// 两条 mail 来源同时非空是**配置错误**：见 [`check_mail_cfg_sources`]（装配期 fail-fast）。
 pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
     if let Some(v) = cfg.plugins.get(name)
         && v.as_object().is_some_and(|o| !o.is_empty())
@@ -627,6 +659,9 @@ pub async fn assemble_plugins(
     config_dir: &Path,
     registries: &mut Registries,
 ) -> Result<Vec<PluginInfo>, String> {
+    // A5：mail 双配置源（`smtp:` 与 `plugins.mail` 皆非空）是配置错误 → 装配期 fail-fast
+    // （`plugin_cfg` 会让非空 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」）。
+    check_mail_cfg_sources(cfg)?;
     let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();
@@ -842,6 +877,58 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A5：mail 双配置源闸门 —— `smtp:` 与非空 `plugins.mail` **皆非空** ⇒ 装配期 Err
+    /// （`plugin_cfg` 会让透传静默胜出，运维改 `smtp:` 会「改了不生效」）。
+    /// 其余四种组合都合法（含 `plugins: {mail: {}}` 空对象 = 回落适配器；`smtp: {}` 空段 = 未配置）。
+    #[test]
+    fn given_both_mail_cfg_sources_nonempty_when_check_then_errors() {
+        use only_js::config::SmtpSection;
+
+        /// 一个 profile（实质内容）的 `smtp:` 段。
+        fn profiles() -> SmtpSection {
+            serde_yaml::from_str("default:\n  host: h\n  allowed_from: [a@x.com]\n").unwrap()
+        }
+        /// 非空 `plugins.mail`（透传形态）。
+        fn passthrough() -> serde_json::Value {
+            serde_json::json!({ "default": { "host": "override" } })
+        }
+        /// 组装一个 Config；`None` = 该来源缺省。
+        fn case(plugins_mail: Option<serde_json::Value>, smtp: Option<SmtpSection>) -> Config {
+            let mut cfg = Config::default();
+            cfg.smtp = smtp;
+            if let Some(v) = plugins_mail {
+                cfg.plugins.insert("mail".into(), v);
+            }
+            cfg
+        }
+
+        // 皆非空 → Err，文案须点名两条来源与「二选一」。
+        let e = check_mail_cfg_sources(&case(Some(passthrough()), Some(profiles())))
+            .expect_err("双源皆非空必须 Err");
+        assert!(
+            e.contains("smtp:") && e.contains("plugins.mail") && e.contains("pick one"),
+            "文案须点明两条来源与二选一：{e}"
+        );
+        // 仅 `workers`（无 profile）也算「非空段」——它就是被静默忽略的那部分配置。
+        let workers_only: SmtpSection = serde_yaml::from_str("workers: 4\n").unwrap();
+        assert!(check_mail_cfg_sources(&case(Some(passthrough()), Some(workers_only))).is_err());
+
+        // 合法的四种组合：
+        // 1) 只有 `smtp:`（标准形态）。
+        assert!(check_mail_cfg_sources(&case(None, Some(profiles()))).is_ok());
+        // 2) 只有 `plugins.mail`（透传）。
+        assert!(check_mail_cfg_sources(&case(Some(passthrough()), None)).is_ok());
+        // 3) `smtp:` 非空 + `plugins: {mail: {}}`（空对象 = 回落适配器，非透传；e2e 夹具即此形态）。
+        assert!(
+            check_mail_cfg_sources(&case(Some(serde_json::json!({})), Some(profiles()))).is_ok()
+        );
+        // 4) `plugins.mail` 非空 + `smtp: {}`（空段 = 未配置，不算冲突）。
+        assert!(
+            check_mail_cfg_sources(&case(Some(passthrough()), Some(SmtpSection::default())))
+                .is_ok()
+        );
     }
 
     #[test]

@@ -63,6 +63,10 @@ smtp:
 - **`tls: none`**：必须显式 `allow_none_tls: true`，否则配置解析失败。
 - **密钥**：只在配置文件与插件内；**不进 JS**（`Mail.profiles()` 仅列 profile 名）。
 - **`file_transport` 目录须先存在**（lettre 不自动建目录）。
+- **双配置源互斥**：顶层 `smtp:` 与**非空** `plugins.mail` 不得同时出现 —— 后者是原样透传
+  且会**静默胜出**，同时写会让 `smtp:` 里的改动（白名单/凭据等）不生效。装配期即报错
+  （文案 `pick one`）。`plugins: {mail: {}}`（空对象）不算冲突：它是「回落 `smtp:` 适配器」
+  的写法。
 
 ## 3. JS API
 

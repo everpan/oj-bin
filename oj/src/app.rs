@@ -319,6 +319,9 @@ pub fn build_mail_backend(
     let Some(vtable) = vtable else {
         return Ok(None);
     };
+    // A5：双配置源（非空 `smtp:` ＋ 非空 `plugins.mail`）此处即 fail-fast ——
+    // `plugin_cfg` 会让透传静默胜出，不能等到「改了白名单不生效」才发现。
+    crate::server_cmd::check_mail_cfg_sources(cfg)?;
     let json = crate::server_cmd::plugin_cfg(cfg, "mail");
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("smtp cfg: {e}"))?;
