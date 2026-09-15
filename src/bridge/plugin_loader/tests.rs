@@ -89,6 +89,20 @@ fn mini_mq_plugin_dir() -> PathBuf {
     .clone()
 }
 
+/// mini-mail（单轴 mail 夹具；与 mini/mini-kv/mini-mq 各占独立目录，避免 scan 计数断言翻倍）。
+fn mini_mail_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-mail",
+            "oj_plugin_test_mini_mail",
+            "mini-mail",
+            "test-plugins-mail",
+        )
+    })
+    .clone()
+}
+
 /// mini-nosym（无 oj 符号的普通 cdylib）：dlopen 成功但缺 `oj_plugin_abi_version`。
 fn mini_nosym_plugin_dir() -> PathBuf {
     static ONCE: OnceLock<PathBuf> = OnceLock::new();
@@ -399,9 +413,37 @@ fn probe_finds_mq_axis_and_zero_axis_mini_misses_it() {
     assert_eq!(mmq.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
 }
 
+/// mini（零轴）：mail 槽 None；mini-mail（单轴 mail）：mail 槽 Some——加轴零破坏回归
+/// （ABI 保持 8）。本用例是 `probe_axes` 的 `"mail"` 臂**唯一的行为级覆盖**：真装载一个
+/// 导出 `oj_plugin_axis_mail` 的 cdylib，走 dlsym → 转型 → 填槽全链路（臂写错类型即滥用
+/// 未定义转型，字段/符号配对本用例也一并钉住）。
+#[test]
+fn probe_finds_mail_axis_and_zero_axis_mini_misses_it() {
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+    unsafe { std::env::remove_var("MINI_PANIC") };
+    let mini = super::load_one(
+        &mini_plugin_dir().join(ffi::plugin_file_name("mini")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mini.registrations.mail.is_none());
+    let mmail = super::load_one(
+        &mini_mail_plugin_dir().join(ffi::plugin_file_name("mini-mail")),
+        None,
+        host_context(),
+        &no_cfg,
+    )
+    .unwrap();
+    assert!(mmail.registrations.mail.is_some());
+    assert_eq!(mmail.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
+}
+
 /// mail 轴已登记进宿主：`AXES` 含 "mail" 且 `Registrations` 有对应槽位。
-/// 注意本用例**不覆盖** `probe_axes` 的 `"mail"` 臂——那需要真有插件导出
-/// `oj_plugin_axis_mail` 符号（见阶段 2 的 mail 夹具）。
+/// （`probe_axes` 的 `"mail"` 臂由 `probe_finds_mail_axis_and_zero_axis_mini_misses_it`
+/// 用 mini-mail 夹具做行为级覆盖。）
 #[test]
 fn axes_and_registrations_wire_mail() {
     assert!(AXES.contains(&"mail"));
