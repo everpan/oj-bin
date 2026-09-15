@@ -1,10 +1,16 @@
 # 设计文档：lettre SMTP 绑定（v0.1.19，插件实现）
 
-- 日期：2026-09-15（初稿）→ v2（三方评审）→ v3（自洽性总检）→ **v4（实现期定稿，随阶段 0–6 落地同步）**
-- 状态：阶段 0–7 已实现（阶段 8 加固验收待做）；本文档与实现同步
+- 日期：2026-09-15（初稿）→ v2（三方评审）→ v3（自洽性总检）→ **v4（实现期定稿，随阶段 0–6 落地同步）** → **v5（阶段 8 安全审计订正）**
+- 状态：阶段 0–8 已实现；**v0.1.19 = 发布点**（`oj` 版本号已递增）
 - 实现形态：**cdylib 插件 `oj-mail`**（非内建 op），新增 `mail` 轴。
 
 ## 0. 版本修订
+
+**v5（阶段 8 安全回归审计实测订正；只订正文档，未改实现语义）**
+- §10 的 `5xx→2`、`鉴权→3` **未实现**：实现统一归 `1`（`engine.rs:43`），已达成为 `0/1/4/5`；用户面文档（`docs/mail-smtp.md` §3、`docs/devkit/api-manual.md` §6）原宣称 `2`/`3` 可用，已同步订正。→ 待做。
+- §11 的 `none` TLS「且 host 为内网 CIDR」**未实现**：只校验显式 `allow_none_tls`。→ 待做（会改配置语义，单列任务）。
+- §11 新增实测结论：宿主 `lettre::Address` 与结构化路 `lettre::Mailbox` 的**接受集不互相包含**（引号本地部/域字面量：宿主放行、插件拒 → 投递期 `code:5`）。方向「插件更严」，**无越权面**；已列表化钉进回归用例。→ 统一解析器待做。
+- §12 的「模拟 SMTP server 断言 5xx→`code:2`」**未做**（与上面第一条同因）。
 
 **v4（实现期定稿；随阶段 0–6 同步，均为实测结论）**
 - **lettre 依赖（阶段 0 spike）**：`lettre 0.11` + `rustls = "=0.23.40"` 单一版本、**无 ring**。feature 必须为 `builder,smtp-transport,tokio1,tokio1-rustls,rustls-no-provider,webpki-roots,aws-lc-rs,hostname,pool,file-transport`；**不得**用 `rustls-tls`（其 `= ["webpki-roots","rustls","ring"]` 会强拉 `rustls/ring` 与框架 aws-lc-rs 双 provider）。宿主侧仅用 `lettre::Address` 做校验（`default-features=false`，不引 TLS 栈）。
@@ -167,7 +173,16 @@ const jobId = r.data.jobId;                       // 统一信封：{code,msg,da
 
 ## 10. 错误处理 / 超时 / 背压
 
-- `code`：连接/网络→`1`、5xx→`2`、鉴权→`3`、队列满→`4`、地址/白名单校验→`5`。`data:{jobId,messageId?}`。
+> **实现期订正（阶段 8 审计，2026-09-15）**：本节的 `5xx→2`、`鉴权→3` **未实现**。
+> 实现把「连接/网络/超时/一切投递期失败」统一归 `1`（`CODE_NETWORK`，见
+> `plugins/oj-mail/src/engine.rs:43` 的常量注释），故 `2`/`3` 当前**不可达**。取舍理由：
+> 失败信封只出脱敏分类文案（lettre 原始错误含 SMTP 对话/收件人，不进信封/总线），
+> 细分 5xx 与鉴权需先解析 lettre 错误分类且仍要维持脱敏——归为**待做**（单列任务）。
+> 已同步订正用户面文档：`docs/mail-smtp.md` §3、`docs/devkit/api-manual.md` §6
+> （原表宣称 `2`/`3` 可用，与实现不符）。已达成的映射为 `0` 成功 / `1` 连接·网络·超时·
+> 投递失败 / `4` 队列满 / `5` 入参·白名单·附件校验（阶段 8 已逐条补回归。
+
+- `code`：连接/网络→`1`、5xx→`2`（**未实现**）、鉴权→`3`（**未实现**）、队列满→`4`、地址/白名单校验→`5`。`data:{jobId,messageId?}`。
 - **CRLF 注入防护**：`subject`/`headers`/地址先剥 `\r\n`；`from/to/cc/bcc` 经 `lettre::Address` 强校验，非法即 `code:5`。
 - **白名单（fail-closed）**：`from` 匹配 `allowed_from` 后缀、`to/cc/bcc` 匹配 `allowed_recipients` 后缀，否则 `code:5`；**空表即拒绝**（缺省不放行）。
 - `msg` 脱敏（无账号/密码/令牌/SMTP 对话）；bus 反馈仅 `jobId/messageId/code`。
@@ -176,11 +191,23 @@ const jobId = r.data.jobId;                       // 统一信封：{code,msg,da
 
 ## 11. 安全
 
+> **实现期订正（阶段 8 审计，2026-09-15）**：以下两条与实现不一致，均**登记为待做**，
+> 本版**不改实现语义**（阶段 8 硬约束：只做用例审计补缺 + 门禁 + 版本递增）：
+> 1. `none` TLS 的「**且 host 为内网 CIDR**」**未实现**：只校验显式 `allow_none_tls: true`
+>    （`plugins/oj-mail/src/config.rs::ProfileCfg::validate`，`tls: none` 无许可即拒）。
+>    落地 CIDR 需引入 IP/CIDR 解析并处理域名（`localhost`）解析口径，会改配置语义，单列任务。
+> 2. **地址接受集两侧不互相包含**（阶段 8 新增对账用例实测）：宿主 `lettre::Address` 放行而
+>    结构化路 `lettre::Mailbox` 拒绝的形态（引号本地部、域字面量）会在投递期报 `code:5`。
+>    方向为「插件比宿主更严」→ **无越权面**（信封派生的地址必然先过宿主白名单与后缀匹配）；
+>    只是对用户表现为无理由的 `code:5`。raw 路与宿主**逐条一致**（同为 `Address`）。
+>    已钉进回归：`plugins/oj-mail/src/message.rs` 的
+>    `host_accepted_addresses_are_accepted_by_plugin_or_listed_as_known_split`。
+
 - 凭据仅在 `config.yaml` →（插件 cfg）`MailProfile`；**不进 JS 自省**（`op_mail_profiles` 只列 key）。
 - **头注入**：CRLF 剥离 + `lettre::Address` 强校验（§10）。
 - **sendRaw 冲突头**：剥离原文 `From/To/Cc/Bcc`（信封权威）；`Subject` 保留但做 CRLF 校验，结构化 `subject` 非空则覆盖（§7）。
 - **越权**：profile 级 `allowed_from`/`allowed_recipients`（宿主前置校验，§4/§10）。
-- **`none` TLS**：需 `allow_none_tls: true` 且 host 为内网 CIDR，否则拒。
+- **`none` TLS**：需 `allow_none_tls: true` 且 host 为内网 CIDR（**后半句未实现**，见上），否则拒。
 - **路径穿越/TOCTOU**：`ensure_within` + 复用句柄（§9）。
 - **bus 反馈泄露**：payload 仅 `jobId/messageId/code`。
 - **XOAuth2**：首版静态 token，刷新后做；令牌不进日志/信封。
@@ -190,7 +217,7 @@ const jobId = r.data.jobId;                       // 统一信封：{code,msg,da
 - `oj-mail` 单测：`req` serde（含 `blobKey` rename）、`Message` 组装（From/To/Subject、multipart 边界、附件字节来自 `MailAttachment`）。
 - 宿主 `mail.rs` 单测：CRLF 剥离、地址校验、白名单拦截、附件解析（blob mock / 临时文件 `path` + `ensure_within` 越界拒绝）、`MailAttachment` 组装、`code` 映射。
 - 桥接 e2e：`smtp.mock` profile 走 lettre `FileTransport` 写 `.eml` 到临时目录（**不依赖网络**），按 `job_id` 命名防竞态；断言 `.eml` 内容与信封；`oj build`/`oj test` 冒烟。
-- 模拟 SMTP server（可选）：本地 `tokio` TcpListener，断言真实投递与 5xx→`code:2`。
+- 模拟 SMTP server（可选，**未做**：见 §0 v5——`5xx→code:2` 未实现）：本地 `tokio` TcpListener，断言真实投递与 5xx→`code:2`。
 - 插件预检：`cargo xtask plugin mail --check`（ABI/身份/semver/符号）。
 
 ## 13. 风险 / 待决
