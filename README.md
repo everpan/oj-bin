@@ -192,6 +192,11 @@ sample/src/
 - **Path params**: attach `.route` to a handler to override the directory mirror —
   `detail.route = "{id}"` makes `/v1/api/user/item/{id}` reachable (and `/v1/api/user/item`
   returns 404 in that case).
+- **Import aliases**: shared code is reachable without counting `../` — `#_shared/validate`
+  anchors at the current module root (`user/_shared/validate.ts`), `#/user/_shared/validate`
+  at the src root. Anchors are derived from the importing file's location, so the same
+  specifier works in dev and in release; `oj build` materializes them into version-pinned
+  relative paths (cross-module aliases must be declared in `manifest.yaml` `deps`).
 - **WebSocket**: `ws.ts` is executed once per received text frame. After the first frame does
   `bus.subscribe("news")`, any handler's `bus.publish("news", ...)` — including from other
   instances — broadcasts to that connection.

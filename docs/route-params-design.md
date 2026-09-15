@@ -4,6 +4,10 @@
 > **本文 §4.1/§十一 的 release/routes.js/build 部分已被 2026-08-24 的 oj build 取代**
 > （多模块版本目录 + `dist/manifests.yaml` 锁 + 聚合加载，见
 > `docs/superpowers/specs/2026-08-23-oj-build-design.md` 与 `docs/cli2.md`）；
+> 其中「剥离与补后缀均为行级处理、动态/别名 import 不处理」一段亦已过时——现由
+> `fix_import_specifiers` 基于唯一扫描器 `bridge::import_scan` 处理（含副作用/动态 import
+> 与 `#` 别名实化，见 `docs/devkit/api-manual.md` §5 与
+> `docs/superpowers/specs/2026-09-15-module-import-alias-design.md`）；
 > 其余章节（matchit 语法/冲突处理/http.params）仍准确。
 > 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/server_cmd.rs`
 > 背景：当前目录镜像路由（`base + 目录路径 → <root>/<path>/api.(ts|js)`）**无路径参数**。`lib.rs:87` 写死 `params: HashMap::new()`，`http.param`(`bootstrap.js:43`) 只读 query。

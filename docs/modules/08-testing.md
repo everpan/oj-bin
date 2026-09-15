@@ -106,7 +106,9 @@ vitest `include: ["tests/**/*.spec.ts"]` —— 见下「方案 B」。
 （本地 `npx vitest run` 12/12 通过）。
 
 > 改写后 L2 新增能力：`mocks/oj-globals.ts` 增加 `lastSqlCalls()`，可断言 handler 发出了
-> 什么 SQL 与绑定参数——这是 L1（只能看响应）看不到的维度。
+> 什么 SQL 与绑定参数——这是 L1（只能看响应）看不到的维度。`db.table(...)` **构造器**（v0.1.17
+> 起 sample 已全面改用）由 `mocks/query-builder.ts` 镜像 `bootstrap.js` 的 API 面，SQL 按
+> 规范形渲染（真实渲染是 sea-query 按方言产出，mock 不复刻方言细节）；未覆盖的形态直接抛错。
 
 ## 5. 运行方式（抄这份）
 

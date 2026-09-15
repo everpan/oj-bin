@@ -87,6 +87,7 @@ db: default         # 可选：模块的 "default" 库重定向到该命名库
 | S003 | 模块 SQL 引用他模块表但未声明 `deps` | `checks::run`（:70 起），附 §3-D2 场景决策表 |
 | S005 | `manifest.tables` 与 `schema.yaml` 双向一致 | `checks::run`（:49） |
 | S007 | 迁移文件 seq 连续性 / 命名 / 方言覆盖 | `migrate::load_migrations` |
+| S008 | 导入别名（`#x` 本模块根 / `#/m/x` src 根）：目标必须存在；跨模块别名必须在 `deps` 声明；`manifest.yaml` 只许在模块根；项目 `package.json` 的 `#` 键 `imports` 与别名命名空间冲突即 fail | `checks::run`（项目级 + 逐模块），扫描器与构建共用 `bridge::import_scan` |
 
 - 报错三要素（硬性要求）：**违规文件路径（+规则 ID）、原因（引用具体声明）、下一步动作**。
 - SQL 表名提取与运行时守卫**同一实现**（`bridge::guard::extract_tables`，§5.3 轻量扫描口径）。

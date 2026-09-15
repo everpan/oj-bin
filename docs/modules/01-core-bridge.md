@@ -22,7 +22,7 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | bus | `op_bus_publish/subscribe/kind` | `bus.rs` |
 | es | `op_es_search/index/del` | `es.rs` |
 | 内省/fetch/日志 | `op_plugins`、`op_fetch`、`op_log` | `plugins_op.rs`、`fetch.rs`、`log.rs` |
-| 模块解析 | `op_resolve_cjs` | `module_loader.rs` |
+| 模块解析 | `op_resolve_cjs`；别名 `resolve_alias` / 相对 `resolve_relative`（同一份探针，`oj build` 复用） | `module_loader.rs` |
 | OIDC | `op_oidc_sign/verify/info` | `oidc.rs` |
 | WS | `op_ws_send`、`op_ws_close` | `ws.rs` |
 | 证书 | `op_cert_gen`、`op_cert_renew` | `cert.rs` |
@@ -102,7 +102,7 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | `http.rs` | `RequestInfo` / `UploadedFile` |
 | `envelope.rs` | `{code,msg,data}` 与 code→HTTP status 映射 |
 | `crypto.rs` / `cert.rs` / `oidc.rs` / `auth.rs` | 密码学原语、JWS 证书、OIDC 状态、守卫 trait |
-| `module_loader.rs` / `loader.rs` / `transpile.rs` | ESM/CJS 解析（`?v=<mtime>`）、HandlerStore、TS 转译 + mtime 缓存 |
+| `module_loader.rs` / `loader.rs` / `transpile.rs` / `import_scan.rs` | ESM/CJS 解析（`?v=<mtime>`）+ **导入别名**（`#` 模块根 / `#/m/x` src 根，锚点由最近 `manifest.yaml` 派生）、HandlerStore、TS 转译 + mtime 缓存、导入位置 specifier 扫描（`oj build` 与 checks 共用） |
 | `ffi.rs` / `plugin_loader.rs` | 见 [05-ffi-and-plugins.md](05-ffi-and-plugins.md) |
 | `inspector.rs` | DevTools inspector WS 桥 |
 | `log.rs` | `op_log` → tracing |

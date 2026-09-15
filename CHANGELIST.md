@@ -79,8 +79,13 @@
   `auth/refresh`、`order/list`、`idp/token`、`oidc/callback`；相对：`admin/role-item`、
   `cert/item`、`idp/login`、`idp/authorize`、`oidc/login`、`oidc/logout`）；
   `idp`/`oidc` 的 `manifest.yaml` 补 `deps.auth`（S008 要求）。
-- 手册：user-manual §4/§8、api-manual §5、dev-guide §7、sample/MODULES.md 补别名规则与边界
-  （含「只能在模块内用」与「跨模块需声明 deps」）。
+- 手册：user-manual §4/§8、api-manual §5、dev-guide §7、cli2 build、testing §L2、
+  sample/MODULES.md 补别名规则与边界（含「只能在模块内用」「跨模块需声明 deps」、
+  tsconfig `#*` 手维护）；user-manual §12 与 api-manual §12「已知限制」表补新约束；
+  内部走读 docs/modules 01/04/07/08 同步（build 改写函数改名与两道断言、S008 进规则表、
+  L2 mock 的构造器面）；devkit SKILL.md 补新模块 checklist 与常见陷阱三行；README /
+  README_cn 特性列表补别名一条；cli2 的 `--check` 规则范围与 route-params-design 的过时段
+  标注同步。
 
 ## v0.1.17（2026-09-15）
 

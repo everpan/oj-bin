@@ -91,13 +91,19 @@
 
 - 版本视图 = `dist/manifests.yaml` 锁 ∪ 本次计划构建的模块版本；
   **版本目录不单射 → fail-fast**（`{m}-{v}` 碰撞）。
-- `checks::run`（S002–S007）**构建即检查**；`--check` 只校验不落盘（CI 门禁）。
+- `checks::run`（S002–S008）**构建即检查**；`--check` 只校验不落盘（CI 门禁）。
 - 单模块：清场同名版本目录 → 转译落盘 → 内省产 `routes.js` → lock upsert → `.tgz`。
-- 转译处理三件事：
+- 转译处理四件事：
   - `strip_route_decls`：剥掉产物里的 `fn.route = "...";` 整行；
-  - `fix_relative_imports`：模块内相对路径重算、跨模块指向 `dist/<m_t>-<v_t>/`；
+  - `fix_import_specifiers`：**全部本地 specifier**（相对 + `#` 别名）经**与运行期同一份探针**
+    归一后重写——模块内重算相对路径、跨模块指向 `dist/<m_t>-<v_t>/`；别名 `#x`/`#/m/x`
+    在此**实化**（产物内不再有 `#`）；目标必须已落盘（非 `.ts` 目标即报错）；
   - 默认 minify（`--no-minify` 得多行可读产物，排障逃生门）。
-- `guard_no_api_imports`：`api.ts` 只许作路由入口，被 import 即拒绝。
+- 两道 fail-fast 兜底（扫描器天花板的收敛点）：
+  - `assert_no_aliases`：单文件内不得残留 `#` specifier；
+  - `assert_dist_consistent`：构建末尾扫**本次产出的目录**，任何本地 specifier 都必须落到
+    已落盘文件（「dev 能跑、release 悬空」→ 构建期显式失败）。
+- `guard_no_api_imports`：`api.ts` 只许作路由入口，被 import 即拒绝（含别名写法 `#item/api`）。
 - `rel_pattern`：相对 pattern 含模块名段；根级声明（`/` 开头）剥首斜杠不加模块段。
 
 ## 5. `test_cmd.rs` + `test_ext.rs`（进程内测试运行器）
