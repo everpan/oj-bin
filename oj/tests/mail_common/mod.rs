@@ -160,6 +160,13 @@ pub fn write_project(t: &Tmp) -> PathBuf {
 /// 真装配：读 config.yaml → 证书 → 插件目录 → `App::from_config`（dev 内省）。
 /// 插件未归置时 `assemble_plugins` 会在装配期失败（文案指向 `cargo xtask plugin mail`）。
 pub async fn boot(t: &Tmp, src: &Path) -> oj::app::App {
+    try_boot(t, src)
+        .await
+        .unwrap_or_else(|e| panic!("装配失败（先跑 `cargo xtask plugin mail`）：{e}"))
+}
+
+/// 同 [`boot`]，但把装配错误**返回**（配置负例用：装配期闸门必须 fail-fast）。
+pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
     let plugins = plugins_dir().unwrap_or_else(|| {
         panic!("bin/plugins 不存在：先跑 `cargo xtask plugin mail` 归置 oj-mail cdylib")
     });
@@ -173,9 +180,7 @@ pub async fn boot(t: &Tmp, src: &Path) -> oj::app::App {
         n.saturating_sub(3600),
         n + 365 * 86_400,
     );
-    oj::app::App::from_config(cfg, &t.0, src.to_path_buf(), "/v1/api".into(), true, false)
-        .await
-        .unwrap_or_else(|e| panic!("装配失败（先跑 `cargo xtask plugin mail`）：{e}"))
+    oj::app::App::from_config(cfg, &t.0, src.to_path_buf(), "/v1/api".into(), true, false).await
 }
 
 /// 进程内派发一个 GET（零 TCP：`App::dispatch` = router oneshot）。

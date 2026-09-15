@@ -11,7 +11,31 @@ mod mail_common;
 
 use std::time::Duration;
 
-use mail_common::{boot, get, lock, tmp_project, write_project};
+use mail_common::{boot, get, lock, tmp_project, try_boot, write_project};
+
+/// A5：双配置源（非空 `smtp:` ＋ 非空 `plugins.mail`）在**真装配**期 fail-fast ——
+/// `plugin_cfg` 会让 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_mail_cfg_sources_fail_fast_at_boot() {
+    let _g = lock();
+    let t = tmp_project();
+    let src = write_project(&t);
+    // 夹具默认是 `plugins: {mail: {}}`（空对象 = 回落适配器）；改成**非空透传**即双源冲突。
+    let p = t.0.join("config.yaml");
+    let cfg = std::fs::read_to_string(&p)
+        .unwrap()
+        .replace("  mail: {}\n", "  mail:\n    mock:\n      host: override\n");
+    std::fs::write(&p, cfg).unwrap();
+
+    let e = match try_boot(&t, &src).await {
+        Ok(_) => panic!("双源非空必须装配失败"),
+        Err(e) => e, // App 非 Debug，不能用 expect_err
+    };
+    assert!(
+        e.contains("plugins.mail") && e.contains("pick one"),
+        "文案须点明二选一：{e}"
+    );
+}
 
 /// Given: `smtp.mock`（FileTransport）+ oj-mail 装好，先真投递一封（证明引擎在工作）；
 /// When: 走**生产停机路径** `App::drain_mail`（控制报文 drain，HTTP 已停收后的调用点同款）；
