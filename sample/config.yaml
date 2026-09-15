@@ -49,6 +49,32 @@ blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/bl
   # secret_key: "minioadmin"
   # path_style: true
 
+smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 mail.* 全局
+        # 一段两用：整段交 oj-mail 插件建 transport（host/port/tls/凭据只走插件、
+        # 不进宿主）；宿主只取每个 profile 的 allowed_from/allowed_recipients 做前置
+        # 白名单校验（**空表 = 拒绝**，fail-closed）。
+  workers: 4            # worker 线程数（省略 = 4；每个 worker 串行投递队列里的信）
+  queue_capacity: 256   # 有界队列容量（满即背压 → 信封 code:4，不无界堆积；省略 = 256）
+  mock:                 # 键即 profile 名（= mail.send(key, …) 的 key；默认 profile 名 "default"）
+    host: "localhost"   # file_transport 下不发网络，host/port 仅为满足插件 schema
+    port: 25
+    tls: none           # 明文须显式 allow_none_tls（fail-closed；本 profile 不联网）
+    allow_none_tls: true
+    mechanism: login
+    file_transport: "/tmp/oj-mail-eml"   # 本地落盘通道：目录**须先存在**（mkdir -p /tmp/oj-mail-eml）
+    allowed_from: ["noreply@x.com"]              # 发件人白名单（后缀匹配）
+    allowed_recipients: ["@x.com"]               # 收件人白名单（to/cc/bcc 后缀匹配）
+  # default:            # 真连 SMTP 的样例（示例值；凭据勿提交进仓库）
+  #   host: "smtp.example.com"
+  #   port: 465
+  #   tls: tls          # tls（隐式 TLS）| starttls（强制升级）| none（须 allow_none_tls: true）
+  #   mechanism: login  # login（user+pass）| xoauth2（user + xoauth2.access_token）
+  #   user: "api@example.com"
+  #   pass: "change-me"
+  #   timeout: 30
+  #   allowed_from: ["noreply@x.com"]
+  #   allowed_recipients: ["@x.com", "@partner.com"]
+
 tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
   enable: true
   header_key: "X-TENANT-ID"
