@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn raw_strips_from_to_cc_bcc_subject_case_insensitively() {
-        let raw = "From: evil@x\nTo: victim@x\nSUBJECT: s\nCc: c@x\nX-Keep: 1\n\nbody";
+        let raw = "From: evil@x\nTo: victim@x\nSUBJECT: spoof-subject\nCc: c@x\nX-Keep: 1\n\nbody";
         let m = build_raw(&envelope(), raw, &[]).expect("剥离");
         let s = String::from_utf8(m).expect("UTF-8");
         assert!(
@@ -677,6 +677,10 @@ mod tests {
             "原文冲突头已剥离: {s}"
         );
         assert!(!s.contains("c@x"), "原文 Cc 已剥离: {s}");
+        assert!(
+            !s.to_lowercase().contains("subject:"),
+            "原文 Subject 行（含大小写变体）必须整行剥离: {s}"
+        );
         assert!(
             s.contains("From: from@example.com") && s.contains("To: to@example.com"),
             "报头由结构化信封重建: {s}"
