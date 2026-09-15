@@ -22,6 +22,8 @@
 - **SOLID 落地**：`MailVtable`（接口）与 `oj-mail`（实现）分离；宿主 `MailBackend` trait 隔离 FFI 细节（依赖倒置）；每个 profile 一个 `MailProfile`（单一职责）；校验/附件解析/发送/存储各自独立函数（可组合）。
 - **每阶段收尾**：跑本阶段全部测试 + `fmt`/`clippy`；`TaskUpdate` 标记完成；在计划文件末尾追加「阶段小结」（改了什么、测试结果、遗留）。
 - **提交粒度**：每任务一次 `git commit`（中文信息，`type(scope): …`）。
+- **评审策略（controller 决定，2026-09-15）**：**所有阶段实施完成后统一审查**（代码评审 + 三方专家/安全统一评审），阶段间不再逐阶段跑 spec/quality 评审仪式；但每阶段仍必须自测（TDD + 门禁）并写阶段小结。
+- **版本**：本特性纳入 **v0.1.19**（`oj/Cargo.toml` 版本号递增提交即发布点）。
 
 ---
 
@@ -554,7 +556,11 @@ async fn server_assembles_mail_backend_from_plugins() {
 Run: `cargo test --release -p oj server_assembles_mail`
 Expected: FAIL
 
-**Step 2: 实现**：`plugins:` 段透传 `smtp:` cfg 给 `oj-mail`；宿主另解析非密钥面为 `MailConfig`；把 `Registrations.mail` 包成 `Arc<dyn MailBackend>` 注入 `Extras.mail`。
+**Step 2: 实现**（**配置路径已定稿**：走 `plugin_cfg` 适配器臂，**不用 `plugins:` 透传**）：
+- `oj/src/config.rs`：增**顶层** `smtp:` 段（类型化）。
+- `oj/src/server_cmd.rs` 的 `plugin_cfg`（约 :473-495）`match name` 增 `"mail"` 臂：把顶层 `smtp:` 序列化后作为 `oj-mail` 的 cfg；**不要**用 `plugins:` 透传（`assemble_plugins` 在 `plugins` 非空时切**严格清单模式**，会让用户被迫列全所有插件）。
+- `ADAPTER_AXES`（`server_cmd.rs` 约 :469，`#[cfg(test)]` 对账清单）追 `"mail"`，使子集断言覆盖它。
+- 宿主另解析 `smtp:` 非密钥面为 `MailConfig`（供校验与 profile 列举）；把 `Registrations.mail` 包成 `Arc<dyn MailBackend>` 注入 `Extras.mail`（`app.rs` / `build_cmd.rs` 内省同步）。
 
 **Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(server): 装配 mail 插件与后端`
 
@@ -583,7 +589,7 @@ Expected: FAIL
 
 **Step 1:** `cargo xtask plugin mail --check` PASS。
 **Step 2:** `plugin-matrix.yml` 增 `oj-mail`。
-**Step 3:** CHANGELIST 记 v0.1.20 特性；api-manual 补 `Mail`/`mail` 用法。
+**Step 3:** CHANGELIST 记 v0.1.19 特性；api-manual 补 `Mail`/`mail` 用法。
 **Step 4: 提交** `docs(mail): CHANGELIST/api-manual/CI 覆盖`
 
 **阶段 7 小结**：端到端可用；CI 与文档齐。
