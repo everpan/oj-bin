@@ -18,9 +18,7 @@
 //! --check 在本子进程跑，PluginLoader 的 forget 语义无碍（进程退出即回收）；
 //! 复用 Task 3.2 同一加载入口保证预检与真实装配一致。
 
-use only_js::bridge::plugin_loader::{
-    AXES, PluginManifestEntry, Registrations, host_context, load_manifest,
-};
+use only_js::bridge::plugin_loader::{AXES, PluginManifestEntry, host_context, load_manifest};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -215,25 +213,6 @@ fn copy_devkit() -> Result<(), String> {
     Ok(())
 }
 
-/// 「该轴是否已在加载结果中注册」判定。
-/// 返回 `Option`：`None` = `AXES` 里有这一项但此处没有对应分支（两表失步）。
-/// **刻意不用 `unreachable!`**——加轴时漏改这一处的正确后果是「预检报错」，
-/// 而不是把开发者的 `cargo xtask plugin <name> --check` 直接 panic 掉。
-/// `AXES` 的每个元素都必须在此有分支，由下方守护测试锁死。
-fn axis_present(axis: &str, r: &Registrations) -> Option<bool> {
-    Some(match axis {
-        "es" => r.es.is_some(),
-        "db" => r.db.is_some(),
-        "blob" => r.blob.is_some(),
-        "bus" => r.bus.is_some(),
-        "kv" => r.kv.is_some(),
-        "auth" => r.auth.is_some(),
-        "mq" => r.mq.is_some(),
-        "mail" => r.mail.is_some(),
-        _ => return None,
-    })
-}
-
 /// 预检：经 PluginLoader（与真实装配同一入口）加载校验。cfg 传 `{}`（端点配置校验在
 /// 服务器装配层做，此处只验证可加载性）。
 fn check(name: &str) -> Result<(), String> {
@@ -256,11 +235,14 @@ fn check(name: &str) -> Result<(), String> {
     let p = &loaded[0];
     let d = &p.descriptor;
     // registrations 由加载期 AXES 逐轴 dlsym 探测填充（plugin_loader::probe_axes），
-    // 此处只按 AXES 顺序汇总为可读清单。判定分支缺失（加轴漏改）→ 普通 Err，不 panic。
+    // 此处只按 AXES 顺序汇总为可读清单。轴→槽位映射归 plugin_loader::Registrations::provides
+    // （单一事实源，不再在本 crate 复制一份）；缺分支 → 普通 Err，不 panic。
     let mut provided: Vec<&str> = Vec::with_capacity(AXES.len());
     for a in AXES {
-        let present = axis_present(a, &p.registrations)
-            .ok_or_else(|| format!("AXES 与 axis_present 判定不同步，请同步：未知轴 '{a}'"))?;
+        let present = p
+            .registrations
+            .provides(a)
+            .ok_or_else(|| format!("AXES 与 provides 判定不同步，请同步：未知轴 '{a}'"))?;
         if present {
             provided.push(a);
         }
@@ -497,25 +479,6 @@ fn main() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// AXES 全消费点守护：每个轴都必须有判定分支。
-    /// 加轴时漏改 `axis_present`（或将来新增的同类汇总表）→ 本测试红，
-    /// 而不是等到 `cargo xtask plugin <name> --check` 才发现。
-    #[test]
-    fn given_axes_table_when_judged_then_every_axis_has_a_branch() {
-        for a in AXES {
-            assert!(
-                axis_present(a, &Registrations::default()).is_some(),
-                "axis {a} 缺判定分支"
-            );
-        }
-        // 未知轴（= 以后新增轴漏改此处）必须返回 None 而非 panic：
-        // check() 据此给普通 Err，预检不会把开发者崩掉。
-        assert_eq!(
-            axis_present("no-such-axis", &Registrations::default()),
-            None
-        );
-    }
 
     #[test]
     fn given_first_party_plugins_when_listed_then_covers_all_axes() {

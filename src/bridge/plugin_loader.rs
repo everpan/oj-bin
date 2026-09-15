@@ -461,6 +461,26 @@ unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
     r
 }
 
+impl Registrations {
+    /// 该轴是否被提供（`None` = 轴名不在 `AXES`）。
+    /// 与 `probe_axes` **同文件相邻**，加轴时两处映射可对照着改，不再有跨 crate 漂移的
+    /// 余地（规格评审 I-2：`tools/xtask` 曾各自维护一份同名映射，加轴漏改即回归）。
+    /// 刻意返回 `Option` 而非 `unreachable!`：漏改的后果应是可读报错，不是 panic。
+    pub fn provides(&self, axis: &str) -> Option<bool> {
+        Some(match axis {
+            "es" => self.es.is_some(),
+            "db" => self.db.is_some(),
+            "blob" => self.blob.is_some(),
+            "bus" => self.bus.is_some(),
+            "kv" => self.kv.is_some(),
+            "auth" => self.auth.is_some(),
+            "mq" => self.mq.is_some(),
+            "mail" => self.mail.is_some(),
+            _ => return None,
+        })
+    }
+}
+
 fn file_stem_name(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     stem.strip_prefix("lib").unwrap_or(stem).to_string()
