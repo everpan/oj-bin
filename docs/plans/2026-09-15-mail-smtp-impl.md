@@ -634,7 +634,108 @@ Windows 路径复用既有 `strip_verbatim` 逻辑；确认无新增跨平台风
 ## 阶段小结（执行时逐条追加）
 
 ### 阶段 0 小结
-（待填）
+
+**结论：`lettre` 与框架既有 `rustls = "=0.23.40"`（aws-lc-rs）编译+运行期均兼容，风险已排除。**
+但**计划中原定的 feature 集需要收敛为方案 B**（见下），否则会新引入 `rustls/ring` 双 provider。
+
+#### 1. 最终 lettre 版本与 feature 列表（方案 B，与计划原稿不同）
+
+```toml
+lettre = { version = "0.11", default-features = false, features = [
+  "builder", "smtp-transport", "tokio1",
+  "tokio1-rustls", "rustls-no-provider", "webpki-roots", "aws-lc-rs",
+  "hostname", "pool", "file-transport"
+] }
+rustls = "=0.23.40"
+```
+
+- 实际解析版本：**lettre v0.11.23**（0.11 线最新），`rustls v0.23.40`，`tokio-rustls v0.26.4`。
+- **为何偏离计划原稿**（原稿为 `tokio1-rustls-tls` + `rustls-tls`）：
+  lettre 的 `rustls-tls = ["webpki-roots", "rustls", "ring"]` —— 它**强制启用 `rustls/ring`**
+  （lettre Cargo.toml 的 `ring = ["rustls?/ring"]`）。而实测**框架今天的依赖图里 rustls
+  只启用 `aws_lc_rs`**（`cargo tree -p only-js -e features -i rustls`：只有
+  `rustls feature "aws_lc_rs"` / `"aws-lc-rs"` / `"prefer-post-quantum"`，**无 ring**）。
+  照原稿落地 = 新引入第二个 provider，把 0 风险变成 1 个隐藏运行期 panic 面。
+- 方案 B 与原稿**功能等价**（`rustls-tls` 的全部内容 = `webpki-roots` + `rustls` + `ring`，
+  逐一替换为显式 `webpki-roots` + `rustls-no-provider` + 去掉 ring），并额外显式声明
+  `aws-lc-rs`，使 `cargo test -p oj-mail`（不链接根 crate）也自洽。
+- **对 `rustls` 无需额外版本处理**：`=0.23.40` 已由根 crate 满足，方案 B 未触发第二个
+  rustls 版本，**无需** `cargo update -p rustls --precise 0.23.40`。
+
+#### 2. `cargo tree` 核验结论（方案 B）
+
+```
+rustls v0.23.40
+├── lettre v0.11.23
+│   └── spike-mail
+├── spike-mail
+└── tokio-rustls v0.26.4
+    └── lettre v0.11.23
+```
+- **单一 rustls 0.23.40**，无第二版本。
+- `cargo tree -p spike-mail -i ring` → `nothing to print`，**ring 不在图中**。
+- rustls 只启用 `aws-lc-rs`（无 `ring`）→ 与框架 provider 完全一致。
+
+#### 3. provider 冲突与处置
+
+- **编译期无冲突**：ring / aws-lc-rs 并存也只是各自编译；真正的问题是运行期
+  `ClientConfig::builder()`（自动判定）在双 provider 且未装默认时会 panic。框架已在
+  `src/bridge/mod.rs:342`（`ws_client_extensions`）显式 `install_default(aws_lc_rs)`。
+- **lettre 侧语义（读 lettre 0.11.23 源码确认，非猜测）**：
+  `src/rustls_crypto.rs::crypto_provider()` 先取 `CryptoProvider::get_default()`，
+  取不到再按 **lettre 自己的 feature** 回落——有 `aws-lc-rs` 则 aws-lc-rs，
+  `all(not(aws-lc-rs), ring)` 则 ring，两者皆无则 `expect` panic。
+  → **原稿方案 A 下 lettre 在「未装默认 provider」时会静默回落 ring**，
+  与「确认 lettre 走 aws-lc-rs」的预期不符；方案 B 显式 `aws-lc-rs`
+  让回落与框架一致（且不再需要 ring）。
+- **硬顺序约束（实测钉死）**：`AsyncSmtpTransport::relay(host)` 会**立即**构建
+  ClientConfig（`Tls::Wrapper(TlsParameters::new_rustls(host))`），因此
+  **provider 安装必须早于任何 transport 构建**。实测纯 `rustls-no-provider`
+  （不带 lettre `aws-lc-rs`）时先 `relay()` 会 panic：
+  `No rustls crypto provider configured. When using the rustls-no-provider feature, ...`
+  → 阶段 3 Task 3.2 的「init 内先 install，再建 transport」是**必须**而非防御性建议。
+  方案 B 带 `aws-lc-rs` 时 lettre 自带回落（不加 install 也能跑），
+  但仍统一按「先 install」实现，保证与框架同实例。
+
+#### 4. `pool` feature 的运行时约束（新增发现，影响阶段 3/4 设计）
+
+lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回收任务。
+在**无 tokio runtime 上下文**中 drop 该 transport 会 panic
+（`there is no reactor running`，且 panic 发生在析构中 → 直接 abort）。
+→ 插件侧 transport 的**创建/使用/销毁都必须在该插件自己的 tokio runtime 内**；
+方案（阶段 4 的 `MailEngine` 自建 multi_thread Runtime）本就满足，
+但**单测/示例不得在纯同步 `fn main` 或 `current_thread` 之外裸建 transport**。
+
+#### 5. spike 结构与清理
+
+- 采用**优先方案**：临时 `tools/spike-mail/`（`Cargo.toml` + `src/main.rs`），
+  临时加入根 `Cargo.toml` 的 `members` 以纳入本仓库 `Cargo.lock`（结论可信度高于仓库外独立 crate）。
+- `src/main.rs` 验证 4 项：① async/sync transport 编译期可构建；② `install_default` 幂等
+  （首次 `Ok`、再次 `Err`）且不 panic；③ 安装后默认 provider **即 aws-lc-rs**
+  （`assert_eq!` cipher_suites 数 + `std::ptr::eq` 首组 KX 实例）；④
+  `TlsParameters::new` 走通 lettre 的 `builder_with_provider` 路径。
+  另提供 `no-install` 参数对照观察回落 / fail-loud 行为。
+  二进制实跑输出：`spike-mail：全部编译期/运行期验证通过`，退出码 0。
+- 清理：已删除 `tools/spike-mail/`，`Cargo.toml` 的 `members` 与 `Cargo.lock` 均已
+  `git checkout` 还原，`git status` 仅剩本计划文档一项改动。
+
+#### 6. 基线测试
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --release -p only-js --lib` | **326 passed; 0 failed** |
+| `cargo test --release -p oj --lib` | **156 passed; 0 failed** |
+
+#### 7. 遗留 / 需决策
+
+1. **阶段 2 落地时 Task 2.1 的 `plugins/oj-mail/Cargo.toml` 须改用方案 B 的 feature 列表**
+   （计划正文原稿仍是 `tokio1-rustls-tls` + `rustls-tls`，阶段 2 执行时同步修订）。
+2. `src/bridge/mod.rs:339-341` 的注释称「reqwest 系又启 ring」——实测根 crate 图中
+   rustls **未启用 ring**（reqwest 0.13 走 `__rustls-aws-lc-rs`），该注释已过时。
+   属阶段 3 范围（provider 注释订正），阶段 0 未改代码以免越界。
+3. 观察（非本阶段引入、不阻塞）：既有测试夹具按设计以 **debug profile** 编译插件
+   （`src/bridge/plugin_loader/tests.rs:10` 有注释、`oj/src/server_cmd.rs:1452` 等），
+   因此 `target/debug` 已有约 **5.6G** 存量产物。
 
 ### 阶段 1 小结
 （待填）
