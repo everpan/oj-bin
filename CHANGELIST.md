@@ -2,7 +2,54 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
-## v0.1.18（2026-09-15）
+## v0.1.19（2026-09-15）
+
+**特性**
+- **mail 轴：邮件投递（新插件 `oj-mail` + JS 全局 `Mail`/`mail`）**。顶层 `smtp:` 段存在即启用；
+  段**一段两用**：整段（含凭据）经 `plugin_cfg` 适配器臂交给 `oj-mail` 插件建 transport，
+  宿主另只吸收每个 profile 的 `allowed_from`/`allowed_recipients` 做前置校验——凭据不进宿主
+  JS 面。**走适配器臂而非 `plugins:` 透传**：`plugins:` 非空即切严格清单模式，用它会顺带把
+  运维的插件装配模式切掉（须列全所有插件）。
+  - **多 profile**：`smtp:` 顶层除 `workers`/`queue_capacity` 外每个键都是一个 profile
+    （键 = `Mail(key)` / `mail.send` 的 key）；未声明的 key 显式报错（不回落 default）。
+  - **四种调用**：`mail.send`（异步 transport）、`mail.sendSync`（同步 transport，worker 内
+    `spawn_blocking`）、`mail.enqueue`（入队即返回 `{jobId}`，真实完成经 `mail.result` 上送）、
+    `mail.sendRaw`（RFC5322 原文投递，与 `attachments` 互斥）。宿主按方法**覆写** req 里的
+    `sync`/`enqueue_only`（JS 侧串用无效）。
+  - **队列 + worker 池**：有界队列（`queue_capacity`，满即**背压** `code:4`，不无界堆积）+
+    `workers` 个 worker 串行投递；停机 graceful drain。**双通道反馈**：同步路（future resolve
+    = 投递结果）与异步上送（`HostContext.deliver("mail.result")` → 宿主按白名单扁平化后存下
+    （限长 + TTL）+ 经 bus 扇出给订阅者；`to`/`subject` 等一律不进反馈帧）。
+  - **引用式附件**（字节不进 JS、不走 base64）：`{filename, blobKey|blob}`（blob 后端）或
+    `{filename, path}`（项目根内本地文件，`ensure_within` 钳制 + canonical 句柄读盘防 TOCTOU），
+    二选一；MIME 决议 = 显式 → 扩展名 → 魔数嗅探 → `application/octet-stream`。
+  - **rustls 三模式**：`tls`（隐式 TLS）/ `starttls`（强制升级，不回落明文）/ `none`（明文，
+    须显式 `allow_none_tls: true`，fail-closed）。认证 `login`（user+pass）或 `xoauth2`
+    （静态 `access_token`；只给 `refresh_token` fail-loud）。lettre 0.11 + rustls 0.23.40
+    单一版本、无 ring（provider 与框架同为 aws-lc-rs）。
+  - **白名单 fail-closed**：`allowed_from`/`allowed_recipients` 后缀匹配（大小写不敏感），
+    **空表 = 拒绝**——白名单是「越权发送」的唯一控制点，缺省放行等于开放中继。
+    宿主侧 CRLF 一律**剥离**（subject/headers）或**拒绝**（地址）；`headers` 不得覆盖
+    From/To/Cc/Bcc/Subject（防白名单绕过）。校验失败一律 `{code:5}` 信封（不抛异常）；
+    仅「未配置 mail」抛错。
+  - **FileTransport**：`file_transport: <dir>` 给定时不发网络，`.eml` 落盘（测试/归档通道）。
+    `oj-mail` 的引擎与 transport 都在插件内，宿主零新增依赖（只 `lettre::Address` 做地址校验）；
+    `ABI_VERSION` 保持 8。
+  - **CI/工具**：`tools/xtask` 的 `PLUGINS` 增 `"mail"`（CI 矩阵与归置的单一真相源，不硬编码
+    副本）；`cargo xtask plugin mail --check` 可预检。JS 类型面见 `docs/devkit/api-manual.md`
+    第 6 章 mail 小节。
+
+**行为变更（升级注意）**
+- **新增顶层 `smtp:` 段**：此前该键被忽略，现在会被解析——若旧配置里恰好有同名且**非映射**
+  的键（如 `smtp: false`），启动会解析失败；改名或删掉即可。不写该段则行为完全不变
+  （`mail.*` 调用报 `mail not configured`）。
+- **配了 `smtp:` 但未装 `oj-mail` 插件**：不阻断启动，`mail.*` 调用报
+  `mail not configured (config smtp: section missing, or oj-mail plugin not loaded)`
+  ——与 es/auth 的「配置声明即 fail-fast」不同（mail 缺插件不构成安全失守，故意放行启动）。
+  装插件：`cargo xtask plugin mail`。
+- **`file_transport` 目录须先存在**（lettre 不建目录）；非空 `allowed_*` 是发信前提。
+
+
 
 **特性**
 - 导入别名 `#x`（**本模块根**）/ `#/m/x`（**src 根**，首段 = 模块目录名）：共享库不再按目录

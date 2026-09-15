@@ -34,6 +34,7 @@ const PLUGINS: &[&str] = &[
     "bus-rabbitmq",
     "kv-redis",
     "auth",
+    "mail",
 ];
 
 /// 以绝对路径声明扩展 JS 的依赖 crate（与根 crate `build.rs` 的 `CRATES` 同步）。
@@ -482,10 +483,11 @@ mod tests {
 
     #[test]
     fn given_first_party_plugins_when_listed_then_covers_all_axes() {
-        // 业务约定：8 个第一方插件 = es/db×2/blob/bus×2/kv/auth 全轴覆盖。
-        assert_eq!(PLUGINS.len(), 8);
+        // 业务约定：9 个第一方插件 = es/db×2/blob/bus×2/kv/auth/mail 全轴覆盖。
+        assert_eq!(PLUGINS.len(), 9);
         assert!(PLUGINS.contains(&"auth"));
         assert!(PLUGINS.contains(&"bus-kafka"));
+        assert!(PLUGINS.contains(&"mail"));
     }
 
     #[test]

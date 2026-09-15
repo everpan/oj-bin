@@ -91,4 +91,4 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
-（json/http/db/kv/blob/bus/es/Kafka/RabbitMQ/tasks…）的完整类型。
+（json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

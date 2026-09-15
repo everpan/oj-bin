@@ -124,6 +124,17 @@ redis:
   # default: "redis://127.0.0.1:6379/1"   # 注释/删除 = 内存 KV；配置即真连，需 oj-kv-redis 插件
 es:
   # endpoint: "http://127.0.0.1:9200"     # 存在即启用 es.search/index/del，需 oj-es 插件
+smtp:                  # 邮件投递（mail 全局）：存在即启用，需 oj-mail 插件
+  # workers: 4                                # worker 线程数；queue_capacity（满即背压 code:4）
+  # default:                                  # 键 = profile 名（= Mail("default")）
+  #   host: "smtp.example.com"
+  #   port: 465
+  #   tls: tls            # tls（隐式）/ starttls（强制升级）/ none（明文须 allow_none_tls: true）
+  #   mechanism: login    # login（user + pass）/ xoauth2（user + xoauth2.access_token）
+  #   user: "api@example.com"
+  #   pass: "change-me"
+  #   allowed_from: ["noreply@x.com"]           # 白名单 fail-closed：空表 = 拒绝
+  #   allowed_recipients: ["@x.com", "@partner.com"]
 plugins:
   # kv-redis: {}                    # 键 = 插件名；空对象 = 透传回落轴适配器
   # auth: { jwt_secret: "..." }     # 非空对象 = 原样透传为该插件 cfg（跳过回落）
@@ -172,6 +183,13 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   "no kv plugin loaded"。`redis` 段缺失/全注释 → 进程内存 KV（`redis.*` 与 `kv.*` 同源）。
 - `es`：可选 Elasticsearch 段，存在即启用 `es.search/index/del`，需 **oj-es** 插件；缺失时调用
   报 `es not configured`。endpoint 尾斜杠自动剪除。
+- `smtp`：可选邮件投递段，存在即启用 `mail.*` / `Mail(key)`，需 **oj-mail** 插件（未装不阻断
+  启动，调用报 `mail not configured`）。段**一段两用**：整段（含凭据）交给插件建 transport，
+  宿主只取每个 profile 的 `allowed_from`/`allowed_recipients` 做前置白名单校验——凭据不进 JS。
+  除 `workers`/`queue_capacity` 外**每个键都是一个 profile**（键 = `Mail(key)` / `mail.send`
+  的 profile 名，未声明的 key 报错）。白名单**后缀匹配且 fail-closed（空表 = 拒绝）**；
+  `tls: none` 须显式 `allow_none_tls: true`；`file_transport: <dir>` 给定则不发网络、`.eml`
+  落该目录（目录须先存在，测试/归档通道）。API 与错误码见 `devkit/api-manual.md` §6「mail」。
 - `plugins` / `plugins_dir`：插件装配。`plugins` 为 **map**，一段三用：键 = 要加载的插件名
   （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，**必须是 YAML 映射（对象）**——
   非空对象原样透传、空对象 = 回落轴适配器，字符串/列表等非对象值视为未提供，静默回落到
