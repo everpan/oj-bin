@@ -716,6 +716,85 @@ mod tests {
         assert!(e.from().is_some());
     }
 
+    /// 地址口径**对账**（阶段 7 遗留 §8.2）：宿主 `mail.rs::validate_address` 放行的地址，
+    /// 插件不得拒绝——否则出现「宿主过了、投递却 `code:5`」的口径分裂。
+    ///
+    /// **实测（阶段 8 新增，TDD 首跑即 RED）**：raw 路与宿主**逐条一致**（两侧同为
+    /// `lettre::Address`）；结构化路用的 `lettre::Mailbox` 与 `Address` 的接受集**并不互相包含**：
+    /// - `Address` 收 / `Mailbox` 拒 → `"quoted local"@x.com`、域字面量 `user@[127.0.0.1]`
+    ///   ——即「宿主放行、插件拒绝」的**已知分裂**（方向为插件更严：信封派生的地址必然先过
+    ///   宿主白名单，故**无越权面**，只是对用户表现为一个没道理的 `code:5`）；
+    /// - `Mailbox` 收 / `Address` 拒 → `显示名 <user@x.com>`——宿主是权威前置门，先拒，安全。
+    ///
+    /// 处置（阶段 8 硬约束：不改实现语义）：**登记为已知偏差**（见阶段 8 小结「已知偏差 D3」），
+    /// 本用例把两侧实测边界**钉死**（分裂项列表化，不无限容忍），任何漂移都会被抓住。
+    #[test]
+    fn host_accepted_addresses_are_accepted_by_plugin_or_listed_as_known_split() {
+        let corpus = [
+            "user@example.com",
+            "user.name+tag@example.com",
+            "UPPER@Example.COM",
+            "user@localhost",
+            "\"quoted local\"@example.com",
+            "user@[127.0.0.1]",
+            "显示名 <user@example.com>", // Address 拒、Mailbox 收（宿主先拒，方向安全）
+            "nope",
+            "a@x.com\r\nBcc: evil@y.com",
+            "",
+        ];
+        /// `Address` 收 / `Mailbox` 拒的**已知分裂**（D3；修好后应从本表移除并放宽断言）。
+        const KNOWN_SPLIT: [&str; 2] = ["\"quoted local\"@example.com", "user@[127.0.0.1]"];
+
+        let mut host_accepted = 0usize;
+        for s in corpus {
+            let host_ok = s.parse::<Address>().is_ok();
+            // raw 路与宿主同一解析器：放行/拒绝必须逐条一致（口径同源的结构性保证）。
+            assert_eq!(
+                host_ok,
+                envelope_of("from@example.com", &[s.to_string()]).is_ok(),
+                "raw 路必须与宿主同判：{s:?}"
+            );
+            if !host_ok {
+                continue;
+            }
+            host_accepted += 1;
+            let mut req = req_with(Some("hi"), None, vec![]);
+            req.from = s.to_string();
+            req.to = vec![s.to_string()];
+            let structured_ok = build_message(&req, &[]).is_ok();
+            if KNOWN_SPLIT.contains(&s) {
+                assert!(
+                    !structured_ok,
+                    "{s:?} 的已知分裂（D3）行为变了——若已修好，请从 KNOWN_SPLIT 移除并更新阶段 8 小结"
+                );
+            } else {
+                assert!(
+                    structured_ok,
+                    "宿主放行的地址 {s:?} 不得被结构化路（Mailbox）拒绝"
+                );
+            }
+        }
+        assert!(host_accepted >= 3, "语料须含至少 3 个宿主放行样本");
+
+        // 反向：宿主拒绝的形态，raw 路（与宿主同解析器）必须同样拒绝。
+        for bad in ["nope", "a@b@c", "a b@x.com", "a@x.com\r\nBcc: evil@y.com"] {
+            assert!(bad.parse::<Address>().is_err(), "{bad} 应被宿主拒");
+            assert!(
+                envelope_of("from@example.com", &[bad.to_string()]).is_err(),
+                "raw 路必须与宿主同判：{bad}"
+            );
+        }
+
+        // CRLF 是**拒绝**口径（不是剥离）：即便 `Mailbox` 自己会忽略尾部 `\r\n`，
+        // `mailbox()` 的前置 `ensure_no_crlf` 也必须先拒——纵深防御不得只靠解析器。
+        for bad in ["a@x.com\r\n", "a@x.com\n", "a@x.com\r\nBcc: evil@y.com"] {
+            assert!(
+                mailbox(bad, "to[0]").is_err(),
+                "结构化路必须先拒 CRLF 地址（不依赖 Mailbox 的宽容解析）：{bad:?}"
+            );
+        }
+    }
+
     // ---- Task 5.2：raw 信封头剥离（controller 决策 2026-09-15：**只剥信封头**，Subject 保留）----
 
     /// raw 路的剥离范围 = **信封头** `From`/`To`/`Cc`/`Bcc`（大小写不敏感）；`Subject` 不是信封

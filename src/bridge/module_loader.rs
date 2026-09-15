@@ -757,6 +757,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// design §9/§11「路径穿越：`ensure_within` **双侧 canonicalize**，符号链接在覆盖内」——
+    /// 词法 `..` 之外的第二条逃逸面：根**内**的符号链接指向根**外**文件（路径字符串完全在
+    /// 根内，只有 canonicalize 能识破）。附件 `{path}` 与模块加载共用本函数。
+    /// 仅 unix（Windows 建符号链接需特权，见 CI 矩阵）。
+    #[test]
+    #[cfg(unix)]
+    fn ensure_within_rejects_symlink_escape() {
+        let base = fx(&[("outside.txt", "secret\n"), ("proj/inside.txt", "ok\n")]);
+        let root = base.join("proj");
+        // 根内文件：放行（对照组，防「一律拒绝」的变异蒙混）。
+        assert!(ensure_within(&root.join("inside.txt"), &root).is_ok());
+
+        // 根内符号链接 → 根外文件。
+        let file_link = root.join("link.txt");
+        std::os::unix::fs::symlink(base.join("outside.txt"), &file_link).unwrap();
+        let e = ensure_within(&file_link, &root).unwrap_err();
+        assert!(e.contains("escapes project root"), "{e}");
+
+        // 根内符号链接 → 根外目录，再穿透一层。
+        let dir_link = root.join("dirlink");
+        std::os::unix::fs::symlink(&base, &dir_link).unwrap();
+        assert!(
+            ensure_within(&dir_link.join("outside.txt"), &root).is_err(),
+            "经目录符号链接穿透到根外也必须拒"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn cjs_detection_and_wrap() {
         assert!(looks_cjs("module.exports = { a: 1 };\n"));
