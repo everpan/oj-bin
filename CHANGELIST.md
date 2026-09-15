@@ -50,6 +50,14 @@
   all/run/toSQL + `update|delete` 无 where 即抛的守卫），SQL 按规范形渲染（小写、`col, col`、
   `?` 占位；真实渲染由 sea-query 按方言产出，mock 不复刻方言），未覆盖形态直接抛错。
   L2 12/12 恢复绿。
+- **Windows 别名解析误判「未找到模块根」**：`module_root_of` 用词法 `starts_with(project_root)`，
+  而 `canonicalize` 给 referrer 目录加 `\\?\` verbatim 前缀、`ModuleSpecifier::to_file_path`
+  还原时又剥掉——同一条长名路径仅差此前缀，导致 `oj build` 内省（`alias_build_materializes_to_versioned_relative_paths`）
+  在 Windows CI 失败。现新增 `strip_verbatim` 在比较前归一两侧前缀；并在构建入口（`run`）与
+  dev 服务端（`app.rs`）对 `src`/`project_root` 统一 `canonicalize` + `strip_verbatim`（与
+  `resolve_to_segs` 的 `strip_prefix`、`oj-plugin-ffi` 的 `dunce::simplified` 同约定），
+  Windows 与 unix 路径形态从此一致。新增 `#[cfg(windows)]` 回归用例
+  `module_root_of_tolerates_verbatim_prefix_mismatch`。
 
 **行为变更（升级注意）**
 - **本地 import 目标必须是 `.ts`**：`import "./x.js"` / `import "./d.json"` 这类**非 `.ts` 目标**

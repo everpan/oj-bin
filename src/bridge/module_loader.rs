@@ -151,15 +151,33 @@ pub fn resolve_relative(base_dir: &Path, spec: &str, ts: bool) -> Result<PathBuf
     ))
 }
 
+/// 剥除 Windows verbatim 前缀 `\\?\`（与 `oj-plugin-ffi/src/path_util.rs` 的
+/// `dunce::simplified` 同效，但本 crate 不引 dunce）。`std::fs::canonicalize` 在
+/// Windows 返回 `\\?\C:\...`，而 `ModuleSpecifier::to_file_path` 还原时**剥掉**该前缀，
+/// 二者词法前缀不一致会让 `module_root_of` 的 `starts_with(project_root)` 误判——此处
+/// 归一后再比。非 Windows 为 no-op。
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// 模块根：referrer 所在目录**向上最近的含 manifest.yaml 的祖先目录**（上溯以
 /// project_root 为界——模块只可能落在它内部，同时避免为越界路径走到文件系统根）。
 /// 锚点由文件自身位置派生，故 dev（`src/<m>/`）、release 产物（`dist/<m>-<v>/`，
 /// manifest.yaml 原样复制）、tasks 镜像（无）三处语义自动一致，无需把 api 根路径
 /// 穿透到各装配点。find 不到 = 该文件不在任何模块内（tasks 池 / tests 目录）。
 pub fn module_root_of(from_dir: &Path, root: &Path) -> Option<PathBuf> {
-    let mut cur = Some(from_dir);
+    // Windows：`canonicalize` 给出的 referrer 带 `\\?\`，project_root 可能不带（或反之），
+    // 先归一再比，避免词法前缀不一致误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
+    let from_dir = strip_verbatim(from_dir);
+    let root = strip_verbatim(root);
+    let mut cur = Some(from_dir.as_path());
     while let Some(d) = cur {
-        if !d.starts_with(root) {
+        if !d.starts_with(&root) {
             break;
         }
         if d.join("manifest.yaml").is_file() {
@@ -553,6 +571,34 @@ mod tests {
         assert!(module_root_of(&outside, &root).is_none());
         let e = resolve_alias("#_shared/validate", &outside, &root, true).unwrap_err();
         assert!(e.contains("manifest.yaml") && e.contains("相对路径"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 回归（Windows）：`canonicalize` 给 referrer 目录加 `\\?\` 前缀，而
+    /// `ModuleSpecifier::to_file_path` 还原时剥掉——同一条长名路径仅差此前缀。
+    /// `module_root_of` 此前用词法 `starts_with`，前缀不一致即误判「未找到模块根」
+    /// （见 build_cmd 的 alias_build_materializes_to_versioned_relative_paths 在 CI 失败）。
+    /// 本用例仅 Windows 编译运行（macOS/Linux canonicalize 不带前缀，无此问题）。
+    #[test]
+    #[cfg(windows)]
+    fn module_root_of_tolerates_verbatim_prefix_mismatch() {
+        let (root, _deep) = alias_fx("verbatim");
+        let canon = root.canonicalize().unwrap(); // 长名 + `\\?\`
+        let with_prefix = canon.join("src/m1/a/b"); // referrer（canonical，带前缀）
+        let no_prefix = strip_verbatim(&with_prefix); // 长名无前缀（模拟 to_file_path）
+
+        // 方向一：referrer 无前缀 vs project_root 带前缀。
+        assert_eq!(
+            module_root_of(&no_prefix, &with_prefix),
+            Some(strip_verbatim(&canon.join("src/m1"))),
+            "no-prefix from_dir vs \\?\\-prefixed root 应命中模块根"
+        );
+        // 方向二：referrer 带前缀 vs project_root 无前缀。
+        assert_eq!(
+            module_root_of(&with_prefix, &no_prefix),
+            Some(canon.join("src/m1")),
+            "\\?\\-prefixed from_dir vs no-prefix root 应命中模块根"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

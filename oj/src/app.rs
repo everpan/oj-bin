@@ -379,11 +379,15 @@ impl App {
                 .to_string());
         }
         // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
+        // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
+        // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
         let dir = dir.canonicalize().unwrap_or(dir);
         let loader = Arc::new(LoaderShared {
-            project_root: config_dir
-                .canonicalize()
-                .unwrap_or_else(|_| config_dir.to_path_buf()),
+            project_root: only_js::bridge::strip_verbatim(
+                &config_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| config_dir.to_path_buf()),
+            ),
             ts,
         });
         // ext_boot：运行时创建期加载一次（bootstrap 的动态补充）。
