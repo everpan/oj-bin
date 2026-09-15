@@ -987,7 +987,7 @@ mod mail_assembly_tests {
     use super::*;
     use oj_plugin_ffi::{FfiFuture, MailAttachment, MailVtable, RString, RVec};
     use only_js::bridge::RequestInfo;
-    use only_js::bridge::mail::{MailMode, handle_send};
+    use only_js::bridge::mail::{CallCtx, MailMode, handle_send};
 
     /// 假 mail vtable：submit 回固定信封（装配测试零网络、零插件）。jobId 回显 key，
     /// 证明 profile 名确实过线（不是被适配器吞掉）。控制报文（`__ctl`）回排空信封，
@@ -1130,6 +1130,7 @@ mod mail_assembly_tests {
             })
             .to_string(),
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         // mock profile 白名单为空 → fail-closed（即便 profile 存在也拒绝）。

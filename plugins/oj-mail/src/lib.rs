@@ -235,6 +235,25 @@ fn credentials(p: &ProfileCfg) -> Result<(Option<Credentials>, Vec<LettreMechani
     }
 }
 
+/// B6：`tls: none`（明文）profile 在**启动时**醒目告警（warn 级 = `HostContext.log(3, …)`，
+/// 宿主落 `tracing::warn!(target: "oj-plugin")`），文案含 profile 名与 host:port。
+///
+/// 设计 §11 原要求「`allow_none_tls: true` **且** host 为内网 CIDR」——后半句**未实现**
+/// （登记在 `docs/mail-smtp.md` §9）。本告警是它的缓解：明文 profile 不可能悄悄上线。
+/// `file_transport` profile 不告警（本地落盘，无网络明文暴露面）。
+fn warn_plaintext_profiles(host: &RArc<HostContext>, cfg: &MailConfig) {
+    for (name, p) in &cfg.profiles {
+        if p.tls == TlsMode::None && p.file_transport.is_none() {
+            let msg = format!(
+                "oj-mail: profile '{name}' 使用 tls: none —— **明文**传输（凭据与邮件可被截获）；\
+                 host={} port={}；设计要求的「内网 CIDR 限制」尚未实现，请自行确保该地址处于受信网络",
+                p.host, p.port
+            );
+            (host.log)(3, RString::from(msg.as_str()));
+        }
+    }
+}
+
 /// 插件自描述。身份必须 = 插件名（crate 名去 `oj-` 前缀），**不是** crate 名 ——
 /// `PluginLoader::load_one` 以清单键做严格相等校验（`plugin_loader.rs:404`），
 /// 且落盘文件名 `lib<name>.dylib` 亦取该名；全 8 个既有插件同此约定
@@ -261,6 +280,8 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     if MAIL_ENGINE.get().is_some() {
         return RResult::Ok(descriptor()); // 重复 init 保留首个引擎，保持幂等
     }
+    // B6：明文 profile 在**启动时**醒目告警（必须在 host 被 deliver 闭包取走之前）。
+    warn_plaintext_profiles(&host, &parsed);
 
     // 结果上送：生产转发 `HostContext.deliver`（测试注入收集器；见 `engine::DeliverSink`）。
     let deliver = DeliverSink::new(move |topic: &str, payload: &[u8]| {
@@ -594,5 +615,39 @@ mod tests {
         assert!(e.contains("allow_none_tls"), "{e}");
         assert!(init_outcome("not json").is_err());
         assert!(init_outcome("{}").is_ok(), "空配置合法（无 profile）");
+    }
+
+    /// B6：`tls: none` 的 profile 在**启动时**必须打**醒目告警**（warn 级 + 含 profile 名与
+    /// host:port，并点明「内网 CIDR 限制未实现」）；`file_transport` profile 不告警
+    /// （本地落盘，无明文网络暴露面）。
+    #[test]
+    fn plaintext_profiles_warn_loudly_at_startup() {
+        use crate::testutil::host_with_log;
+        use std::sync::Mutex;
+        static LOGS: Mutex<Vec<(u8, String)>> = Mutex::new(Vec::new());
+        extern "C" fn capture(level: u8, msg: RString) {
+            LOGS.lock().unwrap().push((level, msg[..].to_string()));
+        }
+        LOGS.lock().unwrap().clear();
+
+        let cfg = MailConfig::parse(
+            r#"{"plain":{"host":"smtp.corp.local","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login"},
+                "mock":{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login","file_transport":"/tmp/eml"},
+                "tlsed":{"host":"smtp.example.com","port":465,"tls":"tls","mechanism":"login","user":"u","pass":"p"}}"#,
+        )
+        .expect("cfg");
+        warn_plaintext_profiles(&host_with_log(capture), &cfg);
+
+        let logs = LOGS.lock().unwrap().clone();
+        assert_eq!(logs.len(), 1, "只有走网络的明文 profile 需要告警：{logs:?}");
+        let (level, msg) = &logs[0];
+        assert_eq!(*level, 3, "必须是 warn 级：{msg}");
+        for needle in ["plain", "smtp.corp.local", "明文", "CIDR"] {
+            assert!(msg.contains(needle), "告警须含 {needle}: {msg}");
+        }
+        assert!(
+            !msg.contains("mock"),
+            "file_transport profile 不告警: {msg}"
+        );
     }
 }

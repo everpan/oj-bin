@@ -16,6 +16,14 @@ pub fn host() -> RArc<HostContext> {
     })
 }
 
+/// 带自定义日志口的宿主（B6 告警用例：断言告警确实经 `HostContext.log` 上送）。
+pub fn host_with_log(log: extern "C" fn(u8, RString)) -> RArc<HostContext> {
+    RArc::new(HostContext {
+        log,
+        deliver: test_deliver,
+    })
+}
+
 /// FfiFuture → 测试异步桥（等价 core 侧 `await_ffi` 的 poll 轮询）。
 /// 以真实墙钟为界，避免固定轮询次数在 CI 负载下误报超时。
 pub async fn drive(fut: &mut FfiFuture) -> Result<Vec<u8>, String> {

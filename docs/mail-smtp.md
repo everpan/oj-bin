@@ -103,8 +103,8 @@ await Mail.profiles();              // ["default","alerts","mock"]
 |---|---|
 | `new Mail(key?)` | profile 实例，`key` 缺省 `"default"`；**未声明的 key 报错**（不回落 default） |
 | `send(m)` / `sendSync(m)` | resolve 投递结果信封；区别仅内部走 async / sync transport |
-| `enqueue(m)` | 入队即回 `{code:0,data:{jobId}}` |
-| `result(jobId)` | 宿主侧结果（`Json \| null`） |
+| `enqueue(m)` | 入队即回 `{code:0,data:{jobId}}`（jobId 由**宿主**生成，调用方传入值被剥离） |
+| `result(jobId)` | 宿主侧结果（`Json \| null`）；**只回本归属**（profile + 模块 + 租户）的结果 |
 | `sendRaw(o)` | `raw` 原文 + 结构化 `from`/`to` 作信封（与 `attachments` 互斥） |
 | `Mail.profiles()` | 已配置 profile 名清单（非密钥面） |
 
@@ -137,6 +137,16 @@ interface MailSendRequest {
 | `2` / `3` | **当前未启用**：首版不细分 SMTP 5xx（`2`）与鉴权失败（`3`），两类都归 `1`——这样 `msg` 只需出脱敏分类文案（lettre 原始错误含 SMTP 对话/收件人，不进信封）。判失败请用 `code !== 0` |
 | `4` | 队列满（背压；`try_send` 拒绝，不阻塞调用方） |
 | `5` | 地址/入参/白名单/附件校验失败 |
+
+**`code != 0` 一律不得自动重试**：`2`（SMTP 5xx，永久）与 `3`（鉴权失败，永久）当前
+**未实现**、与 `1`（连接/网络/超时，多为瞬时）**合并为同一个码**，故宿主/JS 侧**无法**从
+`code` 区分「永久失败」与「瞬时失败」；自动重试会把「收件人不存在」这类永久失败反复重投。
+需要重试时请**显式**判定（如仅对 `code:1` 且人工确认瞬时性），并自行做幂等/去重
+（同一封信重发会产生新的 `jobId`，`mail.result` 不会替你合并）。
+
+> 修订记录（B6）：本版选择**文档化限制**而非新增 `data.retryable` 字段 —— 后者要么随
+> `2`/`3` 的落地一起定（否则字段值只能是猜测），要么就得先把 lettre 错误分类解析出来
+> （design §10 的待做项）。在 `code` 尚不能区分永久/瞬时前，给出 `retryable` 只会误导。
 
 ## 4. 附件（引用式，字节由宿主解析）
 
@@ -184,6 +194,11 @@ smtp:
 ## 6. 反馈通道（`enqueue`）
 
 - `enqueue` 立即回 `{code:0,data:{jobId}}`；worker 完成后经 `HostContext.deliver("mail.result", 信封)` 上送宿主。
+- **`jobId` 由宿主生成**（`<16 hex 随机前缀>-<单调计数>`）：调用方自带的 `jobId` 一律被**剥离**；
+  回执里的 `jobId` 也钉成宿主值（不依赖插件回显）。故 jobId 不可猜（不是 `{pid}-{seq}`）。
+- **归属校验**：宿主在 `submit` **之前**为该 jobId 登记一张票，票上记「profile + 模块 + 租户」；
+  插件上送只能**填充**这张票（不能新建、不能覆写），`mail.result(jobId)` 也只把结果显示给
+  **同一归属**的调用方（换 profile / 换模块 / 换租户 → `null`，不泄露存在性）。
 - 宿主：存 `MailResultStore`（**限长 + TTL**）供 `mail.result(jobId)` 查询，并向**本地 `bus`** 扇出**扁平**结果：
 
 ```js
@@ -201,8 +216,13 @@ bus.subscribe("mail.result");   // 回调收到 { jobId, code, msg, messageId }
   空条目/裸域条目在装配期即被拒绝（历史实现里 `ends_with("")` 会让白名单恒真）。
 - **CRLF 注入**：`subject`/`headers` 剥离 CRLF；`from/to/cc/bcc` 经 `lettre::Address` **强校验**（非法即 `code:5`）。正文/`raw` 原文不剥（换行有语义）。
 - **`headers` 不得覆盖** `From/To/Cc/Bcc/Subject`（否则可绕过白名单）。
+- **结果通道**：jobId 由宿主生成且**不可猜**、调用方传入值被剥离；宿主先登记票、插件只能
+  填充一次（**不可覆写**，杜绝把他人结果改成 `code:0`）；`mail.result` 按
+  「profile + 模块 + 租户」归属过滤（见 §6）。
 - **附件路径** 经 `ensure_within`（双侧 canonicalize，覆盖符号链接）。
-- 密钥不进 JS/日志；错误文案脱敏（不含账号/密码/令牌/SMTP 对话）。
+- **附件大小** 单件/单封两道上限（§4），超限 `code:5`。
+- 密钥不进 JS/日志；错误文案脱敏（不含账号/密码/令牌/SMTP 对话）；白名单未命中**不回显**
+  白名单内容（只给 profile 名，防空转枚举他 profile 的白名单）。
 
 ## 8. 构建、加载与运维
 
@@ -227,12 +247,14 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 mai
 | 跨进程（分布式 bus）`mail.result` | 仅本地扇出；需宿主持 runtime handle 后异步发布（待做） |
 | XOAuth2 token 刷新 | 首版仅静态 `access_token`；`refresh_token`-only fail-loud（待做） |
 | per-来源限流 | 仅全局有界队列 + `code:4`；令牌桶按模块/租户待做 |
+| 结果归属的粒度 | 归属 = **profile + 模块名 + 租户 id**（宿主 `ReqState` 里能拿到的全部）。**能力边界**：拿不到「具体 handler / 用户」，故同一模块内不同 handler 视为同一归属；跨模块回查（A 模块 enqueue、B 模块 `mail.result`）**不支持** —— 跨模块通知请用 `bus.subscribe("mail.result")`。无模块上下文/未启用租户时归属退化为「profile 相同」 |
+| `bus` 订阅面的隔离 | **未做**：`mail.result` 是本地扇出，任何订阅者都会收到所有归属的结果（payload 已脱敏：无 `to`/`subject`，且 jobId 不可猜）。按租户/模块分 topic 待做 |
 | 自动重试 / bounce / DKIM | 不做（交中继/上层）；**`code≠0` 一律不得自动重试**（§3） |
 | 附件上限 | 有：单件 `max_attachment_bytes`（默认 10 MiB）+ 单封合计 `max_total_attachment_bytes`（默认 25 MiB），超限 `code:5`（§4）。**无**「按 profile 分别设限」与「按 MIME 白名单」 |
 | 附件字节的内存峰值 | 上限只约束**单件/单封**大小；`blobKey` 路由后端取字节时仍会先分配整块（后端无 size 接口，拿不到就判不了） |
 | `pool` 生命周期 | lettre `pool` 在 transport 构建与 Drop 时 `tokio::spawn` → 必须全程在插件自身 runtime 内（已保证） |
 | SMTP 错误细分（`code:2`/`3`） | 未启用：5xx 与鉴权失败均归 `1`（§3）。细分要解析 lettre 错误分类，且需在 `msg` 脱敏前提下做（待做） |
-| `tls: none` 的「内网 CIDR」约束 | 未实现：当前只校验显式 `allow_none_tls: true`（设计 §11 曾要求 host 落在内网网段，待做） |
+| `tls: none` 的「内网 CIDR」约束 | 未实现：当前只校验显式 `allow_none_tls: true`（设计 §11 曾要求 host 落在内网网段）。**缓解（B6）**：启动时对每个走网络的明文 profile 打 **warn 级**告警（经 `HostContext.log` 进宿主 tracing，含 profile 名与 host:port）；`file_transport` profile 不告警（不联网）。仍待做 |
 | 地址接受集两侧一致 | **已知分裂**：宿主（`lettre::Address`）放行而结构化路（`lettre::Mailbox`）拒绝的形态（引号本地部 `"a b"@x.com`、域字面量 `a@[127.0.0.1]`）会在投递期报 `code:5`。方向为「插件更严」，无越权面；统一解析器待做 |
 
 ## 10. 相关文档

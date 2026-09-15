@@ -303,6 +303,8 @@ globalThis.es = {
 // / not enabled -- both fold into 1, so test failures with `code !== 0`.
 // enqueue() resolves {code:0,data:{jobId}} and the real completion is published on the
 // bus topic "mail.result" as the flat {jobId,code,msg,messageId} (no to/subject).
+// jobId is HOST-generated and unguessable (a caller-supplied jobId is stripped);
+// result(jobId) only returns results owned by this caller (profile + module + tenant).
 // attachments[i]: {filename, blobKey|path, mime?} -- blobKey rides the blob registry,
 // path must stay inside the project root.
 globalThis.Mail = class {

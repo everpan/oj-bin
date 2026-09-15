@@ -304,20 +304,30 @@ impl Default for AuthCfg {
 /// `allowed_from`/`allowed_recipients` 做前置白名单校验。二者读同一段配置
 /// （装配层把同一份 JSON 同时喂插件 cfg 与宿主校验面，避免两边分叉）。
 ///
-/// 顶层除 `workers`/`queue_capacity` 外**每个键都是一个 profile**（键 = `Mail.b(key)` /
+/// 顶层除全局键（`workers`/`queue_capacity`/`max_attachment_bytes`/
+/// `max_total_attachment_bytes`）外**每个键都是一个 profile**（键 = `Mail(key)` /
 /// `mail.send` 的 profile 名）；未声明的键即未知 profile → 调用返回 `{code:5}`。
+/// **新增全局键必须加进 `SmtpSection` 的显式字段**，否则会被 `flatten` 当 profile 解析。
 // Serialize：装配层原样透传给 oj-mail 插件（spec §3 按值传入；空字段省略而非 null
 // ——插件侧 `ProfileCfg` 是强类型 `Deserialize`，`null` 会直接报错）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SmtpSection {
-    /// worker 线程数（省略 = 插件默认 4）。
+    /// worker 线程数（省略 = 宿主默认）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<usize>,
-    /// 有界队列容量（省略 = 插件默认 256；满即背压，不无界堆积）。
+    /// 有界队列容量（省略 = 宿主默认；满即背压，不无界堆积）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_capacity: Option<usize>,
+    /// 单附件字节上限（省略 = 宿主默认 `MAIL_MAX_ATTACHMENT_BYTES`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attachment_bytes: Option<usize>,
+    /// 单封全部附件合计字节上限（省略 = 宿主默认 `MAIL_MAX_TOTAL_ATTACHMENT_BYTES`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_attachment_bytes: Option<usize>,
     /// profile 名 → 配置（`flatten` 收拢其余顶层键；键序不影响语义）。
+    /// **注意**：新增全局键必须在此显式声明 —— `flatten` 会把未知顶层键当 profile
+    /// 结构体解析，数值键会直接报 `invalid type: integer, expected struct SmtpProfileCfg`。
     #[serde(flatten)]
     pub profiles: HashMap<String, SmtpProfileCfg>,
 }

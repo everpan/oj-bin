@@ -6,13 +6,16 @@
 //!   `headers`/`attachments` → `lettre::Message`（text+html → `multipart/alternative`；
 //!   有附件 → 外层 `multipart/mixed`）。信封（MAIL FROM / RCPT TO）由 lettre 从报头派生
 //!   （To ∪ Cc ∪ Bcc；`Bcc` 报头在派生后按 lettre 默认丢弃 → 收件人可见性正确）。
+//!   正文（`text`/`html`）行尾一律归一 CRLF（B4：裸 CR 是 SMTP smuggling 半开面）。
 //! - **原文投递**（[`build_raw`]）：`raw` 是调用方自备的 RFC5322 原文，由本模块拼出最终字节。
-//!   **只剥离信封头 `From`/`To`/`Cc`/`Bcc`**（信封的权威来源是结构化 `from`/`to`，原文里这些
-//!   头留着就能造出双收件人 / 发件人 spoof，含折行续行一并丢弃）；`Subject` **保留**（非信封
-//!   字段，剥它只会丢主题），但做 CRLF 校验，且**结构化 `subject` 非空时覆盖原文 Subject**。
-//!   其余头与正文逐字节保留（仅行尾归一 CRLF，见 [`build_raw`] 的说明）。**不**经 lettre 的
-//!   MIME 组装 —— `Message::body` 会按「最优编码」重编码正文（行 ≥76 字节即改用
-//!   quoted-printable/base64），已编码的 multipart 原文会被改烂。
+//!   **只剥离信封头/身份头 `From`/`To`/`Cc`/`Bcc`/`Sender`/`Return-Path`**（信封的权威
+//!   来源是结构化 `from`/`to`，原文里这些头留着就能造出双收件人 / 发件人 spoof，含折行
+//!   续行一并丢弃）；`Subject` **保留**（非信封字段，剥它只会丢主题），但做 CRLF 校验，
+//!   且**结构化 `subject` 非空时覆盖原文 Subject**。
+//!   其余头与正文逐字节保留（正文行尾归一 CRLF，裸 CR 也归一；头区的裸 CR 一律拒绝，
+//!   见 [`build_raw`] 的说明）。**不**经 lettre 的 MIME 组装 —— `Message::body` 会按
+//!   「最优编码」重编码正文（行 ≥76 字节即改用 quoted-printable/base64），已编码的
+//!   multipart 原文会被改烂。
 //!
 //! 决策依据：设计 §7/§11（2026-09-15 controller 决策 —— `Subject` 非信封字段，不剥离）。
 //!
@@ -43,16 +46,33 @@ use oj_plugin_ffi::MailAttachment;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// raw 路必须剥离的**信封头**（**大小写不敏感**）：信封（MAIL FROM / RCPT TO）的权威来源是
-/// 结构化 `from`/`to`，原文里这些头留着就能造出「双收件人 / 发件人 spoof」。
+/// raw 路必须剥离的**信封头 / 身份头**（**大小写不敏感**）：信封（MAIL FROM / RCPT TO）的
+/// 权威来源是结构化 `from`/`to`，原文里这些头留着就能造出「双收件人 / 发件人 spoof」。
+///
+/// `Sender`/`Return-Path`（B5）同列：二者都断言「谁把这封信交给 MTA」——
+/// 原文留着就会与重建的 `From`（来自结构化信封）矛盾，构成弱 spoof 面
+/// （`Return-Path` 按 RFC 5321 本就只由收信方在投递时添加，客户端不得发）。
 ///
 /// `Subject` **不在**此列：它不是信封字段，剥掉只会让邮件丢主题；原文 Subject 的注入面由
-/// CRLF 校验覆盖（见 [`build_raw`]）。
-const ENVELOPE_HEADERS: [&str; 4] = ["from", "to", "cc", "bcc"];
+/// CRLF 校验覆盖（见 [`build_raw`]）。`Reply-To` 也不在：raw 是调用方自备的原文，
+/// 它不改变信封与发件人身份（结构化 `headers` 路则禁用，见 [`STRUCTURED_HEADERS`]）。
+const ENVELOPE_HEADERS: [&str; 6] = ["from", "to", "cc", "bcc", "sender", "return-path"];
 
 /// 结构化字段权威、**不允许** `headers` 覆盖的头（含 `Subject`：主题由 `subject` 决定）。
 /// 组装路的信封是 lettre **由报头派生**的，允许覆盖 = 绕过宿主收件人白名单的面。
-const STRUCTURED_HEADERS: [&str; 5] = ["from", "to", "cc", "bcc", "subject"];
+///
+/// B5 补入三个**弱 spoof 面**头：`Sender`（实际提交者，与 `From` 不一致即冒充）、
+/// `Return-Path`（退回地址，客户端本就不该发）、`Reply-To`（把回复引到别处 —— 钓鱼面）。
+const STRUCTURED_HEADERS: [&str; 8] = [
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "sender",
+    "return-path",
+    "reply-to",
+];
 
 /// 附件未给 MIME 且宿主未解析出时的兜底类型。
 const DEFAULT_MIME: &str = "application/octet-stream";
@@ -162,12 +182,14 @@ pub fn build_message(req: &SendRequest, atts: &[MailAttachment]) -> Result<Messa
 
     let content = match (req.text.as_deref(), req.html.as_deref()) {
         // 两版正文 → 备选体（收件人客户端自行择优）。
+        // 正文行尾一律归一 CRLF（B4）：裸 CR 会被中间 MTA 当行界 → SMTP smuggling 半开
+        // （正文里的 `X\r.\r\n` 会让对方提前结束 DATA，余下被当命令）。
         (Some(t), Some(h)) => Some(Content::Multi(MultiPart::alternative_plain_html(
-            t.to_string(),
-            h.to_string(),
+            normalize_crlf(t),
+            normalize_crlf(h),
         ))),
-        (Some(t), None) => Some(Content::Single(SinglePart::plain(t.to_string()))),
-        (None, Some(h)) => Some(Content::Single(SinglePart::html(h.to_string()))),
+        (Some(t), None) => Some(Content::Single(SinglePart::plain(normalize_crlf(t)))),
+        (None, Some(h)) => Some(Content::Single(SinglePart::html(normalize_crlf(h)))),
         (None, None) => None,
     };
 
@@ -319,11 +341,13 @@ fn custom_header(name: &str, value: &str) -> Result<HeaderValue, String> {
 /// 一个 base64 分块的 multipart 原文会被 `multipart/*` 报头 + base64 正文的组合改烂
 /// （收件端解析不出任何 part）。故 raw 路自己拼字节。
 ///
-/// ## 行尾一律归一 CRLF
+/// ## 行尾一律归一 CRLF（正文）/ 头区裸 CR 一律拒绝
 ///
 /// SMTP DATA 的帧界是 CRLF，而 lettre 的送出侧只做**点填充**（`ClientCodec`）不做行尾
-/// 归一：裸 LF 之后的行首 `.` 不会被填充，中间 MTA 可据此提前结束 DATA → 余下内容被当
-/// 命令执行（SMTP smuggling）。故这里把头/正文的行尾统一成 CRLF；正文其余字节不动。
+/// 归一：裸 LF/裸 CR 之后的行首 `.` 不会被填充，中间 MTA 可据此提前结束 DATA → 余下内容被当
+/// 命令执行（SMTP smuggling）。故正文（含 raw 正文）的行尾统一成 CRLF（[`normalize_crlf`]，
+/// 裸 CR 也在内）；**头区**若含裸 CR 直接 `Err`（归一它会凭空造出一个头，见
+/// [`kept_header_lines`]）。
 pub fn build_raw(
     envelope: &Envelope,
     raw: &str,
@@ -373,7 +397,7 @@ fn subject_header(value: &str) -> String {
     headers.to_string()
 }
 
-/// 头部区中**保留**的行（含原行尾）：剥离信封头，其余头（及其折行续行）原样保留。
+/// 头部区中**保留**的行（含原行尾）：剥离信封头/身份头，其余头（及其折行续行）原样保留。
 ///
 /// 折行（continuation，行首为空格/TAB）归属**上一个头**：上一个头被丢弃时，它的续行一并
 /// 丢弃 —— 否则续行会变成无主行（既可能被收件端当成前一个保留头的续行，也可能孤零零
@@ -381,6 +405,10 @@ fn subject_header(value: &str) -> String {
 ///
 /// `keep_subject` = 结构化 `subject` 为空：为真时原文 Subject（含折行续行）保留并要求通过
 /// CRLF 校验；为假时原文 Subject 整段丢弃（让结构化值成为唯一的 Subject）。
+///
+/// **保留的每一行都不得含裸 CR**（B4）：头区里的裸 CR 在「以裸 CR 为行界」的接收端就是
+/// 换行 —— 归一它会**凭空造出一个头**（`X-Foo: a\rBcc: x` → 两条头），比什么都糟；
+/// 故此处**拒绝**（`code:5`），与正文的归一处置互补（正文归一不产生新头）。
 fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String> {
     let mut kept = Vec::new();
     let mut keep_prev = false;
@@ -389,10 +417,8 @@ fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String
         let bare = bare_line(line);
         if bare.starts_with(' ') || bare.starts_with('\t') {
             if keep_prev {
-                if prev_is_subject {
-                    // 续行同样可能夹带裸 CR（行扫描只认 `\n`）—— 保留它就等于保留注入面。
-                    ensure_no_crlf(bare, "raw Subject")?;
-                }
+                // 续行同样可能夹带裸 CR（行扫描只认 `\n`）—— 保留它就等于保留注入面。
+                ensure_no_crlf(bare, "raw 头（折行续行）")?;
                 kept.push(line);
             }
             continue;
@@ -401,18 +427,15 @@ fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String
         let name = bare.split(':').next().unwrap_or(bare);
         prev_is_subject = name.eq_ignore_ascii_case("subject");
         keep_prev = if prev_is_subject {
-            if keep_subject {
-                ensure_no_crlf(bare, "raw Subject")?;
-                true
-            } else {
-                false
-            }
+            keep_subject
         } else {
             !ENVELOPE_HEADERS
                 .iter()
                 .any(|h| name.eq_ignore_ascii_case(h))
         };
         if keep_prev {
+            // 保留头的裸 CR 一律拒（归一 = 造头）。
+            ensure_no_crlf(bare, "raw 头")?;
             kept.push(line);
         }
     }
@@ -437,16 +460,31 @@ fn bare_line(line: &str) -> &str {
     l.strip_suffix('\r').unwrap_or(l)
 }
 
-/// 行尾归一到 CRLF（裸 LF → CRLF；已有 CRLF 不动；裸 CR 保留）。
+/// 行尾一律归一 CRLF（B4）：`CR` / `LF` / `CRLF` 三种行尾**都**映射成 CRLF。
+///
+/// 裸 CR（非 CRLF 的 `\r`）此前被原样保留，于是正文里的 `X\r.\r\n` 在「以裸 CR 为行界」
+/// 的接收端/中间 MTA 上会提前结束 DATA —— 余下内容被当命令执行（SMTP smuggling，
+/// 可注入伪造的 MAIL FROM / RCPT TO）。归一后 `X\r.\r\n` → `X\r\n.\r\n`，那条 `.` 成为
+/// **正常行首的点**，由 lettre 送出侧的点填充（dot-stuffing）正确转义。
+///
+/// **口径选择（归一而非拒绝）**：与「裸 LF → CRLF」已有的处置一致 —— 同一类「行尾写错」
+/// 不该有两种相反处置（LF 归一、CR 拒绝会让人难以预期）；且裸 CR 在真实正文里存在
+/// （Windows 剪贴板 / 老式 Mac 行尾），拒绝会无谓地打断发信。**头区**是例外：那里裸 CR
+/// 一律**拒绝**（见 [`kept_header_lines`]）—— 归一等于凭空造出一个新头（头注入）。
 fn normalize_crlf(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + s.len() / 8);
-    let mut prev_cr = false;
-    for ch in s.chars() {
-        if ch == '\n' && !prev_cr {
-            out.push('\r');
+    let mut it = s.chars().peekable();
+    while let Some(ch) = it.next() {
+        match ch {
+            '\r' => {
+                if it.peek() == Some(&'\n') {
+                    it.next(); // CRLF：整体一个行尾
+                }
+                out.push_str("\r\n");
+            }
+            '\n' => out.push_str("\r\n"),
+            _ => out.push(ch),
         }
-        out.push(ch);
-        prev_cr = ch == '\r';
     }
     out
 }
@@ -935,5 +973,107 @@ mod tests {
             s.contains("X-A: 1\r\n\r\n"),
             "无空行时按「全是头、空正文」处理: {s}"
         );
+    }
+
+    /// B4（SMTP smuggling）：正文里的**裸 CR** 必须一并归一到 CRLF。
+    ///
+    /// 攻击形态：正文含 `X\r.\r\n` —— 若接收端/中间 MTA 以裸 CR 为行界，DATA 在这里就
+    /// 提前结束（那行 `.` 未被点填充），余下内容被当 SMTP 命令执行（可伪造 MAIL FROM /
+    /// RCPT TO）。归一后 `X\r.\r\n` → `X\r\n.\r\n`：那条 `.` 成了正常行首点，由 lettre 的
+    /// 点填充正确转义。
+    #[test]
+    fn raw_normalizes_bare_cr_in_body_to_crlf() {
+        // 正文（不是头区）：`\r` 归一，`\r\n` 不动。
+        let s = String::from_utf8(
+            build_raw(&envelope(), "X-A: 1\n\nX\r.\r\ntail", "", &[]).expect("组装"),
+        )
+        .expect("UTF-8");
+        assert!(
+            !s.contains("X\r."),
+            "正文里的裸 CR 必须被中和（否则 DATA 可提前结束）: {s:?}"
+        );
+        assert!(
+            s.contains("X\r\n.\r\ntail"),
+            "裸 CR 应归一为 CRLF（`\\r.` → `\\r\\n.`）: {s:?}"
+        );
+        assert!(!s.contains('\r') || !s.contains("\r\r"), "{s:?}");
+
+        // 三种行尾（裸 CR / 裸 LF / CRLF）归一后都只有一个 CRLF。
+        assert_eq!(normalize_crlf("a\rb"), "a\r\nb");
+        assert_eq!(normalize_crlf("a\nb"), "a\r\nb");
+        assert_eq!(normalize_crlf("a\r\nb"), "a\r\nb");
+        assert_eq!(normalize_crlf("a\r\r\nb"), "a\r\n\r\nb");
+        assert_eq!(normalize_crlf("a\r\n\r\nb"), "a\r\n\r\nb", "幂等");
+    }
+
+    /// B4：**头区**含裸 CR 一律**拒绝**（而非归一）—— 归一它等于凭空造出一个头
+    /// （`X-Foo: a\rBcc: x` 会变成两条头），且静默改写调用方的头比报错更糟。
+    #[test]
+    fn raw_rejects_bare_cr_in_kept_header() {
+        for raw in [
+            "X-Foo: a\rBcc: victim@x\n\nbody",   // 普通头
+            "X-Foo: a\n \rfolded\n\nbody",       // 折行续行
+            "Subject: a\rBcc: victim@x\n\nbody", // Subject（结构化 subject 为空 → 保留）
+        ] {
+            let e = build_raw(&envelope(), raw, "", &[]).expect_err("头区裸 CR 必须 Err");
+            assert!(e.contains("CR/LF") && e.contains("下一步"), "{raw:?} → {e}");
+        }
+        // 被剥离的头里的裸 CR 无所谓（整行丢弃）：不得因此报错。
+        let s =
+            String::from_utf8(build_raw(&envelope(), "From: a\rX\n\nbody", "", &[]).expect("剥离"))
+                .expect("UTF-8");
+        assert!(!s.contains("From: a\rX"), "被剥离头不得残留: {s:?}");
+    }
+
+    /// B4：结构化 `text`/`html` 正文里的裸 CR 同样归一（组装路是另一条写正文的路径）。
+    #[test]
+    fn structured_bodies_normalize_bare_cr() {
+        let req = req_with(Some("X\r.\r\ntail"), Some("<b>a\rb</b>"), vec![]);
+        let s =
+            String::from_utf8(build_message(&req, &[]).expect("组装").formatted()).expect("UTF-8");
+        assert!(!s.contains("X\r."), "text 里的裸 CR 必须中和: {s:?}");
+        // HTML 段（base64/quoted-printable 之外的形态不做字节级断言）：
+        // 直接钉归一函数的语义即可。
+        assert_eq!(normalize_crlf("<b>a\rb</b>"), "<b>a\r\nb</b>");
+    }
+
+    /// B5：`headers` 不得覆盖**弱 spoof 面**头（`Sender`/`Return-Path`/`Reply-To`）——
+    /// `Sender` 断言实际提交者、`Return-Path` 是退回地址（客户端本就不该发）、
+    /// `Reply-To` 能把回复引到别处。三者与既有 From/To/Cc/Bcc/Subject 同列禁用。
+    #[test]
+    fn headers_cannot_override_spoof_prone_headers() {
+        for name in [
+            "Sender",
+            "sender",
+            "SENDER",
+            "Return-Path",
+            "return-path",
+            "Reply-To",
+            "reply-to",
+        ] {
+            let mut req = req_with(Some("hi"), None, vec![]);
+            req.headers
+                .insert(name.to_string(), "attacker@evil.com".to_string());
+            let e = build_message(&req, &[]).expect_err("弱 spoof 面头必须禁覆盖");
+            assert!(
+                e.contains("不允许覆盖") && e.contains(name),
+                "错误须点名头名 {name}: {e}"
+            );
+        }
+    }
+
+    /// B5：raw 路的剥离清单补 `Sender`/`Return-Path`（含折行续行）—— 二者与结构化信封
+    /// 重建的 `From` 矛盾即弱 spoof；`Reply-To` **不剥**（raw 是调用方自备原文，它不改变
+    /// 信封与发件人身份）。
+    #[test]
+    fn raw_strips_sender_and_return_path_but_keeps_reply_to() {
+        let raw = "Sender: evil@x\n  leak\nReturn-Path: <evil@x>\nReply-To: r@x\nX-Keep: 1\n\nbody";
+        let s =
+            String::from_utf8(build_raw(&envelope(), raw, "", &[]).expect("剥离")).expect("UTF-8");
+        let low = s.to_lowercase();
+        assert!(!low.contains("sender:") && !low.contains("leak"), "{s}");
+        assert!(!low.contains("return-path") && !s.contains("evil@x"), "{s}");
+        assert!(s.contains("Reply-To: r@x"), "Reply-To 保留: {s}");
+        assert!(s.contains("X-Keep: 1") && s.contains("body"), "{s}");
     }
 }

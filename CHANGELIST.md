@@ -28,11 +28,13 @@
     须显式 `allow_none_tls: true`，fail-closed）。认证 `login`（user+pass）或 `xoauth2`
     （静态 `access_token`；只给 `refresh_token` fail-loud）。lettre 0.11 + rustls 0.23.40
     单一版本、无 ring（provider 与框架同为 aws-lc-rs）。
-  - **白名单 fail-closed**：`allowed_from`/`allowed_recipients` 后缀匹配（大小写不敏感），
-    **空表 = 拒绝**——白名单是「越权发送」的唯一控制点，缺省放行等于开放中继。
-    宿主侧 CRLF 一律**剥离**（subject/headers）或**拒绝**（地址）；`headers` 不得覆盖
-    From/To/Cc/Bcc/Subject（防白名单绕过）。校验失败一律 `{code:5}` 信封（不抛异常）；
-    仅「未配置 mail」抛错。
+  - **白名单 fail-closed**：`allowed_from`/`allowed_recipients` **全等**匹配（大小写不敏感；
+    条目 = 完整地址或 `@domain`，不做子域通配），**空表 = 拒绝**——白名单是「越权发送」的
+    唯一控制点，缺省放行等于开放中继。宿主侧 CRLF 一律**剥离**（subject/headers）或**拒绝**
+    （地址）；`headers` 不得覆盖 From/To/Cc/Bcc/Subject/Sender/Return-Path/Reply-To
+    （防白名单绕过与弱 spoof）。校验失败一律 `{code:5}` 信封（不抛异常）；
+    仅「未配置 mail」抛错。附件另有单件/单封上限（`smtp.max_attachment_bytes` /
+    `max_total_attachment_bytes`，超限 `code:5`）。
   - **FileTransport**：`file_transport: <dir>` 给定时不发网络，`.eml` 落盘（测试/归档通道）。
     `oj-mail` 的引擎与 transport 都在插件内，宿主零新增依赖（只 `lettre::Address` 做地址校验）；
     `ABI_VERSION` 保持 8。
@@ -75,6 +77,45 @@
       `code:4` 语义不变；用例改为钉住新文案。
     - `src/bridge/ffi.rs` 的 `host_deliver` 原把「载荷非法」与「mail 未配置」都打成
       「mail 未配置」→ 细分 `DeliverRoute`（`Routed`/`NotConfigured`/`BadPayload`）分开告警。
+- **mail 统一审查批次 B：白名单匹配语义 / 附件上限 / 结果归属 / 裸 CR / 弱 spoof 头 / 文案**
+  - **白名单匹配语义可被绕过**（Blocker，B1）：原实现对条目做裸 `ends_with` 后缀匹配，三处
+    越权面：① `allowed_from: ["noreply@x.com"]` 放行同域仿冒 `evil-noreply@x.com`；
+    ② 漏写 `@` 的条目（`["x.com"]`）放行跨域 `a@evilx.com`；③ `[""]`（空条目）令
+    `ends_with("")` 恒真 = **白名单等于关闭**。改为**全等**匹配（条目只能是完整地址
+    （地址全等）或 `@domain`（域全等），大小写不敏感；**不做子域通配**，子域须显式
+    `@sub.x.com`），并在**装配期**逐条校验条目格式（空串/裸域/首尾空白 → 启动失败，
+    文案点名 `smtp.<profile>.<字段>[<下标>]` + 下一步）；匹配期非法条目 fail-closed。
+  - **附件无大小上限 + 同步读盘**（Blocker，B2）：新增 `smtp.max_attachment_bytes`
+    （默认 10 MiB）与 `smtp.max_total_attachment_bytes`（默认 25 MiB），超限 `code:5`；
+    `path` 路先取长度再读（超限文件不进内存）；读盘 `std::fs::read` → `tokio::fs::read`
+    （内部 spawn_blocking，不再阻塞 isolate 的 `current_thread`）；插件侧再复核一次
+    （纵深防御）。**背景**：附件字节由宿主读盘后经有界队列（容量 256）持有，无上限时
+    project root 内任意大文件（含 `config.yaml` —— 里面有 `jwt_secret`/smtp 口令）可被一次
+    调用读入内存并放大成内存 DoS。
+  - **结果通道可枚举/可覆写**（Important，B3）：① `mail.result(key, jobId)` 原**忽略 key**
+    且无归属校验；② jobId 由**插件**生成（`{pid}-{seq}`，可猜）；③ 宿主不剥调用方自带的
+    jobId，同 id `put` 覆盖 → 任意模块可读他人结果并**覆写成 `code:0`**。改为：宿主生成
+    jobId（每进程随机 16 hex 前缀 + 单调计数，**不可猜**；调用方传入值一律剥离；回执的
+    `data.jobId` 钉成宿主值）；enqueue 路在 submit **之前**登记一张带归属（profile + 模块 +
+    租户）的票，插件上送只能**填充一次**（未登记/重复一律拒绝，`DeliverRoute` 增
+    `UnknownJob`/`Duplicate` 分别告警）；`mail.result` 只回本归属的结果（跨 profile/模块/
+    租户 → `null`）。插件侧兜底 jobId 同步改为随机前缀形态。
+  - **裸 CR 未中和（SMTP smuggling 半开）**（Important，B4）：`normalize_crlf` 原只补 LF 前
+    的 CR、**保留裸 CR**，正文含 `X\r.\r\n` 时以裸 CR 为行界的接收端会提前结束 DATA、余下
+    内容被当命令执行（可注入伪造 MAIL FROM/RCPT TO）。改为三种行尾（CR/LF/CRLF）**一律归一
+    CRLF**（口径与既有「裸 LF → CRLF」一致；拒绝裸 CR 会让同类行尾有两种相反处置），并覆盖
+    结构化 `text`/`html`；**头区**的裸 CR 仍**拒绝**（归一它等于凭空造出一个头）。
+  - **弱 spoof 头面**（Important，B5）：结构化 `headers` 禁覆盖清单由
+    From/To/Cc/Bcc/Subject 扩到含 `Sender`/`Return-Path`/`Reply-To`（宿主与插件同清单）；
+    raw 路剥离清单增 `Sender`/`Return-Path`（`Reply-To` 保留：raw 是调用方自备原文、它不改变
+    信封与发件人身份）；**raw 与结构化 `headers` 互斥**由「静默忽略」改为 fail-loud `code:5`。
+  - **文案与告警**（Minor，B6）：白名单未命中的文案不再 `{:?}` 回显**整份白名单**（换个
+    profile key 即可枚举他 profile 的内域/客户域），只回「未命中 + profile 名」+ 下一步；
+    `messageId` 由 MTA 原始应答改为「队列号或截断到 64 字符」（去服务器指纹/队列信息）；
+    `tls: none`（明文）的 profile 在启动时打 **warn 级**告警（含 profile 名与 host:port，
+    点明「内网 CIDR 限制未实现」；`file_transport` profile 不告警）；文档明确
+    **`code != 0` 一律不得自动重试**（`2`/`3` 未启用，永久失败与瞬时失败同归 `1`，
+    从 `code` 分不出可重试性），未新增 `data.retryable`（见 `docs/mail-smtp.md` §3 的取舍说明）。
 - **IDE 类型：`#` 别名报 TS2307、`QueryBuilder`/`json` 声明滞后**（`sample/global.d.ts`、
   `sample/tsconfig.json`、`sample/types/oj-modules.d.ts`）：
   - `QueryBuilder` 补 `join`（`{left,right}[]` + kind）/`distinct`/`groupBy`/`having`/`union`/`with`/`toJSON`；
@@ -100,6 +141,18 @@
   此前 `plugins.mail`（原样透传）会**静默胜出**（改 `smtp:` 里的白名单/凭据不生效）；
   现在**装配期直接报错**（`pick one`），启动即暴露。`plugins: {mail: {}}`（空对象）
   不受影响 —— 它是「回落 `smtp:` 适配器」的写法（也是本仓 e2e 夹具的形态）。
+- **白名单条目语义收紧**（B1，需核对配置）：匹配由「裸后缀」改为**全等** ——
+  ① `@x.com` **不再**覆盖子域（要子域须显式写 `@sub.x.com`）；② 裸域/空条目/首尾空白
+  现在让**启动失败**（此前空条目会让白名单恒真）。若原配置靠后缀匹配「顺带」覆盖了一批域，
+  请逐条补全。
+- **`mail.result` 归属收窄 + jobId 形态变化**（B3）：enqueue 的 jobId 改由**宿主**生成
+  （`<16 hex>-<序号>`，调用方传入值被忽略）；结果按「profile + 模块 + 租户」过滤 ——
+  **跨模块回查不再可用**（改用 `bus.subscribe("mail.result")` 做通知）。
+- **附件默认上限**（B2）：单件 10 MiB / 单封合计 25 MiB，超限 `code:5`；确有更大附件需求
+  请在 `smtp:` 顶层调 `max_attachment_bytes` / `max_total_attachment_bytes`。
+- **`sendRaw` 与 `headers` 互斥**（B5）：同时给会在宿主侧 `code:5`（此前静默忽略 `headers`）。
+- **正文裸 CR 归一为 CRLF**（B4）：`text`/`html`/`raw` 正文里的裸 `\r` 由「原样保留」改为
+  归一到 `\r\n`（防 SMTP smuggling）；raw **头区**含裸 CR 则直接 `code:5`。
 
 
 

@@ -574,8 +574,9 @@ pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
 pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
     let raw = payload[..].to_vec();
     if &topic[..] == super::mail::MAIL_RESULT_TOPIC {
-        // 两种失败成因分开告警（A6）：排障方向不同 —— 「没配 mail」是部署问题，
-        // 「载荷非法」是插件上送的内容不符合结果信封契约。
+        // 四种失败成因分开告警（A6 + B3）：排障方向不同 —— 「没配 mail」是部署问题，
+        // 「载荷非法」是插件上送的内容不符合结果信封契约，「未知 jobId」是 id 不是宿主
+        // 开出的票（伪造/旧插件自造），「重复」是同一 jobId 二次上送（已拒绝覆盖）。
         match super::mail::route_deliver(&raw) {
             super::mail::DeliverRoute::Routed => {}
             super::mail::DeliverRoute::NotConfigured => {
@@ -583,6 +584,12 @@ pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
             }
             super::mail::DeliverRoute::BadPayload => {
                 eprintln!("warn: mail.result 载荷非法（缺 jobId/code/msg 或非 JSON）——结果丢弃");
+            }
+            super::mail::DeliverRoute::UnknownJob => {
+                eprintln!("warn: mail.result 的 jobId 未经宿主登记（非本宿主开出的票）——结果丢弃");
+            }
+            super::mail::DeliverRoute::Duplicate => {
+                eprintln!("warn: mail.result 同一 jobId 重复上送——拒绝覆盖，保留先到的结果");
             }
         }
         return;

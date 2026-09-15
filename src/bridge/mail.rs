@@ -9,8 +9,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use deno_core::{OpState, op2};
@@ -75,6 +76,58 @@ pub struct ParsedAttachment {
     pub filename: String,
     pub mime: String,
     pub bytes: Vec<u8>,
+}
+
+/// 调用方上下文（B3 归属校验的**最小充分集**）：模块名 + 租户 id。
+///
+/// 二者都取自 `ReqState`（HTTP / WS / `oj test` 三个入口的 `OpState` 均由 `bridge_ext`
+/// 注入 `ReqState`，见 `src/bridge/mod.rs` 的 `state` 闭包）：
+/// - `module` = [`crate::bridge::ReqState::module`]（`run_module` 按目录命中注入的模块名）；
+/// - `tenant` = `ReqState.req.tenant_id`（tenant 启用时由租户头注入）。
+///
+/// **能力边界**：宿主 op 拿不到「调用者是哪个 JS handler/用户」——`http.user` 只有已验签
+/// 用户的 claims，粒度比模块粗且匿名路径为空。故归属标识取「模块 + 租户」这一对
+/// （HTTP 与 WS 两条路都有，且是框架既有的隔离边界）。二者缺失（无模块上下文、未启用
+/// 租户）时退化为空串，归属比较随之退化为「profile 相同」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallCtx {
+    /// 本请求所属模块名（`None` = 无模块上下文，如内省/测试驱动）。
+    pub module: Option<String>,
+    /// 租户 id（`None` = 未启用租户或未带头）。
+    pub tenant: Option<String>,
+}
+
+impl CallCtx {
+    /// 从 op 的 `OpState` 取当前请求上下文（每次调用取最新值，与 `http` 全局同源）。
+    pub fn from_state(state: &OpState) -> Self {
+        let rs = state.borrow::<super::ReqState>();
+        Self {
+            module: rs.module.clone(),
+            tenant: rs.req.tenant_id.clone(),
+        }
+    }
+}
+
+/// 结果的**归属**（B3）：jobId 与「profile + 模块 + 租户」绑定，`mail.result` 只回本归属的结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailOwner {
+    /// 提交时的 profile key（`new Mail(key)` 的 key）。
+    pub profile: String,
+    /// 提交时的模块名（缺省空串）。
+    pub module: String,
+    /// 提交时的租户 id（缺省空串）。
+    pub tenant: String,
+}
+
+impl MailOwner {
+    /// 由 profile key + 调用上下文构造（提交与查询两侧**同一函数** ⇒ 口径不分裂）。
+    pub fn new(profile: &str, ctx: &CallCtx) -> Self {
+        Self {
+            profile: profile.to_string(),
+            module: ctx.module.clone().unwrap_or_default(),
+            tenant: ctx.tenant.clone().unwrap_or_default(),
+        }
+    }
 }
 
 /// mail 轴后端契约（依赖倒置：核心只依赖本 trait；FFI 细节在 [`FfiMailBackend`]）。
@@ -269,11 +322,26 @@ fn str_list(v: Option<&Value>, profile: &str, field: &str) -> BridgeResult<Vec<S
 
 // ---------- 结果存储 + deliver 路由 ----------
 
-/// 结果存储：`jobId → 扁平信封`，**限长 + TTL**（惰性清理，无后台任务）。
+/// 结果存储：`jobId → (归属, 扁平信封?)`，**限长 + TTL**（惰性清理，无后台任务）。
+///
+/// 三态语义（B3）：
+/// 1. **登记**（[`Self::reserve`]）：宿主在 `submit` **之前**为 enqueue 路开出票 —— 归属在此
+///    落定，且同 id 不覆盖；
+/// 2. **完成**（[`Self::complete`]）：插件经 `deliver` 上送只能**填充**已登记且尚无结果的槽；
+///    未登记（伪造 id）或已有结果（重复/覆写）一律拒绝 ⇒ `code:0` 无法被事后改写；
+/// 3. **读取**（[`Self::get`]）：只有归属完全一致的调用方才拿得到（防跨模块/跨租户枚举）。
 pub struct MailResultStore {
     cap: usize,
     ttl: Duration,
-    entries: Mutex<VecDeque<(String, Instant, Value)>>,
+    entries: Mutex<VecDeque<StoreEntry>>,
+}
+
+/// 一条结果槽：归属 + 写入时刻 + 结果（`None` = 已登记、完成上送尚未到达）。
+struct StoreEntry {
+    job_id: String,
+    owner: MailOwner,
+    at: Instant,
+    result: Option<Value>,
 }
 
 impl Default for MailResultStore {
@@ -291,30 +359,54 @@ impl MailResultStore {
         }
     }
 
-    /// 写入（同 jobId 覆盖）；超出限长淘汰最旧。
-    pub fn put(&self, job_id: &str, v: Value) {
+    /// 登记一个待完成的票（宿主生成 jobId 后、`submit` 之前调用）。
+    /// 同 jobId 已存在 → `false`（**不覆盖**既有归属/结果）。
+    pub fn reserve(&self, job_id: &str, owner: MailOwner) -> bool {
         let now = Instant::now();
         let mut g = self.entries.lock().unwrap();
         purge(&mut g, now, self.ttl);
-        g.retain(|(k, _, _)| k != job_id);
-        g.push_back((job_id.to_string(), now, v));
+        if g.iter().any(|e| e.job_id == job_id) {
+            return false;
+        }
+        g.push_back(StoreEntry {
+            job_id: job_id.to_string(),
+            owner,
+            at: now,
+            result: None,
+        });
         while g.len() > self.cap {
             g.pop_front();
         }
+        true
     }
 
-    /// 读取（过期项不可见）。
-    pub fn get(&self, job_id: &str) -> Option<Value> {
+    /// 填入结果（`deliver` 上送的唯一落点；见 [`CompleteOutcome`]）。
+    pub fn complete(&self, job_id: &str, v: Value) -> CompleteOutcome {
+        let now = Instant::now();
+        let mut g = self.entries.lock().unwrap();
+        purge(&mut g, now, self.ttl);
+        let Some(e) = g.iter_mut().rev().find(|e| e.job_id == job_id) else {
+            return CompleteOutcome::UnknownJob;
+        };
+        if e.result.is_some() {
+            return CompleteOutcome::Duplicate;
+        }
+        e.result = Some(v);
+        CompleteOutcome::Filled
+    }
+
+    /// 读取：归属（profile + 模块 + 租户）不一致 → 与「未命中」同（`None`），不泄露存在性。
+    pub fn get(&self, job_id: &str, owner: &MailOwner) -> Option<Value> {
         let now = Instant::now();
         let mut g = self.entries.lock().unwrap();
         purge(&mut g, now, self.ttl);
         g.iter()
             .rev()
-            .find(|(k, _, _)| k == job_id)
-            .map(|(_, _, v)| v.clone())
+            .find(|e| e.job_id == job_id && &e.owner == owner)
+            .and_then(|e| e.result.clone())
     }
 
-    /// 存活条目数（含惰性清理）。
+    /// 存活条目数（含惰性清理；登记未完成的也算）。
     pub fn len(&self) -> usize {
         let now = Instant::now();
         let mut g = self.entries.lock().unwrap();
@@ -327,8 +419,19 @@ impl MailResultStore {
     }
 }
 
-fn purge(g: &mut VecDeque<(String, Instant, Value)>, now: Instant, ttl: Duration) {
-    g.retain(|(_, t, _)| now.saturating_duration_since(*t) < ttl);
+fn purge(g: &mut VecDeque<StoreEntry>, now: Instant, ttl: Duration) {
+    g.retain(|e| now.saturating_duration_since(e.at) < ttl);
+}
+
+/// [`MailResultStore::complete`] 的结果：区分「填上了」与两种**拒绝**（都不改存储）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    /// 已填入结果。
+    Filled,
+    /// 该 jobId **未经宿主登记**（伪造 id / 非本宿主开出的票）。
+    UnknownJob,
+    /// 该 jobId **已有结果** → 拒绝覆盖（重复/伪造上送）。
+    Duplicate,
 }
 
 /// 插件上送的统一信封 → 扁平结果（design §5：`{jobId,code,msg,messageId?}`）。
@@ -352,6 +455,18 @@ pub fn flatten_result(envelope: &Value) -> Option<Value> {
         out.insert("messageId".into(), Value::from(mid));
     }
     Some(Value::Object(out))
+}
+
+/// [`MailResultRouter::route`] 的三态结果 + 拒绝态（调用方据此分别告警，不混为一句）。
+pub enum RouteOutcome {
+    /// 已填充结果并扇出给 n 个本地订阅者。
+    Routed(usize),
+    /// 载荷不是可索引的完成结果（非 JSON，或缺 `jobId`/`code`/`msg`）。
+    BadPayload,
+    /// `jobId` **未经宿主登记**（不是本宿主开出的票）→ 丢弃。
+    UnknownJob,
+    /// `jobId` 已有结果 → **拒绝覆盖**（重复/伪造上送）。
+    Duplicate,
 }
 
 /// `deliver("mail.result", payload)` 的宿主落点：存结果 + 本地扇出。
@@ -380,22 +495,43 @@ impl MailResultRouter {
         &self.store
     }
 
-    /// 存储读取（`op_mail_result`）。
-    pub fn get(&self, job_id: &str) -> Option<Value> {
-        self.store.get(job_id)
+    /// 登记待完成票（宿主 `handle_send` 在 `submit` 前调用；见 [`MailResultStore::reserve`]）。
+    pub fn reserve(&self, job_id: &str, owner: MailOwner) -> bool {
+        self.store.reserve(job_id, owner)
     }
 
-    /// 路由一帧插件上送：`None` = 载荷不是可索引的结果（丢弃，不 panic）。
-    /// `Some(n)` = 已存结果并扇出给 n 个本地订阅者。
-    pub fn route(&self, payload: &[u8]) -> Option<usize> {
-        let env: Value = serde_json::from_slice(payload).ok()?;
-        let flat = flatten_result(&env)?;
-        let job_id = flat.get("jobId").and_then(Value::as_str)?.to_string();
-        self.store.put(&job_id, flat.clone());
-        Some(
-            self.bus
-                .publish_local(MAIL_RESULT_TOPIC, &BusPayload::Json(flat)),
-        )
+    /// 填充结果（未登记/已存在 → 见 [`CompleteOutcome`]）。
+    pub fn complete(&self, job_id: &str, v: Value) -> CompleteOutcome {
+        self.store.complete(job_id, v)
+    }
+
+    /// 存储读取（`op_mail_result`）：归属不符 → `None`（与未命中同）。
+    pub fn get(&self, job_id: &str, owner: &MailOwner) -> Option<Value> {
+        self.store.get(job_id, owner)
+    }
+
+    /// 路由一帧插件上送：结果只进「已登记且尚无结果」的槽（见 [`RouteOutcome`]）。
+    pub fn route(&self, payload: &[u8]) -> RouteOutcome {
+        let Some(env) = serde_json::from_slice::<Value>(payload).ok() else {
+            return RouteOutcome::BadPayload;
+        };
+        let Some(flat) = flatten_result(&env) else {
+            return RouteOutcome::BadPayload;
+        };
+        let job_id = flat
+            .get("jobId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match self.store.complete(&job_id, flat.clone()) {
+            CompleteOutcome::Filled => RouteOutcome::Routed(
+                self.bus
+                    .publish_local(MAIL_RESULT_TOPIC, &BusPayload::Json(flat)),
+            ),
+            // 区分「伪造的 id」与「重复上送」：两者都拒绝，但排障方向不同。
+            CompleteOutcome::UnknownJob => RouteOutcome::UnknownJob,
+            CompleteOutcome::Duplicate => RouteOutcome::Duplicate,
+        }
     }
 }
 
@@ -409,9 +545,9 @@ pub(crate) fn install_mail_deliver(b: &Arc<dyn MailBackend>) {
     *MAIL_DELIVER.lock().unwrap() = Some(Arc::downgrade(b));
 }
 
-/// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点结果（**细分两种失败**：告警文案要能
-/// 分辨「没配 mail」与「载荷非法」——两者都被丢弃，但排障方向完全不同）。
-/// 扇出订阅者数只在 [`MailResultRouter::route`] 的返回值里（告警路径不需要它）。
+/// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点结果（**细分成因**：告警文案要能分辨
+/// 「没配 mail」「载荷非法」「id 不是本宿主开出的票」「重复上送」——都被丢弃，但排障方向
+/// 完全不同）。
 pub(crate) enum DeliverRoute {
     /// 有后端接管：已存结果并扇出（扇出数见 `MailResultRouter::route`）。
     Routed,
@@ -419,10 +555,14 @@ pub(crate) enum DeliverRoute {
     NotConfigured,
     /// 载荷不是可索引的完成结果（非 JSON，或缺 `jobId`/`code`/`msg`）。
     BadPayload,
+    /// `jobId` 未经宿主登记（不是本宿主开出的票，见 B3）。
+    UnknownJob,
+    /// `jobId` 已有结果 → 拒绝覆盖（重复/伪造上送，见 B3）。
+    Duplicate,
 }
 
 /// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点：`Routed` = 存结果 + 扇出；
-/// 其余两种成因见 [`DeliverRoute`]（调用方分别告警，不混为一句）。
+/// 其余成因见 [`DeliverRoute`]（调用方分别告警，不混为一句）。
 pub(crate) fn route_deliver(payload: &[u8]) -> DeliverRoute {
     let b = MAIL_DELIVER
         .lock()
@@ -433,8 +573,10 @@ pub(crate) fn route_deliver(payload: &[u8]) -> DeliverRoute {
         return DeliverRoute::NotConfigured;
     };
     match b.router().route(payload) {
-        Some(_) => DeliverRoute::Routed,
-        None => DeliverRoute::BadPayload,
+        RouteOutcome::Routed(_) => DeliverRoute::Routed,
+        RouteOutcome::BadPayload => DeliverRoute::BadPayload,
+        RouteOutcome::UnknownJob => DeliverRoute::UnknownJob,
+        RouteOutcome::Duplicate => DeliverRoute::Duplicate,
     }
 }
 
@@ -562,7 +704,19 @@ impl MailBackend for FfiMailBackend {
 
 /// 请求头里由结构化字段决定的名字：自定义头**不得**覆盖（否则信封可由报头派生，
 /// 绕过收件人白名单）。与插件 `message.rs::STRUCTURED_HEADERS` 同清单。
-const STRUCTURED_HEADERS: [&str; 5] = ["from", "to", "cc", "bcc", "subject"];
+///
+/// B5 补入三个**弱 spoof 面**头：`Sender`（实际提交者，与 From 不一致即冒充）、
+/// `Return-Path`（退回地址，按 RFC 5321 只能由收信方添加）、`Reply-To`（把回复引向别处）。
+const STRUCTURED_HEADERS: [&str; 8] = [
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "sender",
+    "return-path",
+    "reply-to",
+];
 
 /// CRLF **剥离**（design §10「先剥 `\r\n`」）：头字段里的换行没有合法语义，
 /// 删除即消除头注入（`subject: "a\r\nBcc: x"` → `"aBcc: x"`）。
@@ -680,18 +834,24 @@ fn whitelist_list(v: Option<&Value>, profile: &str, field: &str) -> BridgeResult
 ///
 /// **空表 = 拒绝**（fail-closed）：白名单是「越权发送」的唯一控制点，
 /// 缺省放行等于默认开成开放中继；与本特性 `tls: none` 需显式许可同一取向。
-pub fn check_whitelist(from: &str, rcpts: &[String], cfg: &MailProfileCfg) -> Result<(), String> {
+///
+/// 未命中时**只回「未命中 + profile 名」**（B6）：回显整份白名单等于把该 profile 的
+/// 内域/客户域清单交给任何调用方（换个 profile key 就能枚举他 profile 的白名单）。
+pub fn check_whitelist(
+    from: &str,
+    rcpts: &[String],
+    cfg: &MailProfileCfg,
+    profile: &str,
+) -> Result<(), String> {
     if !whitelist_hit(&cfg.allowed_from, from) {
         return Err(format!(
-            "from '{from}' 不在 allowed_from 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或改用允许的发件人）",
-            cfg.allowed_from
+            "mail: from '{from}' 未命中 profile '{profile}' 的 allowed_from 白名单（下一步：在 smtp.{profile}.allowed_from 里加上该地址，或改用白名单内的发件人）"
         ));
     }
     for r in rcpts {
         if !whitelist_hit(&cfg.allowed_recipients, r) {
             return Err(format!(
-                "收件人 '{r}' 不在 allowed_recipients 白名单（{:?}）（下一步：在 smtp 配置里补白名单条目，或去掉该收件人）",
-                cfg.allowed_recipients
+                "mail: 收件人 '{r}' 未命中 profile '{profile}' 的 allowed_recipients 白名单（下一步：在 smtp.{profile}.allowed_recipients 里加上该域/地址，或去掉该收件人）"
             ));
         }
     }
@@ -753,7 +913,7 @@ fn normalize_headers(obj: &mut Map<String, Value>) -> Result<(), String> {
             .any(|s| name.eq_ignore_ascii_case(s))
         {
             return Err(format!(
-                "mail: headers 不允许覆盖 {name}（From/To/Cc/Bcc/Subject 由 From/to/cc/bcc/subject 决定；下一步：换一个自定义头名）"
+                "mail: headers 不允许覆盖 {name}（From/To/Cc/Bcc/Subject/Sender/Return-Path/Reply-To 由结构化字段或信封决定；下一步：换一个自定义头名）"
             ));
         }
         out.insert(name, Value::String(strip_crlf(val)));
@@ -1031,6 +1191,34 @@ fn code5(msg: &str) -> Value {
     json!({ "code": 5, "msg": msg, "data": {} })
 }
 
+/// 宿主生成的 jobId（B3）：`<每进程随机 16 hex>-<单调计数>`。
+///
+/// 旧形态是插件侧 `{pid}-{seq}`（进程号可枚举 + 计数从 1 起）且宿主不剥调用方传入的
+/// `jobId` ⇒ 任意模块可猜出他人 jobId 读结果、并可**覆写**成 `code:0`。现在：随机前缀
+/// 不可猜（每进程一次从系统熵取 8 字节），计数只保证进程内唯一。
+fn next_job_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    format!("{}-{}", job_prefix(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 每进程随机的 jobId 前缀（16 hex = 64 bit）。
+///
+/// 熵不可得（极罕见）时回落「时间纳秒 + pid」：仍不可枚举，且**不**让发信失败。
+fn job_prefix() -> &'static str {
+    static PREFIX: LazyLock<String> = LazyLock::new(|| {
+        let mut b = [0u8; 8];
+        if getrandom::getrandom(&mut b).is_err() {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            return format!("{nanos:x}{:x}", std::process::id());
+        }
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    });
+    PREFIX.as_str()
+}
+
 /// 校验并**就地规范化**请求；成功返回附件引用表（供字节解析）。
 ///
 /// 规范化内容：CRLF 剥离（subject/headers）、地址规范化（lettre 解析后的规范写法）、
@@ -1073,7 +1261,7 @@ fn validate_request(
         .map(|a| a.to_string())
         .collect();
     let from_norm: &str = from.as_ref();
-    check_whitelist(from_norm, &rcpts, prof)?;
+    check_whitelist(from_norm, &rcpts, prof, key)?;
     obj.insert("from".into(), Value::String(from_norm.to_string()));
     for (field, list) in [("to", &to), ("cc", &cc), ("bcc", &bcc)] {
         let v: Vec<Value> = list.iter().map(|a| Value::String(a.to_string())).collect();
@@ -1123,6 +1311,18 @@ fn validate_request(
             );
         }
         obj.remove("attachments");
+        // B5：raw 路**无处安放**结构化 headers（报头由原文承载，插件只用 raw + subject）——
+        // 原实现静默忽略，等于让调用方以为头加上了。改为 fail-loud。
+        let has_headers = obj
+            .get("headers")
+            .is_some_and(|h| !h.is_null() && h.as_object().is_some_and(|m| !m.is_empty()));
+        if has_headers {
+            return Err(
+                "mail: sendRaw 与 headers 互斥（报头由 raw 原文承载，结构化 headers 不会生效）（下一步：把该头写进 raw 原文，或改用 mail.send）"
+                    .to_string(),
+            );
+        }
+        obj.remove("headers");
         return Ok(Vec::new());
     }
     let refs = parse_attachment_refs(obj.get("attachments").unwrap_or(&Value::Null))?;
@@ -1142,6 +1342,10 @@ fn validate_request(
 /// 返回**结果信封**（与插件同款 `{code,msg,data}`）：校验/解析失败 → `{code:5}`，
 /// FFI 层失败 → `{code:1}`（连接/网络类）。即 JS 侧 `mail.*` 一律 resolve 信封，
 /// 不因邮件内容问题抛异常；仅「未配置 mail」在 op 层抛（见 `op_mail_send`）。
+///
+/// **jobId 由宿主生成**（B3，剥离调用方自带值）：`enqueue` 路先登记 pending 槽位，插件
+/// 随后的完成上送只能填充这张票（见 [`MailResultStore`]）；回执的 `data.jobId` 也钉成
+/// 宿主值，保证 JS 拿到的 id 一定可 `mail.result` 回查。
 pub async fn handle_send(
     backend: Arc<dyn MailBackend>,
     blobs: Arc<BlobRegistry>,
@@ -1149,6 +1353,7 @@ pub async fn handle_send(
     key: &str,
     req_json: &str,
     mode: MailMode,
+    ctx: &CallCtx,
 ) -> Value {
     let mut req: Value = match serde_json::from_str(req_json) {
         Ok(v) => v,
@@ -1166,21 +1371,59 @@ pub async fn handle_send(
         Ok(a) => a,
         Err(e) => return code5(&e),
     };
+    let job_id = next_job_id();
     if let Some(o) = req.as_object_mut() {
+        // 宿主权威：调用方自带的 jobId 一律被覆盖（它可被用来指向/覆写他人的结果槽）。
+        o.insert("jobId".into(), Value::String(job_id.clone()));
         o.insert("sync".into(), Value::Bool(mode == MailMode::Sync));
         o.insert(
             "enqueue_only".into(),
             Value::Bool(mode == MailMode::Enqueue),
         );
     }
-    match backend.submit(key, req.to_string(), atts).await {
+    let router = backend.router();
+    if mode == MailMode::Enqueue {
+        // 登记必须在 submit **之前**：完成上送可能先于 submit 返回。
+        router.reserve(&job_id, MailOwner::new(key, ctx));
+    }
+    let env = match backend.submit(key, req.to_string(), atts).await {
         Ok(env) => env,
         Err(e) => json!({
             "code": 1,
             "msg": format!("mail: 投递未能送达插件（{e}）（下一步：确认 oj-mail 插件已装配、profile 名正确）"),
             "data": {},
         }),
+    };
+    if mode != MailMode::Enqueue {
+        return env;
     }
+    let env = pin_job_id(env, &job_id);
+    if env.get("code").and_then(Value::as_i64) != Some(0) {
+        // 提交失败（队列满 / 未送达插件）：该票的完成上送不会再发生，直接收敛为终态，
+        // 否则 `mail.result(jobId)` 会永久 null（且槽位要等 TTL 才被清理）。
+        if let Some(flat) = flatten_result(&env) {
+            router.complete(&job_id, flat);
+        }
+    }
+    env
+}
+
+/// 把回执的 `data.jobId` 钉成宿主生成的那个（enqueue 路）。
+///
+/// 不依赖插件回显 `jobId`：第三方/旧版插件可能回自己的 id，那样 JS 拿到的 id 查不到结果
+/// （`mail.result` 永远 null）；宿主是 jobId 的权威来源，回执就按宿主的算。
+fn pin_job_id(env: Value, job_id: &str) -> Value {
+    let mut env = env;
+    let Some(o) = env.as_object_mut() else {
+        return env;
+    };
+    if !o.get("data").is_some_and(Value::is_object) {
+        o.insert("data".into(), json!({}));
+    }
+    if let Some(d) = o.get_mut("data").and_then(Value::as_object_mut) {
+        d.insert("jobId".into(), Value::String(job_id.to_string()));
+    }
+    env
 }
 
 // ---------- JS 侧入口（ops） ----------
@@ -1208,8 +1451,13 @@ async fn op_send(
     req_json: String,
     mode: MailMode,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let (backend, blobs, root) = mail_deps(&state.borrow())?;
-    Ok(handle_send(backend, blobs, root.as_deref(), &key, &req_json, mode).await)
+    // 借用必须先结束（下方有 await）：deps 与 ctx 都是自有值。
+    let (backend, blobs, root, ctx) = {
+        let g = state.borrow();
+        let (backend, blobs, root) = mail_deps(&g)?;
+        (backend, blobs, root, CallCtx::from_state(&g))
+    };
+    Ok(handle_send(backend, blobs, root.as_deref(), &key, &req_json, mode, &ctx).await)
 }
 
 /// mail.send(m)：异步 transport，resolve 投递结果信封。
@@ -1256,17 +1504,21 @@ pub async fn op_mail_send_raw(
     op_send(state, key, req_json, MailMode::Raw).await
 }
 
-/// mail.result(id)：查宿主侧存储的异步结果（未命中/已过期 → `null`）。
-/// `key` 保留形参仅为对齐 `Mail` 实例方法签名：结果按 `jobId` 全局索引（与 profile 无关）。
+/// mail.result(id)：查宿主侧存储的异步结果（未命中/已过期/**非本归属** → `null`）。
+///
+/// 归属（B3） = 提交时的 `key`（profile）+ 模块名 + 租户 id（取自 `ReqState`）；
+/// 三者任一不同都视作「未命中」——不泄露该 jobId 是否存在（见 [`MailOwner`]）。
 #[op2]
 #[serde]
 pub async fn op_mail_result(
     state: Rc<RefCell<OpState>>,
-    #[string] _key: String,
+    #[string] key: String,
     #[string] job_id: String,
 ) -> Result<serde_json::Value, JsErrorBox> {
-    let (backend, ..) = mail_deps(&state.borrow())?;
-    Ok(backend.router().get(&job_id).unwrap_or(Value::Null))
+    let g = state.borrow();
+    let (backend, ..) = mail_deps(&g)?;
+    let owner = MailOwner::new(&key, &CallCtx::from_state(&g));
+    Ok(backend.router().get(&job_id, &owner).unwrap_or(Value::Null))
 }
 
 /// mail.profiles()：已配置的 profile 名清单（**非密钥面**：凭据/连接字段不进 JS）。
@@ -1351,8 +1603,16 @@ mod tests {
 
     // ---------- 6.2：StableState/Extras 注入 ----------
 
+    /// 测试用归属：profile = "default"，无模块/租户上下文（`CallCtx::default()`）。
+    fn owner() -> MailOwner {
+        MailOwner::new("default", &CallCtx::default())
+    }
+
     /// Extras.mail 注入 → StableState.mail 取用 → 插件上送的信封落进结果存储
     /// （deliver 路由已由构造期挂上）。
+    ///
+    /// B3：上送只能**填充宿主已登记的票**（`reserve` 由 `handle_send` 在 submit 前做），
+    /// 故这里先登记再上送。
     #[tokio::test(flavor = "current_thread")]
     async fn bridge_injects_mail_backend_and_routes_deliver() {
         let _g = lock();
@@ -1371,9 +1631,10 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(fake.router().reserve("j1", owner()), "宿主先开票");
         // 插件 worker 上送 → 宿主路由：存结果 + 本地扇出。
         deliver_to_host(MAIL_RESULT_TOPIC, ENVELOPE);
-        let stored = fake.router().get("j1").expect("结果必须已存");
+        let stored = fake.router().get("j1", &owner()).expect("结果必须已存");
         assert_eq!(stored["code"], 0);
         assert_eq!(stored["messageId"], "m1");
         // 扇出帧：扁平形态，且**不含** to/subject。
@@ -1405,10 +1666,12 @@ mod tests {
         ));
     }
 
-    /// A6：**载荷非法** ≠ 「未配置」—— 有后端但 payload 不是结果信封（非 JSON / 缺
-    /// `jobId`/`code`/`msg`）时细分报 `BadPayload`，告警文案才能指向插件侧。
+    /// A6 + B3：上送的**四种成因分别归类**（告警文案据此区分，不混为一句）：
+    /// `BadPayload` = 载荷不是结果信封（非 JSON / 缺 `jobId`/`code`/`msg`）；
+    /// `UnknownJob` = jobId 不是本宿主开出的票（未登记）；`Duplicate` = 已有结果（拒绝覆盖）；
+    /// 其余 = `Routed`。
     #[tokio::test(flavor = "current_thread")]
-    async fn route_deliver_with_backend_but_bad_payload_is_bad_payload() {
+    async fn route_deliver_distinguishes_bad_payload_unknown_and_duplicate() {
         let _g = lock();
         let bus = Arc::new(Bus::new());
         let fake = FakeMail::new(MailConfig::empty(), bus.clone());
@@ -1434,9 +1697,17 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
-        // 合法信封 → Routed（对照：不是所有载荷都被判非法）。
+        // 合法信封 → Routed（对照：不是所有载荷都被判非法）——但 B3 起**先要宿主开票**。
+        assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::UnknownJob));
+        assert!(
+            fake.router().get("j1", &owner()).is_none(),
+            "未开票的 jobId 不得写入结果"
+        );
+        assert!(fake.router().reserve("j1", owner()));
         assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::Routed));
-        assert!(fake.router().get("j1").is_some());
+        assert!(fake.router().get("j1", &owner()).is_some());
+        // B3：同一 jobId 二次上送 → 拒绝覆盖（不扇出、不改存储）。
+        assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::Duplicate));
     }
 
     // ---------- 6.3：结果存储 + 扁平化 ----------
@@ -1454,29 +1725,96 @@ mod tests {
         assert!(flatten_result(&json!({"data": {"jobId": "j"}})).is_none());
     }
 
+    /// 限长 + TTL（登记与完成都算条目；超限淘汰最旧、过期惰性清理）。
     #[test]
     fn result_store_caps_oldest_and_expires_by_ttl() {
         let s = MailResultStore::new(2, Duration::from_millis(60));
-        s.put("a", json!({"jobId": "a"}));
-        s.put("b", json!({"jobId": "b"}));
-        s.put("c", json!({"jobId": "c"}));
-        assert!(s.get("a").is_none(), "超限须淘汰最旧");
-        assert!(s.get("b").is_some());
-        assert_eq!(s.get("c").unwrap()["jobId"], "c");
+        let owner = MailOwner::new("default", &CallCtx::default());
+        for id in ["a", "b", "c"] {
+            assert!(s.reserve(id, owner.clone()));
+            assert_eq!(
+                s.complete(id, json!({"jobId": id})),
+                CompleteOutcome::Filled
+            );
+        }
+        assert!(s.get("a", &owner).is_none(), "超限须淘汰最旧");
+        assert!(s.get("b", &owner).is_some());
+        assert_eq!(s.get("c", &owner).unwrap()["jobId"], "c");
         assert_eq!(s.len(), 2, "限长：容量恒定");
         std::thread::sleep(Duration::from_millis(80));
-        assert!(s.get("c").is_none(), "TTL 过期后不可读");
+        assert!(s.get("c", &owner).is_none(), "TTL 过期后不可读");
         assert!(s.is_empty(), "过期项被惰性清理");
     }
 
-    /// 同 jobId 重投覆盖（不重复占容量）。
+    /// B3：同 jobId **不得覆写**（原实现 `put` 同 id 覆盖 → 任意模块可把他人结果改写成
+    /// `code:0`）。宿主开出的票只能被**填充一次**；未登记的 jobId 不得凭空写入结果。
     #[test]
-    fn result_store_overwrites_same_job_id() {
+    fn result_store_refuses_to_overwrite_same_job_id() {
         let s = MailResultStore::new(4, Duration::from_secs(60));
-        s.put("j", json!({"jobId": "j", "code": 0}));
-        s.put("j", json!({"jobId": "j", "code": 2}));
-        assert_eq!(s.len(), 1);
-        assert_eq!(s.get("j").unwrap()["code"], 2);
+        let owner = MailOwner::new("default", &CallCtx::default());
+        assert!(s.reserve("j", owner.clone()), "首次登记成功");
+        assert!(
+            !s.reserve("j", owner.clone()),
+            "同 jobId 不得重复登记（不覆盖）"
+        );
+        assert_eq!(
+            s.complete("j", json!({"jobId": "j", "code": 0})),
+            CompleteOutcome::Filled
+        );
+        assert_eq!(
+            s.complete("j", json!({"jobId": "j", "code": 2, "msg": "forged"})),
+            CompleteOutcome::Duplicate,
+            "已有结果必须拒绝覆盖"
+        );
+        assert_eq!(s.len(), 1, "拒绝覆盖不占额外容量");
+        assert_eq!(
+            s.get("j", &owner).unwrap()["code"],
+            0,
+            "先到的结果必须保持（覆写 = 结果通道可被伪造）"
+        );
+        // 未登记的 jobId（伪造的票）不得写入结果。
+        assert_eq!(
+            s.complete("ghost", json!({"jobId": "ghost", "code": 0})),
+            CompleteOutcome::UnknownJob
+        );
+        assert!(s.get("ghost", &owner).is_none());
+    }
+
+    /// B3：读取按**归属**（profile + 模块 + 租户）隔离 —— 三者任一不同都视作「未命中」，
+    /// 不泄露该 jobId 是否存在（跨模块 / 跨租户枚举面）。
+    #[test]
+    fn result_store_scopes_results_to_owner() {
+        let s = MailResultStore::new(4, Duration::from_secs(60));
+        let me = MailOwner {
+            profile: "default".into(),
+            module: "user".into(),
+            tenant: "t1".into(),
+        };
+        assert!(s.reserve("j", me.clone()));
+        assert_eq!(
+            s.complete("j", json!({"jobId": "j", "code": 0})),
+            CompleteOutcome::Filled
+        );
+        assert!(s.get("j", &me).is_some(), "本人必须读得到");
+        for alien in [
+            MailOwner {
+                module: "other".into(),
+                ..me.clone()
+            },
+            MailOwner {
+                profile: "alerts".into(),
+                ..me.clone()
+            },
+            MailOwner {
+                tenant: "t2".into(),
+                ..me.clone()
+            },
+        ] {
+            assert!(
+                s.get("j", &alien).is_none(),
+                "非本归属不得读到（{alien:?}）"
+            );
+        }
     }
 
     // ---------- 6.2：vtable 适配器 ----------
@@ -1878,11 +2216,11 @@ mod tests {
             allowed_from: vec!["noreply@x.com".into()],
             allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
         };
-        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p).is_ok());
-        assert!(check_whitelist("noreply@x.com", &["a@partner.com".into()], &p).is_ok());
+        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p, "default").is_ok());
+        assert!(check_whitelist("noreply@x.com", &["a@partner.com".into()], &p, "default").is_ok());
         // 大小写不敏感（域名大小写无语义）。
-        assert!(check_whitelist("NoReply@X.com", &["A@X.com".into()], &p).is_ok());
-        let e = check_whitelist("evil@y.com", &["a@x.com".into()], &p).unwrap_err();
+        assert!(check_whitelist("NoReply@X.com", &["A@X.com".into()], &p, "default").is_ok());
+        let e = check_whitelist("evil@y.com", &["a@x.com".into()], &p, "default").unwrap_err();
         assert!(
             e.contains("allowed_from") && e.contains("evil@y.com"),
             "{e}"
@@ -1891,6 +2229,7 @@ mod tests {
             "noreply@x.com",
             &["a@x.com".into(), "b@evil.com".into()],
             &p,
+            "default",
         )
         .unwrap_err();
         assert!(
@@ -1899,14 +2238,44 @@ mod tests {
         );
         // 空表 = 拒绝（fail-closed，同 `tls: none` 的显式许可思路）。
         let empty = MailProfileCfg::default();
-        let e = check_whitelist("a@x.com", &["b@x.com".into()], &empty).unwrap_err();
+        let e = check_whitelist("a@x.com", &["b@x.com".into()], &empty, "default").unwrap_err();
         assert!(e.contains("allowed_from"), "{e}");
         let no_rcpt = MailProfileCfg {
             allowed_from: vec!["@x.com".into()],
             ..Default::default()
         };
-        let e = check_whitelist("a@x.com", &["b@x.com".into()], &no_rcpt).unwrap_err();
+        let e = check_whitelist("a@x.com", &["b@x.com".into()], &no_rcpt, "default").unwrap_err();
         assert!(e.contains("allowed_recipients"), "{e}");
+    }
+
+    /// B6：白名单未命中的文案**不得回显白名单内容** —— 回显等于让任何调用方换个 profile key
+    /// 就能枚举该 profile（乃至他 profile）的内域/客户域清单。只回「未命中 + profile 名」
+    /// + 下一步；回显调用方自己给的地址是可以的（那是它自己的输入）。
+    #[test]
+    fn whitelist_error_names_profile_without_echoing_the_list() {
+        let p = MailProfileCfg {
+            allowed_from: vec!["noreply@secret-corp.com".into()],
+            allowed_recipients: vec!["@internal.corp".into()],
+        };
+        let e = check_whitelist("evil@y.com", &["a@internal.corp".into()], &p, "adm").unwrap_err();
+        assert!(
+            e.contains("adm")
+                && e.contains("allowed_from")
+                && e.contains("evil@y.com")
+                && e.contains("下一步"),
+            "{e}"
+        );
+        assert!(
+            !e.contains("secret-corp.com") && !e.contains("internal.corp"),
+            "不得回显白名单条目：{e}"
+        );
+        let e = check_whitelist("noreply@secret-corp.com", &["x@evil.com".into()], &p, "adm")
+            .unwrap_err();
+        assert!(
+            e.contains("allowed_recipients") && e.contains("x@evil.com") && e.contains("adm"),
+            "{e}"
+        );
+        assert!(!e.contains("internal.corp"), "不得回显白名单条目：{e}");
     }
 
     /// B1：白名单是**唯一**越权控制点，故匹配必须是「域全等 / 地址全等」——
@@ -1922,14 +2291,15 @@ mod tests {
             allowed_recipients: vec!["@x.com".into(), "@partner.com".into()],
         };
         // 正向对照（防「一刀切全拒」也被判绿）。
-        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p).is_ok());
+        assert!(check_whitelist("noreply@x.com", &["a@x.com".into()], &p, "default").is_ok());
         assert!(
-            check_whitelist("NoReply@X.COM", &["a@PARTNER.com".into()], &p).is_ok(),
+            check_whitelist("NoReply@X.COM", &["a@PARTNER.com".into()], &p, "default").is_ok(),
             "大小写不敏感（域名/本地部大小写无语义）"
         );
 
         // ① 同域仿冒发件人：条目是完整地址 ⇒ 必须全等，不得后缀命中。
-        let e = check_whitelist("evil-noreply@x.com", &["a@x.com".into()], &p).unwrap_err();
+        let e =
+            check_whitelist("evil-noreply@x.com", &["a@x.com".into()], &p, "default").unwrap_err();
         assert!(e.contains("allowed_from"), "{e}");
 
         // ② 漏写 `@` 的条目：既不命中 `a@evilx.com`，也不命中任何地址（fail-closed）。
@@ -1937,10 +2307,11 @@ mod tests {
             allowed_from: vec!["noreply@x.com".into()],
             allowed_recipients: vec!["x.com".into()],
         };
-        let e = check_whitelist("noreply@x.com", &["a@evilx.com".into()], &bare).unwrap_err();
+        let e = check_whitelist("noreply@x.com", &["a@evilx.com".into()], &bare, "default")
+            .unwrap_err();
         assert!(e.contains("allowed_recipients"), "{e}");
         assert!(
-            check_whitelist("noreply@x.com", &["a@x.com".into()], &bare).is_err(),
+            check_whitelist("noreply@x.com", &["a@x.com".into()], &bare, "default").is_err(),
             "裸域条目不得退化成后缀匹配（连本域也不放行）"
         );
 
@@ -1949,12 +2320,18 @@ mod tests {
             allowed_from: vec!["".into()],
             allowed_recipients: vec!["@x.com".into()],
         };
-        let e = check_whitelist("anyone@anywhere.com", &["a@x.com".into()], &blank).unwrap_err();
+        let e = check_whitelist(
+            "anyone@anywhere.com",
+            &["a@x.com".into()],
+            &blank,
+            "default",
+        )
+        .unwrap_err();
         assert!(e.contains("allowed_from"), "{e}");
 
         // 子域**不**通配：`@x.com` 只覆盖本域；子域要显式列出。
         assert!(
-            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &p).is_err(),
+            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &p, "default").is_err(),
             "@x.com 不得命中子域 a@sub.x.com"
         );
         let sub = MailProfileCfg {
@@ -1962,12 +2339,38 @@ mod tests {
             allowed_recipients: vec!["@sub.x.com".into()],
         };
         assert!(
-            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &sub).is_ok(),
+            check_whitelist("noreply@x.com", &["a@sub.x.com".into()], &sub, "default").is_ok(),
             "显式 @sub.x.com 必须命中"
         );
         assert!(
-            check_whitelist("noreply@x.com", &["a@x.com".into()], &sub).is_err(),
+            check_whitelist("noreply@x.com", &["a@x.com".into()], &sub, "default").is_err(),
             "@sub.x.com 是域全等，不覆盖父域"
+        );
+    }
+
+    /// B3：宿主 jobId 形态 —— `<16 hex 随机前缀>-<单调计数>`：不可猜（不是可枚举的
+    /// `{pid}-{seq}`，前缀每进程一次取自系统熵）、进程内唯一、前缀进程内稳定。
+    #[test]
+    fn host_job_id_is_unguessable_and_unique() {
+        let a = next_job_id();
+        let b = next_job_id();
+        assert_ne!(a, b, "必须唯一");
+        let (p1, s1) = a.rsplit_once('-').expect("形态 <prefix>-<seq>");
+        let (p2, s2) = b.rsplit_once('-').expect("形态 <prefix>-<seq>");
+        assert_eq!(p1, p2, "前缀每进程固定（同一把不可猜的票根）");
+        assert_eq!(p1.len(), 16, "{a}");
+        assert!(p1.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert!(
+            s1.parse::<u64>().is_ok() && s2.parse::<u64>().is_ok(),
+            "{a} / {b}"
+        );
+        assert!(
+            s2.parse::<u64>().unwrap() > s1.parse::<u64>().unwrap(),
+            "计数单调"
+        );
+        assert!(
+            !a.starts_with(&format!("{}-", std::process::id())),
+            "不得是可枚举的 pid 前缀：{a}"
         );
     }
 
@@ -2300,6 +2703,7 @@ mod tests {
             "default",
             &req,
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 0);
@@ -2351,6 +2755,7 @@ mod tests {
             ]})
             .to_string(),
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 5, "{env}");
@@ -2374,6 +2779,7 @@ mod tests {
                     "attachments": [{"filename": "a.txt", "path": "reports/ok.txt"}]})
             .to_string(),
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 0, "{env}");
@@ -2394,7 +2800,16 @@ mod tests {
             (MailMode::Enqueue, false, true),
         ];
         for (mode, _, _) in expect {
-            handle_send(fake.clone(), empty_blobs(), None, "default", &req, mode).await;
+            handle_send(
+                fake.clone(),
+                empty_blobs(),
+                None,
+                "default",
+                &req,
+                mode,
+                &CallCtx::default(),
+            )
+            .await;
         }
         let sent = fake.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 3);
@@ -2460,6 +2875,7 @@ mod tests {
                 "default",
                 &req.to_string(),
                 MailMode::Send,
+                &CallCtx::default(),
             )
             .await;
             assert_eq!(env["code"], 5, "{req} → {env}");
@@ -2476,6 +2892,7 @@ mod tests {
             "nope",
             &json!({"from": "noreply@x.com", "to": ["a@x.com"], "text": "x"}).to_string(),
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 5, "{env}");
@@ -2489,6 +2906,7 @@ mod tests {
                 "default",
                 &bad,
                 MailMode::Send,
+                &CallCtx::default(),
             )
             .await;
             assert_eq!(env["code"], 5, "{bad} → {env}");
@@ -2535,6 +2953,7 @@ mod tests {
                 "default",
                 &req.to_string(),
                 MailMode::Send,
+                &CallCtx::default(),
             )
             .await;
             assert_eq!(env["code"], 5, "{req} → {env}");
@@ -2549,13 +2968,30 @@ mod tests {
     }
 
     /// `headers` **不得覆盖结构化字段**（design §11：`From`/`To`/`Cc`/`Bcc`/`Subject` 决定
-    /// 信封与主题）。这条是白名单绕过面：若放行 `To`，收件人白名单只查结构化 `to`，而信封
-    /// 由报头派生即可把信发给任意人。宿主侧对五个名字（大小写不敏感）一律 `{code:5}`。
+    /// 信封与主题；B5 补 `Sender`/`Return-Path`/`Reply-To` 三个弱 spoof 面头）。这条是白名单
+    /// 绕过面：若放行 `To`，收件人白名单只查结构化 `to`，而信封由报头派生即可把信发给任意人。
+    /// 宿主侧对八个名字（大小写不敏感）一律 `{code:5}`。
     #[tokio::test(flavor = "current_thread")]
     async fn handle_send_rejects_headers_covering_structured_fields() {
         let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
         for name in [
-            "From", "from", "FROM", "To", "to", "Cc", "cc", "Bcc", "bcc", "Subject", "subject",
+            "From",
+            "from",
+            "FROM",
+            "To",
+            "to",
+            "Cc",
+            "cc",
+            "Bcc",
+            "bcc",
+            "Subject",
+            "subject",
+            "Sender",
+            "sender",
+            "Return-Path",
+            "return-path",
+            "Reply-To",
+            "reply-to",
         ] {
             let mut headers = serde_json::Map::new();
             headers.insert(name.to_string(), Value::String("evil@y.com".into()));
@@ -2569,6 +3005,7 @@ mod tests {
                 "default",
                 &req.to_string(),
                 MailMode::Send,
+                &CallCtx::default(),
             )
             .await;
             assert_eq!(env["code"], 5, "headers 覆盖 {name} 必须拒：{env}");
@@ -2609,6 +3046,7 @@ mod tests {
                 "default",
                 &req.to_string(),
                 MailMode::Send,
+                &CallCtx::default(),
             )
             .await;
             assert_eq!(env["code"], 5, "{req} → {env}");
@@ -2631,6 +3069,7 @@ mod tests {
             "default",
             &req.to_string(),
             MailMode::Send,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 0, "{env}");
@@ -2657,6 +3096,7 @@ mod tests {
             "default",
             &req,
             MailMode::Raw,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 0);
@@ -2675,6 +3115,7 @@ mod tests {
             "default",
             &json!({"from": "noreply@x.com", "to": ["a@x.com"]}).to_string(),
             MailMode::Raw,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 5);
@@ -2689,6 +3130,7 @@ mod tests {
                     "attachments": [{"filename": "a", "blobKey": "k"}]})
             .to_string(),
             MailMode::Raw,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 5);
@@ -2696,6 +3138,26 @@ mod tests {
             env["msg"].as_str().unwrap().contains("attachments"),
             "{env}"
         );
+        // B5：raw 与结构化 `headers` 互斥（原实现静默忽略 headers —— 调用方以为头加上了）。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "raw": "X: 1\r\n\r\nb",
+                    "headers": {"X-Custom": "v"}})
+            .to_string(),
+            MailMode::Raw,
+            &CallCtx::default(),
+        )
+        .await;
+        assert_eq!(env["code"], 5, "{env}");
+        assert!(
+            env["msg"].as_str().unwrap().contains("headers")
+                && env["msg"].as_str().unwrap().contains("下一步"),
+            "{env}"
+        );
+        // 空的 headers（`{}`/null）不算「给了」：raw 路照常可发（见下方正向对照）。
         // 结构化 subject 非空 → 覆盖原文 Subject（design §7：结构化为准）。
         let env = handle_send(
             fake.clone(),
@@ -2706,13 +3168,29 @@ mod tests {
                     "raw": "Subject: orig\r\n\r\nb"})
             .to_string(),
             MailMode::Raw,
+            &CallCtx::default(),
         )
         .await;
         assert_eq!(env["code"], 0);
         let sent = fake.sent.lock().unwrap().clone();
         let fwd: Value = serde_json::from_str(&sent[1].1).unwrap();
         assert_eq!(fwd["subject"], "override");
-        assert_eq!(fake.sent.lock().unwrap().len(), 2, "失败路不触达后端");
+        // 正向对照：空的 headers（`{}`）不算「给了」——raw 路照常可发（防「一刀切拒绝
+        // 一切带 headers 字段的 raw」也被判绿）。
+        let env = handle_send(
+            fake.clone(),
+            empty_blobs(),
+            None,
+            "default",
+            &json!({"from": "noreply@x.com", "to": ["a@x.com"], "raw": "X: 1\r\n\r\nb",
+                    "headers": {}})
+            .to_string(),
+            MailMode::Raw,
+            &CallCtx::default(),
+        )
+        .await;
+        assert_eq!(env["code"], 0, "{env}");
+        assert_eq!(fake.sent.lock().unwrap().len(), 3, "失败路不触达后端");
     }
 
     // ---------- 6.5：JS 全局（Mail / mail）端到端 ----------
@@ -2744,10 +3222,12 @@ mod tests {
     }
 
     async fn run_js(b: &Bridge, src: &str) -> Value {
-        let cap = b
-            .run_with(src, crate::bridge::RequestInfo::default())
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        run_js_req(b, src, crate::bridge::RequestInfo::default()).await
+    }
+
+    /// 带显式请求上下文（租户头）地跑一段 JS —— B3 的跨租户归属校验用例需要它。
+    async fn run_js_req(b: &Bridge, src: &str, req: crate::bridge::RequestInfo) -> Value {
+        let cap = b.run_with(src, req).await.unwrap_or_else(|e| panic!("{e}"));
         serde_json::from_slice(&cap.body)
             .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&cap.body)))
     }
@@ -2803,7 +3283,8 @@ mod tests {
                   ],
                 });
                 const s = await mail.sendSync({ from: "noreply@x.com", to: ["c@partner.com"], text: "x" });
-                const j = await mail.enqueue({ from: "noreply@x.com", to: ["a@x.com"], text: "x" });
+                const j = await mail.enqueue({ from: "noreply@x.com", to: ["a@x.com"], text: "x",
+                                               jobId: "caller-controlled" });
                 const a = await new Mail("alerts").send({ from: "alert@x.com", to: ["a@x.com"], text: "x" });
                 json.ok({ r, s, j, a });
               })().catch((e) => json.ok({ err: String(e) }));
@@ -2814,9 +3295,21 @@ mod tests {
         for k in ["r", "s", "j", "a"] {
             assert_eq!(v["data"][k]["code"], 0, "{k}: {v}");
         }
-        assert_eq!(v["data"]["j"]["data"]["jobId"], "j-stub");
         let sent = fake.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 4);
+        // B3：jobId 由**宿主**生成（非可猜的 {pid}-{seq}，也**不是**插件回显的 "j-stub"），
+        // 且回执里的 id 与过线请求里的 id 是同一个（JS 拿到的票一定可 mail.result 回查）。
+        let enq_req: Value = serde_json::from_str(&sent[2].1).unwrap();
+        let job_id = enq_req["jobId"].as_str().expect("宿主必须给 jobId");
+        assert_ne!(job_id, "caller-controlled", "调用方自带的 jobId 必须被剥掉");
+        assert_eq!(
+            v["data"]["j"]["data"]["jobId"], job_id,
+            "回执的 jobId 必须钉成宿主值（不依赖插件回显）"
+        );
+        let (prefix, seq) = job_id.rsplit_once('-').expect("jobId 形态 <hex>-<seq>");
+        assert_eq!(prefix.len(), 16, "随机前缀 16 hex：{job_id}");
+        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()), "{job_id}");
+        assert!(seq.parse::<u64>().is_ok(), "{job_id}");
         // 附件：下标序 + 字节 + MIME（显式优先 / 扩展名嗅探）。
         assert_eq!(sent[0].2.len(), 2);
         assert_eq!(sent[0].2[0].filename, "b.pdf");
@@ -2892,29 +3385,96 @@ mod tests {
         );
     }
 
-    /// `mail.result(id)`（异步上送结果）+ `Mail.profiles()`（非密钥面）。
+    /// `mail.result(id)`（异步上送结果）+ `Mail.profiles()`（非密钥面）+ B3 归属校验：
+    /// - 本归属（同 profile / 同租户）→ 结果；
+    /// - 换 profile（`new Mail("alerts")`）或换租户（请求头）→ `null`（不泄露存在性）；
+    /// - 未命中 / 已过期 → `null`。
     #[tokio::test(flavor = "current_thread")]
-    async fn js_mail_result_and_profiles() {
+    async fn js_mail_result_is_scoped_to_caller_owner() {
         let _g = lock();
-        let fake = FakeMail::new(whitelisted_config(), Arc::new(Bus::new()));
+        let cfg = MailConfig::new(HashMap::from([
+            (
+                "default".to_string(),
+                whitelisted_config().profile("default").unwrap().clone(),
+            ),
+            (
+                "alerts".to_string(),
+                MailProfileCfg {
+                    allowed_from: vec!["noreply@x.com".into()],
+                    allowed_recipients: vec!["@x.com".into()],
+                },
+            ),
+        ]));
+        let fake = FakeMail::new(cfg, Arc::new(Bus::new()));
         let b = mail_bridge(fake.clone(), None, None);
-        // 插件 worker 上送完成结果 → 宿主存下（供 enqueue 的调用方回查）。
-        deliver_to_host(MAIL_RESULT_TOPIC, ENVELOPE);
-        let v = run_js(
-            &b,
-            r#"(async () => {
+        // 三张票：j1（default / 无租户）、j2（alerts / 无租户）、j3（default / 租户 t1）。
+        let env = |job_id: &str| {
+            format!(
+                r#"{{"code":0,"msg":"sent","data":{{"jobId":"{job_id}","messageId":"m-{job_id}"}}}}"#
+            )
+        };
+        assert!(fake.router().reserve("j1", owner()));
+        assert!(
+            fake.router()
+                .reserve("j2", MailOwner::new("alerts", &CallCtx::default()))
+        );
+        assert!(fake.router().reserve(
+            "j3",
+            MailOwner::new(
+                "default",
+                &CallCtx {
+                    module: None,
+                    tenant: Some("t1".into()),
+                }
+            )
+        ));
+        for id in ["j1", "j2", "j3"] {
+            deliver_to_host(MAIL_RESULT_TOPIC, env(id).as_bytes());
+        }
+        let js = r#"(async () => {
                 const r = await mail.result("j1");
+                const alienProfile = await mail.result("j2");
+                const alienTenant = await mail.result("j3");
+                const alertsOwn = await new Mail("alerts").result("j2");
                 const miss = await mail.result("nope");
                 const p = await Mail.profiles();
-                json.ok({ r, miss, p });
+                json.ok({ r, alienProfile, alienTenant, alertsOwn, miss, p });
               })().catch((e) => json.ok({ err: String(e) }));
-              "#,
+              "#;
+        // 无租户上下文：j1 命中；j2（他人 profile）与 j3（他人租户）都不可见。
+        let v = run_js(&b, js).await;
+        assert!(v["data"].get("err").is_none(), "{v}");
+        assert_eq!(v["data"]["r"]["code"], 0, "{v}");
+        assert_eq!(v["data"]["r"]["messageId"], "m-j1");
+        assert!(v["data"]["r"].get("subject").is_none(), "{v}");
+        assert_eq!(
+            v["data"]["alienProfile"],
+            Value::Null,
+            "跨 profile 必须不可见：{v}"
+        );
+        assert_eq!(
+            v["data"]["alienTenant"],
+            Value::Null,
+            "跨租户必须不可见：{v}"
+        );
+        assert_eq!(
+            v["data"]["alertsOwn"]["messageId"], "m-j2",
+            "本 profile 必须可见：{v}"
+        );
+        assert_eq!(v["data"]["miss"], Value::Null);
+        assert_eq!(v["data"]["p"], json!(["alerts", "default"]));
+
+        // 同租户上下文（t1）→ j1/j3 都可见（归属一致），j2 仍不可见（profile 不同）。
+        let v = run_js_req(
+            &b,
+            js,
+            crate::bridge::RequestInfo {
+                tenant_id: Some("t1".into()),
+                ..Default::default()
+            },
         )
         .await;
-        assert_eq!(v["data"]["r"]["code"], 0, "{v}");
-        assert_eq!(v["data"]["r"]["messageId"], "m1");
-        assert!(v["data"]["r"].get("subject").is_none(), "{v}");
-        assert_eq!(v["data"]["miss"], Value::Null);
-        assert_eq!(v["data"]["p"], json!(["default"]));
+        assert_eq!(v["data"]["r"], Value::Null, "j1 属于无租户归属：{v}");
+        assert_eq!(v["data"]["alienTenant"]["messageId"], "m-j3", "{v}");
     }
 }

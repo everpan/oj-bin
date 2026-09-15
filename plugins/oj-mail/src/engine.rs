@@ -213,6 +213,11 @@ pub struct MailEngine {
     exits: Mutex<std::sync::mpsc::Receiver<()>>,
     /// worker 数（drain 需收齐这么多退出信号）。
     workers: usize,
+    /// 单附件字节上限（B2 **纵深防御**：宿主已按其 `smtp.max_attachment_bytes` 判过；
+    /// 插件再判一次，防第三方宿主漏判 —— 字节是宿主读盘后过线来的）。
+    max_attachment_bytes: usize,
+    /// 单封附件合计上限（同上）。
+    max_total_attachment_bytes: usize,
 }
 
 impl MailEngine {
@@ -237,11 +242,19 @@ impl MailEngine {
                 return Err(e);
             }
         };
-        Self::with_rt(rt, targets, cfg.workers, cfg.queue_capacity, deliver)
+        Self::with_rt(
+            rt,
+            targets,
+            cfg.workers,
+            cfg.queue_capacity,
+            (cfg.max_attachment_bytes, cfg.max_total_attachment_bytes),
+            deliver,
+        )
     }
 
     /// 用显式投递表构造（**测试注入口**：免网络、可闩锁；生产走 [`MailEngine::new`]）。
     /// `#[cfg(test)]`：cdylib 没有库消费者，注入口不必进发布产物。
+    /// 附件上限取 `usize::MAX`（用例不测上限；上限用例走 `MailEngine::new` + 真 cfg）。
     #[cfg(test)]
     pub fn with_targets(
         targets: HashMap<String, MailTarget>,
@@ -250,15 +263,23 @@ impl MailEngine {
         deliver: DeliverSink,
     ) -> Result<Self, String> {
         let rt = runtime(workers)?;
-        Self::with_rt(rt, targets, workers, queue_capacity, deliver)
+        Self::with_rt(
+            rt,
+            targets,
+            workers,
+            queue_capacity,
+            (usize::MAX, usize::MAX),
+            deliver,
+        )
     }
 
-    /// 装配：起 `workers` 个 worker 消费有界队列。
+    /// 装配：起 `workers` 个 worker 消费有界队列。`limits` = (单附件, 单封合计) 字节上限。
     fn with_rt(
         rt: Runtime,
         targets: HashMap<String, MailTarget>,
         workers: usize,
         queue_capacity: usize,
+        limits: (usize, usize),
         deliver: DeliverSink,
     ) -> Result<Self, String> {
         // 配置边界 fail-loud：0 会让队列永不被消费 / 每次投递都立即 code 4（都是坏配置）。
@@ -312,6 +333,8 @@ impl MailEngine {
             rt: Mutex::new(Some(rt)),
             exits: Mutex::new(exits),
             workers,
+            max_attachment_bytes: limits.0,
+            max_total_attachment_bytes: limits.1,
         })
     }
 
@@ -353,6 +376,15 @@ impl MailEngine {
         }
 
         let job_id = parsed.job_id.clone().unwrap_or_else(next_job_id);
+        // B2 纵深防御：附件大小上限（宿主侧是主判据；这一层防第三方宿主漏判）。
+        // 超限 → `code:5` 信封（**不占队列槽位**，也不进 worker）。
+        if let Some(msg) = over_attachment_limit(
+            &atts,
+            self.max_attachment_bytes,
+            self.max_total_attachment_bytes,
+        ) {
+            return ready_ok(fail_envelope(&job_id, CODE_VALIDATION, &msg));
+        }
         let (respond, rx) = if parsed.enqueue_only {
             (None, None)
         } else {
@@ -544,6 +576,33 @@ async fn run_job(job: Job, targets: &HashMap<String, MailTarget>, deliver: &Deli
     }
 }
 
+/// 附件上限的**插件侧复核**（B2 纵深防御；宿主侧 `resolve_attachments` 是主判据）。
+/// 返回超限文案（`None` = 通过）：单件超限即拒；合计超限点名越界的那个附件。
+fn over_attachment_limit(
+    atts: &[MailAttachment],
+    max_file: usize,
+    max_total: usize,
+) -> Option<String> {
+    let mut total = 0usize;
+    for (i, a) in atts.iter().enumerate() {
+        let len = a.bytes.len();
+        if len > max_file {
+            return Some(format!(
+                "mail: attachments[{i}]（{}）{len} 字节超过单附件上限 {max_file} 字节（smtp.max_attachment_bytes）（下一步：换更小的附件，或调大该配置）",
+                a.filename
+            ));
+        }
+        total = total.saturating_add(len);
+        if total > max_total {
+            return Some(format!(
+                "mail: attachments[{i}]（{}）加入后附件合计 {total} 字节超过单封上限 {max_total} 字节（smtp.max_total_attachment_bytes）（下一步：减小附件或减少数量，或调大该配置）",
+                a.filename
+            ));
+        }
+    }
+    None
+}
+
 /// 投递一个 job，返回结果信封 JSON（**唯一**的信封构造点：sync 回传与 enqueue 上送同形）。
 async fn deliver_one(job: &Job, targets: &HashMap<String, MailTarget>) -> String {
     let job_id = job.job_id.as_str();
@@ -629,8 +688,35 @@ fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8
 
 /// 成功信封：`{code:0,msg:"ok",data:{jobId,messageId}}`（`messageId` = 投递凭据）。
 fn ok_envelope(job_id: &str, message_id: &str) -> String {
-    json!({"code": CODE_OK, "msg": "ok", "data": {"jobId": job_id, "messageId": message_id}})
+    json!({"code": CODE_OK, "msg": "ok", "data": {"jobId": job_id, "messageId": sanitize_message_id(message_id)}})
         .to_string()
+}
+
+/// `messageId` 的长度上限（B6；超长即截断）。
+const MESSAGE_ID_MAX: usize = 64;
+
+/// 投递凭据脱敏（B6）：MTA 原始应答可能带**服务器指纹 / 队列信息 / 主机名**
+/// （如 `250 OK id=1a2b (Exim 4.95 mail.example.com)`），而 `messageId` 会进信封、上送
+/// 总线，故只留**队列号**或整段截断：
+/// - 先剥 CR/LF（应答可能是多行 `join(" ")` 出来的）；
+/// - 含 `queued as <id>`（Postfix 系）→ 只取那个 token（去尾部标点）；
+/// - 否则整段截断到 [`MESSAGE_ID_MAX`]（FileTransport 的落盘 id 无空格，原样通过）。
+///
+/// 诚实边界：非 Postfix 应答在截断后仍可能带上少量服务端文本（≤ 64 字符）。
+fn sanitize_message_id(raw: &str) -> String {
+    let one_line: String = raw.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let s = one_line.trim();
+    let lower = s.to_ascii_lowercase();
+    if let Some(i) = lower.find("queued as") {
+        if let Some(tok) = s[i + "queued as".len()..].split_whitespace().next() {
+            let tok = tok
+                .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '>' | '<' | ')' | '('));
+            if !tok.is_empty() {
+                return tok.chars().take(MESSAGE_ID_MAX).collect();
+            }
+        }
+    }
+    s.chars().take(MESSAGE_ID_MAX).collect()
 }
 
 /// `enqueue` 语义的**立即**回执：与 `send` 路**同形**的统一信封
@@ -664,14 +750,26 @@ fn unknown_profile_msg(key: &str) -> String {
     format!("mail: 未知 smtp profile '{key}'（不回落 default）")
 }
 
-/// 未给 `jobId` 时生成：进程号 + 单调计数（进程内唯一、可读、无随机依赖）。
+/// **兜底** jobId（正常路恒由宿主注入 `req.jobId`，见 B3）：`<每进程随机 64 bit>-<单调计数>`。
+///
+/// 旧形态 `{pid}-{seq}` 可枚举（进程号 + 从 1 起的计数）——若让调用方带上它去查结果，
+/// 就等于把结果通道开放给猜测。宿主侧已改为随机前缀（`src/bridge/mail.rs::next_job_id`），
+/// 这里同款兜底：随机源取 std 的 `RandomState`（每进程随机种子，哈希 time+pid+seq），
+/// **不引新依赖**。
 fn next_job_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
     static SEQ: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(seq);
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.write_u32(std::process::id());
+    format!("{:016x}-{seq}", h.finish())
 }
 
 #[cfg(test)]
@@ -683,6 +781,111 @@ mod tests {
     use tokio::sync::Semaphore;
 
     const PROFILE: &str = "default";
+
+    /// B6：`messageId` 只留队列号或截断 —— MTA 原始应答可能带服务器指纹/队列信息，
+    /// 而它会进信封并上送总线（脱敏面）。
+    #[test]
+    fn message_id_keeps_queue_id_only_or_truncates() {
+        // Postfix 系：只留 `queued as` 之后的队列号（去尾部标点）。
+        assert_eq!(
+            sanitize_message_id("250 2.0.0 Ok: queued as 4Wx1AbC\r\n"),
+            "4Wx1AbC"
+        );
+        assert_eq!(sanitize_message_id("250 OK queued as ABC123."), "ABC123");
+        // FileTransport：落盘 id 原样（无空格、短）。
+        assert_eq!(sanitize_message_id("mail-9f8a1b"), "mail-9f8a1b");
+        // 其它应答：剥 CR/LF 并截断到 64。
+        let long = format!("250 {}", "x".repeat(200));
+        let got = sanitize_message_id(&long);
+        assert_eq!(got.len(), MESSAGE_ID_MAX, "{got}");
+        assert!(!got.contains('\n') && !got.contains('\r'), "{got}");
+        assert_eq!(sanitize_message_id("250\r\nOK\r\n"), "250OK");
+    }
+
+    /// B2 纵深防御：附件超限在**插件侧**也回 `code:5`（宿主是主判据；这一层防第三方宿主
+    /// 漏判），且**不占队列槽位**（超限信不落盘 = 没进 worker）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_rejects_oversized_attachments_with_code5() {
+        let dir = temp_dir("engine-attlimit");
+        let cfg = MailConfig::parse(&format!(
+            r#"{{"max_attachment_bytes":8,"max_total_attachment_bytes":12,
+                 "default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,
+                             "mechanism":"login","file_transport":"{}"}}}}"#,
+            dir.display()
+        ))
+        .expect("cfg");
+        let eng = MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎");
+
+        // 单附件超限（9 > 8）。
+        let mut fut = eng.submit(
+            PROFILE,
+            &req_assemble("j-big", true),
+            vec![att_bytes("a.bin", "application/octet-stream", b"123456789")],
+        );
+        let v: Value = serde_json::from_slice(&drive(&mut fut).await.expect("应回信封")).unwrap();
+        assert_eq!(v["code"], CODE_VALIDATION, "信封: {v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_attachment_bytes"),
+            "文案须给配置键与下一步: {v}"
+        );
+
+        // 合计超限（两件各 8 字节 = 16 > 12）。
+        let req2 = json!({
+            "from": "from@example.com",
+            "to": ["to@example.com"],
+            "text": "hi",
+            "jobId": "j-big-2",
+            "attachments": [
+                {"filename": "a.bin", "blobKey": "k1"},
+                {"filename": "b.bin", "blobKey": "k2"},
+            ],
+        })
+        .to_string();
+        let mut fut = eng.submit(
+            PROFILE,
+            &req2,
+            vec![
+                att_bytes("a.bin", "application/octet-stream", b"12345678"),
+                att_bytes("b.bin", "application/octet-stream", b"12345678"),
+            ],
+        );
+        let v: Value = serde_json::from_slice(&drive(&mut fut).await.expect("应回信封")).unwrap();
+        assert_eq!(v["code"], CODE_VALIDATION, "信封: {v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_total_attachment_bytes"),
+            "{v}"
+        );
+
+        // 未投递（file transport 目录里没有 .eml）。
+        assert!(
+            std::fs::read_dir(&dir).expect("目录").next().is_none(),
+            "超限附件不得进 worker（不落盘）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B3 兜底：未给 `jobId` 时引擎自造的 id 也不得是可枚举的 `{pid}-{seq}`
+    /// （正常路宿主恒注入 id，故这只是纵深防御；这里钉死形态与唯一性）。
+    #[test]
+    fn fallback_job_id_is_not_pid_enumerable() {
+        let a = next_job_id();
+        let b = next_job_id();
+        assert_ne!(a, b, "进程内必须唯一");
+        let (prefix, seq) = a.rsplit_once('-').expect("形态 <hex>-<seq>");
+        assert_eq!(prefix.len(), 16, "{a}");
+        assert!(prefix.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert!(seq.parse::<u64>().is_ok(), "{a}");
+        assert!(
+            !a.starts_with(&format!("{}-", std::process::id())),
+            "不得是可枚举的 pid 前缀：{a}"
+        );
+    }
 
     /// `raw` 路的最小合法 req（信封 + 原文）。
     fn req_raw(job_id: Option<&str>, enqueue_only: bool) -> String {
