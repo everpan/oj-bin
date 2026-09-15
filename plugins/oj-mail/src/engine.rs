@@ -1,5 +1,13 @@
 //! `MailEngine`：有界队列 + worker 池 + 背压 + graceful drain（阶段 4）。
 //!
+//! ## 强引用释放顺序（「顺序即契约」，A3）
+//!
+//! `submit` 的 ctl drain 与 `Drop` 都要求：**`drain` 收齐全部 worker 退出信号时，worker
+//! 手里不再有任何 transport 强引用**，于是最后一份强引用的销毁点确定落在 [`dispose`] 的
+//! `rt.enter()` 内（或 worker 自己的 runtime 上下文里）。`async move` 块的捕获变量只在
+//! **future 被 drop** 时释放（实测），故 worker 块里必须**显式** `drop(targets)`（再按依赖序
+//! drop `deliver`/`rx`）**之后**才发退出信号 —— 见 `with_rt` 的注释。
+//!
 //! ## 为什么引擎自建 tokio runtime
 //!
 //! lettre 的 `pool` 在 `AsyncSmtpTransport` 的 **Drop** 里 `E::spawn(...)`
@@ -16,6 +24,12 @@
 //! 用 tokio 专为「在另一个 runtime 里 drop runtime」提供的非阻塞关闭
 //! [`Runtime::shutdown_background`]：先 `rt.enter()` 释放 transport（约束 1），再非阻塞关闭
 //! runtime（约束 2）。销毁顺序固定为 **transport → runtime**。
+//!
+//! ## 停机入口：控制报文（A4）
+//!
+//! 插件引擎是 `OnceLock` 单例（宿主只给 `&`），且 `MailVtable` 形状不许改（ABI 严格相等），
+//! 故 graceful drain 的**生产**入口是 `submit` 的控制报文 `{"__ctl":"drain","timeout_ms":N}`
+//! （见 [`CTL_KEY`]）——宿主在 `oj server` 停机路径（HTTP 停收 + 任务收场之后）调用。
 //!
 //! ## 分期边界
 //!
@@ -49,8 +63,43 @@ pub const CODE_QUEUE_FULL: i32 = 4;
 /// 入参/契约校验失败。
 pub const CODE_VALIDATION: i32 = 5;
 
-/// 引擎已停机（`shutdown` 后）时的统一错误串。
+/// 引擎已停机（`drain` 后）时的统一错误串。
 const STOPPED: &str = "mail: engine 已停机（不再接收投递）";
+
+/// 控制报文键（`req` JSON 顶层）：`{"__ctl":"drain","timeout_ms":10000}`。
+/// 控制报文走**既有** `submit` 入口（vtable 形状不变 ⇒ **零 ABI 变更**）——宿主停机时
+/// 用它触发 graceful drain（见 [`Ctl::Drain`]）。
+pub const CTL_KEY: &str = "__ctl";
+/// `__ctl` 的取值：停机排空（graceful drain）。回信封
+/// `{"code":0,"msg":"ok","data":{"drained":true,"workers":N}}`；drain 超时则 `code:1`
+/// （已停收 + 已销毁，在途 job 可能被丢弃）。
+pub const CTL_DRAIN: &str = "drain";
+/// 控制报文未带 `timeout_ms` 时的默认 drain 总超时（宿主一般显式给）。
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 控制报文（`req` 顶层 `__ctl`）。
+enum Ctl {
+    /// 停机排空：停收 → 等在途跑完（总超时）→ 销毁 transport 与 runtime。
+    Drain { timeout: Duration },
+    /// 未识别的控制名（fail-loud，不静默当业务 req 解析）。
+    Unknown(String),
+}
+
+/// 解析控制报文：`req` 顶层 `__ctl` 为字符串即控制报文（其余字段一概不看）。
+/// 非对象/无 `__ctl` → `None`（走业务路）。`timeout_ms` 仅在 `Drain` 下有意义。
+fn ctl_request(req: &str) -> Option<Ctl> {
+    let v: serde_json::Value = serde_json::from_str(req).ok()?;
+    let name = v.get(CTL_KEY)?.as_str()?;
+    Some(match name {
+        CTL_DRAIN => Ctl::Drain {
+            timeout: v
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(DEFAULT_DRAIN_TIMEOUT, Duration::from_millis),
+        },
+        other => Ctl::Unknown(other.to_string()),
+    })
+}
 
 /// 异步投递函数的返回 future（须 `Send`：worker 任务跑在引擎多线程 runtime 上）。
 pub type SendFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
@@ -149,16 +198,17 @@ struct Req {
 
 /// 引擎：有界队列 + N worker + 结果回传/上送 + 可 drain 的停机。
 pub struct MailEngine {
-    /// 有界队列发送端。`Mutex<Option<_>>`：`shutdown` 需 `take` 后 **drop** 才能关闭接收端
+    /// 有界队列发送端。`Mutex<Option<_>>`：`drain` 需 `take` 后 **drop** 才能关闭接收端
     /// （所有 `Sender` 都没了，worker 的 `recv` 才会返回 `None` 而退出）。
     tx: Mutex<Option<mpsc::Sender<Job>>>,
-    /// profile 名 → 投递目标。`Option`：`shutdown`/`Drop` 时 take 出来交给 [`dispose`]
+    /// profile 名 → 投递目标。`Option`：`drain`/`Drop` 时 take 出来交给 [`dispose`]
     /// 在 **rt 上下文内**释放（lettre pool transport 的 Drop 需要 runtime 上下文）。
-    targets: Option<Arc<HashMap<String, MailTarget>>>,
+    /// `Mutex` 仅为在 `&self`（生产入口：控制报文 drain）下也能 take —— `submit` 只读。
+    targets: Mutex<Option<Arc<HashMap<String, MailTarget>>>>,
     /// 引擎 runtime；同上，take 出去销毁（drop runtime 会阻塞，不能在 async 上下文做）。
-    rt: Option<Runtime>,
+    rt: Mutex<Option<Runtime>>,
     /// worker 退出信号（std 通道：drain 的等待是**同步阻塞**，不走 `block_on`，
-    /// 故 `shutdown` 在 async 上下文里调用也安全）。`Mutex` 仅为满足 `Sync`
+    /// 故 `drain` 在 async 上下文里调用也安全）。`Mutex` 仅为满足 `Sync`
     /// （`mpsc::Receiver` 不是 `Sync`；本插件引擎要放进 `OnceLock` 静态）。
     exits: Mutex<std::sync::mpsc::Receiver<()>>,
     /// worker 数（drain 需收齐这么多退出信号）。
@@ -236,10 +286,21 @@ impl MailEngine {
             let deliver = deliver.clone();
             let exit_tx = exit_tx.clone();
             rt.spawn(async move {
-                worker_loop(rx, targets, deliver).await;
-                // 退出信号在 worker 帧（含 targets 强引用）释放**之后**发出：`shutdown`
-                // 收齐全部信号时，transport 的强引用只剩引擎那一份 → 其销毁点确定落在
-                // `dispose` 的 `rt.enter()` 内（不在别处触发 pool 的 `tokio::spawn`）。
+                // 借用传入：强引用归本块所有。`worker_loop` 按**值**收下的话，强引用会随它的
+                // 函数帧释放；而 `async move` 块的捕获变量更晚 —— 只在 **future 被 drop**
+                // 时才释放（实测：块体跑完、future 仍存活时捕获变量还在）。两者都晚于下面的
+                // 退出信号，于是「信号之后再无 worker 持有的强引用」这条保证不成立。
+                worker_loop(&rx, &targets, &deliver).await;
+                // **顺序即契约**：退出信号必须在 worker 释放全部强引用**之后**发出。
+                // `targets` 持有 transport，而 lettre `pool` 的 Drop 会 `tokio::spawn`
+                // （`pool/async_impl.rs:262`）—— 它必须落在 runtime 上下文内，且最后一份
+                // 强引用的销毁点要确定（`drain` 收齐信号后由 `dispose` 在 `rt.enter()` 内
+                // 释放引擎那一份）。不显式 drop，销毁点就漂到「未来某个线程」上，正确性
+                // 依赖 tokio 内部「取消/回收任务时恰好进入了 runtime 上下文」这一实现细节。
+                // 依赖序（与 `dispose` 的 transport → runtime 同序）：targets → deliver → rx。
+                drop(targets);
+                drop(deliver);
+                drop(rx);
                 let _ = exit_tx.send(());
             });
         }
@@ -247,8 +308,8 @@ impl MailEngine {
 
         Ok(Self {
             tx: Mutex::new(Some(tx)),
-            targets: Some(targets),
-            rt: Some(rt),
+            targets: Mutex::new(Some(targets)),
+            rt: Mutex::new(Some(rt)),
             exits: Mutex::new(exits),
             workers,
         })
@@ -262,23 +323,33 @@ impl MailEngine {
     /// 非阻塞入队（`MailVtable::submit` 的实现体；vtable 侧另包 `catch_future`）。
     ///
     /// 三种返回：
+    /// - 控制报文（`req` 含 `__ctl`）→ 同步执行并回结果信封（见 [`ctl_request`]）；
     /// - `send` 语义 → 等 oneshot 的 `FfiFuture`（由引擎 runtime 驱动，不占调用线程）；
     /// - `enqueue` 语义 → 立即回**统一信封** `{"code":0,"msg":"ok","data":{"jobId":"..."}}`
     ///   （真实完成经 `deliver` 上送；**不是**裸 `{jobId}`，见 [`enqueued_envelope`]）；
     /// - 队列满 → 立即 `{"code":4,...}` 信封（**背压**，绝不阻塞）。
     pub fn submit(&self, key: &str, req: &str, atts: Vec<MailAttachment>) -> FfiFuture {
+        // 控制报文先于一切业务校验（不占 profile key、不占队列槽位）。
+        if let Some(ctl) = ctl_request(req) {
+            return self.run_ctl(ctl);
+        }
         // req 形态错误 / 未知 profile = 调用方契约错误 → FFI 层 Err（fail-loud，不占队列槽位）。
         let parsed: Req = match serde_json::from_str(req) {
             Ok(r) => r,
             Err(e) => return ready_err(format!("mail: 请求 JSON 解析失败: {e}")),
         };
-        let (Some(tx), Some(rt), Some(targets)) =
-            (self.sender(), self.rt.as_ref(), self.targets.as_ref())
-        else {
+        let Some(tx) = self.sender() else {
             return ready_err(STOPPED);
         };
-        if !targets.contains_key(key) {
-            return ready_err(unknown_profile_msg(key));
+        {
+            // 锁只覆盖「查表」：`submit` 不持锁做投递。
+            let g = self.targets.lock().expect("mail: targets 锁中毒");
+            let Some(targets) = g.as_ref() else {
+                return ready_err(STOPPED);
+            };
+            if !targets.contains_key(key) {
+                return ready_err(unknown_profile_msg(key));
+            }
         }
 
         let job_id = parsed.job_id.clone().unwrap_or_else(next_job_id);
@@ -303,14 +374,45 @@ impl MailEngine {
         match tx.try_send(job) {
             Ok(()) => match rx {
                 None => ready_ok(enqueued_envelope(&job_id)),
-                Some(rx) => spawn_ffi_future(rt, async move {
-                    rx.await
-                        .map_err(|_| "mail: 投递任务未回传结果（引擎停机？）".to_string())?
-                        .map(String::into_bytes)
-                }),
+                Some(rx) => {
+                    // 已入队 → 取 rt 起 future（drain 竞态：rt 已销毁 ⇒ 回停机信封）。
+                    let g = self.rt.lock().expect("mail: rt 锁中毒");
+                    let Some(rt) = g.as_ref() else {
+                        return ready_err(STOPPED);
+                    };
+                    spawn_ffi_future(rt, async move {
+                        rx.await
+                            .map_err(|_| "mail: 投递任务未回传结果（引擎停机？）".to_string())?
+                            .map(String::into_bytes)
+                    })
+                }
             },
             Err(mpsc::error::TrySendError::Full(_)) => ready_ok(queue_full_envelope(&job_id)),
             Err(mpsc::error::TrySendError::Closed(_)) => ready_err(STOPPED),
+        }
+    }
+
+    /// 控制报文分派（唯一入口 = [`MailEngine::submit`]；`__ctl` 见 [`ctl_request`]）。
+    ///
+    /// 同步执行并回**统一信封**（`ready_*`：调用方拿到即已就绪，宿主一次 poll 即得结果）。
+    fn run_ctl(&self, ctl: Ctl) -> FfiFuture {
+        match ctl {
+            Ctl::Drain { timeout } => match self.drain(timeout) {
+                Ok(()) => ready_ok(
+                    json!({
+                        "code": CODE_OK, "msg": "ok",
+                        "data": {"drained": true, "workers": self.workers},
+                    })
+                    .to_string(),
+                ),
+                // 超时不是「没做」而是「没等完」：已停收 + 已销毁，在途 job 可能被丢弃。
+                Err(e) => ready_ok(
+                    json!({"code": CODE_NETWORK, "msg": e, "data": {"drained": false}}).to_string(),
+                ),
+            },
+            Ctl::Unknown(name) => {
+                ready_err(format!("mail: 未知控制报文 '{name}'（支持：{CTL_DRAIN}）"))
+            }
         }
     }
 
@@ -318,12 +420,12 @@ impl MailEngine {
     ///
     /// 返回 `Err` = 有 worker 未在超时内退出（在途 job 可能被丢弃）。
     ///
-    /// `allow(dead_code)`：cdylib 内没有库消费者（不 `allow` 会报未使用）；宿主驱动的停机
-    /// （`oj server` 退出时调它）归阶段 7，本阶段的调用方是测试与 `Drop` 的同序销毁逻辑。
-    #[allow(dead_code)]
-    pub fn shutdown(&mut self, timeout: Duration) -> Result<(), String> {
+    /// **`&self`**：生产停机的唯一入口是控制报文（`{"__ctl":"drain"}`），而插件引擎是
+    /// `OnceLock` 单例（只给 `&`）——故 `tx`/`targets`/`rt` 都放在 `Mutex<Option<_>>` 里。
+    /// 并发 drain：后到者会等超时并返回 `Err`（生产只有停机一处调用）。
+    pub fn drain(&self, timeout: Duration) -> Result<(), String> {
         // 1) 关接收端：drop 唯一的 `Sender` ⇒ 队列排空后各 worker 的 `recv` 返回 `None` 并退出。
-        drop(self.tx.get_mut().expect("mail: tx 锁中毒").take());
+        drop(self.tx.lock().expect("mail: tx 锁中毒").take());
         // 2) 等在途/排队 job 跑完（总超时）。退出信号走 **std** 通道：纯同步阻塞等待，
         //    不用 `block_on`（在 async 上下文里起 runtime 会 panic）。
         let deadline = Instant::now() + timeout;
@@ -335,7 +437,7 @@ impl MailEngine {
             }
             if self
                 .exits
-                .get_mut()
+                .lock()
                 .expect("mail: exits 锁中毒")
                 .recv_timeout(left)
                 .is_err()
@@ -358,21 +460,23 @@ impl MailEngine {
     }
 
     /// 交出 rt/targets 给 [`dispose`] 按序销毁（幂等：已交出则 no-op）。
-    fn dispose(&mut self) {
-        if let Some(rt) = self.rt.take() {
-            dispose(rt, self.targets.take());
+    fn dispose(&self) {
+        let rt = self.rt.lock().expect("mail: rt 锁中毒").take();
+        let targets = self.targets.lock().expect("mail: targets 锁中毒").take();
+        if let Some(rt) = rt {
+            dispose(rt, targets);
         }
     }
 }
 
 impl Drop for MailEngine {
     fn drop(&mut self) {
-        // 与 `shutdown` 同序但**不等待**在途 job：
-        // 1) 关接收端（`shutdown` 已关则 no-op）；
+        // 与 `drain` 同序但**不等待**在途 job：
+        // 1) 关接收端（`drain` 已关则 no-op）；
         drop(self.tx.get_mut().expect("mail: tx 锁中毒").take());
         // 2) 先 transport 后 runtime。
         self.dispose();
-        // 未跑完的在途 job 随 runtime 一起被丢弃——需要「在途必达」请显式 `shutdown`（graceful drain）。
+        // 未跑完的在途 job 随 runtime 一起被丢弃——需要「在途必达」请先 `drain`（graceful drain）。
     }
 }
 
@@ -398,7 +502,7 @@ fn runtime(workers: usize) -> Result<Runtime, String> {
 ///    文档与实现 = `shutdown_timeout(Duration::ZERO)`，blocking pool 直接标记已关闭、
 ///    不做阻塞等待），其后 `Runtime::drop` 亦不再走阻塞分支。
 ///
-/// 于是**不需要**把销毁挪到独立线程，`shutdown`/`Drop` 在 `#[tokio::test]`、宿主 async
+/// 于是**不需要**把销毁挪到独立线程，`drain`/`Drop` 在 `#[tokio::test]`、宿主 async
 /// 任务、进程退出等任一上下文里都安全。
 fn dispose(rt: Runtime, targets: Option<Arc<HashMap<String, MailTarget>>>) {
     {
@@ -410,17 +514,18 @@ fn dispose(rt: Runtime, targets: Option<Arc<HashMap<String, MailTarget>>>) {
 
 /// worker 主循环：`recv` 直到发送端关闭且队列排空（graceful drain 的收敛点）。
 ///
-/// `targets`/`deliver` 按值传入：本函数返回即释放（调用方随后才发退出信号，见 `with_rt`）。
+/// `rx`/`targets`/`deliver` 一律**借用**：强引用归调用方（`with_rt` 的 worker 块）所有，
+/// 由它在发出退出信号**之前**显式释放（顺序即契约，见那里的注释）。
 async fn worker_loop(
-    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
-    targets: Arc<HashMap<String, MailTarget>>,
-    deliver: DeliverSink,
+    rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
+    targets: &HashMap<String, MailTarget>,
+    deliver: &DeliverSink,
 ) {
     loop {
         // 锁只在 `recv().await` 期间持有：取到 job 立即释放 ⇒ 其余 worker 可继续取件/并行投递。
         let job = rx.lock().await.recv().await;
         match job {
-            Some(job) => run_job(job, &targets, &deliver).await,
+            Some(job) => run_job(job, targets, deliver).await,
             None => break, // 发送端全部 drop + 队列排空 → 退出
         }
     }
@@ -727,7 +832,7 @@ mod tests {
     async fn full_queue_returns_code4_without_blocking() {
         let (target, gate, mut started) = gated_target(Duration::from_secs(60));
         let (sink, mut delivered) = collector();
-        let mut eng = MailEngine::with_targets(targets_with(target), 1, 1, sink).expect("引擎");
+        let eng = MailEngine::with_targets(targets_with(target), 1, 1, sink).expect("引擎");
 
         // A：占住唯一的 worker（等 `started` 才继续 ⇒ 此刻 worker 已把 A 取走，队列为空）。
         let _ = eng.submit(PROFILE, &req_raw(Some("j-a"), true), vec![]);
@@ -750,7 +855,7 @@ mod tests {
 
         // 放行 A/B：队列被消费完 → drain 成功（也证明 A/B 确实在队列/在途，而非被丢弃）。
         gate.add_permits(2);
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok(), "drain 应成功");
+        assert!(eng.drain(Duration::from_secs(5)).is_ok(), "drain 应成功");
         assert_eq!(
             delivered.try_recv().expect("A 的结果上送").0,
             TOPIC_MAIL_RESULT
@@ -767,7 +872,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn enqueue_delivers_completion_via_sink() {
         let (sink, mut delivered) = collector();
-        let mut eng =
+        let eng =
             MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 8, sink)
                 .expect("引擎");
 
@@ -802,16 +907,16 @@ mod tests {
                 "结果上送不得含收件人/主题（{banned}）: {text}"
             );
         }
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+        assert!(eng.drain(Duration::from_secs(5)).is_ok());
     }
 
-    /// TDD-4：graceful drain —— 入队后立刻 `shutdown`，**在途 job 必须跑完**（结果上送 +
+    /// TDD-4：graceful drain —— 入队后立刻 `drain`，**在途 job 必须跑完**（结果上送 +
     /// 全部 worker 退出），且全程无 panic / 无「no reactor running」类 abort
     /// （transport 与 runtime 的销毁顺序见 `dispose`）。
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_drains_inflight_then_stops() {
+    async fn drain_waits_inflight_then_stops() {
         let (sink, mut delivered) = collector();
-        // 在途 job 需 50ms 才完成：shutdown 必须等它，而不是直接扔下 runtime。
+        // 在途 job 需 50ms 才完成：drain 必须等它，而不是直接扔下 runtime。
         let slow = MailTarget::async_only(
             Duration::from_secs(5),
             Arc::new(|_e, _r| {
@@ -821,10 +926,10 @@ mod tests {
                 })
             }),
         );
-        let mut eng = MailEngine::with_targets(targets_with(slow), 2, 8, sink).expect("引擎");
+        let eng = MailEngine::with_targets(targets_with(slow), 2, 8, sink).expect("引擎");
 
         let _ = eng.submit(PROFILE, &req_raw(Some("j-drain"), true), vec![]);
-        eng.shutdown(Duration::from_secs(10))
+        eng.drain(Duration::from_secs(10))
             .expect("drain 应在超时内完成且 worker 全部退出");
 
         // drain 成功 ⇒ 在途 job 已完成并上送（上送发生在 worker 退出之前）。
@@ -840,13 +945,91 @@ mod tests {
             drive(&mut fut).await.is_err(),
             "停机后 submit 必须报错（不静默丢弃）"
         );
-        // 此处 drop 引擎（rt/transport 已在 shutdown 中销毁）——不得 panic。
+        // 此处 drop 引擎（rt/transport 已在 drain 中销毁）——不得 panic。
+    }
+
+    /// 控制报文 `{"__ctl":"drain","timeout_ms":N}` 的 req 形态。
+    fn ctl_drain_req(timeout_ms: u64) -> String {
+        json!({ CTL_KEY: CTL_DRAIN, "timeout_ms": timeout_ms }).to_string()
+    }
+
+    /// A4：**控制报文** drain（生产停机的唯一入口）—— 插件引擎是 `OnceLock` 单例（只给
+    /// `&`，`drain` 取不到 `&mut`），故 `submit({"__ctl":"drain"})` 必须能触发 graceful drain：
+    /// 等在途 job 跑完（结果照常上送）→ 回 `{code:0,data:{drained:true}}` → 此后 submit
+    /// fail-loud。ctl 路**同步**完成（drain 在 `submit` 内跑完才返回 ready future）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ctl_drain_waits_inflight_then_refuses_new_jobs() {
+        let (target, gate, mut started) = gated_target(Duration::from_secs(5));
+        let (sink, mut delivered) = collector();
+        let eng =
+            Arc::new(MailEngine::with_targets(targets_with(target), 2, 4, sink).expect("引擎"));
+
+        // 在途 job：worker 已取件并卡在闸门上（enqueue 语义 ⇒ 不等结果）。
+        let _ = eng.submit(PROFILE, &req_raw(Some("j-ctl"), true), vec![]);
+        started.recv().await.expect("worker 应已进入投递");
+
+        // 控制报文在 blocking 池里发（drain 是同步等待，不占 async 线程）。
+        let e = Arc::clone(&eng);
+        let handle = tokio::task::spawn_blocking(move || {
+            let fut = e.submit("", &ctl_drain_req(5_000), vec![]);
+            // ctl 路同步完成：首次 poll 即就绪（drain 已在 submit 内跑完）。
+            let code = (fut.poll)(fut.state);
+            assert_eq!(code, 1, "ctl drain 的 future 应即刻就绪（drain 同步完成）");
+            let taken: Result<RBytes, RString> = std::result::Result::from((fut.take)(fut.state));
+            (fut.free)(fut.state); // FfiFuture 无 Drop：free 由本侧显式配对
+            match taken {
+                Ok(b) => b.iter().copied().collect::<Vec<u8>>(),
+                Err(e) => panic!("ctl drain 回了 Err: {}", &e[..]),
+            }
+        });
+
+        // 放行在途 job：drain 必须等它跑完（而不是超时丢件）。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        gate.add_permits(1);
+        let out = handle.await.expect("drain 线程不得 panic");
+        let v: Value = serde_json::from_slice(&out).expect("ctl drain 回信封");
+        assert_eq!(v["code"], CODE_OK, "ctl drain 信封: {v}");
+        assert_eq!(v["data"]["drained"], true, "{v}");
+        assert_eq!(v["data"]["workers"], 2, "{v}");
+
+        // 在途 job 真跑完并上送了（drain 等到了，不是丢件）。
+        let (topic, payload) = delivered
+            .try_recv()
+            .expect("在途 job 的结果应在 drain 前上送");
+        assert_eq!(topic, TOPIC_MAIL_RESULT, "{payload:?}");
+        // 停机后一律 fail-loud：普通投递与再次 drain 都不再入队。
+        let mut fut = eng.submit(PROFILE, &req_raw(Some("j-after-ctl"), false), vec![]);
+        let e = drive(&mut fut).await.expect_err("停机后 submit 必须报错");
+        assert!(e.contains("停机"), "{e}");
+    }
+
+    /// 控制报文解析：未知 `__ctl` fail-loud（**不**静默当业务 req）；无 `__ctl` 的 req 走业务路
+    /// （故「非法 JSON」与「未知 profile」的错误文案仍来自业务路）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ctl_unknown_name_fails_loud_and_plain_req_takes_business_path() {
+        let eng = MailEngine::with_targets(
+            targets_with(ok_target(Duration::from_secs(1))),
+            1,
+            4,
+            DeliverSink::new(|_, _| {}),
+        )
+        .expect("引擎");
+
+        let mut fut = eng.submit(PROFILE, &json!({ CTL_KEY: "nope" }).to_string(), vec![]);
+        let e = drive(&mut fut).await.expect_err("未知控制报文必须 Err");
+        assert!(e.contains("nope") && e.contains(CTL_DRAIN), "{e}");
+
+        // 无 `__ctl` ⇒ 业务路（未知 profile 的既有文案，不被控制报文分支吞掉）。
+        let mut fut = eng.submit("no-such", &req_raw(Some("j-plain"), false), vec![]);
+        let e = drive(&mut fut).await.expect_err("未知 profile 仍报业务错");
+        assert!(e.contains("no-such"), "{e}");
+        assert!(eng.drain(Duration::from_secs(2)).is_ok());
     }
 
     /// TDD-5：未知 profile 必须 fail-loud（不回落 default）。
     #[tokio::test(flavor = "multi_thread")]
     async fn unknown_key_returns_error() {
-        let mut eng = MailEngine::with_targets(
+        let eng = MailEngine::with_targets(
             targets_with(ok_target(Duration::from_secs(1))),
             1,
             4,
@@ -859,7 +1042,7 @@ mod tests {
             .expect_err("未知 profile 必须 Err（不回落 default）");
         assert!(e.contains("typo"), "错误须含 key，便于定位: {e}");
         // 未入队（fast-fail）⇒ 队列空，drain 立即可完成。
-        assert!(eng.shutdown(Duration::from_secs(2)).is_ok());
+        assert!(eng.drain(Duration::from_secs(2)).is_ok());
     }
 
     /// TDD-5b：worker 侧的未知 key 兜底分支（submit 期已 fast-fail；直调内部函数覆盖）。
@@ -1002,7 +1185,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn attachment_count_mismatch_returns_code5() {
         let (sink, _delivered) = collector();
-        let mut eng =
+        let eng =
             MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 4, sink)
                 .expect("引擎");
         let v = submit_expect_fail(&eng, &req_assemble("j-mismatch", true), vec![]).await;
@@ -1012,14 +1195,14 @@ mod tests {
             "msg 须点明附件对齐失败: {v}"
         );
         assert_eq!(v["data"]["jobId"], "j-mismatch");
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+        assert!(eng.drain(Duration::from_secs(5)).is_ok());
     }
 
     /// 无 `raw` 且无正文 → `code:5`（**替换**阶段 4 的「缺 raw 未实现组装」）：不许发空信。
     #[tokio::test(flavor = "multi_thread")]
     async fn assemble_path_without_body_returns_code5() {
         let (sink, _delivered) = collector();
-        let mut eng =
+        let eng =
             MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 4, sink)
                 .expect("引擎");
         let req = json!({"from": "f@example.com", "to": ["t@example.com"], "jobId": "j-nobody"})
@@ -1031,7 +1214,7 @@ mod tests {
             msg.contains("text") && msg.contains("html"),
             "msg 须给下一步: {v}"
         );
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+        assert!(eng.drain(Duration::from_secs(5)).is_ok());
     }
 
     /// raw 路的结构化 `cc`/`bcc` 无对应报头（原文里的 Cc/Bcc 头会被剥离）→ 必须 fail-loud
@@ -1039,7 +1222,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn raw_path_rejects_cc_bcc_and_attachments() {
         let (sink, _delivered) = collector();
-        let mut eng =
+        let eng =
             MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 8, sink)
                 .expect("引擎");
 
@@ -1084,7 +1267,7 @@ mod tests {
         .await;
         assert!(env["msg"].as_str().unwrap().contains("附件"), "信封: {env}");
 
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+        assert!(eng.drain(Duration::from_secs(5)).is_ok());
     }
 
     /// 真 SMTP 路（不连网即失败）：端口 1 无监听 → `code:1`（网络/连接类），
@@ -1110,9 +1293,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn async_delivery_timeout_returns_network_code() {
         let (target, _gate, mut started) = gated_target(Duration::from_millis(50));
-        let mut eng =
-            MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
-                .expect("引擎");
+        let eng = MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
+            .expect("引擎");
         let mut fut = eng.submit(PROFILE, &req_raw(Some("j-timeout"), false), vec![]);
         // 先确认 worker **已进入投递**（否则下面测到的可能只是「还没开始」而非超时）。
         started.recv().await.expect("worker 应已进入投递");
@@ -1126,7 +1308,7 @@ mod tests {
             "msg 须为脱敏分类文案（无 SMTP 对话）: {v}"
         );
         assert!(
-            eng.shutdown(Duration::from_secs(5)).is_ok(),
+            eng.drain(Duration::from_secs(5)).is_ok(),
             "超时后 worker 应能正常 drain"
         );
     }
@@ -1148,9 +1330,8 @@ mod tests {
                 Err("blocked send".to_string())
             }),
         );
-        let mut eng =
-            MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
-                .expect("引擎");
+        let eng = MailEngine::with_targets(targets_with(target), 1, 4, DeliverSink::new(|_, _| {}))
+            .expect("引擎");
         let req = json!({
             "from": "from@example.com", "to": ["to@example.com"],
             "raw": "Subject: t\r\n\r\nbody", "sync": true, "jobId": "j-sync-timeout",
@@ -1165,7 +1346,7 @@ mod tests {
         assert_eq!(v["msg"], "投递超时", "{v}");
 
         let _ = release.send(()); // 放行阻塞线程
-        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+        assert!(eng.drain(Duration::from_secs(5)).is_ok());
     }
 
     /// design §10/§11「`msg` 脱敏（无账号/密码/令牌/SMTP 对话）」+「令牌不进信封」：
@@ -1253,17 +1434,17 @@ mod tests {
         drop(eng);
     }
 
-    /// 硬约束（模块头 §1）证据 · drain 路：`shutdown` 后各 worker 已退出并释放自己的强引用，
+    /// 硬约束（模块头 §1）证据 · drain 路：`drain` 后各 worker 已退出并释放自己的强引用，
     /// 于是 transport 的**最后一份强引用**在 `dispose` 里释放 —— 必须在 rt 上下文内
     /// （lettre `pool` 的 Drop 会 `tokio::spawn`）。
     ///
     /// 变异验证：去掉 `dispose` 的 `rt.enter()` → 本用例 panic（"there is no reactor running"）。
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_releases_pool_transports_inside_runtime_context() {
-        let mut eng = pool_engine(2);
-        eng.shutdown(Duration::from_secs(5))
+    async fn drain_releases_pool_transports_inside_runtime_context() {
+        let eng = pool_engine(2);
+        eng.drain(Duration::from_secs(5))
             .expect("空队列的 drain 应立即成功（worker 全部退出）");
-        drop(eng); // rt/targets 已在 shutdown 内销毁；此处不得 panic
+        drop(eng); // rt/targets 已在 drain 内销毁；此处不得 panic
     }
 
     /// 同一约束的**决定性**版本：同步上下文（进程退出 / 宿主非 async 路径）里线程上
@@ -1272,9 +1453,63 @@ mod tests {
     /// 分辨 —— 变异验证：去掉 `dispose` 里的 `rt.enter()`，本用例 panic
     /// "there is no reactor running"，异步那条仍绿。）
     #[test]
-    fn shutdown_from_sync_context_releases_pool_transports_in_rt_context() {
-        let mut eng = pool_engine(2);
-        eng.shutdown(Duration::from_secs(5))
+    fn drain_from_sync_context_releases_pool_transports_in_rt_context() {
+        let eng = pool_engine(2);
+        eng.drain(Duration::from_secs(5))
             .expect("空队列的 drain 应立即成功（worker 全部退出）");
+    }
+
+    /// A3：**在途 job** + **真 pool transport**（非注入桩）+ 两条「丢弃在途」的销毁路径
+    /// （非 graceful `Drop` 与 drain 超时→`dispose`）都必须无 panic。
+    ///
+    /// 真 pool transport 指向「只 accept、永不应答」的本地监听：SMTP 握手挂在投递中，
+    /// job 跑不完 ⇒ worker 帧（连同它捕获的 `targets` 强引用与在途投递 future）只能在
+    /// runtime 停机时被丢弃。lettre `pool` 的 Drop 会 `tokio::spawn`（`pool/async_impl.rs:262`），
+    /// 故「最后一份强引用的销毁点是否有 runtime 上下文」是这条路径的成败关键。
+    ///
+    /// **实测结论（本用例在当前依赖下是绿的，非「先红后绿」）**：tokio 1.53 在
+    /// `shutdown_background` 取消未完成任务时会先进入 runtime 上下文
+    /// （`OwnedTasks::shutdown` 走 `try_enter_blocking_region`，实测 `Handle::try_current()`
+    /// 为 `Ok`、`tokio::spawn` 成功），故**没有**出现「无上下文析构 → panic」。
+    /// 但这属于 tokio 的实现细节：worker 帧的释放点若晚于退出信号，正确性就不再由本模块
+    /// 的顺序保证所决定（见 `with_rt` 的「顺序即契约」注释）——本用例因此是**回归护栏**
+    /// （钉住「两条丢弃路径都不得 panic」），而非该 bug 的判定证据。
+    #[test]
+    fn discarding_inflight_pool_job_does_not_panic() {
+        // 真监听：accept 后只持有连接、不读不写 ⇒ SMTP 问候永不到来 ⇒ 投递挂住。
+        fn hanging_listener() -> u16 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for c in listener.incoming().flatten() {
+                    held.push(c);
+                }
+            });
+            port
+        }
+        fn engine_to(port: u16) -> MailEngine {
+            let cfg = MailConfig::parse(&format!(
+                r#"{{"workers":1,"queue_capacity":4,"default":{{"host":"127.0.0.1","port":{port},"tls":"none","allow_none_tls":true,"mechanism":"login","timeout":30}}}}"#
+            ))
+            .expect("cfg");
+            MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎")
+        }
+
+        // (1) 非 graceful Drop：不 drain，直接丢弃（在途 job 随 runtime 一起丢）。
+        let eng = engine_to(hanging_listener());
+        let _ = eng.submit(PROFILE, &req_raw(Some("j-drop"), true), vec![]);
+        std::thread::sleep(Duration::from_millis(500));
+        drop(eng);
+
+        // (2) drain 超时：在途 job 挂住 ⇒ drain 到点返回 Err，随后 dispose（同样丢在途）。
+        let eng = engine_to(hanging_listener());
+        let _ = eng.submit(PROFILE, &req_raw(Some("j-drain-timeout"), true), vec![]);
+        std::thread::sleep(Duration::from_millis(500));
+        let e = eng
+            .drain(Duration::from_millis(200))
+            .expect_err("在途 job 挂住 ⇒ drain 必须超时报错");
+        assert!(e.contains("超时"), "{e}");
+        drop(eng); // rt/targets 已在 drain 内销毁；此处不得 panic
     }
 }

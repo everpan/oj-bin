@@ -41,6 +41,24 @@
     第 6 章 mail 小节。
 
 **修复**
+- **mail 统一审查批次 A：enqueue 契约 / worker 强引用释放顺序 / 停机 drain 可达 / 忙等**
+  - **`enqueue` 回统一信封**（Blocker）：插件引擎原回**裸** `{jobId}`，与三层公开契约
+    （`global.d.ts`、`api-manual` §6、`mail-smtp.md` §6「`res.data.jobId`」）不符 ——
+    用户按手册写 `res.data.jobId` 会 TypeError 且拿不到 jobId 去 `mail.result()` 回查。
+    引擎改回 `{code:0,msg:"ok",data:{jobId}}`；宿主加**纵深防御**（插件返回顶层无 `code`
+    时包成信封，容忍旧/第三方裸载荷）；新增**真插件** e2e（`oj/tests/mail_e2e.rs` 的
+    enqueue 用例：统一信封 + 以同队列 `send` 作屏障后 `mail.result(jobId)` 必命中）。
+  - **停机 graceful drain 生产可达**（Important）：`MailEngine::shutdown` 此前只被测试调用
+    （`allow(dead_code)`，引擎是插件内 `OnceLock` 单例、进程退出不 Drop）⇒ 生产停机实际**丢在途
+    邮件**，与文档宣称矛盾。改为**零 ABI 变更**的控制报文 `{"__ctl":"drain","timeout_ms":N}`
+    （走既有 `MailVtable::submit`），宿主在停机路径（`server_cmd` 的 SIGTERM/正常退出，
+    HTTP 停收 + 任务收场之后）经 `App::drain_mail` 调用；总超时 10s，超时告警不阻断退出。
+    新增 `oj/tests/mail_drain_e2e.rs`（真装配 + 真插件：排空后新投递被拒，证明报文到达插件）。
+  - **worker 强引用释放顺序**（Important）：`async move` 块的捕获变量只在 **future 被 drop**
+    时释放（实测），故 worker 帧里的 transport 强引用晚于退出信号释放 —— 注释声称的顺序保证
+    不成立。改为在发退出信号**之前**按依赖序显式 `drop(targets)/drop(deliver)/drop(rx)`，
+    使 transport 的最后一份强引用销毁点确定落在 `rt.enter()` 内（不再依赖 tokio 回收任务的
+    实现细节）；补「在途 job + 真 pool transport + Drop/drain 超时两条路径」回归护栏。
 - **IDE 类型：`#` 别名报 TS2307、`QueryBuilder`/`json` 声明滞后**（`sample/global.d.ts`、
   `sample/tsconfig.json`、`sample/types/oj-modules.d.ts`）：
   - `QueryBuilder` 补 `join`（`{left,right}[]` + kind）/`distinct`/`groupBy`/`having`/`union`/`with`/`toJSON`；

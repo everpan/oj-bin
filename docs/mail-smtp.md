@@ -167,6 +167,10 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 mai
 - 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > `<exe>/plugins` > `<workspace_root>/bin/plugins`，再拼 `<host-triple>/`。
 - **未装插件不阻断启动**；调用 mail 时报 `mail not configured`（可选能力）。
 - 多 profile 复用同一队列/线程池；`workers`/`queue_capacity` 全局，`timeout` 每 profile。
+- **停机 graceful drain**：`oj server` 收到 SIGTERM/正常退出时，在 HTTP 停收 + 长任务收场**之后**
+  会触发排空 —— 插件停收新投递 → 等在途 job 跑完 → 销毁 transport；总超时 **10s**，
+  超时只告警（`warn: mail drain 未完成：…（在途邮件可能被丢弃）`）并不阻断进程退出。
+  排空后仍在跑的 handler 再发信会拿到 `{code:1}`（文案含「停机」）。
 
 ## 9. 已知限制 / 路线
 
