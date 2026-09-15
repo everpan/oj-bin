@@ -1,10 +1,24 @@
 # 设计文档：lettre SMTP 绑定（v0.1.19，插件实现）
 
-- 日期：2026-09-15（初稿）→ v2（依架构师/工程师/安全工程师评审）→ **v3（自洽性总检，按真实代码事实校正）**
-- 状态：已脑暴 + 三方评审 + 自洽复核，待实现
+- 日期：2026-09-15（初稿）→ v2（三方评审）→ v3（自洽性总检）→ **v4（实现期定稿，随阶段 0–6 落地同步）**
+- 状态：阶段 0–6 已实现（阶段 7 装配/e2e、阶段 8 加固验收待做）；本文档与实现同步
 - 实现形态：**cdylib 插件 `oj-mail`**（非内建 op），新增 `mail` 轴。
 
 ## 0. 版本修订
+
+**v4（实现期定稿；随阶段 0–6 同步，均为实测结论）**
+- **lettre 依赖（阶段 0 spike）**：`lettre 0.11` + `rustls = "=0.23.40"` 单一版本、**无 ring**。feature 必须为 `builder,smtp-transport,tokio1,tokio1-rustls,rustls-no-provider,webpki-roots,aws-lc-rs,hostname,pool,file-transport`；**不得**用 `rustls-tls`（其 `= ["webpki-roots","rustls","ring"]` 会强拉 `rustls/ring` 与框架 aws-lc-rs 双 provider）。宿主侧仅用 `lettre::Address` 做校验（`default-features=false`，不引 TLS 栈）。
+- **硬约束**：provider 安装**必先于**任何 transport 构建（`relay()` 立即建 ClientConfig）；`pool` 在 transport **构建期与 Drop 期**都会 `tokio::spawn` → transport 全生命周期（建/用/毁）必须在插件自身 `multi_thread` runtime 上下文内。
+- **lettre 0.11.23 无 `Credentials::from_xoauth2`**：xoauth2 首版实为 `Credentials::new(user, access_token)` + `.authentication(vec![Xoauth2])`；`refresh_token`-only → fail-loud。
+- **`build_raw` 不经 lettre 重编码**（`MessageBuilder::body` 在行长 ≥76 会改 QP/base64 把已编码 multipart 改烂；强制原样路径在非法编码时 `expect` panic）→ raw 路自行归一 CRLF 并原样输出。
+- **raw 冲突头口径（定稿）**：剥离 `From/To/Cc/Bcc`（信封权威）；**保留 `Subject`**（Subject 非信封字段，剥离只会丢主题；注入由 CRLF 拒绝覆盖），结构化 `subject` 非空则覆盖。
+- **附件对齐契约**：插件按**下标**取 `atts[i].bytes` 对应 `req.attachments[i]`，**数量必须一致**（不一致 → `code:5`）；宿主按同序解析生成 `RVec<MailAttachment>`，字节直传 `RBytes`（无 base64/JSON）。
+- **宿主校验口径**：`subject`/`headers` **剥离** CRLF；`from/to/cc/bcc` 用 `lettre::Address` **拒绝**非法；正文与 `raw` 原文不剥（换行有语义）。校验失败 **resolve `{code:5}` 信封**；仅「未配置 mail」抛异常（对齐 `es not configured`）。
+- **白名单 fail-closed**：`allowed_from`/`allowed_recipients` **空表即拒绝**（越权发送的唯一控制点）。
+- **信封与模式**：统一 `{code,msg,data:{jobId,messageId}}`；`enqueue` 返回 `{code:0,data:{jobId}}`（非裸 jobId，JS 取 `res.data.jobId`）；**宿主按 op 覆写 `sync`/`enqueue_only`**（`send()` 夹带 `sync:true` 不生效）。JS 另有 `Mail.profiles()`（`op_mail_profiles` 的可达入口）。
+- **`mail.result` 仅本地同步扇出**：`HostContext.deliver` 是同步 `extern "C"`（不能 await）→ 宿主仅做本地 `bus` 订阅扇出；**跨进程/分布式反馈显式延后**（见 §13）。
+- **`ensure_within` 提 `pub(crate)` 且返回 canonical 路径**：附件 `{path}` 用**返回的 canonical 句柄** `fs::read`（校验路径 ≡ 读盘路径，避免 TOCTOU）。
+- **`FfiFuture` 驱动复用** `ffi::await_ffi`（与 `FfiEsBackend`/`FfiBlobBackend`/`FfiEventBroker` 同一 poll+yield 驱动），未引入新的跨线程手段。
 
 **v3（自洽性校正，按代码事实）**
 - **新增轴零 ABI 变更**：CLAUDE.md 明示「加轴零破坏，既有轴 vtable 形状变更才 bump ABI」，`mq` 轴即先例（其注释：新增轴，ABI 保持 7）。故 `mail` 轴**不 bump `ABI_VERSION`**（保持 8）——v2/v3 早稿的「8→9」有误。
@@ -95,8 +109,10 @@ await mail.send({
     { filename: "x.pdf", path: "reports/x.pdf" }
   ]
 });
-const jobId = await mail.enqueue({ from, to, subject, text });
-// 反馈：bus 主题 mail.result 推 { jobId, code, msg, messageId }（不含 to/subject）
+const r = await mail.enqueue({ from, to, subject, text });
+const jobId = r.data.jobId;                       // 统一信封：{code,msg,data:{jobId}}
+// 反馈：本地 bus 主题 mail.result 推扁平 { jobId, code, msg, messageId }（不含 to/subject）
+// 另有 mail.result(id) 查结果、Mail.profiles() 列 profile key。
 ```
 
 > `send` 与 `sendSync` **对 JS 均非阻塞**（经队列 + FfiFuture await）；区别仅内部走 async / sync transport。
@@ -149,7 +165,7 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 
 - `code`：连接/网络→`1`、5xx→`2`、鉴权→`3`、队列满→`4`、地址/白名单校验→`5`。`data:{jobId,messageId?}`。
 - **CRLF 注入防护**：`subject`/`headers`/地址先剥 `\r\n`；`from/to/cc/bcc` 经 `lettre::Address` 强校验，非法即 `code:5`。
-- **白名单**：`from` 匹配 `allowed_from` 后缀、`to/cc/bcc` 匹配 `allowed_recipients` 后缀，否则 `code:5`。
+- **白名单（fail-closed）**：`from` 匹配 `allowed_from` 后缀、`to/cc/bcc` 匹配 `allowed_recipients` 后缀，否则 `code:5`；**空表即拒绝**（缺省不放行）。
 - `msg` 脱敏（无账号/密码/令牌/SMTP 对话）；bus 反馈仅 `jobId/messageId/code`。
 - 每 job `tokio::time::timeout(profile.timeout)`；超时 `code:1`+`"timeout"`。
 - 背压：插件 mpsc 有界，`try_send`；满则 `submit` 立即回 `code:4`，不冻结 JS 事件循环；`enqueue` 回失败 jobId。
@@ -181,7 +197,8 @@ const jobId = await mail.enqueue({ from, to, subject, text });
 - **lettre 依赖（阶段 0 spike 定稿，方案 B）**：`lettre 0.11`（实测 0.11.23）+ `rustls = "=0.23.40"` 单一版本（无 ring）。feature 集必须为 `builder, smtp-transport, tokio1, tokio1-rustls, rustls-no-provider, webpki-roots, aws-lc-rs, hostname, pool, file-transport`——**不得用 `rustls-tls`/`tokio1-rustls-tls`**（其 `rustls-tls = ["webpki-roots","rustls","ring"]` 会强拉 `rustls/ring`，与框架 aws-lc-rs 形成双 provider）。
 - **provider 安装顺序（硬约束）**：`relay()` 立即构建 ClientConfig → 插件 init 必须**先** `install_default(aws_lc_rs)` **再**建 transport。
 - **`pool` 运行时约束**：lettre `pool` 在 transport `Drop` 时 `tokio::spawn` → transport 的**创建/使用/销毁都必须在该插件自己的 tokio runtime 内**（否则析构期 abort）。
-- `deliver("mail.result")` 与既有 bus 订阅扇出的路由约定需对齐（宿主统一路由：存结果 + 扇出）。
+- `deliver("mail.result")` 与既有 bus 订阅扇出的路由约定需对齐（宿主统一路由：存结果 + 本地扇出）。
+- **跨进程/分布式反馈（延后）**：`HostContext.deliver` 是同步 `extern "C"`，宿主无法在其中 `await` 分布式 `EventBroker::publish`；首版仅本地 `bus` 扇出。若需跨进程 `mail.result`，后续另立方案（如宿主持 runtime handle 后 `spawn` 异步发布）。
 
 ## 14. 里程碑
 

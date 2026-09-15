@@ -568,6 +568,8 @@ Expected: FAIL
 
 **Files:** Create: `oj/tests/mail_e2e.rs`；Modify: `sample/config.yaml`（`smtp.mock` profile）
 
+> **阶段 6 定稿影响**：白名单 **fail-closed**（空表即拒绝）→ `smtp.mock` 必须**显式**写 `allowed_from` 与 `allowed_recipients`，否则 `mail.send` 一律 `code:5`。另 `tls: none` 需显式 `allow_none_tls: true`。
+
 **Step 1: 失败测试**
 
 ```rust
