@@ -948,6 +948,9 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 
 ### mail —— 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）
 
+> 完整手册（架构/插件内幕/附件与 raw 语义/反馈通道/安全清单/运维与已知限制）：
+> `docs/mail-smtp.md`。本节为业务速查。
+
 配顶层 `smtp:` 段即启用全局 `Mail` / `mail`（`mail === new Mail("default")`）；未配置时调用报
 `mail not configured (config smtp: section missing, or oj-mail plugin not loaded)`。
 **投递**在 `oj-mail` 插件内（lettre 连接池 + 有界队列 + worker 池）；**宿主**负责入参校验
