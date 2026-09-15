@@ -20,9 +20,9 @@
 //! ## 分期边界
 //!
 //! 消息组装（text/html/headers/附件 MIME）与附件字节消费归**阶段 5**（`message.rs`）：
-//! worker 投递前按 `req.raw` 有无二选一 —— 有 `raw` → 原文，无 → 结构化组装。
+//! worker 投递前按 `req.raw` 有无二选一 —— 有 `raw` → 原文（剥离冲突头），无 → 结构化组装。
 
-use crate::message::{SendRequest, build_message, envelope_of};
+use crate::message::{SendRequest, build_message, build_raw, envelope_of};
 use crate::{build_profiles, config::MailConfig};
 use lettre::address::Envelope;
 use oj_plugin_ffi::{FfiFuture, MailAttachment, ready_err, ready_ok, spawn_ffi_future};
@@ -490,14 +490,21 @@ async fn deliver_one(job: &Job, targets: &HashMap<String, MailTarget>) -> String
 /// 由 req 组装投递入参（**阶段 5 的两条路**，错误码一律 `code:5`）：
 ///
 /// - `req.raw` 有 → 原文路：信封由结构化 `from`/`to` 生成（与原文报头**解耦**，防双收件人），
-///   正文按原文字节投递；
+///   正文取 [`build_raw`] 剥离冲突头后的字节；
 /// - 否则 → 结构化组装：`build_message` 出 [`lettre::Message`]，信封由 lettre 按其报头派生
 ///   （To ∪ Cc ∪ Bcc，且 `Bcc` 报头已丢弃）。
 fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8>), (i32, String)> {
     let m = &req.message;
     if let Some(raw) = m.raw.as_deref() {
-        // vtable 契约：raw 给定时宿主不解析附件（atts 必为空）。非空 = 调用方把两条路混用了。
-        if !m.attachments.is_empty() || !atts.is_empty() {
+        // raw 路：报头由原文承载，故结构化 cc/bcc **无处安放** —— 静默丢件或塞进 To 头
+        // （泄露 Bcc）都不可接受，直接 fail-loud。
+        if !m.cc.is_empty() || !m.bcc.is_empty() {
+            return Err((
+                CODE_VALIDATION,
+                "raw 路不支持结构化 cc/bcc（原文的 Cc/Bcc 头会被剥离）：请把它们并入 to，或改走结构化组装（去掉 raw）".to_string(),
+            ));
+        }
+        if !m.attachments.is_empty() {
             return Err((
                 CODE_VALIDATION,
                 "raw 与附件互斥：raw 给定时附件必须为空（vtable 契约：宿主不为 raw 解析附件）"
@@ -505,7 +512,8 @@ fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8
             ));
         }
         let envelope = envelope_of(&m.from, &m.to).map_err(|e| (CODE_VALIDATION, e))?;
-        return Ok((envelope, raw.as_bytes().to_vec()));
+        let bytes = build_raw(&envelope, raw, atts).map_err(|e| (CODE_VALIDATION, e))?;
+        return Ok((envelope, bytes));
     }
     let msg = build_message(m, atts).map_err(|e| (CODE_VALIDATION, e))?;
     Ok((msg.envelope().clone(), msg.formatted()))
@@ -880,6 +888,36 @@ mod tests {
         );
     }
 
+    /// raw 路：原文冲突头（From/To/Subject）被剥离、其余头与正文保留，报头由结构化信封重建
+    /// —— 防「双收件人 / 发件人 spoof」。同样以**落盘 `.eml`** 为证。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_path_sends_stripped_raw_and_rebuilt_envelope_headers() {
+        let dir = temp_dir("engine-raw");
+        let eng = file_engine(&dir);
+        let req = json!({
+            "from": "from@example.com",
+            "to": ["to@example.com"],
+            "jobId": "j-raw-1",
+            "raw": "From: evil@x\nTo: victim@x\nSubject: 被剥离\nX-Keep: 1\n\nbody",
+        })
+        .to_string();
+        let eml = submit_and_read_eml(&eng, &req, vec![], &dir).await;
+
+        assert!(
+            eml.contains("X-Keep: 1") && eml.contains("body"),
+            "其余头与正文保留: {eml}"
+        );
+        assert!(
+            !eml.contains("evil@x") && !eml.contains("victim@x"),
+            "冲突头已剥离: {eml}"
+        );
+        assert!(!eml.contains("被剥离"), "原文 Subject 已剥离: {eml}");
+        assert!(
+            eml.contains("From: from@example.com") && eml.contains("To: to@example.com"),
+            "报头由结构化信封重建: {eml}"
+        );
+    }
+
     /// 附件下标对齐失败（请求声明 N 个、宿主解析出 M 个）必须 `code:5` fail-loud，
     /// 绝不静默把没字节的附件发出去（`message.rs` 的对齐契约）。
     #[tokio::test(flavor = "multi_thread")]
@@ -914,6 +952,59 @@ mod tests {
             msg.contains("text") && msg.contains("html"),
             "msg 须给下一步: {v}"
         );
+        assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
+    }
+
+    /// raw 路的结构化 `cc`/`bcc` 无对应报头（原文里的 Cc/Bcc 头会被剥离）→ 必须 fail-loud
+    /// 而不是静默丢件 / 把 Bcc 塞进 To 头；raw 与附件同样互斥（vtable 契约）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_path_rejects_cc_bcc_and_attachments() {
+        let (sink, _delivered) = collector();
+        let mut eng =
+            MailEngine::with_targets(targets_with(ok_target(Duration::from_secs(5))), 1, 8, sink)
+                .expect("引擎");
+
+        for extra in [
+            json!({"cc": ["c@example.com"]}),
+            json!({"bcc": ["b@example.com"]}),
+        ] {
+            let mut v = json!({
+                "from": "f@example.com",
+                "to": ["t@example.com"],
+                "raw": "X-Keep: 1\n\nbody",
+                "jobId": "j-raw-cc",
+            });
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            let env = submit_expect_fail(&eng, &v.to_string(), vec![]).await;
+            assert_eq!(env["code"], CODE_VALIDATION, "信封: {env}");
+            assert!(
+                env["msg"].as_str().unwrap().contains("cc/bcc"),
+                "信封: {env}"
+            );
+        }
+
+        // raw + 声明附件（宿主按契约不解析 → 走 refs 校验）与 raw + 已解析字节，两者都拒。
+        let mut v = json!({
+            "from": "f@example.com",
+            "to": ["t@example.com"],
+            "raw": "X-Keep: 1\n\nbody",
+            "jobId": "j-raw-att",
+            "attachments": [{"filename": "a.pdf", "blobKey": "k"}],
+        });
+        let env = submit_expect_fail(&eng, &v.to_string(), vec![]).await;
+        assert!(env["msg"].as_str().unwrap().contains("附件"), "信封: {env}");
+
+        v["attachments"] = json!([]);
+        let env = submit_expect_fail(
+            &eng,
+            &v.to_string(),
+            vec![att_bytes("a.pdf", "application/pdf", b"x")],
+        )
+        .await;
+        assert!(env["msg"].as_str().unwrap().contains("附件"), "信封: {env}");
+
         assert!(eng.shutdown(Duration::from_secs(5)).is_ok());
     }
 

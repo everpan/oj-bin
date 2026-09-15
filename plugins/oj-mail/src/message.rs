@@ -6,10 +6,9 @@
 //!   `headers`/`attachments` → `lettre::Message`（text+html → `multipart/alternative`；
 //!   有附件 → 外层 `multipart/mixed`）。信封（MAIL FROM / RCPT TO）由 lettre 从报头派生
 //!   （To ∪ Cc ∪ Bcc；`Bcc` 报头在派生后按 lettre 默认丢弃 → 收件人可见性正确）。
-//! - **原文投递**：`raw` 是调用方自备的 RFC5322 原文，由 `engine` 按原字节交给 transport
-//!   —— **不**经 lettre 的 MIME 组装（`Message::body` 会按「最优编码」重编码正文，行 ≥76
-//!   字节就改用 quoted-printable/base64，已编码的 multipart 原文会被改烂）。信封与报头的
-//!   解耦见 `engine::deliver_input`。
+//! - **原文投递**（[`build_raw`]）：`raw` 是调用方自备的 RFC5322 原文，**字节原样**送出，
+//!   仅剥离冲突头（见下）。**不**经 lettre 的 MIME 组装 —— `Message::body` 会按「最优编码」
+//!   重编码（行 ≥76 字节即改用 quoted-printable/base64），已编码的 multipart 原文会被改烂。
 //!
 //! ## 附件对齐契约（宿主 ↔ 插件）
 //!
@@ -286,6 +285,116 @@ fn custom_header(name: &str, value: &str) -> Result<HeaderValue, String> {
     Ok(HeaderValue::new(n, value.to_string()))
 }
 
+/// raw 路：剥离冲突头后的**最终 RFC5322 字节**（信封由调用方另行交给 transport）。
+///
+/// 与 [`build_message`] 不同，这里不经 lettre 组装：原文（除冲突头与行尾）逐字节保留。
+/// 失败一律 `Err(原因 + 下一步)`（由 `engine` 映射为 `code:5`）。
+///
+/// ## 为什么不让 lettre 组装 raw
+///
+/// `MessageBuilder::body` 会按「最优编码」重编码正文（行 ≥76 字节就改 quoted-printable /
+/// base64），而 `Content-Type`/`Content-Transfer-Encoding` 等原文报头是**原样保留**的 ——
+/// 一个 base64 分块的 multipart 原文会被 `multipart/*` 报头 + base64 正文的组合改烂
+/// （收件端解析不出任何 part）。故 raw 路自己拼字节。
+///
+/// ## 行尾一律归一 CRLF
+///
+/// SMTP DATA 的帧界是 CRLF，而 lettre 的送出侧只做**点填充**（`ClientCodec`）不做行尾
+/// 归一：裸 LF 之后的行首 `.` 不会被填充，中间 MTA 可据此提前结束 DATA → 余下内容被当
+/// 命令执行（SMTP smuggling）。故这里把头/正文的行尾统一成 CRLF；正文其余字节不动。
+pub fn build_raw(
+    envelope: &Envelope,
+    raw: &str,
+    atts: &[MailAttachment],
+) -> Result<Vec<u8>, String> {
+    // vtable 契约：raw 给定时宿主不解析附件（atts 必为空）。非空 = 调用方把两条路混用了。
+    if !atts.is_empty() {
+        return Err(
+            "raw 与附件互斥：raw 给定时附件必须为空（vtable 契约：宿主不为 raw 解析附件）"
+                .to_string(),
+        );
+    }
+    let from = envelope
+        .from()
+        .ok_or_else(|| "raw 路缺少信封发件人（MAIL FROM）：请给出结构化 from".to_string())?;
+    let (head, body) = split_head_body(raw);
+
+    let mut out = String::with_capacity(raw.len() + 96);
+    // 报头自结构化信封重建（原文的 From/To/Cc/Bcc/Subject 已剥离 → 不存在双收件人/spoof）。
+    out.push_str(&format!("From: {from}\r\n"));
+    let rcpt: Vec<String> = envelope.to().iter().map(Address::to_string).collect();
+    out.push_str(&format!("To: {}\r\n", rcpt.join(", ")));
+    for line in kept_header_lines(head) {
+        out.push_str(line);
+        if !line.ends_with('\n') {
+            out.push('\n'); // 无空行的「全是头」原文：补上行尾，别把正文粘到最后一个头上
+        }
+    }
+    out.push_str("\r\n"); // 头/正文分隔空行
+    out.push_str(body);
+    Ok(normalize_crlf(&out).into_bytes())
+}
+
+/// 头部区中**保留**的行（含原行尾）：剥离冲突头，其余头（及其折行续行）原样保留。
+///
+/// 折行（continuation，行首为空格/TAB）归属**上一个头**：上一个头被剥离时，它的续行一并
+/// 丢弃 —— 否则续行会变成无主行（既可能被收件端当成前一个保留头的续行，也可能孤零零
+/// 触发解析错误）。
+fn kept_header_lines(head: &str) -> Vec<&str> {
+    let mut kept = Vec::new();
+    let mut keep_prev = false;
+    for line in head.split_inclusive('\n') {
+        let bare = bare_line(line);
+        if bare.starts_with(' ') || bare.starts_with('\t') {
+            if keep_prev {
+                kept.push(line);
+            }
+            continue;
+        }
+        // `Name: value` → 取 `Name`；无冒号的行无从判定冲突，按「保留」处理（不猜不吞）。
+        let name = bare.split(':').next().unwrap_or(bare);
+        keep_prev = !CONFLICTING_HEADERS
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h));
+        if keep_prev {
+            kept.push(line);
+        }
+    }
+    kept
+}
+
+/// 头部区与正文的分界 = 首个空行。返回 `(头部区, 正文)`；无空行 ⇒ 全是头、无正文。
+fn split_head_body(raw: &str) -> (&str, &str) {
+    let mut end = 0usize;
+    for line in raw.split_inclusive('\n') {
+        if bare_line(line).is_empty() {
+            return (&raw[..end], &raw[end + line.len()..]);
+        }
+        end += line.len();
+    }
+    (raw, "")
+}
+
+/// 去掉行尾 `\n` 与 `\r`（只看行尾，不动行内内容）。
+fn bare_line(line: &str) -> &str {
+    let l = line.strip_suffix('\n').unwrap_or(line);
+    l.strip_suffix('\r').unwrap_or(l)
+}
+
+/// 行尾归一到 CRLF（裸 LF → CRLF；已有 CRLF 不动；裸 CR 保留）。
+fn normalize_crlf(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 8);
+    let mut prev_cr = false;
+    for ch in s.chars() {
+        if ch == '\n' && !prev_cr {
+            out.push('\r');
+        }
+        out.push(ch);
+        prev_cr = ch == '\r';
+    }
+    out
+}
+
 /// 拒绝含 CR/LF 的值（头注入纵深防线；主防线是宿主的过线前剥离）。
 fn ensure_no_crlf(value: &str, field: &str) -> Result<(), String> {
     if value.contains(['\r', '\n']) {
@@ -300,6 +409,14 @@ fn ensure_no_crlf(value: &str, field: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use oj_plugin_ffi::{RBytes, RString};
+
+    fn addr(s: &str) -> Address {
+        s.parse().expect("测试地址")
+    }
+
+    fn envelope() -> Envelope {
+        Envelope::new(Some(addr("from@example.com")), vec![addr("to@example.com")]).expect("信封")
+    }
 
     /// vtable 侧的附件字节（宿主解析结果）。
     fn att(filename: &str, mime: &str, bytes: &[u8]) -> MailAttachment {
@@ -542,5 +659,79 @@ mod tests {
         let e = envelope_of("from@example.com", &["t@example.com".to_string()]).expect("信封");
         assert_eq!(e.to().len(), 1);
         assert!(e.from().is_some());
+    }
+
+    // ---- Task 5.2：raw 冲突头剥离 ----
+
+    #[test]
+    fn raw_strips_from_to_cc_bcc_subject_case_insensitively() {
+        let raw = "From: evil@x\nTo: victim@x\nSUBJECT: s\nCc: c@x\nX-Keep: 1\n\nbody";
+        let m = build_raw(&envelope(), raw, &[]).expect("剥离");
+        let s = String::from_utf8(m).expect("UTF-8");
+        assert!(
+            s.contains("X-Keep: 1") && s.contains("body"),
+            "其余头与正文保留: {s}"
+        );
+        assert!(
+            !s.contains("evil@x") && !s.contains("victim@x"),
+            "原文冲突头已剥离: {s}"
+        );
+        assert!(!s.contains("c@x"), "原文 Cc 已剥离: {s}");
+        assert!(
+            s.contains("From: from@example.com") && s.contains("To: to@example.com"),
+            "报头由结构化信封重建: {s}"
+        );
+    }
+
+    #[test]
+    fn raw_strips_folded_continuation_of_stripped_header_only() {
+        let raw = "X-Fold: a\n  keep-me\nFrom: evil@x\n\tleak-me\nX-Two: 2\n\nbody";
+        let s = String::from_utf8(build_raw(&envelope(), raw, &[]).expect("剥离")).expect("UTF-8");
+        assert!(
+            s.contains("X-Fold: a") && s.contains("keep-me"),
+            "保留头的折行保留: {s}"
+        );
+        assert!(!s.contains("leak-me"), "被剥离头的折行不得残留: {s}");
+        assert!(s.contains("X-Two: 2"), "{s}");
+    }
+
+    #[test]
+    fn raw_normalizes_lone_lf_to_crlf_and_keeps_body_otherwise_verbatim() {
+        let raw = "X-A: 1\n\nline1\n.\nline2";
+        let s = String::from_utf8(build_raw(&envelope(), raw, &[]).expect("剥离")).expect("UTF-8");
+        assert!(s.contains("X-A: 1\r\n"), "头行归一为 CRLF: {s}");
+        assert!(
+            !s.contains("\n.\n"),
+            "裸 LF 后的行首点号是 SMTP smuggling 面（dot-stuffing 需要 CRLF）: {s}"
+        );
+        assert!(s.contains("line1\r\n.\r\nline2"), "正文除行尾外不改: {s}");
+        assert!(s.ends_with("line2"), "正文尾部不多不少: {s}");
+    }
+
+    #[test]
+    fn raw_rejects_attachments_and_missing_sender() {
+        let e = build_raw(
+            &envelope(),
+            "X-A: 1\n\nb",
+            &[att("a.pdf", "application/pdf", b"x")],
+        )
+        .expect_err("raw 与附件互斥");
+        assert!(e.contains("附件"), "{e}");
+
+        let senderless = Envelope::new(None, vec![addr("to@example.com")]).expect("信封");
+        assert!(
+            build_raw(&senderless, "X-A: 1\n\nb", &[]).is_err(),
+            "缺发件人必须 Err"
+        );
+    }
+
+    #[test]
+    fn raw_without_blank_line_keeps_headers_and_empty_body() {
+        let s =
+            String::from_utf8(build_raw(&envelope(), "X-A: 1", &[]).expect("剥离")).expect("UTF-8");
+        assert!(
+            s.contains("X-A: 1\r\n\r\n"),
+            "无空行时按「全是头、空正文」处理: {s}"
+        );
     }
 }
