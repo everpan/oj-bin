@@ -313,9 +313,10 @@ pub(crate) fn install_mail_deliver(b: &Arc<dyn MailBackend>) {
 
 /// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点结果（**细分两种失败**：告警文案要能
 /// 分辨「没配 mail」与「载荷非法」——两者都被丢弃，但排障方向完全不同）。
+/// 扇出订阅者数只在 [`MailResultRouter::route`] 的返回值里（告警路径不需要它）。
 pub(crate) enum DeliverRoute {
-    /// 有后端接管：已存结果并扇出给 n 个本地订阅者。
-    Routed(usize),
+    /// 有后端接管：已存结果并扇出（扇出数见 `MailResultRouter::route`）。
+    Routed,
     /// 未配置 mail（`StableState.mail` 为空，或弱引用已失效）。
     NotConfigured,
     /// 载荷不是可索引的完成结果（非 JSON，或缺 `jobId`/`code`/`msg`）。
@@ -334,7 +335,7 @@ pub(crate) fn route_deliver(payload: &[u8]) -> DeliverRoute {
         return DeliverRoute::NotConfigured;
     };
     match b.router().route(payload) {
-        Some(n) => DeliverRoute::Routed(n),
+        Some(_) => DeliverRoute::Routed,
         None => DeliverRoute::BadPayload,
     }
 }
@@ -1200,7 +1201,7 @@ mod tests {
             );
         }
         // 合法信封 → Routed（对照：不是所有载荷都被判非法）。
-        assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::Routed(_)));
+        assert!(matches!(route_deliver(ENVELOPE), DeliverRoute::Routed));
         assert!(fake.router().get("j1").is_some());
     }
 
