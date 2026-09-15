@@ -50,7 +50,8 @@ smtp:
     mechanism: login         # login | xoauth2
     user: api@x
     pass: <secret>
-    # xoauth2: { client_id, client_secret, refresh_token }
+    # mechanism: xoauth2 时——首版仅静态 token：需 user + xoauth2.access_token
+    # xoauth2: { access_token: "ya29..." }   # 只给 refresh_token → fail-loud（刷新后做）
     timeout: 30
     allowed_from: ["noreply@x.com"]              # 发件人白名单（后缀）
     allowed_recipients: ["@x.com", "@partner.com"] # 收件人白名单（后缀）
