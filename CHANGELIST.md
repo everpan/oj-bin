@@ -13,7 +13,8 @@
   - **多 profile**：`smtp:` 顶层除 `workers`/`queue_capacity` 外每个键都是一个 profile
     （键 = `Mail(key)` / `mail.send` 的 key）；未声明的 key 显式报错（不回落 default）。
   - **四种调用**：`mail.send`（异步 transport）、`mail.sendSync`（同步 transport，worker 内
-    `spawn_blocking`）、`mail.enqueue`（入队即返回 `{jobId}`，真实完成经 `mail.result` 上送）、
+    `spawn_blocking`）、`mail.enqueue`（入队即回**统一信封** `{code:0,data:{jobId}}`——**非**裸
+    `jobId`；真实完成经 `mail.result` 与 bus 上送）、
     `mail.sendRaw`（RFC5322 原文投递，与 `attachments` 互斥）。宿主按方法**覆写** req 里的
     `sync`/`enqueue_only`（JS 侧串用无效）。
   - **队列 + worker 池**：有界队列（`queue_capacity`，满即**背压** `code:4`，不无界堆积）+
