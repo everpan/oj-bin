@@ -709,6 +709,11 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - `build` 剥离 `.route` 仅处理语句起始的标准赋值写法（§7.1）。
 - npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules` 解析，发布物需自带）。
 - 旧版本目录不自动回收（锁文件不指向即为死数据，手工删）。
+- **本地导入的目标必须是 `.ts`**：`./x.js` / `./d.json` 在产物里没有对应文件 → `oj build` 直接
+  失败（§8）。
+- **别名只能在模块内的文件里用**：`tests/` 用例目录与 `src/tasks/` 任务池在模块外，没有模块根
+  可锚定，继续用相对路径；跨模块别名必须在 `manifest.yaml` 声明 `deps`；`manifest.yaml` 只能
+  出现在模块根（§8）。
 - 代码默认端口即 `9778`。若改用 <1024 的端口（如 `778`），在 macOS/Linux 属特权端口，需 root。
 - `.tsx`/`.mts` 不转译（直通 V8）。
 - `ext_boot.js` 用顶层 `await` 须带 `export {};`（否则被 CJS 启发式包进非 async 函数）；

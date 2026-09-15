@@ -155,6 +155,10 @@ sample/src/
 
 - **路径参数**：给 handler 挂 `.route` 即可替换目录镜像——
   `detail.route = "{id}"` 使 `/v1/api/user/item/{id}` 可达（此时 `/v1/api/user/item` 为 404）。
+- **导入别名**：共享代码不必再数 `../` —— `#_shared/validate` 锚在**本模块根**
+  （`user/_shared/validate.ts`），`#/user/_shared/validate` 锚在 **src 根**。锚点由引用文件
+  自身位置派生，故同一写法在 dev 与 release 都成立；`oj build` 会把它实化为带版本段的相对
+  路径（跨模块别名须在 `manifest.yaml` 声明 `deps`）。
 - **WebSocket**：`ws.ts` 每收到一个文本帧执行一次。首帧 `bus.subscribe("news")` 订阅主题后，
   任意 handler（含其它实例）的 `bus.publish("news", ...)` 都会广播到该连接。
 - **前缀**：`/v1/api` 来自 config 的 `server.api_prefix`，可用 `-b` 覆盖。

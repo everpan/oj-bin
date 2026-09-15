@@ -1882,6 +1882,11 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |
 | 端口 <1024（如 778）属特权端口 | 需 root 才能 bind | 用 ≥1024（默认 `9778`） |
 | `.tsx` / `.mts` 不转译 | 直通 V8；统一用 `.ts` |
+| 本地导入目标必须是 `.ts` | `./x.js`、`./d.json` 在产物里没有对应文件（只转译 `.ts`）→ `oj build` 直接失败 |
+| 别名只能在**模块内**用 | 模块外的文件（`tests/` 用例、`src/tasks/` 任务池）没有模块根可锚定 → 继续用相对路径 |
+| 跨模块别名必须声明 `deps` | 别名跨模块引用省略 `manifest.deps` → S008 fail（既有**相对**跨模块引用不追溯） |
+| `manifest.yaml` 只能出现在模块根 | 嵌套声明会改写 `#` 别名的锚点 → S008 fail |
+| tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
 | 静态站点无 SPA 回退 / 目录列表 / Range / ETag / 缓存头 | 未知路径不回落 `index.html`；未知扩展名按 `application/octet-stream`；SPA 回退经前置反代补 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |

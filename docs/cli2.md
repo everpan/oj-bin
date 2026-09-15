@@ -110,9 +110,9 @@
 
   `dist/manifests.yaml` 记录模块 → 版本的锁定关系（如 `user: 0.1.0`），每次构建 upsert 对应模块；版本升级后旧版本目录保留，可多版本共存，锁定文件始终指向当前版本。server release 模式按 `dist/manifests.yaml` 逐模块校验（白名单、版本目录存在、manifest name 与模块一致）后加载各 `routes.js` 聚合路由，任何校验失败即启动报错（fail-fast）。
 
-  `--check` 只跑结构检查（S002–S007：manifest 合法性 / 表归属单射 / 跨模块依赖声明 /
-  deps 版本范围 / tables 与 schema.yaml 一致 / seed 纪律 / 迁移文件序列），不写任何产物，
-  可作 CI 门禁。
+  `--check` 只跑结构检查（S002–S008：manifest 合法性 / 表归属单射 / 跨模块依赖声明 /
+  deps 版本范围 / tables 与 schema.yaml 一致 / seed 纪律 / 迁移文件序列 / 导入别名与
+  deps 门禁），不写任何产物，可作 CI 门禁。
 
 ## test
   进程内测试运行器：真实 deno_core 运行时 + 真实路由/鉴权/租户管线派发（零 TCP），
