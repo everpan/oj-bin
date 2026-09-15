@@ -421,7 +421,15 @@ async fn introspect_module_files(
     mdir: &Path,
     files: &[(PathBuf, bool)],
 ) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
-    let root = src.parent().unwrap_or(src).to_path_buf();
+    // 与 dev 一致：project_root 走 canonicalize，使 `versioned_specifier` 给出的
+    // referrer 目录（Windows 带 `\\?\` verbatim 前缀）与 project_root 词法可比——
+    // `module_root_of` 的 `starts_with(project_root)` 否则在 Windows 上因前缀不一致
+    // 误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
+    let root = src
+        .parent()
+        .unwrap_or(src)
+        .canonicalize()
+        .unwrap_or_else(|_| src.parent().unwrap_or(src).to_path_buf());
     // ext_boot：与 dev 同源探测（src 父目录 = 项目根），保证 dev/build/release 三处一致。
     let boot = crate::app::ext_boot_spec(&root)?;
     let mut dbs: HashMap<String, Arc<dyn only_js::bridge::DataAccessor>> = HashMap::new();
