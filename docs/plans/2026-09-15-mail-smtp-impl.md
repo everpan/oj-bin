@@ -585,10 +585,10 @@ Expected: FAIL
 
 ### Task 7.3：xtask/CI 覆盖 + CHANGELIST + 文档
 
-**Files:** Modify: `tools/xtask/src/main.rs`（插件列表含 mail）、`.github/workflows/plugin-matrix.yml`、`CHANGELIST.md`、`README.md`/`docs/devkit/api-manual.md`
+**Files:** Modify: `tools/xtask/src/main.rs`（`PLUGINS` 表增 `"mail"`）、`CHANGELIST.md`、`README.md`/`docs/devkit/api-manual.md`
 
 **Step 1:** `cargo xtask plugin mail --check` PASS。
-**Step 2:** `plugin-matrix.yml` 增 `oj-mail`。
+**Step 2:** **只改 `tools/xtask/src/main.rs:28` 的 `PLUGINS`**（CI matrix / 归置的单一真相源）。**不要改 `.github/workflows/plugin-matrix.yml`**——该文件不硬编码插件名（注释明写「单一真相源是 xtask 的 PLUGINS」，且记有「此前硬编码 7 个漏 `auth`」的历史教训，加插件名到 CI 属重蹈失步）。注意 `PLUGINS` 有守护测试断言 `len()==8`，须连带更新为 9。
 **Step 3:** CHANGELIST 记 v0.1.19 特性；api-manual 补 `Mail`/`mail` 用法。
 **Step 4: 提交** `docs(mail): CHANGELIST/api-manual/CI 覆盖`
 
