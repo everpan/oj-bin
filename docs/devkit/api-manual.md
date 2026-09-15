@@ -552,7 +552,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（20 组）
+### 总表（23 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -565,6 +565,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `blob.put/get/del/url/contentType`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用） |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
+| `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
@@ -944,6 +945,122 @@ bus.subscribe("news");
 | `es.del` | `del(index: string, id: string): Promise<Json>` | `DELETE` 同路径（幂等，缺失返回 404 体） |
 
 index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返回体。
+
+### mail —— 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）
+
+配顶层 `smtp:` 段即启用全局 `Mail` / `mail`（`mail === new Mail("default")`）；未配置时调用报
+`mail not configured (config smtp: section missing, or oj-mail plugin not loaded)`。
+**投递**在 `oj-mail` 插件内（lettre 连接池 + 有界队列 + worker 池）；**宿主**负责入参校验
+（CRLF 剥离/地址强校验/白名单）、附件字节解析、结果存储与 bus 反馈。凭据只在 config →
+插件，**不进 JS**（`Mail.profiles()` 只列 profile 名）。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `new Mail(key)` | `Mail(key?: string)` | profile 实例；`key` = `smtp:` 段里的 profile 名（缺省 `"default"`），未声明的 key 报错（不回落 default） |
+| `mail.send` | `send(m: SendRequest): Promise<Envelope>` | 异步 transport；resolve 投递结果信封 |
+| `mail.sendSync` | `sendSync(m: SendRequest): Promise<Envelope>` | 同步 transport（插件 worker 内 `spawn_blocking` 投递） |
+| `mail.enqueue` | `enqueue(m: SendRequest): Promise<Envelope>` | 入队即回 `{code:0,data:{jobId}}`；真实完成经 `mail.result` 与 bus 上送 |
+| `mail.result` | `result(jobId: string): Promise<Json \| null>` | 查宿主侧结果（未命中/已过期 → `null`；结果按 `jobId` 全局索引） |
+| `mail.sendRaw` | `sendRaw(o: SendRawRequest): Promise<Envelope>` | 原始 MIME 投递（`raw` 原文 + 结构化 `from`/`to` 作信封；与 `attachments` 互斥） |
+| `Mail.profiles` | `Mail.profiles(): Promise<string[]>` | 已配置 profile 名清单（**非密钥面**） |
+
+`SendRequest` 字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `from` | `string` | 必填，发件人（`user@domain`；须命中 `allowed_from`） |
+| `to` / `cc` / `bcc` | `string[]` | `to` 至少一个；三者全部须命中 `allowed_recipients` |
+| `subject` | `string?` | 主题（换行被**剥离**，非拒绝） |
+| `text` / `html` | `string?` | 正文（换行原样保留）；两者至少给一个，或带附件 |
+| `headers` | `Record<string,string>?` | 自定义报头（值剥 CRLF）；**不得**覆盖 From/To/Cc/Bcc/Subject |
+| `attachments` | `Attachment[]?` | 见下 |
+| `sync` / `enqueue_only` | — | **JS 侧无效**：宿主按调用方法（`send`/`sendSync`/`enqueue`）覆写 |
+
+附件（**引用式**，字节不进 JS、不走 base64；`filename` 必填，来源二选一）：
+
+```ts
+attachments: [
+  { filename: "report.pdf", blobKey: "r2d2" },              // blob 后端（blob 字段选后端，缺省 default）
+  { filename: "note.txt", path: "reports/note.txt", mime: "text/plain" },  // 项目根内本地文件
+]
+```
+
+- `path` 必须落在**项目根**内（`../` 越界即拒；符号链接经 canonical 化覆盖，读盘用同一
+  canonical 句柄防 TOCTOU）。
+- MIME 三源决议：显式 `mime` → 文件扩展名 → 字节嗅探 → `application/octet-stream`。
+- `sendRaw` 与 `attachments` **互斥**（原文自带内容）。
+
+信封与错误码：所有方法都 resolve 信封（**只有「未配置 mail」抛异常**）：
+
+| `code` | 含义 |
+|---|---|
+| `0` | 成功：`data.messageId` 为投递凭据（异步 transport 为 SMTP 应答文本，FileTransport 为落盘 `.eml` 文件名主干）；`data.jobId` 为作业号 |
+| `1` | 网络/连接/超时（含「投递未能送达插件」） |
+| `2` | SMTP 5xx |
+| `3` | 鉴权失败 |
+| `4` | 队列满（背压，`enqueue` 亦回同一 jobId） |
+| `5` | 入参校验失败（地址非法/白名单未命中/缺正文/附件形态错/路径越界/未知 profile） |
+
+**白名单是唯一控制点，且 fail-closed**：`allowed_from`/`allowed_recipients` 为后缀匹配
+（大小写不敏感），**空表 = 拒绝**——不写白名单就发不出任何信。
+
+异步反馈（`enqueue` 的双通道之一）：真实完成经 bus topic `mail.result` 扇出**扁平结果**
+（`{jobId, code, msg, messageId?}`，**不含**收件人/主题）：
+
+```ts
+const res = await mail.enqueue({ from: "noreply@x.com", to: ["a@x.com"], text: "hi" });
+if (res.code !== 0) return json.fail(res.code, res.msg);
+const jobId = res.data.jobId;          // 入队成功；真实结果稍后到位
+// WS 会话侧订阅（见第 4 章 ws.ts）：
+bus.subscribe("mail.result");
+```
+
+配置（详见 `sample/config.yaml`；`smtp:` 顶层除 `workers`/`queue_capacity` 外每个键都是一个 profile）：
+
+```yaml
+smtp:
+  workers: 4
+  queue_capacity: 256
+  default:
+    host: smtp.example.com
+    port: 465
+    tls: tls                 # tls（隐式 TLS）| starttls（强制升级）| none（明文，须 allow_none_tls: true）
+    mechanism: login         # login（user + pass）| xoauth2（user + xoauth2.access_token）
+    user: api@example.com
+    pass: "change-me"
+    timeout: 30
+    allowed_from: ["noreply@x.com"]
+    allowed_recipients: ["@x.com", "@partner.com"]
+  mock:                      # 本地落盘通道：不发网络（目录须先存在），测试/归档用
+    host: localhost
+    port: 25
+    tls: none
+    allow_none_tls: true
+    mechanism: login
+    file_transport: "/tmp/oj-mail-eml"
+    allowed_from: ["noreply@x.com"]
+    allowed_recipients: ["@x.com"]
+```
+
+```ts
+export default {
+  async post() {
+    const r = await new Mail("default").send({
+      from: "noreply@x.com",
+      to: ["a@x.com"],
+      subject: "欢迎",
+      text: "正文",
+      attachments: [{ filename: "note.txt", path: "reports/note.txt" }],
+    });
+    if (r.code !== 0) return json.fail(r.code, r.msg);   // 校验失败也是 resolve（不抛）
+    json.ok({ messageId: r.data.messageId, jobId: r.data.jobId });
+  },
+};
+```
+
+门禁与常见坑：`tls: none` 必须显式 `allow_none_tls: true`（fail-closed）；`mock` 等
+FileTransport profile 也须写 `host`/`port`/`tls`/`mechanism`（插件 schema 必填，只是不联网）；
+`file_transport` 目录**须先存在**（lettre 不建目录）；未装插件先跑 `cargo xtask plugin mail`。
 
 ### log —— 结构化日志
 

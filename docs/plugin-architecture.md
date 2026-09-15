@@ -14,7 +14,7 @@
   2. **init**——调 `oj_plugin_init(host, cfg)`（宏内 `catch_unwind` 收敛 panic 为
      `RResult::Err`），插件建立 runtime/单例状态并返回 `PluginDescriptor`
      `{ name, semver, abi_version, fingerprint, desc }`。
-  3. **AXES 逐轴 dlsym**——对探测表 `AXES = [es, db, blob, bus, kv, auth]` 逐轴
+  3. **AXES 逐轴 dlsym**——对探测表 `AXES = [es, db, blob, bus, kv, auth, mq, mail]` 逐轴
      `dlsym("oj_plugin_axis_<axis>")`：查到符号 → 取静态 vtable 指针填入
      `Registrations` 对应槽位；**缺符号 = 不提供该轴**（`None`）。因此**加轴零破坏**：
      既有轴 vtable 形状不变就不需要 bump ABI。

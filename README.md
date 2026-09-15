@@ -164,6 +164,7 @@ Responses are uniformly the `{code, msg, data}` envelope. Injected globals:
 | `blob(name)` | object storage (local / s3) |
 | `bus` | pub/sub (`publish` / `subscribe`), broadcast across instances |
 | `es` | Elasticsearch (`search` / `index` / `del`) |
+| `Mail(key)` / `mail` | email delivery (`send` / `sendSync` / `enqueue` / `result` / `sendRaw`); `smtp:` block + oj-mail plugin |
 | `ws` | WebSocket frame context |
 | `fetch` | browser-compatible Fetch |
 | `log` | structured logging (tracing) |
@@ -225,6 +226,16 @@ es:     {}    # present → enables es.*
 blob:         # present → enables blob.* + {base}/blob/{key} download route
   driver: "local"       # local | s3
   root: "uploads"
+smtp:         # present → enables mail.* (needs the oj-mail plugin); one key per profile
+  default:
+    host: "smtp.example.com"
+    port: 465
+    tls: "tls"            # tls | starttls | none (none requires explicit allow_none_tls: true)
+    mechanism: "login"    # login (user+pass) | xoauth2 (user + xoauth2.access_token)
+    user: "api@example.com"
+    pass: "change-me"
+    allowed_from: ["noreply@x.com"]              # whitelists are fail-closed: empty = reject
+    allowed_recipients: ["@x.com", "@partner.com"]
 tenant:       # multi-tenancy: request must carry header_key, value injected as http.tenantId
   enable: true
   header_key: "X-TENANT-ID"
@@ -249,7 +260,7 @@ only-js/
   server/              axum HTTP service: route lookup → run handler → write back Capture
   oj-plugin-ffi/       C-ABI contract shared by host and plugins (strict ABI_VERSION gate)
   plugins/             cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
-                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth
+                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth / oj-mail
   tools/xtask/         plugin build / copy / preflight tooling (outputs to bin/)
   bin/                 build output: bin/oj (main) + bin/plugins/<triple>/ (plugin cdylibs)
   sample/              runnable example project (config.yaml + src/ + dist/)

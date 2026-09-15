@@ -202,6 +202,65 @@ interface OidcApi {
   readonly clients: Record<string, { secret: string; redirect_uris: string[]; tenant: string }>;
 }
 
+// mail / Mail(key) ：邮件投递（config smtp: 段 + oj-mail 插件启用；未配置调用报
+// mail not configured）。宿主做校验/附件解析，插件做投递；所有方法**都 resolve 信封**
+// （校验失败 = {code:5}，不抛），只有「未配置」抛异常。
+// code：0 成功（data.messageId 为投递凭据、data.jobId 为作业号）/ 1 网络/超时 /
+// 2 SMTP 5xx / 3 鉴权 / 4 队列满 / 5 入参校验（地址、白名单、正文、附件、profile）。
+interface MailEnvelope {
+  code: number;
+  msg: string;
+  data: { jobId?: string; messageId?: string } & Record<string, Json>;
+}
+
+// 附件（引用式：字节不进 JS、不走 base64）：filename 必填，blobKey / path 二选一。
+interface MailAttachment {
+  filename: string;
+  // blob 后端里的键（经 blob 字段选后端，缺省 "default"）。
+  blobKey?: string;
+  blob?: string;
+  // 项目根内的本地文件路径（../ 越界即拒）。
+  path?: string;
+  // 显式 MIME（缺省按扩展名 → 字节嗅探 → application/octet-stream）。
+  mime?: string;
+}
+
+interface MailSendRequest {
+  from: string;
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject?: string;
+  text?: string;
+  html?: string;
+  headers?: Record<string, string>;
+  attachments?: MailAttachment[];
+}
+
+interface MailRawRequest extends MailSendRequest {
+  // RFC5322 原文（与 attachments 互斥）。
+  raw: string;
+}
+
+interface MailApi {
+  // 异步 transport；resolve 投递结果信封。
+  send(m: MailSendRequest): Promise<MailEnvelope>;
+  // 同步 transport（插件 worker 内阻塞投递）。
+  sendSync(m: MailSendRequest): Promise<MailEnvelope>;
+  // 入队即回 {code:0,data:{jobId}}；真实完成经 bus topic "mail.result" 上送。
+  enqueue(m: MailSendRequest): Promise<MailEnvelope>;
+  // 查宿主侧结果（未命中/已过期 → null）。
+  result(jobId: string): Promise<Json | null>;
+  // 原始 MIME 投递。
+  sendRaw(o: MailRawRequest): Promise<MailEnvelope>;
+}
+
+interface Mail {
+  new (key?: string): MailApi;
+  // 已配置 profile 名清单（非密钥面：连接信息/凭据不进 JS）。
+  profiles(): Promise<string[]>;
+}
+
 // bcrypt.* ：密码哈希（Rust 侧 spawn_blocking，CPU 密集不卡 isolate）。
 interface BcryptApi {
   hash(password: string, cost?: number): Promise<string>;
@@ -223,6 +282,9 @@ declare global {
   const blob: BlobApi;
   const bus: BusApi;
   const es: EsApi;
+  // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。
+  const mail: MailApi;
+  const Mail: Mail;
 
   // 命名数据库实例；未配置的名字返回 undefined。
   function DB(name: string): DBInstance | undefined;

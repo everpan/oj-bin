@@ -108,7 +108,7 @@
 | 加一个配置字段 | `src/config.rs` +（需要时）`oj/src/app.rs` 装配 + `docs/user-manual.md` |
 | 改请求前置逻辑 | `server/src/lib.rs` 的 `handle` / `Pipeline` |
 | 改路由匹配/冲突 | `server/src/routes.rs` |
-| 加一个后端轴 | `oj-plugin-ffi/src/<axis>.rs` + `AXES`（`src/bridge/plugin_loader.rs:428`）+ `probe_axes` + 插件 crate |
+| 加一个后端轴 | `oj-plugin-ffi/src/<axis>.rs` + `AXES`（`src/bridge/plugin_loader.rs:432`）+ `probe_axes` + 插件 crate |
 | 改构建产物 | `oj/src/build_cmd.rs`、`pack.rs`、`manifest.rs` |
 | 改迁移/种子/schema | `oj/src/migrate.rs`、`seed.rs`、`schema.rs`、`checks.rs` |
 | 改测试运行器 | `oj/src/test_cmd.rs`、`oj/src/test_ext.rs`、`oj/src/test_ext/test_bootstrap.js` |

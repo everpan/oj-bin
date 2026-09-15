@@ -14,7 +14,7 @@ FFI 契约、ABI_VERSION 纪律、开发/构建/调试全流程。宿主侧装�
 - `ABI_VERSION`（u32，**严格相等**）是唯一硬门禁；构建指纹（rustc/契约 crate 版本/triple）
   仅诊断，不匹配告警不拒绝。
 - 注册是**按轴 dlsym 探测**：宿主 `init` 返回后（abi 门禁通过）对探测表 `AXES`（es/db/
-  blob/bus/kv/auth）逐轴 `dlsym("oj_plugin_axis_<axis>")`——查到符号即该插件提供该轴
+  blob/bus/kv/auth/mq/mail）逐轴 `dlsym("oj_plugin_axis_<axis>")`——查到符号即该插件提供该轴
   （符号返回静态 vtable 指针），**缺符号 = 不提供该轴**。vtable 指向的静态表在 init 时
   就绪即可；加新轴/加插件不再改动共享槽位结构。
 

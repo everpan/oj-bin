@@ -48,7 +48,7 @@ panic → `RResult::Err`）、每轴一个 `oj_plugin_axis_<name>()`（返回擦
 ### 按轴 dlsym（ABI 7 起，加轴零破坏）
 
 ```rust
-pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth"];   // :428
+pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail"];   // :432
 ```
 
 `probe_axes`（:432）对每个轴 `dlsym("oj_plugin_axis_<name>")`：
