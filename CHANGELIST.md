@@ -59,6 +59,11 @@
     不成立。改为在发退出信号**之前**按依赖序显式 `drop(targets)/drop(deliver)/drop(rx)`，
     使 transport 的最后一份强引用销毁点确定落在 `rt.enter()` 内（不再依赖 tokio 回收任务的
     实现细节）；补「在途 job + 真 pool transport + Drop/drain 超时两条路径」回归护栏。
+  - **`submit` 忙等烧核**（Important）：宿主 `FfiMailBackend::submit` 原用 `await_ffi`
+    （`yield_now` 空转）驱动插件 future，而 SMTP 往返可达 `timeout`（默认 30s）⇒ 每秒把该
+    isolate 的 `current_thread` runtime 空转烧满一核。改用 `await_ffi_poll`
+    （`FFI_POLL_BACKOFF = 2ms` 退避；poll/take/free 与取消语义同 `await_ffi`），
+    补用例钉住「pending 期间必须退避睡眠」（变异：换回 `await_ffi` ⇒ 20 次 pending 仅 409µs，红）。
 - **IDE 类型：`#` 别名报 TS2307、`QueryBuilder`/`json` 声明滞后**（`sample/global.d.ts`、
   `sample/tsconfig.json`、`sample/types/oj-modules.d.ts`）：
   - `QueryBuilder` 补 `join`（`{left,right}[]` + kind）/`distinct`/`groupBy`/`having`/`union`/`with`/`toJSON`；

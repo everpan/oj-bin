@@ -376,8 +376,10 @@ impl MailBackend for FfiMailBackend {
             });
         }
         let fut = (self.vtable.submit)(RString::from(key), RString::from(req.as_str()), rv);
-        // 宿主侧驱动 FfiFuture：与 es/db/blob/bus 适配器同一 `await_ffi`（poll+yield_now）。
-        let bytes = super::ffi::await_ffi(fut)
+        // 宿主侧驱动 FfiFuture：与 es/db/blob/bus 适配器同一 `await_ffi_poll`（poll + 退避
+        // sleep；**不**用 `await_ffi` 的 `yield_now` —— SMTP 往返可达 `timeout`（默认 30s），
+        // 空转会把该 isolate 的 `current_thread` runtime 烧满一核）。
+        let bytes = super::ffi::await_ffi_poll(fut, super::ffi::FFI_POLL_BACKOFF)
             .await
             .map_err(|e| format!("ffi mail submit: {e}"))?;
         let v: Value = serde_json::from_slice(&bytes).map_err(
@@ -1458,6 +1460,77 @@ mod tests {
             env,
             json!({"code": 5, "msg": "boom", "data": {}}),
             "已有 code 的信封不得被二次包裹"
+        );
+    }
+
+    /// A2：插件 future 长期 pending 时，宿主**退避睡眠**而非 `yield_now` 空转。
+    /// 20 次 pending × `FFI_POLL_BACKOFF`(2ms) ⇒ 墙钟 ≥ 30ms；空转实现只需 µs 级
+    /// （原实现用 `await_ffi`：SMTP 往返可达 30s ⇒ 每秒烧满该 isolate 的 current_thread）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ffi_mail_backend_backs_off_instead_of_spinning_while_pending() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// 前 `left` 次 poll 返回 pending，之后 ready。
+        struct Countdown {
+            left: AtomicU32,
+            result: Option<Result<Vec<u8>, String>>,
+        }
+        extern "C" fn poll(state: *mut std::ffi::c_void) -> i32 {
+            let s = unsafe { &mut *(state as *mut Countdown) };
+            if s.left.load(Ordering::SeqCst) == 0 {
+                1
+            } else {
+                s.left.fetch_sub(1, Ordering::SeqCst);
+                0
+            }
+        }
+        extern "C" fn take(
+            state: *mut std::ffi::c_void,
+        ) -> oj_plugin_ffi::RResult<oj_plugin_ffi::RBytes, oj_plugin_ffi::RString> {
+            let s = unsafe { &mut *(state as *mut Countdown) };
+            match s.result.take() {
+                Some(Ok(b)) => oj_plugin_ffi::RResult::Ok(oj_plugin_ffi::RBytes::from(&b[..])),
+                _ => oj_plugin_ffi::RResult::Err(oj_plugin_ffi::RString::from("not ready")),
+            }
+        }
+        extern "C" fn free(state: *mut std::ffi::c_void) {
+            if !state.is_null() {
+                drop(unsafe { Box::from_raw(state as *mut Countdown) });
+            }
+        }
+        extern "C" fn submit(
+            _key: oj_plugin_ffi::RString,
+            _req: oj_plugin_ffi::RString,
+            _atts: oj_plugin_ffi::RVec<oj_plugin_ffi::MailAttachment>,
+        ) -> oj_plugin_ffi::FfiFuture {
+            const PENDING: u32 = 20;
+            oj_plugin_ffi::FfiFuture {
+                state: Box::into_raw(Box::new(Countdown {
+                    left: AtomicU32::new(PENDING),
+                    result: Some(Ok(
+                        br#"{"code":0,"msg":"ok","data":{"jobId":"j-slow"}}"#.to_vec()
+                    )),
+                }))
+                .cast(),
+                poll,
+                take,
+                free,
+            }
+        }
+        let vt: &'static MailVtable = Box::leak(Box::new(MailVtable { submit }));
+        let b = FfiMailBackend::new(vt, MailConfig::empty(), Arc::new(Bus::new()));
+
+        let t0 = Instant::now();
+        let env = b
+            .submit("default", "{}".to_string(), vec![])
+            .await
+            .expect("信封");
+        let elapsed = t0.elapsed();
+        assert_eq!(env["data"]["jobId"], "j-slow", "{env}");
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "pending 期间必须退避睡眠（20 × {:?}），实测 {elapsed:?} —— 空转（yield_now）会瞬回",
+            crate::bridge::ffi::FFI_POLL_BACKOFF
         );
     }
 
