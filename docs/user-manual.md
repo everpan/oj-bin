@@ -429,6 +429,8 @@ axum 放开 pin 后可启用。
 
 - 挂 `.route` 后**目录镜像被替换**：`/v1/api/user/item`（镜像路径）→ 404。
 - `"{id}"` 相对当前目录；`"/user/{id}"` 以 `/` 开头挂到 base 根下；`fn.route = ""` 视同未挂。
+- **静态段优先于参数段**，与注册（文件扫描 / `routes.js`）顺序无关：`/x/{pk}` 与 `/x/me`
+  共存时，`GET /x/me` 必落 `me` 的 handler，不会被参数路由吞掉；反之 `/x/abc` 才落 `{pk}`。
 - TS 项目在 `sample/global.d.ts` 声明 `Function.route` 消除编辑器报错（无 tsconfig 时
   TS 语言服务通常也能拾取；严格工程可在 tsconfig `include` 里显式列入）。
 - dev（目录无 `manifests.yaml`，§2 自动判定）启动内省建表；release 用 `oj build` 生成的各模块版本目录内 `routes.js`

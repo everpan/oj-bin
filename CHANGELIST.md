@@ -127,8 +127,38 @@
     文件仍走真类型，未命中降级为 `any`（放在模块化的 `global.d.ts` 里无效，`paths` 命中时
     ambient 也被忽略，均为实测）。该文件随 devkit 分发（`copy_devkit` 增归置 + 守卫测试），
     业务项目须与 `global.d.ts` 一并拷入并纳入 tsconfig `include`（`docs/devkit/README.md`）。
+- **路由：参数路由吞掉后到的静态兄弟（`server/src/routes.rs`，Important）**：`register` 的同
+  pattern 去重原用 `matcher.at_mut(pattern)`——那是**路径匹配**而非 pattern 查找。已注册
+  `/x/admins/{pk}` 时 `at_mut("/x/admins/me")` 会把 `me` 当成实参匹配成功 ⇒ ①**方法嫁接**：
+  静态兄弟的 handler 被并进参数节点的方法表，`GET /x/admins/me` 落到 `{pk}` 的文件；
+  ②**假冲突**：两个同动词静态（`me` / `session`）被判为 `route conflict`，请求期 500 且
+  报的是无关文件；③`listing()` 列出实际不在树里的行。是否触发只取决于注册顺序（api 文件按
+  路径排序：参数目录名 `pk` 排在 `session` / `sign-*` 之前即命中），所以此前只能靠给参数目录
+  加 `zz-`/`{` 前缀改排序来规避。改为**按 pattern 字符串去重**：matcher 的 value 只存**槽位
+  下标**（`usize`），真正的 `HashMap<method, Entry>` 移到表侧 `Vec`（`nodes`），pattern → 槽位
+  由 `slots: HashMap<String, usize>` 记录，`matcher.insert` 每个 pattern 只调用一次。
+  **静态段优先于参数段**由 matchit 自身优先级保证（与注册顺序无关）。release 直载
+  `from_entries` 复用同一 `register`，一并修复。新增 4 条 unit 测试（含最凶的「同动词参数 vs
+  静态」形态，并断言静态命中 `params` 为空），并做了**变异验证**：把去重换回 `at_mut` 后 4 条
+  立即变红。实测：真实项目上旧二进制 2 条假冲突 + 4 个 500 + `oj test` FAIL，修复后 10 行路由
+  全在表、7 个端点全 200、1/1 通过。文档同步 `docs/route-params-design.md` §5（去重不再走
+  `matcher.at`、静态优先、冲突钉死）与 `docs/user-manual.md` §7.1（静态优先）。
+- **路由冲突哨兵不再被后来的声明复活**（同上文件，Minor）：同一 `(pattern, method)` 被 **≥3 个
+  文件**声明时，此前最后一个文件会把方法表里的 `Conflict` 冲回 `File` ⇒ 请求从 500 **静默变
+  200** 且指向第三个文件（与 §5「同 pattern 同方法双声明 → 500」自相矛盾）。现在冲突**钉死**：
+  保持 500，并再记一条 error 指出还有文件参与（测试 `table_conflict_survives_third_declaration`）。
 
 **行为变更（升级注意）**
+- **同位置异名参数现在是「结构性冲突」，release 会 fail-fast 起不来**（路由表改 pattern
+  字符串去重的连带修正，升级务必核对）：`/x/{id}` 已注册时再注册 `/x/{name}`，此前因去重
+  bug 被**静默合并**进同一节点（两条 URL 都可用，且参数名按先注册者算），现在按设计 §5 由
+  matchit 报 `Conflict`：dev 是 error 日志 + **该 URL 404**（服务照常起），release 则因为
+  `oj/src/app.rs` 把 `from_entries` 的 failures 当作致命错误 → **启动直接失败**（此前能起）。
+  所以升级后「release 起不来 / 某条 URL 404」先查启动日志里的 `invalid route … conflict`。
+  改法二选一：统一同位置的参数名（`/x/{id}` 一处即可），或把后来者挪出该位置（改成静态段或
+  更深一层）。另：dev 与 release 的注册序不同（dev 按 api 文件全局排序、release 按
+  `manifests.yaml` 锁顺序逐模块），跨模块的这类冲突在两个模式里丢弃的可能是不同文件
+  ——见 `docs/route-params-design.md` §4/§5。
 - **新增顶层 `smtp:` 段**：此前该键被忽略，现在会被解析——若旧配置里恰好有同名且**非映射**
   的键（如 `smtp: false`），启动会解析失败；改名或删掉即可。不写该段则行为完全不变
   （`mail.*` 调用报 `mail not configured`）。

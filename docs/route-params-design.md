@@ -138,6 +138,11 @@ export default [
 - **fail-fast**：`dist/routes.js` 不存在 → 启动失败，提示 `run 'oj build' first`；存在但 default 导出不是数组 → 同样启动失败。
 - dev 与 release 差异总结：dev = 内省 + fs 兜底（新文件免重启）；release = routes.js 直载，表外一律 404。
 - `file` 字段相对模块根（dist）；`replaced` 集合在 release 恒空（无兜底可拦截）。
+- **注册序差异（决定冲突谁胜、罚金谁被丢）**：dev 由 `api_files` 按**全仓 api 文件路径排序**；
+  release 按 `manifests.yaml` 的**锁顺序逐模块**拼 entries（`oj/src/app.rs`）。同一份源码在跨模块
+  冲突（尤其 §5 的「同位置异名参数」）时，两种模式被丢弃的文件可能不同；且 dev 的 failures 只是
+  告警（服务照常起），release 的 failures 是**致命**（启动返回 Err）。排查启动时先确认自己跑的是
+  哪种模式。
 
 ### 4.2 `oj build` 生成 `routes.js`（并剥离 `.route`）
 
@@ -147,28 +152,46 @@ export default [
 
 **单 matcher + 方法映射值**（比"逐方法一个 matcher + 独立哨兵集合"更省概念）：
 
-- 一个 `matchit::Router`，pattern 的 value 是 `HashMap<method, Entry>`，`Entry = File(path) | Conflict(a, b)`。
+- 一个 `matchit::Router`，pattern 的 value 是**槽位下标**（`usize`）；真正的
+  `HashMap<method, Entry>`（`Entry = File(id) | Conflict(msg)`）存在表侧 `Vec<HashMap<..>>`
+  里，pattern 字符串 ↔ 槽位由表侧 `HashMap<String, usize>` 记录。
 - 405 判定天然 O(1)：lookup 命中但方法缺席 → 405，无需遍历其它 matcher。
 - "冲突哨兵"不需要独立数据结构——冲突直接写进方法映射的 value。
+- **同 pattern 去重必须走 pattern 字符串（查表侧 map），不得用 `matcher.at/at_mut(pattern)`**：
+  后者是**路径匹配**而非 pattern 查找。已注册 `/x/admins/{pk}` 时，`at("/x/admins/me")`
+  会把 `me` 当实参匹配成功 ⇒ 后到的静态兄弟被**嫁接**到参数节点的方法表里（静态段被参数
+  段吞掉；两个同动词静态之间还会报**假冲突**，`GET /x/admins/session` 被判与 `me` 冲突）。
+  一度按此实现，v0.1.19 修复（`server/src/routes.rs` register/ 单测 `table_param_route_does_not_graft_later_static_siblings`）。
 
 **冲突/注册失败分类**（matchit `InsertError` 实际有 4 类，处理各不同）：
 
 | 情形 | matchit 行为 | 处理 |
 |---|---|---|
-| 同 `(pattern, method)` 二次声明 | 首个 insert 已成功；value 里该方法已有 `File` | **error 日志**（文件×2 / 方法 / pattern），value 中改写为 `Conflict`；**请求命中返回 500 + 冲突说明**，服务照常启动 |
-| 同 pattern 不同 method、不同文件 | insert 报 `Conflict`（pattern 已在树中） | 取出既有 value，合并新 method → `File`（**允许**：多文件分动词共享一个 pattern；info 日志提示） |
+| 同 `(pattern, method)` 二次声明 | 槽位已存在；方法映射里该方法已有 `File` | **error 日志**（文件×2 / 方法 / pattern），映射改写为 `Conflict`；**请求命中返回 500 + 冲突说明**，服务照常启动 |
+| 同上，且被 **≥3 个文件**声明（v0.1.19 起） | 槽位已存在且已是 `Conflict` | 冲突**钉死**：保持 500 不再回落；再记一条 error 指出还有文件参与。此前后来者会把 `Conflict` 冲回 `File`，导致请求从 500 静默变 200 且指向第三个文件 |
+| 同 pattern 不同 method、不同文件 | 槽位已存在，**不再调 insert** | 合并新 method → `File`（**允许**：多文件分动词共享一个 pattern；info 日志提示） |
 | 结构性冲突（同位置异名参数：`/user/{id}` 已注册，再注册 `/user/{name}/post`） | insert 报 `Conflict{with}`，后来者**不进树** | error 日志，丢弃后来者；请求只会命中已有路由 |
 | 非法模式（`{` 不闭合 / `{*p}` 不在末尾 / `/{b}-foo` 参数后静态段） | `InvalidParam` / `InvalidCatchAll` / `InvalidParamSegment` | error 日志，丢弃该路由 |
 
+> **静态段优先于参数段**由 matchit 的优先级（静止态在前 + 回溯）保证，与注册顺序无关：
+> `/x/{pk}` 与 `/x/me` 共存时 `/x/me` 必落静态节点（且 `params` 为空）。
+>
+> v0.1.19 前的 bug 让「结构性冲突（异名参数）」被**静默合并**成同一个节点，两条 URL 都能用；
+> 修复后按上表「后来者不进树」处理——升级时若依赖过该歪打正着的行为会变成 404（见 CHANGELIST
+> v0.1.19 行为变更）。
+
 ```rust
-// 伪代码
-match matcher.at(pattern) {                       // 先查是否已有同 pattern
-  Ok(v) if v.contains(method) =>
-      v[method] = Conflict(v[method].file, file); log::error!("route conflict: …"),
-  Ok(v) => v.insert(method, File(file)),          // 跨文件分动词共享 pattern
-  Err(NotFound) => match matcher.insert(pattern, {method: File(file)}) {
-    Ok(()) => {},
-    Err(e) => log::error!("invalid/conflicting route {method} {pattern} from {file}: {e}"),  // 丢弃
+// 伪代码（pattern 字符串去重；matcher 的 value 只是槽位下标）
+match slots.get(pattern) {                        // 先看该 pattern 是否注册过
+  Some(&slot) => match nodes[slot].get(method) {
+      Some(File(a)) => nodes[slot][method] =
+          Conflict(a, file); log::error!("route conflict: …"),
+      Some(Conflict(_)) => log::error!("… declared in more than two files (also {file})"),  // 钉死
+      _            => nodes[slot].insert(method, File(file)),   // 跨文件分动词共享 pattern
+  },
+  None => match matcher.insert(pattern, nodes.len()) {
+      Ok(()) => { slots.insert(pattern, nodes.len()); nodes.push({method: File(file)}); }
+      Err(e) => log::error!("invalid/conflicting route {method} {pattern} from {file}: {e}"),  // 丢弃
   },
 }
 ```

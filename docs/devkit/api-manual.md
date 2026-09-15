@@ -372,6 +372,10 @@ export default { get: detail };
 `.route` 规则：
 
 - 挂载后**目录镜像被替换**：`/user/item`（镜像路径）→ 404，只有参数路由可达。
+- **静态段优先于参数段**（与注册顺序无关）：`/x/{pk}` 与 `/x/me` 共存时，`GET /x/me` 必落
+  `me` 的 handler 且 `http.param("pk")` 为空；只有 `/x/abc` 之类非静态名才进 `{pk}`。
+- 同位置**异名**参数（`/x/{id}` 与 `/x/{name}` 并存）是结构性冲突：后来者在启动时被丢弃
+  （dev 日志告警 + 该 URL 404，release **启动失败**）——同一位置只用一个参数名。
 - `{*path}` catch-all 至少匹配一段：`/file`（零段）→ 404。
 - **参数段内不得混字面**：`{id}.json`、`v{major}.{minor}` 均属非法 pattern，
   启动时被丢弃并记日志 `InvalidParamSegment`。需要前缀/后缀字面的 URL 拆成静态多段，

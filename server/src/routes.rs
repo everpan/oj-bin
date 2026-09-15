@@ -136,9 +136,19 @@ pub struct RouteRow {
 /// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
 /// 405 判定 O(1)（命中 pattern 但方法缺席），“冲突哨兵”即映射里的 Conflict 变体。
 /// files 为文件表：FileId → 唯一绝对路径，消除 (file, method) 的 PathBuf 重复存储。
+///
+/// **值不放在 matcher 里**：matcher 只持 `Vec` 下标（slot），真正的 方法名 → Entry
+/// 映射存在 `nodes` 里，pattern 字符串 ↔ slot 由 `slots` 记录。同 pattern 去重因此
+/// 走得 route 字符串相等，而不是 `matcher.at_mut(pattern)`——后者是**路径匹配**：
+/// 先注册 `/x/{pk}` 时，`at_mut("/x/me")` 会把 `me` 当实参匹配成功，把静态兄弟的方法
+/// 嫁接到 `{pk}` 节点上（静态段被参数段吞掉 / 同动词静态之间假冲突）。
 #[derive(Clone)]
 pub struct RouteTable {
-    matcher: matchit::Router<HashMap<String, Entry>>,
+    matcher: matchit::Router<usize>,
+    /// pattern（注册期的字面量，含参数花括号）→ nodes 下标。
+    slots: HashMap<String, usize>,
+    /// 节点表：方法名 → Entry；与 matcher 的 value（下标）一一对应。
+    nodes: Vec<HashMap<String, Entry>>,
     /// 挂了 .route 的 (file_id, js 方法名)：dev 兜底不得复活其目录镜像 URL。
     replaced: std::collections::HashSet<(FileId, String)>,
     rows: Vec<RouteRow>,
@@ -152,6 +162,8 @@ impl Default for RouteTable {
     fn default() -> Self {
         Self {
             matcher: matchit::Router::new(),
+            slots: HashMap::new(),
+            nodes: Vec::new(),
             replaced: std::collections::HashSet::new(),
             rows: Vec::new(),
             files: Vec::new(),
@@ -170,12 +182,7 @@ impl RouteTable {
     ) -> (Self, Vec<String>) {
         let b = base.trim_matches('/');
         let mut failures = Vec::new();
-        let mut t = RouteTable {
-            matcher: matchit::Router::new(),
-            replaced: std::collections::HashSet::new(),
-            rows: Vec::new(),
-            files: Vec::new(),
-        };
+        let mut t = RouteTable::default();
         for file in api_files(root, ts) {
             let decls = match introspect(&file) {
                 Ok(d) => d,
@@ -218,12 +225,7 @@ impl RouteTable {
     /// release 直载：routes.js 导出的全量行（pattern 已含 base，file 相对 root）。
     /// 注册语义与 build 一致（合并 / 冲突 / 非法 pattern 丢弃），replaced 恒空（无 fs 兜底）。
     pub fn from_entries(root: &Path, entries: &[RouteEntry]) -> (Self, Vec<String>) {
-        let mut t = RouteTable {
-            matcher: matchit::Router::new(),
-            replaced: std::collections::HashSet::new(),
-            rows: Vec::new(),
-            files: Vec::new(),
-        };
+        let mut t = RouteTable::default();
         let mut failures = Vec::new();
         for e in entries {
             if !METHODS.contains(&e.method.as_str()) {
@@ -270,55 +272,68 @@ impl RouteTable {
     /// 同 (pattern, method) 二次声明 → Conflict（请求期 500）；matchit 拒绝 → 记 failures。
     fn register(&mut self, failures: &mut Vec<String>, method: &str, pattern: &str, file: &Path) {
         let fid = self.intern(file);
-        match self.matcher.at_mut(pattern) {
-            Ok(m) => match m.value.get(method) {
+        // 同 pattern 去重按 **字符串相等**（查 slots），不用 matcher.at_mut(pattern)：
+        // 后者是路径匹配，会把 `/x/me` 当成 `/x/{pk}` 的实参，嫁接到参数节点上。
+        if let Some(&slot) = self.slots.get(pattern) {
+            let map = &mut self.nodes[slot];
+            match map.get(method) {
                 Some(Entry::File(a)) => {
                     let msg = format!(
                         "route conflict: {method} {pattern} declared in {} and {}",
                         self.files[a.0 as usize].display(),
                         file.display()
                     );
-                    *m.value.get_mut(method).unwrap() = Entry::Conflict(msg.clone());
+                    map.insert(method.to_string(), Entry::Conflict(msg.clone()));
                     failures.push(msg);
                 }
+                // 冲突**钉死**：第三方再声明不得把它冲回 File（否则 500 静默变 200，
+                // 且指向第三个文件）。仍记 failures，方便运维看到到底有几个文件打架。
+                Some(Entry::Conflict(_)) => failures.push(format!(
+                    "route conflict: {method} {pattern} declared in more than two files (also {})",
+                    file.display()
+                )),
                 _ => {
-                    m.value.insert(method.to_string(), Entry::File(fid));
+                    map.insert(method.to_string(), Entry::File(fid));
                     self.rows.push(RouteRow {
                         method: method.to_string(),
                         pattern: pattern.to_string(),
                         file: fid,
                     });
                 }
-            },
-            Err(_) => {
-                let mut map = HashMap::new();
-                map.insert(method.to_string(), Entry::File(fid));
-                match self.matcher.insert(pattern.to_string(), map) {
-                    Ok(()) => self.rows.push(RouteRow {
-                        method: method.to_string(),
-                        pattern: pattern.to_string(),
-                        file: fid,
-                    }),
-                    // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
-                    Err(e) => failures.push(format!(
-                        "invalid route {method} {pattern} from {}: {e}",
-                        file.display()
-                    )),
-                }
             }
+            return;
+        }
+        let mut map = HashMap::new();
+        map.insert(method.to_string(), Entry::File(fid));
+        let slot = self.nodes.len();
+        match self.matcher.insert(pattern.to_string(), slot) {
+            Ok(()) => {
+                self.slots.insert(pattern.to_string(), slot);
+                self.nodes.push(map);
+                self.rows.push(RouteRow {
+                    method: method.to_string(),
+                    pattern: pattern.to_string(),
+                    file: fid,
+                });
+            }
+            // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
+            Err(e) => failures.push(format!(
+                "invalid route {method} {pattern} from {}: {e}",
+                file.display()
+            )),
         }
     }
 
     /// 查表：path 须先经 `normalize`。未映射动词按"路径存在 → 405"契约处理。
     pub fn lookup(&self, path: &str, verb: &str) -> Lookup {
-        let m = match self.matcher.at(path) {
-            Ok(m) => m,
-            Err(_) => return Lookup::NotFound,
+        // 精确段（静态）优先于参数段：matchit 自带该优先级，与注册顺序无关。
+        let Ok(m) = self.matcher.at(path) else {
+            return Lookup::NotFound;
         };
         let Some(name) = method_name(verb) else {
             return Lookup::MethodNotAllowed;
         };
-        match m.value.get(name) {
+        match self.nodes[*m.value].get(name) {
             Some(Entry::File(f)) => {
                 let pairs = m.params.iter().map(|(k, v)| (k.to_string(), v.to_string()));
                 match decode_params(pairs) {
@@ -810,6 +825,151 @@ mod tests {
             t2.lookup("/v1/api/v/  ", "GET"),
             Lookup::Hit { .. }
         ));
+    }
+
+    // ----- 参数路由与静态兄弟的优先级（注册顺序无关） -----
+
+    #[test]
+    fn table_param_route_does_not_graft_later_static_siblings() {
+        // 缺陷形态（upstream issue: matchit grafting）：参数路由先注册时，后到的静态兄弟
+        // 曾被去重用的 at_mut(pattern) 当成实参匹配，把方法嫁接到 {pk} 节点上。
+        let root = PathBuf::from("/r");
+        let es = |m: &str, p: &str, f: &str| RouteEntry {
+            method: m.into(),
+            pattern: p.into(),
+            file: f.into(),
+        };
+        let (t, failures) = RouteTable::from_entries(
+            &root,
+            &[
+                es("del", "/x/admins/{pk}", "pk/api.js"),
+                es("get", "/x/admins/me", "me/api.js"),
+                es("get", "/x/admins/session", "session/api.js"),
+                es("post", "/x/admins/sign-in", "sign-in/api.js"),
+            ],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        let hit = |path: &str, verb: &str, expect: &str| match t.lookup(path, verb) {
+            Lookup::Hit { file, .. } => assert_eq!(file, PathBuf::from(expect), "{path} {verb}"),
+            other => panic!("{path} {verb} → {}", kind(&other)),
+        };
+        hit("/x/admins/me", "GET", "/r/me/api.js");
+        hit("/x/admins/session", "GET", "/r/session/api.js");
+        hit("/x/admins/sign-in", "POST", "/r/sign-in/api.js");
+        hit("/x/admins/42", "DELETE", "/r/pk/api.js");
+        // 真实静态段优先：me 不得被 {pk} 吞掉（反之亦然）
+        assert!(matches!(
+            t.lookup("/x/admins/me", "DELETE"),
+            Lookup::MethodNotAllowed
+        ));
+    }
+
+    #[test]
+    fn table_static_sibling_beats_same_verb_param() {
+        // 最凶的一形态：参数与静态**同动词**。旧实现里 `{pk}` 先注册会把 `me` 判成
+        // 假冲突（`at_mut` 把 me 当实参），该 (pattern, method) 直接 500。
+        let (t, failures) = tbl(
+            &["a/api.ts", "b/api.ts"],
+            &[("a/api.ts", "get", "/x/{pk}"), ("b/api.ts", "get", "/x/me")],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        match t.lookup("/v1/api/x/me", "GET") {
+            // 静态命中不得带参数（被嫁接时会命中 {pk} 节点、带上 pk=me）
+            Lookup::Hit { file, params } => {
+                assert!(file.ends_with("b/api.ts"), "{file:?}");
+                assert!(params.is_empty(), "{params:?}");
+            }
+            other => panic!("{}", kind(&other)),
+        }
+        match t.lookup("/v1/api/x/42", "GET") {
+            Lookup::Hit { file, params } => {
+                assert!(file.ends_with("a/api.ts"), "{file:?}");
+                assert_eq!(params["pk"], "42");
+            }
+            other => panic!("{}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn table_conflict_survives_third_declaration() {
+        // 冲突哨兵必须钉死：第三个文件再声明同一 (pattern, method) 不得把它冲回 File
+        // （否则请求从 500 静默变 200，且指向第三个文件）。
+        let root = PathBuf::from("/r");
+        let (t, failures) = RouteTable::from_entries(
+            &root,
+            &[
+                RouteEntry {
+                    method: "get".into(),
+                    pattern: "/a/{id}".into(),
+                    file: "a/api.js".into(),
+                },
+                RouteEntry {
+                    method: "get".into(),
+                    pattern: "/a/{id}".into(),
+                    file: "b/api.js".into(),
+                },
+                RouteEntry {
+                    method: "get".into(),
+                    pattern: "/a/{id}".into(),
+                    file: "c/api.js".into(),
+                },
+            ],
+        );
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        match t.lookup("/a/1", "GET") {
+            Lookup::Conflict(msg) => assert!(msg.contains("a/api.js"), "{msg}"),
+            other => panic!("{}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn table_differing_param_names_at_same_slot_conflict() {
+        // 同位置**异名**参数是结构性冲突（设计 §5）：后来者不进树。
+        // 修复前靠 at_mut 命中同类节点而被静默合并，与文档口径不符。
+        let (t, failures) = tbl(
+            &["a/api.ts", "b/api.ts"],
+            &[
+                ("a/api.ts", "get", "/x/{id}"),
+                ("b/api.ts", "get", "/x/{name}"),
+            ],
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("invalid route"), "{failures:?}");
+        assert!(matches!(t.lookup("/v1/api/x/1", "GET"), Lookup::Hit { .. }));
+    }
+
+    #[test]
+    fn table_build_keeps_static_siblings_registered_after_param() {
+        // dev/release 共用的 build 路径：文件按路径排序，a→b→c 即「参数在前、静态在后」。
+        let (t, failures) = tbl(
+            &["a/api.ts", "b/api.ts", "c/api.ts", "d/api.ts"],
+            &[
+                ("a/api.ts", "del", "/admins/{pk}"),
+                ("b/api.ts", "get", "/admins/me"),
+                ("c/api.ts", "get", "/admins/session"),
+                ("d/api.ts", "post", "/admins/sign-in"),
+            ],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+        let hit = |path: &str, verb: &str, expect: &str| match t.lookup(path, verb) {
+            Lookup::Hit { file, .. } => assert!(file.ends_with(expect), "{file:?} vs {expect}"),
+            other => panic!("{path} {verb} → {}", kind(&other)),
+        };
+        hit("/v1/api/admins/me", "GET", "b/api.ts");
+        hit("/v1/api/admins/session", "GET", "c/api.ts");
+        hit("/v1/api/admins/sign-in", "POST", "d/api.ts");
+        hit("/v1/api/admins/42", "DELETE", "a/api.ts");
+        // rows/listing 须与查表一致（嫁接时 rows 会列出实际不在树里的行）
+        assert_eq!(t.listing().len(), 4, "{:?}", t.listing().len());
+    }
+
+    fn kind(l: &Lookup) -> &'static str {
+        match l {
+            Lookup::Hit { .. } => "Hit",
+            Lookup::Conflict(_) => "Conflict",
+            Lookup::MethodNotAllowed => "MethodNotAllowed",
+            Lookup::NotFound => "NotFound",
+        }
     }
 
     // ----- release 直载（routes.js）-----
