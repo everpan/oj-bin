@@ -399,6 +399,16 @@ fn probe_finds_mq_axis_and_zero_axis_mini_misses_it() {
     assert_eq!(mmq.descriptor.abi_version, oj_plugin_ffi::ABI_VERSION);
 }
 
+/// mail 轴已登记进宿主探测表：`AXES` 含 "mail" 且 `Registrations` 有对应槽位。
+/// 二者与 `probe_axes` 的 match 分支必须同加（:456 `unreachable!` 防两表失步）。
+#[test]
+fn axes_includes_mail_and_probe_branch_is_wired() {
+    assert!(AXES.contains(&"mail"));
+    // Registrations 含 mail 字段（编译期即可断言）
+    let r = Registrations::default();
+    assert!(r.mail.is_none());
+}
+
 /// mini-mq call echo 契约冒烟：method + payload 原样回显（JSON in → JSON out）。
 #[tokio::test]
 async fn given_mini_mq_when_call_echo_then_method_and_payload_roundtrip() {
