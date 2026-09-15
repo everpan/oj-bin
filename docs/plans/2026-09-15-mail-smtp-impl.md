@@ -1155,7 +1155,129 @@ Task 3.2 先落测试跑出 `E0308`（SMTP/file 两路 `send_raw` 的 Ok 类型�
 4. 阶段 7 的配置登记：`plugin_cfg`/`config.rs` 的 `mail` 段、`xtask PLUGINS` 见阶段 1 小结 §6。
 
 ### 阶段 4 小结
-（待填）
+
+**结论：有界队列 + worker 池 + `FfiFuture` 回传 + 背压（`try_send` → `code:4`）+ graceful drain
+已落地并有测试钉死（含 4 条变异验证）。** 引擎自建 multi_thread runtime：transport 的
+构建/使用/销毁全在其上下文内（lettre `pool` 在 `Pool::new` 与 `Pool::drop` 两处都
+`E::spawn`），而 runtime 的销毁用 `shutdown_background()`（tokio 禁止在 runtime 上下文里
+drop runtime）。本期 `submit` 只走「原始 MIME」路（`raw`），消息组装归阶段 5。
+
+#### 1. 改了什么
+
+| 文件 | 要点 |
+|---|---|
+| `plugins/oj-mail/src/engine.rs`（新增） | `MailEngine`：**有界** `mpsc::channel(queue_capacity)` + `workers` 个 worker；`Job{key,req,atts,respond,enqueue_only,job_id,sync}`；`Req`（最小 req 视图：`sync`/`enqueue_only`(`enqueueOnly` 别名)/`raw`/`from`/`to[]`/`jobId`）；`DeliverSink`（结果上送抽象，生产转发 `HostContext.deliver`、测试注入收集器）；`MailTarget{timeout,send,send_sync}` + `SendFn`/`SyncSendFn`（依赖倒置的投递函数，测试可注闸门桩）；`submit`/`shutdown`/`dispose`/`Drop`；信封构造 `ok_envelope`/`fail_envelope`/`queue_full_envelope`（失败只回分类文案 + jobId）。 |
+| `plugins/oj-mail/src/testutil.rs`（新增） | `#[cfg(test)]` 共享脚手架：`drive`（FfiFuture 轮询桥）、`temp_dir`（隔离临时目录）、`host`（空宿主）。原先 `lib.rs` 测试内的三份私有副本收敛到此处（`engine.rs` 用例复用同一套）。 |
+| `plugins/oj-mail/src/lib.rs` | `MailProfile` 增 `timeout`；新增 `MailProfile::into_target()`（把两路 lettre transport 包成引擎的 `SendFn`/`SyncSendFn`，闭包持有 `Arc` ⇒ transport 的最终 Drop 落在目标表销毁处，必须在 rt 上下文内）；`MAIL_CFG` 换成进程级 `MAIL_ENGINE: OnceLock<MailEngine>`；`init` 改为**先校验后查幂等**（坏配置永远 fail-loud，与是否已装配无关）+ 建引擎（`MailEngine::new` 内先 `rt.enter()` 再 `build_profiles`）；`submit` 由骨架错误改为委派引擎（`catch_future` 收敛 panic；引擎未装配 → `ready_err`）；`build_profiles` 文档补「构建期也需 runtime 上下文」的实测证据；骨架期用例换成入口守卫用例。 |
+
+#### 2. 跑过的测试与结果（一律 `--release`）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test --release -p oj-mail`（实现前，RED） | **FAILED. 22 passed; 9 failed** —— 9 条阶段 4 用例全红（8 条 `引擎/阶段 4 未实现`，1 条 `missing_raw` 收到假成功的 `code:0`） |
+| `cargo test --release -p oj-mail`（实现后，GREEN） | **33 passed; 0 failed**（阶段 1-3 的 22 + 阶段 4 的 11） |
+| `cargo clippy --release -p oj-mail --all-targets -- -D warnings` | exit 0（0 warning） |
+| `cargo fmt --check` | exit 0 |
+| `cargo xtask plugin mail --check` | `ok: mail 0.1.0 (abi 8) — mail 轴：lettre SMTP 发送（多 profile + 连接池/队列线程池）` / `provided axes: [mail]`（**ABI 仍为 8**，本阶段未触碰 `oj-plugin-ffi`） |
+
+阶段 4 的 11 条用例（`engine::tests` 10 + `tests` 1）：`submit_through_queue_resolves_with_envelope`
+（真 file transport：信封 `messageId` 必须对应真落盘的 `.eml`）、`full_queue_returns_code4_without_blocking`、
+`enqueue_delivers_completion_via_sink`（断言上送**不含**收件人/主题）、`shutdown_drains_inflight_then_stops`、
+`unknown_key_returns_error`、`worker_reports_unknown_key_as_validation_envelope`（worker 兜底分支直调）、
+`missing_raw_fails_loud_and_raw_excludes_atts`、`smtp_connection_refused_returns_network_code`
+（真 SMTP 路：端口 1 无监听 → `code:1` + `msg:"投递失败"`）、
+`dropping_engine_in_async_context_does_not_abort`、`shutdown_releases_pool_transports_inside_runtime_context`、
+`shutdown_from_sync_context_releases_pool_transports_in_rt_context`。
+
+**变异验证（4 条，证明断言真的在钉约束）**
+
+| 变异 | 期望红的用例 | 实测 |
+|---|---|---|
+| `dispose` 去掉 `rt.enter()` | `shutdown_from_sync_context_releases_pool_transports_in_rt_context` | **FAILED**：`there is no reactor running`（lettre `executor.rs:117`，panic 在析构链上） |
+| `dispose` 的 `rt.shutdown_background()` 换回裸 `drop(rt)` | `dropping_engine_in_async_context_does_not_abort` | **FAILED**：`Cannot drop a runtime in a context where blocking is not allowed`（tokio `blocking/shutdown.rs:51`） |
+| 队列容量改 `1 << 20`（形同无界） | `full_queue_returns_code4_without_blocking` | **FAILED**（不再有 `Full`，future 悬挂至 30s drive 超时） |
+| `shutdown` 跳过 drain 等待循环 | `shutdown_drains_inflight_then_stops` | **FAILED**（在途 job 未完成、无上送） |
+
+#### 3. 关键设计落点（`文件:行`）
+
+- 引擎结构与「同生共死」字段：`engine.rs:156`（`tx`/`targets`/`rt`/`exits`/`workers`；`Option`/`Mutex` 均为
+  「drain 时能 take 出去销毁」「`Sync` 以进 `OnceLock`」两处约束服务）。
+- 构建顺序（先 `rt.enter()` 再 `build_profiles`）：`engine.rs:181`。
+- worker 起法与退出信号次序：`engine.rs:212`（`with_rt`）——worker 帧在 `worker_loop` 返回时释放
+  `targets` 强引用，**之后**才发退出信号 ⇒ `shutdown` 收齐信号时 transport 只剩引擎那一份。
+- worker 循环 / 单 job 处理 / 投递与信封：`engine.rs:418`（`worker_loop`，`Arc<tokio::sync::Mutex<Receiver>>`
+  公平取件，锁只在 `recv().await` 期间持有）、`:434`（`run_job`：sync 路 → oneshot、enqueue 路 → `deliver`）、
+  `:447`（`deliver_one`：`timeout` + sync/async 选路 + 唯一信封构造点）、`:499`（`deliver_input`）。
+- 非阻塞入队与背压：`engine.rs:273`（`submit`）→ `:307`（`try_send`）→ `:316`（`Err(Full)` ⇒ 立即 `code:4` 信封）；
+  `send` 语义的 await 点在 `spawn_ffi_future` 的引擎任务里，不占调用线程。
+- drain / 销毁：`engine.rs:328`（`shutdown`：take-drop `tx` → std 通道收 `workers` 个退出信号（同步等待，
+  不用 `block_on`）→ `dispose`）、`:365`（幂等 `dispose`）、`:407`（`dispose`：`rt.enter()` 下 drop targets
+  → `rt.shutdown_background()`）、`:371`（`Drop`：同序但不等待在途）。
+- 宿主接线：`lib.rs:42`（`MAIL_ENGINE`）、`:251`（`init`：先校验后幂等）、`:283`（`submit` 委派）、
+  `:74`（`into_target`）、`:67`（`profile.timeout`）。
+
+#### 4. 背压「不阻塞」如何证明
+
+1. **实测（行为面）**：`full_queue_returns_code4_without_blocking` 用 0 许可 `Semaphore` 闸门把唯一 worker
+   钉在 A 的投递上（收到「已开始投递」信号才继续，确定性，不靠 sleep），B 占满唯一槽位，然后只测第三个
+   `submit` **调用本身**的耗时（`Instant` 包住调用）并断言 < 2s；闸门在断言之后才放行 ⇒ 若 `submit`
+   有任何等待空闲槽位的行为，该断言必然超时（并会拖到 30s drive 超时）。
+2. **结构性**：`MailVtable::submit` 是同步 `extern "C" fn`（签名上不可能 await），实现里唯一的入队点
+   是 `try_send`（`:307`），满即走 `ready_ok(code:4)`（`:316`）——没有 `await send`、没有轮询、没有重试。
+3. **变异（反向）**：容量改成 `1 << 20`（形同无界）后该用例失败 ⇒ 断言确实钉住「有界 → 满即 code 4」，
+   而不是碰巧命中。
+
+#### 5. drain「无 panic / 无 abort」如何证明
+
+- `shutdown` 返回 `Ok(())` 的**语义** = 收齐了 `workers` 个退出信号（每个 worker 只在 `worker_loop` 返回后发），
+  故 `Ok` 本身即「worker 全部已退出」的断言；`Err` 会带上「x/y 个 worker 未退出」。
+- **在途必达**：`shutdown_drains_inflight_then_stops` 的投递函数 sleep 50ms 才成功，入队后**立刻** shutdown：
+  返回 `Ok` 且 sink 随即能 `try_recv` 到该 job 的 `code:0` 信封（上送发生在 worker 退出之前）⇒ 在途 job
+  完成而非被丢弃；随后 `submit` 必须 `Err`（停机不再入队）。
+- **销毁无 panic**：drain 与 Drop 都走 `dispose`（`rt.enter()` 下释放 transport → `shutdown_background()`
+  关闭 runtime）。两条约束各有独立变异证据（§2 表前两行）：去掉 `rt.enter()` 复现 lettre 的
+  "there is no reactor running"；换回裸 `drop(rt)` 复现 tokio 的 "Cannot drop a runtime in a context where
+  blocking is not allowed"。诚实边界：`shutdown_drains_inflight_then_stops` 自身用的是注入桩（无 lettre
+  transport），故「pool transport 的销毁上下文」由上述两条专用用例（真 SMTP transport，构建期不连网）钉住。
+
+#### 6. 与任务书/计划的偏差（均有实证）
+
+1. **提交粒度**：任务书建议两次提交（队列 / 背压+drain）。实测**无绿色的中间态**：本阶段 clippy 首跑即报
+   `fields exits and workers are never read` + `associated items with_targets and shutdown are never used`
+   （`-D warnings` 失败）——即「只有队列、没有 drain」的中间态不绿；而背压（`try_send`）与队列容量本就是
+   同一行 `mpsc::channel(cap)` 的两面。故落**一次引擎提交 + 一次小结提交**，并把注入口/`shutdown` 的
+   dead-code 处置写进代码注释（`with_targets` 用 `#[cfg(test)]` 门控；`shutdown` 加
+   `#[allow(dead_code)]` + 理由）。
+2. **`submit` 的 req 处理取「最小但真实」**：不加组装桩。只走 vtable 契约里真实存在的 `raw` 路；
+   缺 `raw` → `code:5` + 文案点明「阶段 5 未实现消息组装」，并按 vtable 契约校验「`raw` 与附件互斥」
+   （`atts` 非空即报错）。即「缺什么就 fail-loud」，不做假成功。
+3. **`sync: true` 一并落地**（计划 §6/§7 的「按 sync 选路」）：worker 内 `spawn_blocking` 调用同步
+   transport；`MailTarget::async_only` 让测试桩的同步路**显式报错**（避免「以为发了 sync 实际没发」）。
+   诚实边界：`timeout` 只停止等待，已在 blocking 池里开始的调用会跑完（无法取消）。
+4. **上送形态**：按任务书取 `deliver("mail.result", <统一信封 JSON>)`，即
+   `{code,msg,data:{jobId,messageId}}`。⇒ 宿主在阶段 6 需从 `data` 取 `jobId`/`messageId`，再按 design §5
+   的扁平形态（`{jobId,code,msg,messageId}`）扇出到 bus。
+5. **脱敏先行**：失败信封一律只回分类文案（`投递失败`/`投递超时`/`queue full`/校验文案），lettre 原始错误
+   文本既不进信封也不进总线（design §10/§11）。代价：当前诊断细节丢失（遗留 1）。
+6. **新发现（已写进 `build_profiles` 文档）**：无 runtime 上下文时，transport 的**构建期**就会 panic
+   （lettre `Pool::new` 自己也要 `E::spawn`，`pool/async_impl.rs:56`），不只是销毁期。这由一次脚手架误用
+   实测暴露（同步 `#[test]` 里直接调 `build_profiles` → abort），故 `MailEngine::new` 的 `rt.enter()`
+   覆盖构建期而非仅销毁期。
+7. **需求原文的两处顺带证据**：任务书要求「`Drop for MailEngine` 亦按此顺序」已实现（`Drop` 调同一
+   `dispose`，且不再重启新线程——`shutdown_background` 让销毁在任一上下文都安全，比「挪到独立线程
+   + join」更少活动件）；任务书设计的 `MailEngine.deliver` 字段未保留（worker 各持克隆即可，留字段反而
+   是无读取的死字段）。
+
+#### 7. 遗留 / 转下阶段
+
+1. **诊断细节**：lettre 原始错误（SMTP 对话）当前被丢弃，只出分类文案。阶段 5 接 `HostContext.log`
+   上送宿主日志（信封/总线仍只出脱敏分类）。
+2. `jobId` 缺省生成 = `pid-计数器`（进程内唯一即可）。若阶段 6 的 `MailResultStore` 需要跨进程唯一，再换。
+3. 队列取件：`mpsc::Receiver` 是单消费者，多 worker 经 `tokio::sync::Mutex`（FIFO）取用。SMTP 是 I/O
+   密集，不是瓶颈；阶段 8 压测若显示取件成瓶颈再评估专用有界队列。
+4. 宿主驱动的停机（`oj server` 退出时调 `shutdown`）归阶段 7；vtable → 引擎 → 真 transport 的端到端
+   （`oj test` e2e）亦归阶段 7 Task 7.2（本阶段 vtable 只钉入口守卫 + 引擎层真 file transport 落盘）。
+
 
 ### 阶段 5 小结
 （待填）
