@@ -490,7 +490,8 @@ async fn deliver_one(job: &Job, targets: &HashMap<String, MailTarget>) -> String
 /// 由 req 组装投递入参（**阶段 5 的两条路**，错误码一律 `code:5`）：
 ///
 /// - `req.raw` 有 → 原文路：信封由结构化 `from`/`to` 生成（与原文报头**解耦**，防双收件人），
-///   正文取 [`build_raw`] 剥离冲突头后的字节；
+///   正文取 [`build_raw`]：剥离原文 `From`/`To`/`Cc`/`Bcc`；`Subject` 保留，但结构化 `subject`
+///   非空时覆盖（设计 §7/§11，2026-09-15 决策）；
 /// - 否则 → 结构化组装：`build_message` 出 [`lettre::Message`]，信封由 lettre 按其报头派生
 ///   （To ∪ Cc ∪ Bcc，且 `Bcc` 报头已丢弃）。
 fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8>), (i32, String)> {
@@ -512,7 +513,8 @@ fn deliver_input(req: &Req, atts: &[MailAttachment]) -> Result<(Envelope, Vec<u8
             ));
         }
         let envelope = envelope_of(&m.from, &m.to).map_err(|e| (CODE_VALIDATION, e))?;
-        let bytes = build_raw(&envelope, raw, atts).map_err(|e| (CODE_VALIDATION, e))?;
+        let bytes =
+            build_raw(&envelope, raw, &m.subject, atts).map_err(|e| (CODE_VALIDATION, e))?;
         return Ok((envelope, bytes));
     }
     let msg = build_message(m, atts).map_err(|e| (CODE_VALIDATION, e))?;
@@ -888,17 +890,18 @@ mod tests {
         );
     }
 
-    /// raw 路：原文冲突头（From/To/Subject）被剥离、其余头与正文保留，报头由结构化信封重建
-    /// —— 防「双收件人 / 发件人 spoof」。同样以**落盘 `.eml`** 为证。
+    /// raw 路（**结构化为空**）：原文 `From`/`To` 被剥离、报头由结构化信封重建（防双收件人 /
+    /// 发件人 spoof），而原文 `Subject` **保留**（决策：Subject 非信封字段，剥它只会丢主题）。
+    /// 以**落盘 `.eml`** 为证。
     #[tokio::test(flavor = "multi_thread")]
-    async fn raw_path_sends_stripped_raw_and_rebuilt_envelope_headers() {
+    async fn raw_path_drops_envelope_headers_but_keeps_raw_subject() {
         let dir = temp_dir("engine-raw");
         let eng = file_engine(&dir);
         let req = json!({
             "from": "from@example.com",
             "to": ["to@example.com"],
             "jobId": "j-raw-1",
-            "raw": "From: evil@x\nTo: victim@x\nSubject: 被剥离\nX-Keep: 1\n\nbody",
+            "raw": "From: evil@x\nTo: victim@x\nSubject: raw-sub\nX-Keep: 1\n\nbody",
         })
         .to_string();
         let eml = submit_and_read_eml(&eng, &req, vec![], &dir).await;
@@ -909,12 +912,65 @@ mod tests {
         );
         assert!(
             !eml.contains("evil@x") && !eml.contains("victim@x"),
-            "冲突头已剥离: {eml}"
+            "原文信封头已剥离: {eml}"
         );
-        assert!(!eml.contains("被剥离"), "原文 Subject 已剥离: {eml}");
+        assert!(
+            eml.contains("Subject: raw-sub"),
+            "结构化为空时原文 Subject 必须保留: {eml}"
+        );
+        assert_eq!(
+            eml.to_lowercase().matches("subject:").count(),
+            1,
+            "只能有一个 Subject 头: {eml}"
+        );
         assert!(
             eml.contains("From: from@example.com") && eml.contains("To: to@example.com"),
             "报头由结构化信封重建: {eml}"
+        );
+    }
+
+    /// raw 路（**结构化 `subject` 非空**）：以结构化值为准覆盖原文 Subject —— 落盘 `.eml` 里
+    /// 只有一个 Subject 头，且原文那一个（连同其值）不残留。非 ASCII 主题走 RFC2047 编码。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_path_structured_subject_overrides_raw_subject() {
+        let dir = temp_dir("engine-raw-subject");
+        let eng = file_engine(&dir);
+
+        // 1) ASCII 结构化主题：可逐字断言（不必解 RFC2047）
+        let req = json!({
+            "from": "from@example.com",
+            "to": ["to@example.com"],
+            "jobId": "j-raw-sub-1",
+            "subject": "struct-sub",
+            "raw": "Subject: raw-sub\n  folded-leak\nX-Keep: 1\n\nbody",
+        })
+        .to_string();
+        let eml = submit_and_read_eml(&eng, &req, vec![], &dir).await;
+        assert!(eml.contains("Subject: struct-sub"), "结构化主题生效: {eml}");
+        assert!(
+            !eml.contains("raw-sub") && !eml.contains("folded-leak"),
+            "原文 Subject 及其折行续行不得残留: {eml}"
+        );
+        assert_eq!(
+            eml.to_lowercase().matches("subject:").count(),
+            1,
+            "最终只能有一个 Subject 头: {eml}"
+        );
+        assert!(eml.contains("X-Keep: 1") && eml.contains("body"), "{eml}");
+
+        // 2) 非 ASCII 结构化主题：lettre 做 RFC2047 编码（原文 Subject 同样不残留）
+        let req = json!({
+            "from": "from@example.com",
+            "to": ["to@example.com"],
+            "jobId": "j-raw-sub-2",
+            "subject": "结构主题",
+            "raw": "Subject: raw-sub\n\nbody",
+        })
+        .to_string();
+        let eml = submit_and_read_eml(&eng, &req, vec![], &dir).await;
+        assert!(
+            eml.contains("Subject: =?utf-8?") && !eml.contains("raw-sub"),
+            "非 ASCII 主题应 RFC2047 编码且覆盖原文: {eml}"
         );
     }
 
