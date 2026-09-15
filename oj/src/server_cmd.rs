@@ -459,6 +459,10 @@ pub struct Registries {
     /// mq 命名客户端 vtable 表（spec 2026-09-07：插件名 bus-<kind> 路由；
     /// kafkas:/rabbits: 段声明 → 按名找 vtable → connect 出命名实例）。
     pub mq: Vec<(String, &'static oj_plugin_ffi::MqVtable)>,
+    /// mail 键选单 vtable 槽（mail 轴，spec 2026-09-15）：smtp: 段 + 恰一个 mail 插件
+    /// → 装配层构造 `FfiMailBackend`（`app::build_mail_backend`）；多 mail 插件注册冲突
+    /// fail fast。未加载插件时保持 None（`mail.*` 报未配置，不降级）。
+    pub mail: Option<&'static oj_plugin_ffi::MailVtable>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -466,11 +470,15 @@ pub struct Registries {
 /// 第一方轴适配器清单（实际适配分支在 plugin_cfg 的 match；此表供测试与
 /// plugin_loader::AXES 对账，防止两表失步——适配器打空）。加新第一方轴时在此登记。
 #[cfg(test)]
-const ADAPTER_AXES: &[&str] = &["es", "auth"];
+const ADAPTER_AXES: &[&str] = &["es", "auth", "mail"];
 
 /// cfg 回落：plugins.<name> 非空对象原样透传 → 轴适配器 → "{}"。
 /// schema 归插件所有：插件在 init 校验，非法即 Err fail-fast（宿主不解释字段）。
-fn plugin_cfg(cfg: &Config, name: &str) -> String {
+/// **唯一例外**：`"mail"` 的适配器产物同时是**宿主**的白名单校验面（`MailConfig::from_value`
+/// 吃同一份 JSON）——故 white-list/并发/凭据字段必须一并过线，两条路（透传与适配器）
+/// 都得让宿主看得见 `allowed_*`，否则宿主与插件配置面分叉。
+/// `pub(crate)`：`app::build_mail_backend` 复用同一份产物（单一真相源）。
+pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
     if let Some(v) = cfg.plugins.get(name)
         && v.as_object().is_some_and(|o| !o.is_empty())
     {
@@ -488,6 +496,12 @@ fn plugin_cfg(cfg: &Config, name: &str) -> String {
                 "anonymous_paths": a.anonymous_paths,
             })
             .to_string(),
+            None => "{}".to_string(),
+        },
+        // mail（spec 2026-09-15）：顶层 `smtp:` 段 → oj-mail 插件 cfg。
+        // 段缺省/空 → "{}"（插件零 profile；装配层视作未配置，不挂 mail 后端）。
+        "mail" => match &cfg.smtp {
+            Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "{}".to_string()),
             None => "{}".to_string(),
         },
         _ => "{}".to_string(),
@@ -575,6 +589,17 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
                 .map(|vt| (p.descriptor.name[..].to_string(), vt))
         })
         .collect();
+    // mail 键选式单 vtable 槽（spec 2026-09-15）：多 mail 插件注册冲突 fail fast；
+    // `smtp:` 段声明但插件未装 → 不在装配期硬失败（`app::build_mail_backend` 返回 None，
+    // `mail.*` 调用报 "mail not configured" 并点名两种成因）。
+    let mail_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.mail.is_some())
+        .collect();
+    if mail_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register mail backend".to_string());
+    }
+    let mail = mail_plugins.first().and_then(|p| p.registrations.mail);
     Ok(Registries {
         es,
         dbs,
@@ -583,6 +608,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         kv,
         auth,
         mq,
+        mail,
     })
 }
 
@@ -758,6 +784,46 @@ mod tests {
         cfg2.plugins.insert("auth".into(), serde_json::json!({}));
         let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
         assert_eq!(v["jwt_secret"], "s");
+    }
+
+    /// mail 轴 cfg 走**适配器臂**（顶层 `smtp:` 段序列化），**不**要求用户用
+    /// `plugins:` 透传——`plugins:` 非空即切严格清单模式，用户会被迫列全所有插件。
+    /// 过线 JSON 与宿主的校验面同源（`MailConfig::from_value` 吃同一份）。
+    #[test]
+    fn plugin_cfg_mail_serializes_top_level_smtp_section() {
+        // 段缺省 → 空 cfg（插件 init 得到零 profile；宿主不挂后端）。
+        let mut cfg = Config::default();
+        assert_eq!(plugin_cfg(&cfg, "mail"), "{}");
+        // 顶层 smtp: 段 → 插件 cfg（并发参数 + 每 profile 一个键 + 凭据 + 白名单）。
+        cfg.smtp = Some(
+            serde_yaml::from_str(
+                "workers: 2\nqueue_capacity: 8\nmock:\n  host: localhost\n  port: 25\n  \
+                 tls: none\n  allow_none_tls: true\n  mechanism: login\n  \
+                 file_transport: /tmp/eml\n  allowed_from: [noreply@x.com]\n  \
+                 allowed_recipients: [\"@x.com\"]\n",
+            )
+            .unwrap(),
+        );
+        let raw = plugin_cfg(&cfg, "mail");
+        assert_ne!(raw, "{}");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["workers"], 2);
+        assert_eq!(v["queue_capacity"], 8);
+        assert_eq!(v["mock"]["file_transport"], "/tmp/eml");
+        assert_eq!(v["mock"]["tls"], "none");
+        assert_eq!(v["mock"]["allow_none_tls"], true);
+        assert_eq!(v["mock"]["allowed_from"][0], "noreply@x.com");
+        assert_eq!(v["mock"]["allowed_recipients"][0], "@x.com");
+        // 空字段省略（`null` 会让插件强类型反序列化报错）。
+        assert!(v["mock"].get("user").is_none(), "{v}");
+        // 非空对象透传优先（统一语义；宿主与插件仍吃同一份 → 不产生两边分叉）。
+        cfg.plugins.insert(
+            "mail".into(),
+            serde_json::json!({ "mock": { "host": "override" } }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg, "mail")).unwrap();
+        assert_eq!(v["mock"]["host"], "override");
+        assert!(v.get("workers").is_none(), "{v}");
     }
 
     /// 适配器轴必须是宿主探测轴的子集（两表失步 = 适配器永远打空）。
