@@ -99,6 +99,8 @@ pub fn init(logs_dir: &Path, logs_max_m: u64, logs_keep_files: usize, console: b
 }
 
 /// 配置的日志大小上限（M）→ 字节；<100M 钳到 100M（防误配小值导致频繁滚动）。
+/// 仅 unix 落盘路径使用；非 unix 平台无文件滚动，加 cfg 避免 dead_code 告警。
+#[cfg(unix)]
 fn effective_max_bytes(logs_max_m: u64) -> u64 {
     logs_max_m.max(100) * 1024 * 1024
 }
