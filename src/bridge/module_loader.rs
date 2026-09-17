@@ -586,20 +586,24 @@ mod tests {
     #[cfg(windows)]
     fn module_root_of_tolerates_verbatim_prefix_mismatch() {
         let (root, _deep) = alias_fx("verbatim");
-        let canon = root.canonicalize().unwrap(); // 长名 + `\\?\`
+        let canon = root.canonicalize().unwrap(); // 项目根（长名 + `\\?\`）
+        let proj_root_prefix = canon.clone(); // project_root 带前缀
+        let proj_root_plain = strip_verbatim(&canon); // project_root 无前缀
         let with_prefix = canon.join("src/m1/a/b"); // referrer（canonical，带前缀）
-        let no_prefix = strip_verbatim(&with_prefix); // 长名无前缀（模拟 to_file_path）
+        let no_prefix = strip_verbatim(&with_prefix); // referrer 无前缀（模拟 to_file_path）
+        let want = strip_verbatim(&canon.join("src/m1")); // 模块根（归一后必然无前缀）
 
         // 方向一：referrer 无前缀 vs project_root 带前缀。
         assert_eq!(
-            module_root_of(&no_prefix, &with_prefix),
-            Some(strip_verbatim(&canon.join("src/m1"))),
+            module_root_of(&no_prefix, &proj_root_prefix),
+            Some(want.clone()),
             "no-prefix from_dir vs \\?\\-prefixed root 应命中模块根"
         );
         // 方向二：referrer 带前缀 vs project_root 无前缀。
+        // 函数对两者均 `strip_verbatim` 再比，故返回同样是无前缀的模块根。
         assert_eq!(
-            module_root_of(&with_prefix, &no_prefix),
-            Some(canon.join("src/m1")),
+            module_root_of(&with_prefix, &proj_root_plain),
+            Some(want),
             "\\?\\-prefixed from_dir vs no-prefix root 应命中模块根"
         );
         let _ = std::fs::remove_dir_all(&root);
