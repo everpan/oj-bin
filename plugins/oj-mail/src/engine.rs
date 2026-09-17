@@ -707,13 +707,13 @@ fn sanitize_message_id(raw: &str) -> String {
     let one_line: String = raw.chars().filter(|c| *c != '\r' && *c != '\n').collect();
     let s = one_line.trim();
     let lower = s.to_ascii_lowercase();
-    if let Some(i) = lower.find("queued as") {
-        if let Some(tok) = s[i + "queued as".len()..].split_whitespace().next() {
-            let tok = tok
-                .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '>' | '<' | ')' | '('));
-            if !tok.is_empty() {
-                return tok.chars().take(MESSAGE_ID_MAX).collect();
-            }
+    if let Some(i) = lower.find("queued as")
+        && let Some(tok) = s[i + "queued as".len()..].split_whitespace().next()
+    {
+        let tok =
+            tok.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '>' | '<' | ')' | '('));
+        if !tok.is_empty() {
+            return tok.chars().take(MESSAGE_ID_MAX).collect();
         }
     }
     s.chars().take(MESSAGE_ID_MAX).collect()

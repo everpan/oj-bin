@@ -1047,20 +1047,21 @@ mod mail_assembly_tests {
 
     /// 顶层 `smtp:` 段：多 profile（默认/本地落盘）+ 白名单 + 并发参数。
     fn smtp_cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.smtp = Some(
-            serde_yaml::from_str(
-                "workers: 2\n\
-                 queue_capacity: 8\n\
-                 default:\n  host: smtp.example.com\n  port: 465\n  tls: tls\n  \
-                 mechanism: login\n  user: u\n  pass: p\n  \
-                 allowed_from: [noreply@x.com]\n  allowed_recipients: [\"@x.com\"]\n\
-                 mock:\n  host: localhost\n  port: 25\n  tls: none\n  allow_none_tls: true\n  \
-                 mechanism: login\n  file_transport: /tmp/oj-mail-assembly-eml\n",
-            )
-            .unwrap(),
-        );
-        cfg
+        Config {
+            smtp: Some(
+                serde_yaml::from_str(
+                    "workers: 2\n\
+                     queue_capacity: 8\n\
+                     default:\n  host: smtp.example.com\n  port: 465\n  tls: tls\n  \
+                     mechanism: login\n  user: u\n  pass: p\n  \
+                     allowed_from: [noreply@x.com]\n  allowed_recipients: [\"@x.com\"]\n\
+                     mock:\n  host: localhost\n  port: 25\n  tls: none\n  allow_none_tls: true\n  \
+                     mechanism: login\n  file_transport: /tmp/oj-mail-assembly-eml\n",
+                )
+                .unwrap(),
+            ),
+            ..Default::default()
+        }
     }
 
     /// Given: 顶层 `smtp:` 段（多 profile + 白名单）+ oj-mail 插件在册；
@@ -1154,8 +1155,10 @@ mod mail_assembly_tests {
                 .is_none()
         );
         // 空段（`smtp: {}`，零 profile）= 未配置。
-        let mut empty = Config::default();
-        empty.smtp = Some(Default::default());
+        let empty = Config {
+            smtp: Some(Default::default()),
+            ..Default::default()
+        };
         assert!(
             build_mail_backend(&empty, Some(&FAKE_MAIL), bus())
                 .unwrap()

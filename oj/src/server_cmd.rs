@@ -896,8 +896,10 @@ mod tests {
         }
         /// 组装一个 Config；`None` = 该来源缺省。
         fn case(plugins_mail: Option<serde_json::Value>, smtp: Option<SmtpSection>) -> Config {
-            let mut cfg = Config::default();
-            cfg.smtp = smtp;
+            let mut cfg = Config {
+                smtp,
+                ..Default::default()
+            };
             if let Some(v) = plugins_mail {
                 cfg.plugins.insert("mail".into(), v);
             }
