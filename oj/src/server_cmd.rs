@@ -1054,18 +1054,27 @@ mod tests {
             .await
             .unwrap();
         assert!(r.0.port() != 0);
-        // d) 证书过期（宽限期 0）→ 拒绝启动。
-        let e = start(
+    }
+
+    /// 证书过期且宽限期 0 → 启动期硬断言中止（oj/src/app.rs::load_cert_with_watcher 的
+    /// assert!），不再返回可被静默的 Err。panic 载荷含 "certificate"，故用 should_panic。
+    /// 原 certificate_mandatory_gate 的 (d) 步骤拆出独立：该用例 a/b/c 须正常返回，不能与
+    /// 本测的 panic 混在同一测试函数里。
+    #[tokio::test]
+    #[should_panic(expected = "certificate")]
+    async fn expired_cert_aborts_startup() {
+        let t = tmpdir("sc-cert-exp");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
+        // 触发 load_cert_with_watcher 的 assert!（过期且宽限结束）→ panic 经 .await 上抛，
+        // 由 #[should_panic] 捕获。返回值不会到达，故忽略。
+        let _ = start(
             expired_cert_cfg(&t.0),
             &t.0,
             t.0.join("src"),
             "/v1/api".into(),
             true,
         )
-        .await
-        .err()
-        .unwrap_or_default();
-        assert!(e.contains("certificate expired"), "{e}");
+        .await;
     }
 
     /// auth 配了但 jwt_secret 空 → 装配 fail-fast（不静默跳过鉴权）。

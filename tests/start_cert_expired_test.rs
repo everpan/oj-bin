@@ -21,7 +21,10 @@ fn host_plugin_triple() -> String {
     }
 }
 
+// 证书过期且宽限结束 → 启动期硬断言中止（见 oj/src/app.rs::load_cert_with_watcher），
+// 故此处用 should_panic 而非 is_err：panic 载荷含 "certificate" 即命中目标错误。
 #[tokio::test]
+#[should_panic(expected = "certificate")]
 async fn test_start_fails_when_cert_expired_and_grace_over() {
     let now = now_secs();
     let dir = TempDir::new().unwrap();
@@ -48,7 +51,10 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     );
     std::fs::write(config_file.path(), content).unwrap();
 
-    let result = server_cmd::run(ServerArgs {
+    // 断言必有 panic：证书过期且宽限结束应中止启动。panic 载荷含 "certificate"，
+    // 由 #[should_panic(expected = "certificate")] 校验；其余断言（如插件 ABI）失败会
+    // 以不同 panic 信息暴露，从而偏离本测目标。
+    let _ = server_cmd::run(ServerArgs {
         config: config_file.path().to_string_lossy().into_owned(),
         api_path: Some(service_dir.to_string_lossy().into_owned()),
         // 测试必须留终端输出：server_cmd::run 会装 fd 级 tee，console 关闭时连
@@ -57,14 +63,4 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
         ..Default::default()
     })
     .await;
-
-    assert!(
-        result.is_err(),
-        "server must refuse to start when cert expired"
-    );
-    let msg = result.unwrap_err();
-    assert!(
-        msg.contains("certificate"),
-        "expected certificate error, got: {msg}"
-    );
 }
