@@ -8,6 +8,19 @@ use oj::server_cmd;
 use server::test_support::{now_secs, write_cert};
 use tempfile::{NamedTempFile, TempDir};
 
+/// 与 `src/bridge/ffi.rs::triple()` 一致——`<plugins_dir>/<triple>/` 才是扫描目录。
+/// 测试须把插件扫描隔离到空目录，否则 workspace 自带（或 CI 检出）的 bin/plugins 里
+/// 若含 ABI 不符的陈旧产物，会在证书校验前先撞「plugin ABI mismatch」而偏离本测目标。
+fn host_plugin_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        other => format!("{arch}-unknown-{other}-gnu"),
+    }
+}
+
 #[tokio::test]
 async fn test_start_fails_when_cert_expired_and_grace_over() {
     let now = now_secs();
@@ -19,13 +32,19 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     let key_path = key.to_string_lossy().replace('\\', "/");
     let cert_path = cert.to_string_lossy().replace('\\', "/");
 
+    // 插件目录隔离到空夹具：显式指向存在的空 <base>/<triple> 目录，扫描得 0 插件，
+    // 避免 workspace 的 bin/plugins（可能含 ABI 不符的陈旧产物）抢在证书校验前报错。
+    let plugins_base = TempDir::new().unwrap();
+    std::fs::create_dir_all(plugins_base.path().join(host_plugin_triple())).unwrap();
+    let plugins_path = plugins_base.path().to_string_lossy().replace('\\', "/");
+
     let temp_dir = TempDir::new().unwrap();
     let service_dir = temp_dir.path();
 
     let config_file = NamedTempFile::new().unwrap();
     let content = format!(
-        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\n  grace_days: 0\n",
-        key_path, cert_path
+        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\n  grace_days: 0\nplugins_dir: \"{}\"\n",
+        key_path, cert_path, plugins_path
     );
     std::fs::write(config_file.path(), content).unwrap();
 
