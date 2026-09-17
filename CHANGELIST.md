@@ -276,6 +276,15 @@
   L2 mock 的构造器面）；devkit SKILL.md 补新模块 checklist 与常见陷阱三行；README /
   README_cn 特性列表补别名一条；cli2 的 `--check` 规则范围与 route-params-design 的过时段
   标注同步。
+- **tests：Windows 回归用例 `module_root_of_tolerates_verbatim_prefix_mismatch` 实参错配**
+  - 该用例旨在验证 `module_root_of` 在 `from_dir` 与 project_root 的 `\\?\` 前缀**不一致**
+    （canonicalize 加前缀、to_file_path 剥前缀）时仍命中模块根；但两向断言都把**referrer**
+    目录（`with_prefix`/`no_prefix`）当成了 `root` 参数，方向一只把两者归一成同一个
+    `src/m1/a/b` 路径、找不到 manifest 直接 `d == root` 跳出 ⇒ 返回 `None`（CI 在 Windows 红）。
+  - 修正：方向一传 `from_dir = no_prefix` + `root = proj_root_prefix`（canonical 项目根），
+    方向二传 `from_dir = with_prefix` + `root = proj_root_plain`；`module_root_of` 对二者均
+    `strip_verbatim` 再比、返回无前缀模块根，故两向期望统一为 `strip_verbatim(canon/src/m1)`。
+    函数逻辑未动（其前缀归一本就正确）。
 
 ## v0.1.17（2026-09-15）
 
