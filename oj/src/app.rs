@@ -378,10 +378,7 @@ fn load_cert_with_watcher(
             // 证书过期且宽限结束属启动期致命配置错误：硬断言中止，而非打一条可被误读为
             // 「运行时可恢复 ERROR」的日志（服务本就不应启动）。消息含 "certificate" 便于
             // 集成测试与运维从 panic 载荷快速定位。
-            assert!(
-                false,
-                "certificate has expired and grace period elapsed — service will not start"
-            );
+            panic!("certificate has expired and grace period elapsed — service will not start");
         }
         CertificateStatus::Grace { remaining_secs } => {
             tracing::warn!(
