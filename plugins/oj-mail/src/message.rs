@@ -412,7 +412,6 @@ fn subject_header(value: &str) -> String {
 fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String> {
     let mut kept = Vec::new();
     let mut keep_prev = false;
-    let mut prev_is_subject = false;
     for line in head.split_inclusive('\n') {
         let bare = bare_line(line);
         if bare.starts_with(' ') || bare.starts_with('\t') {
@@ -425,8 +424,8 @@ fn kept_header_lines(head: &str, keep_subject: bool) -> Result<Vec<&str>, String
         }
         // `Name: value` → 取 `Name`；无冒号的行无从判定，按「保留」处理（不猜不吞）。
         let name = bare.split(':').next().unwrap_or(bare);
-        prev_is_subject = name.eq_ignore_ascii_case("subject");
-        keep_prev = if prev_is_subject {
+        let is_subject = name.eq_ignore_ascii_case("subject");
+        keep_prev = if is_subject {
             keep_subject
         } else {
             !ENVELOPE_HEADERS
