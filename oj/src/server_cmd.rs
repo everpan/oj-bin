@@ -714,6 +714,16 @@ mod tests {
         Tmp(d)
     }
 
+    /// 隔离插件扫描到空 `<triple>` 目录（同 tests/start_cert_expired_test.rs）：避免
+    /// workspace / CI 检出的 `bin/plugins` 含 ABI 不符的陈旧产物（如遗留 bus-kafka.dll），
+    /// 在目标校验前抢先报「plugins scan」错，偏离本测目标。Windows 主机三元组会命中
+    /// `bin/plugins/<triple>`，故测试须显式把扫描钉到空目录。
+    fn isolate_plugins(dir: &Path) -> PathBuf {
+        let base = dir.join("plugins-isolated");
+        std::fs::create_dir_all(base.join(host_triple())).unwrap();
+        base
+    }
+
     /// 证书必配门禁下，测试须自带有效证书：在 `dir`（随测试存活的临时目录）生成
     /// 真实签名 JWS，返回配好两路径的 Config。有效期 [now-1h, now+1y] → 启动时 Valid。
     fn cert_cfg(dir: &Path) -> Config {
@@ -725,6 +735,8 @@ mod tests {
             n.saturating_sub(3600),
             n + 365 * 86_400,
         );
+        // 隔离插件扫描（见 isolate_plugins）。
+        cfg.plugins_dir = Some(isolate_plugins(dir));
         cfg
     }
 
@@ -734,6 +746,8 @@ mod tests {
         cfg.server.grace_days = Some(0);
         let n = server::test_support::now_secs();
         server::test_support::write_cert_into(&mut cfg.server, dir, n - 2000, n - 1000);
+        // 隔离插件扫描（见 isolate_plugins）。
+        cfg.plugins_dir = Some(isolate_plugins(dir));
         cfg
     }
     impl Drop for Tmp {
