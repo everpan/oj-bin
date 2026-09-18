@@ -433,7 +433,7 @@ pub fn check_tenant_raw(
     let mentions = cleaned.contains("tenant_id");
     let param_has = tid
         .as_deref()
-        .is_some_and(|t| params.iter().any(|p| p.as_str() == Some(t)));
+        .is_some_and(|t| params.iter().any(|p| param_is_tenant(p, t)));
     let ok = match tid {
         Some(_) => mentions && (param_has || !deny),
         None => false,
@@ -453,6 +453,24 @@ pub fn check_tenant_raw(
         ),
     };
     verdict(msg)
+}
+
+/// 参数是否绑定了当前租户 id。三种形态视为等价（同一个值，只是 JS 侧表示不同）：
+/// 字符串（`"42"`）、数字（`42`，小 id 常用）、大整数标记（`toBigInt("42")` 的
+/// `{"$oj$i64":"42"}`，v0.1.22；雪花租户 id 只能这样精确传递）。
+/// 只做「等值」判定，不放松 SQL 侧的 `mentions` 要求——租户条件仍须显式出现在 SQL 里。
+///
+/// **有意不对称**：构造器 insert 的租户校验（`query.rs::apply_tenant`）**只认字符串**形态
+/// （`row["tenant_id"]` 必须等于租户头），且注入的条件本身是字符串绑定值——故数值型
+/// `tenant_id` 列整体不受支持（见 `docs/numeric-limits.md` §4.8）。此处放宽只覆盖裸 SQL 路径。
+fn param_is_tenant(p: &serde_json::Value, tid: &str) -> bool {
+    if p.as_str() == Some(tid) {
+        return true;
+    }
+    if let Some(i) = oj_plugin_ffi::jsint::marker_i64(p) {
+        return i.to_string() == tid;
+    }
+    p.as_i64().is_some_and(|i| i.to_string() == tid)
 }
 
 /// 模块默认库重定向（manifest `db:` 绑定）：仅重定向字面 "default"，
@@ -489,6 +507,30 @@ pub fn bound_db(state: &Rc<RefCell<OpState>>, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 租户参数的三种等价形态（v0.1.22 起含数字与大整数标记）。
+    #[test]
+    fn param_is_tenant_accepts_string_number_and_bigint_marker() {
+        use serde_json::json;
+        // 字符串（长期形态）
+        assert!(param_is_tenant(&json!("42"), "42"));
+        assert!(!param_is_tenant(&json!("42"), "4"));
+        // 数字（小整数 id 直接传 number）
+        assert!(param_is_tenant(&json!(42), "42"));
+        assert!(!param_is_tenant(&json!(43), "42"));
+        // 大整数标记（雪花租户 id 只能这样精确传）
+        assert!(param_is_tenant(&json!({"$oj$i64": "42"}), "42"));
+        assert!(param_is_tenant(
+            &json!({"$oj$i64": "4886674138783273204"}),
+            "4886674138783273204"
+        ));
+        assert!(!param_is_tenant(&json!({"$oj$i64": "43"}), "42"));
+        // 畸形/无关形态不匹配（不因标记形状就放行）
+        assert!(!param_is_tenant(&json!({"$oj$i64": "007"}), "7"));
+        assert!(!param_is_tenant(&json!({"$oj$i64": "42", "x": 1}), "42"));
+        assert!(!param_is_tenant(&json!(null), "42"));
+        assert!(!param_is_tenant(&json!(true), "42"));
+    }
 
     #[test]
     fn extracts_from_join_into_update() {
@@ -693,7 +735,50 @@ mod tests {
             )
             .await;
             assert_eq!(v["code"], 400, "{v}");
-            // 5) toSQL 回放形态（方言引号 + 绑定参数）→ 过（回归守卫）
+            // 5) 数字形态的租户 id（v0.1.22）→ 过
+            let v = run_sql(
+                &b,
+                RequestInfo {
+                    tenant_id: Some("42".into()),
+                    ..Default::default()
+                },
+                r#""select * from t where tenant_id = ?""#,
+                &[json!(42)],
+            )
+            .await;
+            assert_eq!(v["code"], 0, "数字租户 id 应被视为已绑定：{v}");
+
+            // 6) 大整数标记形态（`toBigInt("42")`，雪花租户 id 的唯一精确通路）→ 过
+            let v = run_sql(
+                &b,
+                RequestInfo {
+                    tenant_id: Some("42".into()),
+                    ..Default::default()
+                },
+                r#""select * from t where tenant_id = ?""#,
+                &[json!({"$oj$i64": "42"})],
+            )
+            .await;
+            assert_eq!(v["code"], 0, "大整数标记租户 id 应被视为已绑定：{v}");
+
+            // 7) 标记值不等于租户 id → 仍拒（标记不得成为绕过门）
+            let v = run_sql(
+                &b,
+                RequestInfo {
+                    tenant_id: Some("42".into()),
+                    ..Default::default()
+                },
+                r#""select * from t where tenant_id = ?""#,
+                &[json!({"$oj$i64": "43"})],
+            )
+            .await;
+            assert_eq!(v["code"], 400, "{v}");
+            assert!(
+                v["msg"].as_str().unwrap().contains("params must include"),
+                "{v}"
+            );
+
+            // 8) toSQL 回放形态（方言引号 + 绑定参数）→ 过（回归守卫）
             let cap = b
                 .run_with(
                     r#"json.ok(db.table("t").select(["name"]).toSQL());"#,

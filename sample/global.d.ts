@@ -362,6 +362,15 @@ declare global {
   const oidc: OidcApi;
   const bcrypt: BcryptApi;
 
+  // ---- 大整数（v0.1.22；详见 docs/numeric-limits.md）----
+  // DB 的 i64 超出安全整数范围（|v| > 2^53-1，雪花 id 常态）时，读出来是**十进制字符串**；
+  // 写回去必须用 toBigInt()（字符串是文本意图，PG 上写 bigint 列会直接报错）。
+  // 两者都 fail-loud：非规范十进制 / 已坍缩的 number 一律抛错，不静默取近似。
+  /** 十进制整数字符串 | 安全范围内的 number | bigint → bigint（精确 64 位）。 */
+  function toBigInt(v: string | number | bigint): bigint;
+  /** number | 数字串（含科学计数法）| bigint → number（f64，**显式接受精度丢失**）。 */
+  function toDouble(v: string | number | bigint): number;
+
   // crypto 增补（bootstrap 对原生 crypto 做 Object.assign 合并，原生成员保留）：
   // sha256Hex = 十六进制摘要；randomHex = nBytes 字节随机数的 hex（默认 32 字节）。
   interface Crypto {

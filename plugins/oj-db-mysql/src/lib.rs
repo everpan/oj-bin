@@ -83,6 +83,11 @@ fn bind_value<'q>(
     q: Query<'q, Any, AnyArguments>,
     v: &serde_json::Value,
 ) -> Query<'q, Any, AnyArguments> {
+    // 大整数标记（v0.1.22，`toBigInt()` 的返回值）：绑 i64。必须在对象分支之前——
+    // 否则会被 `other => to_string()` 串化成文本（与 pg/sqlite 同构）。
+    if let Some(i) = oj_plugin_ffi::jsint::marker_i64(v) {
+        return q.bind(i);
+    }
     match v {
         serde_json::Value::Null => q.bind(None::<String>),
         serde_json::Value::Bool(b) => q.bind(*b),
@@ -695,6 +700,14 @@ mod tests {
             .as_u64()
             .unwrap();
 
+        // 先清场：本用例只 `create if not exists` + 固定 id 插入，残留行会让重跑撞主键。
+        drive(&mut exec(
+            handle,
+            RString::from("drop table if exists oj_plugin_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("drop");
         drive(&mut exec(
             handle,
             RString::from("create table if not exists oj_plugin_t (id int primary key, v text)"),
@@ -777,6 +790,77 @@ mod tests {
         ))
         .await
         .expect_err("unknown handle after close");
+    }
+
+    /// 大整数参数（v0.1.22）：`toBigInt()` 的标记形态 → i64 → bigint 列，精确往返。
+    /// env-gated：`OJ_TEST_MYSQL=mysql://…`；未设 env 直接跳过（不进网络）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_bigint_marker_binds_i64() {
+        let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let ex = |sql: &str, params: &str| {
+            let mut f = exec(handle, RString::from(sql), RString::from(params));
+            async move { drive(&mut f).await }
+        };
+        let qy = |sql: &str, params: &str| {
+            let mut f = query(handle, RString::from(sql), RString::from(params));
+            async move { drive(&mut f).await }
+        };
+
+        ex("drop table if exists oj_bigint_t", "[]").await.unwrap();
+        ex(
+            "create table oj_bigint_t (id bigint primary key, note text)",
+            "[]",
+        )
+        .await
+        .unwrap();
+
+        // 标记参数 → i64 → bigint 主键（雪花量级 + i64::MIN）
+        ex(
+            "insert into oj_bigint_t (id, note) values (?, ?)",
+            r#"[{"$oj$i64":"4886674138783273204"},"marker"]"#,
+        )
+        .await
+        .expect("marker param must bind as i64");
+        ex(
+            "insert into oj_bigint_t (id, note) values (?, ?)",
+            r#"[{"$oj$i64":"-9223372036854775808"},"imin"]"#,
+        )
+        .await
+        .expect("i64::MIN must round-trip");
+
+        let rows = qy("select id, note from oj_bigint_t order by id", "[]")
+            .await
+            .expect("query");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        assert_eq!(
+            v[0]["id"],
+            serde_json::json!(-9223372036854775808i64),
+            "插件行转换必须逐字精确：{v}"
+        );
+        assert_eq!(v[1]["id"], serde_json::json!(4886674138783273204i64), "{v}");
+
+        // where 用标记参数比较 bigint 列
+        let rows = qy(
+            "select note from oj_bigint_t where id = ?",
+            r#"[{"$oj$i64":"4886674138783273204"}]"#,
+        )
+        .await
+        .expect("marker param must compare against bigint column");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        assert_eq!(v[0]["note"], serde_json::json!("marker"), "{v}");
+
+        ex("drop table if exists oj_bigint_t", "[]").await.unwrap();
+        close(handle);
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}

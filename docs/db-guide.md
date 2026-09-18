@@ -556,6 +556,11 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 3. **update/delete 必须带 where 且叶子 ≥ 1**——防全表误伤，JS 与 op 双层强制。
 4. 数量级：条件树深度 ≤ 8、叶子 ≤ 64；嵌套 select ≤ 4 层；limit 显式 ≤ 1000。
 5. **多写 .toSQL()**：与执行同管线，报错前先看它渲染出了什么。
+6. **64 位整数（雪花 id）读出来是字符串**（v0.1.22）：`|v| > 2^53-1` 的 i64 一律以十进制
+   字符串交付（超界给 bigint 会让 `json.ok` 直接 500）；回写用 `toBigInt()`——
+   **字符串是文本意图、BigInt 是整数意图**，平台不做启发式转换（PG 上字符串写 bigint 列必报
+   `column "x" is of type bigint but expression is of type text`）。**绝不要 `Number(大整数字符串)`**。
+   完整契约与范式见 `docs/numeric-limits.md`。
 
 ### 常见报错速查
 
@@ -573,6 +578,11 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `condition tree too deep (max 8)` / `too large (max 64 leaves)` | 条件树超限 | 拍平/拆分条件 |
 | `in needs array value` | `op:"in"` 值非数组 | 传数组 |
 | `value and subquery are mutually exclusive` | 叶子同时给了 value 和 subquery | 二选一 |
+| `column "x" is of type bigint but expression is of type text`（PG） | 回写给 bigint 列传了**字符串** | 用 `toBigInt(...)`（见 §11 第 6 条） |
+| `operator does not exist: bigint = text`（PG） | `where bigint 列 = $1` 传了字符串 | 同上 |
+| 主键 `duplicate key`，被撞值末几位是 0 | `Number(max(id)) + 1` 坍缩到 f64 网格值 | 改 `toBigInt(max) + 1n`（`docs/numeric-limits.md` §3） |
+| `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
+| `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | 同一 SQL 文本混用字符串/数字参数（语句缓存既有隐患） | 保持参数形态稳定或换 SQL 文本 |
 | `subquery: nested select too deep` | 嵌套 > 4 层 | 减层或拆 CTE |
 | `nested select does not accept with/unions (v1)` | 子查询/union 成员带了 with/unions | 移到顶层 |
 | `union requires explicit columns` | union 侧省略 select 列 | 双方显式列且列数一致 |

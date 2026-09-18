@@ -16,7 +16,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
    公开分享页按租户读数据（`db.asTenant` + `tenant.allow_as_tenant`）/ SPA 深链回落与每页
    meta（`app_spa_fallback` + `html_meta`）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
    列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态 /
-   多库项目按库迁移与对账（`oj migrate --db <name>`）。
+   多库项目按库迁移与对账（`oj migrate --db <name>`）/ 大整数 id 的生成与回写（`toBigInt`）。
    **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
    `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
@@ -44,6 +44,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
   用**；HTTP/WS handler 里调用直接报错——HTTP 侧发消息用 `send`/`publish`。
 - **任务等待**：运行时无 timer 全局，`setTimeout/setInterval` 不可用；任务里等待
   一律 `await tasks.sleep(ms)`，循环退出条件一律 `!tasks.stopping()`。
+- **大整数（雪花 id / i64）**：DB 的 `|v| > 2^53-1` 的整数读出来是**十进制字符串**（不是
+  number）；**绝不用 `Number()`**（会静默坍缩成 f64 网格值 → 主键 dup 500，即 U38 事故），
+  运算与回写一律 `toBigInt(row.id) + 1n` 并把结果直接当参数传回（§6「大整数与 i64」）。
 
 ## 新模块 checklist
 
@@ -93,6 +96,10 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 尾 `/*` 匿名路径收不到豁免（v0.1.20） | 尾 `/*` 已统一为**严格一层**（旧 oj-auth 侧是任意深度）；跨层改 `/x/**`，启动会对含尾 `/*` 的列表打聚合迁移 WARN。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
+| 雪花 id / 大整数算错、主键 dup 500 | i64 超 `2^53-1` 读出来是**字符串**；`Number(row.id) + 1` 会静默坍缩到 f64 网格值（下次分配撞主键）。范式：`toBigInt(rows[0].m) + 1n` → 直接回写 `db.exec(..., [next])`（v0.1.22，见 `scenarios.md` 场景 7） |
+| `toBigInt` 抛 `not a safe integer` | 传进去的是已坍缩的 number（多为 `Number(...)` 的产物）——传 DB 原样给出的**十进制字符串** |
+| PG 报 `column "x" is of type bigint but expression is of type text` | 回写用了字符串——字符串是文本意图，整数要用 `toBigInt(...)`（PG 不做隐式转换；MySQL/SQLite 会转换但别依赖） |
+| 同一 SQL 混合参数类型后报 `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | PG prepared statement 缓存的既有隐患（与本次无关，v0.1.21 也能复现）：同一 SQL 文本混用字符串/数字参数。换 SQL 文本或保持参数形态稳定 |
 | 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`fixture` / `schema diff` 同旗标） |
 | `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
 | `--db "x" not declared in config (db keys: […])` | 库名不在 config `db:` 段（键即库名）——工具**故意不回落** `default`，防迁移打在开发库上 |
@@ -117,7 +124,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
 
 `scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
-测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）。
+测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）/
+大整数 id（雪花）的生成与精确回写。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
 （json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

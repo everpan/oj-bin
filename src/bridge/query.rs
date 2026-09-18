@@ -433,6 +433,11 @@ fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsError
 }
 
 fn to_qv(v: &Value) -> Qv {
+    // 大整数标记（v0.1.22，`toBigInt()` 的返回值）：绑 i64。必须在 `other => to_string()`
+    // 之前——否则标记对象会被串化成文本（PG 拒绝 text → bigint）。
+    if let Some(i) = oj_plugin_ffi::jsint::marker_i64(v) {
+        return Qv::BigInt(Some(i));
+    }
     match v {
         Value::Null => Qv::String(None),
         Value::Bool(b) => Qv::Bool(Some(*b)),
@@ -1546,7 +1551,7 @@ pub async fn op_db_query_build(
         super::db::Target::Pool(da) => Exec::Pool(da),
         super::db::Target::Tx(t) => Exec::Tx(t.session.lock().await),
     };
-    let out = if rows && !last_id {
+    let mut out = if rows && !last_id {
         ex.query(&sql, &params).await.map(Value::Array).map_err(err)
     } else if last_id {
         ex.exec(&sql, &params).await.map_err(err)?;
@@ -1565,6 +1570,10 @@ pub async fn op_db_query_build(
     } else {
         ex.exec(&sql, &params).await.map(Value::from).map_err(err)
     };
+    // 出口护栏（见 jsnum）：行/合成行/受影响行数里的超界整数降十进制字符串，防 JS 侧 BigInt。
+    if let Ok(v) = out.as_mut() {
+        super::jsnum::sanitize_js_numbers(v);
+    }
     // 截断可观测（v0.1.20）：返回行数达到生效上限 ⇒ 可能是被 LIMIT 截断的（含「显式
     // limit 被 clamp」这类旧版完全静默的情形）。写响应头而不动信封形状（契约不变）。
     if let (Some(a), Ok(Value::Array(v))) = (applied, &out)
@@ -1606,7 +1615,10 @@ pub fn op_db_query_sql(
     // 与执行路径同款归一化 —— toSQL 必须反映真实 SQL（含隐式 LIMIT）。
     let _ = normalize_limit(&state, &mut req);
     let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
-    Ok(serde_json::json!({ "sql": sql, "params": params }))
+    // 出口护栏（见 jsnum）：`toSQL().params` 里的大整数同样会以 BigInt 交给 JS（json.ok 会 500）。
+    let mut out = serde_json::json!({ "sql": sql, "params": params });
+    super::jsnum::sanitize_js_numbers(&mut out);
+    Ok(out)
 }
 
 /// 两构造器 op 共用的租户预变换：读 StableState.sql_guard + ReqState（tenant_id/system），
@@ -1654,7 +1666,9 @@ fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
         Qv::TinyUnsigned(Some(i)) => Value::from(*i as i64),
         Qv::SmallUnsigned(Some(i)) => Value::from(*i as i64),
         Qv::Unsigned(Some(i)) => Value::from(*i as i64),
-        Qv::BigUnsigned(Some(i)) => Value::from(*i as i64),
+        // u64 直出（勿 `as i64`：> i64::MAX 会回绕成负数，静默错值）。超界部分由
+        // op 出口的 jsnum 护栏降为十进制字符串。
+        Qv::BigUnsigned(Some(i)) => Value::from(*i),
         Qv::Float(Some(f)) => num(*f as f64),
         Qv::Double(Some(f)) => num(*f),
         Qv::String(Some(s)) => Value::String(s.to_string()),
@@ -1752,6 +1766,25 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "query failed: {v}");
         v["data"]["n"].as_u64().unwrap() as usize
+    }
+
+    /// `value_to_json` 的 u64 不再回绕（v0.1.22）：`> i64::MAX` 直出 u64，
+    /// 避免旧实现 `as i64` 静默变负数；超界部分由 op 出口护栏降为十进制字符串。
+    #[test]
+    fn value_to_json_keeps_u64_and_bigint_exact() {
+        assert_eq!(
+            value_to_json(&Qv::BigInt(Some(i64::MIN))).unwrap(),
+            json!(i64::MIN)
+        );
+        assert_eq!(
+            value_to_json(&Qv::BigUnsigned(Some(u64::MAX))).unwrap(),
+            json!(u64::MAX)
+        );
+        assert_eq!(value_to_json(&Qv::BigUnsigned(Some(0))).unwrap(), json!(0));
+        // 出口护栏把超界整数降为字符串（端到端见 accessor_sqlx 的 bigint 用例）
+        let mut v = value_to_json(&Qv::BigUnsigned(Some(u64::MAX))).unwrap();
+        super::super::jsnum::sanitize_js_numbers(&mut v);
+        assert_eq!(v, json!("18446744073709551615"));
     }
 
     // ----- LIMIT 配置（db_query 段，v0.1.20）-----

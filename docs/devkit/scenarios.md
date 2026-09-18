@@ -14,6 +14,7 @@
 | [4](#场景-4列表分页与-limit-陷阱) | 「怎么只返回了 100 条」——LIMIT 策略可配 + 截断可观测 | §3 数据层 / §6 db |
 | [5](#场景-5匿名路径怎么写) | `anonymous_paths` 的四种通配形态 + v0.1.20 迁移 | §8 鉴权与多租户 |
 | [6](#场景-6多库项目按库迁移与对账) | config 多了命名库：`oj migrate/fixture/schema diff --db <name>` 逐库跑（v0.1.21） | §3 数据层 / §10 db |
+| [7](#场景-7雪花-id大整数的生成与回写) | 雪花 id 读出是字符串，`Number()` 会静默坍缩 → 主键 dup 500；范式 `toBigInt(m) + 1n`（v0.1.22） | §6 大整数与 i64 |
 
 ---
 
@@ -417,6 +418,64 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 | 想用 `oj server --db` 切库 | 没有这个旗标：运行期按模块 `manifest.db` 路由，`server` 恒以 `default` 为基库 |
 
 > 机制与边界详见仓库 `docs/migration.md` §3.8、`docs/db-guide.md` §1.1。
+
+---
+
+## 场景 7：雪花 id（大整数）的生成与回写
+
+**什么时候用**：主键是雪花 id、或自增 id 已涨过 `2^53-1`（≈9.0e15）——此时
+`db.query` 读出来的值**不是 number 而是十进制字符串**，`Number()` 一转就静默算错。
+
+### ① 配置 / 建表
+
+```sql
+CREATE TABLE seq (id bigint PRIMARY KEY, note text);
+INSERT INTO seq VALUES (4886674138783273204, 'seed');   -- 一个雪花量级起点
+```
+
+### ② 代码（`max+1` 发号，最小改写）
+
+```ts
+// ✗ 事故写法：Number() 把超界整数压到 f64 网格 → +1 被吸收 → 下次分配算同一个值 → dup 500
+const bad = Number((await db.query("select max(id) as m from seq"))[0].m) + 1;
+
+// ✅ 范式：读出来是字符串，转 bigint 做精确算术，结果直接回写
+const rows = await db.query("select max(id) as m from seq");
+const next = toBigInt(rows[0]?.m ?? "0") + 1n;      // bigint；空表用 "0"
+await db.exec("insert into seq (id, note) values (?, ?)", [next, "auto"]);
+json.ok({ id: next });                               // 出线是 "4886674138783273205"（字符串）
+```
+
+按 id 查也同理（**不要**回传字符串）：
+
+```ts
+await db.query("select note from seq where id = ?", [toBigInt(idFromClient)]);  // ✅
+await db.query("select note from seq where id = ?", [idFromClient]);            // ✗ PG: bigint = text
+```
+
+### ③ 验证
+
+```ts
+// 连续两次分配必须各自推进（并把"旧写法会坍缩"钉死）
+const m = toBigInt((await db.query("select max(id) as m from seq"))[0].m);
+const collapsed = Number(m.toString()) + 1;
+expect(collapsed === Number(m)).toBe(true);          // +1 被 f64 吸收
+expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 主键 `duplicate key`，被撞的值末几位是 0 | `Number(max)+1` 算出的是 f64 网格值（不是 max+1），入过库后下次再算同一个值 |
+| `toBigInt: … is not a safe integer` | 传进去的已是 `Number(...)` 的产物——传 DB 原样给出的字符串 |
+| PG: `column "id" is of type bigint but expression is of type text` | 回写用了字符串——用 `toBigInt()`（字符串是文本意图，平台不做启发式转换） |
+| PG: `operator does not exist: bigint = text` | `where id = ?` 传了字符串——同上 |
+| `unsupported type`（`es`/`bus`/`mq`/`jwt`/`ws.sess.state`） | bigint 跨了不容忍的边界——先 `String(v)`（`json.*` / `log` / `mail` 已容忍） |
+| 并发下仍然分配出重复序号 | `max+1` 本身有竞态（与精度无关）——改数据库序列 / `RETURNING` / 行锁 + 唯一索引重试 |
+| 同一条 SQL 混用字符串/数字参数后报 `invalid byte sequence … 0x00` | PG prepared statement 缓存的既有隐患——保持参数形态稳定或换 SQL 文本 |
+
+> 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
 
 ---
 

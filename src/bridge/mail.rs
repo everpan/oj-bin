@@ -1518,7 +1518,11 @@ pub async fn op_mail_result(
     let g = state.borrow();
     let (backend, ..) = mail_deps(&g)?;
     let owner = MailOwner::new(&key, &CallCtx::from_state(&g));
-    Ok(backend.router().get(&job_id, &owner).unwrap_or(Value::Null))
+    // 出口护栏（见 jsnum）：结果体是插件侧 JSON，若含雪花量级整数会以 v8 BigInt 交给 JS
+    // （`json.ok` 直接 500）。与其它 op 出口一致降为十进制字符串。
+    let mut out = backend.router().get(&job_id, &owner).unwrap_or(Value::Null);
+    super::jsnum::sanitize_js_numbers(&mut out);
+    Ok(out)
 }
 
 /// mail.profiles()：已配置的 profile 名清单（**非密钥面**：凭据/连接字段不进 JS）。

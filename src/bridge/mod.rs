@@ -40,6 +40,7 @@ pub mod guard;
 mod http;
 pub mod import_scan;
 mod inspector;
+mod jsnum;
 mod json;
 mod kv;
 mod loader;

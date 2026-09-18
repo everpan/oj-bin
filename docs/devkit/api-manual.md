@@ -599,6 +599,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
+| `toBigInt(v)` / `toDouble(v)` | **大整数转换**（v0.1.22）：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
 ### json —— 信封与响应头
@@ -884,6 +885,44 @@ await db.table("rich")
   默认值由 `db_query.default_limit`（默认 100）给出，显式 limit 被 `db_query.max_limit`
   （默认 1000）clamp；两者均可在配置中调整（硬顶 100000）。顶层结果为数组且行数 ≥ 生效
   上限时，响应带 `X-OJ-Row-Limit: <上限>` 头提示可能被截断。
+
+### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
+
+JS 的 `number` 只有 f64 精度（安全整数上界 **`2^53-1`**，约 9007199254740991）。雪花 id、
+跑到后期的自增主键都远超它，所以平台按**值域**分流：
+
+| DB 值（BIGINT） | JS 侧 | 例 |
+|---|---|---|
+| `\|v\| ≤ 2^53-1` | `number` | `42` |
+| `\|v\| > 2^53-1` | **十进制字符串**（逐字精确） | `"4886674138783273204"` |
+
+（REAL/DOUBLE 列仍是 `number`；`es.search` 的 long 字段同规则。）
+
+- **`toBigInt(v): bigint`** —— 字符串/安全范围内的 number/bigint → 精确 64 位整数。
+  **fail-loud**：`Number("<大整数串>")` 的产物、`1.5`、`"007"`、超 i64 等一律 **throw**。
+- **`toDouble(v): number`** —— 显式接受 f64（可能丢精度）。没有 `toFloat`（JS 无 f32 语义）。
+
+```ts
+// ✅ 生成下一序号（max+1）——读出来是字符串，算完用 toBigInt 写回
+const rows = await db.query("select max(id) as m from seq");
+const next = toBigInt(rows[0]?.m ?? "0") + 1n;
+await db.exec("insert into seq (id) values (?)", [next]);   // bigint → 精确绑定 i64
+json.ok({ id: next });                                      // 出线是字符串
+
+// ✗ 事故写法：Number() 静默坍缩到 f64 网格 → 下次分配撞主键 dup 500
+const seq = Number(rows[0].m) + 1;
+```
+
+- **字符串是文本意图，BigInt 是整数意图**：平台不做启发式猜测。回传**字符串**写 bigint 列在
+  PostgreSQL 上必然报错（`column "x" is of type bigint but expression is of type text`）；
+  MySQL/SQLite 会隐式转换，但不要依赖方言差异。
+- `json.ok / json.raw / json.fail / log 字段 / mail` 容忍 bigint（自动出十进制字符串）；
+  **`es` / `bus` / `mq` / `jwt` / `ws.sess.state` 不容忍**——跨这些边界先 `String(v)`。
+- `max+1` 并发下有竞态（会分配出相同序号），终态用序列/原子分配。
+- **保留键红线**：`$oj$` 前缀是平台内部线格式（`toBigInt()` 参数编码为
+  `{"$oj$i64":"<十进制>"}`）——业务 JSON 数据不得以 `$oj$i64` 之类的 `$oj$` 键为唯一键，
+  否则在**参数位置**会被当作整数绑定。
+- 完整契约、判据表与排障见仓库 `docs/numeric-limits.md`；另见 `scenarios.md` 场景 7。
 
 ### kv / redis —— KV 存储
 
@@ -2080,6 +2119,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
+| i64 超界读出来是字符串，不是 number（v0.1.22） | `\|v\| > 2^53-1`（雪花 id 常态）按值域分流为十进制字符串——改过 `typeof id === "number"` 判断的代码要复查；回写用 `toBigInt()`，别用 `Number()`（会静默坍缩） |
+| `Number("<大整数串>")` 平台拦不住 | 语言语义，只能靠范式：`toBigInt(rows[0].m) + 1n`（`toBigInt` 对已坍缩的值会抛错） |
+| `u64` / `BIGINT UNSIGNED` 未支持 | 读侧对 `> i64::MAX` 的 u64 给十进制字符串（不回绕成负数），但全链路精确性不保证 |
 | 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
 | `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |
@@ -2088,6 +2130,11 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 ### 常见陷阱清单
 
 - `del` 不是 `delete`——DELETE 请求映射方法名 `del`，写错返回 405。
+- 大整数（雪花 id / i64）：读出来是**字符串**，算之前 `toBigInt()`，回写也用它的结果；
+  `Number("<大整数串>")` 会静默坍缩成 f64 网格值（后续撞主键 dup 500），详见 §6「大整数与 i64」。
+- 同一条 SQL 文本别混用不同类型的参数（一会儿字符串、一会儿数字/大整数）——PG 的
+  prepared statement 缓存会给出协议级报错（`invalid byte sequence for encoding "UTF8": 0x00`
+  等）；换 SQL 文本或保持参数形态稳定。
 - `{id}.json` 混字面 pattern 非法——matchit 参数段不得混字面，拆成静态多段由 handler 校验。
 - `seed.sql` 不得含分号字面量（按 `;` 切分）；用 `INSERT OR IGNORE` 保证幂等。
 - postgres 占位符是 `$1`，sqlite/mysql 才是 `?`。

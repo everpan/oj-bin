@@ -50,6 +50,11 @@ impl SqlxAccessor {
 
 /// 将单个 JSON 值绑定到 sqlx 语句（按类型选择可 Encode 的具体类型）。
 fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &Value) -> Query<'q, Any, AnyArguments> {
+    // 大整数标记（v0.1.22，`toBigInt()` 的返回值）：绑 i64。必须在对象分支之前——
+    // 否则会被 `other => to_string()` 串化成文本（PG 拒绝 text → bigint）。
+    if let Some(i) = oj_plugin_ffi::jsint::marker_i64(v) {
+        return q.bind(i);
+    }
     match v {
         Value::Null => q.bind(None::<String>),
         Value::Bool(b) => q.bind(*b),
@@ -358,6 +363,405 @@ mod tests {
         tx.commit().await.unwrap();
         // 已完结的事务再次使用 → "tx finished"
         assert!(tx.query("select 1", &[]).await.is_err());
+    }
+
+    /// 读侧大整数护栏（v0.1.22）：超界整数以**十进制字符串**交给 JS。
+    /// 旧行为是 v8 BigInt → `json.ok` 直接 500（`TypeError: Do not know how to serialize a BigInt`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bigint_reads_cross_as_decimal_strings() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        db.exec_with_params(
+            "create table big (id integer primary key, f real, t text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        // 边界：i64::MIN、2^53-1（安全上界）、2^53、2^53+1、i64::MAX
+        for id in [
+            i64::MIN,
+            9007199254740991i64,
+            9007199254740992,
+            9007199254740993,
+            i64::MAX,
+        ] {
+            db.exec_with_params(
+                "insert into big (id, f, t) values (?, 1.5, ?)",
+                &[json!(id), json!(id.to_string())],
+            )
+            .await
+            .unwrap();
+        }
+        let registry = SchemaRegistry::new().table("big", &["id"], &["id", "f", "t"]);
+        let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
+
+        // ① db.query：超界 → string（精确），安全范围 → number，REAL 列仍是 number。
+        let cap = b
+            .run(
+                r#"
+                db.query("select id, f from big order by id")
+                  .then((rows) => json.ok({ ids: rows.map((r) => r.id), types: rows.map((r) => typeof r.id), f: rows[0].f }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "大整数读取不得再 500：{v}");
+        assert_eq!(
+            v["data"]["ids"],
+            json!([
+                "-9223372036854775808",
+                9007199254740991i64,
+                "9007199254740992",
+                "9007199254740993",
+                "9223372036854775807"
+            ]),
+            "逐字精确且阈值 = 2^53-1"
+        );
+        assert_eq!(
+            v["data"]["types"],
+            json!(["string", "number", "string", "string", "string"])
+        );
+        assert_eq!(v["data"]["f"], json!(1.5), "REAL 列仍是 number");
+
+        // ② 构造器路径（op_db_query_build）同一护栏。
+        let cap = b
+            .run(
+                r#"
+                db.table("big").select(["id"]).orderBy([{field:"id",dir:"asc"}]).limit(10).all()
+                  .then((rows) => json.ok({ ids: rows.map((r) => r.id) }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["ids"][4], json!("9223372036854775807"));
+
+        // ③ tx 内查询同护栏。
+        let cap = b
+            .run(
+                r#"
+                db.tx(async (tx) => {
+                  const rows = await tx.query("select id from big where id = ?", ["9223372036854775807"]);
+                  return json.ok({ id: rows[0].id, type: typeof rows[0].id });
+                }).catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"],
+            json!({"id": "9223372036854775807", "type": "string"})
+        );
+    }
+
+    /// 写侧大整数通道（v0.1.22）：`toBigInt()` 的 BigInt 经保留标记 → 宿主绑 i64，精确落库。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bigint_writes_round_trip_exactly() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        db.exec_with_params("create table w (id integer primary key, note text)", &[])
+            .await
+            .unwrap();
+        let registry = SchemaRegistry::new().table("w", &["id"], &["id", "note"]);
+        let b = Bridge::with_opts(db.clone(), Arc::new(InMemoryKV::new()), registry, false);
+
+        // ① db.exec 参数 + toBigInt 三种入参形态（十进制串 / safe number / bigint）
+        let cap = b
+            .run(
+                r#"
+                const ids = [toBigInt("4886674138783273204"), toBigInt(42), toBigInt(7n)];
+                Promise.all(ids.map((id, i) => db.exec("insert into w (id, note) values (?, ?)", [id, "n" + i])))
+                  .then(() => json.ok({ types: ids.map((v) => typeof v) }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "bigint 参数必须可写：{v}");
+        assert_eq!(v["data"]["types"], json!(["bigint", "bigint", "bigint"]));
+        // 直接读库（Rust 侧）核对逐字精确
+        let rows = db
+            .query_with_params("select id, note from w order by id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["id"], json!(7));
+        assert_eq!(rows[1]["id"], json!(42));
+        assert_eq!(rows[2]["id"], json!(4886674138783273204i64), "雪花量级精确");
+
+        // ② 构造器：insert 行值 + where 值 + update sets（嵌套值均须编码）
+        let cap = b
+            .run(
+                r#"
+                db.table("w").insert({ id: toBigInt("9007199254740993"), note: "ins" }).run()
+                  .then(() => db.table("w").update({ note: "upd" })
+                    .where({ field: "id", op: "eq", value: toBigInt("9007199254740993") }).run())
+                  .then(() => db.table("w").select(["note"])
+                    .where({ field: "id", op: "eq", value: toBigInt("9007199254740993") }).all())
+                  .then((rows) => json.ok({ row: rows[0] }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["row"]["note"], json!("upd"));
+
+        // ③ in 数组里的 bigint
+        let cap = b
+            .run(
+                r#"
+                db.table("w").select(["id"]).where({ field: "id", op: "in", value: [toBigInt("7"), toBigInt("9007199254740993")] })
+                  .orderBy([{field:"id",dir:"asc"}]).all()
+                  .then((rows) => json.ok({ ids: rows.map((r) => r.id) }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["ids"], json!([7, "9007199254740993"]));
+    }
+
+    /// `toBigInt` 的 fail-loud 与保留形状边界（v0.1.22）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn to_bigint_fails_loud_and_marker_is_strict() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        db.exec_with_params("create table s (t text)", &[])
+            .await
+            .unwrap();
+        let registry = SchemaRegistry::new().table("s", &["t"], &["t"]);
+        let b = Bridge::with_opts(db.clone(), Arc::new(InMemoryKV::new()), registry, false);
+
+        // 非法入参一律 throw（**不**静默 coerce）——尤其 Number("<超界串>") 这一 U38 陷阱
+        let cap = b
+            .run(
+                r#"
+                const cases = [
+                  [9007199254740992, "unsafe number"],   // 已坍缩的 f64
+                  [Number("4886674138783273204"), "Number(bigString)"],
+                  [1.5, "float"], ["1.5", "float string"], ["abc", "non-numeric"],
+                  ["007", "leading zero"], ["+1", "plus"], [" 1", "space"], ["-0", "neg zero"],
+                  ["9223372036854775808", "out of i64"], [null, "null"], [true, "bool"], [{}, "object"],
+                ];
+                const thrown = cases.map(([v]) => { try { toBigInt(v); return "NO-THROW"; } catch (e) { return e.constructor.name; } });
+                const dbl = ["abc", null, {}, true].map((v) => { try { toDouble(v); return "NO-THROW"; } catch (e) { return e.constructor.name; } });
+                json.ok({ thrown, dbl, ok: [String(toBigInt("9223372036854775807")), toDouble("1.5"), toDouble(3n)] });
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        for (i, t) in v["data"]["thrown"].as_array().unwrap().iter().enumerate() {
+            assert_ne!(t, "NO-THROW", "toBigInt 第 {i} 例必须抛错");
+        }
+        for (i, t) in v["data"]["dbl"].as_array().unwrap().iter().enumerate() {
+            assert_ne!(t, "NO-THROW", "toDouble 第 {i} 例必须抛错");
+        }
+        assert_eq!(v["data"]["ok"], json!(["9223372036854775807", 1.5, 3]));
+
+        // 畸形标记（非规范十进制）**不**被识别为整数：按普通对象串化绑定，而非静默绑 7。
+        b.run(
+            r#"db.exec("insert into s (t) values (?)", [{ "$oj$i64": "007" }]).then(() => json.ok({}));"#,
+        )
+        .await
+        .unwrap();
+        // 规范标记则绑 i64（写进 TEXT 列由 DB 自行转文本，值精确）
+        b.run(
+            r#"db.exec("insert into s (t) values (?)", [{ "$oj$i64": "42" }]).then(() => json.ok({}));"#,
+        )
+        .await
+        .unwrap();
+        let rows = db
+            .query_with_params("select t from s order by t", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["t"], json!("42"), "规范标记按 i64 绑定");
+        assert_eq!(
+            rows[1]["t"],
+            json!("{\"$oj$i64\":\"007\"}"),
+            "畸形标记按普通值处理（不静默绑 7）"
+        );
+    }
+
+    /// U38 回归（下游真实事故）：`Number(max(id)) + 1` 生成下一序号 → 静默坍缩 → dup 500。
+    /// 范式 `toBigInt(max) + 1n` 必须**精确且可重复**；同时把旧写法的坍缩钉成反证。
+    #[tokio::test(flavor = "current_thread")]
+    async fn u38_max_plus_one_sequence_stays_exact() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        db.exec_with_params("create table seq (id integer primary key, note text)", &[])
+            .await
+            .unwrap();
+        // 预置雪花量级起点（> 2^53），复刻事故表的初始状态
+        db.exec_with_params(
+            "insert into seq (id, note) values (?, 'seed')",
+            &[json!(4886674138783273204i64)],
+        )
+        .await
+        .unwrap();
+        let registry = SchemaRegistry::new().table("seq", &["id"], &["id", "note"]);
+        let b = Bridge::with_opts(db.clone(), Arc::new(InMemoryKV::new()), registry, false);
+
+        // ① 范式：连续两次分配都精确推进（旧写法第二次必然撞主键）
+        let good = r#"
+            (async () => {
+              const rows = await db.query("select max(id) as m from seq");
+              const next = toBigInt(rows[0].m) + 1n;
+              await db.exec("insert into seq (id, note) values (?, ?)", [next, "auto"]);
+              return json.ok({ next: next.toString(), readType: typeof rows[0].m });
+            })().catch((e) => json.fail(500, String(e)));
+        "#;
+        for i in 0..2i64 {
+            let cap = b.run(good).await.unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "第 {i} 次分配不得失败：{v}");
+            assert_eq!(v["data"]["readType"], "string", "读侧超大整数以字符串交付");
+            assert_eq!(
+                v["data"]["next"],
+                Value::from((4886674138783273204i64 + 1 + i).to_string()),
+                "必须逐字等于 max+1"
+            );
+        }
+        let n = db
+            .query_with_params("select count(*) c from seq", &[])
+            .await
+            .unwrap();
+        assert_eq!(n[0]["c"], json!(3), "3 行 = 种子 + 两次分配");
+
+        // ② 反证：旧写法（`Number(m) + 1`）算出的值已不是 max+1（静默坍缩）
+        let bad = r#"
+            (async () => {
+              const rows = await db.query("select max(id) as m from seq");
+              const m = toBigInt(rows[0].m);
+              const collapsed = Number(rows[0].m) + 1;            // U38 的写法
+              return json.ok({ collapsed, isExact: BigInt(collapsed) === m + 1n });
+            })().catch((e) => json.fail(500, String(e)));
+        "#;
+        let cap = b.run(bad).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["isExact"], false,
+            "旧写法必须被证明不等值（这正是事故起点）：{v}"
+        );
+    }
+
+    /// 评审补测（v0.1.22）：其余到达参数的 JS 入口与快照 API 的 bigint 编码。
+    /// 覆盖 `db.query` 参数、`toSQL().params`、`toJSON/fromJSON` 往返、`having`、
+    /// CASE `then`、`union/with` 子查询（unwrapSub）、Date 的 JSON 语义不变。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bigint_covers_remaining_js_entry_points() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        db.exec_with_params("create table c (id integer primary key, t text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into c (id, t) values (?, ?)",
+            &[json!(9007199254740993i64), json!("n")],
+        )
+        .await
+        .unwrap();
+        let registry = SchemaRegistry::new().table("c", &["id"], &["id", "t"]);
+        let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
+
+        let cap = b
+            .run(
+                r#"
+                (async () => {
+                  // ① db.query 的参数也走编码（含未经 toBigInt 的裸 bigint 字面量）
+                  const r1 = await db.query("select ? as v", [9007199254740993n]);
+                  const r2 = await db.query("select t from c where id = ?", [toBigInt("9007199254740993")]);
+                  // ② toSQL().params：标记 → i64 → 出线又是字符串（读侧护栏同款）
+                  const ts = db.table("c").select(["t"]).where({field:"id",op:"eq",value: toBigInt("9007199254740993")}).toSQL();
+                  // ③ toJSON/fromJSON 往返：标记必须存活，且 fromJSON 后仍可执行
+                  const snap = db.table("c").where({field:"id",op:"eq",value: toBigInt("9007199254740993")}).toJSON();
+                  const viaSnap = await db.fromJSON(snap).select(["t"]).all();
+                  // ④ having + CASE then 的编码进快照可见
+                  const hv = db.table("c").select(["t"]).having({field:"id",op:"eq",value: toBigInt("9007199254740993")}).toJSON();
+                  const cw = db.table("c").select([{case:{when:[{cond:{field:"id",op:"eq",value: toBigInt("7")}, then: toBigInt("9007199254740993")}], else: toBigInt("1")}, as:"x"}]).toJSON();
+                  // ⑤ union/with 子查询（unwrapSub）：标记跨嵌套存活
+                  const un = db.table("c").select(["id"]).union(
+                    db.table("c").select(["id"]).where({field:"id",op:"eq",value: toBigInt("9007199254740993")})
+                  ).toJSON();
+                  // ⑥ Date 的 JSON 语义未被破坏（快照里应是 ISO 串而非 {}）
+                  const dt = db.table("c").where({field:"t",op:"gt",value: new Date(0)}).toJSON();
+                  return json.ok({ r1: r1[0].v, r2: r2[0]?.t, tsParam0: ts.params[0], viaSnap: viaSnap[0]?.t,
+                                   hv: hv.having, cw: cw.columns[0], un: un.unions[0].query.conditions[0].value,
+                                   dt: dt.conditions[0].value });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // ① 写侧编码 + 读侧护栏：写进去的 i64 精确，读出来是字符串
+        assert_eq!(v["data"]["r1"], json!("9007199254740993"));
+        assert_eq!(v["data"]["r2"], json!("n"));
+        // ② toSQL().params 的超界整数同样是字符串（sanitize 覆盖 Qv::BigInt 路径）
+        assert_eq!(v["data"]["tsParam0"], json!("9007199254740993"));
+        // ③ 快照往返后仍能精确命中
+        assert_eq!(v["data"]["viaSnap"], json!("n"));
+        // ④ having / CASE then 都被编码为标记（having 存的是整棵条件树）
+        assert_eq!(
+            v["data"]["hv"]["value"]["$oj$i64"],
+            json!("9007199254740993")
+        );
+        assert_eq!(
+            v["data"]["cw"]["case"]["when"][0]["then"]["$oj$i64"],
+            json!("9007199254740993")
+        );
+        assert_eq!(v["data"]["cw"]["case"]["else"]["$oj$i64"], json!("1"));
+        // ⑤ 子查询里的标记存活
+        assert_eq!(v["data"]["un"]["$oj$i64"], json!("9007199254740993"));
+        // ⑥ Date 仍是 ISO 串（不是 {}）——快照走 JSON 语义
+        assert_eq!(v["data"]["dt"], json!("1970-01-01T00:00:00.000Z"));
+    }
+
+    /// 评审核对：`toDouble` 按 `Number()` 语义（文档须与实现一致）；二进制参数显式拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn to_double_follows_number_semantics_and_binary_params_rejected() {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.expect("connect");
+        let b = Bridge::with_opts(
+            db,
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+        );
+        let cap = b
+            .run(
+                r#"
+                (async () => {
+                  const d = [toDouble("1.5"), toDouble("1e3"), toDouble("0x10"), toDouble("Infinity"), toDouble(" 2 ")];
+                  let bin = "NO-THROW";
+                  try { await db.query("select ? as v", [new Uint8Array([1, 2])]); bin = "db.query:NO-THROW"; } catch (e) { bin = "db.query:" + e.constructor.name; }
+                  return json.ok({ d, bin });
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // `Number()` 语义：十六进制/Infinity/前后空白照旧接受（文档已按此描述）
+        assert_eq!(v["data"]["d"][0], json!(1.5));
+        assert_eq!(v["data"]["d"][1], json!(1000));
+        assert_eq!(v["data"]["d"][2], json!(16));
+        assert!(v["data"]["d"][3].is_null(), "Infinity 不能进 JSON → null");
+        assert_eq!(v["data"]["d"][4], json!(2));
+        // 二进制参数：改动前后都是 TypeError（旧为 serde_v8 类型错，新为显式检查 + 更清晰的消息）
+        assert_eq!(
+            v["data"]["bin"],
+            json!("db.query:TypeError"),
+            "二进制参数必须报错"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

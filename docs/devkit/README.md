@@ -6,8 +6,8 @@
 
 | 文件 | 用途 |
 |---|---|
-| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、ext_boot.js 运行时扩展）、鉴权租户、测试、配置、构建发布、运维、安全红线 |
-| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`，v0.1.21）——每篇给「配置 + 代码 + 验证 + 常见坑」 |
+| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、**大整数与 i64（`toBigInt`/`toDouble`，雪花 id 必读）**、ext_boot.js 运行时扩展）、鉴权租户、测试、配置、构建发布、运维、安全红线 |
+| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`，v0.1.21）、雪花 id 大整数的生成与精确回写（`toBigInt`，v0.1.22）——每篇给「配置 + 代码 + 验证 + 常见坑」 |
 | `SKILL.md` | Claude Code 等 agent 的 skill 入口：工作流、红线、checklist、陷阱速查，按章节号引用手册 |
 | `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示。来源为 `sample/global.d.ts`，经 `cargo xtask build` 与本目录文档一同归置到 `bin/devkit/` |
 | `oj-modules.d.ts` | **`#` 导入别名的 ambient 兜底**（`declare module "#*"`）：oj 的 `#x`/`#/m/x` 是「引用方模块」相对别名，TS `paths` 无法表达，无法静态定位的 `#` 导入会被兜底为 `any`（不再报 TS2307）。**非模块** `.d.ts`，须与 `global.d.ts` 一并拷入项目并纳入 tsconfig `include` |

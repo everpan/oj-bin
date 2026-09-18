@@ -339,19 +339,22 @@ pub async fn op_db_query(
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
-    match resolve_target(&state, &name)? {
+    let mut rows = match resolve_target(&state, &name)? {
         Target::Pool(da) => da
             .query_with_params(&sql, &params)
             .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?,
         Target::Tx(t) => t
             .session
             .lock()
             .await
             .query(&sql, &params)
             .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
-    }
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+    };
+    // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
+    super::jsnum::sanitize_rows(&mut rows);
+    Ok(rows)
 }
 
 /// db.exec(sql, params?)：Promise<受影响行数>。
