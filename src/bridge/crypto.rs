@@ -127,7 +127,12 @@ pub fn op_jwt_verify(
         &v,
     )
     .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-    serde_json::to_value(d.claims).map_err(|e| JsErrorBox::generic(e.to_string()))
+    // 出口护栏（见 jsnum）：claims 是**外部可控**的 JSON——雪花量级的数值声明若原样交给 JS
+    // 会变成 v8 BigInt，handler 里 `json.ok(claims)` 直接 500。
+    let mut claims =
+        serde_json::to_value(d.claims).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    super::jsnum::sanitize_js_numbers(&mut claims);
+    Ok(claims)
 }
 
 /// jwt.accessDuration / jwt.refreshDuration（秒；getter 每 runtime 惰性取）。

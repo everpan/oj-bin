@@ -11,6 +11,7 @@ pub mod bus;
 pub mod db;
 pub mod es;
 pub mod future;
+pub mod jsint;
 pub mod kv;
 pub mod mail;
 pub mod mq;

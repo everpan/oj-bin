@@ -2,6 +2,94 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.22（2026-09-19）
+
+修掉「DB 的 64 位整数值跨 JS 边界」的三重缺陷：**读侧必然 500**、**写侧静默精度丢失（假碰撞）**、
+**PG 上字符串写法完全不通**。下游 U38（生产 PG 实测：`Number(max(id))+1` 坍缩 → 主键 dup 500）
+即此链条。设计与证据手册见新增的 `docs/numeric-limits.md`。
+
+**行为变更（读侧，需复查存量代码）**
+
+- **i64 超出 JS 安全整数范围（`|v| > 2^53-1`，雪花 id 常态）时，读值由 v8 `BigInt` 改为
+  十进制字符串**。旧行为下任何含此类值的 `json.ok(rows)` 都直接 500
+  （`TypeError: Do not know how to serialize a BigInt`），故**无兼容性风险**（无人能依赖一个
+  必然失败的行为）；但改过 `typeof id === "number"` 判断的代码需复查。
+  阈值与 serde_v8 的 `MAX_SAFE_INTEGER` **逐字一致**（`(1<<53)-1`：写在 `2^53` 上会漏转 `2^53` 本身）。
+  安全范围内的整数、REAL/DOUBLE 的 f64、TEXT 一律不变。`Json`/`Row` 类型无需改动（本就含 string）。
+
+**特性**
+
+- **新增两个 JS 全局：`toBigInt(v)` / `toDouble(v)`**（`bootstrap.js`；三个 JsRuntime 入口
+  共用 `bridge_ext`，故 HTTP 池 / 任务池 / `oj test` 都可用）。**不做 `toFloat`**——JS 的
+  `Number` 就是 f64，没有独立的 f32 语义。
+  - `toBigInt`：十进制串 / 安全范围内的 number / bigint → `bigint`，**fail-loud**：已坍缩的
+    number（`Number("<大整数串>")` 的产物，任何 `|v| > 2^53-1` 的 f64 都不是 safe integer）、
+    `1.5`、`"007"`、`"+1"`、超 i64 等一律抛错并给出指引。这是 U38 陷阱在**调用点**的捕手。
+  - `toDouble`：number / 数字串（含科学计数法）/ bigint → `number`，**显式接受精度丢失**。
+- **写侧大整数通道**：`toBigInt()` 的返回值是真 `BigInt`（U38 范式需要 `+1n` 精确算术），
+  跨 op 时由 bootstrap 的参数包装层递归编码为保留形状 `{"$oj$i64":"<十进制>"}`
+  （serde_v8 的 `ValueType::BigInt` 直接 `UnsupportedType`，且其 magic/transl8 trait 是
+  `pub(crate)`，外部无法自定义），宿主/插件在绑定参数时解码为 `i64`。
+  解码 `marker_i64` 落在共享契约 crate `oj-plugin-ffi::jsint`（**不 bump ABI**），四处复用：
+  sqlite accessor / oj-db-postgres / oj-db-mysql 的 `bind_value` 与构造器的 `to_qv`
+  （必须在 `other => to_string()` 之前，否则标记被串化成文本）。严格识别（单键对象 + 规范
+  十进制 + i64 内），畸形标记按普通值处理。
+  - **实测依据**：PG 拒绝字符串参数写 bigint 列（`column "id" is of type bigint but expression
+    is of type text`）与 `where bigint = text`；`i64` 参数则精确往返。故「字符串=文本意图、
+    BigInt=整数意图」，平台不做启发式（避免误伤 TEXT 列里的长数字串）。
+- **bigint 容忍面**：`json.ok` / `json.raw` / `json.fail` 的 data / `log` 结构化字段 /
+  `mail.*` / 构造器 `toJSON()`/`fromJSON()`/子查询快照容器 —— 统一走新的 `ojStringify`
+  （`JSON.stringify` + bigint replacer，输出十进制字符串）。其中 `json.fail` 的 data 由
+  `#[serde] Value` 改为 JS 侧预序列化 + `#[string]`（原形态收到 BigInt 会 500）。
+  `es.search` 响应同样过一遍读侧护栏（ES 的 `long` 字段同病）。
+  快照类 API（`toJSON`/子查询嵌入）另有 `encodeSnapshot`（JSON 往返 + bigint 标记），
+  以保留 `Date → ISO 串` 等原 JSON 语义——参数编码器 `encodeParams` 对带 `toJSON` 的对象
+  同样遵循 JSON 语义（否则 `Date` 会被压成 `{}`）。二进制参数（`Uint8Array`/`ArrayBuffer`）
+  显式报 `TypeError`（改动前为 serde_v8 类型错，行为一致、消息更清晰）。
+- **读侧护栏补齐两处出口**（评审发现）：`jwt.verify` 的 **claims 外部可控**（雪花量级的数值
+  声明会让 `json.ok(claims)` 500）与 `mail.result` 的结果体。`jsnum.rs` 模块注释给出
+  **op 出口覆盖清单**（已覆盖 6 处 + 有意不覆盖 4 类及理由），供后续新增 op 时对账。
+- **租户守卫接受三种等值形态的租户 id**：字符串 / 数字 / 大整数标记
+  （`param_is_tenant`）。此前只认字符串，雪花租户 id 用 `toBigInt()` 传会被
+  `sql_guard: deny` 误拒（`params must include current tenant id`）。`mentions` 要求不变。
+
+**修复**
+
+- **env-gated 真库用例不可重跑**（既有）：`oj-db-postgres` / `oj-db-mysql` 的
+  `real_*_roundtrip_via_vtable` 只 `create table if not exists` + 插入固定 id，上一次运行
+  的残留行会让**重跑撞主键**（本机第二次跑 PG 用例时暴露）。两处补 `drop table if exists`
+  清场，用例恢复幂等（PG 已实测连续两次绿）。
+- **`value_to_json` 的 u64 回绕**：`Qv::BigUnsigned(Some(u)) => Value::from(u as i64)`
+  在 `u > i64::MAX` 时静默变成负数 → 改为 u64 直出（超界部分由读侧护栏降为十进制字符串）。
+- devkit 顺带订正：`oj test` 旗标表补 `--db` / `--anonymous`（v0.1.20 漏同步）、
+  已知限制表「静态站点无 SPA 回退」改为「SPA 回落需显式开 `server.app_spa_fallback`」。
+
+**文档**
+
+- 新增 **`docs/numeric-limits.md`**（专题手册：契约与阈值表、`toBigInt`/`toDouble` 接受-拒绝
+  矩阵、绑定类型规则、U38 范式与真实数字、代价与边界、**存量代码自查清单（含 grep）**、
+  排障表、**双专家评审意见与逐条处置**）。
+- devkit（发行交付物）：`api-manual.md` §6 新增「大整数与 i64」小节（含保留键红线）+ 总表行、
+  §13 限制表与陷阱清单；`SKILL.md` **红线新增「大整数」一条**（U38 正是 agent 易犯的写法）、
+  陷阱速查 4 行、场景清单；`scenarios.md` **新增场景 7「雪花 id（大整数）的生成与回写」**；
+  `README.md` 场景清单与手册特性描述。`db-guide.md` §11 红线第 6 条 + 报错速查 5 行。
+- `sample/global.d.ts` 补 `toBigInt` / `toDouble` 声明（含 fail-loud 语义注释）。
+
+**已知债 / 另案登记**
+
+- **PG 语句缓存与混合参数类型（既有隐患，非本次引入）**：同一条 SQL 文本若在不同调用里绑定
+  不同 Rust 类型的参数（字符串 ↔ 数字/大整数），sqlx prepared statement 缓存会给出协议级错误
+  （`invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` /
+  `incorrect binary data format in bind parameter`），且与执行顺序相关。**v0.1.21 用纯数字+字符串
+  即可复现**，与本次改动无关；已记入 `docs/numeric-limits.md` §4.5 与 devkit 陷阱表待专项处理。
+- `u64` / `BIGINT UNSIGNED` 全链路未支持（读侧不再回绕为负数，但精确性不保证）。
+- **数值型租户 id 列不受支持（既有）**：守卫注入的是字符串条件、insert 要求 `tenant_id` 为
+  等于租户头的字符串，故 `tenant_id` 列为 BIGINT/INTEGER 时 PG 报
+  `operator does not exist: bigint = text`（详见 `docs/numeric-limits.md` §4.8）。绕行：租户 id 用 TEXT。
+- 内建序列分配原语（`max+1` 的并发竞态终态）未做。
+- MySQL 侧真库验证未执行（本机拉不到镜像，用例已 env-gated 写好，`OJ_TEST_MYSQL` 可用时即跑）；
+  PostgreSQL 侧已用真实 PG 18 跑通（含 `i64::MIN` 往返、`where` 标记比较、字符串负例、事务路径）。
+
 ## v0.1.21（2026-09-19）
 
 **特性**

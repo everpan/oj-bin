@@ -62,9 +62,14 @@ pub async fn op_es_search(
             "es search: invalid index {index:?}"
         )));
     }
-    es.search(&index, dsl)
+    let mut out = es
+        .search(&index, dsl)
         .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    // 出口护栏（见 jsnum）：ES 响应里的 `long` 字段（如雪花 id）同样要降十进制字符串，
+    // 否则 `json.ok(hits)` 会因 BigInt 无法序列化而 500。
+    super::jsnum::sanitize_js_numbers(&mut out);
+    Ok(out)
 }
 
 /// es.index(index, id, doc)：PUT `/{index}/_doc/{id}?refresh=true`（实时可查）。

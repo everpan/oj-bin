@@ -28,13 +28,18 @@ pub fn op_json_ok(state: &mut OpState, #[string] data_json: String) {
 }
 
 /// json.fail(code, msg, data?)：写失败信封，code<=0 映射 500。
-#[op2]
+/// data 由 JS 侧 `ojStringify` 序列化后传入（BigInt 安全，v0.1.22；serde_v8 会把超界
+/// 整数转成 BigInt 而 `#[serde] Value` 反序列化直接报 unsupported type）。
+#[op2(fast)]
 pub fn op_json_fail(
     state: &mut OpState,
     code: i32,
     #[string] msg: String,
-    #[serde] data: serde_json::Value,
+    #[string] data_json: String,
 ) {
+    // 非法 JSON 回退 null（JS 侧已是 JSON.stringify 产物，正常不会走到）。
+    let data: serde_json::Value =
+        serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
     let s = state.borrow_mut::<ReqState>();
     let (body, status) = envelope::fail(code, &msg, &data);
     s.response = Some(body);
@@ -88,6 +93,65 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["bare"], true);
         assert!(v.get("code").is_none());
+    }
+
+    /// BigInt 容忍面（v0.1.22）：信封/裸 JSON 里的 BigInt 一律序列化为十进制字符串。
+    /// 旧行为是 `JSON.stringify(1n)` 抛 TypeError → 任何含大整数的响应直接 500。
+    /// 读取路径的超大整数已由 `jsnum` 降为字符串；这里覆盖 JS 侧自造 BigInt
+    /// （`toBigInt()` / `BigInt()`）—— `toBigInt` 的返回值必然经这些边界出去。
+    #[tokio::test(flavor = "current_thread")]
+    async fn bigint_in_envelope_serializes_as_decimal_string() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        // ok：嵌套 + 兄弟字段不受影响
+        let cap = b
+            .run(r#"json.ok({ id: 4886674138783273204n, n: 1, arr: [9007199254740993n] });"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["id"], Value::from("4886674138783273204"));
+        assert_eq!(v["data"]["arr"][0], Value::from("9007199254740993"));
+        assert_eq!(v["data"]["n"], 1);
+
+        // raw：裸 JSON 200 同款
+        let cap = b
+            .run(r#"json.raw({ id: 9007199254740993n });"#)
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200);
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["id"], Value::from("9007199254740993"));
+
+        // fail：data 现走 JS 侧 stringify + `#[string]`（原 `#[serde]` 会 unsupported type）
+        let cap = b
+            .run(r#"json.fail(400, "bad", { id: 9223372036854775807n });"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 400);
+        assert_eq!(v["msg"], "bad");
+        assert_eq!(v["data"]["id"], Value::from("9223372036854775807"));
+
+        // log 结构化字段同理（不得因 BigInt 抛错）
+        let cap = b
+            .run(r#"log.info("m", "id", 1n); json.ok({});"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+
+        // 两个转换助手在运行时（HTTP 池 / 任务池 / `oj test` 共用 bridge_ext）可用
+        let cap = b
+            .run(r#"json.ok({ tb: typeof toBigInt, td: typeof toDouble, tf: typeof toFloat });"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["tb"], "function");
+        assert_eq!(v["data"]["td"], "function");
+        assert_eq!(v["data"]["tf"], "undefined", "不做 toFloat（无独立语义）");
     }
 
     /// json.header 显式设置的 content-type 优先，不被默认值覆盖。

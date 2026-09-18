@@ -117,16 +117,115 @@ const { AbortController: ojAbortController } = core.loadExtScript(
 globalThis.AbortController = ojAbortController;
 
 // ----- json: unified envelope + response headers -----
+// BigInt-safe JSON.stringify (v0.1.22): serde_v8 hands i64 beyond 2^53-1 to JS as a
+// BigInt, and JSON.stringify(1n) throws -- which used to turn any response carrying
+// such a value into a 500. DB reads now arrive as decimal strings (see jsnum.rs), but
+// values produced in JS (toBigInt) or coming back from ES can still be BigInt, so
+// serialize every BigInt as its decimal string to match the wire contract.
+function ojStringify(v) {
+  return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
+}
+
+// ----- big integers (v0.1.22): JS number is f64, so i64 beyond 2^53-1 needs BigInt -----
+// Reads hand such values over as decimal strings (see jsnum.rs). toBigInt() converts back
+// and is the only way to *write* a 64-bit integer precisely: serde_v8 rejects BigInt
+// outright, so encodeParams() tags it for the host to bind as i64 (see docs/numeric-limits.md).
+const OJ_I64_KEY = "$oj$i64";
+const OJ_I64_MAX = 9223372036854775807n;
+const OJ_I64_MIN = -9223372036854775808n;
+
+globalThis.toBigInt = (v) => {
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number") {
+    // Any |v| > 2^53-1 already sits on the f64 grid -- the original integer is gone.
+    // Fail loud: Number("<big>") is exactly the trap this guards against.
+    if (!Number.isSafeInteger(v)) {
+      throw new TypeError(
+        "toBigInt: " + v + " is not a safe integer (|v| > 2^53-1) and may already be lossy; pass the original decimal string instead",
+      );
+    }
+    return BigInt(v);
+  }
+  if (typeof v === "string") {
+    // Canonical decimal only: no leading zeros (except "0"), no "+1"/"-0"/spaces.
+    // Mirrors the host-side check in oj-plugin-ffi/src/jsint.rs.
+    if (!/^(0|-?[1-9][0-9]*)$/.test(v)) {
+      throw new TypeError(
+        "toBigInt: expected a canonical decimal integer string, got " + JSON.stringify(v),
+      );
+    }
+    const b = BigInt(v);
+    if (b > OJ_I64_MAX || b < OJ_I64_MIN) {
+      throw new RangeError("toBigInt: " + v + " is out of i64 range");
+    }
+    return b;
+  }
+  throw new TypeError("toBigInt: expected string | number | bigint, got " + typeof v);
+};
+
+globalThis.toDouble = (v) => {
+  if (typeof v === "number") return v;
+  if (typeof v === "bigint") return Number(v);
+  if (typeof v === "string") {
+    const s = v.trim();
+    const n = s === "" ? NaN : Number(s);
+    if (Number.isNaN(n)) {
+      throw new TypeError("toDouble: not a numeric string: " + JSON.stringify(v));
+    }
+    return n;
+  }
+  throw new TypeError("toDouble: expected string | number | bigint, got " + typeof v);
+};
+
+// BigInt -> wire marker for the host (see docs/numeric-limits.md). Range-checked here so an
+// out-of-i64 bigint fails at the call site instead of silently binding as text.
+function i64Marker(v) {
+  if (v > OJ_I64_MAX || v < OJ_I64_MIN) {
+    throw new RangeError("db param: bigint " + v.toString() + " is out of i64 range");
+  }
+  return { [OJ_I64_KEY]: v.toString() };
+}
+
+// Deep-encode BigInt for the op boundary. Idempotent: markers written below are plain
+// objects and pass through untouched, so req snapshots can be re-encoded safely.
+function encodeParams(v) {
+  if (typeof v === "bigint") return i64Marker(v);
+  if (Array.isArray(v)) return v.map(encodeParams);
+  if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
+    // Old path rejected these at serde_v8; fail loud instead of silently flattening a
+    // Uint8Array into {"0":..,"1":..} (binary payloads belong in blob.put).
+    throw new TypeError("db param: binary values are not supported (use blob.put)");
+  }
+  if (v !== null && typeof v === "object") {
+    // JSON-aware values (Date, custom toJSON): follow JSON semantics -- encoding them
+    // generically would flatten a Date to {} and lose the value.
+    if (typeof v.toJSON === "function") return encodeParams(v.toJSON());
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = encodeParams(v[k]);
+    return o;
+  }
+  return v;
+}
+
+// Deep JSON-faithful clone with BigInt tagged (snapshot APIs: toJSON / subquery embedding).
+// JSON round-trip keeps the semantics the old JSON.parse(JSON.stringify(req)) had -- notably
+// Date -> ISO string; the recursive encoder above would flatten a Date to {}.
+function encodeSnapshot(v) {
+  return JSON.parse(
+    JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? i64Marker(x) : x)),
+  );
+}
+
 globalThis.json = {
   // data is JSON.stringify'd on the JS side, so the op can splice it into the
   // envelope verbatim, avoiding the serde_v8 deserialize + serde_json re-serialize cost.
-  ok: (data) => op_json_ok(data === undefined ? "null" : JSON.stringify(data)),
+  ok: (data) => op_json_ok(data === undefined ? "null" : ojStringify(data)),
   fail: (code, msg, data) =>
-    op_json_fail(code | 0, String(msg), data === undefined ? null : data),
+    op_json_fail(code | 0, String(msg), data === undefined ? "null" : ojStringify(data)),
   header: (name, value) => op_json_header(String(name), String(value)),
   // bare JSON 200 (no envelope); OP external endpoints speak standard OIDC JSON.
   // Errors still go through fail() so callers can just test !res.ok on the envelope.
-  raw: (data) => op_json_raw(data === undefined ? "null" : JSON.stringify(data)),
+  raw: (data) => op_json_raw(data === undefined ? "null" : ojStringify(data)),
 };
 
 // ----- http helpers: current request context (lazy proxy; fresh per request) -----
@@ -152,8 +251,8 @@ function logCall(level, msg, kv) {
   const fields = {};
   for (let i = 0; i + 1 < kv.length; i += 2) fields[String(kv[i])] = kv[i + 1];
   // JSON.stringify once on the JS side, hand the JSON string straight to Rust
-  // (avoid double serialization via serde_v8 + to_string).
-  op_log(level, String(msg), JSON.stringify(fields));
+  // (avoid double serialization via serde_v8 + to_string). BigInt-safe (ojStringify).
+  op_log(level, String(msg), ojStringify(fields));
 }
 globalThis.log = {
   debug: (msg, ...kv) => logCall(0, msg, kv),
@@ -310,11 +409,11 @@ globalThis.es = {
 // path must stay inside the project root.
 globalThis.Mail = class {
   constructor(key = "default") { this.key = key; }
-  send(m) { return op_mail_send(this.key, JSON.stringify(m)); }
-  sendSync(m) { return op_mail_send_sync(this.key, JSON.stringify(m)); }
-  enqueue(m) { return op_mail_enqueue(this.key, JSON.stringify(m)); }
+  send(m) { return op_mail_send(this.key, ojStringify(m)); }
+  sendSync(m) { return op_mail_send_sync(this.key, ojStringify(m)); }
+  enqueue(m) { return op_mail_enqueue(this.key, ojStringify(m)); }
   result(id) { return op_mail_result(this.key, String(id)); }
-  sendRaw(o) { return op_mail_send_raw(this.key, JSON.stringify(o)); }
+  sendRaw(o) { return op_mail_send_raw(this.key, ojStringify(o)); }
   static profiles() { return op_mail_profiles(); }
 };
 const ojMailDefault = new Mail("default");
@@ -329,7 +428,7 @@ function unwrapCond(c) { return c && typeof c.tree === "function" ? c.tree() : c
 // builder -> plain req snapshot (subquery/exists embedding passes builders where a
 // tree is expected); non-builders pass through untouched.
 function unwrapSub(v) {
-  return v && v.__req ? JSON.parse(JSON.stringify(v.__req)) : v;
+  return v && v.__req ? encodeSnapshot(v.__req) : v;
 }
 // deep-unwrap a condition tree: condObj -> plain tree, builders -> req snapshots,
 // recursing into and/or arrays and not/subquery/exists slots.
@@ -382,8 +481,8 @@ globalThis.DB = function (name) {
     dbCache.set(name, {
       ...condFactories(),
       // raw SQL + bound params (params optional).
-      query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
-      exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
+      query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : encodeParams(params)),
+      exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params)),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
       // system escape hatch (tenant sql_guard): this request bypasses tenant
@@ -395,7 +494,7 @@ globalThis.DB = function (name) {
       // is on. Unlike asSystem, tenant conditions are STILL enforced.
       asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
       // rebuild a builder from a toJSON() snapshot (continues the chain on this db).
-      fromJSON: (snap) => builderFromReq(snap),
+      fromJSON: (snap) => builderFromReq(encodeParams(snap)),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.
@@ -404,10 +503,10 @@ globalThis.DB = function (name) {
         try {
           const out = await fn({
             ...condFactories(),
-            query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : params),
-            exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : params),
+            query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : encodeParams(params)),
+            exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params)),
             table: (t) => queryBuilder(name, String(t)),
-            fromJSON: (snap) => builderFromReq(snap),
+            fromJSON: (snap) => builderFromReq(encodeParams(snap)),
             asSystem: () => { op_db_as_system(); return dbCache.get(name); },
             asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
           });
@@ -442,29 +541,30 @@ function builderFromReq(snap) {
         if (typeof c === "string") return String(c);
         // deep-unwrap case when conds (condObj/builder, same as where/having)
         if (c && c.case && c.case.when) {
-          return { ...c, case: { ...c.case, when: c.case.when.map((w) => ({ ...w, cond: unwrapTree(w.cond) })) } };
+          // CASE carries values too (when[].then / else) -- encode the whole node.
+          return encodeParams({ ...c, case: { ...c.case, when: c.case.when.map((w) => ({ ...w, cond: unwrapTree(w.cond) })) } });
         }
         return { ...c };
       });
       return api;
     },
-    where(cond) { req.conditions.push(unwrapTree(cond)); return api; },
+    where(cond) { req.conditions.push(encodeParams(unwrapTree(cond))); return api; },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
     all() { return op_db_query_build(req); },
-    insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => ({ ...r })); return api; },
+    insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => encodeParams({ ...r })); return api; },
     // Insert returning clause (whitelisted columns, e.g. ["id"]): run() then resolves
     // to a row array [{id: n}] instead of the affected-row count. pg/sqlite render a
     // single sea-query RETURNING statement; mysql has no RETURNING and takes
     // LAST_INSERT_ID() in a second step on the same connection (use db.tx for safety).
     returning(cols) { req.returning = (cols || []).map(String); return api; },
-    update(sets) { req.verb = "update"; req.sets = { ...sets }; return api; },
+    update(sets) { req.verb = "update"; req.sets = encodeParams({ ...sets }); return api; },
     delete() { req.verb = "delete"; return api; },
     join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
     distinct() { req.distinct = true; return api; },
     groupBy(cols) { req.group_by = (cols || []).map(String); return api; },
-    having(cond) { req.having = unwrapTree(cond); return api; },
+    having(cond) { req.having = encodeParams(unwrapTree(cond)); return api; },
     union(other, kind) { req.unions.push({ kind: kind ? String(kind) : "distinct", query: unwrapSub(other) }); return api; },
     with(name, columns, query) { req.with.push({ name: String(name), columns: (columns || []).map(String), query: unwrapSub(query) }); return api; },
     run() {
@@ -477,7 +577,7 @@ function builderFromReq(snap) {
       return op_db_query_build(req);
     },
     toSQL() { return op_db_query_sql(req); },
-    toJSON() { return JSON.parse(JSON.stringify(req)); },
+    toJSON() { return encodeSnapshot(req); },
     // Internal: expose req for subquery/union/cte embedding (not documented API).
     __req: req,
   };
