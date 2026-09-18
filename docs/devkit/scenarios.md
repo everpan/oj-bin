@@ -13,6 +13,7 @@
 | [3](#场景-3测试不脏开发库) | `oj test` 默认落 `db.test`，测试数据不污染开发库 | §9 测试 |
 | [4](#场景-4列表分页与-limit-陷阱) | 「怎么只返回了 100 条」——LIMIT 策略可配 + 截断可观测 | §3 数据层 / §6 db |
 | [5](#场景-5匿名路径怎么写) | `anonymous_paths` 的四种通配形态 + v0.1.20 迁移 | §8 鉴权与多租户 |
+| [6](#场景-6多库项目按库迁移与对账) | config 多了命名库：`oj migrate/fixture/schema diff --db <name>` 逐库跑（v0.1.21） | §3 数据层 / §10 db |
 
 ---
 
@@ -351,6 +352,71 @@ curl -s -H 'X-TENANT-ID: acme' http://localhost:9778/v1/api/order/list/         
 | 深路径仍 400/401 | 尾 `/*` 只匹配一层，改 `/x/**` 或逐条列出 |
 | 加了租户豁免但还 401 | 两条列表独立：`auth.anonymous_paths` 也得加 |
 | WS 路由想加进列表 | 不用加：`ws.ts` 是真实路由，天然不过前置管线 |
+
+---
+
+## 场景 6：多库项目按库迁移与对账
+
+**什么时候用**：config `db:` 段声明了 `default` 之外的命名库（`analytics` / `warehouse`…），
+或者模块各自绑定了不同的库——上线时**每个库都要有自己的账本与表**。
+
+### ① 配置
+
+```yaml
+# config.yaml
+db:
+  default:   "sqlite://db.sqlite"
+  analytics: "sqlite://analytics.sqlite"
+```
+
+```yaml
+# src/order/manifest.yaml
+name: order
+desc: 订单
+version: 0.1.0
+db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（运行期路由）
+```
+
+### ② 运行
+
+```bash
+# 所有模块都在 default：逐库各跑一遍
+./bin/oj migrate -c config.yaml -d dist                     # → db "default"
+./bin/oj migrate -c config.yaml -d dist --db analytics      # → db "analytics"
+
+# 模块绑了不同库（上面 manifest.db: analytics）：必须带 --module 逐组合跑
+./bin/oj migrate -c config.yaml -d dist --db default   --module user
+./bin/oj migrate -c config.yaml -d dist --db analytics --module order
+
+# 演示数据与漂移门禁同旗标，也要逐库跑
+./bin/oj fixture     -c config.yaml -d src --db analytics --module order
+./bin/oj schema diff -c config.yaml -d dist --db analytics
+```
+
+- `--db <name>` 的 `name` **就是 config `db:` 段的键**，缺省 `default`。
+- 账本 `_oj_migrations`、`schema.yaml` 收敛、`--baseline` 都**各库独立**：
+  A 库迁过了不等于 B 库迁过。
+- `oj migrate` 收尾行会打印目标库（`… → db "analytics"`），多库跑批时用它核对。
+
+### ③ 验证
+
+```bash
+./bin/oj schema diff -c config.yaml -d dist --db default      # in sync（或列出漂移）
+./bin/oj schema diff -c config.yaml -d dist --db analytics    # 逐库都要看
+./bin/oj migrate -c config.yaml -d dist --db analytics --module order   # 重跑幂等，0 applied
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| `--db "x" not declared in config (db keys: […])` | 库名不在 `db:` 段（拼错/漏配）。工具**故意不回落** `default`——否则迁移会打在开发库上 |
+| 某个库启动后报 M004（账本落后） | 那个库没跑 `oj migrate --db <name>`：多库不会自动连带 |
+| `--db analytics` 把没绑 analytics 的模块的表也建进了 analytics | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定——这种项目要配 `--module` 逐组合跑（见 ②） |
+| `--db analytics` 报了别的库连不上的错 | 深瘦身装配会打开 config 里**所有** `db:` 连接；任一 DSN 打不开即失败，与 `--db` 指向哪个库无关 |
+| 想用 `oj server --db` 切库 | 没有这个旗标：运行期按模块 `manifest.db` 路由，`server` 恒以 `default` 为基库 |
+
+> 机制与边界详见仓库 `docs/migration.md` §3.8、`docs/db-guide.md` §1.1。
 
 ---
 

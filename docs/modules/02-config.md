@@ -37,7 +37,7 @@
 
 | 段 | 类型 | 语义 |
 |---|---|---|
-| `db` | `HashMap<name, DSN>` | 多库混用（`sqlite://` / `mysql://` / `postgres://`），经 `DbBackendRegistry` 按 scheme 认领 |
+| `db` | `HashMap<name, DSN>` | 多库混用（`sqlite://` / `mysql://` / `postgres://`），经 `DbBackendRegistry` 按 scheme 认领。**键 = 库名**：`oj migrate` / `oj fixture` / `oj schema diff` 的 `--db` 取值域即此（缺省 `default`，未声明 fail-fast，见 `docs/migration.md` §3.8） |
 | `redis` | `HashMap<name, URL>` | 仅 `redis.default` 参与装配（其余 warn 忽略）；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
 | `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false） |
 | `db_query` | `QueryLimits` | 构造器 LIMIT：`default_limit`（默认 100，顶层 select 未给 limit 时的隐式值）+ `max_limit`（默认 1000，显式 limit 的 clamp 上界，硬顶 100000）。**不能写进 `db:`**——`db` 是 name→DSN map，键即库名 |

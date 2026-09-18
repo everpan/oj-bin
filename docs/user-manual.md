@@ -37,9 +37,9 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ```
 oj server  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
 oj build   [module] [-d src] [-o dist] [--no-minify] [--check]
-oj migrate [-c config.yaml] [-d <src|dist>] [--baseline] [--module M]
-oj fixture [-c config.yaml] [-d <src|dist>] [--module M]
-oj schema diff [-c config.yaml] [-d <src|dist>]
+oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
+oj fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
+oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -57,6 +57,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
 | `--check` | 关 | （build）只跑结构检查（S002–S006）不写任何产物；有违规 exit 1（CI 门禁） |
 | `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
 | `--module` | 无 | （migrate / fixture）只处理指定模块 |
+| `--db` | `default` | （migrate / fixture / schema diff）目标库 = config `db:` 段的 profile 名；未声明则 fail-fast（不回落 default）。多库须逐库各跑一遍 |
 | `--daemon` | 关 | （server）后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`（SIGTERM 走优雅停机） |
 
 - `oj build`：**按模块**转译 src → `dist/<module>-<version>/`（版本从模块 `manifest.yaml`
@@ -72,13 +73,14 @@ oj schema diff [-c config.yaml] [-d <src|dist>]
   - 产出确定性 tgz：`dist/<module>-<version>.tgz`（同输入字节一致），用于整体发布。
   - **构建即检查**：build 内嵌结构检查 S002–S006（违规 fail build，一次报全）；
     `--check` 只校验不落盘（CI 门禁）。规则见 §5.3。
-- `oj migrate`：把各模块 `migrations/*.sql` 按序应用到 default 库（账本
-  `_oj_migrations（module 列区分模块）`），并对声明 `schema.yaml` 的模块做收敛（§5.1）；
-  `--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
-- `oj fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
+- `oj migrate`：把各模块 `migrations/*.sql` 按序应用到目标库（默认 `db.default`，`--db`
+  换 profile；账本 `_oj_migrations（module 列区分模块）`），并对声明 `schema.yaml` 的模块做
+  收敛（§5.1）；`--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
+- `oj fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）；
+  目标库同样由 `--db` 选定。
 - `oj schema diff`：声明式 schema 与实库**只读对账**——D001 缺表/缺列/多列（改名或删除
   须手写迁移）/缺索引，D002 实库有而未声明的表；有漂移打印报告并 exit 1（发布前巡检）。
-  类型漂移不比对（手写迁移场景人工核对）。
+  类型漂移不比对（手写迁移场景人工核对）；目标库由 `--db` 选定，多库须逐库跑。
 - release 模式启动时按 `dist/manifests.yaml` 逐模块加载各版本目录的 `routes.js` 聚合路由；
   锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错（提示先 `oj build`）。
 - `-b` 已不是 build 参数（pattern 不含 base）；误用时显式报错退出。
@@ -335,8 +337,9 @@ desc 与账本不一致 → 报错（S007）。应用入口三处：
 
 - dev 默认 `migrate_on_start: auto`（启动即应用）；
 - release 默认 `verify`（账本落后拒启，M004；先 `oj migrate`）；`off` 逃生门；
-- 显式 `oj migrate [--baseline] [--module M]`；`--baseline` 把 ≤head 的迁移全部记为
-  已应用而不执行（存量库接入）。
+- 显式 `oj migrate [--db name] [--baseline] [--module M]`；`--baseline` 把 ≤head 的迁移
+  全部记为已应用而不执行（存量库接入）；`--db` 选 config `db:` 段的 profile
+  （缺省 `default`，未声明即报错；`oj fixture` / `oj schema diff` 同旗标）。
 
 模块级 `seed.sql`：幂等参考数据，随启动重放（三方言 `default` 库，无库则 warn 跳过）
 ——禁 DDL、INSERT 须幂等（`OR IGNORE` / `ON CONFLICT` / `OR REPLACE` /

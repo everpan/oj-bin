@@ -2,6 +2,41 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.21（2026-09-19）
+
+**特性**
+
+- **`oj migrate` / `oj fixture` / `oj schema diff` 新增 `--db <profile>`（多库运维闭环）**：
+  三处瘦身装配（`migrate_cmd.rs::slim`）原先硬编码 config `db:` 段的 `default` 键，
+  多库项目里非 default 的命名库**无法**走工具链——只能手工执行 SQL，账本
+  `_oj_migrations` 与 `schema.yaml` 收敛都缺位。
+  - `--db <name>` 即 config `db:` 段的键（`db: {default: …, analytics: …}` →
+    `--db analytics`）；缺省仍为 `default`，**选库语义与 v0.1.20 一致**（`default` 缺失时
+    的提示文案与收尾行措辞有更新，见下）。
+  - **未声明的库名 fail-fast**，报错列出可用键（`--db "x" not declared in config
+    (db keys: [...])`），绝不静默回落 default——与 `oj test --db`（v0.1.20）和
+    `App::from_config` 的 `db_override` 同一条纪律：静默回落等于把迁移打在开发库上。
+  - 语义不变：`--db` 只是换目标连接；账本、reconcile、`--baseline`、`--module`
+    均**各库独立**。迁移工具**不读**模块级 `manifest.yaml` 的 `db:` 绑定（那是运行期
+    路由，`src/bridge/guard.rs::bound_db`），故 `--db` 是**整轮**迁移的目标库而非逐模块
+    解析——单一 profile 的项目逐库各跑一遍即可；模块绑定不同库的项目见下条「已知债」。
+  - `oj migrate` 收尾行打印目标库（`… → db "analytics"`），避免多库下跑错库无察觉；
+    `--db` 缺省时提示文案改为「迁移/fixtures/对账需要一个目标库」并列出已声明键
+    （原文案写死 "（迁移/fixtures 作用于 default 库）"）。
+  - **已知债（本次只登记不修）**：`--db` 是**整轮**目标库，`slim` 不解析模块级
+    `manifest.yaml` 的 `db:` 绑定——多库项目须 `--db <profile> --module <M>` 逐组合跑，
+    否则会把全部模块的迁移灌进同一库（静默重复，D002 不报）。登记于
+    `docs/migration.md` §8 与 `docs/modules/04-oj-cli.md` §8。
+  - 文档：`migration.md` 新增 §3.8「多库：`--db` 指定目标 profile」、改写 §6 限制 7
+    （原「只作用 default 库」），`db-guide.md`（§1.1 库级迁移）、`cli2.md` /
+    `user-manual.md` 旗标与用法、`ops-manual.md` 发布流程与排障表（新增
+    `--db "x" not declared` 一行）同步。**devkit（发行交付物）**：`api-manual.md`
+    命令表 / 交付跑法 / 打包部署步骤 / §10 db 段 / 排障表 / 已知限制全表，
+    `SKILL.md` 发布检查与陷阱速查（`--db` 三条），`scenarios.md` **新增场景 6
+    「多库项目按库迁移与对账」**（含整轮语义的踩坑），`README.md` 场景清单同步；
+    顺带订正 devkit 两处陈腐描述：`oj test` 旗标表补 `--db` / `--anonymous`（v0.1.20 漏同步）、
+    已知限制表「静态站点无 SPA 回退」改为「SPA 回落需显式开 `server.app_spa_fallback`」。
+
 ## v0.1.20（2026-09-19）
 
 本版来自下游（plane）上游需求清单（U1–U37）的逐条回源码复核，交付四项：**匿名访问双层**
