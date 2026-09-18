@@ -855,10 +855,14 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
         ),
     ]);
     let mut cfg = base_cfg(&t);
-    cfg.db
-        .insert("default".into(), format!("sqlite://{}/dev.sqlite", fwd(&t)));
-    cfg.db
-        .insert("test".into(), format!("sqlite://{}/tst.sqlite", fwd(&t)));
+    cfg.db.insert(
+        "default".into(),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("dev.sqlite")),
+    );
+    cfg.db.insert(
+        "test".into(),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("tst.sqlite")),
+    );
     // fixtures=true + db_override="test"：`oj test` 的装配形态。
     let app = oj::app::App::from_config(
         cfg,
@@ -888,7 +892,7 @@ async fn has_table(file: &Path, table: &str) -> bool {
     if !file.is_file() {
         return false;
     }
-    let dsn = format!("sqlite://{}", fwd(file));
+    let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(file);
     let db = only_js::bridge::SqlxAccessor::arc(&dsn).await.unwrap();
     let rows = db
         .query_with_params(

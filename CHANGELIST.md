@@ -61,6 +61,15 @@
   清场，用例恢复幂等（PG 已实测连续两次绿）。
 - **`value_to_json` 的 u64 回绕**：`Qv::BigUnsigned(Some(u)) => Value::from(u as i64)`
   在 `u > i64::MAX` 时静默变成负数 → 改为 u64 直出（超界部分由读侧护栏降为十进制字符串）。
+- **Windows 门禁编译失败：v0.1.20 新用例误用 unix-only 辅助函数**（本次 CI 暴露）：`oj/tests/e2e.rs`
+  的 `test_db_override_builds_schema_on_test_db_not_dev` 及其 `has_table` 助手三处直接调用
+  `#[cfg(unix)] fn fwd`（该 cfg 正是 v0.1.19 为消 Windows dead_code 告警加的），Windows 上退化为
+  「cannot find function `fwd`」→ `oj` e2e 目标编译失败。三处 DSN 一律改走
+  `oj_plugin_ffi::path_util::sqlite_file_dsn`（与 `fwd` 自带文档的红线一致：DSN 不走裸 replace）。
+  复核方法：把全仓 `#[cfg(...)]` 里的 `unix` 逐处置换成 `windows` 后 `cargo check --workspace
+  --all-targets`——等价于「unix-only 项全部缺席」的 Windows 形态，结果零 error（`fwd` 是唯一一处，
+  `logging.rs` 的 `cfg(all(test, unix))` / `server_cmd.rs` 的 `daemonize`·`term` 均有 `not(unix)`
+  对偶分支）。
 - devkit 顺带订正：`oj test` 旗标表补 `--db` / `--anonymous`（v0.1.20 漏同步）、
   已知限制表「静态站点无 SPA 回退」改为「SPA 回落需显式开 `server.app_spa_fallback`」。
 
