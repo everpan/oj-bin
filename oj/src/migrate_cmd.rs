@@ -200,12 +200,33 @@ mod tests {
         d
     }
 
+    /// 与 `src/bridge/ffi.rs::triple()` 一致——`<plugins_dir>/<triple>/` 才是扫描目录。
+    /// 测试须把插件扫描隔离到空目录，否则 workspace 自带（或 CI 检出）的 bin/plugins 里
+    /// 若含 ABI 不符的陈旧产物，会在迁移/对账逻辑前抢先报错（仅 Windows 主机三元组命中）。
+    fn host_triple() -> String {
+        let arch = std::env::consts::ARCH;
+        match std::env::consts::OS {
+            "macos" => format!("{arch}-apple-darwin"),
+            "windows" => format!("{arch}-pc-windows-msvc"),
+            "linux" => format!("{arch}-unknown-linux-gnu"),
+            other => format!("{arch}-unknown-{other}-gnu"),
+        }
+    }
+
     /// 夹具：项目根（config.yaml + src/m/{manifest,migrations,fixtures}）。
     fn project(tag: &str) -> PathBuf {
         let t = tmpdir(tag);
+        // 隔离插件扫描到空 <triple> 目录（见 host_triple）：避免 bin/plugins 陈旧产物抢先报错。
+        let plugins_base = t.join("plugins-isolated");
+        std::fs::create_dir_all(plugins_base.join(host_triple())).unwrap();
+        let plugins_dir = plugins_base.to_string_lossy().replace('\\', "/");
         std::fs::write(
             t.join("config.yaml"),
-            format!("db:\n  default: sqlite://{}/db.sqlite\n", t.display()),
+            format!(
+                "db:\n  default: sqlite://{}/db.sqlite\nplugins_dir: \"{}\"\n",
+                t.display(),
+                plugins_dir
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(t.join("src/m/migrations")).unwrap();
