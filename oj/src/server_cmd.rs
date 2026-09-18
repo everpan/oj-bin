@@ -76,7 +76,8 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
-    let app = App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false).await?;
+    let app =
+        App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false, None).await?;
     // 长任务池（spec §6）：随服务拉起——扫描 <dir>/<tasks.dir>，空池/缺目录不报错；
     // 重名/超 max fail-fast。停机 flag 由 App 持有，信号处理器置位。
     let task_flag = app.tasks_flag();
@@ -361,7 +362,7 @@ pub async fn start(
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
-    let app = App::from_config(cfg, config_dir, dir, base, ts, false).await?;
+    let app = App::from_config(cfg, config_dir, dir, base, ts, false, None).await?;
     app.serve(addr).await
 }
 

@@ -188,8 +188,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 归置 devkit（docs/devkit 三件 + docs/oidc-{integration,implementation}.md +
-/// sample/global.d.ts + sample/types/oj-modules.d.ts）-> bin/devkit/。
+/// 归置 devkit（docs/devkit 四件：api-manual / scenarios / README / SKILL +
+/// docs/oidc-{integration,implementation}.md + sample/global.d.ts +
+/// sample/types/oj-modules.d.ts）-> bin/devkit/。
 /// `oj-modules.d.ts` 是**非模块**的 ambient 兜底（`declare module "#*"`），为 `#` 导入
 /// 别名提供兜底——必须与 global.d.ts 一并分发，否则业务项目编辑器仍会对无法静态
 /// 定位的 `#` 导入报 TS2307。
@@ -554,7 +555,7 @@ mod tests {
 
     #[test]
     fn given_repo_docs_when_copy_devkit_then_bin_devkit_fresh_with_oidc_and_dts() {
-        // 发行契约：devkit = docs/devkit 三件 + 两份 OIDC 手册 + sample/global.d.ts
+        // 发行契约：devkit = docs/devkit 四件 + 两份 OIDC 手册 + sample/global.d.ts
         // + sample/types/oj-modules.d.ts（`#` 别名 ambient 兜底，须一并分发）。
         copy_devkit().unwrap();
         let dk = bin_dir().join("devkit");
@@ -563,6 +564,8 @@ mod tests {
         assert!(dk.join("oidc-integration.md").exists());
         assert!(dk.join("oidc-implementation.md").exists());
         assert!(dk.join("api-manual.md").exists());
+        // 场景速查（照抄就能跑）随包分发；SKILL.md 工作流会引用它。
+        assert!(dk.join("scenarios.md").exists());
     }
 
     #[test]

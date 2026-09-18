@@ -66,7 +66,9 @@ export function installGlobals(opts: GlobalsOptions = {}): ResponseCapture {
     publish: (topic: string, msg: any) => published.push({ topic, msg }),
   };
 
-  (globalThis as any).db = {
+  // 构造器面（db.table(...)）：与 bootstrap.js 的 builderFromReq 同 API 形；
+  // 渲染与覆盖范围见 mocks/query-builder.ts。
+  const bare = {
     query: async (sql: string, params?: any[]) => {
       sqlCalls.push({ fn: "query", sql, params: params ?? [] });
       return opts.dbRows ?? [];
@@ -75,15 +77,21 @@ export function installGlobals(opts: GlobalsOptions = {}): ResponseCapture {
       sqlCalls.push({ fn: "exec", sql, params: params ?? [] });
       return 1;
     },
-    // 构造器面（db.table(...)）：与 bootstrap.js 的 builderFromReq 同 API 形；
-    // 渲染与覆盖范围见 mocks/query-builder.ts。
     table: (name: string) =>
       tableBuilder(
         String(name),
         (call) => sqlCalls.push(call),
         () => opts.dbRows ?? [],
       ),
+    // 租户逃生/声明口：与 bootstrap.js 同形（asSystem 绕过防护、asTenant 声明匿名身份），
+    // 且与运行时一致地**返回同一个 db 实例**，便于链式写法 `db.asTenant(id).table(...)`。
+    // L2 不模拟租户注入与三道门禁（那属 Rust 侧，归 L1）——这里只补 API 面，避免
+    // 写了 asTenant 的 handler 在 L2 里 TypeError。真实守卫语义见 L1 用例与
+    // src/bridge/db.rs 的 op_db_as_tenant。
+    asSystem: () => bare,
+    asTenant: (_id: string) => bare,
   };
+  (globalThis as any).db = bare;
 
   (globalThis as any).log = { debug() {}, info() {}, warn() {}, error() {} };
 

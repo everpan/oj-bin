@@ -11,6 +11,12 @@ server:
                      # 演示取 deny：跨模块取数必须显式 deps（P3 评估结论）。
   ownership_guard: deny
   app_path: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务；CLI --app-path 可覆盖）
+  # app_spa_fallback: false   # v0.1.20：SPA 单页回落（默认 false）——开启后，未命中文件的
+                     #  无扩展名 HTML 请求（Accept 含 text/html 或缺失）回落到 index.html，
+                     #  深链刷新可用；API 前缀（api_prefix/app_prefix）下的 404 不受影响。
+  # html_meta: "__meta"       # v0.1.20：每路由 HTML 元信息目录名（相对 app_path；默认关闭）。
+                     #  开启后请求 /a/b/ 时读 <app_path>/__meta/a/b.json 注入 <title> 等；
+                     #  该目录自身不对外公开（直接访问返回 404）。
   # logs_dir: "logs"   # 日志目录（终端输出镜像落盘；文件名 server-<启动秒>_<pid>.log）
   # logs_max_m: 100            # 单个日志文件大小上限（单位 M，<100 按 100 生效），超过滚动
   # logs_keep_files: 10        # 日志文件保留个数（含活动文件，超出删除）
@@ -28,6 +34,11 @@ db:
   # 多库混用（v0.2）：mysql/postgres DSN 原样透传，按名 DB("name") 取用。
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"
   # warehouse: "postgres://127.0.0.1:5432/app"
+
+# db_query:   # v0.1.20：构造器查询的 LIMIT 策略（仅顶层查询；硬顶 100000）
+#   default_limit: 100   # 未显式 .limit() 时的隐式上限（默认 100；0 或 >max_limit 启动报错）
+#   max_limit: 1000      # 显式 .limit(n) 的 clamp 上限（默认 1000；>100000 启动报错）
+                         # 顶层结果行数 ≥ 生效上限时，响应带 X-OJ-Row-Limit 头提示可能被截断。
 
 redis:
   # v0.2: 配置存在即真连 Redis（启动 fail-fast，连不上直接报错退出）；注释/删除 → 内存 KV。
@@ -81,7 +92,12 @@ smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 ma
 tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
   enable: true
   header_key: "X-TENANT-ID"
+  # allow_as_tenant: false       # v0.1.20：允许匿名请求用 db.asTenant(id) 声明身份
+                                 # （仍强制租户条件；仅匿名且未带租户头的请求可用，默认关）
   anonymous_paths:               # 免租户头路径（OIDC 302 跳转腿带不了自定义头）
+    # 通配四形态：字面 / /* 严格一层 / ** 跨任意层 / 中段 * 恰好一段。
+    # 下面三条尾 /* 都只需一层（callback、jwks、discovery）；v0.1.20 启动会对「含尾 /*
+    # 的列表」聚合打一条迁移 WARN（提示深路径改 **）——这里是预期提示、非配置错误。
     - "/oidc/*"
     - "/idp/*"
     - "/idp/.well-known/*"
@@ -93,14 +109,14 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
   signing_method: "HS256"        # HS256 | HS384 | HS512
   access_token_duration: "60s"   # access token 有效期（s/m/h/d）
   refresh_token_duration: "720h" # refresh session 有效期（轮换制）
-  anonymous_paths:               # 免鉴权路径（去 /v1/api 前缀；尾 /* 为一层通配）
-    - "/health"
+  anonymous_paths:               # 免鉴权路径（去 /v1/api 前缀；通配四形态：字面 /
+    - "/health"                  #   /* 严格一层 / ** 跨任意层 / 中段 * 恰好一段）
     - "/auth/login"              # auth 端点已是业务路由，须显式匿名
     - "/auth/refresh"
     - "/auth/logout"
     # WS 订阅路由（/news/ws）不在守卫面内（真实路由，不过前置管线）；
     # 发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
-    - "/oidc/*"
+    - "/oidc/*"                  # 同上：尾 /* 严格一层，启动有聚合迁移 WARN（预期）
     - "/idp/*"
     - "/idp/.well-known/*"
 

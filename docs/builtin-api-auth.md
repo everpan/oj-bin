@@ -152,4 +152,4 @@ flowchart TD
 | `signing_method` | `HS256` | HS256 / HS384 / HS512 |
 | `access_token_duration` | `60s` | access token 有效期 |
 | `refresh_token_duration` | `720h` | refresh token / session 有效期 |
-| `anonymous_paths` | `[]` | 免鉴权路径（去 base 后），尾部 `/*` 一层通配 |
+| `anonymous_paths` | `[]` | 免鉴权路径（去 base 后），通配四形态（v0.1.20）：字面 / 尾 `/*` 严格一层 / 中段 `*` 一段 / `**` 跨段 |

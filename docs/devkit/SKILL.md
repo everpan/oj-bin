@@ -5,13 +5,17 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 
 # oj API 模块开发
 
-本 skill 与参考手册 `api-manual.md` 同目录。**按章节号按需读章，不要盲读全文。**
+本 skill 与参考手册 `api-manual.md`、场景集 `scenarios.md` 同目录。**按章节号按需读章，不要盲读全文。**
 
 ## 工作流
 
 1. **读章**：新项目/新模块 → 手册 §2；写 handler → §4 + §6；用鉴权/租户 → §8；
    写测试 → §9；配置问题 → §10；构建发布 → §11。**要扩展全局对象（`json.page()`
    之类）→ §6 末「ext_boot.js」，不要去改 handler。**
+   **命中下面这些典型需求时，先读 `scenarios.md` 照抄**（配置 + 代码 + 验证 + 常见坑四段）：
+   公开分享页按租户读数据（`db.asTenant` + `tenant.allow_as_tenant`）/ SPA 深链回落与每页
+   meta（`app_spa_fallback` + `html_meta`）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
+   列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态。
    **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
    `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
@@ -82,6 +86,10 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |
 | 查询被拦截 / 启动报 `tenant_id` 相关错（v0.1.15 sql_guard） | `sql_guard: "deny"` 拦截租户条件不匹配的查询（`"warn"` 只告警）：跨租户操作（对账/报表）走 `await db.asSystem()`（请求级 + 审计日志）；共享表须 schema.yaml `tenant: false` **且** config `tenant.shared_allow` 列出，双声明才豁免 |
 | 裸 SQL 被 deny 拦「遗漏 tenant_id」 | `db.query`/`db.exec` 的字面检查（best-effort）要求 SQL 显式带租户条件——优先改走 `db.table()` 构造器（自动注入），系统身份走 `db.asSystem()` |
+| `db.asTenant` 抛错（v0.1.20） | 三道门禁：`tenant.allow_as_tenant: true` 未开 / 请求不是匿名（未命中 `anonymous_paths` 或已带租户头）/ id 为空；且**请求级只能设一次**（防中途换身份）。公开页正确姿势见 `scenarios.md` 场景 1 |
+| 尾 `/*` 匿名路径收不到豁免（v0.1.20） | 尾 `/*` 已统一为**严格一层**（旧 oj-auth 侧是任意深度）；跨层改 `/x/**`，启动会对含尾 `/*` 的列表打聚合迁移 WARN。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
+| SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
+| `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
 | WS 二进制帧 `http.body` 是 null | 设计如此（不做 UTF-8 有损转换）——取字节用 `await http.bodyBytes()`（v0.1.16） |
 | 回显二进制协议帧型变成 Text | `ws.send` 帧型由参数类型决定：Uint8Array → Binary(0x2)，string → Text(0x1)——别把字节 decode 成 string 再发 |
 | `import "#x"` 报「未找到模块根」 | 该文件不在模块内（`tests/` 用例、`src/tasks/` 任务池），或 `--api-path` 在 project root 之外——这些场景用相对路径（v0.1.18 别名锚点 = 向上最近的 `manifest.yaml`） |
@@ -101,6 +109,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 `api-manual.md`（同目录）共 13 章：1 快速开始 / 2 项目结构与模块约定 / 3 模块数据层 /
 4 编写 api.ts / 5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
+
+`scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
+测试库隔离 / LIMIT 分页 / 匿名路径通配。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
 （json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

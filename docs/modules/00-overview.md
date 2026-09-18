@@ -52,7 +52,7 @@
 6. 静态站点兜底（`server.app_path`，GET/HEAD，带穿越防护）。
 7. `run(file, params)` 前置管线：
    - **鉴权** `AuthGuard::verify(path, header)` → 失败 401，匿名放行 `Ok(None)`；
-   - **租户** 缺失/空 → 400（`tenant.anonymous_paths` 一层通配豁免）；
+   - **租户** 缺失/空 → 400（`tenant.anonymous_paths` 通配豁免：字面 / `/*` 一层 / `*` 单段 / `**` 跨段）；
    - **体积** 超 `max_upload` → 413；
    - **multipart** 解析为文本字段 + `Vec<UploadedFile>`；
    - 组装 `RequestInfo { method, params, query, headers, body, tenant_id, user, files }`。
@@ -112,4 +112,4 @@
 | 改构建产物 | `oj/src/build_cmd.rs`、`pack.rs`、`manifest.rs` |
 | 改迁移/种子/schema | `oj/src/migrate.rs`、`seed.rs`、`schema.rs`、`checks.rs` |
 | 改测试运行器 | `oj/src/test_cmd.rs`、`oj/src/test_ext.rs`、`oj/src/test_ext/test_bootstrap.js` |
-| 跑 sample 测试（L1/L2） | `cd sample && npm run test`（= `test:unit` + `test:api`），判据见 [08-testing.md](08-testing.md) |
+| 跑 sample 测试（L1/L2 + 类型） | `cd sample && npm run test`（= `typecheck` + `test:unit` + `test:api`），判据见 [08-testing.md](08-testing.md) |

@@ -246,8 +246,11 @@ const rows = await db.table("account")
 
 要点：
 
-- **隐式 LIMIT 100 只加在顶层查询**；显式 `limit(n)` 一律生效并被 clamp 到 **1000**
-  （`LIMIT_MAX`）。子查询/union 成员不会被隐式截断。
+- **隐式 LIMIT 只加在顶层查询**，值取 `db_query.default_limit`（**默认 100**）；显式
+  `limit(n)` 一律生效并被 clamp 到 `db_query.max_limit`（**默认 1000**，硬顶 100000）。
+  子查询/union 成员不会被隐式截断。两者都在装配期校验（`0` / 倒置 / 超硬顶 → fail-fast）。
+- **截断不再静默**：返回行数达到实际生效上限时，响应带 `X-OJ-Row-Limit: <n>` 头
+  （含「显式 limit 被 clamp」这一类）。显式给了 limit 且行数未达上限 → 不写头。
 - 多次 `.where()` 条件之间 **AND**（`.having()` 是整体替换，单树）。
 - `.orderBy` 的列必须是表/join/CTE 白名单里的**真实列**（聚合别名不行，见 §8）。
 

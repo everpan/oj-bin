@@ -13,7 +13,7 @@ export default {
     // session 只存 uid——roles 重查库取最新。
     const rows = await db.table("users").select(["roles"]).where({ field: "id", op: "eq", value: sess.uid }).all();
     let roles: string[] = [];
-    try { roles = JSON.parse((rows[0] || {}).roles || "[]"); } catch { roles = []; }
+    try { roles = JSON.parse(String((rows[0] || {}).roles || "[]")); } catch { roles = []; }
     // 轮换：先删旧 session（旧 refresh 立即失效，一次一用）再签新对。
     await kv.del(key);
     json.ok(await issueTokens(String(sess.uid), roles));

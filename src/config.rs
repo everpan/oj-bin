@@ -22,6 +22,17 @@ pub struct ServerCfg {
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
     /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（server_cmd 预绝对化后写入）。
     pub app_path: Option<String>,
+    /// SPA 深链接回落（v0.1.20）：静态未命中 + 无扩展名 + Accept html + 不在 api_prefix
+    /// 下 → 送 `<app_path>/index.html`。**默认 false** —— 静默把 404 变 200 会掩盖错配
+    /// （拼错的 API 路径、丢掉的静态资源），故 SPA 工程显式开启。
+    #[serde(default)]
+    pub app_spa_fallback: bool,
+    /// 路由感知 meta 目录（v0.1.20）：相对 `app_path` 的子目录名（如 `"__meta"`）。
+    /// 送 HTML 前按请求路径查 `<app_path>/<html_meta>/<path>.json`，把 `title`/
+    /// `description`/`og:*`/`twitter:*`/`canonical` 注入 `<head>`（值 HTML 转义，
+    /// **不注入脚本**）。None = 不注入。该目录对静态服务不可见（命中即 404）。
+    #[serde(default)]
+    pub html_meta: Option<String>,
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
@@ -67,6 +78,8 @@ impl Default for ServerCfg {
             api_prefix: "/v1/api".into(),
             app_prefix: "/".into(),
             app_path: None,
+            app_spa_fallback: false,
+            html_meta: None,
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
@@ -238,6 +251,11 @@ pub struct TenantCfg {
     /// 空 = 共享表声明被忽略，仍按受租户约束校验 tenant_id 列）。
     #[serde(default)]
     pub shared_allow: Vec<String>,
+    /// `db.asTenant` 开关（v0.1.20）：匿名请求（anonymous_paths 命中且无租户头）允许
+    /// handler 显式声明本次查询的租户身份。**默认 false** —— id 由 handler 自选、平台
+    /// 无从校验，是「授信 handler」而非平台校验，故比 `db.asSystem` 多一道开关。
+    #[serde(default)]
+    pub allow_as_tenant: bool,
 }
 
 impl Default for TenantCfg {
@@ -248,6 +266,7 @@ impl Default for TenantCfg {
             anonymous_paths: Vec::new(),
             sql_guard: crate::bridge::SqlGuard::Off,
             shared_allow: Vec::new(),
+            allow_as_tenant: false,
         }
     }
 }
@@ -506,6 +525,12 @@ pub struct Config {
     /// WS 运行时（spec 2026-09-09 帧池）：闸门 / Worker 数 / 空闲退役。
     #[serde(default)]
     pub ws: WsCfg,
+    /// 构造器 LIMIT（v0.1.20）：`default_limit` = 顶层 select 未给 limit 时的隐式值
+    /// （默认 100），`max_limit` = 显式 limit 的 clamp 上界（默认 1000，硬顶 100000）。
+    /// 两者都在装配期校验（0 / 倒置 / 超硬顶 均 fail-fast）。
+    /// **不能塞进 `db:`**——`db` 是 name → DSN 的 map，键即库名。
+    #[serde(default)]
+    pub db_query: crate::bridge::QueryLimits,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
 }

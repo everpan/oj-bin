@@ -53,14 +53,17 @@ impl Guard {
         })
     }
 
-    /// 精确匹配或尾 "/*" 一层前缀通配（"/pub/*" 命中 "/pub/x"，不命中 "/pub"）。
+    /// 路径通配匹配：**与 `server::path_matches` 同语义的两份实现之一**（插件不能依赖
+    /// server crate，两处各自持有、注释互指；改一侧必须同步另一侧与两侧单测矩阵）。
+    ///
+    /// v0.1.20 统一语义：字面 / `*` 恰好一段（尾 `/*` 仍是严格一层，**不**再像旧版那样
+    /// 任意深度）/ `**` 跨段（≥0 段）。旧版尾 `*` 是 `starts_with` 任意深度，与自身注释
+    /// 和文档矛盾 —— 收紧后深路径请显式写 `/x/**`（迁移提示见 CHANGELIST v0.1.20）。
     fn is_anonymous(&self, path: &str) -> bool {
+        let seg: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         self.anon.iter().any(|p| {
-            if let Some(prefix) = p.strip_suffix("/*") {
-                path.starts_with(prefix) && path.len() > prefix.len()
-            } else {
-                path == p
-            }
+            let pat: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+            segments_match(&pat, &seg)
         })
     }
 
@@ -125,6 +128,19 @@ fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RSt
     })
 }
 
+/// 段序列匹配（`*` 恰好一段 / `**` 跨段 ≥0 段；与 server 侧 `segments_match` 同形）。
+///
+/// `**` 用回溯试 0..=n 段：模式与路径都很短（路径段数 < 20），开销可忽略。
+fn segments_match(pat: &[&str], seg: &[&str]) -> bool {
+    match (pat.first(), seg.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(p), _) if *p == "**" => (0..=seg.len()).any(|k| segments_match(&pat[1..], &seg[k..])),
+        (Some(_), None) => false,
+        (Some(p), Some(s)) => (*p == *s || *p == "*") && segments_match(&pat[1..], &seg[1..]),
+    }
+}
+
 oj_plugin_ffi::oj_plugin_entry!(init, auth => &VTABLE);
 
 #[cfg(test)]
@@ -158,11 +174,40 @@ mod tests {
         .unwrap()
     }
 
+    /// 与 `server::path_matches` 同语义矩阵（防两处实现漂移；v0.1.20）。
     #[test]
     fn anonymous_matching() {
         let g = guard();
         assert!(g.is_anonymous("/health") && g.is_anonymous("/auth/login"));
         assert!(!g.is_anonymous("/auth") && !g.is_anonymous("/me"));
+        // 尾 `/*` 严格一层：不命中两层（旧版 starts_with 会命中，v0.1.20 收紧）。
+        assert!(!g.is_anonymous("/auth/a/b"));
+    }
+
+    #[test]
+    fn anonymous_matching_glob_forms() {
+        let g = Guard::new(&GuardCfg {
+            jwt_secret: "s3cret".into(),
+            signing_method: "HS256".into(),
+            anonymous_paths: vec![
+                "/public/**".into(),
+                "/pub/anchor/*/states".into(),
+                "/a/*/b/*".into(),
+            ],
+        })
+        .unwrap();
+        // `**` 跨段（≥0 段）
+        assert!(g.is_anonymous("/public"));
+        assert!(g.is_anonymous("/public/a"));
+        assert!(g.is_anonymous("/public/a/b/c"));
+        assert!(!g.is_anonymous("/publik/a"));
+        // 中段 `*`：恰好一段
+        assert!(g.is_anonymous("/pub/anchor/v1c/states"));
+        assert!(!g.is_anonymous("/pub/anchor/v1c/x/states"));
+        assert!(!g.is_anonymous("/pub/anchor/v1c/states/x"));
+        // 单模式多 `*`
+        assert!(g.is_anonymous("/a/1/b/2"));
+        assert!(!g.is_anonymous("/a/1/b/2/3"));
     }
 
     #[test]

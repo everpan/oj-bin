@@ -14,6 +14,10 @@ API 签名以同目录 `global.d.ts` 为类型权威。
 5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制
 
+> **想直接抄代码**：同目录 `scenarios.md` 是场景速查（公开分享页匿名读租户数据 /
+> SPA 深链回落与每页 meta / 测试库隔离 / LIMIT 分页陷阱 / 匿名路径通配），
+> 每篇都是「配置 + 代码 + 验证 + 常见坑」。本手册讲「有什么、为什么」，场景集讲「怎么写」。
+
 ## 1. 快速开始
 
 > 何时读我：第一次接触 oj，要从零跑通一个请求。
@@ -630,6 +634,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
 | `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
+| `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
@@ -642,7 +647,7 @@ const rows = await db.table("account")
   .orderBy([{ field: "id", dir: "desc" }])
   .limit(10)
   .offset(0)
-  .all();                                          // → Promise<Json[]>
+  .all();                                          // → Promise<Row[]>（每行 = 列名 → 值）
 ```
 
 - `WhereCond`：`{ field: string; op?: string; value?: unknown }`。
@@ -862,7 +867,10 @@ await db.table("rich")
 - 层数上限 4（`<site>: nested select too deep`，site 为出错位置）；嵌套必须 select
   （`<site>: nested select must be select`）；嵌套禁 with/unions
   （`<site>: nested select does not accept with/unions (v1)`）。
-- 隐式默认 `limit 100` 只作用于**顶层**查询；嵌套/成员不隐式截断（显式 limit 一律生效）。
+- 隐式默认 limit 只作用于**顶层**查询；嵌套/成员不隐式截断（显式 limit 一律生效）。
+  默认值由 `db_query.default_limit`（默认 100）给出，显式 limit 被 `db_query.max_limit`
+  （默认 1000）clamp；两者均可在配置中调整（硬顶 100000）。顶层结果为数组且行数 ≥ 生效
+  上限时，响应带 `X-OJ-Row-Limit: <上限>` 头提示可能被截断。
 
 ### kv / redis —— KV 存储
 
@@ -1427,13 +1435,20 @@ tenant:
   header_key: "X-TENANT-ID"   # 默认即此名
   sql_guard: deny             # 多租户 SQL 防护：false（默认，不改写 SQL）| "warn" | "deny"/true
   shared_allow: [dict]        # 共享表白名单（schema.yaml 里 tenant: false 的表须在此列出才生效）
+  allow_as_tenant: false      # v0.1.20：允许匿名请求用 db.asTenant(id) 声明身份（默认关）
+  anonymous_paths:            # 豁免缺租户头的路径（去 base 前缀、去尾斜杠后的形态）
+    - /public/*               # 尾 /* ：严格一层（/public/a 命中，/public/a/b 不命中）
+    - /idp/**                 # 中段/尾 ** ：跨任意层（/idp 到 /idp/a/b/c 全命中）
+    - /report/*/export        # 中段 * ：恰好一段（/report/7/export 命中，/report/a/b/export 不命中）
 ```
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
-供 handler 做数据隔离。`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 尾
-`/*`」形式，但 tenant 匹配是**严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；
-oj-auth 插件实现为多层前缀），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
-已带的头仍照常注入。
+供 handler 做数据隔离。`tenant.anonymous_paths`（与 `auth.anonymous_paths` 同语义）为
+**去 base 前缀**后的路径，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
+中段 `*`（恰好一段）；豁免命中且确实没带租户头 → 该请求标记为**匿名**（
+`RequestInfo.anonymous`），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
+已带的头仍照常注入。旧写法「尾 `/*` 当多层前缀」在 v0.1.20 收紧为严格一层，装配期对
+`tenant.anonymous_paths` / `auth.anonymous_paths` 中的尾 `/*` 条目打迁移 WARN。
 
 **`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制
@@ -1441,6 +1456,13 @@ oj-auth 插件实现为多层前缀），豁免缺失 400——给 OIDC 302 跳�
 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
 （共享表 `tenant: false` + `shared_allow` 双声明豁免），server 启动 / `oj build` /
 `oj migrate` 三处校验。跨租户操作（对账、运营报表）走 `db.asSystem()`（请求级、打审计日志）。
+**`db.asTenant(id)`（v0.1.20 起）**：与 `asSystem` 方向相反——不是绕过防护，而是给
+**匿名请求**补上租户身份。三道门禁全过才生效：① `tenant.allow_as_tenant: true`
+（默认 false）；② 该请求是匿名的（`anonymous_paths` 命中且未带租户头，或 `oj test
+--anonymous`）；③ `id` 非空。生效后 `tenant_id` 被填为 `id`，构造器查询照常强制注入
+租户条件；**请求级且只能设一次**（已带租户头 / 已设过 → 抛错，防运行期切换身份）。
+典型用途：公开分享页、OIDC 回调等无头请求仍需按 URL 里的租户读取数据。
+
 新人向白话文档见 `docs/tenant-guide.md`；**注意租户头目前是客户端自报，防伪造需 JWT claims
 绑定（规划见设计文档 §7）**。
 
@@ -1536,6 +1558,7 @@ describe("user account", () => {
 
 ```bash
 cd sample && npm run test:unit    # 统一入口（等价 cd unit && npm ci && npx vitest run）
+cd sample && npm run typecheck    # 类型检查（src + tests + unit 共用一个 tsconfig；CI 门禁）
 ```
 
 结构：`mocks/oj-globals.ts` 提供 `installGlobals(opts?)`（把 `db/json/http/bus/log`
@@ -1580,14 +1603,15 @@ bus 事件**内容**，以及 TDD 快速回归；
 
 **推荐组合：开发期 L2 快速验证逻辑，CI 用 L1 守护端到端契约；两层都绿才有信心发布。**
 
-CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job）：
+CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，发版门禁另见
+`release.yml` 的 `lint`）：`npm ci`（`unit/`）→ `npm run typecheck` →
 `cargo run --release -p xtask -- build`（workspace 构建，产出 `bin/oj` + 全部第一方插件，
 勿用 `cargo build -p oj`——会按不同 feature 归一化重编 rusty_v8）→
-`./bin/oj test -c sample/config.yaml -d sample/src --format junit` → vitest。
+`./bin/oj test -c sample/config.yaml -d sample/src --format junit` → `npx vitest run`。
 
-依赖管理：L2 的 vitest 声明在 `unit/package.json` 的 `devDependencies`，与运行时依赖
-（如 `escape-goat`）隔离——被测物不携带测试工具；统一入口在 `sample/package.json`
-（`npm run test` = `test:unit` + `test:api`）。
+依赖管理：L2 的 vitest 与 typescript（类型检查用）声明在 `unit/package.json` 的
+`devDependencies`，与运行时依赖（如 `escape-goat`）隔离——被测物不携带测试工具；
+统一入口在 `sample/package.json`（`npm run test` = `typecheck` + `test:unit` + `test:api`）。
 
 ## 10. 配置 config.yaml
 

@@ -36,9 +36,15 @@ interface QueryBuilder {
   select(cols?: (string | object)[]): QueryBuilder;
   where(cond: WhereCond): QueryBuilder;
   orderBy(items?: OrderByItem[]): QueryBuilder;
+  // LIMIT/OFFSET（v0.1.20 起可配，见 config `db_query` 段——不能写进 `db:` 段）：
+  // 未给 limit 的**顶层** select 隐式补 `db_query.default_limit`（默认 100）；显式 limit
+  // 被 clamp 到 `db_query.max_limit`（默认 1000，硬顶 100000）。嵌套/子查询不隐式截断。
+  // 结果行数 ≥ 生效上限时，响应带 `X-OJ-Row-Limit: <上限>` 头（仅 json.* 路径）——
+  // 判「可能被截断」看该头，别猜。
   limit(n: number): QueryBuilder;
   offset(n: number): QueryBuilder;
-  all(): Promise<Json[]>;
+  // 行数组（每行是列名 → 值；与 db.query 的返回同形）。
+  all(): Promise<Row[]>;
   // DML：动词由 insert/update/delete 声明，run() 终执行（返回受影响行数）。
   // insert + returning(["id"]) 时 run() 改返回行数组 [{ id: n }]——
   // pg/sqlite 是单条 RETURNING 语句；mysql 同连接两步取 LAST_INSERT_ID()（建议放 db.tx）。
@@ -83,10 +89,25 @@ interface DBInstance {
   // 系统逃生通道（tenant sql_guard）：本请求绕过租户注入/校验。显式且被审计，
   // 业务 handler 不得使用。
   asSystem(): DBInstance;
+  // 匿名请求声明租户（v0.1.20）。公开页 handler 用**服务端派生**的租户 id 声明本次请求
+  // 的身份（典型派生链：分享 token → 查共享表 → 租户 id）。**与 asSystem 不同——租户条件
+  // 仍然强制注入**，只是身份由 handler 给。
+  // 三道门禁全过才生效，缺一即抛错（不是静默忽略）：
+  //   ① config `tenant.allow_as_tenant: true`（默认关）；
+  //   ② 请求是匿名请求（命中 `tenant.anonymous_paths` 且未带租户头；`oj test --anonymous`）；
+  //   ③ id 非空。
+  // 另：请求级且**只能调用一次**（已带租户头的请求、或同一请求内二次调用 → 抛错，防运行期
+  // 切换身份）；生效后 `http.tenantId` 即该值，并记一条审计日志。
+  // 红线：id 必须服务端派生，**绝不可**直接取请求参数（否则等于把租户交给调用方）。
+  asTenant(id: string): DBInstance;
   // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
   // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
-  tx(fn: (tx: DBInstance) => unknown): Promise<unknown>;
+  // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
+  tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
 }
+
+// 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）。
+type TxInstance = Omit<DBInstance, "tx">;
 
 // json.* ：统一响应信封 + 响应头。
 interface JsonApi {
@@ -108,7 +129,8 @@ interface HttpApi {
   bodyBytes(): Promise<Uint8Array>;
   // 取路由参数或 query 参数：路径参数优先，query 兜底，均缺失返回 def 原值。
   param(name: string, def?: unknown): any;
-  // 租户 id（tenant 启用时从租户头提取；未启用为 null）。
+  // 租户 id（tenant 启用时从租户头提取；未启用为 null）。`db.asTenant(id)` 声明成功后
+  // 即为该 id（v0.1.20）。
   tenantId: string | null;
   // 已验签用户（auth 启用且通过 Bearer 守卫；否则 null）。
   user: AuthUser | null;
@@ -157,6 +179,18 @@ interface KVApi {
 interface WSApi {
   send(data: string | Uint8Array): void;
   close(): void;
+}
+
+// sess.* ：WS 帧池的会话上下文（v0.1.10 帧池模型；**只在 ws.ts 的生命周期钩子内存在**——
+// HTTP / 任务桥路径没有这个全局）。
+// 执行模型：路由级 W 个无状态 Worker 共享执行，连接态必须外置到 sess.state（Rust 会话表
+// 持久、按连接隔离）；模块作用域只是 Worker 本地只读缓存，**不要**用来放连接状态。
+interface WsSess {
+  // 连接标识（进程内自增；同一连接的各帧相同）。
+  readonly id: number;
+  // 跨帧持久的会话状态。**必须可 JSON 序列化**：不可序列化时该帧的状态回传被丢弃
+  // （Rust 侧保留旧快照），连接不中断——所以别往里塞函数 / class 实例 / Uint8Array。
+  state: Record<string, Json>;
 }
 
 // blob.* ：对象存储（可调用取命名实例：blob("media").put(...)；裸调用 blob.put(...) 等价 default）。
@@ -310,6 +344,8 @@ declare global {
   const kv: KVApi;
   const redis: KVApi;
   const ws: WSApi;
+  // WS 帧池会话上下文（仅 ws.ts 生命周期钩子内可用，见 WsSess）。
+  const sess: WsSess;
   const blob: BlobApi;
   const bus: BusApi;
   const es: EsApi;
@@ -347,14 +383,22 @@ declare global {
     body?: string;
   }
   // WS 帧测试面（v0.1.16）：path 形如 "/echo-bin/ws"（相对 base）。
+  // 帧型判别：binary = true 为二进制帧（data 为 Uint8Array），false 为文本帧（data 为 string）。
   interface TestWsFrame {
     binary: boolean;
     data: string | Uint8Array;
+    // 判别位（可选）：收到帧时为 false/缺失，便于 `if (f.closed) …` 收窄联合类型。
+    closed?: false;
+  }
+  // 对端已关闭（此后不会再收到帧）。
+  interface TestWsClosed {
+    closed: true;
   }
   interface TestWs {
     send(data: string | Uint8Array): Promise<void>;
-    // 下一帧：{binary, data}；对端关闭 {closed: true}；超时无帧 null（默认 1000ms）。
-    next(ms?: number): Promise<TestWsFrame | { closed: true } | null>;
+    // 下一帧：{binary, data}（收到帧）/ {closed: true}（对端关闭）/ null（超时无帧，默认 1000ms）。
+    // 取 binary/data 前先收窄：`if (!f || f.closed) …`（否则 TS 报「binary 不存在于 closed 分支」）。
+    next(ms?: number): Promise<TestWsFrame | TestWsClosed | null>;
     close(): Promise<void>;
   }
   interface Client {

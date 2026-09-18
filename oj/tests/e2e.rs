@@ -835,3 +835,67 @@ async fn e2e_query_builder_join_and_insert() {
     assert_eq!(v["data"].as_array().map(|a| a.len()), Some(1), "{v}");
     let _ = std::fs::remove_dir_all(&t);
 }
+
+/// `oj test` 默认库重定向（v0.1.20，U33）：`db_override` 后**建表/种子/fixtures
+/// 一并落在 test 库**，开发库（db.default）不被触碰——测试写在开发库上（读到非种子
+/// 数据、写坏开发库）是本次要堵的事故面。
+#[tokio::test(flavor = "current_thread")]
+async fn test_db_override_builds_schema_on_test_db_not_dev() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/schema.yaml",
+            "tables:\n\
+             \x20 a:\n\
+             \x20   pk: id\n\
+             \x20   columns:\n\
+             \x20     id: { type: integer, autoincrement: true }\n\
+             \x20     name: { type: text }\n",
+        ),
+    ]);
+    let mut cfg = base_cfg(&t);
+    cfg.db
+        .insert("default".into(), format!("sqlite://{}/dev.sqlite", fwd(&t)));
+    cfg.db
+        .insert("test".into(), format!("sqlite://{}/tst.sqlite", fwd(&t)));
+    // fixtures=true + db_override="test"：`oj test` 的装配形态。
+    let app = oj::app::App::from_config(
+        cfg,
+        &t,
+        t.join("src"),
+        "/v1/api".into(),
+        true,
+        true,
+        Some("test".into()),
+    )
+    .await
+    .expect("from_config with db_override");
+    drop(app);
+    assert!(
+        has_table(&t.join("tst.sqlite"), "a").await,
+        "test 库必须有表"
+    );
+    assert!(
+        !has_table(&t.join("dev.sqlite"), "a").await,
+        "开发库不得被测试装配建表"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// sqlite 文件里是否存在某表（迁移是否落在预期库的判据）。
+async fn has_table(file: &Path, table: &str) -> bool {
+    if !file.is_file() {
+        return false;
+    }
+    let dsn = format!("sqlite://{}", fwd(file));
+    let db = only_js::bridge::SqlxAccessor::arc(&dsn).await.unwrap();
+    let rows = db
+        .query_with_params(
+            "select name from sqlite_master where type='table' and name=?",
+            &[serde_json::json!(table)],
+        )
+        .await
+        .unwrap();
+    !rows.is_empty()
+}

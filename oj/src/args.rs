@@ -40,6 +40,12 @@ pub struct TestArgs {
     pub format: Option<String>,
     /// 报告输出文件；省略则打到 stdout。machine 格式（tap/junit/json）配合此旗标落盘。
     pub output: Option<String>,
+    /// 测试库：字面 "default" 的库调用改指向该库（默认取 config 的 `db.test`；
+    /// 迁移/seed/fixtures 一并跟随，防测试写在开发库上）。未声明的库名 fail-fast。
+    pub db: Option<String>,
+    /// 把测试请求标记为匿名（等同生产 anonymous_paths 命中），让公开面 handler
+    /// （走 `db.asTenant`）在 `oj test` 下可测。
+    pub anonymous: bool,
 }
 
 /// `oj build [module] [-d src] [-o dist] [--no-minify] [--check]`（src → dist，生成 routes.js）。
@@ -175,6 +181,14 @@ enum Commands {
         /// 报告落盘文件；省略则打印到 stdout
         #[arg(long)]
         output: Option<String>,
+        /// 测试库名（默认取 config 的 db.test）：字面 "default" 的库调用改指向该库，
+        /// 迁移/seed/fixtures 一并跟随
+        #[arg(long)]
+        db: Option<String>,
+        /// 把测试请求标记为匿名（等同生产 anonymous_paths 命中），供公开面
+        /// handler（db.asTenant）在测试中授信
+        #[arg(long)]
+        anonymous: bool,
     },
     /// 应用模块迁移到最新（migrations/*.sql → default 库；部署 = build && migrate && server）
     Migrate {
@@ -275,6 +289,8 @@ fn to_command(cli: Cli) -> Command {
             tests,
             format,
             output,
+            db,
+            anonymous,
         } => Command::Test(TestArgs {
             config,
             base,
@@ -282,6 +298,8 @@ fn to_command(cli: Cli) -> Command {
             tests,
             format,
             output,
+            db,
+            anonymous,
         }),
         Commands::Migrate {
             config,

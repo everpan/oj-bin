@@ -288,6 +288,45 @@ pub fn op_db_as_system(state: &mut OpState) -> bool {
     true
 }
 
+/// db.asTenant(id)：匿名请求下由 handler **显式声明**本次查询的租户身份（v0.1.20）。
+///
+/// 与 `asSystem` 的边界（务必写进文档）：`asSystem` = 完全绕过租户防护（跨租户裸奔，
+/// 仅系统任务）；`asTenant` = **仍然强制 tenant_id 条件**（构造器注入、裸 SQL 要求
+/// mentions+param_has），只是身份由 handler 自己给 —— 公开页（anchor → workspace uuid
+/// 查表派生）要的是后者。
+///
+/// 三道 fail-closed 门禁：① `tenant.allow_as_tenant` 显式开启（默认关，面向公开面且
+/// id 无从校验，故不复用 asSystem 的无开关形态）；② 请求必须是**匿名请求**
+/// （`RequestInfo.anonymous`，仅 server 的 anonymous_paths 豁免分支置位——WS 帧/任务桥/
+/// 测试默认路径恒 false）；③ 当前尚无租户 id（防运行期切换身份）。
+/// 调用记审计日志；`ReqState::reset` 后失效（请求级）。
+// nofast：三道门禁的拒绝原因必须抛回 JS（fast op 无异常通道）。
+#[op2(nofast)]
+pub fn op_db_as_tenant(state: &mut OpState, #[string] id: String) -> Result<bool, JsErrorBox> {
+    if id.trim().is_empty() {
+        return Err(JsErrorBox::generic("db.asTenant: id must not be empty"));
+    }
+    // 平台无从校验 id 是否为真实租户（无租户目录可查）——安全完全取决于「服务端派生」
+    // 这条红线，故默认关闭 + 审计日志。
+    let allow = state.borrow::<Arc<super::StableState>>().allow_as_tenant;
+    if !allow {
+        return Err(JsErrorBox::generic(
+            "db.asTenant is disabled: set tenant.allow_as_tenant=true to let anonymous handlers declare a tenant",
+        ));
+    }
+    let rs = state.borrow_mut::<super::ReqState>();
+    if !rs.req.anonymous || rs.req.tenant_id.is_some() {
+        return Err(JsErrorBox::generic(
+            "db.asTenant is only allowed on anonymous requests (anonymous_paths hit, no tenant header)",
+        ));
+    }
+    eprintln!(
+        "warn: db.asTenant({id}) invoked (anonymous request; tenant must be derived server-side)"
+    );
+    rs.req.tenant_id = Some(id);
+    Ok(true)
+}
+
 /// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
 #[op2]
 #[serde]

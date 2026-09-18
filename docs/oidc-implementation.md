@@ -71,7 +71,7 @@ flowchart TD
   （RFC 6749 要求 `access_token` 是顶层字段），错误仍走 `{code,msg,data}` 信封。
 - **豁免面最小**：`tenant.anonymous_paths` 只豁免「缺失租户头的 400」，且仅列出三条
   跳转腿路径（`/oidc/*`、`/idp/*`、`/idp/.well-known/*`）；带有效租户头的请求照常注入
-  `http.tenantId`。匹配是严格一层通配（比 oj-auth 插件的多层前缀更严，深路径需显式列出）。
+  `http.tenantId`。匹配为通配四形态（字面 / 尾 `/*` 一层 / `*` 单段 / `**` 跨段）。
 
 ## 2. 全链时序图
 
@@ -158,7 +158,7 @@ flowchart LR
 | 裸 JSON | `src/bridge/json.rs` | `json.raw(data)`——200 裸 JSON，默认 content-type，`json.header` 可覆盖 |
 | 全局挂载 | `src/bridge/bootstrap.js` | `oidc` 全局（sign/verify/jwks/issuer/rp/clients）；ASCII 纪律 |
 | 装配 | `oj/src/app.rs` | `cfg.oidc → OidcState::from_section → Extras.oidc/StableState`（构造期，fail-fast） |
-| 租户豁免 | `server/src/lib.rs` | `Pipeline.tenant_anon` + `path_matches`（严格一层通配）；run 闭包豁免缺失头 400 |
+| 租户豁免 | `server/src/lib.rs` | `Pipeline.tenant_anon` + `path_matches`（字面 / `/*` 一层 / `*` 单段 / `**` 跨段）；run 闭包豁免缺失头 400 并置 `RequestInfo.anonymous` |
 | OP | `sample/src/idp/` | discovery / jwks.json / authorize / login / token / userinfo（六端点） |
 | RP | `sample/src/oidc/` | login / callback / logout（三端点） |
 | 共享工具 | `sample/src/auth/_shared/util.ts` | redirect / nowSecs / b64uFromHex / parseForm / parseCookies（构建顺序 auth 最先） |

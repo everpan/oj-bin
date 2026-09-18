@@ -237,9 +237,12 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   （迁移完全归 `oj migrate` / 运维）。非法值 fail-fast。
 - `server.ownership_guard`：表归属守卫（§5.3）。`warn`（默认）跨模块表访问仅告警；
   `deny` 未声明 `deps` 的跨模块表访问拒绝执行（500，报错附修复指引）。
-- `tenant.anonymous_paths`：与 auth 匿名列表同为「去 `{base}` 前缀 + 尾 `/*`」形式，但匹配是
-  **严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；oj-auth 插件实现为多层前缀）的
-  **跳转腿豁免**——命中路径不再因缺租户头 400（OIDC 302 场景），已带的头仍注入。
+- `tenant.anonymous_paths`：**跳转腿豁免**（去 `{base}` 前缀 + 通配）——命中路径不再因缺租户头
+  400（OIDC 302 场景），已带的头仍注入。通配四形态（v0.1.20）：字面 / 尾 `/*` 严格一层 /
+  中段 `*` 恰好一段 / `**` 跨任意段。
+- `tenant.allow_as_tenant`（默认 false）：允许匿名请求（豁免命中且无租户头）的 handler 用
+  `db.asTenant(uuid)` 声明本次查询的租户身份——公开页（anchor → workspace uuid）用。仍强制
+  租户条件，只是身份由 handler 给；id 必须服务端派生。
 - `oidc:`：缺段时调用报 `oidc not configured`；私钥只在 Rust 侧解析使用，
   `client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读（与 `auth.jwt_secret` 同一信任级）。
   内置 OP/RP 演示见 §11 与 `sample/README.md`「OIDC 演示」。
@@ -595,8 +598,9 @@ await db.tx(async (tx) => {
 `Authorization: Bearer <access_token>`（缺失/验签失败/过期 → 401）；通过后 handler 里读
 `http.user`（`{id, roles, claims}`）。
 
-- 匿名路径 `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，尾 `/*` 一层通配
-  （`/pub/*` 命中 `/pub/x` 不命中 `/pub`）。auth 端点自身是业务路由，须在此显式匿名。
+- 匿名路径 `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，通配四形态（v0.1.20）：字面 /
+  尾 `/*` 严格一层（`/pub/*` 命中 `/pub/x`，不命中 `/pub` 与 `/pub/a/b`）/ 中段 `*` 恰好一段 /
+  `**` 跨任意段。auth 端点自身是业务路由，须在此显式匿名。
 - 用户表 `users`（`_platform` 伪模块持有归属）最小 schema：
   `id, username, password_hash(bcrypt), roles(JSON 数组串，如 '["admin"]')`。
 - 登录失败统一报 `invalid credentials`（不区分用户不存在/密码错）。

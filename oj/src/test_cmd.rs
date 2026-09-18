@@ -81,9 +81,27 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
         return Err(format!("no *.test.ts found in {}", tests_path.display()));
     }
 
+    // 默认库（v0.1.20）：`--db` 显式优先；否则声明了 `db.test` 就走它——测试写在开发库
+    // 上会读到非种子数据、甚至写坏开发库。两者都没有则打 WARN 继续跑 default（不静默）。
+    let db_override = match a.db.clone() {
+        Some(name) => Some(name),
+        None if cfg.db.contains_key("test") => Some("test".into()),
+        None => {
+            eprintln!(
+                "warn: oj test 未指定测试库（config 无 db.test，也未给 --db）\
+                 —— 用例将跑在 db.default（开发库）上"
+            );
+            None
+        }
+    };
+    if let Some(o) = &db_override {
+        eprintln!("oj test: using db {o:?}（migrate/seed/fixtures 一并跟随）");
+    }
+
     // 钉线程：JsRuntime 是 !Send，必须待在同一 OS 线程。
     let fmt = a.format.clone().unwrap_or_else(|| "human".into());
     let out = a.output.clone();
+    let anonymous = a.anonymous;
     let handle = std::thread::Builder::new()
         .name("oj-test".into())
         .spawn(move || {
@@ -92,8 +110,9 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .build()
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
-                let app = App::from_config(cfg, &config_dir, dir, base, ts, true).await?;
-                run_on_runtime(app, &files, &fmt, out.as_deref()).await
+                let app =
+                    App::from_config(cfg, &config_dir, dir, base, ts, true, db_override).await?;
+                run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })
         .map_err(|e| format!("spawn test thread: {e}"))?;
@@ -110,6 +129,7 @@ async fn run_on_runtime(
     files: &[PathBuf],
     format: &str,
     output: Option<&str>,
+    anonymous: bool,
 ) -> Result<i32, String> {
     let start = Instant::now();
     let stable = app.stable();
@@ -140,6 +160,8 @@ async fn run_on_runtime(
         let mut st = op_state.borrow_mut();
         st.put(app.clone());
         st.put(app as Arc<dyn ClientTransport>);
+        // `oj test --anonymous`：测试请求按匿名请求授信（公开面 handler 可测）。
+        st.put(crate::test_ext::TestAnonymous(anonymous));
         // client.ws 状态（连接表 + 最后一帧槽位 + 惰性端口）。
         st.put(crate::test_ext::ClientWs::default());
     }
