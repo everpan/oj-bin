@@ -52,6 +52,8 @@ pub struct AppState {
     /// 静态站点前缀（server.app_prefix，默认 "/"）。非 "/" 时仅该前缀下的 GET/HEAD
     /// 落静态（前缀剥除后解析，前缀根 → index.html）；API 路由永远优先。
     app_prefix: String,
+    /// 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入。
+    static_opts: StaticOpts,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
     pipeline: Pipeline,
     /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
@@ -62,6 +64,17 @@ pub struct AppState {
     pub certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
     /// 已装配插件自描述清单（`{base}/plugins` 数据源；装配层注入）。
     pub plugins: Arc<Vec<PluginInfo>>,
+}
+
+/// 静态站点增强（v0.1.20，server.app_spa_fallback / server.html_meta）。
+#[derive(Clone, Default)]
+pub struct StaticOpts {
+    /// SPA 深链接回落：静态未命中 + 无扩展名 + Accept html + 不在 api_prefix 下
+    /// → 送 root/index.html。默认 false（静默把 404 变 200 会掩盖错配，故显式开启）。
+    pub spa_fallback: bool,
+    /// 路由感知 meta 目录名（相对静态根）：送 HTML 前按路径查
+    /// `<root>/<dir>/<path>.json` 注入 `<title>`/`<meta>`。None = 不注入。
+    pub html_meta: Option<String>,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -91,17 +104,38 @@ impl Default for Pipeline {
     }
 }
 
-/// 精确匹配或尾 "/*" 严格一层前缀通配（"/oidc/*" 命中 "/oidc/callback"，不命中
-/// 裸前缀 "/oidc" 与两层 "/oidc/a/b"；与 oj-auth is_anonymous 同为「精确或尾通配」
-/// 纯函数，此处按测试收紧为严格一层。插件不能依赖 server crate，两处各自持有，注释互指）。
+/// 路径通配匹配（v0.1.20 升级：字面 / `*` 单段 / `**` 跨段；尾 `/*` 仍是严格一层）。
+///
+/// 三种模式（逐段比对，段由 `/` 切分、忽略空段与尾斜杠）：
+/// - 字面对等：`/health` 只命中 `/health`；
+/// - `*`：匹配**恰好一个**非空段 —— `/oidc/*` 命中 `/oidc/callback`，**不**命中裸
+///   前缀 `/oidc`、也**不**命中两层 `/oidc/a/b`（维持 v0.1.19 的严格一层语义：放宽等于
+///   静默扩大免租户/免鉴权面；要深路径请显式写 `**`）；
+/// - `**`：匹配**零个或多个**段 —— `/public/**` 命中 `/public`、`/public/a`、
+///   `/public/a/b`；中段 `*` 可写 `/public/anchor/*/states`。
+///
+/// 与 `plugins/oj-auth` 的 `is_anonymous` 是**同一语义的两份实现**（插件不能依赖 server
+/// crate，两处各自持有，注释互指）——改任一侧都必须同步另一侧与两侧的单测矩阵。
 pub fn path_matches(list: &[String], path: &str) -> bool {
-    list.iter().any(|p| match p.strip_suffix("/*") {
-        Some(prefix) => match path.strip_prefix(prefix) {
-            Some(rest) => rest.starts_with('/') && !rest[1..].contains('/'),
-            None => false,
-        },
-        None => path == p,
-    })
+    let seg = split_segments(path);
+    list.iter()
+        .any(|p| segments_match(&split_segments(p), &seg))
+}
+
+/// 路径 → 段（去空段与尾斜杠；`"/a/b/"` → `["a","b"]`）。
+fn split_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// 段序列匹配（`*` 单段 / `**` 跨段；`**` 用回溯试 0..=n 段）。
+fn segments_match(pat: &[&str], seg: &[&str]) -> bool {
+    match (pat.first(), seg.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(p), _) if *p == "**" => (0..=seg.len()).any(|k| segments_match(&pat[1..], &seg[k..])),
+        (Some(_), None) => false,
+        (Some(p), Some(s)) => (*p == *s || *p == "*") && segments_match(&pat[1..], &seg[1..]),
+    }
 }
 
 /// 构造 axum 应用：catch-all fallback（`All("/*")` 语义）。
@@ -115,6 +149,8 @@ pub fn app(
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
     app_prefix: String,
+    // static_opts：静态站点两条 v0.1.20 增强（SPA 回落 / per-route meta）。
+    static_opts: StaticOpts,
     pipeline: Pipeline,
     certificate_status: Arc<RwLock<CertificateStatus>>,
     certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
@@ -143,6 +179,7 @@ pub fn app(
             timeout,
             static_root,
             app_prefix,
+            static_opts,
             pipeline,
             base: base.to_string(),
             certificate_status,
@@ -208,6 +245,7 @@ pub async fn serve(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    static_opts: StaticOpts,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -220,6 +258,7 @@ pub async fn serve(
         actor,
         timeout,
         static_root,
+        static_opts,
         pipeline,
     )
     .await
@@ -236,6 +275,7 @@ pub async fn serve_with_listener(
     actor: JsActor,
     timeout: Option<std::time::Duration>,
     static_root: Option<PathBuf>,
+    static_opts: StaticOpts,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
     serve_router(
@@ -249,6 +289,7 @@ pub async fn serve_with_listener(
             timeout,
             static_root,
             "/".to_string(),
+            static_opts,
             pipeline,
             Arc::new(RwLock::new(CertificateStatus::Valid)),
             Arc::new(RwLock::new(None)),
@@ -280,6 +321,8 @@ async fn handle(
     body: axum::body::Bytes,
 ) -> Response {
     let verb = method.as_str();
+    // Accept 判据先算：`headers` 稍后被 run 闭包整体捕获（SPA 回落要用）。
+    let accept_html = wants_html(&headers);
 
     // Certificate validation: restrict GET requests when certificate is expired or in grace period
     if verb == "GET" {
@@ -359,6 +402,9 @@ async fn handle(
             };
             // 前置管线：租户提取（启用后缺失/空 → 400；anonymous_paths 命中的跳转腿
             // 豁免"缺失 400"——OIDC 302 带不了自定义头——但已带的头仍注入）。
+            // anonymous：db.asTenant 的授信判据（v0.1.20）。只有「豁免命中 + 确实没带
+            // 租户头」才是匿名；带了头或没豁免都不是（后者走 400 / tid 注入）。
+            let mut anonymous = false;
             let tenant_id = match st.pipeline.tenant_header.as_deref() {
                 Some(key) => {
                     let exempt = path_matches(
@@ -371,7 +417,10 @@ async fn handle(
                         .filter(|s| !s.is_empty())
                     {
                         Some(tid) => Some(tid.to_string()),
-                        None if exempt => None,
+                        None if exempt => {
+                            anonymous = true;
+                            None
+                        }
                         None => {
                             return fail_response(400, &format!("missing tenant header: {key}"));
                         }
@@ -400,6 +449,7 @@ async fn handle(
                 body: body_bytes,
                 body_binary: false,
                 tenant_id,
+                anonymous,
                 user,
                 files,
                 bus_tx: None,
@@ -438,12 +488,187 @@ async fn handle(
     if let Some(root) = st.static_root.as_deref()
         && matches!(verb, "GET" | "HEAD")
         && let Some(rel_path) = strip_app_prefix(&st.app_prefix, uri.path())
-        && let Some(file) = resolve_static(root, rel_path)
-        && let Ok(body) = tokio::fs::read(&file).await
     {
-        return file_response(&file, body);
+        let meta = st.static_opts.html_meta.as_deref();
+        if let Some(file) = resolve_static(root, rel_path, meta)
+            && let Ok(body) = tokio::fs::read(&file).await
+        {
+            return static_html_response(root, rel_path, &file, body, meta);
+        }
+        // SPA 深链接回落（server.app_spa_fallback，v0.1.20）：未命中 + 无扩展名 +
+        // Accept html + **不在 api_prefix 下**（否则拼错的 API 路径会被 index.html
+        // 吞成 200，掩盖真实 404）→ 送 root/index.html。
+        if st.static_opts.spa_fallback
+            && accept_html
+            && !has_extension(rel_path)
+            && !path_under_base(rel_path, &st.base)
+        {
+            let idx = root.join("index.html");
+            if let Ok(body) = tokio::fs::read(&idx).await {
+                return static_html_response(root, rel_path, &idx, body, meta);
+            }
+        }
     }
     fail_response(404, "no route matched")
+}
+
+/// SPA 回落的 Accept 判据（v0.1.20）：缺失 / `*/*` / 含 `text/html`（q>0）均视为 html。
+/// curl 默认发 `*/*` —— 只认字面 `text/html` 会让回落对最常用客户端失效。
+fn wants_html(headers: &HeaderMap) -> bool {
+    match headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true,
+        Some(v) => v
+            .split(',')
+            .map(|p| p.split(';').next().unwrap_or("").trim())
+            .any(|t| t == "text/html" || t == "*/*"),
+    }
+}
+
+/// 路径是否带扩展名（带扩展名 = 资源请求，不该回落成 HTML）。
+fn has_extension(rel_path: &str) -> bool {
+    rel_path
+        .rsplit('/')
+        .next()
+        .and_then(|last| (last.contains('.')).then_some(true))
+        .unwrap_or(false)
+}
+
+/// 是否落在 API 前缀下（回落须排除，防吞掉 404）。
+fn path_under_base(rel_path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    !base.is_empty() && (rel_path == base || rel_path.starts_with(&format!("{base}/")))
+}
+
+/// 静态响应：HTML 走 per-route meta 注入，其余原样（v0.1.20）。
+fn static_html_response(
+    root: &Path,
+    rel_path: &str,
+    file: &Path,
+    body: Vec<u8>,
+    html_meta: Option<&str>,
+) -> Response {
+    let is_html = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("html"));
+    if is_html && html_meta.is_some() {
+        let Ok(text) = String::from_utf8(body) else {
+            return file_response(file, Vec::new());
+        };
+        let out = inject_meta(&text, root, html_meta, rel_path);
+        return file_response(file, out.into_bytes());
+    }
+    file_response(file, body)
+}
+
+/// 按请求路径查 `<root>/<html_meta>/<path>.json`，把白名单键注入 `<head>`（v0.1.20）。
+///
+/// 只注入 `<title>` / `<meta>` / `<link rel=canonical>`，**绝不注入脚本**（静态响应拿不到
+/// CSP nonce）。值一律 HTML 转义；未命中或无 `</head>` → 原样返回（零副作用）。
+/// 这是 SEO 的廉价中间态：产物由构建期/离线生成，平台不引入 SSR 运行时。
+fn inject_meta(html: &str, root: &Path, html_meta: Option<&str>, rel_path: &str) -> String {
+    let Some(dir) = html_meta else {
+        return html.to_string();
+    };
+    let Some(json_path) = meta_json_path(root, dir, rel_path) else {
+        return html.to_string();
+    };
+    let Ok(raw) = std::fs::read_to_string(&json_path) else {
+        return html.to_string();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        eprintln!("warn: html_meta {}: invalid JSON", json_path.display());
+        return html.to_string();
+    };
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return html.to_string(),
+    };
+    let mut tags = String::new();
+    if let Some(t) = obj.get("title").and_then(|t| t.as_str()) {
+        tags.push_str(&format!("<title>{}</title>\n", escape_html(t)));
+    }
+    if let Some(d) = obj.get("description").and_then(|d| d.as_str()) {
+        tags.push_str(&format!(
+            "<meta name=\"description\" content=\"{}\">\n",
+            escape_html(d)
+        ));
+    }
+    if let Some(c) = obj.get("canonical").and_then(|c| c.as_str()) {
+        tags.push_str(&format!(
+            "<link rel=\"canonical\" href=\"{}\">\n",
+            escape_html(c)
+        ));
+    }
+    // og:* / twitter:*：`og:*` 用 property，其余用 name。
+    let mut rest: Vec<(&String, &Value)> = obj
+        .iter()
+        .filter(|(k, _)| k.starts_with("og:") || k.starts_with("twitter:"))
+        .collect();
+    rest.sort_by(|a, b| a.0.cmp(b.0)); // 稳定输出（便于测试与 diff）
+    for (k, val) in rest {
+        if let Some(s) = val.as_str() {
+            let attr = if k.starts_with("og:") {
+                "property"
+            } else {
+                "name"
+            };
+            tags.push_str(&format!(
+                "<meta {attr}=\"{}\" content=\"{}\">\n",
+                escape_html(k),
+                escape_html(s)
+            ));
+        }
+    }
+    if tags.is_empty() {
+        return html.to_string();
+    }
+    // 注入点：</head>（大小写不敏感）；没有 head 结构则不注入（不猜）。
+    match html.to_lowercase().find("</head>") {
+        Some(i) => {
+            let (a, b) = html.split_at(i);
+            format!("{a}{tags}{b}")
+        }
+        None => html.to_string(),
+    }
+}
+
+/// meta JSON 路径：`<root>/<dir>/<sanitized path>.json`；空路径 → `index.json`。
+/// 段守卫与 resolve_static 同款（防 `%2e%2e` / `..` 走私）。
+fn meta_json_path(root: &Path, dir: &str, rel_path: &str) -> Option<PathBuf> {
+    let rel = rel_path
+        .strip_prefix('/')
+        .unwrap_or(rel_path)
+        .trim_end_matches('/');
+    let mut p = root.to_path_buf();
+    p.push(dir);
+    if rel.is_empty() {
+        p.push("index.json");
+        return Some(p);
+    }
+    for seg in rel.split('/') {
+        let s = percent_encoding::percent_decode_str(seg)
+            .decode_utf8()
+            .ok()?;
+        if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']) {
+            return None;
+        }
+        p.push(s.as_ref());
+    }
+    p.set_extension("json");
+    Some(p)
+}
+
+/// HTML 文本/属性值转义（防 meta JSON 里的 `"`/`</title>` 破坏文档结构）。
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// blob 下载 key：percent-decode 每段后过 valid_key（防 `%2e%2e` 穿越，与 resolve_static 同款守卫）。
@@ -475,7 +700,9 @@ fn strip_app_prefix<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
         .filter(|rest| rest.starts_with('/'))
 }
 
-fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
+/// `meta_dir`：`server.html_meta` 的目录名——该目录是**数据**不是站点资产，
+/// 命中即 404（v0.1.20）。
+fn resolve_static(root: &Path, uri_path: &str, meta_dir: Option<&str>) -> Option<PathBuf> {
     let rel = uri_path.strip_prefix('/')?.trim_end_matches('/');
     let mut p = root.to_path_buf();
     if !rel.is_empty() {
@@ -484,6 +711,9 @@ fn resolve_static(root: &Path, uri_path: &str) -> Option<PathBuf> {
                 .decode_utf8()
                 .ok()?;
             if s.is_empty() || s == "." || s == ".." || s.contains(['/', '\\', '\0']) {
+                return None;
+            }
+            if meta_dir.is_some_and(|d| d == s.as_ref()) {
                 return None;
             }
             p.push(s.as_ref());
@@ -631,6 +861,7 @@ pub(crate) mod tests {
             timeout: None,
             static_root: None,
             app_prefix: "/".to_string(),
+            static_opts: StaticOpts::default(),
             pipeline: Pipeline::default(),
             base: "/v1/api".to_string(),
             certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
@@ -708,6 +939,7 @@ pub(crate) mod tests {
                 make_actor(dir, ts),
                 timeout,
                 None,
+                StaticOpts::default(),
                 pipeline,
             )
             .await
@@ -758,6 +990,7 @@ pub(crate) mod tests {
                 actor,
                 None,
                 None,
+                StaticOpts::default(),
                 pipeline,
             )
             .await
@@ -896,10 +1129,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// path_matches：精确、尾 "/*" 一层通配（不命中裸前缀、不命中两层）。
+    /// path_matches：字面 / 尾 `/*` 一层 / 中段 `*` / `**` 跨段（下游 U2 实测五形态矩阵）。
     #[test]
     fn path_matches_semantics() {
         let l = vec!["/oidc/*".to_string(), "/idp/.well-known/*".to_string()];
+        // 旧语义不变：尾 `/*` 严格一层（不命中裸前缀、不命中两层）。
         assert!(crate::path_matches(&l, "/oidc/callback"));
         assert!(!crate::path_matches(&l, "/oidc"));
         assert!(!crate::path_matches(&l, "/oidc/a/b"));
@@ -908,6 +1142,26 @@ pub(crate) mod tests {
             "/idp/.well-known/openid-configuration"
         ));
         assert!(crate::path_matches(&["/health".to_string()], "/health"));
+        // 尾斜杠与空段容忍。
+        assert!(crate::path_matches(&l, "/oidc/callback/"));
+        // 中段 `*`：匹配任意单段（U2 第一层）。
+        let mid = vec!["/public/anchor/*/states".to_string()];
+        assert!(crate::path_matches(&mid, "/public/anchor/v1c/states"));
+        assert!(!crate::path_matches(&mid, "/public/anchor/v1c/x/states"));
+        assert!(!crate::path_matches(&mid, "/public/anchor/v1c/states/x"));
+        // `**` 跨段：≥0 段。
+        let deep = vec!["/public/**".to_string()];
+        assert!(crate::path_matches(&deep, "/public"));
+        assert!(crate::path_matches(&deep, "/public/a"));
+        assert!(crate::path_matches(&deep, "/public/a/b/c"));
+        assert!(!crate::path_matches(&deep, "/publik/a"));
+        // 单模式多 `*`。
+        let multi = vec!["/a/*/b/*".to_string()];
+        assert!(crate::path_matches(&multi, "/a/1/b/2"));
+        assert!(!crate::path_matches(&multi, "/a/1/b/2/3"));
+        // `**` 不得放行穿越形态（段内含 `..` 只是字面段，但不得因 `**` 命中根路径）。
+        assert!(!crate::path_matches(&deep, "/"));
+        assert!(!crate::path_matches(&deep, ""));
     }
 
     /// multipart：文本字段并入 body、文件进 http.files + http.file(i) 取字节；
@@ -1474,6 +1728,7 @@ pub(crate) mod tests {
     async fn spawn_static(
         api: &[(&str, &str)],
         site: &[(&str, &str)],
+        opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, TempRoutes)) {
         let t = routes(api);
         let s = routes(site);
@@ -1490,6 +1745,7 @@ pub(crate) mod tests {
                 make_actor(dir, true),
                 None,
                 Some(site),
+                opts,
                 Pipeline::default(),
             )
             .await
@@ -1510,6 +1766,7 @@ pub(crate) mod tests {
                 ("css/app.css", "body{}"),
                 ("v1/api/u", "STATIC"),
             ],
+            StaticOpts::default(),
         )
         .await;
         // / → index.html + text/html
@@ -1536,9 +1793,104 @@ pub(crate) mod tests {
         );
     }
 
+    // ----- 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入 -----
+
+    /// SPA 回落：深链接（无扩展名）→ index.html；带扩展名的资源与 API 前缀不回落。
+    #[tokio::test]
+    async fn spa_fallback_serves_index_for_deep_link_only() {
+        let (addr, _keep) = spawn_static(
+            &[],
+            &[("index.html", "<html><head></head><body>app</body></html>")],
+            StaticOpts {
+                spa_fallback: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        // 深链接 → index.html（curl 默认 Accept: */* 也算 html）
+        let r = raw_http(addr, &get(addr, "/space/issues/abc")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("body>app") && r.contains("text/html"),
+            "{r}"
+        );
+        // 带扩展名 = 资源请求，不回落（404 而非被吞成 200）
+        let r = raw_http(addr, &get(addr, "/assets/app.js")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        // API 前缀下的未命中路径不回落（否则拼错的 API 路径会静默变 200）
+        let r = raw_http(addr, &get(addr, "/v1/api/nope/deep")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    /// 回落关时（默认）深链接仍是 404 —— 静默把 404 变 200 会掩盖错配。
+    #[tokio::test]
+    async fn spa_fallback_off_keeps_404() {
+        let (addr, _keep) =
+            spawn_static(&[], &[("index.html", "app")], StaticOpts::default()).await;
+        let r = raw_http(addr, &get(addr, "/space/issues/abc")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    /// meta 注入：按路径查 `__meta/<path>.json` 注入 title/og；值一律转义；
+    /// 该目录本身不对静态服务公开。
+    #[tokio::test]
+    async fn html_meta_injects_escaped_tags_and_hides_meta_dir() {
+        let (addr, _keep) = spawn_static(
+            &[],
+            &[
+                ("index.html", "<html><head></head><body>hi</body></html>"),
+                (
+                    "__meta/space.json",
+                    r#"{"title":"A & B","description":"d","og:title":"OG","twitter:card":"summary","canonical":"https://x/space"}"#,
+                ),
+                ("__meta/index.json", r#"{"title":"Home"}"#),
+                (
+                    "__meta/dirty.json",
+                    r#"{"title":"</title><script>alert(1)</script>"}"#,
+                ),
+            ],
+            StaticOpts {
+                spa_fallback: true,
+                html_meta: Some("__meta".into()),
+            },
+        )
+        .await;
+        // 深链接回落 + 注入
+        let r = raw_http(addr, &get(addr, "/space")).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(r.contains("<title>A &amp; B</title>"), "{r}");
+        assert!(
+            r.contains("<meta property=\"og:title\" content=\"OG\">"),
+            "{r}"
+        );
+        assert!(
+            r.contains("<meta name=\"twitter:card\" content=\"summary\">"),
+            "{r}"
+        );
+        assert!(
+            r.contains("<link rel=\"canonical\" href=\"https://x/space\">"),
+            "{r}"
+        );
+        // 首页（/ → index.html）同样注入（否则首页无 title，与需求矛盾）
+        let r = raw_http(addr, &get(addr, "/")).await;
+        assert!(r.contains("<title>Home</title>"), "{r}");
+        // 值里的标签被转义，不得注入可执行脚本
+        let r = raw_http(addr, &get(addr, "/dirty")).await;
+        assert!(r.contains("&lt;/title&gt;"), "{r}");
+        assert!(!r.contains("<script>alert(1)</script>"), "{r}");
+        // meta 目录是数据不是站点资产 → 不可被直接拉取
+        let r = raw_http(addr, &get(addr, "/__meta/space.json")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        // 未命中 meta → 原样返回
+        let r = raw_http(addr, &get(addr, "/none")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && !r.contains("<title>"),
+            "{r}"
+        );
+    }
+
     #[tokio::test]
     async fn static_guards_traversal_missing_and_verbs() {
-        let (addr, _keep) = spawn_static(&[], &[("index.html", "x")]).await;
+        let (addr, _keep) = spawn_static(&[], &[("index.html", "x")], StaticOpts::default()).await;
         for path in [
             "/../etc/passwd",
             "/a%2e%2e/b",
@@ -1570,7 +1922,7 @@ pub(crate) mod tests {
             "/a%00b",
             "/a//b",
         ] {
-            assert_eq!(resolve_static(root, p), None, "{p}");
+            assert_eq!(resolve_static(root, p, None), None, "{p}");
         }
     }
 
@@ -1667,6 +2019,7 @@ pub(crate) mod tests {
             actor,
             None,
             None,
+            StaticOpts::default(),
             Pipeline::default(),
         ));
         // 轮询等 bind 完成（spawn 与本测试同一 current_thread 运行时，await 期间被驱动）。
@@ -1702,6 +2055,7 @@ pub(crate) mod tests {
             make_actor(t.0.clone(), true),
             None,
             None,
+            StaticOpts::default(),
             Pipeline::default(),
         )
         .await;

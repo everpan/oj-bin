@@ -20,6 +20,8 @@
 | `api_prefix` | `"/v1/api"` | API 前缀；CLI `-b` 覆盖；空前缀拒绝（避免全 404 静默坑）。旧键 `base` 兼容（serde alias，并存报错） |
 | `app_prefix` | `"/"` | 静态站点前缀；`/` = 全路径兜底；非 `/` 时仅前缀下的 GET/HEAD 落静态（前缀剥除后解析），前缀外 404；API 永远优先。不以 `/` 开头 → fail-fast |
 | `app_path` | `None` | 静态站点根（相对 config 目录；CLI `--app-path` 相对 CWD）；`None` = 不开静态服务 |
+| `app_spa_fallback` | `false` | SPA 深链接回落（v0.1.20）：静态未命中 + 无扩展名 + Accept html + 不在 `api_prefix` 下 → 送 `index.html`。默认关（静默把 404 变 200 会掩盖错配） |
+| `html_meta` | `None` | 路由感知 meta 目录名（v0.1.20，相对 `app_path`）：送 HTML 前查 `<app_path>/<html_meta>/<path>.json`，注入 `<title>`/`<meta>`/`<link rel=canonical>`。该目录不对静态服务公开 |
 | `timeout` | `"30s"` | 单请求执行超时，超时 → 408 |
 | `pool_size` | `4` | JS 执行并发度（= actor 数） |
 | `max_upload_bytes` | `10 MiB` | 超出 → 信封 413；axum 层 2x 硬顶（裸 413） |
@@ -37,7 +39,8 @@
 |---|---|---|
 | `db` | `HashMap<name, DSN>` | 多库混用（`sqlite://` / `mysql://` / `postgres://`），经 `DbBackendRegistry` 按 scheme 认领 |
 | `redis` | `HashMap<name, URL>` | 仅 `redis.default` 参与装配（其余 warn 忽略）；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
-| `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（尾 `/*` 一层通配） |
+| `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false） |
+| `db_query` | `QueryLimits` | 构造器 LIMIT：`default_limit`（默认 100，顶层 select 未给 limit 时的隐式值）+ `max_limit`（默认 1000，显式 limit 的 clamp 上界，硬顶 100000）。**不能写进 `db:`**——`db` 是 name→DSN map，键即库名 |
 | `auth` | `AuthCfg` | `jwt_secret`（空 → fail fast）、`signing_method`(HS256/384/512)、access/refresh 时长、`anonymous_paths` |
 | `oidc` | `OidcSection` | `issuer` / `private_key_path`（相对 config 目录）/ `rp: {tenant → {issuer, client_id, client_secret, scope}}` / `clients: {id → {secret, redirect_uris, tenant}}` |
 | `blob` | `BlobSection` | 平铺字段 = 旧单后端（等价 `backends.default`）；`backends.<name>` = 命名多后端；**两者并存且平铺非默认 → 歧义 Err** |

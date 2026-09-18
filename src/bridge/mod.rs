@@ -80,6 +80,8 @@ pub use module_loader::{
 pub use mq::MqInstance;
 pub use named_registry::NamedRegistry;
 pub use plugin_loader::PluginInfo;
+/// 构造器 LIMIT 配置（`db_query:` 段；v0.1.20）——config 与装配层都要用。
+pub use query::QueryLimits;
 pub use registry::SchemaRegistry;
 // boot_runtime 供 oj 的 test 运行时复用（`oj test` 不走 RuntimePool，直接建 JsRuntime）。
 pub use runtime::{BOOT_TIMEOUT, boot_runtime};
@@ -143,6 +145,13 @@ pub struct StableState {
     pub ownership_deny: bool,
     /// 多租户 SQL 防护模式（tenant.sql_guard；Off=不设防）。
     pub sql_guard: SqlGuard,
+    /// `db.asTenant` 开关（tenant.allow_as_tenant，v0.1.20）：默认 false。
+    /// 匿名请求显式声明租户身份的逃生口 —— 面向公开面且 id 无从校验，故 fail-closed。
+    pub allow_as_tenant: bool,
+    /// 运行期默认库重定向（`oj test` 的 db.test；v0.1.20）。仅重定向字面 "default"。
+    pub db_override: Option<String>,
+    /// 构造器 LIMIT：隐式默认 + 显式硬顶（db_query 段，v0.1.20）。
+    pub query_limits: QueryLimits,
     /// 命名 MQ 客户端（Kafka(name)/RabbitMQ(name) 数据源；spec 2026-09-07 §4）。
     /// 段未配置 = 空 registry（op_mq_has 恒 false → JS 侧 undefined）。
     pub kafkas: Arc<NamedRegistry<mq::MqInstance>>,
@@ -179,6 +188,12 @@ pub struct Extras {
     pub ownership_deny: bool,
     /// 多租户 SQL 防护模式（缺省 Off = 不设防）。
     pub sql_guard: SqlGuard,
+    /// `db.asTenant` 开关（缺省 false = 关闭）。
+    pub allow_as_tenant: bool,
+    /// 默认库重定向（`oj test` 注入；None = 用 default）。
+    pub db_override: Option<String>,
+    /// 构造器 LIMIT（缺省 = 内置默认 100 / 硬顶 1000）。
+    pub query_limits: QueryLimits,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     pub boot: Option<String>,
     /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
@@ -255,6 +270,7 @@ deno_core::extension!(
         kv::op_kv_incr,
         db::op_db_has,
         db::op_db_as_system,
+        db::op_db_as_tenant,
         db::op_db_query,
         db::op_db_exec,
         db::op_db_tx_begin,
@@ -563,6 +579,9 @@ impl Bridge {
             modules: extras.modules,
             ownership_deny: extras.ownership_deny,
             sql_guard: extras.sql_guard,
+            allow_as_tenant: extras.allow_as_tenant,
+            db_override: extras.db_override,
+            query_limits: extras.query_limits,
             boot: extras.boot,
             jwt: extras.jwt,
             oidc: extras.oidc,
@@ -1656,6 +1675,9 @@ mod tests {
             modules: Arc::new(HashMap::new()),
             ownership_deny: false,
             sql_guard: SqlGuard::Off,
+            allow_as_tenant: false,
+            db_override: None,
+            query_limits: query::QueryLimits::default(),
             boot: None,
             jwt: None,
             oidc: None,

@@ -258,7 +258,8 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 ### 查询构造器（`db.table(...)`）
 
 `db.table(name)` 返回构造器：`select(cols)`、`where(cond)`（可链多次，多个 where 之间 AND）、
-`orderBy([{field,dir}])`、`limit(n)`（默认 100、硬上限 1000）、`offset(n)`、`all()`。
+`orderBy([{field,dir}])`、`limit(n)`（隐式值 `db_query.default_limit` 默认 100、clamp 上界
+`db_query.max_limit` 默认 1000，均可配）、`offset(n)`、`all()`。
 条件 `{field, op, value}`：`op` ∈ `eq/ne/gt/gte/lt/lte/in/like/isNull`（`in` 的 value 为数组，
 `isNull` 不需 value）。**白名单**：`table` 与 `field` 必须先在 `SchemaRegistry` 声明，否则报
 `unknown table/column`；排序列须 `is_sortable`。
@@ -540,10 +541,10 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符
   白名单 + 参数化值（sea-query）——见 §4 红线。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
-- **租户跳转腿豁免**：`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 尾 `/*`」
-  形式，但 tenant 匹配是**严格一层**通配（更深路径需显式列出，如 `/idp/.well-known/*`；
-  oj-auth 插件实现为多层前缀），命中路径免 "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；
-  已带的头仍照常注入。
+- **租户跳转腿豁免**：`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 通配」，
+  命中路径免 "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；已带的头仍照常注入。
+  通配四形态（v0.1.20，两处实现同一语义）：字面 / 尾 `/*` 严格一层 / 中段 `*` 恰好一段 /
+  `**` 跨任意段（`tenant.anonymous_paths: ["/public/**"]`）。
 
 ### 11.2 证书驱动的 GET 限制（运行时校验）
 

@@ -39,13 +39,26 @@ Router::new()
 7. **路由**：`normalize` → `RouteTable.lookup` → `Hit` 执行 / `Conflict` 500 /
    `MethodNotAllowed` 405 / `NotFound` 继续。
 8. **dev 目录镜像兜底**：`Routes::resolve`，且被 `.route` 替换掉的方法不复活（`is_replaced`）。
-9. **静态兜底**：GET/HEAD + `resolve_static`（逐段解码 + 越界段拒绝）→ 文件响应。
-10. 404 信封。
+9. **静态兜底**：GET/HEAD + `resolve_static`（逐段解码 + 越界段拒绝）→ 文件响应；
+   HTML 响应先过 per-route meta 注入（`server.html_meta`）。
+10. **SPA 深链接回落**（`server.app_spa_fallback`，默认关）：上一步未命中 + 无扩展名
+   + Accept 视为 html + **不在 `api_prefix` 下** → 送 `index.html`。不含 API 前缀是
+   硬要求——否则拼错的 API 路径会被 index.html 吞成 200，掩盖真实 404。
+11. 404 信封。
 
-`path_matches`（`lib.rs:94`）语义：精确匹配，或尾 `/*` **严格一层**前缀通配
-（`/oidc/*` 命中 `/oidc/callback`，不命中 `/oidc` 与 `/oidc/a/b`）。
+`path_matches`（`lib.rs`）语义（v0.1.20 起四形态，逐段比对）：
+
+| 模式     | 语义                   | 例                                                                      |
+| -------- | ---------------------- | ----------------------------------------------------------------------- |
+| 字面     | 逐段全等               | `/health`                                                               |
+| 尾 `/*`  | **严格一层**（不变）   | `/oidc/*` 命中 `/oidc/callback`，不命中 `/oidc` 与 `/oidc/a/b`           |
+| 中段 `*` | 恰好一段               | `/public/anchor/*/states` 命中 `/public/anchor/v1c/states`               |
+| `**`     | 零段或多段（跨层）     | `/public/**` 命中 `/public`、`/public/a`、`/public/a/b`                  |
+
 ⚠️ 该函数在 `server` 与 `oj-auth` 插件里各有一份（插件不能依赖 server crate），
-注释互指，改一处须同步另一处。
+注释互指，改一处须同步另一处（含两侧单测矩阵）。v0.1.20 已把 oj-auth 旧实现
+（尾 `*` 实际任意深度）收紧到同一语义：**深路径请改写 `**`**，装配期对含 `/*`
+的条目会打一次迁移 WARN。
 
 ## 3. 路由表（`routes.rs`）
 

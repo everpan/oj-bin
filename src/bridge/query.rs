@@ -368,8 +368,65 @@ fn default_db() -> String {
     "default".into()
 }
 
-const LIMIT_DEFAULT: u32 = 100;
-const LIMIT_MAX: u32 = 1000;
+/// 隐式 LIMIT（顶层 select 未给 limit 时补上）与显式 limit 的 clamp 硬顶（防 DoS）。
+pub const LIMIT_DEFAULT: u32 = 100;
+pub const LIMIT_MAX: u32 = 1000;
+/// `max_limit` 的绝对上界（配置可上调但不能无界；装配期校验）。
+pub const LIMIT_HARD_CAP: u32 = 100_000;
+
+/// 构造器 LIMIT 配置（`db_query:` 段；v0.1.20）。装配期校验
+/// `1 ≤ default_limit ≤ max_limit ≤ HARD_CAP`。字段名 = YAML 键名（无 rename/alias）；
+/// `deny_unknown_fields` 让拼错的键（如 `default`）在装配期报错而非静默取默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QueryLimits {
+    pub default_limit: u32,
+    pub max_limit: u32,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            default_limit: LIMIT_DEFAULT,
+            max_limit: LIMIT_MAX,
+        }
+    }
+}
+
+impl QueryLimits {
+    /// 装配期校验（fail-fast）：0 与倒置区间都非法——`0` 意味着不设限（DoS 面），
+    /// `default_limit > max_limit` 会让「隐式比显式还大」，两者都不给静默回落。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.default_limit == 0 {
+            return Err("db_query.default_limit must be >= 1 (0 = unlimited)".into());
+        }
+        if self.max_limit == 0 {
+            return Err("db_query.max_limit must be >= 1 (0 = unlimited)".into());
+        }
+        if self.max_limit > LIMIT_HARD_CAP {
+            return Err(format!(
+                "db_query.max_limit {} exceeds hard cap {LIMIT_HARD_CAP}",
+                self.max_limit
+            ));
+        }
+        if self.default_limit > self.max_limit {
+            return Err(format!(
+                "db_query.default_limit {} > max_limit {}",
+                self.default_limit, self.max_limit
+            ));
+        }
+        Ok(())
+    }
+
+    /// 归一化：显式 limit → clamp 到 max_limit；未给 → default_limit。返回实际生效值。
+    fn applied(&self, explicit: Option<u32>) -> u32 {
+        match explicit {
+            // Ord::min 全路径限定：sea-query 的 ExprTrait 也为 u32 提供了 min。
+            Some(l) => Ord::min(l, self.max_limit),
+            None => self.default_limit,
+        }
+    }
+}
 
 fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsErrorBox> {
     Ok(state.borrow().borrow::<Arc<StableState>>().registry.clone())
@@ -1357,13 +1414,10 @@ fn build_select_stmt(
         };
         q.order_by_expr(col_simple_expr(&o.field), dir);
     }
-    // 显式 limit 一律 clamp 后生效；隐式 LIMIT_DEFAULT 只给顶层——union 成员括号内
-    // 禁 LIMIT（SQLite 复合项语法），嵌套子查询也不该被隐式截断。
-    if let Some(l) = req
-        .limit
-        .map(|l| Ord::min(l, LIMIT_MAX))
-        .or((depth == 0).then_some(LIMIT_DEFAULT))
-    {
+    // v0.1.20：limit 已在 op 层归一化（显式 clamp 到 max、顶层未给则补 default），
+    // 构造器只按给定值渲染 —— 嵌套子查询/union 成员的 limit 仍为 None ⇒ 不隐式截断
+    // （union 成员括号内禁 LIMIT：SQLite 复合项语法）。
+    if let Some(l) = req.limit {
         q.limit(l as u64);
     }
     if let Some(off) = req.offset {
@@ -1476,6 +1530,9 @@ pub async fn op_db_query_build(
     guard_req(&state, &req)?;
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;
+    // LIMIT 归一化（v0.1.20，db_query: 段）：顶层 select 未给 limit → 补 default_limit；
+    // 显式 limit → clamp 到 max_limit。返回值用于截断可观测。
+    let applied = normalize_limit(&state, &mut req);
     let dialect = lookup(&state, &req.db)?.dialect();
     let (sql, params) = build_statement(&req, &reg, dialect)?;
     // 返回行的两种形态：select，或 insert + returning。
@@ -1489,7 +1546,7 @@ pub async fn op_db_query_build(
         super::db::Target::Pool(da) => Exec::Pool(da),
         super::db::Target::Tx(t) => Exec::Tx(t.session.lock().await),
     };
-    if rows && !last_id {
+    let out = if rows && !last_id {
         ex.query(&sql, &params).await.map(Value::Array).map_err(err)
     } else if last_id {
         ex.exec(&sql, &params).await.map_err(err)?;
@@ -1507,7 +1564,31 @@ pub async fn op_db_query_build(
         Ok(Value::Array(vec![Value::Object(obj)]))
     } else {
         ex.exec(&sql, &params).await.map(Value::from).map_err(err)
+    };
+    // 截断可观测（v0.1.20）：返回行数达到生效上限 ⇒ 可能是被 LIMIT 截断的（含「显式
+    // limit 被 clamp」这类旧版完全静默的情形）。写响应头而不动信封形状（契约不变）。
+    if let (Some(a), Ok(Value::Array(v))) = (applied, &out)
+        && v.len() >= a as usize
+    {
+        state
+            .borrow_mut()
+            .borrow_mut::<super::ReqState>()
+            .headers
+            .insert("X-OJ-Row-Limit".into(), a.to_string());
     }
+    out
+}
+
+/// 顶层 select 的 LIMIT 归一化（`db_query:` 段；v0.1.20）。
+/// 非 select（insert/update/delete 不接受 limit）返回 None。
+fn normalize_limit(state: &Rc<RefCell<OpState>>, req: &mut QueryReq) -> Option<u32> {
+    if req.verb != Verb::Select {
+        return None;
+    }
+    let limits = state.borrow().borrow::<Arc<StableState>>().query_limits;
+    let applied = limits.applied(req.limit);
+    req.limit = Some(applied);
+    Some(applied)
 }
 
 /// toSQL：与执行完全相同的两段（guard_req + build_statement），只构造不执行；
@@ -1522,6 +1603,8 @@ pub fn op_db_query_sql(
     guard_req(&state, &req)?;
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;
+    // 与执行路径同款归一化 —— toSQL 必须反映真实 SQL（含隐式 LIMIT）。
+    let _ = normalize_limit(&state, &mut req);
     let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
     Ok(serde_json::json!({ "sql": sql, "params": params }))
 }
@@ -1669,6 +1752,144 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "query failed: {v}");
         v["data"]["n"].as_u64().unwrap() as usize
+    }
+
+    // ----- LIMIT 配置（db_query 段，v0.1.20）-----
+
+    /// 10 行夹具 + `db_query: {default_limit: 3, max_limit: 5}`。
+    async fn limited_bridge() -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table t (id integer primary key, name text)", &[])
+            .await
+            .unwrap();
+        for i in 0..10 {
+            db.exec_with_params("insert into t (name) values (?)", &[json!(format!("n{i}"))])
+                .await
+                .unwrap();
+        }
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                query_limits: QueryLimits {
+                    default_limit: 3,
+                    max_limit: 5,
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 隐式 default_limit 生效 + 截断写 `X-OJ-Row-Limit` 响应头（不再静默少数据）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_limit_defaults_and_truncation_header() {
+        let b = limited_bridge().await;
+        // 未给 limit → default_limit=3；返回行数 == 上限 ⇒ 头文件（可能是被截断的）
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).all()
+                     .then(r => json.ok({ n: r.length })).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(3)), "{v}");
+        assert_eq!(
+            cap.headers.get("X-OJ-Row-Limit").map(|s| s.as_str()),
+            Some("3")
+        );
+        // 显式 limit 被 clamp 到 max_limit=5 也写头（旧版这类截断完全静默）
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).limit(1000).all()
+                     .then(r => json.ok({ n: r.length })).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], json!(5), "{v}");
+        assert_eq!(
+            cap.headers.get("X-OJ-Row-Limit").map(|s| s.as_str()),
+            Some("5")
+        );
+        // 行数 < 生效上限 ⇒ 不可能被截断，不写头（避免噪音）
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).where({field:"name",op:"eq",value:"n0"}).limit(5).all()
+                     .then(r => json.ok({ n: r.length })).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], json!(1), "{v}");
+        assert!(!cap.headers.contains_key("X-OJ-Row-Limit"), "{cap:?}");
+        // toSQL 与执行同款归一化（诊断口径一致）
+        // LIMIT/OFFSET 是绑定参数（sea-query 渲染为 `LIMIT ?`），故断言参数而非文本。
+        let cap = b
+            .run(r#"json.ok(db.table("t").select(["name"]).toSQL());"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["sql"].as_str().unwrap().contains("LIMIT"), "{v}");
+        assert!(
+            v["data"]["params"].as_array().unwrap().contains(&json!(3)),
+            "{v}"
+        );
+    }
+
+    /// 拼错的键必须报错（否则 `db_query: {default: 1000}` 会静默取默认值，用户以为生效了）。
+    #[test]
+    fn query_limits_reject_unknown_keys() {
+        let ok: QueryLimits =
+            serde_json::from_str(r#"{"default_limit": 5, "max_limit": 9}"#).unwrap();
+        assert_eq!((ok.default_limit, ok.max_limit), (5, 9));
+        // 缺字段 → 走 Default（`#[serde(default)]`），不是错误。
+        let partial: QueryLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(partial, QueryLimits::default());
+        // 未知键 → 错误。
+        assert!(serde_json::from_str::<QueryLimits>(r#"{"default": 5}"#).is_err());
+    }
+
+    /// 装配期校验：0 / 倒置 / 超硬顶 一律 fail-fast（不给静默回落）。
+    #[test]
+    fn query_limits_validate() {
+        assert!(QueryLimits::default().validate().is_ok());
+        assert!(
+            QueryLimits {
+                default_limit: 0,
+                max_limit: 100
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            QueryLimits {
+                default_limit: 10,
+                max_limit: 0
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            QueryLimits {
+                default_limit: 10,
+                max_limit: LIMIT_HARD_CAP + 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            QueryLimits {
+                default_limit: 10,
+                max_limit: 5
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     /// 两表夹具：a(2 行) × b(3 行，aid 指向 a.id)，验证 join 装配真实参与执行。
@@ -2866,6 +3087,177 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("t1")),
+            "{v}"
+        );
+    }
+
+    /// asTenant 夹具：与 guarded_bridge 同数据，但开启 `tenant.allow_as_tenant`。
+    async fn guarded_bridge_allow_as_tenant(allow: bool) -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params(
+            "create table t (id integer primary key, name text, tenant_id text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        for (n, tid) in [("a1", "t1"), ("b1", "t2")] {
+            db.exec_with_params(
+                "insert into t (name, tenant_id) values (?, ?)",
+                &[json!(n), json!(tid)],
+            )
+            .await
+            .unwrap();
+        }
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name", "tenant_id"]);
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                sql_guard: SqlGuard::Deny,
+                allow_as_tenant: allow,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn req_anonymous() -> RequestInfo {
+        RequestInfo {
+            anonymous: true,
+            ..Default::default()
+        }
+    }
+
+    /// asTenant：匿名请求声明租户后，构造器照常注入该租户条件（仍强制，不是绕过）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_tenant_scopes_query_on_anonymous_request() {
+        let b = guarded_bridge_allow_as_tenant(true).await;
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const d = db.asTenant("t2");
+                     const rows = await d.table("t").select(["name"]).all();
+                     const s = d.table("t").select(["name"]).toSQL();
+                     json.ok({ names: rows.map(r => r.name), sql: s.sql, params: s.params });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                req_anonymous(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["names"], json!(["b1"]), "{v}");
+        assert!(
+            v["data"]["sql"].as_str().unwrap().contains("tenant_id"),
+            "{v}"
+        );
+        assert!(
+            v["data"]["params"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("t2")),
+            "{v}"
+        );
+    }
+
+    /// asTenant 三道门禁：非匿名请求、已带租户头的请求、开关未开 —— 一律拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_tenant_gates() {
+        // 同步抛出（未进 Promise 链）⇒ 一律用 async IIFE 兜住，否则断言看到的是 CoreError。
+        let js = r#"(async () => {
+                     await db.asTenant("t2").table("t").select(["name"]).all();
+                     json.ok({});
+                   })().catch(e => json.fail(400, String(e)));"#;
+        // ① 非匿名（无租户头但也没命中豁免，如 WS/任务/测试默认路径）
+        let b = guarded_bridge_allow_as_tenant(true).await;
+        let v: Value =
+            serde_json::from_slice(&b.run_with(js, RequestInfo::default()).await.unwrap().body)
+                .unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("only allowed on anonymous"),
+            "{v}"
+        );
+        // ② 已带租户头（防运行期切换身份）
+        let v: Value =
+            serde_json::from_slice(&b.run_with(js, req_t1()).await.unwrap().body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("only allowed on anonymous"),
+            "{v}"
+        );
+        // ③ 开关未开（默认 fail-closed）
+        let b = guarded_bridge_allow_as_tenant(false).await;
+        let v: Value =
+            serde_json::from_slice(&b.run_with(js, req_anonymous()).await.unwrap().body).unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(v["msg"].as_str().unwrap().contains("is disabled"), "{v}");
+        // ④ 空 id
+        let v: Value = serde_json::from_slice(
+            &b.run_with(
+                r#"(async () => {
+                     await db.asTenant("").table("t").select(["name"]).all();
+                     json.ok({});
+                   })().catch(e => json.fail(400, String(e)));"#,
+                req_anonymous(),
+            )
+            .await
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert!(
+            v["msg"].as_str().unwrap().contains("must not be empty"),
+            "{v}"
+        );
+    }
+
+    /// asTenant 是请求级：下一次 run（ReqState::reset）后失效，匿名请求重回 deny。
+    #[tokio::test(flavor = "current_thread")]
+    async fn as_tenant_is_request_scoped() {
+        let b = guarded_bridge_allow_as_tenant(true).await;
+        let v: Value = serde_json::from_slice(
+            &b.run_with(
+                r#"(async () => {
+                     await db.asTenant("t2").table("t").select(["name"]).all();
+                     json.ok({});
+                   })().catch(e => json.fail(400, String(e)));"#,
+                req_anonymous(),
+            )
+            .await
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // reset 后不再有租户身份 → 受约束表被拒
+        let v: Value = serde_json::from_slice(
+            &b.run_with(
+                r#"(async () => {
+                     await db.table("t").select(["name"]).all();
+                     json.ok({});
+                   })().catch(e => json.fail(400, String(e)));"#,
+                req_anonymous(),
+            )
+            .await
+            .unwrap()
+            .body,
+        )
+        .unwrap();
+        assert_eq!(v["code"], 400, "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("require tenant context"),
             "{v}"
         );
     }

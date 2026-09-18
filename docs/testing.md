@@ -20,7 +20,7 @@
 ```
 sample/
 ├── config.yaml            # 应用配置（auth/tenant/db…）
-├── package.json           # 统一入口：npm run test = test:unit + test:api
+├── package.json           # 统一入口：npm run test = typecheck + test:unit + test:api
 ├── src/                   # 被测源码（api.ts handler）
 ├── tests/                 # ★ L1 测试文件：*.test.ts（oj test，真实运行时）
 └── unit/                  # ★ L2 vitest 工程（独立 npm 包，纯 mock）
@@ -58,6 +58,8 @@ L1 测试目录由 `oj test -t/--tests <dir>` 指定，相对**配置文件所�
 | `-b/--base` | API 基础前缀覆盖（默认用 config 的 `server.api_prefix`，如 `/v1/api`） |
 | `-d/--dir` | 源码目录 `src` 或产物 `dist`（默认自动判定） |
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
+| `--db` | 覆盖默认库（v0.1.20）：schema 建表 / seed / fixtures 与 handler 的 `db` 全部落在该库。省略时自动落 config `db` 段中的 `test` 库（若声明），否则维持 `default` |
+| `--anonymous` | 以匿名请求身份运行（v0.1.20）：`RequestInfo.anonymous = true`，便于测试 `tenant.anonymous_paths` 覆盖的公开面 |
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |
 | `--output` | 报告落盘文件；省略则打到 stdout（机器格式 stdout 纯净，路由横幅已改打 stderr） |
 
@@ -90,12 +92,20 @@ describe("user account", () => {
   如 `{ "X-TENANT-ID": "default" }`），返回 `access_token`。
 - `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` / `expect(actual).toBe|toEqual|toBeTruthy|toBeFalsy|toContain`。
 
-**两个必知约束（由 config 决定）**
+**三个必知约束（由 config 决定）**
 
 1. **多租户**：config 启用 `tenant` 后，每个请求（含 login/refresh/logout）都必须带
    `X-TENANT-ID` 头，否则 400——`client.login` 的第三个参数就是干这个的。
 2. **鉴权**：config 启用 `auth` 后，除匿名路径（`/health` 与 `anonymous_paths` 配的
    `/auth/*`）外都要带 `Authorization: Bearer <token>`，否则 401。`client.login` 仅用于拿 token。
+3. **落库隔离（v0.1.20）**：`oj test` 默认把 schema/seed/fixtures 与 handler 的 `db`
+   重定向到 config `db` 段的 **`test` 库**（不存在则回落 `default`），避免测试污染开发库；
+   显式 `--db <name>` 可指定别的库（须在 `db` 段声明，否则启动报错）。启动时会打印
+   `oj test: using db "..."`。
+
+> **测公开面**（`tenant.anonymous_paths` 命中的路由，如 OIDC 回调）：加 `--anonymous`
+> 让请求以匿名身份进入（不带租户头也不报 400），配合 `db.asTenant(id)` 可验证「匿名请求
+> 声明租户身份」这条链路；须同时开 `tenant.allow_as_tenant: true`。
 
 > `beforeEach` 注册的是单一全局钩子，跨多个 `describe` 会被覆盖；多 describe 文件建议在各 `it`
 > 内联准备（如每个用例自己 `client.login`），避免互相干扰。
@@ -120,11 +130,35 @@ npm ci          # 或 npm i；lockfile 已提交，CI 用 npm ci 保证可复现
 npx vitest run  # 等价于 npm test
 ```
 
+### 类型检查（L1 + L2 共用一个 tsconfig）
+
+vitest 只转译不检查类型，编辑器里的红线需要单独跑 `tsc`。`sample/tsconfig.json`
+的 `include` 覆盖 `src/` + `tests/` + `unit/`（L2 spec 与 mock），故一条命令覆盖两层：
+
+```bash
+cd sample && npm run typecheck            # 推荐（委托到 unit，用其安装的 tsc）
+# 等价：cd sample/unit && npm run typecheck（= tsc -p ../tsconfig.json）
+```
+
+- 类型权威是 `global.d.ts`（运行时注入的全局对象）+ `types/oj-modules.d.ts`
+  （`#` 别名 ambient 兜底）；两者都在 `include` 内。
+- 只查类型不产出文件（`noEmit: true`）；`unit/vitest.config.ts` 被排除
+  （它用 `node:fs`/`vite`，需要本工程未安装的 `@types/node`）。
+- `typescript` 是 `sample/unit` 的 devDependency（钉 `5.6.3`），随 `npm ci` 安装；
+  必须先 `npm run unit:install`（或 `cd sample/unit && npm ci`）才可运行。
+- **这是 CI 门禁**：`plugin-matrix.yml` 的 `sample-tests` 与 `release.yml` 的 `lint`
+  job 都会跑（后者让 tag 推送发版前必过）。
+- 没有门禁时这类漂移会静默积累（v0.1.20 修过一次：`all()` 返回 `Json[]`、`sess` 未声明、
+  `next()` 判别联合共 30 处）。
+
 ### 结构
 
 - `mocks/oj-globals.ts`：`installGlobals(opts?)` 把运行时注入的 `db/json/http/bus/log` 替换为
   可控桩，返回本次响应捕获 `{ code, msg, data }`；`lastPublished()` 取 `bus.publish` 记录，
   `lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/**构造器**）与绑定参数记录（可断言 handler 走了哪个分支）。
+  桩面与 bootstrap 同形：含 `db.asSystem` / `db.asTenant`（**返回同一实例**，便于
+  `db.asTenant(id).table(...)` 这类链式写法）——但 L2 **不**模拟租户注入与 asTenant 的三道门禁
+  （属 Rust 侧，归 L1 用 `oj test --anonymous` 验）。
 - `mocks/query-builder.ts`：`db.table(...)` 的构造器桩，**镜像** `src/bridge/bootstrap.js` 的
   `builderFromReq` API 面（select/where/orderBy/limit/offset/insert/update/delete/returning/
   all/run/toSQL，含 `update|delete` 无 where 即抛的守卫）。SQL 按**规范形**渲染（小写关键字、
@@ -188,12 +222,20 @@ describe("user/account (L2 分支 + SQL)", () => {
 | 稳定性 | 受后端/配置影响 | 稳定、无副作用 |
 | 入口 | `oj test`（Rust CLI） | `npx vitest run`（Node） |
 
-**推荐组合**：开发期用 L2 快速验证逻辑；CI 用 L1 守护端到端契约。两者都绿，才有信心发布。
+**推荐组合**：开发期用 L2 快速验证逻辑；CI 用 L1 守护端到端契约。两层都绿 + 类型检查过，才有信心发布。
 
 ### CI 示例（GitHub Actions 片段）
 
 ```yaml
 steps:
+  # L2 依赖（vitest + typescript）先装，把类型检查顶到昂贵的 Rust 构建之前。
+  - name: sample/unit install
+    working-directory: sample/unit
+    run: npm ci
+  # 类型门禁（src/ + tests/ + unit/ 共用一个 tsconfig）
+  - name: typecheck
+    working-directory: sample/unit
+    run: npm run typecheck
   # oj 必须经 workspace 构建：`-p oj` 与 `--workspace` 的 feature 归一化不同，
   # 会让 rusty_v8 按不同 fingerprint 重编并找不到静态库。用 xtask 同时拿到 oj + 全部插件。
   - name: build oj + plugins
@@ -202,7 +244,7 @@ steps:
     run: ./bin/oj test -c sample/config.yaml -d sample/src --format junit --output l1.xml
   - name: L2 vitest
     working-directory: sample/unit
-    run: npm ci && npx vitest run
+    run: npx vitest run
   - name: Upload L1 report
     if: always()
     uses: actions/upload-artifact@v4
@@ -211,17 +253,19 @@ steps:
       path: l1.xml
 ```
 
-> 现成 job 见 `.github/workflows/plugin-matrix.yml` 的 `sample-tests`（2026-09-06 补）。
+> 现成 job：`.github/workflows/plugin-matrix.yml` 的 `sample-tests`（2026-09-06 补 L1+L2，
+> 2026-09-19 补类型检查）；发版门禁另见 `release.yml` 的 `lint`（tag 推送时同样跑 typecheck）。
 
 ---
 
 ## 依赖管理
 
-- L2 的 `vitest` 声明在 **`sample/unit/package.json` 的 `devDependencies`**，与 `sample/package.json`
-  的运行时依赖（`escape-goat`）**隔离**——被测物不携带测试工具。
+- L2 的 `vitest` 与 `typescript`（typecheck 用）声明在 **`sample/unit/package.json` 的
+  `devDependencies`**，与 `sample/package.json` 的运行时依赖（`escape-goat`）**隔离**
+  ——被测物不携带测试工具。
 - `sample/unit/package-lock.json` 已提交，`npm ci` 可复现。
 - `sample/unit/.gitignore` 忽略 `node_modules/`，勿提交本地安装目录。
-- 统一入口在 `sample/package.json`：`npm run test`（= `test:unit` + `test:api`）、
-  `npm run test:unit`、`npm run test:api`、`npm run unit:install`。
+- 统一入口在 `sample/package.json`：`npm run test`（= `typecheck` + `test:unit` + `test:api`）、
+  `npm run typecheck`、`npm run test:unit`、`npm run test:api`、`npm run unit:install`。
 - 若想单一 `npm install`，可把 `sample/package.json` 升级为 npm workspaces
   （`"workspaces": ["unit"]`），但「被测物 / 测试工具」分离的当前方案更干净，推荐保持。

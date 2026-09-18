@@ -23,6 +23,7 @@ import {
   op_db_exec,
   op_db_has,
   op_db_as_system,
+  op_db_as_tenant,
   op_db_query,
   op_db_query_build,
   op_db_query_sql,
@@ -388,6 +389,11 @@ globalThis.DB = function (name) {
       // system escape hatch (tenant sql_guard): this request bypasses tenant
       // injection/checks. Explicit + audited; business handlers must not use it.
       asSystem: () => { op_db_as_system(); return dbCache.get(name); },
+      // anonymous-request tenant declaration (v0.1.20): the handler states which
+      // tenant this request queries. Only valid on anonymous requests (tenant
+      // anonymous_paths hit, no tenant header) and only when tenant.allow_as_tenant
+      // is on. Unlike asSystem, tenant conditions are STILL enforced.
+      asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
       // rebuild a builder from a toJSON() snapshot (continues the chain on this db).
       fromJSON: (snap) => builderFromReq(snap),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
@@ -403,6 +409,7 @@ globalThis.DB = function (name) {
             table: (t) => queryBuilder(name, String(t)),
             fromJSON: (snap) => builderFromReq(snap),
             asSystem: () => { op_db_as_system(); return dbCache.get(name); },
+            asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
           });
           await op_db_tx_commit(name);
           return out;

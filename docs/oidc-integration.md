@@ -76,7 +76,7 @@ auth:
     - "/idp/.well-known/*"
 tenant:
   enable: true
-  anonymous_paths:          # 与 auth 的同名机制同形，但匹配是严格一层通配
+  anonymous_paths:          # 与 auth 的同名机制同形：字面 / `/*` 一层 / `*` 单段 / `**` 跨段
     - "/oidc/*"
     - "/idp/*"
     - "/idp/.well-known/*"

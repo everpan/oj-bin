@@ -20,6 +20,10 @@ use crate::app::ClientTransport;
 
 /// 进程内派发响应（op 返回给 JS `client.{method}` 的结果）。
 /// 同名多值头以 ", " 拼接（修正 #8）。
+/// `oj test --anonymous` 标志（v0.1.20）：置于 OpState，供 op_client_dispatch 把测试
+/// 请求标记为匿名（公开面 handler 的 db.asTenant 需要）。
+pub struct TestAnonymous(pub bool);
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClientResp {
     pub status: u16,
@@ -63,10 +67,19 @@ pub async fn op_client_dispatch(
         g.borrow::<Arc<dyn ClientTransport>>().clone()
     };
     // 2) 重置每请求状态（ReqState 在 OpState），防跨请求串号。
+    //    `--anonymous`（v0.1.20）：测试态显式授信匿名请求，让公开面 handler（走
+    //    db.asTenant）在 `oj test` 下可测——生产只有 anonymous_paths 豁免才置位。
     {
+        let anonymous = state
+            .borrow()
+            .try_borrow::<TestAnonymous>()
+            .is_some_and(|a| a.0);
         let mut g = state.borrow_mut();
         let rs = g.borrow_mut::<only_js::bridge::ReqState>();
-        rs.reset(only_js::bridge::RequestInfo::default());
+        rs.reset(only_js::bridge::RequestInfo {
+            anonymous,
+            ..Default::default()
+        });
     }
     // 3) base 拼接（与 app() 路由单一事实来源一致，修正 #7）。
     let uri = format!("{}{}", t.base(), path);

@@ -158,6 +158,18 @@ jobs:
         with:
           node-version: 20
 
+      # L2 依赖（vitest + typescript）先装：把类型检查放在昂贵的 Rust 构建**之前**，
+      # 类型错误 30 秒内失败，不用等一轮 release 构建。
+      - name: sample/unit install (vitest + typescript)
+        working-directory: sample/unit
+        run: npm ci
+
+      # 类型门禁（src/ + tests/ + unit/ 共用一个 tsconfig）：vitest 只转译不查类型，
+      # 不跑这条的话 global.d.ts 与运行时的漂移会静默积累（v0.1.20 实测曾积到 30 处）。
+      - name: typecheck — tsc (src + tests + unit)
+        working-directory: sample/unit
+        run: npm run typecheck
+
       # 必须经 workspace 构建：`cargo build -p oj` 与 `--workspace` 的 feature 归一化不同，
       # 会让 rusty_v8 按不同 fingerprint 重编并找不到静态库（见 tools/xtask/src/main.rs:95）。
       # 用 `cargo xtask build` 同时拿到 oj 与全部第一方插件（sample 鉴权依赖 oj-auth，缺它
@@ -172,7 +184,7 @@ jobs:
 
       - name: L2 — vitest (pure mock unit)
         working-directory: sample/unit
-        run: npm ci && npx vitest run
+        run: npx vitest run
 
       - if: always()
         uses: actions/upload-artifact@v4

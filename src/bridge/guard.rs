@@ -462,17 +462,28 @@ pub fn bound_db(state: &Rc<RefCell<OpState>>, name: &str) -> String {
         return name.to_string();
     }
     let g = state.borrow();
-    let rs = g.borrow::<ReqState>();
-    let Some(m) = rs.module.clone() else {
-        return name.to_string();
+    // 解析顺序（v0.1.20）：显式 DB("name") > manifest `db:` 绑定 > db_override > "default"。
+    // override 不改模块显式绑定的意图，只兜底「未声明」的字面 default。
+    let module_bound = {
+        let rs = g.borrow::<ReqState>();
+        match rs.module.clone() {
+            Some(m) => g
+                .borrow::<Arc<StableState>>()
+                .modules
+                .values()
+                .find(|c| c.name == m)
+                .and_then(|c| c.db.clone()),
+            None => None,
+        }
     };
-    let bound = g
-        .borrow::<Arc<StableState>>()
-        .modules
-        .values()
-        .find(|c| c.name == m)
-        .and_then(|c| c.db.clone());
-    bound.unwrap_or_else(|| name.to_string())
+    match module_bound {
+        Some(b) => b,
+        None => g
+            .borrow::<Arc<StableState>>()
+            .db_override
+            .clone()
+            .unwrap_or_else(|| name.to_string()),
+    }
 }
 
 #[cfg(test)]

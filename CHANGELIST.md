@@ -2,6 +2,154 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.20（2026-09-19）
+
+本版来自下游（plane）上游需求清单（U1–U37）的逐条回源码复核，交付四项：**匿名访问双层**
+（路径通配统一 + `db.asTenant`）、**静态托管两条**（SPA 回落 + 每路由 meta 注入）、
+**`oj test` 测试库隔离**、**构造器 LIMIT 可配与截断可观测**。设计文档（含 20 条专家评审处置）
+见 `docs/superpowers/specs/2026-09-18-v0.1.20-upstream-support-design.md`。
+
+**特性**
+
+- **匿名访问：路径通配四形态统一 + `db.asTenant`（下游 U2，P0 阻塞点）**。下游痛点是双层阻塞：
+  豁免路径匹配能力不足（深层 OIDC 路径进不来），且即便豁免进得来，handler 查租户表仍被
+  `sql_guard` 拦（`tenant_id=None`）。
+  - **通配四形态**（`server::path_matches` 与 `plugins/oj-auth` 的 `is_anonymous` **同语义**，
+    两处实现互指注释 + 各自矩阵测试）：字面全等 / 尾 `/*` **严格一层** / 中段 `*` **恰好一段** /
+    `**` **跨任意层**（含零层，`/idp/**` 命中 `/idp`）。段切分后回溯匹配，`%2e%2e`/`..` 段
+    照旧在解析前被拒。
+  - **`RequestInfo.anonymous`（新字段）**：**仅** server 的「命中 `tenant.anonymous_paths`
+    且确实没带租户头」分支置 true。`tenant_id.is_none()` 有五个来源（租户未启用 / 豁免命中 /
+    WS 帧 / 任务桥 / `oj test`），不能当匿名判据——用它会把 WS 与任务路径一并放行。
+  - **`db.asTenant(id)`（新 op + JS 面，`db` / `DB(name)` / `tx` 内实例同面）**：匿名请求
+    **声明**租户身份。与 `db.asSystem()` 相反——**防护机制不变**（构造器仍强制注入 `tenant_id`、
+    裸 SQL 仍要求 mentions+param_has），只是身份由 handler 给出。三道 **fail-closed** 门禁：
+    ① `tenant.allow_as_tenant: true`（新键，**默认 false**）；② 请求为匿名；③ `id` 非空。
+    不满足即**抛错**（`nofast` op，拒绝原因必须回到 JS）。**请求级且只能设一次**（已带租户头 /
+    二次调用 → 抛错，防运行期切换身份），调用打审计日志。
+  - 定位是**授信 handler**：平台无从校验 id 是否为真实租户，红线是 id 必须服务端派生
+    （token → 查表 → 租户），绝不可直接取 URL 参数（见 `scenarios.md` 场景 1 / §8 风险）。
+- **静态托管：SPA 深链回落 + 每路由 HTML meta（下游 U1）**。原静态兜底「未命中即 404」，
+  SPA 深链接刷新不可用；也没有任何 per-route 模板能力。
+  - `server.app_spa_fallback`（**默认 false**）：未命中 + 无扩展名 + `Accept` 含 `text/html`
+    或缺失或 `*/*`（curl 默认）+ **不在 `api_prefix` 下** → 回落 `index.html`。排除 API 前缀是
+    硬约束：`app_prefix="/"` 时否则会把拼错的 API 路径吞成 200，掩盖真实 404。
+  - `server.html_meta`（目录名，**默认关闭**）：送出 HTML 时按请求路径读
+    `<app_path>/<html_meta>/<path>.json`（`/` 与目录 → `index.json`），把白名单键注入
+    `</head>` 前：`title` / `description` / `canonical` / `og:*`（`property`）/ `twitter:*`
+    （`name`）。**只注入标签、绝不注入脚本**（静态响应拿不到 CSP nonce），值一律 HTML 转义；
+    未命中 / 无 `</head>` / JSON 非法 → 原样返回（零副作用）。meta 目录自身**不对外公开**
+    （`resolve_static` 对该目录返回 None）。不做 SSR——产物由构建期离线生成。
+- **`oj test` 测试库隔离（下游 U33）**：原 `oj test` 复用的 `db.default` 就是开发库，下游实测
+  读到 1000 行非种子数据、甚至写坏开发库。
+  - `App::from_config` 收 `db_override` 并在**装配期**算出 `db_key`，`migrate.apply_all/verify_all`、
+    `build_schema_and_modules`（schema 内省）、`seed.replay_all`、`load_fixtures` **四处全部跟随**
+    ——只改运行期 `bound_db` 会让 test 库无表无种子，比现状更糟。
+  - `oj test` 默认策略：config 声明了 `db.test` ⇒ 用它；否则醒目 WARN 后继续 `default`（不静默）。
+    新增 `--db <name>`（未在 `db:` 段声明即 fail-fast）与 `--anonymous`（以匿名请求身份跑，
+    便于测 `anonymous_paths` 覆盖的公开面）。启动打印 `oj test: using db "..."`。
+  - 运行期 `bound_db` 解析顺序：**显式 `DB("name")` → manifest `db:` 绑定 → `db_override` →
+    `"default"`**（`StableState.db_override` 经 `Extras` 注入）。
+- **构造器 LIMIT 可配 + 截断可观测（下游 U30）**：顶层 select 原隐式 `LIMIT 100`、显式 limit
+  被 clamp 到 1000，**截断完全无信号**（下游「>100 条静默少数据」）。
+  - 新配置段 `db_query: { default_limit, max_limit }`（默认 100 / 1000，硬顶 100000）。
+    装配期校验 `1 ≤ default_limit ≤ max_limit ≤ 100000`，`0` 与倒置区间 fail-fast；
+    结构体 `deny_unknown_fields`——键名拼错（如 `default`）**启动即报错**，不静默取默认值。
+    **注意不能写进 `db:` 段**（`db` 是 name→DSN 的 map，键即库名）。
+  - 归一化在 **op 层**（`normalize_limit`，不穿透 `build_statement` 递归签名）：顶层
+    `limit=None` → `default_limit`；显式 → `min(limit, max_limit)`。保留「嵌套/子查询
+    不隐式截断」语义。`toSQL()` 走同款归一化（诊断与执行口径一致）。
+  - 截断信号：`applied = min(显式或默认, max_limit)`，结果行数 ≥ `applied` ⇒ 响应带
+    `X-OJ-Row-Limit: <applied>` 头（含「显式 limit 被 clamp」这类旧版静默情形）。
+    **信封形状不变**（`{code,msg,data}` 契约不动，下游 12 个生成 client 零改动）。
+- `--db` / `--anonymous` 同时补入 `oj test --help` 与 `docs/testing.md` 旗标表。
+
+**修复**
+
+- **oj-auth 与 server 的匿名通配语义分叉**：`plugins/oj-auth` 的 `is_anonymous` 原为
+  `starts_with` 前缀匹配（尾 `*` = 任意深度），与其自身注释及 `docs/builtin-api-auth.md` 的
+  「一层通配」矛盾，也让「同一份 `anonymous_paths` 在租户与鉴权两道守卫下表现不同」。
+  统一为四形态（与会话无关的纯段匹配），两处实现注释互指，各补通配矩阵测试。
+- **`sample/package.json` 的 `test:api` 路径写错**（既有缺陷，本次接线 `npm test` 时暴露）：
+  npm 以**包目录**为 CWD 执行脚本，脚本里的 `./bin/oj` 与 `-c config.yaml -d src` 却按
+  「CWD = 仓库根」写 → `npm run test:api` 在最后一步必失败
+  （`sh: ./bin/oj: No such file or directory`）。改为 `cd .. && … ./bin/oj test -c
+  sample/config.yaml -d sample/src`（与 CI 命令同形）。此前未暴露是因为 CI 直接在仓库根
+  调 `./bin/oj`，本地统一入口少被走。
+- **`oj test` 运行时装配缺口**：`StableState` 新增字段在 `with_dbs_and_loader` / 测试夹具 /
+  `oj/src/app.rs`（`oj test` 直建 runtime）三处同步，避免 server 与 `oj test` 行为分叉；
+  `oj test` 的 `op_client_dispatch` 显式构造 `RequestInfo { anonymous, ..Default::default() }`。
+- **类型面（`.d.ts`）与运行时/样例对不齐**：用 `tsc -p sample/tsconfig.json` 实测，样例在
+  「本手册宣称 `global.d.ts` 是类型权威」的前提下有 **30 处报错**（此前无类型门禁，属静默腐烂）。
+  - `QueryBuilder.all()` 声明为 `Promise<Json[]>`，而运行时返回的是**行**（列名 → 值）——
+    于是 `rows[0].password_hash`、`{...row}` 全部报错（20 处，散在 auth/idp/oidc/cert/order）。
+    改为 `Promise<Row[]>`（与 `db.query` 同形）；`db.tx` 的回调参数改为 `TxInstance`
+    （`Omit<DBInstance, "tx">`——嵌套事务被运行时拒绝，原声明却让 `tx.tx(...)` 通过类型检查）。
+  - **`sess` 未声明**（`Cannot find name 'sess'`，2 处）：WS 帧池的会话上下文
+    （`sess.id` / `sess.state`，由 `ws_connect` driver 注入）此前只在 API 手册里，类型面缺失。
+    新增 `WsSess` 接口 + `declare global { const sess }`，并写明 `state` **必须可 JSON 序列化**
+    （不可序列化时该帧状态回传被丢弃，连接不中断——对应 `frame_pool.rs` 的 `Option<Value>` 语义）。
+  - `client.ws().next()` 的三态（帧 / `{closed: true}` / `null` 超时）原声明为
+    `TestWsFrame | { closed: true } | null`，调用方取 `binary`/`data` 必然报 2339（10 处）。
+    改为带可选判别位的 `TestWsFrame | TestWsClosed | null`（`closed?: false`），
+    样例测试加 `expectFrame()` 收窄（顺带把「拿到非帧」从 TypeError 变成显式断言失败）。
+  - 样例随类型收紧补 3 处 `String(...)`（`Row` 的列值是 `Json`，直接传 `string` 参数不合法）。
+  - `sample/tsconfig.json` 的 `include` 补 `unit/**/*.ts`（L2 spec / mock 此前不在任何 tsconfig
+    内，编辑器取不到 `json`/`db` 等全局类型），`exclude` 补 `unit/vitest.config.ts`
+    （其 `node:fs`/`vite` 依赖需要 `@types/node`，本工程未安装）。
+  - L2 mock（`sample/unit/mocks/oj-globals.ts`）补 `asSystem` / `asTenant`（与 bootstrap 同形，
+    返回同一实例），否则写了 `db.asTenant(id).table(...)` 的 handler 在 L2 里 TypeError。
+  - `docs/devkit/api-manual.md`：`.all()` 的返回标注由 `Promise<Json[]>` 改为 `Promise<Row[]>`
+    （总表本已列出 `sess.id / sess.state`，类型面此前缺失）。
+  - 验证：`tsc -p sample/tsconfig.json` **0 error**；`vitest run` 12/12 通过；
+    `./bin/oj test -c sample/config.yaml -d sample/src` 43/43 通过。
+  - **类型门禁进 CI**：`sample/unit` 加 `typescript` devDependency（钉 `5.6.3`，随
+    `npm ci` 安装）与 `npm run typecheck`（= `tsc -p ../tsconfig.json`）；
+    `sample/package.json` 加同名脚本（委托 unit）并纳入聚合入口
+    （`npm test` = `typecheck` + `test:unit` + `test:api`）。CI 两处挂载：
+    `plugin-matrix.yml` 的 `sample-tests`（安装/类型检查顶到昂贵的 Rust 构建之前，
+    fail fast）与 `release.yml` 的 `lint`（tag 推送发版前必过，job 更名
+    `fmt + clippy + typecheck`）。负向实测：注入一处类型错误 → 退出码 2、报错定位到文件；
+    移除后退出码 0。
+
+**行为变更（三项，升级前请核对）**
+
+1. **`oj test` 默认库 `default` → `test`**：config 声明了 `db.test` 的项目，测试数据将从
+   `default` 改落 `test`（建表/seed/fixtures 一并跟随）。理由：写坏开发库是真实事故。
+   不需要此行为时显式 `--db default` 即可。
+2. **匿名路径尾 `*` 由「任意深度」收紧为「严格一层」**：受影响的是依赖旧 oj-auth 深前缀行为
+   的 `auth.anonymous_paths` / `tenant.anonymous_paths` 条目（如 `/idp/*` 曾命中
+   `/idp/.well-known/openid-configuration`）。启动期对含尾 `/*` 的列表打**聚合 WARN** 提示
+   改 `**`（不静默收回授权面）。仅需一层的老配置无需改动。
+3. **SPA 回落默认关闭**：`server.app_spa_fallback` 默认 `false`，需显式开启（不复用旧行为，
+   避免 `app_prefix="/"` 的存量部署突然开始吞 404）。
+
+**兼容性**
+
+- `ABI_VERSION` 保持 **8**（无 repr(C) vtable 形状变更；`db.asTenant` 走既有 db 轴 op）。
+- 新增/改动配置键一律 `#[serde(default)]`：`tenant.allow_as_tenant`、`server.app_spa_fallback`、
+  `server.html_meta`、`db_query.{default_limit,max_limit}` —— 老配置零改动（除上述三项行为变更）。
+- 首方插件版本保持随发布统一（`0.1.0`，semver 门禁为可选 pin，无清单 pin 该值）；
+  `oj-auth` 行为变更已写入 `CHANGELIST` + `docs/builtin-api-auth.md`。
+- `cargo build --release` / `cargo fmt --check` / `cargo clippy --release --all-targets -- -D warnings`
+  / `cargo test --release --workspace` 全绿。
+
+**文档**
+
+- `docs/devkit/scenarios.md`（**新增**，随发行包 `devkit/` 分发）：场景速查——公开分享页匿名读
+  租户数据 / SPA 深链回落与每页 meta / 测试库隔离 / LIMIT 分页陷阱 / 匿名路径通配，
+  每篇「配置 + 代码 + 验证 + 常见坑」。
+- `docs/devkit/api-manual.md`：API 表补 `db.asTenant` 与三道门禁；LIMIT 段改 `db_query` 可配 +
+  `X-OJ-Row-Limit`；tenant 配置示例补 `allow_as_tenant` 与通配四形态；首页加场景集指针。
+  `docs/devkit/{README,SKILL}.md` 同步索引与陷阱速查；`tools/xtask` 的 devkit 发行契约测试
+  增 `scenarios.md` 断言。
+- 过期描述订正：`docs/modules/02-config.md`（新键）、`docs/modules/03-server-http.md`（静态
+  9/10/11 步 + 通配表格）、`docs/db-guide.md`、`docs/dev-guide.md`、`docs/user-manual.md`、
+  `docs/tenant-guide.md`（asTenant 场景 + 通配 + 豁免说明）、`docs/testing.md`（`--db` /
+  `--anonymous` / 默认 test 库）、`docs/modules/00-overview.md`、`docs/builtin-api-auth.md`、
+  `docs/oidc-integration.md`、`docs/oidc-implementation.md`、`sample/config.yaml`（新键注释）、
+  `sample/global.d.ts`（`DBInstance.asTenant`）。
+
 ## v0.1.19（2026-09-15）
 
 **特性**

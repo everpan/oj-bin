@@ -47,7 +47,7 @@
 | 动作 | 内容 | 状态 |
 |---|---|---|
 | ① 改名 | `sample/test/` → **`sample/unit/`** | ✅ 已改（`git mv`，历史保留） |
-| ② 统一入口 | `sample/package.json` 加 `test` / `test:unit` / `test:api` / `unit:install` | ✅ 已加 |
+| ② 统一入口 | `sample/package.json` 加 `test` / `typecheck` / `test:unit` / `test:api` / `unit:install` | ✅ 已加（`typecheck` 于 2026-09-19 补） |
 | ③ 目录内分层 | `sample/unit/mocks/`（桩）+ `*.spec.ts`（用例）；L1 保持 `*.test.ts` | ✅ 已改 |
 | ④ 文档同步 | `docs/testing.md` + 本文件 | ✅ 已同步 |
 
@@ -113,12 +113,15 @@ vitest `include: ["tests/**/*.spec.ts"]` —— 见下「方案 B」。
 ## 5. 运行方式（抄这份）
 
 ```bash
-# L0
-cargo test                       # 根 crate
-cargo test --workspace           # 全部（含插件、oj e2e）
+# L0（本项目禁止 debug 构建：一律 --release，见 CLAUDE.md）
+cargo test --release                       # 根 crate
+cargo test --release --workspace           # 全部（含插件、oj e2e）
 
-# L1 + L2（统一入口，推荐）
-cd sample && npm run test          # = test:unit + test:api
+# L1 + L2 + 类型（统一入口，推荐）
+cd sample && npm run test          # = typecheck + test:unit + test:api
+
+# 类型检查（L1/L2 共用一个 tsconfig；CI 门禁）
+cd sample && npm run typecheck     # = npm --prefix unit run typecheck（tsc -p ../tsconfig.json）
 
 # L1
 cd sample && npm run test:api      # xtask build + ./bin/oj test
@@ -159,6 +162,14 @@ cargo clippy --workspace --all-targets -- -D warnings
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
+      # L2 依赖先装：把类型检查放在昂贵的 Rust 构建之前（fail fast）。
+      - name: sample/unit install (vitest + typescript)
+        working-directory: sample/unit
+        run: npm ci
+      # 类型门禁（v0.1.20 补）：src/ + tests/ + unit/ 共用一个 tsconfig。
+      - name: typecheck — tsc
+        working-directory: sample/unit
+        run: npm run typecheck
       # 必须经 workspace 构建：`cargo build -p oj` 与 `--workspace` 的 feature 归一化
       # 不同，会让 rusty_v8 按不同 fingerprint 重编并找不到静态库。xtask build 同时
       # 产出 oj 与全部第一方插件（sample 鉴权依赖 oj-auth）。
@@ -169,11 +180,18 @@ cargo clippy --workspace --all-targets -- -D warnings
         run: ./bin/oj test -c sample/config.yaml -d sample/src --format junit --output l1.xml
       - name: L2 — vitest (pure mock unit)
         working-directory: sample/unit
-        run: npm ci && npx vitest run
+        run: npx vitest run
       - if: always()
         uses: actions/upload-artifact@v4
         with: { name: l1-junit, path: l1.xml, if-no-files-found: warn }
 ```
+
+**类型门禁（v0.1.20 补，2026-09-19）**：vitest 只转译不检查类型，`global.d.ts` 与运行时的
+漂移此前无人守护——实测已积到 **30 处**（`all()` 返回 `Json[]`、`sess` 未声明、`next()` 判别
+联合等）。现由 `sample/unit` 的 `typescript` devDependency 提供 `npm run typecheck`
+（= `tsc -p ../tsconfig.json`），并挂在**两个** workflow 上：`plugin-matrix.yml` 的
+`sample-tests`（手动 dispatch 时的完整 sample 门禁）与 `release.yml` 的 `lint`
+（tag 推送发版前必过）。
 
 > 注：`oj test` 走 `App::from_config`，会经过**证书必配门禁**与迁移门禁。CI 上用的是
 > 随仓库提交的示例自签证书（exp ≈ 2027-08），**到期后本 job 会红**——届时用

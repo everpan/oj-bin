@@ -120,8 +120,66 @@ const rows = await db.asSystem().table("order").select(["id"]).all();
 - 每次调用都打审计日志到服务端控制台——生产上盯这个日志。
 - **别在普通业务 handler 里用**。review 时看到 asSystem 应该问一句「为什么」。
 
-`oj test`（进程内测试运行器）没有租户头，deny 模式下要跑涉及租户表的用例，
-也是在测试代码里 `db.asSystem()` 开一道。
+`oj test`（进程内测试运行器）默认不带租户头；deny 模式下要跑涉及租户表的用例，
+可以 `db.asSystem()` 开一道，或用下面的 `db.asTenant()`（v0.1.20）声明一个租户身份——
+后者仍保留租户防护，更接近生产行为。
+另：`oj test` 默认把 schema/seed/fixtures 和 handler 的 `db` 落在 config `db.test` 库上
+（避免污染开发库），启动会打印 `oj test: using db "test"`。
+
+## 反向逃生口：db.asTenant()（v0.1.20）
+
+`asSystem` 是「把防护整个关掉」；`asTenant` 恰好相反——**给一个匿名请求补上租户身份**。
+
+什么时候需要？典型是**公开分享页 / OIDC 回调**这类请求：浏览器带不了自定义头，路由被
+配进 `tenant.anonymous_paths` 豁免（所以不会被 400 拦），但 handler 仍要按某个租户读数据。
+以前只能 `db.asSystem()` 全放行，现在可以：
+
+```yaml
+tenant:
+  enable: true
+  sql_guard: "deny"
+  allow_as_tenant: true        # ① 总开关，默认 false，不显式打开下面的都白搭
+  anonymous_paths:
+    - "/share/*"               # ② 该路由必须命中豁免（请求进得来才算匿名）
+```
+
+```ts
+// /share/detail handler：URL 上带着租户，用它声明身份
+export const get = async () => {
+  const d = db.asTenant(http.param("tenant"));   // ③ 声明身份
+  return json.ok(await d.table("order").select(["id"]).all());
+  //    ^ 这里仍会自动补 tenant_id 条件——只是值来自上面声明的租户
+};
+```
+
+三道门禁**全过**才生效，缺一不可：
+
+1. `tenant.allow_as_tenant: true`（配置默认关）；
+2. 该请求确实是**匿名**的——命中了 `anonymous_paths` 且没带租户头（`oj test` 里对应
+   `--anonymous`）；
+3. `id` 非空。
+
+不满足任意一条 → **直接抛错**（不是静默忽略），所以调试时看到异常先核对这三条。
+另外它是**请求级、只能设一次**：已经带租户头的请求、或同一请求里第二次调用，都会抛错
+（防止 handler 中途切换身份）。
+
+一句话选型：**要跨租户看全部用 `asSystem`，要给匿名请求认一个租户用 `asTenant`。**
+
+## 豁免路径怎么写（anonymous_paths）
+
+`tenant.anonymous_paths`（以及 `auth.anonymous_paths`）写的是**去掉 API 前缀**后的路径，
+支持四种通配形态：
+
+| 写法 | 含义 | 命中例子 |
+|---|---|---|
+| `/health` | 字面全等 | 只有 `/health` |
+| `/public/*` | 严格**一层** | `/public/a` 命中；`/public/a/b` **不**命中 |
+| `/idp/**` | **跨任意层** | `/idp`、`/idp/a`、`/idp/a/b/c` 全命中 |
+| `/report/*/export` | 中段 `*` 恰好一段 | `/report/7/export` 命中；`/report/a/b/export` 不命中 |
+
+> **v0.1.20 变更**：以前尾 `/*` 被当成「任意层前缀」（`/idp/*` 连
+> `/idp/.well-known/openid-configuration` 也命中）。现在收紧为严格一层，需要跨层请改用
+> `**`。启动时若发现你配的尾 `/*` 条目，会打一条迁移 WARN 提示，照上面的表改即可。
 
 ## 常见报错对照表
 
@@ -134,6 +192,7 @@ const rows = await db.asSystem().table("order").select(["id"]).all();
 | `schema: [m] 表 "t" 缺 tenant_id 列` | guard 开着但表声明没这列 | 补列；共享表则 `tenant: false` + `shared_allow` 双声明 |
 | `warn: ... 共享表声明 "x" 未列入 tenant.shared_allow` | 声明了共享但白名单没点名 | config 补 `tenant.shared_allow: [x]`；不补则该表按受约束处理 |
 | `warn: tenant.sql_guard ... 但 tenant.enable=false` | 开了防护但没开租户识别 | `tenant.enable: true`，或者关掉 sql_guard |
+| `db.asTenant: ...`（调用即抛） | 三道门禁没过：开关没开 / 请求不是匿名 / id 为空 | 依次核对 `tenant.allow_as_tenant: true`、路径在 `anonymous_paths` 且未带租户头、id 非空；同一请求只调一次 |
 
 ## 选型建议
 

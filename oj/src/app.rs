@@ -204,6 +204,31 @@ fn sql_guard_of(cfg: &Config) -> SqlGuard {
     g
 }
 
+/// v0.1.20 通配语义收紧的迁移提示：尾 `/*` 现在是**严格一层**（旧版 oj-auth 侧是
+/// `starts_with` 任意深度）。含尾 `/*` 的列表启动期聚合 WARN 一次（逐条打会刷屏），
+/// 提示深路径改 `**`——收紧会静默收回既有免鉴权/免租户面，不能只靠 CHANGELIST 一行。
+fn warn_legacy_tail_wildcards(cfg: &Config) {
+    let warn = |what: &str, list: &[String]| {
+        let legacy: Vec<&str> = list
+            .iter()
+            .filter(|p| p.ends_with("/*"))
+            .map(String::as_str)
+            .collect();
+        if legacy.is_empty() {
+            return;
+        }
+        eprintln!(
+            "warn: {what} 有 {} 条尾 \"/*\" 条目 {legacy:?}：自 v0.1.20 起为严格一层通配；\
+             需要匹配多层路径请改写为 \"…/**\"",
+            legacy.len()
+        );
+    };
+    warn("tenant.anonymous_paths", &cfg.tenant.anonymous_paths);
+    if let Some(a) = &cfg.auth {
+        warn("auth.anonymous_paths", &a.anonymous_paths);
+    }
+}
+
 /// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
 /// manifest(db/deps) → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx
 /// map（键 = 模块目录绝对路径，run_module 祖先命中注入）。`gate == "auto"` 时逐模块
@@ -212,6 +237,7 @@ async fn build_schema_and_modules(
     dir: &Path,
     ts: bool,
     dbs: &std::collections::HashMap<String, Arc<dyn DataAccessor>>,
+    db_key: &str,
     gate: &str,
     guard: SqlGuard,
     shared_allow: &[String],
@@ -251,8 +277,8 @@ async fn build_schema_and_modules(
             }
             if gate == "auto" {
                 let acc = dbs
-                    .get("default")
-                    .ok_or("schema.yaml requires db 'default'")?;
+                    .get(db_key)
+                    .ok_or_else(|| format!("schema.yaml requires db '{db_key}'"))?;
                 for l in crate::schema::reconcile(acc.as_ref(), &name, &f).await? {
                     eprintln!("schema: {l}");
                 }
@@ -417,6 +443,9 @@ impl App {
         base: String,
         ts: bool,
         fixtures: bool,
+        // db_override：默认库重定向（`oj test` 传 Some("test")）——字面 "default" 的库
+        // 调用改指向该库；迁移 / seed / fixtures / schema 内省一并跟随（测试库须先有表）。
+        db_override: Option<String>,
     ) -> Result<App, String> {
         // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
         for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
@@ -469,6 +498,26 @@ impl App {
         let blob: Option<Arc<dyn BlobBackend>> = blobs.as_ref().and_then(|r| r.default());
         // 逐 db 开库（未知 scheme 注册表 fail-fast）。
         let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
+        // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
+        // 静默回落 default 等于把测试写在开发库上（正是本项要修的事故面）。
+        if let Some(o) = &db_override
+            && !dbs.contains_key(o.as_str())
+        {
+            let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            return Err(format!(
+                "--db {o:?} not declared in config (db keys: {names:?})"
+            ));
+        }
+        let db_key: &str = db_override.as_deref().unwrap_or("default");
+        if let Some(o) = &db_override {
+            eprintln!("oj: default db redirected to {o:?} (migrate/seed/fixtures follow)");
+        }
+        // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
+        let query_limits = cfg.db_query;
+        query_limits.validate()?;
+        // 通配语义 v0.1.20 收紧的迁移提示（尾 `/*` 现为严格一层）。
+        warn_legacy_tail_wildcards(&cfg);
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
         let gate =
@@ -477,8 +526,8 @@ impl App {
                 .as_deref()
                 .unwrap_or(if ts { "auto" } else { "verify" });
         match gate {
-            "auto" => crate::migrate::apply_all(dbs.get("default"), &dir, ts, false).await?,
-            "verify" => crate::migrate::verify_all(dbs.get("default"), &dir, ts).await?,
+            "auto" => crate::migrate::apply_all(dbs.get(db_key), &dir, ts, false).await?,
+            "verify" => crate::migrate::verify_all(dbs.get(db_key), &dir, ts).await?,
             "off" => {}
             other => {
                 return Err(format!(
@@ -490,15 +539,22 @@ impl App {
         let ownership_deny = ownership_deny_of(&cfg)?;
         let sql_guard = sql_guard_of(&cfg);
         // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
-        let (registry, modules) =
-            build_schema_and_modules(&dir, ts, &dbs, gate, sql_guard, &cfg.tenant.shared_allow)
-                .await?;
+        let (registry, modules) = build_schema_and_modules(
+            &dir,
+            ts,
+            &dbs,
+            db_key,
+            gate,
+            sql_guard,
+            &cfg.tenant.shared_allow,
+        )
+        .await?;
         // 种子重放（P0）：各模块 seed.sql（§8-1）。
-        crate::seed::replay_all(dbs.get("default"), &dir).await?;
+        crate::seed::replay_all(dbs.get(db_key), &dir).await?;
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
             let modules = crate::manifest::discover(&dir, ts)?;
-            crate::migrate_cmd::load_fixtures(dbs.get("default"), &modules).await?;
+            crate::migrate_cmd::load_fixtures(dbs.get(db_key), &modules).await?;
         }
         // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
         // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
@@ -547,6 +603,7 @@ impl App {
             let jwt = jwt.clone();
             let oidc = oidc.clone();
             let mail = mail.clone();
+            let db_override = db_override.clone();
             move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -562,6 +619,9 @@ impl App {
                         modules: modules.clone(),
                         ownership_deny,
                         sql_guard,
+                        allow_as_tenant: cfg.tenant.allow_as_tenant,
+                        db_override: db_override.clone(),
+                        query_limits,
                         boot: boot.clone(),
                         // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
                         jwt: jwt.clone(),
@@ -724,6 +784,11 @@ impl App {
             timeout,
             static_root,
             app_prefix,
+            // 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入。
+            server::StaticOpts {
+                spa_fallback: cfg.server.app_spa_fallback,
+                html_meta: cfg.server.html_meta.clone(),
+            },
             pipeline,
             cert_status,
             cert_valid_until,
@@ -745,6 +810,9 @@ impl App {
             modules,
             ownership_deny,
             sql_guard,
+            allow_as_tenant: cfg.tenant.allow_as_tenant,
+            db_override: db_override.clone(),
+            query_limits,
             boot: boot.clone(),
             jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
             oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。

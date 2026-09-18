@@ -31,6 +31,12 @@ pub struct RequestInfo {
     pub body_binary: bool,
     /// 租户 id（tenant.enable 时由 handle() 从 header 提取注入；否则 None）。
     pub tenant_id: Option<String>,
+    /// 匿名请求标志（v0.1.20）：**仅** `tenant.anonymous_paths` 命中、且确实没带租户头
+    /// 的 HTTP 请求为 true（server handle 的 `None if exempt` 分支置位）。
+    /// `tenant_id=None` 的其他来源（租户未启用 / WS 帧 / 任务桥 / 测试默认 RequestInfo）
+    /// **一律 false** —— 它是 `db.asTenant` 的唯一授信判据，不能用 `tenant_id.is_none()`
+    /// 代替（那会把 WS/任务/测试路径一并放行）。
+    pub anonymous: bool,
     /// 已验签用户（auth 启用且非匿名路径：{id, roles, claims}；否则 None）。
     pub user: Option<Value>,
     /// 上传文件（multipart 解析结果；非 multipart 为空）。
