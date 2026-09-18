@@ -59,3 +59,10 @@ pub fn temp_dir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("建临时目录");
     dir
 }
+
+/// 路径进 JSON/YAML 双引号标量前先转正斜杠：Windows 反斜杠是转义序列
+/// （`C:\Users` 的 `\U` → invalid escape），会让 `MailConfig::parse` 直接失败。
+/// Windows 文件 API 均接受正斜杠。
+pub fn fwd(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}

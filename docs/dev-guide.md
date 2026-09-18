@@ -34,6 +34,51 @@
 靠**约定**等价于 `--profile release`——所有脚本/CI/工具一律 `--release`；debug 的
 `rusty_v8` 静态库不可用。日常只用 `cargo build --release`（或 `cargo xtask build`）。
 
+#### Windows：先配 MSVC 构建环境
+
+Windows 上有一处**必踩**的构建前置，且此前只写在 CI 里（本地无从知晓，构建会直接失败）：
+
+`oj-bus-kafka` 依赖 `rdkafka` → `rdkafka-sys`，后者在 Windows 上经 CMake 从源码编
+`librdkafka`（feature `cmake-build` 仅 Windows 启用）。裸机上必然失败于：
+
+```
+CMake Error: Could not create named generator Visual Studio 18 2026
+```
+
+原因是 `rdkafka-sys` 探测到 VS 后**硬编码** `-G "Visual Studio <版本>"`，而本机 CMake
+若不认识该生成器名就直接 abort。此外还有两处（CRT 混链、Git 的 `link.exe` 遮蔽）需要处理。
+
+**用脚本配好环境再构建**（本地等价物，与 CI `.github/workflows/plugin-matrix.yml` 中
+那三步同源）：
+
+```bash
+# Git Bash / MSYS2（必须 source，变量才留在当前 shell）
+source scripts/windows-msvc-env.sh
+cargo xtask build
+cargo test --workspace --release
+```
+
+```bat
+rem cmd.exe / PowerShell：脚本把命令包在配好的环境里跑
+scripts\windows-msvc-env.bat cargo xtask build
+scripts\windows-msvc-env.bat cargo test --workspace --release
+rem 无参数则进入一个已配好的 shell
+```
+
+脚本做三件事（均**不覆盖**你已显式设置的值）：
+
+| 设置 | 作用 |
+|---|---|
+| `CMAKE_GENERATOR=NMake Makefiles` | 用与 VS 版本解耦的生成器，绕开上面那个 CMake 报错 |
+| `_CL_=-MT` | librdkafka 强制静态 CRT，对齐 `.cargo/config.toml` 的 `+crt-static`（否则 LNK4098 / `__imp__*` 悬空） |
+| 移开 Git 的 `usr/bin/link.exe` | 它会遮蔽 MSVC 链接器 → `missing operand after ...`。**改名**为 `.disabled` 而非删除（那是你的 Git 安装，且在仓库外）；恢复：`ren link.exe.disabled link.exe` |
+
+脚本会自动定位 `vcvars64.bat`（先 `vswhere`，再遍历常见安装路径），所以**普通
+PowerShell/cmd 里也能用**，不必先开 VS 开发者命令行。它只解决不了「没装 C++ 工作负载」
+——那需要装「使用 C++ 的桌面开发」。
+
+> 修改 CI 里那三步时请同步本脚本，反之亦然（两边是同一条知识的两份落地）。
+
 ### 常用命令
 
 ```bash

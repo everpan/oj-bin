@@ -320,7 +320,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, mail => oj_plugin_ffi::axis::mail(&MAIL_VT
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{drive, host, temp_dir};
+    use crate::testutil::{drive, fwd, host, temp_dir};
 
     /// descriptor 身份必须是**插件名**（`mail`）而非 crate 名（`oj-mail`）：
     /// `PluginLoader::load_one` 以清单键做严格相等校验，落盘文件名亦取该名。
@@ -398,7 +398,7 @@ mod tests {
         let dir = temp_dir("eml");
         let cfg = MailConfig::parse(&format!(
             r#"{{"default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login","file_transport":"{}"}}}}"#,
-            dir.display()
+            fwd(&dir)
         ))
         .expect("cfg");
         let profiles = build_profiles(&cfg).expect("build");
