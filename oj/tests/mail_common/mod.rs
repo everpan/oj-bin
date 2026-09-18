@@ -59,6 +59,19 @@ impl Drop for Tmp {
     }
 }
 
+/// YAML 双引号标量里的**纯路径**字段（`file_transport`）：Windows 反斜杠在 YAML 里
+/// 是转义序列（`C:\Users` 的 `\U` → unknown escape），故转正斜杠；Windows 文件 API
+/// 接受正斜杠，该字段随后被当路径直接使用（不再经 DSN 解析），故裸 replace 即可。
+///
+/// **不要**用它处理 `sqlite://` DSN：`tmp_project()` 的 `canonicalize()` 在 Windows
+/// 上产出 verbatim 前缀 `\\?\D:\...`，裸 replace 会把 `\\?\` 变成 `//?/`，从而命中
+/// `normalize_sqlite_dsn` 的「`//` 直通」分支（db_backend.rs），跳过盘符修正 →
+/// SQLITE_CANTOPEN。DSN 一律走 `oj_plugin_ffi::path_util::sqlite_file_dsn`（它先经
+/// `dunce` 剥 verbatim 再转正斜杠 + 用单冒号）。
+fn fwd(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 pub fn tmp_project() -> Tmp {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -88,7 +101,7 @@ pub fn write_project(t: &Tmp) -> PathBuf {
             "  port: 0\n",
             "  api_prefix: \"/v1/api\"\n",
             "db:\n",
-            "  default: \"sqlite://{db}\"\n",
+            "  default: \"{db}\"\n",
             "smtp:\n",
             "  workers: 1\n",
             "  queue_capacity: 4\n",
@@ -106,8 +119,8 @@ pub fn write_project(t: &Tmp) -> PathBuf {
             "plugins:\n",
             "  mail: {{}}\n",
         ),
-        db = root.join("db.sqlite").display(),
-        eml = eml_dir().display(),
+        db = oj_plugin_ffi::path_util::sqlite_file_dsn(&root.join("db.sqlite")),
+        eml = fwd(eml_dir()),
     );
     std::fs::write(root.join("config.yaml"), cfg).unwrap();
     std::fs::write(root.join("attachment.txt"), ATT_PAYLOAD).unwrap();

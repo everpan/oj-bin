@@ -21,6 +21,19 @@ fn lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// YAML 双引号标量里的**纯路径**字段：Windows 反斜杠在 YAML 里是转义序列
+/// （`C:\Users` 的 `\U` → unknown escape），故转正斜杠；Windows 文件 API 接受正斜杠。
+///
+/// **不要**用它处理 `sqlite://` DSN：`canonicalize()` 在 Windows 上产出 verbatim 前缀
+/// `\\?\D:\...`，裸 replace 会把 `\\?\` 变成 `//?/`，从而命中 `normalize_sqlite_dsn`
+/// 的「`//` 直通」分支（src/bridge/db_backend.rs），跳过盘符修正 → SQLITE_CANTOPEN。
+/// DSN 一律走 `oj_plugin_ffi::path_util::sqlite_file_dsn`（先 `dunce` 剥 verbatim，
+/// 再转正斜杠，并用单冒号 `sqlite:`）。
+#[cfg(unix)]
+fn fwd(p: &Path) -> String {
+    p.display().to_string().replace('\\', "/")
+}
+
 fn sample() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../sample")
@@ -42,7 +55,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     cfg.server.port = 0;
     cfg.db.insert(
         "default".into(),
-        format!("sqlite://{}/db.sqlite", tmp.display()),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
     );
     // e2e 是 v0.1 UC 验收（不带租户头/不登录）；sample 的 tenant/auth 留给手工冒烟，
     // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
@@ -578,14 +591,13 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
     let root = sample();
     // 极简 config：console_log 开（任务/停机日志镜像到子进程 stderr 可断言）；
     // 证书复用 sample 的示例证书（绝对路径）；db 隔离到临时目录；tasks 默认目录。
-    // Windows 路径反斜杠在 YAML 双引号标量里是转义序列（\U → unknown escape），
-    // sqlite URL 同理不可用——统一转正斜杠（Windows 文件 API 均接受）。
-    let fwd = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+    // 纯路径字段走 `fwd`（YAML 双引号标量里反斜杠是转义）；db DSN 走
+    // `sqlite_file_dsn`（裸 replace 会把 verbatim `\\?\` 变成 `//?/`，见其文档）。
     let cfg = format!(
-        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  console_log: true\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\ndb:\n  default: \"sqlite://{}/db.sqlite\"\ntasks:\n  dir: \"tasks\"\n",
+        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  console_log: true\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\ndb:\n  default: \"{}\"\ntasks:\n  dir: \"tasks\"\n",
         fwd(&root.join("config/public.pem")),
         fwd(&root.join("config/cert.jws")),
-        fwd(&tmp),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
     );
     std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
 
@@ -780,7 +792,7 @@ async fn e2e_query_builder_join_and_insert() {
     let mut cfg = base_cfg(&t);
     cfg.db.insert(
         "default".into(),
-        format!("sqlite://{}/db.sqlite", t.display()),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("db.sqlite")),
     );
     let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await

@@ -66,6 +66,10 @@ jobs:
       # VS2022 又找不到实例。故改用 NMake Makefiles 生成器（与 VS 版本解耦），并由
       # msvc-dev-cmd 注入 MSVC 工具链（cl/nmake 入 PATH），避免生成器名与 cmake
       # 版本错配 → "Could not create named generator" / "could not find instance"。
+      #
+      # 本地 Windows 构建的等价物见 scripts/windows-msvc-env.{bat,sh}——下面这三步
+      # 此前只存在于 CI，本地无从知晓，导致 `cargo build` 必失败于
+      # "Could not create named generator Visual Studio 18 2026"。改动其一请同步另一处。
       - name: Set up MSVC toolchain (cl/nmake) for rdkafka-sys cmake build
         if: matrix.os == 'windows-latest'
         uses: ilammy/msvc-dev-cmd@v1

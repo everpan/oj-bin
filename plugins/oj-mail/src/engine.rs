@@ -775,7 +775,7 @@ fn next_job_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{drive, temp_dir};
+    use crate::testutil::{drive, fwd, temp_dir};
     use oj_plugin_ffi::{RBytes, RString};
     use serde_json::Value;
     use tokio::sync::Semaphore;
@@ -811,7 +811,7 @@ mod tests {
             r#"{{"max_attachment_bytes":8,"max_total_attachment_bytes":12,
                  "default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,
                              "mechanism":"login","file_transport":"{}"}}}}"#,
-            dir.display()
+            fwd(&dir)
         ))
         .expect("cfg");
         let eng = MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎");
@@ -930,7 +930,7 @@ mod tests {
     fn file_engine(dir: &std::path::Path) -> MailEngine {
         let cfg = MailConfig::parse(&format!(
             r#"{{"workers":1,"queue_capacity":4,"default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login","file_transport":"{}"}}}}"#,
-            dir.display()
+            fwd(dir)
         ))
         .expect("cfg");
         MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎")
@@ -1016,7 +1016,7 @@ mod tests {
         let dir = temp_dir("engine-queue");
         let cfg = MailConfig::parse(&format!(
             r#"{{"workers":2,"queue_capacity":8,"default":{{"host":"localhost","port":25,"tls":"none","allow_none_tls":true,"mechanism":"login","file_transport":"{}"}}}}"#,
-            dir.display()
+            fwd(&dir)
         ))
         .expect("cfg");
         let eng = MailEngine::new(&cfg, DeliverSink::new(|_, _| {})).expect("引擎");
