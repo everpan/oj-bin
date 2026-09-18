@@ -10,9 +10,9 @@
 | `server` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log` | `server_cmd.rs:21` |
 | `build [module]` | `-d/--dir`（默认 `src`）、`-o/--out`（默认 `dist`）、`--no-minify`、`--check` | `build_cmd.rs:16` |
 | `test` | `-c`、`-b`、`-d`、`-t/--tests`（默认 `tests`，相对 config_dir）、`--format`（human/tap/junit/json）、`--output` | `test_cmd.rs:46` |
-| `migrate` | `-c`、`-d`、`--baseline`、`--module` | `migrate_cmd.rs:46` |
-| `fixture` | `-c`、`-d`、`--module` | `migrate_cmd.rs:77` |
-| `schema diff` | `-c`、`-d` | `migrate_cmd.rs:86` |
+| `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
+| `fixture` | `-c`、`-d`、`--db`、`--module` | `migrate_cmd.rs:115` |
+| `schema diff` | `-c`、`-d`、`--db` | `migrate_cmd.rs:130` |
 
 已删除的旗标有回归测试钉死（`args.rs:371`）：`build -b`、`server --dev`、`server -d/--dir`、
 `--grace-days` 等一律 clap 报错；空参打印帮助。
@@ -125,6 +125,13 @@
 后者证书门禁无逃生口且携带 seed/路由。瘦身路径只解析 config → 插件 → 开库 → 执行，
 使 CI/运维机无证书也能迁移。
 
+目标库由 `--db <name>` 选定（`slim()` 第三参之后的 `db`，缺省 `"default"`）：
+命中 config `db:` 段的键即取该连接，**未声明即 fail-fast 并列出可用键**——静默回落
+default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`）和
+`App::from_config` 的 `db_override` 同一条纪律。注意迁移工具**不读**模块级
+`manifest.yaml` 的 `db:` 绑定（那是运行期路由，见 `src/bridge/guard.rs::bound_db`），
+多库部署须逐 profile 各跑一遍。`oj server` 无此旗标，恒用 `default`。
+
 ## 7. Rust 集成测试（`oj/tests/`）
 
 - `e2e.rs`：UC1–UC15（方法表、CRUD+params+body、嵌套路由、release 模式、kv 读穿、
@@ -141,3 +148,9 @@
 - `server_cmd::serve` / `serve_with_listener` 与 `App::serve` 两套入口并存。
 - `oj test` 的 `describe/it/expect` 是自研迷你框架，匹配器只有
   `toBe/toEqual/toBeTruthy/toBeFalsy/toContain` 五个（见 [08-testing.md](08-testing.md)）。
+- **瘦身装配的 `--db` 是整轮目标库，不解析模块级 `manifest.db`**（v0.1.21）：
+  `slim()` 只拿到 `manifest::discover` 的 `(name, path)`，模块绑定字段在迁移链上不可见，
+  故多库项目须 `--db <profile> --module <M>` 逐组合跑（否则全部模块的迁移灌进同一库）。
+  修法需让 `slim` 携带绑定或逐模块解析；待真实多库诉求（详见
+  `docs/migration.md` §8）。同表另注：`--db` 与 `oj test --db` 同名不同义
+  （后者是字面 `default` 调用重定向）。

@@ -1,6 +1,6 @@
 ---
 name: oj-api-dev
-description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、Kafka/RabbitMQ 消费任务、tasks 长任务、oj test。
+description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、多库（`--db`）迁移与对账、Kafka/RabbitMQ 消费任务、tasks 长任务、oj test。
 ---
 
 # oj API 模块开发
@@ -15,7 +15,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
    **命中下面这些典型需求时，先读 `scenarios.md` 照抄**（配置 + 代码 + 验证 + 常见坑四段）：
    公开分享页按租户读数据（`db.asTenant` + `tenant.allow_as_tenant`）/ SPA 深链回落与每页
    meta（`app_spa_fallback` + `html_meta`）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
-   列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态。
+   列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态 /
+   多库项目按库迁移与对账（`oj migrate --db <name>`）。
    **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
    `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
@@ -26,6 +27,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
 4. **测试**：先 L2 vitest 测逻辑（快），再 L1 `oj test` 测端到端（真）。两层都绿才算完（§9）。
 5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§11）。
+   release 启动默认 `migrate_on_start: verify`，**先 `oj migrate`**；config `db:` 段有命名库时
+   逐个 `oj migrate -c config.yaml -d dist --db <name>`（未声明库名会报错，不会回落 default）。
 
 ## 红线（不可违反）
 
@@ -90,6 +93,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 尾 `/*` 匿名路径收不到豁免（v0.1.20） | 尾 `/*` 已统一为**严格一层**（旧 oj-auth 侧是任意深度）；跨层改 `/x/**`，启动会对含尾 `/*` 的列表打聚合迁移 WARN。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
+| 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`fixture` / `schema diff` 同旗标） |
+| `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
+| `--db "x" not declared in config (db keys: […])` | 库名不在 config `db:` 段（键即库名）——工具**故意不回落** `default`，防迁移打在开发库上 |
 | WS 二进制帧 `http.body` 是 null | 设计如此（不做 UTF-8 有损转换）——取字节用 `await http.bodyBytes()`（v0.1.16） |
 | 回显二进制协议帧型变成 Text | `ws.send` 帧型由参数类型决定：Uint8Array → Binary(0x2)，string → Text(0x1)——别把字节 decode 成 string 再发 |
 | `import "#x"` 报「未找到模块根」 | 该文件不在模块内（`tests/` 用例、`src/tasks/` 任务池），或 `--api-path` 在 project root 之外——这些场景用相对路径（v0.1.18 别名锚点 = 向上最近的 `manifest.yaml`） |
@@ -111,7 +117,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
 
 `scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
-测试库隔离 / LIMIT 分页 / 匿名路径通配。
+测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
 （json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

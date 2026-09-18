@@ -140,6 +140,30 @@
   - **D002**：实库有而无任何模块声明的表（排除账本 `_oj_migrations%` 与 `sqlite_%`）。
 - 误报逃生门：SQL 注释 `/* oj:allow-table=x,y */`。
 
+### 3.8 多库：`--db` 指定目标 profile
+
+`oj migrate` / `oj fixture` / `oj schema diff` 的目标库由 `--db <name>` 选定，
+`name` 即 config 的 `db:` 段键（`db: {default: …, analytics: …}` → `--db analytics`）：
+
+```bash
+oj migrate  -c config.yaml -d dist --db analytics
+oj fixture  -c config.yaml -d src  --db test --module user
+oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐库跑
+```
+
+- 缺省 = `default`；**未声明的库名 fail-fast**（报错列出可用键），绝不静默回落——
+  否则迁移会打在开发库上。
+- **不改语义**：`--db` 只是换目标连接；账本 `_oj_migrations`、`schema.yaml` 收敛、
+  `--baseline`、`--module` 都**各库独立**——所有模块同一个库的项目，逐 profile 各跑一遍
+  即可（模块各自绑不同库的项目见下条）。
+- **与模块级绑定无关**：`manifest.yaml` 的 `db:` 只影响运行期路由（`src/bridge/guard.rs`
+  的 `bound_db`），迁移工具不读它。**注意**：`--db` 是**整轮**目标库——它把全部模块的
+  迁移灌进该库，所以「模块 A→analytics、模块 B→default」的项目必须用
+  `--db <profile> --module <M>` 逐组合执行（详见 §8 已知债）。
+- `oj server` / `oj test` 不走这条通路：前者恒用 `default`（模块绑定在运行期生效），
+  后者有独立的 `oj test --db`（默认取 `db.test`，**语义是「字面 default 调用重定向」**
+  而非整轮目标库，见 §4.6 / `testing.md`）。
+
 ## 4. 场景速查
 
 | 场景 | 操作 |
@@ -153,6 +177,7 @@
 | 方言差异 | `0002__add_x.mysql.sql` 方言覆盖文件，与通用文件并存；无后缀 = 全方言执行 |
 | 演示 / 测试数据 | `fixtures/`：`oj fixture` / `oj test`（§2.2）；引导数据走 seed.sql（§2.1） |
 | 只迁一个模块 | `oj migrate --module user` / `oj fixture --module user` |
+| 迁到非 default 库 | `oj migrate --db <profile>`（`fixture` / `schema diff` 同旗标；profile = config `db:` 段的键） |
 | 发布前巡检 | `oj schema diff`：D001/D002 有漂移 exit 1 |
 | CI 无证书环境跑迁移 | `oj migrate` / `oj fixture` / `oj schema diff` 走**瘦身装配**（config → 插件 → 开库，不走 App 装配、无证书门禁、不起路由） |
 
@@ -185,8 +210,11 @@
 5. **fixture / seed 的幂等是作者责任**：引擎不记账、不去重；S006 只在构建期挡 seed 的
    INSERT，fixtures 无任何门禁。
 6. **reconcile 不做类型漂移检查**、不做删列、不做改名（§3.6）。
-7. **`oj migrate` / `oj fixture` / `oj schema diff` 只作用 default 库**（config 缺
-   `db.default` 直接报错）；多库场景其余库不参与。
+7. **`oj migrate` / `oj fixture` / `oj schema diff` 只作用一个库**：默认取 config 的
+   `db.default`（缺失直接报错）；`--db <name>` 可改指 `db:` 段的其它 profile，
+   **未声明的库名 fail-fast**（不静默回落 default）。`--db` 不认模块级 `manifest.yaml`
+   的 `db:` 绑定（那只是运行时路由）——模块各自绑不同库的项目须 `--db X --module M`
+   逐组合执行（§3.8 / §8）。
 8. **迁移 SQL 由引擎按文件执行与记账**：文件内容即契约——改一个字节 = M001。
 
 ## 7. 回滚
@@ -203,6 +231,14 @@
 - **旧版每模块账本**：一次性收敛 SQL 见 §3.2。
 - **mysql 账本 version 列为 TINYINT**：每模块 > 127 个迁移时 INSERT 越界，须人工改型
   （`migrate.rs::mysql_ledger_ddl`）。
+- **多库项目的 `--db` 是「整轮」而非「逐模块解析」**（v0.1.21 已知债）：`oj migrate --db X`
+  把**全部模块**的迁移灌进 X，不读各模块 `manifest.yaml` 的 `db:` 绑定
+  （`manifest::discover` 只回 `(name, path)`，绑定字段在迁移链上不可见）。因此
+  「A→analytics、B→default」这类项目**不能**只靠逐个 profile 跑一遍：须用
+  `--db <profile> --module <M>` 逐 (库, 模块) 组合执行，否则 B 的表会被重复灌进
+  analytics（静默重复，D002 不报；`schema diff --db X` 也只对 X 内的实库比对该模块声明）。
+  修法（未做）：让 `slim` 携带 manifest 绑定，或把多库迁移编排成逐模块解析——需先有真实
+  多库项目诉求再动（见 `modules/04-oj-cli.md` §8）。
 
 ## 9. 变更记录
 

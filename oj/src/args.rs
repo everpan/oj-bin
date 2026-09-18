@@ -61,7 +61,7 @@ pub struct BuildArgs {
     pub check: bool,
 }
 
-/// `oj migrate [-c config] [-d dir] [--baseline] [--module M]`。
+/// `oj migrate [-c config] [-d dir] [--db name] [--baseline] [--module M]`。
 pub struct MigrateArgs {
     pub config: String,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
@@ -70,14 +70,18 @@ pub struct MigrateArgs {
     pub baseline: bool,
     /// 只迁移指定模块。
     pub module: Option<String>,
+    /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
+    pub db: Option<String>,
 }
 
-/// `oj fixture [-c config] [-d dir] [--module M]`。
+/// `oj fixture [-c config] [-d dir] [--db name] [--module M]`。
 pub struct FixtureArgs {
     pub config: String,
     pub dir: Option<String>,
     /// 只灌指定模块。
     pub module: Option<String>,
+    /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
+    pub db: Option<String>,
 }
 
 /// 解析结果（错误/帮助/空参由 clap 处理，不会走到这里）。
@@ -90,11 +94,13 @@ pub enum Command {
     SchemaDiff(SchemaDiffArgs),
 }
 
-/// `oj schema diff [-c config] [-d dir]`：声明 vs 实库只读对账（D001/D002，§5.1）。
+/// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
 pub struct SchemaDiffArgs {
     pub config: String,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
+    /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
+    pub db: Option<String>,
 }
 
 /// oj：目录镜像路由的 JS 服务与构建 CLI。
@@ -190,7 +196,7 @@ enum Commands {
         #[arg(long)]
         anonymous: bool,
     },
-    /// 应用模块迁移到最新（migrations/*.sql → default 库；部署 = build && migrate && server）
+    /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && server）
     Migrate {
         /// 配置文件路径（相对 CWD；db 段提供目标库）
         #[arg(short, long, default_value = "config.yaml")]
@@ -199,6 +205,10 @@ enum Commands {
         /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast。
+        /// 与 `oj test --db` 不同——那里是「字面 default 调用重定向」，这里是整轮迁移的目标库
+        #[arg(long)]
+        db: Option<String>,
         /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
         #[arg(long)]
         baseline: bool,
@@ -213,6 +223,9 @@ enum Commands {
         /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
         #[arg(short, long)]
         dir: Option<String>,
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
+        #[arg(long)]
+        db: Option<String>,
         /// 只灌指定模块
         module: Option<String>,
     },
@@ -235,6 +248,9 @@ pub enum SchemaCmd {
         /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
+        #[arg(long)]
+        db: Option<String>,
     },
 }
 
@@ -304,6 +320,7 @@ fn to_command(cli: Cli) -> Command {
         Commands::Migrate {
             config,
             dir,
+            db,
             baseline,
             module,
         } => Command::Migrate(MigrateArgs {
@@ -311,19 +328,22 @@ fn to_command(cli: Cli) -> Command {
             dir,
             baseline,
             module,
+            db,
         }),
         Commands::Fixture {
             config,
             dir,
+            db,
             module,
         } => Command::Fixture(FixtureArgs {
             config,
             dir,
             module,
+            db,
         }),
         Commands::Schema {
-            command: SchemaCmd::Diff { config, dir },
-        } => Command::SchemaDiff(SchemaDiffArgs { config, dir }),
+            command: SchemaCmd::Diff { config, dir, db },
+        } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
     }
 }
 
@@ -503,6 +523,35 @@ mod tests {
         assert_eq!(
             (a.baseline, a.module.as_deref(), a.dir.as_deref()),
             (true, Some("user"), None)
+        );
+    }
+
+    #[test]
+    fn migrate_fixture_schema_diff_map_db_profile() {
+        // --db：三处瘦身装配统一的目标库 profile；缺省 None（→ default）。
+        let Command::Migrate(a) = cmd(&["migrate", "-c", "c.yaml", "--db", "analytics"]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.db.as_deref(), a.config.as_str()),
+            (Some("analytics"), "c.yaml")
+        );
+        let Command::Migrate(a) = cmd(&["migrate"]) else {
+            panic!()
+        };
+        assert!(a.db.is_none());
+        let Command::Fixture(a) = cmd(&["fixture", "--db", "test"]) else {
+            panic!()
+        };
+        assert_eq!(a.db.as_deref(), Some("test"));
+        let Command::SchemaDiff(a) = cmd(&["schema", "diff", "--db", "test"]) else {
+            panic!()
+        };
+        assert_eq!(a.db.as_deref(), Some("test"));
+        // --db 需要值；非法用法仍由 clap 报错。
+        assert!(
+            Cli::try_parse_from(["oj", "migrate", "--db"]).is_err(),
+            "--db 缺值须 clap 报错"
         );
     }
 

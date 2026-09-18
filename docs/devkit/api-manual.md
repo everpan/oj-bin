@@ -123,8 +123,14 @@ curl 'http://localhost:9778/v1/api/hello/'
 
 ```bash
 ./bin/oj build -d src -o dist        # 生成 dist/<module>-<version>/ + manifests.yaml 锁 + tgz
+./bin/oj migrate -c config.yaml -d dist          # release 默认 verify 门禁：先迁移后启动
 ./bin/oj server -c config.yaml --api-path dist
 ```
+
+**多库项目**（config `db:` 声明了 `default` 之外的命名库）：上面前两条默认只作用
+`default`，其余库要加 `--db <name>` 逐库各跑一遍（`oj fixture` / `oj schema diff` 同旗标）。
+模块各自绑不同库（`manifest.yaml` 的 `db:`）时，还须配 `--module` 逐组合跑——见
+`scenarios.md` 场景 6。
 
 构建细节见第 11 章；完整可跑样例见仓库 `sample/`（`sample/README.md`）。
 
@@ -244,7 +250,14 @@ tables:
 |---|---|
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
+| `oj fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物） |
 | `oj build --check` | 只跑结构检查 S001–S007 不落盘（CI 门禁） |
+
+三条数据类命令（`migrate` / `fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
+`name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
+不会静默回落 `default`。注意它是**整轮目标库**——会把全部模块的迁移灌进该库，不读模块级
+`manifest.yaml` 的 `db:` 绑定（那只是运行期路由），所以模块绑不同库的项目要
+`--db <profile> --module <M>` 逐组合跑（`scenarios.md` 场景 6）。
 
 ### 门禁配置（第 10 章 server 表）
 
@@ -1512,6 +1525,11 @@ curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |
 | `--output` | 报告落盘文件；省略打到 stdout（机器格式 stdout 纯净） |
+| `--db` | 测试库（v0.1.20）：缺省取 config 的 `db.test`（未声明则 WARN + 用 `default`）。字面 `default` 的库调用改指向该库，建表/seed/fixtures 一并跟随；未声明即报错 |
+| `--anonymous` | 以匿名请求身份跑（v0.1.20）：等同生产 `tenant.anonymous_paths` 命中，便于测公开面 handler |
+
+> `oj test --db` 与 `oj migrate --db` **同名不同义**：前者重定向「字面 `default` 的库调用」，
+> 后者是整轮迁移的目标库（第 3 章「命令」）。
 
 退出码：**全部通过 = 0，任一失败 = 1**——可直接做 CI 门禁。
 
@@ -1653,6 +1671,9 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
   （sqlite/mysql `?`，postgres `$1`）。
 - `seed.sql` 仅对 **default 库且为 sqlite** 时重放。
 - mysql/pg 连不上启动 fail-fast（连接串错/库未建）。
+- **按库运维（v0.1.21）**：`oj migrate` / `oj fixture` / `oj schema diff` 的 `--db <name>`
+  即上方键名；缺省 `default`，未声明 fail-fast。账本 `_oj_migrations`、schema 收敛、
+  `--baseline` 都各库独立——多库须逐库跑（模块绑不同库见第 3 章「命令」与场景 6）。
 
 ### redis
 
@@ -1870,7 +1891,9 @@ oj-v<version>-<triple>/
 ```
 
 目标机部署：解包 → 项目目录放 `config.yaml` + `dist/` + `seed.sql`（可选）+
-vendored `node_modules/`（不打进 tgz）→ `./oj server -c config.yaml --api-path dist`。
+vendored `node_modules/`（不打进 tgz）→ `./oj migrate -c config.yaml -d dist`
+（release 默认 `migrate_on_start: verify`，账本落后会拒启 M004；config `db:` 段有命名库时
+加 `--db <name>` 逐库跑）→ `./oj server -c config.yaml --api-path dist`。
 启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整（终端默认静默：
 `tail -f logs/server-*.log`，或启动时加 `--console-log`）。
 
@@ -1974,9 +1997,10 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | `GET {base}/…/ws` 404 | release 未重新 build，或 URL 含版本段 | 先 `oj build`；release URL 为 `…/news-0.1.0/ws` |
 | 改 `api.ts` 不生效 | release 下 dist 未更新 / 换版本未重启 | 同步 dist；必要时重启 |
 | `blob not configured` / `es not configured` | config 无对应段 | 加 `blob:` / `es.endpoint` |
-| 启动报 M004 / 迁移账本落后 | release verify 门禁：有迁移未应用 | 先 `oj migrate -c config.yaml -d dist` 再启动 |
+| 启动报 M004 / 迁移账本落后 | release verify 门禁：有迁移未应用 | 先 `oj migrate -c config.yaml -d dist` 再启动；非 default 库加 `--db <name>` |
 | 500 报跨模块表访问被拒 | `ownership_guard: deny` 且未声明 deps | manifest 补 `deps:`；或临时 SQL 注释 `/* oj:allow-table=x */` |
 | `oj schema diff` exit 1 | 声明与实库漂移（D001/D002） | 按输出对齐 schema.yaml 或补迁移；存量库用 `oj migrate --baseline` |
+| `oj migrate` 报 `--db "x" not declared in config (db keys: [...])` | `--db` 的库名不在 config `db:` 段（工具**不**回落 default，防迁错库） | 按报错里的 `db keys` 核对拼写；多库逐 profile 各跑一遍 |
 | 启动报 `ext_boot: …` 并拒启 | ext_boot.js 语法错/导入失败/顶层 await 抛错 | 看报错定位；改完重启 |
 | 启动没打印 `ext_boot: loaded` | 文件不在 config.yaml 同目录，或文件名不是 `ext_boot.js` | 挪到 config 同级；核对文件名 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec | 重启进程 |
@@ -2047,7 +2071,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 跨模块别名必须声明 `deps` | 别名跨模块引用省略 `manifest.deps` → S008 fail（既有**相对**跨模块引用不追溯） |
 | `manifest.yaml` 只能出现在模块根 | 嵌套声明会改写 `#` 别名的锚点 → S008 fail |
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
-| 静态站点无 SPA 回退 / 目录列表 / Range / ETag / 缓存头 | 未知路径不回落 `index.html`；未知扩展名按 `application/octet-stream`；SPA 回退经前置反代补 |
+| 静态站点无目录列表 / Range / ETag / 缓存头 | 未知扩展名按 `application/octet-stream`；SPA 深链回落需显式开 `server.app_spa_fallback: true`（v0.1.20，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；Range/ETag/缓存头经前置反代补 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
@@ -2056,6 +2080,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
+| 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
 | `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |
 | `ext_boot.js` 不做热重载 | 装配期冻结 spec，改动必须重启；池内可能新旧混杂 |

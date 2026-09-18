@@ -131,13 +131,14 @@
   退出码：全部通过 = 0，任一失败 = 1（可直接做 CI 门禁）。测试写法详见 `docs/testing.md`。
 
 ## migrate
-  应用模块迁移到最新（各模块 `migrations/*.sql` → default 库；部署顺序 = build && migrate && server）。
+  应用模块迁移到最新（各模块 `migrations/*.sql` → 目标库；部署顺序 = build && migrate && server）。
 
 ```
-    oj migrate [-c config.yaml] [-d dir] [--baseline] [module]
+    oj migrate [-c config.yaml] [-d dir] [--db name] [--baseline] [module]
 ```
       -c        配置文件（db 段提供目标库）
       -d        服务目录（缺省自动判定）
+      --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
       --baseline 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
       module    只迁移指定模块
 
@@ -145,16 +146,18 @@
   灌入模块 `fixtures/` 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
 
 ```
-    oj fixture [-c config.yaml] [-d dir] [module]
+    oj fixture [-c config.yaml] [-d dir] [--db name] [module]
 ```
+      --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
 
 ## schema diff
   声明式 schema（各模块 `schema.yaml`）与实库只读对账：D001 声明 vs 实库漂移
   （缺表/缺列/多列/缺索引）、D002 实库有而未声明的表；有差异退出码 1。
 
 ```
-    oj schema diff [-c config.yaml] [-d dir]
+    oj schema diff [-c config.yaml] [-d dir] [--db name]
 ```
+      --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
 
   迁移 / schema 的心智模型、门禁与回滚见 `docs/migration.md`。
 

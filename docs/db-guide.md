@@ -113,6 +113,10 @@ db:
   `DB(name)` 返回 `undefined`（`op_db_has` 探测）。
 - **模块默认库重定向**：模块 `manifest.yaml` 可写 `db: warehouse`，此后该模块里的
   字面 `db.*`（即 "default"）自动落到 warehouse；显式 `DB("...")` 不受影响。
+- **库级迁移 / 对账（v0.1.21）**：`oj migrate` / `oj fixture` / `oj schema diff` 默认作用
+  `default`，用 `--db <name>` 改指上面任一命名库（未声明即 fail-fast）。它是**整轮**的
+  目标库，不认模块级 `manifest.yaml` 的 `db:` 绑定——多库部署对每个 profile 各跑一遍，
+  账本 `_oj_migrations` 与 schema 收敛各库独立。详见 `docs/migration.md` §3.8。
 
 ### 1.2 数据库插件
 
@@ -136,7 +140,8 @@ plugins:
   列类型最小集：`integer | bigint | text | boolean | double | blob`。
 - **安全前向自动收敛**（`migrate_on_start: auto`，dev 默认）：加表、加可空列、加索引
   会在启动/reconcile 时自动应用；**类型变更、删列、改名必须走 `migrations/` 手写迁移**
-  （release 默认 `verify`：账本落后拒启，先 `oj migrate`）。
+  （release 默认 `verify`：账本落后拒启，先 `oj migrate`；非 `default` 库用
+  `oj migrate --db <name>`）。
 - 同一张表被两个模块声明 → 装配 fail-fast（S002）。
   `manifest.yaml` 的 `tables:` 清单与 schema.yaml 双向一致（S005，`oj build` 内嵌检查）。
 
