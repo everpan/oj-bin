@@ -97,7 +97,7 @@ ws:
 | `oj/src/server_cmd.rs` / `oj/src/app.rs` | 装配：读 config ws 段建路由池；闸门中间件（upgrade 前全局计数，超限 503） |
 | `sample/src/news/ws.ts`、`chat/ws.ts` | 状态迁移 `sess.state`；注释同步 |
 | docs（api-manual/websocket.md/dev-guide/user-manual/SKILL/MODULES） | 帧池模型、sess 约束（可序列化）、模块作用域新语义、配置面、超时契约（每连接回归）、breaking 标注 |
-| CHANGELIST | v0.2 段（breaking） |
+| CHANGELOG | v0.2 段（breaking） |
 
 ### 测试改造（现状 70 server + 4 bridge ws_session）
 

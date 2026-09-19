@@ -175,10 +175,10 @@ fn column_json_mysql(row: &MySqlRow, ordinal: usize) -> Option<serde_json::Value
 /// `Pooled::Any` 分支是**仅测试用**的（不是受支持的运行时路径）：它只在「非 mysql DSN」时出现，
 /// 而生产装配按 scheme 路由——`mysql://` 必进本插件且必走 typed。**Any 路径验证不到生产 MySQL
 /// 的行解码**（`Any` 的 `TryFrom<MySqlTypeInfo>` 缺 `Tiny` 等分支，Any+MySQL 组合本就不可用），
-/// 故它只覆盖「编排/绑定通路」；MySQL 行形状的回归靠 env-gated 真库用例（见 `CHANGELIST` 的 CI 挂账）。
+/// 故它只覆盖「编排/绑定通路」；MySQL 行形状的回归靠 env-gated 真库用例（见 `CHANGELOG` 的 CI 挂账）。
 ///
 /// 为什么保留 Any：本插件的离线全路径 roundtrip 是 CI 里唯一不依赖 MySQL 服务的覆盖
-/// （CI 无 MySQL service，见 `CHANGELIST` 的 P1-3 挂账；typed 化后 sqlite DSN 无法用 `MySql` 池，
+/// （CI 无 MySQL service，见 `CHANGELOG` 的 P1-3 挂账；typed 化后 sqlite DSN 无法用 `MySql` 池，
 /// 故用枚举分流而不是删掉那条用例）。**本机已用 macOS `container` 起 mysql:8.4 实跑过
 /// `real_mysql_*` 全部用例**（v0.1.24），但那不是 CI 覆盖。
 enum Pooled {

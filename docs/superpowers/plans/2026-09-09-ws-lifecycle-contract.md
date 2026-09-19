@@ -821,18 +821,18 @@ unix@vip.qq.com ai"
 
 ---
 
-### Task 5: 文档 + CHANGELIST + v0.1.9 版本发布点
+### Task 5: 文档 + CHANGELOG + v0.1.9 版本发布点
 
 **Files:**
 - Modify: `docs/devkit/api-manual.md`（§ws.ts 小节，约 `:365-395`）
 - Modify: `docs/websocket.md`（§1 心智模型、§2 帧内发布的「每帧重跑」表述）
 - Modify: `docs/dev-guide.md`（约 `:178` 一行表述）
-- Modify: `CHANGELIST.md`（新增 v0.1.9 段）
+- Modify: `CHANGELOG.md`（新增 v0.1.9 段）
 - Modify: `oj/Cargo.toml`（`version = "0.1.8"` → `"0.1.9"`，`oj/Cargo.toml:3`）
 
 **Interfaces:**
 - Consumes: Task 1-4 的最终行为（真源是代码与测试）。
-- Produces: v0.1.9 发布点提交（CHANGELIST 约定：`oj/Cargo.toml` version 递增提交即版本分界）。
+- Produces: v0.1.9 发布点提交（CHANGELOG 约定：`oj/Cargo.toml` version 递增提交即版本分界）。
 
 - [ ] **Step 1: 改写 `docs/devkit/api-manual.md` §ws.ts**
 
@@ -887,7 +887,7 @@ export default {
 
 「连接升级后**客户端每个文本帧执行一次本文件**」→「连接升级后按**生命周期钩子**执行：`export default { connection, message, close, error }`（connection 一次、message 每帧、close 收尾，详见 devkit/api-manual.md §ws.ts）」。
 
-- [ ] **Step 4: `CHANGELIST.md` 新增 v0.1.9 段**（插在 `## v0.1.8` 之前）
+- [ ] **Step 4: `CHANGELOG.md` 新增 v0.1.9 段**（插在 `## v0.1.8` 之前）
 
 ```markdown
 ## v0.1.9（2026-09-09）
@@ -925,7 +925,7 @@ unix@vip.qq.com ai"
 - [ ] **Step 8: Commit（v0.1.9 发布点）**
 
 ```bash
-git add CHANGELIST.md oj/Cargo.toml
+git add CHANGELOG.md oj/Cargo.toml
 git commit -m "chore(release): v0.1.9——WS 生命周期钩子契约
 
 unix@vip.qq.com ai"

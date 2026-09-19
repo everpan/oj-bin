@@ -58,7 +58,7 @@ impl Guard {
     ///
     /// v0.1.20 统一语义：字面 / `*` 恰好一段（尾 `/*` 仍是严格一层，**不**再像旧版那样
     /// 任意深度）/ `**` 跨段（≥0 段）。旧版尾 `*` 是 `starts_with` 任意深度，与自身注释
-    /// 和文档矛盾 —— 收紧后深路径请显式写 `/x/**`（迁移提示见 CHANGELIST v0.1.20）。
+    /// 和文档矛盾 —— 收紧后深路径请显式写 `/x/**`（迁移提示见 CHANGELOG v0.1.20）。
     fn is_anonymous(&self, path: &str) -> bool {
         let seg: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         self.anon.iter().any(|p| {

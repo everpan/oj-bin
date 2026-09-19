@@ -16,7 +16,7 @@
 - `bootstrap.js` 必须保持 7-bit ASCII。
 - 动态标识符只来自 SchemaRegistry；值只走绑定参数（红线）。
 - 所有插件 profile 保持 `panic = "unwind"`。
-- 每次版本更新需更新 CHANGELIST.md。
+- 每次版本更新需更新 CHANGELOG.md。
 - 新增 JsRuntime 入口才需要 patch_fs_loaded_sources——本计划不涉及。
 
 ---
@@ -707,19 +707,19 @@ migrate_cmd.rs run_migrate：`slim` 已持 cfg——guard 活跃时 `f.validate_
 
 ---
 
-### Task 7: 文档 —— 新人文档 + api-manual + CHANGELIST
+### Task 7: 文档 —— 新人文档 + api-manual + CHANGELOG
 
 **Files:**
 - Create: `docs/tenant-guide.md`（白话新人向）
 - Modify: `docs/devkit/api-manual.md`（db.asSystem / sql_guard 语义小节）
-- Modify: `CHANGELIST.md`（Unreleased 条目）
+- Modify: `CHANGELOG.md`（Unreleased 条目）
 
 - [ ] **Step 1:** `docs/tenant-guide.md`——白话文：什么是租户、X-TENANT-ID 从哪来、
 enable 与 sql_guard 的区别、shared 表怎么声明、asSystem 什么时候用、常见报错
 对照表（缺 tenant header / tenant guard: insert mismatch / raw sql lacks tenant_id
 …各是什么意思、怎么修）。面向第一次用的人，不写实现细节。
 - [ ] **Step 2:** api-manual 补 `db.asSystem()` 与 `tenant.sql_guard` 配置语义。
-- [ ] **Step 3:** CHANGELIST.md 顶部加 Unreleased 条目。
+- [ ] **Step 3:** CHANGELOG.md 顶部加 Unreleased 条目。
 - [ ] **Step 4: Commit** `docs(tenant): 新人文档 + api-manual + changelist`
 
 ---

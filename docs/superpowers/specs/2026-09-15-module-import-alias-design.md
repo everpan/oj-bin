@@ -255,7 +255,7 @@ specifier 分支，不改解析主流程。
 | 残留断言只护别名 → 漏改写的**相对** specifier 仍静默进产物、release 才炸 | 已修 | 新增 `assert_dist_consistent`：构建末尾扫本次产出的目录，每个本地 specifier 必须落到已落盘文件（别名 + 相对一视同仁） |
 | 扫描器不识别正则字面量（`/"/` 会与字符串错位 → 后续 import 漏改） | 保留（有兜底） | 字符级扫描是既定天花板（§11）；错位的后果由 `assert_dist_consistent` 从「运行期静默炸」变为「构建期显式失败」。需要更强保真时换 deno_ast |
 | `module_root_of` 用词法 `starts_with(project_root)`，符号链接下可能误报"未找到模块根" | 保留 + 改进文案 | 真实两条路径两侧都是 canonical（dev 经 `versioned_specifier`、build 经 `src.canonicalize()`），改加 canonicalize 反而会让 build 的 `strip_prefix` 与临时目录夹具产生偏差。改为在报错里点明「上溯以 project root 为界」 |
-| 别名/R import 指向非 `.ts` 目标（`.js`/`.json`）时"构建成功但产物缺文件" | 已修 | 非 `.ts` 目标 → 构建期 fail-fast（「扩展名不会进产物」）。**行为变更**：此前静默悬空，已记 CHANGELIST |
+| 别名/R import 指向非 `.ts` 目标（`.js`/`.json`）时"构建成功但产物缺文件" | 已修 | 非 `.ts` 目标 → 构建期 fail-fast（「扩展名不会进产物」）。**行为变更**：此前静默悬空，已记 CHANGELOG |
 | 构建期改写报错丢文件身份（只报目录 + 无下一步） | 已修 | `build_one` 统一 `.map_err(|e| format!("{}: {e}", rel.display()))` |
 | tasks 池失败会留部分 dist | 保留 | 与既有「失败即部分产物」一致（构建非事务性），未额外加预扫 |
 | 嵌套 `manifest.yaml` 会重新锚定 `#` | 已修 | 并入架构侧 A1 |

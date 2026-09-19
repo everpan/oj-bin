@@ -1,4 +1,4 @@
-# CHANGELIST
+# CHANGELOG
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
@@ -161,10 +161,18 @@
   ④ MySQL 读侧列类型边界（`DECIMAL`/JSON/时间/`BIT`/`GEOMETRY` 报错而非静默 `null`、
   `BOOLEAN` 读出 `1`/`0`）**补齐到 `SKILL.md` 陷阱速查与 `scenarios.md` 场景 7**（此前只在
   `api-manual.md`）；⑤ `README.md` 的 api-manual 索引行补本版亮点并新增「版本同步要求」小节。
-  **同时把该要求固化为流程**（否则下次升级仍会漏）：`CHANGELIST.md` 顶部新增「版本分界提交的
+  **同时把该要求固化为流程**（否则下次升级仍会漏）：`CHANGELOG.md` 顶部新增「版本分界提交的
   固定动作」四条、`docs/devkit/README.md` 新增「版本同步要求」。`bin/devkit/` 已归置，
   与 `docs/devkit/` 四件逐一 diff 一致（`cargo xtask build`；xtask devkit 契约用例 7/7 绿）。
   纯文档改动、无代码与行为变更。
+- **变更日志文件由 `CHANGELIST.md` 更名为 `CHANGELOG.md`**：统一回仓库**原本**的命名——`docs/plans/`
+  与 `docs/superpowers/` 下的任务书与设计稿一直写的就是 `CHANGELOG.md`（如 mail 计划的
+  「Modify: … `CHANGELOG.md`」、tenant-sql-guard 计划的「Modify: `CHANGELOG.md`（Unreleased
+  条目）」、ws-frame-pool 计划的「Modify: `CHANGELOG.md`（v0.1.10 段）」），两套名字并存属历史漂移。
+  本次把文件本身（标题 `# CHANGELOG`）与仓库内全部引用（含 `src/`·`oj/`·`plugins/`·`tools/`
+  的代码注释）一并改名——除本条目对旧名的记述外，`git grep CHANGELIST` 已无残留。
+  **注意**：外部若按文件名引用（文档链接、书签、脚本）需同步改名；文件内容、分组惯例与
+  「`oj/Cargo.toml` 版本递增提交即版本分界」的约定**均不变**。纯改名，无代码与行为变更。
 
 ## v0.1.23（2026-09-19）
 
@@ -537,7 +545,7 @@
 - 新增/改动配置键一律 `#[serde(default)]`：`tenant.allow_as_tenant`、`server.app_spa_fallback`、
   `server.html_meta`、`db_query.{default_limit,max_limit}` —— 老配置零改动（除上述三项行为变更）。
 - 首方插件版本保持随发布统一（`0.1.0`，semver 门禁为可选 pin，无清单 pin 该值）；
-  `oj-auth` 行为变更已写入 `CHANGELIST` + `docs/builtin-api-auth.md`。
+  `oj-auth` 行为变更已写入 `CHANGELOG` + `docs/builtin-api-auth.md`。
 - `cargo build --release` / `cargo fmt --check` / `cargo clippy --release --all-targets -- -D warnings`
   / `cargo test --release --workspace` 全绿。
 
