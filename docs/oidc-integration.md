@@ -65,22 +65,27 @@ curl -si 'https://your.app/v1/api/oidc/login?tenant=default'
   动不了已建立的登录流。
 - 登录成功后本地账号按 **`oidc:<tenant>:<sub>`** JIT 创建（首次登录自动建行，不可密码
   登录），与本地口令账号天然隔离；`roles` 取该行 `roles` 列。
-- `/oidc/*`、`/idp/*` 路径必须同时加进 **`auth.anonymous_paths` 与
+- `/oidc/*`、`/idp/**` 路径必须同时加进 **`auth.anonymous_paths` 与
   `tenant.anonymous_paths`**（浏览器跳转腿带不了 Bearer 和租户头）：
 
 ```yaml
 auth:
   anonymous_paths:
-    - "/oidc/*"
-    - "/idp/*"
-    - "/idp/.well-known/*"
+    - "/oidc/*"                 # login/callback/logout：尾段一层，够用
+    - "/idp/**"                 # authorize/token/userinfo 一层，
+                                #   而 discovery 在 /idp/.well-known/openid-configuration（两层）
 tenant:
   enable: true
   anonymous_paths:          # 与 auth 的同名机制同形：字面 / `/*` 一层 / `*` 单段 / `**` 跨段
     - "/oidc/*"
-    - "/idp/*"
-    - "/idp/.well-known/*"
+    - "/idp/**"
 ```
+
+> **为什么 `/idp` 用 `**` 而不是 `/*`**：尾 `/*` 是**严格一层**（v0.1.20 起），而
+> `/idp/.well-known/openid-configuration` 是两层——写 `/*` 会让 discovery 被守卫拦下。
+> 装配期会因此打迁移 WARN 点名该条目（v0.1.23 起 WARN 只在「改写为 `**` 会真的多命中一条
+> 已注册路由」时才打，所以这条会告警、`/oidc/*` 不会）。确属「有意一层」时写
+> `- { path: "/idp/*", one_layer: true }` 消音，但 OIDC 场景不该这么写。
 
 ## 4. 用内置 OP（自己当身份源）
 

@@ -1452,8 +1452,10 @@ config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插�
 `http.user`（`{id, roles, claims}`）。登录失败统一报 `invalid credentials`（不区分用户
 不存在/密码错）。
 
-**匿名路径** `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，尾 `/*` 为**一层**通配
-（`/pub/*` 命中 `/pub/x` 但不命中 `/pub`）。`{base}` 之外的路径（静态站点）不设防。
+**匿名路径** `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，四种通配形态（字面 / 尾
+`/*` 严格一层 / 中段 `*` 恰好一段 / `**` 跨任意层）。条目写字符串即可，需要显式声明
+「这一层是有意的」时改写成对象形态 `- { path: "/pub/*", one_layer: true }`（消音迁移
+WARN，见下）。`{base}` 之外的路径（静态站点）不设防。
 
 **用户表是业务约定，没有配置项**：框架不管用户表（不存在 `auth.user_table`），JS 端点
 按约定查询 `users` 表（`_platform` 伪模块持有归属），最小 schema：
@@ -1499,8 +1501,30 @@ tenant:
 **去 base 前缀**后的路径，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
 中段 `*`（恰好一段）；豁免命中且确实没带租户头 → 该请求标记为**匿名**（
 `RequestInfo.anonymous`），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
-已带的头仍照常注入。旧写法「尾 `/*` 当多层前缀」在 v0.1.20 收紧为严格一层，装配期对
-`tenant.anonymous_paths` / `auth.anonymous_paths` 中的尾 `/*` 条目打迁移 WARN。
+已带的头仍照常注入。旧写法「尾 `/*` 当多层前缀」在 v0.1.20 收紧为严格一层；装配期对
+`tenant.anonymous_paths` / `auth.anonymous_paths` 中的尾 `/*` 条目打**聚合迁移 WARN**，
+**两个条件同时成立才打**（v0.1.23 起）：
+
+1. 条目是**旧式前缀形态**——只有尾段那一个 `*`，其余段全是字面量（`/idp/*`、`/users/me/accounts/*`）。
+   v0.1.19 的旧实现是「砍掉尾 `*` 再 `starts_with`」（任意深度），只有这种形态当时能命中
+   真实请求；**含中段 `*` 的结构条目**（`/public/anchor/*/issues/*`）那时根本匹配不上，
+   只能诞生于 v0.1.20 的四形态语义，是刻意写的形状——对它们提「改 `**`」是错的，故静默。
+2. 改写成 `**` 后**真的会多命中一条已注册路由**：
+   - `/idp/*` 而项目里注册了 `/idp/.well-known/openid-configuration` → **告警**（收紧确实
+     收回了既有免鉴权面，应改 `/idp/**` 或把深路径单列）；
+   - `/auth/oidc/*` 这类**本就没有更深路由**的条目 → **静默**（改 `**` 反而扩面：`**` 含零层
+     与任意深）。
+
+确属「有意一层」时把条目写成对象形态并标 `one_layer: true`，永久退出该 WARN：
+
+```yaml
+auth:
+  anonymous_paths:
+    - /auth/login
+    - { path: "/auth/oidc/*", one_layer: true }   # 有意的一层（或明知影响面仍要一层）
+```
+
+`one_layer` 标在没有尾 `/*` 的条目上无意义，装配期直接报错（fail-fast，防配置撒谎）。
 
 **`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制

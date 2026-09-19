@@ -93,7 +93,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 查询被拦截 / 启动报 `tenant_id` 相关错（v0.1.15 sql_guard） | `sql_guard: "deny"` 拦截租户条件不匹配的查询（`"warn"` 只告警）：跨租户操作（对账/报表）走 `await db.asSystem()`（请求级 + 审计日志）；共享表须 schema.yaml `tenant: false` **且** config `tenant.shared_allow` 列出，双声明才豁免 |
 | 裸 SQL 被 deny 拦「遗漏 tenant_id」 | `db.query`/`db.exec` 的字面检查（best-effort）要求 SQL 显式带租户条件——优先改走 `db.table()` 构造器（自动注入），系统身份走 `db.asSystem()` |
 | `db.asTenant` 抛错（v0.1.20） | 三道门禁：`tenant.allow_as_tenant: true` 未开 / 请求不是匿名（未命中 `anonymous_paths` 或已带租户头）/ id 为空；且**请求级只能设一次**（防中途换身份）。公开页正确姿势见 `scenarios.md` 场景 1 |
-| 尾 `/*` 匿名路径收不到豁免（v0.1.20） | 尾 `/*` 已统一为**严格一层**（旧 oj-auth 侧是任意深度）；跨层改 `/x/**`，启动会对含尾 `/*` 的列表打聚合迁移 WARN。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
+| 尾 `/*` 匿名路径收不到豁免（v0.1.20） | 尾 `/*` 已统一为**严格一层**（旧 oj-auth 侧是任意深度）；跨层改 `/x/**`。装配期只对「**旧式前缀形态**（只有尾段一个 `*`、其余段全字面）且改写为 `**` 会真的多命中已注册路由」的条目打聚合迁移 WARN（v0.1.23 起，含中段 `*` 的结构条目不再被点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
 | 雪花 id / 大整数算错、主键 dup 500 | i64 超 `2^53-1` 读出来是**字符串**；`Number(row.id) + 1` 会静默坍缩到 f64 网格值（下次分配撞主键）。范式：`toBigInt(rows[0].m) + 1n` → 直接回写 `db.exec(..., [next])`（v0.1.22，见 `scenarios.md` 场景 7） |

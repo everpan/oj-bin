@@ -235,6 +235,77 @@ pub struct BrokerCfg {
     pub topic_prefix: Option<String>,
 }
 
+/// 匿名路径条目（v0.1.23）：字符串简写，或对象形态（带「有意一层」确认）。
+///
+/// 背景：v0.1.20 起尾 `/*` 收紧为**严格一层**，启动期对含尾 `/*` 的列表打聚合 WARN 提示改
+/// `**`。但「尾段恰好一层」本身是四形态中的合法形态——尾段是动态段时只能用 `/*` 表达
+/// （改 `**` 反而扩面：`**` 含零层与任意深），这类条目永远无法让 WARN 消音。
+///
+/// `one_layer: true` 即对该条目的显式确认：声明「这一层是有意的」，退出迁移 WARN。
+/// v0.1.23 起 WARN 默认已改为**按影响面**判定（只在改 `**` 会真多命中已注册路由时才告警，
+/// 见 `oj::app::warn_legacy_tail_wildcards`），本标记用于「明知影响面仍要严格一层」的人工确认。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum AnonPath {
+    /// 简写：`- /auth/oidc/*`
+    Plain(String),
+    /// 对象：`- { path: "/auth/oidc/*", one_layer: true }`
+    Detailed {
+        path: String,
+        /// 显式确认尾 `/*` 是**有意的一层**（非待迁移的旧式宽匹配）。
+        #[serde(default)]
+        one_layer: bool,
+    },
+}
+
+impl AnonPath {
+    /// 条目路径（两种形态同口径）。
+    pub fn path(&self) -> &str {
+        match self {
+            AnonPath::Plain(p) => p,
+            AnonPath::Detailed { path, .. } => path,
+        }
+    }
+
+    /// 是否显式确认为「有意的严格一层」（退出迁移 WARN）。
+    pub fn one_layer(&self) -> bool {
+        matches!(
+            self,
+            AnonPath::Detailed {
+                one_layer: true,
+                ..
+            }
+        )
+    }
+}
+
+/// 匿名路径列表 → 路径字符串列表（server `Pipeline` 与 oj-auth 插件 cfg 都只要字符串；
+/// 插件侧因此零改动，ABI 不变）。
+pub fn anon_paths(list: &[AnonPath]) -> Vec<String> {
+    list.iter().map(|p| p.path().to_string()).collect()
+}
+
+/// 装配期校验（fail-fast）：`one_layer` 只对尾 `/*` 条目有意义——挂在别的条目上是无效
+/// 标记（WARN 本就不会点名它），静默接受等于让配置撒谎。
+pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
+    let check = |what: &str, list: &[AnonPath]| -> Result<(), String> {
+        for p in list {
+            if p.one_layer() && !p.path().ends_with("/*") {
+                return Err(format!(
+                    "{what}: {:?} 标了 one_layer，但没有尾 \"/*\" —— 该标记只用于确认「有意的严格一层」",
+                    p.path()
+                ));
+            }
+        }
+        Ok(())
+    };
+    check("tenant.anonymous_paths", &cfg.tenant.anonymous_paths)?;
+    if let Some(a) = &cfg.auth {
+        check("auth.anonymous_paths", &a.anonymous_paths)?;
+    }
+    Ok(())
+}
+
 /// 多租户注入（OJ-3）：enable 后 handle() 从 header 提取租户 id 注入 http.tenantId。
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -242,7 +313,7 @@ pub struct TenantCfg {
     pub enable: bool,
     pub header_key: String,
     /// 浏览器跳转腿豁免（去 base 后路径；尾 "/*" 一层通配）——OIDC 回跳带不了自定义头。
-    pub anonymous_paths: Vec<String>,
+    pub anonymous_paths: Vec<AnonPath>,
     /// 多租户 SQL 防护（默认 off=false；true=deny 缺租户条件即拒；"warn"=仅告警软过渡）。
     /// 反序列化在 config.rs（三态共用 bridge::SqlGuard 一个类型）。
     #[serde(default)]
@@ -300,8 +371,9 @@ pub struct AuthCfg {
     pub signing_method: String,
     pub access_token_duration: String,
     pub refresh_token_duration: String,
-    /// 免鉴权路径（去 base 后）；结尾 "/*" = 一层前缀通配。
-    pub anonymous_paths: Vec<String>,
+    /// 免鉴权路径（去 base 后）；结尾 "/*" = 一层前缀通配。条目可为字符串简写或
+    /// 对象形态（`{ path, one_layer }`，见 `AnonPath`）。
+    pub anonymous_paths: Vec<AnonPath>,
 }
 
 impl Default for AuthCfg {
@@ -941,7 +1013,54 @@ mod tests {
         assert_eq!(o.rp["acme"].client_id, "cid");
         assert_eq!(o.rp["acme"].scope, "openid"); // 缺省 scope
         assert_eq!(o.clients["web"].redirect_uris[0], "http://x/cb");
-        assert_eq!(c.tenant.anonymous_paths, vec!["/oidc/*".to_string()]);
+        assert_eq!(
+            c.tenant.anonymous_paths,
+            vec![AnonPath::Plain("/oidc/*".into())]
+        );
+    }
+
+    #[test]
+    fn anon_paths_accepts_string_and_object_forms() {
+        // v0.1.23：条目可为字符串简写或对象形态（one_layer 确认）。
+        let c: Config = serde_yaml::from_str(
+            "auth:\n\
+             \x20 jwt_secret: \"s\"\n\
+             \x20 anonymous_paths:\n\
+             \x20   - /auth/login\n\
+             \x20   - path: \"/auth/oidc/*\"\n\
+             \x20     one_layer: true\n\
+             \x20   - path: \"/public/export/*\"\n",
+        )
+        .unwrap();
+        let a = c.auth.as_ref().unwrap();
+        assert_eq!(a.anonymous_paths.len(), 3);
+        assert_eq!(a.anonymous_paths[0], AnonPath::Plain("/auth/login".into()));
+        assert!(!a.anonymous_paths[0].one_layer());
+        assert_eq!(a.anonymous_paths[1].path(), "/auth/oidc/*");
+        assert!(a.anonymous_paths[1].one_layer());
+        // 对象形态缺省 one_layer → false（等同未确认）。
+        assert!(!a.anonymous_paths[2].one_layer());
+        // 消费侧归一：两种形态都给同一份字符串列表（插件 cfg / Pipeline 用）。
+        assert_eq!(
+            anon_paths(&a.anonymous_paths),
+            vec!["/auth/login", "/auth/oidc/*", "/public/export/*"]
+        );
+        assert!(validate_anon_paths(&c).is_ok());
+    }
+
+    #[test]
+    fn one_layer_on_non_tail_wildcard_fails_fast() {
+        // 标在无尾 "/*" 的条目上是无效标记（WARN 本就不会点名它）→ 装配期报错。
+        let c: Config = serde_yaml::from_str(
+            "tenant:\n\
+             \x20 enable: true\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { path: \"/health\", one_layer: true }\n",
+        )
+        .unwrap();
+        let err = validate_anon_paths(&c).unwrap_err();
+        assert!(err.contains("/health"), "{err}");
+        assert!(err.contains("one_layer"), "{err}");
     }
 
     #[test]

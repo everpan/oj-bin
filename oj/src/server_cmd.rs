@@ -533,7 +533,8 @@ pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
             Some(a) => serde_json::json!({
                 "jwt_secret": a.jwt_secret,
                 "signing_method": a.signing_method,
-                "anonymous_paths": a.anonymous_paths,
+                // 插件只吃路径字符串（v0.1.23 起宿主支持条目对象形态，插件侧零改动）。
+                "anonymous_paths": only_js::config::anon_paths(&a.anonymous_paths),
             })
             .to_string(),
             None => "{}".to_string(),
