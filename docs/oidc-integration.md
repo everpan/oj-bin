@@ -81,11 +81,17 @@ tenant:
     - "/idp/**"
 ```
 
-> **为什么 `/idp` 用 `**` 而不是 `/*`**：尾 `/*` 是**严格一层**（v0.1.20 起），而
+> **为什么 `/idp` 用 `**` 而不是 `/*`**：尾 `/*` 是**严格一层**，而
 > `/idp/.well-known/openid-configuration` 是两层——写 `/*` 会让 discovery 被守卫拦下。
-> 装配期会因此打迁移 WARN 点名该条目（v0.1.23 起 WARN 只在「改写为 `**` 会真的多命中一条
-> 已注册路由」时才打，所以这条会告警、`/oidc/*` 不会）。确属「有意一层」时写
-> `- { path: "/idp/*", one_layer: true }` 消音，但 OIDC 场景不该这么写。
+> 注意这条收紧**只发生在 `auth.anonymous_paths`**（oj-auth 侧旧实现是任意深度）；
+> `tenant.anonymous_paths` 自引入起就是严格一层，所以那里写 `/*` 与 `**` 的差别只在于
+> 「要不要覆盖更深路径」，不涉及迁移。
+>
+> 装配期只对 **auth 列表**打迁移 WARN：`/idp/*` 这类旧式前缀条目若确实丢了面（discovery
+> 比它深）就会被点名（v0.1.23 起还要满足「旧式前缀形态 + 确会丢面」两个条件）；确属
+> 「有意一层」时写 `- { path: "/idp/*", one_layer: true }` 消音。
+> `sample/config.yaml` 走的是**更窄**的三条 + `one_layer`（豁免面最小），本文的 `/idp/**`
+> 是等价但更省事的写法——两者都不告警，按你的安全偏好选一个即可。
 
 ## 4. 用内置 OP（自己当身份源）
 
@@ -168,6 +174,7 @@ users (username, password_hash, roles) VALUES (?, '<bcrypt hash>', '[]')`）。
 - [ ] PKCE S256 强制（RP 已强制；IdP 侧也开）
 - [ ] `client_secret` 不进前端/日志；轮换时 `rp` 与 IdP 两侧同步
 - [ ] 生产 IdP 走 HTTPS（issuer 与 discovery 返回值逐字一致）
-- [ ] `auth.anonymous_paths` 与 `tenant.anonymous_paths` 只列跳转腿三段，不加业务路径
+- [ ] `auth.anonymous_paths` 与 `tenant.anonymous_paths` 只列跳转腿路径（本文 §3 用 `/idp/**`
+      两条；`sample/config.yaml` 用 `/idp/* + one_layer` 三条——都是合法窄面），不加业务路径
 - [ ] 私钥文件权限收紧（600）；`config/` 不进镜像分发
 - [ ] 已知晓：demo 私钥 `sample/config/oidc_rs256.pem` 仅供演示，勿用于生产

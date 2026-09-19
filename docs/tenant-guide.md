@@ -177,22 +177,20 @@ export const get = async () => {
 | `/idp/**` | **跨任意层** | `/idp`、`/idp/a`、`/idp/a/b/c` 全命中 |
 | `/report/*/export` | 中段 `*` 恰好一段 | `/report/7/export` 命中；`/report/a/b/export` 不命中 |
 
-> **v0.1.20 变更**：以前尾 `/*` 被当成「任意层前缀」（`/idp/*` 连
-> `/idp/.well-known/openid-configuration` 也命中）。现在收紧为严格一层，需要跨层请改用
-> `**`。装配期对尾 `/*` 条目打迁移 WARN，但**两个条件同时成立才打**（v0.1.23 起）：
-> ① 条目是**旧式前缀形态**（只有尾段一个 `*`、其余段全字面，如 `/idp/*`——旧实现「砍尾 `*`
-> 再 `starts_with`」只有这种形态能命中；含中段 `*` 的结构条目如 `/public/anchor/*/issues/*`
-> 是 v0.1.20 之后刻意写的，不在此列）；② 改写为 `**` 会真的多命中一条已注册路由。
+> **v0.1.20 变更（只发生在 auth 侧）**：`auth.anonymous_paths` 的尾 `/*` 以前被 oj-auth 当成
+> 「任意层前缀」（`/idp/*` 连 `/idp/.well-known/openid-configuration` 也免 Bearer），现在收紧为
+> 严格一层，需要跨层请改用 `**`。**租户侧不受此变更影响**——`tenant.anonymous_paths` 自引入起
+> 就是严格一层（旧 server 实现即 `!rest[1..].contains('/')`），故**不参与**启动期迁移 WARN。
 >
-> 确属「有意一层」时，把条目写成对象形态并标 `one_layer: true` 永久消音：
+> 装配期只对 **`auth.anonymous_paths`** 打迁移 WARN，两个条件同时成立才打（v0.1.23 起）：
+> ① 条目是**旧式前缀形态**（只有尾段一个 `*`、其余段全字面，如 `/idp/*`——旧 oj-auth 实现
+> 「砍尾 `*` 再 `starts_with`」只有这种形态能命中；含中段 `*` 的结构条目如
+> `/public/anchor/*/issues/*` 是 v0.1.20 之后刻意写的，不在此列）；② 该条目确实丢了面（存在
+> 一条已注册路由比严格一层更深）。
 >
-> ```yaml
-> tenant:
->   anonymous_paths:
->     - { path: "/idp/*", one_layer: true }
-> ```
->
-> `one_layer` 标在没有尾 `/*` 的条目上无意义，装配期直接报错。
+> 确属「有意一层」时，把条目写成对象形态并标 `one_layer: true` 永久消音（示例见
+> `docs/devkit/api-manual.md` 的鉴权章；`tenant.` 段同样接受这个形态，只是那里不会告警，
+> 标记等于备注）。`one_layer` 标在末段不是 `*` 的条目上无意义，装配期直接报错。
 
 ## 常见报错对照表
 

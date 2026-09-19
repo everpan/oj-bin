@@ -38,25 +38,40 @@ fn sample_configs_parse_and_pass_anon_path_validation() {
             assert!(auth.iter().any(|x| x == p), "{name}: auth 缺 {p}");
         }
 
-        // `/idp/*` 在样例里是**显式确认的有意一层**（discovery 由 `/idp/.well-known/*` 单列，
-        // 豁免面最小）→ 装配期不会再对它打迁移 WARN。
-        let idp = c
+        // 迁移 WARN 只针对 **auth 列表**（v0.1.23 订正：v0.1.20 的收紧只发生在 oj-auth 侧，
+        // 租户侧自引入起即为严格一层）→ 样例把 one_layer 标在 auth 的 `/idp/*` 上，租户侧
+        // 保持纯字符串（那里标了也不告警，等于备注）。
+        let auth_idp = c
+            .auth
+            .as_ref()
+            .unwrap()
+            .anonymous_paths
+            .iter()
+            .find(|p| p.path() == "/idp/*")
+            .unwrap_or_else(|| panic!("{name}: auth 缺 /idp/*"));
+        assert!(
+            auth_idp.one_layer(),
+            "{name}: auth 的 /idp/* 必须带 one_layer: true（否则启动会打迁移 WARN）"
+        );
+        let tenant_idp = c
             .tenant
             .anonymous_paths
             .iter()
             .find(|p| p.path() == "/idp/*")
             .unwrap_or_else(|| panic!("{name}: tenant 缺 /idp/*"));
         assert!(
-            idp.one_layer(),
-            "{name}: /idp/* 必须带 one_layer: true（否则启动会打迁移 WARN）"
+            !tenant_idp.one_layer(),
+            "{name}: tenant 的 /idp/* 不该带 one_layer（该列表不参与迁移 WARN）"
         );
-        // `/oidc/*` 无更深路由 → 影响面判定为静默，用字符串简写即可（也顺带钉住简写形态）。
+        // `/oidc/*` 无更深路由 → 丢面判定为静默，用字符串简写即可（也顺带钉住简写形态）。
         let oidc = c
-            .tenant
+            .auth
+            .as_ref()
+            .unwrap()
             .anonymous_paths
             .iter()
             .find(|p| p.path() == "/oidc/*")
-            .unwrap_or_else(|| panic!("{name}: tenant 缺 /oidc/*"));
+            .unwrap_or_else(|| panic!("{name}: auth 缺 /oidc/*"));
         assert!(!oidc.one_layer(), "{name}: /oidc/* 不该有 one_layer");
     }
 }

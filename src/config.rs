@@ -244,8 +244,7 @@ pub struct BrokerCfg {
 /// `one_layer: true` 即对该条目的显式确认：声明「这一层是有意的」，退出迁移 WARN。
 /// v0.1.23 起 WARN 默认已改为**按影响面**判定（只在改 `**` 会真多命中已注册路由时才告警，
 /// 见 `oj::app::warn_legacy_tail_wildcards`），本标记用于「明知影响面仍要严格一层」的人工确认。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnonPath {
     /// 简写：`- /auth/oidc/*`
     Plain(String),
@@ -253,9 +252,66 @@ pub enum AnonPath {
     Detailed {
         path: String,
         /// 显式确认尾 `/*` 是**有意的一层**（非待迁移的旧式宽匹配）。
-        #[serde(default)]
         one_layer: bool,
     },
+}
+
+/// 手写 `Deserialize`（不用 `#[serde(untagged)]`），两个理由：
+/// ① **未知键必须报错**——`#{serde(untagged)}` 无法 `deny_unknown_fields`，`one_layr: true`
+///    这样的笔误会**静默**解析成 `one_layer=false`，用户以为已消音而实际没有，正好违背
+///    `validate_anon_paths`「不让配置撒谎」的立论；
+/// ② **报错要能定位**——untagged 的报错只给「did not match any variant」并把位置指到
+///    序列首元素（下游列表动辄 10+ 条），这里给出「合法形态长什么样 + 哪个键不认识」。
+impl<'de> Deserialize<'de> for AnonPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = AnonPath;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("字符串简写 \"/path/*\"，或对象 { path: \"/path/*\", one_layer: true }")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<AnonPath, E> {
+                Ok(AnonPath::Plain(v.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<AnonPath, E> {
+                Ok(AnonPath::Plain(v))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<AnonPath, A::Error> {
+                let mut path: Option<String> = None;
+                let mut one_layer = false;
+                while let Some(key) = m.next_key::<String>()? {
+                    match key.as_str() {
+                        "path" => path = Some(m.next_value()?),
+                        "one_layer" => one_layer = m.next_value()?,
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "anonymous_paths 条目只认 `path` 与 `one_layer` 两个键，\
+                                 收到未知键 `{other}`（拼写错误？）——合法形态：字符串 \
+                                 \"/path/*\" 或对象 {{ path: \"/path/*\", one_layer: true }}"
+                            )));
+                        }
+                    }
+                }
+                let path = path.ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "anonymous_paths 对象形态缺 `path`（合法形态：{ path: \"/path/*\", \
+                         one_layer: true }；只要确认一层时可省 one_layer）",
+                    )
+                })?;
+                Ok(AnonPath::Detailed { path, one_layer })
+            }
+        }
+
+        d.deserialize_any(V)
+    }
 }
 
 impl AnonPath {
@@ -287,12 +343,22 @@ pub fn anon_paths(list: &[AnonPath]) -> Vec<String> {
 
 /// 装配期校验（fail-fast）：`one_layer` 只对尾 `/*` 条目有意义——挂在别的条目上是无效
 /// 标记（WARN 本就不会点名它），静默接受等于让配置撒谎。
+///
+/// 判据用**段级**口径（末段 == `"*"`）而非裸后缀，与匹配层 `server::path_matches` 的
+/// 「忽略空段」保持一致：`/idp/*/` 在运行期就是严格一层，标 `one_layer` 合法。
+/// （迁移 WARN 的 `is_legacy_prefix_shape` 有意仍用裸后缀——它对齐的是 v0.1.19
+/// `strip_suffix("/*")` 的历史口径，两处差异是刻意的。）
 pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
     let check = |what: &str, list: &[AnonPath]| -> Result<(), String> {
         for p in list {
-            if p.one_layer() && !p.path().ends_with("/*") {
+            let tail_is_star = p
+                .path()
+                .split('/')
+                .rfind(|s| !s.is_empty())
+                .is_some_and(|s| s == "*");
+            if p.one_layer() && !tail_is_star {
                 return Err(format!(
-                    "{what}: {:?} 标了 one_layer，但没有尾 \"/*\" —— 该标记只用于确认「有意的严格一层」",
+                    "{what}: {:?} 标了 one_layer，但末段不是 \"*\" —— 该标记只用于确认「有意的严格一层」",
                     p.path()
                 ));
             }
@@ -1061,6 +1127,71 @@ mod tests {
         let err = validate_anon_paths(&c).unwrap_err();
         assert!(err.contains("/health"), "{err}");
         assert!(err.contains("one_layer"), "{err}");
+    }
+
+    #[test]
+    fn one_layer_tail_check_is_segment_wise_like_the_matcher() {
+        // 评审 P2-2：校验用段级口径（末段 == "*"）与匹配层「忽略空段」对齐——
+        // `/x/*/` 在运行期就是严格一层，标 one_layer 合法（此前裸后缀口径会误拒）。
+        let c: Config = serde_yaml::from_str(
+            "tenant:\n\
+             \x20 enable: true\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { path: \"/idp/*/\", one_layer: true }\n\
+             \x20   - { path: \"/a//*\", one_layer: true }\n",
+        )
+        .unwrap();
+        assert!(validate_anon_paths(&c).is_ok());
+        // 末段不是 "*" 的仍然拒。
+        let bad: Config = serde_yaml::from_str(
+            "auth:\n\
+             \x20 jwt_secret: \"s\"\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { path: \"/a/**\", one_layer: true }\n",
+        )
+        .unwrap();
+        assert!(validate_anon_paths(&bad).unwrap_err().contains("/a/**"));
+    }
+
+    #[test]
+    fn anon_path_object_unknown_key_and_missing_path_fail_loud() {
+        // 评审 P2-4：untagged 会把 `one_layr` 静默吃成 one_layer=false（用户以为已消音）——
+        // 手写 Deserialize 后未知键直接报错，并给出合法形态。
+        let err = serde_yaml::from_str::<Config>(
+            "auth:\n\
+             \x20 jwt_secret: \"s\"\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { path: \"/idp/*\", one_layr: true }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("one_layr"), "{err}");
+        assert!(err.contains("one_layer"), "{err}");
+
+        // 对象形态缺 path → 报错（untagged 时代会退化成模糊的 did-not-match-any-variant）。
+        let err = serde_yaml::from_str::<Config>(
+            "tenant:\n\
+             \x20 enable: true\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { one_layer: true }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("path"), "{err}");
+
+        // 值类型写错（one_layer 给字符串）也要有人话报错。
+        let err = serde_yaml::from_str::<Config>(
+            "tenant:\n\
+             \x20 enable: true\n\
+             \x20 anonymous_paths:\n\
+             \x20   - { path: \"/idp/*\", one_layer: \"yes\" }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("one_layer") || err.contains("boolean"),
+            "{err}"
+        );
     }
 
     #[test]

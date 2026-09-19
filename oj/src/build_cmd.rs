@@ -86,30 +86,43 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// tasks 目录名：读配置的 `tasks.dir`（缺文件回落默认 "tasks"——build 不强制要求
-/// server 配置存在）。
-/// 构建期 sql_guard 模式（与 server 装配同一配置源；配置缺失/非法时宽容为 Off，
-/// tenant 声明校验仅在此模式下追加——S* 检查本身不依赖 config）。
-fn sql_guard_of_config(config: &str) -> only_js::bridge::SqlGuard {
+/// 读 config（build 专用）：解析失败**不致命**（build 不装配服务，缺文件也照建），但
+/// 调用方必须**出声**——静默回落会悄悄改掉行为（见下面两处消费者）。
+fn load_config_for_build(config: &str) -> Result<only_js::config::Config, String> {
     let p = Path::new(config);
     let dir = p
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
-        .map(|c| c.tenant.sql_guard)
-        .unwrap_or(only_js::bridge::SqlGuard::Off)
+}
+
+/// 构建期 sql_guard 模式（与 server 装配同一配置源）。
+///
+/// **v0.1.23 起配置解析失败会打 warn**（此前静默回落 `Off`）：`sql_guard` 非 Off 的项目
+/// 靠它给 `S*` 检查加「schema 声明必须有 tenant_id 列」等校验，静默 Off 等于 **CI 门禁失效**。
+/// 注意 `oj build`（本函数）与 `oj server`/`oj test`（`App::from_config`，fail-fast）口径不同，
+/// 这是有意的：build 连 `config.yaml` 不存在都要能跑（见上方函数注释）。
+fn sql_guard_of_config(config: &str) -> only_js::bridge::SqlGuard {
+    match load_config_for_build(config) {
+        Ok(c) => c.tenant.sql_guard,
+        Err(e) => {
+            eprintln!(
+                "warn: 读配置 {config} 失败 → 本次 build 按 sql_guard=off 处理（tenant 声明校验不生效）：{e}"
+            );
+            only_js::bridge::SqlGuard::Off
+        }
+    }
 }
 
 fn tasks_dir_of(config: &str) -> String {
-    let p = Path::new(config);
-    let dir = p
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
-        .map(|c| c.tasks.dir)
-        .unwrap_or_else(|_| "tasks".to_string())
+    match load_config_for_build(config) {
+        Ok(c) => c.tasks.dir,
+        Err(e) => {
+            eprintln!("warn: 读配置 {config} 失败 → 镜像目录回落默认 \"tasks\"：{e}");
+            "tasks".to_string()
+        }
+    }
 }
 
 /// 递归收集 dir 下全部 .ts/.js（相对 dir 的路径）。

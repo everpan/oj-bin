@@ -49,8 +49,11 @@
   curl -s http://localhost:9778/v1/api/auth_demo/me/ \
     -H "Authorization: Bearer <access_token>" -H 'X-TENANT-ID: default'            # 受保护路由（Bearer + 租户头）
 
-- 302 一律 `-i` 手动接力 Location；state/code 一次一用（重放 401），跳转腿免租户头靠
-  `tenant.anonymous_paths`（`/oidc/*`、`/idp/*`），对接外部 IdP 只改 config `oidc.rp`
+- 302 一律 `-i` 手动接力 Location；state/code 一次一用（重放 401）。跳转腿豁免**两条列表都要
+  加**（`tenant.anonymous_paths` 免租户头、`auth.anonymous_paths` 免 Bearer）：本 sample 用
+  `/oidc/*`、`/idp/*`、`/idp/.well-known/*` 三条窄面（discovery 比 `/idp/*` 深一层，故单列；
+  auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」，见 `config.yaml` 注释）；
+  对接外部 IdP 只改 config `oidc.rp`
 - 已知限制：OP `sub` = users.id 字符串 → 自托管 OIDC 登录 JIT 新建本地账号
   （username = `oidc:<tenant>:<sub>`，占位 hash 不可密码登录，与本地口令账号天然隔离），
   不合并原 demo 行
