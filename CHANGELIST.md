@@ -146,6 +146,25 @@
   ④ 场景索引注明 v0.1.20 收紧**仅 auth 侧**；⑤ OIDC 走读段补全为「两条列表各三条路径 +
   auth 的 `/idp/*` 标 `one_layer`」。纯文档改动、无代码变更；devkit 发布产物 `bin/devkit`
   已随之同步（`cargo xtask build`）。
+- **对外文档 `docs/devkit/` 按本版用户可见变更逐条收口**（`218b8a9`）——按「devkit 随版本升级
+  同步」的要求，逐条列出本版用户可见变更后核对四件，补齐如下**真漏项**（①–③ 为
+  `api-manual.md` 新增章节/条目，④ 为 `SKILL.md` / `scenarios.md` 补齐，⑤ 为 `README.md`
+  索引与流程）：
+  ① `api-manual.md` §8 新增 **`tenant_id` 列类型**（白名单 `text|integer|bigint` 与
+  server / `oj build` / `oj migrate` 三处 fail-fast、按列类型绑值、insert/update 四种形态），
+  并点明**数值列上租户头非十进制时 `sql_guard: warn` 也硬失败**；
+  ② `api-manual.md` §6 新增 **`toSQL().params` 的超界整数是 marker**（`$oj$i64`/`$oj$u64`）——
+  此前被降成字符串，用户照文档「回放 params」必然失败；
+  ③ `api-manual.md` §12 新增 **「PostgreSQL 语句缓存（DBA 视角）」**——`/*oj:<形态>*/` 前缀在
+  `pg_stat_activity` / PG 日志 / `EXPLAIN` 里可见（勿误判为被篡改）、`toSQL()` 不含该前缀、
+  `statement-cache-capacity=512` 的由来、MySQL/SQLite 为何不打签名；
+  ④ MySQL 读侧列类型边界（`DECIMAL`/JSON/时间/`BIT`/`GEOMETRY` 报错而非静默 `null`、
+  `BOOLEAN` 读出 `1`/`0`）**补齐到 `SKILL.md` 陷阱速查与 `scenarios.md` 场景 7**（此前只在
+  `api-manual.md`）；⑤ `README.md` 的 api-manual 索引行补本版亮点并新增「版本同步要求」小节。
+  **同时把该要求固化为流程**（否则下次升级仍会漏）：`CHANGELIST.md` 顶部新增「版本分界提交的
+  固定动作」四条、`docs/devkit/README.md` 新增「版本同步要求」。`bin/devkit/` 已归置，
+  与 `docs/devkit/` 四件逐一 diff 一致（`cargo xtask build`；xtask devkit 契约用例 7/7 绿）。
+  纯文档改动、无代码与行为变更。
 
 ## v0.1.23（2026-09-19）
 
