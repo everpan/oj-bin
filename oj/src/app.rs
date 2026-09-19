@@ -399,7 +399,8 @@ async fn build_schema_and_modules(
                 }
                 // 共享表 = 显式 tenant:false 且列于 shared_allow 白名单（交集，fail-closed）。
                 let shared = !tenant_flag && shared_allow.iter().any(|a| a == t);
-                registry = registry.table_owned_shared(&name, t, &pk, &cols, shared);
+                // v0.1.24：带列类型装配（租户守卫按 tenant_id 列类型绑定数值/字符串）。
+                registry = registry.table_owned_shared_typed(&name, t, &pk, &cols, shared);
             }
             if gate == "auto" {
                 let acc = dbs
@@ -932,6 +933,7 @@ impl App {
         // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
         let stable = Arc::new(StableState {
             kv: kv.clone(),
+            seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             dbs: dbs.clone(),
             registry: Arc::new(registry),
             loader: Some(loader.clone()),

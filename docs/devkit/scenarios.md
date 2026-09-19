@@ -14,7 +14,7 @@
 | [4](#场景-4列表分页与-limit-陷阱) | 「怎么只返回了 100 条」——LIMIT 策略可配 + 截断可观测 | §3 数据层 / §6 db |
 | [5](#场景-5匿名路径怎么写) | `anonymous_paths` 的四种通配形态 + v0.1.20 收紧（**仅 auth 侧**）与 `one_layer` 消音 | §8 鉴权与多租户 |
 | [6](#场景-6多库项目按库迁移与对账) | config 多了命名库：`oj migrate/fixture/schema diff --db <name>` 逐库跑（v0.1.21） | §3 数据层 / §10 db |
-| [7](#场景-7雪花-id大整数的生成与回写) | 雪花 id 读出是字符串，`Number()` 会静默坍缩 → 主键 dup 500；范式 `toBigInt(m) + 1n`（v0.1.22） | §6 大整数与 i64 |
+| [7](#场景-7雪花-id大整数的生成与回写) | 取号优先 `db.nextSeq(name)`（v0.1.24，原子）；雪花 id 读出是字符串，`Number()` 会静默坍缩 → 主键 dup 500 | §6 大整数与 i64 |
 
 ---
 
@@ -461,7 +461,18 @@ CREATE TABLE seq (id bigint PRIMARY KEY, note text);
 INSERT INTO seq VALUES (4886674138783273204, 'seed');   -- 一个雪花量级起点
 ```
 
-### ② 代码（`max+1` 发号，最小改写）
+### ② 首选：平台序列（v0.1.24）
+
+新代码**直接用 `db.nextSeq(name)`** —— 单语句原子取号，并发下不会重号，也不需要你自己拿行锁：
+
+```ts
+const id = await db.nextSeq("issue_no");   // 1, 2, 3…；>2^53-1 时给十进制字符串
+```
+
+平台表 `_oj_sequences` 首次使用**自动建**（平台命名空间，业务不要手工读写/迁移）；在 `db.tx`
+内调用会搭车同一连接。序列值不随调用方事务回滚而回退（按「只增不复用」理解）。
+
+### ③ 自己维护业务序列表时（`max+1` 的最小改写）
 
 ```ts
 // ✗ 事故写法：Number() 把超界整数压到 f64 网格 → +1 被吸收 → 下次分配算同一个值 → dup 500
@@ -481,7 +492,7 @@ await db.query("select note from seq where id = ?", [toBigInt(idFromClient)]);  
 await db.query("select note from seq where id = ?", [idFromClient]);            // ✗ PG: bigint = text
 ```
 
-### ③ 验证
+### ④ 验证
 
 ```ts
 // 连续两次分配必须各自推进（并把"旧写法会坍缩"钉死）
@@ -491,7 +502,7 @@ expect(collapsed === Number(m)).toBe(true);          // +1 被 f64 吸收
 expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 ```
 
-### ④ 常见坑
+### ⑤ 常见坑
 
 | 现象 | 原因 |
 |---|---|
@@ -500,8 +511,9 @@ expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 | PG: `column "id" is of type bigint but expression is of type text` | 回写用了字符串——用 `toBigInt()`（字符串是文本意图，平台不做启发式转换） |
 | PG: `operator does not exist: bigint = text` | `where id = ?` 传了字符串——同上 |
 | `unsupported type`（`es`/`bus`/`mq`/`jwt`/`ws.sess.state`） | bigint 跨了不容忍的边界——先 `String(v)`（`json.*` / `log` / `mail` 已容忍） |
-| 并发下仍然分配出重复序号 | `max+1` 本身有竞态（与精度无关）——改数据库序列 / `RETURNING` / 行锁 + 唯一索引重试 |
-| 同一条 SQL 混用字符串/数字参数后报 `invalid byte sequence … 0x00` | PG prepared statement 缓存的既有隐患——保持参数形态稳定或换 SQL 文本 |
+| 并发下仍然分配出重复序号 | `max+1` 本身有竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子） |
+| 同一条 SQL 混用字符串/数字参数后报 `invalid byte sequence … 0x00` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**；若仍出现，检查 PG 插件是否随宿主重建 |
+| `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text 或换 MySQL `BIGINT UNSIGNED` |
 
 > 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
 

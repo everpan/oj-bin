@@ -131,6 +131,12 @@ impl super::db::TxSession for SqlxTx {
         let Some(tx) = g.as_mut() else {
             return Err("tx finished".into());
         };
+        // core 走 sqlx Any：Any 层根本没有 u64 的 Encode → `$oj$u64`（toUBigInt）在这里绑不了，
+        // 明确拒绝（勿静默坍缩成 f64；MySQL 的 u64 支持只在 oj-db-mysql 插件里）。
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -147,6 +153,10 @@ impl super::db::TxSession for SqlxTx {
         let Some(tx) = g.as_mut() else {
             return Err("tx finished".into());
         };
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -197,6 +207,10 @@ impl DataAccessor for SqlxAccessor {
     }
 
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -209,6 +223,10 @@ impl DataAccessor for SqlxAccessor {
     }
 
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -705,8 +723,12 @@ mod tests {
         // ① 写侧编码 + 读侧护栏：写进去的 i64 精确，读出来是字符串
         assert_eq!(v["data"]["r1"], json!("9007199254740993"));
         assert_eq!(v["data"]["r2"], json!("n"));
-        // ② toSQL().params 的超界整数同样是字符串（sanitize 覆盖 Qv::BigInt 路径）
-        assert_eq!(v["data"]["tsParam0"], json!("9007199254740993"));
+        // ② toSQL().params 的超界整数 v0.1.24 起是**标记**而不是十进制字符串——
+        //    这样 `db.query(toSQL().sql, ...toSQL().params)` 才能原样回跑（字符串会被绑成 text）。
+        assert_eq!(
+            v["data"]["tsParam0"],
+            json!({ "$oj$i64": "9007199254740993" })
+        );
         // ③ 快照往返后仍能精确命中
         assert_eq!(v["data"]["viaSnap"], json!("n"));
         // ④ having / CASE then 都被编码为标记（having 存的是整棵条件树）

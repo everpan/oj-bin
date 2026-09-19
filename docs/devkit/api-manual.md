@@ -599,7 +599,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
-| `toBigInt(v)` / `toDouble(v)` | **大整数转换**（v0.1.22）：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；见下「大整数与 i64」 |
+| `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
 ### json —— 信封与响应头
@@ -646,6 +646,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.query` | `query(sql: string, params?: unknown[]): Promise<Row[]>` | 参数化查询 → 行数组 |
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
+| `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）：单语句原子取号，`max+1` 竞态的终态；首次使用自动建平台表 `_oj_sequences`（**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持）；`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
 | `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
@@ -900,10 +901,16 @@ JS 的 `number` 只有 f64 精度（安全整数上界 **`2^53-1`**，约 900719
 
 - **`toBigInt(v): bigint`** —— 字符串/安全范围内的 number/bigint → 精确 64 位整数。
   **fail-loud**：`Number("<大整数串>")` 的产物、`1.5`、`"007"`、超 i64 等一律 **throw**。
+- **`toUBigInt(v): bigint`** —— 同上但为**无符号** 64 位 `[0, 2^64-1]`（v0.1.24）。
+  **只有 MySQL `BIGINT UNSIGNED` 列能承载**；PG / SQLite 传它会明确报错（它们的 bigint 就是
+  i64），请把这类值存成 text 或换库。跨 op 编码为 `{"$oj$u64":"<十进制>"}`。
 - **`toDouble(v): number`** —— 显式接受 f64（可能丢精度）。没有 `toFloat`（JS 无 f32 语义）。
 
 ```ts
-// ✅ 生成下一序号（max+1）——读出来是字符串，算完用 toBigInt 写回
+// ✅ 取号首选：平台序列（v0.1.24）——原子、并发安全，无需自己拿锁
+const id = await db.nextSeq("order_no");                    // 1, 2, 3…（超出 2^53-1 给字符串）
+
+// ✅ 需要自己维护一张业务序列表时（读出来是字符串，算完用 toBigInt 写回）
 const rows = await db.query("select max(id) as m from seq");
 const next = toBigInt(rows[0]?.m ?? "0") + 1n;
 await db.exec("insert into seq (id) values (?)", [next]);   // bigint → 精确绑定 i64
@@ -918,10 +925,18 @@ const seq = Number(rows[0].m) + 1;
   MySQL/SQLite 会隐式转换，但不要依赖方言差异。
 - `json.ok / json.raw / json.fail / log 字段 / mail` 容忍 bigint（自动出十进制字符串）；
   **`es` / `bus` / `mq` / `jwt` / `ws.sess.state` 不容忍**——跨这些边界先 `String(v)`。
-- `max+1` 并发下有竞态（会分配出相同序号），终态用序列/原子分配。
-- **保留键红线**：`$oj$` 前缀是平台内部线格式（`toBigInt()` 参数编码为
-  `{"$oj$i64":"<十进制>"}`）——业务 JSON 数据不得以 `$oj$i64` 之类的 `$oj$` 键为唯一键，
+- `max+1` 并发下有竞态（会分配出相同序号）——**用 `db.nextSeq(name)`**（v0.1.24）。
+  序列值不随调用方事务回滚而回退，按「只增不复用」理解；平台表 `_oj_sequences` 由平台自建自管，
+  业务不要手工读写或迁移它。
+- **保留键红线**：`$oj$` 前缀是平台内部线格式（`toBigInt()` 编码为 `{"$oj$i64":"<十进制>"}`，
+  `toUBigInt()` 为 `{"$oj$u64":"<十进制>"}`）——业务 JSON 数据不得以这类 `$oj$` 键为唯一键，
   否则在**参数位置**会被当作整数绑定。
+- **MySQL 读侧的列类型边界（v0.1.24 定稿，MySQL 用户必读）**：**可读** = 整数家族（含
+  `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`；
+  **其余一律报错**：`DECIMAL`/`NEWDECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、
+  `JSON`、`BIT`、`GEOMETRY`。报错会点名列名与 MySQL 类型并给指路，**不会静默变 `null`**。
+  需要读这些列时**在 SQL 里显式转换**：`select cast(amount as char) as amount from t`。
+  另：`BOOLEAN`/`TINYINT(1)` 读出的是 **`1`/`0`（number）**，不是 `true`/`false`。
 - 完整契约、判据表与排障见仓库 `docs/numeric-limits.md`；另见 `scenarios.md` 场景 7。
 
 ### kv / redis —— KV 存储
@@ -2153,9 +2168,12 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
+| `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |
+| `tenant guard: tenant id "acme" is not a valid integer for numeric column …`（v0.1.24） | `tenant_id` 列声明为 integer/bigint，但租户头不是十进制字面量；数值租户列请用数字租户 id，或把列改成 text |
 | i64 超界读出来是字符串，不是 number（v0.1.22） | `\|v\| > 2^53-1`（雪花 id 常态）按值域分流为十进制字符串——改过 `typeof id === "number"` 判断的代码要复查；回写用 `toBigInt()`，别用 `Number()`（会静默坍缩） |
 | `Number("<大整数串>")` 平台拦不住 | 语言语义，只能靠范式：`toBigInt(rows[0].m) + 1n`（`toBigInt` 对已坍缩的值会抛错） |
-| `u64` / `BIGINT UNSIGNED` 未支持 | 读侧对 `> i64::MAX` 的 u64 给十进制字符串（不回绕成负数），但全链路精确性不保证 |
+| `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持的类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）**报错而非给 `null`**；在 SQL 里显式转换：`select cast(x as char) as x from t`。不要用 `select *` 兜住这些列 |
+| MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` 而不是 `true`/`false`（v0.1.24） | MySQL 没有独立 boolean 类型（`BOOLEAN` 即 `TINYINT(1)`），协议层无列长度元数据可区分；按整数读。需要 boolean 语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
 | `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |

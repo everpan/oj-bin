@@ -74,7 +74,7 @@ tables:
     columns:
       id:    { type: integer }
       item:  { type: text }
-      tenant_id: { type: text }   # 必须，漏了启动/构建/迁移都会报错
+      tenant_id: { type: text }   # 必须；类型限 text/integer/bigint（v0.1.24 起数值列也支持）
 ```
 
 报错长这样，照着补列、或者把它声明成共享表（见下）：
@@ -201,6 +201,8 @@ export const get = async () => {
 | `tenant guard: update sets.tenant_id not allowed` | update 想把行迁到别的租户 | 删掉 sets 里的 tenant_id；跨租户迁移是系统操作，走 asSystem + 手工 SQL |
 | `raw sql lacks tenant_id on [t]` | 裸 SQL 查了租户表但完全没提 tenant_id | 补 `where tenant_id = ?`（参数传 `http.tenantId`）；或改用 `db.table()` 构造器 |
 | `schema: [m] 表 "t" 缺 tenant_id 列` | guard 开着但表声明没这列 | 补列；共享表则 `tenant: false` + `shared_allow` 双声明 |
+| `schema: [m] 表 "t" 的 tenant_id 类型 "double" 不受支持`（v0.1.24） | 声明期校验：`tenant_id` 只能是 text/integer/bigint | 改成受支持类型（数值租户 id 见下），或把该表声明为共享表 |
+| `tenant guard: tenant id "acme" is not a valid integer for numeric column t.tenant_id` | `tenant_id` 列是 integer/bigint，但租户头不是十进制字面量 | 数值租户列请用数字租户 id；或把该列改成 text（推荐雪花租户 id 存 text） |
 | `warn: ... 共享表声明 "x" 未列入 tenant.shared_allow` | 声明了共享但白名单没点名 | config 补 `tenant.shared_allow: [x]`；不补则该表按受约束处理 |
 | `warn: tenant.sql_guard ... 但 tenant.enable=false` | 开了防护但没开租户识别 | `tenant.enable: true`，或者关掉 sql_guard |
 | `db.asTenant: ...`（调用即抛） | 三道门禁没过：开关没开 / 请求不是匿名 / id 为空 | 依次核对 `tenant.allow_as_tenant: true`、路径在 `anonymous_paths` 且未带租户头、id 非空；同一请求只调一次 |

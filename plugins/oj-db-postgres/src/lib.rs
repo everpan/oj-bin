@@ -25,6 +25,56 @@ enum Dialect {
     Postgres,
 }
 
+/// 给 SQL **前置**参数形态签名（v0.1.24，债务①「同文本换参数类型 → 协议级错误」）。
+///
+/// **为什么在插件层而不是宿主**：这是 sqlx 驱动的缓存行为（key 只有 SQL 文本，命中后复用旧
+/// `param OIDs`），插件才是 sqlx 的拥有者；宿主不该知道驱动细节。且插件层是本插件的**单一
+/// 咽喉**（4 个执行点都在本文件），测试也能直接打 vtable 验证。
+///
+/// **形态字母表**：`t`=text/null（`None::<String>` 的 type_info 就是 TEXT，同理合键安全）、
+/// `i`=i64、`f`=f64、`b`=bool、`m`=`$oj$i64` 标记、`u`=`$oj$u64` 标记。
+///
+/// **必须前置**：`…; /*sig*/` 后置在 PG 扩展协议下会被判「多语句」（`cannot insert multiple
+/// commands into a prepared statement`），SQL 以 `--` 行注释结尾时签名还会被吞掉。前置块注释
+/// PG 词法层接受（已用 `PREPARE … AS /*oj:i*/ …` 实测）。`toSQL()` 不进本函数 → 用户可见
+/// 的 SQL 保持干净；DBA 视角会看到前缀（见 `docs/numeric-limits.md` §4.5）。
+///
+/// **MySQL 不需要**：它每次 execute 都重发参数类型（`new_params_bound_flag=1`），病不在同一处；
+/// SQLite 无声明参数类型。二者都不做。
+fn shape_tag(sql: &str, params: &[serde_json::Value]) -> String {
+    if params.is_empty() {
+        return sql.to_string();
+    }
+    let mut sig = String::with_capacity(params.len());
+    for p in params {
+        sig.push(match p {
+            serde_json::Value::Null | serde_json::Value::String(_) => 't',
+            serde_json::Value::Bool(_) => 'b',
+            serde_json::Value::Number(n) => {
+                if n.as_i64().is_some() {
+                    'i'
+                } else {
+                    'f'
+                }
+            }
+            other => {
+                if oj_plugin_ffi::jsint::marker_i64(other).is_some() {
+                    'm'
+                } else if oj_plugin_ffi::jsint::marker_u64(other).is_some() {
+                    // 当前**不可达**：4 个执行点都先跑 `reject_u64_markers`（PG 的 bigint 就是 i64，
+                    // 绑不了 u64）。保留分支是为了「万一 reject 被挪到后面」时缓存键仍然区分得开；
+                    // 若真要放开 u64，必须同步给 PG 侧 `bind_value` 加对应绑定（现在没有）。
+                    'u'
+                } else {
+                    // 其余对象/数组在 bind_value 里走 `to_string()` 落成文本。
+                    't'
+                }
+            }
+        });
+    }
+    format!("/*oj:{sig}*/{sql}")
+}
+
 fn dialect_of(dsn: &str) -> Dialect {
     if dsn.starts_with("mysql://") {
         Dialect::MySql
@@ -33,6 +83,26 @@ fn dialect_of(dsn: &str) -> Dialect {
     } else {
         Dialect::Sqlite
     }
+}
+
+/// 给 PG DSN 补 sqlx 的 `statement-cache-capacity`（仅在未显式设置时）。
+///
+/// 背景（v0.1.24 债务①）：宿主在 PG 方言下给 SQL 前置参数形态签名（`/*oj:<形态>*/`），
+/// 于是「一条 SQL × 若干参数形态」各自成为缓存条目。默认容量 100 在这种乘性增长下会频繁
+/// LRU 淘汰，而**淘汰要发 `Close` + `Sync` 并等回包**（多一次往返）。512 留出余量，又不至于
+/// 让服务端 prepared statement 无界堆积；用户显式写了该参数则以用户为准。
+///
+/// 只对 `postgres://` / `postgresql://` 生效：本插件的离线测试走 sqlite DSN，sqlite 的
+/// DSN 解析器会拒绝未知 query 参数（`unknown query parameter …`）。
+fn with_stmt_cache_capacity(dsn: &str, cap: u32) -> String {
+    if !(dsn.starts_with("postgres://") || dsn.starts_with("postgresql://")) {
+        return dsn.to_string();
+    }
+    if dsn.contains("statement-cache-capacity") {
+        return dsn.to_string();
+    }
+    let sep = if dsn.contains('?') { '&' } else { '?' };
+    format!("{dsn}{sep}statement-cache-capacity={cap}")
 }
 
 fn dialect_str(d: Dialect) -> &'static str {
@@ -144,7 +214,7 @@ impl Client {
     async fn connect(dsn: &str) -> Result<Self, String> {
         sqlx::any::install_default_drivers();
         let pool = PoolOptions::<Any>::new()
-            .connect(dsn)
+            .connect(&with_stmt_cache_capacity(dsn, 512))
             .await
             .map_err(|e| format!("db connect: {e}"))?;
         Ok(Self {
@@ -156,6 +226,12 @@ impl Client {
     }
 
     async fn query(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+        // PG 的 bigint 即 i64：`$oj$u64`（toUBigInt）装不下 → 明确拒绝，勿静默坍缩。
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
+        )?;
+        let sql = shape_tag(sql, params);
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -169,6 +245,11 @@ impl Client {
     }
 
     async fn exec(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
+        )?;
+        let sql = shape_tag(sql, params);
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -217,6 +298,11 @@ impl Client {
         let Some(t) = g.as_mut() else {
             return Err("tx finished".into());
         };
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
+        )?;
+        let sql = shape_tag(sql, params);
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -240,6 +326,11 @@ impl Client {
         let Some(t) = g.as_mut() else {
             return Err("tx finished".into());
         };
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
+        )?;
+        let sql = shape_tag(sql, params);
         let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
@@ -886,6 +977,225 @@ mod tests {
         assert_eq!(v[0]["note"], serde_json::json!("tx"), "{v}");
 
         ex("drop table if exists oj_bigint_t", "[]").await.unwrap();
+        close(handle);
+    }
+
+    /// 债①回归（env-gated）：**同一条 SQL 文本**在不同调用里绑不同 Rust 类型的参数。
+    ///
+    /// 根因：sqlx 的语句缓存只以 SQL 文本为 key（不含参数类型），PG 命中缓存时直接复用旧的
+    /// `(StatementId, param OIDs)`，Bind 却按本次 Rust 类型编码字节 → 协议级错误
+    /// （`insufficient data left in message` / `invalid byte sequence … 0x00`）。
+    ///
+    /// 期望终态（v0.1.24 起宿主在 PG 方言下给 SQL 前置形态签名 `/*oj:<形态>*/`，不同参数形态
+    /// 落到不同缓存条目）：**两个形态都能跑通**。修前本用例必红——它是债①的验收基线。
+    ///
+    /// 用 **text 列**做混形态载体：`insert … (k, v) values ($1, $2)` 传 `("a","x")` 与 `(1,2)`
+    /// 在 PG 上都合法（int8 → text 有赋值转换），差别只在参数形态——正是缓存 bug 的触发面。
+    /// bigint 列不能当载体：字符串参数写 bigint 列本来就会被 PG 拒（那是另一条既有契约，
+    /// 见 `real_postgres_bigint_marker_binds_i64` ③）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_postgres_same_sql_text_mixed_param_shapes() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let desc = match std::result::Result::from(init(host(), RString::from(cfg.as_str()))) {
+            Ok(d) => d,
+            Err(e) => panic!("init failed: {}", &e[..]),
+        };
+        assert_eq!(&desc.name[..], "db-postgres");
+
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        drive(&mut exec(
+            handle,
+            RString::from("drop table if exists oj_shape_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("drop");
+        drive(&mut exec(
+            handle,
+            RString::from("create table if not exists oj_shape_t (k text primary key, v text)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("create");
+
+        // ---- 池路径：同一文本两种形态（t,t）→（i,i）----
+        let ins = "insert into oj_shape_t (k, v) values ($1, $2)";
+        drive(&mut exec(
+            handle,
+            RString::from(ins),
+            RString::from(r#"["a","x"]"#),
+        ))
+        .await
+        .expect("池路径 text 形态（首次会 PARSE 并缓存该文本）");
+        drive(&mut exec(
+            handle,
+            RString::from("insert into oj_shape_t (k, v) values ($1, $2)"),
+            RString::from(r#"[1,2]"#),
+        ))
+        .await
+        .expect("池路径 i64 形态（修前这里报 insufficient data left in message）");
+
+        // ---- tx 路径：同一文本反序再来一次（i,i → t,t），并在 tx 内数缓存条目 ----
+        // tx 独占一条连接，故 `pg_prepared_statements` 的计数是确定的（池路径会分散到多连接）。
+        let bytes = drive(&mut begin(handle)).await.expect("begin");
+        let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        drive(&mut tx_exec(
+            handle,
+            tx_id,
+            RString::from("insert into oj_shape_t (k, v) values ($1, $2)"),
+            RString::from(r#"[3,4]"#),
+        ))
+        .await
+        .expect("tx 路径 i64 形态");
+        drive(&mut tx_exec(
+            handle,
+            tx_id,
+            RString::from("insert into oj_shape_t (k, v) values ($1, $2)"),
+            RString::from(r#"["b","y"]"#),
+        ))
+        .await
+        .expect("tx 路径 text 形态（与上一条同文本、不同形态）");
+        // 同一文本的三种形态 = 三个缓存条目（形态分键生效），且都带 `/*oj:` 前缀。
+        let rows = drive(&mut tx_query(
+            handle,
+            tx_id,
+            RString::from(
+                "select count(*)::int as n from pg_prepared_statements \
+                 where statement like '/*oj:%' and statement like '%oj_shape_t%'",
+            ),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("count prepared");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        assert!(
+            v[0]["n"].as_i64().unwrap_or(0) >= 2,
+            "同一条 SQL 文本的不同参数形态必须各占一个缓存条目（形态分键）：{v}"
+        );
+        drive(&mut tx_commit(handle, tx_id)).await.expect("commit");
+
+        // ---- 结果正确性：四个形态写进去的行都在 ----
+        let rows = drive(&mut query(
+            handle,
+            RString::from("select count(*)::int as n from oj_shape_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("count rows");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        assert_eq!(v[0]["n"], serde_json::json!(4), "四种形态都应落库：{v}");
+
+        drive(&mut exec(
+            handle,
+            RString::from("drop table if exists oj_shape_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("cleanup");
+        close(handle);
+    }
+
+    /// 并发驱动多个 FfiFuture（FfiFuture 非 Send，不能 `tokio::spawn`）：在单个任务里
+    /// 轮询全部——**调度已在插件 runtime 上并行开始**，故这就是真并发。
+    async fn drive_all(futs: &mut [FfiFuture]) -> Vec<Result<Vec<u8>, String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut out: Vec<Option<Result<Vec<u8>, String>>> = (0..futs.len()).map(|_| None).collect();
+        let mut left = futs.len();
+        while left > 0 {
+            for (i, fut) in futs.iter_mut().enumerate() {
+                if out[i].is_some() {
+                    continue;
+                }
+                if (fut.poll)(fut.state) == 0 {
+                    if std::time::Instant::now() >= deadline {
+                        for slot in out.iter_mut() {
+                            if slot.is_none() {
+                                *slot = Some(Err("ffi drive timeout".into()));
+                            }
+                        }
+                        left = 0;
+                        break;
+                    }
+                    continue;
+                }
+                let r = (fut.take)(fut.state);
+                (fut.free)(fut.state);
+                fut.state = std::ptr::null_mut();
+                out[i] = Some(match (1, std::result::Result::from(r)) {
+                    (_, Err(e)) => Err(e[..].to_string()),
+                    (_, Ok(b)) => Ok(b.iter().copied().collect()),
+                });
+                left -= 1;
+            }
+            if left > 0 {
+                tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+            }
+        }
+        out.into_iter().flatten().collect()
+    }
+
+    /// 债④回归（env-gated）：平台序列的单语句原子取号在**真库并发**下无重号、无空洞。
+    ///
+    /// 走的正是 `db.nextSeq` 在 PG 上的那条 SQL（`on conflict … do update … returning v`）；
+    /// 20 个调用在插件 runtime 上并行发起，断言排序后恰为 1..20——`select max(id)+1` 做不到。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_postgres_next_seq_is_atomic_under_concurrency() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = std::result::Result::from(init(host(), RString::from(cfg.as_str())));
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let ex = |sql: &str, params: &str| {
+            let mut f = exec(handle, RString::from(sql), RString::from(params));
+            async move { drive(&mut f).await }
+        };
+
+        ex("drop table if exists _oj_sequences", "[]")
+            .await
+            .unwrap();
+        ex(
+            "create table _oj_sequences (name text primary key, v bigint not null)",
+            "[]",
+        )
+        .await
+        .expect("create seq table");
+
+        let sql = "insert into _oj_sequences (name, v) values ($1, 1) \
+                   on conflict (name) do update set v = _oj_sequences.v + 1 returning v";
+        let mut futs: Vec<FfiFuture> = (0..20)
+            .map(|_| query(handle, RString::from(sql), RString::from(r#"["conc"]"#)))
+            .collect();
+        let outs = drive_all(&mut futs).await;
+        let mut vs: Vec<i64> = Vec::new();
+        for o in outs {
+            let rows = o.expect("并发取号应成功");
+            let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+            let n = v[0]["v"].as_i64().expect("v 应是整数");
+            vs.push(n);
+        }
+        vs.sort_unstable();
+        assert_eq!(vs, (1..=20).collect::<Vec<i64>>(), "并发取号必须稠密无重复");
+
+        ex("drop table if exists _oj_sequences", "[]")
+            .await
+            .unwrap();
         close(handle);
     }
 

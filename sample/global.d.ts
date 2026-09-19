@@ -99,6 +99,9 @@ interface DBInstance {
   // 另：请求级且**只能调用一次**（已带租户头的请求、或同一请求内二次调用 → 抛错，防运行期
   // 切换身份）；生效后 `http.tenantId` 即该值，并记一条审计日志。
   // 红线：id 必须服务端派生，**绝不可**直接取请求参数（否则等于把租户交给调用方）。
+  /** 平台序列分配（v0.1.24）：单语句原子取号，`max+1` 竞态的终态。
+   * 首次使用自动建平台表 `_oj_sequences`；返回值 ≤2^53-1 是 number，超出是十进制字符串。 */
+  nextSeq(name: string): Promise<number | string>;
   asTenant(id: string): DBInstance;
   // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
   // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
@@ -362,12 +365,15 @@ declare global {
   const oidc: OidcApi;
   const bcrypt: BcryptApi;
 
-  // ---- 大整数（v0.1.22；详见 docs/numeric-limits.md）----
+  // ---- 大整数（v0.1.22；u64 见 v0.1.24；详见 docs/numeric-limits.md）----
   // DB 的 i64 超出安全整数范围（|v| > 2^53-1，雪花 id 常态）时，读出来是**十进制字符串**；
   // 写回去必须用 toBigInt()（字符串是文本意图，PG 上写 bigint 列会直接报错）。
   // 两者都 fail-loud：非规范十进制 / 已坍缩的 number 一律抛错，不静默取近似。
-  /** 十进制整数字符串 | 安全范围内的 number | bigint → bigint（精确 64 位）。 */
+  /** 十进制整数字符串 | 安全范围内的 number | bigint → bigint（精确 64 位，范围 [-2^63, 2^63-1]）。 */
   function toBigInt(v: string | number | bigint): bigint;
+  /** 同上但为**无符号** 64 位 `[0, 2^64-1]`：只有 MySQL `BIGINT UNSIGNED` 列能承载，
+   * PG / SQLite 传本值会**明确报错**（它们的 bigint 就是 i64）。 */
+  function toUBigInt(v: string | number | bigint): bigint;
   /** number | 数字串（含科学计数法）| bigint → number（f64，**显式接受精度丢失**）。 */
   function toDouble(v: string | number | bigint): number;
 

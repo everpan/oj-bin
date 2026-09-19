@@ -4,12 +4,12 @@
 > 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-guide.md` §13 与
 > `docs/plugin-development.md`，注册机制见下方 §0。
 
-## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 7）
+## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 8）
 
 - **加载**：宿主启动期 `dlopen` 插件 cdylib（`src/bridge/plugin_loader.rs`，句柄进程期存活，
   不 dlclose）。
 - **探测流程**：
-  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **7**）
+  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **8**）
      **严格相等**才继续；不等 → fail fast（指纹不符仅告警）。
   2. **init**——调 `oj_plugin_init(host, cfg)`（宏内 `catch_unwind` 收敛 panic 为
      `RResult::Err`），插件建立 runtime/单例状态并返回 `PluginDescriptor`
@@ -18,6 +18,10 @@
      `dlsym("oj_plugin_axis_<axis>")`：查到符号 → 取静态 vtable 指针填入
      `Registrations` 对应槽位；**缺符号 = 不提供该轴**（`None`）。因此**加轴零破坏**：
      既有轴 vtable 形状不变就不需要 bump ABI。
+     **但「不 bump ABI」不等于「可以混跑版本」**：跨边界传递的**线形状**（如 `toBigInt()` 的
+     `{"$oj$i64":…}`、v0.1.24 起的 `{"$oj$u64":…}`）是源码级共享约定，旧插件不认识新标记时
+     会把它串化成文本（静默错值）。**宿主与第一方插件必须同批重建发布**；升级二进制时
+     `bin/plugins/` 一并替换。
 - **自描述收集与查询端点**：装配层把每个插件的 descriptor 转成
   `PluginInfo { name, semver, abi_version, fingerprint, description, host_abi_version }`
   存入 `AppState.plugins`，经公共端点 **`GET {base}/plugins`** 返回清单（ok 信封），

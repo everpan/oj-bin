@@ -69,6 +69,18 @@ deno_ast = { version = "0.53.3", features = ["transpiling"] }
 object_store = { version = "0.14.1", features = ["aws"] }
 
 [dev-dependencies]
+# env-gated 真库用例需要具体驱动：`src/bridge/db.rs` 的 `next_seq_first_use_inside_tx_on_real_db`
+# 等 core 级用例直连真库（走 `SqlxAccessor`）。**dev-only**，生产构建不受影响——生产路径的
+# PG/MySQL 都由 oj-db-* 插件承载（见 src/bridge/db_backend.rs），core 只服务 sqlite/memory。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "any",
+    "sqlite",
+    "postgres",
+    "mysql",
+    # MySQL 8 默认 caching_sha2_password → 明文连接需要 RSA 公钥交换。
+    "mysql-rsa",
+] }
 criterion = "0.8.2"
 rand = "0.10.2"
 oj = { path = "oj" }
