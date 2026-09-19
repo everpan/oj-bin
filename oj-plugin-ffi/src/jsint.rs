@@ -18,20 +18,63 @@ use serde_json::Value;
 /// 大整数参数的保留键（`toBigInt()` 的返回值跨 op 时的编码形状）。
 pub const I64_MARKER: &str = "$oj$i64";
 
+/// 无符号 64 位参数的保留键（v0.1.24，`toUBigInt()` 的返回值跨 op 时的编码形状）。
+///
+/// 为什么需要独立标记：`$oj$i64` 绑 i64，`(i64::MAX, u64::MAX]` 的值装不进去；而 MySQL 的
+/// `BIGINT UNSIGNED` 列正是这一段值域。语义分派由宿主/插件按方言做——
+/// - MySQL：绑 `u64`（`sqlx-mysql` 原生支持，且是唯一能精确承载 unsigned 的方言）；
+/// - PG / SQLite：bigint 就是 i64，遇到本标记**明确报错**（而不是静默坍缩/回绕）。
+///
+/// 与 `I64_MARKER` 一样属**源码级共享**（不在任何 `#[repr(C)]` 结构里）→ 新增标记不 bump
+/// `ABI_VERSION`。代价：旧插件遇到本标记会走 `bind_value` 的 `other => to_string()` 落成文本，
+/// 故**插件须与宿主同批重建**。
+pub const U64_MARKER: &str = "$oj$u64";
+
 /// 解码 i64 标记：严格识别「单键对象 + 规范十进制字面量 + 落在 i64 范围内」。
 ///
 /// 严格性的用意是**把误伤面压到最小**：多键对象、非十进制（`"1.0"` / `"+1"` / `" 1"` /
 /// `"1e3"`）、前导零（`"007"`）、超出 i64 的值一律返回 `None`（按普通值处理，不绑定为整数）。
 pub fn marker_i64(v: &Value) -> Option<i64> {
+    let s = marker_str(v, I64_MARKER)?;
+    s.parse::<i64>().ok()
+}
+
+/// 解码 u64 标记：判据同 `marker_i64`，范围放宽到 `u64`。
+///
+/// 注意 (i64::MAX, u64::MAX] 这一段**只有** u64 标记能承载：`$oj$i64` 的值域判定会让它落回
+/// `None`（按普通值处理），故两者是互斥的、不会互相误认。
+pub fn marker_u64(v: &Value) -> Option<u64> {
+    let s = marker_str(v, U64_MARKER)?;
+    s.parse::<u64>().ok()
+}
+
+/// 取标记对象里的十进制串（单键 + 规范十进制），不做范围判定——范围由各 `marker_*` 决定。
+fn marker_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     let obj = v.as_object()?;
     if obj.len() != 1 {
         return None;
     }
-    let s = obj.get(I64_MARKER)?.as_str()?;
+    let s = obj.get(key)?.as_str()?;
     if !is_canonical_decimal(s) {
         return None;
     }
-    s.parse::<i64>().ok()
+    Some(s)
+}
+
+/// 明确拒绝 `$oj$u64` 参数（方言/驱动不支持精确 u64 时），`why` 给出出路。
+///
+/// 为什么单独扫一遍而不在 `bind_value` 里判：`bind_value` 的形态是「`Query` 进 `Query` 出」，
+/// 加 `Result` 会改动 4 个执行点的签名；预扫描只在这几处调用一次，改动面更小。
+/// 返回 `Err` 而不是静默坍缩/落成文本——本仓的既定纪律是「宁可 fail loud，不可静默错值」。
+pub fn reject_u64_markers(params: &[Value], why: &str) -> Result<(), String> {
+    for p in params {
+        if let Some(u) = marker_u64(p) {
+            return Err(format!(
+                "db param: u64 value {u} is not supported on this path — {why}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 规范十进制整数串：可带一个负号，无前导零（`"0"` 本身除外），无 `-0`。
@@ -99,5 +142,37 @@ mod tests {
         assert_eq!(marker_i64(&json!("$oj$i64")), None);
         assert_eq!(marker_i64(&json!({ "$oj$i64": "1", "x": 2 })), None);
         assert_eq!(marker_i64(&json!({ "other": "1" })), None);
+    }
+
+    #[test]
+    fn decodes_u64_marker_and_stays_disjoint_from_i64() {
+        assert_eq!(marker_u64(&json!({ "$oj$u64": "0" })), Some(0));
+        assert_eq!(
+            marker_u64(&json!({ "$oj$u64": "9223372036854775808" })),
+            Some(9223372036854775808)
+        );
+        assert_eq!(
+            marker_u64(&json!({ "$oj$u64": "18446744073709551615" })),
+            Some(u64::MAX)
+        );
+        // 越 u64 / 负号（u64 标记不接受负数）
+        assert_eq!(
+            marker_u64(&json!({ "$oj$u64": "18446744073709551616" })),
+            None
+        );
+        assert_eq!(marker_u64(&json!({ "$oj$u64": "-1" })), None);
+        // 规范性同 i64：非十进制 / 前导零 / 多键 / 非单键对象一律不认
+        for bad in ["1.0", "+1", " 1", "007", "abc"] {
+            assert_eq!(marker_u64(&json!({ "$oj$u64": bad })), None, "{bad:?}");
+        }
+        assert_eq!(marker_u64(&json!({ "$oj$u64": "1", "x": 2 })), None);
+        assert_eq!(marker_u64(&json!({ "$oj$i64": "1" })), None);
+        // 两个标记互不误认（键名不同 + 值域判定各自独立）
+        assert_eq!(marker_i64(&json!({ "$oj$u64": "1" })), None);
+        assert_eq!(marker_u64(&json!({ "$oj$i64": "1" })), None);
+        assert_eq!(
+            marker_u64(&json!({ "$oj$i64": "9223372036854775808" })),
+            None
+        );
     }
 }

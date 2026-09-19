@@ -7,6 +7,124 @@
 > v0.1.23 已发版：标签 `v0.1.23` → `039b314`（含双专家评审处置）。本节收录其后落在 `main`
 > 上的改动；版本号在发版点（`oj/Cargo.toml` 递增提交）确定。
 
+**清账：v0.1.22「已知债 / 另案登记」五条**
+
+设计与逐条证据见 `docs/superpowers/specs/2026-09-19-debt-clearing-v0.1.22-design.md`。
+
+1. **PG 语句缓存 × 混合参数类型（债①）——已修**。根因复核：sqlx 的语句缓存 key **只是 SQL
+   文本**（`statement_cache.rs` 的 `LruCache<String,_>`），PG 执行路径**无条件查缓存**并把旧的
+   `param OIDs` 复用到本次 Bind → 同文本换参数 Rust 类型即协议级错误（真库实测
+   `insufficient data left in message`）。修法：**按参数形态分缓存键**——PG 插件（`shape_tag`，
+   4 个执行点）给 SQL **前置**块注释 `/*oj:<形态>*/`（形态字母表 `t/i/f/b/m/u`；必须前置，
+   后置会被 PG 判多语句或被 `--` 注释吞掉），并给 PG 连接补
+   `statement-cache-capacity=512`（分键后条目数 ×形态数，防 LRU 抖动触发 Close+Sync 往返）。
+   **MySQL 不动**：复核其每次 execute 都重发参数类型（`new_params_bound_flag=1`），病不在此。
+   验收：env-gated 真库用例 `real_postgres_same_sql_text_mixed_param_shapes`（改前必红 → 现绿，
+   含池路径/tx 路径/缓存条目数断言）。
+2. **u64 / `BIGINT UNSIGNED` 全链路（债②）——已修**。新增线形状 `{"$oj$u64":"<十进制>"}`
+   （`oj-plugin-ffi::jsint`，**不 bump ABI**，但**插件须与宿主同批重建**）与 JS 全局
+   `toUBigInt(v)`（`[0, 2^64-1]`，越界 RangeError）；`toBigInt` 对越 i64 的 bigint 改为明确报错
+   并指路 `toUBigInt`。MySQL 插件迁到 **typed 路径**（`Pooled` 枚举：`mysql://` → `sqlx::MySql`，
+   离线测试仍走 `Any`+sqlite 保 CI 覆盖），行解码改为**固定安全顺序**
+   `u64 → i64 → bool → f64 → String → bytes`（`bool::compatible`/`f64::compatible` 都接受整型，
+   顺序反了会把 BIGINT 读成 bool）；**读侧不再回绕成负数**。PG/SQLite 对 `$oj$u64` **明确拒绝**
+   （bigint 就是 i64）。顺带修一处既有漏洞：`toSQL().params` 的超界整数改为回吐 marker
+   （此前被出口护栏降成字符串 → 用户照文档「回放 params」必失败）。
+   **顺带修真实缺口**：MySQL 8 默认 `caching_sha2_password`，明文连接需 sqlx 的 `mysql-rsa`
+   feature——缺它插件**连不上任何 stock MySQL 8**（本机 8.4 实测报
+   `RSA auth backend disabled`），已补。
+   验收：`real_mysql_unsigned_bigint_roundtrips_as_u64`（`u64::MAX` 与 `i64::MAX+1` 精确往返）。
+3. **数值型 `tenant_id` 列（债③）——已从「不支持」变为支持**。列类型从 schema.yaml plumb 到
+   `SchemaRegistry`（`ColumnType`，旧构造器默认 `Unknown` = 旧行为）；`apply_tenant` 按列类型
+   生成绑定值（text/Unknown → 字符串；integer/bigint → 数值，超 i64 用 `$oj$u64`；非十进制租户头
+   → 指名报错），insert/update 的等值判定改走 `guard::param_is_tenant`（字符串/数字/i64 标记/
+   u64 标记四形态），join 的 ON 条件同型。**新增声明期 fail-fast**：`tenant_id` 列类型 ∉
+   {text,integer,bigint} → 启动报错（数值列上的 `bigint = text` 不再等到运行期）。
+4. **内建序列分配原语（债④）——已做**：`db.nextSeq(name)`（`DBInstance` 与 `db.tx` 内均可）。
+   平台表 `_oj_sequences(name, v)` 首次使用自动建（不经模块 schema/迁移）；取号**单语句原子**：
+   PG/SQLite `insert … on conflict(name) do update set v = v+1 returning v`；MySQL
+   `insert … values (?, last_insert_id(1)) on duplicate key update v = last_insert_id(v+1)`
+   再 `select last_insert_id()`（必须同连接 → 无活跃事务时宿主用一次短事务）。返回值过 `jsnum`
+   规则（≤2^53-1 给 number，超出给十进制字符串）。**这是 `select max(id)+1` 竞态的终态**。
+   验收：离线 sqlite（稠密/并发/名称校验/事务搭车）+ PG 真库 20 并发（断言恰为 1..20）
+   + MySQL 真库（顺序 1..3 + 12 并发无丢失更新）。
+5. **MySQL 侧真库验证（债⑤）——已执行**。「本机拉不到镜像」的前提已消失：用 macOS `container`
+   CLI 起 `mysql:8.4`（4C/1G，专用库 `oj_test`），MySQL 插件的全部 env-gated 用例首次实跑并全绿
+   （roundtrip / i64 marker / u64 unsigned / 序列原子性）。同批实跑：PG 18 全绿、Redis 全绿。
+   **未跑**：Kafka（9092 未起）、S3（poc-minio 缺预建桶与凭据，需 `mc mb` 先建
+   `oj-test` 桶）、RabbitMQ（`guest` 仅 loopback，`poc` 用户需在容器内自建；本轮未做）。
+
+**兼容性 / 行为变更（升级前请核对）**
+
+1. **`toSQL().params` 的超界整数由「十进制字符串」改回 **marker**（可重放）**：此前该值被出口
+   护栏降成字符串，导致文档教的「`db.query(toSQL().sql, ...toSQL().params)` 回放」必然失败
+   （`bigint = text`）。现在 `>2^53-1` 的整数以 `{"$oj$i64":…}` / `{"$oj$u64":…}` 形式出现——
+   比较 params 文本的代码需留意。
+2. **`tenant_id` 非法列类型由「运行期 PG 报错」变为「启动期报错」**：`tenant_id` 只能是
+   text/integer/bigint（`double`/`boolean`/`blob` 直接 fail-fast）。
+3. **MySQL 行 JSON 形状随 typed 迁移改变**：整数列统一给 number（Any 时代部分类型落到字符串/
+   字节）；`BIGINT UNSIGNED > i64::MAX` 由**回绕成负数**改为精确值（出口护栏再把 `>2^53-1`
+   降成十进制字符串）。
+4. **`toBigInt` 对越 i64 的 bigint 由「静默返回」改为明确报错**（指路 `toUBigInt`）。
+5. **PG 实际执行的 SQL 文本带 `/*oj:<形态>*/` 前缀**（DBA 视角可见；`toSQL()` 不含）。
+6. **宿主与第一方插件必须同批重建**：`$oj$u64` 是源码级共享的线形状，不 bump ABI，但旧插件会把
+   新标记串化成文本。**混版本不受支持**（复现门槛低，见下方挂账的线形状门禁）。
+7. **核心 crate 的 `[dev-dependencies]` 增 sqlx pg/mysql 驱动**（仅测试构建；core 级真库用例用）。
+8. **MySQL 读侧的列类型边界（本批定稿）**：**可读** = 整数家族（含 `BIGINT UNSIGNED` → u64）、
+   文本家族（`TEXT` 在 MySQL 协议里就是 `Blob` + 非 BINARY collation）、二进制、`FLOAT`/`DOUBLE`；
+   **不可读** = `DECIMAL`/`NEWDECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、`JSON`、
+   `BIT`、`GEOMETRY` → **报错**（点名列名 + MySQL 类型 + 指路 `cast(x as char)`），**绝不静默
+   `null`**。对照 v0.1.23（全程 `sqlx::Any`）：这些类型当时同样读不出来，但错误是 sqlx 的
+   `AnyDriverError`（不点名列）；且 `TINYINT`/`BOOLEAN` 当时**直接报错**，现在按整数读出 **`1`/`0`**
+   （`BOOLEAN` 是 `TINYINT(1)` 的别名——**不是** `true`/`false`，本批无类型长度元数据可区分）。
+9. **数值型 `tenant_id` 列在 `tenant.sql_guard: warn` 下也会硬失败**：租户头不是十进制整数时
+   `tenant_value` 直接 `Err`（warn 模式只放行「无法判定」的情形，不放行「判定为不匹配」）；
+   `text` 列的旧行为不变。注意这与「warn = 只告警」的直觉不同。
+10. **`update({tenant_id: …})` 的等值判定改走 `param_is_tenant`**：text 列 + 数字租户头
+    （如租户 `"7"`、字段写 `7`）由**拒绝**变为**放行**（放宽；两者语义等价）。
+
+**新登记债务（清账过程中发现）**
+
+- **deno_core op 驱动在并发等待时 `RefCell already borrowed` → abort 进程（既有，非本次引入）**：
+  触发条件至少两种——① JS 侧同时发起的 op 数**超过 sqlx 池上限**（默认 10）；
+  ② **在 JS 里 `await` 之后再发起 op**。复现（真库，非推测）：核心 accessor 连 PG 后
+  `Promise.all` 发 16 个 `db.query("select 1")` → `op_driver/futures_unordered_driver.rs:309`
+  panic 且 `panic in a function that cannot unwind` → SIGABRT（**整个进程挂掉，不只是该请求失败**）。
+  与本次新增的 `db.nextSeq` 无关（`db.query` 同样复现）；10 并发以内、单轮发起时正常。
+  本轮的 `db.nextSeq` 真库并发用例因此改由**插件层**驱动（`plugins/oj-db-*`），core 侧只留
+  ≤8 并发的离线用例。**需专项处理**（要么在 op 包装层串行化/限流，要么查 deno_core 0.411 的
+  op 驱动用法）。
+
+- **线形状版本门禁缺失（架构评审 P1-1，本轮只登记）**：`$oj$u64` 这类跨边界线形状没有独立版本号，
+  `HOST_FINGERPRINT` 不含它、且指纹不符**只告警不 fail**（`src/bridge/plugin_loader.rs`）→
+  「宿主换新、插件留旧」不会被拦。建议后续引入单调递增的 `WIRE_VERSION`（可塞进 descriptor 字符串
+  字段以免 bump repr(C)）并对它做**硬门禁**；本轮以文档纪律（§兼容性第 6 条 + `plugin-architecture.md`）
+  替代，混版本明确不受支持。**本轮已做的最小缓解**：`oj-plugin-ffi` 版本 `0.1.0 → 0.1.1`
+  （`HOST_FINGERPRINT` 含该版本号）——旧插件（用 0.1.0 构建）在新宿主上至少会打一条
+  `fingerprint mismatch` 告警，把「静默混版本」变成可见信号。
+- **MySQL 非整数/非文本列的读出（原 R3 的一部分，本轮只登记）**：`DECIMAL`/`JSON`/时间/`BIT`/
+  `GEOMETRY` 目前**报错而非解码**（见 §兼容性第 8 条）。彻底修需要按 `MySqlTypeInfo` 做显式分派表
+  （每种 MySQL 类型的期望 JSON 形状：`DECIMAL` → 十进制字符串、`JSON` → 对象、时间 → 字符串…），
+  属独立设计，本轮先保证「不静默错值」。
+- **单连接 accessor 在活跃事务期间池上发 DDL 会等锁超时（既有性质）**：`sqlite`（`max_connections(1)`，
+  见 `accessor_sqlx.rs`）上，`db.nextSeq` **首次**在 `db.tx` 内使用会挂住——因为 `ensure_seq_once`
+  的 DDL 必须走池，而池的唯一连接被调用方事务持有。PG/MySQL（池 ≥2）无此问题。这是 1 连接
+  accessor 的通用性质（任何「事务内还去池上取连接」的路径都一样），非 `nextSeq` 引入；
+  登记备查，未修。
+- **真库验收不在 CI（架构评审 P1-3，本轮只登记）**：本批的跨方言正确性证据全部来自
+  env-gated 用例，而 env 未设时**静默 pass**、CI 无 service 容器也不设 `OJ_TEST_*` → 门禁恒绿。
+  建议后续加一个起 PG+MySQL service 容器的 job，并引入 `OJ_TEST_REQUIRE=1`（该模式下缺 env 即失败，
+  防「专用 job 里变量名写错→依然绿」）。**开发侧评审补充的具体缺口**：`next_seq_first_use_inside_tx_on_real_db`
+  是「事务内首次取号不毒化事务」（P1-2 修复）的**唯一**守卫，而 sqlite 没有 aborted-tx 语义、
+  假实现更没有 → 该修复在 CI 上实际**无覆盖**。
+
+**测试面变更**
+
+- 核心 crate 的 `[dev-dependencies]` 增 `sqlx` 的 `postgres` / `mysql` / `mysql-rsa` 特征
+  （**仅测试构建**）：env-gated 真库用例需要具体驱动（生产路径的 PG/MySQL 仍由 `oj-db-*` 插件承载）。
+- MySQL 插件保留 Any+sqlite 的离线全路径用例（CI 无 MySQL 时仍有覆盖），新增 typed 路径的
+  env-gated 用例。
+
 **修复（文档）**
 
 - `docs/devkit/scenarios.md` / `docs/devkit/api-manual.md`：匿名路径迁移 WARN 的**对外文案与

@@ -560,7 +560,29 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
    字符串交付（超界给 bigint 会让 `json.ok` 直接 500）；回写用 `toBigInt()`——
    **字符串是文本意图、BigInt 是整数意图**，平台不做启发式转换（PG 上字符串写 bigint 列必报
    `column "x" is of type bigint but expression is of type text`）。**绝不要 `Number(大整数字符串)`**。
+   无符号 64 位（`> i64::MAX`，仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`；
+   **取号优先用 `db.nextSeq(name)`**（见 §11 第 7 条），不要再手写 `max(id)+1`。
    完整契约与范式见 `docs/numeric-limits.md`。
+7. **取号用 `db.nextSeq(name)`（v0.1.24）**：平台序列分配原语，单语句原子、并发安全——
+   `const id = await db.nextSeq("project_identifier");`（在 `db.tx` 内调用则搭车同一连接）。
+   平台表 `_oj_sequences(name, v)` 首次使用**自动建**（`_oj_` 是平台命名空间，**业务不要手工
+   读写/迁移它**）。返回值 ≤2^53-1 是 number，超出是十进制字符串（与 DB 读值同契约）。
+   它取代了历史上 `select max(id)+1` 的写法（后者并发下会分配出相同序号，见
+   `docs/numeric-limits.md` §3）。
+   **四条必须知道的语义**（v0.1.24）：
+   - **库级、跨租户共享**：`_oj_sequences` 没有 `tenant_id`，同一库内所有租户共用一个计数器；
+     需要按租户隔离就把租户拼进 `name`（如 `` `order_no:${http.tenantId}` ``）。
+   - **`name` 用服务端常量**，别直接取用户输入——否则序列表行数可被外部无限放大。
+   - **需要 DDL 权限**（首次使用要 `create table if not exists`）；生产账号若只有 DML 权限，
+     请用迁移**预建** `_oj_sequences(name, v)`。
+   - **`memory://` 后端不支持**（拿不到返回值）。
+   - 序列值**不随调用方事务回滚而回退**（一次独立的原子自增）——按「只增不复用」理解。
+8. **MySQL 读侧的列类型边界（v0.1.24）**：类型化路径下**可读** = 整数家族（含
+   `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`；
+   **其余报错**：`DECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、`JSON`、`BIT`、
+   `GEOMETRY`——报错点名列名与类型，**不会静默给 `null`**。读这些列请在 SQL 里显式转换
+   （`select cast(amount as char) as amount from t`），别用 `select *` 兜。`BOOLEAN`/`TINYINT(1)`
+   按整数读出 `1`/`0`（MySQL 无独立 boolean 类型）。
 
 ### 常见报错速查
 
@@ -582,7 +604,10 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `operator does not exist: bigint = text`（PG） | `where bigint 列 = $1` 传了字符串 | 同上 |
 | 主键 `duplicate key`，被撞值末几位是 0 | `Number(max(id)) + 1` 坍缩到 f64 网格值 | 改 `toBigInt(max) + 1n`（`docs/numeric-limits.md` §3） |
 | `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
-| `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | 同一 SQL 文本混用字符串/数字参数（语句缓存既有隐患） | 保持参数形态稳定或换 SQL 文本 |
+| `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | v0.1.24 前：同一 SQL 文本混用字符串/数字参数（sqlx 语句缓存按文本 key） | **v0.1.24 起平台自动按参数形态分缓存键**，无需再规避；若仍出现，检查 PG 插件是否随宿主重建 |
+| `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()` | 该值改存 text，或把列放到 MySQL `BIGINT UNSIGNED` |
+| `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`select cast(x as char) as x from t`；避免 `select *` |
+| MySQL `BOOLEAN` 读出是 `1`/`0` | `BOOLEAN` 即 `TINYINT(1)`，协议层无长度元数据可区分 | 按整数读；需要布尔语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | `subquery: nested select too deep` | 嵌套 > 4 层 | 减层或拆 CTE |
 | `nested select does not accept with/unions (v1)` | 子查询/union 成员带了 with/unions | 移到顶层 |
 | `union requires explicit columns` | union 侧省略 select 列 | 双方显式列且列数一致 |

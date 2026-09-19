@@ -47,6 +47,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 - **大整数（雪花 id / i64）**：DB 的 `|v| > 2^53-1` 的整数读出来是**十进制字符串**（不是
   number）；**绝不用 `Number()`**（会静默坍缩成 f64 网格值 → 主键 dup 500，即 U38 事故），
   运算与回写一律 `toBigInt(row.id) + 1n` 并把结果直接当参数传回（§6「大整数与 i64」）。
+  **取号优先用 `db.nextSeq(name)`**（v0.1.24，原子且并发安全），别再自己写 `max+1`；
+  无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`。
 
 ## 新模块 checklist
 
@@ -96,10 +98,13 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 尾 `/*` 匿名路径收不到豁免（v0.1.20） | **auth 侧**尾 `/*` 已统一为**严格一层**（旧 oj-auth 是任意深度）；跨层改 `/x/**`。**租户侧自始就是严格一层，无此变更**。装配期只对 `auth.anonymous_paths` 里「旧式前缀形态（只有尾段一个 `*`、其余段全字面）且确实丢了面（有更深的已注册路由）」的条目打聚合迁移 WARN（v0.1.23 起，结构条目与仅差 `**` 零层的都不再点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
+| 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
+| `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |
+| `tenant guard: tenant id "…" is not a valid integer for numeric column …` | `tenant_id` 列是数值类型但租户头不是十进制字面量——用数字租户 id，或把列改成 text |
 | 雪花 id / 大整数算错、主键 dup 500 | i64 超 `2^53-1` 读出来是**字符串**；`Number(row.id) + 1` 会静默坍缩到 f64 网格值（下次分配撞主键）。范式：`toBigInt(rows[0].m) + 1n` → 直接回写 `db.exec(..., [next])`（v0.1.22，见 `scenarios.md` 场景 7） |
 | `toBigInt` 抛 `not a safe integer` | 传进去的是已坍缩的 number（多为 `Number(...)` 的产物）——传 DB 原样给出的**十进制字符串** |
 | PG 报 `column "x" is of type bigint but expression is of type text` | 回写用了字符串——字符串是文本意图，整数要用 `toBigInt(...)`（PG 不做隐式转换；MySQL/SQLite 会转换但别依赖） |
-| 同一 SQL 混合参数类型后报 `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | PG prepared statement 缓存的既有隐患（与本次无关，v0.1.21 也能复现）：同一 SQL 文本混用字符串/数字参数。换 SQL 文本或保持参数形态稳定 |
+| 同一 SQL 混合参数类型后报 `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**（PG 插件给 SQL 前置 `/*oj:<形态>*/` 签名；MySQL 无此问题）。若仍出现，检查 PG 插件是否随宿主重建 |
 | 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`fixture` / `schema diff` 同旗标） |
 | `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
 | `--db "x" not declared in config (db keys: […])` | 库名不在 config `db:` 段（键即库名）——工具**故意不回落** `default`，防迁移打在开发库上 |

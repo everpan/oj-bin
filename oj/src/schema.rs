@@ -133,6 +133,15 @@ fn is_ident(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// `registry_tables()` 的单表条目：表名 / 主键列 / 全部列（名 + 类型）/ tenant 标志。
+/// （别名只是为了让 clippy 的 `type_complexity` 安静，字段语义见函数文档。）
+pub type RegistryTable<'a> = (
+    &'a str,
+    Vec<&'a str>,
+    Vec<(&'a str, only_js::bridge::ColumnType)>,
+    bool,
+);
+
 impl SchemaFile {
     /// 解析 + 校验（标识符白名单、类型、autoincrement 仅限 pk 列、索引列存在）。
     pub fn parse(text: &str) -> Result<Self, String> {
@@ -198,30 +207,57 @@ impl SchemaFile {
         Self::parse(&text).map(Some)
     }
 
-    /// 归属图 + SchemaRegistry 喂料：(表名, 主键列（联合为多列，空=无）, 全部列名,
+    /// 归属图 + SchemaRegistry 喂料：(表名, 主键列（联合为多列，空=无）, 全部列（名+类型）,
     /// tenant 标志（false = 共享表声明）)。
-    pub fn registry_tables(&self) -> Vec<(&str, Vec<&str>, Vec<&str>, bool)> {
+    ///
+    /// v0.1.24 起带上 `col_type`：租户守卫要按 `tenant_id` 的列类型生成绑定值
+    /// （数值列绑数值，否则 PG 报 `operator does not exist: bigint = text`）。
+    pub fn registry_tables(&self) -> Vec<RegistryTable<'_>> {
         self.tables
             .iter()
             .map(|(name, t)| {
                 (
                     name.as_str(),
                     t.pk.iter().map(|s| s.as_str()).collect(),
-                    t.columns.keys().map(|s| s.as_str()).collect(),
+                    t.columns
+                        .iter()
+                        .map(|(cn, cs)| {
+                            (
+                                cn.as_str(),
+                                only_js::bridge::ColumnType::from_schema_type(&cs.col_type),
+                            )
+                        })
+                        .collect(),
                     t.tenant,
                 )
             })
             .collect()
     }
 
-    /// sql_guard 声明期校验：tenant=true（默认）的表必须含 tenant_id 列。
+    /// sql_guard 声明期校验：
+    /// ① `tenant=true`（默认）的表必须含 `tenant_id` 列；
+    /// ② `tenant_id` 列类型必须是 `text` / `integer` / `bigint`（v0.1.24：守卫按列类型绑定，
+    ///    其它类型（double/boolean/blob）没有「等值租户 id」的语义，声明期就拒掉而不是等到
+    ///    运行期报一句难懂的方言错误）。
     pub fn validate_tenant(&self, module: &str) -> Result<(), String> {
         for (name, t) in &self.tables {
-            if t.tenant && !t.columns.contains_key("tenant_id") {
+            if !t.tenant {
+                continue;
+            }
+            let Some(tid) = t.columns.get("tenant_id") else {
                 return Err(format!(
                     "schema: [{module}] 表 {name:?} 缺 tenant_id 列（tenant.sql_guard 启用中；\
                      共享表请显式 tenant: false 并加入 config tenant.shared_allow）"
                 ));
+            };
+            match tid.col_type.as_str() {
+                "text" | "integer" | "bigint" => {}
+                other => {
+                    return Err(format!(
+                        "schema: [{module}] 表 {name:?} 的 tenant_id 类型 {other:?} 不受支持\
+                         （仅 text / integer / bigint；数值列请确保租户头是该类型的十进制字面量）"
+                    ));
+                }
             }
         }
         Ok(())

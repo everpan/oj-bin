@@ -38,7 +38,7 @@
 
 ---
 
-## 2. 安全出口：`toBigInt()` / `toDouble()`
+## 2. 安全出口：`toBigInt()` / `toUBigInt()` / `toDouble()`
 
 ```ts
 const m    = rows[0].m;              // string（超界时）
@@ -63,6 +63,16 @@ json.ok({ id: next });               // 出线："4886674138783273205"
 
 > 关键：任何 `|v| > 2^53-1` 的 f64 都不是 safe integer，因此
 > **`toBigInt(Number(大整数字符串))` 必然抛错**——这正是把 U38 那类事故挡在调用点的机制。
+
+### `toUBigInt(v): bigint`（v0.1.24）
+
+与 `toBigInt` 同形，但值域是**无符号** `[0, 2^64-1]`：
+
+- **只有 MySQL `BIGINT UNSIGNED` 列能承载**；PG / SQLite 传它会得到明确报错（它们的 bigint
+  就是 i64），请改存 text。
+- 同样 fail-loud：非规范十进制串（`"+1"` / `"007"` / `" 1"`）、负数、超 `u64::MAX`、
+  已坍缩的 number 一律抛错。
+- 跨 op 时编码为 `{"$oj$u64":"<十进制>"}`（与 `$oj$i64` 同族保留键）。
 
 ### `toDouble(v): number`
 
@@ -127,7 +137,10 @@ unique constraint` → 业务接口 500，且从"静默写错"到"爆发 500"有
   `INSERT ... RETURNING`（PG/SQLite）/ 行锁（`select ... for update`）+ 同一事务内回写；
 - 不想自建：把发号收敛到一个 handler，用 `db.tx` + 唯一索引冲突重试兜底。
 
-平台暂未内建序列分配原语（见 §4 未支持项）。
+**v0.1.24 起平台内建了原语**：`await db.nextSeq("标识符分配")` —— 单语句原子取号
+（PG/SQLite `insert … on conflict do update … returning`；MySQL `last_insert_id` 惯用法），
+平台表 `_oj_sequences` 首次使用自动建。`max+1` 的范式改写见 §3.1，**新代码请直接用 `nextSeq`**：
+它把「取号」的并发正确性收敛到平台，不再需要调用方自己拿行锁或唯一索引重试。
 
 ---
 
@@ -138,29 +151,63 @@ unique constraint` → 业务接口 500，且从"静默写错"到"爆发 500"有
    serde_v8 反序列化，BigInt 直接报 `unsupported type`。跨这些边界先 `String(v)`。
    （`json.ok` / `json.fail` / `json.raw` / `log` 字段 / `mail` 已容忍 bigint，自动序列化为
    十进制字符串。）
-3. **`u64` / `BIGINT UNSIGNED`**：读侧对 `> i64::MAX` 的 u64 值会给出十进制字符串
-   （不再回绕成负数），但**不保证** MySQL `BIGINT UNSIGNED` 的全链路精确（暂未支持）。
+3. **`u64` / `BIGINT UNSIGNED`（v0.1.24 起支持）**：MySQL 走 **typed 路径**（`sqlx::MySql`）
+   ——读侧 `> i64::MAX` 的 unsigned 值给 number（`>2^53-1` 再由出口护栏降十进制字符串），
+   **不再回绕成负数**；写侧用 `toUBigInt(v)`（`[0, 2^64-1]`）精确绑 u64。
+   PG / SQLite 的 `bigint` 就是 i64，**装不下 u64**：传 `toUBigInt` 会得到明确报错
+   （`u64 value … is not supported on this path`），请存成 text 或用 MySQL。
+   旧插件（未随本版重建）遇到 `$oj$u64` 会被串化成文本——**插件须与宿主同批重建**。
+   - **注意**：`toUBigInt` 的「无符号意图」只在**超过 `i64::MAX`** 时才体现在线形状上。
+     值落在 i64 范围内时（如 `toUBigInt("42")`）JS 的 BigInt 已不携带符号信息，编码为
+     `{"$oj$i64":"42"}` → PG/SQLite 也会照常接受。功能上无害（数值一致、MySQL 亦接受），
+     但「PG/SQLite 会拒绝一切 u64」的说法对 ≤`i64::MAX` 的值不成立。
 4. **`toDouble` 丢精度是显式意图**，平台不再二次告警。
-5. **PG 语句缓存的既有隐患（与本次改动无关，单独登记）**：同一条 SQL 文本若在不同调用里
-   绑定**不同 Rust 类型**的参数（如一会儿字符串、一会儿数字/大整数），sqlx 的 prepared
-   statement 缓存会给出协议级错误（`invalid byte sequence for encoding "UTF8": 0x00` /
-   `insufficient data left in message` / `incorrect binary data format in bind parameter`），
-   且与执行顺序相关。**同一 SQL 文本请保持参数形态稳定**；混合形态时用不同 SQL 文本或包一层
-   `CAST`。该问题在 v0.1.21 及更早版本同样存在（纯数字/字符串混用即可复现）。
+5. **PG 语句缓存 × 混合参数类型（v0.1.24 起平台自动处置，用户无需再规避）**：
+   历史上同一条 SQL 文本若在不同调用里绑定**不同 Rust 类型**的参数（一会儿字符串、一会儿数字），
+   sqlx 的 prepared statement 缓存（key 只有 SQL 文本）会复用旧的参数类型元数据 → 协议级错误
+   （`invalid byte sequence … 0x00` / `insufficient data left in message` / `incorrect binary
+   data format in bind parameter`）。现在 **PG 插件按参数形态给 SQL 前置一段签名注释**
+   （`/*oj:<形态>*/`，形态字母表 `t/i/f/b/m/u`），不同形态自然落到不同缓存条目；
+   用户**不再需要**「保持形态稳定」或换 SQL 文本。
+   - **DBA 可见性**：实际执行的 SQL 文本会带该前缀（`pg_stat_activity` / 日志 / `EXPLAIN`
+     可见）；`toSQL()` 与用户自己的 SQL 字符串**不含**前缀。
+   - MySQL 无此问题（每次 execute 都重发参数类型），SQLite 无声明参数类型——两者都不打签名。
+   - `pg_prepared_statements` 的条目数会随「SQL 数 × 参数形态数」增长（连接级
+     `statement-cache-capacity` 已上调到 512 兜底）。
 6. **保留形状**：`{"$oj$i64":"<十进制>"}` 是 `toBigInt()` 参数的内部编码。业务 JSON 数据
    **不要**以该键为唯一键，否则在**参数位置**会被当作整数绑定。**这是一条红线**：
-   保留键前缀 `$oj$`，业务数据不得使用。
+   保留键前缀 `$oj$`（v0.1.24 起另有 `{"$oj$u64":"<十进制>"}`，`toUBigInt()` 的参数编码），
+   业务数据不得使用。
 7. `schema.yaml` 列类型最小集里没有 `BIGINT UNSIGNED`；bigint 列按 `bigint` 声明即可。
 8. **`kv.incr` 返回 f64**：计数器超过 `2^53` 后会**先丢精度**（与 DB 读侧不同，kv 无护栏）。
    需要精确大计数时改用 DB 或自行以字符串存储。
-9. **数值型租户 id 列不受支持（既有）**：租户守卫注入的条件是**字符串**值
-   （`tenant_id = '<tid>'`，`query.rs::apply_tenant`），且 insert 要求 `tenant_id` 字段是
-   **等于租户头的字符串**。所以当 `tenant_id` 列是 `BIGINT`/`INTEGER` 时：
-   PG 上构造器查询会报 `operator does not exist: bigint = text`；
-   `db.asTenant(...)`/插入用 `toBigInt(tid)` 会报
-   `tenant guard: insert tenant_id mismatch`。
-   **绕行：把租户 id 设计成 TEXT**（雪花租户 id 也建议以字符串存放）。
-   本次未改（需要 schema 感知列类型才能注入正确类型的绑定值，属独立设计）。
+9. **数值型租户 id 列：v0.1.24 起支持**。租户守卫按 `schema.yaml` 声明的 `tenant_id`
+   列类型生成绑定值：
+   - `text`（及旧装配路径的「未声明类型」）→ 字符串（与 v0.1.23 相同的旧行为）；
+   - `integer` / `bigint` → **数值**（`> 2^53-1` 用 i64 标记，`> i64::MAX` 用 `$oj$u64`；
+     PG/SQLite 对后者报错 → 数值租户 id 请落在 i64 内）；
+   - insert/update 的租户等值判定接受 **4 种形态**（字符串 / 数字 / i64 标记 / u64 标记）——
+     即 `tenant_id: "7"`、`tenant_id: 7`、`toBigInt("7")` 都可；
+   - 租户头（或 `db.asTenant(id)`）在数值列上**必须是十进制字面量**，否则报
+     `tenant guard: tenant id "acme" is not a valid integer for numeric column t.tenant_id`。
+   **新增声明期 fail-fast**：`tenant_id` 列类型 ∉ {`text`,`integer`,`bigint`} →
+   启动即报错（`double`/`boolean`/`blob` 没有「等值租户 id」语义）。
+   注意 SQLite 是动态类型：列声明为 INTEGER 就必须存整数形态。
+10. **MySQL 读侧的列类型边界（v0.1.24 定稿）**：typed 路径（`sqlx::MySql`）下**可读**的列类型是
+    **整数家族**（含 `BIGINT UNSIGNED` → u64）、**文本家族**（`TEXT` 在 MySQL 协议里就是
+    `Blob` + 非 BINARY collation）、**二进制**、`FLOAT`/`DOUBLE`；**其余一律报错**：
+    `DECIMAL`/`NEWDECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、`JSON`、`BIT`、
+    `GEOMETRY`。
+    - 报错信息**点名列名与 MySQL 类型**并给指路：
+      `db(mysql): column 'amount' has MySQL type 'DECIMAL' which this plugin does not decode yet
+      — select explicit columns and cast it in SQL (e.g. \`cast(amount as char) as amount\`)`。
+      **绝不会静默变成 `null`**（静默错值是本仓红线）。
+    - 需要读这些列时**在 SQL 里显式转换**：`cast(amount as char) as amount`、`cast(made_at as char)`、
+      `cast(payload as char)` —— 转换后按文本读出。
+    - `BOOLEAN` / `TINYINT(1)` 读出的是 **number `1`/`0`**，不是 `true`/`false`
+      （MySQL 无列长度元数据可区分「boolean 语义的 TINYINT」）。
+    - 对照 v0.1.23（全程 `sqlx::Any`）：上述不可读类型当时同样读不出来，但错误是 sqlx 的
+      `AnyDriverError`（不点名列）；且 `TINYINT`/`BOOLEAN` 当时**直接报错**，现在可读。
 
 ---
 
@@ -181,7 +228,7 @@ grep -rnE 'JSON\.parse|as number' --include=*.ts src/
 ```
 
 逐条处置：凡是「DB 读出的 id」→ 一律按**字符串**传递，需要运算时 `toBigInt()`；
-回写同一 SQL 的参数形态保持一致（见 §4.5）。**判定标准：`row.id + 1`、`Number(row.id)`、
+取号改用 `db.nextSeq(name)`（§3.3）。**判定标准：`row.id + 1`、`Number(row.id)`、
 `typeof row.id === "number"` 三处命中即需改。**
 
 ---
@@ -196,7 +243,7 @@ grep -rnE 'JSON\.parse|as number' --include=*.ts src/
 | `toBigInt: … is not a safe integer` | 传进来的是已坍缩的 number（多为 `Number(...)` 的产物） | 传**原始字符串**（DB 读出来的那个值） |
 | `toBigInt: expected a canonical decimal integer string` | 传了 `"1.5"` / `"007"` / 带空格等 | 传 DB 原样给出的十进制串 |
 | `unsupported type`（`es`/`bus`/`mq`/`jwt`/`ws.sess.state` 等） | bigint 跨了不容忍的边界 | 先 `String(v)`（`json.*` / `log` / `mail` 已容忍） |
-| `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | 同一 SQL 文本混用了不同类型的参数（§4.5） | 保持参数形态稳定，或换 SQL 文本 |
+| `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | v0.1.24 前：同一 SQL 文本混用不同类型参数（见 §4 第 5 条） | v0.1.24 起平台自动分缓存键，无需规避；若仍出现请确认 PG 插件已随宿主重建 |
 
 ---
 

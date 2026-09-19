@@ -15,11 +15,14 @@ sqlx = { version = "0.9", default-features = false, features = [
     "any",
     "mysql",
     "json",
+    # MySQL 8 默认 caching_sha2_password：明文连接要用 RSA 公钥交换换密码，
+    # 没有这个 feature 连不上（报 "RSA auth backend disabled"）。
+    "mysql-rsa",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time"] }
 
 [dev-dependencies]
 # 离线全路径 roundtrip：dev 构建经 feature 统一给 sqlx Any 装 sqlite 驱动
 # （install_default_drivers 按启用特性安装）——生产 cdylib 不受影响，仍单方言 mysql。
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "any", "sqlite", "mysql-rsa"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time", "macros"] }

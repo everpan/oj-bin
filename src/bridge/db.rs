@@ -384,12 +384,353 @@ pub async fn op_db_exec(
     }
 }
 
+/// 平台序列分配原语（v0.1.24，债务④）：`db.nextSeq(name)` → 下一个序号。
+///
+/// **要解决的问题**：业务用 `SELECT max(id) + 1` 取号在并发下会分配出相同序号（下游 U38 的
+/// 事故链就始于这点）。本原语给出**单语句原子**的取号，调用方不再自担竞态。
+///
+/// 语义与边界：
+/// - 平台表 `_oj_sequences(name, v)`，**首次使用自动建**（`create table if not exists`，不经
+///   模块 schema / 迁移；`_oj_` 前缀避开业务命名空间，且未登记 → 裸 SQL 租户守卫短路放行）；
+/// - 取号 SQL 按方言：
+///   - PG / SQLite：`insert … on conflict(name) do update set v = v + 1 returning v`（单语句原子，
+///     直接走池，不需要事务）；
+///   - MySQL：`insert … values (?, last_insert_id(1)) on duplicate key update v = last_insert_id(v + 1)`
+///     再 `select last_insert_id()`——**必须同一连接**（会话级变量），故无活跃事务时用一次短事务；
+/// - **每库一次先确保**：序列表由 `ensure_seq_once` 在取号**之前**建好（DDL 走池、绝不进调用方
+///   事务——MySQL 的 DDL 会隐式提交调用方事务；PG 里事务内失败语句会让事务进入 aborted 态，
+///   后续一律 25P02）。池路径另留「失败→再建表→重试一次」兜底（表被外部 drop 等）；
+///   事务路径**没有**兜底，靠 `ensure_seq_once` 先行保证（架构评审 P1-2）；
+/// - 与调用方事务的关系：在 `db.tx` 内调用则搭车（推荐）。注意序列值**不随调用方回滚而回退**
+///   ——按「只增不复用」理解；
+/// - 返回值过 `jsnum` 规则：`≤2^53-1` 给 number，超出给十进制字符串（与 DB 读值同契约）；
+/// - 序列名绑定为参数（不进 SQL 标识符），无注入面；长度 1..=128。
+#[op2]
+#[serde]
+pub async fn op_db_next_seq(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] seq: String,
+) -> Result<Row, JsErrorBox> {
+    if seq.is_empty() || seq.len() > 128 {
+        return Err(JsErrorBox::generic(
+            "db.nextSeq: name must be 1..=128 characters",
+        ));
+    }
+    let err = |e: String| JsErrorBox::generic(e);
+    let da = super::query::lookup(&state, &name)?;
+    // ① **先确保序列表存在**（每库一次，Bridge 级缓存）。DDL 走池、绝不在调用方事务里做：
+    //    MySQL 的 DDL 会隐式提交调用方事务；PG 里事务内失败语句会让事务进入 aborted 态
+    //    （后续一律 25P02）——若把建表放在「先试后建」的失败路径上，**首次在 db.tx 里用新序列名
+    //    必然失败并毒化调用方事务**（架构评审 P1-2）。
+    //    键用**物理库名**（`bound_db` 的结果）而非 JS 可见名：同一 Bridge 下不同模块可把字面
+    //    `"default"` 绑到不同物理库（`manifest db:` / `db_override`），用可见名当键会让后一个库
+    //    命中前一个库的缓存、跳过建表（池路径多付一次失败+DDL，事务路径直接失败）。
+    let phys = super::guard::bound_db(&state, &name);
+    ensure_seq_once(&state, &phys, &*da).await.map_err(err)?;
+    let mut out = match resolve_target(&state, &name)? {
+        // 池路径：表刚确保过，正常一次成功；仍保留「失败→再建表→重试」兜底（外部 drop 等）。
+        Target::Pool(da) => next_seq_via_pool(&da, &seq).await.map_err(err)?,
+        // tx 路径：搭车调用方事务的连接（建表已在池上完成，此处不再触碰 DDL）。
+        Target::Tx(t) => {
+            let dial = da.dialect();
+            let mut s = t.session.lock().await;
+            seq_next(&mut **s, dial, &seq).await.map_err(err)?
+        }
+    };
+    // 出口护栏：超界整数降十进制字符串（与 DB 读值同契约，见 jsnum）。
+    super::jsnum::sanitize_js_numbers(&mut out);
+    Ok(out)
+}
+
+/// 每个库**一次**地确保平台序列表存在（Bridge 级缓存；DDL 幂等）。
+///
+/// 缓存放在 `StableState`（而非全局 static）：每个 Bridge 对应一份 DB 配置与池，全局缓存会在
+/// 「同一进程里多个独立库（测试的内存库尤甚）」之间误判。并发首用时两个调用各跑一次
+/// `create table if not exists` 也无害（幂等）。
+async fn ensure_seq_once(
+    state: &Rc<RefCell<OpState>>,
+    name: &str,
+    da: &dyn DataAccessor,
+) -> Result<(), String> {
+    // 持锁期间 panic 不能让这个 Bridge 级缓存**永久中毒**（否则此后每次 `nextSeq` 都 panic）。
+    // 这里只是 HashSet 查/插，`PoisonError::into_inner()` 取回的集合本身仍是自洽的。
+    if state
+        .borrow()
+        .borrow::<Arc<super::StableState>>()
+        .seq_ensured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(name)
+    {
+        return Ok(());
+    }
+    ensure_seq_table(da).await?;
+    state
+        .borrow()
+        .borrow::<Arc<super::StableState>>()
+        .seq_ensured
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string());
+    Ok(())
+}
+
+/// 池路径取号：先试一次，失败（表不存在）才建表并重试。
+async fn next_seq_via_pool(da: &Arc<dyn DataAccessor>, seq: &str) -> Result<Row, String> {
+    let dial = da.dialect();
+    match next_seq_once_pool(da, dial, seq).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            ensure_seq_table(&**da).await?;
+            next_seq_once_pool(da, dial, seq)
+                .await
+                .map_err(|e2| format!("{e}; retry after create table failed: {e2}"))
+        }
+    }
+}
+
+/// 池路径的一次取号：PG/SQLite 单语句直走池；MySQL 两条语句包一次短事务（同连接）。
+async fn next_seq_once_pool(
+    da: &Arc<dyn DataAccessor>,
+    dial: Dialect,
+    seq: &str,
+) -> Result<Row, String> {
+    if dial == Dialect::MySql {
+        let mut s = da.begin().await.map_err(|e| e.to_string())?;
+        let v = seq_next(&mut *s, dial, seq).await?;
+        s.commit().await.map_err(|e| e.to_string())?;
+        Ok(v)
+    } else {
+        let rows = da
+            .query_with_params(insert_sql(dial), &[Value::String(seq.to_string())])
+            .await
+            .map_err(|e| e.to_string())?;
+        pick_v(rows)
+    }
+}
+
+/// 序列表 DDL（幂等；按方言给 varchar/text 与 bigint）。
+async fn ensure_seq_table(da: &dyn DataAccessor) -> Result<(), String> {
+    let ddl = match da.dialect() {
+        Dialect::MySql => {
+            "create table if not exists _oj_sequences (name varchar(128) primary key, v bigint not null)"
+        }
+        _ => "create table if not exists _oj_sequences (name text primary key, v bigint not null)",
+    };
+    da.exec_with_params(ddl, &[])
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 取号 SQL（PG/SQLite；MySQL 是两条语句，见 `seq_next`）。
+fn insert_sql(dial: Dialect) -> &'static str {
+    if dial == Dialect::Postgres {
+        "insert into _oj_sequences (name, v) values ($1, 1) \
+         on conflict (name) do update set v = _oj_sequences.v + 1 returning v"
+    } else {
+        "insert into _oj_sequences (name, v) values (?, 1) \
+         on conflict (name) do update set v = v + 1 returning v"
+    }
+}
+
+/// 单次取号（在给定会话内跑完；MySQL 是两条语句，其余一条 `returning`）。
+async fn seq_next(s: &mut dyn TxSession, dialect: Dialect, seq: &str) -> Result<Row, String> {
+    let p = vec![Value::String(seq.to_string())];
+    let rows = if dialect == Dialect::MySql {
+        s.exec(
+            "insert into _oj_sequences (name, v) values (?, last_insert_id(1)) \
+             on duplicate key update v = last_insert_id(v + 1)",
+            &p,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        s.query("select last_insert_id() as v", &[])
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        s.query(insert_sql(dialect), &p)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    pick_v(rows)
+}
+
+/// 从返回行里取 `v` 字段（缺列/空结果 → 报错）。
+fn pick_v(rows: Vec<Row>) -> Result<Row, String> {
+    rows.into_iter()
+        .next()
+        .and_then(|r| r.get("v").cloned())
+        .ok_or_else(|| "db.nextSeq: no value returned".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
     use serde_json::json;
     use std::sync::Arc;
+
+    /// `db.nextSeq`：单语句原子取号（sqlite 离线；PG/MySQL 的真库并发见 env-gated 用例）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_seq_allocates_densely_and_creates_table() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const a = [];
+                     for (let i = 0; i < 3; i++) a.push(await db.nextSeq("proj"));
+                     const other = await db.nextSeq("other");
+                     // 事务内取号：搭车同一连接，且不随回滚而回退（序列语义）
+                     const inTx = await db.tx(async (tx) => {
+                       const x = await tx.nextSeq("proj");
+                       return x;
+                     });
+                     json.ok({ a, other, inTx });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["a"], json!([1, 2, 3]), "同名序列稠密递增：{v}");
+        assert_eq!(v["data"]["other"], json!(1), "不同序列互不干扰：{v}");
+        assert_eq!(v["data"]["inTx"], json!(4), "事务内搭车同一序列：{v}");
+    }
+
+    /// 并发取号不重号（sqlite 单连接串行化；真库并发见 PG/MySQL env-gated）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_seq_is_concurrency_safe_offline() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const ps = [];
+                     for (let i = 0; i < 25; i++) ps.push(db.nextSeq("burst"));
+                     const vs = await Promise.all(ps);
+                     vs.sort((x, y) => x - y);
+                     let dense = true;
+                     for (let i = 0; i < vs.length; i++) if (vs[i] !== i + 1) dense = false;
+                     json.ok({ n: vs.length, dense, first: vs[0], last: vs[vs.length - 1] });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], json!(25), "{v}");
+        assert_eq!(v["data"]["dense"], json!(true), "并发取号应稠密无重复：{v}");
+    }
+
+    // 真库并发取号**不在本文件测**：经由 deno_core 连发 op 会撞既有缺陷
+    // （见 CHANGELIST「已知债」：并发超过 sqlx 池上限 / await 后再发 op → op 驱动
+    // `RefCell already borrowed` abort）。原子性改由插件层真库用例证明：
+    // `plugins/oj-db-postgres` 的 `real_postgres_next_seq_is_atomic_under_concurrency`
+    // 与 `plugins/oj-db-mysql` 的 `real_mysql_next_seq_*`（env-gated）。
+
+    /// 债④回归（env-gated，真库）：**在 `db.tx` 内首次使用新序列名**必须成功，
+    /// 且不得把调用方事务搞成 aborted（架构评审 P1-2 的验收）。
+    ///
+    /// 背景：早期实现是「先试 → 失败才建表 → 在同一事务会话上重试」。PG 里事务内任何失败语句都会
+    /// 让事务进入 aborted 态（后续一律 `25P02`），于是**首次在 tx 内取号必然失败并毒化调用方事务**。
+    /// 现改为「每库一次的先确保（DDL 走池）」——本用例先 `drop table` 强制走首次路径来钉住它。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn next_seq_first_use_inside_tx_on_real_db() {
+        let url = std::env::var("OJ_TEST_PG")
+            .or_else(|_| std::env::var("OJ_TEST_MYSQL"))
+            .unwrap_or_else(|_| {
+                eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
+                String::new()
+            });
+        if url.is_empty() {
+            return;
+        }
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        // 清场：删掉平台序列表，强制本用例走「首次使用（含建表）」路径。
+        let _ = db
+            .exec_with_params("drop table if exists _oj_sequences", &[])
+            .await;
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const r = await db.tx(async (tx) => {
+                       const a = await tx.nextSeq("in_tx_first");   // 首次：建表在池上完成
+                       const b = await tx.nextSeq("in_tx_first");   // 同一事务内再取一次
+                       return { a, b };
+                     });
+                     json.ok(r);
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "tx 内首次取号必须成功（不得毒化事务）：{v}");
+        assert_eq!(v["data"]["a"], json!(1), "{v}");
+        assert_eq!(v["data"]["b"], json!(2), "{v}");
+    }
+
+    /// 序列名越界（空 / 超 128）→ 明确报错。
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_seq_rejects_bad_name() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const e1 = await db.nextSeq("").then(() => "ok", e => String(e));
+                     const e2 = await db.nextSeq("x".repeat(129)).then(() => "ok", e => String(e));
+                     json.ok({ e1, e2 });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["e1"].as_str().unwrap().contains("1..=128"), "{v}");
+        assert!(v["data"]["e2"].as_str().unwrap().contains("1..=128"), "{v}");
+    }
 
     #[test]
     fn dialect_of_recognizes_prefixes() {

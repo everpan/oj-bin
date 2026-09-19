@@ -83,7 +83,7 @@ pub use named_registry::NamedRegistry;
 pub use plugin_loader::PluginInfo;
 /// 构造器 LIMIT 配置（`db_query:` 段；v0.1.20）——config 与装配层都要用。
 pub use query::QueryLimits;
-pub use registry::SchemaRegistry;
+pub use registry::{ColumnType, SchemaRegistry};
 // boot_runtime 供 oj 的 test 运行时复用（`oj test` 不走 RuntimePool，直接建 JsRuntime）。
 pub use runtime::{BOOT_TIMEOUT, boot_runtime};
 
@@ -153,6 +153,10 @@ pub struct StableState {
     pub db_override: Option<String>,
     /// 构造器 LIMIT：隐式默认 + 显式硬顶（db_query 段，v0.1.20）。
     pub query_limits: QueryLimits,
+    /// `db.nextSeq` 的「平台序列表已确保」缓存（键 = 库名；v0.1.24）：DDL 每个库只跑一次。
+    /// **必须放在 Bridge 级**（不能是全局 static）——每个 Bridge 对应一份 DB 配置与连接池，
+    /// 全局缓存会在「同一进程里多个独立库（含测试的内存库）」之间误判。
+    pub seq_ensured: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 命名 MQ 客户端（Kafka(name)/RabbitMQ(name) 数据源；spec 2026-09-07 §4）。
     /// 段未配置 = 空 registry（op_mq_has 恒 false → JS 侧 undefined）。
     pub kafkas: Arc<NamedRegistry<mq::MqInstance>>,
@@ -274,6 +278,7 @@ deno_core::extension!(
         db::op_db_as_tenant,
         db::op_db_query,
         db::op_db_exec,
+        db::op_db_next_seq,
         db::op_db_tx_begin,
         db::op_db_tx_commit,
         db::op_db_tx_rollback,
@@ -571,6 +576,7 @@ impl Bridge {
             dbs,
             registry: Arc::new(registry),
             loader,
+            seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             blobs: extras
                 .blobs
                 .unwrap_or_else(|| Arc::new(blob::BlobRegistry::new())),
@@ -1665,6 +1671,7 @@ mod tests {
             kv: Arc::new(InMemoryKV::new()),
             dbs: HashMap::new(),
             registry: Arc::new(SchemaRegistry::new()),
+            seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             loader: Some(Arc::new(LoaderShared {
                 project_root: root.clone(),
                 ts: false,
@@ -2042,6 +2049,115 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "{v}");
+    }
+
+    /// P1-2 回归（开发侧评审）：「序列表已确保」缓存必须以**物理库**为键，不能用 JS 可见名。
+    ///
+    /// 场景：同一 Bridge 内两个模块把字面 `"default"` 绑到不同物理库（`manifest db:` /
+    /// `ModuleCtx.db`）。若缓存键用可见名 `"default"`，模块 B 会命中模块 A 写入的条目而
+    /// **跳过建表**——池路径白付一次失败语句 + 一次 DDL，事务路径更是直接失败
+    /// （正是架构评审 P1-2 声称已消灭的那类故障）。
+    ///
+    /// 断言方式是**直接数 DDL**（每个物理库各建一次 = 2 次），而不是看返回值：返回值来自
+    /// 记录型 accessor 的固定应答，本用例只验缓存**键**，序列 SQL 由真库用例覆盖。
+    /// （不用真 sqlite 跑事务路径：sqlite 池 `max_connections(1)`，事务持连接时池上再发 DDL
+    /// 必然等锁超时——那是该 accessor 的既有性质，与本用例无关。）
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_seq_ddl_cache_is_keyed_by_physical_db() {
+        let _t = transpile_serial();
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 记录型 accessor：只数 `_oj_sequences` 的 DDL，其余读写走内存假实现。
+        struct DdlCounting {
+            inner: Arc<InMemoryAccessor>,
+            ddl: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl DataAccessor for DdlCounting {
+            fn dialect(&self) -> Dialect {
+                Dialect::Sqlite
+            }
+            async fn begin(&self) -> BridgeResult<Box<dyn super::db::TxSession>> {
+                self.inner.begin().await
+            }
+            async fn query_with_params(
+                &self,
+                _sql: &str,
+                _params: &[Value],
+            ) -> BridgeResult<Vec<Row>> {
+                // 取号语句的固定应答（本用例不验 SQL 语义）。
+                Ok(vec![json!({ "v": 1 })])
+            }
+            async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
+                if sql.contains("_oj_sequences") {
+                    self.ddl.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.exec_with_params(sql, params).await
+            }
+        }
+
+        let js = "export default { get() { db.nextSeq(\"s\")\n\
+                  \x20 .then((v) => json.ok({ v })).catch((e) => json.fail(500, String(e))); } };\n";
+        let (root, api_a) = mod_fx(&[("m_a/api.ts", js), ("m_b/api.ts", js)]);
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+        let dbs = HashMap::from([
+            (
+                "db_a".to_string(),
+                Arc::new(DdlCounting {
+                    inner: Arc::new(InMemoryAccessor::new()),
+                    ddl: count_a.clone(),
+                }) as Arc<dyn DataAccessor>,
+            ),
+            (
+                "db_b".to_string(),
+                Arc::new(DdlCounting {
+                    inner: Arc::new(InMemoryAccessor::new()),
+                    ddl: count_b.clone(),
+                }) as Arc<dyn DataAccessor>,
+            ),
+        ]);
+        let mods = Arc::new(HashMap::from([
+            (
+                root.join("m_a").to_string_lossy().into_owned(),
+                ModuleCtx {
+                    name: "m_a".into(),
+                    deps: Arc::new(std::collections::HashSet::new()),
+                    db: Some("db_a".into()),
+                },
+            ),
+            (
+                root.join("m_b").to_string_lossy().into_owned(),
+                ModuleCtx {
+                    name: "m_b".into(),
+                    deps: Arc::new(std::collections::HashSet::new()),
+                    db: Some("db_b".into()),
+                },
+            ),
+        ]));
+        let b = module_bridge_ex(&root, SchemaRegistry::new(), mods, false, dbs);
+        // 模块 A 先跑（缓存此刻写入），随后模块 B 必须**各自**建表。
+        for api in [&api_a, &root.join("m_b/api.ts")] {
+            let cap = b
+                .run_module(
+                    api,
+                    "get",
+                    RequestInfo::default(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{api:?} -> {v}");
+        }
+        assert_eq!(
+            (
+                count_a.load(Ordering::SeqCst),
+                count_b.load(Ordering::SeqCst)
+            ),
+            (1, 1),
+            "每个物理库都必须各自建一次序列表（缓存键 = 物理库名，不是 JS 可见名）"
+        );
     }
 
     /// F-1 回归（统一审查）：CASE WHEN 条件内的子查询同样过归属守卫——

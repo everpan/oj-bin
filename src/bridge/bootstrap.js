@@ -21,6 +21,7 @@ import {
   op_cert_gen,
   op_cert_renew,
   op_db_exec,
+  op_db_next_seq,
   op_db_has,
   op_db_as_system,
   op_db_as_tenant,
@@ -126,16 +127,26 @@ function ojStringify(v) {
   return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 }
 
-// ----- big integers (v0.1.22): JS number is f64, so i64 beyond 2^53-1 needs BigInt -----
-// Reads hand such values over as decimal strings (see jsnum.rs). toBigInt() converts back
-// and is the only way to *write* a 64-bit integer precisely: serde_v8 rejects BigInt
-// outright, so encodeParams() tags it for the host to bind as i64 (see docs/numeric-limits.md).
+// ----- big integers (v0.1.22; u64 since v0.1.24): JS number is f64, so 64-bit ints need BigInt --
+// Reads hand such values over as decimal strings (see jsnum.rs). toBigInt() / toUBigInt() convert
+// back and are the only way to *write* a 64-bit integer precisely: serde_v8 rejects BigInt
+// outright, so encodeParams() tags it for the host to bind as i64 / u64 (docs/numeric-limits.md).
 const OJ_I64_KEY = "$oj$i64";
+const OJ_U64_KEY = "$oj$u64";
 const OJ_I64_MAX = 9223372036854775807n;
 const OJ_I64_MIN = -9223372036854775808n;
+const OJ_U64_MAX = 18446744073709551615n;
 
+/** Signed 64-bit: [-2^63, 2^63-1]; out of range -> RangeError. */
 globalThis.toBigInt = (v) => {
-  if (typeof v === "bigint") return v;
+  if (typeof v === "bigint") {
+    if (v > OJ_I64_MAX || v < OJ_I64_MIN) {
+      throw new RangeError(
+        "toBigInt: " + v.toString() + " is out of i64 range (use toUBigInt for MySQL BIGINT UNSIGNED)",
+      );
+    }
+    return v;
+  }
   if (typeof v === "number") {
     // Any |v| > 2^53-1 already sits on the f64 grid -- the original integer is gone.
     // Fail loud: Number("<big>") is exactly the trap this guards against.
@@ -163,6 +174,37 @@ globalThis.toBigInt = (v) => {
   throw new TypeError("toBigInt: expected string | number | bigint, got " + typeof v);
 };
 
+/** Unsigned 64-bit: [0, 2^64-1]. Only MySQL BIGINT UNSIGNED can hold it; PG/SQLite reject it. */
+globalThis.toUBigInt = (v) => {
+  if (typeof v === "bigint") {
+    if (v < 0n || v > OJ_U64_MAX) {
+      throw new RangeError("toUBigInt: " + v.toString() + " is out of u64 range");
+    }
+    return v;
+  }
+  if (typeof v === "number") {
+    if (!Number.isSafeInteger(v) || v < 0) {
+      throw new TypeError(
+        "toUBigInt: " + v + " is not a non-negative safe integer; pass the original decimal string instead",
+      );
+    }
+    return BigInt(v);
+  }
+  if (typeof v === "string") {
+    if (!/^(0|[1-9][0-9]*)$/.test(v)) {
+      throw new TypeError(
+        "toUBigInt: expected a canonical non-negative decimal integer string, got " + JSON.stringify(v),
+      );
+    }
+    const b = BigInt(v);
+    if (b > OJ_U64_MAX) {
+      throw new RangeError("toUBigInt: " + v + " is out of u64 range");
+    }
+    return b;
+  }
+  throw new TypeError("toUBigInt: expected string | number | bigint, got " + typeof v);
+};
+
 globalThis.toDouble = (v) => {
   if (typeof v === "number") return v;
   if (typeof v === "bigint") return Number(v);
@@ -178,18 +220,25 @@ globalThis.toDouble = (v) => {
 };
 
 // BigInt -> wire marker for the host (see docs/numeric-limits.md). Range-checked here so an
-// out-of-i64 bigint fails at the call site instead of silently binding as text.
-function i64Marker(v) {
-  if (v > OJ_I64_MAX || v < OJ_I64_MIN) {
-    throw new RangeError("db param: bigint " + v.toString() + " is out of i64 range");
+// out-of-range bigint fails at the call site instead of silently binding as text.
+// i64 range -> $oj$i64 (signed intent); (i64::MAX, u64::MAX] -> $oj$u64 (unsigned intent, the
+// only way to carry MySQL BIGINT UNSIGNED precisely); beyond -> RangeError.
+function intMarker(v) {
+  if (v >= OJ_I64_MIN && v <= OJ_I64_MAX) {
+    return { [OJ_I64_KEY]: v.toString() };
   }
-  return { [OJ_I64_KEY]: v.toString() };
+  if (v > OJ_I64_MAX && v <= OJ_U64_MAX) {
+    return { [OJ_U64_KEY]: v.toString() };
+  }
+  throw new RangeError(
+    "db param: bigint " + v.toString() + " is out of 64-bit range (i64/u64)",
+  );
 }
 
 // Deep-encode BigInt for the op boundary. Idempotent: markers written below are plain
 // objects and pass through untouched, so req snapshots can be re-encoded safely.
 function encodeParams(v) {
-  if (typeof v === "bigint") return i64Marker(v);
+  if (typeof v === "bigint") return intMarker(v);
   if (Array.isArray(v)) return v.map(encodeParams);
   if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
     // Old path rejected these at serde_v8; fail loud instead of silently flattening a
@@ -212,7 +261,7 @@ function encodeParams(v) {
 // Date -> ISO string; the recursive encoder above would flatten a Date to {}.
 function encodeSnapshot(v) {
   return JSON.parse(
-    JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? i64Marker(x) : x)),
+    JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? intMarker(x) : x)),
   );
 }
 
@@ -495,6 +544,10 @@ globalThis.DB = function (name) {
       asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
       // rebuild a builder from a toJSON() snapshot (continues the chain on this db).
       fromJSON: (snap) => builderFromReq(encodeParams(snap)),
+      // platform sequence allocator (v0.1.24): single-statement atomic next value.
+      // Race-free replacement for `select max(id) + 1`; the platform table
+      // `_oj_sequences` is created on first use (see docs/db-guide.md).
+      nextSeq: (n) => op_db_next_seq(name, String(n)),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.
@@ -506,6 +559,8 @@ globalThis.DB = function (name) {
             query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : encodeParams(params)),
             exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params)),
             table: (t) => queryBuilder(name, String(t)),
+            // Same-connection allocator: MySQL's LAST_INSERT_ID is session-scoped.
+            nextSeq: (n) => op_db_next_seq(name, String(n)),
             fromJSON: (snap) => builderFromReq(encodeParams(snap)),
             asSystem: () => { op_db_as_system(); return dbCache.get(name); },
             asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },

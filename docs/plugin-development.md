@@ -42,7 +42,7 @@ authorization) -> RResult<RString, RString>`，ok 值 JSON `null` = 匿名路径
 
 ## 3. ABI_VERSION 纪律
 
-- `ABI_VERSION` 当前 **7**（按轴 dlsym 契约）。**加轴零破坏**——ABI 规则表：
+- `ABI_VERSION` 当前 **8**（按轴 dlsym 契约）。**加轴零破坏**——ABI 规则表：
 
 | 变更 | 是否 bump ABI |
 |------|--------------|

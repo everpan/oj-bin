@@ -455,22 +455,28 @@ pub fn check_tenant_raw(
     verdict(msg)
 }
 
-/// 参数是否绑定了当前租户 id。三种形态视为等价（同一个值，只是 JS 侧表示不同）：
-/// 字符串（`"42"`）、数字（`42`，小 id 常用）、大整数标记（`toBigInt("42")` 的
-/// `{"$oj$i64":"42"}`，v0.1.22；雪花租户 id 只能这样精确传递）。
+/// 参数是否绑定了当前租户 id。四种形态视为等价（同一个值，只是 JS 侧表示不同）：
+/// 字符串（`"42"`）、数字（`42`，小 id 常用）、i64 标记（`toBigInt("42")` 的 `{"$oj$i64":"42"}`，
+/// v0.1.22）、u64 标记（`toUBigInt(...)` 的 `{"$oj$u64":"…"}`，v0.1.24；雪花/无符号租户 id）。
 /// 只做「等值」判定，不放松 SQL 侧的 `mentions` 要求——租户条件仍须显式出现在 SQL 里。
 ///
-/// **有意不对称**：构造器 insert 的租户校验（`query.rs::apply_tenant`）**只认字符串**形态
-/// （`row["tenant_id"]` 必须等于租户头），且注入的条件本身是字符串绑定值——故数值型
-/// `tenant_id` 列整体不受支持（见 `docs/numeric-limits.md` §4.8）。此处放宽只覆盖裸 SQL 路径。
-fn param_is_tenant(p: &serde_json::Value, tid: &str) -> bool {
+/// 构造器侧（`query.rs::apply_tenant`）也复用本判定做 insert 的等值与 update 的拒绝：
+/// 列类型为数值时注入的绑定值同样是数值形态（v0.1.24 起支持数值型 `tenant_id`，
+/// 见 `docs/numeric-limits.md` §4.9），故两侧必须同一口径。
+pub(crate) fn param_is_tenant(p: &serde_json::Value, tid: &str) -> bool {
     if p.as_str() == Some(tid) {
         return true;
     }
     if let Some(i) = oj_plugin_ffi::jsint::marker_i64(p) {
         return i.to_string() == tid;
     }
-    p.as_i64().is_some_and(|i| i.to_string() == tid)
+    if let Some(u) = oj_plugin_ffi::jsint::marker_u64(p) {
+        return u.to_string() == tid;
+    }
+    if let Some(i) = p.as_i64() {
+        return i.to_string() == tid;
+    }
+    p.as_u64().is_some_and(|u| u.to_string() == tid)
 }
 
 /// 模块默认库重定向（manifest `db:` 绑定）：仅重定向字面 "default"，

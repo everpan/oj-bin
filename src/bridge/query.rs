@@ -146,8 +146,9 @@ struct Join {
     /// 多租户防护注入（apply_tenant 无条件覆盖——fromJSON 喂入的 JS 预设值不可信；
     /// build_select_stmt 消费）。
     /// 进 ON 子句而非 WHERE——LEFT JOIN 注入 WHERE 会静默变 INNER JOIN（评审 P2-9）。
-    #[serde(default)]
-    tenant_id: Option<String>,
+    /// 类型是 `Value`（v0.1.24）：列类型为数值时注入的就是数值/大整数标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<Value>,
 }
 
 /// 查询动词（serde default = select，旧线格式零迁移）。
@@ -433,10 +434,13 @@ fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsError
 }
 
 fn to_qv(v: &Value) -> Qv {
-    // 大整数标记（v0.1.22，`toBigInt()` 的返回值）：绑 i64。必须在 `other => to_string()`
-    // 之前——否则标记对象会被串化成文本（PG 拒绝 text → bigint）。
+    // 大整数标记（v0.1.22 `$oj$i64` / v0.1.24 `$oj$u64`，`toBigInt()` / `toUBigInt()` 的返回值）：
+    // 必须在 `other => to_string()` 之前——否则标记对象会被串化成文本（PG 拒绝 text → bigint）。
     if let Some(i) = oj_plugin_ffi::jsint::marker_i64(v) {
         return Qv::BigInt(Some(i));
+    }
+    if let Some(u) = oj_plugin_ffi::jsint::marker_u64(v) {
+        return Qv::BigUnsigned(Some(u));
     }
     match v {
         Value::Null => Qv::String(None),
@@ -867,20 +871,22 @@ fn apply_tenant(
                     req.conditions.push(CondTree::Leaf(Cond {
                         field: format!("{}.tenant_id", req.table),
                         op: Op::Eq,
-                        value: Some(Value::String(tid.into())),
+                        value: Some(tenant_value(reg, &req.table, tid)?),
                         subquery: None,
                     }));
                 }
                 Verb::Insert => {
+                    // v0.1.24：等值判定复用 `param_is_tenant`（字符串/数字/i64 标记/u64 标记
+                    // 四形态等价）——此前只认字符串，数值型 tenant_id 列因此无法插入。
                     for row in &mut req.values {
                         match row.get("tenant_id") {
-                            Some(v) if v.as_str() != Some(tid) => {
+                            Some(v) if !super::guard::param_is_tenant(v, tid) => {
                                 return Err(JsErrorBox::generic(format!(
                                     "tenant guard: insert tenant_id mismatch (got {v}, want {tid:?})"
                                 )));
                             }
                             _ => {
-                                row.insert("tenant_id".into(), Value::String(tid.into()));
+                                row.insert("tenant_id".into(), tenant_value(reg, &req.table, tid)?);
                             }
                         }
                     }
@@ -903,7 +909,7 @@ fn apply_tenant(
         if req.verb == Verb::Update
             && scoped(&req.table)
             && let Some(v) = req.sets.get("tenant_id")
-            && (tid.is_none() || v.as_str() != tid)
+            && (tid.is_none() || !tid.is_some_and(|t| super::guard::param_is_tenant(v, t)))
         {
             return Err(JsErrorBox::generic(format!(
                 "tenant guard: update sets.tenant_id not allowed (got {v})"
@@ -915,7 +921,7 @@ fn apply_tenant(
         if let Some(tid) = tid {
             for j in &mut req.joins {
                 if scoped(&j.table) {
-                    j.tenant_id = Some(tid.to_string());
+                    j.tenant_id = Some(tenant_value(reg, &j.table, tid)?);
                 }
             }
         }
@@ -941,6 +947,38 @@ fn apply_tenant(
         apply_tenant(&mut c.query, reg, tid, guard, false)?;
     }
     Ok(())
+}
+
+/// 租户 id 按**列类型**生成绑定值（v0.1.24）。
+///
+/// - `text` / `Unknown`（旧装配路径）→ 字符串，即 v0.1.23 及以前的行为；
+/// - `integer` / `bigint` → 十进制字面量转数值：≤2^53-1 用 `Number`，更宽用 `$oj$i64`；
+///   超出 i64 的（雪花量级无符号）用 `$oj$u64`——只有 MySQL `BIGINT UNSIGNED` 能承载，
+///   PG/SQLite 会在绑定前**明确报错**（`.oj-plugin-ffi::jsint::reject_u64_markers`）；
+/// - 数值列上给了非十进制租户头 → 直接报错，不要让 PG 回一句
+///   `invalid input syntax for type bigint` 那种看不出「是租户头写错了」的消息。
+///
+/// 该值同时用于：select/update/delete 的注入条件、insert 的强制写、join 的 ON 条件
+/// ——三处必须同型，否则 PG 会在数值列上撞 `bigint = text`。
+fn tenant_value(reg: &SchemaRegistry, table: &str, tid: &str) -> Result<Value, JsErrorBox> {
+    let ty = reg
+        .get(table)
+        .map(|t| t.column_type("tenant_id"))
+        .unwrap_or_default();
+    if !ty.is_numeric() {
+        return Ok(Value::String(tid.into()));
+    }
+    if let Ok(i) = tid.parse::<i64>() {
+        return Ok(int_param(i));
+    }
+    if ty == super::registry::ColumnType::BigInt
+        && let Ok(u) = tid.parse::<u64>()
+    {
+        return Ok(uint_param(u));
+    }
+    Err(JsErrorBox::generic(format!(
+        "tenant guard: tenant id {tid:?} is not a valid integer for numeric column {table}.tenant_id"
+    )))
 }
 
 /// 条件树遍历，嵌套 req 递归 apply_tenant（与 guard_nested 同构镜像演进）。
@@ -1374,9 +1412,8 @@ fn build_select_stmt(
         }
         // 多租户防护注入（apply_tenant 填充）：join 表 tenant_id 进 ON 子句。
         if let Some(tid) = &j.tenant_id {
-            on = on.add(
-                col_simple_expr(&format!("{}.tenant_id", j.table)).eq(Expr::val(tid.as_str())),
-            );
+            on = on
+                .add(col_simple_expr(&format!("{}.tenant_id", j.table)).eq(Expr::val(to_qv(tid))));
         }
         let jt = match j.kind {
             JoinKind::Inner => sea_query::JoinType::InnerJoin,
@@ -1650,6 +1687,13 @@ fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, 
 }
 
 /// sea-query 的 `Value` 转 serde_json::Value（简化：整数/浮点/字符串/布尔/ null）。
+///
+/// **超出安全范围的整数回吐为 marker 而不是 JSON number**（v0.1.24 修既有漏洞）：这里的
+/// 产物就是 `toSQL().params`，而文档教用户「`db.query(toSQL().sql, ...toSQL().params)` 回跑」；
+/// 若吐 number，出口护栏 `jsnum::sanitize_js_numbers` 会把 `>2^53` 的整数降成**字符串**，
+/// 回跑时被绑成 text（PG 报 `bigint but expression is of type text`）——即参数不可重放。
+/// 吐 marker 后既可重放又保持精确；插件侧 `bind_value` 认得这两个形状（见 `jsint`）。
+/// 安全范围内的整数仍吐 number（回放与可读性都不变）。
 fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
     let num = |f: f64| {
         serde_json::Number::from_f64(f)
@@ -1661,19 +1705,40 @@ fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
         Qv::TinyInt(Some(i)) => Value::from(*i),
         Qv::SmallInt(Some(i)) => Value::from(*i),
         Qv::Int(Some(i)) => Value::from(*i),
-        Qv::BigInt(Some(i)) => Value::from(*i),
+        Qv::BigInt(Some(i)) => int_param(*i),
         // sea-query 将 LIMIT/OFFSET 渲染为 unsigned 绑定参数，缺失会退化为 NULL 绑定。
         Qv::TinyUnsigned(Some(i)) => Value::from(*i as i64),
         Qv::SmallUnsigned(Some(i)) => Value::from(*i as i64),
         Qv::Unsigned(Some(i)) => Value::from(*i as i64),
-        // u64 直出（勿 `as i64`：> i64::MAX 会回绕成负数，静默错值）。超界部分由
-        // op 出口的 jsnum 护栏降为十进制字符串。
-        Qv::BigUnsigned(Some(i)) => Value::from(*i),
+        // u64 直出（勿 `as i64`：> i64::MAX 会回绕成负数，静默错值）。超界部分由 op 出口的
+        // jsnum 护栏降为十进制字符串；此处先按可重放口径给 marker。
+        Qv::BigUnsigned(Some(i)) => uint_param(*i),
         Qv::Float(Some(f)) => num(*f as f64),
         Qv::Double(Some(f)) => num(*f),
         Qv::String(Some(s)) => Value::String(s.to_string()),
         _ => Value::Null,
     })
+}
+
+/// i64 参数回吐：安全范围内给 number，超出给 `$oj$i64` marker（可重放，见 `value_to_json`）。
+fn int_param(i: i64) -> Value {
+    if (-super::jsnum::MAX_SAFE_INT..=super::jsnum::MAX_SAFE_INT).contains(&i) {
+        Value::from(i)
+    } else {
+        serde_json::json!({ oj_plugin_ffi::jsint::I64_MARKER: i.to_string() })
+    }
+}
+
+/// u64 参数回吐：≤2^53-1 给 number；≤i64::MAX 用 `$oj$i64`；再往上只能用 `$oj$u64`
+/// （只有 MySQL `BIGINT UNSIGNED` 能承载，PG/SQLite 会明确报错）。
+fn uint_param(u: u64) -> Value {
+    if u <= super::jsnum::MAX_SAFE_INT as u64 {
+        Value::from(u)
+    } else if u <= i64::MAX as u64 {
+        serde_json::json!({ oj_plugin_ffi::jsint::I64_MARKER: u.to_string() })
+    } else {
+        serde_json::json!({ oj_plugin_ffi::jsint::U64_MARKER: u.to_string() })
+    }
 }
 
 /// 按名取 DataAccessor（默认 default）。模块 db 绑定在此收敛重定向：
@@ -1774,17 +1839,40 @@ mod tests {
     fn value_to_json_keeps_u64_and_bigint_exact() {
         assert_eq!(
             value_to_json(&Qv::BigInt(Some(i64::MIN))).unwrap(),
-            json!(i64::MIN)
+            json!({ oj_plugin_ffi::jsint::I64_MARKER: i64::MIN.to_string() })
         );
         assert_eq!(
             value_to_json(&Qv::BigUnsigned(Some(u64::MAX))).unwrap(),
-            json!(u64::MAX)
+            json!({ oj_plugin_ffi::jsint::U64_MARKER: u64::MAX.to_string() })
         );
+        // 安全范围内仍是 number（回放与可读性不变）。
         assert_eq!(value_to_json(&Qv::BigUnsigned(Some(0))).unwrap(), json!(0));
-        // 出口护栏把超界整数降为字符串（端到端见 accessor_sqlx 的 bigint 用例）
-        let mut v = value_to_json(&Qv::BigUnsigned(Some(u64::MAX))).unwrap();
-        super::super::jsnum::sanitize_js_numbers(&mut v);
-        assert_eq!(v, json!("18446744073709551615"));
+        assert_eq!(value_to_json(&Qv::BigInt(Some(42))).unwrap(), json!(42));
+        // >2^53 但 ≤i64::MAX：用 i64 marker（u64 的那一段才需要 $oj$u64）。
+        assert_eq!(
+            value_to_json(&Qv::BigUnsigned(Some(9223372036854775807))).unwrap(),
+            json!({ oj_plugin_ffi::jsint::I64_MARKER: "9223372036854775807" })
+        );
+        // **可重放**（v0.1.24 修的既有漏洞）：出口护栏不再把参数降成字符串，
+        // 于是 `db.query(toSQL().sql, ...toSQL().params)` 能原样回跑。
+        let mut params = vec![
+            value_to_json(&Qv::BigInt(Some(4886674138783273204))).unwrap(),
+            value_to_json(&Qv::BigUnsigned(Some(u64::MAX))).unwrap(),
+        ];
+        super::super::jsnum::sanitize_rows(&mut params);
+        assert_eq!(
+            params[0],
+            json!({ oj_plugin_ffi::jsint::I64_MARKER: "4886674138783273204" }),
+            "i64 大整数参数必须可重放（不得被降成字符串）"
+        );
+        assert_eq!(
+            params[1],
+            json!({ oj_plugin_ffi::jsint::U64_MARKER: "18446744073709551615" })
+        );
+        // 而 DB **读出来的**大整数仍按老口径降为十进制字符串（读侧契约不变）。
+        let mut row = json!({ "id": 4886674138783273204i64 });
+        super::super::jsnum::sanitize_js_numbers(&mut row);
+        assert_eq!(row["id"], json!("4886674138783273204"));
     }
 
     // ----- LIMIT 配置（db_query 段，v0.1.20）-----
@@ -3091,6 +3179,156 @@ mod tests {
             tenant_id: Some("t1".into()),
             ..Default::default()
         }
+    }
+
+    /// 数值型 `tenant_id` 列的夹具（v0.1.24）：`n`（integer 租户列）+ `n2`（join 用）。
+    async fn numeric_tenant_bridge() -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        for ddl in [
+            "create table n (id integer primary key, name text, tenant_id integer)",
+            "create table n2 (id integer primary key, label text, tenant_id integer)",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        for (n, tid) in [("n7", 7), ("n8", 8)] {
+            db.exec_with_params(
+                "insert into n (name, tenant_id) values (?, ?)",
+                &[json!(n), json!(tid)],
+            )
+            .await
+            .unwrap();
+        }
+        db.exec_with_params(
+            "insert into n2 (id, label, tenant_id) values (?, ?, ?)",
+            &[json!(1), json!("o7"), json!(7)],
+        )
+        .await
+        .unwrap();
+        let reg = SchemaRegistry::new()
+            .table_owned_shared_typed(
+                "m",
+                "n",
+                &["id"],
+                &[
+                    ("id", super::super::registry::ColumnType::Integer),
+                    ("name", super::super::registry::ColumnType::Text),
+                    ("tenant_id", super::super::registry::ColumnType::Integer),
+                ],
+                false,
+            )
+            .table_owned_shared_typed(
+                "m",
+                "n2",
+                &["id"],
+                &[
+                    ("id", super::super::registry::ColumnType::Integer),
+                    ("label", super::super::registry::ColumnType::Text),
+                    ("tenant_id", super::super::registry::ColumnType::Integer),
+                ],
+                false,
+            );
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            reg,
+            false,
+            None,
+            Extras {
+                sql_guard: SqlGuard::Deny,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn req_tenant(id: &str) -> RequestInfo {
+        RequestInfo {
+            tenant_id: Some(id.into()),
+            ..Default::default()
+        }
+    }
+
+    /// 数值型 `tenant_id`（v0.1.24）：注入条件 / insert 强制写 / update 拒绝 / join ON
+    /// 全部按**列类型**走数值，且写成「等值四形态」判定（字符串与数字不再二选一）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn numeric_tenant_column_binds_numbers_end_to_end() {
+        let b = numeric_tenant_bridge().await;
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const rows = await db.table("n").select(["name"]).all();
+                     const s = db.table("n").select(["name"]).toSQL();
+                     const j = db.table("n").select(["name"])
+                       .join("n2", [{left:"tenant_id",right:"tenant_id"}]).toSQL();
+                     await db.table("n").insert({ name: "n9" }).run();
+                     const after = await db.table("n").select(["name"]).orderBy([{field:"id",dir:"asc"}]).all();
+                     const mism = await db.table("n").insert({ name: "bad", tenant_id: 8 })
+                       .run().then(() => "ok", e => String(e));
+                     const upd = await db.table("n").update({ tenant_id: 8 })
+                       .where({field:"id",op:"eq",value:1}).run().then(() => "ok", e => String(e));
+                     json.ok({
+                       rows: rows.map(r => r.name),
+                       params: s.params, joinParams: j.params,
+                       after: after.map(r => r.name), mism, upd,
+                     });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                req_tenant("7"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["rows"], json!(["n7"]), "{v}");
+        // 注入的是**数值** 7（不是字符串 "7"）——这正是 PG 数值列不再报 bigint = text 的原因。
+        assert!(
+            v["data"]["params"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == &json!(7)),
+            "{v}"
+        );
+        // join 的 ON 条件同型（数值）。
+        assert!(
+            v["data"]["joinParams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == &json!(7)),
+            "{v}"
+        );
+        // insert 未给 tenant_id → 强制写数值 7；给了别的值 → 四形态等值判定拦下。
+        assert_eq!(v["data"]["after"], json!(["n7", "n9"]), "{v}");
+        assert!(
+            v["data"]["mism"].as_str().unwrap().contains("mismatch"),
+            "{v}"
+        );
+        assert!(
+            v["data"]["upd"].as_str().unwrap().contains("not allowed"),
+            "{v}"
+        );
+    }
+
+    /// 数值型租户列 + 非十进制租户头 → 明确报错（而不是把 "acme" 绑给 integer 列，
+    /// 让 PG 回一句看不出根因的 `invalid input syntax for type integer`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn numeric_tenant_column_rejects_non_numeric_tid() {
+        let b = numeric_tenant_bridge().await;
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const r = await db.table("n").select(["name"]).all()
+                       .then(() => "ok", e => String(e));
+                     json.ok({ r });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                req_tenant("acme"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let msg = v["data"]["r"].as_str().unwrap();
+        assert!(msg.contains("not a valid integer"), "{msg}");
+        assert!(msg.contains("n.tenant_id"), "{msg}");
     }
 
     /// select：构造器查询自动收窄到当前租户；toSQL 产物含注入条件与参数。

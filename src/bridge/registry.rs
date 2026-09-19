@@ -10,6 +10,46 @@ use std::collections::HashMap;
 pub struct ColumnDef {
     pub name: String,
     pub sortable: bool,
+    /// 列类型（v0.1.24；schema.yaml 声明来源）。`Unknown` = 未声明类型信息
+    /// （旧装配路径与全部既有夹具），按**旧行为**处理。
+    pub ty: ColumnType,
+}
+
+/// 列的 SQL 类型（v0.1.24）：取值与 `schema.yaml` 的 `type` 字段一致。
+///
+/// 用途：租户守卫按 `tenant_id` 列类型生成绑定值（数值列必须绑数值，否则 PG 报
+/// `operator does not exist: bigint = text`）；`Unknown` 保留 v0.1.23 及以前的字符串行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColumnType {
+    Integer,
+    BigInt,
+    Text,
+    Boolean,
+    Double,
+    Blob,
+    /// 未声明 / 未识别的类型（旧路径）。按 text 处理，保持向后兼容。
+    #[default]
+    Unknown,
+}
+
+impl ColumnType {
+    /// `schema.yaml` 的 `type` 字面量 → 类型（未知值归 `Unknown`，不 fail——声明期另有校验）。
+    pub fn from_schema_type(s: &str) -> Self {
+        match s {
+            "integer" => ColumnType::Integer,
+            "bigint" => ColumnType::BigInt,
+            "text" => ColumnType::Text,
+            "boolean" => ColumnType::Boolean,
+            "double" => ColumnType::Double,
+            "blob" => ColumnType::Blob,
+            _ => ColumnType::Unknown,
+        }
+    }
+
+    /// 是否可承载数值型租户 id（`apply_tenant` 与声明期校验共用）。
+    pub fn is_numeric(self) -> bool {
+        matches!(self, ColumnType::Integer | ColumnType::BigInt)
+    }
 }
 
 /// 单表定义。
@@ -39,6 +79,11 @@ impl TableDef {
     /// 校验列是否允许排序。
     pub fn is_sortable(&self, name: &str) -> bool {
         self.columns.get(name).map(|c| c.sortable).unwrap_or(false)
+    }
+
+    /// 列类型（未声明列 / 未声明类型 → `Unknown`）。
+    pub fn column_type(&self, name: &str) -> ColumnType {
+        self.columns.get(name).map(|c| c.ty).unwrap_or_default()
     }
 }
 
@@ -79,6 +124,46 @@ impl SchemaRegistry {
         self
     }
 
+    /// 带列类型的归属声明（v0.1.24；schema.yaml 真正带出类型的装配路径）。
+    /// 未列出的主键列与旧路径一样补 `Unknown`——列类型只影响租户守卫的绑定形态。
+    pub fn table_owned_shared_typed(
+        mut self,
+        owner: &str,
+        name: &str,
+        pk: &[&str],
+        columns: &[(&str, ColumnType)],
+        shared: bool,
+    ) -> Self {
+        let mut cols = HashMap::new();
+        for (c, ty) in columns {
+            cols.insert(
+                c.to_string(),
+                ColumnDef {
+                    name: c.to_string(),
+                    sortable: true,
+                    ty: *ty,
+                },
+            );
+        }
+        for p in pk {
+            cols.entry(p.to_string()).or_insert(ColumnDef {
+                name: p.to_string(),
+                sortable: true,
+                ty: ColumnType::Unknown,
+            });
+        }
+        self.tables.insert(
+            name.to_string(),
+            TableDef {
+                columns: cols,
+                primary_key: pk.iter().map(|s| s.to_string()).collect(),
+                owner: Some(owner.to_string()),
+                shared,
+            },
+        );
+        self
+    }
+
     fn declare(&mut self, owner: Option<String>, name: &str, pk: &[&str], columns: &[&str]) {
         self.declare_shared(owner, name, pk, columns, false);
     }
@@ -98,6 +183,7 @@ impl SchemaRegistry {
                 ColumnDef {
                     name: c.to_string(),
                     sortable: true,
+                    ty: ColumnType::Unknown,
                 },
             );
         }
@@ -105,6 +191,7 @@ impl SchemaRegistry {
             cols.entry(p.to_string()).or_insert(ColumnDef {
                 name: p.to_string(),
                 sortable: true,
+                ty: ColumnType::Unknown,
             });
         }
         self.tables.insert(
@@ -180,6 +267,7 @@ mod tests {
             ColumnDef {
                 name: "a".to_string(),
                 sortable: true,
+                ty: ColumnType::Unknown,
             },
         );
         cols.insert(
@@ -187,6 +275,7 @@ mod tests {
             ColumnDef {
                 name: "b".to_string(),
                 sortable: false,
+                ty: ColumnType::Unknown,
             },
         );
         let td = TableDef {
