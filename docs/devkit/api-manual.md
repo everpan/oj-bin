@@ -1564,7 +1564,9 @@ curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/
 `authorize`、`login`、`token`、`userinfo`——标准协议端点用 `json.raw` 出裸 JSON）；
 `sample/src/oidc/` 是 **RP**（`login` → 302 授权 → `callback` 换会话桥接成本地
 `auth` token → `logout`）。OIDC 的 302 跳转腿带不了自定义头，故 demo 在
-`tenant.anonymous_paths` 里匿名 `/oidc/*`、`/idp/*`（键见第 10 章 tenant/auth）；
+`tenant.anonymous_paths` 与 `auth.anonymous_paths` **两条列表**里都匿名
+`/oidc/*`、`/idp/*`、`/idp/.well-known/*`（窄面：discovery 比 `/idp/*` 深一层，故单列；
+auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 章 tenant/auth）；
 `oidc.rp`/`oidc.clients` 配置驱动，对接外部 IdP 只改 config。curl 全链路见
 `sample/README.md` 的「OIDC 演示」；实现走读（含 mermaid 时序图）与接入手册见
 `oidc-implementation.md` / `oidc-integration.md`（仓库在 `docs/` 下，发行包随 devkit
