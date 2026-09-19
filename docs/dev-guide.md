@@ -632,7 +632,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
     `OJ_TEST_RABBITMQ_URL=…` → `oj-bus-rabbitmq`
   - 运行：`cargo test --release --workspace`（env-gated 测试未设 env 即内联跳过；
     `infinite_loop` 曾在部分平台 SIGSEGV，CI 现按平台开关 `skip_infinite_loop` 控制，
-    默认跑全量，见 `.github/workflows/plugin-matrix.yml` 的 matrix 注释）。
+    默认跑全量，见 `.github/workflows/plugin-matrix.yml` 的 `select` job 注释）。
 
 覆盖率经 `cargo llvm-cov --workspace --summary-only` 观测（目标行/区域 >90%）。
 
@@ -760,5 +760,16 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
   最小实现）；commit 尾随 `unix@vip.qq.com ai`。
 - CI（`.github/workflows/`）：`release.yml`（linux-gnu / macos / windows 三平台测试 + 打包）
   与 `plugin-matrix.yml`（宿主 + 全部插件矩阵，`cargo xtask` 同款布局）。全部 `--release`。
+- **CI 资源策略**（v0.1.22 起，治「一个平台红 → 三平台陪跑」）：
+  - `plugin-matrix.yml` 按平台派发：`platforms=windows` 只生成 Windows 那条腿（另两条的 runner
+    不起），`shared_jobs=false` 再跳过 fmt+clippy 与 sample L1/L2 两个平台无关 job。修哪个平台
+    就只验哪个平台；改共享代码时仍用默认 `platforms=all`（三平台是安全网，别长期只跑一条腿）。
+  - concurrency（group = `ref` + 平台选择，`cancel-in-progress: true`）：同一意图的旧矩阵被新派发
+    取代即取消；不同平台选择并存（互不误杀）。
+  - 缓存：只缓 crate 源码/索引 + rusty_v8 预编译库。**不缓 `target/`**——本仓 release target 12G+，
+    三平台相加超 GitHub 每仓 10G 上限，会被 LRU 互相挤出，命中率归零还倒赔上传时间。
+  - `release.yml` 不提供按平台选择（发行物必须三平台齐全），单平台出错用 GitHub 的
+    "Re-run failed jobs" 只重跑那条腿（缓存使其热启动）。
+  - 各 job 均设 `timeout-minutes`：挂死不再默认烧满 360 分钟。
 - 精确 pin `deno_core` 版本（V8 ABI 随其变化）。
 - 产物统一 `cargo xtask build` 归置 `bin/`，发行布局与插件发现路径同形。
