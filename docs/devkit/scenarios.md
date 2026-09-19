@@ -514,6 +514,7 @@ expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 | 并发下仍然分配出重复序号 | `max+1` 本身有竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子） |
 | 同一条 SQL 混用字符串/数字参数后报 `invalid byte sequence … 0x00` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**；若仍出现，检查 PG 插件是否随宿主重建 |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text 或换 MySQL `BIGINT UNSIGNED` |
+| MySQL: `column 'x' has MySQL type 'DECIMAL' … does not decode yet` | 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而非静默给 `null`**；在 SQL 里 `cast(x as char) as x`，别用 `select *`。`BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` |
 
 > 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
 

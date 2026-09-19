@@ -2,6 +2,17 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+**版本分界提交的固定动作**（发版自查）：
+1. 递增 `oj/Cargo.toml` 的 version（`Cargo.lock` 中该包条目同步）；
+2. 本节标题由「下一版（未发布）」改为具体版本号（未打标签时注明）；
+3. **同步更新对外文档 `docs/devkit/` 四件**——`api-manual.md` / `scenarios.md` / `SKILL.md` /
+   `README.md` 必须与该版**用户可见变更**逐条对齐（新 API 与报错文案进 `api-manual.md` 的对应
+   章节**及错误/限制表**，高频陷阱进 `SKILL.md` 陷阱速查，可照抄场景进 `scenarios.md`）；
+4. `cargo xtask build` 归置 `bin/devkit/`（`cargo test --release -p xtask` 的 devkit 契约用例
+   校验产物与源文件一致）。
+
+详见 `docs/devkit/README.md`「版本同步要求」。
+
 ## v0.1.24（2026-09-19 · 版本号已定，**未打标签**）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.23 → 0.1.24`）——**未创建
