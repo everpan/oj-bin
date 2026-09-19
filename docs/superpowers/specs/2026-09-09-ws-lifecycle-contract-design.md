@@ -86,7 +86,7 @@ transpile（不变）→ make() → ws_connect()
 1. `server/src/ws.rs` 现有 legacy 用例改写为新契约（echo 信封、send 顺序、bus 广播、缺失文件、双连接聊天等回归钉全部保留语义）。
 2. 新增用例：error 兜底后连接继续、close 恰好触发一次、无导出断连、connection 阶段 ws.send 先于首帧。
 3. `sample/src/news/ws.ts` 改写为新契约示例。
-4. 文档：`docs/dev-guide.md`、`docs/devkit/api-manual.md` WS 章节、`CHANGELIST.md`（breaking 标注）。
+4. 文档：`docs/dev-guide.md`、`docs/devkit/api-manual.md` WS 章节、`CHANGELOG.md`（breaking 标注）。
 
 ## 范围外（YAGNI）
 

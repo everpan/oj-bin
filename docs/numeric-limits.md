@@ -260,7 +260,7 @@ v0.1.22 交付时按既有流程跑了**开发侧 + 架构侧双专家评审**�
 | # | 意见（开发侧 / 架构侧） | 处置 |
 |---|---|---|
 | 1 | `encodeParams` 把 `Date` 压成 `{}`，破坏 `toJSON`/子查询快照原有的 JSON 语义（P1） | `encodeParams` 对带 `toJSON` 的对象改为遵循 JSON 语义（`Date` → ISO 串）；快照 API 单独用 `encodeSnapshot`（JSON 往返 + bigint 标记）。实测断言见 `bigint_covers_remaining_js_entry_points` |
-| 2 | CHANGELIST 把「订正 `CLAUDE.md` ABI」列入修复，但该文件是 **gitignored/untracked**，diff 里看不到（P1） | 从 CHANGELIST 删除该条（文件本身已订正 7→8，仅作本地指引） |
+| 2 | CHANGELOG 把「订正 `CLAUDE.md` ABI」列入修复，但该文件是 **gitignored/untracked**，diff 里看不到（P1） | 从 CHANGELOG 删除该条（文件本身已订正 7→8，仅作本地指引） |
 | 3 | 测试缺口：`db.query` 参数、`toSQL().params`、`toJSON/fromJSON`、`having`、CASE `then`、`union/with` 子查询、`Qv::BigUnsigned`（P1） | 新增 `bigint_covers_remaining_js_entry_points`（六项全覆盖 + Date 语义）、`value_to_json_keeps_u64_and_bigint_exact` |
 | 4 | `jwt.verify` 的 claims 是**外部可控** JSON，未过护栏 → 雪花量级声明会让 `json.ok(claims)` 500（架构侧 P2） | `op_jwt_verify` 出口加护栏（同类：`op_mail_result`） |
 | 5 | `toDouble` 比文档宽（接受 `0x10` / `Infinity`）（P2） | 文档按实现订正为「`Number()` 语义」并给出接受示例 |

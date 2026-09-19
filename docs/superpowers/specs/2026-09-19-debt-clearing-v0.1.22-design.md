@@ -1,6 +1,6 @@
 # 清账 v0.1.22 · 五条已知债的设计与验证
 
-> 范围：`CHANGELIST.md` v0.1.22「已知债 / 另案登记」五条 —— ①PG 语句缓存 × 混合参数类型、
+> 范围：`CHANGELOG.md` v0.1.22「已知债 / 另案登记」五条 —— ①PG 语句缓存 × 混合参数类型、
 > ②`u64`/`BIGINT UNSIGNED`、③数值型 `tenant_id` 列、④内建序列分配原语、⑤MySQL 侧真库验证。
 > 交付形态：v0.1.23 已发版（标签 → `039b314`），本批改动进 **v0.1.24**（版本号随
 > `oj/Cargo.toml` 递增确定，**未打标签**）；本文件随该批提交落地，评审处置见 §6。
@@ -168,7 +168,7 @@ join 的 ON 参数同型、非十进制租户头报 `not a valid integer for num
 | A1 | **P1-2（真 bug）`db.nextSeq` 在 `db.tx` 内首次使用必失败并毒化调用方事务**：PG 里事务内失败语句使事务进入 aborted 态（`25P02`），而原实现是「先试 → 失败才建表 → 在同一事务会话上重试」 | **已修**：改为「**每库一次的先确保**」——DDL 一律走池、在事务内取号之前完成（`ensure_seq_once` + `StableState.seq_ensured` 缓存，DDL 不落调用方事务，MySQL 的隐式提交与 PG 的 aborted 态都不再可能发生）。新增真库回归 `next_seq_first_use_inside_tx_on_real_db`（先 `drop table` 强制首次路径；**PG 与 MySQL 双跑**：tx 内首次=1、同事务第二次=2） |
 | A2 | P2-1 `Pooled::Any` 分支验证不到生产 MySQL 行解码，「两路径未漂移」的说法不成立；TINYINT 描述不准确 | 采纳：插件内标注 `Pooled::Any` 为**仅测试用**；本文件 §2.2 订正为「Any+MySQL 组合本就不可用（`Any::try_from` 缺 `Tiny` 等分支），离线用例只覆盖编排/绑定通路」；补注 `real_compatible` 显式排除 DECIMAL |
 | A3 | P2-2 `nextSeq` 的语义缺口（库级共享 / `name` 不可取用户输入 / 需 DDL 权限 / `memory://` 不支持 / 序列不回退） | 采纳：`docs/db-guide.md` §11 第 7 条补「四条必须知道的语义」，`docs/devkit/api-manual.md` 的 `db.nextSeq` 行同步 |
-| A4 | P2-3 文档订正：§4.5 悬空引用、`ABI_VERSION 7` 过时、spec 的 TINYINT 描述、CHANGELIST 缺兼容性小节 | 采纳并全部订正（`numeric-limits.md` 两处、`plugin-architecture.md` 与 `plugin-development.md` 的 ABI 8、本文件 §2.2、CHANGELIST 新增「兼容性 / 行为变更」7 条） |
+| A4 | P2-3 文档订正：§4.5 悬空引用、`ABI_VERSION 7` 过时、spec 的 TINYINT 描述、CHANGELOG 缺兼容性小节 | 采纳并全部订正（`numeric-limits.md` 两处、`plugin-architecture.md` 与 `plugin-development.md` 的 ABI 8、本文件 §2.2、CHANGELOG 新增「兼容性 / 行为变更」7 条） |
 | A5 | P2-4 根 crate 的 dev-deps pg/mysql 无 core 用例使用 | **部分采纳**：本轮新增了 core 级真库用例（`next_seq_first_use_inside_tx_on_real_db` 直连真库），驱动**确有用途** → 保留并更新注释指向该用例（不再是无用依赖） |
 | A6 | P2-5 `shape_tag` 的 `'u'` 分支当前不可达、与 `bind_value` 不一致 | 采纳（文档化而非删除）：保留分支并注明「不可达的原因（reject 先行）+ 若放开 u64 必须同步 `bind_value`」，删掉会在未来重排时静默退化成 `'t'` |
 
@@ -176,8 +176,8 @@ join 的 ON 参数同型、非十进制租户头报 `not a valid integer for num
 
 | # | 意见 | 理由 / 处置 |
 |---|---|---|
-| R1 | P1-1 引入 `WIRE_VERSION` 对线形状做**硬门禁**（指纹不符即 fail） | **本轮不采纳，改为登记**（CHANGELIST「线形状版本门禁缺失」）：把加载器从「warn-only」改成 fail 本身是一次**兼容性变更**（会打断仅因 rustc/triple 变化而指纹不符的既有部署），不该夹在清账批次里顺手做；本轮以「混版本明确不受支持」的文档纪律 + 发布物成对（`bin/oj` 与 `bin/plugins/` 同批）替代，并把它列为下一条独立事项 |
-| R2 | P1-3 加 CI 真库 job + `OJ_TEST_REQUIRE=1` | **本轮不采纳，改为登记**：新增 GitHub Actions service（PG+MySQL）与「缺 env 即 fail」的模式需要**在 CI 上首跑验证**，而本机没有 runner——写一个无法本地验证的 workflow 违背本仓「结论必须回源码/实证」的纪律。已把「假绿」风险与建议写进 CHANGELIST，作为独立事项排期 |
+| R1 | P1-1 引入 `WIRE_VERSION` 对线形状做**硬门禁**（指纹不符即 fail） | **本轮不采纳，改为登记**（CHANGELOG「线形状版本门禁缺失」）：把加载器从「warn-only」改成 fail 本身是一次**兼容性变更**（会打断仅因 rustc/triple 变化而指纹不符的既有部署），不该夹在清账批次里顺手做；本轮以「混版本明确不受支持」的文档纪律 + 发布物成对（`bin/oj` 与 `bin/plugins/` 同批）替代，并把它列为下一条独立事项 |
+| R2 | P1-3 加 CI 真库 job + `OJ_TEST_REQUIRE=1` | **本轮不采纳，改为登记**：新增 GitHub Actions service（PG+MySQL）与「缺 env 即 fail」的模式需要**在 CI 上首跑验证**，而本机没有 runner——写一个无法本地验证的 workflow 违背本仓「结论必须回源码/实证」的纪律。已把「假绿」风险与建议写进 CHANGELOG，作为独立事项排期 |
 | R3 | P2-1 把「首个 compatible 胜出」彻底改为按 `MySqlTypeInfo` 显式分派（TINYINT→bool、DECIMAL→String 等） | 本轮**未做**：显式分派需要把每一种 MySQL 类型的期望 JSON 形状逐一定义（含 `BIT`/`DECIMAL`/时间类型的取舍），属独立的「MySQL 类型映射表」设计；本轮先保证**安全顺序**（整数优先、排除 DECIMAL 的 f64 误吞）与真库用例，形状表的统一另立事项 |
 
 ### 6.3 开发侧评审
@@ -193,23 +193,23 @@ join 的 ON 参数同型、非十进制租户头报 `not a valid integer for num
 
 | # | 意见（开发侧评审） | 处置 |
 |---|---|---|
-| D1 | **P0（真回归，已修）MySQL 类型化行解码把一批常见列类型静默变成 `null`**：`column_json_mysql` 的六个探测对 `DECIMAL`/`NEWDECIMAL`/`JSON`/`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`/`BIT` 全部 `compatible=false`（已逐条核 `sqlx-mysql` 的 `str`/`bytes`/`float`/`int`/`uint`/`bool` compatible 列表），返回 `None` → `unwrap_or(Null)` → **空值**。而 `sqlx::Any` 时代这些类型在列转换就抛 `AnyDriverError`（`sqlx-mysql/src/any.rs` 的 `TryFrom<&MySqlTypeInfo>` 只认 Null/Short/Long/LongLong/Float/Double + str/bytes 可兼容者）→ **fail-loud 退化成静默错值**，正踩本仓红线，且发生在本批刚宣布"生产化"的 MySQL 路径上 | **已修（代码）**：`row_to_json_mysql` 改返回 `Result`，未命中任何探测的列**报错**，点名列名 + `col.type_info().name()` + 指路 `cast(x as char)`；两个调用点（池 / 事务）改为 `collect::<Result<…>>()` 传播。新增 env-gated 真库回归 `real_mysql_unsupported_column_types_error_loudly`：`DECIMAL`/`DATETIME`/`JSON` 三个随机列**必报错且错误串含类型名**，同时钉住 `TEXT`/整数/`BIGINT UNSIGNED` 可读、`BOOLEAN` → `1`。**文档同步**：`docs/numeric-limits.md` §4 新增第 10 条、`docs/db-guide.md` §11 新增第 8 条 + 报错表两行、devkit `api-manual.md` 边界小段 + 报错表两行（并删掉已过时的「`u64`/`BIGINT UNSIGNED` 未支持」行）、`CHANGELIST` §兼容性新增第 8 条 |
+| D1 | **P0（真回归，已修）MySQL 类型化行解码把一批常见列类型静默变成 `null`**：`column_json_mysql` 的六个探测对 `DECIMAL`/`NEWDECIMAL`/`JSON`/`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`/`BIT` 全部 `compatible=false`（已逐条核 `sqlx-mysql` 的 `str`/`bytes`/`float`/`int`/`uint`/`bool` compatible 列表），返回 `None` → `unwrap_or(Null)` → **空值**。而 `sqlx::Any` 时代这些类型在列转换就抛 `AnyDriverError`（`sqlx-mysql/src/any.rs` 的 `TryFrom<&MySqlTypeInfo>` 只认 Null/Short/Long/LongLong/Float/Double + str/bytes 可兼容者）→ **fail-loud 退化成静默错值**，正踩本仓红线，且发生在本批刚宣布"生产化"的 MySQL 路径上 | **已修（代码）**：`row_to_json_mysql` 改返回 `Result`，未命中任何探测的列**报错**，点名列名 + `col.type_info().name()` + 指路 `cast(x as char)`；两个调用点（池 / 事务）改为 `collect::<Result<…>>()` 传播。新增 env-gated 真库回归 `real_mysql_unsupported_column_types_error_loudly`：`DECIMAL`/`DATETIME`/`JSON` 三个随机列**必报错且错误串含类型名**，同时钉住 `TEXT`/整数/`BIGINT UNSIGNED` 可读、`BOOLEAN` → `1`。**文档同步**：`docs/numeric-limits.md` §4 新增第 10 条、`docs/db-guide.md` §11 新增第 8 条 + 报错表两行、devkit `api-manual.md` 边界小段 + 报错表两行（并删掉已过时的「`u64`/`BIGINT UNSIGNED` 未支持」行）、`CHANGELOG` §兼容性新增第 8 条 |
 | D2 | **P1（真 bug，已修）`seq_ensured` 用 JS 可见名当键，而物理库可能不同**：`op_db_next_seq` 把 `name`（bootstrap 传来的 `DB(name)` 名）直接当缓存键，但 `lookup` 会经 `guard::bound_db` 把字面 `"default"` 按 manifest `db:` / `db_override` 重定向。同一 Bridge 下模块 A（→`db_a`）写入键 `"default"` 后，模块 B（→`db_b`）会**命中该条目并跳过建表**：池路径白付一次失败语句 + 一次 DDL，**事务路径没有兜底 → 直接失败**——正是 A1 声称已消灭的故障类 | **已修（代码）**：键改用 `bound_db(state, name)` 的结果（物理库名；`StateLookup` 里物理名与 accessor 是 1:1）。新增离线回归 `next_seq_ddl_cache_is_keyed_by_physical_db`：两个模块把字面 `"default"` 绑到两个物理库，用记录型 accessor **直接数 `_oj_sequences` 的 DDL**（每库必须各一次）。**已实测判别力**：临时回退修复 → `(1, 0)` 红，恢复后 `(1, 1)` 绿 |
 | D3 | P2 `src/bridge/db.rs` 的 `op_db_next_seq` doc 仍写「**先试后建表**…只有真正失败才补建」，与实现（每库一次先 `ensure_seq_once`、DDL 一律走池且先于取号）矛盾，将来有人照注释"优化"回去就会复现 A1 | 采纳：该段改写为「**每库一次先确保**（DDL 走池、绝不进调用方事务）+ 池路径保留兜底 + **事务路径无兜底**（靠先 ensure）」 |
-| D4 | P2 `plugins/oj-db-mysql` 的 `bool` 分支**不可达**（`int_compatible` 覆盖 `bool::compatible` 的全部整型且 i64 在前），真实后果是 MySQL `BOOLEAN`/`TINYINT(1)` 读出 `1`/`0` 而非 `true`/`false`；而「Any 时代这些类型报错」意味着 BOOLEAN 是**从报错变可读**，兼容性小节只说「整数列给 number」不够点名 | 采纳：函数注释写清「不可达但保留为顺序意图标记，**勿删**」+「`BOOLEAN` 按整数读」；`CHANGELIST` §兼容性第 8 条、`numeric-limits.md` 第 10 条、`db-guide.md`、devkit `api-manual.md` 四处点名 |
+| D4 | P2 `plugins/oj-db-mysql` 的 `bool` 分支**不可达**（`int_compatible` 覆盖 `bool::compatible` 的全部整型且 i64 在前），真实后果是 MySQL `BOOLEAN`/`TINYINT(1)` 读出 `1`/`0` 而非 `true`/`false`；而「Any 时代这些类型报错」意味着 BOOLEAN 是**从报错变可读**，兼容性小节只说「整数列给 number」不够点名 | 采纳：函数注释写清「不可达但保留为顺序意图标记，**勿删**」+「`BOOLEAN` 按整数读」；`CHANGELOG` §兼容性第 8 条、`numeric-limits.md` 第 10 条、`db-guide.md`、devkit `api-manual.md` 四处点名 |
 | D5 | P2 `bootstrap.js` 的 `intMarker` 让 `toUBigInt("42")` 编码成 `{"$oj$i64":"42"}`——i64 范围内的「无符号意图」丢失（功能无害：MySQL 接受、数值一致），但与 d.ts/文档叙述不一致 | 采纳（**文档而非改码**）：`numeric-limits.md` 第 3 条补「无符号意图仅在 `> i64::MAX` 时体现在线形状上，故『PG/SQLite 拒绝一切 u64』对 ≤`i64::MAX` 的值不成立」。改码需让 BigInt 携带符号意图（新包装类型 = 线形状变更），不夹在本批 |
 | D6 | P2 `ensure_seq_once` 的 `.lock().unwrap()`：持锁期 panic 会让这个 **Bridge 级共享**缓存永久中毒 → 此后每次 `nextSeq` 都 panic | 采纳：两处改 `unwrap_or_else(|e| e.into_inner())`（该 `HashSet` 在 panic 点前后都自洽，取回不变量成立） |
-| D7 | P2 测试面：真库用例 env 未设即**静默 skip**，而 `next_seq_first_use_inside_tx_on_real_db` 是 A1（事务内首次取号）的**唯一**守卫、sqlite 与假实现都没有 aborted-tx 语义 → 该修复在 CI 上实际**无覆盖**；MySQL 并发用例只断言终值；PG 混形态的「缓存条目 ≥2」断言只钉实现细节（去掉前缀即为 0） | 采纳（**登记而非改**）：CI 缺口并入已登记的 P1-3 并在 `CHANGELIST` 写清「该修复在 CI 上实际无覆盖」。**部分已消除**：本批新增的 D2 回归改为**离线可跑**（不依赖真库），把「P1-2 类修复无离线守卫」补上 |
-| D8 | P2 两处行为变更未登记：① 数值型 `tenant_id` 列在 `tenant.sql_guard: warn` 下，租户头非十进制整数时 `tenant_value` 直接 `Err`（warn 只放行「无法判定」，不放行「判定为不匹配」）——与「warn = 只告警」的直觉不同；② `update({tenant_id: 7})`（text 列、租户 `"7"`）由「拒绝」变「放行」（放宽） | 采纳：`CHANGELIST` §兼容性新增第 9、10 条逐条写明 |
+| D7 | P2 测试面：真库用例 env 未设即**静默 skip**，而 `next_seq_first_use_inside_tx_on_real_db` 是 A1（事务内首次取号）的**唯一**守卫、sqlite 与假实现都没有 aborted-tx 语义 → 该修复在 CI 上实际**无覆盖**；MySQL 并发用例只断言终值；PG 混形态的「缓存条目 ≥2」断言只钉实现细节（去掉前缀即为 0） | 采纳（**登记而非改**）：CI 缺口并入已登记的 P1-3 并在 `CHANGELOG` 写清「该修复在 CI 上实际无覆盖」。**部分已消除**：本批新增的 D2 回归改为**离线可跑**（不依赖真库），把「P1-2 类修复无离线守卫」补上 |
+| D8 | P2 两处行为变更未登记：① 数值型 `tenant_id` 列在 `tenant.sql_guard: warn` 下，租户头非十进制整数时 `tenant_value` 直接 `Err`（warn 只放行「无法判定」，不放行「判定为不匹配」）——与「warn = 只告警」的直觉不同；② `update({tenant_id: 7})`（text 列、租户 `"7"`）由「拒绝」变「放行」（放宽） | 采纳：`CHANGELOG` §兼容性新增第 9、10 条逐条写明 |
 
 **D1 连带的具体化挂账**：D1 的彻底修法是按 `MySqlTypeInfo` 显式分派（`DECIMAL`→十进制字符串、
 `JSON`→对象、时间→字符串…）——这正是 §6.2 R3 的「MySQL 类型映射表」；本轮只做到「不静默错值」，
-该能力缺口已作为独立事项写进 `CHANGELIST`。
+该能力缺口已作为独立事项写进 `CHANGELOG`。
 
 **评审过程中新发现并登记的一条**：`sqlite`（`max_connections(1)`）在活跃事务期间于池上发 DDL 会
 **等锁超时**，故 `db.nextSeq` **首次**在 `db.tx` 内使用在 sqlite 上会挂住（PG/MySQL 池 ≥2 无此
 问题）。这是 1 连接 accessor 的通用性质（任何「事务内还去池上取连接」的路径都如此），非 `nextSeq`
-引入，登记备查、未修（见 `CHANGELIST`）。
+引入，登记备查、未修（见 `CHANGELOG`）。
 
 ---
 
@@ -227,7 +227,7 @@ join 的 ON 参数同型、非十进制租户头报 `not a valid integer for num
      `Bridge::run_with` 的事件循环驱动方式有关（测试夹具在单次 run 内密集发起 op），生产
      actor 循环的节奏不同。**需专项排查**；
    - 本轮处置：`db.nextSeq` 的真库并发用例改由**插件层**驱动（`plugins/oj-db-*`，绕开 deno_core），
-     core 侧只留 ≤8 并发的离线用例；在 `CHANGELIST` 登记，并在 `db.rs` 测试处留注释指向。
+     core 侧只留 ≤8 并发的离线用例；在 `CHANGELOG` 登记，并在 `db.rs` 测试处留注释指向。
 2. **MySQL 8 明文连接需 `mysql-rsa`**（§2.2 已修）：这是「MySQL 真库未验证」掩盖住的真实缺口。
 
 ---

@@ -211,7 +211,7 @@ fn sql_guard_of(cfg: &Config) -> SqlGuard {
 /// `strip_suffix("/*")` 加 `starts_with` 再加 `len > prefix.len()`（即尾 `*` = 任意深度）；
 /// **租户侧自引入起就是严格一层**：`git show v0.1.19:server/src/lib.rs` 的 `path_matches`
 /// 即 `!rest[1..].contains('/')`，且 v0.1.19 的租户豁免（同文件 `:364`）走的就是它。
-/// 对 tenant 条目说「收紧收回了面」是伪前提（v0.1.20 CHANGELIST 兼容性条目把两条列表并列，
+/// 对 tenant 条目说「收紧收回了面」是伪前提（v0.1.20 CHANGELOG 兼容性条目把两条列表并列，
 /// 措辞不精确，v0.1.23 已订正）。
 ///
 /// 两个条件**同时成立**才告警：

@@ -585,14 +585,14 @@ Expected: FAIL
 **Step 2: 实现/接线**（并按 `job_id` 命名 .eml 防并发竞态）。
 **Step 3: 跑测试** → PASS。 **Step 4: 提交** `test(mail): FileTransport 端到端`
 
-### Task 7.3：xtask/CI 覆盖 + CHANGELIST + 文档
+### Task 7.3：xtask/CI 覆盖 + CHANGELOG + 文档
 
-**Files:** Modify: `tools/xtask/src/main.rs`（`PLUGINS` 表增 `"mail"`）、`CHANGELIST.md`、`README.md`/`docs/devkit/api-manual.md`
+**Files:** Modify: `tools/xtask/src/main.rs`（`PLUGINS` 表增 `"mail"`）、`CHANGELOG.md`、`README.md`/`docs/devkit/api-manual.md`
 
 **Step 1:** `cargo xtask plugin mail --check` PASS。
 **Step 2:** **只改 `tools/xtask/src/main.rs:28` 的 `PLUGINS`**（CI matrix / 归置的单一真相源）。**不要改 `.github/workflows/plugin-matrix.yml`**——该文件不硬编码插件名（注释明写「单一真相源是 xtask 的 PLUGINS」，且记有「此前硬编码 7 个漏 `auth`」的历史教训，加插件名到 CI 属重蹈失步）。注意 `PLUGINS` 有守护测试断言 `len()==8`，须连带更新为 9。
-**Step 3:** CHANGELIST 记 v0.1.19 特性；api-manual 补 `Mail`/`mail` 用法。
-**Step 4: 提交** `docs(mail): CHANGELIST/api-manual/CI 覆盖`
+**Step 3:** CHANGELOG 记 v0.1.19 特性；api-manual 补 `Mail`/`mail` 用法。
+**Step 4: 提交** `docs(mail): CHANGELOG/api-manual/CI 覆盖`
 
 **阶段 7 小结**：端到端可用；CI 与文档齐。
 
@@ -1648,7 +1648,7 @@ worker → 真 `.eml` 落盘，全链打通；CI 单一真相源（xtask `PLUGIN
 | `sample/config.yaml` | `smtp:` 段 + `mock` profile（`:52` 起）：`file_transport` 落盘通道 + **显式** `allowed_from`/`allowed_recipients` + `tls: none`/`allow_none_tls: true`；另附注释掉的 `default` 真连样例。 |
 | `oj/tests/mail_e2e.rs`（新增） | 真装配 e2e：`eml_dir:36`（进程内共用落盘目录）/`write_project:81`（config.yaml + `mail` 模块 + 附件）/`boot:147`（`App::from_config`）；两条用例：正例 `:188`、白名单负例 `:234`。 |
 | `tools/xtask/src/main.rs` | `PLUGINS` 追加 `"mail"`（`:37`）；守护断言 `len()==8 → 9`（`:487`）。 |
-| 文档 | `CHANGELIST.md` 新增 v0.1.19 段；`docs/devkit/api-manual.md`（总表 + 「mail」小节）；`docs/user-manual.md` §3；`README.md`；`sample/global.d.ts`（阶段 6 漏掉的类型面）；`docs/devkit/{README,SKILL}.md`；阶段 1 小结 §5 的 6 处陈旧 `AXES` 散文清单。 |
+| 文档 | `CHANGELOG.md` 新增 v0.1.19 段；`docs/devkit/api-manual.md`（总表 + 「mail」小节）；`docs/user-manual.md` §3；`README.md`；`sample/global.d.ts`（阶段 6 漏掉的类型面）；`docs/devkit/{README,SKILL}.md`；阶段 1 小结 §5 的 6 处陈旧 `AXES` 散文清单。 |
 
 #### 2. 装配点（全链）
 
@@ -1743,7 +1743,7 @@ config.yaml(smtp:) → only_js::config::SmtpSection
 |---|---|
 | `185c0a3` | `feat(server): mail 装配（smtp: 段 + plugin_cfg 适配器 + Extras.mail 注入）` |
 | `4756ecd` | `test(mail): FileTransport 端到端（真装配 + 真 .eml 落盘）` |
-| `cfeee76` | `docs(mail): CHANGELIST/api-manual/README + xtask PLUGINS 覆盖` |
+| `cfeee76` | `docs(mail): CHANGELOG/api-manual/README + xtask PLUGINS 覆盖` |
 
 #### 7. 遗留 / 交给阶段 8
 
@@ -1816,7 +1816,7 @@ config.yaml(smtp:) → only_js::config::SmtpSection
 | `oj/Cargo.toml` | `version = "0.1.18"` → **`"0.1.19"`** |
 | `Cargo.lock` | `name = "oj"` 块 `0.1.18` → **`0.1.19`**（1 行，`cargo metadata` 同步） |
 
-`CHANGELIST.md` 的 v0.1.19 段落**逐条核对后与实现一致、无需订正**：它未声称 `code:2/3`
+`CHANGELOG.md` 的 v0.1.19 段落**逐条核对后与实现一致、无需订正**：它未声称 `code:2/3`
 可用（故与 D1 不冲突）、未声称 `none` TLS 的内网 CIDR 约束（故与 D2 不冲突）、
 也未声称「宿主地址集 ≡ 插件地址集」（故与 D3 不冲突）；`lettre` 依赖形态
 （`default-features = false`，只取 `Address`）、`ABI_VERSION` 保持 8、`PLUGINS` 增 `mail`、
@@ -1858,7 +1858,7 @@ api-manual「第 6 章 mail 小节」等声明均与代码实测相符。
 | `6b2a50f` | `docs(mail): 阶段 8 安全审计订正 + 小结（错误码 2/3 与 none-CIDR 未实现登记）` |
 | `4076443` | `chore(release): v0.1.19（mail 轴 + IDE 类型修复）` |
 
-（顺序即任务书的「安全补缺 → 门禁/文档 → 版本递增」；`CHANGELIST.md` 的 v0.1.19 段落在阶段 7
+（顺序即任务书的「安全补缺 → 门禁/文档 → 版本递增」；`CHANGELOG.md` 的 v0.1.19 段落在阶段 7
 已写定，本次核对无误故未改动。）
 
 ---
@@ -1875,7 +1875,7 @@ api-manual「第 6 章 mail 小节」等声明均与代码实测相符。
 | A1 | **`enqueue` 返回裸 `{"jobId"}`**，与三层公开契约（`global.d.ts`/bootstrap.js/手册/api-manual）承诺的 `{code:0,data:{jobId}}` 不符 → 用户 `res.data.jobId` TypeError，且拿不到 jobId 就无法 `mail.result()` 回查 | 引擎改回统一信封；宿主对无 `code` 字段的返回做纵深防御包装；补**真插件** `enqueue` e2e（宿主用例用 FakeMail 掩盖了该差异） |
 | A2 | `await_ffi`（`yield_now` 空转）在 SMTP 长耗时下烧满该 isolate 的 current_thread | 改用 `await_ffi_poll`（与 mq 同解） |
 | A3 | worker 帧 drop 顺序不成立 → transport 可能在**无 runtime 上下文**析构（lettre `pool` Drop 时 `tokio::spawn`）→ panic/abort | worker 块内发退出信号**之前**显式 `drop(targets/deliver/rx)` |
-| A4 | graceful drain 生产不可达（仅测试调用，`allow(dead_code)`）→ 停机丢在途邮件，CHANGELIST 承诺落空 | 接线到停机路径 |
+| A4 | graceful drain 生产不可达（仅测试调用，`allow(dead_code)`）→ 停机丢在途邮件，CHANGELOG 承诺落空 | 接线到停机路径 |
 | A5 | `plugins.mail` 与顶层 `smtp:` 并存时**静默遮蔽**后者（改白名单/凭据不生效） | 装配期 fail-fast |
 | A6 | JS 可见面宣称错误码 2/3（未实现）；死变量 `hint`；raw Subject 注释矛盾；`queue full` 英文文案；`host_deliver` 告警不分成因 | 逐项订正 |
 

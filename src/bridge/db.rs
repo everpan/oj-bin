@@ -646,7 +646,7 @@ mod tests {
     }
 
     // 真库并发取号**不在本文件测**：经由 deno_core 连发 op 会撞既有缺陷
-    // （见 CHANGELIST「已知债」：并发超过 sqlx 池上限 / await 后再发 op → op 驱动
+    // （见 CHANGELOG「已知债」：并发超过 sqlx 池上限 / await 后再发 op → op 驱动
     // `RefCell already borrowed` abort）。原子性改由插件层真库用例证明：
     // `plugins/oj-db-postgres` 的 `real_postgres_next_seq_is_atomic_under_concurrency`
     // 与 `plugins/oj-db-mysql` 的 `real_mysql_next_seq_*`（env-gated）。

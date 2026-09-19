@@ -23,7 +23,7 @@
 - 钩子契约不变：`export default { connection, message, close, error }`；返回值忽略；error(e) 后连接继续；**帧超时断开该连接（回归 v0.1.9 契约）**；至少导出一个钩子。
 - SOLID/DRY：新逻辑独立成 `src/bridge/frame_pool.rs`（单一职责）；既有捕获链（ReqState 读取、emit 顺序契约）复用不复制。
 - **执行纪律（用户指令）**：分阶段推进，每阶段完成 → 更新任务状态 + 输出一行小结；TDD（先测后码）；**不逐任务评审，全部完成后集中终审一次**。
-- 最终版本 **v0.1.10**（`oj/Cargo.toml` bump + CHANGELIST v0.1.10 段为发布点提交）。
+- 最终版本 **v0.1.10**（`oj/Cargo.toml` bump + CHANGELOG v0.1.10 段为发布点提交）。
 
 ---
 
@@ -981,14 +981,14 @@ export default {
 - [ ] **Step 4: 冒烟**：`timeout 15 cargo run -p oj -- server -c sample/config.yaml --api-path sample/src`——监听正常、无池装配报错。
 - [ ] **Step 5: Commit** `feat(sample): news 迁移 sess 演示 + 版本 0.1.2，dist 重建（v0.1.10 §阶段四）`
 
-### Task 8: 文档清扫 + CHANGELIST + v0.1.10 发布点
+### Task 8: 文档清扫 + CHANGELOG + v0.1.10 发布点
 
 **Files:**
 - Modify: `docs/devkit/api-manual.md`（§ws.ts：帧池模型、sess API 与可序列化约束、模块作用域新语义、配置面、超时契约回归每连接）
 - Modify: `docs/websocket.md`（§1 心智模型 → 帧池；§4 图 Processor → Worker 池；毒化半径说明）
 - Modify: `docs/dev-guide.md`（ws 装配/执行族描述）
 - Modify: `docs/user-manual.md`、`sample/MODULES.md`、`docs/devkit/SKILL.md`（WS 相关行同步帧池口径）
-- Modify: `CHANGELIST.md`（v0.1.10 段）、`oj/Cargo.toml`（0.1.9 → 0.1.10）
+- Modify: `CHANGELOG.md`（v0.1.10 段）、`oj/Cargo.toml`（0.1.9 → 0.1.10）
 
 **Interfaces:** 无。
 
@@ -1007,7 +1007,7 @@ export default {
 
 - [ ] **Step 2: websocket.md**：§1 标题「帧池运行时」；执行单元表追加「Worker 池（无状态，W/路由）」行；§4 图 Processor 行改「W × Worker（帧队列拉取）」；新增小节「sess 会话状态与帧池约束」（可序列化 / 模块作用域只读 / 毒化半径=1 / 闸门）。
 - [ ] **Step 3: dev-guide / user-manual / MODULES / SKILL**：凡「每连接独占 VM/驻留会话」表述改帧池口径（grep 确认无残留：`grep -rn "独占\|驻留会话" docs/ sample/MODULES.md`）。
-- [ ] **Step 4: CHANGELIST v0.1.10 段**（插在 v0.1.9 前）：
+- [ ] **Step 4: CHANGELOG v0.1.10 段**（插在 v0.1.9 前）：
 
 ```markdown
 ## v0.1.10（2026-09-09）

@@ -277,7 +277,7 @@ fn check(name: &str) -> Result<(), String> {
 ///
 /// 手段：把 deno_* 依赖源码目录与两个自身 bootstrap 临时改名，跑一次最小 `oj build`
 /// （introspect 路径必然初始化 JsRuntime）——任何残留的 `LoadedFromFsDuringSnapshot`
-/// 依赖都会在此 ENOENT；内嵌实现不受影响。改动见 CHANGELIST v0.1.12。
+/// 依赖都会在此 ENOENT；内嵌实现不受影响。改动见 CHANGELOG v0.1.12。
 fn smoke(bin: &Path) -> Result<(), String> {
     let bin = fs::canonicalize(bin).map_err(|e| format!("resolve {}: {e}", bin.display()))?;
     if !bin.is_file() {
