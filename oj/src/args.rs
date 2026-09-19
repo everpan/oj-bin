@@ -105,7 +105,17 @@ pub struct SchemaDiffArgs {
 
 /// oj：目录镜像路由的 JS 服务与构建 CLI。
 #[derive(Debug, Parser)]
-#[command(name = "oj", version, arg_required_else_help = true)]
+#[command(
+    name = "oj",
+    version,
+    arg_required_else_help = true,
+    help_template = "\
+{before-help}{name} {version}
+{about-with-newline}
+{usage-heading} {usage}
+
+{all-args}{after-help}"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

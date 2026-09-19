@@ -176,3 +176,99 @@ where
         Err(_) => fallback,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// ready_ok：poll=1、take=Ok、free 不 UB（task_poll/task_take/task_free 全链路）。
+    #[test]
+    fn ready_ok_poll_take_free_roundtrip() {
+        let f = ready_ok(b"hello");
+        assert_eq!((f.poll)(f.state), 1, "ready_ok 必须立即 ready");
+        let r = (f.take)(f.state);
+        assert!(std::result::Result::from(r).is_ok(), "take 应回 Ok");
+        (f.free)(f.state);
+    }
+
+    /// ready_err：poll=-1、take=Err（错误臂）。
+    #[test]
+    fn ready_err_poll_take_roundtrip() {
+        let f = ready_err("boom");
+        assert_eq!((f.poll)(f.state), -1, "ready_err 必须立即 error");
+        let r = (f.take)(f.state);
+        assert!(std::result::Result::from(r).is_err(), "take 应回 Err");
+        (f.free)(f.state);
+    }
+
+    /// task_free 对 null state 必须 no-op（不 UB）；任一 future 的 free 指针传 null 即可触发分支。
+    #[test]
+    fn free_null_is_safe() {
+        let f = ready_ok(b"x");
+        (f.free)(std::ptr::null_mut());
+    }
+
+    /// spawn_ffi_future：pending 时 poll=0、take 在 ready 前回 Err；完成后 poll=1、take=Ok。
+    #[test]
+    fn spawn_ffi_future_pending_then_ready() {
+        let rt = rt();
+        let pending = spawn_ffi_future(&rt, async {
+            std::future::pending::<Result<Vec<u8>, String>>().await
+        });
+        assert_eq!(
+            (pending.poll)(pending.state),
+            0,
+            "未完成的 future 必须 pending"
+        );
+        // ready 之前 take → result 仍未暂存 → Err("take before ready or twice")。
+        assert!(
+            std::result::Result::from((pending.take)(pending.state)).is_err(),
+            "ready 前 take 必须 Err"
+        );
+        (pending.free)(pending.state);
+
+        let done = spawn_ffi_future(&rt, async { Ok(b"y".to_vec()) });
+        rt.block_on(async {
+            for _ in 0..2000 {
+                if (done.poll)(done.state) != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!((done.poll)(done.state), 1, "完成的 future 必须 ready");
+        assert!(
+            std::result::Result::from((done.take)(done.state)).is_ok(),
+            "完成后 take 必须 Ok"
+        );
+        (done.free)(done.state);
+    }
+
+    /// catch_future：同步 panic → 收敛为立即错误的 future（不跨界展开）。
+    #[test]
+    fn catch_future_panic_returns_error_future() {
+        let f = catch_future(|| -> FfiFuture { panic!("boom") });
+        assert_eq!((f.poll)(f.state), -1, "panic 必须转为 error future");
+        (f.free)(f.state);
+    }
+
+    /// catch_void：同步 panic 收敛为静默（不终止测试进程）。
+    #[test]
+    fn catch_void_swallows_panic() {
+        catch_void(|| panic!("should be swallowed"));
+    }
+
+    /// catch_value：panic → fallback；正常 → 原值。
+    #[test]
+    fn catch_value_returns_fallback_on_panic() {
+        assert_eq!(catch_value(|| panic!("boom"), 42i32), 42);
+        assert_eq!(catch_value(|| 7i32, 42i32), 7);
+    }
+}
