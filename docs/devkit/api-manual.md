@@ -781,6 +781,10 @@ await db.fromJSON(snap).all();   // 复原后继续链/执行；tx 回调对象�
 
 - 快照里的 `db` 字段只是**创建时的 JS 可见名**；`fromJSON` 复原的实例绑定**复原方的 bound db**
   （快照可跨模块传递而不泄漏源模块的库绑定）；tx 内执行自动走事务同连接。
+- **大整数参数在 `toSQL().params` 里是 marker，不是字符串**（v0.1.24 订正）：`>2^53-1` 的整数
+  以 `{"$oj$i64":"…"}` / `{"$oj$u64":"…"}` 形式出现，这样
+  `db.query(toSQL().sql, ...toSQL().params)` 才**真的可回放**（此前被降成字符串 → PG 报
+  `bigint = text`）。比较 params 文本的代码请按 marker 取值。
 
 **事务 `db.tx`**：
 
@@ -1555,6 +1559,14 @@ auth:
 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
 （共享表 `tenant: false` + `shared_allow` 双声明豁免），server 启动 / `oj build` /
 `oj migrate` 三处校验。跨租户操作（对账、运营报表）走 `db.asSystem()`（请求级、打审计日志）。
+**`tenant_id` 列类型（v0.1.24 起）**：只能是 `text` / `integer` / `bigint`，其余类型在
+**server 启动 / `oj build` / `oj migrate` 三处 fail-fast**（`double`/`boolean`/`blob` 没有
+「等值租户 id」语义）。守卫按**声明类型**绑值：`text`（及旧装配路径的「未声明类型」）→ 字符串；
+`integer` / `bigint` → **数值**（`≤2^53-1` 用 number，更宽用 i64 标记，`> i64::MAX` 用
+`$oj$u64`——只有 MySQL `BIGINT UNSIGNED` 能承载，PG/SQLite 会在绑定前报错）；insert / update
+的租户等值判定接受**四种形态**（字符串 / 数字 / `toBigInt` / `toUBigInt`）。**注意**：数值列上
+租户头必须是**十进制字面量**，否则直接报错——**即使 `sql_guard: warn` 也硬失败**（warn 只放行
+「无法判定」的情形，不放行「判定为不匹配」）。
 **`db.asTenant(id)`（v0.1.20 起）**：与 `asSystem` 方向相反——不是绕过防护，而是给
 **匿名请求**补上租户身份。三道门禁全过才生效：① `tenant.allow_as_tenant: true`
 （默认 false）；② 该请求是匿名的（`anonymous_paths` 命中且未带租户头，或 `oj test
@@ -2050,6 +2062,19 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365
   被杀的 JsRuntime **丢弃不回池**，server 不崩、后续请求正常（这是对死循环的唯一熔断手段）。
 - `RuntimePool` 最大空闲 16，负载后自动收缩；`pool_size` 等于并行请求上限
   （过高吃内存，过低排队）。
+
+### PostgreSQL 语句缓存（v0.1.24，DBA 视角）
+
+PG 插件会给**实际执行的 SQL 前置一段块注释签名** `/*oj:<形态>*/`（形态字母表 `t/i/f/b/m/u`，
+分别对应字符串/整数/浮点/布尔/标记/无符号），使「同一条 SQL 文本 + 不同参数 Rust 类型」落到
+**不同** prepared statement 缓存条目——这正是 v0.1.24 前
+`invalid byte sequence … 0x00` / `insufficient data left in message` 的病根（sqlx 的缓存 key
+只有 SQL 文本，命中后复用旧的 param OIDs）。
+
+- **可见性**：`pg_stat_activity.query` / PG 日志 / `EXPLAIN` 里会看到该前缀；`toSQL()` 与业务
+  自己写的 SQL 字符串**不含**前缀。看到它请勿以为被篡改。
+- **容量**：连接补了 `statement-cache-capacity=512`（条目数会随「SQL 数 × 参数形态数」增长）。
+- **MySQL / SQLite 无此问题**（前者每次 execute 重发参数类型，后者无声明参数类型），故不打签名。
 
 ### 日志
 

@@ -6,7 +6,7 @@
 
 | 文件 | 用途 |
 |---|---|
-| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、**大整数与 i64（`toBigInt`/`toUBigInt`/`toDouble`，雪花 id 必读）、平台序列 `db.nextSeq`**、ext_boot.js 运行时扩展）、鉴权租户、测试、配置、构建发布、运维、安全红线 |
+| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、**大整数与 i64（`toBigInt`/`toUBigInt`/`toDouble`，雪花 id 必读）、平台序列 `db.nextSeq`、MySQL 读侧列类型边界**、ext_boot.js 运行时扩展）、鉴权租户（含 `tenant_id` 列类型白名单）、测试、配置、构建发布、运维（含 PG 语句缓存前缀）、安全红线 |
 | `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`，v0.1.21）、取号与雪花 id 的生成/精确回写（`db.nextSeq` / `toBigInt`，v0.1.24）——每篇给「配置 + 代码 + 验证 + 常见坑」 |
 | `SKILL.md` | Claude Code 等 agent 的 skill 入口：工作流、红线、checklist、陷阱速查，按章节号引用手册 |
 | `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示。来源为 `sample/global.d.ts`，经 `cargo xtask build` 与本目录文档一同归置到 `bin/devkit/` |
@@ -33,3 +33,9 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 
 手册与 skill 随 oj 版本一起发布；升级 oj 后用新包内 `devkit/` 覆盖旧拷贝。
 源文件与反馈入口在仓库 `docs/devkit/`。
+
+**版本同步要求（发布前自查）**：每次版本升级，本目录四件（`api-manual.md` / `scenarios.md` /
+`SKILL.md` / `README.md`）必须与该版的用户可见变更**逐条对齐**——新增/变更的 API 与报错文案要
+进 `api-manual.md` 的对应章节**与错误/限制表**，高频陷阱要进 `SKILL.md` 的陷阱速查，
+可照抄的场景要进 `scenarios.md`。发布物 `bin/devkit/` 由 `cargo xtask build` 归置，
+`cargo test --release -p xtask` 的 devkit 契约用例会校验产物与源文件一致。
