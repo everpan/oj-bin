@@ -152,4 +152,4 @@ flowchart TD
 | `signing_method` | `HS256` | HS256 / HS384 / HS512 |
 | `access_token_duration` | `60s` | access token 有效期 |
 | `refresh_token_duration` | `720h` | refresh token / session 有效期 |
-| `anonymous_paths` | `[]` | 免鉴权路径（去 base 后），通配四形态（v0.1.20）：字面 / 尾 `/*` 严格一层 / 中段 `*` 一段 / `**` 跨段 |
+| `anonymous_paths` | `[]` | 免鉴权路径（去 base 后），通配四形态（v0.1.20）：字面 / 尾 `/*` 严格一层 / 中段 `*` 一段 / `**` 跨段。条目可写成对象 `{ path, one_layer: true }` 显式确认「有意一层」以退出迁移 WARN（v0.1.23） |

@@ -2,6 +2,72 @@
 
 以 `oj/Cargo.toml` 的 version 递增提交作为版本分界（该提交即本版本的发布点），fix 类改动在每个版本内单列一组。
 
+## v0.1.23（2026-09-19）
+
+下游 U39：`anonymous_paths` 的 v0.1.20 迁移 WARN **无法消音**。尾 `/*` 是四形态中的合法形态
+（尾段动态时只能用 `/*`；改 `**` 反而扩面——`**` 含零层与任意深），但旧实现「凡尾 `/*` 即
+告警」，这类条目每次启动都被点名，且没有任何配置手段让它退出聚合。本版两处改动合起来治：
+**告警按影响面判定**（默认静音噪音）+ **条目级显式确认**（保留人工逃生门）。
+
+**行为变更（启动日志，需知晓）**
+
+- **迁移 WARN 改为按「影响面」判定**，两个条件**同时成立**才告警
+  （`oj/src/app.rs` 的 `warn_legacy_tail_wildcards` / `tail_wildcard_widens` /
+  `is_legacy_prefix_shape`）：
+  1. 条目是**旧式前缀形态**——只有尾段那一个 `*`、其余段全字面。v0.1.19 的旧实现是
+     `strip_suffix("/*")` + `starts_with`（尾 `*` = 任意深度），只有这种形态当时能命中真实
+     请求；**含中段 `*` 的结构条目**（`/public/anchor/*/issues/*`）那时根本匹配不上，只能
+     诞生于 v0.1.20 的四形态语义，即刻意写出的形状——对它们提「改 `**`」是错的（`**` 会把
+     更深的层级一并纳入，不是用户要的形状）。故按形态豁免，不只看「`**` 是否更宽」。
+  2. 改写为 `**` 后**真的会多命中一条已注册路由**：用路由表 pattern 的**去 base 视图**
+     （`{param}`→`*`、`{*rest}`→`**`）比对「`**` 形态命中而 `/*` 形态不命中」是否存在。
+  - 实测校准（下游真实 config，v0.1.23 二进制实跑）：旧实现点名 **9 条 tenant + 6 条 auth**；
+    加入形态条件后只有**旧式前缀**条目留下（`/users/me/accounts/*`、`/public/assets/v2/anchor/*`
+    、`/instances/admins/*` 等），而 U39 抱怨的结构条目（`/public/anchor/*/issues/*` 系）
+    全部静默。这是一次真实配置对判定口径的回归校准，非纸面推导。
+  - 影响：`/idp/*`（项目里注册了 `/idp/.well-known/openid-configuration`）**照旧告警**——
+    收紧确实收回了既有免鉴权面；`/auth/oidc/*` 这类「本就没有更深路由」的条目**不再刷屏**。
+    以后新增深层路由时告警会自己回来，正是该提醒的时刻。
+  - 调用点从装配早期（`:520`）**后移到路由表建好之后**，故 WARN 在启动日志里位置变晚
+    （在 `module ...` 行与路由清单之后）。
+  - 只按「已注册路由」判是充分的：静态托管与 `/blob` 都在鉴权前直接返回，不经匿名匹配
+    （`server/src/lib.rs`），即匿名路径只对注册路由产生实际效力。
+
+**特性**
+
+- **`anonymous_paths` 支持条目对象形态**（tenant / auth 同形）：`AnonPath` 为 untagged 枚举，
+  除字符串简写外可写 `- { path: "/auth/oidc/*", one_layer: true }`。`one_layer: true` = 显式
+  声明「这一层是有意的」，**永久退出迁移 WARN**（含影响面判定为真的情形）。
+  - 消费侧统一归一为路径字符串（`config::anon_paths()`）：server 的 `Pipeline.tenant_anon` 与
+    oj-auth 插件 cfg JSON 都只吃 `Vec<String>`，**插件侧零改动、ABI 保持 8**。
+  - **装配期 fail-fast**（`config::validate_anon_paths()`）：`one_layer` 标在没有尾 `/*` 的条目上
+    直接报错——该标记只对严格一层有意义，静默接受等于让配置撒谎。
+
+**文档**
+
+- `docs/devkit/`（对外发行）：`api-manual.md` 匿名路径段改写（影响面判定 + `one_layer` 形态）、
+  `scenarios.md` 场景 5 更新 WARN 样例与消音写法 + 常见坑两行；`docs/modules/02-config.md`
+  新增条目形态与校验落点；`docs/tenant-guide.md`、`docs/builtin-api-auth.md` 同步。
+- `docs/oidc-integration.md` / `docs/oidc-implementation.md`：OP 面豁免从 `/idp/*` +
+  `/idp/.well-known/*` 改为 **`/idp/**`**（discovery 比 `/idp/*` 深一层，本就该跨层；旧写法
+  在 v0.1.23 的影响面判定下会持续告警）。
+- `sample/config.yaml` / `sample/config.docker.yaml`：`/idp/*` 改为带 `one_layer: true` 的对象
+  形态（豁免面最小 + 不产生启动噪音），并注明 `/idp/.well-known/*` 单列的理由。
+
+**测试**
+
+- `config.rs`：字符串/对象两形态解析、缺省 `one_layer=false`、归一化、`one_layer` 非尾 `/*`
+  fail-fast，共 2 条新用例。
+- `oj/src/app.rs`：`tail_wide_variant` / `anon_view_of_route`（剥 base、参数段归一）/
+  `is_legacy_prefix_shape`（旧前缀 vs 结构条目）/ `tail_wildcard_widens`（旧前缀形态 + 更深
+  路由才告警，结构条目即使 `**` 更宽也不告警）/ 聚合过滤（`one_layer` 压掉）5 条新用例，
+  其中结构条目的反例直接取自下游 config 的真实写法。
+- `oj/tests/oidc_e2e.rs`：匿名列表改用对象形态，端到端覆盖条目解析 → 装配 → 插件 cfg 链路。
+- `oj/tests/sample_config.rs`（新增）：**发行样例**（`sample/config.yaml` 与
+  `sample/config.docker.yaml`）必须可解析且过 `validate_anon_paths`，并钉住 `/idp/*` 带
+  `one_layer`、`/oidc/*` 用简写——样例里 YAML 写错的暴露面只在装配期，而 `oj build` 读配置
+  是宽容的（`unwrap_or` 吞错），没有本用例只能靠人肉跑 server 才发现。
+
 ## v0.1.22（2026-09-19）
 
 修掉「DB 的 64 位整数值跨 JS 边界」的三重缺陷：**读侧必然 500**、**写侧静默精度丢失（假碰撞）**、

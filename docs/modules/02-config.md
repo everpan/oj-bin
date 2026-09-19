@@ -41,7 +41,7 @@
 | `redis` | `HashMap<name, URL>` | 仅 `redis.default` 参与装配（其余 warn 忽略）；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
 | `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false） |
 | `db_query` | `QueryLimits` | 构造器 LIMIT：`default_limit`（默认 100，顶层 select 未给 limit 时的隐式值）+ `max_limit`（默认 1000，显式 limit 的 clamp 上界，硬顶 100000）。**不能写进 `db:`**——`db` 是 name→DSN map，键即库名 |
-| `auth` | `AuthCfg` | `jwt_secret`（空 → fail fast）、`signing_method`(HS256/384/512)、access/refresh 时长、`anonymous_paths` |
+| `auth` | `AuthCfg` | `jwt_secret`（空 → fail fast）、`signing_method`(HS256/384/512)、access/refresh 时长、`anonymous_paths`（条目＝字符串或 `{path, one_layer}`，见 §4） |
 | `oidc` | `OidcSection` | `issuer` / `private_key_path`（相对 config 目录）/ `rp: {tenant → {issuer, client_id, client_secret, scope}}` / `clients: {id → {secret, redirect_uris, tenant}}` |
 | `blob` | `BlobSection` | 平铺字段 = 旧单后端（等价 `backends.default`）；`backends.<name>` = 命名多后端；**两者并存且平铺非默认 → 歧义 Err** |
 | `es` | `EsCfg` | `endpoint` |
@@ -65,6 +65,21 @@
 | `server.api_prefix` 为空 | `oj/src/server_cmd.rs:95` |
 | 模块名/版本白名单 | `oj/src/manifest.rs:25,37` |
 | schema.yaml 标识符白名单 `[A-Za-z_][A-Za-z0-9_]*` | `oj/src/schema.rs:103` |
+| `anonymous_paths` 的 `one_layer` 只许标在尾 `/*` 条目上 | `config::validate_anon_paths()` + `oj/src/app.rs:565` |
+
+### 4.1 `anonymous_paths` 的条目形态（tenant / auth 同形）
+
+条目是 `AnonPath`（`src/config.rs`）：字符串简写，或对象 `{ path, one_layer }`。
+
+- **两种形态在消费侧归一为路径字符串**（`config::anon_paths()`）：server 的 `Pipeline`
+  与 oj-auth 插件的 cfg JSON 都只吃 `Vec<String>`，故插件侧零改动、ABI 不变。
+- `one_layer: true` = 显式确认该尾 `/*` 是**有意的一层**，退出 v0.1.20 的迁移 WARN。
+- 迁移 WARN 本身自 v0.1.23 起**按影响面判定**，两个条件同时成立才告警：① 条目是**旧式前缀
+  形态**（只有尾段一个 `*`、其余段全字面——旧实现 `strip_suffix("/*")` + `starts_with` 只有
+  这种形态能命中，含中段 `*` 的结构条目是 v0.1.20 后刻意写的）；② 改写为 `**` 会真的多命中
+  一条已注册路由。实现：`oj/src/app.rs` 的 `warn_legacy_tail_wildcards` /
+  `tail_wildcard_widens` / `is_legacy_prefix_shape`，调用点在路由表建好之后。判定只依赖已
+  注册路由是充分的——静态托管与 `/blob` 都在鉴权之前直接返回，不经匿名匹配。
 
 ## 5. 已知问题
 

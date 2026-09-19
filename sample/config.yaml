@@ -96,11 +96,13 @@ tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（�
                                  # （仍强制租户条件；仅匿名且未带租户头的请求可用，默认关）
   anonymous_paths:               # 免租户头路径（OIDC 302 跳转腿带不了自定义头）
     # 通配四形态：字面 / /* 严格一层 / ** 跨任意层 / 中段 * 恰好一段。
-    # 下面三条尾 /* 都只需一层（callback、jwks、discovery）；v0.1.20 启动会对「含尾 /*
-    # 的列表」聚合打一条迁移 WARN（提示深路径改 **）——这里是预期提示、非配置错误。
-    - "/oidc/*"
-    - "/idp/*"
-    - "/idp/.well-known/*"
+    # 条目可写字符串，也可写对象 { path, one_layer } —— one_layer: true 表示「这一层是有意的」。
+    # 迁移 WARN（v0.1.20 收紧后）自 v0.1.23 起只在「① 旧式前缀形态（只有尾段一个 *、其余段
+    # 全字面）且 ② 改写为 ** 会真的多命中一条已注册路由」时才打：/idp/* 两条都满足
+    # （discovery 比它深一层），故下面标 one_layer 显式确认；/oidc/* 无更深路由 → 不告警。
+    - "/oidc/*"                  # login/callback/logout：一层，且无更深路由 → 不告警
+    - { path: "/idp/*", one_layer: true }   # authorize/token/userinfo：一层；discovery 单列
+    - "/idp/.well-known/*"       # discovery：比 /idp/* 深一层，必须单列（豁免面最小）
     # WS 路由（<dir>/ws.ts）是 merge 进 Router 的真实路由，本就不经过这套
     # 前置管线（连接天然匿名）——无需也不会出现在 anonymous_paths 里。
 
@@ -116,8 +118,8 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/auth/logout"
     # WS 订阅路由（/news/ws）不在守卫面内（真实路由，不过前置管线）；
     # 发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
-    - "/oidc/*"                  # 同上：尾 /* 严格一层，启动有聚合迁移 WARN（预期）
-    - "/idp/*"
+    - "/oidc/*"                  # 同上：尾 /* 严格一层；/idp/* 另有更深的 discovery → 标 one_layer
+    - { path: "/idp/*", one_layer: true }
     - "/idp/.well-known/*"
 
 tasks:   # 长任务池（v0.1.6）：dir 相对 API 目录；sample/src/tasks/task_demo.ts 每秒心跳

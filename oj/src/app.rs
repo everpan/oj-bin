@@ -204,22 +204,40 @@ fn sql_guard_of(cfg: &Config) -> SqlGuard {
     g
 }
 
-/// v0.1.20 通配语义收紧的迁移提示：尾 `/*` 现在是**严格一层**（旧版 oj-auth 侧是
-/// `starts_with` 任意深度）。含尾 `/*` 的列表启动期聚合 WARN 一次（逐条打会刷屏），
-/// 提示深路径改 `**`——收紧会静默收回既有免鉴权/免租户面，不能只靠 CHANGELIST 一行。
-fn warn_legacy_tail_wildcards(cfg: &Config) {
-    let warn = |what: &str, list: &[String]| {
+/// v0.1.20 通配语义收紧的迁移提示（v0.1.23 起按 **影响面** 判定，不再「凡尾 `/*` 即告警」）。
+///
+/// 两个条件**同时成立**才告警：
+/// 1. 条目是**旧式前缀形态**——只有尾段那一个 `*`，其余段全是字面量（`is_legacy_prefix_shape`）。
+///    v0.1.19 的旧实现是 `strip_suffix("/*")` + `starts_with`（尾 `*` = 任意深度），只有这种
+///    形态在当时能匹配真实请求；含中段 `*` 的结构条目（`/public/anchor/*/issues/*`）当时根本
+///    匹配不上，只能是 v0.1.20 四形态语义下刻意写出的，对它们提「改 `**`」是错的。
+/// 2. 改写为 `**` 后**真的会多命中一条已注册路由**（`tail_wildcard_widens`）。
+///    - 会（例：`/idp/*` 且已注册 `/idp/.well-known/openid-configuration`）→ 告警：收紧确实
+///      收回了既有免鉴权/免租户面，不能只靠 CHANGELIST 一行；
+///    - 不会（例：`/auth/oidc/*`——本就没有更深路由）→ 静默：改 `**` 反而扩面（`**` 含零层
+///      与任意深），提示与事实矛盾，长期噪音会淹没真正要紧的启动 WARN。
+///
+/// 只按「已注册路由」判是充分的：静态托管与 `/blob` 都在鉴权前直接返回，不经
+/// `anonymous_paths`（`server/src/lib.rs`）——匿名路径只对注册路由产生实际效力。
+/// 条目带 `one_layer: true`（`config::AnonPath::Detailed`）时永不告警，留给「明知影响面仍
+/// 要严格一层」的人工确认。
+///
+/// `routes` = 路由表 pattern 的去 base 视图（`{param}` 段已归一为 `*`，见 `anon_view_of_route`）。
+fn warn_legacy_tail_wildcards(cfg: &Config, routes: &[String]) {
+    let warn = |what: &str, list: &[config::AnonPath]| {
         let legacy: Vec<&str> = list
             .iter()
-            .filter(|p| p.ends_with("/*"))
-            .map(String::as_str)
+            .filter(|p| !p.one_layer())
+            .map(config::AnonPath::path)
+            .filter(|p| tail_wildcard_widens(p, routes))
             .collect();
         if legacy.is_empty() {
             return;
         }
         eprintln!(
-            "warn: {what} 有 {} 条尾 \"/*\" 条目 {legacy:?}：自 v0.1.20 起为严格一层通配；\
-             需要匹配多层路径请改写为 \"…/**\"",
+            "warn: {what} 的 {} 条尾 \"/*\" 条目 {legacy:?}：改写为 \"…/**\" 会多命中已注册路由\
+             （自 v0.1.20 起尾 \"/*\" 已是严格一层）；需要多层就改 \"…/**\"，\
+             确属「有意一层」则写 `{{ path: …, one_layer: true }}` 消音",
             legacy.len()
         );
     };
@@ -227,6 +245,57 @@ fn warn_legacy_tail_wildcards(cfg: &Config) {
     if let Some(a) = &cfg.auth {
         warn("auth.anonymous_paths", &a.anonymous_paths);
     }
+}
+
+/// 尾 `/*` 条目改写为 `**` 后是否会多命中：**旧式前缀形态**且存在任一条已注册路由
+/// 「`**` 形态命中而 `/*` 形态不命中」即为真。非尾 `/*`、非旧式前缀形态恒为假。
+fn tail_wildcard_widens(entry: &str, routes: &[String]) -> bool {
+    if !is_legacy_prefix_shape(entry) {
+        return false;
+    }
+    let Some(wide) = tail_wide_variant(entry) else {
+        return false;
+    };
+    let narrow = [entry.to_string()];
+    routes.iter().any(|r| {
+        server::path_matches(std::slice::from_ref(&wide), r) && !server::path_matches(&narrow, r)
+    })
+}
+
+/// 条目是否为「旧式前缀」形态：只有**尾段**那一个 `*`，其余段全是字面量。
+///
+/// 迁移 WARN 只对这种形态有意义——v0.1.19 的旧实现是 `strip_suffix("/*")` + `starts_with`
+/// （尾 `*` = 任意深度），而含中段 `*` 的条目在当时**匹配不上任何真实请求**（前缀里带着
+/// 字面 `*`），只能诞生于 v0.1.20 的四形态语义之下，即「刻意的结构」而非「待迁移的旧前缀」
+/// ——对它们提「改 `**`」是错的（`**` 会把 `…/*/issues/**` 之外的多层路径一并纳入）。
+/// 实测依据：下游 config 里 `/public/anchor/*/issues/*` 这类结构条目正是这么写的。
+fn is_legacy_prefix_shape(entry: &str) -> bool {
+    match entry.strip_suffix("/*") {
+        Some(head) => head.split('/').all(|seg| !seg.contains('*')),
+        None => false,
+    }
+}
+
+/// `/a/*` → `/a/**`；非尾 `/*` → `None`。
+fn tail_wide_variant(entry: &str) -> Option<String> {
+    Some(format!("{}/**", entry.strip_suffix("/*")?))
+}
+
+/// 路由 pattern → 匿名路径口径：剥掉 base 前缀，参数段 `{param}` / `{*rest}` 归一为
+/// `*` / `**`（匿名路径按**去 base 后**的请求路径匹配，见 `server::path_matches`）。
+fn anon_view_of_route(pattern: &str, base: &str) -> String {
+    let b = base.trim_matches('/');
+    let p = pattern.strip_prefix(&format!("/{b}")).unwrap_or(pattern);
+    p.split('/')
+        .map(
+            |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                Some(inner) if inner.starts_with('*') => "**",
+                Some(_) => "*",
+                None => seg,
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
@@ -516,8 +585,8 @@ impl App {
         // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
         let query_limits = cfg.db_query;
         query_limits.validate()?;
-        // 通配语义 v0.1.20 收紧的迁移提示（尾 `/*` 现为严格一层）。
-        warn_legacy_tail_wildcards(&cfg);
+        // 匿名路径条目校验（v0.1.23）：`one_layer` 只对尾 "/*" 条目有意义（fail-fast）。
+        config::validate_anon_paths(&cfg)?;
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
         let gate =
@@ -744,6 +813,14 @@ impl App {
             }
         }
         let n = cfg.server.pool_size.max(1) as usize;
+        // 通配语义 v0.1.20 收紧的迁移提示（v0.1.23 起按影响面判定）：必须等路由表就绪，
+        // 才能判「改 `**` 是否会真多命中」（见 warn_legacy_tail_wildcards）。
+        let route_views: Vec<String> = table
+            .listing()
+            .iter()
+            .map(|r| anon_view_of_route(&r.pattern, &base))
+            .collect();
+        warn_legacy_tail_wildcards(&cfg, &route_views);
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
@@ -757,7 +834,7 @@ impl App {
 
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
-            tenant_anon: cfg.tenant.anonymous_paths.clone(),
+            tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
             auth,
             max_upload: cfg.server.max_upload_bytes,
             blob: blob.clone(),
@@ -954,6 +1031,121 @@ mod tests {
         assert!(spec.contains("?v="), "{spec}");
         assert!(spec.contains("ext_boot.js"), "{spec}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- v0.1.23：匿名路径迁移 WARN 的影响面判定（U39）----
+
+    /// `/a/*` → `/a/**`；非尾 `/*` 不给宽形态（不在迁移提示范围）。
+    #[test]
+    fn tail_wide_variant_only_for_tail_wildcard() {
+        assert_eq!(tail_wide_variant("/a/*"), Some("/a/**".to_string()));
+        assert_eq!(
+            tail_wide_variant("/public/anchor/*/issues/*"),
+            Some("/public/anchor/*/issues/**".to_string())
+        );
+        assert_eq!(tail_wide_variant("/health"), None);
+        assert_eq!(tail_wide_variant("/a/*/b"), None); // 中段 * 不触发
+        assert_eq!(tail_wide_variant("/a/**"), None); // 已是跨层
+    }
+
+    /// 路由 pattern → 匿名口径：剥 base，`{param}`→`*`、`{*rest}`→`**`。
+    #[test]
+    fn anon_view_strips_base_and_normalizes_params() {
+        assert_eq!(
+            anon_view_of_route("/v1/api/oidc/{id}", "/v1/api"),
+            "/oidc/*"
+        );
+        assert_eq!(
+            anon_view_of_route("/v1/api/idp/.well-known/openid-configuration", "/v1/api"),
+            "/idp/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            anon_view_of_route("/v1/api/assets/{*path}", "/v1/api"),
+            "/assets/**"
+        );
+        // base 不在 pattern 里（非常规）→ 原样归一，不 panic。
+        assert_eq!(anon_view_of_route("/health", "/v1/api"), "/health");
+    }
+
+    /// 旧式前缀形态：只有尾段一个 `*`、其余段全字面。
+    ///
+    /// 这是「可能受 v0.1.20 收紧影响」的**唯一**形态——v0.1.19 是 `strip_suffix("/*")` +
+    /// `starts_with`，含中段 `*` 的条目当时匹配不上任何真实请求（前缀里带字面 `*`），
+    /// 只能诞生于 v0.1.20 之后的四形态语义，即刻意写出的结构。
+    #[test]
+    fn legacy_prefix_shape_is_tail_wildcard_on_literal_segments() {
+        assert!(is_legacy_prefix_shape("/idp/*"));
+        assert!(is_legacy_prefix_shape("/users/me/accounts/*"));
+        assert!(is_legacy_prefix_shape("/public/assets/v2/anchor/*"));
+        // 结构条目（中段含 `*`）→ 不是旧前缀形态（下游 config 实测里的真实写法）。
+        assert!(!is_legacy_prefix_shape("/public/anchor/*/issues/*"));
+        assert!(!is_legacy_prefix_shape("/public/assets/v2/anchor/*/*"));
+        assert!(!is_legacy_prefix_shape("/a/*/b")); // 尾段非 `*`
+        assert!(!is_legacy_prefix_shape("/health"));
+        assert!(!is_legacy_prefix_shape("/a/**"));
+    }
+
+    /// 判定核心：旧前缀形态 + `**` 会多命中已注册路由 → 告警；否则静默。
+    #[test]
+    fn widening_requires_a_deeper_registered_route() {
+        let deep = vec!["/idp/.well-known/openid-configuration".to_string()];
+        // /idp/* 收紧为严格一层 → 深两层的注册路由会被收回 → 该告警。
+        assert!(tail_wildcard_widens("/idp/*", &deep));
+        // 尾段动态段、无更深路由（U39 的抱怨场景）→ 改 ** 反而扩面，静默。
+        assert!(!tail_wildcard_widens("/auth/oidc/*", &deep));
+        // 已注册路由与 /a/* 同层 → 改 ** 不新增命中 → 静默。
+        let one_layer = vec!["/a/b".to_string()];
+        assert!(!tail_wildcard_widens("/a/*", &one_layer));
+        // 无任何路由（纯 404 面）→ 静默。
+        assert!(!tail_wildcard_widens("/a/*", &[]));
+        // 结构条目：即使 `**` 在数学上会多命中，也**不告警**（改 `**` 不是它想要的形状；
+        // 实测依据：下游 config 的 /public/anchor/*/issues/* 与其更深的 comments 路由）。
+        let structured = vec!["/public/anchor/*/issues/*/comments/*".to_string()];
+        assert!(!tail_wildcard_widens(
+            "/public/anchor/*/issues/*",
+            &structured
+        ));
+        assert!(!tail_wildcard_widens(
+            "/public/assets/v2/anchor/*/*",
+            &structured
+        ));
+        // 对照：同一份路由下，旧前缀形态的 /public/anchor/* 仍会告警。
+        assert!(tail_wildcard_widens("/public/anchor/*", &structured));
+    }
+
+    /// 聚合 WARN：只点名「真会多命中」的**旧式前缀**条目，`one_layer` 确认过的与结构条目
+    /// 永不点名（后者两种形态都在用例里）。
+    #[test]
+    fn warn_legacy_tail_wildcards_filters_by_impact() {
+        use only_js::config::AnonPath;
+        let mut cfg = Config::default();
+        cfg.tenant.anonymous_paths = vec![
+            AnonPath::Plain("/idp/*".into()),       // 会多命中 → 点名
+            AnonPath::Plain("/auth/oidc/*".into()), // 无更深路由 → 静默
+            AnonPath::Detailed {
+                path: "/x/*".into(),
+                one_layer: true,
+            }, // 已确认 → 静默
+            AnonPath::Plain("/health".into()),      // 非尾 /* → 静默
+            // 结构条目（中段 `*`）→ 不按旧前缀看待 → 静默（下游 config 实测的同款写法）
+            AnonPath::Plain("/public/anchor/*/issues/*".into()),
+            AnonPath::Plain("/public/assets/v2/anchor/*/*".into()),
+        ];
+        let routes = vec![
+            "/idp/.well-known/openid-configuration".to_string(),
+            "/auth/oidc/callback".to_string(),
+            "/x/a/b/c".to_string(), // 即使**会多命中，one_layer 也压掉
+            "/public/anchor/*/issues/*/comments/*".to_string(),
+        ];
+        let legacy: Vec<&str> = cfg
+            .tenant
+            .anonymous_paths
+            .iter()
+            .filter(|p| !p.one_layer())
+            .map(AnonPath::path)
+            .filter(|p| tail_wildcard_widens(p, &routes))
+            .collect();
+        assert_eq!(legacy, vec!["/idp/*"]);
     }
 }
 
