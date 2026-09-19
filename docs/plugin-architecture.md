@@ -215,4 +215,6 @@ plugins/oj-db-postgres/       crate: PostgresBackend + (Plugin 注册，feature-
   故本轮不采用。
 - **测试**：`accessor_sqlx.rs` 直接 `SqlxAccessor::arc` 的用例保留；新增 `DbBackendRegistry`
   测试（accepts 优先级、未知 DSN 报错、`memory` 后端、`sqlite` 经注册表连通）+ `op_db_backends`
-  自省测试。`OJ_TEST_REDIS`/`OJ_TEST_S3`/`OJ_TEST_ES` 的 `#[ignore]` 集成测试保留。
+  自省测试。真服务集成测试以 env 门控保留（设 `OJ_TEST_PG`/`OJ_TEST_MYSQL`/`OJ_TEST_REDIS`/
+  `OJ_TEST_S3`/`OJ_TEST_KAFKA_BROKERS`/`OJ_TEST_RABBITMQ_URL` 才连真库，未设则内联跳过——
+  非 `#[ignore]`；`oj-es` 离线无需 env，见 [dev-guide.md §12.1](dev-guide.md#121-覆盖率测量与提升cargo-llvm-cov-实操)）。

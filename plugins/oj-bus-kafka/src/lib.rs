@@ -710,8 +710,14 @@ mod tests {
             .as_u64()
             .unwrap();
         let topic = format!("mq.{}", std::process::id());
+        // 带 key/partition/headers（覆盖 `KafkaCore::send` 的 Some 分支），并随后调
+        // `metadata`（覆盖 mq 面的可选 method 分支）。
         let payload = serde_json::json!({
-            "topic": topic, "value": {"n": 1}
+            "topic": topic,
+            "key": "k1",
+            "partition": 0,
+            "headers": {"h1": "v1"},
+            "value": {"n": 1}
         })
         .to_string();
         drive(&mut mq_call(
@@ -721,6 +727,14 @@ mod tests {
         ))
         .await
         .expect("mq send");
+        let md = drive(&mut mq_call(
+            handle,
+            RString::from("metadata"),
+            RString::from("{}"),
+        ))
+        .await
+        .expect("mq metadata");
+        assert!(serde_json::from_slice::<serde_json::Value>(&md).unwrap()["kind"] == "kafka");
         let polled = drive(&mut mq_call(
             handle,
             RString::from("poll"),
@@ -756,6 +770,37 @@ mod tests {
         };
         // 仅 brokers 可构造（rdkafka create 离线构造；连接按需）。
         assert!(BusInstance::new(&cfg).is_ok());
+    }
+
+    /// 离线路径：mq 面 `send` 的 `value_b64` 非法时，base64 解码在触网前即失败（kafka
+    /// `KafkaCore::send` 的 `Some(b64)` 分支），返回可读错误。broker 串用占位（create
+    /// 离线构造），无需真 broker。钉死 `bad value_b64` 文案（评审 F7：错误须可读）。
+    #[test]
+    fn given_bad_value_b64_when_mq_send_then_err_offline() {
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let cfg = serde_json::json!({ "kind": "kafka", "brokers": ["127.0.0.1:1"] }).to_string();
+        let rt = runtime();
+        let bytes = rt
+            .block_on(drive(&mut mq_connect(RString::from(cfg.as_str()))))
+            .expect("mq connect");
+        let handle = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let payload = serde_json::json!({
+            "topic": format!("oj-bad-{}", std::process::id()),
+            "value_b64": "!!!not-valid-base64!!!"
+        })
+        .to_string();
+        let out = rt.block_on(drive(&mut mq_call(
+            handle,
+            RString::from("send"),
+            RString::from(payload.as_str()),
+        )));
+        assert!(
+            matches!(out, Err(ref e) if e.contains("bad value_b64")),
+            "非法 base64 须触网前报错: {out:?}"
+        );
+        mq_close(handle);
     }
 
     /// 真 kafka roundtrip（env-gated）：`OJ_TEST_KAFKA_BROKERS` 给逗号分隔 bootstrap servers。

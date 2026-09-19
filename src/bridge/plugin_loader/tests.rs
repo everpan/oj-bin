@@ -708,6 +708,77 @@ static PL_BLOB_VT: BlobBackendVtable = BlobBackendVtable {
     close: pl_blob_close,
 };
 
+/// 七类加载失败的 Display 文案（运维 / CLI 报错可读，spec §4 失败分类）。
+/// 覆盖 `PluginLoadError::fmt` 全部 match 臂。
+#[test]
+fn plugin_load_error_display_messages() {
+    use crate::bridge::plugin_loader::PluginLoadError;
+    let cases: [PluginLoadError; 7] = [
+        PluginLoadError::FileMissing {
+            path: PathBuf::from("/p/plugin"),
+        },
+        PluginLoadError::PlatformMismatch {
+            path: PathBuf::from("/p/x"),
+            detail: "glibc 2.31 required".into(),
+        },
+        PluginLoadError::DependencyResolution {
+            path: PathBuf::from("/p/x"),
+            loader_text: "read_dir: EACCES".into(),
+        },
+        PluginLoadError::AbiMismatch { plugin: 7, host: 8 },
+        PluginLoadError::SymbolMissing {
+            path: PathBuf::from("/p/x"),
+            symbol: "oj_plugin_init",
+        },
+        PluginLoadError::IdentityMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        },
+        PluginLoadError::InitFailed {
+            name: "mini".into(),
+            detail: "panic".into(),
+        },
+    ];
+    let msgs: Vec<String> = cases.iter().map(|e| e.to_string()).collect();
+    assert!(msgs.iter().all(|m| !m.is_empty()), "Display 不能为空");
+    assert!(msgs[0].contains("plugin file missing"), "{0}", msgs[0]);
+    assert!(msgs[1].contains("platform mismatch"), "{0}", msgs[1]);
+    assert!(
+        msgs[2].contains("dependency resolution failed"),
+        "{0}",
+        msgs[2]
+    );
+    assert!(msgs[3].contains("ABI mismatch"), "{0}", msgs[3]);
+    assert!(msgs[4].contains("symbol missing"), "{0}", msgs[4]);
+    assert!(msgs[5].contains("identity mismatch"), "{0}", msgs[5]);
+    assert!(msgs[6].contains("init failed"), "{0}", msgs[6]);
+}
+
+/// `LoadedPlugin → PluginInfo` 映射（op_plugins / `GET {base}/plugins` 自省输出）。
+/// 覆盖 `From<&LoadedPlugin> for PluginInfo` 全字段拷贝。
+#[test]
+fn loaded_plugin_into_plugin_info_maps_all_fields() {
+    use oj_plugin_ffi::PluginDescriptor;
+    use oj_plugin_ffi::RString;
+    let loaded = LoadedPlugin {
+        descriptor: PluginDescriptor {
+            name: RString::from("mini"),
+            semver: RString::from("0.1.0"),
+            abi_version: 8,
+            fingerprint: RString::from("fp-1"),
+            desc: RString::from("test plugin"),
+        },
+        registrations: Registrations::default(),
+    };
+    let info: PluginInfo = (&loaded).into();
+    assert_eq!(info.name, "mini");
+    assert_eq!(info.semver, "0.1.0");
+    assert_eq!(info.abi_version, 8);
+    assert_eq!(info.fingerprint, "fp-1");
+    assert_eq!(info.description, "test plugin");
+    assert_eq!(info.host_abi_version, ABI_VERSION);
+}
+
 /// blob 装配期 connect 成功 + 三类失败（同 kv：合一个用例避免并行互踩模式开关）。
 /// 成功路径断言：后端名 + cfg JSON 按值原样过线（spec §3 有意的边界）。
 #[tokio::test]

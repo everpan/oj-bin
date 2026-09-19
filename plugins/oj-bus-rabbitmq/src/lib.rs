@@ -761,19 +761,22 @@ mod tests {
         let setup = lapin::Connection::connect(&url, lapin::ConnectionProperties::default())
             .await
             .expect("test rabbit conn");
+        // RabbitMQ 4.x 默认禁止「瞬时非排他队列」（durable=false & exclusive=false）→
+        // 声明即 INTERNAL_ERROR。测试队列设 durable=true（持久）转合法队列；并设
+        // auto_delete=true 在消费者断开后回收，贴合 roundtrip 语义且不留垃圾。
+        let mut qopts = lapin::options::QueueDeclareOptions::default();
+        qopts.durable = true;
+        qopts.auto_delete = true;
         setup
             .create_channel()
             .await
             .expect("test rabbit channel")
-            .queue_declare(
-                queue.as_str(),
-                lapin::options::QueueDeclareOptions::default(),
-                lapin::types::FieldTable::default(),
-            )
+            .queue_declare(queue.as_str(), qopts, lapin::types::FieldTable::default())
             .await
             .expect("declare queue");
         let send_payload = serde_json::json!({
             "exchange": "", "routingKey": queue,
+            "headers": {"h1": "v1"},
             "value": {"n": 1},
         })
         .to_string();
@@ -804,6 +807,47 @@ mod tests {
         ))
         .await
         .expect("mq ack");
+        // 二进制载荷（v0.1.16）：value_b64 走 base64 透传，poll 端见到 value_b64 且
+        // value=null（覆盖 `poll` 的二进制分支）。
+        let bin = b"\xff\xfe\x00\x01non-utf8";
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(bin)
+        };
+        let bin_payload = serde_json::json!({
+            "exchange": "", "routingKey": queue,
+            "value_b64": b64,
+        })
+        .to_string();
+        drive(&mut mq_call(
+            handle,
+            RString::from("send"),
+            RString::from(bin_payload.as_str()),
+        ))
+        .await
+        .expect("mq send bin");
+        let polled2 = drive(&mut mq_call(
+            handle,
+            RString::from("poll"),
+            RString::from(
+                serde_json::json!({ "queues": [queue], "max": 10, "timeoutMs": 5000 })
+                    .to_string()
+                    .as_str(),
+            ),
+        ))
+        .await
+        .expect("mq poll bin");
+        let v2: serde_json::Value = serde_json::from_slice(&polled2).unwrap();
+        assert_eq!(v2["messages"].as_array().unwrap().len(), 1, "{v2}");
+        assert!(v2["messages"][0]["value_b64"].is_string(), "{v2}");
+        assert_eq!(v2["messages"][0]["value"], serde_json::Value::Null);
+        drive(&mut mq_call(
+            handle,
+            RString::from("ack"),
+            RString::from(v2["messages"][0].to_string().as_str()),
+        ))
+        .await
+        .expect("mq ack bin");
         mq_close(handle);
     }
 

@@ -481,7 +481,8 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
   es 插件（oj-es）经 `FfiEsBackend` 适配同一 trait。`url_for` 纯函数拼
   `/{index}/_search` 或 `/{index}/_doc/{id}?refresh=true`（endpoint 尾斜杠幂等剪除）。
   index/id 白名单 `[a-zA-Z0-9_-]+` 防路径注入；响应直通（非 2xx 带 ES 返回体）；未配置 →
-  `es not configured`。真连 roundtrip 用 `OJ_TEST_ES` 环境变量驱动（`#[ignore]`）。
+  `es not configured`。roundtrip 走离线 `httptest` 内存 mock ES HTTP 服务覆盖（**无需
+  `OJ_TEST_ES`**——该变量不存在，见 [§12.1](#121-覆盖率测量与提升cargo-llvm-cov-实操)）。
 
 ---
 
@@ -624,17 +625,140 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
 - 插件适配器测试（`bridge::ffi::adapter_tests`）：mock vtable（Rust 函数指针 + 预置
   FfiFuture）验证 FfiXxxBackend 转发 + Drop close + 返回编码解码；共享静态用 `T_LOCK`
   串行化并在测试开头清理（避免跨测试污染，见 bus `DELIVER_TARGETS` 经验）。
-- 真服务集成测试 + 环境变量门控（**在插件 crate 内**，本地无服务时默认跳过）：
-  - `OJ_TEST_ES=http://127.0.0.1:9200` → `oj-es`（vtable roundtrip）
+- 真服务集成测试 + 环境变量门控（**在插件 crate 内**，本地无服务时默认跳过）。env 门控矩阵：
+  - `OJ_TEST_PG=postgres://…` → `oj-db-postgres`（vtable roundtrip）
+  - `OJ_TEST_MYSQL=mysql://…` → `oj-db-mysql`（vtable roundtrip）
   - `OJ_TEST_REDIS=redis://127.0.0.1:6379/1` → `oj-kv-redis`（vtable roundtrip）
   - `OJ_TEST_S3=endpoint|bucket|region|access|secret|path_style` → `oj-blob-s3`
-  - `OJ_TEST_KAFKA_BROKERS=b1:9092,b2:9092` → `oj-bus-kafka`；
-    `OJ_TEST_RABBITMQ_URL=…` → `oj-bus-rabbitmq`
+  - `OJ_TEST_KAFKA_BROKERS=b1:9092,b2:9092` → `oj-bus-kafka`
+  - `OJ_TEST_RABBITMQ_URL=amqp://…` → `oj-bus-rabbitmq`
+  - **离线、无需 env**：`oj-es`（httptest 内存 mock 覆盖 vtable/HTTP 全路径）、
+    `oj-auth`（纯 JWT/Guard 单测）、`oj-mail`（本地 file transport 落盘 `.eml`）。
   - 运行：`cargo test --release --workspace`（env-gated 测试未设 env 即内联跳过；
     `infinite_loop` 曾在部分平台 SIGSEGV，CI 现按平台开关 `skip_infinite_loop` 控制，
     默认跑全量，见 `.github/workflows/plugin-matrix.yml` 的 `select` job 注释）。
 
-覆盖率经 `cargo llvm-cov --workspace --summary-only` 观测（目标行/区域 >90%）。
+覆盖率经 `cargo llvm-cov --workspace --summary-only` 观测（目标行/区域 >90%）；完整测量与
+提升套路见 [§12.1](#121-覆盖率测量与提升cargo-llvm-cov-实操)。
+
+### 12.1 覆盖率测量与提升（cargo-llvm-cov 实操）
+
+目标：**release 模式下行/区域覆盖率 > 90%**（debug 构建不在支持范围，且 dev 构建曾占
+120G+ 磁盘，禁止）。测量用 `cargo-llvm-cov`，按 workspace 整体与按插件拆分两路。
+
+#### 测量前必做：清理旧的 cov target
+
+`cargo llvm-cov --workspace` 会把所有 30+ 目标的插桩产物写到 `target/llvm-cov-target`。
+若该目录存在陈旧指纹或坏 `*.profdata`（magic 不符），整轮会随机 ENOENT（"could not
+execute process … (never executed)" / os error 2），表现为若干目标编译失败而非覆盖缺口。
+**每次测量前先清**：
+
+```bash
+rm -rf target/llvm-cov-target
+```
+
+#### 真服务 env 门控矩阵（仅在插件 crate 内生效）
+
+未设 env 时对应测试内联 `skip`（仍算 passing），故无服务也能跑全量；设了 env 才连真库。
+矩阵与 §12 一致：
+
+| env 变量 | 格式 | 命中插件 | 是否离线 |
+| --- | --- | --- | --- |
+| `OJ_TEST_PG` | `postgres://…` | `oj-db-postgres` | 需真 PG |
+| `OJ_TEST_MYSQL` | `mysql://…` | `oj-db-mysql` | 需真 MySQL |
+| `OJ_TEST_REDIS` | `redis://127.0.0.1:6379/1` | `oj-kv-redis` | 需真 Redis |
+| `OJ_TEST_S3` | `endpoint\|bucket\|region\|access\|secret\|path_style` | `oj-blob-s3` | 需真 S3/MinIO |
+| `OJ_TEST_KAFKA_BROKERS` | `b1:9092,b2:9092` | `oj-bus-kafka` | 需真 Kafka |
+| `OJ_TEST_RABBITMQ_URL` | `amqp://…` | `oj-bus-rabbitmq` | 需真 RabbitMQ |
+| — | — | `oj-es`（httptest 内存 mock） | **离线** |
+| — | — | `oj-auth`（纯 JWT/Guard 单测） | **离线** |
+| — | — | `oj-mail`（本地 file transport 落盘 `.eml`） | **离线** |
+
+> 注意：`oj-es` 不需要 `OJ_TEST_ES`。其覆盖靠 `httptest` 进程内 mock ES HTTP 服务走通
+> vtable/HTTP 全路径，无需外部 9200。
+
+#### 一键可复现测量命令
+
+先起好真服务（见下方 `container` 起法），再：
+
+```bash
+rm -rf target/llvm-cov-target
+OJ_TEST_PG='postgres://poc:poc@127.0.0.1:5499/oj_test' \
+OJ_TEST_MYSQL='mysql://root:ojtest@127.0.0.1:3306/oj_test' \
+OJ_TEST_REDIS='redis://127.0.0.1:6379/1' \
+OJ_TEST_RABBITMQ_URL='amqp://127.0.0.1:5672/%2f' \
+OJ_TEST_KAFKA_BROKERS='127.0.0.1:9092' \
+OJ_TEST_S3='http://127.0.0.1:9000|oj-test|us-east-1|minioadmin|minioadmin|true' \
+cargo llvm-cov --release --workspace --no-fail-fast --lcov --output-path cov-workspace.lcov
+```
+
+- `--release`：强制插桩 release（disk 约束）。
+- `--no-fail-fast`：个别 env 缺服务时只跳过该插件测试，不让整轮中断。
+- `--lcov`：输出 lcov 便于 lcov 工具/CI 聚合；不要的业务也可改 `--summary-only` 只看比例。
+- 产物 `cov-workspace.lcov` 为本仓未跟踪文件，按需删；行/区域数来自该文件 `SF:`/`LF:`/`LH:`。
+
+#### 真服务起法（macOS `container` CLI）
+
+本机用 Apple `container` CLI（非 colima/docker）。无 `pull` 子命令——`container run`
+会自动拉取。`run -d --name <id> -p host:container -e KEY=VAL <image>`；进容器
+`container exec <id> <args>`。
+
+- **PostgreSQL**：`container run -d --name poc-pg -p 5499:5432 -e POSTGRES_USER=poc -e POSTGRES_PASSWORD=poc -e POSTGRES_DB=oj_test postgres:16`，env 用 5499 端口。
+- **MySQL**：`container run -d --name poc-mysql -p 3306:3306 -e MYSQL_ROOT_PASSWORD=ojtest -e MYSQL_DATABASE=oj_test mysql:8`。
+- **Redis**：`container run -d --name poc-redis -p 6379:6379 redis:7`。
+- **MinIO（S3）**：`container run -d --name poc-minio -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ":9001`；**建桶必须用 `mc alias`**，否则 `mc mb /oj-test` 只会在容器根 fs 建目录而非 MinIO 桶：
+  ```bash
+  container exec poc-minio sh -c 'mc alias set oj http://127.0.0.1:9000 minioadmin minioadmin && mc mb oj/oj-test --region us-east-1'
+  ```
+  默认凭据 `minioadmin/minioadmin`；`path_style=true`（见上 env 段）。`real_s3_roundtrip_via_vtable` 用错桶会报 `NoSuchBucket`。
+- **RabbitMQ**：`container run -d --name poc-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:4-management`。**4.x 队列规则变更**：非持久 + 非排他 + 非自动删除的瞬时队列被拒（`INTERNAL_ERROR - Feature transient_nonexcl_queues is deprecated`）。测试 `queue_declare` 须 `durable=true; auto_delete=true`（见 `plugins/oj-bus-rabbitmq/src/lib.rs`）。
+- **Kafka**：`bitnami/kafka` 已下架（404）。改用 `docker.io/redpandadata/redpanda:latest`（Kafka-API 兼容、单节点最简）或 `docker.io/apache/kafka:3.9.0`：
+  ```bash
+  container run -d --name poc-kafka -p 9092:9092 redpandadata/redpanda:latest \
+    redpanda start --smp 1 --overprovisioned --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr 127.0.0.1:9092
+  ```
+  env 用 `OJ_TEST_KAFKA_BROKERS='127.0.0.1:9092'`。
+- **ES**：`oj-es` 离线不需要；若真要 `poc-es`，`container run -d --name poc-es -p 9200:9200 elasticsearch:8.x`（环境变量 `discovery.type=single-node`）。
+
+#### 按插件拆分测量（定位缺口）
+
+全 workspace 跑耗时且 env 门控下只看得到聚合数。定位单个插件缺口用：
+
+```bash
+OJ_TEST_PG='postgres://poc:poc@127.0.0.1:5499/oj_test' \
+cargo llvm-cov --release --package oj-db-postgres --no-fail-fast --lcov --output-path cov-pg.lcov
+```
+
+首跑偶有 ENOENT（插桩二进制未缓存），重跑一次即过。
+
+#### 提升套路（实测有效）
+
+1. **离线插件优先**：`oj-es`/`oj-auth`/`oj-mail` 不依赖外部服务，先把它们的 vtable/分支/
+   错误路径单测写满（mock vtable、`httptest`、`InMemoryAccessor`/`InMemoryKV`、本地
+   `TcpListener` 桩、file transport 落盘比对）。离线路径能覆盖绝大部分行。
+2. **env 门控真服务测试**：对 `oj-db-*`/`oj-kv-redis`/`oj-blob-s3`/`oj-bus-*`，写
+   `env::var("OJ_TEST_*")` 读取 + 命中则 roundtrip、未命中则 `return` 的集成测试，覆盖
+   真 vtable 收发 + ack/commit 路径。`oj-bus-kafka`/`oj-bus-rabbitmq` 还需补离线坏参测试
+   （如 `bad value_b64`）覆盖错误分支。
+3. **看 lcov 找缺口**：`grep -E '^DA:' cov-*.lcov` 中 `DA:<line>,0` 即未覆盖行，定向补测。
+4. **穿透覆盖**：对 `RResult`（`oj-plugin-ffi`）用 `std::result::Result::from(r).is_ok()`
+   判断，不要 `match RResult::Ok`（关联函数不可作模式）；`catch_unwind` 路径用故意 panic 的
+   mock vtable 触发。
+
+#### 测量后必做：清 disk
+
+插桩产物极大（`target/llvm-cov-target` 可达 6G+，`target/debug` 可达 1.7G+）。跑完即清，
+避免磁盘写满：
+
+```bash
+rm -rf target/llvm-cov-target target/debug
+```
+
+#### 结果登记
+
+本仓曾达 **workspace 94.2%**（36,102/38,339 行），9 个插件均 ≥ 90%（最低 kafka/rabbitmq
+90.9%；`oj-plugin-ffi` 在 workspace 跑中 88.9%；`tools/xtask` 58.5% 不在覆盖目标内）。
+每次版本更新若改动这些模块，重跑上述命令核对比例是否回落 90% 以下，回落则补测。
 
 ---
 
@@ -646,7 +770,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
 profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装成 core trait 供 op 消费（构造放
 core，装配层只经安全入口）。
 
-**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 7，**严格相等**门禁）、`PluginDescriptor
+**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 8，**严格相等**门禁）、`PluginDescriptor
 {name, semver, abi_version, fingerprint, desc}`、各轴 repr(C) vtable（es/db/blob/bus/kv/auth）、
 `HostContext`（log + deliver 回调）。`oj_plugin_entry!(init, kv => &VT)` 生成
 `oj_plugin_abi_version()`、`oj_plugin_init()` 与每轴一个 `oj_plugin_axis_<name>` 符号
