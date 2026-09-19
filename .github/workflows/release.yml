@@ -40,6 +40,7 @@ jobs:
   guard:
     name: release guard (dedupe tag-push re-trigger)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       skip: ${{ steps.meta.outputs.skip }}
@@ -76,12 +77,25 @@ jobs:
     runs-on: ubuntu-latest
     needs: [guard]
     if: needs.guard.outputs.skip != 'true'
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # 见 package job 同名步骤的注释（只缓 crate 源码/索引与 rusty_v8 预编译库，
+      # 不缓存 target/——本仓 release target 12G+，超 GitHub 每仓 10G 缓存上限）。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/gn_out
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -105,11 +119,16 @@ jobs:
         working-directory: sample/unit
         run: npm ci && npm run typecheck
 
+  # 三条腿**必须全跑**（发行物要齐：缺一个 triple 的 dist/*，publish 与 npm 包就残了），
+  # 故不提供 plugin-matrix 那样的按平台选择。单平台出错的成本控制改由两点承担：
+  #   ① 矩阵腿 fail-fast: false —— 一条腿红不会取消另两条（取消掉的要重跑＝白烧一遍）；
+  #   ② 缓存（见下）—— 修好后用 GitHub 的 "Re-run failed jobs" 只重跑那条腿，且热启动。
   package:
     needs: [guard, lint]
     if: needs.guard.outputs.skip != 'true'
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -137,6 +156,20 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # 缓存**只**覆盖两块：crate 源码/索引（省下载）与 rusty_v8 预编译库（省下载 + 解包）。
+      # **不缓存 `target/`**：本仓库 release target 实测 12G+（deno 栈），三平台相加远超
+      # GitHub 每仓 10G 缓存上限，条目会被 LRU 互相挤出——命中率归零还倒赔上传时间。
+      # key 带 Cargo.lock 哈希：依赖一变即换条目；restore-keys 前缀做部分复用。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/gn_out
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。
       # 镜像只装 VS2026，cmake 3.29 不认识其 "Visual Studio 18 2026" 生成器；若改钉
@@ -227,6 +260,7 @@ jobs:
     name: publish release
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -323,6 +357,7 @@ jobs:
     needs: [guard]
     if: github.event_name == 'release' || github.event_name == 'push' || inputs.draft != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # 草稿转正时 release 事件 run 与 tag 重爬 push run 几乎同时到达，二者都会跑本
     # job。按 tag 做 job 级串行化：后到者排队，轮到时 publish_pkg 幂等 skip，硬消除
     # 双 npm publish 竞态（409 re-view 撞上 registry 传播延迟会误判失败）。排队等而非
@@ -391,6 +426,7 @@ jobs:
     name: smoke npm (${{ matrix.triple }})
     needs: publish-npm
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

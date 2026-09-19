@@ -70,6 +70,15 @@
   --all-targets`——等价于「unix-only 项全部缺席」的 Windows 形态，结果零 error（`fwd` 是唯一一处，
   `logging.rs` 的 `cfg(all(test, unix))` / `server_cmd.rs` 的 `daemonize`·`term` 均有 `not(unix)`
   对偶分支）。
+- **CI：三平台矩阵「一红全跑」的资源成本**（`.github/workflows/plugin-matrix.yml` / `release.yml`）。
+  `plugin-matrix.yml` 新增派发输入 `platforms`（`all`/`linux`/`macos`/`windows`，逗号分隔）与
+  `shared_jobs`（`false` = 再跳过 fmt+clippy、sample L1/L2 两个平台无关 job），由新增的 `select`
+  job 生成动态 `matrix.include`——修 Windows 就只生 Windows 那条腿，另两条**根本不生成作业**；
+  另配 workflow 级 concurrency（group = `ref` + 平台选择，`cancel-in-progress`）取消被取代的旧矩阵。
+  两个 workflow 均加 `actions/cache`（只缓 crate 源码/索引与 rusty_v8 预编译库；**不**缓存
+  `target/`——本仓 release target 实测 12G+，三平台相加超 GitHub 每仓 10G 上限会互相 LRU 挤出）
+  与各 job `timeout-minutes`（挂死不再默认烧满 6h）。`release.yml` 保持三平台全跑（发行物必须齐全），
+  单平台出错靠 `fail-fast: false` + 缓存支持「Re-run failed jobs」只重跑那一条腿。
 - devkit 顺带订正：`oj test` 旗标表补 `--db` / `--anonymous`（v0.1.20 漏同步）、
   已知限制表「静态站点无 SPA 回退」改为「SPA 回落需显式开 `server.app_spa_fallback`」。
 

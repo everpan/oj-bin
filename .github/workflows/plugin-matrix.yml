@@ -2,23 +2,111 @@
 # 构建。宿主二进制入 `bin/<triple>/`，插件入 `bin/plugins/<triple>/`，与本地
 # `cargo xtask plugin <name>` 同布局。全部以 --release 构建（无 debug 构建）。
 # Linux 以 ubuntu 的 glibc 为基线；部署含 Alpine 时补 `x86_64-unknown-linux-musl` 行。
+#
+# 资源策略（v0.1.22 起，针对「一个平台红 → 三平台陪跑」）：
+#   - `platforms` 输入：只跑出问题的那条腿（修 Windows 就 `platforms=windows`），
+#     另两条腿的 runner 直接不生出来；`shared_jobs=false` 再把平台无关 job 一起省掉。
+#   - workflow 级 concurrency：同一「ref + 平台选择」只留最新一次派发，旧矩阵被取代即取消
+#     （否则连续推修复 = 多份全量矩阵同时在跑）。
+#   - 矩阵腿 fail-fast: false（不因一条腿失败取消另两条：取消掉的那两条要重跑等于白烧）。
+#   - 缓存只覆盖「下载成本高、体积可控」的两块（见各 job 的 cache 步骤注释）。
 
 name: plugin-matrix
 
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: '要跑的平台：all（默认）/ linux / macos / windows，可逗号分隔（如 windows,linux）'
+        required: false
+        default: all
+      shared_jobs:
+        description: '平台无关 job（fmt+clippy、sample L1+L2）是否跑：true（默认）/ false（单平台快速复验时省一个 runner）'
+        required: false
+        default: 'true'
+
+# 同一「ref + 平台选择」只保留最新一次派发：连续推修复时旧矩阵（已在跑旧代码，结果无参考
+# 价值）被取消，不再陪着烧完。刻意把 `platforms` 放进 group：`platforms=windows` 与
+# `platforms=linux` 是两个**不同意图**的复验，应当并存，不能被对方取消（ref-only 的 group
+# 会让后派发者误杀前一个）。
+concurrency:
+  group: plugin-matrix-${{ github.ref }}-${{ inputs.platforms || 'all' }}
+  cancel-in-progress: true
+
+run-name: plugin-matrix [${{ inputs.platforms || 'all' }}]${{ inputs.shared_jobs == 'false' && ' (仅矩阵)' || '' }}
 
 jobs:
+  # 派发输入 → matrix.include（JSON）。放在独立 job 是为了让「没被选中的平台」**根本不生成
+  # 作业**（job 级 if 拿不到 matrix 上下文，逐 step 加 if 等于每条腿都白起一个 runner）。
+  #
+  # 各腿的 `skip_infinite_loop`（矩阵的唯一真相来源现在在下方的 JSON 字面量里）：
+  # V8 `terminate_execution` 之后的 isolate 析构在「部分平台」曾 SIGSEGV（见
+  # docs/plugin-system-handover.md §6、docs/review-2026-09-06.md P0-3）。此前一律
+  # `-- --skip infinite_loop` 全局跳过，等于长期掩盖这类真实缺陷；现改为按平台开关：
+  # 确证会崩的平台把该腿置 true 并注明复现方式，未置的平台跑全量。当前三平台均为 false
+  # （macOS + release 本地实测通过）。
+  select:
+    name: 解析平台选择
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      include: ${{ steps.pick.outputs.include }}
+      names: ${{ steps.pick.outputs.names }}
+    steps:
+      - id: pick
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          sel=$(printf '%s' "${PLATFORMS:-all}" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+          [ -n "$sel" ] || sel=all
+          linux='{"name":"linux-gnu (x86_64-unknown-linux-gnu)","os":"ubuntu-latest","triple":"x86_64-unknown-linux-gnu","skip_infinite_loop":false}'
+          macos='{"name":"macos (aarch64-apple-darwin)","os":"macos-latest","triple":"aarch64-apple-darwin","skip_infinite_loop":false}'
+          windows='{"name":"windows (x86_64-pc-windows-msvc)","os":"windows-latest","triple":"x86_64-pc-windows-msvc","skip_infinite_loop":false}'
+          [ "$sel" = all ] && sel=linux,macos,windows
+          out=""
+          names=""
+          for p in $(printf '%s' "$sel" | tr ',' ' '); do
+            case "$p" in
+              linux) j=$linux ;;
+              macos) j=$macos ;;
+              windows) j=$windows ;;
+              *) echo "::error::未知平台 '$p'（可选 all / linux / macos / windows，逗号分隔）" >&2; exit 1 ;;
+            esac
+            out="${out:+$out,}$j"
+            names="${names:+$names, }$p"
+          done
+          [ -n "$out" ] || { echo "::error::platforms 解析结果为空" >&2; exit 1; }
+          echo "include=[$out]" >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT 未设置（本脚本须在 Actions 内跑）}"
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          # 收尾不写成 `[ -n ... ] && echo ...`：条件为假时该行返回 1，会让整个 step 报失败。
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "本次矩阵腿：$names" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # 格式与 lint 门禁（与 release.yml 的 lint job 同款；平台无关，单实例一次）。
   lint:
     name: fmt + clippy
+    if: inputs.shared_jobs != 'false'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # 见 matrix job 同名步骤的注释（只缓 crate 源码/索引与 rusty_v8 预编译库）。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/gn_out
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -27,39 +115,39 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   matrix:
-    needs: [lint]
+    # `needs` 含 lint，而 lint 在 `shared_jobs=false` 下是 **skipped**。GitHub 的默认语义是
+    # 「依赖被跳过 → 本 job 一并跳过」，照抄会让 `platforms=windows & shared_jobs=false`
+    # 静默什么都不跑（最坏的一种失败：看着绿，其实没验）。故显式放开 skipped，同时仍挡住
+    # failure（lint 红了不必再烧矩阵）与 cancelled（被取代的 run 不该再起新腿）。
+    needs: [lint, select]
+    if: ${{ !cancelled() && needs.select.result == 'success' && (needs.lint.result == 'success' || needs.lint.result == 'skipped') }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-gnu (x86_64-unknown-linux-gnu)
-            os: ubuntu-latest
-            triple: x86_64-unknown-linux-gnu
-            # V8 `terminate_execution` 之后的 isolate 析构在「部分平台」曾 SIGSEGV
-            # （见 docs/plugin-system-handover.md §6、docs/review-2026-09-06.md P0-3）。
-            # 此前一律 `-- --skip infinite_loop` 全局跳过，等于长期掩盖这类真实缺陷。
-            # 现改为按平台开关：确证会崩的平台把 skip_infinite_loop 置 true 并注明复现方式；
-            # 未置的平台跑全量。当前三平台均为 false（macOS + release 本地实测通过）。
-            skip_infinite_loop: false
-          - name: macos (aarch64-apple-darwin)
-            os: macos-latest
-            triple: aarch64-apple-darwin
-            skip_infinite_loop: false
-          - name: windows (x86_64-pc-windows-msvc)
-            os: windows-latest
-            triple: x86_64-pc-windows-msvc
-            skip_infinite_loop: false
-          # 按需：部署含 Alpine 时启用 musl 行
-          # - name: linux-musl (x86_64-unknown-linux-musl)
-          #   os: ubuntu-latest
-          #   triple: x86_64-unknown-linux-musl
+        include: ${{ fromJSON(needs.select.outputs.include) }}
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # 缓存**只**覆盖两块：crate 源码/索引（省下载）与 rusty_v8 预编译库（150M 起，
+      # 省下载 + 解包）。**不缓存 `target/`**：本仓库 release target 实测 12G+（deno 栈），
+      # 三平台相加远超 GitHub 每仓 10G 缓存上限，条目会被 LRU 互相挤出——命中率归零还倒赔
+      # 上传时间。要缓存整份 target/ 需接受该上限（或改用自建缓存），故有意不做。
+      # key 带 Cargo.lock 哈希：依赖一变即换条目；restore-keys 前缀做部分复用。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/gn_out
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       # Windows 上 rdkafka-sys（oj-bus-kafka 的依赖）经 cmake 从源码编 librdkafka。
       # 镜像只装 VS2026，cmake 3.29 不认识其 "Visual Studio 18 2026" 生成器；若改钉
@@ -117,7 +205,8 @@ jobs:
           ls -la bin/plugins/${{ matrix.triple }}/
 
       # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建）。
-      # infinite_loop 只在 skip_infinite_loop=true 的平台跳过（见 matrix 注释），不再全局跳过。
+      # infinite_loop 只在 skip_infinite_loop=true 的平台跳过（见 select job 的 matrix 定义），
+      # 不再全局跳过。
       - name: cargo test --release (workspace)
         run: cargo test --workspace --release ${{ matrix.skip_infinite_loop && '-- --skip infinite_loop' || '' }}
 
@@ -143,12 +232,14 @@ jobs:
           if-no-files-found: error
 
   # sample 的 L1（oj test，进程内真实运行时）与 L2（vitest，纯 mock）此前**完全不在 CI 里**
-  # —— 端到端契约与 mock 单测无人守护，回归只能靠人工。本 job 补上这个缺口。
+  # ——端到端契约与 mock 单测无人守护，回归只能靠人工。本 job 补上这个缺口。
   # 只跑单一平台：两层测试都不覆盖平台相关行为（平台相关由上面的 matrix 负责）。
   sample-tests:
     needs: [lint]
+    if: inputs.shared_jobs != 'false'
     name: sample L1 + L2
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -157,6 +248,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      # 见 matrix job 同名步骤的注释（只缓 crate 源码/索引与 rusty_v8 预编译库）。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release/gn_out
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       # L2 依赖（vitest + typescript）先装：把类型检查放在昂贵的 Rust 构建**之前**，
       # 类型错误 30 秒内失败，不用等一轮 release 构建。

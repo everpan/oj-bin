@@ -147,7 +147,8 @@ cd sample && npm run typecheck            # 推荐（委托到 unit，用其安�
 - `typescript` 是 `sample/unit` 的 devDependency（钉 `5.6.3`），随 `npm ci` 安装；
   必须先 `npm run unit:install`（或 `cd sample/unit && npm ci`）才可运行。
 - **这是 CI 门禁**：`plugin-matrix.yml` 的 `sample-tests` 与 `release.yml` 的 `lint`
-  job 都会跑（后者让 tag 推送发版前必过）。
+  job 都会跑（后者让 tag 推送发版前必过）。单平台快速复验时可用 `plugin-matrix.yml` 的
+  `shared_jobs=false` 跳过本 job（资源策略见 `docs/dev-guide.md` §16）。
 - 没有门禁时这类漂移会静默积累（v0.1.20 修过一次：`all()` 返回 `Json[]`、`sess` 未声明、
   `next()` 判别联合共 30 处）。
 
