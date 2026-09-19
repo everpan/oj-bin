@@ -148,23 +148,28 @@ async fn oidc_full_chain_login_bridge_and_tenant() {
     let mut cfg = base_cfg(&t);
     cfg.server.host = "127.0.0.1".into(); // issuer/redirect_uri 须与实际绑定地址一致
     cfg.server.port = port;
-    // 与 sample/config.yaml 同形：`/oidc/*` 一层且无更深路由（不告警）；`/idp/*` 因 discovery
-    // 深一层而会触发迁移 WARN，故标 one_layer 显式确认（顺带覆盖条目对象形态的解析链路）。
-    let anon = vec![
+    // 与 sample/config.yaml 同形：`/oidc/*` 一层且无更深路由（不告警）；auth 的 `/idp/*` 因
+    // discovery 深一层**会丢面** → 标 one_layer 显式确认（顺带覆盖条目对象形态的解析链路）。
+    // 租户列表用纯字符串（v0.1.23 起迁移 WARN 只针对 auth 列表）。
+    let anon_plain = vec![
         AnonPath::Plain("/oidc/*".into()),
-        AnonPath::Detailed {
-            path: "/idp/*".into(),
-            one_layer: true,
-        },
+        AnonPath::Plain("/idp/*".into()),
         AnonPath::Plain("/idp/.well-known/*".into()),
     ];
     cfg.auth = Some(AuthCfg {
         jwt_secret: "e2e".into(),
-        anonymous_paths: anon.clone(),
+        anonymous_paths: vec![
+            AnonPath::Plain("/oidc/*".into()),
+            AnonPath::Detailed {
+                path: "/idp/*".into(),
+                one_layer: true,
+            },
+            AnonPath::Plain("/idp/.well-known/*".into()),
+        ],
         ..Default::default()
     });
     cfg.tenant.enable = true;
-    cfg.tenant.anonymous_paths = anon;
+    cfg.tenant.anonymous_paths = anon_plain;
     cfg.oidc = Some(OidcSection {
         issuer: issuer.clone(),
         private_key_path: "oidc_rs256.pem".into(), // 相对 config 目录

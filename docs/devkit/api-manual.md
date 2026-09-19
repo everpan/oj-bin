@@ -1501,19 +1501,25 @@ tenant:
 **去 base 前缀**后的路径，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
 中段 `*`（恰好一段）；豁免命中且确实没带租户头 → 该请求标记为**匿名**（
 `RequestInfo.anonymous`），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
-已带的头仍照常注入。旧写法「尾 `/*` 当多层前缀」在 v0.1.20 收紧为严格一层；装配期对
-`tenant.anonymous_paths` / `auth.anonymous_paths` 中的尾 `/*` 条目打**聚合迁移 WARN**，
-**两个条件同时成立才打**（v0.1.23 起）：
+已带的头仍照常注入。
+
+**迁移 WARN 只针对 `auth.anonymous_paths`**（v0.1.23 订正）：v0.1.20 的「尾 `/*` 从任意深度
+收紧为严格一层」**只发生在 oj-auth 侧**；`tenant.anonymous_paths` 自引入起就是严格一层
+（旧 server 实现即 `!rest[1..].contains('/')`，`git show v0.1.19:server/src/lib.rs`），对租户
+条目提「收回了面」是伪前提，故该列表不再参与启动期告警。
+
+对 `auth.anonymous_paths`，**两个条件同时成立才打**聚合 WARN：
 
 1. 条目是**旧式前缀形态**——只有尾段那一个 `*`，其余段全是字面量（`/idp/*`、`/users/me/accounts/*`）。
-   v0.1.19 的旧实现是「砍掉尾 `*` 再 `starts_with`」（任意深度），只有这种形态当时能命中
+   旧 oj-auth 实现是「砍掉尾 `*` 再 `starts_with`」（任意深度），只有这种形态当时能命中
    真实请求；**含中段 `*` 的结构条目**（`/public/anchor/*/issues/*`）那时根本匹配不上，
    只能诞生于 v0.1.20 的四形态语义，是刻意写的形状——对它们提「改 `**`」是错的，故静默。
-2. 改写成 `**` 后**真的会多命中一条已注册路由**：
-   - `/idp/*` 而项目里注册了 `/idp/.well-known/openid-configuration` → **告警**（收紧确实
-     收回了既有免鉴权面，应改 `/idp/**` 或把深路径单列）；
-   - `/auth/oidc/*` 这类**本就没有更深路由**的条目 → **静默**（改 `**` 反而扩面：`**` 含零层
-     与任意深）。
+2. 该条目**确实丢了面**——存在一条已注册路由比严格一层更深：
+   - `/idp/*` 而项目里注册了 `/idp/.well-known/openid-configuration`（深两层）→ **告警**
+     （收紧确实收回了既有免鉴权面，应改 `/idp/**` 或把深路径单列）；
+   - `/auth/oidc/*` 这类**本就没有更深路由**的条目 → **静默**。
+   - 若唯一「更深」只是 `**` 多出的**零层**（裸 `/user/account` 配 `/user/account/*`）→ 旧语义
+     也没覆盖它，**不算丢面**，同样静默。
 
 确属「有意一层」时把条目写成对象形态并标 `one_layer: true`，永久退出该 WARN：
 
@@ -1521,10 +1527,12 @@ tenant:
 auth:
   anonymous_paths:
     - /auth/login
-    - { path: "/auth/oidc/*", one_layer: true }   # 有意的一层（或明知影响面仍要一层）
+    - { path: "/idp/*", one_layer: true }   # 明知 ** 更宽，就要一层（discovery 另行单列）
 ```
 
-`one_layer` 标在没有尾 `/*` 的条目上无意义，装配期直接报错（fail-fast，防配置撒谎）。
+对象形态只认 `path` 与 `one_layer` 两个键：**写错键名会报错**（不再是静默失配）。`one_layer`
+标在末段不是 `*` 的条目上无意义，装配期直接报错（fail-fast，防配置撒谎）。`tenant.` 段同样
+接受对象形态，但那里不告警，标记等于备注。
 
 **`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制

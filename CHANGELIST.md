@@ -6,67 +6,99 @@
 
 下游 U39：`anonymous_paths` 的 v0.1.20 迁移 WARN **无法消音**。尾 `/*` 是四形态中的合法形态
 （尾段动态时只能用 `/*`；改 `**` 反而扩面——`**` 含零层与任意深），但旧实现「凡尾 `/*` 即
-告警」，这类条目每次启动都被点名，且没有任何配置手段让它退出聚合。本版两处改动合起来治：
-**告警按影响面判定**（默认静音噪音）+ **条目级显式确认**（保留人工逃生门）。
+告警」，这类条目每次启动都被点名，且没有任何配置手段让它退出聚合。本版三处改动合起来治：
+**订正提示的适用面**（只 auth）+ **按真实影响面判定**（默认静音噪音）+ **条目级显式确认**
+（保留人工逃生门）。设计、证据与双专家评审逐条处置见
+`docs/superpowers/specs/2026-09-19-v0.1.23-anon-path-warn-design.md`。
+
+**订正（v0.1.20 兼容性条目的措辞）**
+
+- **v0.1.20 的「尾 `/*` 任意深度 → 严格一层」收紧只发生在 oj-auth 侧**。`tenant.anonymous_paths`
+  自引入起就是严格一层：`git show v0.1.19:server/src/lib.rs` 的 `path_matches` 即
+  `!rest[1..].contains('/')`，且 v0.1.19 的租户豁免（同文件 `:364`）走的就是它。v0.1.20 那条
+  兼容性说明把两条列表并列，读起来像租户也收紧过——本版在原文加了订正注，并且**迁移 WARN
+  只再对 `auth.anonymous_paths` 生效**（对租户条目说「收回了面」是伪前提，也解释了为何
+  下游实测里那几条 tenant 告警怎么调都"消不掉"）。
 
 **行为变更（启动日志，需知晓）**
 
-- **迁移 WARN 改为按「影响面」判定**，两个条件**同时成立**才告警
-  （`oj/src/app.rs` 的 `warn_legacy_tail_wildcards` / `tail_wildcard_widens` /
-  `is_legacy_prefix_shape`）：
-  1. 条目是**旧式前缀形态**——只有尾段那一个 `*`、其余段全字面。v0.1.19 的旧实现是
+- **迁移 WARN 只针对 `auth.anonymous_paths` + 按影响面判定**，两个条件**同时成立**才告警
+  （`oj/src/app.rs` 的 `warn_legacy_tail_wildcards` / `migration_warn_entries`）：
+  1. 条目是**旧式前缀形态**——只有尾段那一个 `*`、其余段全字面。旧 oj-auth 实现是
      `strip_suffix("/*")` + `starts_with`（尾 `*` = 任意深度），只有这种形态当时能命中真实
      请求；**含中段 `*` 的结构条目**（`/public/anchor/*/issues/*`）那时根本匹配不上，只能
-     诞生于 v0.1.20 的四形态语义，即刻意写出的形状——对它们提「改 `**`」是错的（`**` 会把
-     更深的层级一并纳入，不是用户要的形状）。故按形态豁免，不只看「`**` 是否更宽」。
-  2. 改写为 `**` 后**真的会多命中一条已注册路由**：用路由表 pattern 的**去 base 视图**
-     （`{param}`→`*`、`{*rest}`→`**`）比对「`**` 形态命中而 `/*` 形态不命中」是否存在。
-  - 实测校准（下游真实 config，v0.1.23 二进制实跑）：旧实现点名 **9 条 tenant + 6 条 auth**；
-    加入形态条件后只有**旧式前缀**条目留下（`/users/me/accounts/*`、`/public/assets/v2/anchor/*`
-    、`/instances/admins/*` 等），而 U39 抱怨的结构条目（`/public/anchor/*/issues/*` 系）
-    全部静默。这是一次真实配置对判定口径的回归校准，非纸面推导。
-  - 影响：`/idp/*`（项目里注册了 `/idp/.well-known/openid-configuration`）**照旧告警**——
-    收紧确实收回了既有免鉴权面；`/auth/oidc/*` 这类「本就没有更深路由」的条目**不再刷屏**。
-    以后新增深层路由时告警会自己回来，正是该提醒的时刻。
-  - 调用点从装配早期（`:520`）**后移到路由表建好之后**，故 WARN 在启动日志里位置变晚
+     诞生于 v0.1.20 的四形态语义，即刻意写出的形状——对它们提「改 `**`」是错的。
+  2. 该条目**确实丢了面**——存在一条已注册路由比严格一层更深（judged 段级：`tail_entry_loses_coverage`
+     把路由 pattern 归一去 base 的视图后，逐段对拍「head + ≥2 段」是否可达；`**` 只多出的
+     **零层**（裸 head）在旧语义下同样没覆盖，不算丢面）。
+  - 实测校准（上一轮用本版前的二进制跑下游真实 config 的启动日志）：旧实现点名
+    **9 条 tenant + 6 条 auth**；加形态条件后收敛为 **4 条 tenant + 1 条 auth**（U39 抱怨的
+    结构条目全部静默）；再加「只 auth 参与」后 **tenant 侧归零**。下游套件本轮未复跑
+    （该仓只读），auth 侧余下条目属真·旧前缀（`/public/assets/v2/anchor/*` 一类），
+    需要时在那边跑一次 `oj test` 即可看到当前清单。
+  - 调用点从装配早期（原 `:520`）**后移到路由表建好之后**，故 WARN 在启动日志里位置变晚
     （在 `module ...` 行与路由清单之后）。
   - 只按「已注册路由」判是充分的：静态托管与 `/blob` 都在鉴权前直接返回，不经匿名匹配
-    （`server/src/lib.rs`），即匿名路径只对注册路由产生实际效力。
+    （`server/src/lib.rs`，该处已补**互指注释**：改动提前返回的顺序/让它们咨询匿名表时
+    必须同步本判定）。
 
 **特性**
 
-- **`anonymous_paths` 支持条目对象形态**（tenant / auth 同形）：`AnonPath` 为 untagged 枚举，
-  除字符串简写外可写 `- { path: "/auth/oidc/*", one_layer: true }`。`one_layer: true` = 显式
-  声明「这一层是有意的」，**永久退出迁移 WARN**（含影响面判定为真的情形）。
+- **`anonymous_paths` 支持条目对象形态**（tenant / auth 同形）：除字符串简写外可写
+  `- { path: "/auth/oidc/*", one_layer: true }`。`one_layer: true` = 显式声明「这一层是有意的」，
+  **永久退出迁移 WARN**（含影响面判定为真的情形；对 tenant 列表是备注——那里不告警）。
+  - **手写 `Deserialize`（不用 `#[serde(untagged)]`）**：untagged 无法 `deny_unknown_fields`，
+    `one_layr: true` 会被**静默**解析成 `one_layer=false`（用户以为已消音而实际没有），
+    报错还只给「did not match any variant」且位置指向**列表首元素**。现在只认 `path` 与
+    `one_layer` 两个键：未知键 / 缺 `path` / 类型错都给出人话报错。
   - 消费侧统一归一为路径字符串（`config::anon_paths()`）：server 的 `Pipeline.tenant_anon` 与
     oj-auth 插件 cfg JSON 都只吃 `Vec<String>`，**插件侧零改动、ABI 保持 8**。
-  - **装配期 fail-fast**（`config::validate_anon_paths()`）：`one_layer` 标在没有尾 `/*` 的条目上
-    直接报错——该标记只对严格一层有意义，静默接受等于让配置撒谎。
+  - **装配期 fail-fast**（`config::validate_anon_paths()`）：`one_layer` 标在末段不是 `*` 的
+    条目上直接报错。判据用**段级**口径（与匹配层「忽略空段」一致：`/idp/*/` 合法），
+    与迁移 WARN 侧的裸后缀口径**有意不同**（那边对齐的是 v0.1.19 `strip_suffix("/*")` 的历史语义）。
+
+**修复**
+
+- **`oj build` 读配置失败改为出声**（`oj/src/build_cmd.rs` 的 `sql_guard_of_config` /
+  `tasks_dir_of`）：此前静默回落 `sql_guard=off` + `tasks` 目录——`sql_guard` 非 Off 的项目
+  会因此**静默关掉** `S*` 检查里的 tenant 声明校验（CI 门禁失效）。对象形态新增了一类
+  「很容易写错、写错就是整份配置解析失败」的输入，触发面被放大，故本次补上 warn。
+- **影响面判据由「模式对拍模式」改为段级判定**：原实现把条目与路由视图都送进
+  `server::path_matches`，而路由视图自身可能含 `*`/`**`（`{param}` / `{*rest}` 归一而来），
+  pattern-vs-pattern 会**漏报**——`/file/*` 撞上 catch-all 路由 `/file/{*path}`（视图
+  `/file/**`）时静默，`/zzz/*` 撞上带参路由 `/v1/api/{x}/detail/sub` 时也静默，而两者都
+  真的丢了面。
 
 **文档**
 
-- `docs/devkit/`（对外发行）：`api-manual.md` 匿名路径段改写（影响面判定 + `one_layer` 形态）、
-  `scenarios.md` 场景 5 更新 WARN 样例与消音写法 + 常见坑两行；`docs/modules/02-config.md`
-  新增条目形态与校验落点；`docs/tenant-guide.md`、`docs/builtin-api-auth.md` 同步。
-- `docs/oidc-integration.md` / `docs/oidc-implementation.md`：OP 面豁免从 `/idp/*` +
-  `/idp/.well-known/*` 改为 **`/idp/**`**（discovery 比 `/idp/*` 深一层，本就该跨层；旧写法
-  在 v0.1.23 的影响面判定下会持续告警）。
-- `sample/config.yaml` / `sample/config.docker.yaml`：`/idp/*` 改为带 `one_layer: true` 的对象
-  形态（豁免面最小 + 不产生启动噪音），并注明 `/idp/.well-known/*` 单列的理由。
+- `docs/superpowers/specs/2026-09-19-v0.1.23-anon-path-warn-design.md`（新增）：本版设计与
+  **双专家评审逐条处置**（开发侧 + 架构侧并行只读评审；已采纳 11 条 / 未采纳 4 条附理由），
+  含实读证据（v0.1.19 两侧旧实现源码）与实跑验证（样例静音、未知键报错位置、fail-fast）。
+- `docs/devkit/`（对外发行）：`api-manual.md` 匿名路径段改写（适用面＝仅 auth、影响面判定、
+  `one_layer` 形态、对象形态只认两个键）；`scenarios.md` 场景 5 ② 改标题与正文为「只需检查
+  `auth.anonymous_paths`」并补两个反例（仅差零层不告警、结构条目不告警）；`SKILL.md` 陷阱行同步。
+- `docs/modules/02-config.md`：§4 校验表补 `oj build` 出声一条 + 调用点改为按函数名引用
+  （原先写死的行号已漂移）；§4.1 改写为「WARN 只 auth + 两个条件 + 手写 Deserialize」。
+  `docs/modules/03-server-http.md` 的通配语义段同步（收紧只在 auth、WARN 两条件、静态/blob
+  不经匿名匹配）。
+- `docs/tenant-guide.md`：v0.1.20 变更块限定到 auth 侧，明确租户列表不参与告警。
+- `docs/oidc-integration.md` / `docs/oidc-implementation.md`：收紧范围限定 auth；补「本文
+  `/idp/**` 与 sample 的 `/idp/* + one_layer` 是等价两种窄面」的互指；§8 清单措辞对齐。
+- `sample/config.yaml` / `sample/config.docker.yaml`：`one_layer` 挪到 **auth** 的 `/idp/*`
+  （租户侧不再需要），注释写清「租户侧自始严格一层、不参与告警」；`sample/README.md` 同步。
 
 **测试**
 
-- `config.rs`：字符串/对象两形态解析、缺省 `one_layer=false`、归一化、`one_layer` 非尾 `/*`
-  fail-fast，共 2 条新用例。
-- `oj/src/app.rs`：`tail_wide_variant` / `anon_view_of_route`（剥 base、参数段归一）/
-  `is_legacy_prefix_shape`（旧前缀 vs 结构条目）/ `tail_wildcard_widens`（旧前缀形态 + 更深
-  路由才告警，结构条目即使 `**` 更宽也不告警）/ 聚合过滤（`one_layer` 压掉）5 条新用例，
-  其中结构条目的反例直接取自下游 config 的真实写法。
-- `oj/tests/oidc_e2e.rs`：匿名列表改用对象形态，端到端覆盖条目解析 → 装配 → 插件 cfg 链路。
-- `oj/tests/sample_config.rs`（新增）：**发行样例**（`sample/config.yaml` 与
-  `sample/config.docker.yaml`）必须可解析且过 `validate_anon_paths`，并钉住 `/idp/*` 带
-  `one_layer`、`/oidc/*` 用简写——样例里 YAML 写错的暴露面只在装配期，而 `oj build` 读配置
-  是宽容的（`unwrap_or` 吞错），没有本用例只能靠人肉跑 server 才发现。
+- `src/config.rs`：两形态解析、归一化、段级 fail-fast、**未知键/缺 `path`/类型错报错**
+  （评审 P2-3/P2-4 的钉子），共 4 条新用例。
+- `oj/src/app.rs`：`anon_view_of_route`（剥 base、参数段归一）/ `is_legacy_prefix_shape` /
+  `tail_entry_loses_coverage`（含评审反例：catch-all 视图 `**`、带参视图 `/*/detail/sub`
+  必须告警；仅差零层的模块根路由**不**告警）/ `legacy_entries`（直接打被测函数，不复刻过滤链）/
+  `migration_warn_entries`（只 auth 参与），共 5 条新用例。
+- `oj/tests/oidc_e2e.rs`：匿名列表用对象形态，端到端覆盖条目解析 → 装配 → 插件 cfg 链路。
+- `oj/tests/sample_config.rs`（新增）：**发行样例**必须可解析且过 `validate_anon_paths`，
+  并钉住「auth 的 `/idp/*` 带 `one_layer`、tenant 的 `/idp/*` 不带」——样例 YAML 写错的
+  暴露面只在装配期，没有本用例只能靠人肉跑 server 才发现。
 
 ## v0.1.22（2026-09-19）
 
@@ -328,6 +360,10 @@
    的 `auth.anonymous_paths` / `tenant.anonymous_paths` 条目（如 `/idp/*` 曾命中
    `/idp/.well-known/openid-configuration`）。启动期对含尾 `/*` 的列表打**聚合 WARN** 提示
    改 `**`（不静默收回授权面）。仅需一层的老配置无需改动。
+   > **v0.1.23 订正**：这次收紧**只发生在 oj-auth 侧**（`auth.anonymous_paths`）。
+   > `tenant.anonymous_paths` 自引入起即为严格一层——v0.1.19 的 `server::path_matches` 已是
+   > `!rest[1..].contains('/')`，租户豁免（`server/src/lib.rs:364`）走的就是它。本条的
+   > 「两条列表并列」措辞不精确；v0.1.23 起迁移 WARN 也只对 `auth.anonymous_paths` 生效。
 3. **SPA 回落默认关闭**：`server.app_spa_fallback` 默认 `false`，需显式开启（不复用旧行为，
    避免 `app_prefix="/"` 的存量部署突然开始吞 404）。
 

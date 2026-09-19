@@ -70,9 +70,11 @@ flowchart TD
 - **OP 对外端点说标准协议**：discovery/jwks/token/userinfo 成功用 `json.raw` 回裸 JSON
   （RFC 6749 要求 `access_token` 是顶层字段），错误仍走 `{code,msg,data}` 信封。
 - **豁免面最小**：`tenant.anonymous_paths` 只豁免「缺失租户头的 400」，且只列跳转腿路径
-  （`/oidc/*`、`/idp/**`——discovery 在 `/idp/.well-known/openid-configuration`，比 `/idp/*`
+  （`/oidc/*`、`/idp/**`——discovery 挂在 `/idp/.well-known/openid-configuration`，比 `/idp/*`
   深一层，故 OP 面用 `**`）；带有效租户头的请求照常注入 `http.tenantId`。
-  匹配为通配四形态（字面 / 尾 `/*` 一层 / `*` 单段 / `**` 跨段）。
+  匹配为通配四形态（字面 / 尾 `/*` 一层 / `*` 单段 / `**` 跨段）。**语义收紧只发生在 auth 侧**
+  （v0.1.20 把 oj-auth 的尾 `/*` 从任意深度改为严格一层）；租户侧自引入起即为严格一层，
+  故启动期迁移 WARN 只针对 `auth.anonymous_paths`（见 `docs/devkit/scenarios.md` 场景 5）。
 
 ## 2. 全链时序图
 

@@ -344,7 +344,14 @@ async fn handle(
         }
     }
 
-    // 内置 blob 下载路由（{base}/blob/{key}，公开 GET，先于路由表）。
+    // 内置 blob 下载路由（{base}/blob/{key}，公开 GET，先于路由表，也先于前置管线）。
+    //
+    // **与匿名路径的耦合（互指注释）**：本分支（以及下方静态站点兜底）在 auth/tenant
+    // 前置管线**之前**直接 return，因此 `anonymous_paths`（`Pipeline.tenant_anon` /
+    // `AuthGuard::verify`）对它们**不产生任何效力**。启动期的匿名路径迁移 WARN
+    // （`oj/src/app.rs` 的 `warn_legacy_tail_wildcards`）正是靠这一点把「影响面」收窄到
+    // 「已注册路由」——**若把这两处提前返回改为走前置管线，或让它们咨询匿名表，必须同步
+    // 该判定的前提**，否则 WARN 会静默失准。
     if verb == "GET"
         && let Some(blob) = st.pipeline.blob.as_ref()
         && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))

@@ -65,20 +65,27 @@
 | `server.api_prefix` 为空 | `oj/src/server_cmd.rs:95` |
 | 模块名/版本白名单 | `oj/src/manifest.rs:25,37` |
 | schema.yaml 标识符白名单 `[A-Za-z_][A-Za-z0-9_]*` | `oj/src/schema.rs:103` |
-| `anonymous_paths` 的 `one_layer` 只许标在尾 `/*` 条目上 | `config::validate_anon_paths()` + `oj/src/app.rs:565` |
+| `anonymous_paths` 的 `one_layer` 只许标在末段为 `*` 的条目上 | `config::validate_anon_paths()`（调用点 `oj/src/app.rs` 的 `App::from_config`，`db_query.validate()` 之后） |
+| `oj build` 读配置失败改为打 warn（此前静默） | `oj/src/build_cmd.rs` 的 `sql_guard_of_config` / `tasks_dir_of` |
 
 ### 4.1 `anonymous_paths` 的条目形态（tenant / auth 同形）
 
 条目是 `AnonPath`（`src/config.rs`）：字符串简写，或对象 `{ path, one_layer }`。
+**对象形态只认 `path` 与 `one_layer` 两个键**——手写 `Deserialize`（不用 `untagged`），
+未知键/缺 `path`/类型错都直接报错，杜绝 `one_layr: true` 这类笔误被静默吃成 `false`。
 
 - **两种形态在消费侧归一为路径字符串**（`config::anon_paths()`）：server 的 `Pipeline`
   与 oj-auth 插件的 cfg JSON 都只吃 `Vec<String>`，故插件侧零改动、ABI 不变。
-- `one_layer: true` = 显式确认该尾 `/*` 是**有意的一层**，退出 v0.1.20 的迁移 WARN。
-- 迁移 WARN 本身自 v0.1.23 起**按影响面判定**，两个条件同时成立才告警：① 条目是**旧式前缀
-  形态**（只有尾段一个 `*`、其余段全字面——旧实现 `strip_suffix("/*")` + `starts_with` 只有
-  这种形态能命中，含中段 `*` 的结构条目是 v0.1.20 后刻意写的）；② 改写为 `**` 会真的多命中
-  一条已注册路由。实现：`oj/src/app.rs` 的 `warn_legacy_tail_wildcards` /
-  `tail_wildcard_widens` / `is_legacy_prefix_shape`，调用点在路由表建好之后。判定只依赖已
+- `one_layer: true` = 显式确认该尾 `/*` 是**有意的一层**，退出迁移 WARN（该标记只对
+  **auth** 列表有实际作用——见下）。
+- 迁移 WARN 自 v0.1.23 起**按影响面判定**，且**只针对 `auth.anonymous_paths`**（v0.1.20 的
+  「任意深度 → 严格一层」收紧只发生在 oj-auth 侧；`tenant.anonymous_paths` 自引入起就是严格
+  一层，对租户条目说「收回了面」是伪前提）。两个条件同时成立才告警：① 条目是**旧式前缀
+  形态**（只有尾段一个 `*`、其余段全字面——旧 oj-auth 的 `strip_suffix("/*")` + `starts_with`
+  只有这种形态能命中，含中段 `*` 的结构条目是 v0.1.20 后刻意写的）；② 该条目确实**丢面**
+  （存在已注册路由比严格一层更深；`**` 只多出「零层」不算）。实现：`oj/src/app.rs` 的
+  `warn_legacy_tail_wildcards` / `migration_warn_entries` / `legacy_entries` /
+  `tail_entry_loses_coverage` / `is_legacy_prefix_shape`，调用点在路由表建好之后。判定只依赖已
   注册路由是充分的——静态托管与 `/blob` 都在鉴权之前直接返回，不经匿名匹配。
 
 ## 5. 已知问题
