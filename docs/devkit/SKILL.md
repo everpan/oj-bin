@@ -14,7 +14,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
    之类）→ §6 末「ext_boot.js」，不要去改 handler。**
    **命中下面这些典型需求时，先读 `scenarios.md` 照抄**（配置 + 代码 + 验证 + 常见坑四段）：
    公开分享页按租户读数据（`db.asTenant` + `tenant.allow_as_tenant`）/ SPA 深链回落与每页
-   meta（`app_spa_fallback` + `html_meta`）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
+   meta（`app_spa_fallback` + `html_meta` 构建期 JSON / `html_meta_handler` 按数据注入，v0.1.25）
+   / 部署期常量不硬编码（顶层 `vars:` + `vars.get`，v0.1.25）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
    列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态 /
    多库项目按库迁移与对账（`oj migrate --db <name>`）/ 大整数 id 的生成与回写（`toBigInt`）。
    **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
@@ -97,6 +98,13 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | `db.asTenant` 抛错（v0.1.20） | 三道门禁：`tenant.allow_as_tenant: true` 未开 / 请求不是匿名（未命中 `anonymous_paths` 或已带租户头）/ id 为空；且**请求级只能设一次**（防中途换身份）。公开页正确姿势见 `scenarios.md` 场景 1 |
 | 尾 `/*` 匿名路径收不到豁免（v0.1.20） | **auth 侧**尾 `/*` 已统一为**严格一层**（旧 oj-auth 是任意深度）；跨层改 `/x/**`。**租户侧自始就是严格一层，无此变更**。装配期只对 `auth.anonymous_paths` 里「旧式前缀形态（只有尾段一个 `*`、其余段全字面）且确实丢了面（有更深的已注册路由）」的条目打聚合迁移 WARN（v0.1.23 起，结构条目与仅差 `**` 零层的都不再点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
+| IM 预览 / 爬虫只看到默认 title（页面上 JS 改了没用——爬虫不执行 JS） | 构建期已知路由 → `server.html_meta` 的 `__meta/<path>.json`；**按数据**（issue 标题/分享页正文）→ `server.html_meta_handler` 指一个 GET handler（v0.1.25，`http.query.path` 是**已剥 `app_prefix`** 的站点内路径；返回 `title`/`og:*`/… 或信封），配 `html_cache_control` 防盲缓存。见 `scenarios.md` 场景 2 |
+| 注入的 meta「生效了但还是看到旧 title」 | 不会：head 里**同名旧标签会先被摘掉**再放新的（浏览器/爬虫只认第一个，v0.1.25 起替换而非追加）。若真没变：壳的 `<title>` 在 `</head>` 之外，或 head 里是 `<script>` 拼出来的（脚本内容不参与替换） |
+| 动态 meta handler 里 `db.asTenant` 抛错 / `http.tenantId` 是 null | 派发**恒匿名**：请求头（含租户头）一律不传递（安全边界：否则 `sql_guard: deny` 会把攻击者指定的租户当过滤条件）。按 URL 派生 id → `db.asTenant(id)`，并开 `tenant.allow_as_tenant: true` |
+| 预览卡片只在本地对、生产不对 | oj 只在**自己送静态文件**时注入；生产由 nginx/Caddy/CDN 直出 SPA 的话要么改走 oj 托管（`server.app_path`），要么在反代层做注入 |
+| 启动报 `server.html_meta_handler: "…" 不在路由表` / `未映射 GET 方法` | 动态 meta 源必须命中一个 **GET** 路由（v0.1.25 装配期 fail-fast）——常见错因：路径写错、或该路径只有 POST |
+| 日志 `warn: html_meta_handler: …` 但页面照常 200 | fail-open 是设计：handler 非 2xx / 超时 / 非 JSON / 信封 `code != 0` 时按静态结果送出。按 WARN 里的原因修 handler，页面不会 500 |
+| `vars.get("X")` 恒 `null` | 只有写进 config 顶层 `vars:` 段的键可读（fail-closed；平台**不**读 OS env，也没有读任意 config 键的口子）。值只能是标量（`PORT: 3000` 读成 `"3000"`，嵌套 map/list 是配置错误） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
 | 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |

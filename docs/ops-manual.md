@@ -206,7 +206,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 | 启动报 `api path not found: …` | `--api-path` 指定的目录不存在 | 改路径或建目录；两者皆指定时必须都存在（准入门三态） |
 | 启动报 `static site dir not found: …` | 指定了静态根但目录不存在 | 建目录或改路径 |
 | 启动报 `neither api path … specified` | `--api-path` 与静态站点皆未指定（server 无 src/dist 自动搜索兜底） | 显式指定其一：`--api-path` 或 `server.app_path` / `--app-path` |
-| 静态文件 404 | 文件不存在 / 目录缺 `index.html` / 非 GET/HEAD / 无 SPA 回退（v0.1） | 核对文件；SPA 场景先经前置反代补写回退 |
+| 静态文件 404 | 文件不存在 / 目录缺 `index.html` / 非 GET/HEAD / **未开** `server.app_spa_fallback`（SPA 深链默认不回落，v0.1.20） | 核对文件；SPA 站点显式开 `server.app_spa_fallback: true`（`api_prefix` 下的 404 仍 404）；或在反代层做回落 |
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |

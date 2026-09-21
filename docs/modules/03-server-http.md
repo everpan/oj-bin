@@ -40,7 +40,15 @@ Router::new()
    `MethodNotAllowed` 405 / `NotFound` 继续。
 8. **dev 目录镜像兜底**：`Routes::resolve`，且被 `.route` 替换掉的方法不复活（`is_replaced`）。
 9. **静态兜底**：GET/HEAD + `resolve_static`（逐段解码 + 越界段拒绝）→ 文件响应；
-   HTML 响应先过 per-route meta 注入（`server.html_meta`）。
+   HTML 响应先过 per-route meta 注入（`static_page`）：`server.html_meta` 的构建期 JSON
+   打底 → `server.html_meta_handler`（v0.1.25）**内部派发**一个 GET handler（`?path=` 传
+   **已剥 `app_prefix`** 的路径；**恒匿名**——请求头/租户头/请求体都不传递，`tenant_id=None` +
+   `anonymous=true`，否则 `sql_guard: deny` 会把客户端指定的租户当过滤条件）按其返回 JSON
+   覆盖同白名单键；派发失败一律 WARN + 按静态结果送出（fail-open）；`html_cache_control` /
+   handler 的 `cache_control` 决定 HTML 的 `Cache-Control`（二者皆无 = 不加头）。
+   注入是**替换**：`inject_head` 先摘掉 head 里同名的 `<title>`/`<meta>`/`canonical`
+   （浏览器与爬虫只认第一个），再在 `</head>` 前放新标签；`<script>`/`<style>` 内容当不透明
+   文本跳过；`to_lowercase()` 索引错位（非 ASCII）已在 v0.1.25 换成 ASCII 不敏感字节扫描。
 10. **SPA 深链接回落**（`server.app_spa_fallback`，默认关）：上一步未命中 + 无扩展名
    + Accept 视为 html + **不在 `api_prefix` 下** → 送 `index.html`。不含 API 前缀是
    硬要求——否则拼错的 API 路径会被 index.html 吞成 200，掩盖真实 404。

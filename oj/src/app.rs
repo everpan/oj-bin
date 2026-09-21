@@ -500,6 +500,30 @@ pub fn drain_mail_backend(mail: &Arc<dyn MailBackend>, timeout: Duration) -> ser
     }
 }
 
+/// `server.html_meta_handler`（v0.1.25）装配期校验：必须命中路由表里的一个 **GET** 路由。
+///
+/// fail-fast 而非启动后 WARN：配错的后果（页面 meta 没注入）只在爬虫/IM 预览侧可见，
+/// 业务页面自己看不出来——留给运行期的告警等于让配置撒谎。
+fn validate_html_meta_handler(cfg: &Config, table: &routes::RouteTable) -> Result<(), String> {
+    let Some(h) = cfg.server.html_meta_handler.as_deref() else {
+        return Ok(());
+    };
+    let norm = routes::normalize(h)
+        .ok_or_else(|| format!("server.html_meta_handler: {h:?} 不是合法路径（须以 / 开头）"))?;
+    match table.lookup(&norm, "GET") {
+        routes::Lookup::Hit { .. } => Ok(()),
+        routes::Lookup::Conflict(m) => {
+            Err(format!("server.html_meta_handler: {h:?} 路由冲突：{m}"))
+        }
+        routes::Lookup::MethodNotAllowed => Err(format!(
+            "server.html_meta_handler: {h:?} 未映射 GET 方法（meta handler 只能是 GET）"
+        )),
+        routes::Lookup::NotFound => Err(format!(
+            "server.html_meta_handler: {h:?} 不在路由表（拼错了？）"
+        )),
+    }
+}
+
 /// 静态站点根（装配第 20 步）：config `server.app_path` 相对 config_dir 绝对化（CLI
 /// `--app-path` 覆盖值已在 server_cmd 按 CWD 预绝对化，此处见到的即绝对路径）；
 /// 目录缺失 → fail-fast。
@@ -709,6 +733,9 @@ impl App {
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。
         let tasks_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 部署期常量（config `vars:` 段，v0.1.25）：装配期冻结成只读 Arc（`vars.get` 唯一
+        // 数据源），与 make_bridge 的 Extras.vars 同源。
+        let vars = Arc::new(cfg.vars.clone());
         // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
         // Clone 即共享。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
         let make_bridge_of = {
@@ -731,6 +758,8 @@ impl App {
             let oidc = oidc.clone();
             let mail = mail.clone();
             let db_override = db_override.clone();
+            // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
+            let vars = vars.clone();
             move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
                 Bridge::with_dbs_and_loader(
                     dbs.clone(),
@@ -760,6 +789,7 @@ impl App {
                         tasks_flag,
                         // mail 后端（smtp: 段 + oj-mail 插件；未配置/未加载 = None）。
                         mail: mail.clone(),
+                        vars: vars.clone(),
                     },
                 )
             }
@@ -910,6 +940,9 @@ impl App {
             make_bridge,
             ws_opts,
         );
+        // server.html_meta_handler（v0.1.25）：必须是路由表里存在的 GET 路由——拼错
+        // fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露的谎话）。
+        validate_html_meta_handler(&cfg, &table)?;
         let router = server::app(
             &base,
             dir,
@@ -919,10 +952,13 @@ impl App {
             timeout,
             static_root,
             app_prefix,
-            // 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入。
+            // 静态站点增强（v0.1.20 / v0.1.25）：SPA 深链接回落 + per-route meta 注入
+            // （静态 JSON 打底 + 动态 handler 覆盖）+ HTML Cache-Control。
             server::StaticOpts {
                 spa_fallback: cfg.server.app_spa_fallback,
                 html_meta: cfg.server.html_meta.clone(),
+                html_meta_handler: cfg.server.html_meta_handler.clone(),
+                html_cache_control: cfg.server.html_cache_control.clone(),
             },
             pipeline,
             cert_status,
@@ -957,6 +993,7 @@ impl App {
             tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
             mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
+            vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
         });
         Ok(App {
             router,
@@ -1074,6 +1111,51 @@ impl ClientTransport for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- v0.1.25：server.html_meta_handler 装配期校验 ----
+
+    /// meta handler 必须命中一个 GET 路由：命中（含尾斜杠归一）/ 未命中 / 非法路径 / 未配。
+    #[test]
+    fn html_meta_handler_must_resolve_to_a_get_route() {
+        let dir = std::env::temp_dir().join(format!("oj-metah-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.ts"), "export default {};\n").unwrap();
+        let entries = vec![
+            routes::RouteEntry {
+                method: "get".into(),
+                pattern: "/v1/api/html-meta".into(),
+                file: "meta.ts".into(),
+            },
+            routes::RouteEntry {
+                method: "post".into(),
+                pattern: "/v1/api/post-only".into(),
+                file: "meta.ts".into(),
+            },
+        ];
+        let (table, failures) = routes::RouteTable::from_entries(&dir, &entries);
+        assert!(failures.is_empty(), "{failures:?}");
+
+        let mut cfg = Config::default();
+        // 未配置 → 放行（不开动态 meta 是默认形态）
+        assert!(validate_html_meta_handler(&cfg, &table).is_ok());
+        // 命中（尾斜杠与 normalize 等价）
+        cfg.server.html_meta_handler = Some("/v1/api/html-meta/".into());
+        assert!(validate_html_meta_handler(&cfg, &table).is_ok());
+        // 未命中 → 拼错必须 fail-fast，不能留到运行期只在爬虫侧暴露
+        cfg.server.html_meta_handler = Some("/v1/api/typo".into());
+        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        assert!(e.contains("不在路由表"), "{e}");
+        // 只有 POST → 报「未映射 GET 方法」（而不是含混的未命中）
+        cfg.server.html_meta_handler = Some("/v1/api/post-only".into());
+        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        assert!(e.contains("未映射 GET 方法"), "{e}");
+        // 不以 / 开头 → 非法路径
+        cfg.server.html_meta_handler = Some("v1/api/html-meta".into());
+        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        assert!(e.contains("不是合法路径"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 无 ext_boot.js（现网默认）→ None（静默）；存在 → 冻结 `?v=<mtime>`。
     #[test]

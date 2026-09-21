@@ -749,5 +749,8 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）——v0.2 �
 - `.tsx`/`.mts` 不转译（直通 V8）。
 - `ext_boot.js` 用顶层 `await` 须带 `export {};`（否则被 CJS 启发式包进非 async 函数）；
   且拿不到 `ext:core/ops`，只能在已有全局上做组合（§9「扩展全局对象」）。
-- 静态站点（`server.app_path`）无 SPA 回退（未知路径不回落 `index.html`）、无目录列表、
-  无 Range/ETag/缓存头；未知扩展名按 `application/octet-stream` 下载。
+- 静态站点（`server.app_path`）：**默认不回落**（未知路径 404），显式开 `server.app_spa_fallback:
+  true` 才把无扩展名的 HTML 请求回落到 `index.html`（`api_prefix` 下的 404 不受影响）；
+  per-route 的 `<title>`/`og:*` 由 `server.html_meta`（构建期 JSON）或 `server.html_meta_handler`
+  （动态 handler，v0.1.25）注入，HTML 的缓存头用 `server.html_cache_control`；无目录列表、
+  无 Range/ETag（经前置反代补），未知扩展名按 `application/octet-stream` 下载。
