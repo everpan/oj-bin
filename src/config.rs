@@ -33,6 +33,22 @@ pub struct ServerCfg {
     /// **不注入脚本**）。None = 不注入。该目录对静态服务不可见（命中即 404）。
     #[serde(default)]
     pub html_meta: Option<String>,
+    /// 动态 meta 源（v0.1.25）：业务 handler 的**路由路径**（如 `"/v1/api/html-meta"`）。
+    /// 送静态 HTML 前内部派发该 GET handler（原请求路径进 `?path=`，见 `server` 手册），
+    /// 用其返回的 JSON 注入 `<head>`——与 `html_meta` **同一白名单键与转义**，另可带
+    /// `cache_control` 覆盖本响应的缓存头。静态 JSON 打底、动态按 key 覆盖。
+    ///
+    /// 与 `html_meta` 的分工：静态 JSON 只能覆盖**构建期就知道**的路由（prerender 形态）；
+    /// 需要按**数据**（issue 标题 / 分享页正文）注入时用本项。未配置 = 不派发。
+    /// 装配期校验：必须在路由表里命中一个 GET 路由（拼错 fail-fast，不静默降级）。
+    #[serde(default)]
+    pub html_meta_handler: Option<String>,
+    /// HTML 响应的 Cache-Control（v0.1.25）：**只管 HTML**（含 SPA 壳）——注入后同一份
+    /// 壳可能因路由而异，不能再让中间层盲缓存。js/css/图片等资源不受影响（资源的长缓存
+    /// 仍交前置反代，见已知限制）。None = 不加该头（与旧版逐字节一致）；
+    /// 动态 handler 返回的 `cache_control` 优先于本项。
+    #[serde(default)]
+    pub html_cache_control: Option<String>,
     /// 时长字符串（如 "30s"），parse_duration 解析。
     pub timeout: String,
     pub pool_size: u32,
@@ -80,6 +96,8 @@ impl Default for ServerCfg {
             app_path: None,
             app_spa_fallback: false,
             html_meta: None,
+            html_meta_handler: None,
+            html_cache_control: None,
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
@@ -671,6 +689,15 @@ pub struct Config {
     pub db_query: crate::bridge::QueryLimits,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
+    /// 部署期常量（v0.1.25）：`name → string`，handler 经 `vars.get(name)` 读。
+    ///
+    /// **fail-closed**：未在本段声明的键一律读不到（JS 侧恒 `null`）——平台**没有**
+    /// 「读任意 OS env / 读任意 config 键」的通道（旧三层 env 叠加已删，单文件 config
+    /// 是唯一真相源）。值只能是**标量**：字符串/数字/布尔都按其 YAML 字面量读成串
+    /// （`PORT: 3000` → JS 收到 `"3000"`；`FLAG: true` → `"true"`），嵌套 map/list 在
+    /// 解析期报错（本段不是塞 JSON 的地方）。
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
 }
 
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
@@ -755,6 +782,38 @@ mod tests {
             ),
             (5, 3, 60000)
         );
+    }
+
+    /// `vars:` 段（v0.1.25）：标量按 YAML 字面量读成字符串（数字/布尔不必加引号）；
+    /// 嵌套结构解析期报错（值只能是标量）；未声明的键不在表里（fail-closed 的数据面）。
+    #[test]
+    fn vars_section_reads_scalars_and_rejects_nested() {
+        let dir = std::env::temp_dir().join(format!("oj-varcfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "vars:\n  WEB_URL: https://plane.example\n  PORT: 3000\n  FLAG: true\n  RETRIES: \"3\"\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert_eq!(
+            c.vars.get("WEB_URL").map(String::as_str),
+            Some("https://plane.example")
+        );
+        // 标量原样成串（JS 侧读到的就是这里写的那个字面量）
+        assert_eq!(c.vars.get("PORT").map(String::as_str), Some("3000"));
+        assert_eq!(c.vars.get("FLAG").map(String::as_str), Some("true"));
+        assert_eq!(c.vars.get("RETRIES").map(String::as_str), Some("3"));
+        assert!(!c.vars.contains_key("DB_PASSWORD"), "未声明键不在表里");
+        // 嵌套结构 → 解析期报错（vars 只装标量；不要把 config 段当 JSON 塞进来）
+        std::fs::write(dir.join("config.yaml"), "vars:\n  OOPS:\n    a: 1\n").unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("invalid type"), "{e}");
+        // 缺段 → 空表（`vars.get` 恒 null），不是报错
+        std::fs::write(dir.join("config.yaml"), "server:\n  port: 9778\n").unwrap();
+        assert!(load_from(&dir, None).unwrap().vars.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

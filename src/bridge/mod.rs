@@ -56,6 +56,7 @@ mod query;
 mod registry;
 mod runtime;
 pub mod transpile;
+mod vars;
 mod ws;
 
 pub use accessor_sqlx::SqlxAccessor;
@@ -174,6 +175,9 @@ pub struct StableState {
     pub oidc: Option<Arc<oidc::OidcState>>,
     /// mail 后端（装配层按 smtp: 段 + oj-mail 插件注入）；None = mail.* 报 "mail not configured"。
     pub mail: Option<Arc<dyn mail::MailBackend>>,
+    /// 部署期常量（config `vars:` 段，v0.1.25）：`vars.get(name)` 的唯一数据源。
+    /// **fail-closed**：只有这里声明的键可读（空表 = 全 null）。装配期冻结、只读。
+    pub vars: Arc<HashMap<String, String>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -213,6 +217,8 @@ pub struct Extras {
     pub rabbits: Option<Arc<NamedRegistry<mq::MqInstance>>>,
     /// 任务上下文标志（Some 仅注入任务 Bridge，评审 M2）。
     pub tasks_flag: Option<Arc<AtomicBool>>,
+    /// 部署期常量（config `vars:` 段，v0.1.25）；缺省空表 = `vars.get` 恒 null。
+    pub vars: Arc<HashMap<String, String>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -303,6 +309,7 @@ deno_core::extension!(
         mail::op_mail_result,
         mail::op_mail_profiles,
         plugins_op::op_plugins,
+        vars::op_vars_get,
         log::op_log,
         module_loader::op_resolve_cjs,
         oidc::op_oidc_sign,
@@ -601,6 +608,7 @@ impl Bridge {
             tasks_flag: extras.tasks_flag,
             sql_memo: Mutex::new(HashMap::new()),
             mail: extras.mail,
+            vars: extras.vars,
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
         // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
@@ -1694,6 +1702,7 @@ mod tests {
             tasks_flag: None,
             sql_memo: Mutex::new(HashMap::new()),
             mail: None,
+            vars: Arc::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =

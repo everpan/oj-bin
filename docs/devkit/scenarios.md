@@ -161,15 +161,91 @@ dist/
 > `__meta/` 下的 JSON 由**构建期/离线脚本**生成（前端构建产物的一部分），oj 不做 SSR。
 > 值里出现 `<` / `"` 会被 HTML 转义，不必手工处理。
 
-### ③ 验证
+### ③ 按数据注入（公开分享页 / issue 标题，v0.1.25）
+
+`__meta/*.json` 是**构建期**产物，只能覆盖事先就知道的路由。像 `/issues/<动态 id>` 这种标题
+来自数据库的页面，用 `html_meta_handler` 指一个**普通 GET handler**：
+
+```yaml
+server:
+  app_path: "dist"
+  app_spa_fallback: true
+  html_meta_handler: "/v1/api/html-meta"   # 必须命中一个 GET 路由，否则启动即报错
+  html_cache_control: "no-cache"           # 壳随路由而异 → 别让中间层盲缓存（只管 HTML）
+```
+
+```ts
+// src/html-meta/api.ts —— 路由 /v1/api/html-meta/（内部派发，无需进 anonymous_paths）
+export default {
+  async get() {
+    const path = decodeURIComponent(String(http.query.path ?? ""));   // 原始请求路径
+    const id = path.startsWith("/issues/") ? path.slice("/issues/".length) : "";
+    const rows = id
+      ? await db.table("issues").select(["name"])
+          .where({ field: "id", op: "eq", value: id }).limit(1).all()
+      : [];
+    const name = rows.length > 0 ? String(rows[0].name) : "Issue";
+    json.ok({
+      title: `${name} · Acme`,
+      "og:title": name,
+      "og:type": "article",
+      cache_control: "public, max-age=60",   // 保留键 → 本响应的 Cache-Control（优先级最高）
+    });
+  },
+};
+```
+
+要点：
+
+- 送 HTML 前**内部派发**该 handler（HTTP 动词恒 GET）；**`http.query.path` 是已剥 `app_prefix`
+  的站点内路径**（`app_prefix: "/site"` 时 `/site/issues/7` → `/issues/7`），仍是
+  percent-encoded，需要明文自己 `decodeURIComponent`；
+- 返回的键与 `__meta/*.json` **同一白名单**（`title` / `description` / `canonical` /
+  `og:*` / `twitter:*`，值一律转义、不注入脚本）；静态 JSON 打底、动态**按 key 覆盖**；
+- **注入是替换而非追加**：head 里同名的旧标签（壳里写死的 `<title>App</title>`、默认
+  description/og）会先被摘掉再放新的——不这样，浏览器与爬虫只会认第一个、注入等于没注入；
+- **handler 恒以匿名身份运行**：不经前置守卫（页面请求带不了 `Authorization`），
+  **租户头/请求头/请求体一律不传递**（`http.tenantId` 恒 `null`）。要按租户取数就
+  **从 URL 派生 id → `await db.asTenant(id)`**（需 `tenant.allow_as_tenant: true`，见场景 1）。
+  该 handler **不需要**写进 `anonymous_paths`（外部直接访问该路径时仍受守卫约束）；
+- **fail-open**：handler 报错 / 超时 / 非 2xx / 非 JSON / 信封 `code != 0` → 打 WARN，页面
+  按静态结果照常送出（宁可少几个 meta，不可整页挂）；装配期则 fail-fast（路径没命中 GET
+  路由即拒启）；
+- 每次 HTML 请求都会派发一次（无缓存层），超时按 `server.timeout`（默认 30s）：让 handler 只做
+  **轻查询**，并用返回的 `cache_control` 让中间层替你挡住重复请求。meta 若随身份/租户而异，
+  **禁用 `public`**（共享 CDN 会把 A 的标题发给 B）。
+
+> **只挂缓存头、不做注入**：单配 `html_cache_control: "no-cache"` 即可（三键彼此独立，
+> 不需要同时开 `html_meta*`）。
+
+> **生产形态**：注入只在 **oj 自己送静态文件**时生效。若生产由 nginx/Caddy/对象存储直出 SPA，
+> 要么让站点走 oj 托管（`server.app_path`），要么在反代层做同样的事。
+
+顺手一提：邮件里要拼的站点基址这类**部署期常量**，写 config 顶层 `vars:` 段，handler 里
+`vars.get()` 读（同步；只有声明过的键可读，未声明恒 `null`；平台不读 OS env）：
+
+```yaml
+vars:
+  WEB_URL: "https://app.example.com"
+```
+
+```ts
+const web = vars.get("WEB_URL") ?? "http://localhost:3000";
+json.ok({ reset_link: `${web}/reset-password?token=${token}` });
+```
+
+### ④ 验证
 
 ```bash
 curl -s http://localhost:9778/space/7 | grep -o '<title>[^<]*</title>'
 # <title>7 号工作区</title>
 curl -sI http://localhost:9778/__meta/space/7.json | head -1   # 404（元信息不公开）
+# 动态 meta（爬虫视角：不执行 JS 也能看到按数据注入的标签）
+curl -s -H 'Accept: text/html' http://localhost:9778/issues/abc | grep -i 'og:title'
+# <meta property="og:title" content="修复登录超时">
 ```
 
-### ④ 常见坑
+### ⑤ 常见坑
 
 | 现象 | 原因 |
 |---|---|
@@ -179,6 +255,13 @@ curl -sI http://localhost:9778/__meta/space/7.json | head -1   # 404（元信息
 | `curl -X POST` 不回落 | 只有 `GET` / `HEAD` 回落 |
 | 没看到注入 | `dist/index.html` 里没有 `</head>`；或 meta 文件路径不对（`/space/7` → `__meta/space/7.json`，末段先 `set_extension("json")`）；或 Accept 头声明只要别的类型 |
 | 首页没有 title | 缺 `__meta/index.json`（`/` 与目录首页都映射到 `index.json`） |
+| 动态 handler 配了但没生效（日志有 `warn: html_meta_handler`） | 看 WARN 内容：handler 返回非 2xx / 超时 / 返回的不是 JSON 对象 / 信封 `code != 0` —— 注入面坏了会 fail-open 到静态结果 |
+| handler 里 `db.asTenant` 抛错 | 派发是**匿名**的（`http.tenantId` 恒 null，且不看租户头）——需 `tenant.allow_as_tenant: true`，且 id 必须由 URL 派生（见场景 1） |
+| 注入的 title 没生效（还是壳里那个） | 不会：同名旧标签会被摘掉。若真出现，检查壳的 `<title>` 是否写在了 `</head>` 之外，或 head 里是不是 `<script>` 里拼出来的（脚本内容不参与替换） |
+| title 注入对了但 `og:*` 没变 | 动态返回里没给该 key（静态 JSON 打底，按 key 合并）——或值不是字符串（非字符串键一律忽略） |
+| 生产环境的预览卡片还是旧标题 | oj 只在**自己送静态文件**时注入；nginx/Caddy/对象存储直出 SPA 时不生效（见上「生产形态」） |
+| 启动直接报 `server.html_meta_handler: "…" 不在路由表` | 配置的路径没有对应 GET 路由（常见：漏了尾斜杠以外的真实路径、或该路径只有 POST） |
+| `vars.get("X")` 恒 `null` | `X` 没写进 config 的 `vars:` 段（fail-closed；平台不读 OS env） |
 
 ---
 

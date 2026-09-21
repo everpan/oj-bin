@@ -17,6 +17,16 @@ server:
   # html_meta: "__meta"       # v0.1.20：每路由 HTML 元信息目录名（相对 app_path；默认关闭）。
                      #  开启后请求 /a/b/ 时读 <app_path>/__meta/a/b.json 注入 <title> 等；
                      #  该目录自身不对外公开（直接访问返回 404）。
+  # html_meta_handler: "/v1/api/html-meta"   # v0.1.25：**动态** meta 源（业务 handler 的路由路径）。
+                     #  送静态 HTML 前内部派发它（GET，原请求路径进 ?path=），用返回的 JSON 注入
+                     #  <title>/description/canonical/og:*/twitter:*（与 html_meta 同一白名单与转义），
+                     #  保留键 cache_control 可 per-route 覆盖缓存头。静态 JSON 打底、动态按 key 覆盖；
+                     #  失败/超时/非 JSON → 原样送出 + WARN（fail-open）。**需要按数据注入时用它**
+                     #  （issue 标题、分享页正文），构建期 JSON 只能覆盖已知路由。装配期校验：
+                     #  该路径必须命中一个 GET 路由（拼错即启动失败）。
+  # html_cache_control: "no-cache"   # v0.1.25：HTML 响应的 Cache-Control（**只管 HTML**——
+                     #  注入后同一份壳可能因路由而异，不能再让中间层盲缓存；js/css/图片仍交前置
+                     #  反代）。动态 handler 返回的 cache_control 优先；两项都没有 = 不加头。
   # logs_dir: "logs"   # 日志目录（终端输出镜像落盘；文件名 server-<启动秒>_<pid>.log）
   # logs_max_m: 100            # 单个日志文件大小上限（单位 M，<100 按 100 生效），超过滚动
   # logs_keep_files: 10        # 日志文件保留个数（含活动文件，超出删除）
@@ -39,6 +49,11 @@ db:
 #   default_limit: 100   # 未显式 .limit() 时的隐式上限（默认 100；0 或 >max_limit 启动报错）
 #   max_limit: 1000      # 显式 .limit(n) 的 clamp 上限（默认 1000；>100000 启动报错）
                          # 顶层结果行数 ≥ 生效上限时，响应带 X-OJ-Row-Limit 头提示可能被截断。
+
+# vars:   # v0.1.25：部署期常量（handler 用 vars.get("NAME") 读；**同步**，未声明键恒 null）
+#   WEB_URL: "https://app.example.com"   # 换域名只改这里，不必重新构建产物
+#   RETRIES: 3                           # 标量按字面量成串（读出来是 "3"）；嵌套 map/list 报错
+                         # fail-closed：只有这里声明的键可读，没有「读任意 env / 任意 config 键」的口子。
 
 redis:
   # v0.2: 配置存在即真连 Redis（启动 fail-fast，连不上直接报错退出）；注释/删除 → 内存 KV。

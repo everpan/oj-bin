@@ -16,6 +16,97 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.25（2026-09-21）
+
+> 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.24 → 0.1.25`）。发布点标签：
+> **未打标签**（本节随实现提交，标签动作未执行）。上一版：`v0.1.24` → `49d3963`。
+>
+> 本版回应下游消费方（plane）提交的「平台能力缺口」清单（`docs/ever/upstream-pr-platform-capabilities.md`）。
+> 复核结论：清单里两项**平台早已具备**——「邮件试发 + 结果回执」= v0.1.19 的 `mail.send`/`sendSync`
+> 内联投递结果 + `mail.result`（bus 与回查双通道）；「SPA 深链回落 + 按路由 meta」= v0.1.20 的
+> `server.app_spa_fallback` + `server.html_meta`。根因是**下游 vendored 的 oj 落后 13 个小版本**
+> （`oj-module/bin/.oj-version = v0.1.11`），不是能力缺失；平台侧为此补了一处**误导下游的文档硬伤**。
+> 真正缺的两项在本版补齐：**数据驱动的 per-route HTML meta 注入**（静态 JSON 只能覆盖构建期已知
+> 路由，issue 标题这类**按数据**的 SEO/IM 预览要它）与**部署期常量读口**（下游只能把 `WEB_URL`
+> 编译进产物）。清单第三项（契约 codegen 的 multipart）**不在本仓**——落点是框架件 `oj-module`
+> 的 `packages/cli/src/contract/*`，本仓后端早已支持（multer 解析 + `http.files`/`http.file(i)` +
+> `blob.put`），仅需纠正其文档里臆造的 `field()`/`storeBlob` 名字。
+
+**特性**
+
+- **动态 HTML meta（`server.html_meta_handler`）**：配一个**业务 handler 的路由路径**，送静态 HTML
+  前内部派发它（GET，`?path=` 传**已剥 `app_prefix`** 的站点内路径），用返回的 JSON 注入
+  `<head>`——与 `html_meta` **同一白名单键**（`title`/`description`/`canonical`/`og:*`/
+  `twitter:*`）与**同一转义**，另可带保留键 `cache_control` 覆盖本响应缓存头。静态
+  `<html_meta>/<path>.json` 打底、动态**按 key 覆盖**（异名保留）。
+  - **注入是替换不是追加**（`inject_head`）：浏览器与爬虫只认**第一个** `<title>` / 同名
+    `<meta>`，故先摘掉 head 里同名的既有标签再放新标签——壳里写死的 `<title>App</title>`
+    也能被接管（否则「注入成功」是假的：文档里两个 title，生效的仍是旧那个）。`<script>`/
+    `<style>` 内容当不透明文本整段跳过；`og:*`/`twitter:*`/description/canonical 一并去重。
+  - 顺带修掉 v0.1.20 继承来的 `to_lowercase()` 索引错位隐患（大小写变换会改字节长度，非 ASCII
+    前文会让注入点错位）→ 改 ASCII 不敏感**字节**扫描。
+  - 为什么是 handler 而不是「注册回调」：oj 的扩展面只有路由 handler（复用既有超时/日志/
+    `RequestInfo` 形态，零新形态），且构建期 JSON 与运行期数据的分工一目了然。
+  - **恒以匿名身份派发**（`tenant_id = None` + `anonymous = true`，租户头/请求头/请求体一律不
+    传递；`http.tenantId` 恒 `null`）。这是安全边界而非省事：页面请求带什么头由客户端决定，
+    若透传 `X-Tenant`，① `sql_guard: deny` 下构造器会把**攻击者指定的租户**当过滤条件（匿名
+    访客即可把某租户的行读进公开 meta），② `db.asTenant` 的三道门禁要求 `tenant_id` 为空，
+    透传会让它必抛。按租户取数只有一条正路：handler 从 URL 派生 id → `db.asTenant(id)`
+    （需 `tenant.allow_as_tenant: true`）。该 handler **不需要**进 `anonymous_paths`，被外部
+    直接访问时仍受守卫约束。
+  - **fail-open**：未命中/非 2xx/超时/非 JSON/信封 `code != 0` → WARN 后按静态结果送出；`cache_control`
+    类型写错只丢该键（其余 meta 照常）。装配期 **fail-fast**：路径必须命中一个 **GET** 路由
+    （拼错不静默降级——后果只在爬虫/IM 预览侧可见，留给运行期等于让配置撒谎）。
+  - 落点：`src/config.rs`、`server/src/lib.rs`（`static_page` / `dispatch_meta_handler` /
+    `inject_head` + `strip_conflicts` / `element_at` / `attr_value` / `find_ci`）、
+    `oj/src/app.rs`（`validate_html_meta_handler`）。顺带把 `handle()` 内的 `run` 闭包提成自由
+    函数 `run_route`（闭包部分移动 `st`/`headers`，静态兜底就没法再借用它们——与
+    `strip_app_prefix` 同款理由）。
+- **HTML 缓存头（`server.html_cache_control`）**：注入后同一份壳可能因路由而异，不能再让中间层
+  盲缓存。**只管 HTML**（js/css/图片等资源不受影响，其长缓存仍交前置反代）；动态 handler 的
+  `cache_control` 优先于本项；两项都没有 = 不加头（与旧版逐字节一致）。**可独立使用**——只想给
+  SPA 壳挂 `no-cache` 而不做注入时，单配本键即生效（三键彼此独立）。
+- **部署期常量读口（顶层 `vars:` 段 + JS `vars.get(name)`）**：`WEB_URL` 这类「换域名即变」的
+  常量不必再编译进产物。**同步**读（装配期冻结表，无 IO，同 `plugins()`）；**fail-closed**——只有
+  本段声明的键可读，其余恒 `null`，平台**没有**「读任意 OS env / 任意 config 键」的通道（旧的
+  三层 env 叠加已删，单文件 config 是唯一真相源；`db:` 的 DSN、`server.public_key_path` 等敏感面
+  因此不可能经此泄漏到 JS）。值按 YAML **标量**文本成串（`PORT: 3000` → `"3000"`），嵌套 map/list
+  解析期报错。落点：`src/config.rs`、`src/bridge/vars.rs`（新 op）、`src/bridge/mod.rs`
+  （`StableState.vars` / `Extras.vars`）、`src/bridge/bootstrap.js`、`oj/src/app.rs`、`sample/global.d.ts`。
+
+**修复（文档）**
+
+- **`api-manual.md` 的 `app_path` 行自 v0.1.20 起就是错的**：写「无 SPA 回退/Range/ETag」，而
+  `server.app_spa_fallback` 在 v0.1.20 就落地了。下游这份 PR 文档正是引用这条口径推出「平台连深链
+  回落都没有」的结论——本轮把四个静态键（`app_spa_fallback`/`html_meta`/`html_meta_handler`/
+  `html_cache_control`）补进 server 键表与已知限制表，并在 `scenarios.md` 场景 2 加「按路由注入
+  title/OG」的可照抄链路（静态 JSON + 动态 handler + `curl` 验收）。`vars` 进全局章；`SKILL.md`
+  陷阱速查加五条（深链 404 / 注入是替换 / 派发恒匿名的租户取数姿势 / 生产反代直出时注入不生效 /
+  `vars.get` 恒 null）。**同时显式写明部署形态前提**：注入只在 oj 自己送静态文件时生效，生产由
+  nginx/Caddy/CDN 直出 SPA 的部署要么改走 oj 托管，要么在反代层做同样的事——否则读者会
+  over-claim「平台已解锁生产 SEO」。
+- **同一条错口径还散在 `user-manual.md`（已知限制清单）与 `ops-manual.md`（静态 404 排障行）**：
+  两处一并订正（前者补 SPA 回落 + per-route meta + HTML 缓存头的现状，后者把「无 SPA 回退」
+  改成「未开 `server.app_spa_fallback`」）。这两条是**下游文档站同步**时才暴露出来的——说明
+  「订正一处口径」必须全仓 `grep` 同义表述，不能只看被引用的那一行。
+
+**测试**
+
+- `server`：`html_meta_handler_overrides_static_and_sets_cache_control`（打底+覆盖合并、**壳里旧
+  title 被替换且只剩一个 title**、per-route 缓存头、`code != 0` fail-open、无静态 JSON 时动态单独
+  生效）、`html_cache_control_alone_still_applies`（只配缓存头也生效、资源不受影响）、
+  `html_meta_handler_off_is_byte_identical`，外加注入器单测四条（替换壳 title / 同名 meta 与
+  canonical 去重且不误伤 `data-name=` / head 里 `<script>` 内容不被摘 / 非 ASCII 前文不错位不 panic /
+  无 `</head>` 与空表零副作用）；既有 `html_meta_*` 用例补「无缓存头」的向后兼容断言。
+- 根 crate：`bridge::vars`（声明键可读 / 未声明恒 null / 空串与未声明可区分 / 同步值）、
+  `config::tests::vars_section_reads_scalars_and_rejects_nested`。
+- `oj`：`validate_html_meta_handler` 单测（命中含尾斜杠归一 / 未命中 / 只有 POST / 非法路径 / 未配）
+  与 e2e `html_meta_handler_injects_per_route_tags_end_to_end`（真装配 + 真静态兜底 + `Accept: text/html`
+  深链注入 + 旧 title 被替换 + 缓存头 + API 前缀 404 不被吞）。
+- 双路专家评审（开发侧 + 架构侧）抓出并已处置：注入只追加不替换（功能空转）、只配
+  `html_cache_control` 被早退吞掉、租户头透传给无守卫派发（越权读面）、`to_lowercase()` 索引
+  错位、`cache_control` 类型错连坐整份 meta。
+
 ## v0.1.24（2026-09-19）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.23 → 0.1.24`）。发布点标签：

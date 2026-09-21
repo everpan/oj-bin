@@ -903,3 +903,81 @@ async fn has_table(file: &Path, table: &str) -> bool {
         .unwrap();
     !rows.is_empty()
 }
+
+// —— 动态 HTML meta（v0.1.25）：壳 + handler 按路由注入 + per-route 缓存头 —— //
+
+/// 静态站 `app_path` + `server.html_meta_handler`：深链回落送出壳，handler 按**请求路径**
+/// 注入 `<title>`/`og:*`（数据驱动的 SEO/IM 预览正解），`server.html_cache_control` 落到
+/// 响应头；API 前缀下的 404 依旧不被壳吞掉。
+///
+/// 静态夹具建在临时项目里（**不用** `sample/dist`——那是构建产物，禁止手改，见 CLAUDE.md）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn html_meta_handler_injects_per_route_tags_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/meta/manifest.yaml",
+            "name: meta\ndesc: d\nversion: 0.1.0\n",
+        ),
+        (
+            "src/meta/html/api.ts",
+            r#"export default {
+                 get() {
+                   const p = String(http.query.path);
+                   json.ok({ title: "issue " + p, "og:title": "OG " + p });
+                 },
+               };"#,
+        ),
+    ]);
+    let site = t.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(
+        site.join("index.html"),
+        "<html><head><title>shell</title></head><body>app</body></html>",
+    )
+    .unwrap();
+
+    let mut cfg = base_cfg(&t);
+    cfg.server.app_path = Some(site.canonicalize().unwrap().display().to_string());
+    cfg.server.app_spa_fallback = true;
+    cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
+    cfg.server.html_cache_control = Some("no-cache".into());
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    let c = reqwest::Client::new();
+    let resp = c
+        .get(format!("http://{addr}/spaces/demo-issue"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<title>issue /spaces/demo-issue</title>"),
+        "按路由注入失败：{body}"
+    );
+    // 壳里写死的 title 被替换（浏览器/爬虫只认第一个 title）
+    assert!(!body.contains("<title>shell</title>"), "{body}");
+    assert_eq!(body.matches("<title>").count(), 1, "{body}");
+    assert!(
+        body.contains(r#"<meta property="og:title" content="OG /spaces/demo-issue">"#),
+        "og 注入失败：{body}"
+    );
+    // API 前缀下的未命中路径不回落（不被壳吞成 200）
+    let resp = c
+        .get(format!("http://{addr}/v1/api/nope/deep"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let _ = std::fs::remove_dir_all(&t);
+}

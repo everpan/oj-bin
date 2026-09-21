@@ -573,7 +573,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（23 组）
+### 总表（24 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -595,6 +595,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
+| `vars.get(name)` | 部署期常量（顶层 `vars:` 段，v0.1.25）：**同步**返回该键的字符串，未声明键 → `null` |
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
@@ -1160,6 +1161,23 @@ export default {
 FileTransport profile 也须写 `host`/`port`/`tls`/`mechanism`（插件 schema 必填，只是不联网）；
 `file_transport` 目录**须先存在**（lettre 不建目录）；未装插件先跑 `cargo xtask plugin mail`。
 
+**「试发/健康检查」怎么写**（管理端「发送测试邮件」这类需求）：直接用本 profile 的
+**`mail.send`**——它 resolve 的就是**投递结果**，`code !== 0` 即失败并带脱敏原因，
+正确凭据必然真发（不是「配置齐备性检查」）：
+
+```ts
+const r = await mail.send({ from: "noreply@x.com", to: [adminEmail], subject: "test", text: "ping" });
+json.ok({ sent: r.code === 0, messageId: r.data?.messageId });
+```
+
+**凭据只在 config → 插件，不支持按调用方传入凭据**（不是缺口，是红线：一旦 JS 能传 SMTP 凭据，
+任何越权 handler 都能把平台当开放中继用）。要「换凭据立刻生效」= 改 config 的 `smtp:` 段后重启/
+热加载配置，不是从请求体里带。
+
+**要「投递成功」才算数**（邮件审计表的 `sent_at` 这类）：别只写 `enqueue`——用 `mail.send` /
+`sendSync` 拿**同步结果**再落库（`enqueue` 的语义是「已入队」，不是「已送达」）；需要事后通知
+则订阅 bus `mail.result`（只覆盖 `enqueue` 路，且跨 profile/模块/租户归属收窄）。
+
 ### log —— 结构化日志
 
 | API | 签名 |
@@ -1252,6 +1270,35 @@ wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj t
 
 ```ts
 json.ok(plugins());
+```
+
+### vars —— 部署期常量（顶层 `vars:` 段，v0.1.25）
+
+「换域名 / 换环境就得重新构建产物」的老问题的正解：把这类常量写进 config 的 `vars:` 段，
+handler 用 `vars.get(name)` 读。**同步**（装配期冻结的表，无 IO，同 `plugins()`），
+所以可以直接当普通值用：
+
+```ts
+const web = vars.get("WEB_URL") ?? "http://localhost:3000";
+json.ok({ reset_link: `${web}/reset-password?token=${t}` });
+```
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `vars.get` | `get(name: string): string \| null` | 已声明键 → 该字符串；**未声明 / 未配置 `vars:` 段 → `null`**（不抛错，用 `??` 兜底即可） |
+
+**fail-closed（安全边界）**：只有 `vars:` 段里声明的键可读，且平台**没有**「读任意 OS env /
+读任意 config 键」的通道——`db:` 的 DSN、`server.public_key_path`、`smtp:` 的凭据因此不可能
+经此泄漏到 JS。旧的「三层 env 叠加」早已删除，单文件 config 是唯一真相源。
+
+**值只能是标量**：字符串/数字/布尔按 YAML 字面量成串读（`PORT: 3000` → JS 收到 `"3000"`，
+`FLAG: true` → `"true"`）；嵌套 map/list 属配置解析错误（启动即报错）。要区分「没配」与
+「配了空串」，注意空串原样返回、不是 `null`。
+
+```yaml
+vars:
+  WEB_URL: "https://app.example.com"
+  SUPPORT_EMAIL: "support@example.com"
 ```
 
 ### jwt —— JWT 签发与验签（`auth:` 段启用）
@@ -1748,7 +1795,11 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
 | `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
-| `app_path` | 无 | 静态站点根目录；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 SPA 回退/Range/ETag。**准入门**：`--api-path` 与本项至少显式指定其一，两者皆指定则都必须存在 |
+| `app_path` | 无 | 静态站点根目录；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 Range/ETag（经前置反代补）。**准入门**：`--api-path` 与本项至少显式指定其一，两者皆指定则都必须存在 |
+| `app_spa_fallback` | `false` | （v0.1.20）SPA 深链回落：静态未命中 + 无扩展名 + `Accept` 含 `text/html`/`*/*`/缺失 + **不在 `api_prefix` 下** → 送 `<app_path>/index.html`。默认关是刻意的：静默把 404 变 200 会掩盖错配（拼错的资源路径） |
+| `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对 `app_path`）：送 HTML 前读 `<app_path>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
+| `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
+| `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
 | `app_prefix` | `"/"` | 静态站点前缀；默认 `/` = 全路径兜底（与旧版一致）。设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；API 路由永远优先。必须以 `/` 开头，否则启动报错 |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
@@ -1759,6 +1810,94 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
 | `migrate_on_start` | `auto`（dev）/ `verify`（release） | 迁移门禁：auto 启动即应用；verify 账本落后拒启（M004，先 `oj migrate`）；`off` 迁移完全归运维 |
 | `ownership_guard` | `"warn"` | 表归属守卫：`warn` 跨模块表访问仅告警；`deny` 未声明 deps 拒绝执行（500 附修复指引） |
+
+### 静态站点与 per-route meta（SEO / IM 预览）
+
+静态托管只做三件事：按目录镜像发文件（含 SPA 壳）、可选深链回落、可选按路由注入 `<head>`。
+**平台不引入 SSR 运行时**——注入的是「壳 + 一个 JSON 键值表」，不是服务端渲染的页面。
+
+> **注入是「替换」不是「追加」**：浏览器与爬虫只认**第一个** `<title>` / 同名 `<meta>`，
+> 所以注入前会先把 head 里**同名**的既有标签摘掉（`<title>`、`description`、`canonical`、
+> `og:*`、`twitter:*`），再放新标签。壳里写死 `<title>App</title>` 也能被接管——不必改前端
+> 产物。`<script>`/`<style>` 的内容当不透明文本整段跳过（里面的 `<title>` 字符串不会被误摘）。
+> 只在 `</head>` 之前动刀，head 之外原样。
+
+两级 meta 源，可同时开、按 key 合并（静态打底、**动态覆盖**）：
+
+| 源 | 配置 | 适用 |
+|---|---|---|
+| 构建期 JSON | `html_meta: "__meta"` → `<app_path>/__meta/<path>.json` | 路由清单固定（首页、栏目页） |
+| 运行期 handler | `html_meta_handler: "/v1/api/html-meta"` | **按数据**（issue 标题、分享页正文、公开页 OG） |
+
+> 只想给壳挂缓存头、**不做注入**也行：单配 `html_cache_control` 即生效（三键彼此独立）。
+
+动态 handler 的约定：
+
+- 送静态 HTML 前**内部派发**它（HTTP 动词恒 GET，JS 方法名 `get`）；
+- **`http.query.path` 是已剥 `app_prefix` 的站点内路径**（`app_prefix: "/site"` 时
+  `/site/issues/7` → `/issues/7`；SPA 回落的深链接即它本身），仍 percent-encoded，
+  需要明文自己 `decodeURIComponent`；
+- 返回对象（或标准信封 `json.ok({...})` 的 `data`）里的键与 `html_meta` **同一白名单**：
+  `title` / `description` / `canonical` / `og:*` / `twitter:*`（`og:*` 出 `property`，其余出
+  `name`；值一律 HTML 转义、**不注入脚本**）；未列出的键被忽略；
+- 保留键 **`cache_control`**：字符串，作为本响应的 `Cache-Control`（优先级最高），不进 `<head>`；
+  类型写错只丢这个键（WARN），其余 meta 照常注入；
+- **恒以匿名身份运行**：不经前置守卫（页面请求带不了 `Authorization`，走守卫等于恒 401），
+  **租户头/请求头/请求体一律不传递**（`http.tenantId` 恒 `null`）。这不是省事，是安全边界——
+  页面请求的头由客户端决定；若透传 `X-Tenant`，① `sql_guard: deny` 下构造器会把**攻击者指定的
+  租户**当过滤条件，② `db.asTenant` 的门禁要求 `tenant_id` 为空，透传会让它必抛。
+  要按租户取数只有一条正路：**handler 从 URL 派生 id → `await db.asTenant(id)`**
+  （需 `tenant.allow_as_tenant: true`）。
+  该 handler **不需要**写进 `anonymous_paths`；它被外部直接访问时仍受守卫约束（要连外部访问
+  也放开才需加）；
+- **fail-open**：未命中 / 非 2xx / 超时 / 非 JSON / 信封 `code != 0` → 打 WARN 后按静态结果
+  原样送出（注入面坏了不能让页面跟着坏）；装配期则 **fail-fast**（路径必须命中 GET 路由）。
+- **预算与缓存**：每次送 HTML 都会派发一次（平台侧无缓存层），超时按 `server.timeout`
+  （默认 30s）——页面请求会跟着等。让 handler 只做**轻查询**/读缓存，并用返回的 `cache_control`
+  让中间层替你挡住重复请求；不确定就 `no-cache` 或 `private, max-age=…`。
+  **meta 若随身份/租户而异，禁用 `public`**（共享 CDN 会把 A 的标题发给 B；本版已把
+  「租户头」这条来源掐掉，但 URL 派生租户 + `public` 的组合仍要自己判断）。
+
+> **部署形态提醒**：注入由 **oj 自己送静态文件时**生效。生产若由前置反代/CDN 直出 SPA
+> （nginx `try_files` / Caddy `file_server` / 对象存储静态站），本能力不生效——要么让站点走
+> oj 托管（`server.app_path`），要么在反代层做同样的注入。
+
+```yaml
+server:
+  app_path: "dist"
+  app_spa_fallback: true          # 深链刷新不 404
+  html_meta: "__meta"             # 可选：构建期 JSON 打底
+  html_meta_handler: "/v1/api/html-meta"   # 运行期数据驱动
+  html_cache_control: "no-cache"  # 壳随路由而异，别让中间层盲缓存
+```
+
+```ts
+// src/html-meta/api.ts —— 只做「读数据 → 出键值表」，不碰 HTML
+export default {
+  async get() {
+    const path = decodeURIComponent(String(http.query.path ?? ""));
+    const slug = path.replace(/^\/issues\//, "");
+    if (!slug) {
+      json.ok({ title: "App" });
+      return;
+    }
+    const rows = await db.table("issues").select(["name"]).where({ field: "id", op: "eq", value: slug }).limit(1).all();
+    const name = rows.length > 0 ? String(rows[0].name) : "Not found";
+    json.ok({
+      title: `${name} · App`,
+      "og:title": name,
+      "og:type": "article",
+      cache_control: "public, max-age=60",
+    });
+  },
+};
+```
+
+验收（爬虫视角，不执行 JS）：
+
+```bash
+curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<title>\|og:'
+```
 
 ### db —— 命名库（多库混用）
 
@@ -1894,6 +2033,21 @@ plugins:
 已装配插件的清单可查：JS `plugins()`（第 6 章）与内置端点 `GET {base}/plugins`
 （公共端点，不走 Bearer；`plugins` 为保留路径，业务模块勿占用该目录名）。
 
+### vars —— 部署期常量（顶层 `vars:` 段，v0.1.25）
+
+```yaml
+vars:
+  WEB_URL: "https://app.example.com"   # handler: vars.get("WEB_URL")
+  SUPPORT_EMAIL: "support@example.com"
+```
+
+- **唯一读口**是 JS 的 `vars.get(name)`（第 6 章「vars」）：**同步**返回字符串，未声明键 → `null`。
+- **fail-closed**：只有本段声明的键可读，平台没有「读任意 OS env / 任意 config 键」的通道。
+- 值只能是**标量**（数字/布尔按 YAML 字面量成串，`PORT: 3000` → `"3000"`）；嵌套 map/list
+  在解析期报错。
+- 典型用途：邮件里拼的站点基址（`WEB_URL`）、对外展示的联系方式——**换环境只改 config，
+  不必重新 `oj build`**。
+
 ### 证书三字段：必配不可绕过
 
 - `public_key_path` / `certificate_path` 缺任一 → 启动报错退出；**没有任何 config/CLI
@@ -1927,6 +2081,8 @@ plugins:
 | `neither api path … specified` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式指定其一 |
 | `api path not found: …` / `static site dir not found: …` | 指定了 api / 静态目录但不存在（皆指定时两者都必须存在） |
 | `server.app_path` 目录不存在 | 启动报错退出 |
+| `server.html_meta_handler` 未命中 GET 路由 | `server.html_meta_handler: "…" 不在路由表（拼错了？）` / `未映射 GET 方法` 退出（v0.1.25；后果只在爬虫侧可见，故不留到运行期） |
+| `vars:` 段值不是标量（嵌套 map/list） | 解析期报错（值只能是字符串/数字/布尔） |
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
@@ -2184,7 +2340,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 跨模块别名必须声明 `deps` | 别名跨模块引用省略 `manifest.deps` → S008 fail（既有**相对**跨模块引用不追溯） |
 | `manifest.yaml` 只能出现在模块根 | 嵌套声明会改写 `#` 别名的锚点 → S008 fail |
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
-| 静态站点无目录列表 / Range / ETag / 缓存头 | 未知扩展名按 `application/octet-stream`；SPA 深链回落需显式开 `server.app_spa_fallback: true`（v0.1.20，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；Range/ETag/缓存头经前置反代补 |
+| 静态站点无目录列表 / Range / ETag | 未知扩展名按 `application/octet-stream`；SPA 深链回落需显式开 `server.app_spa_fallback: true`（v0.1.20，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；Range/ETag 经前置反代补 |
+| 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
@@ -2228,3 +2385,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - `ext_boot.js` 里别写库/发广播/打外部接口——执行次数是「模块数 + `pool_size` + WS Worker 数
   （每路由 `ws.workers_per_route`）」，副作用按此放大；boot 只做全局装配。
 - `ext_boot.js` 顶层 `await` 忘了 `export {};` → 看起来莫名的 SyntaxError（CJS 启发式误判）。
+- 静态站深链刷新 404：没开 `server.app_spa_fallback: true`（默认关，刻意为之）。
+- IM 预览/爬虫只看到默认标题：`html_meta`（构建期 JSON）覆盖不了**按数据**的路由 —— 用
+  `server.html_meta_handler` 指一个 GET handler（v0.1.25），见 §10「静态站点与 per-route meta」。
+- `vars.get("X")` 恒 `null`：`X` 没写进 config 的 `vars:` 段（fail-closed，不读 OS env）。
+- 动态 meta 的 handler 要读**原始请求路径**得看 `http.query.path`（percent-encoded，自己
+  `decodeURIComponent`）；它不经守卫、拿不到 `http.user`（页面请求本来也没有 Bearer）。

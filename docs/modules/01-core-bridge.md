@@ -21,7 +21,7 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | blob | `op_blob_put/get/del/url/content_type` | `blob.rs` |
 | bus | `op_bus_publish/subscribe/kind` | `bus.rs` |
 | es | `op_es_search/index/del` | `es.rs` |
-| 内省/fetch/日志 | `op_plugins`、`op_fetch`、`op_log` | `plugins_op.rs`、`fetch.rs`、`log.rs` |
+| 内省/fetch/日志 | `op_plugins`、`op_vars_get`、`op_fetch`、`op_log` | `plugins_op.rs`、`vars.rs`（v0.1.25）、`fetch.rs`、`log.rs` |
 | 模块解析 | `op_resolve_cjs`；别名 `resolve_alias` / 相对 `resolve_relative`（同一份探针，`oj build` 复用） | `module_loader.rs` |
 | OIDC | `op_oidc_sign/verify/info` | `oidc.rs` |
 | WS | `op_ws_send`、`op_ws_close` | `ws.rs` |
@@ -45,6 +45,7 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | `fetch(url, opts)` | 浏览器兼容子集 | 经 `reqwest` |
 | `log` | `debug/info/warn/error(msg, ...kv)` | zap 风格交替键值 |
 | `plugins()` | — | 返回已加载插件自描述 |
+| `vars` | `get(name)` | 部署期常量（config `vars:` 段，v0.1.25）：**同步**；未声明键 → `null`（fail-closed，无「读任意 env/config 键」通道） |
 | `cert` | `generate(bits, nbf, exp)` / `renew(pem, nbf, exp)` | RSA keygen + RS256 在 Rust |
 | `jwt` | `sign` / `verify` / `accessDuration` / `refreshDuration` | |
 | `bcrypt` | `hash` / `verify` | Rust 侧 `spawn_blocking` |

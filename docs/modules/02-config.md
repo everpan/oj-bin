@@ -22,6 +22,8 @@
 | `app_path` | `None` | 静态站点根（相对 config 目录；CLI `--app-path` 相对 CWD）；`None` = 不开静态服务 |
 | `app_spa_fallback` | `false` | SPA 深链接回落（v0.1.20）：静态未命中 + 无扩展名 + Accept html + 不在 `api_prefix` 下 → 送 `index.html`。默认关（静默把 404 变 200 会掩盖错配） |
 | `html_meta` | `None` | 路由感知 meta 目录名（v0.1.20，相对 `app_path`）：送 HTML 前查 `<app_path>/<html_meta>/<path>.json`，注入 `<title>`/`<meta>`/`<link rel=canonical>`。该目录不对静态服务公开 |
+| `html_meta_handler` | `None` | 动态 meta 源（v0.1.25）= 业务 handler 的**路由路径**：送 HTML 前内部派发该 GET handler（`?path=` 传**已剥 `app_prefix`** 的路径，**恒匿名**：请求头/租户头/请求体不传递），返回的 JSON 与 `html_meta` 同白名单注入（**替换** head 里同名旧标签），静态 JSON 打底、动态按 key 覆盖；保留键 `cache_control` 覆盖本响应缓存头。失败 → WARN + 原样送出（fail-open）。**装配期校验命中 GET 路由**（`oj/src/app.rs::validate_html_meta_handler`） |
+| `html_cache_control` | `None` | HTML 响应的 `Cache-Control`（v0.1.25，**只管 HTML**，资源不受影响）；handler 的 `cache_control` 优先；None = 不加头 |
 | `timeout` | `"30s"` | 单请求执行超时，超时 → 408 |
 | `pool_size` | `4` | JS 执行并发度（= actor 数） |
 | `max_upload_bytes` | `10 MiB` | 超出 → 信封 413；axum 层 2x 硬顶（裸 413） |
@@ -48,6 +50,7 @@
 | `broker` | `BrokerCfg` | `kind`: local/kafka/rabbitmq；`brokers` / `url` / `group` / `topic_prefix` |
 | `plugins` | `HashMap<name, cfg>` | **一段三用**：键 = 严格清单（非空 map 只装配列出的）/ 值 = 透传 cfg（非空对象原样透传，空对象回落轴适配器）/ 缺省或空 map = 扫描模式。旧 list 写法解析报错 |
 | `plugins_dir` | `Option<PathBuf>` | 相对 config_dir；`None` 走四级后备（见 [05](05-ffi-and-plugins.md)） |
+| `vars` | `HashMap<name, String>` | 部署期常量（v0.1.25）：JS `vars.get(name)` 的**唯一**数据源（**同步** op，装配期冻结）。fail-closed——只有声明的键可读，平台没有「读任意 OS env / 任意 config 键」的通道。值只能是标量（数字/布尔按 YAML 字面量成串；嵌套 map/list 解析期报错） |
 
 ## 3. 时长解析
 
@@ -63,6 +66,7 @@
 | `auth.jwt_secret` 非空 | `oj/src/app.rs:241` |
 | `migrate_on_start` / `ownership_guard` 非法值 | `oj/src/app.rs:173-192` |
 | `server.api_prefix` 为空 | `oj/src/server_cmd.rs:95` |
+| `server.html_meta_handler` 未命中 GET 路由 | `oj/src/app.rs::validate_html_meta_handler`（v0.1.25） |
 | 模块名/版本白名单 | `oj/src/manifest.rs:25,37` |
 | schema.yaml 标识符白名单 `[A-Za-z_][A-Za-z0-9_]*` | `oj/src/schema.rs:103` |
 | `anonymous_paths` 的 `one_layer` 只许标在末段为 `*` 的条目上 | `config::validate_anon_paths()`（调用点 `oj/src/app.rs` 的 `App::from_config`，`db_query.validate()` 之后） |

@@ -336,6 +336,15 @@ interface BcryptApi {
   verify(password: string, hash: string): Promise<boolean>;
 }
 
+// vars.* ：部署期常量读口（config `vars:` 段，v0.1.25）。
+// **同步**（装配期冻结的表，无 IO）；**fail-closed**：只有 config 里声明的键可读，
+// 其余恒 null（没有「读任意 OS env / 任意 config 键」的通道）。值按 YAML 标量文本成串
+// （`PORT: 3000` → `"3000"`；嵌套 map/list 是配置解析错误）。
+//   const web = vars.get("WEB_URL") ?? "http://localhost:3000";
+interface VarsApi {
+  get(name: string): string | null;
+}
+
 declare global {
   interface Function {
     route?: string;
@@ -364,6 +373,8 @@ declare global {
   const jwt: JwtApi;
   const oidc: OidcApi;
   const bcrypt: BcryptApi;
+  // 部署期常量（config `vars:` 段；未声明的键恒 null）。
+  const vars: VarsApi;
 
   // ---- 大整数（v0.1.22；u64 见 v0.1.24；详见 docs/numeric-limits.md）----
   // DB 的 i64 超出安全整数范围（|v| > 2^53-1，雪花 id 常态）时，读出来是**十进制字符串**；

@@ -3,7 +3,7 @@
 // (exposes the op_* bindings as JS globals).
 //
 // Globals: json / db / DB / http / redis / kv / log / fetch / finish / __ojRequire
-//   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto / mail
+//   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto / mail / vars
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
 // Not ported yet: Redis(name) (named multi-KV-backend), XORM(name).
 
@@ -70,6 +70,7 @@ import {
   op_jwt_verify,
   op_random_hex,
   op_sha256_hex,
+  op_vars_get,
   op_ws_send,
   op_ws_send_bin,
   op_ws_frame_close,
@@ -470,6 +471,17 @@ globalThis.mail = ojMailDefault;
 
 // ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
 globalThis.plugins = () => op_plugins();
+
+// ----- vars: deployment-time constants (config `vars:` section) -----
+// Synchronous read (no I/O -- the table is frozen at assembly). FAIL-CLOSED: only keys
+// declared under `vars:` are readable, anything else returns null; there is no "read
+// arbitrary OS env / arbitrary config key" channel. Values are the YAML scalars as text
+// (PORT: 3000 -> "3000"; nested maps/lists are a config parse error). Typical use --
+// deployment decides, business code never hardcodes a release constant:
+//   const web = vars.get("WEB_URL") ?? "http://localhost:3000";
+globalThis.vars = {
+  get: (name) => op_vars_get(String(name)),
+};
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----
 // ----- condition tree factory (pure JSON tree; compose/inspect in JS, zero new ops) -----
