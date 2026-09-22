@@ -577,7 +577,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 
 | 全局 | 说明 |
 |---|---|
-| `json.ok(data?)` / `json.fail(code, msg, data?)` / `json.header(name, value)` | 统一响应信封与响应头 |
+| `json.ok(data?)` / `json.fail(code, msg, data?)` / `json.header(name, value)` / `json.redirect(url, code?)` | 统一响应信封、响应头与 3xx 重定向原语（v0.1.26） |
 | `http.method / query / headers / body / params / param / tenantId / user / files / file(i)` | 当前请求上下文（只读、懒加载、每请求最新） |
 | `db.query / exec / table / tx` | 默认库（`db === DB("default")`） |
 | `DB(name)` | 命名库实例（未配置的名字返回 `undefined`） |
@@ -611,12 +611,16 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.fail` | `fail(code: number, msg: string, data?: unknown): void` | 失败信封，HTTP 状态 = `code`（`code<=0` 映射 500） |
 | `json.header` | `header(name: string, value: string): void` | 设置响应头（同名后写覆盖） |
 | `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
+| `json.redirect` | `redirect(url: string, code?: number): void` | **3xx 重定向原语**（v0.1.26）：`Location` + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 非 3xx **回落 302**（杜绝「200 + Location」畸形响应）；空 url 忽略 `Location`。具名封装：`movedPermanently`(301) / `found`(302) / `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) / `permanentRedirect`(308，永久 + 方法保持)。典型：302 到 `blob.url()` 预签名 URL（`scenarios.md` 场景 8） |
 
 ```ts
 json.ok({ created: true });
 json.fail(400, "name required");
 json.fail(404, "no such account", { id });
 json.header("X-Request-Id", "abc");
+// 重定向（v0.1.26）：不要再用 header+fail 拼——那是失败信封体，非标准形态。
+json.redirect.found(await blob.url(key)); // 302 到预签名 URL，浏览器两跳直取
+json.redirect.seeOther("/v1/api/order/list/"); // POST 提交后跳转：跟随后一律 GET
 ```
 
 ### http —— 请求上下文
@@ -1488,6 +1492,10 @@ while (!tasks.stopping()) {
 业务层常用码约定：400 入参不合法、404 资源不存在、401 未认证、403 已认证但无权、
 500 服务器内部错误。`json.fail` 的 `msg` 会原样进入信封，勿把内部细节（堆栈、SQL）
 透给客户端。
+
+> 3xx 不属于错误通道：重定向走 `json.redirect(url, code?)`（v0.1.26，见 §6 json），
+> 响应**无 `{code,msg,data}` 信封**——body 是 RFC 9110 §15.4 短超文本注记（HEAD 为空），
+> HTTP 状态即所给 3xx（非 3xx 回落 302）。不要拿 `json.fail(302, …)` 当跳转用。
 
 ## 8. 鉴权与多租户
 

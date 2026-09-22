@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.26（2026-09-22）
+
+> 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.25 → 0.1.26`）。发布点标签：
+> **未打标签**（本节随实现提交，标签动作未执行）。上一版：`v0.1.25` → `e2e4c60`。
+
+**特性**
+
+- **302 redirect 原语（`json.redirect`，v0.1.26）**：此前 oj 无 redirect 原语，要跳转只能
+  手工拼 `json.header("Location", url)` + `json.fail(302, …)`——能跑通，但拼出来的是
+  **失败信封体**（浏览器虽忽略，非标准形态）。本版新增原语，遵循 RFC 9110 §15.4：
+  - `json.redirect(url, code?)`：3xx + `Location`；`code` 非 3xx 一律回落 302（原语层面
+    杜绝「200 + Location」的畸形响应）；空 url 忽略 `Location`。
+  - body 按 §15.4 SHOULD：含目标链接的短超文本注记（`<a href="…">{reason}</a>.`，
+    `net/http` Redirect 同款形态）；**HEAD 请求豁免为空 body**；content-type 默认
+    `text/html; charset=utf-8`（`json.header` 显式设置的优先，大小写不敏感）。
+  - 具名封装（语义即注释，对应五个标准 3xx）：`movedPermanently`(301) / `found`(302) /
+    `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) /
+    `permanentRedirect`(308，永久 + 方法保持)。
+  - 典型场景：权限校验后把请求 302 到 `blob.url()` 给出的 S3 预签名 URL，浏览器两跳
+    直取对象（样例 `sample/src/redirect/`；devkit `scenarios.md` 场景 8）。
+  - 落点：`src/bridge/json.rs`（`op_json_redirect` + reason phrase/HTML 转义）、
+    `src/bridge/mod.rs`（op 注册）、`src/bridge/bootstrap.js`（`json.redirect` 及具名封装）。
+    测试：根 crate 单测（默认 302/显式 307/非 3xx 回落/具名封装/转义/HEAD 空 body）+
+    oj e2e（302 首跳注记、HEAD 空 body、回落、seeOther 303）。
+
 ## v0.1.25（2026-09-21）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.24 → 0.1.25`）。发布点标签：

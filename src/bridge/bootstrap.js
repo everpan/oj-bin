@@ -46,6 +46,7 @@ import {
   op_json_header,
   op_json_ok,
   op_json_raw,
+  op_json_redirect,
   op_kv_get,
   op_kv_set,
   op_kv_del,
@@ -273,6 +274,25 @@ globalThis.json = {
   fail: (code, msg, data) =>
     op_json_fail(code | 0, String(msg), data === undefined ? "null" : ojStringify(data)),
   header: (name, value) => op_json_header(String(name), String(value)),
+  // 3xx redirect per RFC 9110 sec.15.4: Location + a short hypertext note with the
+  // target link (empty body on HEAD; ignored by clients that auto-follow). Non-3xx
+  // code falls back to 302.
+  // Named helpers per RFC 9110 semantics:
+  //   301 movedPermanently   permanent move (SEO weight transfers); cacheable
+  //   302 found              temporary; the historical default (HTTP/1.0 "Moved Temporarily")
+  //   303 seeOther           always re-fetch target with GET (correct post-POST redirect)
+  //   307 temporaryRedirect  temporary; request method/body preserved
+  //   308 permanentRedirect  permanent move; method/body preserved (301 with method kept)
+  redirect: Object.assign(
+    (url, code) => op_json_redirect(String(url), code === undefined ? 302 : code | 0),
+    {
+      movedPermanently: (url) => op_json_redirect(String(url), 301),
+      found: (url) => op_json_redirect(String(url), 302),
+      seeOther: (url) => op_json_redirect(String(url), 303),
+      temporaryRedirect: (url) => op_json_redirect(String(url), 307),
+      permanentRedirect: (url) => op_json_redirect(String(url), 308),
+    },
+  ),
   // bare JSON 200 (no envelope); OP external endpoints speak standard OIDC JSON.
   // Errors still go through fail() so callers can just test !res.ok on the envelope.
   raw: (data) => op_json_raw(data === undefined ? "null" : ojStringify(data)),

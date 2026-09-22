@@ -981,3 +981,94 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
     assert_eq!(resp.status(), 404);
     let _ = std::fs::remove_dir_all(&t);
 }
+
+/// json.redirect 原语端到端：3xx + Location + RFC 9110 §15.4 超文本注记（HEAD 豁免为空 body）。
+/// 非 3xx code 由 op 层回落 302。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_redirect_302_location_hypertext_note_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/r/manifest.yaml", "name: r\ndesc: d\nversion: 0.1.0\n"),
+        (
+            "src/r/api.ts",
+            r#"function dispatch() {
+                 const to = String(http.param("to", "https://example.com/"));
+                 const via = http.param("via", "");
+                 if (via === "seeOther") json.redirect.seeOther(to);
+                 else json.redirect(to, Number(http.param("code", "0")));
+               }
+               export default { get: dispatch, head: dispatch };"#,
+        ),
+    ]);
+    let cfg = base_cfg(&t);
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    // 不重定向跟随：断言的是本服务吐出的第一跳（302 + Location + 超文本注记）。
+    let c = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    // 默认 302：Location 原样回写，body 为含链接的短超文本（text/html）。
+    let resp = c
+        .get(format!(
+            "http://{addr}/v1/api/r/?to=https%3A%2F%2Fcdn.example.com%2Fa.png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(resp.headers()["location"], "https://cdn.example.com/a.png");
+    assert!(
+        resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains(r#"<a href="https://cdn.example.com/a.png">Found</a>."#),
+        "超文本注记缺失：{body}"
+    );
+
+    // HEAD 请求：§15.4 豁免，body 为空，Location 仍在。
+    let resp = c
+        .head(format!(
+            "http://{addr}/v1/api/r/?to=https%3A%2F%2Fcdn.example.com%2Fa.png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(resp.headers()["location"], "https://cdn.example.com/a.png");
+    assert!(resp.bytes().await.unwrap().is_empty());
+
+    // 显式 307 生效；非法 code（0/404 → op 层回落 302）。
+    for (q, want) in [("code=307", 307), ("code=0", 302), ("code=404", 302)] {
+        let resp = c
+            .get(format!(
+                "http://{addr}/v1/api/r/?to=https%3A%2F%2Fcdn.example.com%2Fb&{q}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), want, "{q}");
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("<a href="), "{q}: {body}");
+    }
+
+    // 具名封装（RFC 9110）：seeOther → 303 + See Other 注记。
+    let resp = c
+        .get(format!(
+            "http://{addr}/v1/api/r/?to=https%3A%2F%2Fcdn.example.com%2Fc&via=seeOther"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers()["location"], "https://cdn.example.com/c");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(">See Other</a>"), "{body}");
+    let _ = std::fs::remove_dir_all(&t);
+}

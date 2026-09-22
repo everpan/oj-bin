@@ -119,6 +119,16 @@ interface JsonApi {
   header(name: string, value: string): void;
   // 裸 JSON 200（不套信封）：标准协议端点（如 OIDC）用；错误仍走 fail()。
   raw(data?: unknown): void;
+  // 3xx 重定向原语（v0.1.26）：Location + RFC 9110 §15.4 短超文本注记（HEAD 为空 body）。
+  // code 非 3xx 一律回落 302；具名封装对应五个标准 3xx，语义见名。
+  redirect: {
+    (url: string, code?: number): void;
+    movedPermanently(url: string): void; // 301 永久迁移
+    found(url: string): void; // 302 临时（默认）
+    seeOther(url: string): void; // 303 跟随后改 GET
+    temporaryRedirect(url: string): void; // 307 方法/体保持
+    permanentRedirect(url: string): void; // 308 永久 + 方法保持
+  };
 }
 
 // http.* ：当前请求上下文（只读，懒加载，per-request 最新）。
