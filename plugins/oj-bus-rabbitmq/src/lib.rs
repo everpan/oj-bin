@@ -764,9 +764,11 @@ mod tests {
         // RabbitMQ 4.x 默认禁止「瞬时非排他队列」（durable=false & exclusive=false）→
         // 声明即 INTERNAL_ERROR。测试队列设 durable=true（持久）转合法队列；并设
         // auto_delete=true 在消费者断开后回收，贴合 roundtrip 语义且不留垃圾。
-        let mut qopts = lapin::options::QueueDeclareOptions::default();
-        qopts.durable = true;
-        qopts.auto_delete = true;
+        let qopts = lapin::options::QueueDeclareOptions {
+            durable: true,
+            auto_delete: true,
+            ..Default::default()
+        };
         setup
             .create_channel()
             .await
