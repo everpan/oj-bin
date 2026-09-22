@@ -181,8 +181,12 @@ where
 mod tests {
     use super::*;
 
+    // current_thread：block_on 单线程驱动 spawned 任务，yield 一轮即完成，
+    // 不依赖跨 worker 线程的调度时序（multi_thread 在 CPU 争抢下会偶发饿死本循环）。
+    // 仅需 tokio "rt" feature，与 crate 声明一致（rt-multi-thread 并不存在于 Cargo.toml，
+    // 之前靠 workspace feature 统一才能编译，单独 -p 构建直接失败）。
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread()
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
