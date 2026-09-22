@@ -271,6 +271,7 @@ deno_core::extension!(
         json::op_json_fail,
         json::op_json_header,
         json::op_json_raw,
+        json::op_json_redirect,
         http::op_http_info,
         http::op_http_file,
         http::op_http_body_bytes,

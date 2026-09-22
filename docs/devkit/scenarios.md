@@ -15,6 +15,7 @@
 | [5](#场景-5匿名路径怎么写) | `anonymous_paths` 的四种通配形态 + v0.1.20 收紧（**仅 auth 侧**）与 `one_layer` 消音 | §8 鉴权与多租户 |
 | [6](#场景-6多库项目按库迁移与对账) | config 多了命名库：`oj migrate/fixture/schema diff --db <name>` 逐库跑（v0.1.21） | §3 数据层 / §10 db |
 | [7](#场景-7雪花-id大整数的生成与回写) | 取号优先 `db.nextSeq(name)`（v0.1.24，原子）；雪花 id 读出是字符串，`Number()` 会静默坍缩 → 主键 dup 500 | §6 大整数与 i64 |
+| [8](#场景-8302-重定向到-blob-预签名-url) | 权限校验后 302 到 `blob.url()` 预签名 URL，浏览器两跳直取对象（`json.redirect`，v0.1.26） | §6 json / §7 响应信封 |
 
 ---
 
@@ -600,6 +601,50 @@ expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 | MySQL: `column 'x' has MySQL type 'DECIMAL' … does not decode yet` | 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而非静默给 `null`**；在 SQL 里 `cast(x as char) as x`，别用 `select *`。`BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` |
 
 > 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
+
+---
+
+## 场景 8：302 重定向到 blob 预签名 URL
+
+**什么时候用**：浏览器要直接打开/下载一个存在对象存储（S3）里的文件（头像、附件、导出报表），
+bucket 是私有的——不能把永久链接发给前端，也不想让 oj 代理整份字节流（占连接、双倍流量）。
+正解：业务路由**先校验权限**，再 302 到 `blob.url()` 给出的**预签名 URL**，浏览器自动跟跳，
+两跳直取对象，流量不过 oj。
+
+### ① handler
+
+```ts
+// src/download/api.ts —— 目录镜像路由：GET {base}/download/
+export async function get(): Promise<void> {
+  const key = String(http.param("key", ""));
+  if (!key) { json.fail(400, "key required"); return; }
+  // …权限校验在这里（登录态 / 租户 / 文件归属）——通过后才允许拿签名 URL，
+  // 否则等于任何人签出任何人的文件（越权下载）。
+  json.redirect.found(await blob.url(key)); // 302 + Location: <AWS4 预签名串>
+}
+```
+
+### ② 验证
+
+```sh
+curl -i 'http://localhost:9778/v1/api/download/?key=a/b.png'
+# HTTP/1.1 302 Found
+# location: http://127.0.0.1:9000/…/a%2Fb.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&…
+# content-type: text/html; charset=utf-8
+#
+# <a href="http://127.0.0.1:9000/…">Found</a>.   ← RFC 9110 §15.4 注记；浏览器自动跟跳时忽略它
+curl -i '<location 值>'   # 第二跳：200，字节数 = 对象大小
+```
+
+### ③ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 用 `json.header("Location", …)` + `json.fail(302, …)` 拼 | 能跑通但 body 是**失败信封**（非标准形态）。用 `json.redirect`（v0.1.26）：3xx + `Location` + 标准注记，HEAD 请求 body 为空 |
+| 想让客户端改用 GET 再取（如 POST 提交后跳转） | `json.redirect.seeOther(url)`（303）；要保持原方法/请求体用 `temporaryRedirect`（307） |
+| 资源永久换了域名/路径 | `movedPermanently`（301）或 `permanentRedirect`（308，方法保持）——SEO 权重会转移 |
+| 测出来是 200 且 body 是 HTML | 客户端自动跟随了跳转。curl 加 `-i`（或 `--max-redirs 0`），代码里关跟随，断言**第一跳**的 302 + `location` |
+| 传了 code 但不是 3xx（如 `json.redirect(url, 200)`） | op 层一律回落 302——原语杜绝「200 + Location」畸形响应 |
 
 ---
 
