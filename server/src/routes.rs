@@ -69,6 +69,27 @@ pub fn normalize(path: &str) -> Option<String> {
     Some(t.to_string())
 }
 
+/// 段是否为 `_name_` 形态（fs 动态参数写法）。宽松判定，仅用于告警提示。
+pub fn looks_like_underscore_param(seg: &str) -> bool {
+    seg.len() > 2 && seg.starts_with('_') && seg.ends_with('_')
+}
+
+/// fs 段 → URL pattern 段（v0.1.27 `_name_` 约定）：
+/// 仅整段 `_name_` 转换——len>2、首尾各一个 `_`，且 inner 不以 `_` 开头/结尾
+/// （`__x__`/`___`/`_a__` 不转，宁枉勿纵）、inner 不含 `{`/`}`
+/// （`_a{b}_` 不转，提前挡掉而非留给 matchit 启动期报错）。
+/// `_`、`__`、`_a`、`a_`、`_shared`、`a_bb_c` 保持字面。
+/// 下划线是 ASCII，`seg[1..len-1]` 恒为合法字符边界。
+pub fn fs_seg_to_pattern(seg: &str) -> String {
+    if looks_like_underscore_param(seg) {
+        let inner = &seg[1..seg.len() - 1];
+        if !inner.starts_with('_') && !inner.ends_with('_') && !inner.contains(['{', '}']) {
+            return format!("{{{inner}}}");
+        }
+    }
+    seg.to_string()
+}
+
 /// 匹配后参数：percent-decode（`+` 保持字面，路径语义）+ 走私校验，None → 404。
 /// 拒绝：解码值为 `.`/`..`、含 `\`/`\0`，或 **raw 无 `/` 而解码后有 `/`**（单段参数走私 `%2F`）；
 /// catch-all 的 raw 值含真实分隔符，放行。
@@ -618,6 +639,24 @@ mod tests {
         // catch-all 值：raw 含真实分隔符 → 放行
         let ca = decode_params(vec![("path".into(), "a/b%20c".into())].into_iter());
         assert_eq!(ca.unwrap()["path"], "a/b c");
+    }
+
+    // ----- fs 段转换（v0.1.27 `_name_` 约定） -----
+
+    #[test]
+    fn fs_seg_conversion_rules() {
+        // 转换：整段 `_name_`，inner 可含下划线
+        assert_eq!(fs_seg_to_pattern("_aa_"), "{aa}");
+        assert_eq!(fs_seg_to_pattern("_a_b_"), "{a_b}");
+        // 不转换（原样返回）
+        for lit in [
+            "_", "__", "_a", "a_", "__x__", "___", "_a{b}_", "_shared", "a_bb_c", "plain",
+        ] {
+            assert_eq!(fs_seg_to_pattern(lit), lit, "{lit}");
+        }
+        // 宽松判定（告警用）与严格转换的区别
+        assert!(looks_like_underscore_param("__x__")); // 宽松命中……
+        assert_eq!(fs_seg_to_pattern("__x__"), "__x__"); // ……但严格转换拒绝
     }
 
     // ----- RouteTable（纯逻辑，假内省闭包） -----
