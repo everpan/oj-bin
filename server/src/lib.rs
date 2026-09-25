@@ -5,6 +5,7 @@ pub mod certificate;
 pub mod certificate_watcher;
 pub mod logging;
 pub mod routes;
+pub mod tasks;
 /// 测试支撑（仅 dev/test 编译）：生成真实签名 JWS 证书，供装配测试使用。
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

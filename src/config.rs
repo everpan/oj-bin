@@ -620,6 +620,56 @@ pub struct TasksCfg {
     pub max: usize,
     /// 停机宽限秒数：flag 置位后任务有此窗口自然收场，到期看门狗强杀。
     pub stop_grace_secs: u64,
+    /// 池化任务执行体池（v0.2 事件驱动 PRD v2 §6.8）。
+    pub pool: TaskPoolCfg,
+    /// crontab 配置（相对 API 目录；文件缺失 = 无定时任务）。
+    pub crontab: String,
+    /// 执行事件日志（JSONL；disabled = 不写盘）。
+    pub event_log: TaskEventLogCfg,
+}
+
+/// 池化任务执行体配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TaskPoolCfg {
+    /// Worker 线程数（每 Worker 一个 Bridge，多任务交替执行 loop_body）。
+    pub workers: usize,
+    /// 单轮 loop_body 看门狗超时（毫秒；0 = 5s 默认在 default()）。
+    pub loop_body_timeout_ms: u64,
+    /// 轮间节奏（毫秒）：忙扫每轮后 sleep 这么久，防 trivial loop_body 空转独占 Worker。
+    /// 0 = 不限制（忙扫结束立即轮转——压测语义，生产会被空转打满 CPU）。
+    pub interval_ms: u64,
+}
+
+impl Default for TaskPoolCfg {
+    fn default() -> Self {
+        Self {
+            workers: 4,
+            loop_body_timeout_ms: 5000,
+            interval_ms: 100,
+        }
+    }
+}
+
+/// 任务执行事件日志配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TaskEventLogCfg {
+    pub enabled: bool,
+    /// 相对进程 CWD（对齐 logs/ 布局）。
+    pub path: String,
+    /// 单文件滚动上限 MB（0 = 不滚动，ponytail：先一刀切复制数）。
+    pub max_mb: u64,
+}
+
+impl Default for TaskEventLogCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: "logs/task-events.jsonl".into(),
+            max_mb: 16,
+        }
+    }
 }
 
 impl Default for TasksCfg {
@@ -628,6 +678,9 @@ impl Default for TasksCfg {
             dir: "tasks".into(),
             max: 64,
             stop_grace_secs: 30,
+            pool: TaskPoolCfg::default(),
+            crontab: "task/crontab.yaml".into(),
+            event_log: TaskEventLogCfg::default(),
         }
     }
 }

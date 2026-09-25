@@ -75,17 +75,23 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
-    let app =
+    let mut app =
         App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false, None).await?;
-    // 长任务池（spec §6）：随服务拉起——扫描 <dir>/<tasks.dir>，空池/缺目录不报错；
-    // 重名/超 max fail-fast。停机 flag 由 App 持有，信号处理器置位。
+    // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
+    // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
+    // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
     let task_flag = app.tasks_flag();
-    let sup = crate::tasks::TaskSupervisor::spawn_all(
+    let task_pool = crate::tasks::assemble_tasking(
         &tasks_cfg,
         &dir,
         app.make_task_bridge(),
         task_flag.clone(),
     )?;
+    // 任务管理 API（PRD v2 §6.6）：有池（池化长任务/cron）才挂 `{base}/tasks`。
+    if let Some(pool) = task_pool.pool.clone() {
+        let state = app.tasks_api_state(pool.registry.clone(), Some(pool));
+        app.merge_router(server::tasks::tasks_router(&base, state));
+    }
     // 全仓首个信号处理器（评审 F5/S2）：SIGINT/SIGTERM → 置停机 flag → HTTP 侧
     // with_graceful_shutdown 同信号排空在途请求；任务线程在 grace 内自然收场
     // （不退者由 run_task 内置看门狗强杀）。
@@ -105,10 +111,19 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         }
     );
     h.await.map_err(|e| format!("server task: {e}"))?;
-    // 任务线程收场（flag 已置位；join 为阻塞调用，移交 blocking 池）。
-    tokio::task::spawn_blocking(move || sup.shutdown())
-        .await
-        .map_err(|e| format!("tasks shutdown: {e}"))?;
+    // 任务线程收场（flag 已置位；join 为阻塞调用，移交 blocking 池）：
+    // 先存量 TLA 监督器，再池化 Worker（退出前尽力 teardown 全部会话）。
+    let pool2 = task_pool.pool.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(sup) = task_pool.sup {
+            sup.shutdown();
+        }
+        if let Some(p) = pool2 {
+            p.shutdown_and_join();
+        }
+    })
+    .await
+    .map_err(|e| format!("tasks shutdown: {e}"))?;
     // 停机 graceful drain（spec §6 ⑤）：HTTP 已停收、任务已收场后，排空在途邮件
     // （插件侧停收 → 等在途 job 跑完 → 销毁 transport）。超时只告警，不阻断退出。
     app.drain_mail(MAIL_DRAIN_TIMEOUT).await;

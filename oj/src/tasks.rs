@@ -86,18 +86,18 @@ impl TaskSupervisor {
         make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
         flag: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        Self::spawn_all_with_backoff(cfg, root, make_bridge, flag, Duration::from_secs(1))
+        let tasks = scan_tasks(&root.join(&cfg.dir), cfg.max)?;
+        Self::spawn_selected(cfg, tasks, make_bridge, flag, Duration::from_secs(1))
     }
 
-    pub fn spawn_all_with_backoff(
+    /// 拉起指定子集（PRD v2 双模式：池化任务剔除后，存量 TLA 任务走此入口）。
+    pub fn spawn_selected(
         cfg: &TasksCfg,
-        root: &Path,
+        tasks: Vec<(String, PathBuf)>,
         make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
         flag: Arc<AtomicBool>,
         backoff_base: Duration,
     ) -> Result<Self, String> {
-        let dir = root.join(&cfg.dir);
-        let tasks = scan_tasks(&dir, cfg.max)?;
         let grace = Duration::from_secs(cfg.stop_grace_secs);
         let mut handles = Vec::with_capacity(tasks.len());
         for (name, path) in tasks {
@@ -118,6 +118,17 @@ impl TaskSupervisor {
         }
         eprintln!("task: {} task(s) → started", handles.len());
         Ok(Self { handles })
+    }
+
+    pub fn spawn_all_with_backoff(
+        cfg: &TasksCfg,
+        root: &Path,
+        make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
+        flag: Arc<AtomicBool>,
+        backoff_base: Duration,
+    ) -> Result<Self, String> {
+        let tasks = scan_tasks(&root.join(&cfg.dir), cfg.max)?;
+        Self::spawn_selected(cfg, tasks, make_bridge, flag, backoff_base)
     }
 
     /// 停机收场：等每个任务线程退出（调用方须先置位停机 flag）。
@@ -183,6 +194,199 @@ fn task_loop(
     }
 }
 
+/// 任务域装配产物（PRD v2 双模式）：两池各自可选（无对应任务即为 None）。
+pub struct Tasking {
+    /// 存量 TLA 任务监督器（无 TLA 任务 = None）。
+    pub sup: Option<TaskSupervisor>,
+    /// 池化任务执行体（含 cron 一次性作业派发；无池化/cron 任务 = None）。
+    pub pool: Option<Arc<only_js::bridge::task_pool::TaskPool>>,
+}
+
+/// 任务域装配（PRD v2 §9 阶段 1）：扫描 → 探测 loop_body 导出分流（池化/TLA）→
+/// crontab.yaml 注册 → TaskPool 起 Worker → TLA 监督器拉起 → cron 调度器上树。
+/// 探测在独立线程跑（Bridge !Send，own current_thread runtime）；探测失败的文件
+/// 归入 TLA 桶（存量监督器会照常报错 + 退避重启，行为与旧版一致）。
+pub fn assemble_tasking(
+    cfg: &TasksCfg,
+    root: &Path,
+    make_bridge: Arc<dyn Fn() -> only_js::bridge::Bridge + Send + Sync>,
+    flag: Arc<AtomicBool>,
+) -> Result<Tasking, String> {
+    use only_js::bridge::task_pool::{
+        TaskEntry, TaskEventLog, TaskPool, TaskRegistry, parse_crontab_line,
+    };
+
+    let scanned = scan_tasks(&root.join(&cfg.dir), cfg.max)?;
+    // 1) 探测分流。
+    let mut pooled: Vec<(String, PathBuf)> = Vec::new();
+    let mut tla: Vec<(String, PathBuf)> = Vec::new();
+    if !scanned.is_empty() {
+        let make = make_bridge.clone();
+        let probe_set = scanned.clone();
+        let probed = std::thread::Builder::new()
+            .name("task-probe".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("task probe runtime: {e}"))?;
+                let bridge = make();
+                rt.block_on(async {
+                    let mut out = Vec::with_capacity(probe_set.len());
+                    for (name, path) in &probe_set {
+                        let is_loop = bridge.probe_task_loop(path).await.unwrap_or(false);
+                        out.push((name.clone(), path.clone(), is_loop));
+                    }
+                    Ok::<_, String>(out)
+                })
+            })
+            .map_err(|e| format!("spawn task probe: {e}"))?
+            .join()
+            .map_err(|_| "task probe panicked".to_string())??;
+        for (name, path, is_loop) in probed {
+            if is_loop {
+                pooled.push((name, path));
+            } else {
+                tla.push((name, path));
+            }
+        }
+    }
+
+    // 2) 注册表 + 事件日志。
+    let log = TaskEventLog::new(
+        cfg.event_log.enabled,
+        &cfg.event_log.path,
+        cfg.event_log.max_mb,
+    )
+    .map_err(|e| format!("task event log: {e}"))?;
+    let registry = TaskRegistry::new(log);
+
+    // 3) 池化任务先入注册表，再解析 crontab.yaml（tasks.dir 相对；行级错误 fail-fast
+    //    带行号；与池化任务同名的 cron 行拒启）。
+    for (name, path) in pooled {
+        registry.upsert(TaskEntry::long(name, path));
+    }
+    let mut cron_count = 0usize;
+    let tasks_dir = root.join(&cfg.dir);
+    let crontab_path = tasks_dir.join(&cfg.crontab);
+    if let Ok(content) = std::fs::read_to_string(&crontab_path) {
+        for (i, line) in content.lines().enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let (expr, p) = parse_crontab_line(line)
+                .map_err(|e| format!("{}:{}: {e}", crontab_path.display(), i + 1))?;
+            let path = tasks_dir.join(p.trim_start_matches("./"));
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("cron")
+                .to_string();
+            if registry.get(&name).is_some() {
+                return Err(format!(
+                    "crontab:{}: task '{name}' duplicates a pool task",
+                    i + 1
+                ));
+            }
+            registry.upsert(TaskEntry::cron(name, path, expr));
+            cron_count += 1;
+        }
+    }
+
+    // 4) TaskPool（有池化任务或 cron 才起）+ cron 调度器。
+    let pool = if !registry.list().is_empty() {
+        let pool = TaskPool::new(
+            cfg.pool.workers,
+            Duration::from_millis(cfg.pool.loop_body_timeout_ms),
+            Duration::from_millis(cfg.pool.interval_ms),
+            make_bridge.clone(),
+            registry,
+        );
+        pool.spawn();
+        if cron_count > 0 {
+            spawn_cron_driver(pool.clone(), flag.clone());
+        }
+        Some(pool)
+    } else {
+        None
+    };
+
+    // 5) 存量 TLA 监督器（有 TLA 任务才起）。
+    let sup = if tla.is_empty() {
+        None
+    } else {
+        Some(TaskSupervisor::spawn_selected(
+            cfg,
+            tla,
+            make_bridge,
+            flag,
+            Duration::from_secs(1),
+        )?)
+    };
+    Ok(Tasking { sup, pool })
+}
+
+/// cron 调度器（PRD v2 §6.4）：tokio 任务，睡到最近 next_run → 先推后 next_run
+/// （防重复触发，单机权威）→ 投一次性作业。停机 flag 置位即退。
+fn spawn_cron_driver(pool: Arc<only_js::bridge::task_pool::TaskPool>, flag: Arc<AtomicBool>) {
+    use only_js::bridge::task_pool::{OnceJob, TaskKind};
+    tokio::spawn(async move {
+        loop {
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            let now = std::time::SystemTime::now();
+            let next = pool
+                .registry
+                .list()
+                .into_iter()
+                .filter_map(|e| match (&e.kind, e.enabled) {
+                    (
+                        TaskKind::Cron {
+                            next_run: Some(t), ..
+                        },
+                        true,
+                    ) => Some((*t, e)),
+                    _ => None,
+                })
+                .min_by_key(|(t, _)| *t);
+            let Some((fire_at, entry)) = next else {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                    _ = wait_flag(&flag) => return,
+                }
+            };
+            let wait = fire_at.duration_since(now).unwrap_or(Duration::ZERO);
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = wait_flag(&flag) => return,
+            }
+            // 到点：先计算并写回下一次触发时间，再投作业（顺序 = 防重契约）。
+            let new_next = match &entry.kind {
+                TaskKind::Cron { expr, .. } => expr.next_after(std::time::SystemTime::now()),
+                _ => None,
+            };
+            pool.registry.set_next_run(&entry.name, new_next);
+            pool.submit_once(OnceJob {
+                name: entry.name.clone(),
+                path: entry.path.clone(),
+            });
+            pool.registry.log.record(
+                "tasks.commands",
+                "cron.triggered",
+                serde_json::json!({ "task": entry.name }),
+            );
+        }
+    });
+}
+
+/// flag 置位唤醒（select 分支用）：25ms 轮询（ponytail：简单可靠，量级 irrelevant）。
+async fn wait_flag(flag: &AtomicBool) {
+    while !flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +406,7 @@ mod tests {
             dir: dir.into(),
             max,
             stop_grace_secs: 30,
+            ..Default::default()
         }
     }
 
@@ -368,5 +573,268 @@ mod tests {
         assert!(done.is_ok());
         jh.join().unwrap();
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD（PRD v2 FR-LT-002~005）：loop_body 导出 → 池化模式——setup 执行、
+    /// loop_body 轮转计数、stop 后 teardown 执行（kv 侧可观察）；TLA 任务分流不受影响。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_loop_task_when_pool_runs_then_lifecycle_and_teardown_on_stop() {
+        use only_js::bridge::KVStore;
+        use only_js::bridge::task_pool::{TaskKind, TaskStatus};
+        let d = tmpdir("pool");
+        let pool_dir = d.join("tasks");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        std::fs::write(
+            pool_dir.join("task_counter.ts"),
+            "export async function setup() { await kv.set(\"up\", \"1\"); }\n\
+             export async function loop_body() {\n\
+               const n = Number((await kv.get(\"n\")) ?? \"0\");\n\
+               await kv.set(\"n\", String(n + 1));\n\
+             }\n\
+             export async function teardown() { await kv.set(\"down\", \"1\"); }\n",
+        )
+        .unwrap();
+        // 存量 TLA 任务同目录共存：无 loop_body 导出 → TLA 桶（监督器线程）。
+        std::fs::write(
+            pool_dir.join("audit_task.ts"),
+            "export {};\nwhile (!tasks.stopping()) { await Kafka(\"default\").poll([\"t\"], { timeoutMs: 30 }); }\n",
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let kv = Arc::new(only_js::bridge::InMemoryKV::new());
+        let make_bridge = {
+            let kv = kv.clone();
+            let flag = flag.clone();
+            let root = d.clone();
+            Arc::new(move || {
+                let mut reg = only_js::bridge::NamedRegistry::new();
+                let inst = only_js::bridge::MqInstance::new(
+                    "kafka",
+                    Arc::new(|_m: String, _p: serde_json::Value| {
+                        Box::pin(async {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            Ok(serde_json::json!({ "messages": [] }))
+                        })
+                    }),
+                );
+                reg.register("default", Arc::new(inst)).unwrap();
+                only_js::bridge::Bridge::with_dbs_and_loader(
+                    std::collections::HashMap::new(),
+                    kv.clone(),
+                    only_js::bridge::SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(only_js::bridge::LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    only_js::bridge::Extras {
+                        tasks_flag: Some(flag.clone()),
+                        kafkas: Some(Arc::new(reg)),
+                        ..Default::default()
+                    },
+                )
+            }) as Arc<dyn Fn() -> Bridge + Send + Sync>
+        };
+        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        let pool = tasking.pool.expect("loop task must assemble a pool");
+        assert!(
+            tasking.sup.is_some(),
+            "TLA task must go to legacy supervisor"
+        );
+        // setup + loop_body 轮转：run_count 涨、kv.n 涨、kv.up = 1。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let e = pool.registry.get("counter").unwrap();
+            if e.run_count >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "loop_body did not run: {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(kv.get("up").await.unwrap().as_deref(), Some("1"));
+        // stop：desired=false → Worker teardown → 状态 Stopped + kv.down = 1。
+        pool.registry.set_enabled("counter", false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let e = pool.registry.get("counter").unwrap();
+            if e.status == TaskStatus::Stopped {
+                break;
+            }
+            assert!(Instant::now() < deadline, "task did not stop: {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(kv.get("down").await.unwrap().as_deref(), Some("1"));
+        assert_eq!(
+            kv.get("n").await.unwrap().unwrap().parse::<u64>().unwrap() >= 3,
+            true
+        );
+        // 双模式条目同时在册：counter=long（池化）、audit=long（TLA，监督器管状态，
+        // 注册表不跟踪 TLA 运行态——它只是不在池注册表里出现……断言池表只含 counter）。
+        let names: Vec<String> = pool.registry.list().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["counter".to_string()]);
+        // start 复位：enable → Worker 下轮重连（状态离开 Stopped，异步——轮询等）。
+        pool.registry.start("counter");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let e = pool.registry.get("counter").unwrap();
+            if e.status != TaskStatus::Stopped {
+                break;
+            }
+            assert!(Instant::now() < deadline, "task did not restart: {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = pool
+            .registry
+            .get("counter")
+            .map(|e| assert!(matches!(e.kind, TaskKind::Long)));
+        flag.store(true, Ordering::Relaxed);
+        pool.shutdown_and_join();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD：多个池化任务同 Worker 轮转——各自 setup 一次、loop_body 都在推进
+    /// （轮转公平，无饥饿；interval_ms 默认 100ms）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_two_loop_tasks_when_pool_runs_then_both_advance() {
+        use only_js::bridge::KVStore;
+        let d = tmpdir("pool2");
+        let pool_dir = d.join("tasks");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::write(
+                pool_dir.join(format!("task_{name}.ts")),
+                format!(
+                    "export async function setup() {{ await kv.set(\"{name}:up\", \"1\"); }}\n\
+                     export async function loop_body() {{\n\
+                       const n = Number((await kv.get(\"{name}:n\")) ?? \"0\");\n\
+                       await kv.set(\"{name}:n\", String(n + 1));\n\
+                     }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let kv = Arc::new(only_js::bridge::InMemoryKV::new());
+        let make_bridge = {
+            let kv = kv.clone();
+            let flag = flag.clone();
+            let root = d.clone();
+            Arc::new(move || {
+                only_js::bridge::Bridge::with_dbs_and_loader(
+                    std::collections::HashMap::new(),
+                    kv.clone(),
+                    only_js::bridge::SchemaRegistry::new(),
+                    false,
+                    Some(Arc::new(only_js::bridge::LoaderShared {
+                        project_root: root.clone(),
+                        ts: true,
+                    })),
+                    only_js::bridge::Extras {
+                        tasks_flag: Some(flag.clone()),
+                        ..Default::default()
+                    },
+                )
+            }) as Arc<dyn Fn() -> Bridge + Send + Sync>
+        };
+        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        let pool = tasking.pool.expect("pooled tasks must assemble a pool");
+        // 轮询：两个任务的 kv 计数都 ≥3（10s 宽限，远超 100ms 轮间节奏）。
+        for name in ["alpha", "beta"] {
+            let key = format!("{name}:n");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let n = kv
+                    .get(&key)
+                    .await
+                    .unwrap()
+                    .map(|s| s.parse::<u64>().unwrap_or(0))
+                    .unwrap_or(0);
+                if n >= 3 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "task {name} starved: kv.{key} = {n}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                kv.get(&format!("{name}:up")).await.unwrap().as_deref(),
+                Some("1")
+            );
+        }
+        // 注册表两条 long 条目；两任务很可能同 Worker（workers=4，2 任务各自独占）。
+        let longs: Vec<String> = pool
+            .registry
+            .list()
+            .into_iter()
+            .filter(|e| matches!(e.kind, only_js::bridge::task_pool::TaskKind::Long))
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(longs, vec!["alpha".to_string(), "beta".to_string()]);
+        flag.store(true, Ordering::Relaxed);
+        pool.shutdown_and_join();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD（PRD v2 §6.4）：crontab.yaml（tasks.dir 相对）行级错误 fail-fast 带行号；
+    /// 合法行注册 cron 条目；与池化任务同名拒启。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_crontab_when_assemble_then_cron_registered_and_bad_line_fails() {
+        let d = tmpdir("cron");
+        std::fs::create_dir_all(d.join("tasks/task")).unwrap();
+        std::fs::create_dir_all(d.join("tasks/jobs")).unwrap();
+        std::fs::write(
+            d.join("tasks/task/crontab.yaml"),
+            "*/5 * * * * ./jobs/xx.ts\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("tasks/jobs/xx.ts"), "export {};\n").unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let make_bridge = test_bridge_factory(&d, flag.clone());
+        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag).unwrap();
+        let pool = tasking.pool.expect("cron entry must assemble a pool");
+        let e = pool.registry.get("xx").expect("cron entry registered");
+        assert!(matches!(
+            e.kind,
+            only_js::bridge::task_pool::TaskKind::Cron { .. }
+        ));
+        pool.shutdown_and_join();
+        let _ = std::fs::remove_dir_all(&d);
+
+        // 坏行：行号 + 错误文案 fail-fast。
+        let d2 = tmpdir("cron-bad");
+        std::fs::create_dir_all(d2.join("tasks/task")).unwrap();
+        std::fs::write(d2.join("tasks/task/crontab.yaml"), "# ok\n*/5 * * * *\n").unwrap();
+        let flag2 = Arc::new(AtomicBool::new(false));
+        let make_bridge2 = test_bridge_factory(&d2, flag2.clone());
+        let e = assemble_tasking(&cfg("tasks", 64), &d2, make_bridge2, flag2)
+            .err()
+            .unwrap();
+        assert!(e.contains(":2:"), "{e}");
+        let _ = std::fs::remove_dir_all(&d2);
+
+        // 与池化任务同名：拒启（cron 行不许吞掉池化任务）。
+        let d3 = tmpdir("cron-dup");
+        std::fs::create_dir_all(d3.join("tasks/task")).unwrap();
+        std::fs::create_dir_all(d3.join("tasks/jobs")).unwrap();
+        std::fs::write(
+            d3.join("tasks/task/crontab.yaml"),
+            "* * * * * ./jobs/watch.ts\n",
+        )
+        .unwrap();
+        std::fs::write(d3.join("tasks/jobs/watch.ts"), "export {};\n").unwrap();
+        std::fs::write(
+            d3.join("tasks/task_watch.ts"),
+            "export async function loop_body() {}\n",
+        )
+        .unwrap();
+        let flag3 = Arc::new(AtomicBool::new(false));
+        let make_bridge3 = test_bridge_factory(&d3, flag3.clone());
+        let e = assemble_tasking(&cfg("tasks", 64), &d3, make_bridge3, flag3)
+            .err()
+            .unwrap();
+        assert!(e.contains("duplicates a pool task"), "{e}");
+        let _ = std::fs::remove_dir_all(&d3);
     }
 }

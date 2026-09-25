@@ -686,6 +686,80 @@ curl http://localhost:9778/v1/api/user/42
 
 ---
 
+## 场景 10：池化长任务 + cron（v0.1.28）
+
+> 何时用我：写一个每轮被驱动的心跳/对账任务，或按 crontab 定时跑一段 JS。
+> 需要长轮询（一次等几秒以上）的 MQ 消费 → 仍用场景见 §6 TLA 写法。
+
+### ① 任务文件（命名导出三钩子）
+
+`src/tasks/task_watch.ts`（导出 `loop_body` 即自动走池化，与存量 TLA 任务共存）：
+
+```ts
+export async function setup() {
+  log.info("watch connected");
+}
+export async function loop_body() {
+  // 每轮被 worker 调用一次；单轮须 < tasks.pool.loop_body_timeout_ms（默认 5s）
+  const n = (await kv.get("watch:last")) ?? "0";
+  await kv.set("watch:last", String(Number(n) + 1));
+}
+export async function teardown() {
+  log.info("watch down");
+}
+```
+
+不需要 `tasks.stopping()` 轮询与 `tasks.sleep()`：返回即一轮结束；每轮之间框架按
+`tasks.pool.interval_ms`（默认 100ms）sleep 再调下一轮（防空转）；停机时先跑
+`teardown` 再退出（teardown 尽力而为，超时不保证跑完）。
+
+### ② cron 清单（脚本式任务）
+
+`src/tasks/task/crontab.yaml`（`tasks.crontab` 配置，默认即此路径；文件与条目路径
+都相对 `tasks.dir`）：
+
+```yaml
+# 分 时 日 月 周  任务文件（相对 tasks.dir）
+*/5 * * * *  ./jobs/report.ts   # 每 5 分钟跑一次 report.ts
+30 2 * * 1   ./jobs/backup.ts   # 每周一 02:30
+```
+
+cron 文件**不是三钩子任务**——到点整模块跑一次（顶层 await 即执行体，如
+`export {}; await kv.set("report:runs", …)`），跑完释放 Worker。命名用普通文件名
+（`jobs/report.ts`）：用 `task_*.ts` 会被扫描器同时收编成长任务，同名拒启。
+5 字段自研解析（`*/n`、列表、区间；周字段 7=周日）。坏行启动 fail-fast（报错带
+`:行号:`）。cron 任务的启停/改表达式走管理面 `enable`/`disable`/`PATCH {cron}`，
+**不要**对 cron 任务用 `/start`（400）。
+
+### ③ 管理 API（鉴权/租户头与业务路由同语义）
+
+```bash
+BASE=http://localhost:9778/v1/api
+curl -H "Authorization: Bearer $TOKEN" "$BASE/tasks"                 # 清单 ?type=long|cron
+curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/tasks/watch/stop"
+curl -X POST -H "Authorization: Bearer $TOKEN" "$BASE/tasks/report/run-once"  # 仅 cron
+curl -H "Authorization: Bearer $TOKEN" "$BASE/tasks/watch/logs?limit=20"
+curl -X PATCH -H "Authorization: Bearer $TOKEN" \
+     -d '{"cron":"*/10 * * * *"}' "$BASE/tasks/report"              # 仅接受 {enabled, cron}
+```
+
+事件信封 `{eventId, eventType, timestamp, payload}`；内存池 = JSONL 日志
+（`tasks.event_log.path`，超 `max_mb` 轮转）+ 1000 条环形缓冲，`logs` 端点读环形缓冲。
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 跑几轮就 `failed` 再重连 | 单轮 `loop_body` 超 5s 看门狗 → teardown + failed 退避——长轮询任务别用池化 |
+| `tasks.stopping()` 在池化任务里恒 false | 池化由 worker 逐轮驱动，无停机轮询语义；要阻塞等待的任务用 TLA 模式 |
+| 改 `loop_body` 没生效 | 任务无热重载——管理面 `POST {base}/tasks/{name}/reload` 重连单个任务，或重启进程 |
+| `start`/`stop` 对 cron 报 400 | 跨 kind 命令被拒：cron 用 `enable`/`disable`，long 用 `start`/`stop` |
+| `run-once` 报 400/409/503 | 对 long 任务报 400（run-once 仅 cron）；任务正在运行 409；本实例无任务池 503（纯 TLA 部署） |
+| 任务池 CPU 高 / `runCount` 涨得快 | 轮率由 `tasks.pool.interval_ms` 决定（默认 100ms≈10 轮/s/任务，`0` = 不限制）。实测无节奏 4 任务聚合 24.8 万轮/s、CPU 134%（多核空转）。需要更快先算写放大（轮率 × 每轮 kv/db/日志 IO），并把每轮做成增量（kv 存游标），别全量扫 |
+| crontab 改完没反应 | cron 表达式经 `PATCH {base}/tasks/{name}` 改的是注册表；文件仍是重启后的事实源 |
+
+---
+
 ## 相关文档
 
 - `api-manual.md` —— 完整 API 手册（13 章）

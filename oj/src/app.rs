@@ -65,6 +65,11 @@ pub struct App {
     tasks_flag: Arc<std::sync::atomic::AtomicBool>,
     /// 任务 Bridge 工厂（tasks_flag = Some(flag)；与 actor 工厂共享全部后端 Arc）。
     make_task_bridge: Arc<dyn Fn() -> Bridge + Send + Sync>,
+    /// 鉴权守卫句柄（任务管理 API 复用同一守卫，PRD v2 FR-API-AUTH-001）。
+    auth_guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
+    /// 租户头配置（任务管理 API 同管线语义）。
+    tenant_header: Option<String>,
+    tenant_anon: Vec<String>,
 }
 
 /// dispatch 外层超时（handler 死循环 KillSwitch 兜底 server.timeout，这里再兜底测试 task）。
@@ -964,7 +969,7 @@ impl App {
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
-            auth,
+            auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,
             blob: blob.clone(),
         };
@@ -1042,6 +1047,9 @@ impl App {
             base,
             tasks_flag,
             make_task_bridge,
+            auth_guard: auth,
+            tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
+            tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
         })
     }
 
@@ -1091,6 +1099,26 @@ impl App {
     /// 长任务停机 flag（server_cmd 信号处理器置位）。
     pub fn tasks_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.tasks_flag.clone()
+    }
+
+    /// 合并附加路由（PRD v2 任务管理 API：装配在 from_config 之后，经此挂进主 router）。
+    pub fn merge_router(&mut self, r: Router) {
+        self.router = self.router.clone().merge(r);
+    }
+
+    /// 任务管理 API 装配状态（server_cmd 组装 `{base}/tasks` 路由用）。
+    pub fn tasks_api_state(
+        &self,
+        registry: Arc<only_js::bridge::task_pool::TaskRegistry>,
+        pool: Option<Arc<only_js::bridge::task_pool::TaskPool>>,
+    ) -> server::tasks::TasksApiState {
+        server::tasks::TasksApiState {
+            registry,
+            pool,
+            auth: self.auth_guard.clone(),
+            tenant_header: self.tenant_header.clone(),
+            tenant_anon: self.tenant_anon.clone(),
+        }
     }
 
     /// 停机排空在途邮件（spec §6 ⑤「停机 graceful drain」）：SIGTERM/正常退出的停机路径调用
