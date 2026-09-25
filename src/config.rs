@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// 多静态站点条目（v0.1.27，`server.static_sites`）：前缀→目录映射。
+/// `prefix` 规范化见 server_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
+/// `path` 相对 config 目录（CLI `--app-path prefix=dir` 给出的已按 CWD 预绝对化）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct StaticSiteConf {
+    pub prefix: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerCfg {
@@ -22,6 +31,10 @@ pub struct ServerCfg {
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
     /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（server_cmd 预绝对化后写入）。
     pub app_path: Option<String>,
+    /// 多静态站点（v0.1.27）：前缀→目录映射列表。与 (app_prefix, app_path) 主站点
+    /// 共存；规范化后前缀重复 → 启动 fail-fast。缺省空。
+    #[serde(default)]
+    pub static_sites: Vec<StaticSiteConf>,
     /// SPA 深链接回落（v0.1.20）：静态未命中 + 无扩展名 + Accept html + 不在 api_prefix
     /// 下 → 送 `<app_path>/index.html`。**默认 false** —— 静默把 404 变 200 会掩盖错配
     /// （拼错的 API 路径、丢掉的静态资源），故 SPA 工程显式开启。
@@ -94,6 +107,7 @@ impl Default for ServerCfg {
             api_prefix: "/v1/api".into(),
             app_prefix: "/".into(),
             app_path: None,
+            static_sites: Vec::new(),
             app_spa_fallback: false,
             html_meta: None,
             html_meta_handler: None,
@@ -840,6 +854,35 @@ mod tests {
         assert_eq!(c.server.app_path.as_deref(), Some("public"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_sites_parse_and_default() {
+        // 缺省为空表。
+        assert!(ServerCfg::default().static_sites.is_empty());
+        // round-trip：前缀→目录两条（含 "/" 兜底站点）。
+        let dir = std::env::temp_dir().join(format!("ojcfgsites-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "server:\n  static_sites:\n    - { prefix: /docs, path: d1 }\n    - { prefix: /, path: d2 }\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(
+            c.server.static_sites,
+            vec![
+                StaticSiteConf {
+                    prefix: "/docs".into(),
+                    path: "d1".into()
+                },
+                StaticSiteConf {
+                    prefix: "/".into(),
+                    path: "d2".into()
+                },
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
