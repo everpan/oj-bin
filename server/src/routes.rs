@@ -218,16 +218,32 @@ impl RouteTable {
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/");
+            // v0.1.27：fs 段 `_name_` → `{name}`（rel 已归一为正斜杠；逐段转换，含模块段）。
             let dir_base = if rel.is_empty() {
                 format!("/{b}")
             } else {
-                format!("/{b}/{rel}")
+                let conv = rel
+                    .split('/')
+                    .map(fs_seg_to_pattern)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                format!("/{b}/{conv}")
             };
             for (method, route) in decls {
                 if !METHODS.contains(&method.as_str()) {
                     continue;
                 }
                 let route = route.filter(|r| !r.is_empty()); // "" 视同未挂
+                if let Some(r) = &route {
+                    // v0.1.27 告警：`_name_` 是 fs 目录写法；`.route` 值是 matchit 语法，
+                    // `_name_` 在其中是字面段。warning: 前缀由消费方分流（见 app.rs 打印循环）。
+                    if r.split('/').any(looks_like_underscore_param) {
+                        failures.push(format!(
+                            "warning: {method} {}: .route value {r:?} looks like `_name_` fs-param syntax; in .route it stays a literal segment (use {{name}} for params)",
+                            file.display()
+                        ));
+                    }
+                }
                 let pattern = match &route {
                     None => dir_base.clone(),
                     Some(r) if r.starts_with('/') => format!("/{b}{r}"), // 根级（base 根下）
@@ -657,6 +673,89 @@ mod tests {
         // 宽松判定（告警用）与严格转换的区别
         assert!(looks_like_underscore_param("__x__")); // 宽松命中……
         assert_eq!(fs_seg_to_pattern("__x__"), "__x__"); // ……但严格转换拒绝
+    }
+
+    #[test]
+    fn table_underscore_dir_becomes_param() {
+        let (t, f) = tbl(&["user/_id_/api.ts"], &[("user/_id_/api.ts", "get", "")]);
+        assert!(f.is_empty(), "{f:?}");
+        match t.lookup("/v1/api/user/42", "GET") {
+            Lookup::Hit { file, params } => {
+                assert!(file.ends_with("_id_/api.ts"), "{file:?}");
+                assert_eq!(params["id"], "42");
+            }
+            other => panic!("{}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn table_underscore_dir_static_sibling_priority() {
+        let (t, f) = tbl(
+            &["x/_pk_/api.ts", "x/me/api.ts"],
+            &[("x/_pk_/api.ts", "get", ""), ("x/me/api.ts", "get", "")],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        match t.lookup("/v1/api/x/me", "GET") {
+            Lookup::Hit { file, params } => {
+                assert!(file.ends_with("x/me/api.ts"), "{file:?}");
+                assert!(params.is_empty(), "{params:?}");
+            }
+            other => panic!("{}", kind(&other)),
+        }
+        match t.lookup("/v1/api/x/42", "GET") {
+            Lookup::Hit { params, .. } => assert_eq!(params["pk"], "42"),
+            other => panic!("{}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn table_same_level_underscore_params_conflict() {
+        // 同层异名 `_x_` = matchit 同位异名参数 → 结构性冲突，后者丢弃。
+        let (t, f) = tbl(
+            &["u/_aa_/api.ts", "u/_bb_/api.ts"],
+            &[("u/_aa_/api.ts", "get", ""), ("u/_bb_/api.ts", "get", "")],
+        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("invalid route"), "{f:?}");
+        assert!(matches!(t.lookup("/v1/api/u/1", "GET"), Lookup::Hit { .. }));
+    }
+
+    #[test]
+    fn table_underscore_dir_plus_relative_route() {
+        let (t, f) = tbl(&["u/_id_/api.ts"], &[("u/_id_/api.ts", "get", "{sub}")]);
+        assert!(f.is_empty(), "{f:?}");
+        match t.lookup("/v1/api/u/42/99", "GET") {
+            Lookup::Hit { params, .. } => {
+                assert_eq!(params["id"], "42");
+                assert_eq!(params["sub"], "99");
+            }
+            other => panic!("{}", kind(&other)),
+        }
+    }
+
+    #[test]
+    fn table_brace_dir_conflicts_with_underscore_dir() {
+        // `{id}` 字面目录今天已意外可用；与 `_id_` 同 pattern 同方法 → 冲突钉死 500。
+        let (t, f) = tbl(
+            &["u/{id}/api.ts", "u/_id_/api.ts"],
+            &[("u/{id}/api.ts", "get", ""), ("u/_id_/api.ts", "get", "")],
+        );
+        assert!(f.iter().any(|s| s.contains("route conflict")), "{f:?}");
+        assert!(matches!(
+            t.lookup("/v1/api/u/1", "GET"),
+            Lookup::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn table_route_value_underscore_shape_warns() {
+        // `.route = "_id_"` 是字面段（不转换），但须给出 warning: 前缀告警。
+        let (t, f) = tbl(&["u/api.ts"], &[("u/api.ts", "get", "_id_")]);
+        assert!(f.iter().any(|s| s.starts_with("warning:")), "{f:?}");
+        match t.lookup("/v1/api/u/_id_", "GET") {
+            Lookup::Hit { params, .. } => assert!(params.is_empty(), "{params:?}"),
+            other => panic!("{}", kind(&other)),
+        }
     }
 
     // ----- RouteTable（纯逻辑，假内省闭包） -----
