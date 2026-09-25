@@ -111,8 +111,10 @@ release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码�
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
 **后台运行**：加 `--daemon` 脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向
 空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`。
-**准入门（三态，无静默默认）**：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
-至少显式指定其一，否则退出；两者皆指定 → 都必须存在；仅指定其一 → 只启用对应功能。
+**准入门（三态，无静默默认）**：`--api-path` 与静态站点（`server.app_path` /
+`server.static_sites` / `--app-path`）至少显式指定其一，否则退出；`--api-path` 指定了
+就必须存在；静态站点目录存在性由装配期站点表解析统一 fail-fast（重复前缀/缺失目录
+报错含具体来源）。
 
 验证信封返回：
 
@@ -411,7 +413,8 @@ export default { get: detail };
 
 解析顺序：路由表（含 `.route` 参数路由与 `_name_` 目录参数）→ dev 目录镜像兜底
 （dev 模式，表外文件可经 `_x_` 目录下降并提取参数）→
-静态站点（`server.app_path`，`server.app_prefix` 前缀内（默认 `/`），仅 GET/HEAD）→ 404。API 永远优先于静态文件。
+静态站点（`server.app_path` 或 v0.1.27 多站点 `server.static_sites`——最长前缀命中，
+`app_prefix`/`prefix` 前缀内，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
 ### ws.ts（WebSocket 生命周期钩子）
@@ -1812,12 +1815,13 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
 | `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
-| `app_path` | 无 | 静态站点根目录；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；目录不存在启动即报错；穿越段（含 `%2F`）404；无 Range/ETag（经前置反代补）。**准入门**：`--api-path` 与本项至少显式指定其一，两者皆指定则都必须存在 |
+| `app_path` | 无 | 静态站点根目录（legacy 主站点，前缀取 `app_prefix`）；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 裸值相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；穿越段（含 `%2F`）404；无 Range/ETag（经前置反代补）。多站点见 `static_sites`（v0.1.27）；目录存在性归装配期统一 fail-fast |
 | `app_spa_fallback` | `false` | （v0.1.20）SPA 深链回落：静态未命中 + 无扩展名 + `Accept` 含 `text/html`/`*/*`/缺失 + **不在 `api_prefix` 下** → 送 `<app_path>/index.html`。默认关是刻意的：静默把 404 变 200 会掩盖错配（拼错的资源路径） |
 | `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对 `app_path`）：送 HTML 前读 `<app_path>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
 | `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
 | `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
 | `app_prefix` | `"/"` | 静态站点前缀；默认 `/` = 全路径兜底（与旧版一致）。设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；API 路由永远优先。必须以 `/` 开头，否则启动报错 |
+| `static_sites` | `[]` | （v0.1.27）**多静态站点** `prefix→dir` 列表，如 `[{prefix: "/docs", path: "dist/docs"}]`；`path` 相对 config 目录。请求期**最长前缀命中**（`/docs/api/x` 胜过 `/`），命中站内未命中 **不跨站**回落（SPA 回落/meta JSON 均按命中站各自的根）。归一后前缀重复或目录缺失 → 启动报错。与 legacy `app_path`+`app_prefix` 对（视作一条站点）并存；CLI `--app-path prefix=dir` 可重复，同前缀覆盖 config 条目 |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） | |
@@ -1832,6 +1836,11 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 
 静态托管只做三件事：按目录镜像发文件（含 SPA 壳）、可选深链回落、可选按路由注入 `<head>`。
 **平台不引入 SSR 运行时**——注入的是「壳 + 一个 JSON 键值表」，不是服务端渲染的页面。
+
+> **多站点（v0.1.27）**：`server.static_sites` 配多个 `prefix→dir` 站点后，下文的
+> `app_path` 均按**命中站点**理解——meta JSON 目录、SPA 回落的 `index.html` 都读命中站
+> 自己的根；命中站内未命中**不跨站**回落到别的站点。最长前缀命中（`/docs/api/x` 胜过
+> `/` 站），`http.query.path` 是已剥**命中站点前缀**的站内路径。
 
 > **注入是「替换」不是「追加」**：浏览器与爬虫只认**第一个** `<title>` / 同名 `<meta>`，
 > 所以注入前会先把 head 里**同名**的既有标签摘掉（`<title>`、`description`、`canonical`、
@@ -2095,9 +2104,9 @@ vars:
 | `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出 |
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
-| `neither api path … specified` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式指定其一 |
-| `api path not found: …` / `static site dir not found: …` | 指定了 api / 静态目录但不存在（皆指定时两者都必须存在） |
-| `server.app_path` 目录不存在 | 启动报错退出 |
+| `neither api path … specified` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `server.static_sites` / `--app-path`）至少显式指定其一 |
+| `api path not found: …` | `--api-path` 指定了就必须存在（静态站点存在性不在此判，见下行） |
+| `静态站点前缀 … 重复：… 与 … 冲突` / `server.static_sites[prefix=…]: 静态目录 …: No such file or directory` | （v0.1.27）装配期站点表解析 fail-fast：归一后前缀重复（报错含两条来源）或站点目录缺失/非目录 |
 | `server.html_meta_handler` 未命中 GET 路由 | `server.html_meta_handler: "…" 不在路由表（拼错了？）` / `未映射 GET 方法` 退出（v0.1.25；后果只在爬虫侧可见，故不留到运行期） |
 | `vars:` 段值不是标量（嵌套 map/list） | 解析期报错（值只能是字符串/数字/布尔） |
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
@@ -2358,6 +2367,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `manifest.yaml` 只能出现在模块根 | 嵌套声明会改写 `#` 别名的锚点 → S008 fail |
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
 | 静态站点无目录列表 / Range / ETag | 未知扩展名按 `application/octet-stream`；SPA 深链回落需显式开 `server.app_spa_fallback: true`（v0.1.20，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；Range/ETag 经前置反代补 |
+| 多静态站点（v0.1.27） | 前缀归一后重复（含 legacy `app_path` 对与 `static_sites` 撞前缀）→ 启动报错（报两条来源）；站点目录缺失/非目录 → 启动报错；命中站内 miss **不跨站**回落；`/` 前缀最多一条（归一后 dup 即报错）；`spa_fallback`/`html_meta`/`html_cache_control` 是全局开关，对各站点一致生效（无 per-site 配置） |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |

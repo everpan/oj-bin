@@ -420,7 +420,12 @@ mod tests {
                 a.api_path.as_deref(),
                 a.app_path.as_slice()
             ),
-            ("c.yaml", Some("/api"), Some("src"), &["web".to_string()][..])
+            (
+                "c.yaml",
+                Some("/api"),
+                Some("src"),
+                &["web".to_string()][..]
+            )
         );
         // v0.1.27：--app-path 可重复（裸 dir + prefix=dir 混合）
         let Command::Server(a) = cmd(&[
@@ -434,7 +439,10 @@ mod tests {
         ]) else {
             panic!()
         };
-        assert_eq!(a.app_path, vec!["web".to_string(), "/docs=dist/docs".to_string()]);
+        assert_eq!(
+            a.app_path,
+            vec!["web".to_string(), "/docs=dist/docs".to_string()]
+        );
     }
 
     #[test]

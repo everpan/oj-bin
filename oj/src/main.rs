@@ -138,7 +138,7 @@ mod tests {
             config: "no-such-config.yaml".into(),
             base: None,
             api_path: None,
-            app_path: None,
+            app_path: Vec::new(),
             cert_path: None,
             key_path: None,
             console_log: false,

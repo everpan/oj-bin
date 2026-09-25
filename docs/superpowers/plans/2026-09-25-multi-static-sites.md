@@ -68,7 +68,7 @@
 
 **Files:** Modify: `oj/tests/e2e.rs`、`CHANGELOG.md`、`docs/devkit/api-manual.md`、`docs/devkit/SKILL.md`、`docs/dev-guide.md`、`docs/devkit/README.md`；`cargo xtask build` 归置。
 
-- [ ] e2e：config `server.static_sites: [{prefix:/docs,path:d1},{prefix:/,path:d2}]` 起服；curl `/docs/a.txt`→d1、`/b.txt`→d2、`/docs`（前缀根→index.html）；最长前缀用 `/docs` miss+spa 回落验证不跨站
-- [ ] CHANGELOG v0.1.27 特性条；api-manual 配置章静态站点节（static_sites 语法/最长前缀/不跨站）+ 限制表（前缀重复 fail-fast、`/` 唯一）；SKILL.md 一条；dev-guide 一句；devkit README 行
-- [ ] `cargo xtask build` + `cargo test --release -p xtask` + workspace 全量 + fmt + clippy
-- [ ] 全部提交（以 v0.1.27 正式提交）
+- [x] e2e：config `server.static_sites: [{prefix:/docs,path:d1},{prefix:/,path:d2}]` 起服；curl `/docs/a.txt`→d1、`/b.txt`→d2、`/docs`（前缀根→index.html）；最长前缀用 `/docs` miss+spa 回落验证不跨站
+- [x] CHANGELOG v0.1.27 特性条；api-manual 配置章静态站点节（static_sites 语法/最长前缀/不跨站）+ 限制表（前缀重复 fail-fast、`/` 唯一）；SKILL.md 一条；dev-guide 一句；devkit README 行
+- [x] `cargo xtask build` + `cargo test --release -p xtask` + workspace 全量 + fmt + clippy
+- [x] 全部提交（以 v0.1.27 正式提交）
