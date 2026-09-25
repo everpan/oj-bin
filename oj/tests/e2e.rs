@@ -414,6 +414,51 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn underscore_dir_param_dev_serves_and_release_round_trips() {
+    let _g = lock();
+    // v0.1.27：`_name_` 目录段即路径参数，dev 建表与 release routes.js 同口径。
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/_id_/api.ts",
+            "export default { get() { json.ok({ id: http.param(\"id\") }); } };\n",
+        ),
+    ]);
+    // dev：路由表（matchit）命中 `_id_` 目录 → `{id}` 参数
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/42", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["id"], "42", "{v}");
+    // 字面 `_id_` URL 被参数吃掉（实参值 "_id_"），不 404
+    let (s, v) = req(addr, "GET", "/v1/api/u/_id_", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["id"], "_id_", "{v}");
+    drop(_h);
+    // build → release 直载：同口径
+    let a = BuildArgs {
+        module: Some("u".into()),
+        config: "config.yaml".into(),
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+        minify: true,
+        check: false,
+    };
+    oj::build_cmd::run(&a).await.unwrap();
+    let routes = std::fs::read_to_string(t.join("dist/u-0.1.0/routes.js")).unwrap();
+    assert!(routes.contains("\"u/{id}\""), "{routes}");
+    assert!(routes.contains("\"_id_/api.js\""), "{routes}");
+    let (addr, _h) = server_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/42", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["id"], "42", "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_then_release_serves_end_to_end() {
     let _g = lock();
     // 夹具：两个模块（user 0.1.0 带 .route、other 0.9.0 纯镜像）
