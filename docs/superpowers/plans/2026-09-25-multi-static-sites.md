@@ -60,9 +60,9 @@
 - Consumes: Task 1-3 全部。
 - Produces: `fn resolve_static_sites(cfg: &Config, config_dir: &Path) -> Result<Vec<server::StaticSite>, String>`——legacy 对 + static_sites 逐条；前缀 `resolve_app_prefix` 规范化；重复前缀 Err（含两条来源）；路径 `canonicalize`（缺失 Err）；排序移交 `app()`（此处不排）。
 
-- [ ] 实现 + from_config 接线（`server::app(...)` 实参换 `static_sites`）
-- [ ] 测试（app.rs tests）：legacy 单站点兼容（app_path+prefix 产一条）；static_sites 两条；重复前缀（app_path 对 vs static_sites 同前缀）Err 且文案含来源；缺失目录 Err
-- [ ] `cargo test --release -p oj` + commit
+- [x] 实现 + from_config 接线（`server::app(...)` 实参换 `static_sites`）
+- [x] 测试（app.rs tests）：legacy 单站点兼容（app_path+prefix 产一条）；static_sites 两条；重复前缀（app_path 对 vs static_sites 同前缀）Err 且文案含来源；缺失目录 Err
+- [x] `cargo test --release -p oj` + commit
 
 ### Task 5: e2e + 文档 + v0.1.27 正式提交
 

@@ -524,23 +524,64 @@ fn validate_html_meta_handler(cfg: &Config, table: &routes::RouteTable) -> Resul
     }
 }
 
-/// 静态站点根（装配第 20 步）：config `server.app_path` 相对 config_dir 绝对化（CLI
-/// `--app-path` 覆盖值已在 server_cmd 按 CWD 预绝对化，此处见到的即绝对路径）；
-/// 目录缺失 → fail-fast。
-fn resolve_static_root(cfg: &Config, config_dir: &Path) -> Result<Option<PathBuf>, String> {
-    let Some(r) = &cfg.server.app_path else {
-        return Ok(None);
-    };
+/// 静态站点目录绝对化 + canonicalize（缺失/非目录 → fail-fast）。
+fn static_dir(config_dir: &Path, r: &str) -> Result<PathBuf, String> {
     let p = Path::new(r);
     let p = if p.is_absolute() {
         p.to_path_buf()
     } else {
         config_dir.join(p)
     };
-    let p = p
-        .canonicalize()
-        .map_err(|e| format!("server.app_path {}: {e}", p.display()))?;
-    Ok(Some(p))
+    p.canonicalize()
+        .map_err(|e| format!("静态目录 {}: {e}", p.display()))
+}
+
+/// 有效静态站点表（装配第 20 步，v0.1.27 多站点）：legacy `(app_prefix, app_path)` 对 +
+/// `server.static_sites` 逐条 → `Vec<StaticSite>`。前缀经 `resolve_app_prefix` 归一；
+/// 归一后重复 → Err（报两条来源）；目录相对 config_dir 绝对化 + canonicalize。
+/// **不排序**——最长前缀优先的排序归 `server::app()` 独家负责。
+fn resolve_static_sites(
+    cfg: &Config,
+    config_dir: &Path,
+) -> Result<Vec<server::StaticSite>, String> {
+    let mut out = Vec::new();
+    // 归一前缀 → 来源描述（dup 报错要报两条来源）。
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let push = |prefix: &str,
+                path: &str,
+                source: &str,
+                out: &mut Vec<server::StaticSite>,
+                seen: &mut Vec<(String, String)>|
+     -> Result<(), String> {
+        let p = crate::server_cmd::resolve_app_prefix(prefix)
+            .map_err(|e| format!("{source}: prefix {prefix:?}: {e}"))?;
+        if let Some((_, prev)) = seen.iter().find(|(q, _)| *q == p) {
+            return Err(format!("静态站点前缀 {p} 重复：{source} 与 {prev} 冲突"));
+        }
+        seen.push((p.clone(), source.to_string()));
+        let root = static_dir(config_dir, path).map_err(|e| format!("{source}: {e}"))?;
+        out.push(server::StaticSite { prefix: p, root });
+        Ok(())
+    };
+    if let Some(app_path) = &cfg.server.app_path {
+        push(
+            &cfg.server.app_prefix,
+            app_path,
+            "server.app_path（前缀取 server.app_prefix）",
+            &mut out,
+            &mut seen,
+        )?;
+    }
+    for s in &cfg.server.static_sites {
+        push(
+            &s.prefix,
+            &s.path,
+            &format!("server.static_sites[prefix={}]", s.prefix),
+            &mut out,
+            &mut seen,
+        )?;
+    }
+    Ok(out)
 }
 
 /// 证书加载 + 校验 + 热加载 watcher（装配第 21 步）。启动期 `Expired`（宽限已过）→ 拒启；
@@ -585,7 +626,7 @@ impl App {
     ///
     /// 23 步的顺序即语义（见 [docs/modules/04-oj-cli.md]）；其中自成一体的步骤已抽为
     /// 私有函数（connect_kv / ownership_deny_of / build_schema_and_modules /
-    /// build_jwt_and_oidc / resolve_static_root / load_cert_with_watcher）。
+    /// build_jwt_and_oidc / resolve_static_sites / load_cert_with_watcher）。
     #[allow(clippy::too_many_lines)]
     pub async fn from_config(
         cfg: Config,
@@ -912,18 +953,10 @@ impl App {
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
-        // 静态站点根（server.app_path）：相对 config_dir 绝对化（CLI --app-path 已按 CWD 预绝对化）；缺失目录 fail-fast。
-        let static_root = resolve_static_root(&cfg, config_dir)?;
-        // 静态站点前缀（server.app_prefix，默认 "/"）：归一 + 非法值 fail-fast。
-        let app_prefix = crate::server_cmd::resolve_app_prefix(&cfg.server.app_prefix)?;
-        // v0.1.27 多站点过渡期：legacy 单站点包装成单元素表（Task 4 换 resolve_static_sites）。
-        let static_sites = static_root
-            .map(|root| server::StaticSite {
-                prefix: app_prefix.clone(),
-                root,
-            })
-            .into_iter()
-            .collect();
+        // 静态站点表（装配第 20 步，v0.1.27 多站点）：legacy (app_prefix, app_path) 对 +
+        // server.static_sites 逐条；前缀归一 + dup fail-fast（报两条来源）+ 目录
+        // canonicalize（缺失 fail-fast）。最长前缀排序归 server::app()。
+        let static_sites = resolve_static_sites(&cfg, config_dir)?;
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
@@ -1164,7 +1197,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 无 ext_boot.js（现网默认）→ None（静默）；存在 → 冻结 `?v=<mtime>`。
+    // ---- v0.1.27：多静态站点有效站点表 ----
+
+    fn tmp_dirs(names: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+        let base = std::env::temp_dir().join(format!("oj-sites-{}-{names:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs: Vec<PathBuf> = names
+            .iter()
+            .map(|n| {
+                let d = base.join(n);
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        (base, dirs)
+    }
+
+    #[test]
+    fn resolve_static_sites_legacy_and_list() {
+        // legacy 单站点（app_path + app_prefix）产一条，前缀归一。
+        let (base, dirs) = tmp_dirs(&["app", "docs", "root"]);
+        let mut cfg = Config::default();
+        cfg.server.app_path = Some(dirs[0].to_string_lossy().into());
+        cfg.server.app_prefix = "/app/".into(); // 尾斜杠归一 → /app
+        let sites = resolve_static_sites(&cfg, &base).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].prefix, "/app");
+        assert_eq!(sites[0].root, dirs[0].canonicalize().unwrap());
+
+        // static_sites 两条（含 `/` 兜底）。
+        let mut cfg = Config::default();
+        cfg.server.static_sites = vec![
+            only_js::config::StaticSiteConf {
+                prefix: "/docs".into(),
+                path: dirs[1].to_string_lossy().into(),
+            },
+            only_js::config::StaticSiteConf {
+                prefix: "/".into(),
+                path: dirs[2].to_string_lossy().into(),
+            },
+        ];
+        let sites = resolve_static_sites(&cfg, &base).unwrap();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].prefix, "/docs");
+        assert_eq!(sites[1].prefix, "/");
+
+        // 未配置 → 空表（不开静态服务）。
+        assert!(
+            resolve_static_sites(&Config::default(), &base)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_static_sites_dup_prefix_and_missing_dir_fail_fast() {
+        let (base, dirs) = tmp_dirs(&["app", "docs"]);
+        // dup：legacy 对归一后与 static_sites 同前缀 → Err 且报两条来源。
+        let mut cfg = Config::default();
+        cfg.server.app_path = Some(dirs[0].to_string_lossy().into());
+        cfg.server.app_prefix = "/docs/".into();
+        cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
+            prefix: "/docs".into(),
+            path: dirs[1].to_string_lossy().into(),
+        }];
+        let e = resolve_static_sites(&cfg, &base).unwrap_err();
+        assert!(e.contains("重复") && e.contains("server.app_path"), "{e}");
+        assert!(e.contains("static_sites"), "{e}");
+
+        // 缺失目录 → Err（canonicalize fail-fast）。
+        let mut cfg = Config::default();
+        cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
+            prefix: "/x".into(),
+            path: "no-such-dir".into(),
+        }];
+        let e = resolve_static_sites(&cfg, &base).unwrap_err();
+        assert!(e.contains("no-such-dir"), "{e}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn ext_boot_spec_absent_vs_present() {
         let dir = std::env::temp_dir().join(format!("oj-bootspec-{}", std::process::id()));
