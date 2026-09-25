@@ -62,8 +62,9 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     cfg.tenant = Default::default();
     cfg.auth = None;
     // sample/config.yaml 的 app_path: "dist" 指向仓库内产物目录（已停止跟踪，CI
-    // 新克隆无此目录）——e2e UC 不覆盖静态兜底（静态归 server/server_cmd 单测），
-    // 显式关闭，避免 resolve_static_root 因目录缺失 fail-fast。
+    // 新克隆无此目录）——boot() 的 UC 不覆盖静态兜底（多站点静态有专属 e2e，见
+    // multi_static_sites_serve_by_longest_prefix_end_to_end），显式关闭，避免
+    // resolve_static_sites 因目录缺失 fail-fast。
     cfg.server.app_path = None;
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = server::test_support::now_secs();
@@ -1024,6 +1025,68 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+// —— 多静态站点（v0.1.27）：server.static_sites prefix→dir，最长前缀命中，站内 miss 不跨站 —— //
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/api.ts",
+            "export default { get() { json.ok({ u: 1 }); } };",
+        ),
+    ]);
+    let d1 = t.join("docs");
+    let d2 = t.join("web");
+    std::fs::create_dir_all(&d1).unwrap();
+    std::fs::create_dir_all(&d2).unwrap();
+    std::fs::write(d1.join("a.txt"), "DOCS-A").unwrap();
+    std::fs::write(d1.join("index.html"), "<h1>docs</h1>").unwrap();
+    std::fs::write(d2.join("b.txt"), "WEB-B").unwrap();
+    std::fs::write(d2.join("index.html"), "<h1>web</h1>").unwrap();
+    // 不跨站探针：仅 web 根有 docs/deep.txt，docs 站没有 → /docs/deep.txt 必须 404。
+    std::fs::create_dir_all(d2.join("docs")).unwrap();
+    std::fs::write(d2.join("docs/deep.txt"), "MUST-NOT-REACH").unwrap();
+
+    // path 相对 config_dir（t）解析。
+    let mut cfg = base_cfg(&t);
+    cfg.server.static_sites = vec![
+        only_js::config::StaticSiteConf {
+            prefix: "/docs".into(),
+            path: "docs".into(),
+        },
+        only_js::config::StaticSiteConf {
+            prefix: "/".into(),
+            path: "web".into(),
+        },
+    ];
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    let c = reqwest::Client::new();
+    let get = |p: &str| c.get(format!("http://{addr}{p}")).send();
+    // 前缀根 → 该站 index.html；前缀下文件 → 该站内容。
+    assert_eq!(
+        get("/docs").await.unwrap().text().await.unwrap(),
+        "<h1>docs</h1>"
+    );
+    assert_eq!(
+        get("/docs/a.txt").await.unwrap().text().await.unwrap(),
+        "DOCS-A"
+    );
+    // `/` 兜底站。
+    assert_eq!(get("/b.txt").await.unwrap().text().await.unwrap(), "WEB-B");
+    assert_eq!(
+        get("/").await.unwrap().text().await.unwrap(),
+        "<h1>web</h1>"
+    );
+    // 最长命中 /docs 后 miss → 404，不跨站回落 web 根的 docs/deep.txt。
+    assert_eq!(get("/docs/deep.txt").await.unwrap().status(), 404);
     let _ = std::fs::remove_dir_all(&t);
 }
 

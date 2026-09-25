@@ -74,7 +74,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | 启动失败 manifest | `name` 与目录名不一致 |
 | postgres 占位符报错 | 该方言用 `$1`，不是 `?`（sqlite/mysql 才是 `?`） |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
-| 启动报 `neither api path … specified` / `api path not found` / `static site dir not found` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）至少显式指定其一，皆指定则两者都必须存在；CLI 路径相对 CWD，config 路径相对 config 目录 |
+| 启动报 `neither api path … specified` / `api path not found` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `server.static_sites` / `--app-path`）至少显式指定其一；`--api-path` 指定了就必须存在；静态目录存在性由装配期 fail-fast（报错含具体来源）。CLI 路径相对 CWD，config 路径相对 config 目录 |
 | seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸） |
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |
@@ -126,6 +126,7 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | `oj build` 报「扩展名不会进产物」 | 本地导入目标是 `.js`/`.json`——产物只转译 `.ts`，改目标为 `.ts` 或内联 |
 | `.route = "_id_"` 没参数化（v0.1.27） | `.route` 值是 matchit 语法：`_name_` 在其中是**字面段**；参数写 `{name}`——`_name_` 是**目录**写法（dev/build 会对该形态打 warn） |
 | 请求 `/…/_aa_/…` 落进了参数路由（v0.1.27） | `_aa_` 目录转换后不再有静态 `_aa_` 路由；URL 里写 `_aa_` 会被 `{aa}` 当实参吃掉（实参值就是 `"_aa_"`）。`_shared` 无尾下划线不受影响 |
+| 多站点 miss 后 404，明明另一个站点有同名文件（v0.1.27） | **不跨站**是设计：最长前缀命中后只在该站解析 + SPA 回落。`/docs/x` 命中 `/docs` 站就不会回落 `/` 站的 `docs/x`；要共享文件请放各自站点的目录里 |
 | `oj build` 报「manifest.yaml 只能出现在模块根」 | 子目录里多了 `manifest.yaml`——它会被当成 `#` 别名的新锚点，删掉即可 |
 | `mail.send` 报 `mail not configured` | 未配顶层 `smtp:` 段，或 `oj-mail` 插件未加载（`cargo xtask plugin mail`） |
 | `mail.send` 返回 `code:5`（白名单） | `allowed_from`/`allowed_recipients` **空表 fail-closed**——显式列出；或发件人/收件人**未全等命中**条目（条目只能是完整地址或 `@domain`，不做子域通配） |

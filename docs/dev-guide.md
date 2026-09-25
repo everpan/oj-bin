@@ -187,7 +187,8 @@ benches/bridge.rs     # criterion 基准
 ```
 HTTP 请求
   └─ server/lib.rs handle：依次 路由表 lookup（matchit）→ dev 目录镜像兜底（routes.rs）
-     → 静态站点（server.app_path，仅 GET/HEAD）→ 404
+     → 静态站点（legacy `server.app_path` 或 v0.1.27 多站点 `server.static_sites`，
+        最长前缀命中、站内 miss 不跨站，仅 GET/HEAD）→ 404
        └─ 命中 api 文件 → 交给 JsActor
             └─ server/actor.rs：线程化执行（Send bridge 工厂），池化 JsRuntime
                  └─ bridge：driver 模块 file:///oj/driver/{N}.js（AtomicU64 递增）

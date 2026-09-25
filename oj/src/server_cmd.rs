@@ -43,8 +43,7 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     // server.static_sites / CLI --app-path）至少显式指定其一。静态目录存在性统一由
     // 装配期站点表解析 fail-fast（含具体 prefix 来源）。
     let api_specified = a.api_path.is_some();
-    let app_specified =
-        cfg.server.app_path.is_some() || !cfg.server.static_sites.is_empty();
+    let app_specified = cfg.server.app_path.is_some() || !cfg.server.static_sites.is_empty();
     admission_gate(
         if api_specified {
             Some(dir.as_path())
@@ -320,9 +319,11 @@ fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String
                     .map_err(|e| format!("--app-path prefix {prefix:?}: {e}"))?;
                 let dir = absolutize_cwd(&cwd, dir);
                 // 同前缀判定走规范化口径（config 侧可能带尾斜杠等未规范形态）。
-                let idx = cfg.server.static_sites.iter().position(|s| {
-                    resolve_app_prefix(&s.prefix).is_ok_and(|x| x == p)
-                });
+                let idx = cfg
+                    .server
+                    .static_sites
+                    .iter()
+                    .position(|s| resolve_app_prefix(&s.prefix).is_ok_and(|x| x == p));
                 match idx {
                     Some(i) => {
                         let s = &mut cfg.server.static_sites[i];
@@ -1035,9 +1036,19 @@ mod tests {
         });
         fold_cli_app_paths(&mut c, &["/docs=new".into(), "/app=dist/app".into()]).unwrap();
         assert_eq!(c.server.static_sites.len(), 2);
-        let docs = c.server.static_sites.iter().find(|s| s.prefix == "/docs").unwrap();
+        let docs = c
+            .server
+            .static_sites
+            .iter()
+            .find(|s| s.prefix == "/docs")
+            .unwrap();
         assert!(docs.path.ends_with("new"), "{docs:?}");
-        let app = c.server.static_sites.iter().find(|s| s.prefix == "/app").unwrap();
+        let app = c
+            .server
+            .static_sites
+            .iter()
+            .find(|s| s.prefix == "/app")
+            .unwrap();
         assert!(app.path.ends_with("dist/app"), "{app:?}");
         // 裸 + 带前缀混合。
         let mut c = Config::default();

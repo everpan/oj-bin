@@ -40,6 +40,19 @@
   - **启动路由清单改统计输出**：不再逐行打印 METHOD/PATH/FILE 三列表，改为一行
     `routes: N method-row(s), N pattern(s), N api file(s)`；路由错误与冲突仍逐条
     输出具体 method/pattern/文件（dev 告警 + release 硬失败不变）。
+- **多静态站点（`server.static_sites`，v0.1.27）**：静态站点从单 `--app-path` 扩展为
+  **前缀→目录映射**的多站点。legacy `server.app_path` + `server.app_prefix` 对保持
+  不变（单站点特例）。
+  - 配置：新增 `server.static_sites: [{prefix: "/docs", path: "dist/docs"}]` 列表；
+    `path` 相对 config 目录解析。CLI：`--app-path` 可重复——裸 `dir`（至多一次，
+    覆盖主站点 `app_path`）或 `prefix=dir`（如 `--app-path /docs=dist/docs`，同前缀
+    覆盖/新增 `static_sites` 条目，CLI 优先）。
+  - 请求期 **最长前缀命中**（`/` 为兜底 catch-all）：`/docs/api/x` 优先命中 `/docs` 站
+    胜过 `/` 站。命中站点内未命中 → **仅该站** SPA 回落，**不跨站**；meta JSON
+    （`html_meta`）按命中站点各自的根目录解析。
+  - fail-fast：归一后前缀重复（报两条来源）或目录缺失 → 拒绝启动。
+    `spa_fallback` / `html_meta` / `html_meta_handler` / `html_cache_control` 仍为
+    全局开关，对各站点一致生效。
 
 **升级注意（breaking-adjacent）**
 
