@@ -38,6 +38,16 @@ pub enum CertificateStatus {
     Expired,
 }
 
+/// 静态站点（v0.1.27 多站点：URL 前缀 → 磁盘目录映射）。
+#[derive(Clone, Debug)]
+pub struct StaticSite {
+    /// URL 前缀（规范化为首斜杠、无尾斜杠；`/` = 兜底 catch-all）。app() 内按
+    /// 前缀长度降序（同长字符串升序）排序，请求期 find_map 取最长命中。
+    pub prefix: String,
+    /// 磁盘根目录（resolve_static 在此解析；装配期已 canonicalize）。
+    pub root: PathBuf,
+}
+
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
 #[derive(Clone)]
 pub struct AppState {
@@ -47,11 +57,9 @@ pub struct AppState {
     actor: JsActor,
     /// 单请求超时（None = 不限时）。
     timeout: Option<std::time::Duration>,
-    /// 静态站点根（config server.app_path / CLI --app-path）；None → 不开静态服务。
-    static_root: Option<PathBuf>,
-    /// 静态站点前缀（server.app_prefix，默认 "/"）。非 "/" 时仅该前缀下的 GET/HEAD
-    /// 落静态（前缀剥除后解析，前缀根 → index.html）；API 路由永远优先。
-    app_prefix: String,
+    /// 静态站点表（v0.1.27 多站点：prefix→dir 映射；app() 内已按前缀长度降序
+    /// 排好，find_map 取最长命中）。空 = 不开静态服务。
+    static_sites: Vec<StaticSite>,
     /// 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入。
     static_opts: StaticOpts,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
@@ -153,8 +161,7 @@ pub fn app(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
-    static_root: Option<PathBuf>,
-    app_prefix: String,
+    static_sites: Vec<StaticSite>,
     // static_opts：静态站点两条 v0.1.20 增强（SPA 回落 / per-route meta）。
     static_opts: StaticOpts,
     pipeline: Pipeline,
@@ -183,8 +190,7 @@ pub fn app(
             fallback: ts.then(|| Routes::new(base, dir, ts)),
             actor,
             timeout,
-            static_root,
-            app_prefix,
+            static_sites: sorted_sites(static_sites),
             static_opts,
             pipeline,
             base: base.to_string(),
@@ -192,6 +198,18 @@ pub fn app(
             certificate_valid_until,
             plugins,
         })
+}
+
+/// 站点表排序（v0.1.27 多站点）：前缀长度降序（最长命中优先），同长按字符串升序保确定性。
+/// 归 app() 独家负责——装配层（oj/src/app.rs）只归一/去重，不排序。
+fn sorted_sites(mut sites: Vec<StaticSite>) -> Vec<StaticSite> {
+    sites.sort_by(|a, b| {
+        b.prefix
+            .len()
+            .cmp(&a.prefix.len())
+            .then_with(|| a.prefix.cmp(&b.prefix))
+    });
+    sites
 }
 
 /// 健康检查：返回服务状态与证书状态（供监控轮询）。
@@ -250,7 +268,7 @@ pub async fn serve(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
-    static_root: Option<PathBuf>,
+    static_sites: Vec<StaticSite>,
     static_opts: StaticOpts,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
@@ -263,7 +281,7 @@ pub async fn serve(
         table,
         actor,
         timeout,
-        static_root,
+        static_sites,
         static_opts,
         pipeline,
     )
@@ -280,7 +298,7 @@ pub async fn serve_with_listener(
     table: RouteTable,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
-    static_root: Option<PathBuf>,
+    static_sites: Vec<StaticSite>,
     static_opts: StaticOpts,
     pipeline: Pipeline,
 ) -> std::io::Result<()> {
@@ -293,8 +311,7 @@ pub async fn serve_with_listener(
             table,
             actor,
             timeout,
-            static_root,
-            "/".to_string(),
+            static_sites,
             static_opts,
             pipeline,
             Arc::new(RwLock::new(CertificateStatus::Valid)),
@@ -439,22 +456,25 @@ async fn handle(
             None => return fail_response(405, &format!("method {verb} not mapped")),
         }
     }
-    // 静态站点兜底（server.app_path + app_prefix）：API 优先，GET/HEAD only。
-    // 非 "/" 前缀时仅服务前缀下的请求（前缀剥除后解析；前缀根 → index.html），
-    // 前缀外的路径不走静态 —— 与「API 路由永远优先」同层保障。
-    if let Some(root) = st.static_root.as_deref()
-        && matches!(verb, "GET" | "HEAD")
-        && let Some(rel_path) = strip_app_prefix(&st.app_prefix, uri.path())
+    // 静态站点兜底（v0.1.27 多站点：prefix→dir，最长前缀命中——表已在 app() 内
+    // 按前缀长度降序）：API 优先，GET/HEAD only。命中站点内未命中 → **仅该站**
+    // SPA 回落，不跨站；前缀外路径不走静态。
+    if matches!(verb, "GET" | "HEAD")
+        && let Some((site, rel_path)) = st
+            .static_sites
+            .iter()
+            .find_map(|s| strip_app_prefix(&s.prefix, uri.path()).map(|r| (s, r)))
     {
+        let root = &site.root;
         let meta = st.static_opts.html_meta.as_deref();
         if let Some(file) = resolve_static(root, rel_path, meta)
             && let Ok(body) = tokio::fs::read(&file).await
         {
-            return static_page(&st, rel_path, &file, body).await;
+            return static_page(&st, root, rel_path, &file, body).await;
         }
         // SPA 深链接回落（server.app_spa_fallback，v0.1.20）：未命中 + 无扩展名 +
         // Accept html + **不在 api_prefix 下**（否则拼错的 API 路径会被 index.html
-        // 吞成 200，掩盖真实 404）→ 送 root/index.html。
+        // 吞成 200，掩盖真实 404）→ 送 **本站点** root/index.html。
         if st.static_opts.spa_fallback
             && accept_html
             && !has_extension(rel_path)
@@ -462,7 +482,7 @@ async fn handle(
         {
             let idx = root.join("index.html");
             if let Ok(body) = tokio::fs::read(&idx).await {
-                return static_page(&st, rel_path, &idx, body).await;
+                return static_page(&st, root, rel_path, &idx, body).await;
             }
         }
     }
@@ -594,9 +614,16 @@ fn path_under_base(rel_path: &str, base: &str) -> bool {
 /// 静态响应（v0.1.20 起；v0.1.25 增动态 meta + HTML 缓存头）：HTML 走 per-route meta
 /// 注入（静态 JSON 打底 → 动态 handler 覆盖），其余原样；什么都不配时逐字节同旧行为。
 ///
-/// `rel_path` 是**已剥 `app_prefix` 的请求路径**（SPA 回落时即深链接本身，不是 index.html
-/// 的落盘路径）——按它查 meta 才能做到「按路由」。
-async fn static_page(st: &AppState, rel_path: &str, file: &Path, body: Vec<u8>) -> Response {
+/// `rel_path` 是**已剥站点前缀**的请求路径（SPA 回落时即深链接本身，不是 index.html
+/// 的落盘路径）——按它查 meta 才能做到「按路由」；`site_root` 是命中站点的磁盘根
+/// （meta JSON 目录按站点各自解析，v0.1.27 多站点）。
+async fn static_page(
+    st: &AppState,
+    site_root: &Path,
+    rel_path: &str,
+    file: &Path,
+    body: Vec<u8>,
+) -> Response {
     let is_html = file
         .extension()
         .and_then(|e| e.to_str())
@@ -616,15 +643,12 @@ async fn static_page(st: &AppState, rel_path: &str, file: &Path, body: Vec<u8>) 
         }
         return r;
     }
-    let Some(root) = st.static_root.as_deref() else {
-        return file_response(file, body);
-    };
+    // 1) 静态 JSON 打底（`<site_root>/<dir>/<path>.json`，v0.1.20），2) 动态 handler 按 key 覆盖。
+    let mut map = load_static_meta(site_root, opts.html_meta.as_deref(), rel_path);
     let Ok(text) = String::from_utf8(body) else {
         // 非 UTF-8 的「HTML」不是我们能注入的文档（保持 v0.1.20 的旧行为：空体）。
         return file_response(file, Vec::new());
     };
-    // 1) 静态 JSON 打底（`<root>/<dir>/<path>.json`，v0.1.20），2) 动态 handler 按 key 覆盖。
-    let mut map = load_static_meta(root, opts.html_meta.as_deref(), rel_path);
     let mut dynamic_cc: Option<String> = None;
     if has_dynamic {
         match dispatch_meta_handler(st, rel_path).await {
@@ -1104,7 +1128,7 @@ fn decode_blob_key(s: &str) -> Option<String> {
 /// 静态文件解析：uri.path()（仍 percent-encoded）逐段解码后拼 root；
 /// 根/目录 → index.html；越界段（`.`/`..`/`\`/`/`/`\0`/空段，含解码后——
 /// `%2F` 走私等价穿越）→ None（404）。
-/// 请求路径 → 静态解析用的相对路径（剥 `app_prefix`）。
+/// 请求路径 → 命中站点的相对路径（剥站点 `prefix`，多站点最长命中由调用方保证）。
 /// 前缀 "/" → 原样（全路径兜底，行为与旧版一致）；非 "/" 前缀：精确命中前缀根
 /// → "/"（resolve_static 落 index.html），`前缀/...` → "/..."，前缀外（含仅前缀
 /// 更长串如 `/sitex`）→ None（404）。
@@ -1279,8 +1303,7 @@ pub(crate) mod tests {
             fallback: None,
             actor: make_actor(PathBuf::from("."), false),
             timeout: None,
-            static_root: None,
-            app_prefix: "/".to_string(),
+            static_sites: Vec::new(),
             static_opts: StaticOpts::default(),
             pipeline: Pipeline::default(),
             base: "/v1/api".to_string(),
@@ -1358,7 +1381,7 @@ pub(crate) mod tests {
                 table,
                 make_actor(dir, ts),
                 timeout,
-                None,
+                Vec::new(),
                 StaticOpts::default(),
                 pipeline,
             )
@@ -1409,7 +1432,7 @@ pub(crate) mod tests {
                 table,
                 actor,
                 None,
-                None,
+                Vec::new(),
                 StaticOpts::default(),
                 pipeline,
             )
@@ -2150,11 +2173,29 @@ pub(crate) mod tests {
         site: &[(&str, &str)],
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, TempRoutes)) {
+        let (addr, (t, keeps)) = spawn_static_sites(api, &[("/", site.to_vec())], opts).await;
+        (addr, (t, keeps.into_iter().next().unwrap()))
+    }
+
+    /// 多站点版（v0.1.27）：sites = [(prefix, files)]，按给定顺序装配（app() 内重排）。
+    async fn spawn_static_sites(
+        api: &[(&str, &str)],
+        sites: &[(&str, Vec<(&str, &str)>)],
+        opts: StaticOpts,
+    ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
         let t = routes(api);
-        let s = routes(site);
+        let keeps: Vec<TempRoutes> = sites.iter().map(|(_, f)| routes(f)).collect();
+        let static_sites: Vec<StaticSite> = sites
+            .iter()
+            .zip(&keeps)
+            .map(|((prefix, _), k)| StaticSite {
+                prefix: prefix.to_string(),
+                root: k.0.clone(),
+            })
+            .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (dir, table, site) = (t.0.clone(), build_table(&t.0, true, "/v1/api"), s.0.clone());
+        let (dir, table) = (t.0.clone(), build_table(&t.0, true, "/v1/api"));
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
@@ -2164,14 +2205,14 @@ pub(crate) mod tests {
                 table,
                 make_actor(dir, true),
                 None,
-                Some(site),
+                static_sites,
                 opts,
                 Pipeline::default(),
             )
             .await
             .unwrap();
         });
-        (addr, (t, s))
+        (addr, (t, keeps))
     }
 
     #[tokio::test]
@@ -2579,6 +2620,132 @@ pub(crate) mod tests {
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
+    // ----- 多静态站点（v0.1.27：prefix→dir，最长前缀命中）-----
+
+    /// 双站点夹具：`/docs` → docs 根（含嵌套前缀用例文件），`/` → app 根。
+    async fn spawn_two_sites(
+        opts: StaticOpts,
+    ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
+        spawn_static_sites(
+            &[],
+            &[
+                (
+                    "/",
+                    vec![
+                        ("index.html", "<h1>app</h1>"),
+                        ("docs/deep.txt", "APP-ROOT-SHOULD-NOT-SERVE"),
+                    ],
+                ),
+                (
+                    "/docs",
+                    vec![("index.html", "<h1>docs</h1>"), ("api/x.txt", "DOCS-API-X")],
+                ),
+            ],
+            opts,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn multi_static_longest_prefix_wins_and_root_catchall() {
+        let (addr, _keep) = spawn_two_sites(StaticOpts::default()).await;
+        // 最长前缀：`/docs/api/x.txt` 命中 /docs 站，胜过 `/` 站。
+        let r = raw_http(addr, &get(addr, "/docs/api/x.txt")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("DOCS-API-X"),
+            "{r}"
+        );
+        // 前缀根 → 该站 index.html。
+        let r = raw_http(addr, &get(addr, "/docs")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("<h1>docs</h1>"),
+            "{r}"
+        );
+        // `/` 站兜底：前缀外路径落 `/` 站。
+        let r = raw_http(addr, &get(addr, "/other.txt")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        let r = raw_http(addr, &get(addr, "/")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("<h1>app</h1>"),
+            "{r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_static_site_miss_does_not_fall_across_sites() {
+        // 不跨站：`/docs/deep.txt` 仅存在于 `/` 站的 docs/ 子目录——命中 /docs 站
+        // （最长前缀）后未命中必须 404，**不得**回落到 `/` 站的同名文件。
+        let (addr, _keep) = spawn_two_sites(StaticOpts::default()).await;
+        let r = raw_http(addr, &get(addr, "/docs/deep.txt")).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn multi_static_spa_fallback_is_per_site() {
+        // spa_fallback 全局开关，但回落目标各站独立：/docs 站有 index.html →
+        // 深链接 200；`/` 站无 index.html → 404（不跨站借）。
+        let (addr, _keep) = spawn_static_sites(
+            &[],
+            &[
+                ("/", vec![("docs/deep.txt", "SHOULD-NOT-REACH")]),
+                ("/docs", vec![("index.html", "<h1>docs</h1>")]),
+            ],
+            StaticOpts {
+                spa_fallback: true,
+                ..StaticOpts::default()
+            },
+        )
+        .await;
+        let accept = "GET /docs/deep/link HTTP/1.1\r\nHost: t\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
+        let r = raw_http(addr, accept).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("<h1>docs</h1>"),
+            "{r}"
+        );
+        let accept =
+            "GET /deep/link HTTP/1.1\r\nHost: t\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
+        let r = raw_http(addr, accept).await;
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn multi_static_meta_is_per_site() {
+        // html_meta 全局配置，meta JSON 按**命中站点**解析：仅 /docs 站有 __meta，
+        // `/` 站 HTML 无注入（且无错）。
+        let (addr, _keep) = spawn_static_sites(
+            &[],
+            &[
+                (
+                    "/",
+                    vec![("index.html", "<html><head></head><body>app</body></html>")],
+                ),
+                (
+                    "/docs",
+                    vec![
+                        ("index.html", "<html><head></head><body>docs</body></html>"),
+                        ("__meta/index.json", r#"{"title":"Docs Home"}"#),
+                    ],
+                ),
+            ],
+            StaticOpts {
+                html_meta: Some("__meta".to_string()),
+                ..StaticOpts::default()
+            },
+        )
+        .await;
+        let r = raw_http(addr, &get(addr, "/docs/")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("<title>Docs Home</title>"),
+            "{r}"
+        );
+        // `/` 站无 __meta 目录：页面原样，仍 200。
+        let r = raw_http(addr, &get(addr, "/")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.contains("app</body>") && !r.contains("<title>"),
+            "{r}"
+        );
+    }
+
     #[test]
     fn resolve_static_blocks_decoded_traversal() {
         let root = Path::new("/srv");
@@ -2687,7 +2854,7 @@ pub(crate) mod tests {
             table,
             actor,
             None,
-            None,
+            Vec::new(),
             StaticOpts::default(),
             Pipeline::default(),
         ));
@@ -2723,7 +2890,7 @@ pub(crate) mod tests {
             RouteTable::default(),
             make_actor(t.0.clone(), true),
             None,
-            None,
+            Vec::new(),
             StaticOpts::default(),
             Pipeline::default(),
         )
