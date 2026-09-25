@@ -916,6 +916,14 @@ impl App {
         let static_root = resolve_static_root(&cfg, config_dir)?;
         // 静态站点前缀（server.app_prefix，默认 "/"）：归一 + 非法值 fail-fast。
         let app_prefix = crate::server_cmd::resolve_app_prefix(&cfg.server.app_prefix)?;
+        // v0.1.27 多站点过渡期：legacy 单站点包装成单元素表（Task 4 换 resolve_static_sites）。
+        let static_sites = static_root
+            .map(|root| server::StaticSite {
+                prefix: app_prefix.clone(),
+                root,
+            })
+            .into_iter()
+            .collect();
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
@@ -950,8 +958,7 @@ impl App {
             table,
             actor,
             timeout,
-            static_root,
-            app_prefix,
+            static_sites,
             // 静态站点增强（v0.1.20 / v0.1.25）：SPA 深链接回落 + per-route meta 注入
             // （静态 JSON 打底 + 动态 handler 覆盖）+ HTML Cache-Control。
             server::StaticOpts {
