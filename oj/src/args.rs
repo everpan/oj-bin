@@ -12,8 +12,10 @@ pub struct ServerArgs {
     /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；模式按目录内容
     /// 自动判定。None → server 不开 API 功能（须配置静态站点，否则拒绝启动）。
     pub api_path: Option<String>,
-    /// 静态站点目录（相对 CWD）；Some 覆盖 config 的 server.app_path（后者相对 config 目录）。
-    pub app_path: Option<String>,
+    /// 静态站点目录（相对 CWD）；可重复（v0.1.27）。裸 `dir` = 覆盖 config 的主站点
+    /// server.app_path（至多一次）；`prefix=dir` = 覆盖/新增 server.static_sites 中
+    /// 该前缀的条目（CLI 优先）。
+    pub app_path: Vec<String>,
     /// JWS 证书路径；Some 覆盖 config 的 server.certificate_path。
     pub cert_path: Option<String>,
     /// PEM 公钥路径；Some 覆盖 config 的 server.public_key_path。
@@ -138,9 +140,11 @@ enum Commands {
         /// （server.app_path / --app-path）则拒绝启动
         #[arg(long = "api-path")]
         api_path: Option<String>,
-        /// 静态站点目录（相对 CWD；覆盖 config 的 server.app_path，后者相对 config 目录）
+        /// 静态站点目录（相对 CWD；可重复，v0.1.27）：裸 `dir` 覆盖 config 的
+        /// server.app_path（至多一次）；`prefix=dir`（如 `--app-path /docs=dist/docs`）
+        /// 覆盖/新增 server.static_sites 中该前缀的条目（CLI 优先于 config）
         #[arg(long = "app-path")]
-        app_path: Option<String>,
+        app_path: Vec<String>,
         /// JWS 证书路径（覆盖 config 的 server.certificate_path）
         #[arg(long)]
         cert_path: Option<String>,
@@ -392,9 +396,9 @@ mod tests {
             (
                 a.base.as_deref(),
                 a.api_path.as_deref(),
-                a.app_path.as_deref()
+                a.app_path.as_slice()
             ),
-            (None, None, None)
+            (None, None, &[][..])
         );
         let Command::Server(a) = cmd(&[
             "server",
@@ -414,10 +418,23 @@ mod tests {
                 a.config.as_str(),
                 a.base.as_deref(),
                 a.api_path.as_deref(),
-                a.app_path.as_deref()
+                a.app_path.as_slice()
             ),
-            ("c.yaml", Some("/api"), Some("src"), Some("web"))
+            ("c.yaml", Some("/api"), Some("src"), &["web".to_string()][..])
         );
+        // v0.1.27：--app-path 可重复（裸 dir + prefix=dir 混合）
+        let Command::Server(a) = cmd(&[
+            "server",
+            "-c",
+            "c.yaml",
+            "--app-path",
+            "web",
+            "--app-path",
+            "/docs=dist/docs",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.app_path, vec!["web".to_string(), "/docs=dist/docs".to_string()]);
     }
 
     #[test]
