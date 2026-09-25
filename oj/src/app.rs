@@ -874,13 +874,18 @@ impl App {
             (table2, Vec::new())
         };
         for f in &failures {
-            eprintln!("error: route: {f}");
+            if let Some(w) = f.strip_prefix("warning: ") {
+                eprintln!("warn: route: {w}");
+            } else {
+                eprintln!("error: route: {f}");
+            }
         }
-        if !failures.is_empty() {
-            eprintln!(
-                "warn: {} route declaration(s) skipped (see errors above)",
-                failures.len()
-            );
+        let n_err = failures
+            .iter()
+            .filter(|f| !f.starts_with("warning: "))
+            .count();
+        if n_err > 0 {
+            eprintln!("warn: {n_err} route declaration(s) skipped (see errors above)");
         }
         // 路由清单：等宽三列平铺表（METHOD/PATH/FILE，列宽自适应），比
         // 「文件头 + 缩进方法」紧凑易扫。顺序沿用 grouped() 的决定序。
