@@ -16,6 +16,74 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.28（2026-09-25，未打标签）
+
+> 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.27 → 0.1.28`）。
+> 发布点标签：暂未打（待发布点提交后 `git tag -a v0.1.28`）。上一版：`v0.1.27` → `465322c`。
+
+**特性（PRD `docs/prds/event-cqrs.md` v2 §9 阶段 1：任务域事件化）**
+
+- **双模长任务（v0.1.28）**：`src/tasks/` 下的任务文件按**导出探测**分流——
+  导出 `loop_body` 命名导出的文件走**池化任务**（新）；其余（顶层 await 驱动，如
+  MQ 消费循环）走存量 TLA 监督器，行为与旧版完全一致。
+  - 池化任务三钩子：`setup`（连接时执行一次，可缺省）/ `loop_body`（每轮调用，
+    **必须命名导出**，超时 `tasks.pool.loop_body_timeout_ms` 默认 5s——超时或异常
+    → teardown 收场、状态 Failed）/ `teardown`（停止/失败/停机时执行，尽力而为不承诺完成）。
+  - 池化任务**不需要** `tasks.stopping()` 轮询与 `tasks.sleep()`：每轮 loop_body 返回
+    后由 worker 按注册表 desired 位决定是否再调一轮；停机时先跑 teardown 再退出。
+  - `tasks.pool.workers`（默认 4）个常驻 worker 线程，任务静态轮转分配（本地轮换，
+    无共享调度器）；任务模块在 worker runtime 上预载一次（V8 模块缓存，零重编译）。
+- **cron 定时任务（v0.1.28）**：`tasks.crontab`（默认 `task/crontab.yaml`，**相对
+  `tasks.dir`**，条目路径同）逐行 `分 时 日 月 周  路径`，5 字段自研解析（`*/n`、列表、
+  区间、周字段 7=周日）；单驱动调度器到点派发一次性作业（整模块跑一次、跑完释放
+  Worker，先写 next_run 再派发防重入）。坏行 fail-fast（报错带 `:行号:`）；与池化
+  任务同名拒启；cron 文件用普通命名（`task_*.ts` 会被扫描器收编成长任务）。
+- **任务管理 API（v0.1.28）**：`{base}/tasks` 控制面——`GET {base}/tasks`（`?type=long|cron`）、
+  `GET/PATCH/DELETE {base}/tasks/{name}`（PATCH 仅接受 `{enabled, cron}`）、
+  `GET .../{name}/logs`、`POST .../{name}/start|stop|reload|run-once|enable|disable`。
+  鉴权（AuthGuard）与租户头语义与业务路由**完全一致**；跨 kind 命令返回 400 并给提示
+  （cron 用 enable/disable，long 用 start/stop）；**run-once 仅 cron 任务**（long 400、
+  运行中 409、无任务池 503）；DELETE 仅运行时注销（文件仍是事实源）。任务为实例级
+  资源，本期无按租户隔离的视图。
+- **任务事件（v0.1.28）**：薄事件信封 `{eventId, eventType, timestamp, payload}`
+  （camelCase 契约，FR-EB-005；内存池：JSONL 日志 `tasks.event_log.path`（默认
+  `logs/task-events.jsonl`，超 `max_mb`（默认 16）轮转 `.jsonl.1`）+ 1000 条环形缓冲，
+  `logs` 端点可查）。
+- **轮间节奏（v0.1.28）**：池化任务每轮 `loop_body` 返回后框架按
+  `tasks.pool.interval_ms`（默认 100ms；**`0` = 不限制**，立即轮转，压测语义）sleep
+  再调下一轮——防 trivial loop_body 空转独占 Worker。
+  **性能对比（同机 11s 窗口实测）**：单任务 kv get+set + log.info——无节奏 60,149
+  轮/s、CPU 峰值 54.7%、6 万行日志/s；默认 100ms ~9 轮/s、CPU 4.7%。4 任务 kv
+  get+set——`interval_ms: 0` 聚合 247,752 轮/s（每任务 ~62,000，4 Worker 各烧一
+  核，CPU 峰值 133.7%）；默认 100ms 聚合 39 轮/s（每任务 ~10）、CPU 12.5%。
+  多任务轮转公平性有 BDD 测试（`given_two_loop_tasks_when_pool_runs_then_both_advance`）。
+  调优建议（写放大核算、增量游标、长轮询走 TLA）见 `docs/devkit/api-manual.md`
+  §6「性能特征与调优」。
+
+**配置（新增）**
+
+```yaml
+tasks:
+  pool:
+    workers: 4                  # 池化/cron 任务 worker 线程数
+    loop_body_timeout_ms: 5000  # 单轮 loop_body 看门狗超时
+    interval_ms: 100            # 轮间节奏（每轮返回后 sleep 再下一轮，防空转独占 Worker）
+  crontab: task/crontab.yaml    # cron 清单（tasks.dir 相对）；缺省不启用
+  event_log:
+    enabled: true
+    path: logs/task-events.jsonl
+    max_mb: 16
+```
+
+**兼容**
+
+- 存量 TLA 任务（MQ 消费等）零改动：探测不到 `loop_body` 即归入旧监督器；
+  `tasks.stopping()`/`tasks.sleep()`/退避重启语义不变。
+- 不启用池化任务 / cron 时（无 loop_body 导出、无 crontab 文件）不创建任务池，
+  零开销。
+
+详见 `docs/prds/event-cqrs.md` v2（评审修订版）与 `docs/devkit/` 四件套。
+
 ## v0.1.27（2026-09-25）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.26 → 0.1.27`）。发布点标签：

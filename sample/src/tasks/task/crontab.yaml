@@ -1,0 +1,8 @@
+# cron 定时任务清单（v0.1.28，tasks.crontab 默认 task/crontab.yaml，相对 tasks.dir）：
+#   分 时 日 月 周  任务文件（相对 tasks.dir）
+# 5 字段自研解析：支持 */n、列表（1,3）、区间（1-5）；周字段 7 = 周日；# 注释与空行忽略。
+# 到点由单驱动调度器派一次性作业：整模块跑一次（顶层 await 即执行体），跑完释放 Worker。
+# 坏行启动 fail-fast（报错带 :行号:）；与池化任务同名（含 task_* 扫描件）拒启。
+# 管理面：POST {base}/tasks/{name}/enable|disable，PATCH {base}/tasks/{name} {"cron": "…"}。
+*/5 * * * *  ./jobs/report.ts   # 每 5 分钟跑一次 report.ts（计数落 kv）
+# 30 2 * * 1  ./jobs/backup.ts  # 每周一 02:30（示例）

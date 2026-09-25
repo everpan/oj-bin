@@ -19,7 +19,9 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
    列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态 /
    多库项目按库迁移与对账（`oj migrate --db <name>`）/ 大整数 id 的生成与回写（`toBigInt`）。
    **接 Kafka/RabbitMQ 或写长任务 → §6「命名 MQ 客户端与长任务」**（任务文件放
-   `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。
+   `src/tasks/`，命名 `task_{name}.*` / `{name}_task.*`）。**每轮被驱动的轮询/心跳/
+   cron 任务 → §6「池化任务与 cron」**（命名导出 `setup`/`loop_body`/`teardown`，
+   crontab.yaml，管理面 `{base}/tasks`，v0.1.28）。
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
    **发件人/收件人白名单 fail-closed**，空表即拒；附件用 `{blobKey}`/`{path}` 引用，勿内联 base64）。
    完整手册见仓库 `docs/mail-smtp.md`。
@@ -89,7 +91,13 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 | poll 报 "instance busy" | 同一实例已有活跃 poller（任务上下文单 poller）——别并发 poll |
 | 任务收不到消息就退了/killed | `timeoutMs` 应远小于 `stop_grace_secs`；被 killed = 宽限到期看门狗强杀（不响应 `tasks.stopping()`） |
 | 重启后整段消息重复消费 | commit 按 offset+1 推进该分区——多分区主题按分区各 commit 一次（at-least-once，处理须幂等） |
-| 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效） |
+| 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效）；池化任务可用管理面 `POST {base}/tasks/{name}/reload`（v0.1.28） |
+| 池化任务跑几轮就 `failed` | 单轮 `loop_body` 超 `tasks.pool.loop_body_timeout_ms`（默认 5s）即 teardown + failed 退避重连——长轮询（>5s 一次的等待）别用池化，继续用 TLA + `tasks.sleep` |
+| 池化任务里 `tasks.stopping()` 恒 false | 池化任务由 worker 每轮驱动：`loop_body` 返回即一轮结束，天然无需停机轮询/`tasks.sleep`（v0.1.28） |
+| `/tasks/{name}/start` 对 cron 任务报 400 | 跨 kind 命令被拒：cron 用 `enable`/`disable`，long 用 `start`/`stop`（v0.1.28） |
+| `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |
+| 任务池 CPU 飙高 / `runCount` 暴涨 | `interval_ms` 太小或为 0（0 = 不限制，压测语义）——默认 100ms≈10 轮/s；实测无节奏 4 任务聚合 24.8 万轮/s、CPU 134%（多核空转）。先算写放大（轮率 × 每轮 IO）再调小（§6「性能特征与调优」） |
+| `PATCH /tasks/{name}` 报 400 | 只接受 `{enabled, cron}` 两字段（无用户可传脚本路径入口，结构性白名单） |
 | WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定） |
 | （v0.1.9 已消除）旧帧循环的 const 重复声明 | 新契约为生命周期钩子：模块每 Worker 预载一次——无需处理；可变跨帧状态放 `sess.state`（模块作用域只是只读缓存），见 api-manual §ws.ts |
 | WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |

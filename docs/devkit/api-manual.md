@@ -1477,6 +1477,105 @@ while (!tasks.stopping()) {
 
 最小无 broker 示例见 `sample/src/tasks/task_demo.ts`（每秒心跳）。
 
+### 池化任务与 cron（v0.1.28）
+
+> 何时读我：写**每轮被驱动**的轮询/心跳/对账任务，或要按 crontab 定时跑一段 JS。
+> 设计依据见仓库 `docs/prds/event-cqrs.md` v2。
+
+任务文件按**导出探测**自动分流：导出 `loop_body` 命名导出 → **池化任务**（本节）；
+否则 → 上一节 TLA 监督器（顶层 await 循环，MQ 消费写法不变）。两种模式可共存于
+同一 `src/tasks/` 目录。
+
+**池化任务三钩子**（均为命名导出，模块在 worker runtime 上预载一次）：
+
+```ts
+// src/tasks/task_watch.ts
+export async function setup() {
+  // 可选：连接/建会话时执行一次
+}
+export async function loop_body() {
+  // 每轮被 worker 调用一次；单轮超时 loop_body_timeout_ms（默认 5s）
+  // 抛错或超时会触发 teardown 收场并记 Failed（退避重启见下）
+}
+export async function teardown() {
+  // 可选：停止/失败/停机时执行（尽力而为，超时不保证跑完）
+}
+```
+
+- **不需要 `tasks.stopping()` 轮询 / `tasks.sleep()`**：每轮 `loop_body` 返回后
+  worker 按管理面 desired 位决定是否再调一轮；停机时先跑 `teardown` 再退出。
+- **轮间节奏 `tasks.pool.interval_ms`（默认 100ms；`0` = 不限制）**：每轮返回后框架
+  sleep 这么久再调下一轮——防 trivial loop_body 空转独占 Worker（starving 同 Worker
+  上的其他任务）；要更快节奏调小它，长轮询任务别用池化。`0` 表示忙扫结束立即轮转
+  （压测语义，生产会被空转打满多核）。
+- 单轮异常/超时 → teardown → 状态 `failed`；管理面 `start` 后按 1s→2s→4s…
+  （cap 60s）退避重连（对齐存量 TLA 退避语义）。
+- 任务静态分配到 `tasks.pool.workers`（默认 4）个 worker 线程之一，本地轮转。
+- 其余约定与 TLA 任务相同：无 timer 全局、文件须为 ES 模块（顶层 await 的 TLA
+  文件仍需 `export {};`——池化文件靠命名导出天然是模块）、无热重载（管理面
+  `reload` 可重连单个任务）。
+
+**性能特征与调优（v0.1.28 同机实测；单任务 = sample `task_watch` kv get+set +
+`log.info`，多任务 = 4 × kv get+set）**：
+
+| 配置 | 轮率 | 进程 CPU 峰值 | KV/日志写放大 |
+|---|---|---|---|
+| 单任务，无节奏（旧行为） | ~60,000 轮/s | ~55% | 6 万行日志/s + 12 万次 kv/s |
+| 单任务，`interval_ms: 100`（默认） | ~9 轮/s（上限 10/s） | ~5% | 按需 |
+| 4 任务，`interval_ms: 0`（不限制） | 聚合 ~247,800 轮/s（每任务 ~62,000） | ~134%（**>1 核**） | 4 × 12 万次 kv/s |
+| 4 任务，`interval_ms: 100`（默认） | 聚合 ~39 轮/s（每任务 ~10） | ~12.5% | 按需 |
+
+- **吞吐由 `interval_ms` 一个旋钮决定**（默认 100ms → 每任务 ≈10 轮/s 上限）。
+  轮率是**每任务**的，不是全局的——同 Worker 上 N 个任务交替轮转（多任务公平性
+  有 BDD 测试钉住）；不同 Worker 的任务互不相干（4 任务 4 Worker 时空转轮率 ×4，
+  CPU 可超 100% = 多核一起烧）。
+- **调小 `interval_ms` 前先算写放大**：每轮的 kv/db/日志 IO 会乘以轮率。心跳类
+  任务保持默认或调大（如 1000ms）；确需高频轮询才往下调。
+- **单轮等待超过 `loop_body_timeout_ms`（默认 5s）的任务不要用池化**（看门狗
+  会 teardown + failed 退避）——长轮询（MQ 消费、外部接口长连接）留在 TLA 模式，
+  用 `tasks.sleep()` 自定节奏。
+- **每轮做增量、别全量**：loop_body 里用 kv 存游标/水位（如 `watch:last`），
+  每轮只处理游标之后的部分；全量扫描的任务轮率一上来就是灾难。
+- **观测面**：`GET {base}/tasks` 的 `runCount` 增速即实际轮率；进程 CPU 突高先查
+  是不是 `interval_ms` 太小/为 0，或 loop_body 内有隐藏循环。
+
+**cron 定时任务**：`tasks.crontab`（默认 `task/crontab.yaml`，**相对 `tasks.dir`**）
+逐行 `分 时 日 月 周  任务文件路径`（路径同样相对 `tasks.dir`；5 字段：支持 `*/n`、
+列表 `1,3`、区间 `1-5`，周字段 7=周日；`#` 注释与空行忽略）：
+
+```yaml
+# src/tasks/task/crontab.yaml
+*/5 * * * *  ./jobs/report.ts   # 每 5 分钟跑一次 report.ts（整模块跑一次）
+30 2 * * 1   ./jobs/backup.ts   # 每周一 02:30
+```
+
+cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执行体，跑完释放 Worker），
+**不是**三钩子任务。命名用普通文件名（如 `jobs/report.ts`）——用 `task_*.ts` 会被
+任务扫描器同时收编成长任务，同名直接拒启。到点由单驱动调度器派发**一次性作业**
+（复用 worker 池，先推进 next_run 再派发，进程内不重入）。cron 任务的启停/改表达
+式走管理面（见下）。
+
+**任务管理 API（v0.1.28）**：`{base}/tasks` 控制面，鉴权（AuthGuard）与租户头语义
+与业务路由**完全一致**（守卫/匿名路径/租户头缺省 400 同 §8）；无用户可传脚本路径
+的入口（结构性满足脚本路径白名单）：
+
+| 端点 | 说明 |
+|---|---|
+| `GET {base}/tasks?type=long\|cron` | 任务清单（名称/类型/状态/运行次数/上次错误/nextRun） |
+| `GET {base}/tasks/{name}` | 单个任务详情；不存在 404 |
+| `PATCH {base}/tasks/{name}` | 仅接受 `{enabled, cron}`（cron 表达式校验）；其余字段 400 |
+| `DELETE {base}/tasks/{name}` | 运行时注销（文件仍是事实源，重启后按文件重建） |
+| `GET {base}/tasks/{name}/logs?limit=` | 该任务的事件（见下） |
+| `POST {base}/tasks/{name}/start\|stop` | 长任务启/停；cron 任务 400（用 enable/disable） |
+| `POST {base}/tasks/{name}/enable\|disable` | cron（或长任务）启/停开关 |
+| `POST {base}/tasks/{name}/reload` | 重连该任务（重跑 setup） |
+| `POST {base}/tasks/{name}/run-once` | **仅 cron 任务**：立即派一轮（long 任务 400）；运行中 409，无任务池 503 |
+
+**任务事件（v0.1.28）**：薄信封 `{eventId, eventType, timestamp, payload}`
+（`eventType` 如 `task.started`/`task.failed`/`task.timeout`）。内存池 = JSONL 日志
+（`tasks.event_log.path`，超 `max_mb` 轮转 `.jsonl.1`）+ 1000 条环形缓冲；
+`logs` 端点从环形缓冲读。仅内存，无 MQ 后端接入（入 backlog）。
+
 ## 7. 响应信封与错误码
 
 > 何时读我：设计错误返回或排查非 200 时。
@@ -1990,6 +2089,28 @@ broker:
 缺省（无 `broker:` 段）= 进程内 Bus（跨实例不互通）。`kind: kafka`/`rabbitmq` 需对应
 插件，未装 → 启动报 `unknown broker kind`。
 
+### tasks —— 任务池（v0.1.28）
+
+```yaml
+tasks:
+  # dir: tasks                # 任务目录（api-path 相对；递归扫描 task_{name}.* / {name}_task.*）
+  # max: 64                   # 任务数上限（同名双写拒启）
+  # stop_grace_secs: 30       # 停机宽限（TLA 任务看门狗/池化 teardown 共用）
+  pool:
+    workers: 4                # 池化/cron 任务 worker 线程数（静态轮转分配）
+    loop_body_timeout_ms: 5000  # 单轮 loop_body 看门狗超时（超时 → teardown → failed）
+    interval_ms: 100          # 轮间节奏：每轮返回后 sleep 这么久再下一轮（防空转独占 Worker）
+                             #   0 = 不限制（立即轮转——压测语义，生产会打满多核）
+  crontab: task/crontab.yaml  # cron 清单（相对 tasks.dir，5 字段：分 时 日 月 周  相对路径）；缺省不启用
+  event_log:
+    enabled: true             # 任务事件 JSONL 日志（内存池的落盘侧）
+    path: logs/task-events.jsonl
+    max_mb: 16                # 超量轮转 .jsonl.1（朴素单备份）
+```
+
+双模分流：导出 `loop_body` 的任务文件走池化（§6「池化任务与 cron」）；其余走存量
+TLA 监督器。两者皆无（无 loop_body 导出、无 crontab 文件）则不创建任务池。
+
 ### ws —— WebSocket 运行时（v0.1.10）
 
 ```yaml
@@ -2112,6 +2233,7 @@ vars:
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
+| crontab.yaml 坏行（非 5 字段 cron + 路径 / 路径不存在） | fail-fast 退出，报错带 `:行号:`（v0.1.28） |
 
 ## 11. 构建与发布
 

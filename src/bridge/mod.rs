@@ -55,6 +55,7 @@ mod plugins_op;
 mod query;
 mod registry;
 mod runtime;
+pub mod task_pool;
 pub mod transpile;
 mod vars;
 mod ws;
@@ -897,6 +898,89 @@ impl Bridge {
         })
     }
 
+    /// 池化任务会话建立（PRD v2 §6.3）：借出 runtime（不还池，交给 TaskPool Worker 持有），
+    /// driver import 任务模块 → 装配 `__task_hooks`/`__task_call` → **执行 setup** →
+    /// 经 json.ok 回报三钩子存在性。钩子为**命名导出**（setup/loop_body/teardown），
+    /// 模块作用域即任务 ctx（FR-EP-003/004）。管道与 ws_connect 同构（装配期一次性）。
+    pub async fn task_connect(&self, task_file: &std::path::Path) -> Result<TaskSession, RunError> {
+        let spec = module_loader::versioned_specifier(task_file)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        let code = format!(
+            "const m = await import(\"{spec}\");\n\
+             const fns = {{}};\n\
+             for (const k of [\"setup\", \"loop_body\", \"teardown\"])\n\
+               fns[k] = typeof m[k] === \"function\" ? m[k] : null;\n\
+             globalThis.__task_hooks = fns;\n\
+             globalThis.__task_call = async (name) => {{\n\
+               const fn = globalThis.__task_hooks[name];\n\
+               if (!fn) throw new Error(\"task hook '\" + name + \"' not exported\");\n\
+               await fn();\n\
+             }};\n\
+             if (fns.setup) await fns.setup();\n\
+             json.ok({{ setup: !!fns.setup, loop_body: !!fns.loop_body, teardown: !!fns.teardown }});\n"
+        );
+        let driver_spec = deno_core::ModuleSpecifier::parse("file:///oj/task_connect.js")
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
+        let mut rt = self
+            .checkout_armed(RequestInfo::default(), WS_CONNECT_TIMEOUT, None)
+            .await?;
+        let result: Result<(), CoreError> = async {
+            let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
+            let eval = rt.mod_evaluate(id);
+            rt.run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await?;
+            eval.await?;
+            Ok(())
+        }
+        .await;
+        if self.kill.disarm() {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Timeout);
+        }
+        if let Err(e) = result {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Core(e));
+        }
+        let cap = Self::read_capture(&rt);
+        Self::finalize_tx(&rt).await;
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
+        if v["data"]["loop_body"].as_bool() != Some(true) {
+            let _ = rt
+                .run_event_loop(deno_core::PollEventLoopOptions::default())
+                .await;
+            return Err(RunError::Core(CoreError::from(std::io::Error::other(
+                format!(
+                    "task '{}' must export loop_body (named export) to run in TaskPool",
+                    task_file.display()
+                ),
+            ))));
+        }
+        Ok(TaskSession {
+            rt,
+            kill: Arc::clone(&self.kill),
+        })
+    }
+
+    /// 判别任务文件模式（PRD v2 FR-LT-004）：存在 `loop_body` 命名导出 → 池化模式；
+    /// 否则 → 存量 TLA 监督模式。装配期一次性探测，复用 introspect 管道。
+    pub async fn probe_task_loop(&self, task_file: &std::path::Path) -> Result<bool, RunError> {
+        let spec = module_loader::versioned_specifier(task_file)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        let code = format!(
+            "const m = await import(\"{spec}\");\n\
+             json.ok({{ loop: typeof m.loop_body === \"function\" }});\n"
+        );
+        let cap = self
+            .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
+            .await?;
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap_or_default();
+        Ok(v["data"]["loop"].as_bool() == Some(true))
+    }
+
     /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
     /// KillSwitch/ReqState 复用 run_ws 的熔断与捕获路径；被熔断的 runtime 同样不归还池。
     pub async fn run_module(
@@ -1046,6 +1130,54 @@ pub struct WsOutcome {
 pub enum WsSend {
     Text(String),
     Binary(Vec<u8>),
+}
+
+/// 池化任务驻留会话（PRD v2 §6.2/6.3）：模块已加载、setup 已执行，模块作用域 = 任务 ctx。
+/// `!Send`：钉在 TaskPool Worker 线程的 current_thread runtime 上；**永不还池**。
+pub struct TaskSession {
+    pub(crate) rt: JsRuntime,
+    pub(crate) kill: Arc<runtime::KillSwitch>,
+}
+
+impl std::fmt::Debug for TaskSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("TaskSession").finish_non_exhaustive()
+    }
+}
+
+impl TaskSession {
+    /// 触发一个任务钩子（loop_body / teardown）。重置 per-call ReqState、武装看门狗、
+    /// 调 `__task_call(hook)`、排空 event loop。超时 → runtime 已被 terminate（毒化），
+    /// 调用方必须丢弃会话（teardown 不承诺，Rust Drop 兜底——FR-LT-005）。
+    pub async fn fire(&mut self, hook: &str, timeout: std::time::Duration) -> Result<(), RunError> {
+        {
+            let op_state = runtime::op_state(&self.rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().reset(RequestInfo::default());
+        }
+        let handle = self.rt.v8_isolate().thread_safe_handle();
+        self.kill.arm(handle, timeout);
+        let hook_lit = serde_json::to_string(hook).unwrap_or_else(|_| "\"\"".into());
+        let code = format!("globalThis.__task_call({hook_lit});");
+        let result = match self.rt.execute_script("task_event.js", code) {
+            Ok(_) => {
+                self.rt
+                    .run_event_loop(deno_core::PollEventLoopOptions::default())
+                    .await
+            }
+            Err(e) => Err(CoreError::from(e)),
+        };
+        if self.kill.disarm() {
+            return Err(RunError::Timeout);
+        }
+        result.map_err(RunError::Core)?;
+        Self::finalize_tx_pub(&self.rt).await;
+        Ok(())
+    }
+
+    async fn finalize_tx_pub(rt: &JsRuntime) {
+        Bridge::finalize_tx(rt).await;
+    }
 }
 
 /// WS 驻留会话：每连接独占的 runtime（模块已加载、钩子已装配）。
