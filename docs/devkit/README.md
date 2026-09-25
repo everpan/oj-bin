@@ -6,8 +6,8 @@
 
 | 文件 | 用途 |
 |---|---|
-| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、**部署期常量 `vars`（v0.1.25）**、**静态站点与 per-route meta（含动态 `html_meta_handler`，v0.1.25）**、**大整数与 i64（`toBigInt`/`toUBigInt`/`toDouble`，雪花 id 必读）、平台序列 `db.nextSeq`、MySQL 读侧列类型边界**、**3xx 重定向原语 `json.redirect`（v0.1.26）**、ext_boot.js 运行时扩展）、鉴权租户（含 `tenant_id` 列类型白名单）、测试、配置、构建发布、运维（含 PG 语句缓存前缀）、安全红线 |
-| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta（构建期 JSON + **按数据注入的动态 handler**，v0.1.25）、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`，v0.1.21）、取号与雪花 id 的生成/精确回写（`db.nextSeq` / `toBigInt`，v0.1.24）、302 重定向到 blob 预签名 URL（`json.redirect`，v0.1.26）——每篇给「配置 + 代码 + 验证 + 常见坑」 |
+| `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**邮件投递 `Mail`/`mail`**、**部署期常量 `vars`（v0.1.25）**、**静态站点与 per-route meta（含动态 `html_meta_handler`，v0.1.25）**、**大整数与 i64（`toBigInt`/`toUBigInt`/`toDouble`，雪花 id 必读）、平台序列 `db.nextSeq`、MySQL 读侧列类型边界**、**3xx 重定向原语 `json.redirect`（v0.1.26）**、**`_name_` 目录段即路径参数（v0.1.27）**、ext_boot.js 运行时扩展）、鉴权租户（含 `tenant_id` 列类型白名单）、测试、配置、构建发布、运维（含 PG 语句缓存前缀）、安全红线 |
+| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta（构建期 JSON + **按数据注入的动态 handler**，v0.1.25）、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`，v0.1.21）、取号与雪花 id 的生成/精确回写（`db.nextSeq` / `toBigInt`，v0.1.24）、302 重定向到 blob 预签名 URL（`json.redirect`，v0.1.26）、**路径参数路由：`_name_` 目录 vs `.route`（v0.1.27）**——每篇给「配置 + 代码 + 验证 + 常见坑」 |
 | `SKILL.md` | Claude Code 等 agent 的 skill 入口：工作流、红线、checklist、陷阱速查，按章节号引用手册 |
 | `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示。来源为 `sample/global.d.ts`，经 `cargo xtask build` 与本目录文档一同归置到 `bin/devkit/` |
 | `oj-modules.d.ts` | **`#` 导入别名的 ambient 兜底**（`declare module "#*"`）：oj 的 `#x`/`#/m/x` 是「引用方模块」相对别名，TS `paths` 无法表达，无法静态定位的 `#` 导入会被兜底为 `any`（不再报 TS2307）。**非模块** `.d.ts`，须与 `global.d.ts` 一并拷入项目并纳入 tsconfig `include` |

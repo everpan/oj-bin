@@ -218,7 +218,9 @@ HTTP 请求
 handler 是 ESM 源码（dev 模式 `.ts` 按需转译，release 模式服务 `oj build` 产物 `.js`）。
 **目录镜像路由**：`src/user/profile/detail/api.ts` → `/v1/api/user/profile/detail/`；
 `api.ts` 导出 `get`/`post`/`put`/`del`/`patch`/`head`/`options`（HTTP 方法同名，`DELETE`→
-`del`）；可选 `get.route = "{id}"` 声明路径参数（matchit 语法，挂载后**替换**目录镜像路由；
+`del`）；目录段写整段 `_name_` 即路径参数（v0.1.27，`_id_/` → `{id}`，避免 `{}` 进文件
+路径，谓词见 api-manual 路由章）；可选 `get.route = "{id}"` 声明路径参数（matchit 语法，
+挂载后**替换**目录镜像路由；
 参数段不得混字面，`{*path}` 至少匹配一段）。handler **必须调用一次** `json.ok` / `json.fail` /
 `finish` 才能完成会话；顶层可直接 `await`（event loop 由 driver 泵至 Promise 落定）。
 

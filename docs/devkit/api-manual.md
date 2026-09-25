@@ -388,6 +388,12 @@ export default { get: detail };
 
 `.route` 规则：
 
+- **目录段 `_name_` 即路径参数（v0.1.27）**：目录名写成整段 `_name_`（首尾各一个下划线），
+  URL 中即 `{name}`。例：`user/_id_/api.ts` → `/user/{id}`，`http.param("id")` 取值；
+  模块段同样适用（`_aa_/bb/api.ts` → `/{aa}/bb`）。谓词：整段、内部名非空且不以 `_`
+  开头/结尾、不含 `{}`——`__x__`/`___`/`_a{b}_` 保持字面；`_shared`（无尾下划线）
+  不受影响。可与 `.route` 自由组合：`_id_/api.ts` 挂 `.route = "{sub}"` → `{id}/{sub}`。
+  注意 URL 字面写 `_id_` 会被 `{id}` 当实参吃掉（不再有静态 `_id_` 路由）。
 - 挂载后**目录镜像被替换**：`/user/item`（镜像路径）→ 404，只有参数路由可达。
 - **静态段优先于参数段**（与注册顺序无关）：`/x/{pk}` 与 `/x/me` 共存时，`GET /x/me` 必落
   `me` 的 handler 且 `http.param("pk")` 为空；只有 `/x/abc` 之类非静态名才进 `{pk}`。
@@ -401,7 +407,8 @@ export default { get: detail };
 - `oj build` 会把 `.route` 从产物中剥离——**release 下路由事实唯一来源是构建生成的
   `routes.js`**（第 11 章）。
 
-解析顺序：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
+解析顺序：路由表（含 `.route` 参数路由与 `_name_` 目录参数）→ dev 目录镜像兜底
+（dev 模式，表外文件可经 `_x_` 目录下降并提取参数）→
 静态站点（`server.app_path`，`server.app_prefix` 前缀内（默认 `/`），仅 GET/HEAD）→ 404。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
@@ -2359,6 +2366,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
 | `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |
+| `_name_` 目录段必须整段且参数名合法（v0.1.27） | `__x__`/`___`/`_a{b}_` 不转换（保持字面）；转换产物由 `oj build` 期 pattern 试插校验把关，非法/同位异名即构建失败 |
+| 同层异名 `_x_` 目录是结构性冲突（v0.1.27） | `_aa_/` 与 `_bb_/` 并存 → 后者启动丢弃并告警（matchit 同位异名规则，与 `.route` 同） |
+| WS 目录镜像不转换 `_name_`（v0.1.27） | `_name_/ws.ts` 暴露字面 URL；WS 侧暂不支持动态段（v0.2 评估） |
 | `tenant guard: tenant id "acme" is not a valid integer for numeric column …`（v0.1.24） | `tenant_id` 列声明为 integer/bigint，但租户头不是十进制字面量；数值租户列请用数字租户 id，或把列改成 text |
 | i64 超界读出来是字符串，不是 number（v0.1.22） | `\|v\| > 2^53-1`（雪花 id 常态）按值域分流为十进制字符串——改过 `typeof id === "number"` 判断的代码要复查；回写用 `toBigInt()`，别用 `Number()`（会静默坍缩） |
 | `Number("<大整数串>")` 平台拦不住 | 语言语义，只能靠范式：`toBigInt(rows[0].m) + 1n`（`toBigInt` 对已坍缩的值会抛错） |
