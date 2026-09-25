@@ -646,6 +646,44 @@ curl -i '<location 值>'   # 第二跳：200，字节数 = 对象大小
 | 测出来是 200 且 body 是 HTML | 客户端自动跟随了跳转。curl 加 `-i`（或 `--max-redirs 0`），代码里关跟随，断言**第一跳**的 302 + `location` |
 | 传了 code 但不是 3xx（如 `json.redirect(url, 200)`） | op 层一律回落 302——原语杜绝「200 + Location」畸形响应 |
 
+## 场景 9：路径参数路由——`_name_` 目录 vs `.route`
+
+### ① 路由文件
+
+src 下 `user/_id_/api.ts`：
+
+```ts
+function get() {
+  json.ok({ id: http.param("id") });
+}
+export default { get };
+```
+
+URL：`/v1/api/user/42` → `{ id: "42" }`。目录段 `_id_`（首尾各一个下划线）即声明
+参数，避免 `{}` 进文件路径；深层同理：`user/_id_/item/_sku_/api.ts` →
+`/user/{id}/item/{sku}`。
+
+### ② 与 .route 组合
+
+`_id_/api.ts` 内 `get.route = "{sub}"` → `/user/{id}/{sub}`。`.route` 值本身用
+matchit 语法（`{name}`）；`_name_` 写进 `.route` 是**字面段**（dev/build 会打 warn）。
+
+### ③ 验证
+
+```bash
+curl http://localhost:9778/v1/api/user/42
+# → {"code":0,"msg":"ok","data":{"id":"42"}}
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| `__x__`/`_a{b}_` 目录没变成参数 | 谓词是整段 `_name_` 且内部名不以 `_` 开头/结尾、不含 `{}`——这两种形态保持字面 |
+| 同层 `_aa_/` 与 `_bb_/` 只有一个生效 | 同位异名参数是结构性冲突，后者启动丢弃并告警（与 `.route` 同规则） |
+| URL 里写 `_id_` 返回了 `"_id_"` 当 id | 转换后没有静态 `_id_` 路由，`{id}` 把 `_id_` 当实参吃掉 |
+| `oj build` 报 `invalid route pattern` | 构建期 pattern 试插校验（v0.1.27）——如 `.route = "{id}.json"`（参数段混字面）在 build 期就失败，不再等到部署启动 |
+
 ---
 
 ## 相关文档

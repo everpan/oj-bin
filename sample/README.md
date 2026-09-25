@@ -5,6 +5,7 @@
   cargo xtask build                                                            # 先产出 bin/oj + bin/plugins/<triple>/（release）
   ./bin/oj server -c sample/config.yaml --api-path sample/src                  # dev（TS，热重载；启动自动迁移）
   curl http://localhost:9778/v1/api/user/account/?id=1
+  curl http://localhost:9778/v1/api/user/42                       # `_name_` 目录段即路径参数（src/user/_id_/）
 
   ./bin/oj build -d sample/src -o sample/dist                      # 构建（版本目录+migrations+锁+tgz）
   ./bin/oj build --check -d sample/src                             # 结构检查（S002–S006，CI 门禁，不落盘）
