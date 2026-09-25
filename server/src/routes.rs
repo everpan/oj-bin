@@ -28,8 +28,11 @@ impl Routes {
         }
     }
 
-    /// 解析 HTTP 路径 → api 文件绝对路径；目录不存在/越界/非文件 → None。
-    pub fn resolve(&self, http_path: &str) -> Option<PathBuf> {
+    /// 解析 HTTP 路径 → (api 文件绝对路径, 路径参数)。目录不存在/越界/非文件 → None。
+    /// 快路径：字面 join（无参，旧契约）；miss 时带回溯下降（每层 字面 → 首个排序
+    /// `_x_` 候选），经 `_x_` 段收集 (参数名, 实参段)，最后统一过 `decode_params`
+    /// （percent-decode + 走私校验，不过 → 404，与表内命中同一条防线）。
+    pub fn resolve(&self, http_path: &str) -> Option<(PathBuf, HashMap<String, String>)> {
         let rel = http_path.strip_prefix(self.base.as_str())?;
         let rel = rel.trim_matches('/');
         if rel.is_empty() {
@@ -42,12 +45,79 @@ impl Routes {
         {
             return None;
         }
+        let segs: Vec<&str> = rel.split('/').collect();
+        let api = if self.ts { "api.ts" } else { "api.js" };
         let file = self
             .root
-            .join(rel)
-            .join(if self.ts { "api.ts" } else { "api.js" });
-        file.is_file().then_some(file)
+            .join(segs[..].iter().collect::<PathBuf>())
+            .join(api);
+        if file.is_file() {
+            return Some((file, HashMap::new()));
+        }
+        // ponytail: 每层至多一次 read_dir（dev 兜底、仅表外 miss 路径）；
+        // 树极宽且高频 miss 时再考虑缓存。
+        let mut raw: Vec<(String, String)> = Vec::new();
+        let file = self.descend(&self.root, &segs, api, &mut raw)?;
+        decode_params(raw.into_iter()).map(|params| (file, params))
     }
+
+    /// 单层候选序：字面目录 → 排序后首个 `_x_` 目录（同位异名参数在建表期即结构性
+    /// 冲突被丢弃，只试首个，避免命中 release 永远服务不到的路由）。子树失败回溯，
+    /// 回溯时截断已收集的参数。
+    fn descend(
+        &self,
+        dir: &Path,
+        segs: &[&str],
+        api: &str,
+        raw: &mut Vec<(String, String)>,
+    ) -> Option<PathBuf> {
+        if segs.is_empty() {
+            let f = dir.join(api);
+            return f.is_file().then_some(f);
+        }
+        let mark = raw.len();
+        // 1) 字面目录优先（对齐 matchit 静态段优先）。
+        let lit = dir.join(segs[0]);
+        if lit.is_dir()
+            && let Some(f) = self.descend(&lit, &segs[1..], api, raw)
+        {
+            return Some(f);
+        }
+        raw.truncate(mark);
+        // 2) 首个排序后的 `_x_` 候选。
+        let (name, sub) = underscore_child(dir)?;
+        raw.push((name, segs[0].to_string()));
+        let out = self.descend(&sub, &segs[1..], api, raw);
+        if out.is_none() {
+            raw.truncate(mark);
+        }
+        out
+    }
+}
+
+/// 目录下排序后的首个可转换 `_name_` 子目录 → (参数名, 路径)。无则 None。
+/// 用严格转换谓词（`fs_seg_to_pattern` 有转换才命中），与建表期口径一致：
+/// `__x__`/`_a{b}_` 这类不转换的目录在这里同样不是参数候选。
+fn underscore_child(dir: &Path) -> Option<(String, PathBuf)> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut cands: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let conv = fs_seg_to_pattern(&name);
+            if e.path().is_dir() && conv != name {
+                let inner = conv
+                    .trim_start_matches('{')
+                    .trim_end_matches('}')
+                    .to_string();
+                Some((inner, e.path()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    cands.sort();
+    cands.into_iter().next()
 }
 
 /// 查表前守卫+归一：`\`/`\0`/空段/`.`/`..` → None（404，对齐旧 resolve 契约，routes.rs:28-33）；
@@ -574,15 +644,15 @@ mod tests {
         let root = fixture(&["user/account/api.ts", "user/profile/detail/api.ts"]);
         let r = Routes::new("/v1/api", &root, true);
         assert_eq!(
-            r.resolve("/v1/api/user/account/"),
+            r.resolve("/v1/api/user/account/").map(|(f, _)| f),
             Some(root.join("user/account/api.ts"))
         );
         assert_eq!(
-            r.resolve("/v1/api/user/account"),
+            r.resolve("/v1/api/user/account").map(|(f, _)| f),
             Some(root.join("user/account/api.ts"))
         );
         assert_eq!(
-            r.resolve("/v1/api/user/profile/detail/"),
+            r.resolve("/v1/api/user/profile/detail/").map(|(f, _)| f),
             Some(root.join("user/profile/detail/api.ts"))
         );
     }
@@ -612,6 +682,66 @@ mod tests {
                 .resolve("/v1/api/user/account/")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_underscore_dir_descends_with_params() {
+        let root = fixture(&["a/_id_/api.ts"]);
+        let r = Routes::new("/v1/api", &root, true);
+        match r.resolve("/v1/api/a/42") {
+            Some((f, p)) => {
+                assert_eq!(f, root.join("a/_id_/api.ts"));
+                assert_eq!(p["id"], "42");
+            }
+            None => panic!("expected hit"),
+        }
+        // 字面 `_id_` URL：兜底快路径命中磁盘字面目录（无参数）——生产上流
+        // 程表查询在前，注册过的 `_id_` 目录由 `{id}` 参数吃掉（见
+        // table_underscore_dir_becomes_param）；兜底只服务表外文件，保持字面优先。
+        let (f, p) = r.resolve("/v1/api/a/_id_").unwrap();
+        assert_eq!(f, root.join("a/_id_/api.ts"));
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    #[test]
+    fn resolve_descend_literal_first_and_backtracks() {
+        // 字面目录优先：a/me/api.ts 存在时 /a/me 命中它（无参数）。
+        let root = fixture(&["a/_id_/api.ts", "a/me/api.ts"]);
+        let r = Routes::new("/v1/api", &root, true);
+        let (f, p) = r.resolve("/v1/api/a/me").unwrap();
+        assert_eq!(f, root.join("a/me/api.ts"));
+        assert!(p.is_empty(), "{p:?}");
+        // 回溯：字面 a/b/ 存在但子树死路，回退到 _x_ 候选。
+        let root2 = fixture(&["a/_x_/c/api.ts"]);
+        std::fs::create_dir_all(root2.join("a/b")).unwrap();
+        let r2 = Routes::new("/v1/api", &root2, true);
+        let (f2, p2) = r2.resolve("/v1/api/a/b/c").unwrap();
+        assert_eq!(f2, root2.join("a/_x_/c/api.ts"));
+        assert_eq!(p2["x"], "b");
+    }
+
+    #[test]
+    fn resolve_descend_first_candidate_only_and_smuggling() {
+        // 同层多个 _x_：只试排序首个（对齐建表期同位异名丢弃语义）。
+        let root = fixture(&["a/_aa_/api.ts", "a/_bb_/api.ts"]);
+        let r = Routes::new("/v1/api", &root, true);
+        let (f, p) = r.resolve("/v1/api/a/zz").unwrap();
+        assert_eq!(f, root.join("a/_aa_/api.ts"));
+        assert_eq!(p["aa"], "zz");
+        // 走私：%2e%2e / a%2Fb 经参数段 → decode_params 拒 → 404
+        assert!(r.resolve("/v1/api/a/%2e%2e").is_none());
+        assert!(r.resolve("/v1/api/a/a%2Fb").is_none());
+    }
+
+    #[test]
+    fn resolve_deep_mixed_underscore_dirs() {
+        // PRD 原例形态（含模块段 _aa_）。
+        let root = fixture(&["_aa_/bb/_cc_/api.ts"]);
+        let r = Routes::new("/v1/api", &root, true);
+        let (f, p) = r.resolve("/v1/api/11/bb/22").unwrap();
+        assert_eq!(f, root.join("_aa_/bb/_cc_/api.ts"));
+        assert_eq!(p["aa"], "11");
+        assert_eq!(p["cc"], "22");
     }
 
     #[test]

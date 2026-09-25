@@ -418,7 +418,7 @@ async fn handle(
         }
     }
     // dev 兜底：目录镜像（挂 .route 的方法已被替换，不得复活）。
-    if let Some(file) = st.fallback.as_ref().and_then(|fb| fb.resolve(uri.path())) {
+    if let Some((file, params)) = st.fallback.as_ref().and_then(|fb| fb.resolve(uri.path())) {
         // 表内路径经过 canonicalize（macOS /var ↔ /private/var），对齐后再比对
         let file = file.canonicalize().unwrap_or(file);
         match crate::routes::method_name(verb) {
@@ -431,7 +431,7 @@ async fn handle(
                     parse_query(uri.query()),
                     path_no_base.as_deref(),
                     file,
-                    HashMap::new(),
+                    params,
                 )
                 .await;
             }
