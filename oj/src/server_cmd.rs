@@ -13,7 +13,7 @@ use only_js::bridge::plugin_loader::{
     host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
 use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo};
-use only_js::config::{self, Config};
+use only_js::config::{self, Config, StaticSiteConf};
 
 use crate::app::App;
 use crate::args::ServerArgs;
@@ -29,10 +29,9 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
     // （统一装配点）判定，CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
     // 路径语义：CLI `--app-path` 相对 CWD（此处预绝对化）；config `server.app_path`
-    // 相对 config_dir（resolve_static_root 统一处理）。
-    if let Some(p) = a.app_path {
-        let cwd = std::env::current_dir().map_err(|e| format!("resolve --app-path {p}: {e}"))?;
-        cfg.server.app_path = Some(absolutize_cwd(&cwd, &p));
+    // 相对 config_dir（装配期站点表统一处理）。
+    if !a.app_path.is_empty() {
+        fold_cli_app_paths(&mut cfg, &a.app_path)?;
     }
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
@@ -40,18 +39,19 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
     if let Some(p) = a.key_path {
         cfg.server.public_key_path = p;
     }
-    // 准入门（admission_gate 三态）：api（--api-path）与静态（server.app_path /
-    // CLI --app-path）至少显式指定其一；皆指定则两者都必须存在；仅指定其一 →
-    // 只启用对应功能。
+    // 准入门（admission_gate）：api（--api-path）与静态（server.app_path /
+    // server.static_sites / CLI --app-path）至少显式指定其一。静态目录存在性统一由
+    // 装配期站点表解析 fail-fast（含具体 prefix 来源）。
     let api_specified = a.api_path.is_some();
+    let app_specified =
+        cfg.server.app_path.is_some() || !cfg.server.static_sites.is_empty();
     admission_gate(
         if api_specified {
             Some(dir.as_path())
         } else {
             None
         },
-        cfg.server.app_path.as_deref(),
-        &config_dir,
+        app_specified,
     )?;
     // 纯静态模式：api 功能未启用。from_config 需要看到「无 API 目录」（模块扫描
     // NotFound = 空 = 无路由），而 load_app_config 的默认搜索可能已命中 src/，
@@ -256,55 +256,24 @@ pub fn load_app_config(
 /// - 只指定其一 → 该目录必须存在，仅启用对应功能（api 缺席 = 纯静态；app 缺席 = 纯 API）；
 /// - 都未指定 → Err，提醒两者必须指定其一（不再自动搜索 src/dist 兜底）。
 ///
-/// `api_dir`：Some = 指定了 `--api-path`（CLI）；`app_path`：Some = 指定了静态根
-/// （config `server.app_path` 或 CLI `--app-path`，相对路径按 config_dir 解析）。
-fn admission_gate(
-    api_dir: Option<&Path>,
-    app_path: Option<&str>,
-    config_dir: &Path,
-) -> Result<(), String> {
-    let app_dir = |p: &str| {
-        let pp = Path::new(p);
-        if pp.is_absolute() {
-            pp.to_path_buf()
-        } else {
-            config_dir.join(pp)
-        }
-    };
-    match (api_dir, app_path) {
-        (None, None) => Err(
-            "neither api path (--api-path) nor static site (server.app_path / --app-path) \
-             specified — one of them is required to start"
+/// `api_dir`：Some = 指定了 `--api-path`（CLI）；`app_specified`：配置了任一静态站点
+/// （config `server.app_path` / `server.static_sites` 或 CLI `--app-path`）。
+/// 静态目录存在性不在此判——装配期站点表解析统一 fail-fast（含具体 prefix）。
+fn admission_gate(api_dir: Option<&Path>, app_specified: bool) -> Result<(), String> {
+    match (api_dir, app_specified) {
+        (None, false) => Err(
+            "neither api path (--api-path) nor static site (server.app_path / \
+             server.static_sites / --app-path) specified — one of them is required to start"
                 .to_string(),
         ),
-        (None, Some(p)) => {
-            // 纯静态：app 目录必须存在。
-            let full = app_dir(p);
-            if full.is_dir() {
-                Ok(())
-            } else {
-                Err(format!(
-                    "static site dir not found: {}（server.app_path / --app-path）",
-                    full.display()
-                ))
-            }
-        }
-        (Some(api), app) => {
-            // api 必须存在；app 若也指定，同样必须存在（否则启用了个寂寞）。
+        (None, true) => Ok(()), // 纯静态：目录存在性由装配期站点表解析 fail-fast。
+        (Some(api), _) => {
+            // api 必须存在；静态站点（若有）由装配期 fail-fast。
             if !api.is_dir() {
                 return Err(format!(
                     "api path not found: {}（src 源码树或 oj build 产物 dist）",
                     api.display()
                 ));
-            }
-            if let Some(p) = app {
-                let full = app_dir(p);
-                if !full.is_dir() {
-                    return Err(format!(
-                        "static site dir not found: {}（server.app_path / --app-path）",
-                        full.display()
-                    ));
-                }
             }
             Ok(())
         }
@@ -329,6 +298,49 @@ fn resolve_base(cli: Option<&str>, cfg: &str) -> Result<String, String> {
         return Err("base prefix must not be empty (-b / server.api_prefix)".into());
     }
     Ok(b.to_string())
+}
+
+/// CLI `--app-path` 折叠进 config（v0.1.27，可重复）：
+/// - 裸 `dir`（至多一次）→ 覆盖 `server.app_path`，按 CWD 预绝对化（legacy 单值语义）；
+/// - `prefix=dir` → `server.static_sites` 中同前缀条目替换、否则追加（CLI 优先于 config）；
+///   prefix 过 `resolve_app_prefix` 规范化校验。
+fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("resolve --app-path: {e}"))?;
+    let mut bare: Option<&str> = None;
+    for e in entries {
+        match e.split_once('=') {
+            None => {
+                if bare.is_some() {
+                    return Err("--app-path <dir> (bare) may appear at most once; use prefix=dir for additional sites".into());
+                }
+                bare = Some(e);
+            }
+            Some((prefix, dir)) => {
+                let p = resolve_app_prefix(prefix)
+                    .map_err(|e| format!("--app-path prefix {prefix:?}: {e}"))?;
+                let dir = absolutize_cwd(&cwd, dir);
+                // 同前缀判定走规范化口径（config 侧可能带尾斜杠等未规范形态）。
+                let idx = cfg.server.static_sites.iter().position(|s| {
+                    resolve_app_prefix(&s.prefix).is_ok_and(|x| x == p)
+                });
+                match idx {
+                    Some(i) => {
+                        let s = &mut cfg.server.static_sites[i];
+                        s.prefix = p;
+                        s.path = dir;
+                    }
+                    None => cfg.server.static_sites.push(StaticSiteConf {
+                        prefix: p,
+                        path: dir,
+                    }),
+                }
+            }
+        }
+    }
+    if let Some(dir) = bare {
+        cfg.server.app_path = Some(absolutize_cwd(&cwd, dir));
+    }
+    Ok(())
 }
 
 /// 静态站点前缀归一（`server.app_prefix`，默认 "/"）：必须以 `/` 开头；尾斜杠剪除；
@@ -990,25 +1002,50 @@ mod tests {
     #[test]
     fn admission_gate_three_states() {
         // 三态准入：皆指定 → 两者都必须存在；指定其一 → 该目录必须存在；
-        // 皆未指定 → Err 提醒必须指定其一。
+        // 皆未指定 → Err 提醒必须指定其一。静态站点存在性移交装配期（fail-fast）。
         let t = tmpdir("admit");
         std::fs::create_dir(t.0.join("src")).unwrap();
-        std::fs::create_dir(t.0.join("site")).unwrap();
         // 皆指定且都存在 → Ok。
-        assert!(admission_gate(Some(Path::new("src")), Some("site"), &t.0).is_ok());
-        // 皆指定但 api 缺失 → Err（两者都必须校验存在性）。
-        assert!(admission_gate(Some(Path::new("no-api")), Some("site"), &t.0).is_err());
-        // 皆指定但 app 缺失 → Err。
-        assert!(admission_gate(Some(Path::new("src")), Some("no-site"), &t.0).is_err());
+        assert!(admission_gate(Some(Path::new("src")), true).is_ok());
+        // 皆指定但 api 缺失 → Err。
+        assert!(admission_gate(Some(Path::new("no-api")), true).is_err());
         // 仅 api：存在 → Ok，缺失 → Err。
-        assert!(admission_gate(Some(Path::new("src")), None, &t.0).is_ok());
-        assert!(admission_gate(Some(Path::new("no-api")), None, &t.0).is_err());
-        // 仅 app：存在 → Ok，缺失 → Err。
-        assert!(admission_gate(None, Some("site"), &t.0).is_ok());
-        assert!(admission_gate(None, Some("no-site"), &t.0).is_err());
+        assert!(admission_gate(Some(Path::new("src")), false).is_ok());
+        assert!(admission_gate(Some(Path::new("no-api")), false).is_err());
+        // 仅静态站点声明：装配期再 fail-fast 目录存在性（gate 只判「指定与否」）。
+        assert!(admission_gate(None, true).is_ok());
         // 皆未指定 → Err。
-        let e = admission_gate(None, None, &t.0).unwrap_err();
+        let e = admission_gate(None, false).unwrap_err();
         assert!(e.contains("--api-path"), "{e}");
+    }
+
+    #[test]
+    fn fold_cli_app_paths_rules() {
+        // 裸 dir：覆盖主站点 app_path；至多一次。
+        let mut c = Config::default();
+        fold_cli_app_paths(&mut c, &["web".into()]).unwrap();
+        assert!(c.server.app_path.as_deref().unwrap().ends_with("web"));
+        assert!(c.server.static_sites.is_empty());
+        assert!(fold_cli_app_paths(&mut c, &["a".into(), "b".into()]).is_err());
+        // prefix=dir：追加 + 同前缀替换（规范化口径：config 带尾斜杠也命中）。
+        let mut c = Config::default();
+        c.server.static_sites.push(StaticSiteConf {
+            prefix: "/docs/".into(),
+            path: "old".into(),
+        });
+        fold_cli_app_paths(&mut c, &["/docs=new".into(), "/app=dist/app".into()]).unwrap();
+        assert_eq!(c.server.static_sites.len(), 2);
+        let docs = c.server.static_sites.iter().find(|s| s.prefix == "/docs").unwrap();
+        assert!(docs.path.ends_with("new"), "{docs:?}");
+        let app = c.server.static_sites.iter().find(|s| s.prefix == "/app").unwrap();
+        assert!(app.path.ends_with("dist/app"), "{app:?}");
+        // 裸 + 带前缀混合。
+        let mut c = Config::default();
+        fold_cli_app_paths(&mut c, &["web".into(), "/x=dx".into()]).unwrap();
+        assert!(c.server.app_path.is_some());
+        assert_eq!(c.server.static_sites.len(), 1);
+        // 非法 prefix 报错。
+        assert!(fold_cli_app_paths(&mut Config::default(), &["docs=dx".into()]).is_err());
     }
 
     #[test]
