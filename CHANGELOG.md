@@ -37,6 +37,9 @@
   - **告警**：`.route` 值匹配 `_name_` 形态（在 `.route` 中它是**字面段**，参数写 `{name}`）
     与 `_name_` 形态模块名（同位异名双模块部署启动会结构冲突）——dev 启动与 oj build
     均打 warn（`warning: ` 前缀，不致命）。
+  - **启动路由清单改统计输出**：不再逐行打印 METHOD/PATH/FILE 三列表，改为一行
+    `routes: N method-row(s), N pattern(s), N api file(s)`；路由错误与冲突仍逐条
+    输出具体 method/pattern/文件（dev 告警 + release 硬失败不变）。
 
 **升级注意（breaking-adjacent）**
 

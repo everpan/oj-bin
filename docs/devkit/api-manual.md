@@ -103,7 +103,9 @@ export default {
 
 `server` 按 `--api-path` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
 release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码，按需转译，改文件即生效）。
-启动行会把判定结果（`dev/ts` / `release/js` / `static-only`）与模块清单、路由表写进日志。
+启动行会把判定结果（`dev/ts` / `release/js` / `static-only`）与模块清单、路由统计
+（`method-row / pattern / api file` 计数，v0.1.27 起替代逐行路由表）写进日志；
+路由错误与冲突仍逐条打出具体 method/pattern/文件。
 **终端默认静默（`server.console_log` 缺省 false）**——启动时会打一行日志路径的提示，
 随后一切输出只落盘；需要终端同时输出时加 `--console-log` 或配 `server.console_log: true`。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
