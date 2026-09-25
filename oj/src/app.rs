@@ -887,24 +887,19 @@ impl App {
         if n_err > 0 {
             eprintln!("warn: {n_err} route declaration(s) skipped (see errors above)");
         }
-        // 路由清单：等宽三列平铺表（METHOD/PATH/FILE，列宽自适应），比
-        // 「文件头 + 缩进方法」紧凑易扫。顺序沿用 grouped() 的决定序。
-        let rows: Vec<(String, String, String)> = table
-            .grouped()
-            .into_iter()
-            .flat_map(|(_, file, ms)| {
-                let f = file.display().to_string();
-                ms.into_iter().map(move |(m, p)| (m, p, f.clone()))
-            })
-            .collect();
-        if !rows.is_empty() {
-            let wm = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(6);
-            let wp = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(4);
-            eprintln!("  {:<wm$}  {:<wp$}  FILE", "METHOD", "PATH");
-            for (m, p, f) in &rows {
-                eprintln!("  {m:<wm$}  {p:<wp$}  {f}");
-            }
-        }
+        // 路由统计（v0.1.27 起替代逐行三列清单）：一行汇总；错误/冲突的具体路由
+        // 信息由上方 failures 循环逐条输出（dev warn + release 硬失败均含 pattern）。
+        let method_rows = table.listing().len();
+        let patterns = table
+            .listing()
+            .iter()
+            .map(|r| &r.pattern)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let files = table.grouped().len();
+        eprintln!(
+            "routes: {method_rows} method-row(s), {patterns} pattern(s), {files} api file(s)"
+        );
         let n = cfg.server.pool_size.max(1) as usize;
         // 通配语义 v0.1.20 收紧的迁移提示（v0.1.23 起按影响面判定）：必须等路由表就绪，
         // 才能判「改 `**` 是否会真多命中」（见 warn_legacy_tail_wildcards）。
