@@ -386,25 +386,47 @@ async fn build_one(
         }
     }
 
-    // 3. 内省（内存库）→ routes.js：pattern 无 base 含模块段（rel_pattern），
+    // 3. 内省（内存库）→ 校验/告警 → routes.js：pattern 无 base 含模块段（rel_pattern），
     //    file = 同名产物相对版本目录根（正斜杠；根级 api.ts 为裸 api.js）
     let decls = introspect_module_files(src, &mdir, &files).await?;
     let n_api = decls.len();
-    let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
-    for (dir, rows) in decls {
+    // v0.1.27 告警：`_name_` 形态模块名 → 路由参数段，同位异名双模块会在部署启动期结构冲突。
+    if routes::looks_like_underscore_param(module) {
+        eprintln!(
+            "warn: module name {module:?} looks like `_name_` fs-param syntax; it becomes a route param segment (two such modules with different names at the same slot will conflict at deployment startup)"
+        );
+    }
+    let mut rows_out: Vec<(String, String, String)> = Vec::new(); // (file, method, pattern)
+    let mut pats: Vec<String> = Vec::new();
+    for (dir, rows) in &decls {
         let file = if dir.is_empty() {
             "api.js".to_string()
         } else {
             format!("{dir}/api.js")
         };
         for (method, route) in rows {
-            js.push_str(&format!(
-                "  {{ method: {}, pattern: {}, file: {} }},\n",
-                q(&method),
-                q(&rel_pattern(module, &dir, route.as_deref())),
-                q(&file)
-            ));
+            if let Some(r) = route.as_deref().map(str::trim).filter(|r| !r.is_empty())
+                && r.split('/').any(routes::looks_like_underscore_param)
+            {
+                eprintln!(
+                    "warn: {file}: .route value {r:?} looks like `_name_` fs-param syntax; in .route it stays a literal segment (use {{name}} for params)"
+                );
+            }
+            let pat = rel_pattern(module, dir, route.as_deref());
+            pats.push(pat.clone());
+            rows_out.push((file.clone(), method.clone(), pat));
         }
+    }
+    // 构建期 fail-fast：非法 pattern / 同位异名参数在 build 期报错，免得到部署启动才爆。
+    routes::check_patterns(&pats)?;
+    let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
+    for (file, method, pat) in &rows_out {
+        js.push_str(&format!(
+            "  {{ method: {}, pattern: {}, file: {} }},\n",
+            q(method),
+            q(pat),
+            q(file)
+        ));
     }
     js.push_str("];\n");
     std::fs::write(vdir.join("routes.js"), js).map_err(|e| format!("write routes.js: {e}"))?;
@@ -658,22 +680,31 @@ fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>)
 }
 
 /// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块名段。
-/// None/空 route → 目录镜像；相对声明 → 目录 + route；根级声明（/ 开头）→ 剥首斜杠不加模块段。
+/// None/空 route → 目录镜像（v0.1.27：模块段与 rel_dir 逐段过 `fs_seg_to_pattern`，
+/// `_name_` → `{name}`）；相对声明 → 目录 + route；根级声明（/ 开头）→ 剥首斜杠
+/// 不加模块段。route 值**不转换**（matchit 语法，`{name}` 才是参数）。
 fn rel_pattern(module: &str, rel_dir: &str, route: Option<&str>) -> String {
+    let m = routes::fs_seg_to_pattern(module);
+    let conv_dir = |d: &str| {
+        d.split('/')
+            .map(routes::fs_seg_to_pattern)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
     match route.map(str::trim).filter(|r| !r.is_empty()) {
         None => {
             if rel_dir.is_empty() {
-                module.to_string()
+                m
             } else {
-                format!("{module}/{rel_dir}")
+                format!("{m}/{}", conv_dir(rel_dir))
             }
         }
         Some(r) if r.starts_with('/') => r.trim_start_matches('/').to_string(),
         Some(r) => {
             if rel_dir.is_empty() {
-                format!("{module}/{r}")
+                format!("{m}/{r}")
             } else {
-                format!("{module}/{rel_dir}/{r}")
+                format!("{m}/{}/{r}", conv_dir(rel_dir))
             }
         }
     }
@@ -1012,6 +1043,26 @@ mod tests {
     }
 
     #[test]
+    fn rel_pattern_converts_underscore_dirs_and_module() {
+        // 目录镜像：rel_dir 与模块段逐段转换（v0.1.27 `_name_` → `{name}`）
+        assert_eq!(rel_pattern("user", "_id_", None), "user/{id}");
+        assert_eq!(rel_pattern("_mod_", "x", None), "{mod}/x");
+        assert_eq!(rel_pattern("_mod_", "_id_", None), "{mod}/{id}");
+        // 相对 .route 拼在转换后的目录后
+        assert_eq!(
+            rel_pattern("user", "_id_", Some("{sub}")),
+            "user/{id}/{sub}"
+        );
+        // 根级 .route 不吃目录转换
+        assert_eq!(rel_pattern("user", "_id_", Some("/v2/x")), "v2/x");
+        // .route 值不转换：`_name_` 在其中是字面段
+        assert_eq!(rel_pattern("user", "item", Some("_id_")), "user/item/_id_");
+        // 不转换的形态保持字面
+        assert_eq!(rel_pattern("user", "_shared", None), "user/_shared");
+        assert_eq!(rel_pattern("user", "__x__", None), "user/__x__");
+    }
+
+    #[test]
     fn residual_alias_fails_the_build() {
         // 残留断言（扫描器天花板兜底）：产物里还有 `#` specifier → 显式失败
         assert!(assert_no_aliases("import x from \"#_shared/a\";\n", "m/api.js").is_err());
@@ -1177,6 +1228,49 @@ mod tests {
         src_fixture(&t);
         run(&build_args(&t, None)).await.unwrap();
         assert!(!t.join("dist/tasks").exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[tokio::test]
+    async fn build_converts_underscore_dirs_and_validates_patterns() {
+        // v0.1.27：`_name_` 目录段 → routes.js pattern `{name}`，file 保留磁盘路径；
+        // 非法 pattern 构建期 fail-fast；`.route` 值内 `_name_` 是字面段（不转换）。
+        let t = std::env::temp_dir().join(format!("oj-build-us-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("src/user/_id_")).unwrap();
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/_id_/api.ts"),
+            "function get(){ json.ok({id: http.param(\"id\")}); }\nexport default { get };\n",
+        )
+        .unwrap();
+        run(&build_args(&t, None)).await.unwrap();
+        let routes = std::fs::read_to_string(t.join("dist/user-0.1.0/routes.js")).unwrap();
+        assert!(routes.contains("\"user/{id}\""), "{routes}");
+        assert!(routes.contains("\"_id_/api.js\""), "{routes}");
+
+        // `.route = "_id_"`：字面段，构建成功且不转换
+        std::fs::write(
+            t.join("src/user/_id_/api.ts"),
+            "function get(){ json.ok({}); }\nget.route = \"_id_\";\nexport default { get };\n",
+        )
+        .unwrap();
+        run(&build_args(&t, None)).await.unwrap();
+        let routes = std::fs::read_to_string(t.join("dist/user-0.1.0/routes.js")).unwrap();
+        assert!(routes.contains("\"user/{id}/_id_\""), "{routes}");
+
+        // 非法 pattern（matchit 混合段）→ 构建期 fail-fast
+        std::fs::write(
+            t.join("src/user/_id_/api.ts"),
+            "function get(){ json.ok({}); }\nget.route = \"{id}.json\";\nexport default { get };\n",
+        )
+        .unwrap();
+        let err = run(&build_args(&t, None)).await.unwrap_err();
+        assert!(err.contains("invalid route pattern"), "{err}");
         let _ = std::fs::remove_dir_all(&t);
     }
 

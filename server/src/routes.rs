@@ -525,6 +525,25 @@ pub(crate) fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
     }
 }
 
+/// 构建期 pattern 校验（oj build fail-fast，v0.1.27）：逐条插入临时 matchit Router
+/// （补首斜杠），非法语法 / 同位异名参数 → Err。此前这类错误要到部署启动才爆
+/// （release 启动对 from_entries failures 硬失败）。重复 pattern（多方法）可合并。
+pub fn check_patterns(patterns: &[String]) -> Result<(), String> {
+    let mut r = matchit::Router::new();
+    // matchit 对完全相同的 path 重复 insert 也报 Conflict——先按字符串去重
+    // （与 RouteTable 的 slots 去重同口径；多方法共享 pattern 是常态）。
+    let mut seen = std::collections::HashSet::new();
+    for p in patterns {
+        let full = format!("/{}", p.trim_start_matches('/'));
+        if !seen.insert(full.clone()) {
+            continue;
+        }
+        r.insert(full.clone(), ())
+            .map_err(|e| format!("invalid route pattern {full:?}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// routes.js 导出行（oj build 生成；release 直载免内省）。
 pub struct RouteEntry {
     pub method: String,
@@ -886,6 +905,16 @@ mod tests {
             Lookup::Hit { params, .. } => assert!(params.is_empty(), "{params:?}"),
             other => panic!("{}", kind(&other)),
         }
+    }
+
+    #[test]
+    fn check_patterns_rejects_invalid_and_conflicting() {
+        // 合法：重复 pattern（多方法）可合并
+        assert!(check_patterns(&["u/{id}".into(), "u/{id}".into()]).is_ok());
+        // 非法语法（matchit 混合段）
+        assert!(check_patterns(&["u/{id}.json".into()]).is_err());
+        // 同位异名参数（两个 _x_ 目录的产物形态）
+        assert!(check_patterns(&["u/{aa}".into(), "u/{bb}".into()]).is_err());
     }
 
     // ----- RouteTable（纯逻辑，假内省闭包） -----
