@@ -76,44 +76,93 @@ pub fn transpile_src(path: &Path, src: &str) -> Result<String, String> {
     Ok(out.into_source().text)
 }
 
-/// minify：解析 JS → codegen minify 重排（单行、剥注释——含转译尾部内联 sourcemap，
-/// 顺带消掉其中绝对路径与整份源码副本）。确定性：同输入同输出。
-/// ponytail: codegen 级 minify（去空白/注释，不混淆、不做 DCE），保留名字利于排障；
-/// 需要更强压缩时再引 swc_ecma_minifier。
+/// minify：swc_ecma_minifier 全量压缩（DCE + 表达式压缩 + mangle 局部变量名）。
+/// 比 codegen 级 minify 压缩率更高，且函数内局部绑定被重命名（基础混淆）；
+/// mangle top_level=false 保住顶层/导出名（跨文件 import 与 routes.js file 字段不受影响），
+/// `json`/`db`/`http` 等注入全局是属性访问、不是绑定，天然不被碰。确定性：同输入同输出。
+/// ponytail: 字符串数组/控制流平坦化等强混淆不做（javascript-obfuscator 量级），
+/// 需要 `--obfuscate` 档时再议（Node 子进程或自写 swc pass）。
 pub fn minify_js(path: &Path, src: &str) -> Result<String, String> {
-    let parsed = deno_ast::parse_module(deno_ast::ParseParams {
-        specifier: deno_ast::ModuleSpecifier::from_file_path(path)
-            .unwrap_or_else(|_| deno_ast::ModuleSpecifier::parse("file:///minify.js").unwrap()),
-        text: src.into(),
-        media_type: deno_ast::MediaType::JavaScript,
-        capture_tokens: false,
-        scope_analysis: false,
-        maybe_syntax: None,
-    })
-    .map_err(|e| format!("{}: {e}", path.display()))?;
-    // 位置仅在记 srcmap 时回查；同 deno 内部 emit 流程，单文件 SourceMap 即可。
-    let cm = deno_ast::SourceMap::single(parsed.specifier().clone(), src.to_string());
-    let mut buf = vec![];
-    {
-        use deno_ast::swc::codegen::Node;
-        let mut emitter = deno_ast::swc::codegen::Emitter {
-            cfg: deno_ast::swc::codegen::Config::default().with_minify(true),
-            comments: None,
-            cm: cm.inner().clone(),
-            wr: Box::new(deno_ast::swc::codegen::text_writer::JsWriter::new(
-                cm.inner().clone(),
-                "\n",
-                &mut buf,
-                None,
-            )),
-        };
-        match parsed.program_ref() {
-            deno_ast::ProgramRef::Module(m) => m.emit_with(&mut emitter),
-            deno_ast::ProgramRef::Script(s) => s.emit_with(&mut emitter),
+    use deno_ast::swc::common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
+    use deno_ast::swc::ecma_visit::VisitMutWith;
+    use deno_ast::swc::parser::{Parser, StringInput, Syntax, lexer::Lexer};
+    use swc_ecma_minifier::option::{CompressOptions, ExtraOptions, MangleOptions, MinifyOptions};
+
+    // Mark/SyntaxContext 依赖线程局部 GLOBALS（swc 记号分配）；按 swc 惯例包一层。
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let cm: Lrc<SourceMap> = Lrc::new(SourceMap::default());
+        let fm = cm.new_source_file(
+            FileName::Real(path.to_path_buf()).into(),
+            // 相对路径造不出 file URL 之类的顾虑此处无关；src 原样进 SourceMap（mangle
+            // 的字符频率分析读它，确定性来源之一）。
+            String::from(src),
+        );
+        let comments = deno_ast::swc::common::comments::SingleThreadedComments::default();
+        let lexer = Lexer::new(
+            Syntax::Es(Default::default()),
+            deno_ast::swc::ast::EsVersion::Es2022,
+            StringInput::from(&*fm),
+            Some(&comments),
+        );
+        let mut parser = Parser::new_from(lexer);
+        let mut program = parser
+            .parse_program()
+            .map_err(|e| format!("{}: {:?}", path.display(), e))?;
+
+        // resolver 打作用域记号：区分「本文件顶层绑定」与「外部未解析引用」——
+        // mangle 只动前者，导入导出与全局引用的名字由此保住。
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        program.visit_mut_with(&mut deno_ast::swc::transforms::resolver(
+            unresolved_mark,
+            top_level_mark,
+            false,
+        ));
+
+        let program = swc_ecma_minifier::optimize(
+            program,
+            cm,
+            Some(&comments),
+            None,
+            &MinifyOptions {
+                compress: Some(CompressOptions::default()),
+                mangle: Some(MangleOptions {
+                    top_level: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &ExtraOptions {
+                unresolved_mark,
+                top_level_mark,
+                mangle_name_cache: None,
+            },
+        );
+
+        // codegen minify 重排成单行、剥全部注释（含内联 sourcemap——顺带消掉
+        // 绝对路径与整份源码副本）。optimize 已改写 AST，这里只做最终落字。
+        // 位置仅在记 srcmap 时回查（此处不记），空 SourceMap 即可。
+        let cm = Lrc::new(SourceMap::default());
+        let mut buf = vec![];
+        {
+            use deno_ast::swc::codegen::Node;
+            let mut emitter = deno_ast::swc::codegen::Emitter {
+                cfg: deno_ast::swc::codegen::Config::default().with_minify(true),
+                comments: None,
+                cm: cm.clone(),
+                wr: Box::new(deno_ast::swc::codegen::text_writer::JsWriter::new(
+                    cm, "\n", &mut buf, None,
+                )),
+            };
+            match program {
+                deno_ast::swc::ast::Program::Module(m) => m.emit_with(&mut emitter),
+                deno_ast::swc::ast::Program::Script(s) => s.emit_with(&mut emitter),
+            }
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    }
-    String::from_utf8(buf).map_err(|e| format!("{}: {e}", path.display()))
+        String::from_utf8(buf).map_err(|e| format!("{}: {e}", path.display()))
+    })
 }
 
 /// 计数器为进程全局，测试并行跑会互相污染 delta 断言——
@@ -151,9 +200,9 @@ mod tests {
         assert!(!out.contains("//"), "{out}"); // 注释全剥（含 sourcemap 行）
         assert!(out.contains("from\"./a.js\""), "{out}"); // 语句/空白压缩
         assert!(
-            out.contains("json.ok({v})") || out.contains("json.ok({ v })"),
+            out.contains("json.ok({v:") || out.contains("json.ok({ v:"),
             "{out}"
-        );
+        ); // 局部导入绑定 v 被 mangle 成短名（属性名 v 保留）
         // 同输入同输出（构建确定性依赖）
         assert_eq!(minify_js(Path::new("m.js"), src).unwrap(), out);
     }

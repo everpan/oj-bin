@@ -1201,7 +1201,7 @@ mod tests {
         .unwrap();
         run(&build_args(&t, None)).await.unwrap();
         let demo = std::fs::read_to_string(t.join("dist/tasks/task_demo.js")).unwrap();
-        assert!(demo.contains("const n=1"), "{demo}"); // 类型已剥（转译产物，默认 minify）
+        assert!(demo.contains("let n=1"), "{demo}"); // 类型已剥（转译产物，默认 minify）
         assert!(
             demo.contains("\"./_shared/tick.js\"") && demo.contains("\"./_shared/side.js\""),
             "{demo}"
@@ -1209,7 +1209,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(t.join("dist/tasks/_shared/tick.js"))
                 .unwrap()
-                .contains("function tick(n)"),
+                .contains("function tick("),
             "shared lib transpiled"
         );
         // 非版本化：不落锁、不打 tgz。
