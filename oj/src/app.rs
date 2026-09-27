@@ -1827,12 +1827,13 @@ mod mail_assembly_tests {
 
     /// 顶层 `ldap:` 段（不透明 yaml map）：双实例（default 服务账号 / ad ldaps）。
     fn ldap_cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.ldap = Some(serde_yaml::from_str(
-            "default:\n  url: ldap://dc.example.com:389\n  bind_dn: cn=svc,dc=example,dc=com\n  bind_pw: s\n  timeout_ms: 3000\nad:\n  url: ldaps://ad.internal:636\n",
-        )
-        .unwrap());
-        cfg
+        Config {
+            ldap: Some(serde_yaml::from_str(
+                "default:\n  url: ldap://dc.example.com:389\n  bind_dn: cn=svc,dc=example,dc=com\n  bind_pw: s\n  timeout_ms: 3000\nad:\n  url: ldaps://ad.internal:636\n",
+            )
+            .unwrap()),
+            ..Config::default()
+        }
     }
 
     /// Given: 未配 `ldap:`（或空段）／配了但插件未加载；

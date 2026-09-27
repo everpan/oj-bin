@@ -30,10 +30,10 @@ impl InstanceCfg {
                 self.url
             ));
         }
-        if let Some(t) = self.timeout_ms {
-            if !(100..=3_600_000).contains(&t) {
-                return Err(format!("timeout_ms must be in 100..=3600000 (got {t})"));
-            }
+        if let Some(t) = self.timeout_ms
+            && !(100..=3_600_000).contains(&t)
+        {
+            return Err(format!("timeout_ms must be in 100..=3600000 (got {t})"));
         }
         match (&self.bind_dn, &self.bind_pw) {
             (Some(_), None) | (None, Some(_)) => {
