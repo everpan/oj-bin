@@ -6,8 +6,12 @@ pub async fn run_command(cmd: Command) -> i32 {
     // 命令在此挂 stderr 订阅器；server 命令由 server::logging 装配（终端镜像 +
     // 落盘），不得抢 init（try_init 失败静默——重复 init 场景）。
     if !matches!(cmd, Command::Server(_)) {
+        // swc_timer=off：swc minifier 的逐 pass 计时事件（target=swc_timer）不面向用户。
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,swc_timer=off")),
+            )
             .with_writer(std::io::stderr)
             .try_init();
     }

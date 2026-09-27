@@ -57,7 +57,8 @@ pub struct BuildArgs {
     pub config: String,
     pub dir: String,
     pub out: String,
-    /// 转译产物 minify（单行、剥注释）。默认开；`--no-minify` 排障逃生门。
+    /// 转译产物 minify（swc 全量压缩 + 函数内局部变量名混淆）。默认开；
+    /// `--no-minify` 排障逃生门（多行可读产物）。
     pub minify: bool,
     /// 只跑结构检查（S002–S007）不落盘（§5.2 CI 门禁 / 本地快查）。
     pub check: bool,
