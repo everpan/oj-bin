@@ -84,6 +84,22 @@ tasks:
 
 详见 `docs/prds/event-cqrs.md` v2（评审修订版）与 `docs/devkit/` 四件套。
 
+**构建产物压缩升级（v0.1.28）**：`oj build` 默认 minify 从 codegen 级（去空白/注释）
+升级为 **swc_ecma_minifier 全量压缩**——死码消除 + 表达式压缩 + **函数内局部变量名
+混淆**（基础混淆）。mangle `top_level=false`：顶层/导出名不动（跨文件 import 与
+routes.js `file` 字段不受影响），`json`/`db`/`http` 等注入全局是属性访问、不是绑定，
+天然不被碰。产物确定性不变（同输入 tgz 字节一致）。`--no-minify` 排障逃生门不变。
+依赖：新增 `swc_ecma_minifier 36`（与 deno_ast 0.53.3 的 swc 族对齐）、deno_ast 加
+`visit` feature。文档：`docs/devkit/api-manual.md`「构建与发布」产物表。
+
+**文档人话化与对齐（v0.1.28）**：全套对外文档（devkit 四件 + `user-manual` / `dev-guide` /
+`db-guide` / `testing` / `ops-manual` / `tenant-guide` / 插件文档 / 专题 12 件 / 根 `README`）
+拆长句、去 AI 腔，按新人视角补「给谁读/什么时候读」与首次术语解释；顺带修一批与代码的
+漂移——README/ops-manual 的 build/test/clippy 命令补 `--release` 并改走 `cargo xtask build`
++ `bin/oj`（v0.1.27 起产物归置 bin/）、结构检查清单 S001–S007→S001–S008、
+`docs/modules/` 的 `ABI_VERSION 7→8` 与第一方插件 8→9（补 `oj-mail` 行）、
+`scenarios.md` 索引补齐场景 9/10。
+
 ## v0.1.27（2026-09-25）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.26 → 0.1.27`）。发布点标签：

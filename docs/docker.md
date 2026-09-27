@@ -1,7 +1,10 @@
 # oj Docker 方案（编译 / 测试 / 发布 / 验证 / 运行）
 
-本文覆盖用 Docker 镜像分发 oj 的完整链路。镜像自带 glibc，发布后彻底摆脱宿主机
-glibc 版本约束（原「`GLIBC_2.35 not found`」老系统报错问题随之消失）。
+> 给谁读：要把 oj 打成 Docker 镜像、发布到 Docker Hub、或在容器里跑 oj 的人。
+> 从 §3 编译开始按顺序做即可；只是想在容器里跑服务，直接看 §7。
+
+本文覆盖用 Docker 镜像分发 oj 的完整链路。镜像自带 glibc，发布后不再受宿主机
+glibc 版本约束（老的「`GLIBC_2.35 not found`」报错随之消失）。
 
 相关文件（仓库根目录）：
 
@@ -18,11 +21,11 @@ glibc 版本约束（原「`GLIBC_2.35 not found`」老系统报错问题随之�
 
 - **为什么用镜像**：此前 Linux 发布物在 `ubuntu-latest`（glibc 2.39）构建，低版本系统运行报
   `GLIBC_2.35 not found`。容器构建把产物 glibc 需求锚定在 2.31，且镜像自带运行时
-  （distroless，glibc 2.31 + libstdc++），与宿主机 glibc **完全解耦**。
-- **镜像体积**：约 **56.7 MiB**（压缩 OCI）。体积主体是 V8 静态库链接进 `bin/oj` + 8 个插件
-  cdylib，这部分是 deno_core/runtime 固有，镜像手段无法再压；切换 distroless 已去掉 ubuntu
-  基础镜像与 apt 元数据开销。
-- **本地镜像名 vs 远端名**：仓库内统一用本地名 `oj-bin/oj`；推送到 Docker Hub 时命名空间必须是
+  （distroless，glibc 2.31 + libstdc++），与宿主机 glibc 完全解耦。
+- **镜像体积**：约 **56.7 MiB**（压缩 OCI）。体积主体是 V8 静态库链接进 `bin/oj` + 9 个插件
+  cdylib。这部分是 deno_core/runtime 固有的，镜像手段压不下去；切换 distroless 已去掉
+  ubuntu 基础镜像与 apt 元数据开销。
+- **本地镜像名 vs 远端名**：仓库内统一用本地名 `oj-bin/oj`。推送到 Docker Hub 时命名空间必须是
   你的账号，最终远端名为 `everpan/oj`（见 §5）。
 
 > ⚠️ **架构注意（重要）**：本机为 Apple Silicon，**默认构建产出 `linux/arm64` 镜像**。
@@ -36,7 +39,7 @@ glibc 版本约束（原「`GLIBC_2.35 not found`」老系统报错问题随之�
 - 容器运行时二选一：
   - **Apple `container` CLI**（本机推荐，v1.4+）：`container --version`
   - 或 Docker / Docker Desktop
-- 构建资源：建议 **4 CPU / 8 GiB**（V8 静态库链接吃内存，低于此易 OOM）
+- 构建资源：建议 **4 CPU / 8 GiB**（V8 静态库链接吃内存，低于此容易 OOM）
 - 发布所需：Docker Hub 账号 `everpan` 的 **Access Token**（Settings → Security 生成，
   勾选 `read:write` 或 `write:packages` 等价权限）
 
@@ -73,7 +76,7 @@ docker build -t oj-bin/oj .
    （防止 deno_core 把扩展 JS 绝对路径烧进二进制，v0.1.12 教训）
 3. `strip bin/oj bin/plugins/*/*.so` —— 压低产物体积
 4. **glibc 2.31 基线自检** —— 扫描 `bin/oj` 与全部插件 cdylib 引用的 `GLIBC_2.x` 符号，
-   最大值超过 2.31 则 fail-fast（提示基线被破坏，而非让用户到老系统上才撞错）
+   最大值超过 2.31 则 fail-fast（提示基线被破坏，而不是让用户到老系统上才撞错）
 
 构建成功后得到本地镜像 `oj-bin/oj:latest`。确认体积：
 
@@ -88,7 +91,7 @@ container image inspect oj-bin/oj:latest | grep -E '"size"'
 
 ### 4.1 构建期门禁（自动）
 
-上面 §3.3 的 smoke 门禁 + glibc 自检即为「构建即测试」，无需额外动作。
+上面 §3.3 的 smoke 门禁 + glibc 自检就是「构建即测试」，无需额外动作。
 
 ### 4.2 运行期冒烟（推荐）
 
@@ -142,7 +145,7 @@ container image tag oj-bin/oj:latest everpan/oj:latest
 
 ⚠️ **Apple `container` 的已知坑**：交互式 `container registry login docker.io` 会报
 `refusing insecure credential exchange`（Docker Hub token 端点自身发 challenge，`container`
-  安全守卫拒绝交出凭证）。**必须用 `--password-stdin` 形态**：
+安全守卫拒绝交出凭证）。**必须用 `--password-stdin` 形态**：
 
 ```bash
 echo "$DOCKERHUB_TOKEN" | container registry login --username everpan --password-stdin docker.io

@@ -1,15 +1,20 @@
 # 开发手册（Developer Guide）
 
-`only-js`（代号 **oj**）—— 基于 Rust + `deno_core` 的低代码后端框架，将 JS/TS 运行时（V8）
+`only-js`（代号 **oj**）是一个基于 Rust + `deno_core` 的低代码后端框架，把 JS/TS 运行时（V8）
 嵌入 Rust。业务逻辑以 JS/TS「handler」编写，使用注入的全局对象（`json` / `db` / `http` /
 `kv` / `blob` / `bus` / `es` / `fetch` / `log` / `ws` / `plugins` / `cert` / `jwt` /
-`bcrypt` / `crypto` / `finish`），Rust 侧捕获统一的 `{code,msg,data}` 信封，由 HTTP 服务写回。
-数据库、KV、对象存储、事件总线、ES 等后端能力在启动时作为 **cdylib 插件** 通过 C-ABI FFI
-契约（`oj-plugin-ffi`，ABI 7）加载。
+`bcrypt` / `crypto` / `finish`）。Rust 侧捕获统一的 `{code,msg,data}` 信封（即统一响应外壳），
+由 HTTP 服务写回。数据库、KV、对象存储、事件总线、ES 等后端能力在启动时作为 **cdylib 插件**
+通过 C-ABI FFI 契约（`oj-plugin-ffi`，ABI 8）加载。
+
+这份文档写给**要改 oj 本身**的人（框架开发者）。只想用 oj 写业务接口的，去读
+[user-manual.md](user-manual.md)。
 
 本文合并了原日常开发手册与 `oj server` 内部实现走读两份文档：既覆盖**日常开发**
 （环境、构建、写 handler、Rust 侧嵌入 API、加 op、测试、调试），也覆盖**内部实现**
-（执行模型、关键模块深读、安全模型、设计权衡）。JS 全局对象完整参考见
+（执行模型、关键模块深读、安全模型、设计权衡）。文中「装配期」指启动时把配置、插件、
+路由拼起来的阶段；「fail-fast」指发现问题立刻报错退出；「桥（bridge）」指 Rust 与 JS
+运行时之间的那一层（`src/bridge/`）。JS 全局对象完整参考见
 [devkit/api-manual.md](devkit/api-manual.md)（类型权威 `global.d.ts`），插件开发另见
 [plugin-development.md](plugin-development.md)，部署运维见 [ops-manual.md](ops-manual.md)，
 性能数据见 [benchmarks.md](benchmarks.md)，OIDC 实现走读与接入手册见
@@ -18,6 +23,8 @@
 ---
 
 ## 1. 环境与构建
+
+第一次把本仓库编译起来、或被构建问题卡住时读这节。
 
 - Rust toolchain（edition 2024）。`deno_core 0.411` 依赖 `rusty_v8`，首次编译需下载预编译 V8
   静态库（网络受限时设 `V8_FROM_SOURCE=0` 让它走预编译包；**切勿**从源码编译 V8）。
@@ -31,12 +38,12 @@
   - `libloading 0.9`（插件 dlopen）。
 
 **禁止 debug 构建**：`.cargo/config.toml` 无法用 alias 覆盖内建 `build`，故 `cargo build`
-靠**约定**等价于 `--profile release`——所有脚本/CI/工具一律 `--release`；debug 的
+靠**约定**等价于 `--profile release`。所有脚本/CI/工具一律 `--release`；debug 的
 `rusty_v8` 静态库不可用。日常只用 `cargo build --release`（或 `cargo xtask build`）。
 
 #### Windows：先配 MSVC 构建环境
 
-Windows 上有一处**必踩**的构建前置，且此前只写在 CI 里（本地无从知晓，构建会直接失败）：
+Windows 上有一处**必踩**的构建前置，且此前只写在 CI 里（本地无从知晓，构建会直接失败）。
 
 `oj-bus-kafka` 依赖 `rdkafka` → `rdkafka-sys`，后者在 Windows 上经 CMake 从源码编
 `librdkafka`（feature `cmake-build` 仅 Windows 启用）。裸机上必然失败于：
@@ -48,8 +55,7 @@ CMake Error: Could not create named generator Visual Studio 18 2026
 原因是 `rdkafka-sys` 探测到 VS 后**硬编码** `-G "Visual Studio <版本>"`，而本机 CMake
 若不认识该生成器名就直接 abort。此外还有两处（CRT 混链、Git 的 `link.exe` 遮蔽）需要处理。
 
-**用脚本配好环境再构建**（本地等价物，与 CI `.github/workflows/plugin-matrix.yml` 中
-那三步同源）：
+**用脚本配好环境再构建**（这是 CI `.github/workflows/plugin-matrix.yml` 中那三步的本地等价物）：
 
 ```bash
 # Git Bash / MSYS2（必须 source，变量才留在当前 shell）
@@ -74,7 +80,7 @@ rem 无参数则进入一个已配好的 shell
 | 移开 Git 的 `usr/bin/link.exe` | 它会遮蔽 MSVC 链接器 → `missing operand after ...`。**改名**为 `.disabled` 而非删除（那是你的 Git 安装，且在仓库外）；恢复：`ren link.exe.disabled link.exe` |
 
 脚本会自动定位 `vcvars64.bat`（先 `vswhere`，再遍历常见安装路径），所以**普通
-PowerShell/cmd 里也能用**，不必先开 VS 开发者命令行。它只解决不了「没装 C++ 工作负载」
+PowerShell/cmd 里也能用**，不必先开 VS 开发者命令行。它解决不了的是「没装 C++ 工作负载」
 ——那需要装「使用 C++ 的桌面开发」。
 
 > 修改 CI 里那三步时请同步本脚本，反之亦然（两边是同一条知识的两份落地）。
@@ -84,13 +90,13 @@ PowerShell/cmd 里也能用**，不必先开 VS 开发者命令行。它只解�
 ```bash
 cargo build --release        # 发布构建（等价 cargo build，按约定）
 cargo fmt --check            # 格式门禁（cargo fmt 自动修复）
-cargo clippy --all-targets -D warnings   # lint 门禁
+cargo clippy --release --all-targets -- -D warnings   # lint 门禁
 cargo test --release --workspace        # 全部测试（根 crate + oj e2e + 插件；CI 同款。
                                         #   个别平台 SIGSEGV 时才按 workflow 的
                                         #   skip_infinite_loop 开关跳过，不再全局跳过）
-cargo test -p oj             # 单测 + e2e
-cargo test -p mdm-server     # server 单测
-cargo test -- --nocapture    # 看 tracing 输出
+cargo test --release -p oj   # 单测 + e2e
+cargo test --release -p server  # server 单测
+cargo test --release -- --nocapture    # 看 tracing 输出
 cargo build --benches        # 编译 criterion 基准（不跑）
 cargo bench                  # 跑基准（benches/bridge.rs，**必须 release**）
 cargo llvm-cov --workspace --summary-only   # 覆盖率（需 cargo-llvm-cov；V8 需 llvm-cov）
@@ -122,11 +128,13 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（release
 
 ## 2. 项目结构（workspace 布局）
 
+要改代码先知道东西放在哪。这节是仓库地图。
+
 ```
 Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
-src/                  # crate: only-js（lib）——核心执行层（纯 lib，无 bin、无 build.rs）
+src/                  # crate: only-js（lib）——核心执行层（纯 lib，无 bin；build.rs 仅生成扩展 JS 内嵌表）
 ├── lib.rs            # 导出 bridge + config
-├── config.rs         # 配置加载：server{host,port,base,root,timeout,pool_size} + ws{max_connections,workers_per_route,idle_linger_ms} + db/redis/blob/es/broker/plugins 映射
+├── config.rs         # 配置加载：server{host,port,api_prefix,timeout,pool_size,app_path,…} + ws{max_connections,workers_per_route,idle_linger_ms} + db/redis/blob/es/broker/plugins 映射
 └── bridge/           # JS 运行时与 SDK（无 axum/http 依赖，纯执行层）
     ├── mod.rs        # Bridge / StableState / ReqState / Capture + extension! 注册全部 op
     ├── bootstrap.js  # JS 全局对象装配（ESM，必须 7-bit ASCII）
@@ -157,16 +165,16 @@ oj/                   # CLI 二进制：server / build / test / migrate / fixtur
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/routes.js/锁/tgz）
 ├── server_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
 └── tests/e2e.rs      # 端到端验收（UC-1…15）
-server/               # crate: mdm-server（axum HTTP 层）
+server/               # crate: server（axum HTTP 层）
 ├── lib.rs            # axum app 装配 + 前置管线 + 静态站点兜底 + serve_router
 ├── auth.rs           # JWT 核心：Claims 签验、匿名匹配、session（KV）
 ├── routes.rs         # directory-mirror URL → handler 映射
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 ├── certificate.rs    # 证书验签与状态判定（valid/grace/expired）
 └── ws.rs             # WebSocket：闸门 + js_route/mirror_routes + frame_loop（帧池连接侧）
-oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=7）
-plugins/              # 8 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
-                      #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth
+oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=8）
+plugins/              # 9 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
+                      #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth、oj-mail
 tools/xtask/          # crate: cargo xtask bin/plugin/build 构建 + 归置到 bin/
 tools/oj-cert/        # 证书生成小工具 crate（gen/renew，sign_jws 单一事实来源）
 tests/plugins/mini/   # 演练加载/ABI/panic 路径的 cdylib 测试夹具
@@ -183,6 +191,9 @@ benches/bridge.rs     # criterion 基准
 ---
 
 ## 3. 执行模型（数据流）
+
+一个 HTTP 请求从进来到变成 JS 调用、再变成响应，走的完整路径。排查「请求到底死在哪一环」
+时按这张图对照。
 
 ```
 HTTP 请求
@@ -207,23 +218,25 @@ HTTP 请求
   driver 内 `await import(spec)` 触发顶层 await。
 - **两级缓存**：`TranspileCache`（path→(mtime, JS)）+ V8 module cache（靠 mtime 版本化
   specifier `?v=<mtime-nanos>` 实现「改文件即失效」）。
-- **KillSwitch**：超时用 `v8::IsolateHandle::terminate_execution` 强杀（`checkout_armed` 取
-  线程安全句柄——**不是**裸指针：`OwnedIsolate` 包装地址 ≠ 真实 isolate 指针，手转裸指针会
-  SIGSEGV）；被杀的 runtime 直接丢弃（不回池），HTTP 返回 408。这是对 `while(true)` 等
+- **KillSwitch**：超时用 `v8::IsolateHandle::terminate_execution` 强杀。`checkout_armed` 取
+  线程安全句柄（**不是**裸指针：`OwnedIsolate` 包装地址 ≠ 真实 isolate 指针，手转裸指针会
+  SIGSEGV）。被杀的 runtime 直接丢弃（不回池），HTTP 返回 408。这是对 `while(true)` 等
   死循环的唯一可靠熔断手段。
 
 ---
 
 ## 4. 写 handler（JS/TS）
 
+给框架加功能前先弄清 handler 的执行契约。这节也含 SQL 注入红线（必读）。
+
 handler 是 ESM 源码（dev 模式 `.ts` 按需转译，release 模式服务 `oj build` 产物 `.js`）。
-**目录镜像路由**：`src/user/profile/detail/api.ts` → `/v1/api/user/profile/detail/`；
+**目录镜像路由**：`src/user/profile/detail/api.ts` → `/v1/api/user/profile/detail/`。
 `api.ts` 导出 `get`/`post`/`put`/`del`/`patch`/`head`/`options`（HTTP 方法同名，`DELETE`→
-`del`）；目录段写整段 `_name_` 即路径参数（v0.1.27，`_id_/` → `{id}`，避免 `{}` 进文件
-路径，谓词见 api-manual 路由章）；可选 `get.route = "{id}"` 声明路径参数（matchit 语法，
-挂载后**替换**目录镜像路由；
-参数段不得混字面，`{*path}` 至少匹配一段）。handler **必须调用一次** `json.ok` / `json.fail` /
-`finish` 才能完成会话；顶层可直接 `await`（event loop 由 driver 泵至 Promise 落定）。
+`del`）。目录段写整段 `_name_` 即路径参数（v0.1.27，`_id_/` → `{id}`，避免 `{}` 进文件
+路径，谓词见 api-manual 路由章）。也可选 `get.route = "{id}"` 声明路径参数（matchit 语法，
+挂载后**替换**目录镜像路由；参数段不得混字面，`{*path}` 至少匹配一段）。handler **必须调用
+一次** `json.ok` / `json.fail` / `finish` 才能完成会话；顶层可直接 `await`（event loop 由
+driver 泵至 Promise 落定）。
 
 同目录可放 `ws.ts` 产生一条 WebSocket 路由：连接升级后按**生命周期钩子**执行：
 `export default { connection, message, close, error }`（connection 一次、message 每帧、
@@ -278,7 +291,7 @@ await db.table("order")
 
 ### SQL 注入红线（必须读）
 
-- **标识符**（表名/列名）**绝不**来自 JS 字符串拼接——只能来自 `SchemaRegistry` 白名单
+- **标识符**（表名/列名）**绝不**来自 JS 字符串拼接。只能来自 `SchemaRegistry` 白名单
   （经 `db.table(...)` 构造器）。
 - **值**通过绑定参数传递：构造器的 `value`（`db.table("user").where({ field: "id", op: "eq", value: id })`）或原生 `db.query("... where id = $1", [id])`。
 - 占位符风格随底层驱动而定：`$1`（Postgres）/ `?`（MySQL、SQLite）。
@@ -286,6 +299,8 @@ await db.table("order")
 ---
 
 ## 5. 在 Rust 侧使用 Bridge（嵌入 / 测试）
+
+给 oj 写单元测试、或把 oj 嵌进自己的 Rust 程序时读这节。
 
 `Bridge` 是核心执行入口：oj server 用它跑 handler；单测与嵌入场景直接构造。公开 API
 （`src/bridge/mod.rs`）：
@@ -327,7 +342,7 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 **状态模型（重要）**：
 
 - `StableState`（`Arc`，跨请求共享）：`kv` / `dbs` / `client` / `registry` / `blobs` / `bus`
-  / `es` / `modules` 等。**一经 runtime 池共享即不可变**——命名 DB / blob / es / 模块上下文
+  / `es` / `modules` 等。**一经 runtime 池共享即不可变**：命名 DB / blob / es / 模块上下文
   都必须在**构造期**传入（早期版本的 `set_db_accessors` 已删除：池化后 `Arc::get_mut`
   必 panic）。
 - `ReqState`（每请求，存 `OpState`）：`req` / 事务句柄 / 响应捕获。每次借出 runtime 时
@@ -336,12 +351,14 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
   `ReqState`。
 
 `HandlerStore`（`loader.rs`）仍服务于**嵌入与测试场景**：`from_embedded(map)`（编译期嵌入，
-配 `set_handlers` + `run_named`）与 `MDM_HANDLER_DIR` 环境变量（FS 目录 + notify 监听）；
+配 `set_handlers` + `run_named`）与 `MDM_HANDLER_DIR` 环境变量（FS 目录 + notify 监听）。
 oj server 的 handler 加载走 `module_loader.rs` + `run_module`（见 §7）。
 
 ---
 
 ## 6. 接入真实数据库（SqlxAccessor）
+
+写测试要连真库、或嵌入场景要接 MySQL/PG 时读这节（生产部署走插件，不走这条路）。
 
 `SqlxAccessor` 实现了 `DataAccessor`，以 `sqlx::any::Pool<Any>` 驱动无关接入
 MySQL/PostgreSQL/SQLite（生产部署经 **oj-db-mysql / oj-db-postgres 插件**接入；直接用
@@ -361,6 +378,8 @@ let db2 = SqlxAccessor::connect("sqlite:///tmp/oj.db").await?;          // Self�
 
 ## 7. 模块加载与热重载（oj server）
 
+import 解析报错、热重载不生效、dev/release 行为不一致时读这节。
+
 现行加载链路在 `module_loader.rs` + `transpile.rs`：
 
 - **ESM/CJS 双支持**：handler 与项目内模块按 ESM 解析；CJS 依赖（node_modules）经
@@ -377,12 +396,12 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
 
 ### import 解析细节（module_loader.rs）
 
-- `resolve_inner`：已是绝对 `file://` URL 直接返回（**不再 `ensure_within`**，这是信任模型：
+- `resolve_inner`：已是绝对 `file://` URL 直接返回（**不再 `ensure_within`**。这是信任模型：
   内部生成的 specifier 可信，外部请求体/路径才需钳制）。
 - `resolve_relative`：`./` `../` + 补全 `.ts`→`.js`→`/index.ts`→`/index.js` + 词法归一化 `..`。
-- `resolve_alias`：导入别名。`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**；模块根由
+- `resolve_alias`：导入别名。`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**。模块根由
   `module_root_of` 从引用方目录向上找最近的 `manifest.yaml` 祖先（以 project_root 为界）
-  派生——因此 dev（`src/<m>/`）与 release 产物（`dist/<m>-<v>/`，manifest 原样复制）语义
+  派生，因此 dev（`src/<m>/`）与 release 产物（`dist/<m>-<v>/`，manifest 原样复制）语义
   天然一致，不需要把 api 根路径穿透到装配点。别名路径禁 `..`/空段；引用方在 `node_modules`
   内不启用（不劫持第三方包的 `package.json#imports` 语义）；模块外（tests 目录 / 任务池）
   无锚点 → 明确报错。`oj build` 侧用**同一份探针**实化（见 `build_cmd::resolve_to_segs`），
@@ -392,7 +411,7 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
 - `wrap_cjs` / `looks_cjs` / `op_resolve_cjs`：CJS 互操作（`module.exports`→`default`，
   `require` 走 `__ojRequire`，进程级缓存）。启发式识别，**仅裸 specifier**；相对
   `require("./x")` 是已知限制。
-- `ensure_within`：两侧都 `canonicalize` 后做前缀判断，拒绝逃逸；macOS `/var` vs
+- `ensure_within`：两侧都 `canonicalize` 后做前缀判断，拒绝逃逸。macOS `/var` vs
   `/private/var` 的符号链接差异已处理。
 
 另有运行时扩展点 **`ext_boot.js`**（详见 §8.3）。
@@ -400,6 +419,8 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
 ---
 
 ## 8. 关键模块职责（深读）
+
+改 bridge 内部之前，先在这节找到对应模块的边界与已踩过的坑。
 
 ### 8.1 http.rs / envelope.rs / blob.rs —— 请求、响应与对象存储
 
@@ -418,22 +439,22 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
 
 ### 8.2 bootstrap.js —— JS SDK globals 装配
 
-`json.ok` 在 JS 侧 `JSON.stringify` 后交 Rust 拼接信封，省一次 serde_v8 反序列化；
-`http` 是**每请求惰性 Proxy**（`op_http_info()`），`db === DB("default")` 由 JS 侧 `dbCache`
+`json.ok` 在 JS 侧 `JSON.stringify` 后交 Rust 拼接信封，省一次 serde_v8 反序列化。
+`http` 是**每请求惰性 Proxy**（`op_http_info()`）；`db === DB("default")` 由 JS 侧 `dbCache`
 Map 保证同源。
 
-事务（db.tx）：活跃事务存 `ReqState.tx`（`Arc<ActiveTx>`，故 ReqState 不再 Clone），
-query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）；
+事务（db.tx）：活跃事务存 `ReqState.tx`（`Arc<ActiveTx>`，故 ReqState 不再 Clone）。
+query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）。
 `Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
 
 前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（租户/鉴权/blob 已接入，后续
-只加字段不改编构）；提取/守卫逻辑在 run 闭包的 async 块开头，失败走
+只加字段不改编构）。提取/守卫逻辑在 run 闭包的 async 块开头，失败走
 `fail_response(400/401, …)` 信封。鉴权端点（login/refresh/logout）是普通业务路由而非内置
 路由；blob 下载是内置公开路由（auth 之后、路由表 lookup 之前，免鉴权）。
 `max_upload` 双闸：axum `DefaultBodyLimit::max(2x)` 兜 2x 外裸 413，handle() 内
 `body.len() > max_upload` 出信封 413。
 
-角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的——路由级 RBAC 等
+角色鉴权（handler 内按 `http.user.roles` 自行判定）是刻意不加框架层的。路由级 RBAC 等
 真需求出现再议（YAGNI）。
 
 #### ext_boot.js —— bootstrap 的运行时补充
@@ -447,23 +468,23 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 
 实现时必须守住的不变量（每条都对应一个已踩过或已论证的坑）：
 
-- **boot 只在 `checkout` 一处调用**——它是唯一的借出入口，「借出的 runtime 一定已 boot」
+- **boot 只在 `checkout` 一处调用**。它是唯一的借出入口，「借出的 runtime 一定已 boot」
   才有单点保证。`oj test` 不走池（直接 `JsRuntime::new`），故单独补调一次。
 - **运行期 boot 失败返回 `RunError`，绝不 panic**。actor 线程在 `block_on` 里 panic 会
   永久杀死该 worker，pool_size 个 actor 会被逐个耗尽。
 - **启动期必须显式 `prewarm`**（`App::from_config`，建表之前）。否则 boot 错误只能借
   dev 内省间接暴露，而 `bridge_introspector` 会把线程 panic 吞成路由 failure，装配层只
-  warn 不致命 → 「路由全空、服务照常监听」。
+  warn 不致命，最终表现为「路由全空、服务照常监听」。
 - **boot 期 arm 看门狗**（`BOOT_TIMEOUT`，2s）。同步死循环不归还执行器，
   `tokio::time::timeout` 无效，只能靠 `terminate_execution`。且 `fired` 必须先于
   `result` 判定，否则超时被 `Core` 分支抢先、误报 500 而非 408。
-- **失败的 runtime 兜底跑一轮 `run_event_loop` 再丢弃**——未轮询完 event loop 的 isolate
+- **失败的 runtime 兜底跑一轮 `run_event_loop` 再丢弃**。未轮询完 event loop 的 isolate
   析构会触发 V8 句柄错误（本项目有 SIGSEGV 前科，见 `runtime.rs` 头注释）。
 - **`idle.borrow_mut()` 的 `RefMut` 必须在 await 前 drop**。别指望 lint：
   `src/lib.rs` 是 `#![allow(clippy::all)]`。
 - **boot 拿不到 `ext:` 模块**：deno_core 在 loader resolve 之后还有
   `validate_ext_module_import` 一道闸（`file://` referrer 永远过不去）。别去放行
-  `resolve_inner` 的 `ext` scheme——那对全部 handler 生效，且放行也无效。
+  `resolve_inner` 的 `ext` scheme。那对全部 handler 生效，且放行也无效。
 
 ### 8.3 kv.rs / bus.rs / es.rs —— 外部状态与广播
 
@@ -478,8 +499,8 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
   WS 会话的帧通道经 `ReqState.req.bus_tx` 注入（`RequestInfo.bus_tx`，ws.rs frame_loop 里
   `bus_tx→resp_tx` 转发任务与 `ws.send` 同一写出通道，保序）；HTTP 上下文 `bus_tx=None` →
   `op_bus_subscribe` 报错。server 装配共享**一个** `Arc<dyn EventBroker>`（server_cmd 注入
-  Extras.bus——local 或插件 broker；FFI 版经全局 `DELIVER_TARGETS` 按 topic 扇出，跨
-  actor 池/全部 WS 连接共享语义与内置 Bus 一致，`ffi_broker_shared_across_bridges` 回归）。
+  Extras.bus，local 或插件 broker）。FFI 版经全局 `DELIVER_TARGETS` 按 topic 扇出，跨
+  actor 池/全部 WS 连接共享语义与内置 Bus 一致（`ffi_broker_shared_across_bridges` 回归）。
 - `es.rs`：`EsBackend` trait（search/index_doc/delete_doc）+ 内置 `reqwest` 实现；
   es 插件（oj-es）经 `FfiEsBackend` 适配同一 trait。`url_for` 纯函数拼
   `/{index}/_search` 或 `/{index}/_doc/{id}?refresh=true`（endpoint 尾斜杠幂等剪除）。
@@ -491,8 +512,10 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 
 ## 9. DevTools 调试（inspector）
 
+想断点调试 handler（chrome://inspect）时读这节。仅开发用。
+
 - 构造时开开关：`Bridge::with_opts(db, kv, registry, true)`（或 `with_dbs*` 传 `true`）。
-- 起服务：`only_js::bridge::start_inspector(&b, "127.0.0.1:9229".parse()?).await`——借一个
+- 起服务：`only_js::bridge::start_inspector(&b, "127.0.0.1:9229".parse()?).await`：借一个
   runtime 取其 inspector 句柄并起 WS（`inspector.rs`）。未开开关则只 warn 不生效。
 - 浏览器 `chrome://inspect` → 配置 `127.0.0.1:9229` → 断点/单步/看 console。
 - inspector 是 `!Send`，WS 服务跑在 `spawn_local`（current_thread runtime）。
@@ -501,6 +524,8 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 ---
 
 ## 10. 加一个新的 op（扩展 JS SDK）
+
+要给 handler 暴露一个新能力（新全局函数）时按这节的步骤走。
 
 扩展点在 `src/bridge/mod.rs` 的 `deno_core::extension!` 宏与 `bootstrap.js`。
 
@@ -519,15 +544,15 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 > `bootstrap.js` 必须保持 **7-bit ASCII**：deno_core 的 ESM 扩展要求，非 ASCII（如中文注释）
 > 会触发 "Extension code must be 7-bit ASCII" panic。注释统一用英文。
 
-### deno_core 0.410 关键 API 差异
+### deno_core 0.411 关键 API 差异
 
-（比 0.409 有破坏性变化。）
+（0.409 → 0.410 有破坏性变化，0.411 沿用；以下是与旧直觉不同的点。）
 
 - `ModuleLoader` 现在是 **trait**（不是 struct），实现它即可接管 import 解析。
 - **op2 无 `(async)`**：异步 op 用同步 op2 + `async fn` 包装的模式，不要写 `#[op2(async)]`。
 - **错误类型**：`JsErrorBox`（不是 `JsError`）。
 - **扩展 JS 的 ASCII 校验仅 debug 生效**：`bootstrap.js` 里中文注释在 release 可用，但
-  debug 构建会因非 ASCII 报错——所以 bootstrap.js 保持 ASCII-only 注释。
+  debug 构建会因非 ASCII 报错。所以 bootstrap.js 保持 ASCII-only 注释。
 - **esm specifier 命名规则**：扩展 JS 用 `ext:core/ops` 之类的命名空间，主模块不能同名。
 - 单 JsRuntime 单 main module；side module 用 `load_side_es_module_from_code`。
 
@@ -535,25 +560,27 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 
 ## 11. 安全模型与设计红线
 
+这节列出不能破的规矩。改任何跨边界代码（JS↔Rust、SQL、文件路径）前先读。
+
 ### 11.1 通用模型
 
 - **project_root 钳制**：所有 import 解析结果必须落在 project root 内（`ensure_within`）。
 - **目录穿越防护**：路由路径里的 `..`/`.`/`\`/NUL/空段 → 404。静态兜底（`resolve_static`）
-  在此之上先逐段 percent-decode 再校验——解码出 `/`（`%2F` 走私）、`.`、`..`、`\`、NUL、
+  在此之上先逐段 percent-decode 再校验：解码出 `/`（`%2F` 走私）、`.`、`..`、`\`、NUL、
   空段同样 404。
 - **超时熔断**：`server.timeout` + `v8::IsolateHandle::terminate_execution`（408）。
 - **SQL 注入**：`db.query/exec` 全部参数化；`db.table().select().where()` 构造器走标识符
-  白名单 + 参数化值（sea-query）——见 §4 红线。
+  白名单 + 参数化值（sea-query）。见 §4 红线。
 - **manifest 强校验**：`manifest.yaml` 的 `name` 必须等于父目录名，防止模块名与路由脱节。
 - **租户跳转腿豁免**：`tenant.anonymous_paths` 与 auth 匿名列表同为「去 base 前缀 + 通配」，
-  命中路径免 "缺租户头 400"——OIDC 302 浏览器跳转带不了自定义头；已带的头仍照常注入。
+  命中路径免 "缺租户头 400"（OIDC 302 浏览器跳转带不了自定义头）；已带的头仍照常注入。
   通配四形态（v0.1.20，两处实现同一语义）：字面 / 尾 `/*` 严格一层 / 中段 `*` 恰好一段 /
   `**` 跨任意段（`tenant.anonymous_paths: ["/public/**"]`）。
 
 ### 11.2 证书驱动的 GET 限制（运行时校验）
 
 基于非对称加密（RSA-2048 + RS256 JWS）的证书校验**强制开启、不可绕过**：未配齐两个
-证书路径即启动报错退出——没有任何 config/CLI 开关可跳过（防止误跑无证书校验的实例）。
+证书路径即启动报错退出。没有任何 config/CLI 开关可跳过（防止误跑无证书校验的实例）。
 
 - **有效期内**：正常服务（`certificate_status = valid`）。
 - **宽限期内（默认 30 天，可配 `grace_days`）**：所有 **GET** 请求返回 `403`，标准信封；
@@ -591,7 +618,7 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
   传递，不拼接 SQL。
 - `JsRuntime` 是 `!Send`：池与持有它的 event loop 同线程（current_thread）；inspector/WS 用
   `spawn_local`。
-- `panic = "unwind"` 必须在所有插件 profile 中保持——`oj_plugin_entry!` 依赖 `catch_unwind`
+- `panic = "unwind"` 必须在所有插件 profile 中保持。`oj_plugin_entry!` 依赖 `catch_unwind`
   收敛跨边界 panic（任何下游 profile 不得覆盖为 abort）。
 - `bootstrap.js` 必须保持 7-bit ASCII。
 - 失败的 runtime **不回池**（drop 而非 checkin），避免复用可能损坏的 isolate。
@@ -601,6 +628,8 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
 
 ## 12. 测试
 
+给 oj 自身写测试时读这节（业务侧的两层测试见 [testing.md](testing.md)）。
+
 ### 约定
 
 - **Rust 单元测试**就近放各模块 `#[cfg(test)]`；`cargo test --release --workspace` 跑全部
@@ -609,9 +638,9 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
 - handler 级验证：注入 `InMemoryAccessor` / `InMemoryKV`，断言 `Capture.body` 的 JSON，
   复用 `Bridge::new(...).run_with(...)`。
 - **业务 API 测试**（`*.test.ts`）用 `oj test` 进程内运行器（真实运行时 + 真实路由管线，
-  零 TCP），另可配 vitest 纯 mock 层——见 [testing.md](testing.md)。
+  零 TCP），另可配 vitest 纯 mock 层。见 [testing.md](testing.md)。
 - **勿用 `deno test`**：`json`/`db`/`http` 等全局只存在于本 bridge。
-- 异步测试用 `tokio::test(flavor = "current_thread")`——`JsRuntime` 是 `!Send` 的，且池
+- 异步测试用 `tokio::test(flavor = "current_thread")`。`JsRuntime` 是 `!Send` 的，且池
   运行在 current_thread 运行时上（`src/bridge/runtime.rs`）。
 - **TDD red-first**：先写失败测试 → 确认失败 → 最小实现 → 确认通过 → commit。
 
@@ -622,11 +651,11 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
   `manifest.yaml`（缺失会启动失败）。负向路径覆盖：404（无路由/穿越）、405（方法未导出）、
   500（编译错误）、408（死循环超时后 server 存活）、build→release 全链路。
   `E2E_LOCK` 串行锁避免端口/文件冲突。
-- 单元测试随模块内联（`#[cfg(test)]`）；独立优先——内存后端（`InMemoryAccessor` /
+- 单元测试随模块内联（`#[cfg(test)]`）；独立优先：内存后端（`InMemoryAccessor` /
   `InMemoryKV` / `SqlxAccessor::arc("sqlite::memory:")`）、临时目录、`httptest` 桩 ES/fetch、
   本地 `TcpListener` 桩，全程不依赖外部服务。
 - 插件适配器测试（`bridge::ffi::adapter_tests`）：mock vtable（Rust 函数指针 + 预置
-  FfiFuture）验证 FfiXxxBackend 转发 + Drop close + 返回编码解码；共享静态用 `T_LOCK`
+  FfiFuture）验证 FfiXxxBackend 转发 + Drop close + 返回编码解码。共享静态用 `T_LOCK`
   串行化并在测试开头清理（避免跨测试污染，见 bus `DELIVER_TARGETS` 经验）。
 - 真服务集成测试 + 环境变量门控（**在插件 crate 内**，本地无服务时默认跳过）。env 门控矩阵：
   - `OJ_TEST_PG=postgres://…` → `oj-db-postgres`（vtable roundtrip）
@@ -645,6 +674,8 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365   # 用现有私�
 提升套路见 [§12.1](#121-覆盖率测量与提升cargo-llvm-cov-实操)。
 
 ### 12.1 覆盖率测量与提升（cargo-llvm-cov 实操）
+
+要看/要提覆盖率时按这节的操作手册走。
 
 目标：**release 模式下行/区域覆盖率 > 90%**（debug 构建不在支持范围，且 dev 构建曾占
 120G+ 磁盘，禁止）。测量用 `cargo-llvm-cov`，按 workspace 整体与按插件拆分两路。
@@ -702,8 +733,8 @@ cargo llvm-cov --release --workspace --no-fail-fast --lcov --output-path cov-wor
 
 #### 真服务起法（macOS `container` CLI）
 
-本机用 Apple `container` CLI（非 colima/docker）。无 `pull` 子命令——`container run`
-会自动拉取。`run -d --name <id> -p host:container -e KEY=VAL <image>`；进容器
+本机用 Apple `container` CLI（非 colima/docker）。它没有 `pull` 子命令，`container run`
+会自动拉取。用法：`run -d --name <id> -p host:container -e KEY=VAL <image>`；进容器
 `container exec <id> <args>`。
 
 - **PostgreSQL**：`container run -d --name poc-pg -p 5499:5432 -e POSTGRES_USER=poc -e POSTGRES_PASSWORD=poc -e POSTGRES_DB=oj_test postgres:16`，env 用 5499 端口。
@@ -767,6 +798,8 @@ rm -rf target/llvm-cov-target target/debug
 
 ## 13. 插件系统（cdylib + FFI）
 
+要加后端、写第三方插件、或排查插件加载失败时读这节。
+
 **分层**：开发侧五轴解耦（es/db/blob/bus/kv 各自 trait + 注册表），运行侧动态链接库可配置
 装配。全部 FFI 跨界类型收在 `oj-plugin-ffi`；`src/bridge/ffi.rs` 收敛全部 unsafe
 （`load_forget` dlopen + `Box::leak` 进程期存活，任何路径不 dlclose；插件必须 panic=unwind
@@ -785,9 +818,10 @@ core，装配层只经安全入口）。
   （bin/oj 旁即 bin/plugins）> `<workspace_root>/bin/plugins`（与 xtask 产物归置同形），
   相对路径相对 config 目录，最终目录 = `<plugins_dir>/<host-triple>/`。
   `host-triple` 由 `ffi::triple()` 运行时按 `std::env::consts` 重建（与 xtask `rustc -vV` 的
-  host 一致），不依赖 `build.rs`（根 crate 已无 build script）。
+  host 一致）。这条链路不依赖 `build.rs`（根 crate 的 build.rs 只生成扩展 JS 内嵌表，
+  与插件路径无关）。
 - 双模式（`plugins:` 一段三用）：非空 map = 严格清单，只装配键列出的插件（缺文件/身份不符/
-  `@semver` pin 不符 fail fast），值为插件 cfg（非空对象原样透传，空对象 = 回落轴适配器）；
+  `@semver` pin 不符 fail fast），值为插件 cfg（非空对象原样透传，空对象 = 回落轴适配器）。
   缺省/空 map → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。旧 list 写法
   `plugins: [a, b]` 废弃（解析报错）。
 - 注册：abi 门禁（严格相等）→ `init` → 对 `AXES = [es, db, blob, bus, kv, auth, mq, mail]` 逐轴
@@ -819,11 +853,13 @@ core，装配层只经安全入口）。
 
 ## 14. 设计权衡与已知约束
 
+为什么长这样、什么还没做，记在这节。提新需求前先查「仍开放」清单。
+
 ### 已定裁决
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
 
-- 相对 `require()` 不支持——已知限制（db 仅 sqlite 已解除：多库 DSN 按 scheme 分发）。
+- 相对 `require()` 不支持，这是已知限制（db 仅 sqlite 已解除：多库 DSN 按 scheme 分发）。
   外部后端已于插件系统阶段全部 cdylib 化（见 §13）。
 - `build` 已实现（按模块版本目录 + 产物保留原名原结构 + 默认 minify + manifests.yaml 锁 +
   确定性 tgz + release 聚合），设计见
@@ -837,7 +873,7 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
 ### 仍开放
 
 - **fetch SSRF 防护**：出网白名单、内网/RFC1918/链路本地 IP 阻断、body 上限、
-  DNS 解析后复检（防重绑定）、重定向复检——`src/bridge/fetch.rs` 目前均未做
+  DNS 解析后复检（防重绑定）、重定向复检。`src/bridge/fetch.rs` 目前均未做
   （仅 `no_proxy` + 响应整体缓冲）。
 - **V8 内存上限**：`ResourceLimiter` 未接（超时熔断已有，内存无界）。
 - **op 边界埋点**：`metrics` + `/metrics` 端点（exec 时长、op 计数/延迟、db 延迟、v8 堆）。
@@ -846,6 +882,8 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
 ---
 
 ## 15. 排错
+
+框架层报错先来这张表查。业务侧错误码另见 user-manual §10。
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -880,7 +918,9 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
 
 ## 16. 提交与 CI
 
-- 门禁：`cargo fmt --check` + `cargo clippy --all-targets -D warnings` +
+提交代码前读这节：门禁是什么、CI 怎么跑、怎么只跑一条平台腿。
+
+- 门禁：`cargo fmt --check` + `cargo clippy --release --all-targets -- -D warnings` +
   `cargo test --release --workspace`（+ sample 的 L1 `oj test` 与 L2 vitest，见
   `sample-tests` job）。`infinite_loop` 曾全局 `--skip`，现已改为按平台开关，默认跑全量。
 - 纪律：改动后 **release 下测试与构建都要绿**才算完成；**TDD red-first**（先失败测试再
@@ -893,7 +933,7 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
     就只验哪个平台；改共享代码时仍用默认 `platforms=all`（三平台是安全网，别长期只跑一条腿）。
   - concurrency（group = `ref` + 平台选择，`cancel-in-progress: true`）：同一意图的旧矩阵被新派发
     取代即取消；不同平台选择并存（互不误杀）。
-  - 缓存：只缓 crate 源码/索引 + rusty_v8 预编译库。**不缓 `target/`**——本仓 release target 12G+，
+  - 缓存：只缓 crate 源码/索引 + rusty_v8 预编译库。**不缓 `target/`**：本仓 release target 12G+，
     三平台相加超 GitHub 每仓 10G 上限，会被 LRU 互相挤出，命中率归零还倒赔上传时间。
   - `release.yml` 不提供按平台选择（发行物必须三平台齐全），单平台出错用 GitHub 的
     "Re-run failed jobs" 只重跑那条腿（缓存使其热启动）。

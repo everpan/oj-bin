@@ -1,9 +1,11 @@
 # 邮件投递（SMTP）手册
 
-面向使用者的邮件能力说明：配置、JS API、附件、反馈、安全与运维。
-业务速查见 `docs/devkit/api-manual.md` §6「mail」；本手册是完整参考。
+> 给谁读：要在 oj 项目里发邮件的业务开发者，以及运维 SMTP 配置的人。想快速查 API
+> 先看 `docs/devkit/api-manual.md` §6「mail」；本手册是完整参考（配置、JS API、附件、
+> 反馈、安全与运维）。
 
-- 实现形态：**cdylib 插件 `oj-mail`** + 新增 `mail` 轴（非内建 op）。
+- 实现形态：**cdylib 插件 `oj-mail`** + 新增 `mail` 轴（非内建 op）。cdylib 即动态库插件，
+  启动时由宿主 dlopen 加载。
 - 底层：`lettre`（rustls），`rustls = "=0.23.40"`，与框架同 provider（aws-lc-rs，**不引 ring**）。
 - 版本：v0.1.19 起。
 
@@ -15,15 +17,17 @@
 | **插件（`plugins/oj-mail`）** | `lettre` 连接池、**有界队列 + worker 池**、实际投递，经 `FfiFuture` / `HostContext.deliver` 回传结果 |
 
 - 契约：`oj-plugin-ffi` 的 `MailVtable { submit(key, req_json, atts) -> FfiFuture }`（repr(C)）。
-- **新增轴零 ABI 变更**：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`（当前 8）——既有插件无需重编。
-- **插件拿不到宿主后端**（`HostContext` 只有 `log` + `deliver`）：故附件字节解析与 `bus` 发布都在**宿主**完成。
+- **新增轴零 ABI 变更**：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`（当前 8），既有插件无需重编。
+- **插件拿不到宿主后端**（`HostContext` 只有 `log` + `deliver`），所以附件字节解析与 `bus`
+  发布都在**宿主**完成。
 
 ## 2. 配置（`config.yaml`）
 
 顶层 `smtp:` 段，存在即启用 `Mail`/`mail`。段内分两类键：
 
 - **全局键**（4 个，固定含义）：`workers`、`queue_capacity`、`max_attachment_bytes`、`max_total_attachment_bytes`；
-- **其余每个键都是一个 profile**（键名即 `Mail(key)` / `mail.send` 的 profile 名）。
+- **其余每个键都是一个 profile**（键名即 `Mail(key)` / `mail.send` 的 profile 名。
+  profile = 一套独立的 SMTP 连接配置，按名取用）。
 
 ```yaml
 smtp:
@@ -66,7 +70,9 @@ smtp:
 
 - **白名单**：`allowed_from`/`allowed_recipients` **空表即拒绝**（防开放中继）；语义见下。
 - **`tls: none`**：必须显式 `allow_none_tls: true`，否则配置解析失败。
-- **双配置源互斥**：顶层 `smtp:` 与**非空** `plugins.mail` 不得同时出现（后者会静默胜出，让 `smtp:` 的改动不生效）→ 装配期报错。`plugins: {mail: {}}`（空对象）不算冲突，它是「回落 `smtp:` 适配器」的写法。
+- **双配置源互斥**：顶层 `smtp:` 与**非空** `plugins.mail` 不得同时出现。否则后者会静默胜出，
+  `smtp:` 的改动不生效，所以装配期直接报错。`plugins: {mail: {}}`（空对象）不算冲突，
+  它是「回落 `smtp:` 适配器」的写法。
 - **附件上限两个键**：必须为正整数（0 / 负数 / 字符串在启动期即报错，不静默取默认）。
 - **密钥**只在配置文件与插件内，**不进 JS**（`Mail.profiles()` 仅列 profile 名）。
 - **`file_transport` 目录须先存在**（lettre 不自动建目录）。
@@ -81,7 +87,9 @@ smtp:
 | `@x.com` | `@domain`：收件人**域全等** | `a@x.com` | `a@sub.x.com`、`a@evilx.com` |
 
 - **子域不通配**：`@x.com` 只覆盖本域，子域须显式写 `@sub.x.com`（反向亦不覆盖父域）。
-- **条目格式**（装配期校验，写错即启动失败而非静默不命中）：非空、无首尾空白，且必须是「完整地址（含 `@`）」或「`@domain`」之一。`""`、`x.com`（裸域）、`"@"`、`" a@x.com"` 均被拒；错误文案点名 `smtp.<profile>.<字段>[<下标>]` 与下一步。
+- **条目格式**（装配期校验，写错即启动失败而非静默不命中）：非空、无首尾空白，且必须是
+  「完整地址（含 `@`）」或「`@domain`」之一。`""`、`x.com`（裸域）、`"@"`、`" a@x.com"` 均被拒；
+  错误文案点名 `smtp.<profile>.<字段>[<下标>]` 与下一步。
 - `allowed_from` 只比 `from`；`allowed_recipients` 比 `to ∪ cc ∪ bcc` 的**每一个**地址。
 
 ## 3. JS API
@@ -133,11 +141,14 @@ interface MailSendRequest {
 |---|---|
 | `0` | 成功（`data.messageId` / `data.jobId`） |
 | `1` | 连接/网络错误、超时，**以及一切投递期失败**（含 SMTP 5xx 与鉴权失败） |
-| `2` / `3` | **当前未启用**：不细分 5xx（`2`）与鉴权失败（`3`），二者都归 `1`——`msg` 只出脱敏分类文案（lettre 原始错误含 SMTP 对话/收件人，不进信封）。判失败请用 `code !== 0` |
+| `2` / `3` | **当前未启用**：不细分 5xx（`2`）与鉴权失败（`3`），二者都归 `1`。`msg` 只出脱敏分类文案（lettre 原始错误含 SMTP 对话/收件人，不进信封）。判失败请用 `code !== 0` |
 | `4` | 队列满（背压，`try_send` 拒绝，不阻塞调用方） |
 | `5` | 地址/入参/白名单/附件校验失败 |
 
-> **`code !== 0` 一律不得自动重试**：`2`/`3` 未实现、与 `1` 合并为同码，故无法从 `code` 区分永久与瞬时失败；自动重试会把「收件人不存在」这类永久失败反复重投。需要重试请显式判定（如仅对 `code:1` 且确认瞬时性），并自行做幂等（重发会产生新 `jobId`，`mail.result` 不替你合并）。
+> **`code !== 0` 一律不得自动重试**：`2`/`3` 未实现、与 `1` 合并为同码，故无法从 `code`
+> 区分永久与瞬时失败。自动重试会把「收件人不存在」这类永久失败反复重投。需要重试请显式
+> 判定（如仅对 `code:1` 且确认瞬时性），并自行做幂等（重发会产生新 `jobId`，
+> `mail.result` 不替你合并）。
 
 ## 4. 附件（引用式，字节由宿主解析）
 
@@ -149,9 +160,11 @@ interface MailSendRequest {
 | 本地文件 | `{ filename, path }` | 经 `ensure_within` 钳制在 **project root** 内后读盘（越界 → `code:5`） |
 
 - `mime` 显式优先，否则按扩展名/字节嗅探。
-- **下标对齐**：宿主按 `attachments` 顺序生成字节数组，插件按同下标取用；**数量必须一致**（不一致 → `code:5`，防错配）。
-- 路径校验与读盘使用**同一 canonical 句柄**（避免 TOCTOU）。
-- **读盘不阻塞 isolate**：走 `tokio::fs`（内部 `spawn_blocking`）；`path` 路先取文件长度，超限文件**不会被读进内存**。
+- **下标对齐**：宿主按 `attachments` 顺序生成字节数组，插件按同下标取用；**数量必须一致**
+  （不一致 → `code:5`，防错配）。
+- 路径校验与读盘使用**同一 canonical 句柄**（避免 TOCTOU，即「检查后被换掉」的竞态）。
+- **读盘不阻塞 isolate**：走 `tokio::fs`（内部 `spawn_blocking`）；`path` 路先取文件长度，
+  超限文件**不会被读进内存**。
 
 ### 大小上限（超限 → `code:5`）
 
@@ -160,7 +173,9 @@ interface MailSendRequest {
 | `max_attachment_bytes` | 10 MiB（单个附件） |
 | `max_total_attachment_bytes` | 25 MiB（单封信合计） |
 
-超限文案点名哪个附件、两侧字节数与对应配置键。**为什么必须有**：附件字节由宿主读盘后经**有界队列**（默认容量 256）交给插件，无上限时 project root 内任意大文件（含 `config.yaml` 里的 `jwt_secret` / smtp 口令）都能被一次调用读入内存并被队列放大成内存 DoS。
+超限文案点名哪个附件、两侧字节数与对应配置键。**为什么必须有**：附件字节由宿主读盘后经
+**有界队列**（默认容量 256）交给插件。无上限时 project root 内任意大文件（含 `config.yaml`
+里的 `jwt_secret` / smtp 口令）都能被一次调用读入内存，并被队列放大成内存 DoS。
 
 ## 5. `sendRaw` 语义（防双收件人/spoof）
 
@@ -173,16 +188,21 @@ interface MailSendRequest {
 ## 6. 反馈通道（`enqueue`）
 
 - `enqueue` 立即回 `{code:0,data:{jobId}}`；worker 完成后经 `HostContext.deliver("mail.result", 信封)` 上送宿主。
-- **jobId 由宿主生成**（随机前缀 + 单调计数）：调用方自带值一律被剥离，回执里的 `jobId` 也钉成宿主值 —— jobId **不可猜**。
-- **归属校验**：宿主在 `submit` 之前为该 jobId 登记「profile + 模块 + 租户」的票；插件上送只能**填充**这张票（不能新建、不能覆写），`mail.result(jobId)` 只把结果显示给**同一归属**的调用方（换 profile / 换模块 / 换租户 → `null`，不泄露存在性）。
-- 结果存 `MailResultStore`（**限长 1024 + TTL 1 小时**，惰性清理）；并向**本地 `bus`** 扇出扁平结果：
+- **jobId 由宿主生成**（随机前缀 + 单调计数）：调用方自带值一律被剥离，回执里的 `jobId`
+  也钉成宿主值，所以 jobId **不可猜**。
+- **归属校验**：宿主在 `submit` 之前为该 jobId 登记「profile + 模块 + 租户」的票。插件上送
+  只能**填充**这张票（不能新建、不能覆写）。`mail.result(jobId)` 只把结果显示给**同一归属**
+  的调用方（换 profile / 换模块 / 换租户 → `null`，不泄露存在性）。
+- 结果存 `MailResultStore`（**限长 1024 + TTL 1 小时**，惰性清理）；并向**本地 `bus`** 扇出
+  扁平结果：
 
 ```js
 bus.subscribe("mail.result");   // 回调收到 { jobId, code, msg, messageId }
 ```
 
 - payload **不含** `to`/`subject`（脱敏）。
-- **跨进程/分布式反馈不支持**：`deliver` 是同步 `extern "C"`，宿主无法在其中 `await` 分布式总线；首版仅本地扇出。
+- **跨进程/分布式反馈不支持**：`deliver` 是同步 `extern "C"`，宿主无法在其中 `await`
+  分布式总线；首版仅本地扇出。
 
 ## 7. 安全清单
 
@@ -204,8 +224,12 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 mai
 - 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > `<exe>/plugins` > `<workspace_root>/bin/plugins`，再拼 `<host-triple>/`。
 - **未装插件不阻断启动**；调用 mail 时报 `mail not configured`（可选能力）。
 - 多 profile 复用同一队列/线程池；`workers`/`queue_capacity`/上限为全局，`timeout` 每 profile。
-- **停机 graceful drain**：`oj server` 收到停机信号后（HTTP 停收 + 长任务收场之后）触发排空 —— 插件停收新投递 → 等在途 job 跑完 → 销毁 transport；**总超时 10s**，超时只告警（`warn: mail drain 未完成…（在途邮件可能被丢弃）`）并不阻断退出。排空后仍在跑的 handler 再发信会拿到 `{code:1}`（文案含「停机」）。
-- `tls: none` 且走网络的 profile，启动时会打 **warn 级**告警（含 profile 名与 host:port）；`file_transport` profile 不告警。
+- **停机 graceful drain**：`oj server` 收到停机信号后（HTTP 停收 + 长任务收场之后）触发排空：
+  插件停收新投递 → 等在途 job 跑完 → 销毁 transport。**总超时 10s**，超时只告警
+  （`warn: mail drain 未完成…（在途邮件可能被丢弃）`）并不阻断退出。排空后仍在跑的 handler
+  再发信会拿到 `{code:1}`（文案含「停机」）。
+- `tls: none` 且走网络的 profile，启动时会打 **warn 级**告警（含 profile 名与 host:port）；
+  `file_transport` profile 不告警。
 
 ## 9. 已知限制
 

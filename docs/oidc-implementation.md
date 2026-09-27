@@ -1,14 +1,18 @@
 # OIDC 实现文档（OP + RP 双角色）
 
-> 实现走读：sample 内置 OIDC 的架构、时序与数据流。接入视角见
-> [oidc-integration.md](oidc-integration.md)，设计裁决见
+> 给谁读：要读懂或改动 sample 内置 OIDC 实现的维护者。这是实现走读，讲架构、时序与
+> 数据流。想在自己的项目里**接入** OIDC，请先看
+> [oidc-integration.md](oidc-integration.md)；设计裁决见
 > `docs/superpowers/specs/2026-09-05-sample-oidc-design.md`。
+>
+> 术语：**OP**（OIDC Provider）= 签发身份的一方；**RP**（Relying Party）= 消费身份、
+> 把登录委托给 OP 的一方。本项目同进程同时扮演两个角色。
 
 ## 1. 总体架构
 
 同进程双角色：`src/idp/` 是 OP（OIDC Provider，签发身份），`src/oidc/` 是 RP
 （Relying Party，消费身份）。两者共享 core 注入的 `oidc` 全局（RS256 原语 + 配置态）
-与 KV；会话桥接复用既有 `auth` 模块的 `issueTokens`。业务请求鉴权不变——oj-auth 插件
+与 KV；会话桥接复用既有 `auth` 模块的 `issueTokens`。业务请求鉴权不变：oj-auth 插件
 Bearer 守卫 + 租户头照旧，OIDC 只负责「换 token」那一跳。
 
 ```mermaid
@@ -70,7 +74,7 @@ flowchart TD
 - **OP 对外端点说标准协议**：discovery/jwks/token/userinfo 成功用 `json.raw` 回裸 JSON
   （RFC 6749 要求 `access_token` 是顶层字段），错误仍走 `{code,msg,data}` 信封。
 - **豁免面最小**：`tenant.anonymous_paths` 只豁免「缺失租户头的 400」，且只列跳转腿路径
-  （`/oidc/*`、`/idp/**`——discovery 挂在 `/idp/.well-known/openid-configuration`，比 `/idp/*`
+  （`/oidc/*`、`/idp/**`。discovery 挂在 `/idp/.well-known/openid-configuration`，比 `/idp/*`
   深一层，故 OP 面用 `**`）；带有效租户头的请求照常注入 `http.tenantId`。
   匹配为通配四形态（字面 / 尾 `/*` 一层 / `*` 单段 / `**` 跨段）。**语义收紧只发生在 auth 侧**
   （v0.1.20 把 oj-auth 的尾 `/*` 从任意深度改为严格一层）；租户侧自引入起即为严格一层，
@@ -121,6 +125,8 @@ sequenceDiagram
     RP-->>UA: 401 invalid or expired state
 ```
 
+（JIT = Just-In-Time 建号：首次登录成功时自动在本地 users 表插入一行。）
+
 安全闸门与失效路径：
 
 | 闸门 | 失败返回 |
@@ -146,7 +152,7 @@ flowchart LR
 ```
 
 - **RP 侧**：tenant 决定用哪个 IdP。tenant 从 query 进入豁免路由，建 state 时快照进 KV，
-  后续只信快照——query 无法劫持已建立的登录流。
+  后续只信快照。query 无法劫持已建立的登录流。
 - **OP 侧**：tenant 来自 client 注册（`oidc.clients.<id>.tenant`），随 code 进入
   id_token/access_token claims。
 - **豁免边界**：只有跳转腿豁免；登录后的业务请求照常强制 `X-TENANT-ID`，与全站语义一致。

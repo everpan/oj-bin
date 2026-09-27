@@ -1,12 +1,15 @@
 # only js
 
-构建命令行应用程序`oj`,包含以下子命令
+> 给谁读：第一次接触 `oj` 命令行的人。想知道 `server` / `build` / `test` / `migrate` /
+> `fixture` / `schema diff` 各自干什么、参数怎么写时读这篇。
+
+`oj` 是构建出来的命令行程序，包含以下子命令。
 
 ## server
-  执行 `oj server -c config.yaml` 将读取配置文件，启动一个web服务
+  执行 `oj server -c config.yaml` 会读取配置文件，启动一个 web 服务。
 
   -c config.yaml 读取配置文件中的信息，启动服务，其中包含 host port db redis 等配置信息
-  
+
   以下为一个例子
   ```yaml
     server:
@@ -26,8 +29,8 @@
   --api-path dir 以 `dir` 作为项目的服务目录（`src` 源码树或 `oj build` 产物 `dist`，
                  相对 CWD）。模式自动判定：目录含
                  `manifests.yaml` ⇒ release（服务预转译 JS，按锁聚合，不转译），
-                 否则 dev（按需转译 TS，notify 热重载）。缺省时不开 API 功能 ——
-                 准入门三态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
+                 否则 dev（按需转译 TS，notify 热重载）。缺省时不开 API 功能。
+                 准入门有三种状态：`--api-path` 与静态站点（`server.app_path` / `--app-path`）
                  至少显式指定其一，否则退出；两者皆指定则都必须存在，任一缺失退出；
                  仅指定其一即只启用对应功能。一个开发中的服务目录如下
   ```
@@ -47,7 +50,7 @@
   公钥路径）、`--console-log`（打开终端输出，默认只落盘 server.logs_dir；启动失败的
   最终退出原因无论开关都直写终端）。
 
-   每个模块目录下包含一个配置文件 manifest.yaml 用于记录该模型的相关清单，其案例结构如下
+   每个模块目录下包含一个配置文件 manifest.yaml 用于记录该模块的相关清单，其案例结构如下
   ```yaml
     name: "user" # 与模块名文件夹同名，即父目录名，约束条件
     desc: "用户信息相关，记录账号、地址等个人信息" # 模块的简短描述
@@ -68,13 +71,13 @@
         json.ok(r)
     }
     function post(){}
-    // 
+    //
     export default {get,post}
   ```
-   以上代码通过 `oj build moduleA` 命令来编译，制品存放在 `dist`，`build` 子命令为内置转译管线（deno_ast/swc）的包装。
+   以上代码通过 `oj build moduleA` 命令来编译，制品存放在 `dist`。`build` 子命令是内置转译管线（deno_ast/swc）的包装。
 
 ## build
-  开发者通过执行 `oj build user` 命令来编译 user 模块，`build` 子命令为内置转译管线（deno_ast/swc）的包装，基本过程如下
+  开发者通过执行 `oj build user` 命令来编译 user 模块。`build` 子命令是内置转译管线（deno_ast/swc）的包装，基本过程如下
       - 校验 user/manifest.yaml 中的模块名是否与根目录相同，即模块名必须严格相同, 其中 version 记录为 {VERSION}
       - 遍历所有子文件夹的 `api.ts`, 并将其路径提取，例如 `user/profile/detail/api.ts` `API_PATH='user/profile/detail'`
       - 从api.ts中export的方法中，提取 route，如 `get.route={id}`, 则可以依此作为生产 `routes.js` 的路由项数据 `{ method: "get", pattern: "user/profile/detail/{id}", file: "detail/api.js" }`；`file` 相对版本目录根，子目录下的 api.ts 形如 `detail/api.js`（产物保留原名与目录结构，api.ts → 同目录 `api.js`）
@@ -82,7 +85,7 @@
       - 全部 .ts 按原路径换 .js 扩展落盘（api.ts 同名 `api.js`，仅多一步剥 `.route` 声明），manifest.yaml 原样复制；跨模块相对导入（如 order 导入 `../user/_shared/validate`）构建期改写为指向目标模块版本目录的相对路径
      - 导入别名（`#_shared/x` 本模块根 / `#/user/_shared/x` src 根）同批**实化**为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本；落盘后断言产物内无残留 `#` specifier（漏检即构建失败）
      - 改写用与 dev 运行期**同一份解析探针**（含 `.ts` → `.js` → `/index.ts` 补全），故 `import x from "../_shared"` 这类目录索引导入在 dev 与 release 命中同一文件（此前 release 会改写成不存在的 `_shared.js`）
-      - 转译产物默认 minify（单行、剥注释——含内联 sourcemap），`--no-minify` 可关闭以得到可读产物排障
+      - 转译产物默认 minify（单行、剥注释，含内联 sourcemap），`--no-minify` 可关闭以得到可读产物排障
       - 最后将形成若干 `dist/user-{VERSION}/`（如 `detail/api.js`、`_shared/validate.js`）以及 `dist/user-{VERSION}/routes.js`, routes.js 中包含若干路由项数据
       - 同时形成压缩包文件 `dist/user-{VERSION}.tgz`, 用于整体发布（内容确定，同输入重复打包结果一致）
 
@@ -140,7 +143,7 @@
       -d        服务目录（缺省自动判定）
       --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
       --baseline 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
-      module    只迁移指定模块
+      module    只迁移指定模块（位置参数）
 
 ## fixture
   灌入模块 `fixtures/` 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
@@ -149,6 +152,7 @@
     oj fixture [-c config.yaml] [-d dir] [--db name] [module]
 ```
       --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
+      module    只灌指定模块（位置参数）
 
 ## schema diff
   声明式 schema（各模块 `schema.yaml`）与实库只读对账：D001 声明 vs 实库漂移
@@ -160,4 +164,3 @@
       --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
 
   迁移 / schema 的心智模型、门禁与回滚见 `docs/migration.md`。
-

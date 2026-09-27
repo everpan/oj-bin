@@ -1,8 +1,11 @@
 # OIDC 接入手册
 
-> 面向要在自己的 oj 项目里启用 OIDC 的开发者：接外部 IdP（RP 角色）、用内置 OP、
-> 多租户接线与排障。实现原理见 [oidc-implementation.md](oidc-implementation.md)，
+> 给谁读：要在自己的 oj 项目里启用 OIDC 的开发者。覆盖接外部 IdP（RP 角色）、用内置
+> OP、多租户接线与排障。实现原理见 [oidc-implementation.md](oidc-implementation.md)，
 > JS 全局签名见 [devkit/api-manual.md](devkit/api-manual.md) §6 `oidc` 行。
+>
+> 术语：**IdP** = 身份提供方（如 Keycloak、Auth0，或本仓内置 OP）；**RP** = 接入方，
+> 即你的 oj 服务；**OP** = 本仓 sample 自带的身份提供方实现。
 
 ## 1. 前置条件
 
@@ -33,7 +36,7 @@ oidc:
       scope: "openid profile"
 ```
 
-只当 RP、不用内置 OP 时，`rp` 段配好即可——`clients` 段可以省略。`oidc:` 段缺省 =
+只当 RP、不用内置 OP 时，`rp` 段配好即可，`clients` 段可以省略。`oidc:` 段缺省 =
 不启用（`oidc` 全局不存在，调用报 `oidc not configured`）。
 
 IdP 侧注册（在 IdP 的管理台上做）：
@@ -61,10 +64,10 @@ curl -si 'https://your.app/v1/api/oidc/login?tenant=default'
 要点：
 
 - `?tenant=` 必须是 `oidc.rp` 里的键，未知租户 400。
-- `tenant` 与 `state` 一起快照进 KV（TTL 10 分钟），callback 只信快照——用户改 query
+- `tenant` 与 `state` 一起快照进 KV（TTL 10 分钟），callback 只信快照。用户改 query
   动不了已建立的登录流。
-- 登录成功后本地账号按 **`oidc:<tenant>:<sub>`** JIT 创建（首次登录自动建行，不可密码
-  登录），与本地口令账号天然隔离；`roles` 取该行 `roles` 列。
+- 登录成功后本地账号按 **`oidc:<tenant>:<sub>`** JIT 创建（JIT = 首次登录自动建行，
+  不可密码登录），与本地口令账号天然隔离；`roles` 取该行 `roles` 列。
 - `/oidc/*`、`/idp/**` 路径必须同时加进 **`auth.anonymous_paths` 与
   `tenant.anonymous_paths`**（浏览器跳转腿带不了 Bearer 和租户头）：
 
@@ -82,7 +85,7 @@ tenant:
 ```
 
 > **为什么 `/idp` 用 `**` 而不是 `/*`**：尾 `/*` 是**严格一层**，而
-> `/idp/.well-known/openid-configuration` 是两层——写 `/*` 会让 discovery 被守卫拦下。
+> `/idp/.well-known/openid-configuration` 是两层。写 `/*` 会让 discovery 被守卫拦下。
 > 注意这条收紧**只发生在 `auth.anonymous_paths`**（oj-auth 侧旧实现是任意深度）；
 > `tenant.anonymous_paths` 自引入起就是严格一层，所以那里写 `/*` 与 `**` 的差别只在于
 > 「要不要覆盖更深路径」，不涉及迁移。
@@ -91,7 +94,7 @@ tenant:
 > 比它深）就会被点名（v0.1.23 起还要满足「旧式前缀形态 + 确会丢面」两个条件）；确属
 > 「有意一层」时写 `- { path: "/idp/*", one_layer: true }` 消音。
 > `sample/config.yaml` 走的是**更窄**的三条 + `one_layer`（豁免面最小），本文的 `/idp/**`
-> 是等价但更省事的写法——两者都不告警，按你的安全偏好选一个即可。
+> 是等价但更省事的写法。两者都不告警，按你的安全偏好选一个即可。
 
 ## 4. 用内置 OP（自己当身份源）
 
@@ -139,13 +142,13 @@ users (username, password_hash, roles) VALUES (?, '<bcrypt hash>', '[]')`）。
 | 跳转腿豁免 | `tenant.anonymous_paths` | 浏览器 302 带不了租户头；列表外照常 400 |
 | 业务隔离 | `X-TENANT-ID` 头 | 登录后恢复全站强制；行级过滤仍由业务 SQL 自理（框架不自动改写） |
 
-一个 users 表服务多租户时，本地账号名 `oidc:<tenant>:<sub>` 已按租户隔离；**不要**把
+一个 users 表服务多租户时，本地账号名 `oidc:<tenant>:<sub>` 已按租户隔离。**不要**把
 两个不同信任级的 IdP 指向同一租户键。
 
 ## 6. 会话与登出
 
 - callback 返回的 `access_token/refresh_token` 就是既有 `auth` 会话（HS256 + KV 轮换，
-  时长取 `auth.access_token_duration/refresh_token_duration`）——**后续鉴权、refresh、
+  时长取 `auth.access_token_duration/refresh_token_duration`）。**后续鉴权、refresh、
   logout 与本地登录完全同构**，前端无感。
 - OP 侧会话（`IDP_SESSION` cookie）独立存在，只用于 authorize 免重复输密码；Path 限定
   `/…/idp`，HttpOnly + SameSite=Lax。

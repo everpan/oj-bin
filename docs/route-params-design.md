@@ -1,5 +1,8 @@
 # 路径参数路由设计（Route Params Design）
 
+> 给谁读：要理解或修改 oj 路由系统（`.route`、路由表、冲突处理）的维护者。这是一篇
+> 设计文档，记录了当初的决策与理由；读代码前先看它能知道「为什么是现在这样」。
+>
 > 状态：历史设计稿（.route 语义已实现并随 sample 验收）。
 > **本文 §4.1/§十一 的 release/routes.js/build 部分已被 2026-08-24 的 oj build 取代**
 > （多模块版本目录 + `dist/manifests.yaml` 锁 + 聚合加载，见
@@ -14,7 +17,7 @@
 
 ## 一、目标
 
-在保留"JS handler 动态加载、不改 Rust 重编译"的前提下支持路径参数，且**不让参数污染目录结构**（早期 `user/:id/api.ts` 目录方案已否决——目录只应负责代码组织，不应承担路由语义）。
+在保留"JS handler 动态加载、不改 Rust 重编译"的前提下支持路径参数，且**不让参数污染目录结构**（早期 `user/:id/api.ts` 目录方案已否决。目录只应负责代码组织，不应承担路由语义）。
 
 ## 二、核心机制：方法级 `.route` 属性 + 启动内省建表
 
@@ -53,7 +56,7 @@ export default { get: list, post: detail };
 
 启动日志打印：总模块数 / 成功数 / 失败清单。
 
-**内省插入时机**：`server_cmd.rs` 中 LoaderShared 构造（:74）之后、actor 池构造（:76）之前——此时 dbs/kv/loader 均就绪；内省产物直接替换现 `route_table` 目录遍历打印（:66-68）。
+**内省插入时机**：`server_cmd.rs` 中 LoaderShared 构造（:74）之后、actor 池构造（:76）之前。此时 dbs/kv/loader 均就绪；内省产物直接替换现 `route_table` 目录遍历打印（:66-68）。
 
 ## 三、`.route` 语法
 
@@ -65,13 +68,13 @@ export default { get: list, post: detail };
 | `{*name}` | catch-all，**一或多段**，且只能在模式末尾 | `/file/{*path}` |
 | `{{` / `}}` | 字面 `{` / `}` 转义 | `/foo/{{id}}` 匹配字面 `{id}` |
 
-> 约束（实测 matchit `=0.8.4`，axum 0.8.9 硬钉该版本）：**参数段内不得混字面**——
+> 约束（实测 matchit `=0.8.4`，axum 0.8.9 硬钉该版本）：**参数段内不得混字面**。
 > `{id}.json`、`foo-{bar}`、`v{a}.{b}` 一律 `InvalidParamSegment`（按 §5 丢弃+日志）；
 > 参数必须独占一段。0.8.6 已放宽，axum 放开 pin 后可启用。
 
-> 评审定论：matchit 0.8.4（axum 0.8 同款）的原生语法就是 `{param}`/`{*param}`；`:id`/`*path` 是 0.7 旧语法。**用户侧直接采用原生语法**，不做 `:id`→`{id}` 翻译层——两套语法并存 + 翻译规则是净增概念与 bug 面（partial segment `/foo-{bar}`、`{{` 转义都会被朴素替换弄坏）。
+> 评审定论：matchit 0.8.4（axum 0.8 同款）的原生语法就是 `{param}`/`{*param}`；`:id`/`*path` 是 0.7 旧语法。**用户侧直接采用原生语法**，不做 `:id`→`{id}` 翻译层。两套语法并存 + 翻译规则是净增概念与 bug 面（partial segment `/foo-{bar}`、`{{` 转义都会被朴素替换弄坏）。
 >
-> catch-all 语义（matchit tree.rs 源码级核实）：到达 catch-all 节点前必须先吃掉分隔符 `/`，故 `{*path}` **匹配一或多段**——`/v1/api/file` 与归一后的 `/v1/api/file/` 均 404（见第六节 normalize）。另：未归一时 `{*p}` 会把尾斜杠吞进参数值（`bar/`），尾斜杠归一后此问题不存在。
+> catch-all 语义（matchit tree.rs 源码级核实）：到达 catch-all 节点前必须先吃掉分隔符 `/`，故 `{*path}` **匹配一或多段**。`/v1/api/file` 与归一后的 `/v1/api/file/` 均 404（见第六节 normalize）。另：未归一时 `{*p}` 会把尾斜杠吞进参数值（`bar/`），尾斜杠归一后此问题不存在。
 
 ### 3.2 相对 vs 根级（首字符判别）
 
@@ -89,7 +92,7 @@ export default { get: list, post: detail };
 
 无 `.route` 的方法 → 仅用目录推导路径（向后兼容现有零配置路由）。**`.route = ""` 视同未挂**（空串不是有效模式；落相对分支会拼出带尾斜杠的非法 pattern）。
 
-> ⚠️ **挂 `.route` = 替换，不是追加（已裁决维持）**：方法一旦挂 `.route`，其目录镜像 URL（`dir_base`）即不再注册。曾评估"默认同时保留 dir_base"（追加模式）——否决：一个方法静默挂两个 URL、旧路径无法退役、还需发明 `route = false` 魔法值。要同时保留两个路径，写两个方法（一个不挂 = 列表，一个挂 = 详情）——REST list/detail 双函数本就是更清晰的写法。
+> ⚠️ **挂 `.route` = 替换，不是追加（已裁决维持）**：方法一旦挂 `.route`，其目录镜像 URL（`dir_base`）即不再注册。曾评估"默认同时保留 dir_base"（追加模式），否决：一个方法静默挂两个 URL、旧路径无法退役、还需发明 `route = false` 魔法值。要同时保留两个路径，写两个方法（一个不挂 = 列表，一个挂 = 详情）。REST list/detail 双函数本就是更清晰的写法。
 >
 > TS 提示：`detail.route = "{id}"` 在 TypeScript 下报"属性不存在"（swc 只剥类型不影响运行，但编辑器红线）。项目根加一次性 `global.d.ts`：
 > ```ts
@@ -119,7 +122,7 @@ build_route_table(root, base, loader_shared):
 要点：
 
 - **拼接规范化**：`Routes::new` 把 base 归一成 `/v1/api/`（尾斜杠，`routes.rs:17`），字面 `base + route` 会得双斜杠（matchit 精确匹配，永不命中）。拼接前 `base.trim_end_matches('/')`，`route` 侧保留首 `/` 即可。
-- **同一函数挂多个方法**（`export default { get: f, post: f }`）：`.route` 在函数上，两个方法共享同一模式——若非本意，拆成两个函数。
+- **同一函数挂多个方法**（`export default { get: f, post: f }`）：`.route` 在函数上，两个方法共享同一模式。若非本意，拆成两个函数。
 - `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`../oj/src/server_cmd.rs:66-68` 的打印改用其产物。
 
 ### 4.1 release 直载（`routes.js`，免内省）
@@ -134,7 +137,7 @@ export default [
 ];
 ```
 
-- 读取走 `Bridge::read_module_default`（与内省同构的 side-module driver，复用 2s 超时与信封解析），`RouteTable::from_entries` 注册——注册语义与 dev 完全一致（合并 / 冲突 / 非法 pattern 丢弃）。
+- 读取走 `Bridge::read_module_default`（与内省同构的 side-module driver，复用 2s 超时与信封解析），`RouteTable::from_entries` 注册。注册语义与 dev 完全一致（合并 / 冲突 / 非法 pattern 丢弃）。
 - **fail-fast**：`dist/routes.js` 不存在 → 启动失败，提示 `run 'oj build' first`；存在但 default 导出不是数组 → 同样启动失败。
 - dev 与 release 差异总结：dev = 内省 + fs 兜底（新文件免重启）；release = routes.js 直载，表外一律 404。
 - `file` 字段相对模块根（dist）；`replaced` 集合在 release 恒空（无兜底可拦截）。
@@ -176,8 +179,8 @@ export default [
 > **静态段优先于参数段**由 matchit 的优先级（静止态在前 + 回溯）保证，与注册顺序无关：
 > `/x/{pk}` 与 `/x/me` 共存时 `/x/me` 必落静态节点（且 `params` 为空）。
 >
-> v0.1.19 前的 bug 让「结构性冲突（异名参数）」被**静默合并**成同一个节点，两条 URL 都能用；
-> 修复后按上表「后来者不进树」处理——升级时若依赖过该歪打正着的行为会变成 404（见 CHANGELOG
+> v0.1.19 前的 bug 让「结构性冲突（异名参数）」被**静默合并**成同一个节点，两条 URL 都能用。
+> 修复后按上表「后来者不进树」处理。升级时若依赖过该歪打正着的行为会变成 404（见 CHANGELOG
 > v0.1.19 行为变更）。
 
 ```rust
@@ -221,9 +224,9 @@ handle(method, uri, ...):
 按序执行，任一拒绝 → 404（与现 `resolve`(`routes.rs:22-36`) 行为平价）：
 
 1. **非法字符**：含 `\` 或 `\0` → 404。
-2. **尾斜杠归一**：`/a/` → `/a`（根 `/` 保持）——现 `trim_matches('/')` 等价契约（`routes.rs:99`），matchit 不自动归一。
+2. **尾斜杠归一**：`/a/` → `/a`（根 `/` 保持）。现 `trim_matches('/')` 等价契约（`routes.rs:99`），matchit 不自动归一。
 3. **段校验**（归一后 split，任一违例 → 404）：空段（`//`，`routes.rs:111` 测试）、字面 `.` / `..`、含 `\` / `\0`。
-4. **解码后参数校验**：匹配成功后对参数做 percent-decode 并校验——解码值为 `.`/`..`、含 `\`/`\0`，或 **raw 无 `/` 而解码后有 `/`**（单段参数走私 `%2F`）→ 404（封死 `%2e%2e`、`%2f` 编码形式；现实现对编码形式也是 404——字面 join 永远找不到 `%2e%2e` 目录——须保平价）。catch-all 的 raw 值天然含真实分隔符，放行。
+4. **解码后参数校验**：匹配成功后对参数做 percent-decode 并校验。解码值为 `.`/`..`、含 `\`/`\0`，或 **raw 无 `/` 而解码后有 `/`**（单段参数走私 `%2F`）→ 404（封死 `%2e%2e`、`%2f` 编码形式；现实现对编码形式也是 404——字面 join 永远找不到 `%2e%2e` 目录——须保平价）。catch-all 的 raw 值天然含真实分隔符，放行。
 
 > 安全注：查表方案下 file 来自启动期 walk，**与用户输入彻底解耦**，目录穿越面结构性消除；params 不再进文件系统。第 4 条是契约平价，不是防线。
 
@@ -232,7 +235,7 @@ handle(method, uri, ...):
 现 `resolve` 每请求查文件系统，**新增 api 文件无需重启即生效**；纯启动建表会退化此体验。故 dev（`--dev`）下：
 
 - 表 miss → 回退现 `resolve` 目录镜像逻辑 → 命中则照常执行（方法未导出仍由 driver `json.fail(405)` 兜底）。
-- **替换路由守卫**：回退命中文件后，若该 `(file, method)` 在表中已有 `.route` 注册 → 404——挂 `.route` 即替换 dir_base 的语义不得被兜底复活，否则 dev/prod 行为分叉。
+- **替换路由守卫**：回退命中文件后，若该 `(file, method)` 在表中已有 `.route` 注册 → 404。挂 `.route` 即替换 dir_base 的语义不得被兜底复活，否则 dev/prod 行为分叉。
 - 局限（接受）：新增**带参数**路由（`/user/account/42` 形状）表 miss 后目录镜像也解析不出 → 重启生效；修改 `.route` 同理。
 
 release 纯走表（省每请求 stat）。
@@ -240,7 +243,7 @@ release 纯走表（省每请求 stat）。
 ### 6.3 其它契约平价
 
 - **表与模块不一致的兜底**：请求期 driver 仍校验 `typeof fn === "function"`（`mod.rs:366-368`），方法被删 → 405。表过期不产生 500。
-- **HEAD/OPTIONS**：维持现状——需显式导出 `head`/`options`，否则 405（不引入 HEAD→GET 自动回退）。
+- **HEAD/OPTIONS**：维持现状。需显式导出 `head`/`options`，否则 405（不引入 HEAD→GET 自动回退）。
 - **404 文案**：`no api file for route` 语义过时，改为 `no route matched`（`user-manual.md` §10 同步）。
 
 ## 七、JS 侧参数访问（`bootstrap.js`）
@@ -387,9 +390,9 @@ get.route = "{id}";
 
 ## 十、副作用、成本与约束
 
-1. **`.route` 必须是顶层可求值的确定值**（字面量/常量表达式）。它在内省期求值一次、表即固化，请求期不再校验——若依赖可变状态（kv/时间/env 分支），表与模块实际行为**静默发散**。这是约束，不做运行时检测。
+1. **`.route` 必须是顶层可求值的确定值**（字面量/常量表达式）。它在内省期求值一次、表即固化，请求期不再校验。若依赖可变状态（kv/时间/env 分支），表与模块实际行为**静默发散**。这是约束，不做运行时检测。
 2. **顶层副作用执行次数**：内省运行时 1 次 + 每个 actor 运行时首次触达该模块各 1 次（池大小 N → 最多 N+1 次；模块缓存 per-runtime，`?v=` 不变则不重跑）。顶层 db 写必须幂等（推荐迁移到 `seed.sql`）。内省期 dbs 已就绪（`server_cmd.rs` 先开库执行 seed），顶层只读查询安全。
-3. **热重载边界**：handler 内容修改靠 `?v=mtime` 免重启（不变）；新增/删除 api 文件、修改 `.route` 需重启——dev 由 §6.2 兜底缓解（带参数路由除外），release 一律重启。
+3. **热重载边界**：handler 内容修改靠 `?v=mtime` 免重启（不变）；新增/删除 api 文件、修改 `.route` 需重启。dev 由 §6.2 兜底缓解（带参数路由除外），release 一律重启。
 4. 可选参数（`{id?}`）、正则约束暂不纳入，列入后续迭代。
 
 ## 十一、`oj build`（src → dist 产物与 `routes.js` 生成）
@@ -410,4 +413,4 @@ oj build [-b /v1/api] [-d src] [-o dist]
 - 剥离只删"语句起始的 `xxx.route = …`"整行；表达式中间的 `.route` 读取不受影响。动态/别名 import 不处理（出现再加）。
 - 补后缀仅限静态 `from "…"` 字面量且以 `./`、`../` 开头；bare specifier（node_modules）原样保留（release 运行时 project_root 在项目根，可解析）。
 
-`.route` 剥离后 dist 产物即纯 handler；路由事实的唯一来源是 `routes.js`——release 启动不再读任何 `.route`。dev 与 release 的行为对齐靠"同一套注册语义"（`register()` 共享）保证。
+`.route` 剥离后 dist 产物即纯 handler；路由事实的唯一来源是 `routes.js`。release 启动不再读任何 `.route`。dev 与 release 的行为对齐靠"同一套注册语义"（`register()` 共享）保证。

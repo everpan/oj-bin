@@ -1,19 +1,20 @@
 # oj server 运维手册
 
-面向部署、发布、排障。功能面见 `docs/user-manual.md`，实现面见 `docs/dev-guide.md`，
-模块数据层与迁移运维见 `docs/migration.md`。
+**给谁读**：负责部署、发布、排障的人——拿到一台服务器之后照这本走。功能怎么配见
+`docs/user-manual.md`，实现细节见 `docs/dev-guide.md`，模块数据层与迁移运维见
+`docs/migration.md`。
 
 ## 1. 构建与发布
 
 ```bash
-cargo build --release
-ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_core 内嵌）
+cargo xtask build          # release 构建，产物归置 bin/oj + bin/plugins/<triple>/（独立二进制，deno_core 内嵌）
 ```
 
-发布物 = `target/release/oj` + 项目目录（`dist/` + `config.yaml` + `seed.sql` + `node_modules/`）。
+发布物 = `bin/oj` + `bin/plugins/<triple>/` + 项目目录（`dist/` + `config.yaml` + `seed.sql` + `node_modules/`）。
 
 发布流程：
-1. `cargo build --release`（确认 debug/release 双绿）。
+1. `cargo xtask build`——构建 `bin/oj` 和全部第一方插件（本仓库只支持 release 构建，
+   debug 不在支持范围）。
 2. `oj build -d src -o dist`（无参 = 全部模块）——生成各模块版本目录
    `dist/<module>-<version>/`（产物保留 src 目录结构与原名，如 `account/api.js`，
    默认 minify 成单行）、锁文件 `dist/manifests.yaml` 与确定性发布包
@@ -25,9 +26,10 @@ ls -lh target/release/oj          # 独立二进制，无运行时依赖（deno_
    存量库接入用 `--baseline`。发布前可跑 `oj schema diff` 做声明 vs 实库对账（漂移 exit 1）。
    **多库部署**：上面两条默认只作用 `db.default`，非 default 的命名库须加 `--db <profile>`
    逐库各跑一遍（未声明的库名 fail-fast；见 `migration.md` §3.8）。
-4. 打包 `oj` 二进制 + `dist/` + `config.yaml` + `seed.sql`（可选）+ vendored
-   `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
+4. 打包 `bin/oj` + `bin/plugins/<triple>/` + `dist/` + `config.yaml` + `seed.sql`（可选）+
+   vendored `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
 5. 目标机解包，`./oj server -c config.yaml --api-path dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
+   插件发现走 `<exe>/plugins/<triple>/`，保持 `bin/` 的相对布局拷过去即可，无需额外配置。
 
 ### 1.1 npm 分发（`@oj-bin/*`）
 

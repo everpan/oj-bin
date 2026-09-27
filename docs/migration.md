@@ -1,9 +1,11 @@
 # 数据初始化与迁移手册（Data Init & Migration Runbook）
 
-面向**运维与开发者**的数据层专题手册：四条数据通道（`schema.yaml` / `migrations/` /
-`seed.sql` / `fixtures/`）各自的适用场景、限制与红线、错误码速查、标准部署流程。
-规则背景见 `user-manual.md` §5，部署排障见 `ops-manual.md` §7，实现走读见
-`docs/modules/07-data-layer.md`。
+> 给谁读：要部署 oj 服务的运维，以及要改表结构、灌数据的开发者。第一次部署、加表加列、
+> 接入已有数据库时读这篇。
+>
+> 本手册讲四条数据通道（`schema.yaml` / `migrations/` / `seed.sql` / `fixtures/`）各自的
+> 适用场景、限制与红线、错误码速查、标准部署流程。规则背景见 `user-manual.md` §5，
+> 部署排障见 `ops-manual.md` §7，实现走读见 `docs/modules/07-data-layer.md`。
 
 ## 1. 总览：四条数据通道
 
@@ -13,6 +15,9 @@
 | `migrations/*.sql` | 手写结构 / 数据演进 | 启动（auto）/ `oj migrate` | 三方言（方言覆盖文件） | 账本账（重跑零新增） | 是 | S007 + 账本 M001/M002 |
 | `seed.sql` | 引导数据（每次启动重放） | **每次启动**（服务与测试） | 三方言 | S006 门禁 + 引擎按方言改写 `INSERT OR IGNORE` | 是 | S002 / S006 |
 | `fixtures/*.sql` | 演示 / 测试数据（按需灌） | `oj fixture` / `oj test`（**server 永不灌**） | 三方言 | SQL 自身（无门禁） | **否（构建整目录排除）** | 无 |
+
+名词解释：**三方言** = sqlite / mysql / postgres 三种数据库；**账本** = 库里记录「哪些迁移
+已执行」的表；**幂等** = 重复执行结果不变。
 
 选型决策：
 
@@ -27,7 +32,7 @@
 
 两条铁律贯穿所有通道：
 
-1. **动态标识符只来自声明，值只走绑定参数**——迁移与 seed 里的表名列名是作者自写的
+1. **动态标识符只来自声明，值只走绑定参数**。迁移与 seed 里的表名列名是作者自写的
    静态文本，不得从任何运行时输入拼装。
 2. **`;` 朴素切分**：所有 SQL 文件（迁移 / seed / fixtures）按 `;` 拆句，
    **语句内不得含分号字面量**（含在字符串里也不行）。
@@ -41,34 +46,34 @@
   重放；三方言 default 库都执行（无 default 库 → `warn: seed skipped` 跳过）。
 - **适用**：每次启动都必须存在的引导数据（内置角色、菜单树、字典表）。
 - **幂等写法以 sqlite 惯用法为源**：S006 只认 `OR IGNORE` / `OR REPLACE` /
-  `ON CONFLICT` / `ON DUPLICATE KEY` 四形态；引擎把默认写法
-  `INSERT OR IGNORE INTO …` 按目标方言自动改写——mysql → `INSERT IGNORE INTO …`、
+  `ON CONFLICT` / `ON DUPLICATE KEY` 四形态。引擎把默认写法
+  `INSERT OR IGNORE INTO …` 按目标方言自动改写：mysql → `INSERT IGNORE INTO …`、
   pg → `INSERT INTO … ON CONFLICT DO NOTHING`。其余形态**不翻译**（作者显式选择
   的方言写法原样透传，跨方言部署需自写方言文件）。UPDATE / DELETE 不做任何检查，
   写了就会每次启动重复生效。
 - **执行日志（回归与排障）**：seed / migrate / fixture / schema reconcile 的每条
-  语句执行结果都记 tracing 日志——`module` / `file` / `seq` / `rows`（受影响行数）/
+  语句执行结果都记 tracing 日志：`module` / `file` / `seq` / `rows`（受影响行数）/
   `stmt`（截断 200 字符），成功 `ok`、失败 `failed` 附错误。`oj server` 落 `logs/`
   目录（终端镜像落盘）；`oj migrate` / `oj fixture` / `oj test` CLI 直跑落 stderr。
-- **限制**：不记账本——重放历史靠执行日志，不在库内。
+- **限制**：不记账本。重放历史靠执行日志，不在库内。
 - **S006（构建门禁）**：seed.sql 禁 DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME/GRANT/
-  COMMENT——结构归 schema.yaml 或 migrations）；禁非幂等 INSERT；只准碰本模块表与
+  COMMENT，结构归 schema.yaml 或 migrations）；禁非幂等 INSERT；只准碰本模块表与
   `deps:` 声明模块的表。
-- **S002（构建 + 启动双侧）**：同一张表不许两处 `CREATE TABLE`——表 → 模块单射，
+- **S002（构建 + 启动双侧）**：同一张表不许两处 `CREATE TABLE`。表 → 模块单射，
   冲突 fail-fast，不静默合并。
 
 ### 2.2 fixtures/ —— 演示与测试数据，按需灌
 
-- **入口**：`oj fixture -c config.yaml [-d dir] [--module M]`；`oj test` 装配时自动灌
+- **入口**：`oj fixture -c config.yaml [-d dir] [module]`；`oj test` 装配时自动灌
   （`fixtures=true`）。**server 启动永不灌**。
 - **行为**：模块目录下 `fixtures/*.sql`，按文件名排序逐文件、文件内按 `;` 切分顺序
   exec 到 default 库；**不记账本**；重复灌靠 SQL 自身幂等
   （推荐 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`）。
 - **适用**：本地开发造数、演示环境灌数、`oj test` 前置数据。
 - **限制**：
-  - 构建时整目录排除，**不随产物发布**——生产演示数据须走 migrations 或人工执行。
+  - 构建时整目录排除，**不随产物发布**。生产演示数据须走 migrations 或人工执行。
   - 无 S006 类静态检查：非幂等 SQL 重复灌会翻倍，作者自审。
-  - 三方言都执行，但 SQL 方言兼容性（如 `OR IGNORE` 仅 sqlite/mysql）作者自担；
+  - 三方言都执行，但 SQL 方言兼容性（如 `OR IGNORE` 仅 sqlite/mysql）作者自担。
     跨方言用 `MERGE` 语义的写法不存在，写方言分支文件或取 portable 写法。
 
 ## 3. 迁移通道（migrations/）
@@ -80,7 +85,7 @@
 - 方言覆盖文件**必胜**，无后缀通用文件兜底，其他方言文件跳过；同 seq 的通用与覆盖
   文件 `desc` 必须一致（账本 name 的唯一来源，M001 对比依据）。
 - BOM / CRLF 载入侧自动规范化（Windows 检出不误判篡改）。
-- **适用**：一切无法安全推导的变更——NOT NULL 列新增、改名、删列、类型变更、
+- **适用**：一切无法安全推导的变更：NOT NULL 列新增、改名、删列、类型变更、
   数据回填、方言特化 DDL（分区、表空间等）。
 
 ### 3.2 账本
@@ -108,7 +113,7 @@
 | 事务性 DDL | 是：每个迁移 = 一个事务（迁移 SQL + 账本写入同事务，**原子**） | 否：DDL 隐式提交，**逐条执行** |
 | 中途崩溃 | 当前迁移整体回滚，账本无残留 | **半套 DDL 落库且无账本行**：重跑撞 "table exists"，需人工清理残留对象后重试 |
 | 并发互斥 | `pg_advisory_xact_lock`（模块级咨询锁）；sqlite 单连接池天然串行 | 账本 `(module, version)` 主键冲突兜底（后到者 INSERT 报错） |
-| 多语句迁移文件 | 整文件同事务 | 逐条提交——**mysql 上尽量单语句一文件**，把"原子性"留给文件粒度的人工保证 |
+| 多语句迁移文件 | 整文件同事务 | 逐条提交。**mysql 上尽量单语句一文件**，把"原子性"留给文件粒度的人工保证 |
 
 ### 3.4 存量库接入：--baseline
 
@@ -129,7 +134,7 @@
 - **会做（安全前向，幂等）**：缺表 `CREATE TABLE`、缺**可空**列 `ALTER ADD`、
   缺索引 `CREATE INDEX`。
 - **拒绝（fail-fast 并打印迁移模板）**：NOT NULL 列新增（存量行无值）、疑似改名
-  （缺新列 + 多旧列同时出现）——此时按报错里的模板手写 migrations/。
+  （缺新列 + 多旧列同时出现）。此时按报错里的模板手写 migrations/。
 - **不检查**：类型漂移（方言类型反查长尾，人工核）。
 - reconcile 只进 apply 路径（auto / `oj migrate`），verify 启动不收敛。
 
@@ -147,19 +152,19 @@
 
 ```bash
 oj migrate  -c config.yaml -d dist --db analytics
-oj fixture  -c config.yaml -d src  --db test --module user
+oj fixture  -c config.yaml -d src  --db test user
 oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐库跑
 ```
 
-- 缺省 = `default`；**未声明的库名 fail-fast**（报错列出可用键），绝不静默回落——
+- 缺省 = `default`；**未声明的库名 fail-fast**（报错列出可用键），绝不静默回落。
   否则迁移会打在开发库上。
 - **不改语义**：`--db` 只是换目标连接；账本 `_oj_migrations`、`schema.yaml` 收敛、
-  `--baseline`、`--module` 都**各库独立**——所有模块同一个库的项目，逐 profile 各跑一遍
+  `--baseline`、模块位置参数都**各库独立**。所有模块同一个库的项目，逐 profile 各跑一遍
   即可（模块各自绑不同库的项目见下条）。
 - **与模块级绑定无关**：`manifest.yaml` 的 `db:` 只影响运行期路由（`src/bridge/guard.rs`
-  的 `bound_db`），迁移工具不读它。**注意**：`--db` 是**整轮**目标库——它把全部模块的
-  迁移灌进该库，所以「模块 A→analytics、模块 B→default」的项目必须用
-  `--db <profile> --module <M>` 逐组合执行（详见 §8 已知债）。
+  的 `bound_db`），迁移工具不读它。**注意**：`--db` 是**整轮**目标库，它把全部模块的
+  迁移灌进该库。所以「模块 A→analytics、模块 B→default」的项目必须用
+  `--db <profile> <module>` 逐组合执行（详见 §8 已知债）。
 - `oj server` / `oj test` 不走这条通路：前者恒用 `default`（模块绑定在运行期生效），
   后者有独立的 `oj test --db`（默认取 `db.test`，**语义是「字面 default 调用重定向」**
   而非整轮目标库，见 §4.6 / `testing.md`）。
@@ -171,12 +176,12 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
 | 新环境首次部署 | `oj build` → `oj migrate -c config.yaml -d dist` → `oj server`（release verify 门禁要求先迁移） |
 | 开发冷启动 | `oj server -c config.yaml --api-path src`（auto 门禁自动建表 + seed 重放） |
 | 加新表 / 可空列 / 索引 | 只改 `schema.yaml`，下次启动或 `oj migrate` 自动收敛 |
-| 加 NOT NULL 列 | 手写迁移（`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT <值>`）+ schema.yaml 声明——reconcile 对此 fail-fast 并打印模板 |
+| 加 NOT NULL 列 | 手写迁移（`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT <值>`）+ schema.yaml 声明。reconcile 对此 fail-fast 并打印模板 |
 | 改列名 / 删列 | 手写迁移（`RENAME COLUMN` / 先备份后 `DROP`）；删列同时从 schema.yaml 移除，残留会被 `oj schema diff` 报 D001 多列 |
 | 存量库接入（表已存在） | `oj migrate --baseline`（§3.4） |
 | 方言差异 | `0002__add_x.mysql.sql` 方言覆盖文件，与通用文件并存；无后缀 = 全方言执行 |
 | 演示 / 测试数据 | `fixtures/`：`oj fixture` / `oj test`（§2.2）；引导数据走 seed.sql（§2.1） |
-| 只迁一个模块 | `oj migrate --module user` / `oj fixture --module user` |
+| 只迁一个模块 | `oj migrate user` / `oj fixture user`（模块名是位置参数） |
 | 迁到非 default 库 | `oj migrate --db <profile>`（`fixture` / `schema diff` 同旗标；profile = config `db:` 段的键） |
 | 发布前巡检 | `oj schema diff`：D001/D002 有漂移 exit 1 |
 | CI 无证书环境跑迁移 | `oj migrate` / `oj fixture` / `oj schema diff` 走**瘦身装配**（config → 插件 → 开库，不走 App 装配、无证书门禁、不起路由） |
@@ -206,21 +211,21 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
 2. **`;` 朴素切分**：所有 SQL 文件语句内不得含分号字面量。
 3. **seed 幂等写法默认 sqlite 惯用法 `INSERT OR IGNORE`**，引擎按方言自动改写；
    `OR REPLACE` / `ON CONFLICT` / `ON DUPLICATE KEY` 不翻译，跨方言部署须自管（§2.1）。
-4. **mysql 迁移无原子性**：DDL 隐式提交，崩溃可留半套 DDL（§3.3）——多语句文件谨慎。
+4. **mysql 迁移无原子性**：DDL 隐式提交，崩溃可留半套 DDL（§3.3）。多语句文件谨慎。
 5. **fixture / seed 的幂等是作者责任**：引擎不记账、不去重；S006 只在构建期挡 seed 的
    INSERT，fixtures 无任何门禁。
 6. **reconcile 不做类型漂移检查**、不做删列、不做改名（§3.6）。
 7. **`oj migrate` / `oj fixture` / `oj schema diff` 只作用一个库**：默认取 config 的
    `db.default`（缺失直接报错）；`--db <name>` 可改指 `db:` 段的其它 profile，
    **未声明的库名 fail-fast**（不静默回落 default）。`--db` 不认模块级 `manifest.yaml`
-   的 `db:` 绑定（那只是运行时路由）——模块各自绑不同库的项目须 `--db X --module M`
+   的 `db:` 绑定（那只是运行时路由）。模块各自绑不同库的项目须 `--db X <module>`
    逐组合执行（§3.8 / §8）。
-8. **迁移 SQL 由引擎按文件执行与记账**：文件内容即契约——改一个字节 = M001。
+8. **迁移 SQL 由引擎按文件执行与记账**：文件内容即契约，改一个字节 = M001。
 
 ## 7. 回滚
 
 - **应用回滚**：换回上一版 `dist/`（`dist/manifests.yaml` 指回旧版本目录 + 重启）。
-  schema 已前向的部分不自动回退——这就是 M003 禁降版部署的原因：账本领先于产物会被
+  schema 已前向的部分不自动回退。这就是 M003 禁降版部署的原因：账本领先于产物会被
   verify 拒启，必须部署**含最新迁移**的产物。
 - **schema 回滚没有自动机制**：破坏性变更前备份 `*.sqlite` / mysqldump / pg_dump；
   回退以**新 seq 前向迁移**实现（如 `RENAME` 回去）。
@@ -235,9 +240,9 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
   把**全部模块**的迁移灌进 X，不读各模块 `manifest.yaml` 的 `db:` 绑定
   （`manifest::discover` 只回 `(name, path)`，绑定字段在迁移链上不可见）。因此
   「A→analytics、B→default」这类项目**不能**只靠逐个 profile 跑一遍：须用
-  `--db <profile> --module <M>` 逐 (库, 模块) 组合执行，否则 B 的表会被重复灌进
+  `--db <profile> <module>` 逐 (库, 模块) 组合执行，否则 B 的表会被重复灌进
   analytics（静默重复，D002 不报；`schema diff --db X` 也只对 X 内的实库比对该模块声明）。
-  修法（未做）：让 `slim` 携带 manifest 绑定，或把多库迁移编排成逐模块解析——需先有真实
+  修法（未做）：让 `slim` 携带 manifest 绑定，或把多库迁移编排成逐模块解析。需先有真实
   多库项目诉求再动（见 `modules/04-oj-cli.md` §8）。
 
 ## 9. 变更记录

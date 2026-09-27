@@ -2,13 +2,15 @@
 
 适用版本：API 面 v0.2（二进制版本号见 `oj/Cargo.toml`）
 
-本手册面向**用 oj 框架开发业务项目**的开发者与 AI agent：如何组织模块、编写
-`api.ts` / `ws.ts` handler、使用注入的全局对象、写测试、配服务、构建发布与日常运维。
-oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑以 TS handler 编写，
+本手册写给**用 oj 框架开发业务项目**的开发者与 AI agent，内容包括：怎么组织模块、
+怎么写 `api.ts` / `ws.ts` handler、怎么用注入的全局对象、怎么写测试、怎么配服务、
+怎么构建发布与日常运维。
+oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑用 TS handler 编写，
 运行时注入 `json` / `db` / `http` / `kv` / `blob` / `bus` / `es` 等全局对象，
-统一以 `{code,msg,data}` 信封写回 HTTP。仓库内部实现见 `docs/dev-guide.md`，
-部署排障细节见 `docs/ops-manual.md`。本手册随版本包 `devkit/` 一同发布；
-API 签名以同目录 `global.d.ts` 为类型权威。
+所有响应统一套 `{code,msg,data}` 信封写回 HTTP。这里说的「信封」就是那层固定的
+JSON 外壳：`code` 是状态码、`msg` 是消息、`data` 装业务数据。仓库内部实现见
+`docs/dev-guide.md`，部署排障细节见 `docs/ops-manual.md`。本手册随版本包 `devkit/`
+一同发布；API 签名以同目录 `global.d.ts` 为类型权威。
 
 目录：1 快速开始 / 2 项目结构与模块约定 / 3 模块数据层 / 4 编写 api.ts /
 5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
@@ -101,20 +103,23 @@ export default {
 # 仓库内：先 cargo xtask build 产出 bin/oj，再从仓库根执行同形命令
 ```
 
-`server` 按 `--api-path` 目录**自动判定模式**：目录含 `dist/manifests.yaml`（构建锁）→
-release（跑预构建 `.js`，不转译）；否则 dev（服务 `.ts` 源码，按需转译，改文件即生效）。
-启动行会把判定结果（`dev/ts` / `release/js` / `static-only`）与模块清单、路由统计
-（`method-row / pattern / api file` 计数，v0.1.27 起替代逐行路由表）写进日志；
+`server` 按 `--api-path` 目录**自动判定模式**：目录里有 `dist/manifests.yaml`（即「构建锁」，
+记录每个模块锁定用哪个版本）就跑 release——跑预构建的 `.js`，不转译；否则是 dev——服务
+`.ts` 源码，按需转译，改文件即生效。
+启动时日志会写判定结果（`dev/ts` / `release/js` / `static-only`）、模块清单和路由统计
+（`method-row / pattern / api file` 计数，v0.1.27 起替代逐行路由表）；
 路由错误与冲突仍逐条打出具体 method/pattern/文件。
-**终端默认静默（`server.console_log` 缺省 false）**——启动时会打一行日志路径的提示，
-随后一切输出只落盘；需要终端同时输出时加 `--console-log` 或配 `server.console_log: true`。
+**终端默认静默（`server.console_log` 缺省 false）**。启动时会打一行日志路径的提示，
+随后一切输出只落盘。想让终端同时输出，加 `--console-log` 或配 `server.console_log: true`。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
-**后台运行**：加 `--daemon` 脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向
-空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`。
+**后台运行**：加 `--daemon` 脱离终端（unix 用 setsid，windows 用 DETACHED_PROCESS），
+stdio 重定向到空设备，父进程打印子 pid 后退出。日志照常落 `server.logs_dir`，停机用
+`kill <pid>`。
 **准入门（三态，无静默默认）**：`--api-path` 与静态站点（`server.app_path` /
-`server.static_sites` / `--app-path`）至少显式指定其一，否则退出；`--api-path` 指定了
-就必须存在；静态站点目录存在性由装配期站点表解析统一 fail-fast（重复前缀/缺失目录
-报错含具体来源）。
+`server.static_sites` / `--app-path`）至少要显式指定一个，否则退出。`--api-path` 指定了
+就必须存在。静态站点的目录存在性在**装配期**统一检查。「装配期」指启动时把配置、插件、
+路由拼起来、请求还没进来的那个阶段；「fail-fast」指这个阶段一发现问题就立即报错退出，
+不带病启动。重复前缀或目录缺失的报错里都含具体来源。
 
 验证信封返回：
 
@@ -219,8 +224,8 @@ dist/
   收敛到声明（**安全前向**：缺表 CREATE、缺可空列 ALTER ADD、缺索引 CREATE INDEX）。
 - **演进靠迁移**：无法安全推导的变更（NOT NULL 列新增、疑似改名、类型变更、数据回填）
   一律 fail-fast 并打印迁移模板——手写 `migrations/{seq:04}__{desc}[.{sqlite|mysql|postgres}].sql`。
-- **账本记账**：`_oj_migrations（module 列区分模块）` 记录每模块已应用的迁移；带方言后缀的文件只在
-  对应方言库执行。
+- **账本记账**：平台表 `_oj_migrations` 是「账本」，记录每个模块已经应用过哪些迁移
+  （`module` 列区分模块）；带方言后缀的文件只在对应方言的库上执行。
 - **表归属**：schema.yaml 喂归属图（表 → 模块，同表双声明拒启 S002）与 `SchemaRegistry`
   （`db.table()` 列白名单）；跨模块表访问须 manifest `deps:` 声明。
 
@@ -244,7 +249,7 @@ tables:
 
 | 文件 | 时机 | 纪律 |
 |---|---|---|
-| `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations（module 列区分模块）`；序列空洞/乱序 S007 报错 |
+| `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations`（`module` 列区分模块）；序列空洞/乱序 S007 报错 |
 | `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006） |
 | `fixtures/*.sql` | 仅 `oj test` / `oj fixture` 灌入 | 演示/测试数据，不进 release 产物 |
 
@@ -259,9 +264,9 @@ tables:
 
 三条数据类命令（`migrate` / `fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
 `name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
-不会静默回落 `default`。注意它是**整轮目标库**——会把全部模块的迁移灌进该库，不读模块级
-`manifest.yaml` 的 `db:` 绑定（那只是运行期路由），所以模块绑不同库的项目要
-`--db <profile> --module <M>` 逐组合跑（`scenarios.md` 场景 6）。
+不会静默回落 `default`。注意它是**整轮目标库**：会把全部模块的迁移灌进该库，不读模块级
+`manifest.yaml` 的 `db:` 绑定（那只是运行期路由）。所以模块绑不同库的项目，要
+`--db <profile> --module <M>` 逐组合各跑一遍（`scenarios.md` 场景 6）。
 
 ### 门禁配置（第 10 章 server 表）
 
@@ -392,17 +397,17 @@ export default { get: detail };
 
 `.route` 规则：
 
-- **目录段 `_name_` 即路径参数（v0.1.27）**：目录名写成整段 `_name_`（首尾各一个下划线），
-  URL 中即 `{name}`。例：`user/_id_/api.ts` → `/user/{id}`，`http.param("id")` 取值；
-  模块段同样适用（`_aa_/bb/api.ts` → `/{aa}/bb`）。谓词：整段、内部名非空且不以 `_`
-  开头/结尾、不含 `{}`——`__x__`/`___`/`_a{b}_` 保持字面；`_shared`（无尾下划线）
-  不受影响。可与 `.route` 自由组合：`_id_/api.ts` 挂 `.route = "{sub}"` → `{id}/{sub}`。
-  注意 URL 字面写 `_id_` 会被 `{id}` 当实参吃掉（不再有静态 `_id_` 路由）。
+- **目录段 `_name_` 即路径参数（v0.1.27）**：把目录名写成整段 `_name_`（首尾各一个下划线），
+  URL 里这一段就变成 `{name}`。例：`user/_id_/api.ts` → `/user/{id}`，用 `http.param("id")`
+  取值；模块段同样适用（`_aa_/bb/api.ts` → `/{aa}/bb`）。判定规则：必须是整段、内部名非空
+  且不以 `_` 开头/结尾、不含 `{}`。不满足的（`__x__`、`___`、`_a{b}_`）保持字面；`_shared`
+  （无尾下划线）不受影响。可与 `.route` 自由组合：`_id_/api.ts` 挂 `.route = "{sub}"` →
+  `{id}/{sub}`。注意：URL 里字面写 `_id_` 会被 `{id}` 当实参吃掉（不再有静态 `_id_` 路由）。
 - 挂载后**目录镜像被替换**：`/user/item`（镜像路径）→ 404，只有参数路由可达。
 - **静态段优先于参数段**（与注册顺序无关）：`/x/{pk}` 与 `/x/me` 共存时，`GET /x/me` 必落
   `me` 的 handler 且 `http.param("pk")` 为空；只有 `/x/abc` 之类非静态名才进 `{pk}`。
-- 同位置**异名**参数（`/x/{id}` 与 `/x/{name}` 并存）是结构性冲突：后来者在启动时被丢弃
-  （dev 日志告警 + 该 URL 404，release **启动失败**）——同一位置只用一个参数名。
+- 同位置**异名**参数（`/x/{id}` 与 `/x/{name}` 并存）是结构性冲突。后来者在启动时被丢弃：
+  dev 模式日志告警且该 URL 404，release 模式**启动失败**。同一位置只用一个参数名。
 - `{*path}` catch-all 至少匹配一段：`/file`（零段）→ 404。
 - **参数段内不得混字面**：`{id}.json`、`v{major}.{minor}` 均属非法 pattern，
   启动时被丢弃并记日志 `InvalidParamSegment`。需要前缀/后缀字面的 URL 拆成静态多段，
@@ -412,9 +417,9 @@ export default { get: detail };
   `routes.js`**（第 11 章）。
 
 解析顺序：路由表（含 `.route` 参数路由与 `_name_` 目录参数）→ dev 目录镜像兜底
-（dev 模式，表外文件可经 `_x_` 目录下降并提取参数）→
-静态站点（`server.app_path` 或 v0.1.27 多站点 `server.static_sites`——最长前缀命中，
-`app_prefix`/`prefix` 前缀内，仅 GET/HEAD）→ 404。API 永远优先于静态文件。
+（dev 模式，表外文件可经 `_x_` 目录下降并提取参数）→ 静态站点 → 404。静态站点指
+`server.app_path` 或 v0.1.27 的多站点 `server.static_sites`：最长前缀命中，只在
+`app_prefix`/`prefix` 前缀内服务，且仅 GET/HEAD。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
 ### ws.ts（WebSocket 生命周期钩子）
@@ -440,8 +445,8 @@ export default {
 **执行模型（v0.1.10 帧池）**：每路由 W 个无状态 Worker（`ws.workers_per_route`，默认 2）
 共享执行该路由所有连接的帧。连接状态放 `sess.state`（Rust 会话表持久，按连接隔离，
 **必须可 JSON 序列化**——函数等不可序列化值静默丢失）；`sess.id` 为连接 id。
-模块作用域 = Worker 本地只读缓存（W 份副本）：可变跨帧状态禁止放模块作用域，
-路由级可变状态用 kv/bus。
+模块作用域相当于 Worker 本地的只读缓存（W 个 Worker 就有 W 份副本）：可变的跨帧状态
+禁止放模块作用域，路由级可变状态用 kv/bus。
 
 帧超时断开**该连接**（毒化只影响执行帧的 Worker，池自动补员，其它连接无感）。
 `ws.max_connections`（默认 1000，0=不限）超限 upgrade 返 503。
@@ -453,9 +458,9 @@ export default {
   不可依赖其跨帧写入生效）；跨连接共享走 kv / bus。
 - 帧超时 = 断开该连接（钩子收不到该事件）；`error(e)` 是唯一带参钩子（e 为异常对象）。
 
-注意：客户端**主动断连**（先发 Close 帧）路径上，`close()` 钩子仍会触发（服务端副作用如
-kv 写入照常生效），但其 `ws.send` 离帧受 RFC 6455 关闭握手限制无法送达客户端——需要离帧
-可见时用服务端 `ws.close()` 收尾。
+注意客户端**主动断连**（先发 Close 帧）的情况：`close()` 钩子仍会触发，服务端副作用
+（如 kv 写入）照常生效；但钩子里的 `ws.send` 离帧受 RFC 6455 关闭握手限制，无法送达
+客户端。需要离帧可见时，用服务端 `ws.close()` 收尾。
 
 运行案例（摘自 `sample/src/news/ws.ts`）：
 
@@ -498,7 +503,7 @@ export default {
 帧内发布特有的三条语义（系统学习见仓库 `docs/websocket.md`）：
 
 1. **自回声**：本连接若订阅了同一主题，会收到自己发布的广播帧（fan-out 不排除
-   自己）——按 `from` 字段客户端过滤，或发布到别的 topic。
+   自己）。客户端按 `from` 字段过滤，或者发布到别的 topic。
 2. **钩子可直接 `await`**：钩子会被驱动至 Promise 落定才捕获回帧——要拿 `publish`
    返回的「本地接收方数」，直接 `await bus.publish(...)`（kafka/rabbitmq broker 下
    该数恒 0）。
@@ -526,22 +531,22 @@ import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必�
 规则与边界：
 
 - 后缀补全与相对导入同序；别名路径禁 `..` / 空段。
-- **只能在模块内的文件里用**：模块根由**文件自身位置**派生（从所在目录向上最近的
-  `manifest.yaml` 祖先），`src/tests` 用例目录与任务池在模块外 → 没有锚点，继续用相对路径。
+- **只能在模块内的文件里用**：模块根由**文件自身位置**派生——从所在目录向上找最近的
+  `manifest.yaml` 祖先。`src/tests` 用例目录与任务池在模块外 → 没有锚点，继续用相对路径。
   运行期与构建期**共用同一份探针**（`resolve_relative` / `resolve_alias`），所以 dev 与
   release 对同一 specifier 必然命中同一文件（含目录索引）。
 - **跨模块别名需声明依赖**：`manifest.yaml` 的 `deps` 缺目标模块 → `oj build` 报 S008
   （与表归属 S003 同一套归属图）。既有**相对**跨模块引用不追溯（升级不破坏）。
-- release：build 期实化为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本；
-  产物内不含 `#`（落盘后有两道断言：单文件无残留别名 + 本次产出目录内本地 specifier 都必须落到
-  已落盘文件）。任务池是非版本化资产 → 别名一律拒绝，且池内 import 不得越池根。
+- release：build 期实化为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本，
+  产物内不含 `#`。落盘后有两道断言：单文件无残留别名；本次产出目录内的本地 specifier
+  都必须落到已落盘文件。任务池是非版本化资产 → 别名一律拒绝，且池内 import 不得越池根。
 - 约束：`manifest.yaml` 只能出现在模块根（嵌套会改写别名锚点 → S008）；release 模式不解析
   别名（`ts=false` 直接报错）。
 - **本地导入目标必须是 `.ts`**：`./x.js` / `./d.json` 在产物里没有对应文件（只转译 `.ts`）→
   `oj build` fail-fast（此前静默悬空，release 运行期才炸）。
-- 编辑器/测试工具对齐：`tsconfig.json` 的 `paths` 镜像
-  （`"#/*": ["./src/*"]` + `"#*": [各模块 /*]`，值须带 `./` 前缀——无 `baseUrl` 时非相对值会被
-  vite/esbuild 警告；见 `sample/tsconfig.json`）；L2 vitest 走
+- 编辑器/测试工具对齐：`tsconfig.json` 的 `paths` 按同规则镜像
+  （`"#/*": ["./src/*"]` + `"#*": [各模块 /*]`）。值须带 `./` 前缀——无 `baseUrl` 时非相对值
+  会被 vite/esbuild 警告（见 `sample/tsconfig.json`）。L2 vitest 走
   `sample/unit/vitest.config.ts` 的 `resolveId` 插件（同规则镜像）。
 - `#` 与 Node `package.json#imports` 共用命名空间：项目若声明 `#` 开头的 imports 键，
   `oj build` 直接失败（避免 Node/vite 与 oj 两套解析器分叉）。
@@ -602,7 +607,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
-| `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 开箱即用） |
+| `fetch(url, options?)` | WHATWG fetch（deno 官方实现，v0.1.8；真 `Response`/`Headers`，https 无需额外配置） |
 | `ws.send / close` | WebSocket 帧控制（HTTP 路径下 no-op） |
 | `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
@@ -647,7 +652,7 @@ json.redirect.seeOther("/v1/api/order/list/"); // POST 提交后跳转：跟随�
 | `http.params` | `Record<string, string>` | 路径参数对象（已 percent-decode；目录镜像路由下恒空） |
 | `http.param` | `param(name: string, def?: unknown): any` | **路径参数优先，query 兜底**，均缺失返回 `def` 原值 |
 | `http.tenantId` | `string \| null` | 租户 id（`tenant.enable` 时从租户头提取；未启用为 `null`） |
-| `http.user` | `AuthUser \| null` | 已验签用户 `{id, roles, claims}`（auth 启用且过 Bearer 守卫；否则 `null`） |
+| `http.user` | `AuthUser \| null` | 已验签用户 `{id, roles, claims}`；auth 启用且请求通过 Bearer 守卫（进 handler 前统一验 token 的那道检查）才有值，否则 `null` |
 | `http.files` | `UploadedFileMeta[]` | multipart 上传元信息 `[{field, filename, content_type, size}]`；非 multipart 为空数组 |
 | `http.file` | `file(i: number): Promise<Uint8Array>` | 第 i 个上传文件的字节（越界报错 `no such file`） |
 
@@ -663,7 +668,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.query` | `query(sql: string, params?: unknown[]): Promise<Row[]>` | 参数化查询 → 行数组 |
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
-| `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）：单语句原子取号，`max+1` 竞态的终态；首次使用自动建平台表 `_oj_sequences`（**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持）；`db.tx` 内调用搭车同一连接 |
+| `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持。`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
 | `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
@@ -685,7 +690,7 @@ const rows = await db.table("account")
 - `WhereCond`：`{ field: string; op?: string; value?: unknown }`。
   操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/ like / isnull`；未知操作符直接报错。
 - `OrderByItem`：`{ field: string; dir?: "asc" | "desc" | null }`。
-- **红线**：标识符（表/列/别名）只来自 SchemaRegistry 白名单（启动内省所得），值一律经绑定参数——
+- **红线**：标识符（表/列/别名）只来自 SchemaRegistry 白名单（启动内省所得），值一律经绑定参数。
   SQL 注入面为零；未知表/列报错，排序列另有可排序白名单。`limit` 缺省 100、硬上限 1000。
 - 构造器自动按库方言出 SQL（sqlite/mysql/postgres），业务无需手写方言差异。
 
@@ -731,7 +736,8 @@ await db.table("account")
 ```
 
 - `on` 只支持列对列等值（`{left, right}` 数组，非空）；`kind` 省略为 `inner`，可选 `left`。
-- 列可写 `"表.列"`（表 ∈ 基表 ∪ join 表）或裸列名（**只解析基表**——歧义天然拒绝，联表查询建议全限定）。
+- 列可写 `"表.列"`（表 ∈ 基表 ∪ join 表）或裸列名。裸列名**只解析基表**，有歧义直接拒绝；
+  联表查询建议全限定。
 - join 表同样过租户/所有权守卫；**自 join 不支持**（无表别名）。
 
 **聚合 / groupBy / having / distinct**：
@@ -750,8 +756,8 @@ await db.table("order")
 
 - 聚合列 `{ fn: "count"|"sum"|"avg"|"min"|"max", field?: string, as?: string }`；
   别名形状 `^[A-Za-z_][A-Za-z0-9_]*$`（违例报 `illegal alias`）。
-- `having` 白名单列优先，未命中按 select 聚合别名展开（`unknown column '...' in having`）——
-  PG 不允许 HAVING 引用输出别名，展开消灭方言分叉；orderBy 不支持聚合别名（仍走列白名单）。
+- `having` 白名单列优先，未命中按 select 聚合别名展开（`unknown column '...' in having`）。
+  PG 不允许 HAVING 引用输出别名，展开能消灭方言分叉；orderBy 不支持聚合别名（仍走列白名单）。
 - `.distinct()` 去重（仅 select）。
 
 **DML：insert / update / delete**（`.run()` 终执行，返回受影响行数；`.all()` 仅 select）：
@@ -764,7 +770,7 @@ await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).
 ```
 
 - **红线**：`update`/`delete` 必须带 where 且叶子数 ≥ 1。JS 链层早抛（`update requires where`），
-  op 侧同样强制——`fromJSON` 可完全绕过 JS 链层，故动词×字段矩阵为 **op 侧权威校验**。
+  op 侧同样强制——`fromJSON` 可完全绕过 JS 链层，所以动词×字段矩阵以 **op 侧校验为权威**。
 - 动词×字段矩阵：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/having`，
   `values` 非空且多行键集一致；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`，
   `update` 的 `sets` 非空；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
@@ -822,13 +828,13 @@ await db.tx(async (tx) => {
 
 - 回调正常返回 → **提交**；throw / reject → **回滚**并把原错误抛给 handler。
 - `tx` 与 `db` 的 `query / exec / table / fromJSON` 及条件工厂（`leaf/and/or/not`）
-  **同签名**——事务内自动走同一连接，无需改写其余代码（回调对象不含 `tx`——嵌套事务被拒）。
+  **同签名**——事务内自动走同一连接，无需改写其余代码。注意回调对象不含 `tx`，嵌套事务被拒。
 - 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错 `transaction already active`；
   事务未完结时访问其它库报错（先结当前事务）。
 - handler 忘记 `await` 或中途崩溃：请求结束时未完结事务**自动回滚**（服务端打 warn 日志）。
 - **多租户防护在事务内同样生效**：租户注入（select 收窄 / insert 强制写当前租户 /
   update/delete 收窄 / `sets.tenant_id` 拒绝）发生在**路由之前**，与「走池还是走会话」
-  正交——`tx.table(...)` 与 `db.table(...)` 得到完全相同的改写。裸 SQL（`tx.query`）
+  正交。`tx.table(...)` 与 `db.table(...)` 得到完全相同的改写。裸 SQL（`tx.query`）
   只有 best-effort 文本检查，事务内也应优先构造器。
 
 **子查询 / exists**（where 与 having 通用）：
@@ -1053,9 +1059,9 @@ index / id 限 `[a-zA-Z0-9_-]+`（防路径注入）；非 2xx 报错带 ES 返�
 
 配顶层 `smtp:` 段即启用全局 `Mail` / `mail`（`mail === new Mail("default")`）；未配置时调用报
 `mail not configured (config smtp: section missing, or oj-mail plugin not loaded)`。
-**投递**在 `oj-mail` 插件内（lettre 连接池 + 有界队列 + worker 池）；**宿主**负责入参校验
-（CRLF 剥离/地址强校验/白名单）、附件字节解析、结果存储与 bus 反馈。凭据只在 config →
-插件，**不进 JS**（`Mail.profiles()` 只列 profile 名）。
+**投递**在 `oj-mail` 插件内（lettre 连接池 + 有界队列 + worker 池）；**宿主**（即 oj 进程
+本身）负责入参校验（CRLF 剥离/地址强校验/白名单）、附件字节解析、结果存储与 bus 反馈。
+凭据只在 config → 插件，**不进 JS**（`Mail.profiles()` 只列 profile 名）。
 
 | API | 签名 | 说明 |
 |---|---|---|
@@ -1108,8 +1114,8 @@ attachments: [
 **`code !== 0` 一律不得自动重试**：`2`/`3` 未启用，永久失败（SMTP 5xx / 鉴权）与瞬时失败
 （连接/超时）都归 `1`，从 `code` 分不出可重试性；自动重试会把永久失败反复重投。
 
-**白名单是唯一控制点，且 fail-closed**：`allowed_from`/`allowed_recipients` 为**全等**匹配
-（大小写不敏感），**空表 = 拒绝**——不写白名单就发不出任何信。
+**白名单是唯一控制点，且 fail-closed**（宁可全拒也不误放行）：`allowed_from`/`allowed_recipients`
+为**全等**匹配（大小写不敏感），**空表 = 拒绝**——不写白名单就发不出任何信。
 
 - 条目两种合法写法：**完整地址**（`noreply@x.com`，只命中该地址自身，**不**命中
   `evil-noreply@x.com`）与 **`@domain`**（`@x.com`，只命中域全等，**不**命中子域
@@ -1216,7 +1222,7 @@ body / signal / redirect` 均按标准语义：body 支持 `string | Uint8Array`
 字符串），字符串 body 默认 `Content-Type: text/plain;charset=UTF-8`，取消走
 `AbortController`（全局已挂载，如 `AbortSignal.timeout(5000)`）。
 
-https/wss 开箱即用：webpki-roots 根集编译进二进制（`bridge::ws_client_extensions`
+https/wss 无需额外配置：webpki-roots 根集编译进二进制（`bridge::ws_client_extensions`
 注入 `FetchOptions`，https fetch 与 wss 握手共用）。网络错误折叠为 `TypeError`
 （`Invalid URL…` / `error sending request…`），非 2xx 照常返回 `Response`
 （`ok === false`），都不抛 HTTP 状态错。
@@ -1264,12 +1270,12 @@ ws.onmessage = (e) => log.info("frame " + e.data);
 三条硬约束（全部来自真实踩坑）：
 
 1. **鉴权在应用层做，不在管线**：WS 路由（`<dir>/ws.ts`）是 merge 进 Router 的
-   **真实路由，不经过** fallback 的 Bearer/租户前置管线——连接天然匿名，
+   **真实路由，不经过** fallback 的 Bearer/租户前置管线。连接天然匿名，
    `anonymous_paths` 对它无效也不需要配（v0.1.8 起 sample 已删除该冗余条目）。
    受保护数据的订阅要自行做首帧 token 握手，或把发布端点（`POST /news`）留在
    鉴权面内。
 2. **URL 主机名要匹配服务端绑定语义**：服务端缺省监听 `[::1]`（IPv6 回环），写
-   `127.0.0.1` 会 connection refused——用 `localhost`。
+   `127.0.0.1` 会 connection refused，改用 `localhost`。
 3. **等帧必须与停机信号竞速**：挂在 `await` 上没人 wake，会拖到看门狗强杀记 `killed`；
    用 `Promise.race([wake, tasks.sleep(250)])`，轮询间隔 ≪ `stop_grace_secs`
    （与 MQ poll 的 `timeoutMs` 纪律同源）。
@@ -1409,7 +1415,8 @@ globalThis.APP_ENV = "prod";
 
 **命名客户端**：`kafkas:`/`rabbits:` 段（config §10）每个键装配为一个实例，
 `Kafka("default")` / `RabbitMQ("default")` 取用（同名实例进程内同一对象；未配置的
-名返回 `undefined`）。底层经 oj-bus-kafka / oj-bus-rabbitmq 插件的 `mq` 轴。
+名返回 `undefined`）。底层经 oj-bus-kafka / oj-bus-rabbitmq 插件的 `mq` 轴——「轴」是
+插件提供能力的一类接口（db / kv / mq / blob 各算一轴），一个插件可实现多个轴。
 
 | 客户端 | 生产面 | 消费面（**仅任务上下文**） |
 |---|---|---|
@@ -1421,11 +1428,11 @@ globalThis.APP_ENV = "prod";
 载荷为 UTF-8 时 `value` 是解析后的 JSON（解析失败为字符串）；**非 UTF-8 载荷** → `value` 为
 `null`、`value_b64` 为 base64 字符串（v0.1.16 起，自行 `atob`/解码还原字节）。
 
-**消费门禁（评审 M2）**：`poll/commit/ack/nack` 只在长任务上下文可用——HTTP/WS
-handler 里调用直接报错（消费会话归属任务实例，实例级单 poller，第二个并发 poll
-报 `instance busy`）。任务 = `src/tasks/`（`tasks.dir` 可改）下符合命名约定的文件：
-`task_{name}.ts/.js` 或 `{name}_task.ts/.js`（递归扫描；其余文件是共享库，不执行；
-同名双写、超 `max` 直接拒启）。每任务一条专用线程 + 独立 V8 runtime。
+**消费门禁（评审 M2）**：`poll/commit/ack/nack` 只在长任务上下文可用。HTTP/WS
+handler 里调用直接报错——消费会话归属任务实例，实例级单 poller，第二个并发 poll
+报 `instance busy`。任务 = `src/tasks/`（`tasks.dir` 可改）下符合命名约定的文件：
+`task_{name}.ts/.js` 或 `{name}_task.ts/.js`。递归扫描；其余文件视为共享库，不执行；
+同名双写、超 `max` 直接拒启。每任务一条专用线程 + 独立 V8 runtime。
 
 **任务骨架**（顺序语义：poll → 处理 → commit；commit 按 offset+1，重复处理至
 少一次）：
@@ -1483,8 +1490,8 @@ while (!tasks.stopping()) {
 > 设计依据见仓库 `docs/prds/event-cqrs.md` v2。
 
 任务文件按**导出探测**自动分流：导出 `loop_body` 命名导出 → **池化任务**（本节）；
-否则 → 上一节 TLA 监督器（顶层 await 循环，MQ 消费写法不变）。两种模式可共存于
-同一 `src/tasks/` 目录。
+否则 → 上一节的 TLA 监督器。TLA 即 top-level await（顶层 await 循环写法），MQ 消费写法不变。
+两种模式可共存于同一 `src/tasks/` 目录。
 
 **池化任务三钩子**（均为命名导出，模块在 worker runtime 上预载一次）：
 
@@ -1505,8 +1512,8 @@ export async function teardown() {
 - **不需要 `tasks.stopping()` 轮询 / `tasks.sleep()`**：每轮 `loop_body` 返回后
   worker 按管理面 desired 位决定是否再调一轮；停机时先跑 `teardown` 再退出。
 - **轮间节奏 `tasks.pool.interval_ms`（默认 100ms；`0` = 不限制）**：每轮返回后框架
-  sleep 这么久再调下一轮——防 trivial loop_body 空转独占 Worker（starving 同 Worker
-  上的其他任务）；要更快节奏调小它，长轮询任务别用池化。`0` 表示忙扫结束立即轮转
+  sleep 这么久再调下一轮。目的是防 trivial loop_body 空转独占 Worker——那会让同 Worker
+  上的其他任务挨饿。要更快节奏调小它，长轮询任务别用池化。`0` 表示忙扫结束立即轮转
   （压测语义，生产会被空转打满多核）。
 - 单轮异常/超时 → teardown → 状态 `failed`；管理面 `start` 后按 1s→2s→4s…
   （cap 60s）退避重连（对齐存量 TLA 退避语义）。
@@ -1614,7 +1621,8 @@ cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执�
 
 ### auth：块存在即启用（oj-auth 守卫 + JS 端点）
 
-config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插件在前置管线完成）与
+config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插件在前置管线完成，即请求
+进 handler 之前统一验 `Authorization: Bearer` token 的那道检查）与
 **`jwt` / `bcrypt` 全局注入**（供 JS 侧实现登录端点，API 细节见第 6 章 jwt / bcrypt / crypto）。
 `jwt_secret` 配了却为空串 → 启动 fail-fast（不静默跳过）。
 
@@ -1682,23 +1690,23 @@ tenant:
 ```
 
 启用后所有 `{base}` 请求必须带该 header（缺失/空 → 400），值注入 `http.tenantId`
-供 handler 做数据隔离。`tenant.anonymous_paths`（与 `auth.anonymous_paths` 同语义）为
-**去 base 前缀**后的路径，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
-中段 `*`（恰好一段）；豁免命中且确实没带租户头 → 该请求标记为**匿名**（
-`RequestInfo.anonymous`），豁免缺失 400——给 OIDC 302 跳转腿用（浏览器带不了自定义头）；
-已带的头仍照常注入。
+供 handler 做数据隔离。`tenant.anonymous_paths`（与 `auth.anonymous_paths` 同语义）是
+**去 base 前缀**后的路径列表，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
+中段 `*`（恰好一段）。豁免命中且确实没带租户头的请求被标记为**匿名**
+（`RequestInfo.anonymous`），不再因缺头而 400——这是给 OIDC 302 跳转腿用的（浏览器带不了
+自定义头）。已带的头仍照常注入。
 
 **迁移 WARN 只针对 `auth.anonymous_paths`**（v0.1.23 订正）：v0.1.20 的「尾 `/*` 从任意深度
 收紧为严格一层」**只发生在 oj-auth 侧**；`tenant.anonymous_paths` 自引入起就是严格一层
-（旧 server 实现即 `!rest[1..].contains('/')`，`git show v0.1.19:server/src/lib.rs`），对租户
-条目提「收回了面」是伪前提，故该列表不再参与启动期告警。
+（旧 server 实现即 `!rest[1..].contains('/')`，`git show v0.1.19:server/src/lib.rs`）。
+对租户条目提「收回了面」是伪前提，故该列表不再参与启动期告警。
 
 对 `auth.anonymous_paths`，**两个条件同时成立才打**聚合 WARN：
 
 1. 条目是**旧式前缀形态**——只有尾段那一个 `*`，其余段全是字面量（`/idp/*`、`/users/me/accounts/*`）。
    旧 oj-auth 实现是「砍掉尾 `*` 再 `starts_with`」（任意深度），只有这种形态当时能命中
    真实请求；**含中段 `*` 的结构条目**（`/public/anchor/*/issues/*`）那时根本匹配不上，
-   只能诞生于 v0.1.20 的四形态语义，是刻意写的形状——对它们提「改 `**`」是错的，故静默。
+   只能诞生于 v0.1.20 的四形态语义，是刻意写的形状。对它们提「改 `**`」是错的，故静默。
 2. 该条目**确实丢了面**——存在一条已注册路由比严格一层更深：
    - `/idp/*` 而项目里注册了 `/idp/.well-known/openid-configuration`（深两层）→ **告警**
      （收紧确实收回了既有免鉴权面，应改 `/idp/**` 或把深路径单列）；
@@ -1719,17 +1727,17 @@ auth:
 标在末段不是 `*` 的条目上无意义，装配期直接报错（fail-fast，防配置撒谎）。`tenant.` 段同样
 接受对象形态，但那里不告警，标记等于备注。
 
-**`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL——
+**`sql_guard`（v0.1.15 起）**：开 `enable` 只是识别租户头；`sql_guard` 才自动防护 SQL。
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制
-当前租户、update/delete 自动收窄、sets 显式改 tenant_id 拒绝；裸 SQL 查「完全遗漏 tenant_id」
-warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
+当前租户、update/delete 自动收窄、sets 显式改 tenant_id 拒绝。裸 SQL 查「完全遗漏
+tenant_id」时 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
 （共享表 `tenant: false` + `shared_allow` 双声明豁免），server 启动 / `oj build` /
 `oj migrate` 三处校验。跨租户操作（对账、运营报表）走 `db.asSystem()`（请求级、打审计日志）。
 **`tenant_id` 列类型（v0.1.24 起）**：只能是 `text` / `integer` / `bigint`，其余类型在
 **server 启动 / `oj build` / `oj migrate` 三处 fail-fast**（`double`/`boolean`/`blob` 没有
 「等值租户 id」语义）。守卫按**声明类型**绑值：`text`（及旧装配路径的「未声明类型」）→ 字符串；
-`integer` / `bigint` → **数值**（`≤2^53-1` 用 number，更宽用 i64 标记，`> i64::MAX` 用
-`$oj$u64`——只有 MySQL `BIGINT UNSIGNED` 能承载，PG/SQLite 会在绑定前报错）；insert / update
+`integer` / `bigint` → **数值**：`≤2^53-1` 用 number，更宽用 i64 标记，`> i64::MAX` 用
+`$oj$u64`（只有 MySQL `BIGINT UNSIGNED` 能承载，PG/SQLite 会在绑定前报错）。insert / update
 的租户等值判定接受**四种形态**（字符串 / 数字 / `toBigInt` / `toUBigInt`）。**注意**：数值列上
 租户头必须是**十进制字面量**，否则直接报错——**即使 `sql_guard: warn` 也硬失败**（warn 只放行
 「无法判定」的情形，不放行「判定为不匹配」）。
@@ -1845,11 +1853,12 @@ cd sample && npm run test:unit    # 统一入口（等价 cd unit && npm ci && n
 cd sample && npm run typecheck    # 类型检查（src + tests + unit 共用一个 tsconfig；CI 门禁）
 ```
 
-结构：`mocks/oj-globals.ts` 提供 `installGlobals(opts?)`（把 `db/json/http/bus/log`
-换成可控桩，返回响应捕获 `{code,msg,data}`；`lastPublished()` 取 `bus.publish` 记录，
-`lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/构造器）与绑定参数——可断言 handler 走了哪个分支）；
-`invoke.ts` 提供 `invoke(handler, method, opts?)`（装桩 → 调 handler → flush 微任务 →
-返回 `{ ...capture, published }`）；`*.spec.ts` 直接 import 真实 `../src/.../api` 的 handler。
+结构：`mocks/oj-globals.ts` 提供 `installGlobals(opts?)`——把 `db/json/http/bus/log`
+换成可控桩，返回响应捕获 `{code,msg,data}`。`lastPublished()` 取 `bus.publish` 记录，
+`lastSqlCalls()` 取 `db` 发出的 SQL（query/exec/构造器）与绑定参数，可据此断言 handler
+走了哪个分支。`invoke.ts` 提供 `invoke(handler, method, opts?)`（装桩 → 调 handler →
+flush 微任务 → 返回 `{ ...capture, published }`）；`*.spec.ts` 直接 import 真实
+`../src/.../api` 的 handler。
 
 ```ts
 import { describe, it, expect } from "vitest";
@@ -1889,8 +1898,8 @@ bus 事件**内容**，以及 TDD 快速回归；
 
 CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，发版门禁另见
 `release.yml` 的 `lint`）：`npm ci`（`unit/`）→ `npm run typecheck` →
-`cargo run --release -p xtask -- build`（workspace 构建，产出 `bin/oj` + 全部第一方插件，
-勿用 `cargo build -p oj`——会按不同 feature 归一化重编 rusty_v8）→
+`cargo run --release -p xtask -- build`（workspace 构建，产出 `bin/oj` + 全部第一方插件。
+勿用 `cargo build -p oj`，那会按不同 feature 归一化重编 rusty_v8）→
 `./bin/oj test -c sample/config.yaml -d sample/src --format junit` → `npx vitest run`。
 
 依赖管理：L2 的 vitest 与 typescript（类型检查用）声明在 `unit/package.json` 的
@@ -1914,17 +1923,17 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
 | `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
-| `app_path` | 无 | 静态站点根目录（legacy 主站点，前缀取 `app_prefix`）；**省略 = 不开静态服务**（config 配置相对 config 目录；CLI `--app-path` 裸值相对 CWD）。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）；穿越段（含 `%2F`）404；无 Range/ETag（经前置反代补）。多站点见 `static_sites`（v0.1.27）；目录存在性归装配期统一 fail-fast |
+| `app_path` | 无 | 静态站点根目录（legacy 主站点，前缀取 `app_prefix`）。**省略 = 不开静态服务**。config 配置相对 config 目录；CLI `--app-path` 裸值相对 CWD。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）。穿越段（含 `%2F`）404。无 Range/ETag（经前置反代补）。多站点见 `static_sites`（v0.1.27）；目录存在性归装配期统一 fail-fast |
 | `app_spa_fallback` | `false` | （v0.1.20）SPA 深链回落：静态未命中 + 无扩展名 + `Accept` 含 `text/html`/`*/*`/缺失 + **不在 `api_prefix` 下** → 送 `<app_path>/index.html`。默认关是刻意的：静默把 404 变 200 会掩盖错配（拼错的资源路径） |
 | `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对 `app_path`）：送 HTML 前读 `<app_path>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
 | `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
 | `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
 | `app_prefix` | `"/"` | 静态站点前缀；默认 `/` = 全路径兜底（与旧版一致）。设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；API 路由永远优先。必须以 `/` 开头，否则启动报错 |
-| `static_sites` | `[]` | （v0.1.27）**多静态站点** `prefix→dir` 列表，如 `[{prefix: "/docs", path: "dist/docs"}]`；`path` 相对 config 目录。请求期**最长前缀命中**（`/docs/api/x` 胜过 `/`），命中站内未命中 **不跨站**回落（SPA 回落/meta JSON 均按命中站各自的根）。归一后前缀重复或目录缺失 → 启动报错。与 legacy `app_path`+`app_prefix` 对（视作一条站点）并存；CLI `--app-path prefix=dir` 可重复，同前缀覆盖 config 条目 |
+| `static_sites` | `[]` | （v0.1.27）**多静态站点** `prefix→dir` 列表，如 `[{prefix: "/docs", path: "dist/docs"}]`；`path` 相对 config 目录。请求期**最长前缀命中**（`/docs/api/x` 胜过 `/`）。命中站内未命中**不跨站**回落——SPA 回落/meta JSON 均按命中站各自的根。归一后前缀重复或目录缺失 → 启动报错。与 legacy `app_path`+`app_prefix` 对（视作一条站点）并存；CLI `--app-path prefix=dir` 可重复，同前缀覆盖 config 条目 |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
-| `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） | |
-| `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）；`true` = 额外回写终端。CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警**。启动失败的最终退出原因无论开关都直写终端（`echo_terminal`，原始 stderr fd 副本） | |
+| `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） |
+| `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）。`true` = 额外回写终端；CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警**。启动失败的最终退出原因无论开关都直写终端（`echo_terminal`，原始 stderr fd 副本） |
 | `public_key_path` | **必配** | 证书校验公钥（SPKI PEM；仅验签，私钥不落服务器） |
 | `certificate_path` | **必配** | JWS 证书（`Base64URL(Header).Payload.Signature`，RS256） |
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
@@ -1968,9 +1977,9 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 - 保留键 **`cache_control`**：字符串，作为本响应的 `Cache-Control`（优先级最高），不进 `<head>`；
   类型写错只丢这个键（WARN），其余 meta 照常注入；
 - **恒以匿名身份运行**：不经前置守卫（页面请求带不了 `Authorization`，走守卫等于恒 401），
-  **租户头/请求头/请求体一律不传递**（`http.tenantId` 恒 `null`）。这不是省事，是安全边界——
-  页面请求的头由客户端决定；若透传 `X-Tenant`，① `sql_guard: deny` 下构造器会把**攻击者指定的
-  租户**当过滤条件，② `db.asTenant` 的门禁要求 `tenant_id` 为空，透传会让它必抛。
+  **租户头/请求头/请求体一律不传递**（`http.tenantId` 恒 `null`）。这不是省事，是安全边界：
+  页面请求的头由客户端决定。若透传 `X-Tenant`，① `sql_guard: deny` 下构造器会把**攻击者指定的
+  租户**当过滤条件；② `db.asTenant` 的门禁要求 `tenant_id` 为空，透传会让它必抛。
   要按租户取数只有一条正路：**handler 从 URL 派生 id → `await db.asTenant(id)`**
   （需 `tenant.allow_as_tenant: true`）。
   该 handler **不需要**写进 `anonymous_paths`；它被外部直接访问时仍受守卫约束（要连外部访问
@@ -2126,13 +2135,12 @@ V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker �
 
 ### tenant / auth
 
-字段与语义见第 8 章（tenant 默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
+字段与语义见第 8 章。tenant：默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
 跳转腿豁免；v0.1.15 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
-白名单——语义与建表要求见第 8 章与 `docs/tenant-guide.md`；auth 的 `jwt_secret`（空串
-启动 fail-fast，生产必改）、`signing_method`
-（HS256|HS384|HS512，默认 HS256）、`access_token_duration`（默认 60s）、
-`refresh_token_duration`（默认 720h）、`anonymous_paths`——无 `user_table` 配置，
-用户表是业务约定）。
+白名单，语义与建表要求见第 8 章与 `docs/tenant-guide.md`。auth：`jwt_secret`（空串
+启动 fail-fast，生产必改）、`signing_method`（HS256|HS384|HS512，默认 HS256）、
+`access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
+`anonymous_paths`。无 `user_table` 配置——用户表是业务约定。
 
 ### oidc —— 内置 OP/RP 原语（段存在即启用）
 
@@ -2247,14 +2255,18 @@ vars:
 ./bin/oj build user --no-minify        # 排障：多行可读产物（含内联 sourcemap）
 ```
 
-`oj build` 内建结构检查 S001–S007（manifest 合法性/表归属/deps/tables 一致/seed 纪律/迁移序列），违规 fail build；`oj build --check` 只查不落盘，作 CI 门禁。
+`oj build` 内建结构检查 S001–S008：S001 模块目录/manifest 合法性、S002 表归属唯一、
+S003 跨模块 SQL 须声明 deps、S004 deps 版本范围可满足、S005 `tables` 与 schema.yaml
+一致、S006 seed.sql 纪律（禁 DDL/禁非幂等 insert/只碰本模块及 deps 表）、S007 迁移
+序列合法、S008 导入别名（`#` 目标存在、跨模块须在 deps 声明、manifest.yaml 只在模块根）。
+违规 fail build；`oj build --check` 只查不落盘，作 CI 门禁。
 
 每个模块构建为版本目录 `dist/<module>-<version>/`（版本读自模块 `manifest.yaml`；
 同版本重建先清空旧目录）。构建零磁盘副作用（db 用内存库，不执行 seed）。
 
 | 产物 | 说明 |
 |---|---|
-| `<module>-<version>/api.js` 等 | 全部 `.ts` 原路径换 `.js`（api.ts → 同目录 api.js）；默认转译 + minify 成单行（剥注释） |
+| `<module>-<version>/api.js` 等 | 全部 `.ts` 原路径换 `.js`（api.ts → 同目录 api.js）；默认转译 + **全量 minify**（v0.1.28：swc minifier，单行剥注释 + 死码消除/表达式压缩 + **函数内局部变量名混淆**；顶层/导出名与 `json`/`db`/`http` 等注入全局不受影响）。minify 同时剥掉转译尾部自带的内联 sourcemap——那行 base64 里藏着整份 TS 源码和构建机绝对路径，发布物不应带它；`--no-minify` 产物则保留（排障时可映射回源码，但别外发） |
 | `<module>-<version>/routes.js` | 本模块路由表（pattern 无首斜杠、不含 base、含模块名段）；**`.route` 已从 api.js 剥离**——release 下路由事实唯一来源 |
 | `<module>-<version>/manifest.yaml` | 原样复制 |
 | `dist/manifests.yaml` | 模块 → 锁定版本（原子写，保留其他模块条目）；多版本目录可共存，锁决定 release 加载哪个 |
@@ -2315,7 +2327,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
   时 fail-fast 并提示。
 - 发布由仓库 `scripts/npm-publish.sh` 单一来源：装配 + 幂等（`npm view` 已发布即
   skip）+ 门禁（tag 与 Cargo.toml 版本一致性、同 `(os,cpu)` 撞车、包根布局断言）+
-  发布后置信断言（os/cpu/tarball 文件清单）；`DRY_RUN=1` 只装配断言不发布，本地自检用。
+  发布后置信断言（os/cpu/tarball 文件清单）。`DRY_RUN=1` 只装配断言不发布，本地自检用。
 - npm 包不可撤回：CI 上 release 草稿期不发 npm（人工核对 release 后幂等补发），
   版本一经发布不可复用——改代码必须递增版本。
 
@@ -2371,9 +2383,9 @@ cargo run -p oj-cert -- renew -k config/private.pem --days 365
 
 PG 插件会给**实际执行的 SQL 前置一段块注释签名** `/*oj:<形态>*/`（形态字母表 `t/i/f/b/m/u`，
 分别对应字符串/整数/浮点/布尔/标记/无符号），使「同一条 SQL 文本 + 不同参数 Rust 类型」落到
-**不同** prepared statement 缓存条目——这正是 v0.1.24 前
-`invalid byte sequence … 0x00` / `insufficient data left in message` 的病根（sqlx 的缓存 key
-只有 SQL 文本，命中后复用旧的 param OIDs）。
+**不同** prepared statement 缓存条目。这正是 v0.1.24 之前
+`invalid byte sequence … 0x00` / `insufficient data left in message` 的病根：sqlx 的缓存 key
+只有 SQL 文本，命中后会复用旧的 param OIDs。
 
 - **可见性**：`pg_stat_activity.query` / PG 日志 / `EXPLAIN` 里会看到该前缀；`toSQL()` 与业务
   自己写的 SQL 字符串**不含**前缀。看到它请勿以为被篡改。
@@ -2481,7 +2493,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |
-| 端口 <1024（如 778）属特权端口 | 需 root 才能 bind | 用 ≥1024（默认 `9778`） |
+| 端口 <1024（如 778）属特权端口 | 需 root 才能 bind，用 ≥1024（默认 `9778`） |
 | `.tsx` / `.mts` 不转译 | 直通 V8；统一用 `.ts` |
 | 本地导入目标必须是 `.ts` | `./x.js`、`./d.json` 在产物里没有对应文件（只转译 `.ts`）→ `oj build` 直接失败 |
 | 别名只能在**模块内**用 | 模块外的文件（`tests/` 用例、`src/tasks/` 任务池）没有模块根可锚定 → 继续用相对路径 |
