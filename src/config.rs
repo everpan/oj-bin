@@ -725,6 +725,12 @@ pub struct Config {
     /// None = 不启用 mail（`mail.*` 全局报 "mail not configured"）；段存在即启用。
     /// 段由 `oj-mail` 插件投递、宿主持白名单校验与附件解析（见 [`SmtpSection`]）。
     pub smtp: Option<SmtpSection>,
+    /// None = 不启用 ldap（`ldap.*` 全局报 "ldap not configured"）；段存在即启用。
+    /// **一段两用**：整段序列化为 JSON 交给 `oj-ldap` 插件（凭据只走插件）；
+    /// 宿主用 `bridge::LdapConfig::from_value` 吃同一份 JSON 做白名单校验与实例选单。
+    /// 段为**不透明** map（serde_yaml::Value，见 plugins 段同形）——实例字段的白名单
+    /// 归 `LdapConfig::from_value` 独家裁决，未知键装配期 fail-fast（不静默丢弃）。
+    pub ldap: Option<serde_yaml::Value>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
     pub es: Option<EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。

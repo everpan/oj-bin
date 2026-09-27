@@ -4,6 +4,7 @@
 //
 // Globals: json / db / DB / http / redis / kv / log / fetch / finish / __ojRequire
 //   + blob(name) / bus / es / ws / plugins / cert / jwt / bcrypt / oidc / crypto / mail / vars
+//   + ldap / LDAP(name)
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
 // Not ported yet: Redis(name) (named multi-KV-backend), XORM(name).
 
@@ -52,6 +53,7 @@ import {
   op_kv_del,
   op_kv_expire,
   op_kv_incr,
+  op_ldap_call,
   op_log,
   op_mail_enqueue,
   op_mail_profiles,
@@ -488,6 +490,42 @@ globalThis.Mail = class {
 };
 const ojMailDefault = new Mail("default");
 globalThis.mail = ojMailDefault;
+
+// ----- ldap / LDAP(key): directory search + bind-as-auth (the oj-ldap plugin owns the
+// ldap3 connections; host validates args). All methods reject on validation/protocol/
+// network errors; only "ldap not configured" also throws at lookup. ldap.bind(dn,pw)
+// resolves true/false (false = LDAP refused the credentials, rc != 0); search resolves
+// [{dn, attrs:{k:[v]}, bin:{k:[base64]}}] (bin = binary attributes, base64-encoded).
+globalThis.LDAP = class {
+  constructor(key = "default") { this.key = key; }
+  bind(dn, pw) {
+    return op_ldap_call(ojStringify({ op: "bind", key: this.key, dn: String(dn), pw: String(pw) }));
+  }
+  search(base, opts = {}) {
+    const o = opts || {};
+    return op_ldap_call(ojStringify({
+      op: "search", key: this.key, base: String(base),
+      scope: o.scope, filter: o.filter, attrs: o.attrs,
+    }));
+  }
+  searchPaged(base, opts = {}) {
+    const o = opts || {};
+    return op_ldap_call(ojStringify({
+      op: "search_paged", key: this.key, base: String(base),
+      scope: o.scope, filter: o.filter, attrs: o.attrs, page_size: o.pageSize,
+    }));
+  }
+  whoami() {
+    return op_ldap_call(ojStringify({ op: "whoami", key: this.key }));
+  }
+  compare(dn, attr, val) {
+    return op_ldap_call(ojStringify({
+      op: "compare", key: this.key, dn: String(dn), attr: String(attr), val: String(val),
+    }));
+  }
+};
+const ojLdapDefault = new LDAP("default");
+globalThis.ldap = ojLdapDefault;
 
 // ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
 globalThis.plugins = () => op_plugins();

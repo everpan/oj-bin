@@ -102,6 +102,7 @@ pub struct Registrations {
     pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>, // Task auth-1 起
     pub mq: Option<&'static oj_plugin_ffi::MqVtable>,        // mq 命名客户端（spec 2026-09-07）
     pub mail: Option<&'static oj_plugin_ffi::MailVtable>,    // mail 投递（spec 2026-09-15）
+    pub ldap: Option<&'static oj_plugin_ffi::LdapVtable>,    // ldap 目录/鉴权（oj-ldap 轴）
 }
 
 pub struct LoadedPlugin {
@@ -429,7 +430,9 @@ fn load_one(
 
 /// 宿主认识的轴（加新轴 = 此表加一行 + 对应 vtable 类型 + Registrations 加字段；
 /// 插件零感知、零重编译——spec「按轴 dlsym」）。
-pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail"];
+pub const AXES: &[&str] = &[
+    "es", "db", "blob", "bus", "kv", "auth", "mq", "mail", "ldap",
+];
 
 /// init 成功后逐轴 dlsym：`oj_plugin_axis_<name>() -> *const c_void`。
 /// 缺符号或返回 null = 不提供该轴（非错误）。
@@ -455,6 +458,7 @@ unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
             "auth" => r.auth = Some(unsafe { &*(vt as *const oj_plugin_ffi::AuthGuardVtable) }),
             "mq" => r.mq = Some(unsafe { &*(vt as *const oj_plugin_ffi::MqVtable) }),
             "mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailVtable) }),
+            "ldap" => r.ldap = Some(unsafe { &*(vt as *const oj_plugin_ffi::LdapVtable) }),
             _ => unreachable!("AXES 与 probe_axes 分支不同步"),
         }
     }
@@ -476,6 +480,7 @@ impl Registrations {
             "auth" => self.auth.is_some(),
             "mq" => self.mq.is_some(),
             "mail" => self.mail.is_some(),
+            "ldap" => self.ldap.is_some(),
             _ => return None,
         })
     }

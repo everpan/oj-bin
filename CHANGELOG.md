@@ -60,9 +60,34 @@
   调优建议（写放大核算、增量游标、长轮询走 TLA）见 `docs/devkit/api-manual.md`
   §6「性能特征与调优」。
 
+**特性（ldap 轴，v0.1.28）**
+
+- **LDAP 目录与鉴证**：新 cdylib 插件 `oj-ldap`（ldap3 0.12.1 纯 Rust 客户端，
+  `tls-rustls-aws-lc-rs`，零 ring/零 C 库）+ 宿主 `ldap.*` 全局。配顶层 `ldap:` 段
+  （实例名 → url/bind_dn/bind_pw/timeout_ms/start_tls/tls_skip_verify）即启用：
+  - JS API：`ldap.bind(dn,pw): Promise<boolean>`（凭据被拒返回 false，不抛；
+    连接/协议错抛异常）、`ldap.search(base,{scope,filter,attrs})`、
+    `ldap.searchPaged(...)`（RFC 2696 分页聚合，pageSize 默认 500）、`ldap.whoami()`、
+    `ldap.compare(dn,attr,val)`；`ldap === new LDAP("default")`，命名实例 `LDAP(name)`。
+  - 返回条目 `{dn, attrs:{k:[v]}, bin:{k:[base64]}}`（二进制属性 base64 编码）。
+  - 连接模型：每调用独立 connect → 服务账号绑定 → 操作 → unbind（无连接池；
+    用户凭据绝不共享连接）；`bind_dn`/`bind_pw` 成对，不配则匿名 search。
+  - 装配：新轴按轴 dlsym（ABI 不变，加轴零破坏）；`ldap:` 段与 `plugins.ldap`
+    透传皆非空时装配期 fail-fast（二选一，防静默遮蔽）；宿主/插件双侧白名单校验
+    （未知键/坏 url 启动即报错）。
+  - 文档：devkit 四件套同步（api-manual §6 ldap 节 + §13 限制表、SKILL 陷阱、
+    scenarios 场景 11「LDAP/AD 登录鉴证」）。
+
 **配置（新增）**
 
 ```yaml
+ldap:
+  default:
+    url: ldaps://dc.example.com:636
+    bind_dn: cn=svc,ou=app,dc=example,dc=com
+    bind_pw: "change-me"
+    timeout_ms: 5000
+
 tasks:
   pool:
     workers: 4                  # 池化/cron 任务 worker 线程数

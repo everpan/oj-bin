@@ -8,7 +8,7 @@ use std::ffi::c_void;
 
 use crate::{
     AuthGuardVtable, BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable,
-    KVStoreVtable, MailVtable, MqVtable,
+    KVStoreVtable, LdapVtable, MailVtable, MqVtable,
 };
 
 pub fn es(vt: &'static EsBackendVtable) -> *const c_void {
@@ -39,6 +39,10 @@ pub fn mq(vt: &'static MqVtable) -> *const c_void {
     vt as *const _ as *const c_void
 }
 
+pub fn ldap(vt: &'static LdapVtable) -> *const c_void {
+    vt as *const _ as *const c_void
+}
+
 pub fn mail(vt: &'static MailVtable) -> *const c_void {
     vt as *const _ as *const c_void
 }
@@ -62,6 +66,7 @@ mod tests {
         let _: fn(&'static KVStoreVtable) -> *const c_void = axis::kv;
         let _: fn(&'static AuthGuardVtable) -> *const c_void = axis::auth;
         let _: fn(&'static MqVtable) -> *const c_void = axis::mq;
+        let _: fn(&'static LdapVtable) -> *const c_void = axis::ldap;
         let _: fn(&'static MailVtable) -> *const c_void = axis::mail;
     }
 

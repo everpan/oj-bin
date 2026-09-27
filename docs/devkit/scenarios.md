@@ -777,6 +777,78 @@ curl -X PATCH -H "Authorization: Bearer $TOKEN" \
 
 ---
 
+## 场景 11：LDAP/AD 登录鉴证（v0.1.28）
+
+> 何时抄我：登录要校验公司 AD/OpenLDAP 账号；或要按目录分组/属性做授权。
+
+### ① 配置（config.yaml）
+
+```yaml
+ldap:
+  default:
+    url: ldaps://dc.example.com:636
+    bind_dn: cn=svc-oj,ou=service,dc=example,dc=com   # 服务账号：search 前置绑定
+    bind_pw: "change-me"
+    timeout_ms: 5000
+```
+
+装插件：`cargo xtask plugin ldap`（产物 `bin/plugins/<triple>/libldap.dylib`）。
+`bind_dn`/`bind_pw` 成对；都不配 = 匿名 search（多数目录拒绝）。
+
+### ② handler：用户名 → DN → bind 鉴证
+
+```ts
+// src/user/login/api.ts
+const LDAP_FILTER_ESCAPES: Record<string, string> = {
+  "\": "\5c", "*": "\2a", "(": "\28", ")": "\29", " ": "\00",
+};
+const esc = (s: string) => s.replace(/[\*()\0]/g, (c) => LDAP_FILTER_ESCAPES[c]);
+
+export default {
+  async post() {
+    const { username, password } = http.body();
+    if (typeof username !== "string" || typeof password !== "string")
+      return json.fail(400, "bad request");
+    // 1) 查 DN（filter 注入先转义）
+    const found = await ldap.search("ou=users,dc=example,dc=com", {
+      filter: `(uid=${esc(username)})`,
+      attrs: ["uid", "memberOf"],
+    });
+    // 2) 找不到 / 多命中一律按凭据错处理（不泄露用户存在性）
+    if (found.length !== 1) return json.fail(401, "invalid credentials");
+    // 3) 用目录凭据绑定；false = 密码错（不抛）
+    const ok = await ldap.bind(found[0].dn, password);
+    if (!ok) return json.fail(401, "invalid credentials");
+    // 4) 发自己的会话票（目录只鉴证，不签发）
+    const token = await jwt.sign({
+      sub: found[0].attrs.uid[0],
+      groups: found[0].attrs.memberOf ?? [],
+    });
+    json.ok({ token });
+  },
+};
+```
+
+### ③ 验证
+
+```bash
+curl -X POST http://localhost:9778/v1/api/user/login/      -d '{"username":"eve","password":"secret"}'
+# → {"code":0,...,"data":{"token":"..."}}
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 调 `ldap.*` 报 `ldap not configured` | 没配 `ldap:` 段或没装 oj-ldap 插件（报错文案两者都点名） |
+| `ldap.bind` 抛 `connect ... io error` | 网络/端口/防火墙；`url` 拼错；非「凭据错」——`false` 才是凭据错 |
+| `service bind ... rc=49` | 服务账号 `bind_dn`/`bind_pw` 错了（search 在绑定前就失败） |
+| search 报 size limit | AD 默认 1000 条返回上限——改 `ldap.searchPaged(base, { pageSize: 500 })` |
+| `filter` 查不到人 | DN base 不对（`ou=users,…` 按实际目录改）；`scope` 默认 `sub`，base 之上的条目查不到 |
+| 头像/证书拿不到 | 二进制属性在 `entry.bin`（base64 字符串）：`Buffer.from(e.bin.jpegPhoto[0], "base64")` |
+
+---
+
 ## 相关文档
 
 - `api-manual.md` —— 完整 API 手册（13 章）

@@ -75,6 +75,16 @@ blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/bl
   # secret_key: "minioadmin"
   # path_style: true
 
+# ldap:  # LDAP 目录/鉴证（v0.1.28，需 oj-ldap 插件）：段存在即启用 ldap.* 全局
+#   default:
+#     url: ldaps://dc.example.com:636
+#     bind_dn: cn=svc,ou=app,dc=example,dc=com   # 服务账号：search 前置绑定（成对 bind_pw）
+#     bind_pw: "change-me"
+#     timeout_ms: 5000
+#   ad:
+#     url: ldap://ad.internal:389
+#     start_tls: true
+
 smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 mail.* 全局
         # 一段两用：整段交 oj-mail 插件建 transport（host/port/tls/凭据只走插件、
         # 不进宿主）；宿主只取每个 profile 的 allowed_from/allowed_recipients 做前置

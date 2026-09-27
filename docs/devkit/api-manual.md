@@ -604,6 +604,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
+| `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + `oj-ldap` 插件启用）：`bind / search / searchPaged / whoami / compare`，见下「ldap」 |
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
@@ -1199,6 +1200,79 @@ json.ok({ sent: r.code === 0, messageId: r.data?.messageId });
 **要「投递成功」才算数**（邮件审计表的 `sent_at` 这类）：别只写 `enqueue`——用 `mail.send` /
 `sendSync` 拿**同步结果**再落库（`enqueue` 的语义是「已入队」，不是「已送达」）；需要事后通知
 则订阅 bus `mail.result`（只覆盖 `enqueue` 路，且跨 profile/模块/租户归属收窄）。
+
+### ldap —— LDAP 目录与鉴证（`ldap:` 段 + `oj-ldap` 插件启用）
+
+配顶层 `ldap:` 段即启用全局 `LDAP` / `ldap`（`ldap === new LDAP("default")`）；未配置时调用报
+`ldap not configured (config ldap: section missing, or oj-ldap plugin not loaded)`。
+**协议交互**在 `oj-ldap` 插件内（ldap3 客户端：每调用独立 connect → 服务账号绑定 → 操作 →
+unbind，无连接池）；**宿主**负责实例表与入参白名单校验。错误模型同 `db`：**除「未配置」外，
+校验/协议/网络错一律抛异常（Promise reject）**——与 mail 的信箱模型不同，别用 `try/catch`
+当业务分支，只有 `ldap.bind` 的「凭据被拒」是正常返回 `false`。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `new LDAP(key)` | `LDAP(key?: string)` | 实例；`key` = `ldap:` 段里的实例名（缺省 `"default"`），未声明的 key 报错（不回落 default） |
+| `ldap.bind` | `bind(dn: string, pw: string): Promise<boolean>` | simple_bind 鉴证。`true` = 绑定成功；`false` = LDAP 拒绝该凭据（含 rc 49 invalidCredentials）；连接/协议错误**抛异常** |
+| `ldap.search` | `search(base: string, opts?: SearchOpts): Promise<Entry[]>` | 目录查询；大结果集请用 `searchPaged`（无分页时服务端可拒超量返回） |
+| `ldap.searchPaged` | `searchPaged(base: string, opts?: SearchOpts & { pageSize?: number }): Promise<Entry[]>` | RFC 2696 分页聚合（服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
+| `ldap.whoami` | `whoami(): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=svc,…"` 形式的 authzid |
+| `ldap.compare` | `compare(dn: string, attr: string, val: string): Promise<boolean>` | 属性值比对（compareTrue/False），不读出整条目 |
+
+```ts
+type SearchOpts = {
+  scope?: "base" | "one" | "sub";   // 默认 "sub"（整棵子树）；"one" = 仅下一层
+  filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
+  attrs?: string[];                 // 要读的属性名；缺省/空数组 = 服务端默认属性集
+};
+type Entry = {
+  dn: string;
+  attrs: Record<string, string[]>;  // 文本属性（多值即多元素）
+  bin: Record<string, string[]>;    // 二进制属性（jpegPhoto 等），**base64 编码字符串**
+};
+```
+
+鉴证（最常见用途——用 AD/OpenLDAP 校验登录）：
+
+```ts
+export default {
+  async post() {
+    const { username, password } = http.body();
+    const found = await ldap.search("ou=users,dc=example,dc=com", {
+      filter: `(uid=${username})`,   // 用户名 → DN（filter 注入见下）
+      attrs: ["uid"],
+    });
+    if (found.length !== 1) return json.fail(401, "invalid credentials");
+    const ok = await ldap.bind(found[0].dn, password);   // false = 密码错，不抛
+    if (!ok) return json.fail(401, "invalid credentials");
+    json.ok({ uid: found[0].attrs.uid[0] });
+  },
+};
+```
+
+配置（`ldap:` 段，每个顶层键 = 一个实例；未知键/坏 url 启动即报错）：
+
+```yaml
+ldap:
+  default:
+    url: ldaps://dc.example.com:636      # ldap://（明文）或 ldaps://（隐式 TLS）
+    bind_dn: cn=svc,ou=app,dc=example,dc=com   # 服务账号：search/whoami/compare 前置绑定
+    bind_pw: "change-me"                 # 凭据只在 config → 插件，不进 JS
+    timeout_ms: 5000                     # 连接与操作超时（100..=3600000，默认 5000）
+  ad:
+    url: ldap://ad.internal:389
+    start_tls: true                      # 明文口上 StartTLS 升级（ldaps:// 上配置即报错）
+    tls_skip_verify: true                # 自签 CA 测试用；生产关掉
+```
+
+- `bind_dn`/`bind_pw` 须**成对**出现（只配一个 → 启动报错）；都不配时 search 以匿名绑定执行
+  （多数目录默认拒匿名读，届时报「insufficient access rights」类错误）。
+- 错误文案：`ldap: unknown instance 'x'（known: …）`（key 未声明）、`ldap.bind: 'dn' must
+  be a non-empty string`（入参校验）、`ldap: connect ldap://…: io error`（网络/拒连）、
+  `ldap: service bind …: rc=49 …`（服务账号凭据错）。全部 reject，不会 resolve 半个信封。
+- **filter 注入**：`filter` 是拼进 LDAP 查询的字符串，`(uid=${username})` 若 `username`
+  含 `*`/`()`/`\` 会改变查询语义（LDAP 无参数绑定）。**先转义**（把 `*` `(` `)` `\` NUL
+  前缀 `\`）或用 `ldap.compare` 收口。
 
 ### log —— 结构化日志
 
@@ -2521,6 +2595,11 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持的类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）**报错而非给 `null`**；在 SQL 里显式转换：`select cast(x as char) as x from t`。不要用 `select *` 兜住这些列 |
 | MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` 而不是 `true`/`false`（v0.1.24） | MySQL 没有独立 boolean 类型（`BOOLEAN` 即 `TINYINT(1)`），协议层无列长度元数据可区分；按整数读。需要 boolean 语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
+| ldap 无连接池（每调用独立 connect/bind/unbind） | 设计取向：bind(dn,pw) 用户凭据绝不共享连接；LAN 上 AD 连接建立为毫秒级。热路径（每请求多次 LDAP 调用）先用 `search` 一次取全所需字段，仍不够再评估给插件加 ldap3 pool |
+| ldap `search` 不做分页 | 服务端可拒超量返回（AD 默认 1000 条上限）；大结果集用 `ldap.searchPaged` |
+| ldap referral 不自动跟随 | `search` 返回 referral 引用（`ResultEntry::Refer`）时插件收集进结果 refs 并跳过——目录树跨 ref 分片的场景先确认 base 落在目标分区内 |
+| ldap `filter` 无参数绑定 | 字符串直拼，用户输入须先按 RFC 4515 转义（见 §6 ldap 节），否则是 LDAP 版注入 |
+| 二进制属性（`jpegPhoto` 等）出 `bin` 为 base64 字符串 | `entry.bin.jpegPhoto[0]` 是 base64 文本；落库/出 HTTP 前自行解码，勿当 UTF-8 原文 |
 | `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
 | `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |
 | `ext_boot.js` 不做热重载 | 装配期冻结 spec，改动必须重启；池内可能新旧混杂 |
