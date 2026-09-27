@@ -1,8 +1,10 @@
 # oj DevKit——TS API 开发手册 + agent skill
 
-面向用 oj 框架开发业务项目的开发者与 AI agent。本目录是发布交付物
-（`oj-v<version>-<triple>.tar.gz` / `.zip` 内 `devkit/`），由仓库 `docs/devkit/` 经
-`cargo xtask build` 归置到 `bin/devkit/` 产出。
+给用 oj 框架写业务项目的人和 AI agent 看的。本目录是发布交付物：发行包
+（`oj-v<version>-<triple>.tar.gz` / `.zip`）里的 `devkit/` 就是它，由仓库
+`docs/devkit/` 经 `cargo xtask build` 归置到 `bin/devkit/` 产出。
+
+## 里面有什么
 
 | 文件 | 用途 |
 |---|---|
@@ -27,11 +29,11 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 # 或从发行包解包后取 devkit/，路径同上
 ```
 
-安装后 agent 里说"用 oj-api-dev 开发 xxx 模块"，或 Claude Code 里 `/oj-api-dev` 触发。
+装好后用法：agent 里说「用 oj-api-dev 开发 xxx 模块」，或在 Claude Code 里用 `/oj-api-dev` 触发。
 
 ## 更新
 
-手册与 skill 随 oj 版本一起发布；升级 oj 后用新包内 `devkit/` 覆盖旧拷贝。
+手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
 **版本同步要求（发布前自查）**：每次版本升级，本目录四件（`api-manual.md` / `scenarios.md` /

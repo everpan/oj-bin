@@ -4,6 +4,10 @@
 > 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-guide.md` §13 与
 > `docs/plugin-development.md`，注册机制见下方 §0。
 
+**给谁读**：要写插件，直接看 `docs/plugin-development.md`，不用读本文。本文适合想知道
+「为什么最后选了 cdylib + FFI、而不是进程内 trait」的读者——§0 是现行机制速览，
+§1 起是被否决的原方案全文。
+
 ## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 8）
 
 - **加载**：宿主启动期 `dlopen` 插件 cdylib（`src/bridge/plugin_loader.rs`，句柄进程期存活，

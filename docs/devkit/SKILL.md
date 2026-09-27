@@ -5,6 +5,11 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 
 # oj API 模块开发
 
+oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框架负责 HTTP 服务、路由、
+数据库、鉴权、多租户。路由按目录镜像生成——`src/user/profile/api.ts` 就是
+`GET {base}/user/profile/`，不用手写路由表。业务响应统一走 `{code,msg,data}` 信封
+（`json.ok` / `json.fail`），框架替你写回 HTTP。
+
 本 skill 与参考手册 `api-manual.md`、场景集 `scenarios.md` 同目录。**按章节号按需读章，不要盲读全文。**
 
 ## 工作流
@@ -28,7 +33,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
-4. **测试**：先 L2 vitest 测逻辑（快），再 L1 `oj test` 测端到端（真）。两层都绿才算完（§9）。
+4. **测试**：先 L2 vitest 测逻辑（快，不起服务），再 L1 `oj test` 测端到端（真，连真实 DB）。
+   两层都绿才算完（§9）。
 5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§11）。
    release 启动默认 `migrate_on_start: verify`，**先 `oj migrate`**；config `db:` 段有命名库时
    逐个 `oj migrate -c config.yaml -d dist --db <name>`（未声明库名会报错，不会回落 default）。
@@ -152,7 +158,8 @@ description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用—
 
 `scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
 测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）/
-大整数 id（雪花）的生成与精确回写。
+大整数 id（雪花）的生成与精确回写 / 302 重定向到 blob 预签名 URL /
+路径参数路由（`_name_` 目录 vs `.route`）/ 池化长任务 + cron。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
 （json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

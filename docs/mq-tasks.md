@@ -1,10 +1,13 @@
 # MQ 消费任务教学（Kafka/RabbitMQ 命名客户端 + tasks 长任务池）
 
-> 面向两类读者：**要接 MQ 消费、写长任务的业务开发者**（§1–§3）与**要改 MQ/任务
-> 实现的维护者**（§4–§6）。JS 签名权威是 [devkit/api-manual.md](devkit/api-manual.md)
+> 给谁读：要接 MQ 消费、写长任务的业务开发者（读 §1–§3），以及要改 MQ/任务实现的
+> 维护者（读 §4–§6）。JS 签名权威是 [devkit/api-manual.md](devkit/api-manual.md)
 > §6「命名 MQ 客户端与长任务」；设计裁决记录是
 > `docs/superpowers/specs/2026-09-07-mq-client-tasks-design.md`。可运行示例全程以
 > `sample/src/tasks/` 与 `sample/config.yaml` 为锚。
+>
+> 术语：**MQ** = 消息队列（Kafka / RabbitMQ）；**命名客户端** = config 里配好的一个
+> MQ 实例，JS 里按名字取用；**长任务** = 服务启动即拉起、常驻运行的后台 JS 文件。
 
 ## 1. 心智模型：命名客户端 + 常驻任务
 
@@ -53,6 +56,8 @@ while (!tasks.stopping()) {                       // 唯一合法的退出条件
 }
 ```
 
+（TLA = 顶层 await，任务文件顶层直接写 `await`；`export {}` 让文件被识别为 ESM。）
+
 ### RabbitMQ：basic_get 拉取 + 手动 ack
 
 ```ts
@@ -80,7 +85,7 @@ while (!tasks.stopping()) {
 ```
 
 消息形状（`OjMqMessage`，两个 broker 统一）：`{ topic, partition?, offset?, key?,
-value, headers?, ts?, delivery_tag? }`——`delivery_tag` 仅 rabbit（ack/nack 用）。
+value, headers?, ts?, delivery_tag? }`。`delivery_tag` 仅 rabbit（ack/nack 用）。
 
 ### 帧处理器可用的全部「主动作」
 
@@ -139,8 +144,9 @@ bootstrap.js 全局（mqCache 同一性；Kafka/RabbitMQ/tasks）
 
 关键裁决（改实现前必读，出处 spec 评审记录）：
 
-- **单 `mq` 轴 + JSON method dispatch**：加方法零 ABI 变更；`ABI_VERSION` 保持 7
-  （`oj-plugin-ffi/src/mq.rs` 的 `MqVtable` 是全新类型，不动既有 repr(C) 形状）。
+- **单 `mq` 轴 + JSON method dispatch**：加方法零 ABI 变更。引入 mq 轴时 `ABI_VERSION`
+  保持 7（`oj-plugin-ffi/src/mq.rs` 的 `MqVtable` 是全新类型，不动既有 repr(C) 形状）；
+  此后 bus 字节化已把 ABI 升到 8。
 - **消费门禁 = `flag.is_some()`**（`mq.rs` op_mq_call）：任务 Bridge 的
   `StableState.tasks_flag` 是 `Some(flag)`，HTTP 桥是 `None`——判**存在**不判**值**。
   flag 的值是停机信号（生产装配里与 SIGTERM 置位的是同一个 `Arc`，初值 false）。
@@ -148,7 +154,7 @@ bootstrap.js 全局（mqCache 同一性；Kafka/RabbitMQ/tasks）
 - **`MqInstance` Drop 兜底 close**：ffi 构造的实例持 `closer` 闭包，释放时调
   `vtable.close(handle)`（kafka 离开消费组 / rabbit 丢 ackers）。
 - **rabbit 复用 channel**（`reuse_channel`）：lapin 2.5 的 Channel 没有 Drop→close，
-  逐次新建即弃会泄漏连接上的 channel 直到打满 `channel_max`——失效自愈重建。
+  逐次新建即弃会泄漏连接上的 channel，直到打满 `channel_max`。所以失效时自愈重建。
 
 **任务驱动**（`Bridge::run_task`，`src/bridge/mod.rs`）：任务文件**一律按 ESM
 side-module 直载**（转译源 + 文件自身 versioned URL，绕过 loader 的 looks_cjs 启发
@@ -159,11 +165,11 @@ side-module 直载**（转译源 + 文件自身 versioned URL，绕过 loader �
 - `Killed`：宽限到期强杀。
 
 强杀为什么只能靠看门狗：TLA 紧循环（如 `while(true){ await poll() }` 且 op 同步
-就绪）会把 `mod_evaluate` 的初始 microtask checkpoint **同步自旋到永不返回**——宿主
+就绪）会把 `mod_evaluate` 的初始 microtask checkpoint **同步自旋到永不返回**，宿主
 线程连 `select!` 的协作分支都轮不到。所以 `KillSwitch::arm_on_flag(handle, flag,
 grace)` 把停机 flag + grace 交给看门狗线程**代盯**：flag 置位即起算宽限，到点跨线程
 `terminate_execution`。第二个坑：terminate 落在 isolate 空闲窗口会**悬空 TLA
-promise**（`eval` 永不 settle）——fired 后宿主放弃 await eval，兜底轮加 1s 超时。
+promise**（`eval` 永不 settle）。fired 后宿主放弃 await eval，兜底轮加 1s 超时。
 SIGSEGV 纪律：terminate 后本线程兜一轮 event loop 再丢弃 runtime，绝不归还池。
 
 **监督器**（`oj/src/tasks.rs`）：`scan_tasks` 递归扫描 `task_{name}.*` /
@@ -180,7 +186,7 @@ SIGSEGV 纪律：terminate 后本线程兜一轮 event loop 再丢弃 runtime，
 - 任务文件必须有 ESM 标记（`export {};` 或真实 import/export）；CJS 写法
   （`module.exports`）加载即 `ReferenceError` → Crashed。
 - `timeoutMs` ≪ `stop_grace_secs`；处理逻辑必须幂等（at-least-once）。
-- kafka 消费会话在首次 poll 时按当时的 topics 固化订阅，后续换 topics 被忽略——
+- kafka 消费会话在首次 poll 时按当时的 topics 固化订阅，后续换 topics 被忽略。
   要换主题就换实例名。
 - 任务无热重载：改文件重启进程（转译缓存按 mtime 自动失效）。
 - 运行时无 timer 全局：等待一律 `await tasks.sleep(ms)`。

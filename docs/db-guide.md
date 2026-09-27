@@ -6,11 +6,16 @@
 > 本手册讲「怎么上手、为什么这样设计」。逐 API 的穷举式参考见
 > [`docs/devkit/api-manual.md`](devkit/api-manual.md) 第 6 章「db / DB(name)」。
 > 所有 API 名、字段名、报错文案均与源码（`src/bridge/bootstrap.js`、`src/bridge/query.rs`、
-> `src/bridge/db.rs`）逐字核对，版本 0.1.14。
+> `src/bridge/db.rs`）逐字核对，版本 0.1.28。
+>
+> 文中「fail-fast」= 发现问题立刻报错退出；「白名单」= 只有预先声明过的表/列才能被
+> 访问，其余一律拒绝。
 
 ---
 
 ## 0. 五分钟上手
+
+从零到跑通一次查询的最短路径。第一次用 oj 就按这节做。
 
 ### 1) 配一个库
 

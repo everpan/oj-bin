@@ -1,54 +1,62 @@
 # JavaScript Is All You Need
 
-> `only-js` (codename **oj**) —— a low-code backend framework that embeds a JS/TS
-> runtime (`deno_core` / V8) into Rust. Write `api.ts` organized by directory; the directory
-> tree *is* the route table. Changes take effect immediately, and the build output is shippable.
+> `only-js` (codename **oj**) is a low-code backend framework: a Rust binary with a JS/TS
+> runtime (`deno_core` / V8) embedded inside. You write business logic as `api.ts` files in
+> directories — the directory tree *is* the route table. Save a file and the change is live;
+> when you're done, one build command produces a shippable artifact.
+
+New here? This page is the front door: what oj is, why it exists, how to run the sample in
+a few commands, and where to go next.
 
 ---
 
 ## Motivation
 
-In toB engagements you often need `low-code` for fast delivery. Low-code offerings on the
-market vary wildly, but strip away the packaging and they are all fundamentally highly
-configurable systems — and among all forms of configuration, **programmable configuration is
-the highest tier**. The traditional approach is to embed a scripting engine (lua, js) inside a
-backend language; js is the most popular choice thanks to its huge developer base.
+toB work often calls for low-code to deliver fast. Strip the packaging off any low-code
+product and what remains is a highly configurable system — and of all forms of
+configuration, **programmable configuration is the highest tier**. The traditional way to
+get there is embedding a scripting engine (lua, js) inside a backend language; js is the
+usual pick thanks to its huge developer base.
 
-The problem is that, whatever backend language you pick, the complexity never goes away. You
-have to maintain a java / golang / c# backend stack *and* solve "how to embed and tame a js
-runtime inside it"; meanwhile frontend/backend separation itself brings communication overhead
-and knowledge-transfer friction.
+The catch: the complexity never goes away. You still maintain a java / golang / c# backend
+stack, *and* you have to solve "how to embed and tame a js runtime inside it". On top of
+that, frontend/backend separation adds its own communication and knowledge-transfer
+overhead.
 
-This project aims to take the best of all worlds and **unify frontend and backend onto a
-single language: JS/TS**.
+This project takes a different bet: **unify frontend and backend on one language — JS/TS** —
+and let the Rust host absorb everything else.
 
 ### If Node.js is already good enough, why build another one?
 
-Because "being able to run JS" was never the hard part — **"let the business write only JS,
-and have the host absorb everything else" is**. The trade-offs here differ markedly from Node:
+Running JS was never the hard part. **Letting the business write only JS while the host
+absorbs everything else is.** That is where oj's trade-offs differ from Node:
 
-- **Delivery shape**: the core is a Rust binary. At runtime there is no `node_modules` and no
-  toolchain to install; business modules build into versioned output directories plus a
+- **Delivery shape**: the core is a Rust binary. At runtime there is no `node_modules` and
+  no toolchain to install. Business modules build into versioned output directories plus a
   deterministic `.tgz` for publishing.
-- **Safety rails sink into Rust**: dynamic SQL identifiers (table/column names) can only come
-  from the Rust-side `SchemaRegistry` allowlist, and values only go through bound parameters —
-  even a business-side mistake can't assemble an injection. Multi-tenancy, JWT auth, OIDC (built-in OP + RP), certificate
-  validation, and static path-traversal guards all live in the host, not in business discipline.
-- **Zero-config routing**: the directory mirror *is* the route — no registration code to write
-  (see below).
+- **Safety rails sink into Rust**: dynamic SQL identifiers (table/column names) can only
+  come from the Rust-side `SchemaRegistry` allowlist, and values only go through bound
+  parameters. A business-side mistake cannot assemble an injection. Multi-tenancy, JWT auth,
+  OIDC (built-in OP + RP), certificate validation, and static path-traversal guards all live
+  in the host, not in business discipline.
+- **Zero-config routing**: the directory mirror *is* the route — no registration code to
+  write (see below).
 - **Capability is pluggable**: DB dialects, S3, Redis, ES, Kafka/RabbitMQ are all **cdylib
-  plugins**, loaded on demand; capabilities you don't install never enter the binary or its
-  dependencies.
-- **Controlled execution environment**: `JsRuntime`s are pooled and reused with a timeout
-  watchdog (`KillSwitch`) — a single runaway request won't take down the process; failed
-  runtimes are dropped rather than reused.
-- **dev / release dual mode**: dev runs `.ts` directly (transpile on demand + hot reload),
-  release runs prebuilt `.js` (no transpile, lock-aggregated). The same source auto-switches
-  between the two modes.
+  plugins**, loaded on demand. A capability you don't install never enters the binary or its
+  dependency tree.
+- **Controlled execution environment**: `JsRuntime`s are pooled and reused, with a timeout
+  watchdog (`KillSwitch`). One runaway request won't take down the process; a failed runtime
+  is dropped, never reused.
+- **dev / release dual mode**: dev runs `.ts` directly (transpile on demand + hot reload);
+  release runs prebuilt `.js` (no transpile, lock-aggregated). The same source switches
+  between the two modes automatically.
 
 ---
 
 ## Quick Start
+
+Five commands from zero to a running release-mode service. You need a Rust toolchain; the
+first build downloads a prebuilt V8 (slow once, fast afterwards).
 
 ```bash
 cargo xtask build            # build and place bin/oj + bin/plugins/<triple>/ (release; first build pulls prebuilt V8)
@@ -285,12 +293,12 @@ wraps the plugin vtable as a core backend; a panic inside a plugin is contained 
 ## Common development commands
 
 ```bash
-cargo build --workspace                  # build all members (release; output to bin/)
-cargo test                               # root crate unit tests
-cargo test --workspace                   # full test run (incl. oj e2e)
-cargo fmt --check                        # formatting gate
-cargo clippy --all-targets -D warnings   # lint gate
-cargo bench                              # criterion benchmarks
+cargo build --workspace                              # build all members (release; output to bin/)
+cargo test --release                                 # root crate unit tests
+cargo test --release --workspace                     # full test run (incl. oj e2e)
+cargo fmt --check                                    # formatting gate
+cargo clippy --release --all-targets -- -D warnings  # lint gate
+cargo bench                                          # criterion benchmarks
 
 ./bin/oj test -c sample/config.yaml             # run *.test.ts in-process (no server needed)
 cargo xtask bin                                 # build oj and copy into bin/oj

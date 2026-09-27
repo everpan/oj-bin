@@ -11,8 +11,8 @@
 | `.`（`only-js`） | lib | 核心：JS↔Rust bridge + 各后端轴 + 配置模型 |
 | `server` | lib | axum HTTP 服务（feature `test-support` 供测试复用） |
 | `oj` | lib + bin | CLI（`server`/`build`/`test`/`migrate`/`fixture`/`schema diff`）；bin+lib 双 target 便于 `oj/tests/` 触达装配层 |
-| `oj-plugin-ffi` | lib | 宿主与插件共享的 C-ABI 契约（`ABI_VERSION = 7`） |
-| `plugins/oj-*`（8 个） | cdylib | es / db-mysql / db-postgres / blob-s3 / bus-kafka / bus-rabbitmq / kv-redis / auth |
+| `oj-plugin-ffi` | lib | 宿主与插件共享的 C-ABI 契约（`ABI_VERSION = 8`） |
+| `plugins/oj-*`（9 个） | cdylib | es / db-mysql / db-postgres / blob-s3 / bus-kafka / bus-rabbitmq / kv-redis / auth / mail |
 | `tools/xtask` | bin | 构建/拷贝/预检，产物归置到 `bin/` |
 | `tools/oj-cert` | lib + bin | JWS 证书生成/续签工具 |
 | `tests/plugins/mini`、`mini-kv` | cdylib | 加载/ABI/panic 路径的测试夹具 |

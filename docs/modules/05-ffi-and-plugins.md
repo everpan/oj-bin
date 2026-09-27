@@ -87,6 +87,7 @@ pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail
 | `oj-bus-rabbitmq` | bus | lapin |
 | `oj-kv-redis` | kv | RedisKV（迁自 core `kv.rs`） |
 | `oj-auth` | auth | Bearer 守卫；**进程级 GUARD 只认首次 init**（故 OIDC e2e 独立成测试目标） |
+| `oj-mail` | mail | lettre SMTP 投递；发送队列 + worker 池；发件人/收件人白名单 fail-closed（v0.1.19 起） |
 
 插件自描述 `descriptor.desc` 必填，经 `GET {base}/plugins` 公开。
 
