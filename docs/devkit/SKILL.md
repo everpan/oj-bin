@@ -30,6 +30,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
    **发件人/收件人白名单 fail-closed**，空表即拒；附件用 `{blobKey}`/`{path}` 引用，勿内联 base64）。
    完整手册见仓库 `docs/mail-smtp.md`。
+   **LDAP/AD 登录鉴证或目录查询 → §6「ldap」**（配置顶层 `ldap:` + `oj-ldap` 插件；
+   `bind/search/searchPaged/whoami/compare`，reject 模型，仅 `bind` 凭据错返回 `false`；
+   filter 用户输入**必须转义**）。完整手册见仓库 `docs/ldap-integration.md`，
+   可照抄代码见 `scenarios.md` 场景 11。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
