@@ -499,6 +499,10 @@ pub struct Registries {
     /// → 装配层构造 `FfiMailBackend`（`app::build_mail_backend`）；多 mail 插件注册冲突
     /// fail fast。未加载插件时保持 None（`mail.*` 报未配置，不降级）。
     pub mail: Option<&'static oj_plugin_ffi::MailVtable>,
+    /// ldap 键选单 vtable 槽（ldap 轴）：ldap: 段 + 恰一个 ldap 插件
+    /// → 装配层构造 `FfiLdapBackend`（`app::build_ldap_backend`）；多 ldap 插件注册冲突
+    /// fail fast。未加载插件时保持 None（`ldap.*` 报未配置，不降级）。
+    pub ldap: Option<&'static oj_plugin_ffi::LdapVtable>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -506,7 +510,7 @@ pub struct Registries {
 /// 第一方轴适配器清单（实际适配分支在 plugin_cfg 的 match；此表供测试与
 /// plugin_loader::AXES 对账，防止两表失步——适配器打空）。加新第一方轴时在此登记。
 #[cfg(test)]
-const ADAPTER_AXES: &[&str] = &["es", "auth", "mail"];
+const ADAPTER_AXES: &[&str] = &["es", "auth", "mail", "ldap"];
 
 /// A5：mail 的**双配置源**闸门（装配期 fail-fast）。
 ///
@@ -519,6 +523,27 @@ const ADAPTER_AXES: &[&str] = &["es", "auth", "mail"];
 /// `smtp:` 段则要求**有实质内容**（profile 或 `workers`/`queue_capacity`）——
 /// `smtp: {}`（空段）本来就被视作未配置，不算冲突（`plugins: {mail: {}}` 空对象同理，
 /// 它是「回落适配器」而非透传）。
+/// A5-ldap：`plugins.ldap` 透传与顶层 `ldap:` 段皆非空 → 配置错误（透传静默胜出，
+/// 运维改 `ldap:` 会「改了不生效」）。判定与 `plugin_cfg` 选用条件对齐：
+/// `plugins.ldap` = 非空对象；`ldap:` 段 = Some 且非空 map。
+pub(crate) fn check_ldap_cfg_sources(cfg: &Config) -> Result<(), String> {
+    let passthrough = cfg
+        .plugins
+        .get("ldap")
+        .is_some_and(|v| v.as_object().is_some_and(|o| !o.is_empty()));
+    let section_nonempty = cfg
+        .ldap
+        .as_ref()
+        .is_some_and(|v| v.as_mapping().is_some_and(|m| !m.is_empty()));
+    if passthrough && section_nonempty {
+        return Err(
+            "config declares both a non-empty `ldap:` section and a non-empty `plugins.ldap`              entry: pick one (`ldap:` is the standard form; `plugins.ldap` is a raw passthrough              that silently wins over `ldap:` and bypasses its typed parsing)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn check_mail_cfg_sources(cfg: &Config) -> Result<(), String> {
     let passthrough = cfg
         .plugins
@@ -571,6 +596,12 @@ pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
         // 段缺省/空 → "{}"（插件零 profile；装配层视作未配置，不挂 mail 后端）。
         "mail" => match &cfg.smtp {
             Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "{}".to_string()),
+            None => "{}".to_string(),
+        },
+        // ldap：顶层 `ldap:` 段（不透明 map）→ oj-ldap 插件 cfg。
+        // 段缺省/空 → "{}"（插件零实例；装配层视作未配置，不挂 ldap 后端）。
+        "ldap" => match &cfg.ldap {
+            Some(l) => serde_json::to_string(l).unwrap_or_else(|_| "{}".to_string()),
             None => "{}".to_string(),
         },
         _ => "{}".to_string(),
@@ -669,6 +700,17 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register mail backend".to_string());
     }
     let mail = mail_plugins.first().and_then(|p| p.registrations.mail);
+    // ldap 键选式单 vtable 槽：多 ldap 插件注册冲突 fail fast；
+    // `ldap:` 段声明但插件未装 → 不在装配期硬失败（`app::build_ldap_backend` 返回 None，
+    // `ldap.*` 调用报 "ldap not configured"，与 mail 同语义）。
+    let ldap_plugins: Vec<&LoadedPlugin> = loaded
+        .iter()
+        .filter(|p| p.registrations.ldap.is_some())
+        .collect();
+    if ldap_plugins.len() > 1 {
+        return Err("plugins conflict: multiple plugins register ldap backend".to_string());
+    }
+    let ldap = ldap_plugins.first().and_then(|p| p.registrations.ldap);
     Ok(Registries {
         es,
         dbs,
@@ -678,6 +720,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         auth,
         mq,
         mail,
+        ldap,
     })
 }
 
@@ -692,6 +735,7 @@ pub async fn assemble_plugins(
     // A5：mail 双配置源（`smtp:` 与 `plugins.mail` 皆非空）是配置错误 → 装配期 fail-fast
     // （`plugin_cfg` 会让非空 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」）。
     check_mail_cfg_sources(cfg)?;
+    check_ldap_cfg_sources(cfg)?;
     let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();

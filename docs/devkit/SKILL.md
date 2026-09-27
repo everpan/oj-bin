@@ -87,6 +87,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸） |
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |
 | es/blob 调用报错 | config 未配置 `es.endpoint` / `blob:` 段，配置即启用 |
+| `ldap.bind` 一直抛而不是返回 false | 抛 = 连接/协议错；只有 LDAP 拒绝凭据（rc≠0，含 49）才返回 `false`——检查网络/`url`/服务账号，别把 `false` 分支当异常路径 |
+| `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `ldap.searchPaged` |
+| ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |
+| `ldap:` 段改了不生效并报错双配置 | 同时写了顶层 `ldap:` 段与非空 `plugins.ldap` 透传——二选一（透传静默胜出，装配期报错拦截） |
+| `start_tls` 配在 ldaps:// 上启动报错 | ldaps 已隐式 TLS，StartTLS 无意义——`ldap://` 口才用 `start_tls: true` |
 | WS 连上但收不到广播 | 订阅只在 WS 会话内有效（`bus.subscribe` 在 HTTP 路径报错）；release 下 URL 含版本段 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
 | `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |

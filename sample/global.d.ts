@@ -319,6 +319,42 @@ interface MailRawRequest extends MailSendRequest {
   raw: string;
 }
 
+// ldap / LDAP(key) ：LDAP 目录查询与鉴证（config ldap: 段 + oj-ldap 插件启用；未配置
+// 调用报 ldap not configured）。错误模型同 db：**除「未配置」外，校验/协议/网络错一律
+// reject**——只有 ldap.bind 的「凭据被 LDAP 拒绝」是正常返回 false（含 rc 49）。
+interface LdapSearchOpts {
+  // 默认 "sub"（整棵子树）；"one" = 仅 base 下一层；"base" = 只查 base 自身。
+  scope?: "base" | "one" | "sub";
+  // RFC 4515 过滤器，默认 "(objectClass=*)"——用户输入须先转义（无参数绑定）。
+  filter?: string;
+  // 要读的属性名；缺省/空数组 = 服务端默认属性集。
+  attrs?: string[];
+}
+
+interface LdapEntry {
+  dn: string;
+  // 文本属性（多值即多元素）。
+  attrs: Record<string, string[]>;
+  // 二进制属性（jpegPhoto 等）：base64 编码字符串。
+  bin: Record<string, string[]>;
+}
+
+interface LdapApi {
+  // simple_bind 鉴证：true = 绑定成功；false = 凭据被拒（不抛）；连接/协议错 reject。
+  bind(dn: string, pw: string): Promise<boolean>;
+  search(base: string, opts?: LdapSearchOpts): Promise<LdapEntry[]>;
+  // RFC 2696 分页聚合（服务端不支持分页控制时回落单次 search）。
+  searchPaged(base: string, opts?: LdapSearchOpts & { pageSize?: number }): Promise<LdapEntry[]>;
+  // whoami 扩展（RFC 4532）→ "dn:cn=svc,…" 形式的 authzid。
+  whoami(): Promise<string>;
+  // 属性值比对（compareTrue/False），不读出整条目。
+  compare(dn: string, attr: string, val: string): Promise<boolean>;
+}
+
+interface LDAP {
+  new (key?: string): LdapApi;
+}
+
 interface MailApi {
   // 异步 transport；resolve 投递结果信封。
   send(m: MailSendRequest): Promise<MailEnvelope>;
@@ -373,6 +409,8 @@ declare global {
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。
   const mail: MailApi;
+  // 默认实例（"default"）的 ldap；其它实例用 new LDAP("name")。
+  const ldap: LdapApi;
   const Mail: Mail;
 
   // 命名数据库实例；未配置的名字返回 undefined。

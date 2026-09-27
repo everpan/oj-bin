@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oj_plugin_ffi;
 use only_js::bridge::blob::{BlobBackend, BlobRegistry};
+use only_js::bridge::ldap::{FfiLdapBackend, LdapBackend, LdapConfig};
 use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
@@ -491,6 +492,29 @@ pub fn build_mail_backend(
     Ok(Some(Arc::new(FfiMailBackend::new(vtable, mail_cfg, bus))))
 }
 
+/// ldap 装配：顶层 `ldap:` 段 + oj-ldap 插件 vtable → `Arc<dyn LdapBackend>`。
+///
+/// 与 mail 同形：给插件的 cfg 与宿主校验面取自 `plugin_cfg(cfg, "ldap")` 同一份 JSON；
+/// 实例字段的白名单由 `LdapConfig::from_value` 裁决（未知键装配期 fail-fast）。
+/// 未配 `ldap:`（段缺省/空）或插件未加载 → `None`：`ldap.*` 报 "ldap not configured"。
+pub fn build_ldap_backend(
+    cfg: &Config,
+    vtable: Option<&'static oj_plugin_ffi::LdapVtable>,
+) -> Result<Option<Arc<dyn LdapBackend>>, String> {
+    let Some(vtable) = vtable else {
+        return Ok(None);
+    };
+    crate::server_cmd::check_ldap_cfg_sources(cfg)?;
+    let json = crate::server_cmd::plugin_cfg(cfg, "ldap");
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("ldap cfg: {e}"))?;
+    if value.as_object().is_none_or(|o| o.is_empty()) {
+        return Ok(None);
+    }
+    let ldap_cfg = LdapConfig::from_value(&value).map_err(|e| format!("ldap: {e}"))?;
+    Ok(Some(Arc::new(FfiLdapBackend::new(vtable, ldap_cfg))))
+}
+
 /// 停机排空的**逻辑**（[`App::drain_mail`] 的唯一实现；独立成函数便于单测）：
 /// 经 `MailBackend::drain`（控制报文）让插件停收新投递、等在途 job 跑完再销毁 transport。
 ///
@@ -774,6 +798,8 @@ impl App {
         // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
         // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
         let mail = build_mail_backend(&cfg, registries.mail, bus.clone())?;
+        // ldap 后端：ldap: 段 + oj-ldap 插件 vtable（独立能力，无跨后端依赖）。
+        let ldap = build_ldap_backend(&cfg, registries.ldap)?;
         // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
         let (kafkas, rabbits) = build_mq_registries(&cfg, &registries.mq).await?;
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
@@ -803,6 +829,7 @@ impl App {
             let jwt = jwt.clone();
             let oidc = oidc.clone();
             let mail = mail.clone();
+            let ldap = ldap.clone();
             let db_override = db_override.clone();
             // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
             let vars = vars.clone();
@@ -835,6 +862,8 @@ impl App {
                         tasks_flag,
                         // mail 后端（smtp: 段 + oj-mail 插件；未配置/未加载 = None）。
                         mail: mail.clone(),
+                        // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
+                        ldap: ldap.clone(),
                         vars: vars.clone(),
                     },
                 )
@@ -1038,6 +1067,7 @@ impl App {
             tasks_flag: None,
             sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
             mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
+            ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
             vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
         });
         Ok(App {
@@ -1777,6 +1807,94 @@ mod mail_assembly_tests {
             Err(e) => e,
         };
         assert!(e.contains("allowed_from"), "{e}");
+    }
+
+    // ---- ldap 装配测试 ----
+
+    /// 假 ldap vtable：call 回固定结果（装配测试零网络、零插件）。
+    extern "C" fn fake_ldap_call(req: RString) -> FfiFuture {
+        let r = req[..].to_string();
+        let out = if r.contains("\"op\":\"bind\"") {
+            "true"
+        } else {
+            "\"dn:fake\""
+        };
+        oj_plugin_ffi::ready_ok(out.as_bytes().to_vec())
+    }
+    static FAKE_LDAP: oj_plugin_ffi::LdapVtable = oj_plugin_ffi::LdapVtable {
+        call: fake_ldap_call,
+    };
+
+    /// 顶层 `ldap:` 段（不透明 yaml map）：双实例（default 服务账号 / ad ldaps）。
+    fn ldap_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.ldap = Some(serde_yaml::from_str(
+            "default:\n  url: ldap://dc.example.com:389\n  bind_dn: cn=svc,dc=example,dc=com\n  bind_pw: s\n  timeout_ms: 3000\nad:\n  url: ldaps://ad.internal:636\n",
+        )
+        .unwrap());
+        cfg
+    }
+
+    /// Given: 未配 `ldap:`（或空段）／配了但插件未加载；
+    /// Then: 不挂后端（None）——`ldap.*` 报 "ldap not configured"（与 mail 同语义）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_no_ldap_or_no_plugin_when_assemble_then_no_backend() {
+        assert!(
+            build_ldap_backend(&Config::default(), Some(&FAKE_LDAP))
+                .unwrap()
+                .is_none()
+        );
+        let empty = Config {
+            ldap: Some(serde_yaml::Value::Mapping(Default::default())),
+            ..Default::default()
+        };
+        assert!(
+            build_ldap_backend(&empty, Some(&FAKE_LDAP))
+                .unwrap()
+                .is_none()
+        );
+        assert!(build_ldap_backend(&ldap_cfg(), None).unwrap().is_none());
+    }
+
+    /// Given: 合法 `ldap:` 段 + 插件在册；Then: 后端就位，实例表与段一致，
+    /// 且调用确实经 vtable 过线（bind → true）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_ldap_section_when_assemble_then_backend_serves_calls() {
+        let b = build_ldap_backend(&ldap_cfg(), Some(&FAKE_LDAP))
+            .unwrap()
+            .expect("ldap 段 + 插件在册 → 后端就位");
+        assert_eq!(
+            b.config().instance_keys(),
+            vec!["ad".to_string(), "default".to_string()]
+        );
+        let v = b
+            .call(serde_json::json!({"op":"bind","key":"default","dn":"u","pw":"p"}))
+            .await
+            .unwrap();
+        assert_eq!(v, serde_json::json!(true));
+    }
+
+    /// Given: 配置写错（未知键/坏 url，经 `plugins.ldap` 透传进来）或双配置源皆非空；
+    /// Then: 装配期 Err —— 不静默忽略拼错的配置，不在透传/适配器间静默遮蔽。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_bad_ldap_cfg_when_assemble_then_err() {
+        let mut cfg = Config::default();
+        cfg.plugins.insert(
+            "ldap".into(),
+            serde_json::json!({"default": {"url": "http://x"}}),
+        );
+        assert!(build_ldap_backend(&cfg, Some(&FAKE_LDAP)).is_err());
+        // 双配置源：`ldap:` 段与 `plugins.ldap` 皆非空 → Err（二选一）。
+        let mut both = ldap_cfg();
+        both.plugins.insert(
+            "ldap".into(),
+            serde_json::json!({"other": {"url": "ldap://x:389"}}),
+        );
+        let e = match build_ldap_backend(&both, Some(&FAKE_LDAP)) {
+            Ok(_) => panic!("双配置源必须在装配期报错"),
+            Err(e) => e,
+        };
+        assert!(e.contains("pick one"), "{e}");
     }
 
     /// A4：停机排空 —— `drain_mail_backend` 必须把**控制报文**发给插件

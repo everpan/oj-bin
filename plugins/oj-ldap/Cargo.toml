@@ -1,0 +1,25 @@
+[package]
+name = "oj-ldap"
+version = "0.1.0"
+edition = "2024"
+description = "ldap 轴：ldap3 LDAP 客户端（目录查询 + bind-as-auth）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
+# 与仓库 rustls 纪律对齐（root Cargo.toml 注释「全图无 ring」）：
+# tls-rustls-aws-lc-rs = rustls 0.23 + aws-lc-rs provider，禁 default 的 tls-native。
+ldap3 = { version = "0.12.1", default-features = false, features = [
+    "sync",
+    "tls-rustls-aws-lc-rs",
+] }
+# 与根 crate 同版本锁定（root 亦 base64 0.23.x）：bin 属性值 base64 编码过线。
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

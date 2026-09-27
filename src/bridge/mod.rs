@@ -43,6 +43,7 @@ mod inspector;
 mod jsnum;
 mod json;
 mod kv;
+pub mod ldap;
 mod loader;
 mod log;
 pub mod mail;
@@ -73,6 +74,7 @@ pub use envelope::{fail, ok, status_code};
 pub use es::EsBackend;
 pub use http::{RequestInfo, UploadedFile};
 pub use kv::{InMemoryKV, KVStore};
+pub use ldap::{FfiLdapBackend, LdapBackend, LdapConfig};
 pub use loader::HandlerStore;
 // resolve_relative / resolve_alias 一并导出：oj build 的导入实化用**同一份探针**，
 // 使 dev 与 release 对同一 specifier 命中同一文件（dev 能跑 release 炸的一类缺陷）。
@@ -176,6 +178,8 @@ pub struct StableState {
     pub oidc: Option<Arc<oidc::OidcState>>,
     /// mail 后端（装配层按 smtp: 段 + oj-mail 插件注入）；None = mail.* 报 "mail not configured"。
     pub mail: Option<Arc<dyn mail::MailBackend>>,
+    /// ldap 后端（装配层按 ldap: 段 + oj-ldap 插件注入）；None = ldap.* 报 "ldap not configured"。
+    pub ldap: Option<Arc<dyn ldap::LdapBackend>>,
     /// 部署期常量（config `vars:` 段，v0.1.25）：`vars.get(name)` 的唯一数据源。
     /// **fail-closed**：只有这里声明的键可读（空表 = 全 null）。装配期冻结、只读。
     pub vars: Arc<HashMap<String, String>>,
@@ -213,6 +217,8 @@ pub struct Extras {
     /// mail 后端（装配层构造 `mail::FfiMailBackend`）；None = mail.* 未配置报错。
     /// 注入时构造期一并挂 `deliver("mail.result")` 路由（见 `mail::install_mail_deliver`）。
     pub mail: Option<Arc<dyn mail::MailBackend>>,
+    /// ldap 后端（装配层构造 `ldap::FfiLdapBackend`）；None = ldap.* 未配置报错。
+    pub ldap: Option<Arc<dyn ldap::LdapBackend>>,
     /// 命名 MQ 客户端（None = 空 registry，Kafka/RabbitMQ(name) → undefined）。
     pub kafkas: Option<Arc<NamedRegistry<mq::MqInstance>>>,
     pub rabbits: Option<Arc<NamedRegistry<mq::MqInstance>>>,
@@ -334,6 +340,7 @@ deno_core::extension!(
         mq::op_mq_call,
         mq::op_tasks_stopping,
         mq::op_tasks_sleep,
+        ldap::op_ldap_call,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
@@ -610,6 +617,7 @@ impl Bridge {
             tasks_flag: extras.tasks_flag,
             sql_memo: Mutex::new(HashMap::new()),
             mail: extras.mail,
+            ldap: extras.ldap,
             vars: extras.vars,
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
@@ -1835,6 +1843,7 @@ mod tests {
             tasks_flag: None,
             sql_memo: Mutex::new(HashMap::new()),
             mail: None,
+            ldap: None,
             vars: Arc::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
