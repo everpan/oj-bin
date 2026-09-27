@@ -664,9 +664,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(kv.get("down").await.unwrap().as_deref(), Some("1"));
-        assert_eq!(
-            kv.get("n").await.unwrap().unwrap().parse::<u64>().unwrap() >= 3,
-            true
+        assert!(
+            kv.get("n").await.unwrap().unwrap().parse::<u64>().unwrap() >= 3
         );
         // 双模式条目同时在册：counter=long（池化）、audit=long（TLA，监督器管状态，
         // 注册表不跟踪 TLA 运行态——它只是不在池注册表里出现……断言池表只含 counter）。
