@@ -1203,6 +1203,8 @@ json.ok({ sent: r.code === 0, messageId: r.data?.messageId });
 
 ### ldap —— LDAP 目录与鉴证（`ldap:` 段 + `oj-ldap` 插件启用）
 
+> 完整手册（鉴证模式/filter 注入防护/二进制属性/运维/已知限制）见 `docs/ldap-integration.md`。
+
 配顶层 `ldap:` 段即启用全局 `LDAP` / `ldap`（`ldap === new LDAP("default")`）；未配置时调用报
 `ldap not configured (config ldap: section missing, or oj-ldap plugin not loaded)`。
 **协议交互**在 `oj-ldap` 插件内（ldap3 客户端：每调用独立 connect → 服务账号绑定 → 操作 →

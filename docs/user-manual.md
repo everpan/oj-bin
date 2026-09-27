@@ -206,6 +206,13 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   落该目录（目录须先存在，测试/归档通道）。顶层 `smtp:` 与**非空** `plugins.mail` 不得并存
   （装配期报错）。API 与错误码见 `devkit/api-manual.md` §6「mail」；
   完整手册（架构/附件与 `sendRaw` 语义/反馈通道/安全/运维/已知限制）见 `docs/mail-smtp.md`。
+- `ldap`：可选 LDAP 目录/鉴证段（v0.1.28），存在即启用 `ldap.*` / `LDAP(key)`，需 **oj-ldap**
+  插件（未装不阻断启动，调用报 `ldap not configured`）。**每个顶层键 = 一个实例**（键名即
+  `LDAP(key)` 的 key，缺省 `"default"`），实例键 = `url`（仅 ldap://|ldaps://）/ `bind_dn` /
+  `bind_pw`（成对，服务账号）/ `timeout_ms` / `start_tls` / `tls_skip_verify`，未知键启动报错。
+  顶层 `ldap:` 与**非空** `plugins.ldap` 不得并存（装配期报错）。API 见
+  `devkit/api-manual.md` §6「ldap」；完整手册（鉴证模式/filter 注入防护/二进制属性/运维/已知限制）
+  见 `docs/ldap-integration.md`。
 - `plugins` / `plugins_dir`：插件装配。`plugins` 为 **map**，一段三用：键 = 要加载的插件名
   （非空 map = 严格清单，缺失 fail fast）；值 = 插件 cfg，**必须是 YAML 映射（对象）**。
   非空对象原样透传；空对象 = 回落轴适配器；字符串/列表等非对象值视为未提供，静默回落到

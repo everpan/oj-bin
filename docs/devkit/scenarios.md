@@ -802,7 +802,7 @@ ldap:
 const LDAP_FILTER_ESCAPES: Record<string, string> = {
   "\": "\5c", "*": "\2a", "(": "\28", ")": "\29", " ": "\00",
 };
-const esc = (s: string) => s.replace(/[\*()\0]/g, (c) => LDAP_FILTER_ESCAPES[c]);
+const esc = (s: string) => s.replace(/[\\*()\0]/g, (c) => LDAP_FILTER_ESCAPES[c]);
 
 export default {
   async post() {
