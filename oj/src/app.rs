@@ -26,8 +26,8 @@ use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
-    Bridge, DataAccessor, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx,
-    NamedRegistry, SchemaRegistry,
+    Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, NamedRegistry,
+    SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, SqlGuard, StableState};
 use only_js::config::{self, Config};
@@ -363,14 +363,11 @@ fn anon_view_of_route(pattern: &str, base: &str) -> String {
 
 /// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
 /// manifest(db/deps) → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx
-/// map（键 = 模块目录绝对路径，run_module 祖先命中注入）。`gate == "auto"` 时逐模块
-/// reconcile（§D1：安全前向只进 apply 路径，迁移后补声明漂移）。
+/// map（键 = 模块目录绝对路径，run_module 祖先命中注入）。reconcile 不在此
+/// 执行——由 server 装配层在迁移 gate 后显式调用 `schema::reconcile_all`（spec §2.2 #12）。
 async fn build_schema_and_modules(
     dir: &Path,
     ts: bool,
-    dbs: &std::collections::HashMap<String, Arc<dyn DataAccessor>>,
-    db_key: &str,
-    gate: &str,
     guard: SqlGuard,
     shared_allow: &[String],
 ) -> Result<
@@ -407,14 +404,6 @@ async fn build_schema_and_modules(
                 let shared = !tenant_flag && shared_allow.iter().any(|a| a == t);
                 // v0.1.24：带列类型装配（租户守卫按 tenant_id 列类型绑定数值/字符串）。
                 registry = registry.table_owned_shared_typed(&name, t, &pk, &cols, shared);
-            }
-            if gate == "auto" {
-                let acc = dbs
-                    .get(db_key)
-                    .ok_or_else(|| format!("schema.yaml requires db '{db_key}'"))?;
-                for l in crate::schema::reconcile(acc.as_ref(), &name, &f).await? {
-                    eprintln!("schema: {l}");
-                }
             }
         }
         module_map.insert(
@@ -763,30 +752,19 @@ pub async fn assemble_backend(
             "--db {o:?} not declared in config (db keys: {names:?})"
         ));
     }
-    let db_key: &str = db_override.unwrap_or("default");
     if let Some(o) = db_override {
         eprintln!("oj: default db redirected to {o:?} (migrate/seed/fixtures follow)");
     }
     // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
     let query_limits = cfg.db_query;
     query_limits.validate()?;
-    // schema/reconcile 的 gate 参数（gate 执行本身在 HTTP 层；reconcile 随
-    // build_schema_and_modules，独立化见后续任务）。
-    let gate = migrate_gate_of(cfg, ts);
+    // 迁移 gate 的执行留在 HTTP 层（from_config gate match）；此处仅做 schema 归属图。
     // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
     let ownership_deny = ownership_deny_of(cfg)?;
     let sql_guard = sql_guard_of(cfg);
-    // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
-    let (registry, modules) = build_schema_and_modules(
-        dir,
-        ts,
-        &dbs,
-        db_key,
-        gate,
-        sql_guard,
-        &cfg.tenant.shared_allow,
-    )
-    .await?;
+    // §4.8 归属图 + SchemaRegistry 复活。
+    let (registry, modules) =
+        build_schema_and_modules(dir, ts, sql_guard, &cfg.tenant.shared_allow).await?;
     // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
     // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
     let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
@@ -974,7 +952,19 @@ impl App {
         let gate = migrate_gate_of(&cfg, ts);
         let db_key: &str = db_override.as_deref().unwrap_or("default");
         match gate {
-            "auto" => crate::migrate::apply_all(stable.dbs.get(db_key), &dir, ts, false).await?,
+            "auto" => {
+                crate::migrate::apply_all(stable.dbs.get(db_key), &dir, ts, false).await?;
+                for l in crate::schema::reconcile_all(
+                    stable.dbs.get(db_key).map(|a| a.as_ref()),
+                    &dir,
+                    ts,
+                    db_key,
+                )
+                .await?
+                {
+                    eprintln!("schema: {l}");
+                }
+            }
             "verify" => crate::migrate::verify_all(stable.dbs.get(db_key), &dir, ts).await?,
             "off" => {}
             other => {

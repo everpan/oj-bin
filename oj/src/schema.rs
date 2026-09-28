@@ -518,7 +518,24 @@ pub async fn reconcile(
     Ok(log)
 }
 
-/// 声明 vs 实库只读对账（`oj schema diff`，§5.1 漂移层）：
+/// 逐模块 reconcile（gate=auto 时由 server 装配层显式调用，spec §2.2 #12）：
+/// discover 全模块 → SchemaFile::load → reconcile，汇聚日志。模块声明了 schema.yaml
+/// 而库缺失（`acc=None`）即 fail-fast。
+pub async fn reconcile_all(
+    acc: Option<&dyn DataAccessor>,
+    dir: &Path,
+    ts: bool,
+    db_key: &str,
+) -> Result<Vec<String>, String> {
+    let mut log = Vec::new();
+    for (name, mdir) in crate::manifest::discover(dir, ts)? {
+        if let Some(f) = SchemaFile::load(&mdir)? {
+            let acc = acc.ok_or_else(|| format!("schema.yaml requires db '{db_key}'"))?;
+            log.extend(reconcile(acc, &name, &f).await?);
+        }
+    }
+    Ok(log)
+}
 /// D001 缺表 / 缺列 / 多列 / 缺索引；D002 实库有而无任何模块声明（排除
 /// `_oj_migrations%` 账本与 `sqlite_%` 内部表）。类型漂移不比对（方言类型
 /// 反查长尾，手写迁移场景人工核）。返回报告行（空 = 一致）。
@@ -584,6 +601,21 @@ tables:
 
     fn user_schema() -> SchemaFile {
         SchemaFile::parse(USER_YAML).unwrap()
+    }
+
+    /// 拆分契约（spec §2.2 #12）：reconcile_all 独立可调用——空模块目录返回空日志，
+    /// 不再内嵌于 build_schema_and_modules。
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_all_on_empty_dir_returns_empty_log() {
+        let dir = std::env::temp_dir().join(format!("oj-reconcile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let acc = only_js::bridge::InMemoryAccessor::new();
+        let lines = reconcile_all(Some(&acc), &dir, true, "default")
+            .await
+            .unwrap();
+        assert!(lines.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
