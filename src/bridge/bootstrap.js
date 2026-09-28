@@ -14,6 +14,7 @@ import {
   op_blob_get,
   op_blob_put,
   op_blob_url,
+  op_blob_upload_url,
   op_blob_content_type,
   op_bus_publish,
   op_bus_publish_bin,
@@ -73,10 +74,15 @@ import {
   op_jwt_verify,
   op_random_hex,
   op_sha256_hex,
+  op_crypto_random,
   op_vars_get,
   op_ws_send,
   op_ws_send_bin,
   op_ws_frame_close,
+  op_ws_join,
+  op_ws_leave,
+  op_ws_broadcast,
+  op_ws_room_size,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -358,6 +364,9 @@ globalThis.blob = (name) => ({
   get: (key) => op_blob_get(String(name), String(key)),
   del: (key) => op_blob_del(String(name), String(key)),
   url: (key) => op_blob_url(String(name), String(key)),
+  // uploadUrl(key, opts?) -> presigned direct-upload JSON (v0.1.30); s3 only
+  // (local backend: use the direct PUT route instead; the error says so).
+  uploadUrl: (key, opts) => op_blob_upload_url(String(name), String(key), opts === undefined ? null : JSON.stringify(opts)),
   contentType: (key) => op_blob_content_type(String(name), String(key)),
 });
 // back-compat: blob.put(...) === blob("default").put(...)
@@ -434,13 +443,28 @@ globalThis.tasks = {
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
 // send: string -> text frame; Uint8Array/ArrayBuffer -> binary frame (opcode 0x2, v0.1.16).
+// rooms (v0.1.30): same-process fanout. join/leave need a ws handler context (sess id);
+// broadcast also works from HTTP handlers (conn = 0 -> exclude nobody); echo to self is
+// the caller's job (socket.io semantics). roomSize is callable anywhere.
 globalThis.ws = {
   send: (data) =>
     typeof data === "string"
       ? op_ws_send(data)
       : op_ws_send_bin(data instanceof ArrayBuffer ? new Uint8Array(data) : data),
   close: () => op_ws_frame_close(),
+  join: (room) => op_ws_join(String(room), wsConnId(true)),
+  leave: (room) => op_ws_leave(String(room), wsConnId(true)),
+  broadcast: (room, data) => op_ws_broadcast(String(room), String(data), wsConnId(false)),
+  roomSize: (room) => op_ws_room_size(String(room)),
 };
+
+// WS connection id injected per frame (__ws_conn); strict = throw outside ws handler.
+function wsConnId(strict) {
+  const c = globalThis.__ws_conn;
+  if (typeof c === "number" && c > 0) return c;
+  if (strict) throw new Error("ws.join/leave: available only inside a ws handler");
+  return 0;
+}
 
 // ----- WebSocket: outbound WHATWG client (tasks + handlers; no task-context gate:
 // a connection carries no offset/ack consumer session, unlike MQ poll) -----
@@ -767,4 +791,63 @@ globalThis.oidc = (() => {
 globalThis.crypto = Object.assign(globalThis.crypto || {}, {
   sha256Hex: (s) => op_sha256_hex(String(s)),
   randomHex: (n) => op_random_hex(n === undefined ? null : n | 0),
+  // WebCrypto shape: fill any TypedArray view (wasm-bindgen glue depends on it).
+  // ponytail: op caps at 65536, no re-check here; non-view throws TypeError.
+  getRandomValues: (view) => {
+    if (!ArrayBuffer.isView(view)) {
+      throw new TypeError("crypto.getRandomValues: argument must be a TypedArray view");
+    }
+    const bytes = op_crypto_random(view.byteLength);
+    new Uint8Array(view.buffer, view.byteOffset, view.byteLength).set(bytes);
+    return view;
+  },
 });
+
+// ----- base64: atob/btoa globals (wasm-bindgen glue; same algorithm as the oidc inline helper) -----
+(function () {
+  const B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const WS = /[ \t\n\r\f]/;
+  const INVALID = "InvalidCharacterError: The string to be decoded is not correctly encoded.";
+  globalThis.atob = (input) => {
+    let clean = "";
+    for (const c of String(input)) {
+      if (WS.test(c)) continue;
+      if (c === "=" && clean.length >= 2) break; // tolerate trailing padding
+      clean += c;
+    }
+    if (clean.length % 4 === 1) throw new Error(INVALID);
+    let out = "";
+    let bits = 0;
+    let acc = 0;
+    for (const c of clean) {
+      const v = B.indexOf(c);
+      if (v < 0) throw new Error(INVALID);
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((acc >> bits) & 0xff);
+      }
+    }
+    return out;
+  };
+  globalThis.btoa = (input) => {
+    const s = String(input);
+    let out = "";
+    for (let i = 0; i < s.length; i += 3) {
+      const c0 = s.charCodeAt(i);
+      const c1 = i + 1 < s.length ? s.charCodeAt(i + 1) : null;
+      const c2 = i + 2 < s.length ? s.charCodeAt(i + 2) : null;
+      if (c0 > 255 || (c1 !== null && c1 > 255) || (c2 !== null && c2 > 255)) {
+        throw new Error(
+          "InvalidCharacterError: The string to be encoded contains characters outside of the Latin1 range."
+        );
+      }
+      const n = (c0 << 16) | ((c1 || 0) << 8) | (c2 || 0);
+      out += B[(n >> 18) & 63] + B[(n >> 12) & 63] +
+        (c1 !== null ? B[(n >> 6) & 63] : "=") +
+        (c2 !== null ? B[n & 63] : "=");
+    }
+    return out;
+  };
+})();

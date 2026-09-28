@@ -192,6 +192,14 @@ interface KVApi {
 interface WSApi {
   send(data: string | Uint8Array): void;
   close(): void;
+  // 房间原语（v0.1.30，进程内单例 hub；跨实例扇出仍走 bus.publish）：
+  // join/leave 仅在 ws.ts 生命周期钩子内可用（连接身份自动取，断连自动摘除）；
+  // broadcast 为 socket.io 除己语义（发送者要回声自己在 JS 里发），HTTP handler 可调
+  // （无连接身份 = 不排除任何人）；roomSize 任意上下文可调。
+  join(room: string): void;
+  leave(room: string): void;
+  broadcast(room: string, data: string): number;
+  roomSize(room: string): number;
 }
 
 // sess.* ：WS 帧池的会话上下文（v0.1.10 帧池模型；**只在 ws.ts 的生命周期钩子内存在**——
@@ -215,6 +223,10 @@ interface BlobApi {
   del(key: string): Promise<boolean>;
   // local = {base}/blob/{key}；s3 = presigned URL（15min）。
   url(key: string): Promise<string>;
+  // 上传直传预签名（v0.1.30）：s3 返回 15min 预签名 PUT URL（客户端直传不经 handler，
+  // 绕开 max_upload_bytes/30s）；opts 缺省 {"kind":"put"}。local 后端无预签名——抛错，
+  // 改用直传路由 PUT {base}/blob/{key}（上限 server.blob_upload_max_bytes，默认 1 GiB）。
+  uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>;
   // local 缺失 sidecar 且无法按扩展名推断时返回空串；s3 无 Content-Type 时返回 null。
   contentType(key: string): Promise<string | null>;
 }
@@ -436,11 +448,15 @@ declare global {
   /** number | 数字串（含科学计数法）| bigint → number（f64，**显式接受精度丢失**）。 */
   function toDouble(v: string | number | bigint): number;
 
-  // crypto 增补（bootstrap 对原生 crypto 做 Object.assign 合并，原生成员保留）：
-  // sha256Hex = 十六进制摘要；randomHex = nBytes 字节随机数的 hex（默认 32 字节）。
+  // crypto 增补（bootstrap 对 crypto 做 Object.assign 合并）：
+  // sha256Hex = 十六进制摘要；randomHex = nBytes 字节随机数的 hex（默认 32 字节）；
+  // getRandomValues（v0.1.30）= oj 实现（原生不存在）：任意 TypedArray view 填充后
+  // 返回原 view，非 view 抛 TypeError，单次 ≤65536 字节（对齐 WebCrypto；lib.dom 的
+  // 同名声明只是兜底，运行时是 oj 实现）。
   interface Crypto {
     sha256Hex(s: string): string;
     randomHex(nBytes?: number): string;
+    getRandomValues<T extends ArrayBufferView>(view: T): T;
   }
 
   // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----

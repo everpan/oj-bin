@@ -19,6 +19,11 @@
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
 | [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + stdout 直出（v0.1.29） | §11 `oj exec` |
+| [13](#场景-13大文件直传绕开-10mb30s-v0130) | office 大附件 >10MB / 上传+处理超 30s：`blob.uploadUrl` 预签名（s3）或 `PUT {base}/blob/{key}` 直传路由（local）（v0.1.30） | §6 blob |
+| [14](#场景-14浏览器登录cookie-会话--csrf-v0130) | 浏览器表单登录：HttpOnly `oj_sess` + CSRF 双提交；WS 握手同守卫（v0.1.30） | §8 鉴权 |
+| [15](#场景-15ws-房间广播presence-v0130) | 同房间成员互发消息/在线人数：`ws.join` / `ws.broadcast` / `ws.roomSize`（v0.1.30） | §6 ws |
+| [16](#场景-16带-exports-的包与-pnpm-布局v0130) | 现代 npm 包（`exports` 条件导出）与 pnpm 安装的解析约定；CJS 相对 require（v0.1.30） | §5 导入解析 |
+| [17](#场景-17wasm-引擎包进-oj-runtimev0130) | wasm-bindgen 类引擎包（PDF/字体/shaping）的加载前置检查清单（v0.1.30） | §6 crypto |
 
 ---
 
@@ -898,6 +903,221 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 | `sql_guard: "deny"` 库上查询被拦 | exec 无 HTTP 上下文 = 匿名操作员，且守卫不设防；被 deny 拦的查询加 `await db.asSystem()` |
 | 脚本卡死不退 | exec 无超时/KillSwitch——同步死循环只能 Ctrl-C；常驻轮询搬进 `src/tasks/` 任务池 |
 | `--log-file` 没生成 | 打开失败只 warn 一次不中断——看 stderr 首行（路径不可写等） |
+
+---
+
+## 场景 13：大文件直传绕开 10MB/30s（v0.1.30）
+
+**什么时候用**：office 附件动辄几十 MB，两条路都会撞墙——`http.file()` 受
+`server.max_upload_bytes`（10MB）413；上传后进 handler 解析又撞全局 `server.timeout`
+（30s → 408）。直传让**客户端把字节直接送存储**，oj 只经手元信息。
+
+### ① s3 后端：预签名直传
+
+```ts
+// src/files/api.ts —— initiate：只发 URL，不碰字节
+export default {
+  async post() {
+    const key = `uploads/${crypto.randomHex(8)}-${http.body.filename}`;
+    const { url } = await blob.uploadUrl(key);          // 15min 预签名 PUT
+    json.ok({ key, upload_url: url });
+  },
+};
+// 客户端：curl -X PUT --data-binary @big.docx "<upload_url>"
+// 定稿后再调一个业务路由把 key 记进表——权限/审计都在元信息层
+```
+
+### ② local 后端：直传路由
+
+`blob.uploadUrl` 在 local 会抛 `local blob backend has no upload presign; use the
+direct PUT upload route`——用内置直传路由：
+
+```bash
+curl -X PUT --data-binary @big.docx \
+  -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9778/v1/api/blob/uploads/report.docx
+# 200 {"code":0,...}；上限 server.blob_upload_max_bytes（默认 1 GiB，413 信封）
+```
+
+**路由过鉴权守卫**（Bearer/cookie 即令牌），不经 JsActor（无 30s）。下载侧 local
+内联自动支持 `Range`（206 + Content-Range；越界 416）——pdf.js/视频 seek 直接可用。
+
+### ③ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| PUT 413 | 直传腿看 `blob_upload_max_bytes`（1 GiB），**不是** `max_upload_bytes`；改后者没用 |
+| PUT 401 | 直传路由过守卫——头没带或 cookie 过期（WS/cookie 语义见场景 14） |
+| `blob.uploadUrl` multipart 报 not supported | s3 插件只预签名单发 PUT（object_store 无 multipart presign API）；>1 GiB 分片是已知限制 |
+| 大文件处理仍 408 | 直传只解决**存**字节；解析/转换仍走业务路由——给该路由配 `route_timeouts`（见 §10） |
+
+---
+
+## 场景 14：浏览器登录 cookie 会话 + CSRF（v0.1.30）
+
+**什么时候用**：Web 前端登录。Bearer token 存浏览器哪都是问题（localStorage 被
+XSS 拖走）；httpOnly cookie + 双提交 CSRF 是浏览器安全模型正解。CLI/MCP 继续 Bearer。
+
+### ① 配置
+
+```yaml
+auth:
+  jwt_secret: "change-me"
+  anonymous_paths: ["/auth/**"]        # login/logout 端点必须匿名（业务路由，不是内置路由）
+  cookie:
+    enabled: true
+    same_site: Lax                     # 跨站前端改 None + secure: true
+    # name/same_site/secure/ttl_secs/csrf_cookie/csrf_header 均有缺省，见 §8
+```
+
+### ② 登录端点（签发是业务职责；sample/src/auth/ 有参考实现）
+
+```ts
+// src/auth/login/api.ts
+export default {
+  post() {
+    const { username, password } = http.body;
+    const row = db.table("users").where("username", username).first();
+    if (!row || !bcrypt.verify(password, row.password_hash)) json.fail(401, "invalid credentials");
+    const token = jwt.sign({ sub: row.id, roles: JSON.parse(row.roles) }, { expiresIn: 86400 });
+    const csrf = crypto.randomHex(16);
+    json.header("set-cookie",
+      `oj_sess=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
+    json.header("x-csrf-token", csrf);   // 同时经响应头发给前端（非 HttpOnly cookie 亦可）
+    json.ok({ user: { id: row.id, roles: JSON.parse(row.roles) }, csrf_token: csrf });
+  },
+};
+```
+
+### ③ 前端约定
+
+会话 cookie 浏览器自动带（WS 握手也是——**WS 升级过同一守卫**，401 不升级）。
+非 GET/HEAD/OPTIONS 请求把登录拿到的 csrf 值回头发：
+
+```ts
+fetch("/v1/api/doc/save", { method: "POST", headers: { "x-csrf-token": csrf } });
+```
+
+守卫判定序：匿名 → Bearer → cookie 会话（cookie 值 = 同 secret 的 JWT，过期/篡改统一
+401 `missing or invalid bearer token`）→ cookie 会话的非安全方法再查 CSRF 头与
+csrf cookie 相等，否则 401 `missing or invalid csrf token`。Bearer 命中的请求不查 CSRF。
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| GET 通、POST 401 `missing or invalid csrf token` | 双提交缺头/值不等；前端须把 csrf 值存内存并回传 |
+| 升级 v0.1.30 后 WS 连不上（401） | **行为变更**：WS 握手过守卫了——ws 路径加 `anonymous_paths`（浏览器 cookie 形态自动过） |
+| SameSite=Lax 跨站 POST 不带 cookie | 跨站前端要 `SameSite=None; Secure`（HTTPS） |
+| logout 后还能访问 | access JWT 在 cookie 过期前仍有效——短 `ttl_secs` 或维护服务端黑名单 |
+
+---
+
+## 场景 15：WS 房间广播 / presence（v0.1.30）
+
+**什么时候用**：协作文档的房间消息、在线人数、抢锁通知。此前只有 `bus.publish`
+（按 topic 全扇出、自己也能收到），房间是**连接分组**语义：join/broadcast/leave。
+
+### ① ws.ts 生命周期钩子
+
+```ts
+// src/room/ws.ts —— 目录镜像路由即 WS 端点
+export function connection() {
+  ws.join(`doc:${sess.state.docId}`);        // 连接身份自动取；断连自动摘除
+  ws.broadcast(`doc:${sess.state.docId}`, JSON.stringify({ type: "presence", size: ws.roomSize(`doc:${sess.state.docId}`) }));
+}
+export function message() {
+  const m = JSON.parse(http.body);            // 注意：WS 文本帧 http.body 是已解析的 JSON 值，别再 JSON.parse
+  ws.broadcast(`doc:${m.docId}`, JSON.stringify({ from: sess.id, op: m.op }));
+}
+```
+
+```ts
+// src/room/status/api.ts —— HTTP 也可查/可发
+export default {
+  get() {
+    json.ok({ online: ws.roomSize(`doc:${http.param("id", "")}`) });
+  },
+};
+```
+
+### ② 语义速记
+
+- `ws.broadcast(room, data)` → 送达数，**除己**（socket.io 语义）——发送者要回声自己就在
+  JS 里补发；`bus.publish` 是含己自回声，两者别混。
+- 房间是**进程内**单例：多实例部署的跨机扇出仍走 `bus.publish`（rooms 单机房够用）。
+- HTTP handler 调 `broadcast` 不排除任何人（无连接身份），适合服务端系统通知。
+
+### ③ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| `ws.join` 报错 / 无效果 | join/leave 仅 ws.ts 生命周期钩子内可用；HTTP 路径没有连接身份 |
+| 断线重连后房间成员没清 | 不会——所有退出路径自动摘除；presence 以 roomSize 为准别自建计数 |
+| broadcast 返回 0 | 房间没人（join 未生效或成员已断）；诊断先查 `ws.roomSize` |
+
+---
+
+## 场景 16：带 `exports` 的包与 pnpm 布局（v0.1.30）
+
+**什么时候用**：引入现代 npm 包（`exports` 条件导出的 ESM 包、pnpm 安装的项目）。
+v0.1.30 起解析完整对齐 Node：`exports` 封闭语义 + pnpm 符号链接布局 + CJS 相对 require。
+
+### ① 直接可用
+
+```ts
+import { parse } from "fast-xml-parser";      // exports 条件导出（import 条件命中）
+import pdfLib from "pdf-lib";                  // ESM/CJS 混合包（相对 require 链已支持）
+import { thing } from "@scope/pkg/sub";        // 子路径 exports 键
+```
+
+- pnpm 安装无需特殊配置：解析全程不 realpath，`.pnpm/<pkg>@<ver>` 符号链接视图直读。
+- CJS 包内 `require("./sib")` / `require("./data.json")` 可用；循环 require 返回部分
+  exports（Node 语义）。
+
+### ② 报错对照
+
+| 报错 | 含义 |
+|---|---|
+| `Package subpath 'x' is not defined by "exports" in <pkg>/package.json` | 有 `exports` 即封闭语义：该子路径未导出，**不回落** `main`/`module`（Node 一致）。查包文档的真实导出键 |
+| `Node builtin 'path' is not available in oj runtime` | 该包引了 Node 内建——找其 browser/wasm 构建（同场景 17） |
+| 相对 require 报 escapes project root | `../../` 越出项目根被钳——包应装在其 node_modules 内，别手工指外 |
+
+### ③ 仍不支持的（v0.2 已知限制）
+
+`exports` 的 `types`/`browser` 条件不命中（取 import/require/node/default）；CJS 的
+`module.exports = function(){...}` 替换式启发式识别可能漏。`oj build` 依旧不打包
+node_modules——发布物自带（场景表「npm 依赖不打包进 tgz」）。
+
+---
+
+## 场景 17：wasm 引擎包进 oj runtime（v0.1.30）
+
+**什么时候用**：评估把 PDF/字体/shaping 等 wasm 引擎包（pdfium/harfbuzzjs/pdf-lib 类）
+跑进 oj runtime，替代独立 Node worker。
+
+### ① 已验证可用的胶水面
+
+`WebAssembly.instantiate`（V8 内建，L1 实测）+ `atob`/`btoa`（标准 base64）+
+`crypto.getRandomValues(view)`（任意 TypedArray，≤65536 字节/次）——wasm-bindgen 胶水
+的三件套已齐。`TextDecoder`/`fetch` 等 Web 面此前已有。
+
+### ② 引擎包兼容性清单（逐包勾选，避免凭记忆重验）
+
+| 检查项 | 通过条件 |
+|---|---|
+| 解析 | 包的 `exports`/`main` 能被场景 16 的解析命中（L1：`import` 即通） |
+| wasm 实例化 | 包内 `*.wasm` 内嵌或经 URL 加载——内嵌字节走 `WebAssembly.instantiate(bytes)` 必通 |
+| Web API 面 | grep 包产物对 `atob`/`crypto.getRandomValues`/`TextDecoder`/Node 内建的引用：内建引用 → 需要 browser/wasm 构建 |
+| 运行冒烟 | L1 用例：包的最小调用链在 `oj test` 内跑通 |
+
+### ③ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 胶水报 `atob is not defined` / `getRandomValues is not defined`（旧版 oj） | v0.1.30 前无这两个全局——升级；之后仍报说明包引了别的 Web API，按清单补 |
+| `Node builtin 'fs' is not available` | 包用了 Node 构建——换其 browser/esm 入口（看 package.json `exports` 的 browser 条件；oj 不命中 browser 条件时可试包提供的显式 browser bundle 路径） |
+| wasm 字节从哪来 | 多数包把 wasm base64 内嵌进 JS（正好走 `atob`）；独立 `.wasm` 文件经 `fetch(相对/绝对 URL)` 或 `blob.get` 取字节再 instantiate |
 
 ---
 

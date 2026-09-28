@@ -77,41 +77,93 @@ pub fn echo_route() -> axum::Router {
 /// （per-conn 串行保序），json.ok 信封与 ws.send 逐事件写回；单事件熔断超时
 /// 由池内看门狗承担（RoutePool 构造时注入，超时必断连）；
 /// opts.max_connections 为全局并发连接上限（0 = 不限），超限 upgrade 直接 503。
+///
+/// 无鉴权形态（测试/无守卫部署）；生产走 js_route_guarded。
 pub fn js_route(path: &str, pool: Arc<RoutePool>, opts: WsOptions) -> axum::Router {
+    js_route_guarded(path, "", pool, opts, None)
+}
+
+/// 守卫形态：upgrade 前过 AuthGuard（path_no_base = base 之后路径，与 HTTP 管线
+/// 同语义；WS 握手 = GET 方法、cookie 为唯一凭证形态——浏览器 WS 发不了
+/// Authorization 头，Bearer 经 query token 的变体本期不做，见 04-oj-upstream-prs）。
+/// Err → 401 不升级；Ok(None)（匿名路径）与 Ok(Some(user)) 都放行。
+pub fn js_route_guarded(
+    path: &str,
+    path_no_base: &str,
+    pool: Arc<RoutePool>,
+    opts: WsOptions,
+    guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
+) -> axum::Router {
+    let path_no_base = path_no_base.to_string();
     axum::Router::new().route(
         path,
-        axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
-            let pool = pool.clone();
-            async move {
-                if !gate_enter(opts.max_connections) {
-                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        axum::routing::get(
+            move |ws: axum::extract::WebSocketUpgrade, headers: axum::http::HeaderMap| {
+                let pool = pool.clone();
+                let path_no_base = path_no_base.clone();
+                async move {
+                    if let Some(g) = &guard {
+                        let authz = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok());
+                        // 与 server::run_route 同构：全部请求头 JSON（小写名 → 值）。
+                        let headers_json = serde_json::to_string(
+                            &headers
+                                .iter()
+                                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                                .collect::<std::collections::HashMap<_, _>>(),
+                        )
+                        .unwrap_or_default();
+                        if let Err(msg) = g.verify(&path_no_base, "GET", authz, Some(&headers_json))
+                        {
+                            return fail_response(401, &msg);
+                        }
+                    }
+                    if !gate_enter(opts.max_connections) {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    // 槽位归还两条路径共享一份 Arc<GateGuard>：upgrade 半路失败
+                    // （客户端握手后即 RST，axum 走 on_failed_upgrade、永不 spawn
+                    // on_upgrade 回调）与连接真实结束各持一个克隆，GateGuard 恰 drop
+                    // 一次——缺了 failed 路径，反复 connect+RST 可永久打满闸门（DoS）。
+                    let gate = Arc::new(GateGuard);
+                    let failed_gate = Arc::clone(&gate);
+                    ws.on_failed_upgrade(move |_err| drop(failed_gate))
+                        .on_upgrade(move |socket| async move {
+                            // 连接真实结束（正常收尾/panic/任务取消）才递减闸门计数。
+                            let _gate = gate;
+                            frame_loop(socket, pool).await;
+                        })
                 }
-                // 槽位归还两条路径共享一份 Arc<GateGuard>：upgrade 半路失败
-                // （客户端握手后即 RST，axum 走 on_failed_upgrade、永不 spawn
-                // on_upgrade 回调）与连接真实结束各持一个克隆，GateGuard 恰 drop
-                // 一次——缺了 failed 路径，反复 connect+RST 可永久打满闸门（DoS）。
-                let gate = Arc::new(GateGuard);
-                let failed_gate = Arc::clone(&gate);
-                ws.on_failed_upgrade(move |_err| drop(failed_gate))
-                    .on_upgrade(move |socket| async move {
-                        // 连接真实结束（正常收尾/panic/任务取消）才递减闸门计数。
-                        let _gate = gate;
-                        frame_loop(socket, pool).await;
-                    })
-            }
-        }),
+            },
+        ),
     )
+}
+
+/// 401 信封（与 tasks.rs fail_response 同形；ws.rs 自带一份避免跨模块伸手）。
+fn fail_response(status: u16, msg: &str) -> Response {
+    let (body, _) = only_js::bridge::fail(status as i32, msg, &serde_json::Value::Null);
+    let mut r = Response::new(axum::body::Body::from(body));
+    *r.status_mut() = axum::http::StatusCode::from_u16(status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    r.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    r
 }
 
 /// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/ws.ts（优先）/ws.js → GET {base}/<dir>/ws；
 /// 根级 ws.ts → {base}/ws；无 WS 文件返回空 Router（merge 无副作用）。
 /// release 下 root=dist，URL 含模块版本段（news-0.1.0/ws）——v0.2 已知限制，见 user-manual。
+/// guard（oj-4）：WS 握手升级前过鉴权（path_no_base = {rel}/ws，与 anonymous_paths 同根）。
 pub fn mirror_routes(
     base: &str,
     root: &Path,
     timeout: std::time::Duration,
     make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
     opts: WsOptions,
+    guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
 ) -> axum::Router {
     let make = Arc::new(make_bridge);
     let base = format!("/{}/", base.trim_matches('/'));
@@ -132,6 +184,13 @@ pub fn mirror_routes(
         if !seen.insert(path.clone()) {
             continue; // 同目录 ws.ts 与 ws.js 并存：先到者（.ts）胜
         }
+        // path_no_base（守卫面）：与 HTTP 管线的 path_no_base 同根——{rel}/ws，
+        // 根级 ws 为 "/ws"；anonymous_paths 里 WS 路由按此形态声明。
+        let path_no_base = if rel.is_empty() {
+            "/ws".to_string()
+        } else {
+            format!("/{rel}/ws")
+        };
         // 每路由一池：worker 数与空池保活来自 ws 配置段。
         let pool = RoutePool::new(
             file,
@@ -140,7 +199,13 @@ pub fn mirror_routes(
             opts.workers_per_route,
             opts.idle_linger_ms,
         );
-        router = router.merge(js_route(&path, pool, opts));
+        router = router.merge(js_route_guarded(
+            &path,
+            &path_no_base,
+            pool,
+            opts,
+            guard.clone(),
+        ));
     }
     router
 }
@@ -966,6 +1031,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),
+                None,
             )),
         )
         .await;
@@ -1033,6 +1099,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),
+                None,
             )),
         )
         .await;
@@ -1092,6 +1159,88 @@ mod tests {
             ),
         };
         assert!(clean, "expected close or reset, got {res:?}");
+    }
+
+    /// oj-4：守卫形态的 js_route——带守卫时无凭证握手 401 不升级；匿名路径放行。
+    #[tokio::test]
+    async fn js_route_guarded_handshake_auth() {
+        let _e2e = ws_e2e_lock();
+        struct CookieGuard;
+        impl only_js::bridge::AuthGuard for CookieGuard {
+            fn verify(
+                &self,
+                path: &str,
+                _method: &str,
+                _auth: Option<&str>,
+                headers: Option<&str>,
+            ) -> Result<Option<serde_json::Value>, String> {
+                if path == "/pub/ws" {
+                    return Ok(None);
+                }
+                // 模拟 cookie 会话：cookie 头含 oj_sess=good → 放行。
+                match headers.and_then(|h| h.contains("oj_sess=good").then_some(h)) {
+                    Some(_) => Ok(Some(serde_json::json!({"id": "1", "roles": []}))),
+                    None => Err("missing or invalid bearer token".into()),
+                }
+            }
+        }
+        let t = crate::tests::routes(&[]);
+        let pool_root = t.0.clone();
+        let addr = spawn(axum::Router::new().merge(js_route_guarded(
+            "/ws/priv",
+            "/priv/ws",
+            test_pool(
+                &pool_root.join("nope.js"),
+                std::time::Duration::from_secs(1),
+            ),
+            WsOptions::default(),
+            Some(Arc::new(CookieGuard) as Arc<dyn only_js::bridge::AuthGuard>),
+        )))
+        .await;
+
+        // 无凭证：握手应得 401（不升级）。
+        let status = raw_handshake(addr, "/ws/priv", &[]).await;
+        assert_eq!(status, 401, "no credentials must not upgrade");
+        // 带 session cookie：升级成功（101）。
+        let status = raw_handshake(addr, "/ws/priv", &[("Cookie", "oj_sess=good")]).await;
+        assert_eq!(status, 101, "cookie session must upgrade");
+
+        // 匿名路径：无凭证也 101。
+        let addr = spawn(axum::Router::new().merge(js_route_guarded(
+            "/ws/pub",
+            "/pub/ws",
+            test_pool(&t.0.join("nope.js"), std::time::Duration::from_secs(1)),
+            WsOptions::default(),
+            Some(Arc::new(CookieGuard) as Arc<dyn only_js::bridge::AuthGuard>),
+        )))
+        .await;
+        let status = raw_handshake(addr, "/ws/pub", &[]).await;
+        assert_eq!(status, 101, "anonymous ws path must upgrade");
+    }
+
+    /// 原始 WS 握手（含 Upgrade 头），返回 HTTP 状态码（101 = 升级成功）。
+    async fn raw_handshake(
+        addr: std::net::SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        );
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = s.read(&mut buf).await.unwrap();
+        let head = String::from_utf8_lossy(&buf[..n]);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
     }
 
     /// 帧内 bus.publish（教学案例 sample/src/news/chat/ws.ts 的回归钉）：
@@ -1168,6 +1317,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),
+                None,
             )),
         )
         .await;

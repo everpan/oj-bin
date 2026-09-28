@@ -119,6 +119,29 @@ impl BlobPluginState {
             .to_string();
         Ok(u.into_bytes())
     }
+
+    /// ABI 9 上传直传预签名。object_store 的 `signed_url` 覆盖单发 PUT；
+    /// multipart 预签名（Create/UploadPart/Complete）不在 object_store API 面内——
+    /// ponytail：单发 PUT 已解决 10MB/30s 上限（直传不进 handler），multipart 预留 op
+    /// 语义、当前返回 Err（>100MB 超大文件待真实需求再手写 SigV4 三段预签名）。
+    async fn do_upload_url(&self, handle: u64, key: &str, op: &str) -> Result<Vec<u8>, String> {
+        let path = os_path(key)?;
+        let v: serde_json::Value =
+            serde_json::from_str(op).map_err(|e| format!("blob s3 upload_url op: {e}"))?;
+        let kind = v["kind"].as_str().unwrap_or("");
+        if kind != "put" {
+            return Err(format!(
+                "blob s3 upload_url: multipart '{kind}' presign not supported"
+            ));
+        }
+        let u = self
+            .store(handle)?
+            .signed_url(Method::PUT, &path, std::time::Duration::from_secs(15 * 60))
+            .await
+            .map_err(|e| format!("blob s3 sign: {e}"))?
+            .to_string();
+        Ok(format!(r#"{{"url":{u:?}}}"#).into_bytes())
+    }
 }
 
 /// 配置校验 + 建 store（bucket/region 必填 fail-fast；endpoint/access_key/secret_key 可选）。
@@ -210,6 +233,16 @@ extern "C" fn url(handle: u64, key: RString) -> FfiFuture {
     })
 }
 
+/// ABI 9 上传直传预签名（put / multipart 四态，op JSON 语义见 oj-plugin-ffi blob.rs）。
+extern "C" fn upload_url(handle: u64, key: RString, op: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_upload_url(handle, &key[..], &op[..]).await
+        })
+    })
+}
+
 /// content_type：S3 侧对象自身元数据负责 → 恒 None（空串）。key 校验语义与 core 对齐。
 extern "C" fn content_type(_handle: u64, key: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
@@ -232,6 +265,7 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
     get,
     del,
     url,
+    upload_url,
     content_type,
     close,
 };

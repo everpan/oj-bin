@@ -369,6 +369,7 @@ fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String
                     None => cfg.server.static_sites.push(StaticSiteConf {
                         prefix: p,
                         path: dir,
+                        headers: Default::default(),
                     }),
                 }
             }
@@ -604,13 +605,19 @@ pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
             None => "{}".to_string(),
         },
         "auth" => match &cfg.auth {
-            Some(a) => serde_json::json!({
-                "jwt_secret": a.jwt_secret,
-                "signing_method": a.signing_method,
-                // 插件只吃路径字符串（v0.1.23 起宿主支持条目对象形态，插件侧零改动）。
-                "anonymous_paths": only_js::config::anon_paths(&a.anonymous_paths),
-            })
-            .to_string(),
+            Some(a) => {
+                let mut v = serde_json::json!({
+                    "jwt_secret": a.jwt_secret,
+                    "signing_method": a.signing_method,
+                    // 插件只吃路径字符串（v0.1.23 起宿主支持条目对象形态，插件侧零改动）。
+                    "anonymous_paths": only_js::config::anon_paths(&a.anonymous_paths),
+                });
+                // oj-4：cookie 会话形态原样透传（schema 归插件；缺省不带该键 = 关闭）。
+                if let Some(c) = &a.cookie {
+                    v["cookie"] = c.clone();
+                }
+                v.to_string()
+            }
             None => "{}".to_string(),
         },
         // mail（spec 2026-09-15）：顶层 `smtp:` 段 → oj-mail 插件 cfg。
@@ -1144,6 +1151,7 @@ mod tests {
         c.server.static_sites.push(StaticSiteConf {
             prefix: "/docs/".into(),
             path: "old".into(),
+            headers: Default::default(),
         });
         fold_cli_app_paths(&mut c, &["/docs=new".into(), "/app=dist/app".into()]).unwrap();
         assert_eq!(c.server.static_sites.len(), 2);
@@ -2342,7 +2350,12 @@ mod tests {
             .expect("auth vtable slot must be wired from the plugin");
         let guard = only_js::bridge::plugin_loader::auth_guard_from_vtable(vt);
         // 匿名路径 → None（放行，无 token 也行）
-        assert!(guard.verify("/health", None).unwrap().is_none());
+        assert!(
+            guard
+                .verify("/health", "GET", None, None)
+                .unwrap()
+                .is_none()
+        );
         // 有效 token → user（sub → id）
         let now = server::test_support::now_secs();
         let claims = serde_json::json!({
@@ -2355,13 +2368,17 @@ mod tests {
         )
         .unwrap();
         let user = guard
-            .verify("/items", Some(&format!("Bearer {token}")))
+            .verify("/items", "GET", Some(&format!("Bearer {token}")), None)
             .unwrap()
             .expect("valid token must yield user");
         assert_eq!(user["id"], "u1");
         // 坏 token / 缺 token → Err（401 语义）
-        assert!(guard.verify("/items", Some("Bearer nope")).is_err());
-        assert!(guard.verify("/items", None).is_err());
+        assert!(
+            guard
+                .verify("/items", "GET", Some("Bearer nope"), None)
+                .is_err()
+        );
+        assert!(guard.verify("/items", "GET", None, None).is_err());
     }
 
     /// JSON publish → 订阅通道必收 text 信封帧（bus Bytes 载荷才会走 Binary）。

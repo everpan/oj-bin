@@ -16,6 +16,68 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.30（2026-09-28，未打标签）
+
+> 版本分界：`oj/Cargo.toml` 0.1.29 → 0.1.30。上一版：`v0.1.29` → e6ad218。
+
+**特性（genoffice 上游缺口 oj-1 ~ oj-8 一批合入；ABI bump 8 → 9，全部插件须重编译）**
+
+- **模块加载器（oj-1/oj-2，v0.1.30）**：bare specifier 完整实现 Node `exports` 封闭语义
+  （字符串形态 / 条件对象 import·require·node·default / 子路径键 / `./x/*` 与裸 `*` 模式键 /
+  数组 fallback；有 `exports` 即接管、未命中报错**不回落** legacy：ERR_PACKAGE_PATH_NOT_EXPORTED
+  风格文案）；pnpm 布局可用（解析全程不 realpath，符号链接视图直读）——`module → main → index.js`
+  legacy 仅在无 `exports` 时生效。CJS 包装支持相对 require：`./x` 候选 `.js/.json/index.js`、
+  JSON 模块、循环 require 返回部分 exports（Node 语义）、相对路径钳制在 project root 内、
+  `node:` 内建报 `Node builtin 'path' is not available in oj runtime`。
+- **wasm 胶水 Web API（oj-3，v0.1.30）**：新增全局 `atob`/`btoa`（标准 base64，非法输入
+  抛 `InvalidCharacterError`）与 `crypto.getRandomValues(view)`（任意 TypedArray view，
+  非 view 抛 TypeError，单次 ≤65536 字节对齐 WebCrypto）；`WebAssembly.instantiate`
+  经 L1 实测（oj/tests/e2e_wasm.rs）——wasm-bindgen 类引擎包可进 oj runtime 的判定面已打通，
+  剩余按"引擎包兼容性清单"逐包验证。
+- **cookie 会话鉴权（oj-4，v0.1.30）**：oj-auth cfg 新增 `cookie` 段（缺省关闭=行为不变）：
+  `{enabled, name:"oj_sess", same_site:"Lax", secure, ttl_secs:86400, csrf_cookie, csrf_header:"x-csrf-token"}`。
+  判定序：匿名 → Bearer → cookie 会话（session cookie 值 = 同 secret JWT）→ 统一 401
+  （`missing or invalid bearer token`，不泄露哪条路失败）；cookie 会话的非安全方法叠
+  **CSRF 双提交**（csrf 头须等于 csrf cookie，否则 401 `missing or invalid csrf token`）。
+  登录/登出端点是 JS 业务路由职责（sample/src/auth/ 有示例：HttpOnly `oj_sess` +
+  非 HttpOnly csrf cookie）。**WS 握手过守卫**（js_route_guarded：method="GET" + 全头 JSON，
+  401 不升级）——存量部署需把 ws 路径加进 `anonymous_paths`（sample 已补）。
+  行为变更：WS 从此在守卫面内。
+- **大文件上传直传（oj-5，v0.1.30）**：① JS `blob.uploadUrl(key, opts?)`（opts 缺省
+  `{"kind":"put"}`；s3 后端返回 15min 预签名 PUT URL；multipart 形态暂返回 Err——
+  object_store 无 multipart presign API，单发 PUT 已解 10MB/30s 痛点，>100MB 待真实需求）；
+  ② 新直传路由 `PUT {base}/blob/{key}`：走鉴权守卫（Bearer/cookie 即令牌），体积上限
+  独立 `server.blob_upload_max_bytes`（默认 1 GiB），不经 JsActor（无 30s）；handler 面
+  `max_upload_bytes` 不变。请求体按路径分档限长（blob 腿 1 GiB / 其余 2×10MB 裸 413），
+  **移除全局 DefaultBodyLimit**——handler 面内存 DoS 上限不因直传抬升。
+  ③ 路由级 timeout：`server.route_timeouts: [{pattern, timeout}]`（段语义同
+  anonymous_paths，按声明序首个命中，匹配含 base 全路径；配置非法启动 fail-fast）。
+- **WS 房间原语（oj-6，v0.1.30）**：`ws.join(room)` / `ws.leave(room)`（ws handler 内，
+  连接身份自动取）、`ws.broadcast(room, data)` → 送达数（socket.io 除己语义；HTTP handler
+  可调，conn=0 不排除任何人）、`ws.roomSize(room)`（任意上下文）。进程内单例 hub，
+  断连自动摘除；跨实例扇出仍走 bus。
+- **blob Range（oj-7，v0.1.30）**：local 内联下载支持 `Range` 单区间（`a-b`/`a-`/`-N`）→
+  206 + Content-Range + Accept-Ranges；越界/空文件 416（`bytes */len`）；多区间/非法
+  Range → 200 全量（单区间覆盖 pdf.js/媒体 seek 场景）。s3 302 腿不动。
+- **自定义响应头（oj-8，v0.1.30）**：`server.response_headers`（全局）+
+  `server.static_sites[].headers`（per-site 覆盖同名全局值）；施加动态信封/静态站点/blob
+  响应面；**框架自有头永远优先**（配置头只补缺，Content-Type/Location 等不可覆盖）。
+- **ABI 9（破坏性，插件必须重编译）**：`AuthGuardVtable.verify` 四参化
+  `(path_no_base, method, authorization, headers)`——headers 为全部请求头 JSON（小写名→值），
+  cookie 会话与 CSRF 判定材料都在其中；`BlobBackendVtable` 增 `upload_url(handle, key, op)`。
+  `xtask` 第一方插件清单补 `ldap`（此前 `cargo xtask build` 漏装 oj-ldap，bin/plugins
+  会滞留旧 ABI 产物）。
+
+**修复**
+
+- 模块加载器：相对 require 原可 `../../` 逃出 project root——新增 `ensure_within` 钳制。
+- `cargo xtask build` 漏构建 oj-ldap（PLUGINS 清单缺项）。
+
+**文档**
+
+- `docs/devkit/` 四件同步本版用户可见变更（api-manual §5/§6/§7/§8/§10、SKILL 陷阱速查、
+  scenarios 新增 5 场景、README 版本行）；`docs/plugin-architecture.md` ABI 版本号 8 → 9。
+
 ## v0.1.29（2026-09-28，已打标签 v0.1.29）
 
 > 版本分界：`oj/Cargo.toml` 0.1.28 → 0.1.29。上一版：`v0.1.28` → 515c33f。

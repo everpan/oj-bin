@@ -255,7 +255,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `db.query / exec / table / tx` | 原始 SQL / 安全构造器 / 事务 | 标识符走白名单、值参数化；`tx` 回调式，resolve 提交 throw 回滚 |
 | `http.method/params/query/headers/body/tenantId/user/files` | 只读请求上下文（懒 Proxy） | `param(name, def?)` 路径优先、query 兜底 |
 | `kv` / `redis` | KV：`get/set/del/expire/incr` | 同源同面；oj-kv-redis 真连，未配回落内存 KV |
-| `blob(name?)` | 对象存储：`put/get/del/url/contentType` | `blob:` 段启用；下载走 `{base}/blob/{key}` |
+| `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30） |
 | `bus.publish/subscribe/kind` | 事件总线 | HTTP 发布、WS 订阅；`kind()` 是异步 op |
 | `es.search/index/del` | Elasticsearch 薄客户端 | `es:` 段启用，未配置报错 |
 | `fetch(url, opts?)` | 浏览器兼容 Fetch（reqwest） | 响应整体缓冲；不支持 AbortController |
@@ -264,8 +264,8 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `jwt.sign/verify` + `jwt.accessDuration/refreshDuration` | JWT 签发验签 | 密钥/时长装配期注入；claims 固定 `{sub,roles,iat,exp}` |
 | `bcrypt.hash/verify` | 密码哈希（`spawn_blocking`） | 不依赖 `auth:` 段 |
 | `oidc.sign/verify/jwks` + `oidc.issuer/rp/clients` | RS256 JWS 原语 + 装配期配置 | `oidc:` 段启用；私钥留在 Rust（`src/bridge/oidc.rs`） |
-| `crypto.sha256Hex / randomHex` | 摘要与随机数 | 与原生 `getRandomValues` 合并 |
-| `ws.send/close` | WS 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op） | 仅 WS 连接内有意义 |
+| `crypto.sha256Hex / randomHex / getRandomValues` + 全局 `atob/btoa` | 摘要与随机数；wasm 胶水面（v0.1.30） | `getRandomValues` 为 oj 实现（原生不存在）：TypedArray view、≤65536 字节/次 |
+| `ws.send/close` + `ws.join/leave/broadcast/roomSize` | WS 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）；房间原语（v0.1.30） | 仅 WS 连接内有意义；broadcast 除己语义，跨实例扇出走 bus |
 | `plugins()` | 已装配插件自省 | 同源 `GET {base}/plugins` |
 | `finish()` | 标记会话完成但不写响应 | 少用 |
 
@@ -406,11 +406,15 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
   内不启用（不劫持第三方包的 `package.json#imports` 语义）；模块外（tests 目录 / 任务池）
   无锚点 → 明确报错。`oj build` 侧用**同一份探针**实化（见 `build_cmd::resolve_to_segs`），
   故 dev/release 命中同一文件。
-- `resolve_bare`：裸 specifier 从当前文件目录逐级向上找 `node_modules/<pkg>`（至 project
-  root），按 `package.json` `module`→`main`→`index.js` 取入口，支持 `@scope/name` 与子路径。
+- `resolve_bare`（v0.1.30 重写）：裸 specifier 从当前文件目录逐级向上找
+  `node_modules/<pkg>`（至 project root；**不 realpath**——pnpm 符号链接布局直读），
+  按 `package.json` `exports` 封闭语义解析（条件对象/子路径键/`./x/*` 模式/数组 fallback；
+  未命中报错不回落 legacy），无 `exports` 才走 `module`→`main`→`index.js`。
+  ESM 侧 `import` 条件、CJS 侧 `require` 条件（`resolve_bare_mode`）。
 - `wrap_cjs` / `looks_cjs` / `op_resolve_cjs`：CJS 互操作（`module.exports`→`default`，
-  `require` 走 `__ojRequire`，进程级缓存）。启发式识别，**仅裸 specifier**；相对
-  `require("./x")` 是已知限制。
+  `require` 走 `__ojRequire`，进程级缓存）。v0.1.30 起相对 `require("./x")` 可用：
+  候选 `.js/.json/index.js`、JSON 模块、循环 require 返回部分 exports（`__ojCjsRun`
+  注册表）、内建明确报错。
 - `ensure_within`：两侧都 `canonicalize` 后做前缀判断，拒绝逃逸。macOS `/var` vs
   `/private/var` 的符号链接差异已处理。
 

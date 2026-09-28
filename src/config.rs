@@ -13,6 +13,20 @@ use serde::{Deserialize, Serialize};
 pub struct StaticSiteConf {
     pub prefix: String,
     pub path: String,
+    /// 该站点的自定义响应头（v0.1.30，如 CSP）：覆盖 `server.response_headers`
+    /// 里同名的全局头；框架自有头（Content-Type/Content-Length 等）永远优先。
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// 路由级 timeout 覆盖（v0.1.30，`server.route_timeouts`）：pattern 段语义与
+/// tenant anonymous_paths 相同（字面 / `*` 恰好一段 / `**` 跨段），按声明顺序
+/// 首个命中生效；命中请求的 handler 超时用它替换全局 `server.timeout`（408 语义不变）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RouteTimeoutConf {
+    pub pattern: String,
+    /// 时长字符串（如 "5m"），parse_duration 解析；装配期解析失败 fail-fast。
+    pub timeout: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +81,18 @@ pub struct ServerCfg {
     pub pool_size: u32,
     /// 上传体积上限（字节；超出 413）。axum 层再乘 2 做硬顶。
     pub max_upload_bytes: u64,
+    /// blob 直传 PUT 路由（`PUT {base}/blob/{key}`，v0.1.30）的体积上限（字节，
+    /// 默认 1 GiB）——与 handler 面的 `max_upload_bytes` 分开：直传不经 JsActor
+    /// （无 30s timeout、不占 handler 内存上限）。
+    #[serde(default = "default_blob_upload_max_bytes")]
+    pub blob_upload_max_bytes: u64,
+    /// 自定义响应头（v0.1.30）：全局默认（动态信封/静态站点/blob 响应都补）；
+    /// 与框架自有头冲突时框架优先（只补缺，不覆盖）。默认空 = 行为不变。
+    #[serde(default)]
+    pub response_headers: std::collections::HashMap<String, String>,
+    /// 路由级 timeout 覆盖（v0.1.30）：见 RouteTimeoutConf。默认空 = 全局 timeout 一统。
+    #[serde(default)]
+    pub route_timeouts: Vec<RouteTimeoutConf>,
     /// 日志目录：绝对路径原样；相对 → 相对 config 目录；未配置 → config 目录下的 ./logs。
     /// 不存在则自动创建。每次启动一个新文件 `server-<启动秒>_<pid>.log`，终端输出完整镜像落盘。
     #[serde(default)]
@@ -115,6 +141,9 @@ impl Default for ServerCfg {
             timeout: "30s".into(),
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
+            blob_upload_max_bytes: default_blob_upload_max_bytes(),
+            response_headers: Default::default(),
+            route_timeouts: Vec::new(),
             logs_dir: None,
             logs_max_m: 100,
             logs_keep_files: 10,
@@ -472,6 +501,10 @@ pub struct AuthCfg {
     /// 免鉴权路径（去 base 后）；结尾 "/*" = 一层前缀通配。条目可为字符串简写或
     /// 对象形态（`{ path, one_layer }`，见 `AnonPath`）。
     pub anonymous_paths: Vec<AnonPath>,
+    /// cookie 会话形态（oj-4）：原样透传 oj-auth 插件（`{"enabled":true,...}`，
+    /// 键契约属插件 schema）；缺省 None = 纯 Bearer。
+    #[serde(default)]
+    pub cookie: Option<serde_json::Value>,
 }
 
 impl Default for AuthCfg {
@@ -482,6 +515,7 @@ impl Default for AuthCfg {
             access_token_duration: "60s".into(),
             refresh_token_duration: "720h".into(),
             anonymous_paths: Vec::new(),
+            cookie: None,
         }
     }
 }
@@ -812,6 +846,11 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs_f64(n * mult))
 }
 
+/// blob 直传 PUT 默认上限：1 GiB（office/媒体类大文件的直传面，与 handler 10MB 分开）。
+fn default_blob_upload_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,14 +973,54 @@ mod tests {
             vec![
                 StaticSiteConf {
                     prefix: "/docs".into(),
-                    path: "d1".into()
+                    path: "d1".into(),
+                    headers: Default::default(),
                 },
                 StaticSiteConf {
                     prefix: "/".into(),
-                    path: "d2".into()
+                    path: "d2".into(),
+                    headers: Default::default(),
                 },
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_sites_headers_and_new_server_keys_parse() {
+        let dir = std::env::temp_dir().join(format!("ojcfgkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "server:\n  static_sites:\n    - { prefix: /docs, path: d1, headers: { csp: 'default-src self' } }\n  blob_upload_max_bytes: 104857600\n  response_headers: { x-frame-options: DENY, referrer-policy: no-referrer }\n  route_timeouts:\n    - { pattern: /v1/api/convert/**, timeout: 5m }\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.server.blob_upload_max_bytes, 104857600);
+        assert_eq!(
+            c.server
+                .response_headers
+                .get("x-frame-options")
+                .map(String::as_str),
+            Some("DENY")
+        );
+        assert_eq!(
+            c.server.static_sites[0]
+                .headers
+                .get("csp")
+                .map(String::as_str),
+            Some("default-src self")
+        );
+        assert_eq!(c.server.route_timeouts.len(), 1);
+        assert_eq!(c.server.route_timeouts[0].pattern, "/v1/api/convert/**");
+        assert_eq!(c.server.route_timeouts[0].timeout, "5m");
+        // 缺省：1 GiB / 空表。
+        assert_eq!(
+            ServerCfg::default().blob_upload_max_bytes,
+            1024 * 1024 * 1024
+        );
+        assert!(ServerCfg::default().response_headers.is_empty());
+        assert!(ServerCfg::default().route_timeouts.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

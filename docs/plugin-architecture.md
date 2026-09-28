@@ -13,7 +13,7 @@
 - **加载**：宿主启动期 `dlopen` 插件 cdylib（`src/bridge/plugin_loader.rs`，句柄进程期存活，
   不 dlclose）。
 - **探测流程**：
-  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **8**）
+  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **9**）
      **严格相等**才继续；不等 → fail fast（指纹不符仅告警）。
   2. **init**——调 `oj_plugin_init(host, cfg)`（宏内 `catch_unwind` 收敛 panic 为
      `RResult::Err`），插件建立 runtime/单例状态并返回 `PluginDescriptor`

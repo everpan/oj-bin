@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "axum",
@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "oj-plugin-ffi"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dunce",
  "paste",

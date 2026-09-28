@@ -20,6 +20,13 @@ pub struct BlobBackendVtable {
     pub del: extern "C" fn(handle: u64, key: RString) -> FfiFuture,
     /// ok 值 = URL 字符串字节（s3 presign / local 路由）。
     pub url: extern "C" fn(handle: u64, key: RString) -> FfiFuture,
+    /// ABI 9 起：上传直传预签名。op = JSON：
+    /// `{"kind":"put"}` / `{"kind":"multipart_initiate"}` /
+    /// `{"kind":"multipart_part","upload_id":s,"part_number":n}` /
+    /// `{"kind":"multipart_complete","upload_id":s,"parts":[{"part_number":n,"etag":s}]}`。
+    /// ok 值 = JSON `{"url":s, ...}`（url 为客户端直传目标；multipart_complete 的 parts
+    /// 已在 op 内，返回仅需确认字段）。不支持的上传形态返回 Err（宿主回落 handler 收字节）。
+    pub upload_url: extern "C" fn(handle: u64, key: RString, op: RString) -> FfiFuture,
     /// ok 值 = content-type 字符串字节（无 → 空串）。
     pub content_type: extern "C" fn(handle: u64, key: RString) -> FfiFuture,
     pub close: extern "C" fn(handle: u64),

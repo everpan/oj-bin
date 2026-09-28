@@ -192,6 +192,16 @@ pub fn op_random_hex(n: Option<u32>) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// crypto.getRandomValues 的随机源（bootstrap.js 填充 TypedArray view；上限对齐 WebCrypto 65536）。
+#[op2]
+#[serde]
+pub fn op_crypto_random(n: u32) -> Vec<u8> {
+    let n = n.min(65536) as usize;
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).expect("system rng");
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +318,7 @@ mod tests {
             access_token_duration: "60s".into(),
             refresh_token_duration: "720h".into(),
             anonymous_paths: vec![],
+            cookie: None,
         }) else {
             panic!("RS256 must be rejected")
         };
@@ -319,6 +330,7 @@ mod tests {
             access_token_duration: "soon".into(),
             refresh_token_duration: "720h".into(),
             anonymous_paths: vec![],
+            cookie: None,
         }) else {
             panic!("bad duration must be rejected")
         };
@@ -330,6 +342,7 @@ mod tests {
             access_token_duration: "60s".into(),
             refresh_token_duration: "720h".into(),
             anonymous_paths: vec![],
+            cookie: None,
         })
         .unwrap();
         assert_eq!(ok.alg, "HS512");

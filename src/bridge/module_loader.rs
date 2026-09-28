@@ -273,11 +273,64 @@ fn module_names(src_root: &Path) -> Vec<String> {
     out
 }
 
+/// node: 内建模块名（require('path') 报错提示用，区别于「包未安装」）。
+/// ponytail: 常用 38 个；新增内建名按需补（漏网者落入「包未安装」提示，不静默）。
+const NODE_BUILTINS: &[&str] = &[
+    "assert",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "dns",
+    "domain",
+    "events",
+    "fs",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "module",
+    "net",
+    "os",
+    "path",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "repl",
+    "stream",
+    "string_decoder",
+    "sys",
+    "timers",
+    "tls",
+    "tty",
+    "url",
+    "util",
+    "v8",
+    "vm",
+    "worker_threads",
+    "zlib",
+];
+
 /// 裸 specifier 解析（Node 算法简化版）：
 /// pkg → <dir>/node_modules/<pkg>（从 from_dir 逐级向上至 root）→ package.json
-/// 的 module → main → index.js；subpath（pkg/a.js）直映射包内文件。
-/// ponytail: 不做 exports/conditions 映射与 pnpm 布局；主流简单包可用。
+/// 的 exports（有 exports 即完全接管，Node 语义：未命中报错，不回落 legacy）→
+/// 否则 legacy module → main → index.js；subpath（pkg/a.js）直映射包内文件。
+/// require = true 时条件优先级走 require（CJS require 路径）。
 pub fn resolve_bare(spec: &str, from_dir: &Path, root: &Path) -> Result<PathBuf, String> {
+    resolve_bare_mode(spec, from_dir, root, false)
+}
+
+fn resolve_bare_mode(
+    spec: &str,
+    from_dir: &Path,
+    root: &Path,
+    require: bool,
+) -> Result<PathBuf, String> {
     // pkg 名：@scope/name 占两段。
     let mut parts: Vec<&str> = spec.split('/').collect();
     let pkg = if parts.first().is_some_and(|s| s.starts_with('@')) && parts.len() >= 2 {
@@ -296,6 +349,15 @@ pub fn resolve_bare(spec: &str, from_dir: &Path, root: &Path) -> Result<PathBuf,
     while let Some(d) = dir {
         let nm = d.join("node_modules").join(&pkg);
         if nm.is_dir() {
+            // exports 优先：包已找到即定型，未命中不继续向上走（Node ERR_PACKAGE_PATH_NOT_EXPORTED）。
+            if let Some(exports) = read_pkg_json(&nm).and_then(|pj| pj.get("exports").cloned()) {
+                let subpath = if sub.is_empty() {
+                    ".".to_string()
+                } else {
+                    format!("./{}", sub.join("/"))
+                };
+                return resolve_exports(&nm, &exports, &subpath, require);
+            }
             if sub.is_empty() {
                 let p = pkg_entry(&nm)?;
                 return Ok(p);
@@ -318,6 +380,141 @@ pub fn resolve_bare(spec: &str, from_dir: &Path, root: &Path) -> Result<PathBuf,
         from_dir.display(),
         tried.join(", ")
     ))
+}
+
+/// 读取包目录 package.json（不存在/非法 JSON → None，回落 legacy 解析）。
+fn read_pkg_json(pkg_dir: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// exports 字段解析（Node 算法子集）：返回包内目标文件的绝对路径。
+/// subpath = "."（裸包名）或 "./a/b"。require 决定活跃条件
+/// （ESM: import/node/default；CJS: require/node/default；"node" 恒命中——oj 即 node 类宿主）。
+fn resolve_exports(
+    pkg_dir: &Path,
+    exports: &serde_json::Value,
+    subpath: &str,
+    require: bool,
+) -> Result<PathBuf, String> {
+    // 数组 fallback 的存在性判定：归一后在包内且是文件（逃逸检查在终选后仍做）。
+    let pd = normalize_lexically(pkg_dir);
+    let exists = |t: &str| -> bool {
+        let p = normalize_lexically(&pkg_dir.join(t.trim_start_matches("./")));
+        p.starts_with(&pd) && p.is_file()
+    };
+    let target = if exports
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| k.starts_with('.')))
+    {
+        // 子路径映射表：精确键 → "./x/*" 模式键（Node 亦支持裸 "*" 键）。
+        let obj = exports.as_object().unwrap();
+        let mut hit: Option<(&serde_json::Value, String)> =
+            obj.get(subpath).map(|v| (v, String::new()));
+        if hit.is_none() {
+            for (k, v) in obj {
+                let cap = if k == "*" {
+                    subpath.strip_prefix("./").map(str::to_string)
+                } else if let Some(prefix) = k.strip_suffix("/*") {
+                    subpath
+                        .strip_prefix(&format!("{prefix}/"))
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                if let Some(cap) = cap {
+                    hit = Some((v, cap));
+                    break;
+                }
+            }
+        }
+        let (val, cap) = hit.ok_or_else(|| not_exported_err(pkg_dir, subpath, obj.keys()))?;
+        // 数组 fallback 需感知文件存在（Node 语义：项解析不到文件 → 试下一项）。
+        pick_target(val, require, &cap, &exists, false)
+            .ok_or_else(|| not_exported_err(pkg_dir, subpath, obj.keys()))?
+    } else {
+        // 无子路径键：整个 exports = "." 的目标（字符串/数组/条件对象）。
+        pick_target(exports, require, "", &exists, false)
+            .ok_or_else(|| not_exported_err(pkg_dir, subpath, std::iter::empty()))?
+    };
+    // 目标必须是 "./" 开头的包内路径，且词法上不逃逸包目录。
+    let p = normalize_lexically(&pkg_dir.join(target.trim_start_matches("./")));
+    let pd = normalize_lexically(pkg_dir);
+    if !target.starts_with("./") || !p.starts_with(&pd) {
+        return Err(format!(
+            "\"exports\" target '{target}' escapes package '{}'",
+            pkg_dir.display()
+        ));
+    }
+    if !p.is_file() {
+        return Err(format!(
+            "\"exports\" target '{target}' not found ({}); check the package's files",
+            p.display()
+        ));
+    }
+    Ok(p)
+}
+
+/// ERR_PACKAGE_PATH_NOT_EXPORTED 风格报错（含实际导出的子路径，可定位）。
+fn not_exported_err<'a>(
+    pkg_dir: &Path,
+    subpath: &str,
+    keys: impl Iterator<Item = &'a String>,
+) -> String {
+    let keys: Vec<&str> = keys.map(|k| k.as_str()).collect();
+    format!(
+        "Package subpath '{subpath}' is not defined by \"exports\" in '{}'/package.json{}",
+        pkg_dir.display(),
+        if keys.is_empty() {
+            String::new()
+        } else {
+            format!("；导出的子路径：[{}]", keys.join(", "))
+        }
+    )
+}
+
+/// 条件目标选择：字符串 → shape 合法即命中（单目标的存在性由调用方终检，报
+/// "not found"）；数组 → 首个 shape 合法**且文件存在**的项（Node fallback 语义：
+/// 解析不到文件试下一项）；对象 → **按 key 顺序**取第一个命中的活跃条件
+/// （serde_json preserve_order 保插入序；node/default 恒命中，import/require 按
+/// require 取一，types/browser 等未实现条件一律不命中）。
+/// 命中值中的 `*` 用 cap（模式捕获）替换。
+/// ponytail: 数组内非法项跳过而非报错（Node 对非法 target 更严格）；够用再收紧。
+fn pick_target(
+    v: &serde_json::Value,
+    require: bool,
+    cap: &str,
+    exists: &impl Fn(&str) -> bool,
+    check_exists: bool,
+) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.replace('*', cap);
+            if s.starts_with("./") && (!check_exists || exists(&t)) {
+                Some(t)
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Array(a) => a
+            .iter()
+            .find_map(|e| pick_target(e, require, cap, exists, true)),
+        serde_json::Value::Object(o) => {
+            for (k, sub) in o {
+                let active = match k.as_str() {
+                    "default" | "node" => true,
+                    "require" => require,
+                    "import" => !require,
+                    _ => false,
+                };
+                if active && let Some(s) = pick_target(sub, require, cap, exists, check_exists) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// 包入口：package.json 的 module → main → index.js。
@@ -400,9 +597,11 @@ pub fn wrap_cjs(src: &str, module_path: &str) -> String {
     )
 }
 
-/// CJS require 底座：node_modules 解析 + 读源码（JS 侧 __ojRequire eval 执行）。
-/// project_root 取 StableState.loader（T9 oj 装配注入；未配置时报错）。
-/// ponytail: 仅裸 specifier；相对 require 与 exports 映射待真实依赖出现再加。
+/// CJS require 底座：相对（./ ../）+ 裸 specifier 解析（require 条件）、JSON 模块、
+/// 读源码（JS 侧 __ojRequire eval 执行）。project_root 取 StableState.loader
+/// （T9 oj 装配注入；未配置时报错）。
+/// 循环 require：op 返回的包装体自带 globalThis.__ojCjsRun 注册表——同一绝对路径
+/// 只执行一次，环上重复进入返回部分 exports（Node 语义），bootstrap 侧无改动。
 #[op2]
 #[serde]
 pub fn op_resolve_cjs(
@@ -422,10 +621,77 @@ pub fn op_resolve_cjs(
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    let p = resolve_bare(&name, &from, &root).map_err(JsErrorBox::generic)?;
-    let code = std::fs::read_to_string(&p)
+    let p = if name.starts_with("./") || name.starts_with("../") {
+        resolve_cjs_relative(&from, &name).map_err(JsErrorBox::generic)?
+    } else {
+        resolve_bare_mode(&name, &from, &root, true).map_err(|e| {
+            if is_node_builtin(&name) {
+                JsErrorBox::generic(format!(
+                    "Node builtin '{name}' is not available in oj runtime"
+                ))
+            } else {
+                JsErrorBox::generic(e)
+            }
+        })?
+    };
+    // 相对 require 可经 ../../ 越出 project root——载入侧钳制（ESM 路径 resolve_inner 已有）。
+    let p = ensure_within(&p, &root).map_err(JsErrorBox::generic)?;
+    let raw = std::fs::read_to_string(&p)
         .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", p.display())))?;
+    let code = if p.extension().is_some_and(|e| e == "json") {
+        json_module_code(&raw).map_err(JsErrorBox::generic)?
+    } else {
+        cjs_registry_wrap(&raw, &p.display().to_string())
+    };
     Ok(serde_json::json!({ "path": p.display().to_string(), "code": code }))
+}
+
+/// CJS 相对 require 解析：./ ../ → 候选依次 <p>、<p>.js、<p>.json、<p>/index.js、
+/// <p>/index.json（存在即命中）。
+fn resolve_cjs_relative(base_dir: &Path, spec: &str) -> Result<PathBuf, String> {
+    let stem = normalize_lexically(&base_dir.join(spec));
+    let candidates = [
+        stem.clone(),
+        stem.with_extension("js"),
+        stem.with_extension("json"),
+        stem.join("index.js"),
+        stem.join("index.json"),
+    ];
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.clone());
+        }
+    }
+    let tried: Vec<String> = candidates.iter().map(|c| c.display().to_string()).collect();
+    Err(format!(
+        "cannot resolve '{spec}' from '{}': tried [{}]",
+        base_dir.display(),
+        tried.join(", ")
+    ))
+}
+
+/// 是否 node: 内建模块名（剥 "node:" 前缀后取首段，兼容 'node:path' 与 'path/...' 误形）。
+fn is_node_builtin(name: &str) -> bool {
+    let head = name.split('/').next().unwrap_or(name);
+    let head = head.strip_prefix("node:").unwrap_or(head);
+    NODE_BUILTINS.contains(&head)
+}
+
+/// CJS 执行注册表包装体：首次 eval 注册并执行，后续（含循环 require）直接取
+/// exports；module.exports 绑到 __ojRequire 的外层 m（缓存键 referrer::name 的载体）。
+fn cjs_registry_wrap(src: &str, path: &str) -> String {
+    // JSON 编码即合法 JS 字符串字面量（处理引号/反斜杠）。
+    let p = serde_json::to_string(path).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "const __r = (globalThis.__ojCjsRun ??= {{}});\nif (!__r[{p}]) {{\nconst __m = {{ exports: {{}} }};\n__r[{p}] = __m;\n(function (module, exports, require) {{\n{src}\n}})(__m, __m.exports, (n) => globalThis.__ojRequire(n, {p}));\n}}\nmodule.exports = __r[{p}].exports;\n"
+    )
+}
+
+/// JSON require：校验原文为合法 JSON 后包成 module.exports（值语义 = Node）。
+fn json_module_code(raw: &str) -> Result<String, String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| format!("invalid JSON module: {e}"))?;
+    Ok(format!("module.exports = {raw};"))
 }
 
 #[cfg(test)]
@@ -806,5 +1072,241 @@ mod tests {
             wrapped.contains(r#"__ojRequire(n, "/nm/p/main.js")"#),
             "{wrapped}"
         );
+    }
+
+    // ---------- exports / conditions（oj-1） ----------
+
+    #[test]
+    fn bare_resolves_exports_variants() {
+        let root = fx(&[
+            // 字符串形态 + 无 main 的现代包。
+            (
+                "node_modules/strpkg/package.json",
+                r#"{"name":"strpkg","exports":"./index.js"}"#,
+            ),
+            ("node_modules/strpkg/index.js", "export const x = 1;\n"),
+            // 条件对象：import/require 指向不同文件。
+            (
+                "node_modules/condpkg/package.json",
+                r#"{
+                "name":"condpkg",
+                "exports":{".":{"import":"./esm.js","require":"./cjs.js","default":"./fallback.js"}}
+            }"#,
+            ),
+            ("node_modules/condpkg/esm.js", "export const m = 'esm';\n"),
+            ("node_modules/condpkg/cjs.js", "module.exports = 'cjs';\n"),
+            (
+                "node_modules/condpkg/fallback.js",
+                "export const m = 'fb';\n",
+            ),
+            // 子路径键 + "./x/*" 模式。
+            (
+                "node_modules/subpkg/package.json",
+                r#"{
+                "name":"subpkg",
+                "exports":{
+                    "./feat": "./lib/feat.js",
+                    "./deep/*": "./dist/*",
+                    "./arr": ["./nope.js", "./arr.js"]
+                }
+            }"#,
+            ),
+            ("node_modules/subpkg/lib/feat.js", "export const f = 1;\n"),
+            ("node_modules/subpkg/dist/a/b.js", "export const d = 1;\n"),
+            ("node_modules/subpkg/arr.js", "export const a = 1;\n"),
+        ]);
+        let from = root.join("src/user");
+        // 字符串形态（exports 无 "." 键，整体即 "." 目标）。
+        assert!(
+            resolve_bare("strpkg", &from, &root)
+                .unwrap()
+                .ends_with("strpkg/index.js")
+        );
+        // 条件：ESM 走 import，CJS require 走 require。
+        assert!(
+            resolve_bare("condpkg", &from, &root)
+                .unwrap()
+                .ends_with("condpkg/esm.js")
+        );
+        assert!(
+            resolve_bare_mode("condpkg", &from, &root, true)
+                .unwrap()
+                .ends_with("condpkg/cjs.js")
+        );
+        // 子路径键与模式。
+        assert!(
+            resolve_bare("subpkg/feat", &from, &root)
+                .unwrap()
+                .ends_with("lib/feat.js")
+        );
+        assert!(
+            resolve_bare("subpkg/deep/a/b.js", &from, &root)
+                .unwrap()
+                .ends_with("dist/a/b.js")
+        );
+        // 数组 fallback：首个不可解析项跳过，命中第二项。
+        assert!(
+            resolve_bare("subpkg/arr", &from, &root)
+                .unwrap()
+                .ends_with("subpkg/arr.js")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bare_exports_unexported_subpath_errors_with_keys() {
+        let root = fx(&[
+            (
+                "node_modules/expkg/package.json",
+                r#"{
+                "name":"expkg",
+                "exports":{".":"./index.js","./ok":"./ok.js"}
+            }"#,
+            ),
+            ("node_modules/expkg/index.js", "export const x = 1;\n"),
+            ("node_modules/expkg/ok.js", "export const o = 1;\n"),
+            // 显式 exports 之外的文件存在也不可见（Node 封闭语义）。
+            ("node_modules/expkg/internal.js", "export const i = 1;\n"),
+        ]);
+        let from = root.join("src/user");
+        assert!(resolve_bare("expkg/ok", &from, &root).is_ok());
+        for spec in ["expkg/internal", "expkg/nope"] {
+            let e = resolve_bare(spec, &from, &root).unwrap_err();
+            assert!(e.contains("not defined by \"exports\""), "{spec}: {e}");
+            assert!(e.contains("./ok"), "{spec}: {e}");
+        }
+        // 目标文件缺失：命中映射但文件不在 → 报错（而非回落 legacy）。
+        let root2 = fx(&[(
+            "node_modules/misspkg/package.json",
+            r#"{"exports":{".":"./gone.js"}}"#,
+        )]);
+        let from2 = root2.join("src/user");
+        let e = resolve_bare("misspkg", &from2, &root2).unwrap_err();
+        assert!(e.contains("not found"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// pnpm 布局：node_modules/<pkg> 是指向 .pnpm/<pkg>@<v>/node_modules/<pkg> 的
+    /// 符号链接；包的真实位置旁有同伴依赖（peer/dep 链接在 .pnpm/<pkg>@<v>/
+    /// node_modules/ 下）。解析沿符号链接工作、且不得 realpath 中断相对回溯。
+    #[test]
+    #[cfg(unix)]
+    fn bare_resolves_pnpm_symlink_layout() {
+        let root = fx(&[
+            (
+                "node_modules/.pnpm/pkg@1.0.0/node_modules/pkg/package.json",
+                r#"{"name":"pkg","version":"1.0.0","exports":{".":"./index.js"}}"#,
+            ),
+            (
+                "node_modules/.pnpm/pkg@1.0.0/node_modules/pkg/index.js",
+                "export const x = 1;\n",
+            ),
+            (
+                "node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA/package.json",
+                r#"{"name":"pkgA","version":"1.0.0","main":"index.js"}"#,
+            ),
+            (
+                "node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA/index.js",
+                "module.exports = 1;\n",
+            ),
+            (
+                "node_modules/.pnpm/pkgA@1.0.0/node_modules/depB/package.json",
+                r#"{"name":"depB","version":"2.0.0","main":"index.js"}"#,
+            ),
+            (
+                "node_modules/.pnpm/pkgA@1.0.0/node_modules/depB/index.js",
+                "module.exports = 2;\n",
+            ),
+        ]);
+        let nm = root.join("node_modules");
+        // pnpm 风格的平铺链接视图。
+        std::os::unix::fs::symlink(
+            root.join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg"),
+            nm.join("pkg"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA"),
+            nm.join("pkgA"),
+        )
+        .unwrap();
+        let from = root.join("src/user");
+        // 平铺视图：经符号链接命中 exports。
+        assert!(
+            resolve_bare("pkg", &from, &root)
+                .unwrap()
+                .ends_with("pkg/index.js")
+        );
+        // 真实路径深处（versioned_specifier canonicalize 后的 referrer 形态）：
+        // 向上回溯命中 .pnpm/<pkgA>@<v>/node_modules/ 下的同伴依赖。
+        let deep = root.join("node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA/sub");
+        assert!(
+            resolve_bare_mode("depB", &deep, &root, true)
+                .unwrap()
+                .ends_with("depB/index.js")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---------- CJS 相对 require / JSON / 循环（oj-2） ----------
+
+    #[test]
+    fn cjs_relative_probes_js_json_and_index() {
+        let root = fx(&[
+            ("src/user/sib.js", "module.exports = 1;\n"),
+            ("src/user/data.json", r#"{"k": 1}"#),
+            ("src/user/mod/index.js", "module.exports = 2;\n"),
+        ]);
+        let dir = root.join("src/user");
+        assert!(
+            resolve_cjs_relative(&dir, "./sib")
+                .unwrap()
+                .ends_with("sib.js")
+        );
+        assert!(
+            resolve_cjs_relative(&dir, "./data")
+                .unwrap()
+                .ends_with("data.json")
+        );
+        assert!(
+            resolve_cjs_relative(&dir, "./mod")
+                .unwrap()
+                .ends_with("mod/index.js")
+        );
+        let e = resolve_cjs_relative(&dir, "./nope").unwrap_err();
+        assert!(e.contains("tried"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cjs_registry_wrap_is_idempotent_and_builtin_named() {
+        // 注册表守卫：重复 eval 只执行一次（环上第二次进入跳过 src 执行）。
+        let w = cjs_registry_wrap("module.exports.a = 1;\n", "/nm/p/a.js");
+        assert!(w.contains("globalThis.__ojCjsRun"), "{w}");
+        assert!(w.contains("if (!__r[\"/nm/p/a.js\"])"), "{w}");
+        // 嵌套 require 的 referrer = 本模块绝对路径。
+        assert!(
+            w.contains(r#"globalThis.__ojRequire(n, "/nm/p/a.js")"#),
+            "{w}"
+        );
+        // 最终 exports 恒绑注册表（外层 m 拿到的是注册表 exports 引用）。
+        assert!(
+            w.contains("module.exports = __r[\"/nm/p/a.js\"].exports"),
+            "{w}"
+        );
+        // node: 内建识别（首段匹配，含 node: 前缀形态）。
+        assert!(is_node_builtin("path"));
+        assert!(is_node_builtin("node:fs"));
+        assert!(is_node_builtin("fs/promises"));
+        assert!(!is_node_builtin("fsx"));
+    }
+
+    #[test]
+    fn cjs_json_module_code_validates_and_wraps() {
+        let ok = json_module_code(r#"{"k": 1}"#).unwrap();
+        assert_eq!(ok, r#"module.exports = {"k": 1};"#);
+        let e = json_module_code("{not json").unwrap_err();
+        assert!(e.contains("invalid JSON module"), "{e}");
     }
 }

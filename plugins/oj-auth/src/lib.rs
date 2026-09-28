@@ -1,6 +1,7 @@
 //! oj-auth：auth 轴守卫 cdylib 插件（auth 解耦）。只含守卫（验签 + 匿名匹配）；
 //! login/refresh/logout 端点已 JS 化（sample/src/auth/），本插件无 db/kv 依赖。
-//! cfg 契约：init cfg = {"jwt_secret","signing_method","anonymous_paths":[...]} JSON。
+//! cfg 契约：init cfg = {"jwt_secret","signing_method","anonymous_paths":[...],"cookie":{...}} JSON
+//! （cookie 会话形态，oj-4；缺省关闭 = 纯 Bearer）。
 
 use oj_plugin_ffi::{AuthGuardVtable, HostContext, PluginDescriptor, RArc, RResult, RString};
 use std::sync::OnceLock;
@@ -24,6 +25,40 @@ struct GuardCfg {
     signing_method: String,
     #[serde(default)]
     anonymous_paths: Vec<String>,
+    /// cookie 会话形态（ABI 9 / oj-4）。缺省 disabled = 行为与纯 Bearer 完全一致。
+    #[serde(default)]
+    cookie: CookieCfg,
+}
+
+/// cookie 会话配置（enabled=false 时全部字段无效）。
+#[derive(serde::Deserialize, Clone)]
+#[serde(default)]
+struct CookieCfg {
+    enabled: bool,
+    /// session cookie 名（值为与 Bearer 同 secret/alg 签的 JWT）。
+    name: String,
+    /// Set-Cookie 的 SameSite（登录端点签发用；守卫只验签不签发）。
+    same_site: String,
+    secure: bool,
+    /// session 签发时长（秒）；守卫侧以 JWT exp 为准，本值仅供文档/示例对齐。
+    ttl_secs: u64,
+    /// CSRF 双提交：非安全方法要求本 cookie 值 == 本头值（头名小写比较）。
+    csrf_cookie: String,
+    csrf_header: String,
+}
+
+impl Default for CookieCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: "oj_sess".into(),
+            same_site: "Lax".into(),
+            secure: false,
+            ttl_secs: 86_400,
+            csrf_cookie: "oj_csrf".into(),
+            csrf_header: "x-csrf-token".into(),
+        }
+    }
 }
 
 fn default_alg() -> String {
@@ -34,6 +69,7 @@ struct Guard {
     dec: jsonwebtoken::DecodingKey,
     alg: jsonwebtoken::Algorithm,
     anon: Vec<String>,
+    cookie: CookieCfg,
 }
 
 static GUARD: OnceLock<Guard> = OnceLock::new();
@@ -50,6 +86,7 @@ impl Guard {
             dec: jsonwebtoken::DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
             alg,
             anon: cfg.anonymous_paths.clone(),
+            cookie: cfg.cookie.clone(),
         })
     }
 
@@ -68,13 +105,68 @@ impl Guard {
     }
 
     /// 验签 + exp（leeway 0）；null = 匿名放行；对象 = {"id","roles","claims"}。
-    fn verify(&self, path: &str, authorization: &str) -> Result<serde_json::Value, String> {
+    /// ABI 9 四参决策树：匿名 → Bearer → cookie 会话（含 CSRF 双提交）→ 401。
+    /// headers = 全部请求头 JSON（小写名 → 值；宿主保证小写名，本侧头名比较再降一级保险）。
+    fn verify(
+        &self,
+        path: &str,
+        method: &str,
+        authorization: &str,
+        headers: &str,
+    ) -> Result<serde_json::Value, String> {
         if self.is_anonymous(path) {
             return Ok(serde_json::Value::Null);
         }
+        if let Ok(v) = self.verify_bearer(authorization) {
+            return Ok(v);
+        }
+        if self.cookie.enabled {
+            match self.verify_cookie(method, headers) {
+                Ok(v) => return Ok(v),
+                // 会话已建立、CSRF 不过的错透出具体消息（客户端要这个区分）；
+                // 会话本身无效则吞掉、落到统一的 401 文案（不泄露哪条路失败）。
+                Err(CookieErr::Csrf(msg)) => return Err(msg),
+                Err(CookieErr::Session) => {}
+            }
+        }
+        Err("missing or invalid bearer token".to_string())
+    }
+
+    fn verify_bearer(&self, authorization: &str) -> Result<serde_json::Value, String> {
         let token = authorization
             .strip_prefix("Bearer ")
             .ok_or("missing or invalid bearer token")?;
+        self.verify_jwt(token)
+    }
+
+    /// cookie 会话：session cookie 值为同 secret/alg 的 JWT；非安全方法
+    ///（GET/HEAD/OPTIONS 之外）叠 CSRF 双提交（csrf cookie 值 == csrf 头值）。
+    /// Session 错 = 会话无效（→ 统一 401）；Csrf 错 = 会话有效但双提交不过。
+    fn verify_cookie(&self, method: &str, headers: &str) -> Result<serde_json::Value, CookieErr> {
+        let hdrs: serde_json::Value =
+            serde_json::from_str(headers).unwrap_or(serde_json::Value::Null);
+        let cookie_hdr = hdrs["cookie"].as_str().unwrap_or("");
+        let session = cookie_value(cookie_hdr, &self.cookie.name).ok_or(CookieErr::Session)?;
+        let user = self.verify_jwt(session).map_err(|_| CookieErr::Session)?;
+        if !matches!(method, "GET" | "HEAD" | "OPTIONS") {
+            let want = cookie_value(cookie_hdr, &self.cookie.csrf_cookie)
+                .ok_or_else(|| CookieErr::Csrf("missing or invalid csrf token".into()))?;
+            let got = hdrs
+                .as_object()
+                .and_then(|m| {
+                    m.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(&self.cookie.csrf_header))
+                })
+                .and_then(|(_, v)| v.as_str())
+                .ok_or_else(|| CookieErr::Csrf("missing or invalid csrf token".into()))?;
+            if want != got {
+                return Err(CookieErr::Csrf("missing or invalid csrf token".into()));
+            }
+        }
+        Ok(user)
+    }
+
+    fn verify_jwt(&self, token: &str) -> Result<serde_json::Value, String> {
         let mut v = jsonwebtoken::Validation::new(self.alg);
         v.leeway = 0;
         v.validate_exp = true;
@@ -90,15 +182,38 @@ impl Guard {
     }
 }
 
+/// cookie 会话内部错误分类：会话无效（→ 统一 401 文案）vs CSRF 双提交不过
+/// （→ 透出 "missing or invalid csrf token"，客户端需要这个区分）。
+enum CookieErr {
+    /// 会话无效（→ 统一 401 文案，消息不读出）。
+    Session,
+    Csrf(String),
+}
+
+/// 从 Cookie 头取单个 cookie 值（`;` 分段、`k=v` trim）。
+/// ponytail：不做 percent-decode——session/CSRF 值是 base64url/hex，天然无 %XX；
+/// 浏览器编码侧如需解码由其负责（真实依赖出现再加 owned 解码路径）。
+fn cookie_value<'a>(cookie_hdr: &'a str, name: &str) -> Option<&'a str> {
+    cookie_hdr.split(';').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k.trim() == name).then(|| v.trim())
+    })
+}
+
 static VTABLE: AuthGuardVtable = AuthGuardVtable { verify };
 
-extern "C" fn verify(path: RString, authorization: RString) -> RResult<RString, RString> {
+extern "C" fn verify(
+    path: RString,
+    method: RString,
+    authorization: RString,
+    headers: RString,
+) -> RResult<RString, RString> {
     oj_plugin_ffi::catch_value(
         || {
             let Some(g) = GUARD.get() else {
                 return RResult::Err(RString::from("oj-auth: init not called"));
             };
-            match g.verify(&path[..], &authorization[..]) {
+            match g.verify(&path[..], &method[..], &authorization[..], &headers[..]) {
                 Ok(v) => RResult::Ok(RString::from(v.to_string())),
                 Err(msg) => RResult::Err(RString::from(msg.as_str())),
             }
@@ -153,6 +268,21 @@ mod tests {
             jwt_secret: "s3cret".into(),
             signing_method: "HS256".into(),
             anonymous_paths: vec!["/health".into(), "/auth/*".into()],
+            cookie: CookieCfg::default(),
+        })
+        .unwrap()
+    }
+
+    /// cookie 形态守卫：enabled + 非匿名路径 /me。
+    fn guard_cookie() -> Guard {
+        Guard::new(&GuardCfg {
+            jwt_secret: "s3cret".into(),
+            signing_method: "HS256".into(),
+            anonymous_paths: vec![],
+            cookie: CookieCfg {
+                enabled: true,
+                ..CookieCfg::default()
+            },
         })
         .unwrap()
     }
@@ -194,6 +324,7 @@ mod tests {
                 "/pub/anchor/*/states".into(),
                 "/a/*/b/*".into(),
             ],
+            cookie: CookieCfg::default(),
         })
         .unwrap();
         // `**` 跨段（≥0 段）
@@ -213,16 +344,102 @@ mod tests {
     #[test]
     fn verify_anonymous_valid_tampered_expired() {
         let g = guard();
-        assert_eq!(g.verify("/health", "").unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            g.verify("/health", "GET", "", "").unwrap(),
+            serde_json::Value::Null
+        );
         let t = sign(&g, "1", &["admin"], 60);
-        let u = g.verify("/me", &format!("Bearer {t}")).unwrap();
+        let u = g.verify("/me", "GET", &format!("Bearer {t}"), "").unwrap();
         assert_eq!(u["id"], "1");
         assert_eq!(u["roles"][0], "admin");
-        assert!(g.verify("/me", &format!("Bearer {t}x")).is_err());
-        assert!(g.verify("/me", "no-bearer").is_err());
-        assert!(g.verify("/me", "").is_err());
+        assert!(g.verify("/me", "GET", &format!("Bearer {t}x"), "").is_err());
+        assert!(g.verify("/me", "GET", "no-bearer", "").is_err());
+        assert!(g.verify("/me", "GET", "", "").is_err());
         let past = sign(&g, "1", &[], -60);
-        assert!(g.verify("/me", &format!("Bearer {past}")).is_err());
+        assert!(
+            g.verify("/me", "GET", &format!("Bearer {past}"), "")
+                .is_err()
+        );
+    }
+
+    /// cookie 关闭（缺省）→ cookie 一律不认，行为与纯 Bearer 一致。
+    #[test]
+    fn cookie_disabled_ignores_session_cookie() {
+        let g = guard();
+        let t = sign(&g, "1", &[], 60);
+        let hdrs = format!(r#"{{"cookie":"oj_sess={t}"}}"#);
+        assert!(g.verify("/me", "GET", "", &hdrs).is_err());
+    }
+
+    /// cookie 开启：GET + 有效 session cookie → user；过期/篡改 → 401。
+    #[test]
+    fn cookie_session_get_ok_expired_tampered_err() {
+        let g = guard_cookie();
+        let t = sign(&g, "7", &["editor"], 60);
+        let hdrs = format!(r#"{{"cookie":"oj_sess={t}"}}"#);
+        let u = g.verify("/me", "GET", "", &hdrs).unwrap();
+        assert_eq!(u["id"], "7");
+        assert_eq!(u["roles"][0], "editor");
+        // 篡改 + 过期 + 无 cookie 头。
+        let bad = format!(r#"{{"cookie":"oj_sess={t}x"}}"#);
+        assert!(g.verify("/me", "GET", "", &bad).is_err());
+        let past = sign(&g, "7", &[], -60);
+        let old = format!(r#"{{"cookie":"oj_sess={past}"}}"#);
+        assert!(g.verify("/me", "GET", "", &old).is_err());
+        assert!(g.verify("/me", "GET", "", "{}").is_err());
+    }
+
+    /// CSRF 双提交：cookie 会话的非安全方法要求 csrf cookie == csrf 头；Bearer 不查。
+    #[test]
+    fn cookie_session_csrf_double_submit() {
+        let g = guard_cookie();
+        let t = sign(&g, "7", &[], 60);
+        let ok = format!(r#"{{"cookie":"oj_sess={t}; oj_csrf=tok1","x-csrf-token":"tok1"}}"#);
+        assert_eq!(g.verify("/me", "POST", "", &ok).unwrap()["id"], "7");
+        // 缺 csrf 头 / 值不匹配 / 缺 csrf cookie。
+        let no_hdr = format!(r#"{{"cookie":"oj_sess={t}; oj_csrf=tok1"}}"#);
+        let e = g.verify("/me", "POST", "", &no_hdr).unwrap_err();
+        assert_eq!(e, "missing or invalid csrf token");
+        let mismatch = format!(r#"{{"cookie":"oj_sess={t}; oj_csrf=tok1","x-csrf-token":"tok2"}}"#);
+        assert!(g.verify("/me", "POST", "", &mismatch).is_err());
+        let no_csrf_cookie = format!(r#"{{"cookie":"oj_sess={t}","x-csrf-token":"tok1"}}"#);
+        assert!(g.verify("/me", "POST", "", &no_csrf_cookie).is_err());
+        // 安全方法不查 CSRF。
+        assert_eq!(g.verify("/me", "GET", "", &no_hdr).unwrap()["id"], "7");
+        assert_eq!(g.verify("/me", "HEAD", "", &no_hdr).unwrap()["id"], "7");
+        // Bearer 命中不查 CSRF（即便 cookie 烂）。
+        let bt = sign(&g, "9", &[], 60);
+        assert_eq!(
+            g.verify("/me", "POST", &format!("Bearer {bt}"), &no_hdr)
+                .unwrap()["id"],
+            "9"
+        );
+        // 头名大小写不敏感（宿主给的是小写名，插件侧再兜一层）。
+        let upper = format!(r#"{{"cookie":"oj_sess={t}; oj_csrf=tok1","X-CSRF-TOKEN":"tok1"}}"#);
+        assert_eq!(g.verify("/me", "POST", "", &upper).unwrap()["id"], "7");
+    }
+
+    /// Bearer 无效但 cookie 有效 → cookie 兜底（不泄露哪条路失败）。
+    #[test]
+    fn invalid_bearer_falls_back_to_cookie() {
+        let g = guard_cookie();
+        let t = sign(&g, "7", &[], 60);
+        let hdrs = format!(r#"{{"cookie":"oj_sess={t}"}}"#);
+        assert_eq!(
+            g.verify("/me", "GET", "Bearer nope", &hdrs).unwrap()["id"],
+            "7"
+        );
+    }
+
+    /// 匿名路径最短路：cookie 开启也不查会话/CSRF。
+    #[test]
+    fn anonymous_path_short_circuits_before_cookie() {
+        let mut g = guard_cookie();
+        g.anon = vec!["/public/**".into()];
+        assert_eq!(
+            g.verify("/public/x", "POST", "", "").unwrap(),
+            serde_json::Value::Null
+        );
     }
 
     extern "C" fn nl(_level: u8, _msg: RString) {}
@@ -261,6 +478,7 @@ mod tests {
                     jwt_secret: "k".into(),
                     signing_method: alg.into(),
                     anonymous_paths: vec![],
+                    cookie: CookieCfg::default(),
                 })
                 .is_ok()
             );

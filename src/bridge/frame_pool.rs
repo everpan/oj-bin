@@ -448,7 +448,9 @@ impl ConnHandle {
     }
 
     /// 连接收尾：删会话表条目 + 丢排队帧 + 空池 linger 退役计时。
+    /// 所有退出路径汇合于此，WS 房间中心随此一并摘除本连接（oj-6）。
     pub fn detach(&self) {
+        super::ws::hub().remove_conn(self.conn);
         self.pool
             .sessions
             .lock()

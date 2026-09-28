@@ -32,6 +32,9 @@ pub trait BlobBackend: Send + Sync {
     async fn del(&self, key: &str) -> BridgeResult<()>;
     /// 下载/外链地址（local = {base}/blob/{key}；s3 = presigned URL）。
     async fn url(&self, key: &str) -> BridgeResult<String>;
+    /// 上传直传预签名（ABI 9；op JSON 语义同插件契约）。local 无预签名概念：
+    /// 返回 Err，宿主回落直传 PUT 路由。
+    async fn upload_url(&self, key: &str, op: &str) -> BridgeResult<serde_json::Value>;
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>>;
     /// 下载路由直出：Some((bytes, content_type)) 或 302 Location。
     async fn serve(&self, key: &str) -> BridgeResult<BlobServed>;
@@ -179,6 +182,11 @@ impl BlobBackend for LocalBlob {
         Ok(format!("{}/blob/{key}", self.base_url))
     }
 
+    async fn upload_url(&self, key: &str, _op: &str) -> BridgeResult<serde_json::Value> {
+        os_path(key)?;
+        Err("local blob backend has no upload presign; use the direct PUT upload route".into())
+    }
+
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
         os_path(key)?;
         Ok(std::fs::read_to_string(self.ct_path(key))
@@ -303,6 +311,26 @@ pub async fn op_blob_url(
     b.url(&key)
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+/// blob.uploadUrl(key, opts?) → 上传直传预签名 JSON（v0.1.30，ABI 9）。
+/// opts 缺省 `{"kind":"put"}`；s3 后端返回预签名 PUT URL（15min），local 后端抛错
+/// （"local blob backend has no upload presign; use the direct PUT upload route"——
+/// 直传用 `PUT {base}/blob/{key}` 路由）。
+#[op2]
+#[string]
+pub async fn op_blob_upload_url(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] key: String,
+    #[string] op: Option<String>,
+) -> Result<String, JsErrorBox> {
+    let b = { backend_named(&state.borrow(), &name)? };
+    let v = b
+        .upload_url(&key, op.as_deref().unwrap_or(r#"{"kind":"put"}"#))
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    serde_json::to_string(&v).map_err(|e| JsErrorBox::generic(e.to_string()))
 }
 
 /// blob.contentType(key) → content-type 字符串；缺失/无 sidecar/无法推断扩展名时返回空串。
@@ -506,6 +534,48 @@ mod tests {
         }
         // 越界 key 经 os_path 拒绝
         assert!(b.serve("../up").await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn op_blob_upload_url_local_backend_errors_with_direct_put_hint() {
+        let root = tmp_root();
+        let local = LocalBlob::new(&root, "/v1/api").unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                blobs: Some(registry_with_default(Arc::new(local))),
+                ..Default::default()
+            },
+        );
+        // 缺省 opts = {"kind":"put"}；local 后端无预签名 → 错误文案指路直传 PUT 路由。
+        let cap = b
+            .run_with(
+                r#"
+                (async () => {
+                    try {
+                        await blob.uploadUrl("a/big.bin");
+                        json.ok({ err: "" });
+                    } catch (e) {
+                        json.ok({ err: String(e) });
+                    }
+                })().catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let err = v["data"]["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("local blob backend has no upload presign")
+                && err.contains("direct PUT upload route"),
+            "{err}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

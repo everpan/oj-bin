@@ -688,6 +688,9 @@ extern "C" fn pl_blob_connect(name: RString, cfg: RString) -> FfiFuture {
 extern "C" fn pl_blob_stub(_h: u64, _k: RString) -> FfiFuture {
     oj_plugin_ffi::ready_err("stub")
 }
+extern "C" fn pl_blob_upload_url(_h: u64, _k: RString, _op: RString) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
 extern "C" fn pl_blob_put(
     _h: u64,
     _k: RString,
@@ -704,6 +707,7 @@ static PL_BLOB_VT: BlobBackendVtable = BlobBackendVtable {
     get: pl_blob_stub,
     del: pl_blob_stub,
     url: pl_blob_stub,
+    upload_url: pl_blob_upload_url,
     content_type: pl_blob_stub,
     close: pl_blob_close,
 };

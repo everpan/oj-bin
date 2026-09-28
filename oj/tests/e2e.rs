@@ -1058,10 +1058,12 @@ async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
         only_js::config::StaticSiteConf {
             prefix: "/docs".into(),
             path: "docs".into(),
+            headers: Default::default(),
         },
         only_js::config::StaticSiteConf {
             prefix: "/".into(),
             path: "web".into(),
+            headers: Default::default(),
         },
     ];
     let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
