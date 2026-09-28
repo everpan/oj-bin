@@ -2407,6 +2407,51 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 - npm 包不可撤回：CI 上 release 草稿期不发 npm（人工核对 release 后幂等补发），
   版本一经发布不可复用——改代码必须递增版本。
 
+### `oj exec <file.ts|js>` —— 直接执行脚本（v0.1.29）
+
+不起 HTTP 服务，直接在一个装配好完整后端的运行时里跑一个 ts/js 文件：一次性数据
+修复、迁移后对账、定时任务原型、批处理脚本。后端全局与 handler 同源（`json`/`db`/
+`kv`/`blob`/`bus`/`es`/`fetch`/`ws`/`log`/`plugins`/`cert`/`jwt`/`bcrypt`/`crypto`/
+`oidc`/`ldap`/`mail`/`mq`），经 `assemble_backend` 装配，db/kv/es/blob/bus/插件全部可用。
+专题手册：仓库 `docs/exec-integration.md`。
+
+```bash
+./bin/oj exec scripts/fix.ts -c config.yaml                  # 完整后端
+./bin/oj exec scripts/fix.ts -c config.yaml --log-file a.jsonl
+./bin/oj exec scripts/fix.ts -c config.yaml -- --dry-run id=7  # -- 后 argv 注入 globalThis.args
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `<file>` | 必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1） |
+| `-c` | `config.yaml` | 配置文件路径 |
+| `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
+| `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |
+| `--log-file` | 不落盘 | 追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 stderr warn 一次，终端输出继续 |
+| `-- arg...` | 无 | `--` 之后的 argv 原样注入 `globalThis.args: string[]`（无 `--` 为空数组） |
+
+**与 server 的装配差异（有意为之，勿拿 server 直觉套 exec）**：
+
+- **无证书门禁**：`server.certificate_path` 等不校验（exec 不起 HTTP 面）。
+- **迁移默认 off**：server dev 缺省 `auto`、exec 缺省**全跳过**（apply/verify/
+  reconcile 都不做）；仅 config 显式写 `migrate_on_start: auto|verify` 时才执行对应项。
+- **无 KillSwitch**：手工 runtime 不过 RuntimePool，同步死循环（`while(true){}`）
+  会无限挂起——Ctrl-C 是唯一兜底；长任务请用 `src/tasks/` 任务池。
+- **租户/归属守卫不设防**：exec 无 HTTP 请求上下文（租户 id 恒 None），视同匿名
+  系统操作员；`sql_guard: "deny"` 的库上脚本须 `await db.asSystem()`。
+- **`console` 仅 exec 可用**：server/test 的 runtime 无 `console` 全局——同一脚本
+  拷进 handler 会 `ReferenceError`。
+- **`json.*`/`finish` 空转**：`json.ok(x)` 不会打印 x（没有 HTTP 消费方）；要输出
+  用 `console.log`/`log.*`。
+
+输出语义：`console.*` 与 `log.*` 都直出 stdout（`INFO    消息` 形态，管道友好——
+装配期 tracing 日志只走 stderr）；`--log-file` 时同一事件双写 JSONL。退出码：
+成功 settle 0；脚本未捕获异常 / 加载失败 / 装配失败 → stderr 报错，exit 1。
+
+相对导入：脚本可 import 项目根（config 所在目录）内的 `.ts`/`.js`，**必须带显式
+扩展名**（`import "./util.ts"`）；`import "../x"` 上跳出项目根即被拒。脚本放项目外
+（如 `/tmp/foo.ts`）则连 `./util.ts` 都导不了（解析上界 = 项目根）。
+
 ## 12. 运维要点
 
 > 何时读我：服务跑起来之后的证书/日志/排障/升级。
@@ -2605,6 +2650,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `ext_boot.js` 用顶层 `await` 须带 `export {};` | 否则被 CJS 启发式包进非 async 函数 → SyntaxError（§6 末） |
 | `ext_boot.js` 拿不到 `ext:core/ops` | deno_core 拒绝 `file://` → `ext:` 导入；只能在已有全局上做组合，新 op 属改 bootstrap |
 | `ext_boot.js` 不做热重载 | 装配期冻结 spec，改动必须重启；池内可能新旧混杂 |
+| `oj exec` 无执行超时 / KillSwitch（v0.1.29） | 手工 runtime 不过 RuntimePool：同步死循环（`while(true){}`）无限挂起，Ctrl-C 是唯一兜底；常驻轮询用 `src/tasks/` 任务池 |
+| `oj exec` 租户/归属守卫不设防（v0.1.29） | 无 HTTP 请求上下文（租户 id 恒 None）= 匿名系统操作员；`sql_guard: "deny"` 的库上脚本须 `await db.asSystem()` |
+| `oj exec` 相对导入上跳被拒（v0.1.29） | import 被钳制在项目根（config 所在目录）内且须显式扩展名——`import "../x"` 报 escapes project root；脚本在项目外则连 `./util.ts` 都导不了 |
 
 ### 常见陷阱清单
 
@@ -2636,3 +2684,6 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - `vars.get("X")` 恒 `null`：`X` 没写进 config 的 `vars:` 段（fail-closed，不读 OS env）。
 - 动态 meta 的 handler 要读**原始请求路径**得看 `http.query.path`（percent-encoded，自己
   `decodeURIComponent`）；它不经守卫、拿不到 `http.user`（页面请求本来也没有 Bearer）。
+- `oj exec` 脚本里 `json.ok(x)` 不打印 x——`json.*`/`finish` 空转（没有 HTTP 消费方）；
+  要输出用 `console.log`/`log.*`（`console` 仅 exec 运行时提供，拷进 handler 是
+  `ReferenceError`）。`oj exec` 迁移默认 off（server dev 缺省 auto，两命令相反）。
