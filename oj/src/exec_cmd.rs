@@ -57,6 +57,38 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                 let backend =
                     assemble_backend(&cfg, &config_dir, &dir, &base, true, db_override.as_deref())
                         .await?;
+                // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
+                // 有意不对称）；仅 config 显式写 migrate_on_start 时执行对应项，
+                // reconcile 跟随 auto。非法值 fail-fast（与 server 文案一致）。
+                if let Some(gate) = cfg.server.migrate_on_start.as_deref() {
+                    let stable = backend.stable();
+                    let db_key = db_override.as_deref().unwrap_or("default");
+                    match gate {
+                        "auto" => {
+                            crate::migrate::apply_all(stable.dbs.get(db_key), &dir, true, false)
+                                .await?;
+                            for l in crate::schema::reconcile_all(
+                                stable.dbs.get(db_key).map(|a| a.as_ref()),
+                                &dir,
+                                true,
+                                db_key,
+                            )
+                            .await?
+                            {
+                                eprintln!("schema: {l}");
+                            }
+                        }
+                        "verify" => {
+                            crate::migrate::verify_all(stable.dbs.get(db_key), &dir, true).await?
+                        }
+                        "off" => {}
+                        other => {
+                            return Err(format!(
+                                "server.migrate_on_start: illegal value {other:?} (auto|verify|off)"
+                            ));
+                        }
+                    }
+                }
                 run_script(&backend, &script, ExecOptions { args, log_file }).await
             })
         })
@@ -247,6 +279,60 @@ mod tests {
         })
         .unwrap_err();
         assert!(e.contains("plugin"), "{e}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⑦ 迁移门禁（spec §3.1，终审 I-1）：缺省全跳过 → 脚本查不到表；显式
+    /// `migrate_on_start: auto` → apply 建表。两分支钉死 exec 与 server dev
+    /// （缺省 auto）相反的缺省。
+    #[test]
+    fn given_migrate_gate_when_run_then_default_skips_and_explicit_auto_applies() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t7gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src/t7m/migrations")).unwrap();
+        std::fs::write(
+            tmp.join("src/t7m/manifest.yaml"),
+            "name: t7m\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/t7m/migrations/0001__init.sql"),
+            "create table t7gate (id integer);",
+        )
+        .unwrap();
+        let script = tmp.join("probe.ts");
+        std::fs::write(
+            &script,
+            r#"const r = await db.query("select count(*) as c from sqlite_master where type = 'table' and name = 't7gate'", []); if (r[0].c !== 1) throw new Error("GATE=missing");"#,
+        )
+        .unwrap();
+        let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("t7.db"));
+        let mk = |gate: Option<&str>| {
+            let yaml = match gate {
+                Some(g) => {
+                    format!("db:\n  default: \"{dsn}\"\nserver:\n  migrate_on_start: {g}\n")
+                }
+                None => format!("db:\n  default: \"{dsn}\"\n"),
+            };
+            let p = tmp.join(format!(
+                "cfg-{}.yaml",
+                if gate.is_some() { "on" } else { "off" }
+            ));
+            std::fs::write(&p, yaml).unwrap();
+            ExecArgs {
+                file: script.to_string_lossy().into(),
+                config: p.to_string_lossy().into(),
+                dir: Some(tmp.join("src").to_string_lossy().into()),
+                db: None,
+                log_file: None,
+                args: vec![],
+            }
+        };
+        // 缺省（不写 migrate_on_start）= 全跳过 → 表不存在 → 脚本 throw。
+        let e = run(mk(None)).unwrap_err();
+        assert!(e.contains("GATE=missing"), "{e}");
+        // 显式 auto → apply（含 reconcile 跟随）→ 表存在 → settle 0。
+        assert_eq!(run(mk(Some("auto"))).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
