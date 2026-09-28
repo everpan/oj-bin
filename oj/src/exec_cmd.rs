@@ -134,6 +134,7 @@ pub(crate) async fn run_script_ext(
 mod tests {
     use super::*;
     use crate::app::{Backend, assemble_backend};
+    use crate::args::ExecArgs;
     use only_js::config::Config;
 
     async fn backend_fixture(tmp: &Path) -> Backend {
@@ -225,5 +226,27 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    /// ⑥ 装配 fail-fast 透传（spec §4 行 2）：strict 清单列了不存在的插件 → Err。
+    #[test]
+    fn given_strict_manifest_missing_plugin_when_run_then_err_mentions_plugins() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.yaml"), "plugins:\n  nope-plugin: {}\n").unwrap();
+        let script = tmp.join("s.ts");
+        std::fs::write(&script, "console.log(1);").unwrap();
+        let e = run(ExecArgs {
+            file: script.to_string_lossy().into(),
+            config: tmp.join("config.yaml").to_string_lossy().into(),
+            dir: Some(tmp.to_string_lossy().into()),
+            db: None,
+            log_file: None,
+            args: vec![],
+        })
+        .unwrap_err();
+        assert!(e.contains("plugin"), "{e}");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
