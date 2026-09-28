@@ -62,6 +62,13 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::Exec(a) => match oj::exec_cmd::run(a) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("oj exec: {e}");
+                1
+            }
+        },
     }
 }
 
