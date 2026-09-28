@@ -130,6 +130,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 日志 `warn: html_meta_handler: …` 但页面照常 200 | fail-open 是设计：handler 非 2xx / 超时 / 非 JSON / 信封 `code != 0` 时按静态结果送出。按 WARN 里的原因修 handler，页面不会 500 |
 | `vars.get("X")` 恒 `null` | 只有写进 config 顶层 `vars:` 段的键可读（fail-closed；平台**不**读 OS env，也没有读任意 config 键的口子）。值只能是标量（`PORT: 3000` 读成 `"3000"`，嵌套 map/list 是配置错误） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
+| `oj exec` 脚本输出没看到 | `json.ok(x)` 空转（无 HTTP 消费方）——输出用 `console.log`/`log.*`；但 `console` 仅 exec 可用，同一脚本拷进 handler 是 `ReferenceError` |
+| `oj exec` 的 `-- -x` 被 clap 拒 / 脚本里 `args` 是空数组 | 透传参数必须放在 `--` **之后**（`oj exec s.ts -c config.yaml -- --dry-run`），经 `globalThis.args: string[]` 注入；`--` 前的都归 CLI 自己 |
+| `oj exec` import 报 escapes project root / 找不到 `./util` | 相对导入钳制在项目根（config 所在目录）内且**必须显式扩展名**（`import "./util.ts"`）；脚本放项目外连 `./util.ts` 都导不了 |
+| `oj exec` 报迁移相关意外 | exec 迁移默认 **off**（server dev 缺省 auto，两命令相反）；config 显式 `migrate_on_start` 才执行 |
+| `oj exec --log-file` 没生成文件 | 打开失败只 stderr warn 一次、不中断脚本——看 stderr 首行 warn（路径不可写等） |
 | 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |
 | `db(mysql): column 'x' has MySQL type 'DECIMAL' … does not decode yet` | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）——**报错而非静默给 `null`**。在 SQL 里显式转换：`select cast(x as char) as x from t`，别用 `select *`。另：MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0`，不是 `true`/`false` |

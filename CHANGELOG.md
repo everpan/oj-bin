@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.29（2026-09-28，未打标签）
+
+> 版本分界：`oj/Cargo.toml` 0.1.28 → 0.1.29。上一版：`v0.1.28` → 515c33f。
+
+**特性（oj exec 子命令）**
+
+- **`oj exec <file.ts|js>`（v0.1.29）**：直接执行 ts/js 脚本，完整注入后端全局
+  （json/db/kv/blob/bus/es/fetch/ws/log/plugins/cert/jwt/bcrypt/crypto/oidc/ldap/mail/mq，
+  经 `assemble_backend` 装配，与 server 同源）。`console.*`/`log.*` 终端 stdout
+  直出；`--log-file` 双写 JSONL（打开失败仅告警不中断）。`--` 之后 argv 注入
+  `globalThis.args`。脚本可 import 项目根内 .ts/.js（须带显式扩展名）。
+  专题手册：`docs/exec-integration.md`。
+  - CLI：`exec <file> [-c config] [-d dir] [--db name] [--log-file path] [-- arg...]`
+  - **与 server 的装配差异（有意为之）**：无证书门禁；迁移默认 off（仅 config
+    显式 `migrate_on_start` 才执行，server dev 缺省 auto——两命令相反，勿混用）；
+    无 KillSwitch（同步死循环 Ctrl-C 兜底）；`sql_guard=deny` 的库上脚本须
+    `db.asSystem()`；`console` 仅 exec 可用（server/test runtime 无此全局）；
+    `json.*`/`finish` 空转（无 ReqState 消费方）。
+  - **拆分重构（行为不变）**：`App::from_config` 拆出 `assemble_backend`——
+    `Backend = { stable, auth_guard, make_bridge_of }`，StableState 单源；
+    `schema::reconcile_all` 独立化；`mail::install_mail_deliver` 显式化
+    （server 经 Bridge 构造、exec/test 手工 runtime 经 assemble_backend 各装一次）。
+    已知次序差异：多故障场景下 fail-fast 报错先后序有变化（如证书门禁错误改为
+    后端装配错误之后才报出），单故障场景报错文案不变。
+
 ## v0.1.28（2026-09-25，已打标签 v0.1.28）
 
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.27 → 0.1.28`）。

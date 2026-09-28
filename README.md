@@ -118,6 +118,7 @@ through `bin/oj`:**
 | `./bin/oj server -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
 | `./bin/oj build -d <src> -o <dist>` | build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
 | `./bin/oj test -c <config>` | run `*.test.ts` in-process (no server needed) |
+| `./bin/oj exec <file.ts\|js> -c <config>` | run one ts/js script with the full backend injected — one-off fixes / reconciliation / job prototypes (v0.1.29, see `docs/exec-integration.md`) |
 | `./bin/oj migrate / fixture / schema diff` | migrations / demo data / schema diff (see `docs/user-manual.md`) |
 
 - **Portable**: `bin/oj` + `bin/plugins/<triple>/` is the self-contained distribution
@@ -340,6 +341,7 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | `docs/testing.md` | testing conventions |
 | `docs/migration.md` | migration runbook (schema.yaml / migrations / ledger / guards) |
 | `docs/ops-manual.md` | operations |
+| `docs/exec-integration.md` | `oj exec` integration manual (run ts/js scripts with the full backend, v0.1.29) |
 | `docs/benchmarks.md` | performance data |
 | `sample/README.md` | example project notes |
 

@@ -18,6 +18,7 @@
 | [8](#场景-8302-重定向到-blob-预签名-url) | 权限校验后 302 到 `blob.url()` 预签名 URL，浏览器两跳直取对象（`json.redirect`，v0.1.26） | §6 json / §7 响应信封 |
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
+| [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + stdout 直出（v0.1.29） | §11 `oj exec` |
 
 ---
 
@@ -849,9 +850,61 @@ curl -X POST http://localhost:9778/v1/api/user/login/      -d '{"username":"eve"
 
 ---
 
+## 场景 12：一次性数据修复脚本（oj exec，v0.1.29）
+
+> 何时抄我：迁移后对账、一次性数据修复、批处理导出；或定时任务的本地原型
+> （验证逻辑后搬进 `src/tasks/` 任务池上生产——exec 无 KillSwitch，不适合常驻）。
+
+### ① 配置
+
+不需要新配置：复用项目现有 `config.yaml`（exec 经 `assemble_backend` 装配完整后端，
+db/kv/blob/bus/插件全部可用）。唯一要记的差异：**迁移默认 off**（server dev 缺省
+auto，两命令相反）——脚本操作前先确认 `oj migrate` 已跑过。
+
+### ② 脚本（scripts/fix-roles.ts）
+
+```ts
+// 一次性修复：role 为空的历史账号补默认角色；--dry-run 只对账不改数据。
+const dry = args.includes("--dry-run");
+const rows = await db.query("select id, name from account where role is null or role = ''", []);
+console.log(`待修复 ${rows.length} 条`);
+for (const r of rows) {
+  console.log("  fix", r.id, r.name);
+  if (!dry) {
+    await db.exec("update account set role = ? where id = ?", ["member", r.id]);
+  }
+}
+log.info("done", "fixed", dry ? 0 : rows.length);
+```
+
+### ③ 验证
+
+```bash
+./bin/oj exec scripts/fix-roles.ts -c config.yaml -- --dry-run   # 先对账（args 含 --dry-run）
+# → INFO    待修复 2 条
+# → INFO      fix 1 neo …
+./bin/oj exec scripts/fix-roles.ts -c config.yaml --log-file fix.jsonl   # 真跑 + JSONL 落盘
+# 退出码 0 = settle 无异常；脚本 throw → stderr 报 V8 异常，exit 1
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| `json.ok(...)` 什么都没输出 | exec 里 `json.*`/`finish` 空转（没有 HTTP 消费方）——输出用 `console.log`/`log.*` |
+| 脚本拷进 handler 后 `console is not defined` | `console` 仅 exec 运行时提供（server/test 无此全局）——搬回 handler 时删掉 |
+| `args` 是空数组 | 透传参数必须在 `--` **之后**：`oj exec s.ts -c config.yaml -- --dry-run` |
+| import 报 escapes project root | 相对导入钳制在项目根（config 所在目录）内且须显式扩展名（`import "./util.ts"`）；`import "../x"` 上跳被拒 |
+| `sql_guard: "deny"` 库上查询被拦 | exec 无 HTTP 上下文 = 匿名操作员，且守卫不设防；被 deny 拦的查询加 `await db.asSystem()` |
+| 脚本卡死不退 | exec 无超时/KillSwitch——同步死循环只能 Ctrl-C；常驻轮询搬进 `src/tasks/` 任务池 |
+| `--log-file` 没生成 | 打开失败只 warn 一次不中断——看 stderr 首行（路径不可写等） |
+
+---
+
 ## 相关文档
 
 - `api-manual.md` —— 完整 API 手册（13 章）
+- `docs/exec-integration.md`（仓库）—— `oj exec` 集成手册（场景 12 的机制与差异全解）
 - `docs/tenant-guide.md`（仓库）—— 多租户白话指南
 - `docs/testing.md`（仓库）—— L1/L2 两层测试选型
 - `docs/mail-smtp.md`（仓库）—— 邮件投递完整手册

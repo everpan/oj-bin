@@ -105,6 +105,22 @@ kill 12345                       # 停机：SIGTERM 走优雅停机（排空在�
 落盘基于 fd 重定向，**仅 unix**：Windows 上不写日志文件，终端输出强制保留并告警。
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
 
+### 2.1 `oj exec`（v0.1.29）：直接跑脚本
+
+```bash
+./oj exec scripts/fix-roles.ts -c config.yaml -- --dry-run   # -- 后 argv 注入脚本 args
+./oj exec scripts/fix-roles.ts -c config.yaml --log-file fix.jsonl
+```
+
+一次性数据修复/对账/批处理用。**迁移默认 off 是与 server dev 相反的缺省**——
+server dev 不写 `migrate_on_start` 时缺省 `auto`（启动即应用迁移），`oj exec` 同样
+不写时**全跳过**（apply/verify/reconcile 都不做），仅 config 显式写
+`migrate_on_start: auto|verify` 才执行。拿 server 直觉套 exec 之前先核对这个开关。
+其他差异：无证书门禁；无请求超时/KillSwitch（同步死循环 Ctrl-C 兜底，**不适合
+生产常驻**——常驻任务放 `src/tasks/` 任务池）；`sql_guard: "deny"` 库上脚本须
+`db.asSystem()`；stdout 只有脚本输出（装配日志走 stderr），可安全管道/重定向。
+专题手册：`docs/exec-integration.md`。
+
 ## 3. 配置管理
 
 `config.yaml` 全字段可省，均有默认。生产要点：
