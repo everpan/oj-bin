@@ -95,6 +95,7 @@ pub enum Command {
     Migrate(MigrateArgs),
     Fixture(FixtureArgs),
     SchemaDiff(SchemaDiffArgs),
+    Exec(ExecArgs),
 }
 
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
@@ -104,6 +105,17 @@ pub struct SchemaDiffArgs {
     pub dir: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
     pub db: Option<String>,
+}
+
+/// `oj exec [-c config] [-d dir] [--db name] [--log-file path] file [args...]`：
+/// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）。
+pub struct ExecArgs {
+    pub file: String,
+    pub config: String,
+    pub dir: Option<String>,
+    pub db: Option<String>,
+    pub log_file: Option<String>,
+    pub args: Vec<String>,
 }
 
 /// oj：目录镜像路由的 JS 服务与构建 CLI。
@@ -249,6 +261,26 @@ enum Commands {
         #[command(subcommand)]
         command: SchemaCmd,
     },
+    /// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）
+    Exec {
+        /// 脚本文件路径（.ts/.js）
+        file: String,
+        /// 配置文件路径（db/redis/插件段）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录（schema 白名单来源）；默认自动探测（src 优先 dist 次之）
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 字面 "default" 的库调用重定向到该库（未声明的库名 fail-fast）
+        #[arg(long)]
+        db: Option<String>,
+        /// 日志同时落盘 JSONL（终端照出；打开失败仅告警不中断）
+        #[arg(long = "log-file")]
+        log_file: Option<String>,
+        /// 传给脚本的参数（`--` 之后原样注入 globalThis.args）
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 /// `oj schema <sub>`：现有仅 diff（漂移对账）。
@@ -359,6 +391,21 @@ fn to_command(cli: Cli) -> Command {
         Commands::Schema {
             command: SchemaCmd::Diff { config, dir, db },
         } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
+        Commands::Exec {
+            file,
+            config,
+            dir,
+            db,
+            log_file,
+            args,
+        } => Command::Exec(ExecArgs {
+            file,
+            config,
+            dir,
+            db,
+            log_file,
+            args,
+        }),
     }
 }
 
@@ -369,6 +416,26 @@ mod tests {
 
     fn cmd(argv: &[&str]) -> Command {
         to_command(Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied())).unwrap())
+    }
+
+    #[test]
+    fn exec_file_last_args_and_log_file_parse() {
+        // `--` 之后原样透传（含连字符参数）；--log-file / -d / --db 映射。
+        let Command::Exec(a) = cmd(&[
+            "exec", "scripts/job.ts", "-c", "c.yaml", "-d", "src",
+            "--db", "report", "--log-file", "out.jsonl", "--", "-x", "foo bar",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.file, "scripts/job.ts");
+        assert_eq!(a.config, "c.yaml");
+        assert_eq!(a.dir.as_deref(), Some("src"));
+        assert_eq!(a.db.as_deref(), Some("report"));
+        assert_eq!(a.log_file.as_deref(), Some("out.jsonl"));
+        assert_eq!(a.args, ["-x", "foo bar"]);
+        // 无 `--` → args 为空。
+        let Command::Exec(a) = cmd(&["exec", "s.ts", "-c", "c.yaml"]) else { panic!() };
+        assert!(a.args.is_empty());
     }
 
     #[test]
