@@ -1180,3 +1180,62 @@ async fn json_redirect_302_location_hypertext_note_end_to_end() {
     assert!(body.contains(">See Other</a>"), "{body}");
     let _ = std::fs::remove_dir_all(&t);
 }
+
+/// v0.1.29 exec e2e：脚本 console/log 直出 stdout（管道友好，无 tracing 元数据），
+/// 退出码 0；顶层 throw → 退出码 1 且 stderr 携带 V8 异常消息（spec §3.3/§4）。
+/// 最小 config 即可：exec 跳过证书门禁、不声明 db/kv → 内存兜底（spec §3.1 有意分叉）。
+#[test]
+fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-exec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("config.yaml"), "{}\n").unwrap();
+    let script = tmp.join("hello.ts");
+    std::fs::write(
+        &script,
+        "console.log(\"hello-stdout\"); log.info(\"via-log\", \"k\", 1);",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args([
+            "exec",
+            &script.display().to_string(),
+            "-c",
+            &tmp.join("config.yaml").display().to_string(),
+        ])
+        .output()
+        .expect("spawn oj exec child");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hello-stdout"), "{stdout}");
+    assert!(stdout.contains("via-log"), "{stdout}");
+    // 管道友好：tracing 装配日志不进 stdout（只走 stderr）。
+    assert!(!stdout.contains("oj::"), "{stdout}");
+
+    // 失败路径：顶层 throw → 退出码 1，stderr 原样透传 V8 异常（不吞不改写）。
+    let bad = tmp.join("bad.ts");
+    std::fs::write(&bad, "throw new Error(\"exec-e2e-boom\");").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args([
+            "exec",
+            &bad.display().to_string(),
+            "-c",
+            &tmp.join("config.yaml").display().to_string(),
+        ])
+        .output()
+        .expect("spawn oj exec child");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("exec-e2e-boom"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
