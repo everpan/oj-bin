@@ -137,13 +137,17 @@ const MAIL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// 后台运行入口（unix 分支）：re-exec 自身，剥掉 --daemon（避免子进程递归 daemon 化），
 /// setsid 脱离控制终端（终端关闭的 SIGHUP 不再波及），stdio 重定向 /dev/null。
 /// 父进程 spawn 成功即打印子 pid 返回；启动失败的真因见 server.logs_dir 落盘日志。
+///
+/// 自带 glibc 发行包（deploy.sh 启动器注入 OJ_BUNDLED_LD / OJ_BUNDLED_LIB）：re-exec
+/// 必须继续走打包的 ld-linux + --library-path——kernel 按 oj.bin 的 PT_INTERP（系统
+/// /lib64 路径）加载系统 ld-linux，低版本宿主 glibc 即崩；非打包形态 env 缺省，原样 re-exec。
 #[cfg(unix)]
 fn daemonize() -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| format!("daemon: current_exe: {e}"))?;
     let null =
         std::fs::File::open("/dev/null").map_err(|e| format!("daemon: open /dev/null: {e}"))?;
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = bundled_reexec_cmd(&exe);
     cmd.args(strip_daemon_flag(std::env::args_os().skip(1)))
         .stdin(null)
         .stdout(std::process::Stdio::null())
@@ -161,6 +165,23 @@ fn daemonize() -> Result<(), String> {
     let child = cmd.spawn().map_err(|e| format!("daemon: spawn: {e}"))?;
     println!("oj server daemonized (pid {})", child.id());
     Ok(())
+}
+
+/// 构造 daemon re-exec 命令：打包形态（env 齐）→ 打包 ld-linux + --library-path + 程序路径；
+/// 否则 → 直接 re-exec 自身。
+#[cfg(unix)]
+fn bundled_reexec_cmd(exe: &std::path::Path) -> std::process::Command {
+    match (
+        std::env::var_os("OJ_BUNDLED_LD"),
+        std::env::var_os("OJ_BUNDLED_LIB"),
+    ) {
+        (Some(ld), Some(lib)) => {
+            let mut c = std::process::Command::new(ld);
+            c.arg("--library-path").arg(lib).arg(exe);
+            c
+        }
+        _ => std::process::Command::new(exe),
+    }
 }
 
 /// re-exec 参数剥离 --daemon（长旗标独占，无短形式，精确匹配即安全）。
@@ -849,6 +870,37 @@ mod tests {
         // 无 --daemon 时原样透传。
         let out = strip_daemon_flag(["server", "-c", "c.yaml"].into_iter().map(OsString::from));
         assert_eq!(out.len(), 3);
+    }
+
+    /// v0.1.28 fix：自带 glibc 发行包 daemon 化后必须继续走打包 ld-linux（deploy.sh 启动器
+    /// 注入的 OJ_BUNDLED_LD/LIB 标记），否则 re-exec 落回系统 ld-linux 崩在低版本宿主。
+    #[cfg(unix)]
+    #[test]
+    fn bundled_reexec_cmd_prefers_bundled_ld() {
+        let exe = std::path::Path::new("/fake/oj.bin");
+        // Safety: 单测独占进程内这两个 oj 私有 env 键，先后成对 remove/set/remove，无并发读写。
+        unsafe {
+            std::env::remove_var("OJ_BUNDLED_LD");
+            std::env::remove_var("OJ_BUNDLED_LIB");
+        }
+        // 未注入（非打包形态）→ program 即自身。
+        let c = super::bundled_reexec_cmd(exe);
+        assert_eq!(c.get_program(), exe.as_os_str());
+
+        // Safety: 同上，设值后立即断言并清理。
+        unsafe {
+            std::env::set_var("OJ_BUNDLED_LD", "/pkg/lib/ld-linux-x86-64.so.2");
+            std::env::set_var("OJ_BUNDLED_LIB", "/pkg/lib");
+        }
+        let c = super::bundled_reexec_cmd(exe);
+        let args: Vec<_> = c.get_args().collect();
+        assert_eq!(c.get_program(), "/pkg/lib/ld-linux-x86-64.so.2");
+        assert_eq!(args, ["--library-path", "/pkg/lib", "/fake/oj.bin"]);
+        // Safety: 同上，收尾清理。
+        unsafe {
+            std::env::remove_var("OJ_BUNDLED_LD");
+            std::env::remove_var("OJ_BUNDLED_LIB");
+        }
     }
 
     /// 回归钉：缺省服务目录自 config 同级起步逐级向上搜索（src 优先、dist 次之），

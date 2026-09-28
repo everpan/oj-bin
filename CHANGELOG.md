@@ -21,6 +21,19 @@
 > 版本分界按仓库约定落在 `oj/Cargo.toml` 的递增提交上（本版 `0.1.27 → 0.1.28`）。
 > 发布点标签：`v0.1.28`。上一版：`v0.1.27` → `465322c`。
 
+**修复**
+
+- **Linux 自带 glibc 发行包 `--daemon` 启动即退（v0.1.28）**：根因是 daemon 化走
+  `current_exe()` re-exec 真实二进制 `oj.bin`，kernel 按 `oj.bin` 的 PT_INTERP
+  （系统 `/lib64/ld-linux-x86-64.so.2`）加载，绕开了 deploy.sh 启动器精心构造的
+  打包 glibc（`ld-linux --library-path lib/`），glibc 版本低于产物需求的宿主上
+  re-exec 后即退出。修复：启动器 export `OJ_BUNDLED_LD` / `OJ_BUNDLED_LIB` 标记，
+  `daemonize()` re-exec 时优先经打包 ld-linux + `--library-path` 启动（非打包形态
+  env 缺省，行为不变）。
+- **Windows CI 单测 `app::tests::resolve_static_sites_*` 报 InvalidFilename（code 123）**：
+  测试夹具 `tmp_dirs` 用 `{names:?}` Debug 格式拼临时目录名，`[`/`"` 是 Windows
+  非法文件名字符；改用 `names.join("_")`。纯测试修复，无行为变更。
+
 **特性（PRD `docs/prds/event-cqrs.md` v2 §9 阶段 1：任务域事件化）**
 
 - **双模长任务（v0.1.28）**：`src/tasks/` 下的任务文件按**导出探测**分流——

@@ -1258,7 +1258,11 @@ mod tests {
     // ---- v0.1.27：多静态站点有效站点表 ----
 
     fn tmp_dirs(names: &[&str]) -> (PathBuf, Vec<PathBuf>) {
-        let base = std::env::temp_dir().join(format!("oj-sites-{}-{names:?}", std::process::id()));
+        let base = std::env::temp_dir().join(format!(
+            "oj-sites-{}-{}",
+            std::process::id(),
+            names.join("_")
+        ));
         let _ = std::fs::remove_dir_all(&base);
         let dirs: Vec<PathBuf> = names
             .iter()
