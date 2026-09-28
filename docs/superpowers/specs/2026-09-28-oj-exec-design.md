@@ -147,7 +147,8 @@ parse args → load_app_config(config, dir, base=None)   // exec 恒 dev 语义 
   实现（bridge bootstrap 的 ojStringify 是模块内函数，exec_bootstrap 拿不到）。
 - 终端格式：`{LEVEL:5}  {msg}`（级别列对齐；msg 内换行原样保留）。
 - `--log-file f.jsonl`：同事件追加一行 `{"ts":"<RFC3339>","level":"INFO","msg":"..."}`
-  （与 server 落盘字段同形）。文件打开失败 → stderr warn 一次（既有 stderr tracing
+  （exec 自定义 JSONL 形态；server 落盘是 tracing 文本行经 tee，无 JSONL 先例——
+  修订措辞，见 Task 5 评审）。文件打开失败 → stderr warn 一次（既有 stderr tracing
   subscriber 通道，main.rs 非 server 命令已装，stdout 因此天然干净），终端照出，
   脚本继续。
 - **console 仅 exec 可用**：server/test 的 runtime 无 console（deno_core 默认不
