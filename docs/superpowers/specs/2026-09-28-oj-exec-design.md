@@ -31,6 +31,8 @@ async fn assemble_backend(
     cfg: &Config,
     config_dir: &Path,
     dir: &Path,          // api 目录（schema 白名单来源）
+    base: &str,          // blob 下载 URL 前缀：server 传 CLI 解析值（-b 覆盖 >
+                         // server.api_prefix），exec 传 config 派生值
     ts: bool,
     db_override: Option<&str>,
 ) -> Result<Backend, String>
