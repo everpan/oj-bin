@@ -703,12 +703,14 @@ fn migrate_gate_of(cfg: &Config, ts: bool) -> &str {
 /// 留在 `App::from_config`——exec/test 手工 runtime 经此拿到与 server 同一份后端
 /// （无证书门禁，故可在无证书 config 上构造）。
 ///
-/// blob 下载 URL 前缀取 config `server.api_prefix`（CLI `-b` 是 HTTP 层前缀覆盖，
-/// 不进 blob 注册——与拆分前 server 默认形态一致）。
+/// `base` = blob 下载 URL 前缀（local driver 的 `LocalBlob::named` 烘焙进注册表）：
+/// server 传 CLI 解析值（`-b` 覆盖 > `server.api_prefix`），保持路由表与 blob URL
+/// 同源不分裂；exec 无 CLI 覆盖，传 config 派生值。
 pub async fn assemble_backend(
     cfg: &Config,
     config_dir: &Path,
     dir: &Path,
+    base: &str,
     ts: bool,
     db_override: Option<&str>,
 ) -> Result<Backend, String> {
@@ -746,9 +748,7 @@ pub async fn assemble_backend(
     // blob：blob 段存在即启用；未声明 → None。
     let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
         None => None,
-        Some(section) => Some(
-            assemble_blobs(section, config_dir, &cfg.server.api_prefix, registries.blob).await?,
-        ),
+        Some(section) => Some(assemble_blobs(section, config_dir, base, registries.blob).await?),
     };
     // 逐 db 开库（未知 scheme 注册表 fail-fast）。
     let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
@@ -946,8 +946,9 @@ impl App {
         // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
         let dir = dir.canonicalize().unwrap_or(dir);
         // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
-        let backend =
-            Arc::new(assemble_backend(&cfg, config_dir, &dir, ts, db_override.as_deref()).await?);
+        let backend = Arc::new(
+            assemble_backend(&cfg, config_dir, &dir, &base, ts, db_override.as_deref()).await?,
+        );
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
@@ -1446,7 +1447,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let cfg = Config::default(); // 无证书、无 db/redis 段
-        let backend = super::assemble_backend(&cfg, &base, &base, true, None)
+        let backend = super::assemble_backend(&cfg, &base, &base, "/v1/api", true, None)
             .await
             .unwrap();
         // stable 单源：kv/dbs/loader 都经访问器直达，Backend 不复制字段。
