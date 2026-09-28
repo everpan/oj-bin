@@ -540,9 +540,19 @@ impl MailResultRouter {
 static MAIL_DELIVER: LazyLock<Mutex<Option<Weak<dyn MailBackend>>>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// 装配期挂载路由（每次构造带 mail 的 `StableState` 时调用；旧的弱引用随之失效）。
-pub(crate) fn install_mail_deliver(b: &Arc<dyn MailBackend>) {
+/// 装配期挂载路由（server 经 Bridge 构造、exec/test 手工 runtime 经 assemble_backend
+/// 显式调用各装一次；重复安装只是覆写同一弱引用，幂等）。
+pub fn install_mail_deliver(b: &Arc<dyn MailBackend>) {
     *MAIL_DELIVER.lock().unwrap() = Some(Arc::downgrade(b));
+}
+
+/// 路由是否已挂载且后端仍存活（exec 装配自检 / 测试断言用）。
+pub fn mail_deliver_installed() -> bool {
+    MAIL_DELIVER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|w| w.strong_count() > 0)
 }
 
 /// `deliver(MAIL_RESULT_TOPIC, payload)` 的宿主落点结果（**细分成因**：告警文案要能分辨
@@ -1592,6 +1602,24 @@ mod tests {
         fn router(&self) -> &MailResultRouter {
             &self.router
         }
+    }
+
+    #[test]
+    fn given_installed_backend_when_query_then_installed_true() {
+        let _g = lock();
+        let b: Arc<dyn MailBackend> = FakeMail::new(MailConfig::empty(), Arc::new(Bus::new()));
+        install_mail_deliver(&b);
+        assert!(mail_deliver_installed());
+    }
+
+    #[test]
+    fn given_dropped_backend_when_query_then_installed_false() {
+        let _g = lock();
+        {
+            let b: Arc<dyn MailBackend> = FakeMail::new(MailConfig::empty(), Arc::new(Bus::new()));
+            install_mail_deliver(&b);
+        } // 弱引用随强引用消亡
+        assert!(!mail_deliver_installed());
     }
 
     /// 假插件上送的统一信封（`HostContext.deliver(MAIL_RESULT_TOPIC, …)` 的载荷）。

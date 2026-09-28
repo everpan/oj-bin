@@ -20,7 +20,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use oj_plugin_ffi;
-use only_js::bridge::blob::{BlobBackend, BlobRegistry};
+use only_js::bridge::blob::BlobRegistry;
 use only_js::bridge::ldap::{FfiLdapBackend, LdapBackend, LdapConfig};
 use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
@@ -649,6 +649,279 @@ fn load_cert_with_watcher(
     Ok((cert_status, cert_valid_until))
 }
 
+/// 后端装配产物（spec §2.1）：`stable` 是唯一数据源——kv/dbs/registry/loader/blobs/bus/
+/// es/modules/plugins/... 全在 StableState，Backend 不逐字段复制；auth_guard 与 Bridge
+/// 工厂因不进 StableState 而单独持有。exec/test 的手工 runtime 与 server 的 App 共用
+/// 同一份后端。
+pub struct Backend {
+    /// 唯一数据源：手工 `JsRuntime`（exec/test）经 `stable()` 注入（§2.1）。
+    stable: Arc<StableState>,
+    /// auth 守卫（oj-auth 插件 vtable 构造；cfg.auth 未配置 → None）。
+    auth_guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
+    /// Bridge 工厂。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
+    make_bridge_of: Arc<dyn Fn(Option<Arc<std::sync::atomic::AtomicBool>>) -> Bridge + Send + Sync>,
+}
+
+impl Backend {
+    /// StableState 单源访问器。
+    pub fn stable(&self) -> &Arc<StableState> {
+        &self.stable
+    }
+    /// auth 守卫句柄（HTTP 层 Pipeline / App 消费）。
+    pub fn auth_guard(&self) -> Option<&Arc<dyn only_js::bridge::AuthGuard>> {
+        self.auth_guard.as_ref()
+    }
+    /// HTTP 桥工厂（= make_bridge_of(None)）。
+    pub fn make_bridge(&self) -> impl Fn() -> Bridge + Send + Sync {
+        let f = self.make_bridge_of.clone();
+        move || f(None)
+    }
+    /// 任务桥工厂（tasks_flag = Some(flag)；停机 flag 由 HTTP 层创建并传入）。
+    pub fn make_task_bridge(
+        &self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Arc<dyn Fn() -> Bridge + Send + Sync> {
+        let f = self.make_bridge_of.clone();
+        Arc::new(move || f(Some(flag.clone())))
+    }
+}
+
+/// 迁移门禁取值（§4.6，装配与 HTTP 层共用）：dev（ts）默认 auto，release 默认 verify；
+/// `migrate_on_start: off` 为逃生门；非法值在 HTTP 层 match 处 fail-fast。
+fn migrate_gate_of(cfg: &Config, ts: bool) -> &str {
+    cfg.server
+        .migrate_on_start
+        .as_deref()
+        .unwrap_or(if ts { "auto" } else { "verify" })
+}
+
+/// 后端装配（spec §2.2 归属表 #1-#20 + #23）：redis warn → loader → ext_boot → 插件 →
+/// kv/es/blob → dbs+db_override → query_limits → ownership/sql_guard → schema+modules →
+/// auth/jwt/oidc → bus → mail（显式 install deliver 路由）→ ldap → mq → vars →
+/// StableState 组装 + Bridge 工厂。23 步的顺序即语义在后段内部保持原相对顺序；
+/// HTTP 步（证书门禁/匿名路径校验/迁移 gate 执行/seed/fixtures/ext_boot 预热/路由表）
+/// 留在 `App::from_config`——exec/test 手工 runtime 经此拿到与 server 同一份后端
+/// （无证书门禁，故可在无证书 config 上构造）。
+///
+/// blob 下载 URL 前缀取 config `server.api_prefix`（CLI `-b` 是 HTTP 层前缀覆盖，
+/// 不进 blob 注册——与拆分前 server 默认形态一致）。
+pub async fn assemble_backend(
+    cfg: &Config,
+    config_dir: &Path,
+    dir: &Path,
+    ts: bool,
+    db_override: Option<&str>,
+) -> Result<Backend, String> {
+    // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
+    for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
+        eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
+    }
+    // loader：project_root 用 config_dir（api 相对 dir；dir 由调用方绝对化）。
+    // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
+    // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
+    let loader = Arc::new(LoaderShared {
+        project_root: only_js::bridge::strip_verbatim(
+            &config_dir
+                .canonicalize()
+                .unwrap_or_else(|_| config_dir.to_path_buf()),
+        ),
+        ts,
+    });
+    // ext_boot：运行时创建期加载一次（bootstrap 的动态补充）。
+    // specifier 在此冻结 `?v=<mtime>`：改文件须重启进程（池常驻，不做热重载）。
+    let boot = ext_boot_spec(config_dir)?;
+    // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
+    // 自描述清单（PluginInfo）同时喂 Extras/StableState.plugins（JS 内省）与
+    // `GET {base}/plugins`（AppState）。
+    let mut registries = Registries::default();
+    let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
+        assemble_plugins(cfg, config_dir, &mut registries)
+            .await
+            .map_err(|e| format!("plugins: {e}"))?,
+    );
+    // KV：redis.default 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
+    // 未声明 → InMemoryKV 内置兜底。
+    let kv: Arc<dyn KVStore> = connect_kv(cfg, &registries).await?;
+    let es: Option<Arc<dyn EsBackend>> = registries.es;
+    // blob：blob 段存在即启用；未声明 → None。
+    let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
+        None => None,
+        Some(section) => Some(
+            assemble_blobs(section, config_dir, &cfg.server.api_prefix, registries.blob).await?,
+        ),
+    };
+    // 逐 db 开库（未知 scheme 注册表 fail-fast）。
+    let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
+    // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
+    // 静默回落 default 等于把测试写在开发库上（正是本项要修的事故面）。
+    if let Some(o) = db_override
+        && !dbs.contains_key(o)
+    {
+        let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        return Err(format!(
+            "--db {o:?} not declared in config (db keys: {names:?})"
+        ));
+    }
+    let db_key: &str = db_override.unwrap_or("default");
+    if let Some(o) = db_override {
+        eprintln!("oj: default db redirected to {o:?} (migrate/seed/fixtures follow)");
+    }
+    // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
+    let query_limits = cfg.db_query;
+    query_limits.validate()?;
+    // schema/reconcile 的 gate 参数（gate 执行本身在 HTTP 层；reconcile 随
+    // build_schema_and_modules，独立化见后续任务）。
+    let gate = migrate_gate_of(cfg, ts);
+    // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
+    let ownership_deny = ownership_deny_of(cfg)?;
+    let sql_guard = sql_guard_of(cfg);
+    // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
+    let (registry, modules) = build_schema_and_modules(
+        dir,
+        ts,
+        &dbs,
+        db_key,
+        gate,
+        sql_guard,
+        &cfg.tenant.shared_allow,
+    )
+    .await?;
+    // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
+    // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
+    let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
+        Some(a) if a.jwt_secret.trim().is_empty() => {
+            return Err("auth.jwt_secret must not be empty".into());
+        }
+        Some(_) => registries
+            .auth
+            .map(only_js::bridge::plugin_loader::auth_guard_from_vtable),
+        None => None,
+    };
+    let (jwt, oidc) = build_jwt_and_oidc(cfg, config_dir)?;
+    // 共享事件总线。
+    let bus = registries
+        .bus
+        .connect(&cfg.broker)
+        .await
+        .map_err(|e| format!("broker: {e}"))?;
+    // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
+    // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
+    let mail = build_mail_backend(cfg, registries.mail, bus.clone())?;
+    // exec/test 手工 runtime 不经 Bridge 构造（install 原只在 Bridge 构造期触发）——
+    // 装配层显式装一次；幂等（覆写同一进程级弱引用，见 mail::install_mail_deliver）。
+    if let Some(m) = &mail {
+        only_js::bridge::mail::install_mail_deliver(m);
+    }
+    // ldap 后端：ldap: 段 + oj-ldap 插件 vtable（独立能力，无跨后端依赖）。
+    let ldap = build_ldap_backend(cfg, registries.ldap)?;
+    // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
+    let (kafkas, rabbits) = build_mq_registries(cfg, &registries.mq).await?;
+    // 部署期常量（config `vars:` 段，v0.1.25）：装配期冻结成只读 Arc（`vars.get` 唯一
+    // 数据源），与 make_bridge 的 Extras.vars 同源。
+    let vars = Arc::new(cfg.vars.clone());
+    // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
+    // Clone 即共享。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
+    // cfg 只以 Copy 字段（allow_as_tenant）进入闭包：引用不得活进 'static 工厂，
+    // 故先解出值再捕获（stable 单源之前 from_config 持 cfg 的等价写法）。
+    let allow_as_tenant = cfg.tenant.allow_as_tenant;
+    let make_bridge_of = {
+        let (dbs, kv, loader, es, bus) = (
+            dbs.clone(),
+            kv.clone(),
+            loader.clone(),
+            es.clone(),
+            bus.clone(),
+        );
+        let blobs = blobs.clone();
+        let kafkas = kafkas.clone();
+        let rabbits = rabbits.clone();
+        let (registry, modules, ownership_deny) =
+            (registry.clone(), modules.clone(), ownership_deny);
+        // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
+        let plugins = (*plugin_infos).clone();
+        let boot = boot.clone();
+        let jwt = jwt.clone();
+        let oidc = oidc.clone();
+        let mail = mail.clone();
+        let ldap = ldap.clone();
+        let db_override = db_override.map(str::to_owned);
+        // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
+        let vars = vars.clone();
+        move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
+            Bridge::with_dbs_and_loader(
+                dbs.clone(),
+                kv.clone(),
+                registry.clone(),
+                false,
+                Some(loader.clone()),
+                Extras {
+                    blobs: blobs.clone(),
+                    es: es.clone(),
+                    bus: Some(bus.clone()),
+                    plugins: plugins.clone(),
+                    modules: modules.clone(),
+                    ownership_deny,
+                    sql_guard,
+                    allow_as_tenant,
+                    db_override: db_override.clone(),
+                    query_limits,
+                    boot: boot.clone(),
+                    // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
+                    jwt: jwt.clone(),
+                    // oidc 原语配置（OIDC 解耦：JS 端点 oidc.sign/verify/jwks 数据源）。
+                    oidc: oidc.clone(),
+                    // mq 命名实例（T7 装配注入；此处空表兜底，编译占位）。
+                    kafkas: Some(kafkas.clone()),
+                    rabbits: Some(rabbits.clone()),
+                    tasks_flag,
+                    // mail 后端（smtp: 段 + oj-mail 插件；未配置/未加载 = None）。
+                    mail: mail.clone(),
+                    // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
+                    ldap: ldap.clone(),
+                    vars: vars.clone(),
+                },
+            )
+        }
+    };
+    // 共享 StableState：与 actor 工厂同一组后端 Arc（StableState 唯一构造点——
+    // 原 from_config 尾部的组装段迁入，「单一 StableState」不变量由此得到唯一载体）。
+    let stable = Arc::new(StableState {
+        kv: kv.clone(),
+        seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
+        dbs: dbs.clone(),
+        registry: Arc::new(registry),
+        loader: Some(loader.clone()),
+        blobs: blobs
+            .clone()
+            .unwrap_or_else(|| Arc::new(BlobRegistry::new())),
+        bus: bus.clone(),
+        es: es.clone(),
+        plugins: (*plugin_infos).clone(),
+        modules,
+        ownership_deny,
+        sql_guard,
+        allow_as_tenant: cfg.tenant.allow_as_tenant,
+        db_override: db_override.map(str::to_owned),
+        query_limits,
+        boot: boot.clone(),
+        jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
+        oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。
+        kafkas: kafkas.clone(),   // 与 make_bridge 的 Extras.kafkas 同源。
+        rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
+        tasks_flag: None,
+        sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
+        mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
+        ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
+        vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
+    });
+    Ok(Backend {
+        stable,
+        auth_guard: auth,
+        make_bridge_of: Arc::new(make_bridge_of),
+    })
+}
+
 impl App {
     /// 装配并构造（原 `start` 逻辑搬入）。唯一构造一处 `StableState`，同时被 actor 工厂与
     /// 测试运行时引用，保证 db/bus/kv 跨家族为同一组 Arc（修正 #2）。
@@ -668,10 +941,23 @@ impl App {
         // 调用改指向该库；迁移 / seed / fixtures / schema 内省一并跟随（测试库须先有表）。
         db_override: Option<String>,
     ) -> Result<App, String> {
-        // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
-        for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
-            eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
-        }
+        // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
+        // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
+        // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
+        let dir = dir.canonicalize().unwrap_or(dir);
+        // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
+        let backend =
+            Arc::new(assemble_backend(&cfg, config_dir, &dir, ts, db_override.as_deref()).await?);
+        let stable = backend.stable().clone();
+        // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
+        // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
+        let tasks_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let make_bridge = {
+            let backend = backend.clone();
+            move || backend.make_bridge()()
+        };
+        let make_task_bridge = backend.make_task_bridge(tasks_flag.clone());
+        let auth = backend.auth_guard().cloned();
         // 证书必配门禁（无逃生口）：两个证书路径必须都配齐才启动，否则 fail-fast。
         // 证书校验不可被 config 或 CLI 关闭——任何绕过都会违背证书强制校验的初衷。
         if !cfg.server.cert_paths_configured() {
@@ -680,75 +966,15 @@ impl App {
                  no config or flag can skip certificate validation)"
                 .to_string());
         }
-        // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
-        // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
-        // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
-        let dir = dir.canonicalize().unwrap_or(dir);
-        let loader = Arc::new(LoaderShared {
-            project_root: only_js::bridge::strip_verbatim(
-                &config_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| config_dir.to_path_buf()),
-            ),
-            ts,
-        });
-        // ext_boot：运行时创建期加载一次（bootstrap 的动态补充）。
-        // specifier 在此冻结 `?v=<mtime>`：改文件须重启进程（池常驻，不做热重载）。
-        let boot = ext_boot_spec(config_dir)?;
-        // 插件装配（spec §5）：解析 plugins_dir → 清单严格/缺省扫描 → 校验 → 注册。
-        // 自描述清单（PluginInfo）同时喂 Extras/StableState.plugins（JS 内省）与
-        // `GET {base}/plugins`（AppState）。
-        let mut registries = Registries::default();
-        let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
-            assemble_plugins(&cfg, config_dir, &mut registries)
-                .await
-                .map_err(|e| format!("plugins: {e}"))?,
-        );
-        // KV：redis.default 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
-        // 未声明 → InMemoryKV 内置兜底。
-        let kv: Arc<dyn KVStore> = connect_kv(&cfg, &registries).await?;
-        let es: Option<Arc<dyn EsBackend>> = registries.es;
-        // blob：blob 段存在即启用；未声明 → None。
-        let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
-            None => None,
-            Some(section) => {
-                Some(assemble_blobs(section, config_dir, &base, registries.blob).await?)
-            }
-        };
-        // 下载路由仅服务 default 后端。
-        let blob: Option<Arc<dyn BlobBackend>> = blobs.as_ref().and_then(|r| r.default());
-        // 逐 db 开库（未知 scheme 注册表 fail-fast）。
-        let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
-        // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
-        // 静默回落 default 等于把测试写在开发库上（正是本项要修的事故面）。
-        if let Some(o) = &db_override
-            && !dbs.contains_key(o.as_str())
-        {
-            let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
-            names.sort_unstable();
-            return Err(format!(
-                "--db {o:?} not declared in config (db keys: {names:?})"
-            ));
-        }
-        let db_key: &str = db_override.as_deref().unwrap_or("default");
-        if let Some(o) = &db_override {
-            eprintln!("oj: default db redirected to {o:?} (migrate/seed/fixtures follow)");
-        }
-        // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
-        let query_limits = cfg.db_query;
-        query_limits.validate()?;
         // 匿名路径条目校验（v0.1.23）：`one_layer` 只对尾 "/*" 条目有意义（fail-fast）。
         config::validate_anon_paths(&cfg)?;
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
-        let gate =
-            cfg.server
-                .migrate_on_start
-                .as_deref()
-                .unwrap_or(if ts { "auto" } else { "verify" });
+        let gate = migrate_gate_of(&cfg, ts);
+        let db_key: &str = db_override.as_deref().unwrap_or("default");
         match gate {
-            "auto" => crate::migrate::apply_all(dbs.get(db_key), &dir, ts, false).await?,
-            "verify" => crate::migrate::verify_all(dbs.get(db_key), &dir, ts).await?,
+            "auto" => crate::migrate::apply_all(stable.dbs.get(db_key), &dir, ts, false).await?,
+            "verify" => crate::migrate::verify_all(stable.dbs.get(db_key), &dir, ts).await?,
             "off" => {}
             other => {
                 return Err(format!(
@@ -756,133 +982,18 @@ impl App {
                 ));
             }
         }
-        // 表归属守卫模式（§5.3）：warn（默认）| deny（违规拒绝）；非法值 fail-fast。
-        let ownership_deny = ownership_deny_of(&cfg)?;
-        let sql_guard = sql_guard_of(&cfg);
-        // §4.8 归属图 + SchemaRegistry 复活（含 gate=auto 时的逐模块 reconcile）。
-        let (registry, modules) = build_schema_and_modules(
-            &dir,
-            ts,
-            &dbs,
-            db_key,
-            gate,
-            sql_guard,
-            &cfg.tenant.shared_allow,
-        )
-        .await?;
         // 种子重放（P0）：各模块 seed.sql（§8-1）。
-        crate::seed::replay_all(dbs.get(db_key), &dir).await?;
+        crate::seed::replay_all(stable.dbs.get(db_key), &dir).await?;
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
             let modules = crate::manifest::discover(&dir, ts)?;
-            crate::migrate_cmd::load_fixtures(dbs.get(db_key), &modules).await?;
+            crate::migrate_cmd::load_fixtures(stable.dbs.get(db_key), &modules).await?;
         }
-        // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
-        // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
-        let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
-            Some(a) if a.jwt_secret.trim().is_empty() => {
-                return Err("auth.jwt_secret must not be empty".into());
-            }
-            Some(_) => registries
-                .auth
-                .map(only_js::bridge::plugin_loader::auth_guard_from_vtable),
-            None => None,
-        };
-        let (jwt, oidc) = build_jwt_and_oidc(&cfg, config_dir)?;
-        // 共享事件总线。
-        let bus = registries
-            .bus
-            .connect(&cfg.broker)
-            .await
-            .map_err(|e| format!("broker: {e}"))?;
-        // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
-        // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
-        let mail = build_mail_backend(&cfg, registries.mail, bus.clone())?;
-        // ldap 后端：ldap: 段 + oj-ldap 插件 vtable（独立能力，无跨后端依赖）。
-        let ldap = build_ldap_backend(&cfg, registries.ldap)?;
-        // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
-        let (kafkas, rabbits) = build_mq_registries(&cfg, &registries.mq).await?;
-        // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
-        // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。
-        let tasks_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // 部署期常量（config `vars:` 段，v0.1.25）：装配期冻结成只读 Arc（`vars.get` 唯一
-        // 数据源），与 make_bridge 的 Extras.vars 同源。
-        let vars = Arc::new(cfg.vars.clone());
-        // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
-        // Clone 即共享。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
-        let make_bridge_of = {
-            let (dbs, kv, loader, es, bus) = (
-                dbs.clone(),
-                kv.clone(),
-                loader.clone(),
-                es.clone(),
-                bus.clone(),
-            );
-            let blobs = blobs.clone();
-            let kafkas = kafkas.clone();
-            let rabbits = rabbits.clone();
-            let (registry, modules, ownership_deny) =
-                (registry.clone(), modules.clone(), ownership_deny);
-            // 影子绑定：`move` 捕获的是这里的副本，外层 `boot` 仍可供后续 StableState 使用。
-            let plugins = (*plugin_infos).clone();
-            let boot = boot.clone();
-            let jwt = jwt.clone();
-            let oidc = oidc.clone();
-            let mail = mail.clone();
-            let ldap = ldap.clone();
-            let db_override = db_override.clone();
-            // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
-            let vars = vars.clone();
-            move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
-                Bridge::with_dbs_and_loader(
-                    dbs.clone(),
-                    kv.clone(),
-                    registry.clone(),
-                    false,
-                    Some(loader.clone()),
-                    Extras {
-                        blobs: blobs.clone(),
-                        es: es.clone(),
-                        bus: Some(bus.clone()),
-                        plugins: plugins.clone(),
-                        modules: modules.clone(),
-                        ownership_deny,
-                        sql_guard,
-                        allow_as_tenant: cfg.tenant.allow_as_tenant,
-                        db_override: db_override.clone(),
-                        query_limits,
-                        boot: boot.clone(),
-                        // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
-                        jwt: jwt.clone(),
-                        // oidc 原语配置（OIDC 解耦：JS 端点 oidc.sign/verify/jwks 数据源）。
-                        oidc: oidc.clone(),
-                        // mq 命名实例（T7 装配注入；此处空表兜底，编译占位）。
-                        kafkas: Some(kafkas.clone()),
-                        rabbits: Some(rabbits.clone()),
-                        tasks_flag,
-                        // mail 后端（smtp: 段 + oj-mail 插件；未配置/未加载 = None）。
-                        mail: mail.clone(),
-                        // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
-                        ldap: ldap.clone(),
-                        vars: vars.clone(),
-                    },
-                )
-            }
-        };
-        let make_bridge = {
-            let f = make_bridge_of.clone();
-            move || f(None)
-        };
-        let make_task_bridge: Arc<dyn Fn() -> Bridge + Send + Sync> = {
-            let f = make_bridge_of;
-            let flag = tasks_flag.clone();
-            Arc::new(move || f(Some(flag.clone())))
-        };
         // ext_boot 预热：建 runtime 并跑完 boot，失败即 `Err`（真·启动失败）。
         // 必须前移到建表之前 —— 否则 boot 错误只能借 dev 内省的间接失败暴露，而
         // `bridge_introspector` 会把线程 panic 吞成路由 failure（装配层只 warn 不致命，
         // 结果「路由全空、服务照常监听」）。
-        if boot.is_some() {
+        if stable.boot.is_some() {
             prewarm_boot(make_bridge.clone())?;
         }
         // 路由表：dev 启动内省 .route 声明；release 聚合 dist/manifests.yaml。
@@ -1000,7 +1111,8 @@ impl App {
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
             auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,
-            blob: blob.clone(),
+            // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
+            blob: stable.blobs.default(),
         };
         // WS 目录镜像挂载（<dir>/ws.ts → {base}/<dir>/ws）。
         let ws_opts = server::ws::WsOptions {
@@ -1037,42 +1149,13 @@ impl App {
             pipeline,
             cert_status,
             cert_valid_until,
-            plugin_infos.clone(),
+            // 插件自省清单经 stable 单源读取（与 StableState.plugins 同源）。
+            Arc::new(stable.plugins.clone()),
         )
         .merge(ws_router);
-        // 共享 StableState：与 actor 工厂用同一组后端 Arc，供测试运行时注入（修正 #2）。
-        let stable = Arc::new(StableState {
-            kv: kv.clone(),
-            seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
-            dbs: dbs.clone(),
-            registry: Arc::new(registry),
-            loader: Some(loader.clone()),
-            blobs: blobs
-                .clone()
-                .unwrap_or_else(|| Arc::new(BlobRegistry::new())),
-            bus: bus.clone(),
-            es: es.clone(),
-            plugins: (*plugin_infos).clone(),
-            modules,
-            ownership_deny,
-            sql_guard,
-            allow_as_tenant: cfg.tenant.allow_as_tenant,
-            db_override: db_override.clone(),
-            query_limits,
-            boot: boot.clone(),
-            jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
-            oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。
-            kafkas: kafkas.clone(),   // 与 make_bridge 的 Extras.kafkas 同源。
-            rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
-            tasks_flag: None,
-            sql_memo: std::sync::Mutex::new(std::collections::HashMap::new()),
-            mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
-            ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
-            vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
-        });
         Ok(App {
             router,
-            bus,
+            bus: stable.bus.clone(),
             stable,
             base,
             tasks_flag,
@@ -1353,6 +1436,23 @@ mod tests {
         assert!(spec.contains("?v="), "{spec}");
         assert!(spec.contains("ext_boot.js"), "{spec}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// exec 拆分契约（spec §2/§3.1）：后端装配不含证书门禁——Backend 可在无证书
+    /// 配置的最小 config 上构造，stable 是唯一数据源（访问器直达）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_constructs_without_certificate() {
+        let base = std::env::temp_dir().join(format!("oj-backend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let cfg = Config::default(); // 无证书、无 db/redis 段
+        let backend = super::assemble_backend(&cfg, &base, &base, true, None)
+            .await
+            .unwrap();
+        // stable 单源：kv/dbs/loader 都经访问器直达，Backend 不复制字段。
+        assert!(backend.stable().loader.is_some());
+        assert!(backend.stable().dbs.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ---- v0.1.23：匿名路径迁移 WARN 的影响面判定（U39）----
