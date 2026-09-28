@@ -139,8 +139,11 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     - "/auth/login"              # auth 端点已是业务路由，须显式匿名
     - "/auth/refresh"
     - "/auth/logout"
-    # WS 订阅路由（/news/ws）不在守卫面内（真实路由，不过前置管线）；
-    # 发布 POST /news 保持鉴权（L1 news 套件钉住 401 语义）。
+    # oj-4 起 WS 握手过守卫（cookie 凭证）：订阅路由显式匿名或走 cookie 会话。
+    # 本 sample 的 WS 是公开订阅/回显演示 → /news/ws、/echo-bin/ws 匿名；
+    # 生产按 anonymous_paths 收敛。
+    - "/news/ws"
+    - "/echo-bin/ws"
     - "/oidc/*"                  # 一层且无更深路由 → 不告警
     # v0.1.20 把 **oj-auth 侧**的尾 /* 从「任意深度」收紧为严格一层：/idp/* 因此不再覆盖
     # discovery（比它深一层）→ 会打迁移 WARN。这里确认「就要一层」，discovery 单列。

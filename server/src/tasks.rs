@@ -71,6 +71,7 @@ fn entry_json(e: &TaskEntry) -> serde_json::Value {
 /// 匿名路径判定复用 server::path_matches）。
 fn admitted(
     st: &TasksApiState,
+    method: &str,
     path_no_base: &str,
     headers: &HeaderMap,
 ) -> Result<(), Box<Response>> {
@@ -78,7 +79,15 @@ fn admitted(
         let header = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        if let Err(msg) = g.verify(path_no_base, header) {
+        // ABI 9：方法 + 全部请求头 JSON 透传守卫（同 server::run_route 语义）。
+        let headers_json = serde_json::to_string(
+            &headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap_or_default();
+        if let Err(msg) = g.verify(path_no_base, method, header, Some(&headers_json)) {
             return Err(Box::new(fail_response(401, &msg)));
         }
     }
@@ -133,7 +142,7 @@ async fn list_handler(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks", &headers) {
+    if let Err(r) = admitted(&st, "GET", "/tasks", &headers) {
         return *r;
     }
     let filter = q.get("type").cloned();
@@ -156,7 +165,7 @@ async fn get_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*", &headers) {
+    if let Err(r) = admitted(&st, "GET", "/tasks/*", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -171,7 +180,7 @@ async fn logs_handler(
     Path(name): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/logs", &headers) {
+    if let Err(r) = admitted(&st, "GET", "/tasks/*/logs", &headers) {
         return *r;
     }
     if st.registry.get(&name).is_none() {
@@ -197,7 +206,7 @@ async fn start_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/start", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/start", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -218,7 +227,7 @@ async fn stop_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/stop", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/stop", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -239,7 +248,7 @@ async fn reload_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/reload", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/reload", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -260,7 +269,7 @@ async fn enable_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/enable", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/enable", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -281,7 +290,7 @@ async fn disable_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/disable", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/disable", &headers) {
         return *r;
     }
     match st.registry.get(&name) {
@@ -304,7 +313,7 @@ async fn run_once_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*/run-once", &headers) {
+    if let Err(r) = admitted(&st, "POST", "/tasks/*/run-once", &headers) {
         return *r;
     }
     let entry = match st.registry.get(&name) {
@@ -345,7 +354,7 @@ async fn patch_handler(
     Path(name): Path<String>,
     body: String,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*", &headers) {
+    if let Err(r) = admitted(&st, "GET", "/tasks/*", &headers) {
         return *r;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -381,7 +390,7 @@ async fn delete_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "/tasks/*", &headers) {
+    if let Err(r) = admitted(&st, "GET", "/tasks/*", &headers) {
         return *r;
     }
     if st.registry.remove(&name).is_none() {
@@ -406,7 +415,9 @@ mod tests {
         fn verify(
             &self,
             _path: &str,
+            _method: &str,
             _auth: Option<&str>,
+            _headers: Option<&str>,
         ) -> Result<Option<serde_json::Value>, String> {
             Err("unauthorized".into())
         }

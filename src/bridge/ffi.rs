@@ -279,11 +279,15 @@ impl crate::bridge::auth::AuthGuard for FfiAuthGuard {
     fn verify(
         &self,
         path_no_base: &str,
+        method: &str,
         authorization: Option<&str>,
+        headers: Option<&str>,
     ) -> Result<Option<serde_json::Value>, String> {
         let r = (self.vtable.verify)(
             RString::from(path_no_base),
+            RString::from(method),
             RString::from(authorization.unwrap_or("")),
+            RString::from(headers.unwrap_or("")),
         );
         match std::result::Result::from(r) {
             Ok(json) => {
@@ -532,6 +536,14 @@ impl BlobBackend for FfiBlobBackend {
         let fut = (self.vtable.url)(self.handle, RString::from(key));
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("blob url", e))?;
         String::from_utf8(bytes).map_err(|e| ffi_err("blob url decode", e))
+    }
+
+    async fn upload_url(&self, key: &str, op: &str) -> BridgeResult<serde_json::Value> {
+        let fut = (self.vtable.upload_url)(self.handle, RString::from(key), RString::from(op));
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob upload_url", e))?;
+        serde_json::from_slice(&bytes).map_err(|e| ffi_err("blob upload_url decode", e))
     }
 
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>> {
@@ -856,7 +868,7 @@ impl Drop for FfiKVStore {
 #[allow(clippy::await_holding_lock)]
 mod adapter_tests {
     use super::*;
-    use oj_plugin_ffi::RBytes;
+    use oj_plugin_ffi::{RBytes, ready_err, ready_ok};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1296,6 +1308,15 @@ mod adapter_tests {
         BLOB_CLOSED.store(handle, AtomicOrdering::SeqCst);
     }
 
+    extern "C" fn mock_blob_upload_url(_h: u64, key: RString, op: RString) -> FfiFuture {
+        let k: &str = &key;
+        let o: &str = &op;
+        if k == "a/b.png" && o.contains("put") {
+            return ready_ok(br#"{"url":"https://s3.example.com/up"}"#.to_vec());
+        }
+        ready_err("stub")
+    }
+
     fn mock_blob_vtable() -> &'static BlobBackendVtable {
         Box::leak(Box::new(BlobBackendVtable {
             connect: mock_blob_connect,
@@ -1303,6 +1324,7 @@ mod adapter_tests {
             get: mock_blob_get,
             del: mock_blob_del,
             url: mock_blob_url,
+            upload_url: mock_blob_upload_url,
             content_type: mock_blob_content_type,
             close: mock_blob_close,
         }))
@@ -1332,6 +1354,22 @@ mod adapter_tests {
         assert_eq!(b.get("k").await.unwrap(), b"blobdata");
         let (h, key) = BLOB_GET.lock().unwrap().clone();
         assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    /// ABI 9：upload_url 转发（op JSON 透传、响应 JSON 原样解析）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_upload_url_forwards_key_and_op() {
+        let _g = T_LOCK.lock().unwrap();
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        let v = b.upload_url("a/b.png", r#"{"kind":"put"}"#).await.unwrap();
+        assert_eq!(v["url"], "https://s3.example.com/up");
+        // mock 的 miss 臂 → Err 透传
+        assert!(b.upload_url("other", r#"{"kind":"put"}"#).await.is_err());
+        assert!(
+            b.upload_url("a/b.png", r#"{"kind":"multipart_initiate"}"#)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1749,13 +1787,21 @@ mod adapter_tests {
 
     /// auth verify 行为开关：0=对象用户；1=null（匿名放行）；2=标量；3=坏 JSON；4=Err。
     static AUTH_MODE: Mutex<u8> = Mutex::new(0);
-    static AUTH_GOT: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+    static AUTH_GOT: Mutex<(String, String, String, String)> =
+        Mutex::new((String::new(), String::new(), String::new(), String::new()));
 
     extern "C" fn mock_auth_verify(
         path: RString,
+        method: RString,
         authorization: RString,
+        headers: RString,
     ) -> RResult<RString, RString> {
-        *AUTH_GOT.lock().unwrap() = (path[..].to_string(), authorization[..].to_string());
+        *AUTH_GOT.lock().unwrap() = (
+            path[..].to_string(),
+            method[..].to_string(),
+            authorization[..].to_string(),
+            headers[..].to_string(),
+        );
         match *AUTH_MODE.lock().unwrap() {
             1 => RResult::Ok(RString::from("null")),
             2 => RResult::Ok(RString::from("5")),
@@ -1850,12 +1896,29 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let _m = Mode::set(&AUTH_MODE, 0);
         let guard = FfiAuthGuard::new(mock_auth_vtable());
-        let user = guard.verify("/v1/api/u/", Some("Bearer tok1")).unwrap();
+        let user = guard
+            .verify(
+                "/v1/api/u/",
+                "POST",
+                Some("Bearer tok1"),
+                Some(r#"{"cookie":"oj_sess=abc"}"#),
+            )
+            .unwrap();
         assert_eq!(user.unwrap()["id"], "u1");
-        let (path, authz) = AUTH_GOT.lock().unwrap().clone();
+        let (path, method, authz, headers) = AUTH_GOT.lock().unwrap().clone();
         assert_eq!(
-            (path.as_str(), authz.as_str()),
-            ("/v1/api/u/", "Bearer tok1")
+            (
+                path.as_str(),
+                method.as_str(),
+                authz.as_str(),
+                headers.as_str()
+            ),
+            (
+                "/v1/api/u/",
+                "POST",
+                "Bearer tok1",
+                r#"{"cookie":"oj_sess=abc"}"#
+            )
         );
     }
 
@@ -1865,9 +1928,10 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let _m = Mode::set(&AUTH_MODE, 1);
         let guard = FfiAuthGuard::new(mock_auth_vtable());
-        assert_eq!(guard.verify("/p", None).unwrap(), None);
-        let (_, authz) = AUTH_GOT.lock().unwrap().clone();
+        assert_eq!(guard.verify("/p", "GET", None, None).unwrap(), None);
+        let (_, _, authz, headers) = AUTH_GOT.lock().unwrap().clone();
         assert_eq!(authz, "");
+        assert_eq!(headers, "");
     }
 
     /// 坏插件输出（标量 / 非 JSON）→ Err 点名契约违约，不静默当匿名放行。
@@ -1876,10 +1940,10 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let guard = FfiAuthGuard::new(mock_auth_vtable());
         let _m2 = Mode::set(&AUTH_MODE, 2);
-        let e = guard.verify("/p", None).unwrap_err();
+        let e = guard.verify("/p", "GET", None, None).unwrap_err();
         assert!(e.contains("non-object user"), "{e}");
         let _m3 = Mode::set(&AUTH_MODE, 3);
-        let e = guard.verify("/p", None).unwrap_err();
+        let e = guard.verify("/p", "GET", None, None).unwrap_err();
         assert!(e.contains("auth plugin returned bad json"), "{e}");
     }
 
@@ -1889,7 +1953,9 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         let _m = Mode::set(&AUTH_MODE, 4);
         let guard = FfiAuthGuard::new(mock_auth_vtable());
-        let e = guard.verify("/p", Some("Bearer bad")).unwrap_err();
+        let e = guard
+            .verify("/p", "GET", Some("Bearer bad"), None)
+            .unwrap_err();
         assert_eq!(e, "token expired");
     }
 

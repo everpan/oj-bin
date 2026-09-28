@@ -74,7 +74,12 @@ mod tests {
     /// 可低成本真实构造（其余轴同理，不重复摆）。
     #[test]
     fn auth_helper_returns_same_non_null_pointer() {
-        extern "C" fn verify(_: RString, _: RString) -> RResult<RString, RString> {
+        extern "C" fn verify(
+            _: RString,
+            _: RString,
+            _: RString,
+            _: RString,
+        ) -> RResult<RString, RString> {
             RResult::Err(RString::from("stub"))
         }
         static VT: AuthGuardVtable = AuthGuardVtable { verify };

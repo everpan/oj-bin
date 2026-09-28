@@ -567,6 +567,7 @@ fn resolve_static_sites(
     let mut seen: Vec<(String, String)> = Vec::new();
     let push = |prefix: &str,
                 path: &str,
+                headers: &std::collections::HashMap<String, String>,
                 source: &str,
                 out: &mut Vec<server::StaticSite>,
                 seen: &mut Vec<(String, String)>|
@@ -578,13 +579,21 @@ fn resolve_static_sites(
         }
         seen.push((p.clone(), source.to_string()));
         let root = static_dir(config_dir, path).map_err(|e| format!("{source}: {e}"))?;
-        out.push(server::StaticSite { prefix: p, root });
+        out.push(server::StaticSite {
+            prefix: p,
+            root,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        });
         Ok(())
     };
     if let Some(app_path) = &cfg.server.app_path {
         push(
             &cfg.server.app_prefix,
             app_path,
+            &std::collections::HashMap::new(),
             "server.app_path（前缀取 server.app_prefix）",
             &mut out,
             &mut seen,
@@ -594,6 +603,7 @@ fn resolve_static_sites(
         push(
             &s.prefix,
             &s.path,
+            &s.headers,
             &format!("server.static_sites[prefix={}]", s.prefix),
             &mut out,
             &mut seen,
@@ -1102,6 +1112,22 @@ impl App {
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
             auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,
+            blob_upload_max: cfg.server.blob_upload_max_bytes,
+            // oj-5c：路由级 timeout 覆盖——装配期解析 fail-fast（非法时长/空 pattern
+            // 都是配置错误，静默忽略等于部署了假保险）。
+            route_timeouts: cfg
+                .server
+                .route_timeouts
+                .iter()
+                .map(|r| {
+                    if r.pattern.trim().is_empty() {
+                        return Err("server.route_timeouts: empty pattern".to_string());
+                    }
+                    config::parse_duration(&r.timeout)
+                        .map(|d| (r.pattern.clone(), d))
+                        .map_err(|e| format!("server.route_timeouts[{}]: {e}", r.pattern))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
             // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
             blob: stable.blobs.default(),
         };
@@ -1117,6 +1143,7 @@ impl App {
             timeout.unwrap_or(Duration::from_secs(30)),
             make_bridge,
             ws_opts,
+            auth.clone(),
         );
         // server.html_meta_handler（v0.1.25）：必须是路由表里存在的 GET 路由——拼错
         // fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露的谎话）。
@@ -1136,6 +1163,13 @@ impl App {
                 html_meta: cfg.server.html_meta.clone(),
                 html_meta_handler: cfg.server.html_meta_handler.clone(),
                 html_cache_control: cfg.server.html_cache_control.clone(),
+                // oj-8：全局自定义响应头（per-site 覆盖在 StaticSite.headers）。
+                response_headers: cfg
+                    .server
+                    .response_headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             },
             pipeline,
             cert_status,
@@ -1367,10 +1401,12 @@ mod tests {
             only_js::config::StaticSiteConf {
                 prefix: "/docs".into(),
                 path: dirs[1].to_string_lossy().into(),
+                headers: Default::default(),
             },
             only_js::config::StaticSiteConf {
                 prefix: "/".into(),
                 path: dirs[2].to_string_lossy().into(),
+                headers: Default::default(),
             },
         ];
         let sites = resolve_static_sites(&cfg, &base).unwrap();
@@ -1397,6 +1433,7 @@ mod tests {
         cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
             prefix: "/docs".into(),
             path: dirs[1].to_string_lossy().into(),
+            headers: Default::default(),
         }];
         let e = resolve_static_sites(&cfg, &base).unwrap_err();
         assert!(e.contains("重复") && e.contains("server.app_path"), "{e}");
@@ -1407,6 +1444,7 @@ mod tests {
         cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
             prefix: "/x".into(),
             path: "no-such-dir".into(),
+            headers: Default::default(),
         }];
         let e = resolve_static_sites(&cfg, &base).unwrap_err();
         assert!(e.contains("no-such-dir"), "{e}");

@@ -570,14 +570,25 @@ import { nowSecs } from "../../auth/_shared/util";
 ### 裸 specifier（node_modules）
 
 `import { escapeHtml } from "escape-goat"` —— 从当前文件目录**逐级向上**找
-`node_modules/<pkg>`（至 project root），按 `package.json` 的 `module` → `main` →
-`index.js` 取入口；支持 `@scope/name` 与子路径 `pkg/lib/util.js`。
+`node_modules/<pkg>`（至 project root；**全程不 realpath**，pnpm 的符号链接
+`.pnpm/<pkg>@<ver>/node_modules/<pkg>` 布局因此可用）。
+
+**入口解析（v0.1.30 起完整支持 `exports`）**：`package.json` 有 `exports` 字段即由它
+**完全接管**（Node 封闭语义，未命中报错、**不回落** legacy）——支持字符串形态、
+条件对象（import/require 二选一按解析侧取、node/default 恒命中）、子路径键、
+`./x/*` 与裸 `*` 模式键、数组 fallback（逐项尝试）。无 `exports` 才走 legacy
+`module` → `main` → `index.js`。报错文案：
+`Package subpath 'x' is not defined by "exports" in <pkg>/package.json`。
+`@scope/name` 与子路径 `pkg/lib/util.js` 同前。
 
 ### CJS 互操作
 
 CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__ojRequire`
-（进程级缓存）。启发式识别，**仅支持裸 specifier**；相对 `require("./x")` v0.2 不支持
-（ESM 相对导入不受影响）。不读 `package.json` 的 `exports`/`conditions`；pnpm 布局不支持。
+（进程级缓存）。**v0.1.30 起**相对 require 可用：`require("./x")` 候选
+`x` → `x.js` → `x.json`（JSON 模块）→ `x/index.js` → `x/index.json`；
+循环 require 返回部分 exports（Node 语义）；解析结果被钳制在 project root 内。
+裸 specifier 的 require 同样读 `exports`（条件取 `require`）。
+`require("path")` 等 Node 内建报 `Node builtin 'path' is not available in oj runtime`。
 
 ### 安全边界
 
@@ -997,6 +1008,7 @@ auth 会话也在同一 Redis（多实例共享的前提）；未配置时均为
 | `blob.get` | `get(key: string): Promise<Uint8Array>` | 读对象（不存在报错） |
 | `blob.del` | `del(key: string): Promise<boolean>` | 删对象（幂等：不存在视为成功） |
 | `blob.url` | `url(key: string): Promise<string>` | 下载地址：local = `{base}/blob/{key}`；s3 = presigned URL（15min） |
+| `blob.uploadUrl` | `uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>` | 上传直传预签名（v0.1.30）：s3 后端返回 15min 预签名 PUT URL，客户端直传**不经 handler**（绕开 `max_upload_bytes`/30s）；`opts` 缺省 `{"kind":"put"}`，multipart 形态暂返回 Err。local 后端无预签名——报 `local blob backend has no upload presign; use the direct PUT upload route`，改用直传路由 |
 | `blob.contentType` | `contentType(key: string): Promise<string \| null>` | Content-Type（local 读 sidecar / 按扩展名推断；缺失且无法推断返回空串；s3 无 Content-Type 返回 `null`） |
 
 **上传四件套完整例子**（摘自 `sample/src/upload/api.ts`）：
@@ -1020,6 +1032,12 @@ export default {
 下载走内置公开路由 `GET {base}/blob/{key}`（免鉴权、不落业务表；local 直出字节 +
 Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 （第 13 章路径安全）。上传体积上限 `server.max_upload_bytes`（超限 413）。
+
+**大文件直传（v0.1.30，>10MB 或上传+处理超 30s 的场景）**：不经 handler 的两条直传路——
+① s3 后端：`blob.uploadUrl(key)` 拿预签名 PUT URL 给客户端直传；② 任意后端：
+`PUT {base}/blob/{key}` 内置路由（**过鉴权守卫**，Bearer/cookie 即令牌；体积上限独立
+`server.blob_upload_max_bytes`，默认 1 GiB；不经 JsActor，无 30s 限制）。下载侧 local
+内联腿支持 `Range` 单区间（206 + Content-Range；越界 416），pdf.js/媒体 seek 直接可用。
 
 ### bus —— 订阅发布
 
@@ -1318,6 +1336,12 @@ if (r.ok) {
 |---|---|---|
 | `ws.send` | `send(data: string \| Uint8Array): void` | 向当前连接发一帧：string → Text 帧（0x1），Uint8Array → Binary 帧（0x2，v0.1.16 起）；HTTP 路径下 no-op |
 | `ws.close` | `close(): void` | 结束当前连接 |
+| `ws.join` | `join(room: string): void` | 当前连接加入房间（v0.1.30；仅 ws handler 内，连接身份自动取） |
+| `ws.leave` | `leave(room: string): void` | 当前连接离开房间（v0.1.30；仅 ws handler 内；断连自动摘除，无需兜底） |
+| `ws.broadcast` | `broadcast(room: string, data: string): number` | 房间扇出（v0.1.30）：**除己**送达成员数（socket.io 语义，发送者要回声自己在 JS 里发）；HTTP handler 也可调（无连接身份 = 不排除任何人） |
+| `ws.roomSize` | `roomSize(room: string): number` | 房间当前成员数（v0.1.30；presence 最小原语，任意上下文可调） |
+
+房间是**进程内**单例 hub；跨实例扇出仍走 `bus.publish`。
 | `sess.id` | `number`（只读） | 当前连接 id（路由内自 1 递增） |
 | `sess.state` | 读写属性 | 连接会话状态（Rust 会话表持久，按连接隔离）；**必须可 JSON 序列化**——函数等不可序列化值静默丢失 |
 
@@ -1345,11 +1369,12 @@ ws.onmessage = (e) => log.info("frame " + e.data);
 
 三条硬约束（全部来自真实踩坑）：
 
-1. **鉴权在应用层做，不在管线**：WS 路由（`<dir>/ws.ts`）是 merge 进 Router 的
-   **真实路由，不经过** fallback 的 Bearer/租户前置管线。连接天然匿名，
-   `anonymous_paths` 对它无效也不需要配（v0.1.8 起 sample 已删除该冗余条目）。
-   受保护数据的订阅要自行做首帧 token 握手，或把发布端点（`POST /news`）留在
-   鉴权面内。
+1. **鉴权（v0.1.30 起）在握手，不在帧内**：WS 升级握手**过 oj-auth 守卫**
+   （`verify(path_no_base, "GET", authorization, headers JSON)`，401 不升级）——
+   Cookie 头浏览器自动带（cookie 会话形态天然覆盖 WS）；Bearer 客户端可挂
+   Authorization 头。**存量升级注意**：此前 WS 天然匿名，v0.1.30 起要把 ws 路径加进
+   `anonymous_paths` 才恢复匿名（sample 已配 `/news/ws`）。受保护数据的订阅鉴别
+   因此不再需要首帧 token 握手。
 2. **URL 主机名要匹配服务端绑定语义**：服务端缺省监听 `[::1]`（IPv6 回环），写
    `127.0.0.1` 会 connection refused，改用 `localhost`。
 3. **等帧必须与停机信号竞速**：挂在 `await` 上没人 wake，会拖到看门狗强杀记 `killed`；
@@ -1433,13 +1458,20 @@ const ok = await bcrypt.verify(password, row.password_hash);   // false = 口令
 
 ### crypto —— 摘要与随机数（增补进原生 crypto）
 
-bootstrap 对原生 `crypto` 做 `Object.assign` 合并：原生成员（如 `getRandomValues`）保留，
-仅增补两个方法。**不依赖 `auth:` 段，始终可用。**
+bootstrap 对 `crypto` 做 `Object.assign` 合并。**不依赖 `auth:` 段，始终可用。**
+v0.1.30 起补齐 Web 面：`crypto.getRandomValues(view)` 为 oj 实现（原生不存在）——
+任意 TypedArray view 填充后返回原 view，非 view 抛 TypeError，单次 ≤65536 字节
+（对齐 WebCrypto）；wasm-bindgen 胶水（`WebAssembly.instantiate` + getRandomValues +
+atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 
 | API | 签名 | 说明 |
 |---|---|---|
 | `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
+| `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | 填充随机字节（v0.1.30） |
+
+另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30；非法输入抛
+`InvalidCharacterError`），wasm 胶水常用。
 
 ```ts
 const sessionKey = "AUTH-SESSION:" + crypto.sha256Hex(refreshToken);   // 见第 8 章轮换
@@ -1682,6 +1714,10 @@ cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执�
 | 证书已过期（Expired，仅 GET，运行中热替换所致） | 403 | `{"code":403,"msg":"certificate expired: service unavailable","data":null}` |
 | 租户头缺失/为空（`tenant.enable`） | 400 | `missing tenant header: X-TENANT-ID` |
 | Bearer 缺失/无效/过期（`auth:` 启用） | 401 | `missing or invalid bearer token` |
+| cookie 会话 CSRF 校验失败（v0.1.30，非安全方法） | 401 | `missing or invalid csrf token` |
+| blob 直传超 `blob_upload_max_bytes`（v0.1.30） | 413 | `{"code":413,"msg":"upload too large","data":null}` |
+| blob Range 越界 / 空文件（v0.1.30） | 416 | `Content-Range: bytes */<len>` |
+| WS 握手未过守卫（v0.1.30） | 401 | HTTP 401，不升级 |
 
 业务层常用码约定：400 入参不合法、404 资源不存在、401 未认证、403 已认证但无权、
 500 服务器内部错误。`json.fail` 的 `msg` 会原样进入信封，勿把内部细节（堆栈、SQL）
@@ -1720,6 +1756,31 @@ config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插�
 `Authorization: Bearer <access_token>`（缺失 / 验签失败 / 过期 → 401）。通过后 handler 里读
 `http.user`（`{id, roles, claims}`）。登录失败统一报 `invalid credentials`（不区分用户
 不存在/密码错）。
+
+**cookie 会话（v0.1.30，浏览器形态）**：`auth.cookie` 段缺省关闭（= 纯 Bearer 行为）：
+
+```yaml
+auth:
+  jwt_secret: "..."
+  cookie:                      # 可选；缺省整块不写 = 关闭
+    enabled: true
+    name: oj_sess              # HttpOnly 会话 cookie
+    same_site: Lax             # Lax / Strict / None
+    secure: false              # 生产 HTTPS 建议 true
+    ttl_secs: 86400
+    csrf_cookie: oj_csrf       # 非 HttpOnly，JS 可读
+    csrf_header: x-csrf-token
+```
+
+判定序（守卫内）：匿名路径 → Bearer → cookie 会话 → 统一 401
+（`missing or invalid bearer token`，不泄露哪条路失败）。cookie 会话的 cookie 值是
+**同 `jwt_secret` 签的 JWT**（签发是登录端点的职责：`json.header` 写
+`Set-Cookie: oj_sess=<jwt>; HttpOnly; SameSite=Lax; Path=/`，sample 有参考实现）；
+**非安全方法**（非 GET/HEAD/OPTIONS）再叠 CSRF 双提交：`csrf_header` 值必须等于
+`csrf_cookie` 值，否则 401 `missing or invalid csrf token`（Bearer 命中的请求不查）。
+浏览器 WS 握手自动带 Cookie——cookie 形态是 WS 鉴权的主通道（WS 升级过同一守卫，
+401 不升级；v0.1.30 起 ws 路径要在 `anonymous_paths` 里才匿名，见 §6 ws 硬约束 1）。
+CLI/MCP 继续用 Bearer，两者并存。
 
 **匿名路径** `auth.anonymous_paths`：去 `{base}` 前缀的路径列表，四种通配形态（字面 / 尾
 `/*` 严格一层 / 中段 `*` 恰好一段 / `**` 跨任意层）。条目写字符串即可，需要显式声明
@@ -1996,16 +2057,19 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 | `host` | `"localhost"` | 监听地址 |
 | `port` | `9778` | 监听端口；<1024 属特权端口（需 root），不要配成 `778` 之类 |
 | `api_prefix` | `"/v1/api"` | API 基础路由前缀；CLI `-b` 显式给出时覆盖；空前缀（空串/纯斜杠）拒绝启动。旧键名 `base` 仍兼容（并存 → duplicate field 报错） |
-| `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d` |
+| `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d`。路由级覆盖见 `route_timeouts` |
+| `route_timeouts` | `[]` | （v0.1.30）路由级超时覆盖：`[{pattern: "/v1/api/convert/**", timeout: "5m"}]`；pattern 段语义同匿名路径（字面 / `*` 一段 / `**` 跨段），按声明序首个命中，匹配**含 base 全路径**；超时语义同全局（408）。pattern 空/时长非法 → 启动 fail-fast |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
-| `max_upload_bytes` | `10485760`（10MB） | 上传体积上限；axum 层再乘 2 做硬顶（双闸，见第 13 章） |
+| `max_upload_bytes` | `10485760`（10MB） | handler 面（multipart 进 `http.file`）上传体积上限；超限 413。axum 层对非 blob 路径再乘 2 做硬顶（双闸，见第 13 章）。**不经 handler 的直传不受它管**——见 `blob_upload_max_bytes` |
+| `blob_upload_max_bytes` | `1073741824`（1 GiB） | （v0.1.30）直传路由 `PUT {base}/blob/{key}` 的体积上限（过鉴权守卫、不经 JsActor/30s）；超限 413 信封 |
+| `response_headers` | `{}` | （v0.1.30）全局自定义响应头 `{name: value}`，施加动态信封/静态站点/blob 响应面；**框架自有头永远优先**（只补缺，Content-Type/Location 等不可覆盖）；默认空 = 行为不变 |
 | `app_path` | 无 | 静态站点根目录（legacy 主站点，前缀取 `app_prefix`）。**省略 = 不开静态服务**。config 配置相对 config 目录；CLI `--app-path` 裸值相对 CWD。API 未命中的 GET/HEAD 落此目录（目录 → `index.html`）。穿越段（含 `%2F`）404。无 Range/ETag（经前置反代补）。多站点见 `static_sites`（v0.1.27）；目录存在性归装配期统一 fail-fast |
 | `app_spa_fallback` | `false` | （v0.1.20）SPA 深链回落：静态未命中 + 无扩展名 + `Accept` 含 `text/html`/`*/*`/缺失 + **不在 `api_prefix` 下** → 送 `<app_path>/index.html`。默认关是刻意的：静默把 404 变 200 会掩盖错配（拼错的资源路径） |
 | `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对 `app_path`）：送 HTML 前读 `<app_path>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
 | `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
 | `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
 | `app_prefix` | `"/"` | 静态站点前缀；默认 `/` = 全路径兜底（与旧版一致）。设为如 `/site` 时仅 `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404；API 路由永远优先。必须以 `/` 开头，否则启动报错 |
-| `static_sites` | `[]` | （v0.1.27）**多静态站点** `prefix→dir` 列表，如 `[{prefix: "/docs", path: "dist/docs"}]`；`path` 相对 config 目录。请求期**最长前缀命中**（`/docs/api/x` 胜过 `/`）。命中站内未命中**不跨站**回落——SPA 回落/meta JSON 均按命中站各自的根。归一后前缀重复或目录缺失 → 启动报错。与 legacy `app_path`+`app_prefix` 对（视作一条站点）并存；CLI `--app-path prefix=dir` 可重复，同前缀覆盖 config 条目 |
+| `static_sites` | `[]` | （v0.1.27）**多静态站点** `prefix→dir` 列表，如 `[{prefix: "/docs", path: "dist/docs"}]`；`path` 相对 config 目录。请求期**最长前缀命中**（`/docs/api/x` 胜过 `/`）。命中站内未命中**不跨站**回落——SPA 回落/meta JSON 均按命中站各自的根。归一后前缀重复或目录缺失 → 启动报错。与 legacy `app_path`+`app_prefix` 对（视作一条站点）并存；CLI `--app-path prefix=dir` 可重复，同前缀覆盖 config 条目。（v0.1.30）每项可加 `headers: {name: value}` 覆盖全局 `response_headers` 同名头（仅该站点；规则同框架头优先） |
 | `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） |
@@ -2610,7 +2674,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 
 | 限制 | 说明 / 绕行 |
 |---|---|
-| 相对 `require("./x")` 不支持 | ESM 相对导入不受影响；CJS `require` 仅裸 specifier，不读 `exports`/`conditions`，不支持 pnpm 布局 |
+| ~~相对 `require("./x")` 不支持~~（v0.1.30 已支持） | 相对 require / JSON 模块 / 循环 require 均可用；`exports`/`conditions` 与 pnpm 布局完整支持。残留限制：`exports` 的 `types`/`browser` 条件不命中；CJS `module.exports` 替换函数式写法启发式识别 |
+| blob multipart 预签名（v0.1.30） | `blob.uploadUrl` 的 multipart 形态暂返回 Err（object_store 无 multipart presign API）；单发 PUT 预签名 + `PUT {base}/blob/{key}` 直传路由（≤1 GiB）已覆盖大文件场景，>100MB 分片需求出现再补 |
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |

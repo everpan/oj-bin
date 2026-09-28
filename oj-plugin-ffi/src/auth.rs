@@ -11,6 +11,14 @@ use crate::{RResult, RString};
 #[stabby::stabby]
 #[repr(C)]
 pub struct AuthGuardVtable {
-    pub verify:
-        extern "C" fn(path_no_base: RString, authorization: RString) -> RResult<RString, RString>,
+    /// ABI 9 起四参：method = 大写 HTTP 方法（WS 握手 = "GET"）；
+    /// headers = 全部请求头 JSON（小写名 → 值，多值取第一个，含 cookie），
+    /// 空串 = 无头。cookie 会话/CSRF 双提交的判定材料都在 headers 里（插件按
+    /// 各自 cfg 的头名自取），Bearer 形态可全部忽略。
+    pub verify: extern "C" fn(
+        path_no_base: RString,
+        method: RString,
+        authorization: RString,
+        headers: RString,
+    ) -> RResult<RString, RString>,
 }

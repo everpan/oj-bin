@@ -49,7 +49,10 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 7 = 按轴 dlsym（删 PluginRegistrations/register，加轴自此零破坏）。
 /// 8 = bus 字节载荷起（EventBrokerVtable.publish data 与 HostContext.deliver payload
 ///     RString→RBytes，ws 二进制帧透传，v0.1.16）。
-pub const ABI_VERSION: u32 = 8;
+/// 9 = cookie 会话 + 上传直传起（AuthGuardVtable.verify 四参化：path/method/
+///     authorization/headers JSON——method 与任意请求头是 CSRF 双提交判定材料；
+///     BlobBackendVtable 增 upload_url 方法，v0.1.30）。
+pub const ABI_VERSION: u32 = 9;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(
@@ -158,7 +161,12 @@ mod tests {
         use super::{FAKE_A, FAKE_B, FakeVt};
         use crate::{AuthGuardVtable, RResult, RString};
 
-        extern "C" fn stub_verify(_: RString, _: RString) -> RResult<RString, RString> {
+        extern "C" fn stub_verify(
+            _: RString,
+            _: RString,
+            _: RString,
+            _: RString,
+        ) -> RResult<RString, RString> {
             unreachable!()
         }
         static AUTH_VT: AuthGuardVtable = AuthGuardVtable {

@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use serde_json::Value;
@@ -47,6 +47,8 @@ pub struct StaticSite {
     pub prefix: String,
     /// 磁盘根目录（resolve_static 在此解析；装配期已 canonicalize）。
     pub root: PathBuf,
+    /// 该站点的自定义响应头（v0.1.30；覆盖全局同名头，框架自有头仍优先）。
+    pub headers: Vec<(String, String)>,
 }
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
@@ -90,6 +92,11 @@ pub struct StaticOpts {
     /// HTML 响应 Cache-Control（`server.html_cache_control`，v0.1.25）：None = 不加头。
     /// 动态 handler 返回的 `cache_control` 优先。
     pub html_cache_control: Option<String>,
+    /// 自定义响应头全局默认（`server.response_headers`，v0.1.30）：施加于动态信封、
+    /// 静态站点、blob 下载/直传响应；与框架自有头冲突时框架优先（只补缺），
+    /// 静态站点可用 per-site `headers` 覆盖同名的全局值。默认空 = 行为不变。
+    /// 挂在 StaticOpts 是历史签名约束（app() 参数面不变），语义上是全站响应策略。
+    pub response_headers: Vec<(String, String)>,
 }
 
 /// handle() 前置管线配置：请求进入 JS 前的注入/守卫（租户/鉴权/上传）。
@@ -103,7 +110,14 @@ pub struct Pipeline {
     pub auth: Option<Arc<dyn AuthGuard>>,
     /// 上传/请求体上限（超限 413 信封）；axum body limit = 2x（超 2x 裸 413，ponytail: 接受）。
     pub max_upload: u64,
-    /// Some = blob 启用：`{base}/blob/{key}` 公开下载（local 直出 / s3 302 presign）。
+    /// blob 直传 PUT 路由（v0.1.30）体积上限（Pipeline::default = 1 GiB，与 config
+    /// 默认 `blob_upload_max_bytes` 同值）——直传不经 JsActor，与 handler 面分开计价。
+    pub blob_upload_max: u64,
+    /// 路由级 timeout 覆盖（v0.1.30）：(pattern, duration)，按声明顺序首个命中生效；
+    /// pattern 段语义同 `path_matches`（字面 / `*` 一段 / `**` 跨段），匹配全路径（含 base）。
+    pub route_timeouts: Vec<(String, std::time::Duration)>,
+    /// Some = blob 启用：`{base}/blob/{key}` 公开下载（local 直出 / s3 302 presign）；
+    /// PUT 同一前缀 = 守卫保护下的直传上传（v0.1.30）。
     pub blob: Option<Arc<dyn BlobBackend>>,
 }
 
@@ -113,7 +127,9 @@ impl Default for Pipeline {
             tenant_header: None,
             tenant_anon: Vec::new(),
             auth: None,
-            max_upload: 10 * 1024 * 1024, // 10MiB
+            max_upload: 10 * 1024 * 1024,        // 10MiB
+            blob_upload_max: 1024 * 1024 * 1024, // 1GiB
+            route_timeouts: Vec::new(),
             blob: None,
         }
     }
@@ -182,10 +198,8 @@ pub fn app(
         .fallback(any(handle))
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
         .layer(axum::middleware::from_fn(crate::logging::log_requests))
-        // 超 2x max_upload 的请求在 axum 层直接被拒（裸 413）；handle() 内再做信封 413。
-        .layer(axum::extract::DefaultBodyLimit::max(
-            (pipeline.max_upload * 2) as usize,
-        ))
+        // v0.1.30：请求体分档限长移入 handle()（blob 直传 PUT 走 1 GiB 档、其余 2x
+        // max_upload——全局 DefaultBodyLimit 层已移除，不能抬全局上限替直传开路）。
         .with_state(AppState {
             table,
             fallback: ts.then(|| Routes::new(base, dir, ts)),
@@ -337,16 +351,41 @@ pub async fn serve_router(
         .await
 }
 
-async fn handle(
-    State(st): State<AppState>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
+async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method;
+    let uri = parts.uri;
+    let headers = parts.headers;
     let verb = method.as_str();
     // Accept 判据先算：`headers` 稍后被 run 闭包整体捕获（SPA 回落要用）。
     let accept_html = wants_html(&headers);
+
+    // 请求体按路径分档限长（v0.1.30 取代全局 DefaultBodyLimit 层）：blob 直传 PUT
+    // 用 blob_upload_max（默认 1 GiB），其余维持 2x max_upload 硬顶——**不能**把全局
+    // 层抬到 1 GiB（handler 路由会被动接受巨体缓冲，内存 DoS 面扩大）。超限裸 413，
+    // 与旧 DefaultBodyLimit 行为逐字节一致。
+    let is_blob_put = verb == "PUT"
+        && st.pipeline.blob.is_some()
+        && uri.path().starts_with(&format!("{}/blob/", st.base));
+    let body_limit = if is_blob_put {
+        st.pipeline.blob_upload_max as usize
+    } else {
+        (st.pipeline.max_upload.saturating_mul(2)) as usize
+    };
+    let body = match axum::body::to_bytes(body, body_limit).await {
+        Ok(b) => b,
+        Err(_) => {
+            // blob 直传腿给信封 413（与 handler 面 413 语义一致）；其余腿维持旧
+            // DefaultBodyLimit 的裸 413（空体），逐字节兼容存量部署/探测脚本。
+            if is_blob_put {
+                return fail_response(413, "upload too large");
+            }
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
+        }
+    };
 
     // Certificate validation: restrict GET requests when certificate is expired or in grace period
     if verb == "GET" {
@@ -379,14 +418,48 @@ async fn handle(
     // v0.1.25 补第三处**同一前提**的分支：静态兜底内部派发 `server.html_meta_handler`
     // （见 `dispatch_meta_handler`）同样不经守卫（页面请求带不了 Bearer），故该 handler
     // **不必**进 `anonymous_paths`；它被外部直接访问时仍受守卫约束（两侧口径不冲突）。
+    // v0.1.30 补第四处**例外**：下方 PUT（直传上传）走守卫 + 租户准入（写面不能公开），
+    // 只豁免**读取**语义不变。
     if verb == "GET"
         && let Some(blob) = st.pipeline.blob.as_ref()
         && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
         && let Some(key) = decode_blob_key(key)
     {
-        return match blob.serve(&key).await {
+        let mut r = match blob.serve(&key).await {
             Ok(BlobServed::Bytes(bytes, ct)) => {
-                let mut r = Response::new(axum::body::Body::from(bytes));
+                // oj-7：local 内联直出支持单区间 Range（s3 302 腿不在此，presign URL
+                // 由对象存储自己处理 seek）。
+                let mut r = match parse_range(headers.get(axum::http::header::RANGE), bytes.len()) {
+                    RangeSpec::Partial(start, end) => {
+                        let mut r =
+                            Response::new(axum::body::Body::from(bytes[start..=end].to_vec()));
+                        *r.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        r.headers_mut().insert(
+                            axum::http::header::CONTENT_RANGE,
+                            axum::http::HeaderValue::from_str(&format!(
+                                "bytes {start}-{end}/{}",
+                                bytes.len()
+                            ))
+                            .unwrap_or(axum::http::HeaderValue::from_static("bytes 0-0/0")),
+                        );
+                        r
+                    }
+                    RangeSpec::Unsatisfiable => {
+                        let mut r = Response::new(axum::body::Body::empty());
+                        *r.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                        r.headers_mut().insert(
+                            axum::http::header::CONTENT_RANGE,
+                            axum::http::HeaderValue::from_str(&format!("bytes */{}", bytes.len()))
+                                .unwrap_or(axum::http::HeaderValue::from_static("bytes */0")),
+                        );
+                        r
+                    }
+                    RangeSpec::Full => Response::new(axum::body::Body::from(bytes)),
+                };
+                r.headers_mut().insert(
+                    axum::http::header::ACCEPT_RANGES,
+                    axum::http::HeaderValue::from_static("bytes"),
+                );
                 if let Some(ct) = ct {
                     r.headers_mut().insert(
                         axum::http::header::CONTENT_TYPE,
@@ -407,7 +480,44 @@ async fn handle(
                 );
                 r
             }
-            Err(_) => fail_response(404, "blob not found"),
+            Err(_) => return fail_response(404, "blob not found"),
+        };
+        apply_custom_headers(&mut r, &st.static_opts.response_headers);
+        return r;
+    }
+    // blob 直传上传（v0.1.30）：`PUT {base}/blob/{key}`。写面必须过守卫（GET 公开是
+    // 读语义；上传公开 = 任意人写你的存储）。经 admit()（鉴权 + 租户，同 run_route 语义），
+    // 体积上限走 blob_upload_max 档（handle 顶部已按路径放宽 body 限长）。不经 JsActor：
+    // 无 handler 30s timeout。anonymous_paths 可用 `/blob/**` 显式豁免（自甘风险）。
+    if is_blob_put
+        && let Some(blob) = st.pipeline.blob.as_ref()
+        && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
+        && let Some(key) = decode_blob_key(key)
+    {
+        let path_no_base = format!("/blob/{key}");
+        if let Err(resp) = admit(&st, &headers, verb, Some(&path_no_base)) {
+            return *resp;
+        }
+        // 体积上限在 handle 顶部按路径分档已 enforcement（blob 腿 = blob_upload_max，
+        // 超限在 to_bytes 处即 413 信封）——此处 body 必不超档，无需再检。
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        return match blob.put(&key, &body, ct.as_deref()).await {
+            Ok(()) => {
+                let mut r = Response::new(axum::body::Body::from(only_js::bridge::ok(
+                    &serde_json::Value::Null,
+                )));
+                *r.status_mut() = StatusCode::OK;
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                apply_custom_headers(&mut r, &st.static_opts.response_headers);
+                r
+            }
+            Err(_) => fail_response(500, "blob upload failed"),
         };
     }
     // 去 base 路径（鉴权匿名匹配用；不在 base 下 → None = 不设防）。
@@ -423,6 +533,7 @@ async fn handle(
                     verb,
                     parse_query(uri.query()),
                     path_no_base.as_deref(),
+                    &path,
                     file,
                     params,
                 )
@@ -448,6 +559,7 @@ async fn handle(
                     verb,
                     parse_query(uri.query()),
                     path_no_base.as_deref(),
+                    uri.path(),
                     file,
                     params,
                 )
@@ -471,7 +583,9 @@ async fn handle(
         if let Some(file) = resolve_static(root, rel_path, meta)
             && let Ok(body) = tokio::fs::read(&file).await
         {
-            return static_page(&st, root, rel_path, &file, body).await;
+            let mut r = static_page(&st, root, rel_path, &file, body).await;
+            apply_custom_headers(&mut r, &site_headers(&st, site));
+            return r;
         }
         // SPA 深链接回落（server.app_spa_fallback，v0.1.20）：未命中 + 无扩展名 +
         // Accept html + **不在 api_prefix 下**（否则拼错的 API 路径会被 index.html
@@ -483,7 +597,9 @@ async fn handle(
         {
             let idx = root.join("index.html");
             if let Ok(body) = tokio::fs::read(&idx).await {
-                return static_page(&st, root, rel_path, &idx, body).await;
+                let mut r = static_page(&st, root, rel_path, &idx, body).await;
+                apply_custom_headers(&mut r, &site_headers(&st, site));
+                return r;
             }
         }
     }
@@ -503,52 +619,20 @@ async fn run_route(
     verb: &str,
     query: HashMap<String, String>,
     path_no_base: Option<&str>,
+    full_path: &str,
     file: PathBuf,
     params: HashMap<String, String>,
 ) -> Response {
     let m = crate::routes::method_name(verb)
         .expect("checked by caller")
         .to_string();
-    // 前置管线：鉴权（base 内非匿名路径必须过守卫 → 401；Ok(None) = 匿名放行）。
-    let user = match (st.pipeline.auth.as_ref(), path_no_base) {
-        (Some(guard), Some(p)) => {
-            let header = headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok());
-            match guard.verify(p, header) {
-                Ok(Some(u)) => Some(u),
-                Ok(None) => None,
-                Err(msg) => return fail_response(401, &msg),
-            }
-        }
-        _ => None,
+    // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
+    // 防两处准入语义漂移）。401/400 以 Response 返回。
+    let (user, tenant_id, anonymous) = match admit(st, headers, verb, path_no_base) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
     };
-    // 前置管线：租户提取（启用后缺失/空 → 400；anonymous_paths 命中的跳转腿
-    // 豁免"缺失 400"——OIDC 302 带不了自定义头——但已带的头仍注入）。
-    // anonymous：db.asTenant 的授信判据（v0.1.20）。只有「豁免命中 + 确实没带
-    // 租户头」才是匿名；带了头或没豁免都不是（后者走 400 / tid 注入）。
-    let mut anonymous = false;
-    let tenant_id = match st.pipeline.tenant_header.as_deref() {
-        Some(key) => {
-            let exempt = path_matches(&st.pipeline.tenant_anon, path_no_base.unwrap_or(""));
-            match headers
-                .get(key)
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| !s.is_empty())
-            {
-                Some(tid) => Some(tid.to_string()),
-                None if exempt => {
-                    anonymous = true;
-                    None
-                }
-                None => {
-                    return fail_response(400, &format!("missing tenant header: {key}"));
-                }
-            }
-        }
-        None => None,
-    };
-    // 上传/请求体上限（信封 413）；超 2x 的已在 axum 层被拒。
+    // 上传/请求体上限（信封 413）；超 2x 的已在 handle() 分档限长处被拒。
     if body.len() > st.pipeline.max_upload as usize {
         return fail_response(413, "upload too large");
     }
@@ -574,12 +658,84 @@ async fn run_route(
         files,
         bus_tx: None,
     };
-    match st.actor.run_module(file, m, req, st.timeout).await {
+    // oj-5c：路由级 timeout 覆盖（按声明顺序首个命中；含 base 的全路径匹配）。
+    let timeout = st
+        .pipeline
+        .route_timeouts
+        .iter()
+        .find(|(p, _)| path_matches(std::slice::from_ref(p), full_path))
+        .map(|(_, d)| *d)
+        .or(st.timeout);
+    let mut resp = match st.actor.run_module(file, m, req, timeout).await {
         Ok(cap) => capture_response(cap),
         // 超时熔断 → 408。
         Err(e) if e.timeout => fail_response(408, &e.msg),
         Err(e) => fail_response(500, &e.msg),
-    }
+    };
+    apply_custom_headers(&mut resp, &st.static_opts.response_headers);
+    resp
+}
+
+/// 前置管线准入（v0.1.30 抽出）：鉴权（ABI 9 四参守卫）+ 租户提取。
+/// Ok((user, tenant_id, anonymous))；Err = 已构造的 401/400 响应。
+fn admit(
+    st: &AppState,
+    headers: &HeaderMap,
+    verb: &str,
+    path_no_base: Option<&str>,
+) -> Result<(Option<serde_json::Value>, Option<String>, bool), Box<Response>> {
+    // 鉴权（base 内非匿名路径必须过守卫 → 401；Ok(None) = 匿名放行）。
+    // ABI 9：方法 + 全部请求头 JSON（小写名 → 值，含 cookie）透传守卫——
+    // cookie 会话/CSRF 双提交的判定材料都在 headers 里（oj-auth 消费）。
+    let user = match (st.pipeline.auth.as_ref(), path_no_base) {
+        (Some(guard), Some(p)) => {
+            let header = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            let headers_json = serde_json::to_string(
+                &headers
+                    .iter()
+                    .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
+            match guard.verify(p, verb, header, Some(&headers_json)) {
+                Ok(Some(u)) => Some(u),
+                Ok(None) => None,
+                Err(msg) => return Err(Box::new(fail_response(401, &msg))),
+            }
+        }
+        _ => None,
+    };
+    // 租户提取（启用后缺失/空 → 400；anonymous_paths 命中的跳转腿
+    // 豁免"缺失 400"——OIDC 302 带不了自定义头——但已带的头仍注入）。
+    // anonymous：db.asTenant 的授信判据（v0.1.20）。只有「豁免命中 + 确实没带
+    // 租户头」才是匿名；带了头或没豁免都不是（后者走 400 / tid 注入）。
+    let mut anonymous = false;
+    let tenant_id = match st.pipeline.tenant_header.as_deref() {
+        Some(key) => {
+            let exempt = path_matches(&st.pipeline.tenant_anon, path_no_base.unwrap_or(""));
+            match headers
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+            {
+                Some(tid) => Some(tid.to_string()),
+                None if exempt => {
+                    anonymous = true;
+                    None
+                }
+                None => {
+                    return Err(Box::new(fail_response(
+                        400,
+                        &format!("missing tenant header: {key}"),
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+    Ok((user, tenant_id, anonymous))
 }
 
 /// SPA 回落的 Accept 判据（v0.1.20）：缺失 / `*/*` / 含 `text/html`（q>0）均视为 html。
@@ -1234,6 +1390,89 @@ fn fail_response(code: i32, msg: &str) -> Response {
     r
 }
 
+/// Range 头解析结果（oj-7）：Full = 非区间/非法/多区间（ponytail: 多区间不做
+/// multipart/byteranges 响应，回落 200 全量——单区间覆盖 pdf.js/媒体 seek 的全部场景）；
+/// Partial(start, end)（含端点，已按 len 钳制）；Unsatisfiable = 越界/空文件 → 416。
+#[derive(Debug, PartialEq, Eq)]
+enum RangeSpec {
+    Full,
+    Partial(usize, usize),
+    Unsatisfiable,
+}
+
+fn parse_range(header: Option<&axum::http::HeaderValue>, len: usize) -> RangeSpec {
+    let Some(h) = header else {
+        return RangeSpec::Full;
+    };
+    let Ok(s) = h.to_str() else {
+        return RangeSpec::Full;
+    };
+    let Some(rest) = s.trim().strip_prefix("bytes=") else {
+        return RangeSpec::Full;
+    };
+    // ponytail: 多区间（`bytes=a-b,c-d`）→ 200 全量。
+    if rest.contains(',') {
+        return RangeSpec::Full;
+    }
+    let (a, b) = match rest.split_once('-') {
+        Some(v) => v,
+        None => return RangeSpec::Full,
+    };
+    let parse = |s: &str| s.trim().parse::<usize>().ok();
+    match (parse(a), parse(b)) {
+        // "a-b"
+        (Some(start), Some(end)) if start <= end => {
+            if len == 0 || start >= len {
+                RangeSpec::Unsatisfiable
+            } else {
+                RangeSpec::Partial(start, end.min(len - 1))
+            }
+        }
+        // "a-"（到末尾）
+        (Some(start), None) => {
+            if len == 0 || start >= len {
+                RangeSpec::Unsatisfiable
+            } else {
+                RangeSpec::Partial(start, len - 1)
+            }
+        }
+        // "-N"（末尾 N 字节）
+        (None, Some(n)) => {
+            if len == 0 || n == 0 {
+                RangeSpec::Unsatisfiable
+            } else {
+                RangeSpec::Partial(len.saturating_sub(n), len - 1)
+            }
+        }
+        _ => RangeSpec::Full,
+    }
+}
+
+/// oj-8：自定义响应头补缺——**只插入响应里还没有的头**（框架自有头 Content-Type/
+/// Content-Length/Location/Content-Range 等永远优先）；非法头名/值静默跳过
+/// （与 capture_response 对 cap.headers 的宽容解析同款语义）。
+fn apply_custom_headers(r: &mut Response, extra: &[(String, String)]) {
+    for (k, v) in extra {
+        if let (Ok(name), Ok(hv)) = (
+            k.parse::<axum::http::HeaderName>(),
+            axum::http::HeaderValue::from_str(v),
+        ) && !r.headers().contains_key(&name)
+        {
+            r.headers_mut().insert(name, hv);
+        }
+    }
+}
+
+/// 站点级响应头 = 全局默认 + 该站点覆盖（同名替换值，不删全局其它头）。
+fn site_headers<'a>(st: &'a AppState, site: &'a StaticSite) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = st.static_opts.response_headers.clone();
+    for (k, v) in &site.headers {
+        out.retain(|(ek, _)| ek != k);
+        out.push((k.clone(), v.clone()));
+    }
+    out
+}
+
 /// `a=1&b=2` → map（application/x-www-form-urlencoded 解码，+ → 空格、%xx → 字节）。
 fn parse_query(q: Option<&str>) -> HashMap<String, String> {
     q.map(|s| {
@@ -1608,6 +1847,81 @@ pub(crate) mod tests {
         assert!(!crate::path_matches(&deep, ""));
     }
 
+    /// oj-7：Range 单区间解析矩阵（多区间/非法 → 200 全量；越界/空 → 416）。
+    #[test]
+    fn parse_range_semantics() {
+        use super::{RangeSpec, parse_range};
+        let hv = |s: &str| axum::http::HeaderValue::from_str(s).unwrap();
+        let len = 100usize;
+        // 无头 / 非 bytes 单位 / 多区间 / 段序非法 → 全量。
+        assert_eq!(parse_range(None, len), RangeSpec::Full);
+        assert_eq!(parse_range(Some(&hv("items=0-9")), len), RangeSpec::Full);
+        assert_eq!(
+            parse_range(Some(&hv("bytes=0-9,20-29")), len),
+            RangeSpec::Full
+        );
+        assert_eq!(parse_range(Some(&hv("bytes=9-0")), len), RangeSpec::Full);
+        assert_eq!(parse_range(Some(&hv("bytes=x-y")), len), RangeSpec::Full);
+        // 闭区间 + 末端钳制。
+        assert_eq!(
+            parse_range(Some(&hv("bytes=0-9")), len),
+            RangeSpec::Partial(0, 9)
+        );
+        assert_eq!(
+            parse_range(Some(&hv("bytes=90-200")), len),
+            RangeSpec::Partial(90, 99)
+        );
+        // 开区间到末尾。
+        assert_eq!(
+            parse_range(Some(&hv("bytes=50-")), len),
+            RangeSpec::Partial(50, 99)
+        );
+        // 末尾 N 字节。
+        assert_eq!(
+            parse_range(Some(&hv("bytes=-10")), len),
+            RangeSpec::Partial(90, 99)
+        );
+        assert_eq!(
+            parse_range(Some(&hv("bytes=-0")), len),
+            RangeSpec::Unsatisfiable
+        );
+        // 越界 / 空文件 → 416。
+        assert_eq!(
+            parse_range(Some(&hv("bytes=100-")), len),
+            RangeSpec::Unsatisfiable
+        );
+        assert_eq!(
+            parse_range(Some(&hv("bytes=0-9")), 0),
+            RangeSpec::Unsatisfiable
+        );
+    }
+
+    /// oj-8：apply_custom_headers 只补缺、不覆盖框架自有头、跳过非法头名。
+    #[test]
+    fn apply_custom_headers_fills_only_missing() {
+        use super::apply_custom_headers;
+        let mut r = Response::new(axum::body::Body::empty());
+        r.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let extra = vec![
+            ("x-frame-options".to_string(), "DENY".to_string()),
+            ("content-type".to_string(), "text/html".to_string()), // 框架已有 → 不覆盖
+            ("bad header name".to_string(), "x".to_string()),      // 非法名 → 跳过
+        ];
+        apply_custom_headers(&mut r, &extra);
+        assert_eq!(
+            r.headers()["x-frame-options"],
+            axum::http::HeaderValue::from_static("DENY")
+        );
+        assert_eq!(
+            r.headers()[axum::http::header::CONTENT_TYPE],
+            axum::http::HeaderValue::from_static("application/json")
+        );
+        assert!(!r.headers().contains_key("bad header name"));
+    }
+
     /// multipart：文本字段并入 body、文件进 http.files + http.file(i) 取字节；
     /// 非 multipart JSON 语义不变；超 max_upload 413 信封。
     #[tokio::test]
@@ -1750,7 +2064,13 @@ pub(crate) mod tests {
     /// Stub 守卫：/health 匿名；Bearer good → user；其余 Err。
     struct StubGuard;
     impl only_js::bridge::AuthGuard for StubGuard {
-        fn verify(&self, path: &str, auth: Option<&str>) -> Result<Option<Value>, String> {
+        fn verify(
+            &self,
+            path: &str,
+            _method: &str,
+            auth: Option<&str>,
+            _headers: Option<&str>,
+        ) -> Result<Option<Value>, String> {
             if path == "/health" {
                 return Ok(None);
             }
@@ -1948,17 +2268,19 @@ pub(crate) mod tests {
         s
     }
 
+    /// handle() 直接调用的请求构造（v0.1.30 签名改为 Request 后测试统一走这里）。
+    fn test_req(method: &str, uri: &str) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn get_blocked_when_cert_expired() {
         let st = state_with_cert(CertificateStatus::Expired);
-        let resp = crate::handle(
-            axum::extract::State(st),
-            axum::http::Method::GET,
-            axum::http::Uri::from_static("/v1/api/foo"),
-            axum::http::HeaderMap::new(),
-            axum::body::Bytes::new(),
-        )
-        .await;
+        let resp = crate::handle(axum::extract::State(st), test_req("GET", "/v1/api/foo")).await;
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::FORBIDDEN,
@@ -1975,14 +2297,7 @@ pub(crate) mod tests {
         let st = state_with_cert(CertificateStatus::Grace {
             remaining_secs: 86_400,
         });
-        let resp = crate::handle(
-            axum::extract::State(st),
-            axum::http::Method::GET,
-            axum::http::Uri::from_static("/v1/api/foo"),
-            axum::http::HeaderMap::new(),
-            axum::body::Bytes::new(),
-        )
-        .await;
+        let resp = crate::handle(axum::extract::State(st), test_req("GET", "/v1/api/foo")).await;
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::FORBIDDEN,
@@ -1998,14 +2313,7 @@ pub(crate) mod tests {
     async fn non_get_allowed_when_cert_expired() {
         // 仅 GET 受限；POST 等即便证书过期也应继续走到路由层（此处无路由 → 404，但非 403）。
         let st = state_with_cert(CertificateStatus::Expired);
-        let resp = crate::handle(
-            axum::extract::State(st),
-            axum::http::Method::POST,
-            axum::http::Uri::from_static("/v1/api/foo"),
-            axum::http::HeaderMap::new(),
-            axum::body::Bytes::new(),
-        )
-        .await;
+        let resp = crate::handle(axum::extract::State(st), test_req("POST", "/v1/api/foo")).await;
         assert_ne!(
             resp.status(),
             axum::http::StatusCode::FORBIDDEN,
@@ -2016,14 +2324,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn get_allowed_when_cert_valid() {
         let st = state_with_cert(CertificateStatus::Valid);
-        let resp = crate::handle(
-            axum::extract::State(st),
-            axum::http::Method::GET,
-            axum::http::Uri::from_static("/v1/api/foo"),
-            axum::http::HeaderMap::new(),
-            axum::body::Bytes::new(),
-        )
-        .await;
+        let resp = crate::handle(axum::extract::State(st), test_req("GET", "/v1/api/foo")).await;
         assert_ne!(
             resp.status(),
             axum::http::StatusCode::FORBIDDEN,
@@ -2192,6 +2493,7 @@ pub(crate) mod tests {
             .map(|((prefix, _), k)| StaticSite {
                 prefix: prefix.to_string(),
                 root: k.0.clone(),
+                headers: Vec::new(),
             })
             .collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2396,6 +2698,7 @@ pub(crate) mod tests {
                 html_meta: Some("__meta".into()),
                 html_meta_handler: Some("/v1/api/html-meta".into()),
                 html_cache_control: Some("no-cache".into()),
+                response_headers: Vec::new(),
             },
         )
         .await;
@@ -2439,6 +2742,7 @@ pub(crate) mod tests {
                 html_meta: None,
                 html_meta_handler: None,
                 html_cache_control: None,
+                response_headers: Vec::new(),
             },
         )
         .await;
@@ -2920,6 +3224,13 @@ pub(crate) mod tests {
         }
         async fn url(&self, _: &str) -> only_js::bridge::BridgeResult<String> {
             Ok(String::new())
+        }
+        async fn upload_url(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> only_js::bridge::BridgeResult<serde_json::Value> {
+            Err("not used".into())
         }
         async fn content_type(&self, _: &str) -> only_js::bridge::BridgeResult<Option<String>> {
             Ok(None)
