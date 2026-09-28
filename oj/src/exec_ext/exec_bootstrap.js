@@ -13,9 +13,12 @@ function stringify(v) {
   return JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x));
 }
 
-// console.* : free-form multi-arg -> "a 1 {"x":2}".
+// console.* : free-form multi-arg -> "a 1 {"x":2}" (strings bare, rest JSON).
 function emit(level, xs) {
-  op_exec_log(level, xs.map(stringify).join(" "));
+  op_exec_log(
+    level,
+    xs.map((x) => (typeof x === "string" ? x : stringify(x))).join(" ")
+  );
 }
 globalThis.console = {
   debug: (...xs) => emit(0, xs),
