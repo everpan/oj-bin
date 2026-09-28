@@ -422,8 +422,19 @@ mod tests {
     fn exec_file_last_args_and_log_file_parse() {
         // `--` 之后原样透传（含连字符参数）；--log-file / -d / --db 映射。
         let Command::Exec(a) = cmd(&[
-            "exec", "scripts/job.ts", "-c", "c.yaml", "-d", "src",
-            "--db", "report", "--log-file", "out.jsonl", "--", "-x", "foo bar",
+            "exec",
+            "scripts/job.ts",
+            "-c",
+            "c.yaml",
+            "-d",
+            "src",
+            "--db",
+            "report",
+            "--log-file",
+            "out.jsonl",
+            "--",
+            "-x",
+            "foo bar",
         ]) else {
             panic!()
         };
@@ -434,7 +445,9 @@ mod tests {
         assert_eq!(a.log_file.as_deref(), Some("out.jsonl"));
         assert_eq!(a.args, ["-x", "foo bar"]);
         // 无 `--` → args 为空。
-        let Command::Exec(a) = cmd(&["exec", "s.ts", "-c", "c.yaml"]) else { panic!() };
+        let Command::Exec(a) = cmd(&["exec", "s.ts", "-c", "c.yaml"]) else {
+            panic!()
+        };
         assert!(a.args.is_empty());
     }
 

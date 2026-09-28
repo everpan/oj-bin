@@ -5,6 +5,7 @@ pub mod args;
 pub mod build_cmd;
 pub mod checks;
 pub mod exec_cmd;
+pub mod exec_ext;
 pub mod manifest;
 pub mod migrate;
 pub mod migrate_cmd;
