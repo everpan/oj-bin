@@ -129,12 +129,22 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
   for t in "${triples[@]}"; do
     read -r os cpu <<<"$(os_cpu_of "$t")"
     pkg="${SCOPE}/oj-${t}"
-    # registry 传播延迟：retry 3 次
+    # registry 传播延迟：retry 5 次。注意 npm view --json 在版本不存在时退出码非 0 且把
+    # E404 错误对象打印到 stdout（非空）。必须按「退出码成功且非 error 对象」判定拿到真
+    # 元数据——否则错误 JSON 会被当成「非空元数据」短路掉 retry，误报 cpu/os 断言失败。
     meta=""
-    for _ in 1 2 3; do
-      meta=$(npm view "${pkg}@${VERSION}" os cpu --json 2>/dev/null) && [[ -n "$meta" ]] && break
-      sleep 10
+    for _ in 1 2 3 4 5; do
+      if meta=$(npm view "${pkg}@${VERSION}" os cpu --json 2>/dev/null) && \
+         [[ -n "$meta" && "$meta" != *'"error"'* ]]; then
+        break
+      fi
+      meta=""
+      sleep 15
     done
+    if [[ -z "$meta" ]]; then
+      echo "::error::${pkg}@${VERSION} 元数据获取失败（可能未发布或 registry 传播延迟）：npm view 返回空/E404" >&2
+      exit 1
+    fi
     echo "$meta" | grep -q "$os" || { echo "::error::${pkg} os 断言失败（期望 $os）：$meta" >&2; exit 1; }
     echo "$meta" | grep -q "$cpu" || { echo "::error::${pkg} cpu 断言失败（期望 $cpu）：$meta" >&2; exit 1; }
     # tarball 文件清单断言（npm pack 条目带 package/ 前缀）
