@@ -6,7 +6,7 @@
 `oj` 是构建出来的命令行程序，包含以下子命令。
 
 ## server
-  执行 `oj server -c config.yaml` 会读取配置文件，启动一个 web 服务。
+  执行 `oj serve -c config.yaml` 会读取配置文件，启动一个 web 服务。
 
   -c config.yaml 读取配置文件中的信息，启动服务，其中包含 host port db redis 等配置信息
 
@@ -119,7 +119,7 @@
 
 ## test
   进程内测试运行器：真实 deno_core 运行时 + 真实路由/鉴权/租户管线派发（零 TCP），
-  跑 `tests/*.test.ts`（注入 `client` 与 `describe/it/expect`），无需启动 oj server。
+  跑 `tests/*.test.ts`（注入 `client` 与 `describe/it/expect`），无需启动 oj serve。
 
 ```
     oj test [-c config.yaml] [-b base] [-d dir] [-t tests] [--format human|tap|junit|json] [--output file]

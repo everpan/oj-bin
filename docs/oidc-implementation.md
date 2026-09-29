@@ -21,7 +21,7 @@ flowchart TD
         UA["浏览器 / curl"]
     end
 
-    subgraph Server["oj server（同进程）"]
+    subgraph Server["oj serve（同进程）"]
         subgraph RP["RP 模块 sample/src/oidc/"]
             LOGIN["oidc/login<br/>state+nonce+PKCE"]
             CB["oidc/callback<br/>交换+验签+JIT"]

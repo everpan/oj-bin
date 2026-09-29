@@ -3,7 +3,7 @@
 //! 用 `server::test_support` 的固定测试密钥对签出 `exp` 在过去、宽限期 0 的真实证书 →
 //! 启动应返回含 "certificate" 的错误。证书夹具全仓唯一定义（勿再本地拷贝）。
 
-use oj::args::ServerArgs;
+use oj::args::ServeArgs;
 use oj::server_cmd;
 use server::test_support::{now_secs, write_cert};
 use tempfile::{NamedTempFile, TempDir};
@@ -54,7 +54,7 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     // 断言必有 panic：证书过期且宽限结束应中止启动。panic 载荷含 "certificate"，
     // 由 #[should_panic(expected = "certificate")] 校验；其余断言（如插件 ABI）失败会
     // 以不同 panic 信息暴露，从而偏离本测目标。
-    let _ = server_cmd::run(ServerArgs {
+    let _ = server_cmd::run(ServeArgs {
         config: config_file.path().to_string_lossy().into_owned(),
         api_path: Some(service_dir.to_string_lossy().into_owned()),
         // 测试必须留终端输出：server_cmd::run 会装 fd 级 tee，console 关闭时连

@@ -1,7 +1,7 @@
-# oj server 用户手册
+# oj serve 用户手册
 
 `oj` 是一个命令行工具：把按「模块 / 特性」目录组织好的 API 项目直接变成 REST 服务。
-你在项目里按目录写 `api.ts`，`oj server` 把目录树原样映射成 HTTP 路由。改文件即生效
+你在项目里按目录写 `api.ts`，`oj serve` 把目录树原样映射成 HTTP 路由。改文件即生效
 （dev 模式）；编译产物可发布（release 模式）。
 
 这本手册写给「用 oj 起服务、写接口」的人。先读 §1 把服务跑起来，用到哪块再查哪块。
@@ -16,11 +16,11 @@
 cargo xtask build               # 产出 bin/oj + bin/plugins/<triple>/（release；一次构建处处可用）
 
 # dev：直接跑 .ts 源码（目录无 manifests.yaml → 自动 dev/ts）
-./bin/oj server -c sample/config.yaml --api-path sample/src
+./bin/oj serve -c sample/config.yaml --api-path sample/src
 
 # release：先构建再跑产物 dist/（目录有 manifests.yaml → 自动 release/js）
 ./bin/oj build -d sample/src -o sample/dist
-./bin/oj server -c sample/config.yaml --api-path sample/dist
+./bin/oj serve -c sample/config.yaml --api-path sample/dist
 ```
 
 启动时把模块清单与路由表写入日志（终端默认静默，见下）。然后看日志：
@@ -43,7 +43,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 查参数时读这节。六个子命令的全貌：
 
 ```
-oj server  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
+oj serve  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
 oj build   [module] [-c config.yaml] [-d src] [-o dist] [--no-minify] [--check]
 oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--log-file path] [-- arg...]
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]

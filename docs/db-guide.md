@@ -19,7 +19,7 @@
 
 ### 1) 配一个库
 
-`config.yaml`（与 `oj server -c` 指向的目录同级）：
+`config.yaml`（与 `oj serve -c` 指向的目录同级）：
 
 ```yaml
 db:
@@ -94,7 +94,7 @@ export { get };
 ### 4) 跑起来
 
 ```bash
-./bin/oj server -c sample/config.yaml --api-path sample/src
+./bin/oj serve -c sample/config.yaml --api-path sample/src
 curl "http://localhost:9778/v1/api/user/account/?role=admin"
 ```
 

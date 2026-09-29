@@ -1,4 +1,4 @@
-# oj server 运维手册
+# oj serve 运维手册
 
 **给谁读**：负责部署、发布、排障的人——拿到一台服务器之后照这本走。功能怎么配见
 `docs/user-manual.md`，实现细节见 `docs/dev-guide.md`，模块数据层与迁移运维见
@@ -28,7 +28,7 @@ cargo xtask build          # release 构建，产物归置 bin/oj + bin/plugins/
    逐库各跑一遍（未声明的库名 fail-fast；见 `migration.md` §3.8）。
 4. 打包 `bin/oj` + `bin/plugins/<triple>/` + `dist/` + `config.yaml` + `seed.sql`（可选）+
    vendored `node_modules/`（裸 specifier 运行时解析依赖它，**不打进 tgz**）。
-5. 目标机解包，`./oj server -c config.yaml --api-path dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
+5. 目标机解包，`./oj serve -c config.yaml --api-path dist`（dist 含 `manifests.yaml` → 自动 release 跑 `.js`）。
    插件发现走 `<exe>/plugins/<triple>/`，保持 `bin/` 的相对布局拷过去即可，无需额外配置。
 
 ### 1.1 npm 分发（`@oj-bin/*`）
@@ -79,22 +79,22 @@ bash scripts/npm-publish.sh v0.1.13             # 真发（幂等，已发布的
 ## 2. 运行
 
 ```bash
-./oj server -c config.yaml --api-path dist            # release
-./oj server -c config.yaml --api-path src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
+./oj serve -c config.yaml --api-path dist            # release
+./oj serve -c config.yaml --api-path src              # dev（无 manifests.yaml 自动判定；跑 .ts，改文件即生效）
 ```
 
 启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整。
 
 ```bash
 tail -f logs/server-*.log     # 默认：日志只落盘，终端静默
-./oj server -c config.yaml --api-path dist --console-log   # 终端也输出
+./oj serve -c config.yaml --api-path dist --console-log   # 终端也输出
 ```
 
 后台运行（无 systemd/supervisor 时的轻量守护）：
 
 ```bash
-./oj server -c config.yaml --api-path dist --daemon
-# → oj server daemonized (pid 12345)；父进程即退，子进程脱离终端继续跑
+./oj serve -c config.yaml --api-path dist --daemon
+# → oj serve daemonized (pid 12345)；父进程即退，子进程脱离终端继续跑
 kill 12345                       # 停机：SIGTERM 走优雅停机（排空在途请求与任务）
 ```
 
@@ -208,7 +208,7 @@ server dev 不写 `migrate_on_start` 时缺省 `auto`（启动即应用迁移）
 生产建议用 `RUST_LOG` 控制级别：
 
 ```bash
-RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
+RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 ```
 
 ## 7. 排障表

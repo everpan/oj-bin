@@ -62,20 +62,20 @@ first build downloads a prebuilt V8 (slow once, fast afterwards).
 cargo xtask build            # build and place bin/oj + bin/plugins/<triple>/ (release; first build pulls prebuilt V8)
 
 # dev: run .ts sources directly (no manifests.yaml in dir → auto dev/ts, file changes apply live)
-./bin/oj server -c sample/config.yaml --api-path sample/src
+./bin/oj serve -c sample/config.yaml --api-path sample/src
 
 # release: build the artifacts first, apply migrations, then run dist/
 # (manifests.yaml present → auto release/js; migrate is required by the verify gate)
 ./bin/oj build   -d sample/src -o sample/dist
 ./bin/oj migrate -c sample/config.yaml -d sample/dist
-./bin/oj server  -c sample/config.yaml --api-path sample/dist
+./bin/oj serve  -c sample/config.yaml --api-path sample/dist
 ```
 
 ### Install prebuilt binaries via npm
 
 ```bash
 npm i @oj-bin/oj     # drops ./bin/oj + bin/plugins/<triple>/ + bin/devkit/ into your project
-./bin/oj server -c sample/config.yaml --api-path sample/src
+./bin/oj serve -c sample/config.yaml --api-path sample/src
 ```
 
 Prebuilt for linux-x64 (glibc) / macOS-arm64 / windows-x64; other platforms use
@@ -115,7 +115,7 @@ through `bin/oj`:**
 
 | Command | Purpose |
 |---|---|
-| `./bin/oj server -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
+| `./bin/oj serve -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
 | `./bin/oj build -d <src> -o <dist>` | build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
 | `./bin/oj test -c <config>` | run `*.test.ts` in-process (no server needed) |
 | `./bin/oj exec <file.ts\|js> -c <config>` | run one ts/js script with the full backend injected — one-off fixes / reconciliation / job prototypes (v0.1.29, see `docs/exec-integration.md`) |

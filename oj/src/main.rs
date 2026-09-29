@@ -5,7 +5,7 @@ pub async fn run_command(cmd: Command) -> i32 {
     // 数据操作（migrate/fixture/seed/test 的语句重放）走 tracing 记录：非 server
     // 命令在此挂 stderr 订阅器；server 命令由 server::logging 装配（终端镜像 +
     // 落盘），不得抢 init（try_init 失败静默——重复 init 场景）。
-    if !matches!(cmd, Command::Server(_)) {
+    if !matches!(cmd, Command::Serve(_)) {
         // swc_timer=off：swc minifier 的逐 pass 计时事件（target=swc_timer）不面向用户。
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
@@ -23,10 +23,10 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
-        Command::Server(a) => match oj::server_cmd::run(a).await {
+        Command::Serve(a) => match oj::server_cmd::run(a).await {
             Ok(()) => 0,
             Err(e) => {
-                let msg = format!("oj server: {e}");
+                let msg = format!("oj serve: {e}");
                 // console 关闭时 fd 2 已被 tee 重定向，此行只落盘；再直写原终端，
                 // 让启动失败的最终原因在屏幕上立即可见（console 开启时镜像已回显，补写会重复）。
                 eprintln!("{msg}");
@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_missing_config_returns_one() {
-        let code = run_command(Command::Server(oj::args::ServerArgs {
+        let code = run_command(Command::Serve(oj::args::ServeArgs {
             config: "no-such-config.yaml".into(),
             base: None,
             api_path: None,

@@ -84,7 +84,7 @@ schema: [order] 表 "order" 缺 tenant_id 列（tenant.sql_guard 启用中；
 共享表请显式 tenant: false 并加入 config tenant.shared_allow）
 ```
 
-校验挂在三处：`oj server` 启动、`oj build`、`oj migrate`——哪个入口都绕不过去。
+校验挂在三处：`oj serve` 启动、`oj build`、`oj migrate`——哪个入口都绕不过去。
 
 ## 共享表（字典表）怎么办
 

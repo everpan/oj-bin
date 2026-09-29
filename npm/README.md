@@ -21,7 +21,7 @@ bin/devkit/                # API manual + global.d.ts
 ```
 
 ```bash
-./bin/oj server -c config.yaml --api-path src
+./bin/oj serve -c config.yaml --api-path src
 ```
 
 ## Supported platforms

@@ -16,9 +16,9 @@ use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBac
 use only_js::config::{self, Config, StaticSiteConf};
 
 use crate::app::App;
-use crate::args::ServerArgs;
+use crate::args::ServeArgs;
 
-pub async fn run(a: ServerArgs) -> Result<(), String> {
+pub async fn run(a: ServeArgs) -> Result<(), String> {
     // --daemon：re-exec 自身（剥掉 --daemon）脱离终端后父进程即退；
     // 子进程日志照常落 server.logs_dir（console 默认关闭）。
     if a.daemon {
@@ -99,7 +99,7 @@ pub async fn run(a: ServerArgs) -> Result<(), String> {
         .serve_graceful(addr, shutdown_signal(task_flag.clone()))
         .await?;
     println!(
-        "oj server listening on http://{bound}{} (dir={}, {})",
+        "oj serve listening on http://{bound}{} (dir={}, {})",
         base,
         dir.display(),
         if !api_specified {
@@ -163,7 +163,7 @@ fn daemonize() -> Result<(), String> {
         });
     }
     let child = cmd.spawn().map_err(|e| format!("daemon: spawn: {e}"))?;
-    println!("oj server daemonized (pid {})", child.id());
+    println!("oj serve daemonized (pid {})", child.id());
     Ok(())
 }
 
@@ -207,7 +207,7 @@ fn daemonize() -> Result<(), String> {
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map_err(|e| format!("daemon: spawn: {e}"))?;
-    println!("oj server daemonized (pid {})", child.id());
+    println!("oj serve daemonized (pid {})", child.id());
     Ok(())
 }
 
@@ -863,19 +863,19 @@ mod tests {
     fn strip_daemon_flag_drops_only_daemon() {
         use std::ffi::OsString;
         let out = strip_daemon_flag(
-            ["server", "-c", "c.yaml", "--daemon", "--api-path", "src"]
+            ["serve", "-c", "c.yaml", "--daemon", "--api-path", "src"]
                 .into_iter()
                 .map(OsString::from),
         );
         assert_eq!(
             out,
-            ["server", "-c", "c.yaml", "--api-path", "src"]
+            ["serve", "-c", "c.yaml", "--api-path", "src"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
         // 无 --daemon 时原样透传。
-        let out = strip_daemon_flag(["server", "-c", "c.yaml"].into_iter().map(OsString::from));
+        let out = strip_daemon_flag(["serve", "-c", "c.yaml"].into_iter().map(OsString::from));
         assert_eq!(out.len(), 3);
     }
 

@@ -16,6 +16,19 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.31（未打标签）
+
+> 版本分界：`oj/Cargo.toml` 0.1.30 → 0.1.31。上一版：`v0.1.30` → adc1a25。
+> 发布点标签：未打标签（发版时 `git tag -a v0.1.31 -m "v0.1.31: server 子命令重命名为 serve"` 并推送）。
+
+**破坏性变更（CLI 子命令重命名）**
+
+- **`server` 子命令重命名为 `serve`**：`oj server` → `oj serve`（更符合动词命名；
+  `oj/src/args.rs` 的 `Commands`/`Command` 变体由 `Server` 更名为 `Serve`、参数结构
+  `ServerArgs` 更名为 `ServeArgs`，子命令 token 由 clap 派生为 `serve`）。旧 `oj server`
+  不再可用。运行时提示文案（`oj serve listening on ...`、`oj serve daemonized (pid ...)`、
+  `oj serve: <err>`）同步更新。
+
 ## v0.1.30（2026-09-28，已打标签 v0.1.30）
 
 > 版本分界：`oj/Cargo.toml` 0.1.29 → 0.1.30。上一版：`v0.1.29` → e6ad218。
