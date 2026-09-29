@@ -1121,6 +1121,65 @@ node_modules——发布物自带（场景表「npm 依赖不打包进 tgz」）
 
 ---
 
+## 场景 18：config 里的密码不落明文（v0.1.33）
+
+**什么时候用**：`config.yaml` 要进 git / 进镜像 / 发工单附件，里面有 db DSN、redis URL、
+smtp 密码、ldap `bind_pw`、`auth.jwt_secret`、`oidc` 的 client secret。
+
+### ① 一次性：生成密钥对
+
+```bash
+./bin/oj secret keygen --bits 4096 --out-dir keys
+# keys/secrets-private.pem（600，只放部署机）+ keys/secrets-public.pem（可进仓库）
+echo 'keys/secrets-private.pem' >> .gitignore   # 私钥绝不进仓库
+```
+
+### ② 加密：明文 → `ENC[…]`
+
+```bash
+# 走 stdin（推荐）：命令行参数会进 shell history 与 ps
+echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys/secrets-public.pem
+# → ENC[Ab3…]  （同一明文每次不同：OAEP 随机化）
+```
+
+### ③ 写进 config
+
+```yaml
+secrets:
+  private_key_path: keys/secrets-private.pem   # 相对 config 目录
+
+db:
+  default: "ENC[Ab3…]"        # 整条 DSN 一起封，不用拆密码字段
+redis:
+  default: "ENC[Cd9…]"
+auth:
+  jwt_secret: "ENC[Ef1…]"
+ldap:
+  default:
+    url: ldap://dc.example:389
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "ENC[Gh2…]"      # 不透明段里同样支持
+```
+
+### ④ 验证
+
+```bash
+./bin/oj secret open -c config.yaml 'ENC[Ab3…]'   # 应打出原明文（走与启动同一条私钥通道）
+./bin/oj serve -c config.yaml --api-path src      # 起得来即装配通过
+```
+
+### ⑤ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 启动报 `config has ENC[...] sealed values but no decryption key` | 部署机没给私钥：`OJ_SECRET_KEY`（内联 PEM）/ `OJ_SECRET_KEY_FILE`（路径）/ `secrets.private_key_path` 三选一 |
+| `rsa open failed (wrong private key?)` | 私钥和加密用的公钥不是一对（换机器只拷了 config）；**不会**静默降级成把密文当明文 |
+| 换了密钥对，老密文解不开 | 轮换须用**新公钥重封全部密文**——旧私钥解不了新密文，反之亦然 |
+| 想把私钥也塞进 config | 别：那等于把钥匙和锁放同一张纸。私钥留在部署机，config 只放**路径** |
+| 日志里看到 `mysql://***@127.0.0.1:3306/app` | 正常——错误与 warn 里的 DSN/URL 凭据段一律打 `***`（v0.1.33） |
+
+---
+
 ## 相关文档
 
 - `api-manual.md` —— 完整 API 手册（13 章）

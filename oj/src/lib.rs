@@ -11,6 +11,7 @@ pub mod migrate;
 pub mod migrate_cmd;
 pub mod pack;
 pub mod schema;
+pub mod secret_cmd;
 pub mod seed;
 pub mod server_cmd;
 pub mod tasks;

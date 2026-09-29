@@ -719,6 +719,23 @@ impl Default for TasksCfg {
     }
 }
 
+/// 凭据密封（v0.1.33）：config 里 `ENC[...]` 密文值的密钥位置。
+///
+/// **公钥可随仓库走**（`oj secret seal` 用它加密，见不解密权）；**私钥只在部署机**
+/// ——本段只是私钥的**位置**（PEM 内容本身不该进 config，否则等于把钥匙贴在同一张纸上）。
+/// 私钥三通道（优先级从高到低）：`OJ_SECRET_KEY`（内联 PEM）> `OJ_SECRET_KEY_FILE`
+/// （文件路径）> 本段 `private_key_path`（相对 config 目录）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct SecretsCfg {
+    /// 解密私钥 PEM 路径（相对 config 目录；绝对路径原样）。
+    #[serde(default)]
+    pub private_key_path: Option<String>,
+    /// 加密公钥 PEM 路径（`oj secret seal` 未显式给 `-k` 时用；可选）。
+    #[serde(default)]
+    pub public_key_path: Option<String>,
+}
+
 /// WS 运行时配置（spec 2026-09-09 帧池）。段缺省 = 全默认。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -794,6 +811,10 @@ pub struct Config {
     /// **不能塞进 `db:`**——`db` 是 name → DSN 的 map，键即库名。
     #[serde(default)]
     pub db_query: crate::bridge::QueryLimits,
+    /// 凭据密封（v0.1.33）：`ENC[...]` 密文的密钥位置。段缺省 = 无私钥
+    /// （此时配置里出现 `ENC[...]` 会 fail-fast，见 [`SecretsCfg`]）。
+    #[serde(default)]
+    pub secrets: SecretsCfg,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
     /// 部署期常量（v0.1.25）：`name → string`，handler 经 `vars.get(name)` 读。
@@ -827,6 +848,32 @@ pub fn load_from(dir: &Path, explicit: Option<&str>) -> Result<Config, String> {
     };
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    // 密封值解密发生在 **Value 层**（`Config::deserialize` 之前）：ldap/plugins/kafkas
+    // 是不透明 Value，类型层够不着其中的 `bind_pw`；在树上递归替换则全段覆盖且
+    // schema 零改动。配置里没有 `ENC[...]` 时完全不碰密钥路径（旧配置逐字节不变）。
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if crate::secret::has_sealed(&value) {
+        let cfg_path = value
+            .get("secrets")
+            .and_then(|s| s.get("private_key_path"))
+            .and_then(|v| v.as_str());
+        let key = crate::secret::load_private_key(cfg_path, dir).map_err(|e| {
+            format!(
+                "{}: config has ENC[...] sealed values but {e}",
+                path.display()
+            )
+        })?;
+        crate::secret::decrypt_tree(&mut value, &key)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // 解密后**回经文本**再反序列化，而不是 `from_value`：serde_yaml 的 `from_str`
+        // 会把裸标量按字面量读成字符串（`vars: {PORT: 3000}` → `"3000"`，该段依赖此
+        // 行为），而 `from_value` 对 `Value::Number` 直接报 "invalid type: integer"。
+        // 走文本才能与未加密路径逐字节同行为。
+        let plain = serde_yaml::to_string(&value)
+            .map_err(|e| format!("{}: re-serialize after decrypt: {e}", path.display()))?;
+        return serde_yaml::from_str(&plain).map_err(|e| format!("parse {}: {e}", path.display()));
+    }
     serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -925,6 +972,124 @@ mod tests {
         // 缺段 → 空表（`vars.get` 恒 null），不是报错
         std::fs::write(dir.join("config.yaml"), "server:\n  port: 9778\n").unwrap();
         assert!(load_from(&dir, None).unwrap().vars.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// config 里的 `ENC[...]` 在 `load_from` 里就地解密（含不透明段 ldap）：
+    /// 解密后 `Config` 拿到的就是明文，下游（插件 cfg 透传 / DSN 拼接）零改动。
+    #[test]
+    fn sealed_values_are_decrypted_on_load() {
+        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let dir = std::env::temp_dir().join(format!("ojcfgseal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k.pem"), &priv_pem).unwrap();
+        let dsn = crate::secret::seal(&pub_pem, "mysql://root:hunter2@127.0.0.1:3306/app").unwrap();
+        let pw = crate::secret::seal(&pub_pem, "bind-secret").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "secrets:\n  private_key_path: k.pem\n\
+                 db:\n  default: \"{dsn}\"\n\
+                 ldap:\n  default:\n    url: ldap://h:389\n    bind_pw: \"{pw}\"\n"
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert_eq!(c.db["default"], "mysql://root:hunter2@127.0.0.1:3306/app");
+        assert_eq!(
+            c.ldap.as_ref().unwrap()["default"]["bind_pw"].as_str(),
+            Some("bind-secret")
+        );
+        // 明文不该出现在文件里（这就是本项要防的事故面）。
+        let raw = std::fs::read_to_string(dir.join("config.yaml")).unwrap();
+        assert!(!raw.contains("hunter2") && !raw.contains("bind-secret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fail-fast：有 `ENC[...]` 却拿不到私钥 → 拒绝加载。
+    /// 静默把密文当明文用（连上一个叫 "ENC[...]" 的密码）是不可接受的失败形态。
+    #[test]
+    fn sealed_value_without_private_key_fails_fast() {
+        let (_, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let dir = std::env::temp_dir().join(format!("ojcfgnoseal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = crate::secret::seal(&pub_pem, "x").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!("db:\n  default: \"{token}\"\n"),
+        )
+        .unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("sealed"), "{e}");
+        assert!(e.contains("OJ_SECRET_KEY"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 密封值只能落在**字符串字段**上：解密结果必然是字符串，落到 `port` 这类
+    /// 数值字段会 `invalid type: string` —— 这是限制（不是 bug），写死在用例里。
+    #[test]
+    fn sealed_value_on_numeric_field_is_a_parse_error() {
+        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let dir = std::env::temp_dir().join(format!("ojcfgnum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k.pem"), &priv_pem).unwrap();
+        let sealed = crate::secret::seal(&pub_pem, "9778").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!("secrets:\n  private_key_path: k.pem\nserver:\n  port: \"{sealed}\"\n"),
+        )
+        .unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("invalid type"), "{e}");
+        // 解密确实发生过（报错里是明文 9778 而非密文）。
+        assert!(e.contains("9778"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：加密路径不能改变 YAML 的标量→字符串语义。
+    /// `vars: {PORT: 3000}` 一直读成 `"3000"`（见 `vars` 段文档）；若解密后直接
+    /// `from_value`，`Value::Number(3000)` 进 `HashMap<String,String>` 会报
+    /// "invalid type: integer" —— 故解密后回经文本再解析。
+    #[test]
+    fn sealed_path_keeps_scalar_to_string_coercion() {
+        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let dir = std::env::temp_dir().join(format!("ojcfgcoerce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k.pem"), &priv_pem).unwrap();
+        let sealed = crate::secret::seal(&pub_pem, "s3cret").unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "secrets:\n  private_key_path: k.pem\n\
+                 vars:\n  PORT: 3000\n  FLAG: true\n\
+                 auth:\n  jwt_secret: \"{sealed}\"\n"
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert_eq!(c.vars.get("PORT").map(String::as_str), Some("3000"));
+        assert_eq!(c.vars.get("FLAG").map(String::as_str), Some("true"));
+        assert_eq!(c.auth.as_ref().unwrap().jwt_secret, "s3cret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧配置（无 `ENC[...]`）完全不碰密钥路径：不配私钥也照常加载。
+    #[test]
+    fn plain_config_loads_without_any_key() {
+        let dir = std::env::temp_dir().join(format!("ojcfgplain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "db:\n  default: sqlite://a.db\nauth:\n  jwt_secret: s\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert_eq!(c.db["default"], "sqlite://a.db");
+        assert!(c.secrets.private_key_path.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

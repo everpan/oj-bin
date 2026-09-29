@@ -87,6 +87,36 @@ pub struct FixtureArgs {
     pub db: Option<String>,
 }
 
+/// `oj secret keygen [--bits N] [--out-dir D] [--force]`：生成密封密钥对。
+pub struct SecretKeygenArgs {
+    /// RSA 位数（最小 2048）。
+    pub bits: usize,
+    /// 输出目录：`<dir>/secrets-private.pem` 与 `<dir>/secrets-public.pem`。
+    pub out_dir: String,
+    /// 覆盖已存在文件（默认拒绝，防误删在用私钥）。
+    pub force: bool,
+}
+
+/// `oj secret seal [-k pub.pem] [VALUE]`：把明文封成 `ENC[...]`（无 VALUE 时读 stdin）。
+pub struct SecretSealArgs {
+    /// 公钥 PEM 路径；None → 取 `-c` 配置的 `secrets.public_key_path`。
+    pub key: Option<String>,
+    /// 配置文件（只取 `secrets.public_key_path`，不解密整份配置）。
+    pub config: Option<String>,
+    /// 明文；None → 读 stdin（推荐：命令行参数会进 shell history / `ps`）。
+    pub value: Option<String>,
+}
+
+/// `oj secret open [-k priv.pem] [VALUE]`：解出 `ENC[...]` 的明文（排障用）。
+pub struct SecretOpenArgs {
+    /// 私钥 PEM 路径；None → 走 `OJ_SECRET_KEY` / `OJ_SECRET_KEY_FILE` / `-c` 配置的
+    /// `secrets.private_key_path`。
+    pub key: Option<String>,
+    pub config: Option<String>,
+    /// 密文；None → 读 stdin。
+    pub value: Option<String>,
+}
+
 /// 解析结果（错误/帮助/空参由 clap 处理，不会走到这里）。
 pub enum Command {
     Serve(ServeArgs),
@@ -96,6 +126,9 @@ pub enum Command {
     Fixture(FixtureArgs),
     SchemaDiff(SchemaDiffArgs),
     Exec(ExecArgs),
+    SecretKeygen(SecretKeygenArgs),
+    SecretSeal(SecretSealArgs),
+    SecretOpen(SecretOpenArgs),
 }
 
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
@@ -261,6 +294,11 @@ enum Commands {
         #[command(subcommand)]
         command: SchemaCmd,
     },
+    /// 配置凭据密封（config 里的 `ENC[...]`）：keygen / seal / open
+    Secret {
+        #[command(subcommand)]
+        command: SecretCmd,
+    },
     /// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）
     Exec {
         /// 脚本文件路径（.ts/.js）
@@ -280,6 +318,45 @@ enum Commands {
         /// 传给脚本的参数（`--` 之后原样注入 globalThis.args）
         #[arg(last = true)]
         args: Vec<String>,
+    },
+}
+
+/// `oj secret <sub>`。
+#[derive(Debug, Subcommand)]
+pub enum SecretCmd {
+    /// 生成密封密钥对（私钥留在部署机，公钥可随仓库走）
+    Keygen {
+        /// RSA 位数（最小 2048；长期密钥建议 4096）
+        #[arg(long, default_value_t = 2048)]
+        bits: usize,
+        /// 输出目录（落 secrets-private.pem / secrets-public.pem）
+        #[arg(long, default_value = ".")]
+        out_dir: String,
+        /// 覆盖已存在文件（默认拒绝）
+        #[arg(long)]
+        force: bool,
+    },
+    /// 把明文封成 `ENC[...]`（密文可直接写进 config.yaml）
+    Seal {
+        /// 公钥 PEM 路径；缺省取 --config 的 secrets.public_key_path
+        #[arg(short, long)]
+        key: Option<String>,
+        /// 配置文件（只读 secrets.public_key_path）
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 明文；**省略则读 stdin**（命令行参数会进 shell history 与 `ps`）
+        value: Option<String>,
+    },
+    /// 解出 `ENC[...]` 的明文（排障：确认密文与私钥对得上）
+    Open {
+        /// 私钥 PEM 路径；缺省走 OJ_SECRET_KEY / OJ_SECRET_KEY_FILE / --config
+        /// 的 secrets.private_key_path
+        #[arg(short, long)]
+        key: Option<String>,
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 密文 `ENC[...]`；省略则读 stdin
+        value: Option<String>,
     },
 }
 
@@ -391,6 +468,24 @@ fn to_command(cli: Cli) -> Command {
         Commands::Schema {
             command: SchemaCmd::Diff { config, dir, db },
         } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
+        Commands::Secret {
+            command:
+                SecretCmd::Keygen {
+                    bits,
+                    out_dir,
+                    force,
+                },
+        } => Command::SecretKeygen(SecretKeygenArgs {
+            bits,
+            out_dir,
+            force,
+        }),
+        Commands::Secret {
+            command: SecretCmd::Seal { key, config, value },
+        } => Command::SecretSeal(SecretSealArgs { key, config, value }),
+        Commands::Secret {
+            command: SecretCmd::Open { key, config, value },
+        } => Command::SecretOpen(SecretOpenArgs { key, config, value }),
         Commands::Exec {
             file,
             config,
@@ -551,6 +646,52 @@ mod tests {
             (a.module.as_deref(), a.dir.as_str(), a.out.as_str()),
             (Some("user"), "s", "d")
         );
+    }
+
+    #[test]
+    fn secret_subcommands_map_through() {
+        // keygen：--bits / --out-dir / --force。
+        let Command::SecretKeygen(a) = cmd(&[
+            "secret",
+            "keygen",
+            "--bits",
+            "4096",
+            "--out-dir",
+            "keys",
+            "--force",
+        ]) else {
+            panic!()
+        };
+        assert_eq!((a.bits, a.out_dir.as_str(), a.force), (4096, "keys", true));
+        let Command::SecretKeygen(a) = cmd(&["secret", "keygen"]) else {
+            panic!()
+        };
+        assert_eq!((a.bits, a.out_dir.as_str(), a.force), (2048, ".", false));
+        // seal/open：positional VALUE 可省（省则读 stdin），-k 与 -c 均可选。
+        let Command::SecretSeal(a) = cmd(&["secret", "seal", "-k", "pub.pem", "hunter2"]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.key.as_deref(), a.value.as_deref()),
+            (Some("pub.pem"), Some("hunter2"))
+        );
+        let Command::SecretSeal(a) = cmd(&["secret", "seal", "-c", "config.yaml"]) else {
+            panic!()
+        };
+        assert!(a.key.is_none() && a.value.is_none());
+        assert_eq!(a.config.as_deref(), Some("config.yaml"));
+        let Command::SecretOpen(a) = cmd(&["secret", "open", "-k", "priv.pem"]) else {
+            panic!()
+        };
+        assert_eq!(
+            (a.key.as_deref(), a.config.as_deref()),
+            (Some("priv.pem"), None)
+        );
+        let cli =
+            |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
+        // 未知子命令 / 未知旗标仍由 clap 拒（--bits 只属于 keygen）。
+        assert!(cli(&["secret", "nope"]).is_err());
+        assert!(cli(&["secret", "seal", "--bits", "1"]).is_err());
     }
 
     #[test]

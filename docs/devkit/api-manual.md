@@ -2197,6 +2197,8 @@ curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<titl
 - **按库运维（v0.1.21）**：`oj migrate` / `oj fixture` / `oj schema diff` 的 `--db <name>`
   即上方键名；缺省 `default`，未声明 fail-fast。账本 `_oj_migrations`、schema 收敛、
   `--baseline` 都各库独立——多库须逐库跑（模块绑不同库见第 3 章「命令」与场景 6）。
+- DSN 带密码时写成 `"ENC[…]"` 密文（v0.1.33，见「secrets —— 凭据密封」）：整条 DSN
+  一起封即可，不必拆出密码字段。
 
 ### redis
 
@@ -2208,7 +2210,9 @@ redis:
 `default` **配置存在即真连**（启动 fail-fast：连不上直接报错退出，不静默退回内存），
 需 oj-kv-redis 插件；未装插件 → 启动报 `no kv plugin loaded`。段缺失/全注释 →
 进程内存 KV。真连后 `kv`/`redis` 全局与 auth 会话共享同一 Redis（多实例水平扩展的前提）。
-仅 `default` 被使用，其余键 warn 忽略。
+仅 `default` 被使用，其余键 warn 忽略（warn 里的 URL **凭据段打 `***`**）。
+
+URL 带密码时写成 `"ENC[…]"` 密文（v0.1.33，见「secrets —— 凭据密封」）。
 
 ### es
 
@@ -2353,6 +2357,61 @@ vars:
 - 典型用途：邮件里拼的站点基址（`WEB_URL`）、对外展示的联系方式——**换环境只改 config，
   不必重新 `oj build`**。
 
+### secrets —— 凭据密封（`ENC[...]`，v0.1.33）
+
+把 config 里的明文密码换成密文，**配置文件可以进 git，私钥不行**。
+
+```bash
+./bin/oj secret keygen --bits 4096 --out-dir keys   # keys/secrets-private.pem + secrets-public.pem
+echo -n 'hunter2' | ./bin/oj secret seal -k keys/secrets-public.pem   # → ENC[BASE64…]
+./bin/oj secret open -c config.yaml 'ENC[BASE64…]'  # 排障：确认密文与私钥对得上
+```
+
+```yaml
+secrets:
+  private_key_path: keys/secrets-private.pem   # 相对 config 目录；**只放部署机**
+  public_key_path:  keys/secrets-public.pem    # 可选，`oj secret seal` 缺省取它
+
+db:
+  default: "ENC[Ab3…]"          # 整条 DSN 密封（含密码）
+auth:
+  jwt_secret: "ENC[Ab3…]"
+ldap:                            # 不透明段里的 bind_pw 同样支持
+  default:
+    url: ldap://dc.example:389
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "ENC[Ab3…]"
+```
+
+- **算法**：RSA-OAEP-SHA256 只封 32 字节会话密钥，明文由 AES-256-GCM 加密（信封）。
+  所以明文长度无上限，且密文被改一个 bit 会**解密失败**（GCM 校验）而不是解出垃圾。
+- **覆盖范围**：解密发生在配置解析的 Value 层（`Config` 结构体之前），**任何段、任意
+  深度的字符串值**都支持——包括 `ldap` / `plugins` / `kafkas` 这类不透明段。将来新增
+  配置段自动生效。没有 `ENC[...]` 的旧配置**完全不碰密钥路径**，行为不变。
+- **私钥三通道**（优先级从高到低）：`OJ_SECRET_KEY`（PEM 内联）> `OJ_SECRET_KEY_FILE`
+  （文件路径）> 本段 `private_key_path`。**常态用后两者**——内联 PEM 会出现在
+  `/proc/<pid>/environ`、`docker inspect`、k8s pod spec 与 CI 的 env 回显里，只适合临时
+  排障。
+- **每环境用独立密钥对**：信封里没有 key-id，同一密钥对下**把 dev 的密文粘进 prod 照样
+  能解**（反之亦然）。这不是缺陷，是刻意不做 key-id 与 AAD——代价是「环境隔离」要靠密钥
+  分离来兑现，别多环境共用一对密钥。
+- **fail-closed**：配置里有 `ENC[...]` 却找不到私钥（或解密失败）→ **启动报错退出**，
+  绝不静默把密文当明文用（那会连上一个名叫 `ENC[…]` 的密码）。
+- **能防什么**：配置文件泄漏（误提交 git / 镜像层 / 备份 / 工单附件）——泄漏者拿不到
+  私钥就解不出密码。把「N 个密码」收敛成「1 个私钥」，且加密权（公钥，可进仓库）与
+  解密权（私钥，只在部署机）分离。
+- **不防什么**：私钥本身泄漏（那就全完了）、内存取证（明文必然在内存里）。
+  **私钥请 chmod 600（`keygen` 已自动设置）、加进 `.gitignore`、不要和 config 放同一处。**
+- **换密码/轮密钥**：`oj secret seal` 出新密文粘回去即可，密文互不相关（OAEP 随机化，
+  同一明文两次加密结果不同）。轮换密钥对须重封**全部**密文（旧私钥解密不了新密文）。
+- **只能加密字符串值**：解密结果是字符串，落到 `port` / `limit` 这类数值字段会
+  `invalid type: string` 报错（加密非敏感值也不报错——平台不判断「该不该加密」，只判断
+  「是不是密文」）。字面量恰好以 `ENC[` 开头且以 `]` 结尾的明文会被当密文硬失败，报错
+  里会提示换写法。密文也不能当**键**用（`ENC[...]: 1` 直接报错）。
+- **日志面**：DSN / URL 出现在错误信息与 warn 里时**凭据段打 `***`**
+  （如 `mysql://***@127.0.0.1:3306/app`），排障认得 host 就够。
+- `keygen` 缺省 2048 位（生成快）；长期使用的密钥对建议 `--bits 4096`。
+
 ### 证书三字段：必配不可绕过
 
 - `public_key_path` / `certificate_path` 缺任一 → 启动报错退出；**没有任何 config/CLI
@@ -2387,6 +2446,7 @@ vars:
 | `api path not found: …` | `--api-path` 指定了就必须存在（静态站点存在性不在此判，见下行） |
 | `静态站点前缀 … 重复：… 与 … 冲突` / `server.static_sites[prefix=…]: 静态目录 …: No such file or directory` | （v0.1.27）装配期站点表解析 fail-fast：归一后前缀重复（报错含两条来源）或站点目录缺失/非目录 |
 | `server.html_meta_handler` 未命中 GET 路由 | `server.html_meta_handler: "…" 不在路由表（拼错了？）` / `未映射 GET 方法` 退出（v0.1.25；后果只在爬虫侧可见，故不留到运行期） |
+| config 里有 `ENC[…]` 但找不到私钥 / 解密失败 | `config has ENC[...] sealed values but …` 退出（v0.1.33；**不静默把密文当明文用**） |
 | `vars:` 段值不是标量（嵌套 map/list） | 解析期报错（值只能是字符串/数字/布尔） |
 | 同一张表被两个模块 schema.yaml 声明 | 表归属单射违反（S002），启动拒启 |
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |

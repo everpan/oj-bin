@@ -62,6 +62,27 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::SecretKeygen(a) => match oj::secret_cmd::run_keygen(&a) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj secret keygen: {e}");
+                1
+            }
+        },
+        Command::SecretSeal(a) => match oj::secret_cmd::run_seal(&a) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj secret seal: {e}");
+                1
+            }
+        },
+        Command::SecretOpen(a) => match oj::secret_cmd::run_open(&a) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj secret open: {e}");
+                1
+            }
+        },
         Command::Exec(a) => match oj::exec_cmd::run(a) {
             Ok(code) => code,
             Err(e) => {

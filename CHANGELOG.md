@@ -16,6 +16,59 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.33（未打标签）
+
+> 版本分界：`oj/Cargo.toml` 0.1.32 → 0.1.33。上一版：`v0.1.32`。
+> 发布点标签：未打标签（发版时 `git tag -a v0.1.33 -m "v0.1.33: config 凭据密封（ENC[]）+ DSN/URL 日志脱敏"` 并推送）。
+
+**新能力：config 凭据密封（`ENC[...]`）**
+
+- **`config.yaml` 里的敏感值可以写成密文**：`db` DSN、`redis` URL、`blob` 的
+  `access_key/secret_key`、`smtp.*.pass` 与 `xoauth2.access_token`、`ldap` 的 `bind_pw`、
+  `auth.jwt_secret`、`oidc` 的 `client_secret`/`secret` 等**任意段、任意深度的字符串值**
+  都可写成 `ENC[<base64url>]`，启动时用部署机私钥就地解密。配置泄漏（误提交 git / 镜像层
+  / 备份）不再等于密码泄漏——把「N 个密码」收敛成「1 个私钥」。
+- **算法**：RSA-OAEP-SHA256 只封 32 字节会话密钥，明文由 AES-256-GCM 加密（信封）。
+  明文长度无上限（不再受 RSA 单次 190 字节限制），密文被改一个 bit 会**解密失败**
+  而非解出垃圾。
+- **解密落在配置解析的 Value 层**（`Config::deserialize` 之前，`src/config.rs`
+  的 `load_from`）：`ldap` / `plugins` / `kafkas` 这类不透明段同样覆盖，**配置 schema
+  零改动**，将来新增段自动支持。配置里没有 `ENC[...]` 时**完全不碰密钥路径**（旧配置
+  逐字节不变，不配私钥照常启动）。
+- **密封值只能当值**：落在 mapping **键**位（`ENC[...]: 1`）一律报错，不静默留着密文
+  当名字用；数值字段（`server.port`）收到密文会 `invalid type: string`——解密结果必然是
+  字符串，这是限制不是 bug；字面量恰好以 `ENC[` 开头且以 `]` 结尾的明文会被当密文硬失败，
+  报错里给出换写法的提示。
+- **私钥三通道**（优先级高→低）：`OJ_SECRET_KEY`（内联 PEM）> `OJ_SECRET_KEY_FILE`
+  （文件路径）> `secrets.private_key_path`（相对 config 目录）。
+- **fail-closed**：有 `ENC[...]` 却拿不到私钥（或解密失败/密文被篡改）→ **启动报错退出**，
+  绝不静默把密文当明文用（那会连上一个名叫 `ENC[…]` 的密码）。
+- **新增 `oj secret` 子命令**：`keygen`（生成密钥对，私钥自动 chmod 600、拒绝覆盖）、
+  `seal`（明文 → `ENC[…]`，**默认读 stdin**，避免明文进 shell history/`ps`）、
+  `open`（排障，走与启动同一条私钥通道）。
+
+**修复：DSN / URL 明文进错误与日志（宿主 + 插件两侧）**
+
+- 宿主：`db_backend.rs` 未知 scheme 与「非 sqlite DSN」两条报错、`app.rs` 里 redis URL
+  的 warn，原先会把**含密码的整串**原样打出，而 `server::logging` 会把终端输出完整镜像
+  落盘 → 密码明文进 `logs/`。
+- 插件（同一条泄漏链的另一端）：`oj-kv-redis` 的三条连接错误、`oj-bus-rabbitmq` 的
+  连接错误同样原样带 URL，现一并脱敏（插件只依赖 `oj-plugin-ffi`，故本地同口径实现）。
+- 统一为「凭据段打 `***`、host/库名保留」（如 `mysql://***@127.0.0.1:3306/app`、
+  `redis://***@127.0.0.1:6379/1`），排障信息不丢。
+
+- **运维约束（写进文档）**：`OJ_SECRET_KEY` 内联 PEM 会出现在 `/proc/<pid>/environ`、
+  `docker inspect`、k8s pod spec 与 CI 的 env 回显里，**只适合临时排障**，常态用
+  `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`；信封不带 key-id，**每环境须用独立
+  密钥对**（同一对密钥下 dev 密文粘进 prod 照样能解）。`keygen` 缺省 2048 位，长期密钥
+  建议 `--bits 4096`。
+
+**文档**
+
+- `docs/devkit/` 四件同步：`api-manual.md` §10 新增「secrets —— 凭据密封」并补 fail-fast
+  表一行、`scenarios.md` 新增场景 18（照抄即可跑）、`SKILL.md` 陷阱速查新增三条、
+  `README.md` 索引标注版本特性。
+
 ## v0.1.32（未打标签）
 
 > 版本分界：`oj/Cargo.toml` 0.1.31 → 0.1.32。上一版：`v0.1.31` → 38c05eb。
