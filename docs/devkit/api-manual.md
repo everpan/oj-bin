@@ -2412,6 +2412,8 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
   （如 `mysql://***@127.0.0.1:3306/app`），排障认得 host 就够。
 - `keygen` 缺省 2048 位（生成快）；长期使用的密钥对建议 `--bits 4096`。
 
+完整手册（威胁模型、密文格式、轮换与迁移步骤、排障）见仓库 `docs/secrets.md`。
+
 ### 证书三字段：必配不可绕过
 
 - `public_key_path` / `certificate_path` 缺任一 → 启动报错退出；**没有任何 config/CLI
