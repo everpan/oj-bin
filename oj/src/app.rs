@@ -715,7 +715,12 @@ pub async fn assemble_backend(
 ) -> Result<Backend, String> {
     // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
-        eprintln!("warn: redis '{name}' ({url}) ignored (only redis.default is used)");
+        // 脱敏：redis URL 格式是 `redis://:password@host`，原样打出来（且会镜像进
+        // logs/）等于明文泄漏凭据；排障认得 host 就够。
+        eprintln!(
+            "warn: redis '{name}' ({}) ignored (only redis.default is used)",
+            only_js::secret::redact(url)
+        );
     }
     // loader：project_root 用 config_dir（api 相对 dir；dir 由调用方绝对化）。
     // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`

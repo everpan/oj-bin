@@ -117,6 +117,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效）；池化任务可用管理面 `POST {base}/tasks/{name}/reload`（v0.1.28） |
 | 池化任务跑几轮就 `failed` | 单轮 `loop_body` 超 `tasks.pool.loop_body_timeout_ms`（默认 5s）即 teardown + failed 退避重连——长轮询（>5s 一次的等待）别用池化，继续用 TLA + `tasks.sleep` |
 | 池化任务里 `tasks.stopping()` 恒 false | 池化任务由 worker 每轮驱动：`loop_body` 返回即一轮结束，天然无需停机轮询/`tasks.sleep`（v0.1.28） |
+| 启动报 `config has ENC[...] sealed values but no decryption key: …` | config 里有密封值却找不到私钥——设 `OJ_SECRET_KEY`（PEM）/ `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`。**不会**静默把密文当明文用（v0.1.33） |
+| `ENC[…]` 解不开 / 报 `rsa open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
+| 想把 `--value` 写进 shell 命令 | 别——命令行参数进 shell history 与 `ps`；用 `echo -n 'pwd' \| ./bin/oj secret seal -k pub.pem`（尾换行会被剥除） |
 | `/tasks/{name}/start` 对 cron 任务报 400 | 跨 kind 命令被拒：cron 用 `enable`/`disable`，long 用 `start`/`stop`（v0.1.28） |
 | `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |
 | 任务池 CPU 飙高 / `runCount` 暴涨 | `interval_ms` 太小或为 0（0 = 不限制，压测语义）——默认 100ms≈10 轮/s；实测无节奏 4 任务聚合 24.8 万轮/s、CPU 134%（多核空转）。先算写放大（轮率 × 每轮 IO）再调小（§6「性能特征与调优」） |

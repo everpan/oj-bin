@@ -68,7 +68,9 @@ impl RabbitCore {
         // lapin 拨号是真实连接 → 装配期即可探活 fail-fast（spec §7，评审 S3 裁决）。
         let conn = Connection::connect(&url, ConnectionProperties::default())
             .await
-            .map_err(|e| format!("rabbitmq connect {url}: {e}"))?;
+            // 脱敏：amqp URL 带 `user:pass@`，原样进 Err 会经宿主终端镜像落 logs/
+            // （凭据本身往往正是 config 里被 ENC[] 密封的那个值）。
+            .map_err(|e| format!("rabbitmq connect {}: {e}", mask_url(&url)))?;
         Ok(Self {
             url,
             conn: Arc::new(conn),

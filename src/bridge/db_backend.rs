@@ -71,7 +71,13 @@ impl DbBackendRegistry {
             }
         }
         let known: Vec<_> = self.backends.iter().flat_map(|b| b.schemes()).collect();
-        Err(format!("unknown db scheme in dsn '{dsn}' (known: {known:?})").into())
+        // 脱敏：DSN 里带 `user:pass@`，原样进错误/日志等于把密码写进 logs/（logging 会
+        // 把终端输出完整镜像落盘）。排障只需 scheme + host，凭据段打 ***。
+        Err(format!(
+            "unknown db scheme in dsn '{}' (known: {known:?})",
+            crate::secret::redact(dsn)
+        )
+        .into())
     }
     /// 自省：已注册后端名（op_plugins 用）。
     pub fn backend_names(&self) -> Vec<&str> {
@@ -119,7 +125,7 @@ pub fn normalize_sqlite_dsn(dsn: &str, config_dir: &Path) -> BridgeResult<String
         .strip_prefix("sqlite://")
         .or_else(|| dsn.strip_prefix("sqlite:"));
     let Some(rest) = rest else {
-        return Err(format!("not a sqlite dsn (got '{dsn}')").into());
+        return Err(format!("not a sqlite dsn (got '{}')", crate::secret::redact(dsn)).into());
     };
     if rest.is_empty() {
         return Ok("sqlite::memory:".into()); // sqlite://（空）视作内存

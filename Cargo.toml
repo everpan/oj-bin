@@ -71,6 +71,7 @@ deno_ast = { version = "0.53.3", features = ["transpiling", "visit"] }
 # mangle top_level=false：只重命名函数内局部绑定，导出名/顶层名不动（跨文件 import 安全）。
 swc_ecma_minifier = "36"
 object_store = { version = "0.14.1", features = ["aws"] }
+aes-gcm = { version = "0.10", features = ["std"] }
 
 [dev-dependencies]
 # env-gated 真库用例需要具体驱动：`src/bridge/db.rs` 的 `next_seq_first_use_inside_tx_on_real_db`

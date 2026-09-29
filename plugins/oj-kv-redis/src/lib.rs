@@ -44,18 +44,39 @@ struct RedisKV {
     conn: redis::aio::ConnectionManager,
 }
 
+/// URL 脱敏（与宿主 `only_js::secret::redact` 同口径）：`scheme://` 与 `@` 之间的
+/// 凭据段换 `***`，host/库名保留。插件不能依赖宿主库（只依赖 oj-plugin-ffi），故本地
+/// 复制——**口径必须保持一致**，否则一处脱敏另一处漏。
+///
+/// 必须脱敏的原因：Err 串回宿主后会经终端镜像落 `logs/`（`server::logging`），
+/// 而 redis URL 里的密码正是 config 中被 `ENC[...]` 密封的那个值。
+fn redact_url(s: &str) -> String {
+    let Some(rest) = s.split_once("://").map(|(_, r)| r) else {
+        return "***".into();
+    };
+    match rest.find('@') {
+        Some(at) => format!(
+            "{}://***@{}",
+            &s[..s.len() - rest.len() - 3],
+            &rest[at + 1..]
+        ),
+        None => s.to_string(),
+    }
+}
+
 impl RedisKV {
     /// 连接失败/认证失败 → Err（装配 fail-fast；先单次连接探活——ConnectionManager
     /// 内部连不上会无限重试，直接构造会把「redis 宕机」变成启动挂死而非 fail-fast）。
     async fn arc(url: &str) -> Result<Arc<RedisKV>, String> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis open {url}: {e}"))?;
+        let client =
+            redis::Client::open(url).map_err(|e| format!("redis open {}: {e}", redact_url(url)))?;
         let _probe = client
             .get_multiplexed_tokio_connection()
             .await
-            .map_err(|e| format!("redis connect {url}: {e}"))?;
+            .map_err(|e| format!("redis connect {}: {e}", redact_url(url)))?;
         let conn = redis::aio::ConnectionManager::new(client)
             .await
-            .map_err(|e| format!("redis connect {url}: {e}"))?;
+            .map_err(|e| format!("redis connect {}: {e}", redact_url(url)))?;
         Ok(Arc::new(Self { conn }))
     }
 
@@ -248,6 +269,23 @@ oj_plugin_ffi::oj_plugin_entry!(init, kv => &VTABLE);
 mod tests {
     use super::*;
     use oj_plugin_ffi::RBytes;
+
+    /// 连接失败的错误里不该出现明文密码（Err 会经宿主终端镜像落 logs/）。
+    #[test]
+    fn redact_url_hides_credentials() {
+        assert_eq!(
+            redact_url("redis://:pwd@127.0.0.1:6379/1"),
+            "redis://***@127.0.0.1:6379/1"
+        );
+        assert_eq!(redact_url("redis://u:p@h:6379"), "redis://***@h:6379");
+        // 无凭据的 URL 原样。
+        assert_eq!(
+            redact_url("redis://127.0.0.1:6379"),
+            "redis://127.0.0.1:6379"
+        );
+        // 非 URL（裸口令）整串打码。
+        assert_eq!(redact_url("pwd"), "***");
+    }
 
     /// 连接拒绝 → Err（装配 fail-fast 路径；端口 1 无监听）。
     #[tokio::test(flavor = "current_thread")]
