@@ -102,6 +102,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |
 | `ldap:` 段改了不生效并报错双配置 | 同时写了顶层 `ldap:` 段与非空 `plugins.ldap` 透传——二选一（透传静默胜出，装配期报错拦截） |
 | `start_tls` 配在 ldaps:// 上启动报错 | ldaps 已隐式 TLS，StartTLS 无意义——`ldap://` 口才用 `start_tls: true` |
+| `search` 报 `operationsError: 必须先完成 bind` | 匿名绑定被目录拒绝——`ldap:` 段只配了 `bind_dn` 却没给 `bind_pw`，又没在 `search`/`searchPaged` 用 `opts.bindPw` 补上；服务账号 DN 留 config、密码走运行时参数（`search(base, { …, bindPw })`），二者合并生效 |
+| 服务账号密码不想落配置 | config 只写 `bind_dn`，`bind_pw` 经每次 `search`/`searchPaged` 的 `opts.bindPw` 传入（与 config 的 `bind_dn` 合并，取一即可）；`whoami`/`compare` 仍需 config 同时有 `bind_dn`+`bind_pw` |
 | WS 连上但收不到广播 | 订阅只在 WS 会话内有效（`bus.subscribe` 在 HTTP 路径报错）；release 下 URL 含版本段 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
 | `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |

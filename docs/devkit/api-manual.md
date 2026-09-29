@@ -1244,6 +1244,11 @@ type SearchOpts = {
   scope?: "base" | "one" | "sub";   // 默认 "sub"（整棵子树）；"one" = 仅下一层
   filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
   attrs?: string[];                 // 要读的属性名；缺省/空数组 = 服务端默认属性集
+  // 可选：覆盖本次查询的绑定凭据（与 config ldap:<inst> 的 bind_dn/bind_pw 合并——
+  // 二者取一即可，另一个回落 config）。用于把密码作为运行时参数传入，避免落配置。
+  // 仅 search / searchPaged 支持；whoami/compare/bind 仍用 config 服务账号或各自入参。
+  bindDn?: string;
+  bindPw?: string;
 };
 type Entry = {
   dn: string;
@@ -1285,11 +1290,16 @@ ldap:
     tls_skip_verify: true                # 自签 CA 测试用；生产关掉
 ```
 
-- `bind_dn`/`bind_pw` 须**成对**出现（只配一个 → 启动报错）；都不配时 search 以匿名绑定执行
-  （多数目录默认拒匿名读，届时报「insufficient access rights」类错误）。
+- `bind_dn`/`bind_pw` 不再强制成对：`bind_dn` 可单独配（服务账号 DN 非密码，可留配置）；
+  `bind_pw` 缺失时可在每次 `search`/`searchPaged` 用 `opts.bindPw` 作为运行时参数补上
+  （与 config 的 `bind_dn` 合并，取一即可）。**只为「有 `bind_pw` 却无 `bind_dn`」报错**
+  （凭据无绑定目标）。都不配时 search 以匿名绑定执行（多数目录默认拒匿名读，届时报
+  「insufficient access rights」类错误）。
 - 错误文案：`ldap: unknown instance 'x'（known: …）`（key 未声明）、`ldap.bind: 'dn' must
   be a non-empty string`（入参校验）、`ldap: connect ldap://…: io error`（网络/拒连）、
-  `ldap: service bind …: rc=49 …`（服务账号凭据错）。全部 reject，不会 resolve 半个信封。
+  `ldap: service bind …: rc=49 …`（服务账号凭据错）、`ldap.search: 'bindDn'/'bindPw' must
+  be a string`（opts 类型校验）、`bind_pw requires bind_dn (set both in config, or supply
+  bindPw per search call)`（config 只有密码无 DN）。全部 reject，不会 resolve 半个信封。
 - **filter 注入**：`filter` 是拼进 LDAP 查询的字符串，`(uid=${username})` 若 `username`
   含 `*`/`()`/`\` 会改变查询语义（LDAP 无参数绑定）。**先转义**（把 `*` `(` `)` `\` NUL
   前缀 `\`）或用 `ldap.compare` 收口。
