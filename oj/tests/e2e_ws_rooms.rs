@@ -64,7 +64,7 @@ impl WsClient {
         // 读到响应头结束（101 Switching Protocols）；头之后的残留字节进 pre。
         let mut buf = vec![0u8; 1024];
         let mut total = 0;
-        let mut head_end = None;
+        let head_end;
         loop {
             let n = s.read(&mut buf[total..]).await.unwrap();
             assert!(n > 0, "handshake EOF");
@@ -72,11 +72,11 @@ impl WsClient {
             let head = String::from_utf8_lossy(&buf[..total]);
             if let Some(i) = head.find("\r\n\r\n") {
                 assert!(head.starts_with("HTTP/1.1 101"), "upgrade rejected: {head}");
-                head_end = Some(i + 4);
+                head_end = i + 4;
                 break;
             }
         }
-        let pre = buf[head_end.unwrap()..total].to_vec();
+        let pre = buf[head_end..total].to_vec();
         Self { s, pre }
     }
 
@@ -273,7 +273,7 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
     let _ = b.read_text_to().await;
     drop(b); // socket 关闭 = 客户端断连
     let mut size = 0;
-    for i in 0..50 {
+    for _ in 0..50 {
         a.send_text(r#"{"op":"size","room":"r1"}"#).await;
         let v: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
         size = v["data"]["size"].as_u64().unwrap();
