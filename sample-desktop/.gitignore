@@ -1,0 +1,7 @@
+# 生成的自签名证书（含私钥），不入库；用 `cargo run -p oj-cert -- gen` 重新生成
+src-tauri/certs/
+# 本地 sqlite 文件
+src-tauri/*.sqlite
+src-tauri/app.sqlite
+# Tauri 构建产物
+src-tauri/target/

@@ -1,0 +1,37 @@
+[package]
+name = "oj-desktop-demo"
+version = "0.1.0"
+edition = "2024"
+default-run = "oj-desktop-demo"
+
+# 独立 workspace：避免被仓库根 workspace 自动收纳（路径依赖 ../../oj 仍可用）。
+[workspace]
+
+[lib]
+name = "oj_desktop_demo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# devtools 特性：开启 WebKit 检查器（macOS 调试形态可用，见 lib.rs setup）。
+# 仅调试形态生效；release 下 open_devtools 为空操作。
+tauri = { version = "2", features = ["devtools"] }
+# oj 运行时（axum Router + JsActor + 插件装配）；仅作库依赖，不引 Tauri 进 oj 主 CLI。
+oj = { path = "../../oj" }
+# 仅取 Config 类型用于加载 config.yaml（oj 已传递依赖 only_js，此处显式直接依赖以便命名）。
+only-js = { path = "../.." }
+axum = { version = "0.8" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[bin]]
+name = "oj-desktop-demo"
+path = "src/main.rs"
+
+# 禁用 debug 产物（与仓库根约定一致：避免 dev 构建占大量磁盘；统一用 release）。
+[profile.dev]
+debug = false
+incremental = false

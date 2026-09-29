@@ -1,0 +1,3 @@
+name: "sample"
+desc: "oj × Tauri 演示：无端口 App::dispatch 直调"
+version: "0.1.0"

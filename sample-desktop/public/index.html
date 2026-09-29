@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>oj desktop demo</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      button { font-size: 1rem; padding: .5rem 1rem; }
+      pre { background: #111; color: #0f0; padding: 1rem; border-radius: 8px; white-space: pre-wrap; min-height: 4rem; }
+    </style>
+  </head>
+  <body>
+    <h2>oj × Tauri — 无端口桌面后端（模式 C）</h2>
+    <p>前端经 Tauri IPC 调 <code>oj_dispatch</code>，oj 在进程内 <code>App::dispatch</code> 处理，本机无业务端口监听。</p>
+    <button id="call">调用 GET /v1/api/sample/</button>
+    <pre id="out">点击按钮…</pre>
+    <script src="./main.js"></script>
+  </body>
+</html>
