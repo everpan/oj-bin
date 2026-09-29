@@ -1,0 +1,16 @@
+server:
+  # dev 静态服务器（beforeDevCommand 的 `oj serve`）绑定地址/端口；
+  # 仅 oj serve 读取，生产 .app 走 App::dispatch 不监听端口，此配置对其无副作用。
+  host: 127.0.0.1
+  port: 5173
+  # API 基础路由前缀（oj 默认 /v1/api）
+  base: /v1/api
+  # 证书强制必配：桌面端由脚手架生成自签名 keypair 随包分发（见 README）。
+  public_key_path: certs/public.pem
+  certificate_path: certs/cert.jws
+  # 终端也输出（默认仅落盘）
+  console_log: true
+
+# 本地库：sqlite 内置、无需插件；oj 启动即开库（验证「无插件本地 DB」形态）。
+db:
+  default: "sqlite://app.sqlite"

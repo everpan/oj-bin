@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "oj-desktop-demo",
+  "version": "0.1.0",
+  "identifier": "com.oj.desktop.demo",
+  "build": {
+    "beforeDevCommand": "../bin/oj serve -c src-tauri/config.yaml --app-path public",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../public"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "oj desktop demo",
+        "width": 900,
+        "height": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "app",
+    "resources": ["config.yaml", "certs", "src"]
+  }
+}
