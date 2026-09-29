@@ -35,6 +35,11 @@ fn descriptor() -> PluginDescriptor {
 
 fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
     let _ = host; // ldap 轴暂无 deliver 上送需求（无异步完成语义）。
+    // rustls 0.23 要求显式安装默认 CryptoProvider（`tls-rustls-aws-lc-rs` 只启用
+    // 实现，不自动 install）。本插件是独立 cdylib、自带一份 rustls，宿主侧装的
+    // provider 不覆盖此 copy——不装则在 ldaps:// / start_tls 路径 panic：
+    // "Could not automatically determine the process-level CryptoProvider"。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cfg_str = String::from_utf8_lossy(cfg.as_bytes()).into_owned();
     let parsed: PluginCfg = match serde_json::from_str(&cfg_str) {
         Ok(c) => c,

@@ -15,6 +15,9 @@ ldap3 = { version = "0.12.1", default-features = false, features = [
     "sync",
     "tls-rustls-aws-lc-rs",
 ] }
+# 直接依赖 rustls 以安装默认 CryptoProvider（见 lib.rs init）。与 ldap3 同图
+# 统一为 0.23.x；aws-lc-rs 特性已由 ldap3 开启，这里不引 ring（全图无 ring 纪律）。
+rustls = "0.23"
 # 与根 crate 同版本锁定（root 亦 base64 0.23.x）：bin 属性值 base64 编码过线。
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
