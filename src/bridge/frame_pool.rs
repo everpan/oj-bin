@@ -145,11 +145,6 @@ impl Scheduler {
         drop(g);
         self.notify.notify_waiters();
     }
-
-    /// 复活（退役后新连接 attach）。
-    pub(crate) fn reopen(&self) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).closed = false;
-    }
 }
 
 /// Rust 侧会话表条目：sess.state 真身 + 该连接 bus 发送端。
@@ -213,9 +208,20 @@ impl RoutePool {
                 conn: 0,
             };
         }
-        if self.live.load(Ordering::SeqCst) == 0 {
-            self.sched.reopen();
-        }
+        // 退役竞态：linger 线程的 sched.close() 只代表「复查时无会话」，close 落地时
+        // Worker 可能尚未退出（live 未归零）。若只按 live==0 决定 reopen，此窗口内新
+        // 连接的 fire 会直接吃 PoolClosed（客户端首帧即 Close）。唯一可靠信号是
+        // closed 本身：见 closed 即 reopen + 无条件补员——垂死 Worker 若已见到 closed
+        // 会照常退出，补员覆盖其容量；若尚未见到则继续服务，短暂超配无害。
+        let spawn = {
+            let mut g = self.sched.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.closed {
+                g.closed = false;
+                true
+            } else {
+                self.live.load(Ordering::SeqCst) == 0
+            }
+        };
         let conn = self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1;
         self.sessions
             .lock()
@@ -227,7 +233,7 @@ impl RoutePool {
                     bus_tx,
                 },
             );
-        if self.live.load(Ordering::SeqCst) == 0 {
+        if spawn {
             for _ in 0..self.workers_max.max(1) {
                 self.spawn_worker();
             }
@@ -565,10 +571,8 @@ mod tests {
         s.close();
         assert!(matches!(rc.await, Ok(Err(FrameError::PoolClosed))));
         assert!(s.pull().await.is_none()); // closed → pull None（worker 退出）
-        s.reopen(); // 退役后新连接可复活
-        let (fd, _rd) = frame(3);
-        s.submit(fd);
-        assert!(s.pull().await.is_some());
+        // 复活（reopen）路径由池级用例覆盖：ws_pool_reconnect_after_idle_retire /
+        // pool_retires_when_idle_after_linger（attach 锁内见 closed 即复活 + 补员）。
     }
 
     /// 生命周期 + sess 外置：connection 恰好一次、message 每帧、close 收尾；
@@ -746,7 +750,7 @@ export default {
     }
 
     /// 空池 linger 退役：detach 后（linger=0 立即）Worker 退出、live 归零；
-    /// 新连接 attach 复活（reopen + 重新起 Worker）。
+    /// 新连接 attach 复活（锁内见 closed 即复活 + 补员）。
     #[tokio::test(flavor = "current_thread")]
     async fn pool_retires_when_idle_after_linger() {
         let dir = pool_dir("retire");
