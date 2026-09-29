@@ -4240,6 +4240,7 @@ dependencies = [
  "base64 0.23.1",
  "ldap3",
  "oj-plugin-ffi",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

@@ -35,11 +35,13 @@ impl InstanceCfg {
         {
             return Err(format!("timeout_ms must be in 100..=3600000 (got {t})"));
         }
-        match (&self.bind_dn, &self.bind_pw) {
-            (Some(_), None) | (None, Some(_)) => {
-                return Err("bind_dn and bind_pw must both be set (or neither)".to_string());
-            }
-            _ => {}
+        // bind_pw 可经 search opts 的 bindPw 运行时传入（与 config bind_dn 合并），
+        // 故允许 config 只配 bind_dn；仅「有密码无 DN」无意义，须报错。
+        if self.bind_dn.is_none() && self.bind_pw.is_some() {
+            return Err(
+                "bind_pw requires bind_dn (set both in config, or supply bindPw per search call)"
+                    .to_string(),
+            );
         }
         if self.start_tls == Some(true) && self.url.starts_with("ldaps://") {
             return Err(
@@ -79,9 +81,14 @@ mod tests {
 
     #[test]
     fn validate_bind_pair_and_starttls_ldaps_conflict() {
+        // bind_dn 可单独存在（bind_pw 经 search opts 运行时传入）——不再报错。
         let half: InstanceCfg =
             serde_json::from_str(r#"{"url":"ldap://x","bind_dn":"cn=a"}"#).unwrap();
-        assert!(half.validate().is_err());
+        assert!(half.validate().is_ok());
+        // 仅 bind_pw 无 bind_dn 仍报错。
+        let pw_only: InstanceCfg =
+            serde_json::from_str(r#"{"url":"ldap://x","bind_pw":"s"}"#).unwrap();
+        assert!(pw_only.validate().is_err());
         let conflict: InstanceCfg =
             serde_json::from_str(r#"{"url":"ldaps://x","start_tls":true}"#).unwrap();
         assert!(conflict.validate().is_err());

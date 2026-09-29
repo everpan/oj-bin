@@ -341,6 +341,11 @@ interface LdapSearchOpts {
   filter?: string;
   // 要读的属性名；缺省/空数组 = 服务端默认属性集。
   attrs?: string[];
+  // 可选：覆盖本次查询的绑定凭据（与 config ldap:<inst> 的 bind_dn/bind_pw 合并——
+  // 二者取一即可，另一个回落 config）。用于把密码作为运行时参数传入，避免落配置。
+  // 仅 search / searchPaged 支持；whoami/compare/bind 仍用 config 服务账号或各自入参。
+  bindDn?: string;
+  bindPw?: string;
 }
 
 interface LdapEntry {

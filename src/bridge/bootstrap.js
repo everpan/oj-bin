@@ -530,6 +530,7 @@ globalThis.LDAP = class {
     return op_ldap_call(ojStringify({
       op: "search", key: this.key, base: String(base),
       scope: o.scope, filter: o.filter, attrs: o.attrs,
+      bindDn: o.bindDn, bindPw: o.bindPw,
     }));
   }
   searchPaged(base, opts = {}) {
@@ -537,6 +538,7 @@ globalThis.LDAP = class {
     return op_ldap_call(ojStringify({
       op: "search_paged", key: this.key, base: String(base),
       scope: o.scope, filter: o.filter, attrs: o.attrs, page_size: o.pageSize,
+      bindDn: o.bindDn, bindPw: o.bindPw,
     }));
   }
   whoami() {

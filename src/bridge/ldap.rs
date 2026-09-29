@@ -233,6 +233,17 @@ fn validate_call(v: &Value, cfg: &LdapConfig) -> Result<Value, String> {
                     .collect::<Result<Vec<_>, _>>()?,
                 _ => return Err(format!("ldap.{op}: 'attrs' must be an array")),
             };
+            // 可选：覆盖本次查询的绑定凭据（与 config 服务账号合并：取一即可，另一个回落 config）。
+            let bind_dn = match o.get("bindDn") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(format!("ldap.{op}: 'bindDn' must be a string")),
+            };
+            let bind_pw = match o.get("bindPw") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(_) => return Err(format!("ldap.{op}: 'bindPw' must be a string")),
+            };
             let mut m = serde_json::Map::from_iter([
                 ("base".into(), Value::String(base)),
                 ("scope".into(), Value::String(scope)),
@@ -242,6 +253,12 @@ fn validate_call(v: &Value, cfg: &LdapConfig) -> Result<Value, String> {
                     Value::Array(attrs.into_iter().map(Value::String).collect()),
                 ),
             ]);
+            if let Some(b) = bind_dn {
+                m.insert("bind_dn".into(), Value::String(b));
+            }
+            if let Some(b) = bind_pw {
+                m.insert("bind_pw".into(), Value::String(b));
+            }
             if op == "search_paged" {
                 let ps = match o.get("page_size") {
                     None | Some(Value::Null) => 500u64,

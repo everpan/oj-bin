@@ -44,6 +44,11 @@ struct Call {
     attr: Option<String>,
     #[serde(default)]
     val: Option<String>,
+    // search / search_paged 可选：覆盖本次查询的绑定凭据（与 config 服务账号合并）。
+    #[serde(default)]
+    bind_dn: Option<String>,
+    #[serde(default)]
+    bind_pw: Option<String>,
 }
 
 impl Engine {
@@ -84,16 +89,20 @@ impl Engine {
                 spawn_ffi_future(&self.rt, async move { bind_op(&inst, &dn, &pw).await })
             }
             "search" => match search_args(&call, false) {
-                Ok((base, scope, filter, attrs)) => spawn_ffi_future(&self.rt, async move {
-                    search_op(&inst, &base, scope, &filter, &attrs).await
-                }),
+                Ok((base, scope, filter, attrs)) => {
+                    let bind = effective_bind(&call, &inst);
+                    spawn_ffi_future(&self.rt, async move {
+                        search_op(&inst, bind, &base, scope, &filter, &attrs).await
+                    })
+                }
                 Err(e) => ready_err(e),
             },
             "search_paged" => match search_args(&call, true) {
                 Ok((base, scope, filter, attrs)) => {
                     let page_size = call.page_size.unwrap_or(500);
+                    let bind = effective_bind(&call, &inst);
                     spawn_ffi_future(&self.rt, async move {
-                        search_paged_op(&inst, &base, scope, &filter, &attrs, page_size).await
+                        search_paged_op(&inst, bind, &base, scope, &filter, &attrs, page_size).await
                     })
                 }
                 Err(e) => ready_err(e),
@@ -163,11 +172,23 @@ async fn connect(cfg: &InstanceCfg) -> Result<Ldap, String> {
     Ok(ldap)
 }
 
-/// 服务账号绑定（配置了 bind_dn 才发生）；rc != 0 → Err（fail-loud）。
-async fn service_bind(ldap: &mut Ldap, cfg: &InstanceCfg) -> Result<(), String> {
-    if let (Some(dn), Some(pw)) = (&cfg.bind_dn, &cfg.bind_pw) {
+/// 计算 search/searchPaged 的有效绑定凭据：req 中的 bind_dn/bind_pw 与 config 服务账号
+/// 合并（取一即可，另一回落 config）；二者皆无 → None（匿名绑定）。
+fn effective_bind(call: &Call, cfg: &InstanceCfg) -> Option<(String, String)> {
+    let dn = call.bind_dn.clone().or_else(|| cfg.bind_dn.clone());
+    let pw = call.bind_pw.clone().or_else(|| cfg.bind_pw.clone());
+    match (dn, pw) {
+        (Some(dn), Some(pw)) => Some((dn, pw)),
+        _ => None,
+    }
+}
+
+/// 服务账号/显式凭据绑定（bind = Some((dn,pw)) 才发生）；rc != 0 → Err（fail-loud）。
+/// bind = None → 匿名绑定（多数目录默认拒绝匿名读）。
+async fn service_bind(ldap: &mut Ldap, bind: Option<(String, String)>) -> Result<(), String> {
+    if let Some((dn, pw)) = bind {
         let res = ldap
-            .simple_bind(dn, pw)
+            .simple_bind(&dn, &pw)
             .await
             .map_err(|e| format!("ldap: service bind: {e}"))?;
         if res.rc != 0 {
@@ -195,13 +216,14 @@ async fn bind_op(cfg: &InstanceCfg, dn: &str, pw: &str) -> Result<Vec<u8>, Strin
 
 async fn search_op(
     cfg: &InstanceCfg,
+    bind: Option<(String, String)>,
     base: &str,
     scope: Scope,
     filter: &str,
     attrs: &[String],
 ) -> Result<Vec<u8>, String> {
     let mut ldap = connect(cfg).await?;
-    service_bind(&mut ldap, cfg).await?;
+    service_bind(&mut ldap, bind).await?;
     let res: SearchResult = ldap
         .search(base, scope, filter, attrs.to_vec())
         .await
@@ -214,6 +236,7 @@ async fn search_op(
 /// Paged 聚合：cookie 循环直到服务端清空（RFC 2696）。单页失败即整体 Err。
 async fn search_paged_op(
     cfg: &InstanceCfg,
+    bind: Option<(String, String)>,
     base: &str,
     scope: Scope,
     filter: &str,
@@ -221,7 +244,7 @@ async fn search_paged_op(
     page_size: u64,
 ) -> Result<Vec<u8>, String> {
     let mut ldap = connect(cfg).await?;
-    service_bind(&mut ldap, cfg).await?;
+    service_bind(&mut ldap, bind).await?;
     let mut cookie = Vec::new();
     let mut all: Vec<ResultEntry> = Vec::new();
     loop {
@@ -260,7 +283,8 @@ async fn search_paged_op(
 
 async fn whoami_op(cfg: &InstanceCfg) -> Result<Vec<u8>, String> {
     let mut ldap = connect(cfg).await?;
-    service_bind(&mut ldap, cfg).await?;
+    let bind = cfg.bind_dn.clone().zip(cfg.bind_pw.clone());
+    service_bind(&mut ldap, bind).await?;
     let res = ldap
         .extended(WhoAmI)
         .await
@@ -277,7 +301,8 @@ async fn whoami_op(cfg: &InstanceCfg) -> Result<Vec<u8>, String> {
 
 async fn compare_op(cfg: &InstanceCfg, dn: &str, attr: &str, val: &str) -> Result<Vec<u8>, String> {
     let mut ldap = connect(cfg).await?;
-    service_bind(&mut ldap, cfg).await?;
+    let bind = cfg.bind_dn.clone().zip(cfg.bind_pw.clone());
+    service_bind(&mut ldap, bind).await?;
     let equal = ldap
         .compare(dn, attr, val.as_bytes())
         .await
