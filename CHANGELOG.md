@@ -16,10 +16,42 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.31（未打标签）
+## v0.1.32（未打标签）
+
+> 版本分界：`oj/Cargo.toml` 0.1.31 → 0.1.32。上一版：`v0.1.31` → 38c05eb。
+> 发布点标签：未打标签（发版时 `git tag -a v0.1.32 -m "v0.1.32: ldap search 支持 bindDn/bindPw 覆盖 + rustls CryptoProvider 修复"` 并推送）。
+
+**修复（oj-ldap 插件 + bridge + bootstrap.js）**
+
+- **`ldap.search` / `ldap.searchPaged` 支持 `bindDn` / `bindPw` 覆盖本次查询绑定**：
+  此前 `bootstrap.js` 的 `search`/`searchPaged` 组装 op 时漏带这两个字段，导致经
+  `opts.bindPw` 传入的服务账号密码永远到不了插件，搜索退化为匿名绑定（AD 报
+  `operationsError: 必须先完成 bind`）。现 bridge（`src/bridge/ldap.rs` 的
+  `validate_call`）与 `bootstrap.js` 均透传 `bindDn`/`bindPw`，插件
+  `effective_bind` 将其与 config 的 `bind_dn`/`bind_pw` **合并（取一即可，另一个回落 config）**。
+  该特性用于把服务账号**密码作为运行时参数**传入，避免落配置/源码。
+- **oj-ldap 插件 `init` 安装 rustls 默认 `CryptoProvider`**：独立 cdylib 自带一份 rustls，
+  宿主侧装的 provider 不覆盖，未安装时 `ldaps://` / `start_tls` 路径会 panic
+  （`Could not automatically determine the process-level CryptoProvider`）。现
+  `init` 调用 `rustls::crypto::aws_lc_rs::default_provider().install_default()`。
+- **config 校验放宽**：`ldap:<inst>` 允许只配 `bind_dn`（密码经 `search` opts 运行时传入）；
+  仅「有 `bind_pw` 却无 `bind_dn`」仍报错。
+
+**新增（sample）**
+
+- `sample/ldap_verify.ts`：复刻 PHP 的 AD 鉴证流程，验证 oj-ldap 正确性；服务账号 DN 留
+  `sample/config.yaml`，**密码走 `oj exec … -- <account> <password> <adminPassword>` 运行时参数**。
+
+**文档**
+
+- `docs/devkit/api-manual.md`：`SearchOpts` 补 `bindDn`/`bindPw` 说明，修正 config
+  `bind_dn`/`bind_pw` 不再强制成对的规则与错误文案。
+- `docs/devkit/SKILL.md`：补 `search` 匿名绑定 `operationsError` 与「密码走参数」陷阱。
+
+## v0.1.31（已打标签 v0.1.31）
 
 > 版本分界：`oj/Cargo.toml` 0.1.30 → 0.1.31。上一版：`v0.1.30` → adc1a25。
-> 发布点标签：未打标签（发版时 `git tag -a v0.1.31 -m "v0.1.31: server 子命令重命名为 serve"` 并推送）。
+> 发布点标签：`v0.1.31`（38c05eb）。
 
 **破坏性变更（CLI 子命令重命名）**
 
