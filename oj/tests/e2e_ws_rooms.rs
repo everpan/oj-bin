@@ -41,7 +41,13 @@ fn base_cfg(dir: &Path) -> Config {
 }
 
 /// 裸 TCP WebSocket 客户端：101 握手 + 掩码文本帧写出 + 服务端文本帧读入。
-struct WsClient(TcpStream);
+/// `pre` 缓冲 101 之后同段到达的帧字节：connection 钩子回包极快（热 worker）时
+/// hello 会与 101 握手响应合并进同一次 read——丢弃残留 = 丢首帧 = 测试挂死
+/// （Linux CI 实测）。全部读路径带超时，服务端帧丢失时快速失败。
+struct WsClient {
+    s: TcpStream,
+    pre: Vec<u8>,
+}
 
 impl WsClient {
     async fn connect(addr: std::net::SocketAddr, path: &str) -> Self {
@@ -55,20 +61,23 @@ impl WsClient {
         )
         .await
         .unwrap();
-        // 读到响应头结束（101 Switching Protocols）；残留字节一并丢弃（本用例无）。
+        // 读到响应头结束（101 Switching Protocols）；头之后的残留字节进 pre。
         let mut buf = vec![0u8; 1024];
         let mut total = 0;
+        let mut head_end = None;
         loop {
             let n = s.read(&mut buf[total..]).await.unwrap();
             assert!(n > 0, "handshake EOF");
             total += n;
             let head = String::from_utf8_lossy(&buf[..total]);
-            if head.contains("\r\n\r\n") {
+            if let Some(i) = head.find("\r\n\r\n") {
                 assert!(head.starts_with("HTTP/1.1 101"), "upgrade rejected: {head}");
+                head_end = Some(i + 4);
                 break;
             }
         }
-        Self(s)
+        let pre = buf[head_end.unwrap()..total].to_vec();
+        Self { s, pre }
     }
 
     /// 客户端 → 服务端文本帧（MASK 位 + 固定掩码键，协议允许任意键）。
@@ -93,13 +102,23 @@ impl WsClient {
         for (i, b) in bytes.iter().enumerate() {
             frame.push(b ^ key[i % 4]);
         }
-        self.0.write_all(&frame).await.unwrap();
+        self.s.write_all(&frame).await.unwrap();
+    }
+
+    /// 优先消费与 101 同段到达的残留，不足再从 socket 补齐。
+    async fn read_exact_buf(&mut self, out: &mut [u8]) {
+        let n = self.pre.len().min(out.len());
+        out[..n].copy_from_slice(&self.pre[..n]);
+        self.pre.drain(..n);
+        if n < out.len() {
+            self.s.read_exact(&mut out[n..]).await.unwrap();
+        }
     }
 
     /// 读一帧服务端文本帧（服务端帧不掩码；支持 7/16/64 位长度）。
     async fn read_text(&mut self) -> String {
         let mut hdr = [0u8; 2];
-        self.0.read_exact(&mut hdr).await.unwrap();
+        self.read_exact_buf(&mut hdr).await;
         assert_eq!(
             hdr[0] & 0x0f,
             0x1,
@@ -109,19 +128,26 @@ impl WsClient {
         let len = match hdr[1] & 0x7f {
             126 => {
                 let mut b = [0u8; 2];
-                self.0.read_exact(&mut b).await.unwrap();
+                self.read_exact_buf(&mut b).await;
                 u16::from_be_bytes(b) as u64
             }
             127 => {
                 let mut b = [0u8; 8];
-                self.0.read_exact(&mut b).await.unwrap();
+                self.read_exact_buf(&mut b).await;
                 u64::from_be_bytes(b)
             }
             n => n as u64,
         };
         let mut payload = vec![0u8; len as usize];
-        self.0.read_exact(&mut payload).await.unwrap();
+        self.read_exact_buf(&mut payload).await;
         String::from_utf8(payload).unwrap()
+    }
+
+    /// 带超时读（5s）：服务端帧丢失/竞态回归时快速失败，而非挂死 CI。
+    async fn read_text_to(&mut self) -> String {
+        tokio::time::timeout(Duration::from_secs(5), self.read_text())
+            .await
+            .expect("client read timed out (server frame lost?)")
     }
 
     /// 超时读：None = 指定时长内无帧（广播除己语义的判定材料）。
@@ -168,11 +194,11 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
 
     // 两连接握手；connection 钩子回 hello（sess.id 注入）。
     let mut a = WsClient::connect(addr, "/v1/api/rooms/ws").await;
-    let hello_a: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+    let hello_a: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
     assert_eq!(hello_a["code"], 0);
     assert!(hello_a["data"]["hello"].is_number());
     let mut b = WsClient::connect(addr, "/v1/api/rooms/ws").await;
-    let hello_b: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+    let hello_b: serde_json::Value = serde_json::from_str(&b.read_text_to().await).unwrap();
     assert!(hello_b["data"]["hello"].is_number());
 
     // HTTP 上下文 roomSize（跨上下文共享 hub）。
@@ -189,14 +215,14 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
 
     // join：A → 1；B → 2。
     a.send_text(r#"{"op":"join","room":"r1"}"#).await;
-    let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
     assert_eq!(
         (v["data"]["op"].as_str(), v["data"]["size"].as_u64()),
         (Some("join"), Some(1)),
         "{v}"
     );
     b.send_text(r#"{"op":"join","room":"r1"}"#).await;
-    let v: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&b.read_text_to().await).unwrap();
     assert_eq!(
         (v["data"]["op"].as_str(), v["data"]["size"].as_u64()),
         (Some("join"), Some(2)),
@@ -206,13 +232,13 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
     // A 广播：送达数 1（除己）；B 收到帧；A 自己收不到。
     a.send_text(r#"{"op":"broadcast","room":"r1","data":"hi-A"}"#)
         .await;
-    let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
     assert_eq!(
         (v["data"]["op"].as_str(), v["data"]["sent"].as_u64()),
         (Some("broadcast"), Some(1)),
         "{v}"
     );
-    assert_eq!(b.read_text().await, "hi-A");
+    assert_eq!(b.read_text_to().await, "hi-A");
     assert!(
         b.read_text_timeout(Duration::from_millis(300))
             .await
@@ -229,13 +255,13 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
     // B 广播 → A 收到。
     b.send_text(r#"{"op":"broadcast","room":"r1","data":"hi-B"}"#)
         .await;
-    let v: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&b.read_text_to().await).unwrap();
     assert_eq!(v["data"]["sent"], 1, "{v}");
-    assert_eq!(a.read_text().await, "hi-B");
+    assert_eq!(a.read_text_to().await, "hi-B");
 
     // B 主动 leave → 1；再 A leave → 0（房间回收，HTTP 侧同步可见）。
     b.send_text(r#"{"op":"leave","room":"r1"}"#).await;
-    let v: serde_json::Value = serde_json::from_str(&b.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&b.read_text_to().await).unwrap();
     assert_eq!(
         (v["data"]["op"].as_str(), v["data"]["size"].as_u64()),
         (Some("leave"), Some(1)),
@@ -244,12 +270,12 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
 
     // B 重进、再直接断连：detach 清理 → A 轮询 size 回落到 1。
     b.send_text(r#"{"op":"join","room":"r1"}"#).await;
-    let _ = b.read_text().await;
+    let _ = b.read_text_to().await;
     drop(b); // socket 关闭 = 客户端断连
     let mut size = 0;
-    for _ in 0..50 {
+    for i in 0..50 {
         a.send_text(r#"{"op":"size","room":"r1"}"#).await;
-        let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
         size = v["data"]["size"].as_u64().unwrap();
         if size == 1 {
             break;
@@ -260,6 +286,6 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
 
     // A leave → 0。
     a.send_text(r#"{"op":"leave","room":"r1"}"#).await;
-    let v: serde_json::Value = serde_json::from_str(&a.read_text().await).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&a.read_text_to().await).unwrap();
     assert_eq!(v["data"]["size"], 0, "{v}");
 }

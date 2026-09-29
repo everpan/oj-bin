@@ -388,7 +388,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 裸 TCP WebSocket 客户端：upgrade → 掩码文本帧 → 读回帧。
-    struct WsClient(tokio::net::TcpStream);
+    /// `pre`：与 101 同段到达的首帧字节（服务端 emit 先于客户端读完握手时存在）。
+    struct WsClient {
+        s: tokio::net::TcpStream,
+        pre: Vec<u8>,
+    }
 
     impl WsClient {
         async fn connect(addr: std::net::SocketAddr, path: &str) -> Self {
@@ -406,7 +410,9 @@ mod tests {
             let n = s.read(&mut buf).await.unwrap();
             let head = String::from_utf8_lossy(&buf[..n]).into_owned();
             assert!(head.starts_with("HTTP/1.1 101"), "upgrade failed: {head}");
-            Self(s)
+            // 残留字节（header 之后） = 已到达的 WS 帧，不能丢弃。
+            let pre = buf[head.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n)..n].to_vec();
+            Self { s, pre }
         }
 
         /// 客户端帧必须掩码：FIN|opcode, MASK|len, 4 字节 mask, XOR payload。
@@ -415,7 +421,7 @@ mod tests {
             let mut frame = vec![0x80 | opcode, 0x80 | bytes.len() as u8];
             frame.extend_from_slice(&mask);
             frame.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
-            self.0.write_all(&frame).await.unwrap();
+            self.s.write_all(&frame).await.unwrap();
         }
 
         async fn send_text(&mut self, payload: &str) {
@@ -428,20 +434,38 @@ mod tests {
         }
 
         /// 读一个服务端帧（不掩码；小 payload 单字节长度足够本测试）。
+        /// 先消费与 101 同段到达的残留字节，不足再从 socket 补。
         async fn read_frame(&mut self) -> (u8, Vec<u8>) {
             let mut hdr = [0u8; 2];
-            self.0.read_exact(&mut hdr).await.unwrap();
+            self.read_exact_buf(&mut hdr).await;
             let opcode = hdr[0] & 0x0f;
             let len = (hdr[1] & 0x7f) as usize;
             let mut payload = vec![0u8; len];
-            self.0.read_exact(&mut payload).await.unwrap();
+            self.read_exact_buf(&mut payload).await;
             (opcode, payload)
+        }
+
+        /// 优先消费缓冲，不足部分 read_exact 补齐。
+        async fn read_exact_buf(&mut self, out: &mut [u8]) {
+            let n = self.pre.len().min(out.len());
+            out[..n].copy_from_slice(&self.pre[..n]);
+            self.pre.drain(..n);
+            if n < out.len() {
+                self.s.read_exact(&mut out[n..]).await.unwrap();
+            }
         }
 
         async fn read_text(&mut self) -> String {
             let (opcode, payload) = self.read_frame().await;
             assert_eq!(opcode, 0x01, "not a text frame: {opcode:x}");
             String::from_utf8(payload).unwrap()
+        }
+
+        /// 带超时读（3s）：服务端帧丢失时快速失败，而非挂死整个测试进程。
+        async fn read_text_to(&mut self) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(3), self.read_text())
+                .await
+                .expect("client read timed out (server frame lost?)")
         }
     }
 
@@ -621,6 +645,110 @@ mod tests {
             serde_json::json!({"topic": "news", "data": {"a": 1}}),
             "{v}"
         );
+    }
+
+    /// 回归守卫：双连接首帧投递（纯 axum，无 bridge/池）。源于 oj e2e_ws_rooms 的
+    /// Linux CI 挂死排查——排查证明 axum/hyper/tungstenite 升级路径本身无恙，真正
+    /// 缺陷是测试客户端丢弃与 101 同段到达的首帧。本用例钉住两件事：服务端在
+    /// 「客户端尚未读完握手」时立即写帧的合法形态，与客户端缓冲残留字节的正确读法。
+    /// 客户端读全部带 3s 超时：回归时快速失败而非挂死。
+    #[tokio::test]
+    async fn ws_two_conns_first_frame_delivery_pure_axum() {
+        let _e2e = ws_e2e_lock();
+        async fn mini_handler(ws: axum::extract::WebSocketUpgrade) -> axum::response::Response {
+            ws.on_upgrade(|socket: WebSocket| async move {
+                let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, bool)>(64);
+                let (resp_tx, mut resp_rx) = mpsc::channel::<WsSend>(64);
+                let (mut sink, mut stream) = socket.split();
+                tokio::spawn(async move {
+                    while let Some(Ok(msg)) = stream.next().await {
+                        let frame = match msg {
+                            Message::Text(t) => (t.as_bytes().to_vec(), false),
+                            Message::Binary(b) => (b.to_vec(), true),
+                            Message::Close(_) => break,
+                            _ => continue,
+                        };
+                        if msg_tx.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                static N: AtomicU64 = AtomicU64::new(0);
+                let id = N.fetch_add(1, Ordering::Relaxed);
+                let _ =
+                    resp_tx.try_send(WsSend::Text(serde_json::json!({ "hello": id }).to_string()));
+                let writer = tokio::spawn(async move {
+                    while let Some(frame) = resp_rx.recv().await {
+                        let msg = match frame {
+                            WsSend::Text(t) => Message::Text(t.into()),
+                            WsSend::Binary(b) => Message::Binary(b.into()),
+                        };
+                        if sink.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                while let Some((bytes, _)) = msg_rx.recv().await {
+                    let s = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = resp_tx
+                        .try_send(WsSend::Text(serde_json::json!({ "echo": s }).to_string()));
+                }
+                drop(resp_tx);
+                let _ = writer.await;
+            })
+        }
+        let router = axum::Router::new().route("/ws", axum::routing::get(mini_handler));
+        let addr = spawn(router).await;
+        for _ in 0..3 {
+            let mut a = WsClient::connect(addr, "/ws").await;
+            assert!(a.read_text_to().await.contains("\"hello\":"));
+            let mut b = WsClient::connect(addr, "/ws").await;
+            assert!(b.read_text_to().await.contains("\"hello\":"));
+            a.send_text("ping-a").await;
+            assert!(a.read_text_to().await.contains("ping-a"));
+            b.send_text("ping-b").await;
+            assert!(b.read_text_to().await.contains("ping-b"));
+        }
+    }
+
+    /// 回归守卫：空池 linger 退役后的快速重连。曾实修的缺陷——linger 线程的
+    /// sched.close() 落地时 Worker 尚未退出（live 未归零），attach 按 live==0 决定
+    /// reopen 会漏掉此窗口，新连接 fire 直接吃 PoolClosed（客户端首帧即 Close 帧）。
+    /// 修复后 attach 以 closed 标志（锁内）为信号：见 closed 即 reopen + 补员。
+    /// 循环三轮连接/断开/重连，CPU 压力下曾 3/20 复现。
+    #[tokio::test]
+    async fn ws_pool_reconnect_after_idle_retire() {
+        let _e2e = ws_e2e_lock();
+        let t = crate::tests::routes(&[]);
+        let handler = t.0.join("ws.js");
+        std::fs::write(
+            &handler,
+            r#"export default {
+  connection() { json.ok({ hello: 1 }); },
+  message() { json.ok({ op: (http.body || {}).op }); },
+};
+"#,
+        )
+        .unwrap();
+        let pool = test_pool(&handler, std::time::Duration::from_secs(3));
+        let addr =
+            spawn(axum::Router::new().merge(js_route("/ws", pool, WsOptions::default()))).await;
+        for _ in 0..3 {
+            let mut a = WsClient::connect(addr, "/ws").await;
+            assert!(
+                a.read_text_to().await.contains("\"hello\":1"),
+                "A hello lost"
+            );
+            let mut b = WsClient::connect(addr, "/ws").await;
+            assert!(
+                b.read_text_to().await.contains("\"hello\":1"),
+                "B hello lost"
+            );
+            a.send_text(r#"{"op":"x"}"#).await;
+            assert!(a.read_text_to().await.contains("\"op\":\"x\""));
+            b.send_text(r#"{"op":"y"}"#).await;
+            assert!(b.read_text_to().await.contains("\"op\":\"y\""));
+        }
     }
 
     #[tokio::test]
@@ -962,7 +1090,7 @@ mod tests {
         assert!(envelope.contains("\"done\":1"), "{envelope}");
         // close 后连接终止：Close 帧或 EOF（不 panic）。
         let mut buf = [0u8; 64];
-        let n = c.0.read(&mut buf).await.unwrap();
+        let n = c.s.read(&mut buf).await.unwrap();
         assert!(
             n == 0 || buf[0] == 0x88,
             "expected close, got {n} bytes: {:x?}",
@@ -1146,7 +1274,7 @@ mod tests {
         // 同样表示连接已被对端干净终止。只接受传输层终止类错误——其他错误（如
         // 服务端 panic 之外的意外 IO 失败）仍应让测试失败，保住本用例的回归护栏。
         let mut buf = [0u8; 64];
-        let res = c.0.read(&mut buf).await;
+        let res = c.s.read(&mut buf).await;
         let clean = match &res {
             Ok(0) => true,            // 对端优雅关闭（EOF / FIN）
             Ok(_n) => buf[0] == 0x88, // 收到 WebSocket Close 帧
@@ -1441,7 +1569,7 @@ mod tests {
         assert_eq!(c.read_text().await, "bye"); // close 钩子的离帧（恰好一条）
         // 随后 Close 帧或 EOF（Writer 收尾），不 panic。
         let mut buf = [0u8; 8];
-        let n = c.0.read(&mut buf).await.unwrap_or(0);
+        let n = c.s.read(&mut buf).await.unwrap_or(0);
         assert!(n == 0 || buf[0] == 0x88, "expected close, got {n} bytes");
     }
 
@@ -1479,7 +1607,7 @@ mod tests {
         // ws_connect 失败 → 服务端发 Close 帧后关连接；传输层终止类错误同样算干净断连
         // （Windows RST 语义，断言同 js_route_missing_handler_closes_quietly）。
         let mut buf = [0u8; 64];
-        let res = c.0.read(&mut buf).await;
+        let res = c.s.read(&mut buf).await;
         let clean = match &res {
             Ok(0) => true,
             Ok(_n) => buf[0] == 0x88,
@@ -1539,7 +1667,7 @@ mod tests {
         // A：毒帧 → 300ms 超时断连（Close/EOF/RST 族，判定同 missing-file 用例）。
         a.send_text(r#"{"boom":true}"#).await;
         let mut buf = [0u8; 64];
-        let res = a.0.read(&mut buf).await;
+        let res = a.s.read(&mut buf).await;
         let clean = match &res {
             Ok(0) => true,
             Ok(_n) => buf[0] == 0x88,
