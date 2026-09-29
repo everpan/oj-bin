@@ -43,11 +43,11 @@ toB 项目的实施过程中，往往需要 `低代码` 来快速交付。市场
 cargo xtask build            # 构建并归置 bin/oj + bin/plugins/<triple>/（release；首次拉取预编译 V8）
 
 # dev：直接跑 .ts 源码（目录内无 manifests.yaml → 自动判定 dev/ts，改文件即生效）
-./bin/oj server -c sample/config.yaml --api-path sample/src
+./bin/oj serve -c sample/config.yaml --api-path sample/src
 
 # release：先构建产物，再跑 dist/（目录内有 manifests.yaml → 自动判定 release/js）
 ./bin/oj build  -d sample/src -o sample/dist
-./bin/oj server -c sample/config.yaml --api-path sample/dist
+./bin/oj serve -c sample/config.yaml --api-path sample/dist
 ```
 
 > 统一使用编译产物 **`bin/oj`** 运行示例与业务：它由 `cargo xtask build` 一次性产出
@@ -76,7 +76,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 | 命令 | 作用 |
 |---|---|
-| `./bin/oj server -c <config> --api-path <src\|dist>` | 启动服务（目录无/有 `manifests.yaml` 自动判定 dev/ts、release/js） |
+| `./bin/oj serve -c <config> --api-path <src\|dist>` | 启动服务（目录无/有 `manifests.yaml` 自动判定 dev/ts、release/js） |
 | `./bin/oj build -d <src> -o <dist>` | 构建模块：转译 TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
 | `./bin/oj test -c <config>` | 进程内跑 `*.test.ts` 用例（无需起服务） |
 | `./bin/oj migrate / fixture / schema diff` | 迁移 / 演示数据 / schema 对账（详见 `docs/user-manual.md`） |

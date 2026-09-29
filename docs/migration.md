@@ -53,7 +53,7 @@
   写了就会每次启动重复生效。
 - **执行日志（回归与排障）**：seed / migrate / fixture / schema reconcile 的每条
   语句执行结果都记 tracing 日志：`module` / `file` / `seq` / `rows`（受影响行数）/
-  `stmt`（截断 200 字符），成功 `ok`、失败 `failed` 附错误。`oj server` 落 `logs/`
+  `stmt`（截断 200 字符），成功 `ok`、失败 `failed` 附错误。`oj serve` 落 `logs/`
   目录（终端镜像落盘）；`oj migrate` / `oj fixture` / `oj test` CLI 直跑落 stderr。
 - **限制**：不记账本。重放历史靠执行日志，不在库内。
 - **S006（构建门禁）**：seed.sql 禁 DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME/GRANT/
@@ -165,7 +165,7 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
   的 `bound_db`），迁移工具不读它。**注意**：`--db` 是**整轮**目标库，它把全部模块的
   迁移灌进该库。所以「模块 A→analytics、模块 B→default」的项目必须用
   `--db <profile> <module>` 逐组合执行（详见 §8 已知债）。
-- `oj server` / `oj test` 不走这条通路：前者恒用 `default`（模块绑定在运行期生效），
+- `oj serve` / `oj test` 不走这条通路：前者恒用 `default`（模块绑定在运行期生效），
   后者有独立的 `oj test --db`（默认取 `db.test`，**语义是「字面 default 调用重定向」**
   而非整轮目标库，见 §4.6 / `testing.md`）。
 
@@ -173,8 +173,8 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
 
 | 场景 | 操作 |
 |---|---|
-| 新环境首次部署 | `oj build` → `oj migrate -c config.yaml -d dist` → `oj server`（release verify 门禁要求先迁移） |
-| 开发冷启动 | `oj server -c config.yaml --api-path src`（auto 门禁自动建表 + seed 重放） |
+| 新环境首次部署 | `oj build` → `oj migrate -c config.yaml -d dist` → `oj serve`（release verify 门禁要求先迁移） |
+| 开发冷启动 | `oj serve -c config.yaml --api-path src`（auto 门禁自动建表 + seed 重放） |
 | 加新表 / 可空列 / 索引 | 只改 `schema.yaml`，下次启动或 `oj migrate` 自动收敛 |
 | 加 NOT NULL 列 | 手写迁移（`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT <值>`）+ schema.yaml 声明。reconcile 对此 fail-fast 并打印模板 |
 | 改列名 / 删列 | 手写迁移（`RENAME COLUMN` / 先备份后 `DROP`）；删列同时从 schema.yaml 移除，残留会被 `oj schema diff` 报 D001 多列 |

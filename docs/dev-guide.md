@@ -10,7 +10,7 @@
 这份文档写给**要改 oj 本身**的人（框架开发者）。只想用 oj 写业务接口的，去读
 [user-manual.md](user-manual.md)。
 
-本文合并了原日常开发手册与 `oj server` 内部实现走读两份文档：既覆盖**日常开发**
+本文合并了原日常开发手册与 `oj serve` 内部实现走读两份文档：既覆盖**日常开发**
 （环境、构建、写 handler、Rust 侧嵌入 API、加 op、测试、调试），也覆盖**内部实现**
 （执行模型、关键模块深读、安全模型、设计权衡）。文中「装配期」指启动时把配置、插件、
 路由拼起来的阶段；「fail-fast」指发现问题立刻报错退出；「桥（bridge）」指 Rust 与 JS
@@ -102,7 +102,7 @@ cargo bench                  # 跑基准（benches/bridge.rs，**必须 release*
 cargo llvm-cov --workspace --summary-only   # 覆盖率（需 cargo-llvm-cov；V8 需 llvm-cov）
 
 # 前提：cargo xtask build 产出 bin/oj（编译产物，跨环境一致，不依赖 cargo 调用方式）
-./bin/oj server -c sample/config.yaml --api-path sample/src   # 启动服务（模式自动判定）
+./bin/oj serve -c sample/config.yaml --api-path sample/src   # 启动服务（模式自动判定）
 ./bin/oj build -d sample/src -o sample/dist                   # 构建模块产物
 ./bin/oj test -c sample/config.yaml --format human            # 进程内 *.test.ts 运行器
 ./bin/oj migrate / fixture / schema diff   # 迁移 / 演示数据 / schema 对账
@@ -302,7 +302,7 @@ await db.table("order")
 
 给 oj 写单元测试、或把 oj 嵌进自己的 Rust 程序时读这节。
 
-`Bridge` 是核心执行入口：oj server 用它跑 handler；单测与嵌入场景直接构造。公开 API
+`Bridge` 是核心执行入口：oj serve 用它跑 handler；单测与嵌入场景直接构造。公开 API
 （`src/bridge/mod.rs`）：
 
 ```rust
@@ -331,11 +331,11 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 - `Bridge::with_opts(db, kv, registry, inspect)` —— 单 db。
 - `Bridge::with_dbs(dbs, kv, registry, inspect)` —— **全量命名 DB 构造期注入**（无
   `"default"` 键时取第一个补位）。
-- `Bridge::with_dbs_and_loader(..., loader, extras)` —— oj server 专用：模块加载器 +
+- `Bridge::with_dbs_and_loader(..., loader, extras)` —— oj serve 专用：模块加载器 +
   `Extras`（blob/es/bus/plugins/modules 等可选能力）。
 
 执行族：`run` / `run_with` / `run_with_timeout`（超时返回 `RunError::Timeout`）/
-`run_named`（按 HandlerStore 名执行）/ `run_module`（按模块路径执行，oj server 主路径）/
+`run_named`（按 HandlerStore 名执行）/ `run_module`（按模块路径执行，oj serve 主路径）/
 `run_ws`（HTTP 超时执行；WS 自 v0.1.10 改走帧池：`ws_connect` 预载钩子 + `frame_pool.rs`
 逐事件 `ws_event` 派发）/ `prewarm`。返回 `Capture { status, headers, body }`。
 
@@ -352,7 +352,7 @@ println!("status={} body={}", cap.status, String::from_utf8_lossy(&cap.body));
 
 `HandlerStore`（`loader.rs`）仍服务于**嵌入与测试场景**：`from_embedded(map)`（编译期嵌入，
 配 `set_handlers` + `run_named`）与 `MDM_HANDLER_DIR` 环境变量（FS 目录 + notify 监听）。
-oj server 的 handler 加载走 `module_loader.rs` + `run_module`（见 §7）。
+oj serve 的 handler 加载走 `module_loader.rs` + `run_module`（见 §7）。
 
 ---
 
@@ -376,7 +376,7 @@ let db2 = SqlxAccessor::connect("sqlite:///tmp/oj.db").await?;          // Self�
 
 ---
 
-## 7. 模块加载与热重载（oj server）
+## 7. 模块加载与热重载（oj serve）
 
 import 解析报错、热重载不生效、dev/release 行为不一致时读这节。
 
@@ -387,7 +387,7 @@ import 解析报错、热重载不生效、dev/release 行为不一致时读这�
 - **版本化缓存**：模块 specifier 带 `?v=<mtime-nanos>`，文件变更即自然失效缓存，无需清理
   模块图。
 - **TS 转译**：dev 模式 `deno_ast` 剥类型按需转译，结果按 mtime 全局缓存，可选 minify。
-- **热重载**：oj server dev 模式用 `notify` 监听源码树，变更后按上述 mtime 版本化天然生效。
+- **热重载**：oj serve dev 模式用 `notify` 监听源码树，变更后按上述 mtime 版本化天然生效。
 - **release 模式**：服务 `oj build` 产出的 `dist/`（预转译 JS + `routes.js` +
   `manifests.yaml` 版本锁），不转译。
 

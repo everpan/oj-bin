@@ -3,7 +3,7 @@
 > 各模块导览（初学者按序学习 oj 特性）见 [MODULES.md](MODULES.md)。
 
   cargo xtask build                                                            # 先产出 bin/oj + bin/plugins/<triple>/（release）
-  ./bin/oj server -c sample/config.yaml --api-path sample/src                  # dev（TS，热重载；启动自动迁移）
+  ./bin/oj serve -c sample/config.yaml --api-path sample/src                  # dev（TS，热重载；启动自动迁移）
   curl http://localhost:9778/v1/api/user/account/?id=1
   curl http://localhost:9778/v1/api/user/42                       # `_name_` 目录段即路径参数（src/user/_id_/）
 
@@ -11,7 +11,7 @@
   ./bin/oj build --check -d sample/src                             # 结构检查（S002–S006，CI 门禁，不落盘）
   ./bin/oj migrate -c sample/config.yaml -d sample/dist            # release 部署先迁移（verify 门禁要求）
   ./bin/oj schema diff -c sample/config.yaml                       # 声明 vs 实库对账（漂移 exit 1）
-  ./bin/oj server -c sample/config.yaml --api-path sample/dist     # release（按锁聚合；账本落后拒启）
+  ./bin/oj serve -c sample/config.yaml --api-path sample/dist     # release（按锁聚合；账本落后拒启）
 
 - 路由 = 目录镜像：src/user/profile/detail/api.ts → /v1/api/user/profile/detail/
 - 声明式表结构：每模块 `schema.yaml`（§4.2）声明表/列/索引 → 归属图（表→模块单射，
@@ -40,7 +40,7 @@
 
 ## OIDC 演示（src/idp = 同进程 OP，src/oidc = RP）
 
-  ./bin/oj server -c sample/config.yaml --api-path sample/src      # 插件在 bin/plugins 自动发现，无需 OJ_PLUGINS_DIR
+  ./bin/oj serve -c sample/config.yaml --api-path sample/src      # 插件在 bin/plugins 自动发现，无需 OJ_PLUGINS_DIR
   curl -s http://localhost:9778/v1/api/idp/.well-known/openid-configuration        # discovery：裸 JSON（json.raw，无信封）
   curl -s -c /tmp/idp.jar -d '{"username":"demo","password":"demo1234"}' \
     http://localhost:9778/v1/api/idp/login                                         # OP 登录 → IDP_SESSION cookie

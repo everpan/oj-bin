@@ -99,11 +99,11 @@ export default {
 ### 启动与验证
 
 ```bash
-./bin/oj server -c config.yaml --api-path src
+./bin/oj serve -c config.yaml --api-path src
 # 仓库内：先 cargo xtask build 产出 bin/oj，再从仓库根执行同形命令
 ```
 
-`server` 按 `--api-path` 目录**自动判定模式**：目录里有 `dist/manifests.yaml`（即「构建锁」，
+`serve` 按 `--api-path` 目录**自动判定模式**：目录里有 `dist/manifests.yaml`（即「构建锁」，
 记录每个模块锁定用哪个版本）就跑 release——跑预构建的 `.js`，不转译；否则是 dev——服务
 `.ts` 源码，按需转译，改文件即生效。
 启动时日志会写判定结果（`dev/ts` / `release/js` / `static-only`）、模块清单和路由统计
@@ -133,7 +133,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 ```bash
 ./bin/oj build -d src -o dist        # 生成 dist/<module>-<version>/ + manifests.yaml 锁 + tgz
 ./bin/oj migrate -c config.yaml -d dist          # release 默认 verify 门禁：先迁移后启动
-./bin/oj server -c config.yaml --api-path dist
+./bin/oj serve -c config.yaml --api-path dist
 ```
 
 **多库项目**（config `db:` 声明了 `default` 之外的命名库）：上面前两条默认只作用
@@ -1868,10 +1868,10 @@ auth:
 `db.table()` 构造器查询自动注入 `tenant_id` 条件（join 进 ON、子查询递归）、insert 强制
 当前租户、update/delete 自动收窄、sets 显式改 tenant_id 拒绝。裸 SQL 查「完全遗漏
 tenant_id」时 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明的表必须有 `tenant_id` 列
-（共享表 `tenant: false` + `shared_allow` 双声明豁免），server 启动 / `oj build` /
+（共享表 `tenant: false` + `shared_allow` 双声明豁免），serve 启动 / `oj build` /
 `oj migrate` 三处校验。跨租户操作（对账、运营报表）走 `db.asSystem()`（请求级、打审计日志）。
 **`tenant_id` 列类型（v0.1.24 起）**：只能是 `text` / `integer` / `bigint`，其余类型在
-**server 启动 / `oj build` / `oj migrate` 三处 fail-fast**（`double`/`boolean`/`blob` 没有
+**serve 启动 / `oj build` / `oj migrate` 三处 fail-fast**（`double`/`boolean`/`blob` 没有
 「等值租户 id」语义）。守卫按**声明类型**绑值：`text`（及旧装配路径的「未声明类型」）→ 字符串；
 `integer` / `bigint` → **数值**：`≤2^53-1` 用 number，更宽用 i64 标记，`> i64::MAX` 用
 `$oj$u64`（只有 MySQL `BIGINT UNSIGNED` 能承载，PG/SQLite 会在绑定前报错）。insert / update
@@ -2418,7 +2418,7 @@ S003 跨模块 SQL 须声明 deps、S004 deps 版本范围可满足、S005 `tabl
 
 ### release 加载语义
 
-`server --api-path dist`（含 `manifests.yaml` → 自动 release）按锁逐模块加载各版本目录的
+`serve --api-path dist`（含 `manifests.yaml` → 自动 release）按锁逐模块加载各版本目录的
 `routes.js` 聚合路由；锁缺失/损坏、指向不存在的版本、任何条目非法 → 直接报错
 （提示先 `oj build`）。**目录镜像路由在 release 不存在**——路由只认 routes.js，
 所以发布前必须 `oj build`。
@@ -2449,7 +2449,7 @@ oj-v<version>-<triple>/
 目标机部署：解包 → 项目目录放 `config.yaml` + `dist/` + `seed.sql`（可选）+
 vendored `node_modules/`（不打进 tgz）→ `./oj migrate -c config.yaml -d dist`
 （release 默认 `migrate_on_start: verify`，账本落后会拒启 M004；config `db:` 段有命名库时
-加 `--db <name>` 逐库跑）→ `./oj server -c config.yaml --api-path dist`。
+加 `--db <name>` 逐库跑）→ `./oj serve -c config.yaml --api-path dist`。
 启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整（终端默认静默：
 `tail -f logs/server-*.log`，或启动时加 `--console-log`）。
 
@@ -2494,16 +2494,16 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 | `--log-file` | 不落盘 | 追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 stderr warn 一次，终端输出继续 |
 | `-- arg...` | 无 | `--` 之后的 argv 原样注入 `globalThis.args: string[]`（无 `--` 为空数组） |
 
-**与 server 的装配差异（有意为之，勿拿 server 直觉套 exec）**：
+**与 serve 的装配差异（有意为之，勿拿 server 直觉套 exec）**：
 
 - **无证书门禁**：`server.certificate_path` 等不校验（exec 不起 HTTP 面）。
-- **迁移默认 off**：server dev 缺省 `auto`、exec 缺省**全跳过**（apply/verify/
+- **迁移默认 off**：serve dev 缺省 `auto`、exec 缺省**全跳过**（apply/verify/
   reconcile 都不做）；仅 config 显式写 `migrate_on_start: auto|verify` 时才执行对应项。
 - **无 KillSwitch**：手工 runtime 不过 RuntimePool，同步死循环（`while(true){}`）
   会无限挂起——Ctrl-C 是唯一兜底；长任务请用 `src/tasks/` 任务池。
 - **租户/归属守卫不设防**：exec 无 HTTP 请求上下文（租户 id 恒 None），视同匿名
   系统操作员；`sql_guard: "deny"` 的库上脚本须 `await db.asSystem()`。
-- **`console` 仅 exec 可用**：server/test 的 runtime 无 `console` 全局——同一脚本
+- **`console` 仅 exec 可用**：serve/test 的 runtime 无 `console` 全局——同一脚本
   拷进 handler 会 `ReferenceError`。
 - **`json.*`/`finish` 空转**：`json.ok(x)` 不会打印 x（没有 HTTP 消费方）；要输出
   用 `console.log`/`log.*`。
@@ -2583,7 +2583,7 @@ PG 插件会给**实际执行的 SQL 前置一段块注释签名** `/*oj:<形态
 handler 内 `log.debug/info/warn/error(msg, ...kv)`。生产用 `RUST_LOG` 控制级别：
 
 ```bash
-RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
+RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 ```
 
 访问日志目录见第 10 章 `logs_dir`。
@@ -2631,7 +2631,7 @@ RUST_LOG=oj=info ./oj server -c config.yaml --api-path dist
 - **ABI bump 部署顺序：先升插件到新 ABI 并验证，再升宿主**（或同版本原子升级）。
   升级窗口内可用 `plugins()` 自省核对（第 6 章）。
 - 多版本共存回滚（代码）：`dist/` 内旧版本目录不被构建清除，回滚单模块 =
-  把 `dist/manifests.yaml` 该模块指回旧版本 + 重启 server（锁仅启动时读）。
+  把 `dist/manifests.yaml` 该模块指回旧版本 + 重启 serve（锁仅启动时读）。
 - 回滚（二进制）：换回上一版打包产物；保持二进制与 `dist/` 同版本发布。
 - 升级前备份 sqlite 数据文件（`db.default` 路径）；配了 Redis/ES 的实例，它们的可用性
   进入启动契约（fail-fast），发布/巡检时先确认可达。
@@ -2751,4 +2751,4 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   `decodeURIComponent`）；它不经守卫、拿不到 `http.user`（页面请求本来也没有 Bearer）。
 - `oj exec` 脚本里 `json.ok(x)` 不打印 x——`json.*`/`finish` 空转（没有 HTTP 消费方）；
   要输出用 `console.log`/`log.*`（`console` 仅 exec 运行时提供，拷进 handler 是
-  `ReferenceError`）。`oj exec` 迁移默认 off（server dev 缺省 auto，两命令相反）。
+  `ReferenceError`）。`oj exec` 迁移默认 off（serve dev 缺省 auto，两命令相反）。

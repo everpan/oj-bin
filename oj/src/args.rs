@@ -1,11 +1,11 @@
-//! oj 命令行（clap derive）。子命令：server / build。
+//! oj 命令行（clap derive）。子命令：serve / build。
 //! 帮助 `oj --help` / `oj <cmd> --help`；空参打印帮助、非法参数报错均由 clap 退出（code 2）。
 
 use clap::{Parser, Subcommand};
 
 /// server 子命令参数。
 #[derive(Debug, Clone, Default)]
-pub struct ServerArgs {
+pub struct ServeArgs {
     pub config: String,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
@@ -89,7 +89,7 @@ pub struct FixtureArgs {
 
 /// 解析结果（错误/帮助/空参由 clap 处理，不会走到这里）。
 pub enum Command {
-    Server(ServerArgs),
+    Serve(ServeArgs),
     Build(BuildArgs),
     Test(TestArgs),
     Migrate(MigrateArgs),
@@ -140,7 +140,7 @@ struct Cli {
 enum Commands {
     /// 启动 HTTP 服务（目录镜像路由 + app_path 静态兜底）
     #[command(arg_required_else_help = true)]
-    Server {
+    Serve {
         /// 配置文件路径（相对 CWD；server.host/port/app_path + db/redis）
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
@@ -193,7 +193,7 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// 跑 sample API 测试（无需启动 oj server；进程内真实运行时派发）
+    /// 跑 sample API 测试（无需启动 oj serve；进程内真实运行时派发）
     Test {
         /// 配置文件路径（相对 CWD；server.host/port/root + db/redis）
         #[arg(short, long, default_value = "config.yaml")]
@@ -223,7 +223,7 @@ enum Commands {
         #[arg(long)]
         anonymous: bool,
     },
-    /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && server）
+    /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && serve）
     Migrate {
         /// 配置文件路径（相对 CWD；db 段提供目标库）
         #[arg(short, long, default_value = "config.yaml")]
@@ -311,7 +311,7 @@ pub fn parse_from(
 /// Cli → 领域参数（server.dir 的 dev 条件默认在此落地）。
 fn to_command(cli: Cli) -> Command {
     match cli.command {
-        Commands::Server {
+        Commands::Serve {
             config,
             base,
             api_path,
@@ -320,7 +320,7 @@ fn to_command(cli: Cli) -> Command {
             key_path,
             console_log,
             daemon,
-        } => Command::Server(ServerArgs {
+        } => Command::Serve(ServeArgs {
             config,
             base,
             api_path,
@@ -453,16 +453,16 @@ mod tests {
 
     #[test]
     fn server_daemon_flag_maps_through() {
-        // --daemon 长旗标映射进 ServerArgs；短 -d 仍拒绝（--dir 已删，不回收短旗标）。
-        let Command::Server(a) = cmd(&["server", "-c", "c.yaml", "--daemon"]) else {
+        // --daemon 长旗标映射进 ServeArgs；短 -d 仍拒绝（--dir 已删，不回收短旗标）。
+        let Command::Serve(a) = cmd(&["serve", "-c", "c.yaml", "--daemon"]) else {
             panic!()
         };
         assert!(a.daemon);
-        let Command::Server(a) = cmd(&["server", "-c", "c.yaml"]) else {
+        let Command::Serve(a) = cmd(&["serve", "-c", "c.yaml"]) else {
             panic!()
         };
         assert!(!a.daemon);
-        assert!(Cli::try_parse_from(["oj", "server", "-c", "c.yaml", "-d"]).is_err());
+        assert!(Cli::try_parse_from(["oj", "serve", "-c", "c.yaml", "-d"]).is_err());
     }
 
     #[test]
@@ -470,7 +470,7 @@ mod tests {
         // 默认值：base=None（config server.base 兜底） / api_path=None / app_path=None。
         // 裸 `oj server` 现在打印帮助（arg_required_else_help），给一个参数才进入解析，
         // 故默认值用 -c 触发；config 默认 "config.yaml" 由 clap default_value 保证。
-        let Command::Server(a) = cmd(&["server", "-c", "config.yaml"]) else {
+        let Command::Serve(a) = cmd(&["serve", "-c", "config.yaml"]) else {
             panic!()
         };
         assert_eq!(
@@ -481,8 +481,8 @@ mod tests {
             ),
             (None, None, &[][..])
         );
-        let Command::Server(a) = cmd(&[
-            "server",
+        let Command::Serve(a) = cmd(&[
+            "serve",
             "-c",
             "c.yaml",
             "-b",
@@ -509,8 +509,8 @@ mod tests {
             )
         );
         // v0.1.27：--app-path 可重复（裸 dir + prefix=dir 混合）
-        let Command::Server(a) = cmd(&[
-            "server",
+        let Command::Serve(a) = cmd(&[
+            "serve",
             "-c",
             "c.yaml",
             "--app-path",
@@ -563,14 +563,14 @@ mod tests {
         assert!(cli(&["build", "user", "other"]).is_err());
         // 未知子命令 / 未知长旗标
         assert!(cli(&["foo"]).is_err());
-        assert!(cli(&["server", "--nope"]).is_err());
+        assert!(cli(&["serve", "--nope"]).is_err());
         // --dev 已删：模式由 --api-path 目录自动判定（server_cmd::is_release）
-        assert!(cli(&["server", "--dev"]).is_err());
+        assert!(cli(&["serve", "--dev"]).is_err());
         // server 的 -d/--dir 已删（改为 --api-path）：clap 拒绝
-        assert!(cli(&["server", "-d", "src"]).is_err());
-        assert!(cli(&["server", "--dir", "src"]).is_err());
+        assert!(cli(&["serve", "-d", "src"]).is_err());
+        assert!(cli(&["serve", "--dir", "src"]).is_err());
         // --grace-days 已删：宽限天数仅由 config 的 server.grace_days 提供
-        assert!(cli(&["server", "--grace-days", "30"]).is_err());
+        assert!(cli(&["serve", "--grace-days", "30"]).is_err());
         // 空参 → 帮助（arg_required_else_help）
         assert_eq!(
             cli(&[]).unwrap_err().kind(),
@@ -578,17 +578,17 @@ mod tests {
         );
         // `oj server` 裸调（无任何参数）→ 帮助；给了参数（如 -c）才真正启动
         assert_eq!(
-            cli(&["server"]).unwrap_err().kind(),
+            cli(&["serve"]).unwrap_err().kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         );
-        assert!(cli(&["server", "-c", "c.yaml"]).is_ok());
+        assert!(cli(&["serve", "-c", "c.yaml"]).is_ok());
     }
 
     #[test]
     fn server_cert_key_console_overrides_map_through() {
         // 证书三旗标是 config 的覆盖通道（Some → 覆盖 server.certificate_path 等）。
-        let Command::Server(a) = cmd(&[
-            "server",
+        let Command::Serve(a) = cmd(&[
+            "serve",
             "-c",
             "c.yaml",
             "--cert-path",

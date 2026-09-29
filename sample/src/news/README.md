@@ -22,7 +22,7 @@
 
 ```bash
 # 启动（仓库根目录）
-bin/oj server -c sample/config.yaml --api-path sample/src
+bin/oj serve -c sample/config.yaml --api-path sample/src
 
 # 终端 1：连上即完成订阅，收到欢迎帧
 websocat ws://localhost:9778/v1/api/news/ws

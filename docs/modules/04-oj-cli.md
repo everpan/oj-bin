@@ -130,7 +130,7 @@
 default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`）和
 `App::from_config` 的 `db_override` 同一条纪律。注意迁移工具**不读**模块级
 `manifest.yaml` 的 `db:` 绑定（那是运行期路由，见 `src/bridge/guard.rs::bound_db`），
-多库部署须逐 profile 各跑一遍。`oj server` 无此旗标，恒用 `default`。
+多库部署须逐 profile 各跑一遍。`oj serve` 无此旗标，恒用 `default`。
 
 ## 7. Rust 集成测试（`oj/tests/`）
 

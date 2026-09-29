@@ -649,7 +649,7 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
         .args([
-            "server",
+            "serve",
             "-c",
             &tmp.join("config.yaml").display().to_string(),
             "--api-path",
@@ -658,7 +658,7 @@ async fn given_running_server_when_sigterm_then_tasks_stop_and_process_exits() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn oj server child");
+        .expect("spawn oj serve child");
 
     // stdout/stderr 各一线程收集进同一缓冲（task 日志走 eprintln = stderr）。
     let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
