@@ -1,6 +1,11 @@
 //! 配置凭据密封（sealed secret）：config.yaml 里的敏感值以 `ENC[<base64url>]` 承载，
 //! 装配期用部署机私钥就地解密——**配置文件可以进 git，私钥不可以**。
 //!
+//! 信封采用 **X25519 + AES-256-GCM**：RSA（v1）已移除——`oj secret keygen` 只生成 X25519
+//! 密钥，密文固定开销仅 ~62B（版本 1 + 算法 1 + 临时公钥 32 + nonce 12 + tag 16），长度随
+//! 明文，短密码不再被 RSA 地板撑大。明文由 AES-256-GCM 加密，长度无上限（与 v1 信封同构）。
+//! 存量 v1（RSA）密文会在解密时明确报错，提示用 `oj secret seal` 以 X25519 重新加密。
+//!
 //! ## 为什么是信封（RSA-OAEP + AES-256-GCM）而不是裸 RSA
 //! RSA-OAEP 单次的明文上限是 `k - 2*hLen - 2`（2048 位密钥仅 190 字节），DSN 一长就
 //! 顶死；信封只让 RSA 加密 32 字节 CEK，明文长度无上限，且 AES-GCM 自带完整性校验
@@ -16,20 +21,16 @@
 //! 解不出密码。不防：私钥本身泄漏（那就全完了）、内存取证（明文必然在内存里）。
 //! 收益是把「N 个密码」收敛成「1 个私钥」，并让加密权（公钥，可进仓库）与解密权分离。
 
-use std::num::NonZeroU32;
 use std::path::Path;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
-use rsa::pkcs8::{
-    DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
-};
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
+use hkdf::Hkdf;
 use serde_yaml::Value;
 use sha2::Sha256;
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 /// 密封值标记：YAML 里写作 `db: { default: "ENC[<base64url>]" }`。
 pub const PREFIX: &str = "ENC[";
@@ -40,52 +41,82 @@ pub const ENV_KEY: &str = "OJ_SECRET_KEY";
 /// 私钥来源环境变量（PEM 文件路径）。
 pub const ENV_KEY_FILE: &str = "OJ_SECRET_KEY_FILE";
 
-/// 信封版本（布局变更即 bump，旧密文仍能按版本识别）。
-const VERSION: u8 = 1;
-/// AES-256-GCM 内容密钥长度。
-const CEK_LEN: usize = 32;
+/// 已移除的 v1 信封版本号（RSA-OAEP）。仅保留用于识别存量 v1 密文并报清晰错误，不再产生。
+const VERSION_RSA: u8 = 1;
+/// 信封版本（当前唯一：X25519 + AES-256-GCM）。布局变更即 bump，旧密文仍能按版本识别。
+const VERSION_EC: u8 = 2;
+/// 算法标签：1 = X25519 + AES-256-GCM（预留前向兼容别的曲线/算法）。
+const ALG_X25519_AESGCM: u8 = 1;
+/// X25519 公钥字节数（u 坐标）。
+const X25519_PK_LEN: usize = 32;
 /// GCM nonce 长度。
 const NONCE_LEN: usize = 12;
 /// GCM tag 长度（密文至少这么长才算没被截断）。
 const TAG_LEN: usize = 16;
-/// 信封头：版本号 + u16 BE 的 RSA 密文长度。
-const HEADER_LEN: usize = 3;
+
+/// 私钥：`ENC[...]` 现在是 X25519 信封，只需这一种密钥（32 字节种子）。
+#[derive(Debug, Clone)]
+pub struct PrivKey(pub [u8; 32]);
+
+/// 公钥：`PrivKey` 的公开侧（32 字节 u 坐标）。
+#[derive(Debug, Clone)]
+pub struct PubKey(pub [u8; 32]);
+
+/// 本项目 X25519 密钥的 PEM 标签（与 RSA 的 `BEGIN PRIVATE KEY` 等区分）。
+const EC_PRIV_LABEL: &str = "OJ X25519 PRIVATE KEY";
+const EC_PUB_LABEL: &str = "OJ X25519 PUBLIC KEY";
 
 /// 判断一个字符串是否是密封值（不解密、不需要密钥）。
 pub fn is_sealed(s: &str) -> bool {
     s.starts_with(PREFIX) && s.ends_with(SUFFIX)
 }
 
-/// 用公钥把明文封成 `ENC[...]`。
+/// 用公钥把明文封成 `ENC[...]`（X25519 信封）。
 pub fn seal(public_key_pem: &str, plaintext: &str) -> Result<String, String> {
     seal_pub(&parse_public_key(public_key_pem)?, plaintext)
 }
 
 /// 已解析公钥的加密入口（`oj secret seal` 复用同一个 key）。
-pub fn seal_pub(pub_key: &RsaPublicKey, plaintext: &str) -> Result<String, String> {
-    let mut cek = [0u8; CEK_LEN];
-    sys_random(&mut cek).map_err(|e| format!("os random: {e}"))?;
-    let mut nonce = [0u8; NONCE_LEN];
-    sys_random(&mut nonce).map_err(|e| format!("os random: {e}"))?;
+pub fn seal_pub(key: &PubKey, plaintext: &str) -> Result<String, String> {
+    seal_ec_pub(&key.0, plaintext)
+}
 
-    // RSA-OAEP-SHA256 只封 CEK（32B），与明文长度无关。
-    let rsa_ct = pub_key
-        .encrypt(&mut SysRng, Oaep::new::<Sha256>(), &cek)
-        .map_err(|e| format!("rsa seal failed: {e}"))?;
-    let rsa_len = u16::try_from(rsa_ct.len())
-        .map_err(|_| format!("rsa ciphertext too long: {} bytes", rsa_ct.len()))?;
+/// X25519 信封（X25519 ECDH + HKDF-SHA256 派生 CEK + AES-256-GCM）。
+///
+/// 临时密钥每次随机生成，故固定开销仅 `1(版本)+1(alg)+32(临时公钥)+12(nonce)+16(tag)`
+/// ≈ 62 字节——密文长度≈明文+62B，短密码不再被 RSA 的 256/512B 地板撑大。
+fn seal_ec_pub(pk: &[u8; 32], plaintext: &str) -> Result<String, String> {
+    let mut eph_seed = [0u8; 32];
+    sys_random(&mut eph_seed)?;
+    let eph = StaticSecret::from(eph_seed);
+    let eph_pk = X25519Public::from(&eph);
+    // ECIES：封装方用**临时私钥 × 收件方公钥**做 ECDH（pk 是公钥，不能当 StaticSecret 种子用）。
+    let shared = eph.diffie_hellman(&X25519Public::from(*pk));
+    let cek = derive_cek(shared.as_bytes())?;
+
+    let mut nonce = [0u8; NONCE_LEN];
+    sys_random(&mut nonce)?;
     let ct = Aes256Gcm::new_from_slice(&cek)
         .map_err(|e| format!("aes key failed: {e}"))?
         .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
         .map_err(|e| format!("aes-gcm seal failed: {e}"))?;
 
-    let mut env = Vec::with_capacity(HEADER_LEN + rsa_ct.len() + NONCE_LEN + ct.len());
-    env.push(VERSION);
-    env.extend_from_slice(&rsa_len.to_be_bytes());
-    env.extend_from_slice(&rsa_ct);
+    let mut env = Vec::with_capacity(2 + X25519_PK_LEN + NONCE_LEN + ct.len());
+    env.push(VERSION_EC);
+    env.push(ALG_X25519_AESGCM);
+    env.extend_from_slice(eph_pk.as_bytes());
     env.extend_from_slice(&nonce);
     env.extend_from_slice(&ct);
     Ok(format!("{PREFIX}{}{SUFFIX}", URL_SAFE_NO_PAD.encode(env)))
+}
+
+/// X25519 共享秘密 → 32 字节 AES-256-GCM 内容密钥（HKDF-SHA256，固定 info 串）。
+fn derive_cek(shared: &[u8]) -> Result<[u8; 32], String> {
+    let hk = Hkdf::<Sha256>::new(None, shared);
+    let mut cek = [0u8; 32];
+    hk.expand(b"oj-sealed-v2", &mut cek)
+        .map_err(|_| "hkdf expand failed".to_string())?;
+    Ok(cek)
 }
 
 /// 用私钥解出 `ENC[...]` 的明文（也接受裸 base64url，便于排障时粘贴）。
@@ -94,7 +125,8 @@ pub fn open(private_key_pem: &str, token: &str) -> Result<String, String> {
 }
 
 /// 已解析私钥的解密入口（树遍历复用同一个 key，避免每个值都重解析 PEM）。
-pub fn open_pem(key: &RsaPrivateKey, token: &str) -> Result<String, String> {
+/// 按密文版本字节派发：当前仅 X25519 信封；版本 1(RSA, 已移除) 或未知版本明确报错。
+pub fn open_pem(key: &PrivKey, token: &str) -> Result<String, String> {
     let body = token
         .strip_prefix(PREFIX)
         .and_then(|s| s.strip_suffix(SUFFIX))
@@ -105,32 +137,44 @@ pub fn open_pem(key: &RsaPrivateKey, token: &str) -> Result<String, String> {
              开头并以 \"]\" 结尾，请换个写法（如加个前缀/改写大小写），否则会被当密文硬失败"
         )
     })?;
-    if env.len() < HEADER_LEN {
+    if env.is_empty() {
+        return Err("sealed value empty".into());
+    }
+    match env[0] {
+        VERSION_EC => open_ec_pem(key, &env),
+        // 已移除的 v1(RSA) 密文：明确报错，提示用 X25519 重新加密（不静默降级）。
+        VERSION_RSA => Err(
+            "sealed value is v1 (RSA) — v1 信封已移除；请用 `oj secret seal` 以 X25519 重新加密 \
+             （RSA(v1) 密钥不再被本版本支持）"
+                .into(),
+        ),
+        other => Err(format!(
+            "sealed value version {other} unsupported (this oj only knows X25519 envelope) — \
+             用 `oj secret seal` 重新加密（别手改密文）"
+        )),
+    }
+}
+
+/// X25519 解密（X25519 ECDH → HKDF 派生 CEK → AES-256-GCM 解正文）。
+fn open_ec_pem(key: &PrivKey, env: &[u8]) -> Result<String, String> {
+    if env.len() < 2 + X25519_PK_LEN + NONCE_LEN + TAG_LEN {
         return Err(format!(
-            "sealed value truncated: {} bytes (need at least {HEADER_LEN})",
-            env.len()
+            "sealed value truncated: {} bytes (needs at least {} bytes)",
+            env.len(),
+            2 + X25519_PK_LEN + NONCE_LEN + TAG_LEN
         ));
     }
-    if env[0] != VERSION {
+    if env[1] != ALG_X25519_AESGCM {
         return Err(format!(
-            "sealed value version {} unsupported (this oj knows version {VERSION}) — \
-             用 `oj secret seal` 重新加密（别手改密文）",
-            env[0]
+            "sealed value alg {} unsupported (this oj knows X25519+AES-GCM = {ALG_X25519_AESGCM})",
+            env[1]
         ));
     }
-    let rsa_len = u16::from_be_bytes([env[1], env[2]]) as usize;
-    let rest = &env[HEADER_LEN..];
-    if rest.len() < rsa_len + NONCE_LEN + TAG_LEN {
-        return Err(format!(
-            "sealed value truncated: {} bytes body for rsa_len {rsa_len}",
-            rest.len()
-        ));
-    }
-    let (rsa_ct, tail) = rest.split_at(rsa_len);
-    let (nonce, ct) = tail.split_at(NONCE_LEN);
-    let cek = key
-        .decrypt(Oaep::new::<Sha256>(), rsa_ct)
-        .map_err(|e| format!("rsa open failed (wrong private key?): {e}"))?;
+    let (pk_bytes, rest) = env[2..].split_at(X25519_PK_LEN);
+    let (nonce, ct) = rest.split_at(NONCE_LEN);
+    let eph_pk = X25519Public::from(<[u8; 32]>::try_from(pk_bytes).unwrap());
+    let shared = StaticSecret::from(key.0).diffie_hellman(&eph_pk);
+    let cek = derive_cek(shared.as_bytes())?;
     let pt = Aes256Gcm::new_from_slice(&cek)
         .map_err(|e| format!("aes key failed: {e}"))?
         .decrypt(Nonce::from_slice(nonce), ct)
@@ -156,7 +200,7 @@ pub fn has_sealed(v: &Value) -> bool {
 ///
 /// 递归走 Value 而非 `Config` 结构体：`ldap` / `plugins` / `kafkas` 是不透明 Value，
 /// 类型层拦不住里面的 `bind_pw`；且这样将来新增任何段自动支持，schema 零改动。
-pub fn decrypt_tree(v: &mut Value, key: &RsaPrivateKey) -> Result<usize, String> {
+pub fn decrypt_tree(v: &mut Value, key: &PrivKey) -> Result<usize, String> {
     let mut n = 0;
     match v {
         Value::String(s) => {
@@ -195,23 +239,21 @@ pub fn decrypt_tree(v: &mut Value, key: &RsaPrivateKey) -> Result<usize, String>
     Ok(n)
 }
 
-/// 生成密钥对（PEM 字符串）：`(private_pkcs8, public_spki)`。
-pub fn keygen(bits: usize) -> Result<(String, String), String> {
-    if bits < 2048 {
-        return Err(format!(
-            "rsa bits must be >= 2048 (got {bits}); 1024-bit RSA is factorable in practice"
-        ));
-    }
-    let mut rng = SysRng;
-    let private = RsaPrivateKey::new(&mut rng, bits).map_err(|e| format!("rsa keygen: {e}"))?;
-    let public = RsaPublicKey::from(&private);
-    let priv_pem = private
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| format!("encode private key: {e}"))?
-        .to_string();
-    let pub_pem = public
-        .to_public_key_pem(LineEnding::LF)
-        .map_err(|e| format!("encode public key: {e}"))?;
+/// 生成 X25519 密钥对（本项目 `BEGIN OJ X25519 …` 标签的 PEM）。
+/// 固定 32 字节，无需 `--bits`；公钥 32 字节 u 坐标、私钥 32 字节种子。
+/// `ENC[...]` 的密文长度≈明文+62B（短密码不再被 RSA 地板撑大）。
+pub fn keygen() -> Result<(String, String), String> {
+    let mut seed = [0u8; 32];
+    sys_random(&mut seed)?;
+    let priv_pem = format!(
+        "-----BEGIN {EC_PRIV_LABEL}-----\n{}\n-----END {EC_PRIV_LABEL}-----\n",
+        URL_SAFE_NO_PAD.encode(seed)
+    );
+    let pub_bytes: [u8; 32] = *X25519Public::from(&StaticSecret::from(seed)).as_bytes();
+    let pub_pem = format!(
+        "-----BEGIN {EC_PUB_LABEL}-----\n{}\n-----END {EC_PUB_LABEL}-----\n",
+        URL_SAFE_NO_PAD.encode(pub_bytes)
+    );
     Ok((priv_pem, pub_pem))
 }
 
@@ -220,7 +262,7 @@ pub fn keygen(bits: usize) -> Result<(String, String), String> {
 pub fn load_private_key(
     cfg_path: Option<&str>,
     config_dir: &Path,
-) -> Result<RsaPrivateKey, String> {
+) -> Result<PrivKey, String> {
     if let Ok(inline) = std::env::var(ENV_KEY)
         && !inline.trim().is_empty()
     {
@@ -250,24 +292,61 @@ pub fn load_private_key(
 }
 
 /// 从文件读 PEM 公钥（`oj secret seal -k` 用）。
-pub fn load_public_key(path: &Path) -> Result<RsaPublicKey, String> {
+pub fn load_public_key(path: &Path) -> Result<PubKey, String> {
     let pem = std::fs::read_to_string(path)
         .map_err(|e| format!("read public key {}: {e}", path.display()))?;
     parse_public_key(&pem).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// PKCS#8 优先，回落 PKCS#1（`openssl genrsa` 的老格式）。
-fn parse_private_key(pem: &str) -> Result<RsaPrivateKey, String> {
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
-        .map_err(|e| format!("not a usable RSA private key PEM (want PKCS#8 or PKCS#1): {e}"))
+/// 从 PEM 取出 base64 体（剥离 BEGIN/END 标签与空白），优先 URL_SAFE_NO_PAD，回落标准 base64。
+fn pem_body(pem: &str, label: &str) -> Result<Vec<u8>, String> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let lines: Vec<&str> = pem.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.first() != Some(&begin.as_str()) || lines.last() != Some(&end.as_str()) {
+        return Err(format!("not a {label} PEM"));
+    }
+    let b64: String = lines[1..lines.len() - 1].concat();
+    URL_SAFE_NO_PAD
+        .decode(&b64)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&b64))
+        .map_err(|e| format!("{label}: invalid base64: {e}"))
 }
 
-/// SPKI（`BEGIN PUBLIC KEY`）优先，回落 PKCS#1（`BEGIN RSA PUBLIC KEY`）。
-fn parse_public_key(pem: &str) -> Result<RsaPublicKey, String> {
-    RsaPublicKey::from_public_key_pem(pem)
-        .or_else(|_| RsaPublicKey::from_pkcs1_pem(pem))
-        .map_err(|e| format!("not a usable RSA public key PEM (want SPKI or PKCS#1): {e}"))
+/// 解析私钥 PEM：只接受本项目 `BEGIN OJ X25519 …` 标签（RSA(v1) 已移除）。
+pub fn parse_private_key(pem: &str) -> Result<PrivKey, String> {
+    if pem.contains(EC_PRIV_LABEL) {
+        let body = pem_body(pem, EC_PRIV_LABEL)?;
+        if body.len() != 32 {
+            return Err(format!("{EC_PRIV_LABEL}: expected 32 bytes, got {}", body.len()));
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&body);
+        return Ok(PrivKey(seed));
+    }
+    Err(
+        "secrets 现在只支持 X25519 私钥（BEGIN OJ X25519 PRIVATE KEY）；RSA(v1) 已移除，\
+         请用 `oj secret keygen` 重新生成密钥对"
+            .into(),
+    )
+}
+
+/// 解析公钥 PEM：只接受本项目 `BEGIN OJ X25519 …` 标签（RSA(v1) 已移除）。
+pub fn parse_public_key(pem: &str) -> Result<PubKey, String> {
+    if pem.contains(EC_PUB_LABEL) {
+        let body = pem_body(pem, EC_PUB_LABEL)?;
+        if body.len() != 32 {
+            return Err(format!("{EC_PUB_LABEL}: expected 32 bytes, got {}", body.len()));
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&body);
+        return Ok(PubKey(pk));
+    }
+    Err(
+        "secrets 现在只支持 X25519 公钥（BEGIN OJ X25519 PUBLIC KEY）；RSA(v1) 已移除，\
+         请用 `oj secret keygen` 重新生成密钥对"
+            .into(),
+    )
 }
 
 /// URL/DSN 脱敏：凭据段（`scheme://` 与 `@` 之间）换成 `***`，host/库名保留
@@ -289,60 +368,33 @@ pub fn redact(s: &str) -> String {
     }
 }
 
-/// `getrandom`（已在依赖里）→ rsa 需要的 `rand_core 0.6` RNG。
-///
-/// 不引 `rand`：仓库里 `rand 0.10` 是 dev-only 且走 rand_core 0.9，与 rsa 0.9 的
-/// rand_core 0.6 不是同一个 trait，接不上。
-fn sys_random(dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-    getrandom::getrandom(dest).map_err(|_| {
-        NonZeroU32::new(rsa::rand_core::Error::CUSTOM_START)
-            .unwrap()
-            .into()
-    })
+/// 系统随机数：`getrandom`（已在依赖里）填充缓冲区。用于 X25519 密钥种子与 GCM nonce。
+fn sys_random(dest: &mut [u8]) -> Result<(), String> {
+    getrandom::getrandom(dest).map_err(|e| format!("os random unavailable: {e}"))
 }
-
-struct SysRng;
-
-impl rsa::rand_core::RngCore for SysRng {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_be_bytes(b)
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_be_bytes(b)
-    }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        sys_random(dest).expect("os random unavailable")
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-        sys_random(dest)
-    }
-}
-
-impl rsa::rand_core::CryptoRng for SysRng {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 测试专用密钥对（2048 位够用例跑得快；每用例现生成，不落盘）。
+    /// 测试专用密钥对（X25519；每用例现生成，不落盘）。
     fn keypair() -> (String, String) {
-        keygen(2048).unwrap()
+        keygen().unwrap()
     }
 
     #[test]
     fn seal_open_roundtrip() {
         let (priv_pem, pub_pem) = keypair();
-        let token = seal(&pub_pem, "mysql://root:hunter2@127.0.0.1:3306/app").unwrap();
-        assert!(is_sealed(&token), "{token}");
-        assert!(!token.contains("hunter2"));
-        assert_eq!(
-            open(&priv_pem, &token).unwrap(),
-            "mysql://root:hunter2@127.0.0.1:3306/app"
-        );
+        // 短明文（8 字）验证「密文随明文、固定开销 ~62B」：应远短于 RSA(v1) 的 ~735 字符。
+        let short = seal(&pub_pem, "hunter2").unwrap();
+        assert!(is_sealed(&short), "{short}");
+        assert!(short.len() < 130, "short token unexpectedly long: {short}");
+        assert!(!short.contains("hunter2"));
+        assert_eq!(open(&priv_pem, &short).unwrap(), "hunter2");
+        // 长 DSN 也能正常往返（明文长度无上限）。
+        let dsn = "mysql://root:hunter2@127.0.0.1:3306/app";
+        let token = seal(&pub_pem, dsn).unwrap();
+        assert_eq!(open(&priv_pem, &token).unwrap(), dsn);
     }
 
     /// 同一明文两次加密结果不同（OAEP 随机化 + 随机 nonce），但都能解回来。
@@ -356,9 +408,10 @@ mod tests {
         assert_eq!(open(&priv_pem, &b).unwrap(), "same");
     }
 
-    /// 信封而非裸 RSA：明文可以远超 190 字节（2048 位 OAEP 的上限）。
+    /// 信封而非裸 RSA：明文可以远超 190 字节——X25519 只派生会话密钥，正文由
+    /// AES-256-GCM 加密，长度无上限（与 v1 信封同构）。
     #[test]
-    fn envelope_handles_plaintext_longer_than_rsa_limit() {
+    fn envelope_handles_long_plaintext() {
         let (priv_pem, pub_pem) = keypair();
         let long = "x".repeat(4096);
         assert_eq!(
@@ -373,7 +426,7 @@ mod tests {
         let (other_priv, _) = keypair();
         let token = seal(&pub_pem, "secret").unwrap();
         let e = open(&other_priv, &token).unwrap_err();
-        assert!(e.contains("rsa open failed"), "{e}");
+        assert!(e.contains("aes-gcm open failed"), "{e}");
     }
 
     /// 密文改一个字节 → GCM tag 校验失败（不是解出垃圾）。
@@ -394,26 +447,19 @@ mod tests {
         assert!(e.contains("aes-gcm open failed"), "{e}");
     }
 
-    /// 截断：头部合法但声明的 rsa_len 超过实际 body / 密文少一个字节。
-    /// 这两条走的是「长度校验」分支（不是 base64 或版本分支），必须各有覆盖。
+    /// 截断：长度校验分支（不是 base64 或版本分支）必须覆盖。
     #[test]
     fn truncated_envelope_fails_length_check() {
         let (priv_pem, pub_pem) = keypair();
         let env = decode_env(&seal(&pub_pem, "secret").unwrap());
-        // ① 头部说 rsa_len 很大，body 却很短。
-        let mut lying = env.clone();
-        lying[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
-        let e = open(&priv_pem, &encode_env(&lying)).unwrap_err();
+        let min = 2 + X25519_PK_LEN + NONCE_LEN + TAG_LEN;
+        // ① 截到「长度门槛 - 1」→ 长度校验拦下。
+        let e = open(&priv_pem, &encode_env(&env[..min - 1])).unwrap_err();
         assert!(e.contains("truncated"), "{e}");
-        // ② 截到「长度门槛 - 1」→ 长度校验拦下。
-        let rsa_len = u16::from_be_bytes([env[1], env[2]]) as usize;
-        let cut = HEADER_LEN + rsa_len + NONCE_LEN + TAG_LEN - 1;
-        let e = open(&priv_pem, &encode_env(&env[..cut])).unwrap_err();
+        // ② 只留头（版本 + 算法 2 字节）→ 长度校验拦下。
+        let e = open(&priv_pem, &encode_env(&env[..2])).unwrap_err();
         assert!(e.contains("truncated"), "{e}");
-        // ③ 只留头（3 字节）。
-        let e = open(&priv_pem, &encode_env(&env[..HEADER_LEN])).unwrap_err();
-        assert!(e.contains("truncated"), "{e}");
-        // ④ 尾部少一字节但仍在长度门槛之上 → GCM 校验失败（同样不接受，只是拦在不同层）。
+        // ③ 尾部少一字节但仍在长度门槛之上 → GCM 校验失败（同样不接受，只是拦在不同层）。
         let e = open(&priv_pem, &encode_env(&env[..env.len() - 1])).unwrap_err();
         assert!(e.contains("aes-gcm open failed"), "{e}");
     }
@@ -436,6 +482,29 @@ mod tests {
         let (priv_pem, _) = keypair();
         let e = open(&priv_pem, "ENC[this-is-not-base64!!]").unwrap_err();
         assert!(e.contains("明文"), "{e}");
+    }
+
+    // ===== X25519 信封：密文长度随明文（v1/RSA 已移除）=====
+
+    #[test]
+    fn keygen_produces_parseable_pem() {
+        let (priv_pem, pub_pem) = keypair();
+        assert!(priv_pem.contains("OJ X25519 PRIVATE KEY"));
+        assert!(pub_pem.contains("OJ X25519 PUBLIC KEY"));
+        let pt = "x".repeat(4096);
+        let token = seal(&pub_pem, &pt).unwrap();
+        assert_eq!(open(&priv_pem, &token).unwrap(), pt);
+    }
+
+    /// 存量 v1（RSA）密文在移除后必须明确报错，提示用 X25519 重新加密——不静默降级。
+    #[test]
+    fn legacy_v1_token_rejected_with_clear_error() {
+        let (priv_pem, _) = keypair();
+        // 手工拼一个 version=1 的密文（v1 已移除）。
+        let v1_env = vec![VERSION_RSA, ALG_X25519_AESGCM, 0u8, 0u8, 0u8];
+        let token = encode_env(&v1_env);
+        let e = open(&priv_pem, &token).unwrap_err();
+        assert!(e.contains("v1 (RSA)"), "{e}");
     }
 
     fn decode_env(token: &str) -> Vec<u8> {
@@ -464,11 +533,6 @@ mod tests {
             let e = open(&priv_pem, bad).unwrap_err();
             assert!(!e.is_empty(), "{what}");
         }
-    }
-
-    #[test]
-    fn keygen_rejects_short_keys() {
-        assert!(keygen(1024).unwrap_err().contains(">= 2048"));
     }
 
     /// 递归解密：含不透明段（`ldap` 那种 host 对象里的 `bind_pw`）与嵌套 list。

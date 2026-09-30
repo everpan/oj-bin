@@ -5,11 +5,10 @@
 > `docs/devkit/scenarios.md` 场景 18；本手册是完整参考（威胁模型、密文格式、命令、
 > 迁移与轮换、限制、排障）。
 
-- 版本：v0.1.33 起。
+- 版本：v0.1.33 起；**下一版（未发布）移除 RSA(v1) 信封，仅保留 X25519 信封**（config 不再有「RSA 还是 X25519」的歧义）。
 - 实现：`src/secret.rs`（加解密 + 配置树解密 + 脱敏）+ `oj/src/secret_cmd.rs`（CLI）。
-- 依赖：既有 `rsa 0.9` + 新增 `aes-gcm 0.10`（纯 Rust，无 C 编译）；随机数走既有
-  `getrandom 0.2` 适配 `rsa` 的 `rand_core 0.6`（**未引入 `rand`**——仓库里的 `rand 0.10`
-  是 dev-only 且是 rand_core 0.9，与 rsa 0.9 接不上）。
+- 依赖：`x25519-dalek 3` + `hkdf 0.12` + `aes-gcm 0.10`（纯 Rust，无 C 编译）；随机数走
+  `getrandom 0.2`。`rsa` 仍被 `oj-cert` / OIDC 使用，但 secrets 模块已不再依赖它。
 
 ---
 
@@ -35,28 +34,36 @@
 配置里写成字符串 `ENC[<base64url>]`，内部是**信封**（hybrid encryption）：
 
 ```
-信封 = [0x01 版本][u16-BE rsa_ct 长度][RSA-OAEP-SHA256(cek32)][nonce 12B][AES-256-GCM(明文) + tag]
+信封 = [0x02 版本][0x01 算法][X25519 临时公钥 32B][nonce 12B][AES-256-GCM(明文) + tag]
 ```
 
-- **为什么不用裸 RSA**：RSA-OAEP 单次明文上限 `k - 2*hLen - 2`（2048 位密钥仅 190 字节），
-  DSN 一长就顶死；信封只让 RSA 加密 32 字节会话密钥，明文长度无上限。
+- **算法**：X25519 ECDH（临时私钥 × 收件方公钥）+ HKDF-SHA256 派生 32 字节会话密钥，
+  正文由 AES-256-GCM 加密。**固定地板仅约 62B**（版本 1 + 算法 1 + 临时公钥 32 +
+  nonce 12 + tag 16），密文长度≈明文+62B——8 字密码密文约 95 字符，短密码不再被 RSA 地板撑大。
+- **为什么是信封（KEM + AES-GCM）而非直接用 X25519 加密**：X25519 本身只能做密钥协商、
+  不能直接加密长明文；信封用 X25519 派生一次性会话密钥，正文交给 AES-256-GCM——后者
+  明文长度无上限且带完整性校验。
 - **为什么用 AES-GCM 而不是 CBC/裸流密码**：自带完整性校验——密文被改一个 bit 会
   **解密失败**，而不是解出一段垃圾密码后连库失败（后者极难定位）。
 - base64url（无 `+`/`/`/`=`）：在 YAML 任何上下文都无需加引号，避免 `[]` 被当流序列。
-- OAEP 随机化 + 随机 nonce：同一明文两次加密结果不同（无法比对两个密文是否同源）。
+- 随机 nonce + 临时密钥：同一明文两次加密结果不同（无法比对两个密文是否同源）。
+- **版本字节**：首字节 `0x02` 标识本信封；旧版 v1（RSA-OAEP）已移除，遇到 v1 密文解密时
+  明确报错、提示用 `oj secret seal` 以 X25519 重新加密，不静默降级。
+- **RSA(v1) 已移除**：`oj secret keygen` 现在只生成 X25519 密钥，配置里只有一种密钥、
+  不再有「RSA 还是 X25519」的歧义。
 
 ---
 
 ## 3. 命令
 
 ```bash
-# ① 生成密钥对（私钥自动 0o600，已存在则拒绝覆盖）
-./bin/oj secret keygen --bits 4096 --out-dir keys
+# ① 生成密钥对（X25519；私钥自动 0o600，已存在则拒绝覆盖）
+./bin/oj secret keygen --out-dir keys
 echo 'keys/secrets-private.pem' >> .gitignore     # 私钥绝不进仓库
 
 # ② 加密（走 stdin；命令行参数会进 shell history 与 ps）
 echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys/secrets-public.pem
-# → ENC[Ab3…]
+# → ENC[Ab3…]（X25519 信封，密文长度≈明文+62B）
 
 # ③ 排障解密（走与启动同一条私钥通道）
 ./bin/oj secret open -c config.yaml 'ENC[Ab3…]'
@@ -64,8 +71,8 @@ echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys
 
 | 子命令 | 关键参数 | 说明 |
 |---|---|---|
-| `keygen` | `--bits`（默认 2048，最小 2048；长期密钥建议 4096）、`--out-dir`、`--force` | 产出 `secrets-private.pem` / `secrets-public.pem` |
-| `seal` | `-k <pub.pem>` 或 `-c <config.yaml>`（取 `secrets.public_key_path`）；`[VALUE]` 可省（省则读 stdin） | 明文 → `ENC[...]`，尾换行剥除一个 |
+| `keygen` | `--out-dir`、`--force` | 产出 `secrets-private.pem` / `secrets-public.pem`（X25519，32 字节，`BEGIN OJ X25519 …` 标签） |
+| `seal` | `-k <pub.pem>` 或 `-c <config.yaml>`（取 `secrets.public_key_path`）；`[VALUE]` 可省（省则读 stdin） | 明文 → `ENC[...]`（X25519 信封），尾换行剥除一个 |
 | `open` | `-k <priv.pem>` 或 `-c <config.yaml>`；`[VALUE]` 可省 | 密文 → 明文 |
 
 ---
@@ -128,9 +135,10 @@ ldap:                            # 不透明段里的字段同样支持
 | 情形 | 表现 |
 |---|---|
 | 有 `ENC[...]` 但三通道都无私钥 | `config has ENC[...] sealed values but no decryption key: …` 退出 |
-| 私钥与加密公钥不是一对 | `rsa open failed (wrong private key?)` |
+| 私钥与加密公钥不是一对 | `aes-gcm open failed (sealed value tampered?)`（临时密钥由收件方公钥派生，错钥则派生不出同一会话密钥） |
+| 密文是已移除的 v1（RSA） | `sealed value is v1 (RSA) — v1 信封已移除；请用 oj secret seal 以 X25519 重新加密` |
 | 密文被改一个 bit / 截断 | `aes-gcm open failed (sealed value tampered?)` / `truncated` |
-| 密文版本不是 1 | `sealed value version N unsupported … 用 oj secret seal 重新加密` |
+| 密文版本未知（非 0x02） | `sealed value version N unsupported … 用 oj secret seal 重新加密` |
 | 密封值落在 mapping **键**位 | `sealed value used as a mapping key …` |
 | 密文塞进数值字段（`server.port`） | `invalid type: string`（解密结果是字符串，见 §7） |
 | 明文恰好以 `ENC[` 开头、`]` 结尾 | 当密文硬失败，报错里提示换写法 |
@@ -171,7 +179,7 @@ redis://***@127.0.0.1:6379/1
 
 ## 9. 迁移步骤（存量项目）
 
-1. `oj secret keygen --bits 4096 --out-dir keys` + `.gitignore` 加私钥。
+1. `oj secret keygen --out-dir keys` + `.gitignore` 加私钥。
 2. 逐个把明文密码换成密文：`echo -n '<原值>' | oj secret seal -k keys/secrets-public.pem`。
    整条 DSN 直接封，不要拆字段。
 3. config 加 `secrets.private_key_path`（**只写路径，不写 PEM 内容**）。
@@ -188,7 +196,7 @@ redis://***@127.0.0.1:6379/1
 | 症状 | 原因 / 处置 |
 |---|---|
 | 启动报 `no decryption key` | 部署机没给私钥（三通道见 §4）；`oj secret open -c config.yaml` 可复现 |
-| `rsa open failed` | 私钥与公钥不是一对（换机器只拷了 config） |
+| `aes-gcm open failed (sealed value tampered?)` | 私钥与公钥不是一对（换机器只拷了 config） |
 | `oj secret seal` 出来的值解不开 | 用了别的公钥加密；确认 `-k` 指向的 PEM 与私钥同源 |
 | 密文里解出来多了个 `\r` 或换行 | 用 `--value`/positional 传了带换行的值；改走 stdin（尾换行会剥一个） |
 | 换了密钥对老密文全解不开 | 预期行为——用新公钥重封全部密文 |
@@ -196,14 +204,17 @@ redis://***@127.0.0.1:6379/1
 
 ## 11. FAQ：能否与 `oj-cert` 的证书密钥共用一对？
 
-**不能。** 格式上兼容（都是 RSA PEM、都 ≥2048 位，甚至 `secret::parse_private_key` 能直接
-读 `oj-cert` 私钥），但**用途与部署拓扑相反**，共用会直接削弱证书门禁。
+**不能。** 两套密钥**算法与格式都不同**——密封密钥是 `BEGIN OJ X25519 …`（Curve25519，
+用于 ECDH 派生会话密钥），证书密钥是 RSA（`BEGIN PRIVATE KEY`，用于 RS256 签名），
+`secret::parse_private_key` 现在只认 X25519，连 `oj-cert` 的 RSA 私钥都读不进来；何况
+**用途与部署拓扑相反**，共用会直接削弱证书门禁。
 
 | | 证书密钥（`tools/oj-cert`） | 密封密钥（`oj secret keygen`） |
 |---|---|---|
-| 私钥用途 | **RS256 签名**（签发 cert.jws，`SigningKey<Sha256>`） | **OAEP 解密**（解开 config 密文） |
+| 算法 / 格式 | RSA（`BEGIN PRIVATE KEY`，RS256 签名） | X25519（`BEGIN OJ X25519 PRIVATE KEY`，ECDH 派生会话密钥） |
+| 私钥用途 | **签名**（签发 cert.jws） | **ECDH 解密**（解开 config 密文） |
 | 私钥该在哪 | **签发方**（构建机 / 离线冷存；签发才拿出来） | **每台部署机**（否则起不来服务） |
-| 公钥去哪 | 部署机（`server.public_key_path`，ring `RSA_PKCS1_2048_8192_SHA256` 验签） | 开发者 / CI（加密用，可进仓库） |
+| 公钥去哪 | 部署机（`server.public_key_path`，ring 验签） | 开发者 / CI（加密用，可进仓库） |
 | 轮换触发 | 证书续期（renew 重签） | 重封全部密文 |
 
 四条理由：
@@ -211,11 +222,9 @@ redis://***@127.0.0.1:6379/1
 1. **拓扑相反（决定性）**：共用 = 把「签发合法证书」的能力下发到每台部署机。拿到它的人
    能签一张永不过期的证书，**直接绕过证书门禁**（过期 / 宽限 / 身份校验全部失效）。
    部署机本该只有 `server.public_key_path` 那个**公钥**。
-2. **一钥一用途**：NIST SP 800-57 Pt.1 §5.2——同一密钥不得用于多个用途，签名与加密尤其
-   不得共用。历史上的具体教训是 Bleichenbacher / CVE-2006-4339（同一 RSA 密钥同时用于
-   PKCS#1 v1.5 加密与签名时，解密 oracle 可辅助伪造签名）。这里是 OAEP 而非 v1.5 加密，
-   OAEP 本身不可延展，百万消息攻击不直接适用；但交叉协议的安全性靠「两个方案互不相关」
-   来撑，复用就失去了这层保证。
+2. **一钥一用途**：NIST SP 800-57 Pt.1 §5.2——同一密钥不得用于多个用途，签名与密钥协商
+   尤其不得共用（历史上 Bleichenbacher / CVE-2006-4339 正是同一 RSA 密钥既加密又签名时，
+   解密 oracle 辅助伪造签名）。两套算法本就不同，更不该混用。
 3. **轮换互相绑架**：共用后换证书密钥就必须重封所有密码，反之亦然——两个本该独立的
    运维流程被绑死。
 4. **备份策略冲突**：证书私钥应冷存（少碰），密封私钥必须热备（丢了就起不来服务）。

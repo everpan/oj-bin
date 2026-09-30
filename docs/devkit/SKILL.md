@@ -118,7 +118,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 池化任务跑几轮就 `failed` | 单轮 `loop_body` 超 `tasks.pool.loop_body_timeout_ms`（默认 5s）即 teardown + failed 退避重连——长轮询（>5s 一次的等待）别用池化，继续用 TLA + `tasks.sleep` |
 | 池化任务里 `tasks.stopping()` 恒 false | 池化任务由 worker 每轮驱动：`loop_body` 返回即一轮结束，天然无需停机轮询/`tasks.sleep`（v0.1.28） |
 | 启动报 `config has ENC[...] sealed values but no decryption key: …` | config 里有密封值却找不到私钥——设 `OJ_SECRET_KEY`（PEM）/ `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`。**不会**静默把密文当明文用（v0.1.33） |
-| `ENC[…]` 解不开 / 报 `rsa open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
+| `ENC[…]` 解不开 / 报 `aes-gcm open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
+| 报 `sealed value is v1 (RSA) — v1 信封已移除` | 手头是旧版 RSA(v1) 密文，新版已不再支持；用 `oj secret seal` 以 X25519 重新加密（v1 已整体移除，密钥配置只认 X25519 一套） |
+| 想让密文更短 | 信封本就是 X25519 + AES-256-GCM，密文≈明文+62B；`oj secret keygen --out-dir keys` 生成即可，无需额外开关 |
 | 想把 `--value` 写进 shell 命令 | 别——命令行参数进 shell history 与 `ps`；用 `echo -n 'pwd' \| ./bin/oj secret seal -k pub.pem`（尾换行会被剥除） |
 | `/tasks/{name}/start` 对 cron 任务报 400 | 跨 kind 命令被拒：cron 用 `enable`/`disable`，long 用 `start`/`stop`（v0.1.28） |
 | `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |

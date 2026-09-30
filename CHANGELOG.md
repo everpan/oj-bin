@@ -16,6 +16,42 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+> 版本分界：待 `oj/Cargo.toml` 0.1.33 → 下一版本。上一版：`v0.1.33`。
+> 发布点标签：未打标签。
+
+**变更：secrets 信封移除 RSA（v1），仅保留 X25519 信封**
+
+- **为什么移除**：v1（RSA-OAEP）密文固定地板约 256B（2048 位）/ 512B（4096 位），短密码
+  被撑大；且 config 同时存在 RSA / X25519 两套密钥会产生「`private_key_path` 到底指向哪种」
+  的歧义。当前 v1 无人使用，故**整段删除 RSA 路径**，`oj secret keygen` 只生成 X25519 密钥，
+  config 里只有一种密钥，不再有歧义。
+- **密文长度随明文**：X25519 信封走 X25519 ECDH + HKDF-SHA256 派生会话密钥，**固定地板仅
+  约 62B**（版本 1 + 算法 1 + 临时公钥 32 + nonce 12 + tag 16），密文长度≈明文+62B，
+  8 字密码约 95 字符（原 RSA4096 同例会 ~735 字符）。
+- **CLI 简化**：`oj secret keygen` 去掉 `--bits` / `--alg`，只产 32 字节 `BEGIN OJ X25519
+  PRIVATE KEY` / `BEGIN OJ X25519 PUBLIC KEY` PEM（X25519 固定 32 字节，无密钥长度概念）。
+- **存量 v1 密文**：解密时明确报错 `sealed value is v1 (RSA) — v1 信封已移除；请用 oj secret
+  seal 以 X25519 重新加密`，不静默降级。新密文一律 X25519（信封首字节 `0x02`）。
+- **实现**：`PrivKey` / `PubKey` 由「RSA | X25519」枚举收敛为单一 X25519 结构；`seal` /
+  `open` 不再做算法派发；依赖保留 `x25519-dalek 3` + `hkdf 0.12` + `aes-gcm 0.10`，
+  `rsa` 仅余 `oj-cert` / OIDC 使用（secrets 不再依赖）。
+
+**修复：config 裸键（null 值）解析容错**
+
+- `Config` 的 `db` / `redis` / `plugins` 等 map 字段补 `#[serde(default)]`：
+  配置里写成裸键（如 `kafkas:` 即 YAML null）不再报 `invalid type: unit value,
+  expected a map`，而是按空 map 处理。旧二进制缺此容错，故历史 `kafkas:` 裸键曾触发
+  解析失败——现已自愈，无需改配置。
+
+**文档**
+
+- `docs/devkit/` 四件同步：`api-manual.md` §10「secrets」改为「仅 X25519 信封、RSA(v1) 已移除」、
+  `scenarios.md` 场景 18 keygen 示例去 `--bits`/`--alg`、`SKILL.md` 陷阱速查改为 X25519
+  单算法、`README.md` 索引标注「RSA(v1) 已移除」；`docs/secrets.md` 重写为 X25519 单信封
+  （格式 / 命令 / 失败表 / FAQ）；本 CHANGELOG 本节同步。
+
 ## v0.1.33（未打标签）
 
 > 版本分界：`oj/Cargo.toml` 0.1.32 → 0.1.33。上一版：`v0.1.32`。
