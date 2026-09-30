@@ -8,6 +8,12 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use getrandom::getrandom;
+
 use super::StableState;
 
 /// jwt 运行时配置（装配期从 AuthCfg 构建，fail-fast 同旧 Auth::new 语义）。
@@ -202,6 +208,111 @@ pub fn op_crypto_random(n: u32) -> Vec<u8> {
     b
 }
 
+/// crypto.aesGcmEncrypt(plaintext, key)：key 为 hex/base64 编码的原始 16/32 字节，
+/// 按长度选 Aes128/256（aes-gcm 0.10 不含 AES-192）；返回 `base64(nonce12 ‖ ciphertext ‖ tag16)`。
+/// 密钥由调用方从 `vars.get(...)`（可被 `ENC[...]` 密封）传入，op 保持纯原语、不耦合 config。
+#[op2]
+#[string]
+pub fn op_aes_gcm_encrypt(
+    #[string] plaintext: String,
+    #[string] key: String,
+) -> Result<String, JsErrorBox> {
+    let key = decode_key(&key)?;
+    let mut nonce = [0u8; 12];
+    getrandom(&mut nonce).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let ct = aes_encrypt(&key, &nonce, plaintext.as_bytes())?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(STANDARD.encode(out))
+}
+
+/// crypto.aesGcmDecrypt(ciphertext, key)：ciphertext 为 `base64(nonce12 ‖ ct ‖ tag16)`，
+/// 返回明文字符串；篡改/密钥错误抛错（GCM tag 校验失败即报错）。
+#[op2]
+#[string]
+pub fn op_aes_gcm_decrypt(
+    #[string] ciphertext: String,
+    #[string] key: String,
+) -> Result<String, JsErrorBox> {
+    let key = decode_key(&key)?;
+    let raw = STANDARD
+        .decode(ciphertext.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(ciphertext.trim()))
+        .map_err(|e| JsErrorBox::generic(format!("ciphertext not base64: {e}")))?;
+    if raw.len() < 12 {
+        return Err(JsErrorBox::generic("ciphertext too short"));
+    }
+    let (nonce, ct) = raw.split_at(12);
+    let pt = aes_decrypt(&key, nonce, ct)?;
+    String::from_utf8(pt).map_err(|e| JsErrorBox::generic(format!("plaintext not utf8: {e}")))
+}
+
+/// key 为 hex（偶数长且全 hex 字符）或 base64（STANDARD / STANDARD_NO_PAD）编码的原始字节。
+fn decode_key(s: &str) -> Result<Vec<u8>, JsErrorBox> {
+    let t = s.trim();
+    if t.len().is_multiple_of(2) && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut out = Vec::with_capacity(t.len() / 2);
+        let mut i = t.bytes();
+        while let (Some(h), Some(l)) = (i.next(), i.next()) {
+            let hb = (h as char).to_digit(16).unwrap() as u8;
+            let lb = (l as char).to_digit(16).unwrap() as u8;
+            out.push((hb << 4) | lb);
+        }
+        return Ok(out);
+    }
+    STANDARD
+        .decode(t)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(t))
+        .map_err(|e| JsErrorBox::generic(format!("key not hex/base64: {e}")))
+}
+
+/// 按原始密钥长度选择 Aes128/256 并加密（nonce 固定 12 字节）。
+/// 注意：aes-gcm 0.10 仅重导出 Aes128/Aes256，故 24 字节（AES-192）不受支持。
+fn aes_encrypt(key: &[u8], nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, JsErrorBox> {
+    match key.len() {
+        16 => Aes128Gcm::new_from_slice(key)
+            .map_err(box_err)?
+            .encrypt(Nonce::from_slice(nonce), plaintext)
+            .map_err(enc_err),
+        32 => Aes256Gcm::new_from_slice(key)
+            .map_err(box_err)?
+            .encrypt(Nonce::from_slice(nonce), plaintext)
+            .map_err(enc_err),
+        n => Err(JsErrorBox::generic(format!(
+            "aes key must be 16/32 raw bytes (AES-192/24-byte not supported; got {n})"
+        ))),
+    }
+}
+
+/// 按原始密钥长度选择 Aes128/256 并解密。
+fn aes_decrypt(key: &[u8], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>, JsErrorBox> {
+    match key.len() {
+        16 => Aes128Gcm::new_from_slice(key)
+            .map_err(box_err)?
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(dec_err),
+        32 => Aes256Gcm::new_from_slice(key)
+            .map_err(box_err)?
+            .decrypt(Nonce::from_slice(nonce), ct)
+            .map_err(dec_err),
+        n => Err(JsErrorBox::generic(format!(
+            "aes key must be 16/32 raw bytes (AES-192/24-byte not supported; got {n})"
+        ))),
+    }
+}
+
+fn enc_err<E: std::fmt::Display>(e: E) -> JsErrorBox {
+    JsErrorBox::generic(format!("aes-gcm encrypt failed: {e}"))
+}
+
+fn dec_err<E: std::fmt::Display>(e: E) -> JsErrorBox {
+    JsErrorBox::generic(format!("aes-gcm decrypt failed: {e}"))
+}
+
+fn box_err<E: std::fmt::Display>(e: E) -> JsErrorBox {
+    JsErrorBox::generic(format!("aes key init failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +367,33 @@ mod tests {
         assert_eq!(v["data"]["roles"][0], "admin", "{v}");
         assert!(v["data"]["tampered"].is_string(), "{v}");
         assert_eq!(v["data"]["dur"], serde_json::json!([60, 720 * 3600]), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aes_gcm_roundtrip_and_bad_key() {
+        let b = bridge(None);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    // 32 字节原始密钥（hex），等价于 fixtures 用的 sealed vars 取值。
+                    const k = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+                    const ct = crypto.aesGcmEncrypt("hello metabase", k);
+                    const pt = crypto.aesGcmDecrypt(ct, k);
+                    let bad = null;
+                    try { crypto.aesGcmDecrypt(ct, "deadbeef"); } catch (e) { bad = String(e); }
+                    let badLen = null;
+                    try { crypto.aesGcmEncrypt("x", "short"); } catch (e) { badLen = String(e); }
+                    json.ok({ ct, pt, bad, badLen });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["pt"], "hello metabase", "{v}");
+        assert!(v["data"]["ct"].as_str().unwrap().len() > 16, "{v}");
+        assert!(v["data"]["bad"].is_string(), "{v}");
+        assert!(v["data"]["badLen"].is_string(), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

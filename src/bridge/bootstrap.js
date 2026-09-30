@@ -49,6 +49,9 @@ import {
   op_json_ok,
   op_json_raw,
   op_json_redirect,
+  op_json_stream_open,
+  op_stream_write,
+  op_stream_end,
   op_kv_get,
   op_kv_set,
   op_kv_del,
@@ -75,6 +78,8 @@ import {
   op_random_hex,
   op_sha256_hex,
   op_crypto_random,
+  op_aes_gcm_encrypt,
+  op_aes_gcm_decrypt,
   op_vars_get,
   op_ws_send,
   op_ws_send_bin,
@@ -304,6 +309,26 @@ globalThis.json = {
   // bare JSON 200 (no envelope); OP external endpoints speak standard OIDC JSON.
   // Errors still go through fail() so callers can just test !res.ok on the envelope.
   raw: (data) => op_json_raw(data === undefined ? "null" : ojStringify(data)),
+  // Streaming response (v0.1.35): open a channel and push chunks; bypasses the
+  // {code,msg,data} envelope (first byte is the raw body). opts: { status?, contentType? }.
+  stream: (opts) => {
+    op_json_stream_open(opts === undefined ? null : opts);
+    return {
+      write: (c) => op_stream_write(String(c)),
+      end: () => op_stream_end(),
+    };
+  },
+  // SSE convenience over stream(): sets text/event-stream and frames writes as
+  // `data: <c>\n\n`. opts: { status?, heartbeatSecs? }.
+  sse: (opts) => {
+    const o = opts === undefined ? {} : Object.assign({}, opts);
+    o.sse = true;
+    op_json_stream_open(o);
+    return {
+      write: (c) => op_stream_write("data: " + String(c) + "\n\n"),
+      end: () => op_stream_end(),
+    };
+  },
 };
 
 // ----- http helpers: current request context (lazy proxy; fresh per request) -----
@@ -803,6 +828,10 @@ globalThis.crypto = Object.assign(globalThis.crypto || {}, {
     new Uint8Array(view.buffer, view.byteOffset, view.byteLength).set(bytes);
     return view;
   },
+  // AES-GCM application-level encryption: key from vars.get(...) (may be sealed
+  // via ENC[...] in config). plaintext utf8 in, base64(nonce12 || ct || tag16) out.
+  aesGcmEncrypt: (plaintext, key) => op_aes_gcm_encrypt(String(plaintext), String(key)),
+  aesGcmDecrypt: (ciphertext, key) => op_aes_gcm_decrypt(String(ciphertext), String(key)),
 });
 
 // ----- base64: atob/btoa globals (wasm-bindgen glue; same algorithm as the oidc inline helper) -----

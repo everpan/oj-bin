@@ -24,6 +24,7 @@ multer = "3"
 ring = "0.17"
 base64 = "0.21"
 notify = "8"
+tower-http = { version = "0.6", features = ["cors"] }
 
 # 终端镜像落盘（logging）：pipe/dup2 重定向 stdout/stderr。
 [target.'cfg(unix)'.dependencies]

@@ -178,6 +178,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `mail.enqueue` 返回 `code:4` | 队列满（背压）：调大 `smtp.queue_capacity` / `workers`，或降低并发 |
 | `code !== 0` 想自动重试 | **不行**：`2`/`3` 未启用，永久失败与瞬时失败都归 `1`，分不出可重试性——见 `api-manual.md` §6 |
 | IDE 报 `Cannot find module '#_shared/x'` | 该文件尚不存在或不在模块内；`paths` 无法表达「模块相对」别名——创建 `<模块>/_shared/x.ts` 即解析（`global.d.ts` 已加 `#*` 通配兜底消除报错） |
+| 流式响应收到的是 `{code,msg,data}` 而非裸流 | 用了 `json.ok`——流式必须 `json.stream`/`json.sse`，二者**绕过信封**直接写裸 body（v0.1.35） |
+| SSE 客户端收不到帧 | 用了 `json.stream` 却没按 `data: X\n\n` 帧格式——要自动帧化用 `json.sse`；心跳保活 15s（`:\n\n`），静默超 15s 的连接可能被代理掐断（v0.1.35） |
+| `json.stream`/`json.sse` 的 `opts` 想设 `event:`/`id:` | 不支持——`opts` 仅 `status`/`contentType`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
+| 跨域启动直接报错退出 | `server.cors.credentials: true` 且 `origins` 为空——带凭据的 `*` 非法；配显式 `origins`（v0.1.35） |
+| 跨域响应没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂 CORS 层，与旧版一致）；或 `origins: ["*"]` 不展开——放行任意源就把 `origins` 留空（v0.1.35） |
+| `crypto.aesGcmEncrypt` 传 24 字节密钥报错 | 不支持 AES-192——密钥仅 16（AES-128）/32（AES-256）字节的 hex 或 base64；应用层加解密，密钥自管不进 config（v0.1.35） |
 
 ## 手册
 
@@ -188,7 +194,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 `scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
 测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）/
 大整数 id（雪花）的生成与精确回写 / 302 重定向到 blob 预签名 URL /
-路径参数路由（`_name_` 目录 vs `.route`）/ 池化长任务 + cron。
+路径参数路由（`_name_` 目录 vs `.route`）/ 池化长任务 + cron /
+流式响应与 SSE（v0.1.35）/ 前端跨域 CORS（v0.1.35）/ 应用层 AES-GCM 对称加密（v0.1.35）。
 
 类型提示：把同目录 `global.d.ts` 拷进业务项目源码根，编辑器/agent 即获得全局对象
 （json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的完整类型。

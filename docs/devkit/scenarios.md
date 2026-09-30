@@ -1252,6 +1252,102 @@ rabbits:
 
 ---
 
+## 场景 19：流式响应 / SSE 实时推送（v0.1.35）
+
+**什么时候用**：导出大 CSV / 流式转码 / 长列表分块吐给前端（避免一次性把全部内容攒进
+内存再返回）；或 server-sent events 把进度、通知、日志实时推到浏览器（`EventSource`）。
+
+> 流式响应**绕过** `{code,msg,data}` 信封——直接写裸 body。需要结构化业务响应仍走
+> `json.ok` / `json.fail`。
+
+### ① handler（流式 CSV）
+
+```ts
+export default {
+  get() {
+    const s = json.stream({ contentType: "text/csv" });
+    s.write("id,name\n");
+    for (let i = 0; i < 1_000_000; i++) s.write(`${i},row${i}\n`);
+    s.end();                       // 显式关流；不调用也会在 read_capture 阶段自动关闭
+  },
+};
+```
+
+### ② handler（SSE）
+
+```ts
+export default {
+  get() {
+    const e = json.sse();          // Content-Type 自动 text/event-stream
+    e.write("hello");              // 自动包成 data: hello\n\n
+    e.write("world");              // data: world\n\n
+    // 不调用 end() 也行——handler 退出后连接保持，read_capture 接管后关流
+  },
+};
+```
+
+### ③ 验证
+
+```bash
+curl -N http://localhost:9778/v1/api/report/export/   # -N 关闭缓冲，看到分块/逐帧到达
+# SSE：浏览器 new EventSource(url) 监听 message；或 curl -N 看 data: ...\n\n 帧
+```
+
+### ④ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 前端拿到的是 `{code,msg,data}` 而非裸流 | 用了 `json.ok`——流式必须 `json.stream` / `json.sse`，二者绕过信封 |
+| 流「卡住」不结束 | 没调用 `end()` 且连接被前端一直保持——`read_capture` 在 handler 退出后接管并关流；若想显式结束务必 `end()` |
+| SSE 客户端收不到 | 用了 `json.stream` 但没按 `data: X\n\n` 帧格式——要自动帧化用 `json.sse`；心跳保活间隔 15s（`:\n\n`），静默超 15s 的连接可能被代理掐断 |
+| `opts` 想设 `event:`/`id:` 字段 | 不支持——`opts` 仅 `status` / `contentType`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
+| 想边查库边流 | handler 内可正常用 `db`/`kv`；但通道在 handler 返回后才继续推——重活尽量在 `end()` 之前做完 |
+
+---
+
+## 场景 20：前端跨域调用 oj API（CORS，v0.1.35）
+
+**什么时候用**：浏览器里的前端（另一个 origin）要 `fetch` oj 的 API。同源不用配；跨源
+不配会直接被浏览器拦（`CORS` 头缺失）。
+
+> `server.cors` 段**存在即启用**；段缺失（缺省）则不挂 CORS 层，行为与旧版完全一致
+> （响应无 `Access-Control-*` 头）。预检（OPTIONS）由 `tower-http::cors` 在路由前短路，
+> 业务 handler 不感知。
+
+### ① 配置
+
+```yaml
+server:
+  cors:
+    origins: ["https://app.example.com"]   # 非空：精确匹配；为空 → 允许任意源
+    methods: ["GET", "POST"]
+    headers: ["x-foo"]
+    expose:  ["x-request-id"]
+    credentials: false                     # true 必须配 origins（否则启动 fail-fast）
+    max_age: 600
+```
+
+### ② 验证
+
+```bash
+# 预检
+curl -i -X OPTIONS http://localhost:9778/v1/api/u/f/ \
+  -H 'Origin: https://app.example.com' -H 'Access-Control-Request-Method: GET'
+# → 含 Access-Control-Allow-Origin / Access-Control-Allow-Methods
+# 简单请求：带 Origin 的 GET 响应头里出现 Access-Control-Allow-Origin
+```
+
+### ③ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 启动直接报错退出 | `credentials: true` 且 `origins` 为空——带凭据的 `*` 非法，浏览器拒绝；配显式 origins 即可 |
+| 响应里没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂层）——与旧版行为一致；确认 config 段存在 |
+| 预检 404 / 进了业务 handler | 不会——`tower-http::cors` 在路由前短路 OPTIONS；handler 永远看不到预检 |
+| `origins: ["*"]` 不生效 | 写 `*` 字符串不会按通配展开——要放行任意源就把 `origins` 留空（空列表 = `AllowOrigin::any`） |
+
+---
+
 ## 相关文档
 
 - `api-manual.md` —— 完整 API 手册（13 章）

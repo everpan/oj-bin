@@ -1232,6 +1232,18 @@ impl App {
         // server.html_meta_handler（v0.1.25）：必须是路由表里存在的 GET 路由——拼错
         // fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露的谎话）。
         validate_html_meta_handler(&cfg, &table)?;
+        // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
+        // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
+        // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
+        // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
+        if let Some(cors) = &cfg.server.cors
+            && cors.credentials && cors.origins.is_empty()
+        {
+            return Err(
+                "server.cors: credentials=true 需要显式 origins（origins 为空 = 允许任意源，不可与 credentials 同用）"
+                    .into(),
+            );
+        }
         let router = server::app(
             &base,
             dir,
@@ -1260,6 +1272,7 @@ impl App {
             cert_valid_until,
             // 插件自省清单经 stable 单源读取（与 StableState.plugins 同源）。
             Arc::new(stable.plugins.clone()),
+            cfg.server.cors.clone(),
         )
         .merge(ws_router);
         Ok(App {
