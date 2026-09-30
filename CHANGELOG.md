@@ -40,10 +40,14 @@
 
 **修复：config 裸键（null 值）解析容错**
 
-- `Config` 的 `db` / `redis` / `plugins` 等 map 字段补 `#[serde(default)]`：
-  配置里写成裸键（如 `kafkas:` 即 YAML null）不再报 `invalid type: unit value,
-  expected a map`，而是按空 map 处理。旧二进制缺此容错，故历史 `kafkas:` 裸键曾触发
-  解析失败——现已自愈，无需改配置。
+- `Config` 的 `db` / `redis` / `plugins` / `kafkas` / `rabbits` / `vars` 等 map 字段与
+  `secrets` / `tasks` / `ws` / `db_query` 等段字段，由「裸键按空处理」升级为**完整 null 容错**：
+   earlier 的 `#[serde(default)]` 只覆盖「键缺失」，键存在却为 YAML null（如 `redis:` 末无值）
+  仍报 `invalid type: unit value, expected a map`。现抽出统一反序列化辅助 `null_as_default`
+  （`Option::<T>::deserialize` 对 null/缺失均解 `None` → 回退 `T::default()`，对**真实类型错误**
+  如 `redis: foo` 标量仍透传原错不静默吞），并以 `#[serde(default, deserialize_with =
+  "null_as_default")]` 应用到上述字段。裸键与显式 `{}` 等价，且 `oj exec` / `serve` / `build`
+  共用同一条 `load_from` 路径，一并自愈。
 
 **文档**
 

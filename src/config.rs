@@ -6,6 +6,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// 配置字段反序列化辅助：把「缺失」与「显式 null（如 `redis:` 这样的空键）」都落回 `T::default()`。
+///
+/// serde 的 `#[serde(default)]` 只覆盖「键不存在」；键存在却为 YAML null 时仍会报
+/// `invalid type: unit value, expected a map`。`Option::<T>::deserialize` 对「缺失」与
+/// 「null」都解为 `None`，故本函数对二者一视同仁，统一回退默认值——`db:` / `redis:` /
+/// `plugins:` 等空键可直接留空，不必写成 `{}`。
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    // `Option::<T>` 对 YAML null 解为 `None`（→ 默认值）；对**真实类型错误**
+    // （如 `redis: foo` 标量）仍透传原错，不静默吞掉误配置。`?` 保证错误上浮。
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// 多静态站点条目（v0.1.27，`server.static_sites`）：前缀→目录映射。
 /// `prefix` 规范化见 server_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
 /// `path` 相对 config 目录（CLI `--app-path prefix=dir` 给出的已按 CWD 预绝对化）。
@@ -763,10 +779,10 @@ impl Default for WsCfg {
 pub struct Config {
     pub server: ServerCfg,
     /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 仅 default 为 sqlite 时重放）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub db: HashMap<String, String>,
     /// name → redis URL（v0.1 warn 后用内存 KV）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub redis: HashMap<String, String>,
     pub tenant: TenantCfg,
     /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
@@ -792,31 +808,31 @@ pub struct Config {
     /// 严格模式，只装配列出的插件，沿用清单门禁）；值 = 插件 cfg，非空对象原样透传，
     /// 空对象跳过透传回落轴适配器。缺省/空 map = 扫描模式（加载 plugins_dir 全部）。
     /// 旧 list 写法 `plugins: [a, b]` 废弃（解析报错 fail-fast）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub plugins: HashMap<String, serde_json::Value>,
     /// 命名 MQ 实例（spec 2026-09-07 §3）：kafkas.default = { brokers, group } →
     /// Kafka("default")。值 JSON 透传给 mq 插件（kind 由装配层按段来源注入）。
     /// 段缺省 = 不启用（registry 空 → Kafka/RabbitMQ(name) → undefined）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub kafkas: HashMap<String, serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub rabbits: HashMap<String, serde_json::Value>,
     /// 长任务池（spec 2026-09-07 §6）：目录约定 task_{name}.* / {name}_task.*；
     /// 缺省段 = 默认值（dir "tasks"，目录不存在 = 无任务，不报错）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tasks: TasksCfg,
     /// WS 运行时（spec 2026-09-09 帧池）：闸门 / Worker 数 / 空闲退役。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub ws: WsCfg,
     /// 构造器 LIMIT（v0.1.20）：`default_limit` = 顶层 select 未给 limit 时的隐式值
     /// （默认 100），`max_limit` = 显式 limit 的 clamp 上界（默认 1000，硬顶 100000）。
     /// 两者都在装配期校验（0 / 倒置 / 超硬顶 均 fail-fast）。
     /// **不能塞进 `db:`**——`db` 是 name → DSN 的 map，键即库名。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub db_query: crate::bridge::QueryLimits,
     /// 凭据密封（v0.1.33）：`ENC[...]` 密文的密钥位置。段缺省 = 无私钥
     /// （此时配置里出现 `ENC[...]` 会 fail-fast，见 [`SecretsCfg`]）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub secrets: SecretsCfg,
     /// plugins 目录（相对 config_dir；None = 走 OJ_PLUGINS_DIR > <exe>/plugins > <workspace_root>/bin/plugins 后备）。
     pub plugins_dir: Option<PathBuf>,
@@ -827,7 +843,7 @@ pub struct Config {
     /// 是唯一真相源）。值只能是**标量**：字符串/数字/布尔都按其 YAML 字面量读成串
     /// （`PORT: 3000` → JS 收到 `"3000"`；`FLAG: true` → `"true"`），嵌套 map/list 在
     /// 解析期报错（本段不是塞 JSON 的地方）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub vars: HashMap<String, String>,
 }
 
@@ -1093,6 +1109,46 @@ mod tests {
         let c = load_from(&dir, None).unwrap();
         assert_eq!(c.db["default"], "sqlite://a.db");
         assert!(c.secrets.private_key_path.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空键（`redis:` / `db:` / `plugins:` / `kafkas:` 等写成了 YAML null）应落回默认值，
+    /// 而非报 `invalid type: unit value, expected a map`。缺失键、显式 null、正常值三者统一。
+    #[test]
+    fn empty_keys_are_null_tolerant() {
+        let dir = std::env::temp_dir().join(format!("ojcfgempty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            concat!(
+                "redis:\n", // 空键 → null → 空 map
+                "db:\n",
+                "plugins:\n",
+                "kafkas:\n",
+                "rabbits:\n",
+                "vars:\n",
+                "secrets:\n", // 段空键 → SecretsCfg 默认值
+                "tasks:\n",  // 段空键 → TasksCfg 默认值
+                "auth:\n  jwt_secret: s\n",
+            ),
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert!(c.redis.is_empty());
+        assert!(c.db.is_empty());
+        assert!(c.plugins.is_empty());
+        assert!(c.kafkas.is_empty());
+        assert!(c.rabbits.is_empty());
+        assert!(c.vars.is_empty());
+        assert!(c.secrets.private_key_path.is_none());
+        // 真实类型错误仍要上浮（不静默吞掉误配置）：redis 写成标量
+        std::fs::write(
+            dir.join("config.yaml"),
+            "redis: not-a-map\nauth:\n  jwt_secret: s\n",
+        )
+        .unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("invalid type"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
