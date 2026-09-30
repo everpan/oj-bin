@@ -129,6 +129,18 @@ interface JsonApi {
     temporaryRedirect(url: string): void; // 307 方法/体保持
     permanentRedirect(url: string): void; // 308 永久 + 方法保持
   };
+  // 流式响应（v0.1.35）：开流后逐块 write，绕过 {code,msg,data} 信封。
+  // opts：{ status?, contentType? }；返回 writer 必须显式 end()（或 handler 返回即自动关流）。
+  stream(opts?: { status?: number; contentType?: string }): StreamWriter;
+  // SSE 便捷封装：自动 text/event-stream + 数据帧 `data: <c>\n\n`；
+  // opts：{ status?, heartbeatSecs? }（心跳默认 15s，保活穿透代理）。
+  sse(opts?: { status?: number; heartbeatSecs?: number }): StreamWriter;
+}
+
+// 流式写入器（json.stream/json.sse 返回）。
+interface StreamWriter {
+  write(chunk: string): void;
+  end(): void;
 }
 
 // http.* ：当前请求上下文（只读，懒加载，per-request 最新）。
@@ -462,6 +474,11 @@ declare global {
     sha256Hex(s: string): string;
     randomHex(nBytes?: number): string;
     getRandomValues<T extends ArrayBufferView>(view: T): T;
+    // AES-GCM 应用级加密（v0.1.35）：key 为 hex/base64 编码的原始 16/32 字节
+    // （按长度选 Aes128/256；aes-gcm 0.10 不含 AES-192），来自 vars.get(...)；明文 utf8 进，
+    // base64(nonce12 ‖ ct ‖ tag16) 出。密钥缺失/非法由调用方 json.fail。
+    aesGcmEncrypt(plaintext: string, key: string): string;
+    aesGcmDecrypt(ciphertext: string, key: string): string;
   }
 
   // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----

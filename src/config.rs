@@ -175,6 +175,10 @@ pub struct ServerCfg {
     /// 非法值装配期 fail-fast。
     #[serde(default)]
     pub ownership_guard: Option<String>,
+    /// CORS（v0.1.35）：段存在即启用；缺段 = 不挂 CORS 层（安全默认，与 auth/oidc 一致）。
+    /// 具体头在 CorsCfg 内声明；装配期校验 credentials 需显式 origins（见 oj/src/app.rs）。
+    #[serde(default)]
+    pub cors: Option<CorsCfg>,
 }
 
 impl Default for ServerCfg {
@@ -207,8 +211,29 @@ impl Default for ServerCfg {
             grace_days: Some(30),
             migrate_on_start: None,
             ownership_guard: None,
+            cors: None,
         }
     }
+}
+
+/// CORS 配置（v0.1.35，挂 `server.cors`）。段存在即启用，缺段 = 不挂 CORS 层。
+/// 各字段存原始字符串，装配期在 `server/src/lib.rs` 解析为 tower-http 类型；
+/// `credentials: true` 要求 `origins` 非空（否则装配期 fail-fast，避免 tower-http pan]。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct CorsCfg {
+    /// 允许源列表；空 = 允许任意源（AllowOrigin::any）。
+    pub origins: Vec<String>,
+    /// 允许方法（GET/POST/...）；空 = tower-http 默认（GET,HEAD,POST 等）。
+    pub methods: Vec<String>,
+    /// 允许请求头；空 = 反射请求里的 Access-Control-Request-Headers。
+    pub headers: Vec<String>,
+    /// 是否允许凭据（cookie/Authorization）；true 时 origins 必须非空。
+    pub credentials: bool,
+    /// 预检缓存秒数（max-age）；None = 不设。
+    pub max_age: Option<u64>,
+    /// 暴露给浏览器的响应头（Access-Control-Expose-Headers）；空 = 不额外暴露。
+    pub expose: Vec<String>,
 }
 
 impl ServerCfg {

@@ -17,16 +17,20 @@ use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use serde_json::Value;
+use std::time::Duration;
+
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, Any, CorsLayer};
 
 use crate::actor::JsActor;
 use crate::routes::{Lookup, RouteTable, Routes};
 use only_js::bridge::{
     AuthGuard, BlobBackend, BlobServed, PluginInfo, RequestInfo, UploadedFile, fail,
 };
+use only_js::config::CorsCfg;
 
 /// 证书状态
 #[derive(Clone, Debug)]
@@ -185,6 +189,8 @@ pub fn app(
     certificate_status: Arc<RwLock<CertificateStatus>>,
     certificate_valid_until: Arc<RwLock<Option<std::time::SystemTime>>>,
     plugins: Arc<Vec<PluginInfo>>,
+    // CORS（v0.1.35）：段存在即启用；None = 不挂层（行为完全不变）。
+    cors: Option<CorsCfg>,
 ) -> Router {
     let dir = dir.into();
     let base = base.trim_end_matches('/');
@@ -192,27 +198,81 @@ pub fn app(
     // 公共基础设施端点（先于 fallback 的真实 route）：不走 Bearer 守卫 / 证书 GET 门禁，
     // 与 /health 同位（匿名可访问），保留路径遮蔽同名业务路由。
     let plugins_path = format!("{base}/plugins");
-    Router::new()
+    let mut router = Router::new()
         .route(&health_path, axum::routing::get(health_handler))
         .route(&plugins_path, axum::routing::get(plugins_handler))
         .fallback(any(handle))
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
-        .layer(axum::middleware::from_fn(crate::logging::log_requests))
-        // v0.1.30：请求体分档限长移入 handle()（blob 直传 PUT 走 1 GiB 档、其余 2x
-        // max_upload——全局 DefaultBodyLimit 层已移除，不能抬全局上限替直传开路）。
-        .with_state(AppState {
-            table,
-            fallback: ts.then(|| Routes::new(base, dir, ts)),
-            actor,
-            timeout,
-            static_sites: sorted_sites(static_sites),
-            static_opts,
-            pipeline,
-            base: base.to_string(),
-            certificate_status,
-            certificate_valid_until,
-            plugins,
-        })
+        .layer(axum::middleware::from_fn(crate::logging::log_requests));
+    // CORS 层放在最外层（先于 handle 与日志中间件）：预检由本层短路（204 + CORS 头），
+    // 不进入路由；简单请求补 Access-Control-* 响应头。
+    if let Some(cfg) = cors {
+        router = router.layer(build_cors_layer(&cfg));
+    }
+    router.with_state(AppState {
+        table,
+        fallback: ts.then(|| Routes::new(base, dir, ts)),
+        actor,
+        timeout,
+        static_sites: sorted_sites(static_sites),
+        static_opts,
+        pipeline,
+        base: base.to_string(),
+        certificate_status,
+        certificate_valid_until,
+        plugins,
+    })
+}
+
+/// 由 `CorsCfg` 构造 `CorsLayer`（v0.1.35）。
+/// - `origins` 空 → 允许任意源（Any）；非空 → 显式源列表。
+/// - `methods`/`headers` 空 → tower-http 默认（反射/标准方法）。
+/// - `credentials: true` 时调用方（oj/src/app.rs）必须已确保 `origins` 非空，否则
+///   tower-http 运行期 panic；此处仅按值装配。
+/// - `max_age`/`expose` 可选。
+fn build_cors_layer(cfg: &CorsCfg) -> CorsLayer {
+    let mut layer = CorsLayer::new();
+    layer = if cfg.origins.is_empty() {
+        layer.allow_origin(Any)
+    } else {
+        let origins = cfg
+            .origins
+            .iter()
+            .filter_map(|o| o.parse::<HeaderValue>().ok())
+            .collect::<Vec<_>>();
+        layer.allow_origin(AllowOrigin::list(origins))
+    };
+    if !cfg.methods.is_empty() {
+        let methods = cfg
+            .methods
+            .iter()
+            .filter_map(|m| m.parse::<Method>().ok())
+            .collect::<Vec<_>>();
+        layer = layer.allow_methods(AllowMethods::list(methods));
+    }
+    if !cfg.headers.is_empty() {
+        let headers = cfg
+            .headers
+            .iter()
+            .filter_map(|h| h.parse::<HeaderName>().ok())
+            .collect::<Vec<_>>();
+        layer = layer.allow_headers(AllowHeaders::list(headers));
+    }
+    if cfg.credentials {
+        layer = layer.allow_credentials(true);
+    }
+    if let Some(age) = cfg.max_age {
+        layer = layer.max_age(Duration::from_secs(age));
+    }
+    if !cfg.expose.is_empty() {
+        let expose = cfg
+            .expose
+            .iter()
+            .filter_map(|h| h.parse::<HeaderName>().ok())
+            .collect::<Vec<HeaderName>>();
+        layer = layer.expose_headers(expose);
+    }
+    layer
 }
 
 /// 站点表排序（v0.1.27 多站点）：前缀长度降序（最长命中优先），同长按字符串升序保确定性。
@@ -299,6 +359,7 @@ pub async fn serve(
         static_sites,
         static_opts,
         pipeline,
+        None,
     )
     .await
 }
@@ -316,6 +377,7 @@ pub async fn serve_with_listener(
     static_sites: Vec<StaticSite>,
     static_opts: StaticOpts,
     pipeline: Pipeline,
+    cors: Option<CorsCfg>,
 ) -> std::io::Result<()> {
     serve_router(
         listener,
@@ -332,6 +394,7 @@ pub async fn serve_with_listener(
             Arc::new(RwLock::new(CertificateStatus::Valid)),
             Arc::new(RwLock::new(None)),
             Arc::default(),
+            cors,
         ),
         // 测试路径：永不触发的停机信号（保持原行为）。
         std::future::pending(),
@@ -1368,8 +1431,20 @@ fn file_response(file: &Path, body: Vec<u8>) -> Response {
 }
 
 /// Capture → axum Response（status/headers/body 原样回写）。
+/// 流式响应（v0.1.35）：`cap.stream` 为 Some 时以 `Body::from_stream` 逐块写出，绕过信封。
 fn capture_response(cap: only_js::bridge::Capture) -> Response {
-    let mut r = Response::new(axum::body::Body::from(cap.body));
+    let mut r = if let Some(rx) = cap.stream {
+        // 接收端逐块收，映射到 `Result<Bytes, io::Error>` 交给 axum（chunked 传输）。
+        // 不用 `StreamExt::map`：tokio 1.x 的 mpsc 接收端未实现 `Stream` trait（无 stream
+        // feature），改用 unfold + recv() 自建流。
+        use futures_util::stream::unfold;
+        let s = unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|b| (Ok::<_, std::io::Error>(b), rx))
+        });
+        Response::new(axum::body::Body::from_stream(s))
+    } else {
+        Response::new(axum::body::Body::from(cap.body))
+    };
     *r.status_mut() = StatusCode::from_u16(cap.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     for (k, v) in cap.headers {
         if let (Ok(name), Ok(hv)) = (
@@ -1624,6 +1699,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 StaticOpts::default(),
                 pipeline,
+                None,
             )
             .await
             .unwrap();
@@ -1675,6 +1751,7 @@ pub(crate) mod tests {
                 Vec::new(),
                 StaticOpts::default(),
                 pipeline,
+                None,
             )
             .await
             .unwrap();
@@ -2511,6 +2588,7 @@ pub(crate) mod tests {
                 static_sites,
                 opts,
                 Pipeline::default(),
+                None,
             )
             .await
             .unwrap();
@@ -3296,5 +3374,176 @@ pub(crate) mod tests {
     #[test]
     fn given_send_assertion_when_called_then_holds() {
         _assert_send();
+    }
+
+    // ----- 流式响应 / SSE（v0.1.35）-----
+
+    /// 流式路径：handler 用 `json.stream` 逐块写出 → 响应为 chunked 且绕过信封。
+    #[tokio::test]
+    async fn stream_responds_chunked_bypassing_envelope() {
+        let t = routes(&[(
+            "s/export/api.ts",
+            r#"export default { get() {
+                const w = json.stream({ contentType: "text/csv" });
+                w.write("a,b\n");
+                w.write("1,2\n");
+                w.end();
+            } };"#,
+        )]);
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let r = raw_http(
+            addr,
+            "GET /v1/api/s/export/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert!(
+            r.to_lowercase().contains("transfer-encoding: chunked"),
+            "expected chunked transfer: {r}"
+        );
+        assert!(r.contains("content-type: text/csv"), "{r}");
+        // 绕过信封：body 即裸 CSV，无 {code,msg,data}。
+        assert!(r.contains("a,b\n1,2\n"), "{r}");
+        assert!(!r.contains("\"code\""), "{r}");
+    }
+
+    /// SSE 路径：content-type=text/event-stream 且数据按 `data: ..\n\n` 帧化。
+    #[tokio::test]
+    async fn sse_sets_event_stream_content_type() {
+        let t = routes(&[(
+            "s/feed/api.ts",
+            r#"export default { get() {
+                const w = json.sse();
+                w.write("hello");
+                w.write("world");
+                w.end();
+            } };"#,
+        )]);
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let r = raw_http(
+            addr,
+            "GET /v1/api/s/feed/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r.to_lowercase().contains("content-type: text/event-stream"),
+            "{r}"
+        );
+        assert!(r.contains("data: hello\n\ndata: world\n\n"), "{r}");
+    }
+
+    /// 非流式行为不变：普通 json.ok 仍走缓冲信封（回归）。
+    #[tokio::test]
+    async fn non_stream_still_buffered_envelope() {
+        let t = routes(&[(
+            "s/echo/api.ts",
+            "export default { get() { json.ok({ hi: 1 }); } };",
+        )]);
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let r = raw_http(
+            addr,
+            "GET /v1/api/s/echo/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.contains("\"code\":0"), "{r}");
+        assert!(r.contains("\"hi\":1"), "{r}");
+    }
+
+    // ----- CORS（v0.1.35）-----
+
+    /// 带 CORS 配置起服务，返回监听地址（server.cors 段存在即启用）。
+    async fn spawn_cors(
+        base: &str,
+        dir: PathBuf,
+        ts: bool,
+        cors: only_js::config::CorsCfg,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let table = build_table(&dir, ts, base);
+        let base = base.to_string();
+        tokio::spawn(async move {
+            serve_with_listener(
+                listener,
+                &base,
+                dir.clone(),
+                ts,
+                table,
+                make_actor(dir, ts),
+                None,
+                Vec::new(),
+                StaticOpts::default(),
+                Pipeline::default(),
+                Some(cors),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    /// 预检（OPTIONS）由 CORS 层短路，返回 Allow-Origin/Allow-Methods；简单请求补 Allow-Origin。
+    #[tokio::test]
+    async fn cors_preflight_and_simple_request_get_headers() {
+        let t = routes(&[(
+            "u/f/api.ts",
+            "export default { get() { json.ok({ ok: 1 }); } };",
+        )]);
+        let cors = only_js::config::CorsCfg {
+            origins: vec!["http://example.com".into()],
+            methods: vec!["GET".into()],
+            headers: vec!["x-foo".into()],
+            credentials: false,
+            max_age: Some(600),
+            expose: vec![],
+        };
+        let addr = spawn_cors("/v1/api", t.0.clone(), true, cors).await;
+
+        let pre = raw_http(
+            addr,
+            "OPTIONS /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nOrigin: http://example.com\r\nAccess-Control-Request-Method: GET\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            pre.to_lowercase()
+                .contains("access-control-allow-origin: http://example.com"),
+            "{pre}"
+        );
+        assert!(
+            pre.to_lowercase()
+                .contains("access-control-allow-methods: GET")
+                || pre.to_lowercase().contains("access-control-allow-methods"),
+            "{pre}"
+        );
+
+        let ok = raw_http(
+            addr,
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nOrigin: http://example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            ok.to_lowercase()
+                .contains("access-control-allow-origin: http://example.com"),
+            "{ok}"
+        );
+    }
+
+    /// 无 server.cors 段时行为与现在一致（不挂 CORS 层，响应无 Access-Control-* 头）。
+    #[tokio::test]
+    async fn cors_absent_means_no_headers() {
+        let t = routes(&[(
+            "u/f/api.ts",
+            "export default { get() { json.ok({ ok: 1 }); } };",
+        )]);
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
+        let ok = raw_http(
+            addr,
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nOrigin: http://example.com\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !ok.to_lowercase().contains("access-control-allow-origin"),
+            "{ok}"
+        );
     }
 }

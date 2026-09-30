@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.34"
+version = "0.1.35"
 dependencies = [
  "async-trait",
  "axum",
@@ -4411,6 +4411,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bcrypt",
+ "bytes",
  "criterion",
  "deno_ast",
  "deno_core",
@@ -5968,6 +5969,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

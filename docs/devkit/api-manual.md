@@ -641,6 +641,14 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.header` | `header(name: string, value: string): void` | 设置响应头（同名后写覆盖） |
 | `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
 | `json.redirect` | `redirect(url: string, code?: number): void` | **3xx 重定向原语**（v0.1.26）：`Location` + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 非 3xx **回落 302**（杜绝「200 + Location」畸形响应）；空 url 忽略 `Location`。具名封装：`movedPermanently`(301) / `found`(302) / `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) / `permanentRedirect`(308，永久 + 方法保持)。典型：302 到 `blob.url()` 预签名 URL（`scenarios.md` 场景 8） |
+| `json.stream` | `stream(opts?: { status?: number; contentType?: string }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 入参 string/ArrayBuffer/ArrayBufferView/TypedArray |
+| `json.sse` | `sse(opts?: { status?: number; contentType?: string }): StreamWriter` | **SSE 流**（v0.1.35）：等同 `json.stream` 但强制 `Content-Type: text/event-stream`，每次 `write` 的「数据」自动包成 `data: <内容>\n\n` 帧；`opts` 同 `json.stream` |
+
+> **流式 / SSE 响应（v0.1.35）**：`json.stream` / `json.sse` 返回 `StreamWriter`（`{ write(chunk), end() }`）。
+> 数据通道解耦于 isolate 生命周期——handler 退出后 isolate 归还池、但响应继续向客户端推送；
+> **不调用 `end()` 也会在 `read_capture` 阶段自动关流**（心跳任务经 `Notify` 退出）。
+> 限制：流式响应**绕过** `{code,msg,data}` 信封（直接写裸 body）；心跳保活间隔 15s（`:\n\n`）；
+> `opts` 仅支持 `status` / `contentType` 两字段，不支持额外 SSE 字段（如 `event:` / `id:` 需自行拼进 `write` 内容）。
 
 ```ts
 json.ok({ created: true });
@@ -650,6 +658,12 @@ json.header("X-Request-Id", "abc");
 // 重定向（v0.1.26）：不要再用 header+fail 拼——那是失败信封体，非标准形态。
 json.redirect.found(await blob.url(key)); // 302 到预签名 URL，浏览器两跳直取
 json.redirect.seeOther("/v1/api/order/list/"); // POST 提交后跳转：跟随后一律 GET
+
+// v0.1.35：流式 / SSE（绕过信封，直接写裸 body）
+const s = json.stream({ contentType: "text/csv" });
+s.write("a,b\n"); s.write("1,2\n"); s.end();          // 普通流式
+const e = json.sse();
+e.write("hello"); e.write("world");                    // 自动包成 data: hello\n\n / data: world\n\n
 ```
 
 ### http —— 请求上下文
@@ -1479,13 +1493,26 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 | `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
 | `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | 填充随机字节（v0.1.30） |
+| `crypto.aesGcmEncrypt` | `aesGcmEncrypt(plaintext: string, key: string): string` | AES-GCM 对称加密（v0.1.35）：明文 UTF-8，密钥 16/32 字节 hex 或 base64，返回 `base64(nonce ‖ ct ‖ tag)` |
+| `crypto.aesGcmDecrypt` | `aesGcmDecrypt(ciphertext: string, key: string): string` | AES-GCM 解密（v0.1.35）：输入 `aesGcmEncrypt` 的密文，返回原文；密钥/密文错抛错 |
 
 另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30；非法输入抛
 `InvalidCharacterError`），wasm 胶水常用。
 
+> **AES-GCM 应用层加解密（v0.1.35）**：`crypto.aesGcmEncrypt` / `aesGcmDecrypt` 为纯应用层
+> 对称加密——**密钥由调用方自行保管**（不进 config、不托管）。适合对落库前/传输前的字段做加密。
+> 密钥仅支持 **16 字节（AES-128）或 32 字节（AES-256）**的 hex / base64 编码；**不支持
+> AES-192**（上游 crate 未提供），传入 24 字节密钥会明确报错。nonce 由运行时随机生成（12 字节），
+> 与密文、GMAC tag（16 字节）一并 base64 拼接返回，解密方无需单独传 nonce。
+
 ```ts
 const sessionKey = "AUTH-SESSION:" + crypto.sha256Hex(refreshToken);   // 见第 8 章轮换
 const token = crypto.randomHex();                                      // 64 字符不透明串
+
+// v0.1.35：应用层 AES-GCM（密钥自行保管，例如从 env / KMS 注入，不进 config）
+const key = "2b7e151628aed2a6abf7158809cf4f3c";                        // 16 字节 hex
+const blob = crypto.aesGcmEncrypt(userId + ":" + ssn, key);           // 落库前加密
+const plain = crypto.aesGcmDecrypt(blob, key);                         // 取出时解密
 ```
 
 ### ext_boot.js —— 运行时补充全局对象
@@ -2474,6 +2501,7 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | release 下迁移账本落后（verify 门禁） | M004 拒启，报错附 `oj migrate` 命令 |
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
 | crontab.yaml 坏行（非 5 字段 cron + 路径 / 路径不存在） | fail-fast 退出，报错带 `:行号:`（v0.1.28） |
+| `server.cors.credentials: true` 且 `server.cors.origins` 为空 | `cors: credentials requires explicit origins (wildcard '*' is rejected by browsers)` 退出（v0.1.35；带凭据的 `*` 非法）。其余字段缺省回落安全值 |
 
 ## 11. 构建与发布
 

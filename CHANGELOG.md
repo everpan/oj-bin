@@ -16,6 +16,43 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.35
+
+> 版本分界：`oj/Cargo.toml` 0.1.34 → 0.1.35。上一版：`v0.1.34`。
+> 发布点标签：**未打标签**（本版本改动尚未打标签）。
+
+**新增：流式响应 / SSE（PR-1）、CORS（PR-3）、应用层 AES-GCM 加密（PR-10）**
+
+- **流式响应 / SSE（`json.stream` / `json.sse`，PR-1）**
+  - JS 侧通过 `json.stream(opts)` / `json.sse(opts)` 打开流式通道，返回 `{ write(chunk), end() }`。
+    `json.sse` 自动设置 `Content-Type: text/event-stream`，并把每次 `write` 的「数据」包成
+    `data: <内容>\n\n` 帧；`json.stream` 默认 `200`，可经 `opts.status` / `opts.contentType` 覆盖。
+  - 通道解耦于 isolate 生命周期：`run_with` 结束后 isolate 归还池，但数据通道仍由 `Capture`
+    持有并继续向客户端推送；handler 退出后由 `read_capture` 接管 rx 并关闭 tx。超时路径会丢弃
+    runtime 与 tx，客户端收到干净的流终止。
+  - 限制：流式响应**绕过** `{code,msg,data}` 信封（直接写裸 body）；心跳保活间隔 15s
+    （`:\n\n`）；`opts` 仅支持 `status` / `contentType` / `sse` 三个字段。
+
+- **CORS（`server.cors` 段，PR-3）**
+  - config 新增 `server.cors: Option<CorsCfg>`；**段存在即启用**，缺省（段缺失）则不挂 CORS 层
+    （与现行为完全一致，响应无 `Access-Control-*` 头）。
+  - 字段：`origins`（字符串列表）/ `methods` / `headers` / `expose`（暴露响应头）/
+    `credentials`（bool）/ `max_age`（秒，`Option`）。`origins` 为空时退化为 `AllowOrigin::any()`
+    （放行任意源）；非空时按列表精确匹配。
+  - **fail-fast**：`credentials: true` 且 `origins` 为空 → 启动报错（带凭据的 `*` 非法，浏览器
+    会拒）。其余字段缺省回落安全值（methods/headers 为空 → 反射请求的方法/头）。
+  - 预检（OPTIONS）由 `tower-http::cors::CorsLayer` 在路由前短路，业务 handler 不感知。
+
+- **应用层 AES-GCM 加密（`crypto.aesGcmEncrypt` / `crypto.aesGcmDecrypt`，PR-10）**
+  - `crypto.aesGcmEncrypt(plaintext, keyHexOrB64)` / `crypto.aesGcmDecrypt(ciphertext, key)`：
+    基于 `aes-gcm 0.10`，输出 `base64( nonce12 ‖ ciphertext ‖ tag16 )`（明文 UTF-8 入）。
+  - 密钥支持 16 字节（AES-128）或 32 字节（AES-256）的 hex / base64 编码；**不支持 AES-192**
+    （上游 crate 未 re-export），传入 24 字节密钥会返回明确错误。
+  - 应用层加解密，密钥由调用方自行保管（不进 config、不托管）——适合对落库/传输前的字段做对称加密。
+
+**向后兼容**：三项均为纯新增，未改 ABI（ABI_VERSION 仍为 9）、未动任何既有 op / 全局对象语义；
+既有 handler 与 config 无需改动。
+
 ## v0.1.34
 
 > 版本分界：`oj/Cargo.toml` 0.1.33 → 0.1.34。上一版：`v0.1.33`。

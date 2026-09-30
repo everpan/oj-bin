@@ -614,6 +614,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/bus",
@@ -769,6 +770,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(echo_route()),
         )
@@ -803,6 +805,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/js",
@@ -851,6 +854,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/bin",
@@ -941,6 +945,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/binbus",
@@ -996,6 +1001,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/gate",
@@ -1074,6 +1080,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/close",
@@ -1152,6 +1159,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(mirror_routes(
                 "/v1/api",
@@ -1220,6 +1228,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(mirror_routes(
                 "/v1/api",
@@ -1258,6 +1267,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/missing",
@@ -1438,6 +1448,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(mirror_routes(
                 "/v1/api",
@@ -1512,6 +1523,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/err",
@@ -1556,6 +1568,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/bye",
@@ -1594,6 +1607,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/nohooks",
@@ -1654,6 +1668,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/iso",
@@ -1721,6 +1736,7 @@ mod tests {
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
                 Arc::new(std::sync::RwLock::new(None)),
                 Arc::default(),
+                None,
             )
             .merge(js_route(
                 "/ws/order",

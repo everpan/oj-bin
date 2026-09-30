@@ -61,6 +61,7 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 notify = "8"
 futures = "0.3"
+bytes = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1"

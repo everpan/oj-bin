@@ -56,6 +56,7 @@ mod plugins_op;
 mod query;
 mod registry;
 mod runtime;
+mod stream;
 pub mod task_pool;
 pub mod transpile;
 mod vars;
@@ -251,6 +252,16 @@ pub struct ReqState {
     /// db.asSystem() 逃生口：本请求以系统身份绕过租户防护（reset 即失效；
     /// sql_guard 活跃时调用处记审计日志）。默认 false。
     pub system: bool,
+    /// 流式响应（v0.1.35）：`json.stream()`/`json.sse()` 开流时写入器 `tx` 与配对接收端 `rx`。
+    /// `rx` 在 `read_capture` 时移入 `Capture.stream`，与 isolate 生命周期解耦；isolate
+    /// 归还池不依赖流是否已写完（数据通道归 `Capture` 所有，由 server 排空）。
+    /// 用 `RefCell` 包裹以便 `read_capture` 在「OpState 已被共享借用」的帧池路径下仍可取走
+    /// （baseline 的 `read_capture` 走共享借用，帧池 worker 持有该借用跨调用）。
+    pub stream_tx: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<bytes::Bytes>>>,
+    pub stream_rx: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>>,
+    /// SSE 心跳停止信号（仅 `json.sse()` 开流时存在）；`op_stream_end`/`read_capture` 触发，
+    /// 让心跳任务（持有 `stream_tx` 克隆）干净退出并关闭流。
+    pub stream_heartbeat_stop: std::cell::RefCell<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 impl ReqState {
@@ -267,6 +278,9 @@ impl ReqState {
         self.ws_sess = None;
         self.module = None;
         self.system = false;
+        self.stream_tx.borrow_mut().take();
+        self.stream_rx.borrow_mut().take();
+        self.stream_heartbeat_stop.borrow_mut().take();
     }
 }
 
@@ -279,6 +293,9 @@ deno_core::extension!(
         json::op_json_header,
         json::op_json_raw,
         json::op_json_redirect,
+        stream::op_json_stream_open,
+        stream::op_stream_write,
+        stream::op_stream_end,
         http::op_http_info,
         http::op_http_file,
         http::op_http_body_bytes,
@@ -336,6 +353,8 @@ deno_core::extension!(
         crypto::op_sha256_hex,
         crypto::op_random_hex,
         crypto::op_crypto_random,
+        crypto::op_aes_gcm_encrypt,
+        crypto::op_aes_gcm_decrypt,
         ws::op_ws_frame_close,
         ws::op_ws_sess_set,
         ws::op_ws_join,
@@ -526,11 +545,16 @@ fn op_finish(state: &mut OpState) {
 }
 
 /// 响应捕获（json.ok/fail 写入，server 层读取后写回 HTTP 响应）。
-#[derive(Default, Clone, Debug)]
+///
+/// 流式响应（v0.1.35）：若 handler 调用 `json.stream()`/`json.sse()`，`stream` 为 Some，
+/// `server` 用 `axum::body::Body::from_stream` 写出，`body` 字段被忽略（流式路径绕过信封）。
+/// 非流式：走 `body`（与历史行为一致，所有存量调用点无需改动）。
+#[derive(Default, Debug)]
 pub struct Capture {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    pub stream: Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>,
 }
 
 /// Bridge：持有 runtime 池、handler 仓库，并执行 handler 脚本。
@@ -763,12 +787,26 @@ impl Bridge {
     /// 读取当前 runtime 的 per-request 响应捕获。
     fn read_capture(rt: &JsRuntime) -> Capture {
         let op_state = runtime::op_state(rt);
+        // 与 baseline 一致走「共享借用」：帧池 worker（frame_pool.rs）会持有 OpState 的共享
+        // 借用跨调用进入此处，故此处不得用 borrow_mut；流式字段用 ReqState 内的 RefCell 取走。
         let g = op_state.borrow();
         let rs = g.borrow::<ReqState>();
+        // 流式：移出接收端；丢弃写入端（或触发心跳停止）以在 handler 返回后关闭流。
+        // 若 handler 未显式 op_stream_end，此处丢弃 tx 同样关流；心跳任务经 Notify 退出。
+        let (tx, rx, stop) = (
+            rs.stream_tx.borrow_mut().take(),
+            rs.stream_rx.borrow_mut().take(),
+            rs.stream_heartbeat_stop.borrow_mut().take(),
+        );
+        if let Some(s) = stop {
+            s.notify_one();
+        }
+        drop(tx);
         Capture {
             status: rs.status,
             headers: rs.headers.clone(),
             body: rs.response.clone().unwrap_or_default(),
+            stream: rx,
         }
     }
 
