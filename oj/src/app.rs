@@ -1237,7 +1237,8 @@ impl App {
         // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
         // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
         if let Some(cors) = &cfg.server.cors
-            && cors.credentials && cors.origins.is_empty()
+            && cors.credentials
+            && cors.origins.is_empty()
         {
             return Err(
                 "server.cors: credentials=true 需要显式 origins（origins 为空 = 允许任意源，不可与 credentials 同用）"
