@@ -87,10 +87,8 @@ pub struct FixtureArgs {
     pub db: Option<String>,
 }
 
-/// `oj secret keygen [--bits N] [--out-dir D] [--force]`：生成密封密钥对。
+/// `oj secret keygen [--out-dir D] [--force]`：生成密封密钥对（X25519，唯一信封算法）。
 pub struct SecretKeygenArgs {
-    /// RSA 位数（最小 2048）。
-    pub bits: usize,
     /// 输出目录：`<dir>/secrets-private.pem` 与 `<dir>/secrets-public.pem`。
     pub out_dir: String,
     /// 覆盖已存在文件（默认拒绝，防误删在用私钥）。
@@ -324,11 +322,8 @@ enum Commands {
 /// `oj secret <sub>`。
 #[derive(Debug, Subcommand)]
 pub enum SecretCmd {
-    /// 生成密封密钥对（私钥留在部署机，公钥可随仓库走）
+    /// 生成密封密钥对（X25519；私钥留在部署机，公钥可随仓库走）
     Keygen {
-        /// RSA 位数（最小 2048；长期密钥建议 4096）
-        #[arg(long, default_value_t = 2048)]
-        bits: usize,
         /// 输出目录（落 secrets-private.pem / secrets-public.pem）
         #[arg(long, default_value = ".")]
         out_dir: String,
@@ -471,12 +466,10 @@ fn to_command(cli: Cli) -> Command {
         Commands::Secret {
             command:
                 SecretCmd::Keygen {
-                    bits,
                     out_dir,
                     force,
                 },
         } => Command::SecretKeygen(SecretKeygenArgs {
-            bits,
             out_dir,
             force,
         }),
@@ -650,23 +643,21 @@ mod tests {
 
     #[test]
     fn secret_subcommands_map_through() {
-        // keygen：--bits / --out-dir / --force。
+        // keygen：--out-dir / --force（无 --bits/--alg，X25519 是唯一信封算法）。
         let Command::SecretKeygen(a) = cmd(&[
             "secret",
             "keygen",
-            "--bits",
-            "4096",
             "--out-dir",
             "keys",
             "--force",
         ]) else {
             panic!()
         };
-        assert_eq!((a.bits, a.out_dir.as_str(), a.force), (4096, "keys", true));
+        assert_eq!((a.out_dir.as_str(), a.force), ("keys", true));
         let Command::SecretKeygen(a) = cmd(&["secret", "keygen"]) else {
             panic!()
         };
-        assert_eq!((a.bits, a.out_dir.as_str(), a.force), (2048, ".", false));
+        assert_eq!((a.out_dir.as_str(), a.force), (".", false));
         // seal/open：positional VALUE 可省（省则读 stdin），-k 与 -c 均可选。
         let Command::SecretSeal(a) = cmd(&["secret", "seal", "-k", "pub.pem", "hunter2"]) else {
             panic!()
@@ -689,9 +680,9 @@ mod tests {
         );
         let cli =
             |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
-        // 未知子命令 / 未知旗标仍由 clap 拒（--bits 只属于 keygen）。
+        // 未知子命令 / 未知旗标仍由 clap 拒（--bits 已随 v1 一并移除）。
         assert!(cli(&["secret", "nope"]).is_err());
-        assert!(cli(&["secret", "seal", "--bits", "1"]).is_err());
+        assert!(cli(&["secret", "keygen", "--bits", "1"]).is_err());
     }
 
     #[test]

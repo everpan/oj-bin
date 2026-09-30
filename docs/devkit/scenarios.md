@@ -1129,7 +1129,8 @@ smtp 密码、ldap `bind_pw`、`auth.jwt_secret`、`oidc` 的 client secret。
 ### ① 一次性：生成密钥对
 
 ```bash
-./bin/oj secret keygen --bits 4096 --out-dir keys
+# 信封只有一种：X25519 + AES-256-GCM，密文长度≈明文+62B（短密码也紧凑）
+./bin/oj secret keygen --out-dir keys
 # keys/secrets-private.pem（600，只放部署机）+ keys/secrets-public.pem（可进仓库）
 echo 'keys/secrets-private.pem' >> .gitignore   # 私钥绝不进仓库
 ```
@@ -1139,7 +1140,7 @@ echo 'keys/secrets-private.pem' >> .gitignore   # 私钥绝不进仓库
 ```bash
 # 走 stdin（推荐）：命令行参数会进 shell history 与 ps
 echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys/secrets-public.pem
-# → ENC[Ab3…]  （同一明文每次不同：OAEP 随机化）
+# → ENC[Ab3…]  （同一明文每次不同：X25519 临时公钥 + 随机 nonce 保证密文不可重放）
 ```
 
 ### ③ 写进 config
@@ -1173,7 +1174,8 @@ ldap:
 | 现象 | 原因 |
 |---|---|
 | 启动报 `config has ENC[...] sealed values but no decryption key` | 部署机没给私钥：`OJ_SECRET_KEY`（内联 PEM）/ `OJ_SECRET_KEY_FILE`（路径）/ `secrets.private_key_path` 三选一 |
-| `rsa open failed (wrong private key?)` | 私钥和加密用的公钥不是一对（换机器只拷了 config）；**不会**静默降级成把密文当明文 |
+| `aes-gcm open failed (wrong private key?)` | 私钥和加密用的公钥不是一对（换机器只拷了 config）；**不会**静默降级成把密文当明文 |
+| `sealed value is v1 (RSA) — v1 信封已移除` | 手头是旧版 RSA(v1) 密文，新版已不再支持；用 `oj secret seal` 以 X25519 重新加密（v1 无人使用，已整体移除以避免密钥配置歧义） |
 | 换了密钥对，老密文解不开 | 轮换须用**新公钥重封全部密文**——旧私钥解不了新密文，反之亦然 |
 | 想把私钥也塞进 config | 别：那等于把钥匙和锁放同一张纸。私钥留在部署机，config 只放**路径** |
 | 日志里看到 `mysql://***@127.0.0.1:3306/app` | 正常——错误与 warn 里的 DSN/URL 凭据段一律打 `***`（v0.1.33） |

@@ -763,8 +763,10 @@ impl Default for WsCfg {
 pub struct Config {
     pub server: ServerCfg,
     /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 仅 default 为 sqlite 时重放）。
+    #[serde(default)]
     pub db: HashMap<String, String>,
     /// name → redis URL（v0.1 warn 后用内存 KV）。
+    #[serde(default)]
     pub redis: HashMap<String, String>,
     pub tenant: TenantCfg,
     /// None = 不启用鉴权（内置 /auth/* 与 Bearer 守卫均不挂）。
@@ -790,6 +792,7 @@ pub struct Config {
     /// 严格模式，只装配列出的插件，沿用清单门禁）；值 = 插件 cfg，非空对象原样透传，
     /// 空对象跳过透传回落轴适配器。缺省/空 map = 扫描模式（加载 plugins_dir 全部）。
     /// 旧 list 写法 `plugins: [a, b]` 废弃（解析报错 fail-fast）。
+    #[serde(default)]
     pub plugins: HashMap<String, serde_json::Value>,
     /// 命名 MQ 实例（spec 2026-09-07 §3）：kafkas.default = { brokers, group } →
     /// Kafka("default")。值 JSON 透传给 mq 插件（kind 由装配层按段来源注入）。
@@ -979,7 +982,7 @@ mod tests {
     /// 解密后 `Config` 拿到的就是明文，下游（插件 cfg 透传 / DSN 拼接）零改动。
     #[test]
     fn sealed_values_are_decrypted_on_load() {
-        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let (priv_pem, pub_pem) = crate::secret::keygen().unwrap();
         let dir = std::env::temp_dir().join(format!("ojcfgseal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1011,7 +1014,7 @@ mod tests {
     /// 静默把密文当明文用（连上一个叫 "ENC[...]" 的密码）是不可接受的失败形态。
     #[test]
     fn sealed_value_without_private_key_fails_fast() {
-        let (_, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let (_, pub_pem) = crate::secret::keygen().unwrap();
         let dir = std::env::temp_dir().join(format!("ojcfgnoseal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1031,7 +1034,7 @@ mod tests {
     /// 数值字段会 `invalid type: string` —— 这是限制（不是 bug），写死在用例里。
     #[test]
     fn sealed_value_on_numeric_field_is_a_parse_error() {
-        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let (priv_pem, pub_pem) = crate::secret::keygen().unwrap();
         let dir = std::env::temp_dir().join(format!("ojcfgnum-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1055,7 +1058,7 @@ mod tests {
     /// "invalid type: integer" —— 故解密后回经文本再解析。
     #[test]
     fn sealed_path_keeps_scalar_to_string_coercion() {
-        let (priv_pem, pub_pem) = crate::secret::keygen(2048).unwrap();
+        let (priv_pem, pub_pem) = crate::secret::keygen().unwrap();
         let dir = std::env::temp_dir().join(format!("ojcfgcoerce-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

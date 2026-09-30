@@ -30,7 +30,7 @@ pub fn run_keygen(a: &SecretKeygenArgs) -> Result<(), String> {
             ));
         }
     }
-    let (priv_pem, pub_pem) = secret::keygen(a.bits)?;
+    let (priv_pem, pub_pem) = secret::keygen()?;
     write_pem(&priv_path, &priv_pem)?;
     write_pem(&pub_path, &pub_pem)?;
     println!("wrote {}", priv_path.display());
@@ -177,7 +177,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oj-sec-cmd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let a = SecretKeygenArgs {
-            bits: 2048,
             out_dir: dir.display().to_string(),
             force: false,
         };
@@ -206,7 +205,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         run_keygen(&SecretKeygenArgs {
-            bits: 2048,
             out_dir: dir.display().to_string(),
             force: false,
         })
@@ -243,6 +241,30 @@ mod tests {
             secret::open_pem(&key, a.value.as_ref().unwrap()).unwrap(),
             "hunter2"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// X25519 信封 keygen → seal → open 端到端：密文明显短于原 RSA v1 的 ~735 字符。
+    #[test]
+    fn keygen_seal_open_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("oj-sec-x25519-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run_keygen(&SecretKeygenArgs {
+            out_dir: dir.display().to_string(),
+            force: true,
+        })
+        .unwrap();
+        let token = secret::seal_pub(
+            &secret::load_public_key(&dir.join(PUBLIC_FILE)).unwrap(),
+            "hunter2",
+        )
+        .unwrap();
+        assert!(secret::is_sealed(&token));
+        // 固定开销 ~62B：8 字明文密文应远短于原 RSA v1 的 ~735 字符。
+        assert!(token.len() < 130, "token unexpectedly long: {token}");
+        let priv_pem = std::fs::read_to_string(dir.join(PRIVATE_FILE)).unwrap();
+        assert_eq!(secret::open(&priv_pem, &token).unwrap(), "hunter2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
