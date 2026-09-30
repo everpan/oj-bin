@@ -1,3 +1,7 @@
+secrets:
+  private_key_path: ./config/keys/secrets-private.pem   # 相对 config 目录；**只放部署机**
+  public_key_path:  ./config/keys/secrets-public.pem    # 可选，`oj secret seal` 缺省取它
+
 server:
   host: "localhost"
   port: 9778
@@ -84,6 +88,7 @@ ldap:  # LDAP 目录/鉴证（v0.1.28，需 oj-ldap 插件）：段存在即启�
   default:
     url: ldap://pradserver1.wiz.top:389                # 明文口（不安全；临时回退，待服务端启用 TLS）
     bind_dn: cn=newadmin,cn=Users,dc=wiz,dc=top        # 服务账号 DN（非密码）；密码由脚本参数传入
+    bind_pw: ENC[AgEVDf9F5Cg-fFawqpqSoM16mmzZf2a4kHdwTwO27kKvNwMXG5cTDWJFzImHc5a5-Q3SHuPKtAfh5DENWCVWpajPVyNwlVlrCqic7bQ]    # 服务账号密码环境变量名（运行时注入）
     timeout_ms: 5000
 
 smtp:   # 邮件投递（v0.1.19，需 oj-mail 插件）：段存在即启用 mail.* 全局

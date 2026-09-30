@@ -16,3 +16,4 @@ CODEBUDDY_cn.md
 
 dist/
 tmp/
+secrets-private.pem
