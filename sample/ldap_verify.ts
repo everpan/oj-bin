@@ -7,13 +7,15 @@
 //   4. 汇总并返回用户信息
 //
 // 运行（需先 `cargo xtask plugin ldap` 构建 oj-ldap，并 `cargo xtask bin` 构建 oj）：
-//   bin/oj exec sample/ldap_verify.ts -c sample/config.yaml -- <account> <password> <adminPassword>
+//   bin/oj exec sample/ldap_verify.ts -c sample/config.yaml -- <account> <password> [adminPassword]
 //
 // 说明：
 //   - 服务账号 DN 写在 sample/config.yaml 的 `ldap.default.bind_dn`（DN 非密码，可留配置）；
-//     服务账号**密码**走运行时参数 <adminPassword>，绝不落配置/源码。
-//   - search 通过 opts.bindPw 把密码作为本次查询的绑定凭据（与 config bind_dn 合并），
-//     与 PHP 先 bind(admin) 再 search 一致；whoami/compare 等仍用 config 服务账号。
+//     服务账号**密码**优先取 config 的 `ldap.default.bind_pw`；config 未配时再退到运行时参数
+//     <adminPassword>，不强制落配置/源码。
+//   - search 的 opts.bindPw 仅在不传 <adminPassword> 时省略，此时 oj-ldap 回落 config 的
+//     bind_pw（与 config bind_dn 合并），与 PHP 先 bind(admin) 再 search 一致；
+//     whoami/compare 等仍用 config 服务账号。
 //   - 用户密码鉴证走 `ldap.bind("wiz\\<account>", password)`，独立成连（ponytail 模型），
 //     返回 true/false；false 表示 LDAP 拒绝凭据（rc≠0，含 49 invalidCredentials）。
 //   - filter 中用户名经 esc() 转义（LDAP 版 SQL 注入防护；PHP 原样拼接，这里按文档建议补上）。
@@ -45,11 +47,11 @@ function attrOf(
 
 async function main(): Promise<void> {
   const account = args[0];
-  const password = args[1]; // 被鉴证的用户密码
-  const adminPw = args[2]; // 服务账号密码（运行时参数，不落配置）
-  if (!account || password === undefined || !adminPw) {
+  const password = args[1]; // 被鉴证用户的密码（必填）
+  const adminPw = args[2]; // 可选：服务账号 bindPw 密码；不传则采用 config 的 ldap.default.bind_pw
+  if (!account || password === undefined) {
     throw new Error(
-      "usage: oj exec sample/ldap_verify.ts -c sample/config.yaml -- <account> <password> <adminPassword>",
+      "usage: oj exec sample/ldap_verify.ts -c sample/config.yaml -- <account> <password> [adminPassword]",
     );
   }
 
@@ -65,8 +67,10 @@ async function main(): Promise<void> {
   console.log(`[ldap] filter=${filter}`);
 
   // —— 步骤 2：目录查询（scope 缺省 "sub" == PHP 默认的整棵子树）——
-  // 服务账号密码经 opts.bindPw 传入（与 config 的 bind_dn 合并），不落配置。
-  const entries = await ldap.search(base, { scope: "sub", filter, attrs, bindPw: adminPw });
+  // 不传 <adminPassword> 时省略 bindPw，oj-ldap 回落 config 的 bind_pw（与 bind_dn 合并），不落配置。
+  const searchOpts: Record<string, unknown> = { scope: "sub", filter, attrs };
+  if (adminPw !== undefined) searchOpts.bindPw = adminPw;
+  const entries = await ldap.search(base, searchOpts);
   if (entries.length === 0) {
     console.log(JSON.stringify({ login: false, reason: "user not found" }, null, 2));
     return;
@@ -74,7 +78,8 @@ async function main(): Promise<void> {
   if (entries.length > 1) {
     console.log(`[ldap] warn: ${entries.length} entries matched, use first`);
   }
-
+  console.log(`[ldap] found ${entries.length} entries, use first`);
+  console.log(`[ldap] entry `+JSON.stringify(entries[0], null, 2));
   const entry = entries[0];
   const info: Record<string, unknown> = {
     cn: attrOf(entry.attrs, "cn"), // 潘益伟
