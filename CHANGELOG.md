@@ -16,10 +16,33 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.34
 
-> 版本分界：待 `oj/Cargo.toml` 0.1.33 → 下一版本。上一版：`v0.1.33`。
-> 发布点标签：未打标签。
+> 版本分界：`oj/Cargo.toml` 0.1.33 → 0.1.34。上一版：`v0.1.33`。
+> 发布点标签：`v0.1.34`（已打标签）。
+
+**新增：资源根 key 多源选择（`--redis`/`--blob`/`--es`/`--broker`/`--kafka`/`--rabbit`）**
+
+- **动机**：原 `--db` 可切换测试/执行用的数据库；但 `redis`/`blob`/`es`/`broker`/`kafka`/`rabbit`
+  等其余资源根 key 仍只能固定用 config 里名为 `default` 的 profile。一份 config 不能同时声明多源、
+  再用同一套 CLI 选源——与「一份配置配多源资源、按需选源」的诉求冲突。
+- **行为**：`oj test` 与 `oj exec` 现支持与 `--db` 同形的 6 个新旗标，各自把 config 对应段里
+  的命名 profile 选为「默认源」（config 段缺省回退字面 `default`）：
+  - `redis` → `config.redis.<profile>`；`blob` → `config.blob.backends.<profile>`；
+    `es` → `config.es.<profile>`；`broker` → `config.broker.<profile>`；
+    `kafka` → `config.kafkas.<profile>`；`rabbit` → `config.rabbits.<profile>`。
+  - 选中的 profile 在装配期被别名为字面 `"default"`：JS 侧 `redis()`/`blob()`/`es()`/`bus()`/
+    `kafka("default")`/`rabbit("default")` 等无需改代码即指向选中源。
+  - 给定 profile 在 config 段中不存在 → **fail-fast**（提示可用 profile 列表），不静默回落
+    `default`（避免误用开发库/错误后端）。
+- **向后兼容**：`es`/`broker` 配置段由「单对象 `Option`」放宽为「命名 map，兼容单对象写法」——
+  旧的单对象 config（`es: { endpoint: ... }`）经反序列化辅助自动包成 `{ default: ... }`，
+  既有配置无需改动；多源则写 `es: { default: ..., other: ... }`。`db`/`redis`/`blob`/`kafka`/
+  `rabbit` 段本就是命名 map，语义不变。
+- **`--db` 语义保持**：`db` 仍走请求期「字面 default 重定向」（带 `DB("name")` 显式调用不受影响），
+  其余轴在装配期把选中 profile 烘焙为 default 别名；`oj test` 的 `--db` 缺省仍回落 `config.db.test`。
+- **文档**：`docs/devkit/` 四件 + `docs/modules/02-config.md` + `docs/user-manual.md` 同步多源
+  配置示例与新旗标；本 CHANGELOG 本节同步。
 
 **变更：secrets 信封移除 RSA（v1），仅保留 X25519 信封**
 

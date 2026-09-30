@@ -14,7 +14,7 @@
 //!   见设计文档 §3/§4 的零改 fetch 方案），业务代码无需感知传输差异。
 //! - **dev（debug）构建自动弹出 WebKit DevTools**（real devtool），便于桌面端调试前端。
 
-use oj::app::App;
+use oj::app::{App, ResourceProfiles};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::Manager;
@@ -108,7 +108,7 @@ pub fn run() {
             // 注意：此处的 `oj_app` 不能与闭包入参的 Tauri `app` 重名，否则 `app.manage`
             // 会误调到 oj 的 App（无该方法）。
             let oj_app = tauri::async_runtime::block_on(async {
-                App::from_config(cfg, &config_dir, api_dir, base, ts, false, None).await
+                App::from_config(cfg, &config_dir, api_dir, base, ts, false, &ResourceProfiles::default()).await
             })
             .map_err(boxerr)?;
 

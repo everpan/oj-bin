@@ -223,8 +223,13 @@ impl BlobRegistry {
     pub fn register(&mut self, name: &str, b: Arc<dyn BlobBackend>) -> BridgeResult<()> {
         self.inner.register(name, b)
     }
+    /// 设置默认别名：字面 `blob("default")` 解析到 `name`（CLI `--blob` 选源）。
+    /// `name` 不存在 → fail-fast。
+    pub fn set_default_alias(&mut self, name: &str) -> BridgeResult<()> {
+        self.inner.set_default_alias(name)
+    }
     pub fn default(&self) -> Option<Arc<dyn BlobBackend>> {
-        self.inner.get("default")
+        self.inner.default()
     }
     pub fn get(&self, name: &str) -> Option<Arc<dyn BlobBackend>> {
         self.inner.get(name)
@@ -242,16 +247,19 @@ pub fn registry_with_default(b: Arc<dyn BlobBackend>) -> Arc<BlobRegistry> {
     Arc::new(r)
 }
 
-/// 按名取后端（spec §2）：default 缺失保留旧文案；其余名字缺失报「blob backend '<name>'
-/// not configured」（首次调用期报错——配置声明但装配失败在启动期已被 assemble_blobs 拦住）。
+/// 按名取后端（spec §2）：default 经别名解析（CLI `--blob` 选源）；default 缺失保留旧文案；
+/// 其余名字缺失报「blob backend '<name>' not configured」。
 fn backend_named(state: &OpState, name: &str) -> Result<Arc<dyn BlobBackend>, JsErrorBox> {
     let reg = &state.borrow::<Arc<StableState>>().blobs;
+    if name == "default" {
+        return reg.default().ok_or_else(|| {
+            JsErrorBox::generic("blob not configured (config blob: section missing)".to_string())
+        });
+    }
     reg.get(name).ok_or_else(|| {
-        JsErrorBox::generic(if name == "default" {
-            "blob not configured (config blob: section missing)".to_string()
-        } else {
-            format!("blob backend '{name}' not configured (config blob.backends.{name} missing)")
-        })
+        JsErrorBox::generic(format!(
+            "blob backend '{name}' not configured (config blob.backends.{name} missing)"
+        ))
     })
 }
 

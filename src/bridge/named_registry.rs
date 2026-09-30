@@ -9,6 +9,9 @@ use super::BridgeResult;
 pub struct NamedRegistry<T: ?Sized> {
     items: HashMap<String, Arc<T>>,
     order: Vec<String>, // 注册顺序，自省展示用
+    /// 默认别名：字面 "default" 解析到此名（CLI `--<key>` 选定某命名 profile 作默认源）。
+    /// None → 字面 "default" 仍按同名查找（向后兼容既有 `backends.default` 写法）。
+    default_alias: Option<String>,
 }
 
 impl<T: ?Sized> Default for NamedRegistry<T> {
@@ -22,6 +25,7 @@ impl<T: ?Sized> NamedRegistry<T> {
         Self {
             items: HashMap::new(),
             order: Vec::new(),
+            default_alias: None,
         }
     }
     /// 重名 → Err（插件 vs 插件、插件 vs 内置均不允许覆盖，spec §2 注册冲突语义）。
@@ -38,6 +42,25 @@ impl<T: ?Sized> NamedRegistry<T> {
     }
     pub fn contains(&self, name: &str) -> bool {
         self.items.contains_key(name)
+    }
+    /// 设置默认别名：字面 "default" 解析到 `name`。`name` 不存在 → fail-fast（列出已注册名）。
+    /// 与 `--<key> profile` 语义对齐——选错 profile 直接报错，不静默回落 default。
+    pub fn set_default_alias(&mut self, name: &str) -> BridgeResult<()> {
+        if !self.items.contains_key(name) {
+            let mut names: Vec<&str> = self.names().collect();
+            names.sort_unstable();
+            return Err(format!("profile '{name}' not declared (available: {names:?})").into());
+        }
+        self.default_alias = Some(name.to_string());
+        Ok(())
+    }
+    /// 字面 "default" 实际解析的 profile 名（别名或 "default"）。mq 等按名查找前先用它换算。
+    pub fn default_name(&self) -> &str {
+        self.default_alias.as_deref().unwrap_or("default")
+    }
+    /// 解析默认 profile 的实例：别名指向的 profile，或名为 "default" 的 profile。
+    pub fn default(&self) -> Option<Arc<T>> {
+        self.get(self.default_name())
     }
     /// 按注册顺序遍历名字（op_plugins 自省用）。
     pub fn names(&self) -> impl Iterator<Item = &str> {
@@ -73,5 +96,23 @@ mod tests {
         let e = r.register("x", Arc::new(2)).unwrap_err();
         assert!(e.to_string().contains("duplicate name 'x'"));
         assert_eq!(*r.get("x").unwrap(), 1); // 未被覆盖
+    }
+
+    #[test]
+    fn default_alias_redirects_literal_default() {
+        let mut r: NamedRegistry<i32> = NamedRegistry::new();
+        r.register("a", Arc::new(1)).unwrap();
+        r.register("b", Arc::new(2)).unwrap();
+        // 无别名时，字面 "default" 按同名查找（缺失）。
+        assert!(r.default().is_none());
+        assert_eq!(r.default_name(), "default");
+        // 别名 "default" → b。
+        r.set_default_alias("b").unwrap();
+        assert_eq!(r.default_name(), "b");
+        assert_eq!(*r.default().unwrap(), 2);
+        // 别名指向不存在的 profile → fail-fast。
+        let mut r2: NamedRegistry<i32> = NamedRegistry::new();
+        r2.register("a", Arc::new(1)).unwrap();
+        assert!(r2.set_default_alias("missing").is_err());
     }
 }

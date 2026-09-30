@@ -15,7 +15,7 @@ use only_js::bridge::plugin_loader::{
 use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo};
 use only_js::config::{self, Config, StaticSiteConf};
 
-use crate::app::App;
+use crate::app::{App, ResourceProfiles};
 use crate::args::ServeArgs;
 
 pub async fn run(a: ServeArgs) -> Result<(), String> {
@@ -75,8 +75,16 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
-    let mut app =
-        App::from_config(cfg, &config_dir, dir.clone(), base.clone(), ts, false, None).await?;
+    let mut app = App::from_config(
+        cfg,
+        &config_dir,
+        dir.clone(),
+        base.clone(),
+        ts,
+        false,
+        &ResourceProfiles::default(),
+    )
+    .await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
@@ -412,7 +420,16 @@ pub async fn start(
     ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
-    let app = App::from_config(cfg, config_dir, dir, base, ts, false, None).await?;
+    let app = App::from_config(
+        cfg,
+        config_dir,
+        dir,
+        base,
+        ts,
+        false,
+        &ResourceProfiles::default(),
+    )
+    .await?;
     app.serve(addr).await
 }
 
@@ -442,6 +459,7 @@ pub async fn assemble_blobs(
     config_dir: &Path,
     base: &str,
     blob_vt: Option<&'static oj_plugin_ffi::BlobBackendVtable>,
+    blob_profile: Option<&str>,
 ) -> Result<Arc<only_js::bridge::blob::BlobRegistry>, String> {
     let mut r = only_js::bridge::blob::BlobRegistry::new();
     for (name, c) in section.entries()? {
@@ -477,6 +495,21 @@ pub async fn assemble_blobs(
         r.register(&name, backend)
             .map_err(|e| format!("blob '{name}': {e}"))?;
     }
+
+    // CLI `--blob <profile>`：将指定命名 profile 设为字面 "default" 的解析目标。
+    // 仅当注册表非空（已声明 blob 后端）且 profile 存在时生效；选错直接 fail-fast。
+    if let Some(p) = blob_profile {
+        if !r.names().is_empty() {
+            if r.get(p).is_none() {
+                return Err(format!(
+                    "blob profile '{p}' not declared (available: {:?})",
+                    r.names()
+                ));
+            }
+            r.set_default_alias(p).map_err(|e| format!("blob: {e}"))?;
+        }
+    }
+
     Ok(Arc::new(r))
 }
 
@@ -593,17 +626,35 @@ pub(crate) fn check_mail_cfg_sources(cfg: &Config) -> Result<(), String> {
 /// `pub(crate)`：`app::build_mail_backend` 复用同一份产物（单一真相源）。
 ///
 /// 两条 mail 来源同时非空是**配置错误**：见 [`check_mail_cfg_sources`]（装配期 fail-fast）。
-pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
+/// `es_profile`：CLI `--es <profile>` 选定的 profile（None → 默认 `default`）。仅 "es" 分支使用，
+/// 用于从命名 map `cfg.es` 挑 endpoint 发给插件 init；给定 profile 不存在 → 返回错误串（调用方 fail-fast）。
+pub(crate) fn plugin_cfg(
+    cfg: &Config,
+    name: &str,
+    es_profile: Option<&str>,
+) -> Result<String, String> {
     if let Some(v) = cfg.plugins.get(name)
         && v.as_object().is_some_and(|o| !o.is_empty())
     {
-        return v.to_string();
+        return Ok(v.to_string());
     }
     match name {
-        "es" => match &cfg.es {
-            Some(es) => serde_json::json!({ "endpoint": es.endpoint }).to_string(),
-            None => "{}".to_string(),
-        },
+        "es" => {
+            let key = es_profile.unwrap_or("default");
+            match cfg.es.get(key) {
+                Some(es) => Ok(serde_json::json!({ "endpoint": es.endpoint }).to_string()),
+                None => {
+                    if es_profile.is_some() {
+                        let mut keys: Vec<&str> = cfg.es.keys().map(|s| s.as_str()).collect();
+                        keys.sort_unstable();
+                        return Err(format!(
+                            "--es profile '{key}' not declared (available es profiles: {keys:?})"
+                        ));
+                    }
+                    Ok("{}".to_string())
+                }
+            }
+        }
         "auth" => match &cfg.auth {
             Some(a) => {
                 let mut v = serde_json::json!({
@@ -616,23 +667,23 @@ pub(crate) fn plugin_cfg(cfg: &Config, name: &str) -> String {
                 if let Some(c) = &a.cookie {
                     v["cookie"] = c.clone();
                 }
-                v.to_string()
+                Ok(v.to_string())
             }
-            None => "{}".to_string(),
+            None => Ok("{}".to_string()),
         },
         // mail（spec 2026-09-15）：顶层 `smtp:` 段 → oj-mail 插件 cfg。
         // 段缺省/空 → "{}"（插件零 profile；装配层视作未配置，不挂 mail 后端）。
         "mail" => match &cfg.smtp {
-            Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "{}".to_string()),
-            None => "{}".to_string(),
+            Some(s) => Ok(serde_json::to_string(s).unwrap_or_else(|_| "{}".to_string())),
+            None => Ok("{}".to_string()),
         },
         // ldap：顶层 `ldap:` 段（不透明 map）→ oj-ldap 插件 cfg。
         // 段缺省/空 → "{}"（插件零实例；装配层视作未配置，不挂 ldap 后端）。
         "ldap" => match &cfg.ldap {
-            Some(l) => serde_json::to_string(l).unwrap_or_else(|_| "{}".to_string()),
-            None => "{}".to_string(),
+            Some(l) => Ok(serde_json::to_string(l).unwrap_or_else(|_| "{}".to_string())),
+            None => Ok("{}".to_string()),
         },
-        _ => "{}".to_string(),
+        _ => Ok("{}".to_string()),
     }
 }
 
@@ -649,7 +700,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         .iter()
         .filter(|p| p.registrations.es.is_some())
         .collect();
-    if cfg.es.is_some() && es_plugins.is_empty() {
+    if !cfg.es.is_empty() && es_plugins.is_empty() {
         return Err(
             "config declares [es] but no es plugin loaded (run `cargo xtask plugin es`)"
                 .to_string(),
@@ -759,15 +810,29 @@ pub async fn assemble_plugins(
     cfg: &Config,
     config_dir: &Path,
     registries: &mut Registries,
+    es_profile: Option<&str>,
 ) -> Result<Vec<PluginInfo>, String> {
     // A5：mail 双配置源（`smtp:` 与 `plugins.mail` 皆非空）是配置错误 → 装配期 fail-fast
     // （`plugin_cfg` 会让非空 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」）。
     check_mail_cfg_sources(cfg)?;
     check_ldap_cfg_sources(cfg)?;
+    // es profile 预校验：给定了 `--es` 但 `cfg.es` 无此 profile → fail-fast（列出可用 profile）。
+    if let Some(p) = es_profile {
+        if !cfg.es.contains_key(p) {
+            let mut keys: Vec<&str> = cfg.es.keys().map(|s| s.as_str()).collect();
+            keys.sort_unstable();
+            return Err(format!(
+                "--es profile '{p}' not declared (available es profiles: {keys:?})"
+            ));
+        }
+    }
     let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();
-    let cfg_for = |name: &str| -> String { plugin_cfg(cfg, name) };
+    // es_profile 已预校验存在，其余分支不返回 Err，故可安全解包。
+    let cfg_for = |name: &str| -> String {
+        plugin_cfg(cfg, name, es_profile).unwrap_or_else(|e| panic!("plugin_cfg: {e}"))
+    };
     let loaded = match dir {
         Some(dir) if !cfg.plugins.is_empty() => {
             // 严格模式（spec「plugins: 统一语义」）：map 键即清单——只装配列出的插件；
@@ -957,7 +1022,8 @@ mod tests {
             "auth".into(),
             serde_json::json!({ "jwt_secret": "override", "extra_field": 42 }),
         );
-        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg, "auth")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg, "auth", None).unwrap()).unwrap();
         assert_eq!(v["jwt_secret"], "override");
         assert_eq!(v["extra_field"], 42);
         assert_eq!(v.as_object().map(|o| o.len()), Some(2));
@@ -966,13 +1032,57 @@ mod tests {
             auth: Some(serde_yaml::from_str(auth_yaml).unwrap()),
             ..Default::default()
         };
-        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg2, "auth", None).unwrap()).unwrap();
         assert_eq!(v["jwt_secret"], "s");
-        assert_eq!(plugin_cfg(&cfg2, "vendor-thing"), "{}");
+        assert_eq!(
+            plugin_cfg(&cfg2, "vendor-thing", None),
+            Ok("{}".to_string())
+        );
         // 3) 空对象：跳过透传 → 仍轴适配器
         cfg2.plugins.insert("auth".into(), serde_json::json!({}));
-        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg2, "auth")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg2, "auth", None).unwrap()).unwrap();
         assert_eq!(v["jwt_secret"], "s");
+    }
+
+    /// `es` 段多源选择（v0.1.34）：`--es <profile>` 解析对应命名 profile；未声明即 fail-fast。
+    #[test]
+    fn plugin_cfg_es_profile_selection() {
+        let cfg = Config {
+            es: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    config::EsCfg {
+                        endpoint: "http://es-default:9200".into(),
+                    },
+                );
+                m.insert(
+                    "archive".into(),
+                    config::EsCfg {
+                        endpoint: "http://es-archive:9200".into(),
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        // 缺省（None）→ 取 default profile。
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg, "es", None).unwrap()).unwrap();
+        assert_eq!(v["endpoint"], "http://es-default:9200");
+        // 显式选中 archive profile。
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg, "es", Some("archive")).unwrap()).unwrap();
+        assert_eq!(v["endpoint"], "http://es-archive:9200");
+        // 未声明的 profile → fail-fast，且不静默回落 default。
+        let e = plugin_cfg(&cfg, "es", Some("missing"));
+        assert!(e.is_err(), "missing es profile must fail-fast, got {e:?}");
+        assert!(
+            e.unwrap_err().contains("not declared"),
+            "error should name the missing profile"
+        );
     }
 
     /// mail 轴 cfg 走**适配器臂**（顶层 `smtp:` 段序列化），**不**要求用户用
@@ -982,7 +1092,7 @@ mod tests {
     fn plugin_cfg_mail_serializes_top_level_smtp_section() {
         // 段缺省 → 空 cfg（插件 init 得到零 profile；宿主不挂后端）。
         let mut cfg = Config::default();
-        assert_eq!(plugin_cfg(&cfg, "mail"), "{}");
+        assert_eq!(plugin_cfg(&cfg, "mail", None), Ok("{}".to_string()));
         // 顶层 smtp: 段 → 插件 cfg（并发参数 + 每 profile 一个键 + 凭据 + 白名单）。
         cfg.smtp = Some(
             serde_yaml::from_str(
@@ -993,7 +1103,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let raw = plugin_cfg(&cfg, "mail");
+        let raw = plugin_cfg(&cfg, "mail", None).unwrap();
         assert_ne!(raw, "{}");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["workers"], 2);
@@ -1010,7 +1120,8 @@ mod tests {
             "mail".into(),
             serde_json::json!({ "mock": { "host": "override" } }),
         );
-        let v: serde_json::Value = serde_json::from_str(&plugin_cfg(&cfg, "mail")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&plugin_cfg(&cfg, "mail", None).unwrap()).unwrap();
         assert_eq!(v["mock"]["host"], "override");
         assert!(v.get("workers").is_none(), "{v}");
     }
@@ -1355,7 +1466,7 @@ mod tests {
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api", None)
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None, None)
             .await
             .unwrap();
         r.default().unwrap().put("k", b"DEF", None).await.unwrap();
@@ -1366,13 +1477,50 @@ mod tests {
         }
     }
 
+    /// `--blob <profile>`（v0.1.34）：把命名 profile 烘焙为字面 "default" 的解析目标。
+    #[tokio::test]
+    async fn assemble_blobs_profile_selects_default_alias() {
+        let t = tmpdir("sc-blob-alias");
+        let section: config::BlobSection =
+            serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
+                .unwrap();
+        // 选中 img → 字面 default 现在指向 img 后端。
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None, Some("img"))
+            .await
+            .unwrap();
+        r.default().unwrap().put("k", b"IMG", None).await.unwrap();
+        match r.default().unwrap().serve("k").await.unwrap() {
+            only_js::bridge::BlobServed::Bytes(bytes, _) => assert_eq!(bytes, b"IMG"),
+            _ => panic!("default must now resolve to the img backend"),
+        }
+        // 同时 img 仍以原名可取。
+        assert!(r.get("img").is_some());
+    }
+
+    /// `--blob <missing>`（v0.1.34）：选错 profile 直接 fail-fast，不静默回落 default。
+    #[tokio::test]
+    async fn assemble_blobs_missing_profile_fails_fast() {
+        let t = tmpdir("sc-blob-miss");
+        let section: config::BlobSection =
+            serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
+                .unwrap();
+        let e = assemble_blobs(&section, &t.0, "/v1/api", None, Some("ghost"))
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("blob profile 'ghost' not declared"),
+            "expected fail-fast on missing profile, got: {e}"
+        );
+    }
+
     #[tokio::test]
     async fn assemble_blobs_multi_local_and_unknown_driver() {
         let t = tmpdir("sc-blob");
         let section: config::BlobSection =
             serde_yaml::from_str("backends:\n  default:\n    driver: local\n    root: a\n  img:\n    driver: local\n    root: b\n")
                 .unwrap();
-        let r = assemble_blobs(&section, &t.0, "/v1/api", None)
+        let r = assemble_blobs(&section, &t.0, "/v1/api", None, None)
             .await
             .unwrap();
         assert!(r.default().is_some() && r.get("img").is_some());
@@ -1381,7 +1529,7 @@ mod tests {
         // 未知 driver：错误带后端名
         let bad: config::BlobSection =
             serde_yaml::from_str("backends:\n  x:\n    driver: ghost\n").unwrap();
-        let e = assemble_blobs(&bad, &t.0, "/v1/api", None)
+        let e = assemble_blobs(&bad, &t.0, "/v1/api", None, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1396,7 +1544,7 @@ mod tests {
             "backends:\n  default:\n    driver: s3\n    bucket: b\n    region: r\n",
         )
         .unwrap();
-        let e = assemble_blobs(&section, &t.0, "/v1/api", None)
+        let e = assemble_blobs(&section, &t.0, "/v1/api", None, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1823,10 +1971,15 @@ mod tests {
     }
 
     fn es_cfg(endpoint: &str) -> Config {
-        Config {
-            es: Some(config::EsCfg {
+        let mut es = std::collections::HashMap::new();
+        es.insert(
+            "default".to_string(),
+            config::EsCfg {
                 endpoint: endpoint.to_string(),
-            }),
+            },
+        );
+        Config {
+            es,
             ..Default::default()
         }
     }
@@ -1842,7 +1995,7 @@ mod tests {
         };
         cfg.plugins.insert("ghost".into(), serde_json::json!({}));
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
+        let e = assemble_plugins(&cfg, &t.0, &mut r, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1859,7 +2012,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert!(plugins.is_empty());
         assert!(r.es.is_none());
     }
@@ -1876,7 +2029,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
+        let e = assemble_plugins(&cfg, &t.0, &mut r, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1891,7 +2044,7 @@ mod tests {
         let mut cfg = es_cfg("http://127.0.0.1:1");
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
+        let e = assemble_plugins(&cfg, &t.0, &mut r, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1908,7 +2061,7 @@ mod tests {
         let mut cfg = es_cfg("http://127.0.0.1:1");
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -1927,7 +2080,7 @@ mod tests {
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins.insert("es".into(), serde_json::json!({}));
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -1939,7 +2092,7 @@ mod tests {
         };
         cfg.plugins.insert("ghost".into(), serde_json::json!({}));
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
+        let e = assemble_plugins(&cfg, &t.0, &mut r, None)
             .await
             .err()
             .unwrap_or_default();
@@ -1950,7 +2103,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
     }
@@ -1970,7 +2123,7 @@ mod tests {
         cfg.plugins
             .insert("auth".into(), serde_json::json!({"jwt_secret": "x"}));
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["auth", "es"]);
     }
@@ -2013,7 +2166,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "db-mysql");
         let names = r.dbs.backend_names();
@@ -2042,7 +2195,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         let mut m = std::collections::HashMap::new();
         m.insert(
             "mydb".to_string(),
@@ -2094,7 +2247,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "blob-s3");
         assert!(r.blob.is_some(), "blob vtable slot not registered");
@@ -2173,7 +2326,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "bus-kafka");
         let kinds = r.bus.kinds();
@@ -2195,7 +2348,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         let broker_cfg = only_js::config::BrokerCfg {
             kind: "kafka".into(),
             ..Default::default()
@@ -2252,7 +2405,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "kv-redis");
         assert!(r.kv.is_some(), "kv vtable slot not registered");
@@ -2274,7 +2427,7 @@ mod tests {
         cfg.redis
             .insert("default".into(), "redis://127.0.0.1:1/".into());
         let mut r = Registries::default();
-        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert!(r.kv.is_none());
         let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
             .await
@@ -2319,7 +2472,7 @@ mod tests {
         };
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"x\"\n").unwrap());
         let mut r = Registries::default();
-        let e = assemble_plugins(&cfg, &t.0, &mut r)
+        let e = assemble_plugins(&cfg, &t.0, &mut r, None)
             .await
             .err()
             .unwrap_or_default();
@@ -2344,7 +2497,7 @@ mod tests {
                 .unwrap(),
         );
         let mut r = Registries::default();
-        assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         let vt = r
             .auth
             .expect("auth vtable slot must be wired from the plugin");
@@ -2417,7 +2570,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         let broker_cfg = only_js::config::BrokerCfg {
             kind: "kafka".into(),
@@ -2481,7 +2634,7 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &t.0, &mut r).await.unwrap();
+        let plugins = assemble_plugins(&cfg, &t.0, &mut r, None).await.unwrap();
         assert_eq!(plugins.len(), 1);
         let broker_cfg = only_js::config::BrokerCfg {
             kind: "rabbitmq".into(),

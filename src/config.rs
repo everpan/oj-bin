@@ -22,6 +22,44 @@ where
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
+/// 单对象或命名 map 兼容反序列化：旧写法（`es: { endpoint }` / `broker: { kind: kafka }`）
+/// 自动包成 `{ default: {...} }`；新写法（`es: { default: {...}, other: {...} }`）原样保留；
+/// 键缺失或显式 null → 空 map。用于把单例段平滑升级为命名多源 map（CLI `--es`/`--broker` 选源）。
+fn single_or_named_map<'de, D, T>(d: D) -> Result<HashMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMap<T> {
+        Single(T),
+        Map(HashMap<String, T>),
+    }
+    let opt = Option::<OneOrMap<T>>::deserialize(d)?;
+    Ok(match opt {
+        None => HashMap::new(),
+        Some(OneOrMap::Single(s)) => HashMap::from([("default".to_string(), s)]),
+        Some(OneOrMap::Map(m)) => m,
+    })
+}
+
+/// `es:` 段：单对象 → `{ default }`，命名 map 原样，缺失/null → 空。
+fn es_or_default_map<'de, D>(d: D) -> Result<HashMap<String, EsCfg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    single_or_named_map(d)
+}
+
+/// `broker:` 段：单对象 → `{ default }`，命名 map 原样，缺失/null → 空。
+fn broker_or_default_map<'de, D>(d: D) -> Result<HashMap<String, BrokerCfg>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    single_or_named_map(d)
+}
+
 /// 多静态站点条目（v0.1.27，`server.static_sites`）：前缀→目录映射。
 /// `prefix` 规范化见 server_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
 /// `path` 相对 config 目录（CLI `--app-path prefix=dir` 给出的已按 CWD 预绝对化）。
@@ -301,7 +339,7 @@ pub struct EsCfg {
 ///   `topic_prefix`（物理 topic 前缀，可选）。
 /// - rabbitmq：`url`（amqp URL，或取 `brokers[0]`）、`topic_prefix`（交换名，默认 "oj-bus"）。
 // Serialize：装配层经 cfg JSON 透传给 bus 插件（Task 4.3，spec §3 按值传入）。
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default)]
 pub struct BrokerCfg {
     pub kind: String,
@@ -801,9 +839,15 @@ pub struct Config {
     /// 归 `LdapConfig::from_value` 独家裁决，未知键装配期 fail-fast（不静默丢弃）。
     pub ldap: Option<serde_yaml::Value>,
     /// None = 不启用 ES（es.* op 报 "es not configured"）。
-    pub es: Option<EsCfg>,
+    /// 命名多源 map：键 = profile 名，CLI `--es <profile>` 选哪个作默认（默认 default）。
+    /// 旧单对象写法 `es: { endpoint }` 兼容自动包成 `{ default: {...} }`。
+    #[serde(default, deserialize_with = "es_or_default_map")]
+    pub es: HashMap<String, EsCfg>,
     /// None = 不启用分布式 broker（事件总线退化为进程内 Bus）。
-    pub broker: Option<BrokerCfg>,
+    /// 命名多源 map：键 = profile 名，CLI `--broker <profile>` 选哪个作默认（默认 default）。
+    /// 旧单对象写法 `broker: { kind: kafka }` 兼容自动包成 `{ default: {...} }`。
+    #[serde(default, deserialize_with = "broker_or_default_map")]
+    pub broker: HashMap<String, BrokerCfg>,
     /// 插件声明（spec「plugins: 统一语义」一段三用）：键 = 要加载的插件名（非空即
     /// 严格模式，只装配列出的插件，沿用清单门禁）；值 = 插件 cfg，非空对象原样透传，
     /// 空对象跳过透传回落轴适配器。缺省/空 map = 扫描模式（加载 plugins_dir 全部）。
@@ -1128,7 +1172,7 @@ mod tests {
                 "rabbits:\n",
                 "vars:\n",
                 "secrets:\n", // 段空键 → SecretsCfg 默认值
-                "tasks:\n",  // 段空键 → TasksCfg 默认值
+                "tasks:\n",   // 段空键 → TasksCfg 默认值
                 "auth:\n  jwt_secret: s\n",
             ),
         )
@@ -1481,10 +1525,10 @@ mod tests {
 
     #[test]
     fn es_cfg_defaults_and_parse() {
-        // 未配置 → None（es.* 报 "es not configured"）
+        // 未配置 → 空 map（es.* 报 "es not configured"）
         let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
-        assert!(c.es.is_none());
-        // es: 段存在 → Some(endpoint)；endpoint 原样保留（尾斜杠由 EsClient.url_for 剪除）
+        assert!(c.es.is_empty());
+        // 旧单对象写法 `es: { endpoint }` → 兼容包成 { default: { endpoint } }
         let dir = std::env::temp_dir().join(format!("ojcfge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1493,8 +1537,34 @@ mod tests {
         )
         .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
-        let e = c.es.expect("some");
+        let e = c.es.get("default").expect("default profile");
         assert_eq!(e.endpoint, "http://127.0.0.1:9200/");
+        // 命名多源 map 原样保留
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "es:\n  default: { endpoint: http://a:9200 }\n  analytics: { endpoint: http://b:9200 }\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.es.get("default").unwrap().endpoint, "http://a:9200");
+        assert_eq!(c.es.get("analytics").unwrap().endpoint, "http://b:9200");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn es_cfg_null_and_scalar_rejected() {
+        // 显式 null → 空 map（与缺失等价，向后兼容「写了 es: 但没填值」）。
+        let dir = std::env::temp_dir().join(format!("ojcfgn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cfg.yaml"), "es:\n  null\n").unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert!(c.es.is_empty(), "es: null must parse to empty map");
+        // 标量（非对象） → 反序列化失败（不静默吞）。
+        std::fs::write(dir.join("cfg.yaml"), "es: \"a-string\"\n").unwrap();
+        assert!(
+            load_from(&dir, Some("cfg.yaml")).is_err(),
+            "es as scalar must be rejected"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1799,10 +1869,10 @@ mod tests {
 
     #[test]
     fn broker_cfg_defaults_and_parse() {
-        // 未配置 → None（退化为进程内 Bus）
+        // 未配置 → 空 map（退化为进程内 Bus）
         let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
-        assert!(c.broker.is_none());
-        // broker: 段存在 → Some(kind/brokers/...)；缺省 brokers 为空、prefix None
+        assert!(c.broker.is_empty());
+        // 旧单对象写法 `broker: { kind: kafka }` → 兼容包成 { default: { kind: kafka } }
         let dir = std::env::temp_dir().join(format!("ojcfgbr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -1811,12 +1881,21 @@ mod tests {
         )
         .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
-        let b = c.broker.expect("some");
+        let b = c.broker.get("default").expect("default profile");
         assert_eq!(b.kind, "kafka");
         assert_eq!(b.brokers, vec!["127.0.0.1:9092", "k2:9092"]);
         assert_eq!(b.topic_prefix.as_deref(), Some("ev"));
         assert_eq!(b.group.as_deref(), Some("g1"));
         assert!(b.url.is_none());
+        // 命名多源 map 原样保留
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "broker:\n  default: { kind: local }\n  prod: { kind: kafka, brokers: [k:9092] }\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.broker.get("default").unwrap().kind, "local");
+        assert_eq!(c.broker.get("prod").unwrap().kind, "kafka");
         // 空段缺省
         let d = BrokerCfg::default();
         assert_eq!(d.kind, "");

@@ -2,7 +2,7 @@
 //! 这里绕过 Tauri 前端，直接构造请求并 dispatch，确认返回信封（状态码 + body）。
 //! 运行：`cargo run --example verify_dispatch --release`（复用已编译的 oj/only-js）。
 
-use oj::app::App;
+use oj::app::{App, ResourceProfiles};
 use only_js::config;
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ async fn main() {
     let base = cfg.server.api_prefix.clone();
     let dir = manifest.join("src"); // api 根：sample/api.ts → /v1/api/sample/
 
-    let app = App::from_config(cfg, &manifest, dir, base, /*ts=*/ true, /*fixtures=*/ false, None)
+    let app = App::from_config(cfg, &manifest, dir, base, /*ts=*/ true, /*fixtures=*/ false, &oj::app::ResourceProfiles::default())
         .await
         .expect("build oj App");
 

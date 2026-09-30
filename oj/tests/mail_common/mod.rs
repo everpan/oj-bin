@@ -200,7 +200,7 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
         "/v1/api".into(),
         true,
         false,
-        None,
+        &oj::app::ResourceProfiles::default(),
     )
     .await
 }

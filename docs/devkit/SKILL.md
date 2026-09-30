@@ -1,6 +1,6 @@
 ---
 name: oj-api-dev
-description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、多库（`--db`）迁移与对账、Kafka/RabbitMQ 消费任务、tasks 长任务、oj test。
+description: 在 oj (only-js) 框架业务项目中开发 API 模块时使用——新增或修改 api.ts / ws.ts handler、manifest.yaml、模块测试，或排查路由/信封/鉴权/租户行为时。触发场景：写 handler、建模块、目录镜像路由、.route 参数路由、json 信封、db 查询、多源资源选择（`--db/--redis/--blob/--es/--broker/--kafka/--rabbit` 选 profile，v0.1.34）、多库迁移与对账、Kafka/RabbitMQ 消费任务、tasks 长任务、oj test。
 ---
 
 # oj API 模块开发
@@ -160,6 +160,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`fixture` / `schema diff` 同旗标） |
 | `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
 | `--db "x" not declared in config (db keys: […])` | 库名不在 config `db:` 段（键即库名）——工具**故意不回落** `default`，防迁移打在开发库上 |
+| `--redis/--blob/--es/--broker/--kafka/--rabbit` 报 `profile 'X' not declared (available: […])` | 选中的资源 profile 不在对应 config 段（如 `--blob` 不在 `config.blob.backends`）；工具**故意不回落** `default`，防误用开发库/错后端。核对报错里的可用 profile 列表，或补上对应 profile |
+| 一份 config 想同时接多源、又只跑同一条 `oj test`/`oj exec` | v0.1.34 起各资源根 key 都支持 `--<key> <profile>` 选源（`db`/`redis`/`blob`/`es`/`broker`/`kafka`/`rabbit`），选中的 profile 在装配期别名为字面 `default`，JS 全局无需改代码 |
 | WS 二进制帧 `http.body` 是 null | 设计如此（不做 UTF-8 有损转换）——取字节用 `await http.bodyBytes()`（v0.1.16） |
 | 回显二进制协议帧型变成 Text | `ws.send` 帧型由参数类型决定：Uint8Array → Binary(0x2)，string → Text(0x1)——别把字节 decode 成 string 再发 |
 | `import "#x"` 报「未找到模块根」 | 该文件不在模块内（`tests/` 用例、`src/tasks/` 任务池），或 `--api-path` 在 project root 之外——这些场景用相对路径（v0.1.18 别名锚点 = 向上最近的 `manifest.yaml`） |

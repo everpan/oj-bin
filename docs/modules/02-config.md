@@ -40,14 +40,14 @@
 | 段 | 类型 | 语义 |
 |---|---|---|
 | `db` | `HashMap<name, DSN>` | 多库混用（`sqlite://` / `mysql://` / `postgres://`），经 `DbBackendRegistry` 按 scheme 认领。**键 = 库名**：`oj migrate` / `oj fixture` / `oj schema diff` 的 `--db` 取值域即此（缺省 `default`，未声明 fail-fast，见 `docs/migration.md` §3.8） |
-| `redis` | `HashMap<name, URL>` | 仅 `redis.default` 参与装配（其余 warn 忽略）；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
+| `redis` | `HashMap<name, URL>` | 键 = profile 名；缺省装配 `redis.default`，可用 `oj test`/`oj exec` 的 `--redis <profile>` 选其他 profile 为默认源（未声明 fail-fast）。其余未选中的 profile warn 忽略；有声明但无 kv 插件 → fail fast；未声明 → 内置 `InMemoryKV` |
 | `tenant` | `TenantCfg` | `enable` + `header_key`（默认 `X-TENANT-ID`）+ `anonymous_paths`（通配见下）+ `sql_guard` + `shared_allow` + `allow_as_tenant`（`db.asTenant` 开关，默认 false） |
 | `db_query` | `QueryLimits` | 构造器 LIMIT：`default_limit`（默认 100，顶层 select 未给 limit 时的隐式值）+ `max_limit`（默认 1000，显式 limit 的 clamp 上界，硬顶 100000）。**不能写进 `db:`**——`db` 是 name→DSN map，键即库名 |
 | `auth` | `AuthCfg` | `jwt_secret`（空 → fail fast）、`signing_method`(HS256/384/512)、access/refresh 时长、`anonymous_paths`（条目＝字符串或 `{path, one_layer}`，见 §4） |
 | `oidc` | `OidcSection` | `issuer` / `private_key_path`（相对 config 目录）/ `rp: {tenant → {issuer, client_id, client_secret, scope}}` / `clients: {id → {secret, redirect_uris, tenant}}` |
-| `blob` | `BlobSection` | 平铺字段 = 旧单后端（等价 `backends.default`）；`backends.<name>` = 命名多后端；**两者并存且平铺非默认 → 歧义 Err** |
-| `es` | `EsCfg` | `endpoint` |
-| `broker` | `BrokerCfg` | `kind`: local/kafka/rabbitmq；`brokers` / `url` / `group` / `topic_prefix` |
+| `blob` | `BlobSection` | 平铺字段 = 旧单后端（等价 `backends.default`）；`backends.<name>` = 命名多后端；**两者并存且平铺非默认 → 歧义 Err**。键 = profile 名，供 `--blob <profile>` 选默认源（未声明 fail-fast） |
+| `es` | `HashMap<name, EsCfg>` | **v0.1.34 起为命名 map**；旧单对象写法 `es: { endpoint: ... }` 自动包成 `{ default: ... }`，完全兼容。键 = profile 名，供 `oj test`/`oj exec` 的 `--es <profile>` 选取（缺省 `default`，未声明 fail-fast）。值 `endpoint` |
+| `broker` | `HashMap<name, BrokerCfg>` | **v0.1.34 起为命名 map**；旧单对象写法 `broker: { kind: kafka, brokers: [...] }` 自动包成 `{ default: ... }`，完全兼容。键 = profile 名，供 `--broker <profile>` 选取。值：`kind`: local/kafka/rabbitmq；`brokers` / `url` / `group` / `topic_prefix` |
 | `plugins` | `HashMap<name, cfg>` | **一段三用**：键 = 严格清单（非空 map 只装配列出的）/ 值 = 透传 cfg（非空对象原样透传，空对象回落轴适配器）/ 缺省或空 map = 扫描模式。旧 list 写法解析报错 |
 | `plugins_dir` | `Option<PathBuf>` | 相对 config_dir；`None` 走四级后备（见 [05](05-ffi-and-plugins.md)） |
 | `vars` | `HashMap<name, String>` | 部署期常量（v0.1.25）：JS `vars.get(name)` 的**唯一**数据源（**同步** op，装配期冻结）。fail-closed——只有声明的键可读，平台没有「读任意 OS env / 任意 config 键」的通道。值只能是标量（数字/布尔按 YAML 字面量成串；嵌套 map/list 解析期报错） |

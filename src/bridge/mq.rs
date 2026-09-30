@@ -120,7 +120,13 @@ pub fn op_mq_has(state: &mut OpState, #[string] kind: String, #[string] name: St
         "rabbit" => &s.rabbits,
         _ => return false,
     };
-    reg.contains(&name)
+    // 字面 "default" 经别名解析（CLI `--kafka`/`--rabbit` 选源）。
+    let resolved = if name == "default" {
+        reg.default_name().to_string()
+    } else {
+        name
+    };
+    reg.contains(&resolved)
 }
 
 #[op2]
@@ -146,7 +152,11 @@ pub async fn op_mq_call(
             }
         };
         let inst = reg
-            .get(&name)
+            .get(if name == "default" {
+                reg.default_name()
+            } else {
+                &name
+            })
             .ok_or_else(|| JsErrorBox::generic(format!("mq: no {kind} instance named '{name}'")))?;
         (inst, stable.tasks_flag.clone())
     };

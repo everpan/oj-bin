@@ -24,6 +24,7 @@
 | [15](#场景-15ws-房间广播presence-v0130) | 同房间成员互发消息/在线人数：`ws.join` / `ws.broadcast` / `ws.roomSize`（v0.1.30） | §6 ws |
 | [16](#场景-16带-exports-的包与-pnpm-布局v0130) | 现代 npm 包（`exports` 条件导出）与 pnpm 安装的解析约定；CJS 相对 require（v0.1.30） | §5 导入解析 |
 | [17](#场景-17wasm-引擎包进-oj-runtimev0130) | wasm-bindgen 类引擎包（PDF/字体/shaping）的加载前置检查清单（v0.1.30） | §6 crypto |
+| [18](#场景-18一份配置多源资源按需选源v0134) | `config` 同时声明多套 db/redis/blob/es/broker/kafka/rabbit，`oj test`/`oj exec` 用 `--<key> <profile>` 选默认源（v0.1.34） | §9 测试 / §11 `oj exec` / §10 配置 |
 
 ---
 
@@ -1181,6 +1182,73 @@ ldap:
 | 日志里看到 `mysql://***@127.0.0.1:3306/app` | 正常——错误与 warn 里的 DSN/URL 凭据段一律打 `***`（v0.1.33） |
 
 完整手册（威胁模型、密文格式、轮换与迁移步骤）见仓库 `docs/secrets.md`。
+
+---
+
+## 场景 18：一份配置多源资源，按需选源（v0.1.34）
+
+**什么时候用**：你有一份 `config.yaml`，里面同时声明了多套资源——
+比如生产库 `default` + 报表库 `report`（db）、主 redis + 缓存 redis、多个 s3 bucket、
+es 只读副本、kafka 测试集群 vs 生产集群。你想用**同一条** `oj test` / `oj exec`
+对不同的源跑脚本或用例，而不用复制多份 config。
+
+**核心机制**：配置段本来就是命名 map（`db` / `redis` / `blob.backends` / `kafkas` /
+`rabbits`），`es` / `broker` 在 v0.1.34 起也放宽成命名 map（旧的单对象写法
+`es: { endpoint: ... }` 自动包成 `{ default: ... }`，完全兼容）。CLI 用
+`--<key> <profile>` 把某个命名 profile 选为「默认源」，装配期把它别名为字面
+`"default"`——于是 JS 侧 `redis()` / `blob()` / `es()` / `bus()` / `kafka("default")` /
+`rabbit("default")` **一行代码都不用改**就指向选中源。`--db` 语义不变（请求期重定向）。
+
+### ① 配置（多源都在一份 config 里）
+
+```yaml
+db:
+  default: "ENC[...]"          # 开发库
+  report:  "ENC[...]"          # 报表库
+redis:
+  default: "redis://:pw@h:6379/0"
+  cache:  "redis://:pw@h:6379/1"
+blob:
+  backends:
+    default: { driver: local, root: ./data/blob }
+    assets:  { driver: s3, bucket: assets-bkt, region: r }
+es:
+  default:  { endpoint: http://localhost:9200 }
+  archive: { endpoint: http://es-archive:9200 }
+broker:
+  default: { kind: kafka, brokers: ["k:9092"] }
+kafkas:
+  default:  { bootstrap: ["k:9092"] }
+  staging:  { bootstrap: ["k-stg:9092"] }
+rabbits:
+  default:  { url: amqp://guest:guest@r:5672 }
+```
+
+### ② 选源跑
+
+```bash
+# 测试默认落 db.test（等同旧行为）；其余资源走各段 default
+./bin/oj test -c config.yaml -d sample/src
+
+# 报表库 + 缓存 redis + 归档 es 一起选源，handler 不改代码
+./bin/oj test  -c config.yaml -d sample/src --db report --redis cache --es archive
+./bin/oj exec  scripts/fix.ts -c config.yaml --db report --redis cache --es archive
+./bin/oj exec  scripts/backfill.ts -c config.yaml --kafka staging
+```
+
+### ③ 验证
+
+启动日志会打印选源提示（如 `oj: default db redirected to "report"`）；
+未声明的 profile 直接 fail-fast（列出可用 profile），**不会静默回落 default**——
+这点和 `oj migrate --db` 一致，目的都是防止误用开发库/错后端。
+
+### 常见坑
+
+- `--<key>` 的 profile 名是 config 段里的**键名**，不是任意字符串；写错会报
+  `profile 'X' not declared (available: [...])`，按列表核对。
+- `db` 的 `--db` 是**请求期**重定向（字面 `default` 调用改指向），与其他轴「装配期别名」
+  实现不同但效果一致：handler 里 `db.default()` / `redis()` 等都指向选中源。
+- 多个 redis profile 只会有**一个**被装配（选中的那个）；其余在日志里 warn 忽略。
 
 ---
 

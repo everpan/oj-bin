@@ -1947,10 +1947,21 @@ auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |
 | `--output` | 报告落盘文件；省略打到 stdout（机器格式 stdout 纯净） |
 | `--db` | 测试库（v0.1.20）：缺省取 config 的 `db.test`（未声明则 WARN + 用 `default`）。字面 `default` 的库调用改指向该库，建表/seed/fixtures 一并跟随；未声明即报错 |
+| `--redis` | 选中 `config.redis.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast（不回落 default） |
+| `--blob` | 选中 `config.blob.backends.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--es` | 选中 `config.es.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--broker` | 选中 `config.broker.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--kafka` | 选中 `config.kafkas.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--rabbit` | 选中 `config.rabbits.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
 | `--anonymous` | 以匿名请求身份跑（v0.1.20）：等同生产 `tenant.anonymous_paths` 命中，便于测公开面 handler |
 
 > `oj test --db` 与 `oj migrate --db` **同名不同义**：前者重定向「字面 `default` 的库调用」，
 > 后者是整轮迁移的目标库（第 3 章「命令」）。
+>
+> `--redis/--blob/--es/--broker/--kafka/--rabbit`（v0.1.34）把 config 对应段里**命名 profile**
+> 选为默认源，装配期别名为字面 `"default"`——JS 侧 `redis()` / `blob()` / `es()` / `bus()` /
+> `kafka("default")` / `rabbit("default")` 无需改代码即指向选中源。给定 profile 不在 config 段中
+> 直接 fail-fast（列出可用 profile），不静默回落 default。各段缺省回退字面 `default`。
 
 退出码：**全部通过 = 0，任一失败 = 1**——可直接做 CI 门禁。
 
@@ -2572,8 +2583,18 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 | `-c` | `config.yaml` | 配置文件路径 |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |
+| `--redis` | 无 | 选中 `config.redis.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--blob` | 无 | 选中 `config.blob.backends.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--es` | 无 | 选中 `config.es.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--broker` | 无 | 选中 `config.broker.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--kafka` | 无 | 选中 `config.kafkas.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
+| `--rabbit` | 无 | 选中 `config.rabbits.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
 | `--log-file` | 不落盘 | 追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 stderr warn 一次，终端输出继续 |
 | `-- arg...` | 无 | `--` 之后的 argv 原样注入 `globalThis.args: string[]`（无 `--` 为空数组） |
+
+> `--redis/--blob/--es/--broker/--kafka/--rabbit`（v0.1.34）把 config 对应段里**命名 profile**
+> 选为默认源（装配期别名为字面 `"default"`），JS 侧对应全局无需改代码即指向选中源；给定
+> profile 不在 config 段中直接 fail-fast，不静默回落 default。各段缺省回退字面 `default`。
 
 **与 serve 的装配差异（有意为之，勿拿 server 直觉套 exec）**：
 

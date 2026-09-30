@@ -32,7 +32,7 @@ async fn slim(
         ));
     }
     let mut registries = Registries::default();
-    assemble_plugins(&cfg, &config_dir, &mut registries).await?;
+    assemble_plugins(&cfg, &config_dir, &mut registries, None).await?;
     let dbs = connect_dbs(&cfg.db, &registries.dbs, &config_dir).await?;
     // 目标库（v0.1.21）：`--db` 选 config `db:` 段的 profile，缺省 "default"。
     // 未声明的库名 fail-fast——静默回落 default 等于把迁移打在开发库上（与

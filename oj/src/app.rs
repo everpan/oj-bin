@@ -107,19 +107,33 @@ fn prewarm_boot(make_bridge: impl Fn() -> Bridge + Send + Sync + 'static) -> Res
     .map_err(|e| format!("{e} (edit ext_boot.js, then restart the process)"))
 }
 
-/// KV（装配第 6 步）：声明了 `redis.default` → 经 kv 插件 vtable connect（单例 fail-fast）；
-/// 未声明 → 内置 `InMemoryKV` 兜底。
-async fn connect_kv(cfg: &Config, registries: &Registries) -> Result<Arc<dyn KVStore>, String> {
-    match cfg.redis.get("default") {
+/// KV（装配第 6 步）：声明了 `redis.<key>` → 经 kv 插件 vtable connect（单例 fail-fast）；
+/// 未声明 → 内置 `InMemoryKV` 兜底。`key` 来自 `--redis`（默认 "default"）。
+async fn connect_kv(
+    cfg: &Config,
+    registries: &Registries,
+    key: &str,
+) -> Result<Arc<dyn KVStore>, String> {
+    match cfg.redis.get(key) {
         Some(url) => match registries.kv {
             Some(vt) => kv_backend_connect(vt, url)
                 .await
-                .map_err(|e| format!("redis 'default': {e}")),
-            None => Err("config declares redis.default but no kv plugin loaded \
+                .map_err(|e| format!("redis '{key}': {e}")),
+            None => Err("config declares redis but no kv plugin loaded \
                  (run `cargo xtask plugin kv-redis`)"
                 .to_string()),
         },
-        None => Ok(Arc::new(InMemoryKV::new()) as Arc<dyn KVStore>),
+        None => {
+            if cfg.redis.is_empty() {
+                Ok(Arc::new(InMemoryKV::new()) as Arc<dyn KVStore>)
+            } else {
+                let mut names: Vec<&str> = cfg.redis.keys().map(|s| s.as_str()).collect();
+                names.sort_unstable();
+                Err(format!(
+                    "--redis profile '{key}' not declared (available redis profiles: {names:?})"
+                ))
+            }
+        }
     }
 }
 
@@ -138,6 +152,8 @@ fn mq_kind_of(desc_name: &str) -> Option<&'static str> {
 async fn build_mq_registries(
     cfg: &Config,
     mq: &[(String, &'static oj_plugin_ffi::MqVtable)],
+    kafka_profile: Option<&str>,
+    rabbit_profile: Option<&str>,
 ) -> Result<
     (
         Arc<NamedRegistry<MqInstance>>,
@@ -159,9 +175,15 @@ async fn build_mq_registries(
     }
     let mut kafkas = NamedRegistry::new();
     let mut rabbits = NamedRegistry::new();
-    for (section, key, kind, reg) in [
-        (&cfg.kafkas, "kafkas", "kafka", &mut kafkas),
-        (&cfg.rabbits, "rabbits", "rabbit", &mut rabbits),
+    for (section, key, kind, reg, profile) in [
+        (&cfg.kafkas, "kafkas", "kafka", &mut kafkas, kafka_profile),
+        (
+            &cfg.rabbits,
+            "rabbits",
+            "rabbit",
+            &mut rabbits,
+            rabbit_profile,
+        ),
     ] {
         if section.is_empty() {
             continue;
@@ -180,6 +202,10 @@ async fn build_mq_registries(
                 .map_err(|e| format!("{key}.{name}: {e}"))?;
             reg.register(name, Arc::new(inst))
                 .map_err(|e| format!("mq register: {e}"))?;
+        }
+        // `--kafka`/`--rabbit`：把选中 profile 别名为 "default"（字面 kafka("default") 即选中源）。
+        if let Some(p) = profile {
+            reg.set_default_alias(p).map_err(|e| e.to_string())?;
         }
     }
     Ok((Arc::new(kafkas), Arc::new(rabbits)))
@@ -470,7 +496,7 @@ pub fn build_mail_backend(
     // A5：双配置源（非空 `smtp:` ＋ 非空 `plugins.mail`）此处即 fail-fast ——
     // `plugin_cfg` 会让透传静默胜出，不能等到「改了白名单不生效」才发现。
     crate::server_cmd::check_mail_cfg_sources(cfg)?;
-    let json = crate::server_cmd::plugin_cfg(cfg, "mail");
+    let json = crate::server_cmd::plugin_cfg(cfg, "mail", None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("smtp cfg: {e}"))?;
     // 空 cfg（既无 `smtp:` 段也无 `plugins.mail` 透传）→ 视作未配置。
@@ -494,7 +520,7 @@ pub fn build_ldap_backend(
         return Ok(None);
     };
     crate::server_cmd::check_ldap_cfg_sources(cfg)?;
-    let json = crate::server_cmd::plugin_cfg(cfg, "ldap");
+    let json = crate::server_cmd::plugin_cfg(cfg, "ldap", None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("ldap cfg: {e}"))?;
     if value.as_object().is_none_or(|o| o.is_empty()) {
@@ -702,6 +728,21 @@ fn migrate_gate_of(cfg: &Config, ts: bool) -> &str {
 /// 留在 `App::from_config`——exec/test 手工 runtime 经此拿到与 server 同一份后端
 /// （无证书门禁，故可在无证书 config 上构造）。
 ///
+/// 各资源根 key 的默认 profile 选择（对应 `oj test`/`oj exec` 的 `--db`/`--redis`/`--blob`/
+/// `--es`/`--broker`/`--kafka`/`--rabbit`）。None → 字面 "default"；给定 profile 在 config 段中
+/// 不存在 → 装配期 fail-fast。`db` 在请求期做字面 "default" 重定向；其余轴在装配期把选中
+/// profile 烘焙为 "default" 别名（或选为唯一活跃实例）。
+#[derive(Default, Clone)]
+pub struct ResourceProfiles {
+    pub db: Option<String>,
+    pub redis: Option<String>,
+    pub blob: Option<String>,
+    pub es: Option<String>,
+    pub broker: Option<String>,
+    pub kafka: Option<String>,
+    pub rabbit: Option<String>,
+}
+
 /// `base` = blob 下载 URL 前缀（local driver 的 `LocalBlob::named` 烘焙进注册表）：
 /// server 传 CLI 解析值（`-b` 覆盖 > `server.api_prefix`），保持路由表与 blob URL
 /// 同源不分裂；exec 无 CLI 覆盖，传 config 派生值。
@@ -711,14 +752,15 @@ pub async fn assemble_backend(
     dir: &Path,
     base: &str,
     ts: bool,
-    db_override: Option<&str>,
+    profiles: &ResourceProfiles,
 ) -> Result<Backend, String> {
-    // 其余 redis key warn 忽略（仅 redis.default 参与装配）。
-    for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != "default") {
+    // 其余非选中 redis key warn 忽略（仅 selected profile 参与装配）。
+    let redis_key = profiles.redis.as_deref().unwrap_or("default");
+    for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != redis_key) {
         // 脱敏：redis URL 格式是 `redis://:password@host`，原样打出来（且会镜像进
         // logs/）等于明文泄漏凭据；排障认得 host 就够。
         eprintln!(
-            "warn: redis '{name}' ({}) ignored (only redis.default is used)",
+            "warn: redis '{name}' ({}) ignored (only redis.{redis_key} is used)",
             only_js::secret::redact(url)
         );
     }
@@ -741,24 +783,33 @@ pub async fn assemble_backend(
     // `GET {base}/plugins`（AppState）。
     let mut registries = Registries::default();
     let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
-        assemble_plugins(cfg, config_dir, &mut registries)
+        assemble_plugins(cfg, config_dir, &mut registries, profiles.es.as_deref())
             .await
             .map_err(|e| format!("plugins: {e}"))?,
     );
-    // KV：redis.default 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
+    // KV：redis.<key> 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
     // 未声明 → InMemoryKV 内置兜底。
-    let kv: Arc<dyn KVStore> = connect_kv(cfg, &registries).await?;
+    let kv: Arc<dyn KVStore> = connect_kv(cfg, &registries, redis_key).await?;
     let es: Option<Arc<dyn EsBackend>> = registries.es;
-    // blob：blob 段存在即启用；未声明 → None。
+    // blob：blob 段存在即启用；未声明 → None。`--blob` 选中的 profile 别名为 "default"。
     let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
         None => None,
-        Some(section) => Some(assemble_blobs(section, config_dir, base, registries.blob).await?),
+        Some(section) => Some(
+            assemble_blobs(
+                section,
+                config_dir,
+                base,
+                registries.blob,
+                profiles.blob.as_deref(),
+            )
+            .await?,
+        ),
     };
     // 逐 db 开库（未知 scheme 注册表 fail-fast）。
     let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
     // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
     // 静默回落 default 等于把测试写在开发库上（正是本项要修的事故面）。
-    if let Some(o) = db_override
+    if let Some(o) = &profiles.db
         && !dbs.contains_key(o)
     {
         let mut names: Vec<&str> = dbs.keys().map(|s| s.as_str()).collect();
@@ -767,7 +818,7 @@ pub async fn assemble_backend(
             "--db {o:?} not declared in config (db keys: {names:?})"
         ));
     }
-    if let Some(o) = db_override {
+    if let Some(o) = &profiles.db {
         eprintln!("oj: default db redirected to {o:?} (migrate/seed/fixtures follow)");
     }
     // LIMIT 配置（db_query 段）：装配期校验（倒置区间 / 0 / 超硬顶 均 fail-fast）。
@@ -792,12 +843,32 @@ pub async fn assemble_backend(
         None => None,
     };
     let (jwt, oidc) = build_jwt_and_oidc(cfg, config_dir)?;
-    // 共享事件总线。
-    let bus = registries
-        .bus
-        .connect(&cfg.broker)
-        .await
-        .map_err(|e| format!("broker: {e}"))?;
+    // 共享事件总线：按 `--broker` 选中的 profile（`config.broker` 命名 map）连接；
+    // 段为空 → 进程内 Bus；给定 profile 不存在 → fail-fast。
+    let bus = {
+        let key = profiles.broker.as_deref().unwrap_or("default");
+        let cfg_broker = if cfg.broker.is_empty() {
+            None
+        } else {
+            Some(
+                cfg.broker
+                    .get(key)
+                    .ok_or_else(|| {
+                        let mut names: Vec<&str> = cfg.broker.keys().map(|s| s.as_str()).collect();
+                        names.sort_unstable();
+                        format!(
+                            "--broker profile '{key}' not declared (available broker profiles: {names:?})"
+                        )
+                    })?
+                    .to_owned(),
+            )
+        };
+        registries
+            .bus
+            .connect(&cfg_broker)
+            .await
+            .map_err(|e| format!("broker: {e}"))?
+    };
     // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
     // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
     let mail = build_mail_backend(cfg, registries.mail, bus.clone())?;
@@ -809,10 +880,18 @@ pub async fn assemble_backend(
     // ldap 后端：ldap: 段 + oj-ldap 插件 vtable（独立能力，无跨后端依赖）。
     let ldap = build_ldap_backend(cfg, registries.ldap)?;
     // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
-    let (kafkas, rabbits) = build_mq_registries(cfg, &registries.mq).await?;
+    let (kafkas, rabbits) = build_mq_registries(
+        cfg,
+        &registries.mq,
+        profiles.kafka.as_deref(),
+        profiles.rabbit.as_deref(),
+    )
+    .await?;
     // 部署期常量（config `vars:` 段，v0.1.25）：装配期冻结成只读 Arc（`vars.get` 唯一
     // 数据源），与 make_bridge 的 Extras.vars 同源。
     let vars = Arc::new(cfg.vars.clone());
+    // db 默认库重定向需进入 'static 工厂闭包，先取出 owned（profiles 是借用，不能捕获）。
+    let db_override = profiles.db.clone();
     // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
     // Clone 即共享。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
     // cfg 只以 Copy 字段（allow_as_tenant）进入闭包：引用不得活进 'static 工厂，
@@ -838,7 +917,7 @@ pub async fn assemble_backend(
         let oidc = oidc.clone();
         let mail = mail.clone();
         let ldap = ldap.clone();
-        let db_override = db_override.map(str::to_owned);
+        // db_override 已是 owned（上方从 profiles.db 克隆），闭包内直接复用。
         // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
         let vars = vars.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
@@ -895,7 +974,7 @@ pub async fn assemble_backend(
         ownership_deny,
         sql_guard,
         allow_as_tenant: cfg.tenant.allow_as_tenant,
-        db_override: db_override.map(str::to_owned),
+        db_override: profiles.db.clone(),
         query_limits,
         boot: boot.clone(),
         jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
@@ -930,18 +1009,18 @@ impl App {
         base: String,
         ts: bool,
         fixtures: bool,
-        // db_override：默认库重定向（`oj test` 传 Some("test")）——字面 "default" 的库
-        // 调用改指向该库；迁移 / seed / fixtures / schema 内省一并跟随（测试库须先有表）。
-        db_override: Option<String>,
+        // profiles：各资源根 key 的默认 profile 选择（对应 `oj test`/`oj exec` 的
+        // `--db`/`--redis`/`--blob`/`--es`/`--broker`/`--kafka`/`--rabbit`）。字面 "default"
+        // 的调用改指向所选 profile；迁移 / seed / fixtures / schema 内省一并跟随。
+        profiles: &ResourceProfiles,
     ) -> Result<App, String> {
         // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
         // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
         // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
         let dir = dir.canonicalize().unwrap_or(dir);
         // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
-        let backend = Arc::new(
-            assemble_backend(&cfg, config_dir, &dir, &base, ts, db_override.as_deref()).await?,
-        );
+        let backend =
+            Arc::new(assemble_backend(&cfg, config_dir, &dir, &base, ts, profiles).await?);
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
@@ -965,7 +1044,7 @@ impl App {
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
         let gate = migrate_gate_of(&cfg, ts);
-        let db_key: &str = db_override.as_deref().unwrap_or("default");
+        let db_key: &str = profiles.db.as_deref().unwrap_or("default");
         match gate {
             "auto" => {
                 crate::migrate::apply_all(stable.dbs.get(db_key), &dir, ts, false).await?;
@@ -1323,6 +1402,41 @@ impl ClientTransport for App {
 mod tests {
     use super::*;
 
+    // ---- v0.1.34：资源根 key 多源选择（connect_kv 的 --redis 解析） ----
+
+    /// 空 redis 段 → 内置 InMemoryKV 兜底；多源 redis 选错 default → fail-fast；
+    /// 选中存在的 profile 但无 kv 插件 → 明确提示缺插件（不静默回落）。
+    #[tokio::test]
+    async fn connect_kv_redis_profile_selection_and_fail_fast() {
+        // 空 redis 段：无论 key 是什么都回落 InMemoryKV。
+        let cfg = Config::default();
+        let reg = Registries::default();
+        let _ = connect_kv(&cfg, &reg, "default").await.unwrap();
+
+        // 多源 redis（无 default）+ 未传 --redis（默认 default）→ fail-fast。
+        let mut cfg = Config::default();
+        cfg.redis
+            .insert("cache".into(), "redis://:pw@h:6379/1".into());
+        let e = connect_kv(&cfg, &reg, "default")
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e.contains("--redis profile 'default' not declared"),
+            "expected fail-fast on missing default profile, got: {e}"
+        );
+
+        // 选 cache：profile 存在，但无 kv 插件 → 另一种 fail-fast（提示装插件）。
+        let e2 = connect_kv(&cfg, &reg, "cache")
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(
+            e2.contains("no kv plugin loaded"),
+            "expected missing-plugin error, got: {e2}"
+        );
+    }
+
     // ---- v0.1.25：server.html_meta_handler 装配期校验 ----
 
     /// meta handler 必须命中一个 GET 路由：命中（含尾斜杠归一）/ 未命中 / 非法路径 / 未配。
@@ -1480,9 +1594,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let cfg = Config::default(); // 无证书、无 db/redis 段
-        let backend = super::assemble_backend(&cfg, &base, &base, "/v1/api", true, None)
-            .await
-            .unwrap();
+        let backend = super::assemble_backend(
+            &cfg,
+            &base,
+            &base,
+            "/v1/api",
+            true,
+            &ResourceProfiles::default(),
+        )
+        .await
+        .unwrap();
         // stable 单源：kv/dbs/loader 都经访问器直达，Backend 不复制字段。
         assert!(backend.stable().loader.is_some());
         assert!(backend.stable().dbs.is_empty());
@@ -1682,7 +1803,7 @@ mod mq_assembly_tests {
             serde_json::json!({ "default": { "brokers": ["b:9092"] } }),
             "kafkas",
         );
-        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]))
+        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]), None, None)
             .await
             .unwrap();
         assert!(kafkas.get("default").is_some());
@@ -1694,7 +1815,8 @@ mod mq_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_kafkas_without_matching_plugin_when_build_then_err() {
         let cfg = cfg_with(serde_json::json!({ "default": {} }), "kafkas");
-        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-rabbitmq"])).await else {
+        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-rabbitmq"]), None, None).await
+        else {
             panic!("expected fail-fast");
         };
         assert!(e.contains("no mq plugin for kind 'kafka'"), "{e}");
@@ -1704,7 +1826,7 @@ mod mq_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_rabbits_with_only_kafka_plugin_when_build_then_err() {
         let cfg = cfg_with(serde_json::json!({ "default": {} }), "rabbits");
-        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"])).await else {
+        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]), None, None).await else {
             panic!("expected fail-fast");
         };
         assert!(e.contains("no mq plugin for kind 'rabbit'"), "{e}");
@@ -1714,7 +1836,9 @@ mod mq_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_duplicate_kind_plugins_when_build_then_err_conflict() {
         let cfg = cfg_with(serde_json::json!({ "default": {} }), "kafkas");
-        let Err(e) = build_mq_registries(&cfg, &mq_table(&["bus-kafka", "bus-kafka"])).await else {
+        let Err(e) =
+            build_mq_registries(&cfg, &mq_table(&["bus-kafka", "bus-kafka"]), None, None).await
+        else {
             panic!("expected fail-fast");
         };
         assert!(e.contains("multiple mq plugins serve kind 'kafka'"), "{e}");
@@ -1724,7 +1848,7 @@ mod mq_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_empty_sections_when_build_then_empty_registries() {
         let cfg = Config::default();
-        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]))
+        let (kafkas, rabbits) = build_mq_registries(&cfg, &mq_table(&["bus-kafka"]), None, None)
             .await
             .unwrap();
         assert!(kafkas.is_empty() && rabbits.is_empty());

@@ -45,6 +45,18 @@ pub struct TestArgs {
     /// 测试库：字面 "default" 的库调用改指向该库（默认取 config 的 `db.test`；
     /// 迁移/seed/fixtures 一并跟随，防测试写在开发库上）。未声明的库名 fail-fast。
     pub db: Option<String>,
+    /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub redis: Option<String>,
+    /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub blob: Option<String>,
+    /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub es: Option<String>,
+    /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub broker: Option<String>,
+    /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub kafka: Option<String>,
+    /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub rabbit: Option<String>,
     /// 把测试请求标记为匿名（等同生产 anonymous_paths 命中），让公开面 handler
     /// （走 `db.asTenant`）在 `oj test` 下可测。
     pub anonymous: bool,
@@ -145,6 +157,18 @@ pub struct ExecArgs {
     pub config: String,
     pub dir: Option<String>,
     pub db: Option<String>,
+    /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub redis: Option<String>,
+    /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub blob: Option<String>,
+    /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub es: Option<String>,
+    /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub broker: Option<String>,
+    /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub kafka: Option<String>,
+    /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast。
+    pub rabbit: Option<String>,
     pub log_file: Option<String>,
     pub args: Vec<String>,
 }
@@ -249,6 +273,24 @@ enum Commands {
         /// 迁移/seed/fixtures 一并跟随
         #[arg(long)]
         db: Option<String>,
+        /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        redis: Option<String>,
+        /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        blob: Option<String>,
+        /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        es: Option<String>,
+        /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        broker: Option<String>,
+        /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        kafka: Option<String>,
+        /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        rabbit: Option<String>,
         /// 把测试请求标记为匿名（等同生产 anonymous_paths 命中），供公开面
         /// handler（db.asTenant）在测试中授信
         #[arg(long)]
@@ -310,6 +352,24 @@ enum Commands {
         /// 字面 "default" 的库调用重定向到该库（未声明的库名 fail-fast）
         #[arg(long)]
         db: Option<String>,
+        /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        redis: Option<String>,
+        /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        blob: Option<String>,
+        /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        es: Option<String>,
+        /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        broker: Option<String>,
+        /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        kafka: Option<String>,
+        /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast
+        #[arg(long)]
+        rabbit: Option<String>,
         /// 日志同时落盘 JSONL（终端照出；打开失败仅告警不中断）
         #[arg(long = "log-file")]
         log_file: Option<String>,
@@ -425,6 +485,12 @@ fn to_command(cli: Cli) -> Command {
             format,
             output,
             db,
+            redis,
+            blob,
+            es,
+            broker,
+            kafka,
+            rabbit,
             anonymous,
         } => Command::Test(TestArgs {
             config,
@@ -434,6 +500,12 @@ fn to_command(cli: Cli) -> Command {
             format,
             output,
             db,
+            redis,
+            blob,
+            es,
+            broker,
+            kafka,
+            rabbit,
             anonymous,
         }),
         Commands::Migrate {
@@ -464,15 +536,8 @@ fn to_command(cli: Cli) -> Command {
             command: SchemaCmd::Diff { config, dir, db },
         } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
         Commands::Secret {
-            command:
-                SecretCmd::Keygen {
-                    out_dir,
-                    force,
-                },
-        } => Command::SecretKeygen(SecretKeygenArgs {
-            out_dir,
-            force,
-        }),
+            command: SecretCmd::Keygen { out_dir, force },
+        } => Command::SecretKeygen(SecretKeygenArgs { out_dir, force }),
         Commands::Secret {
             command: SecretCmd::Seal { key, config, value },
         } => Command::SecretSeal(SecretSealArgs { key, config, value }),
@@ -484,6 +549,12 @@ fn to_command(cli: Cli) -> Command {
             config,
             dir,
             db,
+            redis,
+            blob,
+            es,
+            broker,
+            kafka,
+            rabbit,
             log_file,
             args,
         } => Command::Exec(ExecArgs {
@@ -491,6 +562,12 @@ fn to_command(cli: Cli) -> Command {
             config,
             dir,
             db,
+            redis,
+            blob,
+            es,
+            broker,
+            kafka,
+            rabbit,
             log_file,
             args,
         }),
@@ -537,6 +614,51 @@ mod tests {
             panic!()
         };
         assert!(a.args.is_empty());
+    }
+
+    #[test]
+    fn exec_resource_profile_flags_parse() {
+        // v0.1.34：资源根 key 多源选择旗标（`--redis/--blob/--es/--broker/--kafka/--rabbit`）。
+        let Command::Exec(a) = cmd(&[
+            "exec", "s.ts", "-c", "c.yaml", "--redis", "cache", "--blob", "assets", "--es",
+            "archive", "--broker", "prod", "--kafka", "staging", "--rabbit", "jobs",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.redis.as_deref(), Some("cache"));
+        assert_eq!(a.blob.as_deref(), Some("assets"));
+        assert_eq!(a.es.as_deref(), Some("archive"));
+        assert_eq!(a.broker.as_deref(), Some("prod"));
+        assert_eq!(a.kafka.as_deref(), Some("staging"));
+        assert_eq!(a.rabbit.as_deref(), Some("jobs"));
+        // 缺省 → 全 None（回落各段 default）。
+        let Command::Exec(a) = cmd(&["exec", "s.ts", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert!(
+            a.redis.is_none()
+                && a.blob.is_none()
+                && a.es.is_none()
+                && a.broker.is_none()
+                && a.kafka.is_none()
+                && a.rabbit.is_none()
+        );
+    }
+
+    #[test]
+    fn test_resource_profile_flags_parse() {
+        let Command::Test(a) = cmd(&[
+            "test", "-c", "c.yaml", "-d", "src", "--redis", "cache", "--blob", "assets", "--es",
+            "archive", "--broker", "prod", "--kafka", "staging", "--rabbit", "jobs",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(a.redis.as_deref(), Some("cache"));
+        assert_eq!(a.blob.as_deref(), Some("assets"));
+        assert_eq!(a.es.as_deref(), Some("archive"));
+        assert_eq!(a.broker.as_deref(), Some("prod"));
+        assert_eq!(a.kafka.as_deref(), Some("staging"));
+        assert_eq!(a.rabbit.as_deref(), Some("jobs"));
     }
 
     #[test]
@@ -644,13 +766,8 @@ mod tests {
     #[test]
     fn secret_subcommands_map_through() {
         // keygen：--out-dir / --force（无 --bits/--alg，X25519 是唯一信封算法）。
-        let Command::SecretKeygen(a) = cmd(&[
-            "secret",
-            "keygen",
-            "--out-dir",
-            "keys",
-            "--force",
-        ]) else {
+        let Command::SecretKeygen(a) = cmd(&["secret", "keygen", "--out-dir", "keys", "--force"])
+        else {
             panic!()
         };
         assert_eq!((a.out_dir.as_str(), a.force), ("keys", true));
