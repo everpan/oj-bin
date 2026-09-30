@@ -351,7 +351,7 @@ impl Default for BlobCfg {
 
 /// ES 客户端（OJ-6）：`es:` 块存在即启用 es.* op；endpoint 尾斜杠由 EsClient.url_for 幂等剪除。
 #[derive(Debug, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EsCfg {
     pub endpoint: String,
 }
@@ -365,7 +365,7 @@ pub struct EsCfg {
 /// - rabbitmq：`url`（amqp URL，或取 `brokers[0]`）、`topic_prefix`（交换名，默认 "oj-bus"）。
 // Serialize：装配层经 cfg JSON 透传给 bus 插件（Task 4.3，spec §3 按值传入）。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BrokerCfg {
     pub kind: String,
     #[serde(default)]

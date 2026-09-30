@@ -19,7 +19,7 @@
 ## v0.1.35
 
 > 版本分界：`oj/Cargo.toml` 0.1.34 → 0.1.35。上一版：`v0.1.34`。
-> 发布点标签：**未打标签**（本版本改动尚未打标签）。
+> 发布点标签：**已打标签：`v0.1.35`**（已推送 origin）。
 
 **新增：流式响应 / SSE（PR-1）、CORS（PR-3）、应用层 AES-GCM 加密（PR-10）**
 
@@ -52,6 +52,23 @@
 
 **向后兼容**：三项均为纯新增，未改 ABI（ABI_VERSION 仍为 9）、未动任何既有 op / 全局对象语义；
 既有 handler 与 config 无需改动。
+
+## v0.1.36
+
+> 版本分界：`oj/Cargo.toml` 0.1.35 → 0.1.36。上一版：`v0.1.35`。
+> 发布点标签：**未打标签**（本版本改动尚未打标签）。
+
+**修复：`broker` / `es` 命名 map 配置解析静默丢字段（v0.1.34 既有 bug）**
+
+- **现象**：`broker:` / `es:` 写成命名多源 map（`broker: { default: { kind: local }, prod: { kind: kafka } }`）
+  时，`default` 条目的 `kind` / `endpoint` 等字段被静默解析为空（如 `kind == ""`、`endpoint == ""`），
+  导致 broker/es 装配走错默认实现。单对象写法（`broker: { kind: kafka }`）不受影响。
+- **根因**：`BrokerCfg` / `EsCfg` 反序列化走 `single_or_named_map` 的 untagged `OneOrMap` 枚举；
+  `Single(T)` 变体因 `T` 未 `deny_unknown_fields`，会把命名 map（`{ default: {...}, prod: {...} }`）
+  **误判为单对象**并忽略 `default`/`prod` 键，于是 `Map` 变体永不命中。
+- **修复**：给 `BrokerCfg` / `EsCfg` 加 `#[serde(deny_unknown_fields)]`——命名 map 下 `Single(T)`
+  因未知键 `default`/`prod` 失败，untagged 正确回退到 `Map` 变体；同时顺带让 broker/es 配置里的
+  拼写键（如 `kindd:`）被启动期拒绝，而非静默忽略。无 ABI 变更（ABI_VERSION 仍为 9）。
 
 ## v0.1.34
 
