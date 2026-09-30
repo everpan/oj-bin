@@ -917,7 +917,10 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
         "/v1/api".into(),
         true,
         true,
-        Some("test".into()),
+        &oj::app::ResourceProfiles {
+            db: Some("test".into()),
+            ..Default::default()
+        },
     )
     .await
     .expect("from_config with db_override");

@@ -15,7 +15,7 @@ use only_js::bridge::{
 };
 use tokio::runtime::Builder as TokioBuilder;
 
-use crate::app::{Backend, assemble_backend};
+use crate::app::{Backend, ResourceProfiles, assemble_backend};
 use crate::args::ExecArgs;
 use crate::exec_ext::{ExecOptions, oj_exec_ext_init};
 use crate::server_cmd::load_app_config;
@@ -29,7 +29,17 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
     }
     let (cfg, config_dir, dir, _ts, base) = load_app_config(&a.config, a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
-    let db_override = a.db.clone();
+    // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
+    // 缺省 default；未声明 fail-fast（装配层统一校验）。
+    let profiles = ResourceProfiles {
+        db: a.db.clone(),
+        redis: a.redis.clone(),
+        blob: a.blob.clone(),
+        es: a.es.clone(),
+        broker: a.broker.clone(),
+        kafka: a.kafka.clone(),
+        rabbit: a.rabbit.clone(),
+    };
     // --log-file 打开失败仅告警（spec §4），终端照出。
     let log_file = match &a.log_file {
         Some(p) => match std::fs::OpenOptions::new()
@@ -55,14 +65,13 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                 .map_err(|e| format!("exec runtime: {e}"))?;
             rt.block_on(async move {
                 let backend =
-                    assemble_backend(&cfg, &config_dir, &dir, &base, true, db_override.as_deref())
-                        .await?;
+                    assemble_backend(&cfg, &config_dir, &dir, &base, true, &profiles).await?;
                 // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
                 // 有意不对称）；仅 config 显式写 migrate_on_start 时执行对应项，
                 // reconcile 跟随 auto。非法值 fail-fast（与 server 文案一致）。
                 if let Some(gate) = cfg.server.migrate_on_start.as_deref() {
                     let stable = backend.stable();
-                    let db_key = db_override.as_deref().unwrap_or("default");
+                    let db_key = profiles.db.as_deref().unwrap_or("default");
                     match gate {
                         "auto" => {
                             crate::migrate::apply_all(stable.dbs.get(db_key), &dir, true, false)
@@ -165,15 +174,22 @@ pub(crate) async fn run_script_ext(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Backend, assemble_backend};
+    use crate::app::{Backend, ResourceProfiles, assemble_backend};
     use crate::args::ExecArgs;
     use only_js::config::Config;
 
     async fn backend_fixture(tmp: &Path) -> Backend {
         let cfg = Config::default();
-        assemble_backend(&cfg, tmp, tmp, "/v1/api", true, None)
-            .await
-            .unwrap()
+        assemble_backend(
+            &cfg,
+            tmp,
+            tmp,
+            "/v1/api",
+            true,
+            &ResourceProfiles::default(),
+        )
+        .await
+        .unwrap()
     }
 
     fn write_script(dir: &Path, name: &str, code: &str) -> PathBuf {
@@ -274,6 +290,12 @@ mod tests {
             config: tmp.join("config.yaml").to_string_lossy().into(),
             dir: Some(tmp.to_string_lossy().into()),
             db: None,
+            redis: None,
+            blob: None,
+            es: None,
+            broker: None,
+            kafka: None,
+            rabbit: None,
             log_file: None,
             args: vec![],
         })
@@ -324,6 +346,12 @@ mod tests {
                 config: p.to_string_lossy().into(),
                 dir: Some(tmp.join("src").to_string_lossy().into()),
                 db: None,
+                redis: None,
+                blob: None,
+                es: None,
+                broker: None,
+                kafka: None,
+                rabbit: None,
                 log_file: None,
                 args: vec![],
             }

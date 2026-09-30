@@ -45,7 +45,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ```
 oj serve  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
 oj build   [module] [-c config.yaml] [-d src] [-o dist] [--no-minify] [--check]
-oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--log-file path] [-- arg...]
+oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
 oj fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
 oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
@@ -67,6 +67,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
 | `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
 | `--module` | 无 | （migrate / fixture）只处理指定模块 |
 | `--db` | `default` | （migrate / fixture / schema diff）目标库 = config `db:` 段的 profile 名；未声明则 fail-fast（不回落 default）。多库须逐库各跑一遍。exec 同名参数为**默认库重定向**（同 `oj test`，语义不同） |
+| `--redis` / `--blob` / `--es` / `--broker` / `--kafka` / `--rabbit` | 各段 `default` | （test / exec，v0.1.34）把 config 对应段里**命名 profile** 选为默认源（装配期别名为字面 `default`，JS 全局无需改代码）；未声明即 fail-fast（不回落 default）。各段：`redis`/`blob.backends`/`es`/`broker`/`kafkas`/`rabbits` |
 | `--log-file` | 不落盘 | （exec）追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 warn 一次，终端照出 |
 | `--` | 无 | （exec）`--` 之后的 argv 原样注入脚本 `globalThis.args: string[]` |
 | `--daemon` | 关 | （server）后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`（SIGTERM 走正常停机流程） |
@@ -145,7 +146,11 @@ db:
 redis:
   # default: "redis://127.0.0.1:6379/1"   # 注释/删除 = 内存 KV；配置即真连，需 oj-kv-redis 插件
 es:
-  # endpoint: "http://127.0.0.1:9200"     # 存在即启用 es.search/index/del，需 oj-es 插件
+  # endpoint: "http://127.0.0.1:9200"     # 单对象写法（v0.1.34 前）；自动包成 { default: ... }
+  # default:                              # 命名 map 写法（v0.1.34+）：键 = profile 名，供 --es 选取
+  #   endpoint: "http://127.0.0.1:9200"   # 存在即启用 es.search/index/del，需 oj-es 插件
+  # archive:
+  #   endpoint: "http://es-archive:9200"
 smtp:                  # 邮件投递（mail 全局）：存在即启用，需 oj-mail 插件
   # workers: 4                                # worker 线程数；queue_capacity（满即背压 code:4）
   # default:                                  # 键 = profile 名（= Mail("default")）
@@ -164,8 +169,11 @@ plugins:
   # 缺省/空 map = 扫描模式（加载 plugins_dir 全部）；旧 list 写法 [a, b] 已废弃
 plugins_dir: "plugins"        # 可选：插件目录（相对 config 目录；省略 = 扫描默认位置）
 broker:
-  # kind: kafka               # 可选：分布式事件总线（local/kafka/rabbitmq；kafka/rabbitmq 需插件）
+  # kind: kafka               # 单对象写法（v0.1.34 前）；自动包成 { default: ... }
   # brokers: ["127.0.0.1:9092"]
+  # default:                  # 命名 map 写法（v0.1.34+）：键 = profile 名，供 --broker 选取
+  #   kind: kafka             # 可选：分布式事件总线（local/kafka/rabbitmq；kafka/rabbitmq 需插件）
+  #   brokers: ["127.0.0.1:9092"]
 blob:
   # 可选：对象存储（driver local/s3，s3 需 oj-blob-s3 插件；完整键见 sample/config.yaml）
 kafkas:                       # 可选：命名 Kafka 实例（v0.1.6），需 oj-bus-kafka 插件

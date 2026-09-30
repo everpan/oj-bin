@@ -20,7 +20,7 @@ use only_js::bridge::OjModuleLoader;
 use only_js::bridge::{bridge_ext_init, patch_fs_loaded_sources, ws_client_extensions};
 use tokio::runtime::Builder as TokioBuilder;
 
-use crate::app::{App, ClientTransport};
+use crate::app::{App, ClientTransport, ResourceProfiles};
 use crate::args::TestArgs;
 use crate::server_cmd::load_app_config;
 use crate::test_ext::oj_test_ext_init;
@@ -97,6 +97,18 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
     if let Some(o) = &db_override {
         eprintln!("oj test: using db {o:?}（migrate/seed/fixtures 一并跟随）");
     }
+    // 其余资源根 key 的默认 profile 选择（--redis/--blob/--es/--broker/--kafka/--rabbit）；
+    // 缺省 default，未声明 fail-fast（装配层统一校验）。db 走上面 db_override 的测试特例
+    // （字面 default 请求期重定向），其余轴在装配期把选中 profile 烘焙为 default 别名。
+    let profiles = ResourceProfiles {
+        db: db_override.clone(),
+        redis: a.redis.clone(),
+        blob: a.blob.clone(),
+        es: a.es.clone(),
+        broker: a.broker.clone(),
+        kafka: a.kafka.clone(),
+        rabbit: a.rabbit.clone(),
+    };
 
     // 钉线程：JsRuntime 是 !Send，必须待在同一 OS 线程。
     let fmt = a.format.clone().unwrap_or_else(|| "human".into());
@@ -111,7 +123,7 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
                 let app =
-                    App::from_config(cfg, &config_dir, dir, base, ts, true, db_override).await?;
+                    App::from_config(cfg, &config_dir, dir, base, ts, true, &profiles).await?;
                 run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })

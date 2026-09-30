@@ -259,10 +259,7 @@ pub fn keygen() -> Result<(String, String), String> {
 
 /// 私钥加载：env 内联 PEM > env 文件 > config 的 `secrets.private_key_path`
 /// （相对 config 目录）。三处都没有 → 明确报错（绝不静默把密文当明文用）。
-pub fn load_private_key(
-    cfg_path: Option<&str>,
-    config_dir: &Path,
-) -> Result<PrivKey, String> {
+pub fn load_private_key(cfg_path: Option<&str>, config_dir: &Path) -> Result<PrivKey, String> {
     if let Ok(inline) = std::env::var(ENV_KEY)
         && !inline.trim().is_empty()
     {
@@ -302,7 +299,11 @@ pub fn load_public_key(path: &Path) -> Result<PubKey, String> {
 fn pem_body(pem: &str, label: &str) -> Result<Vec<u8>, String> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
-    let lines: Vec<&str> = pem.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = pem
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if lines.first() != Some(&begin.as_str()) || lines.last() != Some(&end.as_str()) {
         return Err(format!("not a {label} PEM"));
     }
@@ -318,7 +319,10 @@ pub fn parse_private_key(pem: &str) -> Result<PrivKey, String> {
     if pem.contains(EC_PRIV_LABEL) {
         let body = pem_body(pem, EC_PRIV_LABEL)?;
         if body.len() != 32 {
-            return Err(format!("{EC_PRIV_LABEL}: expected 32 bytes, got {}", body.len()));
+            return Err(format!(
+                "{EC_PRIV_LABEL}: expected 32 bytes, got {}",
+                body.len()
+            ));
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&body);
@@ -336,7 +340,10 @@ pub fn parse_public_key(pem: &str) -> Result<PubKey, String> {
     if pem.contains(EC_PUB_LABEL) {
         let body = pem_body(pem, EC_PUB_LABEL)?;
         if body.len() != 32 {
-            return Err(format!("{EC_PUB_LABEL}: expected 32 bytes, got {}", body.len()));
+            return Err(format!(
+                "{EC_PUB_LABEL}: expected 32 bytes, got {}",
+                body.len()
+            ));
         }
         let mut pk = [0u8; 32];
         pk.copy_from_slice(&body);
