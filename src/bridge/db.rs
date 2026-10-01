@@ -8,13 +8,18 @@
 //! （原始 `query(sql)` 仅保留为无参便捷形式；真实 SQL 实现应优先用 *_with_params 或 query.rs 构造器）。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
+use futures::stream::Stream;
 use serde_json::Value;
+use tokio::sync::{Notify, mpsc};
 
 use super::{BridgeResult, StableState};
 
@@ -78,6 +83,18 @@ pub trait DataAccessor: Send + Sync {
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Row>>;
     /// 参数化执行，返回受影响行数。
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
+
+    /// 流式查询（PR-2 Phase A）：返回逐行流，调用方逐批/逐行消费，避免 `fetch_all` 全量入内存
+    /// （大表导出 / 游标回传）。不进 vtable，故插件后端（`FfiDataAccessor`）走默认实现报错——
+    /// 「backend does not support streaming (ABI 10 required)」，由 PR-2 Phase B 经 vtable 实现。
+    /// 行以 `Result<Row, String>` 传递：Ok = 一行，Err = 流中途错误（pump 转为错误终态）。
+    async fn stream_query(
+        &self,
+        _sql: &str,
+        _params: &[Value],
+    ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
+        Err("backend does not support streaming (ABI 10 required)".into())
+    }
 }
 
 /// DataAccessor 的内存实现（fake）。接口与 sqlx 实现一致（Liskov 可替换）。
@@ -131,6 +148,22 @@ impl DataAccessor for InMemoryAccessor {
             return Err(e.clone().into());
         }
         Ok(g.rows.len() as i64)
+    }
+
+    async fn stream_query(
+        &self,
+        _sql: &str,
+        _params: &[Value],
+    ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
+        let g = self.inner.read().unwrap();
+        if let Some(e) = &g.err {
+            return Err(e.clone().into());
+        }
+        let rows = g.rows.clone();
+        drop(g);
+        Ok(Box::pin(futures::stream::iter(
+            rows.into_iter().map(Ok::<Row, String>),
+        )))
     }
 }
 
@@ -205,6 +238,21 @@ pub(crate) fn resolve_target(
     }
     Ok(Target::Pool(super::query::lookup(state, name)?))
 }
+
+/// PR-2 Phase A：`db.stream` 每请求流注册表（keyed by stream_id）。pump 持有 `Arc<DbStreamShared>`
+/// 克隆推数据，`op_db_stream_next` 拉取；请求结束 `ReqState::reset` 换全新 Arc，旧 Arc 由仍存活的
+/// pump 持有至排空，互不串号。
+pub(crate) type DbStreamRegistry = tokio::sync::Mutex<HashMap<u32, Arc<DbStreamShared>>>;
+
+/// 单条 db.stream 的共享状态：行/错误经 `UnboundedSender` 推给接收端（`rx`）；通道关闭 = 流结束（done）。
+/// `abort` 由 `op_db_stream_abort` 触发，pump 的 `select!` 观测后中止。
+pub(crate) struct DbStreamShared {
+    pub rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<Row, String>>>,
+    pub abort: Arc<Notify>,
+}
+
+/// stream_id 全局自增（每请求注册表独立，跨请求重复无妨；u32 足以覆盖请求生命周期内的并发流）。
+static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
 /// 取走并校验活跃事务（commit/rollback 收尾用；不匹配/缺失报错）。
 fn take_tx(state: &Rc<RefCell<OpState>>, name: &str) -> Result<Arc<ActiveTx>, JsErrorBox> {
@@ -381,6 +429,125 @@ pub async fn op_db_exec(
             .exec(&sql, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
+    }
+}
+
+/// db.stream 打开（PR-2 Phase A）：先 `guard::check_raw` / `check_tenant_raw`（open 前校验，同
+/// `op_db_query`）→ 取 accessor → `stream_query` 开流 → spawn **脱离式 pump**（current_thread 运行时
+/// 内）逐行推入通道；op 立即返回 stream_id。插件后端（FfiDataAccessor）走默认实现报错。
+#[op2]
+pub async fn op_db_stream_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] sql: String,
+    #[serde] params: Option<Vec<Value>>,
+) -> Result<f64, JsErrorBox> {
+    let params = params.unwrap_or_default();
+    super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
+    super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
+    let da = match resolve_target(&state, &name)? {
+        Target::Pool(da) => da,
+        Target::Tx(_) => {
+            return Err(JsErrorBox::generic(
+                "db.stream within an active transaction is not supported in Phase A (ABI 10 required)",
+            ));
+        }
+    };
+    let mut stream = da
+        .stream_query(&sql, &params)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Row, String>>();
+    let shared = Arc::new(DbStreamShared {
+        rx: tokio::sync::Mutex::new(rx),
+        abort: Arc::new(Notify::new()),
+    });
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
+    let reg = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .db_streams
+        .clone();
+    reg.lock().await.insert(id, shared.clone());
+    // 脱离式 pump：监听流与取消信号，逐行推入通道（通道关闭 = done）。
+    let abort = shared.abort.clone();
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        loop {
+            tokio::select! {
+                biased;
+                _ = abort.notified() => {
+                    let _ = tx.send(Err("db stream aborted".to_string()));
+                    break;
+                }
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(row)) => { if tx.send(Ok(row)).is_err() { break; } }
+                        Some(Err(e)) => { let _ = tx.send(Err(e)); break; }
+                        None => break,
+                    }
+                }
+            }
+        }
+        // tx 丢弃 → 接收端 recv 返回 None = 流结束（done）。
+    });
+    Ok(id as f64)
+}
+
+/// db.stream 拉取下一行（PR-2 Phase A）：返回一行（`Value::Object`）；流结束返回 `Value::Null`
+/// （JS 侧作为终止哨兵，因行本身恒为非 null 对象）；途中错误以 `JsErrorBox` 抛出（JS `await` 即抛）。
+#[op2]
+#[serde]
+pub async fn op_db_stream_next(
+    state: Rc<RefCell<OpState>>,
+    stream_id: f64,
+) -> Result<Row, JsErrorBox> {
+    let stream_id = stream_id as u32;
+    let reg = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .db_streams
+        .clone();
+    let shared = reg.lock().await.get(&stream_id).cloned().ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "db stream {stream_id} not found (already closed or never opened)"
+        ))
+    })?;
+    let mut rx = shared.rx.lock().await;
+    match rx.recv().await {
+        Some(Ok(row)) => Ok(row),
+        Some(Err(e)) => Err(JsErrorBox::generic(e)),
+        None => Ok(Row::Null), // done
+    }
+}
+
+/// db.stream 关闭（PR-2 Phase A）：触发中止并移除注册表条目（条目移除后 Arc 仍被 pump / 进行中的
+/// next 持有至排空，无泄漏）；不强制 await，尽快归还。
+#[op2]
+pub async fn op_db_stream_close(state: Rc<RefCell<OpState>>, stream_id: f64) {
+    let stream_id = stream_id as u32;
+    let reg = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .db_streams
+        .clone();
+    if let Some(s) = reg.lock().await.remove(&stream_id) {
+        s.abort.notify_one();
+    }
+}
+
+/// db.stream 主动中止（PR-2 Phase A）：由 bootstrap 在 `AbortSignal` 的 abort 事件上调用，
+/// 触发 pump 中止（pump 经 `DbStreamShared.abort` 观测，回写错误终态）。
+#[op2]
+pub async fn op_db_stream_abort(state: Rc<RefCell<OpState>>, stream_id: f64) {
+    let stream_id = stream_id as u32;
+    let reg = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .db_streams
+        .clone();
+    if let Some(s) = reg.lock().await.get(&stream_id) {
+        s.abort.notify_one();
     }
 }
 
@@ -701,6 +868,65 @@ mod tests {
         assert_eq!(v["data"]["b"], json!(2), "{v}");
     }
 
+    /// PR-2 Phase A 真库回归（env-gated）：`db.stream` 在真实 PG / MySQL 上的逐行结果，与
+    /// `db.query` 全量**一致**（顺序 + 内容），且流走完哨兵正常、无残留注册表条目。
+    /// 仅当 `OJ_TEST_PG` / `OJ_TEST_MYSQL` 设了 DSN 才跑；都未设则 skip。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_matches_query_on_real_db() {
+        let pg = std::env::var("OJ_TEST_PG").ok().filter(|s| !s.is_empty());
+        let my = std::env::var("OJ_TEST_MYSQL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if pg.is_none() && my.is_none() {
+            eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
+            return;
+        }
+        if let Some(url) = pg {
+            stream_eq_check(&url, "pg").await;
+        }
+        if let Some(url) = my {
+            stream_eq_check(&url, "mysql").await;
+        }
+    }
+
+    /// 单库 `db.stream` == `db.query` 全量校验（真库回归辅助）。
+    async fn stream_eq_check(url: &str, tag: &str) {
+        let db = crate::bridge::SqlxAccessor::arc(url).await.unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("drop table if exists _oj_stream_real");
+                     await db.exec("create table _oj_stream_real (id integer, name text)");
+                     // 内联受控值（int + 简单字符串）规避 PG 的 ? 占位符问题；_oj_ 前缀表免登记表白名单。
+                     for (let i = 0; i < 20; i++) await db.exec("insert into _oj_stream_real (id, name) values (" + i + ", 'n" + i + "')");
+                     const all = await db.query("select id, name from _oj_stream_real order by id");
+                     const streamed = [];
+                     for await (const row of db.stream("select id, name from _oj_stream_real order by id")) streamed.push(row);
+                     json.ok({ n1: all.length, n2: streamed.length, eq: JSON.stringify(all) === JSON.stringify(streamed) });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "[{tag}] db.stream real-db failed: {v}");
+        assert_eq!(v["data"]["n1"], json!(20), "[{tag}] {v}");
+        assert_eq!(v["data"]["n2"], json!(20), "[{tag}] {v}");
+        assert_eq!(
+            v["data"]["eq"],
+            json!(true),
+            "[{tag}] db.stream must equal db.query on real db: {v}"
+        );
+    }
+
     /// 序列名越界（空 / 超 128）→ 明确报错。
     #[tokio::test(flavor = "current_thread")]
     async fn next_seq_rejects_bad_name() {
@@ -820,6 +1046,145 @@ mod tests {
                 .unwrap()
                 .contains("transaction active on db 'default'"),
             "{v}"
+        );
+    }
+
+    // PR-2 Phase A：未覆盖 stream_query 的 accessor（如插件 FfiDataAccessor）走默认实现，
+    // 明确报错「backend does not support streaming (ABI 10 required)」。
+    struct NoStreamAccessor;
+    #[async_trait]
+    impl DataAccessor for NoStreamAccessor {
+        async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
+            Ok(vec![])
+        }
+        async fn exec_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_stream_query_reports_unsupported() {
+        let r = NoStreamAccessor.stream_query("select 1", &[]).await;
+        assert!(r.is_err(), "未覆盖的 accessor 必须报错");
+        let msg = r.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("does not support streaming"),
+            "错误文案须指向 ABI 10: {msg}"
+        );
+    }
+
+    /// sqlite 流式结果与 `db.query` 全量一致（顺序/内容）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_stream_matches_query_full_result() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("create table t(id integer, name text)");
+                     for (let i = 0; i < 10; i++) await db.exec("insert into t values (?, ?)", [i, "n" + i]);
+                     const all = await db.query("select id, name from t order by id");
+                     const streamed = [];
+                     for await (const row of db.stream("select id, name from t order by id")) streamed.push(row);
+                     json.ok({ n1: all.length, n2: streamed.length, eq: JSON.stringify(all) === JSON.stringify(streamed) });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n1"], json!(10), "{v}");
+        assert_eq!(v["data"]["n2"], json!(10), "{v}");
+        assert_eq!(v["data"]["eq"], json!(true), "流式结果与全量查询一致：{v}");
+    }
+
+    /// InMemoryAccessor 流式返回已 seed 的行（dev/fake 路径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn inmemory_stream_yields_seeded_rows() {
+        let acc = Arc::new(InMemoryAccessor::new());
+        acc.seed(vec![
+            json!({"id": 1, "name": "a"}),
+            json!({"id": 2, "name": "b"}),
+        ]);
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                acc as Arc<dyn DataAccessor>,
+            )]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const rows = [];
+                     for await (const r of db.stream("ignored")) rows.push(r);
+                     json.ok({ n: rows.length, first: rows[0] });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+        assert_eq!(v["data"]["first"]["id"], json!(1), "{v}");
+    }
+
+    /// 中途 abort：流干净终止（不 panic、连接回池）；abort 经 AbortSignal 的 abort 事件触发。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_abort_terminates_without_panic() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("create table t(id integer)");
+                     for (let i = 0; i < 1000; i++) await db.exec("insert into t values (?)", [i]);
+                     const ac = new AbortController();
+                     let count = 0;
+                     try {
+                       await db.stream("select * from t", [], {
+                         signal: ac.signal,
+                         onRow: () => { count++; if (count >= 3) ac.abort(); }
+                       });
+                       json.ok({ aborted: false, count });
+                     } catch (e) {
+                       json.ok({ aborted: true, count });
+                     }
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["aborted"], json!(true), "abort 必须终止流：{v}");
+        assert!(
+            v["data"]["count"].as_u64().unwrap() >= 3,
+            "至少已消费 3 行：{v}"
         );
     }
 }

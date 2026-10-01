@@ -33,6 +33,10 @@ import {
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
+  op_db_stream_open,
+  op_db_stream_next,
+  op_db_stream_close,
+  op_db_stream_abort,
   op_es_search,
   op_es_index,
   op_es_del,
@@ -669,6 +673,53 @@ globalThis.DB = function (name) {
       // Race-free replacement for `select max(id) + 1`; the platform table
       // `_oj_sequences` is created on first use (see docs/db-guide.md).
       nextSeq: (n) => op_db_next_seq(name, String(n)),
+      // PR-2 Phase A streaming query. Primary form: callback (onRow enriches/transforms each
+      // row, e.g. writing to json.stream). Otherwise returns an async iterable (escape hatch via
+      // for-await). signal is wired through the abort event to op_db_stream_abort.
+      // op_db_stream_open is an async op (returns a Promise<id>); the id is resolved lazily on the
+      // first next()/onRow so this arrow need not be async (for-await needs a sync async-iterable).
+      stream: (sql, params, opts) => {
+        let idP = null;
+        const openId = () => (idP ||= op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params)));
+        const wireAbort = () => { openId().then((id) => op_db_stream_abort(id)); };
+        const signal = opts && opts.signal;
+        if (signal) signal.addEventListener("abort", wireAbort);
+        const close = () => {
+          if (signal) signal.removeEventListener("abort", wireAbort);
+          openId().then((id) => op_db_stream_close(id));
+        };
+        if (opts && typeof opts.onRow === "function") {
+          return (async () => {
+            try {
+              const id = await openId();
+              for (;;) {
+                const row = await op_db_stream_next(id);
+                if (row === null) break;
+                opts.onRow(row);
+              }
+            } finally {
+              close();
+            }
+          })();
+        }
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next: async () => {
+                try {
+                  const id = await openId();
+                  const row = await op_db_stream_next(id);
+                  if (row === null) { close(); return { done: true, value: undefined }; }
+                  return { done: false, value: row };
+                } catch (e) {
+                  close();
+                  throw e;
+                }
+              },
+            };
+          },
+        };
+      },
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.

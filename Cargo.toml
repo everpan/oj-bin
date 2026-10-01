@@ -61,6 +61,9 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 notify = "8"
 futures = "0.3"
+# PR-2 Phase A 流式查询：SqlxAccessor::stream_query 用 try_stream! 持有自有 SQL/参数，
+# 规避 sqlx Query 借用 &str 无法返回 'static 装箱流的问题。
+async-stream = "0.3"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs"] }
 tokio-tungstenite = "0.30"

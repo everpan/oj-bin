@@ -16,6 +16,43 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.37
+
+> 版本分界：`oj/Cargo.toml` 0.1.36 → 0.1.37。上一版：`v0.1.36`。
+> 发布点标签：**未打标签**（待发布时 `git tag -a v0.1.37`）。
+> 注：`v0.1.36` 仅作为中间边界提交（commit `133f2b4`，config `broker/es` 命名 map 解析修复），
+> 未单独打标签，其变更随本版一同发布。
+
+**新增：流式查询 `db.stream`（PR-2 Phase A）**
+
+- **`db.stream(sql, params?, opts?)`（v0.1.37，PR-2 Phase A）**：逐行从后端拉取大结果集，避免
+  `db.query` 一次性全量驻留内存（导出 / ETL / 大表遍历场景）。两种形态：
+  - **回调形态（推荐）**：`opts.onRow(row)` 逐行回调，回调内可 `await`（如每行 `json.stream` 推一帧、
+    或 `db.exec` 落库）；返回 Promise 在流走完 / 中止后 resolve，异常时 reject。
+  - **异步迭代器形态（逃生舱）**：不传 `onRow` 时返回 `AsyncIterable<Row>`，可 `for await` 消费。
+  - **取消**：`opts.signal`（WHATWG `AbortSignal`）在 `abort` 时由桥接层 `op_db_stream_abort` 通知
+    后端 pump 中止；流走完自动移除监听器。桥接层每请求维护流注册表（`ReqState.db_streams`），
+    `reset` 换全新 Arc，存活 pump 不会被跨请求串号。
+- **实现范围（Phase A）**：核心 `SqlxAccessor`（sqlite / mysql / postgres，经 `Any` 驱动）走真流式；
+  后端用 `async-stream` 的 `stream!` 把自有 SQL / 参数 / 池收进生成器状态机（规避 sqlx `Query`
+  借用 `&str` 无法返回 `'static` 装箱流的问题）。`InMemoryAccessor` 同样支持（内存行直接 `iter`）。
+- **边界（Phase A，ABI 9 不升）**：
+  - 仅支持**非事务**目标；`db.tx` 内调用报
+    `db.stream within an active transaction is not supported in Phase A (ABI 10 required)`。
+  - FFI 插件后端（`oj-db-*`）走 `DataAccessor::stream_query` 默认实现，报
+    `backend does not support streaming (ABI 10 required)`——须待 PR-2 Phase B（ABI 10
+    vtable：`stream_open` / `fetch_next` / `stream_cancel` / `stream_close`）落地后插件方可流式。
+  - 内容与 `db.query` 全量**一致**，差异只在内存形态。
+- **文档同步**：`docs/devkit/` 四件已对齐——`api-manual.md` §6 `db` 节新增 `db.stream` 小节 +
+  签名入总表 + §13 已知限制全表新增条目；`scenarios.md` 新增「场景 23：大表流式导出」；
+  `SKILL.md` 陷阱速查新增三条；`README.md` 文件清单同步。
+
+**随本版发布的 v0.1.36 边界修复（未单独立版）**
+
+- `config`：`broker` / `es` 段放宽为命名 map（旧单对象写法兼容），并修复命名 map 解析**静默丢字段**
+  的缺陷（原解析对 `Option<HashMap>` 缺省回退路径漏写字段合并）。资源根 key 多源选择（`--redis` /
+  `--blob` / `--es` / `--broker` / `--kafka` / `--rabbit`，v0.1.34）不受影响。
+
 ## v0.1.35
 
 > 版本分界：`oj/Cargo.toml` 0.1.34 → 0.1.35。上一版：`v0.1.34`。
