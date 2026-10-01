@@ -119,6 +119,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 池化任务里 `tasks.stopping()` 恒 false | 池化任务由 worker 每轮驱动：`loop_body` 返回即一轮结束，天然无需停机轮询/`tasks.sleep`（v0.1.28） |
 | 大文件 `http.file(i)` 报 "was streamed to blob"（v0.1.38） | > `max_upload` 的 multipart 文件被服务端流式直落 blob（内存恒定）——用 `files[i].key` + `blob.get(key)` 或 `files[i].url` 取；小文件 `http.file(i)` 照常 |
 | `db.stream` 在 mysql/pg 上报错/变全量 | v0.1.38 起第一方插件真流式（ABI 10）；第三方插件未实现流式槽时宿主静默回落 `db.query` 全量（仅丢内存优势）。事务内 `db.stream` 恒报错——流式只走直连池 |
+| `db.stream` 取消在 pg/mysql 下是「真取消」，sqlite 只是「协作式」 | v0.1.42 起：`postgres://`/`mysql://` DSN 游标走**专用连接**，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端慢查询立即终止；core/Any（sqlite 等）无服务端句柄，只能**协作式**（下一批返回 `{"error":"cancelled"}`）。别指望 sqlite 的取消能打断正在跑的查询 |
 | `db.stream` 在 `db.tx` 里报 `…not supported in Phase A (ABI 10 required)` | Phase A 只支持直连池，不支持事务内流式——先 `db.query` 取 id 集，或把流式挪到 tx 外 |
 | 插件库（`oj-db-*`）调 `db.stream` 报 `backend does not support streaming (ABI 10 required)` | Phase A 仅核心 `SqlxAccessor`（sqlite/mysql/postgres `Any` 驱动）真流式；FFI 插件要等 PR-2 Phase B（ABI 10 vtable） |
 | 用了 `json.stream` 又 `json.ok` | 流式响应已接管 body，二者互斥——`json.stream`/`sse` 后 handler 直接 `return`，别再包信封 |
