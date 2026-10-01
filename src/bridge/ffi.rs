@@ -124,12 +124,14 @@ use crate::bridge::{
     EventBroker, KVStore, WsSend,
 };
 use crate::config::BrokerCfg;
+use futures::stream::Stream;
 use oj_plugin_ffi::{
     BlobBackendVtable, DataAccessorVtable, EsBackendVtable, EventBrokerVtable, FfiFuture,
     KVStoreVtable, RBytes, RString,
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -409,6 +411,104 @@ impl DataAccessor for FfiDataAccessor {
         let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db exec", e))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db exec decode", e))
     }
+
+    /// ABI 10 流式：经 vtable `stream_open/next` 批量 pull（≤100 行/次）。
+    /// - open 返回哨兵 `{"unsupported":true}`（旧插件/不支持流式的后端）→ 回落有界
+    ///   fetch_all（= db.query 全量，评审定稿：保 dev/test 一致）。
+    /// - 游标清理：正常走完（done/err）只 fire `stream_close`；被 abort 丢弃（pump
+    ///   收到 Notify 后 drop 生成器）→ 先 `stream_cancel`（真取消，插件协作式）再
+    ///   close。两路都 fire-and-forget（future.rs 契约：宿主 drop 句柄=放弃结果，
+    ///   插件任务照常跑完），杜绝 aborted 查询泄漏插件侧游标条目。
+    async fn stream_query(
+        &self,
+        sql: &str,
+        params: &[serde_json::Value],
+    ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
+        let p = params_json(params)?;
+        let fut = (self.vtable.stream_open)(self.handle, RString::from(sql), p);
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("db stream_open", e))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| ffi_err("db stream_open decode", e))?;
+        if v.get("unsupported")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            let rows = self.query_with_params(sql, params).await?;
+            return Ok(Box::pin(futures::stream::iter(
+                rows.into_iter().map(Ok::<Row, String>),
+            )));
+        }
+        let stream_id = v
+            .get("stream_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| ffi_err("db stream_open", "missing stream_id"))?;
+        let handle = self.handle;
+        let vt = self.vtable;
+        let guard = Arc::new(StreamCursorGuard {
+            handle,
+            vtable: vt,
+            stream_id,
+            completed: AtomicBool::new(false),
+        });
+        let g = guard.clone();
+        let row_stream = async_stream::stream! {
+            loop {
+                let fut = (vt.stream_next)(handle, stream_id);
+                match await_ffi(fut).await {
+                    Err(e) => {
+                        yield Err(ffi_err("db stream_next", e).to_string());
+                        break;
+                    }
+                    Ok(bytes) => {
+                        let env: serde_json::Value = match serde_json::from_slice(&bytes) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                yield Err(ffi_err("db stream_next decode", e).to_string());
+                                break;
+                            }
+                        };
+                        if let Some(e) = env.get("error").and_then(|x| x.as_str()) {
+                            yield Err(e.to_string());
+                            break;
+                        }
+                        if env.get("done").and_then(|x| x.as_bool()).unwrap_or(false) {
+                            break;
+                        }
+                        if let Some(rows) = env.get("rows").and_then(|x| x.as_array()) {
+                            for r in rows {
+                                yield Ok(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            g.completed.store(true, Ordering::SeqCst);
+        };
+        drop(guard); // 生成器持有唯一引用；生成器 drop（走完或被 abort 丢弃）即收口
+        Ok(Box::pin(row_stream))
+    }
+}
+
+/// FFI db 流式游标清理守卫（见 `FfiDataAccessor::stream_query` 注释）。
+struct StreamCursorGuard {
+    handle: u64,
+    vtable: &'static DataAccessorVtable,
+    stream_id: u64,
+    /// 生成器走完（done/err）后置位：Drop 只 reclaim（close）不 cancel。
+    completed: AtomicBool,
+}
+
+impl Drop for StreamCursorGuard {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::SeqCst) {
+            let f = (self.vtable.stream_cancel)(self.handle, self.stream_id);
+            drop(FfiGuard(Some(f))); // fire-and-forget：插件任务照常执行
+        }
+        let f = (self.vtable.stream_close)(self.handle, self.stream_id);
+        drop(FfiGuard(Some(f)));
+    }
 }
 
 impl Drop for FfiDataAccessor {
@@ -557,6 +657,44 @@ impl BlobBackend for FfiBlobBackend {
 
     async fn serve(&self, key: &str) -> BridgeResult<BlobServed> {
         Ok(BlobServed::Redirect(self.url(key).await?))
+    }
+
+    /// ABI 10 流式上传转发（open 产 upload_id；chunk/finish/abort 直透）。
+    async fn put_stream_open(&self, key: &str, content_type: Option<&str>) -> BridgeResult<u64> {
+        let ct = RString::from(content_type.unwrap_or(""));
+        let fut = (self.vtable.put_stream_open)(self.handle, RString::from(key), ct);
+        let bytes = await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob put_stream_open", e))?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ffi_err("blob put_stream_open decode", e))?;
+        v.get("upload_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| ffi_err("blob put_stream_open", "missing upload_id"))
+    }
+
+    async fn put_stream_chunk(&self, upload_id: u64, bytes: &[u8]) -> BridgeResult<()> {
+        let fut = (self.vtable.put_stream_chunk)(self.handle, upload_id, to_rbytes(bytes));
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob put_stream_chunk", e))?;
+        Ok(())
+    }
+
+    async fn put_stream_finish(&self, upload_id: u64) -> BridgeResult<()> {
+        let fut = (self.vtable.put_stream_finish)(self.handle, upload_id);
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob put_stream_finish", e))?;
+        Ok(())
+    }
+
+    async fn put_stream_abort(&self, upload_id: u64) -> BridgeResult<()> {
+        let fut = (self.vtable.put_stream_abort)(self.handle, upload_id);
+        await_ffi(fut)
+            .await
+            .map_err(|e| ffi_err("blob put_stream_abort", e))?;
+        Ok(())
     }
 }
 
@@ -1152,6 +1290,37 @@ mod adapter_tests {
         v
     }
 
+    // ---- db 流式 mock（ABI 10）：MODE 0=unsupported（回落 fetch_all）；1=真游标 ----
+    static DB_STREAM_MODE: Mutex<u8> = Mutex::new(0);
+    static DB_STREAM_NEXT_CALLS: AtomicU64 = AtomicU64::new(0);
+    static DB_STREAM_CLOSED: AtomicU64 = AtomicU64::new(0);
+    static DB_STREAM_CANCELLED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn mock_db_stream_open(handle: u64, _sql: RString, _params: RString) -> FfiFuture {
+        match *DB_STREAM_MODE.lock().unwrap() {
+            0 => ready(Ok(br#"{"unsupported":true}"#.to_vec())),
+            _ => ready(Ok(
+                format!(r#"{{"stream_id":{}}}"#, handle + 100).into_bytes()
+            )),
+        }
+    }
+    extern "C" fn mock_db_stream_next(handle: u64, stream_id: u64) -> FfiFuture {
+        let _ = (handle, stream_id);
+        let n = DB_STREAM_NEXT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
+        match n {
+            0 => ready(Ok(br#"{"rows":[{"c":1},{"c":2}]}"#.to_vec())),
+            _ => ready(Ok(br#"{"done":true}"#.to_vec())),
+        }
+    }
+    extern "C" fn mock_db_stream_cancel(_h: u64, _sid: u64) -> FfiFuture {
+        DB_STREAM_CANCELLED.fetch_add(1, AtomicOrdering::SeqCst);
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_db_stream_close(_h: u64, _sid: u64) -> FfiFuture {
+        DB_STREAM_CLOSED.fetch_add(1, AtomicOrdering::SeqCst);
+        ready(Ok(b"".to_vec()))
+    }
+
     fn mock_db_vtable() -> &'static DataAccessorVtable {
         Box::leak(Box::new(DataAccessorVtable {
             connect: mock_db_connect,
@@ -1165,6 +1334,10 @@ mod adapter_tests {
             dialect: mock_db_dialect,
             close: mock_db_close,
             schemes: mock_db_schemes,
+            stream_open: mock_db_stream_open,
+            stream_next: mock_db_stream_next,
+            stream_cancel: mock_db_stream_cancel,
+            stream_close: mock_db_stream_close,
         }))
     }
 
@@ -1202,6 +1375,62 @@ mod adapter_tests {
         assert_eq!((h, sql.as_str()), (42, "select ? as c"));
         assert_eq!(params, r#"[1,"x"]"#);
         assert_eq!(da.exec_with_params("delete from t", &[]).await.unwrap(), 3);
+    }
+
+    /// ABI 10：插件报 `{"unsupported":true}` 哨兵 → 回落 fetch_all（db.query 全量）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_stream_unsupported_sentinel_falls_back_to_fetch_all() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 0;
+        DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let mut s = da.stream_query("select 1", &[]).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(r) = futures::StreamExt::next(&mut s).await {
+            rows.push(r.unwrap());
+        }
+        assert_eq!(rows, vec![serde_json::json!({"c":1,"t":"a"})]);
+        // 回落路径不碰游标
+        assert_eq!(DB_STREAM_CLOSED.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// ABI 10：真游标路径——批量 pull 逐行 yield；走完后 guard 只 close 不 cancel。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_stream_batches_pull_and_close_on_completion() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 1;
+        DB_STREAM_NEXT_CALLS.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let mut s = da.stream_query("select 1", &[]).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(r) = futures::StreamExt::next(&mut s).await {
+            rows.push(r.unwrap());
+        }
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"c":1}), serde_json::json!({"c":2})]
+        );
+        // 生成器走完 → guard Drop：只 close（游标已尽，无需 cancel），不泄漏条目
+        assert_eq!(DB_STREAM_CLOSED.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(DB_STREAM_CANCELLED.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// ABI 10：abort（pump 丢弃生成器）→ guard Drop 先 cancel（真取消）再 close（reclaim）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_stream_abort_fires_cancel_then_close() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 1;
+        DB_STREAM_NEXT_CALLS.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let s = da.stream_query("select 1", &[]).await.unwrap();
+        drop(s); // 中途放弃 = abort 语义
+        assert_eq!(DB_STREAM_CANCELLED.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(DB_STREAM_CLOSED.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1317,6 +1546,36 @@ mod adapter_tests {
         ready_err("stub")
     }
 
+    // ---- blob 流式 mock（ABI 10）----
+    static BLOB_STREAM_OPENED: Mutex<(u64, String, String)> =
+        Mutex::new((0, String::new(), String::new()));
+    static BLOB_STREAM_CHUNK: Mutex<(u64, Vec<u8>)> = Mutex::new((0, Vec::new()));
+    static BLOB_STREAM_FINISHED: AtomicU64 = AtomicU64::new(0);
+    static BLOB_STREAM_ABORTED: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn mock_blob_put_stream_open(handle: u64, key: RString, ct: RString) -> FfiFuture {
+        *BLOB_STREAM_OPENED.lock().unwrap() = (handle, key[..].to_string(), ct[..].to_string());
+        ready(Ok(br#"{"upload_id":77}"#.to_vec()))
+    }
+    extern "C" fn mock_blob_put_stream_chunk(_h: u64, id: u64, bytes: RBytes) -> FfiFuture {
+        let mut b = Vec::with_capacity(bytes.len());
+        for x in &bytes {
+            b.push(*x);
+        }
+        *BLOB_STREAM_CHUNK.lock().unwrap() = (id, b);
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_put_stream_finish(_h: u64, id: u64) -> FfiFuture {
+        BLOB_STREAM_FINISHED.fetch_add(1, AtomicOrdering::SeqCst);
+        let _ = id;
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_put_stream_abort(_h: u64, id: u64) -> FfiFuture {
+        BLOB_STREAM_ABORTED.fetch_add(1, AtomicOrdering::SeqCst);
+        let _ = id;
+        ready(Ok(b"".to_vec()))
+    }
+
     fn mock_blob_vtable() -> &'static BlobBackendVtable {
         Box::leak(Box::new(BlobBackendVtable {
             connect: mock_blob_connect,
@@ -1327,6 +1586,10 @@ mod adapter_tests {
             upload_url: mock_blob_upload_url,
             content_type: mock_blob_content_type,
             close: mock_blob_close,
+            put_stream_open: mock_blob_put_stream_open,
+            put_stream_chunk: mock_blob_put_stream_chunk,
+            put_stream_finish: mock_blob_put_stream_finish,
+            put_stream_abort: mock_blob_put_stream_abort,
         }))
     }
 
@@ -1354,6 +1617,32 @@ mod adapter_tests {
         assert_eq!(b.get("k").await.unwrap(), b"blobdata");
         let (h, key) = BLOB_GET.lock().unwrap().clone();
         assert_eq!((h, key.as_str()), (42, "k"));
+    }
+
+    /// ABI 10：put_stream_* 四槽转发（open 产 upload_id、chunk 字节、finish/abort 计数）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_put_stream_forwards_all_slots() {
+        let _g = T_LOCK.lock().unwrap();
+        BLOB_STREAM_FINISHED.store(0, AtomicOrdering::SeqCst);
+        BLOB_STREAM_ABORTED.store(0, AtomicOrdering::SeqCst);
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        let id = b
+            .put_stream_open("a/big.bin", Some("video/mp4"))
+            .await
+            .unwrap();
+        assert_eq!(id, 77);
+        let (h, key, ct) = BLOB_STREAM_OPENED.lock().unwrap().clone();
+        assert_eq!(
+            (h, key.as_str(), ct.as_str()),
+            (42, "a/big.bin", "video/mp4")
+        );
+        b.put_stream_chunk(id, b"chunk-bytes").await.unwrap();
+        let (cid, bytes) = BLOB_STREAM_CHUNK.lock().unwrap().clone();
+        assert_eq!((cid, bytes.as_slice()), (77, &b"chunk-bytes"[..]));
+        b.put_stream_finish(id).await.unwrap();
+        assert_eq!(BLOB_STREAM_FINISHED.load(AtomicOrdering::SeqCst), 1);
+        b.put_stream_abort(id).await.unwrap();
+        assert_eq!(BLOB_STREAM_ABORTED.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// ABI 9：upload_url 转发（op JSON 透传、响应 JSON 原样解析）。

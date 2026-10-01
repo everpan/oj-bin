@@ -10,12 +10,20 @@ use serde_json::{Value, json};
 use super::ReqState;
 
 /// 上传文件（multipart；op_http_info 只出元信息，字节经 op_http_file 按索引取）。
+/// ABI 10（v0.1.38）起：大文件由服务端**流式**落 blob，`bytes` 置空、`key`/`url` 回填
+/// （handler 经 `blob.get(key)` / `files[i].url` 取）；小文件（≤ max_upload）行为不变。
 #[derive(Default, Clone)]
 pub struct UploadedFile {
     pub field: String,
     pub filename: String,
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
+    /// 文件总字节数（流式文件 bytes 为空，size 仍准确）。
+    pub size: u64,
+    /// 流式落 blob 的对象 key（小文件缓冲路径为 None）。
+    pub key: Option<String>,
+    /// 流式文件的下载/外链地址（blob.url(key)）。
+    pub url: Option<String>,
 }
 
 /// 一次 HTTP 请求的上下文（由 server 层填充）。
@@ -69,12 +77,16 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
             "field": f.field,
             "filename": f.filename,
             "content_type": f.content_type,
-            "size": f.bytes.len(),
+            "size": if f.size > 0 { f.size } else { f.bytes.len() as u64 },
+            // 流式大文件（ABI 10）：bytes 不进 handler，key/url 指向 blob 对象。
+            "key": f.key,
+            "url": f.url,
         })).collect::<Vec<_>>(),
     })
 }
 
 /// http.file(i) → 第 i 个上传文件字节（越界 Err "no such file"）。
+/// 流式大文件（key 有值、bytes 空）明确报错指路，不静默给空字节。
 /// async + #[buffer] 返回（sync buffer-return 在 fast-call 路径卡死；与 blob ops 同款契约）。
 #[op2]
 #[buffer]
@@ -84,11 +96,15 @@ pub async fn op_http_file(
 ) -> Result<Vec<u8>, JsErrorBox> {
     let s = state.borrow();
     let r = s.borrow::<ReqState>();
-    r.req
-        .files
-        .get(i as usize)
-        .map(|f| f.bytes.clone())
-        .ok_or_else(|| JsErrorBox::generic(format!("no such file: {i}")))
+    match r.req.files.get(i as usize) {
+        None => Err(JsErrorBox::generic(format!("no such file: {i}"))),
+        Some(f) if f.key.is_some() && f.bytes.is_empty() => Err(JsErrorBox::generic(format!(
+            "file {i} ('{}') was streamed to blob key '{}' — use blob.get() or http.files[{i}].url (http.file() only serves small buffered uploads)",
+            f.filename,
+            f.key.as_deref().unwrap_or_default()
+        ))),
+        Some(f) => Ok(f.bytes.clone()),
+    }
 }
 
 /// http.bodyBytes()：当前请求/帧的原始字节（WS 文本与二进制帧都可用；HTTP 请求

@@ -1429,7 +1429,7 @@ curl -s 'http://localhost:9778/v1/api/user/enc/?id=1' | head -c 200
 
 ---
 
-## 场景 23：大表流式导出（db.stream，v0.1.37）
+## 场景 23：大表流式导出（db.stream，v0.1.37；v0.1.38 起插件后端真流式）
 
 **什么时候用**：你要遍历一张大表（导出 CSV / ETL / 批量重算），如果 `db.query` 一次性把全量拉进
 内存，结果集越大越容易撑爆 handler 内存、或撞上信封体积上限。`db.stream` 逐行拉取，常驻内存只
@@ -1502,8 +1502,9 @@ curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
 
 | 报错 / 现象 | 原因 |
 |---|---|
-| `db.stream within an active transaction is not supported in Phase A (ABI 10 required)` | 在 `db.tx(...)` 回调里调用了 `db.stream`——Phase A 只支持直连池，先 `db.query` 取 id 集再在 tx 内逐条处理，或把流式放到 tx 外 |
-| `backend does not support streaming (ABI 10 required)` | 后端是 FFI 插件（`oj-db-mysql` 等经 `oj-plugin-ffi` 加载）；Phase A 插件走 `stream_query` 默认实现报错，须等 PR-2 Phase B（ABI 10 vtable） |
+| `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 在 `db.tx(...)` 回调里调用了 `db.stream`——流式只走直连池。先 `db.query` 取 id 集再在 tx 内逐条处理，或把流式放到 tx 外 |
+| `db.stream` 在第三方插件后端上"能跑但不省内存" | 该插件未实现 ABI 10 流式槽（open 哨兵 `{"unsupported":true}`）→ 宿主静默回落 `db.query` 全量。第一方 `oj-db-mysql`/`oj-db-postgres`（v0.1.38 起）真流式 |
+| 取消不是立即生效（插件后端） | 插件取消是**协作式**（批间生效）：`stream_cancel` 置标志后，下一批返回 `{"error":"cancelled"}`；core 后端 = 中途 drop（best-effort） |
 | 写了 `json.ok(...)` 又 `json.stream` | 流式响应已接管 body，二者互斥——用了 `json.stream` 就别再 `json.ok/fail`，handler 直接 `return` |
 | `for await` 拿到的 `row` 是 `undefined` | 流结束哨兵是 `null`，但迭代器形态已为你消化；直接在循环体用 `row` 即可，不要等 `undefined` |
 | 取消后已处理的行「回滚」了 | `signal` 只中止**后续拉取**，已回调/已迭代的行不会回滚——取消前的数据已是最终态 |

@@ -84,16 +84,17 @@ pub trait DataAccessor: Send + Sync {
     /// 参数化执行，返回受影响行数。
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
 
-    /// 流式查询（PR-2 Phase A）：返回逐行流，调用方逐批/逐行消费，避免 `fetch_all` 全量入内存
-    /// （大表导出 / 游标回传）。不进 vtable，故插件后端（`FfiDataAccessor`）走默认实现报错——
-    /// 「backend does not support streaming (ABI 10 required)」，由 PR-2 Phase B 经 vtable 实现。
+    /// 流式查询：返回逐行流，调用方逐批/逐行消费，避免 `fetch_all` 全量入内存
+    /// （大表导出 / 游标回传）。核心 `SqlxAccessor` / `InMemoryAccessor` 与 ABI 10 起
+    /// 的 `FfiDataAccessor`（vtable `stream_open/next/cancel/close` 批量 pull）均实现；
+    /// 未覆盖的进程内后端走默认实现报「backend does not support streaming」。
     /// 行以 `Result<Row, String>` 传递：Ok = 一行，Err = 流中途错误（pump 转为错误终态）。
     async fn stream_query(
         &self,
         _sql: &str,
         _params: &[Value],
     ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
-        Err("backend does not support streaming (ABI 10 required)".into())
+        Err("backend does not support streaming".into())
     }
 }
 
@@ -449,7 +450,7 @@ pub async fn op_db_stream_open(
         Target::Pool(da) => da,
         Target::Tx(_) => {
             return Err(JsErrorBox::generic(
-                "db.stream within an active transaction is not supported in Phase A (ABI 10 required)",
+                "db.stream within an active transaction is not supported (streaming queries run on the connection pool only)",
             ));
         }
     };

@@ -30,4 +30,14 @@ pub struct BlobBackendVtable {
     /// ok 值 = content-type 字符串字节（无 → 空串）。
     pub content_type: extern "C" fn(handle: u64, key: RString) -> FfiFuture,
     pub close: extern "C" fn(handle: u64),
+    /// ABI 10 起：流式上传——开会话。content_type 空串 = 无显式 ct。
+    /// ok 值 = `{"upload_id":u64}`；不支持流式的后端返回 Err（宿主回落整体缓冲 put）。
+    pub put_stream_open:
+        extern "C" fn(handle: u64, key: RString, content_type: RString) -> FfiFuture,
+    /// 追加一块字节（大小不限；s3 插件内部按 ≥5MiB 攒 part）。
+    pub put_stream_chunk: extern "C" fn(handle: u64, upload_id: u64, bytes: RBytes) -> FfiFuture,
+    /// 提交会话（local = 临时文件转正 + ct sidecar；s3 = complete multipart）。
+    pub put_stream_finish: extern "C" fn(handle: u64, upload_id: u64) -> FfiFuture,
+    /// 失败清理（**必加**：s3 abort multipart 防 orphan parts 烧钱；local 删临时文件）。
+    pub put_stream_abort: extern "C" fn(handle: u64, upload_id: u64) -> FfiFuture,
 }

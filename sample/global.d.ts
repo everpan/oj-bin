@@ -162,6 +162,7 @@ interface HttpApi {
   // multipart 上传文件元信息（非 multipart 为空数组）。
   files: UploadedFileMeta[];
   // 取第 i 个上传文件的字节（越界报错 no such file）。
+  // 仅小文件（≤ max_upload）有字节；流式大文件报错并指路 files[i].key/.url（v0.1.38）。
   file(i: number): Promise<Uint8Array>;
 }
 
@@ -173,11 +174,17 @@ interface AuthUser {
 }
 
 // multipart 上传文件元信息。
+// 大文件（> max_upload）由服务端流式落 blob（v0.1.38）：bytes 拿不到（http.file 报错），
+// 用 key/url 取——blob.get(key) 读全文、url 直接下载/外链。
 interface UploadedFileMeta {
   field: string;
   filename: string;
   content_type: string;
   size: number;
+  // 流式大文件的 blob 对象 key（小文件为 null）。
+  key: string | null;
+  // 流式大文件的下载地址（小文件为 null）。
+  url: string | null;
 }
 
 // log.* ：结构化日志（zap SugaredLogger 风格：msg + 交替键值对）。

@@ -6,7 +6,7 @@
 > 本手册讲「怎么上手、为什么这样设计」。逐 API 的穷举式参考见
 > [`docs/devkit/api-manual.md`](devkit/api-manual.md) 第 6 章「db / DB(name)」。
 > 所有 API 名、字段名、报错文案均与源码（`src/bridge/bootstrap.js`、`src/bridge/query.rs`、
-> `src/bridge/db.rs`）逐字核对，版本 0.1.28。
+> `src/bridge/db.rs`）逐字核对，版本 0.1.37。
 >
 > 文中「fail-fast」= 发现问题立刻报错退出；「白名单」= 只有预先声明过的表/列才能被
 > 访问，其余一律拒绝。
@@ -185,6 +185,7 @@ where（构造器条件对象自带 `.has("tenant_id")` 检查，见 [§5.3](#53
 |---|---|---|---|
 | `query` | `query(sql, params?)` | `Promise<行数组>` | 原生参数化查询 |
 | `exec` | `exec(sql, params?)` | `Promise<受影响行数>` | 原生参数化执行 |
+| `stream` | `stream(sql, params?, opts?)` | `Promise<void>` \| `AsyncIterable<行>` | 流式查询（逐行拉取，v0.1.37，见 §3.1） |
 | `table` | `table(name)` | 查询构造器 | 安全构造器（本手册主角） |
 | `fromJSON` | `fromJSON(snapshot)` | 查询构造器 | 从 toJSON 快照恢复 |
 | `tx` | `tx(async (tx) => {...})` | `Promise<fn 返回值>` | 事务 |
@@ -207,6 +208,35 @@ const n = await db.exec("update account set role = ? where id = ?", ["user", 7])
 - `params` 可省略（无参便捷形式）。
 - 裸 SQL 也过归属守卫：SQL 里出现的表必须是你模块拥有的或已声明 deps 的。
 - 表名/列名无法参数化——动态标识符请改用 `db.table()` 构造器（白名单）。
+
+### 3.1 流式查询（`db.stream`，v0.1.37）
+
+`db.query` 会把整张结果集拉进内存；导出、ETL、大表遍历这类场景应该改用 `db.stream`——
+**逐行**从后端拉取，一边收一边处理（写 `json.stream` 推流、落库、累积聚合），常驻内存只有一行：
+
+```ts
+// 回调形态（推荐）：Promise 在流走完后 resolve，异常 reject
+const s = json.stream({ contentType: "text/csv" });
+s.write("id,name\n");
+await db.stream("select id, name from account order by id", null, {
+  onRow: (row) => s.write(`${row.id},${row.name}\n`),
+});
+s.end();
+
+// 异步迭代器形态（逃生舱）：for await 消费
+for await (const row of db.stream("select id, name from account order by id")) {
+  console.log(row);
+}
+```
+
+- 结果与 `db.query` **内容一致**（同一查询逐行 ≡ 全量数组），差异只在内存形态。
+- 取消：传 `opts.signal`（`AbortController.signal`），`abort` 事件触发即中止后端拉取；
+  已回调的行不会回滚。core 后端为 best-effort drop；插件后端为协作式取消（批间生效）。
+- **事务内不可用**：`db.stream` 只走 `DB(name)` 直连池，在 `db.tx(...)` 内调用直接报错。
+- 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
+  InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）
+  真流式；第三方插件未实现流式槽 → 回落 `db.query` 全量（不报错，仅失去内存优势）。
+- 裸 SQL 同样过归属守卫与多租户防护（与 `db.query` 相同）。
 
 ---
 
@@ -623,6 +653,7 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `transaction active on db 'x' …` | 事务中碰了别的库 | 先 commit/rollback |
 | `transaction already active (nested tx not supported)` | 嵌套 `db.tx` | 复用当前 tx 回调对象 |
 | `db: instance 'x' not configured` | `DB("x")` 未在 config.db 声明 | 补 DSN 或改库名 |
+| `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 事务内调 `db.stream` | 移到事务外（流式只走直连池，见 §3.1） |
 
 ---
 

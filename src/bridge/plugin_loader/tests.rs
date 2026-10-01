@@ -699,6 +699,15 @@ extern "C" fn pl_blob_put(
 ) -> FfiFuture {
     oj_plugin_ffi::ready_err("stub")
 }
+extern "C" fn pl_blob_put_stream_stub1(_h: u64, _k: RString, _ct: RString) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_blob_put_stream_stub2(_h: u64, _id: u64, _b: oj_plugin_ffi::RBytes) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
+extern "C" fn pl_blob_put_stream_stub3(_h: u64, _id: u64) -> FfiFuture {
+    oj_plugin_ffi::ready_err("stub")
+}
 extern "C" fn pl_blob_close(_h: u64) {}
 
 static PL_BLOB_VT: BlobBackendVtable = BlobBackendVtable {
@@ -710,6 +719,10 @@ static PL_BLOB_VT: BlobBackendVtable = BlobBackendVtable {
     upload_url: pl_blob_upload_url,
     content_type: pl_blob_stub,
     close: pl_blob_close,
+    put_stream_open: pl_blob_put_stream_stub1,
+    put_stream_chunk: pl_blob_put_stream_stub2,
+    put_stream_finish: pl_blob_put_stream_stub3,
+    put_stream_abort: pl_blob_put_stream_stub3,
 };
 
 /// 七类加载失败的 Display 文案（运维 / CLI 报错可读，spec §4 失败分类）。

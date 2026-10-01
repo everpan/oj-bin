@@ -427,28 +427,12 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
     // 用 blob_upload_max（默认 1 GiB），其余维持 2x max_upload 硬顶——**不能**把全局
     // 层抬到 1 GiB（handler 路由会被动接受巨体缓冲，内存 DoS 面扩大）。超限裸 413，
     // 与旧 DefaultBodyLimit 行为逐字节一致。
+    // v0.1.38（ABI 10）：顶部不再无条件 `to_bytes` 整段缓冲——blob 直传腿与
+    // multipart 腿改为**流式**消费（put_stream_* / multer 流式解析，内存恒定），
+    // 其余腿（非 multipart 的小体）在 run_route 内缓冲，上限语义不变。
     let is_blob_put = verb == "PUT"
         && st.pipeline.blob.is_some()
         && uri.path().starts_with(&format!("{}/blob/", st.base));
-    let body_limit = if is_blob_put {
-        st.pipeline.blob_upload_max as usize
-    } else {
-        (st.pipeline.max_upload.saturating_mul(2)) as usize
-    };
-    let body = match axum::body::to_bytes(body, body_limit).await {
-        Ok(b) => b,
-        Err(_) => {
-            // blob 直传腿给信封 413（与 handler 面 413 语义一致）；其余腿维持旧
-            // DefaultBodyLimit 的裸 413（空体），逐字节兼容存量部署/探测脚本。
-            if is_blob_put {
-                return fail_response(413, "upload too large");
-            }
-            return Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(axum::body::Body::empty())
-                .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
-        }
-    };
 
     // Certificate validation: restrict GET requests when certificate is expired or in grace period
     if verb == "GET" {
@@ -550,8 +534,11 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
     }
     // blob 直传上传（v0.1.30）：`PUT {base}/blob/{key}`。写面必须过守卫（GET 公开是
     // 读语义；上传公开 = 任意人写你的存储）。经 admit()（鉴权 + 租户，同 run_route 语义），
-    // 体积上限走 blob_upload_max 档（handle 顶部已按路径放宽 body 限长）。不经 JsActor：
-    // 无 handler 30s timeout。anonymous_paths 可用 `/blob/**` 显式豁免（自甘风险）。
+    // 体积上限走 blob_upload_max 档。不经 JsActor：无 handler 30s timeout。
+    // anonymous_paths 可用 `/blob/**` 显式豁免（自甘风险）。
+    // v0.1.38（ABI 10）：body 流式 `put_stream_open/chunk/finish` 直落后端（local 落盘 /
+    // s3 multipart），内存恒定；后端不支持流式（put_stream_open Err）回落整段缓冲 put
+    // （上限 blob_upload_max，语义与旧版一致）。
     if is_blob_put
         && let Some(blob) = st.pipeline.blob.as_ref()
         && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
@@ -561,27 +548,7 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
         if let Err(resp) = admit(&st, &headers, verb, Some(&path_no_base)) {
             return *resp;
         }
-        // 体积上限在 handle 顶部按路径分档已 enforcement（blob 腿 = blob_upload_max，
-        // 超限在 to_bytes 处即 413 信封）——此处 body 必不超档，无需再检。
-        let ct = headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        return match blob.put(&key, &body, ct.as_deref()).await {
-            Ok(()) => {
-                let mut r = Response::new(axum::body::Body::from(only_js::bridge::ok(
-                    &serde_json::Value::Null,
-                )));
-                *r.status_mut() = StatusCode::OK;
-                r.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/json"),
-                );
-                apply_custom_headers(&mut r, &st.static_opts.response_headers);
-                r
-            }
-            Err(_) => fail_response(500, "blob upload failed"),
-        };
+        return blob_put_direct(&st, blob.clone(), &key, &headers, body).await;
     }
     // 去 base 路径（鉴权匿名匹配用；不在 base 下 → None = 不设防）。
     let path_no_base = crate::routes::normalize(uri.path())
@@ -678,7 +645,7 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
 async fn run_route(
     st: &AppState,
     headers: &HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
     verb: &str,
     query: HashMap<String, String>,
     path_no_base: Option<&str>,
@@ -695,15 +662,36 @@ async fn run_route(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    // 上传/请求体上限（信封 413）；超 2x 的已在 handle() 分档限长处被拒。
-    if body.len() > st.pipeline.max_upload as usize {
-        return fail_response(413, "upload too large");
-    }
-    // multipart：文本字段并入 body（{name: value}），文件入 files。
-    let (body_bytes, files) = if is_multipart(headers) {
-        parse_multipart(headers, &body).await
+    // v0.1.38（ABI 10）：multipart + blob 已配置 → **流式**解析（文件字段直落 blob，
+    // 内存恒定；大文件不再受 max_upload 硬顶约束，单文件上限 blob_upload_max）；
+    // 其余（非 multipart，或未配 blob）维持整体缓冲（上限 2x max_upload；超 max_upload
+    // 信封 413、超 2x 裸 413——与旧 DefaultBodyLimit 行为逐字节一致）。
+    let (body_bytes, files) = if is_multipart(headers) && st.pipeline.blob.is_some() {
+        match stream_multipart(st, headers, body).await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        }
     } else {
-        (body.to_vec(), Vec::new())
+        let buffered =
+            match axum::body::to_bytes(body, (st.pipeline.max_upload.saturating_mul(2)) as usize)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(axum::body::Body::empty())
+                        .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
+                }
+            };
+        if buffered.len() > st.pipeline.max_upload as usize {
+            return fail_response(413, "upload too large");
+        }
+        if is_multipart(headers) {
+            parse_multipart(headers, &buffered).await
+        } else {
+            (buffered.to_vec(), Vec::new())
+        }
     };
     let req = RequestInfo {
         method: verb.to_string(),
@@ -1566,8 +1554,294 @@ fn is_multipart(headers: &HeaderMap) -> bool {
         .is_some_and(|s| s.starts_with("multipart/form-data"))
 }
 
+/// blob 直传 PUT 的执行体（v0.1.38）：流式 `put_stream_*` 优先（内存恒定，总量闸
+/// blob_upload_max，超限 abort + 信封 413）；后端不支持流式（put_stream_open Err，
+/// 如旧形态后端/网关类实现）→ 回落整段缓冲 put（上限 blob_upload_max，语义同旧版）。
+async fn blob_put_direct(
+    st: &AppState,
+    blob: std::sync::Arc<dyn only_js::bridge::BlobBackend>,
+    key: &str,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+) -> Response {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let ok_resp = || {
+        let mut r = Response::new(axum::body::Body::from(only_js::bridge::ok(
+            &serde_json::Value::Null,
+        )));
+        *r.status_mut() = StatusCode::OK;
+        r.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        apply_custom_headers(&mut r, &st.static_opts.response_headers);
+        r
+    };
+    match blob.put_stream_open(key, ct.as_deref()).await {
+        Ok(upload_id) => {
+            let mut total: u64 = 0;
+            let mut too_large = false;
+            let mut err: Option<String> = None;
+            let mut ds = body.into_data_stream();
+            use futures_util::StreamExt;
+            while let Some(chunk) = ds.next().await {
+                match chunk {
+                    Ok(b) => {
+                        total += b.len() as u64;
+                        if total > st.pipeline.blob_upload_max {
+                            too_large = true;
+                            break;
+                        }
+                        if let Err(e) = blob.put_stream_chunk(upload_id, &b).await {
+                            err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        err = Some(format!("read body: {e}"));
+                        break;
+                    }
+                }
+            }
+            if too_large || err.is_some() {
+                let _ = blob.put_stream_abort(upload_id).await;
+                if too_large {
+                    return fail_response(413, "upload too large");
+                }
+                tracing::warn!(
+                    key,
+                    err = err.as_deref().unwrap_or("?"),
+                    "blob streaming upload failed"
+                );
+                return fail_response(500, "blob upload failed");
+            }
+            match blob.put_stream_finish(upload_id).await {
+                Ok(()) => ok_resp(),
+                Err(_) => fail_response(500, "blob upload failed"),
+            }
+        }
+        // 回落：整段缓冲（上限 blob_upload_max）。
+        Err(_) => match axum::body::to_bytes(body, st.pipeline.blob_upload_max as usize).await {
+            Ok(b) => match blob.put(key, &b, ct.as_deref()).await {
+                Ok(()) => ok_resp(),
+                Err(_) => fail_response(500, "blob upload failed"),
+            },
+            Err(_) => fail_response(413, "upload too large"),
+        },
+    }
+}
+
+/// 流式上传的对象 key（服务端代分配；handler 经 `http.files[i].key`/`.url` 取）。
+/// `uploads/<ns 时间戳>-<进程内序号>-<安全化文件名>`——段非空、无穿越字符（valid_key 直通）。
+fn gen_upload_key(filename: &str) -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = safe.trim_matches(|c| c == '.' || c == '_').to_string();
+    let safe = if safe.is_empty() {
+        "file.bin".to_string()
+    } else {
+        safe
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "uploads/{nanos:x}-{}-{safe}",
+        N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
+/// multer 错误 → 响应：超限 413（FieldSizeExceeded / StreamSizeExceeded），其余 400。
+fn multipart_err_response(e: multer::Error) -> Response {
+    match &e {
+        multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => {
+            fail_response(413, "upload too large")
+        }
+        _ => fail_response(400, &format!("multipart parse: {e}")),
+    }
+}
+
+/// ABI 10 流式 multipart 解析（v0.1.38）：
+/// - 文本字段：缓冲并入 body（{name: value}），累计 ≤ max_upload（防内存 DoS）；
+/// - 文件字段 ≤ max_upload：缓冲进 bytes（`http.file(i)` 旧行为不变）；
+/// - 文件字段 > max_upload：**转流式** `put_stream_*` 直落 blob（单文件上限
+///   blob_upload_max），bytes 置空、`key`/`url` 回填（大文件走 `blob.get(key)` /
+///   `files[i].url`）；任意失败 abort 会话（防 local 临时文件泄漏 / s3 orphan parts）。
+///   multer 总闸 = max_upload + blob_upload_max；multer 报超限 → 413。
+async fn stream_multipart(
+    st: &AppState,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+) -> Result<(Vec<u8>, Vec<UploadedFile>), Box<Response>> {
+    let boundary = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split("boundary=").nth(1))
+        .map(|b| b.trim().trim_matches('"'))
+        .unwrap_or_default();
+    let blob = st
+        .pipeline
+        .blob
+        .as_ref()
+        .expect("caller checked blob configured");
+    let max_up = st.pipeline.max_upload;
+    let blob_cap = st.pipeline.blob_upload_max;
+    let constraints = multer::Constraints::new().size_limit(
+        multer::SizeLimit::new()
+            .whole_stream(max_up + blob_cap)
+            .per_field(blob_cap),
+    );
+    let mut mp =
+        multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
+    let mut fields = serde_json::Map::new();
+    let mut files = Vec::new();
+    while let Some(mut field) = mp
+        .next_field()
+        .await
+        .map_err(multipart_err_response)
+        .map_err(Box::new)?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        let filename = field.file_name().unwrap_or_default().to_string();
+        let content_type = field.content_type().map(|c| c.to_string());
+        if filename.is_empty() {
+            // 文本字段：缓冲（累计 ≤ max_upload；multer per_field 闸是 blob_cap，
+            // 文本内存闸以本计数为准，先到先拦）。
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if buf.len() as u64 + chunk.len() as u64 > max_up {
+                            return Err(Box::new(fail_response(413, "upload too large")));
+                        }
+                        buf.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(Box::new(multipart_err_response(e))),
+                }
+            }
+            fields.insert(
+                name,
+                serde_json::Value::String(String::from_utf8_lossy(&buf).into_owned()),
+            );
+        } else {
+            // 文件字段：缓冲到 max_upload 为止；超过转流式（blob_cap 闸）。
+            let mut buf: Vec<u8> = Vec::new();
+            let mut session: Option<(u64, String)> = None;
+            let mut total: u64 = 0;
+            let mut too_large = false;
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        total += chunk.len() as u64;
+                        if total > blob_cap {
+                            too_large = true;
+                            break;
+                        }
+                        if session.is_none() && buf.len() as u64 + chunk.len() as u64 > max_up {
+                            // 缓冲阈值越过 → 转流式：开 session + flush 已缓冲字节
+                            let key = gen_upload_key(&filename);
+                            match blob.put_stream_open(&key, content_type.as_deref()).await {
+                                Ok(id) => {
+                                    if let Err(e) = blob.put_stream_chunk(id, &buf).await {
+                                        let _ = blob.put_stream_abort(id).await;
+                                        return Err(Box::new(fail_response(
+                                            500,
+                                            &format!("blob upload failed: {e}"),
+                                        )));
+                                    }
+                                    buf = Vec::new();
+                                    session = Some((id, key));
+                                }
+                                Err(_) => {
+                                    // 后端不支持流式且文件 > max_upload：无可回落面（
+                                    // 缓冲会突破内存闸）→ 413 拒绝
+                                    return Err(Box::new(fail_response(413, "upload too large")));
+                                }
+                            }
+                        }
+                        if let Some((id, _)) = session.as_ref() {
+                            if let Err(e) = blob.put_stream_chunk(*id, &chunk).await {
+                                let _ = blob.put_stream_abort(*id).await;
+                                return Err(Box::new(fail_response(
+                                    500,
+                                    &format!("blob upload failed: {e}"),
+                                )));
+                            }
+                        } else {
+                            buf.extend_from_slice(&chunk);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        if let Some((id, _)) = session.take() {
+                            let _ = blob.put_stream_abort(id).await;
+                        }
+                        return Err(Box::new(multipart_err_response(e)));
+                    }
+                }
+            }
+            if too_large {
+                if let Some((id, _)) = session.take() {
+                    let _ = blob.put_stream_abort(id).await;
+                }
+                return Err(Box::new(fail_response(413, "upload too large")));
+            }
+            if let Some((id, key)) = session {
+                // 流式完成：bytes 不回填，key/url 交给 handler
+                match blob.put_stream_finish(id).await {
+                    Ok(()) => {
+                        let url = blob.url(&key).await.ok();
+                        files.push(UploadedFile {
+                            field: name,
+                            filename,
+                            content_type,
+                            bytes: Vec::new(),
+                            size: total,
+                            key: Some(key),
+                            url,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(Box::new(fail_response(
+                            500,
+                            &format!("blob upload failed: {e}"),
+                        )));
+                    }
+                }
+            } else {
+                // 小文件（≤ max_upload）：旧行为，bytes 回填
+                files.push(UploadedFile {
+                    field: name,
+                    filename,
+                    content_type,
+                    bytes: buf,
+                    size: total,
+                    key: None,
+                    url: None,
+                });
+            }
+        }
+    }
+    Ok((serde_json::to_vec(&fields).unwrap_or_default(), files))
+}
+
 /// multer 解析：文本字段 → {name: value}，文件 → Vec<UploadedFile>。
 /// body 已整体在内存（DefaultBodyLimit 上限内），用 once stream 喂 multer。
+/// （v0.1.38 起仅 blob 未配置/小文件路径经此；流式路径见 `stream_multipart`。）
 async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<UploadedFile>) {
     let boundary = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -1596,7 +1870,10 @@ async fn parse_multipart(headers: &HeaderMap, body: &[u8]) -> (Vec<u8>, Vec<Uplo
                 field: name,
                 filename,
                 content_type,
+                size: bytes.len() as u64,
                 bytes,
+                key: None,
+                url: None,
             });
         }
     }
@@ -1713,6 +1990,16 @@ pub(crate) mod tests {
         dir: PathBuf,
         blob: Arc<dyn BlobBackend>,
     ) -> std::net::SocketAddr {
+        spawn_blob_with(base, dir, blob, Pipeline::default()).await
+    }
+
+    /// spawn_blob + 自定义 Pipeline（流式上传测试用：max_upload / blob_upload_max 分档）。
+    async fn spawn_blob_with(
+        base: &str,
+        dir: PathBuf,
+        blob: Arc<dyn BlobBackend>,
+        mut pipeline: Pipeline,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let table = build_table(&dir, true, base);
@@ -1735,10 +2022,7 @@ pub(crate) mod tests {
             )
         });
         let base = base.to_string();
-        let pipeline = Pipeline {
-            blob: Some(blob),
-            ..Default::default()
-        };
+        pipeline.blob = Some(blob);
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
@@ -1789,6 +2073,174 @@ pub(crate) mod tests {
             eprintln!("build_table failures: {failures:?}");
         }
         t
+    }
+
+    /// ABI 10 流式 multipart：大文件（> max_upload）转 put_stream 落 blob——bytes 置空、
+    /// key/url 回填、handler 经 blob.get(key) 取回全文、http.file(i) 明确报错指路；
+    /// 小文件（≤ max_upload）仍缓冲（http.file(i) 兼容）；文本字段语义不变。
+    #[tokio::test]
+    async fn multipart_streaming_big_file_to_blob_small_file_buffered() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() {\n\
+               const f = http.files[0];\n\
+               let fileErr = null, content = null, blobLen = null;\n\
+               try { const b = await http.file(0); content = b.length; } catch (e) { fileErr = String(e); }\n\
+               if (f && f.key) blobLen = (await blob.get(f.key)).length;\n\
+               json.ok({ name: f ? f.filename : null, size: f ? f.size : null, key: f && f.key ? f.key : null, url: f && f.url ? true : false, fileErr, content, blobLen, note: http.body.note });\n\
+             } };",
+        )]);
+        let root = std::env::temp_dir().join(format!("oj-blob-srm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                max_upload: 8,
+                blob_upload_max: 64000,
+                ..Default::default()
+            },
+        )
+        .await;
+        let send = |body: String| {
+            format!(
+                "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        // 大文件 10000B（> max_upload=8）→ 流式落 blob
+        let big = "A".repeat(10000);
+        let body = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.txt\"\r\n\r\n{big}\r\n--X-BND--\r\n"
+        );
+        let r = raw_http(addr, &send(body)).await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "1: {r}");
+        assert_eq!(v["data"]["name"], "big.txt", "{v}");
+        assert_eq!(v["data"]["size"], 10000, "{v}");
+        let key = v["data"]["key"]
+            .as_str()
+            .expect("streamed file must have key");
+        assert!(key.starts_with("uploads/"), "{v}");
+        assert_eq!(v["data"]["url"], true, "{v}");
+        assert_eq!(
+            v["data"]["blobLen"], 10000,
+            "handler 经 blob.get(key) 取回全文: {v}"
+        );
+        assert_eq!(v["data"]["content"], Value::Null, "{v}");
+        assert!(
+            v["data"]["fileErr"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streamed to blob"),
+            "{v}"
+        );
+        assert_eq!(v["data"]["note"], "hi", "{v}");
+        // 小文件 5B（≤ max_upload=8）→ 旧行为：bytes 回填，key 为空
+        let body = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"s.txt\"\r\n\r\nsmall\r\n--X-BND--\r\n"
+        );
+        let r = raw_http(addr, &send(body)).await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "2: {r}");
+        assert_eq!(v["data"]["content"], 5, "{v}");
+        assert_eq!(v["data"]["key"], Value::Null, "{v}");
+        assert_eq!(v["data"]["blobLen"], Value::Null, "{v}");
+        assert_eq!(v["data"]["fileErr"], Value::Null, "{v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ABI 10 流式 multipart：单文件超 blob_upload_max → abort 会话 + 413。
+    #[tokio::test]
+    async fn multipart_streaming_oversize_field_413() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() { json.ok({}); } };",
+        )]);
+        let root = std::env::temp_dir().join(format!("oj-blob-sr4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                max_upload: 8,
+                blob_upload_max: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+        let big = "B".repeat(200);
+        let body = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\r\n{big}\r\n--X-BND--\r\n"
+        );
+        let req = format!(
+            "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw_http(addr, &req).await;
+        assert!(
+            r.starts_with("HTTP/1.1 413") && r.contains("upload too large"),
+            "{r}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ABI 10 blob 直传 PUT 腿：流式落盘（local put_stream），内容一致；超
+    /// blob_upload_max → 413 信封。
+    #[tokio::test]
+    async fn blob_put_route_streams_to_backend() {
+        let t = routes(&[("n/api.ts", "export default { get() { json.ok({}); } };")]);
+        let root = std::env::temp_dir().join(format!("oj-blob-srp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                blob_upload_max: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+        // PUT 60B（≤100）→ 200；GET 回读一致（经流式腿落盘，非缓冲腿）
+        let body = "C".repeat(60);
+        let req = format!(
+            "PUT /v1/api/blob/stream.bin HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw_http(addr, &req).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "put: {r}");
+        let r = raw_http(
+            addr,
+            "GET /v1/api/blob/stream.bin HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            r.starts_with("HTTP/1.1 200") && r.ends_with(&body),
+            "get: {r}"
+        );
+        // PUT 120B（>100）→ 413 信封（abort 路径无残留）
+        let big = "D".repeat(120);
+        let req = format!(
+            "PUT /v1/api/blob/big.bin HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{big}",
+            big.len()
+        );
+        let r = raw_http(addr, &req).await;
+        assert!(
+            r.starts_with("HTTP/1.1 413") && r.contains("upload too large"),
+            "big: {r}"
+        );
+        assert!(!root.join("big.bin").exists(), "超限对象不得落盘");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn raw_http(addr: std::net::SocketAddr, req: &str) -> String {
@@ -3402,8 +3854,9 @@ pub(crate) mod tests {
             "expected chunked transfer: {r}"
         );
         assert!(r.contains("content-type: text/csv"), "{r}");
-        // 绕过信封：body 即裸 CSV，无 {code,msg,data}。
-        assert!(r.contains("a,b\n1,2\n"), "{r}");
+        // 绕过信封：body 即裸 CSV（chunk 帧可能把两次 write 拆开 → 逐段断言），无 {code,msg,data}。
+        assert!(r.contains("a,b"), "{r}");
+        assert!(r.contains("1,2"), "{r}");
         assert!(!r.contains("\"code\""), "{r}");
     }
 
@@ -3429,7 +3882,9 @@ pub(crate) mod tests {
             r.to_lowercase().contains("content-type: text/event-stream"),
             "{r}"
         );
-        assert!(r.contains("data: hello\n\ndata: world\n\n"), "{r}");
+        // chunk 帧可能拆分两次 write → 逐段断言。
+        assert!(r.contains("data: hello"), "{r}");
+        assert!(r.contains("data: world"), "{r}");
     }
 
     /// 非流式行为不变：普通 json.ok 仍走缓冲信封（回归）。

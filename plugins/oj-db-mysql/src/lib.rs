@@ -20,7 +20,8 @@ use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
 use sqlx::{Column, Row, TypeInfo};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +199,27 @@ struct Client {
     dialect: Dialect,
     next_tx: AtomicU64,
     txs: Mutex<HashMap<u64, Arc<Tx>>>,
+    /// ABI 10 流式游标（stream_id → 行流 + 协作式取消标志）。
+    streams: Mutex<HashMap<u64, Arc<StreamHandle>>>,
+    next_stream: AtomicU64,
 }
+
+/// 流式游标句柄：行流独立成 tokio Mutex（批量推进期间独占），取消标志在外层
+/// 无锁置位。取消是**协作式**（批间生效）：sqlx 驱动层拿不到方言级 CancelToken，
+/// `stream_cancel` 置标志，下一次 `stream_next` 返回 `{"error":"cancelled"}`；
+/// `stream_close` 移除条目（行流 drop = 连接回池）。与 vtable 契约「方言级真取消」
+/// 的偏差已登记（计划文档 §实施状态）。
+struct StreamHandle {
+    rows: tokio::sync::Mutex<
+        Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>>,
+    >,
+    cancelled: AtomicBool,
+    /// 错误延迟上报：错误发生时本批已有行 → 行先交付，错误下一拍给出。
+    pending_error: std::sync::Mutex<Option<String>>,
+}
+
+/// 每次 stream_next 的批量行数上限（spec §1.4：砍逐行 FFI 往返）。
+const STREAM_BATCH: usize = 100;
 
 /// 事务：Option 被 take 后（已完结）再调用报 "tx finished"；Mutex 串行并发 op。
 struct Tx {
@@ -314,7 +335,149 @@ impl Client {
             dialect: dialect_of(dsn),
             next_tx: AtomicU64::new(0),
             txs: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            next_stream: AtomicU64::new(0),
         })
+    }
+
+    /// ABI 10：打开流式游标（async-stream 持有自有 SQL/参数/池——无借用逃逸；
+    /// 双池各自成流：typed MySql 承载 u64/BIGINT UNSIGNED，Any 供离线/测试）。
+    async fn stream_open(&self, sql: &str, params: &[serde_json::Value]) -> Result<u64, String> {
+        let rows: Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>> =
+            match &self.pool {
+                Pooled::MySql(p) => {
+                    let sql = sql.to_string();
+                    let params: Vec<serde_json::Value> = params.to_vec();
+                    let pool = p.clone();
+                    Box::pin(async_stream::stream! {
+                        let mut q: Query<'_, MySql, MySqlArguments> =
+                            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                        for v in &params {
+                            q = bind_value_mysql(q, v);
+                        }
+                        use futures::StreamExt;
+                        let mut rows = q.fetch(&pool);
+                        while let Some(r) = rows.next().await {
+                            match r {
+                                Ok(row) => yield row_to_json_mysql(&row),
+                                Err(e) => {
+                                    yield Err(format!("db stream: {e}"));
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                }
+                Pooled::Any(p) => {
+                    // Any 层无 u64：明确拒绝（勿让 `$oj$u64` 落成静默文本）。
+                    oj_plugin_ffi::jsint::reject_u64_markers(
+                        params,
+                        "the sqlx::Any fallback path cannot carry u64 — use a mysql:// DSN with this plugin",
+                    )?;
+                    let sql = sql.to_string();
+                    let params: Vec<serde_json::Value> = params.to_vec();
+                    let pool = p.clone();
+                    Box::pin(async_stream::stream! {
+                        let mut q: Query<'_, Any, AnyArguments> =
+                            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                        for v in &params {
+                            q = bind_value_any(q, v);
+                        }
+                        use futures::StreamExt;
+                        let mut rows = q.fetch(&pool);
+                        while let Some(r) = rows.next().await {
+                            match r {
+                                Ok(row) => yield Ok(row_to_json_any(&row)),
+                                Err(e) => {
+                                    yield Err(format!("db stream: {e}"));
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                }
+            };
+        let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
+        self.streams.lock().unwrap().insert(
+            id,
+            Arc::new(StreamHandle {
+                rows: tokio::sync::Mutex::new(rows),
+                cancelled: AtomicBool::new(false),
+                pending_error: std::sync::Mutex::new(None),
+            }),
+        );
+        Ok(id)
+    }
+
+    /// 批量拉取（≤100 行），信封响应：{"rows":[...]} / {"done":true} / {"error":"..."}。
+    /// done/err 时条目就地移除，行流 drop = 连接回池（close 再到即幂等 Ok）。
+    async fn stream_next(&self, stream_id: u64) -> Result<Vec<u8>, String> {
+        let cur = {
+            let m = self.streams.lock().unwrap();
+            m.get(&stream_id)
+                .cloned()
+                .ok_or_else(|| format!("db: unknown stream {stream_id}"))?
+        };
+        if cur.cancelled.load(Ordering::SeqCst) {
+            return serde_json::to_vec(&serde_json::json!({ "error": "cancelled" }))
+                .map_err(|e| e.to_string());
+        }
+        // 上拍遗留的延迟错误先行交付（条目移除，行流 drop = 连接回池）。
+        if let Some(e) = cur.pending_error.lock().unwrap().take() {
+            let _ = self.streams.lock().unwrap().remove(&stream_id);
+            return serde_json::to_vec(&serde_json::json!({ "error": e }))
+                .map_err(|e| e.to_string());
+        }
+        let mut rows = cur.rows.lock().await;
+        use futures::StreamExt;
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(STREAM_BATCH);
+        let mut stream_ended = false;
+        while out.len() < STREAM_BATCH {
+            match rows.as_mut().next().await {
+                Some(Ok(v)) => out.push(v),
+                Some(Err(e)) => {
+                    // 错误但本批已有行：先交付行，错误经 pending 下一拍上报。
+                    if out.is_empty() {
+                        let _ = self.streams.lock().unwrap().remove(&stream_id);
+                        return serde_json::to_vec(&serde_json::json!({ "error": e }))
+                            .map_err(|e| e.to_string());
+                    }
+                    cur.pending_error.lock().unwrap().replace(e);
+                    stream_ended = true;
+                    break;
+                }
+                None => {
+                    stream_ended = true;
+                    break;
+                }
+            }
+        }
+        if !out.is_empty() {
+            // 尾批（<100 行）随行照常交付；done 由下一次 next 的空批给出。
+            return serde_json::to_vec(&serde_json::json!({ "rows": out }))
+                .map_err(|e| e.to_string());
+        }
+        let _ = self.streams.lock().unwrap().remove(&stream_id);
+        if stream_ended {
+            return serde_json::to_vec(&serde_json::json!({ "done": true }))
+                .map_err(|e| e.to_string());
+        }
+        // out 为空且流未结束 = 不可达（循环必然 push 或置标志）；防御性报错。
+        Err("db stream_next: empty batch without termination".into())
+    }
+
+    /// 协作式取消（批间生效）：无锁置标志，不与进行中的批量争用。
+    fn stream_cancel(&self, stream_id: u64) -> Result<Vec<u8>, String> {
+        if let Some(cur) = self.streams.lock().unwrap().get(&stream_id) {
+            cur.cancelled.store(true, Ordering::SeqCst);
+        }
+        Ok(b"".to_vec())
+    }
+
+    /// 显式 reclaim：移除条目（进行中的批量结束后行流 drop = 连接回池）。幂等。
+    fn stream_close(&self, stream_id: u64) -> Result<Vec<u8>, String> {
+        let _ = self.streams.lock().unwrap().remove(&stream_id);
+        Ok(b"".to_vec())
     }
 
     async fn query(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
@@ -590,6 +753,30 @@ impl DbPluginState {
             serde_json::from_str(params).map_err(|e| format!("db tx_exec: bad params: {e}"))?;
         self.client(handle)?.tx_exec(tx_id, sql, &p).await
     }
+
+    async fn do_stream_open(
+        &self,
+        handle: u64,
+        sql: &str,
+        params: &str,
+    ) -> Result<Vec<u8>, String> {
+        let p: Vec<serde_json::Value> =
+            serde_json::from_str(params).map_err(|e| format!("db stream_open: bad params: {e}"))?;
+        let sid = self.client(handle)?.stream_open(sql, &p).await?;
+        Ok(format!(r#"{{"stream_id":{sid}}}"#).into_bytes())
+    }
+
+    async fn do_stream_next(&self, handle: u64, stream_id: u64) -> Result<Vec<u8>, String> {
+        self.client(handle)?.stream_next(stream_id).await
+    }
+
+    fn do_stream_cancel(&self, handle: u64, stream_id: u64) -> Result<Vec<u8>, String> {
+        self.client(handle)?.stream_cancel(stream_id)
+    }
+
+    fn do_stream_close(&self, handle: u64, stream_id: u64) -> Result<Vec<u8>, String> {
+        self.client(handle)?.stream_close(stream_id)
+    }
 }
 
 // ---- vtable（同步签名返回 FfiFuture）----
@@ -673,6 +860,46 @@ extern "C" fn tx_rollback(handle: u64, tx_id: u64) -> FfiFuture {
     })
 }
 
+// ---- ABI 10：流式查询（批量 pull + 信封，spec §1.4）----
+
+extern "C" fn stream_open(handle: u64, sql: RString, params: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_stream_open(handle, &sql[..], &params[..]).await
+        })
+    })
+}
+
+extern "C" fn stream_next(handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_stream_next(handle, stream_id).await
+        })
+    })
+}
+
+extern "C" fn stream_cancel(handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_stream_cancel(handle, stream_id) },
+        )
+    })
+}
+
+extern "C" fn stream_close(handle: u64, stream_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(
+            &st.rt,
+            async move { st.do_stream_close(handle, stream_id) },
+        )
+    })
+}
+
 extern "C" fn dialect(handle: u64) -> RString {
     oj_plugin_ffi::catch_value(
         || {
@@ -715,6 +942,10 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
     dialect,
     close,
     schemes,
+    stream_open,
+    stream_next,
+    stream_cancel,
+    stream_close,
 };
 
 // ---- 入口 ----
@@ -928,6 +1159,129 @@ mod tests {
     async fn invalid_dsn_fails_fast() {
         assert!(Client::connect("not a url").await.is_err());
         assert!(Client::connect("").await.is_err());
+    }
+
+    /// ABI 10 流式全路径（离线 sqlite）：open → 批量 next（≤100 行/批）→ done 就地
+    /// 移除条目 → 再 next 报 unknown stream；cancel/close 幂等。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_sqlite_dsn_when_stream_roundtrip_then_batched_rows_done_and_cancel() {
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let dir = std::env::temp_dir().join(format!("oj-dbmy-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("t.db")).unwrap();
+        let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&dir.join("t.db"));
+
+        let bytes = drive(&mut connect(RString::from(dsn.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        drive(&mut exec(
+            h,
+            RString::from("create table oj_stream_t (id integer primary key, v text)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("ddl");
+        for i in 0..5 {
+            drive(&mut exec(
+                h,
+                RString::from("insert into oj_stream_t (id, v) values (?, ?)"),
+                RString::from(format!(r#"[{i},"v{i}"]"#).as_str()),
+            ))
+            .await
+            .expect("insert");
+        }
+
+        let bytes = drive(&mut stream_open(
+            h,
+            RString::from("select id, v from oj_stream_t order by id"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        let bytes = drive(&mut stream_next(h, sid)).await.expect("next1");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = v
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .unwrap_or_else(|| panic!("rows envelope: {v}"));
+        assert_eq!(rows.len(), 5, "{v}");
+        assert_eq!(rows[0]["id"], 0, "{v}");
+        assert_eq!(rows[4]["v"], "v4", "{v}");
+
+        let bytes = drive(&mut stream_next(h, sid)).await.expect("next2");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["done"], serde_json::json!(true), "{v}");
+
+        let e = drive(&mut stream_next(h, sid)).await.unwrap_err();
+        assert!(e.contains("unknown stream"), "{e}");
+        drive(&mut stream_cancel(h, sid)).await.expect("cancel");
+        drive(&mut stream_close(h, sid)).await.expect("close");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ABI 10 取消路径（离线）：cancel 置标志 → 下一次 next 返回 {"error":"cancelled"}；
+    /// close 收口后条目消失。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_sqlite_dsn_when_stream_cancelled_then_next_returns_cancelled_envelope() {
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let dir = std::env::temp_dir().join(format!("oj-dbmy-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("t.db")).unwrap();
+        let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&dir.join("t.db"));
+
+        let bytes = drive(&mut connect(RString::from(dsn.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        drive(&mut exec(
+            h,
+            RString::from("create table oj_cancel_t (id integer primary key)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("ddl");
+        for i in 0..3 {
+            drive(&mut exec(
+                h,
+                RString::from("insert into oj_cancel_t (id) values (?)"),
+                RString::from(format!("[{i}]").as_str()),
+            ))
+            .await
+            .expect("insert");
+        }
+
+        let bytes = drive(&mut stream_open(
+            h,
+            RString::from("select id from oj_cancel_t order by id"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+
+        drive(&mut stream_cancel(h, sid)).await.expect("cancel");
+        let bytes = drive(&mut stream_next(h, sid)).await.expect("next");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "cancelled", "{v}");
+
+        drive(&mut stream_close(h, sid)).await.expect("close");
+        let e = drive(&mut stream_next(h, sid)).await.unwrap_err();
+        assert!(e.contains("unknown stream"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真实 mysql 集成（env-gated）：`OJ_TEST_MYSQL=mysql://… cargo test -p oj-db-mysql`。

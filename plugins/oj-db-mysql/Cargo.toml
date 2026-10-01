@@ -10,6 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
 serde_json = "1"
+# ABI 10 流式游标：async-stream 持有自有 SQL/参数/池（规避 sqlx Query 借用 &str）
+async-stream = "0.3"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "any",
