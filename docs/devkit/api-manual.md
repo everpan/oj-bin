@@ -995,7 +995,8 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
   `db.query` 全量**（行为等同 `db.query`，仅失去流式内存优势，不报错）。
 - `db.stream` 与 `db.query` 返回**内容一致**（同一查询的逐行等价于全量数组）；差异只在内存形态。
 - 取消（`signal`）：core 后端为 best-effort drop；插件后端为**协作式取消**（批间生效，
-  下一批返回 `{"error":"cancelled"}`）。`signal` 仅中止拉取，已回调/已迭代的行不会回滚。
+  下一批返回 `{"error":"cancelled"}`）。取消 = **流干净提前结束**（消费端收到 done，不报错；
+  服务端行缓冲有界——64 行——消费端不拉取时后端拉取同步暂停）；已回调/已迭代的行不回滚。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -2886,7 +2887,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `db.stream` 仅非事务目标（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 SqlxAccessor（sqlite/mysql/postgres）+ 第一方插件（`oj-db-mysql`/`oj-db-postgres`，vtable 批量 pull ≤100 行/次）真流式；第三方插件未实现流式槽 → 回落 `db.query` 全量（不报错，仅失去内存优势）。内容等价于 `db.query` 全量，差异仅在内存形态 |
-| 流式取消（`signal`）为 best-effort / 插件协作式（v0.1.38） | core 后端 = 中途 drop（非真取消）；插件后端 = 批间生效（下一批返回 `{"error":"cancelled"}`）。已回调的行不回滚 |
+| 流式取消（`signal`）= 干净提前结束（v0.1.39；非错误） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done；core drop 为 best-effort、插件协作式（批间生效）。已回调的行不回滚 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |

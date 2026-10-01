@@ -16,6 +16,30 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.39 —— 流式防护探测：修复取消真语义（DOMException + 有界背压）
+
+> 对新流式面补**对抗性探测用例**（守卫/闸/回收不靠声明靠钉死），两条探测各抓到一个真 bug，随本版修复。
+
+### 探测发现的修复
+- **`AbortController.abort()` 此前实际不可用**：运行时未挂 `DOMException` 全局，
+  deno_web 的 `AbortSignal.abort()` 构造中断原因即抛 `ReferenceError`——取消从未真正
+  触发过（旧测试靠 catch 分支"碰巧"绿）。本版挂载 `ext:deno_web/01_dom_exception.js`
+  （`db.stream` 的 signal 取消、`fetch` 的 AbortSignal 均受益）。
+- **取消语义改为"干净提前结束"**：`db.stream` 行通道由 unbounded 改为**有界（64 行）**
+  ——消费端不拉取时后端拉取同步暂停（真背压），abort 一到立即停止拉取；已缓冲行交付
+  完即 done（**不报错**）。旧 unbounded 会提前灌满结果集、取消扑空（探测用例
+  `probe_stream_abort_releases_connection` 以 sqlite `max_connections(1)` 泄漏即挂死
+  为哨兵抓到）。旧 abort 用例断言已按新语义订正（不再是"拒绝"，而是提前 done）。
+- `db.stream` close/abort 路径的 open Promise 二次拒绝收敛（守卫错误时不再叠加
+  unhandled rejection）。
+
+### 新增防护探测用例（防"插旗丢防护"）
+- db：租户守卫四态全打（无条件拒 / 无租户头拒 / 匹配放行且只见本租户行 / 参数租户
+  不符拒）；abort 连接回池哨兵；并发游标交叉隔离。
+- server：blob PUT 写面守卫（无 token 401 且不落盘）；流式代分配 key 对穿越文件名
+  （`../../evil.sh`）的净化（对象只落 uploads/ 段、root 无逃逸文件、key 可安全回读）；
+  文本字段超限 413；多文件各自合规但总和超 multer 总闸 413。
+
 ## v0.1.38 —— ABI 10：db 插件流式查询 + blob 流式上传（PR-2/PR-5 Phase B）
 
 > **破坏性 ABI 变更（9→10）**：`DataAccessorVtable`/`BlobBackendVtable` 追加槽位，旧 ABI 9 插件启动即 fail-fast（既有门禁）。

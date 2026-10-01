@@ -129,6 +129,13 @@ const { URL: ojURL, URLSearchParams: ojURLSearchParams } = core.loadExtScript(
 );
 globalThis.URL = ojURL;
 globalThis.URLSearchParams = ojURLSearchParams;
+// DOMException (deno_web 01_dom_exception.js): deno_web's AbortSignal.abort()
+// constructs `new DOMException(...)` as the abort reason -- without this global
+// `ac.abort()` threw ReferenceError and signal-driven cancellation never fired.
+const { DOMException: ojDOMException } = core.loadExtScript(
+  "ext:deno_web/01_dom_exception.js",
+);
+globalThis.DOMException = ojDOMException;
 const { fetch: ojFetch } = core.loadExtScript("ext:deno_fetch/26_fetch.js");
 globalThis.fetch = ojFetch;
 const { AbortController: ojAbortController } = core.loadExtScript(
@@ -681,12 +688,15 @@ globalThis.DB = function (name) {
       stream: (sql, params, opts) => {
         let idP = null;
         const openId = () => (idP ||= op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params)));
-        const wireAbort = () => { openId().then((id) => op_db_stream_abort(id)); };
+        const swallow = (p) => { p.then(() => {}).catch(() => {}); };
+        const wireAbort = () => swallow(openId().then((id) => op_db_stream_abort(id)));
         const signal = opts && opts.signal;
         if (signal) signal.addEventListener("abort", wireAbort);
         const close = () => {
           if (signal) signal.removeEventListener("abort", wireAbort);
-          openId().then((id) => op_db_stream_close(id));
+          // open may itself have failed (guard/unsupported): a second rejection here
+          // would surface as an unhandled rejection on top of the consumer's error.
+          swallow(openId().then((id) => op_db_stream_close(id)));
         };
         if (opts && typeof opts.onRow === "function") {
           return (async () => {

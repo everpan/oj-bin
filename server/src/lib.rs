@@ -2243,6 +2243,143 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 探测：blob 直传**写面**必须过守卫——无 token PUT → 401（"写面不能公开"不能只
+    /// 靠注释声明）；带合法 token → 200。
+    #[tokio::test]
+    async fn probe_blob_put_route_requires_auth() {
+        let t = routes(&[("n/api.ts", "export default { get() { json.ok({}); } };")]);
+        let root = std::env::temp_dir().join(format!("oj-blob-ppa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                auth: Some(Arc::new(StubGuard)),
+                ..Default::default()
+            },
+        )
+        .await;
+        // 无 token → 401（对象不得落盘）
+        let r = raw_http(
+            addr,
+            "PUT /v1/api/blob/evil.bin HTTP/1.1\r\nHost: t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 401"), "写面必须过守卫: {r}");
+        assert!(!root.join("evil.bin").exists(), "未授权上传不得落盘");
+        // 合法 token → 200
+        let r = raw_http(
+            addr,
+            "PUT /v1/api/blob/ok.bin HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer good\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "authz 上传须成功: {r}");
+        assert!(root.join("ok.bin").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 探测：流式上传的**服务端代分配 key** 必须净化穿越文件名——filename 带
+    /// `../../` 时对象必须落在 uploads/ 段内、root 不得出现逃逸文件、key 可安全回读。
+    #[tokio::test]
+    async fn probe_streamed_key_sanitizes_traversal_filename() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() {\n\
+               const f = http.files[0];\n\
+               const content = f.key ? (await blob.get(f.key)).length : null;\n\
+               json.ok({ key: f ? f.key : null, size: f ? f.size : null, content });\n\
+             } };",
+        )]);
+        let root = std::env::temp_dir().join(format!("oj-blob-pks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                max_upload: 8,
+                blob_upload_max: 64000,
+                ..Default::default()
+            },
+        )
+        .await;
+        let big = "E".repeat(500); // > max_upload=8 → 走流式
+        let body = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../evil.sh\"\r\n\r\n{big}\r\n--X-BND--\r\n"
+        );
+        let req = format!(
+            "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let r = raw_http(addr, &req).await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let key = v["data"]["key"].as_str().expect("{v}");
+        assert!(key.starts_with("uploads/"), "key 必须在 uploads/ 段内: {v}");
+        assert!(
+            !key.contains("..") && !key.contains('\\'),
+            "key 不得含穿越字符: {v}"
+        );
+        assert_eq!(v["data"]["content"], 500, "key 须可安全回读: {v}");
+        // root 下不得出现逃逸文件（净化后的 safe 名只会出现在 uploads/ 段内）
+        assert!(!root.join("evil.sh").exists(), "穿越文件名不得逃逸: {v}");
+        assert!(root.join(key).is_file(), "对象实际落盘位置 = key: {v}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 探测：两个内存闸——文本字段 > max_upload → 413（防文本字段撑内存）；
+    /// 多个小文件各自合规但**总和**超 whole_stream 闸 → 413（multer StreamSizeExceeded）。
+    #[tokio::test]
+    async fn probe_multipart_text_oversize_and_total_gate_413() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { async post() { json.ok({}); } };",
+        )]);
+        let root = std::env::temp_dir().join(format!("oj-blob-pgt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let blob: Arc<dyn BlobBackend> = Arc::new(LocalBlob::new(&root, "/v1/api").unwrap());
+        let addr = spawn_blob_with(
+            "/v1/api",
+            t.0.clone(),
+            blob,
+            Pipeline {
+                max_upload: 8,
+                blob_upload_max: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+        let send = |body: String| {
+            format!(
+                "POST /v1/api/u/ HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary=X-BND\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        // ① 文本字段 20B > max_upload=8 → 413
+        let body = format!(
+            "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n{}\r\n--X-BND--\r\n",
+            "N".repeat(20)
+        );
+        let r = raw_http(addr, &send(body)).await;
+        assert!(r.starts_with("HTTP/1.1 413"), "文本字段超限必须 413: {r}");
+        // ② 三个 40B 文件（各自 ≤ blob_cap=100）总和 120 > whole_stream(8+100=108) → 413
+        let f = |n: &str| {
+            format!(
+                "--X-BND\r\nContent-Disposition: form-data; name=\"{n}\"; filename=\"{n}.bin\"\r\n\r\n{}\r\n",
+                "F".repeat(40)
+            )
+        };
+        let body = format!("{}{}{}--X-BND--\r\n", f("a"), f("b"), f("c"));
+        let r = raw_http(addr, &send(body)).await;
+        assert!(r.starts_with("HTTP/1.1 413"), "总和超总闸必须 413: {r}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     async fn raw_http(addr: std::net::SocketAddr, req: &str) -> String {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         s.write_all(req.as_bytes()).await.unwrap();
