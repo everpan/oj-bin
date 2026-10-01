@@ -507,6 +507,25 @@ pub fn validate_server_limits(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// PR-9 装配校验：require_signed_claim 需要 tenant.enable 与 auth 守卫同时存在
+/// （没有验签方就没有「声明」；关着租户却要求声明绑定是配置矛盾）。
+pub fn validate_tenant_binding(cfg: &Config, has_auth: bool) -> Result<(), String> {
+    if !cfg.tenant.require_signed_claim {
+        return Ok(());
+    }
+    if !cfg.tenant.enable {
+        return Err(
+            "tenant.require_signed_claim: needs tenant.enable=true (signed claim binding only applies to tenant injection)".into(),
+        );
+    }
+    if !has_auth {
+        return Err(
+            "tenant.require_signed_claim: needs an auth guard (auth: section) — the tenant id must come from a verified token claim, not the raw header".into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
     let check = |what: &str, list: &[AnonPath]| -> Result<(), String> {
         for p in list {
@@ -543,6 +562,11 @@ pub struct TenantCfg {
     /// 反序列化在 config.rs（三态共用 bridge::SqlGuard 一个类型）。
     #[serde(default)]
     pub sql_guard: crate::bridge::SqlGuard,
+    /// PR-9（v0.1.41）：租户只认**验签后的 claim**（JWT `claims.tenant`）——裸租户头
+    /// 不再自证（带头仅作与 claim 的一致性复核，缺失/不符 403）。需要 auth 守卫与
+    /// tenant.enable 同时开启（装配期 fail-fast，见 validate_tenant_binding）。
+    #[serde(default)]
+    pub require_signed_claim: bool,
     /// 共享表白名单：schema.yaml 标 `tenant: false` 的表须在此列出才生效（fail-closed；
     /// 空 = 共享表声明被忽略，仍按受租户约束校验 tenant_id 列）。
     #[serde(default)]
@@ -558,6 +582,7 @@ impl Default for TenantCfg {
     fn default() -> Self {
         Self {
             enable: false,
+            require_signed_claim: false,
             header_key: "X-TENANT-ID".into(),
             anonymous_paths: Vec::new(),
             sql_guard: crate::bridge::SqlGuard::Off,
@@ -1026,6 +1051,23 @@ mod tests {
             let e = validate_server_limits(&c2).expect_err("低于下限必须拒绝");
             assert!(e.contains("below the minimum"), "{e}");
         }
+    }
+
+    /// PR-9：require_signed_claim 装配校验矩阵。
+    #[test]
+    fn tenant_binding_validation_matrix() {
+        let mut c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
+        // 关闭 → 恒过
+        assert!(validate_tenant_binding(&c, false).is_ok());
+        // 开启但无 auth / 未 enable → 各自拒绝（文案点名）
+        c.tenant.require_signed_claim = true;
+        let e = validate_tenant_binding(&c, true).unwrap_err();
+        assert!(e.contains("tenant.enable=true"), "{e}");
+        c.tenant.enable = true;
+        let e = validate_tenant_binding(&c, false).unwrap_err();
+        assert!(e.contains("needs an auth guard"), "{e}");
+        // 齐备 → 过
+        assert!(validate_tenant_binding(&c, true).is_ok());
     }
 
     #[test]

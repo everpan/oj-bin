@@ -16,6 +16,21 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.41 —— PR-9：租户声明的服务端绑定
+
+- 新配置 `tenant.require_signed_claim`（默认 **false**，行为不变）：开启后 `http.tenantId`
+  **只认验签后的 JWT claim `claims.tenant`**——裸租户头不再自证：
+  - claim 与头不符 → 403 `tenant header does not match signed claim`；
+  - 无 claim → 403 `tenant requires a signed claim (user.claims.tenant missing)`（即使带头）；
+  - claim 命中且无头 → 放行（claim 即来源）；`anonymous_paths` 豁免保持（OIDC 回跳逃生口）。
+- 装配期 fail-fast：开关开启但缺 `tenant.enable` 或缺 auth 守卫 → 拒绝启动
+  （`validate_tenant_binding`，纯函数可单测）。
+- 作用面为 HTTP 前置管线（WS 帧/任务桥为系统上下文，不经此绑定——文档注明）。
+- 探测（击穿优先）：验签 claim 六态矩阵（一致/不符/无头/无 claim/无 token/豁免路径）、
+  开关关闭回归（旧行为逐字节一致）、装配校验矩阵；实施中探测④抓到「缺 claim 时头被
+  放行」的实现漏洞并当场修正为严格 fail-closed。
+- 文档：api-manual 租户配置节 + 错误/限制表、tenant-guide 报错表同步。
+
 ## v0.1.40 —— PR-4：isolate 内存限额（P0 收口）
 
 - 新配置 `server.js_heap_limit_bytes`（默认 **256 MiB**，下限 32 MiB，装配期 fail-fast）：
