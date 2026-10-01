@@ -108,6 +108,8 @@ pub struct StaticOpts {
 pub struct Pipeline {
     /// Some(header) = 租户启用：缺失/空 → 400，命中 → http.tenantId。
     pub tenant_header: Option<String>,
+    /// PR-9（v0.1.41）：租户只认验签 claim（claims.tenant）；裸头仅作一致性复核。
+    pub tenant_require_signed_claim: bool,
     /// 跳转腿豁免（tenant.anonymous_paths；命中则免租户头——OIDC 302 带不了自定义头）。
     pub tenant_anon: Vec<String>,
     /// Some = 鉴权启用：Bearer 守卫 + http.user（实现由 oj-auth 插件提供）。
@@ -129,6 +131,7 @@ impl Default for Pipeline {
     fn default() -> Self {
         Self {
             tenant_header: None,
+            tenant_require_signed_claim: false,
             tenant_anon: Vec::new(),
             auth: None,
             max_upload: 10 * 1024 * 1024,        // 10MiB
@@ -766,21 +769,60 @@ fn admit(
     let tenant_id = match st.pipeline.tenant_header.as_deref() {
         Some(key) => {
             let exempt = path_matches(&st.pipeline.tenant_anon, path_no_base.unwrap_or(""));
-            match headers
+            let header_tid = headers
                 .get(key)
                 .and_then(|v| v.to_str().ok())
                 .filter(|s| !s.is_empty())
-            {
-                Some(tid) => Some(tid.to_string()),
-                None if exempt => {
-                    anonymous = true;
-                    None
+                .map(str::to_string);
+            if st.pipeline.tenant_require_signed_claim {
+                // PR-9（v0.1.41）：租户只认**验签后的 claim**（user.claims.tenant）。
+                // 裸头不再自证：带头仅作与 claim 的一致性复核（不符 403）；
+                // anonymous_paths 豁免保持（OIDC 回跳逃生口不变），其余路径 fail-closed。
+                let claim = user
+                    .as_ref()
+                    .and_then(|u| u.get("claims"))
+                    .and_then(|c| c.get("tenant"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match (&header_tid, &claim) {
+                    (Some(h), Some(c)) if h != c => {
+                        return Err(Box::new(fail_response(
+                            403,
+                            "tenant header does not match signed claim",
+                        )));
+                    }
+                    // claim 是唯一来源（头一致或缺失都取 claim）；claim 缺失时头不得自证。
+                    (_, Some(c)) => Some(c.clone()),
+                    (Some(_), None) => {
+                        return Err(Box::new(fail_response(
+                            403,
+                            "tenant requires a signed claim (user.claims.tenant missing)",
+                        )));
+                    }
+                    (None, None) if exempt => {
+                        anonymous = true;
+                        None
+                    }
+                    (None, None) => {
+                        return Err(Box::new(fail_response(
+                            403,
+                            "tenant requires a signed claim (user.claims.tenant missing)",
+                        )));
+                    }
                 }
-                None => {
-                    return Err(Box::new(fail_response(
-                        400,
-                        &format!("missing tenant header: {key}"),
-                    )));
+            } else {
+                match header_tid {
+                    Some(tid) => Some(tid),
+                    None if exempt => {
+                        anonymous = true;
+                        None
+                    }
+                    None => {
+                        return Err(Box::new(fail_response(
+                            400,
+                            &format!("missing tenant header: {key}"),
+                        )));
+                    }
                 }
             }
         }
@@ -2389,6 +2431,149 @@ pub(crate) mod tests {
     }
 
     /// tenant.enable：header 存在 → 注入 http.tenantId；缺失 → 400；未启用 → null。
+    // ===== PR-9 租户声明绑定（v0.1.41）：击穿测试 =====
+
+    /// 带 claims.tenant 的假守卫（Bearer good → tenant=t1；Bearer plain → 无 tenant claim）。
+    struct ClaimStubGuard;
+    impl only_js::bridge::AuthGuard for ClaimStubGuard {
+        fn verify(
+            &self,
+            path: &str,
+            _method: &str,
+            auth: Option<&str>,
+            _headers: Option<&str>,
+        ) -> Result<Option<Value>, String> {
+            if path == "/health" {
+                return Ok(None);
+            }
+            match auth {
+                Some("Bearer good") => Ok(Some(serde_json::json!({
+                    "id": "1", "roles": ["admin"],
+                    "claims": {"sub": "1", "tenant": "t1"},
+                }))),
+                Some("Bearer plain") => Ok(Some(serde_json::json!({
+                    "id": "2", "roles": ["user"],
+                    "claims": {"sub": "2"},
+                }))),
+                _ => Err("missing or invalid bearer token".into()),
+            }
+        }
+    }
+
+    async fn claim_guard_fixture() -> (std::net::SocketAddr, TempRoutes) {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { get() { json.ok({ t: http.tenantId, uid: http.user ? http.user.id : null }); } };",
+        )]);
+        let addr = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline {
+                tenant_header: Some("X-TENANT-ID".into()),
+                tenant_require_signed_claim: true,
+                auth: Some(Arc::new(ClaimStubGuard)),
+                ..Default::default()
+            },
+        )
+        .await;
+        (addr, t)
+    }
+
+    /// 探测矩阵：验签 claim 是唯一租户来源；裸头仅作一致性复核（fail-closed）。
+    #[tokio::test]
+    async fn probe_tenant_signed_claim_binding() {
+        let (addr, root) = claim_guard_fixture().await;
+        let get = |hdr: Option<&str>, tok: Option<&str>| {
+            format!(
+                "GET /v1/api/u/ HTTP/1.1\r\nHost: t\r\n{}{}Connection: close\r\n\r\n",
+                hdr.map(|h| format!("X-TENANT-ID: {h}\r\n"))
+                    .unwrap_or_default(),
+                tok.map(|t| format!("Authorization: {t}\r\n"))
+                    .unwrap_or_default(),
+            )
+        };
+        // ① claim=t1 + 头 t1 → 200，tenantId=t1（头与 claim 一致）
+        let r = raw_http(addr, &get(Some("t1"), Some("Bearer good"))).await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(
+            r.starts_with("HTTP/1.1 200") && v["data"]["t"] == "t1",
+            "1: {r}"
+        );
+        // ② claim=t1 + 头 t2（不符）→ 403
+        let r = raw_http(addr, &get(Some("t2"), Some("Bearer good"))).await;
+        assert!(
+            r.starts_with("HTTP/1.1 403") && r.contains("does not match signed claim"),
+            "2: {r}"
+        );
+        // ③ 无头 + claim=t1 → 200（claim 即来源，头可选）
+        let r = raw_http(addr, &get(None, Some("Bearer good"))).await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(
+            r.starts_with("HTTP/1.1 200") && v["data"]["t"] == "t1",
+            "3: {r}"
+        );
+        // ④ 验签 token 无 tenant claim + 裸头 → 403（头不再自证，fail-closed）
+        let r = raw_http(addr, &get(Some("t1"), Some("Bearer plain"))).await;
+        assert!(
+            r.starts_with("HTTP/1.1 403") && r.contains("requires a signed claim"),
+            "4: {r}"
+        );
+        // ⑤ 无 token 无头（受保护路径）→ 401（鉴权先于租户）
+        let r = raw_http(addr, &get(None, None)).await;
+        assert!(r.starts_with("HTTP/1.1 401"), "5: {r}");
+        // ⑥ anonymous 豁免路径保持（无头无 token → 放行且匿名）
+        let r = raw_http(
+            addr,
+            &get(None, None).replacen("/v1/api/u/", "/v1/api/health", 1),
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 200"), "6: {r}");
+    }
+
+    /// 探测：开关关闭 → 行为与旧版逐字节一致（裸头自证照常，缺头 400）。
+    #[tokio::test]
+    async fn probe_tenant_binding_off_keeps_legacy_behavior() {
+        let t = routes(&[(
+            "u/api.ts",
+            "export default { get() { json.ok({ t: http.tenantId }); } };",
+        )]);
+        let addr = spawn_pipeline(
+            "/v1/api",
+            t.0.clone(),
+            true,
+            None,
+            Pipeline {
+                tenant_header: Some("X-TENANT-ID".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let r = raw_http(
+            addr,
+            "GET /v1/api/u/ HTTP/1.1\r\nHost: t\r\nX-TENANT-ID: acme\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let v: Value =
+            serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
+                .unwrap();
+        assert!(
+            r.starts_with("HTTP/1.1 200") && v["data"]["t"] == "acme",
+            "off: {r}"
+        );
+        let r = raw_http(
+            addr,
+            "GET /v1/api/u/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(r.starts_with("HTTP/1.1 400"), "off 缺头仍 400: {r}");
+    }
+
     #[tokio::test]
     async fn tenant_header_injected_or_400() {
         let t = routes(&[(

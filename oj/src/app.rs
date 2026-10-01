@@ -1196,8 +1196,10 @@ impl App {
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
+        config::validate_tenant_binding(&cfg, auth.is_some())?;
         let pipeline = server::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
+            tenant_require_signed_claim: cfg.tenant.require_signed_claim,
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
             auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,

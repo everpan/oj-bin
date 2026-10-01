@@ -1815,6 +1815,7 @@ cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执�
 | 证书过期进宽限期（仅 GET） | 403 | `{"code":403,"msg":"certificate expired: service available in grace period, but GET requests are restricted","data":null}` |
 | 证书已过期（Expired，仅 GET，运行中热替换所致） | 403 | `{"code":403,"msg":"certificate expired: service unavailable","data":null}` |
 | 租户头缺失/为空（`tenant.enable`） | 400 | `missing tenant header: X-TENANT-ID` |
+| `tenant.require_signed_claim`（v0.1.41）开启后：裸头自证被拒 | claim 缺失/不符 | 403 `tenant requires a signed claim (user.claims.tenant missing)` / `tenant header does not match signed claim`——JWT 里放 `claims.tenant`，头仅作一致性复核 |
 | Bearer 缺失/无效/过期（`auth:` 启用） | 401 | `missing or invalid bearer token` |
 | cookie 会话 CSRF 校验失败（v0.1.30，非安全方法） | 401 | `missing or invalid csrf token` |
 | blob 直传超 `blob_upload_max_bytes`（v0.1.30） | 413 | `{"code":413,"msg":"upload too large","data":null}` |
@@ -1934,6 +1935,14 @@ tenant:
 中段 `*`（恰好一段）。豁免命中且确实没带租户头的请求被标记为**匿名**
 （`RequestInfo.anonymous`），不再因缺头而 400——这是给 OIDC 302 跳转腿用的（浏览器带不了
 自定义头）。已带的头仍照常注入。
+
+**租户声明的服务端绑定（`tenant.require_signed_claim`，v0.1.41，默认 false）**：开启后
+`http.tenantId` **只认验签后的 JWT claim `claims.tenant`**——裸租户头不再自证：带头仅作与
+claim 的一致性复核（不符 → 403 `tenant header does not match signed claim`），无 claim →
+403 `tenant requires a signed claim (user.claims.tenant missing)`（即使带头）。claim 命中时
+无头也放行（claim 即来源）。`anonymous_paths` 豁免语义不变（OIDC 回跳逃生口）。装配期
+fail-fast：开关开启但缺 `tenant.enable` 或缺 auth 守卫 → 拒绝启动。作用面为 HTTP 前置
+管线（WS 帧/任务桥为系统上下文，不经此绑定）。
 
 **迁移 WARN 只针对 `auth.anonymous_paths`**（v0.1.23 订正）：v0.1.20 的「尾 `/*` 从任意深度
 收紧为严格一层」**只发生在 oj-auth 侧**；`tenant.anonymous_paths` 自引入起就是严格一层

@@ -197,6 +197,7 @@ export const get = async () => {
 | 报错信息 | 什么意思 | 怎么修 |
 |---|---|---|
 | 400 缺租户头 | 请求没带 `X-TENANT-ID`（或配的头名） | curl/前端补上头；测试代码用 `db.asSystem()` |
+| 403 租户未绑定声明（`require_signed_claim: true`，v0.1.41） | 裸头不再自证：`claims.tenant` 缺失或与头不符 | JWT 签发时把租户写进 `claims.tenant`；头仅作一致性复核 |
 | `tenant guard: insert tenant_id mismatch` | insert 想写别人的租户 | 别传 tenant_id（框架自动填当前的），或确认你确实该用 asSystem |
 | `tenant guard: update sets.tenant_id not allowed` | update 想把行迁到别的租户 | 删掉 sets 里的 tenant_id；跨租户迁移是系统操作，走 asSystem + 手工 SQL |
 | `raw sql lacks tenant_id on [t]` | 裸 SQL 查了租户表但完全没提 tenant_id | 补 `where tenant_id = ?`（参数传 `http.tenantId`）；或改用 `db.table()` 构造器 |
