@@ -15,10 +15,10 @@ use oj_plugin_ffi::{
     RString, RVec,
 };
 use sqlx::any::{Any, AnyArguments, AnyRow};
-use sqlx::mysql::{MySql, MySqlArguments, MySqlRow};
+use sqlx::mysql::{MySql, MySqlArguments, MySqlConnection, MySqlRow};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
-use sqlx::{Column, Row, TypeInfo};
+use sqlx::{Column, Connection as _, Row, TypeInfo};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +30,9 @@ enum Dialect {
     MySql,
     Postgres,
 }
+
+/// 流式游标的行流类型（typed 专用连接 / Any 回退路径共用同一形状）。
+type DbStream = Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>>;
 
 /// DSN 前缀 → 方言（本插件只接 mysql；dialect 上送 host 选 sea-query builder）。
 fn dialect_of(dsn: &str) -> Dialect {
@@ -197,6 +200,7 @@ enum TxInner {
 struct Client {
     pool: Pooled,
     dialect: Dialect,
+    dsn: String,
     next_tx: AtomicU64,
     txs: Mutex<HashMap<u64, Arc<Tx>>>,
     /// ABI 10 流式游标（stream_id → 行流 + 协作式取消标志）。
@@ -205,15 +209,18 @@ struct Client {
 }
 
 /// 流式游标句柄：行流独立成 tokio Mutex（批量推进期间独占），取消标志在外层
-/// 无锁置位。取消是**协作式**（批间生效）：sqlx 驱动层拿不到方言级 CancelToken，
-/// `stream_cancel` 置标志，下一次 `stream_next` 返回 `{"error":"cancelled"}`；
-/// `stream_close` 移除条目（行流 drop = 连接回池）。与 vtable 契约「方言级真取消」
-/// 的偏差已登记（计划文档 §实施状态）。
+/// 无锁置位。方言支持矩阵（v0.1.42，与 pg 插件同构）：
+/// - **mysql:// DSN（typed）**：游标单开一条 `MySqlConnection`，`stream_cancel` = **移除
+///   条目并 `KILL QUERY` 专用连接**（服务端立即中断查询——真取消）；
+/// - **其它（Any 回退，如 sqlite）**：池路径 + 协作式取消（置标志，下一批返回
+///   `{"error":"cancelled"}`；`stream_close` 移除条目，行流 drop = 连接回池）。
 struct StreamHandle {
-    rows: tokio::sync::Mutex<
-        Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>>,
-    >,
+    rows: tokio::sync::Mutex<DbStream>,
     cancelled: AtomicBool,
+    /// true = typed 专用连接（真取消：cancel = KILL QUERY + 断连）；false = Any 回退。
+    typed: bool,
+    /// typed 连接的 CONNECTION_ID（KILL QUERY 定位用；连接建立时查询）。
+    conn_id: Option<u64>,
     /// 错误延迟上报：错误发生时本批已有行 → 行先交付，错误下一拍给出。
     pending_error: std::sync::Mutex<Option<String>>,
 }
@@ -333,6 +340,7 @@ impl Client {
         Ok(Self {
             pool,
             dialect: dialect_of(dsn),
+            dsn: dsn.to_string(),
             next_tx: AtomicU64::new(0),
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -340,62 +348,74 @@ impl Client {
         })
     }
 
-    /// ABI 10：打开流式游标（async-stream 持有自有 SQL/参数/池——无借用逃逸；
-    /// 双池各自成流：typed MySql 承载 u64/BIGINT UNSIGNED，Any 供离线/测试）。
+    /// ABI 10：打开流式游标（async-stream 持有自有 SQL/参数/连接——无借用逃逸）。
+    /// 方言矩阵：mysql:// DSN → **typed 专用连接**（cancel = KILL QUERY，服务端立即
+    /// 中断查询，真取消）；其它（sqlite 等）→ Any 池回退（协作式取消）。
     async fn stream_open(&self, sql: &str, params: &[serde_json::Value]) -> Result<u64, String> {
-        let rows: Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>> =
-            match &self.pool {
-                Pooled::MySql(p) => {
-                    let sql = sql.to_string();
-                    let params: Vec<serde_json::Value> = params.to_vec();
-                    let pool = p.clone();
-                    Box::pin(async_stream::stream! {
-                        let mut q: Query<'_, MySql, MySqlArguments> =
-                            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                        for v in &params {
-                            q = bind_value_mysql(q, v);
-                        }
-                        use futures::StreamExt;
-                        let mut rows = q.fetch(&pool);
-                        while let Some(r) = rows.next().await {
-                            match r {
-                                Ok(row) => yield row_to_json_mysql(&row),
-                                Err(e) => {
-                                    yield Err(format!("db stream: {e}"));
-                                    break;
-                                }
+        let sql = sql.to_string();
+        let params: Vec<serde_json::Value> = params.to_vec();
+        let is_mysql = matches!(self.pool, Pooled::MySql(_));
+        let mut conn_id: Option<u64> = None;
+        let rows: DbStream =
+            if is_mysql {
+                // typed 专用连接：连接的所有权随生成器走；cancel = KILL QUERY conn_id
+                // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
+                let mut conn = MySqlConnection::connect(&self.dsn)
+                    .await
+                    .map_err(|e| format!("db stream_open: connect: {e}"))?;
+                conn_id = Some(
+                    sqlx::query_scalar::<_, u64>("select connection_id()")
+                        .fetch_one(&mut conn)
+                        .await
+                        .map_err(|e| format!("db stream_open: connection id: {e}"))?,
+                );
+                Box::pin(async_stream::stream! {
+                    let mut q: Query<'_, MySql, MySqlArguments> =
+                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                    for v in &params {
+                        q = bind_value_mysql(q, v);
+                    }
+                    use futures::StreamExt;
+                    let mut rows = q.fetch(&mut conn);
+                    while let Some(r) = rows.next().await {
+                        match r {
+                            Ok(row) => yield row_to_json_mysql(&row),
+                            Err(e) => {
+                                yield Err(format!("db stream: {e}"));
+                                break;
                             }
                         }
-                    })
-                }
-                Pooled::Any(p) => {
-                    // Any 层无 u64：明确拒绝（勿让 `$oj$u64` 落成静默文本）。
-                    oj_plugin_ffi::jsint::reject_u64_markers(
-                        params,
-                        "the sqlx::Any fallback path cannot carry u64 — use a mysql:// DSN with this plugin",
-                    )?;
-                    let sql = sql.to_string();
-                    let params: Vec<serde_json::Value> = params.to_vec();
-                    let pool = p.clone();
-                    Box::pin(async_stream::stream! {
-                        let mut q: Query<'_, Any, AnyArguments> =
-                            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                        for v in &params {
-                            q = bind_value_any(q, v);
-                        }
-                        use futures::StreamExt;
-                        let mut rows = q.fetch(&pool);
-                        while let Some(r) = rows.next().await {
-                            match r {
-                                Ok(row) => yield Ok(row_to_json_any(&row)),
-                                Err(e) => {
-                                    yield Err(format!("db stream: {e}"));
-                                    break;
-                                }
+                    }
+                    // 生成器结束 → conn drop = 断连（回池）。
+                })
+            } else {
+                // Any 层无 u64：明确拒绝（勿让 `$oj$u64` 落成静默文本）。
+                oj_plugin_ffi::jsint::reject_u64_markers(
+                    &params,
+                    "the sqlx::Any fallback path cannot carry u64 — use a mysql:// DSN with this plugin",
+                )?;
+                let pool = match &self.pool {
+                    Pooled::Any(p) => p.clone(),
+                    _ => unreachable!("is_mysql false ⇒ Any pool"),
+                };
+                Box::pin(async_stream::stream! {
+                    let mut q: Query<'_, Any, AnyArguments> =
+                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                    for v in &params {
+                        q = bind_value_any(q, v);
+                    }
+                    use futures::StreamExt;
+                    let mut rows = q.fetch(&pool);
+                    while let Some(r) = rows.next().await {
+                        match r {
+                            Ok(row) => yield Ok(row_to_json_any(&row)),
+                            Err(e) => {
+                                yield Err(format!("db stream: {e}"));
+                                break;
                             }
                         }
-                    })
-                }
+                    }
+                })
             };
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
         self.streams.lock().unwrap().insert(
@@ -403,6 +423,8 @@ impl Client {
             Arc::new(StreamHandle {
                 rows: tokio::sync::Mutex::new(rows),
                 cancelled: AtomicBool::new(false),
+                typed: is_mysql,
+                conn_id,
                 pending_error: std::sync::Mutex::new(None),
             }),
         );
@@ -466,10 +488,34 @@ impl Client {
         Err("db stream_next: empty batch without termination".into())
     }
 
-    /// 协作式取消（批间生效）：无锁置标志，不与进行中的批量争用。
+    /// 取消：typed（mysql:// DSN）= **移除条目并发 `KILL QUERY` 专用连接**（服务端立即
+    /// 中断查询——真取消，幂等：条目已无即 no-op）；Any 回退 = 置标志（协作式，下一批返回
+    /// cancelled）。
     fn stream_cancel(&self, stream_id: u64) -> Result<Vec<u8>, String> {
-        if let Some(cur) = self.streams.lock().unwrap().get(&stream_id) {
+        let cur = self.streams.lock().unwrap().remove(&stream_id);
+        if let Some(cur) = cur {
+            if cur.typed {
+                // 方言级真取消：独立短连接发 KILL QUERY conn_id，服务端立即中断查询
+                // （sqlx Drop 不通知服务器——断连要等 keepalive，必须显式取消）。
+                if let Some(cid) = cur.conn_id {
+                    let dsn = self.dsn.clone();
+                    tokio::spawn(async move {
+                        if let Ok(mut c) = MySqlConnection::connect(&dsn).await {
+                            // cid 来自服务端 connection_id()，非用户输入，可信；
+                            // KILL QUERY 不接受绑定参数，故以 AssertSqlSafe 包裹动态串。
+                            let _ = sqlx::query(sqlx::AssertSqlSafe(
+                                format!("kill query {cid}").as_str(),
+                            ))
+                            .execute(&mut c)
+                            .await;
+                            let _ = c.close_hard().await;
+                        }
+                    });
+                }
+                return Ok(b"".to_vec()); // 条目已移除（游标 drop，连接随后关闭）
+            }
             cur.cancelled.store(true, Ordering::SeqCst);
+            self.streams.lock().unwrap().insert(stream_id, cur);
         }
         Ok(b"".to_vec())
     }
@@ -1786,6 +1832,94 @@ mod tests {
             .await
             .unwrap();
         close(handle);
+    }
+
+    /// 真取消（env-gated，MySQL 侧，债②验收）：`mysql://` DSN 走 typed 专用连接，
+    /// `stream_cancel` = `KILL QUERY` + 断连，服务端 `information_schema.processlist` 中的
+    /// 慢查询秒级消失（≤5s），随后池 query 正常。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_stream_cancel_kills_server_query() {
+        let Ok(dsn) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(dsn.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        // 第二个 client 轮询 processlist（独立连接，不被慢查询阻塞）。
+        let pbytes = drive(&mut connect(RString::from(dsn.as_str())))
+            .await
+            .expect("poll connect");
+        let ph = serde_json::from_slice::<serde_json::Value>(&pbytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        let slow = "with nums as (select 0 n union all select 1 union all select 2 union all select 3 \
+                     union all select 4 union all select 5 union all select 6 union all select 7 \
+                     union all select 8 union all select 9) \
+                    /*oj-cancel-test*/ select a.n + b.n*10 + c.n*100 as v, sleep(0.02) \
+                     from nums a, nums b, nums c";
+        let bytes = drive(&mut stream_open(
+            h,
+            RString::from(slow),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        // 取一批（批内已在服务端跑起来）
+        drive(&mut stream_next(h, sid)).await.expect("next1");
+
+        let poll = |ph: u64| {
+            async move {
+                // 排除轮询自身连接（其 info 含同一 marker，会自匹配导致计数恒 ≥1）。
+                let sql = "select count(*) as n from information_schema.processlist \
+                           where info like '%oj-cancel-test%' and id <> connection_id()";
+                let mut fut = query(ph, RString::from(sql), RString::from("[]"));
+                drive(&mut fut).await
+            }
+        };
+        // cancel 前：服务端有该查询
+        let pre = poll(ph).await.expect("poll pre");
+        let pre_n = serde_json::from_slice::<serde_json::Value>(&pre).unwrap()[0]["n"]
+            .as_i64()
+            .unwrap();
+        assert!(pre_n >= 1, "cancel 前服务端应有慢查询在跑: {pre_n}");
+
+        // cancel → KILL QUERY → 服务端查询终止
+        drive(&mut stream_cancel(h, sid)).await.expect("cancel");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut cleared = false;
+        while std::time::Instant::now() < deadline {
+            let b = poll(ph).await.expect("poll");
+            if serde_json::from_slice::<serde_json::Value>(&b).unwrap()[0]["n"].as_i64() == Some(0)
+            {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(cleared, "5s 内 processlist 必须无孤儿查询（真取消）");
+        // 池仍正常
+        let b = drive(&mut query(
+            h,
+            RString::from("select 1 as ok"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("post-cancel query");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()[0]["ok"] == 1,
+            "cancel 后池路径须正常"
+        );
+        close(h);
+        close(ph);
     }
 
     extern "C" fn test_log(_level: u8, _msg: RString) {}

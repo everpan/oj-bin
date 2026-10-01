@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.42 —— PR-2 续：流式查询方言级真取消（postgres/mysql）
+
+- **`oj-db-postgres` / `oj-db-mysql` 在 `postgres://` / `mysql://` DSN 下，`db.stream` 取消升级为
+  **真取消**：游标单开一条**专用连接**，取消 = 显式服务端中止——
+  `pg_cancel_backend(pid)`（postgres）/ `KILL QUERY conn_id`（mysql）+ 断连；服务端查询**立即
+  终止**（`pg_stat_activity` / `information_schema.processlist` 中秒级消失），不再等驱动层 drop。
+  - 动机：sqlx 0.9 无方言级 CancelToken，且 `Connection` 的 Drop **不通知服务器**（已验证：drop 后
+    服务端查询仍跑完）；仅靠断连要等 keepalive 才回收，故取消必须显式发令。
+  - `CONNECTION_ID()` / `pg_backend_pid()` 在连接建立时查询并存于 `StreamHandle`，cancel 时经一条
+    **独立短连接**发出后 `close_hard`，不影响主池。
+- **Any 回退路径（sqlite 等）与 core 后端保持协作式取消**（批间生效，下一批返回
+  `{"error":"cancelled"}`）——能力边界：无服务端查询句柄的方言只能协作式。
+- **真实数据库验收**（env-gated，`OJ_TEST_PG` / `OJ_TEST_MYSQL`）：`real_*_stream_cancel_kills_server_query`
+  钉死「cancel 前 processlist/activity 有慢查询 → cancel 后 ≤5s 无孤儿查询 → 池路径仍正常」，
+  修测试自身「轮询连接自匹配 marker」的计量偏差（已加 `id <> connection_id()` / `pid <>
+  pg_backend_pid()` 排除）。
+- 文档：api-manual `db.stream` 取消语义与错误/限制表同步方言矩阵；SKILL.md 陷阱速查增补。
+- 方言能力矩阵（取消语义）：
+
+  | 后端 / DSN            | 流式            | 取消                    |
+  |-----------------------|-----------------|-------------------------|
+  | `oj-db-postgres` (pg) | 专用连接真流式  | `pg_cancel_backend` 真取消 |
+  | `oj-db-mysql` (mysql) | 专用连接真流式  | `KILL QUERY` 真取消     |
+  | core / Any (sqlite)   | 池路径真流式    | 协作式（批间）          |
+
 ## v0.1.41 —— PR-9：租户声明的服务端绑定
 
 - 新配置 `tenant.require_signed_claim`（默认 **false**，行为不变）：开启后 `http.tenantId`
