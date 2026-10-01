@@ -18,13 +18,18 @@
 | [8](#场景-8302-重定向到-blob-预签名-url) | 权限校验后 302 到 `blob.url()` 预签名 URL，浏览器两跳直取对象（`json.redirect`，v0.1.26） | §6 json / §7 响应信封 |
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
+| [11](#场景-11ldapad-登录鉴证v0128) | LDAP/AD 登录鉴证或目录查询（`ldap.bind/search/...`，filter 用户输入须转义，v0.1.28） | §6 ldap / §8 鉴权 |
 | [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + stdout 直出（v0.1.29） | §11 `oj exec` |
 | [13](#场景-13大文件直传绕开-10mb30s-v0130) | office 大附件 >10MB / 上传+处理超 30s：`blob.uploadUrl` 预签名（s3）或 `PUT {base}/blob/{key}` 直传路由（local）（v0.1.30） | §6 blob |
 | [14](#场景-14浏览器登录cookie-会话--csrf-v0130) | 浏览器表单登录：HttpOnly `oj_sess` + CSRF 双提交；WS 握手同守卫（v0.1.30） | §8 鉴权 |
 | [15](#场景-15ws-房间广播presence-v0130) | 同房间成员互发消息/在线人数：`ws.join` / `ws.broadcast` / `ws.roomSize`（v0.1.30） | §6 ws |
 | [16](#场景-16带-exports-的包与-pnpm-布局v0130) | 现代 npm 包（`exports` 条件导出）与 pnpm 安装的解析约定；CJS 相对 require（v0.1.30） | §5 导入解析 |
 | [17](#场景-17wasm-引擎包进-oj-runtimev0130) | wasm-bindgen 类引擎包（PDF/字体/shaping）的加载前置检查清单（v0.1.30） | §6 crypto |
-| [18](#场景-18一份配置多源资源按需选源v0134) | `config` 同时声明多套 db/redis/blob/es/broker/kafka/rabbit，`oj test`/`oj exec` 用 `--<key> <profile>` 选默认源（v0.1.34） | §9 测试 / §11 `oj exec` / §10 配置 |
+| [18](#场景-18config-里的密码不落明文v0133) | config 里的密码/密钥不落明文——`secrets:` 段 + `oj secret keygen/seal/open`（X25519 信封，v0.1.33） | §10 配置 / 凭据密封专题 |
+| [19](#场景-19一份配置多源资源按需选源v0134) | `config` 同时声明多套 db/redis/blob/es/broker/kafka/rabbit，`oj test`/`oj exec` 用 `--<key> <profile>` 选默认源（v0.1.34） | §9 测试 / §11 `oj exec` / §10 配置 |
+| [20](#场景-20流式响应-sse-实时推送v0135) | 导出大 CSV / 实时推送——`json.stream` / `json.sse` 绕过信封、心跳保活（v0.1.35） | §6 json / §7 响应信封 |
+| [21](#场景-21前端跨域调用-oj-apicorsv0135) | 浏览器跨域 `fetch` oj API——`server.cors` 段（段存在即启用，`credentials` 需显式 `origins`，v0.1.35） | §10 配置 / §8 鉴权 |
+| [22](#场景-22应用层-aes-gcm-字段加密v0135) | 应用层 AES-GCM 字段加密——`crypto.aesGcmEncrypt` / `aesGcmDecrypt`（仅 AES-128/256，密钥自管，v0.1.35） | §6 crypto |
 
 ---
 
@@ -1185,7 +1190,7 @@ ldap:
 
 ---
 
-## 场景 18：一份配置多源资源，按需选源（v0.1.34）
+## 场景 19：一份配置多源资源，按需选源（v0.1.34）
 
 **什么时候用**：你有一份 `config.yaml`，里面同时声明了多套资源——
 比如生产库 `default` + 报表库 `report`（db）、主 redis + 缓存 redis、多个 s3 bucket、
@@ -1252,7 +1257,7 @@ rabbits:
 
 ---
 
-## 场景 19：流式响应 / SSE 实时推送（v0.1.35）
+## 场景 20：流式响应 / SSE 实时推送（v0.1.35）
 
 **什么时候用**：导出大 CSV / 流式转码 / 长列表分块吐给前端（避免一次性把全部内容攒进
 内存再返回）；或 server-sent events 把进度、通知、日志实时推到浏览器（`EventSource`）。
@@ -1305,7 +1310,7 @@ curl -N http://localhost:9778/v1/api/report/export/   # -N 关闭缓冲，看到
 
 ---
 
-## 场景 20：前端跨域调用 oj API（CORS，v0.1.35）
+## 场景 21：前端跨域调用 oj API（CORS，v0.1.35）
 
 **什么时候用**：浏览器里的前端（另一个 origin）要 `fetch` oj 的 API。同源不用配；跨源
 不配会直接被浏览器拦（`CORS` 头缺失）。
@@ -1345,6 +1350,163 @@ curl -i -X OPTIONS http://localhost:9778/v1/api/u/f/ \
 | 响应里没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂层）——与旧版行为一致；确认 config 段存在 |
 | 预检 404 / 进了业务 handler | 不会——`tower-http::cors` 在路由前短路 OPTIONS；handler 永远看不到预检 |
 | `origins: ["*"]` 不生效 | 写 `*` 字符串不会按通配展开——要放行任意源就把 `origins` 留空（空列表 = `AllowOrigin::any`） |
+
+---
+
+## 场景 22：应用层 AES-GCM 字段加密（v0.1.35）
+
+**什么时候用**：你要对落库 / 传输前的敏感字段做对称加密（手机号、token、支付信息…），
+但密钥不想进 config、不想托给插件——纯应用层、调用方自管密钥。典型：把字段加密后存进
+db，或把密文经 `json.ok` 返回前端（前端持密钥再解）。
+
+**红线先说**：`crypto.aesGcmEncrypt` / `crypto.aesGcmDecrypt` 是**纯原语**——密钥由你从
+`vars.get(...)`（可被 `ENC[...]` 密封）或别的安全通道传入，op 不耦合 config、不托管密钥。
+**密钥泄露 = 数据泄露，密钥管理归你。**
+
+### ① 密钥（16 / 32 字节原始密钥，hex 或 base64）
+
+```ts
+// 32 字节（AES-256）原始密钥，hex 编码；可塞进 config.vars 并用 ENC[...] 密封
+const KEY = vars.get("APP_FIELD_KEY")!;   // 如 "001122…ff"（32 字节 → 64 hex 字符）
+```
+
+> 密钥只支持 16 字节（AES-128）或 32 字节（AES-256）的 hex / base64；**不支持 AES-192**
+> （上游 crate 未 re-export），传 24 字节密钥会直接报错。
+
+### ② handler（加密后落库）
+
+```ts
+export default {
+  async post() {
+    const KEY = vars.get("APP_FIELD_KEY")!;
+    const phone = http.param("phone", "");
+    if (!phone) return json.fail(400, "phone required");
+
+    // 应用层加密：输出 base64(nonce12 ‖ ciphertext ‖ tag16)，每次密文都不同（随机 nonce）
+    const ct = crypto.aesGcmEncrypt(phone, KEY);
+
+    await db.table("user").insert({ name: http.param("name", ""), phone_enc: ct }).exec();
+    json.ok({ ok: true });
+  },
+};
+```
+
+### ③ handler（读出后解密返回）
+
+```ts
+export default {
+  async get() {
+    const KEY = vars.get("APP_FIELD_KEY")!;
+    const rows = await db.table("user")
+      .select(["phone_enc"])
+      .where({ field: "id", op: "eq", value: http.param("id", "") })
+      .all();
+    if (!rows.length) return json.fail(404, "not found");
+    const phone = crypto.aesGcmDecrypt(rows[0].phone_enc, KEY);  // GCM tag 校验失败即抛错
+    json.ok({ phone });
+  },
+};
+```
+
+### ④ 验证
+
+```bash
+curl -s -X POST 'http://localhost:9778/v1/api/user/enc/' -d 'name=alice&phone=13800000000' | head -c 200
+curl -s 'http://localhost:9778/v1/api/user/enc/?id=1' | head -c 200
+# 密文形如 base64，长度 ≈ 明文 + 12(nonce) + 16(tag)，短明文也紧凑（不似 RSA 信封被撑大）
+```
+
+### ⑤ 常见坑
+
+| 报错 | 原因 |
+|---|---|
+| `aes key must be 16/32 raw bytes (AES-192/24-byte not supported; got 24)` | 传了 24 字节密钥——AES-192 不支持；改用 16 或 32 字节 |
+| `key not hex/base64: ...` | 密钥既不是偶数长全 hex、也不是合法 base64——检查编码与换行/空格（已 `trim`） |
+| `aes-gcm decrypt failed: ...` | GCM tag 校验失败：密文被篡改，或用的不是加密时的同一把密钥 |
+| `ciphertext not base64: ...` / `ciphertext too short` | 解密入参不是 `aesGcmEncrypt` 的输出（缺 nonce 段，或已被二次 base64） |
+| `plaintext not utf8: ...` | 解密成功但原明文不是 UTF-8——本 op 只回字符串；二进制请用别的通路 |
+| 密钥硬编码在 handler 里 | 别——进 config `vars:` 段并用 `ENC[...]` 密封（`vars.get` 读取），密钥管理归你 |
+
+---
+
+## 场景 23：大表流式导出（db.stream，v0.1.37）
+
+**什么时候用**：你要遍历一张大表（导出 CSV / ETL / 批量重算），如果 `db.query` 一次性把全量拉进
+内存，结果集越大越容易撑爆 handler 内存、或撞上信封体积上限。`db.stream` 逐行拉取，常驻内存只
+一行，配合 `json.stream` 边收边推，毫无压力。
+
+**红线先说**：Phase A 仅 **核心 `SqlxAccessor`**（sqlite / mysql / postgres，经 `Any` 驱动）支持真
+流式；在 `db.tx` 内调用、或后端是插件（`oj-db-*` FFI）时都会直接报错（详见 `api-manual.md` §6 db
+节 `db.stream` 与 §13 已知限制全表）。内容与 `db.query` 全量**一致**，差异只在内存形态。
+
+### ① handler（CSV 流式导出）
+
+```ts
+export default {
+  async get() {
+    // 开裸 body 流（绕过 {code,msg,data} 信封），content-type 设 CSV
+    const s = json.stream({ contentType: "text/csv" });
+    s.write("id,name,email\n");
+    // onRow 回调逐行触发，可自由 await（这里只写一行）
+    await db.stream(
+      "select id, name, email from account order by id",
+      null,
+      { onRow: (row) => s.write(`${row.id},${row.name},${row.email}\n`) },
+    );
+    s.end();   // 流走完后再 end，客户端收到完整 CSV
+    return;    // 注意：流式响应已接管 body，不要再 json.ok/json.fail
+  },
+};
+```
+
+### ② 异步迭代器形态（逃生舱）
+
+```ts
+export default {
+  async get() {
+    const ids: number[] = [];
+    for await (const row of db.stream("select id from account order by id")) {
+      ids.push(row.id as number);
+    }
+    // ids 现在装全表 id——若表极大、仍需聚合/落库，优先用 ① 的回调边收边处理
+    json.ok({ count: ids.length });
+  },
+};
+```
+
+### ③ 中途取消（够用即停）
+
+```ts
+const ac = new AbortController();
+await db.stream(
+  "select * from huge_table order by id",
+  null,
+  {
+    signal: ac.signal,
+    onRow: (row) => {
+      if ((row.id as number) > 1_000_000) ac.abort();   // 拉到一百万行就停
+    },
+  },
+);
+```
+
+### ④ 验证
+
+```bash
+curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
+# 输出形如：id,name,email\n1,alice,a@x.com\n2,bob,b@y.com\n…
+# 大表下内存平稳（不随结果集增长），响应流式到达（首行先到）
+```
+
+### ⑤ 常见坑
+
+| 报错 / 现象 | 原因 |
+|---|---|
+| `db.stream within an active transaction is not supported in Phase A (ABI 10 required)` | 在 `db.tx(...)` 回调里调用了 `db.stream`——Phase A 只支持直连池，先 `db.query` 取 id 集再在 tx 内逐条处理，或把流式放到 tx 外 |
+| `backend does not support streaming (ABI 10 required)` | 后端是 FFI 插件（`oj-db-mysql` 等经 `oj-plugin-ffi` 加载）；Phase A 插件走 `stream_query` 默认实现报错，须等 PR-2 Phase B（ABI 10 vtable） |
+| 写了 `json.ok(...)` 又 `json.stream` | 流式响应已接管 body，二者互斥——用了 `json.stream` 就别再 `json.ok/fail`，handler 直接 `return` |
+| `for await` 拿到的 `row` 是 `undefined` | 流结束哨兵是 `null`，但迭代器形态已为你消化；直接在循环体用 `row` 即可，不要等 `undefined` |
+| 取消后已处理的行「回滚」了 | `signal` 只中止**后续拉取**，已回调/已迭代的行不会回滚——取消前的数据已是最终态 |
 
 ---
 

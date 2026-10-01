@@ -117,6 +117,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 改了任务文件没生效 | 任务无热重载——重启进程（转译缓存按 mtime 自动失效）；池化任务可用管理面 `POST {base}/tasks/{name}/reload`（v0.1.28） |
 | 池化任务跑几轮就 `failed` | 单轮 `loop_body` 超 `tasks.pool.loop_body_timeout_ms`（默认 5s）即 teardown + failed 退避重连——长轮询（>5s 一次的等待）别用池化，继续用 TLA + `tasks.sleep` |
 | 池化任务里 `tasks.stopping()` 恒 false | 池化任务由 worker 每轮驱动：`loop_body` 返回即一轮结束，天然无需停机轮询/`tasks.sleep`（v0.1.28） |
+| `db.stream` 在 `db.tx` 里报 `…not supported in Phase A (ABI 10 required)` | Phase A 只支持直连池，不支持事务内流式——先 `db.query` 取 id 集，或把流式挪到 tx 外 |
+| 插件库（`oj-db-*`）调 `db.stream` 报 `backend does not support streaming (ABI 10 required)` | Phase A 仅核心 `SqlxAccessor`（sqlite/mysql/postgres `Any` 驱动）真流式；FFI 插件要等 PR-2 Phase B（ABI 10 vtable） |
+| 用了 `json.stream` 又 `json.ok` | 流式响应已接管 body，二者互斥——`json.stream`/`sse` 后 handler 直接 `return`，别再包信封 |
 | 启动报 `config has ENC[...] sealed values but no decryption key: …` | config 里有密封值却找不到私钥——设 `OJ_SECRET_KEY`（PEM）/ `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`。**不会**静默把密文当明文用（v0.1.33） |
 | `ENC[…]` 解不开 / 报 `aes-gcm open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
 | 报 `sealed value is v1 (RSA) — v1 信封已移除` | 手头是旧版 RSA(v1) 密文，新版已不再支持；用 `oj secret seal` 以 X25519 重新加密（v1 已整体移除，密钥配置只认 X25519 一套） |

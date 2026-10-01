@@ -693,6 +693,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 |---|---|---|
 | `db.query` | `query(sql: string, params?: unknown[]): Promise<Row[]>` | 参数化查询 → 行数组 |
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
+| `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal }): Promise<void> \| AsyncIterable<Row>` | **流式查询**（v0.1.37，PR-2 Phase A）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。两种形态见下 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持。`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
@@ -939,6 +940,61 @@ await db.table("rich")
   默认值由 `db_query.default_limit`（默认 100）给出，显式 limit 被 `db_query.max_limit`
   （默认 1000）clamp；两者均可在配置中调整（硬顶 100000）。顶层结果为数组且行数 ≥ 生效
   上限时，响应带 `X-OJ-Row-Limit: <上限>` 头提示可能被截断。
+
+#### 流式查询 db.stream（v0.1.37，PR-2 Phase A）
+
+`db.query` 一次性把整张结果集拉进内存再序列化回 JS；结果集很大（导出、ETL、大表遍历）时
+会撑爆 handler 内存或触碰信封体积上限。`db.stream` 改为**逐行**从后端拉取，由 JS 一边收一边
+处理（写 `json.stream`、落库、累积聚合等），常驻内存只是一条行。
+
+**两种形态**：
+
+1. **回调形态（推荐）**：`opts.onRow(row)` 逐行回调。回调内可自由 `await`（例如每行 `json.sse`
+   推一帧、或 `db.exec` 落库）。`db.stream` 返回的 Promise 在流走完（含正常结束与中止）后 resolve，
+   异常时 reject（被 `await` 或 `.catch` 捕获）。适合「边收边写」的导出/推送场景。
+
+   ```ts
+   // 大表导出为 CSV 流式响应（边收边写，常驻内存仅一行）
+   const s = json.stream({ contentType: "text/csv" });
+   s.write("id,name\n");
+   await db.stream(
+     "select id, name from account order by id",
+     null,
+     { onRow: (row) => s.write(`${row.id},${row.name}\n`) },
+   );
+   s.end();
+   ```
+
+2. **异步迭代器形态（逃生舱）**：不传 `onRow` 时返回 `AsyncIterable<Row>`，可用 `for await`
+   消费。每行即一条 `Row`（JSON 对象）；流结束自然退出。
+
+   ```ts
+   const out = [];
+   for await (const row of db.stream("select id, name from account order by id")) {
+     out.push(row);
+   }
+   ```
+
+**中止（取消）**：传入 `opts.signal`（WHATWG `AbortSignal`，如 `AbortController.signal`），
+在 `abort` 事件触发时由桥接层调用 `op_db_stream_abort` 通知后端 pump 中止，流提前结束。`signal`
+通过 `addEventListener` 接线，流走完会自动 `removeEventListener`，无需手动清理。
+
+```ts
+const ac = new AbortController();
+db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
+  if (r.id > 1_000_000) ac.abort();   // 够了就停
+}});
+```
+
+**限制与边界（Phase A）**：
+- 仅支持**非事务**目标（`DB(name)` 的直连池）。在 `db.tx(...)` 内部调用 `db.stream` 直接报错
+  `db.stream within an active transaction is not supported in Phase A (ABI 10 required)`。
+- 插件后端（`oj-db-*` 经 FFI 加载）当前走 `DataAccessor::stream_query` 的**默认实现**，会报错
+  `backend does not support streaming (ABI 10 required)`。Phase A 仅核心 `SqlxAccessor`
+  （sqlite/mysql/postgres，`Any` 驱动）提供真实流式；ABB 升级（vtable `stream_open`/`fetch_next`/
+  `stream_cancel`/`stream_close` + `ABI 10`）在 PR-2 Phase B 落地后插件后端方可流式。
+- `db.stream` 与 `db.query` 返回**内容一致**（同一查询的逐行等价于全量数组）；差异只在内存形态。
+- `signal` 仅中止拉取，已回调/已迭代的行不会回滚。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -2821,6 +2877,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
+| `db.stream` 仅非事务 + 核心 SqlxAccessor（v0.1.37，PR-2 Phase A） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported in Phase A`；插件后端（`oj-db-*` FFI）报 `backend does not support streaming (ABI 10 required)`——Phase A 仅 sqlite/mysql/postgres 经 `Any` 驱动真流式，插件后端须等 PR-2 Phase B（ABI 10 vtable）落地。内容等价于 `db.query` 全量，差异仅在内存形态 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |

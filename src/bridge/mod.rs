@@ -262,6 +262,9 @@ pub struct ReqState {
     /// SSE 心跳停止信号（仅 `json.sse()` 开流时存在）；`op_stream_end`/`read_capture` 触发，
     /// 让心跳任务（持有 `stream_tx` 克隆）干净退出并关闭流。
     pub stream_heartbeat_stop: std::cell::RefCell<Option<std::sync::Arc<tokio::sync::Notify>>>,
+    /// PR-2 Phase A：`db.stream` 每请求流注册表（keyed by stream_id）。pump 持有 Arc 克隆推数据，
+    /// `op_db_stream_next` 拉取；`reset` 换全新 Arc，旧 Arc 由仍存活的 pump 持有至排空，互不串。
+    pub(crate) db_streams: std::sync::Arc<db::DbStreamRegistry>,
 }
 
 impl ReqState {
@@ -281,6 +284,7 @@ impl ReqState {
         self.stream_tx.borrow_mut().take();
         self.stream_rx.borrow_mut().take();
         self.stream_heartbeat_stop.borrow_mut().take();
+        self.db_streams = std::sync::Arc::new(db::DbStreamRegistry::default());
     }
 }
 
@@ -313,6 +317,10 @@ deno_core::extension!(
         db::op_db_tx_begin,
         db::op_db_tx_commit,
         db::op_db_tx_rollback,
+        db::op_db_stream_open,
+        db::op_db_stream_next,
+        db::op_db_stream_close,
+        db::op_db_stream_abort,
         query::op_db_query_build,
         query::op_db_query_sql,
         blob::op_blob_put,

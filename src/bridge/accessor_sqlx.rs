@@ -4,9 +4,11 @@
 //! 本实现把 `Value` 绑定到 sqlx 语句，并把结果行转回 `serde_json::Value`，匹配 Value 边界。
 //! 真实 handler 无需感知底层驱动——`db.query_with_params` / `db.table(...)` 统一经此路径。
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::Stream;
 use serde_json::Value;
 use sqlx::any::{Any, AnyArguments};
 use sqlx::pool::{Pool, PoolOptions};
@@ -236,6 +238,38 @@ impl DataAccessor for SqlxAccessor {
             .await
             .map_err(|e| format!("sqlx exec: {e}"))?;
         Ok(res.rows_affected() as i64)
+    }
+
+    async fn stream_query(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<JsRow, String>> + Send>>> {
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
+        // try_stream! 把自有 sql/params/pool 收进生成器状态机，规避 sqlx Query 借用 &str
+        // 无法返回 'static 装箱流的问题（borrow 仅在生成器内部，不外逃）。
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let pool = self.pool.clone();
+        // stream! 直接 yield Result<Value,String>；borrow 仅存在于生成器内部状态机，不外逃。
+        let stream = async_stream::stream! {
+            let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+            for p in &params {
+                q = bind_value(q, p);
+            }
+            let mut rows = q.fetch(&pool);
+            use futures::StreamExt;
+            while let Some(r) = rows.next().await {
+                match r {
+                    Ok(row) => yield Ok(row_to_json(&row)),
+                    Err(e) => { yield Err(e.to_string()); break; }
+                }
+            }
+        };
+        Ok(Box::pin(stream))
     }
 }
 
