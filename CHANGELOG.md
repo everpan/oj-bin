@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.43 —— PR-6 第一步：`oj openapi` 生成 + `--check` 漂移门禁
+
+- **新增 `oj openapi` 子命令**（`oj/src/openapi_cmd.rs`）：从路由表生成 **OpenAPI 3.1**
+  （手搓 `serde_json::Value`，不引入额外 crate），并支持 `--check` 漂移校验（PR-6 第一步；
+  请求/响应 schema 留待后续步）。
+  - `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]`：生成并打印 / 落盘。
+  - `oj openapi -c config.yaml --check`：生成物与已提交 `<dir>/openapi.json` 比对，不一致即
+    打印重生成命令 `oj openapi -c ... -d ... [--base ...] [-o ...]` 与差异行、退出码 1
+    （CI 漂移门禁）；一致退出码 0。
+- **路由发现双模复用既有装配**，避免 dev/release 分叉：
+  - dev（`src`，`ts=true`）：逐文件 `bridge_introspector` 内省 `.route` → `RouteTable::build`；
+  - release（`dist`，含 `manifests.yaml`，`ts=false`）：读锁 + 各模块 `routes.js`
+    （`bridge_default_reader` → `entries_from_value` → `from_entries`）。
+- **当前生成物体量为**：路径 / 方法 / 源文件溯源 `x-oj-file` / 派生 `operationId`
+  （`^[a-zA-Z0-9._~-]+$`，非法字符转 `_`）/ 路径参数（`in: path` 必填）；`responses` 为占位
+  （200 OK）—— handler 仅导出 verb fn + 可选 `.route`，尚无 schema 导出契约，故请求体 / 响应
+  schema 待 PR-6 后续步补完。
+- **catch-all 处理**：oj 的 `{*path}` 写作非 OpenAPI 合法的 glob，生成时收敛为 `{path}` 并抽
+  出路径参数。
+- **漂移比对对键序无关**：`canonical` 递归键升序规范化，键序差异不误报；内容差异必被检出。
+- **验证**：`oj/src/openapi_cmd.rs` 4 个单测覆盖——`generate_produces_valid_openapi_3_1_*`
+  （catch-all 收敛 + 路径参数抽出）、`check_detects_no_drift_and_drift`（篡改 summary 必被检出）、
+  `check_roundtrip_writes_then_detects_tamper`（真·`--check` 文件往返：落盘→同物 0→篡改 1）。
+- 文档：`docs/modules/04-oj-cli.md` 新增 §6「`oj openapi` 子命令」+ 子命令表行；架构文档同步。
+
 ## v0.1.42 —— PR-2 续：流式查询方言级真取消（postgres/mysql）
 
 - **`oj-db-postgres` / `oj-db-mysql` 在 `postgres://` / `mysql://` DSN 下，`db.stream` 取消升级为

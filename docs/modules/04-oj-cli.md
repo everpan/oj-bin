@@ -13,6 +13,7 @@
 | `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
 | `fixture` | `-c`、`-d`、`--db`、`--module` | `migrate_cmd.rs:115` |
 | `schema diff` | `-c`、`-d`、`--db` | `migrate_cmd.rs:130` |
+| `openapi` | `-c/--config`、`-d/--dir`、`-b/--base`、`--check`、`-o/--out` | `openapi_cmd.rs:18` |
 
 已删除的旗标有回归测试钉死（`args.rs:371`）：`build -b`、`server --dev`、`server -d/--dir`、
 `--grace-days` 等一律 clap 报错；空参打印帮助。
@@ -119,7 +120,31 @@
 - `oj test` 不走 `RuntimePool`，故在 `test_cmd.rs:125` 单独补跑一次 ext_boot，
   否则与生产行为分叉。
 
-## 6. 瘦身装配（`migrate_cmd.rs`）
+## 6. `oj openapi` 子命令（`openapi_cmd.rs`）
+
+PR-6 第一步（生成 + 漂移门禁；请求/响应 schema 留待后续步）：
+
+- **路由发现双模复用既有路径**（与 `App::from_config` 同构，不另起灶）：
+  - dev（`-d` 指向 `src`，`ts=true`）：逐文件 `bridge_introspector` 内省 `.route` → `RouteTable::build`；
+  - release（`-d` 指向 `dist`，含 `manifests.yaml`，`ts=false`）：读锁 + 各模块 `routes.js`（`bridge_default_reader` → `entries_from_value` → `from_entries`）。
+- **生成**：`RouteTable.listing()` → OpenAPI 3.1（`serde_json::Value` 手搓，不引额外 crate）。
+  当前仅能收集体量信息（路径 / 方法 / 源文件 `x-oj-file` 溯源 / 派生 `operationId` / 路径参数），
+  `responses` 为占位（200 OK）—— schema 待 PR-6 后续步补完。
+- **漂移门禁 `--check`**：生成物与已提交 `<dir>/openapi.json`（或 `-o` 指定文件）做**键序规范化**
+  `canonical` 比较，不一致即打印 `oj openapi -c ... -d ... [--base ...] [-o ...]` 重生成命令与
+  差异行、退出码 1（CI 钉死路由漂移）；一致退出码 0。`canonical` 递归键升序，键序差异不误报。
+- **退出码**：0 成功 / 1 漂移或错误（`main.rs` 透传）。
+- 设计红线：不引入 OpenAPI 第三方 crate（维持零额外依赖面）；多模路由发现必须复用 `App` 同一条
+  装配逻辑，避免「dev 看到 / release 漏掉」分叉。
+
+### 测试（击穿优先）
+
+- 单元（`openapi_cmd.rs`）：`generate_produces_valid_openapi_3_1_*`（catch-all `{*path}` 收敛
+  `{path}` + 路径参数抽出）、`check_detects_no_drift_and_drift`（篡改 summary 必被检出）、
+  `check_roundtrip_writes_then_detects_tamper`（真·`--check` 文件往返：落盘→同物校验 0→篡改 1）。
+- 篡改 committed `openapi.json` 必须被 `--check` 非零退出——这正是 CI 漂移门禁要抓的。
+
+## 7. 瘦身装配（`migrate_cmd.rs`）
 
 `oj migrate` / `oj fixture` / `oj schema diff` **不走 `App::from_config`** ——
 后者证书门禁无逃生口且携带 seed/路由。瘦身路径只解析 config → 插件 → 开库 → 执行，
@@ -132,7 +157,7 @@ default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`�
 `manifest.yaml` 的 `db:` 绑定（那是运行期路由，见 `src/bridge/guard.rs::bound_db`），
 多库部署须逐 profile 各跑一遍。`oj serve` 无此旗标，恒用 `default`。
 
-## 7. Rust 集成测试（`oj/tests/`）
+## 8. Rust 集成测试（`oj/tests/`）
 
 - `e2e.rs`：UC1–UC15（方法表、CRUD+params+body、嵌套路由、release 模式、kv 读穿、
   imports/裸 specifier、转译缓存与热重载、manifest 不匹配拒启、build→release 全链、
@@ -141,7 +166,7 @@ default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`�
 - `oidc_e2e.rs`：独立测试目标 —— **oj-auth 插件进程级 GUARD 只认首次 init，
   共进程会互染**（见 commit `26dbbaa`）。
 
-## 8. 已知债
+## 9. 已知债
 
 - `App::from_config` 主干 294 行 + 6 个私有步骤函数（2026-09-06 拆分后）；
   路由表构建与 `make_bridge` 闭包仍内联，若再拆需先收拢共享变量。

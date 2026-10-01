@@ -9,6 +9,7 @@ pub mod exec_ext;
 pub mod manifest;
 pub mod migrate;
 pub mod migrate_cmd;
+pub mod openapi_cmd;
 pub mod pack;
 pub mod schema;
 pub mod secret_cmd;

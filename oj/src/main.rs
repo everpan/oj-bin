@@ -90,6 +90,13 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::OpenApi(a) => match oj::openapi_cmd::run(&a).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("oj openapi: {e}");
+                1
+            }
+        },
     }
 }
 
