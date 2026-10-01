@@ -230,8 +230,9 @@ for await (const row of db.stream("select id, name from account order by id")) {
 ```
 
 - 结果与 `db.query` **内容一致**（同一查询逐行 ≡ 全量数组），差异只在内存形态。
-- 取消：传 `opts.signal`（`AbortController.signal`），`abort` 事件触发即中止后端拉取；
-  已回调的行不会回滚。core 后端为 best-effort drop；插件后端为协作式取消（批间生效）。
+- 取消：传 `opts.signal`（`AbortController.signal`），`abort` 事件触发即中止后端拉取——
+  流**干净提前结束**（消费端收到 done，不报错）；服务端行缓冲有界，消费端不拉取时后端
+  拉取同步暂停；已回调的行不会回滚。
 - **事务内不可用**：`db.stream` 只走 `DB(name)` 直连池，在 `db.tx(...)` 内调用直接报错。
 - 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
   InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）

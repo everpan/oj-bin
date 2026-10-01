@@ -245,12 +245,17 @@ pub(crate) fn resolve_target(
 /// pump 持有至排空，互不串号。
 pub(crate) type DbStreamRegistry = tokio::sync::Mutex<HashMap<u32, Arc<DbStreamShared>>>;
 
-/// 单条 db.stream 的共享状态：行/错误经 `UnboundedSender` 推给接收端（`rx`）；通道关闭 = 流结束（done）。
-/// `abort` 由 `op_db_stream_abort` 触发，pump 的 `select!` 观测后中止。
+/// 单条 db.stream 的共享状态：行/错误经有界通道推给接收端（`rx`）；通道关闭 = 流结束（done）。
+/// 有界（`DB_STREAM_CHANNEL_CAP`）= 消费端不拉取时 pump 停在 send 上，abort 立即停止后端
+/// 拉取（真取消；unbounded 会提前灌满结果集、取消扑空）。`abort` 由 `op_db_stream_abort`
+/// 触发，pump 的 `select!` 观测后中止。
 pub(crate) struct DbStreamShared {
-    pub rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<Row, String>>>,
+    pub rx: tokio::sync::Mutex<mpsc::Receiver<Result<Row, String>>>,
     pub abort: Arc<Notify>,
 }
+
+/// pump → 消费端的行缓冲上限（有界背压；abort 后缓冲行继续交付 = "流提前结束"）。
+const DB_STREAM_CHANNEL_CAP: usize = 64;
 
 /// stream_id 全局自增（每请求注册表独立，跨请求重复无妨；u32 足以覆盖请求生命周期内的并发流）。
 static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
@@ -458,7 +463,7 @@ pub async fn op_db_stream_open(
         .stream_query(&sql, &params)
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-    let (tx, rx) = mpsc::unbounded_channel::<Result<Row, String>>();
+    let (tx, rx) = mpsc::channel::<Result<Row, String>>(DB_STREAM_CHANNEL_CAP);
     let shared = Arc::new(DbStreamShared {
         rx: tokio::sync::Mutex::new(rx),
         abort: Arc::new(Notify::new()),
@@ -471,26 +476,27 @@ pub async fn op_db_stream_open(
         .clone();
     reg.lock().await.insert(id, shared.clone());
     // 脱离式 pump：监听流与取消信号，逐行推入通道（通道关闭 = done）。
+    // **有界通道 + 阻塞投递**：消费端不拉取时 pump 停在 send 上——abort 一到即
+    // 停止后端拉取（真取消）；unbounded 会把结果集提前灌满、取消扑空（探测
+    // probe_stream_abort_releases_connection 抓到的回归）。
     let abort = shared.abort.clone();
     tokio::spawn(async move {
         use futures::StreamExt;
         loop {
             tokio::select! {
                 biased;
-                _ = abort.notified() => {
-                    let _ = tx.send(Err("db stream aborted".to_string()));
-                    break;
-                }
+                _ = abort.notified() => break,
                 item = stream.next() => {
                     match item {
-                        Some(Ok(row)) => { if tx.send(Ok(row)).is_err() { break; } }
-                        Some(Err(e)) => { let _ = tx.send(Err(e)); break; }
+                        Some(Ok(row)) => { if tx.send(Ok(row)).await.is_err() { break; } }
+                        Some(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
                         None => break,
                     }
                 }
             }
         }
-        // tx 丢弃 → 接收端 recv 返回 None = 流结束（done）。
+        // tx 丢弃 → 接收端 recv 返回 None = 流结束（done）。abort 后缓冲中的
+        // 已拉行继续交付（"流提前结束"），已交付行不回滚。
     });
     Ok(id as f64)
 }
@@ -1145,6 +1151,205 @@ mod tests {
         assert_eq!(v["data"]["first"]["id"], json!(1), "{v}");
     }
 
+    // ===== 防护探测（probe）：守卫/资源回收不能只靠"插旗"声明，用对抗用例钉死 =====
+
+    /// 探测辅助：跑一段 JS，返回信封 data（code 必须 0）。
+    async fn run_probe(b: &Bridge, req: crate::bridge::RequestInfo, js: String) -> Value {
+        let cap = b.run_with(&js, req).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        v["data"].clone()
+    }
+
+    fn stream_probe_js(sql: &str, params: &str) -> String {
+        format!(
+            r#"(async () => {{
+                 try {{
+                   const rows = [];
+                   for await (const r of db.stream({sql}, {params})) rows.push(r);
+                   json.ok({{ n: rows.length }});
+                 }} catch (e) {{ json.ok({{ err: String(e) }}); }}
+               }})().catch(e => json.fail(500, String(e)));"#
+        )
+    }
+
+    /// 探测：租户守卫对 db.stream 必须与 db.query **同严**（Deny 模式四态全打）。
+    /// 若流式路径在守卫上抄近道（open 前漏 check_tenant_raw），下面至少一条红。
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_stream_tenant_guard_deny_four_states() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "create table t (id integer primary key, name text, tenant_id text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.exec_with_params(
+            "insert into t (id, name, tenant_id) values (1,'a','t1'),(2,'b','t2')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new().table("t", &["id"], &["id", "name", "tenant_id"]),
+            false,
+            None,
+            crate::bridge::Extras {
+                sql_guard: crate::bridge::SqlGuard::Deny,
+                ..Default::default()
+            },
+        );
+        let run = |req, sql: &str, params: &str| {
+            let js = stream_probe_js(sql, params);
+            let b = &b;
+            async move { run_probe(b, req, js).await }
+        };
+        let t1 = crate::bridge::RequestInfo {
+            tenant_id: Some("t1".into()),
+            ..Default::default()
+        };
+        // ① 租户受约束表、SQL 无 tenant_id 条件 → open 前拒绝（游标不得建立）
+        let d = run(t1.clone(), r#""select * from t""#, "null").await;
+        assert!(
+            d["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("lacks tenant_id"),
+            "① 流式必须同样吃租户守卫: {d}"
+        );
+        // ② 无租户头（含受约束表）→ require tenant context
+        let d = run(
+            crate::bridge::RequestInfo::default(),
+            r#""select * from t where tenant_id = 't1'""#,
+            "null",
+        )
+        .await;
+        assert!(
+            d["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("require tenant context"),
+            "② 无租户头必须拒绝: {d}"
+        );
+        // ③ 条件 + 参数租户匹配 → 通过，且只见本租户的行
+        let d = run(
+            t1.clone(),
+            r#""select id from t where tenant_id = ?""#,
+            r#"["t1"]"#,
+        )
+        .await;
+        assert_eq!(d["n"], json!(1), "③ 合法流式须放行且只见本租户行: {d}");
+        // ④ 条件有、参数租户不符（deny 模式）→ 拒
+        let d = run(t1, r#""select id from t where tenant_id = ?""#, r#"["t2"]"#).await;
+        assert!(
+            d["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must include current tenant id"),
+            "④ 参数租户不符必须拒绝: {d}"
+        );
+    }
+
+    /// 探测：中途 abort 后连接必须回池——sqlite 池 max_connections(1)，游标泄漏 =
+    /// 后续同池查询挂死。整条 run_with 套超时哨兵：泄漏即红（不靠人眼看日志）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_stream_abort_releases_connection() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            b.run_with(
+                r#"(async () => {
+                     await db.exec("create table t(id integer)");
+                     for (let i = 0; i < 50; i++) await db.exec("insert into t values (?)", [i]);
+                     const ac = new AbortController();
+                     let n = 0;
+                     try {
+                       await db.stream("select id from t order by id", null, {
+                         signal: ac.signal,
+                         onRow: (r) => { n++; if (n === 3) ac.abort(); },
+                       });
+                     } catch (e) { /* 取消 = 流提前终止（拒绝或正常结束皆可） */ }
+                     // abort 后同池再来一发：连接没回池这里挂死（max_connections(1) 哨兵）
+                     const after = await db.query("select count(*) as c from t");
+                     json.ok({ streamed: n, after: after[0].c });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap()
+        })
+        .await
+        .expect("abort 后同池查询挂死 = 连接泄漏（sqlite max_connections(1) 哨兵）");
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let n = v["data"]["streamed"].as_u64().unwrap();
+        assert!((3..=50).contains(&n), "abort 须提前终止（n={n}）: {v}");
+        assert_eq!(v["data"]["after"], json!(50), "abort 后连接须可用: {v}");
+    }
+
+    /// 探测：并发游标交叉——每请求流注册表按 stream_id 隔离，两个游标交错推进
+    /// 互不串行（若注册表被复用/串号，这里序列即错）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_stream_concurrent_cursors_interleave() {
+        let acc = Arc::new(InMemoryAccessor::new());
+        acc.seed(vec![json!({"id": 1}), json!({"id": 2})]);
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                acc as Arc<dyn DataAccessor>,
+            )]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const a = db.stream("q")[Symbol.asyncIterator]();
+                     const b2 = db.stream("q")[Symbol.asyncIterator]();
+                     const a1 = await a.next();
+                     const b1 = await b2.next();
+                     const a2 = await a.next();
+                     const b2v = await b2.next();
+                     const aDone = (await a.next()).done;
+                     const bDone = (await b2.next()).done;
+                     json.ok({ a: [a1.value.id, a2.value.id], b: [b1.value.id, b2v.value.id], aDone, bDone });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["a"],
+            json!([1, 2]),
+            "游标 a 序列不得被 b 串扰: {v}"
+        );
+        assert_eq!(
+            v["data"]["b"],
+            json!([1, 2]),
+            "游标 b 序列不得被 a 串扰: {v}"
+        );
+        assert_eq!(v["data"]["aDone"], json!(true), "{v}");
+        assert_eq!(v["data"]["bDone"], json!(true), "{v}");
+    }
+
     /// 中途 abort：流干净终止（不 panic、连接回池）；abort 经 AbortSignal 的 abort 事件触发。
     #[tokio::test(flavor = "current_thread")]
     async fn stream_abort_terminates_without_panic() {
@@ -1182,10 +1387,18 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "{v}");
-        assert_eq!(v["data"]["aborted"], json!(true), "abort 必须终止流：{v}");
+        // 有界通道语义：abort = **干净提前结束**（缓冲行交付完即 done，不抛错）；
+        // count 必须 < 1000（取消真的停止了后端拉取，而非灌满缓冲后照常跑完）。
+        assert_eq!(
+            v["data"]["aborted"],
+            json!(false),
+            "abort = 流提前结束（非错误）: {v}"
+        );
+        let count = v["data"]["count"].as_u64().unwrap();
+        assert!(count >= 3, "至少已消费 3 行：{v}");
         assert!(
-            v["data"]["count"].as_u64().unwrap() >= 3,
-            "至少已消费 3 行：{v}"
+            count < 1000,
+            "取消必须停止拉取（count={count} 不得跑完全表）: {v}"
         );
     }
 }
