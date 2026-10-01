@@ -216,12 +216,16 @@ pub enum Lookup {
     NotFound,
 }
 
-/// 启动打印行（method × pattern × file_id）。
+/// 启动打印行（method × pattern × file_id × 契约）。
 #[derive(Clone)]
 pub struct RouteRow {
     pub method: String,
     pub pattern: String,
     pub file: FileId,
+    /// handler 声明的入参契约（`.schema`）；None = 未声明（不校验）。
+    /// **由路由表单一承载** —— dev 内省与 release `routes.js` 都落到此处，
+    /// 契约的三个消费者（运行期校验 / oj build 落盘 / oj openapi 出契约）同读一源。
+    pub schema: Option<serde_json::Value>,
 }
 
 /// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
@@ -269,7 +273,10 @@ impl RouteTable {
         base: &str,
         root: &Path,
         ts: bool,
-        introspect: impl Fn(&Path) -> Result<Vec<(String, Option<String>)>, String>,
+        introspect: impl Fn(
+            &Path,
+        )
+            -> Result<Vec<(String, Option<String>, Option<serde_json::Value>)>, String>,
     ) -> (Self, Vec<String>) {
         let b = base.trim_matches('/');
         let mut failures = Vec::new();
@@ -299,7 +306,7 @@ impl RouteTable {
                     .join("/");
                 format!("/{b}/{conv}")
             };
-            for (method, route) in decls {
+            for (method, route, schema) in decls {
                 if !METHODS.contains(&method.as_str()) {
                     continue;
                 }
@@ -323,7 +330,7 @@ impl RouteTable {
                     let fid = t.intern(&file);
                     t.replaced.insert((fid, method.clone()));
                 }
-                t.register(&mut failures, &method, &pattern, &file);
+                t.register(&mut failures, &method, &pattern, &file, schema.clone());
             }
         }
         (t, failures)
@@ -360,7 +367,13 @@ impl RouteTable {
                 failures.push(format!("routes.js: illegal pattern {}", e.pattern));
                 continue;
             }
-            t.register(&mut failures, &e.method, &e.pattern, &root.join(&e.file));
+            t.register(
+                &mut failures,
+                &e.method,
+                &e.pattern,
+                &root.join(&e.file),
+                e.schema.clone(),
+            );
         }
         (t, failures)
     }
@@ -377,7 +390,14 @@ impl RouteTable {
 
     /// 注册一行：新 pattern 建方法映射；已有 pattern 合并方法；
     /// 同 (pattern, method) 二次声明 → Conflict（请求期 500）；matchit 拒绝 → 记 failures。
-    fn register(&mut self, failures: &mut Vec<String>, method: &str, pattern: &str, file: &Path) {
+    fn register(
+        &mut self,
+        failures: &mut Vec<String>,
+        method: &str,
+        pattern: &str,
+        file: &Path,
+        schema: Option<serde_json::Value>,
+    ) {
         let fid = self.intern(file);
         // 同 pattern 去重按 **字符串相等**（查 slots），不用 matcher.at_mut(pattern)：
         // 后者是路径匹配，会把 `/x/me` 当成 `/x/{pk}` 的实参，嫁接到参数节点上。
@@ -405,6 +425,7 @@ impl RouteTable {
                         method: method.to_string(),
                         pattern: pattern.to_string(),
                         file: fid,
+                        schema: schema.clone(),
                     });
                 }
             }
@@ -421,6 +442,7 @@ impl RouteTable {
                     method: method.to_string(),
                     pattern: pattern.to_string(),
                     file: fid,
+                    schema: schema.clone(),
                 });
             }
             // 非法语法 / 结构性冲突（同位置异名参数）：日志丢弃后来者
@@ -545,10 +567,14 @@ pub fn check_patterns(patterns: &[String]) -> Result<(), String> {
 }
 
 /// routes.js 导出行（oj build 生成；release 直载免内省）。
+#[derive(Clone, Default)]
 pub struct RouteEntry {
     pub method: String,
     pub pattern: String,
     pub file: String,
+    /// handler 声明的入参契约（`.schema`；v0.1.44）。旧产物**无此字段** → None
+    /// （向后兼容：`routes.js` 缺 schema 视为未声明契约，不得因此拒启）。
+    pub schema: Option<serde_json::Value>,
 }
 
 /// routes.js 的 default 导出 → 行集（缺字段/类型错的行跳过）。
@@ -561,6 +587,10 @@ pub fn entries_from_value(v: &serde_json::Value) -> Vec<RouteEntry> {
                         method: e.get("method")?.as_str()?.to_string(),
                         pattern: e.get("pattern")?.as_str()?.to_string(),
                         file: e.get("file")?.as_str()?.to_string(),
+                        schema: match e.get("schema") {
+                            Some(serde_json::Value::Null) | None => None,
+                            Some(v) => Some(v.clone()),
+                        },
                     })
                 })
                 .collect()
@@ -568,20 +598,25 @@ pub fn entries_from_value(v: &serde_json::Value) -> Vec<RouteEntry> {
         .unwrap_or_default()
 }
 
-/// 内省结果 Value（introspect_module 约定：仅函数导出的方法，null=未挂）→ decls。
-pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> {
+/// 内省结果 Value（introspect_module 约定 `{"get":{"route":..|null,"schema":..|null}}`）
+/// → (方法, route, schema) 三元组。**route 与 schema 同源取一趟**，杜绝两处真源漂移。
+pub fn decls_from_value(
+    v: &serde_json::Value,
+) -> Vec<(String, Option<String>, Option<serde_json::Value>)> {
     v.as_object()
         .map(|o| {
             o.iter()
                 .filter_map(|(k, v)| {
-                    Some((
-                        k.clone(),
-                        match v {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            serde_json::Value::Null => None,
-                            _ => return None,
-                        },
-                    ))
+                    let o = v.as_object()?;
+                    let route = o
+                        .get("route")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string());
+                    let schema = match o.get("schema") {
+                        Some(serde_json::Value::Null) | None => None,
+                        Some(s) => Some(s.clone()),
+                    };
+                    Some((k.clone(), route, schema))
                 })
                 .collect()
         })
@@ -593,7 +628,7 @@ pub fn decls_from_value(v: &serde_json::Value) -> Vec<(String, Option<String>)> 
 /// ponytail: 每文件起线程；文件数极大时改单线程批处理。
 pub fn bridge_introspector(
     make: impl Fn() -> only_js::bridge::Bridge + Send + Sync + 'static,
-) -> impl Fn(&Path) -> Result<Vec<(String, Option<String>)>, String> {
+) -> impl Fn(&Path) -> Result<Vec<(String, Option<String>, Option<serde_json::Value>)>, String> {
     let make = std::sync::Arc::new(make);
     move |f: &Path| {
         let f = f.to_path_buf();
@@ -946,7 +981,12 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            Ok(m.get(&key).cloned().unwrap_or_default())
+            Ok(m.get(&key)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(m, r)| (m, r, None))
+                .collect())
         })
     }
 
@@ -1087,7 +1127,7 @@ mod tests {
             if p.ends_with("bad/api.ts") {
                 Err("syntax error".into())
             } else {
-                Ok(vec![("get".into(), None)])
+                Ok(vec![("get".into(), None, None)])
             }
         });
         assert_eq!(f.len(), 1);
@@ -1135,6 +1175,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            schema: None,
         };
         let (t, failures) = RouteTable::from_entries(
             &root,
@@ -1199,16 +1240,19 @@ mod tests {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "a/api.js".into(),
+                    schema: None,
                 },
                 RouteEntry {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "b/api.js".into(),
+                    schema: None,
                 },
                 RouteEntry {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "c/api.js".into(),
+                    schema: None,
                 },
             ],
         );
@@ -1278,6 +1322,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            schema: None,
         };
         let (t, failures) = RouteTable::from_entries(
             &root,
@@ -1323,6 +1368,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            schema: None,
         };
         let (t, failures) = RouteTable::from_entries(
             &root,

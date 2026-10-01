@@ -396,7 +396,8 @@ async fn build_one(
             "warn: module name {module:?} looks like `_name_` fs-param syntax; it becomes a route param segment (two such modules with different names at the same slot will conflict at deployment startup)"
         );
     }
-    let mut rows_out: Vec<(String, String, String)> = Vec::new(); // (file, method, pattern)
+    // (file, method, pattern, 契约) —— 契约一并落进 routes.js，使 release 免内省也能校验。
+    let mut rows_out: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
     let mut pats: Vec<String> = Vec::new();
     for (dir, rows) in &decls {
         let file = if dir.is_empty() {
@@ -404,7 +405,7 @@ async fn build_one(
         } else {
             format!("{dir}/api.js")
         };
-        for (method, route) in rows {
+        for (method, route, schema) in rows {
             if let Some(r) = route.as_deref().map(str::trim).filter(|r| !r.is_empty())
                 && r.split('/').any(routes::looks_like_underscore_param)
             {
@@ -414,19 +415,30 @@ async fn build_one(
             }
             let pat = rel_pattern(module, dir, route.as_deref());
             pats.push(pat.clone());
-            rows_out.push((file.clone(), method.clone(), pat));
+            rows_out.push((file.clone(), method.clone(), pat, schema.clone()));
         }
     }
     // 构建期 fail-fast：非法 pattern / 同位异名参数在 build 期报错，免得到部署启动才爆。
     routes::check_patterns(&pats)?;
     let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
-    for (file, method, pat) in &rows_out {
-        js.push_str(&format!(
-            "  {{ method: {}, pattern: {}, file: {} }},\n",
-            q(method),
-            q(pat),
-            q(file)
-        ));
+    for (file, method, pat, schema) in &rows_out {
+        // schema 仅在声明时写入：旧产物（无该字段）与被划分为「未声明契约」的
+        // 老 ReleaseReader 逻辑保持兼容（缺字段 = 不校验，不得拒启）。
+        match schema {
+            Some(sv) => js.push_str(&format!(
+                "  {{ method: {}, pattern: {}, file: {}, schema: {} }},\n",
+                q(method),
+                q(pat),
+                q(file),
+                serde_json::to_string(sv).map_err(|e| format!("serialize .schema: {e}"))?
+            )),
+            None => js.push_str(&format!(
+                "  {{ method: {}, pattern: {}, file: {} }},\n",
+                q(method),
+                q(pat),
+                q(file)
+            )),
+        }
     }
     js.push_str("];\n");
     std::fs::write(vdir.join("routes.js"), js).map_err(|e| format!("write routes.js: {e}"))?;
@@ -460,7 +472,13 @@ async fn introspect_module_files(
     src: &Path,
     mdir: &Path,
     files: &[(PathBuf, bool)],
-) -> Result<Vec<(String, Vec<(String, Option<String>)>)>, String> {
+) -> Result<
+    Vec<(
+        String,
+        Vec<(String, Option<String>, Option<serde_json::Value>)>,
+    )>,
+    String,
+> {
     // `src` 在 `run` 入口已 canonicalize + strip_verbatim（Windows 去 `\\?\` 前缀，长名），
     // 故 project_root 与 loader 经 `versioned_specifier` 给出的 referrer 目录词法可比，
     // `module_root_of` 不会再误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
@@ -501,7 +519,9 @@ async fn introspect_module_files(
             continue;
         }
         let rows = introspect(&mdir.join(rel))
-            .map_err(|e| format!("introspect {}: {e}", rel.display()))?;
+            .map_err(|e| format!("introspect {}: {e}", rel.display()))?
+            .into_iter()
+            .collect::<Vec<_>>();
         out.push((rel_dir(rel), rows));
     }
     Ok(out)

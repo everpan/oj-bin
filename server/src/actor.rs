@@ -22,6 +22,8 @@ pub enum Job {
         method: String,
         req: RequestInfo,
         timeout: Option<std::time::Duration>,
+        /// 是否执行入参契约校验；仅内部合成派发（`dispatch_meta_handler`）为 false。
+        validate: bool,
         resp: oneshot::Sender<Result<Capture, RunFail>>,
     },
 }
@@ -114,11 +116,12 @@ impl JsActor {
                                     method,
                                     req,
                                     timeout,
+                                    validate,
                                     resp,
                                 } => {
                                     let t = timeout.unwrap_or(NO_TIMEOUT_SENTINEL);
                                     let out = bridge
-                                        .run_module(&path, &method, req, t)
+                                        .run_module_validated(&path, &method, req, t, validate)
                                         .await
                                         .map_err(RunFail::from);
                                     (out, resp)
@@ -165,12 +168,14 @@ impl JsActor {
     }
 
     /// ESM 模块执行（oj server 路径）。
+    /// `validate=false` 仅用于内部合成派发（见 `Bridge::run_module_validated`）。
     pub async fn run_module(
         &self,
         path: std::path::PathBuf,
         method: String,
         req: RequestInfo,
         timeout: Option<std::time::Duration>,
+        validate: bool,
     ) -> Result<Capture, RunFail> {
         let (tx, rx) = oneshot::channel();
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
@@ -180,6 +185,7 @@ impl JsActor {
                 method,
                 req,
                 timeout,
+                validate,
                 resp: tx,
             })
             .await

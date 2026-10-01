@@ -1244,3 +1244,112 @@ fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
     assert!(stderr.contains("exec-e2e-boom"), "{stderr}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// v0.1.44 入参契约端到端（**真 HTTP**）：违反 handler 声明的 `.schema` 必须
+/// 400 且不进 JS；合规放行；`server.schema_validation: false` 时不校验。
+/// 自造最小项目（不依赖 sample），db 隔离到临时目录，证书复用 sample 示例证书。
+async fn contract_boot(
+    tmp: &Path,
+    schema_validation: bool,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let root = sample();
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\n  schema_validation: {}\ndb:\n  default: \"{}\"\n",
+        fwd(&root.join("config/public.pem")),
+        fwd(&root.join("config/cert.jws")),
+        schema_validation,
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
+    );
+    std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
+    let mut c: Config = serde_yaml::from_str(&cfg).unwrap();
+    c.server.app_path = None;
+    let dir = tmp.join("src");
+    server_cmd::start(c, tmp, dir, "/v1/api".into(), true)
+        .await
+        .unwrap()
+}
+
+fn contract_project(tmp: &Path) {
+    // dev 模式要求模块级 manifest.yaml（S005）；本用例无表，tables 留空。
+    std::fs::create_dir_all(tmp.join("src/g/_id_")).unwrap();
+    std::fs::write(
+        tmp.join("src/g/manifest.yaml"),
+        "name: \"g\"\ndesc: \"入参契约 e2e 夹具\"\nversion: \"0.1.0\"\ntables: []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/g/api.ts"),
+        "function post() { json.ok({ reached: true }); }\n\
+         post.schema = { body: { type: \"object\", required: [\"name\"], \
+           properties: { name: { type: \"string\", maxLength: 4 } } } };\n\
+         export default { post };\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/g/_id_/api.ts"),
+        "function get() { json.ok({ reached: true }); }\n\
+         get.schema = { params: { type: \"object\", required: [\"id\"], \
+           properties: { id: { type: \"integer\", minimum: 1 } } } };\n\
+         export default { get };\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_input_contract_when_request_violates_then_400() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-ct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    contract_project(&tmp);
+    let (addr, h) = contract_boot(&tmp, true).await;
+
+    // 1) body 缺 required → 400，且 handler 未执行（不带 reached）。
+    let (st, v) = req(addr, "POST", "/v1/api/g", Some("{}")).await;
+    assert_eq!(st, 400, "{v}");
+    assert_eq!(v["code"], 400, "{v}");
+    assert!(
+        v["data"].is_null() && !format!("{v}").contains("reached"),
+        "契约失败必须在进 JS 之前拦截: {v}"
+    );
+
+    // 2) body 超长 → 400
+    let (st, v) = req(addr, "POST", "/v1/api/g", Some("{\"name\":\"toolong\"}")).await;
+    assert_eq!(st, 400, "{v}");
+
+    // 3) 路径参数非整数（强转失败）→ 400
+    let (st, _) = req(addr, "GET", "/v1/api/g/abc", None).await;
+    assert_eq!(st, 400, "非整数路径参数必须被拒");
+    // 4) 整数但越界（minimum: 1）→ 400
+    let (st, _) = req(addr, "GET", "/v1/api/g/0", None).await;
+    assert_eq!(st, 400, "强转后仍受 minimum 约束");
+
+    // 5) 合规：放行并真正执行 handler
+    let (st, v) = req(addr, "POST", "/v1/api/g", Some("{\"name\":\"ab\"}")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["data"]["reached"], true, "{v}");
+    let (st, v) = req(addr, "GET", "/v1/api/g/12", None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["data"]["reached"], true, "{v}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_schema_validation_off_when_request_violates_then_passes() {
+    // 击穿：开关关闭时即便违反契约也**不得**返回 400（这正是开关的意义）。
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-ctoff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    contract_project(&tmp);
+    let (addr, h) = contract_boot(&tmp, false).await;
+
+    let (st, v) = req(addr, "POST", "/v1/api/g", Some("{}")).await;
+    assert_eq!(st, 200, "开关关闭时不得校验: {v}");
+    assert_eq!(v["data"]["reached"], true, "{v}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

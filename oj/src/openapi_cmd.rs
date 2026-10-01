@@ -112,6 +112,7 @@ pub fn discover_routes(
                 method: e.method,
                 pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
                 file: format!("{module}-{version}/{}", e.file),
+                schema: e.schema,
             });
         }
     }
@@ -123,7 +124,11 @@ pub fn discover_routes(
 }
 
 /// 路由表 → OpenAPI 3.1（serde_json::Value；手工构造，避免引入额外 crate）。
-pub fn generate(table: &server::routes::RouteTable, base: &str) -> Value {
+///
+/// v0.1.44：handler 的 `.schema`（经 `RouteRow.schema` 落到此处）补出
+/// `parameters`（path / query）与 `requestBody`。返回 Result —— 契约与路由
+/// pattern 不一致时**生成期 fail-fast**（见 `contract_params` 的交叉校验）。
+pub fn generate(table: &server::routes::RouteTable, base: &str) -> Result<Value, String> {
     let b = base.trim_matches('/');
     let mut paths: serde_json::Map<String, Value> = serde_json::Map::new();
     for row in table.listing() {
@@ -143,11 +148,35 @@ pub fn generate(table: &server::routes::RouteTable, base: &str) -> Value {
         op.insert("operationId".to_string(), Value::String(operation_id));
         op.insert("summary".to_string(), Value::String(summary));
         op.insert("x-oj-file".to_string(), Value::String(file));
-        let params = path_params(&oa_path);
-        if !params.is_empty() {
-            op.insert("parameters".to_string(), Value::Array(params));
+
+        let sc = row.schema.clone();
+        let mut parameters: Vec<Value> = Vec::new();
+        // 声明了 params 契约 → 契约为真源；否则回落「由 pattern 推导」（type: string）。
+        match sc.as_ref().and_then(|s| s.get("params")) {
+            Some(p) => parameters.extend(contract_params(
+                p,
+                "path",
+                &pattern_param_names(&oa_path),
+                &sub,
+            )?),
+            None => parameters.extend(path_params(&oa_path)),
         }
-        // 占位响应：入参校验留待 PR-6 后续步，此处仅保 OpenAPI 3.1 基本结构。
+        if let Some(q) = sc.as_ref().and_then(|s| s.get("query")) {
+            parameters.extend(contract_params(q, "query", &[], &sub)?);
+        }
+        if !parameters.is_empty() {
+            op.insert("parameters".to_string(), Value::Array(parameters));
+        }
+        if let Some(body) = sc.as_ref().and_then(|s| s.get("body")) {
+            op.insert(
+                "requestBody".to_string(),
+                json!({
+                    "required": true,
+                    "content": { "application/json": { "schema": body.clone() } },
+                }),
+            );
+        }
+        // 占位响应：响应 schema 契约留待后续步，此处仅保 OpenAPI 3.1 基本结构。
         op.insert(
             "responses".to_string(),
             json!({ "200": { "description": "OK" } }),
@@ -159,11 +188,11 @@ pub fn generate(table: &server::routes::RouteTable, base: &str) -> Value {
             .unwrap()
             .insert(method, Value::Object(op));
     }
-    json!({
+    Ok(json!({
         "openapi": "3.1.0",
         "info": { "title": "oj API", "version": "0.1.0" },
         "paths": Value::Object(paths),
-    })
+    }))
 }
 
 /// 命令入口：生成或漂移校验。返回进程退出码（0 成功 / 1 漂移或错误）。
@@ -173,7 +202,7 @@ pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
             .map_err(|e| format!("oj openapi: {e}"))?;
 
     let table = discover_routes(&dir, ts, &base)?;
-    let spec = generate(&table, &base);
+    let spec = generate(&table, &base)?;
     let explicit_out = a.out.is_some();
     let out_path: PathBuf = a
         .out
@@ -251,6 +280,83 @@ fn to_oa_path(raw: &str) -> String {
     format!("/{}", seg.join("/"))
 }
 
+/// 由契约生成 OpenAPI `parameters`（location = "path" | "query"）。
+///
+/// **路径参数交叉校验**（安全相关）：契约声明的名字必须与路由 pattern 的真实参数
+/// **双向一致** —— 声明了 pattern 没有的、或 pattern 有却没声明的，都 fail-fast。
+/// 否则「契约」与「URL」会变成两份真源，而运行期校验只认前者，漏掉的参数等于
+/// 不受任何约束。
+fn contract_params(
+    schema: &Value,
+    location: &str,
+    pattern_names: &[String],
+    sub: &str,
+) -> Result<Vec<Value>, String> {
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let names: Vec<String> = match props {
+        Some(m) => m.keys().cloned().collect(),
+        None => Vec::new(),
+    };
+    let required: Vec<String> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if location == "path" {
+        for n in &names {
+            if !pattern_names.contains(n) {
+                return Err(format!(
+                    "`{sub}`: .schema.params declares `{n}`, but it is not a path param of the route pattern — contract and route must agree (two sources of truth otherwise)"
+                ));
+            }
+        }
+        for n in pattern_names {
+            if !names.contains(n) {
+                return Err(format!(
+                    "`{sub}`: route pattern has path param `{n}` but .schema.params does not declare it — it would pass through unconstrained"
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for n in names {
+        let mut sc = props
+            .and_then(|m| m.get(&n))
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "string" }));
+        // OpenAPI 的 `required` 是 parameter 级字段，schema 级出现即冗余。
+        if let Some(o) = sc.as_object_mut() {
+            o.remove("required");
+        }
+        out.push(json!({
+            "name": n,
+            "in": location,
+            // 路径参数恒必填（URL 段不存在即不匹配）。
+            "required": location == "path" || required.contains(&n),
+            "schema": sc,
+        }));
+    }
+    Ok(out)
+}
+
+/// 路由 pattern 里的路径参数名（OpenAPI 形态 `{name}`）。
+fn pattern_param_names(oa_path: &str) -> Vec<String> {
+    oa_path
+        .split('/')
+        .filter_map(|seg| {
+            seg.strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
 /// 抽取路径参数（OpenAPI `in: path` 必填）。
 fn path_params(oa_path: &str) -> Vec<Value> {
     let mut out = Vec::new();
@@ -318,7 +424,9 @@ fn diff_lines(generated: &str, committed: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use server::routes::RouteTable;
+    use std::path::PathBuf;
 
     /// 合成路由表（免 V8）：把若干 api 文件写盘，用假内省闭包喂声明。
     fn synthetic_table() -> (std::path::PathBuf, RouteTable) {
@@ -346,11 +454,11 @@ mod tests {
                 .replace('\\', "/");
             let decls = if rel == "user/account/api.ts" {
                 vec![
-                    ("get".to_string(), None),
-                    ("post".to_string(), Some("/custom".to_string())),
+                    ("get".to_string(), None, None),
+                    ("post".to_string(), Some("/custom".to_string()), None),
                 ]
             } else if rel == "catch/api.ts" {
-                vec![("get".to_string(), Some("/catch/{*path}".to_string()))]
+                vec![("get".to_string(), Some("/catch/{*path}".to_string()), None)]
             } else {
                 vec![]
             };
@@ -362,7 +470,7 @@ mod tests {
     #[test]
     fn generate_produces_valid_openapi_3_1_with_params_and_catchall() {
         let (_d, table) = synthetic_table();
-        let spec = generate(&table, "/v1/api");
+        let spec = generate(&table, "/v1/api").unwrap();
         assert_eq!(spec["openapi"], "3.1.0");
         let paths = spec["paths"].as_object().expect("paths object");
 
@@ -406,7 +514,7 @@ mod tests {
     #[test]
     fn check_detects_no_drift_and_drift() {
         let (_d, table) = synthetic_table();
-        let spec = generate(&table, "/v1/api");
+        let spec = generate(&table, "/v1/api").unwrap();
 
         // 无漂移：同一生成物比较 → 等价。
         let a = serde_json::to_string_pretty(&canonical(&spec)).unwrap();
@@ -429,7 +537,7 @@ mod tests {
         // 真·`--check` 文件往返：generate → 落盘 → 同生成物校验应无漂移（0）；
         // 篡改 committed 文件后应检出漂移（1）。直接打 emit_or_check，绕开 config 解析。
         let (_d, table) = synthetic_table();
-        let spec = generate(&table, "/v1/api");
+        let spec = generate(&table, "/v1/api").unwrap();
         let dir = std::env::temp_dir().join(format!("oj-oa-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -456,11 +564,134 @@ mod tests {
         );
     }
 
+    /// 由带契约的 RouteEntry 建表：契约经 `from_entries` 落进 RouteRow.schema。
+    fn table_with_contract(
+        method: &str,
+        pattern: &str,
+        file: &str,
+        schema: Value,
+    ) -> (PathBuf, RouteTable) {
+        let dir = std::env::temp_dir().join(format!("oj-oa-ct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries = vec![server::routes::RouteEntry {
+            method: method.to_string(),
+            pattern: pattern.to_string(),
+            file: file.to_string(),
+            schema: Some(schema),
+        }];
+        let (t, fail) = RouteTable::from_entries(&dir, &entries);
+        assert!(fail.is_empty(), "{fail:?}");
+        (dir, t)
+    }
+
+    #[test]
+    fn contract_emits_parameters_and_request_body() {
+        let (_d, t) = table_with_contract(
+            "post",
+            "/v1/api/user/{id}",
+            "user-0.1.0/api.js",
+            json!({
+                "params": {
+                    "type": "object",
+                    "properties": { "id": { "type": "integer", "minimum": 1 } }
+                },
+                "query": {
+                    "type": "object",
+                    "required": ["page"],
+                    "properties": { "page": { "type": "integer" }, "kw": { "type": "string" } }
+                },
+                "body": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": { "name": { "type": "string" } }
+                }
+            }),
+        );
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/user/{id}"]["post"];
+
+        // params → in:path，且**类型来自契约**（不再是硬编码 string）
+        let ps = op["parameters"].as_array().unwrap();
+        let path_p: Vec<_> = ps.iter().filter(|p| p["in"] == "path").collect();
+        assert_eq!(path_p.len(), 1);
+        assert_eq!(path_p[0]["name"], "id");
+        assert_eq!(path_p[0]["required"], true);
+        assert_eq!(path_p[0]["schema"]["type"], "integer");
+        assert_eq!(path_p[0]["schema"]["minimum"], 1);
+
+        // query → in:query，required 只标声明的
+        let q: Vec<_> = ps.iter().filter(|p| p["in"] == "query").collect();
+        assert_eq!(q.len(), 2);
+        let page = q.iter().find(|p| p["name"] == "page").unwrap();
+        assert_eq!(page["required"], true);
+        let kw = q.iter().find(|p| p["name"] == "kw").unwrap();
+        assert_eq!(kw["required"], false);
+
+        // body → requestBody
+        assert_eq!(
+            op["requestBody"]["content"]["application/json"]["schema"]["required"][0],
+            "name"
+        );
+    }
+
+    #[test]
+    fn contract_params_must_agree_with_route_pattern() {
+        // 击穿：契约与 pattern 不一致必须 fail-fast（否则两份真源，未声明者不受约束）。
+        let (_d, t) = table_with_contract(
+            "get",
+            "/v1/api/user/{id}",
+            "user-0.1.0/api.js",
+            json!({ "params": { "type": "object", "properties": { "id": {"type":"integer"}, "ghost": {"type":"string"} } } }),
+        );
+        let err = generate(&t, "/v1/api").unwrap_err();
+        assert!(
+            err.contains("ghost"),
+            "契约声明了 pattern 没有的参数必须报错: {err}"
+        );
+
+        let (_d2, t2) = table_with_contract(
+            "get",
+            "/v1/api/user/{id}",
+            "user-0.1.0/api.js",
+            json!({ "params": { "type": "object", "properties": {} } }),
+        );
+        let err2 = generate(&t2, "/v1/api").unwrap_err();
+        assert!(
+            err2.contains("id"),
+            "pattern 有参数而契约未声明必须报错: {err2}"
+        );
+    }
+
+    #[test]
+    fn without_contract_path_params_fall_back_to_pattern() {
+        // 未声明契约：保持 v0.1.43 行为（pattern 推导 + type: string）。
+        let dir = std::env::temp_dir().join(format!("oj-oa-nb-{}", std::process::id()));
+        let (t, fail) = RouteTable::from_entries(
+            &dir,
+            &[server::routes::RouteEntry {
+                method: "get".to_string(),
+                pattern: "/v1/api/user/{id}".to_string(),
+                file: "user-0.1.0/api.js".to_string(),
+                schema: None,
+            }],
+        );
+        assert!(fail.is_empty());
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/user/{id}"]["get"];
+        assert_eq!(op["parameters"][0]["schema"]["type"], "string");
+        assert!(
+            op.get("requestBody").is_none(),
+            "无 body 契约不得生成 requestBody"
+        );
+    }
+
     #[test]
     fn release_entries_prefix_base_and_build_table() {
         // 直接喂 from_entries，验证 release 形态 pattern 含 base 前缀（与 app.rs 同构）。
         let entries = vec![
             server::routes::RouteEntry {
+                schema: None,
                 method: "get".to_string(),
                 pattern: "/v1/api/user/{id}".to_string(),
                 file: "user-0.1.0/_id_/api.js".to_string(),
@@ -469,12 +700,13 @@ mod tests {
                 method: "post".to_string(),
                 pattern: "/v1/api/admin/role".to_string(),
                 file: "admin-0.1.0/role/api.js".to_string(),
+                schema: None,
             },
         ];
         let dir = std::env::temp_dir().join(format!("oj-oa-rel-{}", std::process::id()));
         let (t, fail) = RouteTable::from_entries(&dir, &entries);
         assert!(fail.is_empty(), "release entries 不应有 failures: {fail:?}");
-        let spec = generate(&t, "/v1/api");
+        let spec = generate(&t, "/v1/api").unwrap();
         let paths = spec["paths"].as_object().unwrap();
         assert!(
             paths.contains_key("/v1/api/user/{id}"),

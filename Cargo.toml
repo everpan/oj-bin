@@ -34,6 +34,9 @@ rustls = "=0.23.40"
 # （deno_permissions 的 RuntimePermissionDescriptorParser 需要它）。
 sys_traits = { version = "0.1.28", features = ["libc", "real", "winapi"] }
 getrandom = "0.2"
+# 入参契约 pattern（v0.1.44）：已在依赖树（经 deno_*），显式声明防漂移；
+# Rust regex != ECMA-262，非法 pattern 在契约注册期 fail-fast。
+regex = "1.13"
 jsonwebtoken = "9"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }

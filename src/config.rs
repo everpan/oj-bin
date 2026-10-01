@@ -184,6 +184,14 @@ pub struct ServerCfg {
     /// fail-fast（低于 V8 正常启动余量，必是配置错误）。
     #[serde(default = "default_js_heap_limit_bytes")]
     pub js_heap_limit_bytes: u64,
+    /// 入参契约校验开关（v0.1.44，PR-6 4b）：true = 按 handler 声明的 `.schema`
+    /// 校验 params / query / body，违反 → **400**（详见 `contract::InputContract`）。
+    ///
+    /// **默认 true（fail-closed）**：声明了契约却不执行 = 假契约，与本项目对
+    /// 「静默降级」的处理一致。`.schema` 是全新声明面，当前无人声明，
+    /// 故升级不产生任何行为变化。
+    #[serde(default = "default_true")]
+    pub schema_validation: bool,
 }
 
 impl Default for ServerCfg {
@@ -206,6 +214,7 @@ impl Default for ServerCfg {
             max_upload_bytes: 10 * 1024 * 1024,
             blob_upload_max_bytes: default_blob_upload_max_bytes(),
             js_heap_limit_bytes: default_js_heap_limit_bytes(),
+            schema_validation: default_true(),
             response_headers: Default::default(),
             route_timeouts: Vec::new(),
             logs_dir: None,
@@ -1033,6 +1042,12 @@ fn default_blob_upload_max_bytes() -> u64 {
 /// 单 isolate 堆限额默认 256 MiB（v0.1.40）。
 fn default_js_heap_limit_bytes() -> u64 {
     256 * 1024 * 1024
+}
+
+/// 布尔开关的 true 默认。
+/// 注：不可复用 `oj::schema::default_true` —— 那会出现 `only-js` 反向依赖 `oj`。
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]

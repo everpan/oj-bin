@@ -341,60 +341,59 @@ impl Client {
         let params: Vec<serde_json::Value> = params.to_vec();
         let is_pg = self.dialect == Dialect::Postgres;
         let mut backend_pid: Option<i32> = None;
-        let rows: DbStream =
-            if is_pg {
-                // typed 专用连接：连接的所有权随生成器走；cancel = pg_cancel_backend(pid)
-                // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
-                let mut conn = PgConnection::connect(&self.dsn)
+        let rows: DbStream = if is_pg {
+            // typed 专用连接：连接的所有权随生成器走；cancel = pg_cancel_backend(pid)
+            // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
+            let mut conn = PgConnection::connect(&self.dsn)
+                .await
+                .map_err(|e| format!("db stream_open: connect: {e}"))?;
+            backend_pid = Some(
+                sqlx::query_scalar::<_, i32>("select pg_backend_pid()")
+                    .fetch_one(&mut conn)
                     .await
-                    .map_err(|e| format!("db stream_open: connect: {e}"))?;
-                backend_pid = Some(
-                    sqlx::query_scalar::<_, i32>("select pg_backend_pid()")
-                        .fetch_one(&mut conn)
-                        .await
-                        .map_err(|e| format!("db stream_open: backend pid: {e}"))?,
-                );
-                Box::pin(async_stream::stream! {
-                    let mut q: Query<'_, Postgres, PgArguments> =
-                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                    for p in &params {
-                        q = bind_value_pg(q, p);
-                    }
-                    use futures::StreamExt;
-                    let mut rows = q.fetch(&mut conn);
-                    while let Some(r) = rows.next().await {
-                        match r {
-                            Ok(row) => yield Ok(row_to_json_pg(&row)),
-                            Err(e) => {
-                                yield Err(format!("db stream: {e}"));
-                                break;
-                            }
+                    .map_err(|e| format!("db stream_open: backend pid: {e}"))?,
+            );
+            Box::pin(async_stream::stream! {
+                let mut q: Query<'_, Postgres, PgArguments> =
+                    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                for p in &params {
+                    q = bind_value_pg(q, p);
+                }
+                use futures::StreamExt;
+                let mut rows = q.fetch(&mut conn);
+                while let Some(r) = rows.next().await {
+                    match r {
+                        Ok(row) => yield Ok(row_to_json_pg(&row)),
+                        Err(e) => {
+                            yield Err(format!("db stream: {e}"));
+                            break;
                         }
                     }
-                    // 生成器结束 → conn drop = 断连。
-                })
-            } else {
-                // Any 回退（sqlite 等）：池路径（协作式取消）。
-                let pool = self.pool.clone();
-                Box::pin(async_stream::stream! {
-                    let mut q: Query<'_, Any, AnyArguments> =
-                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                    for p in &params {
-                        q = bind_value(q, p);
-                    }
-                    use futures::StreamExt;
-                    let mut rows = q.fetch(&pool);
-                    while let Some(r) = rows.next().await {
-                        match r {
-                            Ok(row) => yield Ok(row_to_json(&row)),
-                            Err(e) => {
-                                yield Err(format!("db stream: {e}"));
-                                break;
-                            }
+                }
+                // 生成器结束 → conn drop = 断连。
+            })
+        } else {
+            // Any 回退（sqlite 等）：池路径（协作式取消）。
+            let pool = self.pool.clone();
+            Box::pin(async_stream::stream! {
+                let mut q: Query<'_, Any, AnyArguments> =
+                    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                for p in &params {
+                    q = bind_value(q, p);
+                }
+                use futures::StreamExt;
+                let mut rows = q.fetch(&pool);
+                while let Some(r) = rows.next().await {
+                    match r {
+                        Ok(row) => yield Ok(row_to_json(&row)),
+                        Err(e) => {
+                            yield Err(format!("db stream: {e}"));
+                            break;
                         }
                     }
-                })
-            };
+                }
+            })
+        };
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
         self.streams.lock().unwrap().insert(
             id,

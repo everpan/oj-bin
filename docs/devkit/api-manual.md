@@ -422,6 +422,49 @@ export default { get: detail };
 `app_prefix`/`prefix` 前缀内服务，且仅 GET/HEAD。API 永远优先于静态文件。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
 
+### 入参契约 `.schema`（v0.1.44）
+
+与 `.route` 同构：在导出的函数对象上挂 `.schema`，分**三通道**声明入参
+（`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）：
+
+```js
+export default { get, post };
+
+get.schema = {
+  params: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
+};
+
+post.schema = {
+  query: { type: "object", properties: { page: { type: "integer", minimum: 1 } } },
+  body: {
+    type: "object",
+    required: ["name"],
+    properties: { name: { type: "string", maxLength: 20 } },
+  },
+};
+```
+
+- **声明即执行**：校验发生在 JS **之前**，违反 → `400` 信封
+  （`{"code":400,"msg":"..."}`），handler 不会被调用。
+- **字符串强转**：`params` / `query` 在 HTTP 里只有字符串形态，声明为
+  `integer` / `number` / `boolean` 时会显式强转，转不动即 400；`body` 是真
+  JSON，**不**强转。
+- **受支持关键字**（白名单）：`type` / `required` / `properties` / `items` /
+  `additionalProperties` / `minimum` / `maximum` / `minLength` / `maxLength` /
+  `pattern` / `enum` / `nullable` / `minItems` / `maxItems`。
+  白名单外（`$ref` / `oneOf` / `format` …）一律 **fail-fast，绝不静默跳过**
+  —— 静默放行等于把声明变成不生效的东西。非法契约在**装配期**即报错（启动失败）。
+- **`pattern` 用 Rust regex**，不是 ECMA-262：lookahead / 反向引用不支持，
+  非法 pattern 同样装配期报错。
+- `params` / `query` 只允许扁平标量（string/number/integer/boolean/null）：
+  底层是 `HashMap<String,String>`，声明 array/object 是永远无法满足的死契约，
+  装配期即拒。
+- 开关 `server.schema_validation`：**默认 true**（声明了就会执行）；
+  置 `false` 为逃生门。
+- 同一份声明喂给 `oj openapi`，补出 `parameters` 与 `requestBody`；其中
+  `params` 声明必须与路由 pattern 的实参**双向一致**，否则 `oj openapi` 报错
+  （避免契约与 URL 变成两份真源）。
+
 ### ws.ts（WebSocket 生命周期钩子）
 
 > 系统学习（心智模型 / 实现走读 / 鉴权现状 / 测试映射）见仓库 `docs/websocket.md`
