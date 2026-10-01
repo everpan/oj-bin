@@ -43,6 +43,12 @@ impl From<only_js::bridge::RunError> for RunFail {
                 msg: "handler execution timed out".into(),
                 timeout: true,
             },
+            only_js::bridge::RunError::Oom { limit } => Self {
+                msg: format!(
+                    "js heap limit exceeded (limit {limit} bytes; server.js_heap_limit_bytes)"
+                ),
+                timeout: false,
+            },
             only_js::bridge::RunError::Core(e) => Self {
                 msg: e.to_string(),
                 timeout: false,

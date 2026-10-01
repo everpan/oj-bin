@@ -754,6 +754,8 @@ pub async fn assemble_backend(
     ts: bool,
     profiles: &ResourceProfiles,
 ) -> Result<Backend, String> {
+    // PR-4：单 isolate 堆限额（u64 copy 提前取出，避免闭包借用 &Config）。
+    let js_heap_limit = Some(cfg.server.js_heap_limit_bytes as usize);
     // 其余非选中 redis key warn 忽略（仅 selected profile 参与装配）。
     let redis_key = profiles.redis.as_deref().unwrap_or("default");
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != redis_key) {
@@ -952,6 +954,7 @@ pub async fn assemble_backend(
                     // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
                     ldap: ldap.clone(),
                     vars: vars.clone(),
+                    js_heap_limit,
                 },
             )
         }
@@ -986,6 +989,7 @@ pub async fn assemble_backend(
         mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
         ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
+        js_heap_limit,
     });
     Ok(Backend {
         stable,
@@ -1041,6 +1045,7 @@ impl App {
         }
         // 匿名路径条目校验（v0.1.23）：`one_layer` 只对尾 "/*" 条目有意义（fail-fast）。
         config::validate_anon_paths(&cfg)?;
+        config::validate_server_limits(&cfg)?;
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
         let gate = migrate_gate_of(&cfg, ts);

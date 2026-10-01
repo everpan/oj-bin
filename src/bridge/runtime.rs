@@ -24,6 +24,50 @@ use super::{
 /// 池容量上限（空闲实例数）。设为 0 表示无上限（按需增长后保留）。
 const DEFAULT_MAX_IDLE: usize = 16;
 
+// ===== PR-4 isolate 堆限额（v0.1.40）=====
+
+/// per-isolate 堆限额守卫的 fired 标志（存 OpState；回调置位，宿主读取决定丢弃）。
+#[derive(Clone)]
+pub struct HeapGuardFired(pub Rc<AtomicBool>);
+
+/// V8 near-heap-limit 的 create_params（`heap_limits(0, limit)`；与
+/// `install_heap_limit_callback` 成对使用）。None = 不限额（测试/嵌入式默认）。
+pub fn heap_create_params(limit: usize) -> v8::CreateParams {
+    v8::Isolate::create_params().heap_limits(0, limit)
+}
+
+/// 构造后安装 near-heap-limit 回调（deno_core 官方范式：`terminate_execution` +
+/// 返回放大值给 V8 解卷余量——不放大 V8 会 hard abort 进程）。fired 标志注入
+/// OpState（`heap_guard_fired` 读取；checkin/run 路径据此丢弃 isolate）。
+pub fn install_heap_limit_callback(rt: &mut JsRuntime, limit: usize) -> Rc<AtomicBool> {
+    let fired = Rc::new(AtomicBool::new(false));
+    let f = fired.clone();
+    let handle = rt.v8_isolate().thread_safe_handle();
+    rt.add_near_heap_limit_callback(move |current_limit, _initial_limit| {
+        f.store(true, Ordering::SeqCst);
+        handle.terminate_execution();
+        // **一次性抬「current + 限额」**：显式 heap_limits 下 V8 对新限额的二次逼近会
+        // FatalProcessOutOfMemory（不重入回调），余量必须容下在途分配让 terminate 的
+        // 中断检查抛错。返回值也不能是天文数字（V8 全局分配账本算术会 CHECK 崩）——
+        // 已实测钉死：单个 > 限额的巨型分配仍可能崩进程（已知边界，文档登记）。
+        current_limit.saturating_add(limit)
+    });
+    {
+        let op_state = rt.op_state();
+        op_state.borrow_mut().put(HeapGuardFired(fired.clone()));
+    }
+    fired
+}
+
+/// 该 isolate 是否已触发堆限额（未安装回调的 runtime 恒 false）。
+pub fn heap_guard_fired(rt: &JsRuntime) -> bool {
+    let op_state = rt.op_state();
+    let g = op_state.borrow();
+    g.try_borrow::<HeapGuardFired>()
+        .map(|f| f.0.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
 /// ext_boot 执行超时：boot 里的同步死循环不归还执行器（`tokio::time::timeout` 无效），
 /// 只能靠 `terminate_execution`。量级对齐 `super::INTROSPECT_TIMEOUT`（同为启动期一次性
 /// 执行），单独成常量以免两个用途互相耦合。
@@ -69,7 +113,10 @@ impl RuntimePool {
             .loader
             .clone()
             .map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
-        JsRuntime::new(RuntimeOptions {
+        // PR-4：Some(limit) = create_params.heap_limits + near-heap-limit 回调；
+        // 超限 terminate → fired 标志置位 → checkin 丢弃（不回池）。
+        let create_params = stable.js_heap_limit.map(heap_create_params);
+        let mut rt = JsRuntime::new(RuntimeOptions {
             extensions: {
                 let mut extensions = ws_client_extensions();
                 extensions.push(bridge_ext_init(stable.clone()));
@@ -80,8 +127,13 @@ impl RuntimePool {
             },
             inspector: inspect,
             module_loader,
+            create_params,
             ..Default::default()
-        })
+        });
+        if let Some(limit) = stable.js_heap_limit {
+            install_heap_limit_callback(&mut rt, limit);
+        }
+        rt
     }
 
     /// 借出一个 runtime（优先复用空闲，否则新建并执行 ext_boot）。
@@ -113,6 +165,13 @@ impl RuntimePool {
             let _ = rt.run_event_loop(PollEventLoopOptions::default()).await;
             return Err(RunError::Timeout);
         }
+        // PR-4：boot 期堆超限 → Oom（isolate 丢弃，池可继续 checkout 新实例）。
+        if heap_guard_fired(&rt) {
+            let _ = rt.run_event_loop(PollEventLoopOptions::default()).await;
+            return Err(RunError::Oom {
+                limit: self.stable.js_heap_limit.unwrap_or(0),
+            });
+        }
         match result {
             Ok(()) => Ok(rt),
             Err(e) => {
@@ -124,7 +183,13 @@ impl RuntimePool {
 
     /// 归还一个 runtime 到空闲池（超出上限则丢弃，由 drop 析构 V8 isolate）。
     /// 仅归还已成功执行过 event loop 的 runtime（未轮询的 isolate 析构会触发 V8 句柄错误）。
+    /// PR-4：堆限额已触发的 isolate **绝不回池**（堆已膨胀；防止 handler try/catch
+    /// 吞掉终止错误后把坏 isolate 留在池里）。
     pub fn checkin(&self, rt: JsRuntime) {
+        if heap_guard_fired(&rt) {
+            eprintln!("warn: runtime discarded (js heap limit fired; not returned to pool)");
+            return;
+        }
         let mut idle = self.idle.borrow_mut();
         if idle.len() < self.max_idle {
             idle.push(rt);

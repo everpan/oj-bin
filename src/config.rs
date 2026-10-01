@@ -179,6 +179,11 @@ pub struct ServerCfg {
     /// 具体头在 CorsCfg 内声明；装配期校验 credentials 需显式 origins（见 oj/src/app.rs）。
     #[serde(default)]
     pub cors: Option<CorsCfg>,
+    /// 单 isolate 堆限额（字节，v0.1.40）：V8 near-heap-limit 触发即终止执行并丢弃
+    /// 该 isolate（不回池），超限请求以 5xx 信封返回。默认 256 MiB；< 32 MiB 装配期
+    /// fail-fast（低于 V8 正常启动余量，必是配置错误）。
+    #[serde(default = "default_js_heap_limit_bytes")]
+    pub js_heap_limit_bytes: u64,
 }
 
 impl Default for ServerCfg {
@@ -200,6 +205,7 @@ impl Default for ServerCfg {
             pool_size: 4,
             max_upload_bytes: 10 * 1024 * 1024,
             blob_upload_max_bytes: default_blob_upload_max_bytes(),
+            js_heap_limit_bytes: default_js_heap_limit_bytes(),
             response_headers: Default::default(),
             route_timeouts: Vec::new(),
             logs_dir: None,
@@ -488,6 +494,19 @@ pub fn anon_paths(list: &[AnonPath]) -> Vec<String> {
 /// 「忽略空段」保持一致：`/idp/*/` 在运行期就是严格一层，标 `one_layer` 合法。
 /// （迁移 WARN 的 `is_legacy_prefix_shape` 有意仍用裸后缀——它对齐的是 v0.1.19
 /// `strip_suffix("/*")` 的历史口径，两处差异是刻意的。）
+/// PR-4 装配校验：堆限额 < 32 MiB fail-fast（低于 V8 正常启动余量，必是配置错误）；
+/// 0 同样拒绝（「不限额」应删掉该键走 None 路径，而非写 0 造成歧义）。
+pub fn validate_server_limits(cfg: &Config) -> Result<(), String> {
+    const MIN: u64 = 32 * 1024 * 1024;
+    if cfg.server.js_heap_limit_bytes < MIN {
+        return Err(format!(
+            "server.js_heap_limit_bytes: {} is below the minimum {} (bytes) — configure a sane per-isolate heap limit or remove the key for the default",
+            cfg.server.js_heap_limit_bytes, MIN
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
     let check = |what: &str, list: &[AnonPath]| -> Result<(), String> {
         for p in list {
@@ -986,9 +1005,28 @@ fn default_blob_upload_max_bytes() -> u64 {
     1024 * 1024 * 1024
 }
 
+/// 单 isolate 堆限额默认 256 MiB（v0.1.40）。
+fn default_js_heap_limit_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR-4：堆限额默认 256 MiB，且 < 32 MiB（含 0）装配校验 fail-fast。
+    #[test]
+    fn js_heap_limit_default_and_validate() {
+        let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
+        assert_eq!(c.server.js_heap_limit_bytes, 256 * 1024 * 1024);
+        assert!(validate_server_limits(&c).is_ok(), "默认值必须过校验");
+        for bad in [0u64, 1, 1024, 32 * 1024 * 1024 - 1] {
+            let mut c2 = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
+            c2.server.js_heap_limit_bytes = bad;
+            let e = validate_server_limits(&c2).expect_err("低于下限必须拒绝");
+            assert!(e.contains("below the minimum"), "{e}");
+        }
+    }
 
     #[test]
     fn defaults_when_no_file() {

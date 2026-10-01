@@ -2898,6 +2898,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |
 | `_name_` 目录段必须整段且参数名合法（v0.1.27） | `__x__`/`___`/`_a{b}_` 不转换（保持字面）；转换产物由 `oj build` 期 pattern 试插校验把关，非法/同位异名即构建失败 |
 | 同层异名 `_x_` 目录是结构性冲突（v0.1.27） | `_aa_/` 与 `_bb_/` 并存 → 后者启动丢弃并告警（matchit 同位异名规则，与 `.route` 同） |
+| handler 分配超限 → `js heap limit exceeded`（v0.1.40） | 单 isolate 堆限额 `server.js_heap_limit_bytes`（默认 256 MiB，下限 32 MiB）：V8 near-heap-limit 触发即终止该 isolate 并**丢弃不回池**，请求 5xx 信封、进程存活。已知边界：单个 > 限额的巨型分配仍可能触发 V8 Fatal（V8 二次逼近语义） |
 | WS 目录镜像不转换 `_name_`（v0.1.27） | `_name_/ws.ts` 暴露字面 URL；WS 侧暂不支持动态段（v0.2 评估） |
 | `tenant guard: tenant id "acme" is not a valid integer for numeric column …`（v0.1.24） | `tenant_id` 列声明为 integer/bigint，但租户头不是十进制字面量；数值租户列请用数字租户 id，或把列改成 text |
 | i64 超界读出来是字符串，不是 number（v0.1.22） | `\|v\| > 2^53-1`（雪花 id 常态）按值域分流为十进制字符串——改过 `typeof id === "number"` 判断的代码要复查；回写用 `toBigInt()`，别用 `Number()`（会静默坍缩） |

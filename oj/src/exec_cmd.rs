@@ -124,11 +124,19 @@ pub(crate) async fn run_script(
     // deno_* 扩展以构建机绝对路径声明 JS；进 runtime 前统一换为内嵌源码。
     patch_fs_loaded_sources(&mut extensions);
 
+    // PR-4：与生产 runtime 同源的单 isolate 堆限额（超限 terminate，exec 失败带 OOM 文案）。
+    let create_params = stable
+        .js_heap_limit
+        .map(only_js::bridge::heap_create_params);
     let mut rt = JsRuntime::new(RuntimeOptions {
         extensions,
         module_loader,
+        create_params,
         ..Default::default()
     });
+    if let Some(limit) = stable.js_heap_limit {
+        only_js::bridge::install_heap_limit_callback(&mut rt, limit);
+    }
 
     // ext_boot：`oj exec` 不走 RuntimePool（直接建 JsRuntime），故在此补跑一次。
     if let Some(spec) = stable.boot.as_deref() {

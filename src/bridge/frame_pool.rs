@@ -352,6 +352,17 @@ impl RoutePool {
                     self.live.fetch_sub(1, Ordering::SeqCst);
                     return true;
                 }
+                Err(RunError::Oom { limit }) => {
+                    // PR-4：堆超限 = runtime 已 terminate 毒化（同 Timeout 处置：断连 + 丢弃）。
+                    let _ = f.done.send(Err(FrameError::Core(deno_core::error::CoreError::from(
+                        std::io::Error::other(format!(
+                            "js heap limit exceeded (limit {limit} bytes; server.js_heap_limit_bytes)"
+                        )),
+                    ))));
+                    drop(sess);
+                    self.live.fetch_sub(1, Ordering::SeqCst);
+                    return true;
+                }
                 Err(RunError::Core(e)) => {
                     let _ = f.done.send(Err(FrameError::Core(e)));
                 }
