@@ -16,6 +16,23 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.40 —— PR-4：isolate 内存限额（P0 收口）
+
+- 新配置 `server.js_heap_limit_bytes`（默认 **256 MiB**，下限 32 MiB，装配期 fail-fast）：
+  per-isolate V8 堆限额。超限 handler 被 `terminate_execution` 安全终止，返回 5xx 信封
+  `js heap limit exceeded (limit N bytes; server.js_heap_limit_bytes)`，**进程存活**。
+- **fired isolate 绝不回池**（`RuntimePool::checkin` 单点守卫）：防止 handler 吞掉终止
+  错误后把堆已膨胀的坏 isolate 留在池里；WS 帧路径同 Timeout 毒化处置（断连 + Worker
+  丢弃），池化任务标记 Failed。
+- 覆盖面：HTTP/WS/任务池（RuntimePool::spawn 单点）+ `oj test` / `oj exec` 独立 runtime
+  （DRY：`heap_create_params` / `install_heap_limit_callback` / `heap_guard_fired` 三辅助共用）。
+- 已知边界（文档登记）：单个 > 限额的巨型分配仍可能触发 V8 Fatal OOM（V8 对新限额的
+  二次逼近不重入回调）——进程存活优先于硬顶精确性；稳态超限行为已被击穿测试钉死。
+- 实测钉死三条 V8 语义（写进注释）：二次逼近 Fatal、天文数字返回值 CHECK 崩、余量须
+  容下在途分配。
+- 测试：OOM 击穿（连续两轮 OOM + 池恢复）/ boot 期超限 / 配置校验（默认值 + <32MiB 拒）。
+  `docs/dev-guide.md`「仍开放」清单移除内存限额项。
+
 ## v0.1.39 —— 流式防护探测：修复取消真语义（DOMException + 有界背压）
 
 > 对新流式面补**对抗性探测用例**（守卫/闸/回收不靠声明靠钉死），两条探测各抓到一个真 bug，随本版修复。

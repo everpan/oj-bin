@@ -724,6 +724,22 @@ impl TaskPool {
                                 serde_json::json!({ "task": name, "error": e.to_string() }),
                             );
                         }
+                        Err(super::RunError::Oom { limit }) => {
+                            // PR-4：堆超限 = runtime 已 terminate 毒化（同 Timeout 处置）。
+                            drop(sess);
+                            self.registry.set_status(
+                                name,
+                                TaskStatus::Failed,
+                                Some(format!(
+                                    "loop_body js heap limit exceeded (limit {limit} bytes; server.js_heap_limit_bytes)"
+                                )),
+                            );
+                            self.registry.log.record(
+                                "tasks.execution",
+                                "task.timeout",
+                                serde_json::json!({ "task": name, "error": "js heap limit exceeded" }),
+                            );
+                        }
                         Err(super::RunError::Timeout) => {
                             // 毒化：runtime 已 terminate，teardown 不承诺（FR-LT-005）。
                             drop(sess);

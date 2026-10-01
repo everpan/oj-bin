@@ -158,11 +158,19 @@ async fn run_on_runtime(
     // 否则在非构建机上 JsRuntime 初始化即 ENOENT。
     patch_fs_loaded_sources(&mut extensions);
 
+    // PR-4：与生产 runtime 同源的单 isolate 堆限额（超限 terminate，测试失败带 OOM 文案）。
+    let create_params = stable
+        .js_heap_limit
+        .map(only_js::bridge::heap_create_params);
     let mut rt = JsRuntime::new(RuntimeOptions {
         extensions,
         module_loader,
+        create_params,
         ..Default::default()
     });
+    if let Some(limit) = stable.js_heap_limit {
+        only_js::bridge::install_heap_limit_callback(&mut rt, limit);
+    }
 
     // 注入 ClientTransport（App 自身）。op_client_dispatch 经 OpState 取用；
     // Arc<App> 另存一份给 client.ws（op_client_ws_* 惰性 axum::serve 走 router()）。

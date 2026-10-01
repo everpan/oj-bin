@@ -886,7 +886,9 @@ HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门�
 - **fetch SSRF 防护**：出网白名单、内网/RFC1918/链路本地 IP 阻断、body 上限、
   DNS 解析后复检（防重绑定）、重定向复检。`src/bridge/fetch.rs` 目前均未做
   （仅 `no_proxy` + 响应整体缓冲）。
-- **V8 内存上限**：`ResourceLimiter` 未接（超时熔断已有，内存无界）。
+- ~~**V8 内存上限**~~：**已落地（v0.1.40）**——`server.js_heap_limit_bytes`（默认 256 MiB，
+  ≥32 MiB）经 V8 near-heap-limit 回调终止超限 isolate 并丢弃（不回池），超限请求 5xx 信封。
+  已知边界：单个 > 限额的巨型分配仍可能触发 V8 Fatal（V8 二次逼近语义），文档登记。
 - **op 边界埋点**：`metrics` + `/metrics` 端点（exec 时长、op 计数/延迟、db 延迟、v8 堆）。
 - **错误信息收敛**：`json.fail` 与 500 路径不泄露 Rust/DB 内部细节的审计。
 

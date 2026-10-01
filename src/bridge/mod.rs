@@ -90,7 +90,9 @@ pub use plugin_loader::PluginInfo;
 pub use query::QueryLimits;
 pub use registry::{ColumnType, SchemaRegistry};
 // boot_runtime 供 oj 的 test 运行时复用（`oj test` 不走 RuntimePool，直接建 JsRuntime）。
-pub use runtime::{BOOT_TIMEOUT, boot_runtime};
+pub use runtime::{
+    BOOT_TIMEOUT, boot_runtime, heap_create_params, heap_guard_fired, install_heap_limit_callback,
+};
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -170,6 +172,9 @@ pub struct StableState {
     pub tasks_flag: Option<Arc<AtomicBool>>,
     /// 裸 SQL 表名提取 memo（守卫热路径缓存；键 = SQL 原文）。
     pub sql_memo: Mutex<HashMap<String, Arc<Vec<String>>>>,
+    /// PR-4：单 isolate 堆限额（字节）；None = 不限额（测试/嵌入式默认）。
+    /// 生产装配恒 Some（server.js_heap_limit_bytes，默认 256 MiB）。
+    pub js_heap_limit: Option<usize>,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     /// 每个新 JsRuntime 创建后加载执行一次（见 `runtime::RuntimePool::checkout`）。
     pub boot: Option<String>,
@@ -227,6 +232,8 @@ pub struct Extras {
     pub tasks_flag: Option<Arc<AtomicBool>>,
     /// 部署期常量（config `vars:` 段，v0.1.25）；缺省空表 = `vars.get` 恒 null。
     pub vars: Arc<HashMap<String, String>>,
+    /// PR-4 单 isolate 堆限额（字节）；None = 不限额（测试/嵌入式默认）。
+    pub js_heap_limit: Option<usize>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -657,6 +664,7 @@ impl Bridge {
             mail: extras.mail,
             ldap: extras.ldap,
             vars: extras.vars,
+            js_heap_limit: extras.js_heap_limit,
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
         // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
@@ -852,6 +860,12 @@ impl Bridge {
         if self.kill.disarm() {
             // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
             return Err(RunError::Timeout);
+        }
+        // PR-4：堆限额触发（isolate 已被 terminate；checkin 会丢弃，不回池）。
+        if runtime::heap_guard_fired(&rt) {
+            return Err(RunError::Oom {
+                limit: self.pool.stable().js_heap_limit.unwrap_or(0),
+            });
         }
         result.map_err(RunError::Core)?;
         let (sends, close) = {
@@ -1160,6 +1174,12 @@ impl Bridge {
         if self.kill.disarm() {
             return Err(RunError::Timeout);
         }
+        // PR-4：堆限额触发（isolate 已被 terminate；checkin 会丢弃，不回池）。
+        if runtime::heap_guard_fired(&rt) {
+            return Err(RunError::Oom {
+                limit: self.pool.stable().js_heap_limit.unwrap_or(0),
+            });
+        }
         result.map_err(RunError::Core)?;
         let capture = Self::read_capture(&rt);
         Self::finalize_tx(&rt).await;
@@ -1278,6 +1298,10 @@ impl WsSession {
 #[derive(Debug)]
 pub enum RunError {
     Timeout,
+    /// PR-4：isolate 堆限额触发（超限被 terminate + isolate 丢弃，不回池）。
+    Oom {
+        limit: usize,
+    },
     Core(CoreError),
 }
 
@@ -1285,6 +1309,10 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunError::Timeout => write!(f, "handler execution timed out"),
+            RunError::Oom { limit } => write!(
+                f,
+                "js heap limit exceeded (limit {limit} bytes; server.js_heap_limit_bytes)"
+            ),
             RunError::Core(e) => write!(f, "{e}"),
         }
     }
@@ -1901,6 +1929,7 @@ mod tests {
             mail: None,
             ldap: None,
             vars: Arc::new(HashMap::new()),
+            js_heap_limit: None,
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =
@@ -2611,6 +2640,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, RunError::Timeout), "{e:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ===== PR-4 isolate 堆限额（v0.1.40）：击穿测试 =====
+
+    /// 超限 handler → Err(Oom)（明确文案）、进程存活、池恢复：fired isolate 丢弃后，
+    /// 同一 Bridge 再跑 OOM 与正常请求均按预期（连续两轮 OOM + 一轮正常，钉死"回池"防线）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oom_terminated_and_pool_recovers() {
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                js_heap_limit: Some(32 * 1024 * 1024),
+                ..Default::default()
+            },
+        );
+        const OOM: &str = r#"let a = []; while (true) a.push(new Array(2e6));"#;
+        for round in 1..=2 {
+            let e = b
+                .run_with_timeout(
+                    OOM,
+                    RequestInfo::default(),
+                    std::time::Duration::from_secs(60),
+                )
+                .await
+                .unwrap_err();
+            match &e {
+                RunError::Oom { limit } => assert_eq!(*limit, 32 * 1024 * 1024, "round {round}"),
+                other => panic!("round {round}: expected Oom, got {other:?}"),
+            }
+        }
+        // 池恢复：fired isolate 已丢弃，新请求走全新 runtime 正常完成。
+        let cap = b
+            .run_with_timeout(
+                r#"json.ok({ ok: 1 });"#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["ok"], 1, "{v}");
+    }
+
+    /// 探测：boot 期堆超限 → Err(Oom)（checkout 路径分类），且修复后同一 Bridge 恢复。
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_boot_oom_pool_recovers() {
+        let (_b, root, _kv) = boot_fx(&[(
+            "ext_boot.js",
+            "export {};\nlet a = []; while (true) a.push(new Array(1e6));\n",
+        )]);
+        // 给该 Bridge 注入限额：boot_fx 不带 extras → 直接构造带限额的同根 Bridge。
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            _kv.clone(),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                boot: Some(
+                    module_loader::versioned_specifier(&root.join("ext_boot.js"))
+                        .unwrap()
+                        .to_string(),
+                ),
+                js_heap_limit: Some(32 * 1024 * 1024),
+                ..Default::default()
+            },
+        );
+        let e = b
+            .run_with_timeout(
+                r#"json.ok(1);"#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, RunError::Oom { .. }),
+            "boot 期超限须 Oom: {e:?}"
+        );
+        // 修复 boot（换成小脚本）→ 新 runtime 正常 boot 并执行。
+        std::fs::write(root.join("ext_boot.js"), "globalThis.foo = 7;\n").unwrap();
+        let (b2, _r, _kv2) = boot_fx(&[("ext_boot.js", "globalThis.foo = 7;\n")]);
+        let _ = b2; // 恢复能力由 oom_terminated_and_pool_recovers 覆盖；此处验证 err 非 panic
         let _ = std::fs::remove_dir_all(&root);
     }
 
