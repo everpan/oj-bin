@@ -720,7 +720,7 @@ async fn run_route(
         .find(|(p, _)| path_matches(std::slice::from_ref(p), full_path))
         .map(|(_, d)| *d)
         .or(st.timeout);
-    let mut resp = match st.actor.run_module(file, m, req, timeout).await {
+    let mut resp = match st.actor.run_module(file, m, req, timeout, true).await {
         Ok(cap) => capture_response(cap),
         // 超时熔断 → 408。
         Err(e) if e.timeout => fail_response(408, &e.msg),
@@ -976,6 +976,8 @@ async fn dispatch_meta_handler(
                 .to_string(),
             req,
             st.timeout,
+            // 内部合成派发：不是外部输入，契约校验失败只会静默降级页面 meta。
+            false,
         )
         .await
         .map_err(|e| {
@@ -2183,9 +2185,7 @@ pub(crate) mod tests {
         );
         assert_eq!(v["data"]["note"], "hi", "{v}");
         // 小文件 5B（≤ max_upload=8）→ 旧行为：bytes 回填，key 为空
-        let body = format!(
-            "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"s.txt\"\r\n\r\nsmall\r\n--X-BND--\r\n"
-        );
+        let body = "--X-BND\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--X-BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"s.txt\"\r\n\r\nsmall\r\n--X-BND--\r\n".to_string();
         let r = raw_http(addr, &send(body)).await;
         let v: Value =
             serde_json::from_slice(r.split("\r\n\r\n").nth(1).unwrap_or("null").as_bytes())
@@ -2430,7 +2430,7 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// tenant.enable：header 存在 → 注入 http.tenantId；缺失 → 400；未启用 → null。
+    // tenant.enable：header 存在 → 注入 http.tenantId；缺失 → 400；未启用 → null。
     // ===== PR-9 租户声明绑定（v0.1.41）：击穿测试 =====
 
     /// 带 claims.tenant 的假守卫（Bearer good → tenant=t1；Bearer plain → 无 tenant claim）。
@@ -2484,7 +2484,7 @@ pub(crate) mod tests {
     /// 探测矩阵：验签 claim 是唯一租户来源；裸头仅作一致性复核（fail-closed）。
     #[tokio::test]
     async fn probe_tenant_signed_claim_binding() {
-        let (addr, root) = claim_guard_fixture().await;
+        let (addr, _root) = claim_guard_fixture().await;
         let get = |hdr: Option<&str>, tok: Option<&str>| {
             format!(
                 "GET /v1/api/u/ HTTP/1.1\r\nHost: t\r\n{}{}Connection: close\r\n\r\n",

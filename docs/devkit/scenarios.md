@@ -1518,3 +1518,52 @@ curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
 - `docs/tenant-guide.md`（仓库）—— 多租户白话指南
 - `docs/testing.md`（仓库）—— L1/L2 两层测试选型
 - `docs/mail-smtp.md`（仓库）—— 邮件投递完整手册
+
+## 场景 24：给 handler 加一层入参契约（`.schema`，v0.1.44）
+
+不想在每个 handler 里手写校验，又不想让脏数据进到业务代码。
+
+### ① handler 上挂 `.schema`
+
+```js
+// src/order/list/api.ts
+function post() {
+  const { name } = http.body;
+  json.ok({ created: name });
+}
+
+post.schema = {
+  query: { type: "object", properties: { page: { type: "integer", minimum: 1 } } },
+  body: {
+    type: "object",
+    required: ["name"],
+    properties: { name: { type: "string", maxLength: 20 } },
+  },
+};
+
+export default { post };
+```
+
+路径参数同理（`_id_/api.ts` → `{id}`）：
+
+```js
+get.schema = {
+  params: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
+};
+```
+
+### ② 验证
+
+```bash
+curl -s -X POST 'http://localhost:9778/v1/api/order/list' -H 'content-type: application/json' -d '{}'
+# → HTTP 400 {"code":400,"msg":"body: missing required field `name`","data":null}
+
+curl -s 'http://localhost:9778/v1/api/order/list?page=0'      # 400（minimum: 1）
+curl -s 'http://localhost:9778/v1/api/order/abc'              # 400（id 强转失败）
+```
+
+### ③ 常见坑
+
+- 关键字只在白名单内受支持，越界即**启动失败**（不会到运行期才炸）。
+- `pattern` 是 Rust regex 语义，不是 JS 正则。
+- 契约与路由 pattern 不一致时 `oj openapi` 会报错（两边必须双向对齐）。

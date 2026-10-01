@@ -189,6 +189,9 @@ pub struct StableState {
     /// 部署期常量（config `vars:` 段，v0.1.25）：`vars.get(name)` 的唯一数据源。
     /// **fail-closed**：只有这里声明的键可读（空表 = 全 null）。装配期冻结、只读。
     pub vars: Arc<HashMap<String, String>>,
+    /// 入参契约（v0.1.44）：键 = (api 文件绝对路径, js 方法名)。
+    /// None = 校验关闭；Some(空表) = 无 handler 声明契约（当前全默认）。
+    pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -234,6 +237,9 @@ pub struct Extras {
     pub vars: Arc<HashMap<String, String>>,
     /// PR-4 单 isolate 堆限额（字节）；None = 不限额（测试/嵌入式默认）。
     pub js_heap_limit: Option<usize>,
+    /// 入参契约注册表（v0.1.44）；None = 不校验（缺省；Extras 是 Default 的，
+    /// 故未显式注入的 Bridge 一律不设防，行为与升级前一致）。
+    pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -651,6 +657,7 @@ impl Bridge {
             db_override: extras.db_override,
             query_limits: extras.query_limits,
             boot: extras.boot,
+            input_contracts: extras.input_contracts,
             jwt: extras.jwt,
             oidc: extras.oidc,
             kafkas: extras
@@ -1064,6 +1071,24 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<Capture, RunError> {
+        self.run_module_validated(api_path, method, req, timeout, true)
+            .await
+    }
+
+    /// 与 `run_module` 相同，但可显式关闭入参契约校验。
+    ///
+    /// **仅**内部合成派发（`server::dispatch_meta_handler`）用 `validate=false`：
+    /// 那个请求是框架自己造的（`query={"path":…}`、空 body），不是外部输入；
+    /// 让它的契约校验失败只会静默降级页面 meta，属于误伤。
+    /// 外部请求**一律** `validate=true`（缺省即如此）。
+    pub async fn run_module_validated(
+        &self,
+        api_path: &std::path::Path,
+        method: &str,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+        validate: bool,
+    ) -> Result<Capture, RunError> {
         let spec = module_loader::versioned_specifier(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
         // TLA driver：import 命中 V8 模块缓存（?v= 不变时零转译零重编译）；
@@ -1084,6 +1109,30 @@ impl Bridge {
         // §5.3 执行上下文：api_path 祖先目录命中模块目录 → 本请求归该模块
         // （归属守卫 / bound_db 重定向依据；Map 键 = 模块目录绝对路径，装配期注入）。
         let stable = self.pool.stable();
+        // 入参契约校验（v0.1.44）：**在 V8 之前**拦住不合规输入 → 400。
+        // 与「方法未导出 → 405」同处一个执行切面：两者都是「进 JS 之前」的契约失败。
+        // 注册表为装配后填充的共享 Arc：读锁仅覆盖校验本身（内部无 await，亦不跨 await 持有）。
+        let violation = if validate {
+            if let Some(reg) = &stable.input_contracts {
+                let g = reg.read().unwrap_or_else(|p| p.into_inner());
+                g.check_request(api_path, method, &req).err()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(msg) = violation {
+            let (body, status) = envelope::fail(400, &msg, &serde_json::Value::Null);
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            return Ok(Capture {
+                status,
+                headers,
+                body,
+                stream: None,
+            });
+        }
         let mut module: Option<&str> = None;
         let mut anc = api_path.parent();
         while let Some(d) = anc {
@@ -1096,8 +1145,13 @@ impl Bridge {
         self.run_side_driver(req, code, timeout, module).await
     }
 
-    /// 启动期内省：import api 模块、读 default[method].route，经 json.ok 信封回传 data
-    /// （{"get": "{id}" | null, ...}，仅含函数导出的方法；null = 导出但未挂 .route）。
+    /// 启动期内省：import api 模块、读每个导出方法的 `.route` 与 `.schema`，
+    /// 经 json.ok 信封回传 data（`{"get": {"route":"{id}"|null, "schema": <obj>|null}, ...}`，
+    /// 仅含函数导出的方法）。
+    ///
+    /// **route 与 schema 走同一趟内省** —— 二者必须同源，否则「路由表里有、契约表没有」
+    /// 就会退化成声明不生效。schema 原样透传（未校验），由 `contract::InputContract` 在
+    /// 注册期做白名单 fail-fast。
     /// 复用 run_module 的 driver/KillSwitch/checkin 管道（其注释同样适用）。
     pub async fn introspect_module(
         &self,
@@ -1110,7 +1164,12 @@ impl Bridge {
              const out = {{}};\n\
              for (const k of [\"get\",\"post\",\"put\",\"del\",\"patch\",\"head\",\"options\"]) {{\n\
                const fn = m.default && m.default[k];\n\
-               if (typeof fn === \"function\") out[k] = fn.route === undefined ? null : String(fn.route);\n\
+               if (typeof fn === \"function\") {{\n\
+                 out[k] = {{\n\
+                   route: fn.route === undefined ? null : String(fn.route),\n\
+                   schema: fn.schema === undefined ? null : fn.schema,\n\
+                 }};\n\
+               }}\n\
              }}\n\
              json.ok(out);\n"
         );
@@ -1904,6 +1963,7 @@ mod tests {
             kv: Arc::new(InMemoryKV::new()),
             dbs: HashMap::new(),
             registry: Arc::new(SchemaRegistry::new()),
+            input_contracts: None, // 单测路径不注入契约（默认不校验）
             seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             loader: Some(Arc::new(LoaderShared {
                 project_root: root.clone(),
@@ -2042,6 +2102,82 @@ mod tests {
         assert_eq!(v["data"], json!({"ok": 1, "tag": "t-x"}), "{v}");
     }
 
+    /// 契约守卫（v0.1.44）：外部请求违反 `.schema` → 400 且**不进 JS**；
+    /// 内部合成派发（`dispatch_meta_handler`）豁免 —— 它造的是 `query={"path":…}`、
+    /// 空 body 的合成请求，契约失败只会静默降级页面 meta，属于误伤。
+    #[tokio::test(flavor = "current_thread")]
+    async fn contract_violation_is_400_but_internal_dispatch_is_exempt() {
+        use crate::contract::{InputContract, InputContractRegistry};
+        // 用 .js + ts:false：本用例不需要转译；转译会与 transpile 测试的
+        // 计数器 delta 断言互斥（见 transpile_serial 注释）。
+        let (root, api) = mod_fx(&[(
+            "u/f/api.js",
+            "function get() { json.ok({ reached: true }); }\n\
+             get.schema = { params: { type: \"object\", required: [\"id\"], \
+               properties: { id: { type: \"integer\" } } } };\n\
+             export default { get };\n",
+        )]);
+        let contract = InputContract::try_new(
+            Some(serde_json::json!({
+                "type": "object",
+                "required": ["id"],
+                "properties": { "id": { "type": "integer" } }
+            })),
+            None,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut reg = InputContractRegistry::new();
+        reg.insert(api.clone(), "get", contract).unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: false,
+            })),
+            Extras {
+                input_contracts: Some(Arc::new(std::sync::RwLock::new(reg))),
+                ..Default::default()
+            },
+        );
+        let t = std::time::Duration::from_secs(5);
+
+        // 1) 外部请求（validate=true）：缺 required `id` → 400，且 JS 未被执行。
+        let cap = b
+            .run_module(&api, "get", RequestInfo::default(), t)
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 400, "{}", String::from_utf8_lossy(&cap.body));
+        assert!(
+            !String::from_utf8_lossy(&cap.body).contains("reached"),
+            "契约失败必须在进 JS 之前拦截"
+        );
+
+        // 2) 内部合成派发（validate=false）：豁免，handler 正常执行。
+        let cap2 = b
+            .run_module_validated(&api, "get", RequestInfo::default(), t, false)
+            .await
+            .unwrap();
+        assert_eq!(cap2.status, 200, "{}", String::from_utf8_lossy(&cap2.body));
+        assert!(
+            String::from_utf8_lossy(&cap2.body).contains("reached"),
+            "豁免后应真正执行 handler"
+        );
+
+        // 3) 击穿反向：validate=true 时**合规**请求仍须放行（不得误拦）。
+        let mut ok_req = RequestInfo::default();
+        ok_req.params.insert("id".to_string(), "7".to_string());
+        let cap3 = b
+            .run_module_validated(&api, "get", ok_req, t, true)
+            .await
+            .unwrap();
+        assert_eq!(cap3.status, 200, "合规请求不得被误拦");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn method_not_exported_is_405() {
         let _t = transpile_serial();
@@ -2131,8 +2267,11 @@ mod tests {
         )]);
         let b = module_bridge(&root);
         let v = b.introspect_module(&api).await.unwrap();
-        assert_eq!(v["get"], json!("{id}"), "{v}");
-        assert_eq!(v["del"], json!(null), "{v}");
+        // v0.1.44：内省改为 {"route":..,"schema":..} 双字段（route 与契约同源一趟取）。
+        assert_eq!(v["get"]["route"], json!("{id}"), "{v}");
+        assert_eq!(v["get"]["schema"], json!(null), "{v}");
+        assert_eq!(v["del"]["route"], json!(null), "{v}");
+        assert_eq!(v["del"]["schema"], json!(null), "{v}");
         assert!(v.get("post").is_none(), "{v}"); // 未导出 → 缺席
     }
 

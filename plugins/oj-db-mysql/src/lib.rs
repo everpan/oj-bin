@@ -356,67 +356,66 @@ impl Client {
         let params: Vec<serde_json::Value> = params.to_vec();
         let is_mysql = matches!(self.pool, Pooled::MySql(_));
         let mut conn_id: Option<u64> = None;
-        let rows: DbStream =
-            if is_mysql {
-                // typed 专用连接：连接的所有权随生成器走；cancel = KILL QUERY conn_id
-                // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
-                let mut conn = MySqlConnection::connect(&self.dsn)
+        let rows: DbStream = if is_mysql {
+            // typed 专用连接：连接的所有权随生成器走；cancel = KILL QUERY conn_id
+            // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
+            let mut conn = MySqlConnection::connect(&self.dsn)
+                .await
+                .map_err(|e| format!("db stream_open: connect: {e}"))?;
+            conn_id = Some(
+                sqlx::query_scalar::<_, u64>("select connection_id()")
+                    .fetch_one(&mut conn)
                     .await
-                    .map_err(|e| format!("db stream_open: connect: {e}"))?;
-                conn_id = Some(
-                    sqlx::query_scalar::<_, u64>("select connection_id()")
-                        .fetch_one(&mut conn)
-                        .await
-                        .map_err(|e| format!("db stream_open: connection id: {e}"))?,
-                );
-                Box::pin(async_stream::stream! {
-                    let mut q: Query<'_, MySql, MySqlArguments> =
-                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                    for v in &params {
-                        q = bind_value_mysql(q, v);
-                    }
-                    use futures::StreamExt;
-                    let mut rows = q.fetch(&mut conn);
-                    while let Some(r) = rows.next().await {
-                        match r {
-                            Ok(row) => yield row_to_json_mysql(&row),
-                            Err(e) => {
-                                yield Err(format!("db stream: {e}"));
-                                break;
-                            }
+                    .map_err(|e| format!("db stream_open: connection id: {e}"))?,
+            );
+            Box::pin(async_stream::stream! {
+                let mut q: Query<'_, MySql, MySqlArguments> =
+                    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                for v in &params {
+                    q = bind_value_mysql(q, v);
+                }
+                use futures::StreamExt;
+                let mut rows = q.fetch(&mut conn);
+                while let Some(r) = rows.next().await {
+                    match r {
+                        Ok(row) => yield row_to_json_mysql(&row),
+                        Err(e) => {
+                            yield Err(format!("db stream: {e}"));
+                            break;
                         }
                     }
-                    // 生成器结束 → conn drop = 断连（回池）。
-                })
-            } else {
-                // Any 层无 u64：明确拒绝（勿让 `$oj$u64` 落成静默文本）。
-                oj_plugin_ffi::jsint::reject_u64_markers(
-                    &params,
-                    "the sqlx::Any fallback path cannot carry u64 — use a mysql:// DSN with this plugin",
-                )?;
-                let pool = match &self.pool {
-                    Pooled::Any(p) => p.clone(),
-                    _ => unreachable!("is_mysql false ⇒ Any pool"),
-                };
-                Box::pin(async_stream::stream! {
-                    let mut q: Query<'_, Any, AnyArguments> =
-                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-                    for v in &params {
-                        q = bind_value_any(q, v);
-                    }
-                    use futures::StreamExt;
-                    let mut rows = q.fetch(&pool);
-                    while let Some(r) = rows.next().await {
-                        match r {
-                            Ok(row) => yield Ok(row_to_json_any(&row)),
-                            Err(e) => {
-                                yield Err(format!("db stream: {e}"));
-                                break;
-                            }
-                        }
-                    }
-                })
+                }
+                // 生成器结束 → conn drop = 断连（回池）。
+            })
+        } else {
+            // Any 层无 u64：明确拒绝（勿让 `$oj$u64` 落成静默文本）。
+            oj_plugin_ffi::jsint::reject_u64_markers(
+                &params,
+                "the sqlx::Any fallback path cannot carry u64 — use a mysql:// DSN with this plugin",
+            )?;
+            let pool = match &self.pool {
+                Pooled::Any(p) => p.clone(),
+                _ => unreachable!("is_mysql false ⇒ Any pool"),
             };
+            Box::pin(async_stream::stream! {
+                let mut q: Query<'_, Any, AnyArguments> =
+                    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+                for v in &params {
+                    q = bind_value_any(q, v);
+                }
+                use futures::StreamExt;
+                let mut rows = q.fetch(&pool);
+                while let Some(r) = rows.next().await {
+                    match r {
+                        Ok(row) => yield Ok(row_to_json_any(&row)),
+                        Err(e) => {
+                            yield Err(format!("db stream: {e}"));
+                            break;
+                        }
+                    }
+                }
+            })
+        };
         let id = self.next_stream.fetch_add(1, Ordering::SeqCst) + 1;
         self.streams.lock().unwrap().insert(
             id,

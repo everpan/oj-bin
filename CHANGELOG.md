@@ -16,6 +16,41 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.44 —— PR-6 4b：handler 入参契约（`.schema`）与运行期校验
+
+- **新增 JS 声明面 `.schema`**（与既有 `.route` 完全同构）：在导出的函数对象上分
+  **三通道**声明入参契约 —— `params`（路径段）/ `query` / `body`，对应
+  `http.params` / `http.query` / `http.body`。
+- **声明即执行**：校验在**进 JS 之前**发生（`run_module` 内，与既有「方法未导出 →
+  405」同一切面），违反 → HTTP **400** 信封 `{"code":400,"msg":...}`，handler 不被调用。
+- **字符串强转**：`params` / `query` 在 HTTP 里只有字符串形态，声明
+  `integer`/`number`/`boolean` 时显式强转，转不动即 400；`body` 是真 JSON，不强转。
+- **自研最小校验器（`src/contract.rs`），零新增依赖包**：
+  - 受支持关键字白名单：`type` / `required` / `properties` / `items` /
+    `additionalProperties` / `minimum` / `maximum` / `minLength` / `maxLength` /
+    `pattern` / `enum` / `nullable` / `minItems` / `maxItems`；
+  - 白名单外（`$ref` / `oneOf` / `format` …）一律 **fail-fast，绝不静默跳过**
+    —— 静默放行等于把声明变成不生效的东西（本项目最痛的缺陷类）；
+  - `pattern` 用 **Rust `regex`**（已在依赖树，显式声明防漂移；不是 ECMA-262，
+    lookahead 不支持，非法即装配期报错）；
+  - `params` / `query` 只允许扁平标量 —— 底层是 `HashMap<String,String>`，
+    声明 array/object 是永远无法满足的死契约，装配期即拒。
+- **配置开关 `server.schema_validation`**：默认 **true（fail-closed）** —— 声明了契约
+  却不执行 = 假契约。`.schema` 是全新声明面，当前无人声明，故升级无行为变化。
+- **契约单一真源**：内省一次同时取 `route` 与 `schema`（`{route, schema}`，杜绝两趟
+  内省漂移）；落在 `RouteRow.schema`，dev 内省与 release `routes.js` 同源；
+  `oj build` 把契约写进 `routes.js`（**可选字段**，旧产物缺字段 = 未声明，向后兼容）。
+- **`oj openapi` 补出 `parameters` / `requestBody`**：类型取自契约（不再硬编码
+  `type: string`）；且 `params` 声明与路由 pattern 实参必须**双向一致**，否则生成期
+  报错 —— 否则契约与 URL 会变成两份真源，未声明者不受任何约束。
+- **内部合成派发豁免**：`dispatch_meta_handler` 造的是 `query={"path":…}`、空 body 的
+  合成请求，走 `validate=false`；外部请求一律校验（缺省即校验）。
+- **验证**：`src/contract.rs` 单测 19 项（含击穿：未知关键字不得静默放行、死契约拒、
+  键错配不得误拦、强转边界）；bridge 守卫用例 1 项（外部 400 且不进 JS / 内部豁免 /
+  合规不误拦）；`oj openapi` 用例 +3；**真 HTTP e2e +2**（400 与开关关闭不校验）。
+- 文档：devkit 四件同步（api-manual「入参契约 `.schema`」/ SKILL 陷阱速查 2 条 /
+  scenarios 场景 24 / README 版本提示）；`docs/modules/04-oj-cli.md` 同步。
+
 ## v0.1.43 —— PR-6 第一步：`oj openapi` 生成 + `--check` 漂移门禁
 
 - **新增 `oj openapi` 子命令**（`oj/src/openapi_cmd.rs`）：从路由表生成 **OpenAPI 3.1**

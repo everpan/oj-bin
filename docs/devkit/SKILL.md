@@ -87,6 +87,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | postgres 占位符报错 | 该方言用 `$1`，不是 `?`（sqlite/mysql 才是 `?`） |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
 | 启动报 `neither api path … specified` / `api path not found` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `server.static_sites` / `--app-path`）至少显式指定其一；`--api-path` 指定了就必须存在；静态目录存在性由装配期 fail-fast（报错含具体来源）。CLI 路径相对 CWD，config 路径相对 config 目录 |
+| 启动失败报 `server.schema_validation: invalid .schema` | `.schema` 用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；`params`/`query` 声明 array/object 也是死契约，同样拒 |
+| 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false` |
 | seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |

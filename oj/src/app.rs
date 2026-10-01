@@ -31,6 +31,7 @@ use only_js::bridge::{
 };
 use only_js::bridge::{EventBroker, SqlGuard, StableState};
 use only_js::config::{self, Config};
+use only_js::contract::{InputContract, InputContractRegistry};
 use server::CertificateStatus;
 use server::actor::JsActor;
 use server::certificate::load_certificate_at;
@@ -685,6 +686,9 @@ pub struct Backend {
     auth_guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
     /// Bridge 工厂。tasks_flag 参数化：None = HTTP 桥，Some = 任务桥。
     make_bridge_of: Arc<dyn Fn(Option<Arc<std::sync::atomic::AtomicBool>>) -> Bridge + Send + Sync>,
+    /// 入参契约注册表（v0.1.44）。与 `StableState.input_contracts` **同一个 Arc**：
+    /// 路由表建成后由装配写入一次，所有 Bridge（含已构造的）立即共享。
+    input_contracts: Arc<std::sync::RwLock<InputContractRegistry>>,
 }
 
 impl Backend {
@@ -700,6 +704,10 @@ impl Backend {
     pub fn make_bridge(&self) -> impl Fn() -> Bridge + Send + Sync {
         let f = self.make_bridge_of.clone();
         move || f(None)
+    }
+    /// 入参契约注册表句柄（装配后填充；回填给 ServerInputContract 用）。
+    pub fn input_contracts(&self) -> &Arc<std::sync::RwLock<InputContractRegistry>> {
+        &self.input_contracts
     }
     /// 任务桥工厂（tasks_flag = Some(flag)；停机 flag 由 HTTP 层创建并传入）。
     pub fn make_task_bridge(
@@ -756,6 +764,10 @@ pub async fn assemble_backend(
 ) -> Result<Backend, String> {
     // PR-4：单 isolate 堆限额（u64 copy 提前取出，避免闭包借用 &Config）。
     let js_heap_limit = Some(cfg.server.js_heap_limit_bytes as usize);
+    // 入参契约注册表（v0.1.44）：此刻为空，**路由表建成后**填充。
+    // 共享 Arc 是刻意的 —— Bridge（make_bridge 闭包）先于路由表定义，写入后
+    // 所有 Bridge（含已构造的）一同生效， Injection 顺序不再是约束。
+    let input_contracts = Arc::new(std::sync::RwLock::new(InputContractRegistry::new()));
     // 其余非选中 redis key warn 忽略（仅 selected profile 参与装配）。
     let redis_key = profiles.redis.as_deref().unwrap_or("default");
     for (name, url) in cfg.redis.iter().filter(|(n, _)| n.as_str() != redis_key) {
@@ -922,6 +934,8 @@ pub async fn assemble_backend(
         // db_override 已是 owned（上方从 profiles.db 克隆），闭包内直接复用。
         // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
         let vars = vars.clone();
+        // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
+        let input_contracts = input_contracts.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -955,6 +969,7 @@ pub async fn assemble_backend(
                     ldap: ldap.clone(),
                     vars: vars.clone(),
                     js_heap_limit,
+                    input_contracts: Some(input_contracts.clone()),
                 },
             )
         }
@@ -989,12 +1004,14 @@ pub async fn assemble_backend(
         mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
         ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
+        input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
     });
     Ok(Backend {
         stable,
         auth_guard: auth,
         make_bridge_of: Arc::new(make_bridge_of),
+        input_contracts,
     })
 }
 
@@ -1140,6 +1157,7 @@ impl App {
                         method: e.method,
                         pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
                         file: format!("{module}-{version}/{}", e.file),
+                        schema: e.schema,
                     });
                 }
             }
@@ -1176,6 +1194,43 @@ impl App {
         eprintln!(
             "routes: {method_rows} method-row(s), {patterns} pattern(s), {files} api file(s)"
         );
+        // 入参契约装配（v0.1.44）：RouteRow.schema 是唯一真源（dev 内省 / release
+        // routes.js 都汇到这里）。非法契约必须**硬失败** —— 不得退化为
+        // 「记一条 failure 继续跑」，那等于把声明悄悄变成不生效的东西。
+        if cfg.server.schema_validation {
+            let mut reg = InputContractRegistry::new();
+            for row in table.listing() {
+                let Some(sv) = row.schema.clone() else {
+                    continue;
+                };
+                let file = table.file_path(row.file).to_path_buf();
+                let contract = InputContract::try_new(
+                    sv.get("params").cloned(),
+                    sv.get("query").cloned(),
+                    sv.get("body").cloned(),
+                    &mut Vec::new(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "server.schema_validation: invalid `.schema` on {} {} ({}): {e}",
+                        row.method,
+                        row.pattern,
+                        file.display()
+                    )
+                })?;
+                reg.insert(file, &row.method, contract).map_err(|e| {
+                    format!("server.schema_validation: cannot register contract: {e}")
+                })?;
+            }
+            let n = reg.len();
+            *backend
+                .input_contracts()
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = reg;
+            if n > 0 {
+                eprintln!("input contracts: {n} route-method(s) validated before reaching JS");
+            }
+        }
         let n = cfg.server.pool_size.max(1) as usize;
         // 通配语义 v0.1.20 收紧的迁移提示（v0.1.23 起按影响面判定）：必须等路由表就绪，
         // 才能判「改 `**` 是否会真多命中」（见 warn_legacy_tail_wildcards）。
@@ -1472,11 +1527,13 @@ mod tests {
                 method: "get".into(),
                 pattern: "/v1/api/html-meta".into(),
                 file: "meta.ts".into(),
+                schema: None,
             },
             routes::RouteEntry {
                 method: "post".into(),
                 pattern: "/v1/api/post-only".into(),
                 file: "meta.ts".into(),
+                schema: None,
             },
         ];
         let (table, failures) = routes::RouteTable::from_entries(&dir, &entries);
