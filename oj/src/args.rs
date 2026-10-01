@@ -76,7 +76,22 @@ pub struct BuildArgs {
     pub check: bool,
 }
 
-/// `oj migrate [-c config] [-d dir] [--db name] [--baseline] [--module M]`。
+/// `oj openapi [-c config] [-d dir] [--base B] [--check] [-o out.json]`：
+/// 从路由表（dev 内省 .route / release 读 dist/routes.js）生成 OpenAPI 3.1；
+/// `--check` 把生成物与已提交 openapi.json 比对，不一致非零退出（CI 漂移门禁）。
+/// 与 `TestArgs`/`MigrateArgs` 同构：本结构体为纯数据，clap 属性在 `Commands::OpenApi` 变体上。
+pub struct OpenApiArgs {
+    /// 配置文件路径（db/插件/路由前缀来源）；缺省 config.yaml
+    pub config: String,
+    /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
+    pub dir: Option<String>,
+    /// API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
+    pub base: Option<String>,
+    /// 只校验漂移：生成物与已提交 openapi.json 比对，不一致非零退出（CI 门禁）
+    pub check: bool,
+    /// 输出文件；省略则写 stdout。`--check` 时作为待比对文件，缺省 `<dir>/openapi.json`
+    pub out: Option<String>,
+}
 pub struct MigrateArgs {
     pub config: String,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
@@ -139,6 +154,7 @@ pub enum Command {
     SecretKeygen(SecretKeygenArgs),
     SecretSeal(SecretSealArgs),
     SecretOpen(SecretOpenArgs),
+    OpenApi(OpenApiArgs),
 }
 
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
@@ -377,6 +393,25 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// 从路由表生成 OpenAPI 3.1；`--check` 比对已提交 openapi.json 检测漂移（CI 门禁）
+    #[command(name = "openapi")]
+    OpenApi {
+        /// 配置文件路径（db/插件/路由前缀来源）；缺省 config.yaml
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
+        #[arg(short, long)]
+        base: Option<String>,
+        /// 只校验漂移：生成物与已提交 openapi.json 比对，不一致非零退出（CI 门禁）
+        #[arg(long)]
+        check: bool,
+        /// 输出文件；省略则写 stdout。`--check` 时作为待比对文件，缺省 `<dir>/openapi.json`
+        #[arg(short, long)]
+        out: Option<String>,
+    },
 }
 
 /// `oj secret <sub>`。
@@ -570,6 +605,19 @@ fn to_command(cli: Cli) -> Command {
             rabbit,
             log_file,
             args,
+        }),
+        Commands::OpenApi {
+            config,
+            dir,
+            base,
+            check,
+            out,
+        } => Command::OpenApi(OpenApiArgs {
+            config,
+            dir,
+            base,
+            check,
+            out,
         }),
     }
 }
