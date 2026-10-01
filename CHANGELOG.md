@@ -16,6 +16,43 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.38 —— ABI 10：db 插件流式查询 + blob 流式上传（PR-2/PR-5 Phase B）
+
+> **破坏性 ABI 变更（9→10）**：`DataAccessorVtable`/`BlobBackendVtable` 追加槽位，旧 ABI 9 插件启动即 fail-fast（既有门禁）。
+> 第一方插件 `oj-db-mysql`/`oj-db-postgres`/`oj-blob-s3` 已随本版锁步重建（ABI 10）。
+
+### db 流式：插件后端真流式（PR-2 Phase B）
+- `DataAccessorVtable` 增 `stream_open/stream_next/stream_cancel/stream_close` 四槽：
+  批量 pull（≤100 行/次）+ 信封传输（`{"rows":[...]}` / `{"done":true}` / `{"error":"..."}`，绝不裸 null）。
+- `oj-db-mysql`/`oj-db-postgres` 实现游标化流式（`db.stream` 在 mysql/pg 上真流式，不再回落全量）。
+  取消为**协作式**（批间生效）：`stream_cancel` 置标志，下一批返回 `{"error":"cancelled"}`；
+  `stream_close` 释放游标（连接回池）。sqlx 驱动层拿不到方言级 CancelToken，
+  「方言级真取消」（PG CancelToken / MySQL KILL QUERY）为已登记偏差（计划文档 §实施状态）。
+- 宿主 `FfiDataAccessor::stream_query`：open 哨兵 `{"unsupported":true}`（第三方未实现流式的
+  ABI 10 插件）→ 回落 `db.query` 全量（评审定稿：保 dev/test 一致）；abort 路径由 Drop 守卫
+  fire-and-forget `stream_cancel`+`stream_close`，杜绝插件侧游标条目泄漏。
+- 事务内 `db.stream` 报错文案更新（去 Phase A/ABI 字样，语义不变：流式只走直连池）。
+
+### blob 流式上传：服务端大文件直落 blob（PR-5 Phase B）
+- `BlobBackendVtable` 增 `put_stream_open/chunk/finish/abort` 四槽；进程内 `BlobBackend`
+  trait 同步扩展（`LocalBlob` 临时文件 + Drop 守卫兜底清理 + finish rename 转正 + ct sidecar）；
+  `oj-blob-s3` 用 multipart（每满 8 MiB 一个 part；abort 取消 multipart 防 orphan parts）。
+- **server 流式 multipart**：上传请求体不再整段缓冲——文本字段缓冲并入 body（累计 ≤
+  `max_upload`）；文件字段 ≤ `max_upload` 仍缓冲（`http.file(i)` 旧行为不变）；
+  **> `max_upload` 的文件字段转流式** `put_stream_*` 直落 blob（单文件上限
+  `blob_upload_max`，服务端内存恒定）。multer 总闸 = `max_upload + blob_upload_max`，
+  超限 413。blob 直传 PUT 腿同步流式化（`put_stream_open` Err 回落缓冲 put）。
+- **JS API（additive）**：`http.files[i]` 新增 `key`/`url`（流式大文件的 blob 对象 key 与
+  下载地址，小文件为 null）；`http.file(i)` 对流式大文件明确报错并指路（不再可能静默空字节）。
+
+### 测试 / 文档
+- 新增：FFI 适配器流式（哨兵回落/批量 pull/abort cancel+close）、local 流式落盘+abort 清理、
+  db 插件离线流式 roundtrip + cancelled 信封、server 流式 multipart 三态（大文件落 blob /
+  小文件缓冲 / 超限 413）与 PUT 直传流式腿；真库回归（`OJ_TEST_PG`/`OJ_TEST_MYSQL`）沿用。
+- `docs/devkit/` 四件、`docs/db-guide.md` §3.1、`docs/dev-guide.md`、`docs/user-manual.md`、
+  `sample/global.d.ts`（`UploadedFileMeta.key/url`）同步；`docs/pr2-pr5-implementation-plan.md`
+  登记实施状态与偏差。
+
 ## v0.1.37
 
 > 版本分界：`oj/Cargo.toml` 0.1.36 → 0.1.37。上一版：`v0.1.36`。

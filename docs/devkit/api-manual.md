@@ -679,8 +679,8 @@ e.write("hello"); e.write("world");                    // 自动包成 data: hel
 | `http.param` | `param(name: string, def?: unknown): any` | **路径参数优先，query 兜底**，均缺失返回 `def` 原值 |
 | `http.tenantId` | `string \| null` | 租户 id（`tenant.enable` 时从租户头提取；未启用为 `null`） |
 | `http.user` | `AuthUser \| null` | 已验签用户 `{id, roles, claims}`；auth 启用且请求通过 Bearer 守卫（进 handler 前统一验 token 的那道检查）才有值，否则 `null` |
-| `http.files` | `UploadedFileMeta[]` | multipart 上传元信息 `[{field, filename, content_type, size}]`；非 multipart 为空数组 |
-| `http.file` | `file(i: number): Promise<Uint8Array>` | 第 i 个上传文件的字节（越界报错 `no such file`） |
+| `http.files` | `UploadedFileMeta[]` | multipart 上传元信息 `[{field, filename, content_type, size, key, url}]`；非 multipart 为空数组。**`key`/`url`（v0.1.38）**：流式大文件（> `max_upload`，服务端直落 blob）的 blob 对象 key 与下载地址；小文件为 `null` |
+| `http.file` | `file(i: number): Promise<Uint8Array>` | 第 i 个上传文件的字节（越界报错 `no such file`；**流式大文件报错**并指路 `files[i].key`/`.url`——小文件行为不变） |
 
 ```ts
 const id = Number(http.param("id", 0));   // /item/42?id=9 → "42"（路径优先）
@@ -986,15 +986,16 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
 }});
 ```
 
-**限制与边界（Phase A）**：
+**限制与边界**：
 - 仅支持**非事务**目标（`DB(name)` 的直连池）。在 `db.tx(...)` 内部调用 `db.stream` 直接报错
-  `db.stream within an active transaction is not supported in Phase A (ABI 10 required)`。
-- 插件后端（`oj-db-*` 经 FFI 加载）当前走 `DataAccessor::stream_query` 的**默认实现**，会报错
-  `backend does not support streaming (ABI 10 required)`。Phase A 仅核心 `SqlxAccessor`
-  （sqlite/mysql/postgres，`Any` 驱动）提供真实流式；ABB 升级（vtable `stream_open`/`fetch_next`/
-  `stream_cancel`/`stream_close` + `ABI 10`）在 PR-2 Phase B 落地后插件后端方可流式。
+  `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。
+- **后端支持**（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
+  InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）均
+  **真流式**。第三方插件若未实现流式槽（open 哨兵 `{"unsupported":true}`），宿主**回落
+  `db.query` 全量**（行为等同 `db.query`，仅失去流式内存优势，不报错）。
 - `db.stream` 与 `db.query` 返回**内容一致**（同一查询的逐行等价于全量数组）；差异只在内存形态。
-- `signal` 仅中止拉取，已回调/已迭代的行不会回滚。
+- 取消（`signal`）：core 后端为 best-effort drop；插件后端为**协作式取消**（批间生效，
+  下一批返回 `{"error":"cancelled"}`）。`signal` 仅中止拉取，已回调/已迭代的行不会回滚。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -1108,6 +1109,13 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 `PUT {base}/blob/{key}` 内置路由（**过鉴权守卫**，Bearer/cookie 即令牌；体积上限独立
 `server.blob_upload_max_bytes`，默认 1 GiB；不经 JsActor，无 30s 限制）。下载侧 local
 内联腿支持 `Range` 单区间（206 + Content-Range；越界 416），pdf.js/媒体 seek 直接可用。
+
+**multipart 大文件流式落 blob（v0.1.38）**：multipart 上传不再整段缓冲——**大于
+`server.max_upload_bytes` 的文件字段由服务端流式写进 blob**（local 落盘 / s3 multipart，
+单文件上限 `server.blob_upload_max_bytes`，服务端内存恒定），此时 `http.file(i)` 会报错
+（文件字节不进 handler），改用 `files[i].key`（`blob.get(key)` 读全文）或 `files[i].url`
+（下载/外链地址）；**≤ `max_upload` 的小文件行为完全不变**（`http.file(i)` 照常给字节）。
+服务端代分配的 key 形如 `uploads/<时间戳>-<序号>-<安全化文件名>`。
 
 ### bus —— 订阅发布
 
@@ -2877,7 +2885,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
-| `db.stream` 仅非事务 + 核心 SqlxAccessor（v0.1.37，PR-2 Phase A） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported in Phase A`；插件后端（`oj-db-*` FFI）报 `backend does not support streaming (ABI 10 required)`——Phase A 仅 sqlite/mysql/postgres 经 `Any` 驱动真流式，插件后端须等 PR-2 Phase B（ABI 10 vtable）落地。内容等价于 `db.query` 全量，差异仅在内存形态 |
+| `db.stream` 仅非事务目标（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 SqlxAccessor（sqlite/mysql/postgres）+ 第一方插件（`oj-db-mysql`/`oj-db-postgres`，vtable 批量 pull ≤100 行/次）真流式；第三方插件未实现流式槽 → 回落 `db.query` 全量（不报错，仅失去内存优势）。内容等价于 `db.query` 全量，差异仅在内存形态 |
+| 流式取消（`signal`）为 best-effort / 插件协作式（v0.1.38） | core 后端 = 中途 drop（非真取消）；插件后端 = 批间生效（下一批返回 `{"error":"cancelled"}`）。已回调的行不回滚 |
+| `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |

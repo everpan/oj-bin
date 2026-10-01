@@ -10,7 +10,7 @@
     clippy::type_complexity
 )]
 use std::cell::RefCell;
-
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,6 +38,23 @@ pub trait BlobBackend: Send + Sync {
     async fn content_type(&self, key: &str) -> BridgeResult<Option<String>>;
     /// 下载路由直出：Some((bytes, content_type)) 或 302 Location。
     async fn serve(&self, key: &str) -> BridgeResult<BlobServed>;
+    /// ---- ABI 10 流式上传（put_stream_*；服务端流式 multipart / PUT 直传落盘）----
+    /// 开会话：返回 upload_id。不支持的后端返回 Err（宿主回落整体缓冲 put）。
+    async fn put_stream_open(&self, _key: &str, _content_type: Option<&str>) -> BridgeResult<u64> {
+        Err("blob backend does not support streaming upload (ABI 10 required)".into())
+    }
+    /// 追加一块字节。
+    async fn put_stream_chunk(&self, _upload_id: u64, _bytes: &[u8]) -> BridgeResult<()> {
+        Err("blob backend does not support streaming upload (ABI 10 required)".into())
+    }
+    /// 提交（local = 临时文件转正 + ct sidecar；s3 = complete multipart）。
+    async fn put_stream_finish(&self, _upload_id: u64) -> BridgeResult<()> {
+        Err("blob backend does not support streaming upload (ABI 10 required)".into())
+    }
+    /// 失败清理（s3 abort multipart 防 orphan parts；local 删临时文件）。幂等友好。
+    async fn put_stream_abort(&self, _upload_id: u64) -> BridgeResult<()> {
+        Err("blob backend does not support streaming upload (ABI 10 required)".into())
+    }
 }
 
 /// serve 结果：内联直出或重定向（s3 presign）。
@@ -94,6 +111,30 @@ pub struct LocalBlob {
     base_url: String,
     /// 注册名（spec §2：下载路由仅服务 "default"，非 default 的 url() 明确报错）。
     name: String,
+    /// 流式上传会话（ABI 10；upload_id → 会话）。会话体经 tokio Mutex 独占
+    /// （chunk 写盘跨 await，std MutexGuard 不可过界）；std Mutex 只护表本身。
+    uploads: std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<LocalPutSession>>>>,
+    next_upload: std::sync::atomic::AtomicU64,
+}
+
+/// LocalBlob 流式上传会话：写 `<root>/.oj-tmp-upload-{pid}-{id}`，finish rename 转正。
+/// **Drop 守卫**：finish 未跑（abort / 宿主崩溃除外——崩溃留残骸由部署清理）即删临时文件。
+struct LocalPutSession {
+    tmp: PathBuf,
+    final_path: PathBuf,
+    key: String,
+    ct: Option<String>,
+    /// Some = 仍在写入；finish/abort 时 take（LocalPutSession 实现 Drop，不能 move 出字段）。
+    file: Option<tokio::fs::File>,
+    finished: bool,
+}
+
+impl Drop for LocalPutSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 impl LocalBlob {
@@ -112,6 +153,8 @@ impl LocalBlob {
             root: root.to_path_buf(),
             base_url: base_url.trim_end_matches('/').to_string(),
             name: name.to_string(),
+            uploads: std::sync::Mutex::new(HashMap::new()),
+            next_upload: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -200,6 +243,109 @@ impl BlobBackend for LocalBlob {
             self.get(key).await?,
             self.content_type(key).await?,
         ))
+    }
+
+    /// 流式上传（ABI 10）：临时文件 append → finish rename 转正 + ct sidecar。
+    /// 临时文件名带 pid+序号防并发互踩；Drop 守卫兜底清理（finish/abort 漏调也不泄漏）。
+    async fn put_stream_open(&self, key: &str, content_type: Option<&str>) -> BridgeResult<u64> {
+        os_path(key)?;
+        let id = self
+            .next_upload
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let tmp = self
+            .root
+            .join(format!(".oj-tmp-upload-{}-{}", std::process::id(), id));
+        let file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| format!("blob put_stream_open: {e}"))?;
+        self.uploads.lock().unwrap().insert(
+            id,
+            Arc::new(tokio::sync::Mutex::new(LocalPutSession {
+                tmp: tmp.clone(),
+                final_path: self.root.join(key),
+                key: key.to_string(),
+                ct: content_type.map(str::to_string),
+                file: Some(file),
+                finished: false,
+            })),
+        );
+        Ok(id)
+    }
+
+    async fn put_stream_chunk(&self, upload_id: u64, bytes: &[u8]) -> BridgeResult<()> {
+        use tokio::io::AsyncWriteExt;
+        let s = {
+            let m = self.uploads.lock().unwrap();
+            m.get(&upload_id)
+                .cloned()
+                .ok_or_else(|| format!("blob put_stream_chunk: unknown upload {upload_id}"))?
+        };
+        let mut g = s.lock().await;
+        g.file
+            .as_mut()
+            .ok_or_else(|| format!("blob put_stream_chunk: upload {upload_id} already closed"))?
+            .write_all(bytes)
+            .await
+            .map_err(|e| format!("blob put_stream_chunk: {e}"))?;
+        Ok(())
+    }
+
+    async fn put_stream_finish(&self, upload_id: u64) -> BridgeResult<()> {
+        use tokio::io::AsyncWriteExt;
+        let s = {
+            let mut m = self.uploads.lock().unwrap();
+            m.remove(&upload_id)
+                .ok_or_else(|| format!("blob put_stream_finish: unknown upload {upload_id}"))?
+        };
+        let mut g = s.lock().await;
+        let mut file = g
+            .file
+            .take()
+            .ok_or_else(|| format!("blob put_stream_finish: upload {upload_id} already closed"))?;
+        file.flush()
+            .await
+            .map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        file.sync_all()
+            .await
+            .map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        drop(file);
+        // 目标父目录可能不存在（object_store put 自建目录；rename 不会）→ 先建。
+        if let Some(dir) = g.final_path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        }
+        std::fs::rename(&g.tmp, &g.final_path)
+            .map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        // ct sidecar：与 put() 同语义（显式给的且与推断不同才写；否则清掉旧 sidecar）。
+        let key = g.key.clone();
+        match g
+            .ct
+            .as_deref()
+            .filter(|ct| infer_content_type(&key).as_deref() != Some(*ct))
+        {
+            Some(ct) => {
+                let p = self.ct_path(&key);
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| format!("blob ct dir: {e}"))?;
+                }
+                std::fs::write(p, ct).map_err(|e| format!("blob ct write: {e}"))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(self.ct_path(&key));
+            }
+        }
+        g.finished = true; // Drop 守卫不再删（tmp 已 rename 走，此处防御语义）
+        Ok(())
+    }
+
+    async fn put_stream_abort(&self, upload_id: u64) -> BridgeResult<()> {
+        // remove 后（在途 chunk 释放 Arc 时）Drop 守卫删临时文件；未知 id 幂等成功。
+        let s = self.uploads.lock().unwrap().remove(&upload_id);
+        if let Some(s) = s {
+            let mut g = s.lock().await;
+            g.file.take(); // 先关句柄；finished 保持 false → 会话释放时 Drop 守卫删 tmp
+        }
+        Ok(())
     }
 }
 
@@ -542,6 +688,74 @@ mod tests {
         }
         // 越界 key 经 os_path 拒绝
         assert!(b.serve("../up").await.is_err());
+    }
+
+    /// ABI 10 流式上传（local）：chunk append → finish rename 转正 + ct sidecar；
+    /// abort 删临时文件；未知 upload id 明确报错；非法 key 拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_put_stream_roundtrip_abort_and_cleanup() {
+        let root = tmp_root();
+        let b = LocalBlob::new(&root, "/v1/api").unwrap();
+
+        // 非法 key：open 即拒
+        assert!(b.put_stream_open("../evil", None).await.is_err());
+
+        // 正常路径：三段 chunk → finish；显式 ct（与推断不同）落 sidecar
+        let id = b
+            .put_stream_open("up/big.bin", Some("application/x-custom"))
+            .await
+            .unwrap();
+        b.put_stream_chunk(id, b"chunk1-").await.unwrap();
+        b.put_stream_chunk(id, b"chunk2").await.unwrap();
+        b.put_stream_finish(id).await.unwrap();
+        assert_eq!(
+            b.get("up/big.bin").await.unwrap(),
+            b"chunk1-chunk2".to_vec()
+        );
+        assert_eq!(
+            b.content_type("up/big.bin").await.unwrap().as_deref(),
+            Some("application/x-custom")
+        );
+        // finish 后再 chunk → 未知 id
+        assert!(b.put_stream_chunk(id, b"x").await.is_err());
+
+        // abort 路径：临时文件被清理，最终对象不存在
+        let id2 = b.put_stream_open("up/aborted.bin", None).await.unwrap();
+        b.put_stream_chunk(id2, b"partial").await.unwrap();
+        b.put_stream_abort(id2).await.unwrap();
+        assert!(b.get("up/aborted.bin").await.is_err());
+        // 临时文件名前缀 .oj-tmp-upload- 不残留
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".oj-tmp-upload")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "abort 后临时文件必须清理: {leftovers:?}"
+        );
+
+        // 未知 id：finish/abort 明确报错（幂等友好，文案点名）
+        let e = b
+            .put_stream_finish(999)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("unknown upload"), "{e}");
+
+        // 无 ct 的流式：靠扩展名推断
+        let id3 = b.put_stream_open("up/pic.png", None).await.unwrap();
+        b.put_stream_chunk(id3, b"PNG").await.unwrap();
+        b.put_stream_finish(id3).await.unwrap();
+        assert_eq!(
+            b.content_type("up/pic.png").await.unwrap().as_deref(),
+            Some("image/png")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

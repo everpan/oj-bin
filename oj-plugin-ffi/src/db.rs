@@ -30,4 +30,18 @@ pub struct DataAccessorVtable {
     pub close: extern "C" fn(handle: u64),
     /// 工厂认领的 DSN scheme 前缀列表（如 `["mysql://"]`）；host 装配期读一次。
     pub schemes: extern "C" fn() -> RVec<RString>,
+    /// ABI 10 起：流式查询——打开游标。params = JSON 数组。
+    /// ok 值 = `{"stream_id":u64}`；**不支持流式**的后端返回 Ok(`{"unsupported":true}`)
+    /// （宿主据此回落有界 fetch_all，保 dev/test 与旧插件一致），错误走 Err。
+    pub stream_open: extern "C" fn(handle: u64, sql: RString, params: RString) -> FfiFuture,
+    /// 批量拉取（≤100 行/次，砍逐行 FFI 往返）。ok 值 = 信封 JSON：
+    /// `{"rows":[...]}`（行数组，可为空但须有键）/ `{"done":true}` / `{"error":"..."}`。
+    /// **绝不裸 null**——单列 null 行会与「结束」冲突（spec §1.4 契约）。
+    pub stream_next: extern "C" fn(handle: u64, stream_id: u64) -> FfiFuture,
+    /// 方言级取消（协作式：批间生效——置取消标志，下一次 stream_next 返回
+    /// `{"error":"cancelled"}`；是否同步杀服务端查询由插件自行决定）。
+    pub stream_cancel: extern "C" fn(handle: u64, stream_id: u64) -> FfiFuture,
+    /// 显式 reclaim 游标（完成/出错/取消后都必须调用；**勿用 cancel 兼任清理**——
+    /// 否则每 aborted 查询泄漏一个 HashMap 条目）。
+    pub stream_close: extern "C" fn(handle: u64, stream_id: u64) -> FfiFuture,
 }

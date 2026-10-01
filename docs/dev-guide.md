@@ -252,10 +252,11 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 |---|---|---|
 | `json.ok(data)` / `json.fail(code,msg,data?)` / `json.header(n,v)` / `json.raw(data)` | 信封与响应头；`raw` = 裸 JSON 200（无信封，对外标准协议端点用） | `code<=0` 映射 500；HTTP 状态 = `code` |
 | `db` / `DB(name)` | 数据访问；`db === DB("default")` | 未配置的名字返回 `undefined` |
-| `db.query / exec / table / tx` | 原始 SQL / 安全构造器 / 事务 | 标识符走白名单、值参数化；`tx` 回调式，resolve 提交 throw 回滚 |
+| `db.query / exec / stream / table / tx` | 原始 SQL / 安全构造器 / 事务 | 标识符走白名单、值参数化；`tx` 回调式，resolve 提交 throw 回滚 |
+| `db.stream(sql, params?, {onRow,signal})` | **流式查询**（v0.1.37）：逐行拉取大结果集 | 回调形态（配 `json.stream` 边收边写）或 `for await`；仅非事务目标；核心 SqlxAccessor 与第一方 db 插件（ABI 10 vtable 批量 pull）真流式，第三方未实现槽位回落全量 |
 | `http.method/params/query/headers/body/tenantId/user/files` | 只读请求上下文（懒 Proxy） | `param(name, def?)` 路径优先、query 兜底 |
 | `kv` / `redis` | KV：`get/set/del/expire/incr` | 同源同面；oj-kv-redis 真连，未配回落内存 KV |
-| `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30） |
+| `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30）；multipart 大文件流式直落 blob + `http.files[i].key/url`（v0.1.38，ABI 10 `put_stream_*`） |
 | `bus.publish/subscribe/kind` | 事件总线 | HTTP 发布、WS 订阅；`kind()` 是异步 op |
 | `es.search/index/del` | Elasticsearch 薄客户端 | `es:` 段启用，未配置报错 |
 | `fetch(url, opts?)` | 浏览器兼容 Fetch（reqwest） | 响应整体缓冲；不支持 AbortController |
@@ -450,6 +451,12 @@ Map 保证同源。
 事务（db.tx）：活跃事务存 `ReqState.tx`（`Arc<ActiveTx>`，故 ReqState 不再 Clone）。
 query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库报错 / 无 tx 走池）。
 `Bridge::finalize_tx` 在三条成功路径 checkin 前保底回滚未完结事务。
+
+流式查询（db.stream，v0.1.37）：`op_db_stream_open` 解析目标（拒绝事务）→ `DataAccessor::stream_query`
+（默认实现报"不支持，需 ABI 10"）→ 后台 pump `tokio::select!` 逐行投递到 unbounded mpsc，
+同时监听 `Arc<Notify>` 取消信号；`ReqState.db_streams` 是每请求流注册表，`reset()` 换全新
+`Arc`，跨请求不串号。JS 侧 id 惰性 resolve（open 是异步 op 返回 Promise），id 用 `f64`
+传递（op2 原生整型/`#[serde]` 序列化异常的规避，见 `src/bridge/db.rs`）。
 
 前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（租户/鉴权/blob 已接入，后续
 只加字段不改编构）。提取/守卫逻辑在 run 闭包的 async 块开头，失败走

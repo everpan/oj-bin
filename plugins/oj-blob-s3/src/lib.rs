@@ -39,8 +39,21 @@ struct S3Cfg {
 struct BlobPluginState {
     rt: tokio::runtime::Runtime,
     stores: Mutex<HashMap<u64, Arc<AmazonS3>>>,
+    /// ABI 10 流式上传会话（upload_id → 会话；会话体 tokio Mutex 独占，chunk 跨 await）。
+    uploads: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<PutStream>>>>,
     next_handle: AtomicU64,
+    next_upload: AtomicU64,
 }
+
+/// 流式上传会话：object_store MultipartUpload + ≥8 MiB 定长 part 缓冲
+/// （S3 除末块外要求 ≥5 MiB，R2 类还要求等长——定长 8 MiB 兼容两者）。
+struct PutStream {
+    upload: Box<dyn object_store::MultipartUpload>,
+    buf: Vec<u8>,
+}
+
+/// 单 part 大小（S3 下限 5 MiB；8 MiB 留出等长兼容余量）。
+const PART_SIZE: usize = 8 * 1024 * 1024;
 
 static PLUGIN: OnceLock<BlobPluginState> = OnceLock::new();
 
@@ -141,6 +154,91 @@ impl BlobPluginState {
             .map_err(|e| format!("blob s3 sign: {e}"))?
             .to_string();
         Ok(format!(r#"{{"url":{u:?}}}"#).into_bytes())
+    }
+
+    // ---- ABI 10：流式上传（multipart：每满 8 MiB 一个 part；finish 收尾 part + complete；
+    // abort 取消 multipart——S3 不清理已传 part，不 abort 会 orphan parts 烧钱）----
+
+    async fn do_put_stream_open(&self, handle: u64, key: &str) -> Result<Vec<u8>, String> {
+        let path = os_path(key)?;
+        let store = self.store(handle)?;
+        let upload = store
+            .put_multipart(&path)
+            .await
+            .map_err(|e| format!("blob put_stream_open: {e}"))?;
+        let id = self.next_upload.fetch_add(1, Ordering::SeqCst) + 1;
+        self.uploads.lock().unwrap().insert(
+            id,
+            Arc::new(tokio::sync::Mutex::new(PutStream {
+                upload,
+                buf: Vec::new(),
+            })),
+        );
+        Ok(format!(r#"{{"upload_id":{id}}}"#).into_bytes())
+    }
+
+    async fn do_put_stream_chunk(
+        &self,
+        handle: u64,
+        upload_id: u64,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let s = {
+            let m = self.uploads.lock().unwrap();
+            m.get(&upload_id)
+                .cloned()
+                .ok_or_else(|| format!("blob put_stream_chunk: unknown upload {upload_id}"))?
+        };
+        let mut g = s.lock().await;
+        g.buf.extend_from_slice(bytes);
+        // 定长出块：凑满 8 MiB 即推一个 part（剩余尾量留给后续 chunk / finish）。
+        while g.buf.len() >= PART_SIZE {
+            let chunk: Vec<u8> = g.buf.drain(..PART_SIZE).collect();
+            g.upload
+                .put_part(chunk.into())
+                .await
+                .map_err(|e| format!("blob put_stream_chunk: {e}"))?;
+        }
+        let _ = handle;
+        Ok(b"".to_vec())
+    }
+
+    async fn do_put_stream_finish(&self, handle: u64, upload_id: u64) -> Result<Vec<u8>, String> {
+        let s = {
+            let mut m = self.uploads.lock().unwrap();
+            m.remove(&upload_id)
+                .ok_or_else(|| format!("blob put_stream_finish: unknown upload {upload_id}"))?
+        };
+        let mut g = s.lock().await;
+        // 尾块（< 8 MiB）作为最后 part 推出，再 complete 使对象原子可见。
+        if !g.buf.is_empty() {
+            let rest = std::mem::take(&mut g.buf);
+            g.upload
+                .put_part(rest.into())
+                .await
+                .map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        }
+        g.upload
+            .complete()
+            .await
+            .map_err(|e| format!("blob put_stream_finish: {e}"))?;
+        let _ = handle;
+        Ok(b"".to_vec())
+    }
+
+    async fn do_put_stream_abort(&self, handle: u64, upload_id: u64) -> Result<Vec<u8>, String> {
+        let s = {
+            let mut m = self.uploads.lock().unwrap();
+            m.remove(&upload_id)
+                .ok_or_else(|| format!("blob put_stream_abort: unknown upload {upload_id}"))?
+        };
+        let mut g = s.lock().await;
+        g.upload
+            .abort()
+            .await
+            .map_err(|e| format!("blob put_stream_abort: {e}"))?;
+        let _ = handle;
+        Ok(b"".to_vec())
     }
 }
 
@@ -253,6 +351,48 @@ extern "C" fn content_type(_handle: u64, key: RString) -> FfiFuture {
     })
 }
 
+// ---- ABI 10：流式上传（open/chunk/finish/abort）----
+
+extern "C" fn put_stream_open(handle: u64, key: RString, _content_type: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_put_stream_open(handle, &key[..]).await
+        })
+    })
+}
+
+extern "C" fn put_stream_chunk(handle: u64, upload_id: u64, bytes: RBytes) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let mut b = Vec::with_capacity(bytes.len());
+        for x in &bytes {
+            b.push(*x);
+        }
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_put_stream_chunk(handle, upload_id, &b).await
+        })
+    })
+}
+
+extern "C" fn put_stream_finish(handle: u64, upload_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_put_stream_finish(handle, upload_id).await
+        })
+    })
+}
+
+extern "C" fn put_stream_abort(handle: u64, upload_id: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_put_stream_abort(handle, upload_id).await
+        })
+    })
+}
+
 extern "C" fn close(handle: u64) {
     oj_plugin_ffi::catch_void(|| {
         state().stores.lock().unwrap().remove(&handle);
@@ -268,6 +408,10 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
     upload_url,
     content_type,
     close,
+    put_stream_open,
+    put_stream_chunk,
+    put_stream_finish,
+    put_stream_abort,
 };
 
 // ---- 入口 ----
@@ -294,7 +438,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     PLUGIN.get_or_init(|| BlobPluginState {
         rt: runtime(),
         stores: Mutex::new(HashMap::new()),
+        uploads: Mutex::new(HashMap::new()),
         next_handle: AtomicU64::new(0),
+        next_upload: AtomicU64::new(0),
     });
     RResult::Ok(descriptor())
 }

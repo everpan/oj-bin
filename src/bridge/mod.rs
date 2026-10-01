@@ -1653,7 +1653,7 @@ mod tests {
                 (async () => {
                     const f = http.files[0];
                     const bts = await http.file(0);
-                    json.ok({ name: f.filename, ct: f.content_type, size: f.size, n: bts.length, b0: bts[0] });
+                    json.ok({ name: f.filename, ct: f.content_type, size: f.size, n: bts.length, b0: bts[0], key: f.key, url: f.url });
                 })().catch((e) => json.fail(500, String(e)));
                 "#,
                 RequestInfo {
@@ -1662,6 +1662,7 @@ mod tests {
                         filename: "a.png".into(),
                         content_type: Some("image/png".into()),
                         bytes: vec![1, 2, 3],
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -1671,7 +1672,10 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(
             v["data"],
-            json!({"name": "a.png", "ct": "image/png", "size": 3, "n": 3, "b0": 1}),
+            json!({
+                "name": "a.png", "ct": "image/png", "size": 3, "n": 3, "b0": 1,
+                "key": Value::Null, "url": Value::Null,
+            }),
             "{v}"
         );
         // 无文件时取越界索引 → 报错

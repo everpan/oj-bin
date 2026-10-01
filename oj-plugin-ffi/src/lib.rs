@@ -52,7 +52,11 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 /// 9 = cookie 会话 + 上传直传起（AuthGuardVtable.verify 四参化：path/method/
 ///     authorization/headers JSON——method 与任意请求头是 CSRF 双提交判定材料；
 ///     BlobBackendVtable 增 upload_url 方法，v0.1.30）。
-pub const ABI_VERSION: u32 = 9;
+/// 10 = 流式面起（DataAccessorVtable 增 stream_open/next/cancel/close 四槽——批量 pull
+///     + 信封 `{"rows":[...]}|{"done":true}|{"error":"..."}`，open 哨兵 `{"unsupported":true}`
+///     宿主回落 fetch_all；BlobBackendVtable 增 put_stream_open/chunk/finish/abort 四槽——
+///     服务端流式 multipart/PUT 直传落盘。v0.1.38）。
+pub const ABI_VERSION: u32 = 10;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(

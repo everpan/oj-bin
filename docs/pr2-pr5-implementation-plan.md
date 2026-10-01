@@ -1,5 +1,12 @@
 # PR-2 / PR-5 详细实施方案（v1 · 专家评审后修订）
 
+> **实施状态（2026-10-01，全部完成）**：
+> - ✅ **PR-2 Phase A（v0.1.37，commit 9b0da41）**：`DataAccessor::stream_query`（默认实现报 "backend does not support streaming"）+ `SqlxAccessor`（async-stream 真流式）/`InMemoryAccessor` 实现；4 个 op（open/next/close/abort）+ 每请求流注册表；JS `db.stream`（onRow 回调 + for-await + AbortSignal）。与本文设计的偏差：取消不走 Rust 侧 AbortSignal（deno_core 0.411 无该类型/op2 无 `#[signal]`），改由 JS `addEventListener('abort')` 调 `op_db_stream_abort` + pump `Arc<Notify>`；交付不直写 PR-1 通道，按 Design B 由 JS 拉行（回调内自行 `json.stream` 写帧）。真库回归用例（OJ_TEST_PG/OJ_TEST_MYSQL）双库通过。
+> - ✅ **PR-5 Phase A（v0.1.37）**：`blob.uploadUrl` 直传（场景 13）文档覆盖，零代码。
+> - ✅ **PR-2 Phase B（v0.1.38，ABI 10）**：`DataAccessorVtable` 增 `stream_open/next/cancel/close`（批量 pull ≤100 行 + 信封 `{"rows"}|{"done"}|{"error"}`）；`oj-db-mysql`/`oj-db-postgres` 游标化实现；`{"unsupported":true}` 哨兵 → 宿主回落 `db.query` 全量（评审推荐采纳）；abort 由 Drop 守卫 fire-and-forget `cancel+close`（无游标泄漏）。**登记偏差**：取消为协作式（批间生效）——sqlx `Any` 驱动拿不到方言级 CancelToken，「PG CancelToken / MySQL KILL QUERY 真取消」未实现；`stream_next` 返回 `Result`（vtable 错误臂）而非仅信封。
+> - ✅ **PR-5 Phase B（v0.1.38，ABI 10）**：`BlobBackendVtable` 增 `put_stream_open/chunk/finish/abort`；进程内 `BlobBackend` trait + `LocalBlob`（临时文件 + Drop 守卫 + rename 转正 + ct sidecar）+ `FfiBlobBackend` 适配 + `oj-blob-s3` multipart（8 MiB 定长 part，abort 取消防 orphan parts）；server 流式 multipart（multer 流式解析、文本字段缓冲 ≤ max_upload、小文件 ≤ max_upload 缓冲保持 `http.file(i)` 兼容、大文件转流式落 blob 上限 `blob_upload_max`、总闸 = 两者之和）；blob PUT 直传腿流式化（open Err 回落缓冲）；`http.files[i].key/url` additive 新增、`http.file(i)` 对流式文件明确报错（未做「缓冲至首个文件字段」的特殊化——文本字段全量缓冲语义等价）。
+> - ✅ **ABI 10 单次发布**：三插件锁步重建；门禁（fmt/clippy -D warnings/全 workspace 测试含真库/xtask smoke）。
+
 > 状态：v1 —— 已吸收架构师 / 工程师 / 产品三方评审意见。
 > v0 评审共识：**单次 `ABI 9→10` 是强制结果（无温和过渡）**；两 PR 各拆为「Phase A 无 ABI 速赢 + Phase B 并入 ABI 10」；跨 FFI 用**批量 pull + 信封**；取消语义 core 仅 best-effort、真取消 plugin-only。
 > 代码锚点已在 v0 核对，本版仅据评审调整设计。

@@ -558,6 +558,7 @@ handler 里能直接用的全局都在这张表里。查 API 签名时翻这节�
 | `blob.contentType(key)` | 对象 Content-Type（local 读 sidecar / 按扩展名推断；s3 = null） |
 | `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
 | `db.exec(sql, params?)` | 参数化执行 → Promise |
+| `db.stream(sql, params?, {onRow,signal}?)` | 流式查询（v0.1.37）：逐行拉取大结果集 → `onRow` 回调（Promise）或 `for await` 迭代器；仅非事务目标，详见 `docs/devkit/api-manual.md` |
 | `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
 | `db.tx(async (tx) => { … })` | 事务：回调 resolve 提交 / throw 回滚再抛；`tx.table(...)` 与 `db` 同签名、同连接（构造器与租户防护在事务内同样生效） |
 | `DB(name)` | 命名库实例（`db === DB("default")`） |
