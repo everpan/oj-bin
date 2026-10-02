@@ -19,14 +19,17 @@ export default {
     const tokens = await issueTokens(String(row.id), roles);
     // oj-4 cookie 会话形态（oj-auth cfg cookie.enabled 时守卫侧生效）：
     // HttpOnly 的 session cookie（值 = 与 Bearer 同 secret 的 access JWT）+
-    // CSRF 双提交 token。响应头放不下第二个 Set-Cookie（Capture.headers 单值），
-    // csrf 经 body 下发、由前端写 document.cookie（双提交要求 JS 可读）。
+    // CSRF 双提交 cookie 同响应双发（v0.1.46 json.header 同名头可重复，Set-Cookie
+    // 合法落多个值；oj_csrf 非 HttpOnly——双提交要 JS 读得到）。
     const maxAge = 86400; // 与 oj-auth cookie.ttl_secs 默认对齐
     json.header(
       "Set-Cookie",
       `oj_sess=${tokens.access_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
     );
-    const csrf = crypto.randomHex(16);
-    json.ok({ ...tokens, csrf_token: csrf });
+    json.header(
+      "Set-Cookie",
+      `oj_csrf=${crypto.randomHex(16)}; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
+    );
+    json.ok(tokens);
   },
 };

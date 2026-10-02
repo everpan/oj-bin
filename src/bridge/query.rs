@@ -1620,7 +1620,7 @@ pub async fn op_db_query_build(
             .borrow_mut()
             .borrow_mut::<super::ReqState>()
             .headers
-            .insert("X-OJ-Row-Limit".into(), a.to_string());
+            .push(("X-OJ-Row-Limit".into(), a.to_string()));
     }
     out
 }
@@ -1919,10 +1919,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(3)), "{v}");
-        assert_eq!(
-            cap.headers.get("X-OJ-Row-Limit").map(|s| s.as_str()),
-            Some("3")
-        );
+        assert_eq!(cap.header("X-OJ-Row-Limit"), Some("3"));
         // 显式 limit 被 clamp 到 max_limit=5 也写头（旧版这类截断完全静默）
         let cap = b
             .run(
@@ -1933,10 +1930,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["n"], json!(5), "{v}");
-        assert_eq!(
-            cap.headers.get("X-OJ-Row-Limit").map(|s| s.as_str()),
-            Some("5")
-        );
+        assert_eq!(cap.header("X-OJ-Row-Limit"), Some("5"));
         // 行数 < 生效上限 ⇒ 不可能被截断，不写头（避免噪音）
         let cap = b
             .run(
@@ -1947,7 +1941,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["n"], json!(1), "{v}");
-        assert!(!cap.headers.contains_key("X-OJ-Row-Limit"), "{cap:?}");
+        assert!(cap.header("X-OJ-Row-Limit").is_none(), "{cap:?}");
         // toSQL 与执行同款归一化（诊断口径一致）
         // LIMIT/OFFSET 是绑定参数（sea-query 渲染为 `LIMIT ?`），故断言参数而非文本。
         let cap = b

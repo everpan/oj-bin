@@ -686,7 +686,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 |---|---|---|
 | `json.ok` | `ok(data?: unknown): void` | 成功信封 `{code:0,msg:"ok",data}`，HTTP 200 |
 | `json.fail` | `fail(code: number, msg: string, data?: unknown): void` | 失败信封，HTTP 状态 = `code`（`code<=0` 映射 500） |
-| `json.header` | `header(name: string, value: string): void` | 设置响应头（同名后写覆盖） |
+| `json.header` | `header(name: string, value: string): void` | 追加响应头（v0.1.46）：同名可重复——`Set-Cookie` 双发（登录端点同响应下发 `oj_sess` + `oj_csrf`）合法落多个值；其余头同名最后一个生效 |
 | `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
 | `json.redirect` | `redirect(url: string, code?: number): void` | **3xx 重定向原语**（v0.1.26）：`Location` + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 非 3xx **回落 302**（杜绝「200 + Location」畸形响应）；空 url 忽略 `Location`。具名封装：`movedPermanently`(301) / `found`(302) / `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) / `permanentRedirect`(308，永久 + 方法保持)。典型：302 到 `blob.url()` 预签名 URL（`scenarios.md` 场景 8） |
 | `json.stream` | `stream(opts?: { status?: number; contentType?: string }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 入参 string/ArrayBuffer/ArrayBufferView/TypedArray |
@@ -1932,7 +1932,12 @@ auth:
 判定序（守卫内）：匿名路径 → Bearer → cookie 会话 → 统一 401
 （`missing or invalid bearer token`，不泄露哪条路失败）。cookie 会话的 cookie 值是
 **同 `jwt_secret` 签的 JWT**（签发是登录端点的职责：`json.header` 写
-`Set-Cookie: oj_sess=<jwt>; HttpOnly; SameSite=Lax; Path=/`，sample 有参考实现）；
+`Set-Cookie: oj_sess=<jwt>; HttpOnly; SameSite=Lax; Path=/`，sample 有参考实现）。
+**`oj_csrf` 与 `oj_sess` 同响应双发**（v0.1.46 起 `json.header` 同名头可重复，
+`Set-Cookie` 合法落多个值；此前响应头单值，csrf 只能经 body 下发再由 JS 写
+`document.cookie`——sample 旧 workaround 已废）：登录端点第二个 `json.header`
+写 `Set-Cookie: oj_csrf=<随机>; SameSite=Lax; Path=/`（**非 HttpOnly**——JS 要读）；
+登出端点把两个 cookie 都以 `Max-Age=0` 清掉；
 **非安全方法**（非 GET/HEAD/OPTIONS）再叠 CSRF 双提交：`csrf_header` 值必须等于
 `csrf_cookie` 值，否则 401 `missing or invalid csrf token`（Bearer 命中的请求不查）。
 浏览器 WS 握手自动带 Cookie——cookie 形态是 WS 鉴权的主通道（WS 升级过同一守卫，

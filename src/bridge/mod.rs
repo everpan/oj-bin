@@ -249,7 +249,8 @@ pub struct ReqState {
     pub req: RequestInfo,
     pub response: Option<Vec<u8>>,
     pub status: u16,
-    pub headers: HashMap<String, String>,
+    /// 响应头（有序、可重名——Set-Cookie 合法重复；写回时按名去重语义见 server capture_response）。
+    pub headers: Vec<(String, String)>,
     pub done: bool,
     /// 活跃事务（db.tx；每请求至多一个，reset 时丢弃 = drop 自带回滚）。
     pub tx: Option<Arc<db::ActiveTx>>,
@@ -573,9 +574,22 @@ fn op_finish(state: &mut OpState) {
 #[derive(Default, Debug)]
 pub struct Capture {
     pub status: u16,
-    pub headers: HashMap<String, String>,
+    /// 响应头（有序、可重名；Set-Cookie 依赖多值同存，json.header 追加写入）。
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub stream: Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>,
+}
+
+impl Capture {
+    /// 按名取**最后一个**值（与旧 HashMap 覆盖写语义一致：同名后写覆盖先写的读取结果）。
+    /// 大小写敏感（HTTP 头名语义本大小写不敏感，旧实现即敏感，保持不变）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Bridge：持有 runtime 池、handler 仓库，并执行 handler 脚本。
@@ -1124,8 +1138,7 @@ impl Bridge {
         };
         if let Some(msg) = violation {
             let (body, status) = envelope::fail(400, &msg, &serde_json::Value::Null);
-            let mut headers = HashMap::new();
-            headers.insert("content-type".to_string(), "application/json".to_string());
+            let headers = vec![("content-type".to_string(), "application/json".to_string())];
             return Ok(Capture {
                 status,
                 headers,
@@ -1516,8 +1529,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(cap.status, 200);
-        assert_eq!(cap.headers.get("X-Handler").unwrap(), "test");
-        assert_eq!(cap.headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(cap.header("X-Handler").unwrap(), "test");
+        assert_eq!(cap.header("content-type").unwrap(), "application/json");
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(
             v,
@@ -1536,10 +1549,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            cap.headers.get("Content-Type").unwrap(),
+            cap.header("Content-Type").unwrap(),
             "application/problem+json"
         );
-        assert!(!cap.headers.contains_key("content-type"));
+        assert!(cap.header("content-type").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

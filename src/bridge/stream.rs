@@ -39,10 +39,10 @@ pub fn op_json_stream_open(state: &mut OpState, #[serde] opts: Option<Value>) {
     let rs = state.borrow_mut::<ReqState>();
     rs.status = status;
     if let Some(ct) = content_type {
-        rs.headers.insert("content-type".into(), ct);
+        rs.headers.push(("content-type".into(), ct));
     } else if sse {
         rs.headers
-            .insert("content-type".into(), "text/event-stream".into());
+            .push(("content-type".into(), "text/event-stream".into()));
     }
     rs.stream_tx.borrow_mut().replace(tx);
     rs.stream_rx.borrow_mut().replace(rx);
@@ -125,7 +125,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cap.status, 200);
-        assert_eq!(cap.headers.get("content-type").unwrap(), "text/csv");
+        assert_eq!(cap.header("content-type").unwrap(), "text/csv");
         // 缓冲字段在流式路径不使用。
         assert!(cap.body.is_empty());
         let rx = cap.stream.expect("stream should be open");
@@ -150,10 +150,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            cap.headers.get("content-type").unwrap(),
-            "text/event-stream"
-        );
+        assert_eq!(cap.header("content-type").unwrap(), "text/event-stream");
         let rx = cap.stream.expect("stream should be open");
         let got = collect(rx).await;
         // 两个 SSE 帧：data: hello\n\n + data: world\n\n（心跳 15s 不在测试中触发）。

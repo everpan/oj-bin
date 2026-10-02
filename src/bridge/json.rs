@@ -8,11 +8,11 @@ use super::{ReqState, envelope};
 fn ensure_json_content_type(s: &mut ReqState) {
     if !s
         .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-type"))
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
     {
         s.headers
-            .insert("content-type".into(), "application/json".into());
+            .push(("content-type".into(), "application/json".into()));
     }
 }
 
@@ -48,13 +48,15 @@ pub fn op_json_fail(
     s.done = true;
 }
 
-/// json.header(name, value)：设置返回头（覆盖语义：同名后写覆盖先写），空名忽略。
+/// json.header(name, value)：追加返回头（有序、同名可重复），空名忽略。
+/// 同名头写回时：Set-Cookie 合法重复（登录端点双发 oj_sess + oj_csrf 的唯一通道，
+/// CSRF 双提交依赖它）；其余头最后一个生效（与旧覆盖写读取语义一致）。
 #[op2(fast)]
 pub fn op_json_header(state: &mut OpState, #[string] name: String, #[string] value: String) {
     if name.is_empty() {
         return;
     }
-    state.borrow_mut::<ReqState>().headers.insert(name, value);
+    state.borrow_mut::<ReqState>().headers.push((name, value));
 }
 
 /// 3xx reason phrase（RFC 9110 §15.4；未列出的 3xx 用通名）。
@@ -102,14 +104,14 @@ pub fn op_json_redirect(state: &mut OpState, #[string] url: String, code: i32) {
     s.status = status;
     if !s
         .headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("content-type"))
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
     {
         s.headers
-            .insert("content-type".into(), "text/html; charset=utf-8".into());
+            .push(("content-type".into(), "text/html; charset=utf-8".into()));
     }
     if !url.is_empty() {
-        s.headers.insert("location".into(), url);
+        s.headers.push(("location".into(), url));
     }
     s.done = true;
 }
@@ -146,10 +148,39 @@ mod tests {
             .unwrap();
         assert_eq!(cap.status, 200);
         // 未显式 json.header 时默认补 content-type（同 ok/fail 语义）。
-        assert_eq!(cap.headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(cap.header("content-type").unwrap(), "application/json");
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["bare"], true);
         assert!(v.get("code").is_none());
+    }
+
+    /// 同名头多值（v0.1.46）：json.header 追加写——Set-Cookie 可双发（oj_sess + oj_csrf，
+    /// CSRF 双提交的签发通道）；非 cookie 同名头读取取最后一个（旧覆盖写语义不变）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_header_multi_value_set_cookie_and_last_wins() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let cap = b
+            .run_with(
+                r#"json.header("Set-Cookie", "oj_sess=a; HttpOnly");
+                   json.header("Set-Cookie", "oj_csrf=t; SameSite=Lax");
+                   json.header("X-Dup", "one");
+                   json.header("X-Dup", "two");
+                   json.ok({ ok: true });"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let cookies: Vec<&str> = cap
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "Set-Cookie")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(cookies, ["oj_sess=a; HttpOnly", "oj_csrf=t; SameSite=Lax"]);
+        assert_eq!(cap.header("X-Dup").unwrap(), "two");
     }
 
     /// BigInt 容忍面（v0.1.22）：信封/裸 JSON 里的 BigInt 一律序列化为十进制字符串。
@@ -226,11 +257,11 @@ mod tests {
             .unwrap();
         assert_eq!(cap.status, 302);
         assert_eq!(
-            cap.headers.get("location").unwrap(),
+            cap.header("location").unwrap(),
             "https://example.com/x?a=1&b=2"
         );
         assert_eq!(
-            cap.headers.get("content-type").unwrap(),
+            cap.header("content-type").unwrap(),
             "text/html; charset=utf-8"
         );
         let body = String::from_utf8(cap.body).unwrap();
@@ -284,10 +315,7 @@ mod tests {
             let src = format!("{call};");
             let cap = b.run(&src).await.unwrap();
             assert_eq!(cap.status, want, "{call}");
-            assert_eq!(
-                cap.headers.get("location").unwrap(),
-                "https://example.com/named"
-            );
+            assert_eq!(cap.header("location").unwrap(), "https://example.com/named");
             assert!(
                 String::from_utf8(cap.body).unwrap().contains(reason),
                 "{call}"
@@ -321,7 +349,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(cap.headers.get("Content-Type").unwrap(), "application/jwt");
-        assert!(!cap.headers.contains_key("content-type"));
+        assert_eq!(cap.header("Content-Type").unwrap(), "application/jwt");
+        assert!(cap.header("content-type").is_none());
     }
 }

@@ -16,6 +16,21 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）—— 同名响应头多值：`json.header` 追加语义 + `Set-Cookie` 双发（CSRF 双提交闭环）
+
+**动机**：cookie 会话（v0.1.30）的 CSRF 双提交此前是**半成品**——守卫验「csrf cookie == csrf 头」，
+但 `Capture.headers` 单值（`HashMap<String,String>`），登录端点一个响应放不下第二个
+`Set-Cookie`，`oj_csrf` 只能经 body 下发再由前端 JS 写 `document.cookie`（sample 的
+workaround）。框架层补好多值通道，双提交两枚 cookie 都由服务端签发。
+
+- **`json.header` 追加语义**（行为变更，兼容）：同名头可重复写入有序保留；写回 HTTP 时
+  `Set-Cookie` 追加（合法重复，登录双发 `oj_sess` + `oj_csrf` 的唯一通道），其余头同名
+  最后一个生效（与旧覆盖写读取语义一致）。`ReqState.headers` / `Capture.headers` 改
+  `Vec<(String,String)>`；响应头每请求个位数条，线性扫无性能问题，不上索引。
+- **sample 登录/登出改写**：登录同响应双发 `oj_sess`（HttpOnly）+ `oj_csrf`（JS 可读），
+  删掉 body-csrf workaround；登出两枚 cookie 一并 `Max-Age=0` 清掉。
+- **devkit 对齐**：`api-manual.md` json.header 签名表 + §8 cookie 会话段（双发职责与写法）。
+
 ## v0.1.45 —— 发版文档收尾 + `contract.rs` 格式化
 
 v0.1.44 已交付 PR-6 4b 全部功能，但发版自查（devkit 四件逐条对齐 + fmt 门禁）遗留若干收尾，本版本补齐。无功能/行为变更，无新增用户可见 API。
