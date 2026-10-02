@@ -428,9 +428,21 @@ mod tests {
     use server::routes::RouteTable;
     use std::path::PathBuf;
 
+    /// 每调用一个**独立**临时目录。用例并行跑时不能共用同一路径——构造函数的
+    /// `remove_dir_all` 会把并行用例的 `create_dir_all` 打断（曾让
+    /// `check_detects_no_drift_and_drift` 偶发 panic）。
+    fn unique_tmp(prefix: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
     /// 合成路由表（免 V8）：把若干 api 文件写盘，用假内省闭包喂声明。
     fn synthetic_table() -> (std::path::PathBuf, RouteTable) {
-        let dir = std::env::temp_dir().join(format!("oj-oa-syn-{}", std::process::id()));
+        let dir = unique_tmp("oj-oa-syn");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("user/account")).unwrap();
         std::fs::create_dir_all(dir.join("catch")).unwrap();
@@ -538,7 +550,7 @@ mod tests {
         // 篡改 committed 文件后应检出漂移（1）。直接打 emit_or_check，绕开 config 解析。
         let (_d, table) = synthetic_table();
         let spec = generate(&table, "/v1/api").unwrap();
-        let dir = std::env::temp_dir().join(format!("oj-oa-rt-{}", std::process::id()));
+        let dir = unique_tmp("oj-oa-rt");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("openapi.json");
@@ -564,6 +576,17 @@ mod tests {
         );
     }
 
+    /// 防回归：并行用例各自建表时**必须拿到不同临时目录**——曾共用 `oj-oa-syn-<pid>`，
+    /// 并行跑时构造函数的 `remove_dir_all` 会打断另一用例的 `create_dir_all`（偶发 panic）。
+    #[test]
+    fn synthetic_tables_use_distinct_temp_dirs() {
+        let (a, _) = synthetic_table();
+        let (b, _) = synthetic_table();
+        assert_ne!(a, b, "两次建表不能共用临时目录（并行会互踩）");
+        assert!(a.join("user/account/api.ts").is_file());
+        assert!(b.join("user/account/api.ts").is_file());
+    }
+
     /// 由带契约的 RouteEntry 建表：契约经 `from_entries` 落进 RouteRow.schema。
     fn table_with_contract(
         method: &str,
@@ -571,7 +594,7 @@ mod tests {
         file: &str,
         schema: Value,
     ) -> (PathBuf, RouteTable) {
-        let dir = std::env::temp_dir().join(format!("oj-oa-ct-{}", std::process::id()));
+        let dir = unique_tmp("oj-oa-ct");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let entries = vec![server::routes::RouteEntry {
@@ -666,7 +689,7 @@ mod tests {
     #[test]
     fn without_contract_path_params_fall_back_to_pattern() {
         // 未声明契约：保持 v0.1.43 行为（pattern 推导 + type: string）。
-        let dir = std::env::temp_dir().join(format!("oj-oa-nb-{}", std::process::id()));
+        let dir = unique_tmp("oj-oa-nb");
         let (t, fail) = RouteTable::from_entries(
             &dir,
             &[server::routes::RouteEntry {
@@ -703,7 +726,7 @@ mod tests {
                 schema: None,
             },
         ];
-        let dir = std::env::temp_dir().join(format!("oj-oa-rel-{}", std::process::id()));
+        let dir = unique_tmp("oj-oa-rel");
         let (t, fail) = RouteTable::from_entries(&dir, &entries);
         assert!(fail.is_empty(), "release entries 不应有 failures: {fail:?}");
         let spec = generate(&t, "/v1/api").unwrap();
