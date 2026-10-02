@@ -1483,7 +1483,13 @@ fn capture_response(cap: only_js::bridge::Capture) -> Response {
             k.parse::<axum::http::HeaderName>(),
             v.parse::<axum::http::HeaderValue>(),
         ) {
-            r.headers_mut().insert(name, hv);
+            // Set-Cookie 合法重复（登录双发 oj_sess + oj_csrf 的唯一通道）→ 追加；
+            // 其余头保持旧覆盖写语义（同名最后一个生效）。
+            if name == axum::http::header::SET_COOKIE {
+                r.headers_mut().append(name, hv);
+            } else {
+                r.headers_mut().insert(name, hv);
+            }
         }
     }
     r
@@ -1947,6 +1953,36 @@ pub(crate) mod tests {
             certificate_valid_until: Arc::new(RwLock::new(None)),
             plugins: Arc::default(),
         }
+    }
+
+    /// capture_response 写回（同名头多值，v0.1.46）：Set-Cookie 追加（双发 oj_sess +
+    /// oj_csrf 的唯一通道，防回归）；非 cookie 同名头保持覆盖写（最后一个生效）。
+    #[test]
+    fn capture_response_set_cookie_appends_others_last_wins() {
+        let cap = only_js::bridge::Capture {
+            status: 200,
+            headers: vec![
+                ("Set-Cookie".to_string(), "oj_sess=a; HttpOnly".to_string()),
+                (
+                    "Set-Cookie".to_string(),
+                    "oj_csrf=t; SameSite=Lax".to_string(),
+                ),
+                ("X-Dup".to_string(), "one".to_string()),
+                ("X-Dup".to_string(), "two".to_string()),
+            ],
+            body: b"{\"code\":0}".to_vec(),
+            stream: None,
+        };
+        let r = capture_response(cap);
+        let cookies: Vec<_> = r
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["oj_sess=a; HttpOnly", "oj_csrf=t; SameSite=Lax"]);
+        assert_eq!(r.headers()["X-Dup"], "two");
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
     }
 
     pub(crate) struct TempRoutes(pub(crate) PathBuf);
