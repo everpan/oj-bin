@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）—— 同名响应头多值：`json.header` 追加语义 + `Set-Cookie` 双发（CSRF 双提交闭环）
+## v0.1.46 —— 同名响应头多值：`json.header` 追加语义 + `Set-Cookie` 双发（CSRF 双提交闭环，未打标签）
 
 **动机**：cookie 会话（v0.1.30）的 CSRF 双提交此前是**半成品**——守卫验「csrf cookie == csrf 头」，
 但 `Capture.headers` 单值（`HashMap<String,String>`），登录端点一个响应放不下第二个
