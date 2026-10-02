@@ -16,6 +16,16 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.48 —— 测试稳定：`oj openapi` 用例临时目录不再互踩（无功能/行为变更）
+
+- **临时目录不再互踩**（v0.1.47 后修复，纯测试基建，无用户可见变更）：
+  `oj/src/openapi_cmd.rs` 的 `synthetic_table` / `table_with_contract` 与两处独立用例都按
+  **进程 pid** 拼临时目录（`oj-oa-syn-<pid>` 等），同进程内并行跑时一方的
+  `remove_dir_all` 会打断另一方的 `create_dir_all` —— 表现为
+  `check_detects_no_drift_and_drift` 偶发 panic（单跑必过、全量跑时随机红）。改为
+  `unique_tmp(prefix)`（pid + 原子序号，每调用一个目录），并补防回归用例
+  `synthetic_tables_use_distinct_temp_dirs`。
+
 ## v0.1.47 —— blob 服务端搬运与区间读：`blob.copy` / `blob.move` / `blob.readRange`（ABI 11）
 
 **动机**：大文件（v0.1.38 起流式直落 blob）在 **JS 侧收尾**时代价全在桥上——把临时对象
