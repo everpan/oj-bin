@@ -226,6 +226,64 @@ impl BlobPluginState {
         Ok(b"".to_vec())
     }
 
+    // ---- ABI 11：服务端搬运 + 区间读（字节均不过 V8）----
+
+    /// 服务端复制（CopyObject）：**src 保留**。`src == dst` 为 no-op。
+    async fn do_copy(&self, handle: u64, src: &str, dst: &str) -> Result<Vec<u8>, String> {
+        if src == dst {
+            return Ok(b"".to_vec());
+        }
+        let from = os_path(src)?;
+        let to = os_path(dst)?;
+        self.store(handle)?
+            .copy(&from, &to)
+            .await
+            .map_err(|e| format!("blob copy: {e}"))?;
+        Ok(b"".to_vec())
+    }
+
+    /// 服务端搬移（object_store rename = copy + delete）：**src 不再存在**。
+    async fn do_move(&self, handle: u64, src: &str, dst: &str) -> Result<Vec<u8>, String> {
+        if src == dst {
+            return Ok(b"".to_vec());
+        }
+        let from = os_path(src)?;
+        let to = os_path(dst)?;
+        self.store(handle)?
+            .rename(&from, &to)
+            .await
+            .map_err(|e| format!("blob move: {e}"))?;
+        Ok(b"".to_vec())
+    }
+
+    /// 区间读：先 head 取 size 再 `get_range`——S3 对越界区间返回 416，故在插件侧先截断
+    ///（契约要求短读截断，不能把 416 抛给 JS）。offset 过尾 → 空字节。
+    async fn do_read_range(
+        &self,
+        handle: u64,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, String> {
+        let path = os_path(key)?;
+        let store = self.store(handle)?;
+        let size = store
+            .head(&path)
+            .await
+            .map_err(|e| format!("blob readRange: {e}"))?
+            .size as u64;
+        let start = offset.min(size) as usize;
+        let end = offset.saturating_add(len).min(size) as usize;
+        if end <= start {
+            return Ok(b"".to_vec());
+        }
+        Ok(store
+            .get_range(&path, start..end)
+            .await
+            .map_err(|e| format!("blob readRange: {e}"))?
+            .to_vec())
+    }
+
     async fn do_put_stream_abort(&self, handle: u64, upload_id: u64) -> Result<Vec<u8>, String> {
         let s = {
             let mut m = self.uploads.lock().unwrap();
@@ -393,6 +451,35 @@ extern "C" fn put_stream_abort(handle: u64, upload_id: u64) -> FfiFuture {
     })
 }
 
+// ---- ABI 11：服务端搬运 + 区间读 ----
+
+extern "C" fn copy(handle: u64, src: RString, dst: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_copy(handle, &src[..], &dst[..]).await
+        })
+    })
+}
+
+extern "C" fn move_to(handle: u64, src: RString, dst: RString) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_move(handle, &src[..], &dst[..]).await
+        })
+    })
+}
+
+extern "C" fn read_range(handle: u64, key: RString, offset: u64, len: u64) -> FfiFuture {
+    oj_plugin_ffi::catch_future(|| {
+        let st = state();
+        oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
+            st.do_read_range(handle, &key[..], offset, len).await
+        })
+    })
+}
+
 extern "C" fn close(handle: u64) {
     oj_plugin_ffi::catch_void(|| {
         state().stores.lock().unwrap().remove(&handle);
@@ -412,6 +499,9 @@ static VTABLE: BlobBackendVtable = BlobBackendVtable {
     put_stream_chunk,
     put_stream_finish,
     put_stream_abort,
+    copy,
+    move_to,
+    read_range,
 };
 
 // ---- 入口 ----

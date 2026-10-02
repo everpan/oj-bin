@@ -19,7 +19,7 @@
 
 - 契约：`oj-plugin-ffi` 的 `LdapVtable { call(req_json) -> FfiFuture }`（repr(C)，mail 式单入口
   JSON 分派——加操作不改 vtable 形状）。
-- **新增轴零 ABI 变更**：`AXES` 加 `"ldap"` 不 bump `ABI_VERSION`（当前 8），既有插件无需重编。
+- **新增轴零 ABI 变更**：`AXES` 加 `"ldap"` 不 bump `ABI_VERSION`（当前 11），既有插件无需重编。
 - **连接模型（ponytail）**：**不做连接池**——每次调用独立成连。`bind(dn,pw)` 用户鉴证本就要求
   凭据不落到共享连接上；search 的服务账号绑定在 AD/LAN 上是毫秒级开销。热路径真有压力时的
   升级路径是 `ldap3::pool`（契约不变，插件内部实现）。

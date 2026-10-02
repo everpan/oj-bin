@@ -248,6 +248,13 @@ interface BlobApi {
   uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>;
   // local 缺失 sidecar 且无法按扩展名推断时返回空串；s3 无 Content-Type 时返回 null。
   contentType(key: string): Promise<string | null>;
+  // 服务端复制（v0.1.47，ABI 11）：src 保留。字节不进 JS——大文件搬运别用 get + put。
+  copy(src: string, dst: string): Promise<boolean>;
+  // 服务端搬移（v0.1.47，ABI 11）：src 不再存在（local 同目录 rename / s3 CopyObject+Delete）。
+  move(src: string, dst: string): Promise<boolean>;
+  // 区间读（v0.1.47，ABI 11）：短读截断——越尾只给实际剩余字节，offset 过尾给空数组；
+  // offset / len 为负、小数、NaN 即报错。
+  readRange(key: string, offset: number, len: number): Promise<Uint8Array>;
 }
 
 // bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；

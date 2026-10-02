@@ -659,7 +659,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `DB(name)` | 命名库实例（未配置的名字返回 `undefined`） |
 | `kv.get/set/del/expire/incr` | KV 存储（配 `redis.default` → 真 Redis，否则进程内存 KV） |
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
-| `blob.put/get/del/url/contentType`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用） |
+| `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -1136,6 +1136,9 @@ auth 会话也在同一 Redis（多实例共享的前提）；未配置时均为
 | `blob.url` | `url(key: string): Promise<string>` | 下载地址：local = `{base}/blob/{key}`；s3 = presigned URL（15min） |
 | `blob.uploadUrl` | `uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>` | 上传直传预签名（v0.1.30）：s3 后端返回 15min 预签名 PUT URL，客户端直传**不经 handler**（绕开 `max_upload_bytes`/30s）；`opts` 缺省 `{"kind":"put"}`，multipart 形态暂返回 Err。local 后端无预签名——报 `local blob backend has no upload presign; use the direct PUT upload route`，改用直传路由 |
 | `blob.contentType` | `contentType(key: string): Promise<string \| null>` | Content-Type（local 读 sidecar / 按扩展名推断；缺失且无法推断返回空串；s3 无 Content-Type 返回 `null`） |
+| `blob.copy` | `copy(src: string, dst: string): Promise<boolean>` | **服务端复制（v0.1.47，ABI 11）：src 保留**。local = `fs::copy`；s3 = CopyObject。**字节不进 V8**——大文件搬运的替代写法（不要 `get` + `put`）。`src == dst` 为 no-op；src 不存在报错 |
+| `blob.move` | `move(src: string, dst: string): Promise<boolean>` | **服务端搬移（v0.1.47，ABI 11）：src 不再存在**。local 同父目录 = `fs::rename`（原子、零字节），跨目录 = copy + unlink；s3 = CopyObject + DeleteObject。`src == dst` 为 no-op |
+| `blob.readRange` | `readRange(key: string, offset: number, len: number): Promise<Uint8Array>` | **区间读（v0.1.47，ABI 11）：短读截断**——`offset + len` 越过对象尾部只返回实际可读字节（可能短于 `len`），`offset` 已过尾部返回**空数组**；key 不存在报错；`offset`/`len` 为负 / 非整数 / NaN 报错（`blob readRange: offset must be a non-negative integer`）。后端不支持区间读时宿主回落 `get` 全量再切片（local/s3 均原生支持） |
 
 **上传四件套完整例子**（摘自 `sample/src/upload/api.ts`）：
 
@@ -1171,6 +1174,25 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 （文件字节不进 handler），改用 `files[i].key`（`blob.get(key)` 读全文）或 `files[i].url`
 （下载/外链地址）；**≤ `max_upload` 的小文件行为完全不变**（`http.file(i)` 照常给字节）。
 服务端代分配的 key 形如 `uploads/<时间戳>-<序号>-<安全化文件名>`。
+
+**服务端搬运与区间读（v0.1.47，ABI 11）**：大文件的三件事不该让字节进 V8——
+
+```ts
+// ① 搬运：流式落盘的临时对象转正（不要 blob.get + blob.put，那是 2× 峰值）
+await blob.move(file.key, `docs/${id}/${file.filename}`);
+// ② 复制：src 保留（快照/多版本场景）
+await blob.copy(src, dst);
+// ③ 区间读：嗅探 / 魔数判定只读前 4KB，不必 get 全文
+const head = await blob.readRange(key, 0, 4096);
+```
+
+- `copy` / `move` 由后端服务端完成（local：`fs::copy` / 同目录 `fs::rename`；s3：CopyObject
+  / CopyObject+DeleteObject）；`move` 后 **src 不再存在**，`copy` 后 src 保留。
+- `readRange` 是**短读截断**语义：越尾只读到实际末尾，`offset` 过尾返回空数组——先判空
+  再按 `head.length` 定分支，不要假设一定拿满 `len`。
+- 后端不支持这三件事时宿主回落（`copy` → `get`+`put`、`readRange` → `get` 全量切片），
+  即 JS 侧永不因后端能力失败，但回落**字节进 V8**——local/s3 均原生支持，回落只是保险。
+- `src == dst` 是 no-op（`fs::copy` 同文件语义未定义，会截断文件，故显式挡掉）。
 
 ### bus —— 订阅发布
 
@@ -2985,6 +3007,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `oj exec` 无执行超时 / KillSwitch（v0.1.29） | 手工 runtime 不过 RuntimePool：同步死循环（`while(true){}`）无限挂起，Ctrl-C 是唯一兜底；常驻轮询用 `src/tasks/` 任务池 |
 | `oj exec` 租户/归属守卫不设防（v0.1.29） | 无 HTTP 请求上下文（租户 id 恒 None）= 匿名系统操作员；`sql_guard: "deny"` 的库上脚本须 `await db.asSystem()` |
 | `oj exec` 相对导入上跳被拒（v0.1.29） | import 被钳制在项目根（config 所在目录）内且须显式扩展名——`import "../x"` 报 escapes project root；脚本在项目外则连 `./util.ts` 都导不了 |
+| `blob.readRange` 是短读（v0.1.47） | 越尾只返回实际可读字节、`offset` 过尾返回**空数组**——先判 `head.length` 再分支，不要假设一定拿满 `len`；`offset` / `len` 为负 / 小数 / NaN 报错 `blob readRange: offset must be a non-negative integer` |
+| `blob.copy` / `blob.move` 的 `src == dst`（v0.1.47） | 明确 **no-op**（`fs::copy` 同文件语义未定义、会截断文件）——不是「复制一份给自己」；`move` 后 src 一定不存在，`copy` 后 src 一定还在 |
+| blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |
 
 ### 常见陷阱清单
 

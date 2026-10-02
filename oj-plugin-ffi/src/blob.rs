@@ -40,4 +40,14 @@ pub struct BlobBackendVtable {
     pub put_stream_finish: extern "C" fn(handle: u64, upload_id: u64) -> FfiFuture,
     /// 失败清理（**必加**：s3 abort multipart 防 orphan parts 烧钱；local 删临时文件）。
     pub put_stream_abort: extern "C" fn(handle: u64, upload_id: u64) -> FfiFuture,
+    /// ABI 11 起：服务端复制（**src 保留**）。ok 值 = 空；src 不存在报错。
+    /// 不支持服务端复制的后端返回 Err——宿主回落 `get` + `put`（字节进 V8，仅作能力保险）。
+    pub copy: extern "C" fn(handle: u64, src: RString, dst: RString) -> FfiFuture,
+    /// ABI 11 起：服务端搬移（**src 不再存在**；等价于 copy + del 的原子形态）。
+    /// ok 值 = 空；src 不存在报错。不支持的后端返回 Err（宿主回落 copy + del）。
+    pub move_to: extern "C" fn(handle: u64, src: RString, dst: RString) -> FfiFuture,
+    /// ABI 11 起：区间读。**短读截断语义**——`offset + len` 越过对象尾部时返回实际可读到的
+    /// 字节（可能短于 len），`offset` 已过尾部返回空字节。ok 值 = 读到的字节。
+    /// 不支持区间读的后端返回 Err（宿主回落 `get` 全量再切片）。
+    pub read_range: extern "C" fn(handle: u64, key: RString, offset: u64, len: u64) -> FfiFuture,
 }

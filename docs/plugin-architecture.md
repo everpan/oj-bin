@@ -8,12 +8,12 @@
 「为什么最后选了 cdylib + FFI、而不是进程内 trait」的读者——§0 是现行机制速览，
 §1 起是被否决的原方案全文。
 
-## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 8）
+## 0. 现行注册机制（cdylib + 按轴 dlsym，ABI 11）
 
 - **加载**：宿主启动期 `dlopen` 插件 cdylib（`src/bridge/plugin_loader.rs`，句柄进程期存活，
   不 dlclose）。
 - **探测流程**：
-  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **9**）
+  1. **abi 门禁**——`oj_plugin_abi_version()` 返回值与宿主 `ABI_VERSION`（当前 **11**）
      **严格相等**才继续；不等 → fail fast（指纹不符仅告警）。
   2. **init**——调 `oj_plugin_init(host, cfg)`（宏内 `catch_unwind` 收敛 panic 为
      `RResult::Err`），插件建立 runtime/单例状态并返回 `PluginDescriptor`

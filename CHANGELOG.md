@@ -16,6 +16,43 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.47 —— blob 服务端搬运与区间读：`blob.copy` / `blob.move` / `blob.readRange`（ABI 11）
+
+**动机**：大文件（v0.1.38 起流式直落 blob）在 **JS 侧收尾**时代价全在桥上——把临时对象
+「转正」要 `blob.get` + `blob.put`（整份字节进 V8，峰值 2× 文件大小），而嗅探文件类型
+只需前 4KB。三件事本该由后端服务端完成，不该让字节过桥。
+
+- **`blob.copy(src, dst)`**（src 保留）：`BlobBackend` 增 `copy`，local = `fs::copy`、
+  s3 = CopyObject；默认实现回落 `get` + `put`。
+- **`blob.move(src, dst)`**（src 不再存在）：trait 增 `move_to`，local 同父目录 =
+  `fs::rename`（原子、零字节搬运）、跨目录 = copy + unlink，s3 = CopyObject + DeleteObject；
+  默认实现回落 `copy` + `del`。`src == dst` 两者均为 no-op（`fs::copy` 同文件语义未定义，
+  会截断文件，故显式挡掉）。
+- **`blob.readRange(key, offset, len)`**：trait 增 `read_range`，local = seek + 定长读，
+  s3 = head 取 size 后 `get_range`（S3 对越界区间返 416，故插件侧先截断）。**短读截断**
+  语义——`offset + len` 越尾只返回实际可读字节，`offset` 过尾返回空数组；`offset` / `len`
+  为负 / 小数 / NaN 报 `blob readRange: offset must be a non-negative integer`（不静默取整）。
+- **能力回落**：FFI 后端三槽报错时宿主回落默认实现（`copy` → `get`+`put`、`readRange` →
+  `get` 全量切片），回落也失败则抛**后端原错误**——JS 侧永不因后端能力失败，但回落字节
+  过桥（local/s3 均原生支持，回落只是第三方后端的保险）。
+- **ABI 10 → 11**：`BlobBackendVtable` 增 `copy` / `move_to` / `read_range` 三槽（vtable
+  形状变更 = 必须 bump）。**全部插件须随宿主重编译**（`cargo xtask build`），旧 ABI 产物
+  加载即 `plugin ABI mismatch`。ABI 历史注释与 `docs/modules/05`、
+  `plugin-architecture.md` / `plugin-development.md` / `dev-guide.md` 的「当前 ABI」表述
+  一并订正为 11（此前分别停在 7/9/8）。
+- **local 路径映射**：`LocalBlob::fs_path` 走 `LocalFileSystem::path_to_filesystem`（而非手写
+  `root.join(key)`）——ABI 11 的三条路径都在文件系统层自己算路径，key 含空格 / 非 ASCII 时
+  手写拼接会与 `put`/`get` 的落盘位置编码分叉；已补含中文与空格 key 的 copy/move/readRange
+  往返用例钉住。
+- **devkit 对齐**：`api-manual.md` blob 三 API 行 + 搬运/区间读用法段 + 已知限制与错误表
+  四条；`SKILL.md` 陷阱速查四条；`scenarios.md` 新增场景 25（临时对象转正 + 4KB 嗅探）；
+  `README.md` 增 v0.1.47 条目；`sample/global.d.ts` 的 `BlobApi` 增三方法
+  （`bin/devkit/` 由 `cargo xtask build` 同步）。另订正 `dev-guide.md` blob 概览表（补三 API）
+  与 `docs/modules/00-overview.md` 的 `ABI_VERSION`（8 → 11）。
+- **测试**：local copy（src 保留 + ct 随行）/ move（同目录 rename + 跨目录、src 消失）/
+  `src == dst` no-op / readRange 截断与越界与非法 key / 含中文与空格 key 往返 / JS 面三 API
+  冒烟（含非整数 offset 拒绝）；FFI 适配器三槽转发 + 能力回落 + 「回落也失败抛后端原错误」。
+
 ## v0.1.46 —— 同名响应头多值：`json.header` 追加语义 + `Set-Cookie` 双发（CSRF 双提交闭环，未打标签）
 
 **动机**：cookie 会话（v0.1.30）的 CSRF 双提交此前是**半成品**——守卫验「csrf cookie == csrf 头」，

@@ -22,7 +22,7 @@
 | 02 | **配置模型** | `src/config.rs` | 661 | `config.yaml` 的权威 schema 与解析（段存在即启用） |
 | 03 | **HTTP 服务** | `server/` | ~4.2k | axum：路由表、前置管线（鉴权/租户/上传）、JS actor 派发、证书门禁、WS、日志 |
 | 04 | **CLI 编排** | `oj/` | ~7.2k | `server` / `build` / `test` / `migrate` / `fixture` / `schema diff`；装配与构建 |
-| 05 | **FFI 契约 + 插件** | `oj-plugin-ffi/` + `plugins/*` | 553 + ~3.5k | C-ABI 契约（`ABI_VERSION`、vtable、入口宏）+ 9 个 cdylib 第一方插件 |
+| 05 | **FFI 契约 + 插件** | `oj-plugin-ffi/` + `plugins/*` | 553 + ~3.5k | C-ABI 契约（`ABI_VERSION`、vtable、入口宏）+ 10 个 cdylib 第一方插件 |
 | 06 | **工具链** | `tools/`、`benches/`、`tests/plugins/` | ~1k | xtask 构建归置、oj-cert 证书工具、criterion 基准、测试夹具插件 |
 | 07 | **模块数据层** | `oj/src/{manifest,schema,migrate,seed,checks}.rs` | ~2k | manifest / schema.yaml / migrations / seed / fixtures / 结构检查 S* |
 | 08 | **测试体系** | `oj/tests/`、`tests/`、`sample/{unit,tests}/` | — | 四层测试（L0–L3）与分类方案、`sample/test`→`unit` 改名处置 |

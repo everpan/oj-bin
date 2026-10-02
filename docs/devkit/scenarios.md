@@ -1582,3 +1582,52 @@ curl -s -X POST 'http://localhost:9778/v1/api/order/5' -H 'content-type: applica
 - `pattern` 是 Rust regex 语义，不是 JS 正则（lookahead/反向引用不支持，非法即装配期报错）。
 - `params` / `query` 是字符串来源，声明 `integer`/`number`/`boolean` 时**显式强转**，转不动即 400；`body` 是真 JSON，**不**强转。
 - 契约与路由 pattern 不一致时 `oj openapi` 会报错（两边必须双向对齐）。
+
+## 场景 25：大文件搬运与区间读（blob.copy / move / readRange，v0.1.47）
+
+上传完成（尤其 v0.1.38 的流式大文件）后要「把临时对象转正」，顺带判定文件类型——
+**别让字节进 V8**：`blob.get` + `blob.put` 是整份字节过桥（100MB 文件 ≈ 2× 峰值），
+`blob.get` 全文只为嗅探前 4KB 更是纯浪费。
+
+### ① handler
+
+```ts
+// src/files/complete/api.ts  →  POST /v1/api/files/complete
+export default {
+  async post() {
+    const { key, id } = http.body;                       // 流式落盘的临时 key
+    const dst = `docs/${id}/${key.split("-").pop()}`;
+    // ① 嗅探：只读前 4KB，不碰全文
+    const head = await blob.readRange(key, 0, 4096);
+    const isText = !head.some((b) => b === 0);           // 含 NUL 视为二进制
+    // ② 搬运：服务端 rename / CopyObject，字节不过桥（src 转正后即消失）
+    await blob.move(key, dst);
+    const body = isText ? new TextDecoder().decode(await blob.get(dst)) : "";
+    db.table("file").insert({ id, key: dst, body, binary: !isText }).save();
+    json.ok({ key: dst, url: await blob.url(dst), binary: !isText });
+  },
+};
+```
+
+### ② 验证
+
+```bash
+# 4KB 嗅探：大文件只读前 4096 字节（短读截断：越尾只给实际字节，offset 过尾给空数组）
+curl -s -X POST http://localhost:9778/v1/api/files/complete \
+  -H 'content-type: application/json' -d '{"key":"uploads/1-0-big.pdf","id":7}'
+# → {"code":0,"data":{"key":"docs/7/big.pdf","binary":true,"body":""}}
+
+# 落盘结果：临时 key 已消失（move 语义），目标 key 可读
+curl -sI http://localhost:9778/v1/api/blob/docs/7/big.pdf | head -1   # 200
+curl -sI http://localhost:9778/v1/api/blob/uploads/1-0-big.pdf | head -1  # 404
+```
+
+### ③ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 用 `blob.get` + `blob.put` 搬运 | 整份字节过 V8（2× 峰值瞬态）；换 `blob.move`（src 消失）/ `blob.copy`（src 保留） |
+| 以为 `blob.copy` 之后 src 没了 | `copy` 保留 src、`move` 才删 src；`src == dst` 两者都是 no-op |
+| 假设 `readRange` 一定拿满 `len` | 短读截断：越尾只给实际剩余字节、`offset` 过尾给空数组——先判 `head.length` |
+| `readRange` 报 `offset must be a non-negative integer` | `offset` / `len` 传了负数、小数或 NaN（不静默取整） |
+| 后端不支持时静默变慢 | 宿主会回落（`copy` → `get`+`put`、`readRange` → `get` 全量切片），JS 不报错但字节过桥；local/s3 均原生支持，回落只是第三方后端的保险 |
