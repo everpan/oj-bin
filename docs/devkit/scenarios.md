@@ -959,7 +959,7 @@ curl -X PUT --data-binary @big.docx \
 
 ---
 
-## 场景 14：浏览器登录 cookie 会话 + CSRF（v0.1.30）
+## 场景 14：浏览器登录 cookie 会话 + CSRF（v0.1.30；双 cookie 双发 v0.1.46）
 
 **什么时候用**：Web 前端登录。Bearer token 存浏览器哪都是问题（localStorage 被
 XSS 拖走）；httpOnly cookie + 双提交 CSRF 是浏览器安全模型正解。CLI/MCP 继续 Bearer。
@@ -986,11 +986,13 @@ export default {
     const row = db.table("users").where("username", username).first();
     if (!row || !bcrypt.verify(password, row.password_hash)) json.fail(401, "invalid credentials");
     const token = jwt.sign({ sub: row.id, roles: JSON.parse(row.roles) }, { expiresIn: 86400 });
-    const csrf = crypto.randomHex(16);
+    // v0.1.46 起同名头可重复：两枚 cookie 同响应双发（此前响应头单值，csrf 只能
+    // 经 body 下发 + 前端写 document.cookie）。oj_csrf 非 HttpOnly——双提交要 JS 读得到。
     json.header("set-cookie",
       `oj_sess=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
-    json.header("x-csrf-token", csrf);   // 同时经响应头发给前端（非 HttpOnly cookie 亦可）
-    json.ok({ user: { id: row.id, roles: JSON.parse(row.roles) }, csrf_token: csrf });
+    json.header("set-cookie",
+      `oj_csrf=${crypto.randomHex(16)}; SameSite=Lax; Path=/; Max-Age=86400`);
+    json.ok({ user: { id: row.id, roles: JSON.parse(row.roles) } });
   },
 };
 ```
@@ -998,9 +1000,11 @@ export default {
 ### ③ 前端约定
 
 会话 cookie 浏览器自动带（WS 握手也是——**WS 升级过同一守卫**，401 不升级）。
-非 GET/HEAD/OPTIONS 请求把登录拿到的 csrf 值回头发：
+非 GET/HEAD/OPTIONS 请求做**双提交**：`x-csrf-token` 头 = `oj_csrf` cookie 值
+（cookie 非 HttpOnly，前端从 `document.cookie` 读）：
 
 ```ts
+const csrf = document.cookie.match(/(?:^|;\s*)oj_csrf=([^;]*)/)?.[1] ?? "";
 fetch("/v1/api/doc/save", { method: "POST", headers: { "x-csrf-token": csrf } });
 ```
 
@@ -1012,7 +1016,8 @@ csrf cookie 相等，否则 401 `missing or invalid csrf token`。Bearer 命中�
 
 | 现象 | 原因 |
 |---|---|
-| GET 通、POST 401 `missing or invalid csrf token` | 双提交缺头/值不等；前端须把 csrf 值存内存并回传 |
+| GET 通、POST 401 `missing or invalid csrf token` | 双提交缺头/值不等；确认登录响应真的双发了 `oj_csrf`（< v0.1.46 响应头单值，第二个 `json.header("Set-Cookie", …)` 会**覆盖** `oj_sess`——cookie 登录直接坏，升级 oj）；前端从 `document.cookie` 读值回传 |
+| 登录后只有 `oj_csrf` 没有 `oj_sess` | 同上：宿主版本 < v0.1.46 的单值覆盖 |
 | 升级 v0.1.30 后 WS 连不上（401） | **行为变更**：WS 握手过守卫了——ws 路径加 `anonymous_paths`（浏览器 cookie 形态自动过） |
 | SameSite=Lax 跨站 POST 不带 cookie | 跨站前端要 `SameSite=None; Secure`（HTTPS） |
 | logout 后还能访问 | access JWT 在 cookie 过期前仍有效——短 `ttl_secs` 或维护服务端黑名单 |
