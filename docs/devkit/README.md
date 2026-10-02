@@ -36,6 +36,9 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.43 起新增 `oj openapi` 子命令（从路由表生成 OpenAPI 3.1，含 `--check`
+漂移门禁），见 `api-manual.md` 命令表与 `scenarios.md` 场景 24 的「常见坑」。
+
 v0.1.44 起新增 JS 侧声明面 `.schema`（入参契约，违反 → 400）与
 `server.schema_validation` 开关，见 `api-manual.md`「入参契约 `.schema`」
 与 `scenarios.md` 场景 24。

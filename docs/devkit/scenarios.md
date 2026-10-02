@@ -1526,44 +1526,54 @@ curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
 ### ① handler 上挂 `.schema`
 
 ```js
-// src/order/list/api.ts
+// src/order/_id_/api.ts  →  GET/POST /v1/api/order/{id}
+function get() {
+  const { id } = http.params;
+  const { page } = http.query;
+  json.ok({ id, page });
+}
 function post() {
   const { name } = http.body;
   json.ok({ created: name });
 }
 
+// 路径段 id：声明 integer，运行期强转，转不动即 400；query.page 同理带最小约束
+get.schema = {
+  params: { type: "object", required: ["id"], properties: { id: { type: "integer", minimum: 1 } } },
+  query:  { type: "object", properties: { page: { type: "integer", minimum: 1 } } },
+};
+// body：声明对象 + 必填字段；additionalProperties:false 会拒掉未声明字段
 post.schema = {
-  query: { type: "object", properties: { page: { type: "integer", minimum: 1 } } },
   body: {
     type: "object",
     required: ["name"],
+    additionalProperties: false,
     properties: { name: { type: "string", maxLength: 20 } },
   },
 };
 
-export default { post };
-```
-
-路径参数同理（`_id_/api.ts` → `{id}`）：
-
-```js
-get.schema = {
-  params: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
-};
+export default { get, post };
 ```
 
 ### ② 验证
 
 ```bash
-curl -s -X POST 'http://localhost:9778/v1/api/order/list' -H 'content-type: application/json' -d '{}'
-# → HTTP 400 {"code":400,"msg":"body: missing required field `name`","data":null}
+# GET 路径段强转：abc 不是 integer → 400（校验在进 JS 之前，get 不执行）
+curl -s 'http://localhost:9778/v1/api/order/abc'
+# → HTTP 400 {"code":400,"msg":"params.id: expected integer, cannot parse \"abc\"","data":null}
 
-curl -s 'http://localhost:9778/v1/api/order/list?page=0'      # 400（minimum: 1）
-curl -s 'http://localhost:9778/v1/api/order/abc'              # 400（id 强转失败）
+# GET 查询参数越界：page 最小 1 → 400
+curl -s 'http://localhost:9778/v1/api/order/5?page=0'
+# → HTTP 400 {"code":400,"msg":"query.page: must be >= 1","data":null}
+
+# POST 缺必填字段 → 400（多传未声明字段也会被 additionalProperties:false 拒）
+curl -s -X POST 'http://localhost:9778/v1/api/order/5' -H 'content-type: application/json' -d '{}'
+# → HTTP 400 {"code":400,"msg":"body: missing required field `name`","data":null}
 ```
 
 ### ③ 常见坑
 
 - 关键字只在白名单内受支持，越界即**启动失败**（不会到运行期才炸）。
-- `pattern` 是 Rust regex 语义，不是 JS 正则。
+- `pattern` 是 Rust regex 语义，不是 JS 正则（lookahead/反向引用不支持，非法即装配期报错）。
+- `params` / `query` 是字符串来源，声明 `integer`/`number`/`boolean` 时**显式强转**，转不动即 400；`body` 是真 JSON，**不**强转。
 - 契约与路由 pattern 不一致时 `oj openapi` 会报错（两边必须双向对齐）。
