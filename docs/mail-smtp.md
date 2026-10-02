@@ -17,7 +17,7 @@
 | **插件（`plugins/oj-mail`）** | `lettre` 连接池、**有界队列 + worker 池**、实际投递，经 `FfiFuture` / `HostContext.deliver` 回传结果 |
 
 - 契约：`oj-plugin-ffi` 的 `MailVtable { submit(key, req_json, atts) -> FfiFuture }`（repr(C)）。
-- **新增轴零 ABI 变更**：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`（当前 8），既有插件无需重编。
+- **新增轴零 ABI 变更**：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`（当前 11），既有插件无需重编。
 - **插件拿不到宿主后端**（`HostContext` 只有 `log` + `deliver`），所以附件字节解析与 `bus`
   发布都在**宿主**完成。
 

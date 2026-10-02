@@ -16,6 +16,9 @@ import {
   op_blob_url,
   op_blob_upload_url,
   op_blob_content_type,
+  op_blob_copy,
+  op_blob_move,
+  op_blob_read_range,
   op_bus_publish,
   op_bus_publish_bin,
   op_bus_subscribe,
@@ -404,6 +407,13 @@ globalThis.blob = (name) => ({
   // (local backend: use the direct PUT route instead; the error says so).
   uploadUrl: (key, opts) => op_blob_upload_url(String(name), String(key), opts === undefined ? null : JSON.stringify(opts)),
   contentType: (key) => op_blob_content_type(String(name), String(key)),
+  // copy(src, dst): server-side copy, src is kept (v0.1.47, ABI 11).
+  // move(src, dst): src is gone -- local renames when both keys share a parent dir.
+  copy: (src, dst) => op_blob_copy(String(name), String(src), String(dst)),
+  move: (src, dst) => op_blob_move(String(name), String(src), String(dst)),
+  // readRange(key, offset, len) -> Uint8Array; short read is truncated at EOF
+  // (empty array when offset is past the end).
+  readRange: (key, offset, len) => op_blob_read_range(String(name), String(key), Number(offset), Number(len)),
 });
 // back-compat: blob.put(...) === blob("default").put(...)
 Object.assign(globalThis.blob, globalThis.blob("default"));

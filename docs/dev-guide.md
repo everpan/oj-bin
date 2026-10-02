@@ -5,7 +5,7 @@
 `kv` / `blob` / `bus` / `es` / `fetch` / `log` / `ws` / `plugins` / `cert` / `jwt` /
 `bcrypt` / `crypto` / `finish`）。Rust 侧捕获统一的 `{code,msg,data}` 信封（即统一响应外壳），
 由 HTTP 服务写回。数据库、KV、对象存储、事件总线、ES 等后端能力在启动时作为 **cdylib 插件**
-通过 C-ABI FFI 契约（`oj-plugin-ffi`，ABI 8）加载。
+通过 C-ABI FFI 契约（`oj-plugin-ffi`，ABI 11）加载。
 
 这份文档写给**要改 oj 本身**的人（框架开发者）。只想用 oj 写业务接口的，去读
 [user-manual.md](user-manual.md)。
@@ -172,7 +172,7 @@ server/               # crate: server（axum HTTP 层）
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 ├── certificate.rs    # 证书验签与状态判定（valid/grace/expired）
 └── ws.rs             # WebSocket：闸门 + js_route/mirror_routes + frame_loop（帧池连接侧）
-oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=8）
+oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=11）
 plugins/              # 9 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
                       #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth、oj-mail
 tools/xtask/          # crate: cargo xtask bin/plugin/build 构建 + 归置到 bin/
@@ -256,7 +256,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `db.stream(sql, params?, {onRow,signal})` | **流式查询**（v0.1.37）：逐行拉取大结果集 | 回调形态（配 `json.stream` 边收边写）或 `for await`；仅非事务目标；核心 SqlxAccessor 与第一方 db 插件（ABI 10 vtable 批量 pull）真流式，第三方未实现槽位回落全量 |
 | `http.method/params/query/headers/body/tenantId/user/files` | 只读请求上下文（懒 Proxy） | `param(name, def?)` 路径优先、query 兜底 |
 | `kv` / `redis` | KV：`get/set/del/expire/incr` | 同源同面；oj-kv-redis 真连，未配回落内存 KV |
-| `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30）；multipart 大文件流式直落 blob + `http.files[i].key/url`（v0.1.38，ABI 10 `put_stream_*`） |
+| `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl/copy/move/readRange` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30）；multipart 大文件流式直落 blob + `http.files[i].key/url`（v0.1.38，ABI 10 `put_stream_*`）；`copy`/`move`/`readRange` 为服务端搬运与区间读（v0.1.47，ABI 11）：`copy` 保留 src、`move` 删 src、`readRange` 短读截断（越尾只给实际剩余字节、offset 过尾给空数组） |
 | `bus.publish/subscribe/kind` | 事件总线 | HTTP 发布、WS 订阅；`kind()` 是异步 op |
 | `es.search/index/del` | Elasticsearch 薄客户端 | `es:` 段启用，未配置报错 |
 | `fetch(url, opts?)` | 浏览器兼容 Fetch（reqwest） | 响应整体缓冲；不支持 AbortController |
@@ -817,7 +817,7 @@ rm -rf target/llvm-cov-target target/debug
 profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装成 core trait 供 op 消费（构造放
 core，装配层只经安全入口）。
 
-**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 8，**严格相等**门禁）、`PluginDescriptor
+**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 11，**严格相等**门禁）、`PluginDescriptor
 {name, semver, abi_version, fingerprint, desc}`、各轴 repr(C) vtable（es/db/blob/bus/kv/auth）、
 `HostContext`（log + deliver 回调）。`oj_plugin_entry!(init, kv => &VT)` 生成
 `oj_plugin_abi_version()`、`oj_plugin_init()` 与每轴一个 `oj_plugin_axis_<name>` 符号

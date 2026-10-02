@@ -56,7 +56,9 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 ///     + 信封 `{"rows":[...]}|{"done":true}|{"error":"..."}`，open 哨兵 `{"unsupported":true}`
 ///     宿主回落 fetch_all；BlobBackendVtable 增 put_stream_open/chunk/finish/abort 四槽——
 ///     服务端流式 multipart/PUT 直传落盘。v0.1.38）。
-pub const ABI_VERSION: u32 = 10;
+/// 11 = blob 搬运与区间读起（BlobBackendVtable 增 copy / move_to / read_range 三槽——
+///     服务端复制与搬移让大文件不进 V8；区间读让嗅探/lazy 读只读样本字节。v0.1.47）。
+pub const ABI_VERSION: u32 = 11;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(

@@ -6,7 +6,7 @@
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| `ABI_VERSION` | **7** | **严格相等**门禁。历史：2=db 轴、3=blob 轴、4=bus 轴+HostContext.deliver、5=kv 轴、6=auth 轴、7=按轴 dlsym |
+| `ABI_VERSION` | **11** | **严格相等**门禁。历史：2=db 轴、3=blob 轴、4=bus 轴+HostContext.deliver、5=kv 轴、6=auth 轴、7=按轴 dlsym、8=bus 字节载荷、9=cookie 会话+上传直传、10=流式面（db.stream + blob put_stream_*）、11=blob 搬运与区间读（copy/move_to/read_range） |
 | `HOST_FINGERPRINT` | rustc + crate 版本 + triple | 仅诊断，不匹配只告警 |
 | `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, desc }` | 任何字段变更都要 bump ABI |
 | `HostContext` | `{ log(level,msg), deliver(topic,payload) }` | `RArc` 共享；插件互不可见（不提供 registry lookup） |

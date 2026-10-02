@@ -696,6 +696,57 @@ impl BlobBackend for FfiBlobBackend {
             .map_err(|e| ffi_err("blob put_stream_abort", e))?;
         Ok(())
     }
+
+    /// ABI 11：服务端复制转发。vtable 报错 = 后端无服务端复制能力 → 回落 `get` + `put`
+    /// （字节进 V8，仅作能力保险）；回落也失败则抛 vtable 原错误（更贴近根因）。
+    async fn copy(&self, src: &str, dst: &str) -> BridgeResult<()> {
+        let fut = (self.vtable.copy)(self.handle, RString::from(src), RString::from(dst));
+        if let Err(e) = await_ffi(fut).await {
+            let err = ffi_err("blob copy", e);
+            if let Ok(bytes) = self.get(src).await {
+                let ct = self.content_type(src).await.unwrap_or(None);
+                return self.put(dst, &bytes, ct.as_deref()).await;
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// ABI 11：服务端搬移转发。报错回落 `copy` + `del`（copy 自身还有一层回落）。
+    async fn move_to(&self, src: &str, dst: &str) -> BridgeResult<()> {
+        let fut = (self.vtable.move_to)(self.handle, RString::from(src), RString::from(dst));
+        if let Err(e) = await_ffi(fut).await {
+            let err = ffi_err("blob move", e);
+            if self.copy(src, dst).await.is_ok() {
+                return self.del(src).await;
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// ABI 11：区间读转发（短读截断由插件侧负责）。报错回落 `get` 全量再切片。
+    async fn read_range(&self, key: &str, offset: u64, len: u64) -> BridgeResult<Vec<u8>> {
+        let fut = (self.vtable.read_range)(self.handle, RString::from(key), offset, len);
+        match await_ffi(fut).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                let err = ffi_err("blob readRange", e);
+                match self.get(key).await {
+                    Ok(all) => Ok(slice_range(&all, offset, len)),
+                    Err(_) => Err(err),
+                }
+            }
+        }
+    }
+}
+
+/// 全量字节 → 区间切片（短读截断：`offset` 过尾返回空，越尾只读到 EOF）。
+fn slice_range(all: &[u8], offset: u64, len: u64) -> Vec<u8> {
+    let size = all.len() as u64;
+    let start = offset.min(size) as usize;
+    let end = offset.saturating_add(len).min(size) as usize;
+    all[start..end].to_vec()
 }
 
 impl Drop for FfiBlobBackend {
@@ -1576,6 +1627,46 @@ mod adapter_tests {
         ready(Ok(b"".to_vec()))
     }
 
+    // ---- blob 搬运 / 区间读 mock（ABI 11；mode 3 = 三槽「不支持」→ 触发宿主回落）----
+    static BLOB_COPY: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static BLOB_MOVE: Mutex<(u64, String, String)> = Mutex::new((0, String::new(), String::new()));
+    static BLOB_RANGE: Mutex<(u64, String, u64, u64)> = Mutex::new((0, String::new(), 0, 0));
+
+    extern "C" fn mock_blob_copy(handle: u64, src: RString, dst: RString) -> FfiFuture {
+        *BLOB_COPY.lock().unwrap() = (handle, src[..].to_string(), dst[..].to_string());
+        let m = *BLOB_MODE.lock().unwrap();
+        if m == 1 || m == 3 {
+            return ready(Err("copy unsupported".into()));
+        }
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_move_to(handle: u64, src: RString, dst: RString) -> FfiFuture {
+        *BLOB_MOVE.lock().unwrap() = (handle, src[..].to_string(), dst[..].to_string());
+        let m = *BLOB_MODE.lock().unwrap();
+        if m == 1 || m == 3 {
+            return ready(Err("move unsupported".into()));
+        }
+        ready(Ok(b"".to_vec()))
+    }
+    extern "C" fn mock_blob_read_range(
+        handle: u64,
+        key: RString,
+        offset: u64,
+        len: u64,
+    ) -> FfiFuture {
+        *BLOB_RANGE.lock().unwrap() = (handle, key[..].to_string(), offset, len);
+        let m = *BLOB_MODE.lock().unwrap();
+        if m == 1 || m == 3 {
+            return ready(Err("readRange unsupported".into()));
+        }
+        // 短读截断（契约语义）：mock 体为 8 字节 blobdata。
+        let all = b"blobdata";
+        let size = all.len() as u64;
+        let s = offset.min(size) as usize;
+        let e = offset.saturating_add(len).min(size) as usize;
+        ready(Ok(all[s..e].to_vec()))
+    }
+
     fn mock_blob_vtable() -> &'static BlobBackendVtable {
         Box::leak(Box::new(BlobBackendVtable {
             connect: mock_blob_connect,
@@ -1590,6 +1681,9 @@ mod adapter_tests {
             put_stream_chunk: mock_blob_put_stream_chunk,
             put_stream_finish: mock_blob_put_stream_finish,
             put_stream_abort: mock_blob_put_stream_abort,
+            copy: mock_blob_copy,
+            move_to: mock_blob_move_to,
+            read_range: mock_blob_read_range,
         }))
     }
 
@@ -1684,6 +1778,75 @@ mod adapter_tests {
         // 空串 → None
         BLOB_CT_EMPTY.store(true, AtomicOrdering::SeqCst);
         assert_eq!(b.content_type("k2").await.unwrap(), None);
+    }
+
+    /// ABI 11：copy / move_to / read_range 三槽转发（src+dst 与 offset+len 原样过线）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_copy_move_read_range_forward_all_slots() {
+        let _g = T_LOCK.lock().unwrap();
+        *BLOB_MODE.lock().unwrap() = 0;
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        b.copy("tmp/a.bin", "final/a.bin").await.unwrap();
+        let (h, src, dst) = BLOB_COPY.lock().unwrap().clone();
+        assert_eq!(
+            (h, src.as_str(), dst.as_str()),
+            (42, "tmp/a.bin", "final/a.bin")
+        );
+        b.move_to("tmp/b.bin", "final/b.bin").await.unwrap();
+        let (h, src, dst) = BLOB_MOVE.lock().unwrap().clone();
+        assert_eq!(
+            (h, src.as_str(), dst.as_str()),
+            (42, "tmp/b.bin", "final/b.bin")
+        );
+        assert_eq!(b.read_range("k", 2, 3).await.unwrap(), b"obd");
+        let (h, key, off, len) = BLOB_RANGE.lock().unwrap().clone();
+        assert_eq!((h, key.as_str(), off, len), (42, "k", 2, 3));
+        // 短读截断：offset 过尾 → 空
+        assert_eq!(b.read_range("k", 99, 4).await.unwrap(), b"");
+    }
+
+    /// ABI 11 能力保险：后端无服务端复制 → 回落 `get` + `put`（dst 拿到 src 的字节与 ct）；
+    /// move 回落 = copy + del；readRange 回落 = get 全量再切片。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_copy_move_read_range_fall_back_when_backend_lacks_them() {
+        let _g = T_LOCK.lock().unwrap();
+        BLOB_CT_EMPTY.store(false, AtomicOrdering::SeqCst);
+        *BLOB_MODE.lock().unwrap() = 3;
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        b.copy("s", "d").await.unwrap();
+        assert_eq!(BLOB_GET.lock().unwrap().1, "s");
+        let (_, dkey, bytes, ct) = BLOB_PUT.lock().unwrap().clone();
+        assert_eq!(
+            (dkey.as_str(), bytes.as_slice(), ct.as_str()),
+            ("d", &b"blobdata"[..], "image/png")
+        );
+        b.move_to("s", "d").await.unwrap();
+        assert_eq!(BLOB_DEL.lock().unwrap().1, "s");
+        assert_eq!(b.read_range("k", 2, 3).await.unwrap(), b"obd");
+        *BLOB_MODE.lock().unwrap() = 0;
+    }
+
+    /// 后端与回落双双失败 → 抛 **后端原错误**（回落的错误不盖住根因）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blob_copy_errors_with_backend_reason_when_fallback_also_fails() {
+        let _g = T_LOCK.lock().unwrap();
+        *BLOB_MODE.lock().unwrap() = 1;
+        let b = FfiBlobBackend::new(42, mock_blob_vtable());
+        let e = b
+            .copy("s", "d")
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("copy"), "{e}");
+        let e = b
+            .read_range("k", 0, 4)
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(e.contains("readRange"), "{e}");
+        *BLOB_MODE.lock().unwrap() = 0;
     }
 
     #[tokio::test(flavor = "multi_thread")]

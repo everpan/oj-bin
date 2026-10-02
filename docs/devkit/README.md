@@ -48,6 +48,10 @@ v0.1.46 起 `json.header` 为追加语义：同名响应头可重复（`Set-Cook
 最后一个生效；sample 登录/登出已改写为双 cookie 形态，见 `api-manual.md` §6
 `json.header` 与 §8 cookie 会话段。
 
+v0.1.47 起 blob 增 `copy` / `move` / `readRange` 三件套（服务端搬运与区间读，大文件字节
+不再进 V8）：`copy` 保留 src、`move` 删 src、`readRange` 是短读截断；见
+`api-manual.md` §6 blob 段与 `scenarios.md` 场景 25。
+
 **版本同步要求（发布前自查）**：每次版本升级，本目录四件（`api-manual.md` / `scenarios.md` /
 `SKILL.md` / `README.md`）必须与该版的用户可见变更**逐条对齐**——新增/变更的 API 与报错文案要
 进 `api-manual.md` 的对应章节**与错误/限制表**，高频陷阱要进 `SKILL.md` 的陷阱速查，
