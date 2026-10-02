@@ -261,6 +261,8 @@ tables:
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物） |
 | `oj build --check` | 只跑结构检查 S001–S007 不落盘（CI 门禁） |
+| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43） |
+| `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
 三条数据类命令（`migrate` / `fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
 `name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
@@ -459,6 +461,9 @@ post.schema = {
 - `params` / `query` 只允许扁平标量（string/number/integer/boolean/null）：
   底层是 `HashMap<String,String>`，声明 array/object 是永远无法满足的死契约，
   装配期即拒。
+- `additionalProperties: false`（body 通道）运行期**拒掉未声明字段**；不写则放行额外字段。
+  其余白名单关键字按 JSON Schema 语义生效（`required` / `enum` / `minimum`·`maximum` /
+  `minLength`·`maxLength` / `items` + `minItems`·`maxItems` / `nullable` / `pattern`）。
 - 开关 `server.schema_validation`：**默认 true**（声明了就会执行）；
   置 `false` 为逃生门。
 - 同一份声明喂给 `oj openapi`，补出 `parameters` 与 `requestBody`；其中

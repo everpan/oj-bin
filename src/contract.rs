@@ -305,9 +305,10 @@ fn audit_keywords(v: &Value, path: &str, pats: &mut Vec<String>) -> Result<(), S
         pats.push(s.to_string());
     }
     if let Some(e) = obj.get("enum")
-        && (!e.is_array() || e.as_array().unwrap().is_empty()) {
-            return Err(format!("{path}: enum must be a non-empty array"));
-        }
+        && (!e.is_array() || e.as_array().unwrap().is_empty())
+    {
+        return Err(format!("{path}: enum must be a non-empty array"));
+    }
     for key in ["required", "minLength", "maxLength", "minItems", "maxItems"] {
         // required 已白名单内，此处只做形态校验（数字类不许是字符串）。
         if key == "required" {
@@ -320,15 +321,17 @@ fn audit_keywords(v: &Value, path: &str, pats: &mut Vec<String>) -> Result<(), S
                 }
             }
         } else if let Some(n) = obj.get(key)
-            && !n.is_number() {
-                return Err(format!("{path}: {key} must be a number"));
-            }
+            && !n.is_number()
+        {
+            return Err(format!("{path}: {key} must be a number"));
+        }
     }
     for key in ["minimum", "maximum"] {
         if let Some(n) = obj.get(key)
-            && !n.is_number() {
-                return Err(format!("{path}: {key} must be a number"));
-            }
+            && !n.is_number()
+        {
+            return Err(format!("{path}: {key} must be a number"));
+        }
     }
     if let Some(props) = obj.get("properties") {
         let Some(map) = props.as_object() else {
@@ -514,29 +517,33 @@ fn check_value(
                 }
             }
             if let Some(n) = obj.get("minItems").and_then(|n| n.as_u64())
-                && (a.len() as u64) < n {
-                    return Err(format!(
-                        "{path}: expected at least {n} items, got {}",
-                        a.len()
-                    ));
-                }
+                && (a.len() as u64) < n
+            {
+                return Err(format!(
+                    "{path}: expected at least {n} items, got {}",
+                    a.len()
+                ));
+            }
             if let Some(n) = obj.get("maxItems").and_then(|n| n.as_u64())
-                && (a.len() as u64) > n {
-                    return Err(format!(
-                        "{path}: expected at most {n} items, got {}",
-                        a.len()
-                    ));
-                }
+                && (a.len() as u64) > n
+            {
+                return Err(format!(
+                    "{path}: expected at most {n} items, got {}",
+                    a.len()
+                ));
+            }
         }
         Value::String(s) => {
             if let Some(n) = obj.get("minLength").and_then(|n| n.as_u64())
-                && (s.chars().count() as u64) < n {
-                    return Err(format!("{path}: shorter than minLength {n}"));
-                }
+                && (s.chars().count() as u64) < n
+            {
+                return Err(format!("{path}: shorter than minLength {n}"));
+            }
             if let Some(n) = obj.get("maxLength").and_then(|n| n.as_u64())
-                && (s.chars().count() as u64) > n {
-                    return Err(format!("{path}: longer than maxLength {n}"));
-                }
+                && (s.chars().count() as u64) > n
+            {
+                return Err(format!("{path}: longer than maxLength {n}"));
+            }
             if let Some(Value::String(p)) = obj.get("pattern") {
                 let Some(re) = pats.get(p) else {
                     return Err(format!(
@@ -550,13 +557,15 @@ fn check_value(
         }
         Value::Number(_) => {
             if let Some(n) = obj.get("minimum").and_then(|n| n.as_f64())
-                && value.as_f64().unwrap_or(f64::MAX) < n {
-                    return Err(format!("{path}: must be >= {n}"));
-                }
+                && value.as_f64().unwrap_or(f64::MAX) < n
+            {
+                return Err(format!("{path}: must be >= {n}"));
+            }
             if let Some(n) = obj.get("maximum").and_then(|n| n.as_f64())
-                && value.as_f64().unwrap_or(f64::MIN) > n {
-                    return Err(format!("{path}: must be <= {n}"));
-                }
+                && value.as_f64().unwrap_or(f64::MIN) > n
+            {
+                return Err(format!("{path}: must be <= {n}"));
+            }
         }
         _ => {}
     }

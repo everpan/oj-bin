@@ -16,6 +16,17 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.45 —— 发版文档收尾 + `contract.rs` 格式化
+
+v0.1.44 已交付 PR-6 4b 全部功能，但发版自查（devkit 四件逐条对齐 + fmt 门禁）遗留若干收尾，本版本补齐。无功能/行为变更，无新增用户可见 API。
+
+- **devkit 四件对齐**：
+  - `api-manual.md` 命令表补回 `oj openapi` 子命令（v0.1.43 新增，此前漏登）；`.schema` 节补 `additionalProperties:false` 运行期拒未声明字段的说明。
+  - `README.md` 版本提示补 v0.1.43 `oj openapi` 一行（原本只记了 v0.1.44 `.schema`）。
+  - `SKILL.md` 陷阱速查补 `oj openapi --check` 漂移门禁一行。
+  - `scenarios.md` 场景 24 重写为自洽可跑：原「验证」curl 与示例 handler 不匹配（GET 打到仅导出 `post` 的路由、`params:{id}` 路由未定义），改为单一 `src/order/_id_/api.ts` 导出 `get`+`post`，curl 预期 400 文案与 `src/contract.rs` 实际报错逐字一致。
+- **`src/contract.rs` 格式化**：v0.1.44 提交时未过 `cargo fmt`，本版本补齐（仅空白，无语义改动）。
+
 ## v0.1.44 —— PR-6 4b：handler 入参契约（`.schema`）与运行期校验
 
 - **新增 JS 声明面 `.schema`**（与既有 `.route` 完全同构）：在导出的函数对象上分
