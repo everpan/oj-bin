@@ -230,6 +230,13 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then bin="bin/oj.exe"; fi
           cargo run --release -p xtask -- smoke --bin "$bin"
 
+      # CI 自供给 sample 密钥对并重封 ldap 口令：secrets-private.pem 被 gitignore，CI 克隆
+      # 没有它；config 里的 ENC[...] 缺私钥即 fail-fast。生成匹配密钥对（不提交私钥）并重封，
+      # 使下方 `cargo test` 里的 oj test L1 套件能正常解密 sample/config.yaml。
+      - name: CI sample secrets (keygen + reseal ldap pw)
+        shell: bash
+        run: bash scripts/ci-sample-secrets.sh "$([ "$RUNNER_OS" = "Windows" ] && echo ./bin/oj.exe || echo ./bin/oj)"
+
       # 发布前跑全量测试（release 模式，与 plugin-matrix 同；infinite_loop 在部分平台会
       # SIGSEGV，跳过）。
       - name: cargo test --release (workspace, skip infinite_loop)
