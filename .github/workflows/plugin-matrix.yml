@@ -204,6 +204,13 @@ jobs:
           cargo run --release -p xtask -- build
           ls -la bin/plugins/${{ matrix.triple }}/
 
+      # CI 自供给 sample 密钥对并重封 ldap 口令：secrets-private.pem 被 gitignore，CI 克隆
+      # 没有它；config 里的 ENC[...] 缺私钥即 fail-fast。生成匹配密钥对（不提交私钥）并重封，
+      # 使下方 `cargo test` 里的 oj test L1 套件能正常解密 sample/config.yaml。
+      - name: CI sample secrets (keygen + reseal ldap pw)
+        shell: bash
+        run: bash scripts/ci-sample-secrets.sh "$([ "$RUNNER_OS" = "Windows" ] && echo ./bin/oj.exe || echo ./bin/oj)"
+
       # 宿主 + 全部第一方插件单测（release 模式，避免 debug 构建）。
       # infinite_loop 只在 skip_infinite_loop=true 的平台跳过（见 select job 的 matrix 定义），
       # 不再全局跳过。
@@ -281,6 +288,12 @@ jobs:
 
       # 插件发现：<exe>/plugins/<host-triple>/ —— bin/oj + bin/plugins/ 正好命中，无需
       # 设 OJ_PLUGINS_DIR。
+      # CI 自供给 sample 密钥对并重封 ldap 口令：secrets-private.pem 被 gitignore，CI 克隆
+      # 没有它；config 里的 ENC[...] 缺私钥即 fail-fast。生成匹配密钥对（不提交私钥）并重封，
+      # 使下方 `oj test` 能正常解密 sample/config.yaml。
+      - name: CI sample secrets (keygen + reseal ldap pw)
+        run: bash scripts/ci-sample-secrets.sh ./bin/oj
+
       - name: L1 — oj test (junit)
         run: ./bin/oj test -c sample/config.yaml -d sample/src --format junit --output l1.xml
 
