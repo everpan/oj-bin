@@ -545,7 +545,7 @@ fn walk(root: &Path, dir: &Path, acc: &mut Vec<(PathBuf, bool)>) -> Result<(), S
         let p = e.path();
         let name = e.file_name().to_string_lossy().into_owned();
         if p.is_dir() {
-            // 演示数据不进产物（spec §4.5/P0），由 oj fixture 灌入；
+            // 演示数据不进产物（spec §4.5/P0），由 oj test fixture 灌入；
             // node_modules 与运行期解析口径一致地排除（运行期 resolve_inner 不对
             // node_modules 内的文件启用别名/本地语义），否则会把第三方源码打进产物。
             if name == "fixtures" || name == "node_modules" {

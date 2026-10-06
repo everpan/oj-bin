@@ -1,7 +1,7 @@
 # only js
 
-> 给谁读：第一次接触 `oj` 命令行的人。想知道 `server` / `build` / `test` / `migrate` /
-> `fixture` / `schema diff` 各自干什么、参数怎么写时读这篇。
+> 给谁读：第一次接触 `oj` 命令行的人。想知道 `server` / `build` / `test`（`test fixture`）/
+> `migrate` / `schema diff` 各自干什么、参数怎么写时读这篇。
 
 `oj` 是构建出来的命令行程序，包含以下子命令。
 
@@ -145,11 +145,12 @@
       --baseline 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
       module    只迁移指定模块（位置参数）
 
-## fixture
+## test fixture
   灌入模块 `fixtures/` 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
+  是 `oj test` 的子命令（`oj test` 自身跑用例，`oj test fixture` 灌演示数据）。
 
 ```
-    oj fixture [-c config.yaml] [-d dir] [--db name] [module]
+    oj test fixture [-c config.yaml] [-d dir] [--db name] [module]
 ```
       --db      目标库：config `db:` 段的 profile 名（默认 default）；未声明即报错
       module    只灌指定模块（位置参数）

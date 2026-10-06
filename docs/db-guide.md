@@ -118,7 +118,7 @@ db:
   `DB(name)` 返回 `undefined`（`op_db_has` 探测）。
 - **模块默认库重定向**：模块 `manifest.yaml` 可写 `db: warehouse`，此后该模块里的
   字面 `db.*`（即 "default"）自动落到 warehouse；显式 `DB("...")` 不受影响。
-- **库级迁移 / 对账（v0.1.21）**：`oj migrate` / `oj fixture` / `oj schema diff` 默认作用
+- **库级迁移 / 对账（v0.1.21）**：`oj migrate` / `oj test fixture` / `oj schema diff` 默认作用
   `default`，用 `--db <name>` 改指上面任一命名库（未声明即 fail-fast）。它是**整轮**的
   目标库，不认模块级 `manifest.yaml` 的 `db:` 绑定——多库部署对每个 profile 各跑一遍，
   账本 `_oj_migrations` 与 schema 收敛各库独立。详见 `docs/migration.md` §3.8。

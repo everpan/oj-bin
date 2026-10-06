@@ -146,7 +146,7 @@ PR-6 第一步（生成 + 漂移门禁；请求/响应 schema 留待后续步）
 
 ## 7. 瘦身装配（`migrate_cmd.rs`）
 
-`oj migrate` / `oj fixture` / `oj schema diff` **不走 `App::from_config`** ——
+`oj migrate` / `oj test fixture` / `oj schema diff` **不走 `App::from_config`** ——
 后者证书门禁无逃生口且携带 seed/路由。瘦身路径只解析 config → 插件 → 开库 → 执行，
 使 CI/运维机无证书也能迁移。
 

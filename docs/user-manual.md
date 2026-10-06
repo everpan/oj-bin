@@ -47,7 +47,7 @@ oj serve  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir
 oj build   [module] [-c config.yaml] [-d src] [-o dist] [--no-minify] [--check]
 oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
-oj fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
+oj test fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
 oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
 ```
 
@@ -95,8 +95,8 @@ oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
 - `oj migrate`：把各模块 `migrations/*.sql` 按序应用到目标库（默认 `db.default`，`--db`
   换 profile；账本表 `_oj_migrations` 用 module 列区分模块），并对声明 `schema.yaml` 的模块做
   收敛（§5.1）；`--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
-- `oj fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
-  目标库同样由 `--db` 选定。
+- `oj test fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
+  是 `oj test` 的子命令；目标库同样由 `--db` 选定。
 - `oj schema diff`：声明式 schema 与实库**只读对账**：D001 缺表/缺列/多列（改名或删除
   须手写迁移）/缺索引，D002 实库有而未声明的表。有漂移打印报告并 exit 1（发布前巡检）。
   类型漂移不比对（手写迁移场景人工核对）；目标库由 `--db` 选定，多库须逐库跑。
@@ -300,7 +300,7 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
 │   │   ├── schema.yaml           # 声明式表结构（可选，§5.1）
 │   │   ├── migrations/           # 手写 DDL 演进 0001__init.sql …（可选，§5.2）
 │   │   ├── seed.sql              # 幂等种子，随启动重放（可选）
-│   │   ├── fixtures/             # 演示数据，仅 oj test / oj fixture 灌入（可选）
+│   │   ├── fixtures/             # 演示数据，仅 oj test / oj test fixture 灌入（可选）
 │   │   ├── _shared/validate.ts   # 无 api 文件 → 纯工具代码目录，不产生路由
 │   │   ├── account/api.ts        # → /v1/api/user/account/
 │   │   ├── profile/api.ts        # → /v1/api/user/profile/
@@ -383,12 +383,12 @@ desc 与账本不一致，都会报错（S007）。应用入口三处：
 - release 默认 `verify`（账本落后拒启，M004；先 `oj migrate`）；`off` 逃生门；
 - 显式 `oj migrate [--db name] [--baseline] [--module M]`；`--baseline` 把 ≤head 的迁移
   全部记为已应用而不执行（存量库接入）；`--db` 选 config `db:` 段的 profile
-  （缺省 `default`，未声明即报错；`oj fixture` / `oj schema diff` 同旗标）。
+  （缺省 `default`，未声明即报错；`oj test fixture` / `oj schema diff` 同旗标）。
 
 模块级 `seed.sql`：幂等参考数据，随启动重放（三方言 `default` 库，无库则 warn 跳过）。
 规则：禁 DDL；INSERT 须幂等（`OR IGNORE` / `ON CONFLICT` / `OR REPLACE` /
 `ON DUPLICATE KEY`，写法须匹配部署方言）；只写本模块与 deps 模块的表（S006 校验）。
-`fixtures/`：演示数据，仅 `oj test` / `oj fixture` 灌入（不进发布产物、不记账本）。
+`fixtures/`：演示数据，仅 `oj test` / `oj test fixture` 灌入（不进发布产物、不记账本）。
 
 ### 5.3 检查体系与表归属
 

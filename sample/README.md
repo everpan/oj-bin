@@ -23,7 +23,7 @@
   `server.ownership_guard: warn`（默认，仅告警）| `deny`（违规拒绝执行）
 - 迁移：每模块 `migrations/{seq:04}__{desc}[.方言].sql`（DDL 演进，账本
   `_oj_migrations（module 列区分模块）`）；`seed.sql` 为幂等参考数据随启动重放；
-  `fixtures/` 仅 `oj test` / `oj fixture` 灌入。`server.migrate_on_start`：
+  `fixtures/` 仅 `oj test` / `oj test fixture` 灌入。`server.migrate_on_start`：
   auto（dev 默认）| verify（release 默认，账本落后拒启）| off
 - WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/ws.ts 订阅 news），
   再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧

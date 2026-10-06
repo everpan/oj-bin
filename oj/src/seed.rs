@@ -4,7 +4,7 @@
 //! 关键字（mysql → `INSERT IGNORE`、pg → 句尾 `ON CONFLICT DO NOTHING`）。
 //! 每条语句的执行与结果（受影响行数）记 tracing 日志（server 落 logs/，CLI 落 stderr）。
 //! S002：同一张表被两处 `CREATE TABLE` → 启动 fail-fast，不静默合并（§8-1）。
-//! fixtures/ 不重放（演示数据，由 `oj fixture` 灌入）。
+//! fixtures/ 不重放（演示数据，由 `oj test fixture` 灌入）。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
