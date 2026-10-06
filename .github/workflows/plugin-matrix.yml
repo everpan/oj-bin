@@ -111,8 +111,8 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo clippy --workspace --all-targets -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy --release --workspace --all-targets -D warnings
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
 
   matrix:
     # `needs` 含 lint，而 lint 在 `shared_jobs=false` 下是 **skipped**。GitHub 的默认语义是

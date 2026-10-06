@@ -100,8 +100,8 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo clippy --workspace --all-targets -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy --release --workspace --all-targets -D warnings
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
 
       - uses: actions/setup-node@v4
         with:
