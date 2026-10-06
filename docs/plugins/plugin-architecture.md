@@ -1,10 +1,10 @@
 # 插件化架构方案（blob / s3 / redis / ES / db 按方言）
 
 > 状态：历史方案（进程内 `Plugin` trait 路线**未执行**，已被 cdylib + C-ABI FFI 方案取代）。
-> 保留本文仅作决策过程记录；现行插件系统见 `docs/dev-guide.md` §13 与
-> `docs/plugin-development.md`，注册机制见下方 §0。
+> 保留本文仅作决策过程记录；现行插件系统见 `../dev-guide.md` §13 与
+> `plugin-development.md`，注册机制见下方 §0。
 
-**给谁读**：要写插件，直接看 `docs/plugin-development.md`，不用读本文。本文适合想知道
+**给谁读**：要写插件，直接看 `plugin-development.md`，不用读本文。本文适合想知道
 「为什么最后选了 cdylib + FFI、而不是进程内 trait」的读者——§0 是现行机制速览，
 §1 起是被否决的原方案全文。
 
@@ -31,7 +31,7 @@
   存入 `AppState.plugins`，经公共端点 **`GET {base}/plugins`** 返回清单（ok 信封），
   供运维/监控辨识当前进程装配了什么；JS 侧 `plugins()` 同源自省。
 - **插件配置**：`plugins:` 段一段三用（键 = 严格清单 / 值 = 透传 cfg（空对象回落轴适配器）/
-  缺省 = 扫描模式；旧 list 写法废弃），详见 `docs/plugin-development.md` §7.1。
+  缺省 = 扫描模式；旧 list 写法废弃），详见 `plugin-development.md` §7.1。
 
 ---
 
