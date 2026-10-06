@@ -251,7 +251,7 @@ impl DbBackend for MemoryBackend {
 }
 ```
 
-- [x] **Step 1: 先读现状**——读 `oj/src/server_cmd.rs:280-300` 的 `resolve_dsn` 全文与其测试（`server_cmd.rs:385` 起），把 sqlite 归一化规则（相对路径相对 config_dir 绝对化、`sqlite::memory:` 直通、建空库等）原样提炼为纯函数。
+- [x] **Step 1: 先读现状**——读 `oj/src/serve_cmd.rs:280-300` 的 `resolve_dsn` 全文与其测试（`serve_cmd.rs:385` 起），把 sqlite 归一化规则（相对路径相对 config_dir 绝对化、`sqlite::memory:` 直通、建空库等）原样提炼为纯函数。
 
 - [x] **Step 2: 写失败测试**
 
@@ -331,14 +331,14 @@ unix@vip.qq.com ai"
 ### Task 0.3: resolve_dsn 两处改道 registry.connect
 
 **Files:**
-- Modify: `oj/src/server_cmd.rs:82-88`（db 循环）与 `:280`（删 `resolve_dsn`）
+- Modify: `oj/src/serve_cmd.rs:82-88`（db 循环）与 `:280`（删 `resolve_dsn`）
 - Modify: `oj/src/build_cmd.rs:186-189`（内省内存库）
 - Modify: `server/src/lib.rs`（若有 DSN 解析点，grep 确认）
-- Test: `oj/src/server_cmd.rs` 内既有 `resolve_dsn_dispatches_by_scheme` 测试迁移
+- Test: `oj/src/serve_cmd.rs` 内既有 `resolve_dsn_dispatches_by_scheme` 测试迁移
 
 **Interfaces:**
 - Consumes: `DbBackendRegistry::builtin()` + `connect(dsn, config_dir)`（Task 0.2）。
-- Produces: `pub async fn connect_dbs(cfg_db: &HashMap<String,String>, registry: &DbBackendRegistry, config_dir: &Path) -> Result<HashMap<String, Arc<dyn DataAccessor>>, String>`（放 `oj/src/server_cmd.rs`，server 与 build 共用；build_cmd 传 memory 注册表或直接用 `MemoryBackend`）。
+- Produces: `pub async fn connect_dbs(cfg_db: &HashMap<String,String>, registry: &DbBackendRegistry, config_dir: &Path) -> Result<HashMap<String, Arc<dyn DataAccessor>>, String>`（放 `oj/src/serve_cmd.rs`，server 与 build 共用；build_cmd 传 memory 注册表或直接用 `MemoryBackend`）。
 
 - [x] **Step 1: 确认全部 DSN 解析调用点**
 
@@ -352,7 +352,7 @@ Expected: 列出全部调用点；逐一核对落入本任务改动清单。
 Run: `cargo test -p oj connect_dbs`
 Expected: FAIL
 
-- [x] **Step 4: 实现**——server_cmd.rs 的 db 循环改为：
+- [x] **Step 4: 实现**——serve_cmd.rs 的 db 循环改为：
 
 ```rust
 let registry = only_js::bridge::db_backend::DbBackendRegistry::builtin();
@@ -387,7 +387,7 @@ Expected: 全绿
 - [x] **Step 6: Commit**
 
 ```bash
-git add oj/src/server_cmd.rs oj/src/build_cmd.rs server/src/
+git add oj/src/serve_cmd.rs oj/src/build_cmd.rs server/src/
 git commit -m "refactor(oj): DSN 解析改道 DbBackendRegistry——未知 scheme 报错归注册表
 
 unix@vip.qq.com ai"
@@ -442,7 +442,7 @@ async fn ops_dispatch_via_es_backend_trait() {
 Run: `cargo test -p only-js es:: -- --skip infinite_loop`
 Expected: FAIL（`EsBackend` 未定义）
 
-- [x] **Step 3: 实现**——三 op 改为：取 `Arc<dyn EsBackend>` → 校验 `valid_ident`（留在 op 层，防注入是 op 职责）→ 调 trait 方法。`StableState.es` 与 `Extras.es` 类型改 `Option<Arc<dyn EsBackend>>`；`oj/src/server_cmd.rs:141` 的 `Arc<EsClient>` 注入处加 `as Arc<dyn EsBackend>`  coercion。op 内错误文案 `es not configured` 保持不变。
+- [x] **Step 3: 实现**——三 op 改为：取 `Arc<dyn EsBackend>` → 校验 `valid_ident`（留在 op 层，防注入是 op 职责）→ 调 trait 方法。`StableState.es` 与 `Extras.es` 类型改 `Option<Arc<dyn EsBackend>>`；`oj/src/serve_cmd.rs:141` 的 `Arc<EsClient>` 注入处加 `as Arc<dyn EsBackend>`  coercion。op 内错误文案 `es not configured` 保持不变。
 
 - [x] **Step 4: 跑测试确认通过 + 全量回归**
 
@@ -452,7 +452,7 @@ Expected: 全绿（含 `OJ_TEST_ES` 未设时 skip）
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/bridge/es.rs src/bridge/mod.rs oj/src/server_cmd.rs
+git add src/bridge/es.rs src/bridge/mod.rs oj/src/serve_cmd.rs
 git commit -m "refactor(bridge): es 轴抽 EsBackend trait——EsClient 为首个 HTTP 实现
 
 unix@vip.qq.com ai"
@@ -463,7 +463,7 @@ unix@vip.qq.com ai"
 **Files:**
 - Modify: `src/bridge/mod.rs:69-96`（StableState/Extras 字段改形）
 - Modify: `src/bridge/blob.rs`（op 取数路径改经 BlobRegistry）
-- Modify: `oj/src/server_cmd.rs:120-160`（blob/es/bus 装配段）、`server/src/ws.rs`（共享注入点）、全部测试夹具
+- Modify: `oj/src/serve_cmd.rs:120-160`（blob/es/bus 装配段）、`server/src/ws.rs`（共享注入点）、全部测试夹具
 - Test: 既有全部测试 + 新增 broker 共享语义回归
 
 **Interfaces:**
@@ -512,9 +512,9 @@ impl BlobRegistry {
 - [x] **Step 1: 列出全部受影响的构造/取数点**
 
 Run: `grep -rn "extras.blob\|\.blob\b\|Extras {" src/ oj/src/ server/src/ --include='*.rs' | grep -v "//" | head -30`
-Expected: blob.rs 五个 op 的取数点 + server_cmd.rs 装配段 + 测试夹具，全部入改动清单。
+Expected: blob.rs 五个 op 的取数点 + serve_cmd.rs 装配段 + 测试夹具，全部入改动清单。
 
-- [x] **Step 2: 先改类型再修编译错误**——StableState/Extras 改形后 `cargo check 2>&1 | grep '^error'` 列出的每个点逐一迁移：blob op 从 `state...blob.clone()` 改为 `state...blobs.default()`；`server_cmd.rs` blob 装配段构造 `BlobRegistry` 注册 `default` 后注入；测试夹具同理。ws.rs 的 bus 共享注入不动。
+- [x] **Step 2: 先改类型再修编译错误**——StableState/Extras 改形后 `cargo check 2>&1 | grep '^error'` 列出的每个点逐一迁移：blob op 从 `state...blob.clone()` 改为 `state...blobs.default()`；`serve_cmd.rs` blob 装配段构造 `BlobRegistry` 注册 `default` 后注入；测试夹具同理。ws.rs 的 bus 共享注入不动。
 
 - [x] **Step 3: 新增 broker 共享语义回归测试**（server/src/ws.rs 或既有 ws 测试旁）：
 
@@ -571,8 +571,8 @@ unix@vip.qq.com ai"
 **Files:**
 - Modify: `src/config.rs`（`Config.blob: Option<BlobCfg>` → 新增 `BlobBackendsCfg`）
 - Modify: `src/bridge/blob.rs`（BlobRegistry 放开任意名字 + 注册名入工厂）
-- Modify: `oj/src/server_cmd.rs` blob 装配段
-- Test: blob.rs、config.rs、server_cmd.rs
+- Modify: `oj/src/serve_cmd.rs` blob 装配段
+- Test: blob.rs、config.rs、serve_cmd.rs
 
 **Interfaces:**
 - Produces:
@@ -631,7 +631,7 @@ async fn registry_multi_backend_and_duplicate_fails() {
 Run: `cargo test -p only-js blob -- --skip infinite_loop`
 Expected: FAIL
 
-- [x] **Step 3: 实现**——BlobRegistry 去掉"仅 default"限制（改为直接包 NamedRegistry）；config 新增 `blob_backends` 段（旧 `[blob]` 段保留映射为 default，向后兼容）；server_cmd.rs 装配：遍历配置逐个构造（local root 相对 config_dir 绝对化、s3 走 `S3Blob::new` 现状校验），配置声明的名字全部成功注册，缺一 → `blob backend '<name>': ...` 启动期报错。
+- [x] **Step 3: 实现**——BlobRegistry 去掉"仅 default"限制（改为直接包 NamedRegistry）；config 新增 `blob_backends` 段（旧 `[blob]` 段保留映射为 default，向后兼容）；serve_cmd.rs 装配：遍历配置逐个构造（local root 相对 config_dir 绝对化、s3 走 `S3Blob::new` 现状校验），配置声明的名字全部成功注册，缺一 → `blob backend '<name>': ...` 启动期报错。
 
 - [x] **Step 4: 跑测试确认通过 + 回归**
 
@@ -1239,7 +1239,7 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 ```
 
 - [x] **Step 1: 迁移 EsClient HTTP 实现**入 oj-es（url_for/valid_ident 中 url_for 随实现走、valid_ident 留在 core op 层）；core es.rs 删 HTTP 细节，保留 trait + ops。
-  > 注：core es.rs 的 HTTP 细节**删除随 Task 3.7 装配接线一并做**——`oj/src/server_cmd.rs` 当前仍构造 `EsClient`（3.7 才切插件路径），此步先删会破坏编译；oj-es 已持有完整迁入实现。
+  > 注：core es.rs 的 HTTP 细节**删除随 Task 3.7 装配接线一并做**——`oj/src/serve_cmd.rs` 当前仍构造 `EsClient`（3.7 才切插件路径），此步先删会破坏编译；oj-es 已持有完整迁入实现。
 
 - [x] **Step 2: 写插件内单测**——vtable 三方法经插件自建 runtime 执行（httptest mock http；PLUGIN 单例经 init 建立，`EsClientInner` 直测与 vtable 直测分离避免单例竞争）。
 
@@ -1323,8 +1323,8 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `src/config.rs`（`plugins: Option<Vec<String>>`、`plugins_dir: Option<PathBuf>`）
-- Modify: `oj/src/server_cmd.rs`（装配流程接线，spec §5 全流程）
-- Test: server_cmd.rs / 装配集成测试
+- Modify: `oj/src/serve_cmd.rs`（装配流程接线，spec §5 全流程）
+- Test: serve_cmd.rs / 装配集成测试
 
 **Interfaces:**
 - Consumes: Task 3.2 两模式加载 + Task 3.6 自省字段。

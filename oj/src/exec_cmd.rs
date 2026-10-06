@@ -18,7 +18,7 @@ use tokio::runtime::Builder as TokioBuilder;
 use crate::app::{Backend, ResourceProfiles, assemble_backend};
 use crate::args::ExecArgs;
 use crate::exec_ext::{ExecOptions, oj_exec_ext_init};
-use crate::server_cmd::load_app_config;
+use crate::serve_cmd::load_app_config;
 
 /// 入口：解析校验 → 钉线程 → 装配后端 → 执行脚本 → 进程退出码。
 pub fn run(a: ExecArgs) -> Result<i32, String> {

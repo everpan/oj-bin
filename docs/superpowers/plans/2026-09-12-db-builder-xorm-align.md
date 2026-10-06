@@ -1799,7 +1799,7 @@ unix@vip.qq.com ai"
 ### Task 13：e2e（join + insert 走 HTTP 全链路）
 
 **Files:**
-- Test: `oj/tests/e2e.rs`（新增用例；fixture 形态参照既有 `uc1_method_table`——tmpdir + src 模块树 + config + `server_cmd::start`）
+- Test: `oj/tests/e2e.rs`（新增用例；fixture 形态参照既有 `uc1_method_table`——tmpdir + src 模块树 + config + `serve_cmd::start`）
 - 需模块内 `schema.yaml` 声明两表（SchemaRegistry 装配来源，见 `oj/src/app.rs:222` 的 `table_owned`）
 
 **Interfaces:**
@@ -1826,7 +1826,7 @@ async fn e2e_query_builder_join_and_insert() {
 
 （实现 Step：先 `grep -rn "schema.yaml" sample/src oj/tests/e2e.rs` 抄既有声明语法；
 `db` 用 `sqlite://` 临时文件 DSN 并先经 `db.exec` 建表插种子，或借 module seed.sql 机制——
-参照 `server_cmd.rs` 测试 `module_seeds_replayed_and_served` 的 seed.sql 形态。）
+参照 `serve_cmd.rs` 测试 `module_seeds_replayed_and_served` 的 seed.sql 形态。）
 
 - [x] **Step 2: 跑通**
 

@@ -1,4 +1,4 @@
-//! 进程内应用装配：`App` 抽取自原 `server_cmd::start` 的装配段。
+//! 进程内应用装配：`App` 抽取自原 `serve_cmd::start` 的装配段。
 //!
 //! 设计要点（评审修正清单）：
 //! - 单一 `StableState` 在 `from_config` 内构造一次，被 `App` 的 actor 工厂与测试运行时
@@ -32,17 +32,17 @@ use only_js::bridge::{
 use only_js::bridge::{EventBroker, SqlGuard, StableState};
 use only_js::config::{self, Config};
 use only_js::contract::{InputContract, InputContractRegistry};
-use server::CertificateStatus;
-use server::actor::JsActor;
-use server::certificate::load_certificate_at;
-use server::certificate_watcher::{SharedCertStatus, SharedCertValidUntil, spawn_watcher};
-use server::routes;
-use server::ws;
+use serve::CertificateStatus;
+use serve::actor::JsActor;
+use serve::certificate::load_certificate_at;
+use serve::certificate_watcher::{SharedCertStatus, SharedCertValidUntil, spawn_watcher};
+use serve::routes;
+use serve::ws;
 use tokio::task::JoinHandle;
 use tower::util::ServiceExt;
 
 use crate::manifest;
-use crate::server_cmd::{Registries, assemble_blobs, assemble_plugins, connect_dbs};
+use crate::serve_cmd::{Registries, assemble_blobs, assemble_plugins, connect_dbs};
 
 /// 进程内 HTTP 派发契约：测试运行时把 `Arc<App>` 注入 OpState，JS `client` 全局经
 /// `op_client_dispatch` 调它。trait 必须 `Send+Sync+'static` 且方法用 `async_trait`
@@ -366,13 +366,13 @@ fn is_legacy_prefix_shape(entry: &str) -> bool {
     }
 }
 
-/// 路径 → 段（与 `server::split_segments` 同口径：去空段，故尾斜杠与重复斜杠不影响判定）。
+/// 路径 → 段（与 `serve::split_segments` 同口径：去空段，故尾斜杠与重复斜杠不影响判定）。
 fn split_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
 }
 
 /// 路由 pattern → 匿名路径口径：剥掉 base 前缀，参数段 `{param}` / `{*rest}` 归一为
-/// `*` / `**`（匿名路径按**去 base 后**的请求路径匹配，见 `server::path_matches`）。
+/// `*` / `**`（匿名路径按**去 base 后**的请求路径匹配，见 `serve::path_matches`）。
 fn anon_view_of_route(pattern: &str, base: &str) -> String {
     let b = base.trim_matches('/');
     let p = pattern.strip_prefix(&format!("/{b}")).unwrap_or(pattern);
@@ -496,8 +496,8 @@ pub fn build_mail_backend(
     };
     // A5：双配置源（非空 `smtp:` ＋ 非空 `plugins.mail`）此处即 fail-fast ——
     // `plugin_cfg` 会让透传静默胜出，不能等到「改了白名单不生效」才发现。
-    crate::server_cmd::check_mail_cfg_sources(cfg)?;
-    let json = crate::server_cmd::plugin_cfg(cfg, "mail", None).unwrap();
+    crate::serve_cmd::check_mail_cfg_sources(cfg)?;
+    let json = crate::serve_cmd::plugin_cfg(cfg, "mail", None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("smtp cfg: {e}"))?;
     // 空 cfg（既无 `smtp:` 段也无 `plugins.mail` 透传）→ 视作未配置。
@@ -520,8 +520,8 @@ pub fn build_ldap_backend(
     let Some(vtable) = vtable else {
         return Ok(None);
     };
-    crate::server_cmd::check_ldap_cfg_sources(cfg)?;
-    let json = crate::server_cmd::plugin_cfg(cfg, "ldap", None).unwrap();
+    crate::serve_cmd::check_ldap_cfg_sources(cfg)?;
+    let json = crate::serve_cmd::plugin_cfg(cfg, "ldap", None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("ldap cfg: {e}"))?;
     if value.as_object().is_none_or(|o| o.is_empty()) {
@@ -584,11 +584,11 @@ fn static_dir(config_dir: &Path, r: &str) -> Result<PathBuf, String> {
 /// 有效静态站点表（装配第 20 步，v0.1.27 多站点）：legacy `(app_prefix, app_path)` 对 +
 /// `server.static_sites` 逐条 → `Vec<StaticSite>`。前缀经 `resolve_app_prefix` 归一；
 /// 归一后重复 → Err（报两条来源）；目录相对 config_dir 绝对化 + canonicalize。
-/// **不排序**——最长前缀优先的排序归 `server::app()` 独家负责。
+/// **不排序**——最长前缀优先的排序归 `serve::app()` 独家负责。
 fn resolve_static_sites(
     cfg: &Config,
     config_dir: &Path,
-) -> Result<Vec<server::StaticSite>, String> {
+) -> Result<Vec<serve::StaticSite>, String> {
     let mut out = Vec::new();
     // 归一前缀 → 来源描述（dup 报错要报两条来源）。
     let mut seen: Vec<(String, String)> = Vec::new();
@@ -596,17 +596,17 @@ fn resolve_static_sites(
                 path: &str,
                 headers: &std::collections::HashMap<String, String>,
                 source: &str,
-                out: &mut Vec<server::StaticSite>,
+                out: &mut Vec<serve::StaticSite>,
                 seen: &mut Vec<(String, String)>|
      -> Result<(), String> {
-        let p = crate::server_cmd::resolve_app_prefix(prefix)
+        let p = crate::serve_cmd::resolve_app_prefix(prefix)
             .map_err(|e| format!("{source}: prefix {prefix:?}: {e}"))?;
         if let Some((_, prev)) = seen.iter().find(|(q, _)| *q == p) {
             return Err(format!("静态站点前缀 {p} 重复：{source} 与 {prev} 冲突"));
         }
         seen.push((p.clone(), source.to_string()));
         let root = static_dir(config_dir, path).map_err(|e| format!("{source}: {e}"))?;
-        out.push(server::StaticSite {
+        out.push(serve::StaticSite {
             prefix: p,
             root,
             headers: headers
@@ -1245,14 +1245,14 @@ impl App {
         let actor = JsActor::pool(n, make_bridge.clone());
         // 静态站点表（装配第 20 步，v0.1.27 多站点）：legacy (app_prefix, app_path) 对 +
         // server.static_sites 逐条；前缀归一 + dup fail-fast（报两条来源）+ 目录
-        // canonicalize（缺失 fail-fast）。最长前缀排序归 server::app()。
+        // canonicalize（缺失 fail-fast）。最长前缀排序归 serve::app()。
         let static_sites = resolve_static_sites(&cfg, config_dir)?;
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
         config::validate_tenant_binding(&cfg, auth.is_some())?;
-        let pipeline = server::Pipeline {
+        let pipeline = serve::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             tenant_require_signed_claim: cfg.tenant.require_signed_claim,
             tenant_anon: config::anon_paths(&cfg.tenant.anonymous_paths),
@@ -1278,7 +1278,7 @@ impl App {
             blob: stable.blobs.default(),
         };
         // WS 目录镜像挂载（<dir>/ws.ts → {base}/<dir>/ws）。
-        let ws_opts = server::ws::WsOptions {
+        let ws_opts = serve::ws::WsOptions {
             max_connections: cfg.ws.max_connections,
             workers_per_route: cfg.ws.workers_per_route,
             idle_linger_ms: cfg.ws.idle_linger_ms,
@@ -1307,7 +1307,7 @@ impl App {
                     .into(),
             );
         }
-        let router = server::app(
+        let router = serve::app(
             &base,
             dir,
             ts,
@@ -1317,7 +1317,7 @@ impl App {
             static_sites,
             // 静态站点增强（v0.1.20 / v0.1.25）：SPA 深链接回落 + per-route meta 注入
             // （静态 JSON 打底 + 动态 handler 覆盖）+ HTML Cache-Control。
-            server::StaticOpts {
+            serve::StaticOpts {
                 spa_fallback: cfg.server.app_spa_fallback,
                 html_meta: cfg.server.html_meta.clone(),
                 html_meta_handler: cfg.server.html_meta_handler.clone(),
@@ -1389,12 +1389,12 @@ impl App {
             .map_err(|e| format!("local_addr: {e}"))?;
         let router = self.router.clone(); // Router 克隆廉价（内部 Arc）
         let h = tokio::spawn(async move {
-            let _ = server::serve_router(listener, router, shutdown).await;
+            let _ = serve::serve_router(listener, router, shutdown).await;
         });
         Ok((bound, h))
     }
 
-    /// 长任务停机 flag（server_cmd 信号处理器置位）。
+    /// 长任务停机 flag（serve_cmd 信号处理器置位）。
     pub fn tasks_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.tasks_flag.clone()
     }
@@ -1404,13 +1404,13 @@ impl App {
         self.router = self.router.clone().merge(r);
     }
 
-    /// 任务管理 API 装配状态（server_cmd 组装 `{base}/tasks` 路由用）。
+    /// 任务管理 API 装配状态（serve_cmd 组装 `{base}/tasks` 路由用）。
     pub fn tasks_api_state(
         &self,
         registry: Arc<only_js::bridge::task_pool::TaskRegistry>,
         pool: Option<Arc<only_js::bridge::task_pool::TaskPool>>,
-    ) -> server::tasks::TasksApiState {
-        server::tasks::TasksApiState {
+    ) -> serve::tasks::TasksApiState {
+        serve::tasks::TasksApiState {
             registry,
             pool,
             auth: self.auth_guard.clone(),

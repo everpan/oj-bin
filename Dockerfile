@@ -89,5 +89,5 @@ ENV OJ_PLUGINS_DIR=/usr/local/oj/plugins
 WORKDIR /app
 EXPOSE 9778
 
-ENTRYPOINT ["oj", "server"]
+ENTRYPOINT ["oj", "serve"]
 CMD ["-c", "config.yaml", "--api-path", "src"]

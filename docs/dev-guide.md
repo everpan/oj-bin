@@ -163,7 +163,7 @@ oj/                   # CLI 二进制：server / build / test / migrate / fixtur
 ├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
 ├── pack.rs           # 确定性 tgz 打包（mtime=0/mode 0644/排序 → 同输入同字节）
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/routes.js/锁/tgz）
-├── server_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
+├── serve_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
 └── tests/e2e.rs      # 端到端验收（UC-1…15）
 server/               # crate: server（axum HTTP 层）
 ├── lib.rs            # axum app 装配 + 前置管线 + 静态站点兜底 + serve_router
@@ -392,7 +392,7 @@ import 解析报错、热重载不生效、dev/release 行为不一致时读这�
 - **release 模式**：服务 `oj build` 产出的 `dist/`（预转译 JS + `routes.js` +
   `manifests.yaml` 版本锁），不转译。
 
-模式自动判定（`oj/src/server_cmd.rs` 的 `is_release`）：目录含 `dist/manifests.yaml` ⇒
+模式自动判定（`oj/src/serve_cmd.rs` 的 `is_release`）：目录含 `dist/manifests.yaml` ⇒
 release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](cli2.md)。
 
 ### import 解析细节（module_loader.rs）
@@ -509,7 +509,7 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
   `publish` try_send 广播 JSON 帧并清理 closed sender（返回接收方数），`subscribe` 去重注册。
   WS 会话的帧通道经 `ReqState.req.bus_tx` 注入（`RequestInfo.bus_tx`，ws.rs frame_loop 里
   `bus_tx→resp_tx` 转发任务与 `ws.send` 同一写出通道，保序）；HTTP 上下文 `bus_tx=None` →
-  `op_bus_subscribe` 报错。server 装配共享**一个** `Arc<dyn EventBroker>`（server_cmd 注入
+  `op_bus_subscribe` 报错。server 装配共享**一个** `Arc<dyn EventBroker>`（serve_cmd 注入
   Extras.bus，local 或插件 broker）。FFI 版经全局 `DELIVER_TARGETS` 按 topic 扇出，跨
   actor 池/全部 WS 连接共享语义与内置 Bus 一致（`ffi_broker_shared_across_bridges` 回归）。
 - `es.rs`：`EsBackend` trait（search/index_doc/delete_doc）+ 内置 `reqwest` 实现；
@@ -842,7 +842,7 @@ core，装配层只经安全入口）。
   公共端点 `GET {base}/plugins` 输出插件名/semver/ABI/指纹/**自描述 desc** + 宿主
   ABI_VERSION（升级核对窗口）。
 
-**五轴接线**（server_cmd `build_registries`）：
+**五轴接线**（serve_cmd `build_registries`）：
 
 - es 键选单后端；「cfg es 声明但无 es 插件」→ fail fast。
 - db 认领式注册表：内置 sqlite/memory 打底 + 插件 db 工厂（scheme 交集冲突 fail fast；

@@ -713,7 +713,7 @@ pub(crate) fn build_table(dir: &Path, ts: bool, base: &str) -> RouteTable {
 ### Task 5: CLI 接线与启动打印
 
 **Files:**
-- Modify: `../../../oj/src/server_cmd.rs`（hoist make 闭包；内省建表；打印；serve 传参）
+- Modify: `../../../oj/src/serve_cmd.rs`（hoist make 闭包；内省建表；打印；serve 传参）
 
 **Interfaces:**
 - Consumes: Task 4 的 `serve(addr, base, dir, ts, table, actor, timeout)`、`RouteTable::listing`、`bridge_introspector`；Task 3 `INTROSPECT_TIMEOUT`（间接）。
@@ -721,7 +721,7 @@ pub(crate) fn build_table(dir: &Path, ts: bool, base: &str) -> RouteTable {
 - [ ] **Step 1: 实现**（CLI 无测试基建，逻辑全部在已测组件里，本任务只做接线——接线正确性由 Step 2 手工验证兜住）
 
 ```rust
-// server_cmd.rs run() 内，替换 :62-68 打印段，actor 池构造前：
+// serve_cmd.rs run() 内，替换 :62-68 打印段，actor 池构造前：
 let (table, failures) = {
     let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
     let make = move || Bridge::with_dbs_and_loader(dbs.clone(), kv.clone(), SchemaRegistry::new(), false, Some(loader.clone()));
@@ -736,7 +736,7 @@ for r in table.listing() {
 // actor 池用同一 make（hoist 到 table 构造前的变量，move 进 pool 闭包）。
 // serve 调用加 table 参数。
 ```
-（`Bridge`/`SchemaRegistry` 等已在 server_cmd.rs use；确认 `mdm_server::routes::{RouteTable, bridge_introspector}` 导入。）
+（`Bridge`/`SchemaRegistry` 等已在 serve_cmd.rs use；确认 `mdm_server::routes::{RouteTable, bridge_introspector}` 导入。）
 
 - [ ] **Step 2: 手工验证**（sample 项目跑通）
 
@@ -808,6 +808,6 @@ curl -s -i localhost:8080/v1/api/file             # 404（catch-all ≥1 段）
 
 ## Self-Review 记录
 
-- 规格覆盖：设计稿 §2 内省策略→Task 3+5；§3 语法→Task 1/2 测试；§4 建表→Task 2；§5 冲突→Task 2；§6 normalize/兜底/契约→Task 1/4；§7 参数/解码→Task 1/4；§8 清单→Tasks 1-6 逐行对应（`Cargo.toml`/routes/lib/mod/bootstrap/server_cmd/user-manual/sample 全覆盖）；§9 Demo→Task 6。无缺口。
+- 规格覆盖：设计稿 §2 内省策略→Task 3+5；§3 语法→Task 1/2 测试；§4 建表→Task 2；§5 冲突→Task 2；§6 normalize/兜底/契约→Task 1/4；§7 参数/解码→Task 1/4；§8 清单→Tasks 1-6 逐行对应（`Cargo.toml`/routes/lib/mod/bootstrap/serve_cmd/user-manual/sample 全覆盖）；§9 Demo→Task 6。无缺口。
 - 类型一致：`introspect` 闭包签名、`Lookup`/`Entry`/`RouteRow`、`serve*` 参数序（table 在 actor 前）全计划统一。
 - 已知边角：`{id}` 语法零翻译（无 `{{` 特判——matchit 原生处理）；root 级 `api.ts` 的 dir_base 无尾斜杠特判在 Task 2 `rel.is_empty()` 分支。

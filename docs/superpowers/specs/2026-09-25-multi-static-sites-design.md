@@ -24,7 +24,7 @@ pub struct StaticSiteConf {
 // ServerCfg 新增：#[serde(default)] pub static_sites: Vec<StaticSiteConf>
 ```
 
-### CLI 折叠（`oj/src/server_cmd.rs::run`，App::from_config 之前）
+### CLI 折叠（`oj/src/serve_cmd.rs::run`，App::from_config 之前）
 
 - 裸 `dir`：>1 个 → Err；恰 1 个 → `cfg.server.app_path = abs(cwd, dir)`（现有行为）。
 - `prefix=dir`：`prefix` 过 `resolve_app_prefix` 校验，`cfg.server.static_sites` 中
@@ -45,7 +45,7 @@ pub struct StaticSiteConf {
   ——排序保证最长命中；命中站点内 miss → 该站点 SPA 回落（若开），**不跨站**。
 - `strip_app_prefix`/`resolve_static`/`static_page`/`StaticOpts` 不动（`html_meta`/spa/cache 全局）。
 
-### 准入门（`server_cmd.rs::admission_gate`）
+### 准入门（`serve_cmd.rs::admission_gate`）
 
 静态存在性检查统一移到站点表解析（错误文案对齐：`server.static_sites[prefix=…]: …`
 / `server.app_path …`）；gate 只管「至少指定其一」+ api 目录存在。
@@ -54,7 +54,7 @@ pub struct StaticSiteConf {
 
 - config：static_sites 解析 round-trip、缺省为空。
 - args：`--app-path` 单/多值解析（Vec）。
-- server_cmd：裸多值报错、prefix=dir upsert/替换、裸+带前缀混合。
+- serve_cmd：裸多值报错、prefix=dir upsert/替换、裸+带前缀混合。
 - app 装配：重复前缀 fail-fast（app_path 对 vs static_sites 同名两条）、缺失目录 fail-fast、
   最长前缀排序、CLI 覆盖同前缀。
 - lib.rs：双站点最长前缀匹配、`/` 兜底、站内 miss 不跨站、per-site meta（某站无 __meta 目录

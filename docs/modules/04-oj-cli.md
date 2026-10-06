@@ -7,7 +7,7 @@
 
 | 命令 | 主要参数 | 实现 |
 |---|---|---|
-| `server` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log` | `server_cmd.rs:21` |
+| `server` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log` | `serve_cmd.rs:21` |
 | `build [module]` | `-d/--dir`（默认 `src`）、`-o/--out`（默认 `dist`）、`--no-minify`、`--check` | `build_cmd.rs:16` |
 | `test` | `-c`、`-b`、`-d`、`-t/--tests`（默认 `tests`，相对 config_dir）、`--format`（human/tap/junit/json）、`--output` | `test_cmd.rs:46` |
 | `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
@@ -70,7 +70,7 @@
 `dispatch` = `Router::oneshot`（**零 TCP**，对标 Go Fiber `app.Test`），外层
 `DISPATCH_TIMEOUT = 60s` 兜底 → 408；`base()` 供 op 拼路径。
 
-## 3. `server_cmd.rs` 其余职责
+## 3. `serve_cmd.rs` 其余职责
 
 - `load_app_config`（:61）：config 解析 + 目录/模式判定 + base 归源，`server` 与 `test` 共用。
   目录缺失不在此拦截：server 准入由 `run()` 裁定，migrate/fixture/test 强依赖 api
@@ -170,7 +170,7 @@ default 等于把迁移打在开发库上，与 `oj test --db`（`test_cmd.rs`�
 
 - `App::from_config` 主干 294 行 + 6 个私有步骤函数（2026-09-06 拆分后）；
   路由表构建与 `make_bridge` 闭包仍内联，若再拆需先收拢共享变量。
-- `server_cmd::serve` / `serve_with_listener` 与 `App::serve` 两套入口并存。
+- `serve_cmd::serve` / `serve_with_listener` 与 `App::serve` 两套入口并存。
 - `oj test` 的 `describe/it/expect` 是自研迷你框架，匹配器只有
   `toBe/toEqual/toBeTruthy/toBeFalsy/toContain` 五个（见 [08-testing.md](08-testing.md)）。
 - **瘦身装配的 `--db` 是整轮目标库，不解析模块级 `manifest.db`**（v0.1.21）：

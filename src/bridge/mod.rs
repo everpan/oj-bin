@@ -1094,7 +1094,7 @@ impl Bridge {
 
     /// 与 `run_module` 相同，但可显式关闭入参契约校验。
     ///
-    /// **仅**内部合成派发（`server::dispatch_meta_handler`）用 `validate=false`：
+    /// **仅**内部合成派发（`serve::dispatch_meta_handler`）用 `validate=false`：
     /// 那个请求是框架自己造的（`query={"path":…}`、空 body），不是外部输入；
     /// 让它的契约校验失败只会静默降级页面 meta，属于误伤。
     /// 外部请求**一律** `validate=true`（缺省即如此）。

@@ -186,8 +186,8 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
     let mut cfg: Config = only_js::config::load_from(&t.0, Some("config.yaml")).unwrap();
     cfg.plugins_dir = Some(plugins);
     // 证书必配（无逃生口）：测试自带有效 JWS（有效期 [now-1h, now+1y]）。
-    let n = server::test_support::now_secs();
-    server::test_support::write_cert_into(
+    let n = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
         &mut cfg.server,
         &t.0,
         n.saturating_sub(3600),

@@ -861,7 +861,7 @@ mod tests {
         // 未知子命令 / 未知长旗标
         assert!(cli(&["foo"]).is_err());
         assert!(cli(&["serve", "--nope"]).is_err());
-        // --dev 已删：模式由 --api-path 目录自动判定（server_cmd::is_release）
+        // --dev 已删：模式由 --api-path 目录自动判定（serve_cmd::is_release）
         assert!(cli(&["serve", "--dev"]).is_err());
         // server 的 -d/--dir 已删（改为 --api-path）：clap 拒绝
         assert!(cli(&["serve", "-d", "src"]).is_err());

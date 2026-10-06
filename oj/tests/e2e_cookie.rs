@@ -5,11 +5,11 @@
 //! 不与 e2e.rs 的 boot(cfg.auth=None) 互相污染。
 //!
 //! 前置：`cargo xtask plugin auth` 已把 libauth.dylib 归置 bin/plugins/<triple>/
-//! （server_cmd 默认发现路径）。真实插件装配 = 生产语义。
+//! （serve_cmd 默认发现路径）。真实插件装配 = 生产语义。
 
 use std::path::{Path, PathBuf};
 
-use oj::server_cmd;
+use oj::serve_cmd;
 use only_js::config::Config;
 
 fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
@@ -27,8 +27,8 @@ fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
 fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
-    let n = server::test_support::now_secs();
-    server::test_support::write_cert_into(
+    let n = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
         &mut cfg.server,
         dir,
         n.saturating_sub(3600),
@@ -39,7 +39,7 @@ fn base_cfg(dir: &Path) -> Config {
 }
 
 fn sign(sub: &str, secret: &[u8]) -> String {
-    let now = server::test_support::now_secs();
+    let now = serve::test_support::now_secs();
     let claims = serde_json::json!({
         "sub": sub, "roles": ["editor"], "iat": now, "exp": now + 3600,
     });
@@ -143,7 +143,7 @@ async fn cookie_session_and_ws_handshake_auth_end_to_end() {
         cookie: Some(serde_json::json!({"enabled": true})),
         ..Default::default()
     });
-    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await
         .unwrap();
     let secret = b"cookie-e2e-secret";

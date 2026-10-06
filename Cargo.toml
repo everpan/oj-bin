@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "oj", "oj-plugin-ffi", "plugins/oj-es", "plugins/oj-db-mysql", "plugins/oj-db-postgres", "plugins/oj-blob-s3", "plugins/oj-bus-kafka", "plugins/oj-bus-rabbitmq", "plugins/oj-kv-redis", "plugins/oj-auth", "plugins/oj-mail", "plugins/oj-ldap", "tools/xtask", "tools/oj-cert", "tests/plugins/mini", "tests/plugins/mini-kv", "tests/plugins/mini-mq", "tests/plugins/mini-mail", "tests/plugins/mini-nosym"]
+members = ["serve", "oj", "oj-plugin-ffi", "plugins/oj-es", "plugins/oj-db-mysql", "plugins/oj-db-postgres", "plugins/oj-blob-s3", "plugins/oj-bus-kafka", "plugins/oj-bus-rabbitmq", "plugins/oj-kv-redis", "plugins/oj-auth", "plugins/oj-mail", "plugins/oj-ldap", "tools/xtask", "tools/oj-cert", "tests/plugins/mini", "tests/plugins/mini-kv", "tests/plugins/mini-mq", "tests/plugins/mini-mail", "tests/plugins/mini-nosym"]
 default-members = ["."]
 
 [package]
@@ -99,7 +99,7 @@ criterion = "0.8.2"
 rand = "0.10.2"
 oj = { path = "oj" }
 # test-support：复用 server::test_support 的测试证书夹具（全仓唯一定义，勿再拷贝密钥对）。
-server = { path = "server", features = ["test-support"] }
+serve = { path = "serve", features = ["test-support"] }
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "test-util"] }
 httptest = "0.16"
 tempfile = "3"

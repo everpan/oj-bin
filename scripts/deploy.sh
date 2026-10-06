@@ -160,7 +160,7 @@ if [[ "$TRIPLE" == *linux*gnu* ]]; then
 # oj-bin 自带 glibc 启动器（仅 Linux glibc 发行包）。直接调用打包的 ld-linux 加载
 # 真实二进制 oj.bin，使其使用 lib/ 内的 glibc 运行时，彻底绕开宿主机 glibc 版本限制。
 DIR="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
-# 标记自带运行时：server --daemon re-exec 自身（server_cmd::daemonize）凭此继续走打包
+# 标记自带运行时：serve --daemon re-exec 自身（server_cmd::daemonize）凭此继续走打包
 # ld-linux，否则子进程按 oj.bin 的 PT_INTERP 落回系统 ld-linux，低版本宿主 glibc 即崩。
 export OJ_BUNDLED_LD="\$DIR/lib/${INTERP_BASE}"
 export OJ_BUNDLED_LIB="\$DIR/lib"

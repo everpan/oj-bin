@@ -4,7 +4,7 @@
 
 **Goal:** 删除 `oj server --grace-days` CLI 参数（宽限天数仅由 config 提供）；新建独立工具 crate `tools/oj-cert`（RSA 密钥对 + JWS 证书生成与重签续期）。
 
-**Architecture:** Part 1 纯删除（args/server_cmd/main.rs 测试/文档）。Part 2 新 bin crate `oj-cert`（`src/lib.rs` 持有 gen/renew 逻辑供集成测试直测，`src/main.rs` 为 clap 薄壳）；证书格式与 `server/src/certificate.rs` 契约一致（JWS 三段式，header `{"alg":"RS256","typ":"JWT"}`，payload `{nbf,exp}`，RS256）。
+**Architecture:** Part 1 纯删除（args/serve_cmd/main.rs 测试/文档）。Part 2 新 bin crate `oj-cert`（`src/lib.rs` 持有 gen/renew 逻辑供集成测试直测，`src/main.rs` 为 clap 薄壳）；证书格式与 `server/src/certificate.rs` 契约一致（JWS 三段式，header `{"alg":"RS256","typ":"JWT"}`，payload `{nbf,exp}`，RS256）。
 
 **Tech Stack:** clap 4.5 (derive)、rsa 0.9（features=["pem"]；ring 不能生成 RSA 密钥）、base64 0.23、serde_json 1。
 
@@ -26,7 +26,7 @@
 
 **Files:**
 - Modify: `oj/src/args.rs`（ServerArgs 字段、clap 定义、to_command、测试）
-- Modify: `oj/src/server_cmd.rs:30-33`（覆盖合并块）
+- Modify: `oj/src/serve_cmd.rs:30-33`（覆盖合并块）
 - Modify: `oj/src/main.rs:105`（测试字面量）
 - Modify: `docs/user-manual.md:30,44`、`docs/dev-manual.md:247`
 
@@ -53,7 +53,7 @@ Expected: FAIL —— `ServerArgs`/`Commands::Server` 仍含 `grace_days`，但 
 1. `oj/src/args.rs:18-19` 删 `ServerArgs.grace_days` 字段及文档注释。
 2. `oj/src/args.rs:81-83` 删 `Commands::Server` 的 `grace_days` clap 参数及文档注释。
 3. `oj/src/args.rs` `to_command` 中 `Commands::Server` 分支：解构与构造两处各删 `grace_days,`。
-4. `oj/src/server_cmd.rs`：注释 `// CLI 覆盖：证书路径与宽限天数（若有）。` 改为 `// CLI 覆盖：证书路径（若有）。`，并删除：
+4. `oj/src/serve_cmd.rs`：注释 `// CLI 覆盖：证书路径与宽限天数（若有）。` 改为 `// CLI 覆盖：证书路径（若有）。`，并删除：
 
 ```rust
     if let Some(d) = a.grace_days {

@@ -91,7 +91,7 @@ pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail
 
 插件自描述 `descriptor.desc` 必填，经 `GET {base}/plugins` 公开。
 
-## 4. 注册表与冲突策略（`oj/src/server_cmd.rs:264`）
+## 4. 注册表与冲突策略（`oj/src/serve_cmd.rs:264`）
 
 | 轴 | 注册形态 | 冲突 |
 |---|---|---|

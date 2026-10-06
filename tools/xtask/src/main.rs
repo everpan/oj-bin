@@ -239,7 +239,7 @@ fn check(name: &str) -> Result<(), String> {
     }];
     let host = host_context();
     // 预检只验证可加载性（ABI/身份/semver/按轴符号探测）：需要装配期 cfg 的插件给占位值，
-    // 真实 cfg 由服务器装配层注入（server_cmd::plugin_cfg）。
+    // 真实 cfg 由服务器装配层注入（serve_cmd::plugin_cfg）。
     let cfg_for = |name: &str| -> String {
         match name {
             "auth" => r#"{"jwt_secret":"precheck"}"#.to_string(),

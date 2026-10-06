@@ -60,7 +60,7 @@ async fn drain_reaches_plugin_and_stops_accepting_new_mail() {
         "排空前那封必须真落盘：{env}"
     );
 
-    // ② 生产停机入口（server_cmd 在 HTTP 停收 + 任务收场之后调它）。
+    // ② 生产停机入口（serve_cmd 在 HTTP 停收 + 任务收场之后调它）。
     app.drain_mail(Duration::from_secs(5)).await;
 
     // ③ 排空后插件不再收投递 —— 这是「控制报文真到达插件」的行为证据

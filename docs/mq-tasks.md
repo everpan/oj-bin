@@ -175,7 +175,7 @@ SIGSEGV 纪律：terminate 后本线程兜一轮 event loop 再丢弃 runtime，
 **监督器**（`oj/src/tasks.rs`）：`scan_tasks` 递归扫描 `task_{name}.*` /
 `{name}_task.*`（其余文件是共享库；同名双写、超 `max` fail-fast）→ 每任务
 `std::thread`（名 `task-{name}`）内 current_thread runtime + 独立 Bridge（
-`catch_unwind` 兜 panic）→ 循环 `run_task`。停机序列（`server_cmd.rs` 全仓首个信号
+`catch_unwind` 兜 panic）→ 循环 `run_task`。停机序列（`serve_cmd.rs` 全仓首个信号
 处理器）：SIGINT/SIGTERM → 停机 flag 置位 → axum `with_graceful_shutdown` 同信号
 排空在途请求 → 任务在 `stop_grace_secs` 内自然收场（不退者看门狗强杀）→ join → 退出。
 

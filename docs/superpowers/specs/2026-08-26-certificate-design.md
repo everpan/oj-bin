@@ -83,7 +83,7 @@ if verb == "GET" {
 ---
 
 ## 7. 服务启动提示
-在 `main`（或 `server_cmd::run`）完成证书加载后：
+在 `main`（或 `serve_cmd::run`）完成证书加载后：
 ```rust
 match app_state.certificate_status {
     CertificateStatus::Expired => {

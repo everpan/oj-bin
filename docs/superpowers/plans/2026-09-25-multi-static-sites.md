@@ -27,15 +27,15 @@
 
 ### Task 2: CLI — `--app-path` 可重复 + 折叠 + 准入门
 
-**Files:** Modify: `oj/src/args.rs`、`oj/src/server_cmd.rs`（run/admission_gate + tests）
+**Files:** Modify: `oj/src/args.rs`、`oj/src/serve_cmd.rs`（run/admission_gate + tests）
 
 **Interfaces:**
 - Consumes: Task 1 `StaticSiteConf`、`resolve_app_prefix`。
-- Produces: `ServerArgs.app_path: Vec<String>`（clap 可重复）；`admission_gate(api_dir: Option<&Path>, app_specified: bool) -> Result<(), String>`（静态存在性移交装配）；`fold_cli_app_paths(cfg, entries, cwd) -> Result<(), String>`（server_cmd 内私有：裸 ≤1 → app_path；`prefix=dir` → static_sites upsert）。
+- Produces: `ServerArgs.app_path: Vec<String>`（clap 可重复）；`admission_gate(api_dir: Option<&Path>, app_specified: bool) -> Result<(), String>`（静态存在性移交装配）；`fold_cli_app_paths(cfg, entries, cwd) -> Result<(), String>`（serve_cmd 内私有：裸 ≤1 → app_path；`prefix=dir` → static_sites upsert）。
 
 - [x] args.rs：`app_path: Option<String>` → `Vec<String>`；测试 `server_defaults_and_overrides` 适配（单值 → `vec!["web"]`；新增多值用例 `--app-path a --app-path /x=b` → `["a", "/x=b"]`）
-- [x] server_cmd.rs：run() 改用 fold（裸多值 Err `"--app-path <dir> (bare) may appear at most once"`；prefix 过 `resolve_app_prefix`）；admission_gate 改 `app_specified: bool`（存在性检查删除，错误文案保留 api 部分）
-- [x] server_cmd tests：gate 新签名全适配；fold：裸单值/裸多值报错/prefix=dir 追加+同前缀替换/裸+带前缀混合
+- [x] serve_cmd.rs：run() 改用 fold（裸多值 Err `"--app-path <dir> (bare) may appear at most once"`；prefix 过 `resolve_app_prefix`）；admission_gate 改 `app_specified: bool`（存在性检查删除，错误文案保留 api 部分）
+- [x] serve_cmd tests：gate 新签名全适配；fold：裸单值/裸多值报错/prefix=dir 追加+同前缀替换/裸+带前缀混合
 - [x] `cargo test --release -p oj` + commit
 
 ### Task 3: server — `StaticSite` + 服务侧多站点

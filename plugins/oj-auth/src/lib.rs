@@ -90,7 +90,7 @@ impl Guard {
         })
     }
 
-    /// 路径通配匹配：**与 `server::path_matches` 同语义的两份实现之一**（插件不能依赖
+    /// 路径通配匹配：**与 `serve::path_matches` 同语义的两份实现之一**（插件不能依赖
     /// server crate，两处各自持有、注释互指；改一侧必须同步另一侧与两侧单测矩阵）。
     ///
     /// v0.1.20 统一语义：字面 / `*` 恰好一段（尾 `/*` 仍是严格一层，**不**再像旧版那样
@@ -304,7 +304,7 @@ mod tests {
         .unwrap()
     }
 
-    /// 与 `server::path_matches` 同语义矩阵（防两处实现漂移；v0.1.20）。
+    /// 与 `serve::path_matches` 同语义矩阵（防两处实现漂移；v0.1.20）。
     #[test]
     fn anonymous_matching() {
         let g = guard();

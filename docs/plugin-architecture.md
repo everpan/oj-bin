@@ -57,7 +57,7 @@
 2. `bootstrap.js` 硬编码 `globalThis.blob` / `globalThis.es` / `globalThis.redis` 的装配。
 3. db 方言：当前由 `SqlxAccessor` 经 `sqlx::Any` + `install_default_drivers` 多路复用，
    方言仅由 `dialect_of(dsn)`（`src/bridge/db.rs:33`）挑选 sea-query builder；
-   DSN→Accessor 在 `oj/src/server_cmd.rs:82-88`、`oj/src/build_cmd.rs:186-189` 处硬编码为
+   DSN→Accessor 在 `oj/src/serve_cmd.rs:82-88`、`oj/src/build_cmd.rs:186-189` 处硬编码为
    `SqlxAccessor::arc(dsn)`。
 
 ### 1.3 硬约束（决定"动态"能做到什么程度）
@@ -127,7 +127,7 @@ impl DbBackendRegistry {
   委托现有 `SqlxAccessor::connect`（`src/bridge/accessor_sqlx.rs`）复用一个实现；
   `MemoryBackend` 返回 `InMemoryAccessor`（`src/bridge/db.rs:85`）。
 - **`StableState`** 新增 `db_backends: Arc<DbBackendRegistry>`（`src/bridge/mod.rs:68`）。
-- **DSN 解析改道**：`oj/src/server_cmd.rs:82-88`、`oj/src/build_cmd.rs:186-189` 的
+- **DSN 解析改道**：`oj/src/serve_cmd.rs:82-88`、`oj/src/build_cmd.rs:186-189` 的
   `SqlxAccessor::arc(dsn)` 换成 `registry.connect(dsn)`——未知前缀 DSN 现在**明确报错**
   （而非静默回落 sqlite）。
 - **自省 op**：新增核心 op `op_db_backends`（列已注册方言），`bootstrap.js` 暴露 `db.backends()`。

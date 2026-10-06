@@ -12,7 +12,7 @@
 > 与 `#` 别名实化，见 `docs/devkit/api-manual.md` §5 与
 > `docs/superpowers/specs/2026-09-15-module-import-alias-design.md`）；
 > 其余章节（matchit 语法/冲突处理/http.params）仍准确。
-> 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/server_cmd.rs`
+> 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/serve_cmd.rs`
 > 背景：当前目录镜像路由（`base + 目录路径 → <root>/<path>/api.(ts|js)`）**无路径参数**。`lib.rs:87` 写死 `params: HashMap::new()`，`http.param`(`bootstrap.js:43`) 只读 query。
 
 ## 一、目标
@@ -56,7 +56,7 @@ export default { get: list, post: detail };
 
 启动日志打印：总模块数 / 成功数 / 失败清单。
 
-**内省插入时机**：`server_cmd.rs` 中 LoaderShared 构造（:74）之后、actor 池构造（:76）之前。此时 dbs/kv/loader 均就绪；内省产物直接替换现 `route_table` 目录遍历打印（:66-68）。
+**内省插入时机**：`serve_cmd.rs` 中 LoaderShared 构造（:74）之后、actor 池构造（:76）之前。此时 dbs/kv/loader 均就绪；内省产物直接替换现 `route_table` 目录遍历打印（:66-68）。
 
 ## 三、`.route` 语法
 
@@ -123,7 +123,7 @@ build_route_table(root, base, loader_shared):
 
 - **拼接规范化**：`Routes::new` 把 base 归一成 `/v1/api/`（尾斜杠，`routes.rs:17`），字面 `base + route` 会得双斜杠（matchit 精确匹配，永不命中）。拼接前 `base.trim_end_matches('/')`，`route` 侧保留首 `/` 即可。
 - **同一函数挂多个方法**（`export default { get: f, post: f }`）：`.route` 在函数上，两个方法共享同一模式。若非本意，拆成两个函数。
-- `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`../oj/src/server_cmd.rs:66-68` 的打印改用其产物。
+- `route_table`(`routes.rs:54`) 由"只列目录"升级为"列真实路由"（含方法与参数模式），`../oj/src/serve_cmd.rs:66-68` 的打印改用其产物。
 
 ### 4.1 release 直载（`routes.js`，免内省）
 
@@ -280,7 +280,7 @@ if (p === "param") {
 | `server/src/lib.rs` | 126-138 | `parse_query` 改 form-urlencoded 解码，移除原"未 decode" ponytail 注（行为变更见 §7） |
 | `src/bridge/mod.rs` | 340-400 | 内省 driver 变体（读 `.route` 回传）；`run_module` 管道复用 |
 | `src/bridge/bootstrap.js` | 43-48 | `http.param` 合并 path→query |
-| `../oj/src/server_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |
+| `../oj/src/serve_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |
 | `../oj/src/build_cmd.rs` | 新文件 | `oj build`（§十一）：src → dist 转译、剥 `.route`、补相对 import 后缀、生成 `routes.js` |
 | `../oj/src/args.rs` | — | `Command::Build(BuildArgs)`（`-b/-d/-o`），替换占位 `Vec<String>` |
 | `docs/user-manual.md` | §9 表 / §10 表 / §11 | `http.param` 优先级 + 新增 `http.params` 行；§10 加 500 冲突行、404/405 文案更新、query 解码变更说明；§11 补 `.route` 示例与 `global.d.ts` |
@@ -391,7 +391,7 @@ get.route = "{id}";
 ## 十、副作用、成本与约束
 
 1. **`.route` 必须是顶层可求值的确定值**（字面量/常量表达式）。它在内省期求值一次、表即固化，请求期不再校验。若依赖可变状态（kv/时间/env 分支），表与模块实际行为**静默发散**。这是约束，不做运行时检测。
-2. **顶层副作用执行次数**：内省运行时 1 次 + 每个 actor 运行时首次触达该模块各 1 次（池大小 N → 最多 N+1 次；模块缓存 per-runtime，`?v=` 不变则不重跑）。顶层 db 写必须幂等（推荐迁移到 `seed.sql`）。内省期 dbs 已就绪（`server_cmd.rs` 先开库执行 seed），顶层只读查询安全。
+2. **顶层副作用执行次数**：内省运行时 1 次 + 每个 actor 运行时首次触达该模块各 1 次（池大小 N → 最多 N+1 次；模块缓存 per-runtime，`?v=` 不变则不重跑）。顶层 db 写必须幂等（推荐迁移到 `seed.sql`）。内省期 dbs 已就绪（`serve_cmd.rs` 先开库执行 seed），顶层只读查询安全。
 3. **热重载边界**：handler 内容修改靠 `?v=mtime` 免重启（不变）；新增/删除 api 文件、修改 `.route` 需重启。dev 由 §6.2 兜底缓解（带参数路由除外），release 一律重启。
 4. 可选参数（`{id?}`）、正则约束暂不纳入，列入后续迭代。
 

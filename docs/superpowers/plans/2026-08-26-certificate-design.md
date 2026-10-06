@@ -152,7 +152,7 @@ git commit -m "feat: implement certificate loading & verification"
 ### Task 3: Integrate certificate loading into server startup
 **Files:**
 - Modify: `server/src/lib.rs` (inside `app` function)
-- Modify: `server/src/server_cmd.rs` (run/start entry)
+- Modify: `server/src/serve_cmd.rs` (run/start entry)
 
 **Interfaces:**
 - Consumes: `certificate::load_certificate`
@@ -163,7 +163,7 @@ git commit -m "feat: implement certificate loading & verification"
 #[tokio::test]
 async fn test_start_fails_when_cert_expired_and_grace_over() {
     let cfg = dummy_cfg_expired_past_grace();
-    let result = server_cmd::run(ServerArgs { config: cfg.path.clone(), ..Default::default() }).await;
+    let result = serve_cmd::run(ServerArgs { config: cfg.path.clone(), ..Default::default() }).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("certificate expired"));
 }
@@ -178,7 +178,7 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
   `cargo test --test start_cert_expired_test::test_start_fails_when_cert_expired_and_grace_over -v`
 - [ ] **Step 5: Commit**
 ```bash
-git add server/src/lib.rs server/src/server_cmd.rs tests/start_cert_expired_test.rs
+git add server/src/lib.rs server/src/serve_cmd.rs tests/start_cert_expired_test.rs
 git commit -m "feat: load certificate at startup and abort on full expiry"
 ```
 

@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use server::logging::install_terminal_tee;
+use serve::logging::install_terminal_tee;
 
 /// 单文件阈值（B）。直接调 install 可绕开 `init` 里 100M 的下限钳制。
 const MAX_BYTES: u64 = 64;

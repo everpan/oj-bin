@@ -385,7 +385,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `src/config.rs`（`Config.plugins` 类型 `Option<Vec<String>>` → `HashMap<String, serde_json::Value>`）
-- Modify: `oj/src/server_cmd.rs`（`plugin_cfg_json` → `plugin_cfg`；严格清单改由 map 键驱动 + 子集断言测试）
+- Modify: `oj/src/serve_cmd.rs`（`plugin_cfg_json` → `plugin_cfg`；严格清单改由 map 键驱动 + 子集断言测试）
 
 **Interfaces:**
 - Produces:
@@ -395,7 +395,7 @@ unix@vip.qq.com ai"
 - Consumes: `plugin_loader::AXES`（Task 2 pub）。
 - **Schema 破坏（已裁定接受）**：旧列表写法 `plugins: [a, b]` 解析报错 fail-fast；仓库内零使用。
 
-- [ ] **Step 1: 写失败测试**（server_cmd.rs tests 追加）
+- [ ] **Step 1: 写失败测试**（serve_cmd.rs tests 追加）
 
 ```rust
     /// cfg 回落链（spec「plugins: 统一语义」）：非空对象透传 → 轴适配器 → {}；
@@ -465,9 +465,9 @@ Expected: FAIL（类型/函数未变）
     pub plugins: HashMap<String, serde_json::Value>,
 ```
 
-同步清理旧字段的消费点（`oj/src/server_cmd.rs` 约 338-340 行的清单分支）：严格模式改为从 `cfg.plugins` 键构建 `PluginManifestEntry`（沿用旧路径的门禁与错误文案）；`cfg.plugins` 为空 map = 扫描模式。
+同步清理旧字段的消费点（`oj/src/serve_cmd.rs` 约 338-340 行的清单分支）：严格模式改为从 `cfg.plugins` 键构建 `PluginManifestEntry`（沿用旧路径的门禁与错误文案）；`cfg.plugins` 为空 map = 扫描模式。
 
-`oj/src/server_cmd.rs`：
+`oj/src/serve_cmd.rs`：
 
 ```rust
 /// 第一方轴适配器（cfg 顶层段 → 插件 cfg JSON）。加新第一方轴且需要读顶层段时
@@ -511,7 +511,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/config.rs oj/src/server_cmd.rs
+git add src/config.rs oj/src/serve_cmd.rs
 git commit -m "feat(config)!: plugins 一段三用（键=严格清单/值=透传cfg/空对象回落），废弃 list 写法
 
 unix@vip.qq.com ai"
@@ -523,7 +523,7 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `src/bridge/plugin_loader.rs`（`PluginInfo` 增 `description`）
-- Modify: `oj/src/server_cmd.rs`（装配聚合 `Vec<PluginInfo>` 并传递）
+- Modify: `oj/src/serve_cmd.rs`（装配聚合 `Vec<PluginInfo>` 并传递）
 - Modify: `oj/src/app.rs`（Extras.plugins 接真值 + AppState 传参）
 - Modify: `server/src/lib.rs`（AppState 字段 + `{base}/plugins` route + 测试）
 
@@ -569,7 +569,7 @@ Expected: FAIL（`plugins_handler` / `AppState.plugins` 不存在）
 - [ ] **Step 3: 实现**
 
 1. `src/bridge/plugin_loader.rs`：`PluginInfo` 加 `pub description: String,`；`From<&LoadedPlugin>` 补 `description: p.descriptor.desc[..].to_string()`（`LoadedPlugin` 持 descriptor；字段取值路径以现状为准）。
-2. `oj/src/server_cmd.rs`：`assemble_plugins` 已返回 loaded 列表——在 `App::from_config` 的调用侧聚合 `let plugin_infos: Vec<only_js::bridge::PluginInfo> = loaded.iter().map(PluginInfo::from).collect();`（若 assemble 吞掉所有权则改返回 `(infos, registries)` 或透传 loaded，取最小 diff）。两条消费：`Extras.plugins`（make_bridge 闭包里替换 `Vec::new()`，Arc 共享）与新 AppState 字段。
+2. `oj/src/serve_cmd.rs`：`assemble_plugins` 已返回 loaded 列表——在 `App::from_config` 的调用侧聚合 `let plugin_infos: Vec<only_js::bridge::PluginInfo> = loaded.iter().map(PluginInfo::from).collect();`（若 assemble 吞掉所有权则改返回 `(infos, registries)` 或透传 loaded，取最小 diff）。两条消费：`Extras.plugins`（make_bridge 闭包里替换 `Vec::new()`，Arc 共享）与新 AppState 字段。
 3. `server/src/lib.rs`：
    - `AppState` 加 `pub plugins: std::sync::Arc<Vec<only_js::bridge::PluginInfo>>,`；`app()` 加参数并注入（`dummy_app_state`/`serve_with_listener` 等构造点补 `Arc::default()`；测试用注入真值）。
    - 路由（紧邻 `health_path` 注册，同为先于 fallback 的真实 route——不走 Bearer/证书门禁，与 `/health` 同位的公共端点）：
@@ -604,7 +604,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/bridge/plugin_loader.rs oj/src/server_cmd.rs oj/src/app.rs server/src/lib.rs
+git add src/bridge/plugin_loader.rs oj/src/serve_cmd.rs oj/src/app.rs server/src/lib.rs
 git commit -m "feat(plugins): 自描述收集（PluginInfo.description）+ GET {base}/plugins 查询端点
 
 unix@vip.qq.com ai"

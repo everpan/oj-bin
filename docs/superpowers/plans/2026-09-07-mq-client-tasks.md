@@ -394,9 +394,9 @@ async fn given_http_bridge_when_js_tasks_stopping_then_false() { /* flag=None �
 ### Task 7: 装配注入——kafkas/rabbits kind 路由与 fail-fast
 
 **Files:**
-- Modify: `oj/src/server_cmd.rs`（`build_registries`/`assemble_plugins` 邻域：mq 实例装配函数）+ `oj/src/app.rs`（Extras 传递）
+- Modify: `oj/src/serve_cmd.rs`（`build_registries`/`assemble_plugins` 邻域：mq 实例装配函数）+ `oj/src/app.rs`（Extras 传递）
 - Modify: `src/config.rs:303-320`（`kafkas: HashMap<String, serde_json::Value>`、`rabbits: HashMap<...>`，镜像 `plugins:` 写法；`#[serde(default)]`）
-- Test: `oj/src/server_cmd.rs` tests（装配测试已有证书夹具模式 `test_support`）
+- Test: `oj/src/serve_cmd.rs` tests（装配测试已有证书夹具模式 `test_support`）
 
 **Interfaces:**
 - Produces: `async fn build_mq_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<(Arc<NamedRegistry<MqInstance>>, Arc<NamedRegistry<MqInstance>>), String>`
@@ -470,8 +470,8 @@ async fn given_cjs_style_task_file_when_run_then_still_tla_capable() {
 **Files:**
 - Modify: `src/config.rs`（`tasks: Option<TasksCfg>`；`TasksCfg { dir: String("tasks"), max: usize(64), stop_grace_secs: u64(30) }`）
 - Create: `oj/src/tasks.rs`
-- Modify: `oj/src/server_cmd.rs`（serve 路径拉起监督器 + 停机序列编排）、`oj/src/main.rs`/server_cmd serve（信号）
-- Test: `oj/src/tasks.rs` tests + `oj/src/server_cmd.rs` tests
+- Modify: `oj/src/serve_cmd.rs`（serve 路径拉起监督器 + 停机序列编排）、`oj/src/main.rs`/serve_cmd serve（信号）
+- Test: `oj/src/tasks.rs` tests + `oj/src/serve_cmd.rs` tests
 
 **Interfaces:**
 - Produces:
@@ -480,7 +480,7 @@ pub struct TaskHandle { pub name: String, pub join: std::thread::JoinHandle<()> 
 pub fn scan_tasks(dir: &Path) -> Result<Vec<(String, PathBuf)>, String>; // task_*/ *_task 约定 + 同名冲突 Err + >max Err
 pub struct TaskSupervisor { /* spawn_all / shutdown(grace) / 崩溃退避 1s→2s→…cap 60s */ }
 pub async fn supervise(cfg: TasksCfg, root: PathBuf, make_bridge: impl Fn() -> Bridge + Send + Sync + 'static + Clone, flag: Arc<AtomicBool>) -> !; // 监督循环
-// 停机序列（评审 F5/S2，server_cmd 编排）：
+// 停机序列（评审 F5/S2，serve_cmd 编排）：
 // ① tokio::signal::ctrl_c() + unix SIGTERM 二选一  ② flag 置位 ③ grace 内等任务自然退
 // ④ 到期 kill_after → 任务线程兜 event loop → drop ⑤ mq handle Drop→close ⑥ axum with_graceful_shutdown 同信号触发 ⑦ 退出
 ```

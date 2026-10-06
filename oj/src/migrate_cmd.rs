@@ -8,7 +8,7 @@ use std::sync::Arc;
 use only_js::bridge::DataAccessor;
 
 use crate::args::{FixtureArgs, MigrateArgs, SchemaDiffArgs};
-use crate::server_cmd::{Registries, assemble_plugins, connect_dbs, load_app_config};
+use crate::serve_cmd::{Registries, assemble_plugins, connect_dbs, load_app_config};
 
 /// 瘦身装配产物：目标库句柄（`--db` 选定的 config profile）+ 模块列表（可被 `--module` 过滤）。
 struct Slim {

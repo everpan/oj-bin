@@ -43,7 +43,7 @@ RP  GET /v1/api/oidc/callback?code&state          [豁免]
 
 ## 3. Core 改动（Rust）
 
-### 3.1 `oidc` 配置段（`src/config.rs` + `oj/src/server_cmd.rs` 装配注入）
+### 3.1 `oidc` 配置段（`src/config.rs` + `oj/src/serve_cmd.rs` 装配注入）
 
 ```yaml
 oidc:                                            # 段存在即启用；缺 private_key_path 启动报错
@@ -159,7 +159,7 @@ core Claims。租户继续走既有 `X-TENANT-ID` 头语义；OIDC 登录只负�
 
 **Core**：`src/config.rs`（oidc/tenant 字段）、`src/bridge/oidc.rs`（新）、
 `src/bridge/mod.rs`（注册）、`src/bridge/bootstrap.js`（挂 `oidc` 全局，ASCII）、
-`server/src/lib.rs`（tenant 豁免）、`oj/src/server_cmd.rs`（PEM 装配注入）。
+`server/src/lib.rs`（tenant 豁免）、`oj/src/serve_cmd.rs`（PEM 装配注入）。
 
 **Sample**：`src/idp/`（manifest.yaml + 5 个 api.ts + `_shared/`）、`src/oidc/`
 （manifest.yaml + 3 个 api.ts，复用 `auth/_shared/session.ts` 的 issueTokens——跨模块导入

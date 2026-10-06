@@ -25,7 +25,7 @@
 | 请求日志字段写死：`method/path/status/ms` | `server/src/logging.rs:317-323` |
 | config 只有 `logs_dir`/`logs_max_m`/`logs_keep_files`，管落盘与滚动，**不管格式** | `src/config.rs:24-37` |
 | 落盘 tee 是 **unix-only**；非 unix 只 stderr 输出并告警 | `server/src/logging.rs:48-64` |
-| 只有 `oj server` 装 tee（`oj test` 等不调用） | `oj/src/server_cmd.rs:38` |
+| 只有 `oj server` 装 tee（`oj test` 等不调用） | `oj/src/serve_cmd.rs:38` |
 
 ### 2.1 日志格式到底怎么配
 
@@ -67,7 +67,7 @@ rolling file layer，或 Windows 侧的命名管道 + 镜像线程），是独�
 ### 4.1 「关 stdout」关不掉日志 —— tracing 走的是 stderr
 
 tracing 的控制台层写 **stderr**（`logging.rs:69`）。`stdout` 上只有少量直接 `println!`
-（如启动行 `oj/src/server_cmd.rs:51`）。只静默 fd 1 的话日志照旧刷满终端。
+（如启动行 `oj/src/serve_cmd.rs:51`）。只静默 fd 1 的话日志照旧刷满终端。
 → 开关**同时**静默 fd 1 与 fd 2。
 
 ### 4.2 静默后用户不知道日志去了哪
@@ -80,15 +80,15 @@ tracing 的控制台层写 **stderr**（`logging.rs:69`）。`stdout` 上只有�
 关终端只是跳过「回写原终端」这一步，**管道照旧要读**（`logging.rs:196-198`）。
 不读的话写端攒满 64K 后进程永久阻塞。
 
-### 4.4 走 `server_cmd::run` 的测试必须显式打开终端
+### 4.4 走 `serve_cmd::run` 的测试必须显式打开终端
 
 tee 是在**进程级**劫持 fd 1/2，装好之后连 libtest 自己打印的 `test result:` 汇总行和
 panic 信息都会进管道。默认关闭终端后，这类测试在 CI 里**看不到任何输出**——
 失败时只有一句 "test ... FAILED"，原因全在日志文件里。
 
 已修：`tests/start_cert_expired_test.rs:32` 显式 `console_log: true`（它经
-`server_cmd::run` → `logging::init` 装 tee）。
-**后续任何新增的、会走到 `server_cmd::run` 的测试都必须带上这一行。**
+`serve_cmd::run` → `logging::init` 装 tee）。
+**后续任何新增的、会走到 `serve_cmd::run` 的测试都必须带上这一行。**
 
 （`server` crate 的 tee 测试已单独拆成集成测试二进制 `server/tests/log_tee.rs`——
 tee 是进程级的，装在单元测试二进制里会让同二进制其余 61 条用例的汇总行与 panic
@@ -105,7 +105,7 @@ tee 是进程级的，装在单元测试二进制里会让同二进制其余 61 
 | B. 默认开，`--no-console` 关闭 | 保持现状手感，但服务端默认仍刷终端 |
 
 已按 A 实现。`config` 与 CLI 是「或」关系（两者都是「打开」语义，没有「关闭」的一方）：
-`console = cfg.server.console_log || a.console_log`（`oj/src/server_cmd.rs:40`）。
+`console = cfg.server.console_log || a.console_log`（`oj/src/serve_cmd.rs:40`）。
 
 ### D2 命名 — 待拍板
 
@@ -137,7 +137,7 @@ tee 是进程级的，装在单元测试二进制里会让同二进制其余 61 
 | `server/src/logging.rs` | `init` 增参数 `console: bool`，透传 `install_terminal_tee`/`redirect_fd`/`mirror_loop`；`mirror_loop` 按标志跳过写终端（管道仍读空）；静默前打一行含日志路径的提示；非 unix 分支忽略开关并告警 |
 | `src/config.rs` | `ServerCfg` 增 `console_log: bool`，默认 **false** |
 | `oj/src/args.rs` | `ServerArgs` 增 `console_log: bool`；clap 增 `--console-log` |
-| `oj/src/server_cmd.rs` | `console = cfg.server.console_log \|\| a.console_log` |
+| `oj/src/serve_cmd.rs` | `console = cfg.server.console_log \|\| a.console_log` |
 | `oj/src/main.rs` | 测试里的 `ServerArgs` 字面量补字段 |
 | `docs/devkit/api-manual.md` | 配置表补 `console_log` 行 |
 | `sample/config.yaml` | 注释补 `console_log` 示例 |

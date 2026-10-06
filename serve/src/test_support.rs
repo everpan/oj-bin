@@ -1,7 +1,7 @@
 //! 测试支撑：证书必配（无逃生口）后，测试需自带真实签名的 JWS 证书。
 //!
 //! 用固定测试密钥对对 `{nbf,exp}` 生成 RS256 JWS 并落盘。本模块是全仓唯一
-//! 测试证书夹具（key 常量 + 签名 + 装配），供 `oj`（server_cmd/e2e）与
+//! 测试证书夹具（key 常量 + 签名 + 装配），供 `oj`（serve_cmd/e2e）与
 //! 根 crate（certificate_load / start_cert_expired，经 dev-dep 的
 //! `features = ["test-support"]`）复用。生成路径与 `server/src/certificate.rs` 契约一致。
 
@@ -53,7 +53,7 @@ pub fn write_cert(dir: &Path, nbf: u64, exp: u64) -> (std::path::PathBuf, std::p
 }
 
 /// 一步装配：在 `dir` 生成 `[nbf, exp)` 的真实签名证书，并把两个路径写入 `cfg`。
-/// 证书必配门禁后所有启动测试的公共前置（server_cmd tests / e2e 复用，勿再各写一份）。
+/// 证书必配门禁后所有启动测试的公共前置（serve_cmd tests / e2e 复用，勿再各写一份）。
 pub fn write_cert_into(cfg: &mut only_js::config::ServerCfg, dir: &Path, nbf: u64, exp: u64) {
     let (cert, key) = write_cert(dir, nbf, exp);
     cfg.certificate_path = cert.display().to_string();

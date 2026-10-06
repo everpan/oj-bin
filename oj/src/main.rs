@@ -2,8 +2,8 @@ use oj::args::{self, Command};
 
 /// 执行解析后的命令，返回进程退出码（0 成功 / 1 业务错误）。
 pub async fn run_command(cmd: Command) -> i32 {
-    // 数据操作（migrate/fixture/seed/test 的语句重放）走 tracing 记录：非 server
-    // 命令在此挂 stderr 订阅器；server 命令由 server::logging 装配（终端镜像 +
+    // 数据操作（migrate/fixture/seed/test 的语句重放）走 tracing 记录：非 serve
+    // 命令在此挂 stderr 订阅器；serve 命令由 serve::logging 装配（终端镜像 +
     // 落盘），不得抢 init（try_init 失败静默——重复 init 场景）。
     if !matches!(cmd, Command::Serve(_)) {
         // swc_timer=off：swc minifier 的逐 pass 计时事件（target=swc_timer）不面向用户。
@@ -23,14 +23,14 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
-        Command::Serve(a) => match oj::server_cmd::run(a).await {
+        Command::Serve(a) => match oj::serve_cmd::run(a).await {
             Ok(()) => 0,
             Err(e) => {
                 let msg = format!("oj serve: {e}");
                 // console 关闭时 fd 2 已被 tee 重定向，此行只落盘；再直写原终端，
                 // 让启动失败的最终原因在屏幕上立即可见（console 开启时镜像已回显，补写会重复）。
                 eprintln!("{msg}");
-                server::logging::echo_terminal(&msg);
+                serve::logging::echo_terminal(&msg);
                 1
             }
         },

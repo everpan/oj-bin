@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oj::server_cmd;
+use oj::serve_cmd;
 use only_js::config::Config;
 
 fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
@@ -25,8 +25,8 @@ fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
 fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
-    let n = server::test_support::now_secs();
-    server::test_support::write_cert_into(
+    let n = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
         &mut cfg.server,
         dir,
         n.saturating_sub(3600),
@@ -37,7 +37,7 @@ fn base_cfg(dir: &Path) -> Config {
 }
 
 fn sign(sub: &str, secret: &[u8]) -> String {
-    let now = server::test_support::now_secs();
+    let now = serve::test_support::now_secs();
     let claims = serde_json::json!({
         "sub": sub, "roles": [], "iat": now, "exp": now + 3600,
     });
@@ -150,7 +150,7 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
         ],
         ..Default::default()
     });
-    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await
         .unwrap();
     let secret = b"upload-e2e-secret";

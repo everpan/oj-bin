@@ -75,7 +75,7 @@ Layer 0  核心层    JsRuntime 壳 + 全部 ops + bootstrap.js（全量 JS 命�
 **`resolve_dsn` 归属**：未知 scheme 的 fail-fast 移入 `DbBackendRegistry.connect`
 （无认领即报错；装配层不再硬编码 scheme 白名单，否则第三方插件的新 scheme 会被前置拒绝）；
 sqlite 路径绝对化/建空库是 sqlite 专属逻辑，随内置 `SqliteBackend.connect` 进 core；
-`oj/src/server_cmd.rs`、`oj/src/build_cmd.rs` 两处改道 `registry.connect`。
+`oj/src/serve_cmd.rs`、`oj/src/build_cmd.rs` 两处改道 `registry.connect`。
 
 **`Extras` 迁移**：`Extras` 改作注册表载体（`blob_backends`/`bus_registry`/`es` 等），
 `with_dbs_and_loader` 签名随阶段 0 调整；**`StableState` 字段同步改形**：
