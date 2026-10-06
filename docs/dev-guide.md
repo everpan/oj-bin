@@ -16,7 +16,7 @@
 路由拼起来的阶段；「fail-fast」指发现问题立刻报错退出；「桥（bridge）」指 Rust 与 JS
 运行时之间的那一层（`src/bridge/`）。JS 全局对象完整参考见
 [devkit/api-manual.md](devkit/api-manual.md)（类型权威 `global.d.ts`），插件开发另见
-[plugin-development.md](plugin-development.md)，部署运维见 [ops-manual.md](ops-manual.md)，
+[plugins/plugin-development.md](plugins/plugin-development.md)，部署运维见 [ops-manual.md](ops-manual.md)，
 性能数据见 [benchmarks.md](benchmarks.md)，OIDC 实现走读与接入手册见
 [oidc-implementation.md](oidc-implementation.md) / [oidc-integration.md](oidc-integration.md)。
 
@@ -857,7 +857,7 @@ core，装配层只经安全入口）。
 预检；ABI bump 部署顺序 = 先升插件到新 ABI 并验证，再升宿主（或同版本原子升级）。
 平台矩阵与 `bin/plugins/<triple>/` 布局见 `.github/workflows/plugin-matrix.yml`。
 
-**第三方插件**：见 [plugin-development.md](plugin-development.md)（FFI 契约、ABI 纪律、
+**第三方插件**：见 [plugins/plugin-development.md](plugins/plugin-development.md)（FFI 契约、ABI 纪律、
 入口宏、panic 归因）。
 
 ---

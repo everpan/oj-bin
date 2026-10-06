@@ -238,7 +238,7 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   非空对象原样透传；空对象 = 回落轴适配器；字符串/列表等非对象值视为未提供，静默回落到
   轴适配器/默认来源。**缺省/空 map = 扫描模式**，加载 `<plugins_dir>/<平台目录>/` 全部（缺省平台
   目录 = 当前编译目标 triple）。旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。目录
-  布局与升级回滚见 `dev-guide.md` §13、`plugin-development.md`。
+  布局与升级回滚见 `dev-guide.md` §13、`plugins/plugin-development.md`。
 - `broker`：可选分布式事件总线。缺省 = 进程内 Bus；`kind: kafka`/`rabbitmq` 需对应插件
   （未装报 "unknown broker kind"）。
 - `kafkas:` / `rabbits:`：命名 MQ 实例（v0.1.6），键 = 实例名 → `Kafka("name")` /

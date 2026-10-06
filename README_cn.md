@@ -263,7 +263,7 @@ cargo xtask build                               # 构建 oj + 全部插件到 bi
 | `docs/user-manual.md` | `oj` CLI 与 `config.yaml` 完整参考 |
 | `docs/dev-guide.md` | 开发手册（含加新 op 的步骤） |
 | `docs/bridge.md` | JS 全局对象与模块对照 |
-| `docs/plugin-architecture.md` / `docs/plugin-development.md` | 插件架构与开发 |
+| `docs/plugins/plugin-architecture.md` / `docs/plugins/plugin-development.md` | 插件架构与开发 |
 | `docs/route-params-design.md` | 路径参数路由设计 |
 | `docs/testing.md` | 测试约定 |
 | `docs/ops-manual.md` | 运维 |
