@@ -14,7 +14,7 @@
 | `schema.yaml` | 声明式结构：表 / 列 / 索引 | 启动（auto）/ `oj migrate` 末步 reconcile | 三方言 | reconcile 本身幂等 | 是（`schema.yaml` 原样拷贝） | S005 |
 | `migrations/*.sql` | 手写结构 / 数据演进 | 启动（auto）/ `oj migrate` | 三方言（方言覆盖文件） | 账本账（重跑零新增） | 是 | S007 + 账本 M001/M002 |
 | `seed.sql` | 引导数据（每次启动重放） | **每次启动**（服务与测试） | 三方言 | S006 门禁 + 引擎按方言改写 `INSERT OR IGNORE` | 是 | S002 / S006 |
-| `fixtures/*.sql` | 演示 / 测试数据（按需灌） | `oj fixture` / `oj test`（**server 永不灌**） | 三方言 | SQL 自身（无门禁） | **否（构建整目录排除）** | 无 |
+| `fixtures/*.sql` | 演示 / 测试数据（按需灌） | `oj test fixture` / `oj test`（**server 永不灌**） | 三方言 | SQL 自身（无门禁） | **否（构建整目录排除）** | 无 |
 
 名词解释：**三方言** = sqlite / mysql / postgres 三种数据库；**账本** = 库里记录「哪些迁移
 已执行」的表；**幂等** = 重复执行结果不变。
@@ -54,7 +54,7 @@
 - **执行日志（回归与排障）**：seed / migrate / fixture / schema reconcile 的每条
   语句执行结果都记 tracing 日志：`module` / `file` / `seq` / `rows`（受影响行数）/
   `stmt`（截断 200 字符），成功 `ok`、失败 `failed` 附错误。`oj serve` 落 `logs/`
-  目录（终端镜像落盘）；`oj migrate` / `oj fixture` / `oj test` CLI 直跑落 stderr。
+  目录（终端镜像落盘）；`oj migrate` / `oj test fixture` / `oj test` CLI 直跑落 stderr。
 - **限制**：不记账本。重放历史靠执行日志，不在库内。
 - **S006（构建门禁）**：seed.sql 禁 DDL（CREATE/ALTER/DROP/TRUNCATE/RENAME/GRANT/
   COMMENT，结构归 schema.yaml 或 migrations）；禁非幂等 INSERT；只准碰本模块表与
@@ -64,8 +64,8 @@
 
 ### 2.2 fixtures/ —— 演示与测试数据，按需灌
 
-- **入口**：`oj fixture -c config.yaml [-d dir] [module]`；`oj test` 装配时自动灌
-  （`fixtures=true`）。**server 启动永不灌**。
+- **入口**：`oj test fixture -c config.yaml [-d dir] [module]`（`oj test` 的子命令）；
+  `oj test` 装配时自动灌（非 fixture 子命令，`fixtures=true`）。**server 启动永不灌**。
 - **行为**：模块目录下 `fixtures/*.sql`，按文件名排序逐文件、文件内按 `;` 切分顺序
   exec 到 default 库；**不记账本**；重复灌靠 SQL 自身幂等
   （推荐 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`）。
@@ -147,13 +147,13 @@
 
 ### 3.8 多库：`--db` 指定目标 profile
 
-`oj migrate` / `oj fixture` / `oj schema diff` 的目标库由 `--db <name>` 选定，
+`oj migrate` / `oj test fixture` / `oj schema diff` 的目标库由 `--db <name>` 选定，
 `name` 即 config 的 `db:` 段键（`db: {default: …, analytics: …}` → `--db analytics`）：
 
 ```bash
-oj migrate  -c config.yaml -d dist --db analytics
-oj fixture  -c config.yaml -d src  --db test user
-oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐库跑
+oj migrate      -c config.yaml -d dist --db analytics
+oj test fixture -c config.yaml -d src  --db test user
+oj schema diff  -c config.yaml -d dist --db analytics   # 漂移门禁也要逐库跑
 ```
 
 - 缺省 = `default`；**未声明的库名 fail-fast**（报错列出可用键），绝不静默回落。
@@ -180,11 +180,11 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
 | 改列名 / 删列 | 手写迁移（`RENAME COLUMN` / 先备份后 `DROP`）；删列同时从 schema.yaml 移除，残留会被 `oj schema diff` 报 D001 多列 |
 | 存量库接入（表已存在） | `oj migrate --baseline`（§3.4） |
 | 方言差异 | `0002__add_x.mysql.sql` 方言覆盖文件，与通用文件并存；无后缀 = 全方言执行 |
-| 演示 / 测试数据 | `fixtures/`：`oj fixture` / `oj test`（§2.2）；引导数据走 seed.sql（§2.1） |
-| 只迁一个模块 | `oj migrate user` / `oj fixture user`（模块名是位置参数） |
-| 迁到非 default 库 | `oj migrate --db <profile>`（`fixture` / `schema diff` 同旗标；profile = config `db:` 段的键） |
+| 演示 / 测试数据 | `fixtures/`：`oj test fixture` / `oj test`（§2.2）；引导数据走 seed.sql（§2.1） |
+| 只迁一个模块 | `oj migrate user` / `oj test fixture user`（模块名是位置参数） |
+| 迁到非 default 库 | `oj migrate --db <profile>`（`oj test fixture` / `oj schema diff` 同旗标；profile = config `db:` 段的键） |
 | 发布前巡检 | `oj schema diff`：D001/D002 有漂移 exit 1 |
-| CI 无证书环境跑迁移 | `oj migrate` / `oj fixture` / `oj schema diff` 走**瘦身装配**（config → 插件 → 开库，不走 App 装配、无证书门禁、不起路由） |
+| CI 无证书环境跑迁移 | `oj migrate` / `oj test fixture` / `oj schema diff` 走**瘦身装配**（config → 插件 → 开库，不走 App 装配、无证书门禁、不起路由） |
 
 ## 5. 检查规则与错误码速查（运维排障用）
 
@@ -215,7 +215,7 @@ oj schema diff -c config.yaml -d dist --db analytics   # 漂移门禁也要逐�
 5. **fixture / seed 的幂等是作者责任**：引擎不记账、不去重；S006 只在构建期挡 seed 的
    INSERT，fixtures 无任何门禁。
 6. **reconcile 不做类型漂移检查**、不做删列、不做改名（§3.6）。
-7. **`oj migrate` / `oj fixture` / `oj schema diff` 只作用一个库**：默认取 config 的
+7. **`oj migrate` / `oj test fixture` / `oj schema diff` 只作用一个库**：默认取 config 的
    `db.default`（缺失直接报错）；`--db <name>` 可改指 `db:` 段的其它 profile，
    **未声明的库名 fail-fast**（不静默回落 default）。`--db` 不认模块级 `manifest.yaml`
    的 `db:` 绑定（那只是运行时路由）。模块各自绑不同库的项目须 `--db X <module>`

@@ -34,24 +34,26 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
-        Command::Test(a) => match oj::test_cmd::run(a) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("oj test: {e}");
-                1
-            }
+        Command::Test(cmd) => match cmd {
+            oj::args::TestCmd::Run(a) => match oj::test_cmd::run(a) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("oj test: {e}");
+                    1
+                }
+            },
+            oj::args::TestCmd::Fixture(a) => match oj::migrate_cmd::run_fixture(&a).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("oj test fixture: {e}");
+                    1
+                }
+            },
         },
         Command::Migrate(a) => match oj::migrate_cmd::run_migrate(&a).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("oj migrate: {e}");
-                1
-            }
-        },
-        Command::Fixture(a) => match oj::migrate_cmd::run_fixture(&a).await {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("oj fixture: {e}");
                 1
             }
         },

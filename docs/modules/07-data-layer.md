@@ -72,7 +72,7 @@ db: default         # 可选：模块的 "default" 库重定向到该命名库
 - **S002**：同一张表被两处 `CREATE TABLE` → 启动 fail-fast，不静默合并。
   `create_tables`（:44）识别 `IF NOT EXISTS`、引号（`"t"`/`` `t` ``/`[t]`）与 schema 限定。
 - 先全量冲突检查再执行 —— 失败不落任何副作用。
-- `fixtures/` **不重放**（演示数据，由 `oj fixture` / `oj test` 灌入）。
+- `fixtures/` **不重放**（演示数据，由 `oj test fixture` / `oj test` 灌入）。
 - 无任何种子文件 → 静默返回；有种子但 default 库缺失/非 sqlite → warn 跳过。
 
 ## 5. `checks.rs` —— 结构层静态检查（§5.1）

@@ -62,6 +62,14 @@ pub struct TestArgs {
     pub anonymous: bool,
 }
 
+/// `oj test` 的子命令：直接 `oj test` 跑用例；`oj test fixture` 灌演示数据。
+pub enum TestCmd {
+    /// 跑 *.test.ts（L1：进程内真实运行时）。
+    Run(TestArgs),
+    /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
+    Fixture(FixtureArgs),
+}
+
 /// `oj build [module] [-d src] [-o dist] [--no-minify] [--check]`（src → dist，生成 routes.js）。
 pub struct BuildArgs {
     pub module: Option<String>,
@@ -104,7 +112,7 @@ pub struct MigrateArgs {
     pub db: Option<String>,
 }
 
-/// `oj fixture [-c config] [-d dir] [--db name] [--module M]`。
+/// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`。
 pub struct FixtureArgs {
     pub config: String,
     pub dir: Option<String>,
@@ -146,9 +154,8 @@ pub struct SecretOpenArgs {
 pub enum Command {
     Serve(ServeArgs),
     Build(BuildArgs),
-    Test(TestArgs),
+    Test(TestCmd),
     Migrate(MigrateArgs),
-    Fixture(FixtureArgs),
     SchemaDiff(SchemaDiffArgs),
     Exec(ExecArgs),
     SecretKeygen(SecretKeygenArgs),
@@ -264,7 +271,27 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// 跑 sample API 测试（无需启动 oj serve；进程内真实运行时派发）
+    /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && serve）
+    Migrate {
+        /// 配置文件路径（相对 CWD；db 段提供目标库）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
+        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast。
+        /// 与 `oj test --db` 不同——那里是「字面 default 调用重定向」，这里是整轮迁移的目标库
+        #[arg(long)]
+        db: Option<String>,
+        /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
+        #[arg(long)]
+        baseline: bool,
+        /// 只迁移指定模块（src 首层子目录 / dist 模块名）
+        module: Option<String>,
+    },
+    /// 跑 sample API 测试（无需启动 oj serve；进程内真实运行时派发）。
+    /// 直接 `oj test` 跑用例；`oj test fixture` 灌演示数据。
     Test {
         /// 配置文件路径（相对 CWD；server.host/port/root + db/redis）
         #[arg(short, long, default_value = "config.yaml")]
@@ -311,39 +338,9 @@ enum Commands {
         /// handler（db.asTenant）在测试中授信
         #[arg(long)]
         anonymous: bool,
-    },
-    /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && serve）
-    Migrate {
-        /// 配置文件路径（相对 CWD；db 段提供目标库）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
-        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
-        #[arg(short, long)]
-        dir: Option<String>,
-        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast。
-        /// 与 `oj test --db` 不同——那里是「字面 default 调用重定向」，这里是整轮迁移的目标库
-        #[arg(long)]
-        db: Option<String>,
-        /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
-        #[arg(long)]
-        baseline: bool,
-        /// 只迁移指定模块（src 首层子目录 / dist 模块名）
-        module: Option<String>,
-    },
-    /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）
-    Fixture {
-        /// 配置文件路径（相对 CWD；db 段提供目标库）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
-        /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
-        #[arg(short, long)]
-        dir: Option<String>,
-        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
-        #[arg(long)]
-        db: Option<String>,
-        /// 只灌指定模块
-        module: Option<String>,
+        /// 子命令：省略 → 跑用例；`fixture` → 灌演示数据
+        #[command(subcommand)]
+        command: Option<TestSub>,
     },
     /// 声明式 schema 运维
     Schema {
@@ -411,6 +408,25 @@ enum Commands {
         /// 输出文件；省略则写 stdout。`--check` 时作为待比对文件，缺省 `<dir>/openapi.json`
         #[arg(short, long)]
         out: Option<String>,
+    },
+}
+
+/// `oj test <sub>`：现有仅 fixture（灌演示数据）。
+#[derive(Debug, Subcommand)]
+pub enum TestSub {
+    /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）
+    Fixture {
+        /// 配置文件路径（相对 CWD；db 段提供目标库）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+        /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
+        #[arg(long)]
+        db: Option<String>,
+        /// 只灌指定模块
+        module: Option<String>,
     },
 }
 
@@ -527,22 +543,36 @@ fn to_command(cli: Cli) -> Command {
             kafka,
             rabbit,
             anonymous,
-        } => Command::Test(TestArgs {
-            config,
-            base,
-            dir,
-            tests,
-            format,
-            output,
-            db,
-            redis,
-            blob,
-            es,
-            broker,
-            kafka,
-            rabbit,
-            anonymous,
-        }),
+            command,
+        } => match command {
+            None => Command::Test(TestCmd::Run(TestArgs {
+                config,
+                base,
+                dir,
+                tests,
+                format,
+                output,
+                db,
+                redis,
+                blob,
+                es,
+                broker,
+                kafka,
+                rabbit,
+                anonymous,
+            })),
+            Some(TestSub::Fixture {
+                config,
+                dir,
+                db,
+                module,
+            }) => Command::Test(TestCmd::Fixture(FixtureArgs {
+                config,
+                dir,
+                module,
+                db,
+            })),
+        },
         Commands::Migrate {
             config,
             dir,
@@ -553,17 +583,6 @@ fn to_command(cli: Cli) -> Command {
             config,
             dir,
             baseline,
-            module,
-            db,
-        }),
-        Commands::Fixture {
-            config,
-            dir,
-            db,
-            module,
-        } => Command::Fixture(FixtureArgs {
-            config,
-            dir,
             module,
             db,
         }),
@@ -695,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_resource_profile_flags_parse() {
-        let Command::Test(a) = cmd(&[
+        let Command::Test(crate::args::TestCmd::Run(a)) = cmd(&[
             "test", "-c", "c.yaml", "-d", "src", "--redis", "cache", "--blob", "assets", "--es",
             "archive", "--broker", "prod", "--kafka", "staging", "--rabbit", "jobs",
         ]) else {
@@ -904,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_subcommand_maps_all_report_flags() {
-        let Command::Test(a) = cmd(&[
+        let Command::Test(crate::args::TestCmd::Run(a)) = cmd(&[
             "test", "-c", "c.yaml", "-d", "src", "-t", "tests", "--format", "tap", "--output",
             "r.tap",
         ]) else {
@@ -953,7 +972,9 @@ mod tests {
             panic!()
         };
         assert!(a.db.is_none());
-        let Command::Fixture(a) = cmd(&["fixture", "--db", "test"]) else {
+        let Command::Test(crate::args::TestCmd::Fixture(a)) =
+            cmd(&["test", "fixture", "--db", "test"])
+        else {
             panic!()
         };
         assert_eq!(a.db.as_deref(), Some("test"));
@@ -970,7 +991,9 @@ mod tests {
 
     #[test]
     fn fixture_and_schema_diff_map_config_dir() {
-        let Command::Fixture(a) = cmd(&["fixture", "-c", "c.yaml", "-d", "src"]) else {
+        let Command::Test(crate::args::TestCmd::Fixture(a)) =
+            cmd(&["test", "fixture", "-c", "c.yaml", "-d", "src"])
+        else {
             panic!()
         };
         assert_eq!(

@@ -1,4 +1,4 @@
-//! `oj migrate` / `oj fixture`（§4.6）：**瘦身装配**——不走 `App::from_config`
+//! `oj migrate` / `oj test fixture`（§4.6）：**瘦身装配**——不走 `App::from_config`
 //! （其证书门禁无逃生口、且携带 seed/路由），CI/运维机无证书也可执行迁移；
 //! 只解析 config → 插件 → 逐 db 开库 → 迁移/fixtures。
 
@@ -111,7 +111,7 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `oj fixture [-c config] [-d dir] [--db name] [--module M]`：灌 fixtures/ 演示数据（§4.5）。
+/// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`：灌 fixtures/ 演示数据（§4.5）。
 pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
     let s = slim(
         &a.config,
@@ -121,7 +121,7 @@ pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
     )
     .await?;
     let n = load_fixtures(Some(&s.target), &s.modules).await?;
-    println!("oj fixture: {n} statement(s) loaded");
+    println!("oj test fixture: {n} statement(s) loaded");
     Ok(())
 }
 
@@ -154,7 +154,7 @@ pub async fn run_schema_diff(a: &SchemaDiffArgs) -> Result<(), String> {
 }
 
 /// fixtures/*.sql（演示数据）：按文件名排序、`;` 朴素切分，exec 到目标库。
-/// 不记账本——幂等演示数据可重复灌。供 `oj fixture` 与 `oj test`
+/// 不记账本——幂等演示数据可重复灌。供 `oj test fixture` 与 `oj test`
 /// （from_config fixtures=true）共用。
 pub async fn load_fixtures(
     default: Option<&Arc<dyn DataAccessor>>,

@@ -137,7 +137,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 ```
 
 **多库项目**（config `db:` 声明了 `default` 之外的命名库）：上面前两条默认只作用
-`default`，其余库要加 `--db <name>` 逐库各跑一遍（`oj fixture` / `oj schema diff` 同旗标）。
+`default`，其余库要加 `--db <name>` 逐库各跑一遍（`oj test fixture` / `oj schema diff` 同旗标）。
 模块各自绑不同库（`manifest.yaml` 的 `db:`）时，还须配 `--module` 逐组合跑——见
 `scenarios.md` 场景 6。
 
@@ -158,7 +158,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 │   │   ├── manifest.yaml          # 模块清单（必配）
 │   │   ├── schema.yaml            # 声明式表结构（有表模块必配，第 3 章）
 │   │   ├── migrations/            # 手写迁移 {seq:04}__{desc}[.方言].sql
-│   │   ├── fixtures/              # 演示数据，仅 oj test / oj fixture 灌入
+│   │   ├── fixtures/              # 演示数据，仅 oj test / oj test fixture 灌入
 │   │   ├── _shared/validate.ts    # 无 api 文件 → 纯工具代码目录，不产生路由
 │   │   ├── account/api.ts         # → {base}/user/account/
 │   │   ├── profile/api.ts         # → {base}/user/profile/
@@ -251,7 +251,7 @@ tables:
 |---|---|---|
 | `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations`（`module` 列区分模块）；序列空洞/乱序 S007 报错 |
 | `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006） |
-| `fixtures/*.sql` | 仅 `oj test` / `oj fixture` 灌入 | 演示/测试数据，不进 release 产物 |
+| `fixtures/*.sql` | 仅 `oj test` / `oj test fixture` 灌入 | 演示/测试数据，不进 release 产物 |
 
 ### 命令
 
@@ -259,7 +259,7 @@ tables:
 |---|---|
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
-| `oj fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物） |
+| `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物） |
 | `oj build --check` | 只跑结构检查 S001–S007 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
@@ -2387,7 +2387,7 @@ curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<titl
   （sqlite/mysql `?`，postgres `$1`）。
 - `seed.sql` 仅对 **default 库且为 sqlite** 时重放。
 - mysql/pg 连不上启动 fail-fast（连接串错/库未建）。
-- **按库运维（v0.1.21）**：`oj migrate` / `oj fixture` / `oj schema diff` 的 `--db <name>`
+- **按库运维（v0.1.21）**：`oj migrate` / `oj test fixture` / `oj schema diff` 的 `--db <name>`
   即上方键名；缺省 `default`，未声明 fail-fast。账本 `_oj_migrations`、schema 收敛、
   `--baseline` 都各库独立——多库须逐库跑（模块绑不同库见第 3 章「命令」与场景 6）。
 - DSN 带密码时写成 `"ENC[…]"` 密文（v0.1.33，见「secrets —— 凭据密封」）：整条 DSN
@@ -2984,7 +2984,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
-| fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj fixture）；参考数据走模块 seed.sql |
+| fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj test fixture）；参考数据走模块 seed.sql |
 | `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |
 | `_name_` 目录段必须整段且参数名合法（v0.1.27） | `__x__`/`___`/`_a{b}_` 不转换（保持字面）；转换产物由 `oj build` 期 pattern 试插校验把关，非法/同位异名即构建失败 |
 | 同层异名 `_x_` 目录是结构性冲突（v0.1.27） | `_aa_/` 与 `_bb_/` 并存 → 后者启动丢弃并告警（matchit 同位异名规则，与 `.route` 同） |

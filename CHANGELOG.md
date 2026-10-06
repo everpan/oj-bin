@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.49 —— fixture 归入 test 子命令（未打标签）
+
+**动机**：`fixture` 仅为测试服务的演示数据灌入，原作为顶层子命令与 `test` 平级，语义上
+属于测试范畴。把它收进 `oj test` 之下，CLI 层次更贴合「测试相关动作都在 `oj test` 之下」。
+
+- **`oj fixture` → `oj test fixture`**：`fixture` 由顶层子命令改为 `test` 的子命令，
+  用法与旗标完全保留（`-c/--config`、`-d/--dir`、`--db`、`[module]` 位置参数不变）；
+  `oj test`（不带子命令）行为不变，仍跑 `*.test.ts`。
+- 旧的顶层 `oj fixture` 已移除，调用会报 `unrecognized subcommand 'fixture'`。
+- 装配路径不变：`oj test fixture` 仍走 `migrate_cmd::run_fixture` 的**瘦身装配**
+  （config → 插件 → 开库，无证书门禁），与 `oj migrate` / `oj schema diff` 同源。
+- 文档同步：`docs/cli2.md`、`docs/user-manual.md`、`docs/migration.md`、
+  `docs/modules/04-oj-cli.md`、`docs/modules/02-config.md`、`docs/modules/07-data-layer.md`、
+  `docs/db-guide.md`、`docs/devkit/api-manual.md`、`sample/README.md` 及源码注释中的
+  `oj fixture` 引用全部更新为 `oj test fixture`。
+
 ## v0.1.48 —— 测试稳定：`oj openapi` 用例临时目录不再互踩（无功能/行为变更）
 
 - **临时目录不再互踩**（v0.1.47 后修复，纯测试基建，无用户可见变更）：
