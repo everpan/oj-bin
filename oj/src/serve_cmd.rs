@@ -63,11 +63,11 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     };
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     // 大小滚动参数 server.logs_max_bytes / logs_keep_files。
-    let logs_dir = server::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
+    let logs_dir = serve::logging::resolve_logs_dir(cfg.server.logs_dir.as_deref(), &config_dir);
     // 终端输出默认关闭（只落盘）；config 的 server.console_log 或 CLI `--console-log`
     // 任一打开即打开（「或」而非「覆盖」——两个入口都是「打开」语义，没有「关闭」的一方）。
     let console = cfg.server.console_log || a.console_log;
-    server::logging::init(
+    serve::logging::init(
         &logs_dir,
         cfg.server.logs_max_m,
         cfg.server.logs_keep_files as usize,
@@ -98,7 +98,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     // 任务管理 API（PRD v2 §6.6）：有池（池化长任务/cron）才挂 `{base}/tasks`。
     if let Some(pool) = task_pool.pool.clone() {
         let state = app.tasks_api_state(pool.registry.clone(), Some(pool));
-        app.merge_router(server::tasks::tasks_router(&base, state));
+        app.merge_router(serve::tasks::tasks_router(&base, state));
     }
     // 全仓首个信号处理器（评审 F5/S2）：SIGINT/SIGTERM → 置停机 flag → HTTP 侧
     // with_graceful_shutdown 同信号排空在途请求；任务线程在 grace 内自然收场
@@ -895,8 +895,8 @@ mod tests {
     /// 真实签名 JWS，返回配好两路径的 Config。有效期 [now-1h, now+1y] → 启动时 Valid。
     fn cert_cfg(dir: &Path) -> Config {
         let mut cfg = Config::default();
-        let n = server::test_support::now_secs();
-        server::test_support::write_cert_into(
+        let n = serve::test_support::now_secs();
+        serve::test_support::write_cert_into(
             &mut cfg.server,
             dir,
             n.saturating_sub(3600),
@@ -911,8 +911,8 @@ mod tests {
     fn expired_cert_cfg(dir: &Path) -> Config {
         let mut cfg = Config::default();
         cfg.server.grace_days = Some(0);
-        let n = server::test_support::now_secs();
-        server::test_support::write_cert_into(&mut cfg.server, dir, n - 2000, n - 1000);
+        let n = serve::test_support::now_secs();
+        serve::test_support::write_cert_into(&mut cfg.server, dir, n - 2000, n - 1000);
         // 隔离插件扫描（见 isolate_plugins）。
         cfg.plugins_dir = Some(isolate_plugins(dir));
         cfg
@@ -2510,7 +2510,7 @@ mod tests {
                 .is_none()
         );
         // 有效 token → user（sub → id）
-        let now = server::test_support::now_secs();
+        let now = serve::test_support::now_secs();
         let claims = serde_json::json!({
             "sub": "u1", "roles": ["admin"], "iat": now, "exp": now + 3600
         });

@@ -3,7 +3,7 @@
 //! 经 `assemble_backend` 验证 `ResourceProfiles` 在装配期把选中 profile 烘焙为默认源、
 //! 或选错时 fail-fast。db 走内置 sqlite（无需插件），故本文件不依赖任何 cdylib 插件，
 //! 可在无 `bin/plugins` 的环境稳定跑。其余轴（redis/es/broker/kafka/rabbit）的选源与
-//! fail-fast 逻辑由 `oj/src/{app,server_cmd}.rs` 的单元测试覆盖（不依赖插件即可触发
+//! fail-fast 逻辑由 `oj/src/{app,serve_cmd}.rs` 的单元测试覆盖（不依赖插件即可触发
 //! fail-fast 分支）。
 
 use std::path::PathBuf;

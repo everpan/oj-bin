@@ -11,7 +11,7 @@ use only_js::bridge::import_scan::{
     is_alias, is_local, is_relative, rewrite_specifiers, specifier_spans,
 };
 use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, transpile};
-use server::routes;
+use serve::routes;
 
 use crate::args::BuildArgs;
 

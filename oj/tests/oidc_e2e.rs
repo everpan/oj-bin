@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use oj::server_cmd;
+use oj::serve_cmd;
 use only_js::config::{AnonPath, AuthCfg, Config, OidcClientCfg, OidcRpCfg, OidcSection};
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -51,8 +51,8 @@ fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
 fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
-    let n = server::test_support::now_secs();
-    server::test_support::write_cert_into(
+    let n = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
         &mut cfg.server,
         dir,
         n.saturating_sub(3600),
@@ -193,7 +193,7 @@ async fn oidc_full_chain_login_bridge_and_tenant() {
     });
     cfg.plugins_dir = plugins_dir();
     cfg.plugins.insert("auth".into(), serde_json::json!({})); // 严格清单：只装 oj-auth
-    let (addr, _h) = server_cmd::start(cfg, &t, src, "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, src, "/v1/api".into(), true)
         .await
         .unwrap();
     let http = reqwest::Client::builder()

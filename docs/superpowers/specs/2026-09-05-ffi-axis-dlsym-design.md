@@ -42,7 +42,7 @@ oj_plugin_axis_<name>() -> *const c_void            // 新增；未提供的轴�
 - 返回 `*const XxxVtable` 擦除为 `*const c_void`；宿主按轴转型。vtable 均为 `static`，
   无生命周期问题。
 - **删除**：`PluginDescriptor.register` 字段、`PluginRegistrations` 结构体及其 `none()`
-  /访问器（宿主侧聚合已有 `oj/src/server_cmd.rs::Registries`，插件侧不再看见聚合结构）。
+  /访问器（宿主侧聚合已有 `oj/src/serve_cmd.rs::Registries`，插件侧不再看见聚合结构）。
 
 ### 插件侧宏
 
@@ -99,7 +99,7 @@ fail-fast 规则全部不变。
    改由探测结果构建（保留宿主侧聚合，下游 `es_backend`/`db_backend`/`auth_guard` 等
    包装器不动）。
 4. 插件配置：`src/config.rs` 增 `plugins: Option<HashMap<String, serde_json::Value>>`
-   开放段；`oj/src/server_cmd.rs` 的 `plugin_cfg_json` 泛化为三级回落的 `plugin_cfg`
+   开放段；`oj/src/serve_cmd.rs` 的 `plugin_cfg_json` 泛化为三级回落的 `plugin_cfg`
    （开放 map → 轴适配器表 → `{}`），适配器表与探测表同处声明。
 5. `tools/xtask` `--check` 预检：符号存在性探测替代读 register 返回值。
 6. `.github/workflows/plugin-matrix.yml`、CLAUDE.md/docs（plugin-architecture.md、

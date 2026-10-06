@@ -106,7 +106,7 @@ pub fn js_route_guarded(
                         let authz = headers
                             .get(axum::http::header::AUTHORIZATION)
                             .and_then(|v| v.to_str().ok());
-                        // 与 server::run_route 同构：全部请求头 JSON（小写名 → 值）。
+                        // 与 serve::run_route 同构：全部请求头 JSON（小写名 → 值）。
                         let headers_json = serde_json::to_string(
                             &headers
                                 .iter()

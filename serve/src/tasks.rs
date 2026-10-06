@@ -68,7 +68,7 @@ fn entry_json(e: &TaskEntry) -> serde_json::Value {
 }
 
 /// 守卫 + 租户管线（与 run_route 同语义；path_no_base = base 之后的部分，
-/// 匿名路径判定复用 server::path_matches）。
+/// 匿名路径判定复用 serve::path_matches）。
 fn admitted(
     st: &TasksApiState,
     method: &str,
@@ -79,7 +79,7 @@ fn admitted(
         let header = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        // ABI 9：方法 + 全部请求头 JSON 透传守卫（同 server::run_route 语义）。
+        // ABI 9：方法 + 全部请求头 JSON 透传守卫（同 serve::run_route 语义）。
         let headers_json = serde_json::to_string(
             &headers
                 .iter()

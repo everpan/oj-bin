@@ -540,9 +540,9 @@ globalThis.mail = new Mail("default");
 
 ## 阶段 7：装配与端到端
 
-### Task 7.1：`server_cmd` 装配 mail 插件与后端注入
+### Task 7.1：`serve_cmd` 装配 mail 插件与后端注入
 
-**Files:** Modify: `oj/src/server_cmd.rs`（`assemble_plugins` / `build_registries`）、`oj/src/app.rs`（`Extras.mail`）、`oj/src/build_cmd.rs`（内省 `Extras`）
+**Files:** Modify: `oj/src/serve_cmd.rs`（`assemble_plugins` / `build_registries`）、`oj/src/app.rs`（`Extras.mail`）、`oj/src/build_cmd.rs`（内省 `Extras`）
 
 **Step 1: 失败测试**
 
@@ -558,8 +558,8 @@ Expected: FAIL
 
 **Step 2: 实现**（**配置路径已定稿**：走 `plugin_cfg` 适配器臂，**不用 `plugins:` 透传**）：
 - `oj/src/config.rs`：增**顶层** `smtp:` 段（类型化）。
-- `oj/src/server_cmd.rs` 的 `plugin_cfg`（约 :473-495）`match name` 增 `"mail"` 臂：把顶层 `smtp:` 序列化后作为 `oj-mail` 的 cfg；**不要**用 `plugins:` 透传（`assemble_plugins` 在 `plugins` 非空时切**严格清单模式**，会让用户被迫列全所有插件）。
-- `ADAPTER_AXES`（`server_cmd.rs` 约 :469，`#[cfg(test)]` 对账清单）追 `"mail"`，使子集断言覆盖它。
+- `oj/src/serve_cmd.rs` 的 `plugin_cfg`（约 :473-495）`match name` 增 `"mail"` 臂：把顶层 `smtp:` 序列化后作为 `oj-mail` 的 cfg；**不要**用 `plugins:` 透传（`assemble_plugins` 在 `plugins` 非空时切**严格清单模式**，会让用户被迫列全所有插件）。
+- `ADAPTER_AXES`（`serve_cmd.rs` 约 :469，`#[cfg(test)]` 对账清单）追 `"mail"`，使子集断言覆盖它。
 - 宿主另解析 `smtp:` 非密钥面为 `MailConfig`（供校验与 profile 列举）；把 `Registrations.mail` 包成 `Arc<dyn MailBackend>` 注入 `Extras.mail`（`app.rs` / `build_cmd.rs` 内省同步）。
 
 **Step 3: 跑测试** → PASS。 **Step 4: 提交** `feat(server): 装配 mail 插件与后端`
@@ -746,7 +746,7 @@ lettre 的 `pool` 会在 `AsyncSmtpTransport` 的 `Drop` 里 `tokio::spawn` 回�
    rustls **未启用 ring**（reqwest 0.13 走 `__rustls-aws-lc-rs`），该注释已过时。
    属阶段 3 范围（provider 注释订正），阶段 0 未改代码以免越界。
 3. 观察（非本阶段引入、不阻塞）：既有测试夹具按设计以 **debug profile** 编译插件
-   （`src/bridge/plugin_loader/tests.rs:10` 有注释、`oj/src/server_cmd.rs:1452` 等），
+   （`src/bridge/plugin_loader/tests.rs:10` 有注释、`oj/src/serve_cmd.rs:1452` 等），
    因此 `target/debug` 已有约 **5.6G** 存量产物。
 
 ### 阶段 1 小结
@@ -793,7 +793,7 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 
 1. **测试构造式微调**：计划稿与任务书给的是 `RBytes::from(vec![0u8, 159, 255])`，stabby 未实现 `From<std::vec::Vec<T>>`（编译报 `the trait bound stabby::vec::Vec<u8>: From<std::vec::Vec<u8>> is not satisfied`）。改用 stabby 已实现的 `impl<T: Copy, Alloc: IAlloc + Default> From<&[T]> for stabby::vec::Vec<T, Alloc>`（`stabby-abi 72.1.16`，`src/alloc/vec.rs:552`）：`RBytes::from(&[0u8, 159, 255][..])`。断言本身**未被弱化**（质量评审 M-3 后进一步**加强**为逐位相等，见 §8）。
    > 订正：本小结初版称「`src/bridge/ffi.rs:493` 注释即此先例」——**引用错误**。该行注释实为「stabby 无 `From<&[u8]>`，逐元素 push」，与实测**语义相反**（`RBytes::from(&[u8][..])` 实测可编译）。该注释已由质量评审 M-5 订正（见 §8）。
-2. **无既有单元测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/server_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言，追加 `mail` 自然满足，未改动。
+2. **无既有单元测试需要同步**：仓库内无断言 `AXES` 数量/顺序的用例；`oj/src/serve_cmd.rs` 的 `cfg_adapters_subset_of_probed_axes` 是**子集**断言，追加 `mail` 自然满足，未改动。
    但**漏判了一个非测试消费点**（`tools/xtask` 内联在 `check()` 里的汇总 match）——这正是本次复审抓到的回归，见 §6。
 
 #### 5. `AXES` 全消费点清单（阶段 2 起加轴请逐点核对）
@@ -806,12 +806,12 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 | 2 | `src/bridge/plugin_loader.rs:436-462` `probe_axes` 的 `match *axis` | 功能性（dlsym 转型填槽） | :458 `unreachable!` → **装载期 panic** |
 | 3 | `src/bridge/plugin_loader.rs:104` `Registrations` 槽位字段 | 功能性 | 编译失败（`probe_axes` 的赋值目标缺失） |
 | 4 | `src/bridge/plugin_loader.rs:469` `impl Registrations::provides` 的 `match axis` | 功能性（轴→槽位映射的**单一事实源**） | one-hot / 分支完整性守护测试红；`xtask --check` 给普通 `Err` |
-| 5 | `oj/src/server_cmd.rs:469` `ADAPTER_AXES` | **`#[cfg(test)]` 对账清单，非功能注册表** | 不 panic、不报错（见下） |
+| 5 | `oj/src/serve_cmd.rs:469` `ADAPTER_AXES` | **`#[cfg(test)]` 对账清单，非功能注册表** | 不 panic、不报错（见下） |
 
 - **第 4 项是 I-2 治本后的形态**：轴→槽位映射收归 `Registrations::provides`，与 `probe_axes`
   **同文件相邻**（`plugin_loader.rs:436` 与 `:469`），加轴时可直接对照改。`tools/xtask` 不再
   维护本地副本（曾各自维护一份 → 加轴漏改即回归），改为调用 `provides`。
-- **第 5 项是陷阱**：`ADAPTER_AXES` 带 `#[cfg(test)]`，**只在测试里存在**，登记它本身不产生任何运行期效果；它唯一的作用是被 `cfg_adapters_subset_of_probed_axes` 用来断言 `ADAPTER_AXES ⊆ AXES`（**子集**方向）。所以新增轴**不必**改它，改了也没有功能变化。真正决定插件 cfg 的是 `plugin_cfg` 的 `match name`（`oj/src/server_cmd.rs:479`）。
+- **第 5 项是陷阱**：`ADAPTER_AXES` 带 `#[cfg(test)]`，**只在测试里存在**，登记它本身不产生任何运行期效果；它唯一的作用是被 `cfg_adapters_subset_of_probed_axes` 用来断言 `ADAPTER_AXES ⊆ AXES`（**子集**方向）。所以新增轴**不必**改它，改了也没有功能变化。真正决定插件 cfg 的是 `plugin_cfg` 的 `match name`（`oj/src/serve_cmd.rs:479`）。
 - **文档散文清单共 6 处**（均已因 `mq` 陈旧，同样缺 `mail`），属文档同步、非门禁。
   权威枚举方式：`grep -rn '\bAXES\b' docs/ CLAUDE.md`。当前需阶段 7 订正的 6 处：
 
@@ -859,7 +859,7 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
 **顺带确认：`ADAPTER_AXES` 未登记 `mail` 的行为与判断**（结论，本阶段不实现）：
 
 - **确认行为**：`ADAPTER_AXES` 是 `#[cfg(test)]` 的**测试专用对账清单**，「未登记 `mail`」本身
-  **没有**运行期后果。实际行为由 `plugin_cfg`（`oj/src/server_cmd.rs:473-495`）决定：`name = "mail"`
+  **没有**运行期后果。实际行为由 `plugin_cfg`（`oj/src/serve_cmd.rs:473-495`）决定：`name = "mail"`
   既不命中 `cfg.plugins` 透传分支，也不命中 `match name` 的 `"es"`/`"auth"` 臂 → 落 `_ => "{}"`，
   即 **mail 插件拿到空 cfg，`smtp:` 配置不生效**。你的描述准确。
 - **判断：应当走「登记适配器」**（在 `plugin_cfg` 加 `"mail"` 臂读顶层 `smtp:` + `src/config.rs`
@@ -868,7 +868,7 @@ TDD 节奏：每个任务均先写测试并跑出编译失败（`MailAttachment`
      「宿主另解析 `smtp:` 的**非密钥面**（profile keys、`allowed_*`、`tls`/`allow_none_tls`、host/port）
      作前置校验用」——宿主必须**类型化**读到该段。走 `plugins:` 透传只有插件拿得到、宿主拿不到，
      前置校验无法落地。`es:`/`auth:` 走适配器臂正是同一原因。
-  2. **`plugins:` 透传有副作用**：`assemble_plugins`（`oj/src/server_cmd.rs:602`）在
+  2. **`plugins:` 透传有副作用**：`assemble_plugins`（`oj/src/serve_cmd.rs:602`）在
      `!cfg.plugins.is_empty()` 时切**严格清单模式**——只装配键列出的插件。拿 `plugins: { mail: … }`
      装配置，等于顺手把运维的插件装配模式切了：用户必须把所有要加载的插件都列进去，否则其余插件
      静默不装。这个耦合是 `es:`/`auth:` 顶层段刻意避免的。
@@ -1041,8 +1041,8 @@ EXIT=0
 |---|---|---|
 | `tools/xtask/src/main.rs:28` `PLUGINS`（8 项） | `cargo xtask build` 的插件清单——**CI 与 sample-tests job 的插件归置都走它** | **未登记**（归 Task 7.3）。`cargo xtask plugin mail` 不查该表，本阶段验收不受影响；且另有 `given_first_party_plugins_when_listed_then_covers_all_axes` 断言 `PLUGINS.len() == 8` 且注释为「8 个第一方插件 = es/db×2/blob/bus×2/kv/auth 全轴覆盖」，加 `mail` 须连带改该断言与注释 → 越出本阶段范围。 |
 | `.github/workflows/plugin-matrix.yml` | CI 平台矩阵 | **无需改动**——**发现与计划稿 Task 7.3 的描述不符**：该文件**不含插件名清单**（注释明写「插件清单的单一真相来源是 `tools/xtask/src/main.rs` 的 PLUGINS——CI 不硬编码副本」，并记有「此前硬编码 7 个、漏 `auth`，与 xtask 失步」的历史教训）。故阶段 7 只需改 `PLUGINS`，**不应对本文件增插件名**（否则正是重蹈该文件已明令禁止的硬编码失步）。 |
-| `oj/src/server_cmd.rs:479` `plugin_cfg` 的 `match name` | 插件 cfg 适配器（`mail` 现落 `_ => "{}"`） | **未登记**（归 Task 7.1）。 |
-| `oj/src/server_cmd.rs:469` `ADAPTER_AXES` | `#[cfg(test)]` 对账清单，**非功能注册表** | 同上（阶段 1 小结 §5 已论证：登记它本身无运行期效果）。 |
+| `oj/src/serve_cmd.rs:479` `plugin_cfg` 的 `match name` | 插件 cfg 适配器（`mail` 现落 `_ => "{}"`） | **未登记**（归 Task 7.1）。 |
+| `oj/src/serve_cmd.rs:469` `ADAPTER_AXES` | `#[cfg(test)]` 对账清单，**非功能注册表** | 同上（阶段 1 小结 §5 已论证：登记它本身无运行期效果）。 |
 | `oj/src/config.rs` 顶层 `smtp:` 段 | 宿主类型化读配置 | 归 Task 7.1。 |
 | `plugins:` 段严格清单 | **不是白名单**：`assemble_plugins` 在 `cfg.plugins` 非空时切「严格清单模式」（只装配列出的插件），属运行期配置选择，无待登记的硬编码清单 | 无需登记；但阶段 2 骨架联调若临时用 `plugins: { mail: … }`，须注意会顺带进严格模式（阶段 1 小结 §6 已列）。 |
 | `src/bridge/plugin_loader.rs`（`AXES` / `probe_axes` / `Registrations` / `provides`） | 轴表 4 个消费点 | **阶段 1 已完成**（含 `"mail"`），本阶段零改动。 |
@@ -1643,7 +1643,7 @@ worker → 真 `.eml` 落盘，全链打通；CI 单一真相源（xtask `PLUGIN
 | 文件 | 要点 |
 |---|---|
 | `src/config.rs` | `SmtpSection`（`:313`）/`SmtpProfileCfg`（`:330`）/`SmtpXOAuth2Cfg`（`:373`）；`Config.smtp`（`:475`）。**一段两用**：整段 `Serialize` 给插件（空字段 `skip_serializing_if` **省略而非 `null`**——插件侧 `ProfileCfg` 是强类型 `Deserialize`，`null` 直接报错），宿主另经 `MailConfig::from_value` 只吸收 `allowed_*`。 |
-| `oj/src/server_cmd.rs` | `Registries.mail`（`:465`）+ `build_registries` 的单槽探测与多插件冲突 fail-fast（`:596-602`）；`ADAPTER_AXES` 追加 `"mail"`（`:473`）；`plugin_cfg` 增 `"mail"` 适配器臂（`:503`）并提 `pub(crate)`（`:481`，宿主校验面与插件 cfg 同源）。 |
+| `oj/src/serve_cmd.rs` | `Registries.mail`（`:465`）+ `build_registries` 的单槽探测与多插件冲突 fail-fast（`:596-602`）；`ADAPTER_AXES` 追加 `"mail"`（`:473`）；`plugin_cfg` 增 `"mail"` 适配器臂（`:503`）并提 `pub(crate)`（`:481`，宿主校验面与插件 cfg 同源）。 |
 | `oj/src/app.rs` | `build_mail_backend`（`:313`）；`from_config` 注入两处——`Extras.mail`（`:558`，actor/内省/WS 桥共用）与 `StableState.mail`（`:738`，测试运行时），同一 `Arc`、`bus` 与 `Extras.bus` 同实例（`:506`）。 |
 | `sample/config.yaml` | `smtp:` 段 + `mock` profile（`:52` 起）：`file_transport` 落盘通道 + **显式** `allowed_from`/`allowed_recipients` + `tls: none`/`allow_none_tls: true`；另附注释掉的 `default` 真连样例。 |
 | `oj/tests/mail_e2e.rs`（新增） | 真装配 e2e：`eml_dir:36`（进程内共用落盘目录）/`write_project:81`（config.yaml + `mail` 模块 + 附件）/`boot:147`（`App::from_config`）；两条用例：正例 `:188`、白名单负例 `:234`。 |
@@ -1654,9 +1654,9 @@ worker → 真 `.eml` 落盘，全链打通；CI 单一真相源（xtask `PLUGIN
 
 ```
 config.yaml(smtp:) → only_js::config::SmtpSection
-  → oj/src/server_cmd.rs:503  plugin_cfg("mail")   ← 与 plugins.mail 透传同一回落链
+  → oj/src/serve_cmd.rs:503  plugin_cfg("mail")   ← 与 plugins.mail 透传同一回落链
   → 插件 oj_plugin_init(host, cfg)  ← 同一份 JSON（含凭据，建 transport）
-  → oj/src/server_cmd.rs:602  Registries.mail
+  → oj/src/serve_cmd.rs:602  Registries.mail
   → oj/src/app.rs:313         build_mail_backend（MailConfig::from_value + FfiMailBackend::new）
   → oj/src/app.rs:558 Extras.mail  /  oj/src/app.rs:738 StableState.mail
   → src/bridge/bootstrap.js  globalThis.Mail / mail
@@ -1670,7 +1670,7 @@ config.yaml(smtp:) → only_js::config::SmtpSection
 |---|---|---|
 | 7.1 配置 RED | `cargo test --release -p only-js --lib config::tests::smtp` | **编译失败** `E0609 no field 'smtp' on type 'config::Config'`（3 处） |
 | 7.1 配置 GREEN | 同上 | **22 passed**（新增 2：多 profile 解析 + 过线 JSON 形态；空段 = `Some` 且序列化 `{}`） |
-| 7.1 适配器 RED | `cargo test --release -p oj --lib server_cmd::tests::plugin_cfg` | **FAILED** `assertion left != right failed: left "{}" right "{}"` |
+| 7.1 适配器 RED | `cargo test --release -p oj --lib serve_cmd::tests::plugin_cfg` | **FAILED** `assertion left != right failed: left "{}" right "{}"` |
 | 7.1 适配器 GREEN | 同上 | **2 passed**（另 `cfg_adapters_subset_of_probed_axes` 随 `ADAPTER_AXES` 覆盖 mail） |
 | 7.1 装配 RED | `cargo test --release -p oj --lib mail_assembly` | **编译失败** `E0425 cannot find function 'build_mail_backend'`（5 处） |
 | 7.1 装配 GREEN | 同上 | **3 passed**（注入 + 未配/空段/缺插件 → `None` + 白名单形态错 → 装配期 Err） |

@@ -29,7 +29,7 @@ cli/                          # 新 workspace member（package 名 oj）
 ├── src/main.rs               # 入口：子命令分发
 ├── src/args.rs               # oj 参数解析（纯函数）
 ├── src/manifest.rs           # manifest.yaml 加载 + 校验
-├── src/server_cmd.rs         # server 装配：config→db→seed→manifest→actor→serve
+├── src/serve_cmd.rs         # server 装配：config→db→seed→manifest→actor→serve
 └── tests/e2e.rs              # UC 集成测试（sample + 临时目录）
 src/bridge/
 ├── transpile.rs              # 新：deno_ast strip types + 全局转译缓存
@@ -175,7 +175,7 @@ pub fn parse(args: &[String]) -> Command {
 `../../../oj/src/main.rs`：
 ```rust
 mod args;
-mod server_cmd; // T11 填充；先放占位模块见 Step 6
+mod serve_cmd; // T11 填充；先放占位模块见 Step 6
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -189,7 +189,7 @@ fn main() {
             std::process::exit(2);
         }
         args::Command::Server(a) => {
-            if let Err(e) = server_cmd::run(a) {
+            if let Err(e) = serve_cmd::run(a) {
                 eprintln!("oj server: {e}");
                 std::process::exit(1);
             }
@@ -198,7 +198,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 5: 占位 server_cmd**（`../../../oj/src/server_cmd.rs`，T11 替换）
+- [ ] **Step 5: 占位 serve_cmd**（`../../../oj/src/serve_cmd.rs`，T11 替换）
 
 ```rust
 //! server 装配层（T11 实现）。
@@ -1570,11 +1570,11 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Create: `../../../oj/src/manifest.rs`（含 tests）
-- Rewrite: `../../../oj/src/server_cmd.rs`（含 tests）
+- Rewrite: `../../../oj/src/serve_cmd.rs`（含 tests）
 
 **Interfaces:**
 - Consumes: T1 `ServerArgs`、T3 `config`、T4 `method_table/route_table`、T9 `with_dbs_and_loader`、T10 `serve`。
-- Produces: `manifest::{Manifest, load_modules}`；`Manifest { name, desc, version, config }`；`load_modules(dir: &Path) -> Result<Vec<Manifest>, String>`；`server_cmd::{start, run}`；`start(cfg: Config, config_dir: &Path, dir: PathBuf, base: String, ts: bool) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), String>`（T12/T13 消费）。
+- Produces: `manifest::{Manifest, load_modules}`；`Manifest { name, desc, version, config }`；`load_modules(dir: &Path) -> Result<Vec<Manifest>, String>`；`serve_cmd::{start, run}`；`start(cfg: Config, config_dir: &Path, dir: PathBuf, base: String, ts: bool) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), String>`（T12/T13 消费）。
 
 - [ ] **Step 1: manifest 失败测试**
 
@@ -1649,10 +1649,10 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
 ```
 （tests 辅助 `tmp/write` 按现有 server tests 的 TempDir 模式内联。）
 
-- [ ] **Step 4: server_cmd 失败测试**
+- [ ] **Step 4: serve_cmd 失败测试**
 
 ```rust
-// oj/src/server_cmd.rs tests
+// oj/src/serve_cmd.rs tests
     #[tokio::test]
     async fn rejects_non_sqlite_dsn_at_startup() {
         let mut cfg = Config::default();
@@ -1696,7 +1696,7 @@ pub fn load_modules(dir: &Path) -> Result<Vec<Manifest>, String> {
 
 - [ ] **Step 5: 跑测试确认失败**：`cargo test -p oj` → 编译失败。
 
-- [ ] **Step 6: server_cmd 实现**
+- [ ] **Step 6: serve_cmd 实现**
 
 ```rust
 //! oj server 装配：config → 逐 db 开库（仅 sqlite）→ seed → manifest 校验 →
@@ -2109,7 +2109,7 @@ unix@vip.qq.com ai"
 - Create: `../../../oj/tests/e2e.rs`
 
 **Interfaces:**
-- Consumes: T11 `server_cmd::start`、T6 `transpile_hits`、T12 sample 文件。
+- Consumes: T11 `serve_cmd::start`、T6 `transpile_hits`、T12 sample 文件。
 
 - [ ] **Step 1: 写全部用例测试（一次性写全，逐 UC 断言）**
 
@@ -2119,7 +2119,7 @@ unix@vip.qq.com ai"
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use oj::server_cmd;
+use oj::serve_cmd;
 use only_js::bridge::transpile::transpile_hits;
 use only_js::config::Config;
 
@@ -2139,7 +2139,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     cfg.server.port = 0;
     cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", tmp.display()));
     let dir = sample().join(if dev { "src" } else { "dist" });
-    let (addr, h) = server_cmd::start(cfg, &tmp, dir, "/v1/api".into(), dev).await.unwrap();
+    let (addr, h) = serve_cmd::start(cfg, &tmp, dir, "/v1/api".into(), dev).await.unwrap();
     (addr, h, tmp)  // tmp 供个别用例改文件（UC-14 用独立临时项目）
 }
 
@@ -2238,7 +2238,7 @@ async fn uc14_transpile_cache_and_hot_reload() {
     cfg.server.port = 0;
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     std::fs::write(t.join("seed.sql"), "").unwrap();
-    let (addr, _h, _x) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h, _x) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await.unwrap();
     let before = transpile_hits();
     for _ in 0..3 {
@@ -2255,7 +2255,7 @@ async fn uc14_transpile_cache_and_hot_reload() {
     let _ = std::fs::remove_dir_all(&t);
 }
 ```
-（`oj::server_cmd` 与 `only_js::bridge::transpile` 需 pub 可达：`../../../oj/src/main.rs` 加 `pub mod server_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
+（`oj::serve_cmd` 与 `only_js::bridge::transpile` 需 pub 可达：`../../../oj/src/main.rs` 加 `pub mod serve_cmd;` 等 pub 声明；transpile 模块 `pub mod transpile;`。boot 里 `tmp` 返回值给 UC-14 用独立目录，本例直接内联 start 调用。）
 
 - [ ] **Step 2: 跑测试确认通过（允许的失败逐个修）**
 
@@ -2311,7 +2311,7 @@ fn base_cfg() -> Config {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc7_manifest_mismatch_blocks_startup() {
     let t = tmp_project(&[("src/order/manifest.yaml", "name: orderr\ndesc: d\nversion: 0.1.0\n")]);
-    let e = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let e = serve_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
         .await.err().unwrap_or_default();
     assert!(e.contains("orderr") && e.contains("order"), "{e}");
 }
@@ -2319,7 +2319,7 @@ async fn uc7_manifest_mismatch_blocks_startup() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc10_404_and_405() {
     let t = tmp_project(&[("src/u/f/api.ts", "export default { get() { json.ok({}); } };\n")]);
-    let (addr, _h, _x) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h, _x) = serve_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
         .await.unwrap();
     let (s, _) = req(addr, "GET", "/v1/api/none/here/", None).await;
     assert_eq!(s, 404);
@@ -2334,7 +2334,7 @@ async fn uc10_404_and_405() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uc11_compile_error_envelope() {
     let t = tmp_project(&[("src/u/f/api.ts", "function {{{{\nexport default {};\n")]);
-    let (addr, _h, _x) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h, _x) = serve_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
         .await.unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
     assert_eq!(s, 500);
@@ -2347,7 +2347,7 @@ async fn uc12_timeout_408_server_survives() {
                           ("src/u/ok/api.ts", "export default { get() { json.ok({ alive: true }); } };\n")]);
     let mut cfg = base_cfg();
     cfg.server.timeout = "300ms".into();
-    let (addr, _h, _x) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h, _x) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await.unwrap();
     let (s, _) = req(addr, "GET", "/v1/api/u/loop/", None).await;
     assert_eq!(s, 408);

@@ -22,7 +22,7 @@ use tokio::runtime::Builder as TokioBuilder;
 
 use crate::app::{App, ClientTransport, ResourceProfiles};
 use crate::args::TestArgs;
-use crate::server_cmd::load_app_config;
+use crate::serve_cmd::load_app_config;
 use crate::test_ext::oj_test_ext_init;
 
 /// Rust 侧测试结果汇总（serde_v8 从 JS `__testSummary` 反序列化）。

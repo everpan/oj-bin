@@ -56,7 +56,7 @@ oj build [module] [-d src] [-o dist]
 - `.route` 以 `/` 开头（根级声明）→ `v2/user/{id}`（剥首斜杠）
 - 模块根 `src/user/api.ts` 无 `.route` → `user`
 
-## 3. server release 装配（改 `oj/src/server_cmd.rs` ts=false 分支）
+## 3. server release 装配（改 `oj/src/serve_cmd.rs` ts=false 分支）
 
 ```
 读 dist/manifests.yaml ──缺失/空/非法→ fail-fast（"run oj build first"）

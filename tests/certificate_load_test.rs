@@ -2,18 +2,18 @@
 //! - `load_certificate_at` 对真实签名 JWS 判定 Valid / Grace / Expired。
 //! - 文件被覆盖后，watcher 原子更新共享状态。
 //!
-//! 证书夹具统一来自 `server::test_support`（全仓唯一定义，勿再本地拷贝密钥对/签名器）。
+//! 证书夹具统一来自 `serve::test_support`（全仓唯一定义，勿再本地拷贝密钥对/签名器）。
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use only_js::config::ServerCfg;
 use serde_json::json;
-use server::CertificateStatus;
-use server::certificate::load_certificate_at;
-use server::certificate_watcher::{
+use serve::CertificateStatus;
+use serve::certificate::load_certificate_at;
+use serve::certificate_watcher::{
     SharedCertStatus, SharedCertValidUntil, reload_certificate, spawn_watcher,
 };
-use server::test_support::{TEST_RSA_PUBLIC_PEM, now_secs, write_cert};
+use serve::test_support::{TEST_RSA_PUBLIC_PEM, now_secs, write_cert};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tempfile::{NamedTempFile, TempDir};

@@ -91,7 +91,7 @@
 ## 6. dev / release 双模式
 
 判据唯一：服务目录含 `dist/manifests.yaml` → release（跑预构建 JS，不转译，按锁聚合）；
-否则 dev（服务 `src`，按需转译 TS，`notify` 热重载）。见 `oj/src/server_cmd.rs:105`。
+否则 dev（服务 `src`，按需转译 TS，`notify` 热重载）。见 `oj/src/serve_cmd.rs:105`。
 
 | 维度 | dev | release |
 |---|---|---|

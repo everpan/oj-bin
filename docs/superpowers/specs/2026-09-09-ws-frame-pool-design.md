@@ -94,7 +94,7 @@ ws:
 |---|---|
 | `src/bridge/mod.rs` | 新增 `FrameQueue`/`Scheduler`/`Worker`/`ConnHandle`/会话表；`op_ws_event_done`（带回 sends/close/capture/sess_state）注册；`ws_connect` → Worker 预载路径；`WsSession` 退役 |
 | `server/src/ws.rs` | frame_loop Processor → 投递队列 + done_tx；`conn_on_pinned` 每连接线程撤销；`js_route`/`mirror_routes` 改持路由 Worker 池 |
-| `oj/src/server_cmd.rs` / `oj/src/app.rs` | 装配：读 config ws 段建路由池；闸门中间件（upgrade 前全局计数，超限 503） |
+| `oj/src/serve_cmd.rs` / `oj/src/app.rs` | 装配：读 config ws 段建路由池；闸门中间件（upgrade 前全局计数，超限 503） |
 | `sample/src/news/ws.ts`、`chat/ws.ts` | 状态迁移 `sess.state`；注释同步 |
 | docs（api-manual/websocket.md/dev-guide/user-manual/SKILL/MODULES） | 帧池模型、sess 约束（可序列化）、模块作用域新语义、配置面、超时契约（每连接回归）、breaking 标注 |
 | CHANGELOG | v0.2 段（breaking） |

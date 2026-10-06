@@ -978,14 +978,14 @@ unix@vip.qq.com ai"
 
 **Files:**
 - Modify: `src/config.rs`（`AuthCfg` 删 `user_table` 字段与 Default；相关测试同步删）
-- Modify: `oj/src/server_cmd.rs`（`Registries.auth`、`build_registries`、`plugin_cfg_json`）
+- Modify: `oj/src/serve_cmd.rs`（`Registries.auth`、`build_registries`、`plugin_cfg_json`）
 - Modify: `oj/src/app.rs`（auth 装配改插件守卫 + JwtCfg 注入 Extras）
 
 **Interfaces:**
 - Consumes: Task 3 `plugin_loader::auth_guard` / `ffi::FfiAuthGuard`、Task 1 `JwtCfg`、Task 4 oj-auth 产物。
 - Produces: `Registries.auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>`。
 
-- [ ] **Step 1: 写失败测试**（`oj/src/server_cmd.rs` tests：仿 463 行附近既有 auth 配置测试 + 1178 行 `es_plugin_wires_backend` 模式）
+- [ ] **Step 1: 写失败测试**（`oj/src/serve_cmd.rs` tests：仿 463 行附近既有 auth 配置测试 + 1178 行 `es_plugin_wires_backend` 模式）
 
 ```rust
     /// auth 声明但无 auth 插件 → fail-fast；插件在 → vtable 进 Registries。
@@ -1014,7 +1014,7 @@ Expected: FAIL（行为未实现）
 
 `src/config.rs`：`AuthCfg` 删 `pub user_table: String` 与 Default 里的 `user_table: "users".into()`；该文件 463 行附近测试同步删 user_table 引用。
 
-`oj/src/server_cmd.rs`：
+`oj/src/serve_cmd.rs`：
 1. `Registries` 加 `pub auth: Option<&'static oj_plugin_ffi::AuthGuardVtable>,`（doc：auth 键选单槽，多 auth 插件冲突 fail fast）。
 2. `build_registries` 加（仿 es 块）：
 
@@ -1085,7 +1085,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/config.rs oj/src/server_cmd.rs oj/src/app.rs oj/Cargo.toml src/bridge/plugin_loader.rs src/bridge/mod.rs
+git add src/config.rs oj/src/serve_cmd.rs oj/src/app.rs oj/Cargo.toml src/bridge/plugin_loader.rs src/bridge/mod.rs
 git commit -m "feat(oj): auth 装配切换到 oj-auth 插件守卫 + JwtCfg 注入；删 auth.user_table
 
 unix@vip.qq.com ai"

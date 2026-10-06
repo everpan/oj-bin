@@ -1,7 +1,7 @@
 //! `oj openapi`：从路由表生成 OpenAPI 3.1，并支持 `--check` 漂移校验（PR-6 第一步）。
 //!
 //! 设计：
-//! - 路由发现双模复用既有路径——dev 走 `server::build_table`（V8 内省 .route），
+//! - 路由发现双模复用既有路径——dev 走 `serve::build_table`（V8 内省 .route），
 //!   release 走 `dist/manifests.yaml` + 各模块 `routes.js`（与 serve 装配同构，见
 //!   `app.rs` 的 release 分支）。
 //! - 当前仅能收集体量信息（路径 / 方法 / 源文件 / 派生 module），请求体 / 响应 schema /
@@ -22,7 +22,7 @@ pub fn discover_routes(
     dir: &Path,
     ts: bool,
     base: &str,
-) -> Result<server::routes::RouteTable, String> {
+) -> Result<serve::routes::RouteTable, String> {
     if ts {
         // dev：与 serve 装配同构（app.rs 的 dev 分支）——自建最小 Bridge + bridge_introspector。
         let make = {
@@ -42,11 +42,11 @@ pub fn discover_routes(
                 )
             }
         };
-        let (t, failures) = server::routes::RouteTable::build(
+        let (t, failures) = serve::routes::RouteTable::build(
             base,
             dir,
             ts,
-            server::routes::bridge_introspector(make),
+            serve::routes::bridge_introspector(make),
         );
         if !failures.is_empty() {
             eprintln!("oj openapi: route introspect failures: {failures:?}");
@@ -83,7 +83,7 @@ pub fn discover_routes(
             )
         }
     };
-    let reader = server::routes::bridge_default_reader(make);
+    let reader = serve::routes::bridge_default_reader(make);
     let mut entries = Vec::new();
     let b = base.trim_matches('/');
     for (module, version) in &lock {
@@ -107,8 +107,8 @@ pub fn discover_routes(
         }
         let rjs = mdir.join("routes.js");
         let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
-        for e in server::routes::entries_from_value(&v) {
-            entries.push(server::routes::RouteEntry {
+        for e in serve::routes::entries_from_value(&v) {
+            entries.push(serve::routes::RouteEntry {
                 method: e.method,
                 pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
                 file: format!("{module}-{version}/{}", e.file),
@@ -116,7 +116,7 @@ pub fn discover_routes(
             });
         }
     }
-    let (table, failures) = server::routes::RouteTable::from_entries(dir, &entries);
+    let (table, failures) = serve::routes::RouteTable::from_entries(dir, &entries);
     if !failures.is_empty() {
         return Err(format!("release routes: {}", failures.join("; ")));
     }
@@ -128,7 +128,7 @@ pub fn discover_routes(
 /// v0.1.44：handler 的 `.schema`（经 `RouteRow.schema` 落到此处）补出
 /// `parameters`（path / query）与 `requestBody`。返回 Result —— 契约与路由
 /// pattern 不一致时**生成期 fail-fast**（见 `contract_params` 的交叉校验）。
-pub fn generate(table: &server::routes::RouteTable, base: &str) -> Result<Value, String> {
+pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, String> {
     let b = base.trim_matches('/');
     let mut paths: serde_json::Map<String, Value> = serde_json::Map::new();
     for row in table.listing() {
@@ -198,7 +198,7 @@ pub fn generate(table: &server::routes::RouteTable, base: &str) -> Result<Value,
 /// 命令入口：生成或漂移校验。返回进程退出码（0 成功 / 1 漂移或错误）。
 pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
     let (_cfg, _config_dir, dir, ts, base) =
-        crate::server_cmd::load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())
+        crate::serve_cmd::load_app_config(&a.config, a.dir.as_deref(), a.base.as_deref())
             .map_err(|e| format!("oj openapi: {e}"))?;
 
     let table = discover_routes(&dir, ts, &base)?;
@@ -425,7 +425,7 @@ fn diff_lines(generated: &str, committed: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use server::routes::RouteTable;
+    use serve::routes::RouteTable;
     use std::path::PathBuf;
 
     /// 每调用一个**独立**临时目录。用例并行跑时不能共用同一路径——构造函数的
@@ -597,7 +597,7 @@ mod tests {
         let dir = unique_tmp("oj-oa-ct");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let entries = vec![server::routes::RouteEntry {
+        let entries = vec![serve::routes::RouteEntry {
             method: method.to_string(),
             pattern: pattern.to_string(),
             file: file.to_string(),
@@ -692,7 +692,7 @@ mod tests {
         let dir = unique_tmp("oj-oa-nb");
         let (t, fail) = RouteTable::from_entries(
             &dir,
-            &[server::routes::RouteEntry {
+            &[serve::routes::RouteEntry {
                 method: "get".to_string(),
                 pattern: "/v1/api/user/{id}".to_string(),
                 file: "user-0.1.0/api.js".to_string(),
@@ -713,13 +713,13 @@ mod tests {
     fn release_entries_prefix_base_and_build_table() {
         // 直接喂 from_entries，验证 release 形态 pattern 含 base 前缀（与 app.rs 同构）。
         let entries = vec![
-            server::routes::RouteEntry {
+            serve::routes::RouteEntry {
                 schema: None,
                 method: "get".to_string(),
                 pattern: "/v1/api/user/{id}".to_string(),
                 file: "user-0.1.0/_id_/api.js".to_string(),
             },
-            server::routes::RouteEntry {
+            serve::routes::RouteEntry {
                 method: "post".to_string(),
                 pattern: "/v1/api/admin/role".to_string(),
                 file: "admin-0.1.0/role/api.js".to_string(),

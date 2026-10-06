@@ -135,7 +135,7 @@ actor 线程内跑 `current_thread` runtime，**串行**执行 job；并发度 =
 
 全仓唯一的测试证书夹具：`write_cert(dir, nbf, exp)` / `write_cert_into(&mut cfg, dir, ..)`
 生成**真实签名**的 JWS + SPKI 公钥并写回 `ServerCfg`。
-证书门禁后所有启动测试的公共前置，由 `oj`（server_cmd/e2e）与根 crate（dev-dep）复用。
+证书门禁后所有启动测试的公共前置，由 `oj`（serve_cmd/e2e）与根 crate（dev-dep）复用。
 
 ## 9. 已知债
 

@@ -61,7 +61,7 @@ where
 }
 
 /// 多静态站点条目（v0.1.27，`server.static_sites`）：前缀→目录映射。
-/// `prefix` 规范化见 server_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
+/// `prefix` 规范化见 serve_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
 /// `path` 相对 config 目录（CLI `--app-path prefix=dir` 给出的已按 CWD 预绝对化）。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct StaticSiteConf {
@@ -97,7 +97,7 @@ pub struct ServerCfg {
     /// API 路由永远优先于静态兜底。
     pub app_prefix: String,
     /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
-    /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（server_cmd 预绝对化后写入）。
+    /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（serve_cmd 预绝对化后写入）。
     pub app_path: Option<String>,
     /// 多静态站点（v0.1.27）：前缀→目录映射列表。与 (app_prefix, app_path) 主站点
     /// 共存；规范化后前缀重复 → 启动 fail-fast。缺省空。
@@ -499,7 +499,7 @@ pub fn anon_paths(list: &[AnonPath]) -> Vec<String> {
 /// 装配期校验（fail-fast）：`one_layer` 只对尾 `/*` 条目有意义——挂在别的条目上是无效
 /// 标记（WARN 本就不会点名它），静默接受等于让配置撒谎。
 ///
-/// 判据用**段级**口径（末段 == `"*"`）而非裸后缀，与匹配层 `server::path_matches` 的
+/// 判据用**段级**口径（末段 == `"*"`）而非裸后缀，与匹配层 `serve::path_matches` 的
 /// 「忽略空段」保持一致：`/idp/*/` 在运行期就是严格一层，标 `one_layer` 合法。
 /// （迁移 WARN 的 `is_legacy_prefix_shape` 有意仍用裸后缀——它对齐的是 v0.1.19
 /// `strip_suffix("/*")` 的历史口径，两处差异是刻意的。）

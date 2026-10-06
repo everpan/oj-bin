@@ -1220,7 +1220,7 @@ routes.js `file` 字段不受影响），`json`/`db`/`http` 等注入全局是�
   `oj_plugin_ffi::path_util::sqlite_file_dsn`（与 `fwd` 自带文档的红线一致：DSN 不走裸 replace）。
   复核方法：把全仓 `#[cfg(...)]` 里的 `unix` 逐处置换成 `windows` 后 `cargo check --workspace
   --all-targets`——等价于「unix-only 项全部缺席」的 Windows 形态，结果零 error（`fwd` 是唯一一处，
-  `logging.rs` 的 `cfg(all(test, unix))` / `server_cmd.rs` 的 `daemonize`·`term` 均有 `not(unix)`
+  `logging.rs` 的 `cfg(all(test, unix))` / `serve_cmd.rs` 的 `daemonize`·`term` 均有 `not(unix)`
   对偶分支）。
 - **CI：三平台矩阵「一红全跑」的资源成本**（`.github/workflows/plugin-matrix.yml` / `release.yml`）。
   `plugin-matrix.yml` 新增派发输入 `platforms`（`all`/`linux`/`macos`/`windows`，逗号分隔）与
@@ -1498,7 +1498,7 @@ routes.js `file` 字段不受影响），`json`/`db`/`http` 等注入全局是�
   - **停机 graceful drain 生产可达**（Important）：`MailEngine::shutdown` 此前只被测试调用
     （`allow(dead_code)`，引擎是插件内 `OnceLock` 单例、进程退出不 Drop）⇒ 生产停机实际**丢在途
     邮件**，与文档宣称矛盾。改为**零 ABI 变更**的控制报文 `{"__ctl":"drain","timeout_ms":N}`
-    （走既有 `MailVtable::submit`），宿主在停机路径（`server_cmd` 的 SIGTERM/正常退出，
+    （走既有 `MailVtable::submit`），宿主在停机路径（`serve_cmd` 的 SIGTERM/正常退出，
     HTTP 停收 + 任务收场之后）经 `App::drain_mail` 调用；总超时 10s，超时告警不阻断退出。
     新增 `oj/tests/mail_drain_e2e.rs`（真装配 + 真插件：排空后新投递被拒，证明报文到达插件）。
   - **worker 强引用释放顺序**（Important）：`async move` 块的捕获变量只在 **future 被 drop**

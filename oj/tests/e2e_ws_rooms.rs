@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use oj::server_cmd;
+use oj::serve_cmd;
 use only_js::config::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,8 +29,8 @@ fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
 fn base_cfg(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.server.port = 0;
-    let n = server::test_support::now_secs();
-    server::test_support::write_cert_into(
+    let n = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
         &mut cfg.server,
         dir,
         n.saturating_sub(3600),
@@ -188,7 +188,7 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
     // 严格清单只装 oj-auth（隔离扫描模式与插件单例）；守卫不接线（cfg.auth = None）。
     cfg.plugins
         .insert("auth".into(), serde_json::Value::Object(Default::default()));
-    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
         .await
         .unwrap();
 

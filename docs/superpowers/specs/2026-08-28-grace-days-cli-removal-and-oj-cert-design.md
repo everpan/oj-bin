@@ -19,7 +19,7 @@
 | 文件 | 改动 |
 |------|------|
 | `oj/src/args.rs` | 删 `ServerArgs.grace_days` 字段、`Commands::Server` 的 `grace_days` clap 参数、`to_command` 对应分支 |
-| `oj/src/server_cmd.rs:31-32` | 删 `if let Some(d) = a.grace_days { … }` 覆盖块 |
+| `oj/src/serve_cmd.rs:31-32` | 删 `if let Some(d) = a.grace_days { … }` 覆盖块 |
 | `oj/src/main.rs:105` | 测试字面量删该字段 |
 | `oj/src/args.rs` 测试 `bad_usage_is_clap_error` | 加 `assert!(cli(&["server", "--grace-days", "30"]).is_err())`（沿 `--dev` 已删先例，防止回潮） |
 | `docs/user-manual.md:30,44` | 删 usage 行中的 `--grace-days` 与旗标表对应行 |

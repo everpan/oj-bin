@@ -65,7 +65,7 @@
 | `blob` 平铺/命名歧义 | `BlobSection::entries()` |
 | `auth.jwt_secret` 非空 | `oj/src/app.rs:241` |
 | `migrate_on_start` / `ownership_guard` 非法值 | `oj/src/app.rs:173-192` |
-| `server.api_prefix` 为空 | `oj/src/server_cmd.rs:95` |
+| `server.api_prefix` 为空 | `oj/src/serve_cmd.rs:95` |
 | `server.html_meta_handler` 未命中 GET 路由 | `oj/src/app.rs::validate_html_meta_handler`（v0.1.25） |
 | 模块名/版本白名单 | `oj/src/manifest.rs:25,37` |
 | schema.yaml 标识符白名单 `[A-Za-z_][A-Za-z0-9_]*` | `oj/src/schema.rs:103` |

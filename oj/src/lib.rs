@@ -19,7 +19,7 @@ pub mod pack;
 pub mod schema;
 pub mod secret_cmd;
 pub mod seed;
-pub mod server_cmd;
+pub mod serve_cmd;
 pub mod tasks;
 pub mod test_cmd;
 pub mod test_ext;

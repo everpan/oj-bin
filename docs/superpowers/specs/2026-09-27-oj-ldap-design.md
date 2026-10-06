@@ -60,7 +60,7 @@ LDAP("ad").search(...)               // 命名实例
 | `src/bridge/ldap.rs` | `LdapBackend` trait + `FfiLdapBackend` + 5×`op_ldap_*`（白名单校验层） |
 | `src/bridge/mod.rs` | `StableState.ldap` + Extras + ops 注册 |
 | `src/config.rs` | `ldap: Option<LdapSection>` |
-| `oj/src/server_cmd.rs` | `ADAPTER_AXES` + `"ldap"`、vtable 槽、`app::build_ldap_backend` |
+| `oj/src/serve_cmd.rs` | `ADAPTER_AXES` + `"ldap"`、vtable 槽、`app::build_ldap_backend` |
 | `src/bridge/bootstrap.js` | `ldap`/`LDAP(name)` 装配 |
 | `plugins/oj-ldap/` | `lib.rs` + `config.rs` + `engine.rs`（ldap3 池化） |
 

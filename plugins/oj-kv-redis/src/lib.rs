@@ -48,7 +48,7 @@ struct RedisKV {
 /// 凭据段换 `***`，host/库名保留。插件不能依赖宿主库（只依赖 oj-plugin-ffi），故本地
 /// 复制——**口径必须保持一致**，否则一处脱敏另一处漏。
 ///
-/// 必须脱敏的原因：Err 串回宿主后会经终端镜像落 `logs/`（`server::logging`），
+/// 必须脱敏的原因：Err 串回宿主后会经终端镜像落 `logs/`（`serve::logging`），
 /// 而 redis URL 里的密码正是 config 中被 `ENC[...]` 密封的那个值。
 fn redact_url(s: &str) -> String {
     let Some(rest) = s.split_once("://").map(|(_, r)| r) else {

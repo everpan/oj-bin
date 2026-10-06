@@ -9,7 +9,7 @@
 
 把 `only-js` 的五个后端轴（db/blob/bus/kv/es）从编译期写死改造为
 **cdylib 动态库插件系统**：core 持 op + 注册表，插件为纯工厂 `.so/.dylib/.dll`，
-启动期 libloading 装配。四层：装配层（`oj/src/server_cmd.rs`）→ 插件层（`oj-*` cdylib）
+启动期 libloading 装配。四层：装配层（`oj/src/serve_cmd.rs`）→ 插件层（`oj-*` cdylib）
 → 框架层（core：五注册表 + PluginLoader + `ffi.rs` 全部 unsafe）→ 契约层（`oj-plugin-ffi`）。
 完整设计见 spec，冲突以 spec 为准。
 
@@ -204,7 +204,7 @@ Task 6.2 Step 3 提交 `fix(review): 插件系统完成度 review 意见吸收`�
 | 契约层（vtable/宏/容器） | `oj-plugin-ffi/src/{lib,es,db,blob,bus,kv,future}.rs` |
 | 全部 unsafe + 适配器层 | `src/bridge/ffi.rs`（`load_forget` + 每轴 `FfiXxxBackend`） |
 | 加载器（路径解析/清单/扫描/七分类） | `src/bridge/plugin_loader.rs` + `tests.rs` |
-| 装配层（清单去重/冲突 fail-fast/§2 闸门） | `oj/src/server_cmd.rs`（`assemble_plugins`/`build_registries`） |
+| 装配层（清单去重/冲突 fail-fast/§2 闸门） | `oj/src/serve_cmd.rs`（`assemble_plugins`/`build_registries`） |
 | 插件自省 op | `src/bridge/plugins_op.rs` |
 | 插件 cdylib | `plugins/oj-es` `plugins/oj-db-mysql` `plugins/oj-db-postgres` `plugins/oj-blob-s3` `plugins/oj-bus-kafka` `plugins/oj-bus-rabbitmq` `plugins/oj-kv-redis` |
 | 测试夹具插件 | `tests/plugins/mini` |

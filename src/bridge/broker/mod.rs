@@ -3,7 +3,7 @@
 //! 统一契约在 `super::bus::EventBroker`：进程内 `Bus` 与插件 `FfiEventBroker`
 //! （oj-bus-kafka / oj-bus-rabbitmq）皆实现之，经 `BusBackendRegistry` 按 kind 装配。
 //! `build_broker` 保持签名（薄包装 builtin()），供缺省/测试零插件场景；真实装配在
-//! server_cmd 经 Registries.bus（内置 local + 插件工厂）连接。
+//! serve_cmd 经 Registries.bus（内置 local + 插件工厂）连接。
 
 use std::sync::Arc;
 
