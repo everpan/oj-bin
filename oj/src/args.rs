@@ -173,10 +173,15 @@ pub struct SchemaDiffArgs {
     pub db: Option<String>,
 }
 
-/// `oj exec [-c config] [-d dir] [--db name] [--log-file path] file [args...]`：
+/// `oj exec [-c config] [-d dir] [--db name] [--log-file path] (file | -e code | --repl) [args...]`：
 /// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）。
+/// `file` / `-e/--code` / `--repl` 三选一、互斥：文件 / 内联代码 / 交互式 REPL。
 pub struct ExecArgs {
-    pub file: String,
+    pub file: Option<String>,
+    /// 直接执行的内联代码（TypeScript 语法；JS 子集亦合法）。与 `file` / `--repl` 互斥。
+    pub code: Option<String>,
+    /// 进入交互式 REPL（逐行读 stdin 求值）。与 `file` / `--code` 互斥。
+    pub repl: bool,
     pub config: String,
     pub dir: Option<String>,
     pub db: Option<String>,
@@ -353,9 +358,18 @@ enum Commands {
         command: SecretCmd,
     },
     /// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）
+    /// 三种用法互斥、必选其一：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式 REPL）。
+    #[command(group(clap::ArgGroup::new("exec_src").multiple(false)))]
     Exec {
-        /// 脚本文件路径（.ts/.js）
-        file: String,
+        /// 脚本文件路径（.ts/.js）；与 --code / --repl 互斥
+        #[arg(group = "exec_src")]
+        file: Option<String>,
+        /// 直接执行的内联代码（TypeScript 语法；JS 子集亦合法）；与 file / --repl 互斥
+        #[arg(short = 'e', long = "code", group = "exec_src")]
+        code: Option<String>,
+        /// 进入交互式 REPL（逐行读 stdin 求值，后端全局可用）；与 file / --code 互斥
+        #[arg(long = "repl", group = "exec_src")]
+        repl: bool,
         /// 配置文件路径（db/redis/插件段）
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
@@ -600,6 +614,8 @@ fn to_command(cli: Cli) -> Command {
         } => Command::SecretOpen(SecretOpenArgs { key, config, value }),
         Commands::Exec {
             file,
+            code,
+            repl,
             config,
             dir,
             db,
@@ -613,6 +629,8 @@ fn to_command(cli: Cli) -> Command {
             args,
         } => Command::Exec(ExecArgs {
             file,
+            code,
+            repl,
             config,
             dir,
             db,
@@ -670,7 +688,8 @@ mod tests {
         ]) else {
             panic!()
         };
-        assert_eq!(a.file, "scripts/job.ts");
+        assert_eq!(a.file.as_deref(), Some("scripts/job.ts"));
+        assert_eq!(a.code, None);
         assert_eq!(a.config, "c.yaml");
         assert_eq!(a.dir.as_deref(), Some("src"));
         assert_eq!(a.db.as_deref(), Some("report"));
@@ -680,6 +699,7 @@ mod tests {
         let Command::Exec(a) = cmd(&["exec", "s.ts", "-c", "c.yaml"]) else {
             panic!()
         };
+        assert_eq!(a.file.as_deref(), Some("s.ts"));
         assert!(a.args.is_empty());
     }
 
@@ -710,6 +730,35 @@ mod tests {
                 && a.kafka.is_none()
                 && a.rabbit.is_none()
         );
+    }
+
+    #[test]
+    fn exec_code_and_repl_flags_parse() {
+        // -e/--code 内联代码：与 file 互斥（group），但单独给出时落到 code。
+        let Command::Exec(a) = cmd(&["exec", "-e", "console.log(1)", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert_eq!(a.code.as_deref(), Some("console.log(1)"));
+        assert!(a.file.is_none());
+        assert!(!a.repl);
+        // --code 长旗标同义。
+        let Command::Exec(a) = cmd(&["exec", "--code", "db.query('x')", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert_eq!(a.code.as_deref(), Some("db.query('x')"));
+        // --repl：落到 repl，file/code 均空。
+        let Command::Exec(a) = cmd(&["exec", "--repl", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert!(a.repl);
+        assert!(a.file.is_none() && a.code.is_none());
+        let cli =
+            |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
+        // 互斥：file + --code 报错。
+        assert!(cli(&["exec", "s.ts", "-e", "1"]).is_err());
+        // file + --repl 报错。
+        assert!(cli(&["exec", "s.ts", "--repl"]).is_err());
+        // 三者皆无：缺 source（group 不强制，但本仓 run() 会校验）。
     }
 
     #[test]

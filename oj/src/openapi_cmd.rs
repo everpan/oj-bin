@@ -136,7 +136,11 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
         let raw = row.pattern.trim_start_matches('/');
         let oa_path = to_oa_path(raw);
         let method = row.method.to_lowercase();
-        let file = table.file_path(row.file).to_string_lossy().into_owned();
+        // 溯源标记统一用正斜杠（Windows 原生分隔符是反斜杠，会让跨平台比对/展示不一致）。
+        let file = table
+            .file_path(row.file)
+            .to_string_lossy()
+            .replace('\\', "/");
         let sub = raw
             .strip_prefix(&format!("{b}/"))
             .unwrap_or(raw)
