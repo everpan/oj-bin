@@ -2746,23 +2746,33 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 - npm 包不可撤回：CI 上 release 草稿期不发 npm（人工核对 release 后幂等补发），
   版本一经发布不可复用——改代码必须递增版本。
 
-### `oj exec <file.ts|js>` —— 直接执行脚本（v0.1.29）
+### `oj exec` —— 直接执行脚本（v0.1.29；内联代码/REPL v0.1.50）
 
-不起 HTTP 服务，直接在一个装配好完整后端的运行时里跑一个 ts/js 文件：一次性数据
-修复、迁移后对账、定时任务原型、批处理脚本。后端全局与 handler 同源（`json`/`db`/
-`kv`/`blob`/`bus`/`es`/`fetch`/`ws`/`log`/`plugins`/`cert`/`jwt`/`bcrypt`/`crypto`/
-`oidc`/`ldap`/`mail`/`mq`），经 `assemble_backend` 装配，db/kv/es/blob/bus/插件全部可用。
-专题手册：仓库 `docs/exec-integration.md`。
+不起 HTTP 服务，直接在一个装配好完整后端的运行时里跑 ts/js 代码：一次性数据
+修复、迁移后对账、定时任务原型、批处理脚本、临时调试求值。后端全局与 handler 同源
+（`json`/`db`/`kv`/`blob`/`bus`/`es`/`fetch`/`ws`/`log`/`plugins`/`cert`/`jwt`/`bcrypt`/
+`crypto`/`oidc`/`ldap`/`mail`/`mq`），经 `assemble_backend` 装配，db/kv/es/blob/bus/插件
+全部可用。专题手册：仓库 `docs/exec-integration.md`。
+
+三种用法**互斥、必选其一**：
+
+- **`<file>`**：执行磁盘上的 `.ts`/`.js` 文件（`file + --code` / `file + --repl` 由 clap 报错）。
+- **`-e, --code <code>`**（v0.1.50）：直接执行字符串里的 TypeScript（JS 子集亦合法），不落盘。
+- **`--repl`**（v0.1.50）：进入交互式 REPL，逐行读 stdin 求值（Ctrl-D 退出）。
 
 ```bash
-./bin/oj exec scripts/fix.ts -c config.yaml                  # 完整后端
+./bin/oj exec scripts/fix.ts -c config.yaml                  # 完整后端（文件）
 ./bin/oj exec scripts/fix.ts -c config.yaml --log-file a.jsonl
 ./bin/oj exec scripts/fix.ts -c config.yaml -- --dry-run id=7  # -- 后 argv 注入 globalThis.args
+./bin/oj exec -e 'console.log(await db.query("select 1", []))' -c config.yaml   # 内联代码
+./bin/oj exec --repl -c config.yaml                                        # 交互式 REPL
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `<file>` | 必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1） |
+| `<file>` | 三选一必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1）；与 `--code`/`--repl` 互斥 |
+| `-e, --code` | 三选一必填 | 内联代码（TypeScript 语法）；不落盘、自包含——**不支持相对 import**（无基准目录，合成 `file:///oj-eval.ts` specifier）；与 `<file>`/`--repl` 互斥 |
+| `--repl` | 三选一必填 | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥 |
 | `-c` | `config.yaml` | 配置文件路径 |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |
@@ -2773,7 +2783,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 | `--kafka` | 无 | 选中 `config.kafkas.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
 | `--rabbit` | 无 | 选中 `config.rabbits.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
 | `--log-file` | 不落盘 | 追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 stderr warn 一次，终端输出继续 |
-| `-- arg...` | 无 | `--` 之后的 argv 原样注入 `globalThis.args: string[]`（无 `--` 为空数组） |
+| `-- arg...` | 无 | `--` 之后的 argv 原样注入 `globalThis.args: string[]`（无 `--` 为空数组；REPL 下同样注入） |
 
 > `--redis/--blob/--es/--broker/--kafka/--rabbit`（v0.1.34）把 config 对应段里**命名 profile**
 > 选为默认源（装配期别名为字面 `"default"`），JS 侧对应全局无需改代码即指向选中源；给定
@@ -3007,6 +3017,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `oj exec` 无执行超时 / KillSwitch（v0.1.29） | 手工 runtime 不过 RuntimePool：同步死循环（`while(true){}`）无限挂起，Ctrl-C 是唯一兜底；常驻轮询用 `src/tasks/` 任务池 |
 | `oj exec` 租户/归属守卫不设防（v0.1.29） | 无 HTTP 请求上下文（租户 id 恒 None）= 匿名系统操作员；`sql_guard: "deny"` 的库上脚本须 `await db.asSystem()` |
 | `oj exec` 相对导入上跳被拒（v0.1.29） | import 被钳制在项目根（config 所在目录）内且须显式扩展名——`import "../x"` 报 escapes project root；脚本在项目外则连 `./util.ts` 都导不了 |
+| `oj exec -e/--code` 与 `--repl` 不支持相对 import（v0.1.50） | 内联代码/REPL 行无基准目录（合成 `file:///oj-eval.ts` / `file:///oj-repl/<n>.ts` specifier），**应自包含**；需要 import 复用请改走 `<file>` 模式 |
+| `oj exec --repl` 顶层绑定不跨行持久（v0.1.50） | 每行是独立模块、作用域隔离；`const x=1` 下一行读不到，跨行共享须显式 `globalThis.x = 1` |
 | `blob.readRange` 是短读（v0.1.47） | 越尾只返回实际可读字节、`offset` 过尾返回**空数组**——先判 `head.length` 再分支，不要假设一定拿满 `len`；`offset` / `len` 为负 / 小数 / NaN 报错 `blob readRange: offset must be a non-negative integer` |
 | `blob.copy` / `blob.move` 的 `src == dst`（v0.1.47） | 明确 **no-op**（`fs::copy` 同文件语义未定义、会截断文件）——不是「复制一份给自己」；`move` 后 src 一定不存在，`copy` 后 src 一定还在 |
 | blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |

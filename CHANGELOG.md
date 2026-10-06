@@ -16,6 +16,26 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.50 —— `oj exec` 内联代码与交互式 REPL（未打标签）
+
+**动机**：`oj exec` 原先只能执行磁盘上的 `.ts`/`.js` 文件，临时调试、一次性求值、管道/CI
+里嵌一小段代码都得先落盘。补齐两类轻量入口：**内联代码**（`-e/--code`）与**交互式
+REPL**（`--repl`），三者与 `file` 互斥、必选其一。
+
+- **`-e, --code <code>`（内联代码）**：直接执行字符串里的 TypeScript（JS 子集亦合法），
+  不落盘。后端全局注入、`--db/--redis/.../--log-file`/`-- arg...` 等旗标与文件模式完全一致；
+  代码以 `file:///oj-eval.ts` 合成 specifier 走 side-module（TLA 保真），**不能含相对
+  import**（无基准目录，内联代码应自包含）。
+- **`--repl`（交互式 REPL）**：逐行读 stdin，每行以 TS 转译后独立求值，同一 isolate 内
+  后端全局（`db`/`kv`/`blob`/`console`/`log`/...）全部可用；Ctrl-D（EOF）退出，退出码 0。
+  每行是一个独立模块、顶层绑定作用域隔离，**跨行共享状态需显式挂到 `globalThis`**
+  （如 `globalThis.x = 1`）；与内联代码同理，REPL 行内不支持相对 import。
+- **互斥与校验**：`file` / `--code` / `--repl` 归到同一 `ArgGroup`（`multiple = false`）——
+  两两组合（如 `file + --code`、`file + --repl`）由 clap 报错；三者皆无则由 `run()` 报
+  `exec: 需提供 <file> / --code / --repl 之一`。
+- 装配/迁移门禁/扩展顺序与既有 `oj exec` 文件模式完全同源（`build_runtime` 抽出共用，
+  `boot_if_set` 补跑 ext_boot）；退出码语义不变（settle 0 / 异常·加载失败 1）。
+
 ## v0.1.49 —— fixture 归入 test 子命令（未打标签）
 
 **动机**：`fixture` 仅为测试服务的演示数据灌入，原作为顶层子命令与 `test` 平级，语义上

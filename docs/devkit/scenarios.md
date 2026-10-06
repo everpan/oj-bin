@@ -898,7 +898,21 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 # 退出码 0 = settle 无异常；脚本 throw → stderr 报 V8 异常，exit 1
 ```
 
-### ④ 常见坑
+### ④ 轻量入口：内联代码与 REPL（v0.1.50）
+
+不想为一次性求值落盘一个 `.ts` 文件时，用 `-e/--code` 直接喂字符串，或 `--repl`
+进交互式逐行求值（后端全局同样可用）：
+
+```bash
+# 内联代码（TypeScript 语法；自包含、不支持相对 import）
+./bin/oj exec -e 'const r = await db.query("select count(*) as c from account", []); console.log(r[0].c);' -c config.yaml
+
+# 交互式 REPL：逐行输入，Ctrl-D 退出；顶层绑定不跨行持久，跨行共享须 globalThis.x = …
+./bin/oj exec --repl -c config.yaml
+# oj> console.log(await db.query("select 1", []))
+```
+
+### ⑤ 常见坑
 
 | 现象 | 原因 |
 |---|---|
@@ -906,6 +920,8 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 | 脚本拷进 handler 后 `console is not defined` | `console` 仅 exec 运行时提供（server/test 无此全局）——搬回 handler 时删掉 |
 | `args` 是空数组 | 透传参数必须在 `--` **之后**：`oj exec s.ts -c config.yaml -- --dry-run` |
 | import 报 escapes project root | 相对导入钳制在项目根（config 所在目录）内且须显式扩展名（`import "./util.ts"`）；`import "../x"` 上跳被拒 |
+| `-e/--code`、`--repl` 里 `import "./util"` 报找不到 | 内联代码/REPL 无基准目录、不支持相对 import——要复用模块请走 `oj exec <file>` |
+| REPL 上 `const x=1` 下一行读不到 | 每行独立模块、作用域隔离；跨行共享须显式 `globalThis.x = 1` |
 | `sql_guard: "deny"` 库上查询被拦 | exec 无 HTTP 上下文 = 匿名操作员，且守卫不设防；被 deny 拦的查询加 `await db.asSystem()` |
 | 脚本卡死不退 | exec 无超时/KillSwitch——同步死循环只能 Ctrl-C；常驻轮询搬进 `src/tasks/` 任务池 |
 | `--log-file` 没生成 | 打开失败只 warn 一次不中断——看 stderr 首行（路径不可写等） |

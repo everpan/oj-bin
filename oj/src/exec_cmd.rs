@@ -4,7 +4,10 @@
 //! ws_client_extensions → bridge_ext_init(stable) → exec_ext_init(options)
 //! （ws 在前：bootstrap.js 静态 import 依赖；exec_ext 最后：覆盖 log 依赖
 //! bridge bootstrap 先跑）。
+//!
+//! 三种入口（互斥）：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式 REPL）。
 
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -20,13 +23,35 @@ use crate::args::ExecArgs;
 use crate::exec_ext::{ExecOptions, oj_exec_ext_init};
 use crate::serve_cmd::load_app_config;
 
-/// 入口：解析校验 → 钉线程 → 装配后端 → 执行脚本 → 进程退出码。
+/// exec 执行目标：文件 / 内联代码 / 交互式 REPL（三者互斥、必选其一）。
+pub(crate) enum ExecTarget {
+    File(PathBuf),
+    Code(String),
+    Repl,
+}
+
+/// 入口：解析校验 → 钉线程 → 装配后端 → 执行 → 进程退出码。
 pub fn run(a: ExecArgs) -> Result<i32, String> {
-    let script = PathBuf::from(&a.file);
-    match script.extension().and_then(|e| e.to_str()) {
-        Some("ts") | Some("js") => {}
-        _ => return Err(format!("exec: 仅支持 .ts/.js: {}", script.display())),
-    }
+    let target = match (&a.file, &a.code, a.repl) {
+        (Some(_), Some(_), _) => return Err("exec: <file> 与 --code 互斥，二选一".into()),
+        (_, _, true) => {
+            if a.file.is_some() || a.code.is_some() {
+                return Err("exec: --repl 与 <file>/--code 互斥".into());
+            }
+            ExecTarget::Repl
+        }
+        (Some(file), None, false) => {
+            let p = PathBuf::from(file);
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("ts") | Some("js") => ExecTarget::File(p),
+                _ => return Err(format!("exec: 仅支持 .ts/.js: {}", p.display())),
+            }
+        }
+        (None, Some(code), false) => ExecTarget::Code(code.clone()),
+        (None, None, false) => {
+            return Err("exec: 需提供 <file> / --code / --repl 之一".into())
+        }
+    };
     let (cfg, config_dir, dir, _ts, base) = load_app_config(&a.config, a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
@@ -98,7 +123,19 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                         }
                     }
                 }
-                run_script(&backend, &script, ExecOptions { args, log_file }).await
+                match target {
+                    ExecTarget::Repl => {
+                        let stdin = std::io::stdin();
+                        run_repl(&backend, ExecOptions { args, log_file }, &mut stdin.lock())
+                            .await
+                    }
+                    ExecTarget::File(script) => {
+                        run_script(&backend, &script, ExecOptions { args, log_file }).await
+                    }
+                    ExecTarget::Code(code) => {
+                        run_code(&backend, &code, ExecOptions { args, log_file }).await
+                    }
+                }
             })
         })
         .map_err(|e| format!("spawn exec thread: {e}"))?;
@@ -107,12 +144,9 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         .map_err(|_| "exec thread panicked".to_string())?
 }
 
-/// 装配 JsRuntime 并执行脚本。Ok(0) = settle 无异常；Err = 加载/求值异常（含 V8 堆栈）。
-pub(crate) async fn run_script(
-    backend: &Backend,
-    script: &Path,
-    options: ExecOptions,
-) -> Result<i32, String> {
+/// 装配一次性 JsRuntime（与 serve 同源的扩展 / 堆限额）。ext_boot 由各执行路径在
+/// 持有 rt 后用 `boot_if_set` 补跑（exec 不走 RuntimePool）。
+fn build_runtime(backend: &Backend, options: ExecOptions) -> JsRuntime {
     let stable = backend.stable();
     let loader = stable.loader.clone();
     let module_loader: Option<Rc<dyn deno_core::ModuleLoader>> =
@@ -137,14 +171,38 @@ pub(crate) async fn run_script(
     if let Some(limit) = stable.js_heap_limit {
         only_js::bridge::install_heap_limit_callback(&mut rt, limit);
     }
+    rt
+}
 
-    // ext_boot：`oj exec` 不走 RuntimePool（直接建 JsRuntime），故在此补跑一次。
-    if let Some(spec) = stable.boot.as_deref() {
-        boot_runtime(&mut rt, spec)
-            .await
-            .map_err(|e| format!("ext_boot: {e}"))?;
-    }
+/// 在已装配的 runtime 上加载并执行一段源码（file:// 或合成 specifier）。
+async fn eval_module(
+    rt: &mut JsRuntime,
+    spec: ModuleSpecifier,
+    src: String,
+    label: &str,
+) -> Result<i32, String> {
+    let id = rt
+        .load_side_es_module_from_code(&spec, src)
+        .await
+        .map_err(|e| format!("exec: load {label}: {e}"))?;
+    let eval = rt.mod_evaluate(id);
+    rt.run_event_loop(PollEventLoopOptions::default())
+        .await
+        .map_err(|e| format!("exec: run {label}: {e}"))?;
+    eval.await
+        .map_err(|e| format!("exec: {label}: {e}"))?;
+    Ok(0)
+}
 
+/// 执行文件：transpile + 版本化 URL 走 side-module（TLA 保真）。
+pub(crate) async fn run_script(
+    backend: &Backend,
+    script: &Path,
+    options: ExecOptions,
+) -> Result<i32, String> {
+    let mut rt = build_runtime(backend, options);
+    // ext_boot（持有 rt 后补跑一次；exec 不走 RuntimePool）。
+    boot_if_set(&mut rt, backend).await?;
     // 入口不经 module loader（同任务驱动 run_task 的做法）：looks_cjs 会把无
     // import/export 的脚本误包成 CJS 绞杀 TLA——直接以转译源 + versioned URL 走
     // side-module（TLA 保真）；脚本内相对 import 由 OjModuleLoader 照常解析。
@@ -155,18 +213,79 @@ pub(crate) async fn run_script(
         .map_err(|e| format!("exec: canonicalize {}: {e}", script.display()))?;
     let spec = ModuleSpecifier::from_file_path(&abs)
         .map_err(|_| format!("exec: bad script path: {}", script.display()))?;
-    let id = rt
-        .load_side_es_module_from_code(&spec, format!("{src}\n"))
-        .await
-        .map_err(|e| format!("exec: load {}: {e}", script.display()))?;
-    let eval = rt.mod_evaluate(id);
-    rt.run_event_loop(PollEventLoopOptions::default())
-        .await
-        .map_err(|e| format!("exec: run {}: {e}", script.display()))?;
-    eval.await
-        .map_err(|e| format!("exec: {}: {e}", script.display()))?;
+    eval_module(&mut rt, spec, format!("{src}\n"), &script.display().to_string()).await
+}
+
+/// 执行内联代码（-e/--code）：以 TypeScript 语法转译，合成 specifier 走 side-module。
+pub(crate) async fn run_code(
+    backend: &Backend,
+    code: &str,
+    options: ExecOptions,
+) -> Result<i32, String> {
+    let mut rt = build_runtime(backend, options);
+    boot_if_set(&mut rt, backend).await?;
+    let src = only_js::bridge::transpile::transpile_src(Path::new("oj-eval.ts"), code)
+        .map_err(|e| format!("exec: compile --code: {e}"))?;
+    let spec = ModuleSpecifier::parse("file:///oj-eval.ts")
+        .map_err(|_| "exec: bad eval specifier".to_string())?;
+    eval_module(&mut rt, spec, format!("{src}\n"), "--code").await
+}
+
+/// 交互式 REPL：逐行读 `input`，每行以 TS 转译后独立求值（同一 isolate，后端全局可用）。
+/// 变量跨行不自动持久（模块顶层绑定作用域隔离）；需跨行共享时显式挂到 globalThis。
+pub(crate) async fn run_repl(
+    backend: &Backend,
+    options: ExecOptions,
+    input: &mut dyn BufRead,
+) -> Result<i32, String> {
+    let mut rt = build_runtime(backend, options);
+    boot_if_set(&mut rt, backend).await?;
+    println!("oj REPL —— 后端全局（db/kv/blob/.../console/log）已就绪；Ctrl-D 退出。");
+    let mut stdout = std::io::stdout();
+    let mut line = String::new();
+    let mut n: usize = 0;
+    loop {
+        print!("oj> ");
+        stdout.flush().ok();
+        line.clear();
+        let nread = input.read_line(&mut line).map_err(|e| format!("repl: {e}"))?;
+        if nread == 0 {
+            // EOF（Ctrl-D）。
+            println!();
+            break;
+        }
+        let code = line.trim_end_matches(['\n', '\r']);
+        if code.trim().is_empty() {
+            continue;
+        }
+        let src = match only_js::bridge::transpile::transpile_src(Path::new("oj-repl.ts"), code) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("repl: transpile: {e}");
+                continue;
+            }
+        };
+        let spec = ModuleSpecifier::parse(&format!("file:///oj-repl/{n}.ts"))
+            .map_err(|_| "repl: bad specifier".to_string())?;
+        n += 1;
+        if let Err(e) = eval_module(&mut rt, spec, format!("{src}\n"), "repl").await {
+            eprintln!("{e}");
+        }
+    }
     Ok(0)
 }
+
+/// ext_boot：exec 直接建 JsRuntime，须在持有 rt 后补跑一次（与 serve 走 RuntimePool 不同）。
+async fn boot_if_set(rt: &mut JsRuntime, backend: &Backend) -> Result<(), String> {
+    let stable = backend.stable();
+    if let Some(spec) = stable.boot.as_deref() {
+        boot_runtime(rt, spec)
+            .await
+            .map_err(|e| format!("ext_boot: {e}"))?;
+    }
+    Ok(())
+}
+
 
 /// 测试薄封装：显式 args/log_file（`run()` 的进程内同款路径）。
 #[cfg(test)]
@@ -177,6 +296,17 @@ pub(crate) async fn run_script_ext(
     log_file: Option<std::fs::File>,
 ) -> Result<i32, String> {
     run_script(backend, script, ExecOptions { args, log_file }).await
+}
+
+/// 测试薄封装：内联代码路径（同 `run_script_ext`）。
+#[cfg(test)]
+pub(crate) async fn run_code_ext(
+    backend: &Backend,
+    code: &str,
+    args: Vec<String>,
+    log_file: Option<std::fs::File>,
+) -> Result<i32, String> {
+    run_code(backend, code, ExecOptions { args, log_file }).await
 }
 
 #[cfg(test)]
@@ -294,7 +424,9 @@ mod tests {
         let script = tmp.join("s.ts");
         std::fs::write(&script, "console.log(1);").unwrap();
         let e = run(ExecArgs {
-            file: script.to_string_lossy().into(),
+            file: Some(script.to_string_lossy().into()),
+            code: None,
+            repl: false,
             config: tmp.join("config.yaml").to_string_lossy().into(),
             dir: Some(tmp.to_string_lossy().into()),
             db: None,
@@ -350,7 +482,9 @@ mod tests {
             ));
             std::fs::write(&p, yaml).unwrap();
             ExecArgs {
-                file: script.to_string_lossy().into(),
+                file: Some(script.to_string_lossy().into()),
+                code: None,
+                repl: false,
                 config: p.to_string_lossy().into(),
                 dir: Some(tmp.join("src").to_string_lossy().into()),
                 db: None,
@@ -369,6 +503,48 @@ mod tests {
         assert!(e.contains("GATE=missing"), "{e}");
         // 显式 auto → apply（含 reconcile 跟随）→ 表存在 → settle 0。
         assert_eq!(run(mk(Some("auto"))).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⑧ 内联代码（-e/--code）：args 注入 + TLA 保真；与文件同款求值路径。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_inline_code_when_run_then_args_and_tla_reachable() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t8-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let backend = backend_fixture(&tmp).await;
+        // args 注入（与文件同款 globalThis.args）。
+        let e = run_code_ext(
+            &backend,
+            r#"throw new Error("CODEARGS=" + args.join("|"));"#,
+            vec!["a".into(), "b c".into()],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("CODEARGS=a|b c"), "{e}");
+        // TLA 跑完 event loop → settle 0。
+        assert_eq!(
+            run_code_ext(&backend, r#"await Promise.resolve(); globalThis.__c = 1;"#, vec![], None)
+                .await
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⑨ REPL：管道喂入两行，逐行求值无异常（Ctrl-D / EOF 退出 0）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_piped_lines_when_repl_then_each_line_evaluated() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t9-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let backend = backend_fixture(&tmp).await;
+        let mut input = std::io::Cursor::new("console.log('repl-ok-1');\nconsole.log('repl-ok-2');\n");
+        assert_eq!(
+            run_repl(&backend, ExecOptions { args: vec![], log_file: None }, &mut input)
+                .await
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
