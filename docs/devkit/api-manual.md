@@ -2772,7 +2772,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 |---|---|---|
 | `<file>` | 三选一必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1）；与 `--code`/`--repl` 互斥 |
 | `-e, --code` | 三选一必填 | 内联代码（TypeScript 语法）；不落盘、自包含——**不支持相对 import**（无基准目录，合成 `file:///oj-eval.ts` specifier）；与 `<file>`/`--repl` 互斥 |
-| `--repl` | 三选一必填 | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥 |
+| `--repl` | 三选一必填 | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥。真终端下由 **rustyline** 接管原始终端（方向键 / 行内编辑 / ↑↓ 翻历史，不再把 `\x1b[A` 等转义序列回显成乱串）；管道 / 重定向输入走普通回放（CI、测试、文件回放） |
 | `-c` | `config.yaml` | 配置文件路径 |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |

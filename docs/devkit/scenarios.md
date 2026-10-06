@@ -907,7 +907,8 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 # 内联代码（TypeScript 语法；自包含、不支持相对 import）
 ./bin/oj exec -e 'const r = await db.query("select count(*) as c from account", []); console.log(r[0].c);' -c config.yaml
 
-# 交互式 REPL：逐行输入，Ctrl-D 退出；顶层绑定不跨行持久，跨行共享须 globalThis.x = …
+# 交互式 REPL：逐行输入，Ctrl-D / Ctrl-C 退出；顶层绑定不跨行持久，跨行共享须 globalThis.x = …
+# 真终端下由 rustyline 接管（方向键 / 行内编辑 / ↑↓ 翻历史，不再回显乱串）；管道输入走普通回放。
 ./bin/oj exec --repl -c config.yaml
 # oj> console.log(await db.query("select 1", []))
 ```

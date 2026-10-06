@@ -27,9 +27,11 @@ REPL**（`--repl`），三者与 `file` 互斥、必选其一。
   代码以 `file:///oj-eval.ts` 合成 specifier 走 side-module（TLA 保真），**不能含相对
   import**（无基准目录，内联代码应自包含）。
 - **`--repl`（交互式 REPL）**：逐行读 stdin，每行以 TS 转译后独立求值，同一 isolate 内
-  后端全局（`db`/`kv`/`blob`/`console`/`log`/...）全部可用；Ctrl-D（EOF）退出，退出码 0。
+  后端全局（`db`/`kv`/`blob`/`console`/`log`/...）全部可用；Ctrl-D / Ctrl-C 退出，退出码 0。
   每行是一个独立模块、顶层绑定作用域隔离，**跨行共享状态需显式挂到 `globalThis`**
-  （如 `globalThis.x = 1`）；与内联代码同理，REPL 行内不支持相对 import。
+  （如 `globalThis.x = 1`）；与内联代码同理，REPL 行内不支持相对 import。真终端下由
+  **rustyline** 接管原始终端（方向键 / 行内编辑 / ↑↓ 翻历史），不再把 `\x1b[A` 等转义
+  序列原样回显成乱串；管道 / 重定向输入（CI、测试、文件回放）走普通 BufRead。
 - **互斥与校验**：`file` / `--code` / `--repl` 归到同一 `ArgGroup`（`multiple = false`）——
   两两组合（如 `file + --code`、`file + --repl`）由 clap 报错；三者皆无则由 `run()` 报
   `exec: 需提供 <file> / --code / --repl 之一`。

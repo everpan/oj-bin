@@ -38,6 +38,8 @@ time = "0.3"
 sea-query = "1.0"
 # S004 deps 版本范围匹配（§5.1）：refinery 已带入 1.0（依赖树零新增节点）。
 semver = "1"
+# 交互式 REPL（oj exec --repl）：rustyline 接管原始终端，方向键/历史/行内编辑不再回显乱串。
+rustyline = "14"
 
 # --daemon 后台化：setsid 脱离控制终端（unix 专属；依赖树已有 libc，零新增节点）。
 [target.'cfg(unix)'.dependencies]
