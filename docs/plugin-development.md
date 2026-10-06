@@ -212,5 +212,6 @@ xtask 也不是发行产物（`bin/` 只放 oj + 插件），排除不影响其�
 | `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
 | `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
 | `oj-auth` | auth | jsonwebtoken | core `bridge/auth.rs`（守卫；auth 端点已 JS 化） |
+| `oj-ldap` | ldap | ldap3 | 新增 ldap 轴（`globalThis.ldap`/`LDAP(name)`；bind 鉴权 + 目录检索） |
 
 > 所有第一方插件源码统一位于 `plugins/`；构建产物（cdylib）归置 `bin/plugins/<triple>/`，由 `.gitignore` 忽略。

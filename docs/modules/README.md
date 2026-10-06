@@ -21,7 +21,7 @@
 | 01 | **核心运行时** | `src/`（crate `only-js`） | ~11.5k | deno_core 桥：op 注册、JS 全局装配、状态模型、runtime 池、SQL 白名单、插件加载 |
 | 02 | **配置模型** | `src/config.rs` | 661 | `config.yaml` 的权威 schema 与解析（段存在即启用） |
 | 03 | **HTTP 服务** | `server/` | ~4.2k | axum：路由表、前置管线（鉴权/租户/上传）、JS actor 派发、证书门禁、WS、日志 |
-| 04 | **CLI 编排** | `oj/` | ~7.2k | `server` / `build` / `test` / `migrate` / `fixture` / `schema diff`；装配与构建 |
+| 04 | **CLI 编排** | `oj/` | ~7.2k | `serve` / `build` / `test`（含 `test fixture` 子命令）/ `migrate` / `schema diff` / `secret` / `exec` / `openapi`；装配与构建 |
 | 05 | **FFI 契约 + 插件** | `oj-plugin-ffi/` + `plugins/*` | 553 + ~3.5k | C-ABI 契约（`ABI_VERSION`、vtable、入口宏）+ 10 个 cdylib 第一方插件 |
 | 06 | **工具链** | `tools/`、`benches/`、`tests/plugins/` | ~1k | xtask 构建归置、oj-cert 证书工具、criterion 基准、测试夹具插件 |
 | 07 | **模块数据层** | `oj/src/{manifest,schema,migrate,seed,checks}.rs` | ~2k | manifest / schema.yaml / migrations / seed / fixtures / 结构检查 S* |
@@ -118,8 +118,8 @@ HTTP 请求
 - **状态模型干净**：`StableState` / `ReqState` 二分 + checkout 时 reset，是「V8 池化复用而不串号」
   的关键，也是本项目最难的部分，注释把踩过的坑（RefCell 跨 await、看门狗自 join EDEADLK、
   isolate 析构 SIGSEGV）都钉死了。
-- **能力可插拔且不泄漏依赖**：8 个后端轴全部 cdylib 化，核心不直接依赖 rdkafka/lapin/redis/
-  opensearch；「按轴 dlsym」让加新轴对插件零破坏。
+- **能力可插拔且不泄漏依赖**：9 个后端轴（es / db / blob / bus / kv / auth / mq / mail / ldap）
+  全部 cdylib 化，核心不直接依赖 rdkafka/lapin/redis/opensearch/ldap；「按轴 dlsym」让加新轴对插件零破坏。
 - **安全默认值**：证书门禁无逃生口、上传双上限（axum 2x 硬顶 + 信封 413）、路径穿越守卫在
   `resolve_static` / `decode_blob_key` / `routes.rs` 三处各自收紧、SQL 标识符白名单。
 - **失败分类精细**：插件加载 7 类错误独立文案；`RunError::Timeout` 与 `Core` 分开 → 408/500 语义正确。

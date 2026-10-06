@@ -50,7 +50,10 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | `jwt` | `sign` / `verify` / `accessDuration` / `refreshDuration` | |
 | `bcrypt` | `hash` / `verify` | Rust 侧 `spawn_blocking` |
 | `oidc` | `sign` / `verify(token, jwks?)` / `jwks()` / `issuer` / `rp` / `clients` | 私钥不出 Rust |
-| `crypto` | `sha256Hex` / `randomHex` | 合并进原生 `crypto` |
+| `crypto` | `sha256Hex` / `randomHex` / `aesGcmEncrypt` / `aesGcmDecrypt` / `getRandomValues` | 合并进原生 `crypto` |
+| `ldap` / `LDAP(name)` | `bind` / `search` / `searchPaged` / `whoami` / `compare` | 目录服务（`oj-ldap`）；未配置报 "ldap not configured" |
+| `mail` / `Mail(key)` | `send` / `sendSync` / `enqueue` / `result` / `sendRaw` / `profiles()` | SMTP 投递（`oj-mail`）；未配置抛错 |
+| `Kafka(name)` / `RabbitMQ(name)` | `send`/`publish` / `poll` / `commit`/`ack`/`nack` | 命名消息客户端（bus 之上；消费端限于 task 上下文） |
 | `finish()` | — | 结束会话且不写响应 |
 | `__ojRequire(name, referrer)` | — | CJS 互操作（进程级缓存） |
 

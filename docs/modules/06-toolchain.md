@@ -26,8 +26,8 @@ bin/
 - `host_triple()`（:43）由 `rustc -vV` 的 `host:` 行取；与运行期
   `ffi::triple()`（按 `std::env::consts` 重建）一致。
 - 插件存放文件名以 **descriptor.name** 为名（与 rustc 产物名解耦，`-`→`_` 不同）。
-- `PLUGINS`（:25）= es / db-mysql / db-postgres / blob-s3 / bus-kafka / bus-rabbitmq /
-  kv-redis / **auth**。
+- `PLUGINS`（:28）= es / db-mysql / db-postgres / blob-s3 / bus-kafka / bus-rabbitmq /
+  kv-redis / auth / mail / ldap。
 
 ## 2. `tools/oj-cert`（证书工具，独立不随 oj 发行）
 

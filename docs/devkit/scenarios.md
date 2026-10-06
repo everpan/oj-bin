@@ -524,7 +524,7 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 ./bin/oj migrate -c config.yaml -d dist --db analytics --module order
 
 # 演示数据与漂移门禁同旗标，也要逐库跑
-./bin/oj fixture     -c config.yaml -d src --db analytics --module order
+./bin/oj test fixture -c config.yaml -d src --db analytics --module order
 ./bin/oj schema diff -c config.yaml -d dist --db analytics
 ```
 
@@ -812,7 +812,7 @@ ldap:
 ```ts
 // src/user/login/api.ts
 const LDAP_FILTER_ESCAPES: Record<string, string> = {
-  "\": "\5c", "*": "\2a", "(": "\28", ")": "\29", " ": "\00",
+  "\": "\5c", "*": "\2a", "(": "\28", ")": "\29", "\0": "\00",
 };
 const esc = (s: string) => s.replace(/[\\*()\0]/g, (c) => LDAP_FILTER_ESCAPES[c]);
 

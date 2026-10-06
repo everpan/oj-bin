@@ -22,7 +22,7 @@ glibc 版本约束（老的「`GLIBC_2.35 not found`」报错随之消失）。
 - **为什么用镜像**：此前 Linux 发布物在 `ubuntu-latest`（glibc 2.39）构建，低版本系统运行报
   `GLIBC_2.35 not found`。容器构建把产物 glibc 需求锚定在 2.31，且镜像自带运行时
   （distroless，glibc 2.31 + libstdc++），与宿主机 glibc 完全解耦。
-- **镜像体积**：约 **56.7 MiB**（压缩 OCI）。体积主体是 V8 静态库链接进 `bin/oj` + 9 个插件
+- **镜像体积**：约 **56.7 MiB**（压缩 OCI）。体积主体是 V8 静态库链接进 `bin/oj` + 10 个插件（含 oj-ldap）
   cdylib。这部分是 deno_core/runtime 固有的，镜像手段压不下去；切换 distroless 已去掉
   ubuntu 基础镜像与 apt 元数据开销。
 - **本地镜像名 vs 远端名**：仓库内统一用本地名 `oj-bin/oj`。推送到 Docker Hub 时命名空间必须是

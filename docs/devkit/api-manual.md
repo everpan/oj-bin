@@ -216,7 +216,7 @@ dist/
 ## 3. 模块数据层
 
 > 何时读我：模块要建表、改表、跨模块取数、接存量库时。
-> 运维视角的完整 runbook 见 `docs/migration.md`；本章只写开发要点。
+> 运维视角的完整 runbook 见 `docs/migration.md`；这里只写开发要点。
 
 ### 心智模型
 
@@ -264,7 +264,7 @@ tables:
 | `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
-三条数据类命令（`migrate` / `fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
+三条数据类命令（`migrate` / `test fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
 `name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
 不会静默回落 `default`。注意它是**整轮目标库**：会把全部模块的迁移灌进该库，不读模块级
 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）。所以模块绑不同库的项目，要
@@ -2995,7 +2995,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `Number("<大整数串>")` 平台拦不住 | 语言语义，只能靠范式：`toBigInt(rows[0].m) + 1n`（`toBigInt` 对已坍缩的值会抛错） |
 | `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持的类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）**报错而非给 `null`**；在 SQL 里显式转换：`select cast(x as char) as x from t`。不要用 `select *` 兜住这些列 |
 | MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` 而不是 `true`/`false`（v0.1.24） | MySQL 没有独立 boolean 类型（`BOOLEAN` 即 `TINYINT(1)`），协议层无列长度元数据可区分；按整数读。需要 boolean 语义就在 SQL 里转：`select flag = 1 as flag from t` |
-| 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
+| 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `test fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | ldap 无连接池（每调用独立 connect/bind/unbind） | 设计取向：bind(dn,pw) 用户凭据绝不共享连接；LAN 上 AD 连接建立为毫秒级。热路径（每请求多次 LDAP 调用）先用 `search` 一次取全所需字段，仍不够再评估给插件加 ldap3 pool |
 | ldap `search` 不做分页 | 服务端可拒超量返回（AD 默认 1000 条上限）；大结果集用 `ldap.searchPaged` |
 | ldap referral 不自动跟随 | `search` 返回 referral 引用（`ResultEntry::Refer`）时插件收集进结果 refs 并跳过——目录树跨 ref 分片的场景先确认 base 落在目标分区内 |
