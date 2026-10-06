@@ -29,7 +29,6 @@ fn lock() -> MutexGuard<'static, ()> {
 /// 的「`//` 直通」分支（src/bridge/db_backend.rs），跳过盘符修正 → SQLITE_CANTOPEN。
 /// DSN 一律走 `oj_plugin_ffi::path_util::sqlite_file_dsn`（先 `dunce` 剥 verbatim，
 /// 再转正斜杠，并用单冒号 `sqlite:`）。
-#[cfg(unix)]
 fn fwd(p: &Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
