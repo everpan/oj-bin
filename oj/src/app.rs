@@ -585,10 +585,7 @@ fn static_dir(config_dir: &Path, r: &str) -> Result<PathBuf, String> {
 /// `server.static_sites` 逐条 → `Vec<StaticSite>`。前缀经 `resolve_app_prefix` 归一；
 /// 归一后重复 → Err（报两条来源）；目录相对 config_dir 绝对化 + canonicalize。
 /// **不排序**——最长前缀优先的排序归 `serve::app()` 独家负责。
-fn resolve_static_sites(
-    cfg: &Config,
-    config_dir: &Path,
-) -> Result<Vec<serve::StaticSite>, String> {
+fn resolve_static_sites(cfg: &Config, config_dir: &Path) -> Result<Vec<serve::StaticSite>, String> {
     let mut out = Vec::new();
     // 归一前缀 → 来源描述（dup 报错要报两条来源）。
     let mut seen: Vec<(String, String)> = Vec::new();

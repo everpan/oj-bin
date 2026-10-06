@@ -65,7 +65,7 @@ pub struct TestArgs {
 /// `oj test` 的子命令：直接 `oj test` 跑用例；`oj test fixture` 灌演示数据。
 pub enum TestCmd {
     /// 跑 *.test.ts（L1：进程内真实运行时）。
-    Run(TestArgs),
+    Run(Box<TestArgs>),
     /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）。
     Fixture(FixtureArgs),
 }
@@ -545,7 +545,7 @@ fn to_command(cli: Cli) -> Command {
             anonymous,
             command,
         } => match command {
-            None => Command::Test(TestCmd::Run(TestArgs {
+            None => Command::Test(TestCmd::Run(Box::new(TestArgs {
                 config,
                 base,
                 dir,
@@ -560,7 +560,7 @@ fn to_command(cli: Cli) -> Command {
                 kafka,
                 rabbit,
                 anonymous,
-            })),
+            }))),
             Some(TestSub::Fixture {
                 config,
                 dir,

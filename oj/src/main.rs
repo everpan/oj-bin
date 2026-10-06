@@ -35,7 +35,7 @@ pub async fn run_command(cmd: Command) -> i32 {
             }
         },
         Command::Test(cmd) => match cmd {
-            oj::args::TestCmd::Run(a) => match oj::test_cmd::run(a) {
+            oj::args::TestCmd::Run(a) => match oj::test_cmd::run(*a) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("oj test: {e}");
