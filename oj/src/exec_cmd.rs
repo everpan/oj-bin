@@ -7,7 +7,7 @@
 //!
 //! 三种入口（互斥）：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式 REPL）。
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -48,9 +48,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
             }
         }
         (None, Some(code), false) => ExecTarget::Code(code.clone()),
-        (None, None, false) => {
-            return Err("exec: 需提供 <file> / --code / --repl 之一".into())
-        }
+        (None, None, false) => return Err("exec: 需提供 <file> / --code / --repl 之一".into()),
     };
     let (cfg, config_dir, dir, _ts, base) = load_app_config(&a.config, a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
@@ -125,9 +123,18 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                 }
                 match target {
                     ExecTarget::Repl => {
-                        let stdin = std::io::stdin();
-                        run_repl(&backend, ExecOptions { args, log_file }, &mut stdin.lock())
-                            .await
+                        if std::io::stdin().is_terminal() {
+                            // 真终端：rustyline 接管原始终端（方向键/历史/编辑可用）。
+                            let editor = rustyline::DefaultEditor::new()
+                                .map_err(|e| format!("exec: init repl: {e}"))?;
+                            let mut src = RustylineSource { editor };
+                            run_repl(&backend, ExecOptions { args, log_file }, &mut src).await
+                        } else {
+                            // 管道 / 重定向（CI、测试、文件回放）：走普通 BufRead。
+                            let stdin = std::io::stdin();
+                            run_repl(&backend, ExecOptions { args, log_file }, &mut stdin.lock())
+                                .await
+                        }
                     }
                     ExecTarget::File(script) => {
                         run_script(&backend, &script, ExecOptions { args, log_file }).await
@@ -189,8 +196,7 @@ async fn eval_module(
     rt.run_event_loop(PollEventLoopOptions::default())
         .await
         .map_err(|e| format!("exec: run {label}: {e}"))?;
-    eval.await
-        .map_err(|e| format!("exec: {label}: {e}"))?;
+    eval.await.map_err(|e| format!("exec: {label}: {e}"))?;
     Ok(0)
 }
 
@@ -213,7 +219,13 @@ pub(crate) async fn run_script(
         .map_err(|e| format!("exec: canonicalize {}: {e}", script.display()))?;
     let spec = ModuleSpecifier::from_file_path(&abs)
         .map_err(|_| format!("exec: bad script path: {}", script.display()))?;
-    eval_module(&mut rt, spec, format!("{src}\n"), &script.display().to_string()).await
+    eval_module(
+        &mut rt,
+        spec,
+        format!("{src}\n"),
+        &script.display().to_string(),
+    )
+    .await
 }
 
 /// 执行内联代码（-e/--code）：以 TypeScript 语法转译，合成 specifier 走 side-module。
@@ -231,34 +243,72 @@ pub(crate) async fn run_code(
     eval_module(&mut rt, spec, format!("{src}\n"), "--code").await
 }
 
-/// 交互式 REPL：逐行读 `input`，每行以 TS 转译后独立求值（同一 isolate，后端全局可用）。
-/// 变量跨行不自动持久（模块顶层绑定作用域隔离）；需跨行共享时显式挂到 globalThis。
+/// REPL 行读取抽象：交互式（tty → rustyline，方向键/历史可用）与管道（BufRead，CI/测试）
+/// 共用同一求值循环。`read_line` 自带 prompt 语义——管道实现忽略 prompt，rustyline 实现
+/// 显示并接管原始终端（raw mode），方向键/编辑不再回显乱串。
+pub(crate) trait LineSource {
+    /// 读取一行：Ok(Some(s)) = 行内容；Ok(None) = EOF / Ctrl-C（退出）；Err = I/O 错误。
+    fn read_line(&mut self, prompt: &str) -> std::io::Result<Option<String>>;
+}
+
+/// 管道 / 测试用的简单实现：直接走 `BufRead`（无行编辑，仅非交互回放）。
+impl<R: BufRead> LineSource for R {
+    fn read_line(&mut self, _prompt: &str) -> std::io::Result<Option<String>> {
+        let mut s = String::new();
+        if BufRead::read_line(self, &mut s)? == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(s))
+        }
+    }
+}
+
+/// 交互式实现：rustyline 接管原始终端（raw mode），方向键 / 历史 / 行内编辑正常，
+/// 不再把 `\x1b[A` 等转义序列原样回显成乱串。
+struct RustylineSource {
+    editor: rustyline::DefaultEditor,
+}
+
+impl LineSource for RustylineSource {
+    fn read_line(&mut self, prompt: &str) -> std::io::Result<Option<String>> {
+        match self.editor.readline(prompt) {
+            Ok(line) => {
+                // 记入内存历史（↑/↓ 跨行回溯）；忽略写入失败（如空行 / 容量）。
+                let _ = self.editor.add_history_entry(&line);
+                Ok(Some(line))
+            }
+            // Ctrl-D（Eof）或 Ctrl-C（Interrupted）均退出 REPL。
+            Err(rustyline::error::ReadlineError::Eof)
+            | Err(rustyline::error::ReadlineError::Interrupted) => Ok(None),
+            Err(e) => Err(std::io::Error::other(e)),
+        }
+    }
+}
+
+/// 交互式 REPL：逐行求值（同一 isolate，后端全局可用）。变量跨行不自动持久
+/// （模块顶层绑定作用域隔离）；需跨行共享时显式挂到 `globalThis`。
 pub(crate) async fn run_repl(
     backend: &Backend,
     options: ExecOptions,
-    input: &mut dyn BufRead,
+    src: &mut dyn LineSource,
 ) -> Result<i32, String> {
     let mut rt = build_runtime(backend, options);
     boot_if_set(&mut rt, backend).await?;
-    println!("oj REPL —— 后端全局（db/kv/blob/.../console/log）已就绪；Ctrl-D 退出。");
-    let mut stdout = std::io::stdout();
-    let mut line = String::new();
+    println!(
+        "oj REPL —— 后端全局（db/kv/blob/.../console/log）已就绪；Ctrl-D / Ctrl-C 退出；↑/↓ 翻历史。"
+    );
     let mut n: usize = 0;
     loop {
-        print!("oj> ");
-        stdout.flush().ok();
-        line.clear();
-        let nread = input.read_line(&mut line).map_err(|e| format!("repl: {e}"))?;
-        if nread == 0 {
-            // EOF（Ctrl-D）。
+        let Some(line) = src.read_line("oj> ").map_err(|e| format!("repl: {e}"))? else {
+            // EOF（Ctrl-D）/ Ctrl-C。
             println!();
             break;
-        }
+        };
         let code = line.trim_end_matches(['\n', '\r']);
         if code.trim().is_empty() {
             continue;
         }
-        let src = match only_js::bridge::transpile::transpile_src(Path::new("oj-repl.ts"), code) {
+        let ts = match only_js::bridge::transpile::transpile_src(Path::new("oj-repl.ts"), code) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("repl: transpile: {e}");
@@ -268,7 +318,7 @@ pub(crate) async fn run_repl(
         let spec = ModuleSpecifier::parse(&format!("file:///oj-repl/{n}.ts"))
             .map_err(|_| "repl: bad specifier".to_string())?;
         n += 1;
-        if let Err(e) = eval_module(&mut rt, spec, format!("{src}\n"), "repl").await {
+        if let Err(e) = eval_module(&mut rt, spec, format!("{ts}\n"), "repl").await {
             eprintln!("{e}");
         }
     }
@@ -285,7 +335,6 @@ async fn boot_if_set(rt: &mut JsRuntime, backend: &Backend) -> Result<(), String
     }
     Ok(())
 }
-
 
 /// 测试薄封装：显式 args/log_file（`run()` 的进程内同款路径）。
 #[cfg(test)]
@@ -524,9 +573,14 @@ mod tests {
         assert!(e.contains("CODEARGS=a|b c"), "{e}");
         // TLA 跑完 event loop → settle 0。
         assert_eq!(
-            run_code_ext(&backend, r#"await Promise.resolve(); globalThis.__c = 1;"#, vec![], None)
-                .await
-                .unwrap(),
+            run_code_ext(
+                &backend,
+                r#"await Promise.resolve(); globalThis.__c = 1;"#,
+                vec![],
+                None
+            )
+            .await
+            .unwrap(),
             0
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -538,11 +592,19 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("oj-exec-t9-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let backend = backend_fixture(&tmp).await;
-        let mut input = std::io::Cursor::new("console.log('repl-ok-1');\nconsole.log('repl-ok-2');\n");
+        let mut input =
+            std::io::Cursor::new("console.log('repl-ok-1');\nconsole.log('repl-ok-2');\n");
         assert_eq!(
-            run_repl(&backend, ExecOptions { args: vec![], log_file: None }, &mut input)
-                .await
-                .unwrap(),
+            run_repl(
+                &backend,
+                ExecOptions {
+                    args: vec![],
+                    log_file: None
+                },
+                &mut input
+            )
+            .await
+            .unwrap(),
             0
         );
         let _ = std::fs::remove_dir_all(&tmp);
