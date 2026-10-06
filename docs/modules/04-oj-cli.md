@@ -11,7 +11,7 @@
 | `build [module]` | `-d/--dir`（默认 `src`）、`-o/--out`（默认 `dist`）、`--no-minify`、`--check` | `build_cmd.rs:16` |
 | `test` | `-c`、`-b`、`-d`、`-t/--tests`（默认 `tests`，相对 config_dir）、`--format`（human/tap/junit/json）、`--output` | `test_cmd.rs:46` |
 | `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
-| `fixture` | `-c`、`-d`、`--db`、`--module` | `migrate_cmd.rs:115` |
+| `test fixture` | `test` 的子命令：`-c`、`-d`、`--db`、`[module]` | `migrate_cmd.rs:115` |
 | `schema diff` | `-c`、`-d`、`--db` | `migrate_cmd.rs:130` |
 | `openapi` | `-c/--config`、`-d/--dir`、`-b/--base`、`--check`、`-o/--out` | `openapi_cmd.rs:18` |
 

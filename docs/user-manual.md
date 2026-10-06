@@ -40,7 +40,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 
 ## 2. 命令与参数
 
-查参数时读这节。六个子命令的全貌：
+查参数看这节。子命令一览：
 
 ```
 oj serve  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
@@ -49,13 +49,15 @@ oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--b
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
 oj test fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
 oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
+oj secret  keygen [--out-dir D] [--force] | seal [-k pub.pem] [VALUE] | open [-k priv.pem] [VALUE]
+oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c` | `config.yaml` | 配置文件路径（host/port/base/root/db/redis）。server / build / exec / migrate / fixture / schema diff / test 都有此参数 |
+| `-c` | `config.yaml` | 配置文件路径（host/port/base/root/db/redis）。serve / build / exec / migrate / test fixture / schema diff / secret 都有此参数 |
 | `-b` | config `server.api_prefix`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
-| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path`，无缺省搜索 |
+| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path`，无缺省搜索 |
 | `--api-path` | 无 | （server）API 目录，相对 CWD；缺省 = 不开 API 功能（须配 `--app-path` / `server.app_path`，否则退出） |
 | `--app-path` | 无 | （server）静态站点，相对 CWD，可重复。裸 `dir`（至多一次）覆盖 `server.app_path`；`prefix=dir`（如 `--app-path /docs=dist/docs`）追加/替换 `server.static_sites` 条目（CLI 优先于 config） |
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
@@ -65,7 +67,7 @@ oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
 | `--key-path` | 无 | （server）PEM 公钥路径，覆盖 `server.public_key_path`（证书必配，此参数可满足） |
 | `--check` | 关 | （build）只跑结构检查（S002–S008）不写任何产物；有违规 exit 1（CI 门禁） |
 | `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
-| `--module` | 无 | （migrate / fixture）只处理指定模块 |
+| `--module` | 无 | （migrate / test fixture）只处理指定模块 |
 | `--db` | `default` | （migrate / fixture / schema diff）目标库 = config `db:` 段的 profile 名；未声明则 fail-fast（不回落 default）。多库须逐库各跑一遍。exec 同名参数为**默认库重定向**（同 `oj test`，语义不同） |
 | `--redis` / `--blob` / `--es` / `--broker` / `--kafka` / `--rabbit` | 各段 `default` | （test / exec，v0.1.34）把 config 对应段里**命名 profile** 选为默认源（装配期别名为字面 `default`，JS 全局无需改代码）；未声明即 fail-fast（不回落 default）。各段：`redis`/`blob.backends`/`es`/`broker`/`kafkas`/`rabbits` |
 | `--log-file` | 不落盘 | （exec）追加 JSONL（`{"ts","level","msg"}`）；打开失败仅 warn 一次，终端照出 |
@@ -288,8 +290,6 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
 
 ## 4. 项目目录结构
 
-新建项目或想搞清「文件该放哪」时读这节。
-
 ```
 <project>/
 ├── config.yaml          # 服务配置
@@ -409,8 +409,6 @@ CI 门禁），运行时按 `server.ownership_guard` 处置（`warn` 告警 / `d
 
 ## 6. 编写 api.ts
 
-写第一个接口时读这节。
-
 `api.ts` 导出一个对象，键是 HTTP 动词对应的方法名：
 
 ```ts
@@ -444,8 +442,6 @@ export default { get, post };
 - **响应** 用 `json.ok(data)` / `json.fail(code, msg, data?)`，见 §9。
 
 ## 7. 路由规则
-
-URL 怎么映射到文件、路径参数怎么写，查这节。
 
 URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{feature}/api.ts|js`。
 
@@ -500,7 +496,7 @@ axum 放开 pin 后可启用。
 
 ## 8. 导入（import）
 
-`import` 的解析规则都在这里。引用共享代码、npm 包，或报「找不到模块」时查这节。
+`import` 的解析规则都在这里。引用共享代码、npm 包，或报「找不到模块」时按这节查。
 
 - **别名导入**（共享库推荐写法，与目录深度无关，目录搬动不用改引用）：
   - `#x` 锚在**本模块根**：`src/user/profile/detail/api.ts` 里
@@ -533,8 +529,8 @@ axum 放开 pin 后可启用。
 
 ## 9. handler 可用全局对象
 
-handler 里能直接用的全局都在这张表里。查 API 签名时翻这节（更全的签名见
-`devkit/api-manual.md`）。
+handler 里能直接用的全局都在这张表里。更全的签名见
+`devkit/api-manual.md`。
 
 | 全局 | 说明 |
 |---|---|
@@ -577,8 +573,6 @@ handler 里能直接用的全局都在这张表里。查 API 签名时翻这节�
 SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
 
 ### 扩展全局对象（ext_boot.js）
-
-想给 handler 加自定义全局（不重编 `oj`）时读这节。
 
 上表的全局由 `bootstrap.js` 在**编译期**嵌入二进制。若要在不重编 `oj` 的前提下增补全局
 （如 `json.page()`、`log.trace`），把 `ext_boot.js` 放在 **config.yaml 同级目录**：
@@ -677,8 +671,6 @@ await db.tx(async (tx) => {
 
 ### 文件上传与 blob（上传 + 对象存储）
 
-收文件、存文件、给下载地址，读这节。
-
 `config.yaml` `blob:` 段存在即启用（`blob.put/get/del/url/contentType` 可用，未配置调用报错）。
 
 > `blob.contentType(key)` 由 `op_blob_content_type` 真正接通（`bootstrap.js` 已 import 并挂到
@@ -710,9 +702,7 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段，段非法�
 单段参数解码后含 `/`（`%2F` 走私）按 404 拒绝。query 现按 form-urlencoded 解码
 （`+`→空格、`%XX` 解码；旧版不解码，迁移注意）。
 
-### 订阅发布总线（bus）与 KV/ES（v0.2）
-
-要 WebSocket 推送、主题广播、缓存过期/自增、ES 搜索时读这节。
+### 订阅发布总线（bus）与 KV/ES
 
 **WS 目录镜像**：目录内放 `ws.ts`（dev）/ `ws.js`（release，同 `api.ts` 约定）即产生一条 WebSocket
 路由 `GET {base}/{...path}/ws`——`<root>/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
@@ -749,7 +739,7 @@ export default {
 sample 的 `sample/src/news/`（`api.ts` 发布 + `ws.ts` 订阅）是可运行的最小示例：先连
 `/v1/api/news/ws`（连接建立即订阅，无需发帧），再 `POST /v1/api/news`，连接即收到
 `{"topic":"news",…}` 广播帧。
-release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是 v0.2 已知限制。
+release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是已知限制。
 
 **KV 扩展**：`kv.expire(key, ttlSec)` 设过期（真 Redis 走 EXPIRE；内存 KV 惰性过期），
 `kv.incr(key)` 自增返回新值（键不存在从 0 起）。`redis` 全局与 `kv` 同源：`redis.default`
@@ -760,8 +750,6 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是 v0.
 未配置调用报 `es not configured`，非 2xx 报错带 ES 返回体。
 
 ## 10. 响应信封与错误
-
-接口出错时返回什么、HTTP 状态码怎么定，查这节。
 
 统一信封 `{code, msg, data}`；HTTP 状态码 = `code`（`code=0` → 200）。
 
@@ -780,8 +768,6 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是 v0.
 业务层自定义错误用 `json.fail(400, "…")` 等直接返回对应状态码。
 
 ## 11. 样例走读（sample/）
-
-想看完整可运行的例子、照着抄结构时读这节。
 
 `sample/` 是验收载体，两个模块 `user` / `order`：
 
@@ -805,7 +791,7 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是 v0.
 
 跑法见 §1。验收用例见 `../oj/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
 
-## 12. 已知限制（v0.2）
+## 12. 已知限制
 
 撞墙之前先看这节，可能你遇到的是已知限制而不是 bug。
 

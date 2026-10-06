@@ -170,7 +170,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `toBigInt` 抛 `not a safe integer` | 传进去的是已坍缩的 number（多为 `Number(...)` 的产物）——传 DB 原样给出的**十进制字符串** |
 | PG 报 `column "x" is of type bigint but expression is of type text` | 回写用了字符串——字符串是文本意图，整数要用 `toBigInt(...)`（PG 不做隐式转换；MySQL/SQLite 会转换但别依赖） |
 | 同一 SQL 混合参数类型后报 `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**（PG 插件给 SQL 前置 `/*oj:<形态>*/` 签名；MySQL 无此问题）。若仍出现，检查 PG 插件是否随宿主重建 |
-| 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`fixture` / `schema diff` 同旗标） |
+| 多库项目只有 `default` 迁了 / 某库启动报 M004 | `oj migrate` 缺省只作用 `default`——命名库要 `oj migrate -c config.yaml -d dist --db <name>` 逐库各跑一遍（`test fixture` / `schema diff` 同旗标） |
 | `oj migrate --db X` 把别的模块的表也建进了 X | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）——模块绑不同库时用 `--db X --module M` 逐组合跑（`scenarios.md` 场景 6） |
 | `--db "x" not declared in config (db keys: […])` | 库名不在 config `db:` 段（键即库名）——工具**故意不回落** `default`，防迁移打在开发库上 |
 | `--redis/--blob/--es/--broker/--kafka/--rabbit` 报 `profile 'X' not declared (available: […])` | 选中的资源 profile 不在对应 config 段（如 `--blob` 不在 `config.blob.backends`）；工具**故意不回落** `default`，防误用开发库/错后端。核对报错里的可用 profile 列表，或补上对应 profile |

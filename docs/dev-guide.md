@@ -105,7 +105,7 @@ cargo llvm-cov --workspace --summary-only   # 覆盖率（需 cargo-llvm-cov；V
 ./bin/oj serve -c sample/config.yaml --api-path sample/src   # 启动服务（模式自动判定）
 ./bin/oj build -d sample/src -o sample/dist                   # 构建模块产物
 ./bin/oj test -c sample/config.yaml --format human            # 进程内 *.test.ts 运行器
-./bin/oj migrate / fixture / schema diff   # 迁移 / 演示数据 / schema 对账
+./bin/oj migrate / test fixture / schema diff   # 迁移 / 演示数据 / schema 对账
 # 子命令全表见 oj/src/args.rs 与 docs/cli2.md
 
 # 真服务集成测试（默认 #[ignore]，env 门控，见 §12）
@@ -157,7 +157,7 @@ src/                  # crate: only-js（lib）——核心执行层（纯 lib�
     ├── frame_pool.rs  # WS 帧池：Scheduler（per-conn 保序）+ W 无状态 Worker + Rust 会话表
     ├── ffi.rs        # 全部 unsafe 收敛（load_forget dlopen）+ FfiXxxBackend 适配器层
     └── plugin_loader.rs # PluginLoader：四级路径解析 + 清单/扫描双模式 + ABI 门禁 + AXES 逐轴 dlsym
-oj/                   # CLI 二进制：server / build / test / migrate / fixture / schema
+oj/                   # CLI 二进制：serve / build / test（子命令 fixture）/ migrate / schema / secret / exec / openapi
 ├── main.rs / lib.rs  # entry + CLI lib
 ├── args.rs           # CLI（clap derive：Cli/Commands + 到 ServerArgs/BuildArgs 的映射）
 ├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
@@ -173,8 +173,8 @@ server/               # crate: server（axum HTTP 层）
 ├── certificate.rs    # 证书验签与状态判定（valid/grace/expired）
 └── ws.rs             # WebSocket：闸门 + js_route/mirror_routes + frame_loop（帧池连接侧）
 oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=11）
-plugins/              # 9 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
-                      #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth、oj-mail
+plugins/              # 10 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
+                      #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth、oj-mail、oj-ldap
 tools/xtask/          # crate: cargo xtask bin/plugin/build 构建 + 归置到 bin/
 tools/oj-cert/        # 证书生成小工具 crate（gen/renew，sign_jws 单一事实来源）
 tests/plugins/mini/   # 演练加载/ABI/panic 路径的 cdylib 测试夹具
@@ -801,7 +801,7 @@ rm -rf target/llvm-cov-target target/debug
 
 #### 结果登记
 
-本仓曾达 **workspace 94.2%**（36,102/38,339 行），9 个插件均 ≥ 90%（最低 kafka/rabbitmq
+本仓曾达 **workspace 94.2%**（36,102/38,339 行），10 个插件均 ≥ 90%（最低 kafka/rabbitmq
 90.9%；`oj-plugin-ffi` 在 workspace 跑中 88.9%；`tools/xtask` 58.5% 不在覆盖目标内）。
 每次版本更新若改动这些模块，重跑上述命令核对比例是否回落 90% 以下，回落则补测。
 
@@ -811,7 +811,7 @@ rm -rf target/llvm-cov-target target/debug
 
 要加后端、写第三方插件、或排查插件加载失败时读这节。
 
-**分层**：开发侧五轴解耦（es/db/blob/bus/kv 各自 trait + 注册表），运行侧动态链接库可配置
+**分层**：开发侧按轴解耦（各后端轴各自 trait + 注册表），运行侧动态链接库可配置
 装配。全部 FFI 跨界类型收在 `oj-plugin-ffi`；`src/bridge/ffi.rs` 收敛全部 unsafe
 （`load_forget` dlopen + `Box::leak` 进程期存活，任何路径不 dlclose；插件必须 panic=unwind
 profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装成 core trait 供 op 消费（构造放
@@ -835,14 +835,14 @@ core，装配层只经安全入口）。
   `@semver` pin 不符 fail fast），值为插件 cfg（非空对象原样透传，空对象 = 回落轴适配器）。
   缺省/空 map → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。旧 list 写法
   `plugins: [a, b]` 废弃（解析报错）。
-- 注册：abi 门禁（严格相等）→ `init` → 对 `AXES = [es, db, blob, bus, kv, auth, mq, mail]` 逐轴
+- 注册：abi 门禁（严格相等）→ `init` → 对 `AXES = [es, db, blob, bus, kv, auth, mq, mail, ldap]` 逐轴
   `dlsym("oj_plugin_axis_<axis>")`，缺符号 = 不提供该轴；加轴零破坏（既有轴 vtable 形状
   变更才 bump ABI）。
 - 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` / JS `plugins()` /
   公共端点 `GET {base}/plugins` 输出插件名/semver/ABI/指纹/**自描述 desc** + 宿主
   ABI_VERSION（升级核对窗口）。
 
-**五轴接线**（serve_cmd `build_registries`）：
+**各轴接线**（serve_cmd `build_registries`）：
 
 - es 键选单后端；「cfg es 声明但无 es 插件」→ fail fast。
 - db 认领式注册表：内置 sqlite/memory 打底 + 插件 db 工厂（scheme 交集冲突 fail fast；

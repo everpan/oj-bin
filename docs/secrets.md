@@ -5,7 +5,7 @@
 > `docs/devkit/scenarios.md` 场景 18；本手册是完整参考（威胁模型、密文格式、命令、
 > 迁移与轮换、限制、排障）。
 
-- 版本：v0.1.33 起；**下一版（未发布）移除 RSA(v1) 信封，仅保留 X25519 信封**（config 不再有「RSA 还是 X25519」的歧义）。
+- 版本：v0.1.33 起；**RSA(v1) 信封已移除，仅保留 X25519 信封**（config 不再有「RSA 还是 X25519」的歧义）。
 - 实现：`src/secret.rs`（加解密 + 配置树解密 + 脱敏）+ `oj/src/secret_cmd.rs`（CLI）。
 - 依赖：`x25519-dalek 3` + `hkdf 0.12` + `aes-gcm 0.10`（纯 Rust，无 C 编译）；随机数走
   `getrandom 0.2`。`rsa` 仍被 `oj-cert` / OIDC 使用，但 secrets 模块已不再依赖它。
