@@ -228,10 +228,10 @@ fetch / http / ws）各自一个模块。
 
 ```bash
 cargo build --workspace                  # 构建全部成员（release，产物归置到 bin/）
-cargo test                               # 根 crate 单元测试
-cargo test --workspace                   # 全量测试（含 oj e2e）
+cargo test --release                    # 根 crate 单元测试（release）
+cargo test --release --workspace         # 全量测试（含 oj e2e，release）
 cargo fmt --check                        # 格式门禁
-cargo clippy --all-targets -D warnings   # lint 门禁
+cargo clippy --release --all-targets -- -D warnings   # lint 门禁（release）
 cargo bench                              # criterion 基准
 
 ./bin/oj test -c sample/config.yaml             # 进程内跑 *.test.ts（无需起服务）
