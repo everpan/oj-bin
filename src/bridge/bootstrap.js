@@ -27,6 +27,7 @@ import {
   op_cert_renew,
   op_db_exec,
   op_db_next_seq,
+  op_db_sql_profile,
   op_db_has,
   op_db_as_system,
   op_db_as_tenant,
@@ -690,6 +691,9 @@ globalThis.DB = function (name) {
       // Race-free replacement for `select max(id) + 1`; the platform table
       // `_oj_sequences` is created on first use (see docs/db-guide.md).
       nextSeq: (n) => op_db_next_seq(name, String(n)),
+      // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
+      // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
+      sqlProfile: () => op_db_sql_profile(),
       // PR-2 Phase A streaming query. Primary form: callback (onRow enriches/transforms each
       // row, e.g. writing to json.stream). Otherwise returns an async iterable (escape hatch via
       // for-await). signal is wired through the abort event to op_db_stream_abort.
@@ -753,6 +757,8 @@ globalThis.DB = function (name) {
             table: (t) => queryBuilder(name, String(t)),
             // Same-connection allocator: MySQL's LAST_INSERT_ID is session-scoped.
             nextSeq: (n) => op_db_next_seq(name, String(n)),
+            // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
+            sqlProfile: () => op_db_sql_profile(),
             fromJSON: (snap) => builderFromReq(encodeParams(snap)),
             asSystem: () => { op_db_as_system(); return dbCache.get(name); },
             asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },

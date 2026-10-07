@@ -908,6 +908,8 @@ pub async fn assemble_backend(
     // cfg 只以 Copy 字段（allow_as_tenant）进入闭包：引用不得活进 'static 工厂，
     // 故先解出值再捕获（stable 单源之前 from_config 持 cfg 的等价写法）。
     let allow_as_tenant = cfg.tenant.allow_as_tenant;
+    // SQL 执行追踪（v0.1.51）：dev 默认开、release 默认关，config 段可强制覆盖。
+    let sql_trace = only_js::bridge::sql_trace::SqlTraceConfig::resolve(&cfg.db_trace, ts);
     let make_bridge_of = {
         let (dbs, kv, loader, es, bus) = (
             dbs.clone(),
@@ -951,6 +953,7 @@ pub async fn assemble_backend(
                     allow_as_tenant,
                     db_override: db_override.clone(),
                     query_limits,
+                    sql_trace,
                     boot: boot.clone(),
                     // jwt 原语配置（auth 解耦：JS 端点 jwt.sign/verify 数据源）。
                     jwt: jwt.clone(),
@@ -991,6 +994,7 @@ pub async fn assemble_backend(
         allow_as_tenant: cfg.tenant.allow_as_tenant,
         db_override: profiles.db.clone(),
         query_limits,
+        sql_trace,
         boot: boot.clone(),
         jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
         oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。

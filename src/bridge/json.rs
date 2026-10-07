@@ -1,6 +1,7 @@
 //! json.ok/fail/header 绑定。
 
 use deno_core::{OpState, op2};
+use serde_json::json;
 
 use super::{ReqState, envelope};
 
@@ -20,8 +21,21 @@ fn ensure_json_content_type(s: &mut ReqState) {
 /// data 由 JS 侧 JSON.stringify 为 JSON 文本传入（fast op，避免 serde_v8 反序列化 + 二次序列化）。
 #[op2(fast)]
 pub fn op_json_ok(state: &mut OpState, #[string] data_json: String) {
+    // dev SQL 追踪开启且本请求有 SQL 事件时，把画像作为 `_sql` 兄弟字段附进信封。
+    let trace_on = {
+        let st = state.borrow::<std::sync::Arc<super::StableState>>();
+        st.sql_trace.enabled
+    };
     let s = state.borrow_mut::<ReqState>();
-    s.response = Some(envelope::ok_raw(&data_json));
+    let body = if trace_on && s.sql_profile.count > 0 {
+        match serde_json::to_string(&s.sql_profile.snapshot()) {
+            Ok(sql) => envelope::ok_raw_ext(&data_json, &sql),
+            Err(_) => envelope::ok_raw(&data_json),
+        }
+    } else {
+        envelope::ok_raw(&data_json)
+    };
+    s.response = Some(body);
     s.status = 200;
     ensure_json_content_type(s);
     s.done = true;
@@ -40,8 +54,22 @@ pub fn op_json_fail(
     // 非法 JSON 回退 null（JS 侧已是 JSON.stringify 产物，正常不会走到）。
     let data: serde_json::Value =
         serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null);
+    let trace_on = {
+        let st = state.borrow::<std::sync::Arc<super::StableState>>();
+        st.sql_trace.enabled
+    };
     let s = state.borrow_mut::<ReqState>();
-    let (body, status) = envelope::fail(code, &msg, &data);
+    let (body, status) = if trace_on && s.sql_profile.count > 0 {
+        // 同 ok：dev 追踪开启时把画像附进信封 `_sql`（生产追踪关闭则走默认 fail 信封）。
+        let c = if code <= 0 { 500 } else { code };
+        let mut v = json!({ "code": c, "msg": msg, "data": data });
+        if let Ok(sql) = serde_json::to_value(s.sql_profile.snapshot()) {
+            v["_sql"] = sql;
+        }
+        (serde_json::to_vec(&v).unwrap(), c as u16)
+    } else {
+        envelope::fail(code, &msg, &data)
+    };
     s.response = Some(body);
     s.status = status;
     ensure_json_content_type(s);
