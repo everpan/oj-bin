@@ -232,13 +232,13 @@ enum Commands {
         base: Option<String>,
         /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；
         /// 模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 缺省（server）：不开 API 功能 —— 未指定 --api-path 且未配置静态站点
-        /// （server.app_path / --app-path）则拒绝启动
+        /// 缺省（server）：不开 API 功能 —— 未指定 --api-path 且未配置
+        /// 静态站点（server.app_path / --app-path）则拒绝启动。
         #[arg(long = "api-path")]
         api_path: Option<String>,
         /// 静态站点目录（相对 CWD；可重复，v0.1.27）：裸 `dir` 覆盖 config 的
         /// server.app_path（至多一次）；`prefix=dir`（如 `--app-path /docs=dist/docs`）
-        /// 覆盖/新增 server.static_sites 中该前缀的条目（CLI 优先于 config）
+        /// 覆盖/新增 server.static_sites 中该前缀的条目（CLI 优先于 config）。
         #[arg(long = "app-path")]
         app_path: Vec<String>,
         /// JWS 证书路径（覆盖 config 的 server.certificate_path）
@@ -252,7 +252,8 @@ enum Commands {
         #[arg(long = "console-log")]
         console_log: bool,
         /// 后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），
-        /// stdio 重定向空设备；日志照常落 server.logs_dir，父进程打印子 pid 后退出
+        /// stdio 重定向空设备；日志照常落 server.logs_dir，
+        /// 父进程打印子 pid 后退出。
         #[arg(long = "daemon")]
         daemon: bool,
     },
@@ -281,12 +282,10 @@ enum Commands {
         /// 配置文件路径（相对 CWD；db 段提供目标库）
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
-        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
+        /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
-        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast。
-        /// 与 `oj test --db` 不同——那里是「字面 default 调用重定向」，这里是整轮迁移的目标库
+        /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
         #[arg(long)]
         db: Option<String>,
         /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
@@ -295,8 +294,7 @@ enum Commands {
         /// 只迁移指定模块（src 首层子目录 / dist 模块名）
         module: Option<String>,
     },
-    /// 跑 sample API 测试（无需启动 oj serve；进程内真实运行时派发）。
-    /// 直接 `oj test` 跑用例；`oj test fixture` 灌演示数据。
+    /// 进程内真实运行时跑 *.test.ts；`oj test fixture` 灌演示数据。
     Test {
         /// 配置文件路径（相对 CWD；server.host/port/root + db/redis）
         #[arg(short, long, default_value = "config.yaml")]
@@ -304,8 +302,7 @@ enum Commands {
         /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
-        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
+        /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
         /// 测试用例目录（默认 tests）；相对 config_dir（项目根）
@@ -317,30 +314,34 @@ enum Commands {
         /// 报告落盘文件；省略则打印到 stdout
         #[arg(long)]
         output: Option<String>,
-        /// 测试库名（默认取 config 的 db.test）：字面 "default" 的库调用改指向该库，
-        /// 迁移/seed/fixtures 一并跟随
+        /// 测试库名（默认取 config 的 db.test）：字面 "default" 调用重定向到该库，迁移/seed 跟随
         #[arg(long)]
         db: Option<String>,
-        /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast
+        /// redis 命名 profile（config.redis 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         redis: Option<String>,
-        /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast
+        /// blob 命名 profile（config.blob.backends 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         blob: Option<String>,
-        /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast
+        /// es 命名 profile（config.es 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         es: Option<String>,
-        /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast
+        /// broker 命名 profile（config.broker 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         broker: Option<String>,
-        /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast
+        /// kafka 命名 profile（config.kafkas 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         kafka: Option<String>,
-        /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast
+        /// rabbit 命名 profile（config.rabbits 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         rabbit: Option<String>,
-        /// 把测试请求标记为匿名（等同生产 anonymous_paths 命中），供公开面
-        /// handler（db.asTenant）在测试中授信
+        /// 把测试请求标记为匿名（等同 anonymous_paths 命中），供公开面 handler（db.asTenant）在测试中授信
         #[arg(long)]
         anonymous: bool,
         /// 子命令：省略 → 跑用例；`fixture` → 灌演示数据
@@ -357,8 +358,7 @@ enum Commands {
         #[command(subcommand)]
         command: SecretCmd,
     },
-    /// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）
-    /// 三种用法互斥、必选其一：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式 REPL）。
+    /// 直接执行 ts/js 脚本（注入后端全局；file / -e / --repl 三选一）。
     #[command(group(clap::ArgGroup::new("exec_src").multiple(false)))]
     Exec {
         /// 脚本文件路径（.ts/.js）；与 --code / --repl 互斥
@@ -373,28 +373,34 @@ enum Commands {
         /// 配置文件路径（db/redis/插件段）
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
-        /// 服务目录（schema 白名单来源）；默认自动探测（src 优先 dist 次之）
+        /// 服务目录（schema 白名单来源）；缺省自动探测（src 优先 dist 次之）
         #[arg(short, long)]
         dir: Option<String>,
-        /// 字面 "default" 的库调用重定向到该库（未声明的库名 fail-fast）
+        /// 字面 "default" 的库调用重定向到该库（未声明即 fail-fast）
         #[arg(long)]
         db: Option<String>,
-        /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast
+        /// redis 命名 profile（config.redis 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         redis: Option<String>,
-        /// blob 命名 profile（config.blob.backends 段）选为默认源；缺省 default；未声明 fail-fast
+        /// blob 命名 profile（config.blob.backends 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         blob: Option<String>,
-        /// es 命名 profile（config.es 段）选为默认源；缺省 default；未声明 fail-fast
+        /// es 命名 profile（config.es 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         es: Option<String>,
-        /// broker 命名 profile（config.broker 段）选为默认源；缺省 default；未声明 fail-fast
+        /// broker 命名 profile（config.broker 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         broker: Option<String>,
-        /// kafka 命名 profile（config.kafkas 段）选为默认源；缺省 default；未声明 fail-fast
+        /// kafka 命名 profile（config.kafkas 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         kafka: Option<String>,
-        /// rabbit 命名 profile（config.rabbits 段）选为默认源；缺省 default；未声明 fail-fast
+        /// rabbit 命名 profile（config.rabbits 段）选为默认源；
+        /// 缺省 default；未声明 fail-fast。
         #[arg(long)]
         rabbit: Option<String>,
         /// 日志同时落盘 JSONL（终端照出；打开失败仅告警不中断）
@@ -488,8 +494,7 @@ pub enum SchemaCmd {
         /// 配置文件路径（相对 CWD；db 段提供目标库）
         #[arg(short, long, default_value = "config.yaml")]
         config: String,
-        /// 服务目录；模式自动判定（含 manifests.yaml → release/js，否则 dev/ts）。
-        /// 默认：自 config 同级向上逐级搜，每层 src 优先、dist 次之
+        /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
         /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
