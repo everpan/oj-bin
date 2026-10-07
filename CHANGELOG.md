@@ -39,6 +39,15 @@ op 层计时并产出事件，同时喂给两个出口——dev 结构化日志�
 - **零开销默认**：release 或 `enabled:false` 时 recorder 直接返回，不计时、不分配、不写日志。
   现有 `Bridge` 直接构造（测试/exec）默认关闭追踪，不受影响。
 
+### fix
+
+- **`oj --help` / 子命令 `--help` 说明过长导致换行错乱**：`oj/src/args.rs` 里 clap 实际渲染的
+  帮助文本普遍偏长（单条说明多行、资源 profile 旗标 `--redis/--blob/--es/--broker/--kafka/
+  --rabbit` 12 处重复长句），在窄终端下缠绕、版式混乱。统一精简为单行或极短两行：
+  serve 的 `--api-path/--app-path/--console-log/--daemon`、migrate/test/schema diff/exec 的
+  `--dir/--db`、`test`/`exec` 子命令简介，以及 12 个资源 profile 旗标（表述压成
+  `<源> profile（config.<段>；缺省 default；未声明 fail-fast）`）。仅注释文本变更，无功能/行为变化。
+
 ## v0.1.50 —— `oj exec` 内联代码与交互式 REPL（未打标签）
 
 **动机**：`oj exec` 原先只能执行磁盘上的 `.ts`/`.js` 文件，临时调试、一次性求值、管道/CI
