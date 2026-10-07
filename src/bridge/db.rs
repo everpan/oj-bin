@@ -393,22 +393,100 @@ pub async fn op_db_query(
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
-    let mut rows = match resolve_target(&state, &name)? {
+
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let start = std::time::Instant::now();
+    let res: Result<Vec<Row>, JsErrorBox> = match target {
         Target::Pool(da) => da
             .query_with_params(&sql, &params)
             .await
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
         Target::Tx(t) => t
             .session
             .lock()
             .await
             .query(&sql, &params)
             .await
-            .map_err(|e| JsErrorBox::generic(e.to_string()))?,
+            .map_err(|e| JsErrorBox::generic(e.to_string())),
     };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    trace_sql(
+        &state,
+        &sql,
+        &params,
+        &name,
+        in_tx,
+        ms,
+        res.as_ref().ok().map(|r| r.len() as i64),
+        res.is_ok(),
+        res.as_ref().err().map(|e| e.to_string()),
+    );
+
+    let mut rows = res?;
     // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
     super::jsnum::sanitize_rows(&mut rows);
     Ok(rows)
+}
+
+/// 在 db op 内调用：构造 `SqlEvent` 并交给 `sql_trace::record_sql`（配置未开则零开销直接返回）。
+/// `rows` 为影响/返回行数（stream/未知传 None）；`ok`/`err` 描述执行结果。
+///
+/// 画像/信封永远脱敏（只记「参数个数」）；仅 `redact_params=false` 时 dev 日志记参数原值。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_sql(
+    state: &Rc<RefCell<OpState>>,
+    sql: &str,
+    params: &[Value],
+    db: &str,
+    in_tx: bool,
+    ms: f64,
+    rows: Option<i64>,
+    ok: bool,
+    err: Option<String>,
+) {
+    // 关闭即零开销：先判 enabled，再算任何东西（含 module clone / 参数摘要）。
+    let enabled = state
+        .borrow()
+        .borrow::<std::sync::Arc<super::StableState>>()
+        .sql_trace
+        .enabled;
+    if !enabled {
+        return;
+    }
+    let redact = state
+        .borrow()
+        .borrow::<std::sync::Arc<super::StableState>>()
+        .sql_trace
+        .redact_params;
+    let src = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .module
+        .clone()
+        .unwrap_or_else(|| "anon".into());
+    // 画像/信封永远脱敏；dev 日志在 redact=false 时记原值。
+    let redacted = super::sql_trace::summarize_params(params, true);
+    let log_params = if redact {
+        redacted.clone()
+    } else {
+        super::sql_trace::summarize_params(params, false)
+    };
+    super::sql_trace::record_sql(
+        state,
+        super::sql_trace::SqlEvent {
+            sql: sql.to_string(),
+            params: redacted,
+            db: db.to_string(),
+            in_tx,
+            source: src,
+            ms,
+            rows,
+            ok,
+            error: err,
+        },
+        log_params,
+    );
 }
 
 /// db.exec(sql, params?)：Promise<受影响行数>。
@@ -423,7 +501,11 @@ pub async fn op_db_exec(
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
-    match resolve_target(&state, &name)? {
+
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let start = std::time::Instant::now();
+    let res: Result<i64, JsErrorBox> = match target {
         Target::Pool(da) => da
             .exec_with_params(&sql, &params)
             .await
@@ -435,7 +517,21 @@ pub async fn op_db_exec(
             .exec(&sql, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
-    }
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    trace_sql(
+        &state,
+        &sql,
+        &params,
+        &name,
+        in_tx,
+        ms,
+        res.as_ref().ok().copied(),
+        res.is_ok(),
+        res.as_ref().err().map(|e| e.to_string()),
+    );
+
+    res
 }
 
 /// db.stream 打开（PR-2 Phase A）：先 `guard::check_raw` / `check_tenant_raw`（open 前校验，同
@@ -459,10 +555,22 @@ pub async fn op_db_stream_open(
             ));
         }
     };
-    let mut stream = da
-        .stream_query(&sql, &params)
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let start = std::time::Instant::now();
+    let stream_res = da.stream_query(&sql, &params).await;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    // 流式只追踪「打开」（首行拉取开始）；整条流耗时由 `db.stream` 的逐行消费决定，未计入。
+    trace_sql(
+        &state,
+        &sql,
+        &params,
+        &name,
+        false,
+        ms,
+        None,
+        stream_res.is_ok(),
+        stream_res.as_ref().err().map(|e| e.to_string()),
+    );
+    let mut stream = stream_res.map_err(|e| JsErrorBox::generic(e.to_string()))?;
     let (tx, rx) = mpsc::channel::<Result<Row, String>>(DB_STREAM_CHANNEL_CAP);
     let shared = Arc::new(DbStreamShared {
         rx: tokio::sync::Mutex::new(rx),
@@ -579,6 +687,24 @@ pub async fn op_db_stream_abort(state: Rc<RefCell<OpState>>, stream_id: f64) {
 ///   ——按「只增不复用」理解；
 /// - 返回值过 `jsnum` 规则：`≤2^53-1` 给 number，超出给十进制字符串（与 DB 读值同契约）；
 /// - 序列名绑定为参数（不进 SQL 标识符），无注入面；长度 1..=128。
+/// db.sqlProfile()：本请求 SQL 执行画像快照（v0.1.51，dev 默认开）。
+/// 返回 `{ count, totalMs, slow, byDb, events }`；追踪未开启（release 默认 / config 关）时返回空对象。
+#[op2]
+#[serde]
+pub fn op_db_sql_profile(state: Rc<RefCell<OpState>>) -> Result<serde_json::Value, JsErrorBox> {
+    let enabled = state
+        .borrow()
+        .borrow::<std::sync::Arc<StableState>>()
+        .sql_trace
+        .enabled;
+    if !enabled {
+        return Ok(Value::Object(Default::default()));
+    }
+    let state_ref = state.borrow();
+    let rs = state_ref.borrow::<super::ReqState>();
+    Ok(rs.sql_profile.snapshot())
+}
+
 #[op2]
 #[serde]
 pub async fn op_db_next_seq(
@@ -602,16 +728,34 @@ pub async fn op_db_next_seq(
     //    命中前一个库的缓存、跳过建表（池路径多付一次失败+DDL，事务路径直接失败）。
     let phys = super::guard::bound_db(&state, &name);
     ensure_seq_once(&state, &phys, &*da).await.map_err(err)?;
-    let mut out = match resolve_target(&state, &name)? {
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let start = std::time::Instant::now();
+    let alloc_res: Result<Row, JsErrorBox> = match target {
         // 池路径：表刚确保过，正常一次成功；仍保留「失败→再建表→重试」兜底（外部 drop 等）。
-        Target::Pool(da) => next_seq_via_pool(&da, &seq).await.map_err(err)?,
+        Target::Pool(da) => next_seq_via_pool(&da, &seq).await.map_err(err),
         // tx 路径：搭车调用方事务的连接（建表已在池上完成，此处不再触碰 DDL）。
         Target::Tx(t) => {
             let dial = da.dialect();
             let mut s = t.session.lock().await;
-            seq_next(&mut **s, dial, &seq).await.map_err(err)?
+            seq_next(&mut **s, dial, &seq).await.map_err(err)
         }
     };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    // 序列分配本质是一次取号 SQL，按合成名追踪（不含业务表名）。
+    let sql = format!("db.nextSeq(`{seq}`)");
+    trace_sql(
+        &state,
+        &sql,
+        &[],
+        &name,
+        in_tx,
+        ms,
+        None,
+        alloc_res.is_ok(),
+        alloc_res.as_ref().err().map(|e| e.to_string()),
+    );
+    let mut out = alloc_res?;
     // 出口护栏：超界整数降十进制字符串（与 DB 读值同契约，见 jsnum）。
     super::jsnum::sanitize_js_numbers(&mut out);
     Ok(out)
@@ -1399,6 +1543,201 @@ mod tests {
         assert!(
             count < 1000,
             "取消必须停止拉取（count={count} 不得跑完全表）: {v}"
+        );
+    }
+
+    /// SQL 执行追踪（v0.1.51）：dev 开启后，本请求画像累计 SQL 事件，`db.sqlProfile()` 可读取，
+    /// 且参数默认脱敏（params 只记个数）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_trace_records_profile_and_redacts_params() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let extras = crate::bridge::Extras {
+            sql_trace: crate::bridge::sql_trace::SqlTraceConfig {
+                enabled: true,
+                redact_params: true,
+                slow_ms: 0.0,
+                to_log: false,
+            },
+            ..Default::default()
+        };
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            extras,
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("insert into t (v) values (?)", ["secret"]);
+                     const rows = await db.query("select * from t where v = ?", ["secret"]);
+                     json.ok({ n: rows.length, prof: db.sqlProfile() });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        // 2 条 SQL：insert + select。
+        assert_eq!(
+            v["data"]["prof"]["count"],
+            json!(2),
+            "画像应含 2 条 SQL: {v}"
+        );
+        // 参数脱敏：只记个数，不记 "secret"。
+        assert_eq!(
+            v["data"]["prof"]["events"][0]["params"],
+            json!("1 params"),
+            "参数默认脱敏: {v}"
+        );
+        assert!(
+            v["data"]["prof"]["events"][0]["sql"]
+                .as_str()
+                .unwrap()
+                .contains("insert into t"),
+            "事件含 SQL 文本: {v}"
+        );
+    }
+
+    /// SQL 执行追踪关闭（release 默认）时不累计画像，`db.sqlProfile()` 返回空对象。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_trace_off_yields_empty_profile() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        db.exec_with_params("create table t (id integer primary key)", &[])
+            .await
+            .unwrap();
+        // Extras 默认 sql_trace.enabled = false（release 行为）。
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("insert into t (id) values (1)");
+                     json.ok({ prof: db.sqlProfile() });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["prof"], json!({}), "关闭时画像为空对象: {v}");
+    }
+
+    /// 红线探针：即使 `redact_params: false`，画像与响应信封 `_sql` 也永远脱敏（只记个数），
+    /// 参数原值绝不外泄到客户端（仅服务端 dev 日志可记）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_trace_envelope_always_redacts_even_when_redact_false() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let extras = crate::bridge::Extras {
+            sql_trace: crate::bridge::sql_trace::SqlTraceConfig {
+                enabled: true,
+                redact_params: false, // 故意关脱敏：仅 dev 日志可记原值
+                slow_ms: 0.0,
+                to_log: false,
+            },
+            ..Default::default()
+        };
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            extras,
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("insert into t (v) values (?)", ["SECRET_PLAINTEXT"]);
+                     json.ok({ prof: db.sqlProfile() });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let params = v["data"]["prof"]["events"][0]["params"].as_str().unwrap();
+        // 画像永远脱敏：只记个数，绝不出现原值。
+        assert_eq!(params, "1 params", "画像应永远脱敏: {v}");
+        let body = String::from_utf8_lossy(&cap.body);
+        assert!(
+            !body.contains("SECRET_PLAINTEXT"),
+            "响应体/信封永不泄露参数原值: {body}"
+        );
+    }
+
+    /// 红线探针：db.table().select().all() 等构造器路径也须进画像（engineer P1-1）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_trace_records_query_builder_path() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        db.exec_with_params("create table t (id integer primary key, v text)", &[])
+            .await
+            .unwrap();
+        let extras = crate::bridge::Extras {
+            sql_trace: crate::bridge::sql_trace::SqlTraceConfig {
+                enabled: true,
+                redact_params: true,
+                slow_ms: 0.0,
+                to_log: false,
+            },
+            ..Default::default()
+        };
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new().table("t", &["id"], &["id", "v"]),
+            false,
+            None,
+            extras,
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.table("t").select().all();
+                     json.ok({ prof: db.sqlProfile() });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(
+            v["data"]["prof"]["count"].as_u64().unwrap() >= 1,
+            "构造器路径应进画像: {v}"
+        );
+        assert!(
+            v["data"]["prof"]["events"][0]["sql"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("select"),
+            "画像应含 SELECT: {v}"
         );
     }
 }

@@ -23,6 +23,18 @@ pub fn ok_raw(data_json: &str) -> Vec<u8> {
     buf
 }
 
+/// OK 信封扩展：在 `data` 之后追加一个 `_sql` 兄弟字段（已序列化的 JSON 文本）。
+/// 仅 dev SQL 追踪开启时由 `op_json_ok` 调用，把本请求画像附进信封（生产追踪关闭则走 `ok_raw`）。
+pub fn ok_raw_ext(data_json: &str, sql_json: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + data_json.len() + sql_json.len());
+    buf.extend_from_slice(br#"{"code":0,"msg":"ok","data":"#);
+    buf.extend_from_slice(data_json.as_bytes());
+    buf.extend_from_slice(br#","_sql":"#);
+    buf.extend_from_slice(sql_json.as_bytes());
+    buf.push(b'}');
+    buf
+}
+
 /// Fail 返回失败信封，并返回应映射的 HTTP 状态码（code<=0 默认 500）。
 pub fn fail(code: i32, msg: &str, data: &Value) -> (Vec<u8>, u16) {
     let code = if code <= 0 { 500 } else { code };

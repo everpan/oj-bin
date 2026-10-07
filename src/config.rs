@@ -890,6 +890,33 @@ impl Default for WsCfg {
     }
 }
 
+/// SQL 执行追踪配置（v0.1.51）：开发期追踪 SQL 执行情况与性能。
+///
+/// `enabled` 为 `Option<bool>`：None = 依 dev/release 自动（dev 开、release 关）；
+/// 显式 `true`/`false` 可强制覆盖。参数默认脱敏（`redact_params: true`）——绝不把
+/// 密码/手机号打进日志或画像；关闭脱敏（`false`）仅用于本地排障。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SqlTraceCfg {
+    pub enabled: Option<bool>,
+    pub redact_params: bool,
+    /// 慢查询阈值（毫秒）：仅 dev 日志按此过滤（0 = 全记）；画像始终记全量。
+    pub slow_ms: f64,
+    /// 是否写 dev 日志（默认 true）。
+    pub to_log: bool,
+}
+
+impl Default for SqlTraceCfg {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            redact_params: true,
+            slow_ms: 0.0,
+            to_log: true,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -952,6 +979,9 @@ pub struct Config {
     /// **不能塞进 `db:`**——`db` 是 name → DSN 的 map，键即库名。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_query: crate::bridge::QueryLimits,
+    /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_trace: SqlTraceCfg,
     /// 凭据密封（v0.1.33）：`ENC[...]` 密文的密钥位置。段缺省 = 无私钥
     /// （此时配置里出现 `ENC[...]` 会 fail-fast，见 [`SecretsCfg`]）。
     #[serde(default, deserialize_with = "null_as_default")]

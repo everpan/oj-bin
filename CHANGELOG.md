@@ -16,6 +16,29 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.51 —— SQL 执行追踪（dev 日志 + 运行时画像）（未打标签）
+
+**动机**：开发与排障时看不到 SQL 到底跑了什么、跑了多久。补一层**单一内部 recorder**：
+所有 SQL（池路径 `db.query/exec/stream` 与事务路径 `tx.query/exec`、`db.nextSeq`）都在
+op 层计时并产出事件，同时喂给两个出口——dev 结构化日志与每请求运行时画像。
+
+- **dev 日志（默认开）**：每条 SQL 打 `target="oj::sql"` 的结构化日志，含 `sql` / `db` /
+  `ms` / `rows` / `tx`（是否事务）/ `src`（模块名）/ `status` / `err`。release 默认关，
+  可由 `db_trace.enabled: true` 强制开。
+- **`db.sqlProfile()`（新增 JS 原语）**：返回本请求画像快照
+  `{ count, totalMs, slow:[{sql,ms,db}], byDb:{db:{count,ms}}, events:[{sql,params,db,inTx,source,ms,rows,ok,error}] }`，
+  handler 想看时自己调（性能汇总、慢查询速览、逐条回放）。
+- **dev 信封 `_sql`**：dev 追踪开启且本请求有 SQL 事件时，`json.ok/fail` 的信封追加兄弟字段
+  `_sql`（画像快照），裸 `curl` 即可见，生产追踪关闭则信封不变。
+- **参数默认脱敏**（`db_trace.redact_params: true`）：只记「参数个数」，**绝不**把密码/手机号
+  打进日志或画像；本地排障可设 `false` 显式打开明文（值经 JSON 序列化）。
+- **慢查询阈值**（`db_trace.slow_ms`，默认 0 = 全记）：仅过滤 dev 日志与画像里的 `slow` 列表；
+  画像 `events` 始终记全量。
+- **配置段 `db_trace`**（顶层，不能塞进 `db:` —— `db` 是 name→DSN 的 map）：
+  `enabled`（缺省 = dev 自动开 / release 自动关，可强制）、`redact_params`、`slow_ms`、`to_log`。
+- **零开销默认**：release 或 `enabled:false` 时 recorder 直接返回，不计时、不分配、不写日志。
+  现有 `Bridge` 直接构造（测试/exec）默认关闭追踪，不受影响。
+
 ## v0.1.50 —— `oj exec` 内联代码与交互式 REPL（未打标签）
 
 **动机**：`oj exec` 原先只能执行磁盘上的 `.ts`/`.js` 文件，临时调试、一次性求值、管道/CI

@@ -625,6 +625,53 @@ expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 
 > 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
 
+## 场景 8：开发期追踪 SQL 执行情况与性能（v0.1.51）
+
+dev 模式（无 `dist/manifests.yaml`）默认开启 SQL 追踪，无需任何配置即可看每条 SQL 跑了什么、跑了多久。
+
+### ① 直接看日志
+
+dev 启动后，每条 SQL 打 `target="oj::sql"` 的结构化日志（含 `sql` / `db` / `ms` / `rows` / `tx` / `src` / `status`），stderr 里直接定位慢查询与失败 SQL：
+
+```
+SQL trace sql="select * from account where id = ?" db=default ms=1.23 rows=1 tx=false src=anon status=ok
+```
+
+### ② 在 handler 里取本请求画像
+
+```ts
+const rows = await db.query("select * from account where id = ?", [id]);
+const prof = db.sqlProfile();
+// { count, totalMs, slow:[{sql,ms,db}], byDb:{default:{count,ms}}, events:[{sql,params,db,inTx,source,ms,rows,ok,error}] }
+log.info(`ran ${prof.count} SQL in ${prof.totalMs.toFixed(1)}ms`);
+```
+
+### ③ 裸 curl 看 dev 信封 `_sql`
+
+dev 追踪开启且本请求有 SQL 事件时，标准信封自动追加 `_sql` 字段（= 画像快照），无需改动 handler：
+
+```json
+{ "code": 0, "msg": "ok", "data": [...], "_sql": { "count": 3, "totalMs": 2.1, "byDb": {...}, "events": [...] } }
+```
+
+### ④ 配置（release 强制开 / 关脱敏）
+
+```yaml
+db_trace:
+  enabled: true        # 缺省 = dev 自动开 / release 自动关；可强制
+  redact_params: true  # 默认 true：日志/画像里 params 只记「参数个数」，不记值（防密码/手机号泄漏）
+  slow_ms: 0           # 慢查询阈值(ms)，仅过滤日志与 slow 列表；0 = 全记
+  to_log: true         # 是否写 dev 日志
+```
+
+### ⑤ 常见坑
+
+| 现象 | 原因 |
+|---|---|
+| 生产看不到 SQL / 信封无 `_sql` | 追踪 release 默认关——加 `db_trace.enabled: true` |
+| `params` 是 `"3 params"` 看不到值 | `redact_params: true` 防泄漏；本地排障设 `false` 打开明文，**切勿在生产开** |
+| `db.sqlProfile()` 返回 `{}` | 追踪未开；且画像按请求重置，需在同一个请求内调用 |
+
 ---
 
 ## 场景 8：302 重定向到 blob 预签名 URL

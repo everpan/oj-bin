@@ -656,6 +656,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.ok(data?)` / `json.fail(code, msg, data?)` / `json.header(name, value)` / `json.redirect(url, code?)` | 统一响应信封、响应头与 3xx 重定向原语（v0.1.26） |
 | `http.method / query / headers / body / params / param / tenantId / user / files / file(i)` | 当前请求上下文（只读、懒加载、每请求最新） |
 | `db.query / exec / table / tx` | 默认库（`db === DB("default")`） |
+| `db.sqlProfile()` / 信封 `_sql` | SQL 执行追踪（v0.1.51，dev 默认开）：本请求画像快照 `{count,totalMs,slow,byDb,events}`；dev 信封自动附加 `_sql` 字段 |
 | `DB(name)` | 命名库实例（未配置的名字返回 `undefined`） |
 | `kv.get/set/del/expire/incr` | KV 存储（配 `redis.default` → 真 Redis，否则进程内存 KV） |
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
@@ -748,6 +749,32 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
+| `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
+
+**SQL 执行追踪**（v0.1.51，开发期可观测性）：
+
+dev 模式（无 `dist/manifests.yaml`）默认开启 SQL 追踪，release 默认关闭（可由 `db_trace.enabled: true` 强制开）。所有 SQL（`db.query/exec/stream`、`db.tx` 内 `tx.query/exec`、`db.nextSeq`）在 op 层统一计时并产出事件，同时喂给两个出口：
+
+- **dev 日志**：每条 SQL 打 `target="oj::sql"` 的结构化日志，含 `sql` / `db` / `ms` / `rows` / `tx`（是否事务）/ `src`（模块名）/ `status` / `err`——直接看 stderr 即可定位慢查询与失败 SQL。
+- **`db.sqlProfile()`**：返回本请求画像快照（汇总在 `count`/`totalMs`/`byDb`、慢查询速览在 `slow`、逐条回放在 `events`）。handler 想看时自己调，例如把画像塞进响应或打点：
+  ```js
+  const rows = await db.query("select * from account where id = ?", [id]);
+  const prof = db.sqlProfile();   // { count, totalMs, slow, byDb, events }
+  log.info(`ran ${prof.count} SQL in ${prof.totalMs.toFixed(1)}ms`);
+  ```
+- **dev 信封 `_sql`**：dev 追踪开启且本请求有 SQL 事件时，`json.ok/fail` 的标准信封自动追加兄弟字段 `_sql`（= 画像快照），裸 `curl` 即可见，无需改动 handler。生产追踪关闭时信封不变。
+
+**参数脱敏（红线）**：`db_trace.redact_params` 默认 `true`。画像（`db.sqlProfile()`）与响应信封 `_sql` 里的 `params` **永远**只记「参数个数」（如 `"3 params"`），**绝不**把密码/手机号等经客户端响应外泄。只有服务端 dev 日志（`target="oj::sql"`）在 `redact_params: false` 时才会记参数原值（JSON 序列化），仅供本地排障。
+
+**`db_trace` 配置段**（顶层；`db` 是 name→DSN 的 map 不能塞）：
+```yaml
+db_trace:
+  enabled: true        # 缺省 = dev 自动开 / release 自动关；可强制
+  redact_params: true  # 默认 true：画像/信封只记个数；false 仅让 dev 日志记原值（响应仍脱敏）
+  slow_ms: 0           # 慢查询阈值(ms)；0 = 全收（日志与 slow 列表均不过滤），>0 按阈值过滤
+  to_log: true         # 是否写 dev 日志（dev 默认每条约一行；高频场景可调高 slow_ms 降噪）
+```
+
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
 

@@ -56,6 +56,7 @@ mod plugins_op;
 mod query;
 mod registry;
 mod runtime;
+pub mod sql_trace;
 mod stream;
 pub mod task_pool;
 pub mod transpile;
@@ -160,6 +161,8 @@ pub struct StableState {
     pub db_override: Option<String>,
     /// 构造器 LIMIT：隐式默认 + 显式硬顶（db_query 段，v0.1.20）。
     pub query_limits: QueryLimits,
+    /// SQL 执行追踪配置（dev 日志 + 每请求画像；v0.1.51）。装配期冻结、只读。
+    pub sql_trace: sql_trace::SqlTraceConfig,
     /// `db.nextSeq` 的「平台序列表已确保」缓存（键 = 库名；v0.1.24）：DDL 每个库只跑一次。
     /// **必须放在 Bridge 级**（不能是全局 static）——每个 Bridge 对应一份 DB 配置与连接池，
     /// 全局缓存会在「同一进程里多个独立库（含测试的内存库）」之间误判。
@@ -217,6 +220,8 @@ pub struct Extras {
     pub db_override: Option<String>,
     /// 构造器 LIMIT（缺省 = 内置默认 100 / 硬顶 1000）。
     pub query_limits: QueryLimits,
+    /// SQL 执行追踪配置（缺省关；app 装配按 dev/release + config 决定）。
+    pub sql_trace: sql_trace::SqlTraceConfig,
     /// ext_boot 模块 specifier（装配期冻结的 `file://…?v=<mtime>`）；None = 无 boot。
     pub boot: Option<String>,
     /// jwt 配置（装配层从 config.auth 构建）；None = jwt.* 报 "jwt not configured"。
@@ -279,6 +284,9 @@ pub struct ReqState {
     /// PR-2 Phase A：`db.stream` 每请求流注册表（keyed by stream_id）。pump 持有 Arc 克隆推数据，
     /// `op_db_stream_next` 拉取；`reset` 换全新 Arc，旧 Arc 由仍存活的 pump 持有至排空，互不串。
     pub(crate) db_streams: std::sync::Arc<db::DbStreamRegistry>,
+    /// SQL 执行追踪画像（v0.1.51）：本请求累计的 SQL 事件，dev 信封 `_sql` 与
+    /// `db.sqlProfile()` 的数据源；`reset` 时清空。
+    pub sql_profile: sql_trace::SqlProfile,
 }
 
 impl ReqState {
@@ -299,6 +307,7 @@ impl ReqState {
         self.stream_rx.borrow_mut().take();
         self.stream_heartbeat_stop.borrow_mut().take();
         self.db_streams = std::sync::Arc::new(db::DbStreamRegistry::default());
+        self.sql_profile = sql_trace::SqlProfile::default();
     }
 }
 
@@ -328,6 +337,7 @@ deno_core::extension!(
         db::op_db_query,
         db::op_db_exec,
         db::op_db_next_seq,
+        db::op_db_sql_profile,
         db::op_db_tx_begin,
         db::op_db_tx_commit,
         db::op_db_tx_rollback,
@@ -673,6 +683,7 @@ impl Bridge {
             allow_as_tenant: extras.allow_as_tenant,
             db_override: extras.db_override,
             query_limits: extras.query_limits,
+            sql_trace: extras.sql_trace,
             boot: extras.boot,
             input_contracts: extras.input_contracts,
             jwt: extras.jwt,
@@ -1995,6 +2006,7 @@ mod tests {
             allow_as_tenant: false,
             db_override: None,
             query_limits: query::QueryLimits::default(),
+            sql_trace: sql_trace::SqlTraceConfig::default(),
             boot: None,
             jwt: None,
             oidc: None,

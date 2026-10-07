@@ -1588,24 +1588,125 @@ pub async fn op_db_query_build(
         super::db::Target::Pool(da) => Exec::Pool(da),
         super::db::Target::Tx(t) => Exec::Tx(t.session.lock().await),
     };
+    let in_tx = matches!(&target, super::db::Target::Tx(_));
+    let db_name = req.db.clone();
+    let start = std::time::Instant::now();
     let mut out = if rows && !last_id {
-        ex.query(&sql, &params).await.map(Value::Array).map_err(err)
+        match ex.query(&sql, &params).await {
+            Ok(r) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &db_name,
+                    in_tx,
+                    ms,
+                    Some(r.len() as i64),
+                    true,
+                    None,
+                );
+                Ok(Value::Array(r))
+            }
+            Err(e) => {
+                let em = e.to_string();
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &db_name,
+                    in_tx,
+                    ms,
+                    None,
+                    false,
+                    Some(em.clone()),
+                );
+                Err(JsErrorBox::generic(em))
+            }
+        }
     } else if last_id {
-        ex.exec(&sql, &params).await.map_err(err)?;
-        let r = ex
-            .query("SELECT LAST_INSERT_ID() AS id", &[])
-            .await
-            .map_err(err)?;
-        let v = r
-            .first()
-            .and_then(|row| row.get("id"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let mut obj = serde_json::Map::new();
-        obj.insert(req.returning[0].clone(), v);
-        Ok(Value::Array(vec![Value::Object(obj)]))
+        match ex.exec(&sql, &params).await {
+            Ok(_) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(&state, &sql, &params, &db_name, in_tx, ms, None, true, None);
+                // mysql 无 RETURNING：再发一次 LAST_INSERT_ID 取回自增主键。
+                let r = ex
+                    .query("SELECT LAST_INSERT_ID() AS id", &[])
+                    .await
+                    .map_err(err)?;
+                let ms2 = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    "SELECT LAST_INSERT_ID() AS id",
+                    &[],
+                    &db_name,
+                    in_tx,
+                    ms2 - ms,
+                    Some(r.len() as i64),
+                    true,
+                    None,
+                );
+                let v = r
+                    .first()
+                    .and_then(|row| row.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let mut obj = serde_json::Map::new();
+                obj.insert(req.returning[0].clone(), v);
+                Ok(Value::Array(vec![Value::Object(obj)]))
+            }
+            Err(e) => {
+                let em = e.to_string();
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &db_name,
+                    in_tx,
+                    ms,
+                    None,
+                    false,
+                    Some(em.clone()),
+                );
+                Err(JsErrorBox::generic(em))
+            }
+        }
     } else {
-        ex.exec(&sql, &params).await.map(Value::from).map_err(err)
+        match ex.exec(&sql, &params).await {
+            Ok(n) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &db_name,
+                    in_tx,
+                    ms,
+                    Some(n),
+                    true,
+                    None,
+                );
+                Ok(Value::from(n))
+            }
+            Err(e) => {
+                let em = e.to_string();
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                super::db::trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &db_name,
+                    in_tx,
+                    ms,
+                    None,
+                    false,
+                    Some(em.clone()),
+                );
+                Err(JsErrorBox::generic(em))
+            }
+        }
     };
     // 出口护栏（见 jsnum）：行/合成行/受影响行数里的超界整数降十进制字符串，防 JS 侧 BigInt。
     if let Ok(v) = out.as_mut() {
