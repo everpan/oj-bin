@@ -87,12 +87,46 @@ export default { post };
 ```ts
 // src/upload/api.ts —— 小文件直接落盘（大文件请走 blob 上传）
 async function post() {
-  const f = http.file("doc"); // 上传字段
-  if (!f) { json.fail(400, "doc required"); return; }
-  await fs.writeFile(`inbox/${f.filename}`, new Uint8Array(f.data));
-  json.ok({ saved: f.filename });
+  const f = http.files[0];                 // 第一个上传文件（按字段过滤用 m.field）
+  if (!f) { json.fail(400, "need a file (multipart)"); return; }
+  await fs.writeFile(`inbox/${f.filename}`, await http.file(0));
+  json.ok({ saved: f.filename, size: f.size });
 }
 export default { post };
+```
+
+### multipart 多文件批量上传落盘
+
+```ts
+// src/upload/batch/api.ts —— 一次请求带多个文件（同名字段重复或多个字段名均可）
+async function post() {
+  if (!http.files.length) { json.fail(400, "need files (multipart)"); return; }
+  await fs.mkdir("inbox", { recursive: true });
+  const saved = [];
+  for (let i = 0; i < http.files.length; i++) {
+    const meta = http.files[i];            // {field, filename, content_type, size, key, url}
+    const bytes = await http.file(i);      // 第 i 个文件字节
+    // 文件名是客户端可控输入：白名单化后再拼路径（jail 也会拦 ../，但 sanitized 名字更友好）
+    const safe = meta.filename.replace(/[^\w.-]+/g, "_");
+    const key = `inbox/${Date.now()}-${i}-${safe}`;
+    await fs.writeFile(key, bytes);
+    saved.push({ name: meta.filename, size: bytes.length });
+  }
+  json.ok({ count: saved.length, saved });
+}
+export default { post };
+```
+
+限制：只适用于 ≤ `server.max_upload_bytes` 的文件——超限字段由服务端流式直落
+blob（`http.file(i)` 报错，走 `http.files[i].key` / `.url`，见 api-manual blob 章节）。
+多文件总和受 axum 请求体上限约束，批量传大文件请逐文件直传 blob。
+
+```bash
+# 同名字段重复（-F 多次）与多字段名混合均可
+curl -F "doc=@a.pdf" -F "doc=@b.pdf" -F "img=@c.png" \
+  http://localhost:9778/v1/api/upload/batch/
+# → {"code":0,"data":{"count":3,"saved":[{"name":"a.pdf","size":…}, …]}}
+ls data/inbox/
 ```
 
 ```yaml
