@@ -1744,3 +1744,7 @@ cat data/exports/note.txt                                   # jail 根下真实�
 | `fs.readDir` 当数组用 | 返回异步迭代器：`for await (const e of await fs.readDir(p)) e.name` |
 | 想要 `open`/`read`/`write` 流式 | v1 不暴露 fd 句柄（防池化 runtime 跨请求 fd 泄漏）——大文件走 blob，流式导出见场景 23 |
 | 想读写 jail 外的系统路径 | 不支持：jail 是安全边界。确需访问请把目录挂进 root（symlink 到外部会被 canonicalize 判越界，勿用） |
+
+多文件批量上传（multipart 同名字段重复/多字段名混合）照抄见
+`docs/plugins/fs.md`「multipart 多文件批量上传落盘」——循环 `http.files` +
+`await http.file(i)` 逐个落盘，文件名先白名单化。
