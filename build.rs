@@ -21,12 +21,14 @@ use std::path::{Path, PathBuf};
 
 /// 由 `bridge::ws_client_extensions` 注册、且以 `dir` / `lazy_loaded_*` 声明扩展 JS 的
 /// 依赖 crate；与根 `Cargo.toml` 的 deno_* 依赖保持一致。
-const CRATES: [&str; 5] = [
+const CRATES: [&str; 7] = [
     "deno_web",
     "deno_fetch",
     "deno_net",
     "deno_websocket",
     "deno_webidl",
+    "deno_fs",
+    "deno_io",
 ];
 
 fn main() {

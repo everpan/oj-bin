@@ -104,6 +104,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `route_timeouts` 配了不生效 | pattern 匹配**含 base 全路径**（如 `/v1/api/convert/**`），且按声明序首个命中——诊断时先核对全路径与顺序 |
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |
 | es/blob 调用报错 | config 未配置 `es.endpoint` / `blob:` 段，配置即启用 |
+| `fs.*` 报 `NotCapable` | 未配置 `fs:` 段（fail-closed，启用即写 `fs: {root: ./data}`）、路径越出 `fs.root`、或 readonly 下调用写 API |
 | `ldap.bind` 一直抛而不是返回 false | 抛 = 连接/协议错；只有 LDAP 拒绝凭据（rc≠0，含 49）才返回 `false`——检查网络/`url`/服务账号，别把 `false` 分支当异常路径 |
 | `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `ldap.searchPaged` |
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |
@@ -114,6 +115,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | WS 连上但收不到广播 | 订阅只在 WS 会话内有效（`bus.subscribe` 在 HTTP 路径报错）；release 下 URL 含版本段 |
 | 改了 `ext_boot.js` 没生效 | 不做热重载，装配期已冻结 spec——必须重启进程 |
 | `ext_boot.js` 里 `await` 报 SyntaxError | 文件无 import/export，被 CJS 启发式包进非 async 函数——加一句 `export {};` |
+| fs 相对路径「找不到文件」 | 相对路径解析到 **fs.root** 之下（不是进程 cwd）——想读进程 cwd 的文件请用绝对路径，且绝对路径也必须在 root 内 |
+| `fs.readDir` 拿到不是数组 | 返回异步迭代器（Deno 语义）：`for await (const e of await fs.readDir("sub"))` 取 `e.name` |
+| handler 里 `await fs…` 顶层报 SyntaxError | run_with/短脚本顶层非 module——包 `(async () => { … })()`；api.ts handler 直接 `async function` + `export default` 即可 |
 | `ext_boot.js` 副作用被放大成百上千次 | boot 每个新建 runtime 都跑（模块数 + `pool_size` + WS Worker 数，每路由 `ws.workers_per_route` 个）——只做全局装配，别写库/发广播/打外部接口 |
 | `Kafka("x")` / `RabbitMQ("x")` 是 undefined | config `kafkas:`/`rabbits:` 段没配该实例名（或对应插件未装配） |
 | poll 报 "requires a task context" | 消费方法只能在 `src/tasks/` 任务文件里用；HTTP/WS 侧发消息用 `send`/`publish` |

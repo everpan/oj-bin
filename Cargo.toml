@@ -24,6 +24,10 @@ deno_webidl = "0.258"
 deno_fetch = "0.282"
 deno_net = "0.250"
 deno_websocket = "0.263"
+# 本地文件系统轴（v0.1.53）：JS `fs` 全局。deno_fs 的 30_fs.js 经 core.loadExtScript
+# 依赖 deno_io 的 12_io.js（read/write 原语），两扩展须一并注册（见 ws_client_extensions）。
+deno_fs = "0.168"
+deno_io = "0.168"
 deno_permissions = "0.117"
 # 根证书（v0.1.8）：create_default_root_cert_store（webpki-roots）注入 deno_fetch
 # Options.root_cert_store_provider，https fetch 与 wss 握手共用。

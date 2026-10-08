@@ -199,6 +199,9 @@ broker:
   #   brokers: ["127.0.0.1:9092"]
 blob:
   # 可选：对象存储（driver local/s3，s3 需 oj-blob-s3 插件；完整键见 sample/config.yaml）
+fs:                           # 可选：本地文件系统（v0.1.53；`fs.*` 全局，核心内置非插件）
+  # root: "data"             # jail 根（相对 config 目录；不存在/非目录 → 启动 fail-fast）
+  # readonly: false          # true = 写类 API 全拒（read 轴仍放行）；缺段 = fs.* 抛 NotCapable
 kafkas:                       # 可选：命名 Kafka 实例（v0.1.6），需 oj-bus-kafka 插件
   # default:
   #   brokers: ["127.0.0.1:9092"]   # 值 JSON 原样透传插件
