@@ -16,3 +16,4 @@ AXES 共 9 个：es / db / blob / bus / kv / auth / mq / mail / ldap。
 | [oj-kv-redis](oj-kv-redis.md) | kv | `redis:` | 已随发行包发布（较早合入） | [oj-kv-redis.md](oj-kv-redis.md) |
 | [oj-ldap](oj-ldap.md) | ldap | `ldap:` | 首版可用（v0.1.28 起）；随发行包发布 | [oj-ldap.md](oj-ldap.md) |
 | [oj-mail](oj-mail.md) | mail | `smtp:`（或 `plugins.mail` 透传） | 首版可用（v0.1.19 起）；随发行包发布 | [oj-mail.md](oj-mail.md) |
+| [fs](fs.md) | —（核心内置，非插件） | `fs:` | v0.1.53 起内建 | [fs.md](fs.md) |

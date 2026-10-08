@@ -816,9 +816,20 @@ pub async fn assemble_backend(
             .await?,
         ),
     };
+    // fs：fs 段存在即启用（jail 到 root；root 相对 config_dir 解析）；root 不存在/
+    // 非目录在 FsGrant::new fail-fast。未声明 → fs.* 报 NotCapable（fail-closed）。
+    let fs_grant: Option<Arc<only_js::bridge::fs::FsGrant>> = match &cfg.fs {
+        None => None,
+        Some(section) => {
+            let root = static_dir(config_dir, &section.root)?;
+            Some(Arc::new(only_js::bridge::fs::FsGrant::new(
+                &root,
+                section.readonly,
+            )?))
+        }
+    };
     // 逐 db 开库（未知 scheme 注册表 fail-fast）。
-    let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?;
-    // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
+    let dbs = connect_dbs(&cfg.db, &registries.dbs, config_dir).await?; // 默认库重定向（v0.1.20）：`oj test` 走 db.test。未声明的库名 fail-fast——
     // 静默回落 default 等于把测试写在开发库上（正是本项要修的事故面）。
     if let Some(o) = &profiles.db
         && !dbs.contains_key(o)
@@ -935,6 +946,7 @@ pub async fn assemble_backend(
         let vars = vars.clone();
         // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
         let input_contracts = input_contracts.clone();
+        let fs_grant = fs_grant.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -970,6 +982,8 @@ pub async fn assemble_backend(
                     vars: vars.clone(),
                     js_heap_limit,
                     input_contracts: Some(input_contracts.clone()),
+                    // fs 授权（v0.1.53；config fs: 段）：与 StableState.fs 同一 Arc。
+                    fs: fs_grant.clone(),
                 },
             )
         }
@@ -1007,6 +1021,7 @@ pub async fn assemble_backend(
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
         input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
+        fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。
     });
     Ok(Backend {
         stable,

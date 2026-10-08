@@ -257,6 +257,46 @@ interface BlobApi {
   readRange(key: string, offset: number, len: number): Promise<Uint8Array>;
 }
 
+// fs.* ：本地文件系统（v0.1.53；config `fs:` 段启用）。一次性 API（无 fd 句柄，
+// op 内自开自关）；相对路径解析到 jail 根 fs.root 之下（不是进程 cwd）。
+// 未配置 fs: / 越出 root（含 root 内 symlink 指向外部）/ readonly 下写 → 抛 NotCapable。
+interface FsApi {
+  readFile(path: string): Promise<Uint8Array>;
+  readTextFile(path: string): Promise<string>;
+  writeFile(path: string, data: Uint8Array): Promise<void>;
+  writeTextFile(path: string, data: string): Promise<void>;
+  mkdir(path: string, opts?: { recursive?: boolean }): Promise<void>;
+  remove(path: string, opts?: { recursive?: boolean }): Promise<void>;
+  rename(oldPath: string, newPath: string): Promise<void>;
+  stat(path: string): Promise<FsFileInfo>;
+  // 列目录：返回异步迭代器（不是数组），迭代项为 DirEntry；迭代完自动关闭句柄。
+  readDir(path: string): Promise<AsyncIterable<FsDirEntry>>;
+}
+
+interface FsFileInfo {
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymlink: boolean;
+  size: number;
+  mtime: Date | null;
+  atime: Date | null;
+  birthtime: Date | null;
+  ctime: Date | null;
+  dev: number;
+  mode: number | null;
+  ino: number | null;
+  nlink: number | null;
+  uid: number | null;
+  gid: number | null;
+}
+
+interface FsDirEntry {
+  name: string;
+  isFile: boolean;
+  isDirectory: boolean;
+  isSymlink: boolean;
+}
+
 // bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；
 // subscribe 仅 WS 会话内可用（HTTP 路径报错）；kind 报告活跃 broker 类型。
 interface BusApi {
@@ -448,6 +488,7 @@ declare global {
   // WS 帧池会话上下文（仅 ws.ts 生命周期钩子内可用，见 WsSess）。
   const sess: WsSess;
   const blob: BlobApi;
+  const fs: FsApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。

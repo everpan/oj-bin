@@ -275,6 +275,24 @@ pub struct BlobCfg {
     pub path_style: bool,
 }
 
+/// fs 段（v0.1.53）：本地文件系统 jail。段存在即启用；root 相对路径按 config_dir
+/// 解析（见 app.rs static_dir 同形）；`readonly: true` 时写类 API 全部拒绝。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FsSection {
+    pub root: String,
+    pub readonly: bool,
+}
+
+impl Default for FsSection {
+    fn default() -> Self {
+        Self {
+            root: "data".into(),
+            readonly: false,
+        }
+    }
+}
+
 /// blob 段（spec §2 命名多后端）：平铺字段 = 旧单后端语法糖（等价 backends.default）；
 /// `backends` 命名多后端。两者并存且平铺非默认 → 歧义报错（fail fast）。
 #[derive(Debug, Deserialize)]
@@ -934,6 +952,8 @@ pub struct Config {
     pub oidc: Option<OidcSection>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
     pub blob: Option<BlobSection>,
+    /// None = 不启用 fs（`fs.*` 全局报 NotCapable）；段存在即 jail 到 root。
+    pub fs: Option<FsSection>,
     /// None = 不启用 mail（`mail.*` 全局报 "mail not configured"）；段存在即启用。
     /// 段由 `oj-mail` 插件投递、宿主持白名单校验与附件解析（见 [`SmtpSection`]）。
     pub smtp: Option<SmtpSection>,

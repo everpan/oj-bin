@@ -36,6 +36,7 @@ mod envelope;
 mod es;
 pub(crate) mod ffi;
 pub mod frame_pool;
+pub mod fs;
 pub mod guard;
 mod http;
 pub mod import_scan;
@@ -195,6 +196,8 @@ pub struct StableState {
     /// 入参契约（v0.1.44）：键 = (api 文件绝对路径, js 方法名)。
     /// None = 校验关闭；Some(空表) = 无 handler 声明契约（当前全默认）。
     pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
+    /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 报 PermissionDenied。
+    pub fs: Option<Arc<fs::FsGrant>>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -245,6 +248,9 @@ pub struct Extras {
     /// 入参契约注册表（v0.1.44）；None = 不校验（缺省；Extras 是 Default 的，
     /// 故未显式注入的 Bridge 一律不设防，行为与升级前一致）。
     pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
+    /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 双轴 deny
+    /// （PermissionDenied）。只读语义见 [`fs::FsGrant`]。
+    pub fs: Option<Arc<fs::FsGrant>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -402,6 +408,8 @@ deno_core::extension!(
         mq::op_tasks_stopping,
         mq::op_tasks_sleep,
         ldap::op_ldap_call,
+        fs::op_fs_root,
+        fs::op_fs_resolve,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
@@ -409,13 +417,11 @@ deno_core::extension!(
         state.put(options.stable.clone());
         state.put(ReqState::default());
         // deno_websocket 的 op_ws_check_permission_and_cancel_handle 要求 OpState
-        // 里有 PermissionsContainer——出站 WS 与 fetch 同一信任边界（allow_all）。
+        // 里有 PermissionsContainer——出站 WS 与 fetch 同一信任边界。
         // 放在 bridge_ext 的 state 闭包：HTTP 池 / 任务 / `oj test` 三路径统一生效。
-        state.put(deno_permissions::PermissionsContainer::allow_all(Arc::new(
-            deno_permissions::RuntimePermissionDescriptorParser::new(
-                sys_traits::impls::RealSys,
-            ),
-        )));
+        // fs 轴（v0.1.53）：net 等轴恒放行（出站行为不变），read/write 收窄到
+        // config `fs:` 段的 jail（未配置 = 双 deny，PermissionDenied）。
+        state.put(fs::container_for(options.stable.fs.as_deref()));
     },
 );
 
@@ -469,6 +475,11 @@ pub fn ws_client_extensions() -> Vec<deno_core::Extension> {
         }),
         deno_net::deno_net::init(None, None),
         deno_websocket::deno_websocket::init(),
+        // fs 轴（v0.1.53）：deno_fs 依赖 deno_io 的 read/write 原语（30_fs.js 经
+        // loadExtScript 引 ext:deno_io/12_io.js），两扩展一并注册、顺序即依赖序。
+        // FileSystemRc 在无 sync feature 时是 Rc（非 Arc），故 Rc::new(RealFs)。
+        deno_io::deno_io::init(Some(deno_io::Stdio::default())),
+        deno_fs::deno_fs::init(std::rc::Rc::new(deno_fs::RealFs)),
     ]
 }
 
@@ -701,6 +712,7 @@ impl Bridge {
             ldap: extras.ldap,
             vars: extras.vars,
             js_heap_limit: extras.js_heap_limit,
+            fs: extras.fs,
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
         // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
@@ -2019,6 +2031,7 @@ mod tests {
             ldap: None,
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
+            fs: None,
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =

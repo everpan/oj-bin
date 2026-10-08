@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.53 —— JS handler 本地文件读写（`fs` 全局）（未打标签）
+
+**feat**：移植 Deno 官方 `deno_fs` 扩展（版本锁对齐 deno_core 0.411；`deno_io`
+一并注册供其 read/write 原语），为 JS/TS handler 提供本地文件系统能力：
+
+- 新增 `fs` 全局（9 个一次性 async API）：`readFile` / `readTextFile` /
+  `writeFile` / `writeTextFile` / `mkdir` / `remove` / `rename` / `stat` /
+  `readDir`。**不暴露 fd 句柄**（op 内自开自关，池化 runtime 无跨请求 fd
+  泄漏面）；大文件请走 `blob`。
+- config 新增 `fs:` 段：`root`（jail 根，相对 config 目录解析，缺省 `data`；
+  不存在/非目录启动 fail-fast）+ `readonly`（写 API 全拒）。**段缺省 = 不启用**
+  （fail-closed：`fs.*` 抛 `NotCapable`）。
+- 安全模型双层：门面层 `op_fs_resolve` best-effort canonicalize + root 前缀
+  裁决（封 `..`/绝对越界/symlink 逃逸）；deno_permissions 容器 read/write
+  轴收窄到 root、其余轴（net 等）放行不影响 fetch/WS 出站。
+- 相对路径解析到 jail 根（deno 原生语义是进程 cwd，门面层改写）；
+  挂载 `TextEncoder` / `TextDecoder` 全局（30_fs.js 文本助手依赖）。
+- dev / release / `oj test` 三路径一致可用；`oj build` 零处理。
+
+文档：`docs/plugins/fs.md`（归属索引，核心内置非插件）；devkit 四件对齐
+（api-manual §6 `fs` 章节 + §7 错误表 + §10 配置表 + 总表 25 组；SKILL.md
+陷阱 4 条；scenarios.md 场景 26；`sample/global.d.ts` 增 `FsApi` 类型）。
+测试：单元 7（往返/逃逸/readonly/symlink/池复用/授权构造）+ e2e 2
+（读写回环、readonly 写拒绝）。
+
 ## v0.1.52 —— 全库评审修复（鉴权 / panic 恢复 / 资源健壮性）（未打标签）
 
 **动机**：四路架构评审（核心运行时 / CLI+HTTP / 插件体系 / 文档）产出的 P1/P2 问题

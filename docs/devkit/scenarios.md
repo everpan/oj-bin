@@ -1695,3 +1695,52 @@ curl -sI http://localhost:9778/v1/api/blob/uploads/1-0-big.pdf | head -1  # 404
 | 假设 `readRange` 一定拿满 `len` | 短读截断：越尾只给实际剩余字节、`offset` 过尾给空数组——先判 `head.length` |
 | `readRange` 报 `offset must be a non-negative integer` | `offset` / `len` 传了负数、小数或 NaN（不静默取整） |
 | 后端不支持时静默变慢 | 宿主会回落（`copy` → `get`+`put`、`readRange` → `get` 全量切片），JS 不报错但字节过桥；local/s3 均原生支持，回落只是第三方后端的保险 |
+
+## 场景 26：handler 读写服务器本地文件（fs，v0.1.53）
+
+> 何时用：配置/模板落盘、导出 JSON/CSV 到服务器目录、读取本机生成的文件。
+> 大文件（GB 级）不要用 fs——一次性 API 整体进内存，走 blob（场景 25）。
+
+### ① 配置
+
+```yaml
+fs:
+  root: ./data     # jail 根（相对 config.yaml 所在目录；不存在/非目录 → 启动 fail-fast）
+  readonly: false  # 只读模板目录场景设 true，写 API 全拒
+```
+
+### ② handler
+
+```ts
+// src/fsdemo/api.ts —— 目录镜像路由 /v1/api/fsdemo/
+async function post() {
+  await fs.mkdir("exports", { recursive: true });
+  await fs.writeTextFile("exports/note.txt", "hello " + Date.now());
+  const st = await fs.stat("exports/note.txt");
+  json.ok({ size: st.size });
+}
+async function get() {
+  const names: string[] = [];
+  for await (const e of await fs.readDir("exports")) names.push(e.name);
+  json.ok({ names, text: await fs.readTextFile("exports/note.txt") });
+}
+export default { get, post };
+```
+
+### ③ 验证
+
+```bash
+curl -s -X POST http://localhost:9778/v1/api/fsdemo/        # {"code":0,"data":{"size":…}}
+curl -s http://localhost:9778/v1/api/fsdemo/                # {"code":0,"data":{"names":[…],"text":"hello …"}}
+cat data/exports/note.txt                                   # jail 根下真实落盘
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `fs.*` 报 `NotCapable` | 未配置 `fs:` 段（fail-closed）；或路径越出 `fs.root`（`..`、root 外绝对路径、root 内 symlink 指向外部一律拒）；或 readonly 下调用写 API |
+| 相对路径找不到文件 | 相对路径解析到 **fs.root 之下**，不是进程 cwd |
+| `fs.readDir` 当数组用 | 返回异步迭代器：`for await (const e of await fs.readDir(p)) e.name` |
+| 想要 `open`/`read`/`write` 流式 | v1 不暴露 fd 句柄（防池化 runtime 跨请求 fd 泄漏）——大文件走 blob，流式导出见场景 23 |
+| 想读写 jail 外的系统路径 | 不支持：jail 是安全边界。确需访问请把目录挂进 root（symlink 到外部会被 canonicalize 判越界，勿用） |

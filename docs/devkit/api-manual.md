@@ -649,7 +649,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（24 组）
+### 总表（25 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -661,6 +661,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `kv.get/set/del/expire/incr` | KV 存储（配 `redis.default` → 真 Redis，否则进程内存 KV） |
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
 | `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
+| `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -1221,6 +1222,35 @@ const head = await blob.readRange(key, 0, 4096);
 - 后端不支持这三件事时宿主回落（`copy` → `get`+`put`、`readRange` → `get` 全量切片），
   即 JS 侧永不因后端能力失败，但回落**字节进 V8**——local/s3 均原生支持，回落只是保险。
 - `src == dst` 是 no-op（`fs::copy` 同文件语义未定义，会截断文件，故显式挡掉）。
+
+### fs —— 本地文件（`fs:` 段启用，未配置调用即报错）
+
+一次性读写 API（移植自 Deno `deno_fs`），**无 fd/流式句柄**——op 内自开自关，
+池化 runtime 无跨请求 fd 泄漏面。与 `blob` 分工：blob 走对象存储（大文件/共享），
+fs 走服务进程本地磁盘（配置、模板、落盘导出等小对象）。
+
+| API | 签名 | 说明 |
+|---|---|---|
+| `fs.readFile` | `(path: string) => Promise<Uint8Array>` | 读二进制 |
+| `fs.readTextFile` | `(path: string) => Promise<string>` | 读 UTF-8 文本 |
+| `fs.writeFile` | `(path: string, data: Uint8Array) => Promise<void>` | 写二进制（覆盖） |
+| `fs.writeTextFile` | `(path: string, data: string) => Promise<void>` | 写文本（覆盖） |
+| `fs.mkdir` | `(path: string, opts?: {recursive?: boolean}) => Promise<void>` | 建目录 |
+| `fs.remove` | `(path: string, opts?: {recursive?: boolean}) => Promise<void>` | 删除 |
+| `fs.rename` | `(oldPath: string, newPath: string) => Promise<void>` | 移动/重命名 |
+| `fs.stat` | `(path: string) => Promise<FileInfo>` | 元数据（`size` / `mtime` / `isFile` / `isDirectory` …） |
+| `fs.readDir` | `(path: string) => Promise<AsyncIterable<DirEntry>>` | 列目录：迭代项 `{name, isFile, isDirectory, isSymlink}`（**不是字符串数组**）；迭代完自动关闭目录句柄 |
+
+路径规则：**相对路径解析到 jail 根（`fs.root`）之下**（不是进程 cwd）；绝对路径必须在
+root 内。越界（`..`、root 外绝对路径、root 内指向外部的 symlink）→ `NotCapable`；
+readonly 下写类 API → `NotCapable`；路径不存在 → `NotFound`。
+大文件不要走 fs（一次性 API 整体进内存）——GB 级请用 `blob`。
+
+```yaml
+fs:
+  root: ./data     # jail 根；相对路径按 config.yaml 所在目录解析（缺省 "data"）
+  readonly: false  # true = 写类 API 全拒
+```
 
 ### bus —— 订阅发布
 
@@ -1926,6 +1956,7 @@ cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执�
 | blob 直传超 `blob_upload_max_bytes`（v0.1.30） | 413 | `{"code":413,"msg":"upload too large","data":null}` |
 | blob Range 越界 / 空文件（v0.1.30） | 416 | `Content-Range: bytes */<len>` |
 | WS 握手未过守卫（v0.1.30） | 401 | HTTP 401，不升级 |
+| fs 未配置 `fs:` / 越出 `fs.root` / readonly 写（v0.1.53） | 500 | `{"code":500,"msg":"NotCapable: …","data":null}`（未捕获异常走 500 信封） |
 
 业务层常用码约定：400 入参不合法、404 资源不存在、401 未认证、403 已认证但无权、
 500 服务器内部错误。`json.fail` 的 `msg` 会原样进入信封，勿把内部细节（堆栈、SQL）
@@ -2460,6 +2491,16 @@ blob:
 块存在即启用 `blob.*` 全局与 `{base}/blob/{key}` 下载路由。命名多后端：
 `blob.backends.<name>` 各写一段（与平铺字段互斥，并存且平铺非默认 → 歧义报错），
 JS 侧 `blob("name")` 取用。
+
+### fs —— 本地文件系统
+
+```yaml
+fs:
+  root: ./data     # jail 根（相对 config 目录绝对化；不存在/非目录 → 启动 fail-fast）
+  readonly: false  # true = 写类 API 全拒（read 轴仍放行）
+```
+
+块存在即启用 `fs.*` 全局；缺省不启用（`fs.*` 抛 `NotCapable`，fail-closed）。
 
 ### broker —— 事件总线（三种 kind）
 

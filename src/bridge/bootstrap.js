@@ -96,6 +96,8 @@ import {
   op_ws_leave,
   op_ws_broadcast,
   op_ws_room_size,
+  op_fs_root,
+  op_fs_resolve,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -146,6 +148,47 @@ const { AbortController: ojAbortController } = core.loadExtScript(
   "ext:deno_web/03_abort_signal.js",
 );
 globalThis.AbortController = ojAbortController;
+
+// ----- fs: local file system (v0.1.53, deno_fs) -----
+// One-shot APIs only -- no fd handles (ops open/close within the call, so a
+// pooled runtime can never leak file descriptors across requests). Access is
+// jailed to the config `fs:` root by the PermissionsContainer injected in the
+// bridge_ext state closure; without an `fs:` section every call throws
+// PermissionDenied. TextEncoder/Decoder are prerequisites of the 30_fs.js
+// text helpers and are also useful to handlers, hence mounted globally.
+const { TextEncoder: ojTextEncoder, TextDecoder: ojTextDecoder } =
+  core.loadExtScript("ext:deno_web/08_text_encoding.js");
+globalThis.TextEncoder = ojTextEncoder;
+globalThis.TextDecoder = ojTextDecoder;
+const ojFs = core.loadExtScript("ext:deno_fs/30_fs.js");
+// Relative paths resolve against the jail root (deno's native semantics
+// resolve against the process cwd, which breaks the jail model). null root
+// (fs: section absent) -> paths pass through untouched; the ops themselves
+// then deny every access via the permissions container.
+const ojFsRoot = op_fs_root();
+// Every path goes through op_fs_resolve: best-effort canonicalize + jail
+// verdict (outside fs.root / fs: absent -> NotCapable), returning the
+// canonical absolute path for the deno op (whose own permission check is
+// the second line of defense).
+const ojFsResolve = (p) => {
+  if (typeof p !== "string") return p;
+  if (p.charAt(0) !== "/") {
+    if (!ojFsRoot) return p; // unconfigured: pass through, op check denies
+    p = ojFsRoot + "/" + p;
+  }
+  return op_fs_resolve(p);
+};
+globalThis.fs = {
+  readFile: (p, o) => ojFs.readFile(ojFsResolve(p), o),
+  readTextFile: (p, o) => ojFs.readTextFile(ojFsResolve(p), o),
+  writeFile: (p, d, o) => ojFs.writeFile(ojFsResolve(p), d, o),
+  writeTextFile: (p, d, o) => ojFs.writeTextFile(ojFsResolve(p), d, o),
+  mkdir: (p, o) => ojFs.mkdir(ojFsResolve(p), o),
+  remove: (p, o) => ojFs.remove(ojFsResolve(p), o),
+  rename: (a, b) => ojFs.rename(ojFsResolve(a), ojFsResolve(b)),
+  stat: (p) => ojFs.stat(ojFsResolve(p)),
+  readDir: (p) => ojFs.readDir(ojFsResolve(p)),
+};
 
 // ----- json: unified envelope + response headers -----
 // BigInt-safe JSON.stringify (v0.1.22): serde_v8 hands i64 beyond 2^53-1 to JS as a

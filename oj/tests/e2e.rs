@@ -1352,3 +1352,78 @@ async fn given_schema_validation_off_when_request_violates_then_passes() {
     h.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------- fs 轴（v0.1.53）：config fs: 段端到端 ----------
+
+/// 独立临时项目起服务：config 带 fs: 段（root = <tmp>/data），两个 handler 经
+/// fs 写/读 note.txt。返回 (addr, handle, tmp)。
+async fn boot_fs(readonly: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-fs-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src/fsdemo")).unwrap();
+    std::fs::create_dir_all(tmp.join("data")).unwrap();
+    std::fs::write(
+        tmp.join("src/fsdemo/manifest.yaml"),
+        "name: fsdemo\ndesc: fs e2e\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src/fsdemo/api.ts"),
+        "async function post() {\n  await fs.writeTextFile(\"note.txt\", \"hello-e2e\");\n  json.ok({ done: true });\n}\nasync function get() {\n  json.ok({ t: await fs.readTextFile(\"note.txt\") });\n}\nexport default { get, post };\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.join("seed.sql"), "").unwrap();
+    let mut cfg = Config::default();
+    cfg.server.port = 0;
+    let now = serve::test_support::now_secs();
+    serve::test_support::write_cert_into(
+        &mut cfg.server,
+        &tmp,
+        now.saturating_sub(3600),
+        now + 365 * 86_400,
+    );
+    cfg.db.insert("default".into(), "sqlite::memory:".into());
+    cfg.fs = Some(only_js::config::FsSection {
+        root: "data".into(),
+        readonly,
+    });
+    let (addr, h) = serve_cmd::start(cfg, &tmp, tmp.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    (addr, h, tmp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_read_write_end_to_end() {
+    let _g = lock();
+    let (addr, h, tmp) = boot_fs(false).await;
+    let (st, v) = req(addr, "POST", "/v1/api/fsdemo/", None).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["code"], 0, "{v}");
+    assert_eq!(v["data"]["done"], true, "{v}");
+    // 落盘证据：jail 根（config_dir/data）下真实存在该文件。
+    assert_eq!(
+        std::fs::read_to_string(tmp.join("data/note.txt")).unwrap(),
+        "hello-e2e"
+    );
+    let (_, v) = req(addr, "GET", "/v1/api/fsdemo/", None).await;
+    assert_eq!(v["data"]["t"], "hello-e2e", "{v}");
+    h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_readonly_denies_write_end_to_end() {
+    let _g = lock();
+    let (addr, h, tmp) = boot_fs(true).await;
+    let (st, v) = req(addr, "POST", "/v1/api/fsdemo/", None).await;
+    assert_eq!(st, 500, "未捕获异常走 500 信封: {v}");
+    assert_ne!(v["code"], 0, "{v}");
+    assert!(v["msg"].to_string().contains("NotCapable"), "{v}");
+    // 写确实没落盘。
+    assert!(!tmp.join("data/note.txt").exists());
+    h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

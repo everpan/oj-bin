@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "async-trait",
  "axum",
@@ -4504,6 +4504,8 @@ dependencies = [
  "deno_core",
  "deno_error",
  "deno_fetch",
+ "deno_fs",
+ "deno_io",
  "deno_net",
  "deno_permissions",
  "deno_tls",
