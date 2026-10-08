@@ -42,6 +42,29 @@ struct TestResult {
     error: Option<String>,
 }
 
+/// 递归收集 dir 下 *.test.ts（`_` 前缀目录跳过——私有/共享代码不放用例）。
+fn collect_test_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.is_dir() {
+            let private = p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('_'))
+                .unwrap_or(false);
+            if !private {
+                collect_test_files(&p, out)?;
+            }
+        } else if p
+            .file_name()
+            .map(|n| n.to_string_lossy().ends_with(".test.ts"))
+            .unwrap_or(false)
+        {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
 /// 入口：解析配置 → 钉线程起 runtime → 跑用例 → 返回退出码。
 pub fn run(a: TestArgs) -> Result<i32, String> {
     let (cfg, config_dir, dir, ts, base) =
@@ -65,17 +88,11 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
     let tests_path = std::fs::canonicalize(&tests_path)
         .map_err(|e| format!("tests dir not found: {} ({e})", tests_path.display()))?;
 
-    // 收集 *.test.ts（按名排序，稳定顺序）。
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&tests_path)
-        .map_err(|e| format!("read {}: {e}", tests_path.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.extension().map(|x| x == "ts").unwrap_or(false)
-                && p.file_name()
-                    .map(|n| n.to_string_lossy().ends_with(".test.ts"))
-                    .unwrap_or(false)
-        })
-        .collect();
+    // 收集 *.test.ts（递归；`_` 前缀目录跳过——与路由私有目录约定一致；
+    // 按路径全排序，稳定顺序）。
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_test_files(&tests_path, &mut files)
+        .map_err(|e| format!("read {}: {e}", tests_path.display()))?;
     files.sort();
     if files.is_empty() {
         return Err(format!("no *.test.ts found in {}", tests_path.display()));
@@ -413,6 +430,33 @@ mod tests {
             });
         }
         s
+    }
+
+    #[test]
+    fn given_nested_test_files_when_collect_then_recursive_and_private_dirs_skipped() {
+        // 递归收集（曾只扫首层，子目录用例静默丢失）；`_` 前缀目录跳过（私有/共享代码）。
+        let d = std::env::temp_dir().join(format!("oj-testcmd-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("nested/deeper")).unwrap();
+        std::fs::create_dir_all(d.join("_shared")).unwrap();
+        std::fs::write(d.join("a.test.ts"), "").unwrap();
+        std::fs::write(d.join("nested/b.test.ts"), "").unwrap();
+        std::fs::write(d.join("nested/deeper/c.test.ts"), "").unwrap();
+        std::fs::write(d.join("nested/helper.ts"), "").unwrap();
+        std::fs::write(d.join("_shared/z.test.ts"), "").unwrap();
+        let mut out = Vec::new();
+        collect_test_files(&d, &mut out).unwrap();
+        out.sort();
+        let names: Vec<_> = out
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a.test.ts", "b.test.ts", "c.test.ts"],
+            "{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

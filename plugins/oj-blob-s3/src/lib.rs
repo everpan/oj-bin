@@ -153,7 +153,7 @@ impl BlobPluginState {
             .await
             .map_err(|e| format!("blob s3 sign: {e}"))?
             .to_string();
-        Ok(format!(r#"{{"url":{u:?}}}"#).into_bytes())
+        Ok(upload_url_envelope(&u))
     }
 
     // ---- ABI 10：流式上传（multipart：每满 8 MiB 一个 part；finish 收尾 part + complete；
@@ -298,6 +298,12 @@ impl BlobPluginState {
         let _ = handle;
         Ok(b"".to_vec())
     }
+}
+
+/// upload_url 响应信封。必须走 serde_json 构造：URL 含非 ASCII 时 Rust `{:?}` 产出
+/// `\u{…}` 转义（非 JSON），宿主 `JSON.parse` 直接炸。
+fn upload_url_envelope(u: &str) -> Vec<u8> {
+    serde_json::json!({ "url": u }).to_string().into_bytes()
 }
 
 /// 配置校验 + 建 store（bucket/region 必填 fail-fast；endpoint/access_key/secret_key 可选）。
@@ -536,7 +542,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // worker 只跑 IO 转发（object_store 自管连接），2 足够；缺省 = num_cpus 全核白占线程。
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("oj-blob-s3 tokio runtime")
@@ -607,6 +615,16 @@ mod tests {
             assert!(!valid_key(bad), "{bad}");
         }
         assert!(valid_key("a/b.png"));
+    }
+
+    /// upload_url 信封必须是**合法 JSON**：URL 含非 ASCII（Rust `{:?}` 会产出 `\u{…}`
+    /// 转义，非 JSON——宿主 JSON.parse 炸，即本信封改走 serde_json 的原因）。
+    #[test]
+    fn upload_url_envelope_is_valid_json_for_non_ascii_urls() {
+        let u = "https://b.s3.amazonaws.com/oj/键.png?X-Amz-Signature=abc&x=%E9%94%AE";
+        let v: serde_json::Value =
+            serde_json::from_slice(&upload_url_envelope(u)).expect("must be valid JSON");
+        assert_eq!(v["url"], u, "{v}");
     }
 
     /// 真实 s3 e2e（env-gated）：`OJ_TEST_S3 = endpoint|bucket|region|access|secret|path_style`

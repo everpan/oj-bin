@@ -42,7 +42,7 @@ oj-cert renew -k <private.pem> [-o <dir>] [--days 365] [--exp <unix>]
 - `--days` 是**有效天数**（`days_to_expiry = days * 86400`），避免把天数误当秒。
 - `gen` 是 edition 2024 保留字，公开名仍是 `gen`，定义写作 `r#gen`。
 - `renew` 只写新 `cert.jws`（公钥不变）→ 配合 server 证书热重载免重启续期。
-- 与 `server/src/certificate.rs` 契约一致：`header {"alg":"RS256","typ":"JWT"}` +
+- 与 `serve/src/certificate.rs` 契约一致：`header {"alg":"RS256","typ":"JWT"}` +
   payload `{nbf, exp}` + RS256。
 - 测试 `tools/oj-cert/tests/cert_gen.rs`：用 rsa 独立解码 + 验签（与生成路径不对称，
   可捕格式错误），含拒绝覆盖已存在私钥、`renew` 拒绝非法 exp 等负路径。

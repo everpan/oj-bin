@@ -489,7 +489,7 @@ globalThis.tasks = {
 };
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
-// send: string -> text frame; Uint8Array/ArrayBuffer -> binary frame (opcode 0x2, v0.1.16).
+// send/broadcast: string -> text frame; Uint8Array/ArrayBuffer -> binary frame (opcode 0x2, v0.1.16).
 // rooms (v0.1.30): same-process fanout. join/leave need a ws handler context (sess id);
 // broadcast also works from HTTP handlers (conn = 0 -> exclude nobody); echo to self is
 // the caller's job (socket.io semantics). roomSize is callable anywhere.
@@ -501,7 +501,14 @@ globalThis.ws = {
   close: () => op_ws_frame_close(),
   join: (room) => op_ws_join(String(room), wsConnId(true)),
   leave: (room) => op_ws_leave(String(room), wsConnId(true)),
-  broadcast: (room, data) => op_ws_broadcast(String(room), String(data), wsConnId(false)),
+  broadcast: (room, data) =>
+    typeof data === "string"
+      ? op_ws_broadcast(String(room), data, wsConnId(false))
+      : op_ws_broadcast_bin(
+          String(room),
+          data instanceof ArrayBuffer ? new Uint8Array(data) : data,
+          wsConnId(false),
+        ),
   roomSize: (room) => op_ws_room_size(String(room)),
 };
 
@@ -766,7 +773,10 @@ globalThis.DB = function (name) {
           await op_db_tx_commit(name);
           return out;
         } catch (e) {
-          await op_db_tx_rollback(name);
+          // Rollback is best-effort: its own failure must never mask the business error.
+          try {
+            await op_db_tx_rollback(name);
+          } catch (_) {}
           throw e;
         }
       },

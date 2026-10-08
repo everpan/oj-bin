@@ -180,6 +180,18 @@ pub(crate) fn op_ws_broadcast(
     hub().broadcast(&room, conn as u64, WsSend::Text(data))
 }
 
+/// ws.broadcast(room, Uint8Array)：二进制帧扇出（与 ws.send 的 binary 臂对称，v0.1.16 帧型）。
+#[op2]
+pub(crate) fn op_ws_broadcast_bin(
+    state: &mut OpState,
+    #[string] room: String,
+    #[buffer] data: JsBuffer,
+    conn: u32,
+) -> u32 {
+    let _ = state;
+    hub().broadcast(&room, conn as u64, WsSend::Binary(data.to_vec()))
+}
+
 /// ws.roomSize(room)：房间成员数（任意上下文可调用）。
 #[op2(fast)]
 pub(crate) fn op_ws_room_size(state: &mut OpState, #[string] room: String) -> u32 {

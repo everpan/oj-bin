@@ -259,9 +259,9 @@ tables:
 |---|---|
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
-| `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物） |
-| `oj build --check` | 只跑结构检查 S001–S007 不落盘（CI 门禁） |
-| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43） |
+| `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
+| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由） |
+| `oj build --check` | 只跑结构检查 S001–S008 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
 三条数据类命令（`migrate` / `test fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
@@ -928,7 +928,8 @@ await db.tx(async (tx) => {
 });
 ```
 
-- 回调正常返回 → **提交**；throw / reject → **回滚**并把原错误抛给 handler。
+- 回调正常返回 → **提交**；throw / reject → **回滚**并把原错误抛给 handler（v0.1.52 起
+  rollback 本身失败也不掩盖业务异常，始终抛 handler 的原始错误）。
 - `tx` 与 `db` 的 `query / exec / table / fromJSON` 及条件工厂（`leaf/and/or/not`）
   **同签名**——事务内自动走同一连接，无需改写其余代码。注意回调对象不含 `tx`，嵌套事务被拒。
 - 每请求**至多一个**活跃事务：嵌套 `db.tx` 报错 `transaction already active`；
@@ -1530,7 +1531,7 @@ if (r.ok) {
 | `ws.close` | `close(): void` | 结束当前连接 |
 | `ws.join` | `join(room: string): void` | 当前连接加入房间（v0.1.30；仅 ws handler 内，连接身份自动取） |
 | `ws.leave` | `leave(room: string): void` | 当前连接离开房间（v0.1.30；仅 ws handler 内；断连自动摘除，无需兜底） |
-| `ws.broadcast` | `broadcast(room: string, data: string): number` | 房间扇出（v0.1.30）：**除己**送达成员数（socket.io 语义，发送者要回声自己在 JS 里发）；HTTP handler 也可调（无连接身份 = 不排除任何人） |
+| `ws.broadcast` | `broadcast(room: string, data: string \| ArrayBuffer \| Uint8Array): number` | 房间扇出（v0.1.30）：**除己**送达成员数（socket.io 语义，发送者要回声自己在 JS 里发）；HTTP handler 也可调（无连接身份 = 不排除任何人）。v0.1.52 起 data 与 `ws.send` 对称：string → Text 帧、ArrayBuffer/Uint8Array → Binary 帧；其余类型**报错**而非发垃圾帧 |
 | `ws.roomSize` | `roomSize(room: string): number` | 房间当前成员数（v0.1.30；presence 最小原语，任意上下文可调） |
 
 房间是**进程内**单例 hub；跨实例扇出仍走 `bus.publish`。
@@ -1902,7 +1903,8 @@ cron 文件是**脚本式**的：到点整模块跑一次（顶层 await 即执�
 
 统一信封 `{code, msg, data}`；**HTTP 状态码 = `code`**（`code=0` → 200；
 `code<=0` 映射 500）。业务错误直接 `json.fail(400, "…")` 返回对应状态码，
-无需另设错误通道。
+无需另设错误通道。`code > 65535` 时 HTTP 状态 **clamp 到 65535**（v0.1.52 起，
+此前按位回绕成错值）；信封 body 里的 `code` 保留全精度。
 
 | 场景 | HTTP | 信封示例 |
 |---|---|---|
@@ -2140,7 +2142,8 @@ auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 
 ### L1：`oj test`
 
 目录约定：测试文件放 `tests/*.test.ts`（目录由 `-t/--tests` 指定，相对 config 所在目录，
-默认 `tests`）。
+默认 `tests`）。v0.1.52 起**递归扫描**子目录（`_` 前缀目录跳过，其余按路径排序收集）——
+此前只扫首层，子目录里的 `*.test.ts` 会被静默忽略。
 
 ```bash
 ./bin/oj test -c sample/config.yaml -d sample/src                 # human 摘要

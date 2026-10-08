@@ -9,7 +9,7 @@
 | 成员 | 类型 | 职责 |
 |---|---|---|
 | `.`（`only-js`） | lib | 核心：JS↔Rust bridge + 各后端轴 + 配置模型 |
-| `server` | lib | axum HTTP 服务（feature `test-support` 供测试复用） |
+| `serve` | lib | axum HTTP 服务（feature `test-support` 供测试复用） |
 | `oj` | lib + bin | CLI（`serve`/`build`/`test`（含 `test fixture` 子命令）/`migrate`/`schema diff`/`secret`（keygen/seal/open）/`exec`/`openapi`）；bin+lib 双 target 便于 `oj/tests/` 触达装配层 |
 | `oj-plugin-ffi` | lib | 宿主与插件共享的 C-ABI 契约（`ABI_VERSION = 11`） |
 | `plugins/oj-*`（10 个） | cdylib | es / db-mysql / db-postgres / blob-s3 / bus-kafka / bus-rabbitmq / kv-redis / auth / mail / ldap |
@@ -26,7 +26,7 @@
 ┌─ 装配层（oj/）────────────────────────────────────────────┐
 │  config → 插件 → 开库 → 迁移/种子 → schema 归属图 → 路由表      │
 └───────────────────────────────────────────────────────────┘
-┌─ HTTP 层（server/）───────────────────────────────────────┐
+┌─ HTTP 层（serve/）───────────────────────────────────────┐
 │  handle() 前置管线（证书/租户/鉴权/上传）→ RouteTable → actor   │
 └───────────────────────────────────────────────────────────┘
 ┌─ 运行时层（src/bridge/）──────────────────────────────────┐
@@ -44,8 +44,8 @@
 
 ## 3. 请求全链路（一次 HTTP 调用发生了什么）
 
-1. axum 收到请求，命中 `fallback(any(handle))`（`server/src/lib.rs:128`）。
-2. **证书门禁**：`GET` 且状态为 `Expired`/`Grace` → 403（`server/src/lib.rs:272-290`）。
+1. axum 收到请求，命中 `fallback(any(handle))`（`serve/src/lib.rs:128`）。
+2. **证书门禁**：`GET` 且状态为 `Expired`/`Grace` → 403（`serve/src/lib.rs:272-290`）。
 3. **blob 下载**：`GET {base}/blob/{key}` → `BlobBackend::serve`，local 直出 / s3 302。
 4. **`RouteTable.lookup`**：四态 `Hit` / `Conflict`(500) / `MethodNotAllowed`(405) / `NotFound`。
 5. dev 兜底目录镜像（`Routes::resolve`，且被 `.route` 替换过的方法不复活）。
@@ -82,7 +82,7 @@
 | 红线 | 落点 |
 |---|---|
 | SQL 动态标识符只来自 `SchemaRegistry` 白名单；值只走绑定参数 | `src/bridge/guard.rs`、`query.rs`、`registry.rs` |
-| `JsRuntime` 是 `!Send`：池与持有者钉在 `current_thread`；inspector/WS 用 `spawn_local` | `src/bridge/runtime.rs`、`server/src/actor.rs`、`server/src/ws.rs` |
+| `JsRuntime` 是 `!Send`：池与持有者钉在 `current_thread`；inspector/WS 用 `spawn_local` | `src/bridge/runtime.rs`、`serve/src/actor.rs`、`serve/src/ws.rs` |
 | 所有插件 profile 必须 `panic = "unwind"` | 根 `Cargo.toml` `[profile.release]`；`oj_plugin_entry!` 内建 `catch_unwind` |
 | `bootstrap.js` 必须 7-bit ASCII | `src/bridge/bootstrap.js` |
 | 失败的 runtime 一律丢弃，不归还池 | `src/bridge/mod.rs:386`、`runtime.rs:103-113` |
@@ -106,8 +106,8 @@
 |---|---|
 | 给 JS 加一个全局/方法 | `src/bridge/bootstrap.js` + 对应 `op_*`（`src/bridge/*.rs`）+ `bridge_ext` ops 表（`src/bridge/mod.rs:194`） |
 | 加一个配置字段 | `src/config.rs` +（需要时）`oj/src/app.rs` 装配 + `docs/user-manual.md` |
-| 改请求前置逻辑 | `server/src/lib.rs` 的 `handle` / `Pipeline` |
-| 改路由匹配/冲突 | `server/src/routes.rs` |
+| 改请求前置逻辑 | `serve/src/lib.rs` 的 `handle` / `Pipeline` |
+| 改路由匹配/冲突 | `serve/src/routes.rs` |
 | 加一个后端轴 | `oj-plugin-ffi/src/<axis>.rs` + `AXES`（`src/bridge/plugin_loader.rs:432`）+ `probe_axes` + 插件 crate |
 | 改构建产物 | `oj/src/build_cmd.rs`、`pack.rs`、`manifest.rs` |
 | 改迁移/种子/schema | `oj/src/migrate.rs`、`seed.rs`、`schema.rs`、`checks.rs` |

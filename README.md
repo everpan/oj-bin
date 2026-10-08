@@ -118,8 +118,8 @@ through `bin/oj`:**
 | `./bin/oj serve -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
 | `./bin/oj build -d <src> -o <dist>` | build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
 | `./bin/oj test -c <config>` | run `*.test.ts` in-process (no server needed) |
-| `./bin/oj exec <file.ts\|js> -c <config>` | run one ts/js script with the full backend injected — one-off fixes / reconciliation / job prototypes (v0.1.29, see `docs/exec-integration.md`) |
-| `./bin/oj migrate / fixture / schema diff` | migrations / demo data / schema diff (see `docs/user-manual.md`) |
+| `./bin/oj exec <file.ts\|js / -e <code> / --repl> -c <config>` | run ts/js with the full backend injected — file / inline code / REPL (v0.1.50), one-off fixes / reconciliation / job prototypes (see `docs/exec-integration.md`) |
+| `./bin/oj migrate / test fixture / schema diff` | migrations / demo data / schema diff (see `docs/user-manual.md`) |
 
 - **Portable**: `bin/oj` + `bin/plugins/<triple>/` is the self-contained distribution
   unit — the target machine needs no Rust / cargo / Node toolchain; copy the tree and
@@ -174,9 +174,15 @@ Responses are uniformly the `{code, msg, data}` envelope. Injected globals:
 | `bus` | pub/sub (`publish` / `subscribe`), broadcast across instances |
 | `es` | Elasticsearch (`search` / `index` / `del`) |
 | `Mail(key)` / `mail` | email delivery (`send` / `sendSync` / `enqueue` / `result` / `sendRaw`); `smtp:` block + oj-mail plugin |
+| `LDAP(key)` / `ldap` | directory lookup / bind auth; `ldap:` block + oj-ldap plugin |
+| `Kafka(name)` / `RabbitMQ(name)` | named MQ clients (`kafkas:` / `rabbits:` blocks); task-pool consume/commit |
 | `ws` | WebSocket frame context |
-| `fetch` | browser-compatible Fetch |
+| `fetch` | WHATWG Fetch (deno_fetch: streaming body / AbortController) |
 | `log` | structured logging (tracing) |
+| `cert` / `jwt` / `bcrypt` / `crypto` | signing, tokens, hashing, crypto primitives |
+| `oidc` | OIDC RP helpers (see `docs/oidc-integration.md`) |
+| `tasks` | long-task pool registration (`tasks:` block) |
+| `vars` | deploy-time constants (`vars:` block, fail-closed) |
 | `plugins()` | introspection of loaded plugins |
 | `finish()` | end the session without writing a response |
 
@@ -265,8 +271,8 @@ oidc:         # optional: built-in OP (idp) + RP — standard OIDC code flow + P
 ```
 only-js/
   src/                  core library: src/bridge/ (JS↔Rust bridge, backend axes) + src/config.rs
-  oj/                  CLI binary: server / build / test subcommands (orchestration entry)
-  server/              axum HTTP service: route lookup → run handler → write back Capture
+  oj/                  CLI binary: serve / build / test subcommands (orchestration entry)
+  serve/              axum HTTP service: route lookup → run handler → write back Capture
   oj-plugin-ffi/       C-ABI contract shared by host and plugins (strict ABI_VERSION gate)
   plugins/             cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
                        / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth / oj-mail
@@ -276,7 +282,7 @@ only-js/
   docs/                design and manuals
 ```
 
-**Request path**: HTTP request → `server` catch-all routing (incl. built-in `/auth/*`,
+**Request path**: HTTP request → `serve` catch-all routing (incl. built-in `/auth/*`,
 `/blob/{key}`) → `RouteTable.lookup` → check out a `JsRuntime` from `RuntimePool` and reset
 per-request state → run the matching method of `api.ts` (transpiled first in dev mode) →
 capture the `{code,msg,data}` envelope → write back the response.
@@ -306,6 +312,7 @@ cargo xtask bin                                 # build oj and copy into bin/oj
 cargo xtask plugin <name>                       # build plugin and copy into bin/plugins/<triple>/
 cargo xtask plugin <name> --check               # plugin preflight (ABI / identity / semver / symbols)
 cargo xtask build                               # build oj + all plugins into bin/
+cargo xtask smoke --bin bin/oj                  # release gate: minimal `oj build` with build-machine JS sources hidden
 ```
 
 For async tests use `tokio::test(flavor = "current_thread")` — `JsRuntime` is `!Send`.
@@ -330,6 +337,7 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 
 | Doc | Content |
 |---|---|
+| `docs/devkit/` | **对外 JS API 手册（权威）**：api-manual / scenarios / SKILL / README（`bin/devkit/` 随构建归置） |
 | `docs/modules/` | **模块说明索引**（每个 crate / 子系统的职责、边界、文件地图） |
 | `docs/review-2026-09-06.md` | 全模块代码与架构审查（含 P0/P1 清单与整改记录） |
 | `docs/archive/` | 归档的历史方案/预案（**不描述当前实现**，附「现在该读哪篇」指路表） |
@@ -340,6 +348,9 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | `docs/route-params-design.md` | path-param routing design |
 | `docs/testing.md` | testing conventions |
 | `docs/migration.md` | migration runbook (schema.yaml / migrations / ledger / guards) |
+| `docs/db-guide.md` / `docs/tenant-guide.md` | data layer / multi-tenancy |
+| `docs/secrets.md` | sealed credentials (`ENC[...]`, `oj secret`) |
+| `docs/oidc-integration.md` / `docs/ldap-integration.md` / `docs/mail-smtp.md` / `docs/mq-tasks.md` | integration manuals |
 | `docs/ops-manual.md` | operations |
 | `docs/exec-integration.md` | `oj exec` integration manual (run ts/js scripts with the full backend, v0.1.29) |
 | `docs/benchmarks.md` | performance data |

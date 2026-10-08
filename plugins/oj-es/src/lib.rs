@@ -22,12 +22,19 @@ struct EsClientInner {
     http: reqwest::Client,
 }
 
+/// ES 黑洞防护：无超时 = 插件任务+socket 永久悬挂，宿主 408 后仍逐请求泄漏。
+/// 连接 5s（拒绝/不可达快速失败）、请求 30s（覆盖慢查询/重批量的合理上限）。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl EsClientInner {
     fn new(endpoint: String) -> Self {
         Self {
             endpoint,
             http: reqwest::Client::builder()
                 .no_proxy()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
         }
@@ -239,7 +246,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 
 /// 插件自建 tokio runtime（跨 FFI 不共享宿主 tokio，规避 TLS 双副本，S.2 定稿）。
 fn runtime() -> tokio::runtime::Runtime {
+    // worker 只跑 IO 转发（reqwest 自管连接池），2 足够；缺省 = num_cpus 全核白占线程。
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("oj-es tokio runtime")

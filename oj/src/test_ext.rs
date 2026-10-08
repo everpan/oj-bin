@@ -241,43 +241,48 @@ pub async fn op_client_ws_next(
     #[bigint] timeout_ms: u64,
 ) -> Result<Option<ClientWsNext>, JsErrorBox> {
     let mut c = take_conn(&state, id)?;
-    let wait = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), c.next()).await;
-    let res = match wait {
-        // 超时：流放回，返回 None（无帧，不视为关闭）。
-        Err(_elapsed) => {
-            put_conn(&state, id, c);
-            return Ok(None);
-        }
-        // 流结束（对端关闭）：不再放回。
-        Ok(None) => {
-            state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
-            return Ok(Some(ClientWsNext {
-                frame: false,
-                binary: false,
-            }));
-        }
-        Ok(Some(Err(e))) => {
-            state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
-            return Err(JsErrorBox::generic(format!("client.ws recv: {e}")));
-        }
-        Ok(Some(Ok(msg))) => match msg {
-            Message::Text(t) => (false, t.as_bytes().to_vec()),
-            Message::Binary(b) => (true, b.to_vec()),
-            // Ping/Pong 控制帧直接继续等（timeout 已耗掉一部分，简化：靠上层重试）。
-            Message::Close(_) => {
+    // Ping/Pong 控制帧直接继续等：tokio-tungstenite 读到 Ping 会自动排队 Pong 回显，
+    // 对端 keepalive 不应打断等帧；循环重试，每次满 timeout_ms 窗口。
+    let res = loop {
+        let wait =
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), c.next()).await;
+        match wait {
+            // 超时：流放回，返回 None（无帧，不视为关闭）。
+            Err(_elapsed) => {
+                put_conn(&state, id, c);
+                return Ok(None);
+            }
+            // 流结束（对端关闭）：不再放回。
+            Ok(None) => {
                 state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
                 return Ok(Some(ClientWsNext {
                     frame: false,
                     binary: false,
                 }));
             }
-            other => {
-                put_conn(&state, id, c);
-                return Err(JsErrorBox::generic(format!(
-                    "client.ws: unexpected frame {other:?}"
-                )));
+            Ok(Some(Err(e))) => {
+                state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
+                return Err(JsErrorBox::generic(format!("client.ws recv: {e}")));
             }
-        },
+            Ok(Some(Ok(msg))) => match msg {
+                Message::Text(t) => break (false, t.as_bytes().to_vec()),
+                Message::Binary(b) => break (true, b.to_vec()),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Close(_) => {
+                    state.borrow_mut().borrow_mut::<ClientWs>().last.remove(&id);
+                    return Ok(Some(ClientWsNext {
+                        frame: false,
+                        binary: false,
+                    }));
+                }
+                other => {
+                    put_conn(&state, id, c);
+                    return Err(JsErrorBox::generic(format!(
+                        "client.ws: unexpected frame {other:?}"
+                    )));
+                }
+            },
+        }
     };
     let (binary, bytes) = res;
     {

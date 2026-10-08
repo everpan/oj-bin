@@ -45,7 +45,7 @@ curl 'http://localhost:9778/v1/api/user/account/?id=1'
 ```
 oj serve  [-c config.yaml] [-b /v1/api] [--api-path <src|dist>] [--app-path <dir>] [--cert-path <jws>] [--key-path <pem>] [--daemon]
 oj build   [module] [-c config.yaml] [-d src] [-o dist] [--no-minify] [--check]
-oj exec    <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
+oj exec    [<file> | -e <code> | --repl] [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
 oj test fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
 oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
@@ -65,7 +65,7 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障用） |
 | `--cert-path` | 无 | （server）JWS 证书路径，覆盖 `server.certificate_path`（证书必配，此参数可满足） |
 | `--key-path` | 无 | （server）PEM 公钥路径，覆盖 `server.public_key_path`（证书必配，此参数可满足） |
-| `--check` | 关 | （build）只跑结构检查（S002–S008）不写任何产物；有违规 exit 1（CI 门禁） |
+| `--check` | 关 | （build）只跑结构检查（S001–S008）不写任何产物；有违规 exit 1（CI 门禁） |
 | `--baseline` | 关 | （migrate）存量库接入门：≤head 的迁移全部记为已应用而不执行 |
 | `--module` | 无 | （migrate / test fixture）只处理指定模块 |
 | `--db` | `default` | （migrate / fixture / schema diff）目标库 = config `db:` 段的 profile 名；未声明则 fail-fast（不回落 default）。多库须逐库各跑一遍。exec 同名参数为**默认库重定向**（同 `oj test`，语义不同） |
@@ -92,12 +92,14 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
   - 跨模块相对导入（如 order 引 `../../user/_shared/validate`）构建期改写为指向
     目标模块版本目录的相对路径；目标模块未构建过则报错（先 `oj build user`）。
   - 产出确定性 tgz：`dist/<module>-<version>.tgz`（同输入字节一致），用于整体发布。
-  - **构建即检查**：build 内嵌结构检查 S002–S008（违规 fail build，一次报全）；
+  - **构建即检查**：build 内嵌结构检查 S001–S008（违规 fail build，一次报全）；
     `--check` 只校验不落盘（CI 门禁）。规则见 §5.3。
 - `oj migrate`：把各模块 `migrations/*.sql` 按序应用到目标库（默认 `db.default`，`--db`
   换 profile；账本表 `_oj_migrations` 用 module 列区分模块），并对声明 `schema.yaml` 的模块做
   收敛（§5.1）；`--baseline` 用于存量库接入（§5.2）。发布流程 = `build && migrate && server`。
 - `oj test fixture`：灌入各模块 `fixtures/` 演示数据（dev/test 用；不进发布产物、不记账本）。
+  v0.1.52 起有幂等门禁：非幂等 INSERT（判据同 S006）灌入前报错，改
+  `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌。
   是 `oj test` 的子命令；目标库同样由 `--db` 选定。
 - `oj schema diff`：声明式 schema 与实库**只读对账**：D001 缺表/缺列/多列（改名或删除
   须手写迁移）/缺索引，D002 实库有而未声明的表。有漂移打印报告并 exit 1（发布前巡检）。
@@ -137,6 +139,20 @@ server:
                            # | verify（release 默认，账本落后拒启，先 oj migrate）| off
   ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）
                            # | deny（未声明 deps 的跨模块表访问拒绝执行）
+  static_sites:            # 多静态站点（v0.1.27）：与主站点共存；前缀重复启动报错
+    # - prefix: "/site2"   #   最长前缀命中、站内 miss 不跨站、仅 GET/HEAD
+    #   path: "site2-dist" #   目录相对 config 所在目录
+    #   headers: { X-Frame-Options: "DENY" }   # 站点级响应头，覆盖全局同名（v0.1.30）
+  # max_upload_bytes: 10485760          # handler 面上传上限（字节，超出 413；axum 硬顶 ×2）
+  # blob_upload_max_bytes: 1073741824   # PUT {base}/blob/{key} 直传上限（默认 1 GiB，不经 handler）
+  # app_spa_fallback: false             # SPA 深链回落（v0.1.20；默认 false——404 不静默变 200）
+  # html_meta: "__meta"                 # 路由感知 meta 目录（相对 app_path；送 HTML 前注入 <head>）
+  # html_meta_handler: "/v1/api/html-meta"  # 动态 meta 源（v0.1.25；须命中一个 GET 路由，拼错拒启）
+  # html_cache_control: "no-cache"      # 仅 HTML 响应的 Cache-Control（v0.1.25）
+  # response_headers:                   # 全局自定义响应头（v0.1.30；动态/静态/blob 都补，只补缺不覆盖）
+  #   X-Content-Type-Options: "nosniff"
+  # route_timeouts:                     # 路由级超时覆盖（v0.1.30；pattern 语义同 anonymous_paths）
+  #   - { pattern: "/report/**", timeout: "5m" }
 ws:                        # WebSocket 运行时（段缺省 = 全默认）
   max_connections: 1000    # 全局并发连接闸门：超限 upgrade 返 503；0 = 不限
   workers_per_route: 2     # 每路由无状态 Worker 数（共享执行该路由全部连接的帧）
@@ -145,6 +161,11 @@ db:
   default: "sqlite://db.sqlite"   # 命名库实例，可多库混用
   # analytics: "mysql://user:pass@127.0.0.1:3306/app"   # 需 oj-db-mysql 插件
   # warehouse: "postgres://127.0.0.1:5432/app"          # 需 oj-db-postgres 插件
+db_trace:                  # SQL 执行追踪（v0.1.51；顶层段，不能塞进 db:）
+  # enabled: true          # 缺省 = dev 自动开 / release 自动关，可显式强制
+  # redact_params: true    # 参数脱敏（默认 true = 只记参数个数；false = 明文，仅服务端日志）
+  # slow_ms: 0             # 慢查询阈值（毫秒；0 = 全记；只过滤日志与画像 slow 列表）
+  # to_log: true           # 结构化日志 target="oj::sql"（release 强开时注意 SQL 文本出日志面）
 redis:
   # default: "redis://127.0.0.1:6379/1"   # 注释/删除 = 内存 KV；配置即真连，需 oj-kv-redis 插件
 es:
@@ -189,6 +210,34 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
   # dir: "tasks"              # 任务池目录（相对 API 目录：dev=src/、release=dist/；oj build 镜像）
   # max: 64                   # 任务数上限（超出拒启；每任务=1 线程+1 V8 runtime）
   # stop_grace_secs: 30       # 停机宽限：flag 置位后任务自然收场的窗口，到期看门狗强杀
+auth:                        # 可选：JWT 鉴权（§9）；缺段 = 不挂 Bearer 守卫与内置 /auth/*
+  # jwt_secret: "change-me"          # 生产必改；空串启动 fail-fast；可写 ENC[...] 密封值
+  # signing_method: "HS256"          # HS256 | HS384 | HS512
+  # access_token_duration: "60s"     # access token 有效期（s/m/h/d）
+  # refresh_token_duration: "720h"   # refresh session 有效期（轮换制）
+  # anonymous_paths:                 # 免鉴权路径（去 api 前缀；通配形态同 tenant）
+  #   - "/health"
+  #   - "/auth/login"                # auth 端点已是业务路由，须显式匿名
+  #   - { path: "/files/*", one_layer: true }   # 对象形态：显式一层通配
+  # cookie: { enabled: true }        # 可选：cookie 会话形态（v0.1.30，原样透传 oj-auth；含 CSRF）
+cors:                        # 可选：CORS（v0.1.35；缺段 = 不处理跨域头）
+  # origins: ["https://app.example.com"]   # 空 = 允许任意源；credentials: true 时必须非空
+  # methods: ["GET", "POST", "PUT", "DELETE"]   # 空 = tower-http 默认（GET/HEAD/POST 等）
+  # headers: []                  # 空 = 反射请求的 Access-Control-Request-Headers
+  # credentials: false           # 允许凭据（cookie/Authorization）
+  # max_age: 600                 # 预检缓存秒数（Access-Control-Max-Age）
+  # expose: ["X-Request-Id"]     # Access-Control-Expose-Headers
+secrets:                     # 凭据密封（v0.1.33）：ENC[...] 密文的密钥位置
+  # private_key_path: ./config/keys/secrets-private.pem   # 相对 config 目录；只放部署机，不入仓库
+  # public_key_path:  ./config/keys/secrets-public.pem    # 可选：oj secret seal 缺省取它
+vars:                        # 部署期常量（v0.1.25）：handler 用 vars.get("NAME") 同步读
+  # WEB_URL: "https://app.example.com"   # 换域名只改这里；值只能是标量（按 YAML 字面量成串）
+  # RETRIES: 3                           # 读出来是 "3"；嵌套 map/list 解析期报错
+  # fail-closed：未声明键恒 null；没有「读任意 env / 任意 config 键」的通道
+db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询；硬顶 100000）
+  # default_limit: 100       # 未显式 .limit() 的隐式上限（0 或 >max_limit 启动报错）
+  # max_limit: 1000          # 显式 .limit(n) 的 clamp 上限（>100000 启动报错）
+                             # 结果行数达上限时响应带 X-OJ-Row-Limit 头提示可能截断
 # tenant:                    # 可选：多租户头（缺段 = 不启用）
 #   enable: true             # 启用后请求必须带 header_key（缺失 → 400），值注入 http.tenantId
 #   header_key: "X-TENANT-ID"
@@ -287,6 +336,16 @@ tasks:                        # 可选：长任务池（v0.1.6）；缺省 = 默
 - `oidc:`：缺段时调用报 `oidc not configured`。私钥只在 Rust 侧解析使用；
   `client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读（与 `auth.jwt_secret` 同一信任级）。
   内置 OP/RP 演示见 §11 与 `sample/README.md`「OIDC 演示」。
+- `auth:`：缺段 = 完全不挂鉴权（无内置 `/auth/*` 端点、无 Bearer 守卫，`auth` JS 端点也只是
+  普通业务路由）。守卫（验签/匿名路径）由 **oj-auth** 插件承担；`anonymous_paths` 语义与
+  `tenant.anonymous_paths` 同形（去 api 前缀 + 通配四形态）。`cookie:` 段原样透传 oj-auth
+  （cookie 会话 + CSRF 双提交 + WS 握手守卫，键契约属插件），见 `devkit/api-manual.md` §8。
+- `cors:`：缺段 = 不处理任何跨域头。`credentials: true` 时 `origins` 必须显式非空
+  （带凭据不允许 `*`）；其余键空值走各自默认。
+- `secrets:` / `vars:` / `db_query:`：见上方块内注释。密封细节见 `docs/secrets.md`；
+  `vars` 是配置里**唯一**的部署期常量通道（fail-closed）。
+- `server.static_sites`：多站点列表（最长前缀命中），与主站点（`app_path`/`app_prefix`）
+  共存；CLI `--app-path prefix=dir` 可重复追加/替换条目。
 
 ## 4. 项目目录结构
 
@@ -389,6 +448,8 @@ desc 与账本不一致，都会报错（S007）。应用入口三处：
 规则：禁 DDL；INSERT 须幂等（`OR IGNORE` / `ON CONFLICT` / `OR REPLACE` /
 `ON DUPLICATE KEY`，写法须匹配部署方言）；只写本模块与 deps 模块的表（S006 校验）。
 `fixtures/`：演示数据，仅 `oj test` / `oj test fixture` 灌入（不进发布产物、不记账本）。
+**须幂等写法**（v0.1.52 门禁）：普通 `INSERT` 灌入前报错（判据同 seed 的 S006），
+写 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 即可安全重复灌。
 
 ### 5.3 检查体系与表归属
 
@@ -536,7 +597,7 @@ handler 里能直接用的全局都在这张表里。更全的签名见
 |---|---|
 | `json.ok(data)` | 成功信封（`{code:0,msg:"ok",data}`），HTTP 200 |
 | `json.fail(code, msg, data?)` | 失败信封，HTTP 状态 = `code`（`code<=0` 映射 500） |
-| `json.header(name, value)` | 设置响应头（同名后写覆盖） |
+| `json.header(name, value)` | 追加响应头（有序、同名可重复，v0.1.46） |
 | `http.method` | 请求方法字符串（`GET`/`POST`/…） |
 | `http.query` | query 参数对象（`{id: "1"}`） |
 | `http.headers` | 请求头对象 |

@@ -103,7 +103,7 @@ bus 后端可换（`local`/kafka/rabbitmq 插件），所以跨进程实例的 H
   terminate 后已毒化、Worker 随之弃置（池自动补员，其它连接无感），钩子收不到后续
   事件，连接被服务端关闭（默认 30s，`oj/src/app.rs` 传给 `mirror_routes`）。
 - **顺序契约**：写出顺序 = `ws.send` 按调用序 → 信封 → （后续广播帧）。广播帧与
-  主动发送走同一条写出通道，天然保序（`server/src/ws.rs` Bus forwarder）。
+  主动发送走同一条写出通道，天然保序（`serve/src/ws.rs` Bus forwarder）。
 
 ### 帧内发布：`ws.ts` 里直接 `bus.publish`
 
@@ -168,7 +168,7 @@ release 模式：先 `oj build`（`ws.ts` 随模块一起转译成 `dist/<mod>-<
 ### 鉴权现状（务必知道）
 
 `/v1/api/news/ws` 是 **merge 进 Router 的真实路由**，不是 fallback。而 Bearer 守卫、
-租户头校验、证书 GET 门禁全部实现在 fallback `handle()`（`server/src/lib.rs`）的前置
+租户头校验、证书 GET 门禁全部实现在 fallback `handle()`（`serve/src/lib.rs`）的前置
 管线里。**WS upgrade 因此不经过这套管线**：连接本身是匿名的，鉴权需在帧处理器里
 自行做（如校验 `ws.send` 握手帧里带的 token）。把它当红线记住。
 
@@ -178,7 +178,7 @@ release 模式：先 `oj build`（`ws.ts` 随模块一起转译成 `dist/<mod>-<
 
 ```
 oj/src/app.rs             装配：mirror_routes(base, dir, timeout, make_bridge, opts) merge 进 Router
-server/src/ws.rs          连接生命周期：upgrade → 闸门 → 三任务流水线（全 Send，跑在 axum runtime）
+serve/src/ws.rs          连接生命周期：upgrade → 闸门 → 三任务流水线（全 Send，跑在 axum runtime）
 src/bridge/frame_pool.rs  帧调度：Scheduler（per-conn 在飞=1 保序）+ W Worker + Rust 会话表
 src/bridge/mod.rs         帧执行：ws_connect 预载钩子 → ws_event（每事件一次）→ WsOutcome
 ```
@@ -263,8 +263,8 @@ dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态
 
 ## 6. 测试
 
-`server/src/ws.rs` 的单测与本文件一一对应，改实现前先读、改完必跑
-（`cargo test -p server --lib ws`）：
+`serve/src/ws.rs` 的单测与本文件一一对应，改实现前先读、改完必跑
+（`cargo test -p serve --lib ws`）：
 
 | 用例 | 教学点 |
 |---|---|

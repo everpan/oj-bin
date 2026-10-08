@@ -1,4 +1,4 @@
-# 03 · HTTP 服务（`server/`）
+# 03 · HTTP 服务（`serve/`）
 
 crate 名 `server`（对外 `use server::...`），依赖只有 `only_js`。
 模块：`lib.rs`（装配 + `handle`）、`routes.rs`、`actor.rs`、`ws.rs`、
@@ -128,7 +128,7 @@ actor 线程内跑 `current_thread` runtime，**串行**执行 job；并发度 =
 - `init` 幂等；镜像线程与 fd 按进程生命周期泄漏（对齐 `non_blocking` guard 惯例）。
 - **默认关闭终端输出**（`server.console_log` / `--console-log` 打开）；非 unix 无落盘，
   强制保留终端输出并告警。
-- 仅 unix 实现；`install_terminal_tee` 公开是为 `server/tests/log_tee.rs`
+- 仅 unix 实现；`install_terminal_tee` 公开是为 `serve/tests/log_tee.rs`
   （进程级 tee 必须独占一个测试二进制）。
 
 ## 8. `test_support`（feature `test-support`）

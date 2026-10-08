@@ -549,7 +549,7 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 | 某个库启动后报 M004（账本落后） | 那个库没跑 `oj migrate --db <name>`：多库不会自动连带 |
 | `--db analytics` 把没绑 analytics 的模块的表也建进了 analytics | `--db` 是**整轮**目标库，不读模块级 `manifest.yaml` 的 `db:` 绑定——这种项目要配 `--module` 逐组合跑（见 ②） |
 | `--db analytics` 报了别的库连不上的错 | 深瘦身装配会打开 config 里**所有** `db:` 连接；任一 DSN 打不开即失败，与 `--db` 指向哪个库无关 |
-| 想用 `oj server --db` 切库 | 没有这个旗标：运行期按模块 `manifest.db` 路由，`server` 恒以 `default` 为基库 |
+| 想用 `oj serve --db` 切库 | 没有这个旗标：运行期按模块 `manifest.db` 路由，`serve` 恒以 `default` 为基库 |
 
 > 机制与边界详见仓库 `docs/migration.md` §3.8、`docs/db-guide.md` §1.1。
 

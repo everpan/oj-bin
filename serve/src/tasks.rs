@@ -190,14 +190,19 @@ async fn logs_handler(
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
-    let events: Vec<_> = st
+    // 先过滤后截断（全窗 = 环上限）：先 recent(limit) 会让 busy 任务刷屏时
+    // quiet 任务的日志恒为空。
+    let mut events: Vec<_> = st
         .registry
         .log
-        .recent(limit)
+        .recent(0)
         .into_iter()
         .filter(|v| v["event"]["payload"]["task"].as_str() == Some(name.as_str()))
         .map(|v| v["event"].clone())
         .collect();
+    if limit > 0 && events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
     json_response(only_js::bridge::ok(&serde_json::json!({ "items": events })))
 }
 
@@ -354,7 +359,7 @@ async fn patch_handler(
     Path(name): Path<String>,
     body: String,
 ) -> Response {
-    if let Err(r) = admitted(&st, "GET", "/tasks/*", &headers) {
+    if let Err(r) = admitted(&st, "PATCH", "/tasks/*", &headers) {
         return *r;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -390,7 +395,7 @@ async fn delete_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = admitted(&st, "GET", "/tasks/*", &headers) {
+    if let Err(r) = admitted(&st, "DELETE", "/tasks/*", &headers) {
         return *r;
     }
     if st.registry.remove(&name).is_none() {
@@ -420,6 +425,21 @@ mod tests {
             _headers: Option<&str>,
         ) -> Result<Option<serde_json::Value>, String> {
             Err("unauthorized".into())
+        }
+    }
+
+    /// 捕获守卫：放行一切，记录守卫实际收到的 method（守卫动词钉）。
+    struct CaptureGuard(std::sync::Mutex<Vec<String>>);
+    impl only_js::bridge::AuthGuard for CaptureGuard {
+        fn verify(
+            &self,
+            _path: &str,
+            method: &str,
+            _auth: Option<&str>,
+            _headers: Option<&str>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            self.0.lock().unwrap().push(method.into());
+            Ok(None)
         }
     }
 
@@ -636,6 +656,59 @@ mod tests {
         let items = v["data"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{v}");
         assert_eq!(items[0]["eventType"], "task.started");
+    }
+
+    #[tokio::test]
+    async fn given_logs_endpoint_when_busy_task_floods_then_quiet_task_still_has_items() {
+        // 先过滤后截断钉：quiet 任务的旧事件必须不被 busy 任务的刷屏挤出 limit 窗口
+        // （旧实现先 recent(limit) 再过滤 → 恒 0 条）。
+        let reg = fixture_registry();
+        reg.log.record(
+            "tasks.execution",
+            "task.started",
+            serde_json::json!({ "task": "nightly" }),
+        );
+        for i in 0..20 {
+            reg.log.record(
+                "tasks.execution",
+                "task.started",
+                serde_json::json!({ "task": "orders", "i": i }),
+            );
+        }
+        let addr = spawn(state(reg)).await;
+        let resp = get(addr, "/v1/api/tasks/nightly/logs?limit=5").await;
+        let v = body(&resp);
+        let items = v["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{v}");
+        assert_eq!(items[0]["payload"]["task"], "nightly");
+        // busy 任务自身仍按 limit 截断为最近 5 条。
+        let resp = get(addr, "/v1/api/tasks/orders/logs?limit=5").await;
+        let v = body(&resp);
+        let items = v["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 5, "{v}");
+        assert_eq!(items[4]["payload"]["i"], 19);
+    }
+
+    #[tokio::test]
+    async fn given_patch_and_delete_when_guarded_then_guard_receives_real_method() {
+        // 守卫动词钉：PATCH/DELETE 不得错传 "GET"（旧实现按方法路由守卫时失效）。
+        let seen = std::sync::Arc::new(CaptureGuard(std::sync::Mutex::new(Vec::new())));
+        let mut st = state(fixture_registry());
+        st.auth = Some(seen.clone());
+        let addr = spawn(st).await;
+        let resp = raw(
+            addr,
+            "PATCH /v1/api/tasks/nightly HTTP/1.1\r\nHost: t\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"enabled\":true}",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let resp = raw(
+            addr,
+            "DELETE /v1/api/tasks/nightly HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert_eq!(*seen.0.lock().unwrap(), vec!["PATCH", "DELETE"]);
     }
 
     #[tokio::test]

@@ -422,20 +422,26 @@ fn lock_version(lock: &str, name: &str) -> Option<String> {
 }
 
 /// 依赖源码目录：优先 `vendor/`（cargo vendor），其次 CARGO_HOME registry（目录名带哈希）。
+/// 多个 registry 候选时取排序后的第一个命中（read_dir 顺序不保证；曾取最后一个，选择不定）。
 fn find_crate_dir(cargo_home: &Path, krate: &str, version: &str) -> Option<PathBuf> {
     let vendored = root().join("vendor").join(krate);
     if vendored.is_dir() {
         return Some(vendored);
     }
     let registry_src = cargo_home.join("registry").join("src");
-    let mut found = None;
-    for entry in fs::read_dir(registry_src).ok()?.flatten() {
-        let candidate = entry.path().join(format!("{krate}-{version}"));
+    let mut hashes: Vec<PathBuf> = fs::read_dir(registry_src)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    hashes.sort();
+    for h in hashes {
+        let candidate = h.join(format!("{krate}-{version}"));
         if candidate.is_dir() {
-            found = Some(candidate);
+            return Some(candidate);
         }
     }
-    found
+    None
 }
 
 fn home_dir() -> PathBuf {
@@ -601,5 +607,25 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn given_multiple_registry_candidates_when_find_crate_dir_then_first_sorted_hit_wins() {
+        // 多个 registry 哈希目录都有同名 crate：取排序后第一个（曾取最后一个，选择不定）。
+        let home = std::env::temp_dir().join(format!("oj-xtask-fcd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for h in ["zzz-hash", "aaa-hash"] {
+            let d = home.join("registry/src").join(h).join("fake-crate-9.9.9");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("Cargo.toml"), "x").unwrap();
+        }
+        let want = home
+            .join("registry/src")
+            .join("aaa-hash")
+            .join("fake-crate-9.9.9");
+        assert_eq!(find_crate_dir(&home, "fake-crate", "9.9.9"), Some(want));
+        // 版本未命中 → None。
+        assert_eq!(find_crate_dir(&home, "fake-crate", "0.0.0"), None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

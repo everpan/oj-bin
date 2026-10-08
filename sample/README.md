@@ -8,7 +8,7 @@
   curl http://localhost:9778/v1/api/user/42                       # `_name_` 目录段即路径参数（src/user/_id_/）
 
   ./bin/oj build -d sample/src -o sample/dist                      # 构建（版本目录+migrations+锁+tgz）
-  ./bin/oj build --check -d sample/src                             # 结构检查（S002–S006，CI 门禁，不落盘）
+  ./bin/oj build --check -d sample/src                             # 结构检查（S001–S008，CI 门禁，不落盘）
   ./bin/oj migrate -c sample/config.yaml -d sample/dist            # release 部署先迁移（verify 门禁要求）
   ./bin/oj schema diff -c sample/config.yaml                       # 声明 vs 实库对账（漂移 exit 1）
   ./bin/oj serve -c sample/config.yaml --api-path sample/dist     # release（按锁聚合；账本落后拒启）
@@ -33,8 +33,8 @@
   （私钥 `config/private.pem` 仅示例用，**严禁用于生产**；过期后用
   `cargo run -p oj-cert -- renew -k sample/config/private.pem` 重签）
 - dist/ 为 oj build 产物（保留原名原结构，默认 minify），可再生，勿手改
-- 注意：sample/dist/ 尚未包含 auth 模块（release 模式启动三个 auth 端点 404）；
-  需要时 `oj build` 重新生成
+- sample/dist/ 已包含 auth 等模块（manifests.yaml 已锁定）；改动 src/ 后以 release 模式
+  启动前需 `oj build` 重新生成，否则服务的仍是旧产物
 - node_modules/escape-goat 为直接 vendor 的纯 ESM 包（可 npm install 替换）
 - db.sqlite 由迁移 + seed.sql 初始化（均幂等），已 gitignore
 

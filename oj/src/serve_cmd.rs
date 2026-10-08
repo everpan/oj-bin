@@ -592,7 +592,9 @@ pub(crate) fn check_ldap_cfg_sources(cfg: &Config) -> Result<(), String> {
         .is_some_and(|v| v.as_mapping().is_some_and(|m| !m.is_empty()));
     if passthrough && section_nonempty {
         return Err(
-            "config declares both a non-empty `ldap:` section and a non-empty `plugins.ldap`              entry: pick one (`ldap:` is the standard form; `plugins.ldap` is a raw passthrough              that silently wins over `ldap:` and bypasses its typed parsing)"
+            "config declares both a non-empty `ldap:` section and a non-empty `plugins.ldap` \
+             entry: pick one (`ldap:` is the standard form; `plugins.ldap` is a raw passthrough \
+             that silently wins over `ldap:` and bypasses its typed parsing)"
                 .to_string(),
         );
     }
@@ -1189,6 +1191,45 @@ mod tests {
             check_mail_cfg_sources(&case(Some(passthrough()), Some(SmtpSection::default())))
                 .is_ok()
         );
+    }
+
+    /// A5-ldap：ldap 双配置源闸门（与 mail 同构）；并钉住报错文案——曾漏 `\` 续行，
+    /// 多行字面量被拍平成一行夹一长串空格。
+    #[test]
+    fn given_both_ldap_cfg_sources_nonempty_when_check_then_errors_with_clean_message() {
+        fn section() -> serde_yaml::Value {
+            serde_yaml::from_str("default:\n  url: ldap://h:389\n").unwrap()
+        }
+        fn case(
+            plugins_ldap: Option<serde_json::Value>,
+            ldap: Option<serde_yaml::Value>,
+        ) -> Config {
+            let mut cfg = Config {
+                ldap,
+                ..Default::default()
+            };
+            if let Some(v) = plugins_ldap {
+                cfg.plugins.insert("ldap".into(), v);
+            }
+            cfg
+        }
+
+        // 皆非空 → Err，文案点名两条来源与「二选一」，且不夹拼接空格。
+        let e = check_ldap_cfg_sources(&case(
+            Some(serde_json::json!({ "default": { "url": "override" } })),
+            Some(section()),
+        ))
+        .expect_err("双源皆非空必须 Err");
+        assert!(
+            e.contains("ldap:") && e.contains("plugins.ldap") && e.contains("pick one"),
+            "文案须点明两条来源与二选一：{e}"
+        );
+        assert!(
+            !e.contains("  "),
+            "文案不得含连续空格（漏 \\ 续行症状）：{e:?}"
+        );
+        // 单一来源（只有 `ldap:` 段）合法。
+        assert!(check_ldap_cfg_sources(&case(None, Some(section()))).is_ok());
     }
 
     #[test]

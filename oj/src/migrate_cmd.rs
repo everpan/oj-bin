@@ -184,6 +184,17 @@ pub async fn load_fixtures(
                 .filter(|s| !s.is_empty())
                 .enumerate()
             {
+                // 幂等门禁（执行前 fail-fast，与 S006 seed 同一判据）：注释声称
+                // 「幂等可重复灌」，非幂等 INSERT 重灌即撞主键/数据翻倍——不靠 exec 报错兜底。
+                if crate::checks::lead_word(stmt) == "INSERT"
+                    && !crate::checks::insert_is_idempotent(stmt)
+                {
+                    return Err(format!(
+                        "fixture {name}/{}: 非幂等 INSERT（fixtures 可重复灌，须幂等写法：\
+                         INSERT OR IGNORE / ON CONFLICT DO UPDATE / OR REPLACE——同 S006 seed 纪律）",
+                        f.display()
+                    ));
+                }
                 match acc.exec_with_params(stmt, &[]).await {
                     Ok(rows) => tracing::info!(
                         module = name,
@@ -280,7 +291,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             t.join("src/m/fixtures/demo.sql"),
-            "INSERT INTO g VALUES (1);",
+            "INSERT OR IGNORE INTO g VALUES (1);",
         )
         .unwrap();
         t
@@ -585,5 +596,57 @@ mod tests {
     async fn fixtures_without_default_db_are_skipped() {
         let n = load_fixtures(None, &[]).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// sqlite 直连夹具（绕开 config/插件装配，只打 load_fixtures 门禁本体）。
+    async fn sqlite_acc(t: &Path) -> Arc<dyn DataAccessor> {
+        only_js::bridge::DbBackendRegistry::builtin()
+            .connect(&format!("sqlite://{}", t.join("fx.sqlite").display()), t)
+            .await
+            .unwrap()
+    }
+
+    /// 幂等门禁（与 S006 seed 同判据）：非幂等 INSERT 执行前拒绝，指回 S006 纪律。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_non_idempotent_fixture_when_load_then_rejected_before_exec() {
+        let t = tmpdir("fx-bad");
+        let mdir = t.join("m");
+        std::fs::create_dir_all(mdir.join("fixtures")).unwrap();
+        std::fs::write(mdir.join("fixtures/demo.sql"), "INSERT INTO g VALUES (1);").unwrap();
+        let acc = sqlite_acc(&t).await;
+        acc.exec_with_params("CREATE TABLE g (x)", &[])
+            .await
+            .unwrap();
+        let e = load_fixtures(Some(&acc), &[("m".into(), mdir)])
+            .await
+            .unwrap_err();
+        assert!(e.contains("非幂等 INSERT"), "{e}");
+        assert!(e.contains("S006"), "报错须指回 S006 纪律：{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 幂等写法通过，且重复灌不翻倍（门禁声称的「可重复灌」可观察）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_idempotent_fixture_when_loaded_twice_then_ok_without_duplicates() {
+        let t = tmpdir("fx-ok");
+        let mdir = t.join("m");
+        std::fs::create_dir_all(mdir.join("fixtures")).unwrap();
+        std::fs::write(
+            mdir.join("fixtures/demo.sql"),
+            "INSERT OR IGNORE INTO g VALUES (1);",
+        )
+        .unwrap();
+        let acc = sqlite_acc(&t).await;
+        acc.exec_with_params("CREATE TABLE g (x)", &[])
+            .await
+            .unwrap();
+        let mods = [("m".into(), mdir)];
+        let n = load_fixtures(Some(&acc), &mods).await.unwrap();
+        assert_eq!(n, 1);
+        let n2 = load_fixtures(Some(&acc), &mods).await.unwrap();
+        assert_eq!(n2, 1, "重灌应同样通过（幂等）");
+        let rows = acc.query("select count(*) from g").await.unwrap();
+        assert_eq!(rows.len(), 1, "重复灌不得翻倍：{rows:?}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

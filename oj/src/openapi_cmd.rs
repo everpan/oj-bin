@@ -49,7 +49,9 @@ pub fn discover_routes(
             serve::routes::bridge_introspector(make),
         );
         if !failures.is_empty() {
-            eprintln!("oj openapi: route introspect failures: {failures:?}");
+            // 与 release 分支同语义：内省失败 fail-fast——静默继续会让 spec 缺路由，
+            // `--check` 反而误报漂移。
+            return Err(format!("dev routes: {}", failures.join("; ")));
         }
         return Ok(t);
     }
@@ -711,6 +713,25 @@ mod tests {
             op.get("requestBody").is_none(),
             "无 body 契约不得生成 requestBody"
         );
+    }
+
+    #[test]
+    fn dev_introspect_failure_fails_discovery() {
+        // dev 分支内省失败必须 fail-fast（曾仅 eprintln 继续 → spec 静默缺路由，
+        // `--check` 反而误报漂移）；语义对齐 release 分支的 failures → Err。
+        let dir = unique_tmp("oj-oa-devfail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("user/broken")).unwrap();
+        std::fs::write(dir.join("user/broken/api.ts"), "this is not ?? valid ts").unwrap();
+        let err = match discover_routes(&dir, true, "/v1/api") {
+            Ok(_) => panic!("dev 内省失败须报错退出（fail-fast）"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("dev routes:"),
+            "dev 内省失败须报错退出（fail-fast）：{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

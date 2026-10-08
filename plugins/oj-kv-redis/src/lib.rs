@@ -257,7 +257,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // worker 只跑 IO 转发（redis 连接自管），2 足够；缺省 = num_cpus 全核白占线程。
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("oj-kv-redis tokio runtime")

@@ -209,7 +209,7 @@ plugins/oj-db-postgres/       crate: PostgresBackend + (Plugin 注册，feature-
 - **`Extras` 向后兼容**：阶段 0 在 `Extras`（`src/bridge/mod.rs:85`）加
   `db_backends: Option<Arc<DbBackendRegistry>>`（None=builtin），保持
   `with_dbs_and_loader` 签名不变，所有现有调用点
-  （`server/src/lib.rs` 多个 `with_dbs_and_loader`、`src/main.rs:29`）零改动。
+  （`serve/src/lib.rs` 多个 `with_dbs_and_loader`、`src/main.rs:29`）零改动。
 - **db 阶段的 `sqlx` 复用 vs 真独立**：阶段 0-3 可暂沿用 `SqlxAccessor` 的 `Any` 复用，
   先完成"注册表/可装卸"语义；阶段 4 才把 `sqlx` 三个 driver feature 拆开、由各后端 crate
   各自 `connect` 对应类型池——这是阶段 4 的主要工作量。

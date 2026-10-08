@@ -266,6 +266,22 @@ fn judge(stable: &StableState, ctx: &ModuleCtx, table: &str, src: &str) -> Resul
     Ok(())
 }
 
+/// sql_memo 容量上界：动态拼 SQL 的键空间无界，缓存只省 extract_tables 的重复扫描，
+/// 超界整表清空重来正确性无损。
+const SQL_MEMO_CAP: usize = 4096;
+
+/// memo 插入（超界先整表清空——性能缓存，非正确性缓存）。
+fn memo_put(
+    memo: &mut std::collections::HashMap<String, Arc<Vec<String>>>,
+    sql: &str,
+    tables: Arc<Vec<String>>,
+) {
+    if memo.len() >= SQL_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(sql.to_string(), tables);
+}
+
 /// 裸 SQL 守卫（op_db_query / op_db_exec）：提取表名（memo 缓存）→ 逐表归属判定。
 pub fn check_raw(state: &Rc<RefCell<OpState>>, sql: &str) -> Result<(), JsErrorBox> {
     let Some((ctx, stable)) = module_ctx(state) else {
@@ -277,7 +293,7 @@ pub fn check_raw(state: &Rc<RefCell<OpState>>, sql: &str) -> Result<(), JsErrorB
             t.clone()
         } else {
             let t = Arc::new(extract_tables(sql));
-            memo.insert(sql.to_string(), t.clone());
+            memo_put(&mut memo, sql, t.clone());
             t
         }
     };
@@ -513,6 +529,19 @@ pub fn bound_db(state: &Rc<RefCell<OpState>>, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sql_memo 上界：容量到达后整表清空重来（性能缓存超界不无界增长）。
+    #[test]
+    fn sql_memo_resets_at_cap_instead_of_growing_unbounded() {
+        let mut m = std::collections::HashMap::new();
+        for i in 0..SQL_MEMO_CAP {
+            memo_put(&mut m, &format!("s{i}"), Arc::new(Vec::new()));
+        }
+        assert_eq!(m.len(), SQL_MEMO_CAP);
+        memo_put(&mut m, "fresh", Arc::new(vec!["t".to_string()]));
+        assert_eq!(m.len(), 1, "cap reached: memo must reset, not grow");
+        assert!(m.contains_key("fresh"));
+    }
 
     /// 租户参数的三种等价形态（v0.1.22 起含数字与大整数标记）。
     #[test]

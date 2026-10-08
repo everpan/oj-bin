@@ -222,7 +222,7 @@ extern "C" fn verify(
     )
 }
 
-fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
+fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RString> {
     let parsed: GuardCfg = match serde_json::from_str(&cfg[..]) {
         Ok(c) => c,
         Err(e) => return RResult::Err(RString::from(format!("oj-auth cfg: {e}"))),
@@ -231,7 +231,17 @@ fn init(_host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RSt
         Ok(g) => g,
         Err(e) => return RResult::Err(RString::from(e)),
     };
-    let _ = GUARD.set(guard);
+    // set 失败 = 同进程二次 init（多装配/测试重载同一 dylib）换了个 cfg：OnceLock 已占，
+    // **沿用首份 cfg**（生产单次装配不触发）。warn 一条让「第二份被忽略」可观测，
+    // 不 panic、不 fail init。
+    if GUARD.set(guard).is_err() {
+        (host.log)(
+            3,
+            RString::from(
+                "oj-auth: guard already initialized — keeping the first cfg, new cfg ignored",
+            ),
+        );
+    }
     RResult::Ok(PluginDescriptor {
         name: RString::from("auth"),
         semver: RString::from(env!("CARGO_PKG_VERSION")),
@@ -483,5 +493,22 @@ mod tests {
                 .is_ok()
             );
         }
+    }
+
+    /// 二次 init（换 cfg）不 panic、不 fail init、也不偷换守卫：OnceLock 已占 →
+    /// 沿用首份 cfg（host.log warn 可观测）。before/after 取同一谓词，测试与
+    /// 进程内其它 init 测试的先后顺序无关。
+    #[test]
+    fn second_init_with_different_cfg_keeps_first_guard() {
+        let c1 = r#"{"jwt_secret":"k1","anonymous_paths":["/one"]}"#;
+        let c2 = r#"{"jwt_secret":"k2","anonymous_paths":["/two"]}"#;
+        let Ok(_) = std::result::Result::from(init(host(), RString::from(c1))) else {
+            panic!("first init must succeed");
+        };
+        let before = GUARD.get().map(|g| g.is_anonymous("/one")).unwrap();
+        let d = std::result::Result::from(init(host(), RString::from(c2))).unwrap();
+        assert_eq!(&d.name[..], "auth");
+        let after = GUARD.get().map(|g| g.is_anonymous("/one")).unwrap();
+        assert_eq!(before, after, "守卫必须是首份（第二份 cfg 被忽略）");
     }
 }

@@ -138,15 +138,30 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + yield_now；take→free→state 置 null）。
+/// pending 期转入睡眠前的 yield 预算：前 64 次 poll 走 yield_now（快操作零延迟），
+/// 之后改为睡眠退避（慢查询不再单核空转——yield_now 空转版 db/es/blob/kv/bus 全轴中招）。
+const FFI_SPIN_BUDGET: u32 = 64;
+
+/// 超出 yield 预算后的每次 poll 睡眠时长（500µs：相对插件往返可忽略，CPU 近似 idle）。
+const FFI_AWAIT_BACKOFF: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// FfiFuture → host async 桥（S.2 定稿形态：poll 轮询 + 自适应退避；take→free→state 置 null）。
 /// poll 返回 -1 时也 take（错误细节在 take 的 Err 里）。
 /// 经 FfiGuard 持有：await 被取消时 Drop 只 free 不 take（放弃结果，插件任务允许跑完）。
 pub(crate) async fn await_ffi(fut: FfiFuture) -> Result<Vec<u8>, String> {
     let mut guard = FfiGuard(Some(fut));
+    let mut polls: u32 = 0;
     loop {
         let fut = guard.0.as_mut().expect("fut present until return");
         match (fut.poll)(fut.state) {
-            0 => tokio::task::yield_now().await,
+            0 => {
+                polls += 1;
+                if polls <= FFI_SPIN_BUDGET {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(FFI_AWAIT_BACKOFF).await;
+                }
+            }
             code => {
                 let r = (fut.take)(fut.state);
                 (fut.free)(fut.state);
@@ -765,6 +780,14 @@ pub(crate) static DELIVER_TARGETS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, Vec<UnboundedSender<WsSend>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// DELIVER_TARGETS 加锁（毒化自愈）：持锁线程 panic 毒化后，deliver 在插件线程
+/// 继续 `unwrap` 会连环 panic → abort 进程；恢复到 panic 时刻的部分状态对扇出表无害
+/// （满/closed 条目本就惰性清理），故宁可带伤服务也不放大成进程崩溃。
+fn deliver_targets() -> std::sync::MutexGuard<'static, HashMap<String, Vec<UnboundedSender<WsSend>>>>
+{
+    DELIVER_TARGETS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// host 侧 deliver 回调（HostContext.deliver 指向此）：非阻塞投递，满/closed 惰性清理。
 /// 语义 = Bus::publish 的本地扇出（payload 原样转发；按 topic 去重注册）。
 /// 帧型判定（v0.1.16 wire 约定，与 FfiEventBroker::publish 的封装对称）：payload 为
@@ -801,7 +824,7 @@ pub(crate) extern "C" fn host_deliver(topic: RString, payload: RBytes) {
 /// 本地扇出一帧到 `DELIVER_TARGETS`（满/closed 惰性清理），返回投递成功数。
 /// `host_deliver` 与 `FfiEventBroker::publish_local` 共用（同步路径）。
 pub(crate) fn fanout_targets(topic: &str, frame: WsSend) -> usize {
-    let mut g = DELIVER_TARGETS.lock().unwrap();
+    let mut g = deliver_targets();
     let mut n = 0;
     if let Some(list) = g.get_mut(topic) {
         list.retain(|tx| {
@@ -941,7 +964,7 @@ impl EventBroker for FfiEventBroker {
         // 失败回滚刚注册的通道，避免僵尸注册导致该 topic 静默丢失。
         let _gate = SUBSCRIBE_GATE.lock().await;
         let (is_new_topic, inserted) = {
-            let mut g = DELIVER_TARGETS.lock().unwrap();
+            let mut g = deliver_targets();
             let list = g.entry(topic.to_string()).or_default();
             let is_new_topic = list.is_empty();
             // 同 channel 去重（同一 tx 重复订阅不重复注册）。
@@ -959,7 +982,7 @@ impl EventBroker for FfiEventBroker {
                 // 回滚：仅移除本次刚注册的本通道（列表空则删整条 topic），
                 // 不误伤其他订阅者。
                 if inserted {
-                    let mut g = DELIVER_TARGETS.lock().unwrap();
+                    let mut g = deliver_targets();
                     if let Some(list) = g.get_mut(topic) {
                         list.retain(|t| !t.same_channel(&tx));
                         if list.is_empty() {
@@ -980,7 +1003,7 @@ impl Drop for FfiEventBroker {
         (self.vtable.close)(self.handle);
         // M-1：仅清本 broker 注册的目标，不再整表清空（避免误伤其他 broker 订阅）。
         let registered = std::mem::take(&mut *self.subs.lock().unwrap());
-        let mut g = DELIVER_TARGETS.lock().unwrap();
+        let mut g = deliver_targets();
         for (topic, tx) in registered {
             if let Some(list) = g.get_mut(&topic) {
                 list.retain(|t| !t.same_channel(&tx));
@@ -1925,7 +1948,30 @@ mod adapter_tests {
     }
 
     fn deliver_clear() {
-        DELIVER_TARGETS.lock().unwrap().clear();
+        // 经自愈入口：毒化用例跑过后（std Mutex 毒化标记不可消除）其余用例照常清场。
+        deliver_targets().clear();
+    }
+
+    /// 锁毒化自愈（评审 B2）：持锁 panic 毒化 DELIVER_TARGETS 后，deliver 路径
+    /// （fanout_targets → deliver_targets）恢复内层数据继续服务，不再连环 panic → abort。
+    #[test]
+    fn deliver_targets_poisoned_lock_does_not_kill_deliver() {
+        let _g = T_LOCK.lock().unwrap();
+        deliver_clear();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DELIVER_TARGETS.lock().unwrap();
+            panic!("poison the deliver lock");
+        }));
+        // 毒化后的锁照常可用：注册 + 扇出 + 惰性清理全链路不 panic。
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        deliver_targets()
+            .entry("poison-t".to_string())
+            .or_default()
+            .push(tx);
+        assert_eq!(fanout_targets("poison-t", WsSend::Text("x".into())), 1);
+        assert_eq!(rx.try_recv().unwrap(), WsSend::Text("x".into()));
+        // 经自愈入口清场：毒化标记随 into_inner 消除，不把毒化带给同批用例。
+        deliver_targets().clear();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2035,7 +2081,7 @@ mod adapter_tests {
             rx.try_recv().is_err(),
             "zombie subscription must not deliver"
         );
-        let g = DELIVER_TARGETS.lock().unwrap();
+        let g = deliver_targets();
         let empty = match g.get("t") {
             None => true,
             Some(list) => list.is_empty(),
@@ -2548,6 +2594,21 @@ mod adapter_tests {
         );
     }
 
+    /// Drop 保底回滚对插件侧 rollback 任务失败免疫：vtable 报错（catch_future 把插件
+    /// 任务 panic 收敛为错误 future 的形态）时 Drop 仍恰好 fire 一次，宿主侧不 panic、
+    /// FfiGuard 正常 free（不二次释放）。评审 B3 宿主侧守护——条目移除不得依赖 rollback
+    /// 任务成功（插件侧 remove-before-await 已由 oj-db-mysql/oj-db-postgres 实现）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn given_rollback_task_fails_when_dropped_then_guaranteed_rollback_fires_once() {
+        let _g = T_LOCK.lock().unwrap();
+        DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
+        let _m = Mode::set(&DB_TX_END_MODE, 1);
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let tx = da.begin().await.unwrap();
+        drop(tx); // 保底回滚 fire-and-forget：结果放弃，不因插件失败 panic/泄漏
+        assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 7);
+    }
+
     // ---- blob 轴错误臂 ----
 
     /// blob 五方法插件报错 → 错误文案点名操作；serve 走 url → 错误透传。
@@ -2777,6 +2838,29 @@ mod await_ffi_poll_tests {
         let out = await_ffi_poll(counted_future(0), Duration::from_secs(1))
             .await
             .unwrap();
+        assert_eq!(out, b"ok".to_vec());
+        assert!(t0.elapsed().as_millis() < 100, "{:?}", t0.elapsed());
+    }
+
+    /// await_ffi 自适应退避：前 64 次 poll 走 yield_now（快操作零延迟），此后每次
+    /// 睡 500µs——96 次 pending ⇒ ≥32 次睡眠，墙钟证明不再纯 yield 空转烧核。
+    #[tokio::test]
+    async fn given_many_pending_polls_when_await_ffi_then_sleeps_after_yield_budget() {
+        let t0 = std::time::Instant::now();
+        let out = await_ffi(counted_future(96)).await.unwrap();
+        assert_eq!(out, b"ok".to_vec());
+        assert!(
+            t0.elapsed().as_millis() >= 12,
+            "still spinning past yield budget: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// yield 预算内完成的 future 不引入睡眠尾延迟（64 次 pending 走快路径）。
+    #[tokio::test]
+    async fn given_pending_within_yield_budget_when_await_ffi_then_no_sleep_tail() {
+        let t0 = std::time::Instant::now();
+        let out = await_ffi(counted_future(64)).await.unwrap();
         assert_eq!(out, b"ok".to_vec());
         assert!(t0.elapsed().as_millis() < 100, "{:?}", t0.elapsed());
     }

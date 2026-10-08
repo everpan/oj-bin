@@ -945,14 +945,17 @@ extern "C" fn stream_close(handle: u64, stream_id: u64) -> FfiFuture {
     })
 }
 
+/// 方言自报（签名 `fn(u64) -> RString` 带不了错）：未知/closed handle 上送 `"unknown"`
+/// （宿主按 Sqlite 兜底映射，见 src/bridge/ffi.rs 的 dialect 消费方），并响亮提示——
+/// 绝不冒充真方言 `"sqlite"` 让宿主拿错方言造 SQL。
 extern "C" fn dialect(handle: u64) -> RString {
     oj_plugin_ffi::catch_value(
-        || {
-            let d = state()
-                .client(handle)
-                .map(|c| c.dialect)
-                .unwrap_or(Dialect::Sqlite);
-            RString::from(dialect_str(d))
+        || match state().client(handle) {
+            Ok(c) => RString::from(dialect_str(c.dialect)),
+            Err(e) => {
+                eprintln!("oj-db-mysql: dialect: {e}");
+                RString::from("unknown")
+            }
         },
         RString::from("unknown"),
     )
@@ -1024,7 +1027,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // worker 只跑 IO 转发（sqlx 连接在池内），2 足够；缺省 = num_cpus 全核白占线程。
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("oj-db-mysql tokio runtime")
@@ -1196,6 +1201,8 @@ mod tests {
 
         // dialect(): sqlite DSN → 线名 "sqlite"（占位符补全/幂立按键选依赖它）。
         assert_eq!(&dialect(h)[..], "sqlite");
+        // 未知 handle：上送 "unknown"（宿主按 Sqlite 兜底映射），绝不冒充 "sqlite"。
+        assert_eq!(&dialect(999)[..], "unknown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

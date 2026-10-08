@@ -98,6 +98,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 裸 import 报 `Package subpath 'x' is not defined by "exports"` | v0.1.30 起有 `exports` 即封闭语义（Node 一致）：未命中的子路径**不回落** `main`/`module`——检查包的真实导出键，或该包确未导出此子路径 |
 | CJS `require("path")` 报 `Node builtin 'path' is not available in oj runtime` | Node 内建不可用——找该包的浏览器/wasm 构建（与 wasm 引擎包同款约定） |
 | `blob.uploadUrl` 报 `local blob backend has no upload presign` | local 后端无预签名——s3 才返回预签名 URL；local 用直传路由 `PUT {base}/blob/{key}`（记得带鉴权头） |
+| `oj test fixture` 报非幂等 INSERT | fixtures 须幂等写法（`INSERT OR IGNORE` / `ON CONFLICT DO NOTHING`，判据同 S006；v0.1.52 门禁）——改成幂等写法即可重复灌 |
+| 子目录里的 `*.test.ts` 没被执行 | v0.1.52 起 `oj test` 递归扫 `tests/`（`_` 前缀目录跳过）——此前只扫首层是静默忽略；升级后注意子目录测试会开始跑 |
+| `ws.broadcast` 传对象直接报错 | v0.1.52 起 data 与 `ws.send` 对称：只收 string / ArrayBuffer / Uint8Array，其余报错（此前会发 `"[object Object]"` 垃圾帧） |
 | `route_timeouts` 配了不生效 | pattern 匹配**含 base 全路径**（如 `/v1/api/convert/**`），且按声明序首个命中——诊断时先核对全路径与顺序 |
 | `{id}.json` 路由没建 | matchit 参数段不得混字面，拆成静态多段 |
 | es/blob 调用报错 | config 未配置 `es.endpoint` / `blob:` 段，配置即启用 |
