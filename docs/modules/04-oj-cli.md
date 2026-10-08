@@ -7,7 +7,7 @@
 
 | 命令 | 主要参数 | 实现 |
 |---|---|---|
-| `server` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log` | `serve_cmd.rs:21` |
+| `serve` | `-c/--config`、`-b/--base`、`--api-path`、`--app-path`、`--cert-path`、`--key-path`、`--console-log`、`--daemon` | `serve_cmd.rs:21` |
 | `build [module]` | `-d/--dir`（默认 `src`）、`-o/--out`（默认 `dist`）、`--no-minify`、`--check` | `build_cmd.rs:16` |
 | `test` | `-c`、`-b`、`-d`、`-t/--tests`（默认 `tests`，相对 config_dir）、`--format`（human/tap/junit/json）、`--output` | `test_cmd.rs:46` |
 | `migrate` | `-c`、`-d`、`--db`、`--baseline`、`--module` | `migrate_cmd.rs:74` |
@@ -92,7 +92,7 @@
 
 - 版本视图 = `dist/manifests.yaml` 锁 ∪ 本次计划构建的模块版本；
   **版本目录不单射 → fail-fast**（`{m}-{v}` 碰撞）。
-- `checks::run`（S002–S008）**构建即检查**；`--check` 只校验不落盘（CI 门禁）。
+- `checks::run`（S001–S008）**构建即检查**；`--check` 只校验不落盘（CI 门禁）。
 - 单模块：清场同名版本目录 → 转译落盘 → 内省产 `routes.js` → lock upsert → `.tgz`。
 - 转译处理四件事：
   - `strip_route_decls`：剥掉产物里的 `fn.route = "...";` 整行；

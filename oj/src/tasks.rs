@@ -50,10 +50,15 @@ pub fn scan_tasks(dir: &Path, max: usize) -> Result<Vec<(String, PathBuf)>, Stri
     Ok(out)
 }
 
-/// 递归收集 dir 下全部 .ts/.js。
+/// 递归收集 dir 下全部 .ts/.js。符号链接整体跳过（`is_dir` 会跟随链接，
+/// 自引用/环状链接会死递归）。
 fn walk_ts_js(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
-        let p = entry?.path();
+        let entry = entry?;
+        let p = entry.path();
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
             walk_ts_js(&p, out)?;
         } else if matches!(
@@ -234,7 +239,19 @@ pub fn assemble_tasking(
                 rt.block_on(async {
                     let mut out = Vec::with_capacity(probe_set.len());
                     for (name, path) in &probe_set {
-                        let is_loop = bridge.probe_task_loop(path).await.unwrap_or(false);
+                        // 探测失败非静默：点名任务与原因（语法错/加载失败等）。行为不变
+                        // ——仍归 TLA 桶退避重启（见上方 assemble_tasking 注释），但
+                        // 运维能从日志看到「为什么不进池」。
+                        let is_loop = match bridge.probe_task_loop(path).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "task: probe {name} ({}) failed: {e} — treating as legacy TLA",
+                                    path.display()
+                                );
+                                false
+                            }
+                        };
                         out.push((name.clone(), path.clone(), is_loop));
                     }
                     Ok::<_, String>(out)
@@ -361,23 +378,45 @@ fn spawn_cron_driver(pool: Arc<only_js::bridge::task_pool::TaskPool>, flag: Arc<
                 _ = tokio::time::sleep(wait) => {}
                 _ = wait_flag(&flag) => return,
             }
-            // 到点：先计算并写回下一次触发时间，再投作业（顺序 = 防重契约）。
-            let new_next = match &entry.kind {
-                TaskKind::Cron { expr, .. } => expr.next_after(std::time::SystemTime::now()),
-                _ => None,
+            // 到点：先重读注册表最新 entry（入睡期间 PATCH 改表达式/停用/删除的竞态
+            // 防护——旧快照会把过期表达式写回覆盖新调度），按新值算下一次触发时间写回，
+            // 再投作业（顺序 = 防重契约）。
+            let Some(fresh) = pool.registry.get(&entry.name) else {
+                continue; // 已删除：不写回不投递。
+            };
+            let Some(new_next) = cron_resolved_next(Some(&fresh), std::time::SystemTime::now())
+            else {
+                continue; // 已停用（或非 cron）：不写回——停用条目不会被再次选中，
+                // 重新启用后 next_run 已过期会立即补触发一次。
             };
             pool.registry.set_next_run(&entry.name, new_next);
             pool.submit_once(OnceJob {
-                name: entry.name.clone(),
-                path: entry.path.clone(),
+                name: fresh.name.clone(),
+                path: fresh.path.clone(),
             });
             pool.registry.log.record(
                 "tasks.commands",
                 "cron.triggered",
-                serde_json::json!({ "task": entry.name }),
+                serde_json::json!({ "task": fresh.name }),
             );
         }
     });
+}
+
+/// 到点复核（cron 驱动竞态防护的纯函数臂）：按最新 entry 计算 new_next。
+/// None = 本轮不投递不写回（entry 已停用 / 已非 cron——调度器只选启用的 cron 条目）；
+/// Some(next) = 投递并写回（next 为 None 表示表达式无后续触发，照原样写回）。
+fn cron_resolved_next(
+    fresh: Option<&only_js::bridge::task_pool::TaskEntry>,
+    now: std::time::SystemTime,
+) -> Option<Option<std::time::SystemTime>> {
+    let e = fresh?;
+    match (&e.kind, e.enabled) {
+        (only_js::bridge::task_pool::TaskKind::Cron { expr, .. }, true) => {
+            Some(expr.next_after(now))
+        }
+        _ => None,
+    }
 }
 
 /// flag 置位唤醒（select 分支用）：25ms 轮询（ponytail：简单可靠，量级 irrelevant）。
@@ -457,6 +496,50 @@ mod tests {
         let err = scan_tasks(&pool, 2).unwrap_err();
         assert!(err.contains("max"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD：扫描跳过符号链接（`p.is_dir()` 跟随链接，自引用/环状链接会死递归）。
+    #[cfg(unix)]
+    #[test]
+    fn given_self_referential_symlink_when_scan_then_skipped_not_looped() {
+        use std::os::unix::fs::symlink;
+        let d = tmpdir("symlink");
+        let pool = d.join("tasks");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join("task_a.ts"), "export {};\n").unwrap();
+        // 自引用目录链接：tasks/loop → tasks（顶层）。
+        symlink(d.join("tasks"), pool.join("loop")).unwrap();
+        // 自引用文件链接：链接指向自身。
+        symlink(pool.join("self.ts"), pool.join("self.ts")).unwrap();
+        let out = scan_tasks(&pool, 64).unwrap();
+        assert_eq!(
+            out.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "符号链接须整体跳过：{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BDD：cron 到点复核纯函数臂——入睡期间 entry 被 PATCH（改表达式/停用/删除）
+    /// 后按新值走：停用/删除不投递不写回；表达式已变按新表达式算 next
+    /// （旧快照不得把过期表达式写回覆盖新调度）。
+    #[test]
+    fn given_patched_cron_entry_when_resolved_then_follows_latest_values() {
+        use only_js::bridge::task_pool::{TaskEntry, parse_crontab_line};
+        let (e5, _) = parse_crontab_line("*/5 * * * * ./x.ts").unwrap();
+        let (e10, _) = parse_crontab_line("*/10 * * * * ./x.ts").unwrap();
+        let now = std::time::SystemTime::now();
+
+        // 已删除（None）→ 不投递。
+        assert_eq!(cron_resolved_next(None, now), None);
+        // 已停用 → 不投递（desired 位优先于旧快照）。
+        let mut disabled = TaskEntry::cron("j", PathBuf::from("x.ts"), e5.clone());
+        disabled.enabled = false;
+        assert_eq!(cron_resolved_next(Some(&disabled), now), None);
+        // 表达式已 PATCH → 按新表达式算 next。
+        let patched = TaskEntry::cron("j", PathBuf::from("x.ts"), e10.clone());
+        let got = cron_resolved_next(Some(&patched), now).unwrap();
+        assert_eq!(got, e10.next_after(now), "须按 PATCH 后的表达式算 next");
     }
 
     /// 测试用 Bridge 工厂：内存 kafka（poll 尊重 timeoutMs，10ms 步进）+ 任务 flag。
@@ -833,5 +916,23 @@ mod tests {
             .unwrap();
         assert!(e.contains("duplicates a pool task"), "{e}");
         let _ = std::fs::remove_dir_all(&d3);
+    }
+
+    /// BDD：探测失败的文件（语法错）不静默——warn 打点（含任务名）后照旧归 TLA 桶
+    /// （监督器退避重启，行为与旧版一致），且不阻断装配。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_broken_task_file_when_probe_fails_then_tla_bucket_and_assembly_proceeds() {
+        let d = tmpdir("probe-fail");
+        let pool = d.join("tasks");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join("task_broken.ts"), "this is not ?? valid ts").unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let make_bridge = test_bridge_factory(&d, flag.clone());
+        let tasking = assemble_tasking(&cfg("tasks", 64), &d, make_bridge, flag.clone()).unwrap();
+        assert!(tasking.pool.is_none(), "探测失败不得进池");
+        let sup = tasking.sup.expect("探测失败须归 TLA 桶（warn 打点）");
+        flag.store(true, Ordering::Relaxed);
+        sup.shutdown();
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

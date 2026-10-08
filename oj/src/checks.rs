@@ -224,19 +224,12 @@ pub fn run(
                         seed.display()
                     ));
                 }
-                if head == "INSERT" {
-                    let u = stmt.to_ascii_uppercase();
-                    let idempotent = u.contains("OR IGNORE")
-                        || u.contains("OR REPLACE")
-                        || u.contains("ON CONFLICT")
-                        || u.contains("ON DUPLICATE KEY");
-                    if !idempotent {
-                        v.push(format!(
-                            "S006: {}：seed.sql 含非幂等 INSERT（seed 随启动重放）\n  \
-                             下一步：改 INSERT OR IGNORE / ON CONFLICT DO UPDATE / OR REPLACE",
-                            seed.display()
-                        ));
-                    }
+                if head == "INSERT" && !insert_is_idempotent(stmt) {
+                    v.push(format!(
+                        "S006: {}：seed.sql 含非幂等 INSERT（seed 随启动重放）\n  \
+                         下一步：改 INSERT OR IGNORE / ON CONFLICT DO UPDATE / OR REPLACE",
+                        seed.display()
+                    ));
                 }
             }
             for table in sql_tables(&text, true) {
@@ -366,8 +359,8 @@ fn nested_manifests(src: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// 语句首词（跳过 `--` 行注释与空白；大小写归一）。
-fn lead_word(stmt: &str) -> String {
+/// 语句首词（跳过 `--` 行注释与空白；大小写归一）。S006 与 fixtures 门禁共用。
+pub(crate) fn lead_word(stmt: &str) -> String {
     stmt.lines()
         .find(|l| {
             let t = l.trim_start();
@@ -380,6 +373,16 @@ fn lead_word(stmt: &str) -> String {
                 .map(|w| w.to_ascii_uppercase())
         })
         .unwrap_or_default()
+}
+
+/// INSERT 幂等判据（S006 seed 与 `load_fixtures` 门禁共用同一口径）：两者都随启动/
+/// 重复灌放，必须可重放。
+pub(crate) fn insert_is_idempotent(stmt: &str) -> bool {
+    let u = stmt.to_ascii_uppercase();
+    u.contains("OR IGNORE")
+        || u.contains("OR REPLACE")
+        || u.contains("ON CONFLICT")
+        || u.contains("ON DUPLICATE KEY")
 }
 
 /// SQL 表名提取（口径统一 guard::extract_tables）。.ts 源码先抠 JS 字符串/

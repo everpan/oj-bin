@@ -5,7 +5,7 @@
 
 `oj` 是构建出来的命令行程序，本文讲以下几个常用子命令。
 
-## server
+## serve
   执行 `oj serve -c config.yaml` 会读取配置文件，启动一个 web 服务。
 
   -c config.yaml 读取配置文件中的信息，启动服务，其中包含 host port db redis 等配置信息
@@ -113,7 +113,7 @@
 
   `dist/manifests.yaml` 记录模块 → 版本的锁定关系（如 `user: 0.1.0`），每次构建 upsert 对应模块；版本升级后旧版本目录保留，可多版本共存，锁定文件始终指向当前版本。server release 模式按 `dist/manifests.yaml` 逐模块校验（白名单、版本目录存在、manifest name 与模块一致）后加载各 `routes.js` 聚合路由，任何校验失败即启动报错（fail-fast）。
 
-  `--check` 只跑结构检查（S002–S008：manifest 合法性 / 表归属单射 / 跨模块依赖声明 /
+  `--check` 只跑结构检查（S001–S008：manifest 合法性 / 表归属单射 / 跨模块依赖声明 /
   deps 版本范围 / tables 与 schema.yaml 一致 / seed 纪律 / 迁移文件序列 / 导入别名与
   deps 门禁），不写任何产物，可作 CI 门禁。
 
@@ -134,7 +134,7 @@
   退出码：全部通过 = 0，任一失败 = 1（可直接做 CI 门禁）。测试写法详见 `docs/testing.md`。
 
 ## migrate
-  应用模块迁移到最新（各模块 `migrations/*.sql` → 目标库；部署顺序 = build && migrate && server）。
+  应用模块迁移到最新（各模块 `migrations/*.sql` → 目标库；部署顺序 = build && migrate && serve）。
 
 ```
     oj migrate [-c config.yaml] [-d dir] [--db name] [--baseline] [module]

@@ -95,7 +95,7 @@ cargo test --release --workspace        # 全部测试（根 crate + oj e2e + �
                                         #   个别平台 SIGSEGV 时才按 workflow 的
                                         #   skip_infinite_loop 开关跳过，不再全局跳过）
 cargo test --release -p oj   # 单测 + e2e
-cargo test --release -p server  # server 单测
+cargo test --release -p serve  # serve 单测
 cargo test --release -- --nocapture    # 看 tracing 输出
 cargo build --benches        # 编译 criterion 基准（不跑）
 cargo bench                  # 跑基准（benches/bridge.rs，**必须 release**）
@@ -131,7 +131,7 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（release
 要改代码先知道东西放在哪。这节是仓库地图。
 
 ```
-Cargo.toml            # [workspace] members = ["server", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
+Cargo.toml            # [workspace] members = ["serve", "oj", "oj-plugin-ffi", "plugins/*", "tools/xtask"]
 src/                  # crate: only-js（lib）——核心执行层（纯 lib，无 bin；build.rs 仅生成扩展 JS 内嵌表）
 ├── lib.rs            # 导出 bridge + config
 ├── config.rs         # 配置加载：server{host,port,api_prefix,timeout,pool_size,app_path,…} + ws{max_connections,workers_per_route,idle_linger_ms} + db/redis/blob/es/broker/plugins 映射
@@ -153,7 +153,9 @@ src/                  # crate: only-js（lib）——核心执行层（纯 lib�
     ├── es.rs         # EsBackend trait + 内置 reqwest 实现（oj-es 插件经 FfiEsBackend 适配）
     ├── blob.rs       # BlobBackend trait + LocalBlob 内置（s3 迁插件）
     ├── cert.rs / crypto.rs / auth.rs / guard.rs   # cert 全局、jwt/bcrypt/crypto ops、鉴权
-    ├── fetch.rs / log.rs / ws.rs / inspector.rs   # fetch op、结构化日志、WS op、DevTools 桥
+    ├── log.rs / ws.rs / inspector.rs   # 结构化日志、WS op、DevTools 桥（fetch 走 deno_fetch
+    │                                    # 扩展，无独立模块；另有 mail/mq/ldap/oidc/sql_trace/
+    │                                    # task_pool/stream/vars/broker 等轴模块，未逐一列出）
     ├── frame_pool.rs  # WS 帧池：Scheduler（per-conn 保序）+ W 无状态 Worker + Rust 会话表
     ├── ffi.rs        # 全部 unsafe 收敛（load_forget dlopen）+ FfiXxxBackend 适配器层
     └── plugin_loader.rs # PluginLoader：四级路径解析 + 清单/扫描双模式 + ABI 门禁 + AXES 逐轴 dlsym
@@ -163,9 +165,9 @@ oj/                   # CLI 二进制：serve / build / test（子命令 fixture
 ├── manifest.rs       # manifest.yaml 解析 + module/version 白名单 + manifests.yaml 锁读写
 ├── pack.rs           # 确定性 tgz 打包（mtime=0/mode 0644/排序 → 同输入同字节）
 ├── build_cmd.rs      # build 子命令：按模块版本目录构建（转译+minify/routes.js/锁/tgz）
-├── serve_cmd.rs     # server 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
+├── serve_cmd.rs     # serve 子命令：start() + 模式自动判定 + release 聚合 + 插件装配
 └── tests/e2e.rs      # 端到端验收（UC-1…15）
-server/               # crate: server（axum HTTP 层）
+serve/                 # crate: serve（axum HTTP 层）
 ├── lib.rs            # axum app 装配 + 前置管线 + 静态站点兜底 + serve_router
 ├── auth.rs           # JWT 核心：Claims 签验、匿名匹配、session（KV）
 ├── routes.rs         # directory-mirror URL → handler 映射
@@ -183,7 +185,7 @@ bin/                  # 编译产物目录（bin/oj + bin/plugins/<triple>/，�
 benches/bridge.rs     # criterion 基准
 ```
 
-依赖分层：`bridge`（纯执行，不依赖 HTTP 框架）← `server`（axum 路由 + actor）← `oj`（CLI 装配）。
+依赖分层：`bridge`（纯执行，不依赖 HTTP 框架）← `serve`（axum 路由 + actor）← `oj`（CLI 装配）。
 插件侧只依赖 `oj-plugin-ffi` + 各自后端 SDK，脱离宿主 workspace 可独立编译。
 外部后端（mysql/postgres/s3/kafka/rabbitmq/redis）一律经插件提供，core 只留内置兜底
 （sqlite/memory/local Bus/InMemoryKV）。
@@ -197,11 +199,11 @@ benches/bridge.rs     # criterion 基准
 
 ```
 HTTP 请求
-  └─ server/lib.rs handle：依次 路由表 lookup（matchit）→ dev 目录镜像兜底（routes.rs）
+  └─ serve/lib.rs handle：依次 路由表 lookup（matchit）→ dev 目录镜像兜底（routes.rs）
      → 静态站点（legacy `server.app_path` 或 v0.1.27 多站点 `server.static_sites`，
         最长前缀命中、站内 miss 不跨站，仅 GET/HEAD）→ 404
        └─ 命中 api 文件 → 交给 JsActor
-            └─ server/actor.rs：线程化执行（Send bridge 工厂），池化 JsRuntime
+            └─ serve/actor.rs：线程化执行（Send bridge 工厂），池化 JsRuntime
                  └─ bridge：driver 模块 file:///oj/driver/{N}.js（AtomicU64 递增）
                       const m = await import(spec);   // side module 触发 TLA
                       const fn = m.default?.[method];
@@ -259,7 +261,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `blob(name?)` | 对象存储：`put/get/del/url/contentType/uploadUrl/copy/move/readRange` | `blob:` 段启用；下载走 `{base}/blob/{key}`（local 内联支持 Range 206）；直传 `PUT {base}/blob/{key}`（v0.1.30）；multipart 大文件流式直落 blob + `http.files[i].key/url`（v0.1.38，ABI 10 `put_stream_*`）；`copy`/`move`/`readRange` 为服务端搬运与区间读（v0.1.47，ABI 11）：`copy` 保留 src、`move` 删 src、`readRange` 短读截断（越尾只给实际剩余字节、offset 过尾给空数组） |
 | `bus.publish/subscribe/kind` | 事件总线 | HTTP 发布、WS 订阅；`kind()` 是异步 op |
 | `es.search/index/del` | Elasticsearch 薄客户端 | `es:` 段启用，未配置报错 |
-| `fetch(url, opts?)` | 浏览器兼容 Fetch（reqwest） | 响应整体缓冲；不支持 AbortController |
+| `fetch(url, opts?)` | WHATWG Fetch（deno_fetch：流式 body / AbortController） | SSRF 防护未做（出网白名单/内网阻断，见「仍开放」） |
 | `log.debug/info/warn/error(msg, ...kv)` | 结构化日志（tracing） | 交替键值对 |
 | `cert.generate/renew` | JWS 证书签发/续期（Rust RSA） | 纯内存，不落盘 |
 | `jwt.sign/verify` + `jwt.accessDuration/refreshDuration` | JWT 签发验签 | 密钥/时长装配期注入；claims 固定 `{sub,roles,iat,exp}` |
@@ -458,7 +460,7 @@ query/exec/query_build 按 `resolve_target` 路由（本库 tx 会话 / 他库�
 `Arc`，跨请求不串号。JS 侧 id 惰性 resolve（open 是异步 op 返回 Promise），id 用 `f64`
 传递（op2 原生整型/`#[serde]` 序列化异常的规避，见 `src/bridge/db.rs`）。
 
-前置管线：`server::Pipeline` 是 handle() 进 JS 前的单一扩展点（租户/鉴权/blob 已接入，后续
+前置管线：`serve::Pipeline` 是 handle() 进 JS 前的单一扩展点（租户/鉴权/blob 已接入，后续
 只加字段不改编构）。提取/守卫逻辑在 run 闭包的 async 块开头，失败走
 `fail_response(400/401, …)` 信封。鉴权端点（login/refresh/logout）是普通业务路由而非内置
 路由；blob 下载是内置公开路由（auth 之后、路由表 lookup 之前，免鉴权）。
@@ -609,7 +611,7 @@ server:
 ```
 
 生成与续期（`tools/oj-cert`；格式契约单一事实来源在 `oj-cert`，CLI 与 `cert` 全局同源；
-验签与状态判定在 `server/src/certificate.rs`）：
+验签与状态判定在 `serve/src/certificate.rs`）：
 
 ```sh
 cargo run -p oj-cert -- gen -o config --days 365   # 生成 private.pem / public.pem / cert.jws
@@ -870,7 +872,7 @@ core，装配层只经安全入口）。
 
 见 spec `docs/superpowers/specs/2026-08-22-oj-server-sample-design.md` §8 的 D1–D4：
 
-- 相对 `require()` 不支持，这是已知限制（db 仅 sqlite 已解除：多库 DSN 按 scheme 分发）。
+- 相对 `require("./x")` 自 v0.1.30 起可用（候选 .js/.json/index.js、JSON 模块、循环 require 返回部分 exports；见上文 CJS 互操作一节）。
   外部后端已于插件系统阶段全部 cdylib 化（见 §13）。
 - `build` 已实现（按模块版本目录 + 产物保留原名原结构 + 默认 minify + manifests.yaml 锁 +
   确定性 tgz + release 聚合），设计见
@@ -878,14 +880,14 @@ core，装配层只经安全入口）。
 
 ### 已落地（旧待办销账）
 
-HTTP server（`server/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门狗（`KillSwitch` 跨线程
+HTTP 服务（`serve/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门狗（`KillSwitch` 跨线程
 `terminate_execution` 超时熔断，超时回 408 信封）；handler TS 类型（`sample/global.d.ts`）。
 
 ### 仍开放
 
 - **fetch SSRF 防护**：出网白名单、内网/RFC1918/链路本地 IP 阻断、body 上限、
-  DNS 解析后复检（防重绑定）、重定向复检。`src/bridge/fetch.rs` 目前均未做
-  （仅 `no_proxy` + 响应整体缓冲）。
+  DNS 解析后复检（防重绑定）、重定向复检。目前均未做（`fetch` 由 deno_fetch 扩展
+  提供 WHATWG 语义，桥内无独立 fetch.rs；仅 `no_proxy` 注入）。
 - ~~**V8 内存上限**~~：**已落地（v0.1.40）**——`server.js_heap_limit_bytes`（默认 256 MiB，
   ≥32 MiB）经 V8 near-heap-limit 回调终止超限 isolate 并丢弃（不回池），超限请求 5xx 信封。
   已知边界：单个 > 限额的巨型分配仍可能触发 V8 Fatal（V8 二次逼近语义），文档登记。

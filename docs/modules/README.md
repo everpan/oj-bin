@@ -20,7 +20,7 @@
 | 00 | **总览** | 全仓 | — | 分层、依赖方向、请求全链路、状态模型、红线、文件地图 |
 | 01 | **核心运行时** | `src/`（crate `only-js`） | ~11.5k | deno_core 桥：op 注册、JS 全局装配、状态模型、runtime 池、SQL 白名单、插件加载 |
 | 02 | **配置模型** | `src/config.rs` | 661 | `config.yaml` 的权威 schema 与解析（段存在即启用） |
-| 03 | **HTTP 服务** | `server/` | ~4.2k | axum：路由表、前置管线（鉴权/租户/上传）、JS actor 派发、证书门禁、WS、日志 |
+| 03 | **HTTP 服务** | `serve/` | ~4.2k | axum：路由表、前置管线（鉴权/租户/上传）、JS actor 派发、证书门禁、WS、日志 |
 | 04 | **CLI 编排** | `oj/` | ~7.2k | `serve` / `build` / `test`（含 `test fixture` 子命令）/ `migrate` / `schema diff` / `secret` / `exec` / `openapi`；装配与构建 |
 | 05 | **FFI 契约 + 插件** | `oj-plugin-ffi/` + `plugins/*` | 553 + ~3.5k | C-ABI 契约（`ABI_VERSION`、vtable、入口宏）+ 10 个 cdylib 第一方插件 |
 | 06 | **工具链** | `tools/`、`benches/`、`tests/plugins/` | ~1k | xtask 构建归置、oj-cert 证书工具、criterion 基准、测试夹具插件 |
@@ -36,22 +36,22 @@
          │
     ┌────┴─────┬──────────────┐
     ▼          ▼              ▼
- server/    src/          oj-plugin-ffi/  ◄── 被 oj/ 与 plugins/* 同时依赖
+ serve/     src/          oj-plugin-ffi/  ◄── 被 oj/ 与 plugins/* 同时依赖
  (axum)   (only-js 核心)      ▲
     │          │              │
     └──────────┴── plugins/* ─┘   （插件只依赖契约，不依赖核心/服务）
 
 tools/xtask   —— 独立构建工具（不参与运行时依赖图）
-tools/oj-cert —— 证书生成/重签（`server` 的 dev-dependency 用其 test-support 夹具）
+tools/oj-cert —— 证书生成/重签（`serve` 的 dev-dependency 用其 test-support 夹具）
 ```
 
 关键约束：
 
 - **插件不依赖核心**。`plugins/*` 只 `use oj_plugin_ffi::*`；核心通过 `dlopen` + vtable 反向调用
   插件。这保证「不装的能力不进二进制、不进依赖树」。
-- **`src/` 不依赖 `server/` 或 `oj/`**。核心只提供 `pub mod bridge` + `pub mod config`
+- **`src/` 不依赖 `serve/` 或 `oj/`**。核心只提供 `pub mod bridge` + `pub mod config`
   （`src/lib.rs`）。装配决策（连哪个库、挂不挂鉴权）全在 `oj/src/app.rs`。
-- **`server/` 依赖 `src/`**，不反过来。WS 桥接所需的一切都由 `oj` 以 `make_bridge` 工厂传入。
+- **`serve/` 依赖 `src/`**，不反过来。WS 桥接所需的一切都由 `oj` 以 `make_bridge` 工厂传入。
 
 ---
 
@@ -59,16 +59,16 @@ tools/oj-cert —— 证书生成/重签（`server` 的 dev-dependency 用其 te
 
 ```
 HTTP 请求
- └─ server/src/lib.rs::handle()                     ← axum fallback（catch-all）
-     ├─ 证书 GET 门禁（Expired/Grace → 403）          ← server/src/certificate*.rs
+ └─ serve/src/lib.rs::handle()                     ← axum fallback（catch-all）
+     ├─ 证书 GET 门禁（Expired/Grace → 403）          ← serve/src/certificate*.rs
      ├─ {base}/blob/{key} 公开下载                    ← src/bridge/blob.rs
-     ├─ RouteTable.lookup(path, verb)                 ← server/src/routes.rs（matchit）
+     ├─ RouteTable.lookup(path, verb)                 ← serve/src/routes.rs（matchit）
      │    └─ 四态：Hit / Conflict(500) / MethodNotAllowed(405) / NotFound
      ├─ 前置管线 Pipeline
      │    ├─ AuthGuard.verify()   → 401 或 http.user  ← plugins/oj-auth（经 FFI）
      │    ├─ 租户头提取           → 400 或 http.tenantId
      │    └─ 体积上限 413 + multipart 解析
-     ├─ JsActor.run_module()                          ← server/src/actor.rs
+     ├─ JsActor.run_module()                          ← serve/src/actor.rs
      │    └─ mpsc → 专用 OS 线程（current_thread rt，串行）
      │         └─ Bridge::run_module()                ← src/bridge/mod.rs
      │              ├─ RuntimePool.checkout()（复用 V8 isolate；必要时跑 ext_boot）

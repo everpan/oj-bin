@@ -80,7 +80,7 @@ pub struct BuildArgs {
     /// 转译产物 minify（swc 全量压缩 + 函数内局部变量名混淆）。默认开；
     /// `--no-minify` 排障逃生门（多行可读产物）。
     pub minify: bool,
-    /// 只跑结构检查（S002–S007）不落盘（§5.2 CI 门禁 / 本地快查）。
+    /// 只跑结构检查（S001–S008）不落盘（§5.2 CI 门禁 / 本地快查）。
     pub check: bool,
 }
 
@@ -273,7 +273,7 @@ enum Commands {
         /// 产物不 minify（默认 minify；排障逃生门，得到多行可读产物）
         #[arg(long)]
         no_minify: bool,
-        /// 只跑结构检查（S002–S007），不写任何产物（CI 门禁）
+        /// 只跑结构检查（S001–S008），不写任何产物（CI 门禁）
         #[arg(long)]
         check: bool,
     },

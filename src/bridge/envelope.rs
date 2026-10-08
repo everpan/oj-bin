@@ -35,6 +35,12 @@ pub fn ok_raw_ext(data_json: &str, sql_json: &str) -> Vec<u8> {
     buf
 }
 
+/// 业务 code → HTTP 状态（正数直取；>u16::MAX clamp 到 u16::MAX——`as u16` 强转会
+/// 静默回绕成错值，如 70000 → 4464）。
+fn clamp_status(code: i32) -> u16 {
+    u16::try_from(code).unwrap_or(u16::MAX)
+}
+
 /// Fail 返回失败信封，并返回应映射的 HTTP 状态码（code<=0 默认 500）。
 pub fn fail(code: i32, msg: &str, data: &Value) -> (Vec<u8>, u16) {
     let code = if code <= 0 { 500 } else { code };
@@ -46,12 +52,12 @@ pub fn fail(code: i32, msg: &str, data: &Value) -> (Vec<u8>, u16) {
     buf.extend_from_slice(br#","data":"#);
     serde_json::to_writer(&mut buf, data).expect("envelope marshal");
     buf.push(b'}');
-    (buf, code as u16)
+    (buf, clamp_status(code))
 }
 
 /// StatusCode 将业务 code 映射为 HTTP 状态码（code<=0 → 200）。
 pub fn status_code(code: i32) -> u16 {
-    if code <= 0 { 200 } else { code as u16 }
+    if code <= 0 { 200 } else { clamp_status(code) }
 }
 
 #[cfg(test)]
@@ -71,5 +77,18 @@ mod tests {
 
         assert_eq!(status_code(0), 200);
         assert_eq!(status_code(404), 404);
+    }
+
+    /// 超界业务 code 不得 `as u16` 回绕（70000 → 4464 是错值）：HTTP 状态 clamp 到
+    /// u16::MAX，信封 body 保留全精度业务 code。
+    #[test]
+    fn oversized_codes_clamp_instead_of_wrap() {
+        assert_eq!(status_code(70_000), u16::MAX);
+        assert_eq!(status_code(65_535), 65_535);
+        assert_eq!(status_code(i32::MAX), u16::MAX);
+        let (body, status) = fail(70_000, "boom", &Value::Null);
+        assert_eq!(status, u16::MAX);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["code"], 70_000);
     }
 }

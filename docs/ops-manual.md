@@ -20,7 +20,7 @@ cargo xtask build          # release 构建，产物归置 bin/oj + bin/plugins/
    默认 minify 成单行）、锁文件 `dist/manifests.yaml` 与确定性发布包
    `dist/<module>-<version>.tgz`（同输入重复打包字节一致，可校验完整性）。
    排障需要可读产物时加 `--no-minify` 重建。CI 可在构建前跑 `oj build --check`
-   （只跑结构检查 S002–S006 不落盘，违规 exit 1）。
+   （只跑结构检查 S001–S008 不落盘，违规 exit 1）。
 3. `oj migrate -c config.yaml -d dist`——应用各模块 `migrations/*.sql` 并按 `schema.yaml`
    收敛（release 默认 `migrate_on_start: verify` 门禁要求账本不落后，**先迁移后启动**）；
    存量库接入用 `--baseline`。发布前可跑 `oj schema diff` 做声明 vs 实库对账（漂移 exit 1）。
@@ -110,7 +110,13 @@ kill 12345                       # 停机：SIGTERM 走优雅停机（排空在�
 ```bash
 ./oj exec scripts/fix-roles.ts -c config.yaml -- --dry-run   # -- 后 argv 注入脚本 args
 ./oj exec scripts/fix-roles.ts -c config.yaml --log-file fix.jsonl
+./oj exec -e 'console.log(await db.query("select 1", []))' -c config.yaml   # 内联代码（v0.1.50）
+./oj exec --repl -c config.yaml                             # 交互式 REPL（v0.1.50；变量不跨行持久，需挂 globalThis）
 ```
+
+生产排障开 SQL 追踪（v0.1.51）：config 顶层 `db_trace.enabled: true`（release 默认关），
+每条 SQL 打 `target="oj::sql"` 结构化日志；`db_trace.redact_params` 默认脱敏（只记参数
+个数），设 false 才记明文（仅服务端日志）。`_sql` 信封字段仅在追踪开启时附加。
 
 一次性数据修复/对账/批处理用。**迁移默认 off 是与 server dev 相反的缺省**——
 server dev 不写 `migrate_on_start` 时缺省 `auto`（启动即应用迁移），`oj exec` 同样
@@ -274,7 +280,7 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | 启动报 `M004: 模块 … 有 N 个待应用迁移 … verify 模式拒启` | release 默认 `migrate_on_start: verify`，迁移账本 `_oj_migrations（module 列区分模块）` 落后于 dist 内迁移文件 | 先 `oj migrate -c config.yaml -d dist` 再启动；`off` 是逃生门（迁移归运维，不推荐常态） |
 | `oj schema diff` 报 D001/D002 退出 1 | 声明（schema.yaml）与实库漂移——手工改库、漏迁移、删除列未走迁移 | 按 diff 报告逐条补迁移或修正声明；发布前跑一次作巡检 |
 | `oj migrate` / `test fixture` / `schema diff` 报 `--db "x" not declared in config (db keys: […])` | `--db` 给的 profile 不在 config `db:` 段；工具**不回落** default（防迁错库） | 核对 `db:` 段的键名拼写；多库部署逐 profile 各跑一遍 |
-| 启动/build 报 `S002–S006` | 结构检查违规：表归属冲突（S002）、跨模块表未声明 deps（S003）、deps 版本不满足（S004）、tables 与 schema.yaml 不一致（S005）、seed 纪律（S006） | 按报错「下一步」修复；只查不落盘用 `oj build --check` |
+| 启动/build 报结构检查违规（S001–S008） | manifest 合法性（S001）、表归属冲突（S002）、跨模块表未声明 deps（S003）、deps 版本不满足（S004）、tables 与 schema.yaml 不一致（S005）、seed 纪律（S006）、迁移文件序列（S007）、导入别名/deps 门禁（S008） | 按报错「下一步」修复；只查不落盘用 `oj build --check` |
 
 ## 8. 回滚与恢复
 

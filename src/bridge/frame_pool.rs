@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -130,6 +130,15 @@ impl Scheduler {
         }
     }
 
+    /// Worker 帧中 panic 后的连接清场（panic 恢复路径专用）：在飞帧已随 unwind
+    /// 消亡（done 被 drop → fire 得 PoolClosed），复用 drop_conn 作废排队帧并清
+    /// 在飞标记——同连接后续帧被正常调度而非永久挂起。
+    pub(crate) fn panic_conn(&self, conn: u64) {
+        self.drop_conn(conn);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.in_flight.remove(&conn);
+    }
+
     /// 退役：拒绝新帧、排空存量（Worker pull→None 退出）。
     pub(crate) fn close(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -169,6 +178,8 @@ pub struct RoutePool {
     conn_seq: AtomicU64,
     live: AtomicUsize,
     poisoned: AtomicUsize,
+    /// retire 线程在途标记：空池 detach 去重，不重复叠 sleep 线程。
+    retiring: AtomicBool,
 }
 
 impl RoutePool {
@@ -191,6 +202,7 @@ impl RoutePool {
             conn_seq: AtomicU64::new(0),
             live: AtomicUsize::new(0),
             poisoned: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
         })
     }
 
@@ -250,6 +262,8 @@ impl RoutePool {
 
     pub(crate) fn spawn_worker(self: &Arc<Self>) {
         let pool = Arc::clone(self);
+        // 本 Worker 当前正在执行的连接（0 = 不在帧中）：panic 恢复时据此清场。
+        let cur = Arc::new(AtomicU64::new(0));
         self.live.fetch_add(1, Ordering::SeqCst);
         std::thread::Builder::new()
             .name("ws-worker".into())
@@ -264,7 +278,7 @@ impl RoutePool {
                         .build()
                         .expect("ws worker rt");
                     // live 的扣减在 worker_main 内部（退出即扣，先于 close 等副作用可见）。
-                    rt.block_on(pool.clone().worker_main())
+                    rt.block_on(pool.clone().worker_main(cur.clone()))
                 }));
                 match r {
                     Ok(poisoned) => {
@@ -276,6 +290,13 @@ impl RoutePool {
                     }
                     Err(e) => {
                         eprintln!("ws worker panicked: {e:?}");
+                        // 帧中 panic：清场该连接（在飞标记 + 排队帧），同连接后续帧
+                        // 立刻回错而非永久挂起；cur==0 = panic 未发生在帧执行中
+                        // （rt 构建/make 阶段），无需清场。
+                        let conn = cur.load(Ordering::SeqCst);
+                        if conn != 0 {
+                            pool.sched.panic_conn(conn);
+                        }
                         pool.live.fetch_sub(1, Ordering::SeqCst);
                         respawn_if_needed(&pool);
                     }
@@ -293,7 +314,8 @@ impl RoutePool {
     }
 
     /// Worker 主循环：返回是否毒化退出。live 在此扣减（每个退出路径恰一次）。
-    async fn worker_main(self: Arc<Self>) -> bool {
+    /// cur = 本 Worker 在飞连接标记（panic 恢复路径据此清场）。
+    async fn worker_main(self: Arc<Self>, cur: Arc<AtomicU64>) -> bool {
         let bridge = (self.make)();
         // 预载：模块加载 + 钩子装配（复用 ws_connect；失败 → 本 Worker 不可用，
         // 排空队列让 fire 立刻拿到 PoolClosed——预载失败 = 该文件永久不可用，
@@ -329,8 +351,13 @@ impl RoutePool {
                 bus_tx,
                 ..Default::default()
             };
-            let r = ws_event(&mut sess, f.conn, f.ev, &req, &state, self.timeout).await;
-            self.sched.complete(f.conn);
+            let r = {
+                cur.store(f.conn, Ordering::SeqCst);
+                let r = ws_event(&mut sess, f.conn, f.ev, &req, &state, self.timeout).await;
+                self.sched.complete(f.conn);
+                cur.store(0, Ordering::SeqCst);
+                r
+            };
             match r {
                 Ok((outcome, new_state)) => {
                     // new_state=None = dispatcher finally 回传失败（sess 不可 JSON 序列化，
@@ -474,13 +501,17 @@ impl ConnHandle {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.conn);
         self.pool.sched.drop_conn(self.conn);
-        // 空池 → linger 计时（独立线程；linger=0 走 sleep(0)，同一路径）。
+        // 空池 → linger 计时（共享单一 retire 线程；linger=0 走 sleep(0)，同一路径）。
+        // 在途 retire 未落定则不重复 spawn（此前每次空 detach 都叠一个 sleep 线程）。
+        // ponytail: linger 期间来了又走的连接复用在途计时，退役可能早于其完整
+        // linger——空池退役是纯优化（attach 见 closed 即复活），取最简去重。
         if self
             .pool
             .sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
+            && !self.pool.retiring.swap(true, Ordering::SeqCst)
         {
             let pool = Arc::clone(&self.pool);
             std::thread::Builder::new()
@@ -496,6 +527,7 @@ impl ConnHandle {
                     {
                         pool.sched.close();
                     }
+                    pool.retiring.store(false, Ordering::SeqCst);
                 })
                 .expect("spawn ws-retire");
         }
@@ -565,6 +597,33 @@ mod tests {
         s.complete(7); // 释放 waiting 里的 f2
         let got2 = s.pull().await.unwrap();
         assert_eq!(got2.conn, 7);
+        s.complete(7);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_panic_conn_errors_queued_and_releases_in_flight() {
+        // Worker 帧中 panic 恢复（panic_conn）钉：在飞帧随 unwind 消亡（done 被
+        // drop），同连接排队帧必须回错、在飞标记必须清掉——否则该连接后续帧永久挂起
+        // （旧代码 panic 恢复只补扣 live + 补员，不清 Scheduler 状态）。
+        let s = Scheduler::new();
+        let (f1, r1) = frame(7);
+        s.submit(f1);
+        let (f2, r2) = frame(7);
+        s.submit(f2); // conn7 在飞 → f2 进 waiting
+        let in_flight = s.pull().await.unwrap();
+        assert_eq!(in_flight.conn, 7);
+        drop(in_flight); // unwind 丢帧：done sender 随之 drop
+        assert!(r1.await.is_err(), "在飞帧的 fire 必须立刻得错而非挂起");
+        s.panic_conn(7); // panic 恢复路径的连接清场
+        assert!(matches!(r2.await, Ok(Err(FrameError::Dropped))));
+        // 在飞标记已清：同连接下一帧照常被调度（旧代码此处永久挂起）。
+        let (f3, _r3) = frame(7);
+        s.submit(f3);
+        let got = tokio::time::timeout(Duration::from_secs(2), s.pull())
+            .await
+            .expect("panic 清场后同连接下一帧必须可调度")
+            .unwrap();
+        assert_eq!(got.conn, 7);
         s.complete(7);
     }
 
@@ -919,6 +978,74 @@ export default {
         assert!(String::from_utf8_lossy(&o.capture.body).contains("\"ok\":1"));
         assert_eq!(pool.live_workers(), 1);
         h.detach();
+    }
+
+    /// retire 线程去重钉：linger 在途期间的空 detach 不再叠加 retire 线程；
+    /// 在途 retire 落定后标记复位，后续空 detach 照常退役。
+    #[tokio::test(flavor = "current_thread")]
+    async fn retire_dedupes_while_linger_in_flight_and_resets_after() {
+        let dir = pool_dir("retire-dedupe");
+        let ws_file = dir.join("ws.js");
+        std::fs::write(
+            &ws_file,
+            r#"export default { message() { json.ok({ ok: 1 }); } };"#,
+        )
+        .unwrap();
+        // linger 取 300ms：足以让测试在在途窗口内完成去重断言，又不必等 60s 验证复位。
+        let pool = RoutePool::new(
+            ws_file,
+            ws_test_bridge(&dir),
+            Duration::from_secs(1),
+            1,
+            300,
+        );
+        let (btx, _) = mpsc::unbounded_channel();
+        let h = pool.attach(btx);
+        h.fire("message", vec![], false).await.unwrap();
+        h.detach();
+        for _ in 0..50 {
+            if pool.retiring.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            pool.retiring.load(Ordering::SeqCst),
+            "detach 后 retire 在途"
+        );
+        // linger 在途期间第二条连接来了又走：不再 spawn 第二个 retire（去重），
+        // 池也未退役。
+        let (btx2, _) = mpsc::unbounded_channel();
+        let h2 = pool.attach(btx2);
+        h2.fire("message", vec![], false).await.unwrap();
+        h2.detach();
+        assert!(pool.retiring.load(Ordering::SeqCst));
+        assert!(
+            !pool
+                .sched
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .closed,
+            "linger 在途期间池不得退役"
+        );
+        // 在途 retire 落定：仍空 → 退役 + 标记复位（后续 detach 可再排退休）。
+        let mut retired = false;
+        for _ in 0..100 {
+            if !pool.retiring.load(Ordering::SeqCst)
+                && pool
+                    .sched
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .closed
+            {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(retired, "linger 到期必须退役并复位 retiring");
     }
 
     /// sess.state 不可序列化赋值不清空旧状态（v0.1.10 终审 #4）：帧2 给 sess.state

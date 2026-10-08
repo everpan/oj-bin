@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -552,6 +552,8 @@ pub struct TaskPool {
     jobs_rx: Mutex<std::sync::mpsc::Receiver<OnceJob>>,
     shutdown: Arc<AtomicBool>,
     handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// 存活 Worker 数（panic 补员自愈的观测量）。
+    live: AtomicUsize,
 }
 
 impl TaskPool {
@@ -574,6 +576,7 @@ impl TaskPool {
             jobs_rx: Mutex::new(jobs_rx),
             shutdown: Arc::new(AtomicBool::new(false)),
             handles: Mutex::new(Vec::new()),
+            live: AtomicUsize::new(0),
         })
     }
 
@@ -606,6 +609,11 @@ impl TaskPool {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// 存活 Worker 数（panic 补员自愈的观测量）。
+    pub fn live_workers(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
     /// 停机收场（PRD v2 FR-LT-005）：置位 → join 全部 Worker（Worker 退出前
     /// 已对每个会话尽力 teardown）。阻塞调用，调用方宜在 blocking 上下文。
     pub fn shutdown_and_join(&self) {
@@ -619,6 +627,7 @@ impl TaskPool {
 
     fn spawn_worker(self: &Arc<Self>, worker_id: usize, assigned: Vec<String>) {
         let pool = Arc::clone(self);
+        self.live.fetch_add(1, Ordering::SeqCst);
         let h = std::thread::Builder::new()
             .name(format!("task-worker-{worker_id}"))
             .spawn(move || {
@@ -627,10 +636,16 @@ impl TaskPool {
                         .enable_all()
                         .build()
                         .expect("task worker rt");
-                    rt.block_on(pool.worker_main(worker_id, assigned))
+                    rt.block_on(pool.clone().worker_main(worker_id, assigned.clone()))
                 }));
+                pool.live.fetch_sub(1, Ordering::SeqCst);
                 if let Err(e) = r {
                     eprintln!("task worker {worker_id} panicked: {e:?}");
+                    // 补员（对照 frame_pool）：panic Worker 带走一个坑位，原参重起
+                    // 保持总量；停机中不补（Worker 自然退出即收场）。
+                    if !pool.shutdown.load(Ordering::SeqCst) {
+                        pool.spawn_worker(worker_id, assigned);
+                    }
                 }
             })
             .expect("spawn task-worker");
@@ -655,7 +670,8 @@ impl TaskPool {
                     rx.try_recv().ok()
                 };
                 let Some(job) = job else { break };
-                self.run_once(&bridge, &job).await;
+                // stopping 后 run_once 内部拒绝（排队作业快速出队，不阻塞停机）。
+                let _ = self.run_once(&bridge, &job).await;
             }
             // 2) long 任务对齐 + 轮转。
             let mut idle = true;
@@ -797,7 +813,15 @@ impl TaskPool {
 
     /// 一次性作业：整文件执行一次（cron 脚本 = 普通模块，评估完即结束）。
     /// 复用 run_task 管道（flag 永否 → 自然跑完即 Stopped）。
-    async fn run_once(self: &Arc<Self>, bridge: &Bridge, job: &OnceJob) {
+    /// 停机（stopping）置位后拒绝新作业——在途作业由 run_task 的 grace 看门狗
+    /// 兜底，shutdown_and_join 经 join 等其收场，不无限期阻塞。
+    async fn run_once(self: &Arc<Self>, bridge: &Bridge, job: &OnceJob) -> Result<(), String> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(format!(
+                "task pool stopping: run_once '{}' rejected",
+                job.name
+            ));
+        }
         self.registry
             .set_status(&job.name, TaskStatus::Running, None);
         self.registry.log.record(
@@ -830,6 +854,7 @@ impl TaskPool {
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -926,5 +951,108 @@ mod tests {
         // 1970-01-01 00:00:00Z = 周四。
         let (mi, h, d, mo, dow) = CronExpr::civil(0);
         assert_eq!((mi, h, d, mo, dow), (0, 0, 1, 1, 4));
+    }
+
+    // ---------- panic 补员 / 停机拒绝（对照 frame_pool 夹具形态） ----------
+
+    use super::super::{Extras, InMemoryKV, LoaderShared, SchemaRegistry};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// Bridge 测试工厂（带模块加载器；panic 注入/拒绝路径均不真正执行任务文件）。
+    fn test_bridge(root: &std::path::Path) -> Arc<dyn Fn() -> Bridge + Send + Sync> {
+        let root = root.to_path_buf();
+        Arc::new(move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras::default(),
+            )
+        })
+    }
+
+    fn bridge_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oj-taskpool-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// panic 补员钉（对照 frame_pool 的 worker panic 存活钉）：Worker 线程内 panic
+    /// （make 首调注入）后池必须补员——旧代码只标记 failed 不 respawn，坑位永久丢失。
+    #[test]
+    fn given_worker_panic_when_respawn_then_live_recovered() {
+        let d = bridge_dir("panic");
+        let inner = test_bridge(&d);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let make: Arc<dyn Fn() -> Bridge + Send + Sync> = Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("test-injected task worker panic");
+            }
+            inner()
+        });
+        let pool = TaskPool::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            make,
+            TaskRegistry::new(TaskEventLog::memory_only()),
+        );
+        pool.spawn();
+        // 第 2 次 make = 补员 Worker 已就位（首调 panic → fetch_sub → 原参重起）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.load(Ordering::SeqCst) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "panic 后必须补员，calls={}",
+                seen.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.live_workers(), 1, "存活 Worker 数必须恢复");
+        pool.shutdown_and_join();
+        assert_eq!(pool.live_workers(), 0, "join 后 Worker 全部退出");
+    }
+
+    /// 停机拒绝钉：stopping 置位后 run_once 返回明确错误，且不触碰任务状态
+    /// （不得误标 Running/Failed）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_stopping_when_run_once_then_rejected_without_status_change() {
+        let d = bridge_dir("stop");
+        let pool = TaskPool::new(
+            1,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            test_bridge(&d),
+            TaskRegistry::new(TaskEventLog::memory_only()),
+        );
+        pool.registry.upsert(TaskEntry::cron(
+            "nightly",
+            PathBuf::from("/t/nightly.ts"),
+            CronExpr::parse("* * * * *").unwrap(),
+        ));
+        pool.shutdown();
+        let bridge = (test_bridge(&d))();
+        let err = pool
+            .run_once(
+                &bridge,
+                &OnceJob {
+                    name: "nightly".into(),
+                    path: PathBuf::from("/t/nightly.ts"),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("stopping"), "{err}");
+        assert_eq!(
+            pool.registry.get("nightly").unwrap().status,
+            TaskStatus::Pending
+        );
     }
 }

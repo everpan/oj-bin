@@ -167,7 +167,7 @@ flowchart LR
 | 裸 JSON | `src/bridge/json.rs` | `json.raw(data)`——200 裸 JSON，默认 content-type，`json.header` 可覆盖 |
 | 全局挂载 | `src/bridge/bootstrap.js` | `oidc` 全局（sign/verify/jwks/issuer/rp/clients）；ASCII 纪律 |
 | 装配 | `oj/src/app.rs` | `cfg.oidc → OidcState::from_section → Extras.oidc/StableState`（构造期，fail-fast） |
-| 租户豁免 | `server/src/lib.rs` | `Pipeline.tenant_anon` + `path_matches`（字面 / `/*` 一层 / `*` 单段 / `**` 跨段）；run 闭包豁免缺失头 400 并置 `RequestInfo.anonymous` |
+| 租户豁免 | `serve/src/lib.rs` | `Pipeline.tenant_anon` + `path_matches`（字面 / `/*` 一层 / `*` 单段 / `**` 跨段）；run 闭包豁免缺失头 400 并置 `RequestInfo.anonymous` |
 | OP | `sample/src/idp/` | discovery / jwks.json / authorize / login / token / userinfo（六端点） |
 | RP | `sample/src/oidc/` | login / callback / logout（三端点） |
 | 共享工具 | `sample/src/auth/_shared/util.ts` | redirect / nowSecs / b64uFromHex / parseForm / parseCookies（构建顺序 auth 最先） |

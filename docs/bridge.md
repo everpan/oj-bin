@@ -42,7 +42,7 @@
 ```js
 json.ok(data)              // {code:0, msg:"ok", data} → status 200，标记会话完成
 json.fail(code, msg, data) // code<=0 映射 500
-json.header(name, value)   // 设置返回头（覆盖语义），空名忽略
+json.header(name, value)   // 追加返回头（有序、同名可重复，v0.1.46），空名忽略
 json.raw(data)             // 裸 JSON 200（无信封外壳），标准协议端点用（OP discovery/token 等）
 ```
 

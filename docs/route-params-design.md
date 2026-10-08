@@ -12,7 +12,7 @@
 > 与 `#` 别名实化，见 `docs/devkit/api-manual.md` §5 与
 > `docs/superpowers/specs/2026-09-15-module-import-alias-design.md`）；
 > 其余章节（matchit 语法/冲突处理/http.params）仍准确。
-> 关联：`server/src/routes.rs`、`server/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/serve_cmd.rs`
+> 关联：`serve/src/routes.rs`、`serve/src/lib.rs`、`src/bridge/bootstrap.js`、`src/bridge/module_loader.rs`、`src/bridge/mod.rs`、`../oj/src/serve_cmd.rs`
 > 背景：当前目录镜像路由（`base + 目录路径 → <root>/<path>/api.(ts|js)`）**无路径参数**。`lib.rs:87` 写死 `params: HashMap::new()`，`http.param`(`bootstrap.js:43`) 只读 query。
 
 ## 一、目标
@@ -164,7 +164,7 @@ export default [
   后者是**路径匹配**而非 pattern 查找。已注册 `/x/admins/{pk}` 时，`at("/x/admins/me")`
   会把 `me` 当实参匹配成功 ⇒ 后到的静态兄弟被**嫁接**到参数节点的方法表里（静态段被参数
   段吞掉；两个同动词静态之间还会报**假冲突**，`GET /x/admins/session` 被判与 `me` 冲突）。
-  一度按此实现，v0.1.19 修复（`server/src/routes.rs` register/ 单测 `table_param_route_does_not_graft_later_static_siblings`）。
+  一度按此实现，v0.1.19 修复（`serve/src/routes.rs` register/ 单测 `table_param_route_does_not_graft_later_static_siblings`）。
 
 **冲突/注册失败分类**（matchit `InsertError` 实际有 4 类，处理各不同）：
 
@@ -272,12 +272,12 @@ if (p === "param") {
 
 | 文件 | 位置 | 改动 |
 |---|---|---|
-| `server/Cargo.toml` | — | 加 `matchit = "0.8"`、`percent-encoding`、`form_urlencoded`（均已在 lockfile，仅声明） |
-| `server/src/routes.rs` | 8-36 | `Routes` 持有 matchit matcher（pattern → method map）、保留旧 `resolve` 作 dev 兜底；`resolve` 更名查表语义 |
-| `server/src/routes.rs` | 54-75 | `route_table`/`walk` → `build_route_table`：一次性运行时 import 读 `.route` 建表（§2 错误策略/超时） |
-| `server/src/routes.rs` | 77-133 | 现有目录镜像测试改写：模式注册、参数提取、冲突检测、normalize 守卫（含 `//`、`..`、编码穿越） |
-| `server/src/lib.rs` | 79-94 | `handle` 走 §6 流程：normalize → 查表 → 405/500/404 分支；params 解码后填 `RequestInfo.params`；404 文案更新 |
-| `server/src/lib.rs` | 126-138 | `parse_query` 改 form-urlencoded 解码，移除原"未 decode" ponytail 注（行为变更见 §7） |
+| `serve/Cargo.toml` | — | 加 `matchit = "0.8"`、`percent-encoding`、`form_urlencoded`（均已在 lockfile，仅声明） |
+| `serve/src/routes.rs` | 8-36 | `Routes` 持有 matchit matcher（pattern → method map）、保留旧 `resolve` 作 dev 兜底；`resolve` 更名查表语义 |
+| `serve/src/routes.rs` | 54-75 | `route_table`/`walk` → `build_route_table`：一次性运行时 import 读 `.route` 建表（§2 错误策略/超时） |
+| `serve/src/routes.rs` | 77-133 | 现有目录镜像测试改写：模式注册、参数提取、冲突检测、normalize 守卫（含 `//`、`..`、编码穿越） |
+| `serve/src/lib.rs` | 79-94 | `handle` 走 §6 流程：normalize → 查表 → 405/500/404 分支；params 解码后填 `RequestInfo.params`；404 文案更新 |
+| `serve/src/lib.rs` | 126-138 | `parse_query` 改 form-urlencoded 解码，移除原"未 decode" ponytail 注（行为变更见 §7） |
 | `src/bridge/mod.rs` | 340-400 | 内省 driver 变体（读 `.route` 回传）；`run_module` 管道复用 |
 | `src/bridge/bootstrap.js` | 43-48 | `http.param` 合并 path→query |
 | `../oj/src/serve_cmd.rs` | 62-76 | 内省调用插入（LoaderShared 后、actor 池前）；:66-68 打印改用新表产物；release 分支直载 `routes.js`（§4.1） |

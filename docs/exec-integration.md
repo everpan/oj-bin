@@ -1,11 +1,13 @@
 # oj exec 集成手册（v0.1.29）
 
-`oj exec <file.ts|js>`：不起 HTTP 服务，直接在一个装配好**完整后端**的运行时里执行
-一个 ts/js 文件。面向一次性数据修复、迁移后对账、批处理导出、定时任务原型这类
-「脚本活」——过去这些要么塞进临时 handler 再 curl，要么干脆在框架外写个孤儿脚本。
+`oj exec`（文件 / 内联 / REPL 三种入口，**三选一**，v0.1.50 起后两种可用）：不起 HTTP
+服务，直接在一个装配好**完整后端**的运行时里执行 ts/js。面向一次性数据修复、迁移后
+对账、批处理导出、临时求值与调试这类「脚本活」——过去这些要么塞进临时 handler 再
+curl，要么干脆在框架外写个孤儿脚本。
 
 - 完整后端全局：`json`/`db`/`kv`/`blob`/`bus`/`es`/`fetch`/`ws`/`log`/`plugins`/
-  `cert`/`jwt`/`bcrypt`/`crypto`/`oidc`/`ldap`/`mail`/`mq`，与 handler 同源装配。
+  `cert`/`jwt`/`bcrypt`/`crypto`/`oidc`/`ldap`/`mail`/`tasks`/`vars`/`Kafka`/`RabbitMQ`
+  （命名 MQ 客户端；无裸 `mq` 全局），与 handler 同源装配。
 - 终端 stdout 直出（`console.*` 与 `log.*`），管道友好；`--log-file` 可选 JSONL 双写。
 - `--` 之后的 argv 注入 `globalThis.args`；支持项目根内相对导入（显式扩展名）。
 
@@ -21,12 +23,14 @@ cargo xtask build                                  # 产出 bin/oj
 ## 1. CLI
 
 ```
-oj exec <file> [-c config.yaml] [-d dir] [--db name] [--log-file path] [-- arg...]
+oj exec <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
+oj exec -e <code> [...]     # 内联代码（v0.1.50）：TS 直执行不落盘；不能含相对 import
+oj exec --repl [...]        # 交互式 REPL（v0.1.50）：rustyline 原始终端；变量不跨行持久（挂 globalThis 可跨）
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `<file>` | 必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1）。路径任意（不要求在项目根内） |
+| `<file>` / `-e` / `--repl` | 三选一必填 | `<file>`：脚本路径，仅 `.ts`/`.js`，其他扩展名报错退出（exit 1），路径任意。`-e, --code`：内联代码（以 `file:///oj-eval.ts` 合成 specifier，TLA 保真）。`--repl`：逐行求值 |
 | `-c` | `config.yaml` | 配置文件路径（相对 CWD） |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`）；未声明的库名 fail-fast，不回落 default |

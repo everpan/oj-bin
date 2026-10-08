@@ -16,6 +16,72 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.52 —— 全库评审修复（鉴权 / panic 恢复 / 资源健壮性）（未打标签）
+
+**动机**：四路架构评审（核心运行时 / CLI+HTTP / 插件体系 / 文档）产出的 P1/P2 问题
+批量修复，每个修复带防护测试；同时补全 `docs/user-manual.md` §3 配置参考缺口并做
+全库文档对齐。本版**无新 API**，devkit 四件按行为变更逐条对齐（见各条 v0.1.52 标注）。
+
+**fix（鉴权）**
+- 任务控制面 PATCH/DELETE 守卫动词失真：`admitted` 硬编码传 `"GET"` → 传真实
+  method。此前按方法区分权限的 oj-auth 守卫会被只读凭据绕过或误拒。
+- 任务日志先截断后过滤：busy 任务刷屏时 quiet 任务查日志恒 0 条 → 改为全窗过滤后截断。
+
+**fix（panic 恢复与停机）**
+- WS worker 帧中 panic 后同连接排队帧永久挂起：恢复路径新增 `Scheduler::panic_conn`
+  （复用 drop_conn 作废排队帧 + 清 in_flight），后续帧收到错误而非无限等待。
+- task worker panic 不补员：对照 frame_pool 补齐 respawn（停机中不补）——long 任务
+  不再随一次 worker panic 静默死亡到重启。
+- `run_once` 无视停机：`stopping` 置位后拒绝新的一次性任务（明确 Err），排空循环
+  丢弃待执行项——长 cron 脚本不再无限期阻塞 shutdown；在途作业走既有 grace 看门狗。
+- ws-retire 线程堆积：空池 detach 用 `retiring` 标志去重，高抖动 + 长 linger 下
+  不再每次叠一个 sleep 线程。
+
+**fix（资源与健壮性）**
+- `await_ffi` 忙旋：前 64 次 poll `yield_now` 快路径，之后 500µs 退避——db/es/blob/kv/bus
+  慢调用不再单核空转（mail/mq 的 sleep 版语义不变）。
+- `DELIVER_TARGETS` 锁毒化自愈：`unwrap_or_else(into_inner)`，一次毒化不再连锁
+  panic 插件线程。
+- HTTP 状态对超大 `code` clamp（此前 `as u16` 按位回绕成错值）；信封 body 保留全精度。
+- SQL 守卫 `sql_memo` 缓存加 4096 上界（超界清空，正确性无损）。
+- `ws.broadcast` 支持二进制（ArrayBuffer/Uint8Array → 新 op `op_ws_broadcast_bin`），
+  与 `ws.send` 对称；非法入参报错而非发 `"[object Object]"` 帧。
+- `db.tx` rollback 本身失败不再吞业务异常（始终抛 handler 原始错误）。
+
+**fix（CLI）**
+- `oj test` 递归扫描 `tests/` 子目录（`_` 前缀目录跳过）——此前子目录 `*.test.ts`
+  静默忽略。
+- fixtures 幂等门禁：非幂等 INSERT（判据同 S006）在 `oj test fixture` 灌入前报错；
+  此前注释声称「幂等可重复灌」但无检查强制。
+- `oj openapi` dev 分支内省失败对齐 release 语义 fail-fast——`--check` 不再被
+  静默缺路由误报漂移。
+- cron 到点重读注册表：PATCH 改表达式/停用不再被入睡前的旧快照覆盖一次；
+  任务 probe 失败打 warn 点名任务与原因（行为不变仍退避重启）；
+  任务目录扫描跳过符号链接（自引用符号链接死递归防护）。
+- ldap 双源错误文案续行修复（不再夹长串空格）；xtask `find_crate_dir` 排序取
+  首个命中（结果确定性）。
+
+**fix（插件）**
+- **oj-db-postgres：typed 流式路径静默 null → 响亮报错**（`undecodable_column`，
+  含列名+类型+cast 线索），对齐 mysql「绝不静默 null」纪律；流式遇错 yield Err 终止。
+- oj-db-mysql / oj-db-postgres：dialect 未知/closed handle 上送 `"unknown"` + 告警，
+  不再冒充 `"sqlite"` 误导宿主方言选择。
+- oj-blob-s3：`upload_url` 信封改 serde_json 构造——URL 含非 ASCII 时不再产出
+  `\u{…}` 非法 JSON。
+- oj-es：reqwest `connect_timeout(5s)` + `timeout(30s)`——ES 黑洞不再永久悬挂
+  插件任务与 socket。
+- oj-auth：二次 init 换 cfg 时经 host.log 打 warn（沿用首份），不再静默忽略。
+- 8 个插件的 tokio runtime 统一 `.worker_threads(2)`（16 核机常驻线程 ~130 → ~20）。
+
+**docs**
+- `user-manual.md` §3 配置参考补全：`auth` / `cors` / `secrets` / `vars` / `db_query`
+  / `static_sites` 六段 + `server` 块 v0.1.27/30 项（多站点、上传上限、SPA 回落、
+  html meta、`response_headers`、`route_timeouts`）。
+- 全库文档对齐：`server/` → `serve/` 改名（2026-10）、ABI_VERSION 11、AXES +ldap、
+  CLI 子命令全集（exec/migrate/schema diff/secret/openapi）、S001–S008 检查编号、
+  全局对象表补 mail/ldap/tasks/vars/Kafka/RabbitMQ；devkit 四件同步（broadcast 二进制、
+  oj test 递归、fixtures 门禁、openapi fail-fast、tx rollback 语义、code clamp）。
+
 ## v0.1.51 —— SQL 执行追踪（dev 日志 + 运行时画像）（未打标签）
 
 **动机**：开发与排障时看不到 SQL 到底跑了什么、跑了多久。补一层**单一内部 recorder**：
@@ -69,6 +135,9 @@ REPL**（`--repl`），三者与 `file` 互斥、必选其一。
   `exec: 需提供 <file> / --code / --repl 之一`。
 - 装配/迁移门禁/扩展顺序与既有 `oj exec` 文件模式完全同源（`build_runtime` 抽出共用，
   `boot_if_set` 补跑 ext_boot）；退出码语义不变（settle 0 / 异常·加载失败 1）。
+- **全仓重命名 `server/` → `serve/`**（crate 名与目录名同步，`server_cmd.rs` →
+  `serve_cmd.rs`、`ServerArgs` → `ServeArgs`；config 键 `server:` 不变）。开发者影响：
+  `cargo test -p server` → `-p serve`；对外行为与产物布局不变。
 
 ## v0.1.49 —— fixture 归入 test 子命令（未打标签）
 

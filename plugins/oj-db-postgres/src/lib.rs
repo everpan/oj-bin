@@ -15,7 +15,7 @@ use sqlx::any::{Any, AnyArguments, AnyRow};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::postgres::{PgArguments, PgConnection, PgRow, Postgres};
 use sqlx::query::Query;
-use sqlx::{Column, Row};
+use sqlx::{Column, Row, TypeInfo};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,15 +197,25 @@ fn bind_value<'q>(
     }
 }
 
-fn row_to_json(row: &AnyRow) -> serde_json::Value {
+/// 解不出类型/值时的响亮报错（含列名/类型线索）——绝不静默 `null`（静默 null =
+/// 返回错值）。对齐 oj-db-mysql `row_to_json_mysql` 纪律（见 docs/numeric-limits.md）。
+fn undecodable_column(name: &str, type_name: &str) -> String {
+    format!(
+        "db(postgres): column '{name}' has type '{type_name}' which this plugin does not \
+         decode yet — cast it in SQL (e.g. `cast({name} as text) as {name}`)"
+    )
+}
+
+fn row_to_json(row: &AnyRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
         let ordinal = col.ordinal();
-        let val = column_json(row, ordinal).unwrap_or(serde_json::Value::Null);
+        let val = column_json(row, ordinal)
+            .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
         obj.insert(name, val);
     }
-    serde_json::Value::Object(obj)
+    Ok(serde_json::Value::Object(obj))
 }
 
 fn column_json(row: &AnyRow, ordinal: usize) -> Option<serde_json::Value> {
@@ -266,16 +276,17 @@ fn bind_value_pg<'q>(
     }
 }
 
-/// typed PG 版行转换（镜像 `row_to_json` 的 try 链；未知类型兜底字符串化）。
-fn row_to_json_pg(row: &PgRow) -> serde_json::Value {
+/// typed PG 版行转换（镜像 `row_to_json` 的 try 链；未知类型响亮报错，不静默 null）。
+fn row_to_json_pg(row: &PgRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();
         let ordinal = col.ordinal();
-        let val = column_json_pg(row, ordinal).unwrap_or(serde_json::Value::Null);
+        let val = column_json_pg(row, ordinal)
+            .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
         obj.insert(name, val);
     }
-    serde_json::Value::Object(obj)
+    Ok(serde_json::Value::Object(obj))
 }
 
 fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
@@ -363,7 +374,13 @@ impl Client {
                 let mut rows = q.fetch(&mut conn);
                 while let Some(r) = rows.next().await {
                     match r {
-                        Ok(row) => yield Ok(row_to_json_pg(&row)),
+                        Ok(row) => match row_to_json_pg(&row) {
+                            Ok(v) => yield Ok(v),
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
+                        },
                         Err(e) => {
                             yield Err(format!("db stream: {e}"));
                             break;
@@ -385,7 +402,13 @@ impl Client {
                 let mut rows = q.fetch(&pool);
                 while let Some(r) = rows.next().await {
                     match r {
-                        Ok(row) => yield Ok(row_to_json(&row)),
+                        Ok(row) => match row_to_json(&row) {
+                            Ok(v) => yield Ok(v),
+                            Err(e) => {
+                                yield Err(e);
+                                break;
+                            }
+                        },
                         Err(e) => {
                             yield Err(format!("db stream: {e}"));
                             break;
@@ -514,8 +537,11 @@ impl Client {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| format!("db query: {e}"))?;
-        serde_json::to_vec(&rows.iter().map(row_to_json).collect::<Vec<_>>())
-            .map_err(|e| format!("db query serialize: {e}"))
+        let out = rows
+            .iter()
+            .map(row_to_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_vec(&out).map_err(|e| format!("db query serialize: {e}"))
     }
 
     async fn exec(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
@@ -585,8 +611,11 @@ impl Client {
             .fetch_all(&mut **t)
             .await
             .map_err(|e| format!("db tx query: {e}"))?;
-        serde_json::to_vec(&rows.iter().map(row_to_json).collect::<Vec<_>>())
-            .map_err(|e| format!("db tx query serialize: {e}"))
+        let out = rows
+            .iter()
+            .map(row_to_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_json::to_vec(&out).map_err(|e| format!("db tx query serialize: {e}"))
     }
 
     async fn tx_exec(
@@ -840,14 +869,17 @@ extern "C" fn stream_close(handle: u64, stream_id: u64) -> FfiFuture {
     })
 }
 
+/// 方言自报（签名 `fn(u64) -> RString` 带不了错）：未知/closed handle 上送 `"unknown"`
+/// （宿主按 Sqlite 兜底映射，见 src/bridge/ffi.rs 的 dialect 消费方），并响亮提示——
+/// 绝不冒充真方言 `"sqlite"` 让宿主拿错方言造 SQL。
 extern "C" fn dialect(handle: u64) -> RString {
     oj_plugin_ffi::catch_value(
-        || {
-            let d = state()
-                .client(handle)
-                .map(|c| c.dialect)
-                .unwrap_or(Dialect::Sqlite);
-            RString::from(dialect_str(d))
+        || match state().client(handle) {
+            Ok(c) => RString::from(dialect_str(c.dialect)),
+            Err(e) => {
+                eprintln!("oj-db-postgres: dialect: {e}");
+                RString::from("unknown")
+            }
         },
         RString::from("unknown"),
     )
@@ -919,7 +951,9 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // worker 只跑 IO 转发（sqlx 连接在池内），2 足够；缺省 = num_cpus 全核白占线程。
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("oj-db-postgres tokio runtime")
@@ -948,6 +982,14 @@ mod tests {
         assert_eq!(dialect_str(Dialect::Sqlite), "sqlite");
         assert_eq!(dialect_str(Dialect::MySql), "mysql");
         assert_eq!(dialect_str(Dialect::Postgres), "postgres");
+    }
+
+    /// 解不出列类型必须响亮报错且点名列名+类型（消费方 JS 要能据此改写 SQL）。
+    #[test]
+    fn undecodable_column_error_names_column_and_type() {
+        let e = undecodable_column("amount", "NUMERIC");
+        assert!(e.contains("amount") && e.contains("NUMERIC"), "{e}");
+        assert!(e.contains("cast"), "报错须给出改写线索: {e}");
     }
 
     /// 离线 sqlite 全路径 roundtrip（dev 构建统一出 sqlite 驱动，生产 cdylib 仍单方言）：
@@ -1091,6 +1133,8 @@ mod tests {
 
         // dialect(): sqlite DSN → 线名 "sqlite"（占位符补全/幂立按键选依赖它）。
         assert_eq!(&dialect(h)[..], "sqlite");
+        // 未知 handle：上送 "unknown"（宿主按 Sqlite 兜底映射），绝不冒充 "sqlite"。
+        assert_eq!(&dialect(999)[..], "unknown");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1426,6 +1470,52 @@ mod tests {
         ))
         .await
         .expect_err("unknown handle after close");
+    }
+
+    /// 不可解码列类型响亮报错（env-gated，`OJ_TEST_PG`）：PG 的 jsonb 等类型 sqlx Any
+    /// 不支持——池路径在 fetch 阶段即 AnyDriverError；typed 流式路径必须走
+    /// `undecodable_column` 点名列名+类型，**绝不静默 null 返回错值**。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_postgres_unsupported_column_types_error_loudly() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        // 池路径（Any）：行转换在 fetch 阶段即报错（点名列名）。
+        let e = drive(&mut query(
+            h,
+            RString::from("select '[1,2]'::jsonb as payload"),
+            RString::from("[]"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(e.contains("payload"), "报错须点名 jsonb 列: {e}");
+
+        // typed 流式路径：行转换响亮报错（本修复守护的分支）。
+        let bytes = drive(&mut stream_open(
+            h,
+            RString::from("select '[1,2]'::jsonb as payload"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        let e = drive(&mut stream_next(h, sid)).await.unwrap_err();
+        assert!(
+            e.contains("payload") && e.contains("decode"),
+            "typed 流式必须点名 jsonb 列而非静默 null: {e}"
+        );
+        close(h);
     }
 
     /// 大整数参数（v0.1.22）：`toBigInt()` 的标记形态必须能写进 bigint 列并精确读回；

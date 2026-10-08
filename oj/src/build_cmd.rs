@@ -59,7 +59,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
             return Err(format!("version dir collision: {vd}"));
         }
     }
-    // 检查体系（§5.2）：构建即检查，S002–S006 违规 fail build；--check 只校验不落盘。
+    // 检查体系（§5.2）：构建即检查，S001–S008 违规 fail build；--check 只校验不落盘。
     // sql_guard 活跃时追加 tenant 声明校验（schema.yaml 缺 tenant_id 列 fail build）。
     crate::checks::run(&src, &names, &view, sql_guard_of_config(&a.config))?;
     if a.check {

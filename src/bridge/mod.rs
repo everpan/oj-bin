@@ -395,6 +395,7 @@ deno_core::extension!(
         ws::op_ws_join,
         ws::op_ws_leave,
         ws::op_ws_broadcast,
+        ws::op_ws_broadcast_bin,
         ws::op_ws_room_size,
         mq::op_mq_has,
         mq::op_mq_call,
