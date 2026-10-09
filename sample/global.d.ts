@@ -606,6 +606,12 @@ declare global {
   }): Promise<OjFetchResponse>;
   // 已加载插件自省：[{name, semver, abi_version, fingerprint, host_abi_version}]。
   function plugins(): any[];
+  // 泛型插件轴调用面（v0.1.54）：axis("cache").get("k")——任意方法名 = 该轴的一个 op，
+  // 参数位置传、末位对象 = opts（轴自定义）。未知轴抛错并列出可用轴名。
+  function axis(name: string): any;
+  // 装配期固化诊断（v0.1.54；与 `oj info` CLI 同源，同步无 IO）：build/abi/plugins/
+  // backends/config 五段；config 只出键名不出值；无公共 HTTP 端点。
+  function ojInfo(): any;
 
   // 命名 MQ 客户端（config kafkas:/rabbits: 段；未配置的名 → undefined）。
   // 消费方法（poll/commit/ack/nack）仅长任务上下文可用（HTTP/WS 内调用报错）。

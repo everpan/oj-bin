@@ -164,4 +164,4 @@ axis("cache").set("k", { any: "json" }); // {"ok":true}
   是 v0.1.54 起的新能力——在 `desc` 里注明（骨架已含）。旧宿主（无
   `oj_plugin_axes`，逐轴 dlsym 只探 9 个类型化名）能加载本插件、init 会执行，
   但 `cache` 轴不可达——dlsym 表里没有这个名字；要 JS 可调必须新宿主。
-  版本号以 CHANGELOG 为准（T9 统一发版时对齐）。
+  版本号以 CHANGELOG 为准（已对齐 v0.1.54）。

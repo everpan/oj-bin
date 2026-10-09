@@ -18,7 +18,7 @@
 | [8](#场景-8302-重定向到-blob-预签名-url) | 权限校验后 302 到 `blob.url()` 预签名 URL，浏览器两跳直取对象（`json.redirect`，v0.1.26） | §6 json / §7 响应信封 |
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
-| [11](#场景-11ldapad-登录鉴证v0128) | LDAP/AD 登录鉴证或目录查询（`ldap.bind/search/...`，filter 用户输入须转义，v0.1.28） | §6 ldap / §8 鉴权 |
+| [11](#场景-11ldapad-登录鉴证v0128v0154-起调用面迁移-axisldap) | LDAP/AD 登录鉴证或目录查询（v0.1.54 起 `axis("ldap").bind/search/...`，filter 用户输入须转义，v0.1.28） | §6 ldap / §8 鉴权 |
 | [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + stdout 直出（v0.1.29） | §11 `oj exec` |
 | [13](#场景-13大文件直传绕开-10mb30s-v0130) | office 大附件 >10MB / 上传+处理超 30s：`blob.uploadUrl` 预签名（s3）或 `PUT {base}/blob/{key}` 直传路由（local）（v0.1.30） | §6 blob |
 | [14](#场景-14浏览器登录cookie-会话--csrf-v0130) | 浏览器表单登录：HttpOnly `oj_sess` + CSRF 双提交；WS 握手同守卫（v0.1.30） | §8 鉴权 |
@@ -30,6 +30,7 @@
 | [20](#场景-20流式响应-sse-实时推送v0135) | 导出大 CSV / 实时推送——`json.stream` / `json.sse` 绕过信封、心跳保活（v0.1.35） | §6 json / §7 响应信封 |
 | [21](#场景-21前端跨域调用-oj-apicorsv0135) | 浏览器跨域 `fetch` oj API——`server.cors` 段（段存在即启用，`credentials` 需显式 `origins`，v0.1.35） | §10 配置 / §8 鉴权 |
 | [22](#场景-22应用层-aes-gcm-字段加密v0135) | 应用层 AES-GCM 字段加密——`crypto.aesGcmEncrypt` / `aesGcmDecrypt`（仅 AES-128/256，密钥自管，v0.1.35） | §6 crypto |
+| [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 
 ---
 
@@ -836,9 +837,12 @@ curl -X PATCH -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-## 场景 11：LDAP/AD 登录鉴证（v0.1.28）
+## 场景 11：LDAP/AD 登录鉴证（v0.1.28；v0.1.54 起调用面迁移 `axis("ldap")`）
 
 > 何时抄我：登录要校验公司 AD/OpenLDAP 账号；或要按目录分组/属性做授权。
+> v0.1.54 起 oj-ldap 是泛型轴插件——JS 调用面为 `axis("ldap").<op>(...)`
+> （实例选单经末位 opts 的 `key`）；旧的 `ldap.*`/`LDAP(name)` 类型化全局是遗留
+> 双轨面，装配迁移版插件后报 `ldap not configured`。
 
 ### ① 配置（config.yaml）
 
@@ -869,14 +873,14 @@ export default {
     if (typeof username !== "string" || typeof password !== "string")
       return json.fail(400, "bad request");
     // 1) 查 DN（filter 注入先转义）
-    const found = await ldap.search("ou=users,dc=example,dc=com", {
+    const found = await axis("ldap").search("ou=users,dc=example,dc=com", {
       filter: `(uid=${esc(username)})`,
       attrs: ["uid", "memberOf"],
     });
     // 2) 找不到 / 多命中一律按凭据错处理（不泄露用户存在性）
     if (found.length !== 1) return json.fail(401, "invalid credentials");
     // 3) 用目录凭据绑定；false = 密码错（不抛）
-    const ok = await ldap.bind(found[0].dn, password);
+    const ok = await axis("ldap").bind(found[0].dn, password);
     if (!ok) return json.fail(401, "invalid credentials");
     // 4) 发自己的会话票（目录只鉴证，不签发）
     const token = await jwt.sign({
@@ -899,10 +903,11 @@ curl -X POST http://localhost:9778/v1/api/user/login/      -d '{"username":"eve"
 
 | 现象 | 原因 |
 |---|---|
-| 调 `ldap.*` 报 `ldap not configured` | 没配 `ldap:` 段或没装 oj-ldap 插件（报错文案两者都点名） |
-| `ldap.bind` 抛 `connect ... io error` | 网络/端口/防火墙；`url` 拼错；非「凭据错」——`false` 才是凭据错 |
+| `axis("ldap")` 报 `unknown generic axis 'ldap'` | 插件没装/没进清单，或 ABI 不匹配——`plugins()` / `oj info` 核对 |
+| 调旧 `ldap.*` 报 `ldap not configured`（段已配） | v0.1.54 双轨期行为：迁移版 oj-ldap 不再注册 typed 槽——改用 `axis("ldap").<op>`；确需旧面就加载旧版 typed 插件（二者择一） |
+| `axis("ldap").bind` 抛 `connect ... io error` | 网络/端口/防火墙；`url` 拼错；非「凭据错」——`false` 才是凭据错 |
 | `service bind ... rc=49` | 服务账号 `bind_dn`/`bind_pw` 错了（search 在绑定前就失败） |
-| search 报 size limit | AD 默认 1000 条返回上限——改 `ldap.searchPaged(base, { pageSize: 500 })` |
+| search 报 size limit | AD 默认 1000 条返回上限——改 `axis("ldap").searchPaged(base, { pageSize: 500 })` |
 | `filter` 查不到人 | DN base 不对（`ou=users,…` 按实际目录改）；`scope` 默认 `sub`，base 之上的条目查不到 |
 | 头像/证书拿不到 | 二进制属性在 `entry.bin`（base64 字符串）：`Buffer.from(e.bin.jpegPhoto[0], "base64")` |
 
@@ -1748,3 +1753,53 @@ cat data/exports/note.txt                                   # jail 根下真实�
 多文件批量上传（multipart 同名字段重复/多字段名混合）照抄见
 `docs/api/19-fs.md`「multipart 多文件批量上传落盘」——循环 `http.files` +
 `await http.file(i)` 逐个落盘，文件名先白名单化。
+
+---
+
+## 场景 27：泛型轴插件调用——`axis(name)`（v0.1.54）
+
+> 何时抄我：装了一个声明**泛型轴**的插件（如 oj-ldap 迁移版、`tools/plugin-template`
+> 做的 cache 轴），handler 里要调它的 op。泛型轴不占 9 个类型化轴槽、零 ABI 变更——
+> 插件作者侧范式见仓库 `tools/plugin-template/README.md`。
+
+### ① 装配（config.yaml）
+
+```yaml
+plugins:
+  cache: {}        # 严格清单模式（或留空走扫描模式）
+cache:             # 插件自报 config key（入口宏 config: "cache"）→ 全量段透传进 init
+  max_entries: 1000
+```
+
+装插件：`cargo xtask plugin cache`（产物进 `bin/plugins/<triple>/`）。
+装配后 `oj info` 的 `generic_axes` 段应列出 `cache`；没列出就是没装上。
+
+### ② handler
+
+```ts
+// src/cache_demo/api.ts —— 泛型轴 op = 方法名，参数位置传，末位对象 = opts（轴自定义）
+async function get() {
+  const hit = await axis("cache").get("greeting");
+  if (hit != null) return json.ok({ hit, from: "cache" });
+  const value = `hello ${Date.now()}`;
+  await axis("cache").set("greeting", value, { ttl: 60 });
+  json.ok({ hit: value, from: "fresh" });
+}
+export default { get };
+```
+
+### ③ 验证
+
+```bash
+curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"hello …","from":"fresh"}}
+curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"hello …","from":"cache"}}
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `unknown generic axis 'cache'` | 插件未加载/ABI 不匹配/名字拼错——报错里的 `available` 列表即当前已注册泛型轴；`oj info` / JS `ojInfo().generic_axes` 可核对 |
+| op 报 `axis op '<op>': plugin returned non-JSON` | 插件该 op 返回了非 JSON 字节——插件侧 bug，找插件作者 |
+| 同名泛型轴两个插件都声明 | 装配期 fail-fast（泛型轴每名单提供者）——`plugins:` 清单里只留一个 |
+| 想列一个轴有哪些 op | 协议面没有内省——插件文档/README 为准（如 oj-ldap：`bind/search/searchPaged/whoami/compare`） |

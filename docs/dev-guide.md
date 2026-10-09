@@ -837,9 +837,12 @@ core，装配层只经安全入口）。
   `@semver` pin 不符 fail fast），值为插件 cfg（非空对象原样透传，空对象 = 回落轴适配器）。
   缺省/空 map → 扫描目录全部加载（目录不存在/为空 = 零插件，仅内置后端）。旧 list 写法
   `plugins: [a, b]` 废弃（解析报错）。
-- 注册：abi 门禁（严格相等）→ `init` → 对 `AXES = [es, db, blob, bus, kv, auth, mq, mail, ldap]` 逐轴
-  `dlsym("oj_plugin_axis_<axis>")`，缺符号 = 不提供该轴；加轴零破坏（既有轴 vtable 形状
-  变更才 bump ABI）。
+- 注册：abi 门禁（严格相等）→ `init` → **轴清单自报优先**（`oj_plugin_axes()` 返回
+  `AxisDecl` 名+kind+vtable；TYPED 填 9 槽之一 es/db/blob/bus/kv/auth/mq/mail/ldap，
+  GENERIC 进泛型轴注册表，v0.1.54）→ 清单符号缺失才回落逐轴
+  `dlsym("oj_plugin_axis_<axis>")`（deprecated 告警；缺符号 = 不提供该轴）。加类型化轴
+  零破坏（既有轴 vtable 形状变更才 bump ABI）；泛型轴零宿主改动，JS 调用面
+  `axis("name").op(...)`。
 - 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` / JS `plugins()` /
   公共端点 `GET {base}/plugins` 输出插件名/semver/ABI/指纹/**自描述 desc** + 宿主
   ABI_VERSION（升级核对窗口）。

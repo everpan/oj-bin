@@ -43,17 +43,23 @@ panic → `RResult::Err`）、每轴一个 `oj_plugin_axis_<name>()`（返回擦
 流程 `load_one`（:326）：
 `dlopen`（`ffi::load_forget`，句柄**进程期泄漏**）→ `oj_plugin_abi_version` 严格相等 →
 `oj_plugin_init`（传 `HostContext` + cfg JSON）→ descriptor 内 abi 二次校验 →
-指纹比对（只告警）→ 清单模式下 name/semver 核对 → **逐轴 dlsym**。
+指纹比对（只告警）→ 清单模式下 name/semver 核对 → **轴探测**（自报清单优先，见下）。
 
-### 按轴 dlsym（ABI 7 起，加轴零破坏）
+### 轴清单自报 + 按轴 dlsym 回退（v0.1.54；ABI 7 起加轴零破坏）
 
 ```rust
-pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail", "ldap"];   // :432
+pub(crate) const TYPED_AXES: &[&str] =
+    &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail", "ldap"];   // plugin_loader.rs
 ```
 
-`probe_axes`（:432）对每个轴 `dlsym("oj_plugin_axis_<name>")`：
-**缺符号或返回 null = 不提供该轴（非错误）**。加新轴 = `AXES` 加一行 + vtable 类型 +
-`Registrations` 加字段，`probe_axes` 的 `match` 有 `unreachable!` 兜底防两表失步。
+入口宏双发：per-axis `oj_plugin_axis_<name>` 符号 + 清单符号 **`oj_plugin_axes()`**
+（`RVec<AxisDecl>`：轴名 + kind + vtable）。`probe_axes` **自报清单优先**——TYPED 且名在
+`TYPED_AXES` 填 typed 槽（名不在 → `unknown_axes` 告警）；**GENERIC**（`generic(name) => &VT`
+宏臂，v0.1.54）进泛型轴注册表，JS 经 `axis("name").op(...)` 调用——**新轴零宿主改动**。
+清单符号缺失的旧插件回落逐轴 `dlsym("oj_plugin_axis_<name>")`（deprecated 告警，免重编
+兼容）：**缺符号或返回 null = 不提供该轴（非错误）**。加类型化轴 = `TYPED_AXES` 加一行 +
+vtable 类型 + `Registrations` 加字段，`fill_typed_slot` 的 `match` 有 `unreachable!`
+兜底防两表失步；泛型轴则完全不动宿主。同名泛型轴多插件提供 → 装配期 fail-fast。
 
 ### 插件目录四级解析（`resolve_plugins_dir`，:233）
 
@@ -88,7 +94,7 @@ pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail
 | `oj-kv-redis` | kv | RedisKV（迁自 core `kv.rs`） |
 | `oj-auth` | auth | Bearer 守卫；**进程级 GUARD 只认首次 init**（故 OIDC e2e 独立成测试目标） |
 | `oj-mail` | mail | lettre SMTP 投递；发送队列 + worker 池；发件人/收件人白名单 fail-closed（v0.1.19 起） |
-| `oj-ldap` | ldap | ldap3 目录连接（`globalThis.ldap`/`LDAP(name)`）；bind 鉴权 + 目录检索 |
+| `oj-ldap` | ldap（**泛型轴**，v0.1.54 迁移） | ldap3 目录连接；bind 鉴权 + 目录检索；JS 调用面 `axis("ldap").<op>` |
 
 插件自描述 `descriptor.desc` 必填，经 `GET {base}/plugins` 公开。
 
@@ -104,7 +110,8 @@ pub const AXES: &[&str] = &["es", "db", "blob", "bus", "kv", "auth", "mq", "mail
 | auth | 单槽 | — |
 | mq | 命名客户端注册表（按 kind：kafka/rabbitmq） | kind 冲突 → fail fast |
 | mail | 单槽（default + 命名 profile） | — |
-| ldap | 单槽（default + 命名 profile） | — |
+| ldap | 单槽（default + 命名 profile；v0.1.54 起 oj-ldap 改走泛型轴注册表） | — |
+| 泛型轴（generic） | 名单提供者注册表（v0.1.54；`axis("name")` 调用面） | 同名多插件提供 → fail fast |
 
 「配置声明了能力但插件未装」→ 启动期 fail fast（§2 闸门）。
 

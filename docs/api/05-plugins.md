@@ -27,6 +27,7 @@
 | `fingerprint` | `string` | 构建指纹（核对外发产物一致性） |
 | `description` | `string` | 插件作者自述（descriptor 必填项） |
 | `host_abi_version` | `number` | **宿主**当前 ABI 版本（每条记录重复携行，方便逐条比对） |
+| `unknown_axes` | `string[]` | v0.1.54 起：插件自报轴清单（`oj_plugin_axes()`）中**宿主不认识的类型化轴名**——宿主升级窗口信号；旧插件无此字段 |
 
 ## 错误
 
@@ -42,6 +43,9 @@
 - 清单是**装配期快照**：运行期 `dlopen`/卸载不存在，返回值在进程生命周期内不变。
 - 只报告**插件轴**（es/db/blob/bus/kv/auth/mq/mail/ldap 经 cdylib 加载的后端）；核心
   内建轴（`json`/`http`/`fs`/`log`/`vars` 等）不在清单内。
+- **轴清单自报（v0.1.54）**：插件经 `oj_plugin_axes()` 宏双发声明自己的轴（类型化 +
+  泛型）；宿主探测自报清单优先，旧插件（无该符号）回落逐轴 dlsym（deprecated 告警，
+  免重编兼容）。泛型轴名清单见 `ojInfo().generic_axes` / `oj info` 的 `generic_axes` 行。
 - `GET {base}/plugins` 是保留路径：业务模块不要建同名路由（会被遮蔽）。
 - 字段语义用于**核对**，不要拿 `semver` 做功能开关（功能探测用「调用看报错」，
   如 `es not configured`）。

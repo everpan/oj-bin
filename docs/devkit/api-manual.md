@@ -649,7 +649,7 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
 postgres 用 `$1`**；值一律经参数数组绑定。
 
-### 总表（25 组）
+### 总表（27 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -665,7 +665,8 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
-| `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + `oj-ldap` 插件启用）：`bind / search / searchPaged / whoami / compare`，见下「ldap」 |
+| `axis(name)` | 泛型插件轴调用面（v0.1.54）：`axis("cache").get("k")`；未知轴抛错并列出可用轴名，见下「axis(name)」 |
+| `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + oj-ldap 插件启用）。**v0.1.54 起 oj-ldap 迁移泛型轴**：JS 调用面为 `axis("ldap").bind/search/searchPaged/whoami/compare`（见下「ldap」与「axis(name)」）；类型化 `ldap`/`LDAP` 全局为遗留双轨面 |
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
@@ -674,6 +675,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `sess.id / sess.state` | WS 连接 id 与会话状态（仅 ws.ts 钩子内；state 须可 JSON 序列化） |
 | `new WebSocket(url)` | WHATWG 出站 WS 客户端（任务与 handler 均可用，见下「WebSocket —— 出站客户端」） |
 | `plugins()` | 已加载插件自省 + 宿主 ABI |
+| `ojInfo()` | 装配期固化诊断（v0.1.54；与 `oj info` CLI 同源）：build/abi/plugins/backends/config 五段，config 只出键名，见下「ojInfo()」 |
 | `vars.get(name)` | 部署期常量（顶层 `vars:` 段，v0.1.25）：**同步**返回该键的字符串，未声明键 → `null` |
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
@@ -1436,37 +1438,37 @@ json.ok({ sent: r.code === 0, messageId: r.data?.messageId });
 
 > 完整手册（鉴证模式/filter 注入防护/二进制属性/运维/已知限制）见 `docs/ldap-integration.md`。
 
-配顶层 `ldap:` 段即启用全局 `LDAP` / `ldap`（`ldap === new LDAP("default")`）；未配置时调用报
-`ldap not configured (config ldap: section missing, or oj-ldap plugin not loaded)`。
-**协议交互**在 `oj-ldap` 插件内（ldap3 客户端：每调用独立 connect → 服务账号绑定 → 操作 →
-unbind，无连接池）；**宿主**负责实例表与入参白名单校验。错误模型同 `db`：**除「未配置」外，
-校验/协议/网络错一律抛异常（Promise reject）**——与 mail 的信箱模型不同，别用 `try/catch`
-当业务分支，只有 `ldap.bind` 的「凭据被拒」是正常返回 `false`。
+配顶层 `ldap:` 段并装配 `oj-ldap` 插件即启用。**v0.1.54 起 oj-ldap 已迁移泛型轴**：
+JS 调用面为 **`axis("ldap")`**（`generic(ldap)` 声明，走泛型轴通道），5 个 op 与旧
+类型化 API 语义一致；宿主类型化 `ldap`/`LDAP` 全局保留但装配迁移版插件后调用报
+`ldap not configured`（双轨期；加载旧版 typed oj-ldap 时 `ldap.*` 仍可用）。
+**协议交互**在 `oj-ldap` 插件内（ldap3 客户端：每调用独立 connect → 服务账号绑定 →
+操作 → unbind，无连接池）；入参校验与错误文案与旧版逐字一致。错误模型同 `db`：
+**除「未配置」外，校验/协议/网络错一律抛异常（Promise reject）**——别用 `try/catch`
+当业务分支，只有 `bind` 的「凭据被拒」是正常返回 `false`。
 
-| API | 签名 | 说明 |
+| op（`axis("ldap")`） | 调用 | 说明 |
 |---|---|---|
-| `new LDAP(key)` | `LDAP(key?: string)` | 实例；`key` = `ldap:` 段里的实例名（缺省 `"default"`），未声明的 key 报错（不回落 default） |
-| `ldap.bind` | `bind(dn: string, pw: string): Promise<boolean>` | simple_bind 鉴证。`true` = 绑定成功；`false` = LDAP 拒绝该凭据（含 rc 49 invalidCredentials）；连接/协议错误**抛异常** |
-| `ldap.search` | `search(base: string, opts?: SearchOpts): Promise<Entry[]>` | 目录查询；大结果集请用 `searchPaged`（无分页时服务端可拒超量返回） |
-| `ldap.searchPaged` | `searchPaged(base: string, opts?: SearchOpts & { pageSize?: number }): Promise<Entry[]>` | RFC 2696 分页聚合（服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
-| `ldap.whoami` | `whoami(): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=svc,…"` 形式的 authzid |
-| `ldap.compare` | `compare(dn: string, attr: string, val: string): Promise<boolean>` | 属性值比对（compareTrue/False），不读出整条目 |
+| `bind` | `axis("ldap").bind(dn, pw, opts?): Promise<boolean>` | simple_bind 鉴证。`true` = 绑定成功；`false` = LDAP 拒绝该凭据（含 rc 49 invalidCredentials）；连接/协议错误**抛异常** |
+| `search` | `axis("ldap").search(base, opts?): Promise<Entry[]>` | 目录查询；大结果集请用 `searchPaged`（无分页时服务端可拒超量返回） |
+| `searchPaged` | `axis("ldap").searchPaged(base, opts?): Promise<Entry[]>` | RFC 2696 分页聚合（逐页取回后合并；服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
+| `whoami` | `axis("ldap").whoami(opts?): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=svc,…"` 形式的 authzid |
+| `compare` | `axis("ldap").compare(dn, attr, val, opts?): Promise<boolean>` | 属性值比对（compareTrue/False），不读出整条目 |
 
 ```ts
-type SearchOpts = {
-  scope?: "base" | "one" | "sub";   // 默认 "sub"（整棵子树）；"one" = 仅下一层
+type LdapOpts = {
+  key?: string;                     // 实例名（ldap: 段的顶层键；缺省 "default"）
+  scope?: "base" | "one" | "sub";   // search/searchPaged；默认 "sub"（整棵子树）
   filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
   attrs?: string[];                 // 要读的属性名；缺省/空数组 = 服务端默认属性集
-  // 可选：覆盖本次查询的绑定凭据（与 config ldap:<inst> 的 bind_dn/bind_pw 合并——
-  // 二者取一即可，另一个回落 config）。用于把密码作为运行时参数传入，避免落配置。
-  // 仅 search / searchPaged 支持；whoami/compare/bind 仍用 config 服务账号或各自入参。
-  bindDn?: string;
-  bindPw?: string;
+  pageSize?: number;                // 仅 searchPaged；1..=10000，默认 500
+  bindDn?: string;                  // 覆盖本次查询的绑定凭据（与 config 合并，取一即可；
+  bindPw?: string;                  //   另一个回落 config）。仅 search / searchPaged 支持
 };
-type Entry = {
+type LdapEntry = {
   dn: string;
   attrs: Record<string, string[]>;  // 文本属性（多值即多元素）
-  bin: Record<string, string[]>;    // 二进制属性（jpegPhoto 等），**base64 编码字符串**
+  bin: Record<string, string[]>;    // 二进制属性（jpegPhoto 等），base64 编码字符串
 };
 ```
 
@@ -1476,12 +1478,12 @@ type Entry = {
 export default {
   async post() {
     const { username, password } = http.body();
-    const found = await ldap.search("ou=users,dc=example,dc=com", {
+    const found = await axis("ldap").search("ou=users,dc=example,dc=com", {
       filter: `(uid=${username})`,   // 用户名 → DN（filter 注入见下）
       attrs: ["uid"],
     });
     if (found.length !== 1) return json.fail(401, "invalid credentials");
-    const ok = await ldap.bind(found[0].dn, password);   // false = 密码错，不抛
+    const ok = await axis("ldap").bind(found[0].dn, password);   // false = 密码错，不抛
     if (!ok) return json.fail(401, "invalid credentials");
     json.ok({ uid: found[0].attrs.uid[0] });
   },
@@ -1611,12 +1613,62 @@ wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj t
 
 签名：`plugins(): any[]`。返回已加载插件清单
 `[{name, semver, abi_version, fingerprint, description, host_abi_version}]`——用于升级核对窗口
-（第 11 章插件升级）；`description` 为插件作者自述。同一清单经内置端点
-`GET {base}/plugins` 公开（不走 Bearer，运维/监控用）。
+（第 11 章插件升级）；`description` 为插件作者自述。v0.1.54 起插件**自报轴清单**
+（`oj_plugin_axes()`），插件声明了但宿主不认识的类型化轴名收在增量字段 `unknown_axes`
+（旧插件无此字段）。同一清单经内置端点 `GET {base}/plugins` 公开（不走 Bearer，运维/监控用）。
 
 ```ts
 json.ok(plugins());
 ```
+
+### axis(name) —— 泛型插件轴调用面（v0.1.54）
+
+插件经入口宏 `generic(name) => &VT` 声明的**泛型轴**（不占 9 个类型化轴槽、零 ABI 变更）
+经统一通道暴露给 JS：`axis(name)` 返回一个 Proxy，任意方法名 = 该轴的一个 op：
+
+```ts
+await axis("cache").get("k");                       // op "get"，args ["k"]
+await axis("cache").set("k", 42, { ttl: 60 });      // 末位对象 = opts（轴自定义）
+await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
+```
+
+- **同步返回 Promise**；args 经 BigInt-safe `ojStringify` 序列化（plain `JSON.stringify`
+  遇 BigInt 会抛，这里安全）。
+- 未知轴抛 `unknown generic axis '<name>' (available: [<可用轴名>])`；op 本身的语义/校验/错误
+  文案归插件（如 oj-ldap 的 `ldap: unknown op 'x'（known: …）`），future Err 原样 reject。
+- **信任边界**：泛型轴是插件自报的任意调用面——参数与返回值都是跨 FFI 边界的 JSON，
+  插件自身负责校验（与类型化轴同一信任模型）；handler 侧把 axis 当「带名字的
+  `fetch`」对待，别把不可信输入直接拼进 op 语义。
+- 泛型轴名撞 9 个保留名（es/db/blob/bus/kv/auth/mq/mail/ldap）**不许**——插件作者须知，
+  撞名在旧宿主（pre-kind）上会被误 cast。
+
+### ojInfo() —— 装配期固化诊断（v0.1.54）
+
+与 `oj info [-c config.yaml]` CLI **同一装配体**（`assemble_ojinfo` 单一事实源）的
+JS 出口：handler 里 `ojInfo()` **同步**返回五段诊断对象（装配期冻结，无 IO）：
+
+```jsonc
+{
+  "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…", "config_path": "…" },
+  "abi":     { "abi_version": 11, "host_fingerprint": "…" },
+  "plugins": [ { "name": "…", "semver": "…", "abi_version": 11, "fingerprint": "…",
+                 "description": "…", "host_abi_version": 11, "unknown_axes": [] } ],
+  "backends":{ "db_schemes": {"declared": ["default"]}, "blob_configured": true, "kv_plugin": true,
+               "auth_plugin": true, "mail_plugin": false, "ldap_plugin": false, "es_plugin": false,
+               "mq_plugins": ["kafka"], "bus_kinds": ["local"], "dbs_registered": ["sqlite", "mysql", "postgres", "memory"] },
+  "config":  { "sections": ["auth", "db", "server", …], "unconsumed": ["cahce"] },
+  "generic_axes": ["ldap", "cache"],
+  "unconsumed_sections": ["cahce"]
+}
+```
+
+- **零值泄漏安全语义**：只报**声明面**——不 connect 任何库/broker；config 只出**段名/键名**，
+  值一律不出（DSN、密钥、ENC[...] 明文都不可能经此泄漏）。
+- **没有公共 HTTP 端点**（与 `plugins()` 不同）：要对外透出就自己包一个业务路由
+  （加鉴权），handler 进程内直接调即可。
+- `unconsumed_sections` / `config.unconsumed`：装配期诊断——顶层 config 段没被宿主也没被
+  任何已加载插件消费（`config: "key"` 自报或 `plugins:<name>` 非空透传才算消费）。
+  典型成因：段名拼错，或对应插件没装。启动时 stderr 也会打同名告警。
 
 ### vars —— 部署期常量（顶层 `vars:` 段，v0.1.25）
 
@@ -2586,6 +2638,17 @@ RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `
   字符串/列表等非对象值视为未提供，静默回落。
 - **缺省/空 map = 扫描模式**：加载插件目录全部（目录不存在/为空 = 零插件，仅内置后端）。
   旧 list 写法 `plugins: [a, b]` 已废弃（解析报错）。
+
+**cfg 三级解析（v0.1.54）**：插件 init 收到的 cfg 字符串按序取第一个命中——
+
+1. `plugins:<name>` 非空对象 → 原样透传（如上）；
+2. 插件自报 **config key**（入口宏 `config: "key"`）→ 顶层 `<key>` 段的**全量 Value**
+   （段是「读」不是「占」——撞宿主已知的段名合法；段未配置给 `{}`，段可选是既有语义）；
+3. 按名遗留臂（es/auth/mail/ldap 等第一方适配器）。
+
+未被子报 key 或 `plugins:<name>` 非空透传消费的**未知顶层段**，启动打
+`unconsumed config sections: […] (typo? or plugin not loaded)` 诊断，并可经
+`oj info` CLI / JS `ojInfo()` 复查（见第 6 章「ojInfo()」）。
 
 ```yaml
 plugins:
