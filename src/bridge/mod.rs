@@ -37,6 +37,7 @@ mod es;
 pub(crate) mod ffi;
 pub mod frame_pool;
 pub mod fs;
+pub mod generic_axis;
 pub mod guard;
 mod http;
 pub mod import_scan;
@@ -198,6 +199,9 @@ pub struct StableState {
     pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
     /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 报 PermissionDenied。
     pub fs: Option<Arc<fs::FsGrant>>,
+    /// 泛型轴注册表（插件自报的非类型化轴；bootstrap `axis(name)` 的数据源）。
+    /// 空表 = 无泛型轴，`axis(name).op()` 报 unknown axis 并列可用轴名。
+    pub generic_axes: generic_axis::GenericAxisRegistry,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -251,6 +255,9 @@ pub struct Extras {
     /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 双轴 deny
     /// （PermissionDenied）。只读语义见 [`fs::FsGrant`]。
     pub fs: Option<Arc<fs::FsGrant>>,
+    /// 泛型轴注册表（None = 空 registry，`axis(name)` 一律报 unknown axis——与
+    /// vars 同哲学：未注入 = 空表而非 None）。
+    pub generic_axes: Option<generic_axis::GenericAxisRegistry>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -408,6 +415,7 @@ deno_core::extension!(
         mq::op_tasks_stopping,
         mq::op_tasks_sleep,
         ldap::op_ldap_call,
+        generic_axis::op_axis_call,
         fs::op_fs_root,
         fs::op_fs_resolve,
     ],
@@ -713,6 +721,7 @@ impl Bridge {
             vars: extras.vars,
             js_heap_limit: extras.js_heap_limit,
             fs: extras.fs,
+            generic_axes: extras.generic_axes.unwrap_or_default(),
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
         // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
@@ -2032,6 +2041,7 @@ mod tests {
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
             fs: None,
+            generic_axes: Arc::new(HashMap::new()),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =

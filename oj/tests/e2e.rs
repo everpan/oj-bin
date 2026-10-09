@@ -1428,3 +1428,116 @@ async fn fs_readonly_denies_write_end_to_end() {
     h.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------- 泛型轴通道（T5）：mini-generic 夹具 → bootstrap axis() ----------
+
+/// rustc host triple（serve_cmd 插件装配测试同款形态）。
+fn host_triple() -> String {
+    let out = std::process::Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .unwrap()
+        .to_string()
+}
+
+/// 插件存放文件名（= loader plugin_file_name）。
+fn plugin_file(name: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{name}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{name}.dylib")
+    } else {
+        format!("lib{name}.so")
+    }
+}
+
+/// 编译 mini-generic 泛型轴夹具产物路径（全进程一次；夹具体量小，debug 命中快）。
+fn generic_plugin_artifact() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let status = std::process::Command::new("cargo")
+            .args(["build", "-p", "oj-plugin-test-mini-generic"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for mini-generic");
+        assert!(status.success(), "mini-generic build failed");
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        root.join("target/debug")
+            .join(format!("{prefix}oj_plugin_test_mini_generic.{ext}"))
+    })
+    .clone()
+}
+
+/// 泛型轴 e2e：mini-generic 插件（自报轴名 "greet"）扫描装配 → JS 侧
+/// `axis("greet").greet("oj")` → `{"hello":"oj"}`；未知轴 `axis("nope").x()`
+/// → 500 信封且消息列可用轴名（greet）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_axis_greet_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/g/manifest.yaml",
+            "name: g\ndesc: generic axis e2e\nversion: 0.1.0\n",
+        ),
+        (
+            "src/g/api.ts",
+            r#"async function get() {
+                 const who = http.query.who;
+                 // 无 query 时不传参：插件侧 name 缺省 "world"（空数组序列化路径）。
+                 json.ok(await axis("greet").greet(...(who ? [String(who)] : [])));
+               }
+               export default { get };"#,
+        ),
+        (
+            "src/g/nope/api.ts",
+            r#"async function get() {
+                 await axis("nope").x();
+               }
+               export default { get };"#,
+        ),
+    ]);
+    // 夹具拷入隔离插件目录（plugins_dir 指向 <t>/plugins，扫描模式只见到 mini-generic）。
+    let pdir = t.join("plugins").join(host_triple());
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::copy(
+        generic_plugin_artifact(),
+        pdir.join(plugin_file("mini-generic")),
+    )
+    .unwrap();
+    let mut cfg = base_cfg(&t);
+    cfg.plugins_dir = Some(t.join("plugins"));
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    // 泛型轴调用全链路：args 经 ojStringify 进、插件 JSON 出信封 data。
+    let (s, v) = req(addr, "GET", "/v1/api/g/?who=oj", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"], serde_json::json!({ "hello": "oj" }), "{v}");
+    // 缺省参数：插件侧 name 缺省 "world"。
+    let (s, v) = req(addr, "GET", "/v1/api/g/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"], serde_json::json!({ "hello": "world" }), "{v}");
+
+    // 未知轴：500 信封 + 消息含轴名与可用轴列表。
+    let (s, v) = req(addr, "GET", "/v1/api/g/nope", None).await;
+    assert_eq!(s, 500, "{v}");
+    let msg = v["msg"].as_str().unwrap_or("");
+    assert!(msg.contains("unknown generic axis 'nope'"), "{v}");
+    assert!(msg.contains("greet"), "{v}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&t);
+}

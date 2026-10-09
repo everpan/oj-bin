@@ -77,6 +77,7 @@ import {
   op_oidc_sign,
   op_oidc_verify,
   op_plugins,
+  op_axis_call,
   op_resolve_cjs as __oj_resolve_cjs,
   op_bcrypt_hash,
   op_bcrypt_verify,
@@ -652,6 +653,17 @@ globalThis.ldap = ojLdapDefault;
 
 // ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
 globalThis.plugins = () => op_plugins();
+
+// ----- axis: generic plugin axes (self-reported names outside the typed axes) -----
+// axis("cache").get("k") -> op_axis_call("cache", "get", "[\"k\"]"); unknown axis
+// throws listing the available names. ojStringify is BigInt-safe (plain
+// JSON.stringify throws on BigInt). "then" guard: keeps the proxy thenable-safe.
+globalThis.axis = (name) => new Proxy({}, {
+  get: (_, op) => {
+    if (typeof op !== "string" || op === "then") return undefined;
+    return (...args) => op_axis_call(String(name), op, ojStringify(args));
+  },
+});
 
 // ----- vars: deployment-time constants (config `vars:` section) -----
 // Synchronous read (no I/O -- the table is frozen at assembly). FAIL-CLOSED: only keys
