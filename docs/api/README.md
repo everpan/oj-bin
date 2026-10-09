@@ -19,7 +19,7 @@
 | 10 | `Kafka/RabbitMQ`（mq 轴） | [10-mq.md](10-mq.md) | `mq.rs` / `broker/` |
 | 11 | `es` | [11-es.md](11-es.md) | `es.rs` |
 | 12 | `Mail` / `mail` | [12-mail.md](12-mail.md) | `mail.rs` |
-| 13 | `LDAP` / `ldap` | [13-ldap.md](13-ldap.md) | `ldap.rs` |
+| 13 | `axis("ldap")`（`ldap`/`LDAP` 遗留双轨） | [13-ldap.md](13-ldap.md) | `ldap.rs` |
 | 14 | `ws` / `WebSocket` | [14-ws.md](14-ws.md) | `ws.rs` |
 | 15 | `tasks` | [15-tasks.md](15-tasks.md) | `task_pool.rs` |
 | 16 | `jwt` / `bcrypt` / `crypto` | [16-crypto.md](16-crypto.md) | `crypto.rs` |
