@@ -252,7 +252,8 @@ async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
 
 /// 解析配置 + 目录模式（同 server）：读取 config.yaml，确定服务目录（src 优先 / dist 兜底）、
 /// dev/release 判定、base 前缀归源。server 与 test 命令共用，避免重复解析逻辑。
-/// 返回附带 `top`（顶层未知段 JSON 形）：插件自报 config key 的 cfg 查找面（load_with_extra）。
+/// 返回附带 `top`（顶层全量段 JSON 形，已知 + 未知）：插件自报 config key 的 cfg 查找面
+/// （撞宿主已知段名合法，spec Part 3；load_with_extra）。
 pub fn load_app_config(
     config: &str,
     dir_override: Option<&str>,
@@ -653,8 +654,9 @@ pub(crate) fn plugin_cfg(
     {
         return Ok(v.to_string());
     }
-    // 第 2 级：插件自报 config key（oj_plugin_config_key，T3 探测）→ 顶层未知段查找。
-    // 段是读不是占；已知宿主段仍由下面按名遗留臂服务（es/auth/mail/ldap）。
+    // 第 2 级：插件自报 config key（oj_plugin_config_key，T3 探测）→ 全量顶层 Value
+    // 查找（含宿主已知段——段是读不是占；撞已知名是合法场景，评审 H2 的静默 {} 洞
+    // 由此消解；未声明该段的插件仍走下面按名遗留臂 es/auth/mail/ldap）。
     if let Some(k) = config_key {
         if let Some(v) = top.get(k) {
             return serde_json::to_string(v).map_err(|e| format!("plugin cfg section '{k}': {e}"));
@@ -827,6 +829,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
 }
 
 /// 装配后顶层 Value 中未被任何已加载插件消费的段（config key 或 plugins:<name> 非空）。
+/// top 是全量 mapping，但宿主已知段恒不算 unconsumed（host 自己消费）——只面向未知段。
 pub(crate) fn unconsumed_sections(
     top: &serde_json::Value,
     cfg: &Config,
@@ -845,7 +848,10 @@ pub(crate) fn unconsumed_sections(
     top.as_object()
         .map(|m| {
             m.keys()
-                .filter(|k| !consumed.contains(k.as_str()))
+                .filter(|k| {
+                    !config::known_top_level_keys().contains(&k.as_str()) // 宿主已知段不算
+                        && !consumed.contains(k.as_str())
+                })
                 .cloned()
                 .collect()
         })
@@ -879,7 +885,7 @@ pub async fn assemble_plugins(
     let dir = resolve_plugins_dir(config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();
-    // 三级解析：passthrough（plugins:<name> 非空）→ 插件自报 config key 查顶层未知段
+    // 三级解析：passthrough（plugins:<name> 非空）→ 插件自报 config key 查全量顶层段
     // → 按名遗留臂（es/auth/mail/ldap）。config_key 由 load_one init 前探测（T3）传入。
     let cfg_for = |name: &str, config_key: Option<&str>| -> String {
         plugin_cfg(cfg, top, name, config_key, es_profile)
@@ -1259,18 +1265,20 @@ mod tests {
             }
         }
         let cfg = Config::default();
+        // top 为全量 mapping（含宿主已知段 "redis"）：已知段恒不算 unconsumed。
         let top = serde_json::json!({
             "cache": { "ttl": 60 },
             "vendor": { "url": "x" },
             "lonely": { "a": 1 },
+            "redis": { "default": "redis://h:6379" },
         });
-        // 撞名：插件自报 config key = "cache" → 段被消费，不告警。
+        // 撞名：插件自报 config key = "cache" → 段被消费，不告警（已知段 "redis" 也不列）。
         let loaded_v = vec![loaded("oj-cache", Some("cache"))];
         assert_eq!(
             unconsumed_sections(&top, &cfg, &loaded_v),
             ["vendor", "lonely"]
         );
-        // 透传：plugins:<name> 非空 → 同名段被消费（plugins 本身是已知键，从不在 top）。
+        // 透传：plugins:<name> 非空 → 同名段被消费（plugins 本身是已知键）。
         let mut cfg2 = Config::default();
         cfg2.plugins
             .insert("vendor".into(), serde_json::json!({ "url": "y" }));
@@ -1279,11 +1287,24 @@ mod tests {
             unconsumed_sections(&top, &cfg2, &loaded_v),
             ["cache", "lonely"]
         );
-        // 正常：无任何消费方 → 全部未消费段列出。
+        // 正常：无任何消费方 → 未知段全列出，宿主已知段（redis）仍不列。
         let loaded_v: Vec<LoadedPlugin> = Vec::new();
         assert_eq!(
             unconsumed_sections(&top, &cfg, &loaded_v),
             ["cache", "vendor", "lonely"]
+        );
+    }
+
+    /// spec Part 3：config key 查找面是全量顶层 Value——撞宿主已知段名（config: "redis"）
+    /// 是合法场景，必须取到段内容而不是静默 "{}"（评审 H2）。
+    #[test]
+    fn plugin_cfg_config_key_reads_host_known_section() {
+        let cfg = Config::default();
+        let top = serde_json::json!({ "redis": { "default": "redis://h:6379" } });
+        let s = plugin_cfg(&cfg, &top, "oj-kv-redis", Some("redis"), None).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&s).unwrap()["default"],
+            "redis://h:6379"
         );
     }
 
