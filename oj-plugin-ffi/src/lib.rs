@@ -40,6 +40,23 @@ pub type RBytes = stabby::vec::Vec<u8>;
 pub type RResult<T, E> = stabby::result::Result<T, E>;
 pub type RArc<T> = stabby::sync::Arc<T>;
 
+/// 轴声明（自报清单条目）。RString 不可 const 构造 → 清单调用期经 RVec 返回
+///（评审 M1：不做 static 数组）。
+#[stabby::stabby]
+#[repr(C)]
+pub struct AxisDecl {
+    pub name: RString,
+    pub vtable: *const core::ffi::c_void,
+}
+
+/// 泛型轴 vtable：op 名 + JSON 参数 → JSON bytes 结果。
+/// FfiFuture 与全部既有 vtable 同形（错误经 future Err 透传）。
+#[stabby::stabby]
+#[repr(C)]
+pub struct GenericVtable {
+    pub call: extern "C" fn(op: RString, args: RString) -> FfiFuture,
+}
+
 /// 唯一硬门禁：严格相等才允许加载（spec §3）。
 /// 2 = Task 4.1 起（PluginRegistrations 增 db 槽位 + DataAccessorVtable）。
 /// 3 = Task 4.2 起（PluginRegistrations 增 blob 槽位 + BlobBackendVtable）。
@@ -97,17 +114,32 @@ pub struct HostContext {
 }
 
 /// 插件入口宏：生成 oj_plugin_abi_version / oj_plugin_init（catch_unwind 收敛）/
-/// 每轴一个 `oj_plugin_axis_<name>` 导出符号（返回静态 vtable 指针，擦除为 *const c_void）。
+/// 每轴一个 `oj_plugin_axis_<name>` 导出符号（返回静态 vtable 指针，擦除为 *const c_void）/
+/// 轴自报清单 `oj_plugin_axes` / 可选 `oj_plugin_config_key`。
 /// 用法：
 ///   oj_plugin_entry!(init);                                          // 零轴
 ///   oj_plugin_entry!(init, kv => &KV_VTABLE);                        // 单轴
 ///   oj_plugin_entry!(init, kv => &KV_VTABLE, auth => &AUTH_VTABLE);  // 多轴
-/// 轴标识写入符号前强制小写（宿主探测表全小写）；未提供的轴不导出符号 = 不提供该轴。
+///   oj_plugin_entry!(init, config: "cache", kv => &KV_VTABLE);       // 带配置键
+/// 轴标识必须小写（stringify 原样进清单，无 :lower 兜底）。
+/// 轴标识写入 per-axis 符号前强制小写（宿主探测表全小写）；未提供的轴不导出符号 = 不提供该轴。
 /// 注意：vtable 方法须在实现侧以 catch_value/catch_future 收敛 panic——宿主对
 /// vtable 方法无 catch_unwind（本宏只保护 init）。
 #[macro_export]
 macro_rules! oj_plugin_entry {
+    // 含 config 键的形态：config 必须前置，单独规则避免与 $axis:ident 局部歧义。
+    ($init:expr, config: $ck:literal $(, $axis:ident => $vtable:expr)* $(,)?) => {
+        $crate::oj_plugin_entry_impl! { @body [$init] [$ck] [$($axis => $vtable)*] }
+    };
+    // 不含 config 键的形态（零轴 / 普通轴）。
     ($init:expr $(, $axis:ident => $vtable:expr)* $(,)?) => {
+        $crate::oj_plugin_entry_impl! { @body [$init] [] [$($axis => $vtable)*] }
+    };
+}
+
+#[macro_export]
+macro_rules! oj_plugin_entry_impl {
+    (@body [$init:expr] [$($ck:literal)?] [$($axis:ident => $vtable:expr)*]) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn oj_plugin_abi_version() -> u32 {
             $crate::ABI_VERSION
@@ -138,6 +170,27 @@ macro_rules! oj_plugin_entry {
                 }
             }
         )*
+
+        /// 轴自报清单（宿主优先路径；旧宿主无此符号 → 回退逐轴 dlsym）。
+        /// 宏双发：per-axis 符号保留至回退路径退役（spec 评审 M3）。
+        #[unsafe(no_mangle)]
+        pub extern "C" fn oj_plugin_axes() -> $crate::RVec<$crate::AxisDecl> {
+            let mut v = $crate::RVec::new();
+            $(
+                v.push($crate::AxisDecl {
+                    name: $crate::RString::from(stringify!($axis)),
+                    vtable: $vtable as *const _ as *const ::core::ffi::c_void,
+                });
+            )*
+            v
+        }
+
+        $(
+            #[unsafe(no_mangle)]
+            pub extern "C" fn oj_plugin_config_key() -> $crate::RString {
+                $crate::RString::from($ck)
+            }
+        )?
     };
 }
 
