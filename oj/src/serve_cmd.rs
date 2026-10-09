@@ -880,13 +880,16 @@ pub(crate) fn unconsumed_sections(
 /// spec §5 全流程：解析 plugins_dir → 严格（plugins map 键）/缺省扫描 → 逐个加载校验
 /// → 身份核对 → semver 对照 → 注册（插件先于内置）→ 内置后端注册。
 /// 空 map/目录不存在/为空 → 扫描模式零插件（仅内置后端，不报错，除非 §2 闸门触发）。
+///
+/// 返回 (自省清单, loaded 插件体)：loaded 供 `assemble_ojinfo` 取 config_key
+/// （unconsumed 段诊断）——JS ojInfo() 与 CLI 共用同一装配面。
 pub async fn assemble_plugins(
     cfg: &Config,
     top: &serde_json::Value,
     config_dir: &Path,
     registries: &mut Registries,
     es_profile: Option<&str>,
-) -> Result<Vec<PluginInfo>, String> {
+) -> Result<(Vec<PluginInfo>, Vec<LoadedPlugin>), String> {
     // A5：mail 双配置源（`smtp:` 与 `plugins.mail` 皆非空）是配置错误 → 装配期 fail-fast
     // （`plugin_cfg` 会让非空 `plugins.mail` 静默胜出，运维改 `smtp:` 会「改了不生效」）。
     check_mail_cfg_sources(cfg)?;
@@ -941,7 +944,7 @@ pub async fn assemble_plugins(
     if !unused.is_empty() {
         eprintln!("[oj-serve] unconsumed config sections: {unused:?} (typo? or plugin not loaded)");
     }
-    Ok(loaded.iter().map(PluginInfo::from).collect())
+    Ok((loaded.iter().map(PluginInfo::from).collect(), loaded))
 }
 
 /// oj_info（phpinfo 对应物）单一事实源。两出口（CLI / JS ojInfo()）共用。
@@ -1049,6 +1052,61 @@ fn host_triple_str() -> String {
     }
 }
 
+/// `oj info` 与 JS ojInfo() 的共同装配体（单一事实源，两出口共用）：
+/// backends 声明面 + config 段名 + build/abi + 插件清单 + 泛型轴名。
+/// `config_path` None（serve 测试入口）时 build 不含 config_path 字段。
+/// **只报告声明面**：不 connect 库/broker；config 只出段名/键名，值一律不出。
+pub(crate) fn assemble_ojinfo(
+    cfg: &Config,
+    top: &serde_json::Value,
+    loaded: &[LoadedPlugin],
+    reg: &Registries,
+    config_path: Option<&str>,
+) -> OjInfo {
+    // backends 声明面：db schemes、blob 有/无、broker kinds、kv/auth/es/mail/ldap/mq 槽位。
+    let backends = serde_json::json!({
+        "db_schemes": { "declared": cfg.db.keys().collect::<Vec<_>>() },
+        "blob_configured": cfg.blob.is_some(),
+        "kv_plugin": reg.kv.is_some(),
+        "auth_plugin": reg.auth.is_some(),
+        "mail_plugin": reg.mail.is_some(),
+        "ldap_plugin": reg.ldap.is_some(),
+        "es_plugin": reg.es.is_some(),
+        "mq_plugins": reg.mq.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "bus_kinds": reg.bus.kinds(),
+        "dbs_registered": reg.dbs.backend_names(),
+    });
+    let unconsumed = unconsumed_sections(top, cfg, loaded);
+    let config = serde_json::json!({
+        "sections": known_section_keys(top),
+        "unconsumed": unconsumed,
+    });
+    let mut build = serde_json::json!({
+        "oj": env!("CARGO_PKG_VERSION"),
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "host_triple": host_triple_str(),
+        "v8": v8_version(),
+        "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+    });
+    if let Some(p) = config_path
+        && let Some(m) = build.as_object_mut()
+    {
+        m.insert("config_path".into(), p.into());
+    }
+    OjInfo {
+        build,
+        abi: serde_json::json!({
+            "abi_version": oj_plugin_ffi::ABI_VERSION,
+            "host_fingerprint": oj_plugin_ffi::HOST_FINGERPRINT,
+        }),
+        plugins: loaded.iter().map(PluginInfo::from).collect(),
+        backends,
+        config,
+        generic_axes: reg.generic.iter().map(|(a, _, _)| a.clone()).collect(),
+        unconsumed_sections: unconsumed,
+    }
+}
+
 /// `oj info` 与 JS ojInfo() 的共同装配面：load_with_extra → resolve_plugins_dir →
 /// assemble_plugins 的加载与 config 解析路径 → build_registries；不 connect、不监听。
 /// 副作用 = 执行插件 init 代码，信任边界同 serve。
@@ -1083,42 +1141,13 @@ pub async fn assemble_for_info(cfg_path: &str) -> Result<OjInfo, String> {
         None => vec![],
     };
     let reg = build_registries(cfg, &loaded)?;
-    // backends 声明面：db schemes、blob 有/无、broker kinds、kv/auth/es/mail/ldap/mq 槽位。
-    let backends = serde_json::json!({
-        "db_schemes": { "declared": cfg.db.keys().collect::<Vec<_>>() },
-        "blob_configured": cfg.blob.is_some(),
-        "kv_plugin": reg.kv.is_some(),
-        "auth_plugin": reg.auth.is_some(),
-        "mail_plugin": reg.mail.is_some(),
-        "ldap_plugin": reg.ldap.is_some(),
-        "es_plugin": reg.es.is_some(),
-        "mq_plugins": reg.mq.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-        "bus_kinds": reg.bus.kinds(),
-        "dbs_registered": reg.dbs.backend_names(),
-    });
-    let config = serde_json::json!({
-        "sections": known_section_keys(&loaded_cfg.top),
-        "unconsumed": unconsumed_sections(&loaded_cfg.top, cfg, &loaded),
-    });
-    Ok(OjInfo {
-        build: serde_json::json!({
-            "oj": env!("CARGO_PKG_VERSION"),
-            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-            "host_triple": host_triple_str(),
-            "v8": v8_version(),
-            "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
-            "config_path": cfg_path,
-        }),
-        abi: serde_json::json!({
-            "abi_version": oj_plugin_ffi::ABI_VERSION,
-            "host_fingerprint": oj_plugin_ffi::HOST_FINGERPRINT,
-        }),
-        plugins: loaded.iter().map(PluginInfo::from).collect(),
-        backends,
-        config,
-        generic_axes: reg.generic.iter().map(|(a, _, _)| a.clone()).collect(),
-        unconsumed_sections: unconsumed_sections(&loaded_cfg.top, cfg, &loaded),
-    })
+    Ok(assemble_ojinfo(
+        cfg,
+        &loaded_cfg.top,
+        &loaded,
+        &reg,
+        Some(cfg_path),
+    ))
 }
 
 #[cfg(test)]
@@ -2418,9 +2447,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert!(plugins.is_empty());
         assert!(r.es.is_none());
     }
@@ -2469,9 +2499,10 @@ mod tests {
         let mut cfg = es_cfg("http://127.0.0.1:1");
         cfg.plugins_dir = Some(t.0.clone());
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -2490,9 +2521,10 @@ mod tests {
         cfg.plugins_dir = Some(t.0.clone());
         cfg.plugins.insert("es".into(), serde_json::json!({}));
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
         assert!(r.es.is_some(), "es backend must be wired from the plugin");
@@ -2515,9 +2547,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "es");
     }
@@ -2537,9 +2570,10 @@ mod tests {
         cfg.plugins
             .insert("auth".into(), serde_json::json!({"jwt_secret": "x"}));
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["auth", "es"]);
     }
@@ -2582,9 +2616,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "db-mysql");
         let names = r.dbs.backend_names();
@@ -2667,9 +2702,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "blob-s3");
         assert!(r.blob.is_some(), "blob vtable slot not registered");
@@ -2748,9 +2784,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "bus-kafka");
         let kinds = r.bus.kinds();
@@ -2831,9 +2868,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "kv-redis");
         assert!(r.kv.is_some(), "kv vtable slot not registered");
@@ -3002,9 +3040,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         let broker_cfg = only_js::config::BrokerCfg {
             kind: "kafka".into(),
@@ -3068,9 +3107,10 @@ mod tests {
             ..Default::default()
         };
         let mut r = Registries::default();
-        let plugins = assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
-            .await
-            .unwrap();
+        let (plugins, _loaded) =
+            assemble_plugins(&cfg, &serde_json::Value::Null, &t.0, &mut r, None)
+                .await
+                .unwrap();
         assert_eq!(plugins.len(), 1);
         let broker_cfg = only_js::config::BrokerCfg {
             kind: "rabbitmq".into(),

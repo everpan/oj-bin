@@ -10,7 +10,6 @@ pub async fn run(config: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::serve_cmd::OjInfo;
 
     fn sample() -> OjInfo {

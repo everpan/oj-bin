@@ -796,8 +796,8 @@ pub async fn assemble_backend(
     // 自描述清单（PluginInfo）同时喂 Extras/StableState.plugins（JS 内省）与
     // `GET {base}/plugins`（AppState）。
     let mut registries = Registries::default();
-    let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
-        assemble_plugins(
+    let (plugin_infos, loaded) = {
+        let (infos, loaded) = assemble_plugins(
             cfg,
             top,
             config_dir,
@@ -805,7 +805,21 @@ pub async fn assemble_backend(
             profiles.es.as_deref(),
         )
         .await
-        .map_err(|e| format!("plugins: {e}"))?,
+        .map_err(|e| format!("plugins: {e}"))?;
+        (std::sync::Arc::new(infos), loaded)
+    };
+    // ojInfo() 数据源（与 `oj info` CLI 同源，`serve_cmd::assemble_ojinfo` 单一事实源）：
+    // to_value 固化后注入 StableState/Extras——config 只含段名/键名（值一律不出），
+    // 注入即公开。registries 尚未被消费（es/kv/generic 等槽位在下方逐次取出）。
+    let oj_info: Arc<serde_json::Value> = Arc::new(
+        serde_json::to_value(crate::serve_cmd::assemble_ojinfo(
+            cfg,
+            top,
+            &loaded,
+            &registries,
+            None,
+        ))
+        .map_err(|e| format!("ojinfo: {e}"))?,
     );
     // KV：redis.<key> 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
     // 未声明 → InMemoryKV 内置兜底。
@@ -961,6 +975,8 @@ pub async fn assemble_backend(
         let input_contracts = input_contracts.clone();
         let fs_grant = fs_grant.clone();
         let generic_axes = generic_axes.clone();
+        // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 oj_info 仍供 StableState 使用）。
+        let oj_info = oj_info.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -1000,6 +1016,8 @@ pub async fn assemble_backend(
                     fs: fs_grant.clone(),
                     // 泛型轴注册表：与 StableState.generic_axes 同一 Arc。
                     generic_axes: Some(generic_axes.clone()),
+                    // ojInfo() 数据源：与 StableState.oj_info 同一 Arc（`oj info` CLI 同源）。
+                    oj_info: Some(oj_info.clone()),
                 },
             )
         }
@@ -1039,6 +1057,7 @@ pub async fn assemble_backend(
         js_heap_limit,
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。
         generic_axes,         // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
+        oj_info,              // 与 make_bridge 的 Extras.oj_info 同一 Arc（ojInfo() 数据源）。
     });
     Ok(Backend {
         stable,
