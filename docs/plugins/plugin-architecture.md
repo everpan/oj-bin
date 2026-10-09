@@ -4,7 +4,9 @@
 > 保留本文仅作决策过程记录；现行插件系统见 `../dev-guide.md` §13 与
 > `plugin-development.md`，注册机制见下方 §0。
 
-**给谁读**：要写插件，直接看 `plugin-development.md`，不用读本文。本文适合想知道
+**给谁读**：要写插件，直接看 **[plugin-development.md](plugin-development.md)（插件
+开发手册）**——环境准备/生命周期/入口宏范式/轴选择/配置/错误约定/调试/发布与迁移
+全流程，新轴范式照抄 `tools/plugin-template`。本文适合想知道
 「为什么最后选了 cdylib + FFI、而不是进程内 trait」的读者——§0 是现行机制速览，
 §1 起是被否决的原方案全文。
 
