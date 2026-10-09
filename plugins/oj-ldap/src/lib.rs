@@ -1,9 +1,41 @@
-//! oj-ldap：ldap 轴 cdylib 插件（ldap3 客户端）。
+//! oj-ldap：ldap **泛型轴** cdylib 插件（ldap3 客户端；经 GenericVtable + `axis("ldap")`）。
 //!
-//! 职责边界（同 mail 轴的宿主/插件分工）：
-//! - **宿主**（`src/bridge/ldap.rs`）负责实例表白名单校验 + 调用入参校验 + JS 全局；
-//! - **本插件**负责连接生命周期（每调用 connect → 服务账号绑定 → 操作 → unbind）、
-//!   LDAP 协议交互与结果编码（经 `FfiFuture` 回 JSON）。
+//! 职责边界：
+//! - **宿主**（`src/bridge/ldap.rs` 全局 `ldap`/`LDAP`）是遗留 typed 通道面，保持不动；
+//!   本插件不再注册 typed 槽（`generic(ldap)` 声明 kind=GENERIC，loader 按 kind 路由）。
+//! - **本插件**负责实例 cfg 校验（纵深防御）、连接生命周期（每调用 connect →
+//!   服务账号绑定 → 操作 → unbind）、LDAP 协议交互与泛型轴 JSON 协议的全部入参校验
+//!   （旧 typed 路径的宿主 `validate_call` 职责收编到 [`engine`]）。
+//!
+//! # 泛型轴 JSON 协议（vtable: `call(op, args)`）
+//!
+//! `args` 恒为位置参数 JSON 数组；末位可选 opts 对象。实例选单经 `opts.key`
+//! （缺省 `"default"`）。未知 opts 键忽略（旧宿主白名单重建语义）。连接/协议/
+//! 校验错误经 future Err 透传（JS 侧 reject）；`bind` 凭据被 LDAP 拒绝 = `false`，非错误。
+//!
+//! | op | args | opts | 结果 JSON |
+//! |----|------|------|-----------|
+//! | `bind` | `[dn, pw]` | `{key?}` | `true \| false` |
+//! | `search` | `[base]` | `{key?, scope?, filter?, attrs?, bindDn?, bindPw?}` | `[{dn, attrs:{k:[v]}, bin:{k:[base64]}}]` |
+//! | `search_paged` | `[base]` | 同上 + `{pageSize?}`（缺省 500，范围 1..=10000） | 同 `search` |
+//! | `whoami` | `[]` | `{key?}` | authzid 字符串 |
+//! | `compare` | `[dn, attr, val]` | `{key?}` | `true \| false` |
+//!
+//! - `scope`：`"base" \| "one" \| "sub"`（缺省 `"sub"`）；`filter` 缺省 `"(objectClass=*)"`);
+//!   `attrs` 缺省 `[]`（全属性）。
+//! - `bindDn`/`bindPw`：覆盖本次 search 系查询的绑定凭据，与 config 服务账号按位合并
+//!   （各取一，另一回落 config；皆无 = 匿名绑定）。
+//! - 校验失败文案沿用旧 typed 端到端（宿主 `validate_call` 层）文本，如
+//!   `ldap.search: 'base' must be a non-empty string`、`ldap: unknown instance 'x'（known: …）`。
+//!
+//! JS 调用面（T5 泛型通道）：
+//! ```js
+//! await axis("ldap").bind("uid=eve,dc=example,dc=com", "pw");            // → true|false
+//! await axis("ldap").search("ou=users,dc=example,dc=com", { scope: "one", attrs: ["uid"] });
+//! await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
+//! await axis("ldap").whoami({ key: "ad" });                              // → "dn:cn=svc,…"
+//! await axis("ldap").compare(dn, "uid", "eve");                          // → true|false
+//! ```
 //!
 //! 连接模型（ponytail）：不做连接池——每次调用独立成连，bind(dn,pw) 用户鉴权
 //! 本就要求凭据不共享连接；search 的服务账号绑定在 AD/LAN 上是毫秒级开销。
@@ -15,13 +47,12 @@ mod engine;
 use config::PluginCfg;
 use engine::Engine;
 use oj_plugin_ffi::{
-    ABI_VERSION, FfiFuture, HOST_FINGERPRINT, HostContext, LdapVtable, PluginDescriptor, RArc,
-    RResult, RString,
+    ABI_VERSION, FfiFuture, HOST_FINGERPRINT, HostContext, PluginDescriptor, RArc, RResult, RString,
 };
-use std::sync::OnceLock;
 
 /// 进程级引擎（`init` 装配，`call` 取用；重复 init 保留首个，幂等同 oj-mail）。
 static ENGINE: OnceLock<Engine> = OnceLock::new();
+use std::sync::OnceLock;
 
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
@@ -53,20 +84,23 @@ fn init(host: RArc<HostContext>, cfg: RString) -> RResult<PluginDescriptor, RStr
     RResult::Ok(descriptor())
 }
 
-/// 统一调用入口（契约见 `oj-plugin-ffi/src/ldap.rs` 的 `LdapVtable::call` 文档）。
-/// 解析/分派/回传全在 [`Engine::call`]；此处只做「引擎未装配」兜底与跨边界 panic 收敛。
-extern "C" fn call(req: RString) -> FfiFuture {
+/// 统一调用入口（泛型轴协议见 crate 根文档）。
+/// 解析/分派/回传全在 [`Engine::call`]；此处只做「引擎未装配」兜底与跨边界 panic 收敛
+/// （panic=unwind 红线：宿主对 vtable 方法无 catch_unwind）。
+extern "C" fn call(op: RString, args: RString) -> FfiFuture {
     oj_plugin_ffi::catch_future(|| {
         let Some(engine) = ENGINE.get() else {
             return oj_plugin_ffi::ready_err("oj-ldap: init not called");
         };
-        engine.call(&req[..])
+        engine.call(&op[..], &args[..])
     })
 }
 
-static LDAP_VTABLE: LdapVtable = LdapVtable { call };
+static LDAP_VT: oj_plugin_ffi::GenericVtable = oj_plugin_ffi::GenericVtable { call };
 
-oj_plugin_ffi::oj_plugin_entry!(init, ldap => oj_plugin_ffi::axis::ldap(&LDAP_VTABLE));
+// config: "ldap" 沿用既有 config 段名；generic(ldap) 声明泛型轴（kind=GENERIC，
+// loader 按 kind 路由——typed 槽不再注册，宿主 ldap.* 全局留给遗留 typed 插件）。
+oj_plugin_ffi::oj_plugin_entry!(init, config: "ldap", generic(ldap) => &LDAP_VT);
 
 #[cfg(test)]
 mod tests {
@@ -97,6 +131,25 @@ mod tests {
             RString::from(r#"{"default":{"url":"http://x"}}"#),
         );
         assert!(std::result::Result::from(bad).is_err());
+    }
+
+    /// vtable 协议入口：经 GenericVtable.call(op, args) 分派——未知 op 即 ready Err
+    /// （泛型通道协议在插件边界的工作证据，无网络）。
+    #[test]
+    fn vtable_call_dispatches_by_op() {
+        let cfg = r#"{"default":{"url":"ldap://dc.example.com:389"}}"#;
+        let _ = init(RArc::new(dummy_host()), RString::from(cfg));
+        let f = (LDAP_VT.call)(RString::from("delete"), RString::from("[]"));
+        assert_eq!((f.poll)(f.state), -1);
+        let r = std::result::Result::from((f.take)(f.state));
+        (f.free)(f.state);
+        let Err(e) = r else { panic!("expected Err") };
+        let msg = String::from_utf8_lossy(e.as_bytes());
+        assert!(msg.contains("unknown op 'delete'"), "{msg}");
+        assert!(
+            msg.contains("bind|search|search_paged|whoami|compare"),
+            "{msg}"
+        );
     }
 
     fn dummy_host() -> HostContext {
