@@ -45,13 +45,15 @@ ESM 入口把它们装配成全局对象。加一个 JS 能力 = 加一个 `op_`
 | `fetch(url, opts)` | 浏览器兼容子集 | 经 `reqwest` |
 | `log` | `debug/info/warn/error(msg, ...kv)` | zap 风格交替键值 |
 | `plugins()` | — | 返回已加载插件自描述 |
+| `axis(name)` | 泛型插件轴调用面（v0.1.54）：任意方法名 = 插件自报 op，如 `axis("ldap").search_paged(...)` | 未知轴抛错并列出可用轴名；见 api-manual §6「axis(name)」 |
+| `ojInfo()` | — | 装配期固化诊断（v0.1.54，与 `oj info` CLI 同一装配体 `assemble_ojinfo`）；声明面 only（不 connect、config 只出键名），无公共 HTTP 端点 |
 | `vars` | `get(name)` | 部署期常量（config `vars:` 段，v0.1.25）：**同步**；未声明键 → `null`（fail-closed，无「读任意 env/config 键」通道） |
 | `cert` | `generate(bits, nbf, exp)` / `renew(pem, nbf, exp)` | RSA keygen + RS256 在 Rust |
 | `jwt` | `sign` / `verify` / `accessDuration` / `refreshDuration` | |
 | `bcrypt` | `hash` / `verify` | Rust 侧 `spawn_blocking` |
 | `oidc` | `sign` / `verify(token, jwks?)` / `jwks()` / `issuer` / `rp` / `clients` | 私钥不出 Rust |
 | `crypto` | `sha256Hex` / `randomHex` / `aesGcmEncrypt` / `aesGcmDecrypt` / `getRandomValues` | 合并进原生 `crypto` |
-| `ldap` / `LDAP(name)` | `bind` / `search` / `searchPaged` / `whoami` / `compare` | 目录服务（`oj-ldap`）；未配置报 "ldap not configured" |
+| `axis("ldap")` | `bind` / `search` / `search_paged` / `whoami` / `compare`（方法名 = op 名，原样透传插件） | LDAP 目录服务（`oj-ldap`，v0.1.54 起迁移泛型轴）；类型化 `ldap`/`LDAP` 全局为遗留双轨面——旧宿主配旧 typed 插件仍可用，新宿主配迁移版插件后报 "ldap not configured" |
 | `mail` / `Mail(key)` | `send` / `sendSync` / `enqueue` / `result` / `sendRaw` / `profiles()` | SMTP 投递（`oj-mail`）；未配置抛错 |
 | `Kafka(name)` / `RabbitMQ(name)` | `send`/`publish` / `poll` / `commit`/`ack`/`nack` | 命名消息客户端（bus 之上；消费端限于 task 上下文） |
 | `finish()` | — | 结束会话且不写响应 |

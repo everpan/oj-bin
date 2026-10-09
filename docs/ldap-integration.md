@@ -202,5 +202,6 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 lda
   agent 陷阱速查：`docs/devkit/SKILL.md`。
 - 插件体系：`docs/plugins/plugin-architecture.md`、`docs/plugins/plugin-development.md`
   （泛型轴通道与 `config: "key"` 自报）、`docs/plugins/oj-ldap.md`（本插件）。
-- 配置样例：`sample/config.yaml`（注释掉的 ldap 示例）、`sample/global.d.ts`（TS 类型）。
+- 配置样例：`sample/config.yaml`（**活动** ldap 段示例——`default` 实例，`bind_pw` 走
+  `ENC[...]` 密封值）、`sample/global.d.ts`（TS 类型）。
 - 设计与实现记录：`docs/superpowers/specs/2026-09-27-oj-ldap-design.md`。

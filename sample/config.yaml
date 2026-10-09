@@ -79,7 +79,8 @@ blob:   # 对象存储（v0.2）：块存在即启用——JS blob.* + {base}/bl
   # secret_key: "minioadmin"
   # path_style: true
 
-ldap:  # LDAP 目录/鉴证（v0.1.28，需 oj-ldap 插件）：段存在即启用 ldap.* 全局
+ldap:  # LDAP 目录/鉴证（v0.1.28，需 oj-ldap 插件）：段存在即启用 axis("ldap") 泛型轴调用面
+       # （v0.1.54 起 oj-ldap 迁移泛型轴；类型化 ldap.* 全局为遗留双轨面）
        # 服务账号 DN 可留配置（DN 非密码）；**服务账号密码走运行时参数**，不落本文件。
        # 暂用明文 389：pradserver1 当前拒绝 636 与 389-StartTLS（均 Connection reset），
        # 仅明文可连。待 AD 开启 LDAPS/StartTLS 后改为 ldaps://...:636，或

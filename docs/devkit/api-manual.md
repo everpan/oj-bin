@@ -1517,7 +1517,7 @@ ldap:
   bindPw per search call)`（config 只有密码无 DN）。全部 reject，不会 resolve 半个信封。
 - **filter 注入**：`filter` 是拼进 LDAP 查询的字符串，`(uid=${username})` 若 `username`
   含 `*`/`()`/`\` 会改变查询语义（LDAP 无参数绑定）。**先转义**（把 `*` `(` `)` `\` NUL
-  前缀 `\`）或用 `ldap.compare` 收口。
+  前缀 `\`）或用 `axis("ldap").compare` 收口。
 
 ### log —— 结构化日志
 
@@ -1639,8 +1639,9 @@ await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" 
 - **信任边界**：泛型轴是插件自报的任意调用面——参数与返回值都是跨 FFI 边界的 JSON，
   插件自身负责校验（与类型化轴同一信任模型）；handler 侧把 axis 当「带名字的
   `fetch`」对待，别把不可信输入直接拼进 op 语义。
-- 泛型轴名撞 9 个保留名（es/db/blob/bus/kv/auth/mq/mail/ldap）**不许**——插件作者须知，
-  撞名在旧宿主（pre-kind）上会被误 cast。
+- 泛型轴名**应避开** 9 个保留名（es/db/blob/bus/kv/auth/mq/mail/ldap）；确要撞名（如
+  oj-ldap 即 `ldap`）须部署宿主 ≥ v0.1.54——旧宿主会经 per-axis 符号把泛型轴误 cast
+  成类型化轴，UB。
 
 ### ojInfo() —— 装配期固化诊断（v0.1.54）
 
@@ -1649,7 +1650,7 @@ JS 出口：handler 里 `ojInfo()` **同步**返回五段诊断对象（装配�
 
 ```jsonc
 {
-  "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…", "config_path": "…" },
+  "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…" },  // config_path 仅 oj info CLI 出，JS ojInfo() 无此字段
   "abi":     { "abi_version": 11, "host_fingerprint": "…" },
   "plugins": [ { "name": "…", "semver": "…", "abi_version": 11, "fingerprint": "…",
                  "description": "…", "host_abi_version": 11, "unknown_axes": [] } ],
@@ -3146,7 +3147,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` 而不是 `true`/`false`（v0.1.24） | MySQL 没有独立 boolean 类型（`BOOLEAN` 即 `TINYINT(1)`），协议层无列长度元数据可区分；按整数读。需要 boolean 语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `test fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | ldap 无连接池（每调用独立 connect/bind/unbind） | 设计取向：bind(dn,pw) 用户凭据绝不共享连接；LAN 上 AD 连接建立为毫秒级。热路径（每请求多次 LDAP 调用）先用 `search` 一次取全所需字段，仍不够再评估给插件加 ldap3 pool |
-| ldap `search` 不做分页 | 服务端可拒超量返回（AD 默认 1000 条上限）；大结果集用 `ldap.searchPaged` |
+| ldap `search` 不做分页 | 服务端可拒超量返回（AD 默认 1000 条上限）；大结果集用 `axis("ldap").search_paged` |
 | ldap referral 不自动跟随 | `search` 返回 referral 引用（`ResultEntry::Refer`）时插件收集进结果 refs 并跳过——目录树跨 ref 分片的场景先确认 base 落在目标分区内 |
 | ldap `filter` 无参数绑定 | 字符串直拼，用户输入须先按 RFC 4515 转义（见 §6 ldap 节），否则是 LDAP 版注入 |
 | 二进制属性（`jpegPhoto` 等）出 `bin` 为 base64 字符串 | `entry.bin.jpegPhoto[0]` 是 base64 文本；落库/出 HTTP 前自行解码，勿当 UTF-8 原文 |
