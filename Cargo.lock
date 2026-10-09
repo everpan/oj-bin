@@ -4449,7 +4449,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj-plugin-test-mini-generic"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+ "serde_json",
+]
+
+[[package]]
 name = "oj-plugin-test-mini-kv"
+version = "0.1.0"
+dependencies = [
+ "oj-plugin-ffi",
+]
+
+[[package]]
+name = "oj-plugin-test-mini-legacy"
 version = "0.1.0"
 dependencies = [
  "oj-plugin-ffi",

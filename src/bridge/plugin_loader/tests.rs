@@ -117,6 +117,35 @@ fn mini_nosym_plugin_dir() -> PathBuf {
     .clone()
 }
 
+/// mini-legacy（旧式手写符号夹具：有 oj_plugin_axis_kv、无 oj_plugin_axes——
+/// 独立目录，避免 scan 计数断言翻倍）。
+fn mini_legacy_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-legacy",
+            "oj_plugin_test_mini_legacy",
+            "mini-legacy",
+            "test-plugins-legacy",
+        )
+    })
+    .clone()
+}
+
+/// mini-generic（泛型轴 greet 夹具；独立目录，避免 scan 计数断言翻倍）。
+fn mini_generic_plugin_dir() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        fixture_plugin_dir(
+            "oj-plugin-test-mini-generic",
+            "oj_plugin_test_mini_generic",
+            "mini-generic",
+            "test-plugins-generic",
+        )
+    })
+    .clone()
+}
+
 // ---- 路径解析 ----
 
 #[test]
@@ -596,6 +625,36 @@ fn given_fingerprint_mismatch_when_load_then_warn_only_and_still_ok() {
     let loaded = loaded.unwrap();
     assert_eq!(&loaded.descriptor.name[..], "mini");
     assert_eq!(&loaded.descriptor.fingerprint[..], "rustc-999-bogus");
+}
+
+// ---- 轴自报清单：旧插件回退 / 泛型轴（T2 红测，T3 转绿）----
+
+/// 旧式插件（无 oj_plugin_axes 自报符号）→ 宿主回退逐轴 dlsym，kv 槽仍被填上。
+#[test]
+fn legacy_plugin_without_axes_symbol_loads_via_fallback() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear_mini_hooks();
+    let dir = mini_legacy_plugin_dir();
+    let loaded = load_scanned(&dir, host_context(), &no_cfg).expect("legacy scan load");
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].registrations.kv.is_some(), "kv via fallback dlsym");
+}
+
+/// 泛型轴插件：greet 经自报清单进 generic_axes；不在 9 个类型化轴内 → kv 槽 None。
+#[test]
+fn generic_axis_plugin_reports_greet_axis() {
+    let _g = ENV_LOCK.lock().unwrap();
+    clear_mini_hooks();
+    let dir = mini_generic_plugin_dir();
+    let loaded = load_scanned(&dir, host_context(), &no_cfg).expect("generic scan load");
+    assert_eq!(loaded.len(), 1);
+    let names: Vec<&str> = loaded[0]
+        .generic_axes
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(names, vec!["greet"]);
+    assert!(loaded[0].registrations.kv.is_none());
 }
 
 // ---- 装配期 connect 适配（kv_backend_connect / blob_backend_connect）----
