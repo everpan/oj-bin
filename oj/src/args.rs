@@ -181,8 +181,9 @@ pub struct SchemaDiffArgs {
 }
 
 /// `oj exec [-c config] [-d dir] [--db name] [--log-file path] (file | -e code | --repl) [args...]`：
-/// 直接执行 ts/js 脚本（完整注入后端全局；console/log 终端直出，--log-file 双写落盘）。
-/// `file` / `-e/--code` / `--repl` 三选一、互斥：文件 / 内联代码 / 交互式 REPL。
+/// 直接执行 ts/js 脚本（完整注入后端全局；console/log 输出按通道分离，
+/// --log-file 双写落盘）。`file` / `-e/--code` / `--repl` 三选一、互斥：
+/// 文件 / 内联代码 / 交互式 REPL；三者缺省（裸 `oj exec`，v0.1.55）= 进 REPL。
 pub struct ExecArgs {
     pub file: Option<String>,
     /// 直接执行的内联代码（TypeScript 语法；JS 子集亦合法）。与 `file` / `--repl` 互斥。
@@ -365,7 +366,7 @@ enum Commands {
         #[command(subcommand)]
         command: SecretCmd,
     },
-    /// 直接执行 ts/js 脚本（注入后端全局；file / -e / --repl 三选一）。
+    /// 直接执行 ts/js 脚本（注入后端全局；file / -e / --repl 三选一，缺省进 REPL）。
     #[command(group(clap::ArgGroup::new("exec_src").multiple(false)))]
     Exec {
         /// 脚本文件路径（.ts/.js）；与 --code / --repl 互斥
@@ -777,7 +778,11 @@ mod tests {
         assert!(cli(&["exec", "s.ts", "-e", "1"]).is_err());
         // file + --repl 报错。
         assert!(cli(&["exec", "s.ts", "--repl"]).is_err());
-        // 三者皆无：缺 source（group 不强制，但本仓 run() 会校验）。
+        // 三者皆无：args 层照常解析不报错（v0.1.55 起缺省进 REPL——路由在 exec_cmd 层）。
+        let Command::Exec(a) = cmd(&["exec", "-c", "c.yaml"]) else {
+            panic!()
+        };
+        assert!(a.file.is_none() && a.code.is_none() && !a.repl);
     }
 
     #[test]
