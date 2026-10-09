@@ -60,7 +60,11 @@ fn descriptor() -> PluginDescriptor {
         semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: ABI_VERSION,
         fingerprint: RString::from(HOST_FINGERPRINT),
-        desc: RString::from("LDAP directory search + bind-as-auth (ldap3)"),
+        // desc 会出现在 GET {base}/plugins 与 JS plugins()——泛型轴 + config key 自报
+        // 均为 v0.1.54 起的新能力，旧宿主不可加载本迁移版（在此注明宿主最低版本）。
+        desc: RString::from(
+            "LDAP directory search + bind-as-auth (ldap3); generic axis, requires host >= v0.1.54",
+        ),
     }
 }
 
