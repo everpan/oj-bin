@@ -32,7 +32,7 @@
 //! ```js
 //! await axis("ldap").bind("uid=eve,dc=example,dc=com", "pw");            // → true|false
 //! await axis("ldap").search("ou=users,dc=example,dc=com", { scope: "one", attrs: ["uid"] });
-//! await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
+//! await axis("ldap").search_paged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
 //! await axis("ldap").whoami({ key: "ad" });                              // → "dn:cn=svc,…"
 //! await axis("ldap").compare(dn, "uid", "eve");                          // → true|false
 //! ```
