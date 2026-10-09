@@ -50,7 +50,8 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         (None, Some(code), false) => ExecTarget::Code(code.clone()),
         (None, None, false) => return Err("exec: 需提供 <file> / --code / --repl 之一".into()),
     };
-    let (cfg, config_dir, dir, _ts, base) = load_app_config(&a.config, a.dir.as_deref(), None)?;
+    let (cfg, top, config_dir, dir, _ts, base) =
+        load_app_config(&a.config, a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
     // 缺省 default；未声明 fail-fast（装配层统一校验）。
@@ -88,7 +89,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                 .map_err(|e| format!("exec runtime: {e}"))?;
             rt.block_on(async move {
                 let backend =
-                    assemble_backend(&cfg, &config_dir, &dir, &base, true, &profiles).await?;
+                    assemble_backend(&cfg, &top, &config_dir, &dir, &base, true, &profiles).await?;
                 // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
                 // 有意不对称）；仅 config 显式写 migrate_on_start 时执行对应项，
                 // reconcile 跟随 auto。非法值 fail-fast（与 server 文案一致）。
@@ -369,6 +370,7 @@ mod tests {
         let cfg = Config::default();
         assemble_backend(
             &cfg,
+            &serde_json::Value::Null,
             tmp,
             tmp,
             "/v1/api",

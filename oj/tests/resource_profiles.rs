@@ -41,9 +41,17 @@ async fn db_profile_selection_redirects_default_and_fails_fast_on_missing() {
         db: Some("report".into()),
         ..Default::default()
     };
-    let backend = assemble_backend(&cfg, &dir, &dir, "/v1/api", true, &profiles)
-        .await
-        .expect("assemble with valid --db report");
+    let backend = assemble_backend(
+        &cfg,
+        &serde_json::Value::Null,
+        &dir,
+        &dir,
+        "/v1/api",
+        true,
+        &profiles,
+    )
+    .await
+    .expect("assemble with valid --db report");
     assert_eq!(
         backend.stable().db_override.as_deref(),
         Some("report"),
@@ -55,10 +63,18 @@ async fn db_profile_selection_redirects_default_and_fails_fast_on_missing() {
         db: Some("ghost".into()),
         ..Default::default()
     };
-    let e = assemble_backend(&cfg, &dir, &dir, "/v1/api", true, &profiles)
-        .await
-        .err()
-        .unwrap_or_default();
+    let e = assemble_backend(
+        &cfg,
+        &serde_json::Value::Null,
+        &dir,
+        &dir,
+        "/v1/api",
+        true,
+        &profiles,
+    )
+    .await
+    .err()
+    .unwrap_or_default();
     assert!(
         e.contains("--db"),
         "missing db profile must fail-fast, got: {e}"
@@ -77,6 +93,7 @@ async fn db_profile_default_when_no_override() {
 
     let backend = assemble_backend(
         &cfg,
+        &serde_json::Value::Null,
         &dir,
         &dir,
         "/v1/api",

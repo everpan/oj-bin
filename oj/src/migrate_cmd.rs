@@ -23,7 +23,7 @@ async fn slim(
     module: Option<&str>,
     db: Option<&str>,
 ) -> Result<Slim, String> {
-    let (cfg, config_dir, dir, ts, _base) = load_app_config(config, dir_override, None)?;
+    let (cfg, top, config_dir, dir, ts, _base) = load_app_config(config, dir_override, None)?;
     // 迁移/fixtures 作用于 api 目录下的 SQL；强依赖 api 目录（无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(
@@ -32,7 +32,7 @@ async fn slim(
         ));
     }
     let mut registries = Registries::default();
-    assemble_plugins(&cfg, &config_dir, &mut registries, None).await?;
+    assemble_plugins(&cfg, &top, &config_dir, &mut registries, None).await?;
     let dbs = connect_dbs(&cfg.db, &registries.dbs, &config_dir).await?;
     // 目标库（v0.1.21）：`--db` 选 config `db:` 段的 profile，缺省 "default"。
     // 未声明的库名 fail-fast——静默回落 default 等于把迁移打在开发库上（与
