@@ -120,7 +120,7 @@ for name in $(grep -o "${SCOPE}/oj-[a-z0-9_-]*" npm/oj/package.json | sort -u); 
   fi
 done
 sed "s/__VERSION__/$VERSION/g" npm/oj/package.json > "$maindir/package.json"
-cp npm/oj/postinstall.js npm/README.md "$maindir/"
+cp npm/oj/bin.js npm/oj/postinstall.js npm/README.md "$maindir/"
 [[ -f LICENSE ]] && cp LICENSE "$maindir/" || true
 publish_pkg "$maindir" "${SCOPE}/oj"
 

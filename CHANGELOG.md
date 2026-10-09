@@ -16,6 +16,24 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+**fix（npm 分发）**：主包 `@oj-bin/oj` 此前只靠 `postinstall` 把二进制落盘到
+`<项目根>/bin/`，**未声明 `bin` 字段**，导致 `pnpm dlx @oj-bin/oj` / `npx @oj-bin/oj`
+报 `ERR_PNPM_DLX_NO_BIN`（找不到可执行入口）。
+
+- 新增 `npm/oj/bin.js` 启动器（零依赖 CommonJS）：与 `postinstall.js` 共用同一份
+  `platform-arch → triple` 反向表，经 `require.resolve('@oj-bin/oj-<triple>/package.json')`
+  定位平台子包后 exec 其 `oj`/`oj.exe` 二进制，转发 argv 并传播退出码；子包不可达
+  （如 `--omit=optional`）时回退到与 postinstall 相同的「平台子包未找到」提示并退出 1。
+- 主包 `package.json` 模板新增 `"bin": { "oj": "bin.js" }` 并把它列入 `files`；
+  `scripts/npm-publish.sh` 主包装配步骤同步拷入 `bin.js`。
+- 文档对齐：`npm/README.md`、`docs/ops-manual.md` §1.1、`docs/devkit/README.md`、
+  `docs/devkit/api-manual.md` 安装小节补 `pnpm dlx @oj-bin/oj` / `npx @oj-bin/oj`
+  一次性运行说明；设计 spec `2026-09-11-npm-publish-design.md` §2.3 补 `bin` 字段与
+  dlx 行为，§3 已知缺口补 dlx 兜底路径。回归测试 `npm/oj/test/bin.test.js`（argv 转发 /
+  退出码传播 / 缺子包）全绿。
+
 ## v0.1.53 —— JS handler 本地文件读写（`fs` 全局）（未打标签）
 
 **feat**：移植 Deno 官方 `deno_fs` 扩展（版本锁对齐 deno_core 0.411；`deno_io`

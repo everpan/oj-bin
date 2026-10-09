@@ -24,6 +24,20 @@ bin/devkit/                # API manual + global.d.ts
 ./bin/oj serve -c config.yaml --api-path src
 ```
 
+### One-shot run (npx / pnpm dlx)
+
+The package declares a `oj` bin that locates the platform sub-package and execs it, so
+you can run it without a project-local install:
+
+```bash
+pnpm dlx @oj-bin/oj --version
+npx  @oj-bin/oj serve -c config.yaml --api-path src
+```
+
+This requires the matching platform sub-package (`@oj-bin/oj-<triple>`) to be resolvable;
+with `--omit=optional` it falls back to the same "platform sub-package not found" message
+as a normal install.
+
 ## Supported platforms
 
 | platform | triple |
