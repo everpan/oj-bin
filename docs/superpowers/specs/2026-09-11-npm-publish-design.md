@@ -86,6 +86,7 @@ ERR_PACKAGE_PATH_NOT_EXPORTED。模板注释写死此约束。
   "name": "@oj-bin/oj",
   "version": "<ver>",
   "scripts": { "postinstall": "node postinstall.js" },
+  "bin": { "oj": "bin.js" },
   "optionalDependencies": {
     "@oj-bin/oj-x86_64-unknown-linux-gnu": "<ver>",
     "@oj-bin/oj-aarch64-apple-darwin": "<ver>",
@@ -98,6 +99,13 @@ npm 解析时按各子包 `os`/`cpu` 只安装匹配平台的一个；不匹配�
 （这正是 optionalDependencies 而非 dependencies 的原因）。注意同一
 (os,cpu) 不允许出现两个子包（musl 情形），由 npm-publish.sh 硬校验兜底
 （§4）。
+
+`bin` 字段让 `pnpm dlx @oj-bin/oj` / `npx @oj-bin/oj` 可直接运行：启动器
+`bin.js` 与 postinstall 共用同一份 `platform-arch → triple` 反向表，
+`require.resolve('@oj-bin/oj-<triple>/package.json')` 定位子包后 exec 其 `oj`
+二进制并转发 argv、传播退出码；子包不可达（如 `--omit=optional`）时回退到与
+postinstall 相同的「平台子包未找到」提示并退出 1。发布脚本 `npm-publish.sh`
+需把 `bin.js` 一并拷入主包（`files` 已含 `bin.js`）。
 
 ## 3. postinstall.js 行为
 
@@ -126,7 +134,9 @@ npm 解析时按各子包 `os`/`cpu` 只安装匹配平台的一个；不匹配�
 **已知缺口（文档覆盖，不做代码兜底）**：pnpm ≥10 默认不执行依赖的
 postinstall（需消费方 `onlyBuiltDependencies: ["@oj-bin/oj"]`）、
 `--ignore-scripts` / `ignore-scripts=true`——这两类场景 postinstall 根本没
-跑，连警告都打不出。npm/README.md 与 docs 显式写明，并给出手动兜底命令
+跑，连警告都打不出，也就没有 `./bin/oj` 落盘。npm/README.md 与 docs 显式写明，
+并给出两种兜底：一次性运行走 `pnpm dlx @oj-bin/oj`（启动器 `bin.js` 不依赖
+postinstall，直接 exec 子包二进制），或手动重跑
 `node node_modules/@oj-bin/oj/postinstall.js`（零依赖 CommonJS 设计正为此）。
 
 ## 4. CI 改动（release.yml）

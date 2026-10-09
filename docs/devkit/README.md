@@ -19,6 +19,7 @@
 ```sh
 # npm 安装（v0.1.13 起）：postinstall 把对应平台的 oj / plugins / devkit/ 落盘 <项目根>/bin/
 npm i @oj-bin/oj
+# 或一次性运行（不落盘，从子包直接 exec）：pnpm dlx @oj-bin/oj / npx @oj-bin/oj
 mkdir -p .claude/skills/oj-api-dev
 cp bin/devkit/SKILL.md bin/devkit/api-manual.md bin/devkit/scenarios.md .claude/skills/oj-api-dev/   # agent 用
 cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # 类型提示 + `#` 别名兜底

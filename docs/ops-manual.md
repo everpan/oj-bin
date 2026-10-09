@@ -34,13 +34,23 @@ cargo xtask build          # release 构建，产物归置 bin/oj + bin/plugins/
 ### 1.1 npm 分发（`@oj-bin/*`）
 
 除 Release 归档外，另有一条 npm 渠道：`npm i @oj-bin/oj` 由 postinstall 把二进制落到
-用户项目 `./bin/`（`bin/oj`、`bin/plugins/<triple>/`、`bin/devkit/`）。
+用户项目 `./bin/`（`bin/oj`、`bin/plugins/<triple>/`、`bin/devkit/`）。主包同时声明了 `bin`
+（`npm/oj/bin.js` 启动器，定位平台子包并 exec 其 `oj` 二进制），因此也支持一次性运行，
+无需项目内安装：
+
+```bash
+pnpm dlx @oj-bin/oj --version
+npx  @oj-bin/oj serve -c config.yaml --api-path src
+```
+
+`bin.js` 与 `postinstall.js` 共用同一份 `platform-arch → triple` 反向表；`--omit=optional`
+下子包不可达，启动器回退到与 postinstall 相同的「平台子包未找到」提示并退出 1。
 
 **模板位置**（仅声明，不含发布逻辑）：
 
 | 路径 | 内容 |
 |---|---|
-| `npm/oj/` | 主包 `@oj-bin/oj` 模板（`__VERSION__` 占位 + 3 个平台 optionalDependencies）+ `postinstall.js` + `test/postinstall.test.js` |
+| `npm/oj/` | 主包 `@oj-bin/oj` 模板（`__VERSION__` 占位 + 3 个平台 optionalDependencies）+ `postinstall.js` + `bin.js`（dlx/npx 启动器）+ `test/{postinstall,bin}.test.js` |
 | `npm/platform/` | 平台子包 `@oj-bin/oj-<triple>` 模板（`__TRIPLE__`/`__OS__`/`__CPU__`；**禁止加 `exports` 字段**，见包内注释） |
 | `npm/README.md` | 两类包共用 README（发布时拷入包根） |
 

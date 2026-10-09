@@ -2805,6 +2805,7 @@ vendored `node_modules/`（不打进 tgz）→ `./oj migrate -c config.yaml -d d
 
 ```bash
 npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-bin/oj-<triple>
+# 一次性运行（不落盘）：pnpm dlx @oj-bin/oj / npx @oj-bin/oj —— 经 bin.js 启动器直 exec 子包 oj
 ```
 
 - `postinstall` 按当前平台取子包内容落盘 `<项目根>/bin/`（`oj` / `plugins/<triple>/` /

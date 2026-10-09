@@ -7,10 +7,11 @@
   "repository": { "type": "git", "url": "git+https://github.com/everpan/only-js.git" },
   "engines": { "node": ">=16" },
   "scripts": { "postinstall": "node postinstall.js" },
+  "bin": { "oj": "bin.js" },
   "optionalDependencies": {
     "@oj-bin/oj-x86_64-unknown-linux-gnu": "__VERSION__",
     "@oj-bin/oj-aarch64-apple-darwin": "__VERSION__",
     "@oj-bin/oj-x86_64-pc-windows-msvc": "__VERSION__"
   },
-  "files": ["postinstall.js", "README.md"]
+  "files": ["bin.js", "postinstall.js", "README.md"]
 }
