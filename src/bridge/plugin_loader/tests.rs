@@ -660,6 +660,28 @@ fn generic_axis_plugin_reports_greet_axis() {
     assert!(loaded[0].registrations.kv.is_none());
 }
 
+/// TYPED-kind 自报未知轴名（不在 TYPED_AXES）→ 进 unknown_axes 且所有类型化槽保持
+/// None——classify_axes 按 kind 路由，不再按名猜测通道（oj-ldap 迁移场景：
+/// 自报 ldap + GenericVtable 走 GENERIC 臂才不会被误 cast）。
+#[test]
+fn typed_kind_unknown_axis_name_goes_to_unknown_axes_with_no_slots() {
+    extern "C" fn stub_call(_op: RString, _args: RString) -> FfiFuture {
+        unreachable!("classify 只收指针，不调用 vtable 方法")
+    }
+    static VT: oj_plugin_ffi::GenericVtable = oj_plugin_ffi::GenericVtable { call: stub_call };
+    let decls = [oj_plugin_ffi::AxisDecl {
+        name: RString::from("greet"),
+        vtable: &VT as *const _ as *const std::ffi::c_void,
+        kind: oj_plugin_ffi::AXIS_KIND_TYPED,
+    }];
+    let (r, generic, unknown) = classify_axes("test-plugin", decls.iter());
+    assert_eq!(unknown, vec!["greet".to_string()]);
+    assert!(generic.is_empty());
+    for a in TYPED_AXES {
+        assert_eq!(r.provides(a), Some(false), "轴 {a} 槽被误填");
+    }
+}
+
 // ---- 装配期 connect 适配（kv_backend_connect / blob_backend_connect）----
 
 use oj_plugin_ffi::{BlobBackendVtable, FfiFuture, KVStoreVtable};

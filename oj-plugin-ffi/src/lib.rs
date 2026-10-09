@@ -42,12 +42,20 @@ pub type RArc<T> = stabby::sync::Arc<T>;
 
 /// 轴声明（自报清单条目）。RString 不可 const 构造 → 清单调用期经 RVec 返回
 ///（评审 M1：不做 static 数组）。
+/// kind 判别宿主侧路由：按 kind 而非轴名决定 vtable 按类型化还是泛型通道解释
+///（oj-ldap 泛型轴迁移：自报「ldap」+ GenericVtable 不再被误当 LdapVtable）。
 #[stabby::stabby]
 #[repr(C)]
 pub struct AxisDecl {
     pub name: RString,
     pub vtable: *const core::ffi::c_void,
+    pub kind: u8,
 }
+
+/// 类型化轴：vtable 按宿主 TYPED_AXES 对应类型解释（name 须在 TYPED_AXES 内）。
+pub const AXIS_KIND_TYPED: u8 = 0;
+/// 泛型轴：vtable 按 GenericVtable 解释，走 axis() Proxy 通道。
+pub const AXIS_KIND_GENERIC: u8 = 1;
 
 /// 泛型轴 vtable：op 名 + JSON 参数 → JSON bytes 结果。
 /// FfiFuture 与全部既有 vtable 同形（错误经 future Err 透传）。
@@ -118,28 +126,46 @@ pub struct HostContext {
 /// 轴自报清单 `oj_plugin_axes` / 可选 `oj_plugin_config_key`。
 /// 用法：
 ///   oj_plugin_entry!(init);                                          // 零轴
-///   oj_plugin_entry!(init, kv => &KV_VTABLE);                        // 单轴
+///   oj_plugin_entry!(init, kv => &KV_VTABLE);                        // 单轴（类型化 kind）
 ///   oj_plugin_entry!(init, kv => &KV_VTABLE, auth => &AUTH_VTABLE);  // 多轴
 ///   oj_plugin_entry!(init, config: "cache", kv => &KV_VTABLE);       // 带配置键
+///   oj_plugin_entry!(init, config: "ldap", generic(ldap) => &VT);    // 泛型轴（generic 臂）
 /// 轴标识必须小写（stringify 原样进清单，无 :lower 兜底）。
+/// `axis => &VT` 臂清单 kind=AXIS_KIND_TYPED；`generic(axis) => &VT` 臂 kind=AXIS_KIND_GENERIC
+///（两形态可混用，per-axis 符号均照常生成，旧宿主回退可用）。
 /// 轴标识写入 per-axis 符号前强制小写（宿主探测表全小写）；未提供的轴不导出符号 = 不提供该轴。
 /// 注意：vtable 方法须在实现侧以 catch_value/catch_future 收敛 panic——宿主对
 /// vtable 方法无 catch_unwind（本宏只保护 init）。
 #[macro_export]
 macro_rules! oj_plugin_entry {
-    // 含 config 键的形态：config 必须前置，单独规则避免与 $axis:ident 局部歧义。
-    ($init:expr, config: $ck:literal $(, $axis:ident => $vtable:expr)* $(,)?) => {
-        $crate::oj_plugin_entry_impl! { @body [$init] [$ck] [$($axis => $vtable)*] }
+    // config 键必须前置，单独规则避免与 $axis:ident 局部歧义；其余轴条目交给 @munch。
+    ($init:expr, config: $ck:literal $(, $($rest:tt)*)?) => {
+        $crate::oj_plugin_entry_impl! { @munch [$init] [$ck] [] $(, $($rest)*)? }
     };
-    // 不含 config 键的形态（零轴 / 普通轴）。
-    ($init:expr $(, $axis:ident => $vtable:expr)* $(,)?) => {
-        $crate::oj_plugin_entry_impl! { @body [$init] [] [$($axis => $vtable)*] }
+    ($init:expr $(, $($rest:tt)*)?) => {
+        $crate::oj_plugin_entry_impl! { @munch [$init] [] [] $(, $($rest)*)? }
     };
 }
 
 #[macro_export]
 macro_rules! oj_plugin_entry_impl {
-    (@body [$init:expr] [$($ck:literal)?] [$($axis:ident => $vtable:expr)*]) => {
+    // 逐条消费轴条目：类型化臂与泛型臂最终统一为 `name => (vt, kind)` 形态。
+    (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*]) => {
+        $crate::oj_plugin_entry_impl! { @body [$init] [$($ck)?] [$($acc)*] }
+    };
+    (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*] , $axis:ident => $vtable:expr $(, $($rest:tt)*)?) => {
+        $crate::oj_plugin_entry_impl! {
+            @munch [$init] [$($ck)?] [$($acc)* $axis => ($vtable, $crate::AXIS_KIND_TYPED)]
+            $(, $($rest)*)?
+        }
+    };
+    (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*] , generic($axis:ident) => $vtable:expr $(, $($rest:tt)*)?) => {
+        $crate::oj_plugin_entry_impl! {
+            @munch [$init] [$($ck)?] [$($acc)* $axis => ($vtable, $crate::AXIS_KIND_GENERIC)]
+            $(, $($rest)*)?
+        }
+    };
+    (@body [$init:expr] [$($ck:literal)?] [$($axis:ident => ($vtable:expr, $kind:expr))*]) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn oj_plugin_abi_version() -> u32 {
             $crate::ABI_VERSION
@@ -180,6 +206,7 @@ macro_rules! oj_plugin_entry_impl {
                 v.push($crate::AxisDecl {
                     name: $crate::RString::from(stringify!($axis)),
                     vtable: $vtable as *const _ as *const ::core::ffi::c_void,
+                    kind: $kind,
                 });
             )*
             v
