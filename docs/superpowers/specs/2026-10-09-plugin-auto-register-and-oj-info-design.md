@@ -2,6 +2,19 @@
 
 日期：2026-10-09 · 状态：待评审
 
+## 评审记录（2026-10-09，双专家独立评审，结论一致：修改后通过）
+
+架构师 findings：H1（flatten 全字段语义位移→改两-pass，已采纳）、H2（config key
+撞已知名静默 `{}` → 全量 Value 查找消解，已采纳）、M1（AxisDecl 表示定型 RVec，
+已采纳）、M2（AXES 降级不删 + xtask 迁移，已采纳）、M3（宏双发写死，已采纳）、
+M4（load_one 时序 + cfg_for 签名，已采纳）、L1/L2/L3/L4/L5/L6（均已采纳）。
+
+工程师 findings：S1（static 清单编译不过 → RVec 调用期构造，与 M1 合流采纳）、
+S2（cfg_for 签名穿透 4 调用点，已采纳）、S3（flatten 回归风险 → 两-pass，与 H1
+合流采纳）、M4（手工表措辞修正，已采纳）、M5（mini-legacy 手写符号夹具，已采纳）、
+M6（宏三形态匹配臂 + 轴名小写写死，已采纳）、M7（ojStringify / 保留名 /
+FfiFuture，已采纳）。工作量粗估 7–9.5 人日。
+
 ## 背景与目标
 
 当前插件机制（cdylib + FFI，ABI_VERSION=11 严格相等门禁）已实现 PHP 式「放入目录即加载」：
@@ -31,22 +44,19 @@
 
 ### FFI（`oj-plugin-ffi`，ABI_VERSION 保持 11）
 
-新增两个 repr(C) 类型。**仅新增独立类型，不触碰任何既有 repr(C) 结构字段，
+新增 repr(C) 类型。**仅新增独立类型，不触碰任何既有 repr(C) 结构字段，
 按仓库红线（「repr(C) 字段变更才 bump」）ABI 保持 11 不动**：
 
 ```rust
 /// 一个轴声明：轴名 + 擦除后的 vtable 指针。
+/// 注意：RString（stabby 堆类型）不可 const 构造——清单**不能**做成 static 数组
+///（评审 M1：无法 const 初始化 + *const 字段使 AxisDecl 非 Sync），
+/// 改为调用期构造、经 RVec 返回（先例：DataAccessorVtable.schemes
+/// 返回 RVec<RString>，同 crate 既有形态）。
 #[repr(C)]
 pub struct AxisDecl {
     pub name: RString,                 // 轴名（小写；宿主匹配用）
     pub vtable: *const core::ffi::c_void,
-}
-
-/// 轴清单：静态数组 + 长度。
-#[repr(C)]
-pub struct AxisList {
-    pub items: *const AxisDecl,
-    pub len: usize,
 }
 ```
 
@@ -54,28 +64,47 @@ pub struct AxisList {
 
 ```rust
 #[unsafe(no_mangle)]
-pub extern "C" fn oj_plugin_axes() -> AxisList {
-    static ITEMS: &[AxisDecl] = &[ /* 每轴一个 AxisDecl */ ];
-    AxisList { items: ITEMS.as_ptr(), len: ITEMS.len() }
+pub extern "C" fn oj_plugin_axes() -> RVec<AxisDecl> {
+    // 函数体内运行时构造（RString::from + 静态 vtable 取址）；
+    // vtable 指针与既有 oj_plugin_axis_<name> 返回同一静态地址。
 }
 ```
 
-第一方 10 个插件只需重编译（宏自动产新符号），源码零改动。
-`tools/xtask` 的 `--check` 预检走 PluginLoader，自然兼容。
+宏**双发**（评审 M3，写死）：过渡期同时导出 `oj_plugin_axes()` 与既有
+`oj_plugin_axis_<name>` 符号——正向（旧插件→新宿主）走回退探测，反向
+（新插件→旧宿主）靠 per-axis 符号保持兼容。回退路径退役时 per-axis 符号
+随之删除。轴标识强制小写写死（paste `:lower` 兜底在清单路径不存在，
+宏文档与模板 README 明示「轴标识必须小写」）。
+
+宏匹配需覆盖三形态（评审 M6）：`(init)` / `(init, config: "k")` /
+`(init, config: "k", kv => &VT, ...)`；带 config 的匹配臂须先于轴列表臂。
+
+第一方 10 个插件只需重编译（宏自动产新符号），源码零改动。宏冒烟测试加
+`oj_plugin_axes` 返回内容断言；零轴展开断言空表。
+`tools/xtask` 的 `--check` 预检走 PluginLoader 自然兼容，但 `--check` 的
+轴清单渲染改用自报清单（见下节评审 M2）。
 
 ### 宿主（`src/bridge/plugin_loader.rs`）
 
-- `probe_axes` 重写：**优先** dlsym `oj_plugin_axes()`，按清单逐条按名匹配已知轴类型
-  （match name → cast 为对应 vtable 类型填入 `Registrations`）。
-- **符号缺失（旧插件）→ 回退**现有 AXES 逐轴 dlsym 探测，eprintln 一行 deprecated
-  提示（含插件名）。旧插件兼容不断裂；回退路径保留至少一个大版本周期。
-- 清单中的**未知轴名**（宿主不认识的类型化轴）：收集进
-  `LoadedPlugin.unknown_axes: Vec<String>`，加载时 eprintln 告警。行为变化：
-  旧宿主遇新插件新轴 = 「装上但没消费」；新宿主 = 「明确告诉你没消费」。
-  泛型轴通道（Part 2）落地后，未知轴名应先尝试泛型解释，再落入 unknown_axes。
-- `Registrations` / `provides()` 不变；`AXES` 常量删除。
-- `tests/plugins/mini*` 夹具家族与 `plugin_loader` 单测更新：新增用例——
-  自报清单优先、旧符号回退、未知轴告警、零轴插件空清单。
+- `probe_axes` 重写：**优先** dlsym `oj_plugin_axes()` 取 RVec<AxisDecl>，
+  逐条按名 match → cast 为对应 vtable 类型填入 `Registrations`。
+  「按名转 typed vtable」的 9 臂映射不可消除（类型擦除还原必须按名，评审
+  M4 修正 spec 原措辞）——真正消掉的只是「逐轴 dlsym 探测」。
+- **符号缺失（旧插件）→ 回退**现有 AXES 逐轴 dlsym 探测，eprintln 一行
+  deprecated 提示（含插件名）。旧插件兼容不断裂。
+- **`AXES` 不删除，降级**（评审 M2/M4）：保留为回退探测与已知轴名匹配表，
+  降为 crate 内部实现细节（`pub(crate)`）；现存消费者迁移——xtask
+  `--check` 轴清单渲染改吃自报清单、`serve_cmd` 对账测试改经
+  `Registrations::provides()`、loader 测试同理。回退路径退役时才删。
+- 清单中的**未知轴名**：先尝试泛型轴解释（Part 2；仅非 9 个保留名，
+  保留名撞名按 typed 解释——信任边界与今日插件伪造 axis 符号相同，
+  模板 README 写死 9 个保留名），解释不了才收集进
+  `LoadedPlugin.unknown_axes: Vec<String>` 并 eprintln 告警。
+- `Registrations` / `provides()` 不变。
+- 回退路径无法靠重编译的 mini* 夹具测试（宏一改夹具自动获得新符号，
+  评审 M5）——新增**手写符号的 mini-legacy 夹具**（绕开宏，手写
+  abi_version/init/axis_kv，不导出 oj_plugin_axes）钉死回退路径；
+  另需一个双发符号且内容可区分的夹具钉死「自报优先」。
 
 ## Part 2 — 泛型轴通道（新轴 = 纯插件开发）
 
@@ -83,10 +112,12 @@ pub extern "C" fn oj_plugin_axes() -> AxisList {
 
 ```rust
 /// 泛型轴 vtable：op 名 + JSON 参数 → JSON 结果。repr(C) 新类型，ABI 不变。
+/// FfiFuture 复用 oj_plugin_ffi::FfiFuture（poll/take/free 三件套，与全部既有
+/// vtable 同形；评审 L5——spec 草案的 RFuture 是笔误）。
 #[repr(C)]
 pub struct GenericVtable {
     pub call: extern "C" fn(op: RString, args: RString)
-        -> RFuture<RResult<RString, RString>>,
+        -> FfiFuture<RResult<RString, RString>>,
 }
 // 插件声明：oj_plugin_entry!(init, cache => &VT)
 ```
@@ -104,12 +135,17 @@ pub struct GenericVtable {
   **同名轴多插件 = 装配 fail-fast**（与 loader「不静默跳过」哲学一致）。
 - 新 op：`op_axis_call(name, op, args_json) -> serde_json::Value`：
   未知轴名 → 报错并列出可用泛型轴；调用经 `ffi::await_ffi` 异步完成。
-- `bootstrap.js` 挂**通用代理**（一次性）：
+- `bootstrap.js` 挂**通用代理**（一次性；评审 M7/L2 细节内建）：
 
   ```js
-  // axis("cache").get("k") → op_axis_call("cache", "get", JSON.stringify(["k"]))
+  // axis("cache").get("k") → op_axis_call("cache", "get", ojStringify(["k"]))
   globalThis.axis = (name) => new Proxy({}, {
-    get: (_, op) => (...args) => op_axis_call(name, String(op), JSON.stringify(args)),
+    get: (_, op) => {
+      // BigInt 安全序列化用既有 ojStringify（JSON.stringify 遇 BigInt 即抛）；
+      // then/Symbol.* 属性返回 undefined，防误 await 代理本体得到怪行为。
+      if (typeof op !== "string" || op === "then") return undefined;
+      return (...args) => op_axis_call(name, op, ojStringify(args));
+    },
   });
   ```
 
@@ -145,24 +181,55 @@ pub extern "C" fn oj_plugin_config_key() -> RString  // 例："cache"
 `oj_plugin_entry!(init, config: "cache", cache => &VT)`（不配 config: 则不导出符号，
 行为同旧插件）。
 
-**宿主 `Config`**：加 `#[serde(flatten)] extra: HashMap<String, serde_json::Value>`
-catch-all——既有类型化字段优先，**未知顶层段落入 extra**（顶层字段全部显式声明，
-不存在 SmtpSection 式「flatten 误收已知键」问题）。
+**宿主 extra：两-pass，不用 serde flatten**（评审 H1/S3，双方一致裁定）。
+serde flatten 会把**全部**字段改经 Content 缓冲二次反序列化，serde_yaml 0.9
+的宽松行为随之丢失（活例：`vars: {PORT: 3000}` 裸数字标量按字面读成串的
+行为会炸成 `invalid type: integer`；ldap `Option<serde_yaml::Value>` 段、
+ENC 解密后的回经路径同险）。改用两-pass：
+
+1. `load_from` 已先解析 `serde_yaml::Value`（ENC 解密也在 Value 层）——顺手
+   把顶层 mapping 键集减去**宿主已知顶层键静态表**（config.rs 内一张表，
+   与 Config 字段一一对应）得 extra（serde_json::Value）；
+2. 从该 Value 反序列化 Config（既有路径零变更）。
+
+已知键表加「字段 ↔ 键」对账单测防漂移（AXES 对账测试同款手法）。
+零 derive 风险、零解析路径变更、ENC 天然覆盖。
+
+**load_one 时序重排 + `cfg_for` 签名变更**（评审 S2/M4，spec 原稿漏写）：
+config key 必须在 init **之前**探测（init 就要吃 cfg，不能依赖 init 返回的
+descriptor），而当前 `load_one` 顺序是 abi → init → descriptor → probe_axes，
+且 `cfg_for: &dyn Fn(&str) -> String` 只收插件名。改为：
+
+```
+dlopen → abi 门禁 → dlsym(oj_plugin_config_key)（可选）→ cfg_for(name, key)
+→ init → descriptor → probe_axes
+```
+
+`cfg_for` 签名改 `Fn(&str, Option<&str>) -> String`，穿透 4 个调用点：
+`load_manifest` / `load_scanned`（plugin_loader）、serve_cmd 的 cfg_for 闭包、
+xtask --check 的 cfg_for。serve_cmd 既有 `plugin_cfg` fallback chain 测试族
+（serve_cmd.rs:1016 起）是第一方 10 插件 cfg 投递的保险丝，全程保持绿。
 
 **cfg 解析顺序（`cfg_for` 泛化，零按名硬编码）**，对加载中的插件：
 
 1. `plugins:<name>` 值为非空对象 → 原样透传（既有语义，最高优先）；
-2. 插件导出了 `oj_plugin_config_key` 且顶层存在该段 → extra 里取该段序列化为 JSON；
+2. 插件导出了 `oj_plugin_config_key` 且**顶层 Value 存在该键** → 取该段
+   序列化为 JSON。注意查找范围是**全量顶层 Value（含宿主已知段）**——
+   撞名宿主已知段（如第一方 kv 插件声明 `"redis"`）是合法场景，宿主
+   消费不受影响（段是读不是占）；键不存在 → `"{}"`（段可选是既有语义）。
+   这使评审 H2 的「声明已知名却静默拿 {}」洞直接消失，无需 fail-fast：
+   真打错键名时插件拿 `{}` 且真实段出现在 unconsumed_sections，部署侧可见；
 3. 否则回落宿主遗留按名映射（第一方旧插件的 es_profile 特判等）→ 最终 `"{}"`。
 
-遗留映射只服务既有 10 个第一方插件，永不增长；**新轴/新插件加配置段 = 宿主零改动**
-——插件声明 config key，用户写顶层段，装配期自动到达 init。
+遗留映射只服务既有 10 个第一方插件，永不增长；**新轴/新插件加配置段 = 宿主
+零改动**——插件声明 config key，用户写顶层段，装配期自动到达 init。
 cfg 白名单校验归插件 init 自裁（未知键 fail-fast 在插件侧裁决，与 ldap
 `LdapConfig::from_value` 哲学一致；宿主不为泛型轴做键校验）。
 
-**未消费段诊断**：装配后 `extra` 中未被任何已加载插件（经 config key 或
-`plugins:<name>`）消费的段，进 oj_info 的 `config.unconsumed_sections` 列表——
-堵住「段名打错被静默忽略」的洞，且无需宿主认识任何段名。
+**未消费段诊断**：装配后顶层 Value 中未被任何已加载插件（经 config key 或
+`plugins:<name>`）消费的段：eprintln 一行告警（评审 L3，不 fail-fast）+
+进 oj_info 的 `config.unconsumed_sections`——堵住「段名打错被静默忽略」的洞，
+且无需宿主认识任何段名。
 
 ### 测试
 
@@ -184,13 +251,16 @@ cfg 白名单校验归插件 init 自裁（未知键 fail-fast 在插件侧裁�
 | `config` | 段名 → 键名清单；**值一律不出**（零泄漏面；ENC[...] 密文也不回显）；`unconsumed_sections`：未消费顶层段清单（Part 3 诊断） |
 | `serve` | dev/release 模式判定、base、api_path（`oj info` 提供；JS 侧运行时相同） |
 
-**只报告声明面，不真连库/连 broker**（php -i 亦不连数据库）；连接可用性不在 oj_info 职责内。
+**只报告声明面，不真连库/连 broker**（php -i 亦不连数据库）；连接可用性不在
+oj_info 职责内。注意 `oj info` 复用装配管线 = **会执行插件 init 代码**（线程/
+连接池等副作用与 serve 相同；评审 L1）——信任边界同 serve，文档注明。
 
 ### 出口
 
-- **CLI `oj info -c config.yaml`**：复用 serve_cmd 的装配管线——将「config 加载 +
-  插件装配 + 注册表构建」从 `start()` 抽成可独立调用的纯装配函数（不监听端口），
-  php -i 风格纯文本打印分段键值 + 插件表。
+- **CLI `oj info -c config.yaml`**：装配切割点天然存在（评审 L8）：`assemble_plugins`
+  已是独立 pub fn（只 init 不 connect）、`build_registries` 仅私有可见性阻隔——
+  提可见性 + 组合成纯装配函数（不监听端口），php -i 风格纯文本打印分段键值
+  + 插件表。
 - **JS `globalThis.ojInfo()`**：装配产物序列化注入 runtime（随 StableState 或专用
   静态注入），bootstrap.js 挂载；返回上述 JSON 对象。文档注明：自行包 HTTP 端点时
   鉴权是部署者责任；框架不提供公共 oj_info 端点。
@@ -204,9 +274,19 @@ cfg 白名单校验归插件 init 自裁（未知键 fail-fast 在插件侧裁�
 
 ## 测试
 
-- `plugin_loader`：自报优先 / 旧符号回退 / 未知轴收集 / 零轴空清单 / 泛型轴注册与冲突。
-- `oj_plugin_entry!` 宏测试：生成符号存在性（沿用现有 paste 符号测试方式）。
-- e2e：扫描模式加载带泛型轴的 mini 夹具插件，`axis("<名>").<op>()` 端到端调用。
+- `plugin_loader`：自报优先 / 旧符号回退 / 未知轴收集 / 零轴空清单 / 泛型轴注册
+  与冲突。**回退路径用 mini-legacy 手写符号夹具**（评审 M5：mini* 夹具经宏重编译
+  自动获得新符号，回退无从触发；mini-legacy 绕开宏手写 abi_version/init/axis_kv，
+  兼作「宏改动不破坏手写符号插件」的守门员）。
+- `oj_plugin_entry!` 宏测试：生成符号存在性 + `oj_plugin_axes` 返回内容断言 +
+  零轴空表 + 三形态匹配臂（纯 `(init)` / 带 config 零轴 / 带 config 多轴）。
+- e2e：扫描模式加载带泛型轴的 mini 夹具插件，`axis("<名>").<op>()` 端到端调用；
+  **三个 JsRuntime 入口（HTTP 池 / tasks / `oj test`）均有 `axis()`/`ojInfo()`
+  可用的覆盖**（评审 L4，呼应「新增 runtime 入口必须打补丁函数」教训）。
+- cfg 三级解析顺序单测（plugins: 透传优先序不回归；serve_cmd plugin_cfg 既有
+  fallback chain 测试族保持绿）；config key 段到达 init 端到端；两-pass extra 与
+  已知键对账单测。
+- 未消费段 eprintln + 出现在 oj_info。
 - `oj info` CLI 冒烟（有插件/零插件两形态）；JS `ojInfo()` e2e 调用。
 
 ## 文档与版本红线
@@ -221,8 +301,16 @@ cfg 白名单校验归插件 init 自裁（未知键 fail-fast 在插件侧裁�
 - `docs/plugins/plugin-architecture.md`：自报清单 + 泛型轴通道机制
 - `docs/plugins/plugin-development.md`：新轴开发范式指向 tools/plugin-template
 
+## 已知限制（评审确认后明示）
+
+- 泛型轴插件在**老宿主**（无 Part 1/2 代码的版本）上零信号：probe 不到任何
+  类型化轴 = 装上但没消费且无告警（ABI 严格相等门禁决定的边界）。模板 README
+  提示插件作者在 `desc` 注明所需宿主最低版本（评审 L6）。
+
 ## 开放问题（实现时定夺，不阻塞）
 
 - 泛型轴是否需要命名多实例（如 blob.backends 形态）：v1 不做，冲突即 fail-fast；
   需要时按 named_registry 既有模式扩展，ABI 不变。
 - `oj info` 是否打印路由表统计：v1 不做（routes 构建属于 serve 启动面）。
+- 回退路径（逐轴 dlsym + per-axis 符号双发）的退役时点：待生态插件普遍重编译
+  后另立版本决定，本版只标记 deprecated。
