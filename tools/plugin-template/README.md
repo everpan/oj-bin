@@ -6,27 +6,57 @@
 自动走泛型通道，JS 侧经 `axis()` 全局调用。
 
 > 模板 crate **不进 workspace members**（它不是构建目标，是被拷贝的骨架）。
+> 骨架自带的空 `[workspace]` 段只为了让模板在 oj 仓库内能被独立
+> `cargo build` 验收；**拷贝使用时按下面路径 A 删掉它**。
+
+## 命名三方对齐（先读这段）
+
+xtask 约定三者用同一个 `<name>`（本模板 = `cache`）：
+
+| 位置 | 值 |
+|---|---|
+| crate 包名 | `oj-cache`（`oj-<name>` 惯例；产物 `liboj_cache.dylib`） |
+| `cargo xtask plugin <name>` | `cache` |
+| descriptor.name（lib.rs init） | `cache` → loader 文件名 `libcache.dylib` |
+
+包名 ≠ descriptor 名（照 oj-db-mysql 包 / `"db-mysql"` 名）。`plugins:` 清单键与
+`plugins.<name>` 透传段键也按 descriptor.name（`cache`）查。改轴名时三处一起改。
 
 ## 快速开始
 
+### 路径 A：在 oj 仓库内开发（`cargo xtask plugin`，推荐）
+
 ```bash
-# 1. 拷出骨架（放到你的仓库，例如 plugins/ 下）
 cp -r tools/plugin-template plugins/oj-cache
 cd plugins/oj-cache
 
-# 2. 改名：Cargo.toml [package].name / lib.rs 里 desc 与 RResult 文案、轴名 cache
+# 1) 删 Cargo.toml 里的空 [workspace] 段（否则 crate 自成 workspace 根，
+#    cargo xtask plugin 的 --workspace 构建不会构建它，产物也落不进根 target/）；
+# 2) 把 "plugins/oj-cache" 加进根 Cargo.toml 的 workspace members；
+# 3) 按需改轴名（见上表三处）。
 
-# 3. 构建 + 拷贝到 bin/plugins/<host-triple>/
-cargo xtask plugin oj-cache
-# 预检（ABI / 身份 / semver / 符号，不加载）
-cargo xtask plugin oj-cache --check
-
-# 4. config.yaml 声明（strict 清单或 scan 模式皆可），启动宿主
+cargo xtask plugin cache        # --workspace 构建 + 拷到 bin/plugins/<host-triple>/libcache.dylib
+cargo xtask plugin cache --check  # 预检（ABI / 身份 / semver / 轴符号，经 PluginLoader 加载）
 ```
 
-骨架自带空 `[workspace]` 段使其自成 workspace 根（避免 "believes it's in a
-workspace when it's not"）；并入你自己的 workspace 后删除该段并调整
-`oj-plugin-ffi` 的 path 依赖即可。
+### 路径 B：独立 manifest（不进宿主仓库）
+
+```bash
+cp -r tools/plugin-template ~/my-oj-cache && cd ~/my-oj-cache
+cargo build --release   # 保留空 [workspace] 段；调整 oj-plugin-ffi 的 path 依赖
+# 手动按 loader 文件名拷入（<host-triple> 用 `rustc -vV | grep host` 取）：
+cp target/release/liboj_cache.dylib <oj仓库>/bin/plugins/<host-triple>/libcache.dylib
+```
+
+config.yaml 声明（strict 清单或 scan 模式皆可），启动宿主：
+
+```yaml
+# strict 清单：键 = descriptor.name（只装配列出的插件）；
+# 空对象值 = cfg 回落第 2/3 级解析（非空对象则原样透传给 init，最优先）
+plugins:
+  cache: {}
+# 缺省 plugins 段或空 map = scan 模式（按 bin/plugins/<triple>/ 文件发现）
+```
 
 ## 范式四契约（违反任一条 = 加载失败 / 调用出错 / UB）
 
@@ -66,8 +96,9 @@ oj_plugin_entry!(init, config: "cache", kv => &KV_VT, generic(cache) => &CACHE_V
   泛型 kind 臂。泛型轴必须写 `generic(...)`——裸名字会被当成类型化 kind，
   loader 会把 `GenericVtable` 当类型化 vtable 用，行为未定义。
 - 宏生成：`oj_plugin_abi_version` / `oj_plugin_init`（内置 catch_unwind）/
-  每轴 `oj_plugin_axis_<name>` / 轴自报清单 `oj_plugin_axes()` /
-  `oj_plugin_config_key()`。未列出的轴不导出符号 = 不提供该轴。
+  每轴 `oj_plugin_axis_<name>` / 轴自报清单 `oj_plugin_axes()`；**仅当**写了
+  `config:` 声明才额外生成 `oj_plugin_config_key()`，未列出的轴不导出符号
+  = 不提供该轴。
 
 ### RResult 注意（stabby）
 
@@ -85,7 +116,7 @@ return RResult::Ok(descriptor);                           // 构造照旧
 `config: "cache"` 声明后，插件 init 收到的 `cfg` 按**三级解析**（`oj/src/serve_cmd.rs` 的
 `plugin_cfg`，先到先用）：
 
-1. `plugins.<插件名>` 非空对象 → 原样透传（最优先）；
+1. `plugins.<name>`（descriptor.name）非空对象 → 原样透传（最优先）；
 2. 插件自报 config key → 查 **config.yaml 全量顶层段**（含宿主已知段——段是读
    不是占，撞已知名是合法场景）；段不存在 → `{}`（段可选）；
 3. 按名遗留臂（仅宿主内置的 es/auth/mail/ldap 插件）。
@@ -97,9 +128,9 @@ return RResult::Ok(descriptor);                           // 构造照旧
 cache:
   max_entries: 1000
 
-# 或第 1 级：plugins 段按插件名透传（非空对象原样进 init，优先级更高）
+# 或第 1 级：plugins 段按 descriptor.name 透传（非空对象原样进 init，优先级更高）
 # plugins:
-#   oj-cache:
+#   cache:
 #     max_entries: 1000
 ```
 
@@ -130,7 +161,7 @@ axis("cache").set("k", { any: "json" }); // {"ok":true}
 - 插件发现四级（先到先用）：`OJ_PLUGINS_DIR` 环境变量 > config `plugins_dir` >
   `<exe>/plugins` > `<workspace_root>/bin/plugins`，各拼 `<host-triple>/`。
 - **宿主最低版本**：泛型轴通道（`axis()` + `oj_plugin_axes`）与 config key 自报
-  是 v0.1.54 起的新能力——在 `desc` 里注明（骨架已含），旧宿主无
-  `oj_plugin_axes` 符号时回退逐轴 dlsym（泛型轴插件仍能加载，但
-  `generic(...)` kind 判别需要新宿主，否则轴名撞保留名会被误路由）。
+  是 v0.1.54 起的新能力——在 `desc` 里注明（骨架已含）。旧宿主（无
+  `oj_plugin_axes`，逐轴 dlsym 只探 9 个类型化名）能加载本插件、init 会执行，
+  但 `cache` 轴不可达——dlsym 表里没有这个名字；要 JS 可调必须新宿主。
   版本号以 CHANGELOG 为准（T9 统一发版时对齐）。

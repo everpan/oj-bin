@@ -67,7 +67,10 @@ fn init(
         return RResult::Err(e);
     }
     RResult::Ok(oj_plugin_ffi::PluginDescriptor {
-        name: RString::from("oj-cache"),
+        // 三方对齐（xtask 约定）：descriptor.name = `cargo xtask plugin <name>` 的
+        // <name> = loader 文件名 lib<name>.dylib。包名是 oj-cache，名字却是 "cache"
+        // （照 oj-db-mysql 包 / "db-mysql" 名）。改轴名时三处一起改。
+        name: RString::from("cache"),
         semver: RString::from(env!("CARGO_PKG_VERSION")),
         abi_version: oj_plugin_ffi::ABI_VERSION,
         fingerprint: RString::from(oj_plugin_ffi::HOST_FINGERPRINT),
