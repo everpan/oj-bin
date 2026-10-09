@@ -1,6 +1,7 @@
 //! oj-plugin-ffi：宿主与插件共享的 FFI 契约（两侧依赖同一 crate，spec §3）。
 //! - `ABI_VERSION`：唯一硬门禁，严格相等才允许加载。
 //! - 所有 repr(C) 类型的字段变更 = ABI_VERSION bump；向后兼容走 cfg JSON 字段。
+//!   例外：本版尚未随发布出去的符号/类型（如 oj_plugin_axes/AxisDecl）布局可安全演进。
 //! - stabby 72 注意：`RResult` 的 Ok/Err 是关联函数（构造用 `RResult::Ok(v)`），
 //!   消费侧 `std::result::Result::from(r)` 转换后 match，不能模式匹配。
 
@@ -133,6 +134,9 @@ pub struct HostContext {
 /// 轴标识必须小写（stringify 原样进清单，无 :lower 兜底）。
 /// `axis => &VT` 臂清单 kind=AXIS_KIND_TYPED；`generic(axis) => &VT` 臂 kind=AXIS_KIND_GENERIC
 ///（两形态可混用，per-axis 符号均照常生成，旧宿主回退可用）。
+/// 警示：泛型臂轴名若撞 TYPED_AXES 保留名（如 ldap），pre-kind 旧宿主会经 per-axis
+/// 符号把 GenericVtable 误 cast 为类型化 vtable（静默 UB）——根治依赖宿主升级，
+/// 迁移期插件须保证部署宿主版本 >= 引入 kind 判别的一版。
 /// 轴标识写入 per-axis 符号前强制小写（宿主探测表全小写）；未提供的轴不导出符号 = 不提供该轴。
 /// 注意：vtable 方法须在实现侧以 catch_value/catch_future 收敛 panic——宿主对
 /// vtable 方法无 catch_unwind（本宏只保护 init）。
@@ -150,7 +154,8 @@ macro_rules! oj_plugin_entry {
 #[macro_export]
 macro_rules! oj_plugin_entry_impl {
     // 逐条消费轴条目：类型化臂与泛型臂最终统一为 `name => (vt, kind)` 形态。
-    (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*]) => {
+    // 基底臂带 $(,)?：容忍条目列表后的尾逗号（oj_plugin_entry!(init, kv => &VT,)）。
+    (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*] $(,)?) => {
         $crate::oj_plugin_entry_impl! { @body [$init] [$($ck)?] [$($acc)*] }
     };
     (@munch [$init:expr] [$($ck:literal)?] [$($acc:tt)*] , $axis:ident => $vtable:expr $(, $($rest:tt)*)?) => {
