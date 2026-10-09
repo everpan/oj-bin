@@ -8,16 +8,23 @@
 
 ## 1. 一句话模型
 
-- 插件 = 一个 **cdylib**，导出 `oj_plugin_abi_version` + `oj_plugin_init`，以及**每提供一轴**
-  一个 `oj_plugin_axis_<name>` 符号（全部由入口宏生成，禁止手写 `#[no_mangle]` 绕过）。
+- 插件 = 一个 **cdylib**，导出 `oj_plugin_abi_version` + `oj_plugin_init`，以及
+  **轴声明**（全部由入口宏生成，禁止手写 `#[no_mangle]` 绕过）：
+  类型化轴每轴一个 `oj_plugin_axis_<name>` 符号；v0.1.54 起宏**双发**清单符号
+  `oj_plugin_axes()`（`RVec<AxisDecl>`：轴名 + kind + vtable），宿主探测**自报清单
+  优先**，清单缺失才回落逐轴 dlsym（deprecated 告警；旧插件免重编兼容）。
 - 宿主与插件只通过 `oj-plugin-ffi` crate 的类型跨边界（**唯一允许**）；tokio/tracing 等
   运行时类型绝不过线。
 - `ABI_VERSION`（u32，**严格相等**）是唯一硬门禁；构建指纹（rustc/契约 crate 版本/triple）
   仅诊断，不匹配告警不拒绝。
-- 注册是**按轴 dlsym 探测**：宿主 `init` 返回后（abi 门禁通过）对探测表 `AXES`（es/db/
-  blob/bus/kv/auth/mq/mail/ldap）逐轴 `dlsym("oj_plugin_axis_<axis>")`——查到符号即该插件提供该轴
-  （符号返回静态 vtable 指针），**缺符号 = 不提供该轴**。vtable 指向的静态表在 init 时
-  就绪即可；加新轴/加插件不再改动共享槽位结构。
+- 注册是**按轴自报 + dlsym 探测**：宿主 `init` 返回后（abi 门禁通过）先取
+  `oj_plugin_axes()` 清单——**TYPED** 且名在 `TYPED_AXES`（es/db/blob/bus/kv/auth/mq/
+  mail/ldap，9 个）填 typed 槽；**GENERIC**（`generic(name) => &VT` 宏臂）进泛型轴注册表，
+  JS 经 `axis("name").op(...)` 调用——**新轴从此零宿主改动、零 ABI 变更**；清单缺失的旧
+  插件回落逐轴 dlsym（`oj_plugin_axis_<axis>`，缺符号 = 不提供该轴）。
+- **新轴范式（v0.1.54）**：照抄 [`tools/plugin-template`](../../tools/plugin-template/README.md)
+  ——命名三方对齐（crate `oj-<name>` / 产物 `lib<name>.so` / descriptor 名剥前缀）、
+  `config: "key"` 声明、泛型轴臂、两路径构建（xtask 联编 / 独立 cargo）齐全。
 
 ## 2. 契约 crate 类型面
 
@@ -33,7 +40,9 @@
 | `HostContext` | 宿主回调集：`log(level, msg)`、`deliver(topic, payload)` |
 | `PluginDescriptor` | `{ name, semver, abi_version, fingerprint, desc }`（见 §7 自描述） |
 
-各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`。方法签名形态：
+各轴 vtable 见 `oj-plugin-ffi/src/{es,db,blob,bus,kv,auth}.rs`；泛型轴 vtable
+（`GenericVtable`，v0.1.54）与轴清单类型（`AxisDecl`）见 `oj-plugin-ffi/src/lib.rs`。
+方法签名形态：
 同步函数返回 `FfiFuture`；`connect` 产 handle（`{"handle":N}` JSON），`close` 释放。
 
 **auth 轴特例**（`AuthGuardVtable`，唯一同步轴，不返回 `FfiFuture`）：`verify(path_no_base,
@@ -126,8 +135,10 @@ fn descriptor() -> PluginDescriptor {
     }
 }
 
-// init 后宿主对 AXES 逐轴 dlsym：提供哪个轴就在宏尾声明哪个轴（轴标识强制小写）。
-// 缺轴声明 = 不导出该符号 = 不提供该轴；多轴用逗号并列。
+// init 后宿主取 oj_plugin_axes() 自报清单（缺失才回落逐轴 dlsym）：
+// 类型化轴用 `axis => &VT` 臂（kind=TYPED）；泛型轴用 `generic(name) => &VT` 臂
+// （kind=GENERIC，JS 调用面 axis("name").op(...)）；config: 声明自报配置键（§7.1）。
+// 缺轴声明 = 不导出该符号/清单不含 = 不提供该轴；多轴用逗号并列。
 // vtable 一律经 oj_plugin_ffi::axis helper 传入（见下方红线）。
 oj_plugin_ffi::oj_plugin_entry!(init, db => oj_plugin_ffi::axis::db(&VTABLE));
 // oj_plugin_ffi::oj_plugin_entry!(
@@ -135,6 +146,8 @@ oj_plugin_ffi::oj_plugin_entry!(init, db => oj_plugin_ffi::axis::db(&VTABLE));
 //     kv => oj_plugin_ffi::axis::kv(&KV_VTABLE),
 //     auth => oj_plugin_ffi::axis::auth(&AUTH_VTABLE),
 // );  // 多轴
+// oj_plugin_ffi::oj_plugin_entry!(init, config: "cache", generic(cache) => &CACHE_VT);
+//     // 泛型轴 + 自报配置键（v0.1.54；范式照抄 tools/plugin-template）
 // oj_plugin_ffi::oj_plugin_entry!(init);  // 零轴（纯自描述）
 ```
 
@@ -142,7 +155,10 @@ oj_plugin_ffi::oj_plugin_entry!(init, db => oj_plugin_ffi::axis::db(&VTABLE));
   （`as *const _ as *const c_void`），不检查类型——`auth => &KV_VTABLE` 这类复制粘贴
   错误**能通过编译**，而宿主侧按轴转型 → 每请求热路径（auth verify）直接 **UB**。
   **推荐一律用 `oj_plugin_ffi::axis` 的 helper 传 vtable**（上例形态）：每个 helper 只
-  接受该轴的 vtable 类型，写错编译不过。
+  接受该轴的 vtable 类型，写错编译不过。泛型臂 `generic(name) => &VT` 同理：`VT` 必须按
+  `GenericVtable { call }` 形状构造（宿主按 `GenericVtable` 解释），且 `name` **避开 9 个
+  类型化保留名**——pre-kind 旧宿主无 kind 概念、按名 cast，撞名会把 `GenericVtable`
+  误当类型化 vtable。
 
 - 命名：插件 `descriptor.name` 决定存放文件名（`lib<name>.dylib` / `<name>.dll`）；crate 名
   `oj-<name>` → 构建产物 `liboj_<name>.<ext>`。扫描模式按文件名加载、严格清单模式按
@@ -153,7 +169,7 @@ oj_plugin_ffi::oj_plugin_entry!(init, db => oj_plugin_ffi::axis::db(&VTABLE));
   的 `{name, semver, abi_version, fingerprint, description}`，经公共端点
   `GET {base}/plugins`（ok 信封）公开，供运维/监控辨识当前进程装配了什么。
 
-### 7.1 插件配置：`plugins:` 一段三用
+### 7.1 插件配置：`plugins:` 一段三用 + cfg 三级解析（v0.1.54）
 
 `config.yaml` 的 `plugins:` 段统一为 **map**（旧 list 写法 `plugins: [a, b]` 已废弃，
 解析报错 fail-fast）：
@@ -172,6 +188,19 @@ plugins:
 - **值 = cfg 透传**：非空对象原样透传给插件 `init(cfg)`；**空对象 `{}` = 跳过透传，回落
   轴适配器**（第一方插件由宿主把对应 config 段映射成 cfg，如 es→`cfg.es`、auth→
   `cfg.auth`；无适配器的轴回落 `"{}"`）。
+
+**cfg 三级解析（v0.1.54）**：插件 `init` 收到的 cfg 字符串按序取第一个命中——
+
+1. `plugins:<name>` 非空对象 → 原样透传（如上）；
+2. 插件自报 **config key**（入口宏 `config: "key"`）→ 顶层 `<key>` 段的**全量 Value**。
+   段是「读」不是「占」——撞宿主已知段名合法；段未配置给 `"{}"`（段可选是既有语义，
+   init 须容忍空 cfg 或自行 fail-fast）；
+3. 按名遗留臂（es/auth/mail/ldap 等第一方适配器；无适配器 → `"{}"`）。
+
+未被子报 key 或 `plugins:<name>` 非空透传消费的**未知顶层段**，启动打
+`[oj-serve] unconsumed config sections: […] (typo? or plugin not loaded)` 诊断
+（拼写错误 / 插件没装的早期信号）；`oj info` CLI 与 JS `ojInfo()` 的 `unconsumed`
+段可复查。
 
 ## 8. 构建与调试
 
@@ -212,6 +241,6 @@ xtask 也不是发行产物（`bin/` 只放 oj + 插件），排除不影响其�
 | `oj-bus-kafka` / `oj-bus-rabbitmq` | bus | rdkafka / lapin | core `bridge/broker/` |
 | `oj-kv-redis` | kv | redis | core `bridge/kv.rs` RedisKV |
 | `oj-auth` | auth | jsonwebtoken | core `bridge/auth.rs`（守卫；auth 端点已 JS 化） |
-| `oj-ldap` | ldap | ldap3 | 新增 ldap 轴（`globalThis.ldap`/`LDAP(name)`；bind 鉴权 + 目录检索） |
+| `oj-ldap` | ldap（**泛型轴**，v0.1.54 迁移） | ldap3 | 目录查询与 bind 鉴证；JS 调用面 `axis("ldap").<op>` |
 
 > 所有第一方插件源码统一位于 `plugins/`；构建产物（cdylib）归置 `bin/plugins/<triple>/`，由 `.gitignore` 忽略。

@@ -26,6 +26,7 @@
 | 17 | `cert` | [17-cert.md](17-cert.md) | `cert.rs` |
 | 18 | `oidc` | [18-oidc.md](18-oidc.md) | `oidc.rs` |
 | 19 | `fs` | [19-fs.md](19-fs.md) | `fs.rs` |
+| 20 | `ojInfo()` / `oj info` | [20-ojinfo.md](20-ojinfo.md) | `oj/src/serve_cmd.rs`（`assemble_ojinfo`）/ `plugins_op.rs` |
 
 其它内建全局（`fetch`、`URL`、`TextEncoder`、`toBigInt`/`toUBigInt`/`toDouble` 等）：
 `fetch` 与 Web API 类由 deno_fetch/deno_web 扩展提供，见 api-manual 相应章节；

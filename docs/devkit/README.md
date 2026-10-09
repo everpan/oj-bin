@@ -53,6 +53,14 @@ v0.1.47 起 blob 增 `copy` / `move` / `readRange` 三件套（服务端搬运�
 不再进 V8）：`copy` 保留 src、`move` 删 src、`readRange` 是短读截断；见
 `api-manual.md` §6 blob 段与 `scenarios.md` 场景 25。
 
+v0.1.54 起新增**泛型插件轴通道**（`axis(name).op(...)`，插件宏 `generic(name) => &VT` 声明，
+零 ABI 变更）与 **`ojInfo()` / `oj info` CLI**（同一装配体的五段诊断：build/abi/plugins/
+backends/config，config 只出键名、无公共端点）；oj-ldap 迁移泛型轴（JS 调用面改为
+`axis("ldap").<op>`，类型化 `ldap.*` 为遗留双轨面）；插件**自报轴清单**（`oj_plugin_axes()`
+双发，旧插件免重编回退兼容）与**自报配置键**（宏 `config: "key"`，cfg 三级解析 +
+unconsumed 段诊断）。插件作者范式见仓库 `tools/plugin-template`，运维/业务侧细节见
+`api-manual.md` §6「axis(name)」「ojInfo()」与 §10「plugins」。
+
 v0.1.52 为评审修复版（无新 API）：`ws.broadcast` 收二进制（与 `send` 对称，非法入参报错）、
 `oj test` 递归扫 `tests/`、fixtures 幂等门禁、`oj openapi` dev 内省失败 fail-fast、
 `db.tx` rollback 失败不吞业务异常、HTTP 状态对超大 `code` clamp；详见
@@ -61,5 +69,6 @@ v0.1.52 为评审修复版（无新 API）：`ws.broadcast` 收二进制（与 `
 **版本同步要求（发布前自查）**：每次版本升级，本目录四件（`api-manual.md` / `scenarios.md` /
 `SKILL.md` / `README.md`）必须与该版的用户可见变更**逐条对齐**——新增/变更的 API 与报错文案要
 进 `api-manual.md` 的对应章节**与错误/限制表**，高频陷阱要进 `SKILL.md` 的陷阱速查，
-可照抄的场景要进 `scenarios.md`。发布物 `bin/devkit/` 由 `cargo xtask build` 归置，
+可照抄的场景要进 `scenarios.md`。发布物 `bin/devkit/` 由 `cargo xtask build` 归置
+（含 `sample/global.d.ts` 与 `sample/types/oj-modules.d.ts` 两份类型声明），
 `cargo test --release -p xtask` 的 devkit 契约用例会校验产物与源文件一致。
