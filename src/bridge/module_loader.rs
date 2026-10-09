@@ -165,6 +165,31 @@ pub fn strip_verbatim(p: &Path) -> PathBuf {
     }
 }
 
+/// （仅测试）建符号链接；返回是否成功。Windows 无符号链接特权（未开 Developer
+/// Mode）时失败 → 调用方 skip 而非 panic，让逃逸类用例在有特权的主机（含 CI）
+/// 真跑、无特权的主机安静让路。
+#[cfg(test)]
+pub(crate) fn try_symlink(target: &Path, link: &Path, dir: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = dir;
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if dir {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        } else {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link, dir);
+        false
+    }
+}
+
 /// 模块根：referrer 所在目录**向上最近的含 manifest.yaml 的祖先目录**（上溯以
 /// project_root 为界——模块只可能落在它内部，同时避免为越界路径走到文件系统根）。
 /// 锚点由文件自身位置派生，故 dev（`src/<m>/`）、release 产物（`dist/<m>-<v>/`，
@@ -1030,9 +1055,8 @@ mod tests {
     /// design §9/§11「路径穿越：`ensure_within` **双侧 canonicalize**，符号链接在覆盖内」——
     /// 词法 `..` 之外的第二条逃逸面：根**内**的符号链接指向根**外**文件（路径字符串完全在
     /// 根内，只有 canonicalize 能识破）。附件 `{path}` 与模块加载共用本函数。
-    /// 仅 unix（Windows 建符号链接需特权，见 CI 矩阵）。
+    /// Windows 无符号链接特权（未开 Developer Mode）时跳过。
     #[test]
-    #[cfg(unix)]
     fn ensure_within_rejects_symlink_escape() {
         let base = fx(&[("outside.txt", "secret\n"), ("proj/inside.txt", "ok\n")]);
         let root = base.join("proj");
@@ -1041,13 +1065,17 @@ mod tests {
 
         // 根内符号链接 → 根外文件。
         let file_link = root.join("link.txt");
-        std::os::unix::fs::symlink(base.join("outside.txt"), &file_link).unwrap();
+        if !try_symlink(&base.join("outside.txt"), &file_link, false) {
+            eprintln!("skip ensure_within_rejects_symlink_escape: symlink unavailable");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
         let e = ensure_within(&file_link, &root).unwrap_err();
         assert!(e.contains("escapes project root"), "{e}");
 
         // 根内符号链接 → 根外目录，再穿透一层。
         let dir_link = root.join("dirlink");
-        std::os::unix::fs::symlink(&base, &dir_link).unwrap();
+        assert!(try_symlink(&base, &dir_link, true), "symlink_dir failed");
         assert!(
             ensure_within(&dir_link.join("outside.txt"), &root).is_err(),
             "经目录符号链接穿透到根外也必须拒"
@@ -1190,8 +1218,8 @@ mod tests {
     /// pnpm 布局：node_modules/<pkg> 是指向 .pnpm/<pkg>@<v>/node_modules/<pkg> 的
     /// 符号链接；包的真实位置旁有同伴依赖（peer/dep 链接在 .pnpm/<pkg>@<v>/
     /// node_modules/ 下）。解析沿符号链接工作、且不得 realpath 中断相对回溯。
+    /// Windows 无符号链接特权（未开 Developer Mode）时跳过。
     #[test]
-    #[cfg(unix)]
     fn bare_resolves_pnpm_symlink_layout() {
         let root = fx(&[
             (
@@ -1221,16 +1249,23 @@ mod tests {
         ]);
         let nm = root.join("node_modules");
         // pnpm 风格的平铺链接视图。
-        std::os::unix::fs::symlink(
-            root.join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg"),
-            nm.join("pkg"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
-            root.join("node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA"),
-            nm.join("pkgA"),
-        )
-        .unwrap();
+        if !try_symlink(
+            &root.join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg"),
+            &nm.join("pkg"),
+            true,
+        ) {
+            eprintln!("skip bare_resolves_pnpm_symlink_layout: symlink unavailable");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(
+            try_symlink(
+                &root.join("node_modules/.pnpm/pkgA@1.0.0/node_modules/pkgA"),
+                &nm.join("pkgA"),
+                true
+            ),
+            "symlink_dir failed"
+        );
         let from = root.join("src/user");
         // 平铺视图：经符号链接命中 exports。
         assert!(

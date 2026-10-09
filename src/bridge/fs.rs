@@ -81,22 +81,14 @@ pub fn container_for(grant: Option<&FsGrant>) -> PermissionsContainer {
     PermissionsContainer::new(Arc::new(parser), permissions_for(grant))
 }
 
-/// 暴露给 bootstrap 面面的 jail 根（None = 未配置）：相对路径在门面层解析到
-/// root 之下（deno 原生语义是解析到进程 cwd，与 jail 模型不符）。
-#[op2]
-#[string]
-pub fn op_fs_root(state: &mut OpState) -> Option<String> {
-    state
-        .borrow::<Arc<crate::bridge::StableState>>()
-        .fs
-        .as_ref()
-        .map(|g| g.root.to_string_lossy().into_owned())
-}
-
-/// 门面层的 jail 裁决（v1 安全关键）：对（已拼上 root 的）路径做 best-effort
-/// canonicalize——整体不存在（写新文件）时逐级上溯到最近存在的祖先再拼回后缀——
-/// 结果落在 root 外，或 fs: 未配置，一律 `NotCapable`；落在 root 内则返回
-/// canonical 绝对路径供 deno op 使用，op 内的权限检查成为第二道防线。
+/// 门面层的 jail 裁决（v1 安全关键）：相对路径先按 jail 根 lexical 折叠成绝对
+/// 路径（`.` 丢弃、`..` 对 root 逐级上托——Windows verbatim 路径不归一 `..`，
+/// 必须先折平再 canonicalize；此前的 JS 侧字符串拼接在 verbatim 根上产生
+/// `/` 混合分隔符，canonicalize 必败、叶级 symlink 从未被解析，构成 Windows
+/// 逃逸面），随后 best-effort canonicalize——整体不存在（写新文件）时逐级
+/// 上溯到最近存在的祖先再拼回后缀——结果落在 root 外，或 fs: 未配置，一律
+/// `NotCapable`；落在 root 内则返回 canonical 绝对路径供 deno op 使用，op 内
+/// 的权限检查成为第二道防线。
 /// ponytail: 检查与使用之间存在 TOCTOU 窗口（symbolic link 交换），对
 /// 「防误触/防越界默认值」的威胁模型可接受；要堵则需 openat2 族，代价不值。
 #[op2]
@@ -112,14 +104,8 @@ pub fn op_fs_resolve(
             "fs not configured (config fs: section missing)",
         )
     })?;
-    let p = Path::new(&path);
-    if !p.is_absolute() {
-        return Err(deno_error::JsErrorBox::new(
-            "NotCapable",
-            format!("path is not absolute: {path}"),
-        ));
-    }
-    let resolved = resolve_existing(p)?;
+    let joined = join_jailed(&grant.root, Path::new(&path));
+    let resolved = resolve_existing(&joined)?;
     if !resolved.starts_with(&grant.root) {
         return Err(deno_error::JsErrorBox::new(
             "NotCapable",
@@ -127,6 +113,29 @@ pub fn op_fs_resolve(
         ));
     }
     Ok(resolved.to_string_lossy().into_owned())
+}
+
+/// 相对 → jail 内绝对（lexical 折叠，不触盘）；绝对路径原样返回。折叠对
+/// `..` 上托越过 root 时得到的短路径交给 canonicalize 后的 starts_with 拒绝。
+fn join_jailed(root: &Path, p: &Path) -> PathBuf {
+    use std::path::Component;
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let mut out = root.to_path_buf();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => out.push(name),
+            // Prefix/RootDir：绝对性已被上方 is_absolute 分流，残余按忽略处理
+            // （如 Windows `\x` 落回 root 下，安全方向）。
+            _ => {}
+        }
+    }
+    out
 }
 
 /// best-effort canonicalize：逐级上溯到最近存在的祖先，canonicalize 后拼回后缀。
@@ -302,16 +311,20 @@ mod tests {
     }
 
     /// root 内 symlink 指向 root 外 → 读仍被拒（canonicalize 双侧封逃逸）。
+    /// Windows 无符号链接特权（未开 Developer Mode）时跳过。
     #[tokio::test(flavor = "current_thread")]
     async fn fs_symlink_escape_denied() {
         let root = jail("symlink");
         let outside = jail("symlink-outside");
         std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
-        #[cfg(not(unix))]
-        std::os::windows::fs::symlink_file(outside.join("secret.txt"), root.join("link.txt"))
-            .unwrap();
+        if !crate::bridge::module_loader::try_symlink(
+            &outside.join("secret.txt"),
+            &root.join("link.txt"),
+            false,
+        ) {
+            eprintln!("skip fs_symlink_escape_denied: symlink unavailable");
+            return;
+        }
         let b = bridge_with_fs(&root, false);
         let e = b
             .run_with(

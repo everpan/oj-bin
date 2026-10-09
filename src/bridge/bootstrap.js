@@ -98,7 +98,6 @@ import {
   op_ws_leave,
   op_ws_broadcast,
   op_ws_room_size,
-  op_fs_root,
   op_fs_resolve,
 } from "ext:core/ops";
 
@@ -163,23 +162,15 @@ const { TextEncoder: ojTextEncoder, TextDecoder: ojTextDecoder } =
 globalThis.TextEncoder = ojTextEncoder;
 globalThis.TextDecoder = ojTextDecoder;
 const ojFs = core.loadExtScript("ext:deno_fs/30_fs.js");
-// Relative paths resolve against the jail root (deno's native semantics
-// resolve against the process cwd, which breaks the jail model). null root
-// (fs: section absent) -> paths pass through untouched; the ops themselves
-// then deny every access via the permissions container.
-const ojFsRoot = op_fs_root();
-// Every path goes through op_fs_resolve: best-effort canonicalize + jail
+// Every path goes through op_fs_resolve: it folds relative paths against the
+// jail root (deno's native semantics resolve against the process cwd, which
+// breaks the jail model), then best-effort canonicalizes and issues the jail
 // verdict (outside fs.root / fs: absent -> NotCapable), returning the
 // canonical absolute path for the deno op (whose own permission check is
-// the second line of defense).
-const ojFsResolve = (p) => {
-  if (typeof p !== "string") return p;
-  if (p.charAt(0) !== "/") {
-    if (!ojFsRoot) return p; // unconfigured: pass through, op check denies
-    p = ojFsRoot + "/" + p;
-  }
-  return op_fs_resolve(p);
-};
+// the second line of defense). Joining must stay in Rust: string-concat in
+// JS mixes "/" into Windows verbatim roots (\\?\\C:\\...), which disables
+// separator normalization and defeats leaf-symlink resolution.
+const ojFsResolve = (p) => (typeof p === "string" ? op_fs_resolve(p) : p);
 globalThis.fs = {
   readFile: (p, o) => ojFs.readFile(ojFsResolve(p), o),
   readTextFile: (p, o) => ojFs.readTextFile(ojFsResolve(p), o),

@@ -404,13 +404,28 @@ mod tests {
                 }
             }));
         }
-        {
-            let _sw = KillSwitch::spawn();
-            // 等 50ms：看门狗 25ms 轮询，此刻几乎必然处于循环体中持有强引用；
-            // 主线程随后 drop 自己的 Arc，让最后一份引用落在看门狗线程上。
-            std::thread::sleep(Duration::from_millis(50));
+        let sw = KillSwitch::spawn();
+        let w = Arc::downgrade(&sw);
+        // 会合：看门狗进入循环体（upgrade() 持强引用 → strong_count==2）再 drop，
+        // 「最后一份引用在看门狗线程上」由此确定性成立，不赌固定 sleep。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&sw) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watchdog never entered its loop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        drop(sw);
+        // 观察：drop 跑完的确定性信号 = 全部 Arc 释放（weak 升级失败）或 hook
+        // 捕获到 self-join panic，二者先到先收（此前 sleep(100) 赌 hook 先落）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !caught.load(AtomicOrdering::Relaxed) && std::time::Instant::now() < deadline {
+            if w.upgrade().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let prev_restore = prev.clone();
         std::panic::set_hook(Box::new(move |info| prev_restore(info)));
         assert!(

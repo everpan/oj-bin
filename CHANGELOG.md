@@ -18,6 +18,26 @@
 
 ## v0.1.55（未打标签）
 
+**fix（fs）**：Windows 下 jail 内 symlink 逃逸被放行（CI 缺陷钉 `fs_symlink_escape_denied` 暴露）。
+
+- **根因**：相对路径此前在 JS 门面用 `root + "/" + p` 拼接——Windows 上 root 已
+  canonicalize 成 verbatim 形式（`\\?\C:\...`），`\\?\` 前缀关闭分隔符归一，`/` 不再是
+  分隔符，canonicalize 必然失败 → 回退路径只 canonicalize 了父目录（root 本身）再拼回
+  叶名，**叶级 symlink 从未被解析**，root 内指向 root 外的 symlink 读取被放行。unix 拼
+  接结果干净、canonicalize 直接成功并跟随 symlink，故仅 Windows 受影响。
+- **修复**：相对→绝对的折叠移进门面 op `op_fs_resolve`（Rust `Path` 语义，跨平台正确；
+  `..`/`.` 先对 root lexical 折平再 canonicalize，Windows verbatim 路径不归一 `..` 的
+  问题一并消除）。JS 门面 `fs.*` 退化为透传；内部 op `op_fs_root` 随之下线。对外语义与
+  错误文案不变（相对路径解析到 jail 根之下、越界 `NotCapable`）。
+
+**fix（tasks）**：panic 补员与停机并发的 join 竞态（CI 缺陷钉
+`given_worker_panic_when_respawn_then_live_recovered` 暴露）。
+
+- 补员由垂死 Worker 线程内递归 `spawn_worker` 完成，替补句柄的 push 发生在 `spawn()`
+  返回之后；`shutdown_and_join` 单次 `mem::take` 可能抢在 push 之前拿走句柄表 → 替补
+  Worker 漏 join，`live` 停在 1（停机收场不等待仍在跑的 Worker）。现循环 take+join 至
+  `live == 0`——stopping 置位后补员有界，必然收敛。
+
 **feat（exec）**：`oj exec` 输出通道分离（管道友好）+ 裸 `oj exec` 缺省进 REPL。
 
 - **输出通道分离**：`console.log`/`console.info` **原样**输出 stdout——不再带 `INFO`
