@@ -1048,7 +1048,9 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
     ]
 }
 
-/// 顶层 Value 减去已知键 = 未消费候选（插件 config key 查找面）。
+/// 顶层 Value 减去已知键 = 未消费候选。仅对账单测使用（top 本身是全量；
+/// 未消费判定见 serve_cmd::unconsumed_sections 内联过滤）。
+#[cfg(test)]
 fn split_extra(v: &serde_yaml::Value) -> serde_yaml::Value {
     let Some(m) = v.as_mapping() else {
         return serde_yaml::Value::Null;
@@ -1064,10 +1066,11 @@ fn split_extra(v: &serde_yaml::Value) -> serde_yaml::Value {
     serde_yaml::Value::Mapping(kept)
 }
 
-/// load_with_extra 的产物：typed Config + 顶层未知段的 JSON 形（插件 cfg 查找面）。
+/// load_with_extra 的产物：typed Config + 顶层全量段的 JSON 形（插件 cfg 查找面）。
 pub struct LoadedConfig {
     pub config: Config,
-    /// 解密后顶层 mapping 的 JSON 形（未知段全量；插件 config key 查找面）。
+    /// 解密后顶层 mapping 的 JSON 形（已知 + 未知段全量；插件 config key 查找面，
+    /// 撞宿主已知段名是合法场景——spec Part 3）。
     pub top: serde_json::Value,
 }
 
@@ -1105,9 +1108,11 @@ pub fn load_with_extra(path: &Path, dir: &Path) -> Result<LoadedConfig, String> 
     };
     let config: Config =
         serde_yaml::from_str(final_text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    // 两-pass 的 second pass：同一最终文本得顶层未知段（段值保持 YAML 类型化的 JSON
-    // 形态，数字仍是数字——与 typed Config 的裸标量读串行为分层，互不影响）。
-    let top = serde_json::to_value(split_extra(&value))
+    // 两-pass 的 second pass：同一（解密后）Value 树得**全量**顶层 mapping 的 JSON 形
+    //（已知 + 未知段；段值保持 YAML 类型化形态，数字仍是数字——与 typed Config 的裸标量
+    // 读串行为分层，互不影响）。全量语义是 spec 裁定：插件自报 config key 可撞宿主已知
+    // 段名（config: "redis"），查找面必须含已知段（评审 H2）。
+    let top = serde_json::to_value(&value)
         .map_err(|e| format!("{}: top sections: {e}", path.display()))?;
     Ok(LoadedConfig { config, top })
 }
@@ -1184,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn load_with_extra_splits_known_and_unknown_top_level() {
+    fn load_with_extra_top_is_full_mapping() {
         let dir = std::env::temp_dir();
         let p = dir.join("oj-test-extra-config.yaml");
         std::fs::write(
@@ -1204,10 +1209,11 @@ cache:
             loaded.config.vars.get("PORT").map(String::as_str),
             Some("3000")
         );
-        // 未知段进 extra（已知段不进）：
+        // top = 全量顶层 mapping（spec 裁定：已知 + 未知段都在查找面，
+        // 插件 config key 可撞宿主已知段名）：
         assert!(loaded.top.get("cache").is_some());
-        assert!(loaded.top.get("server").is_none());
-        assert!(loaded.top.get("vars").is_none());
+        assert!(loaded.top.get("server").is_some());
+        assert!(loaded.top.get("vars").is_some());
         std::fs::remove_file(&p).ok();
     }
 
