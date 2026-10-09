@@ -61,16 +61,16 @@ v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平�
 
 ```mermaid
 flowchart TD
-    A["dlopen 插件 cdylib<br>（句柄进程期存活，不 dlclose）"] --> B{"oj_plugin_abi_version()<br>== 宿主 ABI 11 ?"}
-    B -- "不等" --> X1["fail fast<br>plugin ABI mismatch: plugin=N host=M"]
-    B -- "相等" --> C["oj_plugin_init(host, cfg)<br>宏内 catch_unwind 收敛 panic"]
-    C -- "Err / panic" --> X2["装配期拒绝加载"]
-    C -- "Ok(PluginDescriptor)" --> D{"dlsym(oj_plugin_axes)<br>自报清单存在 ?"}
-    D -- "是（v0.1.54+）" --> E["按 kind 分类：<br>TYPED 且名在 9 轴 → typed 槽<br>GENERIC → 泛型轴注册表<br>类型化撞名外 → unknown_axes 告警"]
-    D -- "否（旧插件）" --> F["回落逐轴 dlsym<br>oj_plugin_axis_&lt;name&gt;<br>（deprecated 告警）"]
-    E --> G["build_registries 冲突检查<br>同名泛型轴 / 单槽多插件 → fail fast"]
+    A["宿主打开插件动态库<br/>（加载后常驻，不会卸载）"] --> B{"ABI 版本对得上吗？<br/>（双方都必须是 11）"}
+    B -->|对不上| X1["拒绝加载，启动失败<br/>（报 plugin ABI mismatch）"]
+    B -->|对得上| C["调用插件初始化 init<br/>（插件在此建运行时、校验配置；<br/>崩溃会被拦下变成错误）"]
+    C -->|初始化失败| X2["拒绝加载，启动失败"]
+    C -->|初始化成功| D{"插件会自报家底吗？<br/>（新版插件会交轴清单）"}
+    D -->|会，新版插件| E["按清单登记：<br/>内置 9 轴 → 各就各位<br/>自定义轴 → 进泛型轴名册<br/>没见过的内置名 → 打警告"]
+    D -->|不会，老插件| F["老办法：逐个名字探测轴符号<br/>（打已过时警告，功能不受影响）"]
+    E --> G["查重：同一个轴两个插件抢 → 拒绝启动"]
     F --> G
-    G --> H["注册表随进程生命周期冻结"]
+    G --> H["登记完毕，锁死到进程结束"]
 ```
 
 ## 3. 契约类型面（oj-plugin-ffi）
@@ -376,29 +376,29 @@ cargo xtask plugin <name> --check
 
 ```mermaid
 flowchart LR
-    subgraph JS["JS 运行时（V8 isolate）"]
-        G["宿主全局<br>db / kv / mail / ldap…（typed 轴）"]
-        AX["axis(&quot;name&quot;).op() Proxy<br>（泛型轴）"]
-        SI["plugins() / ojInfo()"]
+    subgraph JSR["JS 侧（V8 运行时）"]
+        G["内置全局对象<br/>db / kv / mail / ldap…"]
+        AX["axis('名字').任意方法()<br/>（自定义轴）"]
+        SI["plugins() / ojInfo()<br/>（看看装了啥）"]
     end
-    subgraph HOST["Rust 宿主核心"]
-        OPS["bridge ops<br>op_axis_call / 轴 op / op_oj_info"]
-        PL["PluginLoader<br>load → ABI 门禁 → init → 轴探测"]
-        RG["typed 槽 × 9（es/db/blob/bus/kv/auth/mq/mail/ldap）<br>+ 泛型轴注册表<br>（build_registries 冲突检查后冻结）"]
-        EP["GET /plugins 端点<br>（PluginInfo 清单）"]
+    subgraph HOST["Rust 宿主"]
+        OPS["桥接命令层<br/>（JS 的调用落到这里）"]
+        PL["插件加载器<br/>查版本 → 初始化 → 问提供哪些轴"]
+        RG["9 个内置轴槽位 + 自定义轴名册<br/>（查重后锁死）"]
+        EP["GET /plugins<br/>（插件清单给运维看）"]
     end
-    subgraph LIBS["cdylib 插件 bin/plugins/&lt;host-triple&gt;/"]
-        TP["类型化轴插件<br>oj-db-mysql / oj-kv-redis / oj-auth…"]
-        GP["泛型轴插件<br>oj-ldap / 第三方新轴（模板骨架）"]
+    subgraph LIBS["插件动态库（bin/plugins/平台目录/）"]
+        TP["内置轴插件<br/>MySQL / Redis / auth…"]
+        GP["自定义轴插件<br/>如 oj-ldap、你新写的轴"]
     end
-    FFI["oj-plugin-ffi（唯一跨界契约）<br>RString / RBytes / FfiFuture / AxisDecl / HostContext"]
+    FFI["跨界契约（双方共享的规则）<br/>字符串 / 字节 / 异步句柄 / 轴清单"]
     G --> OPS
     AX --> OPS
     OPS --> RG
     SI --> EP
     PL --> RG
-    TP -- "dlopen + 导出符号" --> PL
-    GP -- "dlopen + 导出符号" --> PL
+    TP -->|启动时被打开| PL
+    GP -->|启动时被打开| PL
     TP === FFI
     GP === FFI
     PL === FFI
@@ -408,28 +408,28 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant CLI as oj serve
-    participant ASM as 装配层（assemble_plugins）
-    participant LD as PluginLoader
-    participant SO as 插件 cdylib
-    participant RG as 注册表（typed 槽 + 泛型轴）
-    participant RT as RuntimePool（V8）
+    participant CLI as oj 启动
+    participant ASM as 装配层
+    participant LD as 加载器
+    participant SO as 插件库
+    participant RG as 注册表
+    participant RT as JS 运行时
 
-    CLI->>ASM: 读 config.yaml（plugins: 段一段三用）
-    ASM->>ASM: 清单模式（非空 map）或扫描模式（缺省/空）
-    loop 每个待装配插件
-        ASM->>LD: load_one(path, cfg)
-        LD->>SO: dlopen + oj_plugin_abi_version()
-        SO-->>LD: ABI 11（严格相等，否则 fail fast）
-        LD->>SO: oj_plugin_init(host, cfg)
-        SO-->>LD: PluginDescriptor（catch_unwind 兜底）
-        LD->>SO: oj_plugin_axes()（缺失则逐轴 dlsym 回落）
-        SO-->>LD: RVec&lt;AxisDecl&gt;（名 + kind + vtable）
-        LD-->>ASM: 轴注册结果（typed 槽 / 泛型轴 / unknown_axes 告警）
+    CLI->>ASM: 读配置（plugins 段）
+    ASM->>ASM: 配置点名了就装点名的；没点名就扫目录全装
+    loop 对每个插件
+        ASM->>LD: 装载这个插件
+        LD->>SO: 打开动态库，问 ABI 版本
+        SO-->>LD: 报版本（必须完全一致，否则拒装）
+        LD->>SO: 调初始化（把配置交给它）
+        SO-->>LD: 报身份（名字 / 版本 / 说明）
+        LD->>SO: 问：你提供哪些轴？
+        SO-->>LD: 报轴清单（老插件答不上就逐个试符号）
+        LD-->>ASM: 登记结果（内置槽 / 自定义轴 / 陌生名告警）
     end
-    ASM->>RG: build_registries（冲突 fail-fast，注册表冻结）
-    ASM->>RT: StableState（后端 Arc / oj_info）注入 + 启动 V8 池
-    RT-->>CLI: 服务就绪（GET /plugins 可查装配清单）
+    ASM->>RG: 查重，锁定注册表
+    ASM->>RT: 后端连接和插件清单就位，启动 JS 池
+    RT-->>CLI: 服务就绪（GET /plugins 可查清单）
 ```
 
 要点（细则见对应章节）：
