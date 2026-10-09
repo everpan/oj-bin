@@ -907,7 +907,7 @@ curl -X POST http://localhost:9778/v1/api/user/login/      -d '{"username":"eve"
 | 调旧 `ldap.*` 报 `ldap not configured`（段已配） | v0.1.54 双轨期行为：迁移版 oj-ldap 不再注册 typed 槽——改用 `axis("ldap").<op>`；确需旧面就加载旧版 typed 插件（二者择一） |
 | `axis("ldap").bind` 抛 `connect ... io error` | 网络/端口/防火墙；`url` 拼错；非「凭据错」——`false` 才是凭据错 |
 | `service bind ... rc=49` | 服务账号 `bind_dn`/`bind_pw` 错了（search 在绑定前就失败） |
-| search 报 size limit | AD 默认 1000 条返回上限——改 `axis("ldap").searchPaged(base, { pageSize: 500 })` |
+| search 报 size limit | AD 默认 1000 条返回上限——改 `axis("ldap").search_paged(base, { pageSize: 500 })` |
 | `filter` 查不到人 | DN base 不对（`ou=users,…` 按实际目录改）；`scope` 默认 `sub`，base 之上的条目查不到 |
 | 头像/证书拿不到 | 二进制属性在 `entry.bin`（base64 字符串）：`Buffer.from(e.bin.jpegPhoto[0], "base64")` |
 
@@ -1805,4 +1805,4 @@ curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"he
 | `unknown generic axis 'cache'` | 插件未加载/ABI 不匹配/名字拼错——报错里的 `available` 列表即当前已注册泛型轴；`oj info` / JS `ojInfo().generic_axes` 可核对 |
 | op 报 `axis op '<op>': plugin returned non-JSON` | 插件该 op 返回了非 JSON 字节——插件侧 bug，找插件作者 |
 | 同名泛型轴两个插件都声明 | 装配期 fail-fast（泛型轴每名单提供者）——`plugins:` 清单里只留一个 |
-| 想列一个轴有哪些 op | 协议面没有内省——插件文档/README 为准（如 oj-ldap：`bind/search/searchPaged/whoami/compare`） |
+| 想列一个轴有哪些 op | 协议面没有内省——插件文档/README 为准（如 oj-ldap：`bind/search/search_paged/whoami/compare`） |

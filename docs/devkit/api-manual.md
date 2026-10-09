@@ -666,7 +666,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
 | `axis(name)` | 泛型插件轴调用面（v0.1.54）：`axis("cache").get("k")`；未知轴抛错并列出可用轴名，见下「axis(name)」 |
-| `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + oj-ldap 插件启用）。**v0.1.54 起 oj-ldap 迁移泛型轴**：JS 调用面为 `axis("ldap").bind/search/searchPaged/whoami/compare`（见下「ldap」与「axis(name)」）；类型化 `ldap`/`LDAP` 全局为遗留双轨面 |
+| `LDAP(key)` / `ldap` | LDAP 目录查询与鉴证（`ldap:` 段 + oj-ldap 插件启用）。**v0.1.54 起 oj-ldap 迁移泛型轴**：JS 调用面为 `axis("ldap").bind/search/search_paged/whoami/compare`（见下「ldap」与「axis(name)」）；类型化 `ldap`/`LDAP` 全局为遗留双轨面 |
 | `Kafka(name)` / `RabbitMQ(name)` | 命名 MQ 客户端（`kafkas:`/`rabbits:` 段；未配置的名 → `undefined`；消费方法仅任务上下文，见下「命名 MQ 客户端与长任务」） |
 | `tasks.stopping() / tasks.sleep(ms)` | 长任务上下文：停机信号 + 等待原语（见下「命名 MQ 客户端与长任务」） |
 | `log.debug / info / warn / error` | 结构化日志 |
@@ -1450,20 +1450,20 @@ JS 调用面为 **`axis("ldap")`**（`generic(ldap)` 声明，走泛型轴通道
 | op（`axis("ldap")`） | 调用 | 说明 |
 |---|---|---|
 | `bind` | `axis("ldap").bind(dn, pw, opts?): Promise<boolean>` | simple_bind 鉴证。`true` = 绑定成功；`false` = LDAP 拒绝该凭据（含 rc 49 invalidCredentials）；连接/协议错误**抛异常** |
-| `search` | `axis("ldap").search(base, opts?): Promise<Entry[]>` | 目录查询；大结果集请用 `searchPaged`（无分页时服务端可拒超量返回） |
-| `searchPaged` | `axis("ldap").searchPaged(base, opts?): Promise<Entry[]>` | RFC 2696 分页聚合（逐页取回后合并；服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
+| `search` | `axis("ldap").search(base, opts?): Promise<Entry[]>` | 目录查询；大结果集请用 `search_paged`（无分页时服务端可拒超量返回） |
+| `search_paged` | `axis("ldap").search_paged(base, opts?): Promise<Entry[]>` | RFC 2696 分页聚合（逐页取回后合并；服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
 | `whoami` | `axis("ldap").whoami(opts?): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=svc,…"` 形式的 authzid |
 | `compare` | `axis("ldap").compare(dn, attr, val, opts?): Promise<boolean>` | 属性值比对（compareTrue/False），不读出整条目 |
 
 ```ts
 type LdapOpts = {
   key?: string;                     // 实例名（ldap: 段的顶层键；缺省 "default"）
-  scope?: "base" | "one" | "sub";   // search/searchPaged；默认 "sub"（整棵子树）
+  scope?: "base" | "one" | "sub";   // search/search_paged；默认 "sub"（整棵子树）
   filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
   attrs?: string[];                 // 要读的属性名；缺省/空数组 = 服务端默认属性集
-  pageSize?: number;                // 仅 searchPaged；1..=10000，默认 500
+  pageSize?: number;                // 仅 search_paged；1..=10000，默认 500
   bindDn?: string;                  // 覆盖本次查询的绑定凭据（与 config 合并，取一即可；
-  bindPw?: string;                  //   另一个回落 config）。仅 search / searchPaged 支持
+  bindPw?: string;                  //   另一个回落 config）。仅 search / search_paged 支持
 };
 type LdapEntry = {
   dn: string;
@@ -1506,7 +1506,7 @@ ldap:
 ```
 
 - `bind_dn`/`bind_pw` 不再强制成对：`bind_dn` 可单独配（服务账号 DN 非密码，可留配置）；
-  `bind_pw` 缺失时可在每次 `search`/`searchPaged` 用 `opts.bindPw` 作为运行时参数补上
+  `bind_pw` 缺失时可在每次 `search`/`search_paged` 用 `opts.bindPw` 作为运行时参数补上
   （与 config 的 `bind_dn` 合并，取一即可）。**只为「有 `bind_pw` 却无 `bind_dn`」报错**
   （凭据无绑定目标）。都不配时 search 以匿名绑定执行（多数目录默认拒匿名读，届时报
   「insufficient access rights」类错误）。
@@ -1629,7 +1629,7 @@ json.ok(plugins());
 ```ts
 await axis("cache").get("k");                       // op "get"，args ["k"]
 await axis("cache").set("k", 42, { ttl: 60 });      // 末位对象 = opts（轴自定义）
-await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
+await axis("ldap").search_paged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
 ```
 
 - **同步返回 Promise**；args 经 BigInt-safe `ojStringify` 序列化（plain `JSON.stringify`

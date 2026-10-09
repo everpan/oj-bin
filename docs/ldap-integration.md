@@ -68,7 +68,7 @@ ldap:
 ```js
 const ok = await axis("ldap").bind(dn, pw);                    // true=绑定成功；false=凭据被拒
 const entries = await axis("ldap").search(base, opts);         // 目录查询
-const all = await axis("ldap").searchPaged(base, { ...opts, pageSize: 500 });  // RFC 2696 分页聚合
+const all = await axis("ldap").search_paged(base, { ...opts, pageSize: 500 });  // RFC 2696 分页聚合
 const authzid = await axis("ldap").whoami();                   // "dn:cn=svc-oj,…"
 const same = await axis("ldap").compare(dn, "uid", "eve");     // 属性值比对，不读出整条目
 
@@ -81,8 +81,8 @@ const adEntries = await axis("ldap").search(base, { key: "ad", ...opts });  // �
 | op | 签名 | 说明 |
 |---|---|---|
 | `bind` | `axis("ldap").bind(dn, pw, opts?): Promise<boolean>` | simple_bind 鉴证。`true` = 成功；`false` = LDAP 拒绝凭据（rc≠0，含 49 invalidCredentials）；连接/协议错误**抛异常** |
-| `search` | `axis("ldap").search(base, opts?): Promise<Entry[]>` | 目录查询；大结果集用 `searchPaged`（服务端可拒超量返回，AD 默认上限 1000 条） |
-| `searchPaged` | `axis("ldap").searchPaged(base, opts & {pageSize?}): Promise<Entry[]>` | 分页 cookie 循环聚合到完；服务端不支持分页控制时**原样回落单次 search**。`pageSize` 1..=10000，默认 500 |
+| `search` | `axis("ldap").search(base, opts?): Promise<Entry[]>` | 目录查询；大结果集用 `search_paged`（服务端可拒超量返回，AD 默认上限 1000 条） |
+| `search_paged` | `axis("ldap").search_paged(base, opts & {pageSize?}): Promise<Entry[]>` | 分页 cookie 循环聚合到完；服务端不支持分页控制时**原样回落单次 search**。`pageSize` 1..=10000，默认 500 |
 | `whoami` | `axis("ldap").whoami(opts?): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=…"` 形式的 authzid（服务账号身份自检/连通性探活） |
 | `compare` | `axis("ldap").compare(dn, attr, val, opts?): Promise<boolean>` | compareTrue/False（rc 6/5）；比读出整条目再比对便宜，适合「组成员是否含某值」 |
 
@@ -93,7 +93,7 @@ type LdapOpts = {
   filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
   attrs?: string[];                 // 属性名清单；缺省/空 = 服务端默认属性集
   bindDn?: string;                  // 覆盖本次查询的绑定凭据（与 config 合并，取一即可；
-  bindPw?: string;                  //   另一个回落 config）。仅 search / searchPaged 支持
+  bindPw?: string;                  //   另一个回落 config）。仅 search / search_paged 支持
 };
 type Entry = {
   dn: string;
@@ -120,7 +120,7 @@ type Entry = {
 | `ldap.bind: 'dn' must be a non-empty string` | 入参校验（插件侧，JS 抛出前） |
 | `ldap: connect ldap://…: io error` / `Connection refused` | 网络/端口/防火墙/`url` 拼错 |
 | `ldap: service bind cn=…: rc=49 …` | 服务账号凭据错（search 在绑定阶段就失败） |
-| `ldap: search: … size limit exceeded` | 超服务端返回上限——换 `searchPaged` |
+| `ldap: search: … size limit exceeded` | 超服务端返回上限——换 `search_paged` |
 | `ldap: entry parse failed (malformed server data)` | 单条返回 BER 解析失败（整次调用拒绝） |
 
 > **`bind` 的 `false` 是唯一正常返回值**，别用 `try/catch` 当业务分支：
@@ -164,7 +164,7 @@ const esc = (s: string) => s.replace(/[\\*()\0]/g, (c) => LDAP_FILTER_ESCAPES[c]
 const img = Buffer.from(entry.bin.jpegPhoto[0], "base64");  // 或 atob() → Uint8Array
 ```
 
-> 注意整条目（含 base64 后的二进制）一次性聚进内存——`searchPaged` 只是把**协议交互**分页，
+> 注意整条目（含 base64 后的二进制）一次性聚进内存——`search_paged` 只是把**协议交互**分页，
 > 聚合结果仍是完整数组。大对象属性请用 `attrs` 收窄只取需要的键。
 
 ## 7. 构建、加载与运维
@@ -189,12 +189,12 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 lda
 |---|---|
 | 连接池 | **无**——每调用独立 connect/bind/unbind（§1；升级路径 `ldap3::pool`） |
 | Referral 跟随 | **不跟随**——`search()` 把 referral 收集进结果但不自动跳转（ldap3 语义）；需要跨分区查询请显式对该 base 再查 |
-| 写操作 | 无 `add`/`modify`/`delete`——本期只读 + 鉴证面（bind/search/searchPaged/whoami/compare）；写操作是新 op 字符串，插件内加分派即可（vtable 不变） |
+| 写操作 | 无 `add`/`modify`/`delete`——本期只读 + 鉴证面（bind/search/search_paged/whoami/compare）；写操作是新 op 字符串，插件内加分派即可（vtable 不变） |
 | filter 参数化 | 无——原始 RFC 4515 字符串，须自行转义（§5）；`compare` 是值传输的安全替代 |
-| 分页语义 | `searchPaged` 聚合**全部**结果后一次性返回（不是迭代器/流）；超大结果集注意内存（§6） |
+| 分页语义 | `search_paged` 聚合**全部**结果后一次性返回（不是迭代器/流）；超大结果集注意内存（§6） |
 | 二进制传输 | `entry.bin` base64 进 JSON——比 FFI 直传字节多约 33% 体积；巨大证书对象考虑 `attrs` 收窄 |
 | TLS | `ldaps://` 与 `start_tls` 二选一；`tls_skip_verify` 无内网 CIDR 约束（仅显式开关） |
-| AD 1000 条上限 | 服务端行为——用 `searchPaged`（本插件已内建 cookie 循环） |
+| AD 1000 条上限 | 服务端行为——用 `search_paged`（本插件已内建 cookie 循环） |
 
 ## 9. 相关文档
 

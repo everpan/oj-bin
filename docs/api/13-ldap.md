@@ -7,7 +7,7 @@
 
 ## 是什么
 
-`oj-ldap` 插件经**泛型轴通道**向 handler 提供 LDAP 目录查询（search / searchPaged /
+`oj-ldap` 插件经**泛型轴通道**向 handler 提供 LDAP 目录查询（search / search_paged /
 whoami / compare）与 bind 鉴证。**协议交互**在插件内（ldap3 客户端：每调用独立
 connect → 服务账号绑定 → 操作 → unbind，无连接池）；入参校验与错误文案与旧类型化
 通道逐字一致。启用条件：config 有顶层 `ldap:` 段 + oj-ldap 插件已装配。
@@ -33,7 +33,7 @@ ldap:
 ```
 
 - 未知键 / 坏 url（非 `ldap://` / `ldaps://`）/ 类型错误 → **启动 fail-fast**。
-- `bind_dn` 可单独配（DN 非密码）；`bind_pw` 缺失时可在每次 `search` / `searchPaged`
+- `bind_dn` 可单独配（DN 非密码）；`bind_pw` 缺失时可在每次 `search` / `search_paged`
   用 opts 的 `bindPw` 运行时补上（与 config 的 `bind_dn` 合并）。**只为「有 `bind_pw`
   却无 `bind_dn`」报错**。都不配则匿名绑定（多数目录默认拒匿名读）。
 
@@ -42,20 +42,20 @@ ldap:
 | op | 调用 | 说明 |
 |---|---|---|
 | `bind` | `axis("ldap").bind(dn: string, pw: string, opts?): Promise<boolean>` | simple_bind 鉴证。`true` = 绑定成功；`false` = LDAP 拒绝该凭据（含 rc 49 invalidCredentials）；连接/协议错误**抛异常** |
-| `search` | `axis("ldap").search(base: string, opts?): Promise<Entry[]>` | 目录查询；大结果集请用 `searchPaged`（无分页时服务端可拒超量返回） |
-| `searchPaged` | `axis("ldap").searchPaged(base: string, opts?): Promise<Entry[]>` | RFC 2696 **分页聚合**（逐页取回后合并为完整数组；服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
+| `search` | `axis("ldap").search(base: string, opts?): Promise<Entry[]>` | 目录查询；大结果集请用 `search_paged`（无分页时服务端可拒超量返回） |
+| `search_paged` | `axis("ldap").search_paged(base: string, opts?): Promise<Entry[]>` | RFC 2696 **分页聚合**（逐页取回后合并为完整数组；服务端不支持分页控制时原样回落单次 search）。`pageSize` 1..=10000，默认 500 |
 | `whoami` | `axis("ldap").whoami(opts?): Promise<string>` | whoami 扩展（RFC 4532）→ `"dn:cn=svc,…"` 形式的 authzid |
 | `compare` | `axis("ldap").compare(dn: string, attr: string, val: string, opts?): Promise<boolean>` | 属性值比对（compareTrue/False），不读出整条目 |
 
 ```ts
 type LdapOpts = {
   key?: string;                     // 实例名（ldap: 段顶层键；缺省 "default"）
-  scope?: "base" | "one" | "sub";   // search/searchPaged；默认 "sub"（整棵子树）；"one" = 仅下一层
+  scope?: "base" | "one" | "sub";   // search/search_paged；默认 "sub"（整棵子树）；"one" = 仅下一层
   filter?: string;                  // RFC 4515 过滤器，默认 "(objectClass=*)"
   attrs?: string[];                 // 要读的属性名；缺省/空数组 = 服务端默认属性集
-  pageSize?: number;                // 仅 searchPaged；1..=10000，默认 500
+  pageSize?: number;                // 仅 search_paged；1..=10000，默认 500
   bindDn?: string;                  // 覆盖本次查询的绑定凭据（与 config 合并，取一即可；
-  bindPw?: string;                  //   另一个回落 config）。仅 search / searchPaged 支持
+  bindPw?: string;                  //   另一个回落 config）。仅 search / search_paged 支持
 };
 type Entry = {
   dn: string;
@@ -102,7 +102,7 @@ type Entry = {
 - 只读 + 鉴证面：无 add / modify / delete 写操作。
 - 无连接池：每调用独立 connect → bind → 操作 → unbind，高频场景注意往返开销。
 - referral 不自动跟随。
-- `bindDn` / `bindPw` 仅 `search` / `searchPaged` 支持；`whoami` / `compare` /
+- `bindDn` / `bindPw` 仅 `search` / `search_paged` 支持；`whoami` / `compare` /
   `bind` 用 config 服务账号或各自入参。
 - 结果大小：聚合结果整体进内存（`Entry[]`），超大目录导出请分批按 base/scope 拆。
 
@@ -147,7 +147,7 @@ curl -s -X POST http://localhost:9778/v1/api/ldap_auth/login \
 签发 JWT 需另配 `auth:` 段（oj-auth 插件）；本路由自身也要进
 `auth.anonymous_paths`。
 
-### 通讯录模糊查询（searchPaged 聚合大结果集）
+### 通讯录模糊查询（search_paged 聚合大结果集）
 
 ```ts
 // src/directory/search/api.ts —— 按姓名关键字查员工目录
@@ -159,8 +159,8 @@ function esc(s: string): string {
 async function get() {
   const kw = String(http.query.kw ?? "");
   if (!kw) { json.fail(400, "kw required"); return; }
-  // 大结果集用 searchPaged（RFC 2696 分页聚合，pageSize 默认 500）
-  const entries = await axis("ldap").searchPaged("ou=users,dc=example,dc=com", {
+  // 大结果集用 search_paged（RFC 2696 分页聚合，pageSize 默认 500）
+  const entries = await axis("ldap").search_paged("ou=users,dc=example,dc=com", {
     filter: `(displayName=*${esc(kw)}*)`,
     attrs: ["uid", "displayName", "mail", "department"],
   });
