@@ -344,7 +344,7 @@ Do not use `deno test`: the globals a handler depends on exist only inside this 
 | `docs/user-manual.md` | full `oj` CLI and `config.yaml` reference |
 | `docs/dev-guide.md` | developer manuals (incl. adding a new op) |
 | `docs/bridge.md` | JS globals and module cross-reference |
-| `docs/plugins/plugin-architecture.md` / `docs/plugins/plugin-development.md` | plugin architecture and development |
+| `docs/plugins/plugin-development.md` | plugin architecture and development |
 | `docs/route-params-design.md` | path-param routing design |
 | `docs/testing.md` | testing conventions |
 | `docs/migration.md` | migration runbook (schema.yaml / migrations / ledger / guards) |

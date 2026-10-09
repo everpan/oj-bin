@@ -251,5 +251,5 @@ cargo xtask build                  # 构建 oj + 全部第一方插件（含 mai
 
 - 业务速查：`docs/devkit/api-manual.md` §6「mail」；agent：`docs/devkit/SKILL.md`。
 - 配置：`docs/user-manual.md`（`smtp:` 段）。
-- 插件体系：`docs/plugins/plugin-architecture.md`、`docs/plugins/plugin-development.md`。
+- 插件体系：`docs/plugins/plugin-development.md`。
 - 设计与实现记录：`docs/plans/2026-09-15-mail-smtp-design.md`、`docs/plans/2026-09-15-mail-smtp-impl.md`。

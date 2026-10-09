@@ -13,7 +13,7 @@
 | 日常开发流程与内部实现走读 | `docs/dev-guide.md` |
 | bridge 的 op 与状态模型 | `docs/modules/01-core-bridge.md` |
 | 插件开发（第三方） | `docs/plugins/plugin-development.md` |
-| 插件系统当前注册机制 | `docs/plugins/plugin-architecture.md` §0（该文其余章节是历史方案） |
+| 插件系统当前注册机制 | `docs/plugins/plugin-development.md` §13-§14（架构总览与设计决策记录） |
 | 证书/运维 | `docs/ops-manual.md` |
 
 ## 归档清单

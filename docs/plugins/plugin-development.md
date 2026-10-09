@@ -4,10 +4,11 @@
 v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平台目录扫描或按清单装配。
 
 **给谁读**：第三方插件作者。本手册覆盖从环境准备、生命周期、入口宏范式、轴选择、
-配置、错误约定、调试到发布与迁移的全流程。**新轴起手请直接拷贝
+配置、错误约定、调试到发布与迁移的全流程，并附系统架构总览（§13，含架构图/启动
+时序图）与设计决策记录（§14：为什么是 cdylib + C-ABI FFI）。**新轴起手请直接拷贝
 [`tools/plugin-template`](../../tools/plugin-template/README.md)**（泛型轴骨架，命名/
-宏/配置/构建四契约齐全）。宿主侧装配语义见 `dev-guide.md` §13 与
-`plugin-architecture.md` §0；配置写法见 `user-manual.md` §3 与 devkit api-manual §10。
+宏/配置/构建四契约齐全）。宿主侧装配语义见 `dev-guide.md` §13；配置写法见
+`user-manual.md` §3 与 devkit api-manual §10。
 
 ## 1. 开发环境准备
 
@@ -55,6 +56,22 @@ v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平�
    （`oj_plugin_axis_<name>`，deprecated 告警）。之后装配层 `build_registries`
    做冲突检查（同名泛型轴多插件 / 单槽轴多插件 → fail fast），注册表随进程
    生命周期冻结。
+
+生命周期全景（fail-fast 分支即上列四阶段的拒绝路径）：
+
+```mermaid
+flowchart TD
+    A["dlopen 插件 cdylib<br>（句柄进程期存活，不 dlclose）"] --> B{"oj_plugin_abi_version()<br>== 宿主 ABI 11 ?"}
+    B -- "不等" --> X1["fail fast<br>plugin ABI mismatch: plugin=N host=M"]
+    B -- "相等" --> C["oj_plugin_init(host, cfg)<br>宏内 catch_unwind 收敛 panic"]
+    C -- "Err / panic" --> X2["装配期拒绝加载"]
+    C -- "Ok(PluginDescriptor)" --> D{"dlsym(oj_plugin_axes)<br>自报清单存在 ?"}
+    D -- "是（v0.1.54+）" --> E["按 kind 分类：<br>TYPED 且名在 9 轴 → typed 槽<br>GENERIC → 泛型轴注册表<br>类型化撞名外 → unknown_axes 告警"]
+    D -- "否（旧插件）" --> F["回落逐轴 dlsym<br>oj_plugin_axis_&lt;name&gt;<br>（deprecated 告警）"]
+    E --> G["build_registries 冲突检查<br>同名泛型轴 / 单槽多插件 → fail fast"]
+    F --> G
+    G --> H["注册表随进程生命周期冻结"]
+```
 
 ## 3. 契约类型面（oj-plugin-ffi）
 
@@ -348,3 +365,110 @@ cargo xtask plugin <name> --check
 > 所有第一方插件源码统一位于 `plugins/`；构建产物（cdylib）归置
 > `bin/plugins/<triple>/`，由 `.gitignore` 忽略。范式骨架见
 > [`tools/plugin-template`](../../tools/plugin-template/README.md)。
+
+## 13. 系统架构与注册机制（总览）
+
+宿主与插件只经 `oj-plugin-ffi` 契约跨界（§3）；加载期宿主主动 `dlopen` + 符号探测
+（§2），运行期调用面分两路：类型化轴走宿主装配的全局对象（`db`/`kv`/`mail`/…），
+泛型轴走 `axis("name").op()` Proxy 直通（§5）。插件自描述（`PluginInfo`）在装配期
+收集，经公共端点 **`GET {base}/plugins`**（ok 信封）与 JS `plugins()` / `ojInfo()`
+同源可查，供运维/监控辨识当前进程装配了什么（含 `unknown_axes` 告警清单）。
+
+```mermaid
+flowchart LR
+    subgraph JS["JS 运行时（V8 isolate）"]
+        G["宿主全局<br>db / kv / mail / ldap…（typed 轴）"]
+        AX["axis(&quot;name&quot;).op() Proxy<br>（泛型轴）"]
+        SI["plugins() / ojInfo()"]
+    end
+    subgraph HOST["Rust 宿主核心"]
+        OPS["bridge ops<br>op_axis_call / 轴 op / op_oj_info"]
+        PL["PluginLoader<br>load → ABI 门禁 → init → 轴探测"]
+        RG["typed 槽 × 9（es/db/blob/bus/kv/auth/mq/mail/ldap）<br>+ 泛型轴注册表<br>（build_registries 冲突检查后冻结）"]
+        EP["GET /plugins 端点<br>（PluginInfo 清单）"]
+    end
+    subgraph LIBS["cdylib 插件 bin/plugins/&lt;host-triple&gt;/"]
+        TP["类型化轴插件<br>oj-db-mysql / oj-kv-redis / oj-auth…"]
+        GP["泛型轴插件<br>oj-ldap / 第三方新轴（模板骨架）"]
+    end
+    FFI["oj-plugin-ffi（唯一跨界契约）<br>RString / RBytes / FfiFuture / AxisDecl / HostContext"]
+    G --> OPS
+    AX --> OPS
+    OPS --> RG
+    SI --> EP
+    PL --> RG
+    TP -- "dlopen + 导出符号" --> PL
+    GP -- "dlopen + 导出符号" --> PL
+    TP === FFI
+    GP === FFI
+    PL === FFI
+```
+
+宿主启动装配时序（`oj serve` 视角；`oj info` 走同一装配面的零连接变体）：
+
+```mermaid
+sequenceDiagram
+    participant CLI as oj serve
+    participant ASM as 装配层（assemble_plugins）
+    participant LD as PluginLoader
+    participant SO as 插件 cdylib
+    participant RG as 注册表（typed 槽 + 泛型轴）
+    participant RT as RuntimePool（V8）
+
+    CLI->>ASM: 读 config.yaml（plugins: 段一段三用）
+    ASM->>ASM: 清单模式（非空 map）或扫描模式（缺省/空）
+    loop 每个待装配插件
+        ASM->>LD: load_one(path, cfg)
+        LD->>SO: dlopen + oj_plugin_abi_version()
+        SO-->>LD: ABI 11（严格相等，否则 fail fast）
+        LD->>SO: oj_plugin_init(host, cfg)
+        SO-->>LD: PluginDescriptor（catch_unwind 兜底）
+        LD->>SO: oj_plugin_axes()（缺失则逐轴 dlsym 回落）
+        SO-->>LD: RVec&lt;AxisDecl&gt;（名 + kind + vtable）
+        LD-->>ASM: 轴注册结果（typed 槽 / 泛型轴 / unknown_axes 告警）
+    end
+    ASM->>RG: build_registries（冲突 fail-fast，注册表冻结）
+    ASM->>RT: StableState（后端 Arc / oj_info）注入 + 启动 V8 池
+    RT-->>CLI: 服务就绪（GET /plugins 可查装配清单）
+```
+
+要点（细则见对应章节）：
+
+- **探测优先级**：自报清单 `oj_plugin_axes` 优先（kind 判别路由）；清单缺失的旧
+  插件回落逐轴 `dlsym`（deprecated 告警，免重编兼容）——§2。
+- **fail-fast 面**：ABI 严格相等、init Err/panic、同名泛型轴多插件、单槽轴多插件、
+  严格清单缺文件/身份/`@semver` pin 不符——装配期一律拒绝启动，不静默降级——§2/§7。
+- **配置**：`plugins:` 一段三用 + cfg 三级解析，未被消费的未知顶层段启动打
+  `unconsumed config sections` 诊断——§7。
+- **版本兼容**：「不 bump ABI」≠「可混跑版本」——跨边界线形状（`{"$oj$i64":…}` 等）
+  是源码级共享约定，宿主与插件必须同批重建发布；泛型轴撞 9 保留名须宿主
+  ≥ v0.1.54——§10 兼容矩阵。
+
+## 14. 设计决策记录：为什么是 cdylib + C-ABI FFI
+
+现行插件系统经历过一次路线更换（2026-09）：最初完成的是**进程内 `Plugin` trait**
+方案（编译期链接，trait + `BridgeBuilder` + db 方言 `DbBackend` 注册表，feature-gate
+拆分驱动），其依赖倒置成果（`Arc<dyn Trait>` 后端注入 `Extras`/`StableState`）保留
+至今；但该路线随后被 **cdylib + C-ABI FFI**（stabby 契约）整体取代。决策要点：
+
+- **进程内方案的硬上限**：依赖仍编译进核心二进制——feature-gate 只能削减驱动
+  种类，做不到「不装 kafka 就没有 rdkafka」的按需装卸；`Plugin` 也无法跨仓库
+  独立发版（与宿主同工具链、同 workspace 才能编）。
+- **FFI 路线的三个已知风险及其化解**（原方案风险节逐一对应）：
+  - `Arc` 跨 `.so` 边界 allocator 不匹配 → drop UB → **stabby 类型全权跨界**
+    （`RString`/`RArc`/`RVec` 稳定布局，§3），宿主与插件只共享 `oj-plugin-ffi`；
+  - `deno_core::Extension` 非 `repr(C)` 过不了边界 → **插件不碰 Extension**，只导出
+    `extern "C"` 符号（入口宏生成，§4）；
+  - Rust future（`!Unpin`/编译器私有）不可跨 C-ABI → **`FfiFuture` 手写状态机**
+    （state/poll/take/free，§6），异步工作留在插件自建 runtime，宿主只轮询。
+- **换来的能力**：后端依赖随插件装卸（扫描/清单装配）、插件崩溃隔离
+  （`catch_unwind` 双层收敛成 Err 而非 abort 宿主，§8）、第三方可独立仓库发版
+  （模板骨架，§1 路径 B）。
+- **付出的约束**：ABI 严格相等门禁 + 线形状同批发布（§10）；vtable 方法 panic 必须
+  插件内收敛（§8）；tokio/tracing 等运行时类型绝不过线（§3）；无热插拔——op
+  命名空间在 `JsRuntime::new` 时一次固定，插件只能在启动装配期装载（这是 V8
+  isolate 的本质约束，两条路线下相同）。
+
+> 原方案全文（进程内 trait 路线的完整设计与分阶段计划，未执行）留存于 git 历史
+> （`docs/plugins/plugin-architecture.md`，已删除）。
+
