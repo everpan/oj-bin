@@ -202,6 +202,10 @@ pub struct StableState {
     /// 泛型轴注册表（插件自报的非类型化轴；bootstrap `axis(name)` 的数据源）。
     /// 空表 = 无泛型轴，`axis(name).op()` 报 unknown axis 并列可用轴名。
     pub generic_axes: generic_axis::GenericAxisRegistry,
+    /// ojInfo() 数据源（与 `oj info` CLI 同源的 OjInfo 经 serde_json::to_value 固化；
+    /// v0.1.54）。装配期已脱敏（config 只含段名/键名，值一律不出）——**注入即公开**，
+    /// op 层不得附加任何值。
+    pub oj_info: Arc<serde_json::Value>,
 }
 
 /// bridge 可选能力注入（构造期一次）。
@@ -258,6 +262,9 @@ pub struct Extras {
     /// 泛型轴注册表（None = 空 registry，`axis(name)` 一律报 unknown axis——与
     /// vars 同哲学：未注入 = 空表而非 None）。
     pub generic_axes: Option<generic_axis::GenericAxisRegistry>,
+    /// ojInfo() 数据源（None = 空对象 {}，与 vars 同哲学：未注入 = 空表而非 None；
+    /// 值在装配层已脱敏，此处只接固化 JSON）。
+    pub oj_info: Option<Arc<serde_json::Value>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -383,6 +390,7 @@ deno_core::extension!(
         mail::op_mail_result,
         mail::op_mail_profiles,
         plugins_op::op_plugins,
+        plugins_op::op_oj_info,
         vars::op_vars_get,
         log::op_log,
         module_loader::op_resolve_cjs,
@@ -722,6 +730,9 @@ impl Bridge {
             js_heap_limit: extras.js_heap_limit,
             fs: extras.fs,
             generic_axes: extras.generic_axes.unwrap_or_default(),
+            oj_info: extras
+                .oj_info
+                .unwrap_or_else(|| Arc::new(serde_json::json!({}))),
         });
         // mail 结果回调（HostContext.deliver，无状态 extern "C"）经进程级弱引用路由到本后端：
         // 存结果 + 本地扇出。未配置 mail 时不挂（上送被明确丢弃并告警）。
@@ -2042,6 +2053,7 @@ mod tests {
             js_heap_limit: None,
             fs: None,
             generic_axes: Arc::new(HashMap::new()),
+            oj_info: Arc::new(serde_json::json!({})),
         });
         // 无 boot → 看门狗不参与（Default 不起线程），仅满足池的构造契约。
         let pool =

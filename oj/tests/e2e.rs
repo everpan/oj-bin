@@ -1480,6 +1480,48 @@ fn generic_plugin_artifact() -> PathBuf {
     .clone()
 }
 
+/// ojInfo() e2e（HTTP 池入口）：serve 装配注入 → handler 内 `ojInfo()` 返回与
+/// `oj info` CLI 同源的结构（abi/build/config 声明面）。安全红线：config 只出
+/// 段名/键名——vars 的部署值不得出现在响应的任何序列化字段里。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ojinfo_global_available_in_handler() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/i/manifest.yaml", "name: i\ndesc: d\nversion: 0.1.0\n"),
+        (
+            "src/i/api.ts",
+            "export default { get() { json.ok(ojInfo()); } };",
+        ),
+    ]);
+    let mut cfg = base_cfg(&t);
+    // 敏感样式部署值：只许以「段名/键名」形态出现，值一律不得泄漏。
+    cfg.vars.insert("TOKEN".into(), "secret-value-123".into());
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    let (s, v) = req(addr, "GET", "/v1/api/i/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["data"]["abi"]["abi_version"],
+        oj_plugin_ffi::ABI_VERSION,
+        "{v}"
+    );
+    assert_eq!(
+        v["data"]["abi"]["host_fingerprint"],
+        oj_plugin_ffi::HOST_FINGERPRINT,
+        "{v}"
+    );
+    assert_eq!(v["data"]["build"]["oj"], env!("CARGO_PKG_VERSION"), "{v}");
+    assert!(v["data"]["config"]["sections"].is_array(), "{v}");
+    assert!(v["data"]["plugins"].is_array(), "{v}");
+    let leaked = serde_json::to_string(&v).unwrap();
+    assert!(!leaked.contains("secret-value-123"), "{leaked}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&t);
+}
+
 /// 泛型轴 e2e：mini-generic 插件（自报轴名 "greet"）扫描装配 → JS 侧
 /// `axis("greet").greet("oj")` → `{"hello":"oj"}`；未知轴 `axis("nope").x()`
 /// → 500 信封且消息列可用轴名（greet）。

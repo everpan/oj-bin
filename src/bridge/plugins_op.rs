@@ -14,6 +14,15 @@ pub fn op_plugins(state: &mut OpState) -> Vec<PluginInfo> {
     state.borrow::<Arc<StableState>>().plugins.clone()
 }
 
+/// ojInfo()：装配期固化的 OjInfo（与 `oj info` CLI 同源，`serve_cmd::assemble_ojinfo`
+/// 产物经 serde_json::to_value 注入 StableState；v0.1.54）。值在装配期已脱敏
+///（config 只含段名/键名），op 层零泄漏面。
+#[op2]
+#[serde]
+pub fn op_oj_info(state: &mut OpState) -> serde_json::Value {
+    state.borrow::<Arc<StableState>>().oj_info.as_ref().clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +77,56 @@ mod tests {
             "{v}"
         );
         assert_eq!(arr[1]["name"], "kv");
+    }
+
+    /// ojInfo()：注入值原样透出（三入口共享同一 StableState 构造路径，
+    /// tasks / `oj test` 入口的注入由编译器对 Extras 字段强制找全）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ojinfo_reflects_injected_value() {
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                oj_info: Some(Arc::new(serde_json::json!({
+                    "abi": { "abi_version": oj_plugin_ffi::ABI_VERSION }
+                }))),
+                ..Default::default()
+            },
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => { json.ok(ojInfo()); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(
+            v["data"]["abi"]["abi_version"],
+            oj_plugin_ffi::ABI_VERSION,
+            "{v}"
+        );
+    }
+
+    /// ojInfo() 缺省 = 空对象（未注入 → {}，与 vars 同哲学：空表而非 None）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn ojinfo_defaults_to_empty_object() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => { json.ok(ojInfo()); })().catch((e) => json.ok({ err: String(e) }));"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], serde_json::json!({}), "{v}");
     }
 
     /// 零插件 → 空数组（host ABI 由 op 类型与装配层携行，见上例）。

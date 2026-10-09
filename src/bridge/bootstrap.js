@@ -77,6 +77,7 @@ import {
   op_oidc_sign,
   op_oidc_verify,
   op_plugins,
+  op_oj_info,
   op_axis_call,
   op_resolve_cjs as __oj_resolve_cjs,
   op_bcrypt_hash,
@@ -653,6 +654,11 @@ globalThis.ldap = ojLdapDefault;
 
 // ----- plugins: loaded plugin introspection (name/semver/abi/fingerprint + host ABI) -----
 globalThis.plugins = () => op_plugins();
+
+// ----- ojInfo: assembly-frozen diagnostics (same source as the `oj info` CLI) -----
+// Values are names only (config sections/keys, no values); there is no public HTTP
+// endpoint for this -- handlers call ojInfo() in-process.
+globalThis.ojInfo = () => op_oj_info();
 
 // ----- axis: generic plugin axes (self-reported names outside the typed axes) -----
 // axis("cache").get("k") -> op_axis_call("cache", "get", "[\"k\"]"); unknown axis
