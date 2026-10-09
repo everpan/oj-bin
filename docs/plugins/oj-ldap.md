@@ -3,7 +3,7 @@
 ## 概述
 
 提供 `ldap` **泛型轴**的 cdylib 插件（v0.1.54 起从类型化轴迁移），底层 `ldap3`
-（纯 Rust tokio LDAP 客户端）。负责目录查询与 bind 鉴证：search / searchPaged /
+（纯 Rust tokio LDAP 客户端）。负责目录查询与 bind 鉴证：search / search_paged /
 whoami / compare / bind。连接模型为每调用独立 connect → 服务账号绑定 → 操作 →
 unbind，不做连接池。
 
@@ -53,7 +53,7 @@ JS 侧：
 ```js
 await axis("ldap").bind("uid=eve,dc=example,dc=com", "pw");            // → true|false
 await axis("ldap").search("ou=users,dc=example,dc=com", { scope: "one", attrs: ["uid"] });
-await axis("ldap").searchPaged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
+await axis("ldap").search_paged("dc=example,dc=com", { pageSize: 1000, key: "ad" });
 await axis("ldap").whoami({ key: "ad" });                              // → "dn:cn=svc,…"
 await axis("ldap").compare(dn, "uid", "eve");                          // → true|false
 ```

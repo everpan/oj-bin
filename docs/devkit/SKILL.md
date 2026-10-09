@@ -31,7 +31,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    **发件人/收件人白名单 fail-closed**，空表即拒；附件用 `{blobKey}`/`{path}` 引用，勿内联 base64）。
    完整手册见仓库 `docs/mail-smtp.md`。
    **LDAP/AD 登录鉴证或目录查询 → §6「ldap」**（配置顶层 `ldap:` + `oj-ldap` 插件；
-   v0.1.54 起调用面为 `axis("ldap").bind/search/searchPaged/whoami/compare`，reject 模型，
+   v0.1.54 起调用面为 `axis("ldap").bind/search/search_paged/whoami/compare`，reject 模型，
    仅 `bind` 凭据错返回 `false`；filter 用户输入**必须转义**）。完整手册见仓库
    `docs/ldap-integration.md`，可照抄代码见 `scenarios.md` 场景 11。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
@@ -109,12 +109,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `ldap.*` 报 `ldap not configured` 但 `ldap:` 段已配 | v0.1.54 起 oj-ldap 迁移**泛型轴**——调用面改成 `axis("ldap").<op>(...)`；类型化 `ldap`/`LDAP` 全局是遗留双轨面，装配迁移版插件后报 not configured |
 | `axis("x")` 报 `unknown generic axis '<x>'` | 轴没装上（插件未加载/ABI 不匹配）或名字拼错——报错里的 available 列表即当前已注册泛型轴；确认插件在 `plugins:` 清单或扫描目录里 |
 | 泛型轴插件撞名（插件作者） | 泛型轴名**避开 9 个保留名**（es/db/blob/bus/kv/auth/mq/mail/ldap）——pre-kind 旧宿主按名 cast，会把 GenericVtable 误当类型化 vtable；同名泛型轴多插件提供 → 装配期 fail-fast |
-| `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `axis("ldap").searchPaged(base, { pageSize: 500 })` |
+| `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `axis("ldap").search_paged(base, { pageSize: 500 })` |
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |
 | `ldap:` 段改了不生效并报错双配置 | 同时写了顶层 `ldap:` 段与非空 `plugins.ldap` 透传——二选一（透传静默胜出，装配期报错拦截） |
 | `start_tls` 配在 ldaps:// 上启动报错 | ldaps 已隐式 TLS，StartTLS 无意义——`ldap://` 口才用 `start_tls: true` |
-| `search` 报 `operationsError: 必须先完成 bind` | 匿名绑定被目录拒绝——`ldap:` 段只配了 `bind_dn` 却没给 `bind_pw`，又没在 `search`/`searchPaged` 用 opts 的 `bindPw` 补上；服务账号 DN 留 config、密码走运行时参数（`axis("ldap").search(base, { …, bindPw })`），二者合并生效 |
-| 服务账号密码不想落配置 | config 只写 `bind_dn`，`bind_pw` 经每次 `search`/`searchPaged` 的 opts `bindPw` 传入（与 config 的 `bind_dn` 合并，取一即可）；`whoami`/`compare` 仍需 config 同时有 `bind_dn`+`bind_pw` |
+| `search` 报 `operationsError: 必须先完成 bind` | 匿名绑定被目录拒绝——`ldap:` 段只配了 `bind_dn` 却没给 `bind_pw`，又没在 `search`/`search_paged` 用 opts 的 `bindPw` 补上；服务账号 DN 留 config、密码走运行时参数（`axis("ldap").search(base, { …, bindPw })`），二者合并生效 |
+| 服务账号密码不想落配置 | config 只写 `bind_dn`，`bind_pw` 经每次 `search`/`search_paged` 的 opts `bindPw` 传入（与 config 的 `bind_dn` 合并，取一即可）；`whoami`/`compare` 仍需 config 同时有 `bind_dn`+`bind_pw` |
 | 启动 stderr 打 `unconsumed config sections: […]`（v0.1.54） | 有顶层 config 段没被宿主也没被任何插件消费——多半是段名拼错（如 `cahce`）或对应插件没装；已加载插件只认 `config: "key"` 自报段与 `plugins:<name>` 非空透传。`oj info` / `ojInfo()` 可复查 |
 | 插件 init 收到 `{}`（config key 段已配）（v0.1.54，插件作者） | 三级解析第 2 级：自报 `config: "key"` 的段**未配置就给 `{}`**（段可选是既有语义）——插件 init 必须容忍空 cfg 或自行 fail-fast，别假设段必在 |
 | 重编后的新插件在旧宿主上加载（插件作者） | 旧插件无需重编（`oj_plugin_axes` 缺失回落 per-axis dlsym）；但**新插件必须配新宿主**——旧 cdylib 换新宿主、或新 cdylib 配旧宿主都须 `cargo xtask build` 全量联编，勿混跑版本 |
