@@ -944,6 +944,183 @@ pub async fn assemble_plugins(
     Ok(loaded.iter().map(PluginInfo::from).collect())
 }
 
+/// oj_info（phpinfo 对应物）单一事实源。两出口（CLI / JS ojInfo()）共用。
+/// 只报告声明面：不 connect 库/broker；config 只出段名/键名，值一律不出。
+#[derive(serde::Serialize)]
+pub struct OjInfo {
+    pub build: serde_json::Value,
+    pub abi: serde_json::Value,
+    pub plugins: Vec<PluginInfo>,
+    pub backends: serde_json::Value,
+    pub config: serde_json::Value,
+    pub generic_axes: Vec<String>,
+    pub unconsumed_sections: Vec<String>,
+}
+
+impl OjInfo {
+    /// php -i 风格分段纯文本。
+    pub fn to_text(&self) -> String {
+        let mut o =
+            String::from("oj info — declaration surface only (no connections, no config values)\n");
+        let sec = |o: &mut String, t: &str| {
+            o.push_str("\n## ");
+            o.push_str(t);
+            o.push('\n');
+        };
+        sec(&mut o, "build");
+        if let Some(m) = self.build.as_object() {
+            for (k, v) in m {
+                line(&mut o, k, v);
+            }
+        }
+        sec(&mut o, "abi");
+        if let Some(m) = self.abi.as_object() {
+            for (k, v) in m {
+                line(&mut o, k, v);
+            }
+        }
+        sec(&mut o, "plugins");
+        if self.plugins.is_empty() {
+            o.push_str("(none loaded)\n");
+        }
+        for p in &self.plugins {
+            o.push_str(&format!(
+                "- {} {} (abi {})\n  desc: {}\n",
+                p.name, p.semver, p.abi_version, p.description
+            ));
+            if !p.unknown_axes.is_empty() {
+                o.push_str(&format!("  unknown_axes: {:?}\n", p.unknown_axes));
+            }
+        }
+        line(
+            &mut o,
+            "generic_axes",
+            &serde_json::json!(self.generic_axes),
+        );
+        sec(&mut o, "backends");
+        if let Some(m) = self.backends.as_object() {
+            for (k, v) in m {
+                line(&mut o, k, v);
+            }
+        }
+        sec(&mut o, "config");
+        line(&mut o, "sections", &self.config["sections"]);
+        line(&mut o, "unconsumed", &self.config["unconsumed"]);
+        o
+    }
+}
+
+/// `key: value` 一行；字符串值原样出，其余按 JSON 出。
+fn line(o: &mut String, k: &str, v: &serde_json::Value) {
+    o.push_str(k);
+    o.push_str(": ");
+    if let Some(s) = v.as_str() {
+        o.push_str(s);
+    } else {
+        o.push_str(&serde_json::to_string(v).unwrap_or_default());
+    }
+    o.push('\n');
+}
+
+/// 顶层 config 段键排序清单（只出键名不出值）。
+fn known_section_keys(top: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = top
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// V8 版本（经 deno_core re-export；独立小函数便于测试替换）。
+fn v8_version() -> String {
+    deno_core::v8::V8::get_version().to_string()
+}
+
+/// 宿主 triple（与 core `ffi::triple()` 同口径——该 fn 为 pub(crate)，此处按
+/// `std::env::consts` 重建，与 serve_cmd tests / migrate_cmd 的既有 helper 一致）。
+fn host_triple_str() -> String {
+    let arch = std::env::consts::ARCH;
+    match std::env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        other => format!("{arch}-unknown-{other}-gnu"),
+    }
+}
+
+/// `oj info` 与 JS ojInfo() 的共同装配面：load_with_extra → resolve_plugins_dir →
+/// assemble_plugins 的加载与 config 解析路径 → build_registries；不 connect、不监听。
+/// 副作用 = 执行插件 init 代码，信任边界同 serve。
+pub async fn assemble_for_info(cfg_path: &str) -> Result<OjInfo, String> {
+    let config_dir = config_dir_of(Path::new(cfg_path));
+    let loaded_cfg = config::load_with_extra(Path::new(cfg_path), &config_dir)
+        .map_err(|e| format!("config: {e}"))?;
+    let cfg = &loaded_cfg.config;
+    let dir = resolve_plugins_dir(&config_dir, cfg.plugins_dir.as_deref())
+        .map_err(|e| format!("plugins dir: {e}"))?;
+    let host = host_context();
+    // 与 assemble_plugins 同一取值路径（三级解析：passthrough → config key → 按名臂）。
+    let cfg_for = |name: &str, config_key: Option<&str>| -> String {
+        plugin_cfg(cfg, &loaded_cfg.top, name, config_key, None)
+            .unwrap_or_else(|e| panic!("plugin_cfg: {e}"))
+    };
+    let loaded = match &dir {
+        Some(d) if !cfg.plugins.is_empty() => {
+            let mut entries: Vec<PluginManifestEntry> = cfg
+                .plugins
+                .keys()
+                .map(|name| PluginManifestEntry {
+                    name: name.clone(),
+                    semver_pin: None,
+                })
+                .collect();
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            load_manifest(d, &entries, host, &cfg_for)
+                .map_err(|e| format!("plugins manifest: {e}"))?
+        }
+        Some(d) => load_scanned(d, host, &cfg_for).map_err(|e| format!("plugins scan: {e}"))?,
+        None => vec![],
+    };
+    let reg = build_registries(cfg, &loaded)?;
+    // backends 声明面：db schemes、blob 有/无、broker kinds、kv/auth/es/mail/ldap/mq 槽位。
+    let backends = serde_json::json!({
+        "db_schemes": { "declared": cfg.db.keys().collect::<Vec<_>>() },
+        "blob_configured": cfg.blob.is_some(),
+        "kv_plugin": reg.kv.is_some(),
+        "auth_plugin": reg.auth.is_some(),
+        "mail_plugin": reg.mail.is_some(),
+        "ldap_plugin": reg.ldap.is_some(),
+        "es_plugin": reg.es.is_some(),
+        "mq_plugins": reg.mq.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "bus_kinds": reg.bus.kinds(),
+        "dbs_registered": reg.dbs.backend_names(),
+    });
+    let config = serde_json::json!({
+        "sections": known_section_keys(&loaded_cfg.top),
+        "unconsumed": unconsumed_sections(&loaded_cfg.top, cfg, &loaded),
+    });
+    Ok(OjInfo {
+        build: serde_json::json!({
+            "oj": env!("CARGO_PKG_VERSION"),
+            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "host_triple": host_triple_str(),
+            "v8": v8_version(),
+            "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+            "config_path": cfg_path,
+        }),
+        abi: serde_json::json!({
+            "abi_version": oj_plugin_ffi::ABI_VERSION,
+            "host_fingerprint": oj_plugin_ffi::HOST_FINGERPRINT,
+        }),
+        plugins: loaded.iter().map(PluginInfo::from).collect(),
+        backends,
+        config,
+        generic_axes: reg.generic.iter().map(|(a, _, _)| a.clone()).collect(),
+        unconsumed_sections: unconsumed_sections(&loaded_cfg.top, cfg, &loaded),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

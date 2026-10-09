@@ -162,6 +162,13 @@ pub enum Command {
     SecretSeal(SecretSealArgs),
     SecretOpen(SecretOpenArgs),
     OpenApi(OpenApiArgs),
+    Info(InfoArgs),
+}
+
+/// `oj info [-c config]`：phpinfo 风格诊断（版本/ABI/插件/后端注册/配置段，值不出）。
+pub struct InfoArgs {
+    /// 配置文件路径（相对 CWD）
+    pub config: String,
 }
 
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
@@ -429,6 +436,12 @@ enum Commands {
         #[arg(short, long)]
         out: Option<String>,
     },
+    /// phpinfo 风格诊断：版本/ABI/插件/后端注册/配置段（值不出）
+    Info {
+        /// 配置文件路径（相对 CWD）
+        #[arg(short, long, default_value = "config.yaml")]
+        config: String,
+    },
 }
 
 /// `oj test <sub>`：现有仅 fixture（灌演示数据）。
@@ -661,6 +674,7 @@ fn to_command(cli: Cli) -> Command {
             check,
             out,
         }),
+        Commands::Info { config } => Command::Info(InfoArgs { config }),
     }
 }
 
