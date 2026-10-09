@@ -9,9 +9,16 @@ extern "C" fn greet(op: RString, args: RString) -> FfiFuture {
     }
     let name = serde_json::from_slice::<serde_json::Value>(args[..].as_bytes())
         .ok()
-        .and_then(|v| v.as_array().and_then(|a| a.first().and_then(|v| v.as_str()).map(String::from)))
+        .and_then(|v| {
+            v.as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_str()).map(String::from))
+        })
         .unwrap_or_else(|| "world".to_string());
-    oj_plugin_ffi::ready_ok(serde_json::json!({ "hello": name }).to_string().into_bytes())
+    oj_plugin_ffi::ready_ok(
+        serde_json::json!({ "hello": name })
+            .to_string()
+            .into_bytes(),
+    )
 }
 
 static GREET_VT: oj_plugin_ffi::GenericVtable = oj_plugin_ffi::GenericVtable { call: greet };

@@ -108,6 +108,14 @@ pub struct Registrations {
 pub struct LoadedPlugin {
     pub descriptor: PluginDescriptor,
     pub registrations: Registrations,
+    /// 泛型轴：清单轴名不在 TYPED_AXES（vtable 按 GenericVtable 解释；撞保留名
+    /// 的按 typed 解释，故此处必然是非保留名）。
+    pub generic_axes: Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
+    /// 自报了但宿主既不认识、泛型也不收的轴名（恒空实现，结构对称与 spec 一致；
+    /// 预留「撞保留名却按 typed cast 失败」等未来防御场景）。
+    pub unknown_axes: Vec<String>,
+    /// init 前探测的声明配置段键（oj_plugin_config_key；旧插件 None）。
+    pub config_key: Option<String>,
 }
 
 impl fmt::Debug for LoadedPlugin {
@@ -133,6 +141,8 @@ pub struct PluginInfo {
     pub description: String,
     /// 宿主当前 ABI_VERSION（插件不必与此一致，运维据此核对升级窗口）。
     pub host_abi_version: u32,
+    /// 自报了但宿主不认识的轴名（恒空实现；op_plugins 输出增量字段）。
+    pub unknown_axes: Vec<String>,
 }
 
 impl From<&LoadedPlugin> for PluginInfo {
@@ -144,6 +154,7 @@ impl From<&LoadedPlugin> for PluginInfo {
             fingerprint: p.descriptor.fingerprint[..].to_string(),
             description: p.descriptor.desc[..].to_string(),
             host_abi_version: ABI_VERSION,
+            unknown_axes: p.unknown_axes.clone(),
         }
     }
 }
@@ -330,7 +341,7 @@ fn load_one(
     path: &Path,
     expected: Option<&PluginManifestEntry>,
     host: RArc<HostContext>,
-    cfg_for: &dyn Fn(&str) -> String,
+    cfg_for: &dyn Fn(&str, Option<&str>) -> String,
 ) -> Result<LoadedPlugin, PluginLoadError> {
     install_panic_hook();
     let lib = unsafe { ffi::load_forget(path)? };
@@ -365,11 +376,20 @@ fn load_one(
     let probe = expected
         .map(|e| e.name.clone())
         .unwrap_or_else(|| file_stem_name(path));
+    // 声明配置段键须在 init 前探测（init 就要吃 cfg，不能依赖 init 返回的 descriptor）。
+    let config_key = unsafe {
+        lib.get::<extern "C" fn() -> RString>(b"oj_plugin_config_key")
+            .ok()
+            .map(|f| f()[..].to_string())
+    };
     // M-2：RAII 守卫管理 CURRENT_PLUGIN。即便下面 cfg_for / init_sym panic，
     // 守卫 Drop 也会复位，避免残留旧名。
     *CURRENT_PLUGIN.lock().unwrap() = Some(probe.clone());
     let _guard = CurrentPluginGuard;
-    let r = init_sym(host, RString::from(cfg_for(&probe).as_str()));
+    let r = init_sym(
+        host,
+        RString::from(cfg_for(&probe, config_key.as_deref()).as_str()),
+    );
 
     let descriptor = match std::result::Result::from(r) {
         Ok(d) => d,
@@ -418,27 +438,49 @@ fn load_one(
         }
     }
 
-    // init 后按轴 dlsym 探测（spec「按轴 dlsym」）：句柄已泄漏进程期存活，
+    // init 后探测轴（自报清单优先，旧符号回退）：句柄已泄漏进程期存活，
     // vtable 指针永久有效，探测后不持有 lib 引用。
-    let registrations = unsafe { probe_axes(lib) };
+    let (registrations, generic_axes, unknown_axes) = unsafe { probe_axes(lib, &probe) };
 
     Ok(LoadedPlugin {
         descriptor,
         registrations,
+        generic_axes,
+        unknown_axes,
+        config_key,
     })
 }
 
-/// 宿主认识的轴（加新轴 = 此表加一行 + 对应 vtable 类型 + Registrations 加字段；
-/// 插件零感知、零重编译——spec「按轴 dlsym」）。
-pub const AXES: &[&str] = &[
+/// 宿主认识的类型化轴（9 个）。清单按名匹配的右值表 + 回退逐轴 dlsym 共用。
+/// pub(crate)：crate 内部实现细节（评审 M2/M4——非公共契约，xtask 不再 import）。
+pub(crate) const TYPED_AXES: &[&str] = &[
     "es", "db", "blob", "bus", "kv", "auth", "mq", "mail", "ldap",
 ];
 
-/// init 成功后逐轴 dlsym：`oj_plugin_axis_<name>() -> *const c_void`。
-/// 缺符号或返回 null = 不提供该轴（非错误）。
-unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
+/// init 成功后轴探测：`oj_plugin_axes()` 自报清单优先；缺符号回落逐轴 dlsym
+/// `oj_plugin_axis_<name>() -> *const c_void`（缺符号或返回 null = 不提供该轴，非错误）。
+unsafe fn probe_axes(
+    lib: &libloading::Library,
+    plugin_name: &str,
+) -> (
+    Registrations,
+    Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
+    Vec<String>,
+) {
+    if let Ok(f) = unsafe {
+        lib.get::<unsafe extern "C" fn() -> oj_plugin_ffi::RVec<oj_plugin_ffi::AxisDecl>>(
+            b"oj_plugin_axes",
+        )
+    } {
+        let decls = unsafe { f() };
+        return classify_axes(plugin_name, decls.iter());
+    }
+    eprintln!(
+        "[oj-plugin] '{plugin_name}': no oj_plugin_axes symbol, falling back to per-axis dlsym (deprecated; rebuild plugin)"
+    );
+    // 回退：逐轴 dlsym（填 Registrations；泛型/unknown 恒空）。
     let mut r = Registrations::default();
-    for axis in AXES {
+    for axis in TYPED_AXES {
         let sym = format!("oj_plugin_axis_{axis}");
         let Ok(f) = (unsafe {
             lib.get::<unsafe extern "C" fn() -> *const std::ffi::c_void>(sym.as_bytes())
@@ -449,24 +491,56 @@ unsafe fn probe_axes(lib: &libloading::Library) -> Registrations {
         if vt.is_null() {
             continue;
         }
-        match *axis {
-            "es" => r.es = Some(unsafe { &*(vt as *const oj_plugin_ffi::EsBackendVtable) }),
-            "db" => r.db = Some(unsafe { &*(vt as *const oj_plugin_ffi::DataAccessorVtable) }),
-            "blob" => r.blob = Some(unsafe { &*(vt as *const oj_plugin_ffi::BlobBackendVtable) }),
-            "bus" => r.bus = Some(unsafe { &*(vt as *const oj_plugin_ffi::EventBrokerVtable) }),
-            "kv" => r.kv = Some(unsafe { &*(vt as *const oj_plugin_ffi::KVStoreVtable) }),
-            "auth" => r.auth = Some(unsafe { &*(vt as *const oj_plugin_ffi::AuthGuardVtable) }),
-            "mq" => r.mq = Some(unsafe { &*(vt as *const oj_plugin_ffi::MqVtable) }),
-            "mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailVtable) }),
-            "ldap" => r.ldap = Some(unsafe { &*(vt as *const oj_plugin_ffi::LdapVtable) }),
-            _ => unreachable!("AXES 与 probe_axes 分支不同步"),
+        fill_typed_slot(&mut r, axis, vt);
+    }
+    (r, Vec::new(), Vec::new())
+}
+
+/// 自报清单分类：TYPED_AXES 名填 typed 槽（vtable 按对应类型转型），其余名进泛型轴。
+fn classify_axes<'a>(
+    plugin_name: &str,
+    decls: impl Iterator<Item = &'a oj_plugin_ffi::AxisDecl>,
+) -> (
+    Registrations,
+    Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
+    Vec<String>,
+) {
+    let mut r = Registrations::default();
+    let mut generic = Vec::new();
+    let unknown = Vec::new();
+    for d in decls {
+        let name = d.name[..].to_string();
+        if TYPED_AXES.contains(&name.as_str()) {
+            fill_typed_slot(&mut r, &name, d.vtable);
+        } else {
+            // 安全前提：插件按 GenericVtable 形状构造该 vtable（信任边界同既有轴）。
+            generic.push((name, unsafe {
+                &*(d.vtable as *const oj_plugin_ffi::GenericVtable)
+            }));
         }
     }
-    r
+    let _ = plugin_name;
+    (r, generic, unknown)
+}
+
+/// 把一个自报/回退的 vtable 指针填入对应 typed 槽（cast 在臂内，与既有形态一致）。
+fn fill_typed_slot(r: &mut Registrations, axis: &str, vt: *const std::ffi::c_void) {
+    match axis {
+        "es" => r.es = Some(unsafe { &*(vt as *const oj_plugin_ffi::EsBackendVtable) }),
+        "db" => r.db = Some(unsafe { &*(vt as *const oj_plugin_ffi::DataAccessorVtable) }),
+        "blob" => r.blob = Some(unsafe { &*(vt as *const oj_plugin_ffi::BlobBackendVtable) }),
+        "bus" => r.bus = Some(unsafe { &*(vt as *const oj_plugin_ffi::EventBrokerVtable) }),
+        "kv" => r.kv = Some(unsafe { &*(vt as *const oj_plugin_ffi::KVStoreVtable) }),
+        "auth" => r.auth = Some(unsafe { &*(vt as *const oj_plugin_ffi::AuthGuardVtable) }),
+        "mq" => r.mq = Some(unsafe { &*(vt as *const oj_plugin_ffi::MqVtable) }),
+        "mail" => r.mail = Some(unsafe { &*(vt as *const oj_plugin_ffi::MailVtable) }),
+        "ldap" => r.ldap = Some(unsafe { &*(vt as *const oj_plugin_ffi::LdapVtable) }),
+        _ => unreachable!("TYPED_AXES 与 fill_typed_slot 分支不同步"),
+    }
 }
 
 impl Registrations {
-    /// 该轴是否被提供（`None` = 轴名不在 `AXES`）。
+    /// 该轴是否被提供（`None` = 轴名不在 `TYPED_AXES`）。
     /// 与 `probe_axes` **同文件相邻**，加轴时两处映射可对照着改，不再有跨 crate 漂移的
     /// 余地（规格评审 I-2：`tools/xtask` 曾各自维护一份同名映射，加轴漏改即回归）。
     /// 刻意返回 `Option` 而非 `unreachable!`：漏改的后果应是可读报错，不是 panic。
@@ -496,7 +570,7 @@ pub fn load_manifest(
     dir: &Path,
     manifest: &[PluginManifestEntry],
     host: RArc<HostContext>,
-    cfg_for: &dyn Fn(&str) -> String,
+    cfg_for: &dyn Fn(&str, Option<&str>) -> String,
 ) -> Result<Vec<LoadedPlugin>, PluginLoadError> {
     let mut out = Vec::with_capacity(manifest.len());
     for entry in manifest {
@@ -513,7 +587,7 @@ pub fn load_manifest(
 pub fn load_scanned(
     dir: &Path,
     host: RArc<HostContext>,
-    cfg_for: &dyn Fn(&str) -> String,
+    cfg_for: &dyn Fn(&str, Option<&str>) -> String,
 ) -> Result<Vec<LoadedPlugin>, PluginLoadError> {
     if !dir.is_dir() {
         return Ok(vec![]);

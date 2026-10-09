@@ -71,7 +71,7 @@ fn mini_kv_plugin_dir() -> PathBuf {
     .clone()
 }
 
-fn no_cfg(_: &str) -> String {
+fn no_cfg(_: &str, _: Option<&str>) -> String {
     "{}".to_string()
 }
 
@@ -345,7 +345,7 @@ fn panic_hook_emit_helper() {
         semver_pin: None,
     }];
     let r = std::panic::catch_unwind(|| {
-        let _ = load_manifest(&dir, &manifest, host_context(), &|_| panic!("cfg boom"));
+        let _ = load_manifest(&dir, &manifest, host_context(), &|_, _| panic!("cfg boom"));
     });
     assert!(r.is_err(), "host panic must propagate (not swallowed)");
 }
@@ -366,7 +366,7 @@ fn manifest_semver_pin_ok() {
 #[test]
 fn scan_empty_dir_is_zero_plugins() {
     let base = tempfile::tempdir().unwrap();
-    let loaded = load_scanned(base.path(), host_context(), &|_| "{}".to_string()).unwrap();
+    let loaded = load_scanned(base.path(), host_context(), &|_, _| "{}".to_string()).unwrap();
     assert!(loaded.is_empty());
 }
 
@@ -375,7 +375,7 @@ fn scan_missing_dir_is_zero_plugins() {
     let loaded = load_scanned(
         Path::new("/nonexistent-plugins-dir"),
         host_context(),
-        &|_| "{}".to_string(),
+        &|_, _| "{}".to_string(),
     )
     .unwrap();
     assert!(loaded.is_empty());
@@ -385,7 +385,7 @@ fn scan_missing_dir_is_zero_plugins() {
 fn scan_loads_mini() {
     let _g = ENV_LOCK.lock().unwrap();
     let dir = mini_plugin_dir();
-    let loaded = load_scanned(&dir, host_context(), &|_| "{}".to_string()).unwrap();
+    let loaded = load_scanned(&dir, host_context(), &|_, _| "{}".to_string()).unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(&loaded[0].descriptor.name[..], "mini");
 }
@@ -485,24 +485,24 @@ fn given_only_mail_slot_set_when_provides_then_only_mail_is_true() {
     }
     static MAIL_VT: oj_plugin_ffi::MailVtable = oj_plugin_ffi::MailVtable { submit };
 
-    // mail 必须在 AXES 里，否则下面的循环覆盖不到它（本断言非恒真）。
-    assert!(AXES.contains(&"mail"));
+    // mail 必须在 TYPED_AXES 里，否则下面的循环覆盖不到它（本断言非恒真）。
+    assert!(TYPED_AXES.contains(&"mail"));
     let r = Registrations {
         mail: Some(&MAIL_VT),
         ..Default::default()
     };
-    for a in AXES {
+    for a in TYPED_AXES {
         assert_eq!(r.provides(a), Some(*a == "mail"), "axis {a} 判定错配");
     }
 }
 
-/// `AXES` 每项都必须有 `provides` 分支（加轴漏改 → 本测试红，而不是等到
+/// `TYPED_AXES` 每项都必须有 `provides` 分支（加轴漏改 → 本测试红，而不是等到
 /// `cargo xtask plugin <name> --check` 才发现）。未知轴须返回 `None`（而非 panic），
 /// `check()` 据此给普通 Err。
 #[test]
 fn given_axes_table_when_provides_then_every_axis_has_a_branch() {
     let r = Registrations::default();
-    for a in AXES {
+    for a in TYPED_AXES {
         assert!(r.provides(a).is_some(), "axis {a} 缺 provides 分支");
     }
     assert_eq!(r.provides("no-such-axis"), None);
@@ -548,7 +548,7 @@ fn scan_bad_plugin_is_err_not_skipped() {
     let base = tempfile::tempdir().unwrap();
     let bad = base.path().join(ffi::plugin_file_name("bad"));
     std::fs::write(&bad, b"not a real shared library").unwrap();
-    let err = load_scanned(base.path(), host_context(), &|_| "{}".to_string()).unwrap_err();
+    let err = load_scanned(base.path(), host_context(), &|_, _| "{}".to_string()).unwrap_err();
     // loader 拒绝（分类为 PlatformMismatch 或 DependencyResolution 均可，关键是不静默跳过）。
     assert!(
         matches!(
@@ -637,7 +637,10 @@ fn legacy_plugin_without_axes_symbol_loads_via_fallback() {
     let dir = mini_legacy_plugin_dir();
     let loaded = load_scanned(&dir, host_context(), &no_cfg).expect("legacy scan load");
     assert_eq!(loaded.len(), 1);
-    assert!(loaded[0].registrations.kv.is_some(), "kv via fallback dlsym");
+    assert!(
+        loaded[0].registrations.kv.is_some(),
+        "kv via fallback dlsym"
+    );
 }
 
 /// 泛型轴插件：greet 经自报清单进 generic_axes；不在 9 个类型化轴内 → kv 槽 None。
@@ -854,6 +857,9 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
             desc: RString::from("test plugin"),
         },
         registrations: Registrations::default(),
+        generic_axes: Vec::new(),
+        unknown_axes: Vec::new(),
+        config_key: None,
     };
     let info: PluginInfo = (&loaded).into();
     assert_eq!(info.name, "mini");
@@ -862,6 +868,7 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
     assert_eq!(info.fingerprint, "fp-1");
     assert_eq!(info.description, "test plugin");
     assert_eq!(info.host_abi_version, ABI_VERSION);
+    assert_eq!(info.unknown_axes, Vec::<String>::new());
 }
 
 /// blob 装配期 connect 成功 + 三类失败（同 kv：合一个用例避免并行互踩模式开关）。
