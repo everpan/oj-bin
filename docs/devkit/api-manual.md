@@ -2881,7 +2881,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 - npm 包不可撤回：CI 上 release 草稿期不发 npm（人工核对 release 后幂等补发），
   版本一经发布不可复用——改代码必须递增版本。
 
-### `oj exec` —— 直接执行脚本（v0.1.29；内联代码/REPL v0.1.50）
+### `oj exec` —— 直接执行脚本（v0.1.29；内联代码/REPL v0.1.50；输出通道分离 + 缺省 REPL v0.1.55）
 
 不起 HTTP 服务，直接在一个装配好完整后端的运行时里跑 ts/js 代码：一次性数据
 修复、迁移后对账、定时任务原型、批处理脚本、临时调试求值。后端全局与 handler 同源
@@ -2889,7 +2889,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 `crypto`/`oidc`/`ldap`/`mail`/`mq`），经 `assemble_backend` 装配，db/kv/es/blob/bus/插件
 全部可用。专题手册：仓库 `docs/exec-integration.md`。
 
-三种用法**互斥、必选其一**：
+三种用法互斥（**三者缺省——裸 `oj exec`——v0.1.55 起进 REPL**）：
 
 - **`<file>`**：执行磁盘上的 `.ts`/`.js` 文件（`file + --code` / `file + --repl` 由 clap 报错）。
 - **`-e, --code <code>`**（v0.1.50）：直接执行字符串里的 TypeScript（JS 子集亦合法），不落盘。
@@ -2901,13 +2901,14 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 ./bin/oj exec scripts/fix.ts -c config.yaml -- --dry-run id=7  # -- 后 argv 注入 globalThis.args
 ./bin/oj exec -e 'console.log(await db.query("select 1", []))' -c config.yaml   # 内联代码
 ./bin/oj exec --repl -c config.yaml                                        # 交互式 REPL
+./bin/oj exec -c config.yaml                                              # 裸 exec：缺省进 REPL（v0.1.55）
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `<file>` | 三选一必填 | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1）；与 `--code`/`--repl` 互斥 |
-| `-e, --code` | 三选一必填 | 内联代码（TypeScript 语法）；不落盘、自包含——**不支持相对 import**（无基准目录，合成 `file:///oj-eval.ts` specifier）；与 `<file>`/`--repl` 互斥 |
-| `--repl` | 三选一必填 | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥。真终端下由 **rustyline** 接管原始终端（方向键 / 行内编辑 / ↑↓ 翻历史，不再把 `\x1b[A` 等转义序列回显成乱串）；管道 / 重定向输入走普通回放（CI、测试、文件回放） |
+| `<file>` | 三选一，缺省 REPL | 脚本路径；仅 `.ts`/`.js`，其他扩展名报错退出（exit 1）；与 `--code`/`--repl` 互斥 |
+| `-e, --code` | 三选一，缺省 REPL | 内联代码（TypeScript 语法）；不落盘、自包含——**不支持相对 import**（无基准目录，合成 `file:///oj-eval.ts` specifier）；与 `<file>`/`--repl` 互斥 |
+| `--repl` | 三选一，缺省 REPL | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥。真终端下由 **rustyline** 接管原始终端（方向键 / 行内编辑 / ↑↓ 翻历史，不再把 `\x1b[A` 等转义序列回显成乱串）；管道 / 重定向输入走普通回放（CI、测试、文件回放）。**裸 `oj exec`（无 file/-e/--repl）缺省即进 REPL（v0.1.55）** |
 | `-c` | `config.yaml` | 配置文件路径 |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |
@@ -2938,9 +2939,12 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 - **`json.*`/`finish` 空转**：`json.ok(x)` 不会打印 x（没有 HTTP 消费方）；要输出
   用 `console.log`/`log.*`。
 
-输出语义：`console.*` 与 `log.*` 都直出 stdout（`INFO    消息` 形态，管道友好——
-装配期 tracing 日志只走 stderr）；`--log-file` 时同一事件双写 JSONL。退出码：
-成功 settle 0；脚本未捕获异常 / 加载失败 / 装配失败 → stderr 报错，exit 1。
+输出语义（**v0.1.55 通道分离**：结果走 stdout、诊断走 stderr）：`console.log`/`info`
+**原样** stdout——无级别前缀，管道消费方拿到的就是消息本体（装配期 tracing 日志也只走
+stderr，stdout 保持纯净）；`console.debug`/`warn`/`error` 与 `log.*`（zap 结构化日志，
+含 info 级）走 **stderr**（保留 `INFO    消息` 式级别标签）；`--log-file` 时同一事件
+双写 JSONL（全部级别照旧带级别标签落盘，语义不变）。退出码：成功 settle 0；脚本未捕获
+异常 / 加载失败 / 装配失败 → stderr 报错，exit 1。
 
 相对导入：脚本可 import 项目根（config 所在目录）内的 `.ts`/`.js`，**必须带显式
 扩展名**（`import "./util.ts"`）；`import "../x"` 上跳出项目根即被拒。脚本放项目外
@@ -3190,4 +3194,6 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   `decodeURIComponent`）；它不经守卫、拿不到 `http.user`（页面请求本来也没有 Bearer）。
 - `oj exec` 脚本里 `json.ok(x)` 不打印 x——`json.*`/`finish` 空转（没有 HTTP 消费方）；
   要输出用 `console.log`/`log.*`（`console` 仅 exec 运行时提供，拷进 handler 是
-  `ReferenceError`）。`oj exec` 迁移默认 off（serve dev 缺省 auto，两命令相反）。
+  `ReferenceError`；v0.1.55 起通道分离——`console.log`/`info` 原样 stdout，
+  `console.debug`/`warn`/`error` 与 `log.*` 走 stderr）。`oj exec` 迁移默认 off
+  （serve dev 缺省 auto，两命令相反）。

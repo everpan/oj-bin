@@ -1,6 +1,7 @@
-# oj exec 集成手册（v0.1.29）
+# oj exec 集成手册（v0.1.29；v0.1.55 通道分离 + 缺省 REPL）
 
-`oj exec`（文件 / 内联 / REPL 三种入口，**三选一**，v0.1.50 起后两种可用）：不起 HTTP
+`oj exec`（文件 / 内联 / REPL 三种入口，**三选一**，v0.1.50 起后两种可用；**裸
+`oj exec` 三者缺省 = 进 REPL**，v0.1.55）：不起 HTTP
 服务，直接在一个装配好**完整后端**的运行时里执行 ts/js。面向一次性数据修复、迁移后
 对账、批处理导出、临时求值与调试这类「脚本活」——过去这些要么塞进临时 handler 再
 curl，要么干脆在框架外写个孤儿脚本。
@@ -8,7 +9,9 @@ curl，要么干脆在框架外写个孤儿脚本。
 - 完整后端全局：`json`/`db`/`kv`/`blob`/`bus`/`es`/`fetch`/`ws`/`log`/`plugins`/
   `cert`/`jwt`/`bcrypt`/`crypto`/`oidc`/`ldap`/`mail`/`tasks`/`vars`/`Kafka`/`RabbitMQ`
   （命名 MQ 客户端；无裸 `mq` 全局），与 handler 同源装配。
-- 终端 stdout 直出（`console.*` 与 `log.*`），管道友好；`--log-file` 可选 JSONL 双写。
+- 输出按通道分离（v0.1.55）：`console.log`/`console.info` **原样** stdout（无级别前缀，
+  管道友好）；`console.debug`/`warn`/`error` 与 `log.*` 走 **stderr**（带级别标签）；
+  `--log-file` 可选 JSONL 双写。
 - `--` 之后的 argv 注入 `globalThis.args`；支持项目根内相对导入（显式扩展名）。
 
 快速上手：
@@ -26,11 +29,12 @@ cargo xtask build                                  # 产出 bin/oj
 oj exec <file> [-c config.yaml] [-d dir] [--db name] [--redis/--blob/--es/--broker/--kafka/--rabbit <profile>] [--log-file path] [-- arg...]
 oj exec -e <code> [...]     # 内联代码（v0.1.50）：TS 直执行不落盘；不能含相对 import
 oj exec --repl [...]        # 交互式 REPL（v0.1.50）：rustyline 原始终端；变量不跨行持久（挂 globalThis 可跨）
+oj exec [...]               # 裸 exec（v0.1.55）：三者缺省 = 进 REPL
 ```
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `<file>` / `-e` / `--repl` | 三选一必填 | `<file>`：脚本路径，仅 `.ts`/`.js`，其他扩展名报错退出（exit 1），路径任意。`-e, --code`：内联代码（以 `file:///oj-eval.ts` 合成 specifier，TLA 保真）。`--repl`：逐行求值 |
+| `<file>` / `-e` / `--repl` | 三选一，**缺省进 REPL**（v0.1.55） | `<file>`：脚本路径，仅 `.ts`/`.js`，其他扩展名报错退出（exit 1），路径任意。`-e, --code`：内联代码（以 `file:///oj-eval.ts` 合成 specifier，TLA 保真）。`--repl`：逐行求值 |
 | `-c` | `config.yaml` | 配置文件路径（相对 CWD） |
 | `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
 | `--db` | 无 | 默认库重定向（同 `oj test`）；未声明的库名 fail-fast，不回落 default |
@@ -85,12 +89,19 @@ exec 复用 v0.1.29 从 `App::from_config` 拆出的 `assemble_backend`（db/kv/
 
 ## 4. 输出与退出码
 
-输出通道（`oj/src/exec_ext.rs`）：
+输出通道（`oj/src/exec_ext.rs`，v0.1.55 起按通道分离——结果走 stdout、诊断走 stderr）：
 
-- `console.*` 与 `log.*` 都经 `op_exec_log` 到 Rust sink：终端行 `{LEVEL:<5}  {msg}`
-  直出 stdout（级别列对齐，msg 内换行原样保留；console 多参 `join(" ")`，字符串裸出）。
-- `--log-file` 时同一事件追加一行 JSONL；文件写入失败 warn-once 后放弃落盘，不影响终端。
-- 装配期 Rust tracing 日志只走 stderr——**stdout 里只有脚本输出**，管道/重定向干净：
+- `console.log` / `console.info`（level 1）→ **stdout 原样**：无级别前缀，msg 内换行
+  原样保留（console 多参 `join(" ")`，字符串裸出）——管道消费方拿到的就是消息本体。
+- `console.debug` / `console.warn` / `console.error` → **stderr**，保留级别标签
+  `{LEVEL:<5}  {msg}`（级别列对齐）。
+- `log.*`（zap 结构化日志）→ **一律 stderr 带级别标签**（含 info 级；JS 侧经新增显式
+  op `op_exec_log_err` 与 console 通道分离）——它是日志不是结果，若跟随 level 1 进
+  stdout 会把字段 JSON 混进管道输出。
+- `--log-file` 时同一事件追加一行 JSONL（**全部级别含 console.log 都照旧带级别标签
+  落盘，语义不变**）；文件写入失败 warn-once 后放弃落盘，不影响终端。
+- 装配期 Rust tracing 日志只走 stderr——**stdout 里只有脚本 `console.log`/`info` 的
+  原样输出**，管道/重定向干净：
 
 ```bash
 ./bin/oj exec scripts/dump.ts -c config.yaml | jq .        # stdout 纯净可管道
@@ -103,7 +114,7 @@ exec 复用 v0.1.29 从 `App::from_config` 拆出的 `assemble_backend`（db/kv/
 | 脚本不存在 / 非 .ts/.js | stderr `exec: 仅支持 .ts/.js: <path>` | 1 |
 | 脚本加载 / 顶层求值异常 | stderr 打印 V8 异常 + 堆栈（不吞、不改写） | 1 |
 | `--log-file` 打开/写入失败 | stderr warn 一次，终端照出，继续 | — |
-| 成功 settle | 静默（输出仅来自脚本打印） | 0 |
+| 成功 settle | 静默（stdout 仅来自脚本 console.log/info 原样打印） | 0 |
 
 ## 5. 模块导入与 TS
 
@@ -154,10 +165,14 @@ console.log(`done, ${rows.length} rows`);             // stdout 直出
 
 ## 8. 测试覆盖（仓库内）
 
-- 单测/集成：`oj/src/exec_cmd.rs`（6 例——JSONL 双写、非空 argv 注入、相对 import
-  链、TLA settle、顶层 throw、装配 fail-fast）+ `oj/src/exec_ext.rs` + `oj/src/args.rs`。
+- 单测/集成：`oj/src/exec_cmd.rs`（JSONL 双写、非空 argv 注入、相对 import
+  链、TLA settle、顶层 throw、装配 fail-fast、REPL 管道喂行）+ `oj/src/exec_ext.rs`
+  （终端行路由纯函数：level 1 → stdout 原样、0/2/3 → stderr 带标签、log.* 恒 stderr、
+  JSONL 回归）+ `oj/src/args.rs`（裸 exec 解析不报错）。
 - e2e：`oj/tests/e2e.rs::given_exec_script_when_console_then_stdout_direct_and_exit_codes`
-  （子进程断言 stdout 直出、stdout 无 tracing、throw → exit 1 + V8 异常透传）。
+  （子进程断言 stdout 原样无前缀、console.error/log.* 落 stderr、stdout 无 tracing、
+  throw → exit 1 + V8 异常透传）+ `given_bare_exec_when_no_src_then_defaults_to_repl`
+  （裸 exec 缺省进 REPL：stdin 管道喂行求值，EOF 退出 0）。
 - 装配回归：`cargo test --release --workspace`（`assemble_backend` 拆分行为不变证据）。
 
 ## 9. 相关文档

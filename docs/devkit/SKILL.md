@@ -170,6 +170,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `vars.get("X")` 恒 `null` | 只有写进 config 顶层 `vars:` 段的键可读（fail-closed；平台**不**读 OS env，也没有读任意 config 键的口子）。值只能是标量（`PORT: 3000` 读成 `"3000"`，嵌套 map/list 是配置错误） |
 | `oj test` 读到/写坏了开发库数据 | 未声明 `db.test`（或未给 `--db <name>`）——`oj test` 默认落 `db.test`，启动日志打印 `oj test: using db "..."`；测公开面 handler 要加 `--anonymous` |
 | `oj exec` 脚本输出没看到 | `json.ok(x)` 空转（无 HTTP 消费方）——输出用 `console.log`/`log.*`；但 `console` 仅 exec 可用，同一脚本拷进 handler 是 `ReferenceError` |
+| `oj exec` 管道里拿到 `INFO` 前缀 / `log.*` 字段混进结果 | v0.1.55 起通道分离：`console.log`/`info` **原样** stdout（无前缀）；`console.debug`/`warn`/`error` 与 `log.*`（含 info 级）走 **stderr** 带级别标签——管道只收 `console.log` 本体；`--log-file` JSONL 语义不变 |
 | `oj exec` 的 `-- -x` 被 clap 拒 / 脚本里 `args` 是空数组 | 透传参数必须放在 `--` **之后**（`oj exec s.ts -c config.yaml -- --dry-run`），经 `globalThis.args: string[]` 注入；`--` 前的都归 CLI 自己 |
 | `oj exec` import 报 escapes project root / 找不到 `./util` | 相对导入钳制在项目根（config 所在目录）内且**必须显式扩展名**（`import "./util.ts"`）；脚本放项目外连 `./util.ts` 都导不了 |
 | `oj exec -e/--code` / `--repl` 里 `import "./util"` 报找不到 | 内联代码与 REPL 行**无基准目录**，不支持相对 import——要复用抽出的模块请改走 `oj exec <file>` |
