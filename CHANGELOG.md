@@ -16,7 +16,45 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.54（未打标签）
+
+**feat（插件体系）**：插件轴清单自报 + 泛型轴通道（新轴零宿主改动）+ 插件自报配置键 + `oj info` CLI / JS `ojInfo()`。
+
+### 插件作者向
+
+- **轴清单自报（`oj_plugin_axes()`）**：入口宏 `oj_plugin_entry!` 现在双发——除既有的
+  per-axis `oj_plugin_axis_<name>` 符号外，新增 `oj_plugin_axes()` 返回
+  `RVec<AxisDecl>`（轴名 + kind + vtable）。宿主探测**自报清单优先**，清单缺失才回落
+  逐轴 dlsym（打 deprecated 告警）。**旧插件（无新符号）无需重编即可继续加载**；
+  但重编后须与宿主同批发布（`cargo xtask build` 联编），别混跑版本。
+- **泛型轴通道**：宏新增显式泛型臂 `generic(name) => &VT`（`AxisDecl.kind=GENERIC`）。
+  泛型轴**不占类型化轴槽、不加 `TYPED_AXES`、零 ABI 变更**——新后端轴（如 cache、
+  queue）从此不需要宿主发版。JS 调用面：`axis(name).op(...args)`（args 经 BigInt-safe
+  `ojStringify` 序列化，末位可挂 opts 对象）。**泛型轴名避开 9 个保留名**
+  （es/db/blob/bus/kv/auth/mq/mail/ldap）——旧宿主（无 kind 概念的 pre-kind 宿主）按名
+  cast，撞名会把 `GenericVtable` 误当类型化 vtable。
+- **插件自报配置键**：宏 `config: "key"` 声明后，宿主 cfg 解析增加第 2 级——
+  `plugins:<name>` 非空透传 → 顶层 `<key>` 段（全量 Value，段可选，未配置给 `{}`）→
+  按名遗留臂。未被子报 key 或透传消费的未知顶层段，启动时打 `unconsumed config
+  sections` 诊断（拼写错误 / 插件没装的早期信号），并可在 `oj info` / `ojInfo()` 里查。
+- **开发模板**：新轴范式见 `tools/plugin-template`（命名三方对齐：crate 带 `oj-` 前缀、
+  descriptor 名剥离；`config:` 声明；xtask 联编与独立 cargo 两路径构建；desc 里注明
+  宿主最低版本）。
+
+### 运维向
+
+- **`oj info [-c config.yaml]`** CLI：phpinfo 风格诊断，五段纯文本——build（oj 版本 /
+  profile / host triple / V8 / exe / config 路径）、abi（ABI_VERSION + 宿主指纹）、
+  plugins（每个插件 name/semver/abi/desc + `unknown_axes`）、backends（声明面：db
+  schemes、blob 有无、broker kinds、kv/auth/es/mail/ldap/mq 槽位）、config（段名清单 +
+  unconsumed 段）。**只报声明面**：不 connect 库/broker，config 只出键名不出值。
+- **JS `ojInfo()`**：与 CLI 同一装配体（`assemble_ojinfo` 单一事实源），handler 进程内
+  自省；**无公共 HTTP 端点**（需要时自己包业务路由透出）。config 段同样只出键名。
+- **oj-ldap 迁移泛型轴**（双轨期）：JS 调用面改为 `axis("ldap").bind/search/searchPaged/
+  whoami/compare`（op 集与语义不变，实例选单经末位 opts 的 `key`，缺省 `default`）。
+  宿主类型化 `ldap`/`LDAP` 全局保留，但装配迁移版插件后调用报
+  `ldap not configured`（旧版 typed 插件仍可加载，二者择一）。
+- 同名泛型轴多插件提供 → 装配期 fail-fast（泛型轴每名单提供者）。
 
 **fix（npm 分发）**：主包 `@oj-bin/oj` 此前只靠 `postinstall` 把二进制落盘到
 `<项目根>/bin/`，**未声明 `bin` 字段**，导致 `pnpm dlx @oj-bin/oj` / `npx @oj-bin/oj`
