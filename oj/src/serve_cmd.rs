@@ -570,6 +570,9 @@ pub struct Registries {
     /// → 装配层构造 `FfiLdapBackend`（`app::build_ldap_backend`）；多 ldap 插件注册冲突
     /// fail fast。未加载插件时保持 None（`ldap.*` 报未配置，不降级）。
     pub ldap: Option<&'static oj_plugin_ffi::LdapVtable>,
+    /// 泛型轴（插件自报的非类型化轴，不在 plugin_loader::TYPED_AXES 内）：
+    /// (轴名, 插件名, vtable)；跨插件同名冲突在 build_registries fail fast。
+    pub generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -815,6 +818,21 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         return Err("plugins conflict: multiple plugins register ldap backend".to_string());
     }
     let ldap = ldap_plugins.first().and_then(|p| p.registrations.ldap);
+    // 泛型轴：跨插件轴名冲突 fail-fast（与「不静默跳过」哲学一致）。
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    let mut generic = Vec::new();
+    for p in loaded {
+        for (axis, vt) in &p.generic_axes {
+            if let Some(prev) = seen.insert(axis, &p.descriptor.name[..]) {
+                return Err(format!(
+                    "plugins conflict: generic axis '{axis}' provided by both '{prev}' and '{}' \
+                     (generic axes are single-provider per axis)",
+                    &p.descriptor.name[..]
+                ));
+            }
+            generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
+        }
+    }
     Ok(Registries {
         es,
         dbs,
@@ -825,6 +843,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         mq,
         mail,
         ldap,
+        generic,
     })
 }
 

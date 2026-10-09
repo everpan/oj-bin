@@ -811,6 +811,10 @@ pub async fn assemble_backend(
     // 未声明 → InMemoryKV 内置兜底。
     let kv: Arc<dyn KVStore> = connect_kv(cfg, &registries, redis_key).await?;
     let es: Option<Arc<dyn EsBackend>> = registries.es;
+    // 泛型轴注册表（插件自报的非类型化轴 → bootstrap `axis(name)`）：装配期冻结，
+    // 与 make_bridge 的 Extras.generic_axes / StableState.generic_axes 同源。
+    let generic_axes =
+        only_js::bridge::generic_axis::registry_from(std::mem::take(&mut registries.generic));
     // blob：blob 段存在即启用；未声明 → None。`--blob` 选中的 profile 别名为 "default"。
     let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
         None => None,
@@ -956,6 +960,7 @@ pub async fn assemble_backend(
         // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
         let input_contracts = input_contracts.clone();
         let fs_grant = fs_grant.clone();
+        let generic_axes = generic_axes.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -993,6 +998,8 @@ pub async fn assemble_backend(
                     input_contracts: Some(input_contracts.clone()),
                     // fs 授权（v0.1.53；config fs: 段）：与 StableState.fs 同一 Arc。
                     fs: fs_grant.clone(),
+                    // 泛型轴注册表：与 StableState.generic_axes 同一 Arc。
+                    generic_axes: Some(generic_axes.clone()),
                 },
             )
         }
@@ -1031,6 +1038,7 @@ pub async fn assemble_backend(
         input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。
+        generic_axes,         // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
     });
     Ok(Backend {
         stable,
