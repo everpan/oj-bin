@@ -1186,8 +1186,9 @@ async fn json_redirect_302_location_hypertext_note_end_to_end() {
     let _ = std::fs::remove_dir_all(&t);
 }
 
-/// v0.1.29 exec e2e：脚本 console/log 直出 stdout（管道友好，无 tracing 元数据），
-/// 退出码 0；顶层 throw → 退出码 1 且 stderr 携带 V8 异常消息（spec §3.3/§4）。
+/// v0.1.55 exec e2e（输出通道分离）：console.log/info 原样 stdout（无级别前缀，
+/// 管道友好）；console.warn/error 与 log.* 走 stderr（带级别标签）；退出码 0；
+/// 顶层 throw → 退出码 1 且 stderr 携带 V8 异常消息（spec §3.3/§4）。
 /// 最小 config 即可：exec 跳过证书门禁、不声明 db/kv → 内存兜底（spec §3.1 有意分叉）。
 #[test]
 fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
@@ -1199,7 +1200,7 @@ fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
     let script = tmp.join("hello.ts");
     std::fs::write(
         &script,
-        "console.log(\"hello-stdout\"); log.info(\"via-log\", \"k\", 1);",
+        "console.log(\"hello-stdout\"); console.error(\"err-stderr\"); log.info(\"via-log\", \"k\", 1);",
     )
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
@@ -1217,8 +1218,15 @@ fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("hello-stdout"), "{stdout}");
-    assert!(stdout.contains("via-log"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // stdout 原样：整行 == 消息本体，无级别前缀（双保险）。
+    assert_eq!(stdout.trim(), "hello-stdout", "{stdout}");
+    assert!(!stdout.contains("INFO"), "{stdout}");
+    // console.error / log.* → stderr（带级别标签，诊断不污染管道）。
+    assert!(stderr.contains("err-stderr"), "{stderr}");
+    assert!(stderr.contains("ERROR"), "{stderr}");
+    assert!(stderr.contains("via-log"), "{stderr}");
+    assert!(stderr.contains("INFO"), "{stderr}");
     // 管道友好：tracing 装配日志不进 stdout（只走 stderr）。
     assert!(!stdout.contains("oj::"), "{stdout}");
 
@@ -1242,6 +1250,43 @@ fn given_exec_script_when_console_then_stdout_direct_and_exit_codes() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("exec-e2e-boom"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// v0.1.55 裸 exec e2e：无 file/-e/--repl 时缺省进 REPL——stdin 管道喂一行后
+/// 关闭（EOF 退出），退出码 0，stdout 原样携带脚本打印（同时钉死通道分离）。
+#[test]
+fn given_bare_exec_when_no_src_then_defaults_to_repl() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-exec-repl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("config.yaml"), "{}\n").unwrap();
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args(["exec", "-c", &tmp.join("config.yaml").display().to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oj exec repl child");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"console.log('repl-e2e');\n")
+        .unwrap();
+    let out = child.wait_with_output().expect("wait oj exec repl child");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("REPL"), "{stdout}");
+    assert!(stdout.lines().any(|l| l.trim() == "repl-e2e"), "{stdout}");
+    assert!(!stdout.contains("INFO"), "{stdout}");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

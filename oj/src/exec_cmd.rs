@@ -5,7 +5,8 @@
 //! （ws 在前：bootstrap.js 静态 import 依赖；exec_ext 最后：覆盖 log 依赖
 //! bridge bootstrap 先跑）。
 //!
-//! 三种入口（互斥）：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式 REPL）。
+//! 三种入口（互斥）：`file`（执行文件）/ `-e,--code`（内联代码）/ `--repl`（交互式
+//! REPL）；三者缺省（裸 `oj exec`，v0.1.55）= 进 REPL。
 
 use std::io::{BufRead, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use crate::args::ExecArgs;
 use crate::exec_ext::{ExecOptions, oj_exec_ext_init};
 use crate::serve_cmd::load_app_config;
 
-/// exec 执行目标：文件 / 内联代码 / 交互式 REPL（三者互斥、必选其一）。
+/// exec 执行目标：文件 / 内联代码 / 交互式 REPL（三者互斥；缺省 = REPL）。
 pub(crate) enum ExecTarget {
     File(PathBuf),
     Code(String),
@@ -48,7 +49,8 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
             }
         }
         (None, Some(code), false) => ExecTarget::Code(code.clone()),
-        (None, None, false) => return Err("exec: 需提供 <file> / --code / --repl 之一".into()),
+        // 三者缺省（裸 `oj exec`）= REPL（v0.1.55，替代原报错）。
+        (None, None, false) => ExecTarget::Repl,
     };
     let (cfg, top, config_dir, dir, _ts, base) =
         load_app_config(&a.config, a.dir.as_deref(), None)?;
