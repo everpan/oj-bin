@@ -34,6 +34,76 @@
 
 已随发行包发布（较早合入）。
 
+## 案例
+
+### 商品图上传后返回预签名下载地址
+
+```ts
+// src/product/image/api.ts —— multipart 上传商品图 → 存 S3 → 回预签名 URL
+async function post() {
+  const f = http.files[0];                  // {field, filename, content_type, size, ...}
+  if (!f) { json.fail(400, "need a file (multipart)"); return; }
+  const safe = f.filename.replace(/[^\w.-]+/g, "_");
+  const key = `products/${http.param("id", "0")}/${Date.now()}-${safe}`;
+  await blob.put(key, await http.file(0), f.content_type);
+  json.ok({ key, url: await blob.url(key) });  // url = 15min 预签名下载地址
+}
+export default { post };
+```
+
+```bash
+curl -F "img=@cover.png" http://localhost:9778/v1/api/product/image/?id=42
+# → {"code":0,"data":{"key":"products/42/...-cover.png","url":"https://s3.../...?X-Amz-Signature=..."}}
+```
+
+### 大视频客户端直传 S3（绕开请求体上限与 30s 超时）
+
+```ts
+// src/media/ticket/api.ts —— 发直传票：客户端拿预签名 PUT URL 自行上传
+async function post() {
+  const b = http.body as { filename?: string };
+  const safe = (b?.filename ?? "video.mp4").replace(/[^\w.-]+/g, "_");
+  const key = `media/${Date.now()}-${safe}`;
+  const { url } = await blob.uploadUrl(key);  // 15min 预签名 PUT
+  json.ok({ key, url });
+}
+export default { post };
+```
+
+```bash
+# ① 拿票；② 客户端直传（不经 oj）
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"filename":"a.mp4"}' http://localhost:9778/v1/api/media/ticket/
+curl -T a.mp4 "<返回的 url>"
+# 下载走内置公开路由：GET /v1/api/blob/<key> → 302 跳预签名 URL
+```
+
+### 流式落盘的临时对象服务端转正（字节不进 V8）
+
+```ts
+// src/docs/commit/api.ts —— 大附件先被服务端流式落 S3，审核通过后 move 到正式目录
+async function post() {
+  const b = http.body as { key?: string; docId?: string };
+  if (!b?.key || !b?.docId) { json.fail(400, "need key & docId"); return; }
+  const dst = `docs/${b.docId}/${b.key.split("/").pop()}`;
+  await blob.move(b.key, dst);   // s3 = CopyObject + DeleteObject，2 次服务端调用
+  json.ok({ key: dst });
+}
+export default { post };
+```
+
+```yaml
+# config.yaml —— 三个案例共用；MinIO / 自建端点切 path_style
+blob:
+  driver: s3
+  endpoint: http://minio:9000
+  bucket: my-app
+  region: cn-north-1
+  access_key: ENC[...]     # oj secret seal 生成；缺省 = 匿名
+  secret_key: ENC[...]
+  path_style: true
+```
+
 ## 备注
 
 - 与 `oj-kv-redis` 等服务不同：blob 插件的 `init` 无装配期配置，后端配置在 `connect` 时按值传入。

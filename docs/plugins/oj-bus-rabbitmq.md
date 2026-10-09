@@ -35,6 +35,81 @@ mq 面的 `poll` 收 `queues` / `max` / `timeoutMs`；`send` 走 `exchange` / `r
 
 已随发行包发布（较早合入）。
 
+## 案例
+
+### bus 面：工单状态变更实时推给坐席台
+
+```ts
+// src/ticket/status/api.ts —— 状态流转 → bus.publish 扇出（topic_prefix 默认 oj-bus）
+async function post() {
+  const b = http.body as { id?: string; status?: string };
+  if (!b?.id || !b?.status) { json.fail(400, "need id & status"); return; }
+  const n = await bus.publish("ticket.status", { id: b.id, status: b.status });
+  json.ok({ receivers: n });
+}
+export default { post };
+```
+
+```ts
+// src/ticket/status/ws.ts —— 坐席台连接即订阅；断开自动清除
+export default {
+  connection() {
+    bus.subscribe("ticket.status");
+    json.ok({ subscribed: true });
+  },
+};
+```
+
+```yaml
+# config.yaml —— broker 命名 map（v0.1.34）；bus 面共享这份连接
+broker:
+  default:
+    kind: rabbit
+    url: "amqp://guest:guest@127.0.0.1:5672"
+```
+
+```bash
+# WS 先连 /v1/api/ticket/status/ws，然后：
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"id":"T-77","status":"resolved"}' http://localhost:9778/v1/api/ticket/status/
+# WS 侧收到 Text 帧 {"topic":"ticket.status","data":{"id":"T-77","status":"resolved"}}
+```
+
+### mq 面：短信发送队列逐条消费（ack / 失败 nack 重投）
+
+```ts
+// src/tasks/task_sms.ts —— basic.get 拉取 → 成功 ack → 失败 nack 回队列（仅任务上下文可用）
+export {};
+const r = RabbitMQ("default");
+while (!tasks.stopping()) {
+  const { messages } = await r.poll(["sms.outbox"], { max: 10, timeoutMs: 1000 });
+  for (const m of messages) {
+    try {
+      const resp = await fetch("https://sms.example.com/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: m.value.to, text: m.value.text }),
+      });
+      if (!resp.ok) throw new Error("sms gateway " + resp.status);
+      await r.ack(m);
+    } catch (e) {
+      await r.nack(m, true);   // requeue：交回 broker 重投，at-least-once
+      log.warn("sms send failed, requeued: " + e);
+    }
+  }
+}
+```
+
+```yaml
+# config.yaml —— mq 面走独立的 rabbits: 命名段（值透传本插件）
+rabbits:
+  default:
+    url: "amqp://guest:guest@127.0.0.1:5672"
+```
+
+注意：未确认投递的 acker 随实例 `close` drop，由 broker 重投——处理逻辑必须幂等；
+`timeoutMs` 要显著小于 `tasks.stop_grace_secs`（默认 30s），避免停机被看门狗强杀。
+
 ## 备注
 
 - 双轴插件：`bus` push 扇出、`mq` pull 消费共用 `RabbitCore`。

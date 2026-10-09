@@ -42,6 +42,129 @@
 
 首版可用（`docs/mail-smtp.md` 记 v0.1.19 起）；随发行包发布。
 
+## 案例
+
+### 注册后发欢迎邮件（同步投递）
+
+```yaml
+# config.yaml —— smtp: 段存在即启用 mail；每个非全局键是一个 profile
+smtp:
+  default:
+    host: smtp.example.com
+    port: 465
+    tls: tls                 # tls（隐式 465）| starttls | none（须 allow_none_tls: true）
+    mechanism: login
+    user: api@example.com
+    pass: "ENC[...]"
+    allowed_from: ["noreply@x.com"]            # 白名单 fail-closed：空表 = 全拒
+    allowed_recipients: ["@x.com", "@partner.com"]
+```
+
+```ts
+// src/user/register/api.ts —— 注册成功后发欢迎信
+async function post() {
+  const { email, name } = http.body || {};
+  if (!email) { json.fail(400, "email required"); return; }
+  // …（建账号落库略）
+  const r = await mail.send({   // mail === new Mail("default")
+    from: "noreply@x.com",      // 须命中 allowed_from
+    to: [String(email)],        // 须命中 allowed_recipients
+    subject: "欢迎注册",
+    text: `${name ?? ""}，欢迎加入！`,
+  });
+  if (r.code !== 0) {           // 信封模型：失败也是 resolve，不抛；不得按 code 自动重试
+    json.fail(r.code, r.msg);
+    return;
+  }
+  json.ok({ messageId: r.data.messageId });
+}
+export default { post };
+```
+
+```bash
+curl -s -X POST http://localhost:9778/v1/api/user/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"a@x.com","name":"Ada"}'
+# → {"code":0,"data":{"messageId":"<…@x.com>"}}
+```
+
+### 批量通知走队列，结果异步回查
+
+大批量通知用 `enqueue` 入队即回（`{jobId}`），真实完成经 `mail.result(jobId)`
+或 bus topic `mail.result` 上送：
+
+```ts
+// src/notify/batch/api.ts —— 批量入队，立即返回 jobId 清单
+async function post() {
+  const { recipients } = http.body || {};
+  if (!Array.isArray(recipients) || !recipients.length) {
+    json.fail(400, "recipients required");
+    return;
+  }
+  const jobs = [];
+  for (const addr of recipients) {
+    const r = await mail.enqueue({
+      from: "noreply@x.com",
+      to: [String(addr)],
+      subject: "系统维护通知",
+      text: "本周六 02:00-04:00 停机维护。",
+    });
+    if (r.code !== 0) { json.fail(r.code, r.msg); return; }
+    jobs.push({ to: addr, jobId: r.data.jobId });   // jobId 由宿主生成
+  }
+  json.ok({ queued: jobs.length, jobs });
+}
+export default { post };
+```
+
+```ts
+// src/notify/status/api.ts —— 事后按 jobId 查投递结果
+async function get() {
+  const jobId = String(http.query.jobId ?? "");
+  const res = await mail.result(jobId);   // 未命中/过期/非本归属 → null
+  if (!res) { json.fail(404, "job not found or expired"); return; }
+  json.ok(res);   // {jobId, code, msg, messageId?}（扁平结果，不含收件人/主题）
+}
+export default { get };
+```
+
+### 本地开发用 file_transport 落盘调试
+
+不发网络、写 `.eml` 到目录，联调模板/白名单足够：
+
+```yaml
+smtp:
+  mock:
+    host: localhost            # file_transport 也须写全 host/port/tls/mechanism（schema 必填）
+    port: 25
+    tls: none
+    allow_none_tls: true
+    mechanism: login
+    file_transport: "/tmp/oj-mail-eml"   # 目录须先存在（lettre 不建目录）
+    allowed_from: ["noreply@x.com"]
+    allowed_recipients: ["@x.com"]
+```
+
+```ts
+// src/dev/mailtest/api.ts —— 打 mock profile，不发网络
+async function post() {
+  const r = await new Mail("mock").send({
+    from: "noreply@x.com",
+    to: ["a@x.com"],
+    subject: "模板自测",
+    html: "<h1>hello</h1>",
+  });
+  if (r.code !== 0) { json.fail(r.code, r.msg); return; }
+  json.ok({ eml: r.data.messageId });   // FileTransport 下为落盘 .eml 文件名主干
+}
+export default { post };
+```
+
+```bash
+curl -s -X POST http://localhost:9778/v1/api/dev/mailtest/
+ls /tmp/oj-mail-eml/   # 查看落盘的 .eml
+```
+
 ## 备注
 
 - 新增 `mail` 轴**零 ABI 变更**：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`，既有插件无需重编。
