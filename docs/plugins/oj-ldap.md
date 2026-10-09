@@ -33,6 +33,106 @@
 
 首版可用（`docs/ldap-integration.md` 记 v0.1.28 起）；随发行包发布。
 
+## 案例
+
+### 用 AD / OpenLDAP 账号登录（search 找 DN + bind 鉴证）
+
+```yaml
+# config.yaml —— ldap: 段存在即启用 ldap；每个顶层键 = 一个实例
+ldap:
+  default:
+    url: ldaps://dc.example.com:636          # ldap://（明文）或 ldaps://（隐式 TLS）
+    bind_dn: cn=svc,ou=app,dc=example,dc=com # 服务账号：search/whoami/compare 前置绑定
+    bind_pw: "ENC[...]"                      # 凭据只在 config → 插件，不进 JS
+    timeout_ms: 5000
+```
+
+```ts
+// src/ldap_auth/login/api.ts —— 目录账号登录：先按 uid 找 DN，再用用户密码 bind
+// filter 是原始 RFC 4515 字符串、无参数绑定，用户输入必须先转义
+function esc(s: string): string {
+  return s.replace(/[\0*()\\]/g, (c) =>
+    "\\" + c.charCodeAt(0).toString(16).padStart(2, "0"));
+}
+
+async function post() {
+  const { username, password } = http.body || {};
+  if (!username || !password) { json.fail(400, "username/password required"); return; }
+  const found = await ldap.search("ou=users,dc=example,dc=com", {
+    filter: `(uid=${esc(String(username))})`,
+    attrs: ["uid", "displayName"],
+  });
+  if (found.length !== 1) { json.fail(401, "invalid credentials"); return; }
+  // bind 的「凭据被拒」正常返回 false（不抛）；连接/协议错才抛异常
+  const ok = await ldap.bind(found[0].dn, String(password));
+  if (!ok) { json.fail(401, "invalid credentials"); return; }
+  json.ok({
+    access_token: await jwt.sign({ sub: found[0].attrs.uid[0] }),
+    name: found[0].attrs.displayName?.[0],
+  });
+}
+export default { post };
+```
+
+```bash
+curl -s -X POST http://localhost:9778/v1/api/ldap_auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"ada","password":"s3cret"}'
+# → {"code":0,"data":{"access_token":"<jwt>","name":"Ada Lovelace"}}
+```
+
+签发 JWT 需另配 `auth:` 段（oj-auth 插件）；本路由自身也要进 `auth.anonymous_paths`。
+
+### 通讯录模糊查询（searchPaged 聚合大结果集）
+
+```ts
+// src/directory/search/api.ts —— 按姓名关键字查员工目录
+function esc(s: string): string {
+  return s.replace(/[\0*()\\]/g, (c) =>
+    "\\" + c.charCodeAt(0).toString(16).padStart(2, "0"));
+}
+
+async function get() {
+  const kw = String(http.query.kw ?? "");
+  if (!kw) { json.fail(400, "kw required"); return; }
+  // 大结果集用 searchPaged（RFC 2696 分页聚合，pageSize 默认 500）
+  const entries = await ldap.searchPaged("ou=users,dc=example,dc=com", {
+    filter: `(displayName=*${esc(kw)}*)`,
+    attrs: ["uid", "displayName", "mail", "department"],
+  });
+  json.ok(entries.map((e) => ({
+    uid: e.attrs.uid?.[0],
+    name: e.attrs.displayName?.[0],
+    mail: e.attrs.mail?.[0],
+    dept: e.attrs.department?.[0],
+  })));
+}
+export default { get };
+```
+
+```bash
+curl -s 'http://localhost:9778/v1/api/directory/search/?kw=ada' \
+  -H "Authorization: Bearer $TOKEN"
+# → {"code":0,"data":[{"uid":"ada","name":"Ada Lovelace","mail":"ada@example.com", …}]}
+```
+
+### 组成员判定用 compare 收口（不读整条目）
+
+判定「某用户是否在某组」不必 search 整条目再本地比对，`compare` 是值传输，
+天然无 filter 注入面：
+
+```ts
+// src/directory/in_group/api.ts —— 校验用户是否属于指定组
+async function get() {
+  const userDn = String(http.query.user_dn ?? "");
+  const groupDn = String(http.query.group_dn ?? "cn=admins,ou=groups,dc=example,dc=com");
+  if (!userDn) { json.fail(400, "user_dn required"); return; }
+  const member = await ldap.compare(groupDn, "member", userDn);
+  json.ok({ member });
+}
+export default { get };
+```
+
 ## 备注
 
 - 新增 `ldap` 轴**零 ABI 变更**：`AXES` 加 `"ldap"` 不 bump `ABI_VERSION`，既有插件无需重编。

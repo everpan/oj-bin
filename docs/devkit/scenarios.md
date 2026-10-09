@@ -1746,5 +1746,5 @@ cat data/exports/note.txt                                   # jail 根下真实�
 | 想读写 jail 外的系统路径 | 不支持：jail 是安全边界。确需访问请把目录挂进 root（symlink 到外部会被 canonicalize 判越界，勿用） |
 
 多文件批量上传（multipart 同名字段重复/多字段名混合）照抄见
-`docs/plugins/fs.md`「multipart 多文件批量上传落盘」——循环 `http.files` +
+`docs/api/19-fs.md`「multipart 多文件批量上传落盘」——循环 `http.files` +
 `await http.file(i)` 逐个落盘，文件名先白名单化。
