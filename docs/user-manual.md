@@ -75,7 +75,9 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 | `--daemon` | 关 | （server）后台运行：脱离终端（unix setsid / windows DETACHED_PROCESS），stdio 重定向空设备，父进程打印子 pid 后退出；日志照常落 `server.logs_dir`，停机用 `kill <pid>`（SIGTERM 走正常停机流程） |
 
 - `oj exec`（v0.1.29）：直接执行一个 ts/js 脚本，注入完整后端全局（db/kv/blob/bus/es/
-  插件等与 handler 同源），`console.*`/`log.*` 直出 stdout，`--log-file` 可选 JSONL 双写。
+  插件等与 handler 同源），输出按通道分离（v0.1.55）：`console.log`/`info` 原样 stdout
+  （无级别前缀，管道友好），`console.debug`/`warn`/`error` 与 `log.*` 走 stderr（带级别
+  标签），`--log-file` 可选 JSONL 双写。裸 `oj exec`（无 file/-e/--repl）缺省进 REPL。
   一次性数据修复/对账/批处理/任务原型用。**与 server 的装配差异**：无证书门禁、
   迁移默认 off（server dev 缺省 auto——两命令相反）、无请求超时（同步死循环 Ctrl-C
   兜底）、`sql_guard: "deny"` 库上须 `db.asSystem()`、`console` 仅 exec 可用、

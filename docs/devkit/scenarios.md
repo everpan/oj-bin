@@ -19,7 +19,7 @@
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
 | [11](#场景-11ldapad-登录鉴证v0128v0154-起调用面迁移-axisldap) | LDAP/AD 登录鉴证或目录查询（v0.1.54 起 `axis("ldap").bind/search/...`，filter 用户输入须转义，v0.1.28） | §6 ldap / §8 鉴权 |
-| [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + stdout 直出（v0.1.29） | §11 `oj exec` |
+| [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + 输出通道分离（console.log 原样 stdout，v0.1.29/v0.1.55） | §11 `oj exec` |
 | [13](#场景-13大文件直传绕开-10mb30s-v0130) | office 大附件 >10MB / 上传+处理超 30s：`blob.uploadUrl` 预签名（s3）或 `PUT {base}/blob/{key}` 直传路由（local）（v0.1.30） | §6 blob |
 | [14](#场景-14浏览器登录cookie-会话--csrf-v0130) | 浏览器表单登录：HttpOnly `oj_sess` + CSRF 双提交；WS 握手同守卫（v0.1.30） | §8 鉴权 |
 | [15](#场景-15ws-房间广播presence-v0130) | 同房间成员互发消息/在线人数：`ws.join` / `ws.broadcast` / `ws.roomSize`（v0.1.30） | §6 ws |
@@ -944,10 +944,11 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 
 ```bash
 ./bin/oj exec scripts/fix-roles.ts -c config.yaml -- --dry-run   # 先对账（args 含 --dry-run）
-# → INFO    待修复 2 条
-# → INFO      fix 1 neo …
+# → 待修复 2 条          （console.log 原样 stdout，无级别前缀——v0.1.55 通道分离）
+# →   fix 1 neo …
 ./bin/oj exec scripts/fix-roles.ts -c config.yaml --log-file fix.jsonl   # 真跑 + JSONL 落盘
 # 退出码 0 = settle 无异常；脚本 throw → stderr 报 V8 异常，exit 1
+# （脚本里的 log.info("done", …) 走 stderr 带 INFO 标签——日志不混进 stdout 管道）
 ```
 
 ### ④ 轻量入口：内联代码与 REPL（v0.1.50）
@@ -962,6 +963,8 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 # 交互式 REPL：逐行输入，Ctrl-D / Ctrl-C 退出；顶层绑定不跨行持久，跨行共享须 globalThis.x = …
 # 真终端下由 rustyline 接管（方向键 / 行内编辑 / ↑↓ 翻历史，不再回显乱串）；管道输入走普通回放。
 ./bin/oj exec --repl -c config.yaml
+# 裸 exec（v0.1.55）：无 file / -e / --repl 时缺省进 REPL，与 --repl 等价。
+./bin/oj exec -c config.yaml
 # oj> console.log(await db.query("select 1", []))
 ```
 

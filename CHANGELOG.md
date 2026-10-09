@@ -16,6 +16,21 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.55（未打标签）
+
+**feat（exec）**：`oj exec` 输出通道分离（管道友好）+ 裸 `oj exec` 缺省进 REPL。
+
+- **输出通道分离**：`console.log`/`console.info` **原样**输出 stdout——不再带 `INFO`
+  级别前缀（此前 `INFO   hello` 形态污染管道消费方），msg 内换行原样保留；
+  `console.debug`/`console.warn`/`console.error` 与 `log.*`（zap 结构化日志，**含 info
+  级**）一律走 **stderr** 并保留 `{LEVEL:<5}  ` 级别标签——诊断走日志通道（Unix 约定），
+  不混进管道结果。`--log-file` JSONL 语义不变：全部级别照旧带级别标签落盘。实现上
+  JS 侧 `log.*` 改走新增的显式 op `op_exec_log_err`（与 console 通道分离，不用 level
+  魔数位编码）。
+- **裸 `oj exec` 缺省进 REPL**：无 `<file>` / `-e` / `--repl` 时不再报错
+  「需提供 <file> / --code / --repl 之一」，缺省进入交互式 REPL（真终端 rustyline，
+  管道/重定向输入走普通回放）；`--repl` 与其他入口的互斥报错保持不变。
+
 ## v0.1.54（未打标签）
 
 **feat（插件体系）**：插件轴清单自报 + 泛型轴通道（新轴零宿主改动）+ 插件自报配置键 + `oj info` CLI / JS `ojInfo()`。
