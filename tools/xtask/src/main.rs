@@ -18,7 +18,7 @@
 //! --check 在本子进程跑，PluginLoader 的 forget 语义无碍（进程退出即回收）；
 //! 复用 Task 3.2 同一加载入口保证预检与真实装配一致。
 
-use only_js::bridge::plugin_loader::{AXES, PluginManifestEntry, host_context, load_manifest};
+use only_js::bridge::plugin_loader::{PluginManifestEntry, host_context, load_manifest};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -240,8 +240,8 @@ fn check(name: &str) -> Result<(), String> {
     let host = host_context();
     // 预检只验证可加载性（ABI/身份/semver/按轴符号探测）：需要装配期 cfg 的插件给占位值，
     // 真实 cfg 由服务器装配层注入（serve_cmd::plugin_cfg）。
-    let cfg_for = |name: &str| -> String {
-        match name {
+    let cfg_for = |_name: &str, _config_key: Option<&str>| -> String {
+        match _name {
             "auth" => r#"{"jwt_secret":"precheck"}"#.to_string(),
             _ => "{}".to_string(),
         }
@@ -250,15 +250,18 @@ fn check(name: &str) -> Result<(), String> {
         .map_err(|e| format!("precheck failed: {e}"))?;
     let p = &loaded[0];
     let d = &p.descriptor;
-    // registrations 由加载期 AXES 逐轴 dlsym 探测填充（plugin_loader::probe_axes），
-    // 此处只按 AXES 顺序汇总为可读清单。轴→槽位映射归 plugin_loader::Registrations::provides
-    // （单一事实源，不再在本 crate 复制一份）；缺分支 → 普通 Err，不 panic。
-    let mut provided: Vec<&str> = Vec::with_capacity(AXES.len());
-    for a in AXES {
+    // 类型化轴渲染表：与 plugin_loader::TYPED_AXES（pub(crate)）对账——加轴漏改此处
+    // → 预检渲染缺轴（可读报错面），plugin_loader 测试 `given_axes_table_when_provides_*`
+    // 钉 TYPED_AXES 与 provides 同步。
+    const PRECHECK_AXES: &[&str] = &[
+        "es", "db", "blob", "bus", "kv", "auth", "mq", "mail", "ldap",
+    ];
+    let mut provided: Vec<&str> = Vec::with_capacity(PRECHECK_AXES.len());
+    for a in PRECHECK_AXES {
         let present = p
             .registrations
             .provides(a)
-            .ok_or_else(|| format!("AXES 与 provides 判定不同步，请同步：未知轴 '{a}'"))?;
+            .ok_or_else(|| format!("PRECHECK_AXES 与 provides 判定不同步，请同步：未知轴 '{a}'"))?;
         if present {
             provided.push(a);
         }

@@ -832,7 +832,9 @@ pub async fn assemble_plugins(
         .map_err(|e| format!("plugins dir: {e}"))?;
     let host = host_context();
     // es_profile 已预校验存在，其余分支不返回 Err，故可安全解包。
-    let cfg_for = |name: &str| -> String {
+    // config_key（插件声明的顶层 cfg 段键，oj_plugin_config_key）在 T4 接通前先忽略：
+    // 当前解析序仍只按插件名查 plugins:<name> 与遗留映射。
+    let cfg_for = |name: &str, _config_key: Option<&str>| -> String {
         plugin_cfg(cfg, name, es_profile).unwrap_or_else(|e| panic!("plugin_cfg: {e}"))
     };
     let loaded = match dir {
@@ -1129,13 +1131,12 @@ mod tests {
     }
 
     /// 适配器轴必须是宿主探测轴的子集（两表失步 = 适配器永远打空）。
+    /// TYPED_AXES 已降级 pub(crate)，此处经公共 `Registrations::provides` 判定「宿主认识该轴」。
     #[test]
     fn cfg_adapters_subset_of_probed_axes() {
+        let r = only_js::bridge::plugin_loader::Registrations::default();
         for name in ADAPTER_AXES {
-            assert!(
-                only_js::bridge::plugin_loader::AXES.contains(name),
-                "{name}"
-            );
+            assert!(r.provides(name).is_some(), "{name}");
         }
     }
 
