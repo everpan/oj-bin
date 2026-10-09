@@ -2,7 +2,9 @@
 //! 约定：ABI_VERSION 严格相等是唯一硬门禁；构建指纹不符仅告警（eprintln）。
 
 use super::ffi;
-use oj_plugin_ffi::{ABI_VERSION, HOST_FINGERPRINT, HostContext, PluginDescriptor, RArc, RString};
+use oj_plugin_ffi::{
+    ABI_VERSION, AXIS_KIND_GENERIC, HOST_FINGERPRINT, HostContext, PluginDescriptor, RArc, RString,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
@@ -496,7 +498,9 @@ unsafe fn probe_axes(
     (r, Vec::new(), Vec::new())
 }
 
-/// 自报清单分类：TYPED_AXES 名填 typed 槽（vtable 按对应类型转型），其余名进泛型轴。
+/// 自报清单分类：按 kind 路由——TYPED 且名在 TYPED_AXES 填 typed 槽；
+/// TYPED 且名不在 → unknown_axes（警告，fail-fast 由装配层按既有惯例）；
+/// GENERIC → 泛型轴（同名冲突检查不变，仍在装配层）。
 fn classify_axes<'a>(
     plugin_name: &str,
     decls: impl Iterator<Item = &'a oj_plugin_ffi::AxisDecl>,
@@ -507,19 +511,23 @@ fn classify_axes<'a>(
 ) {
     let mut r = Registrations::default();
     let mut generic = Vec::new();
-    let unknown = Vec::new();
+    let mut unknown = Vec::new();
     for d in decls {
         let name = d.name[..].to_string();
-        if TYPED_AXES.contains(&name.as_str()) {
-            fill_typed_slot(&mut r, &name, d.vtable);
-        } else {
+        if d.kind == AXIS_KIND_GENERIC {
             // 安全前提：插件按 GenericVtable 形状构造该 vtable（信任边界同既有轴）。
             generic.push((name, unsafe {
                 &*(d.vtable as *const oj_plugin_ffi::GenericVtable)
             }));
+        } else if TYPED_AXES.contains(&name.as_str()) {
+            fill_typed_slot(&mut r, &name, d.vtable);
+        } else {
+            eprintln!(
+                "[oj-plugin] '{plugin_name}': typed axis '{name}' not in host TYPED_AXES, ignoring"
+            );
+            unknown.push(name);
         }
     }
-    let _ = plugin_name;
     (r, generic, unknown)
 }
 

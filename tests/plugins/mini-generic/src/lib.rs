@@ -1,4 +1,4 @@
-//! 泛型轴夹具：轴名 "greet" 不在宿主 9 个类型化轴内 → 泛型通道。
+//! 泛型轴夹具：轴名 "greet" 不在宿主 9 个类型化轴内 → 泛型通道（generic 臂声明）。
 //! greet op：`call("greet", args)` 返回 `{"hello": <args[0].name>}`（name 缺省 "world"）。
 
 use oj_plugin_ffi::{FfiFuture, HostContext, RArc, RResult, RString, oj_plugin_entry};
@@ -36,4 +36,4 @@ fn init(
     })
 }
 
-oj_plugin_entry!(init, greet => &GREET_VT);
+oj_plugin_entry!(init, generic(greet) => &GREET_VT);
