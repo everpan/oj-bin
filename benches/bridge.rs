@@ -11,7 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use only_js::bridge::{Bridge, DataAccessor, InMemoryAccessor, InMemoryKV, KVStore, RequestInfo};
+use only_js::bridge::generic_axis::registry_from;
+use only_js::bridge::ldap::{FfiLdapBackend, LdapConfig};
+use only_js::bridge::{
+    Bridge, DataAccessor, Extras, InMemoryAccessor, InMemoryKV, KVStore, RequestInfo,
+    SchemaRegistry,
+};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -19,6 +24,29 @@ use tokio::runtime::Runtime;
 
 /// 每次迭代 JS 循环内的 op 调用次数（fetch 除外）。
 const N: usize = 100;
+
+/// ldap 通道对比的每次迭代调用次数（任务书要求 N=1000 级）。
+const LDAP_N: usize = 1000;
+
+// ---- ldap typed vs generic 通道对比：mock vtable 做最小工作（立即 ready），----
+// ---- 只测通道纯开销（JS 面 → op → 校验/序列化 → FFI future → JSON 回程）。----
+
+extern "C" fn mock_ldap_call(_req: oj_plugin_ffi::RString) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_ok(br#"true"#.to_vec())
+}
+static MOCK_LDAP_VT: oj_plugin_ffi::LdapVtable = oj_plugin_ffi::LdapVtable {
+    call: mock_ldap_call,
+};
+
+extern "C" fn mock_axis_call(
+    _op: oj_plugin_ffi::RString,
+    _args: oj_plugin_ffi::RString,
+) -> oj_plugin_ffi::FfiFuture {
+    oj_plugin_ffi::ready_ok(br#"true"#.to_vec())
+}
+static MOCK_AXIS_VT: oj_plugin_ffi::GenericVtable = oj_plugin_ffi::GenericVtable {
+    call: mock_axis_call,
+};
 
 fn runtime() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -173,5 +201,54 @@ fn bench_js(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rust, bench_js);
+/// ldap 通道对比：同形态 mock 操作（立即 ready 的 bind）分别走
+/// typed（`ldap.bind` → op_ldap_call → FfiLdapBackend → LdapVtable）与
+/// generic（`axis("ldap").bind` → op_axis_call → GenericVtable），
+/// 差额 = 泛型通道相对 typed 通道的纯开销。
+fn bench_ldap_channel(c: &mut Criterion) {
+    let rt = runtime();
+    let ldap_cfg = LdapConfig::from_value(&json!({
+        "default": { "url": "ldap://127.0.0.1:1" },
+    }))
+    .unwrap();
+    let axes = registry_from(vec![(
+        "ldap".to_string(),
+        "ldap".to_string(),
+        &MOCK_AXIS_VT,
+    )]);
+    let bridge = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::new(),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Extras {
+            ldap: Some(Arc::new(FfiLdapBackend::new(&MOCK_LDAP_VT, ldap_cfg))),
+            generic_axes: Some(axes),
+            ..Default::default()
+        },
+    );
+    let mut group = c.benchmark_group("js");
+    group.throughput(Throughput::Elements(LDAP_N as u64));
+
+    let typed = format!(
+        "(async () => {{ for (let i = 0; i < {LDAP_N}; i++) \
+            await ldap.bind(\"uid=eve,dc=example,dc=com\", \"pw\"); }})()"
+    );
+    group.bench_function("ldap.typed(bind, x1000)", |b| {
+        b.iter(|| rt.block_on(bridge.run_with(&typed, req())).unwrap())
+    });
+
+    let generic = format!(
+        "(async () => {{ for (let i = 0; i < {LDAP_N}; i++) \
+            await axis(\"ldap\").bind(\"uid=eve,dc=example,dc=com\", \"pw\"); }})()"
+    );
+    group.bench_function("ldap.generic(bind, x1000)", |b| {
+        b.iter(|| rt.block_on(bridge.run_with(&generic, req())).unwrap())
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_rust, bench_js, bench_ldap_channel);
 criterion_main!(benches);
