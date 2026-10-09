@@ -72,7 +72,7 @@ pub extern "C" fn oj_plugin_axes() -> AxisList {
 - 清单中的**未知轴名**（宿主不认识的类型化轴）：收集进
   `LoadedPlugin.unknown_axes: Vec<String>`，加载时 eprintln 告警。行为变化：
   旧宿主遇新插件新轴 = 「装上但没消费」；新宿主 = 「明确告诉你没消费」。
-  泛型轴通道（Part 3）落地后，未知轴名应先尝试泛型解释，再落入 unknown_axes。
+  泛型轴通道（Part 2）落地后，未知轴名应先尝试泛型解释，再落入 unknown_axes。
 - `Registrations` / `provides()` 不变；`AXES` 常量删除。
 - `tests/plugins/mini*` 夹具家族与 `plugin_loader` 单测更新：新增用例——
   自报清单优先、旧符号回退、未知轴告警、零轴插件空清单。
@@ -122,7 +122,54 @@ pub struct GenericVtable {
 1~2 个示例 op + README 范式说明（轴名约定、panic 收敛、错误返回、JS 调用形态、
 xtask 构建命令）。README 指向本文档与 plugin-development.md。
 
-## Part 3 — oj_info
+## Part 3 — 配置自报（充分自治：配置解析不再随轴增长）
+
+### 问题
+
+cfg 到插件的通路今天是宿主侧**按名硬编码**：`serve_cmd.rs` 的 `plugin_cfg(cfg, name,
+es_profile)` 把插件名映射到 config 段（`auth:` / `es:` / `broker:` / `kafkas:` …），
+新增带配置段的轴 = 主程序改 `plugin_cfg` + `Config` 加字段。顶层 `Config` 虽无
+`deny_unknown_fields`（未知段解析不炸），但段值到不了插件手里。
+
+### 设计
+
+**FFI 新增（可选）静态符号**（须在 init 之前可探——init 就要吃 cfg，不能依赖
+init 返回的 descriptor）：
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn oj_plugin_config_key() -> RString  // 例："cache"
+```
+
+由 `oj_plugin_entry!` 追加可选参数生成：
+`oj_plugin_entry!(init, config: "cache", cache => &VT)`（不配 config: 则不导出符号，
+行为同旧插件）。
+
+**宿主 `Config`**：加 `#[serde(flatten)] extra: HashMap<String, serde_json::Value>`
+catch-all——既有类型化字段优先，**未知顶层段落入 extra**（顶层字段全部显式声明，
+不存在 SmtpSection 式「flatten 误收已知键」问题）。
+
+**cfg 解析顺序（`cfg_for` 泛化，零按名硬编码）**，对加载中的插件：
+
+1. `plugins:<name>` 值为非空对象 → 原样透传（既有语义，最高优先）；
+2. 插件导出了 `oj_plugin_config_key` 且顶层存在该段 → extra 里取该段序列化为 JSON；
+3. 否则回落宿主遗留按名映射（第一方旧插件的 es_profile 特判等）→ 最终 `"{}"`。
+
+遗留映射只服务既有 10 个第一方插件，永不增长；**新轴/新插件加配置段 = 宿主零改动**
+——插件声明 config key，用户写顶层段，装配期自动到达 init。
+cfg 白名单校验归插件 init 自裁（未知键 fail-fast 在插件侧裁决，与 ldap
+`LdapConfig::from_value` 哲学一致；宿主不为泛型轴做键校验）。
+
+**未消费段诊断**：装配后 `extra` 中未被任何已加载插件（经 config key 或
+`plugins:<name>`）消费的段，进 oj_info 的 `config.unconsumed_sections` 列表——
+堵住「段名打错被静默忽略」的洞，且无需宿主认识任何段名。
+
+### 测试
+
+- cfg 三级解析顺序单测；config key 段到达 init 的端到端（mini 夹具）；
+- 未消费段出现在 oj_info；`plugins:` 透传优先序不回归。
+
+## Part 4 — oj_info
 
 ### 数据源
 
@@ -134,7 +181,7 @@ xtask 构建命令）。README 指向本文档与 plugin-development.md。
 | `abi` | `ABI_VERSION`、`HOST_FINGERPRINT` |
 | `plugins` | 现有 `PluginInfo` 全字段（name/semver/abi/fingerprint/desc/host_abi）+ 每插件 `unknown_axes` 告警 |
 | `backends` | `build_registries` 声明面：db 各库 scheme、redis profiles、blob 后端清单、broker kind、es endpoint、auth 守卫有/无、mq kafkas/rabbits、mail profiles、ldap 实例、**泛型轴清单** |
-| `config` | 段名 → 键名清单；**值一律不出**（零泄漏面；ENC[...] 密文也不回显） |
+| `config` | 段名 → 键名清单；**值一律不出**（零泄漏面；ENC[...] 密文也不回显）；`unconsumed_sections`：未消费顶层段清单（Part 3 诊断） |
 | `serve` | dev/release 模式判定、base、api_path（`oj info` 提供；JS 侧运行时相同） |
 
 **只报告声明面，不真连库/连 broker**（php -i 亦不连数据库）；连接可用性不在 oj_info 职责内。
