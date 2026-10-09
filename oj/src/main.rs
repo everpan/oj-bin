@@ -99,6 +99,13 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::Info(a) => match oj::info_cmd::run(&a.config).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("oj info: {e}");
+                1
+            }
+        },
     }
 }
 
