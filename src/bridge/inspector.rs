@@ -105,14 +105,18 @@ mod tests {
             ..Default::default()
         });
         let insp = rt.inspector();
+        // 先占住端口再 spawn 同址 → AddrInuse 对任何用户/平台都成立（端口 1 在
+        // root/特权容器里 bind 得动，走不到失败分支）。
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
         let ls = tokio::task::LocalSet::new();
         ls.run_until(async {
-            // 端口 1 通常无绑定权限 → bind 失败分支。
-            spawn(insp.clone(), "0.0.0.0:1".parse().unwrap());
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            // bind 失败分支在任务返回时确定性地走完（此前 sleep(40) 赌它完成）。
+            spawn(insp.clone(), addr).await.unwrap();
         })
         .await;
         drop(ls);
+        drop(l);
         drop(insp);
         drop(rt);
     }
@@ -159,9 +163,13 @@ mod tests {
                 "expected text frame: {msg:?}"
             );
 
-            // Close → session_loop 走 Close 分支并中止 pump。
+            // Close → session_loop 走 Close 分支并中止 pump：服务端关套接字时
+            // next() 收尾（此前 sleep(30) 赌它处理完；带超时防挂死）。
             ws.send(Message::Close(None)).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await;
         })
         .await;
         drop(ls);

@@ -289,14 +289,21 @@ async fn uc14_transpile_cache_and_hot_reload() {
     }
     // 启动内省已预热转译缓存：3 次请求 0 次新转译（缓存全局共享，跨 actor）。
     assert_eq!(transpile_hits(), before);
-    // 热重载：改文件 → mtime 变 → 下次请求新结果。
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // 热重载：改文件 → mtime 变 → 下次请求新结果。mtime 粒度在个别文件系统
+    // （HFS+ / 容器卷挂载）可达秒级，固定 sleep 赌不动 → deadline 轮询。
     std::fs::write(
         t.join("src/u/f/api.ts"),
         "export default { get() { json.ok({ v: 2 }); } };\n",
     )
     .unwrap();
-    let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let v = loop {
+        let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
+        if v["data"]["v"] == 2 || std::time::Instant::now() >= deadline {
+            break v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     assert_eq!(v["data"]["v"], 2, "{v}");
     let _ = std::fs::remove_dir_all(&t);
 }

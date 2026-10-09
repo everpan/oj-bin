@@ -424,7 +424,6 @@ deno_core::extension!(
         mq::op_tasks_sleep,
         ldap::op_ldap_call,
         generic_axis::op_axis_call,
-        fs::op_fs_root,
         fs::op_fs_resolve,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",

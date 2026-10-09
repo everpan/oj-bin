@@ -616,12 +616,21 @@ impl TaskPool {
 
     /// 停机收场（PRD v2 FR-LT-005）：置位 → join 全部 Worker（Worker 退出前
     /// 已对每个会话尽力 teardown）。阻塞调用，调用方宜在 blocking 上下文。
+    /// 补员与停机并发时，垂死 Worker 对替补句柄的 push 可晚于下方 take（替补
+    /// Worker 跑 make 早于句柄入册）——循环到 live 归零为止；stopping 置位后
+    /// 补员有界（再补前会看到 stopping），必然收敛。
     pub fn shutdown_and_join(&self) {
         self.shutdown();
-        let handles: Vec<_> =
-            std::mem::take(&mut *self.handles.lock().unwrap_or_else(|e| e.into_inner()));
-        for h in handles {
-            let _ = h.join();
+        loop {
+            let handles: Vec<_> =
+                std::mem::take(&mut *self.handles.lock().unwrap_or_else(|e| e.into_inner()));
+            for h in handles {
+                let _ = h.join();
+            }
+            if self.live.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
