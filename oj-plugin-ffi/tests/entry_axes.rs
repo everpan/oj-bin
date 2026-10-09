@@ -19,8 +19,9 @@ mod fake {
     pub static GREET_VT: oj_plugin_ffi::GenericVtable =
         oj_plugin_ffi::GenericVtable { call: greet_stub };
 
-    // 混合形态：类型化臂 + 泛型臂 + config 键，一条展开全盖。
-    oj_plugin_entry!(init, config: "cache", cache => &VT_A, search => &VT_B, generic(greet) => &GREET_VT);
+    // 混合形态：类型化臂 + 泛型臂 + config 键，一条展开全盖；尾逗号容忍也钉在此
+    // （旧宏 $(,)? 语义的回归守护：基底臂 @munch 须接受条目列表后的尾逗号）。
+    oj_plugin_entry!(init, config: "cache", cache => &VT_A, search => &VT_B, generic(greet) => &GREET_VT,);
 
     fn init(
         _host: RArc<oj_plugin_ffi::HostContext>,
