@@ -1480,6 +1480,30 @@ fn generic_plugin_artifact() -> PathBuf {
     .clone()
 }
 
+/// 编译 oj-ldap（release；泛型轴迁移后的真实插件产物）路径（全进程一次）。
+fn ldap_plugin_artifact() -> PathBuf {
+    static ONCE: OnceLock<PathBuf> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", "oj-ldap"])
+            .current_dir(&root)
+            .status()
+            .expect("invoke cargo build for oj-ldap");
+        assert!(status.success(), "oj-ldap build failed");
+        let (prefix, ext) = if cfg!(target_os = "windows") {
+            ("", "dll")
+        } else if cfg!(target_os = "macos") {
+            ("lib", "dylib")
+        } else {
+            ("lib", "so")
+        };
+        root.join("target/release")
+            .join(format!("{prefix}oj_ldap.{ext}"))
+    })
+    .clone()
+}
+
 /// ojInfo() e2e（HTTP 池入口）：serve 装配注入 → handler 内 `ojInfo()` 返回与
 /// `oj info` CLI 同源的结构（abi/build/config 声明面）。安全红线：config 只出
 /// 段名/键名——vars 的部署值不得出现在响应的任何序列化字段里。
@@ -1579,6 +1603,103 @@ async fn generic_axis_greet_end_to_end() {
     let msg = v["msg"].as_str().unwrap_or("");
     assert!(msg.contains("unknown generic axis 'nope'"), "{v}");
     assert!(msg.contains("greet"), "{v}");
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// oj-ldap 泛型轴迁移 e2e：真实插件产物（generic(ldap) 声明）扫描装配 →
+/// JS 侧 `axis("ldap").<op>(...)` 全链路。仓库无 LDAP 测试基建，取舍：
+/// 装配 + 协议校验/未知 op 错误路径 + connect 失败链路（127.0.0.1:1 即拒，
+/// 证明 axis() → op_axis_call → GenericVtable → 引擎 → ldap3 的端到端通路）在此
+/// 验收；成功路径（真实目录返回）由 oj-ldap crate 内单测覆盖协议层，与迁移前同级。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ldap_generic_axis_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/l/manifest.yaml",
+            "name: l\ndesc: ldap generic axis e2e\nversion: 0.1.0\n",
+        ),
+        (
+            "src/l/api.ts",
+            r#"async function get() {
+             const op = http.query.op;
+             try {
+               if (op === "unknown") await axis("ldap").delete();
+               else if (op === "badargs") await axis("ldap").bind("uid=eve");
+               else if (op === "whoami") await axis("ldap").whoami({ key: "default" });
+               else if (op === "noaxis") await axis("nope").x();
+               else if (op === "search") {
+                 await axis("ldap").search("ou=users,dc=example,dc=com", { scope: "one", attrs: ["uid"] });
+               } else json.ok({ done: true });
+             } catch (e) {
+               json.ok({ err: String(e) });
+             }
+           }
+           export default { get };"#,
+        ),
+    ]);
+    let pdir = t.join("plugins").join(host_triple());
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::copy(ldap_plugin_artifact(), pdir.join(plugin_file("ldap"))).unwrap();
+    let mut cfg = base_cfg(&t);
+    cfg.plugins_dir = Some(t.join("plugins"));
+    // start() 测试入口 top=Null（config key 段查找不可用）→ 走 plugins.<name> 透传臂
+    // （plugin_cfg 第 1 级优先）。实例指向本机端口 1：connect 即 ECONNREFUSED（毫秒级）。
+    cfg.plugins.insert(
+        "ldap".into(),
+        serde_json::json!({ "default": { "url": "ldap://127.0.0.1:1" } }),
+    );
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+
+    // 泛型轴注册成功 + 插件侧 op 分派：未知 op 错误文案点名已知 op 全集。
+    let (s, v) = req(addr, "GET", "/v1/api/l/?op=unknown", None).await;
+    assert_eq!(s, 200, "{v}");
+    let err = v["data"]["err"].as_str().unwrap_or("");
+    assert!(err.contains("ldap: unknown op 'delete'"), "{v}");
+    assert!(
+        err.contains("bind|search|search_paged|whoami|compare"),
+        "{v}"
+    );
+    // 协议入参校验（泛型通道无宿主校验层，插件侧文案 = 旧宿主层文案）。
+    let (s, v) = req(addr, "GET", "/v1/api/l/?op=badargs", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["data"]["err"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ldap.bind: 'pw' must be a string"),
+        "{v}"
+    );
+    // 端到端通路：whoami → 引擎 connect（127.0.0.1:1 拒绝）→ 错误经 FFI future 回程。
+    let (s, v) = req(addr, "GET", "/v1/api/l/?op=whoami", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["data"]["err"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ldap: connect ldap://127.0.0.1:1"),
+        "{v}"
+    );
+    // search 同样抵达网络层（opts 校验通过后才 connect）。
+    let (s, v) = req(addr, "GET", "/v1/api/l/?op=search", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["data"]["err"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ldap: connect ldap://127.0.0.1:1"),
+        "{v}"
+    );
+    // 未知轴报错列出可用轴（含 ldap）→ 装配注册证据。
+    let (s, v) = req(addr, "GET", "/v1/api/l/?op=noaxis", None).await;
+    assert_eq!(s, 200, "{v}");
+    let err = v["data"]["err"].as_str().unwrap_or("");
+    assert!(err.contains("unknown generic axis 'nope'"), "{v}");
+    assert!(err.contains("ldap"), "{v}");
 
     h.abort();
     let _ = std::fs::remove_dir_all(&t);
