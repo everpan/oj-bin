@@ -1019,6 +1019,99 @@ pub struct Config {
     pub vars: HashMap<String, String>,
 }
 
+/// 与 Config 字段一一对应的顶层键清单。**新增 Config 字段必须同步此表**
+///（对账单测 known_top_level_keys_covers_all_typed_fields 防漂移）。
+pub fn known_top_level_keys() -> &'static [&'static str] {
+    &[
+        "server",
+        "db",
+        "redis",
+        "tenant",
+        "auth",
+        "oidc",
+        "blob",
+        "fs",
+        "smtp",
+        "ldap",
+        "es",
+        "broker",
+        "plugins",
+        "plugins_dir",
+        "kafkas",
+        "rabbits",
+        "vars",
+        "db_query",
+        "db_trace",
+        "tasks",
+        "secrets",
+        "ws",
+    ]
+}
+
+/// 顶层 Value 减去已知键 = 未消费候选（插件 config key 查找面）。
+fn split_extra(v: &serde_yaml::Value) -> serde_yaml::Value {
+    let Some(m) = v.as_mapping() else {
+        return serde_yaml::Value::Null;
+    };
+    let kept: serde_yaml::Mapping = m
+        .iter()
+        .filter(|(k, _)| {
+            !k.as_str()
+                .is_some_and(|s| known_top_level_keys().contains(&s))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    serde_yaml::Value::Mapping(kept)
+}
+
+/// load_with_extra 的产物：typed Config + 顶层未知段的 JSON 形（插件 cfg 查找面）。
+pub struct LoadedConfig {
+    pub config: Config,
+    /// 解密后顶层 mapping 的 JSON 形（未知段全量；插件 config key 查找面）。
+    pub top: serde_json::Value,
+}
+
+pub fn load_with_extra(path: &Path, dir: &Path) -> Result<LoadedConfig, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    // 密封值解密发生在 **Value 层**（`Config::deserialize` 之前）：ldap/plugins/kafkas
+    // 是不透明 Value，类型层够不着其中的 `bind_pw`；在树上递归替换则全段覆盖且
+    // schema 零改动。配置里没有 `ENC[...]` 时完全不碰密钥路径（旧配置逐字节不变）。
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let plain;
+    let final_text = if crate::secret::has_sealed(&value) {
+        let cfg_path = value
+            .get("secrets")
+            .and_then(|s| s.get("private_key_path"))
+            .and_then(|v| v.as_str());
+        let key = crate::secret::load_private_key(cfg_path, dir).map_err(|e| {
+            format!(
+                "{}: config has ENC[...] sealed values but {e}",
+                path.display()
+            )
+        })?;
+        crate::secret::decrypt_tree(&mut value, &key)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // 解密后**回经文本**再反序列化，而不是 `from_value`：serde_yaml 的 `from_str`
+        // 会把裸标量按字面量读成字符串（`vars: {PORT: 3000}` → `"3000"`，该段依赖此
+        // 行为），而 `from_value` 对 `Value::Number` 直接报 "invalid type: integer"。
+        // 走文本才能与未加密路径逐字节同行为。
+        plain = serde_yaml::to_string(&value)
+            .map_err(|e| format!("{}: re-serialize after decrypt: {e}", path.display()))?;
+        &plain
+    } else {
+        &text
+    };
+    let config: Config =
+        serde_yaml::from_str(final_text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // 两-pass 的 second pass：同一最终文本得顶层未知段（段值保持 YAML 类型化的 JSON
+    // 形态，数字仍是数字——与 typed Config 的裸标量读串行为分层，互不影响）。
+    let top = serde_json::to_value(split_extra(&value))
+        .map_err(|e| format!("{}: top sections: {e}", path.display()))?;
+    Ok(LoadedConfig { config, top })
+}
+
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
 pub fn load_from(dir: &Path, explicit: Option<&str>) -> Result<Config, String> {
     let path = match explicit {
@@ -1037,35 +1130,7 @@ pub fn load_from(dir: &Path, explicit: Option<&str>) -> Result<Config, String> {
             full
         }
     };
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    // 密封值解密发生在 **Value 层**（`Config::deserialize` 之前）：ldap/plugins/kafkas
-    // 是不透明 Value，类型层够不着其中的 `bind_pw`；在树上递归替换则全段覆盖且
-    // schema 零改动。配置里没有 `ENC[...]` 时完全不碰密钥路径（旧配置逐字节不变）。
-    let mut value: serde_yaml::Value =
-        serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    if crate::secret::has_sealed(&value) {
-        let cfg_path = value
-            .get("secrets")
-            .and_then(|s| s.get("private_key_path"))
-            .and_then(|v| v.as_str());
-        let key = crate::secret::load_private_key(cfg_path, dir).map_err(|e| {
-            format!(
-                "{}: config has ENC[...] sealed values but {e}",
-                path.display()
-            )
-        })?;
-        crate::secret::decrypt_tree(&mut value, &key)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        // 解密后**回经文本**再反序列化，而不是 `from_value`：serde_yaml 的 `from_str`
-        // 会把裸标量按字面量读成字符串（`vars: {PORT: 3000}` → `"3000"`，该段依赖此
-        // 行为），而 `from_value` 对 `Value::Number` 直接报 "invalid type: integer"。
-        // 走文本才能与未加密路径逐字节同行为。
-        let plain = serde_yaml::to_string(&value)
-            .map_err(|e| format!("{}: re-serialize after decrypt: {e}", path.display()))?;
-        return serde_yaml::from_str(&plain).map_err(|e| format!("parse {}: {e}", path.display()));
-    }
-    serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    load_with_extra(&path, dir).map(|c| c.config)
 }
 
 /// "30s"/"500ms" → Duration（沿用旧实现语义）。
@@ -1115,6 +1180,51 @@ mod tests {
             c2.server.js_heap_limit_bytes = bad;
             let e = validate_server_limits(&c2).expect_err("低于下限必须拒绝");
             assert!(e.contains("below the minimum"), "{e}");
+        }
+    }
+
+    #[test]
+    fn load_with_extra_splits_known_and_unknown_top_level() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("oj-test-extra-config.yaml");
+        std::fs::write(
+            &p,
+            r#"
+server: { host: "127.0.0.1", port: 9778 }
+vars: { PORT: 3000 }
+cache:
+  backend: memory
+  ttl: 60
+"#,
+        )
+        .unwrap();
+        let loaded = load_with_extra(&p, &dir).expect("load_with_extra");
+        // vars 数字标量仍按字面读成串（既有宽松行为不可回归）：
+        assert_eq!(
+            loaded.config.vars.get("PORT").map(String::as_str),
+            Some("3000")
+        );
+        // 未知段进 extra（已知段不进）：
+        assert!(loaded.top.get("cache").is_some());
+        assert!(loaded.top.get("server").is_none());
+        assert!(loaded.top.get("vars").is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn known_top_level_keys_covers_all_typed_fields() {
+        // 对账单测（评审 H1/S3）：每个已知键都能被 Config 解析接受，
+        // 且列表不含重复。新增 Config 字段必须同步此表。
+        let keys = known_top_level_keys();
+        assert_eq!(
+            keys.len(),
+            keys.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+        for k in keys {
+            let yaml = format!("{k}: null\n");
+            let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            let extra = split_extra(&v);
+            assert!(extra.get(*k).is_none(), "known key '{k}' leaked into extra");
         }
     }
 

@@ -487,6 +487,7 @@ fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, Str
 /// "mail not configured"（与 es/auth 的「未配置」语义一致）。
 pub fn build_mail_backend(
     cfg: &Config,
+    top: &serde_json::Value,
     vtable: Option<&'static oj_plugin_ffi::MailVtable>,
     bus: Arc<dyn EventBroker>,
 ) -> Result<Option<Arc<dyn MailBackend>>, String> {
@@ -497,7 +498,7 @@ pub fn build_mail_backend(
     // A5：双配置源（非空 `smtp:` ＋ 非空 `plugins.mail`）此处即 fail-fast ——
     // `plugin_cfg` 会让透传静默胜出，不能等到「改了白名单不生效」才发现。
     crate::serve_cmd::check_mail_cfg_sources(cfg)?;
-    let json = crate::serve_cmd::plugin_cfg(cfg, "mail", None).unwrap();
+    let json = crate::serve_cmd::plugin_cfg(cfg, top, "mail", None, None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("smtp cfg: {e}"))?;
     // 空 cfg（既无 `smtp:` 段也无 `plugins.mail` 透传）→ 视作未配置。
@@ -515,13 +516,14 @@ pub fn build_mail_backend(
 /// 未配 `ldap:`（段缺省/空）或插件未加载 → `None`：`ldap.*` 报 "ldap not configured"。
 pub fn build_ldap_backend(
     cfg: &Config,
+    top: &serde_json::Value,
     vtable: Option<&'static oj_plugin_ffi::LdapVtable>,
 ) -> Result<Option<Arc<dyn LdapBackend>>, String> {
     let Some(vtable) = vtable else {
         return Ok(None);
     };
     crate::serve_cmd::check_ldap_cfg_sources(cfg)?;
-    let json = crate::serve_cmd::plugin_cfg(cfg, "ldap", None).unwrap();
+    let json = crate::serve_cmd::plugin_cfg(cfg, top, "ldap", None, None).unwrap();
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("ldap cfg: {e}"))?;
     if value.as_object().is_none_or(|o| o.is_empty()) {
@@ -753,6 +755,7 @@ pub struct ResourceProfiles {
 /// 同源不分裂；exec 无 CLI 覆盖，传 config 派生值。
 pub async fn assemble_backend(
     cfg: &Config,
+    top: &serde_json::Value,
     config_dir: &Path,
     dir: &Path,
     base: &str,
@@ -794,9 +797,15 @@ pub async fn assemble_backend(
     // `GET {base}/plugins`（AppState）。
     let mut registries = Registries::default();
     let plugin_infos: std::sync::Arc<Vec<only_js::bridge::PluginInfo>> = std::sync::Arc::new(
-        assemble_plugins(cfg, config_dir, &mut registries, profiles.es.as_deref())
-            .await
-            .map_err(|e| format!("plugins: {e}"))?,
+        assemble_plugins(
+            cfg,
+            top,
+            config_dir,
+            &mut registries,
+            profiles.es.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("plugins: {e}"))?,
     );
     // KV：redis.<key> 存在 → 经 kv 插件 vtable connect（单例 fail-fast）；
     // 未声明 → InMemoryKV 内置兜底。
@@ -893,14 +902,14 @@ pub async fn assemble_backend(
     };
     // mail 后端（spec 2026-09-15）：顶层 smtp: 段 + oj-mail 插件 vtable。
     // 必须在 bus 之后——结果上送（`mail.result`）的扇出目标是同一总线实例。
-    let mail = build_mail_backend(cfg, registries.mail, bus.clone())?;
+    let mail = build_mail_backend(cfg, top, registries.mail, bus.clone())?;
     // exec/test 手工 runtime 不经 Bridge 构造（install 原只在 Bridge 构造期触发）——
     // 装配层显式装一次；幂等（覆写同一进程级弱引用，见 mail::install_mail_deliver）。
     if let Some(m) = &mail {
         only_js::bridge::mail::install_mail_deliver(m);
     }
     // ldap 后端：ldap: 段 + oj-ldap 插件 vtable（独立能力，无跨后端依赖）。
-    let ldap = build_ldap_backend(cfg, registries.ldap)?;
+    let ldap = build_ldap_backend(cfg, top, registries.ldap)?;
     // mq 命名实例（spec §3/§7）：kafkas:/rabbits: 段 → 插件 connect → 命名 registry。
     let (kafkas, rabbits) = build_mq_registries(
         cfg,
@@ -1039,8 +1048,10 @@ impl App {
     /// 私有函数（connect_kv / ownership_deny_of / build_schema_and_modules /
     /// build_jwt_and_oidc / resolve_static_sites / load_cert_with_watcher）。
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)] // top 与 cfg 分层传（serde 无关的查找面），不并为 struct
     pub async fn from_config(
         cfg: Config,
+        top: &serde_json::Value,
         config_dir: &Path,
         dir: PathBuf,
         base: String,
@@ -1057,7 +1068,7 @@ impl App {
         let dir = dir.canonicalize().unwrap_or(dir);
         // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
         let backend =
-            Arc::new(assemble_backend(&cfg, config_dir, &dir, &base, ts, profiles).await?);
+            Arc::new(assemble_backend(&cfg, top, config_dir, &dir, &base, ts, profiles).await?);
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
@@ -1690,6 +1701,7 @@ mod tests {
         let cfg = Config::default(); // 无证书、无 db/redis 段
         let backend = super::assemble_backend(
             &cfg,
+            &serde_json::Value::Null,
             &base,
             &base,
             "/v1/api",
@@ -2039,7 +2051,7 @@ mod mail_assembly_tests {
     async fn given_smtp_configured_when_assemble_then_mail_backend_injected() {
         let cfg = smtp_cfg();
         let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
-        let mb = build_mail_backend(&cfg, Some(&FAKE_MAIL), bus)
+        let mb = build_mail_backend(&cfg, &serde_json::Value::Null, Some(&FAKE_MAIL), bus)
             .unwrap()
             .expect("smtp 段 + 插件在册 → 必须注入 mail 后端");
         // 非密钥面：profile 名单 / 白名单（宿主校验依据）。
@@ -2117,9 +2129,14 @@ mod mail_assembly_tests {
         let bus = || -> Arc<dyn EventBroker> { Arc::new(only_js::bridge::Bus::new()) };
         // 段缺省。
         assert!(
-            build_mail_backend(&Config::default(), Some(&FAKE_MAIL), bus())
-                .unwrap()
-                .is_none()
+            build_mail_backend(
+                &Config::default(),
+                &serde_json::Value::Null,
+                Some(&FAKE_MAIL),
+                bus()
+            )
+            .unwrap()
+            .is_none()
         );
         // 空段（`smtp: {}`，零 profile）= 未配置。
         let empty = Config {
@@ -2127,13 +2144,13 @@ mod mail_assembly_tests {
             ..Default::default()
         };
         assert!(
-            build_mail_backend(&empty, Some(&FAKE_MAIL), bus())
+            build_mail_backend(&empty, &serde_json::Value::Null, Some(&FAKE_MAIL), bus())
                 .unwrap()
                 .is_none()
         );
         // 配了段但 oj-mail 未加载（`Registrations.mail = None`）。
         assert!(
-            build_mail_backend(&smtp_cfg(), None, bus())
+            build_mail_backend(&smtp_cfg(), &serde_json::Value::Null, None, bus())
                 .unwrap()
                 .is_none()
         );
@@ -2156,6 +2173,7 @@ mod mail_assembly_tests {
         );
         let e = match build_mail_backend(
             &cfg,
+            &serde_json::Value::Null,
             Some(&FAKE_MAIL),
             Arc::new(only_js::bridge::Bus::new()),
         ) {
@@ -2197,27 +2215,35 @@ mod mail_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_no_ldap_or_no_plugin_when_assemble_then_no_backend() {
         assert!(
-            build_ldap_backend(&Config::default(), Some(&FAKE_LDAP))
-                .unwrap()
-                .is_none()
+            build_ldap_backend(
+                &Config::default(),
+                &serde_json::Value::Null,
+                Some(&FAKE_LDAP)
+            )
+            .unwrap()
+            .is_none()
         );
         let empty = Config {
             ldap: Some(serde_yaml::Value::Mapping(Default::default())),
             ..Default::default()
         };
         assert!(
-            build_ldap_backend(&empty, Some(&FAKE_LDAP))
+            build_ldap_backend(&empty, &serde_json::Value::Null, Some(&FAKE_LDAP))
                 .unwrap()
                 .is_none()
         );
-        assert!(build_ldap_backend(&ldap_cfg(), None).unwrap().is_none());
+        assert!(
+            build_ldap_backend(&ldap_cfg(), &serde_json::Value::Null, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Given: 合法 `ldap:` 段 + 插件在册；Then: 后端就位，实例表与段一致，
     /// 且调用确实经 vtable 过线（bind → true）。
     #[tokio::test(flavor = "current_thread")]
     async fn given_ldap_section_when_assemble_then_backend_serves_calls() {
-        let b = build_ldap_backend(&ldap_cfg(), Some(&FAKE_LDAP))
+        let b = build_ldap_backend(&ldap_cfg(), &serde_json::Value::Null, Some(&FAKE_LDAP))
             .unwrap()
             .expect("ldap 段 + 插件在册 → 后端就位");
         assert_eq!(
@@ -2240,14 +2266,14 @@ mod mail_assembly_tests {
             "ldap".into(),
             serde_json::json!({"default": {"url": "http://x"}}),
         );
-        assert!(build_ldap_backend(&cfg, Some(&FAKE_LDAP)).is_err());
+        assert!(build_ldap_backend(&cfg, &serde_json::Value::Null, Some(&FAKE_LDAP)).is_err());
         // 双配置源：`ldap:` 段与 `plugins.ldap` 皆非空 → Err（二选一）。
         let mut both = ldap_cfg();
         both.plugins.insert(
             "ldap".into(),
             serde_json::json!({"other": {"url": "ldap://x:389"}}),
         );
-        let e = match build_ldap_backend(&both, Some(&FAKE_LDAP)) {
+        let e = match build_ldap_backend(&both, &serde_json::Value::Null, Some(&FAKE_LDAP)) {
             Ok(_) => panic!("双配置源必须在装配期报错"),
             Err(e) => e,
         };
@@ -2259,7 +2285,7 @@ mod mail_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_mail_backend_when_drain_then_control_message_sent_and_envelope_returned() {
         let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
-        let mb = build_mail_backend(&smtp_cfg(), Some(&FAKE_MAIL), bus)
+        let mb = build_mail_backend(&smtp_cfg(), &serde_json::Value::Null, Some(&FAKE_MAIL), bus)
             .unwrap()
             .expect("smtp 段 + 插件在册 → 后端就位");
         SEEN_REQS.lock().unwrap().clear();
@@ -2281,9 +2307,14 @@ mod mail_assembly_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn given_broken_plugin_when_drain_then_failure_becomes_envelope() {
         let bus: Arc<dyn EventBroker> = Arc::new(only_js::bridge::Bus::new());
-        let mb = build_mail_backend(&smtp_cfg(), Some(&PENDING_MAIL), bus)
-            .unwrap()
-            .expect("后端就位");
+        let mb = build_mail_backend(
+            &smtp_cfg(),
+            &serde_json::Value::Null,
+            Some(&PENDING_MAIL),
+            bus,
+        )
+        .unwrap()
+        .expect("后端就位");
         let v = drain_mail_backend(&mb, Duration::from_millis(10));
         assert_eq!(v["code"], 1, "{v}");
         assert_eq!(v["data"]["drained"], false, "{v}");

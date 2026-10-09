@@ -911,6 +911,7 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
     // fixtures=true + db_override="test"：`oj test` 的装配形态。
     let app = oj::app::App::from_config(
         cfg,
+        &serde_json::Value::Null,
         &t,
         t.join("src"),
         "/v1/api".into(),

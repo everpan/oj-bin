@@ -195,6 +195,7 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
     );
     oj::app::App::from_config(
         cfg,
+        &serde_json::Value::Null,
         &t.0,
         src.to_path_buf(),
         "/v1/api".into(),
