@@ -5,8 +5,7 @@
 > directories — the directory tree *is* the route table. Save a file and the change is live;
 > when you're done, one build command produces a shippable artifact.
 
-New here? This page is the front door: what oj is, why it exists, how to run the sample in
-a few commands, and where to go next.
+English | [简体中文](README_cn.md)
 
 ---
 
@@ -38,109 +37,96 @@ absorbs everything else is.** That is where oj's trade-offs differ from Node:
   come from the Rust-side `SchemaRegistry` allowlist, and values only go through bound
   parameters. A business-side mistake cannot assemble an injection. Multi-tenancy, JWT auth,
   OIDC (built-in OP + RP), certificate validation, and static path-traversal guards all live
-  in the host, not in business discipline.
-- **Zero-config routing**: the directory mirror *is* the route — no registration code to
-  write (see below).
-- **Capability is pluggable**: DB dialects, S3, Redis, ES, Kafka/RabbitMQ are all **cdylib
-  plugins**, loaded on demand. A capability you don't install never enters the binary or its
-  dependency tree.
-- **Controlled execution environment**: `JsRuntime`s are pooled and reused, with a timeout
-  watchdog (`KillSwitch`). One runaway request won't take down the process; a failed runtime
-  is dropped, never reused.
-- **dev / release dual mode**: dev runs `.ts` directly (transpile on demand + hot reload);
-  release runs prebuilt `.js` (no transpile, lock-aggregated). The same source switches
-  between the two modes automatically.
+  in the host — not in business discipline.
+- **Zero-config routing**: directory mirroring *is* routing; not a single line of
+  registration code (see below).
+- **Pluggable capabilities**: database dialects, S3, Redis, ES, Kafka/RabbitMQ, SMTP, and
+  LDAP are all **cdylib plugins**, loaded on demand. A capability you don't load adds no
+  code and no dependency.
+- **A contained execution environment**: `JsRuntime` pooling plus a watchdog (`KillSwitch`)
+  means one runaway request cannot take down the process; a failed runtime is discarded,
+  never reused.
+- **dev / release dual mode**: dev runs `.ts` directly (on-demand transpile + hot reload);
+  release runs pre-built `.js` (no transpile, aggregated by the build lock). Same source,
+  mode auto-detected from directory contents.
 
 ---
 
 ## Quick Start
 
-Five commands from zero to a running release-mode service. You need a Rust toolchain; the
-first build downloads a prebuilt V8 (slow once, fast afterwards).
-
 ```bash
-cargo xtask build            # build and place bin/oj + bin/plugins/<triple>/ (release; first build pulls prebuilt V8)
+cargo xtask build            # build and stage bin/oj + bin/plugins/<triple>/ (release; pulls prebuilt V8 on first run)
 
-# dev: run .ts sources directly (no manifests.yaml in dir → auto dev/ts, file changes apply live)
+# dev: run .ts sources directly (no manifests.yaml in the dir → auto dev/ts; edits are live)
 ./bin/oj serve -c sample/config.yaml --api-path sample/src
 
-# release: build the artifacts first, apply migrations, then run dist/
-# (manifests.yaml present → auto release/js; migrate is required by the verify gate)
-./bin/oj build   -d sample/src -o sample/dist
-./bin/oj migrate -c sample/config.yaml -d sample/dist
-./bin/oj serve  -c sample/config.yaml --api-path sample/dist
+# release: build artifacts first, then serve dist/ (manifests.yaml present → auto release/js)
+./bin/oj build  -d sample/src -o sample/dist
+./bin/oj serve -c sample/config.yaml --api-path sample/dist
 ```
 
-### Install prebuilt binaries via npm
+> Always run examples and business projects through the compiled **`bin/oj`** binary: it is
+> produced in one shot by `cargo xtask build` (including all first-party plugin cdylibs),
+> needs no cargo / Rust toolchain at runtime, and can be copied as-is between environments
+> on the same platform — more portable and more consistent than `cargo run`. Command path
+> arguments resolve against the **current working directory** (CWD); the examples below
+> assume the repository root.
+
+On startup the module list and route table are written to the log (**terminal is silent by
+default**, file-only; add `--console-log` or set `server.console_log: true` to mirror to
+the terminal):
 
 ```bash
-npm i @oj-bin/oj     # drops ./bin/oj + bin/plugins/<triple>/ + bin/devkit/ into your project
-./bin/oj serve -c sample/config.yaml --api-path sample/src
+tail -f sample/logs/server-*.log
 ```
-
-Prebuilt for linux-x64 (glibc) / macOS-arm64 / windows-x64; other platforms use
-[GitHub Releases](https://github.com/everpan/only-js/releases). Notes: pnpm ≥10 needs
-`onlyBuiltDependencies: ["@oj-bin/oj"]` in `pnpm-workspace.yaml`; with `--ignore-scripts`
-run `node node_modules/@oj-bin/oj/postinstall.js` manually; global install (`-g`) is not
-supported. China users may prefer `--registry=https://registry.npmmirror.com` (auto-mirrored).
-
-> Always run examples and business workloads through the compiled **`bin/oj`**: one
-> `cargo xtask build` produces it together with all first-party plugin cdylibs; at
-> runtime it needs no cargo / Rust toolchain, and the same artifact can be copied
-> verbatim between environments on the same platform — more portable and consistent
-> than `cargo run`. Path arguments are resolved against the **current working
-> directory** (CWD); doc examples below assume execution from the repo root.
-
-Modules own their data layer: a per-module `schema.yaml` (declarative tables, the source of
-truth), `migrations/*.sql` (hand-written DDL evolution with a per-module ledger), and
-`seed.sql`/`fixtures/`. `oj build --check` runs the structural checks (table ownership,
-cross-module deps, seed discipline) without writing artifacts, and `oj schema diff` reports
-drift between declarations and the live database.
-
-On startup it prints the module list and route table, then:
 
 ```bash
 curl 'http://localhost:9778/v1/api/user/account/?id=1'
 # → {"code":0,"msg":"ok","data":[{"id":1,"name":"neo","role":"admin"}]}
+
+curl http://localhost:9778/v1/api/plugins   # self-descriptions of loaded plugins (public endpoint)
 ```
 
-> Under network restrictions set `V8_FROM_SOURCE=0` to force the prebuilt package — **do not**
-> compile V8 from source.
+> On restricted networks set `V8_FROM_SOURCE=0` to force the prebuilt V8 package — do
+> **not** build V8 from source.
 
-### About `bin/oj`: the single compiled-artifact entry point
+### About `bin/oj`: the single compiled entry point
 
-`cargo xtask build` produces `bin/oj` (main binary) and `bin/plugins/<host-triple>/`
-(all first-party plugin cdylibs) in one go. **All examples and business workloads go
-through `bin/oj`:**
+`cargo xtask build` produces `bin/oj` (the main binary) and `bin/plugins/<host-triple>/`
+(all first-party plugin cdylibs) in one shot. **All examples and business deployments go
+through `bin/oj`**:
 
 | Command | Purpose |
 |---|---|
-| `./bin/oj serve -c <config> --api-path <src\|dist>` | start the service (auto dev/ts or release/js by the presence of `manifests.yaml`) |
-| `./bin/oj build -d <src> -o <dist>` | build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
-| `./bin/oj test -c <config>` | run `*.test.ts` in-process (no server needed) |
-| `./bin/oj exec <file.ts\|js / -e <code> / --repl> -c <config>` | run ts/js with the full backend injected — file / inline code / REPL (v0.1.50), one-off fixes / reconciliation / job prototypes (see `docs/exec-integration.md`) |
-| `./bin/oj migrate / test fixture / schema diff` | migrations / demo data / schema diff (see `docs/user-manual.md`) |
+| `./bin/oj serve -c <config> --api-path <src\|dist>` | Start the server (dir with/without `manifests.yaml` auto-detects dev/ts vs release/js) |
+| `./bin/oj build -d <src> -o <dist>` | Build modules: transpile TS → `dist/<module>-<version>/` + routes.js + manifests.yaml + .tgz |
+| `./bin/oj test -c <config>` | Run `*.test.ts` cases in-process (no server needed) |
+| `./bin/oj exec [-e code \| file \| --repl]` | Run a script with the full backend injected; pure computation needs **no config** |
+| `./bin/oj migrate / test fixture / schema diff` | Migrations / fixture data / schema reconciliation |
+| `./bin/oj openapi --check` | Generate OpenAPI 3.1 from the route table / CI drift gate |
+| `./bin/oj secret keygen / seal / open` | Config credential sealing (the `ENC[...]` values in config) |
+| `./bin/oj info` | phpinfo-style diagnostics (version/ABI/plugins/backend registry; values never printed) |
 
-- **Portable**: `bin/oj` + `bin/plugins/<triple>/` is the self-contained distribution
-  unit — the target machine needs no Rust / cargo / Node toolchain; copy the tree and
-  run (or ship the package produced by `scripts/deploy.sh`). `cargo build --workspace`
-  is for development; its outputs land in `bin/` too.
-- **Consistent**: docs, CI and production all use the same entry point, independent of
-  how cargo is invoked or which features cargo resolves.
-- **Path semantics**: CLI `--api-path` / `--app-path` resolve against the **current
-  working directory** (CWD); `server.app_path` inside the config resolves against the
+- **Portable**: `bin/oj` + `bin/plugins/<triple>/` is the self-contained release unit —
+  the target machine needs no Rust / cargo / Node toolchain; copy the tree and run (or use
+  `scripts/deploy.sh` to produce a release package). `cargo build --workspace` is for
+  development; its artifacts are staged into `bin/` as well.
+- **Consistent**: docs, CI, and production share one entry point — behavior does not drift
+  with cargo invocation styles or feature resolution.
+- **Path semantics**: CLI `--api-path` / `--app-path` resolve against the **current working
+  directory** (CWD); `mounts:` api/web directories inside the config resolve against the
   config file's directory.
-- **Admission gate**: `--api-path` and the static site (`server.app_path` /
-  `--app-path`) — at least one must be specified explicitly or the server exits; when
-  both are specified, both directories must exist.
+- **Admission gate (v0.1.58)**: startup is refused when the top-level `mounts:` table
+  (config + CLI folding) is empty. `test` / `migrate` / `exec` / `openapi` accept
+  `--site <prefix>` to select one api mount (that tree and its prefix only).
 
 ---
 
 ## What a handler looks like
 
 `api.ts` default-exports a method table (`get`/`post`/`put`/`del`/`patch`/`head`/`options`).
-The globals are injected by the host — no import needed; `json.ok` / `json.fail` must be called
-exactly once to end the session.
+Globals are injected by the host — no imports; exactly one of `json.ok` / `json.fail` must
+be called to end the session.
 
 ```ts
 function get(): void {
@@ -162,111 +148,97 @@ function post(): void {
 export default { get, post };
 ```
 
-Responses are uniformly the `{code, msg, data}` envelope. Injected globals:
+Responses are the unified `{code, msg, data}` envelope. Injected globals:
 
 | Global | Purpose |
 |---|---|
-| `json` | `ok` / `fail` / `header` —— unified envelope and response headers |
-| `http` | read-only request context: `method` / `param()` / `query` / `headers` / `body` / `tenantId` |
-| `db` / `DB(name)` | SQL access; `db === DB("default")`, multiple DBs addressed by name |
-| `kv` / `redis` | key-value store (in-memory implementation when Redis is unconfigured) |
-| `blob(name)` | object storage (local / s3) |
-| `bus` | pub/sub (`publish` / `subscribe`), broadcast across instances |
+| `json` | `ok` / `fail` / `header` / `redirect` / `stream` / `sse` — envelope, headers, 3xx, streaming |
+| `http` | Read-only request context: `method` / `param()` / `query` / `headers` / `body` / `files` / `tenantId` / `user` |
+| `db` / `DB(name)` | SQL access; `db === DB("default")`, named databases; `db.asSystem` / `db.asTenant` request-scoped identity |
+| `kv` / `redis` | Key-value store (in-memory implementation when Redis is not configured) |
+| `blob(name)` | Object storage (local / s3; large-file direct upload via `blob.uploadUrl`) |
+| `bus` | Pub/sub (`publish` / `subscribe`), broadcast across instances |
 | `es` | Elasticsearch (`search` / `index` / `del`) |
-| `Mail(key)` / `mail` | email delivery (`send` / `sendSync` / `enqueue` / `result` / `sendRaw`); `smtp:` block + oj-mail plugin |
-| `LDAP(key)` / `ldap` | directory lookup / bind auth; `ldap:` block + oj-ldap plugin |
-| `Kafka(name)` / `RabbitMQ(name)` | named MQ clients (`kafkas:` / `rabbits:` blocks); task-pool consume/commit |
-| `ws` | WebSocket frame context |
-| `fetch` | WHATWG Fetch (deno_fetch: streaming body / AbortController) |
-| `log` | structured logging (tracing) |
-| `cert` / `jwt` / `bcrypt` / `crypto` | signing, tokens, hashing, crypto primitives |
-| `oidc` | OIDC RP helpers (see `docs/oidc-integration.md`) |
-| `tasks` | long-task pool registration (`tasks:` block) |
-| `vars` | deploy-time constants (`vars:` block, fail-closed) |
-| `plugins()` | introspection of loaded plugins |
-| `finish()` | end the session without writing a response |
+| `mail` | SMTP delivery (`send` / `enqueue`; allowlist enforced in the host) |
+| `Kafka(name)` / `RabbitMQ(name)` | Named MQ clients (long-task context) |
+| `tasks` | Long tasks (`src/tasks/` pooled tasks + crontab) |
+| `ws` | WebSocket frame context (`join` / `broadcast` room primitives) |
+| `cert` / `jwt` / `bcrypt` / `crypto` | Certificate / JWT sign-verify / password hashing / AES-GCM primitives |
+| `oidc` / `ldap` / `ldap(name)` | OIDC primitives and LDAP directory |
+| `fs` | Local files (jailed to `fs.root`) |
+| `vars` | Deployment-time constants (config `vars:` section, fail-closed) |
+| `plugins()` | Introspection of loaded plugins |
+| `ojInfo()` | Runtime diagnostics (same source as `oj info`) |
+| `finish()` | End the session without writing a response |
 
 ---
 
-## Directory-mirrored routing
+## Directory-mirror routing
 
-The directory tree *is* the route table — no registration required:
+The directory tree **is** the route table — no registration:
 
 ```
 sample/src/
   user/
-    manifest.yaml            # name / desc / version (source of build artifact version)
+    manifest.yaml            # name / desc / version (source of artifact versions)
     account/api.ts           → /v1/api/user/account/
     profile/detail/api.ts    → /v1/api/user/profile/detail/
     item/api.ts              → /v1/api/user/item/{id}   (see below)
-    _shared/validate.ts      # leading underscore = private, not a route
+    _shared/validate.ts      # underscore prefix = private, no route
   news/
     api.ts                   → /v1/api/news
     ws.ts                    → /v1/api/news/ws          (WebSocket)
 ```
 
-- **Path params**: attach `.route` to a handler to override the directory mirror —
-  `detail.route = "{id}"` makes `/v1/api/user/item/{id}` reachable (and `/v1/api/user/item`
-  returns 404 in that case).
-- **Import aliases**: shared code is reachable without counting `../` — `#_shared/validate`
-  anchors at the current module root (`user/_shared/validate.ts`), `#/user/_shared/validate`
-  at the src root. Anchors are derived from the importing file's location, so the same
-  specifier works in dev and in release; `oj build` materializes them into version-pinned
-  relative paths (cross-module aliases must be declared in `manifest.yaml` `deps`).
-- **WebSocket**: `ws.ts` is executed once per received text frame. After the first frame does
-  `bus.subscribe("news")`, any handler's `bus.publish("news", ...)` — including from other
-  instances — broadcasts to that connection.
-- **Prefix**: `/v1/api` comes from config `server.api_prefix`, overridable with `-b`.
+- **Path parameters**: attach `.route` to a handler to replace the mirror —
+  `detail.route = "{id}"` makes `/v1/api/user/item/{id}` reachable (`/v1/api/user/item`
+  becomes 404).
+- **Import aliases**: no more counting `../` — `#_shared/validate` anchors at the
+  **module root** (`user/_shared/validate.ts`), `#/user/_shared/validate` anchors at the
+  **src root**. Anchors derive from the importing file's own location, so the same spelling
+  works in dev and release; `oj build` materializes them as versioned relative paths
+  (cross-module aliases require `deps` in `manifest.yaml`).
+- **WebSocket**: `ws.ts` runs once per received text frame. After the first frame calls
+  `bus.subscribe("news")`, any handler's `bus.publish("news", ...)` (on any instance)
+  broadcasts to that connection.
+- **Prefix (v0.1.58)**: `/v1/api` comes from the api mount's `prefix` — mounts carry their
+  own full URL prefix; the URL is what you write. Multiple API trees / static sites are just
+  more mount lines (longest-prefix match, no cross-mount fallback).
 
 ---
 
 ## Configuration overview (`config.yaml`)
 
-A block's presence enables it, its absence disables it — that is the governing principle of
-configuration (full reference in `docs/user-manual.md`).
-
-> Since v0.1.57 the file itself is optional: every subcommand's `-c` falls back to a search —
-> `config.yaml` walking up from the CWD, then `$HOME/.oj/config.yaml` — and uses built-in
-> defaults when none is found (`build` / `openapi` / `exec` / `info` and static-only `serve`
-> need no config file at all). An explicit `-c` pointing at a missing file is still an error.
+A section present = enabled; absent = disabled — that is the governing principle (full
+reference and the **legacy-key migration guide** live in `docs/user-manual.md` §3/§3.1).
 
 ```yaml
+# Mount table (v0.1.58): one line = one URL prefix + one directory (api/web, exactly one).
+# Legacy server.api_prefix / app_path / app_prefix / static_sites have been removed.
+mounts:
+  - prefix: "/v1/api"    # api mount: /v1/api/<module>/...
+    api: "src"           #   runs src in dev, dist in release — auto-detected per mount
+  - prefix: "/"          # web mount: static site (GET/HEAD only; other methods → 405)
+    web: "dist"
+    # spa: true          # SPA deep-link fallback (default false; opt-in)
 server:
   host: "localhost"
   port: 9778
-  api_prefix: "/v1/api"  # API prefix (legacy key `base` still accepted)
-  app_path: "dist"      # static site root (omitted = no static serving; CLI --app-path is CWD-relative)
-  app_prefix: "/"       # static site prefix (default / = catch-all; e.g. "/site" serves only /site/*)
-  timeout: "30s"        # per-request execution timeout (blown → 408)
+  timeout: "30s"        # per-request execution timeout (circuit-breaks → 408)
   pool_size: 4          # JS execution concurrency
 db:
-  default: "sqlite://db.sqlite"     # multi-DB mixing: addressed by name via DB("name")
-redis:  {}    # present → connect for real (fail-fast at startup); commented out → in-memory KV
-es:     {}    # present → enables es.*
-blob:         # present → enables blob.* + {base}/blob/{key} download route
+  default: "sqlite://db.sqlite"     # multiple databases: DB("name")
+redis:  {}    # present = real connection (fail-fast at startup); commented out → in-memory KV
+es:     {}    # present = enable es.*
+blob:         # present = enable blob.* + the {mount-prefix}/blob/{key} download route
   driver: "local"       # local | s3
   root: "uploads"
-smtp:         # present → enables mail.* (needs the oj-mail plugin); one key per profile
-  default:
-    host: "smtp.example.com"
-    port: 465
-    tls: "tls"            # tls | starttls | none (none requires explicit allow_none_tls: true)
-    mechanism: "login"    # login (user+pass) | xoauth2 (user + xoauth2.access_token)
-    user: "api@example.com"
-    pass: "change-me"
-    allowed_from: ["noreply@x.com"]              # exact match; whitelists are fail-closed (empty = reject)
-    allowed_recipients: ["@x.com", "@partner.com"]  # "@domain" = exact domain, no subdomain wildcard
-tenant:       # multi-tenancy: request must carry header_key, value injected as http.tenantId
+tenant:       # multi-tenancy: requests must carry header_key; injected as http.tenantId
   enable: true
   header_key: "X-TENANT-ID"
-auth:         # JWT: built-in /v1/api/auth/{login,refresh,logout} + Bearer guard
+auth:         # JWT: oj-auth plugin guard (Bearer/cookie) + auth business routes (sample/src/auth/)
   jwt_secret: "change-me"
   anonymous_paths: ["/health"]
-oidc:         # optional: built-in OP (idp) + RP — standard OIDC code flow + PKCE S256 + RS256
-  issuer: "http://localhost:9778/v1/api/idp"
-  private_key_path: "./config/oidc_rs256.pem"
-  rp: { default: { issuer: "http://localhost:9778/v1/api/idp", client_id: "app", client_secret: "...", scope: "openid" } }
-  clients: { app: { secret: "...", redirect_uris: ["http://localhost:9778/v1/api/oidc/callback"], tenant: "default" } }
 ```
 
 ---
@@ -275,91 +247,90 @@ oidc:         # optional: built-in OP (idp) + RP — standard OIDC code flow + P
 
 ```
 only-js/
-  src/                  core library: src/bridge/ (JS↔Rust bridge, backend axes) + src/config.rs
-  oj/                  CLI binary: serve / build / test subcommands (orchestration entry)
-  serve/              axum HTTP service: route lookup → run handler → write back Capture
+  src/                 core library: src/bridge/ (JS↔Rust bridge, backend axes) + src/config.rs
+  oj/                  CLI binary: serve / build / test / exec / migrate / schema / secret
+                       / openapi / info subcommands (orchestration entry)
+  serve/               axum HTTP service: mount dispatch → run handler → write back Capture
   oj-plugin-ffi/       C-ABI contract shared by host and plugins (strict ABI_VERSION gate)
   plugins/             cdylib plugins: oj-es / oj-db-{mysql,postgres} / oj-blob-s3
-                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth / oj-mail
-  tools/xtask/         plugin build / copy / preflight tooling (outputs to bin/)
-  bin/                 build output: bin/oj (main) + bin/plugins/<triple>/ (plugin cdylibs)
-  sample/              runnable example project (config.yaml + src/ + dist/)
-  docs/                design and manuals
+                       / oj-bus-{kafka,rabbitmq} / oj-kv-redis / oj-auth
+                       / oj-mail / oj-ldap
+  tools/xtask/         plugin build / stage / preflight (artifacts staged into bin/)
+  bin/                 build artifacts: bin/oj (main binary) + bin/plugins/<triple>/ (plugin cdylibs)
+  sample/              runnable sample project (config.yaml + src/ + dist/)
+  docs/                design docs and manuals
 ```
 
-**Request path**: HTTP request → `serve` catch-all routing (incl. built-in `/auth/*`,
-`/blob/{key}`) → `RouteTable.lookup` → check out a `JsRuntime` from `RuntimePool` and reset
-per-request state → run the matching method of `api.ts` (transpiled first in dev mode) →
-capture the `{code,msg,data}` envelope → write back the response.
+**Request path**: HTTP request → `serve` picks a mount by longest-prefix match (api mount:
+built-in `/health`, `/plugins`, `/blob/{key}` → route table → pre-handler pipeline
+(auth + tenant) → dev directory-mirror fallback; web mount: static serving) → check out a
+`JsRuntime` from the `RuntimePool`, reset per-request state → run the matching method of
+`api.ts` (transpiled first in dev mode) → capture the `{code,msg,data}` envelope → write
+the response.
 
-**JS↔Rust boundary**: `src/bridge/mod.rs` registers all `op_*` via `deno_core::extension!`,
-and `bootstrap.js` assembles those ops into the globals table above. Each backend axis (db /
-kv / blob / bus / es / fetch / http / ws) is its own module.
+**JS↔Rust boundary**: `src/bridge/mod.rs` registers all `op_*` via `deno_core::extension!`;
+`bootstrap.js` assembles those ops into the globals listed above. Each backend axis
+(db / kv / blob / bus / es / fetch / http / ws / mail / ldap) lives in its own module.
 
-**Plugins**: at startup `dlopen` loads the cdylib, validates the ABI version and identity, then
-wraps the plugin vtable as a core backend; a panic inside a plugin is contained by
-`oj_plugin_entry!`'s `catch_unwind` into an error instead of aborting the host.
+**Plugins**: cdylibs are `dlopen`ed at startup; after ABI and identity checks the plugin
+vtables are wrapped into core backends. A panic inside a plugin is contained by
+`oj_plugin_entry!`'s `catch_unwind` into an error — the host never aborts. Business
+endpoints (login/logout etc.) are ordinary business routes (see `sample/src/auth/`),
+protected by the oj-auth plugin's Bearer/cookie guard.
 
 ---
 
 ## Common development commands
 
 ```bash
-cargo build --workspace                              # build all members (release; output to bin/)
-cargo test --release                                 # root crate unit tests
-cargo test --release --workspace                     # full test run (incl. oj e2e)
-cargo fmt --check                                    # formatting gate
-cargo clippy --release --all-targets -- -D warnings  # lint gate
-cargo bench                                          # criterion benchmarks
+cargo build --workspace                  # build all members (release, staged into bin/)
+cargo test --release                    # root-crate unit tests (release)
+cargo test --release --workspace         # full test suite (incl. oj e2e, release)
+cargo fmt --check                        # format gate
+cargo clippy --release --all-targets -- -D warnings   # lint gate (release)
+cargo bench                              # criterion benchmarks
 
-./bin/oj test -c sample/config.yaml             # run *.test.ts in-process (no server needed)
-cargo xtask bin                                 # build oj and copy into bin/oj
-cargo xtask plugin <name>                       # build plugin and copy into bin/plugins/<triple>/
+./bin/oj test -c sample/config.yaml             # run *.test.ts in-process (no server)
+cargo xtask bin                                 # build oj and stage into bin/oj
+cargo xtask plugin <name>                       # build a plugin into bin/plugins/<triple>/
 cargo xtask plugin <name> --check               # plugin preflight (ABI / identity / semver / symbols)
 cargo xtask build                               # build oj + all plugins into bin/
-cargo xtask smoke --bin bin/oj                  # release gate: minimal `oj build` with build-machine JS sources hidden
+cargo xtask smoke --bin bin/oj                  # release gate (minimal oj build with build-machine sources hidden)
 ```
 
-For async tests use `tokio::test(flavor = "current_thread")` — `JsRuntime` is `!Send`.
-Do not use `deno test`: the globals a handler depends on exist only inside this bridge.
+Async tests must use `tokio::test(flavor = "current_thread")` — `JsRuntime` is `!Send`.
+Do not use `deno test`: the globals handlers rely on exist only in this bridge.
 
 ---
 
 ## Design red lines
 
-- **SQL**: dynamic identifiers come only from the `SchemaRegistry` allowlist; values go only
-  through bound parameters, never string concatenation.
-- **`JsRuntime` is `!Send`**: the pool and its holder live on the same `current_thread`
-  runtime; inspector/WS use `spawn_local`.
-- **`panic = "unwind"`**: must hold across all plugin profiles, otherwise cross-boundary panic
-  containment breaks.
+- **SQL**: dynamic identifiers come only from the `SchemaRegistry` allowlist; values only
+  through bound parameters — never concatenated.
+- **`JsRuntime` is `!Send`**: the pool and everything holding it stays on a
+  `current_thread` runtime; inspector/WS use `spawn_local`.
+- **`panic = "unwind"`**: keep it in every plugin profile, or cross-boundary panic
+  containment stops working.
 - **`bootstrap.js` must stay 7-bit ASCII** (non-ASCII triggers a deno_core error).
-- Failed runtimes are always dropped, never returned to the pool.
+- **Config credentials**: passwords/keys in config are always sealed as `ENC[...]`
+  (`oj secret seal`); private keys stay on the deploy machine and never enter the repo.
+- A failed runtime is always discarded, never returned to the pool.
 
 ---
 
-## Documentation
+## Docs
 
-| Doc | Content |
+| Doc | Contents |
 |---|---|
-| `docs/devkit/` | **对外 JS API 手册（权威）**：api-manual / scenarios / SKILL / README（`bin/devkit/` 随构建归置） |
-| `docs/modules/` | **模块说明索引**（每个 crate / 子系统的职责、边界、文件地图） |
-| `docs/review-2026-09-06.md` | 全模块代码与架构审查（含 P0/P1 清单与整改记录） |
-| `docs/archive/` | 归档的历史方案/预案（**不描述当前实现**，附「现在该读哪篇」指路表） |
-| `docs/user-manual.md` | full `oj` CLI and `config.yaml` reference |
-| `docs/dev-guide.md` | developer manuals (incl. adding a new op) |
-| `docs/bridge.md` | JS globals and module cross-reference |
-| `docs/plugins/plugin-development.md` | plugin architecture and development |
-| `docs/route-params-design.md` | path-param routing design |
-| `docs/testing.md` | testing conventions |
-| `docs/migration.md` | migration runbook (schema.yaml / migrations / ledger / guards) |
-| `docs/db-guide.md` / `docs/tenant-guide.md` | data layer / multi-tenancy |
-| `docs/secrets.md` | sealed credentials (`ENC[...]`, `oj secret`) |
-| `docs/oidc-integration.md` / `docs/ldap-integration.md` / `docs/mail-smtp.md` / `docs/mq-tasks.md` | integration manuals |
-| `docs/ops-manual.md` | operations |
-| `docs/exec-integration.md` | `oj exec` integration manual (run ts/js scripts with the full backend, v0.1.29) |
-| `docs/benchmarks.md` | performance data |
-| `sample/README.md` | example project notes |
+| `docs/user-manual.md` | Full `oj` CLI and `config.yaml` reference (§3.1 legacy-key migration guide) |
+| `docs/dev-guide.md` | Development manual (incl. how to add a new op) |
+| `docs/devkit/api-manual.md` | Business development manual (global-object API, scenarios; ships as `devkit/`) |
+| `docs/bridge.md` | JS globals ↔ modules map |
+| `docs/plugins/plugin-development.md` | Plugin architecture and development |
+| `docs/testing.md` | Testing conventions |
+| `docs/ops-manual.md` | Operations |
+| `docs/benchmarks.md` | Performance data |
+| `sample/README.md` | Sample project guide |
 
-> `docs/dev-guide.md` merges the daily-development manual and the internal
-> implementation walkthrough; for commands and structure this file and the code are authoritative.
+> `docs/dev-guide.md` is the development manual (day-to-day work + internal walkthrough,
+> merged); commands and structure defer to this file and the code.

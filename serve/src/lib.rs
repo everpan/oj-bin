@@ -3180,7 +3180,6 @@ pub(crate) mod tests {
             fingerprint: "fp".into(),
             description: "auth guard".into(),
             host_abi_version: 0,
-            unknown_axes: Vec::new(),
         }]);
         // handler 以 route 形态挂在 base 下，直接调（base 前缀拼接的路径校验在集成层）。
         let resp = crate::plugins_handler(axum::extract::State(st)).await;

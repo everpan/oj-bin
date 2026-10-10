@@ -39,7 +39,6 @@ mod tests {
             fingerprint: "test-fingerprint".into(),
             description: "test plugin".into(),
             host_abi_version: oj_plugin_ffi::ABI_VERSION,
-            unknown_axes: Vec::new(),
         }
     }
 

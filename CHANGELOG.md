@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.59（未打标签）
+
+**fix（cli）**：`oj exec` / `test` / `migrate` / `schema diff` / `openapi` 缺省目录探测
+（无 `-d`、无 api 挂载时向上搜 src/dist）只认「像业务树」的候选——首层 `*/manifest.yaml`、
+`manifests.yaml`（release 锁）或空树；源码仓自己的 `src/`（首层子目录无 manifest）被跳过，
+裸 `oj exec` 不再在源码仓根爆 `module 'bridge' missing manifest.yaml`；全程无合格候选 →
+回落 `.oj-no-api` 占位目录（必然不存在，模块扫描 = 零模块）并打 note 指路 `-d`/`-c`——
+exec（纯脚本不需要表白名单）照常跑，test/migrate/schema diff 由各自的目录存在性检查给出
+明确报错。**`oj exec` 不需要 config.yaml**（v0.1.57 起 `-c` 可省，纯计算脚本零配置可跑）。
+文档同步：exec 章明确该契约，user-manual §3.1 增补完整「改前 → 改后」迁移示例。
+
+**chore（plugins）**：移除 `oj info` / `ojInfo()` / `GET {base}/plugins` / JS `plugins()`
+输出里恒空的 `unknown_axes` 字段（v0.1.54 引入的「宿主升级窗口信号」零下游消费——泛型轴
+通道承接一切合法新轴，typed 未知名在装配期 stderr 告警后忽略，告警保留）。插件自省面
+键集收敛为六键：`{name, semver, abi_version, fingerprint, description, host_abi_version}`。
+
 ## v0.1.58
 
 **breaking（config/serve）**：站点配置删除旧键，升级为顶层 `mounts:` 扁平挂载表——

@@ -54,7 +54,7 @@ pub(crate) const TYPED_AXES: &[&str] =
 
 入口宏双发：per-axis `oj_plugin_axis_<name>` 符号 + 清单符号 **`oj_plugin_axes()`**
 （`RVec<AxisDecl>`：轴名 + kind + vtable）。`probe_axes` **自报清单优先**——TYPED 且名在
-`TYPED_AXES` 填 typed 槽（名不在 → `unknown_axes` 告警）；**GENERIC**（`generic(name) => &VT`
+`TYPED_AXES` 填 typed 槽（名不在 → stderr 告警并忽略）；**GENERIC**（`generic(name) => &VT`
 宏臂，v0.1.54）进泛型轴注册表，JS 经 `axis("name").op(...)` 调用——**新轴零宿主改动**。
 清单符号缺失的旧插件回落逐轴 `dlsym("oj_plugin_axis_<name>")`（deprecated 告警，免重编
 兼容）：**缺符号或返回 null = 不提供该轴（非错误）**。加类型化轴 = `TYPED_AXES` 加一行 +

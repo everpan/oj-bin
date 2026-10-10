@@ -27,7 +27,6 @@
 | `fingerprint` | `string` | 构建指纹（核对外发产物一致性） |
 | `description` | `string` | 插件作者自述（descriptor 必填项） |
 | `host_abi_version` | `number` | **宿主**当前 ABI 版本（每条记录重复携行，方便逐条比对） |
-| `unknown_axes` | `string[]` | v0.1.54 起：插件自报轴清单（`oj_plugin_axes()`）中**宿主不认识的类型化轴名**——宿主升级窗口信号；旧插件无此字段 |
 
 ## 错误
 

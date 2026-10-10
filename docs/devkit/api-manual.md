@@ -1614,7 +1614,7 @@ wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj t
 签名：`plugins(): any[]`。返回已加载插件清单
 `[{name, semver, abi_version, fingerprint, description, host_abi_version}]`——用于升级核对窗口
 （第 11 章插件升级）；`description` 为插件作者自述。v0.1.54 起插件**自报轴清单**
-（`oj_plugin_axes()`），插件声明了但宿主不认识的类型化轴名收在增量字段 `unknown_axes`
+（`oj_plugin_axes()`）；v0.1.58 起插件声明了但宿主不认识的类型化轴名在装配期 stderr 告警后忽略（不再出现在 `plugins()`/`{base}/plugins` 输出里）
 （旧插件无此字段）。同一清单经内置端点 `GET {base}/plugins` 公开（不走 Bearer，运维/监控用）。
 
 ```ts
@@ -1653,7 +1653,7 @@ JS 出口：handler 里 `ojInfo()` **同步**返回五段诊断对象（装配�
   "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…" },  // config_path 仅 oj info CLI 出，JS ojInfo() 无此字段
   "abi":     { "abi_version": 11, "host_fingerprint": "…" },
   "plugins": [ { "name": "…", "semver": "…", "abi_version": 11, "fingerprint": "…",
-                 "description": "…", "host_abi_version": 11, "unknown_axes": [] } ],
+                 "description": "…", "host_abi_version": 11 } ],
   "backends":{ "db_schemes": {"declared": ["default"]}, "blob_configured": true, "kv_plugin": true,
                "auth_plugin": true, "mail_plugin": false, "ldap_plugin": false, "es_plugin": false,
                "mq_plugins": ["kafka"], "bus_kinds": ["local"], "dbs_registered": ["sqlite", "mysql", "postgres", "memory"] },
@@ -2926,6 +2926,13 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 `crypto`/`oidc`/`ldap`/`mail`/`mq`），经 `assemble_backend` 装配，db/kv/es/blob/bus/插件
 全部可用。专题手册：仓库 `docs/exec-integration.md`。
 
+**config.yaml 不是必需的**（v0.1.57 起 `-c` 可省）：省略时按「CWD 逐级向上 `config.yaml`
+→ `$HOME/.oj/config.yaml`」搜索，都没有就用内置默认值（stderr 打 `note:`）——纯计算脚本
+（`-e 'console.log(1)'` 之类，不碰 db/表白名单）零配置可跑。目录解析（`-d` 缺省时）：取
+config/mounts 的第一条 api 挂载，无挂载才向上探测（只认「像业务树」的候选，见 `-d`
+参数行）；在源码仓根这类「祖先带非业务 `src/`」的地方裸跑，会得到 `service dir not
+found` 指路 `-d`/`-c`，而不是把别人的树当模块扫。
+
 三种用法互斥（**三者缺省——裸 `oj exec`——v0.1.55 起进 REPL**）：
 
 - **`<file>`**：执行磁盘上的 `.ts`/`.js` 文件（`file + --code` / `file + --repl` 由 clap 报错）。
@@ -2947,7 +2954,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 | `-e, --code` | 三选一，缺省 REPL | 内联代码（TypeScript 语法）；不落盘、自包含——**不支持相对 import**（无基准目录，合成 `file:///oj-eval.ts` specifier）；与 `<file>`/`--repl` 互斥 |
 | `--repl` | 三选一，缺省 REPL | 交互式 REPL：逐行读 stdin 求值，后端全局可用；每行独立模块、顶层绑定作用域隔离，**跨行共享状态须显式 `globalThis.x = …`**；与 `<file>`/`--code` 互斥。真终端下由 **rustyline** 接管原始终端（方向键 / 行内编辑 / ↑↓ 翻历史，不再把 `\x1b[A` 等转义序列回显成乱串）；管道 / 重定向输入走普通回放（CI、测试、文件回放）。**裸 `oj exec`（无 file/-e/--repl）缺省即进 REPL（v0.1.55）** |
 | `-c` | `config.yaml` | 配置文件路径 |
-| `-d` | 自动探测 | schema 白名单来源目录（自 config 同级向上逐级搜，同 `oj test`）；探测不到 → 空 SchemaRegistry + stderr warn 继续（纯 kv/log/fetch 脚本不需要表白名单） |
+| `-d` | 自动探测 | schema 白名单来源目录（自 config 同级/CWD 向上逐级搜，同 `oj test`；只认「像业务树」的候选——首层 `*/manifest.yaml`、`manifests.yaml` 或空树，源码仓自己的 `src/` 会被跳过）；无合格候选 → 报 `service dir not found` 指路 `-d`/`-c`（纯 kv/log/fetch 脚本不受影响，给了 `-d` 或空树即可跑） |
 | `--db` | 无 | 默认库重定向（同 `oj test`；未声明的库名 fail-fast，不回落 default） |
 | `--redis` | 无 | 选中 `config.redis.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
 | `--blob` | 无 | 选中 `config.blob.backends.<profile>` 为默认源（v0.1.34）；未声明即 fail-fast |
