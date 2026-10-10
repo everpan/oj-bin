@@ -188,7 +188,7 @@ async fn ws_rooms_join_broadcast_leave_and_disconnect_cleanup_end_to_end() {
     // 严格清单只装 oj-auth（隔离扫描模式与插件单例）；守卫不接线（cfg.auth = None）。
     cfg.plugins
         .insert("auth".into(), serde_json::Value::Object(Default::default()));
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 

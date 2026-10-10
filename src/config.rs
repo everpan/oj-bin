@@ -60,18 +60,39 @@ where
     single_or_named_map(d)
 }
 
-/// 多静态站点条目（v0.1.27，`server.static_sites`）：前缀→目录映射。
-/// `prefix` 规范化见 serve_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 唯一）；
-/// `path` 相对 config 目录（CLI `--app-path prefix=dir` 给出的已按 CWD 预绝对化）。
+/// 挂载条目（v0.1.58，顶层 `mounts:` 扁平挂载表）：一行 = 一个 URL 前缀 + 一个目录。
+/// `api`/`web` 恰好其一（校验见 [`validate_mounts`]）；`prefix` 归一化见
+/// serve_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 允许）；api/web 目录相对
+/// config 目录（CLI 折叠进来的条目已按 CWD 预绝对化）。
+/// `headers` 用 BTreeMap 保证输出定序（serve 端转 `Vec<(String,String)>`）。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct StaticSiteConf {
+pub struct MountConf {
     pub prefix: String,
-    pub path: String,
-    /// 该站点的自定义响应头（v0.1.30，如 CSP）：覆盖 `server.response_headers`
+    /// api 挂载：服务该目录下的模块路由（src 源码树或 oj build 产物 dist）。
+    #[serde(default)]
+    pub api: Option<String>,
+    /// web 挂载：静态站点根目录；`spa: true` 显式开启 SPA 深链接回落（默认 false，
+    /// 继承 v0.1.20「静默 404→200 掩盖错配」的立论）。
+    #[serde(default)]
+    pub web: Option<String>,
+    #[serde(default)]
+    pub spa: Option<bool>,
+    /// 该站点的自定义响应头（v0.1.30 语义沿用，如 CSP）：覆盖 `server.response_headers`
     /// 里同名的全局头；框架自有头（Content-Type/Content-Length 等）永远优先。
     #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
+    pub headers: std::collections::BTreeMap<String, String>,
 }
+
+/// v0.1.58 删除的旧站点键（`server.*`）：出现即报错并输出迁移后的 `mounts:` YAML
+/// （见 `load_with_extra` 的 `detect_legacy_server_keys`，绝不静默迁移）。
+pub const LEGACY_SITE_KEYS: &[&str] = &[
+    "app_path",
+    "app_prefix",
+    "static_sites",
+    "api_prefix",
+    "base",
+    "app_spa_fallback",
+];
 
 /// 路由级 timeout 覆盖（v0.1.30，`server.route_timeouts`）：pattern 段语义与
 /// tenant anonymous_paths 相同（字面 / `*` 恰好一段 / `**` 跨段），按声明顺序
@@ -88,28 +109,8 @@ pub struct RouteTimeoutConf {
 pub struct ServerCfg {
     pub host: String,
     pub port: u16,
-    /// API 基础路由前缀（如 "/v1/api"）；CLI `-b` 显式给出时覆盖。
-    /// 旧键名 `base` 仍可解析（serde alias），两键并存 → duplicate field 报错。
-    #[serde(alias = "base")]
-    pub api_prefix: String,
-    /// 静态站点前缀（默认 "/" = 全路径兜底）。非 "/" 时仅该前缀下的 GET/HEAD
-    /// 落静态目录（前缀剥除后解析；前缀根 → index.html），前缀外一律 404。
-    /// API 路由永远优先于静态兜底。
-    pub app_prefix: String,
-    /// 静态站点根目录（相对 config 所在目录）；None → 不开静态服务。
-    /// CLI `--app-path` 显式给出时覆盖，且按 CWD 解析（serve_cmd 预绝对化后写入）。
-    pub app_path: Option<String>,
-    /// 多静态站点（v0.1.27）：前缀→目录映射列表。与 (app_prefix, app_path) 主站点
-    /// 共存；规范化后前缀重复 → 启动 fail-fast。缺省空。
-    #[serde(default)]
-    pub static_sites: Vec<StaticSiteConf>,
-    /// SPA 深链接回落（v0.1.20）：静态未命中 + 无扩展名 + Accept html + 不在 api_prefix
-    /// 下 → 送 `<app_path>/index.html`。**默认 false** —— 静默把 404 变 200 会掩盖错配
-    /// （拼错的 API 路径、丢掉的静态资源），故 SPA 工程显式开启。
-    #[serde(default)]
-    pub app_spa_fallback: bool,
-    /// 路由感知 meta 目录（v0.1.20）：相对 `app_path` 的子目录名（如 `"__meta"`）。
-    /// 送 HTML 前按请求路径查 `<app_path>/<html_meta>/<path>.json`，把 `title`/
+    /// 路由感知 meta 目录（v0.1.20）：相对各 web 挂载根的子目录名（如 `"__meta"`）。
+    /// 送 HTML 前按请求路径查 `<挂载root>/<html_meta>/<path>.json`，把 `title`/
     /// `description`/`og:*`/`twitter:*`/`canonical` 注入 `<head>`（值 HTML 转义，
     /// **不注入脚本**）。None = 不注入。该目录对静态服务不可见（命中即 404）。
     #[serde(default)]
@@ -201,11 +202,6 @@ impl Default for ServerCfg {
             // 9778：与 README / sample/config.yaml / devkit 手册一致（此前为 778，
             // 省缺 port 的用户会静默落到与文档不同的端口）。
             port: 9778,
-            api_prefix: "/v1/api".into(),
-            app_prefix: "/".into(),
-            app_path: None,
-            static_sites: Vec::new(),
-            app_spa_fallback: false,
             html_meta: None,
             html_meta_handler: None,
             html_cache_control: None,
@@ -577,6 +573,195 @@ pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// mounts 结构校验（v0.1.58 规则 1/2 + 「api/web 恰好其一」）。load 期统一执行；
+/// 跨条目前缀判定用轻量归一（去尾斜杠，`/docs` 与 `/docs/` 同 prefix）——
+/// 「必须以 `/` 开头 / 目录 canonicalize / 逐条目 dev-release 判定」归装配期
+/// `resolve_mounts`（规则 4，oj/src/app.rs）。
+pub fn validate_mounts(mounts: &[MountConf]) -> Result<(), String> {
+    let norm = |p: &str| {
+        let t = p.trim_end_matches('/');
+        if t.is_empty() {
+            "/".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    for (i, m) in mounts.iter().enumerate() {
+        let at = |what: String| format!("mounts[{i}] (prefix {:?}): {what}", m.prefix);
+        if m.prefix.trim().is_empty() {
+            return Err(at("prefix must not be empty (omit the key instead)".into()));
+        }
+        match (&m.api, &m.web) {
+            (Some(_), Some(_)) => {
+                return Err(at(
+                    "`api` and `web` are mutually exclusive — one mount = one directory".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(at("exactly one of `api` or `web` is required".into()));
+            }
+            (Some(a), None) | (None, Some(a)) => {
+                if a.trim().is_empty() {
+                    let key = if m.api.is_some() { "api" } else { "web" };
+                    return Err(at(format!(
+                        "{key} must not be empty (omit the key instead)"
+                    )));
+                }
+            }
+        }
+        if m.spa == Some(true) && m.web.is_none() {
+            return Err(at("`spa: true` only applies to a web mount".into()));
+        }
+    }
+    // 同类重复拒绝（api×api / web×web）；同 prefix 一条 api + 一条 web 合法（api 优先）。
+    let mut seen: Vec<(String, bool)> = Vec::new(); // (归一 prefix, is_api)
+    for (i, m) in mounts.iter().enumerate() {
+        let p = norm(&m.prefix);
+        let is_api = m.api.is_some();
+        if seen.iter().any(|(q, a)| *q == p && *a == is_api) {
+            let kind = if is_api { "api" } else { "web" };
+            return Err(format!(
+                "mounts[{i}]: duplicate {kind} mount prefix {p:?} (same-kind duplicates are rejected; one api + one web on the same prefix is allowed)"
+            ));
+        }
+        seen.push((p, is_api));
+    }
+    // spa 约束：`spa: true` 要求同 prefix 无 api 挂载（配对 web 不回落；嵌套 api
+    // 经最长前缀命中吞不掉，也轮不到该 web 的回落）。
+    for (i, m) in mounts.iter().enumerate() {
+        if m.spa != Some(true) {
+            continue;
+        }
+        let p = norm(&m.prefix);
+        if mounts
+            .iter()
+            .any(|o| o.api.is_some() && norm(&o.prefix) == p)
+        {
+            return Err(format!(
+                "mounts[{i}]: `spa: true` requires no api mount on the same prefix {p:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 旧站点键检测（v0.1.58 规则 3）：`server.*` 五旧键（含 `api_prefix` 的 serde alias
+/// `base`）任一出现 → 报错并输出迁移后的 `mounts:` YAML。在 `load_with_extra` 的
+/// **解密后 Value 树上、typed 反序列化之前**检测——`ServerCfg` 无 `deny_unknown_fields`，
+/// 删字段后旧键会被静默忽略，此处是唯一防线；加密/明文两路径统一走这棵树。
+pub fn detect_legacy_server_keys(value: &serde_yaml::Value) -> Result<(), String> {
+    let Some(server) = value.get("server").and_then(|s| s.as_mapping()) else {
+        return Ok(());
+    };
+    let has = |k: &str| server.get(k).is_some_and(|v| !v.is_null());
+    // `base` 与 `api_prefix` 同物（alias）：并存时 serde 报 duplicate field，
+    // 单独出现时按同一概念报告，不重复列两行。
+    let mut hit: Vec<String> = Vec::new();
+    if has("api_prefix") || has("base") {
+        hit.push("api_prefix".into());
+    }
+    for k in ["app_path", "app_prefix", "static_sites", "app_spa_fallback"] {
+        if has(k) {
+            hit.push(k.into());
+        }
+    }
+    if hit.is_empty() {
+        return Ok(());
+    }
+    Err(legacy_migration_message(server, &hit))
+}
+
+/// 旧写法 → 新写法逐键两列 + 等价 `mounts:` 块（规则 3）。`app_spa_fallback: true`
+/// 作用于**每一个** web 条目——旧版它是全局开关（StaticOpts.spa_fallback），
+/// 只映射主站点会静默丢掉 static_sites 的 SPA 行为（评审 F1）。
+fn legacy_migration_message(server: &serde_yaml::Mapping, hit: &[String]) -> String {
+    let s = |k: &str| {
+        server
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let app_path = s("app_path");
+    let app_prefix = s("app_prefix").unwrap_or_else(|| "/".into());
+    let spa = server
+        .get("app_spa_fallback")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut per_key: Vec<String> = Vec::new();
+    let mut entries: Vec<String> = Vec::new();
+    let entry = |prefix: &str, web: &str| {
+        let mut e = format!("  - prefix: {prefix:?}\n    web: {web:?}");
+        if spa {
+            e.push_str("\n    spa: true");
+        }
+        e
+    };
+    if let Some(p) = &app_path {
+        per_key.push(format!(
+            "  server.app_path + server.app_prefix {app_prefix:?}  →  {{ prefix: {app_prefix:?}, web: {p:?} }}"
+        ));
+        entries.push(entry(&app_prefix, p));
+    } else if hit.iter().any(|k| k == "app_path" || k == "app_prefix") {
+        per_key.push("  server.app_prefix（无 app_path）  →  跳过：无主站点可迁移".into());
+    }
+    // static_sites 逐条（含 headers）。
+    if let Some(list) = server.get("static_sites").and_then(|v| v.as_sequence()) {
+        for (i, site) in list.iter().enumerate() {
+            let (prefix, path) = (
+                site.get("prefix").and_then(|v| v.as_str()).unwrap_or("?"),
+                site.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+            );
+            per_key.push(format!(
+                "  server.static_sites[{i}] (prefix {prefix:?})  →  {{ prefix: {prefix:?}, web: {path:?} }}"
+            ));
+            let mut e = entry(prefix, path);
+            if let Some(headers) = site.get("headers").and_then(|v| v.as_mapping()) {
+                let pairs: Vec<String> = headers
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        Some(format!(
+                            "{}: {}",
+                            k.as_str()?,
+                            serde_yaml::to_string(v).ok()?.trim().to_string()
+                        ))
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    e.push_str(&format!("\n    headers: {{ {} }}", pairs.join(", ")));
+                }
+            }
+            entries.push(e);
+        }
+    }
+    if server.get("app_spa_fallback").is_some() {
+        per_key.push(format!(
+            "  server.app_spa_fallback: {spa}  →  每个 web 条目的 `spa: {spa}`（旧版为全局开关）"
+        ));
+    }
+    // api_prefix / base：无从机械映射（目录只有用户知道）。
+    if let Some(p) = s("api_prefix").or_else(|| s("base")) {
+        per_key.push(format!(
+            "  server.api_prefix {p:?}  →  api 挂载自带完整 prefix（CLI -b 不再需要）：\n     - prefix: {p:?}\n       api: <api 目录>"
+        ));
+        entries.push(format!("  # - prefix: {p:?}\n  #   api: \"<api 目录>\""));
+    }
+    let mounts_block = if entries.is_empty() {
+        "  (no web/static entries to migrate — api mounts are hand-written)".to_string()
+    } else {
+        entries.join("\n")
+    };
+    format!(
+        "config uses removed `server.*` site keys (v0.1.58): {} — migrate to top-level `mounts:`\n\
+         (one line = one URL prefix + one directory; api and web are separate entries)\n\n\
+         old → new:\n{}\n\n\
+         equivalent `mounts:` block:\nmounts:\n{}\n\n\
+         see docs/user-manual.md §3 (mounts)",
+        hit.join(", "),
+        per_key.join("\n"),
+        mounts_block
+    )
+}
+
 /// 多租户注入（OJ-3）：enable 后 handle() 从 header 提取租户 id 注入 http.tenantId。
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -939,6 +1124,11 @@ impl Default for SqlTraceCfg {
 #[serde(default)]
 pub struct Config {
     pub server: ServerCfg,
+    /// 挂载表（v0.1.58）：一行 = 一个绝对 URL 前缀 + 一个目录（api/web 恰好其一）。
+    /// 校验见 [`validate_mounts`]；目录解析/前缀归一/逐条目 dev-release 判定在
+    /// oj/src/app.rs `resolve_mounts`。缺省空（serve 须有 CLI 挂载，否则报错）。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub mounts: Vec<MountConf>,
     /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 仅 default 为 sqlite 时重放）。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db: HashMap<String, String>,
@@ -1024,6 +1214,7 @@ pub struct Config {
 pub fn known_top_level_keys() -> &'static [&'static str] {
     &[
         "server",
+        "mounts",
         "db",
         "redis",
         "tenant",
@@ -1106,8 +1297,13 @@ pub fn load_with_extra(path: &Path, dir: &Path) -> Result<LoadedConfig, String> 
     } else {
         &text
     };
+    // 旧站点键检测（v0.1.58 规则 3）：解密后 Value 树、typed 反序列化之前——
+    // `ServerCfg` 无 deny_unknown_fields，typed 层拦不住已删除的旧键（静默忽略）。
+    detect_legacy_server_keys(&value).map_err(|e| format!("{}: {e}", path.display()))?;
     let config: Config =
         serde_yaml::from_str(final_text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // mounts 结构校验（v0.1.58 规则 1/2）：空串 / api+web 双写 / 同类重复 / spa 约束。
+    validate_mounts(&config.mounts).map_err(|e| format!("{}: {e}", path.display()))?;
     // 两-pass 的 second pass：同一（解密后）Value 树得**全量**顶层 mapping 的 JSON 形
     //（已知 + 未知段；段值保持 YAML 类型化形态，数字仍是数字——与 typed Config 的裸标量
     // 读串行为分层，互不影响）。全量语义是 spec 裁定：插件自报 config key 可撞宿主已知
@@ -1289,9 +1485,7 @@ cache:
     fn defaults_when_no_file() {
         let c = load_from(std::path::Path::new("/nonexistent-dir"), None).unwrap();
         assert_eq!((c.server.host.as_str(), c.server.port), ("localhost", 9778));
-        assert_eq!(c.server.api_prefix, "/v1/api");
-        assert_eq!(c.server.app_prefix, "/");
-        assert!(c.server.app_path.is_none());
+        assert!(c.mounts.is_empty());
         assert_eq!(parse_duration(&c.server.timeout).unwrap().as_secs(), 30);
         assert_eq!(c.server.pool_size, 4);
         assert!(c.db.is_empty() && c.redis.is_empty());
@@ -1526,61 +1720,147 @@ cache:
     fn parses_url_style_dsn_map() {
         let dir = std::env::temp_dir().join(format!("ojcfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // `base:` 为旧键名（serde alias）——本用例兼测旧配置兼容；新键 `api_prefix`
-        // 与旧键并存时 serde 报 duplicate field（防两处配置漂移）。
         std::fs::write(dir.join("cfg.yaml"), concat!(
-            "server:\n  host: 0.0.0.0\n  port: 9000\n  base: /xapi\n  app_prefix: /site\n  app_path: public\n  timeout: 5s\n  pool_size: 2\n",
+            "server:\n  host: 0.0.0.0\n  port: 9000\n  timeout: 5s\n  pool_size: 2\n",
+            "mounts:\n  - { prefix: /xapi, api: src }\n",
             "db:\n  default: sqlite://db.sqlite\n",
             "redis:\n  default: redis://127.0.0.1:6379/1\n",
         )).unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert_eq!(c.server.host, "0.0.0.0");
-        assert_eq!(c.server.api_prefix, "/xapi");
-        assert_eq!(c.server.app_prefix, "/site");
-        assert_eq!(c.server.app_path.as_deref(), Some("public"));
+        assert_eq!(c.mounts[0].prefix, "/xapi");
+        assert_eq!(c.mounts[0].api.as_deref(), Some("src"));
         assert_eq!(c.db["default"], "sqlite://db.sqlite");
         assert_eq!(c.redis.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn static_sites_parse_and_default() {
+    fn mounts_parse_and_default() {
         // 缺省为空表。
-        assert!(ServerCfg::default().static_sites.is_empty());
-        // round-trip：前缀→目录两条（含 "/" 兜底站点）。
+        let c = load_from(std::path::Path::new("/nonexistent"), None).unwrap();
+        assert!(c.mounts.is_empty());
+        // round-trip：api + web + 配对 + headers（BTreeMap）+ spa。
         let dir = std::env::temp_dir().join(format!("ojcfgsites-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("cfg.yaml"),
-            "server:\n  static_sites:\n    - { prefix: /docs, path: d1 }\n    - { prefix: /, path: d2 }\n",
+            concat!(
+                "mounts:\n",
+                "  - { prefix: /v1/api, api: src }\n",
+                "  - prefix: /docs\n",
+                "    web: d1\n",
+                "    spa: true\n",
+                "    headers: { b: 2, a: 1 }\n",
+            ),
         )
         .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        assert_eq!(c.mounts.len(), 2);
+        assert_eq!(c.mounts[0].prefix, "/v1/api");
+        assert_eq!(c.mounts[0].api.as_deref(), Some("src"));
+        assert!(c.mounts[0].web.is_none() && c.mounts[0].spa.is_none());
+        assert_eq!(c.mounts[1].web.as_deref(), Some("d1"));
+        assert_eq!(c.mounts[1].spa, Some(true));
+        // BTreeMap 输出定序（键序与书写序无关）。
         assert_eq!(
-            c.server.static_sites,
-            vec![
-                StaticSiteConf {
-                    prefix: "/docs".into(),
-                    path: "d1".into(),
-                    headers: Default::default(),
-                },
-                StaticSiteConf {
-                    prefix: "/".into(),
-                    path: "d2".into(),
-                    headers: Default::default(),
-                },
-            ]
+            c.mounts[1].headers.keys().collect::<Vec<_>>(),
+            vec!["a", "b"]
         );
+        // 根 `/` 前缀合法（规则 4 的解析归装配期，这里只钉解析不拒）。
+        std::fs::write(dir.join("cfg.yaml"), "mounts:\n  - { prefix: /, web: d2 }\n").unwrap();
+        assert_eq!(load_from(&dir, Some("cfg.yaml")).unwrap().mounts[0].prefix, "/");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 规则 1/2 校验矩阵：空串、api/web 恰好其一、同类重复、api+web 配对、spa 约束。
+    #[test]
+    fn mounts_validation_matrix() {
+        let m = |prefix: &str, api: Option<&str>, web: Option<&str>, spa: Option<bool>| MountConf {
+            prefix: prefix.into(),
+            api: api.map(Into::into),
+            web: web.map(Into::into),
+            spa,
+            headers: Default::default(),
+        };
+        // api/web 双写 → Err；双缺 → Err。
+        assert!(validate_mounts(&[m("/p", Some("a"), Some("w"), None)]).is_err());
+        assert!(validate_mounts(&[m("/p", None, None, None)]).is_err());
+        // 值空串 → Err（规则 1）。
+        for bad in [
+            m("", Some("a"), None, None),
+            m("/p", Some(""), None, None),
+            m("/p", None, Some("  "), None),
+        ] {
+            let e = validate_mounts(&[bad]).unwrap_err();
+            assert!(e.contains("must not be empty"), "{e}");
+        }
+        // api+web 同 prefix 配对 → Ok（api 优先）。
+        assert!(
+            validate_mounts(&[m("/p", Some("a"), None, None), m("/p", None, Some("w"), None)])
+                .is_ok()
+        );
+        // 同类重复 → Err（含尾斜杠归一口径）。
+        assert!(validate_mounts(&[m("/docs", None, Some("a"), None), m("/docs/", None, Some("b"), None)]).is_err());
+        assert!(validate_mounts(&[m("/a", Some("x"), None, None), m("/a", Some("y"), None, None)]).is_err());
+        // spa: true 同 prefix 有 api → Err；配对无 api / 无 spa → Ok。
+        assert!(validate_mounts(&[m("/p", Some("a"), None, None), m("/p", None, Some("w"), Some(true))]).is_err());
+        assert!(validate_mounts(&[m("/p", None, Some("w"), Some(true))]).is_ok());
+        // spa 标在 api 挂载上 → 无意义标记，Err（不让配置撒谎）。
+        assert!(validate_mounts(&[m("/p", Some("a"), None, Some(true))]).is_err());
+        // 嵌套（/v1 web spa + /v1/api api）合法：最长前缀命中使回落吞不掉 api 路径。
+        assert!(
+            validate_mounts(&[m("/v1", None, Some("w"), Some(true)), m("/v1/api", Some("a"), None, None)])
+                .is_ok()
+        );
+        // 根 `/` api 挂载合法（规则 4 允许，此处钉不误拒）。
+        assert!(validate_mounts(&[m("/", Some("a"), None, None)]).is_ok());
+    }
+
+    /// 规则 3：五旧键任一出现 → 报错 + 迁移 YAML（spa 全 web 条目 / headers 保留 /
+    /// api_prefix 只给提示 / `base` alias 同捕获）。
+    #[test]
+    fn legacy_server_keys_error_with_migration_yaml() {
+        let dir = std::env::temp_dir().join(format!("ojcfglegacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = concat!(
+            "server:\n",
+            "  app_prefix: /site\n",
+            "  app_path: public\n",
+            "  app_spa_fallback: true\n",
+            "  static_sites:\n",
+            "    - { prefix: /docs, path: d1, headers: { csp: 'default-src self' } }\n",
+            "  api_prefix: /v1/api\n",
+        );
+        std::fs::write(dir.join("cfg.yaml"), cfg).unwrap();
+        let e = load_from(&dir, Some("cfg.yaml")).unwrap_err();
+        // 逐键两列 + 等价块 + 文档指引。
+        assert!(e.contains("removed `server.*` site keys"), "{e}");
+        assert!(e.contains("server.app_path + server.app_prefix \"/site\""), "{e}");
+        assert!(e.contains("server.static_sites[0]"), "{e}");
+        assert!(e.contains("server.api_prefix \"/v1/api\""), "{e}");
+        // F1：spa 加到每一个 web 条目（主站点 + static_sites）——旧版是全局开关。
+        assert_eq!(e.matches("spa: true").count(), 2, "{e}");
+        assert!(e.contains("- prefix: \"/site\"") && e.contains("web: \"public\""), "{e}");
+        assert!(e.contains("web: \"d1\"") && e.contains("csp: default-src self"), "{e}");
+        assert!(e.contains("docs/user-manual.md"), "{e}");
+        // `base` alias 同捕获（api_prefix 的旧键名）。
+        std::fs::write(dir.join("cfg.yaml"), "server:\n  base: /xapi\n").unwrap();
+        let e = load_from(&dir, Some("cfg.yaml")).unwrap_err();
+        assert!(e.contains("api_prefix") && e.contains("/xapi"), "{e}");
+        // 干净配置不受影响。
+        std::fs::write(dir.join("cfg.yaml"), "server:\n  port: 1\nmounts:\n  - { prefix: /, web: d }\n").unwrap();
+        assert!(load_from(&dir, Some("cfg.yaml")).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn static_sites_headers_and_new_server_keys_parse() {
+    fn mounts_headers_and_new_server_keys_parse() {
         let dir = std::env::temp_dir().join(format!("ojcfgkeys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("cfg.yaml"),
-            "server:\n  static_sites:\n    - { prefix: /docs, path: d1, headers: { csp: 'default-src self' } }\n  blob_upload_max_bytes: 104857600\n  response_headers: { x-frame-options: DENY, referrer-policy: no-referrer }\n  route_timeouts:\n    - { pattern: /v1/api/convert/**, timeout: 5m }\n",
+            "mounts:\n  - { prefix: /docs, web: d1, headers: { csp: 'default-src self' } }\nserver:\n  blob_upload_max_bytes: 104857600\n  response_headers: { x-frame-options: DENY, referrer-policy: no-referrer }\n  route_timeouts:\n    - { pattern: /v1/api/convert/**, timeout: 5m }\n",
         )
         .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
@@ -1593,10 +1873,7 @@ cache:
             Some("DENY")
         );
         assert_eq!(
-            c.server.static_sites[0]
-                .headers
-                .get("csp")
-                .map(String::as_str),
+            c.mounts[0].headers.get("csp").map(String::as_str),
             Some("default-src self")
         );
         assert_eq!(c.server.route_timeouts.len(), 1);

@@ -388,13 +388,15 @@ fn anon_view_of_route(pattern: &str, base: &str) -> String {
         .join("/")
 }
 
-/// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步）：discover 全模块 → schema.yaml +
-/// manifest(db/deps) → registry（S002 同表双声明 fail-fast；table_owned 记 owner）+ ModuleCtx
-/// map（键 = 模块目录绝对路径，run_module 祖先命中注入）。reconcile 不在此
-/// 执行——由 server 装配层在迁移 gate 后显式调用 `schema::reconcile_all`（spec §2.2 #12）。
+/// 归属图 + SchemaRegistry 复活（§4.8，装配第 11 步；v0.1.58 多挂载）：逐 api 树
+/// discover 全模块 → schema.yaml + manifest(db/deps) → registry（S002 同表双声明
+/// fail-fast，含跨树；table_owned 记 owner）+ ModuleCtx map（键 = 模块目录绝对路径，
+/// run_module 祖先命中注入）。**模块名跨树重复 → 报错**（旧单树形态下
+/// `module_map.insert` 会静默共存，多挂载下同名模块的路由归属会变得不可判读）。
+/// reconcile 不在此执行——由 server 装配层在迁移 gate 后显式调用
+/// `schema::reconcile_all`（spec §2.2 #12）。
 async fn build_schema_and_modules(
-    dir: &Path,
-    ts: bool,
+    trees: &[(PathBuf, bool)],
     guard: SqlGuard,
     shared_allow: &[String],
 ) -> Result<
@@ -407,8 +409,19 @@ async fn build_schema_and_modules(
     let mut registry = SchemaRegistry::new();
     let mut module_map: std::collections::HashMap<String, ModuleCtx> =
         std::collections::HashMap::new();
-    for (name, mdir) in manifest::discover(dir, ts)? {
-        let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
+    let mut module_owner: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    for (dir, ts) in trees {
+        for (name, mdir) in manifest::discover(dir, *ts)? {
+            if let Some(prev) = module_owner.get(&name) {
+                return Err(format!(
+                    "module {name:?} declared in multiple places ({} and {}) — module names must be unique across api mounts",
+                    prev.display(),
+                    mdir.display()
+                ));
+            }
+            module_owner.insert(name.clone(), mdir.clone());
+            let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
         if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
             if guard != SqlGuard::Off {
                 f.validate_tenant(&name)?;
@@ -441,6 +454,7 @@ async fn build_schema_and_modules(
                 db: mf.db.clone(),
             },
         );
+        }
     }
     Ok((registry, Arc::new(module_map)))
 }
@@ -547,31 +561,102 @@ pub fn drain_mail_backend(mail: &Arc<dyn MailBackend>, timeout: Duration) -> ser
     }
 }
 
-/// `server.html_meta_handler`（v0.1.25）装配期校验：必须命中路由表里的一个 **GET** 路由。
+/// 装配期挂载 → 运行时挂载：api 条目配各自的表 + dev 兜底，并**吸收**同 prefix 的
+/// web（配对 web 无 spa——规则 2 已在 config 层拒绝 `spa: true` + api 同 prefix）；
+/// 未被吸收的 web 条目原样成独立挂载。声明序保留（primary = 第一条 api）。
+fn build_runtime_mounts(
+    resolved: Vec<ResolvedMount>,
+    tables: Vec<(String, routes::RouteTable)>,
+) -> Vec<serve::RuntimeMount> {
+    let mut out = Vec::new();
+    let mut paired: std::collections::HashSet<String> = Default::default();
+    for m in &resolved {
+        if let Some((dir, ts)) = m.kind.api() {
+            let table = tables
+                .iter()
+                .find(|(p, _)| *p == m.prefix)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_default();
+            let web = resolved.iter().find_map(|w| match &w.kind {
+                ResolvedMountKind::Web { root, headers, .. }
+                    if w.prefix == m.prefix && !paired.contains(&w.prefix) =>
+                {
+                    paired.insert(w.prefix.clone());
+                    Some(serve::WebMount {
+                        prefix: w.prefix.clone(),
+                        root: root.clone(),
+                        headers: headers.clone(),
+                        spa: false,
+                    })
+                }
+                _ => None,
+            });
+            out.push(serve::RuntimeMount::Api {
+                prefix: m.prefix.clone(),
+                table,
+                fallback: ts.then(|| routes::Routes::new(&m.prefix, dir, ts)),
+                web,
+            });
+        }
+    }
+    for m in &resolved {
+        if let ResolvedMountKind::Web { root, headers, spa } = &m.kind
+            && !paired.contains(&m.prefix)
+        {
+            paired.insert(m.prefix.clone());
+            out.push(serve::RuntimeMount::Web(serve::WebMount {
+                prefix: m.prefix.clone(),
+                root: root.clone(),
+                headers: headers.clone(),
+                spa: *spa,
+            }));
+        }
+    }
+    out
+}
+
+/// `server.html_meta_handler`（v0.1.25）装配期校验：必须命中**某个 api 挂载**路由表里的
+/// 一个 **GET** 路由（v0.1.58 多挂载：按 handler 前缀定表；不在任何前缀下 → 报错）。
 ///
 /// fail-fast 而非启动后 WARN：配错的后果（页面 meta 没注入）只在爬虫/IM 预览侧可见，
 /// 业务页面自己看不出来——留给运行期的告警等于让配置撒谎。
-fn validate_html_meta_handler(cfg: &Config, table: &routes::RouteTable) -> Result<(), String> {
+fn validate_html_meta_handler(
+    cfg: &Config,
+    tables: &[(String, routes::RouteTable)],
+) -> Result<(), String> {
     let Some(h) = cfg.server.html_meta_handler.as_deref() else {
         return Ok(());
     };
     let norm = routes::normalize(h)
         .ok_or_else(|| format!("server.html_meta_handler: {h:?} 不是合法路径（须以 / 开头）"))?;
-    match table.lookup(&norm, "GET") {
-        routes::Lookup::Hit { .. } => Ok(()),
-        routes::Lookup::Conflict(m) => {
-            Err(format!("server.html_meta_handler: {h:?} 路由冲突：{m}"))
+    let under = |p: &str| {
+        let p = p.trim_end_matches('/');
+        p.is_empty() || norm == p || norm.starts_with(&format!("{p}/"))
+    };
+    for (prefix, table) in tables {
+        if !under(prefix) {
+            continue;
         }
-        routes::Lookup::MethodNotAllowed => Err(format!(
-            "server.html_meta_handler: {h:?} 未映射 GET 方法（meta handler 只能是 GET）"
-        )),
-        routes::Lookup::NotFound => Err(format!(
-            "server.html_meta_handler: {h:?} 不在路由表（拼错了？）"
-        )),
+        return match table.lookup(&norm, "GET") {
+            routes::Lookup::Hit { .. } => Ok(()),
+            routes::Lookup::Conflict(m) => {
+                Err(format!("server.html_meta_handler: {h:?} 路由冲突：{m}"))
+            }
+            routes::Lookup::MethodNotAllowed => Err(format!(
+                "server.html_meta_handler: {h:?} 未映射 GET 方法（meta handler 只能是 GET）"
+            )),
+            routes::Lookup::NotFound => Err(format!(
+                "server.html_meta_handler: {h:?} 不在路由表（拼错了？）"
+            )),
+        };
     }
+    Err(format!(
+        "server.html_meta_handler: {h:?} 不在任何 api 挂载前缀下（挂载前缀：{:?}）",
+        tables.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    ))
 }
 
-/// 静态站点目录绝对化 + canonicalize（缺失/非目录 → fail-fast）。
+/// 静态目录绝对化 + canonicalize（缺失/非目录 → fail-fast）。
 fn static_dir(config_dir: &Path, r: &str) -> Result<PathBuf, String> {
     let p = Path::new(r);
     let p = if p.is_absolute() {
@@ -580,60 +665,85 @@ fn static_dir(config_dir: &Path, r: &str) -> Result<PathBuf, String> {
         config_dir.join(p)
     };
     p.canonicalize()
-        .map_err(|e| format!("静态目录 {}: {e}", p.display()))
+        .map_err(|e| format!("挂载目录 {}: {e}", p.display()))
 }
 
-/// 有效静态站点表（装配第 20 步，v0.1.27 多站点）：legacy `(app_prefix, app_path)` 对 +
-/// `server.static_sites` 逐条 → `Vec<StaticSite>`。前缀经 `resolve_app_prefix` 归一；
-/// 归一后重复 → Err（报两条来源）；目录相对 config_dir 绝对化 + canonicalize。
-/// **不排序**——最长前缀优先的排序归 `serve::app()` 独家负责。
-fn resolve_static_sites(cfg: &Config, config_dir: &Path) -> Result<Vec<serve::StaticSite>, String> {
-    let mut out = Vec::new();
-    // 归一前缀 → 来源描述（dup 报错要报两条来源）。
-    let mut seen: Vec<(String, String)> = Vec::new();
-    let push = |prefix: &str,
-                path: &str,
-                headers: &std::collections::HashMap<String, String>,
-                source: &str,
-                out: &mut Vec<serve::StaticSite>,
-                seen: &mut Vec<(String, String)>|
-     -> Result<(), String> {
-        let p = crate::serve_cmd::resolve_app_prefix(prefix)
-            .map_err(|e| format!("{source}: prefix {prefix:?}: {e}"))?;
-        if let Some((_, prev)) = seen.iter().find(|(q, _)| *q == p) {
-            return Err(format!("静态站点前缀 {p} 重复：{source} 与 {prev} 冲突"));
+/// 装配期挂载（[`resolve_mounts`] 产物，v0.1.58）：前缀已归一（首斜杠、无尾斜杠、
+/// `/` 允许），目录已 canonicalize，api 逐条目 dev/release 判定。**声明序保留**
+/// （primary = 第一条 api 挂载）；最长前缀排序归 `serve::app()` 独家负责。
+#[derive(Debug)]
+pub struct ResolvedMount {
+    pub prefix: String,
+    pub kind: ResolvedMountKind,
+}
+
+#[derive(Debug)]
+pub enum ResolvedMountKind {
+    /// api 挂载：服务该目录下的模块路由；`ts` = 逐条目 `is_release` 取反（目录即模式）。
+    Api { dir: PathBuf, ts: bool },
+    /// web 挂载：静态站点；`spa` = 显式 `spa: true`（默认 false）。
+    Web {
+        root: PathBuf,
+        headers: Vec<(String, String)>,
+        spa: bool,
+    },
+}
+
+impl ResolvedMountKind {
+    pub(crate) fn api(&self) -> Option<(&Path, bool)> {
+        match self {
+            ResolvedMountKind::Api { dir, ts } => Some((dir, *ts)),
+            _ => None,
         }
-        seen.push((p.clone(), source.to_string()));
-        let root = static_dir(config_dir, path).map_err(|e| format!("{source}: {e}"))?;
-        out.push(serve::StaticSite {
-            prefix: p,
-            root,
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        });
-        Ok(())
-    };
-    if let Some(app_path) = &cfg.server.app_path {
-        push(
-            &cfg.server.app_prefix,
-            app_path,
-            &std::collections::HashMap::new(),
-            "server.app_path（前缀取 server.app_prefix）",
-            &mut out,
-            &mut seen,
-        )?;
     }
-    for s in &cfg.server.static_sites {
-        push(
-            &s.prefix,
-            &s.path,
-            &s.headers,
-            &format!("server.static_sites[prefix={}]", s.prefix),
-            &mut out,
-            &mut seen,
-        )?;
+}
+
+/// 有效挂载表（装配，v0.1.58 规则 4）：`cfg.mounts` 逐条目 → 前缀经
+/// `resolve_app_prefix` 归一（同 prefix **同类**重复 → Err；api+web 配对合法，后续
+/// 内联）；目录相对 config_dir 绝对化 + canonicalize（缺失 fail-fast）；api 条目
+/// 逐条目 `is_release` 判 dev/release。允许根 `/`（api 路由 `/<module>`，内建
+/// `/health`/`/plugins`/`/blob/{key}`）。结构规则 1/2 已在 config 层校验。
+pub(crate) fn resolve_mounts(
+    cfg: &Config,
+    config_dir: &Path,
+) -> Result<Vec<ResolvedMount>, String> {
+    let mut out = Vec::new();
+    let mut seen: Vec<(String, bool)> = Vec::new(); // (归一 prefix, is_api)
+    for (i, m) in cfg.mounts.iter().enumerate() {
+        let p = crate::serve_cmd::resolve_app_prefix(&m.prefix)
+            .map_err(|e| format!("mounts[{i}]: prefix {:?}: {e}", m.prefix))?;
+        let is_api = m.api.is_some();
+        if seen.iter().any(|(q, a)| *q == p && *a == is_api) {
+            let kind = if is_api { "api" } else { "web" };
+            return Err(format!("mounts[{i}]: duplicate {kind} mount prefix {p:?}"));
+        }
+        seen.push((p.clone(), is_api));
+        match (&m.api, &m.web) {
+            (Some(api), None) => {
+                let dir = static_dir(config_dir, api).map_err(|e| format!("mounts[{i}]: {e}"))?;
+                let ts = !crate::serve_cmd::is_release(&dir);
+                out.push(ResolvedMount {
+                    prefix: p,
+                    kind: ResolvedMountKind::Api { dir, ts },
+                });
+            }
+            (None, Some(web)) => {
+                let root = static_dir(config_dir, web).map_err(|e| format!("mounts[{i}]: {e}"))?;
+                out.push(ResolvedMount {
+                    prefix: p,
+                    kind: ResolvedMountKind::Web {
+                        root,
+                        headers: m.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        spa: m.spa.unwrap_or(false),
+                    },
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "mounts[{i}]: exactly one of `api` or `web` is required"
+                ));
+            }
+        }
     }
     Ok(out)
 }
@@ -757,7 +867,9 @@ pub async fn assemble_backend(
     cfg: &Config,
     top: &serde_json::Value,
     config_dir: &Path,
-    dir: &Path,
+    // api 树集合（v0.1.58 多挂载）：(目录, ts) 逐树 discover；loader 全局 ts 由
+    // 调用方取 primary 树的判定传入。
+    trees: &[(PathBuf, bool)],
     base: &str,
     ts: bool,
     profiles: &ResourceProfiles,
@@ -879,7 +991,7 @@ pub async fn assemble_backend(
     let sql_guard = sql_guard_of(cfg);
     // §4.8 归属图 + SchemaRegistry 复活。
     let (registry, modules) =
-        build_schema_and_modules(dir, ts, sql_guard, &cfg.tenant.shared_allow).await?;
+        build_schema_and_modules(trees, sql_guard, &cfg.tenant.shared_allow).await?;
     // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
     // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
     let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
@@ -1075,27 +1187,49 @@ impl App {
     /// 私有函数（connect_kv / ownership_deny_of / build_schema_and_modules /
     /// build_jwt_and_oidc / resolve_static_sites / load_cert_with_watcher）。
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_arguments)] // top 与 cfg 分层传（serde 无关的查找面），不并为 struct
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_config(
         cfg: Config,
         top: &serde_json::Value,
         config_dir: &Path,
-        dir: PathBuf,
-        base: String,
-        ts: bool,
         fixtures: bool,
         // profiles：各资源根 key 的默认 profile 选择（对应 `oj test`/`oj exec` 的
         // `--db`/`--redis`/`--blob`/`--es`/`--broker`/`--kafka`/`--rabbit`）。字面 "default"
         // 的调用改指向所选 profile；迁移 / seed / fixtures / schema 内省一并跟随。
         profiles: &ResourceProfiles,
     ) -> Result<App, String> {
-        // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
-        // strip_verbatim 去 Windows `\\?\` 前缀：canonicalize 与 referrer 目录（`to_file_path`
-        // 剥前缀）同形，避免 `module_root_of` 词法前缀不一致误判「未找到模块根」。
-        let dir = dir.canonicalize().unwrap_or(dir);
+        // 挂载解析（v0.1.58）：结构校验（程序化构造的 cfg 不经 load 层，这里兜底）→
+        // 归一 / canonicalize / 逐条目 dev-release（规则 4）。primary = 第一条 api 挂载
+        // （base/loader 全局 ts 取自它；迁移/seed/fixtures 逐 api 树循环）；纯静态时
+        // api 功能未启用——占位路径（模块扫描 NotFound = 空 = 无路由）。
+        config::validate_mounts(&cfg.mounts)?;
+        let resolved = resolve_mounts(&cfg, config_dir)?;
+        let primary = resolved
+            .iter()
+            .find_map(|m| m.kind.api().map(|(d, t)| (d.to_path_buf(), t)));
+        let (_dir, ts, base) = match primary {
+            Some((d, t)) => (
+                d,
+                t,
+                resolved
+                    .iter()
+                    .find(|m| m.kind.api().is_some())
+                    .map(|m| m.prefix.clone())
+                    .unwrap_or_default(),
+            ),
+            None => (
+                config_dir.join(".oj-static-only"),
+                false,
+                crate::serve_cmd::DEFAULT_API_PREFIX.to_string(),
+            ),
+        };
+        let trees: Vec<(PathBuf, bool)> = resolved
+            .iter()
+            .filter_map(|m| m.kind.api().map(|(d, t)| (d.to_path_buf(), t)))
+            .collect();
         // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
         let backend =
-            Arc::new(assemble_backend(&cfg, top, config_dir, &dir, &base, ts, profiles).await?);
+            Arc::new(assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?);
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
@@ -1123,19 +1257,27 @@ impl App {
         let db_key: &str = profiles.db.as_deref().unwrap_or("default");
         match gate {
             "auto" => {
-                crate::migrate::apply_all(stable.dbs.get(db_key), &dir, ts, false).await?;
-                for l in crate::schema::reconcile_all(
-                    stable.dbs.get(db_key).map(|a| a.as_ref()),
-                    &dir,
-                    ts,
-                    db_key,
-                )
-                .await?
-                {
-                    eprintln!("schema: {l}");
+                // v0.1.58 多挂载：逐 api 树 apply + reconcile（同一目标库；表名冲突由
+                // build_schema_and_modules 的 S002 先行拦截，走不到这里）。
+                for (tdir, tts) in &trees {
+                    crate::migrate::apply_all(stable.dbs.get(db_key), tdir, *tts, false).await?;
+                    for l in crate::schema::reconcile_all(
+                        stable.dbs.get(db_key).map(|a| a.as_ref()),
+                        tdir,
+                        *tts,
+                        db_key,
+                    )
+                    .await?
+                    {
+                        eprintln!("schema: {l}");
+                    }
                 }
             }
-            "verify" => crate::migrate::verify_all(stable.dbs.get(db_key), &dir, ts).await?,
+            "verify" => {
+                for (tdir, tts) in &trees {
+                    crate::migrate::verify_all(stable.dbs.get(db_key), tdir, *tts).await?;
+                }
+            }
             "off" => {}
             other => {
                 return Err(format!(
@@ -1143,12 +1285,16 @@ impl App {
                 ));
             }
         }
-        // 种子重放（P0）：各模块 seed.sql（§8-1）。
-        crate::seed::replay_all(stable.dbs.get(db_key), &dir).await?;
+        // 种子重放（P0）：各 api 树的模块 seed.sql（§8-1）。
+        for (tdir, _) in &trees {
+            crate::seed::replay_all(stable.dbs.get(db_key), tdir).await?;
+        }
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
-            let modules = crate::manifest::discover(&dir, ts)?;
-            crate::migrate_cmd::load_fixtures(stable.dbs.get(db_key), &modules).await?;
+            for (tdir, tts) in &trees {
+                let modules = crate::manifest::discover(tdir, *tts)?;
+                crate::migrate_cmd::load_fixtures(stable.dbs.get(db_key), &modules).await?;
+            }
         }
         // ext_boot 预热：建 runtime 并跑完 boot，失败即 `Err`（真·启动失败）。
         // 必须前移到建表之前 —— 否则 boot 错误只能借 dev 内省的间接失败暴露，而
@@ -1157,70 +1303,83 @@ impl App {
         if stable.boot.is_some() {
             prewarm_boot(make_bridge.clone())?;
         }
-        // 路由表：dev 启动内省 .route 声明；release 聚合 dist/manifests.yaml。
-        let (table, failures) = if ts {
-            for m in manifest::load_modules(&dir, Some(&cfg.tasks.dir))? {
-                eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
-            }
-            routes::RouteTable::build(
-                &base,
-                &dir,
-                ts,
-                routes::bridge_introspector(make_bridge.clone()),
-            )
-        } else {
-            let lock = manifest::load_lock(&dir.join("manifests.yaml")).map_err(|e| {
-                format!(
-                    "release mode: {}: {e}",
-                    dir.join("manifests.yaml").display()
+        // 路由表：逐 api 挂载构建（v0.1.58 多挂载）。dev 启动内省 .route 声明；
+        // release 聚合该树 manifests.yaml（pattern = /{挂载prefix}/{e.pattern}）。
+        let mut tables: Vec<(String, routes::RouteTable)> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for m in resolved.iter().filter(|m| m.kind.api().is_some()) {
+            let (prefix, mdir, mts) = match m.kind.api() {
+                Some((d, t)) => (m.prefix.as_str(), d, t),
+                None => unreachable!("filtered above"),
+            };
+            let (table, mount_failures) = if mts {
+                for md in manifest::load_modules(mdir, Some(&cfg.tasks.dir))? {
+                    eprintln!("module {} v{} — {}", md.name, md.version, md.desc);
+                }
+                routes::RouteTable::build(
+                    prefix,
+                    mdir,
+                    mts,
+                    routes::bridge_introspector(make_bridge.clone()),
                 )
-            })?;
-            if lock.is_empty() {
-                return Err(format!(
-                    "release mode: {} missing or empty — run `oj build` first",
-                    dir.join("manifests.yaml").display()
-                ));
-            }
-            let reader = routes::bridge_default_reader(make_bridge.clone());
-            let mut entries = Vec::new();
-            let b = base.trim_matches('/');
-            for (module, version) in &lock {
-                manifest::validate_module(module).map_err(|e| format!("manifests.yaml: {e}"))?;
-                manifest::validate_version(version).map_err(|e| format!("manifests.yaml: {e}"))?;
-                let mdir = dir.join(format!("{module}-{version}"));
-                let mf = mdir.join("manifest.yaml");
-                if !mf.is_file() {
+            } else {
+                let lock = manifest::load_lock(&mdir.join("manifests.yaml")).map_err(|e| {
+                    format!(
+                        "release mode: {}: {e}",
+                        mdir.join("manifests.yaml").display()
+                    )
+                })?;
+                if lock.is_empty() {
                     return Err(format!(
-                        "release mode: {} missing — run `oj build {module}`",
-                        mf.display()
+                        "release mode: {} missing or empty — run `oj build` first",
+                        mdir.join("manifests.yaml").display()
                     ));
                 }
-                let m = manifest::parse_one(&mf)?;
-                if m.name != *module {
-                    return Err(format!(
-                        "manifest name {:?} != module {module:?} (in {})",
-                        m.name,
-                        mf.display()
-                    ));
+                let reader = routes::bridge_default_reader(make_bridge.clone());
+                let mut entries = Vec::new();
+                let b = prefix.trim_matches('/');
+                for (module, version) in &lock {
+                    manifest::validate_module(module)
+                        .map_err(|e| format!("manifests.yaml: {e}"))?;
+                    manifest::validate_version(version)
+                        .map_err(|e| format!("manifests.yaml: {e}"))?;
+                    let mdir = mdir.join(format!("{module}-{version}"));
+                    let mf = mdir.join("manifest.yaml");
+                    if !mf.is_file() {
+                        return Err(format!(
+                            "release mode: {} missing — run `oj build {module}`",
+                            mf.display()
+                        ));
+                    }
+                    let m = manifest::parse_one(&mf)?;
+                    if m.name != *module {
+                        return Err(format!(
+                            "manifest name {:?} != module {module:?} (in {})",
+                            m.name,
+                            mf.display()
+                        ));
+                    }
+                    eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
+                    let rjs = mdir.join("routes.js");
+                    let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
+                    for e in routes::entries_from_value(&v) {
+                        entries.push(routes::RouteEntry {
+                            method: e.method,
+                            pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
+                            file: format!("{module}-{version}/{}", e.file),
+                            schema: e.schema,
+                        });
+                    }
                 }
-                eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
-                let rjs = mdir.join("routes.js");
-                let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
-                for e in routes::entries_from_value(&v) {
-                    entries.push(routes::RouteEntry {
-                        method: e.method,
-                        pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
-                        file: format!("{module}-{version}/{}", e.file),
-                        schema: e.schema,
-                    });
+                let (table2, failures2) = routes::RouteTable::from_entries(mdir, &entries);
+                if !failures2.is_empty() {
+                    return Err(format!("release routes: {}", failures2.join("; ")));
                 }
-            }
-            let (table2, failures2) = routes::RouteTable::from_entries(&dir, &entries);
-            if !failures2.is_empty() {
-                return Err(format!("release routes: {}", failures2.join("; ")));
-            }
-            (table2, Vec::new())
-        };
+                (table2, Vec::new())
+            };
+            failures.extend(mount_failures);
+            tables.push((prefix.to_string(), table));
+        }
         for f in &failures {
             if let Some(w) = f.strip_prefix("warning: ") {
                 eprintln!("warn: route: {w}");
@@ -1235,16 +1394,16 @@ impl App {
         if n_err > 0 {
             eprintln!("warn: {n_err} route declaration(s) skipped (see errors above)");
         }
-        // 路由统计（v0.1.27 起替代逐行三列清单）：一行汇总；错误/冲突的具体路由
-        // 信息由上方 failures 循环逐条输出（dev warn + release 硬失败均含 pattern）。
-        let method_rows = table.listing().len();
-        let patterns = table
-            .listing()
+        // 路由统计（v0.1.27 起替代逐行三列清单；v0.1.58 跨挂载汇总）：一行汇总；
+        // 错误/冲突的具体路由信息由上方 failures 循环逐条输出。
+        let method_rows = tables.iter().map(|(_, t)| t.listing().len()).sum::<usize>();
+        let patterns = tables
             .iter()
+            .flat_map(|(_, t)| t.listing())
             .map(|r| &r.pattern)
             .collect::<std::collections::HashSet<_>>()
             .len();
-        let files = table.grouped().len();
+        let files = tables.iter().map(|(_, t)| t.grouped().len()).sum::<usize>();
         eprintln!(
             "routes: {method_rows} method-row(s), {patterns} pattern(s), {files} api file(s)"
         );
@@ -1253,28 +1412,30 @@ impl App {
         // 「记一条 failure 继续跑」，那等于把声明悄悄变成不生效的东西。
         if cfg.server.schema_validation {
             let mut reg = InputContractRegistry::new();
-            for row in table.listing() {
-                let Some(sv) = row.schema.clone() else {
-                    continue;
-                };
-                let file = table.file_path(row.file).to_path_buf();
-                let contract = InputContract::try_new(
-                    sv.get("params").cloned(),
-                    sv.get("query").cloned(),
-                    sv.get("body").cloned(),
-                    &mut Vec::new(),
-                )
-                .map_err(|e| {
-                    format!(
-                        "server.schema_validation: invalid `.schema` on {} {} ({}): {e}",
-                        row.method,
-                        row.pattern,
-                        file.display()
+            for (_, table) in &tables {
+                for row in table.listing() {
+                    let Some(sv) = row.schema.clone() else {
+                        continue;
+                    };
+                    let file = table.file_path(row.file).to_path_buf();
+                    let contract = InputContract::try_new(
+                        sv.get("params").cloned(),
+                        sv.get("query").cloned(),
+                        sv.get("body").cloned(),
+                        &mut Vec::new(),
                     )
-                })?;
-                reg.insert(file, &row.method, contract).map_err(|e| {
-                    format!("server.schema_validation: cannot register contract: {e}")
-                })?;
+                    .map_err(|e| {
+                        format!(
+                            "server.schema_validation: invalid `.schema` on {} {} ({}): {e}",
+                            row.method,
+                            row.pattern,
+                            file.display()
+                        )
+                    })?;
+                    reg.insert(file, &row.method, contract).map_err(|e| {
+                        format!("server.schema_validation: cannot register contract: {e}")
+                    })?;
+                }
             }
             let n = reg.len();
             *backend
@@ -1288,19 +1449,21 @@ impl App {
         let n = cfg.server.pool_size.max(1) as usize;
         // 通配语义 v0.1.20 收紧的迁移提示（v0.1.23 起按影响面判定）：必须等路由表就绪，
         // 才能判「改 `**` 是否会真多命中」（见 warn_legacy_tail_wildcards）。
-        let route_views: Vec<String> = table
-            .listing()
+        // 多挂载：每张表按**自己的挂载前缀**剥 base。
+        let route_views: Vec<String> = tables
             .iter()
-            .map(|r| anon_view_of_route(&r.pattern, &base))
+            .flat_map(|(prefix, table)| {
+                table
+                    .listing()
+                    .iter()
+                    .map(|r| anon_view_of_route(&r.pattern, prefix))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         warn_legacy_tail_wildcards(&cfg, &route_views);
         let timeout = config::parse_duration(&cfg.server.timeout).ok();
         // actor 池：bridges 与 WS 连接共享同一 Bus 与 Extras。
         let actor = JsActor::pool(n, make_bridge.clone());
-        // 静态站点表（装配第 20 步，v0.1.27 多站点）：legacy (app_prefix, app_path) 对 +
-        // server.static_sites 逐条；前缀归一 + dup fail-fast（报两条来源）+ 目录
-        // canonicalize（缺失 fail-fast）。最长前缀排序归 serve::app()。
-        let static_sites = resolve_static_sites(&cfg, config_dir)?;
         // 证书必配（门禁已确保两路径齐备）→ 加载并校验，证书失效即拒绝启动。
         // 运行中过期由热加载切换到 Grace/Expired → GET 限制（handle 内），服务不中断。
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
@@ -1331,25 +1494,35 @@ impl App {
             // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
             blob: stable.blobs.default(),
         };
-        // WS 目录镜像挂载（<dir>/ws.ts → {base}/<dir>/ws）。
+        // WS 目录镜像挂载：逐 api 挂载（<挂载dir>/ws.ts → {挂载prefix}/<dir>/ws）。
         let ws_opts = serve::ws::WsOptions {
             max_connections: cfg.ws.max_connections,
             workers_per_route: cfg.ws.workers_per_route,
             idle_linger_ms: cfg.ws.idle_linger_ms,
         };
-        let ws_router = ws::mirror_routes(
-            &base,
-            &dir,
-            timeout.unwrap_or(Duration::from_secs(30)),
-            make_bridge,
-            ws_opts,
-            auth.clone(),
-        );
-        // server.html_meta_handler（v0.1.25）：必须是路由表里存在的 GET 路由——拼错
-        // fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露的谎话）。
-        validate_html_meta_handler(&cfg, &table)?;
-        // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
-        // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
+        let mut ws_router = Router::new();
+        for m in resolved.iter().filter(|m| m.kind.api().is_some()) {
+            let (prefix, mdir) = match m.kind.api() {
+                Some((d, _)) => (m.prefix.as_str(), d),
+                None => unreachable!("filtered above"),
+            };
+            ws_router = ws_router.merge(ws::mirror_routes(
+                prefix,
+                mdir,
+                timeout.unwrap_or(Duration::from_secs(30)),
+                make_bridge.clone(),
+                serve::ws::WsOptions {
+                    max_connections: ws_opts.max_connections,
+                    workers_per_route: ws_opts.workers_per_route,
+                    idle_linger_ms: ws_opts.idle_linger_ms,
+                },
+                auth.clone(),
+            ));
+        }
+        // server.html_meta_handler（v0.1.25）：必须在（某个挂载的）路由表里命中 GET
+        // 路由——拼错 fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露
+        // 的谎话）。多 api 挂载：按 handler 前缀定表。
+        validate_html_meta_handler(&cfg, &tables)?;
         // server.cors（v0.1.35）：credentials 需显式 origins——否则 tower-http 运行期
         // panic（Any 源 + credentials 不被允许）。装配期 fail-fast 比请求期崩溃更友好。
         if let Some(cors) = &cfg.server.cors
@@ -1361,22 +1534,20 @@ impl App {
                     .into(),
             );
         }
+        // 运行时挂载：api 条目吸收同 prefix 的 web（配对 → 无 spa）；独立 web 原样。
+        // 最长前缀排序归 serve::app()。
+        let runtime_mounts = build_runtime_mounts(resolved, tables);
         let router = serve::app(
-            &base,
-            dir,
-            ts,
-            table,
+            runtime_mounts,
             actor,
             timeout,
-            static_sites,
-            // 静态站点增强（v0.1.20 / v0.1.25）：SPA 深链接回落 + per-route meta 注入
-            // （静态 JSON 打底 + 动态 handler 覆盖）+ HTML Cache-Control。
+            // 静态增强（v0.1.25）：per-route meta 注入（静态 JSON 打底 + 动态 handler
+            // 覆盖）+ HTML Cache-Control；SPA 回落已下沉挂载 `spa`。
             serve::StaticOpts {
-                spa_fallback: cfg.server.app_spa_fallback,
                 html_meta: cfg.server.html_meta.clone(),
                 html_meta_handler: cfg.server.html_meta_handler.clone(),
                 html_cache_control: cfg.server.html_cache_control.clone(),
-                // oj-8：全局自定义响应头（per-site 覆盖在 StaticSite.headers）。
+                // oj-8：全局自定义响应头（per-site 覆盖在 WebMount.headers）。
                 response_headers: cfg
                     .server
                     .response_headers
@@ -1592,29 +1763,34 @@ mod tests {
         ];
         let (table, failures) = routes::RouteTable::from_entries(&dir, &entries);
         assert!(failures.is_empty(), "{failures:?}");
+        let tables = vec![("/v1/api".to_string(), table)];
 
         let mut cfg = Config::default();
         // 未配置 → 放行（不开动态 meta 是默认形态）
-        assert!(validate_html_meta_handler(&cfg, &table).is_ok());
+        assert!(validate_html_meta_handler(&cfg, &tables).is_ok());
         // 命中（尾斜杠与 normalize 等价）
         cfg.server.html_meta_handler = Some("/v1/api/html-meta/".into());
-        assert!(validate_html_meta_handler(&cfg, &table).is_ok());
+        assert!(validate_html_meta_handler(&cfg, &tables).is_ok());
         // 未命中 → 拼错必须 fail-fast，不能留到运行期只在爬虫侧暴露
         cfg.server.html_meta_handler = Some("/v1/api/typo".into());
-        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        let e = validate_html_meta_handler(&cfg, &tables).unwrap_err();
         assert!(e.contains("不在路由表"), "{e}");
         // 只有 POST → 报「未映射 GET 方法」（而不是含混的未命中）
         cfg.server.html_meta_handler = Some("/v1/api/post-only".into());
-        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        let e = validate_html_meta_handler(&cfg, &tables).unwrap_err();
         assert!(e.contains("未映射 GET 方法"), "{e}");
         // 不以 / 开头 → 非法路径
         cfg.server.html_meta_handler = Some("v1/api/html-meta".into());
-        let e = validate_html_meta_handler(&cfg, &table).unwrap_err();
+        let e = validate_html_meta_handler(&cfg, &tables).unwrap_err();
         assert!(e.contains("不是合法路径"), "{e}");
+        // 在任何 api 挂载前缀之外 → 点名挂载前缀
+        cfg.server.html_meta_handler = Some("/v9/handler".into());
+        let e = validate_html_meta_handler(&cfg, &tables).unwrap_err();
+        assert!(e.contains("不在任何 api 挂载前缀下"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- v0.1.27：多静态站点有效站点表 ----
+    // ---- v0.1.58：resolve_mounts 矩阵（归一/配对/根/缺目录/同类重复）----
 
     fn tmp_dirs(names: &[&str]) -> (PathBuf, Vec<PathBuf>) {
         let base = std::env::temp_dir().join(format!(
@@ -1634,71 +1810,105 @@ mod tests {
         (base, dirs)
     }
 
-    #[test]
-    fn resolve_static_sites_legacy_and_list() {
-        // legacy 单站点（app_path + app_prefix）产一条，前缀归一。
-        let (base, dirs) = tmp_dirs(&["app", "docs", "root"]);
-        let mut cfg = Config::default();
-        cfg.server.app_path = Some(dirs[0].to_string_lossy().into());
-        cfg.server.app_prefix = "/app/".into(); // 尾斜杠归一 → /app
-        let sites = resolve_static_sites(&cfg, &base).unwrap();
-        assert_eq!(sites.len(), 1);
-        assert_eq!(sites[0].prefix, "/app");
-        assert_eq!(sites[0].root, dirs[0].canonicalize().unwrap());
-
-        // static_sites 两条（含 `/` 兜底）。
-        let mut cfg = Config::default();
-        cfg.server.static_sites = vec![
-            only_js::config::StaticSiteConf {
-                prefix: "/docs".into(),
-                path: dirs[1].to_string_lossy().into(),
-                headers: Default::default(),
-            },
-            only_js::config::StaticSiteConf {
-                prefix: "/".into(),
-                path: dirs[2].to_string_lossy().into(),
-                headers: Default::default(),
-            },
-        ];
-        let sites = resolve_static_sites(&cfg, &base).unwrap();
-        assert_eq!(sites.len(), 2);
-        assert_eq!(sites[0].prefix, "/docs");
-        assert_eq!(sites[1].prefix, "/");
-
-        // 未配置 → 空表（不开静态服务）。
-        assert!(
-            resolve_static_sites(&Config::default(), &base)
-                .unwrap()
-                .is_empty()
-        );
-        let _ = std::fs::remove_dir_all(&base);
+    fn mount(prefix: &str, api: Option<&str>, web: Option<&str>, spa: Option<bool>) -> config::MountConf {
+        config::MountConf {
+            prefix: prefix.into(),
+            api: api.map(Into::into),
+            web: web.map(Into::into),
+            spa,
+            headers: Default::default(),
+        }
     }
 
     #[test]
-    fn resolve_static_sites_dup_prefix_and_missing_dir_fail_fast() {
-        let (base, dirs) = tmp_dirs(&["app", "docs"]);
-        // dup：legacy 对归一后与 static_sites 同前缀 → Err 且报两条来源。
+    fn resolve_mounts_matrix() {
+        let (base, dirs) = tmp_dirs(&["api", "web", "docs"]);
+        // 归一：尾斜杠剪除；目录 canonicalize；api 逐条目 dev 判定（无 manifests.yaml → ts）。
         let mut cfg = Config::default();
-        cfg.server.app_path = Some(dirs[0].to_string_lossy().into());
-        cfg.server.app_prefix = "/docs/".into();
-        cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
-            prefix: "/docs".into(),
-            path: dirs[1].to_string_lossy().into(),
-            headers: Default::default(),
-        }];
-        let e = resolve_static_sites(&cfg, &base).unwrap_err();
-        assert!(e.contains("重复") && e.contains("server.app_path"), "{e}");
-        assert!(e.contains("static_sites"), "{e}");
+        cfg.mounts = vec![
+            mount("/v1/api/", Some(dirs[0].to_string_lossy().as_ref()), None, None),
+            mount("/", None, Some(dirs[1].to_string_lossy().as_ref()), None),
+        ];
+        let out = resolve_mounts(&cfg, &base).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].prefix, "/v1/api");
+        let (d, ts) = out[0].kind.api().unwrap();
+        assert_eq!(d, &dirs[0].canonicalize().unwrap());
+        assert!(ts, "无 manifests.yaml → dev");
+        assert!(matches!(out[1].kind, ResolvedMountKind::Web { spa: false, .. }));
 
-        // 缺失目录 → Err（canonicalize fail-fast）。
+        // 嵌套合法：/v1 web(spa) + /v1/api api；根 `/` api 挂载合法。
         let mut cfg = Config::default();
-        cfg.server.static_sites = vec![only_js::config::StaticSiteConf {
-            prefix: "/x".into(),
-            path: "no-such-dir".into(),
-            headers: Default::default(),
-        }];
-        let e = resolve_static_sites(&cfg, &base).unwrap_err();
-        assert!(e.contains("no-such-dir"), "{e}");
+        cfg.mounts = vec![
+            mount("/v1", None, Some(dirs[1].to_string_lossy().as_ref()), Some(true)),
+            mount("/v1/api", Some(dirs[0].to_string_lossy().as_ref()), None, None),
+            mount("/", Some(dirs[2].to_string_lossy().as_ref()), None, None),
+        ];
+        let out = resolve_mounts(&cfg, &base).unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].kind, ResolvedMountKind::Web { spa: true, .. }));
+
+        // 同类重复（含尾斜杠归一口径）→ Err；api+web 配对 → 合法。
+        let mut cfg = Config::default();
+        cfg.mounts = vec![
+            mount("/docs", None, Some("docs"), None),
+            mount("/docs/", None, Some("docs2"), None),
+        ];
+        let e = resolve_mounts(&cfg, &base).unwrap_err();
+        assert!(e.contains("duplicate web mount"), "{e}");
+        let mut cfg = Config::default();
+        cfg.mounts = vec![
+            mount("/p", Some("api"), None, None),
+            mount("/p", None, Some("web"), None),
+        ];
+        assert_eq!(resolve_mounts(&cfg, &base).unwrap().len(), 2);
+
+        // 缺失目录 → Err（canonicalize fail-fast，带条目序号）。
+        let mut cfg = Config::default();
+        cfg.mounts = vec![mount("/x", None, Some("no-such-dir"), None)];
+        let e = resolve_mounts(&cfg, &base).unwrap_err();
+        assert!(e.contains("mounts[0]") && e.contains("no-such-dir"), "{e}");
+
+        // 声明序保留（primary = 第一条 api）。
+        let mut cfg = Config::default();
+        cfg.mounts = vec![
+            mount("/second", Some(dirs[0].to_string_lossy().as_ref()), None, None),
+            mount("/first", Some(dirs[2].to_string_lossy().as_ref()), None, None),
+        ];
+        let out = resolve_mounts(&cfg, &base).unwrap();
+        assert_eq!(out[0].prefix, "/second");
+
+        // 未配置 → 空表（纯静态占位由 from_config 决定）。
+        assert!(resolve_mounts(&Config::default(), &base).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 跨树模块名重复 → Err（旧单树形态下静默共存/遮蔽，多挂载下必须 fail-fast）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_schema_rejects_cross_tree_module_name_dup() {
+        let (base, dirs) = tmp_dirs(&["t1", "t2"]);
+        for d in &dirs {
+            std::fs::create_dir_all(d.join("u")).unwrap();
+            std::fs::write(
+                d.join("u/manifest.yaml"),
+                "name: u\ndesc: d\nversion: 0.1.0\n",
+            )
+            .unwrap();
+        }
+        let trees = vec![
+            (dirs[0].clone(), true),
+            (dirs[1].clone(), true),
+        ];
+        let e = build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("expected cross-tree dup error"));
+        assert!(e.contains("u") && e.contains("multiple"), "{e}");
+        // 同一树两份没问题（不触发跨树重名）。
+        let trees = vec![(dirs[0].clone(), true)];
+        assert!(build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
+            .await
+            .is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1730,7 +1940,7 @@ mod tests {
             &cfg,
             &serde_json::Value::Null,
             &base,
-            &base,
+            &[(base.clone(), true)],
             "/v1/api",
             true,
             &ResourceProfiles::default(),

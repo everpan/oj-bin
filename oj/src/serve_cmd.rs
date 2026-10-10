@@ -13,10 +13,52 @@ use only_js::bridge::plugin_loader::{
     host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
 use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo};
-use only_js::config::{self, Config, LoadedConfig, StaticSiteConf};
+use only_js::config::{self, Config, LoadedConfig};
 
 use crate::app::{App, ResourceProfiles};
 use crate::args::ServeArgs;
+
+/// API 前缀缺省常量（v0.1.58）：旧 `server.api_prefix` 键已删，CLI `-b` / 挂载折叠
+/// 都回落此值——与删除前的 `ServerCfg::default().api_prefix` 同值（零 URL 变化）。
+pub const DEFAULT_API_PREFIX: &str = "/v1/api";
+
+/// CLI 挂载折叠（v0.1.58）：`--api-path d [-b B]` → upsert `{prefix: B, api: d}`
+/// （B = `-b` > [`DEFAULT_API_PREFIX`]，**不再有全局 base**——挂载自带完整 prefix）；
+/// `--app-path` 裸 `d` → upsert `{prefix: "/", web: d}`（按 CWD 预绝对化）、
+/// `prefix=dir` → 同 prefix 条目替换否则追加。`-b` 无 `--api-path` → Err
+/// （裸 -b 在挂载模型下无处附着，静默忽略等于部署假配置）。
+fn fold_cli_mounts(cfg: &mut Config, a: &ServeArgs) -> Result<(), String> {
+    if a.base.is_some() && a.api_path.is_none() {
+        return Err("--base/-b requires --api-path (api mounts carry their own prefix)".into());
+    }
+    if !a.app_path.is_empty() {
+        fold_cli_app_paths(cfg, &a.app_path)?;
+    }
+    if let Some(d) = &a.api_path {
+        let prefix = resolve_app_prefix(a.base.as_deref().unwrap_or(DEFAULT_API_PREFIX))
+            .map_err(|e| format!("--base: {e}"))?;
+        let api = absolutize_cwd(
+            &std::env::current_dir().map_err(|e| format!("resolve --api-path: {e}"))?,
+            d,
+        );
+        let idx = cfg.mounts.iter().position(|m| {
+            m.api.is_some()
+                && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
+        });
+        let entry = config::MountConf {
+            prefix,
+            api: Some(api),
+            web: None,
+            spa: None,
+            headers: Default::default(),
+        };
+        match idx {
+            Some(i) => cfg.mounts[i] = entry,
+            None => cfg.mounts.push(entry),
+        }
+    }
+    Ok(())
+}
 
 pub async fn run(a: ServeArgs) -> Result<(), String> {
     // --daemon：re-exec 自身（剥掉 --daemon）脱离终端后父进程即退；
@@ -24,45 +66,44 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     if a.daemon {
         return daemonize();
     }
-    let (mut cfg, top, config_dir, dir, ts, base) = load_app_config(
-        a.config.as_deref(),
-        a.api_path.as_deref(),
-        a.base.as_deref(),
-    )?;
-    // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
-    // （统一装配点）判定，CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
-    // 路径语义：CLI `--app-path` 相对 CWD（此处预绝对化）；config `server.app_path`
-    // 相对 config_dir（装配期站点表统一处理）。
-    if !a.app_path.is_empty() {
-        fold_cli_app_paths(&mut cfg, &a.app_path)?;
-    }
+    let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref())?;
+    // CLI 挂载折叠：--api-path / --app-path 全部 upsert 进 cfg.mounts（CLI 优先）。
+    fold_cli_mounts(&mut cfg, &a)?;
     if let Some(p) = a.cert_path {
         cfg.server.certificate_path = p;
     }
     if let Some(p) = a.key_path {
         cfg.server.public_key_path = p;
     }
-    // 准入门（admission_gate）：api（--api-path）与静态（server.app_path /
-    // server.static_sites / CLI --app-path）至少显式指定其一。静态目录存在性统一由
-    // 装配期站点表解析 fail-fast（含具体 prefix 来源）。
-    let api_specified = a.api_path.is_some();
-    let app_specified = cfg.server.app_path.is_some() || !cfg.server.static_sites.is_empty();
-    admission_gate(
-        if api_specified {
-            Some(dir.as_path())
-        } else {
-            None
-        },
-        app_specified,
-    )?;
-    // 纯静态模式：api 功能未启用。from_config 需要看到「无 API 目录」（模块扫描
-    // NotFound = 空 = 无路由），而 load_app_config 的默认搜索可能已命中 src/，
-    // 故传必然缺失的占位路径，避免把搜到的 API 目录静默挂上来。
-    let dir = if api_specified {
-        dir
-    } else {
-        eprintln!("note: no --api-path — serving static site only");
-        config_dir.join(".oj-static-only")
+    // 准入门（规则 5）：mounts（config + CLI 折叠后）为空 → 报错提示。
+    // 目录存在性统一由装配期 resolve_mounts fail-fast（含具体 prefix/条目序号）。
+    admission_gate(&cfg)?;
+    // primary api 树（tasks 目录 / 日志行展示用；解析细节由 from_config 统一裁决）。
+    let (dir, ts, base) = match cfg
+        .mounts
+        .iter()
+        .find_map(|m| m.api.as_ref().map(|d| (d.clone(), m.prefix.clone())))
+    {
+        Some((d, b)) => {
+            let d = {
+                let p = PathBuf::from(&d);
+                if p.is_absolute() {
+                    p
+                } else {
+                    config_dir.join(p)
+                }
+            };
+            let ts = !is_release(&d);
+            (d, ts, b)
+        }
+        None => {
+            eprintln!("note: no api mount — serving web mount(s) only");
+            (
+                config_dir.join(".oj-static-only"),
+                false,
+                DEFAULT_API_PREFIX.into(),
+            )
+        }
     };
     // 初始化日志：目录默认 config 相对 ./logs，可在 server.logs_dir 配置；不存在自动创建。
     // 大小滚动参数 server.logs_max_bytes / logs_keep_files。
@@ -78,17 +119,9 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     );
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
-    let mut app = App::from_config(
-        cfg,
-        &top,
-        &config_dir,
-        dir.clone(),
-        base.clone(),
-        ts,
-        false,
-        &ResourceProfiles::default(),
-    )
-    .await?;
+    let static_only = cfg.mounts.iter().all(|m| m.api.is_none());
+    let mut app = App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default())
+        .await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
@@ -114,7 +147,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         "oj serve listening on http://{bound}{} (dir={}, {})",
         base,
         dir.display(),
-        if !api_specified {
+        if static_only {
             "static-only"
         } else if ts {
             "dev/ts"
@@ -275,95 +308,184 @@ async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
     flag.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 解析配置 + 目录模式（同 server）：搜索并读取 config.yaml，确定服务目录（src 优先 /
-/// dist 兜底）、dev/release 判定、base 前缀归源。server 与 test 命令共用，避免重复解析逻辑。
-/// `config`：None 走统一搜索（CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml），
-/// 未找到不报错——回落内置默认 Config（config_dir = CWD），纯静态 serve / 无后端
-/// exec/test 等场景无需配置文件。
+/// 解析配置文件（v0.1.58 自 load_app_config 抽出）：`config` None 走统一搜索
+/// （CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml），未找到不报错——回落
+/// 内置默认 Config（config_dir = CWD），纯静态 serve / 无后端 exec/test 等场景无需配置文件。
 /// 返回附带 `top`（顶层全量段 JSON 形，已知 + 未知）：插件自报 config key 的 cfg 查找面
 /// （撞宿主已知段名合法，spec Part 3；load_with_extra）。
-pub fn load_app_config(
-    config: Option<&str>,
-    dir_override: Option<&str>,
-    base_override: Option<&str>,
-) -> Result<(Config, serde_json::Value, PathBuf, PathBuf, bool, String), String> {
-    let (cfg, top, config_dir) = match config::find_path(config)? {
+pub fn load_cfg(config: Option<&str>) -> Result<(Config, serde_json::Value, PathBuf), String> {
+    match config::find_path(config)? {
         Some(path) => {
             let config_dir = config_dir_of(&path);
             let LoadedConfig { config, top } = config::load_with_extra(&path, &config_dir)
                 .map_err(|e| format!("load config: {e}"))?;
-            (config, top, config_dir)
+            Ok((config, top, config_dir))
         }
         None => {
             eprintln!(
                 "note: no config.yaml found (searched cwd upward, $HOME/.oj/config.yaml) — \
                  using built-in defaults"
             );
-            (
+            Ok((
                 Config::default(),
                 serde_json::Value::Object(Default::default()),
                 std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?,
-            )
+            ))
         }
-    };
-    // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
-    // 默认目录：自 config 同级起步逐级向上搜索，每层 src 优先、dist 次之；
-    // 一路到根都没找到 → 回落 config_dir/src。
-    // 目录缺失不在此拦截：server 准入（api 与静态至少其一）由 run() 裁定，
-    // migrate/fixture/test 强依赖 api 目录、各自就地报错。from_config 对缺失
-    // 目录全程容忍（模块扫描 NotFound = 空 = 无模块，见 manifest::load_modules）。
-    let dir = dir_override.map(PathBuf::from).unwrap_or_else(|| {
-        let mut cur = Some(config_dir.as_path());
-        loop {
-            match cur {
-                Some(d) => {
-                    let src = d.join("src");
-                    if src.is_dir() {
-                        break src;
-                    }
-                    let dist = d.join("dist");
-                    if dist.is_dir() {
-                        break dist;
-                    }
-                    cur = d.parent();
-                }
-                None => break config_dir.join("src"),
-            }
+    }
+}
+
+/// 解析配置 + 服务目录 / api 前缀（v0.1.58 挂载模型）。server 折叠 CLI 挂载后自解析
+/// （见 `fold_cli_mounts`）；test/migrate/exec/openapi 共用本函数，取值优先级：
+/// - `--site <prefix>`：命中 api 挂载 → **只留这一条**（选树语义：迁移/路由都只对它；
+///   折叠写回 `cfg.mounts`——下游 `App::from_config` 只看挂载）；命中 web 挂载 → Err
+///   并列出全部 api prefix 供选；与 `-d`/`-b` 同给 → Err（互斥，不留含糊面）。
+/// - 无 --site：显式 `-d`（按 CWD 绝对化，覆盖第一条 api 挂载的目录）> 第一条 api
+///   挂载（目录已按 config_dir 解析）> 缺省搜索（自 config 同级逐级向上，每层 src
+///   优先、dist 次之）。`-b` 改写第一条 api 挂载的前缀（无挂载 → 以该前缀新增）。
+/// - ts = 目录即模式（`is_release`）。目录缺失不在此拦截：test/migrate 强依赖 api
+///   目录、各自就地报错；from_config 对缺失目录全程容忍（模块扫描 NotFound = 空）。
+pub fn load_app_config(
+    config: Option<&str>,
+    site: Option<&str>,
+    dir_override: Option<&str>,
+    base_override: Option<&str>,
+) -> Result<(Config, serde_json::Value, PathBuf, PathBuf, bool, String), String> {
+    let (mut cfg, top, config_dir) = load_cfg(config)?;
+    if site.is_some() {
+        if dir_override.is_some() {
+            return Err("--site and -d/--dir are mutually exclusive".into());
         }
+        if base_override.is_some() {
+            return Err("--site and -b/--base are mutually exclusive".into());
+        }
+    }
+    let resolved = crate::app::resolve_mounts(&cfg, &config_dir)?;
+    let primary = resolved.iter().find_map(|m| {
+        m.kind
+            .api()
+            .map(|(d, t)| (d.to_path_buf(), t, m.prefix.clone()))
     });
+    // --site：选树。只保留选中的 api 挂载（web 挂载对 test/migrate/exec/openapi 无意义）。
+    if let Some(s) = site {
+        let want = resolve_app_prefix(s).map_err(|e| format!("--site: {e}"))?;
+        let Some((dir, ts, prefix)) = resolved.iter().find_map(|m| {
+            (m.prefix == want)
+                .then_some(m.kind.api())
+                .flatten()
+                .map(|(d, t)| (d.to_path_buf(), t, m.prefix.clone()))
+        }) else {
+            let api_prefixes: Vec<&str> = resolved
+                .iter()
+                .filter(|m| m.kind.api().is_some())
+                .map(|m| m.prefix.as_str())
+                .collect();
+            return Err(if resolved.iter().any(|m| m.prefix == want) {
+                format!(
+                    "--site {s:?} is a web mount — pick an api mount (available api prefixes: {api_prefixes:?})"
+                )
+            } else {
+                format!("--site {s:?} not found (available api prefixes: {api_prefixes:?})")
+            });
+        };
+        let picked = cfg
+            .mounts
+            .iter()
+            .find(|m| {
+                m.api.is_some()
+                    && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
+            })
+            .cloned();
+        if let Some(m) = picked {
+            cfg.mounts = vec![m];
+        }
+        return Ok((cfg, top, config_dir, dir, ts, prefix));
+    }
+    // -d：覆盖第一条 api 挂载的目录（无挂载 → 以默认前缀新增一条）。
+    let dir = match dir_override {
+        Some(d) => {
+            let p = absolutize_cwd(
+                &std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?,
+                d,
+            );
+            match cfg.mounts.iter().position(|m| m.api.is_some()) {
+                Some(i) => cfg.mounts[i].api = Some(p),
+                None => cfg.mounts.push(config::MountConf {
+                    prefix: base_override
+                        .unwrap_or(DEFAULT_API_PREFIX)
+                        .to_string(),
+                    api: Some(p),
+                    web: None,
+                    spa: None,
+                    headers: Default::default(),
+                }),
+            }
+            PathBuf::from(d)
+        }
+        None => match &primary {
+            Some((d, _, _)) => d.clone(),
+            // 无任何 api 挂载：旧行为兜底——自 config 同级逐级向上搜索。
+            None => search_api_dir(&config_dir),
+        },
+    };
+    // -b：改写第一条 api 挂载的前缀（无挂载 → 以该前缀新增一条指向解析出的目录）。
+    let base = match base_override {
+        Some(b) => {
+            let p = resolve_app_prefix(b).map_err(|e| format!("--base: {e}"))?;
+            match cfg.mounts.iter().position(|m| m.api.is_some()) {
+                Some(i) => cfg.mounts[i].prefix = p.clone(),
+                None => cfg.mounts.push(config::MountConf {
+                    prefix: p.clone(),
+                    api: Some(dir.to_string_lossy().into_owned()),
+                    web: None,
+                    spa: None,
+                    headers: Default::default(),
+                }),
+            }
+            p
+        }
+        None => primary
+            .as_ref()
+            .map(|(_, _, p)| p.clone())
+            .unwrap_or_else(|| DEFAULT_API_PREFIX.to_string()),
+    };
     let ts = !is_release(&dir);
-    let base = resolve_base(base_override, &cfg.server.api_prefix)?;
     Ok((cfg, top, config_dir, dir, ts, base))
 }
 
-/// server 准入门（显式三态，无静默默认）：
-/// - api 与 app 都指定 → **两者都必须存在**，任一缺失 Err 退出（显式要求的能力
-///   缺失时静默降级是坑）；
-/// - 只指定其一 → 该目录必须存在，仅启用对应功能（api 缺席 = 纯静态；app 缺席 = 纯 API）；
-/// - 都未指定 → Err，提醒两者必须指定其一（不再自动搜索 src/dist 兜底）。
-///
-/// `api_dir`：Some = 指定了 `--api-path`（CLI）；`app_specified`：配置了任一静态站点
-/// （config `server.app_path` / `server.static_sites` 或 CLI `--app-path`）。
-/// 静态目录存在性不在此判——装配期站点表解析统一 fail-fast（含具体 prefix）。
-fn admission_gate(api_dir: Option<&Path>, app_specified: bool) -> Result<(), String> {
-    match (api_dir, app_specified) {
-        (None, false) => Err(
-            "neither api path (--api-path) nor static site (server.app_path / \
-             server.static_sites / --app-path) specified — one of them is required to start"
-                .to_string(),
-        ),
-        (None, true) => Ok(()), // 纯静态：目录存在性由装配期站点表解析 fail-fast。
-        (Some(api), _) => {
-            // api 必须存在；静态站点（若有）由装配期 fail-fast。
-            if !api.is_dir() {
-                return Err(format!(
-                    "api path not found: {}（src 源码树或 oj build 产物 dist）",
-                    api.display()
-                ));
+/// 缺省服务目录搜索（无任何 api 挂载时的旧行为）：自 config 同级起步逐级向上，
+/// 每层 src 优先、dist 次之；一路到根都没找到 → 回落 config_dir/src。
+fn search_api_dir(config_dir: &Path) -> PathBuf {
+    let mut cur = Some(config_dir);
+    loop {
+        match cur {
+            Some(d) => {
+                let src = d.join("src");
+                if src.is_dir() {
+                    return src;
+                }
+                let dist = d.join("dist");
+                if dist.is_dir() {
+                    return dist;
+                }
+                cur = d.parent();
             }
-            Ok(())
+            None => return config_dir.join("src"),
         }
     }
+}
+
+/// server 准入门（v0.1.58 规则 5）：mounts（config + CLI 折叠后）为空 → Err 提示。
+/// 目录存在性不在此判——装配期 resolve_mounts 统一 fail-fast（含 prefix/条目序号）。
+fn admission_gate(cfg: &Config) -> Result<(), String> {
+    if cfg.mounts.is_empty() {
+        return Err(
+            "no mounts configured — add a top-level `mounts:` entry (one line = one URL \
+             prefix + one api/web directory) or pass --api-path/--app-path"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// 相对路径按 `base`（CWD）绝对化；绝对路径原样。供 CLI `--app-path` 使用。
@@ -376,19 +498,9 @@ fn absolutize_cwd(base: &Path, p: &str) -> String {
     }
 }
 
-/// api 前缀归源：CLI `-b` 显式给出 > config `server.api_prefix`（默认 /v1/api）。
-/// 空前缀拒绝（全 404 的静默坑）。
-fn resolve_base(cli: Option<&str>, cfg: &str) -> Result<String, String> {
-    let b = cli.unwrap_or(cfg);
-    if b.trim_matches('/').is_empty() {
-        return Err("base prefix must not be empty (-b / server.api_prefix)".into());
-    }
-    Ok(b.to_string())
-}
-
-/// CLI `--app-path` 折叠进 config（v0.1.27，可重复）：
-/// - 裸 `dir`（至多一次）→ 覆盖 `server.app_path`，按 CWD 预绝对化（legacy 单值语义）；
-/// - `prefix=dir` → `server.static_sites` 中同前缀条目替换、否则追加（CLI 优先于 config）；
+/// CLI `--app-path` 折叠进 mounts（v0.1.58，可重复；语义沿用 v0.1.27 的两形态）：
+/// - 裸 `dir`（至多一次）→ upsert `{prefix: "/", web: dir}`，按 CWD 预绝对化；
+/// - `prefix=dir` → 同前缀 **web** 条目替换（保留 headers/spa）、否则追加（CLI 优先）。
 ///   prefix 过 `resolve_app_prefix` 规范化校验。
 fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("resolve --app-path: {e}"))?;
@@ -404,40 +516,40 @@ fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String
             Some((prefix, dir)) => {
                 let p = resolve_app_prefix(prefix)
                     .map_err(|e| format!("--app-path prefix {prefix:?}: {e}"))?;
-                let dir = absolutize_cwd(&cwd, dir);
-                // 同前缀判定走规范化口径（config 侧可能带尾斜杠等未规范形态）。
-                let idx = cfg
-                    .server
-                    .static_sites
-                    .iter()
-                    .position(|s| resolve_app_prefix(&s.prefix).is_ok_and(|x| x == p));
-                match idx {
-                    Some(i) => {
-                        let s = &mut cfg.server.static_sites[i];
-                        s.prefix = p;
-                        s.path = dir;
-                    }
-                    None => cfg.server.static_sites.push(StaticSiteConf {
-                        prefix: p,
-                        path: dir,
-                        headers: Default::default(),
-                    }),
-                }
+                upsert_web(cfg, &p, absolutize_cwd(&cwd, dir));
             }
         }
     }
     if let Some(dir) = bare {
-        cfg.server.app_path = Some(absolutize_cwd(&cwd, dir));
+        upsert_web(cfg, "/", absolutize_cwd(&cwd, dir));
     }
     Ok(())
 }
 
-/// 静态站点前缀归一（`server.app_prefix`，默认 "/"）：必须以 `/` 开头；尾斜杠剪除；
-/// 剪完为空 → "/"（根）。非 "/" 前缀时静态兜底仅服务该前缀下的 GET/HEAD。
-/// 非法（不以 `/` 开头）→ Err fail-fast。
+/// 同前缀 web 条目替换（保留 headers/spa——CLI 只覆盖目录）、否则追加（规范化口径：
+/// config 侧可能带尾斜杠等未规范形态）。
+fn upsert_web(cfg: &mut Config, prefix: &str, dir: String) {
+    let idx = cfg.mounts.iter().position(|m| {
+        m.web.is_some()
+            && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
+    });
+    match idx {
+        Some(i) => cfg.mounts[i].web = Some(dir),
+        None => cfg.mounts.push(config::MountConf {
+            prefix: prefix.to_string(),
+            api: None,
+            web: Some(dir),
+            spa: None,
+            headers: Default::default(),
+        }),
+    }
+}
+
+/// 静态挂载前缀归一（挂载 `prefix`，`/` 允许）：必须以 `/` 开头；尾斜杠剪除；
+/// 剪完为空 → "/"（根）。非法（不以 `/` 开头）→ Err fail-fast。
 pub fn resolve_app_prefix(cfg: &str) -> Result<String, String> {
     if !cfg.starts_with('/') {
-        return Err(format!("server.app_prefix must start with '/': {cfg:?}"));
+        return Err(format!("mount prefix must start with '/': {cfg:?}"));
     }
     let trimmed = cfg.trim_end_matches('/');
     Ok(if trimmed.is_empty() {
@@ -449,28 +561,32 @@ pub fn resolve_app_prefix(cfg: &str) -> Result<String, String> {
 
 /// 模式判定：服务目录含 `manifests.yaml`（oj build 锁文件）→ release 产物树。
 /// src 源码树无此文件 → dev。两类目录形态互斥，判据确定。
-fn is_release(dir: &Path) -> bool {
+pub fn is_release(dir: &Path) -> bool {
     dir.join("manifests.yaml").is_file()
 }
 
 /// 装配并监听（port=0 → 随机端口，测试用）。维持旧签名（返回 (SocketAddr, JoinHandle)），
-/// 现有 `cargo test` 端口 0 + reqwest 用例零改动——内部委托 `App::from_config` + `App::serve`。
+/// 现有 `cargo test` 端口 0 + reqwest 用例零改动——内部把 `(base, dir)` 折成一条 api
+/// 挂载后委托 `App::from_config` + `App::serve`（ts 由目录内容自动判定）。
 pub async fn start(
-    cfg: Config,
+    mut cfg: Config,
     config_dir: &Path,
     dir: PathBuf,
     base: String,
-    ts: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
+    cfg.mounts.push(config::MountConf {
+        prefix: base,
+        api: Some(dir.to_string_lossy().into_owned()),
+        web: None,
+        spa: None,
+        headers: Default::default(),
+    });
     // top 传 Null：测试入口不依赖顶层未知段（config key 解析），保持旧签名零改动。
     let app = App::from_config(
         cfg,
         &serde_json::Value::Null,
         config_dir,
-        dir,
-        base,
-        ts,
         false,
         &ResourceProfiles::default(),
     )
@@ -1359,7 +1475,7 @@ mod tests {
         std::fs::write(t.0.join("config.yaml"), "{}\n").unwrap();
         let cfg = t.0.join("config.yaml");
         let (_, _, _, dir, ts, _) =
-            load_app_config(Some(cfg.to_str().unwrap()), None, None).unwrap();
+            load_app_config(Some(cfg.to_str().unwrap()), None, None, None).unwrap();
         assert_eq!(dir, t.0.join("src"));
         assert!(ts);
 
@@ -1369,7 +1485,7 @@ mod tests {
         std::fs::write(t2.0.join("config.yaml"), "{}\n").unwrap();
         let cfg2 = t2.0.join("config.yaml");
         let (_, _, _, dir2, _, _) =
-            load_app_config(Some(cfg2.to_str().unwrap()), None, None).unwrap();
+            load_app_config(Some(cfg2.to_str().unwrap()), None, None, None).unwrap();
         assert_eq!(dir2, t2.0.join("dist"));
 
         // config 下钻一层（sub/config.yaml），src 在父级 → 向上搜索命中。
@@ -1379,7 +1495,7 @@ mod tests {
         std::fs::write(t3.0.join("sub/config.yaml"), "{}\n").unwrap();
         let cfg3 = t3.0.join("sub/config.yaml");
         let (_, _, _, dir3, _, _) =
-            load_app_config(Some(cfg3.to_str().unwrap()), None, None).unwrap();
+            load_app_config(Some(cfg3.to_str().unwrap()), None, None, None).unwrap();
         assert_eq!(dir3, t3.0.join("src"));
     }
 
@@ -1753,74 +1869,114 @@ mod tests {
     }
 
     #[test]
-    fn admission_gate_three_states() {
-        // 三态准入：皆指定 → 两者都必须存在；指定其一 → 该目录必须存在；
-        // 皆未指定 → Err 提醒必须指定其一。静态站点存在性移交装配期（fail-fast）。
-        let t = tmpdir("admit");
-        std::fs::create_dir(t.0.join("src")).unwrap();
-        // 皆指定且都存在 → Ok。
-        assert!(admission_gate(Some(Path::new("src")), true).is_ok());
-        // 皆指定但 api 缺失 → Err。
-        assert!(admission_gate(Some(Path::new("no-api")), true).is_err());
-        // 仅 api：存在 → Ok，缺失 → Err。
-        assert!(admission_gate(Some(Path::new("src")), false).is_ok());
-        assert!(admission_gate(Some(Path::new("no-api")), false).is_err());
-        // 仅静态站点声明：装配期再 fail-fast 目录存在性（gate 只判「指定与否」）。
-        assert!(admission_gate(None, true).is_ok());
-        // 皆未指定 → Err。
-        let e = admission_gate(None, false).unwrap_err();
-        assert!(e.contains("--api-path"), "{e}");
+    fn admission_gate_mounts() {
+        // 规则 5：mounts（config + CLI 折叠后）空 → Err；任一挂载 → Ok。
+        // 目录存在性移交装配期 resolve_mounts（fail-fast，含 prefix/条目序号）。
+        let e = admission_gate(&Config::default()).unwrap_err();
+        assert!(e.contains("mounts"), "{e}");
+        let mut c = Config::default();
+        c.mounts.push(config::MountConf {
+            prefix: "/".into(),
+            api: None,
+            web: Some("web".into()),
+            spa: None,
+            headers: Default::default(),
+        });
+        assert!(admission_gate(&c).is_ok());
     }
 
     #[test]
     fn fold_cli_app_paths_rules() {
-        // 裸 dir：覆盖主站点 app_path；至多一次。
+        // 裸 dir：upsert `/` web 挂载；至多一次。
         let mut c = Config::default();
         fold_cli_app_paths(&mut c, &["web".into()]).unwrap();
-        assert!(c.server.app_path.as_deref().unwrap().ends_with("web"));
-        assert!(c.server.static_sites.is_empty());
+        assert_eq!(c.mounts.len(), 1);
+        assert_eq!(c.mounts[0].prefix, "/");
+        assert!(c.mounts[0].web.as_deref().unwrap().ends_with("web"));
         assert!(fold_cli_app_paths(&mut c, &["a".into(), "b".into()]).is_err());
-        // prefix=dir：追加 + 同前缀替换（规范化口径：config 带尾斜杠也命中）。
+        // prefix=dir：追加 + 同前缀 web 条目替换（规范化口径：config 带尾斜杠也命中；
+        // headers/spa 保留）。
         let mut c = Config::default();
-        c.server.static_sites.push(StaticSiteConf {
+        c.mounts.push(config::MountConf {
             prefix: "/docs/".into(),
-            path: "old".into(),
+            api: None,
+            web: Some("old".into()),
+            spa: Some(true),
             headers: Default::default(),
         });
         fold_cli_app_paths(&mut c, &["/docs=new".into(), "/app=dist/app".into()]).unwrap();
-        assert_eq!(c.server.static_sites.len(), 2);
-        let docs = c
-            .server
-            .static_sites
-            .iter()
-            .find(|s| s.prefix == "/docs")
-            .unwrap();
-        assert!(docs.path.ends_with("new"), "{docs:?}");
-        let app = c
-            .server
-            .static_sites
-            .iter()
-            .find(|s| s.prefix == "/app")
-            .unwrap();
-        assert!(app.path.ends_with("dist/app"), "{app:?}");
-        // 裸 + 带前缀混合。
+        assert_eq!(c.mounts.len(), 2);
+        let docs = c.mounts.iter().find(|m| m.prefix == "/docs").unwrap();
+        assert!(docs.web.as_deref().unwrap().ends_with("new"), "{docs:?}");
+        assert_eq!(docs.spa, Some(true), "CLI 只覆盖目录，spa 保留");
+        let app = c.mounts.iter().find(|m| m.prefix == "/app").unwrap();
+        assert!(app.web.as_deref().unwrap().ends_with("dist/app"), "{app:?}");
+        // 裸 + 带前缀混合；裸覆盖 config 的 `/` web 条目。
         let mut c = Config::default();
+        c.mounts.push(config::MountConf {
+            prefix: "/".into(),
+            api: None,
+            web: Some("old-root".into()),
+            spa: None,
+            headers: Default::default(),
+        });
         fold_cli_app_paths(&mut c, &["web".into(), "/x=dx".into()]).unwrap();
-        assert!(c.server.app_path.is_some());
-        assert_eq!(c.server.static_sites.len(), 1);
+        assert_eq!(c.mounts.len(), 2);
+        assert!(c.mounts[0].web.as_deref().unwrap().ends_with("web"));
+        // 同前缀 api 挂载不受 --app-path 影响（配对语义：追加而非替换）。
+        let mut c = Config::default();
+        c.mounts.push(config::MountConf {
+            prefix: "/docs".into(),
+            api: Some("src".into()),
+            web: None,
+            spa: None,
+            headers: Default::default(),
+        });
+        fold_cli_app_paths(&mut c, &["/docs=d".into()]).unwrap();
+        assert_eq!(c.mounts.len(), 2);
+        assert!(c.mounts[0].api.is_some() && c.mounts[1].web.is_some());
         // 非法 prefix 报错。
         assert!(fold_cli_app_paths(&mut Config::default(), &["docs=dx".into()]).is_err());
     }
 
     #[test]
-    fn base_precedence_and_empty_guard() {
-        // CLI -b > config server.api_prefix（config 默认 /v1/api 由 ServerCfg::default 兜底）
-        assert_eq!(resolve_base(None, "/xapi").unwrap(), "/xapi");
-        assert_eq!(resolve_base(Some("/cli"), "/xapi").unwrap(), "/cli");
-        assert_eq!(resolve_base(None, "/v1/api").unwrap(), "/v1/api");
-        // 空前缀（仅斜杠）拒绝
-        assert!(resolve_base(Some(""), "/xapi").is_err());
-        assert!(resolve_base(None, "///").is_err());
+    fn fold_cli_mounts_rules() {
+        // --api-path upsert {prefix: B, api: d}：B = -b > 默认 /v1/api；同前缀 api 替换目录。
+        let mut c = Config::default();
+        c.mounts.push(config::MountConf {
+            prefix: "/v1/api".into(),
+            api: Some("dist".into()),
+            web: None,
+            spa: None,
+            headers: Default::default(),
+        });
+        let a = ServeArgs {
+            api_path: Some("src".into()),
+            base: Some("/cli".into()),
+            ..Default::default()
+        };
+        fold_cli_mounts(&mut c, &a).unwrap();
+        assert_eq!(c.mounts.len(), 1, "同前缀 api 条目替换而非追加");
+        assert_eq!(c.mounts[0].prefix, "/cli");
+        assert!(c.mounts[0].api.as_deref().unwrap().ends_with("src"));
+        // -b 无 --api-path → Err（裸 -b 无处附着）。
+        let a = ServeArgs {
+            base: Some("/x".into()),
+            ..Default::default()
+        };
+        let e = fold_cli_mounts(&mut Config::default(), &a).unwrap_err();
+        assert!(e.contains("--base"), "{e}");
+        // 缺省 prefix = DEFAULT_API_PREFIX（零 URL 变化）。
+        let mut c = Config::default();
+        fold_cli_mounts(
+            &mut c,
+            &ServeArgs {
+                api_path: Some("src".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.mounts[0].prefix, "/v1/api");
     }
 
     #[test]
@@ -1846,7 +2002,6 @@ mod tests {
             &t.0,
             t.0.join("src"),
             "/v1/api".into(),
-            true,
         )
         .await
         .err()
@@ -1858,7 +2013,7 @@ mod tests {
         // b) 只配一个路径 → 仍拒绝（缺任一不算就绪）。
         let mut cfg = Config::default();
         cfg.server.public_key_path = "/nonexistent/key.pem".into();
-        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -1867,7 +2022,7 @@ mod tests {
         let mut cfg = cert_cfg(&t.0);
         cfg.server.host = "127.0.0.1".into(); // 沙箱环境 localhost 解析受限，绑定回环更稳
         cfg.server.port = 0;
-        let r = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let r = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
         assert!(r.0.port() != 0);
@@ -1889,7 +2044,6 @@ mod tests {
             &t.0,
             t.0.join("src"),
             "/v1/api".into(),
-            true,
         )
         .await;
     }
@@ -1912,7 +2066,6 @@ mod tests {
             Path::new("/tmp"),
             t.0.join("src"),
             "/v1/api".into(),
-            true,
         )
         .await
         .err()
@@ -1944,7 +2097,6 @@ mod tests {
             Path::new("/tmp"),
             t.0.join("src"),
             "/v1/api".into(),
-            true,
         )
         .await
         .err()
@@ -2108,7 +2260,6 @@ mod tests {
             &t.0,
             t.0.join("src"),
             "/v1/api".into(),
-            true,
         )
         .await
         .err()
@@ -2151,7 +2302,7 @@ mod tests {
         ]);
         let mut cfg = cert_cfg(&t);
         cfg.server.port = 0; // 随机端口（默认 778 并行测试会撞）
-        let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into(), false)
+        let (addr, _h) = start(cfg, &t, t.join("dist"), "/v1/api".into())
             .await
             .unwrap();
         let r = reqwest::get(format!("http://{addr}/v1/api/user/item/7"))
@@ -2181,7 +2332,7 @@ mod tests {
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0;
         cfg.db.insert("default".into(), db.clone());
-        let _ = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let _ = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
         let acc = only_js::bridge::DbBackendRegistry::builtin()
@@ -2209,7 +2360,7 @@ mod tests {
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0;
         cfg.db.insert("default".into(), db2.clone());
-        let e = start(cfg, &t.0, dist.clone(), "/v1/api".into(), false)
+        let e = start(cfg, &t.0, dist.clone(), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2250,7 +2401,7 @@ mod tests {
         // e) 非法值 fail-fast。
         let mut cfg = cert_cfg(&t.0);
         cfg.server.migrate_on_start = Some("nope".into());
-        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2268,7 +2419,7 @@ mod tests {
     async fn release_fail_fast_paths() {
         // a) 无 manifests.yaml
         let t = rel_fixture(&[("dist/user-0.1.0/manifest.yaml", MANI)]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2281,14 +2432,14 @@ mod tests {
             ("dist/manifests.yaml", "user: 9.9.9\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
         ]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
         assert!(e.contains("9.9.9"), "{e}");
         // c) version 注入
         let t = rel_fixture(&[("dist/manifests.yaml", "user: ../../etc\n")]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2301,7 +2452,7 @@ mod tests {
                 "name: other\ndesc: d\nversion: 0.1.0\n",
             ),
         ]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2316,7 +2467,7 @@ mod tests {
             ("dist/user-0.1.0/manifest.yaml", MANI),
             ("dist/user-0.1.0/routes.js", "export default [ "),
         ]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2350,7 +2501,7 @@ mod tests {
                 "export default { get() { json.ok({}); } };\n",
             ),
         ]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2364,7 +2515,7 @@ mod tests {
             ("dist/manifests.yaml", "user: [unclosed\n"),
             ("dist/user-0.1.0/manifest.yaml", MANI),
         ]);
-        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+        let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2378,7 +2529,7 @@ mod tests {
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0; // 随机端口
         cfg.server.app_path = Some(".".into()); // 相对 config_dir
-        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
         let r = reqwest::get(format!("http://{addr}/")).await.unwrap();
@@ -2394,7 +2545,7 @@ mod tests {
         let t = tmpdir("sc-root-missing");
         let mut cfg = cert_cfg(&t.0);
         cfg.server.app_path = Some("no-such-dir".into());
-        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
@@ -2423,7 +2574,7 @@ mod tests {
             "default".into(),
             format!("sqlite://{}/db.sqlite", t.0.display()),
         );
-        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
         std::fs::create_dir_all(t.0.join("src/u/f")).unwrap();
@@ -2985,7 +3136,7 @@ mod tests {
             .await
             .unwrap();
         assert!(r.kv.is_none());
-        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true)
+        let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();

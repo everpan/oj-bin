@@ -117,13 +117,13 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
     cfg.server
         .response_headers
         .insert("x-oj-e2e".into(), "global".into());
-    cfg.server
-        .static_sites
-        .push(only_js::config::StaticSiteConf {
-            prefix: "/docs".into(),
-            path: t.join("docs").to_string_lossy().into(),
-            headers: std::collections::HashMap::from([("x-oj-e2e".into(), "docs".into())]),
-        });
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/docs".into(),
+        api: None,
+        web: Some(t.join("docs").to_string_lossy().into()),
+        spa: None,
+        headers: std::collections::BTreeMap::from([("x-oj-e2e".into(), "docs".into())]),
+    });
     // oj-5c：slow 路由 1s 超时（全局 30s 不可能等到——408 必是覆盖生效）。
     cfg.server
         .route_timeouts
@@ -131,8 +131,13 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
             pattern: "/v1/api/slow/**".into(),
             timeout: "1s".into(),
         });
-    cfg.server.app_path = Some(t.join("web").to_string_lossy().into());
-    cfg.server.app_prefix = "/".into();
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/".into(),
+        api: None,
+        web: Some(t.join("web").to_string_lossy().into()),
+        spa: None,
+        headers: Default::default(),
+    });
     cfg.blob = Some(only_js::config::BlobSection {
         driver: "local".into(),
         root: t.join("blob-root").to_string_lossy().into(),
@@ -150,7 +155,7 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
         ],
         ..Default::default()
     });
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let secret = b"upload-e2e-secret";

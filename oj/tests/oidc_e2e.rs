@@ -193,7 +193,7 @@ async fn oidc_full_chain_login_bridge_and_tenant() {
     });
     cfg.plugins_dir = plugins_dir();
     cfg.plugins.insert("auth".into(), serde_json::json!({})); // 严格清单：只装 oj-auth
-    let (addr, _h) = serve_cmd::start(cfg, &t, src, "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, src, "/v1/api".into())
         .await
         .unwrap();
     let http = reqwest::Client::builder()

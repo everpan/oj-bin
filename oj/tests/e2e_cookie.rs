@@ -143,7 +143,7 @@ async fn cookie_session_and_ws_handshake_auth_end_to_end() {
         cookie: Some(serde_json::json!({"enabled": true})),
         ..Default::default()
     });
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let secret = b"cookie-e2e-secret";
