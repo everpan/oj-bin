@@ -56,10 +56,11 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `-c` | 自动搜索 | 配置文件路径（host/port/base/root/db/redis）。**v0.1.57 起可省**：省略时按序搜索 ① CWD 逐级向上 `config.yaml` → ② `$HOME/.oj/config.yaml`；都没找到用内置默认值继续（stderr 打 `note:` 提示），显式 `-c` 指向缺失文件仍报错。serve / build / exec / migrate / test / schema diff / openapi / info / secret seal/open 都有此参数 |
-| `-b` | config `server.api_prefix`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
-| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path`，无缺省搜索 |
-| `--api-path` | 无 | （server）API 目录，相对 CWD；缺省 = 不开 API 功能（须配 `--app-path` / `server.app_path`，否则退出） |
-| `--app-path` | 无 | （server）静态站点，相对 CWD，可重复。裸 `dir`（至多一次）覆盖 `server.app_path`；`prefix=dir`（如 `--app-path /docs=dist/docs`）追加/替换 `server.static_sites` 条目（CLI 优先于 config） |
+| `-b` | `/v1/api` | （server）`--api-path` 折叠挂载的 URL 前缀（v0.1.58：挂载自带完整 prefix，`-b` **仅在折叠 `--api-path` 时生效**，裸 `-b` 报错）。test / openapi 用它覆盖路由前缀 |
+| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 取第一条 api 挂载，无挂载时自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path` |
+| `--api-path` | 无 | （server）API 目录，相对 CWD；折叠为 `{prefix: <-b 或 /v1/api>, api: <dir>}` 挂载（同前缀替换）。缺省 = 不开 API 挂载（须有 `mounts:` / `--app-path`，否则退出） |
+| `--app-path` | 无 | （server）web 挂载，相对 CWD，可重复。裸 `dir`（至多一次）upsert `{prefix: "/", web: dir}`；`prefix=dir`（如 `--app-path /docs=dist/docs`）upsert 同前缀 web 条目（CLI 优先，`headers`/`spa` 保留） |
+| `--site` | 无 | （test / test fixture / migrate / exec / openapi）选 api 挂载（挂载 prefix，如 `--site /v2`）：只用该树与其前缀；命中 web 挂载 → 报错并列出全部 api prefix；与 `-d`/`-b` 互斥 |
 | `module` | 无 → 全部模块 | （build）要编译的模块名 |
 | `-o` | `dist` | （build）产物目录 |
 | `--no-minify` | 开（即默认 minify） | （build）关闭产物 minify，得到多行可读产物（排障用） |
@@ -115,11 +116,11 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 - **模式自动判定**（server）：`--api-path` 目录含 `manifests.yaml`
   （构建锁）→ release 跑 `.js`；否则 dev 跑 `.ts`（改文件即生效）。指定的目录
   不存在启动即报错。启动行会打印判定结果（`dev/ts` / `release/js` / `static-only`）。
-- **准入门（三态，无静默默认）**：api（`--api-path`）与静态（`server.app_path` /
-  `--app-path`）至少显式指定其一，否则退出并提醒。两者皆指定 → 都必须存在，任一
-  缺失退出；仅指定其一 → 只启用对应功能。
+- **准入门（v0.1.58）**：`mounts:`（config + CLI 折叠后）为空 → 退出并提醒
+  （一行挂载 = 一个 URL 前缀 + 一个目录）。目录存在性由装配期统一 fail-fast
+  （报错含挂载序号与前缀）。
 - 相对路径（`-c`/`-d`/`--api-path`/CLI `--app-path`）相对**当前工作目录**（CWD），
-  不是相对 config 所在目录；config 中的 `server.app_path` 相对 config 目录。
+  不是相对 config 所在目录；config `mounts:` 中的 api/web 目录相对 config 目录。
 
 ## 3. 配置 config.yaml
 
@@ -131,14 +132,25 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 > （回落默认时相对 CWD）。
 
 ```yaml
+# 挂载表（v0.1.58）：一行 = 一个 URL 前缀 + 一个目录（api/web 恰好其一）。
+# 挂载自带完整 prefix——写什么 URL 就是什么；旧 server.api_prefix / app_path /
+# app_prefix / static_sites / app_spa_fallback 已删除（出现即报错并输出迁移 YAML）。
+mounts:
+  - prefix: "/v1/api"     # api 挂载：/v1/api/<module>/...（目录相对 config 所在目录）
+    api: "src"            #   src 源码树（dev）或 oj build 产物 dist（release），逐条目自动判定
+  - prefix: "/"           # web 挂载：API 未命中的 GET/HEAD 落静态（目录须存在，缺失拒启）
+    web: "public"
+    # spa: true           # SPA 深链回落（默认 false——404 不静默变 200；显式开启才回落）
+    # headers: { X-Frame-Options: "DENY" }   # 挂载级响应头，覆盖全局同名（v0.1.30）
+  # - prefix: "/v2"       # 第二个 api 挂载：/v2/<module>/...（多 API 目录同进程）
+  #   api: "dist-v2"
+  # - prefix: "/docs"     # 与 api 挂载同前缀可配对（api 优先；配对 web 不开 spa 回落）
+  #   web: "docs-dist"
 server:
   host: "localhost"       # 监听地址（默认 localhost）
   port: 9778              # 监听端口（代码默认即 9778）
-  api_prefix: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖；空前缀拒绝；旧键 base 兼容）
   timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
   pool_size: 4            # JS 执行线程数（并发度）
-  app_path: "public"      # 静态站点根目录（相对 config 目录；省略 = 不开静态服务）
-  app_prefix: "/"         # 静态站点前缀（默认 / = 全路径兜底；如 "/site" 则仅 /site/* 落静态）
   public_key_path: "./config/public_key.pem"   # 证书校验公钥（PEM，必配）
   certificate_path: "./config/certificate.jws"  # JWS 证书（Base64URL(Header).Payload.Signature，必配）
   grace_days: 30           # 证书过期后宽限天数（默认 30；缩窄可加速告警）
@@ -146,14 +158,9 @@ server:
                            # | verify（release 默认，账本落后拒启，先 oj migrate）| off
   ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）
                            # | deny（未声明 deps 的跨模块表访问拒绝执行）
-  static_sites:            # 多静态站点（v0.1.27）：与主站点共存；前缀重复启动报错
-    # - prefix: "/site2"   #   最长前缀命中、站内 miss 不跨站、仅 GET/HEAD
-    #   path: "site2-dist" #   目录相对 config 所在目录
-    #   headers: { X-Frame-Options: "DENY" }   # 站点级响应头，覆盖全局同名（v0.1.30）
   # max_upload_bytes: 10485760          # handler 面上传上限（字节，超出 413；axum 硬顶 ×2）
-  # blob_upload_max_bytes: 1073741824   # PUT {base}/blob/{key} 直传上限（默认 1 GiB，不经 handler）
-  # app_spa_fallback: false             # SPA 深链回落（v0.1.20；默认 false——404 不静默变 200）
-  # html_meta: "__meta"                 # 路由感知 meta 目录（相对 app_path；送 HTML 前注入 <head>）
+  # blob_upload_max_bytes: 1073741824   # PUT {挂载prefix}/blob/{key} 直传上限（默认 1 GiB，不经 handler）
+  # html_meta: "__meta"                 # 路由感知 meta 目录（相对各 web 挂载根；送 HTML 前注入 <head>）
   # html_meta_handler: "/v1/api/html-meta"  # 动态 meta 源（v0.1.25；须命中一个 GET 路由，拼错拒启）
   # html_cache_control: "no-cache"      # 仅 HTML 响应的 Cache-Control（v0.1.25）
   # response_headers:                   # 全局自定义响应头（v0.1.30；动态/静态/blob 都补，只补缺不覆盖）
@@ -312,16 +319,21 @@ db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询�
   序列：SIGINT/SIGTERM → `tasks.stopping()` 置位 → `stop_grace_secs` 宽限 → 看门狗强杀
   → HTTP 排空 → 退出。启动/重启/停机逐条落日志。
 - `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
-- `server.app_path`（CLI `--app-path` 覆盖）：静态站点服务。config 配置相对 config 目录；CLI 显式给出时相对 CWD。API 路由（`-b` 前缀下）优先，未命中的 GET/HEAD 落到该目录
-  按路径读文件（目录 → `index.html`）；目录不存在启动即报错。穿越段（含 `%2F` 编码）按 404。
-  静态站点前缀 `server.app_prefix`（默认 `/` = 全路径兜底）：设为如 `/site` 时仅
-  `/site/*` 的 GET/HEAD 落静态（前缀剥除后解析，`/site` → `index.html`），前缀外 404。
-  API 路由永远优先于静态兜底。
-  多站点用 `server.static_sites`（v0.1.27，前缀→目录映射列表，最长前缀命中、站内 miss
-  不跨站，仅 GET/HEAD）；CLI `--app-path prefix=dir` 可重复追加/替换条目。
-  **准入门（三态，无静默默认）**：api（`--api-path`）与静态（`server.app_path` / `--app-path`）至少显式指定其一，否则退出。
-  两者皆指定 → 都必须存在，任一缺失退出；仅指定其一 → 只启用对应功能
-  （api 缺席 = 纯静态模式，无 API 路由，监听行标 `static-only`；app 缺席 = 纯 API）。
+- `mounts:`（v0.1.58）：挂载表，一行 = 一个绝对 URL 前缀 + 一个目录（api/web 恰好
+  其一；值空串报错）。目录相对 config 目录（CLI `--app-path`/`--api-path` 折叠进来的
+  相对 CWD）。**路由按前缀最长命中、跨挂载不回落**：`/v2/typo` 只会命中 `/v2` 挂载
+  （404 JSON），不会被 `/` web 挂载吞成 200。
+  - api 挂载：`{prefix, api: dir}` 服务该目录的模块路由；目录不存在/含 manifests.yaml
+    与否（dev/release）逐条目判定，缺失启动即报错。**同前缀一条 api + 一条 web 合法**
+    （配对；api 优先，配对 web 不开 spa 回落）；同类重复报错。
+  - web 挂载：`{prefix, web: dir}` 静态服务，仅 GET/HEAD（其余方法 **405**）；前缀根 →
+    `index.html`；穿越段（含 `%2F` 编码）按 404。`spa: true` 显式开启深链回落（默认
+    false），且要求同前缀无 api 挂载（否则报错——嵌套 api 挂载经最长前缀命中本来就
+    吞不掉）。
+  - 允许根 `/`：api 挂载路由 `/<module>`，内建端点 `/health`、`/plugins`、`/blob/{key}`
+    跟各自 api 挂载前缀走（多 api 挂载逐个注册；与既往部署零 URL 变化）。
+  - 准入门：`mounts:`（config + CLI 折叠后）为空 → 退出并提醒（api 缺席 = 纯 web，
+    监听行标 `static-only`）。
 - `server.public_key_path` / `server.certificate_path` / `server.grace_days`：
   **证书必配且不可绕过**。两个路径缺任一即启动报错退出（无任何 config/CLI 开关可跳过
   证书校验；CLI `--cert-path`/`--key-path` 可覆盖路径，但不能豁免校验）。配齐后启用
@@ -355,8 +367,27 @@ db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询�
   （带凭据不允许 `*`）；其余键空值走各自默认。
 - `secrets:` / `vars:` / `db_query:`：见上方块内注释。密封细节见 `docs/secrets.md`；
   `vars` 是配置里**唯一**的部署期常量通道（fail-closed）。
-- `server.static_sites`：多站点列表（最长前缀命中），与主站点（`app_path`/`app_prefix`）
-  共存；CLI `--app-path prefix=dir` 可重复追加/替换条目。
+- 多 API 目录 / 多站点：`mounts:` 多条 api/web 挂载（见上）；CLI `--api-path` /
+  `--app-path prefix=dir` 可重复 upsert（CLI 优先于 config）。`oj test` / `migrate` /
+  `exec` / `openapi` / `test fixture` 用 `--site <prefix>` 选 api 挂载（只用该树）。
+
+### 3.1 旧站点键迁移（v0.1.58）
+
+五个 `server.*` 旧键已删除：`app_path` / `app_prefix` / `static_sites` / `api_prefix`
+（含旧键名 `base`）/ `app_spa_fallback`。config 里出现任一个 → **启动报错**（绝不静默
+迁移），错误信息按「旧写法 → 新写法」逐键给出等价 `mounts:` YAML，与下表同源：
+
+| 旧写法 | 新写法 |
+|---|---|
+| `server.app_path: public`（前缀取 `server.app_prefix`，默认 `/`） | `- { prefix: "/", web: "public" }` |
+| `server.app_spa_fallback: true` | 每个 web 条目加 `spa: true`（旧版为全局开关） |
+| `server.static_sites[i]` | `- { prefix: <p>, web: <path>, headers: {...} }` |
+| `server.api_prefix: "/v1/api"`（或 `base:`） | 无机械映射——api 挂载自带完整 prefix：`- { prefix: "/v1/api", api: <目录> }`；CLI `-b` 不再需要 |
+
+CLI 对应关系：`--api-path d` ≙ `- { prefix: <-b 或 /v1/api>, api: d }`；`--app-path d` ≙
+`- { prefix: "/", web: d }`；`--app-path /p=d` ≙ upsert `{prefix: "/", web: …}` 同款。
+注意两处可见行为变化：web 挂载非 GET/HEAD 由「落入 404」变**显式 405**；SPA 回落从全局
+开关改为**逐挂载显式 `spa: true`**（默认 false）。
 
 ## 4. 项目目录结构
 
@@ -530,8 +561,10 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{fea
 - 路径任意深度：`/v1/api/user/profile/detail/` → `src/user/profile/detail/api.ts` 的 `get`。
 - 尾斜杠有无皆可。
 - 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
-- **解析顺序**：路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→
-  静态站点（`server.app_path`，仅 GET/HEAD，见 §3）→ 404。API 永远优先于静态文件。
+- **解析顺序（v0.1.58 挂载模型）**：按前缀最长命中选挂载（跨挂载不回落）→ api 挂载内
+  路由表（含 `.route` 参数路由）→ dev 目录镜像兜底（dev 模式）→ 同前缀配对 web（无 spa
+  回落）→ 404；web 挂载直接静态服务（仅 GET/HEAD）。内建端点 `{api挂载prefix}/health`、
+  `{api挂载prefix}/plugins`、`{api挂载prefix}/blob/{key}` 逐 api 挂载注册。
 
 ### 7.1 路径参数路由（`.route`）
 
@@ -881,8 +914,9 @@ release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是已�
 - `.tsx`/`.mts` 不转译（直通 V8）。
 - `ext_boot.js` 用顶层 `await` 须带 `export {};`（否则被 CJS 启发式包进非 async 函数）；
   且拿不到 `ext:core/ops`，只能在已有全局上做组合（§9「扩展全局对象」）。
-- 静态站点（`server.app_path`）：**默认不回落**（未知路径 404），显式开 `server.app_spa_fallback:
-  true` 才把无扩展名的 HTML 请求回落到 `index.html`（`api_prefix` 下的 404 不受影响）；
-  per-route 的 `<title>`/`og:*` 由 `server.html_meta`（构建期 JSON）或 `server.html_meta_handler`
-  （动态 handler，v0.1.25）注入，HTML 的缓存头用 `server.html_cache_control`；无目录列表、
-  无 Range/ETag（经前置反代补），未知扩展名按 `application/octet-stream` 下载。
+- web 挂载：**默认不回落**（未知路径 404），显式开挂载 `spa: true` 才把无扩展名的 HTML
+  请求回落到该挂载根 `index.html`（api 挂载前缀下的 404 不受影响——最长前缀命中使拼错
+  路径直接落 api 挂载）；per-route 的 `<title>`/`og:*` 由 `server.html_meta`（构建期 JSON，
+  相对各 web 挂载根）或 `server.html_meta_handler`（动态 handler，v0.1.25）注入，HTML 的
+  缓存头用 `server.html_cache_control`；无目录列表、无 Range/ETag（经前置反代补），
+  未知扩展名按 `application/octet-stream` 下载。

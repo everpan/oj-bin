@@ -136,10 +136,13 @@ curl -s http://localhost:9778/v1/api/share/detail/abc123 | head -c 200
 ### ① 配置
 
 ```yaml
+mounts:
+  - prefix: "/v1/api"          # api 挂载：这个前缀下的 404 不会被回落吞掉（见坑 1）
+    api: "src"
+  - prefix: "/"                # web 挂载：静态站点根（相对 config 文件目录）
+    web: "dist"
+    spa: true                  # 默认 false：不显式打开就没有深链回落
 server:
-  api_prefix: "/v1/api"        # 这个前缀下的 404 不会被回落吞掉（见坑 1）
-  app_path: "dist"             # 静态站点根（相对 config 文件目录）
-  app_spa_fallback: true       # 默认 false：不显式打开就没有深链回落
   html_meta: "__meta"          # 默认关闭：开启后按请求路径读 __meta/<path>.json 注入
 ```
 
@@ -187,9 +190,11 @@ dist/
 来自数据库的页面，用 `html_meta_handler` 指一个**普通 GET handler**：
 
 ```yaml
+mounts:
+  - prefix: "/"
+    web: "dist"
+    spa: true
 server:
-  app_path: "dist"
-  app_spa_fallback: true
   html_meta_handler: "/v1/api/html-meta"   # 必须命中一个 GET 路由，否则启动即报错
   html_cache_control: "no-cache"           # 壳随路由而异 → 别让中间层盲缓存（只管 HTML）
 ```
@@ -217,8 +222,8 @@ export default {
 
 要点：
 
-- 送 HTML 前**内部派发**该 handler（HTTP 动词恒 GET）；**`http.query.path` 是已剥 `app_prefix`
-  的站点内路径**（`app_prefix: "/site"` 时 `/site/issues/7` → `/issues/7`），仍是
+- 送 HTML 前**内部派发**该 handler（HTTP 动词恒 GET）；**`http.query.path` 是已剥命中
+  web 挂载前缀的站点内路径**（挂载 `prefix: "/site"` 时 `/site/issues/7` → `/issues/7`），仍是
   percent-encoded，需要明文自己 `decodeURIComponent`；
 - 返回的键与 `__meta/*.json` **同一白名单**（`title` / `description` / `canonical` /
   `og:*` / `twitter:*`，值一律转义、不注入脚本）；静态 JSON 打底、动态**按 key 覆盖**；
@@ -239,7 +244,7 @@ export default {
 > 不需要同时开 `html_meta*`）。
 
 > **生产形态**：注入只在 **oj 自己送静态文件**时生效。若生产由 nginx/Caddy/对象存储直出 SPA，
-> 要么让站点走 oj 托管（`server.app_path`），要么在反代层做同样的事。
+> 要么让站点走 oj 托管（web 挂载），要么在反代层做同样的事。
 
 顺手一提：邮件里要拼的站点基址这类**部署期常量**，写 config 顶层 `vars:` 段，handler 里
 `vars.get()` 读（同步；只有声明过的键可读，未声明恒 `null`；平台不读 OS env）：
@@ -269,7 +274,7 @@ curl -s -H 'Accept: text/html' http://localhost:9778/issues/abc | grep -i 'og:ti
 
 | 现象 | 原因 |
 |---|---|
-| 深链仍然 404 | 忘了 `app_spa_fallback: true`（默认关） |
+| 深链仍然 404 | web 挂载忘了 `spa: true`（默认关） |
 | 拼错的 API 路径返回 200 + 首页 HTML | 不会：`/v1/api` 前缀下的路径**不参与回落**，该 404 还是 404 |
 | 某个前端路由没回落 | 路径带扩展名（如 `/space/7.json`）——带扩展名视为资源请求，不回落 |
 | `curl -X POST` 不回落 | 只有 `GET` / `HEAD` 回落 |

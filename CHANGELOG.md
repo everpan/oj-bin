@@ -16,6 +16,42 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.58（未打标签）
+
+**breaking（config/serve）**：站点配置删除旧键，升级为顶层 `mounts:` 扁平挂载表——
+一行 = 一个 URL 前缀 + 一个目录（api/web 恰好其一），支持多 API 目录与多静态站点。
+
+- **五个旧键删除**：`server.api_prefix`（含旧键名 `base`）/ `server.app_path` /
+  `server.app_prefix` / `server.static_sites` / `server.app_spa_fallback`。config 里
+  出现任一个 → **启动报错并输出迁移后的 `mounts:` YAML**（按「旧写法 → 新写法」逐键
+  两列，`app_spa_fallback: true` 加到每一个 web 条目——旧版它是全局开关；绝不静默迁移）。
+  迁移对照见 `docs/user-manual.md` §3.1。
+- **`mounts:` 语义**：按前缀**最长命中、跨挂载不回落**；同前缀一条 api + 一条 web 可配对
+  （api 优先，配对 web 无 SPA 回落），同类重复报错；值空串报错；`spa: true` 要求同前缀
+  无 api 挂载；允许根 `/`；web 挂载仅 GET/HEAD（**其余方法由旧版「落入 404」改为显式
+  405**）。目录 canonicalize 逐条目 fail-fast（api 挂载目录缺失不再静默空路由）。
+- **内建端点零 URL 变化**：`/health`、`/plugins`、`/blob/{key}` 依旧注册在 api 挂载前缀
+  下（今日即 `{base}/...`，base 默认 `/v1/api`），逐 api 挂载各注册一份。
+- **SPA 回落改 per-挂载显式 `spa: true`**（默认 false）——继承 v0.1.20「静默把 404 变
+  200 会掩盖错配」的立论；`path_under_base` 排除检查结构性消亡（api 前缀路径恒最长命中
+  api 挂载）。
+- **CLI**：`--api-path d [-b B]` → upsert `{prefix: B, api: d}`（B = `-b` > 默认
+  `/v1/api`；**裸 `-b`（无 `--api-path`）报错**——挂载自带 prefix，无处附着）；`--app-path`
+  裸 `d` → upsert `{prefix: "/", web: d}`、`prefix=dir` → upsert 同前缀 web 条目（保留
+  headers/spa）。`oj test` / `test fixture` / `migrate` / `exec` / `openapi` 新增
+  `--site <prefix>`：选 api 挂载（只用该树与其前缀）；命中 web 挂载报错并列出全部 api
+  prefix；与 `-d`/`-b` 互斥。
+- **装配**：多 api 树并集装配——迁移/seed/fixtures/schema 收敛逐 api 树执行；表名跨树
+  重复沿用 S002 fail-fast；**模块名跨树重复改报错**（旧 `module_map.insert` 静默共存）；
+  路由表逐挂载构建，`html_meta_handler` 按前缀定表，`GET {base}/plugins` 数据不变。
+
+**feat(sample)**：`sample/config.yaml` 改写为 `mounts:` 形态（api `/v1/api` + web `/`
+指 `dist`，URL 不变）；`sample/README.md` 命令与说明同步。
+
+**docs**：`docs/user-manual.md` §3 重写挂载章 + §3.1 迁移小节；devkit 四件同步
+（api-manual「mounts（v0.1.58）」节 + 错误/限制表、SKILL 陷阱速查、scenarios 场景 2、
+README 版本行）。
+
 ## v0.1.57（未打标签）
 
 **feat(cli)**：所有子命令的 `-c/--config` 改为可选，并统一配置搜索路径。

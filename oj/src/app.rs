@@ -422,38 +422,38 @@ async fn build_schema_and_modules(
             }
             module_owner.insert(name.clone(), mdir.clone());
             let mf = manifest::parse_one(&mdir.join("manifest.yaml"))?;
-        if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
-            if guard != SqlGuard::Off {
-                f.validate_tenant(&name)?;
-                for st in f.shared_tables() {
-                    if !shared_allow.iter().any(|a| a == st) {
-                        eprintln!(
-                            "warn: [{name}] 共享表声明 {st:?} 未列入 tenant.shared_allow，按受租户约束处理（tenant_id 列校验将生效）"
-                        );
+            if let Some(f) = crate::schema::SchemaFile::load(&mdir)? {
+                if guard != SqlGuard::Off {
+                    f.validate_tenant(&name)?;
+                    for st in f.shared_tables() {
+                        if !shared_allow.iter().any(|a| a == st) {
+                            eprintln!(
+                                "warn: [{name}] 共享表声明 {st:?} 未列入 tenant.shared_allow，按受租户约束处理（tenant_id 列校验将生效）"
+                            );
+                        }
                     }
                 }
-            }
-            for (t, pk, cols, tenant_flag) in f.registry_tables() {
-                if registry.has_table(t) {
-                    return Err(format!(
-                        "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
-                        registry.owner_of(t).unwrap_or("?")
-                    ));
+                for (t, pk, cols, tenant_flag) in f.registry_tables() {
+                    if registry.has_table(t) {
+                        return Err(format!(
+                            "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
+                            registry.owner_of(t).unwrap_or("?")
+                        ));
+                    }
+                    // 共享表 = 显式 tenant:false 且列于 shared_allow 白名单（交集，fail-closed）。
+                    let shared = !tenant_flag && shared_allow.iter().any(|a| a == t);
+                    // v0.1.24：带列类型装配（租户守卫按 tenant_id 列类型绑定数值/字符串）。
+                    registry = registry.table_owned_shared_typed(&name, t, &pk, &cols, shared);
                 }
-                // 共享表 = 显式 tenant:false 且列于 shared_allow 白名单（交集，fail-closed）。
-                let shared = !tenant_flag && shared_allow.iter().any(|a| a == t);
-                // v0.1.24：带列类型装配（租户守卫按 tenant_id 列类型绑定数值/字符串）。
-                registry = registry.table_owned_shared_typed(&name, t, &pk, &cols, shared);
             }
-        }
-        module_map.insert(
-            mdir.to_string_lossy().into_owned(),
-            ModuleCtx {
-                name: name.clone(),
-                deps: Arc::new(mf.deps.keys().cloned().collect()),
-                db: mf.db.clone(),
-            },
-        );
+            module_map.insert(
+                mdir.to_string_lossy().into_owned(),
+                ModuleCtx {
+                    name: name.clone(),
+                    deps: Arc::new(mf.deps.keys().cloned().collect()),
+                    db: mf.db.clone(),
+                },
+            );
         }
     }
     Ok((registry, Arc::new(module_map)))
@@ -733,7 +733,11 @@ pub(crate) fn resolve_mounts(
                     prefix: p,
                     kind: ResolvedMountKind::Web {
                         root,
-                        headers: m.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        headers: m
+                            .headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                         spa: m.spa.unwrap_or(false),
                     },
                 });
@@ -1361,7 +1365,9 @@ impl App {
                     }
                     eprintln!("module {} v{} — {}", m.name, m.version, m.desc);
                     let rjs = mdir.join("routes.js");
-                    let v = reader(&rjs).map_err(|e| format!("load {}: {e}", rjs.display()))?;
+                    let v = reader(&rjs).map_err(|e| {
+                        format!("load {}: {e} — run `oj build` first", rjs.display())
+                    })?;
                     for e in routes::entries_from_value(&v) {
                         entries.push(routes::RouteEntry {
                             method: e.method,
@@ -1810,7 +1816,12 @@ mod tests {
         (base, dirs)
     }
 
-    fn mount(prefix: &str, api: Option<&str>, web: Option<&str>, spa: Option<bool>) -> config::MountConf {
+    fn mount(
+        prefix: &str,
+        api: Option<&str>,
+        web: Option<&str>,
+        spa: Option<bool>,
+    ) -> config::MountConf {
         config::MountConf {
             prefix: prefix.into(),
             api: api.map(Into::into),
@@ -1826,7 +1837,12 @@ mod tests {
         // 归一：尾斜杠剪除；目录 canonicalize；api 逐条目 dev 判定（无 manifests.yaml → ts）。
         let mut cfg = Config::default();
         cfg.mounts = vec![
-            mount("/v1/api/", Some(dirs[0].to_string_lossy().as_ref()), None, None),
+            mount(
+                "/v1/api/",
+                Some(dirs[0].to_string_lossy().as_ref()),
+                None,
+                None,
+            ),
             mount("/", None, Some(dirs[1].to_string_lossy().as_ref()), None),
         ];
         let out = resolve_mounts(&cfg, &base).unwrap();
@@ -1835,18 +1851,34 @@ mod tests {
         let (d, ts) = out[0].kind.api().unwrap();
         assert_eq!(d, &dirs[0].canonicalize().unwrap());
         assert!(ts, "无 manifests.yaml → dev");
-        assert!(matches!(out[1].kind, ResolvedMountKind::Web { spa: false, .. }));
+        assert!(matches!(
+            out[1].kind,
+            ResolvedMountKind::Web { spa: false, .. }
+        ));
 
         // 嵌套合法：/v1 web(spa) + /v1/api api；根 `/` api 挂载合法。
         let mut cfg = Config::default();
         cfg.mounts = vec![
-            mount("/v1", None, Some(dirs[1].to_string_lossy().as_ref()), Some(true)),
-            mount("/v1/api", Some(dirs[0].to_string_lossy().as_ref()), None, None),
+            mount(
+                "/v1",
+                None,
+                Some(dirs[1].to_string_lossy().as_ref()),
+                Some(true),
+            ),
+            mount(
+                "/v1/api",
+                Some(dirs[0].to_string_lossy().as_ref()),
+                None,
+                None,
+            ),
             mount("/", Some(dirs[2].to_string_lossy().as_ref()), None, None),
         ];
         let out = resolve_mounts(&cfg, &base).unwrap();
         assert_eq!(out.len(), 3);
-        assert!(matches!(out[0].kind, ResolvedMountKind::Web { spa: true, .. }));
+        assert!(matches!(
+            out[0].kind,
+            ResolvedMountKind::Web { spa: true, .. }
+        ));
 
         // 同类重复（含尾斜杠归一口径）→ Err；api+web 配对 → 合法。
         let mut cfg = Config::default();
@@ -1872,14 +1904,28 @@ mod tests {
         // 声明序保留（primary = 第一条 api）。
         let mut cfg = Config::default();
         cfg.mounts = vec![
-            mount("/second", Some(dirs[0].to_string_lossy().as_ref()), None, None),
-            mount("/first", Some(dirs[2].to_string_lossy().as_ref()), None, None),
+            mount(
+                "/second",
+                Some(dirs[0].to_string_lossy().as_ref()),
+                None,
+                None,
+            ),
+            mount(
+                "/first",
+                Some(dirs[2].to_string_lossy().as_ref()),
+                None,
+                None,
+            ),
         ];
         let out = resolve_mounts(&cfg, &base).unwrap();
         assert_eq!(out[0].prefix, "/second");
 
         // 未配置 → 空表（纯静态占位由 from_config 决定）。
-        assert!(resolve_mounts(&Config::default(), &base).unwrap().is_empty());
+        assert!(
+            resolve_mounts(&Config::default(), &base)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1895,10 +1941,7 @@ mod tests {
             )
             .unwrap();
         }
-        let trees = vec![
-            (dirs[0].clone(), true),
-            (dirs[1].clone(), true),
-        ];
+        let trees = vec![(dirs[0].clone(), true), (dirs[1].clone(), true)];
         let e = build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
             .await
             .err()
@@ -1906,9 +1949,11 @@ mod tests {
         assert!(e.contains("u") && e.contains("multiple"), "{e}");
         // 同一树两份没问题（不触发跨树重名）。
         let trees = vec![(dirs[0].clone(), true)];
-        assert!(build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
-            .await
-            .is_ok());
+        assert!(
+            build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
+                .await
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

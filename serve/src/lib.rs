@@ -51,6 +51,9 @@ pub enum CertificateStatus {
 /// 运行时挂载（v0.1.58 mounts 模型）：api（路由表 + dev 兜底 + 可选配对 web）
 /// 或 web（纯静态）。`prefix` 已归一（首斜杠、无尾斜杠、`/` 允许）；app() 内按
 /// 前缀长度降序（同长字符串升序）排序，请求期取最长命中，**跨挂载不回落**。
+// Api 腿携带 RouteTable（与旧 AppState.table 同一暴露面，Clone 成本不变），
+// 与 Web 腿的体积差是模型固有形状，非误用。
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum RuntimeMount {
     Api {
@@ -219,17 +222,14 @@ pub fn app(
     cors: Option<CorsCfg>,
 ) -> Router {
     let mut router = Router::new();
-    for m in mounts.iter().filter(|m| matches!(m, RuntimeMount::Api { .. })) {
+    for m in mounts
+        .iter()
+        .filter(|m| matches!(m, RuntimeMount::Api { .. }))
+    {
         let p = m.prefix().trim_end_matches('/');
         router = router
-            .route(
-                &format!("{p}/health"),
-                axum::routing::get(health_handler),
-            )
-            .route(
-                &format!("{p}/plugins"),
-                axum::routing::get(plugins_handler),
-            );
+            .route(&format!("{p}/health"), axum::routing::get(health_handler))
+            .route(&format!("{p}/plugins"), axum::routing::get(plugins_handler));
     }
     router = router
         .fallback(any(handle))
@@ -486,7 +486,6 @@ async fn handle_api(
     body: axum::body::Body,
     accept_html: bool,
 ) -> Response {
-
     // 内置 blob 下载路由（{prefix}/blob/{key}，公开 GET，先于路由表，也先于前置管线）。
     //
     // **与匿名路径的耦合（互指注释）**：本分支（以及配对 web 静态腿）在 auth/tenant
@@ -3415,8 +3414,7 @@ pub(crate) mod tests {
         site: &[(&str, &str)],
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, TempRoutes)) {
-        let (addr, (t, keeps)) =
-            spawn_static_sites(api, &[("/", spa, site.to_vec())], opts).await;
+        let (addr, (t, keeps)) = spawn_static_sites(api, &[("/", spa, site.to_vec())], opts).await;
         (addr, (t, keeps.into_iter().next().unwrap()))
     }
 
@@ -3428,10 +3426,7 @@ pub(crate) mod tests {
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
         let t = routes(api);
-        let keeps: Vec<TempRoutes> = sites
-            .iter()
-            .map(|(_, _, f)| routes(f))
-            .collect();
+        let keeps: Vec<TempRoutes> = sites.iter().map(|(_, _, f)| routes(f)).collect();
         let mut mounts: Vec<RuntimeMount> = sites
             .iter()
             .zip(&keeps)
@@ -3444,10 +3439,11 @@ pub(crate) mod tests {
                 })
             })
             .collect();
+        let table = build_table(&t.0, true, "/v1/api");
         mounts.push(RuntimeMount::Api {
             prefix: "/v1/api".to_string(),
-            table: RouteTable::default(),
-            fallback: None,
+            table,
+            fallback: Some(Routes::new("/v1/api", t.0.clone(), true)),
             web: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3612,7 +3608,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn html_meta_handler_overrides_static_and_sets_cache_control() {
         let (addr, _keep) = spawn_static(
-            true,
             &[(
                 "html-meta/api.ts",
                 r#"export default {
@@ -3634,6 +3629,7 @@ pub(crate) mod tests {
                      },
                    };"#,
             )],
+            true,
             &[
                 (
                     "index.html",
@@ -4103,17 +4099,15 @@ pub(crate) mod tests {
             fallback: Some(Routes::new("/v1/api", dir, true)),
             web: None,
         }];
-        let server = tokio::spawn(
-            serve_with_listener(
-                listener,
-                mounts,
-                actor,
-                None,
-                StaticOpts::default(),
-                Pipeline::default(),
-                None,
-            ),
-        );
+        let server = tokio::spawn(serve_with_listener(
+            listener,
+            mounts,
+            actor,
+            None,
+            StaticOpts::default(),
+            Pipeline::default(),
+            None,
+        ));
         // 有界轮询等 bind 完成（spawn 与本测试同一 current_thread 运行时，await 期间被驱动）。
         let mut bound = false;
         for _ in 0..200 {

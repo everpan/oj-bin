@@ -24,8 +24,7 @@ async fn slim(
     module: Option<&str>,
     db: Option<&str>,
 ) -> Result<Slim, String> {
-    let (cfg, top, config_dir, dir, ts, _base) =
-        load_app_config(config, site, dir_override, None)?;
+    let (cfg, top, config_dir, dir, ts, _base) = load_app_config(config, site, dir_override, None)?;
     // 迁移/fixtures 作用于 api 目录下的 SQL；强依赖 api 目录（无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(
@@ -445,7 +444,7 @@ mod tests {
         // 未声明库名：三处一致 fail-fast 且报出可用键。
         for e in [
             run_migrate(&MigrateArgs {
-            site: None,
+                site: None,
                 config: Some(cfg(&t)),
                 dir: src(&t),
                 baseline: false,
@@ -455,7 +454,7 @@ mod tests {
             .await
             .unwrap_err(),
             run_fixture(&FixtureArgs {
-            site: None,
+                site: None,
                 config: Some(cfg(&t)),
                 dir: src(&t),
                 module: None,

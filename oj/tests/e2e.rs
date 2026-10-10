@@ -60,11 +60,11 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     // 租户注入/400 与鉴权全链路在 mdm-server::tests 覆盖。
     cfg.tenant = Default::default();
     cfg.auth = None;
-    // sample/config.yaml 的 app_path: "dist" 指向仓库内产物目录（已停止跟踪，CI
-    // 新克隆无此目录）——boot() 的 UC 不覆盖静态兜底（多站点静态有专属 e2e，见
-    // multi_static_sites_serve_by_longest_prefix_end_to_end），显式关闭，避免
-    // resolve_static_sites 因目录缺失 fail-fast。
-    cfg.server.app_path = None;
+    // sample/config.yaml 的 web 挂载指向 dist（gitignore，CI 新克隆无此目录）且
+    // api 挂载固定 src——boot() 按本用例的 dev/release 目录重挂：清掉 sample 挂载，
+    // 由 start() 注入 (dir, /v1/api) 一条（UC 不覆盖静态兜底，多站点静态有专属 e2e，
+    // 见 multi_static_sites_serve_by_longest_prefix_end_to_end）。
+    cfg.mounts.clear();
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = serve::test_support::now_secs();
     serve::test_support::write_cert_into(
@@ -104,7 +104,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
                 .await
                 .unwrap();
         }
-        serve_cmd::start(cfg, &root, dir, "/v1/api".into(), dev)
+        serve_cmd::start(cfg, &root, dir, "/v1/api".into())
             .await
             .unwrap()
     };
@@ -549,7 +549,11 @@ async fn release_mode_loads_routes_js_without_introspection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_mode_without_routes_js_fails_fast() {
     let _g = lock();
-    let t = tmp_project(&[("dist/u/manifest.yaml", MANIFEST)]);
+    // 有锁才进 release 腿（目录即模式）；锁指向的产物目录缺失 routes.js → 提示 oj build。
+    let t = tmp_project(&[
+        ("dist/manifests.yaml", "u: 0.1.0\n"),
+        ("dist/u-0.1.0/manifest.yaml", MANIFEST),
+    ]);
     let e = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .err()
@@ -915,14 +919,18 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
         "test".into(),
         oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("tst.sqlite")),
     );
-    // fixtures=true + db_override="test"：`oj test` 的装配形态。
+    // fixtures=true + db_override="test"：`oj test` 的装配形态（v0.1.58：api 目录进挂载）。
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/v1/api".into(),
+        api: Some(t.join("src").to_string_lossy().into_owned()),
+        web: None,
+        spa: None,
+        headers: Default::default(),
+    });
     let app = oj::app::App::from_config(
         cfg,
         &serde_json::Value::Null,
         &t,
-        t.join("src"),
-        "/v1/api".into(),
-        true,
         true,
         &oj::app::ResourceProfiles {
             db: Some("test".into()),
@@ -994,8 +1002,13 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
     .unwrap();
 
     let mut cfg = base_cfg(&t);
-    cfg.server.app_path = Some(site.canonicalize().unwrap().display().to_string());
-    cfg.server.app_spa_fallback = true;
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/".into(),
+        api: None,
+        web: Some(site.canonicalize().unwrap().display().to_string()),
+        spa: Some(true),
+        headers: Default::default(),
+    });
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     cfg.server.html_cache_control = Some("no-cache".into());
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
@@ -1064,15 +1077,19 @@ async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
 
     // path 相对 config_dir（t）解析。
     let mut cfg = base_cfg(&t);
-    cfg.server.static_sites = vec![
-        only_js::config::StaticSiteConf {
+    cfg.mounts = vec![
+        only_js::config::MountConf {
             prefix: "/docs".into(),
-            path: "docs".into(),
+            api: None,
+            web: Some("docs".into()),
+            spa: None,
             headers: Default::default(),
         },
-        only_js::config::StaticSiteConf {
+        only_js::config::MountConf {
             prefix: "/".into(),
-            path: "web".into(),
+            api: None,
+            web: Some("web".into()),
+            spa: None,
             headers: Default::default(),
         },
     ];
@@ -1313,8 +1330,7 @@ async fn contract_boot(
         oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
     );
     std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
-    let mut c: Config = serde_yaml::from_str(&cfg).unwrap();
-    c.server.app_path = None;
+    let c: Config = serde_yaml::from_str(&cfg).unwrap();
     let dir = tmp.join("src");
     serve_cmd::start(c, tmp, dir, "/v1/api".into())
         .await

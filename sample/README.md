@@ -27,8 +27,11 @@
   auto（dev 默认）| verify（release 默认，账本落后拒启）| off
 - WS 订阅发布示例：连 /v1/api/news/ws 发任意一帧（src/news/ws.ts 订阅 news），
   再 POST /v1/api/news → 连接收到 {"topic":"news",…} 广播帧
-- config.yaml `server.app_path: dist`（相对 config 目录；CLI `--app-path` 可覆盖，相对 CWD）：API 未命中的 GET/HEAD 落静态（/manifests.yaml、
-  /user-0.1.0.tgz 可直接访问；dist 无 index.html 故 / 为 404）
+- config.yaml 顶层 `mounts:`（v0.1.58，一行 = 一个 URL 前缀 + 一个目录）：api `/v1/api`
+  服务 src（dev）/ dist（release，`--api-path sample/dist` 覆盖或改挂载条目）；web `/` 指
+  `dist`——API 未命中的 GET/HEAD 落静态（/manifests.yaml、/user-0.1.0.tgz 可直接访问；
+  dist 无 index.html 故 / 为 404；web 挂载目录须存在，新克隆先 `oj build` 或删除该条）。
+  多挂载语义（最长前缀命中、跨挂载不回落、`spa: true` 逐挂载显式）见 docs/user-manual.md §3
 - 证书必配（不可绕过）：sample 自带自签示例证书 `config/{public.pem,cert.jws}`
   （私钥 `config/private.pem` 仅示例用，**严禁用于生产**；过期后用
   `cargo run -p oj-cert -- renew -k sample/config/private.pem` 重签）

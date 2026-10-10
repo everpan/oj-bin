@@ -53,6 +53,13 @@ v0.1.47 起 blob 增 `copy` / `move` / `readRange` 三件套（服务端搬运�
 不再进 V8）：`copy` 保留 src、`move` 删 src、`readRange` 是短读截断；见
 `api-manual.md` §6 blob 段与 `scenarios.md` 场景 25。
 
+v0.1.58 起**站点配置升级为顶层 `mounts:` 扁平挂载表**（一行 = 一个 URL 前缀 + 一个
+目录，api/web 恰好其一）：五个旧 `server.*` 键（`api_prefix`/`app_path`/`app_prefix`/
+`static_sites`/`app_spa_fallback`）已删除，出现即报错并输出迁移 YAML；SPA 回落改为
+逐挂载显式 `spa: true`（默认 false）；web 挂载非 GET/HEAD 显式 405；`oj test`/`migrate`/
+`exec`/`openapi`/`test fixture` 新增 `--site <prefix>` 选 api 挂载。见 `api-manual.md`
+「mounts（v0.1.58）」、`user-manual.md` §3.1 迁移对照与 `scenarios.md` 场景 2。
+
 v0.1.57 起所有子命令的 `-c/--config` 均可省略：省略时按 **CWD 逐级向上 `config.yaml` →
 `$HOME/.oj/config.yaml`** 搜索，未找到用内置默认值继续（显式 `-c` 缺失仍 fail-fast）——
 `oj build` / `oj openapi` / `oj exec`（纯计算）/ `oj info` / 纯静态 `oj serve` 无需配置即可

@@ -96,10 +96,12 @@ pub fn write_project(t: &Tmp) -> PathBuf {
     std::fs::create_dir_all(src.join("mail")).unwrap();
     let cfg = format!(
         concat!(
+            "mounts:\n",
+            "  - prefix: \"/v1/api\"\n",
+            "    api: \"src\"\n",
             "server:\n",
             "  host: \"127.0.0.1\"\n",
             "  port: 0\n",
-            "  api_prefix: \"/v1/api\"\n",
             "db:\n",
             "  default: \"{db}\"\n",
             "smtp:\n",
@@ -193,14 +195,8 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
         n.saturating_sub(3600),
         n + 365 * 86_400,
     );
-    // v0.1.58：api 目录进挂载表（from_config 只看 mounts）。
-    cfg.mounts.push(only_js::config::MountConf {
-        prefix: "/v1/api".into(),
-        api: Some(src.to_string_lossy().into_owned()),
-        web: None,
-        spa: None,
-        headers: Default::default(),
-    });
+    // v0.1.58：api 挂载由上方 config 模板的 mounts: 段提供（from_config 只看 mounts）。
+    let _ = &src;
     oj::app::App::from_config(
         cfg,
         &serde_json::Value::Null,
