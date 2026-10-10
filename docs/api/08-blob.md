@@ -23,7 +23,7 @@ cdylib 插件 `oj-blob-s3` 承载（blob 轴）。JS 侧暴露 `blob` 全局对�
 ```yaml
 blob:                      # 段存在即启用；缺省 = blob 全局/上传/下载路由均不挂
   driver: "local"          # local | s3
-  root: "uploads"          # local 专用：存储根（相对 config.yaml 所在目录解析）
+  root: "uploads"          # local：存储根（相对 config.yaml 所在目录解析）；s3：对象键前缀（可空）
   # s3（oj-blob-s3 插件；MinIO 需 path_style: true）：
   # driver: "s3"
   # endpoint: "http://127.0.0.1:9000"
@@ -45,6 +45,18 @@ server:
 
 - 平铺字段是 `backends.default` 的旧语法糖；多后端请统一写 `backends:`。
 - 配置声明了名字但装配时无对应后端（如 s3 插件未装）→ 启动 fail-fast。
+
+s3 后端（`oj-blob-s3` 插件）每后端连接收的字段：
+
+| 字段 | 说明 |
+|---|---|
+| `driver` | 取 `s3` |
+| `root` | 对象键前缀（可空） |
+| `endpoint` | S3 兼容端点；`http://` 明文端点会自动放开 `allow_http` |
+| `bucket` | 必填（缺 → 启动报错） |
+| `region` | 必填（缺 → 启动报错） |
+| `access_key` / `secret_key` | 可选；缺则匿名访问 |
+| `path_style` | 默认 `false`（virtual-hosted）；MinIO / 自建切 `true` |
 
 ## API
 
@@ -90,6 +102,19 @@ server:
   落 blob**（v0.1.38，local 临时文件 / s3 multipart，服务端内存恒定），此时 `http.file(i)`
   报错，改用 `http.files[i].key` / `.url`；服务端代分配 key 形如
   `uploads/<时间戳>-<序号>-<安全化文件名>`。
+
+## 插件实现
+
+`s3` 驱动由 cdylib 插件 `oj-blob-s3` 承载（提供 `blob` 轴；已随发行包发布）：
+
+- 底层走 `object_store` 的 `AmazonS3` + `reqwest`，纯 Rust 无原生库。实现 `put` /
+  `get` / `del` / `url`（预签名 15min）/ `upload_url` / 流式上传（8 MiB 定长 part）/
+  服务端 copy·move / 区间读，行为与下线前的 `S3Blob` 对齐。
+- 与 `oj-kv-redis` 等服务不同：`init` 无装配期配置，后端配置在 `connect` 时按值传入。
+- `content_type` 恒为 `null`：MIME 由 S3 对象自身元数据负责。
+- 多 part 上传当前仅支持单发 `put` 预签名；`multipart` 预签名
+  （Create/UploadPart/Complete）未实现，预留 op 返回 Err（>100MB 超大文件待真实
+  需求再加 SigV4 三段预签名）。
 
 ## 案例
 
@@ -174,4 +199,36 @@ export default { post };
 ```bash
 curl -X POST "http://localhost:9778/v1/api/report/finalize/?key=uploads/1717-0-big.zip&id=42"
 # → {"code":0,"data":{"key":"docs/42/pack.zip","url":"/v1/api/blob/docs/42/pack.zip"}}
+```
+
+### 商品图上传 S3 并回预签名地址（s3 后端）
+
+```ts
+// src/product/image/api.ts —— multipart 上传商品图 → 存 S3 → 回预签名 URL
+async function post() {
+  const f = http.files[0];                  // {field, filename, content_type, size, ...}
+  if (!f) { json.fail(400, "need a file (multipart)"); return; }
+  const safe = f.filename.replace(/[^\w.-]+/g, "_");
+  const key = `products/${http.param("id", "0")}/${Date.now()}-${safe}`;
+  await blob.put(key, await http.file(0), f.content_type);
+  json.ok({ key, url: await blob.url(key) });  // url = 15min 预签名下载地址
+}
+export default { post };
+```
+
+```yaml
+# config.yaml —— MinIO / 自建端点切 path_style
+blob:
+  driver: s3
+  endpoint: http://minio:9000
+  bucket: my-app
+  region: cn-north-1
+  access_key: ENC[...]     # oj secret seal 生成；缺省 = 匿名
+  secret_key: ENC[...]
+  path_style: true
+```
+
+```bash
+curl -F "img=@cover.png" http://localhost:9778/v1/api/product/image/?id=42
+# → {"code":0,"data":{"key":"products/42/...-cover.png","url":"https://s3.../...?X-Amz-Signature=..."}}
 ```

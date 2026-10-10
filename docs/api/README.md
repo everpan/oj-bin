@@ -5,6 +5,11 @@
 **权威 API 参考为 [`../devkit/api-manual.md`](../devkit/api-manual.md)**，本目录与其对齐，
 如有出入以 api-manual 为准。
 
+有后端插件的轴（db / kv / blob / bus / mq / es / mail / ldap），插件实现细节在各篇的
+「插件实现」节（原 `docs/plugins/oj-*.md` 已并入，见
+[`../plugins/README.md`](../plugins/README.md)）；auth 轴无 handler 侧 API 专题页，
+插件状态见 [`../plugins/oj-auth.md`](../plugins/oj-auth.md)。
+
 | # | 全局对象 | 文档 | 对应 bridge 源 |
 |---|---|---|---|
 | 01 | `json` / `finish` | [01-json.md](01-json.md) | `json.rs` / `envelope.rs` |
