@@ -129,26 +129,41 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
   for t in "${triples[@]}"; do
     read -r os cpu <<<"$(os_cpu_of "$t")"
     pkg="${SCOPE}/oj-${t}"
-    # registry 传播延迟：retry 5 次。注意 npm view --json 在版本不存在时退出码非 0 且把
-    # E404 错误对象打印到 stdout（非空）。必须按「退出码成功且非 error 对象」判定拿到真
-    # 元数据——否则错误 JSON 会被当成「非空元数据」短路掉 retry，误报 cpu/os 断言失败。
-    meta=""
-    for _ in 1 2 3 4 5; do
+    # registry 传播延迟：retry 8 次、退避至 ~5 分钟（镜像 CDN 最坏分钟级）。注意 npm view --json
+    # 在版本不存在时退出码非 0 且把 E404 错误对象打印到 stdout（非空）。必须按「退出码成功且非
+    # error 对象」判定拿到真元数据——否则错误 JSON 会被当成「非空元数据」短路掉 retry，误报
+    # cpu/os 断言失败。
+    meta=""; tb=""
+    for attempt in 1 2 3 4 5 6 7 8; do
       if meta=$(npm view "${pkg}@${VERSION}" os cpu --json 2>/dev/null) && \
          [[ -n "$meta" && "$meta" != *'"error"'* ]]; then
+        tb=$(npm view "${pkg}@${VERSION}" dist.tarball 2>/dev/null || true)
         break
       fi
       meta=""
-      sleep 15
+      [[ $attempt -lt 8 ]] && sleep $(( attempt * 15 > 60 ? 60 : attempt * 15 ))
     done
     if [[ -z "$meta" ]]; then
-      echo "::error::${pkg}@${VERSION} 元数据获取失败（可能未发布或 registry 传播延迟）：npm view 返回空/E404" >&2
-      exit 1
+      # npm view 仍不可见（CLI 负缓存/镜像差异）：直连 registry packument 作第二意见
+      reg="$(npm config get registry)"; reg="${reg%/}"
+      enc="$(printf '%s' "$pkg" | sed 's|/|%2F|')"
+      pack="$(curl -fsSL --max-time 30 "$reg/$enc" 2>/dev/null || true)"
+      if [[ -n "$pack" ]] && printf '%s' "$pack" | grep -q "\"${VERSION}\""; then
+        printf '%s' "$pack" | grep -q "\"$os\""  || { echo "::error::${pkg} packument os 断言失败（期望 $os）" >&2; exit 1; }
+        printf '%s' "$pack" | grep -q "\"$cpu\"" || { echo "::error::${pkg} packument cpu 断言失败（期望 $cpu）" >&2; exit 1; }
+        tb="$(printf '%s' "$pack" | node -e 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));const v=p.versions&&p.versions[process.argv[1]];process.stdout.write((v&&v.dist&&v.dist.tarball)||"")' "$VERSION")"
+        echo "note: npm view 尚未可见，已用 registry packument 兜底验证 ${pkg}@${VERSION}"
+      else
+        echo "::error::${pkg}@${VERSION} 元数据获取失败（可能未发布或 registry 传播延迟）：npm view 与 packument 均不可见" >&2
+        exit 1
+      fi
     fi
-    echo "$meta" | grep -q "$os" || { echo "::error::${pkg} os 断言失败（期望 $os）：$meta" >&2; exit 1; }
-    echo "$meta" | grep -q "$cpu" || { echo "::error::${pkg} cpu 断言失败（期望 $cpu）：$meta" >&2; exit 1; }
+    if [[ -n "$meta" ]]; then
+      echo "$meta" | grep -q "$os" || { echo "::error::${pkg} os 断言失败（期望 $os）：$meta" >&2; exit 1; }
+      echo "$meta" | grep -q "$cpu" || { echo "::error::${pkg} cpu 断言失败（期望 $cpu）：$meta" >&2; exit 1; }
+    fi
     # tarball 文件清单断言（npm pack 条目带 package/ 前缀）
-    tb=$(npm view "${pkg}@${VERSION}" dist.tarball)
+    [[ -n "$tb" ]] || { echo "::error::${pkg} 拿不到 dist.tarball" >&2; exit 1; }
     case "$os" in
       win32)  want='oj\.exe$|\.dll$' ;;
       darwin) want='package/oj$|\.dylib$' ;;
