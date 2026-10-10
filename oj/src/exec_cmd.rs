@@ -53,7 +53,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         (None, None, false) => ExecTarget::Repl,
     };
     let (cfg, top, config_dir, dir, _ts, base) =
-        load_app_config(&a.config, a.dir.as_deref(), None)?;
+        load_app_config(a.config.as_deref(), a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
     // 缺省 default；未声明 fail-fast（装配层统一校验）。
@@ -480,7 +480,7 @@ mod tests {
             file: Some(script.to_string_lossy().into()),
             code: None,
             repl: false,
-            config: tmp.join("config.yaml").to_string_lossy().into(),
+            config: Some(tmp.join("config.yaml").to_string_lossy().into()),
             dir: Some(tmp.to_string_lossy().into()),
             db: None,
             redis: None,
@@ -538,7 +538,7 @@ mod tests {
                 file: Some(script.to_string_lossy().into()),
                 code: None,
                 repl: false,
-                config: p.to_string_lossy().into(),
+                config: Some(p.to_string_lossy().into()),
                 dir: Some(tmp.join("src").to_string_lossy().into()),
                 db: None,
                 redis: None,

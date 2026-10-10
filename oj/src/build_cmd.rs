@@ -27,7 +27,7 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     );
     let out = PathBuf::from(&a.out);
     // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
-    let tasks_dir = tasks_dir_of(&a.config);
+    let tasks_dir = tasks_dir_of(a.config.as_deref());
     let mut view = crate::manifest::load_lock(&out.join("manifests.yaml"))?;
     let mut names: Vec<String> = match &a.module {
         Some(m) => {
@@ -61,7 +61,12 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     }
     // 检查体系（§5.2）：构建即检查，S001–S008 违规 fail build；--check 只校验不落盘。
     // sql_guard 活跃时追加 tenant 声明校验（schema.yaml 缺 tenant_id 列 fail build）。
-    crate::checks::run(&src, &names, &view, sql_guard_of_config(&a.config))?;
+    crate::checks::run(
+        &src,
+        &names,
+        &view,
+        sql_guard_of_config(a.config.as_deref()),
+    )?;
     if a.check {
         println!("oj build --check: {} module(s) OK", names.len());
         return Ok(());
@@ -88,13 +93,19 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
 
 /// 读 config（build 专用）：解析失败**不致命**（build 不装配服务，缺文件也照建），但
 /// 调用方必须**出声**——静默回落会悄悄改掉行为（见下面两处消费者）。
-fn load_config_for_build(config: &str) -> Result<only_js::config::Config, String> {
-    let p = Path::new(config);
-    let dir = p
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
+/// `config` None → 统一搜索（CWD 逐级向上 + $HOME/.oj），未找到静默用默认 Config
+/// （build 本就要求无 config 也能跑）。
+fn load_config_for_build(config: Option<&str>) -> Result<only_js::config::Config, String> {
+    match only_js::config::find_path(config)? {
+        Some(p) => {
+            let dir = p
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            only_js::config::load_from(dir, p.file_name().and_then(|s| s.to_str()))
+        }
+        None => Ok(only_js::config::Config::default()),
+    }
 }
 
 /// 构建期 sql_guard 模式（与 server 装配同一配置源）。
@@ -103,23 +114,27 @@ fn load_config_for_build(config: &str) -> Result<only_js::config::Config, String
 /// 靠它给 `S*` 检查加「schema 声明必须有 tenant_id 列」等校验，静默 Off 等于 **CI 门禁失效**。
 /// 注意 `oj build`（本函数）与 `oj server`/`oj test`（`App::from_config`，fail-fast）口径不同，
 /// 这是有意的：build 连 `config.yaml` 不存在都要能跑（见上方函数注释）。
-fn sql_guard_of_config(config: &str) -> only_js::bridge::SqlGuard {
+fn sql_guard_of_config(config: Option<&str>) -> only_js::bridge::SqlGuard {
     match load_config_for_build(config) {
         Ok(c) => c.tenant.sql_guard,
         Err(e) => {
             eprintln!(
-                "warn: 读配置 {config} 失败 → 本次 build 按 sql_guard=off 处理（tenant 声明校验不生效）：{e}"
+                "warn: 读配置 {} 失败 → 本次 build 按 sql_guard=off 处理（tenant 声明校验不生效）：{e}",
+                config.unwrap_or("<auto-search>")
             );
             only_js::bridge::SqlGuard::Off
         }
     }
 }
 
-fn tasks_dir_of(config: &str) -> String {
+fn tasks_dir_of(config: Option<&str>) -> String {
     match load_config_for_build(config) {
         Ok(c) => c.tasks.dir,
         Err(e) => {
-            eprintln!("warn: 读配置 {config} 失败 → 镜像目录回落默认 \"tasks\"：{e}");
+            eprintln!(
+                "warn: 读配置 {} 失败 → 镜像目录回落默认 \"tasks\"：{e}",
+                config.unwrap_or("<auto-search>")
+            );
             "tasks".to_string()
         }
     }
@@ -1190,7 +1205,7 @@ mod tests {
     fn build_args(t: &std::path::Path, module: Option<&str>) -> BuildArgs {
         BuildArgs {
             module: module.map(str::to_string),
-            config: t.join("config.yaml").display().to_string(),
+            config: Some(t.join("config.yaml").display().to_string()),
             dir: t.join("src").display().to_string(),
             out: t.join("dist").display().to_string(),
             minify: true,

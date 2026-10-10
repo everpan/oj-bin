@@ -1806,3 +1806,31 @@ curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"he
 | op 报 `axis op '<op>': plugin returned non-JSON` | 插件该 op 返回了非 JSON 字节——插件侧 bug，找插件作者 |
 | 同名泛型轴两个插件都声明 | 装配期 fail-fast（泛型轴每名单提供者）——`plugins:` 清单里只留一个 |
 | 想列一个轴有哪些 op | 协议面没有内省——插件文档/README 为准（如 oj-ldap：`bind/search/search_paged/whoami/compare`） |
+
+## 附：无配置文件快速用法（v0.1.57）
+
+所有子命令的 `-c/--config` 均可省略。省略时按序搜索：**CWD 逐级向上 `config.yaml` →
+`$HOME/.oj/config.yaml`**；都没找到则用内置默认值继续（stderr 打 `note: no config.yaml
+found …`），显式 `-c` 指向缺失文件仍 fail-fast。
+
+```bash
+# 纯计算脚本：不碰任何后端，无需 config
+./bin/oj exec -e 'console.log(JSON.stringify({ok: 1 + 1}))'
+
+# 构建 / OpenAPI 生成 / 诊断：无 config 也能跑
+./bin/oj build -d src -o dist
+./bin/oj openapi -d src -o openapi.json
+./bin/oj info        # 回落内置默认 → config 段为空，其余照常
+
+# 纯静态站点：无 config 起服务（证书两路径仍必配——给旗标）
+./bin/oj serve --api-path dist --app-path web --cert-path cert.jws --key-path pub.pem
+
+# 用户级兜底配置：所有项目共享一份
+mkdir -p ~/.oj && cp config.yaml ~/.oj/config.yaml
+```
+
+| 坑 | 说明 |
+|---|---|
+| 命令行为像「用了别人家的配置」 | 上级目录或 `~/.oj/config.yaml` 有一份就会被自动采用；`oj info` 核对实际装配的段键名，必要时显式 `-c` 锁定 |
+| 无 config 跑 `migrate` / `test` 报未声明 default 库 | 回落默认 Config 里没有任何后端——这类命令本来就须要 config，错误在用到后端时才给出 |
+| `secret seal` / `open` 不带 `-c` | 同样走搜索；`open` 的私钥仍优先 `OJ_SECRET_KEY` / `OJ_SECRET_KEY_FILE` 环境通道 |

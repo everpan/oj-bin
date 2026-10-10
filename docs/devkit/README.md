@@ -53,6 +53,12 @@ v0.1.47 起 blob 增 `copy` / `move` / `readRange` 三件套（服务端搬运�
 不再进 V8）：`copy` 保留 src、`move` 删 src、`readRange` 是短读截断；见
 `api-manual.md` §6 blob 段与 `scenarios.md` 场景 25。
 
+v0.1.57 起所有子命令的 `-c/--config` 均可省略：省略时按 **CWD 逐级向上 `config.yaml` →
+`$HOME/.oj/config.yaml`** 搜索，未找到用内置默认值继续（显式 `-c` 缺失仍 fail-fast）——
+`oj build` / `oj openapi` / `oj exec`（纯计算）/ `oj info` / 纯静态 `oj serve` 无需配置即可
+运行；`oj secret seal/open` 的 `-c` 缺省同样走搜索。见 `api-manual.md` §10 引言、
+`SKILL.md` 陷阱速查首行与 `scenarios.md` 文末附录。
+
 v0.1.54 起新增**泛型插件轴通道**（`axis(name).op(...)`，插件宏 `generic(name) => &VT` 声明，
 零 ABI 变更）与 **`ojInfo()` / `oj info` CLI**（同一装配体的五段诊断：build/abi/plugins/
 backends/config，config 只出键名、无公共端点）；oj-ldap 迁移泛型轴（JS 调用面改为

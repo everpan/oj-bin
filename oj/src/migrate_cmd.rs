@@ -18,7 +18,7 @@ struct Slim {
 }
 
 async fn slim(
-    config: &str,
+    config: Option<&str>,
     dir_override: Option<&str>,
     module: Option<&str>,
     db: Option<&str>,
@@ -73,7 +73,7 @@ async fn slim(
 /// （P0 建过表的存量库接入门，Q5）；`--db` = 目标库 profile（缺省 default）。
 pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
     let s = slim(
-        &a.config,
+        a.config.as_deref(),
         a.dir.as_deref(),
         a.module.as_deref(),
         a.db.as_deref(),
@@ -114,7 +114,7 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
 /// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`：灌 fixtures/ 演示数据（§4.5）。
 pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
     let s = slim(
-        &a.config,
+        a.config.as_deref(),
         a.dir.as_deref(),
         a.module.as_deref(),
         a.db.as_deref(),
@@ -128,7 +128,7 @@ pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
 /// 有差异 → 打印报告并 Err（进程退 1，CI 门禁可用）；一致 → in sync。
 pub async fn run_schema_diff(a: &SchemaDiffArgs) -> Result<(), String> {
-    let s = slim(&a.config, a.dir.as_deref(), None, a.db.as_deref()).await?;
+    let s = slim(a.config.as_deref(), a.dir.as_deref(), None, a.db.as_deref()).await?;
     let mut mods = Vec::new();
     for (name, mdir) in &s.modules {
         if let Some(f) = crate::schema::SchemaFile::load(mdir)? {
@@ -330,7 +330,7 @@ mod tests {
     async fn migrate_and_fixture_end_to_end() {
         let t = project("e2e");
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -342,7 +342,7 @@ mod tests {
         assert!(has_table(&t, "_oj_migrations").await);
         // 幂等：重跑不增不改。
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -352,7 +352,7 @@ mod tests {
         .unwrap();
         // fixture：演示数据进表（不进账本）。
         run_fixture(&FixtureArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             module: None,
             db: None,
@@ -361,7 +361,7 @@ mod tests {
         .unwrap();
         // 未知模块 fail-fast。
         let e = run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: Some("ghost".into()),
@@ -384,7 +384,7 @@ mod tests {
         )
         .unwrap();
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -402,7 +402,7 @@ mod tests {
         );
         assert!(!has_table(&t, "g").await, "default 库不得被 --db test 写入");
         run_fixture(&FixtureArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             module: None,
             db: Some("test".into()),
@@ -411,14 +411,14 @@ mod tests {
         .unwrap();
         // 对账同样落在 test profile（迁过的库 in sync；default 未迁 → D001 漂移）。
         run_schema_diff(&SchemaDiffArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             db: Some("test".into()),
         })
         .await
         .unwrap();
         let e = run_schema_diff(&SchemaDiffArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             db: None,
         })
@@ -428,7 +428,7 @@ mod tests {
         // 未声明库名：三处一致 fail-fast 且报出可用键。
         for e in [
             run_migrate(&MigrateArgs {
-                config: cfg(&t),
+                config: Some(cfg(&t)),
                 dir: src(&t),
                 baseline: false,
                 module: None,
@@ -437,7 +437,7 @@ mod tests {
             .await
             .unwrap_err(),
             run_fixture(&FixtureArgs {
-                config: cfg(&t),
+                config: Some(cfg(&t)),
                 dir: src(&t),
                 module: None,
                 db: Some("ghost".into()),
@@ -445,7 +445,7 @@ mod tests {
             .await
             .unwrap_err(),
             run_schema_diff(&SchemaDiffArgs {
-                config: cfg(&t),
+                config: Some(cfg(&t)),
                 dir: src(&t),
                 db: Some("ghost".into()),
             })
@@ -465,7 +465,7 @@ mod tests {
         let t = project("dbedge");
         // 空串按「未声明」处理（与 `App::from_config` 同口径），不退化成 default。
         let e = run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -482,7 +482,7 @@ mod tests {
         let x = format!("sqlite://{}/db_test.sqlite", t.display());
         write_config(&t, &[("test", &x)]);
         let e = run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -493,7 +493,7 @@ mod tests {
         assert!(e.contains("--db"), "缺 default 须指路 --db：{e}");
         assert!(!has_table_in(&t.join("db_test.sqlite"), "g").await);
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -510,7 +510,7 @@ mod tests {
     async fn baseline_records_without_executing() {
         let t = project("base");
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: true,
             module: None,
@@ -529,7 +529,7 @@ mod tests {
         let t = project("diff");
         // 无 schema.yaml：对账空集 → in sync。
         run_schema_diff(&SchemaDiffArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             db: None,
         })
@@ -542,7 +542,7 @@ mod tests {
         )
         .unwrap();
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -551,7 +551,7 @@ mod tests {
         .await
         .unwrap();
         run_schema_diff(&SchemaDiffArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             db: None,
         })
@@ -565,7 +565,7 @@ mod tests {
     async fn schema_diff_flags_missing_table_as_drift() {
         let t = project("drift");
         run_migrate(&MigrateArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             baseline: false,
             module: None,
@@ -580,7 +580,7 @@ mod tests {
         )
         .unwrap();
         let e = run_schema_diff(&SchemaDiffArgs {
-            config: cfg(&t),
+            config: Some(cfg(&t)),
             dir: src(&t),
             db: None,
         })

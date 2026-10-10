@@ -81,6 +81,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 
 | 症状 | 原因 |
 |---|---|
+| 命令用了「别人家」的配置 / 行为与预期不符（v0.1.57 起） | `-c` 省略时按 **CWD 逐级向上 → `$HOME/.oj/config.yaml`** 搜索——上级目录甚至 home 兜底有一份 config.yaml 就会被采用。排查：stderr 出现 `note: no config.yaml found …` = 确实回落了内置默认；否则 `oj info` 看实际装配的配置段键名，必要时显式 `-c` 锁定 |
 | DELETE 返回 405 | 方法名写成了 `delete`，应为 `del` |
 | release 下参数路由 404 | build 剥了 `.route`，路由以 routes.js 为准——确认先 `oj build` |
 | 启动失败 manifest | `name` 与目录名不一致 |

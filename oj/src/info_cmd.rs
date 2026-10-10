@@ -2,7 +2,7 @@
 //! 装配面在 `serve_cmd::assemble_for_info`（与 serve 共用加载/config 解析路径，
 //! 但不 connect、不监听）。
 
-pub async fn run(config: &str) -> Result<(), String> {
+pub async fn run(config: Option<&str>) -> Result<(), String> {
     let info = crate::serve_cmd::assemble_for_info(config).await?;
     println!("{}", info.to_text());
     Ok(())

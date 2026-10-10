@@ -1117,6 +1117,40 @@ pub fn load_with_extra(path: &Path, dir: &Path) -> Result<LoadedConfig, String> 
     Ok(LoadedConfig { config, top })
 }
 
+/// 配置搜索（v0.1.57）：显式 `-c` > CWD 逐级向上找 config.yaml > `$HOME/.oj/config.yaml`。
+/// explicit Some 且文件缺失 → Err；自动搜索未命中 → Ok(None)（调用方回落内置默认 Config）。
+pub fn find_path(explicit: Option<&str>) -> Result<Option<PathBuf>, String> {
+    match explicit {
+        Some(p) => {
+            let full = PathBuf::from(p);
+            if full.is_file() {
+                Ok(Some(full))
+            } else {
+                Err(format!("config file not found: {}", full.display()))
+            }
+        }
+        None => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("resolve cwd for config search: {e}"))?;
+            for d in cwd.ancestors() {
+                let c = d.join("config.yaml");
+                if c.is_file() {
+                    return Ok(Some(c));
+                }
+            }
+            // HOME 之外再兜 USERPROFILE（Windows 无 HOME）。
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            if let Some(h) = home {
+                let c = PathBuf::from(h).join(".oj").join("config.yaml");
+                if c.is_file() {
+                    return Ok(Some(c));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 /// explicit=None 找默认 config.yaml，缺失静默用默认值；Some 指向缺失文件报错。
 pub fn load_from(dir: &Path, explicit: Option<&str>) -> Result<Config, String> {
     let path = match explicit {
@@ -2191,6 +2225,29 @@ cache:
                 && d.group.is_none()
                 && d.topic_prefix.is_none()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_path_explicit_and_search() {
+        // 显式 -c：存在 → Some（绝对/相对均可），缺失 → Err。
+        let dir = std::env::temp_dir().join(format!("oj-findpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.yaml");
+        std::fs::write(
+            &cfg,
+            "server: { port: 1 }
+",
+        )
+        .unwrap();
+        assert_eq!(
+            find_path(Some(cfg.to_str().unwrap())).unwrap(),
+            Some(cfg.clone())
+        );
+        assert!(find_path(Some(dir.join("none.yaml").to_str().unwrap())).is_err());
+        // 未找到：返回值合法（None 或某处命中——不假定测试机 HOME 状态）。
+        let _ = find_path(None).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

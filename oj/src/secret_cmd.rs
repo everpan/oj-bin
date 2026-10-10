@@ -46,12 +46,26 @@ pub fn run_seal(a: &SecretSealArgs) -> Result<(), String> {
     let pub_path = match &a.key {
         Some(p) => PathBuf::from(p),
         None => {
-            let Some(c) = &a.config else {
+            // -c 缺省走统一搜索（CWD 逐级向上 + $HOME/.oj）；两处都没找到 config 才报错。
+            let found = match &a.config {
+                Some(c) => Some(cfg_path_of(c)?),
+                None => match only_js::config::find_path(None)? {
+                    Some(p) => {
+                        let dir = p
+                            .parent()
+                            .filter(|d| !d.as_os_str().is_empty())
+                            .unwrap_or(Path::new("."))
+                            .to_path_buf();
+                        Some((dir, p))
+                    }
+                    None => None,
+                },
+            };
+            let Some((cfg_dir, path)) = found else {
                 return Err("need a public key: pass -k <pub.pem> or -c <config.yaml> \
                             (with secrets.public_key_path)"
                     .into());
             };
-            let (cfg_dir, path) = cfg_path_of(c)?;
             PathBuf::from(secrets_key_path(&path, "public_key_path", &cfg_dir)?)
         }
     };
@@ -74,7 +88,19 @@ pub fn run_open(a: &SecretOpenArgs) -> Result<(), String> {
         None => {
             let (cfg_dir, path) = match &a.config {
                 Some(c) => cfg_path_of(c)?,
-                None => (PathBuf::from("."), PathBuf::from("config.yaml")),
+                // 统一搜索；未找到回落占位路径——load_private_key 仍会先走
+                // OJ_SECRET_KEY / OJ_SECRET_KEY_FILE 环境通道（无需 config）。
+                None => match only_js::config::find_path(None)? {
+                    Some(p) => {
+                        let dir = p
+                            .parent()
+                            .filter(|d| !d.as_os_str().is_empty())
+                            .unwrap_or(Path::new("."))
+                            .to_path_buf();
+                        (dir, p)
+                    }
+                    None => (PathBuf::from("."), PathBuf::from("config.yaml")),
+                },
             };
             let key = secret::load_private_key(
                 secrets_key_path_opt(&path, "private_key_path").as_deref(),

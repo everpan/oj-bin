@@ -99,7 +99,7 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
-        Command::Info(a) => match oj::info_cmd::run(&a.config).await {
+        Command::Info(a) => match oj::info_cmd::run(a.config.as_deref()).await {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("oj info: {e}");
@@ -150,7 +150,7 @@ mod tests {
         .unwrap();
         let a = BuildArgs {
             module: None,
-            config: d.join("config.yaml").display().to_string(),
+            config: Some(d.join("config.yaml").display().to_string()),
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,
@@ -169,7 +169,7 @@ mod tests {
         // foo 目录无 manifest.yaml → 构建失败。
         let a = BuildArgs {
             module: Some("foo".into()),
-            config: d.join("config.yaml").display().to_string(),
+            config: Some(d.join("config.yaml").display().to_string()),
             dir: d.join("src").display().to_string(),
             out: d.join("dist").display().to_string(),
             minify: true,
@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_missing_config_returns_one() {
         let code = run_command(Command::Serve(oj::args::ServeArgs {
-            config: "no-such-config.yaml".into(),
+            config: Some("no-such-config.yaml".into()),
             base: None,
             api_path: None,
             app_path: Vec::new(),

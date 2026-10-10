@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.57（未打标签）
+
+**feat(cli)**：所有子命令的 `-c/--config` 改为可选，并统一配置搜索路径。
+
+- 搜索顺序（省略 `-c` 时）：① CWD 逐级向上找 `config.yaml`（项目根或任意上级目录有一份
+  即可）；② `$HOME/.oj/config.yaml`（Windows 回落 `USERPROFILE`，用户级兜底）。两处都没找到
+  → 不报错，用内置默认 Config 继续（stderr 打 `note: no config.yaml found …`；config_dir
+  回落 CWD，相对路径语义不变）。显式 `-c` 指向缺失文件仍 fail-fast。
+- 无需配置即可运行：`oj build` / `oj openapi` / `oj exec`（纯计算脚本）/ `oj info` /
+  纯静态 `oj serve`（`--api-path` + `--app-path` + 证书旗标俱足时）。需要后端的命令
+  （`migrate` / `test` / `schema diff` / `fixture` 等）在用到后端时给出「未声明 default 库」
+  类错误，不再先报「config 文件不存在」。
+- `oj secret seal/open` 的 `-c` 缺省同样走统一搜索；`open` 私钥仍优先
+  `OJ_SECRET_KEY` / `OJ_SECRET_KEY_FILE` 环境通道。
+- `oj openapi` 漂移提示的 regen 命令不再强带 `-c`（未给定时）。
+
 ## v0.1.56（未打标签）
 
 **fix（plugins）**：打包形态（deploy.sh / npm 启动器，glibc 发行包经 ld-linux 启动）插件发现与

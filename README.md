@@ -225,6 +225,11 @@ sample/src/
 A block's presence enables it, its absence disables it — that is the governing principle of
 configuration (full reference in `docs/user-manual.md`).
 
+> Since v0.1.57 the file itself is optional: every subcommand's `-c` falls back to a search —
+> `config.yaml` walking up from the CWD, then `$HOME/.oj/config.yaml` — and uses built-in
+> defaults when none is found (`build` / `openapi` / `exec` / `info` and static-only `serve`
+> need no config file at all). An explicit `-c` pointing at a missing file is still an error.
+
 ```yaml
 server:
   host: "localhost"

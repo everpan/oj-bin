@@ -2236,7 +2236,7 @@ auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 
 
 | 旗标 | 说明 |
 |---|---|
-| `-c/--config` | 配置文件（默认 `config.yaml`） |
+| `-c/--config` | 配置文件（v0.1.57 起可省：CWD 逐级向上 → `$HOME/.oj/config.yaml` 搜索，未找到用内置默认） |
 | `-b/--base` | API 基础前缀覆盖（默认用 config `server.api_prefix`） |
 | `-d/--dir` | 源码目录 `src` 或产物 `dist`（默认自动判定） |
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
@@ -2364,8 +2364,15 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 
 > 何时读我：起服务前定配置，或排查启动 fail-fast 时。
 
-全字段可省（均有默认），除证书两路径**必配**。相对路径相对 **config 所在目录**；
-命令行相对路径相对 CWD。
+**`-c` 可选与搜索路径（v0.1.57）**：除 `secret keygen` 本就不需要配置外，所有子命令的
+`-c/--config` 均可省略。省略时按序搜索：① CWD 逐级向上找 `config.yaml`（项目根或任意
+上级目录有一份即可）；② `$HOME/.oj/config.yaml`（用户级兜底）。两处都没找到 → **不报错**，
+用内置默认 Config 继续：`oj build` / `oj openapi` / `oj exec`（纯计算脚本）/ `oj info` /
+纯静态 `oj serve`（`--api-path` + `--app-path` 俱足时）无需配置文件即可运行；需要后端的
+命令（`migrate` / `test` / `schema diff` 等）会在用到具体后端时给出「未声明 default 库」
+类错误。显式 `-c` 指向缺失文件仍是 fail-fast。stderr 会打出 `note: no config.yaml found …`
+提示回落了默认值。全字段可省（均有默认），除证书两路径**必配**。
+相对路径相对 **config 所在目录**（回落默认时相对 CWD）；命令行相对路径相对 CWD。
 
 ### server
 
