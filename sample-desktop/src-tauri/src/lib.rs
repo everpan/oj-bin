@@ -101,7 +101,8 @@ pub fn run() {
                 );
             }
 
-            let base = cfg.server.api_prefix.clone();
+            // v0.1.58：server.api_prefix 已删（挂载自带 prefix）；桌面形态固定默认前缀。
+    let base = "/v1/api".to_string();
             let ts = true; // dev 与 release 均运行时转译 TS（免 oj build 预构建步骤）
 
             // App::from_config 为 async，Tauri 自带 tokio runtime，block_on 构造一次。

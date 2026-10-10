@@ -42,8 +42,7 @@ fn fold_cli_mounts(cfg: &mut Config, a: &ServeArgs) -> Result<(), String> {
             d,
         );
         let idx = cfg.mounts.iter().position(|m| {
-            m.api.is_some()
-                && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
+            m.api.is_some() && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
         });
         let entry = config::MountConf {
             prefix,
@@ -120,8 +119,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
     let static_only = cfg.mounts.iter().all(|m| m.api.is_none());
-    let mut app = App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default())
-        .await?;
+    let mut app =
+        App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default()).await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
@@ -391,10 +390,7 @@ pub fn load_app_config(
         let picked = cfg
             .mounts
             .iter()
-            .find(|m| {
-                m.api.is_some()
-                    && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
-            })
+            .find(|m| m.api.is_some() && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix))
             .cloned();
         if let Some(m) = picked {
             cfg.mounts = vec![m];
@@ -411,9 +407,7 @@ pub fn load_app_config(
             match cfg.mounts.iter().position(|m| m.api.is_some()) {
                 Some(i) => cfg.mounts[i].api = Some(p),
                 None => cfg.mounts.push(config::MountConf {
-                    prefix: base_override
-                        .unwrap_or(DEFAULT_API_PREFIX)
-                        .to_string(),
+                    prefix: base_override.unwrap_or(DEFAULT_API_PREFIX).to_string(),
                     api: Some(p),
                     web: None,
                     spa: None,
@@ -529,12 +523,15 @@ fn fold_cli_app_paths(cfg: &mut Config, entries: &[String]) -> Result<(), String
 /// 同前缀 web 条目替换（保留 headers/spa——CLI 只覆盖目录）、否则追加（规范化口径：
 /// config 侧可能带尾斜杠等未规范形态）。
 fn upsert_web(cfg: &mut Config, prefix: &str, dir: String) {
-    let idx = cfg.mounts.iter().position(|m| {
-        m.web.is_some()
-            && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix)
-    });
+    let idx = cfg
+        .mounts
+        .iter()
+        .position(|m| m.web.is_some() && resolve_app_prefix(&m.prefix).is_ok_and(|x| x == prefix));
     match idx {
-        Some(i) => cfg.mounts[i].web = Some(dir),
+        Some(i) => {
+            cfg.mounts[i].web = Some(dir);
+            cfg.mounts[i].prefix = prefix.to_string();
+        }
         None => cfg.mounts.push(config::MountConf {
             prefix: prefix.to_string(),
             api: None,
@@ -1956,9 +1953,19 @@ mod tests {
             ..Default::default()
         };
         fold_cli_mounts(&mut c, &a).unwrap();
-        assert_eq!(c.mounts.len(), 1, "同前缀 api 条目替换而非追加");
-        assert_eq!(c.mounts[0].prefix, "/cli");
-        assert!(c.mounts[0].api.as_deref().unwrap().ends_with("src"));
+        // CLI 前缀 /cli ≠ config 的 /v1/api → 追加（挂载自带 prefix，无全局 base 可覆盖）。
+        assert_eq!(c.mounts.len(), 2);
+        assert_eq!(c.mounts[1].prefix, "/cli");
+        assert!(c.mounts[1].api.as_deref().unwrap().ends_with("src"));
+        // 同前缀 → 替换目录（CLI 优先）。
+        let a = ServeArgs {
+            api_path: Some("src".into()),
+            base: Some("/cli".into()),
+            ..Default::default()
+        };
+        fold_cli_mounts(&mut c, &a).unwrap();
+        assert_eq!(c.mounts.len(), 2);
+        assert!(c.mounts[1].api.as_deref().unwrap().ends_with("src"));
         // -b 无 --api-path → Err（裸 -b 无处附着）。
         let a = ServeArgs {
             base: Some("/x".into()),
@@ -1997,15 +2004,10 @@ mod tests {
         let t = tmpdir("sc-cert");
         std::fs::create_dir_all(t.0.join("src")).unwrap();
         // a) 未配置任何证书路径 → 拒绝启动。
-        let e = start(
-            Config::default(),
-            &t.0,
-            t.0.join("src"),
-            "/v1/api".into(),
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(Config::default(), &t.0, t.0.join("src"), "/v1/api".into())
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(
             e.contains("certificate is mandatory") && e.contains("public_key_path"),
             "{e}"
@@ -2054,6 +2056,7 @@ mod tests {
     #[tokio::test]
     async fn empty_jwt_secret_fails_fast() {
         let t = tmpdir("sc-jwt");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
         let pdir = t.0.join(host_triple());
         std::fs::create_dir_all(&pdir).unwrap();
         std::fs::copy(auth_plugin_artifact(), pdir.join(plugin_file("auth"))).unwrap();
@@ -2061,15 +2064,10 @@ mod tests {
         cfg.plugins_dir = Some(t.0.clone());
         cfg.db.insert("default".into(), "sqlite::memory:".into());
         cfg.auth = Some(serde_yaml::from_str("jwt_secret: \"\"\n").unwrap());
-        let e = start(
-            cfg,
-            Path::new("/tmp"),
-            t.0.join("src"),
-            "/v1/api".into(),
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cfg, Path::new("/tmp"), t.0.join("src"), "/v1/api".into())
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("jwt_secret"), "{e}");
     }
 
@@ -2089,18 +2087,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_dsn_scheme() {
         let t = tmpdir("sc-dsn2");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
         let mut cfg = cert_cfg(&t.0);
         cfg.db
             .insert("default".into(), "oracle://u:p@localhost/test".into());
-        let e = start(
-            cfg,
-            Path::new("/tmp"),
-            t.0.join("src"),
-            "/v1/api".into(),
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cfg, Path::new("/tmp"), t.0.join("src"), "/v1/api".into())
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("scheme"), "{e}");
     }
 
@@ -2255,15 +2249,10 @@ mod tests {
             "name: x\ndesc: d\nversion: 0.1.0\n",
         )
         .unwrap();
-        let e = start(
-            cert_cfg(&t.0),
-            &t.0,
-            t.0.join("src"),
-            "/v1/api".into(),
-        )
-        .await
-        .err()
-        .unwrap_or_default();
+        let e = start(cert_cfg(&t.0), &t.0, t.0.join("src"), "/v1/api".into())
+            .await
+            .err()
+            .unwrap_or_default();
         assert!(e.contains("name"), "{e}");
     }
 
@@ -2374,9 +2363,7 @@ mod tests {
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0;
         cfg.db.insert("default".into(), db2);
-        let _ = start(cfg, &t.0, dist, "/v1/api".into(), false)
-            .await
-            .unwrap();
+        let _ = start(cfg, &t.0, dist, "/v1/api".into()).await.unwrap();
         // d) off 逃生门：空库 + 迁移不执行也不拒启。
         let dist2 = rel_fixture(&[
             ("dist/manifests.yaml", "u: 0.1.0\n"),
@@ -2395,9 +2382,7 @@ mod tests {
             format!("sqlite://{}/off.sqlite", t.0.display()),
         );
         cfg.server.migrate_on_start = Some("off".into());
-        let _ = start(cfg, &t.0, dist2, "/v1/api".into(), false)
-            .await
-            .unwrap();
+        let _ = start(cfg, &t.0, dist2, "/v1/api".into()).await.unwrap();
         // e) 非法值 fail-fast。
         let mut cfg = cert_cfg(&t.0);
         cfg.server.migrate_on_start = Some("nope".into());
@@ -2417,16 +2402,15 @@ mod tests {
 
     #[tokio::test]
     async fn release_fail_fast_paths() {
-        // a) 无 manifests.yaml
+        // a) 无 manifests.yaml：自动判定（目录即模式）下这是 dev 树——产物版目录名
+        // user-0.1.0 与 manifest name 不符，dev 内省报 manifest 错（release 缺锁的
+        // 报错面由下方 b 用例覆盖：有锁才进 release 腿）。
         let t = rel_fixture(&[("dist/user-0.1.0/manifest.yaml", MANI)]);
         let e = start(cert_cfg(&t), &t, t.join("dist"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
-        assert!(
-            e.contains("manifests.yaml") || e.contains("oj build"),
-            "{e}"
-        );
+        assert!(e.contains("manifest"), "{e}");
         // b) 锁指向不存在版本
         let t = rel_fixture(&[
             ("dist/manifests.yaml", "user: 9.9.9\n"),
@@ -2525,10 +2509,18 @@ mod tests {
     #[tokio::test]
     async fn server_app_path_serves_static_relative_to_config_dir() {
         let t = tmpdir("sc-root");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
         std::fs::write(t.0.join("index.html"), "<h1>site</h1>").unwrap();
         let mut cfg = cert_cfg(&t.0);
         cfg.server.port = 0; // 随机端口
-        cfg.server.app_path = Some(".".into()); // 相对 config_dir
+        // web 挂载相对 config_dir（v0.1.58：原 server.app_path: "."）。
+        cfg.mounts.push(only_js::config::MountConf {
+            prefix: "/".into(),
+            api: None,
+            web: Some(".".into()),
+            spa: None,
+            headers: Default::default(),
+        });
         let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
@@ -2544,12 +2536,18 @@ mod tests {
         // 在抵达 server.app_path 检查前就于模块扫描阶段报错，掩盖了本测试真正要验证的逻辑。
         let t = tmpdir("sc-root-missing");
         let mut cfg = cert_cfg(&t.0);
-        cfg.server.app_path = Some("no-such-dir".into());
+        cfg.mounts.push(only_js::config::MountConf {
+            prefix: "/".into(),
+            api: None,
+            web: Some("no-such-dir".into()),
+            spa: None,
+            headers: Default::default(),
+        });
         let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()
             .unwrap_or_default();
-        assert!(e.contains("server.app_path"), "{e}");
+        assert!(e.contains("mounts[") && e.contains("no-such-dir"), "{e}");
     }
 
     /// P0：模块种子重放——src/u/seed.sql 建表插数，handler 查得到。
@@ -3126,6 +3124,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn redis_declared_without_kv_plugin_fails_fast() {
         let t = tmpdir("sc-kvplug-none");
+        std::fs::create_dir_all(t.0.join("src")).unwrap();
         std::fs::create_dir_all(t.0.join(host_triple())).unwrap(); // 空插件目录 → 零插件
         let mut cfg = cert_cfg(&t.0);
         cfg.plugins_dir = Some(t.0.clone());

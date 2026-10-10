@@ -10,7 +10,8 @@ use std::path::PathBuf;
 async fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // = src-tauri
     let cfg = config::load_from(&manifest, Some("config.yaml")).expect("load config.yaml");
-    let base = cfg.server.api_prefix.clone();
+    // v0.1.58：server.api_prefix 已删（挂载自带 prefix）；桌面形态固定默认前缀。
+    let base = "/v1/api".to_string();
     let dir = manifest.join("src"); // api 根：sample/api.ts → /v1/api/sample/
 
     let app = App::from_config(cfg, &manifest, dir, base, /*ts=*/ true, /*fixtures=*/ false, &oj::app::ResourceProfiles::default())

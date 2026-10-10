@@ -602,13 +602,14 @@ mod tests {
         };
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 actor,
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -758,13 +759,14 @@ mod tests {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -793,13 +795,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -842,13 +845,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -933,13 +937,14 @@ mod tests {
         };
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 actor,
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -989,13 +994,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1068,13 +1074,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1147,13 +1154,14 @@ mod tests {
         };
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 JsActor::pool(1, make.clone()),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1216,13 +1224,14 @@ mod tests {
         };
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 JsActor::pool(1, make.clone()),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1255,13 +1264,14 @@ mod tests {
         let t = crate::tests::routes(&[]);
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1436,13 +1446,14 @@ mod tests {
         };
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 JsActor::pool(1, make.clone()),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1511,13 +1522,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1556,13 +1568,14 @@ mod tests {
         .unwrap();
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1595,13 +1608,14 @@ mod tests {
         std::fs::write(&handler, r#"json.ok({});"#).unwrap(); // 无 default 导出
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1656,13 +1670,14 @@ mod tests {
         let timeout = std::time::Duration::from_millis(300);
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
@@ -1724,13 +1739,14 @@ mod tests {
         let timeout = std::time::Duration::from_secs(1);
         let addr = spawn(
             app(
-                "/v1/api",
-                t.0.clone(),
-                true,
-                crate::tests::build_table(&t.0, true, "/v1/api"),
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
                 crate::tests::make_actor(t.0.clone(), true),
                 None,
-                Vec::new(),
                 crate::StaticOpts::default(),
                 crate::Pipeline::default(),
                 Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),

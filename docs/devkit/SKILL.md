@@ -19,7 +19,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    之类）→ §6 末「ext_boot.js」，不要去改 handler。**
    **命中下面这些典型需求时，先读 `scenarios.md` 照抄**（配置 + 代码 + 验证 + 常见坑四段）：
    公开分享页按租户读数据（`db.asTenant` + `tenant.allow_as_tenant`）/ SPA 深链回落与每页
-   meta（`app_spa_fallback` + `html_meta` 构建期 JSON / `html_meta_handler` 按数据注入，v0.1.25）
+   meta（web 挂载 `spa: true` + `html_meta` 构建期 JSON / `html_meta_handler` 按数据注入，v0.1.25）
    / 部署期常量不硬编码（顶层 `vars:` + `vars.get`，v0.1.25）/ `oj test` 测试库隔离与 `--db`、`--anonymous` /
    列表 LIMIT 分页与 `X-OJ-Row-Limit` / `anonymous_paths` 通配四形态 /
    多库项目按库迁移与对账（`oj migrate --db <name>`）/ 大整数 id 的生成与回写（`toBigInt`）。
@@ -87,7 +87,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 启动失败 manifest | `name` 与目录名不一致 |
 | postgres 占位符报错 | 该方言用 `$1`，不是 `?`（sqlite/mysql 才是 `?`） |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
-| 启动报 `neither api path … specified` / `api path not found` | 准入门三态：`--api-path` 与静态站点（`server.app_path` / `server.static_sites` / `--app-path`）至少显式指定其一；`--api-path` 指定了就必须存在；静态目录存在性由装配期 fail-fast（报错含具体来源）。CLI 路径相对 CWD，config 路径相对 config 目录 |
+| 启动报 `no mounts configured` / `mounts[i]: 挂载目录 … No such file` | 准入门（v0.1.58）：顶层 `mounts:`（config + CLI 折叠后）为空——加一条挂载或传 `--api-path`/`--app-path`；挂载目录存在性由装配期 fail-fast（报错含挂载序号与前缀）。CLI 路径相对 CWD，config 挂载目录相对 config 目录。旧 `server.app_path` 等五键已删，出现即报错并输出迁移 YAML |
 | 启动失败报 `server.schema_validation: invalid .schema` | `.schema` 用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；`params`/`query` 声明 array/object 也是死契约，同样拒 |
 | 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false` |
 | CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast |
@@ -162,11 +162,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.asTenant` 抛错（v0.1.20） | 三道门禁：`tenant.allow_as_tenant: true` 未开 / 请求不是匿名（未命中 `anonymous_paths` 或已带租户头）/ id 为空；且**请求级只能设一次**（防中途换身份）。公开页正确姿势见 `scenarios.md` 场景 1 |
 | 尾 `/*` 匿名路径收不到豁免（v0.1.20） | **auth 侧**尾 `/*` 已统一为**严格一层**（旧 oj-auth 是任意深度）；跨层改 `/x/**`。**租户侧自始就是严格一层，无此变更**。装配期只对 `auth.anonymous_paths` 里「旧式前缀形态（只有尾段一个 `*`、其余段全字面）且确实丢了面（有更深的已注册路由）」的条目打聚合迁移 WARN（v0.1.23 起，结构条目与仅差 `**` 零层的都不再点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
 | 要 302 跳转只会 `header`+`fail` 拼 | 拼出来的是**失败信封体**（非标准形态）。用 `json.redirect(url[, code])`（v0.1.26）：3xx + `Location` + RFC 9110 §15.4 注记（HEAD 为空 body）；`code` 非 3xx 回落 302 |
-| SPA 深链 404 / 只回 100 条数据 | 前者：`server.app_spa_fallback: true`（默认关，且 `api_prefix` 下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
-| IM 预览 / 爬虫只看到默认 title（页面上 JS 改了没用——爬虫不执行 JS） | 构建期已知路由 → `server.html_meta` 的 `__meta/<path>.json`；**按数据**（issue 标题/分享页正文）→ `server.html_meta_handler` 指一个 GET handler（v0.1.25，`http.query.path` 是**已剥 `app_prefix`** 的站点内路径；返回 `title`/`og:*`/… 或信封），配 `html_cache_control` 防盲缓存。见 `scenarios.md` 场景 2 |
+| SPA 深链 404 / 只回 100 条数据 | 前者：web 挂载写 `spa: true`（v0.1.58 起逐挂载，默认关，api 挂载前缀下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
+| IM 预览 / 爬虫只看到默认 title（页面上 JS 改了没用——爬虫不执行 JS） | 构建期已知路由 → `server.html_meta` 的 `__meta/<path>.json`；**按数据**（issue 标题/分享页正文）→ `server.html_meta_handler` 指一个 GET handler（v0.1.25，`http.query.path` 是**已剥命中 web 挂载前缀**的站点内路径；返回 `title`/`og:*`/… 或信封），配 `html_cache_control` 防盲缓存。见 `scenarios.md` 场景 2 |
 | 注入的 meta「生效了但还是看到旧 title」 | 不会：head 里**同名旧标签会先被摘掉**再放新的（浏览器/爬虫只认第一个，v0.1.25 起替换而非追加）。若真没变：壳的 `<title>` 在 `</head>` 之外，或 head 里是 `<script>` 拼出来的（脚本内容不参与替换） |
 | 动态 meta handler 里 `db.asTenant` 抛错 / `http.tenantId` 是 null | 派发**恒匿名**：请求头（含租户头）一律不传递（安全边界：否则 `sql_guard: deny` 会把攻击者指定的租户当过滤条件）。按 URL 派生 id → `db.asTenant(id)`，并开 `tenant.allow_as_tenant: true` |
-| 预览卡片只在本地对、生产不对 | oj 只在**自己送静态文件**时注入；生产由 nginx/Caddy/CDN 直出 SPA 的话要么改走 oj 托管（`server.app_path`），要么在反代层做注入 |
+| 预览卡片只在本地对、生产不对 | oj 只在**自己送静态文件**时注入；生产由 nginx/Caddy/CDN 直出 SPA 的话要么改走 oj 托管（web 挂载），要么在反代层做注入 |
 | 启动报 `server.html_meta_handler: "…" 不在路由表` / `未映射 GET 方法` | 动态 meta 源必须命中一个 **GET** 路由（v0.1.25 装配期 fail-fast）——常见错因：路径写错、或该路径只有 POST |
 | 日志 `warn: html_meta_handler: …` 但页面照常 200 | fail-open 是设计：handler 非 2xx / 超时 / 非 JSON / 信封 `code != 0` 时按静态结果送出。按 WARN 里的原因修 handler，页面不会 500 |
 | `vars.get("X")` 恒 `null` | 只有写进 config 顶层 `vars:` 段的键可读（fail-closed；平台**不**读 OS env，也没有读任意 config 键的口子）。值只能是标量（`PORT: 3000` 读成 `"3000"`，嵌套 map/list 是配置错误） |

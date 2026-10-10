@@ -675,12 +675,7 @@ pub fn detect_legacy_server_keys(value: &serde_yaml::Value) -> Result<(), String
 /// 作用于**每一个** web 条目——旧版它是全局开关（StaticOpts.spa_fallback），
 /// 只映射主站点会静默丢掉 static_sites 的 SPA 行为（评审 F1）。
 fn legacy_migration_message(server: &serde_yaml::Mapping, hit: &[String]) -> String {
-    let s = |k: &str| {
-        server
-            .get(k)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
+    let s = |k: &str| server.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let app_path = s("app_path");
     let app_prefix = s("app_prefix").unwrap_or_else(|| "/".into());
     let spa = server
@@ -722,7 +717,7 @@ fn legacy_migration_message(server: &serde_yaml::Mapping, hit: &[String]) -> Str
                         Some(format!(
                             "{}: {}",
                             k.as_str()?,
-                            serde_yaml::to_string(v).ok()?.trim().to_string()
+                            serde_yaml::to_string(v).ok()?.trim()
                         ))
                     })
                     .collect();
@@ -1720,12 +1715,16 @@ cache:
     fn parses_url_style_dsn_map() {
         let dir = std::env::temp_dir().join(format!("ojcfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cfg.yaml"), concat!(
-            "server:\n  host: 0.0.0.0\n  port: 9000\n  timeout: 5s\n  pool_size: 2\n",
-            "mounts:\n  - { prefix: /xapi, api: src }\n",
-            "db:\n  default: sqlite://db.sqlite\n",
-            "redis:\n  default: redis://127.0.0.1:6379/1\n",
-        )).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            concat!(
+                "server:\n  host: 0.0.0.0\n  port: 9000\n  timeout: 5s\n  pool_size: 2\n",
+                "mounts:\n  - { prefix: /xapi, api: src }\n",
+                "db:\n  default: sqlite://db.sqlite\n",
+                "redis:\n  default: redis://127.0.0.1:6379/1\n",
+            ),
+        )
+        .unwrap();
         let c = load_from(&dir, Some("cfg.yaml")).unwrap();
         assert_eq!(c.server.host, "0.0.0.0");
         assert_eq!(c.mounts[0].prefix, "/xapi");
@@ -1768,8 +1767,15 @@ cache:
             vec!["a", "b"]
         );
         // 根 `/` 前缀合法（规则 4 的解析归装配期，这里只钉解析不拒）。
-        std::fs::write(dir.join("cfg.yaml"), "mounts:\n  - { prefix: /, web: d2 }\n").unwrap();
-        assert_eq!(load_from(&dir, Some("cfg.yaml")).unwrap().mounts[0].prefix, "/");
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "mounts:\n  - { prefix: /, web: d2 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_from(&dir, Some("cfg.yaml")).unwrap().mounts[0].prefix,
+            "/"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1797,21 +1803,45 @@ cache:
         }
         // api+web 同 prefix 配对 → Ok（api 优先）。
         assert!(
-            validate_mounts(&[m("/p", Some("a"), None, None), m("/p", None, Some("w"), None)])
-                .is_ok()
+            validate_mounts(&[
+                m("/p", Some("a"), None, None),
+                m("/p", None, Some("w"), None)
+            ])
+            .is_ok()
         );
         // 同类重复 → Err（含尾斜杠归一口径）。
-        assert!(validate_mounts(&[m("/docs", None, Some("a"), None), m("/docs/", None, Some("b"), None)]).is_err());
-        assert!(validate_mounts(&[m("/a", Some("x"), None, None), m("/a", Some("y"), None, None)]).is_err());
+        assert!(
+            validate_mounts(&[
+                m("/docs", None, Some("a"), None),
+                m("/docs/", None, Some("b"), None)
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_mounts(&[
+                m("/a", Some("x"), None, None),
+                m("/a", Some("y"), None, None)
+            ])
+            .is_err()
+        );
         // spa: true 同 prefix 有 api → Err；配对无 api / 无 spa → Ok。
-        assert!(validate_mounts(&[m("/p", Some("a"), None, None), m("/p", None, Some("w"), Some(true))]).is_err());
+        assert!(
+            validate_mounts(&[
+                m("/p", Some("a"), None, None),
+                m("/p", None, Some("w"), Some(true))
+            ])
+            .is_err()
+        );
         assert!(validate_mounts(&[m("/p", None, Some("w"), Some(true))]).is_ok());
         // spa 标在 api 挂载上 → 无意义标记，Err（不让配置撒谎）。
         assert!(validate_mounts(&[m("/p", Some("a"), None, Some(true))]).is_err());
         // 嵌套（/v1 web spa + /v1/api api）合法：最长前缀命中使回落吞不掉 api 路径。
         assert!(
-            validate_mounts(&[m("/v1", None, Some("w"), Some(true)), m("/v1/api", Some("a"), None, None)])
-                .is_ok()
+            validate_mounts(&[
+                m("/v1", None, Some("w"), Some(true)),
+                m("/v1/api", Some("a"), None, None)
+            ])
+            .is_ok()
         );
         // 根 `/` api 挂载合法（规则 4 允许，此处钉不误拒）。
         assert!(validate_mounts(&[m("/", Some("a"), None, None)]).is_ok());
@@ -1836,20 +1866,34 @@ cache:
         let e = load_from(&dir, Some("cfg.yaml")).unwrap_err();
         // 逐键两列 + 等价块 + 文档指引。
         assert!(e.contains("removed `server.*` site keys"), "{e}");
-        assert!(e.contains("server.app_path + server.app_prefix \"/site\""), "{e}");
+        assert!(
+            e.contains("server.app_path + server.app_prefix \"/site\""),
+            "{e}"
+        );
         assert!(e.contains("server.static_sites[0]"), "{e}");
         assert!(e.contains("server.api_prefix \"/v1/api\""), "{e}");
-        // F1：spa 加到每一个 web 条目（主站点 + static_sites）——旧版是全局开关。
-        assert_eq!(e.matches("spa: true").count(), 2, "{e}");
-        assert!(e.contains("- prefix: \"/site\"") && e.contains("web: \"public\""), "{e}");
-        assert!(e.contains("web: \"d1\"") && e.contains("csp: default-src self"), "{e}");
+        // F1：spa 加到每一个 web 条目（主站点 + static_sites）——旧版是全局开关
+        //（只数 mounts 块内 4 空格缩进的条目行，per-key 说明行里也提到 spa）。
+        assert_eq!(e.matches("\n    spa: true").count(), 2, "{e}");
+        assert!(
+            e.contains("- prefix: \"/site\"") && e.contains("web: \"public\""),
+            "{e}"
+        );
+        assert!(
+            e.contains("web: \"d1\"") && e.contains("csp: default-src self"),
+            "{e}"
+        );
         assert!(e.contains("docs/user-manual.md"), "{e}");
         // `base` alias 同捕获（api_prefix 的旧键名）。
         std::fs::write(dir.join("cfg.yaml"), "server:\n  base: /xapi\n").unwrap();
         let e = load_from(&dir, Some("cfg.yaml")).unwrap_err();
         assert!(e.contains("api_prefix") && e.contains("/xapi"), "{e}");
         // 干净配置不受影响。
-        std::fs::write(dir.join("cfg.yaml"), "server:\n  port: 1\nmounts:\n  - { prefix: /, web: d }\n").unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "server:\n  port: 1\nmounts:\n  - { prefix: /, web: d }\n",
+        )
+        .unwrap();
         assert!(load_from(&dir, Some("cfg.yaml")).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }

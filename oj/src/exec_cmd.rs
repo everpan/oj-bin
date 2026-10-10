@@ -52,8 +52,12 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         // 三者缺省（裸 `oj exec`）= REPL（v0.1.55，替代原报错）。
         (None, None, false) => ExecTarget::Repl,
     };
-    let (cfg, top, config_dir, dir, _ts, base) =
-        load_app_config(a.config.as_deref(), a.site.as_deref(), a.dir.as_deref(), None)?;
+    let (cfg, top, config_dir, dir, _ts, base) = load_app_config(
+        a.config.as_deref(),
+        a.site.as_deref(),
+        a.dir.as_deref(),
+        None,
+    )?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
     // 缺省 default；未声明 fail-fast（装配层统一校验）。
@@ -544,7 +548,7 @@ mod tests {
             ));
             std::fs::write(&p, yaml).unwrap();
             ExecArgs {
-            site: None,
+                site: None,
                 file: Some(script.to_string_lossy().into()),
                 code: None,
                 repl: false,

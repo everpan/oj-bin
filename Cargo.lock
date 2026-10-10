@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "async-trait",
  "axum",
