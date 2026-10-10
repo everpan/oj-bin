@@ -47,7 +47,7 @@ as a normal install.
 | windows x64 (msvc) | `x86_64-pc-windows-msvc` |
 
 Other platforms: download from
-[GitHub Releases](https://github.com/everpan/only-js/releases) or build from source.
+[GitHub Releases](https://github.com/everpan/oj-bin/releases) or build from source.
 
 ## Notes
 
@@ -63,4 +63,4 @@ Other platforms: download from
 - China mirrors: npmmirror syncs this package automatically —
   `npm i @oj-bin/oj --registry=https://registry.npmmirror.com`
 
-Repo & docs: <https://github.com/everpan/only-js>
+Repo & docs: <https://github.com/everpan/oj-bin>
