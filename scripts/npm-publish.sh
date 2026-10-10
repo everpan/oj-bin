@@ -2,8 +2,14 @@
 # npm 发布脚本（单一真相来源，CI 与本地同形）。
 # 用法:   bash scripts/npm-publish.sh <tag>
 # env:    DIST_DIR（默认 ./dist） STAGE_DIR（默认 mktemp） DRY_RUN=1（只装配+断言，不 publish）
-# 顺序:   平台子包逐个 publish（任一真失败即死，绝不发主包）→ 主包 → 发布后置信断言。
+# 顺序:   OIDC 预检 → 平台子包逐个 publish（任一真失败即死，绝不发主包）→ 主包 → 发布后置信断言。
 # 兼容 bash 3.2（macOS 自带）：禁 declare -A / mapfile。
+#
+# 鉴权：只走 npm Trusted Publishing（OIDC，docs.npmjs.com/trusted-publishers）——
+# 账号开启 2FA 后，非交互发布只剩两条路：bypass 2FA 的 granular token（长期凭证，要轮换，
+# 且包级设了「disallow tokens」就彻底不可用）或 OIDC（无长期凭证，官方对 CI 的推荐解）。
+# 本脚本选后者：凭证由 npm CLI 用 GitHub Actions 的 OIDC id-token 现换现用，
+# 仓库里不再存 NPM_TOKEN，也就没有 token 泄漏/轮换问题。
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -16,6 +22,38 @@ DIST_DIR="${DIST_DIR:-$PWD/dist}"
 cargo_version=$(awk -F'"' '/^version =[[:space:]]*"/ { print $2; exit }' oj/Cargo.toml)
 if [[ "$VERSION" != "$cargo_version" ]]; then
   echo "::error::tag '${TAG}' 与 oj/Cargo.toml version '${cargo_version}' 不一致" >&2
+  exit 1
+fi
+
+# ---- 1b. OIDC 预检（Trusted Publishing 前置条件，先于一切装配动作）------
+# 放到最前：OIDC 配错（缺 id-token 权限 / npm CLI 太老）在 npm publish 阶段才暴露的话，
+# 已经解包装配过一轮，报错还容易被「registry lag」的 re-view 分支误吞成已发布。
+ver_ge() { # <have> <want>：x.y.z 逐段数值比较（npm -v 形如 11.6.0）
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    split(a,x,"."); split(b,y,".")
+    for(i=1;i<=3;i++){ if((x[i]+0)>(y[i]+0)) exit 0; if((x[i]+0)<(y[i]+0)) exit 1 }
+    exit 0 }'
+}
+NPM_MIN=11.5.1   # 官方硬要求：Trusted Publishing 需 npm CLI ≥11.5.1 / Node ≥22.14.0
+npm_have=$(npm -v 2>/dev/null) || npm_have=""
+if [[ -z "$npm_have" ]]; then
+  echo "::error::拿不到 npm 版本（npm CLI 不可用）" >&2
+  exit 1
+fi
+if ! ver_ge "$npm_have" "$NPM_MIN"; then
+  echo "::error::npm CLI ${npm_have} < ${NPM_MIN}：Trusted Publishing（OIDC）要求 npm ≥ ${NPM_MIN}（Node ≥ 22.14.0）；CI 里把 setup-node 的 node-version 提到 24" >&2
+  exit 1
+fi
+# GitHub Actions 的 OIDC 环境变量由 runner 在 id-token: write 下注入；缺失即代表权限没开
+# 或不在 GitHub 托管 runner 上（self-hosted 不受 Trusted Publishing 支持）。
+if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+  echo "::error::未检测到 GitHub OIDC 环境（ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN 为空）：本脚本只走 Trusted Publishing，需在 workflow 的 job 上加 'permissions: id-token: write'，且只能用 GitHub 托管 runner" >&2
+  exit 1
+fi
+# 长期 token 存在时 npm CLI 会在 OIDC 失败后静默回退到它——那样 OIDC 配错永远发现不了，
+# 等于白迁移。故直接拒绝。
+if [[ -n "${NODE_AUTH_TOKEN:-}" ]]; then
+  echo "::error::检测到 NODE_AUTH_TOKEN：OIDC-only 模式不带长期 token（npm 会在 OIDC 失败时静默回退到 token，配错就永远暴露不了）。请从 workflow 中移除该 env" >&2
   exit 1
 fi
 
@@ -52,6 +90,8 @@ done
 # ---- 5. publish-first 幂等 ----------------------------------------------
 # npm view 预检命中 CDN 旧缓存可能误判不存在 → publish 失败后 re-view，可见即成功。
 publish_pkg() { # <pkgdir> <pkg-name>
+  # 不注入任何 token：npm CLI 检测到 OIDC 环境后自行换短时发布凭证。
+  # provenance 由 GitHub Actions 自动生成（公共仓库 + 公共包），无需 --provenance。
   local dir="$1" pkg="$2" out
   if [[ "${DRY_RUN:-0}" == "1" ]]; then echo "[dry-run] publish ${pkg}@${VERSION} ($dir)"; return 0; fi
   if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then

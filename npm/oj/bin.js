@@ -20,7 +20,7 @@ const key = `${process.platform}-${process.arch}`;
 const triple = TRIPLES[key];
 if (!triple) {
   console.error(`${TAG} 暂无 ${key} 的预编译包（现有：${Object.keys(TRIPLES).join(', ')}）。\n` +
-    `请从 https://github.com/everpan/only-js/releases 下载对应平台包。`);
+    `请从 https://github.com/everpan/oj-bin/releases 下载对应平台包。`);
   process.exit(1);
 }
 

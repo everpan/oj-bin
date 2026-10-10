@@ -365,6 +365,16 @@ jobs:
     if: github.event_name == 'release' || github.event_name == 'push' || inputs.draft != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # npm 发布走 Trusted Publishing（OIDC，docs.npmjs.com/trusted-publishers）：账号开了 2FA
+    # 后，非交互发布只剩「bypass 2FA 的 granular token」与「OIDC」两条路，本仓选后者——
+    # 仓库里不再存长期凭证。
+    #
+    # id-token: write 是 OIDC 的开关：缺它 runner 不注入 ACTIONS_ID_TOKEN_REQUEST_*，
+    # npm-publish.sh 的预检会直接 fail（而不是等到 npm publish 才 401）。
+    # contents: read —— 本 job 只在 skip=true 分支用 gh release download 取资产。
+    permissions:
+      id-token: write
+      contents: read
     # 草稿转正时 release 事件 run 与 tag 重爬 push run 几乎同时到达，二者都会跑本
     # job。按 tag 做 job 级串行化：后到者排队，轮到时 publish_pkg 幂等 skip，硬消除
     # 双 npm publish 竞态（409 re-view 撞上 registry 传播延迟会误判失败）。排队等而非
@@ -412,19 +422,27 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: gh release download "${{ steps.tag.outputs.tag }}" --dir dist
 
+      # node 24（= npm 11.x）而非 22（npm 10.x）：Trusted Publishing 要求
+      # npm CLI ≥ 11.5.1 / Node ≥ 22.14.0，低于此版本 npm-publish.sh 的预检会 fail。
+      # 不再传 registry-url：那会让 setup-node 往 .npmrc 写
+      # //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}，而本 job 已无 token ——
+      # 留一条空的 authToken 只会干扰 OIDC 路径。默认 registry 本就是 npmjs。
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
 
-      - name: npm whoami (fail fast on bad NPM_TOKEN)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm whoami
-
+      # 没有 npm whoami 步骤：OIDC 下没有「长期身份」可问，且官方明确 whoami 不校验
+      # trusted publishing 权限。凭证正确性由 npm publish 本身 + 脚本预检保证。
+      #
+      # npmjs.com 侧一次性配置（4 个包各自配一遍，OIDC 信任关系是 per-package 的）：
+      #   @oj-bin/oj、@oj-bin/oj-x86_64-unknown-linux-gnu、
+      #   @oj-bin/oj-aarch64-apple-darwin、@oj-bin/oj-x86_64-pc-windows-msvc
+      #   → Settings → Trusted Publisher → GitHub Actions：
+      #     repo = everpan/oj-bin，workflow = release.yml，allowed action 勾 npm publish。
+      # 两个坑：① 包 package.json 的 repository.url 必须与 GitHub 仓库完全一致
+      # （everpan/only-js 已改名 oj-bin，故元数据同步为 oj-bin）；
+      # ② 配置保存后 npm 不校验，且须在 2 天内完成首次成功发布，否则配置失效要删了重建。
       - name: publish @oj-bin packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bash scripts/npm-publish.sh "${{ steps.tag.outputs.tag }}"
 
   # 发布后置信：三平台真机 npm i + ./bin/oj --help。Windows postinstall 路径只有

@@ -16,6 +16,27 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+**chore（ci/npm）**：npm 发布鉴权切到 **Trusted Publishing（OIDC）**。npmjs 账号启用
+Two-Factor Authentication 后，CI 的非交互发布只剩两条路——勾了 Bypass 2FA 的 granular
+token（长期凭证，要轮换；包级若设「disallow tokens」直接不可用）或 OIDC；本仓选后者：
+`publish-npm` job 加 `permissions: id-token: write` 并把 setup-node 提到 Node 24
+（npm ≥ 11.5.1），由 npm CLI 用 GitHub Actions 的 OIDC id-token 现换短时发布凭证，
+仓库不再存 `NPM_TOKEN`（该 secret 已可删）；`npm whoami` 步骤随之删除——OIDC 下没有长期
+身份可问，官方亦明确它不校验 trusted publishing 权限。`scripts/npm-publish.sh` 新增
+**§1b 预检**（先于一切装配动作）：npm CLI < 11.5.1 即 fail、无 GitHub OIDC 环境变量即
+fail、检测到 `NODE_AUTH_TOKEN` 即 fail（npm 会在 OIDC 失败时静默回退到 token，配错就
+永远暴露不了）。配套：包元数据 `repository`/`homepage` 随 GitHub 仓库更名订正为
+`everpan/oj-bin`（官方强校验 `repository.url` 须与发布仓库完全一致，不一致则 publish
+失败）；`npm-publish.test.sh` 自检补到 7 例（新增三项门禁 + npm 版本边界 11.5.1 放行）。
+
+**一次性手工前置**（只有人能在 npmjs.com 做）：为 `@oj-bin/oj` 与三个
+`@oj-bin/oj-<triple>` **各配一遍** trusted publisher（per-package）——GitHub Actions /
+`everpan/oj-bin` / workflow `release.yml` / 允许 `npm publish`；配置保存后 npm 不校验，
+且**须在 2 天内完成首次成功发布**，否则配置失效需删了重建。详见
+`docs/superpowers/specs/2026-09-11-npm-publish-design.md` §7。
+
 ## v0.1.59（未打标签）
 
 **fix（cli）**：`oj exec` / `test` / `migrate` / `schema diff` / `openapi` 缺省目录探测

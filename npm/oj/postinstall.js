@@ -15,7 +15,7 @@ const TRIPLES = {
   'darwin-arm64': 'aarch64-apple-darwin',
   'win32-x64': 'x86_64-pc-windows-msvc',
 };
-const RELEASES = 'https://github.com/everpan/only-js/releases';
+const RELEASES = 'https://github.com/everpan/oj-bin/releases';
 const TAG = '[@oj-bin/oj]';
 
 function bail(msg) { // 装不上：醒目提示 + exit 0；stderr 不可用也要保证 exit 0

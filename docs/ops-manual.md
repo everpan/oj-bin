@@ -57,15 +57,23 @@ npx  @oj-bin/oj serve -c config.yaml --api-path src
 发布逻辑的单一真相来源是 `scripts/npm-publish.sh`——CI（`release.yml` 的 `publish-npm`
 job）与本地手动发布走同一脚本。首选走 CI：打 tag 推送即自动发布，无需本地操作。
 
-**手动发布**（CI 不可用或需补发时）：
+**发布鉴权**：npmjs 账号启用 2FA 后，CI 走 **Trusted Publishing（OIDC）**——`publish-npm`
+job 加 `permissions: id-token: write`，npm CLI 自己换短时凭证，仓库里没有长期 token
+（`NPM_TOKEN` 已移除）。npmjs 侧需给 4 个包各配一遍 trusted publisher（`everpan/oj-bin` /
+`release.yml`）：网页点击路径、`npm trust` 批量命令、验证与排错见
+`docs/superpowers/specs/2026-09-11-npm-publish-design.md` §5.1，约束与副作用见 §7。
+
+**手动发布 / 补发**：脚本只认 GitHub Actions 的 OIDC 环境（本地没有，也不接受
+`NODE_AUTH_TOKEN` 兜底），故补发**一律走 CI**——`workflow_dispatch`（同 tag、`draft=false`）
+或 Re-run failed jobs 只重跑 `publish-npm` job（幂等，已发布的包自动 skip）。
+
+本地只能演练（不发真包，需 npm ≥ 11.5.1）：
 
 ```bash
-npm whoami        # 未登录则 npm login（脚本用本地 ~/.npmrc，无需 NPM_TOKEN）
-
 # dist/ 需备齐 oj-v<ver>-<triple>.tar.gz / .zip（CI package job 的 dist-* artifact，
-# 或本地 scripts/deploy.sh——后者仅产本机 triple）
-DRY_RUN=1 bash scripts/npm-publish.sh v0.1.13   # 演练：只装配+断言，不发布
-bash scripts/npm-publish.sh v0.1.13             # 真发（幂等，已发布的包自动 skip）
+# 或 gh release download；本地 scripts/deploy.sh 仅产本机 triple）
+ACTIONS_ID_TOKEN_REQUEST_URL=x ACTIONS_ID_TOKEN_REQUEST_TOKEN=y \
+  DRY_RUN=1 bash scripts/npm-publish.sh v0.1.13   # 只装配+断言，不发布
 ```
 
 脚本内建门禁与顺序，无需人工操心：

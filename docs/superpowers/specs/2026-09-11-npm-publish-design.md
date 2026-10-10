@@ -1,7 +1,8 @@
 # npm 分发方案（npmjs 发布编译产物）
 
 **日期**：2026-09-11（同日经双评审修订：arch-reviewer 7 条 + impl-reviewer 8 条，全部处置完毕）
-**状态**：已拍板。scoped 包 `@oj-bin/oj`；安装落盘 `$INIT_CWD/bin/`；GitHub Release 双发——npm 拆独立 `publish-npm` job（不阻塞 Release 但失败标红）；CI 鉴权用 `NPM_TOKEN` secret。
+**状态**：已拍板。scoped 包 `@oj-bin/oj`；安装落盘 `$INIT_CWD/bin/`；GitHub Release 双发——npm 拆独立 `publish-npm` job（不阻塞 Release 但失败标红）。
+**2026-10-10 修订（鉴权）**：npmjs 账号启用 2FA 后 `NPM_TOKEN` 路径失效，CI 改为 **Trusted Publishing（OIDC）**——仓库不再存长期凭证。本次修订同步：§0 鉴权行、§1 非目标、§4 CI 改动与脚本门禁、§5 手工准备、§6 风险表；包元数据 `repository.url` 随仓库更名订正为 `everpan/oj-bin`（OIDC 强校验项，见 §7）。
 
 ## 0. 结论速览
 
@@ -16,7 +17,7 @@
 | 发布入口 | release.yml 新增独立 **`publish-npm` job**（`needs: package`，与 `publish` 平级） |
 | 失败语义 | GitHub Release 由 `publish` job 先行创建，不受 npm 影响；npm 失败 = workflow 红（不用 continue-on-error——step 级 continue-on-error 下 job 结论仍绿，告警形同虚设），幂等设计支持 Re-run failed jobs 只重跑 npm 段 |
 | 版本注入 | npm 包 version = **`${tag#v}`**（npm 不允许前导 `v`） |
-| CI 鉴权 | `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`（Automation granular token，权限限 `@oj-bin/*`） |
+| CI 鉴权 | **npm Trusted Publishing（OIDC）**：job 加 `permissions: id-token: write`，npm CLI 自行换短时凭证；仓库无长期 token（2026-10-10 由 `NPM_TOKEN` 迁移，见 §7） |
 | 国内可达性 | npmmirror 自动全量镜像 npmjs（含 scoped 包），`registry.npmmirror.com` 零配置可用 |
 
 ## 1. 目标与非目标
@@ -34,7 +35,7 @@
 - musl 平台包——os/cpu 字段区分不了 gnu/musl，启用前必须先定 libc 策略（见 §6 风险表）；npm-publish.sh 内置防呆硬校验。
 - 全局安装（`npm i -g`）——INIT_CWD 指向用户敲命令的随机 cwd，落盘语义不成立；postinstall 检测后明确报错并指向项目内安装或 GitHub Release。
 - npmmirror 手工同步——自动镜像，零操作。
-- OIDC trusted publishing——本次用 NPM_TOKEN；token 管理负担显现后可再迁移。
+- ~~OIDC trusted publishing~~——2026-10-10 已迁移（npmjs 账号启用 2FA，非交互发布只剩「bypass 2FA 的 granular token」与「OIDC」两条路；选 OIDC，见 §7）。
 
 ## 2. 包结构
 
@@ -148,14 +149,20 @@ postinstall，直接 exec 子包二进制），或手动重跑
 ```yaml
 publish-npm:
   needs: package            # 与 publish 平级，不 needs publish——npm 失败不影响 Release 已先行创建
-  runs-on: ubuntu-latest
+  runs-on: ubuntu-latest    # 必须是 GitHub 托管 runner（self-hosted 不支持 Trusted Publishing）
+  permissions:
+    id-token: write         # OIDC 开关：缺它 runner 不注入 ACTIONS_ID_TOKEN_REQUEST_*
+    contents: read
   steps:
     - checkout
     - download-artifact (dist-*, merge 到 dist/)
-    - actions/setup-node@v4 (node 22, registry-url: https://registry.npmjs.org)
+    - actions/setup-node@v4 (node 24)   # ≥22.14.0 / npm ≥11.5.1；不再传 registry-url（见 §7）
     - run: bash scripts/npm-publish.sh "${{ steps.tag.outputs.tag }}"
-      env: { NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }} }
+      # 无 NODE_AUTH_TOKEN：认证由 OIDC 承担
 ```
+
+**没有 `npm whoami` 步骤**：OIDC 下没有长期身份可问，且官方明确 `npm whoami` 不校验
+trusted publishing 权限——凭证正确性改由脚本预检（§7）+ `npm publish` 本身保证。
 
 （tag 解析步骤从 `publish` 提取为可复用前置，或 publish-npm 内联同一段
 awk——实现时定，语义不变：tag 与 oj/Cargo.toml version 一致性门禁双保险。）
@@ -206,10 +213,53 @@ awk——实现时定，语义不变：tag 与 oj/Cargo.toml version 一致性�
 
 1. npmjs.com 注册账号；创建 org **`oj-bin`**（scoped 包的前提，免费，
    public 包不收钱）；
-2. 生成 **Automation** 类型 granular access token，权限限 `@oj-bin/*`；
-3. repo Settings → Secrets 加 `NPM_TOKEN`；
+2. ~~生成 Automation granular access token → `NPM_TOKEN` secret~~（2026-10-10 起不再需要，
+   见 §7）；账号启用 2FA 后该路径只在 token 勾了 **Bypass 2FA** 时可用，且包级若选了
+   「Require 2FA and disallow tokens」则彻底不可用；
+3. **为 4 个包各自配 trusted publisher**（per-package，不是 per-scope）——步骤见 §5.1；
 4. 首次发布由 CI 直发（`@oj-bin/oj`、`@oj-bin/oj-*` 已核实未被占名，
    2026-09-11 `npm view` 验证 404）。
+
+### 5.1 trusted publisher 配置步骤
+
+四个包各来一遍：`@oj-bin/oj`、`@oj-bin/oj-x86_64-unknown-linux-gnu`、
+`@oj-bin/oj-aarch64-apple-darwin`、`@oj-bin/oj-x86_64-pc-windows-msvc`。
+
+**A. 网页（npmjs.com）**——包页面 → **Settings** → *Trusted Publisher* → **GitHub Actions**：
+
+| 字段 | 填什么 |
+|---|---|
+| Organization or user | `everpan` |
+| Repository | `oj-bin`（仓库已由 `only-js` 改名，OIDC 认的是现名） |
+| Workflow filename | `release.yml`（只填文件名，带 `.yml`） |
+| Environment name | 留空（未用 GitHub Environment） |
+| Allowed actions | 勾 **`npm publish`**（`npm stage publish` 默认允许，与本流水线无关） |
+
+保存即可。**npm 保存时不校验**，填错了要等 publish 才炸；配置不可编辑，改错只能删了重建。
+
+**B. CLI（批量，4 个包更快）**——需 npm CLI ≥ 11.15.0，且第一次调用要过一次 2FA
+（npm 网站上有「跳过之后 5 分钟的 2FA」选项，配 4 个包绰绰有余；granular token 不管用，
+必须账号级 2FA 登录态）：
+
+```bash
+npm i -g npm@latest     # 本机 npm ≥ 11.15.0
+for p in oj oj-x86_64-unknown-linux-gnu oj-aarch64-apple-darwin oj-x86_64-pc-windows-msvc; do
+  npm trust github "@oj-bin/$p" \
+    --repo everpan/oj-bin --file release.yml --allow-publish -y
+  sleep 2               # 官方建议：防限流
+done
+npm trust list @oj-bin/oj        # 回看已配的信任关系（revoke 用它的 id）
+```
+
+**验证**：配好后推一个 tag（或 `workflow_dispatch` 同 tag、`draft=false`）→ `publish-npm`
+job 日志应出现 `published @oj-bin/oj-…@<ver>` + 末尾 `verified … os=… cpu=…`；
+`npm view @oj-bin/oj@<ver> --json` 可见新版本，npmjs 包页出现 provenance 徽章
+（公共仓库 + 公共包才有）。
+
+**排错**（官方 Troubleshooting）：publish 报 `ENEEDAUTH / Unable to authenticate` ——
+按序查：workflow 文件名是否与配置**完全一致**（含 `.yml`、大小写）→ 是否 GitHub 托管
+runner（self-hosted 不支持）→ job 是否有 `id-token: write` → 包的 `repository.url`
+是否等于 `git+https://github.com/everpan/oj-bin.git`。
 
 ## 6. 风险与缓解
 
@@ -228,4 +278,35 @@ awk——实现时定，语义不变：tag 与 oj/Cargo.toml version 一致性�
 | musl 与 gnu 同 (os,cpu) 不可区分 | npm-publish.sh 硬校验撞车即 fail；启用 musl 前须先定 libc 策略（npm ≥11 `libc` 字段 + postinstall 运行时检测兜底） |
 | 子包模板误加 `exports` 字段 | 模板注释写死禁令（`require.resolve('.../package.json')` 依赖它） |
 | registry 传播延迟导致冒烟抖动 | retry 3 次；smoke-npm 是独立 job，失败不阻塞已发布的 Release |
-| NPM_TOKEN 泄漏 | granular token 限 `@oj-bin/*` + Automation 型（绕 2FA 但无登录权） |
+| ~~NPM_TOKEN 泄漏~~ | 2026-10-10 起仓库无长期凭证（OIDC 短时凭证，见 §7） |
+| OIDC 配置漂移（workflow 改名/换仓库/换 self-hosted runner） | 脚本预检先死（§7）；npmjs 侧配置保存后 npm 不校验，改 workflow 文件名必须同步改 trusted publisher |
+| trusted publisher 配置「2 天内未首发」自动失效 | 配置与首发放在同一次发布窗口内；失效后删了重建（配置不可编辑） |
+| `repository.url` 与 GitHub 仓库不一致（only-js 已改名 oj-bin） | 包元数据同步为 `everpan/oj-bin`；OIDC 强校验项，不一致则 publish 失败 |
+| 残留 `NODE_AUTH_TOKEN` 让 npm 在 OIDC 失败时静默回退 | 脚本检测到该变量即 fail（不让它成为隐性兜底） |
+
+## 7. 鉴权：Trusted Publishing（OIDC）（2026-10-10）
+
+**为什么改**：npmjs 账号启用 2FA 后，非交互（CI）发布只剩两条路——
+① granular access token 勾 **Bypass 2FA**（长期凭证：要轮换；包级设了
+「Require 2FA and disallow tokens」就直接不可用）；② **Trusted Publishing（OIDC）**：
+npm CLI 用 GitHub Actions 的 OIDC id-token 现换短时发布凭证，**仓库里没有长期凭证**。
+选 ②（官方对 CI/CD 的推荐解，[docs.npmjs.com/trusted-publishers](https://docs.npmjs.com/trusted-publishers)）。
+
+**官方硬约束**（`scripts/npm-publish.sh` §1b 已全部做成预检，先于装配动作执行）：
+
+| 约束 | 落地 |
+|---|---|
+| npm CLI ≥ 11.5.1 / Node ≥ 22.14.0 | `setup-node` 用 `node-version: '24'`；脚本比较 `npm -v` 与 11.5.1，低即 fail |
+| GitHub 托管 runner | `runs-on: ubuntu-latest`（self-hosted 不受支持） |
+| job 需 `permissions: id-token: write` | 脚本校验 `ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN` 非空 |
+| `package.json` 的 `repository.url` 必须与 GitHub 仓库完全一致 | 随仓库更名订正为 `git+https://github.com/everpan/oj-bin.git` |
+| 配置保存后 2 天内须完成首次成功发布 | 与首发同窗口配置；失效即删了重建（配置不可编辑） |
+| 不允许隐性回退到长期 token | 脚本检测到 `NODE_AUTH_TOKEN` 非空即 fail |
+
+**两点副作用**：① `npm whoami` 在 OIDC 下无意义（官方：不校验 trusted publishing 权限）→
+CI 该步骤删除；② `setup-node` 不再传 `registry-url`——它会往 `.npmrc` 写
+`//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`，job 已无 token，留空 authToken 只会干扰
+OIDC 路径（默认 registry 本就是 npmjs）。
+
+**provenance**：GitHub Actions + OIDC 下 npm 自动附带来源声明（公共仓库 + 公共包），
+无需 `--provenance`；私有仓库不发 provenance，但发布照常工作。
