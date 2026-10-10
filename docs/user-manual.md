@@ -57,7 +57,7 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 |---|---|---|
 | `-c` | 自动搜索 | 配置文件路径（host/port/base/root/db/redis）。**v0.1.57 起可省**：省略时按序搜索 ① CWD 逐级向上 `config.yaml` → ② `$HOME/.oj/config.yaml`；都没找到用内置默认值继续（stderr 打 `note:` 提示），显式 `-c` 指向缺失文件仍报错。serve / build / exec / migrate / test / schema diff / openapi / info / secret seal/open 都有此参数 |
 | `-b` | `/v1/api` | （server）`--api-path` 折叠挂载的 URL 前缀（v0.1.58：挂载自带完整 prefix，`-b` **仅在折叠 `--api-path` 时生效**，裸 `-b` 报错）。test / openapi 用它覆盖路由前缀 |
-| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 取第一条 api 挂载，无挂载时自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path` |
+| `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` / `exec` 取第一条 api 挂载，无挂载时自 config 同级（无 config = CWD）向上逐级搜（每层 src 优先、dist 次之；候选须「像业务树」——首层 `*/manifest.yaml`、`manifests.yaml` 或空树，非业务 `src/`（如源码仓自己的代码树）被跳过），无合格候选报 `service dir not found`。server 用 `--api-path` |
 | `--api-path` | 无 | （server）API 目录，相对 CWD；折叠为 `{prefix: <-b 或 /v1/api>, api: <dir>}` 挂载（同前缀替换）。缺省 = 不开 API 挂载（须有 `mounts:` / `--app-path`，否则退出） |
 | `--app-path` | 无 | （server）web 挂载，相对 CWD，可重复。裸 `dir`（至多一次）upsert `{prefix: "/", web: dir}`；`prefix=dir`（如 `--app-path /docs=dist/docs`）upsert 同前缀 web 条目（CLI 优先，`headers`/`spa` 保留） |
 | `--site` | 无 | （test / test fixture / migrate / exec / openapi）选 api 挂载（挂载 prefix，如 `--site /v2`）：只用该树与其前缀；命中 web 挂载 → 报错并列出全部 api prefix；与 `-d`/`-b` 互斥 |
@@ -388,6 +388,44 @@ CLI 对应关系：`--api-path d` ≙ `- { prefix: <-b 或 /v1/api>, api: d }`�
 `- { prefix: "/", web: d }`；`--app-path /p=d` ≙ upsert `{prefix: "/", web: …}` 同款。
 注意两处可见行为变化：web 挂载非 GET/HEAD 由「落入 404」变**显式 405**；SPA 回落从全局
 开关改为**逐挂载显式 `spa: true`**（默认 false）。
+
+#### 迁移示例（改前 → 改后，可照抄）
+
+旧写法（v0.1.57 及之前，单 API + 主静态站 + 两个附加静态站）：
+
+```yaml
+server:
+  api_prefix: "/v1/api"
+  app_path: "web-dist"          # 主静态站（前缀取 app_prefix，默认 /）
+  app_spa_fallback: true        # 全局开关：主站 + 附加站都回落
+  static_sites:
+    - prefix: "/docs"
+      path: "docs-dist"
+      headers: { X-Frame-Options: "DENY" }
+    - prefix: "/app2"
+      path: "app2-dist"
+```
+
+新写法（v0.1.58，语义等价——每个站点一条挂载，`spa: true` 逐条显式）：
+
+```yaml
+mounts:
+  - prefix: "/v1/api"           # API 挂载（原 api_prefix 即挂载前缀）
+    api: "src"
+  - prefix: "/"                 # 原 app_path（+ app_prefix）
+    web: "web-dist"
+    spa: true                   # 原 app_spa_fallback（旧版全局开 → 这里逐条写）
+  - prefix: "/docs"
+    web: "docs-dist"
+    spa: true
+    headers: { X-Frame-Options: "DENY" }
+  - prefix: "/app2"
+    web: "app2-dist"
+    spa: true
+```
+
+快捷迁移路径：直接跑 `oj serve`——五旧键任一出现即启动报错，错误信息里已带按当前
+config 生成的等价 `mounts:` YAML（含 spa/headers），复制粘贴改目录即可。
 
 ## 4. 项目目录结构
 

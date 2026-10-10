@@ -418,8 +418,26 @@ pub fn load_app_config(
         }
         None => match &primary {
             Some((d, _, _)) => d.clone(),
-            // 无任何 api 挂载：旧行为兜底——自 config 同级逐级向上搜索。
-            None => search_api_dir(&config_dir),
+            // 无任何 api 挂载：兜底搜索（自 config 同级/CWD 向上，只认「像业务树」的
+            // 候选——首层 */manifest.yaml、manifests.yaml 或空树；源码仓自己的 src/
+            // 由此跳过）。无合格候选 → 占位路径（必然不存在，discover = 空 =
+            // 零模块零路由），沿用纯静态 serve 的 `.oj-static-only` 同款模式：
+            // exec 照常跑（纯脚本不需要表白名单，stderr 有 note），test/migrate/
+            // schema diff 由各自的 dir 存在性检查给出明确报错。
+            None => match search_api_dir(&config_dir) {
+                Some(d) => d,
+                None => {
+                    let fallback = config_dir.join(".oj-no-api");
+                    eprintln!(
+                        "note: no plausible api dir found (searched upward from {} for a \
+                         src/dist containing first-level */manifest.yaml, manifests.yaml, or \
+                         an empty dir) — using {}; pass -d <dir> or -c a config with api mounts",
+                        config_dir.display(),
+                        fallback.display()
+                    );
+                    fallback
+                }
+            },
         },
     };
     // -b：改写第一条 api 挂载的前缀（无挂载 → 以该前缀新增一条指向解析出的目录）。
@@ -447,26 +465,46 @@ pub fn load_app_config(
     Ok((cfg, top, config_dir, dir, ts, base))
 }
 
-/// 缺省服务目录搜索（无任何 api 挂载时的旧行为）：自 config 同级起步逐级向上，
-/// 每层 src 优先、dist 次之；一路到根都没找到 → 回落 config_dir/src。
-fn search_api_dir(config_dir: &Path) -> PathBuf {
-    let mut cur = Some(config_dir);
-    loop {
-        match cur {
-            Some(d) => {
-                let src = d.join("src");
-                if src.is_dir() {
-                    return src;
+/// 缺省 api 目录搜索（无 `-d`、无 api 挂载时的兜底）：自 config 同级（无 config 时
+/// = CWD）起步逐级向上，每层 src 优先、dist 次之。候选须「像业务树」才被接受——
+/// ≥1 个首层 `*/manifest.yaml`（dev 模块树）、含 `manifests.yaml`（release 产物锁）、
+/// 或**无任何首层子目录**（空树：fresh 项目合法，discover = 零模块）；否则继续向上
+/// ——本仓这类「祖先有非业务 `src/`」（如 Rust 源码树）由此跳过，不再让裸 `oj exec`
+/// 在源码仓根爆出 `module 'bridge' missing manifest.yaml`（2026-10-10 用户实测）。
+/// 全程无合格候选 → None（调用方报 service dir not found，不再回落编造的
+/// `config_dir/src`——静默猜进错误的树然后把 discover 错误甩给用户，才是坑）。
+fn search_api_dir(config_dir: &Path) -> Option<PathBuf> {
+    let plausible = |d: &Path| -> bool {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            return false;
+        };
+        let mut has_subdir = false;
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                has_subdir = true;
+                if e.path().join("manifest.yaml").is_file() {
+                    return true; // dev 模块树
                 }
-                let dist = d.join("dist");
-                if dist.is_dir() {
-                    return dist;
-                }
-                cur = d.parent();
             }
-            None => return config_dir.join("src"),
         }
+        if !has_subdir {
+            return true; // 空树（无首层子目录）：fresh 项目
+        }
+        d.join("manifests.yaml").is_file() // release 锁
+    };
+    let mut cur = Some(config_dir);
+    while let Some(d) = cur {
+        let src = d.join("src");
+        if src.is_dir() && plausible(&src) {
+            return Some(src);
+        }
+        let dist = d.join("dist");
+        if dist.is_dir() && plausible(&dist) {
+            return Some(dist);
+        }
+        cur = d.parent();
     }
+    None
 }
 
 /// server 准入门（v0.1.58 规则 5）：mounts（config + CLI 折叠后）为空 → Err 提示。
@@ -1137,9 +1175,6 @@ impl OjInfo {
                 "- {} {} (abi {})\n  desc: {}\n",
                 p.name, p.semver, p.abi_version, p.description
             ));
-            if !p.unknown_axes.is_empty() {
-                o.push_str(&format!("  unknown_axes: {:?}\n", p.unknown_axes));
-            }
         }
         line(
             &mut o,
@@ -1496,6 +1531,53 @@ mod tests {
         assert_eq!(dir3, t3.0.join("src"));
     }
 
+    /// search_api_dir 只认「像业务树」的候选：非业务 src（如源码仓自己的 Rust 树，
+    /// 首层只有无 manifest 的子目录/文件）被跳过继续向上；全程无合格候选 → None
+    /// （调用方报 service dir not found），不再把 `module 'bridge' missing
+    /// manifest.yaml` 甩给裸跑 `oj exec` 的用户（2026-10-10 实测陷阱）。
+    #[test]
+    fn search_api_dir_requires_plausible_tree() {
+        // 非业务 src（首层子目录无 manifest.yaml）→ 跳过；祖先也无合格候选 → None
+        // （load_app_config 据此走 `.oj-no-api` 占位，exec 照常跑、test/migrate 明确报错）。
+        let t = tmpdir("search-rust");
+        std::fs::create_dir_all(t.0.join("src/bridge")).unwrap();
+        std::fs::write(t.0.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(search_api_dir(&t.0), None);
+
+        // dev 模块树（首层 */manifest.yaml）→ 命中；同层 src 优先于 dist。
+        let t2 = tmpdir("search-dev");
+        std::fs::create_dir_all(t2.0.join("src/u")).unwrap();
+        std::fs::write(t2.0.join("src/u/manifest.yaml"), "name: u\n").unwrap();
+        std::fs::create_dir_all(t2.0.join("dist")).unwrap();
+        assert_eq!(search_api_dir(&t2.0), Some(t2.0.join("src")));
+
+        // release 产物锁（manifests.yaml，版本目录的 manifest 在二层）→ 命中。
+        let t3 = tmpdir("search-rel");
+        std::fs::create_dir_all(t3.0.join("dist/u-0.1.0")).unwrap();
+        std::fs::write(t3.0.join("dist/manifests.yaml"), "u: 0.1.0\n").unwrap();
+        assert_eq!(search_api_dir(&t3.0), Some(t3.0.join("dist")));
+
+        // 空树（fresh 项目）→ 合法候选；子目录起向上命中合格树。
+        let t4 = tmpdir("search-empty");
+        std::fs::create_dir_all(t4.0.join("sub")).unwrap();
+        std::fs::create_dir_all(t4.0.join("src")).unwrap();
+        std::fs::write(t4.0.join("config.yaml"), "{}\n").unwrap();
+        assert_eq!(search_api_dir(&t4.0), Some(t4.0.join("src")));
+        assert_eq!(search_api_dir(&t4.0.join("sub")), Some(t4.0.join("src")));
+
+        // 全链（回归 v0.1.58 exec e2e 用的形态）：config={}/src=空 → load_app_config
+        // 必须解析出该 src（而非占位）。
+        std::fs::write(t4.0.join("cfg2.yaml"), "{}\n").unwrap();
+        let (_, _, _, dir2, _, _) = load_app_config(
+            Some(t4.0.join("cfg2.yaml").to_str().unwrap()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dir2, t4.0.join("src"), "空 src 须被全链解析命中");
+    }
+
     /// cfg 回落链（spec「plugins: 统一语义」）：非空对象透传 → 轴适配器 → {}；
     /// 空对象不抢占透传优先级（否则 auth: {} 会切断顶层段 cfg 流）。
     #[test]
@@ -1686,7 +1768,6 @@ mod tests {
                 },
                 registrations: Default::default(),
                 generic_axes: Vec::new(),
-                unknown_axes: Vec::new(),
                 config_key: key.map(Into::into),
             }
         }

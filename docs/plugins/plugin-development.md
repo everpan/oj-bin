@@ -52,7 +52,8 @@ v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平�
    取 `RVec<AxisDecl>`（轴名 + kind + vtable），按 kind 分类：TYPED 且名在
    `TYPED_AXES`（es/db/blob/bus/kv/auth/mq/mail/ldap，9 个）→ 填 typed 槽；
    GENERIC → 泛型轴注册表（JS `axis("name")` 面）；名不在 TYPED_AXES 的类型化
-   自报 → `unknown_axes` 告警。清单符号缺失的**旧插件回落逐轴 dlsym**
+   自报 typed 轴名不在宿主表 → stderr 告警并忽略（v0.1.58 起不再收进
+   `unknown_axes` 字段——泛型轴通道承接一切合法新轴）。清单符号缺失的**旧插件回落逐轴 dlsym**
    （`oj_plugin_axis_<name>`，deprecated 告警）。之后装配层 `build_registries`
    做冲突检查（同名泛型轴多插件 / 单槽轴多插件 → fail fast），注册表随进程
    生命周期冻结。
@@ -372,7 +373,7 @@ cargo xtask plugin <name> --check
 （§2），运行期调用面分两路：类型化轴走宿主装配的全局对象（`db`/`kv`/`mail`/…），
 泛型轴走 `axis("name").op()` Proxy 直通（§5）。插件自描述（`PluginInfo`）在装配期
 收集，经公共端点 **`GET {base}/plugins`**（ok 信封）与 JS `plugins()` / `ojInfo()`
-同源可查，供运维/监控辨识当前进程装配了什么（含 `unknown_axes` 告警清单）。
+同源可查，供运维/监控辨识当前进程装配了什么。
 
 ```mermaid
 flowchart LR

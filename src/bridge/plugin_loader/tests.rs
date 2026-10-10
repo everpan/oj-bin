@@ -704,11 +704,13 @@ fn generic_axis_plugin_reports_greet_axis() {
     assert!(loaded[0].registrations.kv.is_none());
 }
 
-/// TYPED-kind 自报未知轴名（不在 TYPED_AXES）→ 进 unknown_axes 且所有类型化槽保持
-/// None——classify_axes 按 kind 路由，不再按名猜测通道（oj-ldap 迁移场景：
-/// 自报 ldap + GenericVtable 走 GENERIC 臂才不会被误 cast）。
+/// TYPED-kind 自报未知轴名（不在 TYPED_AXES）→ 告警后忽略（v0.1.58 起
+/// unknown_axes 字段已移除——泛型轴通道承接一切合法新轴，typed 未知名是
+/// 插件/宿主版本错配，告警即终点），所有类型化槽保持 None——classify_axes
+/// 按 kind 路由，不再按名猜测通道（oj-ldap 迁移场景：自报 ldap + GenericVtable
+/// 走 GENERIC 臂才不会被误 cast）。
 #[test]
-fn typed_kind_unknown_axis_name_goes_to_unknown_axes_with_no_slots() {
+fn typed_kind_unknown_axis_name_is_warned_and_ignored_with_no_slots() {
     extern "C" fn stub_call(_op: RString, _args: RString) -> FfiFuture {
         unreachable!("classify 只收指针，不调用 vtable 方法")
     }
@@ -718,8 +720,7 @@ fn typed_kind_unknown_axis_name_goes_to_unknown_axes_with_no_slots() {
         vtable: &VT as *const _ as *const std::ffi::c_void,
         kind: oj_plugin_ffi::AXIS_KIND_TYPED,
     }];
-    let (r, generic, unknown) = classify_axes("test-plugin", decls.iter());
-    assert_eq!(unknown, vec!["greet".to_string()]);
+    let (r, generic) = classify_axes("test-plugin", decls.iter());
     assert!(generic.is_empty());
     for a in TYPED_AXES {
         assert_eq!(r.provides(a), Some(false), "轴 {a} 槽被误填");
@@ -924,7 +925,6 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
         },
         registrations: Registrations::default(),
         generic_axes: Vec::new(),
-        unknown_axes: Vec::new(),
         config_key: None,
     };
     let info: PluginInfo = (&loaded).into();
@@ -934,7 +934,18 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
     assert_eq!(info.fingerprint, "fp-1");
     assert_eq!(info.description, "test plugin");
     assert_eq!(info.host_abi_version, ABI_VERSION);
-    assert_eq!(info.unknown_axes, Vec::<String>::new());
+    // v0.1.58 移除恒空的 unknown_axes：序列化键集固定为六键（消费方契约钉）。
+    assert_eq!(
+        serde_json::to_value(&info).unwrap(),
+        serde_json::json!({
+            "name": "mini",
+            "semver": "0.1.0",
+            "abi_version": 8,
+            "fingerprint": "fp-1",
+            "description": "test plugin",
+            "host_abi_version": oj_plugin_ffi::ABI_VERSION,
+        })
+    );
 }
 
 /// blob 装配期 connect 成功 + 三类失败（同 kv：合一个用例避免并行互踩模式开关）。

@@ -113,9 +113,6 @@ pub struct LoadedPlugin {
     /// 泛型轴：清单轴名不在 TYPED_AXES（vtable 按 GenericVtable 解释；撞保留名
     /// 的按 typed 解释，故此处必然是非保留名）。
     pub generic_axes: Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
-    /// 自报了但宿主既不认识、泛型也不收的轴名（恒空实现，结构对称与 spec 一致；
-    /// 预留「撞保留名却按 typed cast 失败」等未来防御场景）。
-    pub unknown_axes: Vec<String>,
     /// init 前探测的声明配置段键（oj_plugin_config_key；旧插件 None）。
     pub config_key: Option<String>,
 }
@@ -143,8 +140,21 @@ pub struct PluginInfo {
     pub description: String,
     /// 宿主当前 ABI_VERSION（插件不必与此一致，运维据此核对升级窗口）。
     pub host_abi_version: u32,
-    /// 自报了但宿主不认识的轴名（恒空实现；op_plugins 输出增量字段）。
-    pub unknown_axes: Vec<String>,
+}
+
+impl PluginInfo {
+    /// 完整性回归钉（v0.1.58 移除恒空的 unknown_axes 时补）：序列化面键集固定，
+    /// `GET {base}/plugins` / ojInfo() / JS `plugins()` 的消费者以此为准。
+    pub fn serialized_keys() -> &'static [&'static str] {
+        &[
+            "name",
+            "semver",
+            "abi_version",
+            "fingerprint",
+            "description",
+            "host_abi_version",
+        ]
+    }
 }
 
 impl From<&LoadedPlugin> for PluginInfo {
@@ -156,7 +166,6 @@ impl From<&LoadedPlugin> for PluginInfo {
             fingerprint: p.descriptor.fingerprint[..].to_string(),
             description: p.descriptor.desc[..].to_string(),
             host_abi_version: ABI_VERSION,
-            unknown_axes: p.unknown_axes.clone(),
         }
     }
 }
@@ -454,13 +463,12 @@ fn load_one(
 
     // init 后探测轴（自报清单优先，旧符号回退）：句柄已泄漏进程期存活，
     // vtable 指针永久有效，探测后不持有 lib 引用。
-    let (registrations, generic_axes, unknown_axes) = unsafe { probe_axes(lib, &probe) };
+    let (registrations, generic_axes) = unsafe { probe_axes(lib, &probe) };
 
     Ok(LoadedPlugin {
         descriptor,
         registrations,
         generic_axes,
-        unknown_axes,
         config_key,
     })
 }
@@ -479,7 +487,6 @@ unsafe fn probe_axes(
 ) -> (
     Registrations,
     Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
-    Vec<String>,
 ) {
     if let Ok(f) = unsafe {
         lib.get::<unsafe extern "C" fn() -> oj_plugin_ffi::RVec<oj_plugin_ffi::AxisDecl>>(
@@ -492,7 +499,7 @@ unsafe fn probe_axes(
     eprintln!(
         "[oj-plugin] '{plugin_name}': no oj_plugin_axes symbol, falling back to per-axis dlsym (deprecated; rebuild plugin)"
     );
-    // 回退：逐轴 dlsym（填 Registrations；泛型/unknown 恒空）。
+    // 回退：逐轴 dlsym（填 Registrations；旧插件无自报清单，泛型轴不适用）。
     let mut r = Registrations::default();
     for axis in TYPED_AXES {
         let sym = format!("oj_plugin_axis_{axis}");
@@ -507,11 +514,12 @@ unsafe fn probe_axes(
         }
         fill_typed_slot(&mut r, axis, vt);
     }
-    (r, Vec::new(), Vec::new())
+    (r, Vec::new())
 }
 
 /// 自报清单分类：按 kind 路由——TYPED 且名在 TYPED_AXES 填 typed 槽；
-/// TYPED 且名不在 → unknown_axes（警告，fail-fast 由装配层按既有惯例）；
+/// TYPED 且名不在 → eprintln 告警后忽略（v0.1.58 起不再搬运进 unknown_axes 字段：
+/// 泛型轴通道已承接一切合法新轴，typed 未知名是插件/宿主版本错配，告警即终点）；
 /// GENERIC → 泛型轴（同名冲突检查不变，仍在装配层）。
 fn classify_axes<'a>(
     plugin_name: &str,
@@ -519,11 +527,9 @@ fn classify_axes<'a>(
 ) -> (
     Registrations,
     Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
-    Vec<String>,
 ) {
     let mut r = Registrations::default();
     let mut generic = Vec::new();
-    let mut unknown = Vec::new();
     for d in decls {
         let name = d.name[..].to_string();
         if d.kind == AXIS_KIND_GENERIC {
@@ -537,10 +543,9 @@ fn classify_axes<'a>(
             eprintln!(
                 "[oj-plugin] '{plugin_name}': typed axis '{name}' not in host TYPED_AXES, ignoring"
             );
-            unknown.push(name);
         }
     }
-    (r, generic, unknown)
+    (r, generic)
 }
 
 /// 把一个自报/回退的 vtable 指针填入对应 typed 槽（cast 在臂内，与既有形态一致）。
