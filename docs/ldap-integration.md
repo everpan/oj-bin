@@ -175,7 +175,7 @@ cargo xtask plugin ldap --check    # ABI/身份/semver/符号 预检
 cargo xtask build                  # 构建 oj + 全部第一方插件（含 ldap）
 ```
 
-- 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > `<exe>/plugins` > `<workspace_root>/bin/plugins`，
+- 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > 打包布局（`OJ_BUNDLED_LD` 上溯两级，仅打包形态）> `<exe>/plugins` > `<workspace_root>/bin/plugins`，
   再拼 `<host-triple>/`。
 - **超时只有一个旋钮** `timeout_ms`（连接与操作共用）；目录跨 WAN 时调大，内网默认 5s 通常够。
 - 每次调用独立连接的代价 = 一次 TCP/TLS 握手 + 一次服务账号绑定。QPS 高的热路径若测出瓶颈，

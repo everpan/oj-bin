@@ -2660,12 +2660,13 @@ plugins:
 命名契约：插件文件 stem == descriptor name == `plugins:` 键（如 `libauth.dylib` ↔ `auth`）；
 扫描模式以文件 stem 命中配置键。
 
-`plugins_dir` 目录四级发现（先到先得），最终目录 = `<plugins_dir>/<host-triple>/`：
+`plugins_dir` 目录五级发现（先到先得），最终目录 = `<plugins_dir>/<host-triple>/`：
 
 1. 环境变量 `OJ_PLUGINS_DIR`
 2. config `plugins_dir`（相对 config 目录）
-3. `<exe>/plugins`（`bin/oj` 旁即 `bin/plugins`）
-4. `<workspace_root>/bin/plugins`
+3. 打包布局：`OJ_BUNDLED_LD` 上溯两级得 `<bin>/plugins`（仅打包形态，v0.1.56 起）
+4. `<exe>/plugins`（`bin/oj` 旁即 `bin/plugins`）
+5. `<workspace_root>/bin/plugins`
 
 已装配插件的清单可查：JS `plugins()`（第 6 章）与内置端点 `GET {base}/plugins`
 （公共端点，不走 Bearer；`plugins` 为保留路径，业务模块勿占用该目录名）。

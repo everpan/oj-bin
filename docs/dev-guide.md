@@ -827,7 +827,8 @@ core，装配层只经安全入口）。
 
 **装配语义**（`plugin_loader.rs`）：
 
-- 路径四级解析（先到先得）：`OJ_PLUGINS_DIR` > config `plugins_dir` > `<exe>/plugins`
+- 路径五级解析（先到先得）：`OJ_PLUGINS_DIR` > config `plugins_dir` > 打包布局
+  （`OJ_BUNDLED_LD` 上溯两级得 `<bin>/plugins`，仅打包形态）> `<exe>/plugins`
   （bin/oj 旁即 bin/plugins）> `<workspace_root>/bin/plugins`（与 xtask 产物归置同形），
   相对路径相对 config 目录，最终目录 = `<plugins_dir>/<host-triple>/`。
   `host-triple` 由 `ffi::triple()` 运行时按 `std::env::consts` 重建（与 xtask `rustc -vV` 的

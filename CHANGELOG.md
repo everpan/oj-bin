@@ -16,7 +16,19 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.55（未打标签）
+## v0.1.56（未打标签）
+
+**fix（plugins）**：打包形态（deploy.sh / npm 启动器，glibc 发行包经 ld-linux 启动）插件发现与
+daemon re-exec 不再依赖 `current_exe`。
+
+- 插件发现新增**打包布局候选**：`OJ_BUNDLED_LD` 上溯两级得 `<bin>/plugins`，置于 exe 启发式
+  之前；优先级 env > toml > 打包布局 > exe > workspace_root 不变，非打包形态行为不变。修复
+  npm 发行包（0.1.55 实测，`ojm dev` 必现）零插件加载——插件文件齐全也报 fail fast
+  「no auth plugin loaded」。
+- `oj serve --daemon` 打包形态 re-exec 目标由 ld.so 改为 `<bin>/oj` 启动器（自带
+  `OJ_BUNDLED_LD`/`LIB` 导出与 ld 链），不再把加载器当 ELF 加载导致秒退。
+
+## v0.1.55
 
 **fix（fs）**：Windows 下 jail 内 symlink 逃逸被放行（CI 缺陷钉 `fs_symlink_escape_denied` 暴露）。
 
