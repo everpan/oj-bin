@@ -37,6 +37,20 @@ ldap:
   用 opts 的 `bindPw` 运行时补上（与 config 的 `bind_dn` 合并）。**只为「有 `bind_pw`
   却无 `bind_dn`」报错**。都不配则匿名绑定（多数目录默认拒匿名读）。
 
+实例字段一览：
+
+| 实例字段 | 说明 |
+|---|---|
+| `url` | 仅 `ldap://` / `ldaps://`；未知 scheme / 坏 url → 启动报错 |
+| `bind_dn` / `bind_pw` | 服务账号，成对出现（只配一个 → 报错）；都不配则匿名绑定 |
+| `timeout_ms` | 连接与操作超时（100..=3600000，默认 5000） |
+| `start_tls` | 仅用于 `ldap://` 口；配在 `ldaps://` 上 → 启动报错 |
+| `tls_skip_verify` | 跳过服务端证书校验，仅测试环境 |
+
+入口宏自报 `config: "ldap"`——cfg 三级解析第 2 级直接取顶层 `ldap:` 段全量 Value
+（未配置给 `{}`，段可选；`plugins.ldap` 非空透传仍优先）。字段权威定义见
+[`../ldap-integration.md`](../ldap-integration.md) 的 `ldap` 配置段（§2）。
+
 ## API（`axis("ldap")` 的 5 个 op，全部 async）
 
 | op | 调用 | 说明 |
@@ -71,7 +85,7 @@ type Entry = {
   `ldap not configured`。这是双轨期行为：旧版 typed oj-ldap（注册 `ldap` typed 槽的
   旧 cdylib）仍可加载，`ldap.*` 照常工作；二者择一，别混。
 - 泛型轴通用语义见 devkit api-manual §6「axis(name)」与
-  [docs/api/20-ojinfo.md](20-ojinfo.md)：未知轴抛 `unknown generic axis 'ldap'
+  [docs/api/20-ojinfo.md](/reference/api/20-ojinfo)：未知轴抛 `unknown generic axis 'ldap'
   (available: […])`。
 
 ## 错误
@@ -105,6 +119,41 @@ type Entry = {
 - `bindDn` / `bindPw` 仅 `search` / `search_paged` 支持；`whoami` / `compare` /
   `bind` 用 config 服务账号或各自入参。
 - 结果大小：聚合结果整体进内存（`Entry[]`），超大目录导出请分批按 base/scope 拆。
+
+## 插件实现
+
+oj-ldap 是提供 `ldap` 泛型轴的 cdylib 插件（`kind=GENERIC`；v0.1.54 之前为类型化
+轴），底层 `ldap3`（纯 Rust tokio LDAP 客户端）。泛型轴声明
+`oj_plugin_entry!(init, config: "ldap", generic(ldap) => &LDAP_VT)`——不占 9 个
+类型化轴槽、零 ABI 变更；协议面与 vtable 形状见 `oj-plugin-ffi` 的
+`GenericVtable` / `AxisDecl`。
+
+泛型轴 JSON 协议（vtable: `call(op, args)`）：`args` 恒为位置参数 JSON 数组，末位
+可选 opts 对象；实例选单经 `opts.key`（缺省 `"default"`），未知 opts 键忽略。
+连接/协议/校验错误经 future Err 透传（JS 侧 reject）；`bind` 凭据被 LDAP 拒绝 =
+`false`，非错误。
+
+| op | args | opts | 结果 JSON |
+|----|------|------|-----------|
+| `bind` | `[dn, pw]` | `{key?}` | `true \| false` |
+| `search` | `[base]` | `{key?, scope?, filter?, attrs?, bindDn?, bindPw?}` | `[{dn, attrs:{k:[v]}, bin:{k:[base64]}}]` |
+| `search_paged` | `[base]` | 同上 + `{pageSize?}`（缺省 500，范围 1..=10000） | 同 `search` |
+| `whoami` | `[]` | `{key?}` | authzid 字符串 |
+| `compare` | `[dn, attr, val]` | `{key?}` | `true \| false` |
+
+依赖与构建注意：
+
+- `ldap3` 0.12.1，TLS 走 `tls-rustls-aws-lc-rs`（rustls 0.23 + aws-lc-rs，与框架同
+  provider，不引 ring / native-tls）。
+- init 时显式 `install_default` 装 aws-lc-rs CryptoProvider：本插件是独立 cdylib、
+  自带一份 rustls，宿主侧的 provider 不覆盖此 copy，不装则在 `ldaps://` /
+  `start_tls` 路径 panic。
+- 鉴权 `bind(dn, pw)` 的凭据绝不落到共享连接上（连接模型决定）。
+- 泛型轴名 `ldap` 撞类型化保留名——本插件只能配 v0.1.54+ 宿主（pre-kind 宿主按名
+  cast 会误解释 vtable；desc 已注明最低版本）。
+
+状态：v0.1.28 首版（类型化轴，`docs/ldap-integration.md` 记录）；v0.1.54 迁移泛型
+轴。随发行包发布。
 
 ## 案例
 

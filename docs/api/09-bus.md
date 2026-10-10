@@ -76,6 +76,20 @@ broker:            # 段缺省 = 进程内 Bus（kind local），保持零配置
   **持久队列消费**（消费组逐条拉取、commit/ack 确认）。`broker:` 段喂 bus 轴，
   `kafkas:`/`rabbits:` 段喂 mq 轴——同配一套 Kafka 可以两段都写、各司其职。
 
+## 插件实现
+
+`broker.kind` 配 `kafka` / `rabbitmq` 时，bus 轴由 cdylib 插件承载：
+
+- **oj-bus-kafka**（底层 `rdkafka`）：bus 面做 push 扇出，订阅经 `deliver` 回调上送，
+  auto-commit（push 语义）。实现细节见 [`10-mq.md`](10-mq.md) 的「插件实现」。
+- **oj-bus-rabbitmq**（底层 `lapin`，纯 Rust，基于 tokio，无原生 TLS 库，构建比 kafka 轻）：
+  bus 面 push 扇出、收到即 ack；装配期即拨号探活（fail-fast），amqp URL 的 `user:pass`
+  在错误文案中脱敏（`amqp://u:***@host`）；复用 channel 防 channel_max 打满。
+
+两个插件都是双轴插件（bus + mq 两面对接同一份 `KafkaCore` / `RabbitCore` driver）；
+`close` 会停掉 detach 的 push 消费任务。均已随发行包发布；真库 roundtrip 测试分别由
+`OJ_TEST_KAFKA_BROKERS` / `OJ_TEST_RABBITMQ_URL` 门控，未设则跳过（不进网络）。
+
 ## 案例
 
 ### HTTP 发布 → WS 订阅（新闻推送）
