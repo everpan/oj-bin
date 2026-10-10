@@ -277,7 +277,7 @@ runner（self-hosted 不支持）→ job 是否有 `id-token: write` → 包的 
 | macOS/Windows 子包装配错（os/cpu 写反、zip 层级错） | 元数据断言 + tgz 文件清单断言 + 三 runner smoke-npm job |
 | musl 与 gnu 同 (os,cpu) 不可区分 | npm-publish.sh 硬校验撞车即 fail；启用 musl 前须先定 libc 策略（npm ≥11 `libc` 字段 + postinstall 运行时检测兜底） |
 | 子包模板误加 `exports` 字段 | 模板注释写死禁令（`require.resolve('.../package.json')` 依赖它） |
-| registry 传播延迟导致冒烟抖动 | retry 3 次；smoke-npm 是独立 job，失败不阻塞已发布的 Release |
+| registry 传播延迟导致冒烟抖动 | smoke-npm 装前先用 `npm view` 等主包 + 本 triple 子包可见（每包最多 10×20s），再 `npm i`（retry 3×30s）；smoke 是独立 job，失败不阻塞已发布的 Release。**v0.1.59 实测**：只靠 install retry 3×20s 时 Windows 腿连吃 3 个 `ETARGET`（主包 15:54:16Z 才落库，Windows 15:54:03Z 就开装）——ETARGET 是「本 runner 命中的 CDN 节点还没这版」，不是没发出去 |
 | ~~NPM_TOKEN 泄漏~~ | 2026-10-10 起仓库无长期凭证（OIDC 短时凭证，见 §7） |
 | OIDC 配置漂移（workflow 改名/换仓库/换 self-hosted runner） | 脚本预检先死（§7）；npmjs 侧配置保存后 npm 不校验，改 workflow 文件名必须同步改 trusted publisher |
 | trusted publisher 配置「2 天内未首发」自动失效 | 配置与首发放在同一次发布窗口内；失效后删了重建（配置不可编辑） |

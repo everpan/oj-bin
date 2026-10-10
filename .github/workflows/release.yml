@@ -468,16 +468,34 @@ jobs:
         shell: bash
         env:
           VER: ${{ needs.publish-npm.outputs.version }}
+          TRIPLE: ${{ matrix.triple }}
         run: |
           set -e
           d=$(mktemp -d) && cd "$d"
           npm init -y >/dev/null
+          # 先等 registry 可见再装：publish-npm 的发布后置信是在 ubuntu runner 上做的，
+          # 三台 runner 各自命中不同的 CDN 缓存节点，主包刚发布的那几分钟里 `npm i` 会
+          # 直接 ETARGET（"No matching version found"）——不是包没发出去，是还没同步到。
+          # 只靠 install 的 retry 撑不过（v0.1.59 Windows 腿实测：3×20s 全 ETARGET）。
+          wait_visible() { # <pkg>：等它在本 runner 视角的 registry 上可见
+            local pkg="$1" i
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if npm view "${pkg}@${VER}" version >/dev/null 2>&1; then
+                echo "${pkg}@${VER} 可见（第 $i 次探到）"; return 0
+              fi
+              sleep 20
+            done
+            echo "::error::${pkg}@${VER} 等了 200s 在本 runner 仍不可见：registry 传播异常或发布确实失败（先查 publish-npm job 日志）" >&2
+            return 1
+          }
+          wait_visible "@oj-bin/oj" || exit 1
+          wait_visible "@oj-bin/oj-${TRIPLE}" || exit 1
           ok=0
           for i in 1 2 3; do
             if npm i "@oj-bin/oj@${VER}"; then ok=1; break; fi
-            echo "retry $i: registry propagation lag"; sleep 20
+            echo "retry $i: install 失败（多为传播尾巴）"; sleep 30
           done
-          [[ $ok == 1 ]] || { echo "::error::npm i @oj-bin/oj@${VER} 失败"; exit 1; }
+          [[ $ok == 1 ]] || { echo "::error::npm i @oj-bin/oj@${VER} 失败：registry 已可见该版本，属安装/网络问题"; exit 1; }
           ls -la bin/
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             [[ -f bin/oj.exe ]] && ./bin/oj.exe --help
