@@ -200,6 +200,50 @@ fn resolve_default_missing_is_none() {
     assert_eq!(got, None);
 }
 
+#[test]
+fn resolve_bundled_layout_from_oj_bundled_ld() {
+    let _g = ENV_LOCK.lock().unwrap();
+    unsafe { std::env::remove_var("OJ_PLUGINS_DIR") };
+    // 打包形态：OJ_BUNDLED_LD 指向 <bin>/lib/ld-linux-*（启动器 exec 动态加载器的
+    // 产物），真实插件目录是同 <bin> 下的 plugins/。exe 侧候选（测试进程在
+    // target/.../deps）与 workspace 候选均不涉，命中全靠 bundled 候选。
+    let base = tempfile::tempdir().unwrap();
+    let bin_dir = base.path().join("bin");
+    let ld = bin_dir.join("lib").join("ld-linux-x86-64.so.2");
+    std::fs::create_dir_all(ld.parent().unwrap()).unwrap();
+    std::fs::write(&ld, b"").unwrap();
+    let dir = bin_dir.join("plugins").join(ffi::triple());
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("OJ_BUNDLED_LD", &ld) };
+    let got = resolve_plugins_dir(Path::new("/nonexistent-cfg"), None).unwrap();
+    unsafe { std::env::remove_var("OJ_BUNDLED_LD") };
+    assert_eq!(got, Some(dir));
+}
+
+#[test]
+fn resolve_env_still_overrides_bundled_layout() {
+    let _g = ENV_LOCK.lock().unwrap();
+    // OJ_PLUGINS_DIR 优先级高于打包布局候选（四级解析第 1 级不变）。
+    let base = tempfile::tempdir().unwrap();
+    let bin_dir = base.path().join("bin");
+    let ld = bin_dir.join("lib").join("ld-linux-x86-64.so.2");
+    std::fs::create_dir_all(ld.parent().unwrap()).unwrap();
+    std::fs::write(&ld, b"").unwrap();
+    std::fs::create_dir_all(bin_dir.join("plugins").join(ffi::triple())).unwrap();
+    let env_dir = base.path().join("env-plugins").join(ffi::triple());
+    std::fs::create_dir_all(&env_dir).unwrap();
+    unsafe {
+        std::env::set_var("OJ_BUNDLED_LD", &ld);
+        std::env::set_var("OJ_PLUGINS_DIR", base.path().join("env-plugins"));
+    }
+    let got = resolve_plugins_dir(Path::new("/nonexistent-cfg"), None).unwrap();
+    unsafe {
+        std::env::remove_var("OJ_BUNDLED_LD");
+        std::env::remove_var("OJ_PLUGINS_DIR");
+    }
+    assert_eq!(got, Some(env_dir));
+}
+
 // ---- 清单模式 ----
 
 #[test]
