@@ -3417,11 +3417,14 @@ pub(crate) mod tests {
         (addr, (t, keeps.into_iter().next().unwrap()))
     }
 
+    /// 静态站夹具条目：(prefix, spa, files)。
+    type SiteFixture<'a> = (&'a str, bool, Vec<(&'a str, &'a str)>);
+
     /// 多站点版（v0.1.27 语义沿用 v0.1.58 挂载模型）：sites = [(prefix, files, spa)]。
     /// 另挂一条空 api 挂载 /v1/api（表空，仅为最长前缀路由提供 api 面）。
     async fn spawn_static_sites(
         api: &[(&str, &str)],
-        sites: &[(&str, bool, Vec<(&str, &str)>)],
+        sites: &[SiteFixture<'_>],
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
         let t = routes(api);

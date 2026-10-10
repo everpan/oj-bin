@@ -1835,16 +1835,18 @@ mod tests {
     fn resolve_mounts_matrix() {
         let (base, dirs) = tmp_dirs(&["api", "web", "docs"]);
         // 归一：尾斜杠剪除；目录 canonicalize；api 逐条目 dev 判定（无 manifests.yaml → ts）。
-        let mut cfg = Config::default();
-        cfg.mounts = vec![
-            mount(
-                "/v1/api/",
-                Some(dirs[0].to_string_lossy().as_ref()),
-                None,
-                None,
-            ),
-            mount("/", None, Some(dirs[1].to_string_lossy().as_ref()), None),
-        ];
+        let cfg = Config {
+            mounts: vec![
+                mount(
+                    "/v1/api/",
+                    Some(dirs[0].to_string_lossy().as_ref()),
+                    None,
+                    None,
+                ),
+                mount("/", None, Some(dirs[1].to_string_lossy().as_ref()), None),
+            ],
+            ..Default::default()
+        };
         let out = resolve_mounts(&cfg, &base).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].prefix, "/v1/api");
@@ -1857,22 +1859,24 @@ mod tests {
         ));
 
         // 嵌套合法：/v1 web(spa) + /v1/api api；根 `/` api 挂载合法。
-        let mut cfg = Config::default();
-        cfg.mounts = vec![
-            mount(
-                "/v1",
-                None,
-                Some(dirs[1].to_string_lossy().as_ref()),
-                Some(true),
-            ),
-            mount(
-                "/v1/api",
-                Some(dirs[0].to_string_lossy().as_ref()),
-                None,
-                None,
-            ),
-            mount("/", Some(dirs[2].to_string_lossy().as_ref()), None, None),
-        ];
+        let cfg = Config {
+            mounts: vec![
+                mount(
+                    "/v1",
+                    None,
+                    Some(dirs[1].to_string_lossy().as_ref()),
+                    Some(true),
+                ),
+                mount(
+                    "/v1/api",
+                    Some(dirs[0].to_string_lossy().as_ref()),
+                    None,
+                    None,
+                ),
+                mount("/", Some(dirs[2].to_string_lossy().as_ref()), None, None),
+            ],
+            ..Default::default()
+        };
         let out = resolve_mounts(&cfg, &base).unwrap();
         assert_eq!(out.len(), 3);
         assert!(matches!(
@@ -1881,42 +1885,50 @@ mod tests {
         ));
 
         // 同类重复（含尾斜杠归一口径）→ Err；api+web 配对 → 合法。
-        let mut cfg = Config::default();
-        cfg.mounts = vec![
-            mount("/docs", None, Some("docs"), None),
-            mount("/docs/", None, Some("docs2"), None),
-        ];
+        let cfg = Config {
+            mounts: vec![
+                mount("/docs", None, Some("docs"), None),
+                mount("/docs/", None, Some("docs2"), None),
+            ],
+            ..Default::default()
+        };
         let e = resolve_mounts(&cfg, &base).unwrap_err();
         assert!(e.contains("duplicate web mount"), "{e}");
-        let mut cfg = Config::default();
-        cfg.mounts = vec![
-            mount("/p", Some("api"), None, None),
-            mount("/p", None, Some("web"), None),
-        ];
+        let cfg = Config {
+            mounts: vec![
+                mount("/p", Some("api"), None, None),
+                mount("/p", None, Some("web"), None),
+            ],
+            ..Default::default()
+        };
         assert_eq!(resolve_mounts(&cfg, &base).unwrap().len(), 2);
 
         // 缺失目录 → Err（canonicalize fail-fast，带条目序号）。
-        let mut cfg = Config::default();
-        cfg.mounts = vec![mount("/x", None, Some("no-such-dir"), None)];
+        let cfg = Config {
+            mounts: vec![mount("/x", None, Some("no-such-dir"), None)],
+            ..Default::default()
+        };
         let e = resolve_mounts(&cfg, &base).unwrap_err();
         assert!(e.contains("mounts[0]") && e.contains("no-such-dir"), "{e}");
 
         // 声明序保留（primary = 第一条 api）。
-        let mut cfg = Config::default();
-        cfg.mounts = vec![
-            mount(
-                "/second",
-                Some(dirs[0].to_string_lossy().as_ref()),
-                None,
-                None,
-            ),
-            mount(
-                "/first",
-                Some(dirs[2].to_string_lossy().as_ref()),
-                None,
-                None,
-            ),
-        ];
+        let cfg = Config {
+            mounts: vec![
+                mount(
+                    "/second",
+                    Some(dirs[0].to_string_lossy().as_ref()),
+                    None,
+                    None,
+                ),
+                mount(
+                    "/first",
+                    Some(dirs[2].to_string_lossy().as_ref()),
+                    None,
+                    None,
+                ),
+            ],
+            ..Default::default()
+        };
         let out = resolve_mounts(&cfg, &base).unwrap();
         assert_eq!(out[0].prefix, "/second");
 
