@@ -55,7 +55,7 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `-c` | `config.yaml` | 配置文件路径（host/port/base/root/db/redis）。serve / build / exec / migrate / test fixture / schema diff / secret 都有此参数 |
+| `-c` | 自动搜索 | 配置文件路径（host/port/base/root/db/redis）。**v0.1.57 起可省**：省略时按序搜索 ① CWD 逐级向上 `config.yaml` → ② `$HOME/.oj/config.yaml`；都没找到用内置默认值继续（stderr 打 `note:` 提示），显式 `-c` 指向缺失文件仍报错。serve / build / exec / migrate / test / schema diff / openapi / info / secret seal/open 都有此参数 |
 | `-b` | config `server.api_prefix`（默认 `/v1/api`） | （server）基础路由前缀，显式给出时覆盖 config（build 无此参数） |
 | `-d` | 见说明 | 服务目录。`build` 恒为 `src`；`test fixture` 为 src 存在取 src、否则 dist；`migrate` / `schema diff` / `test` 自 config 同级向上逐级搜（每层 src 优先、dist 次之）。server 用 `--api-path`，无缺省搜索 |
 | `--api-path` | 无 | （server）API 目录，相对 CWD；缺省 = 不开 API 功能（须配 `--app-path` / `server.app_path`，否则退出） |
@@ -124,6 +124,11 @@ oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 ## 3. 配置 config.yaml
 
 服务行为几乎都由这个文件决定。改端口、接数据库、开插件、调超时，都在这里查。
+
+> **v0.1.57**：文件本身可选——所有命令的 `-c` 省略时按「CWD 逐级向上 `config.yaml` →
+> `$HOME/.oj/config.yaml`」搜索，未找到用内置默认值继续（无后端的 `build` / `openapi` /
+> `exec` / `info`、纯静态 `serve` 因此无需配置文件）；相对路径仍相对 config 所在目录
+> （回落默认时相对 CWD）。
 
 ```yaml
 server:

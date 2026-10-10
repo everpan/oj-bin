@@ -55,7 +55,7 @@ async fn test_start_fails_when_cert_expired_and_grace_over() {
     // 由 #[should_panic(expected = "certificate")] 校验；其余断言（如插件 ABI）失败会
     // 以不同 panic 信息暴露，从而偏离本测目标。
     let _ = serve_cmd::run(ServeArgs {
-        config: config_file.path().to_string_lossy().into_owned(),
+        config: Some(config_file.path().to_string_lossy().into_owned()),
         api_path: Some(service_dir.to_string_lossy().into_owned()),
         // 测试必须留终端输出：serve_cmd::run 会装 fd 级 tee，console 关闭时连
         // libtest 自身的汇总行与 panic 信息都会被吞进日志文件，CI 里看不到失败原因。

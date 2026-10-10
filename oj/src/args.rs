@@ -1,12 +1,15 @@
-//! oj 命令行（clap derive）。子命令：serve / build。
+//! oj 命令行（clap derive）。子命令：serve / build / test / migrate / schema / secret /
+//! exec / openapi / info。
 //! 帮助 `oj --help` / `oj <cmd> --help`；空参打印帮助、非法参数报错均由 clap 退出（code 2）。
+//! 所有命令的 `-c/--config` 均可省（v0.1.57）：缺省按 CWD 逐级向上 config.yaml →
+//! $HOME/.oj/config.yaml 搜索，未找到用内置默认值；显式 -c 缺失仍报错。
 
 use clap::{Parser, Subcommand};
 
 /// server 子命令参数。
 #[derive(Debug, Clone, Default)]
 pub struct ServeArgs {
-    pub config: String,
+    pub config: Option<String>,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
     /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；模式按目录内容
@@ -31,7 +34,7 @@ pub struct ServeArgs {
 
 /// test 子命令参数（L1：进程内真实运行时跑 *.test.ts）。
 pub struct TestArgs {
-    pub config: String,
+    pub config: Option<String>,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
@@ -74,7 +77,7 @@ pub enum TestCmd {
 pub struct BuildArgs {
     pub module: Option<String>,
     /// 配置文件（读 tasks.dir 决定镜像目录名；缺文件回落默认 "tasks"）。
-    pub config: String,
+    pub config: Option<String>,
     pub dir: String,
     pub out: String,
     /// 转译产物 minify（swc 全量压缩 + 函数内局部变量名混淆）。默认开；
@@ -89,8 +92,8 @@ pub struct BuildArgs {
 /// `--check` 把生成物与已提交 openapi.json 比对，不一致非零退出（CI 漂移门禁）。
 /// 与 `TestArgs`/`MigrateArgs` 同构：本结构体为纯数据，clap 属性在 `Commands::OpenApi` 变体上。
 pub struct OpenApiArgs {
-    /// 配置文件路径（db/插件/路由前缀来源）；缺省 config.yaml
-    pub config: String,
+    /// 配置文件路径（db/插件/路由前缀来源）；缺省自动搜索
+    pub config: Option<String>,
     /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
     pub dir: Option<String>,
     /// API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
@@ -101,7 +104,7 @@ pub struct OpenApiArgs {
     pub out: Option<String>,
 }
 pub struct MigrateArgs {
-    pub config: String,
+    pub config: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
@@ -114,7 +117,7 @@ pub struct MigrateArgs {
 
 /// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`。
 pub struct FixtureArgs {
-    pub config: String,
+    pub config: Option<String>,
     pub dir: Option<String>,
     /// 只灌指定模块。
     pub module: Option<String>,
@@ -167,13 +170,13 @@ pub enum Command {
 
 /// `oj info [-c config]`：phpinfo 风格诊断（版本/ABI/插件/后端注册/配置段，值不出）。
 pub struct InfoArgs {
-    /// 配置文件路径（相对 CWD）
-    pub config: String,
+    /// 配置文件路径（缺省自动搜索）
+    pub config: Option<String>,
 }
 
 /// `oj schema diff [-c config] [-d dir] [--db name]`：声明 vs 实库只读对账（D001/D002，§5.1）。
 pub struct SchemaDiffArgs {
-    pub config: String,
+    pub config: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
@@ -190,7 +193,7 @@ pub struct ExecArgs {
     pub code: Option<String>,
     /// 进入交互式 REPL（逐行读 stdin 求值）。与 `file` / `--code` 互斥。
     pub repl: bool,
-    pub config: String,
+    pub config: Option<String>,
     pub dir: Option<String>,
     pub db: Option<String>,
     /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast。
@@ -232,9 +235,10 @@ enum Commands {
     /// 启动 HTTP 服务（目录镜像路由 + app_path 静态兜底）
     #[command(arg_required_else_help = true)]
     Serve {
-        /// 配置文件路径（相对 CWD；server.host/port/app_path + db/redis）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml；
+        /// 未找到用内置默认值——纯静态 serve / 无后端 exec 等场景无需配置）
+        #[arg(short, long)]
+        config: Option<String>,
         /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
@@ -269,9 +273,9 @@ enum Commands {
     Build {
         /// 目标模块名（src 首层子目录）；省略 = 全部模块
         module: Option<String>,
-        /// 配置文件（读 tasks.dir 决定镜像目录名；缺文件回落默认 "tasks"）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件（读 tasks.dir 决定镜像目录名；缺省自动搜索，未找到回落默认 "tasks"）
+        #[arg(short, long)]
+        config: Option<String>,
         /// 源码目录
         #[arg(short, long, default_value = "src")]
         dir: String,
@@ -287,9 +291,9 @@ enum Commands {
     },
     /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && serve）
     Migrate {
-        /// 配置文件路径（相对 CWD；db 段提供目标库）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
+        #[arg(short, long)]
+        config: Option<String>,
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
@@ -304,9 +308,9 @@ enum Commands {
     },
     /// 进程内真实运行时跑 *.test.ts；`oj test fixture` 灌演示数据。
     Test {
-        /// 配置文件路径（相对 CWD；server.host/port/root + db/redis）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
+        #[arg(short, long)]
+        config: Option<String>,
         /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
@@ -378,9 +382,9 @@ enum Commands {
         /// 进入交互式 REPL（逐行读 stdin 求值，后端全局可用）；与 file / --code 互斥
         #[arg(long = "repl", group = "exec_src")]
         repl: bool,
-        /// 配置文件路径（db/redis/插件段）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索；未找到用内置默认值——纯计算脚本无需配置）
+        #[arg(short, long)]
+        config: Option<String>,
         /// 服务目录（schema 白名单来源）；缺省自动探测（src 优先 dist 次之）
         #[arg(short, long)]
         dir: Option<String>,
@@ -421,9 +425,9 @@ enum Commands {
     /// 从路由表生成 OpenAPI 3.1；`--check` 比对已提交 openapi.json 检测漂移（CI 门禁）
     #[command(name = "openapi")]
     OpenApi {
-        /// 配置文件路径（db/插件/路由前缀来源）；缺省 config.yaml
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（db/插件/路由前缀来源）；缺省自动搜索，未找到用内置默认值
+        #[arg(short, long)]
+        config: Option<String>,
         /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
         #[arg(short, long)]
         dir: Option<String>,
@@ -439,9 +443,9 @@ enum Commands {
     },
     /// phpinfo 风格诊断：版本/ABI/插件/后端注册/配置段（值不出）
     Info {
-        /// 配置文件路径（相对 CWD）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索；未找到用内置默认值）
+        #[arg(short, long)]
+        config: Option<String>,
     },
 }
 
@@ -450,9 +454,9 @@ enum Commands {
 pub enum TestSub {
     /// 灌入模块 fixtures/ 演示数据（dev/test 用；不进 release 产物、不随启动重放）
     Fixture {
-        /// 配置文件路径（相对 CWD；db 段提供目标库）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
+        #[arg(short, long)]
+        config: Option<String>,
         /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
         #[arg(short, long)]
         dir: Option<String>,
@@ -505,9 +509,9 @@ pub enum SecretCmd {
 pub enum SchemaCmd {
     /// 声明式 schema 与实库只读对账（D001 漂移 / D002 未声明表；有差异退 1）
     Diff {
-        /// 配置文件路径（相对 CWD；db 段提供目标库）
-        #[arg(short, long, default_value = "config.yaml")]
-        config: String,
+        /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
+        #[arg(short, long)]
+        config: Option<String>,
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
@@ -710,7 +714,7 @@ mod tests {
         };
         assert_eq!(a.file.as_deref(), Some("scripts/job.ts"));
         assert_eq!(a.code, None);
-        assert_eq!(a.config, "c.yaml");
+        assert_eq!(a.config.as_deref(), Some("c.yaml"));
         assert_eq!(a.dir.as_deref(), Some("src"));
         assert_eq!(a.db.as_deref(), Some("report"));
         assert_eq!(a.log_file.as_deref(), Some("out.jsonl"));
@@ -846,13 +850,13 @@ mod tests {
         };
         assert_eq!(
             (
-                a.config.as_str(),
+                a.config.as_deref(),
                 a.base.as_deref(),
                 a.api_path.as_deref(),
                 a.app_path.as_slice()
             ),
             (
-                "c.yaml",
+                Some("c.yaml"),
                 Some("/api"),
                 Some("src"),
                 &["web".to_string()][..]
@@ -1004,14 +1008,14 @@ mod tests {
         };
         assert_eq!(
             (
-                a.config.as_str(),
+                a.config.as_deref(),
                 a.dir.as_deref(),
                 a.tests.as_deref(),
                 a.format.as_deref(),
                 a.output.as_deref()
             ),
             (
-                "c.yaml",
+                Some("c.yaml"),
                 Some("src"),
                 Some("tests"),
                 Some("tap"),
@@ -1038,8 +1042,8 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            (a.db.as_deref(), a.config.as_str()),
-            (Some("analytics"), "c.yaml")
+            (a.db.as_deref(), a.config.as_deref()),
+            (Some("analytics"), Some("c.yaml"))
         );
         let Command::Migrate(a) = cmd(&["migrate"]) else {
             panic!()
@@ -1070,12 +1074,15 @@ mod tests {
             panic!()
         };
         assert_eq!(
-            (a.config.as_str(), a.dir.as_deref()),
-            ("c.yaml", Some("src"))
+            (a.config.as_deref(), a.dir.as_deref()),
+            (Some("c.yaml"), Some("src"))
         );
         let Command::SchemaDiff(a) = cmd(&["schema", "diff", "-c", "c.yaml"]) else {
             panic!()
         };
-        assert_eq!((a.config.as_str(), a.dir.as_deref()), ("c.yaml", None));
+        assert_eq!(
+            (a.config.as_deref(), a.dir.as_deref()),
+            (Some("c.yaml"), None)
+        );
     }
 }

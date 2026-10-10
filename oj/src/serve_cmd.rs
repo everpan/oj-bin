@@ -24,8 +24,11 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     if a.daemon {
         return daemonize();
     }
-    let (mut cfg, top, config_dir, dir, ts, base) =
-        load_app_config(&a.config, a.api_path.as_deref(), a.base.as_deref())?;
+    let (mut cfg, top, config_dir, dir, ts, base) = load_app_config(
+        a.config.as_deref(),
+        a.api_path.as_deref(),
+        a.base.as_deref(),
+    )?;
     // CLI 覆盖：静态站点目录 / 证书路径（若有）。强制证书门禁在 App::from_config
     // （统一装配点）判定，CLI 与测试共用同一路径，避免 run()/start() 两处判空漂移。
     // 路径语义：CLI `--app-path` 相对 CWD（此处预绝对化）；config `server.app_path`
@@ -272,29 +275,37 @@ async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
     flag.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 解析配置 + 目录模式（同 server）：读取 config.yaml，确定服务目录（src 优先 / dist 兜底）、
-/// dev/release 判定、base 前缀归源。server 与 test 命令共用，避免重复解析逻辑。
+/// 解析配置 + 目录模式（同 server）：搜索并读取 config.yaml，确定服务目录（src 优先 /
+/// dist 兜底）、dev/release 判定、base 前缀归源。server 与 test 命令共用，避免重复解析逻辑。
+/// `config`：None 走统一搜索（CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml），
+/// 未找到不报错——回落内置默认 Config（config_dir = CWD），纯静态 serve / 无后端
+/// exec/test 等场景无需配置文件。
 /// 返回附带 `top`（顶层全量段 JSON 形，已知 + 未知）：插件自报 config key 的 cfg 查找面
 /// （撞宿主已知段名合法，spec Part 3；load_with_extra）。
 pub fn load_app_config(
-    config: &str,
+    config: Option<&str>,
     dir_override: Option<&str>,
     base_override: Option<&str>,
 ) -> Result<(Config, serde_json::Value, PathBuf, PathBuf, bool, String), String> {
-    let config_path = PathBuf::from(config);
-    let config_dir = config_dir_of(&config_path);
-    let loaded = config::load_with_extra(
-        // 与原 load_from(dir, file_name) 同口径：file_name 取不到（路径以 ".." 结尾等）
-        // 回落默认 config.yaml。
-        &config_dir.join(
-            config_path
-                .file_name()
-                .unwrap_or_else(|| "config.yaml".as_ref()),
-        ),
-        &config_dir,
-    )
-    .map_err(|e| format!("load config: {e}"))?;
-    let LoadedConfig { config: cfg, top } = loaded;
+    let (cfg, top, config_dir) = match config::find_path(config)? {
+        Some(path) => {
+            let config_dir = config_dir_of(&path);
+            let LoadedConfig { config, top } = config::load_with_extra(&path, &config_dir)
+                .map_err(|e| format!("load config: {e}"))?;
+            (config, top, config_dir)
+        }
+        None => {
+            eprintln!(
+                "note: no config.yaml found (searched cwd upward, $HOME/.oj/config.yaml) — \
+                 using built-in defaults"
+            );
+            (
+                Config::default(),
+                serde_json::Value::Object(Default::default()),
+                std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?,
+            )
+        }
+    };
     // 目录即模式：含构建锁 manifests.yaml → release(js)；否则 dev(ts)。
     // 默认目录：自 config 同级起步逐级向上搜索，每层 src 优先、dist 次之；
     // 一路到根都没找到 → 回落 config_dir/src。
@@ -1132,10 +1143,23 @@ pub(crate) fn assemble_ojinfo(
 /// `oj info` 与 JS ojInfo() 的共同装配面：load_with_extra → resolve_plugins_dir →
 /// assemble_plugins 的加载与 config 解析路径 → build_registries；不 connect、不监听。
 /// 副作用 = 执行插件 init 代码，信任边界同 serve。
-pub async fn assemble_for_info(cfg_path: &str) -> Result<OjInfo, String> {
-    let config_dir = config_dir_of(Path::new(cfg_path));
-    let loaded_cfg = config::load_with_extra(Path::new(cfg_path), &config_dir)
-        .map_err(|e| format!("config: {e}"))?;
+pub async fn assemble_for_info(cfg_path: Option<&str>) -> Result<OjInfo, String> {
+    // 与 load_app_config 同一搜索口径；未找到 → 默认 Config + 空 top（config 段显示为空）。
+    let (loaded_cfg, config_dir) = match config::find_path(cfg_path)? {
+        Some(path) => {
+            let config_dir = config_dir_of(&path);
+            let loaded =
+                config::load_with_extra(&path, &config_dir).map_err(|e| format!("config: {e}"))?;
+            (loaded, config_dir)
+        }
+        None => (
+            LoadedConfig {
+                config: Config::default(),
+                top: serde_json::Value::Object(Default::default()),
+            },
+            std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?,
+        ),
+    };
     let cfg = &loaded_cfg.config;
     let dir = resolve_plugins_dir(&config_dir, cfg.plugins_dir.as_deref())
         .map_err(|e| format!("plugins dir: {e}"))?;
@@ -1168,7 +1192,7 @@ pub async fn assemble_for_info(cfg_path: &str) -> Result<OjInfo, String> {
         &loaded_cfg.top,
         &loaded,
         &reg,
-        Some(cfg_path),
+        cfg_path,
     ))
 }
 
@@ -1334,7 +1358,8 @@ mod tests {
         std::fs::create_dir_all(t.0.join("dist")).unwrap();
         std::fs::write(t.0.join("config.yaml"), "{}\n").unwrap();
         let cfg = t.0.join("config.yaml");
-        let (_, _, _, dir, ts, _) = load_app_config(cfg.to_str().unwrap(), None, None).unwrap();
+        let (_, _, _, dir, ts, _) =
+            load_app_config(Some(cfg.to_str().unwrap()), None, None).unwrap();
         assert_eq!(dir, t.0.join("src"));
         assert!(ts);
 
@@ -1343,7 +1368,8 @@ mod tests {
         std::fs::create_dir_all(t2.0.join("dist")).unwrap();
         std::fs::write(t2.0.join("config.yaml"), "{}\n").unwrap();
         let cfg2 = t2.0.join("config.yaml");
-        let (_, _, _, dir2, _, _) = load_app_config(cfg2.to_str().unwrap(), None, None).unwrap();
+        let (_, _, _, dir2, _, _) =
+            load_app_config(Some(cfg2.to_str().unwrap()), None, None).unwrap();
         assert_eq!(dir2, t2.0.join("dist"));
 
         // config 下钻一层（sub/config.yaml），src 在父级 → 向上搜索命中。
@@ -1352,7 +1378,8 @@ mod tests {
         std::fs::create_dir_all(t3.0.join("sub")).unwrap();
         std::fs::write(t3.0.join("sub/config.yaml"), "{}\n").unwrap();
         let cfg3 = t3.0.join("sub/config.yaml");
-        let (_, _, _, dir3, _, _) = load_app_config(cfg3.to_str().unwrap(), None, None).unwrap();
+        let (_, _, _, dir3, _, _) =
+            load_app_config(Some(cfg3.to_str().unwrap()), None, None).unwrap();
         assert_eq!(dir3, t3.0.join("src"));
     }
 
