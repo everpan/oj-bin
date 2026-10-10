@@ -31,6 +31,12 @@ fail、检测到 `NODE_AUTH_TOKEN` 即 fail（npm 会在 OIDC 失败时静默回
 `everpan/oj-bin`（官方强校验 `repository.url` 须与发布仓库完全一致，不一致则 publish
 失败）；`npm-publish.test.sh` 自检补到 7 例（新增三项门禁 + npm 版本边界 11.5.1 放行）。
 
+**fix（ci/smoke）**：`smoke-npm` 装包前先用 `npm view` 等 registry 可见（主包 + 本 triple
+子包，每包最多 10×20s），再 `npm i`（retry 3×30s）。原实现只有 install 的 3×20s retry：
+v0.1.59 发布时 Windows 腿连吃三个 `ETARGET`（主包 15:54:16Z 才落 registry，Windows 腿
+15:54:03Z 就开装，命中尚未同步的 CDN 节点）——这是「本 runner 视角还没这版」，不是包没
+发出去；现在先等可见再装，并把两种失败（等不到可见 vs 已可见却装不上）的报错分开。
+
 **一次性手工前置**（只有人能在 npmjs.com 做）：为 `@oj-bin/oj` 与三个
 `@oj-bin/oj-<triple>` **各配一遍** trusted publisher（per-package）——GitHub Actions /
 `everpan/oj-bin` / workflow `release.yml` / 允许 `npm publish`；配置保存后 npm 不校验，
