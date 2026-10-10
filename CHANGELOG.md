@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.58（未打标签）
+## v0.1.58
 
 **breaking（config/serve）**：站点配置删除旧键，升级为顶层 `mounts:` 扁平挂载表——
 一行 = 一个 URL 前缀 + 一个目录（api/web 恰好其一），支持多 API 目录与多静态站点。
