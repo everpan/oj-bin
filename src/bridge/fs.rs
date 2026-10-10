@@ -277,10 +277,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("NotCapable"), "{e}");
-        let abs = format!(
-            r#"(async () => {{ await fs.readTextFile("{}"); }})();"#,
-            outside.join("secret.txt").display()
-        );
+        // 正向斜杠嵌入 JS：反斜杠会被当转义吃掉（\r→CR、\U→U），路径被毁后
+        // 落回 jail 内，断言拿到的就是 deno 的 invalid_argument 而非 NotCapable。
+        let abs_path = outside
+            .join("secret.txt")
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let abs = format!(r#"(async () => {{ await fs.readTextFile("{abs_path}"); }})();"#);
         let e = b.run_with(&abs, Default::default()).await.unwrap_err();
         assert!(e.to_string().contains("NotCapable"), "{e}");
     }
