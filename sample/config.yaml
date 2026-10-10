@@ -2,11 +2,21 @@ secrets:
   private_key_path: ./config/keys/secrets-private.pem   # 相对 config 目录；**只放部署机**
   public_key_path:  ./config/keys/secrets-public.pem    # 可选，`oj secret seal` 缺省取它
 
+# 挂载表（v0.1.58）：一行 = 一个 URL 前缀 + 一个目录（api/web 恰好其一）。
+# 旧 server.api_prefix / app_path / static_sites / app_spa_fallback 已删除——
+# 挂载自带完整 prefix，写什么 URL 就是什么。
+mounts:
+  - prefix: "/v1/api"    # API 挂载：/v1/api/<module>/...（与既往部署同形）
+    api: "src"           # dev：服务 src（TS 按需转译）；release 用 --api-path sample/dist 覆盖，
+                         # 或把本条改为 api: "dist"（目录即模式：含 manifests.yaml → release）
+  - prefix: "/"          # web 挂载（原 server.app_path: dist）：API 未命中的 GET/HEAD 落静态；
+    web: "dist"          # 目录须存在（新克隆先 `oj build`，或删除本条只跑 API）
+    # spa: true          # SPA 深链接回落（默认 false）：未命中 + 无扩展名 + Accept html
+                         # → index.html。api 挂载（更长前缀）下的 404 不受影响。
+
 server:
   host: "localhost"
   port: 9778
-  api_prefix: "/v1/api"   # API 基础路由前缀（CLI -b 显式给出时覆盖；旧键名 base 仍兼容）
-  # app_prefix: "/"       # 静态站点前缀（默认 / = 全路径兜底）；如 "/site" 则仅 /site/* 落静态
   # migrate_on_start: auto   # 迁移门禁（§4.6）：auto（dev 默认，启动即应用）|
                      # verify（release 默认，账本落后拒启，先 oj migrate）| off
   # ownership_guard: warn    # 表归属守卫（§5.3）：warn（默认，跨模块表访问仅告警）|
@@ -14,12 +24,8 @@ server:
                      # sample 各模块 tables/deps 已声明齐（oj build --check 全绿），
                      # 演示取 deny：跨模块取数必须显式 deps（P3 评估结论）。
   ownership_guard: deny
-  app_path: "dist"   # 静态站点根（相对本文件目录；省略 = 不开静态服务；CLI --app-path 可覆盖）
-  # app_spa_fallback: false   # v0.1.20：SPA 单页回落（默认 false）——开启后，未命中文件的
-                     #  无扩展名 HTML 请求（Accept 含 text/html 或缺失）回落到 index.html，
-                     #  深链刷新可用；API 前缀（api_prefix/app_prefix）下的 404 不受影响。
-  # html_meta: "__meta"       # v0.1.20：每路由 HTML 元信息目录名（相对 app_path；默认关闭）。
-                     #  开启后请求 /a/b/ 时读 <app_path>/__meta/a/b.json 注入 <title> 等；
+  # html_meta: "__meta"       # v0.1.20：每路由 HTML 元信息目录名（相对各 web 挂载根；默认关闭）。
+                     #  开启后请求 /a/b/ 时读 <挂载根>/__meta/a/b.json 注入 <title> 等；
                      #  该目录自身不对外公开（直接访问返回 404）。
   # html_meta_handler: "/v1/api/html-meta"   # v0.1.25：**动态** meta 源（业务 handler 的路由路径）。
                      #  送静态 HTML 前内部派发它（GET，原请求路径进 ?path=），用返回的 JSON 注入

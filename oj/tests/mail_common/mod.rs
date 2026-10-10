@@ -193,13 +193,18 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
         n.saturating_sub(3600),
         n + 365 * 86_400,
     );
+    // v0.1.58：api 目录进挂载表（from_config 只看 mounts）。
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/v1/api".into(),
+        api: Some(src.to_string_lossy().into_owned()),
+        web: None,
+        spa: None,
+        headers: Default::default(),
+    });
     oj::app::App::from_config(
         cfg,
         &serde_json::Value::Null,
         &t.0,
-        src.to_path_buf(),
-        "/v1/api".into(),
-        true,
         false,
         &oj::app::ResourceProfiles::default(),
     )

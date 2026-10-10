@@ -37,6 +37,9 @@ pub struct TestArgs {
     pub config: Option<String>,
     /// None → 用 config 的 server.base（默认 /v1/api）。
     pub base: Option<String>,
+    /// 选择挂载（v0.1.58 `--site <prefix>`）：命中 api 挂载 → 用其目录与前缀；
+    /// 命中 web 挂载 → Err 并列出全部 api prefix；与 `-d`/`-b` 互斥。
+    pub site: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。默认 "tests"。
@@ -94,9 +97,11 @@ pub struct BuildArgs {
 pub struct OpenApiArgs {
     /// 配置文件路径（db/插件/路由前缀来源）；缺省自动搜索
     pub config: Option<String>,
+    /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d`/`-b` 互斥
+    pub site: Option<String>,
     /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
     pub dir: Option<String>,
-    /// API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
+    /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
     pub base: Option<String>,
     /// 只校验漂移：生成物与已提交 openapi.json 比对，不一致非零退出（CI 门禁）
     pub check: bool,
@@ -105,6 +110,8 @@ pub struct OpenApiArgs {
 }
 pub struct MigrateArgs {
     pub config: Option<String>,
+    /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
+    pub site: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
@@ -118,6 +125,8 @@ pub struct MigrateArgs {
 /// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`。
 pub struct FixtureArgs {
     pub config: Option<String>,
+    /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
+    pub site: Option<String>,
     pub dir: Option<String>,
     /// 只灌指定模块。
     pub module: Option<String>,
@@ -194,6 +203,8 @@ pub struct ExecArgs {
     /// 进入交互式 REPL（逐行读 stdin 求值）。与 `file` / `--code` 互斥。
     pub repl: bool,
     pub config: Option<String>,
+    /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
+    pub site: Option<String>,
     pub dir: Option<String>,
     pub db: Option<String>,
     /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast。
@@ -294,6 +305,9 @@ enum Commands {
         /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
         #[arg(short, long)]
         config: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录；与 -d 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
@@ -311,9 +325,13 @@ enum Commands {
         /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
         #[arg(short, long)]
         config: Option<String>,
-        /// API 基础路由前缀；缺省用 config 的 server.base（默认 /v1/api）
+        /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录与前缀；
+        /// 命中 web 挂载 → 报错并列出全部 api prefix；与 -d/-b 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
@@ -385,6 +403,9 @@ enum Commands {
         /// 配置文件路径（缺省自动搜索；未找到用内置默认值——纯计算脚本无需配置）
         #[arg(short, long)]
         config: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录；与 -d 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
         /// 服务目录（schema 白名单来源）；缺省自动探测（src 优先 dist 次之）
         #[arg(short, long)]
         dir: Option<String>,
@@ -428,10 +449,13 @@ enum Commands {
         /// 配置文件路径（db/插件/路由前缀来源）；缺省自动搜索，未找到用内置默认值
         #[arg(short, long)]
         config: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录与前缀；与 -d/-b 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
         /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
         #[arg(short, long)]
         dir: Option<String>,
-        /// API 基础路由前缀；缺省用 config 的 server.api_prefix（默认 /v1/api）
+        /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
         /// 只校验漂移：生成物与已提交 openapi.json 比对，不一致非零退出（CI 门禁）
@@ -457,6 +481,9 @@ pub enum TestSub {
         /// 配置文件路径（缺省自动搜索：CWD 逐级向上 config.yaml，兜底 $HOME/.oj/config.yaml）
         #[arg(short, long)]
         config: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录；与 -d 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
         /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
         #[arg(short, long)]
         dir: Option<String>,
@@ -568,6 +595,7 @@ fn to_command(cli: Cli) -> Command {
         Commands::Test {
             config,
             base,
+            site,
             dir,
             tests,
             format,
@@ -585,6 +613,7 @@ fn to_command(cli: Cli) -> Command {
             None => Command::Test(TestCmd::Run(Box::new(TestArgs {
                 config,
                 base,
+                site,
                 dir,
                 tests,
                 format,
@@ -600,11 +629,13 @@ fn to_command(cli: Cli) -> Command {
             }))),
             Some(TestSub::Fixture {
                 config,
+                site,
                 dir,
                 db,
                 module,
             }) => Command::Test(TestCmd::Fixture(FixtureArgs {
                 config,
+                site,
                 dir,
                 module,
                 db,
@@ -612,12 +643,14 @@ fn to_command(cli: Cli) -> Command {
         },
         Commands::Migrate {
             config,
+            site,
             dir,
             db,
             baseline,
             module,
         } => Command::Migrate(MigrateArgs {
             config,
+            site,
             dir,
             baseline,
             module,
@@ -640,6 +673,7 @@ fn to_command(cli: Cli) -> Command {
             code,
             repl,
             config,
+            site,
             dir,
             db,
             redis,
@@ -655,6 +689,7 @@ fn to_command(cli: Cli) -> Command {
             code,
             repl,
             config,
+            site,
             dir,
             db,
             redis,
@@ -668,12 +703,14 @@ fn to_command(cli: Cli) -> Command {
         }),
         Commands::OpenApi {
             config,
+            site,
             dir,
             base,
             check,
             out,
         } => Command::OpenApi(OpenApiArgs {
             config,
+            site,
             dir,
             base,
             check,

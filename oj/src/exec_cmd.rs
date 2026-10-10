@@ -53,7 +53,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         (None, None, false) => ExecTarget::Repl,
     };
     let (cfg, top, config_dir, dir, _ts, base) =
-        load_app_config(a.config.as_deref(), a.dir.as_deref(), None)?;
+        load_app_config(a.config.as_deref(), a.site.as_deref(), a.dir.as_deref(), None)?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
     // 缺省 default；未声明 fail-fast（装配层统一校验）。
@@ -90,8 +90,16 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                 .build()
                 .map_err(|e| format!("exec runtime: {e}"))?;
             rt.block_on(async move {
-                let backend =
-                    assemble_backend(&cfg, &top, &config_dir, &dir, &base, true, &profiles).await?;
+                let backend = assemble_backend(
+                    &cfg,
+                    &top,
+                    &config_dir,
+                    &[(dir.clone(), true)],
+                    &base,
+                    true,
+                    &profiles,
+                )
+                .await?;
                 // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
                 // 有意不对称）；仅 config 显式写 migrate_on_start 时执行对应项，
                 // reconcile 跟随 auto。非法值 fail-fast（与 server 文案一致）。
@@ -374,7 +382,7 @@ mod tests {
             &cfg,
             &serde_json::Value::Null,
             tmp,
-            tmp,
+            &[(tmp.to_path_buf(), true)],
             "/v1/api",
             true,
             &ResourceProfiles::default(),
@@ -477,6 +485,7 @@ mod tests {
         let script = tmp.join("s.ts");
         std::fs::write(&script, "console.log(1);").unwrap();
         let e = run(ExecArgs {
+            site: None,
             file: Some(script.to_string_lossy().into()),
             code: None,
             repl: false,
@@ -535,6 +544,7 @@ mod tests {
             ));
             std::fs::write(&p, yaml).unwrap();
             ExecArgs {
+            site: None,
                 file: Some(script.to_string_lossy().into()),
                 code: None,
                 repl: false,

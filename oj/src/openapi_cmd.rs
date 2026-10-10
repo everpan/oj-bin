@@ -204,7 +204,12 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
 /// 命令入口：生成或漂移校验。返回进程退出码（0 成功 / 1 漂移或错误）。
 pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
     let (_cfg, _top, _config_dir, dir, ts, base) =
-        crate::serve_cmd::load_app_config(a.config.as_deref(), a.dir.as_deref(), a.base.as_deref())
+        crate::serve_cmd::load_app_config(
+            a.config.as_deref(),
+            a.site.as_deref(),
+            a.dir.as_deref(),
+            a.base.as_deref(),
+        )
             .map_err(|e| format!("oj openapi: {e}"))?;
 
     let table = discover_routes(&dir, ts, &base)?;

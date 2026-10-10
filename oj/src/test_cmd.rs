@@ -67,8 +67,12 @@ fn collect_test_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()>
 
 /// 入口：解析配置 → 钉线程起 runtime → 跑用例 → 返回退出码。
 pub fn run(a: TestArgs) -> Result<i32, String> {
-    let (cfg, top, config_dir, dir, ts, base) =
-        load_app_config(a.config.as_deref(), a.dir.as_deref(), a.base.as_deref())?;
+    let (cfg, top, config_dir, dir, _ts, _base) = load_app_config(
+        a.config.as_deref(),
+        a.site.as_deref(),
+        a.dir.as_deref(),
+        a.base.as_deref(),
+    )?;
     // test 强依赖 api 目录（用例针对 handler；无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(
@@ -139,8 +143,7 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .build()
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
-                let app = App::from_config(cfg, &top, &config_dir, dir, base, ts, true, &profiles)
-                    .await?;
+                let app = App::from_config(cfg, &top, &config_dir, true, &profiles).await?;
                 run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })

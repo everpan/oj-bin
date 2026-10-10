@@ -279,7 +279,7 @@ async fn uc14_transpile_cache_and_hot_reload() {
     );
     cfg.db.insert("default".into(), "sqlite::memory:".into());
     std::fs::write(t.join("seed.sql"), "").unwrap();
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let before = transpile_hits();
@@ -352,7 +352,7 @@ async fn uc7_manifest_mismatch_blocks_startup() {
         "src/order/manifest.yaml",
         "name: orderr\ndesc: d\nversion: 0.1.0\n",
     )]);
-    let e = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
+    let e = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
         .await
         .err()
         .unwrap_or_default();
@@ -408,7 +408,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         "0.1.0"
     );
     // release 全链路：聚合 dist/manifests.yaml 锁定版本服务（spec §3）
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/item/3", None).await;
@@ -432,7 +432,7 @@ async fn underscore_dir_param_dev_serves_and_release_round_trips() {
         ),
     ]);
     // dev：路由表（matchit）命中 `_id_` 目录 → `{id}` 参数
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/42", None).await;
@@ -456,7 +456,7 @@ async fn underscore_dir_param_dev_serves_and_release_round_trips() {
     let routes = std::fs::read_to_string(t.join("dist/u-0.1.0/routes.js")).unwrap();
     assert!(routes.contains("\"u/{id}\""), "{routes}");
     assert!(routes.contains("\"_id_/api.js\""), "{routes}");
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/42", None).await;
@@ -503,7 +503,7 @@ async fn build_then_release_serves_end_to_end() {
     let lock = oj::manifest::load_lock(&t.join("dist/manifests.yaml")).unwrap();
     assert_eq!(lock.len(), 2, "{lock:?}");
     assert_eq!(lock["other"], "0.9.0");
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .unwrap();
     // /v1/api/user/item/3 命中 .route 行；/v1/api/other/l 命中镜像行
@@ -534,7 +534,7 @@ async fn release_mode_loads_routes_js_without_introspection() {
             "export default [ { method: \"get\", pattern: \"u/f/{id}\", file: \"f/api.js\" } ];\n",
         ),
     ]);
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/7", None).await;
@@ -550,7 +550,7 @@ async fn release_mode_loads_routes_js_without_introspection() {
 async fn release_mode_without_routes_js_fails_fast() {
     let _g = lock();
     let t = tmp_project(&[("dist/u/manifest.yaml", MANIFEST)]);
-    let e = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into(), false)
+    let e = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
         .await
         .err()
         .unwrap_or_default();
@@ -568,7 +568,7 @@ async fn uc10_404_and_405_and_traversal() {
             "export default { get() { json.ok({}); } };\n",
         ),
     ]);
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let (s, _) = req(addr, "GET", "/v1/api/none/here/", None).await;
@@ -590,7 +590,7 @@ async fn uc11_compile_error_envelope() {
         ("src/u/manifest.yaml", MANIFEST),
         ("src/u/f/api.ts", "function {{{{\nexport default {};\n"),
     ]);
-    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let (s, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
@@ -615,7 +615,7 @@ async fn uc12_timeout_408_server_survives() {
     ]);
     let mut cfg = base_cfg(&t);
     cfg.server.timeout = "300ms".into();
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     let (s, _) = req(addr, "GET", "/v1/api/u/loop/", None).await;
@@ -846,7 +846,7 @@ async fn e2e_query_builder_join_and_insert() {
         "default".into(),
         oj_plugin_ffi::path_util::sqlite_file_dsn(&t.join("db.sqlite")),
     );
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
     // insert a×2（builder DML 返回受影响行数）。
@@ -998,7 +998,7 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
     cfg.server.app_spa_fallback = true;
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     cfg.server.html_cache_control = Some("no-cache".into());
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 
@@ -1076,7 +1076,7 @@ async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
             headers: Default::default(),
         },
     ];
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 
@@ -1121,7 +1121,7 @@ async fn json_redirect_302_location_hypertext_note_end_to_end() {
         ),
     ]);
     let cfg = base_cfg(&t);
-    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 
@@ -1316,7 +1316,7 @@ async fn contract_boot(
     let mut c: Config = serde_yaml::from_str(&cfg).unwrap();
     c.server.app_path = None;
     let dir = tmp.join("src");
-    serve_cmd::start(c, tmp, dir, "/v1/api".into(), true)
+    serve_cmd::start(c, tmp, dir, "/v1/api".into())
         .await
         .unwrap()
 }
@@ -1442,7 +1442,7 @@ async fn boot_fs(readonly: bool) -> (std::net::SocketAddr, tokio::task::JoinHand
         root: "data".into(),
         readonly,
     });
-    let (addr, h) = serve_cmd::start(cfg, &tmp, tmp.join("src"), "/v1/api".into(), true)
+    let (addr, h) = serve_cmd::start(cfg, &tmp, tmp.join("src"), "/v1/api".into())
         .await
         .unwrap();
     (addr, h, tmp)
@@ -1572,7 +1572,7 @@ async fn ojinfo_global_available_in_handler() {
     let mut cfg = base_cfg(&t);
     // 敏感样式部署值：只许以「段名/键名」形态出现，值一律不得泄漏。
     cfg.vars.insert("TOKEN".into(), "secret-value-123".into());
-    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 
@@ -1636,7 +1636,7 @@ async fn generic_axis_greet_end_to_end() {
     .unwrap();
     let mut cfg = base_cfg(&t);
     cfg.plugins_dir = Some(t.join("plugins"));
-    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 
@@ -1703,7 +1703,7 @@ async fn ldap_generic_axis_end_to_end() {
         "ldap".into(),
         serde_json::json!({ "default": { "url": "ldap://127.0.0.1:1" } }),
     );
-    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+    let (addr, h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
         .unwrap();
 

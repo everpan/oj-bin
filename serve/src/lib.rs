@@ -48,36 +48,57 @@ pub enum CertificateStatus {
     Expired,
 }
 
-/// 静态站点（v0.1.27 多站点：URL 前缀 → 磁盘目录映射）。
-#[derive(Clone, Debug)]
-pub struct StaticSite {
-    /// URL 前缀（规范化为首斜杠、无尾斜杠；`/` = 兜底 catch-all）。app() 内按
-    /// 前缀长度降序（同长字符串升序）排序，请求期 find_map 取最长命中。
+/// 运行时挂载（v0.1.58 mounts 模型）：api（路由表 + dev 兜底 + 可选配对 web）
+/// 或 web（纯静态）。`prefix` 已归一（首斜杠、无尾斜杠、`/` 允许）；app() 内按
+/// 前缀长度降序（同长字符串升序）排序，请求期取最长命中，**跨挂载不回落**。
+#[derive(Clone)]
+pub enum RuntimeMount {
+    Api {
+        prefix: String,
+        table: RouteTable,
+        /// dev（ts）文件系统兜底：表 miss 时回退目录镜像；release None。
+        fallback: Option<Routes>,
+        /// 同 prefix 配对的 web 挂载（api 优先；该 web **不开** SPA 回落——
+        /// 规则 2：最长前缀命中已使拼错路径直接落 api 挂载，回落吞不掉也不该吞）。
+        web: Option<WebMount>,
+    },
+    Web(WebMount),
+}
+
+/// 静态站点（URL 前缀 → 磁盘目录映射；装配期已 canonicalize）。
+#[derive(Clone)]
+pub struct WebMount {
     pub prefix: String,
-    /// 磁盘根目录（resolve_static 在此解析；装配期已 canonicalize）。
     pub root: PathBuf,
     /// 该站点的自定义响应头（v0.1.30；覆盖全局同名头，框架自有头仍优先）。
     pub headers: Vec<(String, String)>,
+    /// SPA 深链接回落：显式 `spa: true` 才开（默认 false——静默把 404 变 200 会
+    /// 掩盖错配，继承 v0.1.20 立论）。配对 web 恒 false。
+    pub spa: bool,
+}
+
+impl RuntimeMount {
+    /// 挂载前缀（两种形态同口径）。
+    fn prefix(&self) -> &str {
+        match self {
+            RuntimeMount::Api { prefix, .. } => prefix,
+            RuntimeMount::Web(w) => &w.prefix,
+        }
+    }
 }
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
 #[derive(Clone)]
 pub struct AppState {
-    table: RouteTable,
-    /// dev（ts=true）文件系统兜底：表 miss 时回退目录镜像；release None。
-    fallback: Option<Routes>,
+    /// 挂载表（app() 内已按前缀长度降序排好，取最长命中）。空 = 全 404。
+    mounts: Vec<RuntimeMount>,
     actor: JsActor,
     /// 单请求超时（None = 不限时）。
     timeout: Option<std::time::Duration>,
-    /// 静态站点表（v0.1.27 多站点：prefix→dir 映射；app() 内已按前缀长度降序
-    /// 排好，find_map 取最长命中）。空 = 不开静态服务。
-    static_sites: Vec<StaticSite>,
-    /// 静态站点增强（v0.1.20）：SPA 深链接回落 + per-route meta 注入。
+    /// 静态增强（v0.1.25：per-route meta + HTML 缓存头；v0.1.30：全局响应头）。
     static_opts: StaticOpts,
     /// handle() 前置管线（OJ-3..5 单一扩展点；后续阶段只加字段）。
     pipeline: Pipeline,
-    /// API 基础前缀（内置 auth 路由 / 匿名路径匹配用）。
-    base: String,
     /// 当前证书状态（热加载共享，可用 RwLock 原子更新）
     pub certificate_status: Arc<RwLock<CertificateStatus>>,
     /// 证书有效期截止时间（热加载共享）
@@ -86,13 +107,10 @@ pub struct AppState {
     pub plugins: Arc<Vec<PluginInfo>>,
 }
 
-/// 静态站点增强（v0.1.20 起；v0.1.25 增动态 meta 与 HTML 缓存头）。
+/// 静态增强（v0.1.25 起：动态 meta 与 HTML 缓存头；SPA 回落已下沉 per-挂载 `spa`）。
 #[derive(Clone, Default)]
 pub struct StaticOpts {
-    /// SPA 深链接回落：静态未命中 + 无扩展名 + Accept html + 不在 api_prefix 下
-    /// → 送 root/index.html。默认 false（静默把 404 变 200 会掩盖错配，故显式开启）。
-    pub spa_fallback: bool,
-    /// 路由感知 meta 目录名（相对静态根）：送 HTML 前按路径查
+    /// 路由感知 meta 目录名（相对各 web 挂载根）：送 HTML 前按路径查
     /// `<root>/<dir>/<path>.json` 注入 `<title>`/`<meta>`。None = 不注入。
     pub html_meta: Option<String>,
     /// 动态 meta handler 路由（`server.html_meta_handler`，v0.1.25）：静态 JSON 打底后
@@ -182,16 +200,16 @@ fn segments_match(pat: &[&str], seg: &[&str]) -> bool {
 }
 
 /// 构造 axum 应用：catch-all fallback（`All("/*")` 语义）。
+/// `mounts` 按前缀长度降序（同长字符串升序）重排后入 state；每个 api 挂载注册
+/// `{prefix}/health` 与 `{prefix}/plugins` 两条真实路由（公共基础设施端点：不走
+/// Bearer 守卫 / 证书 GET 门禁，匿名可访问，保留路径遮蔽同名业务路由）。
+/// 与 v0.1.57 零 URL 变化：今日即注册在 `{base}/health` 等，base = api 挂载 prefix。
 #[allow(clippy::too_many_arguments)]
 pub fn app(
-    base: &str,
-    dir: impl Into<PathBuf>,
-    ts: bool,
-    table: RouteTable,
+    mounts: Vec<RuntimeMount>,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
-    static_sites: Vec<StaticSite>,
-    // static_opts：静态站点两条 v0.1.20 增强（SPA 回落 / per-route meta）。
+    // static_opts：per-route meta + HTML 缓存头 + 全局响应头（SPA 回落已下沉挂载 `spa`）。
     static_opts: StaticOpts,
     pipeline: Pipeline,
     certificate_status: Arc<RwLock<CertificateStatus>>,
@@ -200,15 +218,20 @@ pub fn app(
     // CORS（v0.1.35）：段存在即启用；None = 不挂层（行为完全不变）。
     cors: Option<CorsCfg>,
 ) -> Router {
-    let dir = dir.into();
-    let base = base.trim_end_matches('/');
-    let health_path = format!("{base}/health");
-    // 公共基础设施端点（先于 fallback 的真实 route）：不走 Bearer 守卫 / 证书 GET 门禁，
-    // 与 /health 同位（匿名可访问），保留路径遮蔽同名业务路由。
-    let plugins_path = format!("{base}/plugins");
-    let mut router = Router::new()
-        .route(&health_path, axum::routing::get(health_handler))
-        .route(&plugins_path, axum::routing::get(plugins_handler))
+    let mut router = Router::new();
+    for m in mounts.iter().filter(|m| matches!(m, RuntimeMount::Api { .. })) {
+        let p = m.prefix().trim_end_matches('/');
+        router = router
+            .route(
+                &format!("{p}/health"),
+                axum::routing::get(health_handler),
+            )
+            .route(
+                &format!("{p}/plugins"),
+                axum::routing::get(plugins_handler),
+            );
+    }
+    router = router
         .fallback(any(handle))
         // 请求日志中间件（method/path/status/耗时 → 文件日志 + stderr）。
         .layer(axum::middleware::from_fn(crate::logging::log_requests));
@@ -218,14 +241,11 @@ pub fn app(
         router = router.layer(build_cors_layer(&cfg));
     }
     router.with_state(AppState {
-        table,
-        fallback: ts.then(|| Routes::new(base, dir, ts)),
+        mounts: sorted_mounts(mounts),
         actor,
         timeout,
-        static_sites: sorted_sites(static_sites),
         static_opts,
         pipeline,
-        base: base.to_string(),
         certificate_status,
         certificate_valid_until,
         plugins,
@@ -283,16 +303,17 @@ fn build_cors_layer(cfg: &CorsCfg) -> CorsLayer {
     layer
 }
 
-/// 站点表排序（v0.1.27 多站点）：前缀长度降序（最长命中优先），同长按字符串升序保确定性。
-/// 归 app() 独家负责——装配层（oj/src/app.rs）只归一/去重，不排序。
-fn sorted_sites(mut sites: Vec<StaticSite>) -> Vec<StaticSite> {
-    sites.sort_by(|a, b| {
-        b.prefix
+/// 挂载表排序（v0.1.58 mounts 模型，语义沿用 v0.1.27 多站点）：前缀长度降序
+/// （最长命中优先），同长按字符串升序保确定性。归 app() 独家负责——装配层
+/// （oj/src/app.rs）只归一/去重/配对，不排序。
+fn sorted_mounts(mut mounts: Vec<RuntimeMount>) -> Vec<RuntimeMount> {
+    mounts.sort_by(|a, b| {
+        b.prefix()
             .len()
-            .cmp(&a.prefix.len())
-            .then_with(|| a.prefix.cmp(&b.prefix))
+            .cmp(&a.prefix().len())
+            .then_with(|| a.prefix().cmp(b.prefix()))
     });
-    sites
+    mounts
 }
 
 /// 健康检查：返回服务状态与证书状态（供监控轮询）。
@@ -341,48 +362,13 @@ async fn plugins_handler(State(st): State<AppState>) -> Response {
     r
 }
 
-/// 绑定监听并服务。
-#[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    addr: std::net::SocketAddr,
-    base: &str,
-    dir: impl Into<PathBuf>,
-    ts: bool,
-    table: RouteTable,
-    actor: JsActor,
-    timeout: Option<std::time::Duration>,
-    static_sites: Vec<StaticSite>,
-    static_opts: StaticOpts,
-    pipeline: Pipeline,
-) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_with_listener(
-        listener,
-        base,
-        dir,
-        ts,
-        table,
-        actor,
-        timeout,
-        static_sites,
-        static_opts,
-        pipeline,
-        None,
-    )
-    .await
-}
-
 /// 已绑定监听上服务（测试/T11：先 bind 端口 0 再读 local_addr）。
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
-    base: &str,
-    dir: impl Into<PathBuf>,
-    ts: bool,
-    table: RouteTable,
+    mounts: Vec<RuntimeMount>,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
-    static_sites: Vec<StaticSite>,
     static_opts: StaticOpts,
     pipeline: Pipeline,
     cors: Option<CorsCfg>,
@@ -390,13 +376,9 @@ pub async fn serve_with_listener(
     serve_router(
         listener,
         app(
-            base,
-            dir,
-            ts,
-            table,
+            mounts,
             actor,
             timeout,
-            static_sites,
             static_opts,
             pipeline,
             Arc::new(RwLock::new(CertificateStatus::Valid)),
@@ -431,17 +413,6 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
     // Accept 判据先算：`headers` 稍后被 run 闭包整体捕获（SPA 回落要用）。
     let accept_html = wants_html(&headers);
 
-    // 请求体按路径分档限长（v0.1.30 取代全局 DefaultBodyLimit 层）：blob 直传 PUT
-    // 用 blob_upload_max（默认 1 GiB），其余维持 2x max_upload 硬顶——**不能**把全局
-    // 层抬到 1 GiB（handler 路由会被动接受巨体缓冲，内存 DoS 面扩大）。超限裸 413，
-    // 与旧 DefaultBodyLimit 行为逐字节一致。
-    // v0.1.38（ABI 10）：顶部不再无条件 `to_bytes` 整段缓冲——blob 直传腿与
-    // multipart 腿改为**流式**消费（put_stream_* / multer 流式解析，内存恒定），
-    // 其余腿（非 multipart 的小体）在 run_route 内缓冲，上限语义不变。
-    let is_blob_put = verb == "PUT"
-        && st.pipeline.blob.is_some()
-        && uri.path().starts_with(&format!("{}/blob/", st.base));
-
     // Certificate validation: restrict GET requests when certificate is expired or in grace period
     if verb == "GET" {
         match &*st
@@ -462,22 +433,77 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
         }
     }
 
-    // 内置 blob 下载路由（{base}/blob/{key}，公开 GET，先于路由表，也先于前置管线）。
+    // 挂载分发（v0.1.58 mounts 模型）：最长前缀命中（表已按前缀长度降序排序），
+    // **跨挂载不回落**；未命中任何挂载 → 404。请求体按路径分档限长的说明
+    // （v0.1.30/v0.1.38）随执行腿下移：blob 直传腿流式消费（内存恒定），其余腿在
+    // run_route 内缓冲（上限 2x max_upload，超 max_upload 信封 413、超 2x 裸 413）。
+    let Some((mount, rel)) = st
+        .mounts
+        .iter()
+        .find_map(|m| strip_app_prefix(m.prefix(), uri.path()).map(|r| (m, r)))
+    else {
+        return fail_response(404, "no route matched");
+    };
+    match mount {
+        RuntimeMount::Api {
+            prefix,
+            table,
+            fallback,
+            web,
+        } => {
+            handle_api(
+                &st,
+                prefix,
+                table,
+                fallback.as_ref(),
+                web.as_ref(),
+                rel,
+                verb,
+                &uri,
+                &headers,
+                body,
+                accept_html,
+            )
+            .await
+        }
+        RuntimeMount::Web(w) => serve_web(&st, w, rel, verb, accept_html).await,
+    }
+}
+
+/// api 挂载执行腿：blob 下载/直传 → 路由表 → dev 兜底 → 同 prefix 配对 web（无 SPA）
+/// → 404 JSON。前置管线的 rel path = 剥命中挂载 prefix（多 api 挂载各自对齐匿名面）。
+#[allow(clippy::too_many_arguments)]
+async fn handle_api(
+    st: &AppState,
+    prefix: &str,
+    table: &RouteTable,
+    fallback: Option<&Routes>,
+    web: Option<&WebMount>,
+    rel: &str,
+    verb: &str,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    accept_html: bool,
+) -> Response {
+
+    // 内置 blob 下载路由（{prefix}/blob/{key}，公开 GET，先于路由表，也先于前置管线）。
     //
-    // **与匿名路径的耦合（互指注释）**：本分支（以及下方静态站点兜底）在 auth/tenant
+    // **与匿名路径的耦合（互指注释）**：本分支（以及配对 web 静态腿）在 auth/tenant
     // 前置管线**之前**直接 return，因此 `anonymous_paths`（`Pipeline.tenant_anon` /
     // `AuthGuard::verify`）对它们**不产生任何效力**。启动期的匿名路径迁移 WARN
     // （`oj/src/app.rs` 的 `warn_legacy_tail_wildcards`）正是靠这一点把「影响面」收窄到
     // 「已注册路由」——**若把这两处提前返回改为走前置管线，或让它们咨询匿名表，必须同步
     // 该判定的前提**，否则 WARN 会静默失准。
-    // v0.1.25 补第三处**同一前提**的分支：静态兜底内部派发 `server.html_meta_handler`
-    // （见 `dispatch_meta_handler`）同样不经守卫（页面请求带不了 Bearer），故该 handler
-    // **不必**进 `anonymous_paths`；它被外部直接访问时仍受守卫约束（两侧口径不冲突）。
+    // v0.1.25 补第三处**同一前提**的分支：配对 web 的 meta 注入内部派发
+    // `server.html_meta_handler`（见 `dispatch_meta_handler`）同样不经守卫（页面请求
+    // 带不了 Bearer），故该 handler **不必**进 `anonymous_paths`；它被外部直接访问时
+    // 仍受守卫约束（两侧口径不冲突）。
     // v0.1.30 补第四处**例外**：下方 PUT（直传上传）走守卫 + 租户准入（写面不能公开），
     // 只豁免**读取**语义不变。
     if verb == "GET"
         && let Some(blob) = st.pipeline.blob.as_ref()
-        && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
+        && let Some(key) = uri.path().strip_prefix(&format!("{prefix}/blob/"))
         && let Some(key) = decode_blob_key(key)
     {
         let mut r = match blob.serve(&key).await {
@@ -540,33 +566,33 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
         apply_custom_headers(&mut r, &st.static_opts.response_headers);
         return r;
     }
-    // blob 直传上传（v0.1.30）：`PUT {base}/blob/{key}`。写面必须过守卫（GET 公开是
+    // blob 直传上传（v0.1.30）：`PUT {prefix}/blob/{key}`。写面必须过守卫（GET 公开是
     // 读语义；上传公开 = 任意人写你的存储）。经 admit()（鉴权 + 租户，同 run_route 语义），
     // 体积上限走 blob_upload_max 档。不经 JsActor：无 handler 30s timeout。
     // anonymous_paths 可用 `/blob/**` 显式豁免（自甘风险）。
     // v0.1.38（ABI 10）：body 流式 `put_stream_open/chunk/finish` 直落后端（local 落盘 /
     // s3 multipart），内存恒定；后端不支持流式（put_stream_open Err）回落整段缓冲 put
     // （上限 blob_upload_max，语义与旧版一致）。
-    if is_blob_put
+    if verb == "PUT"
         && let Some(blob) = st.pipeline.blob.as_ref()
-        && let Some(key) = uri.path().strip_prefix(&format!("{}/blob/", st.base))
+        && let Some(key) = uri.path().strip_prefix(&format!("{prefix}/blob/"))
         && let Some(key) = decode_blob_key(key)
     {
         let path_no_base = format!("/blob/{key}");
-        if let Err(resp) = admit(&st, &headers, verb, Some(&path_no_base)) {
+        if let Err(resp) = admit(st, headers, verb, Some(&path_no_base)) {
             return *resp;
         }
-        return blob_put_direct(&st, blob.clone(), &key, &headers, body).await;
+        return blob_put_direct(st, blob.clone(), &key, headers, body).await;
     }
-    // 去 base 路径（鉴权匿名匹配用；不在 base 下 → None = 不设防）。
+    // 去 prefix 路径（鉴权匿名匹配用；不在 prefix 下 → None = 不设防）。
     let path_no_base = crate::routes::normalize(uri.path())
-        .and_then(|p| p.strip_prefix(st.base.as_str()).map(|s| s.to_string()));
+        .and_then(|p| p.strip_prefix(prefix).map(|s| s.to_string()));
     if let Some(path) = crate::routes::normalize(uri.path()) {
-        match st.table.lookup(&path, verb) {
+        match table.lookup(&path, verb) {
             Lookup::Hit { file, params } => {
                 return run_route(
-                    &st,
-                    &headers,
+                    st,
+                    headers,
                     body,
                     verb,
                     parse_query(uri.query()),
@@ -585,14 +611,14 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
         }
     }
     // dev 兜底：目录镜像（挂 .route 的方法已被替换，不得复活）。
-    if let Some((file, params)) = st.fallback.as_ref().and_then(|fb| fb.resolve(uri.path())) {
+    if let Some((file, params)) = fallback.and_then(|fb| fb.resolve(uri.path())) {
         // 表内路径经过 canonicalize（macOS /var ↔ /private/var），对齐后再比对
         let file = file.canonicalize().unwrap_or(file);
         match crate::routes::method_name(verb) {
-            Some(m) if !st.table.is_replaced(&file, m) => {
+            Some(m) if !table.is_replaced(&file, m) => {
                 return run_route(
-                    &st,
-                    &headers,
+                    st,
+                    headers,
                     body,
                     verb,
                     parse_query(uri.query()),
@@ -607,38 +633,48 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
             None => return fail_response(405, &format!("method {verb} not mapped")),
         }
     }
-    // 静态站点兜底（v0.1.27 多站点：prefix→dir，最长前缀命中——表已在 app() 内
-    // 按前缀长度降序）：API 优先，GET/HEAD only。命中站点内未命中 → **仅该站**
-    // SPA 回落，不跨站；前缀外路径不走静态。
-    if matches!(verb, "GET" | "HEAD")
-        && let Some((site, rel_path)) = st
-            .static_sites
-            .iter()
-            .find_map(|s| strip_app_prefix(&s.prefix, uri.path()).map(|r| (s, r)))
+    // 同 prefix 配对 web（规则 2）：api 优先已由顺序保证；该 web **不开** SPA 回落
+    // （最长前缀命中已使拼错路径直接落 api 挂载，回落吞不掉也不该吞）。
+    if let Some(w) = web {
+        return serve_web(st, w, rel, verb, accept_html).await;
+    }
+    fail_response(404, "no route matched")
+}
+
+/// web 挂载静态服务（v0.1.58 自 handle() 静态兜底抽出）：仅 GET/HEAD（其余 405，
+/// 规则 4）；`spa: true` 且未命中文件 + 无扩展名 + Accept html → 回落该挂载根
+/// index.html（默认 false：静默把 404 变 200 会掩盖错配，继承 v0.1.20 立论）。
+/// 跨挂载不回落：未命中即 404——旧版的 `path_under_base` 排除检查结构性消亡
+/// （api 前缀路径恒最长命中 api 挂载，走不到 web 腿；配对 web 又被规则 2 禁 spa）。
+async fn serve_web(
+    st: &AppState,
+    w: &WebMount,
+    rel_path: &str,
+    verb: &str,
+    accept_html: bool,
+) -> Response {
+    if !matches!(verb, "GET" | "HEAD") {
+        return fail_response(
+            405,
+            &format!("method {verb} not allowed (web mounts serve GET/HEAD only)"),
+        );
+    }
+    let meta = st.static_opts.html_meta.as_deref();
+    if let Some(file) = resolve_static(&w.root, rel_path, meta)
+        && let Ok(body) = tokio::fs::read(&file).await
     {
-        let root = &site.root;
-        let meta = st.static_opts.html_meta.as_deref();
-        if let Some(file) = resolve_static(root, rel_path, meta)
-            && let Ok(body) = tokio::fs::read(&file).await
-        {
-            let mut r = static_page(&st, root, rel_path, &file, body).await;
-            apply_custom_headers(&mut r, &site_headers(&st, site));
+        let mut r = static_page(st, &w.root, rel_path, &file, body).await;
+        apply_custom_headers(&mut r, &site_headers(st, w));
+        return r;
+    }
+    // SPA 深链接回落（挂载 `spa: true`，v0.1.20 语义）：未命中 + 无扩展名 +
+    // Accept html → 送 **本挂载** root/index.html。
+    if w.spa && accept_html && !has_extension(rel_path) {
+        let idx = w.root.join("index.html");
+        if let Ok(body) = tokio::fs::read(&idx).await {
+            let mut r = static_page(st, &w.root, rel_path, &idx, body).await;
+            apply_custom_headers(&mut r, &site_headers(st, w));
             return r;
-        }
-        // SPA 深链接回落（server.app_spa_fallback，v0.1.20）：未命中 + 无扩展名 +
-        // Accept html + **不在 api_prefix 下**（否则拼错的 API 路径会被 index.html
-        // 吞成 200，掩盖真实 404）→ 送 **本站点** root/index.html。
-        if st.static_opts.spa_fallback
-            && accept_html
-            && !has_extension(rel_path)
-            && !path_under_base(rel_path, &st.base)
-        {
-            let idx = root.join("index.html");
-            if let Ok(body) = tokio::fs::read(&idx).await {
-                let mut r = static_page(&st, root, rel_path, &idx, body).await;
-                apply_custom_headers(&mut r, &site_headers(&st, site));
-                return r;
-            }
         }
     }
     fail_response(404, "no route matched")
@@ -860,12 +896,6 @@ fn has_extension(rel_path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 是否落在 API 前缀下（回落须排除，防吞掉 404）。
-fn path_under_base(rel_path: &str, base: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    !base.is_empty() && (rel_path == base || rel_path.starts_with(&format!("{base}/")))
-}
-
 /// 静态响应（v0.1.20 起；v0.1.25 增动态 meta + HTML 缓存头）：HTML 走 per-route meta
 /// 注入（静态 JSON 打底 → 动态 handler 覆盖），其余原样；什么都不配时逐字节同旧行为。
 ///
@@ -949,7 +979,21 @@ async fn dispatch_meta_handler(
         .ok_or("not configured")?;
     let norm = crate::routes::normalize(handler)
         .ok_or_else(|| format!("{handler:?} 不是合法路径（须以 / 开头）"))?;
-    let (file, params) = match st.table.lookup(&norm, "GET") {
+    // 按前缀定挂载（v0.1.58 多 api 挂载）：handler 是带挂载前缀的完整路由路径，
+    // 取其所属 api 挂载的路由表查找。
+    let table = st
+        .mounts
+        .iter()
+        .find_map(|m| match m {
+            RuntimeMount::Api { prefix, table, .. }
+                if strip_app_prefix(prefix, &norm).is_some() =>
+            {
+                Some(table)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{handler:?} 不在任何 api 挂载前缀下（拼错了？）"))?;
+    let (file, params) = match table.lookup(&norm, "GET") {
         Lookup::Hit { file, params } => (file, params),
         Lookup::Conflict(m) => return Err(format!("{handler:?} 路由冲突：{m}")),
         Lookup::MethodNotAllowed => return Err(format!("{handler:?} 未映射 GET 方法")),
@@ -1582,7 +1626,7 @@ fn apply_custom_headers(r: &mut Response, extra: &[(String, String)]) {
 }
 
 /// 站点级响应头 = 全局默认 + 该站点覆盖（同名替换值，不删全局其它头）。
-fn site_headers<'a>(st: &'a AppState, site: &'a StaticSite) -> Vec<(String, String)> {
+fn site_headers<'a>(st: &'a AppState, site: &'a WebMount) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = st.static_opts.response_headers.clone();
     for (k, v) in &site.headers {
         out.retain(|(ek, _)| ek != k);
@@ -1946,14 +1990,11 @@ pub(crate) mod tests {
     // Helper for tests: create a minimal AppState
     pub(crate) fn dummy_app_state() -> AppState {
         AppState {
-            table: RouteTable::default(),
-            fallback: None,
+            mounts: Vec::new(),
             actor: make_actor(PathBuf::from("."), false),
             timeout: None,
-            static_sites: Vec::new(),
             static_opts: StaticOpts::default(),
             pipeline: Pipeline::default(),
-            base: "/v1/api".to_string(),
             certificate_status: Arc::new(RwLock::new(CertificateStatus::Valid)),
             certificate_valid_until: Arc::new(RwLock::new(None)),
             plugins: Arc::default(),
@@ -2049,16 +2090,18 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         let table = build_table(&dir, ts, base);
         let base = base.to_string();
+        let mounts = vec![RuntimeMount::Api {
+            prefix: base.clone(),
+            table,
+            fallback: ts.then(|| Routes::new(&base, dir.clone(), ts)),
+            web: None,
+        }];
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
-                &base,
-                dir.clone(),
-                ts,
-                table,
+                mounts,
                 make_actor(dir, ts),
                 timeout,
-                Vec::new(),
                 StaticOpts::default(),
                 pipeline,
                 None,
@@ -2108,16 +2151,18 @@ pub(crate) mod tests {
         });
         let base = base.to_string();
         pipeline.blob = Some(blob);
+        let mounts = vec![RuntimeMount::Api {
+            prefix: base.clone(),
+            table,
+            fallback: Some(Routes::new(&base, dir.clone(), true)),
+            web: None,
+        }];
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
-                &base,
-                dir.clone(),
-                true,
-                table,
+                mounts,
                 actor,
                 None,
-                Vec::new(),
                 StaticOpts::default(),
                 pipeline,
                 None,
@@ -3363,45 +3408,57 @@ pub(crate) mod tests {
     // ----- 静态站点（server.app_path）-----
 
     /// 返回 (addr, 夹具)：夹具须在测试内持有（TempRoutes Drop 会删目录）。
+    /// 根 `/` 站；`spa` 即挂载显式 `spa: true`（默认 false）。
     async fn spawn_static(
         api: &[(&str, &str)],
+        spa: bool,
         site: &[(&str, &str)],
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, TempRoutes)) {
-        let (addr, (t, keeps)) = spawn_static_sites(api, &[("/", site.to_vec())], opts).await;
+        let (addr, (t, keeps)) =
+            spawn_static_sites(api, &[("/", spa, site.to_vec())], opts).await;
         (addr, (t, keeps.into_iter().next().unwrap()))
     }
 
-    /// 多站点版（v0.1.27）：sites = [(prefix, files)]，按给定顺序装配（app() 内重排）。
+    /// 多站点版（v0.1.27 语义沿用 v0.1.58 挂载模型）：sites = [(prefix, files, spa)]。
+    /// 另挂一条空 api 挂载 /v1/api（表空，仅为最长前缀路由提供 api 面）。
     async fn spawn_static_sites(
         api: &[(&str, &str)],
-        sites: &[(&str, Vec<(&str, &str)>)],
+        sites: &[(&str, bool, Vec<(&str, &str)>)],
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
         let t = routes(api);
-        let keeps: Vec<TempRoutes> = sites.iter().map(|(_, f)| routes(f)).collect();
-        let static_sites: Vec<StaticSite> = sites
+        let keeps: Vec<TempRoutes> = sites
+            .iter()
+            .map(|(_, _, f)| routes(f))
+            .collect();
+        let mut mounts: Vec<RuntimeMount> = sites
             .iter()
             .zip(&keeps)
-            .map(|((prefix, _), k)| StaticSite {
-                prefix: prefix.to_string(),
-                root: k.0.clone(),
-                headers: Vec::new(),
+            .map(|((prefix, spa, _), k)| {
+                RuntimeMount::Web(WebMount {
+                    prefix: prefix.to_string(),
+                    root: k.0.clone(),
+                    headers: Vec::new(),
+                    spa: *spa,
+                })
             })
             .collect();
+        mounts.push(RuntimeMount::Api {
+            prefix: "/v1/api".to_string(),
+            table: RouteTable::default(),
+            fallback: None,
+            web: None,
+        });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (dir, table) = (t.0.clone(), build_table(&t.0, true, "/v1/api"));
+        let dir = t.0.clone();
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
-                "/v1/api",
-                dir.clone(),
-                true,
-                table,
+                mounts,
                 make_actor(dir, true),
                 None,
-                static_sites,
                 opts,
                 Pipeline::default(),
                 None,
@@ -3419,6 +3476,7 @@ pub(crate) mod tests {
                 "u/f/api.ts",
                 "export default { get() { json.ok({ api: true }); } };",
             )],
+            false,
             &[
                 ("index.html", "<h1>hi</h1>"),
                 ("css/app.css", "body{}"),
@@ -3458,11 +3516,9 @@ pub(crate) mod tests {
     async fn spa_fallback_serves_index_for_deep_link_only() {
         let (addr, _keep) = spawn_static(
             &[],
+            true,
             &[("index.html", "<html><head></head><body>app</body></html>")],
-            StaticOpts {
-                spa_fallback: true,
-                ..Default::default()
-            },
+            StaticOpts::default(),
         )
         .await;
         // 深链接 → index.html（curl 默认 Accept: */* 也算 html）
@@ -3483,7 +3539,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn spa_fallback_off_keeps_404() {
         let (addr, _keep) =
-            spawn_static(&[], &[("index.html", "app")], StaticOpts::default()).await;
+            spawn_static(&[], false, &[("index.html", "app")], StaticOpts::default()).await;
         let r = raw_http(addr, &get(addr, "/space/issues/abc")).await;
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
@@ -3494,6 +3550,7 @@ pub(crate) mod tests {
     async fn html_meta_injects_escaped_tags_and_hides_meta_dir() {
         let (addr, _keep) = spawn_static(
             &[],
+            true,
             &[
                 ("index.html", "<html><head></head><body>hi</body></html>"),
                 (
@@ -3507,7 +3564,6 @@ pub(crate) mod tests {
                 ),
             ],
             StaticOpts {
-                spa_fallback: true,
                 html_meta: Some("__meta".into()),
                 ..Default::default()
             },
@@ -3556,6 +3612,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn html_meta_handler_overrides_static_and_sets_cache_control() {
         let (addr, _keep) = spawn_static(
+            true,
             &[(
                 "html-meta/api.ts",
                 r#"export default {
@@ -3588,7 +3645,6 @@ pub(crate) mod tests {
                 ),
             ],
             StaticOpts {
-                spa_fallback: true,
                 html_meta: Some("__meta".into()),
                 html_meta_handler: Some("/v1/api/html-meta".into()),
                 html_cache_control: Some("no-cache".into()),
@@ -3630,14 +3686,9 @@ pub(crate) mod tests {
     async fn html_meta_handler_off_is_byte_identical() {
         let (addr, _keep) = spawn_static(
             &[],
+            true,
             &[("index.html", "<html><head></head><body>hi</body></html>")],
-            StaticOpts {
-                spa_fallback: true,
-                html_meta: None,
-                html_meta_handler: None,
-                html_cache_control: None,
-                response_headers: Vec::new(),
-            },
+            StaticOpts::default(),
         )
         .await;
         let r = raw_http(addr, &get(addr, "/space/abc")).await;
@@ -3656,9 +3707,9 @@ pub(crate) mod tests {
     async fn html_cache_control_alone_still_applies() {
         let (addr, _keep) = spawn_static(
             &[],
+            true,
             &[("index.html", "<html><head></head><body>hi</body></html>")],
             StaticOpts {
-                spa_fallback: true,
                 html_cache_control: Some("no-cache".into()),
                 ..Default::default()
             },
@@ -3675,9 +3726,9 @@ pub(crate) mod tests {
         // 非 HTML 资产不受影响（缓存头只管 HTML）
         let (addr2, _keep2) = spawn_static(
             &[],
+            true,
             &[("index.html", "x"), ("assets/app.js", "console.log(1)")],
             StaticOpts {
-                spa_fallback: true,
                 html_cache_control: Some("no-cache".into()),
                 ..Default::default()
             },
@@ -3799,7 +3850,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn static_guards_traversal_missing_and_verbs() {
-        let (addr, _keep) = spawn_static(&[], &[("index.html", "x")], StaticOpts::default()).await;
+        let (addr, _keep) =
+            spawn_static(&[], false, &[("index.html", "x")], StaticOpts::default()).await;
         for path in [
             "/../etc/passwd",
             "/a%2e%2e/b",
@@ -3810,19 +3862,20 @@ pub(crate) mod tests {
             let r = raw_http(addr, &get(addr, path)).await;
             assert!(r.starts_with("HTTP/1.1 404"), "{path}: {r}");
         }
-        // 非 GET/HEAD 不走静态
+        // 非 GET/HEAD 不走静态（规则 4：显式 405，v0.1.58 前落入 404）
         let r = raw_http(
             addr,
             "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
         .await;
-        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        assert!(r.starts_with("HTTP/1.1 405"), "{r}");
     }
 
     // ----- 多静态站点（v0.1.27：prefix→dir，最长前缀命中）-----
 
-    /// 双站点夹具：`/docs` → docs 根（含嵌套前缀用例文件），`/` → app 根。
+    /// 双站点夹具：`/docs` → docs 根（含嵌套前缀用例文件），`/` → app 根（spa 取 `root_spa`）。
     async fn spawn_two_sites(
+        root_spa: bool,
         opts: StaticOpts,
     ) -> (std::net::SocketAddr, (TempRoutes, Vec<TempRoutes>)) {
         spawn_static_sites(
@@ -3830,6 +3883,7 @@ pub(crate) mod tests {
             &[
                 (
                     "/",
+                    root_spa,
                     vec![
                         ("index.html", "<h1>app</h1>"),
                         ("docs/deep.txt", "APP-ROOT-SHOULD-NOT-SERVE"),
@@ -3837,6 +3891,7 @@ pub(crate) mod tests {
                 ),
                 (
                     "/docs",
+                    false,
                     vec![("index.html", "<h1>docs</h1>"), ("api/x.txt", "DOCS-API-X")],
                 ),
             ],
@@ -3847,7 +3902,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn multi_static_longest_prefix_wins_and_root_catchall() {
-        let (addr, _keep) = spawn_two_sites(StaticOpts::default()).await;
+        let (addr, _keep) = spawn_two_sites(false, StaticOpts::default()).await;
         // 最长前缀：`/docs/api/x.txt` 命中 /docs 站，胜过 `/` 站。
         let r = raw_http(addr, &get(addr, "/docs/api/x.txt")).await;
         assert!(
@@ -3874,25 +3929,22 @@ pub(crate) mod tests {
     async fn multi_static_site_miss_does_not_fall_across_sites() {
         // 不跨站：`/docs/deep.txt` 仅存在于 `/` 站的 docs/ 子目录——命中 /docs 站
         // （最长前缀）后未命中必须 404，**不得**回落到 `/` 站的同名文件。
-        let (addr, _keep) = spawn_two_sites(StaticOpts::default()).await;
+        let (addr, _keep) = spawn_two_sites(false, StaticOpts::default()).await;
         let r = raw_http(addr, &get(addr, "/docs/deep.txt")).await;
         assert!(r.starts_with("HTTP/1.1 404"), "{r}");
     }
 
     #[tokio::test]
     async fn multi_static_spa_fallback_is_per_site() {
-        // spa_fallback 全局开关，但回落目标各站独立：/docs 站有 index.html →
-        // 深链接 200；`/` 站无 index.html → 404（不跨站借）。
+        // v0.1.58：spa 是**挂载级**显式开关（`spa: true`，默认 false）——/docs 开、
+        // `/` 关：/docs 深链接 200；`/` 深链接 404（不跨站借）。
         let (addr, _keep) = spawn_static_sites(
             &[],
             &[
-                ("/", vec![("docs/deep.txt", "SHOULD-NOT-REACH")]),
-                ("/docs", vec![("index.html", "<h1>docs</h1>")]),
+                ("/", false, vec![("docs/deep.txt", "SHOULD-NOT-REACH")]),
+                ("/docs", true, vec![("index.html", "<h1>docs</h1>")]),
             ],
-            StaticOpts {
-                spa_fallback: true,
-                ..StaticOpts::default()
-            },
+            StaticOpts::default(),
         )
         .await;
         let accept = "GET /docs/deep/link HTTP/1.1\r\nHost: t\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
@@ -3916,10 +3968,12 @@ pub(crate) mod tests {
             &[
                 (
                     "/",
+                    false,
                     vec![("index.html", "<html><head></head><body>app</body></html>")],
                 ),
                 (
                     "/docs",
+                    false,
                     vec![
                         ("index.html", "<html><head></head><body>docs</body></html>"),
                         ("__meta/index.json", r#"{"title":"Docs Home"}"#),
@@ -4028,12 +4082,12 @@ pub(crate) mod tests {
         );
     }
 
-    // ---------- 补覆盖：serve()（bind 版） / blob 302 重定向 / mime_of ----------
+    // ---------- 补覆盖：serve_with_listener（直接喂挂载） / blob 302 重定向 / mime_of ----------
 
-    /// Given: 自由端口 + 合法路由；When: serve() 自行 bind 后收 GET；Then: 200 信封回包；
-    /// 且端口被占时 serve() 以 bind 错误快速失败（Err 腿，覆盖 `bind().await?` 传播）。
+    /// Given: 已绑定 listener + api 挂载；When: serve_with_listener 收 GET；Then: 200 信封回包
+    /// （v0.1.58 起 bind 归调用方——`oj serve` 走 `App::serve_graceful`，本 crate 无 bind 版入口）。
     #[tokio::test]
-    async fn given_free_addr_when_serve_binds_then_requests_answered() {
+    async fn given_listener_with_mounts_when_serving_then_requests_answered() {
         let t = routes(&[(
             "u/s/api.ts",
             "export default { get() { json.ok({ ok: 1 }); } };",
@@ -4041,23 +4095,26 @@ pub(crate) mod tests {
         let dir = t.0.clone();
         let table = build_table(&dir, true, "/v1/api");
         let actor = make_actor(dir.clone(), true);
-        // 用临时 listener 探一个自由端口，drop 后交给 serve() 自行 bind。
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-        let server = tokio::spawn(serve(
-            addr,
-            "/v1/api",
-            dir.clone(),
-            true,
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mounts = vec![RuntimeMount::Api {
+            prefix: "/v1/api".to_string(),
             table,
-            actor,
-            None,
-            Vec::new(),
-            StaticOpts::default(),
-            Pipeline::default(),
-        ));
-        // 轮询等 bind 完成（spawn 与本测试同一 current_thread 运行时，await 期间被驱动）。
+            fallback: Some(Routes::new("/v1/api", dir, true)),
+            web: None,
+        }];
+        let server = tokio::spawn(
+            serve_with_listener(
+                listener,
+                mounts,
+                actor,
+                None,
+                StaticOpts::default(),
+                Pipeline::default(),
+                None,
+            ),
+        );
+        // 有界轮询等 bind 完成（spawn 与本测试同一 current_thread 运行时，await 期间被驱动）。
         let mut bound = false;
         for _ in 0..200 {
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
@@ -4066,7 +4123,7 @@ pub(crate) mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(bound, "serve() did not bind {addr}");
+        assert!(bound, "server did not bind {addr}");
         let r = raw_http(
             addr,
             "GET /v1/api/u/s/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
@@ -4077,24 +4134,6 @@ pub(crate) mod tests {
             "{r}"
         );
         server.abort();
-
-        // Err 腿：端口已被占 → serve() 返回 Err（bind 冲突 fail-fast）。
-        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let taken = held.local_addr().unwrap();
-        let err = serve(
-            taken,
-            "/v1/api",
-            t.0.clone(),
-            true,
-            RouteTable::default(),
-            make_actor(t.0.clone(), true),
-            None,
-            Vec::new(),
-            StaticOpts::default(),
-            Pipeline::default(),
-        )
-        .await;
-        assert!(err.is_err(), "expected bind-conflict error");
     }
 
     /// Given: serve 恒 302 的 blob 后端（模拟 s3 presign 直链）；When: GET {base}/blob/k；
@@ -4281,16 +4320,18 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         let table = build_table(&dir, ts, base);
         let base = base.to_string();
+        let mounts = vec![RuntimeMount::Api {
+            prefix: base.clone(),
+            table,
+            fallback: ts.then(|| Routes::new(&base, dir.clone(), ts)),
+            web: None,
+        }];
         tokio::spawn(async move {
             serve_with_listener(
                 listener,
-                &base,
-                dir.clone(),
-                ts,
-                table,
+                mounts,
                 make_actor(dir, ts),
                 None,
-                Vec::new(),
                 StaticOpts::default(),
                 Pipeline::default(),
                 Some(cors),
