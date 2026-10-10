@@ -243,9 +243,10 @@ pub async fn blob_backend_connect(
 }
 
 /// 加载路径解析（spec §4）：OJ_PLUGINS_DIR > oj.toml plugins_dir >
+/// 打包布局（OJ_BUNDLED_LD 上溯两级得 <bin>/plugins，仅打包形态）>
 /// <exe>/plugins > <workspace_root>/bin/plugins（与 xtask 产物归置同形）。
 /// relative 一律相对 oj.toml 所在目录（config_dir）。返回最终目录 = <plugins_dir>/<host-triple>/。
-/// 显式配置 1/2 而目录不存在 → Err；默认 3/4 不存在 → Ok(None)（零插件）。
+/// 显式配置 1/2 而目录不存在 → Err；默认候选不存在 → Ok(None)（零插件）。
 pub fn resolve_plugins_dir(
     config_dir: &Path,
     toml_plugins_dir: Option<&Path>,
@@ -270,6 +271,17 @@ pub fn resolve_plugins_dir(
         };
     }
     let mut candidates = Vec::new();
+    // 打包形态（deploy.sh / npm 启动器注入 OJ_BUNDLED_LD，ld 位于 <bin>/lib/）：
+    // 进程经「exec 动态加载器」启动，current_exe() 指向 ld-linux 而非真实二进制，
+    // exe 侧候选必落空（拼出 <bin>/lib/plugins）——由 ld 路径上溯两级得 <bin>，
+    // 其 plugins/ 才是真实插件目录。置于 exe 候选之前：打包布局是确定事实，
+    // 启发式只是兜底。OJ_BUNDLED_LD 未设置（非打包形态）则无此候选，行为不变。
+    if let Some(ld) = std::env::var_os("OJ_BUNDLED_LD") {
+        let ld = PathBuf::from(ld);
+        if let Some(bin_dir) = ld.parent().and_then(|p| p.parent()) {
+            candidates.push(bin_dir.join("plugins"));
+        }
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

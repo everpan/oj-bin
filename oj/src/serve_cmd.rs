@@ -150,13 +150,17 @@ const MAIL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// 自带 glibc 发行包（deploy.sh 启动器注入 OJ_BUNDLED_LD / OJ_BUNDLED_LIB）：re-exec
 /// 必须继续走打包的 ld-linux + --library-path——kernel 按 oj.bin 的 PT_INTERP（系统
 /// /lib64 路径）加载系统 ld-linux，低版本宿主 glibc 即崩；非打包形态 env 缺省，原样 re-exec。
+///
+/// 打包形态的 re-exec 目标是 **<bin>/oj 启动器**而非 current_exe()：进程经「exec 动态
+/// 加载器」启动，current_exe() 指向 ld-linux，把它当 program 传给 ld.so 会被当 ELF
+/// 加载必败（oj serve 秒退）；启动器脚本自带 OJ_BUNDLED_LD/LIB 导出与 ld 链，re-exec
+/// 它即等价于原语义。
 #[cfg(unix)]
 fn daemonize() -> Result<(), String> {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| format!("daemon: current_exe: {e}"))?;
+    let mut cmd = daemon_reexec_cmd()?;
     let null =
         std::fs::File::open("/dev/null").map_err(|e| format!("daemon: open /dev/null: {e}"))?;
-    let mut cmd = bundled_reexec_cmd(&exe);
     cmd.args(strip_daemon_flag(std::env::args_os().skip(1)))
         .stdin(null)
         .stdout(std::process::Stdio::null())
@@ -174,6 +178,24 @@ fn daemonize() -> Result<(), String> {
     let child = cmd.spawn().map_err(|e| format!("daemon: spawn: {e}"))?;
     println!("oj serve daemonized (pid {})", child.id());
     Ok(())
+}
+
+/// daemon re-exec 命令：打包形态（OJ_BUNDLED_LD 在 <bin>/lib/ 下且 <bin>/oj 启动器
+/// 存在）→ re-exec 启动器（它自会重放打包 ld 链）；否则 → 原样 re-exec 自身
+/// （bundled_reexec_cmd 无 env 时直通分支）。
+#[cfg(unix)]
+fn daemon_reexec_cmd() -> Result<std::process::Command, String> {
+    if let Some(ld) = std::env::var_os("OJ_BUNDLED_LD") {
+        let ld = std::path::PathBuf::from(ld);
+        if let Some(dir) = ld.parent().and_then(|p| p.parent()) {
+            let launcher = dir.join("oj");
+            if launcher.is_file() {
+                return Ok(std::process::Command::new(launcher));
+            }
+        }
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("daemon: current_exe: {e}"))?;
+    Ok(bundled_reexec_cmd(&exe))
 }
 
 /// 构造 daemon re-exec 命令：打包形态（env 齐）→ 打包 ld-linux + --library-path + 程序路径；
@@ -1155,6 +1177,9 @@ mod tests {
     use super::*;
     use only_js::bridge::plugin_loader::kv_backend_connect;
 
+    /// env 相关测试串行化（同进程并行测试会互踩环境变量）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct Tmp(PathBuf);
     fn tmpdir(tag: &str) -> Tmp {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1236,6 +1261,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bundled_reexec_cmd_prefers_bundled_ld() {
+        let _g = ENV_LOCK.lock().unwrap();
         let exe = std::path::Path::new("/fake/oj.bin");
         // Safety: 单测独占进程内这两个 oj 私有 env 键，先后成对 remove/set/remove，无并发读写。
         unsafe {
@@ -1260,6 +1286,41 @@ mod tests {
             std::env::remove_var("OJ_BUNDLED_LD");
             std::env::remove_var("OJ_BUNDLED_LIB");
         }
+    }
+
+    /// 打包形态（OJ_BUNDLED_LD 指向 <bin>/lib/ld-linux-*）daemon re-exec 的目标是
+    /// <bin>/oj 启动器：进程经「exec 动态加载器」启动，current_exe() 指向 ld-linux，
+    /// 把它当 program 传给 ld.so 会被当 ELF 加载必败（oj serve 秒退）；启动器脚本
+    /// 自带 OJ_BUNDLED_LD/LIB 导出与 ld 链，re-exec 它即原语义。且不得再被
+    /// bundled_reexec_cmd 包一层 ld（脚本不是 ELF，ld.so 无法加载）。
+    #[cfg(unix)]
+    #[test]
+    fn daemon_reexec_cmd_targets_launcher_under_bundled_ld() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let t = tmpdir("daemon-reexec");
+        let bin_dir = t.0.join("bin");
+        let ld = bin_dir.join("lib").join("ld-linux-x86-64.so.2");
+        std::fs::create_dir_all(ld.parent().unwrap()).unwrap();
+        std::fs::write(&ld, b"").unwrap();
+        let launcher = bin_dir.join("oj");
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        // Safety: 单测独占进程内 oj 私有 env 键，设值后立即断言并清理（ENV_LOCK 串行化）。
+        unsafe {
+            std::env::set_var("OJ_BUNDLED_LD", &ld);
+            std::env::set_var("OJ_BUNDLED_LIB", bin_dir.join("lib"));
+        }
+        let c = super::daemon_reexec_cmd().unwrap();
+        // Safety: 同上，收尾清理。
+        unsafe {
+            std::env::remove_var("OJ_BUNDLED_LD");
+            std::env::remove_var("OJ_BUNDLED_LIB");
+        }
+        assert_eq!(c.get_program(), launcher.as_os_str());
+        let args: Vec<_> = c.get_args().collect();
+        assert!(
+            args.is_empty(),
+            "launcher re-exec 不得再包 ld 参数: {args:?}"
+        );
     }
 
     /// 回归钉：缺省服务目录自 config 同级起步逐级向上搜索（src 优先、dist 次之），
