@@ -108,6 +108,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `axis("ldap").bind` 一直抛而不是返回 false | 抛 = 连接/协议错；只有 LDAP 拒绝凭据（rc≠0，含 49）才返回 `false`——检查网络/`url`/服务账号，别把 `false` 分支当异常路径 |
 | `ldap.*` 报 `ldap not configured` 但 `ldap:` 段已配 | v0.1.54 起 oj-ldap 迁移**泛型轴**——调用面改成 `axis("ldap").<op>(...)`；类型化 `ldap`/`LDAP` 全局是遗留双轨面，装配迁移版插件后报 not configured |
 | `axis("x")` 报 `unknown generic axis '<x>'` | 轴没装上（插件未加载/ABI 不匹配）或名字拼错——报错里的 available 列表即当前已注册泛型轴；确认插件在 `plugins:` 清单或扫描目录里 |
+| 打包发行版（deploy.sh / npm 启动器）启动报 `no auth plugin loaded`（插件文件齐全）或 `oj serve --daemon` 秒退 | v0.1.55 及更早：glibc 打包形态进程映像是 ld-linux，`current_exe()` 指向加载器，插件发现候选与 daemon re-exec 全部落空——升 v0.1.56+；临时绕法：显式 `OJ_PLUGINS_DIR` |
 | 泛型轴插件撞名（插件作者） | 泛型轴名**避开 9 个保留名**（es/db/blob/bus/kv/auth/mq/mail/ldap）——pre-kind 旧宿主按名 cast，会把 GenericVtable 误当类型化 vtable；同名泛型轴多插件提供 → 装配期 fail-fast |
 | `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `axis("ldap").search_paged(base, { pageSize: 500 })` |
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |

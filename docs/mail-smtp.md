@@ -221,7 +221,7 @@ cargo xtask plugin mail --check    # ABI/身份/semver/符号 预检
 cargo xtask build                  # 构建 oj + 全部第一方插件（含 mail）
 ```
 
-- 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > `<exe>/plugins` > `<workspace_root>/bin/plugins`，再拼 `<host-triple>/`。
+- 插件发现：`OJ_PLUGINS_DIR` > config `plugins_dir` > 打包布局（`OJ_BUNDLED_LD` 上溯两级，仅打包形态）> `<exe>/plugins` > `<workspace_root>/bin/plugins`，再拼 `<host-triple>/`。
 - **未装插件不阻断启动**；调用 mail 时报 `mail not configured`（可选能力）。
 - 多 profile 复用同一队列/线程池；`workers`/`queue_capacity`/上限为全局，`timeout` 每 profile。
 - **停机 graceful drain**：`oj serve` 收到停机信号后（HTTP 停收 + 长任务收场之后）触发排空：

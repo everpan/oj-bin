@@ -136,7 +136,8 @@ plugins:
 ```
 
 插件发现路径（先到先得）：`OJ_PLUGINS_DIR` 环境变量 > config 的 `plugins_dir` >
-`<exe>/plugins` > `<workspace_root>/bin/plugins/<host-triple>/`。
+打包布局（`OJ_BUNDLED_LD` 上溯两级，仅打包形态）> `<exe>/plugins` >
+`<workspace_root>/bin/plugins/<host-triple>/`。
 用 `cargo xtask build` 会把插件归置到 `bin/plugins/`。
 
 ### 1.3 `schema.yaml` —— 白名单与建表
