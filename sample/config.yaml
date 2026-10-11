@@ -139,6 +139,8 @@ tenant:   # 多租户注入（v0.2）：启用后请求必须带 header_key（�
     - "/oidc/*"                  # login/callback/logout：一层够用
     - "/idp/*"                   # authorize/token/userinfo：一层
     - "/idp/.well-known/*"       # discovery：比 /idp/* 深一层，必须单列（豁免面最小）
+    - "/sso/login"                              # SSO form 登录端点（v0.1.61，无 token 可言）
+    - { path: "/sso/cas/*", one_layer: true }   # SSO CAS 302 腿
     # WS 路由（<dir>/ws.ts）是 merge 进 Router 的真实路由，本就不经过这套
     # 前置管线（连接天然匿名）——无需也不会出现在 anonymous_paths 里。
 
@@ -163,6 +165,8 @@ auth:   # JWT 鉴权：oj-auth 插件守卫（验签/匿名）+ JS 端点（src/
     # 迁移 WARN 自 v0.1.23 起只在「旧式前缀形态 + 确会丢面」时打。
     - { path: "/idp/*", one_layer: true }
     - "/idp/.well-known/*"
+    - "/sso/login"                              # SSO form 登录端点（v0.1.61，无 token 可言）
+    - { path: "/sso/cas/*", one_layer: true }   # SSO CAS 302 腿
 
 tasks:   # 长任务池（v0.1.6）：dir 相对 API 目录；sample/src/tasks/task_demo.ts 每秒心跳
   dir: "tasks"
@@ -177,6 +181,13 @@ kafkas:   # 命名 Kafka（v0.1.6）：值透传 oj-bus-kafka；配好 brokers �
 rabbits:   # 命名 RabbitMQ（v0.1.6）：值透传 oj-bus-rabbitmq；RabbitMQ("default")
   # default:
   #   url: "amqp://guest:guest@127.0.0.1:5672"
+
+http_sso:                          # HTTP 表单 / CAS SSO（v0.1.61）；段存在即启用
+  corp:
+    kind: form
+    login_url: "https://sso.example.com/login"   # 占位示例，对接企业 SSO 时替换
+    success_when: { message: "" }  # 上游成功时 message 为空串（mm-wiki 同款判据）
+    profile: { name: data.name, email: data.email }
 
 oidc:   # OIDC（spec 2026-09-05）：同进程 OP + RP。demo 私钥与示例证书同性质，勿用于生产。
   issuer: "http://localhost:9778/v1/api/idp"
