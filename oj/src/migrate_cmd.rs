@@ -24,7 +24,8 @@ async fn slim(
     module: Option<&str>,
     db: Option<&str>,
 ) -> Result<Slim, String> {
-    let (cfg, top, config_dir, dir, ts, _base) = load_app_config(config, site, dir_override, None)?;
+    let (cfg, top, config_dir, dir, ts, _base) =
+        load_app_config(config, site, dir_override, None, true)?;
     // 迁移/fixtures 作用于 api 目录下的 SQL；强依赖 api 目录（无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(

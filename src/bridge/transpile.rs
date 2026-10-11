@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+use deno_ast::swc::ast::{ModuleItem, Stmt};
+
 /// 实际发生转译的次数（UC-14 缓存断言用）。
 static TRANSPILE_COUNT: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
 
@@ -74,6 +76,49 @@ pub fn transpile_src(path: &Path, src: &str) -> Result<String, String> {
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(out.into_source().text)
+}
+
+/// REPL/devtools 风格：当整段源码是**单个顶层表达式语句**时，返回将其求值结果回显的包裹
+/// 源码 `console.log((<expr>));`，使 `oj exec -e '<expr>'` / REPL 默认打印表达式值
+/// （如 `oj exec -e '1'` 输出 `1`、箭头/对象字面量 `({a:1})` 正常格式化）。
+///
+/// 不回显的情形（返回 `None`，原样执行）：
+/// - 非单表达式语句（声明 `const x=1`、语句块、多语句 `a=1; b=2`、`{a:1}` 当块），避免污染；
+/// - 已是显式打印（以 `console.log/info/warn/error/debug/trace(` 或 `print(` 开头），不再叠加回显。
+pub fn wrap_expr_value_for_print(code: &str) -> Option<String> {
+    let spec = deno_ast::ModuleSpecifier::parse("file:///oj-eval.ts").ok()?;
+    let parsed = deno_ast::parse_module(deno_ast::ParseParams {
+        specifier: spec,
+        text: code.into(),
+        media_type: deno_ast::MediaType::TypeScript,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .ok()?;
+    // 仅当整段是单个表达式语句时才回显（声明/块/多语句不回显）。
+    let is_single_expr = match parsed.program_ref() {
+        deno_ast::ProgramRef::Module(m) => matches!(&m.body[..], [ModuleItem::Stmt(Stmt::Expr(_))]),
+        deno_ast::ProgramRef::Script(s) => matches!(&s.body[..], [Stmt::Expr(_)]),
+    };
+    if !is_single_expr {
+        return None;
+    }
+    // 整段即该表达式：去掉首尾空白与可选结尾分号后包裹。
+    let expr_src = code.trim();
+    let expr_src = expr_src.strip_suffix(';').unwrap_or(expr_src).trim();
+    // 已显式打印则不重复回显（避免 `console.log("x")` 再叠打 `undefined`）。
+    if expr_src.starts_with("console.log(")
+        || expr_src.starts_with("console.info(")
+        || expr_src.starts_with("console.warn(")
+        || expr_src.starts_with("console.error(")
+        || expr_src.starts_with("console.debug(")
+        || expr_src.starts_with("console.trace(")
+        || expr_src.starts_with("print(")
+    {
+        return None;
+    }
+    Some(format!("console.log(({expr_src}));\n"))
 }
 
 /// minify：swc_ecma_minifier 全量压缩（DCE + 表达式压缩 + mangle 局部变量名）。
@@ -257,5 +302,52 @@ mod tla_probe_tests {
         let out = super::cached_transpile(&p).unwrap();
         assert!(out.contains("await"), "TLA lost: {out}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod wrap_expr_tests {
+    use super::wrap_expr_value_for_print as wrap;
+
+    /// 单表达式 → 包裹 console.log((...)) 回显其值。
+    #[test]
+    fn single_expr_is_wrapped_for_print() {
+        assert_eq!(wrap("1"), Some("console.log((1));\n".into()));
+        assert_eq!(wrap("2 + 3"), Some("console.log((2 + 3));\n".into()));
+        // 对象字面量加括号仍正确格式化。
+        assert_eq!(
+            wrap("({a:1, b:[2,3]})"),
+            Some("console.log((({a:1, b:[2,3]})));\n".into())
+        );
+        assert_eq!(
+            wrap("\"hello\""),
+            Some("console.log((\"hello\"));\n".into())
+        );
+        assert_eq!(
+            wrap("Math.max(1,2,3)"),
+            Some("console.log((Math.max(1,2,3)));\n".into())
+        );
+        // 可选结尾分号被剥离。
+        assert_eq!(wrap("1;"), Some("console.log((1));\n".into()));
+    }
+
+    /// 非单表达式语句 → 不回显（原样执行）。
+    #[test]
+    fn non_single_expr_is_not_wrapped() {
+        assert_eq!(wrap("const x = 1; x"), None); // 多语句
+        assert_eq!(wrap("a = 1; b = 2"), None); // 多语句
+        assert_eq!(wrap("const x = 1"), None); // 声明
+        assert_eq!(wrap("function f(){}"), None); // 声明
+        assert_eq!(wrap("if (1) 2"), None); // 非表达式语句
+        assert_eq!(wrap(""), None); // 空
+    }
+
+    /// 已是显式打印 → 不重复回显（避免叠打 undefined）。
+    #[test]
+    fn explicit_print_is_not_wrapped() {
+        assert_eq!(wrap("console.log(\"x\")"), None);
+        assert_eq!(wrap("console.error(\"x\")"), None);
+        assert_eq!(wrap("console.info(1)"), None);
+        assert_eq!(wrap("print(1)"), None);
     }
 }

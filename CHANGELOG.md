@@ -16,7 +16,14 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.60（未打标签）
+
+**feat（exec）**：`oj exec` 子命令不再要求 `config.yaml`（未找到时静默回落内置默认，不再向
+stderr 打 `note: no config.yaml found …`；与 `oj info` 同口径，仅 `serve`/`migrate`/`openapi`
+等依赖后端配置的场景保留该提示）。同时 `oj exec -e '<expr>'` 与 REPL 默认回显单表达式的求值
+结果（devtools 风格）：仅当整段是单个顶层表达式语句时才包裹 `console.log((<expr>));` 输出其值
+（如 `oj exec -e '1'` 输出 `1`、`oj exec -e '({a:1})'` 输出 `{"a":1}`）；多语句 / 声明 / 已显式
+`console.log` 等场景不回显，避免污染输出。
 
 **chore（ci/npm）**：npm 发布鉴权切到 **Trusted Publishing（OIDC）**。npmjs 账号启用
 Two-Factor Authentication 后，CI 的非交互发布只剩两条路——勾了 Bypass 2FA 的 granular

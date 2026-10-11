@@ -2927,11 +2927,17 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 全部可用。专题手册：仓库 `docs/exec-integration.md`。
 
 **config.yaml 不是必需的**（v0.1.57 起 `-c` 可省）：省略时按「CWD 逐级向上 `config.yaml`
-→ `$HOME/.oj/config.yaml`」搜索，都没有就用内置默认值（stderr 打 `note:`）——纯计算脚本
-（`-e 'console.log(1)'` 之类，不碰 db/表白名单）零配置可跑。目录解析（`-d` 缺省时）：取
-config/mounts 的第一条 api 挂载，无挂载才向上探测（只认「像业务树」的候选，见 `-d`
-参数行）；在源码仓根这类「祖先带非业务 `src/`」的地方裸跑，会得到 `service dir not
+→ `$HOME/.oj/config.yaml`」搜索，都没有就用内置默认值（**v0.1.60 起 `oj exec` 静默回落、
+不再向 stderr 打 `note:`**，与 `oj info` 同口径；仅 `serve`/`migrate`/`openapi` 等依赖后端配置
+的场景保留该提示）——纯计算脚本（`-e '1'` 之类，不碰 db/表白名单）零配置可跑。目录解析
+（`-d` 缺省时）：取 config/mounts 的第一条 api 挂载，无挂载才向上探测（只认「像业务树」的候选，
+见 `-d` 参数行）；在源码仓根这类「祖先带非业务 `src/`」的地方裸跑，会得到 `service dir not
 found` 指路 `-d`/`-c`，而不是把别人的树当模块扫。
+
+**`-e` / REPL 默认回显单表达式求值结果**（v0.1.60，devtools 风格）：仅当整段是**单个顶层
+表达式语句**时才包裹 `console.log((<expr>));` 输出其值——`oj exec -e '1'` 输出 `1`、
+`oj exec -e '({a:1})'` 输出 `{"a":1}`；多语句 / 声明（如 `const x=1; x`）/ 已显式 `console.log`
+等场景**不回显**，避免污染输出。需要显式控制输出时照常用 `console.log`。
 
 三种用法互斥（**三者缺省——裸 `oj exec`——v0.1.55 起进 REPL**）：
 

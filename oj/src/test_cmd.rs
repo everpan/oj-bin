@@ -72,6 +72,8 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
         a.site.as_deref(),
         a.dir.as_deref(),
         a.base.as_deref(),
+        // test 无需配置文件（无后端执行），未找到 config 时静默回落内置默认。
+        false,
     )?;
     // test 强依赖 api 目录（用例针对 handler；无「纯静态」形态）。
     if !dir.is_dir() {

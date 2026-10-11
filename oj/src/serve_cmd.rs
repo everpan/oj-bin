@@ -65,7 +65,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     if a.daemon {
         return daemonize();
     }
-    let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref())?;
+    let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref(), true)?;
     // CLI 挂载折叠：--api-path / --app-path 全部 upsert 进 cfg.mounts（CLI 优先）。
     fold_cli_mounts(&mut cfg, &a)?;
     if let Some(p) = a.cert_path {
@@ -312,7 +312,10 @@ async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
 /// 内置默认 Config（config_dir = CWD），纯静态 serve / 无后端 exec/test 等场景无需配置文件。
 /// 返回附带 `top`（顶层全量段 JSON 形，已知 + 未知）：插件自报 config key 的 cfg 查找面
 /// （撞宿主已知段名合法，spec Part 3；load_with_extra）。
-pub fn load_cfg(config: Option<&str>) -> Result<(Config, serde_json::Value, PathBuf), String> {
+pub fn load_cfg(
+    config: Option<&str>,
+    note_on_default: bool,
+) -> Result<(Config, serde_json::Value, PathBuf), String> {
     match config::find_path(config)? {
         Some(path) => {
             let config_dir = config_dir_of(&path);
@@ -321,10 +324,12 @@ pub fn load_cfg(config: Option<&str>) -> Result<(Config, serde_json::Value, Path
             Ok((config, top, config_dir))
         }
         None => {
-            eprintln!(
-                "note: no config.yaml found (searched cwd upward, $HOME/.oj/config.yaml) — \
-                 using built-in defaults"
-            );
+            if note_on_default {
+                eprintln!(
+                    "note: no config.yaml found (searched cwd upward, $HOME/.oj/config.yaml) — \
+                     using built-in defaults"
+                );
+            }
             Ok((
                 Config::default(),
                 serde_json::Value::Object(Default::default()),
@@ -349,8 +354,9 @@ pub fn load_app_config(
     site: Option<&str>,
     dir_override: Option<&str>,
     base_override: Option<&str>,
+    note_on_default: bool,
 ) -> Result<(Config, serde_json::Value, PathBuf, PathBuf, bool, String), String> {
-    let (mut cfg, top, config_dir) = load_cfg(config)?;
+    let (mut cfg, top, config_dir) = load_cfg(config, note_on_default)?;
     if site.is_some() {
         if dir_override.is_some() {
             return Err("--site and -d/--dir are mutually exclusive".into());
@@ -1507,7 +1513,7 @@ mod tests {
         std::fs::write(t.0.join("config.yaml"), "{}\n").unwrap();
         let cfg = t.0.join("config.yaml");
         let (_, _, _, dir, ts, _) =
-            load_app_config(Some(cfg.to_str().unwrap()), None, None, None).unwrap();
+            load_app_config(Some(cfg.to_str().unwrap()), None, None, None, false).unwrap();
         assert_eq!(dir, t.0.join("src"));
         assert!(ts);
 
@@ -1517,7 +1523,7 @@ mod tests {
         std::fs::write(t2.0.join("config.yaml"), "{}\n").unwrap();
         let cfg2 = t2.0.join("config.yaml");
         let (_, _, _, dir2, _, _) =
-            load_app_config(Some(cfg2.to_str().unwrap()), None, None, None).unwrap();
+            load_app_config(Some(cfg2.to_str().unwrap()), None, None, None, false).unwrap();
         assert_eq!(dir2, t2.0.join("dist"));
 
         // config 下钻一层（sub/config.yaml），src 在父级 → 向上搜索命中。
@@ -1527,7 +1533,7 @@ mod tests {
         std::fs::write(t3.0.join("sub/config.yaml"), "{}\n").unwrap();
         let cfg3 = t3.0.join("sub/config.yaml");
         let (_, _, _, dir3, _, _) =
-            load_app_config(Some(cfg3.to_str().unwrap()), None, None, None).unwrap();
+            load_app_config(Some(cfg3.to_str().unwrap()), None, None, None, false).unwrap();
         assert_eq!(dir3, t3.0.join("src"));
     }
 
@@ -1573,6 +1579,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(dir2, t4.0.join("src"), "空 src 须被全链解析命中");

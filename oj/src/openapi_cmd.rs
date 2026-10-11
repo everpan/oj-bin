@@ -208,6 +208,7 @@ pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
         a.site.as_deref(),
         a.dir.as_deref(),
         a.base.as_deref(),
+        true,
     )
     .map_err(|e| format!("oj openapi: {e}"))?;
 

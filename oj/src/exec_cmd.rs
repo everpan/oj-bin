@@ -57,6 +57,9 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         a.site.as_deref(),
         a.dir.as_deref(),
         None,
+        // exec 无需配置文件（纯静态脚本执行），未找到 config 时静默回落内置默认，
+        // 不打 `note: no config.yaml found`（与 `oj info` 同口径）。
+        false,
     )?;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
@@ -251,7 +254,10 @@ pub(crate) async fn run_code(
 ) -> Result<i32, String> {
     let mut rt = build_runtime(backend, options);
     boot_if_set(&mut rt, backend).await?;
-    let src = only_js::bridge::transpile::transpile_src(Path::new("oj-eval.ts"), code)
+    // 单表达式默认回显其值（REPL/devtools 风格）；非单表达式原样执行。
+    let code = only_js::bridge::transpile::wrap_expr_value_for_print(code)
+        .unwrap_or_else(|| code.to_string());
+    let src = only_js::bridge::transpile::transpile_src(Path::new("oj-eval.ts"), &code)
         .map_err(|e| format!("exec: compile --code: {e}"))?;
     let spec = ModuleSpecifier::parse("file:///oj-eval.ts")
         .map_err(|_| "exec: bad eval specifier".to_string())?;
@@ -323,7 +329,10 @@ pub(crate) async fn run_repl(
         if code.trim().is_empty() {
             continue;
         }
-        let ts = match only_js::bridge::transpile::transpile_src(Path::new("oj-repl.ts"), code) {
+        // 单表达式默认回显其值（REPL/devtools 风格）；非单表达式原样执行。
+        let code = only_js::bridge::transpile::wrap_expr_value_for_print(code)
+            .unwrap_or_else(|| code.to_string());
+        let ts = match only_js::bridge::transpile::transpile_src(Path::new("oj-repl.ts"), &code) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("repl: transpile: {e}");
@@ -422,6 +431,48 @@ mod tests {
         let line = std::fs::read_to_string(&log).unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["msg"], r#"hello-exec 1 {"x":2}"#);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⑩ `oj exec -e '<expr>'` 单表达式默认回显其值（devtools 风格，回归用例）：
+    /// `-e '1'` 经包裹 console.log 输出 `1`（JSONL msg 断言）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_single_expr_when_exec_code_then_value_is_printed() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t10-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("out.jsonl");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let backend = backend_fixture(&tmp).await;
+        let code = run_code_ext(&backend, "1", vec![], Some(f)).await.unwrap();
+        assert_eq!(code, 0);
+        let line = std::fs::read_to_string(&log).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["msg"], "1");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// ⑪ 多语句 / 声明不回显（原样执行，不叠打 undefined）：`-e 'const x=1; x'` 静默。
+    #[tokio::test(flavor = "current_thread")]
+    async fn given_multi_stmt_when_exec_code_then_no_echo() {
+        let tmp = std::env::temp_dir().join(format!("oj-exec-t11-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("out.jsonl");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let backend = backend_fixture(&tmp).await;
+        let code = run_code_ext(&backend, "const x = 1; x", vec![], Some(f))
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        // 无 console.log 输出行。
+        assert!(std::fs::read_to_string(&log).unwrap().trim().is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
