@@ -1926,6 +1926,112 @@ tenant:
 | CAS 回跳 401 | 跳转/回跳腿没进 `auth.` / `tenant.` **两条**匿名列表（互相独立，只加一条不够） |
 | token 拼进 CAS 回跳 URL | 泄露面（Referer/浏览器历史）——httpOnly 双 cookie 交接；302 目标只认配置固定值或 `/` 开头相对路径，防 open-redirect |
 
+## 场景 29：引擎原生全文检索（`_shared/search`，v0.1.61）
+
+> 何时抄我：文档/wiki/博客要全文检索，但不想为中小规模上 ES。三引擎原生 FTS
+> 统一成一个面——sqlite FTS5（bundled 已开）/ mysql FULLTEXT(ngram) /
+> postgres tsvector+GIN——零额外依赖、随库走、`db.tx` 内使用即同事务。
+> 源码：`sample/src/_platform/_shared/search.ts`，引用方 manifest 补
+> `deps: { _platform: "^0.1.0" }`。
+
+### ① 建索引与写入口
+
+```ts
+import { createSearch } from "#/_platform/_shared/search";
+const search = createSearch(db);
+
+// ensureIndex = DDL：进程内每表一次；**禁止在 db.tx 内调用**（MySQL DDL 隐式提交）
+await search.ensureIndex("docs", { fields: ["title", "body"], pk: "id" });
+
+// index/remove = 业务表 upsert/delete（三引擎索引随业务行自动维护）
+await search.index("docs", { id: 42, title: "部署手册", body: "在生产环境部署 oj" });
+await search.remove("docs", 42);
+```
+
+事务一致性：业务写入与 `search.index(...)` 放进同一个 `db.tx`，语句经 op 层
+`resolve_target` 自动路由进同一连接——无 ES 式异步漂移：
+
+```ts
+await db.tx(async () => {
+  await db.table("docs").insert({ id: 43, title: "…", body: "…" }).run();
+  await search.index("docs", { id: 43, title: "…", body: "…" });
+});
+```
+
+### ② 检索与高亮
+
+```ts
+const hits = await search.query("docs", "环境部署", { limit: 20, highlight: true });
+// hits = [{ id: 42, score: <引擎原始分>, fragments: { body: "…<mark>环境部署</mark>…" } }]
+```
+
+### ③ 验证
+
+L1（sqlite 腿，`oj test`）：`sample/tests/search.test.ts`——增删改后检索一致、短词回退、
+DDL 拒事务、标识符白名单。
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| sqlite 查 2 个字没结果 | trigram 对 <3 字符**静默零命中**——共享模块自动回退业务表 `LIKE`（score=1，转义 `%`/`_`/`\`） |
+| `DDL inside db.tx` 报错 | ensureIndex 进了事务——MySQL DDL 会隐式提交调用方事务，模块用 `tx.isTx` 直接拒绝 |
+| 想直写 `docs_fts` | 别——索引随业务行自动维护，直写 = 双份索引；`index()` 只碰业务表 |
+| score 跨引擎比较 | 不可比——返回引擎原始分（sqlite bm25 负值、mysql 相关度、pg ts_rank） |
+| `sql_guard: deny` 部署下 search 全挂 | deny 与 FTS 裸查询互斥：要么关守卫要么不用 search；启用租户守卫的库 MATCH 查询须带业务表 `tenant_id` 条件 |
+| mysql 建索引报重复 | `ADD FULLTEXT` 无 IF NOT EXISTS——模块已先查 `information_schema.statistics` 再建；自写 SQL 照抄该模式 |
+| pg 占位符 | `$1` 不是 `?`（sqlx Any 不转换）——模块按 `db.dialect()` 渲染 |
+| mysql 中文没召回 | FULLTEXT 必须 `WITH PARSER ngram`（服务端 ≥5.7.6） |
+| `oj schema diff` 报 D002 | `docs_fts*` 影子表未声明——文档化噪音，人工忽略 |
+
+## 场景 30：内容版本化——CAS 修订 + diff + 回滚（`_shared/versions`，v0.1.61）
+
+> 何时抄我：文档/CMS 每次保存要一个不可变修订，支持历史/对比/回滚。CAS 内容表
+> （sha256 去重）+ 修订表（UNIQUE 乐观锁兜底）+ 行级 diff，全部随库走、同事务。
+> 源码：`sample/src/_platform/_shared/versions.ts`；建表迁移在
+> `sample/src/_platform/migrations/0002__versions.{sql,mysql.sql,pg.sql}`
+> （sha256 用 CHAR(64)——MySQL TEXT 不可作 PK）。
+
+### ① 提交 / 历史 / 取回 / 回滚
+
+```ts
+import { createVersions } from "#/_platform/_shared/versions";
+const versions = createVersions(db);
+
+const v = await versions.commit("doc", docId, content, {
+  author: http.user?.id, message: "修正部署步骤", expect: 6,   // 乐观锁（可省略）
+});
+// v = { version: 7, sha256: "…" }
+const body = await versions.get("doc", docId, 7);        // 7 | "head"
+const log  = await versions.history("doc", docId, { limit: 20 });
+const d    = await versions.diff("doc", docId, 6, 7);     // [{type:"ctx"|"add"|"del", text}]
+await versions.rollback("doc", docId, 6, { author: http.user?.id, message: "回滚到 v6" });
+```
+
+### ② 事务与并发
+
+- `commit` 在调用方 `db.tx` 内调用即同事务（内容+修订行一起回滚）。
+- `expect` 与当前 `max(version)` 不符 → 409；并发双 commit 后插者撞
+  `UNIQUE(entity_type, entity_id, version)` → 统一 409 `version conflict`。
+  不带 `expect` = last-write-wins（UNIQUE 仍保证版本号不重）。
+- `rollback` = 旧内容重放为新版本（不删历史，审计友好）；清理（purge）留给业务路由鉴权。
+
+### ③ 验证
+
+L1：`sample/tests/versions.test.ts`——commit×5/get/history/diff/rollback、乐观锁 409、
+同内容 CAS 去重、`db.tx` 回滚连带修订回滚、大文档格子预算闸。
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 409 `version conflict` | 乐观锁撞版本：重读 head 重试，或明示 last-write-wins（省 `expect`） |
+| `diff too large` | 修剪公共前后缀后格子数 >4M（≈16MB DP 矩阵会打穿 isolate 堆）——缩小对比范围 |
+| 同内容反复 commit 撑库 | 不会——CAS：sha256 命中 `oj_ver_content` 主键即跳过，修订行只是指针 |
+| 想自己建表 | 用现成迁移（方言文件 `.{sqlite,mysql,pg}.sql` 后缀）；手写注意 MySQL TEXT 不可作 PK |
+| 业务表挂版本 | `entity_type`/`entity_id` 是字符串指针——换实体类型换 `entity_type` 即可，勿混用 |
+| purge 想直接删 `oj_ver_content` | 会把仍被修订行引用的内容删掉——先删无引用 sha256（超管权限留给业务鉴权） |
+
 ## 附：无配置文件快速用法（v0.1.57）
 
 所有子命令的 `-c/--config` 均可省略。省略时按序搜索：**CWD 逐级向上 `config.yaml` →

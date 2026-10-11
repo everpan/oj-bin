@@ -680,6 +680,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
+| `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（sample/src/sso/ 参考实现），详见第 10 章「sso」 |
 | `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
 | `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
@@ -753,6 +754,7 @@ const page = http.param("page", 1);       // 无路径参数 → query 兜底 �
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
+| `db.dialect()` | `dialect(): "sqlite" \| "mysql" \| "postgres"` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 
 **SQL 执行追踪**（v0.1.51，开发期可观测性）：
 
@@ -2669,6 +2671,33 @@ RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `
 私钥只在 Rust 侧解析使用；`client_secret` 经 `oidc.rp`/`oidc.clients` 对 JS 可读——
 与 `auth.jwt_secret` 同一信任级（能跑 handler 即能拿鉴权密钥）。
 
+### sso —— HTTP 表单 / CAS SSO 提供者注册表（段存在即启用）
+
+顶层 `http_sso:` 段（map：提供者名 → 配置）装配期注入；缺段调用 `sso.providers` 报
+`http sso not configured`。**登录端点是普通业务模块**（`sample/src/sso/` 参考实现，
+守卫只认签出的 token）——form 登录端点与 CAS 302 腿都要进 `auth.anonymous_paths` 与
+`tenant.anonymous_paths` 两条列表。
+
+| 键 | 说明 |
+|---|---|
+| `kind` | `form`（转发凭据到企业端点，按响应判成败）\| `cas2`（302 跳转 + ticket 回校） |
+| `login_url` | form: 凭据校验端点；cas2: CAS `/login` |
+| `cas_validate_url` / `callback_url` | cas2 必填：ticket 校验端点 / 本站回跳绝对 URL（装配期固定，**禁从请求 Host 派生**，两腿 service 必须同串） |
+| `user_field` / `pass_field` | 凭据字段名，缺省 `username` / `password` |
+| `body_encoding` | form 出站编码：`form`（urlencoded，缺省）\| `json` |
+| `extra_fields` | 附加固定字段（app_id 等；secret 类值写 `ENC[...]`，装载期自动解封） |
+| `success_when` | 成功判定：点路径 → 期望值，全部命中即成功；form 必填 |
+| `profile` | 用户信息映射：本地 users 列 → 上游响应点路径 |
+| `allow_http` | 显式允许 `http://` 上游（内网联调）；缺省拒绝（同 smtp `allow_none_tls` 口径） |
+
+判定语义：点路径只支持 `.` 分隔对象遍历；**缺失/null 仅当期望值为 `null` 时命中**；其余
+`String(actual) === String(expected)`（`0` 与 `"0"` 互命中）。mm-wiki 判据
+`message == ""` → `success_when: { message: "" }`。JIT 键
+`sso:<provider>:<tenant>:<username>` + `"!sso"` 占位 hash（该号永不可密码登录）；
+provider 必须命中已配置名（未命中 400 `unknown sso provider`）。CAS 交接红线：token 不进
+URL（httpOnly 双 cookie），302 目标只认 `/` 开头且非 `//` 的相对路径。可照抄：
+`scenarios.md` 场景 28。
+
 ### plugins / plugins_dir —— 插件装配（map 一段三用）
 
 `plugins:` 为 **map**，一段三用：
@@ -3112,6 +3141,14 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | `ext_boot.js` 里 `import "ext:core/ops"` 失败 | deno_core 硬拦，设计如此 | 用已有全局组合；要新 op 属改 bootstrap |
 | 运行期偶发 500 且 msg 含 `ext_boot` | boot 依赖外部服务抖动，或文件被删/替换 | boot 改为幂等无外部依赖；恢复文件后重启 |
 
+| `http sso not configured` | `http_sso:` 段缺省 | 加段即启用；不用就别调 `sso.providers` |
+| 400 `unknown sso provider: x` | provider 未命中 `http_sso` 已配置名 | 核对 config 键名与请求 `provider` |
+| 启动报 `http_sso.x: … must be https` | 非 https 上游且未 `allow_http` | 上游改 https，或内网联调显式 `allow_http: true` |
+| 409 `version conflict` | versions 乐观锁：`expect` 与当前 head 不符，或并发双 commit 撞 UNIQUE | 重读 head 重试；不带 `expect` 即 last-write-wins |
+| `diff too large (line budget exceeded)` | versions.diff 修剪后格子数超 4M | 缩小对比范围或整删整加 |
+| `search.ensureIndex: DDL inside db.tx` | ensureIndex 在 `db.tx` 内调用 | 移到事务外（MySQL DDL 会隐式提交调用方事务） |
+| `search.*: call ensureIndex('t') first` | index/remove/query 先于 ensureIndex | 先 ensureIndex（进程内每表一次） |
+
 完整排障表见 `docs/ops-manual.md` §7。
 
 ### 插件升级与回滚
@@ -3178,6 +3215,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
 | web 挂载无目录列表 / Range / ETag | 未知扩展名按 `application/octet-stream`；SPA 深链回落需挂载显式 `spa: true`（v0.1.58 起逐挂载，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；Range/ETag 经前置反代补；web 挂载仅 GET/HEAD（其余方法 405） |
 | 多挂载（v0.1.58） | 同类前缀归一后重复 → 启动报错；挂载目录缺失/非目录 → 启动报错；命中挂载内 miss **不跨挂载**回落；`spa` 逐挂载显式（配对 web 恒无回落）；`html_meta`/`html_cache_control` 是全局键、按命中挂载根生效 |
+| search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 腿仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音 |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |

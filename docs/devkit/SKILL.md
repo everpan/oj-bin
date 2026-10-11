@@ -37,6 +37,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    **新增登录来源（企业 HTTP 表单 / CAS SSO）→ 不改 oj-auth 插件**——它只是守卫
    （验签 + 匿名路径 + CSRF），登录端点全是普通业务模块；照抄 `sample/src/oidc/`，
    可照抄代码见 `scenarios.md` 场景 28。
+   **全文检索（不上 ES）→ §6「db.dialect」+ `sample/src/_platform/_shared/search.ts`**
+   （三引擎原生 FTS 统一面；ensureIndex 禁入 db.tx；sqlite 短词自动 LIKE 回退），可照抄
+   代码见 `scenarios.md` 场景 29。**内容版本化 / 历史 / diff / 回滚 →
+   `sample/src/_platform/_shared/versions.ts`**（CAS 去重 + UNIQUE 乐观锁 + 行级 diff；
+   撞版本 409），见 `scenarios.md` 场景 30。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
@@ -101,6 +106,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
 | 登录响应要同时下发 `oj_sess` + `oj_csrf` 两枚 cookie | v0.1.46 起 `json.header` 同名头追加、`Set-Cookie` 合法双发（此前响应头单值，csrf 只能 body 下发 + 前端写 `document.cookie`）；登出记得两枚都 `Max-Age=0` |
 | 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `sample/src/oidc/`（场景 28）。**登录端点必须进匿名列表**（无 token 可言，form 与 302 腿都是，`auth.`/`tenant.` 两条都加）；JIT 建号用「`来源:provider:tenant:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录）；CAS 交接 token 不进 URL、302 目标只认 `/` 开头相对路径 |
+| `search.ensureIndex` 报 `DDL inside db.tx` | ensureIndex 是 DDL——MySQL 会隐式提交调用方事务；移到事务外，index/remove/query 留在事务内（同连接自动路由） |
+| sqlite 全文检索 2 个字查不到 | trigram 对 <3 字符静默零命中——`_shared/search` 自动回退业务表 LIKE；自写 FTS SQL 也要处理该边界 |
+| `versions.commit` 报 409 `version conflict` | 乐观锁：`expect` 与当前 head 不符或并发撞 `UNIQUE(entity_type,entity_id,version)`——重读 head 重试；省 `expect` 即 last-write-wins |
 | 裸 import 报 `Package subpath 'x' is not defined by "exports"` | v0.1.30 起有 `exports` 即封闭语义（Node 一致）：未命中的子路径**不回落** `main`/`module`——检查包的真实导出键，或该包确未导出此子路径 |
 | CJS `require("path")` 报 `Node builtin 'path' is not available in oj runtime` | Node 内建不可用——找该包的浏览器/wasm 构建（与 wasm 引擎包同款约定） |
 | `blob.uploadUrl` 报 `local blob backend has no upload presign` | local 后端无预签名——s3 才返回预签名 URL；local 用直传路由 `PUT {base}/blob/{key}`（记得带鉴权头） |
