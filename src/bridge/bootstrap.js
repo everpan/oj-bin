@@ -34,6 +34,7 @@ import {
   op_db_query,
   op_db_query_build,
   op_db_query_sql,
+  op_db_dialect,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -750,6 +751,7 @@ globalThis.DB = function (name) {
       // Race-free replacement for `select max(id) + 1`; the platform table
       // `_oj_sequences` is created on first use (see docs/db-guide.md).
       nextSeq: (n) => op_db_next_seq(name, String(n)),
+      dialect: () => op_db_dialect(name),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -816,6 +818,10 @@ globalThis.DB = function (name) {
             table: (t) => queryBuilder(name, String(t)),
             // Same-connection allocator: MySQL's LAST_INSERT_ID is session-scoped.
             nextSeq: (n) => op_db_next_seq(name, String(n)),
+            // Engine name for dialect-aware SQL in shared libs; isTx marks the tx-scoped
+            // handle (DDL must never run inside db.tx -- MySQL implicit commit).
+            dialect: () => op_db_dialect(name),
+            isTx: true,
             // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
             sqlProfile: () => op_db_sql_profile(),
             fromJSON: (snap) => builderFromReq(encodeParams(snap)),

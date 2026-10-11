@@ -761,6 +761,24 @@ pub async fn op_db_next_seq(
     Ok(out)
 }
 
+/// JS `db.dialect()`：报连接引擎名（"sqlite" | "mysql" | "postgres"）。方言是 accessor
+/// 属性、与事务无关，不走 resolve_target（v0.1.61，`_shared/search` 等共享模块按此分派
+/// 方言 SQL；业务 handler 慎用——分支方言即放弃跨引擎可移植承诺）。
+#[op2]
+#[string]
+pub fn op_db_dialect(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<String, JsErrorBox> {
+    let da = super::query::lookup(&state, &name)?;
+    Ok(match da.dialect() {
+        Dialect::MySql => "mysql",
+        Dialect::Postgres => "postgres",
+        Dialect::Sqlite => "sqlite",
+    }
+    .into())
+}
+
 /// 每个库**一次**地确保平台序列表存在（Bridge 级缓存；DDL 幂等）。
 ///
 /// 缓存放在 `StableState`（而非全局 static）：每个 Bridge 对应一份 DB 配置与池，全局缓存会在
@@ -889,6 +907,36 @@ mod tests {
     use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
     use serde_json::json;
     use std::sync::Arc;
+
+    /// `db.dialect()`：报引擎名；tx 回调对象同面（v0.1.61，`_shared/search` 依赖此分派）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn db_dialect_reports_engine_name() {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const inTx = await db.tx(async (tx) => tx.dialect());
+                     json.ok({ d: await db.dialect(), inTx });
+                   })().catch(e => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["d"], "sqlite", "{v}");
+        assert_eq!(v["data"]["inTx"], "sqlite", "tx 对象同样暴露 dialect：{v}");
+    }
 
     /// `db.nextSeq`：单语句原子取号（sqlite 离线；PG/MySQL 的真库并发见 env-gated 用例）。
     #[tokio::test(flavor = "current_thread")]

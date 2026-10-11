@@ -102,6 +102,9 @@ interface DBInstance {
   /** 平台序列分配（v0.1.24）：单语句原子取号，`max+1` 竞态的终态。
    * 首次使用自动建平台表 `_oj_sequences`；返回值 ≤2^53-1 是 number，超出是十进制字符串。 */
   nextSeq(name: string): Promise<number | string>;
+  /** 连接引擎名（v0.1.61）：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
+   * 诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，慎用。 */
+  dialect(): "sqlite" | "mysql" | "postgres";
   asTenant(id: string): DBInstance;
   // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
   // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
@@ -110,7 +113,9 @@ interface DBInstance {
 }
 
 // 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）。
-type TxInstance = Omit<DBInstance, "tx">;
+// isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
+// （MySQL 的 DDL 会隐式提交调用方事务）。
+type TxInstance = Omit<DBInstance, "tx"> & { isTx?: true };
 
 // json.* ：统一响应信封 + 响应头。
 interface JsonApi {

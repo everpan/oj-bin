@@ -367,6 +367,7 @@ deno_core::extension!(
         db::op_db_stream_abort,
         query::op_db_query_build,
         query::op_db_query_sql,
+        db::op_db_dialect,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,
