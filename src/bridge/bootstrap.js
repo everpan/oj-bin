@@ -75,6 +75,7 @@ import {
   op_mail_send_raw,
   op_mail_send_sync,
   op_oidc_info,
+  op_sso_providers,
   op_oidc_sign,
   op_oidc_verify,
   op_plugins,
@@ -651,6 +652,13 @@ globalThis.plugins = () => op_plugins();
 // Values are names only (config sections/keys, no values); there is no public HTTP
 // endpoint for this -- handlers call ojInfo() in-process.
 globalThis.ojInfo = () => op_oj_info();
+
+// ----- sso: HTTP form / CAS SSO provider registry (assembly-time http_sso: config) -----
+// sso.providers -> map of provider name -> cfg; missing section throws
+// "http sso not configured" (same semantics as oidc).
+globalThis.sso = {
+  get providers() { return op_sso_providers(); },
+};
 
 // ----- axis: generic plugin axes (self-reported names outside the typed axes) -----
 // axis("cache").get("k") -> op_axis_call("cache", "get", "[\"k\"]"); unknown axis

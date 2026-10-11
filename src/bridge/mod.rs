@@ -53,6 +53,7 @@ mod module_loader;
 pub mod mq;
 mod named_registry;
 pub mod oidc;
+pub mod sso;
 pub mod plugin_loader;
 mod plugins_op;
 mod query;
@@ -187,6 +188,9 @@ pub struct StableState {
     pub jwt: Option<Arc<JwtCfg>>,
     /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
     pub oidc: Option<Arc<oidc::OidcState>>,
+    /// HTTP 表单 / CAS SSO 提供者（v0.1.61，`http_sso:` 段）。None =
+    /// `sso.providers` 报 "http sso not configured"。
+    pub sso: Option<Arc<serde_json::Value>>,
     /// mail 后端（装配层按 smtp: 段 + oj-mail 插件注入）；None = mail.* 报 "mail not configured"。
     pub mail: Option<Arc<dyn mail::MailBackend>>,
     /// ldap 后端（装配层按 ldap: 段 + oj-ldap 插件注入）；None = ldap.* 报 "ldap not configured"。
@@ -239,6 +243,9 @@ pub struct Extras {
     pub jwt: Option<Arc<JwtCfg>>,
     /// OIDC 配置态（装配层从 config.oidc 构建）；None = oidc.* 报 "oidc not configured"。
     pub oidc: Option<Arc<oidc::OidcState>>,
+    /// HTTP 表单 / CAS SSO 提供者（v0.1.61，`http_sso:` 段）。None =
+    /// `sso.providers` 报 "http sso not configured"。
+    pub sso: Option<Arc<serde_json::Value>>,
     /// mail 后端（装配层构造 `mail::FfiMailBackend`）；None = mail.* 未配置报错。
     /// 注入时构造期一并挂 `deliver("mail.result")` 路由（见 `mail::install_mail_deliver`）。
     pub mail: Option<Arc<dyn mail::MailBackend>>,
@@ -398,6 +405,7 @@ deno_core::extension!(
         oidc::op_oidc_sign,
         oidc::op_oidc_verify,
         oidc::op_oidc_info,
+        sso::op_sso_providers,
         ws::op_ws_send,
         ws::op_ws_send_bin,
         cert::op_cert_gen,
@@ -716,6 +724,7 @@ impl Bridge {
             input_contracts: extras.input_contracts,
             jwt: extras.jwt,
             oidc: extras.oidc,
+            sso: extras.sso,
             kafkas: extras
                 .kafkas
                 .unwrap_or_else(|| Arc::new(NamedRegistry::new())),
@@ -2043,6 +2052,7 @@ mod tests {
             boot: None,
             jwt: None,
             oidc: None,
+            sso: None,
             kafkas: Arc::new(NamedRegistry::new()),
             rabbits: Arc::new(NamedRegistry::new()),
             tasks_flag: None,

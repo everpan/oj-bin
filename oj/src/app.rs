@@ -485,6 +485,13 @@ fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, Str
     Ok((jwt, oidc))
 }
 
+/// http_sso 段 → bridge `Extras.sso`（v0.1.61）。段不存在 = None（JS 报 not configured）。
+fn build_sso(cfg: &Config) -> Option<Arc<serde_json::Value>> {
+    cfg.http_sso
+        .as_ref()
+        .map(|m| Arc::new(serde_json::to_value(m).expect("http_sso serialize")))
+}
+
 /// mail 装配（装配第 N 步，spec 2026-09-15 §4）：顶层 `smtp:` 段 + oj-mail 插件 vtable
 /// → `Arc<dyn MailBackend>`（注入 `Extras.mail` 与 `StableState.mail`，两者同源）。
 ///
@@ -1008,6 +1015,8 @@ pub async fn assemble_backend(
         None => None,
     };
     let (jwt, oidc) = build_jwt_and_oidc(cfg, config_dir)?;
+    let sso = build_sso(cfg);   // v0.1.61：http_sso 段（'static 闭包外先算好）。
+    let sso_for_closure = sso.clone();   // move 闭包（:1104）捕获自有副本。
     // 共享事件总线：按 `--broker` 选中的 profile（`config.broker` 命名 map）连接；
     // 段为空 → 进程内 Bus；给定 profile 不存在 → fail-fast。
     let bus = {
@@ -1117,6 +1126,8 @@ pub async fn assemble_backend(
                     jwt: jwt.clone(),
                     // oidc 原语配置（OIDC 解耦：JS 端点 oidc.sign/verify/jwks 数据源）。
                     oidc: oidc.clone(),
+                    // http_sso 段（v0.1.61：JS 登录端点 sso.providers 数据源）。
+                    sso: sso_for_closure.clone(),
                     // mq 命名实例（T7 装配注入；此处空表兜底，编译占位）。
                     kafkas: Some(kafkas.clone()),
                     rabbits: Some(rabbits.clone()),
@@ -1162,6 +1173,7 @@ pub async fn assemble_backend(
         boot: boot.clone(),
         jwt: jwt.clone(),         // 与 make_bridge 的 Extras.jwt 同源。
         oidc: oidc.clone(),       // 与 make_bridge 的 Extras.oidc 同源。
+        sso: sso.clone(),         // 与 make_bridge 的 Extras.sso 同源。
         kafkas: kafkas.clone(),   // 与 make_bridge 的 Extras.kafkas 同源。
         rabbits: rabbits.clone(), // 与 make_bridge 的 Extras.rabbits 同源。
         tasks_flag: None,

@@ -360,6 +360,25 @@ interface OidcApi {
   readonly clients: Record<string, { secret: string; redirect_uris: string[]; tenant: string }>;
 }
 
+// sso.* ：HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，config `http_sso:` 段注入；
+// 未配置调用报 http sso not configured）。字段语义与校验规则见 api-manual §sso。
+interface SsoProviderCfg {
+  kind: "form" | "cas2";
+  login_url: string;
+  cas_validate_url?: string;
+  callback_url?: string;
+  user_field?: string;
+  pass_field?: string;
+  body_encoding?: "form" | "json";
+  extra_fields?: Record<string, unknown>;
+  success_when?: Record<string, unknown>;
+  profile?: Record<string, string>;
+  allow_http?: boolean;
+}
+interface SsoApi {
+  readonly providers: Record<string, SsoProviderCfg>;
+}
+
 // mail / Mail(key) ：邮件投递（config smtp: 段 + oj-mail 插件启用；未配置调用报
 // mail not configured）。宿主做校验/附件解析，插件做投递；所有方法**都 resolve 信封**
 // （校验失败 = {code:5}，不抛），只有「未配置」抛异常。
@@ -497,6 +516,9 @@ declare global {
   const cert: CertApi;
   const jwt: JwtApi;
   const oidc: OidcApi;
+  // sso.*：HTTP 表单 / CAS SSO 提供者注册表（config `http_sso:` 段注入；未配置调用报
+  // http sso not configured）。登录端点（业务模块）读它分派上游；详见 api-manual §sso。
+  const sso: SsoApi;
   const bcrypt: BcryptApi;
   // 部署期常量（config `vars:` 段；未声明的键恒 null）。
   const vars: VarsApi;
