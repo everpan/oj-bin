@@ -16,6 +16,49 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.61（未打标签）
+
+**feat（db）**：JS `db.dialect()` 报连接引擎名（`"sqlite" | "mysql" | "postgres"`）。供
+`_shared` 共享模块与诊断分派方言 SQL；`db.tx` 回调对象同面（并带 `isTx: true` 标记事务域
+句柄——DDL 必须拒绝在此类句柄上执行，见 search）。业务 handler 分支方言 = 放弃跨引擎
+可移植承诺，慎用。
+
+**feat（versions）**：内容版本化原语 `sample/src/_platform/_shared/versions.ts`——CAS
+内容表（sha256 去重，CHAR(64) PK）+ 修订表（`UNIQUE(entity_type, entity_id, version)`
+乐观锁兜底）+ 行级 LCS diff（格子预算 4M 闸）。`commit/get/history/diff/rollback`；
+并发双 commit 与 `expect` 撞版本统一 409 `version conflict`；在调用方 `db.tx` 内调用即
+同事务。建表迁移 `_platform/migrations/0002__versions.{sql,mysql.sql,pg.sql}`（MySQL
+TEXT 不可作 PK，故走手写方言迁移而非 schema.yaml）。
+
+**feat（search）**：引擎原生 FTS 统一面 `sample/src/_platform/_shared/search.ts`——
+sqlite FTS5(trigram) / mysql FULLTEXT(ngram，≥5.7.6) / postgres tsvector+GIN(PG12+)。
+`ensureIndex`（DDL，进程内每表一次，**禁止入 db.tx**——`tx.isTx` 直接拒绝）/
+`index`/`remove`（业务表 upsert/delete，绝不直写 FTS 对象）/`query`（绑定参数 + 标识符
+白名单 + 高亮：sqlite `snippet()`、pg `ts_headline()`、mysql 应用层截窗）。sqlite 短词
+（<3 字符）自动回退业务表 LIKE；FTS 短语引号包裹防语法注入；pg 占位符 `$n`。
+
+**feat（sso）**：HTTP 表单 / CAS SSO 登录来源。config 顶层 `http_sso:` 段（map，键 =
+提供者名）+ JS 全局 `sso.providers`（段缺省报 `http sso not configured`，同 oidc 语义）；
+装配期校验（kind 白名单 / form 必 `success_when` / cas2 必两 URL / 名字禁 `:` / 非 https
+缺省拒绝、`allow_http: true` 显式放行）。参考实现 `sample/src/sso/`：form 转发凭据
+（`body_encoding: form|json`，判定 `success_when` 点路径，网络错 502 / 判定失败 401 分态）
+与 cas2 302+ticket（XML 命名空间容忍正则）；JIT 键 `sso:<provider>:<tenant>:<username>` +
+`"!sso"` 占位 hash（该号永不可密码登录）；CAS 交接红线：token 不进 URL（httpOnly 双
+cookie）、302 目标白名单（`/` 开头非 `//`）。登录端点与 302 腿都进 `auth.` / `tenant.`
+两条匿名列表。`HttpSsoProvider` 手写 `Default`（derive 会绕过 serde 缺省函数，Rust 侧
+直接构造会得到空字段名的坏配置）。
+
+**docs（devkit）**：四件同步——api-manual（`db.dialect` / `sso.providers` 全局、第 10 章
+「sso」配置段、排障表 7 行、v0.2 限制表 FTS 边界）、scenarios 场景 28 重写（分层事实 +
+JIT 占位 hash + CAS 交接红线）与新增场景 29/30、SKILL 路由与陷阱行、README 索引。
+
+**test（sso）**：独立 e2e 目标 `oj/tests/sso_e2e.rs`（隔离 oj-auth OnceLock）：form
+JIT 登录 + cas2 ticket 回校 + provider 未配置 400 + 坏票 401（mock 上游为项目内业务模块）。
+
+**test（L1）**：`sample/tests/{versions,search}.test.ts`——versions 四用例（提交/取回/
+diff/回滚、乐观锁 409、CAS 去重、事务回滚一致性、大文档闸）；search 三用例（增删改检索
+一致、短词回退、DDL 拒事务、标识符白名单）。
+
 ## v0.1.60（未打标签）
 
 **feat（exec）**：`oj exec` 子命令不再要求 `config.yaml`（未找到时静默回落内置默认，不再向
