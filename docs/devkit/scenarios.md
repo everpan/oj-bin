@@ -1856,9 +1856,11 @@ export default {
     const body = await r.json().catch(() => null);
     // 成功判定读对方响应的具体字段；失败统一 json.fail，不回吐外部响应体
     if (!r.ok || !body || body.data?.code !== 0) json.fail(401, "invalid credentials");
-    // 多提供者时 provider 由请求携带并进键（见 docs/superpowers/specs/ v0.1.61 设计）
+    // provider 必须命中 config http_sso 已配置名单（未命中 400，防自报命名空间）；
+    // JIT 键含 provider 与 tenant 段做隔离（见 docs/superpowers/specs/ v0.1.61 设计）：
+    // "sso:<provider>:<tenant>:<username>"（未启用租户 tenant 为空串）
     const p = String(http.body.provider || "corp");
-    const localName = "sso:" + p + ":" + username;
+    const localName = "sso:" + p + ":" + (http.tenantId ?? "") + ":" + username;
     let rows = await db.table("users")
       .select(["id", "roles"])
       .where({ field: "username", op: "eq", value: localName }).all();
@@ -1892,22 +1894,25 @@ false**——该号永远不能走本地密码登录，只能由 SSO 换发（OI
 - 回跳腿 `GET /sso/cas/callback?ticket=ST-…` →
   `fetch("{cas}/serviceValidate?ticket=…&service=…")` → 响应含
   `<cas:authenticationSuccess>` 即成功，取 `<cas:user>` 走上面同款 JIT；
-- 成功后签发 token 并 302 回前端（同 OIDC callback 的桥接模式，`sample/src/oidc/`
-  是现成模板——CAS 比 OIDC 少 PKCE/JWKS，纯 XML 判定）。
+- 成功后签发 token 并 302 回前端。**交接红线**：token 不进 URL（httpOnly 双 cookie，
+  场景 14）；`service` 用装配期配置的固定 callback URL（禁从请求 Host 派生）；302
+  目标只认配置固定值或 `/` 开头且非 `//` 的相对路径（绝对 URL 400，防 open-redirect）。
 
-### ④ 配置：302 跳转腿进两条匿名列表
+### ④ 配置：登录端点与 302 腿都进两条匿名列表
 
 ```yaml
 auth:
   anonymous_paths:
-    - { path: "/sso/cas/*", one_layer: true }
+    - "/sso/login"                                # form 登录端点：无 token 可言，必须匿名
+    - { path: "/sso/cas/*", one_layer: true }     # CAS 302 腿（带不了自定义头）
 tenant:
   anonymous_paths:
-    - { path: "/sso/cas/*", one_layer: true }   # 两条列表独立，都要加（OIDC 同款）
+    - "/sso/login"
+    - { path: "/sso/cas/*", one_layer: true }     # 两条列表独立，都要加（OIDC 同款）
 ```
 
-纯表单形态 `POST /sso/login` 是前端直调的普通 API，**不需要**匿名——要匿名的
-只有 CAS 这类浏览器 302 腿（带不了自定义头）。
+登录端点**必须**匿名——守卫对非匿名路径无 token 一律 401，而登录恰恰是无 token 时
+调用的（`/auth/login` 先例）；CAS 302 腿还带不了自定义头/租户头，故两条列表都要。
 
 ### ⑤ 常见坑
 
@@ -1917,8 +1922,9 @@ tenant:
 | JIT 建号给了真实口令 hash 或空串 | 占位串（`"!sso"`）就是「此号不走密码登录」的声明——bcrypt 对非法 hash 恒 false；写真实 hash 等于给 SSO 账号开了第二条密码攻击面 |
 | username 不带来源前缀 | `sso:zhang` 与本地 `zhang` 必须是两个号；混用同一键 = 低信任来源可接管高信任账号 |
 | 把外部 SSO 响应体回吐给前端 | 泄露内部信息——失败统一 `json.fail(401, …)`，成功判定只读具体字段 |
-| 生产走 http:// | SSO 凭据明文过网——强制 HTTPS；凭据不进日志 |
+| 生产走 http:// | SSO 凭据明文过网——缺省拒绝非 https 的 `login_url`（装配期报错），内网联调显式 `allow_http: true` 才放行（带 WARN，与 mail 的 `allow_none_tls` 同口径）；凭据不进日志 |
 | CAS 回跳 401 | 跳转/回跳腿没进 `auth.` / `tenant.` **两条**匿名列表（互相独立，只加一条不够） |
+| token 拼进 CAS 回跳 URL | 泄露面（Referer/浏览器历史）——httpOnly 双 cookie 交接；302 目标只认配置固定值或 `/` 开头相对路径，防 open-redirect |
 
 ## 附：无配置文件快速用法（v0.1.57）
 
