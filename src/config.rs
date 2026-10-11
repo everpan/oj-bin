@@ -573,6 +573,48 @@ pub fn validate_anon_paths(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// http_sso 段装配期校验（v0.1.61）：kind 白名单 / form 必 success_when / cas2 必两 URL /
+/// name 禁 `:` / HTTPS 门禁（allow_http 显式放行）。load 期统一执行。
+pub fn validate_http_sso(cfg: &Config) -> Result<(), String> {
+    let Some(provs) = &cfg.http_sso else {
+        return Ok(());
+    };
+    for (name, p) in provs {
+        if name.contains(':') {
+            return Err(format!("http_sso.{name}: name must not contain ':'"));
+        }
+        match p.kind.as_str() {
+            "form" => {
+                if p.success_when.is_empty() {
+                    return Err(format!("http_sso.{name}: form requires success_when"));
+                }
+            }
+            "cas2" => {
+                if p.cas_validate_url.is_empty() || p.callback_url.is_empty() {
+                    return Err(format!(
+                        "http_sso.{name}: cas2 requires cas_validate_url and callback_url"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!("http_sso.{name}: unknown kind {other:?} (form | cas2)"));
+            }
+        }
+        for (what, url) in [
+            ("login_url", &p.login_url),
+            ("cas_validate_url", &p.cas_validate_url),
+            ("callback_url", &p.callback_url),
+        ] {
+            if !url.is_empty() && !url.starts_with("https://") && !p.allow_http {
+                return Err(format!(
+                    "http_sso.{name}: {what} must be https (set allow_http: true to override)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// mounts 结构校验（v0.1.58 规则 1/2 + 「api/web 恰好其一」）。load 期统一执行；
 /// 跨条目前缀判定用轻量归一（去尾斜杠，`/docs` 与 `/docs/` 同 prefix）——
 /// 「必须以 `/` 开头 / 目录 canonicalize / 逐条目 dev-release 判定」归装配期
@@ -974,6 +1016,55 @@ pub struct OidcSection {
     pub clients: HashMap<String, OidcClientCfg>,
 }
 
+/// HTTP 表单 / CAS SSO 提供者（v0.1.61，spec 2026-10-11 §一）。`http_sso:` 段存在即启用；
+/// map 键 = 提供者名（禁 `:`，JIT 键按 `:` 切分）。段内敏感值写 ENC[...]——装载期整树
+/// 自动解封（secret.rs decrypt_tree），无私钥 fail-fast。
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HttpSsoProvider {
+    /// form | cas2
+    pub kind: String,
+    /// form: 凭据校验端点；cas2: CAS /login
+    #[serde(default)]
+    pub login_url: String,
+    /// cas2 必填：ticket 校验端点（/serviceValidate）
+    #[serde(default)]
+    pub cas_validate_url: String,
+    /// cas2 必填：本站回跳绝对 URL（装配期固定，禁从请求 Host 派生——防 ticket 校验被引偏）
+    #[serde(default)]
+    pub callback_url: String,
+    /// 缺省 username
+    #[serde(default = "default_sso_user_field")]
+    pub user_field: String,
+    /// 缺省 password
+    #[serde(default = "default_sso_pass_field")]
+    pub pass_field: String,
+    /// form 出站编码：form（urlencoded，缺省）| json
+    #[serde(default = "default_sso_body_encoding")]
+    pub body_encoding: String,
+    /// 附加固定字段（app_id 等；secret 类值写 ENC[...]）
+    #[serde(default)]
+    pub extra_fields: HashMap<String, serde_json::Value>,
+    /// 成功判定：点路径 → 期望值，全部命中即成功；form 必填
+    #[serde(default)]
+    pub success_when: HashMap<String, serde_json::Value>,
+    /// 用户信息映射：本地 users 列 → 上游响应点路径
+    #[serde(default)]
+    pub profile: HashMap<String, String>,
+    /// 显式允许 http:// 上游（内网联调）。缺省拒绝（fail-closed，同 smtp allow_none_tls 口径）
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
+fn default_sso_user_field() -> String {
+    "username".into()
+}
+fn default_sso_pass_field() -> String {
+    "password".into()
+}
+fn default_sso_body_encoding() -> String {
+    "form".into()
+}
+
 /// 长任务池配置（spec 2026-09-07 §6）。dir 相对 API 目录（dev=src/、release=dist/）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -1135,6 +1226,9 @@ pub struct Config {
     pub auth: Option<AuthCfg>,
     /// None = 不启用 OIDC。
     pub oidc: Option<OidcSection>,
+    /// HTTP 表单 / CAS SSO（v0.1.61）。None = 不启用（JS `sso.providers` 报 not configured）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_sso: Option<HashMap<String, HttpSsoProvider>>,
     /// None = 不启用 blob（blob 全局/上传/下载路由均不挂）。
     pub blob: Option<BlobSection>,
     /// None = 不启用 fs（`fs.*` 全局报 NotCapable）；段存在即 jail 到 root。
@@ -1398,6 +1492,58 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// http_sso 校验矩阵（v0.1.61）：kind 白名单 / form 必 success_when / cas2 必两 URL /
+    /// name 禁 `:` / 缺省拒 http，allow_http 放行。
+    #[test]
+    fn validate_http_sso_matrix() {
+        let mut cfg = Config::default();
+        assert!(validate_http_sso(&cfg).is_ok(), "段缺省 = 不校验");
+        let mut p = HttpSsoProvider {
+            kind: "form".into(),
+            login_url: "https://sso.corp.com/login".into(),
+            ..Default::default()
+        };
+        let mut m = std::collections::HashMap::new();
+        m.insert("corp".to_string(), p.clone());
+        cfg.http_sso = Some(m);
+        assert!(validate_http_sso(&cfg).is_err(), "form 缺 success_when 必须拒绝");
+        p.success_when.insert("message".to_string(), serde_json::json!(""));
+        let mut m2 = std::collections::HashMap::new();
+        m2.insert("corp".to_string(), p.clone());
+        cfg.http_sso = Some(m2);
+        assert!(validate_http_sso(&cfg).is_ok());
+        let mut m3 = std::collections::HashMap::new();
+        m3.insert("ba:d".to_string(), p.clone());
+        cfg.http_sso = Some(m3);
+        assert!(validate_http_sso(&cfg).is_err(), "name 含 `:` 必须拒绝");
+        let p2 = HttpSsoProvider {
+            kind: "cas2".into(),
+            login_url: "http://sso.corp.com/login".into(),   // http 且未 allow_http
+            ..Default::default()
+        };
+        let mut m4 = std::collections::HashMap::new();
+        m4.insert("corp".to_string(), p2.clone());
+        cfg.http_sso = Some(m4);
+        assert!(validate_http_sso(&cfg).is_err(), "非 https 缺省拒绝");
+        let p3 = HttpSsoProvider {
+            allow_http: true,
+            ..p2
+        };
+        let mut m5 = std::collections::HashMap::new();
+        m5.insert("corp".to_string(), p3.clone());
+        cfg.http_sso = Some(m5);
+        assert!(validate_http_sso(&cfg).is_err(), "cas2 缺两 URL 必须拒绝（https 放行后仍要报）");
+        let p4 = HttpSsoProvider {
+            cas_validate_url: "https://sso.corp.com/serviceValidate".into(),
+            callback_url: "https://app.corp.com/v1/api/sso/cas/callback/".into(),
+            ..p3.clone()
+        };
+        let mut m6 = std::collections::HashMap::new();
+        m6.insert("corp".to_string(), p4);
+        cfg.http_sso = Some(m6);
+        assert!(validate_http_sso(&cfg).is_ok(), "allow_http + cas2 两 URL 齐全 → 放行");
+    }
 
     /// PR-4：堆限额默认 256 MiB，且 < 32 MiB（含 0）装配校验 fail-fast。
     #[test]
