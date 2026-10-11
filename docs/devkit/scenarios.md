@@ -1832,6 +1832,94 @@ curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"he
 | 同名泛型轴两个插件都声明 | 装配期 fail-fast（泛型轴每名单提供者）——`plugins:` 清单里只留一个 |
 | 想列一个轴有哪些 op | 协议面没有内省——插件文档/README 为准（如 oj-ldap：`bind/search/search_paged/whoami/compare`） |
 
+## 场景 28：新增一种登录来源（HTTP SSO / CAS / 企业统一登录）
+
+> 何时抄我：企业统一登录是「把用户名/密码 POST 到公司 SSO 地址，按 JSON 响应判
+> 成败」的表单形态，或 CAS（302 跳转 + ticket 回校）。**先记住分层：`oj-auth`
+> 插件只是守卫**（Bearer/cookie 验签 + 匿名路径 + CSRF），**所有登录端点本来就是
+> 普通业务模块**——sample 的 `/auth/login`、`/oidc/*` 全是 JS handler，守卫对
+> 「登录从哪来」不可见。新增来源 = 新写一个业务模块（照抄 `sample/src/oidc/`
+> 或 `sample/src/auth/`），**不要动 oj-auth 插件**（那是 ABI 面）。
+
+### ① 表单形态：转发凭据到外部端点（src/sso/login/api.ts）
+
+```ts
+export default {
+  async post() {
+    const { username, password } = http.body;
+    // POST 到企业 SSO，字段名按对方要求组装
+    const r = await fetch("https://sso.corp.com/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password, app_id: "myapp" }),
+    });
+    const body = await r.json().catch(() => null);
+    // 成功判定读对方响应的具体字段；失败统一 json.fail，不回吐外部响应体
+    if (!r.ok || !body || body.data?.code !== 0) json.fail(401, "invalid credentials");
+    // 多提供者时 provider 由请求携带并进键（见 docs/superpowers/specs/ v0.1.61 设计）
+    const p = String(http.body.provider || "corp");
+    const localName = "sso:" + p + ":" + username;
+    let rows = await db.table("users")
+      .select(["id", "roles"])
+      .where({ field: "username", op: "eq", value: localName }).all();
+    if (!rows.length) {
+      await db.table("users")
+        .insert({ username: localName, password_hash: "!sso", roles: "[]" }).run();
+      rows = await db.table("users")
+        .select(["id", "roles"])
+        .where({ field: "username", op: "eq", value: localName }).all();
+    }
+    const roles = JSON.parse(<string>rows[0].roles || "[]");
+    json.ok(await issueTokens(String(rows[0].id), roles));   // 与本地登录同构，见场景 14
+  },
+};
+```
+
+签发/会话/CSRF 与本地登录完全同构（`sample/src/auth/_shared/session.ts` 的
+`issueTokens` + 场景 14 的双 cookie）——登录来源只决定「凭据验过没有」，验过即
+换发自家 token，后续请求对守卫无异。
+
+### ② JIT 建号：占位 hash 锁死密码登录
+
+上面 `password_hash: "!sso"` 是关键：**非法 bcrypt 串，`bcrypt.verify` 恒
+false**——该号永远不能走本地密码登录，只能由 SSO 换发（OIDC 同款：`"oidc:<tenant>:<sub>"`
++ `"!oidc"`，零 schema 变更）。username 带来源前缀做命名空间隔离：`sso:zhang`
+与本地 `zhang` 是两个号；两不同信任级的来源不得指同一键。
+
+### ③ CAS 形态：302 跳转 + ticket 回校
+
+- 跳转腿 `GET /sso/cas/login` → 302 到 `{cas}/login?service={callback URL}`；
+- 回跳腿 `GET /sso/cas/callback?ticket=ST-…` →
+  `fetch("{cas}/serviceValidate?ticket=…&service=…")` → 响应含
+  `<cas:authenticationSuccess>` 即成功，取 `<cas:user>` 走上面同款 JIT；
+- 成功后签发 token 并 302 回前端（同 OIDC callback 的桥接模式，`sample/src/oidc/`
+  是现成模板——CAS 比 OIDC 少 PKCE/JWKS，纯 XML 判定）。
+
+### ④ 配置：302 跳转腿进两条匿名列表
+
+```yaml
+auth:
+  anonymous_paths:
+    - { path: "/sso/cas/*", one_layer: true }
+tenant:
+  anonymous_paths:
+    - { path: "/sso/cas/*", one_layer: true }   # 两条列表独立，都要加（OIDC 同款）
+```
+
+纯表单形态 `POST /sso/login` 是前端直调的普通 API，**不需要**匿名——要匿名的
+只有 CAS 这类浏览器 302 腿（带不了自定义头）。
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 想加 SSO 就去改 oj-auth 插件 | 方向错了：插件只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI（`AuthGuardVtable`，全部插件联动重编）；登录端点是业务模块，本场景 + `sample/src/oidc/` 覆盖 |
+| JIT 建号给了真实口令 hash 或空串 | 占位串（`"!sso"`）就是「此号不走密码登录」的声明——bcrypt 对非法 hash 恒 false；写真实 hash 等于给 SSO 账号开了第二条密码攻击面 |
+| username 不带来源前缀 | `sso:zhang` 与本地 `zhang` 必须是两个号；混用同一键 = 低信任来源可接管高信任账号 |
+| 把外部 SSO 响应体回吐给前端 | 泄露内部信息——失败统一 `json.fail(401, …)`，成功判定只读具体字段 |
+| 生产走 http:// | SSO 凭据明文过网——强制 HTTPS；凭据不进日志 |
+| CAS 回跳 401 | 跳转/回跳腿没进 `auth.` / `tenant.` **两条**匿名列表（互相独立，只加一条不够） |
+
 ## 附：无配置文件快速用法（v0.1.57）
 
 所有子命令的 `-c/--config` 均可省略。省略时按序搜索：**CWD 逐级向上 `config.yaml` →

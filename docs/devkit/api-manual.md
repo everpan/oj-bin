@@ -2215,6 +2215,12 @@ auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 
 `oidc-implementation.md` / `oidc-integration.md`（仓库在 `docs/` 下，发行包随 devkit
 同目录附带）。
 
+> 分层注记：`oj-auth` 插件只是**守卫**（Bearer/cookie 验签 + 匿名路径 + CSRF），
+> `sample/src/auth/`、`sample/src/oidc/` 这些登录端点全是**普通业务模块**——守卫对
+> 登录来源不可见。新增一种登录来源（企业 HTTP 表单 / CAS SSO 等）= 新写一个业务
+> 模块 + 匿名路径放行跳转腿，不改插件、不动 ABI；JIT 建号用「来源前缀键 +
+> 非法占位 password_hash（`bcrypt.verify` 恒 false）」。可照抄见 `scenarios.md` 场景 28。
+
 ## 9. 测试
 
 > 何时读我：写模块测试或搭 CI 时。

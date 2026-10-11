@@ -34,6 +34,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    v0.1.54 起调用面为 `axis("ldap").bind/search/search_paged/whoami/compare`，reject 模型，
    仅 `bind` 凭据错返回 `false`；filter 用户输入**必须转义**）。完整手册见仓库
    `docs/ldap-integration.md`，可照抄代码见 `scenarios.md` 场景 11。
+   **新增登录来源（企业 HTTP 表单 / CAS SSO）→ 不改 oj-auth 插件**——它只是守卫
+   （验签 + 匿名路径 + CSRF），登录端点全是普通业务模块；照抄 `sample/src/oidc/`，
+   可照抄代码见 `scenarios.md` 场景 28。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
@@ -97,6 +100,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
 | 登录响应要同时下发 `oj_sess` + `oj_csrf` 两枚 cookie | v0.1.46 起 `json.header` 同名头追加、`Set-Cookie` 合法双发（此前响应头单值，csrf 只能 body 下发 + 前端写 `document.cookie`）；登出记得两枚都 `Max-Age=0` |
+| 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `sample/src/oidc/`（场景 28）。JIT 建号用「`来源:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录），CAS 302 腿记得 `auth.`/`tenant.` 两条匿名列表都加 |
 | 裸 import 报 `Package subpath 'x' is not defined by "exports"` | v0.1.30 起有 `exports` 即封闭语义（Node 一致）：未命中的子路径**不回落** `main`/`module`——检查包的真实导出键，或该包确未导出此子路径 |
 | CJS `require("path")` 报 `Node builtin 'path' is not available in oj runtime` | Node 内建不可用——找该包的浏览器/wasm 构建（与 wasm 引擎包同款约定） |
 | `blob.uploadUrl` 报 `local blob backend has no upload presign` | local 后端无预签名——s3 才返回预签名 URL；local 用直传路由 `PUT {base}/blob/{key}`（记得带鉴权头） |
