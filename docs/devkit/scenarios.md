@@ -19,7 +19,7 @@
 | [9](#场景-9路径参数路由_name_-目录-vs-route) | 路径里带参数：`_name_` 目录 vs `.route`（v0.1.27） | §4 编写 api.ts |
 | [10](#场景-10池化长任务--cronv0128) | 池化长任务 + cron：三钩子任务文件 + crontab.yaml + 管理 API（v0.1.28） | §6 池化任务与 cron |
 | [11](#场景-11ldapad-登录鉴证v0128v0154-起调用面迁移-axisldap) | LDAP/AD 登录鉴证或目录查询（v0.1.54 起 `axis("ldap").bind/search/...`，filter 用户输入须转义，v0.1.28） | §6 ldap / §8 鉴权 |
-| [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + 输出通道分离（console.log 原样 stdout，v0.1.29/v0.1.55） | §11 `oj exec` |
+| [12](#场景-12一次性数据修复脚本oj-execv0129) | `oj exec` 直接跑 ts/js：一次性数据修复/对账/批处理，完整后端全局 + 输出通道分离（console.log 原样 stdout，v0.1.29/v0.1.55）；**v0.1.60 起无需 config 静默回落 + `-e`/REPL 单表达式回显** | §11 `oj exec` |
 | [13](#场景-13大文件直传绕开-10mb30s-v0130) | office 大附件 >10MB / 上传+处理超 30s：`blob.uploadUrl` 预签名（s3）或 `PUT {base}/blob/{key}` 直传路由（local）（v0.1.30） | §6 blob |
 | [14](#场景-14浏览器登录cookie-会话--csrf-v0130) | 浏览器表单登录：HttpOnly `oj_sess` + CSRF 双提交；WS 握手同守卫（v0.1.30） | §8 鉴权 |
 | [15](#场景-15ws-房间广播presence-v0130) | 同房间成员互发消息/在线人数：`ws.join` / `ws.broadcast` / `ws.roomSize`（v0.1.30） | §6 ws |
@@ -983,6 +983,26 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 | import 报 escapes project root | 相对导入钳制在项目根（config 所在目录）内且须显式扩展名（`import "./util.ts"`）；`import "../x"` 上跳被拒 |
 | `-e/--code`、`--repl` 里 `import "./util"` 报找不到 | 内联代码/REPL 无基准目录、不支持相对 import——要复用模块请走 `oj exec <file>` |
 | REPL 上 `const x=1` 下一行读不到 | 每行独立模块、作用域隔离；跨行共享须显式 `globalThis.x = 1` |
+
+### ⑥ 零配置与表达式回显（v0.1.60）
+
+**无需 config.yaml**：省略 `-c` 时向上搜索不到即用内置默认，且**不再向 stderr 打
+`note: no config.yaml found`**（`oj exec` / `oj info` 同口径；仅 `serve` / `migrate` /
+`openapi` 等依赖后端配置的场景保留该提示）。纯计算脚本 `-e '1'` 之类可零配置直接跑。
+
+**`-e` / REPL 默认回显单表达式求值结果**（devtools 风格）：整段是单个顶层表达式语句时
+自动包裹 `console.log((<expr>))` 输出其值；多语句 / 声明 / 已显式 `console.log` 不回显
+（避免污染输出、不叠打 `undefined`）。
+
+```bash
+./bin/oj exec -e '1'                    # → 1（stdout）
+./bin/oj exec -e '({a:1})'            # → {"a":1}
+./bin/oj exec -e 'await db.query("select 1", [])'   # 顶层 await 保真，回显结果
+./bin/oj exec -e 'const x=1; x'        # 多语句：不回显
+./bin/oj exec -e 'console.log("x")'    # 已显式打印：仅输出 x，不叠打 undefined
+# 无 -c 也能跑（零配置）：
+./bin/oj exec -e '1'
+```
 | `sql_guard: "deny"` 库上查询被拦 | exec 无 HTTP 上下文 = 匿名操作员，且守卫不设防；被 deny 拦的查询加 `await db.asSystem()` |
 | 脚本卡死不退 | exec 无超时/KillSwitch——同步死循环只能 Ctrl-C；常驻轮询搬进 `src/tasks/` 任务池 |
 | `--log-file` 没生成 | 打开失败只 warn 一次不中断——看 stderr 首行（路径不可写等） |
