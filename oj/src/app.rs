@@ -1015,8 +1015,8 @@ pub async fn assemble_backend(
         None => None,
     };
     let (jwt, oidc) = build_jwt_and_oidc(cfg, config_dir)?;
-    let sso = build_sso(cfg);   // v0.1.61：http_sso 段（'static 闭包外先算好）。
-    let sso_for_closure = sso.clone();   // move 闭包（:1104）捕获自有副本。
+    let sso = build_sso(cfg); // v0.1.61：http_sso 段（'static 闭包外先算好）。
+    let sso_for_closure = sso.clone(); // move 闭包（:1104）捕获自有副本。
     // 共享事件总线：按 `--broker` 选中的 profile（`config.broker` 命名 map）连接；
     // 段为空 → 进程内 Bus；给定 profile 不存在 → fail-fast。
     let bus = {

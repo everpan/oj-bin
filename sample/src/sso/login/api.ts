@@ -31,7 +31,14 @@ export default {
       json.fail(502, "sso upstream failed");
       return;
     }
-    const body: unknown = await r.json().catch(() => null);
+    // 判定用 body：text + JSON.parse（兼容上游直接回对象或 json.raw(string) 双重编码形态）
+    let body: unknown = null;
+    try {
+      body = JSON.parse(await r.text());
+      if (typeof body === "string") body = JSON.parse(body);
+    } catch {
+      body = null;
+    }
     if (!r.ok || !body || !hitWhen(body, p.success_when ?? {})) {
       json.fail(401, "invalid credentials");
       return;

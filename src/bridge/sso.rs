@@ -7,8 +7,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use deno_core::op2;
 use deno_core::OpState;
+use deno_core::op2;
 use deno_error::JsErrorBox;
 
 /// 取 SSO 配置态（未配置 → 报错，同 oidc 的 not configured 语义）。
@@ -17,15 +17,15 @@ fn sso_of(state: &deno_core::OpState) -> Result<std::sync::Arc<serde_json::Value
         .borrow::<std::sync::Arc<crate::bridge::StableState>>()
         .sso
         .clone()
-        .ok_or_else(|| JsErrorBox::generic("http sso not configured (config http_sso: section missing)"))
+        .ok_or_else(|| {
+            JsErrorBox::generic("http sso not configured (config http_sso: section missing)")
+        })
 }
 
 /// `sso.providers`：`http_sso:` 段原样（map：提供者名 → 配置）。
 #[op2]
 #[serde]
-pub fn op_sso_providers(
-    state: Rc<RefCell<OpState>>,
-) -> Result<serde_json::Value, JsErrorBox> {
+pub fn op_sso_providers(state: Rc<RefCell<OpState>>) -> Result<serde_json::Value, JsErrorBox> {
     Ok((*sso_of(&state.borrow())?).clone())
 }
 
@@ -47,7 +47,10 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
         assert!(
-            v["data"].as_str().unwrap().contains("http sso not configured"),
+            v["data"]
+                .as_str()
+                .unwrap()
+                .contains("http sso not configured"),
             "{v}"
         );
     }

@@ -597,7 +597,9 @@ pub fn validate_http_sso(cfg: &Config) -> Result<(), String> {
                 }
             }
             other => {
-                return Err(format!("http_sso.{name}: unknown kind {other:?} (form | cas2)"));
+                return Err(format!(
+                    "http_sso.{name}: unknown kind {other:?} (form | cas2)"
+                ));
             }
         }
         for (what, url) in [
@@ -1019,7 +1021,7 @@ pub struct OidcSection {
 /// HTTP 表单 / CAS SSO 提供者（v0.1.61，spec 2026-10-11 §一）。`http_sso:` 段存在即启用；
 /// map 键 = 提供者名（禁 `:`，JIT 键按 `:` 切分）。段内敏感值写 ENC[...]——装载期整树
 /// 自动解封（secret.rs decrypt_tree），无私钥 fail-fast。
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HttpSsoProvider {
     /// form | cas2
     pub kind: String,
@@ -1063,6 +1065,26 @@ fn default_sso_pass_field() -> String {
 }
 fn default_sso_body_encoding() -> String {
     "form".into()
+}
+
+// 手写 Default（不用 derive）：derive 会把 user_field/pass_field/body_encoding 置空串、
+// 绕过 serde 缺省函数——Rust 侧直接构造（测试/编程装配）会得到「空字段名」的坏配置。
+impl Default for HttpSsoProvider {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            login_url: String::new(),
+            cas_validate_url: String::new(),
+            callback_url: String::new(),
+            user_field: default_sso_user_field(),
+            pass_field: default_sso_pass_field(),
+            body_encoding: default_sso_body_encoding(),
+            extra_fields: HashMap::new(),
+            success_when: HashMap::new(),
+            profile: HashMap::new(),
+            allow_http: false,
+        }
+    }
 }
 
 /// 长任务池配置（spec 2026-09-07 §6）。dir 相对 API 目录（dev=src/、release=dist/）。
@@ -1507,8 +1529,12 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert("corp".to_string(), p.clone());
         cfg.http_sso = Some(m);
-        assert!(validate_http_sso(&cfg).is_err(), "form 缺 success_when 必须拒绝");
-        p.success_when.insert("message".to_string(), serde_json::json!(""));
+        assert!(
+            validate_http_sso(&cfg).is_err(),
+            "form 缺 success_when 必须拒绝"
+        );
+        p.success_when
+            .insert("message".to_string(), serde_json::json!(""));
         let mut m2 = std::collections::HashMap::new();
         m2.insert("corp".to_string(), p.clone());
         cfg.http_sso = Some(m2);
@@ -1519,7 +1545,7 @@ mod tests {
         assert!(validate_http_sso(&cfg).is_err(), "name 含 `:` 必须拒绝");
         let p2 = HttpSsoProvider {
             kind: "cas2".into(),
-            login_url: "http://sso.corp.com/login".into(),   // http 且未 allow_http
+            login_url: "http://sso.corp.com/login".into(), // http 且未 allow_http
             ..Default::default()
         };
         let mut m4 = std::collections::HashMap::new();
@@ -1533,7 +1559,10 @@ mod tests {
         let mut m5 = std::collections::HashMap::new();
         m5.insert("corp".to_string(), p3.clone());
         cfg.http_sso = Some(m5);
-        assert!(validate_http_sso(&cfg).is_err(), "cas2 缺两 URL 必须拒绝（https 放行后仍要报）");
+        assert!(
+            validate_http_sso(&cfg).is_err(),
+            "cas2 缺两 URL 必须拒绝（https 放行后仍要报）"
+        );
         let p4 = HttpSsoProvider {
             cas_validate_url: "https://sso.corp.com/serviceValidate".into(),
             callback_url: "https://app.corp.com/v1/api/sso/cas/callback/".into(),
@@ -1542,7 +1571,10 @@ mod tests {
         let mut m6 = std::collections::HashMap::new();
         m6.insert("corp".to_string(), p4);
         cfg.http_sso = Some(m6);
-        assert!(validate_http_sso(&cfg).is_ok(), "allow_http + cas2 两 URL 齐全 → 放行");
+        assert!(
+            validate_http_sso(&cfg).is_ok(),
+            "allow_http + cas2 两 URL 齐全 → 放行"
+        );
     }
 
     /// PR-4：堆限额默认 256 MiB，且 < 32 MiB（含 0）装配校验 fail-fast。
