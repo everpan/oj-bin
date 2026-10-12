@@ -351,18 +351,28 @@ jobs:
   # 下 job 结论仍绿，告警形同虚设）。失败 = workflow 红；GitHub Release 由 publish job
   # 先行创建不受影响；幂等设计支持 Re-run failed jobs 只重跑本段。
   #
-  # 只依赖 guard，不依赖 package，产物按 run 类型二选一：
-  #   - 首发 run（skip=false，dispatch draft=false / 真实 tag 推送）：用本次构建产物；
+  # 依赖 guard + package，产物按 run 类型二选一：
+  #   - 首发 run（skip=false，dispatch draft=false / 真实 tag 推送）：等 package 成功后
+  #     用本次构建产物。曾经只依赖 guard——首发 run 与 package 赛跑，download-artifact
+  #     拿到空 dist，npm-publish.sh 直接红（v0.1.61 首次编译实测）；等 package 成功
+  #     即根除该竞态，package 失败则本 job 跳过（红在构建腿，发布腿不加噪）。
   #   - 草稿转正（release: published，即人工点发布的手动确认）与 tag 重爬 run
-  #     （skip=true）：package 未跑、无 actions 产物 → 从 release 资产拉首发 run
-  #     上传的 dist/*，照旧走 npm-publish.sh 幂等 publish（已发布即 skip）。
+  #     （skip=true）：package 被 skip，if 的 always() 放行 → 从 release 资产拉首发
+  #     run 上传的 dist/*，照旧走 npm-publish.sh 幂等 publish（已发布即 skip）。
   #   注：dispatch draft=true 的首发 run 不发 npm（下方 if 的 draft 门禁）；草稿人工
   #   转正才触发 release 事件接续。gh release create 用 GITHUB_TOKEN，其触发的
   #   release/push 事件被 GitHub 抑制，不会造成额外重跑。
   publish-npm:
     name: publish npm (@oj-bin)
-    needs: [guard]
-    if: github.event_name == 'release' || github.event_name == 'push' || inputs.draft != 'true'
+    needs: [guard, package]
+    # always()：needs 里被 skip 的 package 不许连坐 skip 本 job（skip=true 路径靠
+    # release 资产）；skip=false 时 package 必须 success 才有产物可发。
+    if: >-
+      ${{
+        always()
+        && (github.event_name == 'release' || github.event_name == 'push' || inputs.draft != 'true')
+        && (needs.guard.outputs.skip == 'true' || needs.package.result == 'success')
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # npm 发布走 Trusted Publishing（OIDC，docs.npmjs.com/trusted-publishers）：账号开了 2FA
