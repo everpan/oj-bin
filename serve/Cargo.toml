@@ -10,6 +10,7 @@ test-support = []
 [dependencies]
 only-js = { path = ".." }
 axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
 matchit = "0.8"
 percent-encoding = "2.3"
 form_urlencoded = "1.2"

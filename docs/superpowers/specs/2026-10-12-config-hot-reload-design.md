@@ -1,7 +1,7 @@
 # config 热更新设计（v1）
 
 - 日期：2026-10-12
-- 状态：已评审（双专家对抗复核后修订），待实现计划
+- 状态：已评审（双专家对抗复核 + 第二轮复核后修订），待实现计划
 - 关联：`serve/src/lib.rs`（路由装配）、`oj/src/app.rs`（App 生命周期）、`oj/src/serve_cmd.rs`（启动编排）、`oj/src/tasks.rs`（任务池）
 
 ## 1. 背景与目标
@@ -23,28 +23,38 @@
 
 ```
 TcpListener（永生，只 bind 一次）
-  └─ 外层 Router（启动期构造一次，静态）
-       ├─ {p}/_system/health        GET（新位，匿名，每 api 挂载）
-       ├─ {p}/health                GET（旧位废弃别名，匿名，每次命中 warn）
-       ├─ {p}/_system/config        GET/POST（reload_api 开启才注册；自带守卫）
-       └─ fallback → watch::Receiver<Arc<Router>> 取当前内层 Router
-                      → 原样 oneshot 转发（不 nest、不剥前缀）
+  └─ 外层 Router（启动期构造一次，静态，只挂一个 fallback，不挂任何中间件）
+       └─ fallback 持有 Arc<ReloadState>，按路径分流：
+            ├─ 命中某已知 mount prefix 的 {p}/_system/health
+            │     → 新位 200；{p}/health 旧别名 → 200 + warn（每命中一条）
+            ├─ 命中某已知 mount prefix 的 {p}/_system/config
+            │     → 自拦鉴权（见 §4）后走 reload 流程（POST）/ 摘要（GET）
+            └─ 其余 → watch::Receiver<Arc<Router>> 取当前内层 Router
+                     → 原样 oneshot 转发（不 nest、不剥前缀）
                                     ▲
 内层 Router = App.router（业务 + /plugins + 静态挂载 + WS 路由）
 热更 = watch::Sender::send(新 Router) + 旧 App 靠 Arc 引用计数自然 drain
 ```
 
+> **第二轮复核修订**：原设计把 `{p}/_system/*` 作为外层**具体路由**逐 prefix 注册，
+> 与「外层启动期构造一次、静态」冲突——重载**新增** api 挂载前缀时该前缀拿不到
+> `_system` 端点（违反「绝无静默不生效」）。改为：外层只挂**单一 fallback**，
+> `_system`/health 由该 fallback 在 ReloadState 已知的 mount prefix 集合上分流处理，
+> 不再以内层路由形式存在。这样既保留「外层静态、只构造一次」，又让 mounts 变化
+> （含新增前缀）只需更新 ReloadState 的 prefix 集合即可，且 `_system` 仍在外层、
+> 不经内层证书 GET 门禁（满足 §9.5 运维到期可用）。
+
 关键事实（复核确认）：
 
-- `Router` 内部 Arc，克隆廉价；外层 fallback 原样转发即可，`{base}` 之外的路径全部由内层 fallback `handle`（`serve/src/lib.rs:235,440-446`）最长前缀分发正确到达，无双记日志。
-- WS upgrade 经 oneshot 机制成立：真 hyper 请求的 `OnUpgrade` 随 extensions 存活（axum 0.8.9，`ws.rs:495` 要求该 extension），101 原样返回。**进程内 dispatch 测试路径构造裸请求测不到 upgrade**，验收必须含真 TCP e2e（§10）。
+- `Router` 内部 Arc，克隆廉价；外层 fallback 原样转发即可，`{base}` 之外的路径全部由内层 fallback `handle`（`serve/src/lib.rs:235,440-446`）最长前缀分发正确到达，无双记日志。外层 fallback 本身不挂 `log_requests`/`CorsLayer`，业务中间件只在内层一次性生效，无双重记录/双重 CORS。
+- WS upgrade 经 oneshot 机制成立：真 hyper 请求的 `OnUpgrade` 随 `Request` 的 extensions 存活（`axum::extract::ws::WebSocketUpgrade` 从 extensions 取出 `hyper::upgrade::OnUpgrade`），外层 `oneshot` 透传整份 `Request`（含 extensions）后内层 `on_upgrade` 返回 101，`axum::Body` 携带升级后的流由 `axum::serve` 原样驱动。**WS 升级透传是 axum 内部语义，与 `ws.rs` 具体行号无关**；**进程内 dispatch 测试路径构造裸请求测不到 upgrade**，验收必须含真 TCP e2e（§10）。
 - 旧 JS 世界回收 = Arc 自然 drain：actor 线程 channel 关且队空自退，isolate 在 actor 线程析构，KillSwitch drop ≤25ms（`serve/src/actor.rs:85-133`、`src/bridge/runtime.rs:364-380`）。**JS RuntimePool 没有 shutdown_and_join，也不要给它加。**
-- `{base}` 钉在启动期：热更改 api prefix 后 `_system`/health 仍在旧 base——文档注明（§9）。
-- `_system` 真实路由在外层，不经过内层 handle 的证书 GET 门禁（`lib.rs:417-434`）——运维期望行为，注明。
+- `{base}` 钉在启动期：热更改 api prefix 后 `_system`/health 仍在旧 base——文档注明（§9）。新增 prefix 经 ReloadState.prefixes 集合自动覆盖（见上修订）。
+- `_system` 真实逻辑在外层 fallback，不经过内层 handle 的证书 GET 门禁（`lib.rs:417-434`）——运维期望行为，保留。
 
 ## 4. API 面
 
-保留命名空间 `{base}/_system`（base = 每个 api 挂载 prefix，注册面与今日 health 一致）：
+保留命名空间 `{base}/_system`（base = 每个 api 挂载 prefix；`{base}/_system/*` 由外层 fallback 在 ReloadState 已知 prefix 集合上分流处理，**不是内层路由**）：
 
 | 端点 | 方法 | 语义 | 鉴权 |
 |---|---|---|---|
@@ -52,8 +62,9 @@ TcpListener（永生，只 bind 一次）
 | `{base}/_system/config` | GET | 摘要：`{config_path, sha256, loaded_at, generation, last_reload}`。**不回显内容**（密封值零泄露面） | reload_api 守卫 |
 | `{base}/_system/config` | POST | 触发热更：重读磁盘 config.yaml → 验证 → 应用。**无 body**（非空 body 拒收 400） | reload_api 守卫 |
 
-- **`server.reload_api` 缺省 `false`**：不开则 `{base}/_system/config` 不注册（404）。热更是基础设施级触发器（可引发 db 重连、全量重装配），与业务路由裸奔不等价，必须显式开启。
+- **`server.reload_api` 缺省 `false`**：不开则 `{base}/_system/config` 走 404 分支（fallback 不认该路径）。热更是基础设施级触发器（可引发 db 重连、全量重装配），与业务路由裸奔不等价，必须显式开启。字段须新增到 `ServerCfg`（`src/config.rs:109` + `Default` 于 `:198`，`#[serde(default)]` 缺省 `false`），见 §7 必改清单 0。
 - 守卫：auth 已配置 → 复用 `auth_guard`（AuthGuard/Bearer）；auth 未配置 → **仅回环地址可调**（`ConnectInfo<SocketAddr>` 判定，非 127.0.0.1/::1 → 403）。保住 dev 无鉴权体验，堵死远程无凭据触发。
+  - **第二轮复核新增**：回环判定依赖 `ConnectInfo<SocketAddr>`，须由 serve 栈注入。新 `serve_graceful` 必须用 `into_make_service_with_connect_info(SocketAddr)`（或等价 `Connected` 实现）起服务，否则该守卫编译不过/提取失败（当前 `serve_router` 经 `axum::serve` 直起，未注入连接信息）。见 §7.3。
 - `{base}/_system` 为保留路径，遮蔽同名业务路由（`/plugins` 同语义）。装配期扫 RouteTable pattern 撞 `{base}/_system/**` → **warn**（先例即静默，warn 一条不算破坏）。
 - POST 重读**磁盘文件**而非收 body：密封凭据不出盘、API 内容与磁盘无漂移；`load_with_extra` 的解密管线（`src/config.rs:1379-1417`）原样复用，私钥解析每次生效（`OJ_SECRET_KEY` > `OJ_SECRET_KEY_FILE` > `secrets.private_key_path`，`src/secret.rs:262-289`），失败 fail-fast → 400。
 
@@ -76,6 +87,16 @@ POST {base}/_system/config
     - 复用旧 Registries（from_config 增可选参数，跳过 assemble_plugins，
       app.rs:923）——插件不二次 init（oj-auth OnceLock GUARD keep-first
       已证实全局态重入不安全，plugins/oj-auth/src/lib.rs:75）
+    - **第二轮复核新增（关键）**：影子装配必须复用旧 `StableState`
+      （`app.rs:1249` `stable = backend.stable().clone()`）中的**全部后端连接**
+      （db/redis/blob/es/broker/mail/ldap/auth/smtp 的 pool），**绝不按新 cfg
+      重新建池**。`reuse_registries` 跳过 `assemble_plugins` 后，后端实例由插件
+      持有且不复初始化 → 旧 pool 自动沿用；新 cfg 中 `restart_pending` 段的
+      值只记录、不接线（见 §6）。若 `assemble_backend` 在 `reuse_registries`
+      下仍新建 pool，则（a）`restart_pending`「沿旧」被打破、（b）重载瞬间闪建
+      连接——实现必须规避。
+    - mounts 变化（含新增 prefix）：更新 ReloadState.prefixes 集合（§3 修订），
+      `{base}/_system/*` 立即对新 prefix 生效，无需重建外层 Router。
     失败 → 400 + 具体原因，旧世界继续
  ③ 任务池交接（顺序是回滚完整性的关键，swap 必须最后）
     a. 旧 tasks_flag 显式 store(true)（信号处理器不会替你置，
@@ -107,11 +128,15 @@ POST 返回体三清单：`applied`（本代已生效）/ `restart_pending`（�
 
 ## 7. 必改清单（实现计划入口）
 
+0. **新增 `server.reload_api` 配置字段**：`ServerCfg`（`src/config.rs:109`）增
+   `pub reload_api: bool`，`#[serde(default)]`；`Default` 于 `:198` 置 `false`。
+   （第二轮复核发现：原设计全程引用该字段但 §7 漏列，且全仓此前无此字段。）
 1. `oj/src/serve_cmd.rs:71-76`：`a.cert_path`/`a.key_path` 是 **move**，改 `.clone()`——否则 CLI 覆盖无法重放（编译不过）。
-2. `App::from_config` 增可选 `reuse_registries` 参数（None = 现状零变化；Some = 跳过 assemble_plugins/复用 PluginInfo）。
-3. `serve_graceful` → 新增 swappable 服务形态：listener 永生 + 外层 Router（持有 `Arc<ReloadState>`：watch Sender、Mutex、代际 id、归一 cfg 快照、config 路径、auth_guard、mounts）。现有 `serve`/`dispatch` 路径不动。
-4. `serve/src/lib.rs:229-232`：health 注册从 serve::app 内迁至外层（新位 + 旧别名 warn）；plugins 注册原地不动（随内层每代重建）。
-5. `serve/src/certificate_watcher.rs:48-109`：detached `thread::park()` 每次装配泄漏一条线程 + inotify watch → **提为进程级单例**（按 resolved 路径重建 watch 注册），不再随 App 生成。
+2. `App::from_config` 增可选 `reuse_registries` 参数（None = 现状零变化；Some = 跳过 assemble_plugins/复用 PluginInfo），并据 §5 ② 在 `Some` 下复用旧 `StableState` 后端连接、不重建 pool。
+3. `serve_graceful` → 新增 swappable 服务形态：listener 永生 + 外层 Router（单一 fallback，持有 `Arc<ReloadState>`：watch Sender、Mutex、代际 id、归一 cfg 快照、config 路径、auth_guard、**已知 mount prefix 集合**）。外层 fallback 分流 `_system`/health（§3 修订）后把其余请求 `oneshot` 给当前内层 Router。现有 `serve`/`dispatch` 路径不动。
+   - **第二轮复核新增**：`serve_graceful` 必须用 `into_make_service_with_connect_info(SocketAddr)` 注入连接信息，供 `_system/config` 回环守卫提取（§4）。
+4. `serve/src/lib.rs:229-232`：health 注册从 serve::app 内迁至外层 fallback（新位 `{p}/_system/health` + 旧别名 `{p}/health` warn）；plugins 注册原地不动（随内层每代重建）。
+5. `serve/src/certificate_watcher.rs:48-109`：detached `thread::park()` 每次装配泄漏一条线程 + inotify watch → **提为进程级单例**（按 resolved 路径去重，不重复 spawn；`app.rs:789` 在 `from_config` 内，重载路径极易再次触发，单例必须覆盖每代复用）。
 6. 迁移门禁增「热更路径强制 verify-only」参数位（from_config 调用方传入，启动路径不变）。
 
 ## 8. 双专家复核结论存档（2026-10-12）
@@ -135,7 +160,8 @@ POST 返回体三清单：`applied`（本代已生效）/ `restart_pending`（�
 2. cron 丢拍不补（§5）；窗口内旧 `{base}/tasks` API run-once 可能被拒（旧池 stopping）——错误信封如实返回。
 3. 旧世界被 WS 长连接钉死：旧 Backend（db 池等）存活至最后一条旧 WS 连接关闭（`serve/src/ws.rs:195-201` RoutePool 持 bridge 工厂）——反复热更 N 代并存；`WsOptions.idle_linger_ms` 空闲断连可缓解，文档写明内存上界语义。
 4. api prefix 变更不迁移 `_system`/health 的注册 base（§3）。
-5. 证书过期期间：业务 GET 走内层门禁 403，`_system` 在外层不受限（运维可用）。
+5. 证书过期期间：业务 GET 走内层门禁 403，`_system` 在外层 fallback 不受限（运维可用）。
+6. 新增 api 挂载前缀：`{base}/_system/*` 与 health 经 ReloadState.prefixes 集合自动覆盖新 prefix（§3 修订），无需重启；该 prefix 的业务路由随内层 swap 生效。
 
 ## 10. 测试与验收
 
@@ -158,3 +184,17 @@ e2e（`oj/tests/e2e.rs` 惯例，真实进程 + 真 TCP）：
 - CHANGELOG.md 条目（health URL 迁移标注 BREAKING、reload_api、`_system` 命名空间）。
 - `docs/devkit/` 四件套对齐：api-manual（新端点 + 错误表 + restart_pending 语义）、scenarios（热更场景）、SKILL.md（陷阱：幂等基于归一 cfg、cron 丢拍、WS 钉死）、README。
 - 改完 `cargo xtask build` 归置 `bin/devkit/`，devkit 契约用例校验。
+
+## 12. 第二轮复核修订（2026-10-12）
+
+复核方逐项核对了设计锚点与代码库事实，修订如下：
+
+1. **§7 补 `server.reload_api` 字段**：全仓此前无此字段，必改清单漏列，已补为项 0（config.rs:109 + Default:198）。
+2. **§3 架构修订**：原「外层逐 prefix 注册 `_system` 具体路由」与「外层静态」冲突，且重载新增 prefix 会丢 `_system` 端点（违反绝无静默不生效）。改为**外层单一 fallback 在 ReloadState 已知 prefix 集合上分流处理 `_system`/health**，外层保持构造一次、不挂中间件；mounts 变化只更新 prefix 集合。同时仍满足 §9.5 证书到期运维可用。
+3. **§4 回环守卫依赖**：`ConnectInfo<SocketAddr>` 须由 serve 栈注入，`serve_graceful` 须 `into_make_service_with_connect_info(SocketAddr)`，已写入 §7.3。
+4. **§3 WS 引文更正**：`ws.rs:495` 实为单测内部取值，非 OnUpgrade 要求；WS 透传属 axum 内部语义，已重写表述。
+5. **§5 ② 复用旧后端连接**：明确 `reuse_registries` 下 `assemble_backend` 不得按新 cfg 重建 pool（否则 restart_pending「沿旧」被破 + 重载闪建连接），新增为关键约束。
+6. **§7.5 证书 watcher 去重**：按 resolved 路径去重、每代复用同一单例，避免反复重载累积线程/inotify fd。
+7. **§9 新增边界 6**：新增挂载 prefix 的 `_system`/health 自动覆盖，无需重启。
+
+未改动的双专家结论（§8）与四条放行前置仍然成立。

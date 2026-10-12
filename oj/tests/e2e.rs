@@ -117,7 +117,10 @@ async fn req(
     path: &str,
     body: Option<&str>,
 ) -> (u16, serde_json::Value) {
-    let c = reqwest::Client::new();
+    let c = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap();
     let mut r = c.request(
         reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
         format!("http://{addr}{path}"),
@@ -936,6 +939,7 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
             db: Some("test".into()),
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("from_config with db_override");
@@ -1771,4 +1775,229 @@ async fn ldap_generic_axis_end_to_end() {
 
     h.abort();
     let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 配置热更新 v1 端到端（spec 2026-10-12）：`server.reload_api: true` 起服务，
+/// 经真实 TCP 验证 health / config GET / POST 幂等 / 改段后 applied 清单 / 再 POST 幂等。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn given_reload_api_when_post_config_then_swaps_and_reports_diff() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-reload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let root = sample();
+    // config 必须落在 sample 项目根内（loader 的 project_root 钳制要求 api 在根内，
+    // 否则别名解析 `#_shared/...` 报 escapes project root）——故写入 sample 内临时文件，
+    // 相对路径即可（config_dir = sample）。db 用独立临时文件隔离。
+    // 固定端口（e2e 全用例串行持锁，无并发冲突）：避免解析 stdout（pipe 下 stdout 行缓冲
+    // 不保证及时送达），改用 health 端点轮询探活。
+    let cfg_path = root.join(".oj-reload-e2e.yaml");
+    let _ = std::fs::remove_file(&cfg_path);
+    // reload_api: true；证书复用 sample 示例证书（相对 config_dir）；api 挂载 src（相对）。
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: 19978\n  reload_api: true\n  public_key_path: \"config/public.pem\"\n  certificate_path: \"config/cert.jws\"\ndb:\n  default: \"{}\"\nmounts:\n  - prefix: \"/v1/api\"\n    api: \"src\"\nvars:\n  FOO: \"bar\"\n",
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
+    );
+    std::fs::write(&cfg_path, &cfg).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args(["serve", "-c", &cfg_path.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oj serve child");
+
+    // stdout/stderr 收集进同一缓冲（仅用于失败诊断，不用于就绪探测）。
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut readers = Vec::new();
+    for stream in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ] {
+        let Some(stream) = stream else { continue };
+        let buf = out_buf.clone();
+        readers.push(std::thread::spawn(move || {
+            use std::io::BufRead;
+            for l in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                buf.lock().unwrap().push_str(&format!("{l}\n"));
+            }
+        }));
+    }
+
+    // 等就绪：轮询 health 端点（≤120s；首启含全 sample 转译 + 迁移）。
+    // 直接用 reqwest 容忍连接拒绝（server 未起时），`req` 辅助会因 connect 失败 unwrap 而 panic。
+    let addr: std::net::SocketAddr = "127.0.0.1:19978".parse().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let health_url = format!("http://{addr}/v1/api/_system/health");
+    loop {
+        let ready = match client.get(&health_url).send().await {
+            Ok(r) => r.status().as_u16() == 200,
+            Err(_) => false,
+        };
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server not ready in time:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    // health（绕过内层证书门禁，运维窗口可探活）。
+    let (st, _body) = req(addr, "GET", "/v1/api/_system/health", None).await;
+    assert_eq!(st, 200, "health");
+
+    // config GET：初始代际 0。
+    let (st, body) = req(addr, "GET", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "config get");
+    assert_eq!(body["generation"].as_u64(), Some(0), "{body}");
+
+    // POST 空 body：首次与落盘一致 → unchanged（代际不变）。
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "config post unchanged");
+    assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
+    assert_eq!(body["generation"].as_u64(), Some(0), "{body}");
+
+    // 改 vars 段 → 重写落盘 → POST：applied 含 "vars"，代际推进到 1。
+    let cfg2 = cfg.replace("FOO: \"bar\"", "FOO: \"baz\"");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "config post applied");
+    assert_eq!(body["code"].as_i64(), Some(0), "{body}");
+    let applied = body["data"]["applied"].as_array().expect("applied array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("vars")),
+        "vars should be in applied: {body}"
+    );
+    assert_eq!(body["data"]["generation"].as_u64(), Some(1), "{body}");
+
+    // 再 POST（无改动）→ 仍 unchanged，代际保持 1。
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "config post idempotent");
+    assert_eq!(body["msg"].as_str(), Some("unchanged"), "{body}");
+    assert_eq!(body["generation"].as_u64(), Some(1), "{body}");
+
+    // 停机。
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+    let _ = child.wait();
+    // 清理 sample 内临时 config。
+    let _ = std::fs::remove_file(&cfg_path);
+}
+
+/// 经真实 TCP 验证 §6 段 diff 三清单：改 `vars`（applied）/ `db`（restart_pending）/
+/// `server`（kept_listener）三类段，POST 后代际推进且三清单分类正确；v1 仅上报不实际重启，
+/// 监听器仍绑定原端口（kept_listener 语义）。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn given_reload_api_when_backend_and_listener_segments_change_then_classified() {
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-reload2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let root = sample();
+    let cfg_path = root.join(".oj-reload-e2e2.yaml");
+    let _ = std::fs::remove_file(&cfg_path);
+    let db1 = oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db1.sqlite"));
+    let db2 = oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db2.sqlite"));
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: 19978\n  reload_api: true\n  public_key_path: \"config/public.pem\"\n  certificate_path: \"config/cert.jws\"\ndb:\n  default: \"{}\"\nmounts:\n  - prefix: \"/v1/api\"\n    api: \"src\"\nvars:\n  FOO: \"bar\"\n",
+        db1,
+    );
+    std::fs::write(&cfg_path, &cfg).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args(["serve", "-c", &cfg_path.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oj serve child");
+
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut readers = Vec::new();
+    for stream in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ] {
+        let Some(stream) = stream else { continue };
+        let buf = out_buf.clone();
+        readers.push(std::thread::spawn(move || {
+            use std::io::BufRead;
+            for l in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+                buf.lock().unwrap().push_str(&format!("{l}\n"));
+            }
+        }));
+    }
+
+    let addr: std::net::SocketAddr = "127.0.0.1:19978".parse().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let health_url = format!("http://{addr}/v1/api/_system/health");
+    loop {
+        let ready = match client.get(&health_url).send().await {
+            Ok(r) => r.status().as_u16() == 200,
+            Err(_) => false,
+        };
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server not ready in time:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    // 改三类段：`vars`（applied）/ `db` DSN 变更（restart_pending）/ `server.port` 变更
+    // （kept_listener；监听器不动，仍走 19978）。
+    let cfg2 = cfg
+        .replace("FOO: \"bar\"", "FOO: \"baz\"")
+        .replace(&db1, &db2)
+        .replace("port: 19978", "port: 19111");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req(addr, "POST", "/v1/api/_system/config", None).await;
+    assert_eq!(st, 200, "config post classified");
+    assert_eq!(body["code"].as_i64(), Some(0), "{body}");
+    let d = &body["data"];
+    let applied = d["applied"].as_array().expect("applied array");
+    let restart_pending = d["restart_pending"].as_array().expect("restart_pending array");
+    let kept_listener = d["kept_listener"].as_array().expect("kept_listener array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("vars")),
+        "vars in applied: {body}"
+    );
+    assert!(
+        restart_pending.iter().any(|v| v.as_str() == Some("db")),
+        "db in restart_pending: {body}"
+    );
+    assert!(
+        kept_listener.iter().any(|v| v.as_str() == Some("server")),
+        "server in kept_listener: {body}"
+    );
+    assert_eq!(d["generation"].as_u64(), Some(1), "{body}");
+
+    // kept_listener：监听器仍绑定原端口，health 仍可探活。
+    let (st, _body) = req(addr, "GET", "/v1/api/_system/health", None).await;
+    assert_eq!(st, 200, "listener kept on old port after server-seg change");
+
+    // 停机。
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&cfg_path);
 }

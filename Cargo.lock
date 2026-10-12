@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "oj"
-version = "0.1.62"
+version = "0.1.63"
 dependencies = [
  "async-trait",
  "axum",
@@ -4290,6 +4290,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serve",
+ "sha2 0.10.9",
  "tar",
  "time",
  "tokio",
@@ -6106,6 +6107,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

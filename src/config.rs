@@ -193,6 +193,11 @@ pub struct ServerCfg {
     /// 故升级不产生任何行为变化。
     #[serde(default = "default_true")]
     pub schema_validation: bool,
+    /// 配置热更新 API 开关（v1，spec 2026-10-12）：true → 注册 `{base}/_system/config`
+    /// GET/POST 触发热更；false（缺省）→ 该端点 404。热更是基础设施级触发器（可引发
+    /// 后端重装配），与业务路由裸奔不等价，必须显式开启。
+    #[serde(default)]
+    pub reload_api: bool,
 }
 
 impl Default for ServerCfg {
@@ -223,6 +228,7 @@ impl Default for ServerCfg {
             migrate_on_start: None,
             ownership_guard: None,
             cors: None,
+            reload_api: false,
         }
     }
 }

@@ -17,6 +17,7 @@ use only_js::config::{self, Config, LoadedConfig};
 
 use crate::app::{App, ResourceProfiles};
 use crate::args::ServeArgs;
+use crate::tasks::Tasking;
 
 /// API 前缀缺省常量（v0.1.58）：旧 `server.api_prefix` 键已删，CLI `-b` / 挂载折叠
 /// 都回落此值——与删除前的 `ServerCfg::default().api_prefix` 同值（零 URL 变化）。
@@ -68,10 +69,10 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref(), true)?;
     // CLI 挂载折叠：--api-path / --app-path 全部 upsert 进 cfg.mounts（CLI 优先）。
     fold_cli_mounts(&mut cfg, &a)?;
-    if let Some(p) = a.cert_path {
+    if let Some(p) = a.cert_path.clone() {
         cfg.server.certificate_path = p;
     }
-    if let Some(p) = a.key_path {
+    if let Some(p) = a.key_path.clone() {
         cfg.server.public_key_path = p;
     }
     // 准入门（规则 5）：mounts（config + CLI 折叠后）为空 → 报错提示。
@@ -119,8 +120,21 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     let addr = to_socket_addrs_sync(&format!("{}:{}", cfg.server.host, cfg.server.port))?;
     let tasks_cfg = cfg.tasks.clone();
     let static_only = cfg.mounts.iter().all(|m| m.api.is_none());
+    // 热更所需：已知 api 挂载 prefix（ReloadState 分流 _system 用）+ 配置路径（摘要回显）。
+    let prefixes: Vec<String> = cfg
+        .mounts
+        .iter()
+        .filter_map(|m| m.api.as_ref().map(|_| m.prefix.clone()))
+        .collect();
+    let config_path = a
+        .config
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_dir.join("config.yaml"));
+    // reload_api 开关须在读 cfg 前捕获（cfg 随后移入 App::from_config）。
+    let reload_api = cfg.server.reload_api;
     let mut app =
-        App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default()).await?;
+        App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default(), None).await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
@@ -139,8 +153,30 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     // 全仓首个信号处理器（评审 F5/S2）：SIGINT/SIGTERM → 置停机 flag → HTTP 侧
     // with_graceful_shutdown 同信号排空在途请求；任务线程在 grace 内自然收场
     // （不退者由 run_task 内置看门狗强杀）。
+    if reload_api {
+        return serve_hot_reload_branch(
+            &app,
+            addr,
+            &a,
+            &top,
+            &config_dir,
+            &base,
+            &dir,
+            &ResourceProfiles::default(),
+            task_flag.clone(),
+            task_pool,
+            static_only,
+            ts,
+            prefixes,
+            config_path,
+        )
+        .await;
+    }
     let (bound, h) = app
-        .serve_graceful(addr, shutdown_signal(task_flag.clone()))
+        .serve_graceful(
+            addr,
+            shutdown_signal(Arc::new(tokio::sync::Mutex::new(task_flag.clone()))),
+        )
         .await?;
     println!(
         "oj serve listening on http://{bound}{} (dir={}, {})",
@@ -172,6 +208,294 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     // （插件侧停收 → 等在途 job 跑完 → 销毁 transport）。超时只告警，不阻断退出。
     app.drain_mail(MAIL_DRAIN_TIMEOUT).await;
     Ok(())
+}
+
+/// 热更新服务形态（v1，`server.reload_api=true`）：构造 `ReloadState` + 注入
+/// `reload_executor` 闭包，经 `App::serve_hot_reload` 起 swappable 服务。
+#[allow(clippy::too_many_arguments)]
+async fn serve_hot_reload_branch(
+    app: &App,
+    addr: SocketAddr,
+    args: &ServeArgs,
+    top: &serde_json::Value,
+    config_dir: &Path,
+    base: &str,
+    dir: &Path,
+    profiles: &ResourceProfiles,
+    task_flag: Arc<std::sync::atomic::AtomicBool>,
+    initial_tasking: Tasking,
+    static_only: bool,
+    ts: bool,
+    prefixes: Vec<String>,
+    config_path: PathBuf,
+) -> Result<(), String> {
+    // 首代归一 raw 文档作为幂等/diff 基线（reload 路径一致，稳定）。
+    // 用 raw 文档而非解析后的 `Config`：避免对核心 `Config` 强加 `Serialize` /
+    // `Clone`（涉及大量子段类型），且 CLI/进程级覆盖在进程生命周期内不变，
+    // 落盘文件内容即热更真触发源，足以做幂等判定与段 diff。
+    let baseline_raw = std::fs::read(&config_path)
+        .map_err(|e| format!("reload baseline read: {e}"))?;
+    let baseline_doc: serde_yaml::Value = serde_yaml::from_slice(&baseline_raw)
+        .map_err(|e| format!("reload baseline parse: {e}"))?;
+    let baseline_sha = doc_sha(&baseline_doc).map_err(|e| format!("reload baseline sha: {e}"))?;
+    let ctx = Arc::new(HotReloadCtx {
+        args: args.clone(),
+        top: top.clone(),
+        config_dir: config_dir.to_path_buf(),
+        base: base.to_string(),
+        dir: dir.to_path_buf(),
+        profiles: profiles.clone(),
+        backend: app.backend(),
+        current_doc: tokio::sync::Mutex::new(baseline_doc),
+        current_sha: tokio::sync::Mutex::new(baseline_sha),
+        config_path: config_path.clone(),
+        tasking: tokio::sync::Mutex::new(initial_tasking),
+        current_task_flag: Arc::new(tokio::sync::Mutex::new(task_flag)),
+        committer: tokio::sync::OnceCell::new(),
+    });
+
+    let rs = serve::reload::ReloadState::new(
+        Arc::new(app.router()),
+        prefixes,
+        app.auth_guard(),
+        true,
+        config_path,
+        None,
+    );
+    let committer = rs.committer();
+    ctx.set_committer(committer);
+    rs.set_executor(build_reload_executor(ctx.clone())).await;
+
+    let (bound, h) = app
+        .serve_hot_reload(addr, rs, shutdown_signal(ctx.current_task_flag.clone()))
+        .await?;
+    println!(
+        "oj serve listening on http://{bound}{} (dir={}, {}, hot-reload on)",
+        base,
+        dir.display(),
+        if static_only {
+            "static-only"
+        } else if ts {
+            "dev/ts"
+        } else {
+            "release/js"
+        }
+    );
+    h.await.map_err(|e| format!("server task: {e}"))?;
+    // 停机：关闭最新一代任务池（可能在重载中已切换）。
+    let mut latest = ctx.tasking.lock().await;
+    let pool2 = latest.pool.clone();
+    // `TaskSupervisor` 无 `Default` 故不能用 `Option::take()`，这里显式 replace。
+    #[allow(clippy::mem_replace_option_with_none)]
+    let sup2 = std::mem::replace(&mut latest.sup, None);
+    drop(latest);
+    tokio::task::spawn_blocking(move || {
+        if let Some(sup) = sup2 {
+            sup.shutdown();
+        }
+        if let Some(p) = pool2 {
+            p.shutdown_and_join();
+        }
+    })
+    .await
+    .map_err(|e| format!("tasks shutdown: {e}"))?;
+    app.drain_mail(MAIL_DRAIN_TIMEOUT).await;
+    Ok(())
+}
+
+/// 热更共享上下文（executor 闭包捕获）。
+struct HotReloadCtx {
+    args: ServeArgs,
+    top: serde_json::Value,
+    config_dir: PathBuf,
+    base: String,
+    dir: PathBuf,
+    profiles: ResourceProfiles,
+    /// 复用后端（含全部连接池 + 插件 vtable），热更不重建（§5 ②）。
+    backend: Arc<crate::app::Backend>,
+    /// 当前代归一 raw 文档（段 diff 基线）+ 其 sha256（幂等判定）。
+    current_doc: tokio::sync::Mutex<serde_yaml::Value>,
+    current_sha: tokio::sync::Mutex<String>,
+    /// 配置路径（幂等读取落盘文件用）。
+    config_path: PathBuf,
+    /// 当前代任务池（重载交接）。
+    tasking: tokio::sync::Mutex<Tasking>,
+    /// 当前代任务池停机 flag 的「运行时指向」：热更后 `do_reload` 会把它换成
+    /// 新一代池的 flag，SIGTERM 经 `shutdown_signal` 精确停机在跑的那一代池。
+    current_task_flag: Arc<tokio::sync::Mutex<Arc<std::sync::atomic::AtomicBool>>>,
+    /// 提交句柄（构造 ReloadState 后注入，避免循环依赖）。
+    committer: tokio::sync::OnceCell<serve::reload::Committer>,
+}
+
+impl HotReloadCtx {
+    fn set_committer(&self, c: serve::reload::Committer) {
+        let _ = self.committer.set(c);
+    }
+
+    async fn committer(&self) -> &serve::reload::Committer {
+        self.committer
+            .get()
+            .expect("committer set before reload")
+    }
+}
+
+/// 构造 `reload_executor` 闭包：在独立线程 + 多线 runtime 跑 `do_reload`
+/// （`from_config` 含 DB verify / 模块转译 / 任务池交接，需在带 blocking 池的多线
+/// runtime 上跑，current_thread 会因内部 spawn/join 段死锁；禁止在 axum handler
+/// 直接 await，故包一层独立线程）。
+fn build_reload_executor(ctx: Arc<HotReloadCtx>) -> serve::reload::ReloadExecutor {
+    Arc::new(move || {
+        let ctx = ctx.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .map_err(|e| (500u16, format!("reload runtime: {e}")))?;
+            rt.block_on(async { do_reload(&ctx).await })
+        });
+        handle
+            .join()
+            .unwrap_or_else(|_| Err((500u16, "reload thread panicked".to_string())))
+    })
+}
+
+/// 单次热更全流程（§5）：归一 → 影子装配（复用后端）→ 任务池交接 → swap + 三清单。
+async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (u16, String)> {
+    // ① 归一：load_cfg（解密→类型→mounts→legacy 键）→ fold_cli_mounts 重放 →
+    //    cert/key 覆盖重放 → admission_gate。
+    let (mut cfg, _, _) = load_cfg(ctx.args.config.as_deref(), true).map_err(|e| (400u16, e))?;
+    fold_cli_mounts(&mut cfg, &ctx.args).map_err(|e| (400u16, e))?;
+    if let Some(p) = ctx.args.cert_path.clone() {
+        cfg.server.certificate_path = p;
+    }
+    if let Some(p) = ctx.args.key_path.clone() {
+        cfg.server.public_key_path = p;
+    }
+    admission_gate(&cfg).map_err(|e| (400u16, e))?;
+    // 幂等 / diff 基线：归一 raw 文档（落盘文件解析，CLI 覆盖在进程生命周期不变）。
+    let raw = std::fs::read(&ctx.config_path).map_err(|e| (400u16, format!("read config: {e}")))?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_slice(&raw).map_err(|e| (400u16, format!("parse config: {e}")))?;
+    let sha = doc_sha(&doc).map_err(|e| (400u16, e))?;
+    // 幂等：归一 raw 文档的 sha256 与当前代相同 → unchanged（不装配、不 swap）。
+    let cur_gen = ctx.committer().await.generation().await;
+    {
+        let cur = ctx.current_sha.lock().await;
+        if *cur == sha {
+            return Ok(serve::reload::ReloadOutcome {
+                generation: cur_gen,
+                applied: vec![],
+                restart_pending: vec![],
+                kept_listener: vec![],
+                unchanged: true,
+            });
+        }
+    }
+    // 段 diff 三清单（旧代 vs 新代）。
+    let old_doc = ctx.current_doc.lock().await.clone();
+    let (applied, restart_pending, kept_listener) = diff_configs(&old_doc, &doc);
+    // ② 影子装配（复用旧 Backend：不重建连接池、不二次 init 插件；迁移强制 verify-only）。
+    // `cfg` 整体移入 `from_config`；任务配置先取出克隆供下方任务池交接。
+    let tasks_cfg = cfg.tasks.clone();
+    let mut new_app = App::from_config(
+        cfg,
+        &ctx.top,
+        &ctx.config_dir,
+        false,
+        &ctx.profiles,
+        Some(ctx.backend.clone()),
+    )
+    .await
+    .map_err(|e| (400u16, e))?;
+    // ③ 任务池交接（顺序：先建新池 fail-fast，再停旧池——回滚完整：新池失败则旧池仍跑）。
+    let new_flag = new_app.tasks_flag();
+    let new_tasking = {
+        // 旧池用「上一代」flag 停机：取出 current_task_flag 当前指向的旧 flag，
+        // 置位使其退出；随后把 current_task_flag 指向新 flag，使 SIGTERM 精确停机
+        // 当前在跑的新池（spec §6 ⑤）。
+        let old_flag = ctx.current_task_flag.lock().await.clone();
+        let mut old = ctx.tasking.lock().await;
+        let t = crate::tasks::assemble_tasking(
+            &tasks_cfg,
+            &ctx.dir,
+            new_app.make_task_bridge(),
+            new_flag.clone(),
+        )
+        .map_err(|e| (500u16, e))?;
+        // 旧池停机（flag 置位 → 驱动退出；spawn_blocking 同步 join）。
+        old_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let old_pool = old.pool.clone();
+        // `TaskSupervisor` 无 `Default` 故不能用 `Option::take()`，这里显式 replace。
+        #[allow(clippy::mem_replace_option_with_none)]
+        let old_sup = std::mem::replace(&mut old.sup, None);
+        drop(old);
+        if let Some(p) = old_pool {
+            let p2 = p.clone();
+            tokio::task::spawn_blocking(move || p2.shutdown_and_join())
+                .await
+                .map_err(|e| (500u16, format!("join old task pool: {e}")))?;
+        }
+        if let Some(s) = old_sup {
+            s.shutdown();
+        }
+        t
+    };
+    // 任务管理 API 随新代重建（有池才挂）。
+    if let Some(p) = new_tasking.pool.clone() {
+        let state = new_app.tasks_api_state(p.registry.clone(), Some(p));
+        new_app.merge_router(serve::tasks::tasks_router(&ctx.base, state));
+    }
+    // ④ watch swap：新 Router 送入通道，旧 App 随在途请求完成自然 drain。
+    let new_inner = std::sync::Arc::new(new_app.router());
+    let generation = ctx.committer().await.commit(new_inner, sha.clone()).await;
+    *ctx.current_doc.lock().await = doc;
+    *ctx.current_sha.lock().await = sha;
+    *ctx.tasking.lock().await = new_tasking;
+    // 当前代 flag 指向新池：后续 SIGTERM 精确停机这一代（spec §6 ⑤）。
+    *ctx.current_task_flag.lock().await = new_flag.clone();
+    Ok(serve::reload::ReloadOutcome {
+        generation,
+        applied,
+        restart_pending,
+        kept_listener,
+        unchanged: false,
+    })
+}
+
+/// 归一 raw 文档的 sha256（幂等 / 代际追踪用）。raw 文档 → 规范 JSON → sha256。
+fn doc_sha(doc: &serde_yaml::Value) -> Result<String, String> {
+    let v = serde_json::to_value(doc).map_err(|e| format!("cfg doc: {e}"))?;
+    let s = serde_json::to_string(&v).map_err(|e| format!("cfg enc: {e}"))?;
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(s.as_bytes());
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// 新旧归一 raw 文档顶层段逐段 diff → 三清单（§6 矩阵）。
+/// 比对 `known_top_level_keys` 范围内各段（serde_yaml::Value 的 PartialEq）。
+fn diff_configs(
+    old: &serde_yaml::Value,
+    new: &serde_yaml::Value,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut applied = Vec::new();
+    let mut restart_pending = Vec::new();
+    let mut kept_listener = Vec::new();
+    for key in only_js::config::known_top_level_keys() {
+        let o = old.get(key);
+        let n = new.get(key);
+        if o == n {
+            continue;
+        }
+        match *key {
+            "db" | "redis" | "blob" | "es" | "broker" | "smtp" | "ldap" | "auth" | "kafkas"
+            | "rabbits" | "plugins" | "plugins_dir" | "secrets" => restart_pending.push((*key).to_string()),
+            "server" => kept_listener.push((*key).to_string()),
+            _ => applied.push((*key).to_string()),
+        }
+    }
+    (applied, restart_pending, kept_listener)
 }
 
 /// 停机 mail drain 的总超时：在途投递本身已在插件侧受 `profile.timeout` 约束，
@@ -284,7 +608,9 @@ fn daemonize() -> Result<(), String> {
 
 /// 停机信号（spec §6 ①）：SIGINT（ctrl_c）与 SIGTERM 二选一（Windows 仅 ctrl_c）；
 /// 命中即置停机 flag（任务循环检测退出；HTTP 侧随之排空）。
-async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
+/// `flag` 是当前任务池停机 flag 的「运行时指向」：热更后 `do_reload` 会把它换成
+/// 新一代池的 flag，故 SIGTERM 总是精确停机「在跑的那一代」池（spec §6 ⑤）。
+async fn shutdown_signal(flag: Arc<tokio::sync::Mutex<Arc<std::sync::atomic::AtomicBool>>>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -304,7 +630,7 @@ async fn shutdown_signal(flag: Arc<std::sync::atomic::AtomicBool>) {
         _ = term => {},
     }
     eprintln!("shutdown: stop flag set — draining tasks and in-flight requests");
-    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    flag.lock().await.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 解析配置文件（v0.1.58 自 load_app_config 抽出）：`config` None 走统一搜索
@@ -630,6 +956,7 @@ pub async fn start(
         config_dir,
         false,
         &ResourceProfiles::default(),
+        None,
     )
     .await?;
     app.serve(addr).await
@@ -3474,3 +3801,87 @@ mod tests {
         assert_eq!(v2["data"]["v"], 11, "{t2}");
     }
 }
+
+/// 热更段 diff / 幂等单测（v1，spec 2026-10-12 §6 矩阵 + 幂等门禁）。
+/// 直接驱动私有 `diff_configs` / `doc_sha`，覆盖三清单分类、幂等同值、保留路径冲突 warn。
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::{diff_configs, doc_sha};
+    use serde_yaml::Value;
+
+    /// 构造一个最小归一 raw 文档（各段给占位值，便于单点改写比对）。
+    fn base_doc() -> Value {
+        serde_yaml::from_str(
+            r#"
+server: { host: "0.0.0.0", port: 9778 }
+mounts:
+  - { prefix: "/v1/api", api: "./src" }
+db: { default: "sqlite://./a.db" }
+redis: { default: "redis://localhost" }
+vars: { FOO: "bar" }
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn diff_classifies_restart_pending() {
+        let old = base_doc();
+        let mut new = base_doc();
+        // 改 db → 后端段：restart_pending（沿用旧池，重启后生效）。
+        new["db"] = serde_yaml::from_str(r#"{ default: "sqlite://./b.db" }"#).unwrap();
+        let (applied, restart_pending, kept) = diff_configs(&old, &new);
+        assert!(restart_pending.contains(&"db".to_string()));
+        assert!(!applied.contains(&"db".to_string()));
+        assert!(!kept.contains(&"db".to_string()));
+    }
+
+    #[test]
+    fn diff_classifies_kept_listener() {
+        let old = base_doc();
+        let mut new = base_doc();
+        // 改 server（port/host/证书）→ listener 级沿旧：kept_listener。
+        new["server"] = serde_yaml::from_str(r#"{ host: "127.0.0.1", port: 9779 }"#).unwrap();
+        let (_applied, restart_pending, kept) = diff_configs(&old, &new);
+        assert!(kept.contains(&"server".to_string()));
+        assert!(!restart_pending.contains(&"server".to_string()));
+    }
+
+    #[test]
+    fn diff_classifies_applied() {
+        let old = base_doc();
+        let mut new = base_doc();
+        // 改 vars（部署期常量，无需重建后端）→ applied（本代生效）。
+        new["vars"] = serde_yaml::from_str(r#"{ FOO: "baz" }"#).unwrap();
+        let (applied, restart_pending, kept) = diff_configs(&old, &new);
+        assert!(applied.contains(&"vars".to_string()));
+        assert!(!restart_pending.contains(&"vars".to_string()));
+        assert!(!kept.contains(&"vars".to_string()));
+    }
+
+    #[test]
+    fn diff_unchanged_is_empty() {
+        let old = base_doc();
+        let new = base_doc();
+        let (applied, restart_pending, kept) = diff_configs(&old, &new);
+        assert!(applied.is_empty());
+        assert!(restart_pending.is_empty());
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn doc_sha_is_idempotent() {
+        let a = base_doc();
+        let b = base_doc();
+        assert_eq!(doc_sha(&a).unwrap(), doc_sha(&b).unwrap());
+    }
+
+    #[test]
+    fn doc_sha_changes_on_edit() {
+        let a = base_doc();
+        let mut b = base_doc();
+        b["vars"] = serde_yaml::from_str(r#"{ FOO: "changed" }"#).unwrap();
+        assert_ne!(doc_sha(&a).unwrap(), doc_sha(&b).unwrap());
+    }
+}
+

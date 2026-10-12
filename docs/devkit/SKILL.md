@@ -167,6 +167,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |
 | 任务池 CPU 飙高 / `runCount` 暴涨 | `interval_ms` 太小或为 0（0 = 不限制，压测语义）——默认 100ms≈10 轮/s；实测无节奏 4 任务聚合 24.8 万轮/s、CPU 134%（多核空转）。先算写放大（轮率 × 每轮 IO）再调小（§6「性能特征与调优」） |
 | `PATCH /tasks/{name}` 报 400 | 只接受 `{enabled, cron}` 两字段（无用户可传脚本路径入口，结构性白名单） |
+| `server.reload_api: true` 改了 `db:`/`redis:`/`plugins:` 等后端段没即时换 | 这些是 `restart_pending`：热更**复用首代连接池与插件 vtable**，不重建后端——返回清单提示，实际生效要**重启进程**（`_system/config` 看 `restart_pending`） |
+| `server.reload_api: true` 改了 `server.port`/`host`/证书路径没生效 | `server` 段是 `kept_listener`：listener 永生，改了也下个进程才生效（`_system/config` 看 `kept_listener`） |
+| `POST {base}/_system/config` 报 403 | 未配 `auth:` 时只允许**回环**调用；远程调度走 Bearer 守卫须先配 `auth:` 段 |
+| `POST {base}/_system/config` 报 409 | 上一次热更还在跑（串行锁占用）——等上一次完成再发 |
+| `POST {base}/_system/config` 报 400 且 body 非空 | 该端点**只接受空 body**，改配置请直接改落盘文件再 POST 触发 |
 | WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定） |
 | （v0.1.9 已消除）旧帧循环的 const 重复声明 | 新契约为生命周期钩子：模块每 Worker 预载一次——无需处理；可变跨帧状态放 `sess.state`（模块作用域只是只读缓存），见 api-manual §ws.ts |
 | WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |

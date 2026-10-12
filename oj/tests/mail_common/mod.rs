@@ -203,6 +203,7 @@ pub async fn try_boot(t: &Tmp, src: &Path) -> Result<oj::app::App, String> {
         &t.0,
         false,
         &oj::app::ResourceProfiles::default(),
+        None,
     )
     .await
 }

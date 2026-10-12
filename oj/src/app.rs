@@ -35,7 +35,7 @@ use only_js::contract::{InputContract, InputContractRegistry};
 use serve::CertificateStatus;
 use serve::actor::JsActor;
 use serve::certificate::load_certificate_at;
-use serve::certificate_watcher::{SharedCertStatus, SharedCertValidUntil, spawn_watcher};
+use serve::certificate_watcher::{SharedCertStatus, SharedCertValidUntil};
 use serve::routes;
 use serve::ws;
 use tokio::task::JoinHandle;
@@ -62,6 +62,8 @@ pub struct App {
     bus: Arc<dyn EventBroker>,
     /// 与 actor 工厂共享同一组后端的 StableState，供测试运行时（bridge_ext）复用（修正 #2）。
     stable: Arc<StableState>,
+    /// 后端装配产物（含所有后端连接池 + 插件 vtable）。热更时复用以避免重连（§5 ②）。
+    backend: Arc<Backend>,
     base: String,
     /// 长任务停机 flag（spec §6）：信号处理器置位，任务 Bridge 经 Extras 注入。
     tasks_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -786,11 +788,12 @@ fn load_cert_with_watcher(
     let cert_status: SharedCertStatus = Arc::new(RwLock::new(status));
     let cert_valid_until: SharedCertValidUntil = Arc::new(RwLock::new(valid_until));
     // 热加载：证书/公钥文件被覆盖即原子更新状态（事件驱动，不轮询）。
-    spawn_watcher(
+    // 进程级单例：热更每代 `from_config` 不重复起 watcher 线程（避免线程/inotify fd 累积）。
+    serve::certificate_watcher::ensure_watcher(
         cert_status.clone(),
         cert_valid_until.clone(),
-        cfg.server.clone(),
-        config_dir.to_path_buf(),
+        &cfg.server,
+        config_dir,
     );
     Ok((cert_status, cert_valid_until))
 }
@@ -1213,6 +1216,9 @@ impl App {
         // `--db`/`--redis`/`--blob`/`--es`/`--broker`/`--kafka`/`--rabbit`）。字面 "default"
         // 的调用改指向所选 profile；迁移 / seed / fixtures / schema 内省一并跟随。
         profiles: &ResourceProfiles,
+        // 热更复用：Some(旧 Backend) → 跳过 `assemble_backend`（不重建任何后端连接池，
+        // 不二次 init 插件），仅重建路由层 + 任务池 + JS 模块树；None = 现状零变化。
+        reuse_backend: Option<Arc<Backend>>,
     ) -> Result<App, String> {
         // 挂载解析（v0.1.58）：结构校验（程序化构造的 cfg 不经 load 层，这里兜底）→
         // 归一 / canonicalize / 逐条目 dev-release（规则 4）。primary = 第一条 api 挂载
@@ -1244,8 +1250,16 @@ impl App {
             .filter_map(|m| m.kind.api().map(|(d, t)| (d.to_path_buf(), t)))
             .collect();
         // 后端装配（spec §2.2 归属表）：StableState 唯一构造点，HTTP 步全在下方。
-        let backend =
-            Arc::new(assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?);
+        // 热更复用：Some(旧 Backend) → 跳过 assemble_backend（不重建连接池、不二次 init 插件）。
+        let reused = reuse_backend.is_some();
+        let backend = match reuse_backend {
+            Some(b) => b,
+            None => {
+                Arc::new(
+                    assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?,
+                )
+            }
+        };
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
         // Some(flag)（HTTP actor 桥注 None——消费会话归属评审 M2）。HTTP 层创建。
@@ -1269,7 +1283,12 @@ impl App {
         config::validate_server_limits(&cfg)?;
         // 迁移门禁（§4.6，先于 seed）：dev 默认 auto（apply），release 默认 verify
         // （M003/M004 校验，账本落后拒启）；`migrate_on_start: off` 为逃生门。
-        let gate = migrate_gate_of(&cfg, ts);
+        // 热更路径强制 verify-only（dev 默认 auto-apply 会打生产库，§5 ②）。
+        let gate = if reused {
+            "verify"
+        } else {
+            migrate_gate_of(&cfg, ts)
+        };
         let db_key: &str = profiles.db.as_deref().unwrap_or("default");
         match gate {
             "auto" => {
@@ -1301,9 +1320,12 @@ impl App {
                 ));
             }
         }
-        // 种子重放（P0）：各 api 树的模块 seed.sql（§8-1）。
-        for (tdir, _) in &trees {
-            crate::seed::replay_all(stable.dbs.get(db_key), tdir).await?;
+        // 种子重放（P0）：各 api 树的模块 seed.sql（§8-1）。热更复用时不重放
+        // （种子是一次性初始化，重载不应再灌库，§5 ②）。
+        if !reused {
+            for (tdir, _) in &trees {
+                crate::seed::replay_all(stable.dbs.get(db_key), tdir).await?;
+            }
         }
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
@@ -1585,6 +1607,7 @@ impl App {
             router,
             bus: stable.bus.clone(),
             stable,
+            backend,
             base,
             tasks_flag,
             make_task_bridge,
@@ -1633,6 +1656,27 @@ impl App {
         let router = self.router.clone(); // Router 克隆廉价（内部 Arc）
         let h = tokio::spawn(async move {
             let _ = serve::serve_router(listener, router, shutdown).await;
+        });
+        Ok((bound, h))
+    }
+
+    /// 热更新服务形态（v1，仅 `server.reload_api=true` 时由 `serve_cmd::run` 调用）：
+    /// listener 永生 + 外层单一 fallback（`ReloadState` 持有当前内层 Router 的 watch 通道）。
+    /// `rs` 已由 `serve_cmd` 构造（含 `reload_executor` 闭包与首代内层 Router）。
+    pub async fn serve_hot_reload(
+        &self,
+        addr: SocketAddr,
+        rs: std::sync::Arc<serve::reload::ReloadState>,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(SocketAddr, JoinHandle<()>), String> {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("bind: {e}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr: {e}"))?;
+        let h = tokio::spawn(async move {
+            let _ = serve::reload::serve_swappable(listener, rs, shutdown).await;
         });
         Ok((bound, h))
     }
@@ -1694,6 +1738,16 @@ impl App {
     /// 唯一 StableState（与 actor 共享后端），供测试运行时构造 bridge_ext。
     pub fn stable(&self) -> Arc<StableState> {
         self.stable.clone()
+    }
+
+    /// 后端装配产物（含全部连接池 + 插件 vtable）；热更时复用以避免重连（§5 ②）。
+    pub fn backend(&self) -> Arc<Backend> {
+        self.backend.clone()
+    }
+
+    /// 当前鉴权守卫（reload 注入 `ReloadState` 用；返回克隆的 `Arc` 句柄）。
+    pub fn auth_guard(&self) -> Option<Arc<dyn only_js::bridge::AuthGuard>> {
+        self.auth_guard.clone()
     }
 
     /// API 基础前缀。

@@ -16,6 +16,27 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.63（未打标签）
+
+**feat（oj serve）：配置热更新（v1）**。`server.reload_api: true` 时 `oj serve` 走
+「永生 listener + 外层单一 fallback」形态，支持零停机热更：
+
+- `POST {base}/_system/config`（空 body）触发热更；`GET {base}/_system/config` 看当前代际
+  （`config_path`/`sha256`/`loaded_at`/`generation`）；`GET {base}/_system/health` 看健康 +
+  代际（旧 `{base}/health` 仍兼容但告警）。
+- 热更流程：归一（load_cfg → fold_cli_mounts 重放 → 证书/公钥路径重放 → admission_gate）
+  → 幂等判定（归一落盘文件 sha256 同代 → `unchanged`，不装配不 swap）→ 段 diff 三清单
+  （`applied` 本代生效 / `restart_pending` 沿用旧池重启后生效 / `kept_listener` listener 级沿旧）
+  → 影子装配（**复用首代连接池与插件 vtable**，不重建后端、迁移强制 verify-only、不重放 seed）
+  → 任务池先建新池 fail-fast 再停旧池 → `watch` 通道整体 swap 内层 Router，旧代随在途请求自然 drain。
+- 守卫：`auth:` 配置了 → 需 Bearer 验签（401）；未配 → 仅回环可调（非回环 403）。并发
+  `POST` 拿不到串行锁 → 409 `reload in progress`。非空 body → 400。
+- 失败不破坏在跑实例：装配失败返回 400 + 原因，旧代继续服务；新任务池建不起来则旧池仍跑。
+- 证书 watcher 进程级单例：按「证书路径|公钥路径」去重，反复热更不再累积 watcher 线程 /
+  inotify fd（spec §6 边界 5）。
+- 设计文档：`docs/superpowers/specs/2026-10-12-config-hot-reload-design.md`（含 §3 外层
+  fallback 分流、§5 全流程、§6 段 diff 矩阵、§9 边界清单，经双专家对抗复核 + 第二轮修订）。
+
 ## v0.1.62（未打标签）
 
 **perf（bridge）**：请求热路径三项优化（基线与前后对比见 `docs/perf/baseline-2026-10-12.md`，

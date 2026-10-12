@@ -15,6 +15,34 @@ use only_js::config::ServerCfg;
 
 use crate::certificate::{CertificateStatus, load_certificate_at};
 
+/// 进程级单例：按「resolved 证书路径 + 公钥路径」去重，避免每次 `from_config`
+/// （热更每代）都 `spawn_watcher` 起一条永生线程 + 一个 inotify watch（反复热更会
+/// 累积线程 / inotify fd，直至耗尽）。首个调用起线程，后续同 key 直接复用同一 watcher。
+static WATCHERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Arc<()>>>> =
+    std::sync::OnceLock::new();
+
+/// 启动证书热加载（幂等单例）。`resolved_cert` / `resolved_key` 为相对 config 目录解析后的
+/// 绝对路径；相同路径组合只起一个 watcher 线程。
+pub fn ensure_watcher(
+    status: SharedCertStatus,
+    valid_until: SharedCertValidUntil,
+    cfg: &ServerCfg,
+    config_dir: &Path,
+) {
+    let key_cert = crate::certificate::resolve_path(&cfg.certificate_path, config_dir);
+    let key_pub = crate::certificate::resolve_path(&cfg.public_key_path, config_dir);
+    let key = format!("{}|{}", key_cert.display(), key_pub.display());
+    let reg = WATCHERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = reg.lock().expect("watcher registry lock poisoned");
+    if map.contains_key(&key) {
+        return; // 已存在，复用（热更不重复 spawn）
+    }
+    map.insert(key, Arc::new(()));
+    drop(map);
+    // 首次：起 watcher 线程（detached，进程退出即终止）。
+    spawn_watcher(status, valid_until, cfg.clone(), config_dir.to_path_buf());
+}
+
 /// 派生证书状态类型别名，避免调用处重复书写。
 pub type SharedCertStatus = Arc<RwLock<CertificateStatus>>;
 pub type SharedCertValidUntil = Arc<RwLock<Option<SystemTime>>>;

@@ -145,7 +145,7 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .build()
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
-                let app = App::from_config(cfg, &top, &config_dir, true, &profiles).await?;
+                let app = App::from_config(cfg, &top, &config_dir, true, &profiles, None).await?;
                 run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })

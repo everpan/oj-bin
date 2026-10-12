@@ -9,6 +9,8 @@ pub mod actor;
 pub mod certificate;
 pub mod certificate_watcher;
 pub mod logging;
+/// 配置热更新传输层（v1）：外层单一 fallback + watch 通道 + reload_api 门禁。
+pub mod reload;
 pub mod routes;
 pub mod tasks;
 /// 测试支撑（仅 dev/test 编译）：生成真实签名 JWS 证书，供装配测试使用。

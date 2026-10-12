@@ -2437,6 +2437,36 @@ mounts:
 | `grace_days` | `30` | 证书过期后宽限天数（缩窄可加速告警） |
 | `migrate_on_start` | `auto`（dev）/ `verify`（release） | 迁移门禁：auto 启动即应用；verify 账本落后拒启（M004，先 `oj migrate`）；`off` 迁移完全归运维 |
 | `ownership_guard` | `"warn"` | 表归属守卫：`warn` 跨模块表访问仅告警；`deny` 未声明 deps 拒绝执行（500 附修复指引） |
+| `reload_api` | `false` | （v1 配置热更新）开启后 `oj serve` 走「永生 listener + 外层单一 fallback」形态：监听 `POST {base}/_system/config` 触发热更、`GET {base}/_system/config` 看当前代际、`GET {base}/_system/health` 看健康 + 代际。详见下「配置热更新（reload_api）」。关闭则维持原 `serve_graceful` 行为（零变化） |
+
+#### 配置热更新（reload_api）
+
+`server.reload_api: true` 时，`oj serve` 启动「热更新服务形态」：监听 socket 永生（不被热更/优雅停机外的信号关闭），所有请求经一层**外层 fallback** 分流——`_system` 相关路径由平台处理，其余原样 `oneshot` 转发给「当前内层 Router」（由 `watch` 通道持有，热更时整体替换）。热更**零停机**：旧内层 Router 随在途请求完成自然 drain，新请求命中新 Router。
+
+> **保留路径**：`_system` 是平台保留前缀，业务模块勿占用；`{base}/_system/config`（`GET`/`POST`）与 `{base}/_system/health` 由外层 fallback 直接响应，不经业务路由，也不走证书过期门禁（运维换证窗口仍可探活）。
+
+**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
+
+- **幂等**：归一后落盘文件 sha256 与当前代相同 → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。
+- **段 diff 三清单**（每次成功 swap 返回）：
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）——已验证合法，但本代沿用旧连接池/旧插件 vtable，**重启后生效**。
+  - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
+  - `applied`：其余段（如 `vars` 部署期常量）——本代即生效。
+
+成功响应：`{"code":0,"data":{"generation":<n>,"applied":[...],"restart_pending":[...],"kept_listener":[...]}}`。
+
+**守卫**：`server.reload_api` 开启后 `_system/config` 受保护——`auth:` 配置了 → 需 Bearer 验签（401 详情在响应体）；未配 `auth:` → 仅**回环地址**（loopback）可调，非回环 403（响应体 `"reload_api requires loopback or auth"`）。`GET` 同样受此守卫。
+
+**并发**：同一时刻只允许一个热更；第二个并发 `POST` 在拿不到串行锁时返回 **409 `reload in progress`**。
+
+**代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation}`；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
+
+**限制（v1 边界）**：
+- 热更**复用首代已建立的连接池与插件 vtable**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。
+- 触发源是**落盘配置文件**：进程生命周期内 CLI 覆盖（`--api-path`/`--cert-path`）不变，故以文件内容为热更真触发源。改文件 → `POST` 即生效。
+- 装配失败（如 `admission_gate` 不通过、新模块编译错）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例）；任务池交接为先建新池 fail-fast、再停旧池，新池建不起来则旧池仍跑（回滚完整）。
+
+| `reload_api` | `false` | （v1 配置热更新）开启后 `oj serve` 走「永生 listener + 外层单一 fallback」形态：监听 `POST {base}/_system/config` 触发热更、`GET {base}/_system/config` 看当前代际、`GET {base}/_system/health` 看健康 + 代际。详见下「配置热更新（reload_api）」。关闭则维持原 `serve_graceful` 行为（零变化） |
 
 ### 静态站点与 per-route meta（SEO / IM 预览）
 
