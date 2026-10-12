@@ -16,6 +16,38 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.62（未打标签）
+
+**perf（bridge）**：请求热路径三项优化（基线与前后对比见 `docs/perf/baseline-2026-10-12.md`，
+锚定快照 `docs/perf/data/2026-10-12.txt`）。
+
+- **http 快照 memo**：`http.*` 属性访问此前每次全量深拷贝 RequestInfo（headers/query
+  clone + 整个 body 重解析，实测 11.6µs/次）——现按请求代数命中 memo，每请求至多一次
+  真快照（实测 −98%）。行为语义不变；`db.asTenant` 等请求中途改 `req` 的操作会失效
+  memo（快照仍即时反映）。
+- **模块执行 driver 常驻化**：每请求编译一次性 side-module driver → bootstrap 常驻
+  `__ojRun`（AsyncFunction，`"use strict"` 前缀对齐 module 严格语义）。单次模块执行
+  20.5µs → 4.23µs（−79%）；isolate module map 不再随请求数无界增长。错误信封保持
+  `类名: 消息` 形态（`NotCapable: …` 等）。
+- **release 模式免每请求 stat/canonicalize**：driver spec 每路径首请求冻结（dev 热重载
+  语义不变；release 下改文件本就须重跑 `oj build`）。
+
+**perf（serve）**：请求路径去重复功——鉴权头 map 单次构造（此前开 auth 时字符串化两遍）；
+静态资产 ETag(mtime-len) + `If-None-Match` → **304**（免读盘免传输；HTML 走 meta 注入
+不参与，缓存策略归 `server.html_cache_control`）；`html_meta` JSON 进程缓存 + 异步读
+（此前每 HTML 请求在 async worker 线程同步读盘）；无注入页面零拷贝。
+
+**perf（tasks）**：worker 对齐循环免每 5ms 每任务全量 TaskEntry clone；事件日志内存计数
+替代逐条 stat、BufWriter 自然刷盘替代逐条 flush。
+
+**chore（ci）**：release 流水线 publish-npm 等待 package 成功（根除首发 run 空 dist 竞态）。
+
+**chore（bench）**：新增 `js/run_module`、`js/http.access` 基准补真实路径盲区；
+`scripts/perf-baseline.sh` 导出中位数快照供跨版本对比。
+
+本版无新增 JS API / 报错文案 / 限制变化——`docs/devkit/` 四件无需对齐（http memo、
+log 级别短路、ETag 对 JS 面透明）。
+
 ## v0.1.61（未打标签）
 
 **feat（db）**：JS `db.dialect()` 报连接引擎名（`"sqlite" | "mysql" | "postgres"`）。供

@@ -1,7 +1,8 @@
 [package]
 name = "oj"
-version = "0.1.61"
+version = "0.1.62"
 edition = "2024"
+authors = ["everpan <unix@vip.qq.com>"]
 
 [dependencies]
 only-js = { path = ".." }

@@ -6,6 +6,7 @@ default-members = ["."]
 name = "only-js"
 version = "0.1.3"
 edition = "2024"
+authors = ["everpan <unix@vip.qq.com>"]
 
 # 无可选 feature：kafka/rabbitmq 事件 broker 已迁插件（Task 4.3，oj-bus-kafka /
 # oj-bus-rabbitmq cdylib 各自携带 rdkafka/lapin 客户端，core 不再依赖）。
