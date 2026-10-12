@@ -71,47 +71,6 @@ interface QueryBuilder {
   toJSON(): object;
 }
 
-// DB(name) 返回的命名数据库实例。
-interface DBInstance {
-  // 原始 SQL + 绑定参数（params 可选）。返回行数组。
-  query(sql: string, params?: unknown[]): Promise<Row[]>;
-  // 执行写操作，返回受影响行数。
-  exec(sql: string, params?: unknown[]): Promise<number>;
-  // 安全查询构造器（标识符白名单 + 参数化值）。
-  table(name: string): QueryBuilder;
-  // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
-  leaf(field: string, op: string, value?: unknown): WhereCond;
-  and(...conds: WhereCond[]): WhereCond;
-  or(...conds: WhereCond[]): WhereCond;
-  not(cond: WhereCond): WhereCond;
-  // 从 toJSON() 快照复原构造器（继续链式调用）。
-  fromJSON(snap: object): QueryBuilder;
-  // 系统逃生通道（tenant sql_guard）：本请求绕过租户注入/校验。显式且被审计，
-  // 业务 handler 不得使用。
-  asSystem(): DBInstance;
-  // 匿名请求声明租户（v0.1.20）。公开页 handler 用**服务端派生**的租户 id 声明本次请求
-  // 的身份（典型派生链：分享 token → 查共享表 → 租户 id）。**与 asSystem 不同——租户条件
-  // 仍然强制注入**，只是身份由 handler 给。
-  // 三道门禁全过才生效，缺一即抛错（不是静默忽略）：
-  //   ① config `tenant.allow_as_tenant: true`（默认关）；
-  //   ② 请求是匿名请求（命中 `tenant.anonymous_paths` 且未带租户头；`oj test --anonymous`）；
-  //   ③ id 非空。
-  // 另：请求级且**只能调用一次**（已带租户头的请求、或同一请求内二次调用 → 抛错，防运行期
-  // 切换身份）；生效后 `http.tenantId` 即该值，并记一条审计日志。
-  // 红线：id 必须服务端派生，**绝不可**直接取请求参数（否则等于把租户交给调用方）。
-  /** 平台序列分配（v0.1.24）：单语句原子取号，`max+1` 竞态的终态。
-   * 首次使用自动建平台表 `_oj_sequences`；返回值 ≤2^53-1 是 number，超出是十进制字符串。 */
-  nextSeq(name: string): Promise<number | string>;
-  /** 连接引擎名（v0.1.61）：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
-   * 诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，慎用。 */
-  dialect(): "sqlite" | "mysql" | "postgres";
-  asTenant(id: string): DBInstance;
-  // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
-  // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
-  // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
-  tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
-}
-
 // 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）。
 // isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
 // （MySQL 的 DDL 会隐式提交调用方事务）。
@@ -492,6 +451,48 @@ declare global {
     route?: string;
   }
 
+  // DB(name) 返回的命名数据库实例。（在 declare global 内：业务代码要能**点名**
+  // 这个类型（如 `function f(dbi: DBInstance)`）；放模块作用域会 TS2304。）
+  interface DBInstance {
+    // 原始 SQL + 绑定参数（params 可选）。返回行数组。
+    query(sql: string, params?: unknown[]): Promise<Row[]>;
+    // 执行写操作，返回受影响行数。
+    exec(sql: string, params?: unknown[]): Promise<number>;
+    // 安全查询构造器（标识符白名单 + 参数化值）。
+    table(name: string): QueryBuilder;
+    // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
+    leaf(field: string, op: string, value?: unknown): WhereCond;
+    and(...conds: WhereCond[]): WhereCond;
+    or(...conds: WhereCond[]): WhereCond;
+    not(cond: WhereCond): WhereCond;
+    // 从 toJSON() 快照复原构造器（继续链式调用）。
+    fromJSON(snap: object): QueryBuilder;
+    // 系统逃生通道（tenant sql_guard）：本请求绕过租户注入/校验。显式且被审计，
+    // 业务 handler 不得使用。
+    asSystem(): DBInstance;
+    // 匿名请求声明租户（v0.1.20）。公开页 handler 用**服务端派生**的租户 id 声明本次请求
+    // 的身份（典型派生链：分享 token → 查共享表 → 租户 id）。**与 asSystem 不同——租户条件
+    // 仍然强制注入**，只是身份由 handler 给。
+    // 三道门禁全过才生效，缺一即抛错（不是静默忽略）：
+    //   ① config `tenant.allow_as_tenant: true`（默认关）；
+    //   ② 请求是匿名请求（命中 `tenant.anonymous_paths` 且未带租户头；`oj test --anonymous`）；
+    //   ③ id 非空。
+    // 另：请求级且**只能调用一次**（已带租户头的请求、或同一请求内二次调用 → 抛错，防运行期
+    // 切换身份）；生效后 `http.tenantId` 即该值，并记一条审计日志。
+    // 红线：id 必须服务端派生，**绝不可**直接取请求参数（否则等于把租户交给调用方）。
+    /** 平台序列分配（v0.1.24）：单语句原子取号，`max+1` 竞态的终态。
+     * 首次使用自动建平台表 `_oj_sequences`；返回值 ≤2^53-1 是 number，超出是十进制字符串。 */
+    nextSeq(name: string): Promise<number | string>;
+    /** 连接引擎名（v0.1.61）：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
+     * 诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，慎用。 */
+    dialect(): "sqlite" | "mysql" | "postgres";
+    asTenant(id: string): DBInstance;
+    // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
+    // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
+    // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
+    tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
+  }
+
   const json: JsonApi;
   const http: HttpApi;
   const log: Logger;
@@ -613,6 +614,19 @@ declare global {
   function finish(): void;
   // CJS 同步 require（eval + 进程级缓存）。
   function __ojRequire(name: string, referrerPath?: string): any;
+  // fetch 返回的 Response（浏览器风格子集）。在 declare global 内：业务代码要能
+  // **点名**它（如 `let r: OjFetchResponse`，try/catch 两段赋值场景）；放模块作用域
+  // 会 TS2304，误标 DOM 的 Response 则 TS2740（缺 redirected/type/url 等）。
+  interface OjFetchResponse {
+    ok: boolean;
+    status: number;
+    statusText: string;
+    headers: Record<string, string>;
+    json(): Promise<Json | null>;
+    text(): Promise<string>;
+    arrayBuffer(): Promise<Uint8Array>;
+    clone(): OjFetchResponse;
+  }
   // 浏览器兼容的 fetch（url 必填，options 同 RequestInit 的常用子集）。
   function fetch(url: string, options?: {
     method?: string;
@@ -677,17 +691,5 @@ interface OjRabbitClient {
 // 由 `types/oj-modules.d.ts`（非模块，真 ambient `declare module "#*"`）兜底为 `any`
 // 而非报 TS2307；已存在、能被 `paths` 命中的别名仍走真实文件类型。运行时由 oj 的
 // loader 解析，本文件与该兜底只影响编辑器 / tsc。
-
-// fetch 返回的 Response（浏览器风格子集）。
-interface OjFetchResponse {
-  ok: boolean;
-  status: number;
-  statusText: string;
-  headers: Record<string, string>;
-  json(): Promise<Json | null>;
-  text(): Promise<string>;
-  arrayBuffer(): Promise<Uint8Array>;
-  clone(): OjFetchResponse;
-}
 
 export {};

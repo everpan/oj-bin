@@ -145,9 +145,9 @@ export function createSearch(dbi: DBInstance) {
         // trigram 对 <3 字符查询静默零命中 → LIKE 回退（score=1；转义 %/_/\）
         const where = fs.map((f) => `${qw(f)} LIKE ${P(0)} ESCAPE '\\'`).join(" OR ");
         const like = `%${likeEscape(q)}%`;
-        return await dbi.query(
+        return num(await dbi.query(
           `SELECT ${qw(pk)} AS id, 1 AS score FROM ${qw(t)} WHERE ${where} LIMIT ${limit}`,
-          fs.map(() => like));
+          fs.map(() => like)));
       }
       // trigram 短语查询：整词加引号防 FTS 语法注入（双写引号转义）
       const phrase = `"${q.replace(/"/g, '""')}"`;

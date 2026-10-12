@@ -118,11 +118,12 @@ export function createVersions(dbi: DBInstance) {
                          opts: { limit?: number; offset?: number } = {}): Promise<HistoryEntry[]> {
     const limit = Math.max(1, Number(opts.limit ?? 20));
     const offset = Math.max(0, Number(opts.offset ?? 0));
+    // SELECT 列与 HistoryEntry 一一对应（Row 是索引签名类型，接口须经 unknown 断言）。
     return await dbi.query(
       `SELECT version, author, message, created_at FROM oj_versions
        WHERE entity_type = ${P(0)} AND entity_id = ${P(1)}
        ORDER BY version DESC LIMIT ${limit} OFFSET ${offset}`,
-      [entityType, entityId]);
+      [entityType, entityId]) as unknown as HistoryEntry[];
   }
 
   async function diff(entityType: string, entityId: string, va: number, vb: number): Promise<DiffLine[]> {

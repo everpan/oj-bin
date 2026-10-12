@@ -11,7 +11,7 @@ export default {
     const p = providerOf(name);
     if (!p || p.kind !== "cas2") { json.fail(400, `unknown cas provider: ${name}`); return; }
     const ticket = String(http.query.ticket ?? "");
-    let r: Response;
+    let r: OjFetchResponse;
     try {
       r = await fetch(`${p.cas_validate_url}?ticket=${encodeURIComponent(ticket)
         }&service=${encodeURIComponent(p.callback_url ?? "")}`);

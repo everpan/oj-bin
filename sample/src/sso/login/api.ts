@@ -14,7 +14,7 @@ export default {
     const fields: Record<string, unknown> = { ...(p.extra_fields ?? {}) };
     fields[p.user_field ?? "username"] = username;
     fields[p.pass_field ?? "password"] = String(http.body?.password ?? "");
-    let r: Response;
+    let r: OjFetchResponse;
     try {
       r = await fetch(p.login_url, {
         method: "POST",
