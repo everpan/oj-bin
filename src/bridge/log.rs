@@ -25,6 +25,19 @@ pub fn op_log(level: u8, #[string] msg: &str, #[string] fields: String) {
     }
 }
 
+/// 级别门（perf F7）：logCall 据此在 JS 侧早退，被 tracing 过滤掉的级别
+/// （生产 info 级下的 debug）不再白付 fields 构建 + stringify + String 拷贝。
+/// 与 op_log 同一 target/level 语义（tracing::enabled 走同一 subscriber 判定）。
+#[op2(fast)]
+pub fn op_log_enabled(level: u8) -> bool {
+    match level {
+        0 => tracing::enabled!(target: "js", tracing::Level::DEBUG),
+        1 => tracing::enabled!(target: "js", tracing::Level::INFO),
+        2 => tracing::enabled!(target: "js", tracing::Level::WARN),
+        _ => tracing::enabled!(target: "js", tracing::Level::ERROR),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV};

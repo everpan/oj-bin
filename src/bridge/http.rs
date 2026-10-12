@@ -55,6 +55,14 @@ pub struct RequestInfo {
 
 use std::collections::HashMap;
 
+/// http 快照 memo 的代数（perf）：bootstrap 的 http Proxy 每次属性访问先读本值，
+/// 与 JS 侧 memo 代数比对——不同才重新拉全量快照（op_http_info）。
+/// 读代数是一次 smi fast op，远便宜于 op_http_info 的全量深拷贝 + body 重解析。
+#[op2(fast)]
+pub fn op_http_epoch(state: &mut OpState) -> u32 {
+    state.borrow::<ReqState>().epoch
+}
+
 /// http 全局对象的快照（bootstrap 每次访问调用，保证 per-request 最新）。
 #[op2]
 #[serde]

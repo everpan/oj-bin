@@ -378,6 +378,8 @@ pub fn op_db_as_tenant(state: &mut OpState, #[string] id: String) -> Result<bool
         "warn: db.asTenant({id}) invoked (anonymous request; tenant must be derived server-side)"
     );
     rs.req.tenant_id = Some(id);
+    // 请求中途改了 req → http 快照 memo（bootstrap 按 epoch 判旧）随之失效。
+    rs.epoch = rs.epoch.wrapping_add(1);
     Ok(true)
 }
 

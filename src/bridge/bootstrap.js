@@ -51,6 +51,9 @@ import {
   op_tasks_sleep,
   op_finish,
   op_http_info,
+  op_http_epoch,
+  op_driver_error,
+  op_log_enabled,
   op_http_file,
   op_http_body_bytes,
   op_json_fail,
@@ -385,7 +388,20 @@ globalThis.json = {
 };
 
 // ----- http helpers: current request context (lazy proxy; fresh per request) -----
-const httpInfo = () => op_http_info();
+// Snapshot memo: op_http_info deep-copies the whole RequestInfo (headers/query clone +
+// body re-parse) per call. Handlers touch http.* many times per request, so cache the
+// last snapshot and re-pull only when the Rust-side request epoch (ReqState.epoch,
+// bumped on reset and on mid-request req mutation) moves on.
+let httpMemo = null;
+let httpMemoEpoch = -1;
+const httpInfo = () => {
+  const ep = op_http_epoch();
+  if (ep !== httpMemoEpoch) {
+    httpMemo = op_http_info();
+    httpMemoEpoch = ep;
+  }
+  return httpMemo;
+};
 globalThis.http = new Proxy({}, {
   get: (_t, p) => {
     if (p === "param") {
@@ -404,6 +420,9 @@ globalThis.http = new Proxy({}, {
 
 // ----- log: structured logging (msg + alternating key/value pairs, like zap SugaredLogger) -----
 function logCall(level, msg, kv) {
+  // Level gate: skip fields build + stringify entirely when tracing filters the
+  // level out (debug under production info is otherwise pure waste).
+  if (!op_log_enabled(level)) return;
   const fields = {};
   for (let i = 0; i + 1 < kv.length; i += 2) fields[String(kv[i])] = kv[i + 1];
   // JSON.stringify once on the JS side, hand the JSON string straight to Rust
@@ -918,6 +937,27 @@ function queryBuilder(name, table) {
 
 // ----- finish: mark session done -----
 globalThis.finish = () => op_finish();
+
+// ----- module driver (perf F2) -----
+// Resident dispatch runner: execute the framework-built driver body via a per-request
+// AsyncFunction compilation -- await-capable like the old side-module driver body
+// (TLA-style awaits), and strict via the "use strict" prologue to match module
+// semantics, without the per-request module load (compile + module-map growth).
+// Errors are marshaled through op_driver_error; Rust maps them to the same
+// RunError::Core path as before. Reset/capture semantics unchanged.
+const OjAsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+globalThis.__ojRun = async () => {
+  try {
+    await new OjAsyncFunction('"use strict";\n' + globalThis.__ojBody)();
+  } catch (e) {
+    // Include the error class name (e.g. "NotCapable: ..."): the old side-module
+    // path surfaced "Name: message" via mod_evaluate; e.message alone drops it
+    // (handlers and tests match on the class name).
+    const n = e && e.name !== undefined ? String(e.name) : "";
+    const m = e && e.message !== undefined ? String(e.message) : String(e);
+    op_driver_error(n && m !== n ? n + ": " + m : m);
+  }
+};
 
 // ----- __ojRequire: sync require() for CJS interop (eval + process-wide cache) -----
 const __ojReqCache = new Map();

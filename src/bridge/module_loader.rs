@@ -2,8 +2,9 @@
 //! 与 CJS 包装互操作。`?v=<mtime>` 版本化 specifier 让 V8 模块缓存天然按内容失效。
 //! 注意：旧版本模块不可卸载，按编辑次数缓慢积累（dev 重启清零，release 有界）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use deno_core::ModuleSpecifier;
@@ -82,8 +83,8 @@ impl OjModuleLoader {
             .to_file_path()
             .map_err(|_| ModuleLoaderError::generic(format!("not a file url: {spec}")))?;
         let src = cached_transpile(&path).map_err(ModuleLoaderError::generic)?;
-        let code = if looks_cjs(&src) {
-            wrap_cjs(&src, &path.display().to_string())
+        let code: std::sync::Arc<str> = if looks_cjs(&src) {
+            std::sync::Arc::from(wrap_cjs(&src, &path.display().to_string()).as_str())
         } else {
             src
         };
@@ -581,6 +582,28 @@ pub fn versioned_specifier(path: &Path) -> Result<ModuleSpecifier, String> {
         .map_err(|_| format!("cannot build file url from {}", path.display()))?;
     url.set_query(Some(&format!("v={}", nanos.as_nanos())));
     Ok(url)
+}
+
+/// release 模式（ts=false）的 driver spec 冻结缓存（perf F3）：每路径首请求算一次
+/// （stat + canonicalize），之后纯内存命中。release 服务 manifests 聚合产物、热重载
+/// 不适用（改文件须重跑 `oj build`），per-request 的 mtime 探测纯属白付——
+/// versioned_specifier 的 stat + canonicalize 在深层路径上是 7-11 次 syscall。
+/// dev（ts=true）保持逐请求版本化（热重载语义）。
+pub(crate) fn driver_spec(path: &Path, ts: bool) -> Result<ModuleSpecifier, String> {
+    if ts {
+        return versioned_specifier(path);
+    }
+    static FROZEN: OnceLock<Mutex<HashMap<PathBuf, ModuleSpecifier>>> = OnceLock::new();
+    let mut m = FROZEN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(s) = m.get(path) {
+        return Ok(s.clone());
+    }
+    let s = versioned_specifier(path)?;
+    m.insert(path.to_path_buf(), s.clone());
+    Ok(s)
 }
 
 /// project_root 钳制：解析结果 canonical 化后必须仍在 root 内。

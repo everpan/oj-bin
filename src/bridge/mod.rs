@@ -104,7 +104,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use deno_core::error::CoreError;
-use deno_core::{JsRuntime, OpState, PollEventLoopOptions, op2};
+use deno_core::{JsRuntime, ModuleSpecifier, OpState, PollEventLoopOptions, op2};
 
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
 pub type BridgeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -314,12 +314,21 @@ pub struct ReqState {
     /// SQL 执行追踪画像（v0.1.51）：本请求累计的 SQL 事件，dev 信封 `_sql` 与
     /// `db.sqlProfile()` 的数据源；`reset` 时清空。
     pub sql_profile: sql_trace::SqlProfile,
+    /// http 快照 memo 的失效代数（perf）：`reset` 及请求中途改 `req` 的 op
+    /// （op_db_as_tenant）自增。bootstrap 的 http Proxy 据此判断 memo 是否过期，
+    /// 让 `http.*` 属性访问从「每次全量快照」降为「一次 smi fast op + memo 命中」。
+    pub epoch: u32,
+    /// 模块执行 driver 的异常回传（perf F2）：`__ojRun`（bootstrap）catch 后经
+    /// op_driver_error 存入；run_side_driver 据此映射 RunError::Core。语义等价于
+    /// 旧 side-module 路径的 mod_evaluate 错误（500 + 消息），但免每请求 module 装载。
+    pub driver_error: Option<String>,
 }
 
 impl ReqState {
     /// 重置为初始态，写入新请求的上下文。
     pub fn reset(&mut self, req: RequestInfo) {
         self.req = req;
+        self.epoch = self.epoch.wrapping_add(1);
         self.response = None;
         self.status = 200;
         self.headers.clear();
@@ -335,6 +344,7 @@ impl ReqState {
         self.stream_heartbeat_stop.borrow_mut().take();
         self.db_streams = std::sync::Arc::new(db::DbStreamRegistry::default());
         self.sql_profile = sql_trace::SqlProfile::default();
+        self.driver_error = None;
     }
 }
 
@@ -342,6 +352,7 @@ deno_core::extension!(
     bridge_ext,
     ops = [
         op_finish,
+        op_driver_error,
         json::op_json_ok,
         json::op_json_fail,
         json::op_json_header,
@@ -351,6 +362,7 @@ deno_core::extension!(
         stream::op_stream_write,
         stream::op_stream_end,
         http::op_http_info,
+        http::op_http_epoch,
         http::op_http_file,
         http::op_http_body_bytes,
         kv::op_kv_get,
@@ -401,6 +413,7 @@ deno_core::extension!(
         plugins_op::op_oj_info,
         vars::op_vars_get,
         log::op_log,
+        log::op_log_enabled,
         module_loader::op_resolve_cjs,
         oidc::op_oidc_sign,
         oidc::op_oidc_verify,
@@ -613,6 +626,13 @@ impl Bridge {
 #[op2(fast)]
 fn op_finish(state: &mut OpState) {
     state.borrow_mut::<ReqState>().done = true;
+}
+
+/// 模块 driver 的异常回传（perf F2）：bootstrap 的 `__ojRun` catch 后存入 ReqState，
+/// run_side_driver 据此映射 RunError::Core（isolate 丢弃语义与旧 module 路径一致）。
+#[op2(fast)]
+fn op_driver_error(state: &mut OpState, #[string] msg: &str) {
+    state.borrow_mut::<ReqState>().driver_error = Some(msg.to_string());
 }
 
 /// 响应捕获（json.ok/fail 写入，server 层读取后写回 HTTP 响应）。
@@ -1121,10 +1141,11 @@ impl Bridge {
     pub async fn probe_task_loop(&self, task_file: &std::path::Path) -> Result<bool, RunError> {
         let spec = module_loader::versioned_specifier(task_file)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
-        let code = format!(
+        let body = format!(
             "const m = await import(\"{spec}\");\n\
              json.ok({{ loop: typeof m.loop_body === \"function\" }});\n"
         );
+        let code = driver_script(&body);
         let cap = self
             .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
             .await?;
@@ -1159,23 +1180,27 @@ impl Bridge {
         timeout: std::time::Duration,
         validate: bool,
     ) -> Result<Capture, RunError> {
-        let spec = module_loader::versioned_specifier(api_path)
+        let spec = self
+            .driver_spec(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
         // TLA driver：import 命中 V8 模块缓存（?v= 不变时零转译零重编译）；
         // 方法未导出 → json.fail(405)（信封映射 HTTP 405）。
         // method/msg 以 JSON 编码嵌入（合法 JS 字面量，杜绝引号注入）。
+        // 经常驻 `__ojRun`（bootstrap，strict direct eval）执行——不再每请求装载
+        // side-module driver（perf F2：省编译/装载 + module map 无界增长）。
         let method_lit = serde_json::to_string(method).unwrap_or_else(|_| "\"\"".into());
         let msg_lit = serde_json::to_string(&format!(
             "method '{method}' not exported by {}",
             api_path.display()
         ))
         .unwrap_or_else(|_| "\"method not exported\"".into());
-        let code = format!(
+        let body = format!(
             "const m = await import(\"{spec}\");\n\
              const fn = m.default && m.default[{method_lit}];\n\
              if (typeof fn !== \"function\") json.fail(405, {msg_lit});\n\
              else await fn();\n"
         );
+        let code = driver_script(&body);
         // §5.3 执行上下文：api_path 祖先目录命中模块目录 → 本请求归该模块
         // （归属守卫 / bound_db 重定向依据；Map 键 = 模块目录绝对路径，装配期注入）。
         let stable = self.pool.stable();
@@ -1226,9 +1251,10 @@ impl Bridge {
         &self,
         api_path: &std::path::Path,
     ) -> Result<serde_json::Value, RunError> {
-        let spec = module_loader::versioned_specifier(api_path)
+        let spec = self
+            .driver_spec(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
-        let code = format!(
+        let body = format!(
             "const m = await import(\"{spec}\");\n\
              const out = {{}};\n\
              for (const k of [\"get\",\"post\",\"put\",\"del\",\"patch\",\"head\",\"options\"]) {{\n\
@@ -1242,6 +1268,7 @@ impl Bridge {
              }}\n\
              json.ok(out);\n"
         );
+        let code = driver_script(&body);
         let cap = self
             .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
             .await?;
@@ -1256,10 +1283,11 @@ impl Bridge {
     ) -> Result<serde_json::Value, RunError> {
         let spec = module_loader::versioned_specifier(path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
-        let code = format!(
+        let body = format!(
             "const m = await import(\"{spec}\");\n\
              json.ok(m.default === undefined ? null : m.default);\n"
         );
+        let code = driver_script(&body);
         let cap = self
             .run_side_driver(RequestInfo::default(), code, INTROSPECT_TIMEOUT, None)
             .await?;
@@ -1267,10 +1295,29 @@ impl Bridge {
         Ok(v["data"].clone())
     }
 
-    /// 一次性 side-module driver 执行：借出 runtime、武装看门狗、执行 `code`
-    /// （code 已 import 目标模块并触发对应 handler/内省），返回响应捕获。
-    /// run_module / introspect_module / read_module_default 共用（KillSwitch + 事件循环 + 信封解析）。
-    /// 超时 → RunError::Timeout（runtime 不归还）；handler 错误 → RunError::Core。
+    /// 请求路径的模块 spec（perf F3）：dev 逐请求 mtime 版本化（热重载）；
+    /// release（ts=false，含无 loader）走冻结缓存——首请求一次 stat/canonicalize，
+    /// 之后零 syscall。
+    fn driver_spec(&self, path: &std::path::Path) -> Result<ModuleSpecifier, String> {
+        let ts = self
+            .pool
+            .stable()
+            .loader
+            .as_ref()
+            .map(|l| l.ts)
+            .unwrap_or(false);
+        module_loader::driver_spec(path, ts)
+    }
+
+    /// 模块 driver 执行（perf F2 重构）：借出 runtime、武装看门狗，经常驻
+    /// `__ojRun`（bootstrap，strict direct eval）执行 `code`（已 import 目标模块并
+    /// 触发对应 handler/内省），返回响应捕获。不再每请求装载 side-module driver
+    /// （省一次 module 编译/实例化 + isolate module map 不再随请求数无界增长）。
+    /// run_module / introspect_module / read_module_default / probe_task_loop 共用。
+    /// `code` 必须是 `driver_script(&body)` 的产物——裸 body 的顶层 await 在
+    /// execute_script（classic script）里是语法错（曾漏包 probe 一处，tasks 探测
+    /// 全体误落 TLA 桶，dup 校验失效）。
+    /// 超时 → RunError::Timeout（runtime 不归还）；driver 异常 → RunError::Core（同旧）。
     async fn run_side_driver(
         &self,
         req: RequestInfo,
@@ -1278,23 +1325,13 @@ impl Bridge {
         timeout: std::time::Duration,
         module: Option<&str>,
     ) -> Result<Capture, RunError> {
-        static DRV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = DRV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/driver/{n}.js"))
-            .map_err(|e| {
-            RunError::Core(CoreError::from(std::io::Error::other(e.to_string())))
-        })?;
         let mut rt = self.checkout_armed(req, timeout, module).await?;
-        // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
-        // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
-        // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
-        // 池化 runtime 的第二个请求（driver/N 递增）会撞 MainModuleAlreadyExists。
+        // `__ojRun` catch 后经 op_driver_error 回传；promise 恒 resolve，event loop
+        // 排空即完成——错误通道走 ReqState.driver_error（不再有 mod_evaluate future）。
         let result: Result<(), CoreError> = async {
-            let id = rt.load_side_es_module_from_code(&driver_spec, code).await?;
-            let eval = rt.mod_evaluate(id);
+            rt.execute_script("<oj-driver>", code)?;
             rt.run_event_loop(deno_core::PollEventLoopOptions::default())
                 .await?;
-            eval.await?;
             Ok(())
         }
         .await;
@@ -1308,12 +1345,29 @@ impl Bridge {
                 limit: self.pool.stable().js_heap_limit.unwrap_or(0),
             });
         }
+        // driver 异常（原 mod_evaluate 错误通道）：runtime 不回池（与旧错误路径一致）。
+        let driver_err = {
+            let op_state = runtime::op_state(&rt);
+            let g = op_state.borrow();
+            g.borrow::<ReqState>().driver_error.clone()
+        };
+        if let Some(msg) = driver_err {
+            return Err(RunError::Core(CoreError::from(std::io::Error::other(msg))));
+        }
         result.map_err(RunError::Core)?;
         let capture = Self::read_capture(&rt);
         Self::finalize_tx(&rt).await;
         self.pool.checkin(rt);
         Ok(capture)
     }
+}
+
+/// driver 执行脚本（perf F2）：把框架生成的 body 以 JSON 字面量塞进
+/// `globalThis.__ojBody`，调常驻 `__ojRun`（bootstrap；strict direct eval + 异常
+/// 经 op_driver_error 回传）。每请求只编译这段两行小 script，不再装载 side module。
+fn driver_script(body: &str) -> String {
+    let body_lit = serde_json::to_string(body).unwrap_or_else(|_| "\"\"".into());
+    format!("globalThis.__ojBody = {body_lit};\n__ojRun();\n")
 }
 
 /// 内省超时：坏模块顶层死循环不挂死启动。

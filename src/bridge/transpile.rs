@@ -21,7 +21,7 @@ pub fn transpile_hits() -> usize {
     count().load(std::sync::atomic::Ordering::Relaxed)
 }
 
-type Cache = Mutex<HashMap<PathBuf, (SystemTime, String)>>;
+type Cache = Mutex<HashMap<PathBuf, (SystemTime, std::sync::Arc<str>)>>;
 
 fn cache() -> &'static Cache {
     static C: OnceLock<Cache> = OnceLock::new();
@@ -29,7 +29,9 @@ fn cache() -> &'static Cache {
 }
 
 /// 读盘 + mtime 缓存 + 转译（.ts）或原文（.js 直读不转译）。
-pub fn cached_transpile(path: &Path) -> Result<String, String> {
+/// 缓存值 `Arc<str>`（perf F6）：命中路径 `Arc::clone` 归零整份源码拷贝，
+/// 锁内不再做 O(源码长度) 的 memcpy；deno_core 的 ModuleCodeString 直收 Arc<str>。
+pub fn cached_transpile(path: &Path) -> Result<std::sync::Arc<str>, String> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map_err(|e| format!("stat {}: {e}", path.display()))?;
@@ -44,6 +46,7 @@ pub fn cached_transpile(path: &Path) -> Result<String, String> {
     } else {
         raw
     };
+    let out: std::sync::Arc<str> = std::sync::Arc::from(out.as_str());
     cache()
         .lock()
         .unwrap()

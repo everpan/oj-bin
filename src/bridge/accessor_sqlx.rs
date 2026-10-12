@@ -75,8 +75,10 @@ fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &Value) -> Query<'q, Any, 
 }
 
 /// 单行 AnyRow -> serde_json::Value（逐列按类型探测）。
+/// ponytail: 列名键必须 owned String（serde_json::Map 契约），无法整体免分配——
+/// 真要消掉得换流式序列化直写输出，收益配不上改动面。with_capacity 只免宽行 rehash。
 fn row_to_json(row: &sqlx::any::AnyRow) -> Value {
-    let mut obj = serde_json::Map::new();
+    let mut obj = serde_json::Map::with_capacity(row.columns().len());
     for col in row.columns() {
         let name = col.name().to_string();
         let ordinal = col.ordinal();
