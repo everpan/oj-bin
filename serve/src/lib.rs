@@ -466,7 +466,7 @@ async fn handle(State(st): State<AppState>, req: axum::extract::Request) -> Resp
             )
             .await
         }
-        RuntimeMount::Web(w) => serve_web(&st, w, rel, verb, accept_html).await,
+        RuntimeMount::Web(w) => serve_web(&st, w, rel, verb, accept_html, &headers).await,
     }
 }
 
@@ -502,7 +502,7 @@ async fn handle_api(
     // 只豁免**读取**语义不变。
     if verb == "GET"
         && let Some(blob) = st.pipeline.blob.as_ref()
-        && let Some(key) = uri.path().strip_prefix(&format!("{prefix}/blob/"))
+        && let Some(key) = blob_key_of(prefix, uri.path())
         && let Some(key) = decode_blob_key(key)
     {
         let mut r = match blob.serve(&key).await {
@@ -574,7 +574,7 @@ async fn handle_api(
     // （上限 blob_upload_max，语义与旧版一致）。
     if verb == "PUT"
         && let Some(blob) = st.pipeline.blob.as_ref()
-        && let Some(key) = uri.path().strip_prefix(&format!("{prefix}/blob/"))
+        && let Some(key) = blob_key_of(prefix, uri.path())
         && let Some(key) = decode_blob_key(key)
     {
         let path_no_base = format!("/blob/{key}");
@@ -635,7 +635,7 @@ async fn handle_api(
     // 同 prefix 配对 web（规则 2）：api 优先已由顺序保证；该 web **不开** SPA 回落
     // （最长前缀命中已使拼错路径直接落 api 挂载，回落吞不掉也不该吞）。
     if let Some(w) = web {
-        return serve_web(st, w, rel, verb, accept_html).await;
+        return serve_web(st, w, rel, verb, accept_html, headers).await;
     }
     fail_response(404, "no route matched")
 }
@@ -651,6 +651,7 @@ async fn serve_web(
     rel_path: &str,
     verb: &str,
     accept_html: bool,
+    headers: &HeaderMap,
 ) -> Response {
     if !matches!(verb, "GET" | "HEAD") {
         return fail_response(
@@ -659,12 +660,42 @@ async fn serve_web(
         );
     }
     let meta = st.static_opts.html_meta.as_deref();
-    if let Some(file) = resolve_static(&w.root, rel_path, meta)
-        && let Ok(body) = tokio::fs::read(&file).await
-    {
-        let mut r = static_page(st, &w.root, rel_path, &file, body).await;
-        apply_custom_headers(&mut r, &site_headers(st, w));
-        return r;
+    if let Some(file) = resolve_static(&w.root, rel_path, meta) {
+        let is_html = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("html"));
+        // 条件请求（perf F9，非 HTML 资产）：ETag(mtime-len) 命中 If-None-Match →
+        // 304 免读盘免传输。HTML 不做——体经 meta 注入后与文件不再逐字节一致，
+        // 且缓存策略本就归 `html_cache_control` 管。
+        let etag = if is_html {
+            None
+        } else {
+            tokio::fs::metadata(&file)
+                .await
+                .ok()
+                .and_then(|m| etag_of(&m))
+        };
+        if let Some(etag) = &etag
+            && if_none_match_hit(headers, etag)
+        {
+            let mut r = Response::new(axum::body::Body::empty());
+            *r.status_mut() = StatusCode::NOT_MODIFIED;
+            if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
+                r.headers_mut().insert(axum::http::header::ETAG, v);
+            }
+            return r;
+        }
+        if let Ok(body) = tokio::fs::read(&file).await {
+            let mut r = static_page(st, &w.root, rel_path, &file, body).await;
+            if let Some(etag) = &etag
+                && let Ok(v) = axum::http::HeaderValue::from_str(etag)
+            {
+                r.headers_mut().insert(axum::http::header::ETAG, v);
+            }
+            apply_custom_headers(&mut r, &site_headers(st, w));
+            return r;
+        }
     }
     // SPA 深链接回落（挂载 `spa: true`，v0.1.20 语义）：未命中 + 无扩展名 +
     // Accept html → 送 **本挂载** root/index.html。
@@ -701,7 +732,7 @@ async fn run_route(
         .to_string();
     // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
     // 防两处准入语义漂移）。401/400 以 Response 返回。
-    let (user, tenant_id, anonymous) = match admit(st, headers, verb, path_no_base) {
+    let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -740,10 +771,12 @@ async fn run_route(
         method: verb.to_string(),
         params,
         query,
-        headers: headers
-            .iter()
-            .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
-            .collect(),
+        headers: hdr_map.unwrap_or_else(|| {
+            headers
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+                .collect()
+        }),
         body: body_bytes,
         body_binary: false,
         tenant_id,
@@ -771,28 +804,39 @@ async fn run_route(
 }
 
 /// 前置管线准入（v0.1.30 抽出）：鉴权（ABI 9 四参守卫）+ 租户提取。
-/// Ok((user, tenant_id, anonymous))；Err = 已构造的 401/400 响应。
+/// Ok((user, tenant_id, anonymous, headers_map))；Err = 已构造的 401/400 响应。
+/// headers_map：鉴权已构建的头 map（perf F8，run_route 复用免二次字符串化）；
+/// 鉴权未激活为 None。
+type AdmitOut = (
+    Option<serde_json::Value>,
+    Option<String>,
+    bool,
+    Option<HashMap<String, String>>,
+);
+
 fn admit(
     st: &AppState,
     headers: &HeaderMap,
     verb: &str,
     path_no_base: Option<&str>,
-) -> Result<(Option<serde_json::Value>, Option<String>, bool), Box<Response>> {
+) -> Result<AdmitOut, Box<Response>> {
     // 鉴权（base 内非匿名路径必须过守卫 → 401；Ok(None) = 匿名放行）。
     // ABI 9：方法 + 全部请求头 JSON（小写名 → 值，含 cookie）透传守卫——
     // cookie 会话/CSRF 双提交的判定材料都在 headers 里（oj-auth 消费）。
+    // 头 map 只在此构建一次（perf F8）：String 化的 map 同时喂 FFI JSON 与
+    // run_route 的 RequestInfo（此前同一批头被字符串化两遍）。
+    let mut hdr_map: Option<HashMap<String, String>> = None;
     let user = match (st.pipeline.auth.as_ref(), path_no_base) {
         (Some(guard), Some(p)) => {
             let header = headers
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok());
-            let headers_json = serde_json::to_string(
-                &headers
-                    .iter()
-                    .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
-                    .collect::<std::collections::HashMap<_, _>>(),
-            )
-            .unwrap_or_default();
+            let hm: HashMap<String, String> = headers
+                .iter()
+                .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+                .collect();
+            let headers_json = serde_json::to_string(&hm).unwrap_or_default();
+            hdr_map = Some(hm);
             match guard.verify(p, verb, header, Some(&headers_json)) {
                 Ok(Some(u)) => Some(u),
                 Ok(None) => None,
@@ -868,7 +912,7 @@ fn admit(
         }
         None => None,
     };
-    Ok((user, tenant_id, anonymous))
+    Ok((user, tenant_id, anonymous, hdr_map))
 }
 
 /// SPA 回落的 Accept 判据（v0.1.20）：缺失 / `*/*` / 含 `text/html`（q>0）均视为 html。
@@ -928,7 +972,7 @@ async fn static_page(
         return r;
     }
     // 1) 静态 JSON 打底（`<site_root>/<dir>/<path>.json`，v0.1.20），2) 动态 handler 按 key 覆盖。
-    let mut map = load_static_meta(site_root, opts.html_meta.as_deref(), rel_path);
+    let mut map = load_static_meta(site_root, opts.html_meta.as_deref(), rel_path).await;
     let Ok(text) = String::from_utf8(body) else {
         // 非 UTF-8 的「HTML」不是我们能注入的文档（保持 v0.1.20 的旧行为：空体）。
         return file_response(file, Vec::new());
@@ -944,7 +988,7 @@ async fn static_page(
             Err(e) => eprintln!("warn: html_meta_handler: {e}"),
         }
     }
-    let out = inject_head(&text, &map);
+    let out = inject_head(text, &map);
     let mut r = file_response(file, out.into_bytes());
     // 缓存头：动态 handler 的 cache_control > server.html_cache_control；都没有 = 不加。
     if let Some(cc) = dynamic_cc.as_deref().or(opts.html_cache_control.as_deref()) {
@@ -1079,7 +1123,22 @@ fn set_cache_control(r: &mut Response, value: &str) {
 }
 
 /// 静态 meta JSON（`<root>/<dir>/<path>.json`）→ 键值表；未配置/未命中/非对象 → 空表。
-fn load_static_meta(
+/// meta JSON 进程缓存（perf F10）：(mtime, map)。命中只付 1 次 stat——此前每个
+/// HTML 请求都在 async worker 线程上做**同步** open/read + JSON parse（worker 被
+/// 磁盘往返阻塞）。失效同 transpile 缓存：mtime 变即重读。
+/// meta JSON 缓存条目：(mtime, 解析结果)。
+type MetaEntry = (
+    std::time::SystemTime,
+    std::sync::Arc<serde_json::Map<String, Value>>,
+);
+type MetaCacheMap = HashMap<PathBuf, MetaEntry>;
+
+fn meta_cache() -> &'static std::sync::Mutex<MetaCacheMap> {
+    static C: std::sync::OnceLock<std::sync::Mutex<MetaCacheMap>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+async fn load_static_meta(
     root: &Path,
     html_meta: Option<&str>,
     rel_path: &str,
@@ -1090,17 +1149,34 @@ fn load_static_meta(
     let Some(json_path) = meta_json_path(root, dir, rel_path) else {
         return serde_json::Map::new();
     };
-    let Ok(raw) = std::fs::read_to_string(&json_path) else {
+    let mtime = tokio::fs::metadata(&json_path)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
+    let Some(mtime) = mtime else {
         return serde_json::Map::new();
     };
-    match serde_json::from_str::<Value>(&raw) {
-        Ok(Value::Object(o)) => o,
-        Ok(_) => serde_json::Map::new(),
+    if let Some((t, m)) = meta_cache().lock().unwrap().get(&json_path)
+        && *t == mtime
+    {
+        return (**m).clone();
+    }
+    let Ok(raw) = tokio::fs::read_to_string(&json_path).await else {
+        return serde_json::Map::new();
+    };
+    let map = match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(o)) => std::sync::Arc::new(o),
+        Ok(_) => return serde_json::Map::new(),
         Err(_) => {
             eprintln!("warn: html_meta {}: invalid JSON", json_path.display());
-            serde_json::Map::new()
+            return serde_json::Map::new();
         }
-    }
+    };
+    meta_cache()
+        .lock()
+        .unwrap()
+        .insert(json_path, (mtime, map.clone()));
+    (*map).clone()
 }
 
 /// 键值表 → `<head>` 注入片段（白名单：`title` / `description` / `canonical` /
@@ -1203,25 +1279,27 @@ fn conflict_keys(obj: &serde_json::Map<String, Value>) -> Vec<Conflict> {
 /// 注入的第二个 title 根本不会生效（`og:*` 同理）。v0.1.20 只插入不摘除，等于注入了个寂寞。
 /// 键白名单与 HTML 转义由 `render_meta_tags` 负责，这里只管「摘同名旧标签 + 放新标签」。
 /// 无 `</head>` / 无可渲染键 → 原样返回（不猜结构）。
-fn inject_head(html: &str, obj: &serde_json::Map<String, Value>) -> String {
+/// 接管 HTML 所有权（perf F11）：无可注入标签 / 找不到锚点时原样返回——
+/// 此前每请求对整份文档做一次 `to_string()` 全量拷贝。
+fn inject_head(html: String, obj: &serde_json::Map<String, Value>) -> String {
     let tags = render_meta_tags(obj);
     if tags.is_empty() {
-        return html.to_string();
+        return html;
     }
-    let Some(head_end) = find_ci(html, b"</head>") else {
-        return html.to_string();
+    let Some(head_end) = find_ci(&html, b"</head>") else {
+        return html;
     };
     // head 内容起点：`<head …>` 开标签之后；没有开标签就从文档头起算（仍只动 head 段内）。
     // 用 ASCII 不敏感扫描（**不** `to_lowercase()`——大小写变换会改字节长度，索引会错位）。
-    let head_start = match find_ci(html, b"<head") {
+    let head_start = match find_ci(&html, b"<head") {
         Some(i) => match html[i..].find('>') {
             Some(gt) => i + gt + 1,
-            None => return html.to_string(),
+            None => return html,
         },
         None => 0,
     };
     if head_start > head_end {
-        return html.to_string();
+        return html;
     }
     let stripped = strip_conflicts(&html[head_start..head_end], &conflict_keys(obj));
     let mut out = String::with_capacity(html.len() + tags.len());
@@ -1498,6 +1576,41 @@ fn mime_of(p: &Path) -> &'static str {
         "yaml" | "yml" => "application/yaml",
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
+    }
+}
+
+/// blob 快速路径的 key 提取（perf F12）：免每请求 `format!("{prefix}/blob/")` 分配。
+/// 与旧写法逐字节同语义——含 base `"/"` 的历史怪癖（`{prefix}/blob/` 拼出
+/// `"//blob/"`，只有 `//blob/x` 形态命中；行为保留不改，修它属另一议题）。
+fn blob_key_of<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
+    if prefix == "/" {
+        path.strip_prefix("//blob/")
+    } else {
+        path.strip_prefix(prefix)
+            .and_then(|r| r.strip_prefix("/blob/"))
+    }
+}
+
+/// 静态资产 ETag（perf F9）：强 ETag `"mtime-hex len-hex"`——体即文件字节，精确成立。
+fn etag_of(m: &std::fs::Metadata) -> Option<String> {
+    let len = m.len();
+    let mtime = m.modified().ok()?;
+    let nanos = mtime
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!(r#""{nanos:x}-{len:x}""#))
+}
+
+/// If-None-Match 命中判定（弱比较，务实口径）：`*` 或值列表包含本 ETag 即命中。
+fn if_none_match_hit(headers: &HeaderMap, etag: &str) -> bool {
+    match headers.get(axum::http::header::IF_NONE_MATCH) {
+        Some(v) => match v.to_str() {
+            Ok(s) if s.trim() == "*" => true,
+            Ok(s) => s.split(',').any(|t| t.trim() == etag),
+            Err(_) => false,
+        },
+        None => false,
     }
 }
 
@@ -3751,7 +3864,7 @@ pub(crate) mod tests {
     #[test]
     fn inject_head_replaces_shell_title() {
         let html = "<html><head><title>shell</title></head><body>x</body></html>";
-        let out = inject_head(html, &meta(&[("title", "Dyn & Co")]));
+        let out = inject_head(html.to_string(), &meta(&[("title", "Dyn & Co")]));
         assert_eq!(out.matches("<title>").count(), 1, "{out}");
         assert!(out.contains("<title>Dyn &amp; Co</title>"), "{out}");
         assert!(!out.contains("shell"), "{out}");
@@ -3772,7 +3885,7 @@ pub(crate) mod tests {
             "</head><body>x</body></html>"
         );
         let out = inject_head(
-            html,
+            html.to_string(),
             &meta(&[
                 ("description", "new desc"),
                 ("og:title", "New OG"),
@@ -3809,7 +3922,7 @@ pub(crate) mod tests {
             "<title>shell</title>",
             "</head><body>x</body></html>"
         );
-        let out = inject_head(html, &meta(&[("title", "Real")]));
+        let out = inject_head(html.to_string(), &meta(&[("title", "Real")]));
         assert!(
             out.contains("window.__tpl = \"<title>inner</title>\""),
             "{out}"
@@ -3823,7 +3936,7 @@ pub(crate) mod tests {
     fn inject_head_is_index_safe_on_non_ascii() {
         let html =
             "<html><head><meta charset=\"utf-8\"><!-- İstanbul --></head><body>ş</body></html>";
-        let out = inject_head(html, &meta(&[("title", "Türkçe")]));
+        let out = inject_head(html.to_string(), &meta(&[("title", "Türkçe")]));
         assert!(out.contains("<title>Türkçe</title>"), "{out}");
         assert!(out.contains("<!-- İstanbul -->"), "注释被破坏：{out}");
         // 注入点仍在 `</head>` 之前，head 之外原样
@@ -3839,11 +3952,17 @@ pub(crate) mod tests {
     #[test]
     fn inject_head_no_head_or_empty_is_untouched() {
         let no_head = "<html><body>x</body></html>";
-        assert_eq!(inject_head(no_head, &meta(&[("title", "T")])), no_head);
+        assert_eq!(
+            inject_head(no_head.to_string(), &meta(&[("title", "T")])),
+            no_head
+        );
         let html = "<html><head><title>s</title></head></html>";
-        assert_eq!(inject_head(html, &serde_json::Map::new()), html);
+        assert_eq!(inject_head(html.to_string(), &serde_json::Map::new()), html);
         // 只给非白名单键（渲染不出东西）→ 不得摘任何标签
-        assert_eq!(inject_head(html, &meta(&[("foo", "bar")])), html);
+        assert_eq!(
+            inject_head(html.to_string(), &meta(&[("foo", "bar")])),
+            html
+        );
     }
 
     #[tokio::test]
