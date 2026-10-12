@@ -1,0 +1,20 @@
+# oj-bin criterion 中位数快照（单位 ns）
+# date: 2026-10-12T02:42:08Z
+# host: Darwin arm64
+# ref:  fe8f317
+js/baseline.run(json.ok x1)	833
+js/db.exec	22600
+js/db.query	48464
+js/fetch(local, x20)	757815
+js/http.access (x100)	26175
+js/json.ok	15505
+js/ldap.generic(bind, x1000)	440545
+js/ldap.typed(bind, x1000)	1249458
+js/log.info	46991
+js/redis.get	14861
+js/redis.set	15734
+js/run_module (json.ok x1)	4221
+rust/accessor.query	130
+rust/envelope.ok	67
+rust/kv.get	85
+rust/kv.set	72
