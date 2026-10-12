@@ -69,6 +69,25 @@ fn req() -> RequestInfo {
     }
 }
 
+/// 仿真请求上下文：16 头 + 4 查询参数 + 小 JSON body（贴近真实 handler 的 http.* 访问面）。
+fn rich_req() -> RequestInfo {
+    let mut headers = std::collections::HashMap::new();
+    for i in 0..16 {
+        headers.insert(format!("x-h{i}"), "v".to_string());
+    }
+    let mut query = std::collections::HashMap::new();
+    for i in 0..4 {
+        query.insert(format!("q{i}"), i.to_string());
+    }
+    RequestInfo {
+        method: "GET".into(),
+        headers,
+        query,
+        body: br#"{"a":1}"#.to_vec(),
+        ..Default::default()
+    }
+}
+
 /// 纯 Rust 层：信封序列化与 trait 实现。
 fn bench_rust(c: &mut Criterion) {
     let rt = runtime();
@@ -250,5 +269,70 @@ fn bench_ldap_channel(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rust, bench_js, bench_ldap_channel);
+/// P0 仪器：http.* 访问面基准。handler 里 `http.method`/`http.headers`/`http.query.x`
+/// 是最高频语句——每次属性访问的理论成本 = 1 次 op_http_info 全量快照（headers/query
+/// clone + body 解析 + serde_v8 全树转换）。
+fn bench_http_access(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("js");
+    group.throughput(Throughput::Elements(N as u64));
+    let bridge = new_bridge();
+    let script = format!(
+        r#"(function () {{ let s = 0; for (let i = 0; i < {N}; i++) {{
+             s += http.method.length; s += Object.keys(http.headers).length;
+             s += http.query.q0.length; s += http.param("q1") === "1" ? 1 : 0;
+           }} json.ok(s); }})()"#
+    );
+    group.bench_function("http.access (x100)", |b| {
+        b.iter(|| rt.block_on(bridge.run_with(&script, rich_req())).unwrap())
+    });
+    group.finish();
+}
+
+/// P0 仪器：run_module 全链路（HTTP 真实路径：side-module driver + api 模块 V8 缓存命中）。
+/// 现有基准只覆盖 run_with（纯 script），run_module 的 driver 装载开销是盲区。
+fn bench_run_module(c: &mut Criterion) {
+    use only_js::bridge::LoaderShared;
+    use std::collections::HashMap;
+
+    let rt = runtime();
+    let mut group = c.benchmark_group("js");
+    group.throughput(Throughput::Elements(1));
+
+    let root = std::env::temp_dir().join(format!("oj-bench-mod-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let api = root.join("bench_api.js");
+    std::fs::write(&api, "export default { get() { json.ok({ n: 1 }); } };\n").unwrap();
+
+    let mut dbs: HashMap<String, Arc<dyn DataAccessor>> = HashMap::new();
+    dbs.insert("default".to_string(), Arc::new(InMemoryAccessor::new()));
+    let bridge = Bridge::with_dbs_and_loader(
+        dbs,
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        Some(Arc::new(LoaderShared {
+            project_root: root.clone(),
+            ts: false,
+        })),
+        Default::default(),
+    );
+    group.bench_function("run_module (json.ok x1)", |b| {
+        b.iter(|| {
+            rt.block_on(bridge.run_module(&api, "get", rich_req(), Duration::from_secs(5)))
+                .unwrap()
+        })
+    });
+    group.finish();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+criterion_group!(
+    benches,
+    bench_rust,
+    bench_js,
+    bench_http_access,
+    bench_run_module,
+    bench_ldap_channel
+);
 criterion_main!(benches);
