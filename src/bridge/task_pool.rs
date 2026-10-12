@@ -47,6 +47,8 @@ pub struct TaskEventLog {
     file: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     recent: Mutex<VecDeque<serde_json::Value>>,
     seq: AtomicU64,
+    /// 当前文件字节数的内存计数（perf F16）：替代每条事件的 metadata stat。
+    size: AtomicU64,
 }
 
 const RECENT_CAP: usize = 1000;
@@ -74,6 +76,11 @@ impl TaskEventLog {
             None
         };
         Ok(Self {
+            size: AtomicU64::new(if enabled {
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            }),
             path,
             max_bytes: max_mb * 1024 * 1024,
             file: Mutex::new(file),
@@ -90,6 +97,7 @@ impl TaskEventLog {
             file: Mutex::new(None),
             recent: Mutex::new(VecDeque::new()),
             seq: AtomicU64::new(0),
+            size: AtomicU64::new(0),
         }
     }
 
@@ -106,24 +114,25 @@ impl TaskEventLog {
         drop(recent);
         if let Some(f) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             use std::io::Write;
-            // 滚动检查（append 前；粗略按当前文件大小）。
-            if self.max_bytes > 0 {
-                let cur = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-                if cur > self.max_bytes {
-                    let _ = f.flush();
-                    let _ = std::fs::rename(&self.path, self.path.with_extension("jsonl.1"));
-                    if let Ok(nf) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&self.path)
-                    {
-                        *f = std::io::BufWriter::new(nf);
-                    }
+            // 滚动检查（append 前；内存计数——perf F16：此前每条事件一次 metadata stat）。
+            if self.max_bytes > 0 && self.size.load(Ordering::Relaxed) > self.max_bytes {
+                let _ = f.flush();
+                let _ = std::fs::rename(&self.path, self.path.with_extension("jsonl.1"));
+                if let Ok(nf) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                {
+                    *f = std::io::BufWriter::new(nf);
                 }
+                self.size.store(0, Ordering::Relaxed);
             }
             let _ = f.write_all(line.to_string().as_bytes());
             let _ = f.write_all(b"\n");
-            let _ = f.flush();
+            // 不逐条 flush（perf F16）：BufWriter 满则自然刷盘，事件是诊断数据，
+            // 崩溃丢最后几条可接受；零碎 write 全量直达 kernel 纯属白付。
+            self.size
+                .fetch_add(line.to_string().len() as u64 + 1, Ordering::Relaxed);
         }
     }
 
@@ -242,6 +251,19 @@ impl TaskRegistry {
             .unwrap_or_else(|e| e.into_inner())
             .get(name)
             .cloned()
+    }
+
+    /// worker 对齐循环的轻量快照（perf F15）：只取循环消费的 (want, status, path)。
+    /// 循环每 5ms 对每个 assigned 任务跑一轮，此前每轮全量 clone TaskEntry
+    /// （name/path/cron/时间戳/last_error），实际只读 enabled 与 status 两字段。
+    pub fn snapshot(&self, name: &str) -> Option<(bool, TaskStatus, PathBuf)> {
+        let g = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g.get(name)?;
+        Some((
+            e.enabled && !matches!(e.status, TaskStatus::Failed),
+            e.status,
+            e.path.clone(),
+        ))
     }
 
     pub fn list(&self) -> Vec<TaskEntry> {
@@ -685,17 +707,16 @@ impl TaskPool {
             // 2) long 任务对齐 + 轮转。
             let mut idle = true;
             for name in &assigned {
-                let entry = match self.registry.get(name) {
-                    Some(e) => e,
+                let (want, status, path) = match self.registry.snapshot(name) {
+                    Some(v) => v,
                     None => continue,
                 };
-                let want = entry.enabled && !matches!(entry.status, TaskStatus::Failed);
                 let connected = sessions.contains_key(name);
                 if self.registry.take_reload(name) && connected {
                     self.teardown(&mut sessions, name, "reload").await;
                 }
                 if want && !connected {
-                    match bridge.task_connect(&entry.path).await {
+                    match bridge.task_connect(&path).await {
                         Ok(sess) => {
                             sessions.insert(name.clone(), sess);
                             self.registry.set_status(name, TaskStatus::Running, None);
@@ -723,7 +744,7 @@ impl TaskPool {
                 }
                 if !want
                     && !connected
-                    && matches!(entry.status, TaskStatus::Running | TaskStatus::Pending)
+                    && matches!(status, TaskStatus::Running | TaskStatus::Pending)
                 {
                     // 未连接任务的停用：状态直接落 Stopped（无 teardown 义务）。
                     self.registry.set_status(name, TaskStatus::Stopped, None);
