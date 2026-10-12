@@ -48,7 +48,7 @@
 本版无新增 JS API / 报错文案 / 限制变化——`docs/devkit/` 四件无需对齐（http memo、
 log 级别短路、ETag 对 JS 面透明）。
 
-## v0.1.61（未打标签）
+## v0.1.61
 
 **feat（db）**：JS `db.dialect()` 报连接引擎名（`"sqlite" | "mysql" | "postgres"`）。供
 `_shared` 共享模块与诊断分派方言 SQL；`db.tx` 回调对象同面（并带 `isTx: true` 标记事务域
