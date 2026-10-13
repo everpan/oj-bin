@@ -118,7 +118,11 @@ export default {
 **例外**：启动失败的最终退出原因总是直写终端（console 关闭也不例外），便于立即调整。
 **后台运行**：加 `--daemon` 脱离终端（unix 用 setsid，windows 用 DETACHED_PROCESS），
 stdio 重定向到空设备，父进程打印子 pid 后退出。日志照常落 `server.logs_dir`，停机用
-`kill <pid>`。
+`kill <pid>`。unix 上父进程会**等子进程就绪信号**（30s 上限）：子进程监听绑定后才打印
+`daemonized (pid …)` 并退 0；启动失败（config/证书/插件/端口任一环节）父进程**带真因
+报错并非零退出**——不再有「报了 daemonized 但其实没起来」的假成功。自带 glibc 发行包
+的 re-exec **直接 exec 随包 ld-linux + `oj.bin`**：子进程从 fork 后第一个 exec 起全程
+跑随包 glibc，不经系统 `/bin/sh`（宿主 sh/coreutils 异常不再能静默杀死 daemon 子进程）。
 **准入门（v0.1.58）**：`mounts:`（config + CLI 折叠后）为空 → 退出并提醒。挂载目录的
 存在性在**装配期**统一检查。「装配期」指启动时把配置、插件、路由拼起来、请求还没进来的
 那个阶段；「fail-fast」指这个阶段一发现问题就立即报错退出，不带病启动。重复前缀或目录
@@ -1034,6 +1038,38 @@ await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).
   `update` 的 `sets` 非空；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
 - insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
 - `db.tx` 内构造的 DML 自动走事务同连接（见下）。
+
+**受影响行数的三方言语义（跨引擎可移植的关键差异）**：
+
+`run()` 的返回值 = WHERE **匹配行数**——mysql / postgres / sqlite 在 oj 运行时上一致：
+
+| 引擎 | 协议原生默认 | oj 运行时 |
+|---|---|---|
+| mysql | **实际变更行**（同值 UPDATE 得 0） | 匹配行（连接协商 `CLIENT_FOUND_ROWS`） |
+| postgres | 匹配行（命令标签 `UPDATE n`） | 匹配行 |
+| sqlite | 匹配行（`changes()`） | 匹配行 |
+
+mysql 协议默认只数「值真的变了」的行——裸 mysql 客户端（`ROW_COUNT()` 即此语义）
+对**幂等重写**是陷阱：把 `is_read` 已是 1 的行再置 1 得 0。oj 的 mysql 插件（sqlx）
+连接时协商 `CLIENT_FOUND_ROWS`，服务端改报匹配行，与 sqlite / pg 拉齐（oj-db-mysql
+真库契约测试钉死：同值重复 UPDATE → 1、WHERE 不匹配 → 0）。**但别把这当保险**：
+用行数判「行存在 / 归属我」（`affected > 0`）只在匹配语义下成立，换连接方式
+（裸驱动、未来的插件实现）即翻车。正确姿势是**先断言再写、行数不读**：
+
+```ts
+// 跨引擎安全的幂等写：先按 (id, user_id) 断言归属，再无条件 UPDATE
+const owned = await db.table("notifications").select(["id"]).where({ and: [
+	{ field: "id", op: "eq", value: id },
+	{ field: "user_id", op: "eq", value: uid },
+] }).limit(1).all();
+if (owned.length === 0)
+	json.fail(403, "forbidden");      // 非本人/不存在——SELECT 断言，不看行数
+else
+	await db.table("notifications").update({ is_read: 1 })
+		.where({ field: "id", op: "eq", value: id }).run();  // 行数不读：重复已读幂等成功
+```
+
+DELETE 无此坑（删行必「变更」，匹配行 = 变更行），但归属判断同样推荐先 SELECT 断言。
 
 **insert 取回主键 `.returning([...])`**（`run()` 改返回行数组，不返回行数）：
 

@@ -98,6 +98,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 端点该拆目录、用嵌套组还是平铺（选型） | 同实体多端点用嵌套组、**以实体对象为根**（组名=实体，子组=子资源）；端点独立演化/多人分权拆目录；≤3 个同形端点平铺——详见 api-manual §4「何时采用」与场景 31 |
 | 启动失败 manifest | `name` 与目录名不一致 |
 | postgres 占位符 | **0.1.67 起三引擎统一用 `?`**（宿主对 postgres 自动改写 `$n`）；存量 `$n` 继续有效（`$n`+`?` 混用按序号续接）。计数不匹配在 PG 上提前报 `placeholder count N != params M`；jsonb 存在性判断用 `jsonb_exists(doc,'key')`，**别写裸 `?` 运算符** |
+| 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
 | `oj exec` 报 `module '…' missing manifest.yaml` 或 `service dir not found` | 裸 `oj exec` 在没有 config/mounts/`-d` 时会向上**猜** api 目录——在源码仓根会撞上仓库自己的 `src/`。exec **不需要** config.yaml：纯计算脚本直接 `-e` 跑；要后端就 `-c <项目config>` 或 `-d <api目录>` 显式给（v0.1.58 起探测只认「像业务树」的候选，非业务 `src/` 已跳过） |
 | 启动报 `no mounts configured` / `mounts[i]: 挂载目录 … No such file` | 准入门（v0.1.58）：顶层 `mounts:`（config + CLI 折叠后）为空——加一条挂载或传 `--api-path`/`--app-path`；挂载目录存在性由装配期 fail-fast（报错含挂载序号与前缀）。CLI 路径相对 CWD，config 挂载目录相对 config 目录。旧 `server.app_path` 等五键已删，出现即报错并输出迁移 YAML |
@@ -129,6 +130,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `ldap.*` 报 `ldap not configured` 但 `ldap:` 段已配 | v0.1.54 起 oj-ldap 迁移**泛型轴**——调用面改成 `axis("ldap").<op>(...)`；类型化 `ldap`/`LDAP` 全局是遗留双轨面，装配迁移版插件后报 not configured |
 | `axis("x")` 报 `unknown generic axis '<x>'` | 轴没装上（插件未加载/ABI 不匹配）或名字拼错——报错里的 available 列表即当前已注册泛型轴；确认插件在 `plugins:` 清单或扫描目录里 |
 | 打包发行版（deploy.sh / npm 启动器）启动报 `no auth plugin loaded`（插件文件齐全）或 `oj serve --daemon` 秒退 | v0.1.55 及更早：glibc 打包形态进程映像是 ld-linux，`current_exe()` 指向加载器，插件发现候选与 daemon re-exec 全部落空——升 v0.1.56+；临时绕法：显式 `OJ_PLUGINS_DIR` |
+| `oj serve --daemon` 报 `daemon child (pid N) exited during startup: …` | 子进程启动期失败（config / 证书 / 插件 / 端口任一环节），**真因即冒号后内容**——父进程已从「假成功」改为带因并非零退出，按报错修配置即可；若真因不可捕获（子进程被 kill -9 / 段错误），提示转 server logs 目录 |
 | 泛型轴插件撞名（插件作者） | 泛型轴名**避开 9 个保留名**（es/db/blob/bus/kv/auth/mq/mail/ldap）——pre-kind 旧宿主按名 cast，会把 GenericVtable 误当类型化 vtable；同名泛型轴多插件提供 → 装配期 fail-fast |
 | `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `axis("ldap").search_paged(base, { pageSize: 500 })` |
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |

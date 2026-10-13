@@ -66,6 +66,17 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     if a.daemon {
         return daemonize();
     }
+    // daemon 子进程回传通道（`OJ_DAEMON_READY_FD` 存在即子进程）：启动成败经该 fd
+    // 告知父进程——`ok` = 已监听；失败 = 真因。非 daemon 子进程 env 缺省，全 no-op。
+    daemon_ready::init_from_env();
+    let r = run_inner(a).await;
+    if let Err(e) = &r {
+        daemon_ready::fail(e);
+    }
+    r
+}
+
+async fn run_inner(a: ServeArgs) -> Result<(), String> {
     let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref(), true)?;
     // CLI 挂载折叠：--api-path / --app-path 全部 upsert 进 cfg.mounts（CLI 优先）。
     fold_cli_mounts(&mut cfg, &a)?;
@@ -185,6 +196,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
             shutdown_signal(Arc::new(tokio::sync::Mutex::new(task_flag.clone()))),
         )
         .await?;
+    // daemon 子进程：监听已绑定 = 启动成功落定，回传父进程（非 daemon 子进程 no-op）。
+    daemon_ready::ok();
     println!(
         "oj serve listening on http://{bound}{} (dir={}, {})",
         base,
@@ -276,6 +289,8 @@ async fn serve_hot_reload_branch(
     let (bound, h) = app
         .serve_hot_reload(addr, rs, shutdown_signal(ctx.current_task_flag.clone()))
         .await?;
+    // daemon 子进程：监听已绑定 = 启动成功落定，回传父进程（非 daemon 子进程 no-op）。
+    daemon_ready::ok();
     println!(
         "oj serve listening on http://{bound}{} (dir={}, {}, hot-reload on)",
         base,
@@ -509,28 +524,30 @@ fn diff_configs(
 /// 这里给 10s 上限 —— 足够跑完正常在途投递，又不会让 SIGTERM 后的退出过程长期挂住。
 const MAIL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// 后台运行入口（unix 分支）：re-exec 自身，剥掉 --daemon（避免子进程递归 daemon 化），
+/// 后台运行入口（unix 分支）：re-exec 自身（剥掉 --daemon）脱离终端后父进程即退，
 /// setsid 脱离控制终端（终端关闭的 SIGHUP 不再波及），stdio 重定向 /dev/null。
-/// 父进程 spawn 成功即打印子 pid 返回；启动失败的真因见 server.logs_dir 落盘日志。
+/// 父进程随后**等子进程就绪信号**（[`wait_daemon_ready`]）：`ok` = 已监听；启动期
+/// 死亡 = 带真因报错并非零退出——不再有「spawn 成功即报 daemonized」的假成功
+/// （stdio 全指 /dev/null，子进程启动失败时父进程秒退会让真因彻底不可见）。
 ///
 /// 自带 glibc 发行包（deploy.sh 启动器注入 OJ_BUNDLED_LD / OJ_BUNDLED_LIB）：re-exec
-/// 必须继续走打包的 ld-linux + --library-path——kernel 按 oj.bin 的 PT_INTERP（系统
-/// /lib64 路径）加载系统 ld-linux，低版本宿主 glibc 即崩；非打包形态 env 缺省，原样 re-exec。
-///
-/// 打包形态的 re-exec 目标是 **<bin>/oj 启动器**而非 current_exe()：进程经「exec 动态
-/// 加载器」启动，current_exe() 指向 ld-linux，把它当 program 传给 ld.so 会被当 ELF
-/// 加载必败（oj serve 秒退）；启动器脚本自带 OJ_BUNDLED_LD/LIB 导出与 ld 链，re-exec
-/// 它即等价于原语义。
+/// **直接 exec 随包 ld-linux + <bin>/oj.bin**（见 [`daemon_reexec_cmd`]）——kernel 按
+/// oj.bin 的 PT_INTERP（系统 /lib64 路径）加载系统 ld-linux 的路子不走，低版本宿主
+/// glibc 即崩；非打包形态 env 缺省，原样 re-exec。
 #[cfg(unix)]
 fn daemonize() -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let mut cmd = daemon_reexec_cmd()?;
     let null =
         std::fs::File::open("/dev/null").map_err(|e| format!("daemon: open /dev/null: {e}"))?;
+    // 就绪管道（父读子写）：子进程启动落定后经此回传 ok / 真因。写端 fd 号经 env 告知
+    // 子进程（fd 非 CLOEXEC、exec 后号子不变；读端设 CLOEXEC，子进程不继承）。
+    let (rx, tx) = daemon_ready_pipe().map_err(|e| format!("daemon: ready pipe: {e}"))?;
     cmd.args(strip_daemon_flag(std::env::args_os().skip(1)))
         .stdin(null)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        .env(OJ_DAEMON_READY_FD, tx.to_string());
     // Safety: setsid 是 async-signal-safe 的单调用，fork 后的子进程里只做这一件事。
     unsafe {
         cmd.pre_exec(|| {
@@ -542,19 +559,56 @@ fn daemonize() -> Result<(), String> {
         });
     }
     let child = cmd.spawn().map_err(|e| format!("daemon: spawn: {e}"))?;
-    println!("oj serve daemonized (pid {})", child.id());
-    Ok(())
+    let pid = child.id();
+    // 父进程只留读端：本副本的写端关掉，子进程死亡时读端才见 EOF。
+    // Safety: tx 为管道写端、父进程内无其他用户。
+    unsafe { libc::close(tx) };
+    match wait_daemon_ready(rx, DAEMON_READY_TIMEOUT) {
+        DaemonReady::Ok => {
+            println!("oj serve daemonized (pid {pid})");
+            Ok(())
+        }
+        DaemonReady::Starting => {
+            // 超时但子进程还活着：不杀不判死——大应用装配慢于超时属正常，提示看日志。
+            println!(
+                "oj serve daemonized (pid {pid}); not confirmed listening within {}s — check server logs",
+                DAEMON_READY_TIMEOUT.as_secs()
+            );
+            Ok(())
+        }
+        DaemonReady::Died(msg) => Err(format!(
+            "daemon child (pid {pid}) exited during startup: {}",
+            if msg.is_empty() {
+                "no error captured (crash?) — see server logs".to_string()
+            } else {
+                msg
+            }
+        )),
+    }
 }
 
-/// daemon re-exec 命令：打包形态（OJ_BUNDLED_LD 在 <bin>/lib/ 下且 <bin>/oj 启动器
-/// 存在）→ re-exec 启动器（它自会重放打包 ld 链）；否则 → 原样 re-exec 自身
-/// （bundled_reexec_cmd 无 env 时直通分支）。
+/// daemon re-exec 命令（unix）：打包形态（`OJ_BUNDLED_LD` 指向 `<bin>/lib/ld-linux-*`）
+/// → **直接 exec 随包 ld-linux + `<bin>/oj.bin`**。刻意不走 `<bin>/oj 启动器脚本`：
+/// 脚本经 kernel shebang 拉起**系统 /bin/sh**，DIR 计算还要 fork 子 shell exec
+/// `readlink`/`dirname`——整段中间层都是系统 glibc，宿主这段任何异常（sh 变体 /
+/// coreutils 缺失 / exec 受限）都让 daemon 子进程死得悄无声息（stdio 已指 /dev/null）。
+/// 直接 exec 后子进程从 fork 后第一个 exec 起全程跑随包 glibc，链条零系统组件。
+/// `<bin>/oj.bin` 缺失（异常布局）→ 回退启动器脚本（它自会重放 ld 链）；非打包形态
+/// （env 缺省）→ 原样 re-exec 自身（bundled_reexec_cmd 直通分支）。
 #[cfg(unix)]
 fn daemon_reexec_cmd() -> Result<std::process::Command, String> {
     if let Some(ld) = std::env::var_os("OJ_BUNDLED_LD") {
         let ld = std::path::PathBuf::from(ld);
-        if let Some(dir) = ld.parent().and_then(|p| p.parent()) {
-            let launcher = dir.join("oj");
+        // <bin>/lib/ld-linux-* → <bin>；oj.bin 与 lib/ 都与 ld 同级布局（deploy.sh）。
+        if let Some(bin_dir) = ld.parent().and_then(|p| p.parent()) {
+            let oj_bin = bin_dir.join("oj.bin");
+            if oj_bin.is_file() {
+                let lib = ld.parent().expect("ld has a parent dir").to_path_buf();
+                let mut c = std::process::Command::new(ld);
+                c.arg("--library-path").arg(lib).arg(oj_bin);
+                return Ok(c);
+            }
+            let launcher = bin_dir.join("oj");
             if launcher.is_file() {
                 return Ok(std::process::Command::new(launcher));
             }
@@ -586,6 +640,157 @@ fn strip_daemon_flag(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
     args.into_iter().filter(|a| a != "--daemon").collect()
+}
+
+/// daemon 子进程就绪回传的 env 键：值 = 就绪管道写端 fd 号（exec 后号子不变）。
+/// 子进程（serve 非 --daemon 形态）见该 env 即知自己是 daemon 子进程。
+#[cfg(unix)]
+const OJ_DAEMON_READY_FD: &str = "OJ_DAEMON_READY_FD";
+
+/// 父进程等就绪信号的总超时：config 装配 + 插件加载 + V8 初始化在大应用上要数秒，
+/// 30s 够慢机器落定；超时只是「未确认」，不杀不判死。
+#[cfg(unix)]
+const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 就绪管道（父读子写）：读端设 CLOEXEC（子进程不继承），写端原样继承、号子经 env 告知。
+#[cfg(unix)]
+fn daemon_ready_pipe() -> std::io::Result<(libc::c_int, libc::c_int)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // Safety: 纯 fd 创建，buf 为栈上双元素数组。
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Safety: 纯 fcntl。
+    if unsafe { libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // Safety: 两支皆为刚建出、本函数独享的 fd。
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(e);
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// 父进程等的就绪信号：Ok = 子进程已监听；Starting = 超时但仍存活；Died = 启动期退出。
+#[cfg(unix)]
+#[derive(Debug)]
+enum DaemonReady {
+    Ok,
+    Starting,
+    Died(String),
+}
+
+/// 等就绪信号（`rx` 读端所有权在函数内收回并关闭）：读到 `ok` → Ok；EOF 无字节
+/// （子进程未及回传即死）→ Died("")；EOF 前有字节 → Died(真因)；超时 → Starting。
+#[cfg(unix)]
+fn wait_daemon_ready(rx: libc::c_int, timeout: std::time::Duration) -> DaemonReady {
+    let r = wait_daemon_ready_inner(rx, timeout);
+    // Safety: rx 为本函数独享（父进程另一副本已关），关闭一次。
+    unsafe { libc::close(rx) };
+    r
+}
+
+#[cfg(unix)]
+fn wait_daemon_ready_inner(rx: libc::c_int, timeout: std::time::Duration) -> DaemonReady {
+    use std::io::Read;
+    use std::os::unix::io::FromRawFd;
+    // 不取得 fd 所有权（防 drop 误关）：ManuallyDrop 包一层。
+    let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(rx) });
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        if remain.is_zero() {
+            return DaemonReady::Starting;
+        }
+        let mut pfd = libc::pollfd {
+            fd: rx,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = remain.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // Safety: pfd 栈上有效，n = 1。
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // poll 自身失败（不该发生）：按未确认处理，不误判死亡。
+            return DaemonReady::Starting;
+        }
+        if n == 0 {
+            return DaemonReady::Starting;
+        }
+        let mut chunk = [0u8; 512];
+        match f.read(&mut chunk) {
+            // EOF：子进程写毕即关 / 已死。攒到的内容一次性裁决。
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let msg = String::from_utf8_lossy(&buf).trim().to_string();
+    if msg == "ok" {
+        DaemonReady::Ok
+    } else {
+        DaemonReady::Died(msg)
+    }
+}
+
+/// daemon 子进程 → 父进程的就绪/失败回传（unix）。父进程（[`daemonize`]）建管道并把
+/// 写端 fd 号经 env [`OJ_DAEMON_READY_FD`] 传给孩子；孩子启动落定后**写一次**即关：
+/// [`ok`] 在监听绑定后调，[`fail`] 在 run 返回 Err 时调。进程级一次性（静态位防重复
+/// 写——服务器运行期错误不得再回传，那时父进程早退出了）；env 缺省（非 daemon 子进程）
+/// 时全部 no-op。
+#[cfg(unix)]
+mod daemon_ready {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FD: OnceLock<libc::c_int> = OnceLock::new();
+    static SIGNALED: AtomicBool = AtomicBool::new(false);
+
+    /// 从 env 取就绪 fd（run 入口调一次；无 env = 非 daemon 子进程）。
+    pub fn init_from_env() {
+        if let Some(fd) = std::env::var_os(super::OJ_DAEMON_READY_FD)
+            .and_then(|s| s.to_str().and_then(|s| s.parse::<libc::c_int>().ok()))
+            .filter(|fd| *fd > 2)
+        {
+            let _ = FD.set(fd);
+        }
+    }
+
+    /// 启动成功落定（监听已绑定）：回传 `ok`。仅首次生效。
+    pub fn ok() {
+        write_once(b"ok");
+    }
+
+    /// 启动失败：回传真因。仅首次生效（ok 之后的运行期错误不再回传）。
+    pub fn fail(msg: &str) {
+        write_once(msg.as_bytes());
+    }
+
+    fn write_once(bytes: &[u8]) {
+        let Some(fd) = FD.get() else { return };
+        if SIGNALED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Safety: fd 来自 env、本进程独享；单次 write + close。
+        unsafe {
+            libc::write(*fd, bytes.as_ptr().cast(), bytes.len());
+            libc::close(*fd);
+        }
+    }
+}
+
+/// 非 unix：无就绪管道（windows daemon 化未接回传），全部 no-op。
+#[cfg(not(unix))]
+mod daemon_ready {
+    pub fn init_from_env() {}
+    pub fn ok() {}
+    pub fn fail(_msg: &str) {}
 }
 
 /// Windows 后台运行：DETACHED_PROCESS（不分配/不挂控制台，stdio 已重定向 null）
@@ -1803,19 +2008,22 @@ mod tests {
     }
 
     /// 打包形态（OJ_BUNDLED_LD 指向 <bin>/lib/ld-linux-*）daemon re-exec 的目标是
-    /// <bin>/oj 启动器：进程经「exec 动态加载器」启动，current_exe() 指向 ld-linux，
-    /// 把它当 program 传给 ld.so 会被当 ELF 加载必败（oj serve 秒退）；启动器脚本
-    /// 自带 OJ_BUNDLED_LD/LIB 导出与 ld 链，re-exec 它即原语义。且不得再被
-    /// bundled_reexec_cmd 包一层 ld（脚本不是 ELF，ld.so 无法加载）。
+    /// **随包 ld-linux + <bin>/oj.bin**（direct exec）：进程经「exec 动态加载器」启动，
+    /// current_exe() 指向 ld-linux，把它当 program 传给 ld.so 会被当 ELF 加载必败；
+    /// 而走 <bin>/oj 启动器脚本会经 shebang 拉起系统 /bin/sh（+readlink/dirname），
+    /// 整段中间层是系统 glibc——宿主那段任何异常都让 daemon 子进程静默死亡。直接 exec
+    /// 后子进程从第一个 exec 起全程随包 glibc。
     #[cfg(unix)]
     #[test]
-    fn daemon_reexec_cmd_targets_launcher_under_bundled_ld() {
+    fn daemon_reexec_cmd_prefers_bundled_ld_with_ojbin() {
         let _g = ENV_LOCK.lock().unwrap();
         let t = tmpdir("daemon-reexec");
         let bin_dir = t.0.join("bin");
         let ld = bin_dir.join("lib").join("ld-linux-x86-64.so.2");
         std::fs::create_dir_all(ld.parent().unwrap()).unwrap();
         std::fs::write(&ld, b"").unwrap();
+        let oj_bin = bin_dir.join("oj.bin");
+        std::fs::write(&oj_bin, b"").unwrap();
         let launcher = bin_dir.join("oj");
         std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
         // Safety: 单测独占进程内 oj 私有 env 键，设值后立即断言并清理（ENV_LOCK 串行化）。
@@ -1829,12 +2037,118 @@ mod tests {
             std::env::remove_var("OJ_BUNDLED_LD");
             std::env::remove_var("OJ_BUNDLED_LIB");
         }
-        assert_eq!(c.get_program(), launcher.as_os_str());
+        assert_eq!(c.get_program(), ld.as_os_str());
         let args: Vec<_> = c.get_args().collect();
-        assert!(
-            args.is_empty(),
-            "launcher re-exec 不得再包 ld 参数: {args:?}"
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("--library-path"),
+                bin_dir.join("lib").as_os_str(),
+                oj_bin.as_os_str(),
+            ],
+            "direct exec：随包 ld + --library-path + oj.bin，不包启动器脚本"
         );
+    }
+
+    /// oj.bin 缺失（异常布局）→ 回退 <bin>/oj 启动器脚本（它自会重放 ld 链），
+    /// 且不得再被包一层 ld 参数（脚本不是 ELF，ld.so 无法加载）。
+    #[cfg(unix)]
+    #[test]
+    fn daemon_reexec_cmd_falls_back_to_launcher_when_ojbin_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let t = tmpdir("daemon-reexec-fb");
+        let bin_dir = t.0.join("bin");
+        let ld = bin_dir.join("lib").join("ld-linux-x86-64.so.2");
+        std::fs::create_dir_all(ld.parent().unwrap()).unwrap();
+        std::fs::write(&ld, b"").unwrap();
+        let launcher = bin_dir.join("oj");
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        // Safety: 单测独占进程内 oj 私有 env 键（ENV_LOCK 串行化）。
+        unsafe {
+            std::env::set_var("OJ_BUNDLED_LD", &ld);
+            std::env::set_var("OJ_BUNDLED_LIB", bin_dir.join("lib"));
+        }
+        let c = super::daemon_reexec_cmd().unwrap();
+        // Safety: 同上，收尾清理。
+        unsafe {
+            std::env::remove_var("OJ_BUNDLED_LD");
+            std::env::remove_var("OJ_BUNDLED_LIB");
+        }
+        assert_eq!(c.get_program(), launcher.as_os_str());
+        assert!(
+            c.get_args().len() == 0,
+            "launcher re-exec 不得再包 ld 参数: {:?}",
+            c.get_args().collect::<Vec<_>>()
+        );
+    }
+
+    /// 就绪管道裁决（进程内管道模拟子进程的四种结局）：
+    /// `ok` → Ok；EOF 前有字节 → Died(真因)；EOF 无字节（未及回传即死）→ Died("")；
+    /// 写端开着不写（活着但没就绪）→ 超时 Starting。
+    #[cfg(unix)]
+    fn ready_pipe() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0 as libc::c_int; 2];
+        // Safety: 纯 fd 创建。
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        (fds[0], fds[1])
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_ok_when_wait_daemon_ready_then_ready_ok() {
+        let (rx, tx) = ready_pipe();
+        // Safety: 栈上字面量、长度匹配。
+        unsafe {
+            libc::write(tx, b"ok".as_ptr().cast(), 2);
+            libc::close(tx);
+        }
+        assert!(matches!(
+            super::wait_daemon_ready(rx, std::time::Duration::from_secs(5)),
+            super::DaemonReady::Ok
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_error_then_eof_when_wait_daemon_ready_then_died_with_msg() {
+        let (rx, tx) = ready_pipe();
+        let msg = b"load config: bad yaml";
+        // Safety: 栈上字面量、长度匹配。
+        unsafe {
+            libc::write(tx, msg.as_ptr().cast(), msg.len());
+            libc::close(tx);
+        }
+        match super::wait_daemon_ready(rx, std::time::Duration::from_secs(5)) {
+            super::DaemonReady::Died(m) => assert_eq!(m, "load config: bad yaml"),
+            other => panic!("expected Died, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_silent_death_when_wait_daemon_ready_then_died_empty() {
+        let (rx, tx) = ready_pipe();
+        // Safety: tx 为刚建出的写端。
+        unsafe {
+            libc::close(tx);
+        } // 子进程未及回传即死：EOF 无字节
+        assert!(matches!(
+            super::wait_daemon_ready(rx, std::time::Duration::from_secs(5)),
+            super::DaemonReady::Died(m) if m.is_empty()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_no_signal_when_wait_daemon_ready_then_starting() {
+        let (rx, tx) = ready_pipe();
+        // 写端开着不写 = 子进程还活着但未就绪 → 超时 Starting（不判死）。
+        let r = super::wait_daemon_ready(rx, std::time::Duration::from_millis(50));
+        // Safety: tx 为刚建出的写端。
+        unsafe {
+            libc::close(tx);
+        }
+        assert!(matches!(r, super::DaemonReady::Starting));
     }
 
     /// 回归钉：缺省服务目录自 config 同级起步逐级向上搜索（src 优先、dist 次之），

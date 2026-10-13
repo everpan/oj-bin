@@ -1520,6 +1520,70 @@ mod tests {
         close(handle);
     }
 
+    /// MySQL affected-rows 语义契约（env-gated）：插件 typed 池经 sqlx 连接时协商
+    /// `CLIENT_FOUND_ROWS`（sqlx-mysql `MySqlStream::with_socket` 默认请求，再与服务端
+    /// 广告取交集），UPDATE 的 `rows_affected()` = **匹配行数**（found rows）——与
+    /// sqlite `changes()`、pg 命令标签同语义，而非裸 mysql 客户端默认的「实际变更行」。
+    /// 下游「按受影响行数判存在/归属」的写法因此在 oj 栈上三方言一致（同值重复 UPDATE
+    /// 仍得 1，不会把幂等重放误判成 0 行）；一旦池构造被改（自定义 ConnectOptions 丢
+    /// flag / sqlx 升级改默认），同值重复 UPDATE 会变 0，本用例即红。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_update_affected_rows_counts_matched_not_changed() {
+        let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let affected = |sql: &str| {
+            let mut f = exec(handle, RString::from(sql), RString::from("[]"));
+            async move {
+                let b = drive(&mut f).await.expect("exec");
+                serde_json::from_slice::<serde_json::Value>(&b)
+                    .unwrap()
+                    .as_i64()
+                    .expect("exec returns affected-rows number")
+            }
+        };
+
+        affected("drop table if exists oj_affrows_t").await;
+        affected(
+            "create table oj_affrows_t (id bigint primary key, is_read bigint not null default 0)",
+        )
+        .await;
+        affected("insert into oj_affrows_t (id, is_read) values (1, 0)").await;
+
+        // 首次 0→1：1 行。
+        assert_eq!(
+            affected("update oj_affrows_t set is_read = 1 where id = 1").await,
+            1
+        );
+        // 同值重复 1→1：**匹配行 1**（FOUND_ROWS 语义；若落回「实际变更行」则 0）。
+        assert_eq!(
+            affected("update oj_affrows_t set is_read = 1 where id = 1").await,
+            1,
+            "CLIENT_FOUND_ROWS 未协商：同值 UPDATE 返回了变更行数而非匹配行数"
+        );
+        // 真实变更 1→0：1 行。
+        assert_eq!(
+            affected("update oj_affrows_t set is_read = 0 where id = 1").await,
+            1
+        );
+        // WHERE 不匹配：0 行（两种语义下皆 0，防恒真式实现）。
+        assert_eq!(
+            affected("update oj_affrows_t set is_read = 1 where id = 999").await,
+            0
+        );
+
+        affected("drop table if exists oj_affrows_t").await;
+        close(handle);
+    }
+
     /// u64 / `BIGINT UNSIGNED`（v0.1.24，env-gated）：typed 路径下**读侧不再回绕成负数**、
     /// 写侧能精确绑 `u64::MAX`。这是债务②的验收基线——Any 路径（老实现）会把
     /// `18446744073709551615` 读成 `-1`。

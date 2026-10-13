@@ -16,6 +16,41 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## 下一版（未发布）
+
+**fix（serve）：--daemon 子进程直连随包 glibc + 启动成败回传父进程（两项）**。
+Linux 自带 glibc 发行包的 daemon re-exec 原走 `<bin>/oj` 启动器脚本：kernel 按
+shebang 拉起**系统 /bin/sh**，DIR 计算还要 fork 子 shell exec `readlink`/`dirname`
+——整段中间层都是系统 glibc，宿主这段任何异常（sh 变体 / coreutils 缺失 / exec 受限）
+都让 daemon 子进程死得悄无声息（stdio 已指 /dev/null，父进程又「spawn 成功即报
+daemonized」秒退，真因不可见）。两项修复：
+
+1. re-exec 改为**直接 exec 随包 ld-linux + `<bin>/oj.bin`**（`OJ_BUNDLED_LD` 上溯两级
+   得 `<bin>`）：子进程从 fork 后第一个 exec 起全程跑随包 glibc，链条零系统组件；
+   `oj.bin` 缺失回退启动器脚本，非打包形态照旧 `current_exe`。
+2. **就绪管道**（父读子写，写端 fd 号经 `OJ_DAEMON_READY_FD` 随 re-exec 传给孩子）：
+   子进程监听绑定后回传 `ok`，启动失败回传真因；父进程等 30s——`ok` → 照旧打印
+   daemonized 退 0；子进程启动期退出 → **带真因报错并非零退出**（不再假成功）；
+   超时但存活 → 提示看 server logs。`run()` 拆出 `run_inner` 包装回传，非 daemon
+   场景零行为变化。
+
+**test（oj-db-mysql 0.1.1）：MySQL affected-rows 语义契约测试（env-gated 真库）**。
+下游（oj-wiki P4 评审）曾按裸 MySQL 文档语义推演「同值重复 UPDATE 得 0 行 ⇒ 重复已读
+403」——该前提在 oj 栈上不成立：oj-db-mysql 的 typed 池经 sqlx 连接时协商
+`CLIENT_FOUND_ROWS`（sqlx-mysql `MySqlStream::with_socket` 默认请求、与服务端广告取
+交集），UPDATE 的 `rows_affected()` = **匹配行数**，与 sqlite `changes()`、pg 命令标签
+同语义（不带该 flag 的裸客户端才是「实际变更行」）。新增
+`real_mysql_update_affected_rows_counts_matched_not_changed` 钉死契约：同值重复
+UPDATE → 1、WHERE 不匹配 → 0、真实变更 → 1——池构造被改（自定义 ConnectOptions 丢
+flag）或 sqlx 升级改默认即红。插件 version 0.1.0 → 0.1.1（自本节起，插件涉及调整
+必须 bump 插件自有 version）。
+
+**devkit 同步**：api-manual §6 DML 节新增「受影响行数的三方言语义」——三方言矩阵
+（mysql 协议原生默认「实际变更行」、oj 运行时协商 `CLIENT_FOUND_ROWS` 后与 sqlite/pg
+一致为「匹配行」）+ 「先断言再写、行数不读」的跨引擎幂等写范式与代码；SKILL.md 陷阱
+速查新增对应一行。api-manual §1 `--daemon` 描述补就绪等待 / 失败回传 / 随包 glibc
+直连三项行为；SKILL.md 陷阱速查新增「`daemon child exited during startup`」一行。
+
 ## v0.1.68
 
 **fix（sample）：`_shared/search.ts` pg 分支占位符与 `ts_headline` 调用修复（pg 真库验证首次跑通）**。
