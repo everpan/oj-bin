@@ -2002,7 +2002,7 @@ DDL 拒事务、标识符白名单。
 
 | 坑 | 说明 |
 |---|---|
-| sqlite 查 2 个字没结果 | trigram 对 <3 字符**静默零命中**——共享模块自动回退业务表 `LIKE`（score=1，转义 `%`/`_`/`\`） |
+| sqlite 查 2 个字没结果 | trigram 对 <3 字符**静默零命中**——共享模块自动回退业务表 `LIKE`（score=1，统一 `ESCAPE '!'`，转义 `!`/`%`/`_`；勿用 `ESCAPE '\'`——mysql 默认 sql_mode 下是 1064） |
 | `DDL inside db.tx` 报错 | ensureIndex 进了事务——MySQL DDL 会隐式提交调用方事务，模块用 `tx.isTx` 直接拒绝 |
 | 想直写 `docs_fts` | 别——索引随业务行自动维护，直写 = 双份索引；`index()` 只碰业务表 |
 | score 跨引擎比较 | 不可比——返回引擎原始分（sqlite bm25 负值、mysql 相关度、pg ts_rank） |

@@ -15,7 +15,10 @@ function id(name: string, what: string): string {
   return name;
 }
 function likeEscape(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => "\\" + c);
+  // 转义符统一用 `!`（三方言一致）：mysql 下 `ESCAPE '\'` 在默认 sql_mode 是
+  // 语法错误（反斜杠吃掉收尾引号，1064），且 `\` 本就是 mysql LIKE 默认转义符、
+  // 子句冗余。`!` 自身是转义符，须双写。
+  return s.replace(/[!%_]/g, (c) => "!" + c);
 }
 /** mysql 应用层高亮：indexOf 截窗口（ngram 分词在索引侧，与原文无关）。 */
 function mark(text: string, q: string): string {
@@ -28,7 +31,8 @@ function mark(text: string, q: string): string {
 }
 
 /** 短词（<3 字符）跨方言统一 LIKE 回退：trigram/ngram/tsvector 对短词静默零命中，
- *  直接对基表 LIKE（复用 likeEscape 转义 %/_/\）。三方言共用，避免分支重复。 */
+ *  直接对基表 LIKE（复用 likeEscape 转义 !/%/_，统一 ESCAPE '!'）。三方言共用，
+ *  避免分支重复。 */
 async function likeFallback(
   dbi: DBInstance,
   t: string,
@@ -41,7 +45,7 @@ async function likeFallback(
 ): Promise<Hit[]> {
   const n = [...q].length;
   if (!(n > 0 && n < 3)) return [];
-  const where = fs.map((f) => `${qw(f)} LIKE ${P(0)} ESCAPE '\\'`).join(" OR ");
+  const where = fs.map((f) => `${qw(f)} LIKE ${P(0)} ESCAPE '!'`).join(" OR ");
   const like = `%${likeEscape(q)}%`;
   return (await dbi.query(
     `SELECT ${qw(pk)} AS id, 1 AS score FROM ${qw(t)} WHERE ${where} LIMIT ${limit}`,

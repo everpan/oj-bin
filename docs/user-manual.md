@@ -343,8 +343,8 @@ db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询�
   事件驱动）。证书生成/续期用 `tools/oj-cert`（`gen` / `renew`），详见 `dev-guide.md` §11.2
   与 `ops-manual.md` §3/§7。
 - 模块 `seed.sql` 启动时对 `default` 库重放（三方言；幂等写法写 sqlite 惯用法
-  `INSERT OR IGNORE`，引擎按方言自动改写；语句按 `;` 切分，**seed 内不得有分号
-  字面量**）。
+  `INSERT OR IGNORE`，引擎按方言自动改写，语句前置 `--` 注释行允许；语句按 `;` 切分，
+  **seed 内不得有分号字面量**）。
 - `server.migrate_on_start`：启动迁移门禁。`auto`（dev 默认）启动即应用迁移与 schema 收敛；
   `verify`（release 默认）校验账本，落后即拒启（M004，报错附 `oj migrate` 命令）；`off` 是逃生门
   （迁移完全归 `oj migrate` / 运维）。非法值 fail-fast。

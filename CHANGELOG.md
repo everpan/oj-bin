@@ -16,7 +16,38 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.65（未打标签）
+## v0.1.66
+
+下游（oj-wiki P3 方言攻坚，MySQL 8.4.11 / PG 16.15 实机验证）反馈五项，本版全量修复：
+
+**fix（bridge.query）：构造器 SELECT 在 mysql 误路由 LAST_INSERT_ID 分支 panic（Critical）**。
+`op_db_query_build` 曾以 `rows && dialect == MySql` 判定两步取 id——SELECT 也是行集，
+于是 mysql 上任何 `db.table(...).select()` 都进 exec 分支、`returning[0]` 空数组越界
+panic，请求挂死（HTTP 000），**mysql 部署整体不可用**。执行路由抽出纯函数
+`ExecRoute`（Rows / LastId / Affected），**仅 `insert + returning 非空 + mysql` 才进
+LastId**；单测矩阵钉死「Select + mysql 必走行集」防回归。
+
+**fix（seed）：语句前置注释行不再绕过方言改写**。`;` 朴素切分后 chunk 以 `--` 注释打头时，
+`translate_insert` 的「INSERT 起头」判定落空，`INSERT OR IGNORE` 原样下发 mysql → 1064。
+改写判定前剥前置 `--` 行注释（命中改写输出剥注释语句，未命中原样透传）；单测覆盖多注释行、
+尾随注释保留、纯注释 chunk。
+
+**fix（sample）：search 短词 LIKE 回退统一 `ESCAPE '!'`**。`ESCAPE '\'` 在 mysql 默认
+sql_mode 下反斜杠吃掉收尾引号 → 1064（pymysql 服务端实锤；HTTP 层此前被上项 panic 遮蔽，
+修复后会以 500 暴露）。`likeEscape` 同步转义 `!`/`%`/`_`（`!` 双写），三方言单一代码路径，
+对 `NO_BACKSLASH_ESCAPES` 免疫。
+
+**fix（bridge.stream）：`json.stream().write()` 兑现二进制宽契约**。JS 分发器曾把
+`ArrayBuffer`/类型化数组/`DataView` 直传 `op_stream_write_bytes`，而 deno_core `#[buffer]`
+只认 `Uint8Array` → TypeError（手册 0.1.65 已承诺宽契约、实测仅 `Uint8Array` 可用）。
+分发层转换后进 op（ArrayBuffer → `new Uint8Array(c)`；view → 按 buffer+offset+length
+取 `Uint8Array`）；桥接测试钉死四种形状逐字节无损 + string 仍走文本通道。
+
+**fix（config）：订正 seed 方言范围 stale 注释**。`db` 段注释曾写「seed 仅 default 为
+sqlite 时重放」，与实现（三方言均重放）相反——下游曾据此误列炸点。同步订正 devkit
+api-manual 同款矛盾陈述。
+
+## v0.1.65
 
 **feat（bridge.stream）：二进制流写出 + 文件名响应头**。下游（如 wiki 附件下载）可经
 `json.stream` 流式回源**字节**，不再被迫 302 到免鉴权 blob 路由。`write` 按入参类型分发：

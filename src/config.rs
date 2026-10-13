@@ -1243,7 +1243,8 @@ pub struct Config {
     /// oj/src/app.rs `resolve_mounts`。缺省空（serve 须有 CLI 挂载，否则报错）。
     #[serde(default, deserialize_with = "null_as_default")]
     pub mounts: Vec<MountConf>,
-    /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 仅 default 为 sqlite 时重放）。
+    /// name → DSN（sqlite://…、mysql://…、postgres://… 可混用；seed 三方言启动
+    /// 均重放，幂等靠 S006 门禁 + seed.rs 按方言改写——勿再写「仅 sqlite 重放」）。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db: HashMap<String, String>,
     /// name → redis URL（v0.1 warn 后用内存 KV）。

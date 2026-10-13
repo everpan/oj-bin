@@ -371,12 +371,17 @@ globalThis.json = {
   stream: (opts) => {
     op_json_stream_open(opts === undefined ? null : opts);
     return {
-      // Binary (Uint8Array/ArrayBuffer/TypedArray) goes through the byte op; everything
-      // else is written as UTF-8 text (CSV/JSON/SSE rows).
-      write: (c) =>
-        c instanceof Uint8Array || c instanceof ArrayBuffer || ArrayBuffer.isView(c)
-          ? op_stream_write_bytes(c)
-          : op_stream_write(String(c)),
+      // Binary (Uint8Array/ArrayBuffer/TypedArray/DataView) goes through the byte
+      // op; everything else is written as UTF-8 text (CSV/JSON/SSE rows). Only
+      // Uint8Array passes the op's #[buffer] binding directly -- other shapes are
+      // converted here, else ArrayBuffer/views die with TypeError (v0.1.66 fix).
+      write: (c) => {
+        if (c instanceof Uint8Array) return op_stream_write_bytes(c);
+        if (c instanceof ArrayBuffer) return op_stream_write_bytes(new Uint8Array(c));
+        if (ArrayBuffer.isView(c))
+          return op_stream_write_bytes(new Uint8Array(c.buffer, c.byteOffset, c.byteLength));
+        return op_stream_write(String(c));
+      },
       end: () => op_stream_end(),
     };
   },

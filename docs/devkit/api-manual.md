@@ -253,7 +253,7 @@ tables:
 | 文件 | 时机 | 纪律 |
 |---|---|---|
 | `migrations/{seq:04}__{desc}[.方言].sql` | 启动（auto）/ `oj migrate` | 只前向；账本 `_oj_migrations`（`module` 列区分模块）；序列空洞/乱序 S007 报错 |
-| `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006） |
+| `seed.sql`（模块级） | 每次启动重放 | 幂等 `INSERT OR IGNORE`；按 `;` 切分，语句内不得含分号字面量（S006）；语句前置 `--` 注释行允许（v0.1.66 起，改写判定先剥注释） |
 | `fixtures/*.sql` | 仅 `oj test` / `oj test fixture` 灌入 | 演示/测试数据，不进 release 产物 |
 
 ### 命令
@@ -810,7 +810,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.header` | `header(name: string, value: string): void` | 追加响应头（v0.1.46）：同名可重复——`Set-Cookie` 双发（登录端点同响应下发 `oj_sess` + `oj_csrf`）合法落多个值；其余头同名最后一个生效 |
 | `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
 | `json.redirect` | `redirect(url: string, code?: number): void` | **3xx 重定向原语**（v0.1.26）：`Location` + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 非 3xx **回落 302**（杜绝「200 + Location」畸形响应）；空 url 忽略 `Location`。具名封装：`movedPermanently`(301) / `found`(302) / `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) / `permanentRedirect`(308，永久 + 方法保持)。典型：302 到 `blob.url()` 预签名 URL（`scenarios.md` 场景 8） |
-| `json.stream` | `stream(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 按入参类型分发：`Uint8Array`/`ArrayBuffer`/类型化数组（如 `Int32Array`）走**字节通道**（二进制无损，附件/图片下载用）；其余（`string` 等）走 UTF-8 文本通道（CSV/JSON/SSE 行）。`opts.fileName`（v0.1.65）写入 `Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认 `attachment` 下载，传 `inline` 内联展示）——浏览器另存为原名而非安全化名，且**无需 302 到免鉴权 blob 路由**即可把鉴权后的字节流式回源 |
+| `json.stream` | `stream(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 按入参类型分发：`Uint8Array`/`ArrayBuffer`/类型化数组（如 `Int32Array`）/`DataView` 走**字节通道**（二进制无损，附件/图片下载用；v0.1.66 起后三者在分发层转为 `Uint8Array` 后进字节 op，0.1.65 实测会 TypeError）；其余（`string` 等）走 UTF-8 文本通道（CSV/JSON/SSE 行）。`opts.fileName`（v0.1.65）写入 `Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认 `attachment` 下载，传 `inline` 内联展示）——浏览器另存为原名而非安全化名，且**无需 302 到免鉴权 blob 路由**即可把鉴权后的字节流式回源 |
 | `json.sse` | `sse(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): StreamWriter` | **SSE 流**（v0.1.35）：等同 `json.stream` 但强制 `Content-Type: text/event-stream`，每次 `write` 的「数据」自动包成 `data: <内容>\n\n` 帧；`opts` 同 `json.stream` |
 
 > **流式 / SSE 响应（v0.1.35）**：`json.stream` / `json.sse` 返回 `StreamWriter`（`{ write(chunk), end() }`）。
@@ -818,7 +818,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 > **不调用 `end()` 也会在 `read_capture` 阶段自动关流**（心跳任务经 `Notify` 退出）。
 > 限制：流式响应**绕过** `{code,msg,data}` 信封（直接写裸 body）；心跳保活间隔 15s（`:\n\n`）；
 > `opts` 支持 `status` / `contentType` / `fileName` / `disposition` 四字段；
-> **二进制须传 `Uint8Array`/`ArrayBuffer`/`TypedArray`**——传 `string` 会被当 UTF-8 文本而失真（如图片/压缩包）；
+> **二进制须传 `Uint8Array`/`ArrayBuffer`/`TypedArray`/`DataView`**——传 `string` 会被当 UTF-8 文本而失真（如图片/压缩包）；
 > 不支持额外 SSE 字段（如 `event:` / `id:` 需自行拼进 `write` 内容）。
 
 ```ts
@@ -2696,7 +2696,7 @@ curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<titl
   未装插件 → 启动报 `unknown db scheme`。
 - `DB("name")` 按名取库；查询构造器自动按库方言出 SQL；裸 SQL 占位符方言归业务
   （sqlite/mysql `?`，postgres `$1`）。
-- `seed.sql` 仅对 **default 库且为 sqlite** 时重放。
+- `seed.sql` 启动时对 `default` 库重放，**三方言**（幂等靠 S006 门禁 + 引擎按方言改写）。
 - mysql/pg 连不上启动 fail-fast（连接串错/库未建）。
 - **按库运维（v0.1.21）**：`oj migrate` / `oj test fixture` / `oj schema diff` 的 `--db <name>`
   即上方键名；缺省 `default`，未声明 fail-fast。账本 `_oj_migrations`、schema 收敛、

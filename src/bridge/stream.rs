@@ -231,6 +231,51 @@ mod tests {
         assert_eq!(got, vec![0x00u8, 0xff, 0x89, 0x50, 0x0a]);
     }
 
+    /// F5 回归钉子（v0.1.65 实锤）：ArrayBuffer / 类型化数组 / DataView 曾在
+    /// write 分发后死于 op 的 TypeError（#[buffer] 只认 Uint8Array），须在分发层
+    /// 转换后逐字节无损。
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_stream_accepts_all_binary_shapes() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        let cap = b
+            .run(
+                r#"
+                const s = json.stream({ contentType: "application/octet-stream" });
+                // ArrayBuffer（非 view，曾 TypeError）。
+                const ab = new ArrayBuffer(3);
+                new Uint8Array(ab).set([0x01, 0x02, 0x03]);
+                s.write(ab);
+                // 类型化数组（非 Uint8Array，曾 TypeError）。
+                s.write(new Int32Array([0x04050607]));
+                // DataView（曾 TypeError）。
+                const dv = new DataView(new ArrayBuffer(2));
+                dv.setUint8(0, 0xfe);
+                dv.setUint8(1, 0xff);
+                s.write(dv);
+                // string 仍走文本通道。
+                s.write("tail");
+                s.end();
+                "#,
+            )
+            .await
+            .unwrap();
+        let rx = cap.stream.expect("stream should be open");
+        let got = collect_bytes(rx).await;
+        // Int32Array 0x04050607 小端 = 07 06 05 04；"tail" 为 UTF-8 文本。
+        assert_eq!(
+            got,
+            vec![
+                0x01, 0x02, 0x03, // ArrayBuffer
+                0x07, 0x06, 0x05, 0x04, // Int32Array (LE)
+                0xfe, 0xff, // DataView
+                b't', b'a', b'i', b'l', // string
+            ]
+        );
+    }
+
     /// 收取接收端全部字节（测试辅助）。
     async fn collect(mut rx: UnboundedReceiver<Bytes>) -> String {
         let mut out = String::new();

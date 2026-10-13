@@ -37,6 +37,14 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.66 修复三处用户可见缺陷：`json.stream().write()` 的 `ArrayBuffer`/类型化数组/`DataView`
+在分发层转为 `Uint8Array` 后进字节 op（0.1.65 实测仅 `Uint8Array` 可用，其余 TypeError，
+手册承诺兑现）；seed 语句前置 `--` 注释行不再使 `INSERT OR IGNORE` 方言改写失效（v0.1.65
+会原样下发 mysql → 1064）；sample `_shared/search` 短词 LIKE 回退改统一 `ESCAPE '!'`
+（转义 `!`/`%`/`_`——`ESCAPE '\'` 在 mysql 默认 sql_mode 下是 1064）。另修构造器 SELECT
+在 mysql 误路由 LAST_INSERT_ID 分支的 panic（0.1.65 上 mysql 全业务面阻断，无对外契约变更）。
+见 `api-manual.md` §6 `json.stream`、seed 纪律表与 `scenarios.md` 场景「常见坑」。
+
 v0.1.65 起 `json.stream` / `json.sse` 的 `opts` 新增 `fileName` / `disposition`：`fileName` 写入
 `Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认
 `attachment`，可传 `inline`），浏览器另存为原名、且**无需 302 到免鉴权 blob 路由**即可把鉴权后

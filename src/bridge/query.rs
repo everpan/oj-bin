@@ -1557,6 +1557,29 @@ impl Exec<'_> {
     }
 }
 
+/// 执行路由（三态）：select，或 pg/sqlite 的 insert+returning → 行集；
+/// mysql 的 insert+returning → exec + 同目标 SELECT LAST_INSERT_ID() 两步；
+/// 其余 DML → 受影响行数。**只有 insert+returning 才能进 LastId**——历史上曾用
+/// `rows && dialect == MySql` 判定，把构造器 SELECT（也是行集）误路由进两步
+/// 分支，`returning[0]` 越界 panic（v0.1.66 修复）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecRoute {
+    Rows,
+    LastId,
+    Affected,
+}
+
+fn exec_route(verb: Verb, returning_empty: bool, dialect: Dialect) -> ExecRoute {
+    match verb {
+        Verb::Select => ExecRoute::Rows,
+        Verb::Insert if !returning_empty => match dialect {
+            Dialect::MySql => ExecRoute::LastId,
+            _ => ExecRoute::Rows,
+        },
+        _ => ExecRoute::Affected,
+    }
+}
+
 /// op_db_query_build：结构化查询 -> 参数化 SQL -> 执行。
 /// select → rows 数组；insert 带 returning → rows 数组（pg/sqlite 走 sea-query
 /// RETURNING 单语句；mysql 同目标两步）；其余 DML → 受影响行数 number。
@@ -1577,9 +1600,8 @@ pub async fn op_db_query_build(
     let applied = normalize_limit(&state, &mut req);
     let dialect = lookup(&state, &req.db)?.dialect();
     let (sql, params) = build_statement(&req, &reg, dialect)?;
-    // 返回行的两种形态：select，或 insert + returning。
-    let rows = req.verb == Verb::Select || (req.verb == Verb::Insert && !req.returning.is_empty());
-    let last_id = rows && dialect == Dialect::MySql; // mysql 无 RETURNING → 两步
+    // 执行路由：行集 / mysql 两步取自增 id / 受影响行数（判定见 ExecRoute）。
+    let route = exec_route(req.verb, req.returning.is_empty(), dialect);
     let err = |e: String| JsErrorBox::generic(e);
 
     // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
@@ -1591,7 +1613,7 @@ pub async fn op_db_query_build(
     let in_tx = matches!(&target, super::db::Target::Tx(_));
     let db_name = req.db.clone();
     let start = std::time::Instant::now();
-    let mut out = if rows && !last_id {
+    let mut out = if route == ExecRoute::Rows {
         match ex.query(&sql, &params).await {
             Ok(r) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1625,7 +1647,7 @@ pub async fn op_db_query_build(
                 Err(JsErrorBox::generic(em))
             }
         }
-    } else if last_id {
+    } else if route == ExecRoute::LastId {
         match ex.exec(&sql, &params).await {
             Ok(_) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1866,6 +1888,41 @@ fn _assert(_: &BridgeResult<()>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 执行路由矩阵（F1 回归钉子）：**Select 在 mysql 上绝不能进 LastId 两步
+    /// 分支**——returning 为空会在 `returning[0]` 越界 panic（v0.1.65 实锤，
+    /// mysql 全业务面请求挂死）。
+    #[test]
+    fn exec_route_matrix() {
+        // select：任何方言都走行集（对抗用例：mysql + select 曾误路由 LastId）。
+        for d in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+            assert_eq!(exec_route(Verb::Select, true, d), ExecRoute::Rows);
+            assert_eq!(exec_route(Verb::Select, false, d), ExecRoute::Rows);
+        }
+        // insert + returning：pg/sqlite 走 RETURNING 行集；mysql 走两步 LastId。
+        assert_eq!(
+            exec_route(Verb::Insert, false, Dialect::MySql),
+            ExecRoute::LastId
+        );
+        assert_eq!(
+            exec_route(Verb::Insert, false, Dialect::Postgres),
+            ExecRoute::Rows
+        );
+        assert_eq!(
+            exec_route(Verb::Insert, false, Dialect::Sqlite),
+            ExecRoute::Rows
+        );
+        // insert 无 returning：受影响行数（mysql 也不例外——LAST_INSERT_ID 无处安放）。
+        assert_eq!(
+            exec_route(Verb::Insert, true, Dialect::MySql),
+            ExecRoute::Affected
+        );
+        // update / delete：一律受影响行数。
+        for v in [Verb::Update, Verb::Delete] {
+            assert_eq!(exec_route(v, true, Dialect::MySql), ExecRoute::Affected);
+            assert_eq!(exec_route(v, false, Dialect::Postgres), ExecRoute::Affected);
+        }
+    }
 
     /// 相同条件三种方言的占位符风格：sqlite/mysql 用 `?`，postgres 用 `$1`（builder 职责）。
     #[test]

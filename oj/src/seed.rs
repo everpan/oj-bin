@@ -122,23 +122,41 @@ fn split_statements(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 剥前置 `--` 行注释与空白：`;` 朴素切分后 chunk 头部可能是注释行，直接按
+/// 「INSERT 起头」判定会漏改写（v0.1.65 实锤：seed 语句前置注释行让
+/// `INSERT OR IGNORE` 原样下发 mysql → 1064）。整段皆注释 → 空串。
+fn strip_leading_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        match s.strip_prefix("--") {
+            None => return s,
+            Some(rest) => match rest.find('\n') {
+                Some(i) => s = &rest[i + 1..],
+                None => return "",
+            },
+        }
+    }
+}
+
 /// seed 幂等写法以 sqlite 惯用法为源：`INSERT OR IGNORE INTO …`。按目标方言改写
 /// 关键字：mysql → `INSERT IGNORE`；pg → 剥 `OR IGNORE`、句尾追加 `ON CONFLICT DO
 /// NOTHING`。其余形态（`OR REPLACE` / `ON CONFLICT` / `ON DUPLICATE KEY`）与非
 /// INSERT 语句一律原样透传——作者显式选择的方言写法不猜测改写。
+/// 判定前先剥前置注释（见 [`strip_leading_comments`]）；未命中改写时保留原文。
 pub fn translate_insert<'a>(stmt: &'a str, d: Dialect) -> Cow<'a, str> {
     if d == Dialect::Sqlite {
         return Cow::Borrowed(stmt);
     }
+    let body = strip_leading_comments(stmt);
     // 仅当语句以 INSERT 起头、紧跟空白 + OR IGNORE + 词边界时改写。
-    if !stmt
+    if !body
         .get(..6)
         .is_some_and(|h| h.eq_ignore_ascii_case("INSERT"))
-        || !stmt[6..].starts_with(|c: char| c.is_ascii_whitespace())
+        || !body[6..].starts_with(|c: char| c.is_ascii_whitespace())
     {
         return Cow::Borrowed(stmt);
     }
-    let after = stmt[6..].trim_start();
+    let after = body[6..].trim_start();
     if !after
         .get(..9)
         .is_some_and(|h| h.eq_ignore_ascii_case("or ignore"))
@@ -285,6 +303,48 @@ mod tests {
         assert_eq!(
             translate_insert("INSERT OR IGNORED INTO t VALUES (1)", Dialect::MySql),
             "INSERT OR IGNORED INTO t VALUES (1)"
+        );
+    }
+
+    /// 前置注释行不得绕过方言改写（F2 回归钉子：v0.1.65 中 `--` 注释打头的
+    /// chunk 让 `INSERT OR IGNORE` 原样下发 mysql → 1064）。
+    #[test]
+    fn translate_insert_strips_leading_comments() {
+        // 注释行 + INSERT OR IGNORE：mysql / pg 均正确改写（注释剥除）。
+        assert_eq!(
+            translate_insert(
+                "-- 引导数据\nINSERT OR IGNORE INTO t VALUES (1)",
+                Dialect::MySql
+            ),
+            "INSERT IGNORE INTO t VALUES (1)"
+        );
+        assert_eq!(
+            translate_insert(
+                "-- a\n\n   -- b\nINSERT OR IGNORE INTO t (a) VALUES (1)",
+                Dialect::Postgres
+            ),
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"
+        );
+        // 未命中改写：原文（含注释）原样透传，不动作者内容。
+        assert_eq!(
+            translate_insert("-- c\nINSERT INTO t VALUES (1)", Dialect::MySql),
+            "-- c\nINSERT INTO t VALUES (1)"
+        );
+        // 尾随注释保留（只剥前置）。
+        assert_eq!(
+            translate_insert("INSERT OR IGNORE INTO t VALUES (1) -- c", Dialect::MySql),
+            "INSERT IGNORE INTO t VALUES (1) -- c"
+        );
+        // 纯注释 chunk：不改写、不 panic。
+        assert_eq!(
+            translate_insert("-- c1\n-- c2", Dialect::MySql),
+            "-- c1\n-- c2"
+        );
+        // 前缀 `--` 一律按注释剥（宽松，对齐 sqlite 语义；mysql 下 `--c` 非法 SQL，
+        // 剥除后改写反而给出可执行的幂等语句）。
+        assert_eq!(
+            translate_insert("--c\nINSERT OR IGNORE INTO t VALUES (1)", Dialect::MySql),
+            "INSERT IGNORE INTO t VALUES (1)"
         );
     }
 

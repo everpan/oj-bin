@@ -104,7 +104,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 启动失败报 `server.schema_validation: invalid .schema` | `.schema` 用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；`params`/`query` 声明 array/object 也是死契约，同样拒 |
 | 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false` |
 | CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast |
-| seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量 |
+| seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量；语句前置 `--` 注释行允许（v0.1.66 起，方言改写判定先剥注释——此前注释打头会让 `INSERT OR IGNORE` 原样下发 mysql → 1064） |
+| 自写 LIKE 要转义 `%`/`_` | 别用 `ESCAPE '\'`——mysql 默认 sql_mode 下反斜杠吃掉收尾引号即 1064；统一 `ESCAPE '!'` 并转义 `!`/`%`/`_`（`_shared/search` 已照此） |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
