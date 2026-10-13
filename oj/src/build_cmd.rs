@@ -411,8 +411,9 @@ async fn build_one(
             "warn: module name {module:?} looks like `_name_` fs-param syntax; it becomes a route param segment (two such modules with different names at the same slot will conflict at deployment startup)"
         );
     }
-    // (file, method, pattern, 契约) —— 契约一并落进 routes.js，使 release 免内省也能校验。
-    let mut rows_out: Vec<(String, String, String, Option<serde_json::Value>)> = Vec::new();
+    // (file, method, handler 链, pattern, 契约) —— 契约与链一并落进 routes.js，
+    // 使 release 免内省也能校验入参、派发嵌套 handler。
+    let mut rows_out: Vec<(String, String, String, String, Option<serde_json::Value>)> = Vec::new();
     let mut pats: Vec<String> = Vec::new();
     for (dir, rows) in &decls {
         let file = if dir.is_empty() {
@@ -420,7 +421,9 @@ async fn build_one(
         } else {
             format!("{dir}/api.js")
         };
-        for (method, route, schema) in rows {
+        for (chain, route, schema) in rows {
+            // 动词 = 链尾（内省保证只有 verb 键成 leaf；此处同口径推导）。
+            let method = chain.rsplit('.').next().unwrap_or(chain);
             if let Some(r) = route.as_deref().map(str::trim).filter(|r| !r.is_empty())
                 && r.split('/').any(routes::looks_like_underscore_param)
             {
@@ -430,30 +433,38 @@ async fn build_one(
             }
             let pat = rel_pattern(module, dir, route.as_deref());
             pats.push(pat.clone());
-            rows_out.push((file.clone(), method.clone(), pat, schema.clone()));
+            rows_out.push((
+                file.clone(),
+                method.to_string(),
+                chain.clone(),
+                pat,
+                schema.clone(),
+            ));
         }
     }
     // 构建期 fail-fast：非法 pattern / 同位异名参数在 build 期报错，免得到部署启动才爆。
     routes::check_patterns(&pats)?;
     let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");
-    for (file, method, pat, schema) in &rows_out {
-        // schema 仅在声明时写入：旧产物（无该字段）与被划分为「未声明契约」的
-        // 老 ReleaseReader 逻辑保持兼容（缺字段 = 不校验，不得拒启）。
-        match schema {
-            Some(sv) => js.push_str(&format!(
-                "  {{ method: {}, pattern: {}, file: {}, schema: {} }},\n",
-                q(method),
-                q(pat),
-                q(file),
-                serde_json::to_string(sv).map_err(|e| format!("serialize .schema: {e}"))?
-            )),
-            None => js.push_str(&format!(
-                "  {{ method: {}, pattern: {}, file: {} }},\n",
-                q(method),
-                q(pat),
-                q(file)
-            )),
+    for (file, method, chain, pat, schema) in &rows_out {
+        // schema 仅在声明时写入（旧产物无该字段 = 不校验，不得拒启）；handler 链仅在
+        // 与 method 不同（嵌套组）时写入——顶层动词行保持旧产物字节形态。
+        let mut row = format!(
+            "  {{ method: {}, pattern: {}, file: {}",
+            q(method),
+            q(pat),
+            q(file)
+        );
+        if chain != method {
+            row.push_str(&format!(", handler: {}", q(chain)));
         }
+        if let Some(sv) = schema {
+            row.push_str(&format!(
+                ", schema: {}",
+                serde_json::to_string(sv).map_err(|e| format!("serialize .schema: {e}"))?
+            ));
+        }
+        row.push_str(" },\n");
+        js.push_str(&row);
     }
     js.push_str("];\n");
     std::fs::write(vdir.join("routes.js"), js).map_err(|e| format!("write routes.js: {e}"))?;
@@ -482,7 +493,8 @@ async fn build_one(
 /// 模块内省：每个 api.ts 一线程 + current_thread runtime（Bridge !Send），内存库
 /// 零磁盘副作用（同 dev 内省管道）。project_root 取 src 父目录（= 项目根，同 dev 的
 /// config_dir）：bare import 要沿 node_modules 向上解析到项目根（src 下没有）。
-/// 返回 (rel 目录, 该 api.ts 的 (method, route) 行)，顺序随 collect_module 确定。
+/// 返回 (rel 目录, 该 api.ts 的 (handler 链, 有效 route, schema) 行)，顺序随
+/// collect_module 确定。v0.1.64：链为 `introspect_module` 扁平 leaf 的 chain。
 async fn introspect_module_files(
     src: &Path,
     mdir: &Path,
@@ -1263,6 +1275,59 @@ mod tests {
         src_fixture(&t);
         run(&build_args(&t, None)).await.unwrap();
         assert!(!t.join("dist/tasks").exists());
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// v0.1.64 嵌套 handler 组：routes.js 为嵌套 verb 落 `handler` 链；
+    /// 顶层动词（链 == 方法）不写该字段（旧产物字节形态不变）。
+    #[tokio::test]
+    async fn build_emits_handler_chain_for_nested_groups() {
+        let t = std::env::temp_dir().join(format!("oj-build-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("src/user/item")).unwrap();
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/item/api.ts"),
+            "function get(){ json.ok({}); }\n\
+             const upload = { post: () => { json.ok({}); } };\n\
+             upload.route = \"/x/{anchor}/upload\";\n\
+             export default { get, upload };\n",
+        )
+        .unwrap();
+        run(&build_args(&t, Some("user"))).await.unwrap();
+        let routes = std::fs::read_to_string(t.join("dist/user-0.1.0/routes.js")).unwrap();
+        // 嵌套组 verb → handler 链 + 组 .route 的根级 pattern
+        assert!(routes.contains("handler: \"upload.post\""), "{routes}");
+        assert!(routes.contains("\"x/{anchor}/upload\""), "{routes}");
+        // 顶层动词：链即方法，不写 handler（旧产物兼容）
+        assert!(!routes.contains("handler: \"get\""), "{routes}");
+        assert!(routes.contains("\"user/item\""), "{routes}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// 判别红线：非 verb 键挂函数（此前的静默丢弃陷阱）→ 构建期可操作失败。
+    #[tokio::test]
+    async fn build_rejects_non_verb_function_export() {
+        let t = std::env::temp_dir().join(format!("oj-build-nonverb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("src/user")).unwrap();
+        std::fs::write(
+            t.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            t.join("src/user/api.ts"),
+            "function helper(){ json.ok({}); }\n\
+             export default { get(){ json.ok({}); }, helper };\n",
+        )
+        .unwrap();
+        let err = run(&build_args(&t, Some("user"))).await.unwrap_err();
+        assert!(err.contains("helper"), "{err}");
         let _ = std::fs::remove_dir_all(&t);
     }
 

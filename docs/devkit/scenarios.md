@@ -31,6 +31,7 @@
 | [21](#场景-21前端跨域调用-oj-apicorsv0135) | 浏览器跨域 `fetch` oj API——`server.cors` 段（段存在即启用，`credentials` 需显式 `origins`，v0.1.35） | §10 配置 / §8 鉴权 |
 | [22](#场景-22应用层-aes-gcm-字段加密v0135) | 应用层 AES-GCM 字段加密——`crypto.aesGcmEncrypt` / `aesGcmDecrypt`（仅 AES-128/256，密钥自管，v0.1.35） | §6 crypto |
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
+| [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
 
 ---
 
@@ -306,11 +307,11 @@ db:
 ### ② 运行
 
 ```bash
-./bin/oj test -c sample/config.yaml -d sample/src
+./bin/oj test -c config.yaml -d src
 # stderr: oj test: using db "test"（migrate / seed / fixtures 一并跟随）
 
-./bin/oj test -c sample/config.yaml -d sample/src --db ci_scratch   # 指定别的库（须在 db 段声明）
-./bin/oj test -c sample/config.yaml -d sample/src --anonymous       # 以匿名身份跑（测公开面）
+./bin/oj test -c config.yaml -d src --db ci_scratch   # 指定别的库（须在 db 段声明）
+./bin/oj test -c config.yaml -d src --anonymous       # 以匿名身份跑（测公开面）
 ```
 
 - 建表、seed、fixtures、以及 handler 里的 `db` **全部**跟着走，不会出现「表建在 A 库、
@@ -1073,7 +1074,7 @@ auth:
     # name/same_site/secure/ttl_secs/csrf_cookie/csrf_header 均有缺省，见 §8
 ```
 
-### ② 登录端点（签发是业务职责；sample/src/auth/ 有参考实现）
+### ② 登录端点（签发是业务职责；src/auth/ 有参考实现）
 
 ```ts
 // src/auth/login/api.ts
@@ -1335,10 +1336,10 @@ rabbits:
 
 ```bash
 # 测试默认落 db.test（等同旧行为）；其余资源走各段 default
-./bin/oj test -c config.yaml -d sample/src
+./bin/oj test -c config.yaml -d src
 
 # 报表库 + 缓存 redis + 归档 es 一起选源，handler 不改代码
-./bin/oj test  -c config.yaml -d sample/src --db report --redis cache --es archive
+./bin/oj test  -c config.yaml -d src --db report --redis cache --es archive
 ./bin/oj exec  scripts/fix.ts -c config.yaml --db report --redis cache --es archive
 ./bin/oj exec  scripts/backfill.ts -c config.yaml --kafka staging
 ```
@@ -1838,8 +1839,8 @@ curl -s http://localhost:9778/v1/api/cache_demo/   # {"code":0,"data":{"hit":"he
 > 成败」的表单形态，或 CAS（302 跳转 + ticket 回校）。**先记住分层：`oj-auth`
 > 插件只是守卫**（Bearer/cookie 验签 + 匿名路径 + CSRF），**所有登录端点本来就是
 > 普通业务模块**——sample 的 `/auth/login`、`/oidc/*` 全是 JS handler，守卫对
-> 「登录从哪来」不可见。新增来源 = 新写一个业务模块（照抄 `sample/src/oidc/`
-> 或 `sample/src/auth/`），**不要动 oj-auth 插件**（那是 ABI 面）。
+> 「登录从哪来」不可见。新增来源 = 新写一个业务模块（照抄 `src/oidc/`
+> 或 `src/auth/`），**不要动 oj-auth 插件**（那是 ABI 面）。
 
 ### ① 表单形态：转发凭据到外部端点（src/sso/login/api.ts）
 
@@ -1877,7 +1878,7 @@ export default {
 };
 ```
 
-签发/会话/CSRF 与本地登录完全同构（`sample/src/auth/_shared/session.ts` 的
+签发/会话/CSRF 与本地登录完全同构（`src/auth/_shared/session.ts` 的
 `issueTokens` + 场景 14 的双 cookie）——登录来源只决定「凭据验过没有」，验过即
 换发自家 token，后续请求对守卫无异。
 
@@ -1918,7 +1919,7 @@ tenant:
 
 | 坑 | 说明 |
 |---|---|
-| 想加 SSO 就去改 oj-auth 插件 | 方向错了：插件只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI（`AuthGuardVtable`，全部插件联动重编）；登录端点是业务模块，本场景 + `sample/src/oidc/` 覆盖 |
+| 想加 SSO 就去改 oj-auth 插件 | 方向错了：插件只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI（`AuthGuardVtable`，全部插件联动重编）；登录端点是业务模块，本场景 + `src/oidc/` 覆盖 |
 | JIT 建号给了真实口令 hash 或空串 | 占位串（`"!sso"`）就是「此号不走密码登录」的声明——bcrypt 对非法 hash 恒 false；写真实 hash 等于给 SSO 账号开了第二条密码攻击面 |
 | username 不带来源前缀 | `sso:zhang` 与本地 `zhang` 必须是两个号；混用同一键 = 低信任来源可接管高信任账号 |
 | 把外部 SSO 响应体回吐给前端 | 泄露内部信息——失败统一 `json.fail(401, …)`，成功判定只读具体字段 |
@@ -1931,7 +1932,7 @@ tenant:
 > 何时抄我：文档/wiki/博客要全文检索，但不想为中小规模上 ES。三引擎原生 FTS
 > 统一成一个面——sqlite FTS5（bundled 已开）/ mysql FULLTEXT(ngram) /
 > postgres tsvector+GIN——零额外依赖、随库走、`db.tx` 内使用即同事务。
-> 源码：`sample/src/_platform/_shared/search.ts`，引用方 manifest 补
+> 源码：`src/_platform/_shared/search.ts`，引用方 manifest 补
 > `deps: { _platform: "^0.1.0" }`。
 
 ### ① 建索引与写入口
@@ -1967,7 +1968,7 @@ const hits = await search.query("docs", "环境部署", { limit: 20, highlight: 
 
 ### ③ 验证
 
-L1（sqlite 腿，`oj test`）：`sample/tests/search.test.ts`——增删改后检索一致、短词回退、
+L1（sqlite 腿，`oj test`）：`tests/search.test.ts`——增删改后检索一致、短词回退、
 DDL 拒事务、标识符白名单。
 
 ### ④ 常见坑
@@ -1988,8 +1989,8 @@ DDL 拒事务、标识符白名单。
 
 > 何时抄我：文档/CMS 每次保存要一个不可变修订，支持历史/对比/回滚。CAS 内容表
 > （sha256 去重）+ 修订表（UNIQUE 乐观锁兜底）+ 行级 diff，全部随库走、同事务。
-> 源码：`sample/src/_platform/_shared/versions.ts`；建表迁移在
-> `sample/src/_platform/migrations/0002__versions.{sql,mysql.sql,pg.sql}`
+> 源码：`src/_platform/_shared/versions.ts`；建表迁移在
+> `src/_platform/migrations/0002__versions.{sql,mysql.sql,pg.sql}`
 > （sha256 用 CHAR(64)——MySQL TEXT 不可作 PK）。
 
 ### ① 提交 / 历史 / 取回 / 回滚
@@ -2018,7 +2019,7 @@ await versions.rollback("doc", docId, 6, { author: http.user?.id, message: "回�
 
 ### ③ 验证
 
-L1：`sample/tests/versions.test.ts`——commit×5/get/history/diff/rollback、乐观锁 409、
+L1：`tests/versions.test.ts`——commit×5/get/history/diff/rollback、乐观锁 409、
 同内容 CAS 去重、`db.tx` 回滚连带修订回滚、大文档格子预算闸。
 
 ### ④ 常见坑
@@ -2059,3 +2060,71 @@ mkdir -p ~/.oj && cp config.yaml ~/.oj/config.yaml
 | 命令行为像「用了别人家的配置」 | 上级目录或 `~/.oj/config.yaml` 有一份就会被自动采用；`oj info` 核对实际装配的段键名，必要时显式 `-c` 锁定 |
 | 无 config 跑 `migrate` / `test` 报未声明 default 库 | 回落默认 Config 里没有任何后端——这类命令本来就须要 config，错误在用到后端时才给出 |
 | `secret seal` / `open` 不带 `-c` | 同样走搜索；`open` 的私钥仍优先 `OJ_SECRET_KEY` / `OJ_SECRET_KEY_FILE` 环境通道 |
+
+## 场景 31：一个文件多个同动词端点——嵌套 handler 组（v0.1.64）
+
+> 何时抄我：同一实体有多个同动词端点（如资产的 读/建/上传），不想为每个动词拆子目录，
+> 也不想把 api.ts 撑成大文件。**以实体对象为根**：组名用领域实体，子组用实体下的子资源。
+> 端点极少（≤3）时平铺即可；端点各自独立演化、多人分权时仍拆目录。
+> 源码：`src/nest/api.ts`，L1 用例 `tests/nest.test.ts`。
+
+### ① 实体为根：同实体多端点聚一组
+
+```ts
+// src/nest/api.ts
+function get(): void { json.ok({ where: "get" }); }              // GET  /nest/
+
+const asset = {
+  get: () => { json.ok({ where: "asset.get", state: http.query.state }); }, // GET  /nest/asset
+  post: () => { json.ok({ where: "asset.post" }); },             // POST /nest/asset
+  upload: {                                                      // 子资源（再嵌一层）
+    post: async () => { json.ok({ where: "asset.upload.post" }); }, // POST /nest/asset/upload
+  },
+};
+asset.get.schema = {                                             // 契约只挂函数，不是路由
+  query: { type: "object", required: ["state"], properties: { state: { type: "string" } } },
+};
+
+export default { get, asset };
+```
+
+### ② 对外根级 URL：组级 `.route` 作整组前缀
+
+```ts
+const anchor = {
+  post: async () => { json.ok({ anchor: http.param("anchor", "") }); },
+};
+anchor.route = "/x/{anchor}/upload";   // 绝对 → base 根下：POST /x/{anchor}/upload
+
+// 实体名可以是非标识符（连字符），计算式访问命中
+const auditLog = { get: () => { json.ok({ where: "audit-log.get" }); } };
+export default { anchor, "audit-log": auditLog };
+```
+
+### ③ 验证
+
+dev 与 release 两态一致（`oj build` 后 routes.js 为嵌套行写 `handler: "asset.get"`，
+顶层动词行不写该字段；旧产物无此字段照常启动）。sample L1（`oj test -c config.yaml
+-d src`）覆盖全形态：
+
+```
+GET  /v1/api/nest/                → 200 get
+GET  /v1/api/nest/asset           → 400（缺 query state，契约在 JS 前拦）
+GET  /v1/api/nest/asset?state=ok  → 200 asset.get
+POST /v1/api/nest/asset           → 200 asset.post
+POST /v1/api/nest/asset/upload    → 200 asset.upload.post
+POST /v1/api/x/a1/upload          → 200 anchor.post
+GET  /v1/api/nest/audit-log       → 200 audit-log.get
+GET  /v1/api/nest/asset/schema    → 404（元数据不生成路由）
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 启动报 `verb key 'x' … expected handler function` | 动词键下挂了对象/数组/基元——动词键只能是 handler 函数 |
+| 启动报 `non-verb key 'x' … expected nested group object` | 非动词键挂了函数/数组/基元（此前的静默丢弃陷阱）；helper 函数别进 default 导出 |
+| 组挂 `.route` 后目录镜像 404 | 符合预期：组动词各自替换镜像（与顶层 `.route` 同语义） |
+| 报 `nested deeper than 4 levels` / `circular handler group` | 嵌套上限 4 层；自引用（`a.self = a`）内省期即失败 |
+| release 启动报 `illegal handler chain` | routes.js 的 `handler` 段非法（`/`、空段、`__proto__`/`constructor`/`prototype`）——重新 `oj build` |
+| 该拆目录还是用组 | 见 api-manual §4「何时采用」：同实体多端点用组（实体为根）；端点独立演化/多人分权拆目录；≤3 个同形端点平铺 |

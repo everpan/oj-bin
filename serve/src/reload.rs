@@ -16,10 +16,10 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
-use tower::util::ServiceExt;
 use only_js::bridge::AuthGuard;
 use serde_json::Value;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
+use tower::util::ServiceExt;
 
 /// 热更执行结果（POST 成功返回体）。
 #[derive(Clone, Debug)]
@@ -38,8 +38,7 @@ pub struct ReloadOutcome {
 
 /// 热更执行闭包类型：`oj` 侧注入。同步执行（内部用 blocking 线程做影子装配），
 /// 返回 `Ok(outcome)` 或 `Err((status, msg))`（`status`=HTTP 状态，400/500）。
-pub type ReloadExecutor =
-    Arc<dyn Fn() -> Result<ReloadOutcome, (u16, String)> + Send + Sync>;
+pub type ReloadExecutor = Arc<dyn Fn() -> Result<ReloadOutcome, (u16, String)> + Send + Sync>;
 
 /// 代际元数据（GET 摘要来源）。
 #[derive(Clone, Debug)]
@@ -230,7 +229,12 @@ async fn handle_config(
             let authorization = headers
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok());
-            match g.verify("/_system/config", req.method().as_str(), authorization, None) {
+            match g.verify(
+                "/_system/config",
+                req.method().as_str(),
+                authorization,
+                None,
+            ) {
                 Ok(_) => {}
                 Err(msg) => {
                     return (StatusCode::UNAUTHORIZED, Json(Value::String(msg))).into_response();
@@ -276,7 +280,9 @@ async fn handle_config(
             if !body.is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(Value::String("reload_api POST must have empty body".to_string())),
+                    Json(Value::String(
+                        "reload_api POST must have empty body".to_string(),
+                    )),
                 )
                     .into_response();
             }
@@ -342,9 +348,7 @@ pub async fn serve_swappable(
     rs: Arc<ReloadState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let router = Router::new()
-        .fallback(any(system_fallback))
-        .with_state(rs);
+    let router = Router::new().fallback(any(system_fallback)).with_state(rs);
     axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),

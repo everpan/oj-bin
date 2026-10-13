@@ -24,6 +24,7 @@
         "./src/echo-bin/*",
         "./src/file/*",
         "./src/idp/*",
+        "./src/nest/*",
         "./src/news/*",
         "./src/oidc/*",
         "./src/order/*",

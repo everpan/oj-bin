@@ -133,8 +133,15 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         .unwrap_or_else(|| config_dir.join("config.yaml"));
     // reload_api 开关须在读 cfg 前捕获（cfg 随后移入 App::from_config）。
     let reload_api = cfg.server.reload_api;
-    let mut app =
-        App::from_config(cfg, &top, &config_dir, false, &ResourceProfiles::default(), None).await?;
+    let mut app = App::from_config(
+        cfg,
+        &top,
+        &config_dir,
+        false,
+        &ResourceProfiles::default(),
+        None,
+    )
+    .await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
     // 有 loop_body = 池化模式（TaskPool，多任务共享有限 Worker）；无 = 存量 TLA
     // 监督模式（一任务一线程 + 退避重启，tasks.rs 原样）。两模式零迁移共存。
@@ -233,10 +240,10 @@ async fn serve_hot_reload_branch(
     // 用 raw 文档而非解析后的 `Config`：避免对核心 `Config` 强加 `Serialize` /
     // `Clone`（涉及大量子段类型），且 CLI/进程级覆盖在进程生命周期内不变，
     // 落盘文件内容即热更真触发源，足以做幂等判定与段 diff。
-    let baseline_raw = std::fs::read(&config_path)
-        .map_err(|e| format!("reload baseline read: {e}"))?;
-    let baseline_doc: serde_yaml::Value = serde_yaml::from_slice(&baseline_raw)
-        .map_err(|e| format!("reload baseline parse: {e}"))?;
+    let baseline_raw =
+        std::fs::read(&config_path).map_err(|e| format!("reload baseline read: {e}"))?;
+    let baseline_doc: serde_yaml::Value =
+        serde_yaml::from_slice(&baseline_raw).map_err(|e| format!("reload baseline parse: {e}"))?;
     let baseline_sha = doc_sha(&baseline_doc).map_err(|e| format!("reload baseline sha: {e}"))?;
     let ctx = Arc::new(HotReloadCtx {
         args: args.clone(),
@@ -333,9 +340,7 @@ impl HotReloadCtx {
     }
 
     async fn committer(&self) -> &serve::reload::Committer {
-        self.committer
-            .get()
-            .expect("committer set before reload")
+        self.committer.get().expect("committer set before reload")
     }
 }
 
@@ -490,7 +495,9 @@ fn diff_configs(
         }
         match *key {
             "db" | "redis" | "blob" | "es" | "broker" | "smtp" | "ldap" | "auth" | "kafkas"
-            | "rabbits" | "plugins" | "plugins_dir" | "secrets" => restart_pending.push((*key).to_string()),
+            | "rabbits" | "plugins" | "plugins_dir" | "secrets" => {
+                restart_pending.push((*key).to_string())
+            }
             "server" => kept_listener.push((*key).to_string()),
             _ => applied.push((*key).to_string()),
         }
@@ -630,7 +637,9 @@ async fn shutdown_signal(flag: Arc<tokio::sync::Mutex<Arc<std::sync::atomic::Ato
         _ = term => {},
     }
     eprintln!("shutdown: stop flag set — draining tasks and in-flight requests");
-    flag.lock().await.store(true, std::sync::atomic::Ordering::Relaxed);
+    flag.lock()
+        .await
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 解析配置文件（v0.1.58 自 load_app_config 抽出）：`config` None 走统一搜索
@@ -3884,4 +3893,3 @@ vars: { FOO: "bar" }
         assert_ne!(doc_sha(&a).unwrap(), doc_sha(&b).unwrap());
     }
 }
-

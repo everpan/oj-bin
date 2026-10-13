@@ -197,6 +197,23 @@ demo（admin）200、trinity（user）实测 403。
   `rabbits:` 段使用；教学走读见 `docs/mq-tasks.md`，写法见
   `docs/devkit/api-manual.md` §6「命名 MQ 客户端与长任务」。
 
+## ⑫ nest —— 嵌套 handler 组（v0.1.64）
+
+`src/nest/api.ts`：**以实体对象为根**把同一聚合的多个同动词端点聚在一个文件里——
+不必为每个动词拆子目录，也不必把 api.ts 撑成大文件。组名即路径段，组可再嵌子组
+（上限 4 层）；组级 `.route` 作整组默认前缀（对外根级 URL）。选型判据（DDD 参照：
+模块=限界上下文、实体组=聚合根、子组=聚合内从属资源、独立聚合才拆目录）见
+`docs/devkit/api-manual.md` §4「何时采用」与场景 31；L1 用例 `tests/nest.test.ts`。
+
+```
+GET  /v1/api/nest/                → get（模块根端点，目录镜像）
+GET  /v1/api/nest/asset?state=ok  → asset.get（.schema 契约，缺 state → 400）
+POST /v1/api/nest/asset           → asset.post
+POST /v1/api/nest/asset/upload    → asset.upload.post（实体下子资源，再嵌一层）
+POST /v1/api/x/a1/upload          → anchor.post（组级 .route 挂 base 根下）
+GET  /v1/api/nest/audit-log       → "audit-log".get（连字符实体名）
+```
+
 ---
 
 ## 特性 → 模块速查
@@ -216,6 +233,7 @@ demo（admin）200、trinity（user）实测 403。
 | JWT 签发与校验（bcrypt/jwt/crypto） | auth | `login/api.ts` + `_shared/session.ts` |
 | `http.user` 身份 / 角色门禁 | auth_demo · admin · cert | `me/api.ts` · `cert/api.ts` |
 | WS 生命周期钩子 + bus 发布订阅 | news | `ws.ts` + `api.ts` |
+| 嵌套 handler 组（实体为根，同文件多端点） | nest | `api.ts` |
 | multipart + blob 对象存储 | upload | `api.ts` |
 | `json.raw` 裸 JSON（协议端点） | idp | `.well-known/openid-configuration/api.ts` |
 | OIDC OP / RP 全流程 | idp · oidc | 见 README「OIDC 演示」 |

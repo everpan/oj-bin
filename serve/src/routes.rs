@@ -198,10 +198,11 @@ pub fn method_name(m: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(pub u32);
 
-/// 单 pattern 下某方法的归宿：文件 / 冲突（请求期 500）。
+/// 单 pattern 下某方法的归宿：文件 + handler 链 / 冲突（请求期 500）。
+/// v0.1.64：链为点分路径（`"cccc.get"`；顶层动词即 `"get"`），`run_module` 据此逐段取值。
 #[derive(Clone)]
 pub enum Entry {
-    File(FileId),
+    File(FileId, String),
     Conflict(String),
 }
 
@@ -210,6 +211,8 @@ pub enum Lookup {
     Hit {
         file: PathBuf,
         params: HashMap<String, String>,
+        /// handler 链（点分；末段即动词）。派发凭此取值，不再用 method 反查。
+        handler: String,
     },
     Conflict(String),
     MethodNotAllowed,
@@ -222,10 +225,26 @@ pub struct RouteRow {
     pub method: String,
     pub pattern: String,
     pub file: FileId,
+    /// handler 链（点分；`method` 即其末段）。契约注册与 openapi 同源。
+    pub handler: String,
     /// handler 声明的入参契约（`.schema`）；None = 未声明（不校验）。
     /// **由路由表单一承载** —— dev 内省与 release `routes.js` 都落到此处，
     /// 契约的三个消费者（运行期校验 / oj build 落盘 / oj openapi 出契约）同读一源。
     pub schema: Option<serde_json::Value>,
+}
+
+/// handler 链段名合法性（§四 权威规则，与 JS driver 同口径）：非空、不含 `/`、
+/// 排除 `__proto__` / `constructor` / `prototype`（原型链防护）。段含 `.` 不可能
+/// （链按 `.` 拆分）；连字符等非标识符段合法（计算式访问天然兼容）。
+pub fn legal_handler_chain(chain: &str) -> bool {
+    !chain.is_empty()
+        && chain.split('.').all(|s| {
+            !s.is_empty()
+                && !s.contains('/')
+                && s != "__proto__"
+                && s != "constructor"
+                && s != "prototype"
+        })
 }
 
 /// 路由表：单 matchit matcher，pattern 的 value 是 方法名 → Entry 映射——
@@ -267,8 +286,10 @@ impl Default for RouteTable {
 }
 
 impl RouteTable {
-    /// 建表：内省闭包按文件返回 Vec<(方法, .route 或 None)>；返回 (表, 失败/冲突清单)。
-    /// 纯逻辑（依赖倒置：不依赖 JS 运行时），CLI/测试注入真实或假内省。
+    /// 建表：内省闭包按文件返回 Vec<(handler 链, 有效 .route 或 None, schema)>；
+    /// 返回 (表, 失败/冲突清单)。纯逻辑（依赖倒置：不依赖 JS 运行时），
+    /// CLI/测试注入真实或假内省。v0.1.64：链来自 `introspect_module` 的扁平 leaf
+    /// （组前缀已在 JS 侧解析为有效路由）；动词取链尾，METHODS 白名单作纵深防线。
     pub fn build(
         base: &str,
         root: &Path,
@@ -306,8 +327,10 @@ impl RouteTable {
                     .join("/");
                 format!("/{b}/{conv}")
             };
-            for (method, route, schema) in decls {
-                if !METHODS.contains(&method.as_str()) {
+            for (chain, route, schema) in decls {
+                // 动词 = 链尾（内省保证只有 verb 键成 leaf；此处为纵深防线）。
+                let method = chain.rsplit('.').next().unwrap_or(&chain);
+                if !METHODS.contains(&method) {
                     continue;
                 }
                 let route = route.filter(|r| !r.is_empty()); // "" 视同未挂
@@ -326,11 +349,20 @@ impl RouteTable {
                     Some(r) if r.starts_with('/') => format!("/{b}{r}"), // 根级（base 根下）
                     Some(r) => format!("{dir_base}/{r}"),                // 相对
                 };
+                // 有效路由非空 = 声明了显式 pattern（自身或组 .route）→ 该 (file, verb)
+                // 的目录镜像不得被 dev 兜底复活。顶层动词无 .route 不标记（旧语义）。
                 if route.is_some() {
                     let fid = t.intern(&file);
-                    t.replaced.insert((fid, method.clone()));
+                    t.replaced.insert((fid, method.to_string()));
                 }
-                t.register(&mut failures, &method, &pattern, &file, schema.clone());
+                t.register(
+                    &mut failures,
+                    method,
+                    &pattern,
+                    &file,
+                    schema.clone(),
+                    &chain,
+                );
             }
         }
         (t, failures)
@@ -338,6 +370,8 @@ impl RouteTable {
 
     /// release 直载：routes.js 导出的全量行（pattern 已含 base，file 相对 root）。
     /// 注册语义与 build 一致（合并 / 冲突 / 非法 pattern 丢弃），replaced 恒空（无 fs 兜底）。
+    /// handler 链：行内 `handler` 字段优先；旧产物缺字段 → 以 `method` 兜底填链
+    /// （单段链即旧行为，老 dist 不必重新 build 照常启动）。
     pub fn from_entries(root: &Path, entries: &[RouteEntry]) -> (Self, Vec<String>) {
         let mut t = RouteTable::default();
         let mut failures = Vec::new();
@@ -367,12 +401,22 @@ impl RouteTable {
                 failures.push(format!("routes.js: illegal pattern {}", e.pattern));
                 continue;
             }
+            // handler 链解析（A6：release 入口段名校验，与 §四 白名单同口径）。
+            let chain = e.handler.clone().unwrap_or_else(|| e.method.clone());
+            if !legal_handler_chain(&chain) {
+                failures.push(format!(
+                    "routes.js: illegal handler chain {:?} (method {}, pattern {})",
+                    chain, e.method, e.pattern
+                ));
+                continue;
+            }
             t.register(
                 &mut failures,
                 &e.method,
                 &e.pattern,
                 &root.join(&e.file),
                 e.schema.clone(),
+                &chain,
             );
         }
         (t, failures)
@@ -397,6 +441,7 @@ impl RouteTable {
         pattern: &str,
         file: &Path,
         schema: Option<serde_json::Value>,
+        handler: &str,
     ) {
         let fid = self.intern(file);
         // 同 pattern 去重按 **字符串相等**（查 slots），不用 matcher.at_mut(pattern)：
@@ -404,7 +449,7 @@ impl RouteTable {
         if let Some(&slot) = self.slots.get(pattern) {
             let map = &mut self.nodes[slot];
             match map.get(method) {
-                Some(Entry::File(a)) => {
+                Some(Entry::File(a, _)) => {
                     let msg = format!(
                         "route conflict: {method} {pattern} declared in {} and {}",
                         self.files[a.0 as usize].display(),
@@ -420,11 +465,12 @@ impl RouteTable {
                     file.display()
                 )),
                 _ => {
-                    map.insert(method.to_string(), Entry::File(fid));
+                    map.insert(method.to_string(), Entry::File(fid, handler.to_string()));
                     self.rows.push(RouteRow {
                         method: method.to_string(),
                         pattern: pattern.to_string(),
                         file: fid,
+                        handler: handler.to_string(),
                         schema: schema.clone(),
                     });
                 }
@@ -432,7 +478,7 @@ impl RouteTable {
             return;
         }
         let mut map = HashMap::new();
-        map.insert(method.to_string(), Entry::File(fid));
+        map.insert(method.to_string(), Entry::File(fid, handler.to_string()));
         let slot = self.nodes.len();
         match self.matcher.insert(pattern.to_string(), slot) {
             Ok(()) => {
@@ -442,6 +488,7 @@ impl RouteTable {
                     method: method.to_string(),
                     pattern: pattern.to_string(),
                     file: fid,
+                    handler: handler.to_string(),
                     schema: schema.clone(),
                 });
             }
@@ -463,12 +510,13 @@ impl RouteTable {
             return Lookup::MethodNotAllowed;
         };
         match self.nodes[*m.value].get(name) {
-            Some(Entry::File(f)) => {
+            Some(Entry::File(f, handler)) => {
                 let pairs = m.params.iter().map(|(k, v)| (k.to_string(), v.to_string()));
                 match decode_params(pairs) {
                     Some(params) => Lookup::Hit {
                         file: self.files[f.0 as usize].clone(),
                         params,
+                        handler: handler.clone(),
                     },
                     None => Lookup::NotFound, // 走私参数 → 404（§6.1-4）
                 }
@@ -572,6 +620,9 @@ pub struct RouteEntry {
     pub method: String,
     pub pattern: String,
     pub file: String,
+    /// handler 链（v0.1.64 嵌套组；点分，如 `"cccc.get"`）。**旧产物无此字段**
+    /// → None（向后兼容：`from_entries` 以 `method` 兜底填链，老 dist 照常启动）。
+    pub handler: Option<String>,
     /// handler 声明的入参契约（`.schema`；v0.1.44）。旧产物**无此字段** → None
     /// （向后兼容：`routes.js` 缺 schema 视为未声明契约，不得因此拒启）。
     pub schema: Option<serde_json::Value>,
@@ -587,6 +638,10 @@ pub fn entries_from_value(v: &serde_json::Value) -> Vec<RouteEntry> {
                         method: e.get("method")?.as_str()?.to_string(),
                         pattern: e.get("pattern")?.as_str()?.to_string(),
                         file: e.get("file")?.as_str()?.to_string(),
+                        handler: match e.get("handler") {
+                            Some(serde_json::Value::Null) | None => None,
+                            Some(h) => h.as_str().map(|s| s.to_string()),
+                        },
                         schema: match e.get("schema") {
                             Some(serde_json::Value::Null) | None => None,
                             Some(v) => Some(v.clone()),
@@ -598,16 +653,18 @@ pub fn entries_from_value(v: &serde_json::Value) -> Vec<RouteEntry> {
         .unwrap_or_default()
 }
 
-/// 内省结果 Value（introspect_module 约定 `{"get":{"route":..|null,"schema":..|null}}`）
-/// → (方法, route, schema) 三元组。**route 与 schema 同源取一趟**，杜绝两处真源漂移。
+/// 内省结果 Value（v0.1.64 `introspect_module` 约定：扁平 leaf 数组
+/// `[{ chain, route, schema }, ...]`）→ (handler 链, 有效 route, schema) 三元组。
+/// **route 与 schema 同源取一趟**，杜绝两处真源漂移。
 pub fn decls_from_value(
     v: &serde_json::Value,
 ) -> Vec<(String, Option<String>, Option<serde_json::Value>)> {
-    v.as_object()
-        .map(|o| {
-            o.iter()
-                .filter_map(|(k, v)| {
-                    let o = v.as_object()?;
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| {
+                    let o = l.as_object()?;
+                    let chain = o.get("chain")?.as_str()?.to_string();
                     let route = o
                         .get("route")
                         .and_then(|r| r.as_str())
@@ -616,7 +673,7 @@ pub fn decls_from_value(
                         Some(serde_json::Value::Null) | None => None,
                         Some(s) => Some(s.clone()),
                     };
-                    Some((k.clone(), route, schema))
+                    Some((chain, route, schema))
                 })
                 .collect()
         })
@@ -864,7 +921,7 @@ mod tests {
         let (t, f) = tbl(&["user/_id_/api.ts"], &[("user/_id_/api.ts", "get", "")]);
         assert!(f.is_empty(), "{f:?}");
         match t.lookup("/v1/api/user/42", "GET") {
-            Lookup::Hit { file, params } => {
+            Lookup::Hit { file, params, .. } => {
                 assert!(file.ends_with("_id_/api.ts"), "{file:?}");
                 assert_eq!(params["id"], "42");
             }
@@ -880,7 +937,7 @@ mod tests {
         );
         assert!(f.is_empty(), "{f:?}");
         match t.lookup("/v1/api/x/me", "GET") {
-            Lookup::Hit { file, params } => {
+            Lookup::Hit { file, params, .. } => {
                 assert!(file.ends_with("x/me/api.ts"), "{file:?}");
                 assert!(params.is_empty(), "{params:?}");
             }
@@ -955,24 +1012,21 @@ mod tests {
     // ----- RouteTable（纯逻辑，假内省闭包） -----
 
     fn tbl(files: &[&str], decls: &[(&str, &str, &str)]) -> (RouteTable, Vec<String>) {
-        // decls: (文件相对路径, 方法, .route 值；空串 = 未挂)
+        // decls: (文件相对路径, handler 链, 有效 .route 值；空串 = 未挂)。
+        // v0.1.64：链即内省产物的 chain（`"cccc.get"`；顶层动词为单段），route 为
+        // 组前缀解析后的有效路由（JS 侧完成，Rust 只见最终词汇）。
         let root = fixture(files);
-        let m: HashMap<String, Vec<(String, Option<String>)>> = decls
-            .iter()
-            .map(|(f, m, r)| {
-                (
-                    f.to_string(),
-                    vec![(
-                        m.to_string(),
-                        if r.is_empty() {
-                            None
-                        } else {
-                            Some(r.to_string())
-                        },
-                    )],
-                )
-            })
-            .collect();
+        let mut m: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+        for (f, c, r) in decls {
+            m.entry(f.to_string()).or_default().push((
+                c.to_string(),
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.to_string())
+                },
+            ));
+        }
         RouteTable::build("/v1/api", &root, true, |p: &Path| {
             // 跨平台：file 路径在 Windows 用反斜杠，而 decls 的 key 用正斜杠，
             // 统一转正斜杠再查表，否则 Windows 下 key 不匹配 → 整表空注册。
@@ -985,9 +1039,192 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(m, r)| (m, r, None))
+                .map(|(c, r)| (c, r, None))
                 .collect())
         })
+    }
+
+    // ----- v0.1.64 嵌套 handler 组 -----
+
+    #[test]
+    fn table_registers_nested_group_routes() {
+        // 组无 .route → 挂 {父前缀}/{组名}；Lookup::Hit 带 handler 链。
+        // 注意 route 列为**有效路由**（内省已展开组名前缀）：组动词恒非空。
+        let (t, f) = tbl(
+            &["aaa/bbb/api.ts"],
+            &[
+                ("aaa/bbb/api.ts", "get", ""),
+                ("aaa/bbb/api.ts", "cccc.get", "cccc"),
+                ("aaa/bbb/api.ts", "cccc.post", "cccc"),
+                ("aaa/bbb/api.ts", "cccc.list.get", "cccc/list"),
+            ],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        for (path, verb, want) in [
+            ("/v1/api/aaa/bbb", "GET", "get"),
+            ("/v1/api/aaa/bbb/cccc", "GET", "cccc.get"),
+            ("/v1/api/aaa/bbb/cccc", "POST", "cccc.post"),
+            ("/v1/api/aaa/bbb/cccc/list", "GET", "cccc.list.get"),
+        ] {
+            match t.lookup(path, verb) {
+                Lookup::Hit { handler, .. } => {
+                    assert_eq!(handler, want, "{path} {verb}")
+                }
+                _ => panic!("expected hit for {path} {verb}"),
+            }
+        }
+    }
+
+    #[test]
+    fn table_group_route_prefix_and_verb_override() {
+        // 组 .route 已由内省展开为有效路由：cccc.get → /x；cccc.post 自身 /y 覆盖
+        let (t, f) = tbl(
+            &["g/api.ts"],
+            &[
+                ("g/api.ts", "cccc.get", "/x"),
+                ("g/api.ts", "cccc.post", "/y"),
+            ],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        for (path, verb, want) in [
+            ("/v1/api/x", "GET", "cccc.get"),
+            ("/v1/api/y", "POST", "cccc.post"),
+        ] {
+            match t.lookup(path, verb) {
+                Lookup::Hit { handler, .. } => assert_eq!(handler, want, "{path} {verb}"),
+                _ => panic!("expected hit for {path} {verb}"),
+            }
+        }
+        // 组动词各自 replaced：目录镜像不复活
+        assert!(matches!(t.lookup("/v1/api/g", "GET"), Lookup::NotFound));
+    }
+
+    #[test]
+    fn table_replaced_semantics_with_groups() {
+        // 顶层动词无 .route → 不标记 replaced（旧语义保持）
+        let (t, _) = tbl(&["a/api.ts"], &[("a/api.ts", "get", "")]);
+        let id = t.listing()[0].file;
+        assert!(!t.is_replaced(t.file_path(id), "get"));
+        // 组动词（有效路由非空）→ 各自标记；同文件无 .route 的 post 不标记
+        let (t, _) = tbl(
+            &["b/api.ts"],
+            &[("b/api.ts", "cccc.get", "cccc"), ("b/api.ts", "post", "")],
+        );
+        let id = t
+            .listing()
+            .iter()
+            .find(|r| r.handler == "cccc.get")
+            .unwrap()
+            .file;
+        assert!(t.is_replaced(t.file_path(id), "get"));
+        assert!(!t.is_replaced(t.file_path(id), "post"));
+        // 表内该 pattern 已存在（post 注册于目录镜像）→ GET 得 405；
+        // replaced 的「兜底 404 不复活」在 serve::handle 的 fs 兜底层判定
+        // （表 miss 才走兜底），集成用例见 oj/tests/e2e.rs。
+        assert!(matches!(
+            t.lookup("/v1/api/b", "GET"),
+            Lookup::MethodNotAllowed
+        ));
+        match t.lookup("/v1/api/b", "POST") {
+            Lookup::Hit { handler, .. } => assert_eq!(handler, "post"),
+            _ => panic!("expected hit"),
+        }
+    }
+
+    #[test]
+    fn table_unknown_chain_tail_is_filtered() {
+        // 链尾非动词（内省纵深防线）：不注册也不炸
+        let (t, f) = tbl(&["a/api.ts"], &[("a/api.ts", "cccc.upload", "cccc")]);
+        assert!(f.is_empty(), "{f:?}");
+        assert!(t.listing().is_empty());
+        assert!(matches!(
+            t.lookup("/v1/api/a/cccc", "GET"),
+            Lookup::NotFound
+        ));
+    }
+
+    #[test]
+    fn decls_from_value_parses_flat_leaves() {
+        let v = serde_json::json!([
+            { "chain": "get", "route": null, "schema": null },
+            {
+                "chain": "cccc.get",
+                "route": "cccc",
+                "schema": { "query": { "type": "object" } },
+            },
+        ]);
+        let d = decls_from_value(&v);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[0].0, "get");
+        assert_eq!(d[0].1, None);
+        assert_eq!(d[1].0, "cccc.get");
+        assert_eq!(d[1].1.as_deref(), Some("cccc"));
+        assert!(d[1].2.is_some());
+        // 旧对象形状 / 垃圾输入 → 空表（不炸）
+        assert!(decls_from_value(&serde_json::json!({})).is_empty());
+        assert!(decls_from_value(&serde_json::json!(5)).is_empty());
+    }
+
+    #[test]
+    fn entries_from_value_parses_handler_with_fallback() {
+        let v = serde_json::json!([
+            { "method": "get", "pattern": "/a", "file": "a/api.js", "handler": "cccc.get" },
+            { "method": "post", "pattern": "/b", "file": "b/api.js" },
+        ]);
+        let e = entries_from_value(&v);
+        assert_eq!(e[0].handler.as_deref(), Some("cccc.get"));
+        assert_eq!(e[1].handler, None); // 旧产物缺字段
+        let dir = fixture(&[]);
+        let (t, f) = RouteTable::from_entries(&dir, &e);
+        assert!(f.is_empty(), "{f:?}");
+        let rows: Vec<&str> = t.listing().iter().map(|r| r.handler.as_str()).collect();
+        assert!(rows.contains(&"cccc.get"), "{rows:?}");
+        assert!(rows.contains(&"post"), "{rows:?}"); // None → method 兜底填链
+    }
+
+    #[test]
+    fn from_entries_rejects_illegal_handler_chain() {
+        let dir = fixture(&[]);
+        for bad in [
+            "__proto__.get",
+            "a.constructor",
+            "a.prototype",
+            "a//b",
+            "",
+            "a..get",
+        ] {
+            let e = vec![RouteEntry {
+                method: "get".into(),
+                pattern: "/x".into(),
+                file: "a/api.js".into(),
+                handler: Some(bad.into()),
+                ..Default::default()
+            }];
+            let (t, f) = RouteTable::from_entries(&dir, &e);
+            assert!(
+                f.iter().any(|s| s.contains("handler")),
+                "chain {bad:?}: {f:?}"
+            );
+            assert!(t.listing().is_empty(), "chain {bad:?} must not register");
+        }
+    }
+
+    #[test]
+    fn from_entries_registers_nested_chain() {
+        let dir = fixture(&[]);
+        let e = vec![RouteEntry {
+            method: "get".into(),
+            pattern: "/api/x".into(),
+            file: "a/api.js".into(),
+            handler: Some("cccc.get".into()),
+            ..Default::default()
+        }];
+        let (t, f) = RouteTable::from_entries(&dir, &e);
+        assert!(f.is_empty(), "{f:?}");
+        match t.lookup("/api/x", "GET") {
+            Lookup::Hit { handler, .. } => assert_eq!(handler, "cccc.get"),
+            _ => panic!("expected hit"),
+        }
     }
 
     #[test]
@@ -1175,6 +1412,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            handler: None,
             schema: None,
         };
         let (t, failures) = RouteTable::from_entries(
@@ -1213,14 +1451,14 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         match t.lookup("/v1/api/x/me", "GET") {
             // 静态命中不得带参数（被嫁接时会命中 {pk} 节点、带上 pk=me）
-            Lookup::Hit { file, params } => {
+            Lookup::Hit { file, params, .. } => {
                 assert!(file.ends_with("b/api.ts"), "{file:?}");
                 assert!(params.is_empty(), "{params:?}");
             }
             other => panic!("{}", kind(&other)),
         }
         match t.lookup("/v1/api/x/42", "GET") {
-            Lookup::Hit { file, params } => {
+            Lookup::Hit { file, params, .. } => {
                 assert!(file.ends_with("a/api.ts"), "{file:?}");
                 assert_eq!(params["pk"], "42");
             }
@@ -1240,18 +1478,21 @@ mod tests {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "a/api.js".into(),
+                    handler: None,
                     schema: None,
                 },
                 RouteEntry {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "b/api.js".into(),
+                    handler: None,
                     schema: None,
                 },
                 RouteEntry {
                     method: "get".into(),
                     pattern: "/a/{id}".into(),
                     file: "c/api.js".into(),
+                    handler: None,
                     schema: None,
                 },
             ],
@@ -1322,6 +1563,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            handler: None,
             schema: None,
         };
         let (t, failures) = RouteTable::from_entries(
@@ -1368,6 +1610,7 @@ mod tests {
             method: m.into(),
             pattern: p.into(),
             file: f.into(),
+            handler: None,
             schema: None,
         };
         let (t, failures) = RouteTable::from_entries(

@@ -1254,11 +1254,9 @@ impl App {
         let reused = reuse_backend.is_some();
         let backend = match reuse_backend {
             Some(b) => b,
-            None => {
-                Arc::new(
-                    assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?,
-                )
-            }
+            None => Arc::new(
+                assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?,
+            ),
         };
         let stable = backend.stable().clone();
         // 停机 flag（spec §6）：App 持有，信号处理器置位；任务 Bridge 的 Extras 注
@@ -1407,6 +1405,7 @@ impl App {
                             method: e.method,
                             pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
                             file: format!("{module}-{version}/{}", e.file),
+                            handler: e.handler,
                             schema: e.schema,
                         });
                     }
@@ -1472,7 +1471,9 @@ impl App {
                             file.display()
                         )
                     })?;
-                    reg.insert(file, &row.method, contract).map_err(|e| {
+                    // 契约键 = (api 文件, handler 链)（v0.1.64）：嵌套组各 verb
+                    // 契约互不串门；与 run_module_validated 的 check_request 同键。
+                    reg.insert(file, &row.handler, contract).map_err(|e| {
                         format!("server.schema_validation: cannot register contract: {e}")
                     })?;
                 }
@@ -1824,12 +1825,14 @@ mod tests {
                 method: "get".into(),
                 pattern: "/v1/api/html-meta".into(),
                 file: "meta.ts".into(),
+                handler: None,
                 schema: None,
             },
             routes::RouteEntry {
                 method: "post".into(),
                 pattern: "/v1/api/post-only".into(),
                 file: "meta.ts".into(),
+                handler: None,
                 schema: None,
             },
         ];

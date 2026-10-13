@@ -35,12 +35,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    仅 `bind` 凭据错返回 `false`；filter 用户输入**必须转义**）。完整手册见仓库
    `docs/ldap-integration.md`，可照抄代码见 `scenarios.md` 场景 11。
    **新增登录来源（企业 HTTP 表单 / CAS SSO）→ 不改 oj-auth 插件**——它只是守卫
-   （验签 + 匿名路径 + CSRF），登录端点全是普通业务模块；照抄 `sample/src/oidc/`，
+   （验签 + 匿名路径 + CSRF），登录端点全是普通业务模块；照抄 `src/oidc/`，
    可照抄代码见 `scenarios.md` 场景 28。
-   **全文检索（不上 ES）→ §6「db.dialect」+ `sample/src/_platform/_shared/search.ts`**
+   **全文检索（不上 ES）→ §6「db.dialect」+ `src/_platform/_shared/search.ts`**
    （三引擎原生 FTS 统一面；ensureIndex 禁入 db.tx；sqlite 短词自动 LIKE 回退），可照抄
    代码见 `scenarios.md` 场景 29。**内容版本化 / 历史 / diff / 回滚 →
-   `sample/src/_platform/_shared/versions.ts`**（CAS 去重 + UNIQUE 乐观锁 + 行级 diff；
+   `src/_platform/_shared/versions.ts`**（CAS 去重 + UNIQUE 乐观锁 + 行级 diff；
    撞版本 409），见 `scenarios.md` 场景 30。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
@@ -92,6 +92,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 命令用了「别人家」的配置 / 行为与预期不符（v0.1.57 起） | `-c` 省略时按 **CWD 逐级向上 → `$HOME/.oj/config.yaml`** 搜索——上级目录甚至 home 兜底有一份 config.yaml 就会被采用。`serve`/`migrate`/`openapi` 等依赖后端配置的场景若回落默认会向 stderr 打 `note: no config.yaml found …`；**`oj exec` / `oj info` 自 v0.1.60 起静默回落、不再打该 note**。排查：怀疑被「别人家」config 影响时显式 `-c` 锁定，或 `oj info` 看实际装配的配置段键名 |
 | DELETE 返回 405 | 方法名写成了 `delete`，应为 `del` |
 | release 下参数路由 404 | build 剥了 `.route`，路由以 routes.js 为准——确认先 `oj build` |
+| 启动/`oj build` 报 `verb key 'x' … expected handler function` 或 `non-verb key 'x' … expected nested group object` | v0.1.64 嵌套组判别红线：动词键必须是函数，非动词键必须是普通对象——组上误挂的 `cccc.foo = []` / `cccc.x = 1` / 函数 helper 一律可操作报错（不再静默丢弃）；`.route`/`.schema` 等元数据只挂 handler 函数 |
+| release 启动报 `illegal handler chain` | `routes.js` 的 `handler` 段非法（含 `/`、空段、`__proto__`/`constructor`/`prototype`，或段间多一个 `.`）——手改产物恢复或重新 `oj build`；嵌套上限 4 层、自引用在内省期即失败 |
+| 组 `.route` 挂了之后目录镜像 404 | 符合预期：组动词各自替换目录镜像（与顶层 `.route` 同语义）；要镜像可达就别挂 `.route` |
+| 端点该拆目录、用嵌套组还是平铺（选型） | 同实体多端点用嵌套组、**以实体对象为根**（组名=实体，子组=子资源）；端点独立演化/多人分权拆目录；≤3 个同形端点平铺——详见 api-manual §4「何时采用」与场景 31 |
 | 启动失败 manifest | `name` 与目录名不一致 |
 | postgres 占位符报错 | 该方言用 `$1`，不是 `?`（sqlite/mysql 才是 `?`） |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
@@ -105,7 +109,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
 | 登录响应要同时下发 `oj_sess` + `oj_csrf` 两枚 cookie | v0.1.46 起 `json.header` 同名头追加、`Set-Cookie` 合法双发（此前响应头单值，csrf 只能 body 下发 + 前端写 `document.cookie`）；登出记得两枚都 `Max-Age=0` |
-| 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `sample/src/oidc/`（场景 28）。**登录端点必须进匿名列表**（无 token 可言，form 与 302 腿都是，`auth.`/`tenant.` 两条都加）；JIT 建号用「`来源:provider:tenant:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录）；CAS 交接 token 不进 URL、302 目标只认 `/` 开头相对路径 |
+| 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `src/oidc/`（场景 28）。**登录端点必须进匿名列表**（无 token 可言，form 与 302 腿都是，`auth.`/`tenant.` 两条都加）；JIT 建号用「`来源:provider:tenant:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录）；CAS 交接 token 不进 URL、302 目标只认 `/` 开头相对路径 |
 | `search.ensureIndex` 报 `DDL inside db.tx` | ensureIndex 是 DDL——MySQL 会隐式提交调用方事务；移到事务外，index/remove/query 留在事务内（同连接自动路由） |
 | sqlite 全文检索 2 个字查不到 | trigram 对 <3 字符静默零命中——`_shared/search` 自动回退业务表 LIKE；自写 FTS SQL 也要处理该边界 |
 | `versions.commit` 报 409 `version conflict` | 乐观锁：`expect` 与当前 head 不符或并发撞 `UNIQUE(entity_type,entity_id,version)`——重读 head 重试；省 `expect` 即 last-write-wins |

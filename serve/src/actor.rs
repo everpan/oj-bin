@@ -19,7 +19,8 @@ pub enum Job {
     /// ESM 模块执行（oj server 路径）。
     Module {
         path: std::path::PathBuf,
-        method: String,
+        /// 点分 handler 链（v0.1.64 嵌套组；顶层动词即 `"get"`）。
+        handler: String,
         req: RequestInfo,
         timeout: Option<std::time::Duration>,
         /// 是否执行入参契约校验；仅内部合成派发（`dispatch_meta_handler`）为 false。
@@ -113,7 +114,7 @@ impl JsActor {
                                 }
                                 Job::Module {
                                     path,
-                                    method,
+                                    handler,
                                     req,
                                     timeout,
                                     validate,
@@ -121,7 +122,7 @@ impl JsActor {
                                 } => {
                                     let t = timeout.unwrap_or(NO_TIMEOUT_SENTINEL);
                                     let out = bridge
-                                        .run_module_validated(&path, &method, req, t, validate)
+                                        .run_module_validated(&path, &handler, req, t, validate)
                                         .await
                                         .map_err(RunFail::from);
                                     (out, resp)
@@ -167,12 +168,13 @@ impl JsActor {
         })?
     }
 
-    /// ESM 模块执行（oj server 路径）。
+    /// ESM 模块执行（oj server 路径）。`handler` = 点分 handler 链（v0.1.64 嵌套组；
+    /// 顶层动词即 `"get"`），driver 据此逐段取值。
     /// `validate=false` 仅用于内部合成派发（见 `Bridge::run_module_validated`）。
     pub async fn run_module(
         &self,
         path: std::path::PathBuf,
-        method: String,
+        handler: String,
         req: RequestInfo,
         timeout: Option<std::time::Duration>,
         validate: bool,
@@ -182,7 +184,7 @@ impl JsActor {
         self.senders[i]
             .send(Job::Module {
                 path,
-                method,
+                handler,
                 req,
                 timeout,
                 validate,

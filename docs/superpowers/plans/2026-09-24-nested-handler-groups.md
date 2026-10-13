@@ -1,6 +1,9 @@
 # api.ts 嵌套 handler 组（v0.1.27+）Implementation Plan
 
-> 状态：**待定（pending）** —— 方案已定稿，等用户拍板后开工。落此文档前的需求与复核结论见下。
+> 状态：**已实施（v0.1.64，未打标签）** —— 2026-10-12 按 TDD 分三批落地完毕，门禁全绿
+> （workspace 1230 用例 / clippy `-D warnings` / xtask 契约 8 用例 / `cargo fmt --check` 零 diff）。
+> 用户可见变更见 `CHANGELOG.md` v0.1.64 与 devkit 四件（含「何时采用」DDD 选型指南与
+> `sample/src/nest/` 实体为根示例）；落地偏差与处置记录见 §八.5。
 
 **Goal:** 允许 `api.ts` 的 default 导出里用**非动词键挂载嵌套 handler 组**
 （`export default { get, post, upload: { get, post } }`），使「一个文件多个同动词端点」
@@ -246,19 +249,19 @@ export default { get, cccc };
 
 ## 七、落地步骤
 
-- [ ] 内省递归化（`src/bridge/mod.rs:1250`）+ `run_module` handler 链（`src/bridge/mod.rs:1158`）
-- [ ] `serve/src/routes.rs`：Entry/Lookup 带链、递归建表、来自 routes.js 的 handler 校验
-- [ ] `serve/src/actor.rs`、`serve/src/lib.rs` 透传 handler
-- [ ] `oj/src/build_cmd.rs`、`oj/src/app.rs`：routes.js 写入与读取 handler
-- [ ] 回归测试（routes 单测 + 内省单测 + build 产物断言）+ **§二.A 示例端到端用例**（4 路由 +
+- [x] 内省递归化（`src/bridge/mod.rs:1250`）+ `run_module` handler 链（`src/bridge/mod.rs:1158`）
+- [x] `serve/src/routes.rs`：Entry/Lookup 带链、递归建表、来自 routes.js 的 handler 校验
+- [x] `serve/src/actor.rs`、`serve/src/lib.rs` 透传 handler
+- [x] `oj/src/build_cmd.rs`、`oj/src/app.rs`：routes.js 写入与读取 handler
+- [x] 回归测试（routes 单测 + 内省单测 + build 产物断言）+ **§二.A 示例端到端用例**（4 路由 +
    `schema` 元数据隔离 + 组含动词与子组）+ 判别红线用例（组上挂数组/基元报错）
-- [ ] **集成测试（专家评审缺口，必做）**：内省递归 → `build` → `Lookup::Hit` 带链 → driver 逐段
+- [x] **集成测试（专家评审缺口，必做）**：内省递归 → `build` → `Lookup::Hit` 带链 → driver 逐段
    取值命中嵌套 handler（dev 态）；release 态 routes.js 直载同源命中；非标识符段名（`user-list`）
    计算式访问；组 `.route` 后目录镜像 404；`from_entries` 注入 `handler:"__proto__.get"` 非法段
    → failure；双态不变量（验收 11）。建议落 `oj/tests/e2e.rs` + `serve/src/routes.rs` 的
    `from_entries` 单测 + `src/bridge` 内省/派发单测。
-- [ ] devkit 四件 + CHANGELOG + `cargo xtask build`
-- [ ] 门禁复跑 + 专家评审处置（架构侧 / 工程侧 / 安全侧，结论见 §八）+ 本文档 §八 处置记录
+- [x] devkit 四件 + CHANGELOG + `cargo xtask build`
+- [x] 门禁复跑 + 专家评审处置（架构侧 / 工程侧 / 安全侧，结论见 §八）+ 本文档 §八 处置记录
 
 ## 八、评审意见与处置（2026-10-12 三方专家评审）
 
@@ -305,6 +308,28 @@ export default { get, cccc };
 
 - 跨仓 oj-module `VERB_OF` 只读问题依旧（AST 扫描仍会把 `cccc:{get,post}` 判「端点未实现」），只登记不擅改。
 - 深度上限具体值（4）与白名单正则，落地时若需微调以评审结论为准，不阻塞开工。
+
+### 8.5 落地处置记录（2026-10-12 实施，TDD 三批）
+
+实施与方案的**有意偏差**（均不改变验收结论），逐条登记：
+
+| # | 偏差 | 依据 / 理由 |
+|---|---|---|
+| D1 | 段名校验未用 `^[A-Za-z_$][A-Za-z0-9_$]*$`，改为「非空 + 不含 `/` + 排除 `__proto__`/`constructor`/`prototype`」 | 原正则拒绝连字符组名，与验收 12（`user-list` 命中）冲突；按 §8.4 授权微调。计算式访问对任意字符串安全，真实风险（注入/原型）由 JSON 字面量嵌入 + 排除项 + `hasOwnProperty.call` 覆盖。Rust 侧同口径实为 `legal_handler_chain` |
+| D2 | JS 内省 leaf 只产 `{chain, route, schema}`；`method`/`top_level` 由 Rust 从链尾推导 | DRY：verb 判定在 JS 已做，Rust 再存一份必漂移；也少一处 A3 分歧面。METHODS 白名单在 `build` 保留作纵深防线 |
+| D3 | 文件层（root default）字符串 `.route` 实现为整文件默认前缀；`route` 成为组/文件对象保留键 | §二 语义表「文件」行的落地；组自身 `.route` 不再被子键遍历撞见（实现期发现的真问题） |
+| D4 | 环检测用**路径** WeakSet（进/出删），非全局 seen | 全局 seen 会误杀「同组对象挂两个键」的合法 DAG；路径集 + 深度上限 4 双重满足 S1 |
+| D5 | driver 允许 object\|function 中间段下钻 | 保留旧语义（`m.default[method]` 可读函数导出上的属性）；与内省 `Object.keys(fn)` 口径一致，防双态分歧 |
+| D6 | 缺段（含顶层方法未导出）→ 404；「存在但非函数」→ 405 | §四 推荐片段的字面语义；替代旧的「一律 405」，已写入 CHANGELOG 行为变化 |
+| D7 | routes.js 仅在 `chain != method`（嵌套行）时写 `handler` 字段 | 顶层动词行与旧产物字节一致；旧产物无字段 → `method` 兜底填链（E4），双兼容 |
+| D8 | 入参契约键由 (文件, 方法) 改为 (文件, handler 链) | 嵌套组同文件同动词的契约互不串门；`dispatch_meta_handler` 同走链 |
+
+**门禁结果**：`cargo test --release --workspace` 1230 通过 / 0 失败；`cargo clippy --release
+--all-targets -- -D warnings` 零告警；`cargo test --release -p xtask` 8 通过（bin/devkit 与
+docs/devkit 一致）；`cargo fmt --check` 零 diff。HEAD 遗留的 11 处 fmt 漂移
+（`oj/src/app.rs:1254`、`oj/src/serve_cmd.rs` 6 处、`serve/src/reload.rs` 5 处，均出自
+config 热更提交 d641a62/5a92f8e）在本方案的 `cargo xtask build`（发布管线自带 fmt）中
+被一并格式化，随本次提交落入，未单独拆分。
 
 ## 附录 A：在途改动（已回退，开工时第一步重做）
 

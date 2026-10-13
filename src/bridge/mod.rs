@@ -1153,16 +1153,17 @@ impl Bridge {
         Ok(v["data"]["loop"].as_bool() == Some(true))
     }
 
-    /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
+    /// ESM 模式执行：TLA driver 模块 import api 模块，沿 **handler 链**逐段计算式
+    /// 取值并调用末段函数（v0.1.64 嵌套 handler 组；顶层动词链即 `"get"`，行为不变）。
     /// KillSwitch/ReqState 复用 run_ws 的熔断与捕获路径；被熔断的 runtime 同样不归还池。
     pub async fn run_module(
         &self,
         api_path: &std::path::Path,
-        method: &str,
+        handler: &str,
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<Capture, RunError> {
-        self.run_module_validated(api_path, method, req, timeout, true)
+        self.run_module_validated(api_path, handler, req, timeout, true)
             .await
     }
 
@@ -1175,7 +1176,7 @@ impl Bridge {
     pub async fn run_module_validated(
         &self,
         api_path: &std::path::Path,
-        method: &str,
+        handler: &str,
         req: RequestInfo,
         timeout: std::time::Duration,
         validate: bool,
@@ -1184,33 +1185,50 @@ impl Bridge {
             .driver_spec(api_path)
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
         // TLA driver：import 命中 V8 模块缓存（?v= 不变时零转译零重编译）；
-        // 方法未导出 → json.fail(405)（信封映射 HTTP 405）。
-        // method/msg 以 JSON 编码嵌入（合法 JS 字面量，杜绝引号注入）。
+        // 段缺失 → 404，末段非函数 / default 缺失 → 405（信封映射同码 HTTP）。
+        // 链/段/msg 一律 JSON 编码嵌入（合法 JS 字面量，杜绝引号/换行注入）。
         // 经常驻 `__ojRun`（bootstrap，strict direct eval）执行——不再每请求装载
         // side-module driver（perf F2：省编译/装载 + module map 无界增长）。
-        let method_lit = serde_json::to_string(method).unwrap_or_else(|_| "\"\"".into());
+        let handler_lit = serde_json::to_string(handler).unwrap_or_else(|_| "\"\"".into());
         let msg_lit = serde_json::to_string(&format!(
-            "method '{method}' not exported by {}",
+            "handler '{handler}' not exported by {}",
             api_path.display()
         ))
-        .unwrap_or_else(|_| "\"method not exported\"".into());
+        .unwrap_or_else(|_| "\"handler not exported\"".into());
         let body = format!(
             "const m = await import(\"{spec}\");\n\
-             const fn = m.default && m.default[{method_lit}];\n\
-             if (typeof fn !== \"function\") json.fail(405, {msg_lit});\n\
-             else await fn();\n"
+             const SEGS = {handler_lit}.split(\".\");\n\
+             const root = m.default;\n\
+             if (!root || (typeof root !== \"object\" && typeof root !== \"function\"))\n\
+               json.fail(405, {msg_lit});\n\
+             else {{\n\
+               let cur = root;\n\
+               for (let i = 0; i < SEGS.length; i++) {{\n\
+                 const s = SEGS[i];\n\
+                 if (s === \"\" || s.indexOf(\"/\") >= 0 ||\n\
+                     s === \"__proto__\" || s === \"constructor\" || s === \"prototype\")\n\
+                   return json.fail(404, \"bad handler segment\");\n\
+                 if ((typeof cur !== \"object\" && typeof cur !== \"function\") ||\n\
+                     !Object.prototype.hasOwnProperty.call(cur, s))\n\
+                   return json.fail(404, \"no handler\");\n\
+                 cur = cur[s];\n\
+               }}\n\
+               if (typeof cur !== \"function\") json.fail(405, {msg_lit});\n\
+               else await cur();\n\
+             }}\n"
         );
         let code = driver_script(&body);
         // §5.3 执行上下文：api_path 祖先目录命中模块目录 → 本请求归该模块
         // （归属守卫 / bound_db 重定向依据；Map 键 = 模块目录绝对路径，装配期注入）。
         let stable = self.pool.stable();
         // 入参契约校验（v0.1.44）：**在 V8 之前**拦住不合规输入 → 400。
-        // 与「方法未导出 → 405」同处一个执行切面：两者都是「进 JS 之前」的契约失败。
+        // 与「handler 未导出 → 405」同处一个执行切面：两者都是「进 JS 之前」的契约失败。
+        // 契约键 = (api 文件, handler 链) —— 嵌套组各 verb 契约互不串门。
         // 注册表为装配后填充的共享 Arc：读锁仅覆盖校验本身（内部无 await，亦不跨 await 持有）。
         let violation = if validate {
             if let Some(reg) = &stable.input_contracts {
                 let g = reg.read().unwrap_or_else(|p| p.into_inner());
-                g.check_request(api_path, method, &req).err()
+                g.check_request(api_path, handler, &req).err()
             } else {
                 None
             }
@@ -1239,13 +1257,19 @@ impl Bridge {
         self.run_side_driver(req, code, timeout, module).await
     }
 
-    /// 启动期内省：import api 模块、读每个导出方法的 `.route` 与 `.schema`，
-    /// 经 json.ok 信封回传 data（`{"get": {"route":"{id}"|null, "schema": <obj>|null}, ...}`，
-    /// 仅含函数导出的方法）。
+    /// 启动期内省：import api 模块，**递归**遍历 default 导出的键（v0.1.64 嵌套 handler 组），
+    /// 经 json.ok 信封回传**扁平 leaf 数组** `[{ chain, route, schema }, ...]`：
+    /// - `chain`：点分 handler 链（`"cccc.get"`；顶层动词即 `"get"`）；
+    /// - `route`：组前缀解析后的**有效路由**（Rust 词汇：`null` = 目录镜像 /
+    ///   `"/x"` = 根级 / `"seg/.."` = 相对目录镜像）；
+    /// - `schema`：handler 函数上的 `.schema` 元数据（原样透传，未校验）。
     ///
-    /// **route 与 schema 走同一趟内省** —— 二者必须同源，否则「路由表里有、契约表没有」
-    /// 就会退化成声明不生效。schema 原样透传（未校验），由 `contract::InputContract` 在
-    /// 注册期做白名单 fail-fast。
+    /// 判别红线（§二.A）：**先按键是否 verb 分派，再以 `typeof` 校验值**——verb 键必须是
+    /// 函数（否则报错）；非 verb 键必须是普通对象（函数/数组/基元一律报错，消灭此前的
+    /// 静默丢弃）。组级 `.route` 作整组默认前缀，动词自身 `.route` 优先覆盖。
+    /// 防护：`seen` 路径 WeakSet（进/出删，拦自引用环且不误伤共享组对象的 DAG）+
+    /// 深度上限 4（链长 >4 即失败）。**route 与 schema 同源一趟取**，否则「路由表里有、
+    /// 契约表没有」会退化成声明不生效。
     /// 复用 run_module 的 driver/KillSwitch/checkin 管道（其注释同样适用）。
     pub async fn introspect_module(
         &self,
@@ -1256,16 +1280,45 @@ impl Bridge {
             .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
         let body = format!(
             "const m = await import(\"{spec}\");\n\
-             const out = {{}};\n\
-             for (const k of [\"get\",\"post\",\"put\",\"del\",\"patch\",\"head\",\"options\"]) {{\n\
-               const fn = m.default && m.default[k];\n\
-               if (typeof fn === \"function\") {{\n\
-                 out[k] = {{\n\
-                   route: fn.route === undefined ? null : String(fn.route),\n\
-                   schema: fn.schema === undefined ? null : fn.schema,\n\
-                 }};\n\
+             const VERBS = new Set([\"get\",\"post\",\"put\",\"del\",\"patch\",\"head\",\"options\"]);\n\
+             const out = [];\n\
+             const seen = new WeakSet();\n\
+             const resolve = (own, rp) =>\n\
+               own === null ? rp :\n\
+               own.charAt(0) === \"/\" ? own :\n\
+               rp ? rp + \"/\" + own : own;\n\
+             const walk = (obj, prefix, rp, name, depth) => {{\n\
+               const at = prefix.join(\".\") || \"<root>\";\n\
+               if (depth > 4) throw new Error(\"handler group nested deeper than 4 levels at \" + at);\n\
+               if (seen.has(obj)) throw new Error(\"circular handler group at \" + at);\n\
+               seen.add(obj);\n\
+               const lraw = obj.route;\n\
+               const layer = (typeof lraw === \"string\" && lraw !== \"\")\n\
+                 ? resolve(String(lraw), rp)\n\
+                 : (rp ? rp + \"/\" + name : name);\n\
+               for (const k of Object.keys(obj)) {{\n\
+                 if (k === \"route\" && typeof obj[k] === \"string\") continue;\n\
+                 const v = obj[k];\n\
+                 if (VERBS.has(k)) {{\n\
+                   if (typeof v !== \"function\")\n\
+                     throw new Error(\"verb key '\" + k + \"' at \" + at + \" is \" + (v === null ? \"null\" : typeof v) + \", expected handler function\");\n\
+                   const raw = v.route;\n\
+                   const own = (raw === undefined || raw === null || raw === \"\") ? null : String(raw);\n\
+                   out.push({{\n\
+                     chain: prefix.concat(k).join(\".\"),\n\
+                     route: resolve(own, layer) || null,\n\
+                     schema: v.schema === undefined ? null : v.schema,\n\
+                   }});\n\
+                 }} else {{\n\
+                   if (v === null || typeof v !== \"object\" || Array.isArray(v))\n\
+                     throw new Error(\"non-verb key '\" + k + \"' at \" + at + \" is \" + (Array.isArray(v) ? \"array\" : (v === null ? \"null\" : typeof v)) + \", expected nested group object\");\n\
+                   walk(v, prefix.concat(k), layer, k, depth + 1);\n\
+                 }}\n\
                }}\n\
-             }}\n\
+               seen.delete(obj);\n\
+             }};\n\
+             const d = m.default;\n\
+             if (d !== undefined && d !== null) walk(d, [], \"\", \"\", 1);\n\
              json.ok(out);\n"
         );
         let code = driver_script(&body);
@@ -2306,8 +2359,170 @@ mod tests {
         assert_eq!(cap3.status, 200, "合规请求不得被误拦");
     }
 
+    /// v0.1.64 嵌套 handler 组：driver 沿 handler 链逐段计算式取值。
     #[tokio::test(flavor = "current_thread")]
-    async fn method_not_exported_is_405() {
+    async fn run_module_dispatches_nested_handler_chain() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "const cccc = { get() { json.ok({ where: \"cccc.get\" }); } };\n\
+             export default { post() { json.ok({ where: \"post\" }); }, cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        let t = std::time::Duration::from_secs(5);
+        for (chain, want) in [("cccc.get", "cccc.get"), ("post", "post")] {
+            let cap = b
+                .run_module(&api, chain, RequestInfo::default(), t)
+                .await
+                .unwrap();
+            assert_eq!(
+                cap.status,
+                200,
+                "chain {chain}: {}",
+                String::from_utf8_lossy(&cap.body)
+            );
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["data"]["where"], json!(want), "chain {chain}");
+        }
+    }
+
+    /// 段名红线：`__proto__` / `constructor` / `prototype` / 空段 / 含 `/` → 404
+    /// （计算式访问前的排除先于取值；手改/旧 routes.js 的纵深防护）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_bad_segments_are_404() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "const cccc = { get() { json.ok({}); } };\n\
+             export default { cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        for chain in [
+            "cccc.__proto__",
+            "cccc.constructor",
+            "cccc.prototype",
+            "cccc.get/evil",
+            "",
+            "cccc..get",
+        ] {
+            let cap = b
+                .run_module(
+                    &api,
+                    chain,
+                    RequestInfo::default(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                cap.status,
+                404,
+                "chain {chain:?}: {}",
+                String::from_utf8_lossy(&cap.body)
+            );
+        }
+    }
+
+    /// 链上任意一段缺失（含中间段）→ 404「no handler」。
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_missing_chain_is_404() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "const cccc = { get() { json.ok({}); } };\n\
+             export default { cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        for chain in ["cccc.post", "nope.get", "cccc.get.deeper"] {
+            let cap = b
+                .run_module(
+                    &api,
+                    chain,
+                    RequestInfo::default(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                cap.status,
+                404,
+                "chain {chain:?}: {}",
+                String::from_utf8_lossy(&cap.body)
+            );
+        }
+    }
+
+    /// 末段不是函数（手改 routes.js 指到对象属性）→ 405，不进 JS。
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_non_function_leaf_is_405() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "const cccc = { get: { nested: 1 } };\n\
+             export default { cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        let cap = b
+            .run_module(
+                &api,
+                "cccc.get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 405, "{}", String::from_utf8_lossy(&cap.body));
+    }
+
+    /// 非标识符段名（连字符组名）经计算式访问正确命中。
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_non_identifier_segment_hits() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "const userList = { get() { json.ok({ ok: true }); } };\n\
+             export default { \"user-list\": userList };\n",
+        )]);
+        let b = module_bridge(&root);
+        let cap = b
+            .run_module(
+                &api,
+                "user-list.get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+    }
+
+    /// 兼容：default 导出是**函数**且 handler 挂其属性（旧语义读 `m.default[method]`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_function_default_still_works() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "export default function api() {}\n\
+             api.get = function () { json.ok({ fn: true }); };\n",
+        )]);
+        let b = module_bridge(&root);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+    }
+
+    /// 链上缺段（含顶层动词未导出）→ 404「no handler」（v0.1.64 §四 driver 语义；
+    /// 旧版顶层缺失方法为 405，随嵌套链统一为 404——「存在但非函数」才是 405，
+    /// 见 `run_module_non_function_leaf_is_405`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_handler_segment_is_404() {
         let _t = transpile_serial();
         let (root, api) = mod_fx(&[("u/f/api.ts", "export default { get() { json.ok({}); } };\n")]);
         let b = module_bridge(&root);
@@ -2320,7 +2535,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(cap.status, 405, "{}", String::from_utf8_lossy(&cap.body));
+        assert_eq!(cap.status, 404, "{}", String::from_utf8_lossy(&cap.body));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2395,12 +2610,212 @@ mod tests {
         )]);
         let b = module_bridge(&root);
         let v = b.introspect_module(&api).await.unwrap();
-        // v0.1.44：内省改为 {"route":..,"schema":..} 双字段（route 与契约同源一趟取）。
-        assert_eq!(v["get"]["route"], json!("{id}"), "{v}");
-        assert_eq!(v["get"]["schema"], json!(null), "{v}");
-        assert_eq!(v["del"]["route"], json!(null), "{v}");
-        assert_eq!(v["del"]["schema"], json!(null), "{v}");
-        assert!(v.get("post").is_none(), "{v}"); // 未导出 → 缺席
+        // v0.1.64：扁平 leaf 数组；route 与 schema 同源一趟取（v0.1.44 语义不变）。
+        assert_eq!(leaf(&v, "get")["route"], json!("{id}"), "{v}");
+        assert_eq!(leaf(&v, "get")["schema"], json!(null), "{v}");
+        assert_eq!(leaf(&v, "del")["route"], json!(null), "{v}");
+        assert_eq!(leaf(&v, "del")["schema"], json!(null), "{v}");
+        assert_eq!(v.as_array().unwrap().len(), 2, "{v}"); // 未导出的 post 缺席
+    }
+
+    /// 取某个 leaf（按 handler 链在内省数组里查找）；嵌套组用例共用。
+    fn leaf<'a>(v: &'a Value, chain: &str) -> &'a Value {
+        v.as_array()
+            .expect("introspect output is a flat leaf array")
+            .iter()
+            .find(|l| l["chain"] == chain)
+            .unwrap_or_else(|| panic!("no leaf {chain:?} in {v}"))
+    }
+
+    /// v0.1.64 嵌套 handler 组：内省产出**扁平 leaf 数组**（`{chain, route, schema}`），
+    /// route 为组前缀解析后的有效路由（Rust 词汇：null = 目录镜像 / "/x" = 根级 /
+    /// "seg/.." = 相对目录镜像）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_nested_groups_yield_flat_leaves() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "aaa/bbb/api.ts",
+            "function get() { json.ok({}); }\n\
+             const cccc = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+               list: { get: () => { json.ok({}); } },\n\
+             };\n\
+             cccc.get.schema = { query: { type: \"object\" } };\n\
+             export default { get, cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "get")["route"], json!(null), "{v}");
+        assert_eq!(leaf(&v, "cccc.get")["route"], json!("cccc"), "{v}");
+        assert_eq!(leaf(&v, "cccc.post")["route"], json!("cccc"), "{v}");
+        assert_eq!(
+            leaf(&v, "cccc.list.get")["route"],
+            json!("cccc/list"),
+            "{v}"
+        );
+        // 元数据隔离：schema 只挂在 handler 函数上，不生成任何路由
+        assert_eq!(
+            leaf(&v, "cccc.get")["schema"],
+            json!({ "query": { "type": "object" } }),
+            "{v}"
+        );
+        assert!(leaf(&v, "cccc.post")["schema"] == json!(null), "{v}");
+        assert_eq!(v.as_array().unwrap().len(), 4, "{v}");
+    }
+
+    /// 组级 `.route` 作整组默认前缀；动词自身 `.route` 优先覆盖（绝对/相对皆可）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_group_route_is_default_prefix_and_verb_overrides() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const cccc = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+             };\n\
+             cccc.route = \"/x\";\n\
+             cccc.post.route = \"/y\";\n\
+             export default { cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "cccc.get")["route"], json!("/x"), "{v}");
+        assert_eq!(leaf(&v, "cccc.post")["route"], json!("/y"), "{v}");
+    }
+
+    /// 相对组 `.route`：动词自身相对路由按「父前缀 + / + R」解析。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_relative_routes_resolve_against_layer_prefix() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "r/api.ts",
+            "const cccc = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+             };\n\
+             cccc.route = \"sub\";\n\
+             cccc.post.route = \"deep/thing\";\n\
+             function put() { json.ok({}); }\n\
+             put.route = \"me\";\n\
+             export default { put, cccc };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "put")["route"], json!("me"), "{v}");
+        assert_eq!(leaf(&v, "cccc.get")["route"], json!("sub"), "{v}");
+        assert_eq!(
+            leaf(&v, "cccc.post")["route"],
+            json!("sub/deep/thing"),
+            "{v}"
+        );
+    }
+
+    /// 文件层（root default）`.route` 同样作本层默认前缀（§二 语义表「文件」行）：
+    /// 绝对 → 根级；动词自身 `.route` 优先覆盖。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_file_level_route_is_default_prefix() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "f/api.ts",
+            "function get() { json.ok({}); }\n\
+             function post() { json.ok({}); }\n\
+             post.route = \"/y\";\n\
+             export default { get, post, route: \"/x\" };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "get")["route"], json!("/x"), "{v}");
+        assert_eq!(leaf(&v, "post")["route"], json!("/y"), "{v}");
+    }
+
+    /// 判别红线（§二.A）：verb 键非函数 / 非 verb 键挂函数、数组、基元 → 可操作 Err，
+    /// 且错误信息点名出事的键（不再是静默丢弃）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_rejects_illegal_verb_and_group_values() {
+        let _t = transpile_serial();
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "v/api.ts",
+                "export default { get: { nested: 1 } };\n",
+                "get",
+            ),
+            (
+                "f/api.ts",
+                "function helper() {}\nexport default { helper };\n",
+                "helper",
+            ),
+            ("a/api.ts", "export default { upload: [1, 2] };\n", "upload"),
+            ("p/api.ts", "export default { upload: 1 };\n", "upload"),
+            ("n/api.ts", "export default { get: null };\n", "get"),
+        ];
+        for (rel, src, key) in cases {
+            let (root, api) = mod_fx(&[(rel, src)]);
+            let b = module_bridge(&root);
+            let e = b.introspect_module(&api).await.unwrap_err();
+            assert!(
+                e.to_string().contains(key),
+                "case {rel}: error should name the offending key {key:?}: {e}"
+            );
+        }
+    }
+
+    /// 循环引用（`a.self = a`）→ 内省期即失败，不递归到超时/爆栈（S1 防护）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_rejects_circular_group() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "c/api.ts",
+            "const a = { get: () => { json.ok({}); } };\n\
+             a.self = a;\n\
+             export default { a };\n",
+        )]);
+        let b = module_bridge(&root);
+        let e = b.introspect_module(&api).await.unwrap_err();
+        assert!(e.to_string().contains("circular"), "{e}");
+    }
+
+    /// 深度上限 4：链长 5（`a.b.c.d.get`）→ 失败；链长 4（`a.b.c.get`）→ 放行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_depth_limit_is_four() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "d/api.ts",
+            "const d = { get: () => { json.ok({}); } };\n\
+             const c = { d };\n\
+             const b = { c };\n\
+             const a = { b };\n\
+             export default { a };\n",
+        )]);
+        let b = module_bridge(&root);
+        let e = b.introspect_module(&api).await.unwrap_err();
+        assert!(e.to_string().contains("deep"), "{e}");
+
+        let (root, api) = mod_fx(&[(
+            "d/api.ts",
+            "const c = { get: () => { json.ok({}); } };\n\
+             const b = { c };\n\
+             const a = { b };\n\
+             export default { a };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "a.b.c.get")["route"], json!("a/b/c"), "{v}");
+    }
+
+    /// 同一组对象挂两个键（DAG，非环）→ 各自成 route，不得误报循环。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_allows_shared_group_object() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "s/api.ts",
+            "const shared = { get: () => { json.ok({}); } };\n\
+             export default { a: shared, b: shared };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(leaf(&v, "a.get")["route"], json!("a"), "{v}");
+        assert_eq!(leaf(&v, "b.get")["route"], json!("b"), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

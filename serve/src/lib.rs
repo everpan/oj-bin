@@ -590,7 +590,12 @@ async fn handle_api(
         .and_then(|p| p.strip_prefix(prefix).map(|s| s.to_string()));
     if let Some(path) = crate::routes::normalize(uri.path()) {
         match table.lookup(&path, verb) {
-            Lookup::Hit { file, params } => {
+            Lookup::Hit {
+                file,
+                params,
+                handler,
+                ..
+            } => {
                 return run_route(
                     st,
                     headers,
@@ -601,6 +606,7 @@ async fn handle_api(
                     &path,
                     file,
                     params,
+                    handler,
                 )
                 .await;
             }
@@ -627,6 +633,7 @@ async fn handle_api(
                     uri.path(),
                     file,
                     params,
+                    m.to_string(),
                 )
                 .await;
             }
@@ -728,10 +735,8 @@ async fn run_route(
     full_path: &str,
     file: PathBuf,
     params: HashMap<String, String>,
+    handler: String,
 ) -> Response {
-    let m = crate::routes::method_name(verb)
-        .expect("checked by caller")
-        .to_string();
     // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
     // 防两处准入语义漂移）。401/400 以 Response 返回。
     let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base) {
@@ -795,7 +800,7 @@ async fn run_route(
         .find(|(p, _)| path_matches(std::slice::from_ref(p), full_path))
         .map(|(_, d)| *d)
         .or(st.timeout);
-    let mut resp = match st.actor.run_module(file, m, req, timeout, true).await {
+    let mut resp = match st.actor.run_module(file, handler, req, timeout, true).await {
         Ok(cap) => capture_response(cap),
         // 超时熔断 → 408。
         Err(e) if e.timeout => fail_response(408, &e.msg),
@@ -1038,8 +1043,13 @@ async fn dispatch_meta_handler(
             _ => None,
         })
         .ok_or_else(|| format!("{handler:?} 不在任何 api 挂载前缀下（拼错了？）"))?;
-    let (file, params) = match table.lookup(&norm, "GET") {
-        Lookup::Hit { file, params } => (file, params),
+    let (file, params, chain) = match table.lookup(&norm, "GET") {
+        Lookup::Hit {
+            file,
+            params,
+            handler,
+            ..
+        } => (file, params, handler),
         Lookup::Conflict(m) => return Err(format!("{handler:?} 路由冲突：{m}")),
         Lookup::MethodNotAllowed => return Err(format!("{handler:?} 未映射 GET 方法")),
         Lookup::NotFound => return Err(format!("{handler:?} 不在路由表（拼错了？）")),
@@ -1063,13 +1073,9 @@ async fn dispatch_meta_handler(
         .actor
         .run_module(
             file,
-            // JS 侧方法名（"get"，不是 HTTP 动词）——`run_module` 用它索引 `default[method]`，
-            // 传 "GET" 会命中「方法未导出」→ json.fail(405)。
-            crate::routes::method_name("GET")
-                .expect("GET is mapped")
-                .to_string(),
-            req,
-            st.timeout,
+            // handler 链（v0.1.64：meta handler 也可以是嵌套组 verb；顶层即 "get"）——
+            // `run_module` 用它逐段索引 default，传 HTTP 动词 "GET" 会找不到 handler。
+            chain, req, st.timeout,
             // 内部合成派发：不是外部输入，契约校验失败只会静默降级页面 meta。
             false,
         )

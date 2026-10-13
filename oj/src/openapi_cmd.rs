@@ -114,6 +114,7 @@ pub fn discover_routes(
                 method: e.method,
                 pattern: format!("/{b}/{}", e.pattern.trim_matches('/')),
                 file: format!("{module}-{version}/{}", e.file),
+                handler: e.handler,
                 schema: e.schema,
             });
         }
@@ -615,6 +616,7 @@ mod tests {
             method: method.to_string(),
             pattern: pattern.to_string(),
             file: file.to_string(),
+            handler: None,
             schema: Some(schema),
         }];
         let (t, fail) = RouteTable::from_entries(&dir, &entries);
@@ -710,6 +712,7 @@ mod tests {
                 method: "get".to_string(),
                 pattern: "/v1/api/user/{id}".to_string(),
                 file: "user-0.1.0/api.js".to_string(),
+                handler: None,
                 schema: None,
             }],
         );
@@ -751,11 +754,13 @@ mod tests {
                 method: "get".to_string(),
                 pattern: "/v1/api/user/{id}".to_string(),
                 file: "user-0.1.0/_id_/api.js".to_string(),
+                handler: None,
             },
             serve::routes::RouteEntry {
                 method: "post".to_string(),
                 pattern: "/v1/api/admin/role".to_string(),
                 file: "admin-0.1.0/role/api.js".to_string(),
+                handler: None,
                 schema: None,
             },
         ];

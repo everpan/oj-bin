@@ -449,6 +449,8 @@ interface VarsApi {
 declare global {
   interface Function {
     route?: string;
+    /** handler 入参契约（v0.1.44 `.schema`；嵌套组动词同样可挂，键 = (文件, handler 链)） */
+    schema?: Record<string, unknown>;
   }
 
   // DB(name) 返回的命名数据库实例。（在 declare global 内：业务代码要能**点名**

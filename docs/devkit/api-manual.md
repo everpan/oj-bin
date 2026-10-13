@@ -1,6 +1,6 @@
 # oj TS API 开发手册
 
-适用版本：API 面 v0.2（二进制版本号见 `oj/Cargo.toml`）
+适用版本：API 面 v0.2（二进制版本号见 `oj --version`）
 
 本手册写给**用 oj 框架开发业务项目**的开发者与 AI agent，内容包括：怎么组织模块、
 怎么写 `api.ts` / `ws.ts` handler、怎么用注入的全局对象、怎么写测试、怎么配服务、
@@ -8,9 +8,13 @@
 oj 是把 V8（deno_core）嵌进 Rust 的低代码后端框架：业务逻辑用 TS handler 编写，
 运行时注入 `json` / `db` / `http` / `kv` / `blob` / `bus` / `es` 等全局对象，
 所有响应统一套 `{code,msg,data}` 信封写回 HTTP。这里说的「信封」就是那层固定的
-JSON 外壳：`code` 是状态码、`msg` 是消息、`data` 装业务数据。仓库内部实现见
-`docs/dev-guide.md`，部署排障细节见 `docs/ops-manual.md`。本手册随版本包 `devkit/`
-一同发布；API 签名以同目录 `global.d.ts` 为类型权威。
+JSON 外壳：`code` 是状态码、`msg` 是消息、`data` 装业务数据。本手册随版本包 `devkit/`
+一同独立发布，内容自洽（不依赖 oj 仓库内路径）；API 签名以同目录 `global.d.ts` 为类型权威。
+
+> **上下文独立性**：本文档（及同目录 `scenarios.md` / `SKILL.md` / `README.md`）随
+> `devkit/` 单独分发。文中示例路径（`src/...` / `tests/...` / `config.yaml` 等）均相对
+> **你的项目根**；完整可运行样例（sample 项目）见 oj 仓库
+> `sample/` 目录（github.com/everpan/oj-bin）。
 
 目录：1 快速开始 / 2 项目结构与模块约定 / 3 模块数据层 / 4 编写 api.ts /
 5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
@@ -140,7 +144,7 @@ curl 'http://localhost:9778/v1/api/hello/'
 模块各自绑不同库（`manifest.yaml` 的 `db:`）时，还须配 `--module` 逐组合跑——见
 `scenarios.md` 场景 6。
 
-构建细节见第 11 章；完整可跑样例见仓库 `sample/`（`sample/README.md`）。
+构建细节见第 11 章；完整可跑样例见 oj 仓库 `sample/` 目录（github.com/everpan/oj-bin）。
 
 ## 2. 项目结构与模块约定
 
@@ -316,7 +320,7 @@ schema 回滚**没有自动机制**（refinery 语义，只前向）：破坏性
 ### 两种 handler 写法
 
 **写法一：同步函数 + `.then().catch()`**。方法体同步返回，异步调用走 Promise 链；
-runtime 会泵 event loop 直到所有 Promise 落定后再写回响应（摘自 `sample/src/user/account/api.ts`）：
+runtime 会泵 event loop 直到所有 Promise 落定后再写回响应（摘自 `src/user/account/api.ts`）：
 
 ```ts
 function get(): void {
@@ -329,7 +333,7 @@ function get(): void {
 export default { get };
 ```
 
-**写法二：`async` 函数**（driver 会 `await fn()`；摘自 `sample/src/news/api.ts`）：
+**写法二：`async` 函数**（driver 会 `await fn()`；摘自 `src/news/api.ts`）：
 
 ```ts
 export default {
@@ -358,7 +362,7 @@ if (!b.name) { json.fail(400, "name required"); return; }
 返回原始帧字节）：
 
 ```ts
-// ws.ts：帧型忠实回显（可运行案例 sample/src/echo-bin/ws.ts）
+// ws.ts：帧型忠实回显（可运行案例 src/echo-bin/ws.ts）
 export default {
   async message() {
     const text = http.body; // 二进制帧为 null
@@ -374,7 +378,7 @@ URL = `{base}/{module}/{...path}/{feature}/` → `<dir>/{module}/{...path}/{feat
 尾斜杠有无皆可；`{base}` = api 挂载的 `prefix`（v0.1.58 挂载模型；缺省挂载即 `/v1/api`）。
 
 handler 函数挂 `.route` 属性即**替换**目录镜像路由，支持 matchit 语法
-（摘自 `sample/src/user/item/api.ts`）：
+（摘自 `src/user/item/api.ts`）：
 
 ```ts
 function detail(): void {
@@ -423,6 +427,77 @@ api 挂载内：路由表（含 `.route` 参数路由与 `_name_` 目录参数�
 其余方法 405）。API 永远优先于静态文件。内建端点 `{api挂载prefix}/health`、
 `{api挂载prefix}/plugins`、`{api挂载prefix}/blob/{key}` 逐 api 挂载注册。
 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ 404。
+
+### 嵌套 handler 组（v0.1.64）
+
+default 导出里**非动词键 + 对象值**即一个嵌套 handler 组：一个文件挂多个同动词端点，
+不再必须拆子目录。组名即路径段（与目录镜像同构），组可再嵌子组（上限 4 层）。
+
+**何时采用（以领域驱动设计为参照，先读这段再决定形态）**。DDD 概念到 oj 落点的对应：
+
+| DDD 概念 | oj 落点 | 说明 |
+|---|---|---|
+| 限界上下文 | **模块**（`manifest.yaml`） | 先按业务边界分模块，不在一个模块里堆多个上下文 |
+| 聚合根 | **实体组**（`asset`） | 同一聚合的操作（动词）聚在组内——这是嵌套组的主用例 |
+| 聚合内的子实体 / 从属资源 | **子组**（`asset.upload`） | 没有独立生命周期，随聚合根一起路由 |
+| 独立聚合 | **独立目录 / 文件** | 不塞进别人的组——各自演化、各自鉴权 |
+
+三档形态按聚合判据选择：
+
+| 形态 | 适合 | 代价 |
+|---|---|---|
+| 拆子目录（`asset/get/api.ts`、`asset/post/api.ts`） | **不同聚合**：端点各自独立演化、多人分权、权限面不同 | 目录膨胀：一个聚合三五个动词就占三五行 `find` 结果；跨端点共享 helper 要走 `_shared` |
+| **嵌套组（同一聚合的多操作，推荐）** | 同一聚合根的多个同动词端点（资产的 读/建/上传），或一组共享前缀的对外端点 | 单文件变大——按聚合分段即可控；文件仍然过胖是**聚合过胖**的信号（DDD：拆聚合），不是回退动词目录的理由 |
+| 单文件平铺所有动词 | 模块根本身就是单一聚合且操作极少（≤3 个） | 动词一多，`.route`/`.schema` 在文件里交错难读 |
+
+一句话：**同一聚合的操作进同一个实体组，不同聚合才拆目录**——在「多文件夹」与「大文件」
+之间取平衡。可运行示例：`src/nest/api.ts`（L1 用例 `tests/nest.test.ts`）。
+
+```ts
+// src/nest/api.ts —— 实体为根：asset 的集合读/建/上传聚在一组
+function get(): void { json.ok({ where: "get" }); }              // GET  /nest/
+
+const asset = {
+  get: () => { json.ok({ where: "asset.get", state: http.query.state }); }, // GET  /nest/asset
+  post: () => { json.ok({ where: "asset.post" }); },             // POST /nest/asset
+  upload: {                                                      // 子资源（再嵌一层）
+    post: async () => { json.ok({ where: "asset.upload.post" }); }, // POST /nest/asset/upload
+  },
+};
+asset.get.schema = { query: { type: "object", required: ["state"],
+  properties: { state: { type: "string" } } } };                 // 元数据只挂函数，不是路由
+
+export default { get, asset };
+```
+
+组级 `.route` 作**整组默认前缀**，动词自身 `.route` 优先覆盖（规则与顶层 `.route` 相同：
+绝对 `/` 开头挂 base 根下，否则相对本层前缀）——适合把整组实体挂到对外根级 URL：
+
+```ts
+const anchor = {
+  post: async () => { json.ok({ anchor: http.param("anchor", "") }); },
+};
+anchor.route = "/x/{anchor}/upload";   // 组前缀：POST /x/{anchor}/upload 命中 anchor.post
+export default { anchor };             // 组内动词未单独挂 .route 时沿用之前缀
+```
+
+判别红线（**启动/`oj build` 期可操作报错，不再静默丢弃**）：
+
+| 键 | 值 | 语义 |
+|---|---|---|
+| 动词键（`get/post/put/del/patch/head/options`） | 函数 | handler 端点；`.route` / `.schema` 等属性一律读作元数据 |
+| 动词键 | 对象 / 数组 / 基元 / null | **报错**（动词键下不允许挂子组或常量） |
+| 非动词键 | 普通对象 | 子组，递归解析 |
+| 非动词键 | 函数 / 数组 / 基元 / null | **报错**（此前的静默丢弃陷阱） |
+
+- 组名可以是连字符等非标识符（`"audit-log"`），经计算式访问命中；段名不得含 `/`、
+  不得为 `__proto__` / `constructor` / `prototype`（手改 `routes.js` 注入这些段 →
+  release 启动失败）。
+- 组对象的 `.route`（字符串）是本层前缀声明，不当子键；`route` 因此是保留键。
+- 嵌套上限 4 层；自引用（`const a = {}; a.self = a;`）在内省期即失败，不会拖死启动。
+- 挂 `.route` 的组动词同样**替换目录镜像**：镜像 URL 不再可达（404）。
+- release：`oj build` 为嵌套行写入 `handler` 链字段（顶层动词行不写，旧产物无此字段
+  照常启动）；路由事实唯一来源仍是 `routes.js`（第 11 章）。
 
 ### 入参契约 `.schema`（v0.1.44）
 
@@ -510,7 +585,7 @@ export default {
 （如 kv 写入）照常生效；但钩子里的 `ws.send` 离帧受 RFC 6455 关闭握手限制，无法送达
 客户端。需要离帧可见时，用服务端 `ws.close()` 收尾。
 
-运行案例（摘自 `sample/src/news/ws.ts`）：
+运行案例（摘自 `src/news/ws.ts`）：
 
 ```ts
 export default {
@@ -528,7 +603,7 @@ export default {
 ### 帧内发布：`ws.ts` 里直接 `bus.publish`
 
 `bus.publish` 没有上下文限制（只有 `bus.subscribe` 限 WS 连接），帧处理器可以直接当
-「广播泵」用。可运行案例 `sample/src/news/chat/ws.ts`——聊天室，任意连接发帧，
+「广播泵」用。可运行案例 `src/news/chat/ws.ts`——聊天室，任意连接发帧，
 所有订阅者收广播：
 
 ```ts
@@ -594,8 +669,8 @@ import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必�
   `oj build` fail-fast（此前静默悬空，release 运行期才炸）。
 - 编辑器/测试工具对齐：`tsconfig.json` 的 `paths` 按同规则镜像
   （`"#/*": ["./src/*"]` + `"#*": [各模块 /*]`）。值须带 `./` 前缀——无 `baseUrl` 时非相对值
-  会被 vite/esbuild 警告（见 `sample/tsconfig.json`）。L2 vitest 走
-  `sample/unit/vitest.config.ts` 的 `resolveId` 插件（同规则镜像）。
+  会被 vite/esbuild 警告（见 `tsconfig.json`）。L2 vitest 走
+  `unit/vitest.config.ts` 的 `resolveId` 插件（同规则镜像）。
 - `#` 与 Node `package.json#imports` 共用命名空间：项目若声明 `#` 开头的 imports 键，
   `oj build` 直接失败（避免 Node/vite 与 oj 两套解析器分叉）。
 
@@ -609,7 +684,7 @@ import { positiveId, requireRole } from "../_shared/validate";   // → ../_shar
 
 **跨模块相对导入**（如 `idp` 引 `auth` 的工具）：dev 下直接可跑；build 时改写为指向
 目标模块版本目录的相对路径——目标模块未构建过则报错，先 `oj build auth` 再
-`oj build idp`（摘自 `sample/src/idp/login/api.ts`）：
+`oj build idp`（摘自 `src/idp/login/api.ts`）：
 
 ```ts
 import { nowSecs } from "../../auth/_shared/util";
@@ -680,7 +755,7 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `jwt.sign / verify / accessDuration / refreshDuration` | JWT 签发与验签（`auth:` 段注入；未配置调用报错，见第 8 章） |
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
-| `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（sample/src/sso/ 参考实现），详见第 10 章「sso」 |
+| `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（src/sso/ 参考实现），详见第 10 章「sso」 |
 | `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
 | `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
@@ -1150,7 +1225,7 @@ const seq = Number(rows[0].m) + 1;
 （`redis.get / redis.set / redis.del / redis.expire / redis.incr` 与上表同签名——二者同源同面。）
 
 ```ts
-// 读穿缓存（摘自 sample/src/order/detail/api.ts，改编）
+// 读穿缓存（摘自 src/order/detail/api.ts，改编）
 const hit = await kv.get(key);
 if (hit !== null) { json.ok({ cached: true, data: JSON.parse(hit) }); return; }
 ```
@@ -1173,7 +1248,7 @@ auth 会话也在同一 Redis（多实例共享的前提）；未配置时均为
 | `blob.move` | `move(src: string, dst: string): Promise<boolean>` | **服务端搬移（v0.1.47，ABI 11）：src 不再存在**。local 同父目录 = `fs::rename`（原子、零字节），跨目录 = copy + unlink；s3 = CopyObject + DeleteObject。`src == dst` 为 no-op |
 | `blob.readRange` | `readRange(key: string, offset: number, len: number): Promise<Uint8Array>` | **区间读（v0.1.47，ABI 11）：短读截断**——`offset + len` 越过对象尾部只返回实际可读字节（可能短于 `len`），`offset` 已过尾部返回**空数组**；key 不存在报错；`offset`/`len` 为负 / 非整数 / NaN 报错（`blob readRange: offset must be a non-negative integer`）。后端不支持区间读时宿主回落 `get` 全量再切片（local/s3 均原生支持） |
 
-**上传四件套完整例子**（摘自 `sample/src/upload/api.ts`）：
+**上传四件套完整例子**（摘自 `src/upload/api.ts`）：
 
 ```ts
 export default {
@@ -1370,7 +1445,7 @@ const jobId = res.data.jobId;          // 入队成功；真实结果稍后到�
 bus.subscribe("mail.result");
 ```
 
-配置（详见 `sample/config.yaml`；`smtp:` 顶层除 `workers`/`queue_capacity` 外每个键都是一个 profile）：
+配置（详见 `config.yaml`；`smtp:` 顶层除 `workers`/`queue_capacity` 外每个键都是一个 profile）：
 
 ```yaml
 smtp:
@@ -1581,7 +1656,7 @@ if (r.ok) {
 无 MQ 式 task 门禁（连接无 offset/ack 消费会话语义）。
 
 长任务里作消费端取数（`src/tasks/task_*.ts`，写法同「命名 MQ 客户端与长任务」，
-可运行案例 `sample/src/tasks/task_wsclient.ts`）：
+可运行案例 `src/tasks/task_wsclient.ts`）：
 
 ```ts
 const ws = new WebSocket("ws://localhost:9778/v1/api/news/ws");
@@ -1881,7 +1956,7 @@ while (!tasks.stopping()) {
 - 与 `bus.*` 的关系：`bus` 是进程内/分布式**广播**（fire-and-forget），MQ 客户端是
   **持久队列消费**（有 offset/ack 语义）。需要可靠逐条消费用后者。
 
-最小无 broker 示例见 `sample/src/tasks/task_demo.ts`（每秒心跳）。
+最小无 broker 示例见 `src/tasks/task_demo.ts`（每秒心跳）。
 
 ### 池化任务与 cron（v0.1.28）
 
@@ -2033,11 +2108,11 @@ config `auth:` 段存在即启用两层能力：**Bearer 守卫**（oj-auth 插�
 `jwt_secret` 配了却为空串 → 启动 fail-fast（不静默跳过）。
 
 **auth 端点是业务路由，不是内置路由**：`login` / `refresh` / `logout` 由普通 JS 模块实现
-（sample 提供参考实现 `sample/src/auth/`，目录镜像路由 `POST /auth/login|refresh|logout`）：
+（sample 提供参考实现 `src/auth/`，目录镜像路由 `POST /auth/login|refresh|logout`）：
 `db` 查用户表、`bcrypt.verify` 校验密码、`jwt.sign` 签发 access token，refresh 为不透明
 随机串 + KV session（轮换）。框架不内置这些路由——业务可整模块替换或改名。
 
-| 端点（sample/src/auth/） | 请求体 | 响应 data |
+| 端点（src/auth/） | 请求体 | 响应 data |
 |---|---|---|
 | `POST /auth/login` | `{"username","password"}` | `{"access_token","refresh_token","expires_in"(秒),"user":{"id","roles"}}` |
 | `POST /auth/refresh` | `{"refresh_token"}` | 同上（**轮换**：旧 refresh 立即失效） |
@@ -2102,7 +2177,7 @@ auth 段其余字段（`jwt_secret` 生产必改且空串启动 fail-fast、`sig
 access/refresh 时长）见第 10 章配置表。
 
 ```ts
-// 受保护路由：读验签后的用户身份（sample/src/auth_demo/me/api.ts）
+// 受保护路由：读验签后的用户身份（src/auth_demo/me/api.ts）
 export default {
   get() {
     json.ok({ user: http.user });
@@ -2197,28 +2272,28 @@ tenant_id」时 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明
 
 ### auth_demo 走读（sample）
 
-`sample/src/auth_demo/`：`me`（受保护，返回 `http.user`）与 `health`（匿名，
-在 `anonymous_paths`）两个路由；`sample/seed.sql` 已建 `users` 表并写入 demo 用户
+`src/auth_demo/`：`me`（受保护，返回 `http.user`）与 `health`（匿名，
+在 `anonymous_paths`）两个路由；`seed.sql` 已建 `users` 表并写入 demo 用户
 （`demo` / `demo1234`，角色 admin）。走读顺序：login 拿 token → 带 Bearer 打
 `/auth_demo/me/` → refresh 轮换 → logout 失效。sample 同时开了 tenant，
-curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `sample/src/auth_demo/README.md`）。
+curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `src/auth_demo/README.md`）。
 
 ### OIDC 演示走读（sample：idp + oidc）
 
-`sample/src/idp/` 是同进程 **OP**（`/.well-known/openid-configuration`、`jwks.json`、
+`src/idp/` 是同进程 **OP**（`/.well-known/openid-configuration`、`jwks.json`、
 `authorize`、`login`、`token`、`userinfo`——标准协议端点用 `json.raw` 出裸 JSON）；
-`sample/src/oidc/` 是 **RP**（`login` → 302 授权 → `callback` 换会话桥接成本地
+`src/oidc/` 是 **RP**（`login` → 302 授权 → `callback` 换会话桥接成本地
 `auth` token → `logout`）。OIDC 的 302 跳转腿带不了自定义头，故 demo 在
 `tenant.anonymous_paths` 与 `auth.anonymous_paths` **两条列表**里都匿名
 `/oidc/*`、`/idp/*`、`/idp/.well-known/*`（窄面：discovery 比 `/idp/*` 深一层，故单列；
 auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 章 tenant/auth）；
 `oidc.rp`/`oidc.clients` 配置驱动，对接外部 IdP 只改 config。curl 全链路见
-`sample/README.md` 的「OIDC 演示」；实现走读（含 mermaid 时序图）与接入手册见
+oj 仓库 `sample/`（github.com/everpan/oj-bin）的「OIDC 演示」；实现走读（含 mermaid 时序图）与接入手册见
 `oidc-implementation.md` / `oidc-integration.md`（仓库在 `docs/` 下，发行包随 devkit
 同目录附带）。
 
 > 分层注记：`oj-auth` 插件只是**守卫**（Bearer/cookie 验签 + 匿名路径 + CSRF），
-> `sample/src/auth/`、`sample/src/oidc/` 这些登录端点全是**普通业务模块**——守卫对
+> `src/auth/`、`src/oidc/` 这些登录端点全是**普通业务模块**——守卫对
 > 登录来源不可见。新增一种登录来源（企业 HTTP 表单 / CAS SSO 等）= 新写一个业务
 > 模块 + 匿名路径放行跳转腿，不改插件、不动 ABI；JIT 建号用「来源前缀键 +
 > 非法占位 password_hash（`bcrypt.verify` 恒 false）」。可照抄见 `scenarios.md` 场景 28。
@@ -2238,7 +2313,7 @@ auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 
 此前只扫首层，子目录里的 `*.test.ts` 会被静默忽略。
 
 ```bash
-./bin/oj test -c sample/config.yaml -d sample/src                 # human 摘要
+./bin/oj test -c config.yaml -d src                       # human 摘要
 ./bin/oj test -c config.yaml -d src --format junit --output l1.xml # CI 报告
 ```
 
@@ -2291,8 +2366,8 @@ describe("user account", () => {
 | API | 说明 |
 |---|---|
 | `client.get/post/put/del/patch/head/options(path, opts?)` | 进程内派发；`opts = { headers?, body? }`，返回 `ClientResp { status, headers, body, upgrade }`；`path` 相对 base（如 `"/user/account"`） |
-| `client.login(username, password, headers?)` | POST 业务路由 `/auth/login`（sample/src/auth/）→ 返回 `access_token`（失败抛错；`headers` 透传，如租户头） |
-| `client.ws(path)`（v0.1.16） | WS 帧测试面：`send(string\|Uint8Array)` / `next(ms?) → {binary,data}\|{closed:true}\|null` / `close()`；首次使用惰性起 127.0.0.1:0 本地服务（真实路由 + 帧循环）。**`send`/`next`/`close` 任一个都能建连**——`next()` 可单独读服务端主动推的首帧（connection 钩子 `ws.send` / bus 广播），不必先 `send`；文本帧 `data` 为 string（运行时无 `TextDecoder`，测试面自带 UTF-8 解码）。用例见 `sample/tests/ws-bin.test.ts` |
+| `client.login(username, password, headers?)` | POST 业务路由 `/auth/login`（src/auth/）→ 返回 `access_token`（失败抛错；`headers` 透传，如租户头） |
+| `client.ws(path)`（v0.1.16） | WS 帧测试面：`send(string\|Uint8Array)` / `next(ms?) → {binary,data}\|{closed:true}\|null` / `close()`；首次使用惰性起 127.0.0.1:0 本地服务（真实路由 + 帧循环）。**`send`/`next`/`close` 任一个都能建连**——`next()` 可单独读服务端主动推的首帧（connection 钩子 `ws.send` / bus 广播），不必先 `send`；文本帧 `data` 为 string（运行时无 `TextDecoder`，测试面自带 UTF-8 解码）。用例见 `tests/ws-bin.test.ts` |
 | `describe(name, fn)` / `it(name, fn)` / `beforeEach(fn)` | vitest 风格子集 |
 | `expect(actual)` | `.toBe / .toEqual / .toBeTruthy / .toBeFalsy / .toContain` |
 | `finish()` | 标记会话结束 |
@@ -2362,11 +2437,11 @@ CI 已内置（`.github/workflows/plugin-matrix.yml` 的 `sample-tests` job，�
 `release.yml` 的 `lint`）：`npm ci`（`unit/`）→ `npm run typecheck` →
 `cargo run --release -p xtask -- build`（workspace 构建，产出 `bin/oj` + 全部第一方插件。
 勿用 `cargo build -p oj`，那会按不同 feature 归一化重编 rusty_v8）→
-`./bin/oj test -c sample/config.yaml -d sample/src --format junit` → `npx vitest run`。
+`./bin/oj test -c config.yaml -d src --format junit` → `npx vitest run`。
 
 依赖管理：L2 的 vitest 与 typescript（类型检查用）声明在 `unit/package.json` 的
 `devDependencies`，与运行时依赖（如 `escape-goat`）隔离——被测物不携带测试工具；
-统一入口在 `sample/package.json`（`npm run test` = `typecheck` + `test:unit` + `test:api`）。
+统一入口在 `package.json`（`npm run test` = `typecheck` + `test:unit` + `test:api`）。
 
 ## 10. 配置 config.yaml
 
@@ -2694,7 +2769,7 @@ RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `
 | 键 | 说明 |
 |---|---|
 | `issuer` | OP 标识/发现基址（如 `http://localhost:9778/v1/api/idp`） |
-| `private_key_path` | RS256 私钥（PKCS#8 PEM，相对 config 目录；demo 用 `sample/config/oidc_rs256.pem`，与示例证书同性质，勿用于生产） |
+| `private_key_path` | RS256 私钥（PKCS#8 PEM，相对 config 目录；demo 用 `config/oidc_rs256.pem`，与示例证书同性质，勿用于生产） |
 | `rp` | RP 侧 `tenant → IdP` 映射：`issuer` / `client_id` / `client_secret` / `scope` |
 | `clients` | OP 侧 client 白名单：`secret` / `redirect_uris`（**精确串**，未命中绝不重定向）/ `tenant` |
 
@@ -2704,7 +2779,7 @@ RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `
 ### sso —— HTTP 表单 / CAS SSO 提供者注册表（段存在即启用）
 
 顶层 `http_sso:` 段（map：提供者名 → 配置）装配期注入；缺段调用 `sso.providers` 报
-`http sso not configured`。**登录端点是普通业务模块**（`sample/src/sso/` 参考实现，
+`http sso not configured`。**登录端点是普通业务模块**（`src/sso/` 参考实现，
 守卫只认签出的 token）——form 登录端点与 CAS 302 腿都要进 `auth.anonymous_paths` 与
 `tenant.anonymous_paths` 两条列表。
 
@@ -2945,7 +3020,7 @@ scripts\deploy.bat         # Windows (cmd) → dist/oj-v<version>-<triple>.zip
 
 `<triple>` 取自 `rustc -vV` 的 host 行（如 `aarch64-apple-darwin`、
 `x86_64-unknown-linux-gnu`、`x86_64-pc-windows-msvc`），与插件加载器的发现路径
-`<exe>/plugins/<triple>/` 同形。版本取自 `oj/Cargo.toml`。每个包附带同名
+`<exe>/plugins/<triple>/` 同形。版本取自发布流程（与 `oj --version` 一致）。每个包附带同名
 `.sha256` 校验文件。
 
 包内容（解包后，根路径 = 包名）：
@@ -3179,7 +3254,7 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | `search.ensureIndex: DDL inside db.tx` | ensureIndex 在 `db.tx` 内调用 | 移到事务外（MySQL DDL 会隐式提交调用方事务） |
 | `search.*: call ensureIndex('t') first` | index/remove/query 先于 ensureIndex | 先 ensureIndex（进程内每表一次） |
 
-完整排障表见 `docs/ops-manual.md` §7。
+完整排障表见 oj 仓库 `docs/ops-manual.md` §7（github.com/everpan/oj-bin）。
 
 ### 插件升级与回滚
 
@@ -3226,6 +3301,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - blob key 白名单：按 `/` 分段，`.` / `..` / `\` / NUL / 空段拒绝。下载路由
   `{base}/blob/{key}` **公开免鉴权**——不要把需鉴权的对象放进去。
 - import 解析结果钳制在 project root 内，`..` 逃逸报错（第 5 章）。
+- handler 链段名（嵌套组，v0.1.64）禁 `/`、空段与 `__proto__`/`constructor`/`prototype`：
+  内省期权威校验，运行期 driver 与 release `from_entries` 双保险——手改 `routes.js`
+  注入这些段 → 记 failure 不注册（dev）/ 启动失败（release）。
 
 ### v0.2 已知限制全表
 
@@ -3234,6 +3312,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | ~~相对 `require("./x")` 不支持~~（v0.1.30 已支持） | 相对 require / JSON 模块 / 循环 require 均可用；`exports`/`conditions` 与 pnpm 布局完整支持。残留限制：`exports` 的 `types`/`browser` 条件不命中；CJS `module.exports` 替换函数式写法启发式识别 |
 | blob multipart 预签名（v0.1.30） | `blob.uploadUrl` 的 multipart 形态暂返回 Err（object_store 无 multipart presign API）；单发 PUT 预签名 + `PUT {base}/blob/{key}` 直传路由（≤1 GiB）已覆盖大文件场景，>100MB 分片需求出现再补 |
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
+| 嵌套 handler 组上限 4 层、`route` 为保留键（v0.1.64） | 链长 >4 或自引用（`a.self=a`）内省期即失败；组对象的字符串 `.route` 是本层前缀声明，故子组不能命名 `route` |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |
 | 端口 <1024（如 778）属特权端口 | 需 root 才能 bind，用 ≥1024（默认 `9778`） |

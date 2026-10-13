@@ -16,6 +16,33 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.64（未打标签）
+
+**feat（api.ts）：嵌套 handler 组**。default 导出里**非动词键 + 对象值**即嵌套 handler 组
+——一个文件挂多个同动词端点不再必须拆子目录；同时**消灭静默丢弃**：声明了却注册不上的
+导出键（非动词函数/数组/基元、动词键挂非函数）在启动/`oj build` 期可操作报错。
+
+- 组名即路径段（与目录镜像同构），组可再嵌子组（上限 4 层）；组级 `.route` 作整组
+  默认前缀，动词自身 `.route` 优先覆盖（绝对 `/` 开头挂 base 根下，否则相对本层前缀）。
+- 判别红线：**先按键是否 verb 分派，再以 `typeof` 校验值**——动词键必须是函数
+  （`.route`/`.schema` 等属性一律读作元数据，不拆子路由）；非动词键必须是普通对象。
+  组对象的字符串 `.route` 是本层前缀声明（`route` 为保留键）。
+- 防护：JS 内省 driver 内 `WeakSet` 路径环检测（`a.self=a` 内省期即失败，不拖死启动）
+  + 深度上限 4；段名禁 `/` 与 `__proto__`/`constructor`/`prototype`，内省期权威校验、
+  运行期 driver 与 `from_entries` 双保险（手改 `routes.js` 注入 → release 启动失败）。
+- 派发：`Entry`/`Lookup::Hit`/`RouteRow` 携带点分 handler 链，`run_module` driver 逐段
+  `Object.prototype.hasOwnProperty.call` + 计算式取值（连字符组名 `user-list` 可命中）；
+  入参契约键同步改 (文件, 链)——嵌套组各 verb 契约互不串门。
+- `routes.js` 为嵌套行写 `handler` 字段（顶层动词行不写，**旧产物无此字段照常启动**，
+  以 `method` 兜底填链）；dev 内省与 `oj build` 共用同一递归 driver，双态零分歧。
+- 行为变化：handler 缺失（含顶层方法未导出）由 405 改为 404「no handler」；「存在但
+  非函数」仍为 405。
+- 设计文档：`docs/superpowers/plans/2026-09-24-nested-handler-groups.md`（三方专家评审
+  结论已并入 §八）。
+- 示例与选型：`sample/src/nest/api.ts`（实体为根：`asset` 组含 `upload` 子资源、
+  根级实体组 `.route`、连字符实体名；L1 用例 `sample/tests/nest.test.ts`）；
+  「何时采用（拆目录 / 嵌套组 / 平铺三档取舍）」见 api-manual §4 与场景 31。
+
 ## v0.1.63（未打标签）
 
 **feat（oj serve）：配置热更新（v1）**。`server.reload_api: true` 时 `oj serve` 走

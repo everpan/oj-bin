@@ -468,6 +468,215 @@ async fn underscore_dir_param_dev_serves_and_release_round_trips() {
     let _ = std::fs::remove_dir_all(&t);
 }
 
+/// v0.1.64 嵌套 handler 组：`{ post, upload: { post } }` + 组 `.route`，
+/// dev 与 release 两态同命中（双态不变量，验收 1/11）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_handler_group_dev_and_release_serve_end_to_end() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/item/api.ts",
+            "async function post() { json.ok({ where: \"post\" }); }\n\
+             post.route = \"/x/{anchor}\";\n\
+             const upload = { post: async () => { json.ok({ where: \"upload.post\" }); } };\n\
+             upload.route = \"/x/{anchor}/upload\";\n\
+             export default { post, upload };\n",
+        ),
+    ]);
+    // dev 态
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "POST", "/v1/api/x/a1", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "post", "{v}");
+    let (s, v) = req(addr, "POST", "/v1/api/x/a1/upload", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "upload.post", "{v}");
+    // 组路径只声明了 POST → GET 得 405
+    let (s, _) = req(addr, "GET", "/v1/api/x/a1/upload", None).await;
+    assert_eq!(s, 405);
+    // 目录镜像不复活（组动词 replaced；且 item 目录无 api.ts 之外的声明）
+    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
+    assert_eq!(s, 404);
+    drop(_h);
+
+    // release 态：build → dist 直载，行为逐一相等
+    let a = BuildArgs {
+        module: Some("u".into()),
+        config: Some("config.yaml".into()),
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+        minify: true,
+        check: false,
+    };
+    oj::build_cmd::run(&a).await.unwrap();
+    let routes = std::fs::read_to_string(t.join("dist/u-0.1.0/routes.js")).unwrap();
+    assert!(routes.contains("handler: \"upload.post\""), "{routes}");
+    assert!(!routes.contains("handler: \"post\""), "{routes}"); // 顶层动词不落链
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "POST", "/v1/api/x/a1", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "post", "{v}");
+    let (s, v) = req(addr, "POST", "/v1/api/x/a1/upload", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "upload.post", "{v}");
+    let (s, _) = req(addr, "GET", "/v1/api/x/a1/upload", None).await;
+    assert_eq!(s, 405);
+    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
+    assert_eq!(s, 404);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 组 `.route` 后目录镜像 404（replaced 经真实 fs 兜底层判定）+ 非标识符段名
+/// （`user-list`）计算式访问命中（验收 12 前半）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_group_route_suppresses_mirror_and_hyphen_segment_hits() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/item/api.ts",
+            "const cccc = { get: () => { json.ok({ where: \"cccc.get\" }); } };\n\
+             cccc.route = \"/y\";\n\
+             const userList = { get: () => { json.ok({ where: \"user-list.get\" }); } };\n\
+             export default { cccc, \"user-list\": userList };\n",
+        ),
+    ]);
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/y", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "cccc.get", "{v}");
+    // 镜像 URL 被 replaced 拦（表内无 + 兜底不复活）→ 404
+    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
+    assert_eq!(s, 404);
+    // 连字符组名：无 .route → {父前缀}/user-list
+    let (s, v) = req(addr, "GET", "/v1/api/u/item/user-list", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "user-list.get", "{v}");
+    drop(_h);
+
+    let a = BuildArgs {
+        module: Some("u".into()),
+        config: Some("config.yaml".into()),
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+        minify: true,
+        check: false,
+    };
+    oj::build_cmd::run(&a).await.unwrap();
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/y", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "cccc.get", "{v}");
+    let (s, _) = req(addr, "GET", "/v1/api/u/item", None).await;
+    assert_eq!(s, 404);
+    let (s, v) = req(addr, "GET", "/v1/api/u/item/user-list", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["data"]["where"], "user-list.get", "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// §二.A 示例端到端：组同时含动词与子组（4 路由）；`cccc.get.schema` 元数据隔离
+/// （契约只作用于该 handler，且不生成 `schema` 路由）（验收 7/8）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_group_mixed_verbs_and_subgroups_with_schema_isolation() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/aaa/bbb/api.ts",
+            "function get() { json.ok({ where: \"get\" }); }\n\
+             const cccc = {\n\
+               get: () => { json.ok({ where: \"cccc.get\", need: http.query.need }); },\n\
+               post: () => { json.ok({ where: \"cccc.post\" }); },\n\
+               list: { get: () => { json.ok({ where: \"cccc.list.get\" }); } },\n\
+             };\n\
+             cccc.get.schema = { query: { type: \"object\", required: [\"need\"],\n\
+               properties: { need: { type: \"string\" } } } };\n\
+             export default { get, cccc };\n",
+        ),
+    ]);
+    for mode in ["src", "dist"] {
+        if mode == "dist" {
+            let a = BuildArgs {
+                module: Some("u".into()),
+                config: Some("config.yaml".into()),
+                dir: t.join("src").display().to_string(),
+                out: t.join("dist").display().to_string(),
+                minify: true,
+                check: false,
+            };
+            oj::build_cmd::run(&a).await.unwrap();
+        }
+        let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join(mode), "/v1/api".into())
+            .await
+            .unwrap();
+        let (s, v) = req(addr, "GET", "/v1/api/u/aaa/bbb", None).await;
+        assert_eq!(s, 200, "{mode} {v}");
+        assert_eq!(v["data"]["where"], "get", "{mode}");
+        let (s, v) = req(addr, "POST", "/v1/api/u/aaa/bbb/cccc", None).await;
+        assert_eq!(s, 200, "{mode} {v}");
+        assert_eq!(v["data"]["where"], "cccc.post", "{mode}");
+        let (s, v) = req(addr, "GET", "/v1/api/u/aaa/bbb/cccc/list", None).await;
+        assert_eq!(s, 200, "{mode} {v}");
+        assert_eq!(v["data"]["where"], "cccc.list.get", "{mode}");
+        // 契约键按链隔离：cccc.get 缺 need → 400 且不进 JS
+        let (s, _) = req(addr, "GET", "/v1/api/u/aaa/bbb/cccc", None).await;
+        assert_eq!(s, 400, "{mode}");
+        let (s, v) = req(addr, "GET", "/v1/api/u/aaa/bbb/cccc?need=1", None).await;
+        assert_eq!(s, 200, "{mode} {v}");
+        assert_eq!(v["data"]["where"], "cccc.get", "{mode}");
+        // 元数据不生成路由：不存在名为 schema 的子路径
+        let (s, _) = req(addr, "GET", "/v1/api/u/aaa/bbb/cccc/schema", None).await;
+        assert_eq!(s, 404, "{mode}");
+        drop(_h);
+    }
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// routes.js 手改 `handler` 非法段（原型注入）→ release 启动失败（§四 双保险，验收 12 后半）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_routes_js_illegal_handler_chain_fails_startup() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/item/api.ts",
+            "const cccc = { get: () => { json.ok({}); } };\n\
+             export default { cccc };\n",
+        ),
+    ]);
+    let a = BuildArgs {
+        module: Some("u".into()),
+        config: Some("config.yaml".into()),
+        dir: t.join("src").display().to_string(),
+        out: t.join("dist").display().to_string(),
+        minify: true,
+        check: false,
+    };
+    oj::build_cmd::run(&a).await.unwrap();
+    let rjs = t.join("dist/u-0.1.0/routes.js");
+    let mut s = std::fs::read_to_string(&rjs).unwrap();
+    // 手改产物：把合法链替换成原型注入段（替换整个 handler 值，避免重复键后者生效）
+    s = s.replace("handler: \"cccc.get\"", "handler: \"cccc.__proto__\"");
+    assert!(s.contains("cccc.__proto__"), "{s}");
+    std::fs::write(&rjs, s).unwrap();
+    let e = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
+        .await
+        .err()
+        .unwrap_or_default();
+    assert!(e.contains("handler"), "{e}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_then_release_serves_end_to_end() {
     let _g = lock();
@@ -1812,14 +2021,23 @@ async fn given_reload_api_when_post_config_then_swaps_and_reports_diff() {
     let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let mut readers = Vec::new();
     for stream in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ] {
         let Some(stream) = stream else { continue };
         let buf = out_buf.clone();
         readers.push(std::thread::spawn(move || {
             use std::io::BufRead;
-            for l in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+            for l in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
                 buf.lock().unwrap().push_str(&format!("{l}\n"));
             }
         }));
@@ -1925,14 +2143,23 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
     let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let mut readers = Vec::new();
     for stream in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ] {
         let Some(stream) = stream else { continue };
         let buf = out_buf.clone();
         readers.push(std::thread::spawn(move || {
             use std::io::BufRead;
-            for l in std::io::BufReader::new(stream).lines().map_while(Result::ok) {
+            for l in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
                 buf.lock().unwrap().push_str(&format!("{l}\n"));
             }
         }));
@@ -1973,7 +2200,9 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
     assert_eq!(body["code"].as_i64(), Some(0), "{body}");
     let d = &body["data"];
     let applied = d["applied"].as_array().expect("applied array");
-    let restart_pending = d["restart_pending"].as_array().expect("restart_pending array");
+    let restart_pending = d["restart_pending"]
+        .as_array()
+        .expect("restart_pending array");
     let kept_listener = d["kept_listener"].as_array().expect("kept_listener array");
     assert!(
         applied.iter().any(|v| v.as_str() == Some("vars")),
