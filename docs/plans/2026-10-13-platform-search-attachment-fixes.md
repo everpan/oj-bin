@@ -83,8 +83,8 @@
 - **验证**：`search.test.ts` 增「body 'alpha'→'beta' 后搜 'alpha' 必空（旧词不残留）」用例，钉死触发器正确性；保留 oj-wiki 调用侧 remove+index 不变（向后兼容）。
 
 ### 3c mysql 高亮 N 查询（P1）
-- **根因**：`search.ts:178-185` mysql 高亮路径对**每命中**多一次 `SELECT` 取原文；下游若取大窗（如 1000）即千次查询塌方。
-- **方案**：高亮策略与方言解耦——大窗（如 `limit>200`）时 `highlight:false`，由调用侧用本地 `mark()` 补片段（sqlite/pg/mysql 一致，免去 mysql N 查询）；小窗保持引擎高亮。此调整与下游 oj-wiki B1 的「大窗关高亮」协同。
+- **根因**：`search.ts` mysql 高亮路径对**每命中、每字段**多一次 `SELECT` 取原文；下游若取大窗（如 1000）即千（×字段数）次查询塌方。
+- **方案（实现采用，优于原计划「大窗关高亮」）**：高亮改为**一次批量取回全部命中行原文**——`WHERE pk IN (?, ?, …)` 单查询，再在应用层用现成的 `mark()` 截片段（sqlite/pg 本就用 `mark`/引擎高亮，mysql 无内置 snippet，故统一走本地 `mark`）。既消除 N 查询，又保持任意窗口高亮可用，不牺牲功能、不与下游 B1 强耦合。
 
 ---
 
@@ -95,7 +95,7 @@
 | D-3 | `src/contract.rs:25` `SUPPORTED_KEYWORDS` | 加入 `"default"`（+ 可选 check 注入） |
 | 3a | `sample/src/_platform/_shared/search.ts:170-199` | mysql/pg 增 `<3` LIKE 回退 |
 | 3b | `sample/src/_platform/_shared/search.ts:111-112` | sqlite index() 改 remove+insert |
-| 3c | `sample/src/_platform/_shared/search.ts` | 大窗高亮改本地 mark |
+| 3c | `sample/src/_platform/_shared/search.ts`（mysql `query` 高亮分支） | 批量 `IN` 取原文 + 本地 `mark`，根除每命中一查询 |
 
 ## 验证门禁（P0 完成后）
 - `cargo test -p oj`（`contract` / `stream` 相关用例全绿）；`cargo build` 通过。

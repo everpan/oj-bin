@@ -235,7 +235,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | IDE 报 `Cannot find module '#_shared/x'` | 该文件尚不存在或不在模块内；`paths` 无法表达「模块相对」别名——创建 `<模块>/_shared/x.ts` 即解析（`global.d.ts` 已加 `#*` 通配兜底消除报错） |
 | 流式响应收到的是 `{code,msg,data}` 而非裸流 | 用了 `json.ok`——流式必须 `json.stream`/`json.sse`，二者**绕过信封**直接写裸 body（v0.1.35） |
 | SSE 客户端收不到帧 | 用了 `json.stream` 却没按 `data: X\n\n` 帧格式——要自动帧化用 `json.sse`；心跳保活 15s（`:\n\n`），静默超 15s 的连接可能被代理掐断（v0.1.35） |
-| `json.stream`/`json.sse` 的 `opts` 想设 `event:`/`id:` | 不支持——`opts` 仅 `status`/`contentType`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
+| `json.stream`/`json.sse` 的 `opts` 想设 `event:`/`id:` | 不支持——`opts` 仅 `status`/`contentType`/`fileName`/`disposition`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
+| 流式写二进制（图片/附件）乱码或不全 | `write` 传了 `string`——会被当 UTF-8 文本而失真（v0.1.65 前根本不支持二进制）。**二进制必须传 `Uint8Array`/`ArrayBuffer`/类型化数组**，走字节通道逐字节无损；`fileName` 一并设 `Content-Disposition` 让浏览器另存为原名（无需 302 到免鉴权 blob 路由）。文本 CSV/JSON/SSE 行仍传 `string` |
 | 跨域启动直接报错退出 | `server.cors.credentials: true` 且 `origins` 为空——带凭据的 `*` 非法；配显式 `origins`（v0.1.35） |
 | 跨域响应没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂 CORS 层，与旧版一致）；或 `origins: ["*"]` 不展开——放行任意源就把 `origins` 留空（v0.1.35） |
 | `crypto.aesGcmEncrypt` 传 24 字节密钥报错 | 不支持 AES-192——密钥仅 16（AES-128）/32（AES-256）字节的 hex 或 base64；应用层加解密，密钥自管不进 config（v0.1.35） |

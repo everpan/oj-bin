@@ -567,7 +567,9 @@ post.schema = {
   JSON，**不**强转。
 - **受支持关键字**（白名单）：`type` / `required` / `properties` / `items` /
   `additionalProperties` / `minimum` / `maximum` / `minLength` / `maxLength` /
-  `pattern` / `enum` / `nullable` / `minItems` / `maxItems`。
+  `pattern` / `enum` / `nullable` / `minItems` / `maxItems` / `default`。
+  `default` 是纯注解关键字（无校验语义，v0.1.65 起放开）：声明后装配期不再 fail-fast，但
+  **oj 不会替你填值**——缺省钳制仍须 handler 自行做（应用层 `?? default`）。
   白名单外（`$ref` / `oneOf` / `format` …）一律 **fail-fast，绝不静默跳过**
   —— 静默放行等于把声明变成不生效的东西。非法契约在**装配期**即报错（启动失败）。
 - **`pattern` 用 Rust regex**，不是 ECMA-262：lookahead / 反向引用不支持，
@@ -808,14 +810,16 @@ postgres 用 `$1`**；值一律经参数数组绑定。
 | `json.header` | `header(name: string, value: string): void` | 追加响应头（v0.1.46）：同名可重复——`Set-Cookie` 双发（登录端点同响应下发 `oj_sess` + `oj_csrf`）合法落多个值；其余头同名最后一个生效 |
 | `json.raw` | `raw(data: unknown): void` | **裸 JSON 200（无 `{code,msg,data}` 信封）**，content-type 默认 `application/json`（`json.header` 可覆盖）。对外标准协议端点用（OIDC discovery/jwks/token/userinfo）；错误仍走 `json.fail` 信封 |
 | `json.redirect` | `redirect(url: string, code?: number): void` | **3xx 重定向原语**（v0.1.26）：`Location` + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 非 3xx **回落 302**（杜绝「200 + Location」畸形响应）；空 url 忽略 `Location`。具名封装：`movedPermanently`(301) / `found`(302) / `seeOther`(303，跟随后改 GET) / `temporaryRedirect`(307，方法/体保持) / `permanentRedirect`(308，永久 + 方法保持)。典型：302 到 `blob.url()` 预签名 URL（`scenarios.md` 场景 8） |
-| `json.stream` | `stream(opts?: { status?: number; contentType?: string }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 入参 string/ArrayBuffer/ArrayBufferView/TypedArray |
-| `json.sse` | `sse(opts?: { status?: number; contentType?: string }): StreamWriter` | **SSE 流**（v0.1.35）：等同 `json.stream` 但强制 `Content-Type: text/event-stream`，每次 `write` 的「数据」自动包成 `data: <内容>\n\n` 帧；`opts` 同 `json.stream` |
+| `json.stream` | `stream(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): StreamWriter` | **流式响应**（v0.1.35）：打开裸 body 流（绕过信封），返回 `{ write(chunk), end() }`；默认 HTTP 200，可经 `opts.status` / `opts.contentType` 覆盖。`write` 按入参类型分发：`Uint8Array`/`ArrayBuffer`/类型化数组（如 `Int32Array`）走**字节通道**（二进制无损，附件/图片下载用）；其余（`string` 等）走 UTF-8 文本通道（CSV/JSON/SSE 行）。`opts.fileName`（v0.1.65）写入 `Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认 `attachment` 下载，传 `inline` 内联展示）——浏览器另存为原名而非安全化名，且**无需 302 到免鉴权 blob 路由**即可把鉴权后的字节流式回源 |
+| `json.sse` | `sse(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): StreamWriter` | **SSE 流**（v0.1.35）：等同 `json.stream` 但强制 `Content-Type: text/event-stream`，每次 `write` 的「数据」自动包成 `data: <内容>\n\n` 帧；`opts` 同 `json.stream` |
 
 > **流式 / SSE 响应（v0.1.35）**：`json.stream` / `json.sse` 返回 `StreamWriter`（`{ write(chunk), end() }`）。
 > 数据通道解耦于 isolate 生命周期——handler 退出后 isolate 归还池、但响应继续向客户端推送；
 > **不调用 `end()` 也会在 `read_capture` 阶段自动关流**（心跳任务经 `Notify` 退出）。
 > 限制：流式响应**绕过** `{code,msg,data}` 信封（直接写裸 body）；心跳保活间隔 15s（`:\n\n`）；
-> `opts` 仅支持 `status` / `contentType` 两字段，不支持额外 SSE 字段（如 `event:` / `id:` 需自行拼进 `write` 内容）。
+> `opts` 支持 `status` / `contentType` / `fileName` / `disposition` 四字段；
+> **二进制须传 `Uint8Array`/`ArrayBuffer`/`TypedArray`**——传 `string` 会被当 UTF-8 文本而失真（如图片/压缩包）；
+> 不支持额外 SSE 字段（如 `event:` / `id:` 需自行拼进 `write` 内容）。
 
 ```ts
 json.ok({ created: true });
@@ -828,9 +832,15 @@ json.redirect.seeOther("/v1/api/order/list/"); // POST 提交后跳转：跟随�
 
 // v0.1.35：流式 / SSE（绕过信封，直接写裸 body）
 const s = json.stream({ contentType: "text/csv" });
-s.write("a,b\n"); s.write("1,2\n"); s.end();          // 普通流式
+s.write("a,b\n"); s.write("1,2\n"); s.end();          // 普通流式（文本通道）
 const e = json.sse();
 e.write("hello"); e.write("world");                    // 自动包成 data: hello\n\n / data: world\n\n
+
+// v0.1.65：二进制附件下载（鉴权后流式回源，无需 302 到免鉴权 blob 路由）
+const bytes = await db.query(...);                     // Uint8Array
+const dl = json.stream({ contentType: "application/octet-stream", fileName: "报告.pdf" });
+dl.write(new Uint8Array(bytes)); dl.end();             // 字节通道：逐字节无损
+// → Content-Disposition: attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf
 ```
 
 ### http —— 请求上下文

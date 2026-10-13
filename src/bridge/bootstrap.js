@@ -63,6 +63,7 @@ import {
   op_json_redirect,
   op_json_stream_open,
   op_stream_write,
+  op_stream_write_bytes,
   op_stream_end,
   op_kv_get,
   op_kv_set,
@@ -370,7 +371,12 @@ globalThis.json = {
   stream: (opts) => {
     op_json_stream_open(opts === undefined ? null : opts);
     return {
-      write: (c) => op_stream_write(String(c)),
+      // Binary (Uint8Array/ArrayBuffer/TypedArray) goes through the byte op; everything
+      // else is written as UTF-8 text (CSV/JSON/SSE rows).
+      write: (c) =>
+        c instanceof Uint8Array || c instanceof ArrayBuffer || ArrayBuffer.isView(c)
+          ? op_stream_write_bytes(c)
+          : op_stream_write(String(c)),
       end: () => op_stream_end(),
     };
   },

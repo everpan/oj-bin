@@ -360,6 +360,7 @@ deno_core::extension!(
         json::op_json_redirect,
         stream::op_json_stream_open,
         stream::op_stream_write,
+        stream::op_stream_write_bytes,
         stream::op_stream_end,
         http::op_http_info,
         http::op_http_epoch,

@@ -38,4 +38,24 @@ describe("search (sqlite FTS5)", () => {
     try { await search.query("docs; DROP TABLE users", "x"); } catch (e) { msg = String(e); }
     expect(msg).toContain("invalid");
   });
+
+  it("sqlite index() 重写同 id 不残留旧词（FTS 触发器陷阱 D-5）", async () => {
+    await db.exec("CREATE TABLE IF NOT EXISTS search_docs2 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)");
+    await db.exec("DELETE FROM search_docs2");
+    await search.ensureIndex("search_docs2", { fields: ["title", "body"] });
+    await search.index("search_docs2", { id: 1, title: "a", body: "alpha" });
+    await search.index("search_docs2", { id: 1, title: "a", body: "beta" }); // 同 id 重写
+    // 旧词 alpha 必须不可搜（DELETE 触发 fts_ad → 旧词清除），新词 beta 可搜
+    expect((await search.query("search_docs2", "alpha", { limit: 10 })).length).toBe(0);
+    expect((await search.query("search_docs2", "beta", { limit: 10 })).length).toBe(1);
+  });
+
+  it("短词（<3 字符）基表 LIKE 回退仍可搜", async () => {
+    await db.exec("CREATE TABLE IF NOT EXISTS search_docs3 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)");
+    await db.exec("DELETE FROM search_docs3");
+    await search.ensureIndex("search_docs3", { fields: ["title", "body"] });
+    await search.index("search_docs3", { id: 1, title: "部", body: "部门例会" });
+    // trigram 对 <3 字符静默零命中 → 走基表 LIKE 回退，单字仍可搜（跨方言一致）
+    expect((await search.query("search_docs3", "部", { limit: 10 })).some((h) => Number(h.id) === 1)).toBe(true);
+  });
 });

@@ -11,11 +11,35 @@
 //! 退出，接收端关闭，流干净终止。
 
 use bytes::Bytes;
-use deno_core::{OpState, op2};
+use deno_core::{JsBuffer, OpState, op2};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
+
+/// RFC 3986 百分号编码（UTF-8 字节级）：仅 unreserved 集（ALPHA/DIGIT/-\._~）原样，其余
+/// `%XX`。供 `filename*=UTF-8''<encoded>` 使用，使附件下载流式回源时浏览器另存为原名。
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    out
+}
 
 use super::ReqState;
 
@@ -34,6 +58,15 @@ pub fn op_json_stream_open(state: &mut OpState, #[serde] opts: Option<Value>) {
         .get("contentType")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let file_name = opts
+        .get("fileName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let disposition = opts
+        .get("disposition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("attachment")
+        .to_string();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let rs = state.borrow_mut::<ReqState>();
@@ -43,6 +76,14 @@ pub fn op_json_stream_open(state: &mut OpState, #[serde] opts: Option<Value>) {
     } else if sse {
         rs.headers
             .push(("content-type".into(), "text/event-stream".into()));
+    }
+    if let Some(fn_) = file_name {
+        // RFC 5987：filename*=UTF-8''<percent-encoded>，浏览器据此外存为原名。
+        // disposition 默认 attachment（下载）；传 "inline" 可内联展示。
+        rs.headers.push((
+            "content-disposition".into(),
+            format!("{disposition}; filename*=UTF-8''{}", pct_encode(&fn_)),
+        ));
     }
     rs.stream_tx.borrow_mut().replace(tx);
     rs.stream_rx.borrow_mut().replace(rx);
@@ -80,6 +121,16 @@ pub fn op_stream_write(state: &mut OpState, #[string] chunk: String) {
     if let Some(tx) = tx {
         // 客户端已断开时 send 返回 Err，忽略即可（连接清理由 server 层负责）。
         let _ = tx.send(Bytes::from(chunk));
+    }
+}
+
+/// 写入一块（二进制）：附件等字节流。流未开或无接收端时静默忽略。与文本 write 同通道。
+#[op2]
+pub fn op_stream_write_bytes(state: &mut OpState, #[buffer] chunk: JsBuffer) {
+    let tx: Option<mpsc::UnboundedSender<Bytes>> =
+        state.borrow_mut::<ReqState>().stream_tx.borrow().clone();
+    if let Some(tx) = tx {
+        let _ = tx.send(Bytes::from(chunk.to_vec()));
     }
 }
 
@@ -157,11 +208,43 @@ mod tests {
         assert_eq!(got, "data: hello\n\ndata: world\n\n");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn json_stream_writes_binary_bytes_intact() {
+        let b = Bridge::new(
+            Arc::new(InMemoryAccessor::new()),
+            Arc::new(InMemoryKV::new()),
+        );
+        // 非 UTF-8 字节（含 0x00 / 0xff）：走 op_stream_write_bytes，须逐字节无损。
+        let cap = b
+            .run(
+                r#"
+                const s = json.stream({ contentType: "application/octet-stream" });
+                s.write(new Uint8Array([0x00, 0xff, 0x89, 0x50, 0x0a]));
+                s.end();
+                "#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200);
+        let rx = cap.stream.expect("stream should be open");
+        let got = collect_bytes(rx).await;
+        assert_eq!(got, vec![0x00u8, 0xff, 0x89, 0x50, 0x0a]);
+    }
+
     /// 收取接收端全部字节（测试辅助）。
     async fn collect(mut rx: UnboundedReceiver<Bytes>) -> String {
         let mut out = String::new();
         while let Some(b) = rx.recv().await {
             out.push_str(std::str::from_utf8(&b).unwrap());
+        }
+        out
+    }
+
+    /// 收取接收端全部字节为 Vec<u8>（测试辅助，二进制无损）。
+    async fn collect_bytes(mut rx: UnboundedReceiver<Bytes>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(b) = rx.recv().await {
+            out.extend_from_slice(&b);
         }
         out
     }

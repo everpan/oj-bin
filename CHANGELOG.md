@@ -16,6 +16,29 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.65（未打标签）
+
+**feat（bridge.stream）：二进制流写出 + 文件名响应头**。下游（如 wiki 附件下载）可经
+`json.stream` 流式回源**字节**，不再被迫 302 到免鉴权 blob 路由。`write` 按入参类型分发：
+`Uint8Array`/`ArrayBuffer`/类型化数组走新增 `op_stream_write_bytes`（通道本就是
+`UnboundedSender<Bytes>`，原 `op_stream_write` 仅收 UTF-8 文本导致二进制失真）；其余仍是
+UTF-8 文本（CSV/JSON/SSE 行）。`json.stream({ fileName })` 写入 `content-disposition:
+attachment; filename*=UTF-8''<encoded>`，浏览器另存为原名而非安全化名。
+
+**feat（contract）：`.schema` 白名单放开 `default`**。`default` 是标准 JSON Schema 注解关键字、
+无校验语义，加入 `SUPPORTED_KEYWORDS` 后 handler 可声明 `default` 而装配期不再 FAIL FAST；未知
+关键字仍硬失败（静默跳过会让声明成谎话）。应用层缺省钳制与之并存，不冲突。
+
+**fix（sample._platform.search）：短词跨方言一致 + FTS 触发器陷阱根除 + mysql 高亮 N 查询**（下游 vendor 源）。
+- 短词（<3 字符）回退统一为共享 `likeFallback`：trigram/ngram/tsvector 对短词静默零命中，现三
+  方言都对基表 `LIKE`（复用 `likeEscape`）回退，消除方言行为分叉。
+- sqlite `index()` 由 `INSERT OR REPLACE` 改为「真 DELETE + INSERT」：前者在 `recursive_triggers=OFF`
+  （默认）下隐式 DELETE 不触发 AFTER DELETE 触发器 → FTS 虚表留旧词（实测复现）；后者 DELETE 必
+  触发 `fts_ad`、INSERT 必触发 `fts_ai`，三方言安全，移除 footgun。
+- mysql 高亮分支由「每命中、每字段一次 SELECT」改为**单次批量 `IN` 取回全部命中行原文**，再走
+  现成的本地 `mark()` 截片段（sqlite/pg 本就引擎高亮/本地 `mark`，mysql 无内置 snippet）。消除大
+  窗（如 limit=1000 → 千×字段数 次查询）塌方，且任意窗口高亮仍可用，不牺牲功能。
+
 ## v0.1.64
 
 **feat（api.ts）：嵌套 handler 组**。default 导出里**非动词键 + 对象值**即嵌套 handler 组

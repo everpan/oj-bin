@@ -37,6 +37,7 @@ pub const SUPPORTED_KEYWORDS: &[&str] = &[
     "nullable",
     "minItems",
     "maxItems",
+    "default",
 ];
 
 /// params / query 允许的类型（`HashMap<String, String>` 只能表达这些）。
@@ -1019,6 +1020,30 @@ mod tests {
         assert!(
             InputContract::try_new(None, None, Some(json!({ "properties": "x" })), &mut vec![])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn default_keyword_allowed_but_unknown_still_fails() {
+        // `default` 已加入 SUPPORTED_KEYWORDS：声明不再 FAIL FAST。
+        assert!(
+            InputContract::try_new(
+                None,
+                None,
+                Some(json!({ "type": "string", "default": "x" })),
+                &mut vec![]
+            )
+            .is_ok()
+        );
+        // 其它未知关键字仍 FAIL FAST（回归保护，静默跳过会让声明成谎话）。
+        assert!(
+            InputContract::try_new(
+                None,
+                None,
+                Some(json!({ "type": "string", "format": "email" })),
+                &mut vec![]
+            )
+            .is_err()
         );
     }
 

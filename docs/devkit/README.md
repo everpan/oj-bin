@@ -37,6 +37,15 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.65 起 `json.stream` / `json.sse` 的 `opts` 新增 `fileName` / `disposition`：`fileName` 写入
+`Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认
+`attachment`，可传 `inline`），浏览器另存为原名、且**无需 302 到免鉴权 blob 路由**即可把鉴权后
+的字节流式回源；`write` 按入参类型分发——`Uint8Array`/`ArrayBuffer`/类型化数组走**字节通道**
+（二进制无损），其余当 UTF-8 文本。`contract` 白名单放开 `default`（纯注解关键字，无校验语义，
+oj 不替你填值）。sample 引擎原生检索 `_shared/search` 修三处：短词（<3 字符）跨方言统一基表
+`LIKE` 回退、sqlite `index()` 根除 FTS 触发器残留旧词、mysql 高亮由每命中一查询改为单次批量
+`IN` 取原文。见 `api-manual.md` §6 `json.stream` / 「入参契约 `.schema`」与 `SKILL.md` 陷阱速查。
+
 v0.1.43 起新增 `oj openapi` 子命令（从路由表生成 OpenAPI 3.1，含 `--check`
 漂移门禁），见 `api-manual.md` 命令表与 `scenarios.md` 场景 24 的「常见坑」。
 

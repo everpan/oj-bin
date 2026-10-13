@@ -1613,6 +1613,32 @@ curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
 | `for await` 拿到的 `row` 是 `undefined` | 流结束哨兵是 `null`，但迭代器形态已为你消化；直接在循环体用 `row` 即可，不要等 `undefined` |
 | 取消后已处理的行「回滚」了 | `signal` 只中止**后续拉取**，已回调/已迭代的行不会回滚——取消前的数据已是最终态 |
 
+### ⑥ 鉴权后二进制附件下载（v0.1.65）
+
+`json.stream` 的 `opts` 新增 `fileName` / `disposition`：可直接把**鉴权后**的字节流式回源、且
+浏览器另存为原名，**无需 302 到免鉴权 blob 路由**（避免鉴权被绕过、预签名 URL 泄露）。二进制
+**必须传 `Uint8Array`/`ArrayBuffer`/类型化数组**——走字节通道逐字节无损；传 `string` 会被当
+UTF-8 文本而失真（图片/压缩包乱码）。
+
+```ts
+export default {
+  async get({ id }: { id: string }) {
+    const rows = await db.query("select data, name from attachment where id = ?", [id]);
+    const s = json.stream({
+      contentType: "application/octet-stream",
+      fileName: String(rows[0].name),  // → Content-Disposition: attachment; filename*=UTF-8''<pct-encoded>
+      // disposition: "inline",          // 默认 attachment；内联展示改 inline
+    });
+    s.write(new Uint8Array(rows[0].data));  // 字节通道：逐字节无损
+    s.end();
+    return;
+  },
+};
+```
+
+**验证**：`curl -s -D - 'http://localhost:9778/v1/api/attachment/?id=1' -o out.bin` → 响应头含
+`Content-Disposition: attachment; filename*=UTF-8''<encoded>`，`out.bin` 与源文件逐字节一致。
+
 ---
 
 ## 相关文档
