@@ -1409,7 +1409,7 @@ curl -N http://localhost:9778/v1/api/report/export/   # -N 关闭缓冲，看到
 | 前端拿到的是 `{code,msg,data}` 而非裸流 | 用了 `json.ok`——流式必须 `json.stream` / `json.sse`，二者绕过信封 |
 | 流「卡住」不结束 | 没调用 `end()` 且连接被前端一直保持——`read_capture` 在 handler 退出后接管并关流；若想显式结束务必 `end()` |
 | SSE 客户端收不到 | 用了 `json.stream` 但没按 `data: X\n\n` 帧格式——要自动帧化用 `json.sse`；心跳保活间隔 15s（`:\n\n`），静默超 15s 的连接可能被代理掐断 |
-| `opts` 想设 `event:`/`id:` 字段 | 不支持——`opts` 仅 `status` / `contentType`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
+| `opts` 想设 `event:`/`id:` 字段 | 不支持——`opts` 仅 `status` / `contentType` / `fileName` / `disposition`；自定义 SSE 字段自己拼进 `write("event: x\ndata: y\n\n")` |
 | 想边查库边流 | handler 内可正常用 `db`/`kv`；但通道在 handler 返回后才继续推——重活尽量在 `end()` 之前做完 |
 
 ---

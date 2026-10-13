@@ -54,9 +54,14 @@ TEMP_DIR="${DIST_DIR}/${PACKAGE_NAME}"
 echo "host triple : ${TRIPLE}"
 echo "version     : ${VERSION}"
 
-# 清空 dist/（不删整个 dist 再建，避免并发时闪断）
-rm -rf "${DIST_DIR}"
+# 仅确保 dist/ 存在——**不清空**，保留 dist/ 下其它历史版本包（不同版本 / 不同 triple 的
+# 已发布归档不误删）。
 mkdir -p "${DIST_DIR}"
+
+# 仅清理「本次要重建」的产物（同名临时目录 / 归档 / 校验和）；重跑时覆盖本次构建，但不动
+# 历史包。
+rm -rf "${DIST_DIR}/${PACKAGE_NAME}"
+rm -f "${DIST_DIR}/${PACKAGE_NAME}.tar.gz" "${DIST_DIR}/${PACKAGE_NAME}.tar.gz.sha256"
 
 # 构建并归置 oj + 全部第一方插件 + devkit -> bin/
 echo "Building release (oj + plugins + devkit) into bin/ ..."

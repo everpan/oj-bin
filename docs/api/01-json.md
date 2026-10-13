@@ -22,8 +22,8 @@
 | `json.redirect` | `redirect(url: string, code?: number): void` | 3xx 重定向：写 `Location` 头 + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 缺省 302；**非 3xx 一律回落 302**（杜绝「200 + Location」畸形响应）；空 url 不写 `Location` |
 | `json.redirect.*` | `movedPermanently(url)` / `found(url)` / `seeOther(url)` / `temporaryRedirect(url)` / `permanentRedirect(url)` | 具名封装：301 / 302 / 303（跟随后改 GET）/ 307（方法/体保持）/ 308（永久 + 方法保持） |
 | `json.raw` | `raw(data?: unknown): void` | **裸 JSON 200，无信封**。对外标准协议端点用（OIDC discovery/jwks/token 等）；错误仍走 `json.fail` 信封 |
-| `json.stream` | `stream(opts?: { status?: number; contentType?: string }): { write(chunk), end() }` | 流式响应（v0.1.35）：绕过信封直接写裸 body；`write` 接受 string/ArrayBuffer/ArrayBufferView；不调 `end()` 也会在响应收尾阶段自动关流 |
-| `json.sse` | `sse(opts?: { status?: number; heartbeatSecs?: number }): { write(chunk), end() }` | SSE 流：强制 `Content-Type: text/event-stream`，每次 `write` 自动包成 `data: <内容>\n\n` 帧 |
+| `json.stream` | `stream(opts?: { status?: number; contentType?: string; fileName?: string; disposition?: "attachment" \| "inline" }): { write(chunk), end() }` | 流式响应（v0.1.35）：绕过信封直接写裸 body；`write` 按入参类型分发——`Uint8Array`/`ArrayBuffer`/类型化数组走**字节通道**（二进制无损，附件/图片下载用），其余（`string` 等）走 UTF-8 文本通道（CSV/JSON/SSE 行）；不调 `end()` 也会在响应收尾阶段自动关流。`opts.fileName`（v0.1.65）写 `Content-Disposition: <disposition>; filename*=UTF-8''<encoded>`（`disposition` 默认 `attachment`，传 `inline` 内联展示）——浏览器另存为原名、无需 302 到免鉴权 blob 路由 |
+| `json.sse` | `sse(opts?: { status?: number; heartbeatSecs?: number; fileName?: string; disposition?: "attachment" \| "inline" }): { write(chunk), end() }` | SSE 流：强制 `Content-Type: text/event-stream`，每次 `write` 自动包成 `data: <内容>\n\n` 帧；`opts` 同 `json.stream` |
 | `finish` | `finish(): void` | 仅标记会话完成（不写响应）。HTTP handler 用 `json.*` 即可；`finish` 是测试 SDK 的结束标记 |
 
 行为要点：
@@ -53,7 +53,9 @@
   （`s.response` 被替换）；不要指望两次 `json.ok` 合并输出。
 - `json.raw` 只负责「裸 JSON」；要裸的非 JSON 内容请用 `json.stream` + `contentType`。
 - `json.stream`/`json.sse` 绕过信封：首字节即裸 body，无法在流中途改状态码；
+  `opts` 支持 `status` / `contentType` / `fileName` / `disposition` 四字段；
   SSE 不支持 `event:`/`id:` 字段（需自行拼进 `write` 内容），心跳保活间隔 15s（`:\n\n`）。
+  **二进制须传 `Uint8Array`/`ArrayBuffer`/类型化数组**——传 `string` 会被当 UTF-8 文本而失真。
 - `finish()` 在 HTTP handler 里不等于「返回 200」——它只是 done 标记，响应体仍为空
   （serve 层会按上表兜底 500）。HTTP 路径请用 `json.ok(...)` 收尾。
 
