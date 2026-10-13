@@ -53,6 +53,7 @@ mod module_loader;
 pub mod mq;
 mod named_registry;
 pub mod oidc;
+mod placeholder;
 pub mod plugin_loader;
 mod plugins_op;
 mod query;

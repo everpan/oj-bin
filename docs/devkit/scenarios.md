@@ -2008,7 +2008,7 @@ DDL 拒事务、标识符白名单。
 | score 跨引擎比较 | 不可比——返回引擎原始分（sqlite bm25 负值、mysql 相关度、pg ts_rank） |
 | `sql_guard: deny` 部署下 search 全挂 | deny 与 FTS 裸查询互斥：要么关守卫要么不用 search；启用租户守卫的库 MATCH 查询须带业务表 `tenant_id` 条件 |
 | mysql 建索引报重复 | `ADD FULLTEXT` 无 IF NOT EXISTS——模块已先查 `information_schema.statistics` 再建；自写 SQL 照抄该模式 |
-| pg 占位符 | `$1` 不是 `?`（sqlx Any 不转换）——模块按 `db.dialect()` 渲染 |
+| pg 占位符 | **0.1.67 起统一 `?`**（宿主自动改写 `$n`，sqlx Any 不转换的问题已在宿主侧解决）；存量 `db.dialect()` 渲染的 `$n` 继续有效 |
 | mysql 中文没召回 | FULLTEXT 必须 `WITH PARSER ngram`（服务端 ≥5.7.6） |
 | `oj schema diff` 报 D002 | `docs_fts*` 影子表未声明——文档化噪音，人工忽略 |
 

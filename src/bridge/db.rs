@@ -7,6 +7,7 @@
 //! 安全性：新增 `query_with_params` / `exec_with_params` 以支持绑定参数，杜绝 JS 侧字符串拼接
 //! （原始 `query(sql)` 仅保留为无参便捷形式；真实 SQL 实现应优先用 *_with_params 或 query.rs 构造器）。
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -211,6 +212,9 @@ pub fn op_db_has(state: &mut OpState, #[string] name: &str) -> bool {
 pub struct ActiveTx {
     pub db: String,
     pub session: tokio::sync::Mutex<Box<dyn TxSession>>,
+    /// 连接方言（begin 时从 accessor 快照；0.1.67 占位符统一改写需要）。
+    /// 不走 TxSession trait/FFI vtable 的理由见 op_db_tx_begin 注释。
+    pub dialect: Dialect,
 }
 
 /// 当前请求的活跃事务句柄（无则 None）。借用即取即还。
@@ -238,6 +242,39 @@ pub(crate) fn resolve_target(
         )));
     }
     Ok(Target::Pool(super::query::lookup(state, name)?))
+}
+
+/// 占位符统一改写（0.1.67，design docs/plans/2026-10-13-unified-db-placeholder-design.md）：
+/// `?` 是 oj 唯一占位符，postgres 方言由宿主改写为 `$n`；sqlite/mysql/空参透传零开销。
+/// 三个裸 SQL op（query/exec/stream_open）的唯一插桩点（DRY）；守护测试钉死出口白名单。
+/// fail-loud（计数不匹配）同样记 trace（ok=false），不留画像盲区（评审 E6）；
+/// trace 一律记**原始** SQL（画像定位开发者所写，非引擎所收）。
+#[allow(clippy::too_many_arguments)]
+fn normalize_and_trace<'a>(
+    state: &Rc<RefCell<OpState>>,
+    dialect: Dialect,
+    in_tx: bool,
+    name: &str,
+    sql: &'a str,
+    params: &[Value],
+) -> Result<Cow<'a, str>, JsErrorBox> {
+    match super::placeholder::normalize_sql(dialect, sql, params) {
+        Ok(norm) => Ok(norm),
+        Err(e) => {
+            trace_sql(
+                state,
+                sql,
+                params,
+                name,
+                in_tx,
+                0.0,
+                None,
+                false,
+                Some(e.clone()),
+            );
+            Err(JsErrorBox::generic(e))
+        }
+    }
 }
 
 /// PR-2 Phase A：`db.stream` 每请求流注册表（keyed by stream_id）。pump 持有 `Arc<DbStreamShared>`
@@ -293,9 +330,13 @@ pub async fn op_db_tx_begin(
         .begin()
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    // 方言快照进 ActiveTx（而非 TxSession trait 加方法 / FFI ABI 演进）：方言是
+    // accessor 静态属性，begin 时可从 da.dialect() 拿到；前者要改 SqlxTx/InMemoryTx
+    // 及全部夹具，后者要 bump ABI_VERSION（严格相等门禁）——代价与收益不成比例。
     state.borrow_mut().borrow_mut::<super::ReqState>().tx = Some(Arc::new(ActiveTx {
         db: name,
         session: tokio::sync::Mutex::new(session),
+        dialect: da.dialect(),
     }));
     Ok(true)
 }
@@ -398,17 +439,22 @@ pub async fn op_db_query(
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
+    let dialect = match &target {
+        Target::Tx(t) => t.dialect,
+        Target::Pool(da) => da.dialect(),
+    };
+    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
     let res: Result<Vec<Row>, JsErrorBox> = match target {
         Target::Pool(da) => da
-            .query_with_params(&sql, &params)
+            .query_with_params(&norm, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
         Target::Tx(t) => t
             .session
             .lock()
             .await
-            .query(&sql, &params)
+            .query(&norm, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
     };
@@ -506,17 +552,22 @@ pub async fn op_db_exec(
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
+    let dialect = match &target {
+        Target::Tx(t) => t.dialect,
+        Target::Pool(da) => da.dialect(),
+    };
+    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
     let res: Result<i64, JsErrorBox> = match target {
         Target::Pool(da) => da
-            .exec_with_params(&sql, &params)
+            .exec_with_params(&norm, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
         Target::Tx(t) => t
             .session
             .lock()
             .await
-            .exec(&sql, &params)
+            .exec(&norm, &params)
             .await
             .map_err(|e| JsErrorBox::generic(e.to_string())),
     };
@@ -557,8 +608,10 @@ pub async fn op_db_stream_open(
             ));
         }
     };
+    // stream 明确拒绝事务，方言直接取 accessor（无需 ActiveTx 快照）。
+    let norm = normalize_and_trace(&state, da.dialect(), false, &name, &sql, &params)?;
     let start = std::time::Instant::now();
-    let stream_res = da.stream_query(&sql, &params).await;
+    let stream_res = da.stream_query(&norm, &params).await;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     // 流式只追踪「打开」（首行拉取开始）；整条流耗时由 `db.stream` 的逐行消费决定，未计入。
     trace_sql(
@@ -910,6 +963,53 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    /// 守护测试（0.1.67，评审 A1）：把「裸 SQL 出口 ⊆ {query, exec, stream_open}」
+    /// 从文档承诺变成 CI 资产——枚举 op 注册表的全部 op_db_*，新增 op 必须先过
+    /// 本白名单（属裸 SQL 出口则插桩 normalize_and_trace，否则更新此表并说明）。
+    #[test]
+    fn raw_sql_op_exits_are_pinned() {
+        const WHITELIST: [&str; 17] = [
+            "op_db_as_system",
+            "op_db_as_tenant",
+            "op_db_dialect",
+            "op_db_exec",
+            "op_db_has",
+            "op_db_next_seq",
+            "op_db_query",
+            "op_db_query_build",
+            "op_db_query_sql",
+            "op_db_sql_profile",
+            "op_db_stream_abort",
+            "op_db_stream_close",
+            "op_db_stream_next",
+            "op_db_stream_open",
+            "op_db_tx_begin",
+            "op_db_tx_commit",
+            "op_db_tx_rollback",
+        ];
+        let src = include_str!("mod.rs");
+        let mut found: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            let Some((module, op)) = t.split_once("::") else {
+                continue;
+            };
+            if module != "db" && module != "query" {
+                continue;
+            }
+            let op = op.trim_end_matches(',');
+            if op.starts_with("op_db_") {
+                found.push(op);
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        assert_eq!(
+            found, WHITELIST,
+            "op 注册表出现新 op_db_*：属裸 SQL 出口必须插桩 normalize_and_trace（占位符统一），否则更新白名单"
+        );
+    }
+
     /// `db.dialect()`：报引擎名；tx 回调对象同面（v0.1.61，`_shared/search` 依赖此分派）。
     #[tokio::test(flavor = "current_thread")]
     async fn db_dialect_reports_engine_name() {
@@ -1025,7 +1125,9 @@ mod tests {
     /// 背景：早期实现是「先试 → 失败才建表 → 在同一事务会话上重试」。PG 里事务内任何失败语句都会
     /// 让事务进入 aborted 态（后续一律 `25P02`），于是**首次在 tx 内取号必然失败并毒化调用方事务**。
     /// 现改为「每库一次的先确保（DDL 走池）」——本用例先 `drop table` 强制走首次路径来钉住它。
-    #[tokio::test(flavor = "multi_thread")]
+    /// flavor 必须 current_thread：deno op 内 deno_unsync::spawn 断言 CurrentThread，
+    /// multi_thread 下 env 一设即 SIGABRT（该用例此前从未真跑过——env 未设静默 skip 假绿）。
+    #[tokio::test(flavor = "current_thread")]
     async fn next_seq_first_use_inside_tx_on_real_db() {
         let url = std::env::var("OJ_TEST_PG")
             .or_else(|_| std::env::var("OJ_TEST_MYSQL"))
@@ -1072,7 +1174,8 @@ mod tests {
     /// PR-2 Phase A 真库回归（env-gated）：`db.stream` 在真实 PG / MySQL 上的逐行结果，与
     /// `db.query` 全量**一致**（顺序 + 内容），且流走完哨兵正常、无残留注册表条目。
     /// 仅当 `OJ_TEST_PG` / `OJ_TEST_MYSQL` 设了 DSN 才跑；都未设则 skip。
-    #[tokio::test(flavor = "multi_thread")]
+    /// flavor 同上必须 current_thread（multi_thread 即 SIGABRT，存量假绿已修）。
+    #[tokio::test(flavor = "current_thread")]
     async fn stream_matches_query_on_real_db() {
         let pg = std::env::var("OJ_TEST_PG").ok().filter(|s| !s.is_empty());
         let my = std::env::var("OJ_TEST_MYSQL")
@@ -1788,6 +1891,261 @@ mod tests {
                 .to_lowercase()
                 .contains("select"),
             "画像应含 SELECT: {v}"
+        );
+    }
+
+    // —— §3③ 真库 e2e（design §3③）：占位符统一改写 × 真实 postgres，经
+    // oj-db-postgres 插件后端（生产路径）。env-gated：OJ_TEST_PG 未设则静默 skip。
+    // 注意：改写发生在宿主 op 层（normalize_and_trace），对 DataAccessor 实现透明——
+    // 故插件后端与 core SqlxAccessor 走同一改写面；插件特有的方言缓存由 ffi mock 钉死。
+
+    /// 编译并加载 oj-db-postgres cdylib → DbBackend（进程内一次；DSN 未设返回 None）。
+    fn pg_backend() -> Option<Arc<dyn crate::bridge::DbBackend>> {
+        let Ok(_dsn) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return None;
+        };
+        static ONCE: std::sync::OnceLock<Option<Arc<dyn crate::bridge::DbBackend>>> =
+            std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let root = crate::bridge::ffi::workspace_root();
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "oj-db-postgres"])
+                .current_dir(&root)
+                .status()
+                .expect("invoke cargo build for oj-db-postgres");
+            assert!(status.success(), "oj-db-postgres build failed");
+            let (prefix, ext) = if cfg!(target_os = "windows") {
+                ("", "dll")
+            } else if cfg!(target_os = "macos") {
+                ("lib", "dylib")
+            } else {
+                ("lib", "so")
+            };
+            let built = root
+                .join("target/debug")
+                .join(format!("{prefix}oj_db_postgres.{ext}"));
+            let dir = root
+                .join("target/pg-e2e-plugins")
+                .join(crate::bridge::ffi::triple());
+            std::fs::create_dir_all(&dir).unwrap();
+            let dst = dir.join(crate::bridge::ffi::plugin_file_name("db-postgres"));
+            if !dst.exists() {
+                std::fs::copy(&built, &dst).expect("copy oj-db-postgres artifact");
+            }
+            let loaded = crate::bridge::plugin_loader::load_scanned(
+                &dir,
+                crate::bridge::plugin_loader::host_context(),
+                &|_, _| "{}".to_string(),
+            )
+            .expect("load oj-db-postgres plugin");
+            loaded
+                .iter()
+                .find_map(crate::bridge::plugin_loader::db_backend)
+        })
+        .clone()
+    }
+
+    /// connect 真库（每测试一次连接，供 Bridge 注入）。
+    async fn pg_accessor() -> Option<Arc<dyn DataAccessor>> {
+        let dsn = std::env::var("OJ_TEST_PG").ok()?;
+        let be = pg_backend()?;
+        let cfg_dir = crate::bridge::ffi::workspace_root().join("target/pg-e2e-cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        Some(be.connect(&dsn, &cfg_dir).await.expect("connect pg"))
+    }
+
+    /// 原始报障场景 + 字面量不误伤 + 方言自报：裸 `?` 写一次，PG 跑通。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_e2e_raw_question_mark_roundtrip() {
+        let Some(da) = pg_accessor().await else {
+            return;
+        };
+        let registry = SchemaRegistry::new().table("ph_e2e_a", &["id"], &["id", "name"]);
+        let b = Bridge::with_opts(da, Arc::new(InMemoryKV::new()), registry, false);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("create table if not exists ph_e2e_a (id integer primary key, name text)", []);
+                     await db.exec("delete from ph_e2e_a", []);
+                     await db.exec("insert into ph_e2e_a (id, name) values (?, ?)", [1, "a"]);
+                     await db.exec("insert into ph_e2e_a (id, name) values (?, 'a?b?')", [2]);
+                     const rows = await db.query("select id, name from ph_e2e_a where id = ? and name = ?", [1, "a"]);
+                     return json.ok({ dialect: db.dialect(), rows });
+                   })().catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "裸 `?` 在 PG 必须跑通（原始报障场景）：{v}");
+        assert_eq!(v["data"]["dialect"], json!("postgres"), "{v}");
+        assert_eq!(v["data"]["rows"], json!([{"id": 1, "name": "a"}]), "{v}");
+        // 字面量 `a?b?` 逐字相等——SQL 文本里的 `?` 未被改写误伤
+        let cap = b
+            .run_with(
+                r#"db.query("select name from ph_e2e_a where id = ?", [2])
+                     .then((rows) => json.ok({ name: rows[0].name }))
+                     .catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["name"], json!("a?b?"), "字面量 `?` 不得误伤：{v}");
+    }
+
+    /// `$1` + `?` 混用续号；tx 内裸 `?` 同场景（评审 P4）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_e2e_mixed_numbering_and_tx() {
+        let Some(da) = pg_accessor().await else {
+            return;
+        };
+        let registry = SchemaRegistry::new().table("ph_e2e_b", &["id"], &["id", "name"]);
+        let b = Bridge::with_opts(da, Arc::new(InMemoryKV::new()), registry, false);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("create table if not exists ph_e2e_b (id integer primary key, name text)", []);
+                     await db.exec("delete from ph_e2e_b", []);
+                     await db.exec("insert into ph_e2e_b (id, name) values (?, ?)", [1, "a"]);
+                     await db.exec("insert into ph_e2e_b (id, name) values (?, ?)", [2, "b"]);
+                     // `$1` 引 params[0]，`?` 续号为 $2 引 params[1]（vendored P() 兼容面）
+                     const mixed = (await db.query("select name from ph_e2e_b where id = $1 or name = ? order by name", [2, "a"])).map((r) => r.name);
+                     await db.tx(async (tx) => {
+                       await tx.exec("insert into ph_e2e_b (id, name) values (?, ?)", [9, "tx"]);
+                       const rows = await tx.query("select name from ph_e2e_b where id = ?", [9]);
+                       if (rows[0].name !== "tx") throw new Error("tx query failed");
+                     });
+                     const after = await db.query("select count(*) c from ph_e2e_b where name = ?", ["tx"]);
+                     return json.ok({ mixed, txCount: after[0].c });
+                   })().catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["mixed"], json!(["a", "b"]), "{v}");
+        assert_eq!(
+            v["data"]["txCount"],
+            json!(1),
+            "tx 内裸 `?` 写入未提交/已提交面: {v}"
+        );
+    }
+
+    /// stream 出口带 `?` 带参（评审 P4：改写覆盖三出口之一）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_e2e_stream_with_params() {
+        let Some(da) = pg_accessor().await else {
+            return;
+        };
+        let registry = SchemaRegistry::new().table("ph_e2e_c", &["id"], &["id", "name"]);
+        let b = Bridge::with_opts(da, Arc::new(InMemoryKV::new()), registry, false);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.exec("create table if not exists ph_e2e_c (id integer primary key, name text)", []);
+                     await db.exec("delete from ph_e2e_c", []);
+                     await db.exec("insert into ph_e2e_c (id, name) values (?, ?)", [1, "a"]);
+                     await db.exec("insert into ph_e2e_c (id, name) values (?, ?)", [2, "b"]);
+                     const ids = [];
+                     // INT4 列是插件已知不可解码面，cast text 规避（与占位符改写无关）
+                     await db.stream("select cast(id as text) as id from ph_e2e_c where id >= ? order by id", [1], {
+                       onRow: (r) => ids.push(r.id),
+                     });
+                     return json.ok({ ids });
+                   })().catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["ids"],
+            json!(["1", "2"]),
+            "stream 出口裸 `?` 必须跑通: {v}"
+        );
+    }
+
+    /// 计数不匹配 fail-loud：文案含两个数字 + 正解 hint（击穿验证报错本身，评审 P3/P4）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_e2e_count_mismatch_message() {
+        let Some(da) = pg_accessor().await else {
+            return;
+        };
+        let registry = SchemaRegistry::new().table("ph_e2e_d", &["id"], &["id", "name"]);
+        let b = Bridge::with_opts(da, Arc::new(InMemoryKV::new()), registry, false);
+        let cap = b
+            .run_with(
+                r#"db.query("insert into ph_e2e_d (id, name) values (?, ?)", [1])
+                     .then(() => json.ok({}))
+                     .catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert_ne!(v["code"], 0, "计数不匹配必须报错: {v}");
+        assert!(
+            msg.contains("placeholder count 2 != params 1"),
+            "文案须含两个数字: {msg}"
+        );
+        assert!(
+            msg.contains("hint") && msg.contains("jsonb_exists"),
+            "文案须含正解 hint: {msg}"
+        );
+    }
+
+    /// sql_trace 记原始 SQL：改写后执行，画像里仍是 `?` 而非 `$n`（评审 P6）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn pg_e2e_trace_records_original_sql() {
+        let Some(da) = pg_accessor().await else {
+            return;
+        };
+        let extras = crate::bridge::Extras {
+            sql_trace: crate::bridge::sql_trace::SqlTraceConfig {
+                enabled: true,
+                redact_params: true,
+                slow_ms: 0.0,
+                to_log: false,
+            },
+            ..Default::default()
+        };
+        let registry = SchemaRegistry::new().table("ph_e2e", &["id"], &["id", "name"]);
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), da as _)]),
+            Arc::new(InMemoryKV::new()),
+            registry,
+            false,
+            None,
+            extras,
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     await db.query("select ? as v", [7]);
+                     const p = db.sqlProfile();
+                     return json.ok({ sqls: p.events.map((e) => e.sql) });
+                   })().catch((e) => json.fail(500, String(e)));"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let sqls = v["data"]["sqls"].as_array().expect("profile events");
+        assert!(
+            sqls.iter().any(|s| s.as_str() == Some("select ? as v")),
+            "trace 须记原始 `?` SQL: {v}"
+        );
+        assert!(
+            sqls.iter()
+                .all(|s| !s.as_str().unwrap_or("").contains("$1")),
+            "trace 不得记改写后 SQL: {v}"
         );
     }
 }

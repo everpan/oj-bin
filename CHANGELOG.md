@@ -16,6 +16,37 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.67（未打标签）
+
+**feat（db）：`?` 成为三引擎统一绑定参数占位符——postgres 由宿主自动改写 `$n`**。
+裸 `db.query` / `db.exec` / `db.stream` / `db.tx` 的 SQL 里写 `?` 即可跨 sqlite / mysql /
+postgres 跑通，业务代码无需再按 `db.dialect()` 分支渲染占位符（修复 postgres 上
+`?` 报 `syntax error at end of input` 的原始报障）。改写发生在宿主 op 层单漏斗
+（`normalize_placeholders`，跳过字符串/标识符/注释/dollar-quote 引用区，
+`?|`/`?&`/几何 `?x` 运算符豁免，`$n` 按最大序号续接），对构造器路径与 db 插件透明；
+计数不匹配 fail-loud（仅 postgres：`placeholder count N != params M` + 正解 hint）；
+sql_trace 记原始 SQL 不受影响。三类人群升级说明：
+
+1. **一直写 `?` 的用户**：postgres 报错就此修复，存量代码零改动；
+2. **一直写 `$n` 的用户**：继续有效，无需任何修改——`$n` + `?` 混用时 `?` 按已有
+   最大序号续接（`where a = $1 and b = ?` → `b = $2`）；
+3. **用 `?|` / `?&`（及几何 `?#`/`?-`/`?<`/`?>`/`?=`/`?~`）的用户**：不受影响，
+   运算符形态的 `?` 一律豁免。
+
+已知限制（详见 api-manual「统一占位符」节的行为矩阵）：PG 下 **jsonb 裸 `?` 存在性
+运算符 + 带参** 与占位符无法区分，会被改写导致静默错绑——一律改用
+`jsonb_exists(doc, 'key')`（空参语句不受影响）；`E'…'` 转义引号内的 `?` 已感知、不受改写。
+计数 fail-loud 仅 postgres 触发，sqlite/mysql 的占位符/参数数不匹配仍由引擎执行期报错。
+
+**fix（测试基建，顺手修复的存量假绿）**：`next_seq_first_use_inside_tx_on_real_db` /
+`stream_matches_query_on_real_db` 两个 env-gated 用例误用 multi_thread flavor——
+deno op 内 `deno_unsync::spawn` 断言 CurrentThread，env 一设即 SIGABRT；它们自写下起
+从未真跑过（env 未设静默 skip）。改 current_thread 后在真库上修活。
+
+**devkit 四件同步**：SKILL.md / api-manual.md / scenarios.md / db-guide 中六处
+「pg 用 `$1`」旧表述全部反转为「统一 `?`」；api-manual 新增「统一占位符」节
+（三 DSN 示例 + PG × JSONB `?` × 参数行为矩阵 + 错误口径分列）。
+
 ## v0.1.66
 
 下游（oj-wiki P3 方言攻坚，MySQL 8.4.11 / PG 16.15 实机验证）反馈五项，本版全量修复：

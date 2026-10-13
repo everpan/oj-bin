@@ -762,8 +762,35 @@ CJS 包自动包装：`module.exports` → `default`；`require("pkg")` 走 `__o
 
 > 何时读我：写任何 handler 期间，查签名与语义。
 
-签名与 `global.d.ts` 一致（类型权威）。SQL 占位符方言：**sqlite / mysql 用 `?`，
-postgres 用 `$1`**；值一律经参数数组绑定。
+签名与 `global.d.ts` 一致（类型权威）。**`?` 是三引擎统一绑定参数占位符（0.1.67 起）**；
+值一律经参数数组绑定。
+
+#### 统一占位符（0.1.67）
+
+同一段 SQL、三引擎跑通——写 `?` 即可，postgres 由宿主 op 层自动改写为 `$n`，业务代码
+**无需 `db.dialect()` 分支**：
+
+```ts
+// 以下三 DSN（sqlite:./a.db / mysql://… / postgres://…）跑同一段 SQL：
+const rows = await db.query("select * from user where age > ? and name = ?", [18, "a"]);
+const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
+```
+
+- **存量 `$n` 写法继续有效**：postgres 上 `$n`+`?` 混用时，`?` 按已有最大序号续接
+  （`where a = $1 and b = ?` → `b = $2`）；不改也不报错。
+- **计数 fail-loud 仅 postgres**：改写后占位符数 ≠ 参数数即报
+  `placeholder count N != params M`（附正解 hint），比引擎侧报错更早、文案更可读；
+  sqlite/mysql 的同类不匹配仍由引擎在执行期报错（口径见各引擎错误表）。
+- **PG × JSONB `?` × 参数 行为矩阵**（`?` 运算符与占位符共用一个字符，宿主按下表处理）：
+
+| 写法 | params 空 | params 非空 | 说明 |
+| --- | --- | --- | --- |
+| `doc ?\| 'a','b'`（及 `?&`/`?#`/`?-`/`?<`/`?>`/`?=`/`?~`） | 可用 | 可用 | 后跟运算符字符的 `?` 一律豁免不改写 |
+| `doc ? 'key'`（裸 jsonb 存在性） | **可用** | **禁止**——`?` 会被当占位符改写，静默错绑 | 空参短路不误伤；带参必须换 `jsonb_exists` |
+| `E'a\'?b'` 等字符串字面量 | 可用 | 可用 | E-string 反斜杠转义已感知；但仍建议少用 |
+
+  **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
+  不写裸 `?` 运算符——它无法与占位符区分。
 
 ### 总表（27 组）
 
@@ -2694,8 +2721,8 @@ curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<titl
 
 - 内置只有 sqlite/memory；`mysql`/`postgres` 需对应插件（oj-db-mysql / oj-db-postgres），
   未装插件 → 启动报 `unknown db scheme`。
-- `DB("name")` 按名取库；查询构造器自动按库方言出 SQL；裸 SQL 占位符方言归业务
-  （sqlite/mysql `?`，postgres `$1`）。
+- `DB("name")` 按名取库；查询构造器自动按库方言出 SQL；裸 SQL **统一用 `?` 占位符**
+  （0.1.67 起，postgres 由宿主自动改写 `$n`；存量 `$n` 继续有效，见「统一占位符」节）。
 - `seed.sql` 启动时对 `default` 库重放，**三方言**（幂等靠 S006 门禁 + 引擎按方言改写）。
 - mysql/pg 连不上启动 fail-fast（连接串错/库未建）。
 - **按库运维（v0.1.21）**：`oj migrate` / `oj test fixture` / `oj schema diff` 的 `--db <name>`
@@ -3424,7 +3451,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   等）；换 SQL 文本或保持参数形态稳定。
 - `{id}.json` 混字面 pattern 非法——matchit 参数段不得混字面，拆成静态多段由 handler 校验。
 - `seed.sql` 不得含分号字面量（按 `;` 切分）；用 `INSERT OR IGNORE` 保证幂等。
-- postgres 占位符是 `$1`，sqlite/mysql 才是 `?`。
+- postgres 占位符 **0.1.67 起也用 `?`**（宿主自动改写 `$n`；`$n` 存量写法继续有效）；jsonb 存在性用 `jsonb_exists(doc, 'key')`，勿写裸 `?` 运算符。
 - 上传 413 双闸：`max_upload_bytes`（信封 413）+ axum 层 2x 硬顶（裸 413）——客户端看到
   的 413 未必带 oj 信封。
 - 未配置 `blob:` / `es:` 段时调用 `blob.*` / `es.*` 即报错（配置即启用）。

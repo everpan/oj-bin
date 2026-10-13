@@ -372,11 +372,23 @@ impl DbBackend for FfiDbBackend {
 pub struct FfiDataAccessor {
     handle: u64,
     vtable: &'static DataAccessorVtable,
+    /// 方言（0.1.67 构造期缓存）：方言是连接的静态属性，免得每条 SQL 一次 vtable 往返
+    /// （op 层占位符统一改写每次都要读方言；做法对齐 FfiDbBackend 构造期读 schemes）。
+    dialect: Dialect,
 }
 
 impl FfiDataAccessor {
     pub fn new(handle: u64, vtable: &'static DataAccessorVtable) -> Self {
-        Self { handle, vtable }
+        let dialect = match &(vtable.dialect)(handle)[..] {
+            "mysql" => Dialect::MySql,
+            "postgres" => Dialect::Postgres,
+            _ => Dialect::Sqlite,
+        };
+        Self {
+            handle,
+            vtable,
+            dialect,
+        }
     }
 }
 
@@ -391,11 +403,7 @@ fn params_json(
 #[async_trait::async_trait]
 impl DataAccessor for FfiDataAccessor {
     fn dialect(&self) -> Dialect {
-        match &(self.vtable.dialect)(self.handle)[..] {
-            "mysql" => Dialect::MySql,
-            "postgres" => Dialect::Postgres,
-            _ => Dialect::Sqlite,
-        }
+        self.dialect
     }
 
     async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
@@ -2546,18 +2554,30 @@ mod adapter_tests {
     }
 
     /// 方言自报映射：mysql → MySql；未知方言兜底 Sqlite（宿主不改插件契约）。
+    /// 0.1.67 起方言在**构造期**缓存（连接的静态属性，免每条 SQL 一次 vtable 往返）
+    /// ——故模式须在构造前设定，构造后不再随 vtable 变化。
     #[test]
     fn given_dialect_variants_when_reported_then_mapped_with_sqlite_fallback() {
         let _g = T_LOCK.lock().unwrap();
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
         {
             let _m = Mode::set(&DB_DIALECT_MODE, 1);
+            let da = FfiDataAccessor::new(42, mock_db_vtable());
             assert_eq!(da.dialect(), Dialect::MySql);
         }
         {
             let _m = Mode::set(&DB_DIALECT_MODE, 2);
+            let da = FfiDataAccessor::new(42, mock_db_vtable());
             assert_eq!(da.dialect(), Dialect::Sqlite);
         }
+        // 默认模式（postgres）+ 构造后切模式不再生效（缓存语义钉死）
+        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        assert_eq!(da.dialect(), Dialect::Postgres);
+        let _m = Mode::set(&DB_DIALECT_MODE, 1);
+        assert_eq!(
+            da.dialect(),
+            Dialect::Postgres,
+            "构造期缓存：构造后不随 vtable 变化"
+        );
     }
 
     /// commit 失败 → Err 且事务视为未完结：drop 保底回滚仍触发（ReqState reset
