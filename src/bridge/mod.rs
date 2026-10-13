@@ -2912,7 +2912,8 @@ mod tests {
         bad.params.insert("id".into(), "x".into());
         let cap = b.run_module(&api, "asset.get", bad, t).await.unwrap();
         assert_eq!(
-            cap.status, 400,
+            cap.status,
+            400,
             "asset.get 应继承组级 params.id 契约: {}",
             String::from_utf8_lossy(&cap.body)
         );
@@ -2931,7 +2932,8 @@ mod tests {
         p.body = serde_json::to_vec(&json!({})).unwrap();
         let cap = b.run_module(&api, "asset.post", p, t).await.unwrap();
         assert_eq!(
-            cap.status, 400,
+            cap.status,
+            400,
             "asset.post 应合并 body.name 契约: {}",
             String::from_utf8_lossy(&cap.body)
         );
