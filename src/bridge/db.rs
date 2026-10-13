@@ -1231,6 +1231,131 @@ mod tests {
         );
     }
 
+    // —— §3④ `_shared/search.ts` 三方言真库回归（v0.1.68 修复 pg 占位符）——
+    //
+    // search 共享模块此前自写 `$1`（likeFallback 多字段 OR、pg FTS 非 highlight），与
+    // 宿主统一占位符改写的参数计数校验冲突 → pg 上 `search.query` 一律报错
+    // `placeholder count 1 != params N`。修复后统一 `?` 交宿主改写。本用例把
+    // `sample/src/_platform/_shared/search.ts` 转译后内联进 bridge，三种数据库跑同一
+    // 脚本：多字段表（≥2 字段，验证绑定数量正确）× FTS 非 highlight/highlight ×
+    // 2 字/1 字 LIKE 回退 × remove 后零命中 × 大小写混合查询（LIKE 回退与 FTS 两路）。
+    // 需设 OJ_TEST_PG / OJ_TEST_MYSQL 才跑对应数据库分支（sqlite 内存库分支常跑）。
+
+    /// 转译 sample 的 search 共享模块为可内联 JS（script 上下文无模块系统：剥 export，
+    /// type/interface 已被转译剥离）。
+    fn search_shared_js() -> String {
+        let root = crate::bridge::ffi::workspace_root();
+        let path = root.join("sample/src/_platform/_shared/search.ts");
+        let src = std::fs::read_to_string(&path).expect("read search.ts");
+        let js = crate::bridge::transpile::transpile_src(&path, &src).expect("transpile search.ts");
+        js.replace("export ", "")
+    }
+
+    /// search 三方言统一脚本：ensure/index/query(FTS+回退+高亮)/remove 全链路。
+    const SEARCH_SHARED_HARNESS: &str = r#"
+(async () => {
+  const T = "_oj_search_real";
+  await db.exec(`drop table if exists ${T}`, []);
+  await db.exec(`create table ${T} (id integer primary key, title text, body text)`, []);
+  const search = createSearch(db);
+  await search.ensureIndex(T, { fields: ["title", "body"] });
+  await search.index(T, { id: 1, title: "部署手册", body: "生产 环境" });
+  await search.index(T, { id: 2, title: "公告", body: "本周例会" });
+  await search.index(T, { id: 3, title: "Release Notes", body: "Kafka Cluster" });
+  const r = {};
+  // ① FTS ≥3 字非 highlight（pg 非高亮路径修复前 count 1 != 2）
+  r.fts = (await search.query(T, "部署手册")).map((h) => Number(h.id));
+  // ② FTS highlight（pg ts_headline 为第三处占位符）
+  const hl = await search.query(T, "部署手册", { highlight: true });
+  r.hlIds = hl.map((h) => Number(h.id));
+  r.hlMark = JSON.stringify((hl[0] && hl[0].fragments) || {}).includes("<mark>");
+  // ③ 2 字 LIKE 回退，多字段 OR（修复前 pg count 1 != 2）
+  r.two = (await search.query(T, "部署")).map((h) => Number(h.id));
+  // ④ 1 字 LIKE 回退
+  r.one = (await search.query(T, "公")).map((h) => Number(h.id));
+  // ⑤ remove 后 FTS 不再命中
+  await search.remove(T, 2);
+  r.afterRemove = (await search.query(T, "本周例会")).map((h) => Number(h.id));
+  // ⑥ 大小写混合：2 字回退（小写查大写原文 / 大写查小写查询词）——pg 用
+  //    ILIKE 对齐 sqlite/mysql 的不敏感语义（修复前 pg 上两者均空）
+  r.kaLower = (await search.query(T, "ka")).map((h) => Number(h.id));
+  r.kaUpper = (await search.query(T, "KA")).map((h) => Number(h.id));
+  // ⑦ 大小写混合：FTS 路径（trigram/'simple'/ngram 皆折叠大小写，大写查询词命中）
+  r.ftsCase = (await search.query(T, "RELEASE")).map((h) => Number(h.id));
+  json.ok(r);
+})().catch(e => json.fail(500, String(e)));"#;
+
+    /// 单个数据库分支执行 + 断言（sqlite 内存库 / pg / mysql 共用）。
+    async fn search_shared_check(js: &str, url: &str, tag: &str) {
+        let db = crate::bridge::SqlxAccessor::arc(url).await.unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let src = format!("{js}\n{SEARCH_SHARED_HARNESS}");
+        let cap = b
+            .run_with(&src, crate::bridge::RequestInfo::default())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "[{tag}] search harness failed: {v}");
+        assert_eq!(v["data"]["fts"], json!([1]), "[{tag}] FTS ≥3字: {v}");
+        assert_eq!(v["data"]["hlIds"], json!([1]), "[{tag}] FTS highlight: {v}");
+        assert_eq!(
+            v["data"]["hlMark"],
+            json!(true),
+            "[{tag}] highlight <mark>: {v}"
+        );
+        assert_eq!(v["data"]["two"], json!([1]), "[{tag}] 2字 LIKE 回退: {v}");
+        assert_eq!(v["data"]["one"], json!([2]), "[{tag}] 1字 LIKE 回退: {v}");
+        assert_eq!(
+            v["data"]["afterRemove"],
+            json!([]),
+            "[{tag}] remove 后: {v}"
+        );
+        // ⑥ 大小写：row3 body "Kafka Cluster"，row2 已 remove 不干扰
+        assert_eq!(
+            v["data"]["kaLower"],
+            json!([3]),
+            "[{tag}] 回退小写查询词: {v}"
+        );
+        assert_eq!(
+            v["data"]["kaUpper"],
+            json!([3]),
+            "[{tag}] 回退大写查询词: {v}"
+        );
+        // ⑦ FTS 路径大小写折叠（trigram/'simple'/ngram）
+        assert_eq!(
+            v["data"]["ftsCase"],
+            json!([3]),
+            "[{tag}] FTS 大写查询词: {v}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_shared_module_on_real_dbs() {
+        let js = search_shared_js();
+        // sqlite 内存库分支：无 env 依赖，验证 JS 本体与三方言共用路径。
+        search_shared_check(&js, "sqlite::memory:", "sqlite").await;
+        let pg = std::env::var("OJ_TEST_PG").ok().filter(|s| !s.is_empty());
+        let my = std::env::var("OJ_TEST_MYSQL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if pg.is_none() && my.is_none() {
+            eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
+        }
+        if let Some(url) = pg {
+            search_shared_check(&js, &url, "pg").await;
+        }
+        if let Some(url) = my {
+            search_shared_check(&js, &url, "mysql").await;
+        }
+    }
+
     /// 序列名越界（空 / 超 128）→ 明确报错。
     #[tokio::test(flavor = "current_thread")]
     async fn next_seq_rejects_bad_name() {

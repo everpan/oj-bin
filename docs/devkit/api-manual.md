@@ -345,7 +345,7 @@ export default {
 };
 ```
 
-两种写法等价可用；同一文件可混用。响应一律经 `json.ok` / `json.fail` 收口（第 7 章）。
+两种写法等价可用；同一文件可混用。响应一律通过 `json.ok` / `json.fail` 统一返回（第 7 章）。
 
 ### 请求体 http.body
 
@@ -697,7 +697,7 @@ import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必�
 - 后缀补全与相对导入同序；别名路径禁 `..` / 空段。
 - **只能在模块内的文件里用**：模块根由**文件自身位置**派生——从所在目录向上找最近的
   `manifest.yaml` 祖先。`src/tests` 用例目录与任务池在模块外 → 没有锚点，继续用相对路径。
-  运行期与构建期**共用同一份探针**（`resolve_relative` / `resolve_alias`），所以 dev 与
+  运行期与构建期**共用同一套路径解析逻辑**（`resolve_relative` / `resolve_alias`），所以 dev 与
   release 对同一 specifier 必然命中同一文件（含目录索引）。
 - **跨模块别名需声明依赖**：`manifest.yaml` 的 `deps` 缺目标模块 → `oj build` 报 S008
   （与表归属 S003 同一套归属图）。既有**相对**跨模块引用不追溯（升级不破坏）。
@@ -778,9 +778,9 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 
 - **存量 `$n` 写法继续有效**：postgres 上 `$n`+`?` 混用时，`?` 按已有最大序号续接
   （`where a = $1 and b = ?` → `b = $2`）；不改也不报错。
-- **计数 fail-loud 仅 postgres**：改写后占位符数 ≠ 参数数即报
+- **参数计数校验仅 postgres**：改写后占位符数 ≠ 参数数即报
   `placeholder count N != params M`（附正解 hint），比引擎侧报错更早、文案更可读；
-  sqlite/mysql 的同类不匹配仍由引擎在执行期报错（口径见各引擎错误表）。
+  sqlite/mysql 的同类不匹配仍由引擎在执行期报错（提示文本见各引擎错误表）。
 - **PG × JSONB `?` × 参数 行为矩阵**（`?` 运算符与占位符共用一个字符，宿主按下表处理）：
 
 | 写法 | params 空 | params 非空 | 说明 |
@@ -1249,7 +1249,7 @@ JS 的 `number` 只有 f64 精度（安全整数上界 **`2^53-1`**，约 900719
 （REAL/DOUBLE 列仍是 `number`；`es.search` 的 long 字段同规则。）
 
 - **`toBigInt(v): bigint`** —— 字符串/安全范围内的 number/bigint → 精确 64 位整数。
-  **fail-loud**：`Number("<大整数串>")` 的产物、`1.5`、`"007"`、超 i64 等一律 **throw**。
+  **无法精确转换时直接报错**：`Number("<大整数串>")` 的产物、`1.5`、`"007"`、超 i64 等一律 **throw**。
 - **`toUBigInt(v): bigint`** —— 同上但为**无符号** 64 位 `[0, 2^64-1]`（v0.1.24）。
   **只有 MySQL `BIGINT UNSIGNED` 列能承载**；PG / SQLite 传它会明确报错（它们的 bigint 就是
   i64），请把这类值存成 text 或换库。跨 op 编码为 `{"$oj$u64":"<十进制>"}`。
@@ -1350,7 +1350,7 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 ① s3 后端：`blob.uploadUrl(key)` 拿预签名 PUT URL 给客户端直传；② 任意后端：
 `PUT {base}/blob/{key}` 内置路由（**过鉴权守卫**，Bearer/cookie 即令牌；体积上限独立
 `server.blob_upload_max_bytes`，默认 1 GiB；不经 JsActor，无 30s 限制）。下载侧 local
-内联腿支持 `Range` 单区间（206 + Content-Range；越界 416），pdf.js/媒体 seek 直接可用。
+内联附件的响应支持 `Range` 单区间（206 + Content-Range；越界 416），pdf.js/媒体 seek 直接可用。
 
 **multipart 大文件流式落 blob（v0.1.38）**：multipart 上传不再整段缓冲——**大于
 `server.max_upload_bytes` 的文件字段由服务端流式写进 blob**（local 落盘 / s3 multipart，
@@ -1670,7 +1670,7 @@ ldap:
   bindPw per search call)`（config 只有密码无 DN）。全部 reject，不会 resolve 半个信封。
 - **filter 注入**：`filter` 是拼进 LDAP 查询的字符串，`(uid=${username})` 若 `username`
   含 `*`/`()`/`\` 会改变查询语义（LDAP 无参数绑定）。**先转义**（把 `*` `(` `)` `\` NUL
-  前缀 `\`）或用 `axis("ldap").compare` 收口。
+  前缀 `\`）或用 `axis("ldap").compare` 做精确比较。
 
 ### log —— 结构化日志
 
@@ -2280,7 +2280,7 @@ tenant:
 供 handler 做数据隔离。`tenant.anonymous_paths`（与 `auth.anonymous_paths` 同语义）是
 **去 base 前缀**后的路径列表，支持四种通配形态：字面、`/*`（严格一层）、`**`（跨任意层）、
 中段 `*`（恰好一段）。豁免命中且确实没带租户头的请求被标记为**匿名**
-（`RequestInfo.anonymous`），不再因缺头而 400——这是给 OIDC 302 跳转腿用的（浏览器带不了
+（`RequestInfo.anonymous`），不再因缺头而 400——这是给 OIDC 302 跳转请求用的（浏览器带不了
 自定义头）。已带的头仍照常注入。
 
 **租户声明的服务端绑定（`tenant.require_signed_claim`，v0.1.41，默认 false）**：开启后
@@ -2359,7 +2359,7 @@ curl 需另带 `-H 'X-TENANT-ID: acme'`（完整命令见 `src/auth_demo/README.
 `src/idp/` 是同进程 **OP**（`/.well-known/openid-configuration`、`jwks.json`、
 `authorize`、`login`、`token`、`userinfo`——标准协议端点用 `json.raw` 出裸 JSON）；
 `src/oidc/` 是 **RP**（`login` → 302 授权 → `callback` 换会话桥接成本地
-`auth` token → `logout`）。OIDC 的 302 跳转腿带不了自定义头，故 demo 在
+`auth` token → `logout`）。OIDC 的 302 跳转请求带不了自定义头，故 demo 在
 `tenant.anonymous_paths` 与 `auth.anonymous_paths` **两条列表**里都匿名
 `/oidc/*`、`/idp/*`、`/idp/.well-known/*`（窄面：discovery 比 `/idp/*` 深一层，故单列；
 auth 的 `/idp/*` 标 `one_layer: true` 确认「有意一层」；键见第 10 章 tenant/auth）；
@@ -2371,7 +2371,7 @@ oj 仓库 `sample/`（github.com/everpan/oj-bin）的「OIDC 演示」；实现�
 > 分层注记：`oj-auth` 插件只是**守卫**（Bearer/cookie 验签 + 匿名路径 + CSRF），
 > `src/auth/`、`src/oidc/` 这些登录端点全是**普通业务模块**——守卫对
 > 登录来源不可见。新增一种登录来源（企业 HTTP 表单 / CAS SSO 等）= 新写一个业务
-> 模块 + 匿名路径放行跳转腿，不改插件、不动 ABI；JIT 建号用「来源前缀键 +
+> 模块 + 匿名路径放行跳转请求，不改插件、不动 ABI；JIT 建号用「来源前缀键 +
 > 非法占位 password_hash（`bcrypt.verify` 恒 false）」。可照抄见 `scenarios.md` 场景 28。
 
 ## 9. 测试
@@ -2831,7 +2831,7 @@ V8 runtime 按 Worker 数常驻；单帧超时只断该连接（毒化 Worker �
 ### tenant / auth
 
 字段与语义见第 8 章。tenant：默认关闭、header 默认 `X-TENANT-ID`、`anonymous_paths`
-跳转腿豁免；v0.1.15 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
+跳转请求豁免；v0.1.15 起增 `sql_guard`（false|"warn"|"deny"）与 `shared_allow` 共享表
 白名单，语义与建表要求见第 8 章与 `docs/tenant-guide.md`。auth：`jwt_secret`（空串
 启动 fail-fast，生产必改）、`signing_method`（HS256|HS384|HS512，默认 HS256）、
 `access_token_duration`（默认 60s）、`refresh_token_duration`（默认 720h）、
@@ -2856,20 +2856,20 @@ RS256 签名/验签原语与装配期配置（第 6 章 `oidc` 全局）；缺 `
 
 顶层 `http_sso:` 段（map：提供者名 → 配置）装配期注入；缺段调用 `sso.providers` 报
 `http sso not configured`。**登录端点是普通业务模块**（`src/sso/` 参考实现，
-守卫只认签出的 token）——form 登录端点与 CAS 302 腿都要进 `auth.anonymous_paths` 与
+守卫只认签出的 token）——form 登录端点与 CAS 302 跳转请求都要进 `auth.anonymous_paths` 与
 `tenant.anonymous_paths` 两条列表。
 
 | 键 | 说明 |
 |---|---|
 | `kind` | `form`（转发凭据到企业端点，按响应判成败）\| `cas2`（302 跳转 + ticket 回校） |
 | `login_url` | form: 凭据校验端点；cas2: CAS `/login` |
-| `cas_validate_url` / `callback_url` | cas2 必填：ticket 校验端点 / 本站回跳绝对 URL（装配期固定，**禁从请求 Host 派生**，两腿 service 必须同串） |
+| `cas_validate_url` / `callback_url` | cas2 必填：ticket 校验端点 / 本站回跳绝对 URL（装配期固定，**禁从请求 Host 派生**，两处请求的 service 必须同串） |
 | `user_field` / `pass_field` | 凭据字段名，缺省 `username` / `password` |
 | `body_encoding` | form 出站编码：`form`（urlencoded，缺省）\| `json` |
 | `extra_fields` | 附加固定字段（app_id 等；secret 类值写 `ENC[...]`，装载期自动解封） |
 | `success_when` | 成功判定：点路径 → 期望值，全部命中即成功；form 必填 |
 | `profile` | 用户信息映射：本地 users 列 → 上游响应点路径 |
-| `allow_http` | 显式允许 `http://` 上游（内网联调）；缺省拒绝（同 smtp `allow_none_tls` 口径） |
+| `allow_http` | 显式允许 `http://` 上游（内网联调）；缺省拒绝（与 smtp `allow_none_tls` 行为一致） |
 
 判定语义：点路径只支持 `.` 分隔对象遍历；**缺失/null 仅当期望值为 `null` 时命中**；其余
 `String(actual) === String(expected)`（`0` 与 `"0"` 互命中）。mm-wiki 判据
@@ -3144,7 +3144,7 @@ npm i @oj-bin/oj     # 主包；optionalDependencies 自动带平台子包 @oj-b
 
 **config.yaml 不是必需的**（v0.1.57 起 `-c` 可省）：省略时按「CWD 逐级向上 `config.yaml`
 → `$HOME/.oj/config.yaml`」搜索，都没有就用内置默认值（**v0.1.60 起 `oj exec` 静默回落、
-不再向 stderr 打 `note:`**，与 `oj info` 同口径；仅 `serve`/`migrate`/`openapi` 等依赖后端配置
+不再向 stderr 打 `note:`**，与 `oj info` 行为一致；仅 `serve`/`migrate`/`openapi` 等依赖后端配置
 的场景保留该提示）——纯计算脚本（`-e '1'` 之类，不碰 db/表白名单）零配置可跑。目录解析
 （`-d` 缺省时）：取 config/mounts 的第一条 api 挂载，无挂载才向上探测（只认「像业务树」的候选，
 见 `-d` 参数行）；在源码仓根这类「祖先带非业务 `src/`」的地方裸跑，会得到 `service dir not
@@ -3400,7 +3400,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | tasks 池禁用别名 / 不得越池根 | 任务池是非版本化资产（只镜像 `dist/<tasks.dir>/`），无法绑定模块版本 |
 | web 挂载无目录列表 / Range / ETag | 未知扩展名按 `application/octet-stream`；SPA 深链回落需挂载显式 `spa: true`（v0.1.58 起逐挂载，默认关——静默把 404 变 200 会掩盖错配，见 `scenarios.md` 场景 2）；HTML 缓存头可配 `server.html_cache_control`（v0.1.25，只作用于 HTML）；Range/ETag 经前置反代补；web 挂载仅 GET/HEAD（其余方法 405） |
 | 多挂载（v0.1.58） | 同类前缀归一后重复 → 启动报错；挂载目录缺失/非目录 → 启动报错；命中挂载内 miss **不跨挂载**回落；`spa` 逐挂载显式（配对 web 恒无回落）；`html_meta`/`html_cache_control` 是全局键、按命中挂载根生效 |
-| search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 腿仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音 |
+| search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 实现仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音；pg 实现 v0.1.68 修复（自写 `$n` 与统一占位符计数校验冲突 + `ts_headline` 签名错——highlight 的 fragments 键为 `_doc` 文档级片段）；短词回退大小写三方言一致（pg 用 `ILIKE`，v0.1.68 起） |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |

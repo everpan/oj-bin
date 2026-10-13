@@ -32,7 +32,7 @@
 | [22](#场景-22应用层-aes-gcm-字段加密v0135) | 应用层 AES-GCM 字段加密——`crypto.aesGcmEncrypt` / `aesGcmDecrypt`（仅 AES-128/256，密钥自管，v0.1.35） | §6 crypto |
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 | [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
-| [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 收口公共前缀与公共入参 | §4 编写 api.ts |
+| [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 统一声明公共前缀与公共入参 | §4 编写 api.ts |
 
 ---
 
@@ -407,7 +407,7 @@ json.ok({ page, size, rows });
 ## 场景 5：匿名路径怎么写
 
 **什么时候用**：有些路径要免鉴权——`tenant.anonymous_paths` 免租户头，
-`auth.anonymous_paths` 免 Bearer。典型场景是 OIDC 跳转腿：OIDC 是「跳到第三方登录页
+`auth.anonymous_paths` 免 Bearer。典型场景是 OIDC 跳转请求：OIDC 是「跳到第三方登录页
 再跳回来」的单点登录流程，浏览器发起的 302 跳转带不了自定义头，也带不了 Authorization。
 
 ### ① 四种通配形态
@@ -433,7 +433,7 @@ auth:
     - "/idp/**"
 ```
 
-> 两条列表是**独立的**：OIDC 回调这种「浏览器跳转腿」通常**两个都要加**，
+> 两条列表是**独立的**：OIDC 回调这类「浏览器跳转请求」通常**两个都要加**，
 > 只加一个仍会被另一道守卫拦下。
 
 ### ② v0.1.20 的行为变更（只需检查 `auth.anonymous_paths`）
@@ -610,7 +610,7 @@ await db.query("select note from seq where id = ?", [idFromClient]);            
 ### ④ 验证
 
 ```ts
-// 连续两次分配必须各自推进（并把"旧写法会坍缩"钉死）
+// 连续两次分配必须各自推进（确认"旧写法会坍缩"的问题不再出现）
 const m = toBigInt((await db.query("select max(id) as m from seq"))[0].m);
 const collapsed = Number(m.toString()) + 1;
 expect(collapsed === Number(m)).toBe(true);          // +1 被 f64 吸收
@@ -989,7 +989,7 @@ log.info("done", "fixed", dry ? 0 : rows.length);
 ### ⑥ 零配置与表达式回显（v0.1.60）
 
 **无需 config.yaml**：省略 `-c` 时向上搜索不到即用内置默认，且**不再向 stderr 打
-`note: no config.yaml found`**（`oj exec` / `oj info` 同口径；仅 `serve` / `migrate` /
+`note: no config.yaml found`**（`oj exec` / `oj info` 行为一致；仅 `serve` / `migrate` /
 `openapi` 等依赖后端配置的场景保留该提示）。纯计算脚本 `-e '1'` 之类可零配置直接跑。
 
 **`-e` / REPL 默认回显单表达式求值结果**（devtools 风格）：整段是单个顶层表达式语句时
@@ -1051,7 +1051,7 @@ curl -X PUT --data-binary @big.docx \
 
 | 现象 | 原因 |
 |---|---|
-| PUT 413 | 直传腿看 `blob_upload_max_bytes`（1 GiB），**不是** `max_upload_bytes`；改后者没用 |
+| PUT 413 | 直传路由看 `blob_upload_max_bytes`（1 GiB），**不是** `max_upload_bytes`；改后者没用 |
 | PUT 401 | 直传路由过守卫——头没带或 cookie 过期（WS/cookie 语义见场景 14） |
 | `blob.uploadUrl` multipart 报 not supported | s3 插件只预签名单发 PUT（object_store 无 multipart presign API）；>1 GiB 分片是已知限制 |
 | 大文件处理仍 408 | 直传只解决**存**字节；解析/转换仍走业务路由——给该路由配 `route_timeouts`（见 §10） |
@@ -1918,21 +1918,21 @@ false**——该号永远不能走本地密码登录，只能由 SSO 换发（OI
 
 ### ③ CAS 形态：302 跳转 + ticket 回校
 
-- 跳转腿 `GET /sso/cas/login` → 302 到 `{cas}/login?service={callback URL}`；
-- 回跳腿 `GET /sso/cas/callback?ticket=ST-…` →
+- 跳转请求 `GET /sso/cas/login` → 302 到 `{cas}/login?service={callback URL}`；
+- 回跳请求 `GET /sso/cas/callback?ticket=ST-…` →
   `fetch("{cas}/serviceValidate?ticket=…&service=…")` → 响应含
   `<cas:authenticationSuccess>` 即成功，取 `<cas:user>` 走上面同款 JIT；
 - 成功后签发 token 并 302 回前端。**交接红线**：token 不进 URL（httpOnly 双 cookie，
   场景 14）；`service` 用装配期配置的固定 callback URL（禁从请求 Host 派生）；302
   目标只认配置固定值或 `/` 开头且非 `//` 的相对路径（绝对 URL 400，防 open-redirect）。
 
-### ④ 配置：登录端点与 302 腿都进两条匿名列表
+### ④ 配置：登录端点与 302 跳转请求都进两条匿名列表
 
 ```yaml
 auth:
   anonymous_paths:
     - "/sso/login"                                # form 登录端点：无 token 可言，必须匿名
-    - { path: "/sso/cas/*", one_layer: true }     # CAS 302 腿（带不了自定义头）
+    - { path: "/sso/cas/*", one_layer: true }     # CAS 302 跳转请求（带不了自定义头）
 tenant:
   anonymous_paths:
     - "/sso/login"
@@ -1940,7 +1940,7 @@ tenant:
 ```
 
 登录端点**必须**匿名——守卫对非匿名路径无 token 一律 401，而登录恰恰是无 token 时
-调用的（`/auth/login` 先例）；CAS 302 腿还带不了自定义头/租户头，故两条列表都要。
+调用的（`/auth/login` 先例）；CAS 302 跳转请求还带不了自定义头/租户头，故两条列表都要。
 
 ### ⑤ 常见坑
 
@@ -1950,8 +1950,8 @@ tenant:
 | JIT 建号给了真实口令 hash 或空串 | 占位串（`"!sso"`）就是「此号不走密码登录」的声明——bcrypt 对非法 hash 恒 false；写真实 hash 等于给 SSO 账号开了第二条密码攻击面 |
 | username 不带来源前缀 | `sso:zhang` 与本地 `zhang` 必须是两个号；混用同一键 = 低信任来源可接管高信任账号 |
 | 把外部 SSO 响应体回吐给前端 | 泄露内部信息——失败统一 `json.fail(401, …)`，成功判定只读具体字段 |
-| 生产走 http:// | SSO 凭据明文过网——缺省拒绝非 https 的 `login_url`（装配期报错），内网联调显式 `allow_http: true` 才放行（带 WARN，与 mail 的 `allow_none_tls` 同口径）；凭据不进日志 |
-| CAS 回跳 401 | 跳转/回跳腿没进 `auth.` / `tenant.` **两条**匿名列表（互相独立，只加一条不够） |
+| 生产走 http:// | SSO 凭据明文过网——缺省拒绝非 https 的 `login_url`（装配期报错），内网联调显式 `allow_http: true` 才放行（带 WARN，与 mail 的 `allow_none_tls` 行为一致）；凭据不进日志 |
+| CAS 回跳 401 | 跳转/回跳请求没进 `auth.` / `tenant.` **两条**匿名列表（互相独立，只加一条不够） |
 | token 拼进 CAS 回跳 URL | 泄露面（Referer/浏览器历史）——httpOnly 双 cookie 交接；302 目标只认配置固定值或 `/` 开头相对路径，防 open-redirect |
 
 ## 场景 29：引擎原生全文检索（`_shared/search`，v0.1.61）
@@ -1995,7 +1995,7 @@ const hits = await search.query("docs", "环境部署", { limit: 20, highlight: 
 
 ### ③ 验证
 
-L1（sqlite 腿，`oj test`）：`tests/search.test.ts`——增删改后检索一致、短词回退、
+L1（基于 sqlite，`oj test`）：`tests/search.test.ts`——增删改后检索一致、短词回退、
 DDL 拒事务、标识符白名单。
 
 ### ④ 常见坑
@@ -2160,7 +2160,7 @@ GET  /v1/api/nest/asset/schema    → 404（元数据不生成路由）
 
 > 何时抄我：你在设计一个**聚合**（如「项目 Project」带成员、看板、附件），要决定
 > 「哪些端点进同一个实体组、哪些拆目录、组级路由/契约怎么挂」。本场景给一套可照抄的
-> **领域驱动设计落点**，重点是用**组级 `.route` + 组级 `.schema`** 一次性收口整组的
+> **领域驱动设计落点**，重点是用**组级 `.route` + 组级 `.schema`** 一次性统一声明整组的
 > 前缀与公共入参，避免每个动词重复声明。
 > 配套：`src/nest/api.ts`（L1 `tests/nest.test.ts`）；手册 §4「嵌套 handler 组」。
 
@@ -2173,7 +2173,7 @@ GET  /v1/api/nest/asset/schema    → 404（元数据不生成路由）
 | 聚合内从属资源 | **子组**（随聚合根路由） | `project.members`（成员随项目生命周期，无独立 URL 空间） |
 | 独立聚合 | **独立目录 / 文件** | `billing` 不进 `project` 组——各自演化、各自鉴权 |
 
-### ② 组级 `.route` + 组级 `.schema`：整组收口前缀与公共入参
+### ② 组级 `.route` + 组级 `.schema`：整组统一声明前缀与公共入参
 
 `project` 聚合的端点分两类：集合端（`GET/POST /project`，无 id）与条目端
 （`GET/PUT /project/{projectId}`，带 id）。**组级 `.schema` 只承载跨端点共享的 query
@@ -2233,7 +2233,7 @@ export default { project };
 | 平铺 | 模块根只有 ≤3 个动词 | 动词一多立刻收进实体组 |
 
 一句话：**同一聚合的操作进同一个实体组，不同聚合才拆目录；组级 `.route`/`.schema`
-收口公共前缀与公共入参，动词只补差异**。在「多文件夹」与「大文件」之间取平衡，
+统一声明公共前缀与公共入参，动词只补差异**。在「多文件夹」与「大文件」之间取平衡，
 文件仍过胖则是聚合该拆的领域信号，而非改用目录结构掩盖。
 
 ### ④ 验证

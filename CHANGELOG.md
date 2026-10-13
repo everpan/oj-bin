@@ -16,7 +16,28 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.67（未打标签）
+## v0.1.68
+
+**fix（sample）：`_shared/search.ts` pg 分支占位符与 `ts_headline` 调用修复（pg 真库验证首次跑通）**。
+search 共享模块沿用 v0.1.61 的「pg 自写 `$n`」旧约定，与 v0.1.67 的统一占位符正面相撞：
+likeFallback 多字段 OR 全写 `$1` 却绑 N 个参数、pg FTS 非 highlight 路径 `$1` 出现两处绑
+2 个 → pg 上 `search.query` 一律报错（`placeholder count 1 != params N`）。
+改为三方言统一 `?` 交宿主改写（删除 `P` 方言分支，highlight 与否绑定数 3/2 一一对应）；
+顺带修 `ts_headline` 调用——原样照抄 sqlite `snippet()` 的七位置参数签名（PG 实际签名
+`(config, document text, query, options 单字符串)`，document 须拼回原文而非 tsvector），
+pg 高亮此前从未可用。**大小写语义对齐**：pg 的 `LIKE` 大小写敏感（sqlite LIKE 对 ASCII
+不敏感、mysql 默认 collation 为 CI），likeFallback 在 pg 分支改用 `ILIKE`（同样支持
+`ESCAPE` 子句），三方言短词回退行为一致。新增三方言真库回归
+`search_shared_module_on_real_dbs`
+（多字段表验证绑定数 × FTS 非 highlight/highlight × 2 字/1 字 LIKE 回退 × remove 后
+零命中 × 大小写混合查询——LIKE 回退与 FTS 两路都覆盖；sqlite 内存库常跑，pg/mysql 需设
+真库环境变量）。
+
+**devkit 四件同步**：api-manual 限制表补 search pg 修复与 ILIKE 说明；SKILL.md 陷阱速查
+新增「pg 上 `search.query` 报 `placeholder count 1 != params N`」一行；另对四件做了一轮
+表述通用化清理（如「腿/钉死/口径」等内部说法改为通用表述，不改变任何技术含义）。
+
+## v0.1.67
 
 **feat（db）：`?` 成为三引擎统一绑定参数占位符——postgres 由宿主自动改写 `$n`**。
 裸 `db.query` / `db.exec` / `db.stream` / `db.tx` 的 SQL 里写 `?` 即可跨 sqlite / mysql /

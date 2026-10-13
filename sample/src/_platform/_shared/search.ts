@@ -4,7 +4,9 @@
 // 调用方事务，isTx 句柄直接拒绝）；index/remove = 业务表 upsert/delete（三引擎索引
 // 随业务行自动维护，绝不直写 FTS 对象）；query = MATCH 裸 SQL + 绑定参数（标识符
 // 白名单校验后拼接）。score 为引擎原始分，**不可跨引擎比较**。
-// 占位符：pg $n，sqlite/mysql ?（sqlx Any 不转换）。
+// 占位符：三方言统一 `?`（v0.1.67 起宿主 op 层对 postgres 自动改写 $n 并校验
+// 参数个数）——**禁止**在此自写 `$n`：参数个数对不上宿主会直接报错
+// （`placeholder count != params`，v0.1.68 前 pg 的 LIKE 回退/FTS 查询正是因此报错）。
 
 export type Dialect = "sqlite" | "mysql" | "postgres";
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -32,7 +34,8 @@ function mark(text: string, q: string): string {
 
 /** 短词（<3 字符）跨方言统一 LIKE 回退：trigram/ngram/tsvector 对短词静默零命中，
  *  直接对基表 LIKE（复用 likeEscape 转义 !/%/_，统一 ESCAPE '!'）。三方言共用，
- *  避免分支重复。 */
+ *  避免分支重复。大小写对齐：pg 的 LIKE 大小写敏感（sqlite LIKE 对 ASCII 不敏感、
+ *  mysql 默认 collation 为 CI），pg 分支用 ILIKE（同样支持 ESCAPE 子句）。 */
 async function likeFallback(
   dbi: DBInstance,
   t: string,
@@ -40,16 +43,16 @@ async function likeFallback(
   fs: string[],
   q: string,
   limit: number,
-  P: (i: number) => string,
   qw: (c: string) => string,
 ): Promise<Hit[]> {
   const n = [...q].length;
   if (!(n > 0 && n < 3)) return [];
-  const where = fs.map((f) => `${qw(f)} LIKE ${P(0)} ESCAPE '!'`).join(" OR ");
-  const like = `%${likeEscape(q)}%`;
+  const op = dbi.dialect() === "postgres" ? "ILIKE" : "LIKE";
+  const where = fs.map((f) => `${qw(f)} ${op} ? ESCAPE '!'`).join(" OR ");
+  const pat = `%${likeEscape(q)}%`;
   return (await dbi.query(
     `SELECT ${qw(pk)} AS id, 1 AS score FROM ${qw(t)} WHERE ${where} LIMIT ${limit}`,
-    fs.map(() => like),
+    fs.map(() => pat),
   )).map((r: Record<string, unknown>) => ({ id: r.id, score: Number(r.score) }));
 }
 
@@ -59,7 +62,6 @@ export interface Hit { id: unknown; score: number; fragments?: Record<string, st
 
 export function createSearch(dbi: DBInstance) {
   const d: Dialect = dbi.dialect();
-  const P = (i: number) => (d === "postgres" ? `$${i + 1}` : "?");
   const pks = new Map<string, string>();
   const fieldsOf = new Map<string, string[]>();
 
@@ -98,7 +100,7 @@ export function createSearch(dbi: DBInstance) {
       const idxName = `ft_${t}`;
       const hit = await dbi.query(
         `SELECT COUNT(*) AS n FROM information_schema.statistics
-         WHERE table_schema = DATABASE() AND table_name = ${P(0)} AND index_name = ${P(1)}`,
+         WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?`,
         [t, idxName]);
       if (Number(hit[0].n) === 0) {   // ADD FULLTEXT 无 IF NOT EXISTS：先查再建
         await dbi.exec(`ALTER TABLE \`${t}\` ADD FULLTEXT INDEX \`${idxName}\` (${
@@ -107,8 +109,8 @@ export function createSearch(dbi: DBInstance) {
     } else {
       const hit = await dbi.query(
         `SELECT COUNT(*) AS n FROM information_schema.columns
-         WHERE table_schema = current_schema() AND table_name::text = ${P(0)
-        } AND column_name::text = 'tsv'`, [t]);
+         WHERE table_schema = current_schema() AND table_name::text = ?
+         AND column_name::text = 'tsv'`, [t]);
       if (Number(hit[0].n) === 0) {
         const expr = `to_tsvector('simple', ${
           fs.map((f) => `coalesce(${f}, '')`).join(" || ' ' || ")})`;
@@ -133,14 +135,14 @@ export function createSearch(dbi: DBInstance) {
     cols.forEach((c) => id(c, "column"));
     const q = (c: string) => (d === "mysql" ? `\`${c}\`` : `"${c}"`);
     const colSql = cols.map(q).join(", ");
-    const marks = cols.map((_, i) => P(i)).join(", ");
+    const marks = cols.map(() => "?").join(", ");
     const vals = [...Object.values(row)];
     if (d === "sqlite") {
       // INSERT OR REPLACE 在 recursive_triggers=OFF（默认）下隐式 DELETE 不触发 AFTER DELETE
       // 触发器 → FTS 虚表留旧词。改用 真 DELETE（触发 fts_ad）+ INSERT（触发 fts_ai），三方言安全。
       // 两语句非原子：sqlite 调用方须在 db.tx 内调用（oj-wiki searchIndexInTx 已满足）；
       // 回填路径（无事务）失败可重跑，幂等。
-      await dbi.exec(`DELETE FROM ${q(t)} WHERE ${q(pk)} = ${P(0)}`, [row[pk]]);
+      await dbi.exec(`DELETE FROM ${q(t)} WHERE ${q(pk)} = ?`, [row[pk]]);
       await dbi.exec(`INSERT INTO ${q(t)} (${colSql}) VALUES (${marks})`, vals);
     } else if (d === "mysql") {
       const set = cols.map((c) => `${q(c)} = VALUES(${q(c)})`).join(", ");
@@ -157,7 +159,7 @@ export function createSearch(dbi: DBInstance) {
     const t = id(table, "table");
     registered(t, "remove");
     const q = (c: string) => (d === "mysql" ? `\`${c}\`` : `"${c}"`);
-    await dbi.exec(`DELETE FROM ${q(t)} WHERE ${q(pks.get(t)!)} = ${P(0)}`, [pkValue]);
+    await dbi.exec(`DELETE FROM ${q(t)} WHERE ${q(pks.get(t)!)} = ?`, [pkValue]);
   }
 
   async function query(table: string, q: string, opts: QueryOpts = {}): Promise<Hit[]> {
@@ -172,7 +174,7 @@ export function createSearch(dbi: DBInstance) {
       rows.map((r) => ({ id: r.id, score: Number(r.score) }));
 
     // 短词跨方言统一回退（基表 LIKE）——trigram/ngram/tsvector 对 <3 字符静默零命中。
-    const fb = await likeFallback(dbi, t, pk, fs, q, limit, P, qw);
+    const fb = await likeFallback(dbi, t, pk, fs, q, limit, qw);
     if (fb.length) return fb;
 
     if (d === "sqlite") {
@@ -184,7 +186,7 @@ export function createSearch(dbi: DBInstance) {
         : "";
       const rows = await dbi.query(
         `SELECT rowid AS id, bm25("${t}_fts") AS score${snip} FROM "${t}_fts"
-         WHERE "${t}_fts" MATCH ${P(0)} ORDER BY rank LIMIT ${limit}`, [phrase]);
+         WHERE "${t}_fts" MATCH ? ORDER BY rank LIMIT ${limit}`, [phrase]);
       return rows.map((r: Record<string, unknown>) => {
         const h: Hit = { id: r.id, score: Number(r.score) };
         if (opts.highlight) {
@@ -197,15 +199,15 @@ export function createSearch(dbi: DBInstance) {
     if (d === "mysql") {
       const cols = fs.join(", ");
       const rows = await dbi.query(
-        `SELECT ${qw(pk)} AS id, MATCH(${cols}) AGAINST(${P(0)} IN NATURAL LANGUAGE MODE) AS score
-         FROM ${qw(t)} WHERE MATCH(${cols}) AGAINST(${P(1)} IN NATURAL LANGUAGE MODE) LIMIT ${limit}`,
+        `SELECT ${qw(pk)} AS id, MATCH(${cols}) AGAINST(? IN NATURAL LANGUAGE MODE) AS score
+         FROM ${qw(t)} WHERE MATCH(${cols}) AGAINST(? IN NATURAL LANGUAGE MODE) LIMIT ${limit}`,
         [q, q]);
       if (!opts.highlight) return num(rows);
       // 高亮：一次批量取回全部命中行的原文（避免每命中一次 SELECT 的 N 查询塌方），
       // 再在应用层用 mark() 截取片段——与 sqlite/pg 一致，mysql 无内置 snippet。
       if (!rows.length) return num(rows);
       const ids = rows.map((r) => r.id);
-      const placeholders = ids.map((_, i) => P(i)).join(", ");
+      const placeholders = ids.map(() => "?").join(", ");
       const src = await dbi.query(
         `SELECT ${qw(pk)} AS id, ${fs.map(qw).join(", ")} FROM ${qw(t)} WHERE ${qw(pk)} IN (${placeholders})`,
         ids,
@@ -218,13 +220,19 @@ export function createSearch(dbi: DBInstance) {
         return { id: r.id, score: Number(r.score), fragments };
       });
     }
-    // postgres：ts_headline 是文档级 → 单一 fragments._doc
+    // postgres：ts_headline 是文档级 → 单一 fragments._doc。
+    // 签名 (config, document text, query, options 单字符串)——document 须拼回原文
+    // （tsvector 的文本形态是词位串，高亮会错）；options 不是 sqlite snippet 的
+    // 位置参数。占位符 2（非 highlight）/ 3（highlight）个 `?`，绑定数一一对应。
+    const doc = fs.map((f) => `coalesce(${qw(f)}, '')`).join(" || ' ' || ");
     const hl = opts.highlight
-      ? `, ts_headline('simple', tsv, plainto_tsquery('simple', ${P(1)}), '<mark>', '</mark>', '…', 12) AS headline`
+      ? `, ts_headline('simple', ${doc}, plainto_tsquery('simple', ?), `
+        + `'StartSel=<mark>, StopSel=</mark>, MaxFragments=12, FragmentDelimiter=…') AS headline`
       : "";
     const rows = await dbi.query(
-      `SELECT ${qw(pk)} AS id, ts_rank(tsv, plainto_tsquery('simple', ${P(0)})) AS score${hl}
-       FROM ${qw(t)} WHERE tsv @@ plainto_tsquery('simple', ${P(0)}) LIMIT ${limit}`, [q, q]);
+      `SELECT ${qw(pk)} AS id, ts_rank(tsv, plainto_tsquery('simple', ?)) AS score${hl}
+       FROM ${qw(t)} WHERE tsv @@ plainto_tsquery('simple', ?) LIMIT ${limit}`,
+      Array.from({ length: opts.highlight ? 3 : 2 }, () => q));
     return rows.map((r: Record<string, unknown>) => {
       const h: Hit = { id: r.id, score: Number(r.score) };
       if (opts.highlight) h.fragments = { _doc: String(r.headline ?? "") };

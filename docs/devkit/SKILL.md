@@ -44,7 +44,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    撞版本 409），见 `scenarios.md` 场景 30。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
-3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 收口。
+3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 统一返回。
 4. **测试**：先 L2 vitest 测逻辑（快，不起服务），再 L1 `oj test` 测端到端（真，连真实 DB）。
    两层都绿才算完（§9）。
 5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§11）。
@@ -110,9 +110,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
 | 登录响应要同时下发 `oj_sess` + `oj_csrf` 两枚 cookie | v0.1.46 起 `json.header` 同名头追加、`Set-Cookie` 合法双发（此前响应头单值，csrf 只能 body 下发 + 前端写 `document.cookie`）；登出记得两枚都 `Max-Age=0` |
-| 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `src/oidc/`（场景 28）。**登录端点必须进匿名列表**（无 token 可言，form 与 302 腿都是，`auth.`/`tenant.` 两条都加）；JIT 建号用「`来源:provider:tenant:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录）；CAS 交接 token 不进 URL、302 目标只认 `/` 开头相对路径 |
+| 要接企业 HTTP 表单 / CAS SSO（或任何新登录来源） | 别改 oj-auth 插件——它只是守卫（验签 + 匿名路径 + CSRF），改它 = 动 ABI；登录端点全是业务模块，照抄 `src/oidc/`（场景 28）。**登录端点必须进匿名列表**（无 token 可言，form 与 302 跳转请求都是，`auth.`/`tenant.` 两条都加）；JIT 建号用「`来源:provider:tenant:用户` 键 + `"!<来源>"` 非法占位 hash」（verify 恒 false，锁死密码登录）；CAS 交接 token 不进 URL、302 目标只认 `/` 开头相对路径 |
 | `search.ensureIndex` 报 `DDL inside db.tx` | ensureIndex 是 DDL——MySQL 会隐式提交调用方事务；移到事务外，index/remove/query 留在事务内（同连接自动路由） |
 | sqlite 全文检索 2 个字查不到 | trigram 对 <3 字符静默零命中——`_shared/search` 自动回退业务表 LIKE；自写 FTS SQL 也要处理该边界 |
+| pg 上 `search.query` 报 `placeholder count 1 != params N` | 旧版 `_shared/search` 自写 `$n` 与 v0.1.67 统一占位符计数校验冲突（v0.1.68 已修，升级即消）——业务裸 SQL 同理：**别手写 `$n` 却按 `?` 的个数绑参** |
 | `versions.commit` 报 409 `version conflict` | 乐观锁：`expect` 与当前 head 不符或并发撞 `UNIQUE(entity_type,entity_id,version)`——重读 head 重试；省 `expect` 即 last-write-wins |
 | 裸 import 报 `Package subpath 'x' is not defined by "exports"` | v0.1.30 起有 `exports` 即封闭语义（Node 一致）：未命中的子路径**不回落** `main`/`module`——检查包的真实导出键，或该包确未导出此子路径 |
 | CJS `require("path")` 报 `Node builtin 'path' is not available in oj runtime` | Node 内建不可用——找该包的浏览器/wasm 构建（与 wasm 引擎包同款约定） |
@@ -183,7 +184,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 查询被拦截 / 启动报 `tenant_id` 相关错（v0.1.15 sql_guard） | `sql_guard: "deny"` 拦截租户条件不匹配的查询（`"warn"` 只告警）：跨租户操作（对账/报表）走 `await db.asSystem()`（请求级 + 审计日志）；共享表须 schema.yaml `tenant: false` **且** config `tenant.shared_allow` 列出，双声明才豁免 |
 | 裸 SQL 被 deny 拦「遗漏 tenant_id」 | `db.query`/`db.exec` 的字面检查（best-effort）要求 SQL 显式带租户条件——优先改走 `db.table()` 构造器（自动注入），系统身份走 `db.asSystem()` |
 | `db.asTenant` 抛错（v0.1.20） | 三道门禁：`tenant.allow_as_tenant: true` 未开 / 请求不是匿名（未命中 `anonymous_paths` 或已带租户头）/ id 为空；且**请求级只能设一次**（防中途换身份）。公开页正确姿势见 `scenarios.md` 场景 1 |
-| 尾 `/*` 匿名路径收不到豁免（v0.1.20） | **auth 侧**尾 `/*` 已统一为**严格一层**（旧 oj-auth 是任意深度）；跨层改 `/x/**`。**租户侧自始就是严格一层，无此变更**。装配期只对 `auth.anonymous_paths` 里「旧式前缀形态（只有尾段一个 `*`、其余段全字面）且确实丢了面（有更深的已注册路由）」的条目打聚合迁移 WARN（v0.1.23 起，结构条目与仅差 `**` 零层的都不再点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转腿要都加 |
+| 尾 `/*` 匿名路径收不到豁免（v0.1.20） | **auth 侧**尾 `/*` 已统一为**严格一层**（旧 oj-auth 是任意深度）；跨层改 `/x/**`。**租户侧自始就是严格一层，无此变更**。装配期只对 `auth.anonymous_paths` 里「旧式前缀形态（只有尾段一个 `*`、其余段全字面）且确实丢了面（有更深的已注册路由）」的条目打聚合迁移 WARN（v0.1.23 起，结构条目与仅差 `**` 零层的都不再点名）；确属有意一层可写 `- { path: "/x/*", one_layer: true }` 消音。`tenant.` 与 `auth.` 两条匿名列表独立，OIDC 跳转请求要都加 |
 | 要 302 跳转只会 `header`+`fail` 拼 | 拼出来的是**失败信封体**（非标准形态）。用 `json.redirect(url[, code])`（v0.1.26）：3xx + `Location` + RFC 9110 §15.4 注记（HEAD 为空 body）；`code` 非 3xx 回落 302 |
 | SPA 深链 404 / 只回 100 条数据 | 前者：web 挂载写 `spa: true`（v0.1.58 起逐挂载，默认关，api 挂载前缀下的 404 不被吞）；后者：没写 `limit()` 吃了 `db_query.default_limit`（默认 100，看 `X-OJ-Row-Limit` 头） |
 | IM 预览 / 爬虫只看到默认 title（页面上 JS 改了没用——爬虫不执行 JS） | 构建期已知路由 → `server.html_meta` 的 `__meta/<path>.json`；**按数据**（issue 标题/分享页正文）→ `server.html_meta_handler` 指一个 GET handler（v0.1.25，`http.query.path` 是**已剥命中 web 挂载前缀**的站点内路径；返回 `title`/`og:*`/… 或信封），配 `html_cache_control` 防盲缓存。见 `scenarios.md` 场景 2 |
