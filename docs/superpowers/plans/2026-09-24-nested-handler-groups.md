@@ -1,6 +1,6 @@
 # api.ts 嵌套 handler 组（v0.1.27+）Implementation Plan
 
-> 状态：**已实施（v0.1.64，未打标签）** —— 2026-10-12 按 TDD 分三批落地完毕，门禁全绿
+> 状态：**已实施（v0.1.64，已打标签）** —— 2026-10-12 按 TDD 分三批落地完毕，门禁全绿
 > （workspace 1230 用例 / clippy `-D warnings` / xtask 契约 8 用例 / `cargo fmt --check` 零 diff）。
 > 用户可见变更见 `CHANGELOG.md` v0.1.64 与 devkit 四件（含「何时采用」DDD 选型指南与
 > `sample/src/nest/` 实体为根示例）；落地偏差与处置记录见 §八.5。
