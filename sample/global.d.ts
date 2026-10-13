@@ -453,6 +453,17 @@ declare global {
     schema?: Record<string, unknown>;
   }
 
+  // 嵌套组（v0.1.64）：以实体对象为根的组同样可挂组级 `.route`（整组默认前缀）与
+  // 组级 `.schema`（整组默认入参契约），与 handler 级同语义。组是普通对象字面量，
+  // 故在 `Object` 上声明，使 `anchor.route = "/x/{anchor}/upload"` 之类不报 TS2339。
+  // 运行时：组级 `.schema` 作继承默认，动词自身 `.schema` 在其上合并（通道级
+  // required 并集 / properties 逐键覆盖）。
+  interface Object {
+    route?: string;
+    /** 组级入参契约（v0.1.64 嵌套组）：整组默认，动词 `.schema` 在其上合并 */
+    schema?: Record<string, unknown>;
+  }
+
   // DB(name) 返回的命名数据库实例。（在 declare global 内：业务代码要能**点名**
   // 这个类型（如 `function f(dbi: DBInstance)`）；放模块作用域会 TS2304。）
   interface DBInstance {

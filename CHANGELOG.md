@@ -27,6 +27,12 @@
 - 判别红线：**先按键是否 verb 分派，再以 `typeof` 校验值**——动词键必须是函数
   （`.route`/`.schema` 等属性一律读作元数据，不拆子路由）；非动词键必须是普通对象。
   组对象的字符串 `.route` 是本层前缀声明（`route` 为保留键）。
+- 组级 `.schema`（与组级 `.route` 同等地位）：组对象挂 `.schema` 作整组默认入参契约，
+  组内动词无自身 `.schema` 时继承之，动词自身 `.schema` 在其上**合并**（同通道 `required`
+  取并集、`properties` 动词逐键覆盖、其余通道级关键字动词优先）；合并发生在内省期，落到
+  `RouteRow.schema`（`oj openapi` 与运行期守卫同源），非法契约 `server.schema_validation`
+  装配期硬失败。`schema` 因此同列 `route` 为组级保留键。ambient 类型 `Object.schema` 同步放开
+  （`global.d.ts`）。
 - 防护：JS 内省 driver 内 `WeakSet` 路径环检测（`a.self=a` 内省期即失败，不拖死启动）
   + 深度上限 4；段名禁 `/` 与 `__proto__`/`constructor`/`prototype`，内省期权威校验、
   运行期 driver 与 `from_entries` 双保险（手改 `routes.js` 注入 → release 启动失败）。

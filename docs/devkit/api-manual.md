@@ -481,6 +481,39 @@ anchor.route = "/x/{anchor}/upload";   // 组前缀：POST /x/{anchor}/upload �
 export default { anchor };             // 组内动词未单独挂 .route 时沿用之前缀
 ```
 
+组级 `.schema` 与组级 `.route` **同等地位**：组对象上挂 `.schema` 作整组默认入参契约，
+组内动词无自身 `.schema` 时继承之；动词自身 `.schema` 在其上**合并**（通道级，与
+`oj openapi` / 运行期守卫同源——合并发生在内省期，结果落到 `RouteRow.schema`）：
+
+- 同通道（`params` / `query` / `body`）`required` 取**并集**；
+- 同 `properties` **动词逐键覆盖**、组值兜底；
+- 其余通道级关键字（如 `additionalProperties`）动词优先。
+
+组 `.schema` 非法 → `server.schema_validation` 装配期硬失败（不静默跳过）。
+
+> 与 oj-module 对齐：`.schema` 的首要目的是**让接口符合 OpenAPI 并生成文档**（`oj openapi`
+> 从 `RouteRow.schema` 出 parameters / requestBody）。因此组级 `.schema` 适合承载**跨端点共享
+> 的 query 契约**（分页 / 租户 / 公共过滤），而**路径参数（`params`）留给各 verb 自挂**——
+> 因为 `oj openapi` 对 path 参数做**双向一致**硬校验：组级 `.schema` 若声明了某路径参数，
+> 组内**每个**动词的路由 pattern 都必须含它，否则装配期失败。把 `params` 放组级只适用于
+> 「整组动词都带同一路径参数」的情况（组 `.route` 以该参数为固定前缀时最自然）。
+
+```ts
+const asset = {
+  get:  () => { json.ok({ where: "asset.get" }); },   // GET  /nest/asset
+  post: () => { json.ok({ where: "asset.post" }); },   // POST /nest/asset
+};
+// 组级默认契约：本聚合所有端点的公共 query（分页）——不碰路径参数，避免与部分动词的 {id} 冲突
+asset.schema = {
+  query: { type: "object", properties: { page: { type: "integer", minimum: 1 }, pageSize: { type: "integer", maximum: 100 } } },
+};
+// 建端点叠加 body 契约：最终 = 组 query(page/pageSize) ∪ 动词 body.title（不是替换）
+asset.post.schema = {
+  body: { type: "object", required: ["title"], properties: { title: { type: "string", maxLength: 80 } } },
+};
+export default { asset };
+```
+
 判别红线（**启动/`oj build` 期可操作报错，不再静默丢弃**）：
 
 | 键 | 值 | 语义 |
@@ -493,7 +526,8 @@ export default { anchor };             // 组内动词未单独挂 .route 时沿
 - 组名可以是连字符等非标识符（`"audit-log"`），经计算式访问命中；段名不得含 `/`、
   不得为 `__proto__` / `constructor` / `prototype`（手改 `routes.js` 注入这些段 →
   release 启动失败）。
-- 组对象的 `.route`（字符串）是本层前缀声明，不当子键；`route` 因此是保留键。
+- 组对象的 `.route`（字符串）/ `.schema`（对象）是本层前缀/默认契约声明，不当子键；
+  `route` 与 `schema` 因此是**保留键**（组对象上这两个名字不会被当作子组解析）。
 - 嵌套上限 4 层；自引用（`const a = {}; a.self = a;`）在内省期即失败，不会拖死启动。
 - 挂 `.route` 的组动词同样**替换目录镜像**：镜像 URL 不再可达（404）。
 - release：`oj build` 为嵌套行写入 `handler` 链字段（顶层动词行不写，旧产物无此字段
@@ -502,7 +536,12 @@ export default { anchor };             // 组内动词未单独挂 .route 时沿
 ### 入参契约 `.schema`（v0.1.44）
 
 与 `.route` 同构：在导出的函数对象上挂 `.schema`，分**三通道**声明入参
-（`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）：
+（`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）。
+`.schema` 的首要目的是**让接口符合 OpenAPI 并生成文档**（`oj openapi` 从 `RouteRow.schema`
+出 parameters / requestBody；与 oj-module 的「前端契约 → 后端 `.schema` → OpenAPI」管线同源
+对齐——关键字白名单、三通道 `params`/`query`/`body` 形态完全一致）。它既可挂在**动词函数**
+上（单端点契约），也可挂在**组对象**上（整组默认契约，见上节「嵌套 handler 组」的组级
+`.schema`——组内动词继承并合并）：
 
 ```js
 export default { get, post };

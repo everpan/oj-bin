@@ -32,6 +32,7 @@
 | [22](#场景-22应用层-aes-gcm-字段加密v0135) | 应用层 AES-GCM 字段加密——`crypto.aesGcmEncrypt` / `aesGcmDecrypt`（仅 AES-128/256，密钥自管，v0.1.35） | §6 crypto |
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 | [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
+| [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 收口公共前缀与公共入参 | §4 编写 api.ts |
 
 ---
 
@@ -2128,3 +2129,97 @@ GET  /v1/api/nest/asset/schema    → 404（元数据不生成路由）
 | 报 `nested deeper than 4 levels` / `circular handler group` | 嵌套上限 4 层；自引用（`a.self = a`）内省期即失败 |
 | release 启动报 `illegal handler chain` | routes.js 的 `handler` 段非法（`/`、空段、`__proto__`/`constructor`/`prototype`）——重新 `oj build` |
 | 该拆目录还是用组 | 见 api-manual §4「何时采用」：同实体多端点用组（实体为根）；端点独立演化/多人分权拆目录；≤3 个同形端点平铺 |
+
+## 场景 32：用 DDD 规划组级 API（实体为根 + 组级 `.route`/`.schema` 平衡）
+
+> 何时抄我：你在设计一个**聚合**（如「项目 Project」带成员、看板、附件），要决定
+> 「哪些端点进同一个实体组、哪些拆目录、组级路由/契约怎么挂」。本场景给一套可照抄的
+> **领域驱动设计落点**，重点是用**组级 `.route` + 组级 `.schema`** 一次性收口整组的
+> 前缀与公共入参，避免每个动词重复声明。
+> 配套：`src/nest/api.ts`（L1 `tests/nest.test.ts`）；手册 §4「嵌套 handler 组」。
+
+### ① DDD 概念 → oj 落点（先画这张表再动手）
+
+| DDD 概念 | oj 落点 | 本场景例子 |
+|---|---|---|
+| 限界上下文 | **模块**（`manifest.yaml`） | `project` 模块独占「协作」上下文，不混进 `billing` |
+| 聚合根 | **实体组**（组名 = 聚合根） | `project` 组：`project.get` / `project.post` / `project.put` |
+| 聚合内从属资源 | **子组**（随聚合根路由） | `project.members`（成员随项目生命周期，无独立 URL 空间） |
+| 独立聚合 | **独立目录 / 文件** | `billing` 不进 `project` 组——各自演化、各自鉴权 |
+
+### ② 组级 `.route` + 组级 `.schema`：整组收口前缀与公共入参
+
+`project` 聚合的端点分两类：集合端（`GET/POST /project`，无 id）与条目端
+（`GET/PUT /project/{projectId}`，带 id）。**组级 `.schema` 只承载跨端点共享的 query
+（分页）——路径参数留给各 verb 自挂**（否则 `oj openapi` 的 path 参数双向一致校验
+会对无 id 的集合端报错；这是与 oj-module 的 OpenAPI 管线对齐的硬约束）：
+
+```ts
+// src/project/api.ts —— 聚合根为根
+const project = {
+  get:     () => { json.ok({ where: "project.get" }); },        // GET  /project            （列表）
+  post:    () => { json.ok({ where: "project.post" }); },       // POST /project            （创建，无 id）
+  getById: () => { json.ok({ where: "project.getById", id: http.param("projectId") }); }, // GET  /project/{projectId}
+  put:     () => { json.ok({ where: "project.put" }); },        // PUT  /project/{projectId}
+  // 从属资源：再嵌一层子组
+  members: {
+    get:  () => { json.ok({ where: "project.members.get" }); }, // GET  /project/{projectId}/members
+    post: () => { json.ok({ where: "project.members.post" }); },
+  },
+};
+// 组级默认前缀：整组挂 /project 下
+project.route = "/project";
+// 组级默认契约：本聚合所有端点的公共 query（分页）——不碰路径参数
+project.schema = {
+  query: { type: "object", properties: { page: { type: "integer", minimum: 1 }, pageSize: { type: "integer", maximum: 100 } } },
+};
+// 条目端：动词自身 .route 挂路径参数 + 动词 .schema 补 params（与组 query 合并）
+project.getById.route = "{projectId}";
+project.getById.schema = {
+  params: { type: "object", required: ["projectId"], properties: { projectId: { type: "string" } } },
+};
+project.put.route = "{projectId}";
+project.put.schema = {
+  params: { type: "object", required: ["projectId"], properties: { projectId: { type: "string" } } },
+};
+// 创建端叠加 body 契约：最终 = 组 query(page/pageSize) ∪ 动词 body.title
+project.post.schema = {
+  body: { type: "object", required: ["title"], properties: { title: { type: "string", maxLength: 80 } } },
+};
+
+export default { project };
+```
+
+内省期合并结果（`oj openapi` 与运行期守卫同源）：
+
+- `project.get` / `project.post` → 继承组 `query`（分页），无路径参数冲突；
+- `project.getById` / `project.put` → 组 `query` ∪ 动词 `params.projectId`（route 含 `{projectId}`，双向一致校验通过）；
+- `project.members.*` → 继承组 `query`（路由 `/project/{projectId}/members` 含 id，但若 members 自身要 id，在 `members` 子组挂 `.schema` 即可，沿链累加）；
+- 任一 `.schema` 非法 → `server.schema_validation` 装配期硬失败（不静默跳过）。
+
+### ③ 平衡判据：组 vs 子目录 vs 平铺（别走向任一极端）
+
+| 形态 | 用在本场景的哪部分 | 何时回退 |
+|---|---|---|
+| 实体组（`project`） | 同一聚合根的读/建/改/删 + 从属资源 | 文件过胖（>~80 行）→ **聚合过胖信号**，按子域拆聚合，不是回退动词目录 |
+| 子组（`project.members`） | 没有独立生命周期的从属资源 | 成员要独立鉴权/独立演化 → 升为独立目录 `project-member/` |
+| 拆子目录 | `billing`（独立聚合） | — |
+| 平铺 | 模块根只有 ≤3 个动词 | 动词一多立刻收进实体组 |
+
+一句话：**同一聚合的操作进同一个实体组，不同聚合才拆目录；组级 `.route`/`.schema`
+收口公共前缀与公共入参，动词只补差异**。在「多文件夹」与「大文件」之间取平衡，
+文件仍过胖则是聚合该拆的领域信号，而非改用目录结构掩盖。
+
+### ④ 验证
+
+```
+GET  /v1/api/project                  → 200 project.get（列表，继承组 query 分页）
+POST /v1/api/project                  → 400 缺 body.title（组 query ∪ 动词 body 合并校验，进 JS 前）
+GET  /v1/api/project/{pid}            → 200 project.getById（route 含 {projectId}，双向一致校验通过）
+PUT  /v1/api/project/{pid}            → 200 project.put
+GET  /v1/api/project/{pid}/members    → 200 project.members.get（继承组 query）
+POST /v1/api/project/{pid}/members    → 200 project.members.post
+GET  /v1/api/project/{pid}/schema     → 404（元数据不生成路由；契约只进 OpenAPI/校验）
+```
+
+

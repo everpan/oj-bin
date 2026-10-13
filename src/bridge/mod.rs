@@ -1287,7 +1287,31 @@ impl Bridge {
                own === null ? rp :\n\
                own.charAt(0) === \"/\" ? own :\n\
                rp ? rp + \"/\" + own : own;\n\
-             const walk = (obj, prefix, rp, name, depth) => {{\n\
+             // 组级 .schema 与组级 .route 同等地位：组 .schema 作整组默认契约，动词自身\n\
+             // .schema 在其上合并——通道级（params/query/body）逐项合并：required 取并集、\n\
+             // properties 动词逐键覆盖（缺省用组值）；其余通道级关键字动词优先。\n\
+             const mergeSchema = (base, over) => {{\n\
+               if (over === undefined || over === null) return base || null;\n\
+               if (base === undefined || base === null) return over;\n\
+               if (typeof base !== \"object\" || typeof over !== \"object\") return over;\n\
+               const out = {{}};\n\
+               for (const ch of [\"params\", \"query\", \"body\"]) {{\n\
+                 const b = base[ch], o = over[ch];\n\
+                 if (b && o) {{\n\
+                   const merged = Object.assign({{}}, b, o);\n\
+                   const br = Array.isArray(b.required) ? b.required : [];\n\
+                   const or = Array.isArray(o.required) ? o.required : [];\n\
+                   merged.required = Array.from(new Set(br.concat(or)));\n\
+                   merged.properties = Object.assign({{}}, b.properties || {{}}, o.properties || {{}});\n\
+                   out[ch] = merged;\n\
+                 }} else if (b) {{ out[ch] = b; }}\n\
+                 else if (o) {{ out[ch] = o; }}\n\
+               }}\n\
+               for (const k of Object.keys(over)) if (!(k in out)) out[k] = over[k];\n\
+               for (const k of Object.keys(base)) if (!(k in out)) out[k] = base[k];\n\
+               return out;\n\
+             }};\n\
+             const walk = (obj, prefix, rp, gschema, name, depth) => {{\n\
                const at = prefix.join(\".\") || \"<root>\";\n\
                if (depth > 4) throw new Error(\"handler group nested deeper than 4 levels at \" + at);\n\
                if (seen.has(obj)) throw new Error(\"circular handler group at \" + at);\n\
@@ -1296,8 +1320,10 @@ impl Bridge {
                const layer = (typeof lraw === \"string\" && lraw !== \"\")\n\
                  ? resolve(String(lraw), rp)\n\
                  : (rp ? rp + \"/\" + name : name);\n\
+               const thisSchema = mergeSchema(gschema, obj.schema);\n\
                for (const k of Object.keys(obj)) {{\n\
                  if (k === \"route\" && typeof obj[k] === \"string\") continue;\n\
+                 if (k === \"schema\") continue;\n\
                  const v = obj[k];\n\
                  if (VERBS.has(k)) {{\n\
                    if (typeof v !== \"function\")\n\
@@ -1307,18 +1333,18 @@ impl Bridge {
                    out.push({{\n\
                      chain: prefix.concat(k).join(\".\"),\n\
                      route: resolve(own, layer) || null,\n\
-                     schema: v.schema === undefined ? null : v.schema,\n\
+                     schema: mergeSchema(thisSchema, v.schema),\n\
                    }});\n\
                  }} else {{\n\
                    if (v === null || typeof v !== \"object\" || Array.isArray(v))\n\
                      throw new Error(\"non-verb key '\" + k + \"' at \" + at + \" is \" + (Array.isArray(v) ? \"array\" : (v === null ? \"null\" : typeof v)) + \", expected nested group object\");\n\
-                   walk(v, prefix.concat(k), layer, k, depth + 1);\n\
+                   walk(v, prefix.concat(k), layer, thisSchema, k, depth + 1);\n\
                  }}\n\
                }}\n\
                seen.delete(obj);\n\
              }};\n\
              const d = m.default;\n\
-             if (d !== undefined && d !== null) walk(d, [], \"\", \"\", 1);\n\
+             if (d !== undefined && d !== null) walk(d, [], \"\", null, \"\", 1);\n\
              json.ok(out);\n"
         );
         let code = driver_script(&body);
@@ -2727,6 +2753,195 @@ mod tests {
         let v = b.introspect_module(&api).await.unwrap();
         assert_eq!(leaf(&v, "get")["route"], json!("/x"), "{v}");
         assert_eq!(leaf(&v, "post")["route"], json!("/y"), "{v}");
+    }
+
+    /// 组级 `.schema` 与组级 `.route` 同等地位：组 `.schema` 作整组默认契约，动词继承；
+    /// 动词自身 `.schema` 在其上**合并**（通道并集，不是替换）——组级 params + 动词级 body。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_group_schema_is_inherited_and_verb_merges() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const asset = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+             };\n\
+             asset.schema = {\n\
+               params: { type: \"object\", required: [\"id\"], properties: { id: { type: \"integer\" } } },\n\
+             };\n\
+             asset.post.schema = {\n\
+               body: { type: \"object\", required: [\"name\"], properties: { name: { type: \"string\" } } },\n\
+             };\n\
+             export default { asset };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        // 动词继承组级 params 契约
+        assert_eq!(
+            leaf(&v, "asset.get")["schema"],
+            json!({ "params": { "type": "object", "required": ["id"], "properties": { "id": { "type": "integer" } } } }),
+            "{v}"
+        );
+        // 动词合并：组级 params + 动词级 body（通道并集，非替换）
+        assert_eq!(
+            leaf(&v, "asset.post")["schema"],
+            json!({
+                "params": { "type": "object", "required": ["id"], "properties": { "id": { "type": "integer" } } },
+                "body": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
+            }),
+            "{v}"
+        );
+    }
+
+    /// 动词 `.schema` 合并语义：同通道 `required` 取并集、同 `properties` 动词逐键覆盖、组键保留。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_verb_schema_merges_required_union_and_property_override() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const asset = {\n\
+               post: () => { json.ok({}); },\n\
+             };\n\
+             asset.schema = {\n\
+               query: { type: \"object\", required: [\"a\"], properties: { a: { type: \"string\" }, b: { type: \"string\" } } },\n\
+             };\n\
+             asset.post.schema = {\n\
+               query: { type: \"object\", required: [\"c\"], properties: { a: { type: \"integer\" }, c: { type: \"string\" } } },\n\
+             };\n\
+             export default { asset };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(
+            leaf(&v, "asset.post")["schema"],
+            json!({
+                "query": {
+                    "type": "object",
+                    "required": ["a", "c"],
+                    "properties": { "a": { "type": "integer" }, "b": { "type": "string" }, "c": { "type": "string" } }
+                }
+            }),
+            "{v}"
+        );
+    }
+
+    /// 嵌套组：组级 `.schema` 沿链累加（outer 的 params + inner 的 query 都落到 verb）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_nested_group_schema_accumulates() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const outer = {\n\
+               inner: {\n\
+                 get: () => { json.ok({}); },\n\
+               },\n\
+             };\n\
+             outer.schema = { params: { type: \"object\", required: [\"tid\"], properties: { tid: { type: \"string\" } } } };\n\
+             outer.inner.schema = { query: { type: \"object\", required: [\"q\"], properties: { q: { type: \"string\" } } } };\n\
+             export default { outer };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(
+            leaf(&v, "outer.inner.get")["schema"],
+            json!({
+                "params": { "type": "object", "required": ["tid"], "properties": { "tid": { "type": "string" } } },
+                "query": { "type": "object", "required": ["q"], "properties": { "q": { "type": "string" } } }
+            }),
+            "{v}"
+        );
+    }
+
+    /// 组级 `.schema` 必须落到运行期契约守卫：合并后的契约在进 JS 之前校验，违反 → 400。
+    /// 用内省结果装配注册表（与 app.rs 同径：RouteRow.schema 即唯一真源），再经 run_module 触发校验。
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_schema_enforced_before_js_via_merged_contract() {
+        use crate::contract::{InputContract, InputContractRegistry};
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const asset = {\n\
+               get: () => { json.ok({ reached: true }); },\n\
+               post: () => { json.ok({ reached: true }); },\n\
+             };\n\
+             asset.schema = {\n\
+               params: { type: \"object\", required: [\"id\"], properties: { id: { type: \"integer\" } } },\n\
+             };\n\
+             asset.post.schema = {\n\
+               body: { type: \"object\", required: [\"name\"], properties: { name: { type: \"string\" } } },\n\
+             };\n\
+             export default { asset };\n",
+        )]);
+        // 从内省结果装配契约注册表（与 app.rs 同径：RouteRow.schema 即真源）。
+        let probe = module_bridge(&root);
+        let leaves = probe.introspect_module(&api).await.unwrap();
+        let mut reg = InputContractRegistry::new();
+        for lf in leaves.as_array().unwrap() {
+            let sv = &lf["schema"];
+            if sv.is_null() {
+                continue;
+            }
+            let c = InputContract::try_new(
+                sv.get("params").cloned(),
+                sv.get("query").cloned(),
+                sv.get("body").cloned(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            reg.insert(api.clone(), lf["chain"].as_str().unwrap(), c)
+                .unwrap();
+        }
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: root.clone(),
+                ts: true,
+            })),
+            Extras {
+                input_contracts: Some(Arc::new(std::sync::RwLock::new(reg))),
+                ..Default::default()
+            },
+        );
+        let t = std::time::Duration::from_secs(5);
+
+        // asset.get：继承组级 params.id —— 非法值 → 400，不进 JS。
+        let mut bad = RequestInfo::default();
+        bad.params.insert("id".into(), "x".into());
+        let cap = b.run_module(&api, "asset.get", bad, t).await.unwrap();
+        assert_eq!(
+            cap.status, 400,
+            "asset.get 应继承组级 params.id 契约: {}",
+            String::from_utf8_lossy(&cap.body)
+        );
+
+        // asset.get：合规 → 200，JS 被执行。
+        let mut good = RequestInfo::default();
+        good.params.insert("id".into(), "7".into());
+        let cap = b.run_module(&api, "asset.get", good, t).await.unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["reached"], json!(true));
+
+        // asset.post：合并组级 params.id + 动词级 body.name —— 缺 body.name → 400。
+        let mut p = RequestInfo::default();
+        p.params.insert("id".into(), "7".into());
+        p.body = serde_json::to_vec(&json!({})).unwrap();
+        let cap = b.run_module(&api, "asset.post", p, t).await.unwrap();
+        assert_eq!(
+            cap.status, 400,
+            "asset.post 应合并 body.name 契约: {}",
+            String::from_utf8_lossy(&cap.body)
+        );
+
+        // asset.post：全合规 → 200。
+        let mut p2 = RequestInfo::default();
+        p2.params.insert("id".into(), "7".into());
+        p2.body = serde_json::to_vec(&json!({"name": "x"})).unwrap();
+        let cap = b.run_module(&api, "asset.post", p2, t).await.unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
     }
 
     /// 判别红线（§二.A）：verb 键非函数 / 非 verb 键挂函数、数组、基元 → 可操作 Err，

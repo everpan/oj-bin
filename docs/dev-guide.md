@@ -940,8 +940,10 @@ HTTP 服务（`serve/` + `oj`）；`db.tx(fn)` 回调式事务；执行看门狗
 提交代码前读这节：门禁是什么、CI 怎么跑、怎么只跑一条平台腿。
 
 - 门禁：`cargo fmt --check` + `cargo clippy --release --all-targets -- -D warnings` +
-  `cargo test --release --workspace`（+ sample 的 L1 `oj test` 与 L2 vitest，见
-  `sample-tests` job）。`infinite_loop` 曾全局 `--skip`，现已改为按平台开关，默认跑全量。
+  `cargo test --release --workspace`（+ sample 的 TS 类型门禁 `cd sample/unit && npm run typecheck`
+  （`tsc -p ../tsconfig.json`，校验 `src/` + `unit/` 与 `global.d.ts` 运行时不漂移，见
+  `plugin-matrix.yml`）+ L1 `oj test` 与 L2 vitest，见 `sample-tests` job）。`infinite_loop` 曾全局
+  `--skip`，现已改为按平台开关，默认跑全量。
 - 纪律：改动后 **release 下测试与构建都要绿**才算完成；**TDD red-first**（先失败测试再
   最小实现）；commit 尾随 `unix@vip.qq.com ai`。
 - CI（`.github/workflows/`）：`release.yml`（linux-gnu / macos / windows 三平台测试 + 打包）
