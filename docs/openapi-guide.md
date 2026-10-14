@@ -24,23 +24,64 @@
 
 ---
 
-## 2. 最小可生成条件
+## 2. 最小可生成条件与路由推算（`.route` 基本可省略）
 
 要让 `oj openapi` 产出有意义的内容，每个接口至少需要：
 
-1. **路由**：handler 上挂 `.route`（或在嵌套组上挂组级 `.route`）。没有路由就没有接口。
+1. **路由**：**绝大多数情况不用写 `.route`**——路由默认由「文件所在目录 + 导出名」推算
+   （见下方 2.1）。只有需要偏离目录镜像（加路径参数、挂到 base 根、用嵌套组等）时才写
+   `.route`。没有路由就没有接口。
 2. **（可选但强烈建议）`.schema`**：在 handler 函数对象上挂 `.schema`，分 `params` /
    `query` / `body` 三通道声明入参。不挂也能生成（路径参数退化为 `string`），但文档里
    就没有类型、没有 `requestBody`、也没有任何约束信息。
 
+### 2.1 路由默认怎么推算（不写 `.route` 时）
+
+oj 的路由表构建（`serve::routes::RouteTable::build`，`serve/src/routes.rs`）对**每个 `api.ts`**
+按下列规则落路由，所以你几乎不需要手写 `.route`：
+
+- **目录镜像为主路由**：文件 `src/<a>/<b>/api.ts` 默认得到
+  `GET/POST/... /{base}/<a>/<b>`（`base` 通常是 `/v1/api`）。
+- **目录段 `_name_` 自动变成路径参数**：目录名写成 `_user_` 这种「首尾下划线」形态，会被
+  转换为 `{user}`。例如 `src/user/_id_/api.ts` → `/{base}/user/{id}`。
+  判定很严格——整段 `_x_`、内层不以 `_` 起止、不含 `{}` 才转换；`_shared`、`a_bb_c`
+  这类保持字面段（见 `fs_seg_to_pattern`）。
+- **导出名 = HTTP 方法**：`export default { get, post, put, del, patch, head, options }`
+  里**每一个键名都必须是 HTTP 方法之一**（链尾取方法，非方法名会被直接忽略）。所以「一个文件
+  里既要查询又要创建」就各自命名为 `get` / `post`，**不是** `list` / `create`。
+- **嵌套组对象 = 额外的路径段**：`export default { cccc: { get, post } }` 会让 `cccc`
+  成为路径段 → `/{base}/<dir>/cccc` 下挂 GET/POST；再嵌套 `cccc: { list: { get } }`
+  → `/{base}/<dir>/cccc/list` 的 GET。组名本身也可以是 `_name_` 形态变成参数。
+
+### 2.2 `.route` 的三种写法（仅在需要偏离目录镜像时）
+
+当默认镜像不够用时，给某个 verb（或嵌套组）挂 `.route`：
+
+| `.route` 写法 | 最终 pattern | 适用场景 |
+|---|---|---|
+| 不写 / `""` | `{base}/<目录镜像>` | 默认即可，最常见 |
+| 相对，如 `"detail"` | `{base}/<目录镜像>/detail` | 同一目录下追加子路径 |
+| 相对，如 `"{id}"` | `{base}/<目录镜像>/{id}` | 同一文件里区分「列表」与「详情」 |
+| **以 `/` 开头**，如 `"/home/pie"` | `{base}/home/pie` | **根级**：忽略文件所在目录，直接挂在 base 根下（常用于把分散文件收拢到统一前缀） |
+
+> 提示：写了 `.route`（非空）的 verb，其目录镜像会被「替换」掉——dev 兜底层不会再把
+> 目录路径复活成同名路由，避免两个 pattern 指向同一文件（`replaced` 集合，见 `routes.rs`）。
+
+### 2.3 最小示例（零 `.route`）
+
 ```ts
-// src/wiki/collections/api.ts
+// src/wiki/collections/api.ts —— 完全不写 .route，路由 = 目录镜像
+// 自动得到：GET /v1/api/wiki/collections
 function get() { /* ... */ }
-get.route = "/collections/{id}";   // GET /v1/api/wiki/collections/{id}
-get.schema = {
-  params: { type: "object", required: ["id"], properties: { id: { type: "integer", minimum: 1 } } },
-};
 export default { get };
+```
+
+想在同一「资源」下既有列表 GET 又有详情 GET，oj 的惯用法是**用 `_id_` 目录而不是手写
+`.route`**（详见第 5 节完整示例）：
+
+```
+src/wiki/collections/api.ts      # get → GET  /v1/api/wiki/collections
+src/wiki/collections/_id_/api.ts # get → GET  /v1/api/wiki/collections/{id}  （_id_ 目录 ⇒ {id}）
 ```
 
 ---
@@ -126,43 +167,42 @@ oj openapi -d src --check
 ```
 
 > 注：`info.title` / `info.version` 目前是**固定占位值**（`oj API` / `0.1.0`），不会自动从
-> 你的 config 或 `oj --version` 填上。需要自定义标题时，生成后手动改或交给生成后脚本处理。
+> config 或 oj 版本填上（**为何不从 oj 版本填空，见 §6.5**）。发布前按需手动改或交给生成
+> 后脚本注入你项目的 API 版本。
 
 ---
 
-## 5. 完整示例：从源码到 openapi.json
+## 5. 完整示例：从目录结构到 openapi.json（几乎零 `.route`）
 
-### 源码（src/wiki/collections/api.ts）
+oj 的路由几乎都能从目录/导出结构推算。下面用 wiki/collections 这套最典型的「列表 + 创建 +
+详情」演示：文件怎么放、`oj openapi` 就怎么出——全程不写 `.route`。
+
+### 目录与源码
+
+```
+src/wiki/collections/api.ts        # 列表 + 创建，无需 .route
+src/wiki/collections/_id_/api.ts   # 详情：目录名 _id_ 自动变成 {id} 路径参数
+```
 
 ```ts
+// src/wiki/collections/api.ts —— 不写 .route，路由 = 目录镜像
 function get() {
-  const { id } = http.params;
-  json.ok({ id });
-}
-function list() {
   const { type, page } = http.query;
   json.ok({ type, page });
 }
-function create() {
+function post() {                    // POST 同样走目录镜像
   const { title } = http.body;
   json.ok({ created: title });
 }
 
-get.route    = "/collections/{id}";   // GET  /v1/api/wiki/collections/{id}
-list.route   = "/collections";          // GET  /v1/api/wiki/collections
-create.route = "/collections";          // POST /v1/api/wiki/collections
-
 get.schema = {
-  params: { type: "object", required: ["id"], properties: { id: { type: "integer", minimum: 1 } } },
-};
-list.schema = {
   query: {
     type: "object",
     required: ["type"],
     properties: { type: { type: "integer", enum: [1, 2] }, page: { type: "integer", minimum: 1 } },
   },
 };
-create.schema = {
+post.schema = {
   body: {
     type: "object",
     required: ["title"],
@@ -171,7 +211,19 @@ create.schema = {
   },
 };
 
-export default { get, list, create };
+export default { get, post };      // 导出名 get/post = HTTP 方法
+```
+
+```ts
+// src/wiki/collections/_id_/api.ts —— 目录 _id_ ⇒ 路径参数 {id}，仍无需 .route
+function get() {
+  const { id } = http.params;
+  json.ok({ id });
+}
+get.schema = {
+  params: { type: "object", required: ["id"], properties: { id: { type: "integer", minimum: 1 } } },
+};
+export default { get };
 ```
 
 ### 运行
@@ -187,20 +239,9 @@ oj openapi -d src -o openapi.json
   "openapi": "3.1.0",
   "info": { "title": "oj API", "version": "0.1.0" },
   "paths": {
-    "/v1/api/wiki/collections/{id}": {
-      "get": {
-        "operationId": "wiki_collections__id__get",
-        "summary": "GET v1/api/wiki/collections/{id}",
-        "parameters": [
-          { "name": "id", "in": "path", "required": true,
-            "schema": { "type": "integer", "minimum": 1 } }
-        ],
-        "responses": { "200": { "description": "OK" } }
-      }
-    },
     "/v1/api/wiki/collections": {
       "get": {
-        "operationId": "wiki_collections_list_get",
+        "operationId": "wiki_collections_get",
         "summary": "GET v1/api/wiki/collections",
         "parameters": [
           { "name": "type", "in": "query", "required": true,
@@ -211,7 +252,7 @@ oj openapi -d src -o openapi.json
         "responses": { "200": { "description": "OK" } }
       },
       "post": {
-        "operationId": "wiki_collections_create_post",
+        "operationId": "wiki_collections_post",
         "summary": "POST v1/api/wiki/collections",
         "requestBody": {
           "required": true,
@@ -228,6 +269,17 @@ oj openapi -d src -o openapi.json
         },
         "responses": { "200": { "description": "OK" } }
       }
+    },
+    "/v1/api/wiki/collections/{id}": {
+      "get": {
+        "operationId": "wiki_collections__id__get",
+        "summary": "GET v1/api/wiki/collections/{id}",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true,
+            "schema": { "type": "integer", "minimum": 1 } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
     }
   }
 }
@@ -235,10 +287,13 @@ oj openapi -d src -o openapi.json
 
 注意看映射关系：
 
-- `.schema.params.id`（integer, minimum 1）→ `in: path` 参数，类型**来自契约**；
-- `.schema.query`（type 必填 / page 选填）→ `in: query` 参数，`required` 只标声明的；
-- `.schema.body` → `requestBody`，且 `additionalProperties:false` 等契约细节原样进入
-  `schema`（前端代码生成器能据此校验入参）。
+- **完全没有 `.route`**：`collections/api.ts` 的 `get`/`post` 直接落到目录镜像
+  `/v1/api/wiki/collections`；详情靠 `collections/_id_/api.ts` 的 `_id_` 目录自动变成
+  `{id}` 路径参数——这正是 oj 推荐的无 `.route` 写法（列表 GET 与详情 GET 用两个文件而非
+  在一个文件里挂两个 `get`）。
+- 导出名 `get`/`post` 就是 HTTP 方法；`_id_` 目录 / 嵌套组自动展开成路径段。
+- `.schema.query`（type 必填 / page 选填）→ `in: query` 参数；`.schema.body` →
+  `requestBody`；`.schema.params.id`（integer, minimum 1）→ `in: path` 参数，类型**来自契约**。
 
 ---
 
@@ -289,9 +344,25 @@ OpenAPI 里 `required` 是 **parameter 级**字段（标识「这个参数是否
 没有 `200` 的响应结构；也不要手写 response schema 塞进生成物（下一次 `--check` 会把它当漂移
 打回）。需要响应文档时，等后续版本或暂时在生成后做后处理。
 
-### 6.5 `info` 是占位值
+### 6.5 `info` 是占位值（且**不应**从 oj 版本填空）
 
-`title` / `version` 固定为 `oj API` / `0.1.0`，不读你的项目。发布给外部前按需改。
+`info.title` / `info.version` 当前固定为 `oj API` / `0.1.0`，不读你的项目。
+
+关于 `info.version` 一个值得说清的疑问：**能不能直接填 oj 自己的版本（当前 `0.1.69`，
+代码里用 `env!("CARGO_PKG_VERSION")` 可取，见 `oj/src/info_cmd.rs` / `serve_cmd.rs`）？**
+结论：**不合适，不建议。**
+
+- OpenAPI 语义里 `info.version` 是「**这份 API 文档（即你的接口）的版本**」，与 OpenAPI
+  Specification 版本、与框架实现版本都不同。
+- oj 的 `CARGO_PKG_VERSION`（如 `0.1.69`）是**框架自身的版本**，把它填进 `info.version`
+  会误导消费方以为「这个 API 已经迭代到 0.1.69」，而实际上那只是 oj 的版本号。
+- oj 目前**没有单一的「项目 API 版本」概念**——`dist/manifests.yaml` 里是**每模块**各自的
+  版本，不存在一个能代表整个 API 的全局版本。因此无法自动取到「正确的」 `info.version`。
+
+所以当前保持占位是最稳妥的：**发布给外部前，把 `info.version` 手动改成你项目的 API 版本**，
+或交给「生成后脚本」注入（如从 `package.json` / `git describe` 读取）。未来若要自动化，正确
+的设计是在 config 或 `oj openapi` 加一个显式的 `--api-version` / 配置字段，由你显式给出接口
+版本，而不是复用框架版本。
 
 ### 6.6 dev 内省失败会直接报错
 
