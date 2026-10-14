@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.69（未打标签）
+## v0.1.69
 
 **fix（serve）：--daemon 子进程直连随包 glibc + 启动成败回传父进程（两项）**。
 Linux 自带 glibc 发行包的 daemon re-exec 原走 `<bin>/oj` 启动器脚本：kernel 按
@@ -59,6 +59,11 @@ flag）或 sqlx 升级改默认即红。插件 version 0.1.0 → 0.1.1（自本�
 一致为「匹配行」）+ 「先断言再写、行数不读」的跨引擎幂等写范式与代码；SKILL.md 陷阱
 速查新增对应一行。api-manual §1 `--daemon` 描述补就绪等待 / 失败回传 / 随包 glibc
 直连三项行为；SKILL.md 陷阱速查新增「`daemon child exited during startup`」一行。
+
+**feat（scripts/install.sh）：第二位置参数指定安装位置，且须已存在且为空（安全约束）**。
+安装位置可由第二位置参数显式指定（优先级高于 `OJ_INSTALL_DIR`），用于隔离安装；该目录
+必须**预先存在且为空**，否则报错退出——脚本**不会主动清空 / 删除**目标，避免误指向含数据
+目录被整体覆盖。默认安装目录（`~/.local/share/oj`）仍走 `mkdir -p` + 合并的旧升级语义。
 
 ## v0.1.68
 
