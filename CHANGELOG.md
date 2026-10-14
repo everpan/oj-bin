@@ -41,7 +41,8 @@ daemonized」秒退，真因不可见）。两项修复：
 **数值**比较（`numeric_eq`：两边整数精确比对、含浮点则按 `f64` 归并，使 `1 == 1.0` 成立、
 `1.5` 仍不命中）。`type:"number"/"integer"` 两种声明下的 `enum:[1,2]` + `type=1` 均通过，
 非成员（`type=1.5` / `type=3`）仍被拒。新增 `numeric_enum_in_query_matches_coerced_float`
-钉死回归。无需改用户 API，故 devkit 文档无变化。
+钉死回归。无新 API / 报错文案，但 `api-manual.md`「入参契约 `.schema`」补数值枚举按值比较说明、
+`SKILL.md` 陷阱速查新增对应一行、`README.md` 更新日志补 v0.1.69 条目（devkit 四件已同步）。
 
 **test（oj-db-mysql 0.1.1）：MySQL affected-rows 语义契约测试（env-gated 真库）**。
 下游（oj-wiki P4 评审）曾按裸 MySQL 文档语义推演「同值重复 UPDATE 得 0 行 ⇒ 重复已读

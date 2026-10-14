@@ -45,6 +45,14 @@ v0.1.66 修复三处用户可见缺陷：`json.stream().write()` 的 `ArrayBuffe
 在 mysql 误路由 LAST_INSERT_ID 分支的 panic（0.1.65 上 mysql 全业务面阻断，无对外契约变更）。
 见 `api-manual.md` §6 `json.stream`、seed 纪律表与 `scenarios.md` 场景「常见坑」。
 
+v0.1.69 修复 `query`/`params` 数值 `enum` 误杀合法浮点值（根因，无对外 API 变更）：
+`enum:[1,2]` 配合 `type:"number"/"integer"` 时，`?x=1` 强转得到的 `1`/`1.0` 现按**数值**
+命中成员，合法值不再被 `must be one of` 误拒（旧版的 handler 内重校验绕行壳可还原为直接
+声明 `enum`）。另 `scripts/install.sh` 支持**第二位置参数指定安装位置**（优先级高于
+`OJ_INSTALL_DIR`），该目录须已存在且为空，脚本不主动清空/删除，避免误覆盖含数据目录。
+见 `api-manual.md`「入参契约 `.schema`」数值枚举说明与「发行包布局与打包脚本 / 安装脚本」
+及 `SKILL.md` 陷阱速查。
+
 v0.1.65 起 `json.stream` / `json.sse` 的 `opts` 新增 `fileName` / `disposition`：`fileName` 写入
 `Content-Disposition: <disposition>; filename*=UTF-8''<pct-encoded>`（`disposition` 默认
 `attachment`，可传 `inline`），浏览器另存为原名、且**无需 302 到免鉴权 blob 路由**即可把鉴权后

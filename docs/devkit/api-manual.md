@@ -584,6 +584,10 @@ post.schema = {
 - `additionalProperties: false`（body 通道）运行期**拒掉未声明字段**；不写则放行额外字段。
   其余白名单关键字按 JSON Schema 语义生效（`required` / `enum` / `minimum`·`maximum` /
   `minLength`·`maxLength` / `items` + `minItems`·`maxItems` / `nullable` / `pattern`）。
+- **数值 `enum` 按值比较**：`query`/`params` 经强转后 `number` 声明得到浮点（如 `?x=1`
+  → `1.0`），`enum` 成员判定按**数值**而非 serde_json 数字变体——`1` 与 `1.0` 等价，
+  故 `type:"number"/"integer"` + `enum:[1,2]` 配合 `?x=1` 直接命中，**不要**为绕过误报
+  而在 handler 内重校验（那是对已修复根因的临时壳）。越界值（如 `3`、`1.5`）仍被拒。
 - 开关 `server.schema_validation`：**默认 true**（声明了就会执行）；
   置 `false` 为逃生门。
 - 同一份声明喂给 `oj openapi`，补出 `parameters` 与 `requestBody`；其中
@@ -3150,6 +3154,23 @@ vendored `node_modules/`（不打进 tgz）→ `./oj migrate -c config.yaml -d d
 加 `--db <name>` 逐库跑）→ `./oj serve -c config.yaml --api-path dist`。
 启动时把模块清单 + 路由表写入日志，可据此核对发布是否完整（终端默认静默：
 `tail -f logs/server-*.log`，或启动时加 `--console-log`）。
+
+### 安装脚本（scripts/install.sh）
+
+从仓库 `dist/` 取发行包解包覆盖安装到本机（维护侧便捷工具，非运行期 API）：
+
+```bash
+scripts/install.sh                                    # 自动选 dist/ 下 mtime 最新的 oj-v*.tar.gz
+scripts/install.sh oj-v0.1.69-aarch64-apple-darwin    # 按包名（自动补 .tar.gz）
+scripts/install.sh path/to/oj-v0.1.69-xxx.tar.gz      # 按 tar.gz 路径
+scripts/install.sh <包> /custom/oj                    # 第二参数指定安装位置
+```
+
+- 安装位置可用 **第二位置参数**显式指定（优先级高于环境变量 `OJ_INSTALL_DIR`，
+  见 `scripts/install.sh` 头部），用于隔离安装。
+- **安全约束**：显式指定的安装位置必须**已存在且为空**，否则报错退出；脚本**不会**
+  主动清空 / 删除目标，避免误指向含数据的目录被整体覆盖。默认安装目录
+  （`~/.local/share/oj`）仍走 `mkdir -p` + 合并的旧升级语义。
 
 ### npm 分发（@oj-bin/*，v0.1.13）
 
