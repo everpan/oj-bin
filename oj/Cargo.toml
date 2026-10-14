@@ -1,6 +1,6 @@
 [package]
 name = "oj"
-version = "0.1.68"
+version = "0.1.69"
 edition = "2024"
 authors = ["everpan <unix@vip.qq.com>"]
 

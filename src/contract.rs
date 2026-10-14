@@ -476,7 +476,7 @@ fn check_value(
         let Some(arr) = e.as_array() else {
             return Ok(());
         };
-        if !arr.iter().any(|x| x == value) {
+        if !enum_contains(arr, value) {
             return Err(format!(
                 "{path}: must be one of {}, got {}",
                 serde_json::to_string(arr).unwrap_or_default(),
@@ -582,6 +582,35 @@ fn kind_of(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
+}
+
+/// 枚举成员判定：数字按**数值**比较，而非 serde_json 的严格变体相等。
+///
+/// 根因：query/param 经强转得到的数值，`number` 声明会变成 `Float(1.0)`，
+/// 而契约里 `enum:[1,2]` 的字面量被解析为 `PosInt(1)`；serde_json 的
+/// `Float(1.0) != PosInt(1)`，于是合法值 `1` 被 `must be one of` 误杀
+/// （`got 1.0`）。按语义数值比较即可让 `1` / `1.0` 正确命中成员。
+fn enum_contains(arr: &[Value], value: &Value) -> bool {
+    arr.iter().any(|x| values_eq(x, value))
+}
+
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => numeric_eq(x, y),
+        _ => a == b,
+    }
+}
+
+fn numeric_eq(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    // 两边都是整数时优先精确比较（as_i64 对非整数返回 None）。
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+        return x == y;
+    }
+    // 任一为浮点：按 f64 比较，使 1 == 1.0 成立，而 1.5 仍不命中 1。
+    a.as_f64() == b.as_f64()
 }
 
 #[cfg(test)]
@@ -1021,6 +1050,51 @@ mod tests {
             InputContract::try_new(None, None, Some(json!({ "properties": "x" })), &mut vec![])
                 .is_err()
         );
+    }
+
+    // ---- 击穿：query 数值 enum 的根因修复（Float(1.0) 必须命中 PosInt(1)） ----
+
+    #[test]
+    fn numeric_enum_in_query_matches_coerced_float() {
+        // 复现 PR 根因：type 声明为 number、enum:[1,2]，前端传 type=1。
+        // 强转得到 Float(1.0)，必须按数值命中 enum 成员，而非误报 got 1.0。
+        let c = ok(
+            None,
+            Some(json!({
+                "type": "object",
+                "properties": { "type": { "type": "number", "enum": [1, 2] } }
+            })),
+            None,
+        );
+        let empty = HashMap::new();
+        assert!(
+            c.check(&empty, &map(&[("type", "1")]), None, &pats_of(&c))
+                .is_ok(),
+            "number + enum:[1,2] + type=1 必须放行"
+        );
+        // 整数字面量声明同样命中（PosInt vs PosInt）。
+        let c2 = ok(
+            None,
+            Some(json!({
+                "type": "object",
+                "properties": { "type": { "type": "integer", "enum": [1, 2] } }
+            })),
+            None,
+        );
+        assert!(
+            c2.check(&empty, &map(&[("type", "2")]), None, &pats_of(&c2))
+                .is_ok()
+        );
+        // 非成员浮点值仍须被拒（1.5 不命中 1|2）。
+        let err = c
+            .check(&empty, &map(&[("type", "1.5")]), None, &pats_of(&c))
+            .unwrap_err();
+        assert!(err.contains("must be one of"), "got: {err}");
+        // 越界整型仍须被拒。
+        let err = c
+            .check(&empty, &map(&[("type", "3")]), None, &pats_of(&c))
+            .unwrap_err();
+        assert!(err.contains("must be one of"), "got: {err}");
     }
 
     #[test]

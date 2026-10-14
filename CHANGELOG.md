@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## 下一版（未发布）
+## v0.1.69（未打标签）
 
 **fix（serve）：--daemon 子进程直连随包 glibc + 启动成败回传父进程（两项）**。
 Linux 自带 glibc 发行包的 daemon re-exec 原走 `<bin>/oj` 启动器脚本：kernel 按
@@ -33,6 +33,15 @@ daemonized」秒退，真因不可见）。两项修复：
    daemonized 退 0；子进程启动期退出 → **带真因报错并非零退出**（不再假成功）；
    超时但存活 → 提示看 server logs。`run()` 拆出 `run_inner` 包装回传，非 daemon
    场景零行为变化。
+
+**fix（contract）：query/param 数值 `enum` 误杀合法浮点值（根因修复）**。
+`InputContract` 校验器对 `enum` 成员判定直接用 serde_json 的 `==`：query/param 经强转，
+`number` 声明会得到 `Float(1.0)`，而契约字面量 `enum:[1,2]` 被解析为 `PosInt(1)`——
+`Float(1.0) != PosInt(1)` 导致合法值被 `must be one of` 误拒（报 `got 1.0`）。改为数字按
+**数值**比较（`numeric_eq`：两边整数精确比对、含浮点则按 `f64` 归并，使 `1 == 1.0` 成立、
+`1.5` 仍不命中）。`type:"number"/"integer"` 两种声明下的 `enum:[1,2]` + `type=1` 均通过，
+非成员（`type=1.5` / `type=3`）仍被拒。新增 `numeric_enum_in_query_matches_coerced_float`
+钉死回归。无需改用户 API，故 devkit 文档无变化。
 
 **test（oj-db-mysql 0.1.1）：MySQL affected-rows 语义契约测试（env-gated 真库）**。
 下游（oj-wiki P4 评审）曾按裸 MySQL 文档语义推演「同值重复 UPDATE 得 0 行 ⇒ 重复已读
