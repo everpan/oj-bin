@@ -84,6 +84,119 @@ src/wiki/collections/api.ts      # get → GET  /v1/api/wiki/collections
 src/wiki/collections/_id_/api.ts # get → GET  /v1/api/wiki/collections/{id}  （_id_ 目录 ⇒ {id}）
 ```
 
+### 2.4 三通道 `params` / `query` / `body`：各自是什么、什么时候出现
+
+`.schema` 里的三个通道对应请求入参的三种来源。**声明了哪条才校验哪条**——未声明的通道
+不受运行期约束、也不进文档：
+
+| 通道 | 来源（JS 侧读取） | 什么情况声明 | 文档映射 |
+|---|---|---|---|
+| `params` | 路径参数：路由 pattern 里的 `{name}` 段（来自 `_id_` 目录或 `.route`），JS 用 `http.params` 读 | pattern 里有路径参数就该声明，且名字必须与 pattern **双向一致**（见 §6.1）；没有路径参数就不写这条 | `in: path`（恒必填） |
+| `query` | URL 查询串 `?a=1&b=2`，JS 用 `http.query` 读 | 分页 / 过滤 / 开关等「挂在 URL 问号后」的入参，任何动词都可以有 | `in: query` |
+| `body` | JSON 请求体，JS 用 `http.body` 读 | 创建 / 更新等「载荷在请求体里」的场景——实践中即 **POST / PUT / PATCH**（`del` 带载荷少见但协议层不拦） | `requestBody` |
+
+两个实务提醒：
+
+- **GET/HEAD 别声明 `body`**：HTTP 语义上没有请求体，客户端不会发；而 oj 对声明了
+  `body` 通道的端点，会拿「无 body → null」去校验 `type: "object"`——等于**每个请求都
+  400**（死契约）。
+- **常见组合就三种**：列表 GET = 只有 `query`；详情 GET = 只有 `params`；
+  POST/PUT = `params`（若有）+ `body`。绝大多数接口落在这三格子里。
+
+### 2.5 `.schema` 挂哪里：动词级与组级（通道级合并）
+
+`.schema` 可挂两处，运行期守卫与 `oj openapi` **同源消费**（合并发生在内省期，结果落到
+`RouteRow.schema`）：
+
+- **动词级**（最常用）：挂在导出的 handler 函数对象上，只约束该端点；
+- **组级**：挂在嵌套组对象上，作整组**默认契约**——组内动词没挂 `.schema` 就继承，
+  挂了则按**通道合并**（组 `query` ∪ 动词 `body`，是「并集」不是「替换」）。
+
+```ts
+const asset = {
+  post() { /* ... */ },
+  get()  { /* ... */ },
+};
+// 组级默认契约：整组共享的 query（分页）——不碰路径参数
+asset.schema = {
+  query: { type: "object", properties: { page: { type: "integer", minimum: 1 } } },
+};
+// 动词级叠加 body：最终 = 组 query(page) ∪ 动词 body(title)
+asset.post.schema = {
+  body: { type: "object", required: ["title"], properties: { title: { type: "string" } } },
+};
+export default { asset };
+```
+
+经验法则（见 `docs/devkit/api-manual.md`「嵌套 handler 组」）：**跨端点共享的 query 契约
+（分页 / 租户 / 公共过滤）放组级**；**路径参数（`params`）留给各动词自挂**——组级若声明了
+某路径参数，组内每个动词的 pattern 都必须含它，否则装配期失败。
+组 `.schema` 非法 → 装配期硬失败（不静默跳过）。
+
+### 2.6 `.schema` 支持的 key 速查（白名单）
+
+`.schema` 是 **JSON Schema 的严格子集**：白名单外的关键字（`$ref` / `oneOf` / `format`…）
+**注册期直接报错**，绝不静默跳过——「声明了但没生效」在本项目里是最重的缺陷类。
+
+| key | 作用 | 何时用 |
+|---|---|---|
+| `type` | 类型；单串或数组（如 `["string","null"]`）。允许 `string/number/integer/boolean/object/array/null` | 必写，每个属性都声明 |
+| `required` | 字符串数组：哪些属性必填 | 缺了就 400 的字段 |
+| `properties` | 子属性契约（递归校验） | object 的字段约束 |
+| `items` | 数组元素契约（递归校验） | `type:"array"` 必配 |
+| `additionalProperties` | `false` = 禁止未声明字段 | body 收口，防脏字段混入 |
+| `minimum` / `maximum` | 数值边界 | `page`≥1、金额上限 |
+| `minLength` / `maxLength` | 字符串长度边界 | 标题、编码长度闸 |
+| `pattern` | 正则约束（**Rust `regex`，≠ ECMA-262**：不支持 lookahead/反向引用；非法注册期报错） | 手机号、ID 格式 |
+| `enum` | 非空数组：合法值枚举 | 状态位；数值枚举**按值比较**（v0.1.69 修复过 `1.0` 误杀） |
+| `nullable` | `true` 时 `null` 放行 | 选填字段显式传 null |
+| `minItems` / `maxItems` | 数组元素个数边界 | 批量接口限 1~100 条之类 |
+| `default` | 白名单允许；**仅随契约透传进 openapi.json，运行期不会为缺参补默认值** | 纯文档用途 |
+
+### 2.7 两个行为差异要记住
+
+- **`params`/`query` 会强转**：这两通道来源是字符串 map，值按声明类型 coerce
+  （`"1"` → 整数 1、`"true"` → boolean）；**body 是 JSON，不强转**——body 里的数值必须
+  真的是数值，别传字符串。
+- **`params`/`query` 只允许扁平标量**：在这两通道里声明 `object`/`array` 是**永远无法满足的
+  死契约**，注册期拒绝（底层来源是 `HashMap<String,String>`）。
+
+### 2.8 案例：一份完整 `.schema` 及其双重效果
+
+```ts
+// src/wiki/collections/api.ts
+function post() {
+  const { title, tags, status, remark } = http.body;
+  json.ok({ created: title });
+}
+post.schema = {
+  body: {
+    type: "object",
+    required: ["title"],
+    additionalProperties: false,     // 多传字段 → 400
+    properties: {
+      title:  { type: "string", minLength: 1, maxLength: 80 },
+      tags:   { type: "array", minItems: 1, maxItems: 20,
+                items: { type: "string", pattern: "^[a-z][a-z0-9-]*$" } },
+      status: { type: "integer", enum: [0, 1, 2], default: 0 },  // default 只进文档
+      remark: { type: "string", nullable: true },                // 显式 null 放行
+    },
+  },
+};
+export default { post };
+```
+
+同一份声明在两处生效：
+
+1. **运行期**（先于 JS 执行；`server.schema_validation` 默认开，可关但声明仍进文档）：
+   - `POST /v1/api/wiki/collections` 传 `{"title":"hi","extra":1}` → 400
+     `body: additional property \`extra\` is not allowed`；
+   - 传 `{"title":""}` → 400 `body.title: shorter than minLength 1`；
+   - 漏掉 `title` → 400 `body: missing required field \`title\``；
+   - 合法请求才进 handler——JS 里不用再写一遍「if (!title) …」。
+2. **文档期**：`oj openapi` 把这份契约原样变成 `requestBody.content.application/json.schema`
+   （含 enum / default / nullable / minLength…），Swagger 与前端代码生成器据此校验入参。
+
 ---
 
 ## 3. 三条命令快速上手
