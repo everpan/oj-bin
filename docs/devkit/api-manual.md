@@ -267,7 +267,7 @@ tables:
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
-| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由） |
+| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response` → `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错 |
 | `oj build --check` | 只跑结构检查 S001–S008 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
@@ -537,10 +537,11 @@ export default { asset };
 - release：`oj build` 为嵌套行写入 `handler` 链字段（顶层动词行不写，旧产物无此字段
   照常启动）；路由事实唯一来源仍是 `routes.js`（第 11 章）。
 
-### 入参契约 `.schema`（v0.1.44）
+### 入参与出参契约 `.schema`（v0.1.44，响应通道 v0.1.70）
 
-与 `.route` 同构：在导出的函数对象上挂 `.schema`，分**三通道**声明入参
-（`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）。
+与 `.route` 同构：在导出的函数对象上挂 `.schema`，分**四通道**声明——入参三通道
+（`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）
+加出参 `response`（v0.1.70）。
 `.schema` 的首要目的是**让接口符合 OpenAPI 并生成文档**（`oj openapi` 从 `RouteRow.schema`
 出 parameters / requestBody；与 oj-module 的「前端契约 → 后端 `.schema` → OpenAPI」管线同源
 对齐——关键字白名单、三通道 `params`/`query`/`body` 形态完全一致）。它既可挂在**动词函数**
@@ -589,10 +590,57 @@ post.schema = {
   故 `type:"number"/"integer"` + `enum:[1,2]` 配合 `?x=1` 直接命中，**不要**为绕过误报
   而在 handler 内重校验（那是对已修复根因的临时壳）。越界值（如 `3`、`1.5`）仍被拒。
 - 开关 `server.schema_validation`：**默认 true**（声明了就会执行）；
-  置 `false` 为逃生门。
-- 同一份声明喂给 `oj openapi`，补出 `parameters` 与 `requestBody`；其中
+  置 `false` 为逃生门——**它只关「是否执行运行期校验」，不关「声明是否合法」**：
+  拼错通道名、白名单外关键字这类**声明错误**在该开关关闭时**照样启动失败**。
+  不要用这个开关去绕启动报错（那会同时关掉全部入参校验）。
+- 同一份声明喂给 `oj openapi`，补出 `parameters` / `requestBody` / `responses`；其中
   `params` 声明必须与路由 pattern 的实参**双向一致**，否则 `oj openapi` 报错
   （避免契约与 URL 变成两份真源）。
+
+#### `response` 通道：出参声明（v0.1.70）
+
+```js
+get.schema = {
+  // 入参照旧……
+  // 出参：声明 `json.ok(data)` 的 **data payload**
+  response: {
+    type: "object",
+    required: ["list", "total"],
+    properties: {
+      list: { type: "array", items: { type: "object", properties: { id: { type: "integer" } } } },
+      total: { type: "integer", minimum: 0 },
+    },
+  },
+};
+```
+
+四件事必须说清楚（否则一定会被误解）：
+
+1. **只声明、不校验。** 运行期**不**校验返回值——少返回字段不会 400/500，也不会有
+   任何告警。把它当**写给前端的类型注释**，不是守卫。理由：响应由 JS 产生，校验失败时
+   请求已执行完、无处可去；把出参变成硬约束会让「少返回一个字段」升级成 500 级故障。
+   产物里带了 `x-oj-response-enforced: false` 就是这个意思。
+2. **它 = `json.ok(data)` 的 data payload**，不是整包信封。`oj openapi` 输出的是
+   **完整信封** `{code,msg,data}`（oj 的 wire 恒为信封，公开产物不该对字节撒谎）。
+3. **`json.raw` / `json.stream` / `json.sse` 端点不要声明 `response`**——它们绕过信封
+   出裸 body，声明了就与 wire 不符（这类端点不声明即保持占位）。
+4. **声明合法性照旧 fail-fast**：关键字白名单 / 类型字面值 / `pattern` 可编译，写错即
+   启动失败。`response` 允许 object / array / 嵌套（与 `body` 同），**不**受
+   `params`/`query` 那套「仅扁平标量」限制。
+
+组级 `.schema` 的 `response` 与入参合并规则**不同**：`response` 走「动词级**整体覆盖**、
+无则继承组级」，不做 `required` 并集 / `properties` 逐键覆盖——响应是动词各不相同的，
+组级必填被某动词继承会让文档声称返回并不存在的字段。
+
+> **不得把 `response` 当脱敏 / 裁剪边界**：按声明裁字段是字段级越权的伪保证
+> （声明窄于实际返回时，多出来的数据照样到了客户端）。
+
+#### `.schema` 顶层只允许四个通道（v0.1.70，行为收紧）
+
+顶层键白名单 = `params` / `query` / `body` / `response`；其余键（`param` / `bodys` /
+`responce` / `title` / `$schema` …）**装配期硬失败**（报错带 method / pattern /
+handler 链 / 文件）。以前这类键被**静默忽略**——拼错的通道意味着接口一直在裸奔，
+而「声明了但没生效」是本项目最重的缺陷类。报 `unsupported channel` 就改名或删除。
 
 ### ws.ts（WebSocket 生命周期钩子）
 
@@ -3446,6 +3494,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | blob multipart 预签名（v0.1.30） | `blob.uploadUrl` 的 multipart 形态暂返回 Err（object_store 无 multipart presign API）；单发 PUT 预签名 + `PUT {base}/blob/{key}` 直传路由（≤1 GiB）已覆盖大文件场景，>100MB 分片需求出现再补 |
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
 | 嵌套 handler 组上限 4 层、`route` 为保留键（v0.1.64） | 链长 >4 或自引用（`a.self=a`）内省期即失败；组对象的字符串 `.route` 是本层前缀声明，故子组不能命名 `route` |
+| `.schema` 顶层只允许四通道（v0.1.70） | 白名单 = `params`/`query`/`body`/`response`，其余键装配期硬失败（旧版静默忽略 = 接口裸奔）。报错带 method/pattern/handler/文件；**不要**用 `schema_validation: false` 绕 |
+| `.schema.response` 运行期**不校验**（v0.1.70） | 只作文档与生成真源（产物带 `x-oj-response-enforced: false`）：少返回字段不报错、不裁剪。`json.raw`/`json.stream`/`json.sse` 端点无信封，**不要**声明 `response` |
+| `oj openapi` 生成期审计 + `operationId` 唯一（v0.1.70） | 非法 `.schema`（含拼错通道）在生成期即失败，不再进 spec；`/user/profile` 与 `/user-profile` 派生同名 `user_profile_get` → 报错（下游按它命名符号会互相覆盖） |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |
 | 端口 <1024（如 778）属特权端口 | 需 root 才能 bind，用 ≥1024（默认 `9778`） |

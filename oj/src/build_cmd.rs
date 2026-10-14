@@ -442,6 +442,16 @@ async fn build_one(
             ));
         }
     }
+    // `.schema` 声明合法性审计（v0.1.70）：与 serve 装配**同口径**（同一个
+    // `contract::audit_schema`）。落盘前拦住，否则非法声明会先写进 routes.js，
+    // 直到部署启动才爆——而 openapi.json 现在是下游生成 __client 的唯一输入。
+    for (file, method, chain, pat, schema) in &rows_out {
+        if let Some(sv) = schema {
+            only_js::contract::audit_schema(sv).map_err(|e| {
+                format!("invalid `.schema` on {method} {pat} (handler `{chain}`, {file}): {e}")
+            })?;
+        }
+    }
     // 构建期 fail-fast：非法 pattern / 同位异名参数在 build 期报错，免得到部署启动才爆。
     routes::check_patterns(&pats)?;
     let mut js = String::from("// 由 oj build 生成；勿手改。\nexport default [\n");

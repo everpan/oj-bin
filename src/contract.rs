@@ -1,8 +1,16 @@
 //! InputContract：handler 入参契约（v0.1.44，PR-6 4b）。
 //!
-//! handler 导出函数可挂 `.schema`（与 `.route` 同构），分**三通道**描述入参：
-//! `params`（路径段）/ `query` / `body`，对应 `RequestInfo` 的同名字段。
-//! 同一份声明既作运行期校验（违反 → 400），也喂 `oj openapi` 出 `parameters`/`requestBody`。
+//! handler 导出函数可挂 `.schema`（与 `.route` 同构），分通道描述入参与出参：
+//! `params`（路径段）/ `query` / `body`（入参三通道，与 `RequestInfo` 同名字段对应），
+//! 以及 v0.1.70 起的 **`response`**（出参声明）。
+//! 同一份声明既作运行期校验（入参违反 → 400），也喂 `oj openapi` 出
+//! `parameters` / `requestBody` / `responses`。
+//!
+//! ## `response` 通道为何不参与运行期校验
+//! 响应由 JS 产生，校验失败时请求已执行完——无处可去，且会把「少返回一个字段」
+//! 变成 500 级故障。故 `response` 只**声明与审计**（装配期关键字白名单 /
+//! 类型字面值 / pattern 可编译，一律 fail-fast），是**文档与生成器的真源**
+//! （`oj openapi` 的 `responses.200`、`oj gen client` 的响应类型），运行期不拦。
 //!
 //! ## 为何自研最小校验器而非引入 JSON Schema crate
 //! 需要的是 **OpenAPI 方言**：路径/查询参数在 HTTP 里只有字符串形态，数值必须显式强转；
@@ -39,6 +47,12 @@ pub const SUPPORTED_KEYWORDS: &[&str] = &[
     "maxItems",
     "default",
 ];
+
+/// `.schema` 允许的通道（顶层键白名单）。
+///
+/// 顶层出现白名单外的键 → 装配期 fail-fast：入参三通道拼错（如 `param` / `bodys`）
+/// 会让整份契约静默不生效，这正是本项目最重的缺陷类，宁可启动失败。
+pub const SCHEMA_CHANNELS: &[&str] = &["params", "query", "body", "response"];
 
 /// params / query 允许的类型（`HashMap<String, String>` 只能表达这些）。
 const SCALAR_TYPES: &[&str] = &["string", "number", "integer", "boolean", "null"];
@@ -275,6 +289,62 @@ fn audit_channel_opt(
     audit_keywords(s, &format!(".schema.{chan}"), pats)
 }
 
+/// 一处 handler 的 `.schema` **全量审计**（v0.1.70 唯一入口）。
+///
+/// 三条路径——serve 装配（`oj/src/app.rs`）/ `oj build` 落盘 `routes.js` /
+/// `oj openapi` 生成——**必须同口径**：只在装配期审计会让非法声明先落进产物，
+/// 而 openapi.json 现在是下游 `__client` 生成的唯一输入，等 serve 才红就太晚了。
+///
+/// 审计项：①顶层通道白名单 ②`params`/`query` 仅扁平标量 ③各通道关键字白名单
+/// ④类型字面值 ⑤`pattern` 可编译（Rust regex）。**任一不合法 → Err。**
+///
+/// 与 `server.schema_validation` 开关**无关**：开关管「是否执行校验」，不管
+/// 「声明是否合法」——逃生门是给「规则误杀合法流量」准备的，不是给代码写错准备的。
+/// 收集到的 pattern 在此丢弃（可编译性已在审计内验证）；需要预编译的调用方自行
+/// 走 `InputContract::try_new` / `InputContractRegistry::insert`。
+pub fn audit_schema(schema: &Value) -> Result<(), String> {
+    let mut pats = Vec::new();
+    audit_channels(schema)?;
+    audit_scalar_channel(&schema.get("params").cloned(), "params", &mut pats)?;
+    audit_scalar_channel(&schema.get("query").cloned(), "query", &mut pats)?;
+    audit_channel_opt(&schema.get("body").cloned(), "body", &mut pats)?;
+    if let Some(r) = schema.get("response") {
+        audit_response(r)?;
+    }
+    Ok(())
+}
+
+/// `.schema` 顶层通道白名单审计（v0.1.70）。
+///
+/// 拼错通道名（`param` / `bodys` / `responce` …）会让整份契约**静默不生效**——
+/// 运行期守卫只认 `params`/`query`/`body`，拼错的那个等于裸奔。故 fail-fast。
+fn audit_channels(schema: &Value) -> Result<(), String> {
+    let Some(obj) = schema.as_object() else {
+        return Err(".schema: must be an object".to_string());
+    };
+    for k in obj.keys() {
+        if !SCHEMA_CHANNELS.contains(&k.as_str()) {
+            return Err(format!(
+                ".schema: unsupported channel `{k}` — allowed channels are {}; \
+                 an unknown channel would be silently ignored at runtime, so it FAILS FAST \
+                 here instead (a declaration that does nothing is a lie)",
+                SCHEMA_CHANNELS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `response` 通道审计（v0.1.70）：关键字白名单 + 类型字面值 + pattern 可编译，
+/// 一律 fail-fast。**不套** params/query 的「仅扁平标量」限制——响应是 JSON 值，
+/// object / array / 嵌套都是合法形态（与 `body` 同语义）。
+///
+/// 运行期**不**校验响应（见模块文档），这里只保证声明本身合法，好让它安全地成为
+/// `oj openapi` 的 `responses` 与下游 `__client` 响应类型的真源。
+fn audit_response(schema: &Value) -> Result<(), String> {
+    audit_keywords(schema, ".schema.response", &mut Vec::new())
+}
+
 /// 递归审计：白名单关键字 + 类型字面值合法 + pattern 可编译。
 fn audit_keywords(v: &Value, path: &str, pats: &mut Vec<String>) -> Result<(), String> {
     let obj = v
@@ -339,6 +409,17 @@ fn audit_keywords(v: &Value, path: &str, pats: &mut Vec<String>) -> Result<(), S
             return Err(format!("{path}: properties must be an object"));
         };
         for (name, sub) in map {
+            // 原型链污染防线：openapi.json 是下游生成 TS/zod 的输入，属性名会直接
+            // 变成生成源码里的键。这三个键生成的字面量对象会改到原型上
+            // （与 `legal_handler_chain` 对 handler 链段的口径一致）。
+            for bad in ["__proto__", "constructor", "prototype"] {
+                if name == bad {
+                    return Err(format!(
+                        "{path}.properties.{name}: `{bad}` is not allowed as a property name \
+                         (prototype-pollution guard: these names become keys in generated client code)"
+                    ));
+                }
+            }
             audit_keywords(sub, &format!("{path}.properties.{name}"), pats)?;
         }
     }
@@ -1119,6 +1200,115 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- v0.1.70：`response` 通道（只声明 + 审计，运行期不校验） ----
+
+    #[test]
+    fn audit_schema_rejects_unknown_channel() {
+        // 击穿：拼错通道名以前**静默不生效**（接口裸奔），现在必须 fail-fast。
+        for ch in ["param", "bodys", "responce", "querys", "header", "$schema"] {
+            let err = audit_schema(&json!({ ch: { "type": "object" } })).unwrap_err();
+            assert!(
+                err.contains(ch) && err.contains("unsupported channel"),
+                "`{ch}` 必须被通道白名单拒: {err}"
+            );
+        }
+        // 合法四通道放行。
+        assert!(
+            audit_schema(&json!({
+                "params": { "type": "object", "properties": { "id": { "type": "integer" } } },
+                "query": { "type": "object", "properties": { "p": { "type": "string" } } },
+                "body": { "type": "object" },
+                "response": { "type": "object" }
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn response_channel_allows_nesting_unlike_scalar_channels() {
+        // response 是 JSON 值：object / array / 嵌套都合法——不得被 params/query
+        // 那套「仅扁平标量」规则误拒（那是入参来源是 HashMap<String,String> 决定的）。
+        let resp = json!({
+            "type": "object",
+            "required": ["list"],
+            "properties": {
+                "list": { "type": "array", "items": {
+                    "type": "object", "properties": { "id": { "type": "integer" } }
+                }},
+                "total": { "type": "integer", "minimum": 0 }
+            }
+        });
+        assert!(
+            audit_schema(&json!({ "response": resp })).is_ok(),
+            "response 允许嵌套 object/array"
+        );
+        // 反向击穿：同样的形态放在 params 里仍是死契约，必须被拒。
+        let err = audit_schema(&json!({
+            "params": { "type": "object", "properties": { "list": { "type": "array" } } }
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("only scalar") || err.contains("never"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn response_channel_still_fails_fast_on_bad_declaration() {
+        // 声明合法性照旧 fail-fast：未知关键字 / 非法类型 / 不可编译 pattern。
+        let err = audit_schema(&json!({
+            "response": { "type": "object", "properties": { "a": { "type": "string", "format": "email" } } }
+        }))
+        .unwrap_err();
+        assert!(err.contains("format") && err.contains("FAIL FAST"), "{err}");
+
+        let err = audit_schema(&json!({ "response": { "type": "str" } })).unwrap_err();
+        assert!(err.contains("unknown type"), "{err}");
+
+        let err = audit_schema(&json!({
+            "response": { "type": "object", "properties": { "a": { "type": "string", "pattern": "(?=x)" } } }
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("lookahead") || err.contains("not a valid Rust regex"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn prototype_pollution_names_are_rejected_in_properties() {
+        // openapi.json 是下游生成 TS/zod 的输入，`properties` 的键会原样变成生成源码
+        // 里的键——这三个名字生成的字面量对象会改到原型上。
+        for bad in ["__proto__", "constructor", "prototype"] {
+            let mut props = serde_json::Map::new();
+            props.insert(bad.to_string(), json!({ "type": "string" }));
+            let err = audit_schema(&json!({ "body": { "type": "object", "properties": props } }))
+                .unwrap_err();
+            assert!(
+                err.contains(bad) && err.contains("prototype-pollution"),
+                "`{bad}` 必须被拒: {err}"
+            );
+        }
+        // 正常字段名不受影响（含连字符、下划线、非 ASCII 都不禁）。
+        assert!(
+            audit_schema(&json!({
+                "body": { "type": "object", "properties": { "a-b": { "type": "string" } } }
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn audit_schema_covers_input_channels_too() {
+        // 唯一入口也要守住入参：openapi 生成 / build 落盘路径以前完全不审计，
+        // 坏契约会原样进产物（下游现在拿 openapi.json 生成 client）。
+        let err = audit_schema(&json!({ "body": { "type": "object", "oneOf": [] } })).unwrap_err();
+        assert!(err.contains("oneOf") && err.contains("FAIL FAST"), "{err}");
+        assert!(audit_schema(&json!({ "body": { "type": "object" } })).is_ok());
+        // 非对象形态的 .schema 本身也不放行。
+        assert!(audit_schema(&json!([])).is_err());
     }
 
     #[test]

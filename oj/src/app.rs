@@ -1446,9 +1446,18 @@ impl App {
         eprintln!(
             "routes: {method_rows} method-row(s), {patterns} pattern(s), {files} api file(s)"
         );
-        // 入参契约装配（v0.1.44）：RouteRow.schema 是唯一真源（dev 内省 / release
-        // routes.js 都汇到这里）。非法契约必须**硬失败** —— 不得退化为
+        // `.schema` 声明合法性审计（v0.1.70）：RouteRow.schema 是唯一真源（dev 内省 /
+        // release routes.js 都汇到这里）。非法声明必须**硬失败** —— 不得退化为
         // 「记一条 failure 继续跑」，那等于把声明悄悄变成不生效的东西。
+        //
+        // **不受 `server.schema_validation` 开关影响**：开关管的是「是否执行运行期校验」，
+        // 不是「声明是否合法」。逃生门是给「规则误杀合法流量」准备的，不是给代码写错
+        // 准备的——写错了就别让它起来，否则拼错的通道还在裸奔、下游还拿 openapi.json
+        // 去生成 client。
+        for (_, table) in &tables {
+            table.audit_schemas()?;
+        }
+        // 入参契约装配（v0.1.44）：审计已过，此处只登记运行期要执行的那部分。
         if cfg.server.schema_validation {
             let mut reg = InputContractRegistry::new();
             for (_, table) in &tables {
@@ -1465,9 +1474,10 @@ impl App {
                     )
                     .map_err(|e| {
                         format!(
-                            "server.schema_validation: invalid `.schema` on {} {} ({}): {e}",
+                            "invalid `.schema` on {} {} (handler `{}`, {}): {e}",
                             row.method,
                             row.pattern,
+                            row.handler,
                             file.display()
                         )
                     })?;

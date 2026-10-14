@@ -1290,25 +1290,37 @@ impl Bridge {
                own.charAt(0) === \"/\" ? own :\n\
                rp ? rp + \"/\" + own : own;\n\
              // 组级 .schema 与组级 .route 同等地位：组 .schema 作整组默认契约，动词自身\n\
-             // .schema 在其上合并——通道级（params/query/body）逐项合并：required 取并集、\n\
-             // properties 动词逐键覆盖（缺省用组值）；其余通道级关键字动词优先。\n\
+             // .schema 在其上合并。入参三通道（params/query/body）与 response 通道\n\
+             // 合并规则不同，见下。\n\
              const mergeSchema = (base, over) => {{\n\
                if (over === undefined || over === null) return base || null;\n\
                if (base === undefined || base === null) return over;\n\
                if (typeof base !== \"object\" || typeof over !== \"object\") return over;\n\
                const out = {{}};\n\
+               // 入参三通道：通道级合并——required 取并集、properties 动词逐键覆盖\n\
+               // （缺省用组值），其余通道级关键字动词优先。空并集 / 空 properties\n\
+               // **不写入**：凭空注入空的 required / properties 会给原本没声明\n\
+               // 这些键的通道塞进空值，进 openapi 就是噪声。\n\
                for (const ch of [\"params\", \"query\", \"body\"]) {{\n\
                  const b = base[ch], o = over[ch];\n\
                  if (b && o) {{\n\
                    const merged = Object.assign({{}}, b, o);\n\
                    const br = Array.isArray(b.required) ? b.required : [];\n\
                    const or = Array.isArray(o.required) ? o.required : [];\n\
-                   merged.required = Array.from(new Set(br.concat(or)));\n\
-                   merged.properties = Object.assign({{}}, b.properties || {{}}, o.properties || {{}});\n\
+                   const req = Array.from(new Set(br.concat(or)));\n\
+                   if (req.length) merged.required = req; else delete merged.required;\n\
+                   const props = Object.assign({{}}, b.properties || {{}}, o.properties || {{}});\n\
+                   if (Object.keys(props).length) merged.properties = props; else delete merged.properties;\n\
                    out[ch] = merged;\n\
                  }} else if (b) {{ out[ch] = b; }}\n\
                  else if (o) {{ out[ch] = o; }}\n\
                }}\n\
+               // response：动词级**整体覆盖**，无则继承组级。不并入参那套\n\
+               // （required 并集 / properties 逐键覆盖）——响应是动词各不相同的，\n\
+               // 组级声明的必填字段被某动词继承后，文档与下游 client 会声称返回\n\
+               // 并不存在的必填项，那是假真源。\n\
+               if (over.response) out.response = over.response;\n\
+               else if (base.response) out.response = base.response;\n\
                for (const k of Object.keys(over)) if (!(k in out)) out[k] = over[k];\n\
                for (const k of Object.keys(base)) if (!(k in out)) out[k] = base[k];\n\
                return out;\n\

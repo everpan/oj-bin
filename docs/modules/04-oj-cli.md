@@ -122,14 +122,21 @@
 
 ## 6. `oj openapi` 子命令（`openapi_cmd.rs`）
 
-PR-6 第一步（生成 + 漂移门禁；请求/响应 schema 留待后续步）：
+PR-6：生成 + 漂移门禁（请求侧 v0.1.44；**响应侧 v0.1.70** 补完）：
 
 - **路由发现双模复用既有路径**（与 `App::from_config` 同构，不另起灶）：
   - dev（`-d` 指向 `src`，`ts=true`）：逐文件 `bridge_introspector` 内省 `.route` → `RouteTable::build`；
   - release（`-d` 指向 `dist`，含 `manifests.yaml`，`ts=false`）：读锁 + 各模块 `routes.js`（`bridge_default_reader` → `entries_from_value` → `from_entries`）。
+- **生成前审计**：`RouteTable::audit_schemas()`（v0.1.70）——非法 `.schema` 不再原样进 spec。
+  产物是下游 `__client` 生成的唯一输入，且 release 的 `routes.js` 可能来自第三方 `.tgz`
+  模块（构建期不可信输入）。dev / release 两条发现路径在此一并收口。
 - **生成**：`RouteTable.listing()` → OpenAPI 3.1（`serde_json::Value` 手搓，不引额外 crate）。
-  当前仅能收集体量信息（路径 / 方法 / 源文件 `x-oj-file` 溯源 / 派生 `operationId` / 路径参数），
-  `responses` 为占位（200 OK）—— schema 待 PR-6 后续步补完。
+  路径 / 方法 / 源文件 `x-oj-file`（**相对 api 根**，不带绝对路径）/ 派生 `operationId` /
+  路径参数 / `parameters` / `requestBody`；v0.1.70 起另有：
+  - `responses.200` ← `.schema.response`（外裹 `{code,msg,data}` 信封 + `x-oj-response-enforced: false`；
+    未声明则保持占位 200 OK）；
+  - operation 级 `tags: [<module>]` 与根级 `tags` 清单（模块归属，`RouteTable::module_of`）；
+  - `operationId` 重复即报错（下游按它命名符号会静默覆盖）。
 - **漂移门禁 `--check`**：生成物与已提交 `<dir>/openapi.json`（或 `-o` 指定文件）做**键序规范化**
   `canonical` 比较，不一致即打印 `oj openapi -c ... -d ... [--base ...] [-o ...]` 重生成命令与
   差异行、退出码 1（CI 钉死路由漂移）；一致退出码 0。`canonical` 递归键升序，键序差异不误报。
@@ -141,7 +148,17 @@ PR-6 第一步（生成 + 漂移门禁；请求/响应 schema 留待后续步）
 
 - 单元（`openapi_cmd.rs`）：`generate_produces_valid_openapi_3_1_*`（catch-all `{*path}` 收敛
   `{path}` + 路径参数抽出）、`check_detects_no_drift_and_drift`（篡改 summary 必被检出）、
-  `check_roundtrip_writes_then_detects_tamper`（真·`--check` 文件往返：落盘→同物校验 0→篡改 1）。
+  `check_roundtrip_writes_then_detects_tamper`（真·`--check` 文件往返：落盘→同物校验 0→篡改 1）；
+  v0.1.70 另加 `response_contract_becomes_enveloped_200_schema`（信封外裹 + data 原样）、
+  `without_response_contract_200_stays_placeholder`（占位回归）、
+  `generate_fails_fast_on_invalid_schema`（拼错通道 / 坏关键字不得进 spec）、
+  `tags_carry_module_for_downstream_codegen` + `dev_files_are_tagged_by_first_dir_segment`、
+  `duplicate_operation_ids_fail_generation`。
+- 单元（`serve/src/routes.rs`）：`module_of` 剥 release 版本后缀但不误伤连字符模块名、
+  `rel_file_never_leaks_absolute_path`、`audit_schemas_is_the_single_door_...`。
+- e2e：`given_response_contract_when_response_violates_then_still_200`（**反向击穿**——
+  `response` 不是守卫）、`given_invalid_schema_when_boot_then_fails_even_with_validation_off`
+  （声明合法性审计不受 `schema_validation` 开关影响）。
 - 篡改 committed `openapi.json` 必须被 `--check` 非零退出——这正是 CI 漂移门禁要抓的。
 
 ## 7. 瘦身装配（`migrate_cmd.rs`）

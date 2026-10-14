@@ -102,10 +102,13 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
 | `oj exec` 报 `module '…' missing manifest.yaml` 或 `service dir not found` | 裸 `oj exec` 在没有 config/mounts/`-d` 时会向上**猜** api 目录——在源码仓根会撞上仓库自己的 `src/`。exec **不需要** config.yaml：纯计算脚本直接 `-e` 跑；要后端就 `-c <项目config>` 或 `-d <api目录>` 显式给（v0.1.58 起探测只认「像业务树」的候选，非业务 `src/` 已跳过） |
 | 启动报 `no mounts configured` / `mounts[i]: 挂载目录 … No such file` | 准入门（v0.1.58）：顶层 `mounts:`（config + CLI 折叠后）为空——加一条挂载或传 `--api-path`/`--app-path`；挂载目录存在性由装配期 fail-fast（报错含挂载序号与前缀）。CLI 路径相对 CWD，config 挂载目录相对 config 目录。旧 `server.app_path` 等五键已删，出现即报错并输出迁移 YAML |
-| 启动失败报 `server.schema_validation: invalid .schema` | `.schema` 用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；`params`/`query` 声明 array/object 也是死契约，同样拒 |
-| 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false` |
+| 启动失败报 `invalid \`.schema\` on …` | 三种之一：①用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；②`params`/`query` 声明 array/object（死契约）；③**顶层通道名拼错**（`param` / `bodys` / `responce` …，v0.1.70 起白名单只有 `params`/`query`/`body`/`response`）。报错带 method/pattern/handler/文件 |
+| 升级到 v0.1.70 后启动报 `unsupported channel` | 该通道**以前也从未生效**（被静默忽略，接口一直在裸奔）——改名或删除。**不要**用 `schema_validation: false` 绕：该开关只关运行期校验，声明合法性审计不受它影响，绕了还会连带关掉全部入参校验 |
+| 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false`（只关运行期校验） |
+| 声明了 `.schema.response` 但返回字段不合规却没报错 | **这是预期行为**：`response` 只作文档与生成真源（产物带 `x-oj-response-enforced: false`），运行期**不**校验响应（校验失败时请求已执行完，无处可去）。别把它当守卫，也别当脱敏边界 |
 | `query`/`params` 数值 `enum` 报 `must be one of [1,2], got 1.0` | 旧版根因（已修）：`enum` 按 serde_json 数字变体严格比较，强转得到的 `1.0` 不命中字面量 `1`。**升 v0.1.69+** 即消，**不要**为绕行在 handler 内重校验 / 删 `enum`（那是临时壳，根因已修复——数值 `enum` 现按值比较，`1` 与 `1.0` 等价） |
-| CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast |
+| CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast。**升 v0.1.70 必须重生成一次**：产物新增 `tags`（模块归属）、`responses.200` 落地、`x-oj-file` 改相对路径 |
+| `oj openapi` 报 `operationId … is derived from two different routes` | 两条路由（如 `/user/profile` 与 `/user-profile`）派生出同名 operationId —— 下游 codegen 按它命名符号会静默覆盖；给其中一条设显式 `.route` 改名 |
 | seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量；语句前置 `--` 注释行允许（v0.1.66 起，方言改写判定先剥注释——此前注释打头会让 `INSERT OR IGNORE` 原样下发 mysql → 1064） |
 | 自写 LIKE 要转义 `%`/`_` | 别用 `ESCAPE '\'`——mysql 默认 sql_mode 下反斜杠吃掉收尾引号即 1064；统一 `ESCAPE '!'` 并转义 `!`/`%`/`_`（`_shared/search` 已照此） |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |

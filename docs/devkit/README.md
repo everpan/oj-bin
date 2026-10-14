@@ -45,6 +45,20 @@ v0.1.66 修复三处用户可见缺陷：`json.stream().write()` 的 `ArrayBuffe
 在 mysql 误路由 LAST_INSERT_ID 分支的 panic（0.1.65 上 mysql 全业务面阻断，无对外契约变更）。
 见 `api-manual.md` §6 `json.stream`、seed 纪律表与 `scenarios.md` 场景「常见坑」。
 
+v0.1.70 新增 `.schema` 的**响应通道 `response`**（入参与出参同一处声明），并把 `oj openapi`
+的响应侧补齐：`response` = `json.ok(data)` 的 **data payload**，生成物输出**完整信封**
+`{code,msg,data}` 并带 `x-oj-response-enforced: false`——**运行期不校验响应**（响应由 JS
+产生，校验失败时无所去处），它只作文档与生成真源，不得当脱敏/裁剪边界；`json.raw` /
+`json.stream` / `json.sse` 端点无信封，不要声明。产物另新增：operation 级与根级
+**`tags: [<module>]`**（下游按它分模块生成 client）、`x-oj-file` 改相对路径（不带本机绝对
+路径）。**行为收紧**：`.schema` 顶层键白名单只有 `params`/`query`/`body`/`response`，其余
+（拼错的 `param`/`bodys`/`responce`）装配期硬失败——这类键以前被静默忽略，接口一直在裸奔；
+且该审计**不受 `schema_validation: false` 影响**（那开关只关运行期校验，不要拿它绕启动
+报错）。`oj openapi` 另加两道 fail-fast：生成前审计全部 `.schema`（非法契约不再原样进
+spec，release 的第三方 `.tgz` 模块同样兜底）、`operationId` 重复即报错。升级后**必须重生成
+一次 openapi.json**。见 `api-manual.md`「入参与出参契约 `.schema`」的 `response` 小节与
+`SKILL.md` 陷阱速查。
+
 v0.1.69 修复 `query`/`params` 数值 `enum` 误杀合法浮点值（根因，无对外 API 变更）：
 `enum:[1,2]` 配合 `type:"number"/"integer"` 时，`?x=1` 强转得到的 `1`/`1.0` 现按**数值**
 命中成员，合法值不再被 `must be one of` 误拒（旧版的 handler 内重校验绕行壳可还原为直接

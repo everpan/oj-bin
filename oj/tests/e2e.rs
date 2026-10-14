@@ -1574,6 +1574,16 @@ fn contract_project(tmp: &Path) {
          export default { get };\n",
     )
     .unwrap();
+    // v0.1.70：声明了响应契约但**故意不按它返回**——用作「response 不是守卫」的反向击穿。
+    std::fs::create_dir_all(tmp.join("src/g/r")).unwrap();
+    std::fs::write(
+        tmp.join("src/g/r/api.ts"),
+        "function get() { json.ok({ reached: true }); }\n\
+         get.schema = { response: { type: \"object\", required: [\"nope\"], \
+           properties: { nope: { type: \"string\" } } } };\n\
+         export default { get };\n",
+    )
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1632,6 +1642,70 @@ async fn given_schema_validation_off_when_request_violates_then_passes() {
     assert_eq!(v["data"]["reached"], true, "{v}");
 
     h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_response_contract_when_response_violates_then_still_200() {
+    // 击穿（**反向**）：`response` 是声明、不是守卫——违反它不得变成 400/500。
+    // 响应由 JS 产生，校验失败时请求已执行完、无处可去（拿它当硬约束会把
+    // 「少返回一个字段」升级成 500 级故障）。
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-resp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    contract_project(&tmp);
+    let (addr, h) = contract_boot(&tmp, true).await;
+
+    // 声明了必填 `nope`，实际只返回 `reached`——必须照常 200 且不被裁剪。
+    let (st, v) = req(addr, "GET", "/v1/api/g/r", None).await;
+    assert_eq!(st, 200, "response 声明不得拦请求: {v}");
+    assert_eq!(v["data"]["reached"], true, "{v}");
+    assert!(
+        v["data"].get("nope").is_none(),
+        "声明不得反过来裁剪/补写响应: {v}"
+    );
+
+    h.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_invalid_schema_when_boot_then_fails_even_with_validation_off() {
+    // 击穿：声明**合法性**审计不受 `server.schema_validation` 开关影响。
+    // 开关管「是否执行运行期校验」，不管「声明是否合法」——逃生门是给「规则误杀
+    // 合法流量」准备的，不是给代码写错准备的。拼错通道以前静默不生效（接口裸奔）。
+    let _g = lock();
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-badschema-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    contract_project(&tmp);
+    // 改成拼错的通道名（`bodys`）。
+    std::fs::write(
+        tmp.join("src/g/api.ts"),
+        "function post() { json.ok({ reached: true }); }\n\
+         post.schema = { bodys: { type: \"object\" } };\n\
+         export default { post };\n",
+    )
+    .unwrap();
+
+    let root = sample();
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: 0\n  public_key_path: \"{}\"\n  certificate_path: \"{}\"\n  schema_validation: false\ndb:\n  default: \"{}\"\n",
+        fwd(&root.join("config/public.pem")),
+        fwd(&root.join("config/cert.jws")),
+        oj_plugin_ffi::path_util::sqlite_file_dsn(&tmp.join("db.sqlite")),
+    );
+    std::fs::write(tmp.join("config.yaml"), &cfg).unwrap();
+    let c: Config = serde_yaml::from_str(&cfg).unwrap();
+    let err = serve_cmd::start(c, &tmp, tmp.join("src"), "/v1/api".into())
+        .await
+        .expect_err("非法 .schema 必须让启动失败，即使 schema_validation: false");
+    assert!(
+        err.contains("bodys") && err.contains("unsupported channel"),
+        "报错必须指向拼错的通道: {err}"
+    );
+
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

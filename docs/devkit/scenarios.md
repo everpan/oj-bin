@@ -2212,6 +2212,18 @@ project.put.schema = {
 project.post.schema = {
   body: { type: "object", required: ["title"], properties: { title: { type: "string", maxLength: 80 } } },
 };
+// 出参声明（v0.1.70）：`response` = `json.ok(data)` 的 data payload，只进文档/生成，
+// 运行期**不校验**。注意它与入参合并规则不同——动词级**整体覆盖**，不与组级做并集。
+project.get.schema = {
+  response: {
+    type: "object",
+    required: ["list", "total"],
+    properties: {
+      list: { type: "array", items: { type: "object" } },
+      total: { type: "integer", minimum: 0 },
+    },
+  },
+};
 
 export default { project };
 ```
@@ -2221,7 +2233,11 @@ export default { project };
 - `project.get` / `project.post` → 继承组 `query`（分页），无路径参数冲突；
 - `project.getById` / `project.put` → 组 `query` ∪ 动词 `params.projectId`（route 含 `{projectId}`，双向一致校验通过）；
 - `project.members.*` → 继承组 `query`（路由 `/project/{projectId}/members` 含 id，但若 members 自身要 id，在 `members` 子组挂 `.schema` 即可，沿链累加）；
-- 任一 `.schema` 非法 → `server.schema_validation` 装配期硬失败（不静默跳过）。
+- `response` 通道**不并入参那套**：动词级整体覆盖、无则继承组级（不做 `required` 并集 /
+  `properties` 逐键覆盖）——响应是动词各不相同的，组级必填被某动词继承会让文档声称
+  返回并不存在的字段。
+- 任一 `.schema` 非法 → 装配期硬失败（不静默跳过），且**不受 `schema_validation: false`
+  影响**：该开关只关运行期校验，不关声明合法性。
 
 ### ③ 平衡判据：组 vs 子目录 vs 平铺（别走向任一极端）
 

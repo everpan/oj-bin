@@ -268,6 +268,9 @@ pub struct RouteTable {
     rows: Vec<RouteRow>,
     /// 文件表：FileId → 唯一绝对路径（去重存储，供 file_path / 分组输出复用）。
     files: Vec<PathBuf>,
+    /// api 根（dev 的 `src` / release 的 `dist`）：v0.1.70 起留存，供
+    /// `rel_file`（对外产物不带绝对路径）与 `module_of`（模块归属）使用。
+    root: PathBuf,
 }
 
 const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
@@ -281,6 +284,7 @@ impl Default for RouteTable {
             replaced: std::collections::HashSet::new(),
             rows: Vec::new(),
             files: Vec::new(),
+            root: PathBuf::new(),
         }
     }
 }
@@ -301,7 +305,10 @@ impl RouteTable {
     ) -> (Self, Vec<String>) {
         let b = base.trim_matches('/');
         let mut failures = Vec::new();
-        let mut t = RouteTable::default();
+        let mut t = RouteTable {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
         for file in api_files(root, ts) {
             let decls = match introspect(&file) {
                 Ok(d) => d,
@@ -373,7 +380,10 @@ impl RouteTable {
     /// handler 链：行内 `handler` 字段优先；旧产物缺字段 → 以 `method` 兜底填链
     /// （单段链即旧行为，老 dist 不必重新 build 照常启动）。
     pub fn from_entries(root: &Path, entries: &[RouteEntry]) -> (Self, Vec<String>) {
-        let mut t = RouteTable::default();
+        let mut t = RouteTable {
+            root: root.to_path_buf(),
+            ..Default::default()
+        };
         let mut failures = Vec::new();
         for e in entries {
             if !METHODS.contains(&e.method.as_str()) {
@@ -549,6 +559,63 @@ impl RouteTable {
     /// FileId → 绝对路径（lookup 已把 Hit 解析为 PathBuf；此处供 banner / is_replaced 复用）。
     pub fn file_path(&self, id: FileId) -> &Path {
         &self.files[id.0 as usize]
+    }
+
+    /// FileId → **相对 api 根**的路径（v0.1.70）。
+    ///
+    /// 对外产物（openapi.json 的 `x-oj-file`）走这里：产物是公开文件，不该带本机
+    /// 绝对路径（信息泄露，且换台机器就不可比）。
+    pub fn rel_file(&self, id: FileId) -> &Path {
+        let p = self.file_path(id);
+        p.strip_prefix(&self.root).unwrap_or(p)
+    }
+
+    /// 路由所属**模块名**（v0.1.70）：供 `oj openapi` 出 `tags`，下游据此把
+    /// `__client` 分模块落盘（生成代码必须知道归属，光有 operationId 不够）。
+    ///
+    /// - dev：`src/<module>/<...>/api.ts` 的首段；
+    /// - release：`routes.js` 的 `<module>-<version>/...` 首段剥掉版本后缀。
+    ///
+    /// 只剩一层（api 根的裸 `api.ts` / `api.js`）→ None（无模块归属）。
+    pub fn module_of(&self, id: FileId) -> Option<String> {
+        let rel = self.rel_file(id);
+        let mut it = rel.components();
+        let first = it.next()?.as_os_str().to_string_lossy().into_owned();
+        it.next()?; // 根的裸 api 文件，不属于任何模块
+        // `<module>-<version>`：尾段是「数字与点」且含点才剥（模块名本身允许连字符，
+        // `my-module` 的尾段 `module` 不是版本号，不会被误剥）。
+        match first.rsplit_once('-') {
+            Some((m, v))
+                if !m.is_empty()
+                    && v.contains('.')
+                    && v.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+            {
+                Some(m.to_string())
+            }
+            _ => Some(first),
+        }
+    }
+
+    /// 全表 `.schema` **声明合法性审计**（v0.1.70 唯一入口）。
+    ///
+    /// 消费路径必须调用它（当前三处：`oj serve` 装配 / `oj build` 落盘 /
+    /// `oj openapi` 生成）。**release 的 `routes.js` 可能来自第三方 `.tgz` 模块**——
+    /// 那里的 `.schema` 是构建期不可信输入，不能只靠「本仓 build 时审过」。
+    /// 审计项与报错文案见 `only_js::contract::audit_schema`。
+    pub fn audit_schemas(&self) -> Result<(), String> {
+        for row in &self.rows {
+            let Some(sv) = &row.schema else { continue };
+            only_js::contract::audit_schema(sv).map_err(|e| {
+                format!(
+                    "invalid `.schema` on {} {} (handler `{}`, {}): {e}",
+                    row.method,
+                    row.pattern,
+                    row.handler,
+                    self.rel_file(row.file).display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// 按文件分组输出（FileId 分组）：同一 api 文件的多个谓词归到一行文件头下，
@@ -1129,6 +1196,120 @@ mod tests {
             Lookup::Hit { handler, .. } => assert_eq!(handler, "post"),
             _ => panic!("expected hit"),
         }
+    }
+
+    // ---- v0.1.70：模块归属 / 相对路径（供 openapi 出 tags、x-oj-file） ----
+
+    #[test]
+    fn module_of_strips_release_version_suffix_but_keeps_hyphen_names() {
+        let dir = fixture(&[]);
+        let mk = |file: &str| -> (RouteTable, FileId) {
+            let (t, f) = RouteTable::from_entries(
+                &dir,
+                &[RouteEntry {
+                    method: "get".to_string(),
+                    pattern: "/v1/api/x".to_string(),
+                    file: file.to_string(),
+                    handler: None,
+                    schema: None,
+                }],
+            );
+            assert!(f.is_empty(), "{f:?}");
+            let id = t.listing()[0].file;
+            (t, id)
+        };
+        // release：`<module>-<version>/...` → 剥版本
+        assert_eq!(
+            mk("wiki-0.1.0/api.js")
+                .0
+                .module_of(mk("wiki-0.1.0/api.js").1)
+                .as_deref(),
+            Some("wiki")
+        );
+        assert_eq!(
+            mk("wiki-0.1.0/collections/api.js")
+                .0
+                .module_of(mk("wiki-0.1.0/collections/api.js").1)
+                .as_deref(),
+            Some("wiki")
+        );
+        // 模块名自带连字符不得被误剥（尾段不是版本号）
+        assert_eq!(
+            mk("my-module-0.1.0/api.js")
+                .0
+                .module_of(mk("my-module-0.1.0/api.js").1)
+                .as_deref(),
+            Some("my-module")
+        );
+        // 只剩一层（release 根的裸 api.js）→ 无模块归属
+        assert_eq!(mk("api.js").0.module_of(mk("api.js").1), None);
+    }
+
+    #[test]
+    fn rel_file_never_leaks_absolute_path() {
+        // openapi.json 是公开产物：x-oj-file 走 rel_file，不得带本机绝对路径。
+        let dir = fixture(&[]);
+        let (t, f) = RouteTable::from_entries(
+            &dir,
+            &[RouteEntry {
+                method: "get".to_string(),
+                pattern: "/v1/api/x".to_string(),
+                file: "wiki-0.1.0/api.js".to_string(),
+                handler: None,
+                schema: None,
+            }],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        let id = t.listing()[0].file;
+        let rel = t.rel_file(id);
+        assert!(
+            !rel.is_absolute(),
+            "rel_file 不得是绝对路径: {}",
+            rel.display()
+        );
+        assert_eq!(
+            rel.to_string_lossy().replace('\\', "/"),
+            "wiki-0.1.0/api.js"
+        );
+        // 溯源仍可用（绝对形态没丢）。
+        assert!(t.file_path(id).is_absolute());
+    }
+
+    #[test]
+    fn audit_schemas_is_the_single_door_and_fails_on_bad_declaration() {
+        // release 的 routes.js 可能来自第三方 .tgz 模块：其 .schema 属不可信输入，
+        // 必须经 `audit_schemas` 兜底，不能只靠「本仓 build 时审过」。
+        let dir = fixture(&[]);
+        let entry = |schema: Option<serde_json::Value>| RouteEntry {
+            method: "get".to_string(),
+            pattern: "/v1/api/x".to_string(),
+            file: "wiki-0.1.0/api.js".to_string(),
+            handler: None,
+            schema,
+        };
+        let (t, f) = RouteTable::from_entries(
+            &dir,
+            &[entry(Some(
+                serde_json::json!({ "body": { "type": "object" } }),
+            ))],
+        );
+        assert!(f.is_empty());
+        assert!(t.audit_schemas().is_ok(), "合法契约放行");
+
+        let (t2, f2) = RouteTable::from_entries(
+            &dir,
+            &[entry(Some(
+                serde_json::json!({ "bodys": { "type": "object" } }),
+            ))],
+        );
+        assert!(f2.is_empty());
+        let err = t2.audit_schemas().unwrap_err();
+        assert!(
+            err.contains("bodys") && err.contains("unsupported channel"),
+            "拼错通道必须被 audit_schemas 拦: {err}"
+        );
+        // 报错带 handler 链与相对文件，便于定位。
+        assert!(err.contains("wiki-0.1.0/api.js"), "{err}");
     }
 
     #[test]

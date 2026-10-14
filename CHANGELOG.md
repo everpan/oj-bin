@@ -16,6 +16,67 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.70
+
+**feat（contract）：`.schema` 新增 `response` 响应通道 —— 入参与出参同一处声明。**
+下游 `oj-module` 要把契约权威源从 `contract.ts`（zod / `defineApi`）迁到 handler 的
+`.schema`，前提是 oj 能同时表达出参。选 `response` 而不是另挂 `.responseSchema`：
+与 `params`/`query`/`body` 同处一个 `.schema` 对象内 = 同一处声明、同一趟内省、
+同一份落盘（`RouteRow.schema` 本就整对象透传），省掉一个特殊性而不是补回三个。
+
+- **只声明、不校验**：运行期**不**校验响应——响应由 JS 产生，校验失败时请求已执行完、
+  无处可去；把出参变成硬约束会让「少返回一个字段」升级成 500 级故障。它是**文档与
+  生成真源**，不是守卫。
+- **声明合法性照旧 fail-fast**：关键字白名单 / 类型字面值 / `pattern` 可编译，写错即失败。
+- 组级合并与入参**不同**：`response` 走「动词级整体覆盖、无则继承组级」，不做
+  `required` 并集 / `properties` 逐键覆盖——响应是动词各不相同的，组级必填被某动词
+  继承会让文档声称返回并不存在的字段（假真源）。
+- 组级 `mergeSchema` 不再给没声明的通道凭空注入空 `required` / `properties`
+  （进 openapi 是噪声）；`Object.assign` 改对象展开，避 `__proto__` 键改到原型上。
+
+**feat（openapi）：`responses.200` 落地 + 产物带模块归属 `tags`。**
+`oj openapi` 不再是「只有请求侧的半份文档」，且成为下游 `__client` 生成的**唯一输入**
+（上游不再生成 TS 代码——前端布局 / zod 版本都属下游约定，不该硬编码进平台件）。
+
+- `response` = `json.ok(data)` 的 **data payload**；oj 的 wire 恒为
+  `{code,msg,data}`（`src/bridge/envelope.rs`），故生成物**外裹信封**——公开产物不该对
+  字节撒谎。`json.raw` / `json.stream` / `json.sse` 端点绕过信封，**不要**声明 `response`。
+  未声明 `response` 的端点保持占位 `{"200":{"description":"OK"}}`（旧行为不变）。
+- 产物自带 `x-oj-response-enforced: false`：免责写进 artifact，而非只写手册——下游**不得**
+  把 `response` 当脱敏 / 裁剪边界。
+- operation 级 **`tags: [<module>]`** + spec 根级 `tags`：生成代码必须知道模块归属，
+  光有 `operationId` 不够。用标准 OpenAPI 分组字段（通用工具同样按它归组）；
+  release 的 `<module>-<version>` 会剥掉版本后缀（`my-module` 这类连字符名不误剥）。
+- `x-oj-file` 改**相对 api 根**路径：产物是公开文件，带本机绝对路径属信息泄露，
+  且换机器就不可比。
+
+**feat（contract）：`.schema` 顶层通道白名单 —— 拼错通道从此启动即失败（行为收紧）。**
+`.schema` 顶层只允许 `params` / `query` / `body` / `response`；其余键（拼错的 `param` /
+`bodys` / `responce`，或 `title` / `$schema` 之类）装配期**硬失败**。
+以前这类键被静默忽略——接口一直在裸奔，而「声明了但没生效」是本项目最重的缺陷类。
+报错带 method / pattern / handler 链 / 相对文件。**不要用 `server.schema_validation: false`
+绕**：该开关只关「是否执行运行期校验」，声明合法性审计**不受它影响**（逃生门是给
+「规则误杀合法流量」准备的，不是给代码写错准备的）。
+
+**feat（openapi）：生成期两道新 fail-fast。**
+
+1. **声明合法性审计**：`oj openapi` 以前完全不审计，坏契约会原样进 spec——而现在
+   openapi.json 是下游代码生成的唯一输入。审计收口为 `RouteTable::audit_schemas()`，
+   `oj serve` 装配 / `oj build` 落盘 / `oj openapi` 生成**三处同口径**（release 的
+   `routes.js` 可能来自第三方 `.tgz` 模块，其 `.schema` 属构建期不可信输入）。
+2. **operationId 唯一性**：`/user/profile` 与 `/user-profile` 会派生出同一个
+   `user_profile_get`，下游按它命名符号会静默互相覆盖 → 生成期拦死。
+
+**feat（contract）：`properties` 键名禁 `__proto__` / `constructor` / `prototype`。**
+openapi.json 是下游生成 TS/zod 的输入，属性名会原样变成生成源码里的键——这三个名字
+生成的字面量对象会改到原型上（与 `legal_handler_chain` 对 handler 链段同口径）。
+
+新增用例：`response` 各路径审计 / 组级整体覆盖 / 运行期不拦请求（e2e 反向击穿）/
+拼错通道在 `schema_validation: false` 下仍启动失败（e2e）/ envelope 与占位回归 /
+模块 `tags` / operationId 重复 fail-fast / `rel_file` 不带绝对路径。
+devkit 四件与 `docs/openapi-guide.md` 已同步（响应通道章节、`responses` 不再占位、
+陷阱速查补白名单收紧与「不要用开关绕」）。
+
 ## v0.1.69
 
 **fix（serve）：--daemon 子进程直连随包 glibc + 启动成败回传父进程（两项）**。

@@ -3,9 +3,9 @@
 面向第一次接触 oj 的开发者：从「为什么需要它」到「怎么用」「它内部怎么跑」
 「会遇到哪些坑」，用一个完整例子串起来。读完即可独立生成并维护项目的 OpenAPI 文档。
 
-> 关联深度文档：`.schema` 的写法与三通道契约见 `docs/devkit/api-manual.md`「入参契约
-> `.schema`」（v0.1.44）与 `docs/devkit/scenarios.md` 场景 24；本文只讲 OpenAPI，不重复
-> 契约语法。
+> 关联深度文档：`.schema` 的写法与四通道契约见 `docs/devkit/api-manual.md`「入参与出参
+> 契约 `.schema`」（v0.1.44，响应通道 v0.1.70）与 `docs/devkit/scenarios.md` 场景 24；
+> 本文只讲 OpenAPI，不重复契约语法。
 
 ---
 
@@ -15,12 +15,18 @@
 **OpenAPI 3.1** 的 `openapi.json`。这份文件可以被 Swagger UI、Redoc、Postman、各类
 前端代码生成器直接消费——也就是「不用手写接口文档，路由即文档」。
 
-关键认知：**你写的 `.schema`（handler 入参契约）是唯一真源**。同一份声明同时驱动两件事：
+关键认知：**你写的 `.schema`（handler 契约）是唯一真源**。同一份声明同时驱动两件事：
 
-- **运行期校验**：请求进来先在 JS 之前按 `.schema` 校验，不合法直接 `400`（handler 不执行）；
-- **文档生成**：`oj openapi` 读同一份 `.schema`，自动补出 `parameters` / `requestBody`。
+- **运行期校验**：请求进来先在 JS 之前按 `.schema` 的**入参**通道校验，不合法直接 `400`
+  （handler 不执行）；
+- **文档生成**：`oj openapi` 读同一份 `.schema`，自动补出 `parameters` / `requestBody`
+  / `responses`（响应通道 v0.1.70 起）。
 
 所以「把接口写对」和「把文档写对」是同一件事——没有两份要同步的真源。
+
+> 唯一的不对称：`response`（出参）**只声明、不校验**——运行期不拦返回值（响应由 JS 产生，
+> 校验失败时请求已执行完、无处可去）。产物里带 `x-oj-response-enforced: false` 就是声明
+> 这一点。它是文档与 codegen 的真源，**不是**守卫，也**不能**当脱敏边界。
 
 ---
 
@@ -32,8 +38,9 @@
    （见下方 2.1）。只有需要偏离目录镜像（加路径参数、挂到 base 根、用嵌套组等）时才写
    `.route`。没有路由就没有接口。
 2. **（可选但强烈建议）`.schema`**：在 handler 函数对象上挂 `.schema`，分 `params` /
-   `query` / `body` 三通道声明入参。不挂也能生成（路径参数退化为 `string`），但文档里
-   就没有类型、没有 `requestBody`、也没有任何约束信息。
+   `query` / `body` 三通道声明**入参**（外加 `response` 通道声明**出参**，v0.1.70）。
+   不挂也能生成（路径参数退化为 `string`），但文档里就没有类型、没有 `requestBody`、
+   没有 `responses` 结构，也没有任何约束信息。
 
 ### 2.1 路由默认怎么推算（不写 `.route` 时）
 
@@ -84,9 +91,9 @@ src/wiki/collections/api.ts      # get → GET  /v1/api/wiki/collections
 src/wiki/collections/_id_/api.ts # get → GET  /v1/api/wiki/collections/{id}  （_id_ 目录 ⇒ {id}）
 ```
 
-### 2.4 三通道 `params` / `query` / `body`：各自是什么、什么时候出现
+### 2.4 四通道 `params` / `query` / `body` / `response`：各自是什么、什么时候出现
 
-`.schema` 里的三个通道对应请求入参的三种来源。**声明了哪条才校验哪条**——未声明的通道
+`.schema` 里前三个通道对应请求入参的三种来源。**声明了哪条才校验哪条**——未声明的通道
 不受运行期约束、也不进文档：
 
 | 通道 | 来源（JS 侧读取） | 什么情况声明 | 文档映射 |
@@ -94,6 +101,7 @@ src/wiki/collections/_id_/api.ts # get → GET  /v1/api/wiki/collections/{id}  �
 | `params` | 路径参数：路由 pattern 里的 `{name}` 段（来自 `_id_` 目录或 `.route`），JS 用 `http.params` 读 | pattern 里有路径参数就该声明，且名字必须与 pattern **双向一致**（见 §6.1）；没有路径参数就不写这条 | `in: path`（恒必填） |
 | `query` | URL 查询串 `?a=1&b=2`，JS 用 `http.query` 读 | 分页 / 过滤 / 开关等「挂在 URL 问号后」的入参，任何动词都可以有 | `in: query` |
 | `body` | JSON 请求体，JS 用 `http.body` 读 | 创建 / 更新等「载荷在请求体里」的场景——实践中即 **POST / PUT / PATCH**（`del` 带载荷少见但协议层不拦） | `requestBody` |
+| `response` | **出参**（v0.1.70）：`json.ok(data)` 的 **data payload** | 想让文档/前端 client 知道返回结构就声明。**运行期不校验**；`json.raw` / `json.stream` / `json.sse` 端点（无信封）不要声明 | `responses.200.content`（外裹 `{code,msg,data}`） |
 
 两个实务提醒：
 
@@ -255,7 +263,8 @@ oj openapi -d src --check
 | `x-oj-file` | **溯源标记**：该路由来自哪个源码文件（排障 / 追溯用，非 OpenAPI 标准字段） |
 | `parameters` | `in: path` 来自路由 pattern（或 `.schema.params`，带真实类型）；`in: query` 来自 `.schema.query` |
 | `requestBody` | 来自 `.schema.body`（`content.application/json.schema` = 你的 body 契约） |
-| `responses` | **当前为占位** `{ "200": { "description": "OK" } }`——响应体 schema 尚未生成（属后续步，详见第 6 节「已知边界」） |
+| `responses` | v0.1.70 起来自 `.schema.response`：输出**完整信封** `{code,msg,data}` 并带 `x-oj-response-enforced: false`（声明、不校验）。未声明 `response` 的端点仍是占位 `{ "200": { "description": "OK" } }` |
+| `tags` | v0.1.70 起每个 operation 带 `[<模块名>]`，spec 根还有去重排序的全量 `tags` 清单——下游 codegen 按它分模块落盘 |
 
 两个值得记住的归一化规则：
 
@@ -450,25 +459,69 @@ OpenAPI 里 `required` 是 **parameter 级**字段（标识「这个参数是否
 通道里写的 `required: ["id"]` 会被正确翻译成 parameter 的 `required: true`，**不会**残留在
 `schema` 子对象里（生成器会自动剥掉）。别在参数级的 `schema` 里再写一遍 `required`。
 
-### 6.4 `responses` 目前是占位
+### 6.4 `responses` 由 `.schema.response` 生成（v0.1.70 起）
 
-当前实现**只生成 `responses: { "200": { "description": "OK" } }`**——响应体 schema 还没生成
-（属于 PR-6 后续步）。所以这份 OpenAPI 的「请求侧」完整、「响应侧」还是骨架。别惊讶为什么
-没有 `200` 的响应结构；也不要手写 response schema 塞进生成物（下一次 `--check` 会把它当漂移
-打回）。需要响应文档时，等后续版本或暂时在生成后做后处理。
+```ts
+get.schema = {
+  response: {
+    type: "object",
+    required: ["list", "total"],
+    properties: {
+      list:  { type: "array", items: { type: "object" } },
+      total: { type: "integer", minimum: 0 },
+    },
+  },
+};
+```
+
+生成物（注意 `data` 外层那三个字段是 oj 的统一信封，不是你写的）：
+
+```json
+"responses": {
+  "200": {
+    "description": "OK",
+    "x-oj-response-enforced": false,
+    "content": {
+      "application/json": {
+        "schema": {
+          "type": "object",
+          "required": ["code", "msg", "data"],
+          "properties": {
+            "code": { "type": "integer" },
+            "msg":  { "type": "string" },
+            "data": { "type": "object", "required": ["list", "total"], "properties": { … } }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+三条必须记住：
+
+1. **`response` = `json.ok(data)` 的 data payload**，不是整包信封。oj 的 wire 恒为
+   `{code,msg,data}`，所以生成物替你外裹了一层——别在 `response` 里再写一遍 `code`/`msg`。
+2. **运行期不校验**（`x-oj-response-enforced: false`）：少返回字段不会 400/500，也不会
+   裁剪。别把它当守卫或脱敏边界。
+3. **`json.raw` / `json.stream` / `json.sse` 端点不要声明 `response`**——它们绕过信封出裸
+   body，声明了就与真实 wire 不符。这类端点不声明即保持占位。
+
+未声明 `response` 的端点仍是 `{ "200": { "description": "OK" } }`。**不要**手写 response
+schema 塞进生成物（下一次 `--check` 会把它当漂移打回）。
 
 ### 6.5 `info` 是占位值（且**不应**从 oj 版本填空）
 
 `info.title` / `info.version` 当前固定为 `oj API` / `0.1.0`，不读你的项目。
 
-关于 `info.version` 一个值得说清的疑问：**能不能直接填 oj 自己的版本（当前 `0.1.69`，
+关于 `info.version` 一个值得说清的疑问：**能不能直接填 oj 自己的版本（当前 `0.1.71`，
 代码里用 `env!("CARGO_PKG_VERSION")` 可取，见 `oj/src/info_cmd.rs` / `serve_cmd.rs`）？**
 结论：**不合适，不建议。**
 
 - OpenAPI 语义里 `info.version` 是「**这份 API 文档（即你的接口）的版本**」，与 OpenAPI
   Specification 版本、与框架实现版本都不同。
-- oj 的 `CARGO_PKG_VERSION`（如 `0.1.69`）是**框架自身的版本**，把它填进 `info.version`
-  会误导消费方以为「这个 API 已经迭代到 0.1.69」，而实际上那只是 oj 的版本号。
+- oj 的 `CARGO_PKG_VERSION`（如 `0.1.71`）是**框架自身的版本**，把它填进 `info.version`
+  会误导消费方以为「这个 API 已经迭代到 0.1.71」，而实际上那只是 oj 的版本号。
 - oj 目前**没有单一的「项目 API 版本」概念**——`dist/manifests.yaml` 里是**每模块**各自的
   版本，不存在一个能代表整个 API 的全局版本。因此无法自动取到「正确的」 `info.version`。
 
@@ -503,6 +556,7 @@ OpenAPI 里 `required` 是 **parameter 级**字段（标识「这个参数是否
 | 加了路由但没重新生成 | `openapi.json` 落后于源码 | 本地重跑生成并提交 |
 | 手改了 `openapi.json` | 与「路由表真值」不符 | 删掉手改，改源码 `.schema` 后重新生成 |
 | 只改了 `.schema` 类型 | 生成物变了但没提交 | 重新生成并提交 |
+| **升到 v0.1.70 后首次跑就报漂移** | 产物形状变了：新增 `tags`（模块归属）、`responses.200` 落地、`x-oj-file` 改相对路径 | 预期内——重跑生成并提交一次即可 |
 
 > 内存：比较前会做**对象键升序规范化**，所以「键顺序不同」不算漂移，只有内容不同才算——
 > 你可以放心用格式化工具美化 `openapi.json`，只要语义不变 `--check` 就过。
@@ -512,9 +566,14 @@ OpenAPI 里 `required` 是 **parameter 级**字段（标识「这个参数是否
 ## 8. 一句话总结
 
 > 写对 `.schema`，路由即文档：`oj openapi -d src -o openapi.json` 生成、`--check` 守住、
-> 提交进仓库即可。`params`/`query`/`body` 三通道直接变成 OpenAPI 的 `parameters` /
-> `requestBody`；路径参数必须与路由 pattern 双向对齐，否则生成期就报错。
+> 提交进仓库即可。`params`/`query`/`body` 三通道变成 OpenAPI 的 `parameters` /
+> `requestBody`，`response` 通道变成 `responses.200`（外裹信封）；路径参数必须与路由
+> pattern 双向对齐，否则生成期就报错。
 
-进阶：嵌套 handler 组 + 组级 `.route` / 组级 `.schema` 的合并语义、判别红线，见
-`docs/devkit/api-manual.md`「嵌套 handler 组」与「入参契约 `.schema`」；`.schema` 写法与
-校验示例见 `docs/devkit/scenarios.md` 场景 24。
+下游 codegen：产物每个 operation 带 `tags: [<模块名>]`、根级有全量 `tags` 清单，可据此
+把生成的 client 分模块落盘；`x-oj-file` 是相对 api 根的路径。
+
+进阶：嵌套 handler 组 + 组级 `.route` / 组级 `.schema` 的合并语义（`response` 与入参
+规则不同：动词级整体覆盖）、判别红线，见 `docs/devkit/api-manual.md`「嵌套 handler 组」
+与「入参与出参契约 `.schema`」；`.schema` 写法与校验示例见 `docs/devkit/scenarios.md`
+场景 24。

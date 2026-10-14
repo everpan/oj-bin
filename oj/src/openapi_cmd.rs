@@ -132,16 +132,29 @@ pub fn discover_routes(
 /// `parameters`（path / query）与 `requestBody`。返回 Result —— 契约与路由
 /// pattern 不一致时**生成期 fail-fast**（见 `contract_params` 的交叉校验）。
 pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, String> {
+    // `.schema` 声明合法性审计（v0.1.70）：与 serve 装配 / `oj build` 落盘**同口径**
+    // （同一个 `only_js::contract::audit_schema`）。dev 与 release 两条发现路径都在
+    // 这里收口——release 的 `routes.js` 可能来自第三方 `.tgz` 模块，其 `.schema` 属
+    // 构建期不可信输入，不能只靠「本仓 build 时审过」。
+    // 生成物现在是下游 `__client` 的唯一输入，含非法声明等于把谎言喂给代码生成。
+    table.audit_schemas()?;
     let b = base.trim_matches('/');
     let mut paths: serde_json::Map<String, Value> = serde_json::Map::new();
+    // 模块清单（v0.1.70）：下游按 `tags` 把生成的 client 分模块落盘；也是标准
+    // OpenAPI 的分组字段（Swagger / 通用生成器同样按它归组）。
+    let mut modules: Vec<String> = Vec::new();
+    // operationId 唯一性（v0.1.70）：`/user/profile` 与 `/user-profile` 会派生出同一个
+    // `user_profile_get`——下游按 operationId 命名函数会静默互相覆盖，生成期必须拦。
+    let mut seen_ops: HashMap<String, String> = HashMap::new();
     for row in table.listing() {
         // row.pattern 形如 "/v1/api/user/{id}"（含 base 与前导 /）。
         let raw = row.pattern.trim_start_matches('/');
         let oa_path = to_oa_path(raw);
         let method = row.method.to_lowercase();
-        // 溯源标记统一用正斜杠（Windows 原生分隔符是反斜杠，会让跨平台比对/展示不一致）。
+        // 溯源标记：相对 api 根 + 统一正斜杠。产物是公开文件——**不带绝对路径**
+        // （本机路径属信息泄露，且换机器就不可比）；Windows 反斜杠归一以免跨平台漂移。
         let file = table
-            .file_path(row.file)
+            .rel_file(row.file)
             .to_string_lossy()
             .replace('\\', "/");
         let sub = raw
@@ -149,12 +162,28 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
             .unwrap_or(raw)
             .to_string();
         let operation_id = operation_id(&sub, &method);
+        if let Some(prev) = seen_ops.get(&operation_id) {
+            return Err(format!(
+                "operationId `{operation_id}` is derived from two different routes: `{prev}` and \
+                 `{raw}` — downstream codegen names symbols by operationId and the second would \
+                 silently overwrite the first; disambiguate the routes (or set an explicit .route)"
+            ));
+        }
+        seen_ops.insert(operation_id.clone(), raw.to_string());
         let summary = format!("{} {}", method.to_uppercase(), raw);
 
         let mut op = serde_json::Map::new();
         op.insert("operationId".to_string(), Value::String(operation_id));
         op.insert("summary".to_string(), Value::String(summary));
         op.insert("x-oj-file".to_string(), Value::String(file));
+        // 模块归属（v0.1.70）：生成代码必须知道端点属于哪个模块，否则下游只能靠
+        // `x-oj-file` 猜目录。用标准 `tags` —— 通用 OpenAPI 工具同样按它归组。
+        if let Some(m) = table.module_of(row.file) {
+            op.insert("tags".to_string(), json!([m.clone()]));
+            if !modules.contains(&m) {
+                modules.push(m);
+            }
+        }
 
         let sc = row.schema.clone();
         let mut parameters: Vec<Value> = Vec::new();
@@ -183,10 +212,27 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
                 }),
             );
         }
-        // 占位响应：响应 schema 契约留待后续步，此处仅保 OpenAPI 3.1 基本结构。
+        // 响应（v0.1.70）：`.schema.response` 声明的是 `json.ok(data)` 的 **data payload**
+        // （不是整包信封），而 oj 的 wire 恒为 `{code,msg,data}`（`src/bridge/envelope.rs`），
+        // 故生成物外裹一层——openapi.json 是公开产物，不该对字节撒谎。
+        // 未声明 `response` 的端点保持占位（旧行为不变）。
         op.insert(
             "responses".to_string(),
-            json!({ "200": { "description": "OK" } }),
+            match sc.as_ref().and_then(|s| s.get("response")) {
+                Some(r) => json!({
+                    "200": {
+                        "description": "OK",
+                        // 免责标记写进产物本身：`response` 是**声明**，运行期不校验
+                        // （响应由 JS 产生，校验失败时无所去处）。下游不得把它当脱敏 /
+                        // 裁剪边界——按声明裁字段是字段级越权的伪保证。
+                        "x-oj-response-enforced": false,
+                        "content": {
+                            "application/json": { "schema": envelope_schema(r) }
+                        }
+                    }
+                }),
+                None => json!({ "200": { "description": "OK" } }),
+            },
         );
 
         let path_obj = paths.entry(oa_path.clone()).or_insert_with(|| json!({}));
@@ -195,11 +241,36 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
             .unwrap()
             .insert(method, Value::Object(op));
     }
-    Ok(json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": { "title": "oj API", "version": "0.1.0" },
         "paths": Value::Object(paths),
-    }))
+    });
+    if !modules.is_empty() {
+        modules.sort();
+        spec.as_object_mut().unwrap().insert(
+            "tags".to_string(),
+            Value::Array(modules.into_iter().map(|m| json!({ "name": m })).collect()),
+        );
+    }
+    Ok(spec)
+}
+
+/// 把 `data` payload 的契约外裹 oj 统一信封 `{code,msg,data}`。
+///
+/// `json.raw` / `json.stream` / `json.sse` 端点**绕过信封**出裸 body（`envelope.rs` 无对应
+/// 出口），这类端点**不应**声明 `response`——声明即与 wire 不符。此处不加逃生门：
+/// 声明了就按信封语义出，宁可让用户不声明，也不加一个「特殊模式」关键字。
+fn envelope_schema(data: &Value) -> Value {
+    json!({
+        "type": "object",
+        "required": ["code", "msg", "data"],
+        "properties": {
+            "code": { "type": "integer" },
+            "msg": { "type": "string" },
+            "data": data.clone()
+        }
+    })
 }
 
 /// 命令入口：生成或漂移校验。返回进程退出码（0 成功 / 1 漂移或错误）。
@@ -672,6 +743,161 @@ mod tests {
             op["requestBody"]["content"]["application/json"]["schema"]["required"][0],
             "name"
         );
+    }
+
+    #[test]
+    fn response_contract_becomes_enveloped_200_schema() {
+        // v0.1.70：`.schema.response` 声明的是 `json.ok(data)` 的 **data payload**，
+        // 而 oj 的 wire 恒为 `{code,msg,data}` 信封，故生成物外裹一层——openapi.json
+        // 是公开产物（且是下游生成 __client 的唯一输入），不该对字节撒谎。
+        let (_d, t) = table_with_contract(
+            "get",
+            "/v1/api/wiki/collections",
+            "wiki-0.1.0/collections/api.js",
+            json!({
+                "response": {
+                    "type": "object",
+                    "required": ["list", "total"],
+                    "properties": {
+                        "list": { "type": "array", "items": { "type": "object" } },
+                        "total": { "type": "integer", "minimum": 0 }
+                    }
+                }
+            }),
+        );
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/wiki/collections"]["get"];
+        let r200 = &op["responses"]["200"];
+        assert_eq!(r200["description"], "OK");
+        let s = &r200["content"]["application/json"]["schema"];
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["required"][0], "code");
+        assert_eq!(s["required"][2], "data");
+        assert_eq!(s["properties"]["code"]["type"], "integer");
+        assert_eq!(s["properties"]["msg"]["type"], "string");
+        // data 必须是**原样的** response 契约（不得被改写/降级）。
+        assert_eq!(s["properties"]["data"]["required"][1], "total");
+        assert_eq!(
+            s["properties"]["data"]["properties"]["list"]["items"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn without_response_contract_200_stays_placeholder() {
+        // 回归：未声明 response 的端点保持 v0.1.43 起的占位，不得凭空长出 content。
+        let (_d, t) = table_with_contract(
+            "get",
+            "/v1/api/wiki/collections",
+            "wiki-0.1.0/collections/api.js",
+            json!({ "query": { "type": "object", "properties": { "p": { "type": "integer" } } } }),
+        );
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/wiki/collections"]["get"];
+        assert_eq!(op["responses"]["200"]["description"], "OK");
+        assert!(
+            op["responses"]["200"].get("content").is_none(),
+            "无 response 声明不得生成 content"
+        );
+    }
+
+    #[test]
+    fn tags_carry_module_for_downstream_codegen() {
+        // v0.1.70：生成代码必须知道端点属于哪个模块（下游按 tags 把 __client 分模块
+        // 落盘）。release 形态的 file 是 `<module>-<version>/...`，版本后缀要剥掉。
+        let (_d, t) = table_with_contract(
+            "get",
+            "/v1/api/wiki/collections",
+            "wiki-0.1.0/collections/api.js",
+            json!({ "response": { "type": "object" } }),
+        );
+        let spec = generate(&t, "/v1/api").unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/api/wiki/collections"]["get"]["tags"][0], "wiki",
+            "operation 级 tags 必须是模块名（剥掉 -<version>）"
+        );
+        // 根级 tags 让下游/通用工具不必扫 paths 就能枚举模块。
+        assert_eq!(spec["tags"][0]["name"], "wiki");
+        // 免责标记随产物走：`response` 是声明，运行期不校验。
+        assert_eq!(
+            spec["paths"]["/v1/api/wiki/collections"]["get"]["responses"]["200"]["x-oj-response-enforced"],
+            false
+        );
+    }
+
+    #[test]
+    fn dev_files_are_tagged_by_first_dir_segment() {
+        // dev：模块 = api 根下的首段目录（无子目录的裸 api.ts 无模块归属）。
+        let (_d, table) = synthetic_table();
+        let spec = generate(&table, "/v1/api").unwrap();
+        assert_eq!(
+            spec["paths"]["/v1/api/user/account"]["get"]["tags"][0],
+            "user"
+        );
+        assert_eq!(
+            spec["paths"]["/v1/api/catch/{path}"]["get"]["tags"][0],
+            "catch"
+        );
+        let mods: Vec<&str> = spec["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(mods, vec!["catch", "user"], "根级 tags 应去重且稳定排序");
+    }
+
+    #[test]
+    fn duplicate_operation_ids_fail_generation() {
+        // 击穿：`/user/profile` 与 `/user-profile` 派生出同一个 `user_profile_get`——
+        // 下游按 operationId 命名符号会静默互相覆盖，生成期必须拦死。
+        let dir = unique_tmp("oj-oa-dup");
+        let entries = vec![
+            serve::routes::RouteEntry {
+                method: "get".to_string(),
+                pattern: "/v1/api/user/profile".to_string(),
+                file: "user-0.1.0/profile/api.js".to_string(),
+                handler: None,
+                schema: None,
+            },
+            serve::routes::RouteEntry {
+                method: "get".to_string(),
+                pattern: "/v1/api/user-profile".to_string(),
+                file: "user-0.1.0/profile/api.js".to_string(),
+                handler: None,
+                schema: None,
+            },
+        ];
+        let (t, fail) = RouteTable::from_entries(&dir, &entries);
+        assert!(fail.is_empty(), "{fail:?}");
+        let err = generate(&t, "/v1/api").unwrap_err();
+        assert!(
+            err.contains("user_profile_get") && err.contains("silently overwrite"),
+            "重复 operationId 必须 fail-fast: {err}"
+        );
+    }
+
+    #[test]
+    fn generate_fails_fast_on_invalid_schema() {
+        // 击穿：生成期必须审计。openapi.json 现在是下游 __client 的唯一输入，
+        // 放一份非法契约进去等于把谎言喂给代码生成。
+        for bad in [
+            json!({ "response": { "type": "object", "format": "x" } }),
+            json!({ "body": { "type": "object", "oneOf": [] } }),
+            json!({ "param": { "type": "object" } }), // 拼错通道：以前静默不生效
+        ] {
+            let (_d, t) = table_with_contract(
+                "get",
+                "/v1/api/wiki/collections",
+                "wiki-0.1.0/collections/api.js",
+                bad,
+            );
+            let err = generate(&t, "/v1/api").unwrap_err();
+            assert!(
+                err.contains("invalid `.schema`"),
+                "非法契约必须在生成期 fail-fast: {err}"
+            );
+        }
     }
 
     #[test]
