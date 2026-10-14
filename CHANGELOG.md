@@ -16,6 +16,35 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.71
+
+**docs（contract）：`.schema` 表达力边界显式化 —— zod 对照表 + 不支持清单。**
+下游要拿 `openapi.json` 生成 zod（`contract.ts` → `.schema` 迁移的前提之一），必须先知道
+oj 能表达什么、不能表达什么。本版不改任何行为，只把边界**写死并钉进测试**：
+
+- **支持清单 → zod 映射表**：`type`（含类型数组 `["string","null"]` → `.nullable()`）/
+  `required` / `properties` / `items` / `additionalProperties: false` → `.strict()` /
+  `minimum`·`maximum` / `minLength`·`maxLength`（按**字符数**算）/ `pattern` / `enum`
+  （数值按值比较）/ `nullable` / `minItems`·`maxItems` / `default`（oj 侧纯注解，不填值）。
+- **不支持且 fail-fast**：`$ref` / `oneOf` / `allOf` / `anyOf` / `not` / `format` /
+  `patternProperties` / `dependencies`，以及 JSON Schema 的 `if`/`then`/`else` / `const` /
+  `contains` / `propertyNames` / `uniqueItems` / `exclusiveMinimum`·`exclusiveMaximum` /
+  `multipleOf` / `maxProperties`·`minProperties`；zod 侧的 `refine` / `transform` /
+  `discriminatedUnion` / `record` 同样写不了。
+  - **联合类型 / discriminated union**：改用「可选字段 + 单形态」，判别逻辑进 handler。
+  - **`format`（email / date-time / uuid）**：改成 `pattern`（它是唯一的字符串形状约束手段）。
+- **跨语言红线写进文档**：`pattern` 是 Rust regex ≠ ECMA-262，下游搬进前端 zod 时，
+  Rust-only 语法（lookahead / 反向引用）要么编译失败、要么**语义漂移**——后者更危险：
+  Rust 拒的字符串在 JS 放行 = 前端校验被绕过。建议只写两边都成立的保守正则。
+- **下游 codegen 三条注意事项**：属性名 / `enum` 元素 / `default` 值都是任意 JSON 字符串，
+  必须 `JSON.stringify` 后嵌入，不得裸插值；`required` 项**可能不在 `properties` 中**
+  （JSON Schema 允许只声明必填不约束类型），取值前先判存在。
+
+新增 `dsl_boundary_is_exactly_the_documented_zod_subset` 钉死「白名单全集放行 +
+不支持清单逐条 FAIL FAST」——没有第三种「静默降级」。devkit 四件已同步
+（`api-manual.md` 新增「表达力边界：与 zod 的对照表」、`SKILL.md` 陷阱速查补
+「写不了」两条、`README.md` 更新日志）。
+
 ## v0.1.70
 
 **feat（contract）：`.schema` 新增 `response` 响应通道 —— 入参与出参同一处声明。**
@@ -75,7 +104,8 @@ openapi.json 是下游生成 TS/zod 的输入，属性名会原样变成生成�
 拼错通道在 `schema_validation: false` 下仍启动失败（e2e）/ envelope 与占位回归 /
 模块 `tags` / operationId 重复 fail-fast / `rel_file` 不带绝对路径。
 devkit 四件与 `docs/openapi-guide.md` 已同步（响应通道章节、`responses` 不再占位、
-陷阱速查补白名单收紧与「不要用开关绕」）。
+陷阱速查补白名单收紧与「不要用开关绕」）。**本版未打标签**（与 v0.1.71 同批提交，
+只发 v0.1.71——升级即从 0.1.69 直接到 0.1.71，两版内容一并到达）。**本版未打标签。**
 
 ## v0.1.69
 

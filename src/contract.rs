@@ -1278,6 +1278,62 @@ mod tests {
     }
 
     #[test]
+    fn dsl_boundary_is_exactly_the_documented_zod_subset() {
+        // v0.1.71 对外承诺的边界（devkit「表达力边界」表）在此钉死：
+        // 白名单内**全部**放行、白名单外**全部** fail-fast——没有第三种「静默降级」。
+        let full = json!({
+            "type": "object",
+            "required": ["a"],
+            "properties": {
+                "a": { "type": ["string", "null"], "minLength": 1, "maxLength": 8,
+                       "pattern": "^[a-z]+$", "enum": ["x", "y"], "default": "x" },
+                "b": { "type": "integer", "minimum": 0, "maximum": 10, "nullable": true },
+                "c": { "type": "array", "minItems": 1, "maxItems": 3,
+                       "items": { "type": "object", "additionalProperties": false,
+                                  "properties": { "d": { "type": "boolean" } } } }
+            },
+            "additionalProperties": false
+        });
+        assert!(
+            audit_schema(&json!({ "body": full })).is_ok(),
+            "白名单全集必须放行"
+        );
+
+        // 不支持清单（含 zod 用户最常撞的几个）：一律 FAIL FAST，不静默忽略。
+        for kw in [
+            "$ref",
+            "oneOf",
+            "allOf",
+            "anyOf",
+            "not",
+            "format",
+            "patternProperties",
+            "dependencies",
+            "if",
+            "then",
+            "else",
+            "const",
+            "contains",
+            "propertyNames",
+            "uniqueItems",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "maxProperties",
+            "minProperties",
+        ] {
+            let mut m = serde_json::Map::new();
+            m.insert("type".to_string(), json!("object"));
+            m.insert(kw.to_string(), json!("x"));
+            let err = audit_schema(&json!({ "body": Value::Object(m) })).unwrap_err();
+            assert!(
+                err.contains(kw) && err.contains("FAIL FAST"),
+                "`{kw}` 必须在边界清单外且 fail-fast: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn prototype_pollution_names_are_rejected_in_properties() {
         // openapi.json 是下游生成 TS/zod 的输入，`properties` 的键会原样变成生成源码
         // 里的键——这三个名字生成的字面量对象会改到原型上。

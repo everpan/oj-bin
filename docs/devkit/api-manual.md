@@ -635,6 +635,57 @@ get.schema = {
 > **不得把 `response` 当脱敏 / 裁剪边界**：按声明裁字段是字段级越权的伪保证
 > （声明窄于实际返回时，多出来的数据照样到了客户端）。
 
+#### 表达力边界：与 zod 的对照表（v0.1.71）
+
+`.schema` 是 **JSON Schema 的严格子集**，不是 zod 的超集也不是其等价物。下游拿
+`openapi.json` 生成 zod 时按下表映射；**表外的构造一律 fail-fast**（装配期/生成期报错），
+不会静默降级——宁可写不了，也不给你一份「声明了但没生效」的契约。
+
+| `.schema` 关键字 | zod 写法 | 备注 |
+|---|---|---|
+| `type: "string"/"number"/"integer"/"boolean"/"null"` | `z.string()` / `z.number()` / `z.number().int()` / `z.boolean()` / `z.null()` | `integer` 在 JSON Schema 与 OpenAPI 里都是「整型」，映射到 zod 是 `z.number().int()` |
+| `type: ["string","null"]`（类型数组） | `z.string().nullable()` | 类型数组是 nullable 的标准写法 |
+| `type: "object"` + `properties` | `z.object({...})` | 递归生效 |
+| `type: "array"` + `items` | `z.array(...)` | `items` 必配 |
+| `required: ["a"]` | 字段不加 `.optional()` | OpenAPI 里 `required` 是**父级**字段，不是字段级 |
+| `additionalProperties: false` | `z.object({}).strict()` | 运行期（body 通道）真的拒未声明字段 |
+| `minimum` / `maximum` | `.min()` / `.max()`（数值） | |
+| `minLength` / `maxLength` | `.min()` / `.max()`（字符串） | 按**字符数**（`chars().count()`）算，不是字节 |
+| `pattern` | `.regex(new RegExp(...))` | **见下方跨语言红线** |
+| `enum: [...]` | `z.enum([...])` / `z.literal()` 联合 | 非空数组；**数值按值比较**（`1` 与 `1.0` 等价） |
+| `nullable: true` | `.nullable()` | |
+| `minItems` / `maxItems` | `.min()` / `.max()`（数组） | |
+| `default` | `.default(...)`（仅 zod 侧） | oj 侧**纯注解**：不替你填值，缺省钳制仍须 handler 自己做 |
+
+**不支持且 fail-fast**（`$ref` / `oneOf` / `allOf` / `anyOf` / `not` / `format` /
+`patternProperties` / `dependencies` / 以及 zod 的 `refine` / `transform` /
+`discriminatedUnion` / `record`）。其中高频的两条怎么改写：
+
+- **联合类型 / discriminated union**：写不了。用「可选字段 + 单形态」表达
+  （例如 `{ kind: {type:"string", enum:["a","b"]}, aOnly?: ..., bOnly?: ... }`），
+  判别逻辑放 handler。
+- **`format`（email / date-time / uuid 等）**：写不了。改成 `pattern`
+  （`pattern` 是唯一的字符串形状约束手段）。别指望 oj 帮你校验邮箱——那需要真解析器。
+
+**跨语言红线（`pattern`）**：`.schema` 的 `pattern` 是 **Rust regex**，不是 ECMA-262。
+下游把它搬进前端 zod 的 `new RegExp(...)` 时：
+
+- Rust-only 语法（lookahead `(?=` `(?!` `(?<=` `(?<!`、反向引用 `\1`）在 JS 里要么
+  **编译失败**、要么**语义漂移**——漂移尤其危险：Rust 里拒绝的字符串在 JS 里被放行，
+  等于前端校验被绕过；
+- 反过来 JS 支持而 Rust 不支持的写法，在 oj 侧装配期就报错（不会静默）。
+- 实践建议：`.schema` 里只写**两边都成立**的保守正则（字符类、量词、锚点、`\d`/`\w` 等），
+  复杂校验下移到 handler。
+
+**下游 codegen 的三条注意事项**（openapi.json 里的值是任意 JSON 字符串，可含 `` ` ``、
+`*/`、换行、`${`）：
+
+1. 属性名已是合法 JSON 键，但**不保证**是合法 JS 标识符——生成对象键请一律
+   `JSON.stringify(name)` 后嵌入，不要裸插值；
+2. `enum` 元素与 `default` 值同理，必须序列化后嵌入；
+3. `required` 里的项**可能不在 `properties` 中**（JSON Schema 允许「只声明必填、不约束
+   类型」），codegen 取值前先判存在。
+
 #### `.schema` 顶层只允许四个通道（v0.1.70，行为收紧）
 
 顶层键白名单 = `params` / `query` / `body` / `response`；其余键（`param` / `bodys` /

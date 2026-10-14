@@ -106,6 +106,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 升级到 v0.1.70 后启动报 `unsupported channel` | 该通道**以前也从未生效**（被静默忽略，接口一直在裸奔）——改名或删除。**不要**用 `schema_validation: false` 绕：该开关只关运行期校验，声明合法性审计不受它影响，绕了还会连带关掉全部入参校验 |
 | 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false`（只关运行期校验） |
 | 声明了 `.schema.response` 但返回字段不合规却没报错 | **这是预期行为**：`response` 只作文档与生成真源（产物带 `x-oj-response-enforced: false`），运行期**不**校验响应（校验失败时请求已执行完，无处可去）。别把它当守卫，也别当脱敏边界 |
+| `.schema` 里写联合类型 / `format: "email"` 被拒 | 都不在白名单：联合（`oneOf`/`anyOf`/`discriminatedUnion`）改「可选字段 + 单形态」，判别逻辑进 handler；`format` 改 `pattern`。完整对照表见 api-manual「表达力边界：与 zod 的对照表」 |
+| 前端 zod 的 `.regex()` 与 oj 侧行为不一致（或 `new RegExp` 直接抛错） | `pattern` 是 **Rust regex** ≠ ECMA-262：lookahead / 反向引用在 JS 里要么编译失败、要么**语义漂移**（Rust 拒的字符串在 JS 放行 = 前端校验被绕过）。只写两边都成立的保守正则，复杂校验下移到 handler |
 | `query`/`params` 数值 `enum` 报 `must be one of [1,2], got 1.0` | 旧版根因（已修）：`enum` 按 serde_json 数字变体严格比较，强转得到的 `1.0` 不命中字面量 `1`。**升 v0.1.69+** 即消，**不要**为绕行在 handler 内重校验 / 删 `enum`（那是临时壳，根因已修复——数值 `enum` 现按值比较，`1` 与 `1.0` 等价） |
 | CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast。**升 v0.1.70 必须重生成一次**：产物新增 `tags`（模块归属）、`responses.200` 落地、`x-oj-file` 改相对路径 |
 | `oj openapi` 报 `operationId … is derived from two different routes` | 两条路由（如 `/user/profile` 与 `/user-profile`）派生出同名 operationId —— 下游 codegen 按它命名符号会静默覆盖；给其中一条设显式 `.route` 改名 |

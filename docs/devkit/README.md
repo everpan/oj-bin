@@ -45,6 +45,13 @@ v0.1.66 修复三处用户可见缺陷：`json.stream().write()` 的 `ArrayBuffe
 在 mysql 误路由 LAST_INSERT_ID 分支的 panic（0.1.65 上 mysql 全业务面阻断，无对外契约变更）。
 见 `api-manual.md` §6 `json.stream`、seed 纪律表与 `scenarios.md` 场景「常见坑」。
 
+v0.1.71 把 `.schema` 的**表达力边界显式化**（无行为变更，纯文档 + 钉死测试）：给出
+「`.schema` 关键字 → zod 写法」对照表与**不支持清单**（联合类型 / `format` / `$ref` /
+`oneOf` …一律 fail-fast，并给出改写方案），并写清跨语言红线——`pattern` 是 Rust regex
+≠ ECMA-262，下游搬进前端 zod 时 Rust-only 语法会编译失败或**语义漂移**（前端校验被绕过）。
+另附下游 codegen 三条注意事项（属性名/`enum`/`default` 须 `JSON.stringify` 嵌入；
+`required` 项可能不在 `properties` 中）。见 `api-manual.md`「表达力边界：与 zod 的对照表」。
+
 v0.1.70 新增 `.schema` 的**响应通道 `response`**（入参与出参同一处声明），并把 `oj openapi`
 的响应侧补齐：`response` = `json.ok(data)` 的 **data payload**，生成物输出**完整信封**
 `{code,msg,data}` 并带 `x-oj-response-enforced: false`——**运行期不校验响应**（响应由 JS

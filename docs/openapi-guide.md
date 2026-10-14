@@ -161,6 +161,10 @@ export default { asset };
 | `minItems` / `maxItems` | 数组元素个数边界 | 批量接口限 1~100 条之类 |
 | `default` | 白名单允许；**仅随契约透传进 openapi.json，运行期不会为缺参补默认值** | 纯文档用途 |
 
+完整的「`.schema` 关键字 → zod 写法」对照表与**不支持清单**（联合类型 / `format` /
+`$ref` / `oneOf` …一律 fail-fast，附改写方案）见 `docs/devkit/api-manual.md`
+「表达力边界：与 zod 的对照表」（v0.1.71）。下游拿本产物生成 zod 前应先读它。
+
 ### 2.7 两个行为差异要记住
 
 - **`params`/`query` 会强转**：这两通道来源是字符串 map，值按声明类型 coerce
