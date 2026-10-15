@@ -267,7 +267,7 @@ tables:
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
-| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response` → `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错 |
+| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错 |
 | `oj build --check` | 只跑结构检查 S001–S008 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
@@ -530,18 +530,20 @@ export default { asset };
 - 组名可以是连字符等非标识符（`"audit-log"`），经计算式访问命中；段名不得含 `/`、
   不得为 `__proto__` / `constructor` / `prototype`（手改 `routes.js` 注入这些段 →
   release 启动失败）。
-- 组对象的 `.route`（字符串）/ `.schema`（对象）是本层前缀/默认契约声明，不当子键；
-  `route` 与 `schema` 因此是**保留键**（组对象上这两个名字不会被当作子组解析）。
+- 组对象的 `.route`（字符串）/ `.schema`（对象）/ `.response`（对象，v0.1.72）是本层
+  前缀/默认契约/默认出参声明，不当子键；`route` 与 `schema` 与 `response` 因此是
+  **保留键**（组对象上这几个名字不会被当作子组解析）。
 - 嵌套上限 4 层；自引用（`const a = {}; a.self = a;`）在内省期即失败，不会拖死启动。
 - 挂 `.route` 的组动词同样**替换目录镜像**：镜像 URL 不再可达（404）。
 - release：`oj build` 为嵌套行写入 `handler` 链字段（顶层动词行不写，旧产物无此字段
   照常启动）；路由事实唯一来源仍是 `routes.js`（第 11 章）。
 
-### 入参与出参契约 `.schema`（v0.1.44，响应通道 v0.1.70）
+### 入参与出参契约 `.schema`（v0.1.44，响应通道 v0.1.70，平级 `.response` v0.1.72）
 
 与 `.route` 同构：在导出的函数对象上挂 `.schema`，分**四通道**声明——入参三通道
 （`params` / `query` / `body`，对应 `http.params` / `http.query` / `http.body`）
-加出参 `response`（v0.1.70）。
+加出参 `response`（v0.1.70；v0.1.72 起出参也可写在 `.schema` **之外**的平级 `.response`，
+见下节）。
 `.schema` 的首要目的是**让接口符合 OpenAPI 并生成文档**（`oj openapi` 从 `RouteRow.schema`
 出 parameters / requestBody；与 oj-module 的「前端契约 → 后端 `.schema` → OpenAPI」管线同源
 对齐——关键字白名单、三通道 `params`/`query`/`body` 形态完全一致）。它既可挂在**动词函数**
@@ -597,7 +599,7 @@ post.schema = {
   `params` 声明必须与路由 pattern 的实参**双向一致**，否则 `oj openapi` 报错
   （避免契约与 URL 变成两份真源）。
 
-#### `response` 通道：出参声明（v0.1.70）
+#### `response` 通道：出参声明（v0.1.70，平级 `.response` v0.1.72）
 
 ```js
 get.schema = {
@@ -612,7 +614,22 @@ get.schema = {
     },
   },
 };
+
+// v0.1.72：出参也可写在 .schema 之外的平级 .response——.schema 只放入参，
+// 入参与出参不再混在同一对象里。语义与 .schema.response 完全一致。
+get.response = {
+  type: "object",
+  required: ["list", "total"],
+  properties: { list: { type: "array" }, total: { type: "integer" } },
+};
+get.schema = { query: { type: "object" } }; // 现在只放入参
 ```
+
+生效优先级（四个位置并存时）：**动词 `.response` > 组 `.response` > 动词
+`.schema.response` > 组 `.schema.response`**。组级 `.response` 与组级 `.schema`
+同机制：作整组默认沿嵌套层层继承，动词自身 `.response` 整体覆盖。两位置并存时
+`.response` 优先；`.schema.response` 继续生效，存量零破坏。`oj openapi` 的
+生成逻辑完全不变（仍取最终生效者裹信封），未声明任何 response 的端点保持占位 200。
 
 四件事必须说清楚（否则一定会被误解）：
 
@@ -692,6 +709,8 @@ get.schema = {
 `responce` / `title` / `$schema` …）**装配期硬失败**（报错带 method / pattern /
 handler 链 / 文件）。以前这类键被**静默忽略**——拼错的通道意味着接口一直在裸奔，
 而「声明了但没生效」是本项目最重的缺陷类。报 `unsupported channel` 就改名或删除。
+（v0.1.72 的平级 `.response` 不在此列：它在 `.schema` 之外，胜出者会被写回
+`schema.response` 通道，同样过这道审计。）
 
 ### ws.ts（WebSocket 生命周期钩子）
 
@@ -3546,7 +3565,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | build 剥 `.route` 仅识别语句起始的标准赋值写法 | `fn.route = "…"` 顶层标准写法可用；花式写法可能漏剥 |
 | 嵌套 handler 组上限 4 层、`route` 为保留键（v0.1.64） | 链长 >4 或自引用（`a.self=a`）内省期即失败；组对象的字符串 `.route` 是本层前缀声明，故子组不能命名 `route` |
 | `.schema` 顶层只允许四通道（v0.1.70） | 白名单 = `params`/`query`/`body`/`response`，其余键装配期硬失败（旧版静默忽略 = 接口裸奔）。报错带 method/pattern/handler/文件；**不要**用 `schema_validation: false` 绕 |
-| `.schema.response` 运行期**不校验**（v0.1.70） | 只作文档与生成真源（产物带 `x-oj-response-enforced: false`）：少返回字段不报错、不裁剪。`json.raw`/`json.stream`/`json.sse` 端点无信封，**不要**声明 `response` |
+| `.schema.response` / 平级 `.response` 运行期**不校验**（v0.1.70；平级声明位 v0.1.72） | 只作文档与生成真源（产物带 `x-oj-response-enforced: false`）：少返回字段不报错、不裁剪。`json.raw`/`json.stream`/`json.sse` 端点无信封，**不要**声明 `response`。出参四个声明位并存时优先级：动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response` |
 | `oj openapi` 生成期审计 + `operationId` 唯一（v0.1.70） | 非法 `.schema`（含拼错通道）在生成期即失败，不再进 spec；`/user/profile` 与 `/user-profile` 派生同名 `user_profile_get` → 报错（下游按它命名符号会互相覆盖） |
 | npm 依赖不打包进 tgz | 发布物需自带 `node_modules/` |
 | 旧版本目录不自动回收 | 锁不指向即为死数据，手工删 |

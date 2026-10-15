@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.72
+
+**feat（openapi/introspect）：响应契约可在 `.schema` 之外的平级 `.response` 声明。**
+此前出参（`json.ok(data)` 的 data payload）只能写在 `.schema.response`，入参与出参混在同一
+对象里。本版新增与 `.schema` **平级**的 `.response` 声明位（动词级 `v.response` / 组级
+`obj.response`，组级沿嵌套层层继承）：
+
+- 生效优先级：**动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`**。
+- `oj openapi` 生成 `responses.200.content` 的逻辑完全不变：仍取最终生效的 response 作
+  data payload，外裹 `{code,msg,data}` 信封；任何位置都未声明时保持占位
+  `{ "200": { "description": "OK" } }`（无 content）。
+- `.schema.response` 继续生效，存量零破坏；两位置并存时 `.response` 优先。
+- 动机：`.schema` 只放入参、出参独立声明，匹配「handler 逻辑与契约分离 / 多文件」的演进方向。
+- 实现：`introspect_module` 的 JS 内省脚本新增 `gresp` 继承链，胜出者写回 `schema.response`
+  透传（浅拷贝写回，防共享引用污染同组兄弟动词）；`openapi_cmd` 零改动。
+
 ## v0.1.71
 
 **docs（contract）：`.schema` 表达力边界显式化 —— zod 对照表 + 不支持清单。**

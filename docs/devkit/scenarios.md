@@ -1708,6 +1708,28 @@ curl -s -X POST 'http://localhost:9778/v1/api/order/5' -H 'content-type: applica
 - `params` / `query` 是字符串来源，声明 `integer`/`number`/`boolean` 时**显式强转**，转不动即 400；`body` 是真 JSON，**不**强转。
 - 契约与路由 pattern 不一致时 `oj openapi` 会报错（两边必须双向对齐）。
 
+### ④ 出参声明：`.schema` 之内或平级 `.response`（v0.1.72）
+
+```js
+// 两种写法等价可并存，.response 平级写法语义相同、.schema 只放入参更清爽
+get.schema = {
+  params: { type: "object", required: ["id"], properties: { id: { type: "integer" } } },
+  response: { type: "object", properties: { id: { type: "integer" } } },
+};
+// 组级默认出参：整组继承，动词 .response 整体覆盖
+post.response = { type: "object", properties: { created: { type: "string" } } };
+post.schema = { body: { type: "object", required: ["name"] } };
+```
+
+四位置并存时优先级：**动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组
+`.schema.response`**。运行期**不校验**响应（只喂 `oj openapi` / 下游 client 生成）；
+`json.raw` / `json.stream` / `json.sse` 端点无信封，不要声明。验证：
+
+```bash
+./bin/oj openapi -c config.yaml -d src | grep -A8 '"responses"'
+# → 200 的 content schema 是 {code,msg,data} 信封，data 即声明的 payload
+```
+
 ## 场景 25：大文件搬运与区间读（blob.copy / move / readRange，v0.1.47）
 
 上传完成（尤其 v0.1.38 的流式大文件）后要「把临时对象转正」，顺带判定文件类型——

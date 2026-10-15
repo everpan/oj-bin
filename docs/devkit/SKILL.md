@@ -105,7 +105,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 启动失败报 `invalid \`.schema\` on …` | 三种之一：①用了白名单外关键字（`$ref` / `oneOf` / `format` …）或 pattern 不是合法 Rust regex —— 一律 fail-fast，**不会**静默跳过；②`params`/`query` 声明 array/object（死契约）；③**顶层通道名拼错**（`param` / `bodys` / `responce` …，v0.1.70 起白名单只有 `params`/`query`/`body`/`response`）。报错带 method/pattern/handler/文件 |
 | 升级到 v0.1.70 后启动报 `unsupported channel` | 该通道**以前也从未生效**（被静默忽略，接口一直在裸奔）——改名或删除。**不要**用 `schema_validation: false` 绕：该开关只关运行期校验，声明合法性审计不受它影响，绕了还会连带关掉全部入参校验 |
 | 请求 400 且 handler 没执行 | 入参违反 `.schema`（校验在 JS 之前）；`params`/`query` 是字符串，声明 integer 时会强转，转不动即 400。逃生门：`server.schema_validation: false`（只关运行期校验） |
-| 声明了 `.schema.response` 但返回字段不合规却没报错 | **这是预期行为**：`response` 只作文档与生成真源（产物带 `x-oj-response-enforced: false`），运行期**不**校验响应（校验失败时请求已执行完，无处可去）。别把它当守卫，也别当脱敏边界 |
+| 声明了 `.schema.response`（或平级 `.response`，v0.1.72）但返回字段不合规却没报错 | **这是预期行为**：`response` 只作文档与生成真源（产物带 `x-oj-response-enforced: false`），运行期**不**校验响应（校验失败时请求已执行完，无处可去）。别把它当守卫，也别当脱敏边界。四个声明位并存时优先级：动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response` |
 | `.schema` 里写联合类型 / `format: "email"` 被拒 | 都不在白名单：联合（`oneOf`/`anyOf`/`discriminatedUnion`）改「可选字段 + 单形态」，判别逻辑进 handler；`format` 改 `pattern`。完整对照表见 api-manual「表达力边界：与 zod 的对照表」 |
 | 前端 zod 的 `.regex()` 与 oj 侧行为不一致（或 `new RegExp` 直接抛错） | `pattern` 是 **Rust regex** ≠ ECMA-262：lookahead / 反向引用在 JS 里要么编译失败、要么**语义漂移**（Rust 拒的字符串在 JS 放行 = 前端校验被绕过）。只写两边都成立的保守正则，复杂校验下移到 handler |
 | `query`/`params` 数值 `enum` 报 `must be one of [1,2], got 1.0` | 旧版根因（已修）：`enum` 按 serde_json 数字变体严格比较，强转得到的 `1.0` 不命中字面量 `1`。**升 v0.1.69+** 即消，**不要**为绕行在 handler 内重校验 / 删 `enum`（那是临时壳，根因已修复——数值 `enum` 现按值比较，`1` 与 `1.0` 等价） |

@@ -37,6 +37,12 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.72 新增与 `.schema` **平级**的出参声明位 `.response`（动词级 `v.response` / 组级
+`obj.response`，组级沿嵌套继承）：`.schema` 只放入参，出参独立声明，匹配「handler 逻辑与
+契约分离 / 多文件」的演进方向。生效优先级：**动词 `.response` > 组 `.response` > 动词
+`.schema.response` > 组 `.schema.response`**；`oj openapi` 生成逻辑不变（取最终生效者裹
+`{code,msg,data}` 信封），`.schema.response` 存量零破坏。见 `api-manual.md`「`response` 通道」。
+
 v0.1.66 修复三处用户可见缺陷：`json.stream().write()` 的 `ArrayBuffer`/类型化数组/`DataView`
 在分发层转为 `Uint8Array` 后进字节 op（0.1.65 实测仅 `Uint8Array` 可用，其余 TypeError，
 手册承诺兑现）；seed 语句前置 `--` 注释行不再使 `INSERT OR IGNORE` 方言改写失效（v0.1.65

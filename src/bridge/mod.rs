@@ -1291,7 +1291,9 @@ impl Bridge {
                rp ? rp + \"/\" + own : own;\n\
              // 组级 .schema 与组级 .route 同等地位：组 .schema 作整组默认契约，动词自身\n\
              // .schema 在其上合并。入参三通道（params/query/body）与 response 通道\n\
-             // 合并规则不同，见下。\n\
+             // 合并规则不同，见下。v0.1.72：出参另可与 .schema **平级**声明 .response，\n\
+             // 由 walk 的 gresp 链继承，最终按 动词.response > 组.response > 动词\n\
+             // .schema.response > 组.schema.response 写回 schema.response 透传。\n\
              const mergeSchema = (base, over) => {{\n\
                if (over === undefined || over === null) return base || null;\n\
                if (base === undefined || base === null) return over;\n\
@@ -1325,7 +1327,7 @@ impl Bridge {
                for (const k of Object.keys(base)) if (!(k in out)) out[k] = base[k];\n\
                return out;\n\
              }};\n\
-             const walk = (obj, prefix, rp, gschema, name, depth) => {{\n\
+             const walk = (obj, prefix, rp, gschema, gresp, name, depth) => {{\n\
                const at = prefix.join(\".\") || \"<root>\";\n\
                if (depth > 4) throw new Error(\"handler group nested deeper than 4 levels at \" + at);\n\
                if (seen.has(obj)) throw new Error(\"circular handler group at \" + at);\n\
@@ -1335,30 +1337,39 @@ impl Bridge {
                  ? resolve(String(lraw), rp)\n\
                  : (rp ? rp + \"/\" + name : name);\n\
                const thisSchema = mergeSchema(gschema, obj.schema);\n\
+               // 组级 .response 平级声明（v0.1.72）：组值沿嵌套层层继承，与 gschema 同机制。\n\
+               const thisResp = obj.response !== undefined ? obj.response : gresp;\n\
                for (const k of Object.keys(obj)) {{\n\
                  if (k === \"route\" && typeof obj[k] === \"string\") continue;\n\
                  if (k === \"schema\") continue;\n\
+                 if (k === \"response\") continue;\n\
                  const v = obj[k];\n\
                  if (VERBS.has(k)) {{\n\
                    if (typeof v !== \"function\")\n\
                      throw new Error(\"verb key '\" + k + \"' at \" + at + \" is \" + (v === null ? \"null\" : typeof v) + \", expected handler function\");\n\
                    const raw = v.route;\n\
                    const own = (raw === undefined || raw === null || raw === \"\") ? null : String(raw);\n\
+                   const mschema = mergeSchema(thisSchema, v.schema);\n\
+                   // 出参优先级：动词 .response > 继承的组 .response > 合并后的 .schema\n\
+                   // .response（动词 > 组，mergeSchema 已保证）。浅拷贝写回——mschema 可\n\
+                   // 能 IS thisSchema（v.schema 缺省时共享引用），直接改会污染同组兄弟动词。\n\
+                   const resp = v.response !== undefined ? v.response : thisResp;\n\
+                   const vschema = resp !== undefined ? Object.assign({{}}, mschema, {{ response: resp }}) : mschema;\n\
                    out.push({{\n\
                      chain: prefix.concat(k).join(\".\"),\n\
                      route: resolve(own, layer) || null,\n\
-                     schema: mergeSchema(thisSchema, v.schema),\n\
+                     schema: vschema,\n\
                    }});\n\
                  }} else {{\n\
                    if (v === null || typeof v !== \"object\" || Array.isArray(v))\n\
                      throw new Error(\"non-verb key '\" + k + \"' at \" + at + \" is \" + (Array.isArray(v) ? \"array\" : (v === null ? \"null\" : typeof v)) + \", expected nested group object\");\n\
-                   walk(v, prefix.concat(k), layer, thisSchema, k, depth + 1);\n\
+                   walk(v, prefix.concat(k), layer, thisSchema, thisResp, k, depth + 1);\n\
                  }}\n\
                }}\n\
                seen.delete(obj);\n\
              }};\n\
              const d = m.default;\n\
-             if (d !== undefined && d !== null) walk(d, [], \"\", null, \"\", 1);\n\
+             if (d !== undefined && d !== null) walk(d, [], \"\", null, undefined, \"\", 1);\n\
              json.ok(out);\n"
         );
         let code = driver_script(&body);
@@ -2804,6 +2815,95 @@ mod tests {
                 "body": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
             }),
             "{v}"
+        );
+    }
+
+    /// v0.1.72：`.response` 平级声明——出参不再只能塞在 `.schema.response` 里。
+    /// 优先级：动词 `.response` > 组 `.response`（沿嵌套继承）> 动词 `.schema.response`
+    /// > 组 `.schema.response`；均缺省时 schema 不带 response 键（openapi 占位行为不变）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_response_sibling_priority_and_inheritance() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const grp = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+               put: () => { json.ok({}); },\n\
+               del: () => { json.ok({}); },\n\
+             };\n\
+             grp.response = { type: \"object\", properties: { g: { type: \"integer\" } } };\n\
+             grp.get.response = { type: \"string\" };\n\
+             grp.post.schema = { response: { type: \"integer\" } };\n\
+             grp.put.schema = { query: { type: \"object\" } };\n\
+             function patch() { json.ok({}); }\n\
+             patch.response = { type: \"boolean\" };\n\
+             export default { grp, patch };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        // 动词 .response 覆盖组 .response
+        assert_eq!(
+            leaf(&v, "grp.get")["schema"]["response"],
+            json!({ "type": "string" }),
+            "{v}"
+        );
+        // 组 .response 优先于动词 .schema.response
+        assert_eq!(
+            leaf(&v, "grp.post")["schema"]["response"],
+            json!({ "type": "object", "properties": { "g": { "type": "integer" } } }),
+            "{v}"
+        );
+        // 组 .response 被普通动词继承（入参通道不受影响）
+        assert_eq!(
+            leaf(&v, "grp.put")["schema"],
+            json!({
+                "query": { "type": "object" },
+                "response": { "type": "object", "properties": { "g": { "type": "integer" } } }
+            }),
+            "{v}"
+        );
+        // 回归：动词 b 的 .schema.response 被组 .response 顶替后，不得泄漏给兄弟动词 d
+        assert_eq!(
+            leaf(&v, "grp.del")["schema"]["response"],
+            json!({ "type": "object", "properties": { "g": { "type": "integer" } } }),
+            "{v}"
+        );
+        // 无组上下文：仅写动词级 .response 同样生效
+        assert_eq!(
+            leaf(&v, "patch")["schema"]["response"],
+            json!({ "type": "boolean" }),
+            "{v}"
+        );
+    }
+
+    /// v0.1.72：`.response` 平级声明下，组内某动词「v.schema 缺省 → 共享引用」路径
+    /// 不得污染组级合并契约（thisSchema 被兄弟动词共享）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_response_sibling_no_shared_reference_pollution() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "g/api.ts",
+            "const grp = {\n\
+               get: () => { json.ok({}); },\n\
+               post: () => { json.ok({}); },\n\
+             };\n\
+             grp.schema = { query: { type: \"object\" } };\n\
+             grp.get.response = { type: \"string\" };\n\
+             export default { grp };\n",
+        )]);
+        let b = module_bridge(&root);
+        let v = b.introspect_module(&api).await.unwrap();
+        assert_eq!(
+            leaf(&v, "grp.get")["schema"]["response"],
+            json!({ "type": "string" }),
+            "{v}"
+        );
+        // b 未声明任何 response：不得从 a 的浅拷贝写回中「捡到」response
+        assert!(
+            leaf(&v, "grp.post")["schema"].get("response").is_none(),
+            "{}",
+            leaf(&v, "grp.post")["schema"]
         );
     }
 
