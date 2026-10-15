@@ -150,7 +150,14 @@ pub fn generate(table: &serve::routes::RouteTable, base: &str) -> Result<Value, 
         // row.pattern 形如 "/v1/api/user/{id}"（含 base 与前导 /）。
         let raw = row.pattern.trim_start_matches('/');
         let oa_path = to_oa_path(raw);
-        let method = row.method.to_lowercase();
+        // oj 的删除动词是 `del`（serve 运行期 del↔DELETE 映射见 serve/src/routes.rs），
+        // 但 OpenAPI 3.x 操作键只认标准 HTTP 方法——归一为 `delete`（v0.1.73）。
+        // 一处归一，operationId / summary / path 键三处同源（下游 client 方法名
+        // 随之从 delXxx 变 deleteXxx，属一次性重命名）。
+        let method = match row.method.to_lowercase().as_str() {
+            "del" => "delete".to_string(),
+            _ => row.method.to_lowercase(),
+        };
         // 溯源标记：相对 api 根 + 统一正斜杠。产物是公开文件——**不带绝对路径**
         // （本机路径属信息泄露，且换机器就不可比）；Windows 反斜杠归一以免跨平台漂移。
         let file = table
@@ -781,6 +788,22 @@ mod tests {
             s["properties"]["data"]["properties"]["list"]["items"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn del_verb_is_normalized_to_delete_operation_key() {
+        // v0.1.73：oj 删除动词是 `del`，但 OpenAPI 3.x 操作键只认标准 HTTP 方法。
+        // 归一须在 operationId / summary / path 键三处一致（同源自 method 变量）。
+        let (_d, t) =
+            table_with_contract("del", "/v1/api/user/{id}", "user-0.1.0/api.js", json!({}));
+        let spec = generate(&t, "/v1/api").unwrap();
+        let op = &spec["paths"]["/v1/api/user/{id}"];
+        assert!(op.get("del").is_none(), "del 不得作为操作键出现: {op}");
+        let d = &op["delete"];
+        assert_eq!(d["summary"], "DELETE v1/api/user/{id}");
+        assert_eq!(d["operationId"], "user__id__delete");
+        // 未声明 response → 占位 200 照旧
+        assert_eq!(d["responses"]["200"]["description"], "OK");
     }
 
     #[test]

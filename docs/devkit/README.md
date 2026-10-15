@@ -37,6 +37,12 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.73 修复 `oj openapi` 的操作键归一：oj 运行期删除动词是 `del`（serve `DELETE`↔`del`
+映射不变），但 OpenAPI 3.x 只认标准 HTTP 方法——生成物此前写出非法的 `"del"` 键，
+严格工具/生成器报错或忽略，且对手工修正过的存量 `openapi.json` 必然 `--check` 漂移。
+本版归一为 `delete`（operationId 同步 `..._delete`，下游 client 方法名 `deleteXxx()`，
+一次性重命名）。见 `api-manual.md` §4「动词 → 方法名映射」与 SKILL 陷阱速查。
+
 v0.1.72 新增与 `.schema` **平级**的出参声明位 `.response`（动词级 `v.response` / 组级
 `obj.response`，组级沿嵌套继承）：`.schema` 只放入参，出参独立声明，匹配「handler 逻辑与
 契约分离 / 多文件」的演进方向。生效优先级：**动词 `.response` > 组 `.response` > 动词

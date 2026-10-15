@@ -16,6 +16,21 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.73
+
+**fix（openapi）：`del` 动词归一为 `delete` 操作键。**
+OpenAPI 3.x 的操作键只认标准 HTTP 方法，而 oj 运行期的删除动词是 `del`
+（serve `DELETE`↔`del` 映射是既成事实，`serve/src/routes.rs`）——`oj openapi`
+此前把动词名原样写进操作键，产出非法的 `"del"`：严格 OpenAPI 工具 / 生成器报错或
+忽略，下游 `__client` 生成 `delXxx()` 而非 `deleteXxx()`，且对手工修正过的存量
+`openapi.json` 必然 `--check` 漂移。本版在 `generate` 内一处归一：
+
+- `del` → `delete`，其它动词原样；`operationId` / `summary` / path 键三处同源，
+  同步归一（`del_x` → `delete_x`）。
+- 仅影响 OpenAPI 输出；serve 运行期 wire 映射不变。
+- 兼容性：存量手工 `"delete"` 与归一输出一致，`--check` 不再漂移；下游 client
+  方法名 `delXxx` → `deleteXxx` 为一次性重命名（业务调用点需同步改名）。
+
 ## v0.1.72
 
 **feat（openapi/introspect）：响应契约可在 `.schema` 之外的平级 `.response` 声明。**

@@ -267,7 +267,7 @@ tables:
 | `oj migrate -c config.yaml -d <dir>` | 应用待执行迁移（`--baseline`：存量库接入，≤head 记为已应用不执行） |
 | `oj schema diff -c config.yaml -d <dir>` | 声明 vs 实库对账（D001 漂移 / D002 未声明表），只读，漂移 exit 1 |
 | `oj test fixture -c config.yaml -d <dir>` | 灌 `fixtures/*.sql` 演示数据（dev/test 用，不进 release 产物）。v0.1.52 起有**幂等门禁**：非幂等 INSERT（判据同 S006）灌入前报错，改 `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` 写法即可重复灌 |
-| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错 |
+| `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错、**v0.1.73 起 `del` 动词归一为 `delete` 操作键**（OpenAPI 3.x 只认标准 HTTP 方法） |
 | `oj build --check` | 只跑结构检查 S001–S008 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
 
@@ -319,7 +319,9 @@ schema 回滚**没有自动机制**（refinery 语义，只前向）：破坏性
 | OPTIONS | `options` |
 
 **DELETE 的方法名是 `del`，不是 `delete`**——写错时该请求返回 405
-（`method DELETE not allowed`）。
+（`method DELETE not allowed`）。注意这是**运行期**命名；`oj openapi` 的生成物
+（v0.1.73 起）会把 `del` 归一为 OpenAPI 标准操作键 `delete`（operationId 同步
+`..._delete`），下游 client 方法名为 `deleteXxx()`。
 
 ### 两种 handler 写法
 
