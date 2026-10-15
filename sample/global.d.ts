@@ -451,17 +451,24 @@ declare global {
     route?: string;
     /** handler 入参契约（v0.1.44 `.schema`；嵌套组动词同样可挂，键 = (文件, handler 链)） */
     schema?: Record<string, unknown>;
+    /** handler 出参契约（v0.1.72）：与 `.schema` 平级声明，语义同 `.schema.response`
+     * （`json.ok(data)` 的 data payload；运行期不校验，只喂 `oj openapi` / client 生成）。
+     * 优先级：动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response` */
+    response?: Record<string, unknown>;
   }
 
-  // 嵌套组（v0.1.64）：以实体对象为根的组同样可挂组级 `.route`（整组默认前缀）与
-  // 组级 `.schema`（整组默认入参契约），与 handler 级同语义。组是普通对象字面量，
+  // 嵌套组（v0.1.64）：以实体对象为根的组同样可挂组级 `.route`（整组默认前缀）、
+  // 组级 `.schema`（整组默认入参契约）与组级 `.response`（整组默认出参，v0.1.72），
+  // 与 handler 级同语义。组是普通对象字面量，
   // 故在 `Object` 上声明，使 `anchor.route = "/x/{anchor}/upload"` 之类不报 TS2339。
   // 运行时：组级 `.schema` 作继承默认，动词自身 `.schema` 在其上合并（通道级
-  // required 并集 / properties 逐键覆盖）。
+  // required 并集 / properties 逐键覆盖）；组级 `.response` 同样沿嵌套层层继承。
   interface Object {
     route?: string;
     /** 组级入参契约（v0.1.64 嵌套组）：整组默认，动词 `.schema` 在其上合并 */
     schema?: Record<string, unknown>;
+    /** 组级出参契约（v0.1.72）：整组默认，沿嵌套继承，动词 `.response` 整体覆盖 */
+    response?: Record<string, unknown>;
   }
 
   // DB(name) 返回的命名数据库实例。（在 declare global 内：业务代码要能**点名**
