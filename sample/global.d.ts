@@ -467,7 +467,9 @@ declare global {
     route?: string;
     /** 组级入参契约（v0.1.64 嵌套组）：整组默认，动词 `.schema` 在其上合并 */
     schema?: Record<string, unknown>;
-    /** 组级出参契约（v0.1.72）：整组默认，沿嵌套继承，动词 `.response` 整体覆盖 */
+    /** 组级出参契约（v0.1.72）：整组默认，沿嵌套继承，动词 `.response` 整体覆盖。
+     * ⚠️ 保留键：组对象上的 `response` 被当作声明读走，**不能**用来命名嵌套子组
+     * （子组命名为 response 会静默不产生路由，与 `schema`/`route` 相同） */
     response?: Record<string, unknown>;
   }
 

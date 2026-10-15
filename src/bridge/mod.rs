@@ -1321,8 +1321,10 @@ impl Bridge {
                // （required 并集 / properties 逐键覆盖）——响应是动词各不相同的，\n\
                // 组级声明的必填字段被某动词继承后，文档与下游 client 会声称返回\n\
                // 并不存在的必填项，那是假真源。\n\
-               if (over.response) out.response = over.response;\n\
-               else if (base.response) out.response = base.response;\n\
+               // 判定与平级 .response 链一致（v0.1.74）：null 视为未声明；声明了但非法
+               // （如布尔 false，装配期 audit fail-fast）不静默跳过优先级。
+               if (over.response !== undefined && over.response !== null) out.response = over.response;\n\
+               else if (base.response !== undefined && base.response !== null) out.response = base.response;\n\
                for (const k of Object.keys(over)) if (!(k in out)) out[k] = over[k];\n\
                for (const k of Object.keys(base)) if (!(k in out)) out[k] = base[k];\n\
                return out;\n\
@@ -1338,7 +1340,7 @@ impl Bridge {
                  : (rp ? rp + \"/\" + name : name);\n\
                const thisSchema = mergeSchema(gschema, obj.schema);\n\
                // 组级 .response 平级声明（v0.1.72）：组值沿嵌套层层继承，与 gschema 同机制。\n\
-               const thisResp = obj.response !== undefined ? obj.response : gresp;\n\
+               const thisResp = obj.response != null ? obj.response : gresp;\n\
                for (const k of Object.keys(obj)) {{\n\
                  if (k === \"route\" && typeof obj[k] === \"string\") continue;\n\
                  if (k === \"schema\") continue;\n\
@@ -1353,7 +1355,7 @@ impl Bridge {
                    // 出参优先级：动词 .response > 继承的组 .response > 合并后的 .schema\n\
                    // .response（动词 > 组，mergeSchema 已保证）。浅拷贝写回——mschema 可\n\
                    // 能 IS thisSchema（v.schema 缺省时共享引用），直接改会污染同组兄弟动词。\n\
-                   const resp = v.response !== undefined ? v.response : thisResp;\n\
+                   const resp = v.response != null ? v.response : thisResp;\n\
                    const vschema = resp !== undefined ? Object.assign({{}}, mschema, {{ response: resp }}) : mschema;\n\
                    out.push({{\n\
                      chain: prefix.concat(k).join(\".\"),\n\
@@ -2831,11 +2833,15 @@ mod tests {
                post: () => { json.ok({}); },\n\
                put: () => { json.ok({}); },\n\
                del: () => { json.ok({}); },\n\
+               head: () => { json.ok({}); },\n\
+               options: () => { json.ok({}); },\n\
              };\n\
              grp.response = { type: \"object\", properties: { g: { type: \"integer\" } } };\n\
              grp.get.response = { type: \"string\" };\n\
              grp.post.schema = { response: { type: \"integer\" } };\n\
              grp.put.schema = { query: { type: \"object\" } };\n\
+             grp.head.response = null;\n\
+             grp.options.schema = { response: null };\n\
              function patch() { json.ok({}); }\n\
              patch.response = { type: \"boolean\" };\n\
              export default { grp, patch };\n",
@@ -2873,6 +2879,18 @@ mod tests {
         assert_eq!(
             leaf(&v, "patch")["schema"]["response"],
             json!({ "type": "boolean" }),
+            "{v}"
+        );
+        // v0.1.74：null 视为未声明——head 的 .response = null 回落继承组级
+        assert_eq!(
+            leaf(&v, "grp.head")["schema"]["response"],
+            json!({ "type": "object", "properties": { "g": { "type": "integer" } } }),
+            "{v}"
+        );
+        // v0.1.74：.schema.response = null 同样视为未声明——组 .response 优先
+        assert_eq!(
+            leaf(&v, "grp.options")["schema"]["response"],
+            json!({ "type": "object", "properties": { "g": { "type": "integer" } } }),
             "{v}"
         );
     }

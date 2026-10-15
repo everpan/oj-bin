@@ -37,6 +37,12 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.74 收敛 v0.1.72 评审发现的边界不一致：`.response` 声明位值为 `null` 现与缺失同义
+（回落继承链 / 占位，不再被 audit 以非对象拒启），`.schema.response` 合并同步改为
+「null 即未声明」使文档优先级链在边界成立；`global.d.ts` 补组级保留键警告
+（`response` 与 `schema`/`route` 同列，命名嵌套子组会静默丢路由）。见 api-manual
+「`response` 通道」。
+
 v0.1.73 修复 `oj openapi` 的操作键归一：oj 运行期删除动词是 `del`（serve `DELETE`↔`del`
 映射不变），但 OpenAPI 3.x 只认标准 HTTP 方法——生成物此前写出非法的 `"del"` 键，
 严格工具/生成器报错或忽略，且对手工修正过的存量 `openapi.json` 必然 `--check` 漂移。

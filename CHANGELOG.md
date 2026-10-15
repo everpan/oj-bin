@@ -16,6 +16,20 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.74
+
+**fix（introspect/d.ts）：`.response` 空值语义统一 + 保留键提示。**
+/code-review 复核 v0.1.72 发现两处边界不一致，本版收敛：
+
+- **null 视为未声明**：v0.1.72 平级 `.response` 链用 `!== undefined` 判定，`.response = null`
+  会胜出优先级链并在装配期被 audit 以「schema must be an object」loud 拒绝；而
+  `.schema.response` 合并走 truthy 检查，falsy 值被静默跳过、让组级违背文档优先级顶替。
+  两通道现统一为「undefined/null = 未声明」：回落继承链与占位行为；声明了但非法
+  （如布尔 schema）照旧装配期 fail-fast，不静默跳过优先级。
+- **`global.d.ts`**：`Object.response` JSDoc 补保留键警告（组对象上的 `response` 被当
+  声明读走，命名嵌套子组会静默不产生路由——与 `schema`/`route` 相同）；驳回「类型
+  放宽到 `| boolean`」建议（审计契约本就拒非对象，TS 侧保持更窄才是对的）。
+
 ## v0.1.73
 
 **fix（openapi）：`del` 动词归一为 `delete` 操作键。**
