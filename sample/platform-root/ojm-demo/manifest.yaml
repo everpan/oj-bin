@@ -1,0 +1,3 @@
+name: ojm-demo
+desc: 平台特权演示（fs trusted_paths 读 / server.reloadConfig / exec.run）
+version: 0.1.0

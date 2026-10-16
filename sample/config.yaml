@@ -13,6 +13,9 @@ mounts:
     web: "dist"          # 目录须存在（新克隆先 `oj build`，或删除本条只跑 API）
     # spa: true          # SPA 深链接回落（默认 false）：未命中 + 无扩展名 + Accept html
                          # → index.html。api 挂载（更长前缀）下的 404 不受影响。
+  - prefix: "/_platform" # 平台特权挂载：受控根 platform-root（与 /v1/api=src、/=dist 均不同径，
+                         # 不触发 anti-squatting 绊线）。其下模块经 discover 获得归属与路由。
+    api: "platform-root"
 
 server:
   host: "localhost"
@@ -208,3 +211,24 @@ oidc:   # OIDC（spec 2026-09-05）：同进程 OP + RP。demo 私钥与示例�
       redirect_uris:
         - "http://localhost:9778/v1/api/oidc/callback"
       tenant: "default"
+
+# fs 段（v0.1.53）：本地文件系统 jail。平台特权演示（ojm-demo）的 fs 读写扩展
+# 面 = fs.root ∪ platform.trusted_paths，exec 的 ${path:} 占位符校验也依赖 fs.root，
+# 故演示需启用本段。root 取本目录（含 config.yaml 与 platform-root），演示只读即可
+# （get/reload/extract 均不写盘），readonly: true 即够；生产按最小暴露设窄 root。
+fs:
+  root: "."
+  readonly: true
+
+# platform 段（v0.1.75，ojm 批次）：平台特权统管。
+# ojm-demo 演示三类特权面：fs trusted_paths 读、server.reloadConfig、exec.run。
+# platform.root 须与 mounts 的 /_platform 挂载指向同一目录，且不与 /v1/api(src)、/(dist) 同径或父子。
+platform:
+  modules: ["ojm-demo"]                 # 平台特权模块白名单
+  root: "./platform-root"               # 受控挂载根（须经 mounts[].api 接入）
+  trusted_paths: ["./config.yaml"]      # 额外授权路径根（含 config.yaml，供 fs/exec 越界读）
+  exec:                                 # exec 授权（与 modules 相互独立）
+    ojm-demo:
+      allow:
+        - "tar -tzf ${path:archive}"    # 归档预检模板；archive 须落在 fs.root ∪ trusted_paths
+      env: []                           # 透传环境变量白名单（演示无需）
