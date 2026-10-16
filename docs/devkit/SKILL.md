@@ -264,6 +264,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 安装器靠 `oj migrate --format json` 的 JSON 解析成功就当迁移成功 | json `error` 字段已脱敏（`<scheme>://***@host`，不漏密码），但**退出码**才是成败真源：任一模块失败 json 仍成功解析、只是 `results[]` 里 `ok=false` 且进程退非 0——安装器必须校验 exit code，不能只 `JSON.parse` 成功 |
 | 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
 | `crypto.md5Hex` 用在凭据/签名/完整性校验上 | MD5 已密码学破损——仅限**非安全场景**（缓存键/etag/旧系统兼容），安全用途改 `sha256Hex` 或 `bcrypt`（v0.1.75） |
+| 写 `http.module.name = "x"` 抛 `TypeError: Cannot assign to read only property` | 预期（v0.1.76）：`http.module` 是框架授信依据（归属守卫/bound_db/平台特权）故冻结只读。strict（ESM / api 文件 CJS 包装）下写/delete 抛错；`require()` 的 CJS 代码（sloppy）写它静默无效——两条路径都改不了框架状态。只读用即可；测试要伪造身份走真实路由 |
+| `http.module` 是 `null`，`http.module.name` 直接 TypeError | 按 handler 文件所在目录判定（非请求来源）：任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期无模块上下文——先判 `null`（与 `http.user` 匿名同款）；页面 meta 合成派发在模块目录内**有值**（v0.1.76） |
+| 把 `http.module.version` 回显给外部客户端 | version 是指纹面——日志/内部打点用即可，勿进响应体/错误消息外发给客户端（v0.1.76） |
 
 ## 手册
 

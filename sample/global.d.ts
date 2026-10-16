@@ -123,6 +123,11 @@ interface HttpApi {
   tenantId: string | null;
   // 已验签用户（auth 启用且通过 Bearer 守卫；否则 null）。
   user: AuthUser | null;
+  // 本请求命中的模块身份（v0.1.76：路由分发时注入；无模块上下文——任务桥 /
+  // WS 帧 / run_with / 启动期内省——为 null）。**只读**：对象已冻结，strict 下
+  // 写属性抛 TypeError（CJS require 路径静默无效）。version 勿回显给外部客户端
+  // （指纹面）。
+  module: { name: string; version: string } | null;
   // multipart 上传文件元信息（非 multipart 为空数组）。
   files: UploadedFileMeta[];
   // 取第 i 个上传文件的字节（越界报错 no such file）。

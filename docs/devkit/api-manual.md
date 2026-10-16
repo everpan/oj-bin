@@ -954,7 +954,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | 全局 | 说明 |
 |---|---|
 | `json.ok(data?)` / `json.fail(code, msg, data?)` / `json.header(name, value)` / `json.redirect(url, code?)` | 统一响应信封、响应头与 3xx 重定向原语（v0.1.26） |
-| `http.method / query / headers / body / params / param / tenantId / user / files / file(i)` | 当前请求上下文（只读、懒加载、每请求最新） |
+| `http.method / query / headers / body / params / param / tenantId / user / module / files / file(i)` | 当前请求上下文（只读、懒加载、每请求最新；`module` = 只读模块身份 `{name, version}`，v0.1.76） |
 | `db.query / exec / table / tx` | 默认库（`db === DB("default")`） |
 | `db.sqlProfile()` / 信封 `_sql` | SQL 执行追踪（v0.1.51，dev 默认开）：本请求画像快照 `{count,totalMs,slow,byDb,events}`；dev 信封自动附加 `_sql` 字段 |
 | `DB(name)` | 命名库实例（未配置的名字返回 `undefined`） |
@@ -1044,6 +1044,7 @@ dl.write(new Uint8Array(bytes)); dl.end();             // 字节通道：逐字�
 | `http.param` | `param(name: string, def?: unknown): any` | **路径参数优先，query 兜底**，均缺失返回 `def` 原值 |
 | `http.tenantId` | `string \| null` | 租户 id（`tenant.enable` 时从租户头提取；未启用为 `null`） |
 | `http.user` | `AuthUser \| null` | 已验签用户 `{id, roles, claims}`；auth 启用且请求通过 Bearer 守卫（进 handler 前统一验 token 的那道检查）才有值，否则 `null` |
+| `http.module` | `{ name: string; version: string } \| null` | **模块身份**（v0.1.76）：路由分发时按 handler 文件所在模块目录注入 `{name, version}`（dev 取 `src/<m>/manifest.yaml`，release 取 `dist/<m>-<v>/manifest.yaml`）。无模块上下文（任务桥 / WS 帧 / `run_with` / 启动期内省）为 `null`；页面 meta 合成派发在模块目录内**有值**。**只读**：对象已冻结，strict 下写抛 TypeError（详见 §6.1） |
 | `http.files` | `UploadedFileMeta[]` | multipart 上传元信息 `[{field, filename, content_type, size, key, url}]`；非 multipart 为空数组。**`key`/`url`（v0.1.38）**：流式大文件（> `max_upload`，服务端直落 blob）的 blob 对象 key 与下载地址；小文件为 `null` |
 | `http.file` | `file(i: number): Promise<Uint8Array>` | 第 i 个上传文件的字节（越界报错 `no such file`；**流式大文件报错**并指路 `files[i].key`/`.url`——小文件行为不变） |
 
@@ -1051,6 +1052,28 @@ dl.write(new Uint8Array(bytes)); dl.end();             // 字节通道：逐字�
 const id = Number(http.param("id", 0));   // /item/42?id=9 → "42"（路径优先）
 const page = http.param("page", 1);       // 无路径参数 → query 兜底 → 默认 1
 ```
+
+#### http.module —— 只读模块身份（v0.1.76）
+
+模块路由分发时注入，让业务知道请求落在哪个模块/哪个版本：
+
+```ts
+// 典型用途：按模块版本做观测打点 / 兼容分支（版本分流本身在 manifests 锁与挂载层）
+log.info("hit", "module", http.module.name, "version", http.module.version);
+if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
+```
+
+- **判定依据是 handler 文件所在目录**（祖先目录命中模块目录），不是请求来源：
+  - 有值：普通 api.ts 路由、**页面 meta 合成派发**（handler 在模块目录内时）；
+  - `null`：任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期。
+- **只读**：返回对象已 `Object.freeze`。`module` 是框架授信依据（跨模块表归属守卫 /
+  bound_db 重定向 / 平台特权换装都按它裁决），故冻结；`http.user` 不冻（维持现状）。
+  strict（ESM / api 文件 CJS 包装）下写属性抛 `TypeError: Cannot assign to read only
+  property ...`；`require()` 引入的 CJS 代码（`new Function`，sloppy）写它静默无效。
+  两条路径都改不了框架状态——JS 拿到的只是快照拷贝。
+- **勿回显 version 给外部客户端**：版本号是指纹面，日志/内部打点用即可。
+- dev 与 release 的 version 同源同值（`src/<m>/manifest.yaml` 与 `dist/<m>-<v>/` 内
+  manifest）；release 装配期校验二者一致，不一致（stale/手改 dist）启动即 fail-fast。
 
 ### db / DB(name) —— 数据库
 
@@ -3894,6 +3917,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `exec.run` 运行面硬限制（v0.1.75） | stdout+stderr **流式合计 10MB** 上限（超限杀进程组抛错，已收部分不返回）；`timeoutMs` 缺省 30s、硬上限 600s（超出**钳制**不报错）；输出强制 UTF-8（二进制不支持）；cwd 钉在 fs.root 但**非隔离边界**（路径防线在 `${path:}` 占位符校验，勿传越界相对路径）；未配 `fs:` → exec 整体不可用；子进程 argv[0] 是宿主解析后的**绝对路径**（非模板首 token 原文）；信号终止 `code = 128 + signal`，非 0 退出码**不抛错**照常返回 |
 | `yaml.parse` 三预算（v0.1.75） | 输入 1 MiB / 节点 100_000（含 alias 展开）/ 深度 128，超限抛错点名**不崩进程**；重复键后键覆盖，多文档 / 非字符串键 / NaN·Inf 一律拒绝（不静默强转）；**stringify 禁用于 config.yaml 回写**（serde_yaml 丢注释，回写走文本手术三步模式） |
 | `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
+| `http.module` 写属性抛 `TypeError: Cannot assign to read only property …`（v0.1.76） | `http.module` 是框架授信依据（归属守卫 / bound_db / 平台特权换装）故冻结只读：strict（ESM / api 文件 CJS 包装）下写 / delete 抛 TypeError；`require()` 引入的 CJS 代码（`new Function`，sloppy）写它**静默无效**。两条路径都改不了框架状态（JS 只持快照拷贝）——只读用即可，测试要伪造模块身份走真实路由（e2e 同款），无可写变体 |
+| `http.module` 为 `null` 的上下文（v0.1.76） | 任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期——按 handler 文件所在目录判定，不是请求来源。访问前判 `null`（与 `http.user` 匿名时同款体验）；页面 meta 合成派发在模块目录内**有值** |
 
 ### 常见陷阱清单
 

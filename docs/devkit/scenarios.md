@@ -2683,3 +2683,48 @@ curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/install/ \
 
 ---
 
+
+## 场景 36：按模块版本做观测打点与兼容分支（`http.module`，v0.1.76）
+
+多模块/多版本并存（release 锁里 `<module>-<version>` 可多代）时，业务常需要知道
+「这个请求跑在哪个模块的哪个版本上」——`http.module` 就是为这个注入的只读身份。
+
+### ① handler（照抄）
+
+```ts
+// src/<module>/diag/whoami/api.ts
+export default {
+  get() {
+    const m = http.module;   // { name, version } | null（无模块上下文为 null）
+    if (m === null) {
+      // 任务桥 / WS 帧 / run_with / 内省期：没有模块归属
+      json.ok({ module: null });
+      return;
+    }
+    // 观测打点：模块名 + 版本进日志（version 勿回显给客户端——指纹面）
+    log.info("whoami", "module", m.name, "version", m.version);
+    // 兼容分支：按版本前缀分流（版本分流本身在 manifests 锁/挂载层，这里只做行为兼容）
+    const legacy = m.version.startsWith("0.1.");
+    json.ok({ module: m.name, version: m.version, legacy });
+  },
+};
+```
+
+### ② 验证
+
+```bash
+# dev：version 取 src/<m>/manifest.yaml
+curl -s http://localhost:9778/v1/api/<module>/diag/whoami/
+# → {"code":0,"data":{"module":"<module>","version":"0.1.0","legacy":true}}
+
+# release：version 取 dist/<m>-<v>/manifest.yaml（与目录后缀一致，装配期 fail-fast 校验）
+```
+
+### ③ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `http.module` 是 `null` | 按 handler 文件所在目录判定（非请求来源）：任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期无归属——先判 `null` 再访问（与 `http.user` 匿名同款） |
+| 写 `http.module.name = "x"` 抛 `TypeError: Cannot assign to read only property` | 预期：模块身份是框架授信依据（归属守卫/bound_db/平台特权）故冻结；strict 下写/delete 抛错，`require()` 的 CJS 代码写它静默无效——只读用即可 |
+| dev 与 release 版本不一致 | 改了 `src/<m>/manifest.yaml` 的 version 但没 `oj build`——release 装配期校验 manifest version == 目录后缀，不一致（stale/手改 dist）启动即 fail-fast；重新 `oj build` 即可 |
+| 拿 version 做 A/B 分流 | 版本分流在 `manifests.yaml` 锁与挂载层（同 pattern 多版本竞争由锁裁决）；handler 内按自身 version 分支只适合观测打点与兼容分支，别当分流机制用 |

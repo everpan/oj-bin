@@ -16,6 +16,13 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.76（未打标签）
+
+- `http.module`：模块路由分发注入只读模块身份 `{name, version}`（dev 版本取 `src/<m>/manifest.yaml`，release 取 `dist/<m>-<v>/manifest.yaml`）。判定依据是 handler 文件所在模块目录而非请求来源——无模块上下文（任务桥 / WS 帧 / `run_with` / 启动期内省）为 `null`；页面 meta 合成派发在模块目录内有值；
+- 只读语义：返回对象已 `Object.freeze`——strict（ESM / api 文件 CJS 包装）下写 / delete 抛 `TypeError: Cannot assign to read only property …`，`require()` 引入的 CJS 代码（sloppy）写它静默无效。两条路径都改不了框架授信面（跨模块表归属守卫 / bound_db 重定向 / 平台特权换装）——JS 只持 `op_http_info` 快照拷贝；
+- release 装配新增 manifest version 与目录后缀 `<module>-<version>` 一致性 fail-fast：错位 / 手改的 dist manifest 不再让 `http.module.version` 与真实加载版本静默不符；
+- 配套：devkit 四件同步（api-manual §6.1 + 错误/限制表、SKILL 三条陷阱、scenarios 场景 36、README per-version 段）、`sample/src/user/module-info/api.ts` 演示端点、e2e dev/release 双模式 + 对抗性冻结探测（含 `require()` sloppy 路径）。
+
 ## v0.1.75
 
 本版承载「ojm 后端原生化」批次（设计稿与实施计划见 `docs/plans/2026-10-16-ojm-native-exec-*`）。

@@ -9,7 +9,7 @@
 | 文件 | 用途 |
 |---|---|
 | `api-manual.md` | 完备开发手册（13 章）：模块开发、全局对象 API（含 §6 命名 MQ 客户端 Kafka/RabbitMQ 与长任务池、**池化任务与 cron（v0.1.28）**、**邮件投递 `Mail`/`mail`**、**LDAP 目录与鉴证（v0.1.28）**、**部署期常量 `vars`（v0.1.25）**、静态站点与 per-route meta、大整数与 i64、3xx 重定向原语 `json.redirect`（v0.1.26）、`_name_` 目录段（v0.1.27）、多静态站点（v0.1.27）、**嵌套 handler 组 + 组级 `.route`（v0.1.64；非动词键挂子组、动词/子组判别红线、handler 链派发）**、**WS 房间原语 `ws.join`/`broadcast`/`roomSize`（v0.1.30）**、**blob 上传直传 `blob.uploadUrl` + `PUT {base}/blob/{key}` 路由 + Range 206（v0.1.30）**、**`atob`/`btoa`/`crypto.getRandomValues` wasm 胶水面（v0.1.30）**、ext_boot.js 运行时扩展）、鉴权租户（含 **cookie 会话 + CSRF 双提交 + WS 握手守卫（v0.1.30）**）、测试、配置（含 **`route_timeouts`/`blob_upload_max_bytes`/`response_headers`（v0.1.30）**、**凭据密封 `secrets:` 段与 `oj secret keygen/seal/open`（v0.1.33；X25519 信封，v1 RSA 已移除）**、**资源根 key 多源选择 `--redis/--blob/--es/--broker/--kafka/--rabbit`（v0.1.34；`es`/`broker` 配置段放宽为命名 map，单对象写法兼容）**、**流式响应 / SSE（`json.stream`/`json.sse`，v0.1.35；绕过信封、心跳保活）、CORS（`server.cors` 段，v0.1.35；`credentials` 需显式 `origins`）、应用层 AES-GCM（`crypto.aesGcmEncrypt`/`aesGcmDecrypt`，v0.1.35；仅 AES-128/256）**、**流式查询 `db.stream`（v0.1.37；逐行拉取大结果集，回调 `onRow` + 异步迭代器两种形态、`AbortSignal` 取消；v0.1.38 起 ABI 10——第一方 db 插件真流式，第三方未实现槽位静默回落全量）**、**multipart 大文件流式落 blob（v0.1.38；`http.files[i].key`/`.url`，`http.file(i)` 仅小文件）**、构建发布（含 `oj exec`（v0.1.29；内联代码 `-e/--code` 与交互式 `--repl` v0.1.50；v0.1.60 无需 config 静默回落 + `-e`/REPL 单表达式回显））、**SQL 执行追踪与 dev 信封 `_sql` / `db.sqlProfile()`（v0.1.51；dev 默认开、参数脱敏）、**本地文件 `fs.*`（v0.1.53；jail 到 `fs.root`，未配置/越界抛 `NotCapable`，无 fd 流式）**、**外部命令执行 `exec.run`（v0.1.75；`platform.exec` argv 模板白名单 + 路径占位符校验，无 shell，缺省全 deny）**、运维、安全红线 |
-| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta、静态+动态 meta handler、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`）、雪花 id 生成/精确回写、302 到 blob 预签名 URL、路径参数路由 `_name_` vs `.route`、池化长任务 + cron（v0.1.28）、`oj exec` 数据修复（v0.1.29）、**大文件直传绕开 10MB/30s（v0.1.30）**、**cookie 会话 + CSRF + WS 握手守卫（v0.1.30）**、**WS 房间广播/presence（v0.1.30）**、**`exports`/pnpm 包解析约定（v0.1.30）**、**wasm 引擎包兼容性清单（v0.1.30）**、**流式响应 / SSE（v0.1.35）**、**前端跨域 CORS（v0.1.35）**、**应用层 AES-GCM（v0.1.35）**、**大表流式导出 `db.stream`（v0.1.37）**、**multipart 大文件流式落 blob（v0.1.38）**、**`oj exec` 内联代码与 REPL（v0.1.50；v0.1.60 无需 config + 单表达式回显）**、**SQL 执行追踪与 `db.sqlProfile()`（v0.1.51）**、**handler 读写本地文件 `fs`（v0.1.53）**、**新增登录来源：HTTP 表单 / CAS SSO（场景 28，含 JIT 建号与匿名路径）**、**引擎原生全文检索 `_shared/search`（场景 29）**、**内容版本化 CAS 修订/diff/回滚 `_shared/versions`（场景 30）**、**一个文件多个同动词端点：嵌套 handler 组 + 组级 `.route`（场景 31，v0.1.64）**、**特权模块受控挂载 + tar 解压安全落位（场景 33/34，v0.1.75；platform 段 + `exec.run` 三步范式）**——每篇给「配置 + 代码 + 验证 + 常见坑」 |
+| `scenarios.md` | **场景速查（照抄就能跑）**：公开分享页按租户读数据（`db.asTenant`）、SPA 深链回落与每页 meta、静态+动态 meta handler、`oj test` 测试库隔离、LIMIT 分页陷阱、匿名路径通配形态、多库项目按库迁移与对账（`--db`）、雪花 id 生成/精确回写、302 到 blob 预签名 URL、路径参数路由 `_name_` vs `.route`、池化长任务 + cron（v0.1.28）、`oj exec` 数据修复（v0.1.29）、**大文件直传绕开 10MB/30s（v0.1.30）**、**cookie 会话 + CSRF + WS 握手守卫（v0.1.30）**、**WS 房间广播/presence（v0.1.30）**、**`exports`/pnpm 包解析约定（v0.1.30）**、**wasm 引擎包兼容性清单（v0.1.30）**、**流式响应 / SSE（v0.1.35）**、**前端跨域 CORS（v0.1.35）**、**应用层 AES-GCM（v0.1.35）**、**大表流式导出 `db.stream`（v0.1.37）**、**multipart 大文件流式落 blob（v0.1.38）**、**`oj exec` 内联代码与 REPL（v0.1.50；v0.1.60 无需 config + 单表达式回显）**、**SQL 执行追踪与 `db.sqlProfile()`（v0.1.51）**、**handler 读写本地文件 `fs`（v0.1.53）**、**新增登录来源：HTTP 表单 / CAS SSO（场景 28，含 JIT 建号与匿名路径）**、**引擎原生全文检索 `_shared/search`（场景 29）**、**内容版本化 CAS 修订/diff/回滚 `_shared/versions`（场景 30）**、**一个文件多个同动词端点：嵌套 handler 组 + 组级 `.route`（场景 31，v0.1.64）**、**特权模块受控挂载 + tar 解压安全落位（场景 33/34，v0.1.75；platform 段 + `exec.run` 三步范式）**、**按模块版本观测打点与兼容分支 `http.module`（场景 36，v0.1.76；只读模块身份）**——每篇给「配置 + 代码 + 验证 + 常见坑」 |
 | `SKILL.md` | Claude Code 等 agent 的 skill 入口：工作流、红线、checklist、陷阱速查，按章节号引用手册 |
 | `global.d.ts` | handler 全局对象（json/http/db/kv/blob/bus/es/mail/Kafka/RabbitMQ/tasks…）的 TS 类型声明；拷进项目源码根即获得编辑器/agent 类型提示。与 oj 仓库 sample 项目同源；由发布流程 `cargo xtask build` 与本目录文档一同归置到 `bin/devkit/` |
 | `oj-modules.d.ts` | **`#` 导入别名的 ambient 兜底**（`declare module "#*"`）：oj 的 `#x`/`#/m/x` 是「引用方模块」相对别名，TS `paths` 无法表达，无法静态定位的 `#` 导入会被兜底为 `any`（不再报 TS2307）。**非模块** `.d.ts`，须与 `global.d.ts` 一并拷入项目并纳入 tsconfig `include` |
@@ -37,7 +37,18 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
-v0.1.75（未打标签，实施中）已落地部分：`crypto.verifyEd25519`（Ed25519 验签
+v0.1.76（未打标签）已落地部分：**`http.module`**——模块路由分发时注入的**只读**模块
+身份 `{name, version}`（dev 取 `src/<m>/manifest.yaml` 的 version，release 取
+`dist/<m>-<v>/manifest.yaml`；无模块上下文——任务桥 / WS 帧 / `run_with` / 启动期
+内省——为 `null`，页面 meta 合成派发在模块目录内**有值**）。对象已冻结：strict
+（ESM / api 文件 CJS 包装）下写 / delete 抛 `TypeError: Cannot assign to read only
+property …`，`require()` 引入的 CJS 代码（sloppy）写它静默无效——两条路径都改不了
+框架授信面（跨模块表归属守卫 / bound_db 重定向 / 平台特权换装），JS 只持快照拷贝。
+release 装配期新增 manifest version 与目录后缀一致性 fail-fast（stale / 手改 dist
+不再静默误判版本）。见 api-manual §6「http.module」小节与 §13 限制表、SKILL 陷阱
+速查与 scenarios 场景 36。
+
+v0.1.75 已落地部分：`crypto.verifyEd25519`（Ed25519 验签
 原语，双层语义——格式错抛错、验签不过返回 `false`；sig 仅标准 base64、公钥仅 32 字节
 原始 key 的 hex/base64）与 `crypto.sha256Hex` 二进制扩面（`Uint8Array`/`ArrayBuffer`
 入参；**行为变更**——非 string/二进制入参旧版经 `String()` 强转求摘要，现抛 TypeError）；
