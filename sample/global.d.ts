@@ -490,6 +490,26 @@ interface YamlApi {
   stringify(value: object): Promise<string>;
 }
 
+// server.*：平台级控制（v0.1.75，platform 特权）。
+// reloadConfig：进程内触发热更，与 `POST {base}/_system/config` 同一 executor 与串行锁。
+// 返回恒定形状五键：`unchanged=true` 时三清单为空数组；tasks/WS 上下文无归属 → NotCapable；
+// `oj test` / 嵌入式 → `reload not available`；并发撞锁 → `server.reloadConfig: reload in progress (busy)`。
+interface ServerReloadResult {
+  /** 代际 id（每次成功 swap +1；unchanged 时不变）。 */
+  generation: number;
+  /** 配置未变（归一后与原代等价）：true 时 applied/restart_pending/kept_listener 均为空数组。 */
+  unchanged: boolean;
+  /** 本轮实际生效的变更项（段/键清单）。 */
+  applied: string[];
+  /** 需重启进程才生效的项（如 db/redis/plugins 后端段、server 段）——提示重启，本进程不重建。 */
+  restart_pending: string[];
+  /** 本进程永久持有、不随热更变更的项（如 listener：server.port/host/证书路径）。 */
+  kept_listener: string[];
+}
+interface ServerApi {
+  reloadConfig(): Promise<ServerReloadResult>;
+}
+
 declare global {
   interface Function {
     route?: string;
@@ -573,6 +593,8 @@ declare global {
   const exec: ExecApi;
   // YAML 读写原语（v0.1.75，无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
   const yaml: YamlApi;
+  // server.*：平台级控制（v0.1.75，platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
+  const server: ServerApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。

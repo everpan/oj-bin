@@ -949,7 +949,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
   **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
   不写裸 `?` 运算符——它无法与占位符区分。
 
-### 总表（29 组）
+### 总表（35 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -964,7 +964,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
 | `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
-| `server.reloadConfig()` | 进程内触发热更（v0.1.76，`platform.modules` 特权）：与 `POST {base}/_system/config` 同一 executor 与串行锁，返回恒定形状三清单；`oj test` / 嵌入式抛 `reload not available`，见下「server」 |
+| `server.reloadConfig()` | 进程内触发热更（v0.1.75，`platform.modules` 特权）：与 `POST {base}/_system/config` 同一 executor 与串行锁，返回恒定形状（`generation` + 三清单 `applied`/`restart_pending`/`kept_listener`，`unchanged` 时三清单空）；`oj test` / 嵌入式抛 `reload not available`，见下「server」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -984,6 +984,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（src/sso/ 参考实现），详见第 10 章「sso」 |
+| `cert.generate / cert.renew` | JWS 证书生成/重签（RSA + RS256，纯内存不落盘；`oj-cert` 工具同源于此）。部署期证书签发用 `oj-cert`，运行期此全局仅当内存自签发/续期通道；详见第 10 章「证书门禁」 |
 | `crypto.sha256Hex / md5Hex / randomHex` | sha256/MD5 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留；**MD5 仅限非安全场景**，见第 13 章限制） |
 | `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
@@ -1676,7 +1677,7 @@ Error）：
 
 | 文案 | 类 | 触发 |
 |---|---|---|
-| `exec not configured (config platform: section missing)` | NotCapable | 未配 `platform.exec` 段 |
+| `exec not configured (config platform.exec section missing)` | NotCapable | 未配 `platform.exec` 段 |
 | `exec requires module ownership (request has no module context)` | NotCapable | tasks / WS 等无模块归属的上下文 |
 | `module '<m>' is not authorized for exec` | NotCapable | 模块不在 `platform.exec` 授权表 |
 | `exec requires fs.root (config fs: section missing)` | NotCapable | 未配 `fs:` 段 |
@@ -1739,7 +1740,7 @@ yaml.stringify(value: object): Promise<string>;  // 仅承诺机器产物（mani
 | `yaml.parse: timed out after 5s` | hang 兜底（预算内正常解析为毫秒级） |
 | `yaml.stringify: <e>` | 不可序列化值 |
 
-### server —— 平台级控制（v0.1.76，platform 特权）
+### server —— 平台级控制（v0.1.75，platform 特权）
 
 ```ts
 server.reloadConfig(): Promise<{

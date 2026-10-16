@@ -121,7 +121,7 @@ pub struct MigrateArgs {
     pub module: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
     pub db: Option<String>,
-    /// 输出格式（v0.1.76）：`json` = stdout 输出一行 `{"results":[...]}`（安装器
+    /// 输出格式（v0.1.75）：`json` = stdout 输出一行 `{"results":[...]}`（安装器
     /// 经 exec.run 消费；错误统一脱敏，任一模块失败退出码非 0 但 json 仍完整）；
     /// 缺省/`human` = 人读格式（不变）。
     pub format: Option<String>,
