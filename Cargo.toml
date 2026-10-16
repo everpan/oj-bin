@@ -63,6 +63,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 sea-query = "1.0"
 sha2 = "0.10"
+# md5Hex（v0.1.75）：与 sha2 同属 RustCrypto digest 0.10 家族，共享 generic-array 底座。
+md-5 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "macros",

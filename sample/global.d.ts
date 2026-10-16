@@ -566,6 +566,10 @@ declare global {
   interface Crypto {
     /** string 走 UTF-8 摘要；Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）。 */
     sha256Hex(data: string | Uint8Array | ArrayBuffer): string;
+    /** MD5 十六进制摘要。**MD5 已密码学破损，仅限非安全场景（缓存键/etag/旧系统兼容），
+     * 不得用于凭据/签名/完整性校验。** 入参分流同 sha256Hex：string 走 UTF-8；
+     * Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）；其余抛 TypeError。 */
+    md5Hex(data: string | Uint8Array | ArrayBuffer): string;
     randomHex(nBytes?: number): string;
     getRandomValues<T extends ArrayBufferView>(view: T): T;
     // AES-GCM 应用级加密（v0.1.35）：key 为 hex/base64 编码的原始 16/32 字节

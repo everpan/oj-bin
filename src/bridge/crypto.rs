@@ -188,6 +188,27 @@ pub fn op_sha256_hex(#[string] s: String) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// crypto.md5Hex(s)：MD5 已密码学破损，仅限非安全场景（缓存键/etag/旧系统兼容）。
+#[op2]
+#[string]
+pub fn op_md5_hex(#[string] s: String) -> String {
+    use md5::Digest;
+    let mut h = md5::Md5::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// crypto.md5Hex 二进制扩面：对任意字节序列（Uint8Array view）求 MD5 hex
+/// （字符串走 op_md5_hex，bootstrap.js 按类型分流）。
+#[op2]
+#[string]
+pub fn op_md5_bytes(#[buffer] data: JsBuffer) -> String {
+    use md5::Digest;
+    let mut h = md5::Md5::new();
+    h.update(&data);
+    format!("{:x}", h.finalize())
+}
+
 /// crypto.verifyEd25519(publicKey, msg, sigBase64)：Ed25519 验签（纯原语，bundle 签名校验用）。
 /// publicKey 为 hex/base64 编码的 32 字节原始公钥（不支持 PEM/SPKI）；msg 为 UTF-8 字符串；
 /// sig 仅 base64（STANDARD / NO_PAD，base64url 不支持）。格式错（base64 非法、公钥 ≠ 32 字节、
@@ -601,6 +622,48 @@ mod tests {
             d["nonUtf8"], "b3d510ef04275ca8e698e5b3cbb0ece3949ef9252f0cdc839e9ee347409a2209",
             "{v}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn md5_hex_string_binary_and_type_gates() {
+        // RFC 1321 向量 + 空串 + 二进制/非 UTF-8（期望值经 python3 hashlib 独立预计算，
+        // 不用实现自身当期望）+ 非 string/二进制入参 TypeError（与 sha256Hex 同门禁）。
+        let b = bridge(None);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const u8 = new Uint8Array([1, 2, 3]);
+                    let tNum = null, tNull = null;
+                    try { crypto.md5Hex(123); } catch (e) { tNum = String(e); }
+                    try { crypto.md5Hex(null); } catch (e) { tNull = String(e); }
+                    json.ok({
+                        abc: crypto.md5Hex("abc"),
+                        empty: crypto.md5Hex(""),
+                        digest: crypto.md5Hex("message digest"),
+                        bytes: crypto.md5Hex(u8),
+                        ab: crypto.md5Hex(u8.buffer),
+                        nonUtf8: crypto.md5Hex(new Uint8Array([0xff, 0xfe])),
+                        tNum, tNull,
+                    });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        let d = &v["data"];
+        // RFC 1321 §A.5 测试套件抽查
+        assert_eq!(d["abc"], "900150983cd24fb0d6963f7d28e17f72", "{v}");
+        assert_eq!(d["empty"], "d41d8cd98f00b204e9800998ecf8427e", "{v}");
+        assert_eq!(d["digest"], "f96b697d7cb7938d525a2f31aaf161d0", "{v}");
+        // 二进制：Uint8Array 与等价 ArrayBuffer 一致
+        assert_eq!(d["bytes"], "5289df737df57326fcdd22597afb1fac", "{v}");
+        assert_eq!(d["ab"], "5289df737df57326fcdd22597afb1fac", "{v}");
+        // 非 UTF-8 字节不炸且结果正确
+        assert_eq!(d["nonUtf8"], "f3b25701fe362ec84616a93a45ce9998", "{v}");
+        // 非 string/二进制 → TypeError
+        assert!(d["tNum"].as_str().unwrap().contains("TypeError"), "{v}");
+        assert!(d["tNull"].as_str().unwrap().contains("TypeError"), "{v}");
     }
 
     #[test]

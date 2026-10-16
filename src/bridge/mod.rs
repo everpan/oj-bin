@@ -444,6 +444,8 @@ deno_core::extension!(
         crypto::op_bcrypt_verify,
         crypto::op_sha256_hex,
         crypto::op_sha256_bytes,
+        crypto::op_md5_hex,
+        crypto::op_md5_bytes,
         crypto::op_ed25519_verify,
         crypto::op_random_hex,
         crypto::op_crypto_random,

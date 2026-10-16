@@ -94,6 +94,8 @@ import {
   op_random_hex,
   op_sha256_hex,
   op_sha256_bytes,
+  op_md5_hex,
+  op_md5_bytes,
   op_ed25519_verify,
   op_crypto_random,
   op_aes_gcm_encrypt,
@@ -1029,6 +1031,14 @@ globalThis.crypto = Object.assign(globalThis.crypto || {}, {
     if (typeof data === "string") return op_sha256_hex(data);
     if (data instanceof ArrayBuffer) data = new Uint8Array(data);
     return op_sha256_bytes(data);
+  },
+  // md5: BROKEN cryptographically - non-security uses only (cache keys, etags,
+  // legacy compat). Never for credentials/signatures/integrity checks.
+  // Same dispatch shape as sha256Hex.
+  md5Hex: (data) => {
+    if (typeof data === "string") return op_md5_hex(data);
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+    return op_md5_bytes(data);
   },
   randomHex: (n) => op_random_hex(n === undefined ? null : n | 0),
   // WebCrypto shape: fill any TypedArray view (wasm-bindgen glue depends on it).

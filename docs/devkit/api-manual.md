@@ -955,7 +955,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（src/sso/ 参考实现），详见第 10 章「sso」 |
-| `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
+| `crypto.sha256Hex / md5Hex / randomHex` | sha256/MD5 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留；**MD5 仅限非安全场景**，见第 13 章限制） |
 | `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
@@ -2067,6 +2067,7 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 | API | 签名 | 说明 |
 |---|---|---|
 | `crypto.sha256Hex` | `sha256Hex(data: string \| Uint8Array \| ArrayBuffer): string` | UTF-8 编码后的 sha256 十六进制摘要；v0.1.75 起支持二进制入参（`Uint8Array`/`ArrayBuffer` 自动归一，非 UTF-8 字节不炸）。**行为变更（v0.1.75）**：非 string/二进制入参（number/null 等）旧版经 `String()` 强转求摘要，现抛 TypeError（fail-loud） |
+| `crypto.md5Hex` | `md5Hex(data: string \| Uint8Array \| ArrayBuffer): string` | MD5 十六进制摘要（v0.1.75）。入参分流同 `sha256Hex`：string 走 UTF-8；`Uint8Array`/`ArrayBuffer` 走原始字节摘要（非 UTF-8 字节安全）；其余抛 TypeError。**MD5 已密码学破损，仅限非安全场景（缓存键/etag/旧系统兼容），不得用于凭据/签名/完整性校验** |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
 | `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | 填充随机字节（v0.1.30） |
 | `crypto.aesGcmEncrypt` | `aesGcmEncrypt(plaintext: string, key: string): string` | AES-GCM 对称加密（v0.1.35）：明文 UTF-8，密钥 16/32 字节 hex 或 base64，返回 `base64(nonce ‖ ct ‖ tag)` |
@@ -3694,6 +3695,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |
 | `crypto.verifyEd25519` 编码面（v0.1.75） | `sigBase64` 仅标准 base64（STANDARD/NO_PAD，**base64url 不支持**）；`msg` 仅 UTF-8 字符串；`publicKey` 须 hex/base64 编码的 **32 字节原始 key**（**PEM/SPKI 不支持**）。格式错抛错（文案 `verifyEd25519: …` 起头），格式合法验签不过返回 `false` |
 | `crypto.sha256Hex` 非 string/二进制入参抛 TypeError（v0.1.75 **行为变更**） | 旧版把 number/null 等经 `String()` 强转求摘要（静默产出垃圾摘要）；现 fail-loud 抛 TypeError——旧脚本传非 string/二进制入参的要先改（`String(x)` 显式转或改传 `Uint8Array`） |
+| `crypto.md5Hex` 已密码学破损（v0.1.75） | MD5 仅限**非安全场景**（缓存键/etag/旧系统兼容），**不得用于凭据/签名/完整性校验**；入参分流同 `sha256Hex`（string 走 UTF-8，`Uint8Array`/`ArrayBuffer` 走原始字节，其余抛 TypeError） |
 | `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面本版仅 fs 轴扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）；tasks/WS 上下文无模块归属 → 特权恒不可用；`exec` 段本版解析不生效 |
 | `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 
