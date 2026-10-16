@@ -2239,6 +2239,94 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 装配期正例（ojm 批次 D4 补遗的 sample platform demo 同形）：受控挂载根下部署
+    /// `ojm-demo` 模块、trusted_paths 指向真实存在的 config.yaml、缺省 fs grant 缺失下
+    /// `build_platform_grants` 仍能产出含 ojm-demo 的特权授权且未 fail-fast。
+    /// 同时验证 mounts 三前缀（/v1/api=src、/=dist、/_platform=platform-root）互不重叠、
+    /// 不触发 anti-squatting 绊线。
+    #[test]
+    fn platform_grants_sample_demo_assembles() {
+        let dir = std::env::temp_dir().join(format!("oj-platdemo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        // 模拟 sample 布局：src / dist / platform-root/ojm-demo（含 manifest）。
+        std::fs::create_dir_all(dir.join("src/user")).unwrap();
+        std::fs::write(
+            dir.join("src/user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::create_dir_all(dir.join("platform-root/ojm-demo")).unwrap();
+        std::fs::write(
+            dir.join("platform-root/ojm-demo/manifest.yaml"),
+            "name: ojm-demo\ndesc: 平台特权演示\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        // trusted_paths 指向真实存在的 config.yaml。
+        std::fs::write(dir.join("config.yaml"), "fs:\n  root: \".\"\n").unwrap();
+
+        let src = dir.join("src");
+        let dist = dir.join("dist");
+        let proot = dir.join("platform-root");
+        // 三挂载树：与 sample 同形（/_platform 指向 platform-root，且互不为父子）。
+        let trees = vec![
+            (src.clone(), true),
+            (dist.clone(), true),
+            (proot.clone(), true),
+        ];
+        let installed: std::collections::HashSet<String> = trees
+            .iter()
+            .flat_map(|(r, ts)| {
+                crate::manifest::discover(r, *ts)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(n, _)| n)
+            })
+            .collect();
+        assert!(installed.contains("ojm-demo") && installed.contains("user"));
+
+        let cfg = Config {
+            platform: Some(only_js::config::PlatformCfg {
+                modules: vec!["ojm-demo".to_string()],
+                root: Some("./platform-root".to_string()),
+                trusted_paths: vec!["./config.yaml".to_string()],
+                exec: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "ojm-demo".to_string(),
+                        only_js::config::ExecAllowCfg {
+                            allow: vec!["tar -tzf ${path:archive}".to_string()],
+                            env: vec![],
+                        },
+                    );
+                    m
+                },
+            }),
+            ..Default::default()
+        };
+
+        // 缺省 fs grant（fs: 未配置）→ 装配不应 fail-fast，且特权集合含 ojm-demo。
+        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap();
+        let pg = pg.expect("platform grant present");
+        assert!(pg.modules.contains("ojm-demo"));
+        assert!(
+            eg.expect("exec grant present")
+                .per_module
+                .contains_key("ojm-demo"),
+            "exec 授权应含 ojm-demo"
+        );
+        // trusted_paths 已并入（受控根缺省 = [fs.root]，此处 fs 未配 → 仅 trusted）。
+        assert!(
+            pg.trusted.iter().any(|t| t.ends_with("config.yaml")),
+            "trusted_paths 应含 config.yaml"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 受控挂载根归属（BDD 补充，设计稿 §1.2 ①）：platform.root 下的模块经
     /// 真实装配获得归属——特权模块读 trusted 文件可及、普通挂载树模块同路径
     /// 仍 NotCapable；归属名喂给 assert_platform 直接调用逐态验证。
