@@ -136,6 +136,10 @@ exec.run(argv: string[], opts?: {
 
 ### 1.4 tar 解压组合（模板 + 后置校验）
 
+> 范围注记：本批次交付 `exec` 原语（模板 + 路径占位符校验 + 组杀）以支撑 `tar` 调用；
+> 本节的 walk 后置校验、原子落位与方言探测属 **ojm-installer（oj-module 仓库）** 的 JS 编排，
+> 不在本批次代码范围内（见 §0 范围声明）。
+
 - 解压：`exec.run(["tar","-xzf","<archive>","-C","<dest>"])`（模板 literal 定死，
   两路径占位符受 §1.1 校验）。
 - **安全判定后置**（安全评审意见 7 修复）：`tar -tzf` 预检降级为快速失败优化；
@@ -148,6 +152,8 @@ exec.run(argv: string[], opts?: {
 - 运行环境无 `tar` → exec.run 抛错点名（部署文档写明依赖）。
 
 ### 1.5 原子落位次序（产品评审意见 3 补）
+
+> 范围注记：同 §1.4，本节 5 步原子落位属 ojm-installer 编排，本批次仅交付其依赖的 exec 原语。
 
 1. 解压到 `<dist>/.staging/<name>-<version>-<rand>/`（jail/受控路径内）；
 2. walk 校验（§1.4）；
