@@ -34,6 +34,7 @@ pub mod db_backend;
 mod embedded_js;
 mod envelope;
 mod es;
+pub mod exec;
 pub(crate) mod ffi;
 pub mod frame_pool;
 pub mod fs;
@@ -54,10 +55,12 @@ pub mod mq;
 mod named_registry;
 pub mod oidc;
 mod placeholder;
+pub mod platform;
 pub mod plugin_loader;
 mod plugins_op;
 mod query;
 mod registry;
+pub mod reload_bridge;
 mod runtime;
 pub mod sql_trace;
 pub mod sso;
@@ -66,6 +69,7 @@ pub mod task_pool;
 pub mod transpile;
 mod vars;
 mod ws;
+mod yaml;
 
 pub use accessor_sqlx::SqlxAccessor;
 pub use auth::AuthGuard;
@@ -204,6 +208,17 @@ pub struct StableState {
     pub input_contracts: Option<Arc<std::sync::RwLock<crate::contract::InputContractRegistry>>>,
     /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 报 PermissionDenied。
     pub fs: Option<Arc<fs::FsGrant>>,
+    /// 平台特权授权（config `platform:` 段，ojm 批次）；None = 平台 API 恒
+    /// "platform not configured"。见 [`platform::PlatformGrant`] 与 [`platform::assert_platform`]。
+    pub platform: Option<Arc<platform::PlatformGrant>>,
+    /// exec 授权（config `platform.exec:` 段；阶段 3 `exec.run` 消费）；
+    /// None = exec 恒 NotCapable。
+    pub exec: Option<Arc<platform::ExecGrant>>,
+    /// 热更触发槽（ojm PR-3）：`oj serve` 装配期后填的 executor 闭包；槽空 =
+    /// 非 serve 形态（`oj test` / 嵌入式）→ op 报 `reload not available`。
+    /// 槽指针构造期冻结、内容后填（不触 `Arc::get_mut` 红线）；桥池多实例
+    /// 共享同一槽（同一 `Arc<OnceLock>`），每代热更重建桥后依旧有效。
+    pub reload: Arc<reload_bridge::ReloadSlot>,
     /// 泛型轴注册表（插件自报的非类型化轴；bootstrap `axis(name)` 的数据源）。
     /// 空表 = 无泛型轴，`axis(name).op()` 报 unknown axis 并列可用轴名。
     pub generic_axes: generic_axis::GenericAxisRegistry,
@@ -267,6 +282,16 @@ pub struct Extras {
     /// 本地文件系统授权（config `fs:` 段；v0.1.53）；None = fs.* 双轴 deny
     /// （PermissionDenied）。只读语义见 [`fs::FsGrant`]。
     pub fs: Option<Arc<fs::FsGrant>>,
+    /// 平台特权授权（config `platform:` 段，ojm 批次）；None = assert_platform 恒
+    /// "platform not configured"。见 [`platform::PlatformGrant`]。
+    pub platform: Option<Arc<platform::PlatformGrant>>,
+    /// exec 授权（config `platform.exec:` 段；阶段 3 消费）；None = exec 恒 NotCapable。
+    pub exec: Option<Arc<platform::ExecGrant>>,
+    /// 热更触发槽（ojm PR-3）：缺省空槽 = `server.reloadConfig` 报
+    /// `reload not available`（Extras 是 Default 的，`oj test` / 嵌入式零接线
+    /// 即 fail-closed）。`oj serve` 装配层传入共享槽 Arc 并在 ReloadState
+    /// 就绪后 `set`（槽位后填，照搬 `ReloadState::set_executor` 解环惯例）。
+    pub reload: Arc<reload_bridge::ReloadSlot>,
     /// 泛型轴注册表（None = 空 registry，`axis(name)` 一律报 unknown axis——与
     /// vars 同哲学：未注入 = 空表而非 None）。
     pub generic_axes: Option<generic_axis::GenericAxisRegistry>,
@@ -431,6 +456,10 @@ deno_core::extension!(
         crypto::op_bcrypt_hash,
         crypto::op_bcrypt_verify,
         crypto::op_sha256_hex,
+        crypto::op_sha256_bytes,
+        crypto::op_md5_hex,
+        crypto::op_md5_bytes,
+        crypto::op_ed25519_verify,
         crypto::op_random_hex,
         crypto::op_crypto_random,
         crypto::op_aes_gcm_encrypt,
@@ -449,6 +478,10 @@ deno_core::extension!(
         ldap::op_ldap_call,
         generic_axis::op_axis_call,
         fs::op_fs_resolve,
+        exec::op_exec_run,
+        yaml::op_yaml_parse,
+        yaml::op_yaml_stringify,
+        reload_bridge::op_server_reload_config,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
@@ -760,6 +793,9 @@ impl Bridge {
             vars: extras.vars,
             js_heap_limit: extras.js_heap_limit,
             fs: extras.fs,
+            platform: extras.platform,
+            exec: extras.exec,
+            reload: extras.reload,
             generic_axes: extras.generic_axes.unwrap_or_default(),
             oj_info: extras
                 .oj_info
@@ -784,6 +820,12 @@ impl Bridge {
     /// 替换 handler 仓库（生产用嵌入 map，开发用 FS 热重载）。
     pub fn set_handlers(&mut self, handlers: HandlerStore) {
         self.handlers = handlers;
+    }
+
+    /// StableState 句柄（测试内省用；生产装配侧持 Backend::stable 单源）。
+    #[cfg(test)]
+    pub(crate) fn stable_for_test(&self) -> Arc<StableState> {
+        self.pool.stable().clone()
     }
 
     /// 取 inspector 句柄（若以 inspect=true 构造且已有 checkout 的 runtime 持有时可用）。
@@ -829,12 +871,28 @@ impl Bridge {
         module: Option<&str>,
     ) -> Result<JsRuntime, RunError> {
         let rt = self.pool.checkout().await?;
+        let stable = self.pool.stable().clone();
         {
             let op_state = runtime::op_state(&rt);
             let mut g = op_state.borrow_mut();
-            let rs = g.borrow_mut::<ReqState>();
-            rs.reset(req);
-            rs.module = module.map(|s| s.to_string());
+            {
+                let rs = g.borrow_mut::<ReqState>();
+                rs.reset(req);
+                rs.module = module.map(|s| s.to_string());
+            }
+            // fs 轴第二道防线按模块特权级换装（ojm 批次，设计稿 §1.6）：特权模块
+            // （ReqState.module ∈ platform.modules）的 read/write 授权面 =
+            // fs.root ∪ trusted_paths；非特权 = 既有 fs.root 单集合（行为不变）。
+            // 门面裁决在 fs::op_fs_resolve（特权判定 + trusted 集合放行），此处保证
+            // deno op 自身的权限检查与之同口径——trusted 路径的可及性缺这步会被
+            // deno_permissions 拒掉。池中归还的 runtime 仍带上一请求的容器；所有
+            // 借出路径（HTTP/run_with/任务/WS/内省，含 inspector 挂载前借出）都先经
+            // 本函数重置，特权容器不跨请求生效。
+            g.put(fs::container_for_module(
+                stable.fs.as_deref(),
+                stable.platform.as_deref(),
+                module,
+            ));
         }
         Ok(rt)
     }
@@ -867,11 +925,18 @@ impl Bridge {
 
     /// 取 inspector 句柄（`inspect=true` 构造时有效；否则 None）：借出一个 runtime（已完成
     /// boot）取句柄后立即归还。
+    ///
+    /// 借出**必须**走 `checkout_reset`（非裸 `pool.checkout`）：池中归还的 runtime 仍带
+    /// 上一请求的 OpState，若那是特权请求，残留的特权 PermissionsContainer 会被挂上的
+    /// 调试器求值触达。checkout_reset 以 `module=None` 重置，容器即非特权基线形态。
     pub async fn inspector(&self) -> Option<Rc<deno_core::JsRuntimeInspector>> {
         if !self.inspect {
             return None;
         }
-        let rt = self.pool.checkout().await.ok()?;
+        let rt = self
+            .checkout_reset(RequestInfo::default(), None)
+            .await
+            .ok()?;
         let insp = rt.inspector();
         self.pool.checkin(rt);
         Some(insp)
@@ -2222,6 +2287,9 @@ mod tests {
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
             fs: None,
+            platform: None,
+            exec: None,
+            reload: Arc::new(std::sync::OnceLock::new()),
             generic_axes: Arc::new(HashMap::new()),
             oj_info: Arc::new(serde_json::json!({})),
         });
@@ -4097,4 +4165,101 @@ mod tests {
 
     // ws 会话/帧池用例（lifecycle、钩子契约、毒化半径）在 frame_pool::tests——
     // 它们消费 RoutePool/ConnHandle，辅助同置一处（ws_test_bridge/pool_dir）。
+
+    /// inspector 借出基线化（评审修复）：特权请求归池后，`inspector()` 经
+    /// checkout_reset 重置容器——随后从池中**裸借出**（不再重置）探测 OpState，
+    /// trusted 路径必须已不可及（修复前：裸 checkout 不重置，特权容器残留可触达）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspector_checkout_resets_privileged_container() {
+        use deno_permissions::{PermissionState, PermissionsContainer};
+
+        let root = std::env::temp_dir().join(format!("oj-insp-{}-root", std::process::id()));
+        let trusted_dir =
+            std::env::temp_dir().join(format!("oj-insp-{}-trusted", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&trusted_dir).unwrap();
+        // macOS 下 temp_dir 经 symlink：统一 canonical，防前缀比对被形态打穿。
+        let root = root.canonicalize().unwrap();
+        let trusted_dir = trusted_dir.canonicalize().unwrap();
+        let in_root = root.join("in.txt");
+        let in_trusted = trusted_dir.join("cfg.txt");
+        std::fs::write(&in_root, b"1").unwrap();
+        std::fs::write(&in_trusted, b"2").unwrap();
+
+        // 特权模块归属（模块目录键 = §5.3 装配形态）+ fs/platform grants。
+        let (base, api) = mod_fx(&[(
+            "plat/api.js",
+            "export async function ping() { json.ok(1); }\nexport default { ping };\n",
+        )]);
+        let modules: Arc<HashMap<String, ModuleCtx>> = Arc::new(HashMap::from([(
+            base.join("plat").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "plat".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        let fs_grant = Arc::new(fs::FsGrant::new(&root, false).unwrap());
+        let platform = Arc::new(
+            platform::PlatformGrant::new(
+                vec!["plat".into()],
+                std::slice::from_ref(&trusted_dir),
+                Some(&fs_grant.root),
+            )
+            .unwrap(),
+        );
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            true, // inspect=true：inspector() 借出路径才生效
+            Some(Arc::new(LoaderShared {
+                project_root: base.clone(),
+                ts: false,
+            })),
+            Extras {
+                modules,
+                fs: Some(fs_grant),
+                platform: Some(platform),
+                ..Default::default()
+            },
+        );
+        let t = std::time::Duration::from_secs(5);
+
+        // ① 特权请求：run_module 注入归属 → checkout_reset 换装特权容器 → 归池残留。
+        let cap = b
+            .run_module(&api, "ping", RequestInfo::default(), t)
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200);
+
+        // ② inspector 借出（修复点：内部 checkout_reset 以 module=None 基线化）。
+        assert!(b.inspector().await.is_some());
+
+        // ③ 裸借出探测（LIFO 取回同一 runtime，不经任何重置）：
+        //    trusted 路径不可及、root 内可及——特权容器已重置回基线。
+        let rt = b.pool.checkout().await.unwrap();
+        let probe = {
+            let op_state = runtime::op_state(&rt);
+            let g = op_state.borrow();
+            let c = g.borrow::<PermissionsContainer>();
+            (
+                c.query_read(Some(in_trusted.to_string_lossy().as_ref()))
+                    .unwrap(),
+                c.query_read(Some(in_root.to_string_lossy().as_ref()))
+                    .unwrap(),
+            )
+        };
+        b.pool.checkin(rt);
+        assert_eq!(
+            probe.0,
+            PermissionState::Prompt,
+            "trusted must be unreachable after inspector reset"
+        );
+        assert_eq!(
+            probe.1,
+            PermissionState::Granted,
+            "root must stay reachable"
+        );
+    }
 }

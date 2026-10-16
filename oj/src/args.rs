@@ -116,10 +116,15 @@ pub struct MigrateArgs {
     pub dir: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
     pub baseline: bool,
-    /// 只迁移指定模块。
+    /// 只迁移指定模块。裸模块名精确匹配（现状）；未命中时按 dist 版本目录名
+    /// `<module>-<version>` 定向（dev 树目录名即裸名，版本目录定向仅 dist 有意义）。
     pub module: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
     pub db: Option<String>,
+    /// 输出格式（v0.1.75）：`json` = stdout 输出一行 `{"results":[...]}`（安装器
+    /// 经 exec.run 消费；错误统一脱敏，任一模块失败退出码非 0 但 json 仍完整）；
+    /// 缺省/`human` = 人读格式（不变）。
+    pub format: Option<String>,
 }
 
 /// `oj test fixture [-c config] [-d dir] [--db name] [--module M]`。
@@ -317,8 +322,12 @@ enum Commands {
         /// 存量库接入门：≤head 的迁移全部记为已应用而不执行（P0 建过表的库）
         #[arg(long)]
         baseline: bool,
-        /// 只迁移指定模块（src 首层子目录 / dist 模块名）
+        /// 只迁移指定模块（裸模块名 / dist 版本目录名 `<module>-<version>`）
         module: Option<String>,
+        /// 输出格式：`json`（stdout 一行 `{"results":[...]}`，错误脱敏）；
+        /// 缺省人读
+        #[arg(long)]
+        format: Option<String>,
     },
     /// 进程内真实运行时跑 *.test.ts；`oj test fixture` 灌演示数据。
     Test {
@@ -648,6 +657,7 @@ fn to_command(cli: Cli) -> Command {
             db,
             baseline,
             module,
+            format,
         } => Command::Migrate(MigrateArgs {
             config,
             site,
@@ -655,6 +665,7 @@ fn to_command(cli: Cli) -> Command {
             baseline,
             module,
             db,
+            format,
         }),
         Commands::Schema {
             command: SchemaCmd::Diff { config, dir, db },

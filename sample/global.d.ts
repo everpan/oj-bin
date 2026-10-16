@@ -446,6 +446,70 @@ interface VarsApi {
   get(name: string): string | null;
 }
 
+// exec.*：外部命令执行（v0.1.75，config `platform.exec` 段授权）。
+// 授权模型 = argv 模板白名单（literal token 逐字相等 + ${path:NAME}/${raw:NAME} 占位符
+// 恰吸收一个 token）+ 无 shell：argv 必须恰命中一条授权模板（歧义命中报错，不静默择一）。
+// ${path:} 值按路径校验（fs.root ∪ trusted_paths）；${raw:} 拒 `-` 开头与绝对形态。
+// exec 授权与 platform.modules 相互独立；缺省全 deny（fail-closed）。
+interface ExecRunOpts {
+  /** 缺省 30_000，硬上限 600_000（超出钳制）。大 DDL / 大 stdin 显式调大。 */
+  timeoutMs?: number;
+  /** 一次性写入子进程 stdin 后关闭写端；写入也在超时窗口内。 */
+  stdin?: string;
+}
+interface ExecResult {
+  /** 进程退出码：非 0 也正常返回（不抛错）；信号终止 = 128 + signal。 */
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+interface ExecApi {
+  /**
+   * 执行一条授权模板匹配后的外部命令（无 shell；cwd 钉在 fs.root，env 默认空表仅
+   * 白名单透传、PATH 不继承；argv[0] 为宿主解析后的绝对路径——"oj" 即服务进程自身）。
+   * 抛错边界：未授权 / 模板失配 / 歧义 / 路径越界 → NotCapable；超时（整组击杀）/
+   * 输出超限（stdout+stderr 合计 10MB） / spawn 失败 / 非 UTF-8 输出 → 普通 Error。
+   * 未配 `fs:` 段或 tasks/WS 上下文（无模块归属）恒拒。
+   */
+  run(argv: string[], opts?: ExecRunOpts): Promise<ExecResult>;
+}
+
+// yaml.*：YAML 读写原语（v0.1.75，无特权，始终可用）。
+// parse: 三预算防炸弹（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128），Rust 阻塞池
+// 执行 + 独立 5s deadline；重复键后键覆盖；多文档 / 非字符串键 / NaN·Inf 拒绝；
+// 非法 YAML 抛带行列错误；超 2^53-1 的整数为十进制字符串（json.ok 安全）。
+// stringify: 仅承诺机器产物（manifests.yaml）往返——serde_yaml 丢注释，
+// 禁用于 config.yaml 回写（走文本手术）。
+interface YamlApi {
+  parse(text: string): Promise<unknown>;
+  /**
+   * 仅承诺机器产物（manifests.yaml）往返——serde_yaml 丢注释，禁用于 config.yaml
+   * 回写（走文本手术）。对象键输出保留 JS 对象键插入序（整数型键先行），不排序；
+   * 需确定序请在 stringify 前自行归序。
+   */
+  stringify(value: object): Promise<string>;
+}
+
+// server.*：平台级控制（v0.1.75，platform 特权）。
+// reloadConfig：进程内触发热更，与 `POST {base}/_system/config` 同一 executor 与串行锁。
+// 返回恒定形状五键：`unchanged=true` 时三清单为空数组；tasks/WS 上下文无归属 → NotCapable；
+// `oj test` / 嵌入式 → `reload not available`；并发撞锁 → `server.reloadConfig: reload in progress (busy)`。
+interface ServerReloadResult {
+  /** 代际 id（每次成功 swap +1；unchanged 时不变）。 */
+  generation: number;
+  /** 配置未变（归一后与原代等价）：true 时 applied/restart_pending/kept_listener 均为空数组。 */
+  unchanged: boolean;
+  /** 本轮实际生效的变更项（段/键清单）。 */
+  applied: string[];
+  /** 需重启进程才生效的项（如 db/redis/plugins 后端段、server 段）——提示重启，本进程不重建。 */
+  restart_pending: string[];
+  /** 本进程永久持有、不随热更变更的项（如 listener：server.port/host/证书路径）。 */
+  kept_listener: string[];
+}
+interface ServerApi {
+  reloadConfig(): Promise<ServerReloadResult>;
+}
+
 declare global {
   interface Function {
     route?: string;
@@ -525,6 +589,12 @@ declare global {
   const sess: WsSess;
   const blob: BlobApi;
   const fs: FsApi;
+  // 外部命令执行（v0.1.75，platform.exec 段授权；见 ExecApi JSDoc 与 api-manual §6「exec」）。
+  const exec: ExecApi;
+  // YAML 读写原语（v0.1.75，无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
+  const yaml: YamlApi;
+  // server.*：平台级控制（v0.1.75，platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
+  const server: ServerApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。
@@ -564,7 +634,12 @@ declare global {
   // 返回原 view，非 view 抛 TypeError，单次 ≤65536 字节（对齐 WebCrypto；lib.dom 的
   // 同名声明只是兜底，运行时是 oj 实现）。
   interface Crypto {
-    sha256Hex(s: string): string;
+    /** string 走 UTF-8 摘要；Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）。 */
+    sha256Hex(data: string | Uint8Array | ArrayBuffer): string;
+    /** MD5 十六进制摘要。**MD5 已密码学破损，仅限非安全场景（缓存键/etag/旧系统兼容），
+     * 不得用于凭据/签名/完整性校验。** 入参分流同 sha256Hex：string 走 UTF-8；
+     * Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）；其余抛 TypeError。 */
+    md5Hex(data: string | Uint8Array | ArrayBuffer): string;
     randomHex(nBytes?: number): string;
     getRandomValues<T extends ArrayBufferView>(view: T): T;
     // AES-GCM 应用级加密（v0.1.35）：key 为 hex/base64 编码的原始 16/32 字节
@@ -572,6 +647,11 @@ declare global {
     // base64(nonce12 ‖ ct ‖ tag16) 出。密钥缺失/非法由调用方 json.fail。
     aesGcmEncrypt(plaintext: string, key: string): string;
     aesGcmDecrypt(ciphertext: string, key: string): string;
+    /** Ed25519 验签：publicKey 为 hex/base64 编码的 **32 字节原始公钥**（不支持 PEM/SPKI）；
+     * msg 为 UTF-8 字符串；sigBase64 仅 base64（STANDARD/NO_PAD，不支持 base64url）。
+     * 验签通过返回 true，签名/密钥不匹配返回 false；格式错（公钥 ≠ 32 字节、
+     * sig 解码后 ≠ 64 字节、base64 非法）抛错。 */
+    verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean;
   }
 
   // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----

@@ -96,10 +96,15 @@ platform:
   - **tasks 与 WS 上下文无归属**（`task_connect`/`ws_connect` 以 `module=None`
     checkout）→ 平台 API 与 exec 恒 NotCapable。若安装器需要任务化触发，须另行改造
     任务路径的模块归属推导（独立改造项，不默认可用）。
-  - **抢注防护**：模块名来自第三方 bundle manifest，按名锚定可被抢注。装配期校验：
-    `platform.modules` 列出的模块，其物理目录必须位于**平台受控目录**（config/mount
-    解析的市场安装树之外）；特权名单中的名字出现在安装树内 → 装配 fail-fast。
-    api-manual 写明：「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断。
+  - **抢注防护与受控挂载**：模块名来自第三方 bundle manifest，按名锚定可被抢注。
+    装配期校验：`platform.modules` 列出的模块名出现在**市场安装树**（config mounts /
+    `-d` dist 树的 discover 产物）→ 装配 fail-fast。特权模块的正经部署形态是
+    **`platform.root` 受控挂载根**（config 显式指向的本地目录，如 `./platform-modules`）：
+    ① 该根下的模块同样经 discover 产生归属（目录祖先命中机制不变）；② 其产物模块名
+    **豁免**抢注检查；③ `platform.modules` 名单必须是 `platform.root` 产物名的子集
+    （名单中存在但受控根下不存在的模块 → 装配 fail-fast，防「有特权无实现」的悬空
+    配置）。api-manual 写明：「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断；
+    特权模块只能由部署方放入 `platform.root`。
 
 ### 1.3 `exec` 全局（`src/bridge/exec.rs` 新文件）
 
@@ -131,6 +136,10 @@ exec.run(argv: string[], opts?: {
 
 ### 1.4 tar 解压组合（模板 + 后置校验）
 
+> 范围注记：本批次交付 `exec` 原语（模板 + 路径占位符校验 + 组杀）以支撑 `tar` 调用；
+> 本节的 walk 后置校验、原子落位与方言探测属 **ojm-installer（oj-module 仓库）** 的 JS 编排，
+> 不在本批次代码范围内（见 §0 范围声明）。
+
 - 解压：`exec.run(["tar","-xzf","<archive>","-C","<dest>"])`（模板 literal 定死，
   两路径占位符受 §1.1 校验）。
 - **安全判定后置**（安全评审意见 7 修复）：`tar -tzf` 预检降级为快速失败优化；
@@ -143,6 +152,8 @@ exec.run(argv: string[], opts?: {
 - 运行环境无 `tar` → exec.run 抛错点名（部署文档写明依赖）。
 
 ### 1.5 原子落位次序（产品评审意见 3 补）
+
+> 范围注记：同 §1.4，本节 5 步原子落位属 ojm-installer 编排，本批次仅交付其依赖的 exec 原语。
 
 1. 解压到 `<dist>/.staging/<name>-<version>-<rand>/`（jail/受控路径内）；
 2. walk 校验（§1.4）；

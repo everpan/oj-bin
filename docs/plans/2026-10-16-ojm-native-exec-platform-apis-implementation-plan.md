@@ -158,6 +158,11 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 - Step 2：装配期构建 grants；抢注校验（特权名 ∩ 安装树模块名 → fail-fast）。
 - Step 3：fs 轴特权扩展——`StableState.fs` 裁决对特权模块追加 trusted_paths（在 `op_fs_resolve` 前置裁决点实现，改 `fs.rs` 判定入口）→ PASS。
 
+**阶段 2 实施偏差记录**（评审后修订）：
+1. **装配位置**：grants 构建/抢注防护落在 `oj/src/app.rs assemble_backend`（`build_platform_grants`），非计划原文的 `serve_cmd.rs`——StableState 唯一构造点在该处，注入路径最短。
+2. **checkout_reset 换装**：deno fs op 有第二道防线（PermissionsContainer，per-runtime），trusted 可及性必须按请求换装容器；`Bridge::checkout_reset` 是全部借出路径（含 inspector 挂载前借出）的唯一重置点，`inspector()` 因此从裸 checkout 改走 checkout_reset（防特权容器经调试器求值触达）。
+3. **platform.root 受控挂载**（设计稿 §1.2 修订）：抢注检查豁免受控根 discover 产物，`modules` ⊆ 受控根产物（悬空 fail-fast）；受控根与任何其它 api 挂载树同径或互为父子（前缀重叠）→ fail-fast（防抢注绊线被静默穿透）；不引入隐式 mount——受控根以既有 mounts 条目接入（部署方把 `platform.root` 目录写进 `mounts[].api`），校验挂在「挂载树 discover 产物 + 受控根 discover 产物」两份集合上，零新装配面。
+
 **阶段提交**：`feat(platform): platform 段（modules/trusted_paths/exec 授权）+ 特权裁决 + 抢注防护`。
 
 ---
@@ -271,7 +276,7 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 
 ## 阶段 7：文档 / 样例 / 版本（任务 #8）
 
-1. **devkit 四件**逐条对齐：api-manual（总表 27 组 → 新增 `exec`/`server`/`yaml` 组；错误/限制表：NotCapable 文案、模板失配、输出超限、YAML 预算、unchanged 形状、tasks/WS 无特权、sig 仅 base64、公钥非 PEM、PEM 不支持等）、SKILL.md 陷阱速查（config.yaml 在 jail 外须 trusted_paths、大 DDL 须显式 timeoutMs、base64url 公钥不支持）、scenarios.md（安装闭环场景：下载→校验→解压→迁移→回写→热更）、README.md。
+1. **devkit 四件**逐条对齐：api-manual（总表 27 组 → 新增 `exec`/`server`/`yaml` 组；错误/限制表：NotCapable 文案、模板失配、输出超限、YAML 预算、unchanged 形状、tasks/WS 无特权、sig 仅 base64、公钥非 PEM、PEM 不支持等，**另登记**：`sha256Hex` 非 string/二进制入参现抛 TypeError（旧版 `String(s)` 强转，fail-loud 行为变更））、SKILL.md 陷阱速查（config.yaml 在 jail 外须 trusted_paths、大 DDL 须显式 timeoutMs、base64url 公钥不支持）、scenarios.md（安装闭环场景：下载→校验→解压→迁移→回写→热更）、README.md。**批次收尾登记（yaml 阶段审查遗留）**：① 错误表补「自定义 tag（`!Foo …`）不支持」一行；② devkit README v0.1.75 已落地清单补 yaml 摘要；③ 打版前逐条核对增量同步轮次已覆盖面（crypto/platform/exec/yaml 均已随阶段同步，阶段 7 收敛余量）。
 2. `sample/global.d.ts`：`exec`/`server`/`yaml` interface + `crypto.verifyEd25519`/`sha256Hex` 重载。
 3. `docs/dev-guide.md`（platform 段走读）、`docs/ops-manual.md`（tar 依赖与方言、`OJ_SECRET_KEY` 透传、无 tar 环境 exec 报错）、`docs/bridge.md`（op↔global 对应面）。
 4. `sample/src/` 增 `platform_demo` 模块 + `sample/config.yaml` 补 `platform:` 段示例。
@@ -295,3 +300,26 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 ## 附录：spike 结论
 
 （阶段 0 执行后回填：ring 链证据、Ed25519 API 确认、serde_yaml deprecated 评估、tar 方言探测。）
+
+### Task 0.1 + 0.2 实证结论（2026-10-16，worktree feat/ojm-native-exec）
+
+**ring 链证据**（`cargo tree -i ring@0.17`，Exit 0）：
+
+- 根链（预期存在，已证实）：`ring 0.17.14 ← jsonwebtoken 9.3.1 ← only-js`（根 crate 直接链）。
+- serve 侧链：`ring 0.17.14 ← serve`（`serve/Cargo.toml:25` 直依 `ring = "0.17"`）。
+- `Cargo.lock` 单版本：仅一条 `name = "ring"`，`version = "0.17.14"`（Cargo.lock:5577）。非 rustls 途经，与评审结论一致。
+
+**Ed25519 API 确认**（ring 0.17.14 源码，`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.14/`）：
+
+- `src/ec/curve25519/ed25519/verification.rs:34` 定义 `pub static ED25519: EdDSAParameters`，实现 `signature::VerificationAlgorithm`（`UnparsedPublicKey::new(&signature::ED25519, pk)` 用法见 `src/signature.rs:158` 文档示例）。
+- 经 `src/signature.rs:261-263` re-export 为 `ring::signature::ED25519`；该模块无任何 `cfg(feature)` 门控，ring 0.17 的 feature 仅影响汇编/后端选择，Ed25519 恒可用。签名侧 `signature::Ed25519KeyPair`（signing.rs）同在。
+- 结论：无需备选 `ed25519-dalek`，Step 3 不触发。
+
+**tokio process 现状**：
+
+- 基线（修改前）：根 `Cargo.toml:76` `[dependencies]` tokio features 为 `["macros", "rt", "sync", "net", "io-util", "time", "fs"]`，无 `"process"`——process 此前仅靠 deno/reqwest 上游 feature 统一隐式启用，证实「必须显式声明」的风险真实存在。
+- 已修：features 追加 `"process"`；`[dev-dependencies]` tokio（`Cargo.toml:111`）保持不动（最小改动）。
+
+**依赖声明**：根 `[dependencies]` 增 `ring = "0.17"`（紧邻 jsonwebtoken，含注释）；`cargo check --release` 通过，`Cargo.lock` 自动同步后仍单版本 0.17.14，无版本统一冲突。
+
+**serde_yaml / tar 方言探测**：待后续阶段任务执行后回填。

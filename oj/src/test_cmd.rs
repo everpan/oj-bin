@@ -145,7 +145,10 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
                 .build()
                 .map_err(|e| format!("test runtime: {e}"))?;
             rt.block_on(async move {
-                let app = App::from_config(cfg, &top, &config_dir, true, &profiles, None).await?;
+                // 槽位 None：oj test 无热更执行器（`server.reloadConfig` 报
+                // reload not available，fail-closed）。
+                let app =
+                    App::from_config(cfg, &top, &config_dir, true, &profiles, None, None).await?;
                 run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })

@@ -93,6 +93,10 @@ import {
   op_jwt_verify,
   op_random_hex,
   op_sha256_hex,
+  op_sha256_bytes,
+  op_md5_hex,
+  op_md5_bytes,
+  op_ed25519_verify,
   op_crypto_random,
   op_aes_gcm_encrypt,
   op_aes_gcm_decrypt,
@@ -105,6 +109,10 @@ import {
   op_ws_broadcast,
   op_ws_room_size,
   op_fs_resolve,
+  op_exec_run,
+  op_yaml_parse,
+  op_yaml_stringify,
+  op_server_reload_config,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -187,6 +195,44 @@ globalThis.fs = {
   rename: (a, b) => ojFs.rename(ojFsResolve(a), ojFsResolve(b)),
   stat: (p) => ojFs.stat(ojFsResolve(p)),
   readDir: (p) => ojFs.readDir(ojFsResolve(p)),
+};
+
+// ----- exec: external command primitive (argv templates; ojm batch) -----
+// Runs ONLY an authorized argv template: literal tokens must match exactly and
+// typed placeholders absorb exactly one token each (${path:NAME} is checked
+// against fs.root + trusted_paths; ${raw:NAME} rejects option-like/absolute
+// forms). No shell. cwd is fs.root; env is empty except the configured
+// whitelist (values never enter JS); stdout+stderr combined 10MB cap; timeout
+// defaults to 30s, hard cap 600s (larger values are clamped). A process that
+// runs to exit (ANY code) resolves {code, stdout, stderr} (signal death maps
+// to 128+signal); authorization/template/timeout/limit/spawn failures throw.
+globalThis.exec = {
+  run: (argv, opts) => op_exec_run(argv, opts === undefined ? null : opts),
+};
+
+// ----- yaml: bounded parse / stringify (ojm batch) -----
+// parse runs on the blocking pool with its own 5s deadline behind three budgets
+// (1 MiB input, 100k nodes incl. alias replay, nesting depth 128); errors are
+// named (budget exceeded / line+column for syntax). Out-of-range integers arrive
+// as decimal strings; duplicate mapping keys: last one wins. stringify is for
+// MACHINE ARTIFACTS ONLY (manifests.yaml round-trip) -- it loses comments, so
+// never use it to rewrite config.yaml (do text surgery instead).
+globalThis.yaml = {
+  parse: (text) => op_yaml_parse(String(text)),
+  stringify: (value) => op_yaml_stringify(value === undefined ? null : value),
+};
+
+// ----- server: platform-level controls (ojm batch) -----
+// reloadConfig triggers the in-process config hot reload. It shares the SAME
+// executor instance and the SAME reload lock as the HTTP POST
+// {base}/_system/config endpoint: a concurrent trigger fails with a busy
+// error (409 semantics, never silently queued). Requires the caller module to
+// be platform-privileged (config platform.modules); outside `oj serve`
+// (oj test / embedded) it throws "reload not available". While the reload
+// runs (seconds: DB verify + transpile) the actor executing this handler is
+// occupied and is not returned to the pool until it completes.
+globalThis.server = {
+  reloadConfig: () => op_server_reload_config(),
 };
 
 // ----- json: unified envelope + response headers -----
@@ -1020,7 +1066,22 @@ globalThis.oidc = (() => {
 
 // ----- crypto: sha256/random helpers (merge, keep native getRandomValues if present) -----
 globalThis.crypto = Object.assign(globalThis.crypto || {}, {
-  sha256Hex: (s) => op_sha256_hex(String(s)),
+  // string -> op_sha256_hex; Uint8Array/ArrayBuffer -> op_sha256_bytes (binary
+  // digest, e.g. non-utf8 payloads). JsBuffer only accepts views, so unwrap
+  // ArrayBuffer first.
+  sha256Hex: (data) => {
+    if (typeof data === "string") return op_sha256_hex(data);
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+    return op_sha256_bytes(data);
+  },
+  // md5: BROKEN cryptographically - non-security uses only (cache keys, etags,
+  // legacy compat). Never for credentials/signatures/integrity checks.
+  // Same dispatch shape as sha256Hex.
+  md5Hex: (data) => {
+    if (typeof data === "string") return op_md5_hex(data);
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+    return op_md5_bytes(data);
+  },
   randomHex: (n) => op_random_hex(n === undefined ? null : n | 0),
   // WebCrypto shape: fill any TypedArray view (wasm-bindgen glue depends on it).
   // ponytail: op caps at 65536, no re-check here; non-view throws TypeError.
@@ -1036,6 +1097,11 @@ globalThis.crypto = Object.assign(globalThis.crypto || {}, {
   // via ENC[...] in config). plaintext utf8 in, base64(nonce12 || ct || tag16) out.
   aesGcmEncrypt: (plaintext, key) => op_aes_gcm_encrypt(String(plaintext), String(key)),
   aesGcmDecrypt: (ciphertext, key) => op_aes_gcm_decrypt(String(ciphertext), String(key)),
+  // Ed25519 verification (bundle signature check). publicKey: hex/base64 raw
+  // 32-byte key (no PEM/SPKI); sig: base64 only (no base64url). Format errors
+  // throw; signature mismatch returns false.
+  verifyEd25519: (publicKey, msg, sigBase64) =>
+    op_ed25519_verify(String(publicKey), String(msg), String(sigBase64)),
 });
 
 // ----- base64: atob/btoa globals (wasm-bindgen glue; same algorithm as the oidc inline helper) -----

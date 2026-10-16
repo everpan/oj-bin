@@ -277,6 +277,32 @@ tables:
 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）。所以模块绑不同库的项目，要
 `--db <profile> --module <M>` 逐组合各跑一遍（`scenarios.md` 场景 6）。
 
+### `oj migrate` 输出格式与模块定向
+
+**`--format json`**（机器可读，安装器/CI 收敛用）：continue-and-collect——单模块失败**不中断**其余模块，
+全部结果聚合成**一行 JSON** 打到 stdout（人读行改走 stderr，保证 stdout 纯净可解析）。输出契约：
+
+```json
+{ "results": [ { "module": "modA", "ok": true,  "applied": [ { "version": 1, "name": "init" } ] },
+               { "module": "modB", "ok": false, "error": "at seq 1: ..." } ],
+  "error": null }
+```
+
+- `results[]`：每模块一条；`ok=false` 时 `error` 携**脱敏后**原因（凭据段 `<scheme>://***@host`，
+  同 `secret::redact` 语义）。装配期（开库/目录解析）全局失败则 `results` 为空、`error` 携原因。
+- `applied[]`：本轮**新应用**的迁移（`version`/`name` 与账本一致，`name` 即 `V{seq}__{desc}` 的
+  `{desc}`）；幂等重跑为空数组；`--baseline` 记账不执行 → 空数组。
+- 退出码：任一模块失败即非 0（人读格式同样）；安装器**必须校验 exit code**，不能只凭 JSON 解析成功。
+- 错误脱敏：`error` 字段里的 `<scheme>://user:pass@host` 一律抹为 `<scheme>://***@host`（host/端口保留），
+  纯文本逐字节原样——日志/报错绝不外泄库密码。失败位点：`error` 形如 `at seq {账本最高 seq+1}: …`
+  （该模块账本空时即 `at seq 1:`），点名首败迁移序号。
+
+**`--module <M>`**（定向迁移）：两级匹配，命中唯一才收——
+① 裸模块名精确匹配（dev 树目录名即裸名）；② 未命中时按 dist 版本目录名 `<module>-<version>`
+定向（release 锁聚合形态 `<dir>/<m>-<v>/`）。**不解析 `<m>-<v>` 字符串**（version 可含 `-` 如
+`0.1.0-beta`，拆分有歧义），直接对已发现目录名匹配：`--module modA` 与 `--module modA-1.0.0`
+在 release 下等价只动 modA。多库项目：`--db X --module M` 逐组合跑（场景 6）。
+
 ### 门禁配置（第 10 章 server 表）
 
 - `server.migrate_on_start`：`auto`（dev 默认，启动即应用）/ `verify`（release 默认，
@@ -923,7 +949,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
   **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
   不写裸 `?` 运算符——它无法与占位符区分。
 
-### 总表（27 组）
+### 总表（35 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -936,6 +962,9 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
 | `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
+| `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
+| `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
+| `server.reloadConfig()` | 进程内触发热更（v0.1.75，`platform.modules` 特权）：与 `POST {base}/_system/config` 同一 executor 与串行锁，返回恒定形状（`generation` + 三清单 `applied`/`restart_pending`/`kept_listener`，`unchanged` 时三清单空）；`oj test` / 嵌入式抛 `reload not available`，见下「server」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -955,7 +984,8 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `bcrypt.hash / verify` | 密码哈希与校验（Rust 侧 `spawn_blocking`，不卡 isolate） |
 | `oidc.sign / verify / jwks` + `oidc.issuer / rp / clients` | RS256 JWS 原语与装配期配置（`oidc:` 段启用；私钥留在 Rust，见第 10 章） |
 | `sso.providers` | HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，`http_sso:` 段启用；段缺省调用报 `http sso not configured`）。登录端点是**业务模块**（src/sso/ 参考实现），详见第 10 章「sso」 |
-| `crypto.sha256Hex / randomHex` | sha256 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留） |
+| `cert.generate / cert.renew` | JWS 证书生成/重签（RSA + RS256，纯内存不落盘；`oj-cert` 工具同源于此）。部署期证书签发用 `oj-cert`，运行期此全局仅当内存自签发/续期通道；详见第 10 章「证书门禁」 |
+| `crypto.sha256Hex / md5Hex / randomHex` | sha256/MD5 十六进制摘要 / 随机 hex（增补进原生 `crypto`，原生成员保留；**MD5 仅限非安全场景**，见第 13 章限制） |
 | `toBigInt(v)` / `toUBigInt(v)` / `toDouble(v)` | **64 位整数转换**：DB 的 i64 超界（雪花 id）读出为十进制字符串，回写用 `toBigInt()`；无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`（v0.1.24）；见下「大整数与 i64」 |
 | 测试 SDK（`client.*` / `describe / it / expect / beforeEach` / `finish`） | **仅测试文件可用**，见第 9 章 |
 
@@ -1570,6 +1600,175 @@ fs:
   readonly: false  # true = 写类 API 全拒
 ```
 
+> **平台特权 fs 扩展（v0.1.75，`platform:` 段）**：`platform.modules` 名单中的特权模块
+> （归属 = 请求级模块身份，URL/JS 侧不可伪造）的 fs 读写授权面 = **`fs.root ∪ platform.trusted_paths`**
+> （门面裁决与 deno 内建 op 的第二道防线同口径放行）；非特权模块行为不变。
+> 前提：**`fs:` 段已配置**（fs 未配置时恒非特权——trusted_paths 不会在无 jail 的前提下放行任何
+> 路径）；`fs.readonly: true` 时写类 API 对 trusted_paths 同样全拒。越出集合报
+> `NotCapable: path escapes fs.root: …`（文案不变，判定集合已扩为并集）。
+> 配置写法见 §10「platform」。
+
+### exec —— 外部命令执行（v0.1.75，`platform.exec` 段授权）
+
+```ts
+exec.run(argv: string[], opts?: {
+  timeoutMs?: number;   // 缺省 30_000，硬上限 600_000（传更大值被钳到上限，不报错）
+  stdin?: string;       // 可选，一次性写入后关闭写端（子进程读到 EOF）
+}): Promise<{ code: number; stdout: string; stderr: string }>
+```
+
+外部命令原语：**无 shell**——spawn 只接受「授权模板匹配后重建的 argv」。安全形态 =
+config 白名单 + argv 模板 + 平台特权限定，全部 fail-closed：
+
+```yaml
+platform:
+  exec:
+    ojm-installer:              # 模块名 → exec 授权；列出该模块 = 授权其 exec
+      allow:                    # argv 模板：literal token 逐字相等，JS 只能填占位符
+        - "tar -xzf ${path:archive} -C ${path:dest}"
+        - "tar -tzf ${path:archive}"
+      env: ["OJ_SECRET_KEY"]    # 透传环境变量白名单（值不进 JS 面）
+```
+
+- **授权与 `platform.modules` 相互独立**：exec 特权只看 `platform.exec.<模块>` 是否列出该
+  模块——「有平台 API 特权无 exec」或反之都合法；两处都未配 = 该面全 deny。
+- **模板匹配**：argv 逐 token 对 `allow` 条目匹配。literal token 必须**逐字相等**（tar 的
+  `--use-compress-program` / 任意 `-f` 之类 option 注入因此无从下手）；占位符**恰吸收一个
+  token**；token 数不齐 / literal 失配 → 0 命中，报 `exec template mismatch`；同一 argv
+  命中 ≥2 条模板 → `exec template ambiguous`（歧义拒绝，不静默择一）。
+- **两类占位符**：
+  - `${path:NAME}`：吸收一个 token，值按**路径**校验——相对路径按 fs.root 折叠 +
+    canonicalize，解析结果必须落在 **`fs.root ∪ trusted_paths`** 内（与 fs 轴特权扩展同一
+    实现，无第二套语义）；放行后以 canonical 绝对路径传给子进程。
+  - `${raw:NAME}`：仅字面收集，拒 `-` 开头（option 注入）与绝对形态（`/`、`\`、盘符起手），
+    拒收以 `exec template mismatch` 报出（中段 `-`/`/` 合法，只看起手形态）。
+  - 占位符名须匹配 `[A-Za-z_][A-Za-z0-9_]*`；未知占位符类型 / 嵌入 / 未闭合 / 非法名等模板
+    语法错在**调用期** fail-closed 抛 `exec template parse failed (<raw>): …`（配置面原样
+    保存、解析期报错是设计约定的时点）。
+- **命令解析（模板首 token）**：必须是**裸名**——不接受占位符、不含 `/` `\` 路径分隔符。
+  `"oj"` 特判解析为服务进程自身（`current_exe()`，serve 进程即 bin/oj，同版本自保证）；
+  其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
+  PATH，宿主侧解析消除 execvp 回落默认路径的不确定性）。解析失败 →
+  `exec: command resolve failed for '<name>': …`。注意：**子进程拿到的 argv[0] 是解析后的
+  绝对路径**，不是模板首 token 原文。
+- **返回 vs 抛错边界**：进程正常跑到退出（**含非 0 退出码**）= 返回 `{code, stdout, stderr}`
+  （信号终止映射 `code = 128 + signal`，TERM=15 → 143）；执行环境失败 = **抛错**——未授权 /
+  模板失配 / 歧义 / 占位符路径越界为 `NotCapable` 类，超时 / 输出超限 / spawn 失败 /
+  UTF-8 解码失败为普通 Error 类（文案见下表）。
+- **硬限制**：
+  - stdout + stderr **流式合计 10MB 上限**（边读边计数；超限 kill 进程组 + 抛错，已收部分
+    不随错返回）；
+  - `timeoutMs` 缺省 30_000、硬上限 600_000（超出钳制）；到期先 `kill(-pgid, SIGKILL)` 整组
+    击杀（含孙进程）再兜底杀直接子进程（Windows 无进程组对应物，仅杀直接子进程）；**stdin
+    写入也在超时窗口内**——子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（大 DDL /
+    大输入显式调大 `timeoutMs`）；
+  - stdout / stderr 强制 UTF-8 解码，非法序列抛错（二进制输出不在本原语范围）；
+  - 子进程 cwd = **fs.root**；env 默认**空表**，仅 `env` 白名单透传（值不进 JS 面，PATH
+    不继承）。cwd 钉定**不构成隔离边界**（无 OS 级 chroot）——文件可达性由 `${path:}` 校验
+    承载，**不要**给子进程传越出授权集合的路径；
+  - **未配 `fs:` 段 → exec 整体不可用**（`NotCapable: exec requires fs.root …`）；
+  - tasks / WS 上下文无模块归属 → 恒拒（`exec requires module ownership …`）。
+- **tar 解压范式**：`tar -tzf` 预检只是快速失败优化；**权威校验 = 解压后对目标目录全量
+  walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、总体积对账），配合 `.staging` 原子
+  落位——完整三步范式见 `scenarios.md` 场景 34。
+
+**错误文案速查**（文案以实现为准；「类」= 错误分类，`NotCapable` 为授权面，其余为普通
+Error）：
+
+| 文案 | 类 | 触发 |
+|---|---|---|
+| `exec not configured (config platform.exec section missing)` | NotCapable | 未配 `platform.exec` 段 |
+| `exec requires module ownership (request has no module context)` | NotCapable | tasks / WS 等无模块归属的上下文 |
+| `module '<m>' is not authorized for exec` | NotCapable | 模块不在 `platform.exec` 授权表 |
+| `exec requires fs.root (config fs: section missing)` | NotCapable | 未配 `fs:` 段 |
+| `exec template mismatch: <reason>` | NotCapable | 0 命中：literal 失配 / token 数不齐 / `${raw:}` 拒 `-` 开头或绝对形态 |
+| `exec template ambiguous: argv matches <N> authorized templates` | NotCapable | ≥2 条模板同时命中（不静默择一） |
+| `exec ${path:NAME}: path outside fs.root and trusted_paths: <p> (resolved <abs>)` | NotCapable | 路径占位符越出 `fs.root ∪ trusted_paths` |
+| `exec template parse failed (<raw>): <e>` | Error | 模板语法错（未知占位符类型 / 未闭合 / 非法名 / 首 token 含路径分隔符等） |
+| `exec: command resolve failed for '<name>': …` | Error | 命令名解析失败（含 `command '<name>' not found in PATH`） |
+| `exec: spawn failed for '<abs>': <e>` | Error | 进程启动失败 |
+| `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀） |
+| `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB |
+| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8 |
+| `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
+
+### yaml —— YAML 读写原语（v0.1.75，无特权，始终可用）
+
+```ts
+yaml.parse(text: string): Promise<unknown>;      // 只读解析（异步：Rust 阻塞池执行，须 await）
+yaml.stringify(value: object): Promise<string>;  // 仅承诺机器产物（manifests.yaml）往返（异步）
+```
+
+纯解析原语，不占 platform 授权面（所有模块、tasks/WS 上下文均可用）。parse 在 Rust
+阻塞池执行（不卡 isolate），带独立 5s deadline 与**三预算**，超限一律抛错点名：
+
+- **输入 1 MiB**：超限报 `yaml.parse: input exceeds 1 MiB limit (N bytes)`；
+- **节点总数 100_000**（含 alias 引用展开出的每个节点）：billion laughs 链式放大
+  （`a1: &a1 [*a0,*a0]` 逐层翻倍）在展开侧计节点，超限报
+  `yaml.parse: node budget exceeded`；serde_yaml 内建的 alias 重放上限先触发时映射为
+  `yaml.parse: alias budget exceeded (alias replay amplification)`；
+- **嵌套深度 128**：约 20 万 `[` 即合法 1MB 输入而递归下降栈溢出不可捕获——超限报
+  `yaml.parse: nesting depth limit exceeded (128)`（进程存活，不崩）。
+
+语义细则（实测钉死，serde_yaml 0.9.34）：
+
+- **重复键**：后键覆盖（`a: 1\na: 2` → `{a: 2}`），不报错；
+- **多文档**（`---` 分隔）→ 抛 `expected a single YAML document`；
+- **非字符串键**（`1: a` / `null: a`）→ 抛 `non-string mapping key not supported`；
+- **NaN / `.inf` / `.nan`** → 抛 `non-finite number (NaN/Inf) not supported`（取更严取向）；
+- **大整数**：超出 2^53-1 一律十进制字符串（i128/u128 级在解析器内即转；i64/u64 级出口过
+  数值护栏，与「大整数与 i64」一节同形态），`json.ok` 不会 500；
+- **空文档**（空串/纯空白）→ `null`；
+- **非法 YAML** → `yaml.parse: invalid YAML at line N column M: <detail>`（带行列）。
+
+> ⚠️ **stringify 禁用于 config.yaml 回写**：serde_yaml 往返丢注释与空白。改 config 只走
+> 文本手术三步模式（`fs.readTextFile` → 只改目标段 → `yaml.parse` 语义复检 → 写回，
+> 路径授权见第 10 章 `trusted_paths`）。stringify 只承诺**机器产物**（manifests.yaml
+> 形状的 map/list/标量）往返；**对象键输出保留 JS 对象键插入序（整数型键先行），
+> 不排序**——需确定序请在 stringify 前自行归序（键序由单测钉死，运行时依赖
+> deno_core 传递开启的 serde_json `preserve_order`，该 feature 撤销即测试红）。
+
+| 错误文案 | 说明 |
+|---|---|
+| `yaml.parse: input exceeds 1 MiB limit (N bytes)` | 输入超限 |
+| `yaml.parse: node budget exceeded` / `yaml.parse: alias budget exceeded (alias replay amplification)` | 节点 / alias 重放预算超限 |
+| `yaml.parse: nesting depth limit exceeded (128)` | 嵌套超深 |
+| `yaml.parse: expected a single YAML document (multi-document input rejected)` | 多文档输入 |
+| `yaml.parse: non-string mapping key not supported` | 非字符串键 |
+| `yaml.parse: non-finite number (NaN/Inf) not supported` | NaN / `.inf` / `.nan` |
+| `yaml.parse: invalid YAML at line N column M: <detail>` | 语法错（带行列） |
+| `yaml.parse: timed out after 5s` | hang 兜底（预算内正常解析为毫秒级） |
+| `yaml.stringify: <e>` | 不可序列化值 |
+
+### server —— 平台级控制（v0.1.75，platform 特权）
+
+```ts
+server.reloadConfig(): Promise<{
+  generation: number; unchanged: boolean;
+  applied: string[]; restart_pending: string[]; kept_listener: string[];
+}>
+```
+
+进程内触发热更，与 `POST {base}/_system/config` 调**同一 executor 实例、同一把串行
+锁**（响应三清单语义见第 10 章「配置热更新（reload_api）」）：
+
+- **特权**：仅 `platform.modules` 名单内的模块可调（特权是请求级归属，见 `platform:`
+  段说明）；tasks/WS 上下文无归属恒 `NotCapable`。
+- **返回形状恒定**：`unchanged=true` 时三清单为空数组，JS 无需分支。
+- **不可用形态**：`oj test` / 嵌入式（无热更执行器）抛 `reload not available`。
+- **并发**：与 HTTP POST 共享串行锁——撞锁一方抛 busy 错误，**不静默排队**。
+- **⚠️ actor 占用**：热更在独立线程跑影子装配（**秒级**：DB verify + 模块转译），
+  **触发 reload 的 handler 所在 actor 在此期间被占用**、不归还池；大规模热更期间
+  该 actor 的后续请求短暂排队。避免在流量高峰频繁触发。
+
+| 错误文案 | 说明 |
+|---|---|
+| `NotCapable: module 'x' is not platform-privileged` | 调用模块不在 `platform.modules` |
+| `NotCapable: platform APIs require module ownership (request has no module context)` | tasks/WS 上下文无归属 |
+| `reload not available (not running under oj serve)` | `oj test` / 嵌入式无执行器 |
+| `server.reloadConfig: reload in progress (busy)` | 并发触发撞串行锁（HTTP 侧同语义 409） |
+| `server.reloadConfig: HTTP 400: <原因>` | 归一/装配失败（旧代继续服务，不破坏在跑实例） |
+
 ### bus —— 订阅发布
 
 | API | 签名 | 说明 |
@@ -2058,11 +2257,13 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
+| `crypto.sha256Hex` | `sha256Hex(data: string \| Uint8Array \| ArrayBuffer): string` | UTF-8 编码后的 sha256 十六进制摘要；v0.1.75 起支持二进制入参（`Uint8Array`/`ArrayBuffer` 自动归一，非 UTF-8 字节不炸）。**行为变更（v0.1.75）**：非 string/二进制入参（number/null 等）旧版经 `String()` 强转求摘要，现抛 TypeError（fail-loud） |
+| `crypto.md5Hex` | `md5Hex(data: string \| Uint8Array \| ArrayBuffer): string` | MD5 十六进制摘要（v0.1.75）。入参分流同 `sha256Hex`：string 走 UTF-8；`Uint8Array`/`ArrayBuffer` 走原始字节摘要（非 UTF-8 字节安全）；其余抛 TypeError。**MD5 已密码学破损，仅限非安全场景（缓存键/etag/旧系统兼容），不得用于凭据/签名/完整性校验** |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
 | `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | 填充随机字节（v0.1.30） |
 | `crypto.aesGcmEncrypt` | `aesGcmEncrypt(plaintext: string, key: string): string` | AES-GCM 对称加密（v0.1.35）：明文 UTF-8，密钥 16/32 字节 hex 或 base64，返回 `base64(nonce ‖ ct ‖ tag)` |
 | `crypto.aesGcmDecrypt` | `aesGcmDecrypt(ciphertext: string, key: string): string` | AES-GCM 解密（v0.1.35）：输入 `aesGcmEncrypt` 的密文，返回原文；密钥/密文错抛错 |
+| `crypto.verifyEd25519` | `verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean` | Ed25519 验签原语（v0.1.75，bundle 签名校验用），双层语义见下 |
 
 另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30；非法输入抛
 `InvalidCharacterError`），wasm 胶水常用。
@@ -2072,6 +2273,26 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 > 密钥仅支持 **16 字节（AES-128）或 32 字节（AES-256）**的 hex / base64 编码；**不支持
 > AES-192**（上游 crate 未提供），传入 24 字节密钥会明确报错。nonce 由运行时随机生成（12 字节），
 > 与密文、GMAC tag（16 字节）一并 base64 拼接返回，解密方无需单独传 nonce。
+
+> **Ed25519 验签（v0.1.75）**：`crypto.verifyEd25519(publicKey, msg, sigBase64)` 为纯验签
+> 原语（bundle 签名校验用）。**双层语义**：格式错抛错（文案均以 `verifyEd25519: ` 起头——
+> `signature not base64` / `public key must be 32 raw bytes (got N)` /
+> `signature must be 64 bytes (got N)` / `key not hex/base64`）；格式合法但验签不过
+> （错公钥/错 msg/无效曲线点）返回 `false` 而非抛错。编码限制：
+> ① `sigBase64` 仅**标准 base64**（STANDARD / NO_PAD，**base64url 不支持**）；
+> ② `msg` 仅 UTF-8 字符串；③ `publicKey` 须是 hex / base64 编码的 **32 字节原始公钥**
+> （**PEM/SPKI 不支持**）。
+
+bundle 签名校验典型用法（规范串 `"<name>@<version>:<sha256>"` + Ed25519；发布方对规范串
+签名，安装方用发布方公钥验签）：
+
+```ts
+const bundleBytes = await fs.readFile(`${name}-${version}.tgz`);      // 二进制直接求摘要
+const canon = `${name}@${version}:${crypto.sha256Hex(bundleBytes)}`;  // 规范串
+if (!crypto.verifyEd25519(publisherPubKey, canon, sigBase64)) {
+  json.fail(400, "bundle signature mismatch");                        // 验签不过 → false
+}
+```
 
 ```ts
 const sessionKey = "AUTH-SESSION:" + crypto.sha256Hex(refreshToken);   // 见第 8 章轮换
@@ -2759,11 +2980,11 @@ mounts:
 
 > **保留路径**：`_system` 是平台保留前缀，业务模块勿占用；`{base}/_system/config`（`GET`/`POST`）与 `{base}/_system/health` 由外层 fallback 直接响应，不经业务路由，也不走证书过期门禁（运维换证窗口仍可探活）。
 
-**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
+**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400），或特权模块在 JS 侧调 `server.reloadConfig()`（同一 executor 实例与同一把串行锁，见「server」一节）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
 
 - **幂等**：归一后落盘文件 sha256 与当前代相同 → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）——已验证合法，但本代沿用旧连接池/旧插件 vtable，**重启后生效**。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）与**特权面段（`platform`/`fs`）**——已验证合法，但本代沿用旧连接池/旧插件 vtable/旧授权面，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
   - `applied`：其余段（如 `vars` 部署期常量）——本代即生效。
 
@@ -2771,7 +2992,7 @@ mounts:
 
 **守卫**：`server.reload_api` 开启后 `_system/config` 受保护——`auth:` 配置了 → 需 Bearer 验签（401 详情在响应体）；未配 `auth:` → 仅**回环地址**（loopback）可调，非回环 403（响应体 `"reload_api requires loopback or auth"`）。`GET` 同样受此守卫。
 
-**并发**：同一时刻只允许一个热更；第二个并发 `POST` 在拿不到串行锁时返回 **409 `reload in progress`**。
+**并发**：同一时刻只允许一个热更（HTTP POST 与 JS `server.reloadConfig()` 共享同一把串行锁）；第二个并发触发在拿不到锁时返回 **409 `reload in progress`**（JS 侧抛 `server.reloadConfig: reload in progress (busy)`）。
 
 **代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation}`；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
 
@@ -2941,6 +3162,46 @@ fs:
 ```
 
 块存在即启用 `fs.*` 全局；缺省不启用（`fs.*` 抛 `NotCapable`，fail-closed）。
+
+### platform —— 平台特权（v0.1.75，ojm 批次）
+
+```yaml
+platform:
+  modules: ["ojm-installer"]      # 平台特权模块名单
+  root: "./platform-modules"      # 受控挂载根（modules 非空时必配，须同时列为 mounts[].api 条目）
+  trusted_paths: ["./config.yaml", "./dist"]   # 额外授权路径根（canonical，装配期 fail-fast）
+  exec:                           # exec 授权（v0.1.75 生效；与 modules 相互独立，缺省 = 全 deny）
+    ojm-installer:
+      allow:                      # argv 模板：literal 逐字 + ${path:}/${raw:} 占位符（见 §6「exec」）
+        - "tar -xzf ${path:archive} -C ${path:dest}"
+        - "tar -tzf ${path:archive}"
+      env: ["OJ_SECRET_KEY"]
+```
+
+**fail-closed**：不配 `platform:` 段 = 全部平台特权不可用（运行期裁决报
+`NotCapable: platform not configured (config platform: section missing)`）。
+段存在而某键缺省 = 该键为空名单（同样 deny）。
+
+特权面（归属 = 请求级模块身份，URL/JS 侧不可伪造；tasks/WS 上下文无模块归属 →
+特权恒不可用）：
+
+| 键 | 语义 |
+|---|---|
+| `modules` | 平台特权模块名白名单。非名单模块报 `NotCapable: module 'x' is not platform-privileged` |
+| `root` | 受控挂载根：特权模块的**唯一**正经部署目录（相对 config_dir 解析）。`modules` 非空时必配，且该目录必须同时列为 **`mounts[].api` 条目**——模块归属与路由只能来自挂载 discover。特权模块只能由部署方放入该目录 |
+| `trusted_paths` | 额外授权路径根（相对 config_dir 解析；canonical 化，路径不存在 → 装配 fail-fast）。生效面 = 特权模块的 **fs 读写范围**（`fs.root ∪ trusted_paths`，见 §6 fs「平台特权 fs 扩展」；`fs:` 未配置时 fs 轴不生效，非特权模块行为不变）与 **exec `${path:}` 占位符的校验集合**（§6「exec」） |
+| `exec` | **exec 全局授权**（v0.1.75 生效）：模块名 → `{ allow: [argv 模板], env: [透传环境变量白名单] }`。列出该模块 = 授权其 `exec.run`；**与 `modules` 相互独立**（只配一边拿不到另一边）。模板 literal token 逐字相等、`${path:NAME}`/`${raw:NAME}` 占位符恰吸一 token；模板语法错在调用期 fail-closed 点名。签名、语义与错误文案见 §6「exec」 |
+
+装配期抢注/绊线防护（全部启动 fail-fast，不等第一个请求）：
+
+- **抢注（anti-squatting）**：特权名出现在任何其他 api 挂载树 →
+  `platform module 'x' must not come from an install tree (deploy it in a platform-controlled directory under platform.root)`——「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断。
+- **受控根互斥**：`platform.root` 与其他 api 挂载树同径或互为父子 →
+  `platform.root (…) must not overlap another api mount (…) — the anti-squatting tripwire would be silently disabled`（防部署方误把受控根指到市场安装树；父目录形态会让市场产物静默穿透绊线）。
+- **root 未挂载**：`platform.root (…) must be mounted as an api mount to give platform modules routes and ownership`。
+- **root 缺失**：`platform.modules is set but platform.root is missing — privileged modules need a controlled mount root`。
+- **名单悬空**（root 下无此模块）：`platform module 'x' is not deployed under platform.root (dangling privilege: no module implementation)`。
+- **trusted_paths 不存在**：`platform.trusted_paths canonicalize failed (…): …`。
 
 ### broker —— 事件总线（三种 kind）
 
@@ -3207,6 +3468,8 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
 | crontab.yaml 坏行（非 5 字段 cron + 路径 / 路径不存在） | fail-fast 退出，报错带 `:行号:`（v0.1.28） |
 | `server.cors.credentials: true` 且 `server.cors.origins` 为空 | `cors: credentials requires explicit origins (wildcard '*' is rejected by browsers)` 退出（v0.1.35；带凭据的 `*` 非法）。其余字段缺省回落安全值 |
+| `platform.modules` 非空但 `platform.root` 缺失 / root 未列为 api mount / 与其他挂载树同径或父子 / 名单悬空 | platform 段装配 fail-fast 退出（v0.1.75，报错原文见 §10「platform」——抢注绊线必须在装配期生效，运行期拦截为时已晚） |
+| `platform.trusted_paths` 条目不存在 | `platform.trusted_paths canonicalize failed (…): …` 退出（v0.1.75） |
 
 ## 11. 构建与发布
 
@@ -3623,6 +3886,14 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `blob.readRange` 是短读（v0.1.47） | 越尾只返回实际可读字节、`offset` 过尾返回**空数组**——先判 `head.length` 再分支，不要假设一定拿满 `len`；`offset` / `len` 为负 / 小数 / NaN 报错 `blob readRange: offset must be a non-negative integer` |
 | `blob.copy` / `blob.move` 的 `src == dst`（v0.1.47） | 明确 **no-op**（`fs::copy` 同文件语义未定义、会截断文件）——不是「复制一份给自己」；`move` 后 src 一定不存在，`copy` 后 src 一定还在 |
 | blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |
+| `crypto.verifyEd25519` 编码面（v0.1.75） | `sigBase64` 仅标准 base64（STANDARD/NO_PAD，**base64url 不支持**）；`msg` 仅 UTF-8 字符串；`publicKey` 须 hex/base64 编码的 **32 字节原始 key**（**PEM/SPKI 不支持**）。格式错抛错（文案 `verifyEd25519: …` 起头），格式合法验签不过返回 `false` |
+| `crypto.sha256Hex` 非 string/二进制入参抛 TypeError（v0.1.75 **行为变更**） | 旧版把 number/null 等经 `String()` 强转求摘要（静默产出垃圾摘要）；现 fail-loud 抛 TypeError——旧脚本传非 string/二进制入参的要先改（`String(x)` 显式转或改传 `Uint8Array`） |
+| `crypto.md5Hex` 已密码学破损（v0.1.75） | MD5 仅限**非安全场景**（缓存键/etag/旧系统兼容），**不得用于凭据/签名/完整性校验**；入参分流同 `sha256Hex`（string 走 UTF-8，`Uint8Array`/`ArrayBuffer` 走原始字节，其余抛 TypeError） |
+| `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面 = 特权模块 fs 读写扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）+ `exec.run`（见下两条）；tasks/WS 上下文无模块归属 → 特权恒不可用 |
+| `exec.run` 授权 ≠ `platform.modules`（v0.1.75） | **两名单相互独立**：exec 特权只看 `platform.exec.<模块>` 是否列出该模块——只配 `modules` 不配 `exec`（或反之）拿不到对应面；未授权/模板失配/歧义/`${path:}` 越界一律 `NotCapable` 点名（文案见 §6「exec」错误表） |
+| `exec.run` 运行面硬限制（v0.1.75） | stdout+stderr **流式合计 10MB** 上限（超限杀进程组抛错，已收部分不返回）；`timeoutMs` 缺省 30s、硬上限 600s（超出**钳制**不报错）；输出强制 UTF-8（二进制不支持）；cwd 钉在 fs.root 但**非隔离边界**（路径防线在 `${path:}` 占位符校验，勿传越界相对路径）；未配 `fs:` → exec 整体不可用；子进程 argv[0] 是宿主解析后的**绝对路径**（非模板首 token 原文）；信号终止 `code = 128 + signal`，非 0 退出码**不抛错**照常返回 |
+| `yaml.parse` 三预算（v0.1.75） | 输入 1 MiB / 节点 100_000（含 alias 展开）/ 深度 128，超限抛错点名**不崩进程**；重复键后键覆盖，多文档 / 非字符串键 / NaN·Inf 一律拒绝（不静默强转）；**stringify 禁用于 config.yaml 回写**（serde_yaml 丢注释，回写走文本手术三步模式） |
+| `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 
 ### 常见陷阱清单
 

@@ -33,6 +33,9 @@
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 | [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
 | [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 统一声明公共前缀与公共入参 | §4 编写 api.ts |
+| [33](#场景-33特权模块受控挂载最小配置platformv0175) | 平台特权模块最小配置：`platform:` 段 + `mounts[].api` 条目 + 特权 fs 读 trusted 文件 + `exec` 授权（v0.1.75；fail-closed，装配期抢注防护） | §6 fs / §6 exec / §10 platform |
+| [34](#场景-34tar-解压安全落位exectar-三步范式v0175) | 用 `exec.run` 跑系统 tar 安全解压发行包：`-tzf` 预检 + 成员名复检 → 解压到 `.staging` → 解压后 walk 校验（symlink 零容忍 + 体积对账）→ 原子落位（v0.1.75；argv 模板白名单，无 shell） | §6 exec / §10 platform |
+| [35](#场景-35解决方案市场模块安装闭环v0175) | 市场模块安装端到端闭环：`fetch` 下载 → `sha256Hex` 比对 → `verifyEd25519` 验签 → `exec.run` tar 解压 → `yaml.parse` 读 manifest → `platform.trusted_paths` 文本手术回写 config → `exec.run` `oj migrate --format json` → `server.reloadConfig` 热更（v0.1.75；各步 fail-closed） | §6 fetch / §6 crypto / §6 exec / §6 yaml / §6 server / §10 platform |
 
 ---
 
@@ -2286,4 +2289,397 @@ POST /v1/api/project/{pid}/members    → 200 project.members.post
 GET  /v1/api/project/{pid}/schema     → 404（元数据不生成路由；契约只进 OpenAPI/校验）
 ```
 
+---
+
+## 场景 33：特权模块受控挂载最小配置（platform，v0.1.75）
+
+> 何时抄我：你要部署一个**平台特权模块**（如 ojm 安装器），它需要读 jail 之外的
+> 受信文件（config、发行产物）或执行外部命令（tar 解压等）。本场景给最小可跑配置——
+> 生效面 = 特权模块 fs 读写范围扩为 `fs.root ∪ trusted_paths` + `exec` 全局授权；
+> tar 解压三步范式见场景 34。
+> 手册 §10「platform」、§6 fs「平台特权 fs 扩展」、§6「exec」。
+
+### ① 目录布局（特权模块只能部署方手工放入受控根，不进市场安装树）
+
+```text
+<项目根>/
+├─ config.yaml
+├─ config.yaml.bak …          # 受信文件（trusted_paths 指向）
+├─ src/…                      # 普通业务模块（市场安装树，行为不变）
+└─ platform-modules/
+   └─ ojm-installer/
+      ├─ manifest.yaml        # name = ojm-installer
+      └─ api.ts
+```
+
+### ② 配置（三处缺一不可：mounts 条目 + platform 段 + fs 段）
+
+```yaml
+mounts:
+  - prefix: /v1/api
+    dir: src               # 市场安装树（普通模块，行为不变）
+  - prefix: /v1/platform   # 受控根也是普通 api 挂载（前缀须与其他 api 挂载不同——
+    dir: platform-modules  #   同类同前缀重复会被拒）——特权模块由此获得归属与路由
+
+fs:
+  root: ./data             # 特权扩展的前提：fs: 段已配置（未配置时特权恒不可用）
+  readonly: false
+
+platform:
+  modules: ["ojm-installer"]
+  root: "./platform-modules"                 # modules 非空时必配；须同时列为 mounts[].api 条目
+  trusted_paths: ["."]                       # 额外授权根：相对 config_dir 解析（此处=项目根，
+                                             # 覆盖 config.yaml 等受信文件；须已存在，否则装配 fail-fast）
+  exec:                                      # exec 授权（v0.1.75 生效；与 modules 相互独立，
+    ojm-installer:                           #   列出该模块 = 授权其 exec.run）
+      allow: ["tar -tzf ${path:archive}", "tar -xzf ${path:archive} -C ${path:dest}"]
+      env: ["OJ_SECRET_KEY"]                 # 透传环境变量白名单（值不进 JS 面）
+```
+
+### ③ handler（特权模块里 fs 读 trusted 文件）
+
+```ts
+// platform-modules/ojm-installer/api.ts —— 目录镜像路由 /v1/platform/ojm-installer/
+async function get() {
+  // 特权面 = fs.root ∪ trusted_paths：trusted_paths 内文件可读（相对路径按 fs.root 折叠，
+  // 绝对 canonical 路径也可）；非特权模块读同一文件 → NotCapable
+  const cfg = await fs.readTextFile("../config.yaml");   // 折叠后落在 trusted 根内
+  json.ok({ len: cfg.length });
+}
+export default { get };
+```
+
+### ④ 验证
+
+```bash
+curl -s http://localhost:9778/v1/platform/ojm-installer/   # {"code":0,"data":{"len":…}}
+# 非特权模块读同一文件 → NotCapable（行为不变，fail-closed）
+```
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 报 `NotCapable: platform not configured` | config 里根本没有 `platform:` 段——fail-closed，不配 = 全部特权不可用 |
+| 报 `NotCapable: module 'x' is not platform-privileged` | 模块不在 `platform.modules` 名单；或没部署在 `platform.root` 下；或受控根没列为 `mounts[].api` 条目（归属与路由只能来自挂载 discover）——三处缺一不可 |
+| tasks/WS 里调平台能力恒被拒 | 上下文无模块归属（`module = None`）→ 特权恒不可用，设计如此 |
+| 特权模块读 trusted 外文件报 `path escapes fs.root` | 特权面 = `fs.root ∪ trusted_paths` 的**并集**，越出即拒——把目录根加进 `trusted_paths` |
+| 配了 `trusted_paths` 但 `fs:` 段没配 | 特权扩展不生效（fs 未配置时恒非特权，trusted_paths 不会凭空开 jail）——先配 `fs.root` |
+| 启动报 `platform.modules is set but platform.root is missing` | 名单非空必须配受控根，且该目录须列为 `mounts[].api` 条目 |
+| 启动报 `platform module 'x' … must not come from an install tree` | 特权名出现在了其他挂载树（抢注防护，fail-fast）——特权模块只能由部署方放入 `platform.root`，别让市场安装树里出现同名 bundle |
+| 启动报 `platform.root (…) must not overlap another api mount (…)` | 受控根与其他挂载树同径或互为父子（含父目录形态）——绊线会被静默穿透，装配期直接拒绝 |
+| 启动报 `… is not deployed under platform.root (dangling privilege…)` | 名单悬空：`platform.root` 下没有这个模块——部署它或从名单删掉 |
+| 启动报 `platform.trusted_paths canonicalize failed` | trusted_paths 条目路径不存在——相对 config_dir 解析，先建目录或改路径 |
+| `exec.run` 报 `module 'x' is not authorized for exec` | **exec 授权 ≠ `platform.modules`**（两名单独立）——`platform.exec.<模块>` 里列出该模块并给匹配的 argv 模板（场景 34） |
+
+---
+
+## 场景 34：tar 解压安全落位——`exec.run` + tar 三步范式（v0.1.75）
+
+> 何时抄我：特权模块要解压发行包（安装闭环「下载 → 校验 → 解压落位」的落位段）。
+> `exec.run` 无 shell，argv 必须恰命中一条 `platform.exec.<模块>.allow` 授权模板；
+> **安全判定后置**——`tar -tzf` 预检只是快速失败优化，权威校验 = 解压后对目标目录
+> 全量 walk。手册 §6「exec」、§10「platform」。
+
+### ① 配置（在场景 33 基础上给 exec 加 tar 模板）
+
+```yaml
+fs:
+  root: ./data
+  readonly: false
+
+platform:
+  modules: ["ojm-installer"]
+  root: "./platform-modules"
+  trusted_paths: ["."]
+  exec:
+    ojm-installer:
+      allow:
+        - "tar -tzf ${path:archive}"                       # 预检：列成员（快速失败）
+        - "tar -xzf ${path:archive} -C ${path:dest}"       # 解压：两路径都过 ${path:} 校验
+      env: []                                              # tar 不需要环境变量；缺省空表
+```
+
+模板红线：literal token 逐字相等——handler 里多传/换掉任何 literal（如给 tar 夹
+`--use-compress-program=…`）都报 `exec template mismatch`；`${path:}` 值按路径校验
+（须落在 `fs.root ∪ trusted_paths` 内），`${raw:}` 拒 `-` 开头与绝对形态。
+
+### ② handler（三步范式：预检 + 成员名复检 → 解压到 .staging → walk 校验 → 原子落位）
+
+```ts
+// platform-modules/ojm-installer/extract/api.ts —— POST /v1/platform/ojm-installer/extract/
+// body: { archive: "uploads/pkg-1.0.0.tgz", name: "pkg", version: "1.0.0" }（相对 fs.root）
+const SIZE_CAP = 512 * 1024 * 1024;   // 解压结果体积对账上限（按需定，防归档炸弹填盘）
+
+async function post() {
+  const { archive, name, version } = http.body as { archive: string; name: string; version: string };
+  const staging = `dist/.staging/${name}-${version}-${Date.now()}`;
+
+  // ① 预检（快速失败）+ 成员名复检：组件级拒 `..` / 绝对形态 / 控制字符
+  //    （按 / 分段判，不做子串匹配——`a..b` 是合法文件名）
+  const listed = (await exec.run(["tar", "-tzf", archive])).stdout;
+  for (const line of listed.split("\n")) {
+    const m = line.trim();
+    if (!m) continue;
+    if (m.startsWith("/") || m.includes("\0") || m.split("/").some((c) => c === "..")) {
+      throw new Error(`rejected archive member: ${m}`);
+    }
+  }
+
+  // ② 解压到 .staging（jail 内；cwd 已钉在 fs.root，${path:} 值经路径校验）
+  await exec.run(["tar", "-xzf", archive, "-C", staging]);
+
+  // ③ 权威校验：解压后对 staging 全量 walk——symlink/hardlink/设备零容忍 + 体积对账
+  let total = 0;
+  async function walk(p: string): Promise<void> {
+    for await (const e of await fs.readDir(p)) {
+      const full = `${p}/${e.name}`;
+      if (e.isSymlink) throw new Error(`symlink rejected: ${full}`);
+      const st = await fs.stat(full);
+      if (e.isDirectory) { await walk(full); continue; }
+      total += st.size;
+      if (total > SIZE_CAP) throw new Error(`extracted size exceeds ${SIZE_CAP}`);
+    }
+  }
+  await walk(staging);
+
+  // ④ 原子落位：同盘 rename 原子（生产建议：目标已存在先 rename 到 <target>.old-<rand>，
+  //    成功后回收；staging 命名与 manifests.yaml 的 <module>-<version> 约定一致）
+  const target = `dist/${name}-${version}`;
+  await fs.rename(staging, target);
+  json.ok({ target, totalBytes: total });
+}
+export default { post };
+```
+
+任一步抛错：预检/成员名阶段还没落盘；walk 阶段应删掉整个 staging 目录再抛
+（不部分落盘——示例从简，生产把 ③ 包进 try/catch 补 `fs.remove(staging, {recursive: true})`）。
+
+### ③ 验证
+
+```bash
+# 造一个测试包塞进 jail
+mkdir -p data/uploads data/dist && tar -czf data/uploads/pkg-1.0.0.tgz -C data .
+curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/extract/ \
+  -H 'content-type: application/json' \
+  -d '{"archive":"uploads/pkg-1.0.0.tgz","name":"pkg","version":"1.0.0"}'
+# → {"code":0,"data":{"target":"dist/pkg-1.0.0","totalBytes":…}}
+ls data/dist/pkg-1.0.0
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `NotCapable: … not authorized for exec` / `template mismatch` | 模块没进 `platform.exec` 授权表；或 argv 与模板 literal 不逐字 / token 数不齐 / `${raw:}` 收到 `-` 开头 token。**exec 授权 ≠ `platform.modules`**，两名单独立 |
+| `exec template ambiguous: argv matches N authorized templates` | 同一 argv 命中 ≥2 条模板（如 `tar -tzf ${path:a}` 与 `tar ${raw:x} ${path:a}` 都能吃 `tar -tzf a.tgz`）——收紧模板消除歧义，宿主不静默择一 |
+| `NotCapable: exec ${path:archive}: path outside fs.root and trusted_paths …` | 归档/目标路径越出 `fs.root ∪ trusted_paths`——把所在目录根加进 `trusted_paths`，或把文件挪进 jail |
+| `exec: command resolve failed for 'tar': … not found in PATH` | 部署机没有 tar——依赖由部署文档声明（macOS bsdtar / Linux GNU tar 方言差异被后置 walk 校验天然覆盖） |
+| `exec output limit exceeded` / `exec timed out after N ms` | `tar -tzf` 大包成员列表可超 stdout 合计 10MB；大包解压超缺省 30s——显式调大 `timeoutMs`（硬上限 600s） |
+| 只做 `-tzf` 预检就信任归档 | 预检与解压之间归档可被同 jail 模块置换（TOCTOU）；**权威校验是解压后 walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、体积对账）——三步一步都不能省 |
+| 给 `${raw:}` 传文件路径 | `${raw:}` 拒 `-` 开头与绝对形态（`/`、`\`、盘符起手），传路径请用 `${path:}`（它才做 jail 校验） |
+| 子进程拿到的 argv[0] 不是 "tar" 原文 | 预期：宿主把模板首 token 解析为绝对路径（按宿主 PATH）再传给子进程；模板首 token 必须是裸名 |
+
+---
+
+## 场景 35：解决方案市场模块安装闭环（v0.1.75）
+
+> 何时抄我：平台要做一个「市场」，让运维/用户在运行时从远端拉取一个解决方案 bundle（`.tgz`）
+> 并安全装进本实例——下载 → 完整性 → 真实性 → 解压落位 → 读 manifest → 回写 config →
+> 迁移 → 热更，整条链路端到端。本场景把本批次能力（`fetch` / `crypto.sha256Hex` /
+> `crypto.verifyEd25519` / `exec.run` / `yaml.parse` / `platform.trusted_paths` /
+> `server.reloadConfig` / `oj migrate --format json`）串成一条**每步 fail-closed** 的闭环。
+> 基础特权配置（mounts + `platform:` + `fs:` + exec 授权）见场景 33 / 34。
+> 手册 §6 fetch / §6 crypto / §6 exec / §6 yaml / §6 server / §10 platform。
+>
+> **关键纪律**：下载/校验/验签/迁移任何一步失败，都**不落盘、不改锁、不触热更**——
+> 已落盘的版本目录在迁移失败后删除、已回写的 config 在失败时恢复。fail-closed 不是风格，是
+> 市场被中间人投毒时唯一的防线。
+
+### ① 前置：最小 config（特权模块 + trusted_paths 把 config.yaml 纳入特权 fs 可达范围）
+
+```yaml
+fs:
+  root: ./data                 # 特权扩展前提：fs: 段已配置（未配置时 exec/特权恒不可用）
+  readonly: false
+
+platform:
+  modules: ["ojm-installer"]   # 只有此名单模块可调 server.reloadConfig / 读 trusted_paths 外文件
+  root: "./platform-modules"   # modules 非空必配；受控根须同时列为 mounts[].api 条目
+  trusted_paths: ["."]         # 额外授权根 = 项目根（config.yaml 所在）；相对 config_dir 解析
+  exec:
+    ojm-installer:             # exec 授权与 modules 相互独立：列出该模块 = 授权其 exec.run
+      allow:
+        - "tar -tzf ${path:archive}"                                       # 解压预检（场景 34）
+        - "tar -xzf ${path:archive} -C ${path:dest}"                       # 解压落位
+        - "oj migrate -c ${path:config} --format json -d ${path:root} ${raw:module}"  # 迁移（见步骤 7）
+      env: []
+
+mounts:
+  - prefix: /v1/api
+    dir: src                   # 市场安装树（普通模块，行为不变）
+  - prefix: /v1/platform
+    dir: platform-modules      # 受控根也是普通 api 挂载（前缀须与其他 api 挂载不同）
+```
+
+> **特权前提（逐步点名）**：步骤 1–5（下载/校验/验签/解压/读 manifest）只需 `fetch` + `fs`（jail 内）
+> 与 `crypto`（始终可用），**不需要** platform 特权；步骤 6（回写 config.yaml）与步骤 8（热更）要求
+> 模块在 `platform.modules` 且 config.yaml 落在 `platform.trusted_paths`；步骤 4 / 7 的 `exec.run`
+> 要求模块在 `platform.exec` 授权表（与 `modules` 相互独立）。
+
+### ② 安装 handler（八步闭环，每步 fail-closed）
+
+```ts
+// platform-modules/ojm-installer/install/api.ts —— POST /v1/platform/ojm-installer/install/
+// body: { offer: "pkg/1.0.0" }（市场单 id；实际安装单含 url/sha256/signature，由市场 API 下发）
+const PUBLISHER_PUBKEY = "<hex/base64 编码的 32 字节原始 Ed25519 公钥>";
+const SIZE_CAP = 512 * 1024 * 1024;
+
+async function post() {
+  const { offer } = http.body as { offer: string };
+  const [name, version] = offer.split("/");
+
+  // —— 步骤 1：从市场 API 取安装单 + 下载 bundle.tgz 到 jail 内 .staging ——
+  // 特权前提：普通模块即可（fetch + fs 在 fs.root 内，无需 platform）。
+  // 为什么 fail-closed：下载失败 → fetch 抛错，根本不落盘。
+  const meta = await (await fetch(`https://market/api/solutions/${offer}`)).json() as
+    { url: string; sha256: string; signature: string };
+  const tgz = await (await fetch(meta.url)).arrayBuffer();   // Uint8Array
+  const archive = `downloads/${name}-${version}.tgz`;
+  await fs.mkdir("downloads", { recursive: true });
+  await fs.writeFile(archive, tgz);
+
+  // —— 步骤 2：sha256 比对（fail-closed：不符不落盘、不改锁、不触热更）——
+  const sum = crypto.sha256Hex(tgz);            // 二进制直接求摘要（v0.1.75 扩面）
+  if (sum !== meta.sha256) {
+    await fs.remove(archive);
+    json.fail(400, "bundle sha256 mismatch");
+    return;
+  }
+
+  // —— 步骤 3：发布方签名验签（fail-closed：不符同样不落盘/不改锁/不触热更）——
+  // 规范串固定为 "<name>@<version>:<sha256>"；sigBase64 仅标准 base64。
+  // 特权前提：crypto 始终可用，无需 platform。
+  const canon = `${name}@${version}:${sum}`;
+  if (!crypto.verifyEd25519(PUBLISHER_PUBKEY, canon, meta.signature)) {
+    await fs.remove(archive);
+    json.fail(400, "bundle signature mismatch");
+    return;
+  }
+
+  // —— 步骤 4：解压落位（exec 模板白名单；前置见①：platform.exec 须含 tar 模板 + fs: 段已配）——
+  // 为什么 fail-closed：解压前先做 -tzf 预检 + 成员名复检，解压后全量 walk 校验（symlink 零容忍
+  // + 体积对账），任一步失败删掉整个 staging 再抛——不部分落盘（同场景 34 三步范式）。
+  const staging = `dist/.staging/${name}-${version}-${Date.now()}`;
+  await exec.run(["tar", "-tzf", archive], { timeoutMs: 120000 });   // 预检（快速失败）
+  await exec.run(["tar", "-xzf", archive, "-C", staging], { timeoutMs: 120000 });
+  // ……（此处省略 walk 校验：同场景 34③ 的 symlink/体积对账，失败先 fs.remove(staging, {recursive:true})）
+  const dest = `dist/${name}-${version}`;
+  await fs.rename(staging, dest);
+
+  // —— 步骤 5：读 manifest（yaml.parse 三预算防炸弹）——
+  const manifest = yaml.parse(await fs.readTextFile(`${dest}/manifest.yaml`)) as
+    { name: string; version: string; /* … */ };
+
+  // —— 步骤 6：config 回写（anonymous_paths 并入 / vars.ojm_solutions_gen 自增）——
+  // 特权前提：config.yaml 须落在 platform.trusted_paths 内（① 已配 "."）；模块须 platform.modules。
+  // 为什么 fail-closed：走「文本手术 + yaml.parse 复检 + sha256 自校验」三步，而不是
+  // yaml.stringify 全量覆盖——后者会丢注释与空白（见 §6 yaml 警告）。
+  try {
+    await patchConfigCommit(name, version);
+  } catch (e) {
+    await fs.remove(dest, { recursive: true });
+    json.fail(500, `config patch failed: ${String(e)}`);
+    return;
+  }
+
+  // —— 步骤 7：迁移（约束 B 先于热更；fail-closed：必须校验 exit code）——
+  // 特权前提：platform.exec 须含 oj migrate 模板（① 已配）。
+  const r = await exec.run(
+    ["oj", "migrate", "-c", "../config.yaml", "--format", "json", "-d", "dist", `${name}-${version}`],
+    { timeoutMs: 600000 },   // 大表迁移可能超缺省 30s，显式调大（硬上限 600s）
+  );
+  const out = JSON.parse(r.stdout) as
+    { results: { module: string; ok: boolean; error?: string }[]; error: null | string };
+  // 退出码才是成败真源：任一模块失败 json 仍成功解析、只是 results[].ok=false 且进程退非 0。
+  const allOk = r.code === 0 && out.results.every((x) => x.ok);
+  if (!allOk) {
+    await fs.remove(dest, { recursive: true });   // 删版本目录
+    await restoreConfig();                        // 恢复锁（撤销步骤 6 的回写）
+    json.fail(500, "migration failed");
+    return;
+  }
+
+  // —— 步骤 8：热更（特权前提：模块须 platform.modules；reloadConfig 仅特权模块可调）——
+  // 返回恒定五键：generation + unchanged + 三清单（applied/restart_pending/kept_listener）。
+  const rc = await server.reloadConfig();
+  // 验收项：若 restart_pending 含 platform/fs，说明本进程不重建后端/fs 根，须提示运维重启。
+  if (rc.restart_pending.some((s) => s === "platform" || s === "fs")) {
+    log.warn("solution installed but restart required", "pending", rc.restart_pending);
+  }
+  json.ok({ generation: rc.generation, restart_pending: rc.restart_pending });
+}
+
+// 步骤 6 的「文本手术三步」辅助：只插/改目标段，不碰其余文本。
+async function patchConfigCommit(name: string, version: string): Promise<void> {
+  const cfgPath = "../config.yaml";                 // 经 trusted_paths 折叠后落在项目根
+  const before = await fs.readTextFile(cfgPath);
+  // ① 文本手术：把新模块加进 mounts（或 anonymous_paths / vars.ojm_solutions_gen）
+  //    ——这里以「给 vars 加一个计数器键」为例，避免正则误伤其它段：
+  const marker = "vars:";
+  const inject = `\n  ojm_solutions_gen: "${(await readGen(before)) + 1}"`; // 自增计数器
+  let next = before.includes("\nvars:")
+    ? before.replace(/\nvars:\s*\n/, `\nvars:${inject}\n`)
+    : `${before.trimEnd()}\nvars:${inject}\n`;
+  // ② yaml.parse 复检：确保仍是合法 YAML（手术没把结构打断）
+  yaml.parse(next);
+  // ③ 写回 + sha256 自校验：写后再读回，摘要一致才认为落盘完整（防静默截断）
+  await fs.writeTextFile(cfgPath, next);
+  const written = await fs.readTextFile(cfgPath);
+  if (crypto.sha256Hex(written) !== crypto.sha256Hex(next)) {
+    throw new Error("config self-check failed after write");
+  }
+}
+async function readGen(text: string): Promise<number> {
+  const v = yaml.parse(text) as { vars?: { ojm_solutions_gen?: string } };
+  return Number(v.vars?.ojm_solutions_gen ?? "0") || 0;
+}
+async function restoreConfig(): Promise<void> {
+  // 撤销 patchConfigCommit：恢复步骤 6 之前的 config（生产建议先备份 config.yaml.bak，此处从备份回填）
+  const bak = await fs.readTextFile("../config.yaml.bak");
+  await fs.writeTextFile("../config.yaml", bak);
+}
+
+export default { post };
+```
+
+### ③ 验证
+
+```bash
+# 触发安装（运维/市场调用，特权模块归属来自 mounts，无需手动带租户头）
+curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/install/ \
+  -H 'content-type: application/json' \
+  -d '{"offer":"pkg/1.0.0"}'
+# 成功 → {"code":0,"data":{"generation":N,"restart_pending":[...]}}
+# 失败任一环节 → 不落盘/不改锁/不热更；迁移失败会删版本目录 + 还原 config
+
+# 验收：install 后手动改坏 config.yaml 的 sha256 段，看 reloadConfig 是否仍拒绝（旧代继续服务）
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `crypto.verifyEd25519` 报 `verifyEd25519: key not hex/base64` / `public key must be 32 raw bytes` | 公钥传了 base64url（含 `-`/`_`）或 PEM/SPKI，或不是 32 字节原始 key——只收 hex/base64 编码的 32 字节原始公钥；签名只收标准 base64（**base64url 不支持**）；格式错抛错、验签不过返回 `false`（v0.1.75） |
+| `crypto.sha256Hex(123)` 抛 TypeError | v0.1.75 行为变更：非 string/二进制入参（number/null）现抛错，不再经 `String()` 强转求摘要——显式 `String(x)` 或改传 `Uint8Array` |
+| `crypto.md5Hex` 用在签名/完整性校验 | MD5 已密码学破损，仅限缓存键/etag/旧系统兼容；本场景完整性用 `sha256Hex`、真实性用 `verifyEd25519`，**不要**用 md5 |
+| `exec.run` 报 `module 'ojm-installer' is not authorized for exec` | 步骤 4/7 的 tar / oj migrate 模板没进 `platform.exec.ojm-installer.allow`；**exec 授权 ≠ `platform.modules`**，两名单独立 |
+| `exec ${path:config}: path outside fs.root and trusted_paths` | `../config.yaml` 没落在 `platform.trusted_paths` 内——把 config 所在根加进 `trusted_paths`（场景 33） |
+| `server.reloadConfig` 报 `NotCapable: module 'x' is not platform-privileged` | 步骤 8 的调用模块不在 `platform.modules`，或没部署在 `platform.root` 下，或受控根没列为 `mounts[].api` 条目——三缺一 |
+| `oj migrate` 子进程里 `argv[0]` 不是 "oj" 原文 | 预期：宿主把 "oj" 解析为服务进程自身（`current_exe()`）——模板首 token 写裸名 `oj` 即可 |
+| `exec output limit exceeded` / `exec timed out after 600000 ms` | tar 大包成员列表可超 stdout 合计 10MB；大表迁移超 600s——本场景已显式把 migrate 的 `timeoutMs` 调到硬上限 600s，tar 调 120s |
+| 只 `JSON.parse(r.stdout)` 成功就当迁移成功 | json `error` 已脱敏、迁移失败仍成功解析——**退出码 `r.code` 才是真源**，必须 `r.code===0 && results.every(ok)` |
+| `yaml.stringify` 回写 config.yaml 后注释全丢 | 本场景刻意走「文本手术三步」而非 stringify 覆盖——serde_yaml 丢注释，config 回写禁走 stringify（§6 yaml） |
+
+---
 

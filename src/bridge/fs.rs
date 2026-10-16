@@ -43,8 +43,16 @@ impl FsGrant {
 /// 仅 read/write 随授权收窄：None = 双 deny；Some(readonly) = read 限定 root；
 /// Some(rw) = 双轴限定 root。每个 JsRuntime 的 bridge_ext state 闭包各调一次。
 pub fn permissions_for(grant: Option<&FsGrant>) -> Permissions {
+    let roots = grant.map(|g| vec![g.root.to_string_lossy().into_owned()]);
+    let readonly = grant.is_some_and(|g| g.readonly);
+    permissions_for_roots(roots, readonly)
+}
+
+/// read/write 授权根集合 → deno 权限集（构建单点：非特权 [`permissions_for`] 与
+/// 特权 [`container_for_module`] 共用，readonly 语义一致——readonly 时 write 轴
+/// 不给任何 allow = 整体 deny，对 trusted_paths 同样生效）。
+fn permissions_for_roots(read_roots: Option<Vec<String>>, readonly: bool) -> Permissions {
     let parser = RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys);
-    let root_str = |g: &FsGrant| g.root.to_string_lossy().into_owned();
     let opts = PermissionsOptions {
         allow_env: None,
         deny_env: None,
@@ -53,7 +61,7 @@ pub fn permissions_for(grant: Option<&FsGrant>) -> Permissions {
         deny_net: None,
         allow_ffi: None,
         deny_ffi: None,
-        allow_read: grant.map(|g| vec![root_str(g)]),
+        allow_read: read_roots.clone(),
         deny_read: None,
         ignore_read: None,
         allow_run: None,
@@ -61,7 +69,7 @@ pub fn permissions_for(grant: Option<&FsGrant>) -> Permissions {
         allow_sys: None,
         deny_sys: None,
         // readonly 时 write 轴不给任何 allow → 整体 deny。
-        allow_write: grant.filter(|g| !g.readonly).map(|g| vec![root_str(g)]),
+        allow_write: read_roots.filter(|_| !readonly),
         deny_write: None,
         allow_import: None,
         deny_import: None,
@@ -81,6 +89,41 @@ pub fn container_for(grant: Option<&FsGrant>) -> PermissionsContainer {
     PermissionsContainer::new(Arc::new(parser), permissions_for(grant))
 }
 
+/// 按模块特权级构建容器（ojm 批次，设计稿 §1.6）：特权模块
+/// （`module ∈ platform.modules`）的 read/write 授权面 = fs.root ∪ trusted_paths；
+/// 其余一律走既有 [`container_for`]（非特权行为零变化）。
+///
+/// 调用点：`Bridge::checkout_reset` 每请求换装（deno fs op 的权限检查是第二道
+/// 防线， trusted 路径可及性缺这步会被 deno_permissions 拒掉）。`fs:` 未配置时
+/// 恒非特权（fail-closed：trusted_paths 不在没有 jail 的前提下放行任何路径）。
+pub fn container_for_module(
+    grant: Option<&FsGrant>,
+    platform: Option<&crate::bridge::platform::PlatformGrant>,
+    module: Option<&str>,
+) -> PermissionsContainer {
+    let privileged =
+        grant.is_some() && module.is_some_and(|m| platform.is_some_and(|p| p.modules.contains(m)));
+    if !privileged {
+        return container_for(grant);
+    }
+    let g = grant.expect("privileged implies fs grant (checked above)");
+    let p = platform.expect("privileged implies platform grant (checked above)");
+    // PlatformGrant.trusted 首位即 fs.root（grant 构建期并入去重）；此处仍防御性
+    // 去重，防手构 grant 或重复根把同一 allowlist 条目灌两遍。
+    let mut roots = vec![g.root.to_string_lossy().into_owned()];
+    for t in &p.trusted {
+        let s = t.to_string_lossy().into_owned();
+        if !roots.contains(&s) {
+            roots.push(s);
+        }
+    }
+    let parser = RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys);
+    PermissionsContainer::new(
+        Arc::new(parser),
+        permissions_for_roots(Some(roots), g.readonly),
+    )
+}
+
 /// 门面层的 jail 裁决（v1 安全关键）：相对路径先按 jail 根 lexical 折叠成绝对
 /// 路径（`.` 丢弃、`..` 对 root 逐级上托——Windows verbatim 路径不归一 `..`，
 /// 必须先折平再 canonicalize；此前的 JS 侧字符串拼接在 verbatim 根上产生
@@ -97,16 +140,27 @@ pub fn op_fs_resolve(
     state: &mut OpState,
     #[string] path: String,
 ) -> Result<String, deno_error::JsErrorBox> {
-    let grant = state.borrow::<Arc<crate::bridge::StableState>>().fs.clone();
+    let (grant, platform) = {
+        let stable = state.borrow::<Arc<crate::bridge::StableState>>();
+        (stable.fs.clone(), stable.platform.clone())
+    };
     let grant = grant.ok_or_else(|| {
         deno_error::JsErrorBox::new(
             "NotCapable",
             "fs not configured (config fs: section missing)",
         )
     })?;
+    // 特权双查（ojm 批次，设计稿 §1.6）：ReqState.module ∈ platform.modules →
+    // 判定集合 = fs.root ∪ trusted_paths（resolve_allowed 同一集合语义）；否则
+    // 行为完全不变（仅 fs.root）。
+    let module = state.borrow::<crate::bridge::ReqState>().module.clone();
+    let trusted: &[PathBuf] = match (&platform, &module) {
+        (Some(p), Some(m)) if p.modules.contains(m) => &p.trusted,
+        _ => &[],
+    };
     let joined = join_jailed(&grant.root, Path::new(&path));
     let resolved = resolve_existing(&joined)?;
-    if !resolved.starts_with(&grant.root) {
+    if !resolved.starts_with(&grant.root) && !trusted.iter().any(|t| resolved.starts_with(t)) {
         return Err(deno_error::JsErrorBox::new(
             "NotCapable",
             format!("path escapes fs.root: {path}"),
@@ -117,7 +171,9 @@ pub fn op_fs_resolve(
 
 /// 相对 → jail 内绝对（lexical 折叠，不触盘）；绝对路径原样返回。折叠对
 /// `..` 上托越过 root 时得到的短路径交给 canonicalize 后的 starts_with 拒绝。
-fn join_jailed(root: &Path, p: &Path) -> PathBuf {
+/// `pub(crate)`：platform.rs 的 [`crate::bridge::platform::resolve_allowed`]
+/// 复用同一折叠实现（路径校验单点，DRY——两处语义漂移即逃逸面）。
+pub(crate) fn join_jailed(root: &Path, p: &Path) -> PathBuf {
     use std::path::Component;
     if p.is_absolute() {
         return p.to_path_buf();
@@ -139,7 +195,8 @@ fn join_jailed(root: &Path, p: &Path) -> PathBuf {
 }
 
 /// best-effort canonicalize：逐级上溯到最近存在的祖先，canonicalize 后拼回后缀。
-fn resolve_existing(p: &Path) -> Result<PathBuf, deno_error::JsErrorBox> {
+/// `pub(crate)`：同 [`join_jailed`]，platform.rs 路径校验单点复用。
+pub(crate) fn resolve_existing(p: &Path) -> Result<PathBuf, deno_error::JsErrorBox> {
     let mut ancestor = p;
     let mut suffix: Vec<&std::ffi::OsStr> = Vec::new();
     loop {
@@ -312,6 +369,138 @@ mod tests {
             let e = b.run_with(code, Default::default()).await.unwrap_err();
             assert!(e.to_string().contains("NotCapable"), "{code} -> {e}");
         }
+    }
+
+    /// 特权模块（ReqState.module ∈ platform.modules）fs 轴扩展（BDD S5，ojm 批次）：
+    /// trusted_paths 内文件读写可及（门面裁决 + deno 第二道防线同口径放行）；
+    /// 非特权模块同路径仍 NotCapable（既有 jail 行为零变化）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs_trusted_paths_reachable_for_privileged_module_only() {
+        use crate::bridge::ModuleCtx;
+        use crate::bridge::module_loader::LoaderShared;
+        use crate::bridge::platform::PlatformGrant;
+        // macOS 下 temp_dir 经 symlink：统一 canonical，防前缀比对被形态打穿。
+        let root = jail("platfs").canonicalize().unwrap();
+        let trusted_dir = jail("platfs-trusted").canonicalize().unwrap();
+        std::fs::write(trusted_dir.join("config.yaml"), b"cfg").unwrap();
+        let grant = FsGrant::new(&root, false).unwrap();
+        let platform = Arc::new(
+            PlatformGrant::new(
+                vec!["plat".into()],
+                std::slice::from_ref(&trusted_dir),
+                Some(&grant.root),
+            )
+            .unwrap(),
+        );
+        // 模块树：plat 模块（api.js），归属键 = 模块目录绝对路径（§5.3 装配形态）。
+        let base = jail("platfs-mod").canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("plat")).unwrap();
+        let cfg_path = trusted_dir.join("config.yaml");
+        let out_path = trusted_dir.join("out.txt");
+        std::fs::write(
+            base.join("plat/api.js"),
+            format!(
+                "export async function readTrusted() {{\n\
+                 \x20 const t = await fs.readTextFile(\"{cfg}\");\n\
+                 \x20 json.ok({{ t }});\n\
+                 }}\n\
+                 export async function writeTrusted() {{\n\
+                 \x20 await fs.writeTextFile(\"{out}\", \"hi\");\n\
+                 \x20 json.ok({{ done: true }});\n\
+                 }}\n\
+                 export default {{ readTrusted, writeTrusted }};\n",
+                cfg = cfg_path.display(),
+                out = out_path.display(),
+            ),
+        )
+        .unwrap();
+        let mut modules = HashMap::new();
+        modules.insert(
+            base.join("plat").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "plat".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        );
+        let b = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: base.clone(),
+                ts: false,
+            })),
+            Extras {
+                fs: Some(Arc::new(grant)),
+                platform: Some(platform),
+                modules: Arc::new(modules),
+                ..Default::default()
+            },
+        );
+        let t = std::time::Duration::from_secs(5);
+        let api = base.join("plat/api.js");
+
+        // ① 特权模块：trusted 文件读 + 写都可达（写的是新文件——resolve_existing
+        //    逐级上溯到 trusted 根拼回后缀，落点仍在集合内）。
+        let cap = b
+            .run_module(&api, "readTrusted", Default::default(), t)
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+        let cap = b
+            .run_module(&api, "writeTrusted", Default::default(), t)
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+        assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "hi");
+
+        // ② 非特权（run_with 无模块归属）：同一路径两态皆拒（门面 NotCapable）。
+        for code in [
+            format!(
+                r#"(async () => {{ await fs.readTextFile("{}"); }})();"#,
+                cfg_path.display()
+            ),
+            format!(
+                r#"(async () => {{ await fs.writeTextFile("{}", "x"); }})();"#,
+                out_path.display()
+            ),
+        ] {
+            let e = b.run_with(&code, Default::default()).await.unwrap_err();
+            assert!(e.to_string().contains("NotCapable"), "{code} -> {e}");
+        }
+        // ③ 非特权模块（归属模块不在 platform.modules）：同样拒。
+        let mut modules2 = HashMap::new();
+        modules2.insert(
+            base.join("plat").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "plain".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        );
+        let b2 = Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared {
+                project_root: base.clone(),
+                ts: false,
+            })),
+            Extras {
+                fs: b.stable_for_test().fs.clone(),
+                platform: b.stable_for_test().platform.clone(),
+                modules: Arc::new(modules2),
+                ..Default::default()
+            },
+        );
+        let e = b2
+            .run_module(&api, "readTrusted", Default::default(), t)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("NotCapable"), "{e}");
     }
 
     /// root 内 symlink 指向 root 外 → 读仍被拒（canonicalize 双侧封逃逸）。

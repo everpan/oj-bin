@@ -43,6 +43,9 @@ getrandom = "0.2"
 # Rust regex != ECMA-262，非法 pattern 在契约注册期 fail-fast。
 regex = "1.13"
 jsonwebtoken = "9"
+# Ed25519 验签（ojm native exec 阶段 0）：ring 已在依赖树（jsonwebtoken 9.3.1 经
+# ring 0.17；serve 亦直依），显式声明钉死版本面，防上游 feature 漂移。
+ring = "0.17"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
@@ -60,6 +63,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 sea-query = "1.0"
 sha2 = "0.10"
+# md5Hex（v0.1.75）：与 sha2 同属 RustCrypto digest 0.10 家族，共享 generic-array 底座。
+md-5 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "macros",
@@ -73,7 +78,7 @@ futures = "0.3"
 # 规避 sqlx Query 借用 &str 无法返回 'static 装箱流的问题。
 async-stream = "0.3"
 bytes = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs", "process"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -86,6 +91,13 @@ object_store = { version = "0.14.1", features = ["aws"] }
 aes-gcm = { version = "0.10", features = ["std"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 hkdf = "0.12"
+
+# exec.run 超时组杀（ojm 批次，设计稿 §1.3.5）：kill(-pgid, SIGKILL)。std 无进程组
+# kill 原语；libc 已在依赖树（tokio/sqlx 等传递引入，lock 单版本 0.2.189），
+# target 门控直依同版本 → 零新增编译单元；仅 unix（Windows 无进程组对应物，
+# 只杀直接子进程并已在部署文档声明）。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # env-gated 真库用例需要具体驱动：`src/bridge/db.rs` 的 `next_seq_first_use_inside_tx_on_real_db`

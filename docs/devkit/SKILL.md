@@ -210,6 +210,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `oj exec` import 报 escapes project root / 找不到 `./util` | 相对导入钳制在项目根（config 所在目录）内且**必须显式扩展名**（`import "./util.ts"`）；脚本放项目外连 `./util.ts` 都导不了 |
 | `oj exec -e/--code` / `--repl` 里 `import "./util"` 报找不到 | 内联代码与 REPL 行**无基准目录**，不支持相对 import——要复用抽出的模块请改走 `oj exec <file>` |
 | `oj exec` 报迁移相关意外 | exec 迁移默认 **off**（serve dev 缺省 auto，两命令相反）；config 显式 `migrate_on_start` 才执行 |
+| `yaml.parse` 报 `node budget exceeded` / `alias budget exceeded` | 输入在 1MB 内但 alias 链式展开超预算（billion laughs 防护，v0.1.75）——压缩引用层数；正常 manifests.yaml（千节点级）远离预算。超 2^53-1 的整数为十进制字符串，不是 number |
+| `yaml.stringify` 回写 config.yaml 后注释全丢 | stringify 是 serde_yaml 往返，只保语义不保文本——**禁用于 config.yaml**；回写走文本手术三步模式（`fs.readTextFile` → 只改目标段 → `yaml.parse` 复检 → 写回） |
+| `yaml.parse` 报 `non-string mapping key` / `expected a single YAML document` | int/bool/null 键与多文档（`---`）都不接受——需键值对齐 machine 产物形态；重复键后键覆盖（不报错） |
 | `oj exec --log-file` 没生成文件 | 打开失败只 stderr warn 一次、不中断脚本——看 stderr 首行 warn（路径不可写等） |
 | 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |
@@ -251,6 +254,16 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 跨域启动直接报错退出 | `server.cors.credentials: true` 且 `origins` 为空——带凭据的 `*` 非法；配显式 `origins`（v0.1.35） |
 | 跨域响应没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂 CORS 层，与旧版一致）；或 `origins: ["*"]` 不展开——放行任意源就把 `origins` 留空（v0.1.35） |
 | `crypto.aesGcmEncrypt` 传 24 字节密钥报错 | 不支持 AES-192——密钥仅 16（AES-128）/32（AES-256）字节的 hex 或 base64；应用层加解密，密钥自管不进 config（v0.1.35） |
+| `crypto.verifyEd25519` 报 `verifyEd25519: key not hex/base64` | 公钥传了 base64url（含 `-`/`_`）或 PEM——只收 hex/base64 编码的 32 字节**原始** key（PEM/SPKI 不支持）；签名同理只收标准 base64（**base64url 不支持**）。格式错抛错、验签不过返回 `false`（v0.1.75） |
+| 特权模块运行时报 `NotCapable: module 'x' is not platform-privileged` | 部署形态陷阱：模块必须部署在 `platform.root` 下**且**该目录列为 `mounts[].api` 条目（归属与路由只能来自挂载 discover），再加 `platform.modules` 名单——三缺一都拿不到特权；`platform:` 段整个不配则报 `platform not configured`（fail-closed，v0.1.75） |
+| `exec.run` 报 `NotCapable: … not authorized for exec` / `template mismatch` / `ambiguous` | **exec 授权 ≠ `platform.modules`**（两名单独立，只配一边拿不到另一边）：`platform.exec.<模块>.allow` 里要有匹配的 argv 模板——literal token 逐字相等、`${path:}`/`${raw:}` 占位符恰吸一 token、同一 argv 命中两条模板即歧义拒绝（v0.1.75） |
+| `exec.run` 里给子进程传相对路径就以为出不了 jail | cwd 钉在 fs.root 但**不构成隔离边界**——路径越界防线在 `${path:}` 占位符校验（`fs.root ∪ trusted_paths`），别把越出集合的路径交给子进程（v0.1.75） |
+| exec 子进程里 `argv[0]` 和模板首 token 不一致 | 预期：宿主侧把首 token 解析为**绝对路径**（"oj"→服务进程自身，其余 PATH 解析）再传给子进程；模板首 token 必须是裸名（路径分隔符直接拒）（v0.1.75） |
+| `exec.run` 大 stdin 报 `exec timed out after N ms` | stdin 写入也在超时窗口内：子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（缺省 30s）——大 DDL / 大输入显式调大 `timeoutMs`（硬上限 600s，超出钳制）（v0.1.75） |
+| `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |
+| 安装器靠 `oj migrate --format json` 的 JSON 解析成功就当迁移成功 | json `error` 字段已脱敏（`<scheme>://***@host`，不漏密码），但**退出码**才是成败真源：任一模块失败 json 仍成功解析、只是 `results[]` 里 `ok=false` 且进程退非 0——安装器必须校验 exit code，不能只 `JSON.parse` 成功 |
+| 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
+| `crypto.md5Hex` 用在凭据/签名/完整性校验上 | MD5 已密码学破损——仅限**非安全场景**（缓存键/etag/旧系统兼容），安全用途改 `sha256Hex` 或 `bcrypt`（v0.1.75） |
 
 ## 手册
 

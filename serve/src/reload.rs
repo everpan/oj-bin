@@ -22,23 +22,17 @@ use tokio::sync::{Mutex, watch};
 use tower::util::ServiceExt;
 
 /// 热更执行结果（POST 成功返回体）。
-#[derive(Clone, Debug)]
-pub struct ReloadOutcome {
-    /// 代际 id（每次成功 swap +1；unchanged 时不变）。
-    pub generation: u64,
-    /// 本代已生效段。
-    pub applied: Vec<String>,
-    /// 已验证合法但本代沿用旧值、重启后生效。
-    pub restart_pending: Vec<String>,
-    /// listener 级沿旧（port/host/certificate_path/public_key_path）。
-    pub kept_listener: Vec<String>,
-    /// 归一后 cfg 与当前代相同（幂等）。
-    pub unchanged: bool,
-}
+///
+/// **单一真源**（ojm PR-3 类型下沉，设计稿 §3）：定义在根 crate
+/// `only_js::bridge::reload_bridge`，此处 re-export——HTTP 端点序列化与
+/// JS `server.reloadConfig()` 共用同一结构，根 crate 不可反向依赖 serve。
+pub use only_js::bridge::reload_bridge::ReloadOutcome;
 
 /// 热更执行闭包类型：`oj` 侧注入。同步执行（内部用 blocking 线程做影子装配），
 /// 返回 `Ok(outcome)` 或 `Err((status, msg))`（`status`=HTTP 状态，400/500）。
-pub type ReloadExecutor = Arc<dyn Fn() -> Result<ReloadOutcome, (u16, String)> + Send + Sync>;
+/// 与根 crate 的 [`only_js::bridge::reload_bridge::ReloadExecutorLike`] 同一类型：
+/// 槽位（Extras/StableState.reload）与 HTTP 侧注入的是同一 executor 实例。
+pub type ReloadExecutor = only_js::bridge::reload_bridge::ReloadExecutorLike;
 
 /// 代际元数据（GET 摘要来源）。
 #[derive(Clone, Debug)]
@@ -136,6 +130,40 @@ impl ReloadState {
     /// 不可用 `blocking_lock`（会 panic "Cannot block the current thread"）。
     pub async fn set_executor(&self, ex: ReloadExecutor) {
         *self.executor.lock().await = Some(ex);
+    }
+
+    /// busy 错误（409）：共享 busy 文案——HTTP 线上行为逐字节不变（v1 既有），
+    /// JS 侧 op 映射时叠加 busy 语义点名。
+    fn busy() -> (u16, String) {
+        (409u16, "reload in progress".to_string())
+    }
+
+    /// executor 未就绪（503）：`ReloadState` 已构造但 executor 尚未注入。
+    fn not_ready() -> (u16, String) {
+        (503u16, "reload executor not ready".to_string())
+    }
+
+    /// 共享触发入口（异步形态，HTTP POST 专用）：try_lock(`reload_lock`) 串行化
+    /// → 取 executor → 同步执行。JS `server.reloadConfig` 经
+    /// [`Self::trigger_sync`]（spawn_blocking 线程）调**同一 executor 实例与
+    /// 同一把 `reload_lock`**（共享处理体，设计稿 §3；撞锁 → busy 明确报错，
+    /// 不静默并发排队）。
+    pub async fn trigger(&self) -> Result<ReloadOutcome, (u16, String)> {
+        let _guard = self.reload_lock.try_lock().map_err(|_| Self::busy())?;
+        let exec = self.executor.lock().await;
+        let exec = exec.as_ref().ok_or_else(Self::not_ready)?;
+        exec()
+    }
+
+    /// 共享触发入口（同步形态，JS `server.reloadConfig` 经 spawn_blocking 调用）。
+    /// tokio Mutex 的 `try_lock` 是同步操作，可在阻塞池线程内完成；`reload_lock`
+    /// 已串行化全部触发（HTTP 侧经 [`Self::trigger`] 先抢同一把锁），executor
+    /// 锁此处实际无竞争，`try_lock` 失败按 busy 归类（防御性，不可达路径）。
+    pub fn trigger_sync(&self) -> Result<ReloadOutcome, (u16, String)> {
+        let _guard = self.reload_lock.try_lock().map_err(|_| Self::busy())?;
+        let exec = self.executor.try_lock().map_err(|_| Self::busy())?;
+        let exec = exec.as_ref().ok_or_else(Self::not_ready)?;
+        exec()
     }
 
     /// 取出提交句柄（供 `reload_executor` 闭包捕获）。
@@ -286,50 +314,15 @@ async fn handle_config(
                 )
                     .into_response();
             }
-            // 串行化：并发 POST → 后来者 409 busy。
-            let _guard = match rs.reload_lock.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(Value::String("reload in progress".to_string())),
-                    )
-                        .into_response();
-                }
-            };
-            let exec = rs.executor.lock().await;
-            let exec = match exec.as_ref() {
-                Some(e) => e,
-                None => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(Value::String("reload executor not ready".to_string())),
-                    )
-                        .into_response();
-                }
-            };
-            match exec() {
-                Ok(outcome) => {
-                    if outcome.unchanged {
-                        Json(serde_json::json!({
-                            "code": 0,
-                            "msg": "unchanged",
-                            "generation": outcome.generation,
-                        }))
-                        .into_response()
-                    } else {
-                        Json(serde_json::json!({
-                            "code": 0,
-                            "data": {
-                                "generation": outcome.generation,
-                                "applied": outcome.applied,
-                                "restart_pending": outcome.restart_pending,
-                                "kept_listener": outcome.kept_listener,
-                            }
-                        }))
-                        .into_response()
-                    }
-                }
+            // 共享处理体（设计稿 §3）：try_lock → executor → outcome 映射收敛在
+            // [`ReloadState::trigger`] / [`outcome_response`]，HTTP POST 与 JS
+            // `server.reloadConfig`（槽位闭包 → `trigger_sync`）同源——同一把
+            // reload_lock、同一 executor 实例，形状/状态码由结构保证逐字对齐。
+            // JS 侧经 spawn_blocking 调用（executor 同步闭包，Send+Sync 已成立）；
+            // **既定语义**：触发 reload 的 handler 所在 actor 在热更期间被占用
+            // （秒级，DB verify + 转译），完成前不归还池。
+            match rs.trigger().await {
+                Ok(outcome) => outcome_response(outcome),
                 Err((status, msg)) => (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     Json(Value::String(msg)),
@@ -338,6 +331,31 @@ async fn handle_config(
             }
         }
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
+
+/// outcome → HTTP 响应（唯一映射点；v1 线上行为逐字节不变）：
+/// unchanged → `{code:0,msg:"unchanged",generation}`（无三清单）；
+/// 其余 → `{code:0,data:{generation,applied,restart_pending,kept_listener}}`。
+fn outcome_response(outcome: ReloadOutcome) -> Response<Body> {
+    if outcome.unchanged {
+        Json(serde_json::json!({
+            "code": 0,
+            "msg": "unchanged",
+            "generation": outcome.generation,
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "generation": outcome.generation,
+                "applied": outcome.applied,
+                "restart_pending": outcome.restart_pending,
+                "kept_listener": outcome.kept_listener,
+            }
+        }))
+        .into_response()
     }
 }
 
@@ -355,4 +373,138 @@ pub async fn serve_swappable(
     )
     .with_graceful_shutdown(shutdown)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    fn state() -> Arc<ReloadState> {
+        ReloadState::new(
+            Arc::new(Router::new()),
+            vec![],
+            None,
+            true,
+            PathBuf::from("config.yaml"),
+            None,
+        )
+    }
+
+    fn outcome(generation: u64, unchanged: bool) -> ReloadOutcome {
+        ReloadOutcome {
+            generation,
+            unchanged,
+            applied: Vec::new(),
+            restart_pending: Vec::new(),
+            kept_listener: Vec::new(),
+        }
+    }
+
+    /// 撞 reload_lock → busy（共享串行化语义，HTTP 与 JS 同一把锁）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_busy_when_reload_lock_held() {
+        let rs = state();
+        let _g = rs.reload_lock.try_lock().unwrap();
+        let e = rs.trigger().await.unwrap_err();
+        assert_eq!(e.0, 409);
+        assert_eq!(e.1, "reload in progress");
+        // 同步形态（JS spawn_blocking 路径）同一把锁：同样 busy。
+        let e = rs.trigger_sync().unwrap_err();
+        assert_eq!(e.0, 409);
+        assert_eq!(e.1, "reload in progress");
+    }
+
+    /// executor 缺席 → 503；注入后 async/sync 两形态同源。
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_not_ready_then_executor_shared() {
+        let rs = state();
+        let e = rs.trigger().await.unwrap_err();
+        assert_eq!(e.0, 503);
+        let e = rs.trigger_sync().unwrap_err();
+        assert_eq!(e.0, 503);
+
+        let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = called.clone();
+        rs.set_executor(Arc::new(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(outcome(7, true))
+        }))
+        .await;
+        let o = rs.trigger().await.unwrap();
+        assert!(o.unchanged && o.generation == 7);
+        let o = rs.trigger_sync().unwrap();
+        assert!(o.unchanged && o.generation == 7);
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Err((status, msg)) 透传（oj 侧装配失败 400/500 形态）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn trigger_propagates_executor_error() {
+        let rs = state();
+        rs.set_executor(Arc::new(|| Err((400u16, "bad config".to_string()))))
+            .await;
+        let e = rs.trigger().await.unwrap_err();
+        assert_eq!(e.0, 400);
+        assert_eq!(e.1, "bad config");
+    }
+
+    /// outcome → HTTP 响应形状（v1 线上行为逐字节不变）：unchanged 三键无清单，
+    /// 其余 code/data 四键。
+    #[test]
+    fn outcome_response_shapes() {
+        let resp = outcome_response(outcome(3, true));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = serde_json::json!({
+            "code": 0,
+            "msg": "unchanged",
+            "generation": 3,
+        });
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"code":0,"msg":"unchanged","generation":3}"#
+        );
+
+        let resp = outcome_response(ReloadOutcome {
+            generation: 4,
+            unchanged: false,
+            applied: vec!["vars".into()],
+            restart_pending: vec!["db".into()],
+            kept_listener: vec!["server".into()],
+        });
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "generation": 4,
+                "applied": ["vars"],
+                "restart_pending": ["db"],
+                "kept_listener": ["server"],
+            }
+        });
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"code":0,"data":{"generation":4,"applied":["vars"],"restart_pending":["db"],"kept_listener":["server"]}}"#
+        );
+    }
+
+    /// busy 期间 executor 不被触碰：串行化先于取 executor（共享处理体的次序契约）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_precedes_executor_fetch() {
+        let rs = state();
+        let c = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = c.clone();
+        rs.set_executor(Arc::new(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(outcome(1, false))
+        }))
+        .await;
+        // 先抢锁模拟在跑的 reload，再触发：busy，executor 未被调用。
+        let _g = rs.reload_lock.try_lock().unwrap();
+        let e = rs.trigger().await.unwrap_err();
+        assert_eq!(e.0, 409);
+        assert_eq!(c.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
