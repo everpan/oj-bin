@@ -4542,6 +4542,7 @@ dependencies = [
  "oj-plugin-ffi",
  "rand 0.10.2",
  "regex",
+ "ring",
  "rsa 0.9.10",
  "rustls",
  "sea-query",

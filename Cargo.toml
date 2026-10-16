@@ -43,6 +43,9 @@ getrandom = "0.2"
 # Rust regex != ECMA-262，非法 pattern 在契约注册期 fail-fast。
 regex = "1.13"
 jsonwebtoken = "9"
+# Ed25519 验签（ojm native exec 阶段 0）：ring 已在依赖树（jsonwebtoken 9.3.1 经
+# ring 0.17；serve 亦直依），显式声明钉死版本面，防上游 feature 漂移。
+ring = "0.17"
 libloading = "0.9.0"
 oj-cert = { path = "tools/oj-cert" }
 oj-plugin-ffi = { path = "oj-plugin-ffi" }
@@ -73,7 +76,7 @@ futures = "0.3"
 # 规避 sqlx Query 借用 &str 无法返回 'static 装箱流的问题。
 async-stream = "0.3"
 bytes = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "time", "fs", "process"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

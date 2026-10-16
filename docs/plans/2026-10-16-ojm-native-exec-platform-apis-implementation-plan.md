@@ -295,3 +295,26 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 ## 附录：spike 结论
 
 （阶段 0 执行后回填：ring 链证据、Ed25519 API 确认、serde_yaml deprecated 评估、tar 方言探测。）
+
+### Task 0.1 + 0.2 实证结论（2026-10-16，worktree feat/ojm-native-exec）
+
+**ring 链证据**（`cargo tree -i ring@0.17`，Exit 0）：
+
+- 根链（预期存在，已证实）：`ring 0.17.14 ← jsonwebtoken 9.3.1 ← only-js`（根 crate 直接链）。
+- serve 侧链：`ring 0.17.14 ← serve`（`serve/Cargo.toml:25` 直依 `ring = "0.17"`）。
+- `Cargo.lock` 单版本：仅一条 `name = "ring"`，`version = "0.17.14"`（Cargo.lock:5577）。非 rustls 途经，与评审结论一致。
+
+**Ed25519 API 确认**（ring 0.17.14 源码，`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.14/`）：
+
+- `src/ec/curve25519/ed25519/verification.rs:34` 定义 `pub static ED25519: EdDSAParameters`，实现 `signature::VerificationAlgorithm`（`UnparsedPublicKey::new(&signature::ED25519, pk)` 用法见 `src/signature.rs:158` 文档示例）。
+- 经 `src/signature.rs:261-263` re-export 为 `ring::signature::ED25519`；该模块无任何 `cfg(feature)` 门控，ring 0.17 的 feature 仅影响汇编/后端选择，Ed25519 恒可用。签名侧 `signature::Ed25519KeyPair`（signing.rs）同在。
+- 结论：无需备选 `ed25519-dalek`，Step 3 不触发。
+
+**tokio process 现状**：
+
+- 基线（修改前）：根 `Cargo.toml:76` `[dependencies]` tokio features 为 `["macros", "rt", "sync", "net", "io-util", "time", "fs"]`，无 `"process"`——process 此前仅靠 deno/reqwest 上游 feature 统一隐式启用，证实「必须显式声明」的风险真实存在。
+- 已修：features 追加 `"process"`；`[dev-dependencies]` tokio（`Cargo.toml:111`）保持不动（最小改动）。
+
+**依赖声明**：根 `[dependencies]` 增 `ring = "0.17"`（紧邻 jsonwebtoken，含注释）；`cargo check --release` 通过，`Cargo.lock` 自动同步后仍单版本 0.17.14，无版本统一冲突。
+
+**serde_yaml / tar 方言探测**：待后续阶段任务执行后回填。
