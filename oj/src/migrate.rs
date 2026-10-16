@@ -385,26 +385,62 @@ const LEDGER_DDL: &str = "CREATE TABLE IF NOT EXISTS _oj_migrations (\
          checksum VARCHAR(255), \
          PRIMARY KEY (module, version));";
 
-/// 单模块 apply（无迁移目录 → 0）。baseline=true → Target::Fake（记账不执行）。
+/// 本轮新应用的迁移条目（`--format json` 的 applied 载荷；version/name 与账本
+/// 一致——name 为 refinery 解析后的 desc，即 `V{seq}__{desc}` 的 `{desc}`）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AppliedInfo {
+    pub version: i64,
+    pub name: String,
+}
+
+/// 账本内该模块最高已应用 seq（账本不可读 / 无行 → None）。
+/// 仅用于失败位点提示，不参与迁移决策。
+async fn ledger_head(acc: &Arc<dyn DataAccessor>, module: &str) -> Option<i64> {
+    let sql = format!(
+        "SELECT MAX(version) AS head FROM {LEDGER_TABLE} WHERE module = {}",
+        quote_str(module)
+    );
+    acc.query_with_params(&sql, &[])
+        .await
+        .ok()?
+        .first()
+        .and_then(|r| r["head"].as_i64())
+}
+
+/// 单模块 apply（无迁移目录 → 空表）。baseline=true → Target::Fake（记账不执行，
+/// refinery Fake 语义下 applied_migrations 为空——applied 只含**真执行**的新应用）。
+/// 失败 Err 携失败位点：`at seq {账本最高 seq+1}`（abort 语义 ⇒ 首败即停该模块，
+/// 账本头的下一个 seq 即失败迁移；json error 字段靠它点名 seq）。
 pub async fn apply_module(
     acc: &Arc<dyn DataAccessor>,
     module: &str,
     mdir: &Path,
     baseline: bool,
-) -> Result<usize, String> {
+) -> Result<Vec<AppliedInfo>, String> {
     let migs = load_migrations(&mdir.join("migrations"), acc.dialect())?;
     if migs.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let target = if baseline {
         Target::Fake
     } else {
         Target::Latest
     };
-    Ok(run_module(acc.clone(), module, &migs, target)
-        .await?
-        .applied_migrations()
-        .len())
+    match run_module(acc.clone(), module, &migs, target).await {
+        Ok(report) => Ok(report
+            .applied_migrations()
+            .iter()
+            .map(|m| AppliedInfo {
+                version: m.version(),
+                name: m.name().to_string(),
+            })
+            .collect()),
+        Err(e) => Err(match ledger_head(acc, module).await {
+            Some(h) => format!("at seq {}: {e}", h + 1),
+            // 账本空（该模块尚无任何已应用迁移）→ 失败位点即首个 seq 1。
+            None => format!("at seq 1: {e}"),
+        }),
+    }
 }
 
 /// 单模块 verify（release 启动校验，§4.6）：
@@ -475,12 +511,13 @@ pub async fn apply_all(
         return Ok(());
     };
     for (name, mdir) in crate::manifest::discover(dir, ts)? {
-        let n = apply_module(acc, &name, &mdir, baseline)
+        let applied = apply_module(acc, &name, &mdir, baseline)
             .await
             .map_err(|e| format!("module {name}: {e}"))?;
-        if n > 0 {
+        if !applied.is_empty() {
             eprintln!(
-                "migrate: {name}: {n} applied{}",
+                "migrate: {name}: {} applied{}",
+                applied.len(),
                 if baseline {
                     " (baseline, recorded only)"
                 } else {

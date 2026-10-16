@@ -277,6 +277,32 @@ tables:
 `manifest.yaml` 的 `db:` 绑定（那只是运行期路由）。所以模块绑不同库的项目，要
 `--db <profile> --module <M>` 逐组合各跑一遍（`scenarios.md` 场景 6）。
 
+### `oj migrate` 输出格式与模块定向
+
+**`--format json`**（机器可读，安装器/CI 收敛用）：continue-and-collect——单模块失败**不中断**其余模块，
+全部结果聚合成**一行 JSON** 打到 stdout（人读行改走 stderr，保证 stdout 纯净可解析）。输出契约：
+
+```json
+{ "results": [ { "module": "modA", "ok": true,  "applied": [ { "version": 1, "name": "init" } ] },
+               { "module": "modB", "ok": false, "error": "at seq 1: ..." } ],
+  "error": null }
+```
+
+- `results[]`：每模块一条；`ok=false` 时 `error` 携**脱敏后**原因（凭据段 `<scheme>://***@host`，
+  同 `secret::redact` 语义）。装配期（开库/目录解析）全局失败则 `results` 为空、`error` 携原因。
+- `applied[]`：本轮**新应用**的迁移（`version`/`name` 与账本一致，`name` 即 `V{seq}__{desc}` 的
+  `{desc}`）；幂等重跑为空数组；`--baseline` 记账不执行 → 空数组。
+- 退出码：任一模块失败即非 0（人读格式同样）；安装器**必须校验 exit code**，不能只凭 JSON 解析成功。
+- 错误脱敏：`error` 字段里的 `<scheme>://user:pass@host` 一律抹为 `<scheme>://***@host`（host/端口保留），
+  纯文本逐字节原样——日志/报错绝不外泄库密码。失败位点：`error` 形如 `at seq {账本最高 seq+1}: …`
+  （该模块账本空时即 `at seq 1:`），点名首败迁移序号。
+
+**`--module <M>`**（定向迁移）：两级匹配，命中唯一才收——
+① 裸模块名精确匹配（dev 树目录名即裸名）；② 未命中时按 dist 版本目录名 `<module>-<version>`
+定向（release 锁聚合形态 `<dir>/<m>-<v>/`）。**不解析 `<m>-<v>` 字符串**（version 可含 `-` 如
+`0.1.0-beta`，拆分有歧义），直接对已发现目录名匹配：`--module modA` 与 `--module modA-1.0.0`
+在 release 下等价只动 modA。多库项目：`--db X --module M` 逐组合跑（场景 6）。
+
 ### 门禁配置（第 10 章 server 表）
 
 - `server.migrate_on_start`：`auto`（dev 默认，启动即应用）/ `verify`（release 默认，
