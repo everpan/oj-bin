@@ -65,6 +65,23 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
     // 由 start() 注入 (dir, /v1/api) 一条（UC 不覆盖静态兜底，多站点静态有专属 e2e，
     // 见 multi_static_sites_serve_by_longest_prefix_end_to_end）。
     cfg.mounts.clear();
+    // 平台特权挂载（v0.1.75 ojm 批次 D4 起 sample/config.yaml 带 platform 段）：
+    // platform.root 须经 mounts[].api 接入，否则启动即 fail-fast。boot 清掉 sample
+    // 挂载后必须补回 /_platform → platform-root（源码目录，dev/release 双模式都以
+    // ts 挂载服务——mixed mounts 逐挂载判模式）。
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/_platform".into(),
+        api: Some(
+            root.join("platform-root")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string(),
+        ),
+        web: None,
+        spa: None,
+        headers: Default::default(),
+    });
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = serve::test_support::now_secs();
     serve::test_support::write_cert_into(
@@ -2626,4 +2643,124 @@ async fn given_reload_api_when_privilege_segments_change_then_restart_pending_an
 
     stop_reload_serve(&mut child).await;
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// —— http.module：模块路由分发注入只读模块身份（v0.1.76）—— //
+
+/// dev + release 双模式：GET /v1/api/user/module-info/ 回显 http.module
+/// {name, version}。dev 版本取 src/<m>/manifest.yaml，release 取
+/// dist/<m>-<v>/manifest.yaml——双 boot 同值（版本一致性门禁的运行期验证）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_module_injected_in_dev_and_release() {
+    let _g = lock();
+    for dev in [true, false] {
+        let (addr, _h, _t) = boot(dev).await;
+        let (s, v) = req(addr, "GET", "/v1/api/user/module-info/", None).await;
+        assert_eq!(s, 200, "dev={dev}: {v}");
+        assert_eq!(v["data"]["module"]["name"], "user", "dev={dev}: {v}");
+        assert_eq!(v["data"]["module"]["version"], "0.1.0", "dev={dev}: {v}");
+        if !dev {
+            let _ = std::fs::remove_dir_all(sample().join(".e2e-dist"));
+        }
+    }
+}
+
+/// 挂载根级直置 api（不在任何模块目录内）→ http.module === null
+/// （serve 栈透传 bridge 派生结果，非请求来源判定）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_module_null_for_root_level_api() {
+    let _g = lock();
+    let t = tmp_project(&[(
+        "src/api.ts",
+        "export default { get() { json.ok({ mod: http.module }); } };\n",
+    )]);
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/", None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["data"]["mod"].is_null(), "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 页面 meta 合成派发（serve 内部 run_module，validate=false）：handler 在模块
+/// 目录内 → 合成派发同样携带 http.module 身份（合成派发继承所属模块，非 null）。
+/// title 由 http.module 拼成，经壳注入断言。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_dispatch_injects_module_identity() {
+    let _g = lock();
+    let t = tmp_project(&[
+        (
+            "src/meta/manifest.yaml",
+            "name: meta\ndesc: d\nversion: 0.1.0\n",
+        ),
+        (
+            "src/meta/html/api.ts",
+            r#"export default {
+                 get() {
+                   const m = http.module;
+                   json.ok({ title: "mod:" + (m === null ? "null" : m.name + ":" + m.version) });
+                 },
+               };"#,
+        ),
+    ]);
+    let site = t.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(
+        site.join("index.html"),
+        "<html><head><title>shell</title></head><body>app</body></html>",
+    )
+    .unwrap();
+    let mut cfg = base_cfg(&t);
+    cfg.mounts.push(only_js::config::MountConf {
+        prefix: "/".into(),
+        api: None,
+        web: Some(site.canonicalize().unwrap().display().to_string()),
+        spa: Some(true),
+        headers: Default::default(),
+    });
+    cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
+    let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    let c = reqwest::Client::new();
+    let resp = c
+        .get(format!("http://{addr}/spaces/demo"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("<title>mod:meta:0.1.0</title>"),
+        "合成派发未携带模块身份：{body}"
+    );
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+/// 对抗性（v0.1.76）：strict ESM handler 写 http.module → 500 信封携 TypeError
+/// ——冻结只读经完整 serve 栈生效（不止 bridge 单测）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_module_frozen_enforced_through_serve_stack() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        (
+            "src/u/probe/api.ts",
+            r#"export default {
+                 get() { http.module.name = "evil"; json.ok({ mod: http.module }); },
+               };"#,
+        ),
+    ]);
+    let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("src"), "/v1/api".into())
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/probe/", None).await;
+    assert_eq!(s, 500, "{v}");
+    assert!(
+        v["msg"].as_str().unwrap_or("").contains("read only"),
+        "strict 写冻结对象应经 500 信封回传 TypeError：{v}"
+    );
+    let _ = std::fs::remove_dir_all(&t);
 }
