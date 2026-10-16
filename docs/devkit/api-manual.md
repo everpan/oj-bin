@@ -1570,6 +1570,14 @@ fs:
   readonly: false  # true = 写类 API 全拒
 ```
 
+> **平台特权 fs 扩展（v0.1.75，`platform:` 段）**：`platform.modules` 名单中的特权模块
+> （归属 = 请求级模块身份，URL/JS 侧不可伪造）的 fs 读写授权面 = **`fs.root ∪ platform.trusted_paths`**
+> （门面裁决与 deno 内建 op 的第二道防线同口径放行）；非特权模块行为不变。
+> 前提：**`fs:` 段已配置**（fs 未配置时恒非特权——trusted_paths 不会在无 jail 的前提下放行任何
+> 路径）；`fs.readonly: true` 时写类 API 对 trusted_paths 同样全拒。越出集合报
+> `NotCapable: path escapes fs.root: …`（文案不变，判定集合已扩为并集）。
+> 配置写法见 §10「platform」。
+
 ### bus —— 订阅发布
 
 | API | 签名 | 说明 |
@@ -2058,11 +2066,12 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
+| `crypto.sha256Hex` | `sha256Hex(data: string \| Uint8Array \| ArrayBuffer): string` | UTF-8 编码后的 sha256 十六进制摘要；v0.1.75 起支持二进制入参（`Uint8Array`/`ArrayBuffer` 自动归一，非 UTF-8 字节不炸）。**行为变更（v0.1.75）**：非 string/二进制入参（number/null 等）旧版经 `String()` 强转求摘要，现抛 TypeError（fail-loud） |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex（缺省 32 字节） |
 | `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | 填充随机字节（v0.1.30） |
 | `crypto.aesGcmEncrypt` | `aesGcmEncrypt(plaintext: string, key: string): string` | AES-GCM 对称加密（v0.1.35）：明文 UTF-8，密钥 16/32 字节 hex 或 base64，返回 `base64(nonce ‖ ct ‖ tag)` |
 | `crypto.aesGcmDecrypt` | `aesGcmDecrypt(ciphertext: string, key: string): string` | AES-GCM 解密（v0.1.35）：输入 `aesGcmEncrypt` 的密文，返回原文；密钥/密文错抛错 |
+| `crypto.verifyEd25519` | `verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean` | Ed25519 验签原语（v0.1.75，bundle 签名校验用），双层语义见下 |
 
 另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30；非法输入抛
 `InvalidCharacterError`），wasm 胶水常用。
@@ -2072,6 +2081,26 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 > 密钥仅支持 **16 字节（AES-128）或 32 字节（AES-256）**的 hex / base64 编码；**不支持
 > AES-192**（上游 crate 未提供），传入 24 字节密钥会明确报错。nonce 由运行时随机生成（12 字节），
 > 与密文、GMAC tag（16 字节）一并 base64 拼接返回，解密方无需单独传 nonce。
+
+> **Ed25519 验签（v0.1.75）**：`crypto.verifyEd25519(publicKey, msg, sigBase64)` 为纯验签
+> 原语（bundle 签名校验用）。**双层语义**：格式错抛错（文案均以 `verifyEd25519: ` 起头——
+> `signature not base64` / `public key must be 32 raw bytes (got N)` /
+> `signature must be 64 bytes (got N)` / `key not hex/base64`）；格式合法但验签不过
+> （错公钥/错 msg/无效曲线点）返回 `false` 而非抛错。编码限制：
+> ① `sigBase64` 仅**标准 base64**（STANDARD / NO_PAD，**base64url 不支持**）；
+> ② `msg` 仅 UTF-8 字符串；③ `publicKey` 须是 hex / base64 编码的 **32 字节原始公钥**
+> （**PEM/SPKI 不支持**）。
+
+bundle 签名校验典型用法（规范串 `"<name>@<version>:<sha256>"` + Ed25519；发布方对规范串
+签名，安装方用发布方公钥验签）：
+
+```ts
+const bundleBytes = await fs.readFile(`${name}-${version}.tgz`);      // 二进制直接求摘要
+const canon = `${name}@${version}:${crypto.sha256Hex(bundleBytes)}`;  // 规范串
+if (!crypto.verifyEd25519(publisherPubKey, canon, sigBase64)) {
+  json.fail(400, "bundle signature mismatch");                        // 验签不过 → false
+}
+```
 
 ```ts
 const sessionKey = "AUTH-SESSION:" + crypto.sha256Hex(refreshToken);   // 见第 8 章轮换
@@ -2942,6 +2971,44 @@ fs:
 
 块存在即启用 `fs.*` 全局；缺省不启用（`fs.*` 抛 `NotCapable`，fail-closed）。
 
+### platform —— 平台特权（v0.1.75，ojm 批次）
+
+```yaml
+platform:
+  modules: ["ojm-installer"]      # 平台特权模块名单
+  root: "./platform-modules"      # 受控挂载根（modules 非空时必配，须同时列为 mounts[].api 条目）
+  trusted_paths: ["./config.yaml", "./dist"]   # 额外授权路径根（canonical，装配期 fail-fast）
+  exec:                           # 【预留段】本版解析但不生效——exec 全局随后续版本交付
+    ojm-installer:
+      allow: ["tar -xzf ${path:archive} -C ${path:dest}"]
+      env: ["OJ_SECRET_KEY"]
+```
+
+**fail-closed**：不配 `platform:` 段 = 全部平台特权不可用（运行期裁决报
+`NotCapable: platform not configured (config platform: section missing)`）。
+段存在而某键缺省 = 该键为空名单（同样 deny）。
+
+特权面（归属 = 请求级模块身份，URL/JS 侧不可伪造；tasks/WS 上下文无模块归属 →
+特权恒不可用）：
+
+| 键 | 语义 |
+|---|---|
+| `modules` | 平台特权模块名白名单。非名单模块报 `NotCapable: module 'x' is not platform-privileged` |
+| `root` | 受控挂载根：特权模块的**唯一**正经部署目录（相对 config_dir 解析）。`modules` 非空时必配，且该目录必须同时列为 **`mounts[].api` 条目**——模块归属与路由只能来自挂载 discover。特权模块只能由部署方放入该目录 |
+| `trusted_paths` | 额外授权路径根（相对 config_dir 解析；canonical 化，路径不存在 → 装配 fail-fast）。**本版生效面 = fs 轴扩展**：特权模块的 fs 读写范围 = `fs.root ∪ trusted_paths`（见 §6 fs「平台特权 fs 扩展」；`fs:` 未配置时不生效，非特权模块行为不变） |
+| `exec` | 【预留段】本版解析并保存形状（argv 模板 + env 白名单），但**不生效**——`exec` 全局随后续版本交付 |
+
+装配期抢注/绊线防护（全部启动 fail-fast，不等第一个请求）：
+
+- **抢注（anti-squatting）**：特权名出现在任何其他 api 挂载树 →
+  `platform module 'x' must not come from an install tree (deploy it in a platform-controlled directory under platform.root)`——「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断。
+- **受控根互斥**：`platform.root` 与其他 api 挂载树同径或互为父子 →
+  `platform.root (…) must not overlap another api mount (…) — the anti-squatting tripwire would be silently disabled`（防部署方误把受控根指到市场安装树；父目录形态会让市场产物静默穿透绊线）。
+- **root 未挂载**：`platform.root (…) must be mounted as an api mount to give platform modules routes and ownership`。
+- **root 缺失**：`platform.modules is set but platform.root is missing — privileged modules need a controlled mount root`。
+- **名单悬空**（root 下无此模块）：`platform module 'x' is not deployed under platform.root (dangling privilege: no module implementation)`。
+- **trusted_paths 不存在**：`platform.trusted_paths canonicalize failed (…): …`。
+
 ### broker —— 事件总线（三种 kind）
 
 ```yaml
@@ -3207,6 +3274,8 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | `ext_boot.js` 存在但语法错/导入失败/顶层 await 抛错 | 启动期预热即 `ext_boot: …` 退出（服务不监听） |
 | crontab.yaml 坏行（非 5 字段 cron + 路径 / 路径不存在） | fail-fast 退出，报错带 `:行号:`（v0.1.28） |
 | `server.cors.credentials: true` 且 `server.cors.origins` 为空 | `cors: credentials requires explicit origins (wildcard '*' is rejected by browsers)` 退出（v0.1.35；带凭据的 `*` 非法）。其余字段缺省回落安全值 |
+| `platform.modules` 非空但 `platform.root` 缺失 / root 未列为 api mount / 与其他挂载树同径或父子 / 名单悬空 | platform 段装配 fail-fast 退出（v0.1.75，报错原文见 §10「platform」——抢注绊线必须在装配期生效，运行期拦截为时已晚） |
+| `platform.trusted_paths` 条目不存在 | `platform.trusted_paths canonicalize failed (…): …` 退出（v0.1.75） |
 
 ## 11. 构建与发布
 
@@ -3623,6 +3692,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `blob.readRange` 是短读（v0.1.47） | 越尾只返回实际可读字节、`offset` 过尾返回**空数组**——先判 `head.length` 再分支，不要假设一定拿满 `len`；`offset` / `len` 为负 / 小数 / NaN 报错 `blob readRange: offset must be a non-negative integer` |
 | `blob.copy` / `blob.move` 的 `src == dst`（v0.1.47） | 明确 **no-op**（`fs::copy` 同文件语义未定义、会截断文件）——不是「复制一份给自己」；`move` 后 src 一定不存在，`copy` 后 src 一定还在 |
 | blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |
+| `crypto.verifyEd25519` 编码面（v0.1.75） | `sigBase64` 仅标准 base64（STANDARD/NO_PAD，**base64url 不支持**）；`msg` 仅 UTF-8 字符串；`publicKey` 须 hex/base64 编码的 **32 字节原始 key**（**PEM/SPKI 不支持**）。格式错抛错（文案 `verifyEd25519: …` 起头），格式合法验签不过返回 `false` |
+| `crypto.sha256Hex` 非 string/二进制入参抛 TypeError（v0.1.75 **行为变更**） | 旧版把 number/null 等经 `String()` 强转求摘要（静默产出垃圾摘要）；现 fail-loud 抛 TypeError——旧脚本传非 string/二进制入参的要先改（`String(x)` 显式转或改传 `Uint8Array`） |
+| `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面本版仅 fs 轴扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）；tasks/WS 上下文无模块归属 → 特权恒不可用；`exec` 段本版解析不生效 |
+| `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 
 ### 常见陷阱清单
 

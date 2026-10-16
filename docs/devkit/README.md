@@ -37,6 +37,15 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.75（未打标签，实施中）阶段 1/2 已落地部分：`crypto.verifyEd25519`（Ed25519 验签
+原语，双层语义——格式错抛错、验签不过返回 `false`；sig 仅标准 base64、公钥仅 32 字节
+原始 key 的 hex/base64）与 `crypto.sha256Hex` 二进制扩面（`Uint8Array`/`ArrayBuffer`
+入参；**行为变更**——非 string/二进制入参旧版经 `String()` 强转求摘要，现抛 TypeError）；
+`platform:` 配置段地基（特权模块名单 + 受控挂载根 + `trusted_paths` 授权路径根，
+fail-closed，装配期抢注/互斥防护；本版生效面 = 特权模块 fs 读写范围扩为
+`fs.root ∪ trusted_paths`，`exec` 段解析但不生效）。见 api-manual §6 crypto/fs、
+§10「platform」、§13 限制表与 SKILL 陷阱速查。
+
 v0.1.74 收敛 v0.1.72 评审发现的边界不一致：`.response` 声明位值为 `null` 现与缺失同义
 （回落继承链 / 占位，不再被 audit 以非对象拒启），`.schema.response` 合并同步改为
 「null 即未声明」使文档优先级链在边界成立；`global.d.ts` 补组级保留键警告

@@ -251,6 +251,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 跨域启动直接报错退出 | `server.cors.credentials: true` 且 `origins` 为空——带凭据的 `*` 非法；配显式 `origins`（v0.1.35） |
 | 跨域响应没有 `Access-Control-*` 头 | `server.cors` 段没写（缺省不挂 CORS 层，与旧版一致）；或 `origins: ["*"]` 不展开——放行任意源就把 `origins` 留空（v0.1.35） |
 | `crypto.aesGcmEncrypt` 传 24 字节密钥报错 | 不支持 AES-192——密钥仅 16（AES-128）/32（AES-256）字节的 hex 或 base64；应用层加解密，密钥自管不进 config（v0.1.35） |
+| `crypto.verifyEd25519` 报 `verifyEd25519: key not hex/base64` | 公钥传了 base64url（含 `-`/`_`）或 PEM——只收 hex/base64 编码的 32 字节**原始** key（PEM/SPKI 不支持）；签名同理只收标准 base64（**base64url 不支持**）。格式错抛错、验签不过返回 `false`（v0.1.75） |
+| 特权模块运行时报 `NotCapable: module 'x' is not platform-privileged` | 部署形态陷阱：模块必须部署在 `platform.root` 下**且**该目录列为 `mounts[].api` 条目（归属与路由只能来自挂载 discover），再加 `platform.modules` 名单——三缺一都拿不到特权；`platform:` 段整个不配则报 `platform not configured`（fail-closed，v0.1.75） |
+| 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
 
 ## 手册
 

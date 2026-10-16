@@ -33,6 +33,7 @@
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 | [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
 | [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 统一声明公共前缀与公共入参 | §4 编写 api.ts |
+| [33](#场景-33特权模块受控挂载最小配置platformv0175) | 平台特权模块最小配置：`platform:` 段 + `mounts[].api` 条目 + 特权 fs 读 trusted 文件（v0.1.75；fail-closed，装配期抢注防护；exec 段预留不生效） | §6 fs / §10 platform |
 
 ---
 
@@ -2286,4 +2287,86 @@ POST /v1/api/project/{pid}/members    → 200 project.members.post
 GET  /v1/api/project/{pid}/schema     → 404（元数据不生成路由；契约只进 OpenAPI/校验）
 ```
 
+---
+
+## 场景 33：特权模块受控挂载最小配置（platform，v0.1.75）
+
+> 何时抄我：你要部署一个**平台特权模块**（如 ojm 安装器），它需要读 jail 之外的
+> 受信文件（config、发行产物）。本场景给最小可跑配置——**只写本版可用 API**
+> （生效面 = 特权模块 fs 读写范围扩为 `fs.root ∪ trusted_paths`；`exec` 全局尚未交付）。
+> 手册 §10「platform」、§6 fs「平台特权 fs 扩展」。
+
+### ① 目录布局（特权模块只能部署方手工放入受控根，不进市场安装树）
+
+```text
+<项目根>/
+├─ config.yaml
+├─ config.yaml.bak …          # 受信文件（trusted_paths 指向）
+├─ src/…                      # 普通业务模块（市场安装树，行为不变）
+└─ platform-modules/
+   └─ ojm-installer/
+      ├─ manifest.yaml        # name = ojm-installer
+      └─ api.ts
+```
+
+### ② 配置（三处缺一不可：mounts 条目 + platform 段 + fs 段）
+
+```yaml
+mounts:
+  - prefix: /v1/api
+    dir: src               # 市场安装树（普通模块，行为不变）
+  - prefix: /v1/platform   # 受控根也是普通 api 挂载（前缀须与其他 api 挂载不同——
+    dir: platform-modules  #   同类同前缀重复会被拒）——特权模块由此获得归属与路由
+
+fs:
+  root: ./data             # 特权扩展的前提：fs: 段已配置（未配置时特权恒不可用）
+  readonly: false
+
+platform:
+  modules: ["ojm-installer"]
+  root: "./platform-modules"                 # modules 非空时必配；须同时列为 mounts[].api 条目
+  trusted_paths: ["."]                       # 额外授权根：相对 config_dir 解析（此处=项目根，
+                                             # 覆盖 config.yaml 等受信文件；须已存在，否则装配 fail-fast）
+  # exec:                                    # 【预留段】本版解析但不生效，exec 全局随后续版本交付
+  #   ojm-installer:
+  #     allow: ["tar -xzf ${path:archive} -C ${path:dest}"]
+  #     env: ["OJ_SECRET_KEY"]
+```
+
+### ③ handler（特权模块里 fs 读 trusted 文件）
+
+```ts
+// platform-modules/ojm-installer/api.ts —— 目录镜像路由 /v1/platform/ojm-installer/
+async function get() {
+  // 特权面 = fs.root ∪ trusted_paths：trusted_paths 内文件可读（相对路径按 fs.root 折叠，
+  // 绝对 canonical 路径也可）；非特权模块读同一文件 → NotCapable
+  const cfg = await fs.readTextFile("../config.yaml");   // 折叠后落在 trusted 根内
+  json.ok({ len: cfg.length });
+}
+export default { get };
+```
+
+### ④ 验证
+
+```bash
+curl -s http://localhost:9778/v1/platform/ojm-installer/   # {"code":0,"data":{"len":…}}
+# 非特权模块读同一文件 → NotCapable（行为不变，fail-closed）
+```
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 报 `NotCapable: platform not configured` | config 里根本没有 `platform:` 段——fail-closed，不配 = 全部特权不可用 |
+| 报 `NotCapable: module 'x' is not platform-privileged` | 模块不在 `platform.modules` 名单；或没部署在 `platform.root` 下；或受控根没列为 `mounts[].api` 条目（归属与路由只能来自挂载 discover）——三处缺一不可 |
+| tasks/WS 里调平台能力恒被拒 | 上下文无模块归属（`module = None`）→ 特权恒不可用，设计如此 |
+| 特权模块读 trusted 外文件报 `path escapes fs.root` | 特权面 = `fs.root ∪ trusted_paths` 的**并集**，越出即拒——把目录根加进 `trusted_paths` |
+| 配了 `trusted_paths` 但 `fs:` 段没配 | 特权扩展不生效（fs 未配置时恒非特权，trusted_paths 不会凭空开 jail）——先配 `fs.root` |
+| 启动报 `platform.modules is set but platform.root is missing` | 名单非空必须配受控根，且该目录须列为 `mounts[].api` 条目 |
+| 启动报 `platform module 'x' … must not come from an install tree` | 特权名出现在了其他挂载树（抢注防护，fail-fast）——特权模块只能由部署方放入 `platform.root`，别让市场安装树里出现同名 bundle |
+| 启动报 `platform.root (…) must not overlap another api mount (…)` | 受控根与其他挂载树同径或互为父子（含父目录形态）——绊线会被静默穿透，装配期直接拒绝 |
+| 启动报 `… is not deployed under platform.root (dangling privilege…)` | 名单悬空：`platform.root` 下没有这个模块——部署它或从名单删掉 |
+| 启动报 `platform.trusted_paths canonicalize failed` | trusted_paths 条目路径不存在——相对 config_dir 解析，先建目录或改路径 |
+
+---
 
