@@ -16,10 +16,9 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.75（未打标签，实施中）
+## v0.1.75
 
-本版承载「ojm 后端原生化」批次（设计稿与实施计划见 `docs/plans/2026-10-16-ojm-native-exec-*`），
-随各阶段合入逐步填充；条目以最终用户可见变更为准：
+本版承载「ojm 后端原生化」批次（设计稿与实施计划见 `docs/plans/2026-10-16-ojm-native-exec-*`）。
 
 - `crypto.verifyEd25519`：Ed25519 验签原语（格式错抛错、验签不过 false）+ `crypto.sha256Hex` 支持二进制入参；`crypto.md5Hex` 加入（同分流：string 走 UTF-8、Uint8Array/ArrayBuffer 走原始字节，其余抛 TypeError；**MD5 已密码学破损，仅限非安全场景**）；
 - `exec.run`：外部命令原语（`platform.exec` argv 模板白名单 + 路径占位符校验，缺省全 deny）；
