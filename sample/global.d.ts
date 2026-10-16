@@ -564,7 +564,8 @@ declare global {
   // 返回原 view，非 view 抛 TypeError，单次 ≤65536 字节（对齐 WebCrypto；lib.dom 的
   // 同名声明只是兜底，运行时是 oj 实现）。
   interface Crypto {
-    sha256Hex(s: string): string;
+    /** string 走 UTF-8 摘要；Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）。 */
+    sha256Hex(data: string | Uint8Array | ArrayBuffer): string;
     randomHex(nBytes?: number): string;
     getRandomValues<T extends ArrayBufferView>(view: T): T;
     // AES-GCM 应用级加密（v0.1.35）：key 为 hex/base64 编码的原始 16/32 字节
@@ -572,6 +573,11 @@ declare global {
     // base64(nonce12 ‖ ct ‖ tag16) 出。密钥缺失/非法由调用方 json.fail。
     aesGcmEncrypt(plaintext: string, key: string): string;
     aesGcmDecrypt(ciphertext: string, key: string): string;
+    /** Ed25519 验签：publicKey 为 hex/base64 编码的 **32 字节原始公钥**（不支持 PEM/SPKI）；
+     * msg 为 UTF-8 字符串；sigBase64 仅 base64（STANDARD/NO_PAD，不支持 base64url）。
+     * 验签通过返回 true，签名/密钥不匹配返回 false；格式错（公钥 ≠ 32 字节、
+     * sig 解码后 ≠ 64 字节、base64 非法）抛错。 */
+    verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean;
   }
 
   // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----

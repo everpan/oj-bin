@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use deno_core::{OpState, op2};
+use deno_core::{JsBuffer, OpState, op2};
 use deno_error::JsErrorBox;
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -185,6 +185,50 @@ pub fn op_sha256_hex(#[string] s: String) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// crypto.verifyEd25519(publicKey, msg, sigBase64)：Ed25519 验签（纯原语，bundle 签名校验用）。
+/// publicKey 为 hex/base64 编码的 32 字节原始公钥（不支持 PEM/SPKI）；msg 为 UTF-8 字符串；
+/// sig 仅 base64（STANDARD / NO_PAD，base64url 不支持）。格式错（base64 非法、公钥 ≠ 32 字节、
+/// sig 解码后 ≠ 64 字节）抛错；签名/密钥不匹配返回 false。
+#[op2(fast)]
+pub fn op_ed25519_verify(
+    #[string] public_key: String,
+    #[string] msg: String,
+    #[string] sig_base64: String,
+) -> Result<bool, JsErrorBox> {
+    let pk =
+        decode_key(&public_key).map_err(|e| JsErrorBox::generic(format!("verifyEd25519: {e}")))?;
+    if pk.len() != 32 {
+        return Err(JsErrorBox::generic(format!(
+            "verifyEd25519: public key must be 32 raw bytes (got {})",
+            pk.len()
+        )));
+    }
+    let sig_b64 = sig_base64.trim();
+    let sig = STANDARD
+        .decode(sig_b64)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(sig_b64))
+        .map_err(|e| JsErrorBox::generic(format!("verifyEd25519: signature not base64: {e}")))?;
+    if sig.len() != 64 {
+        return Err(JsErrorBox::generic(format!(
+            "verifyEd25519: signature must be 64 bytes (got {})",
+            sig.len()
+        )));
+    }
+    let v = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pk);
+    Ok(v.verify(msg.as_bytes(), &sig).is_ok())
+}
+
+/// crypto.sha256Hex 二进制扩面：对任意字节序列（Uint8Array view）求 SHA-256 hex
+/// （字符串走 op_sha256_hex，bootstrap.js 按类型分流）。
+#[op2]
+#[string]
+pub fn op_sha256_bytes(#[buffer] data: JsBuffer) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(&data);
     format!("{:x}", h.finalize())
 }
 
@@ -445,6 +489,118 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(v["data"]["hexLen"], 64);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ed25519_verify_rfc8032_vectors_and_format_gates() {
+        // RFC 8032 §7.1 TEST 1 / TEST 2 官方向量；格式错抛错（文案以 verifyEd25519: 起头），
+        // 验签不过返回 false（双层语义）。
+        let b = bridge(None);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const PK = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+                    // RFC 8032 TEST 2 自带公钥（msg 为单字节 0x72 = "r"）
+                    const PK2 = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+                    const PK_B64 = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+                    const PK_URL = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+                    const SIG1 = "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw==";
+                    const SIG2 = "kqAJqfDUyrhyDoILX2QlQKKye1QWUD+Ps3YiI+vbadoIWsHkPhWZbkWPNhPQ8R2MOHsurrQwKu6wDSkWErsMAA==";
+                    const SIG63 = "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQ";
+                    // 场景1：正确签名（Test 1，msg=""）通过
+                    const s1 = crypto.verifyEd25519(PK, "", SIG1);
+                    // 场景2：篡改拒绝 —— msg 配错签名 false；Test 2 正向 true；再篡改 false
+                    const s2a = crypto.verifyEd25519(PK, "r", SIG1);
+                    const s2b = crypto.verifyEd25519(PK2, "r", SIG2);
+                    const s2c = crypto.verifyEd25519(PK, "s", SIG2);
+                    // 场景3：错公钥拒绝（翻转首字节）
+                    const s3 = crypto.verifyEd25519("c7" + PK.slice(2), "r", SIG2);
+                    // 场景4：非法 base64 → 抛错
+                    let e4 = null;
+                    try { crypto.verifyEd25519(PK, "", "!!!"); } catch (err) { e4 = String(err); }
+                    // 场景5：公钥 31/33 字节 → 抛错
+                    let e5a = null, e5b = null;
+                    try { crypto.verifyEd25519(PK.slice(0, 62), "", SIG1); } catch (err) { e5a = String(err); }
+                    try { crypto.verifyEd25519(PK + "aa", "", SIG1); } catch (err) { e5b = String(err); }
+                    // 场景6：sig 解码后 63 字节 → 抛错
+                    let e6 = null;
+                    try { crypto.verifyEd25519(PK, "", SIG63); } catch (err) { e6 = String(err); }
+                    // 场景7：hex/base64 双编码均可用（同一把公钥换 base64 形式）
+                    const s7 = crypto.verifyEd25519(PK_B64, "", SIG1);
+                    // 场景8：base64url 公钥（含 '_'）→ 抛错点名
+                    let e8 = null;
+                    try { crypto.verifyEd25519(PK_URL, "", SIG1); } catch (err) { e8 = String(err); }
+                    // 场景9：hex 优先于 base64 —— 32 字符全 hexdigit 串同时是合法 NO_PAD
+                    // base64（会解出 24 字节），hex 分支优先故解出 16 字节并点名长度
+                    let e9 = null;
+                    try { crypto.verifyEd25519("0123456789abcdef0123456789abcdef", "", SIG1); } catch (err) { e9 = String(err); }
+                    // 场景10：格式合法但密码学无效 —— 32 字节全零公钥 + 合法 64 字节 sig → false（不抛错）
+                    const s10 = crypto.verifyEd25519("0".repeat(64), "r", SIG2);
+                    json.ok({ s1, s2a, s2b, s2c, s3, e4, e5a, e5b, e6, s7, e8, e9, s10 });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        let d = &v["data"];
+        // 通过/拒绝双层
+        assert_eq!(d["s1"], true, "{v}");
+        assert_eq!(d["s2a"], false, "{v}");
+        assert_eq!(d["s2b"], true, "{v}");
+        assert_eq!(d["s2c"], false, "{v}");
+        assert_eq!(d["s3"], false, "{v}");
+        assert_eq!(d["s7"], true, "{v}");
+        // 格式错抛错并点名原因（String(err) 带 "Error: " 前缀，故查 contains）
+        let e4 = d["e4"].as_str().unwrap();
+        assert!(e4.contains("verifyEd25519: signature not base64"), "{e4}");
+        for e in [d["e5a"].as_str().unwrap(), d["e5b"].as_str().unwrap()] {
+            assert!(e.contains("must be 32 raw bytes"), "{e}");
+            assert!(e.contains("got "), "{e}");
+        }
+        let e6 = d["e6"].as_str().unwrap();
+        assert!(e6.contains("must be 64 bytes"), "{e6}");
+        let e8 = d["e8"].as_str().unwrap();
+        assert!(e8.contains("verifyEd25519: key not hex/base64"), "{e8}");
+        // hex 分支优先于 base64：16 字节长度点名同时钉死分支选择
+        let e9 = d["e9"].as_str().unwrap();
+        assert!(e9.contains("must be 32 raw bytes (got 16)"), "{e9}");
+        // 无效曲线点 / 全零公钥：格式合法 → 返回 false 而非抛错
+        assert_eq!(d["s10"], false, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sha256_hex_accepts_binary_input() {
+        // 场景9：sha256Hex 扩二进制 —— Uint8Array / ArrayBuffer 等价；非 UTF-8 字节不炸。
+        let b = bridge(None);
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                    const u8 = new Uint8Array([1, 2, 3]);
+                    json.ok({
+                        bytes: crypto.sha256Hex(u8),
+                        ab: crypto.sha256Hex(u8.buffer),
+                        nonUtf8: crypto.sha256Hex(new Uint8Array([0xff, 0xfe])),
+                    });
+                })().catch((e) => json.fail(500, String(e)));"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        let d = &v["data"];
+        assert_eq!(
+            d["bytes"], "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+            "{v}"
+        );
+        assert_eq!(
+            d["ab"], "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+            "{v}"
+        );
+        assert_eq!(
+            d["nonUtf8"], "b3d510ef04275ca8e698e5b3cbb0ece3949ef9252f0cdc839e9ee347409a2209",
+            "{v}"
+        );
     }
 
     #[test]

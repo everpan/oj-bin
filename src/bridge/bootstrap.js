@@ -93,6 +93,8 @@ import {
   op_jwt_verify,
   op_random_hex,
   op_sha256_hex,
+  op_sha256_bytes,
+  op_ed25519_verify,
   op_crypto_random,
   op_aes_gcm_encrypt,
   op_aes_gcm_decrypt,
@@ -1020,7 +1022,14 @@ globalThis.oidc = (() => {
 
 // ----- crypto: sha256/random helpers (merge, keep native getRandomValues if present) -----
 globalThis.crypto = Object.assign(globalThis.crypto || {}, {
-  sha256Hex: (s) => op_sha256_hex(String(s)),
+  // string -> op_sha256_hex; Uint8Array/ArrayBuffer -> op_sha256_bytes (binary
+  // digest, e.g. non-utf8 payloads). JsBuffer only accepts views, so unwrap
+  // ArrayBuffer first.
+  sha256Hex: (data) => {
+    if (typeof data === "string") return op_sha256_hex(data);
+    if (data instanceof ArrayBuffer) data = new Uint8Array(data);
+    return op_sha256_bytes(data);
+  },
   randomHex: (n) => op_random_hex(n === undefined ? null : n | 0),
   // WebCrypto shape: fill any TypedArray view (wasm-bindgen glue depends on it).
   // ponytail: op caps at 65536, no re-check here; non-view throws TypeError.
@@ -1036,6 +1045,11 @@ globalThis.crypto = Object.assign(globalThis.crypto || {}, {
   // via ENC[...] in config). plaintext utf8 in, base64(nonce12 || ct || tag16) out.
   aesGcmEncrypt: (plaintext, key) => op_aes_gcm_encrypt(String(plaintext), String(key)),
   aesGcmDecrypt: (ciphertext, key) => op_aes_gcm_decrypt(String(ciphertext), String(key)),
+  // Ed25519 verification (bundle signature check). publicKey: hex/base64 raw
+  // 32-byte key (no PEM/SPKI); sig: base64 only (no base64url). Format errors
+  // throw; signature mismatch returns false.
+  verifyEd25519: (publicKey, msg, sigBase64) =>
+    op_ed25519_verify(String(publicKey), String(msg), String(sigBase64)),
 });
 
 // ----- base64: atob/btoa globals (wasm-bindgen glue; same algorithm as the oidc inline helper) -----
