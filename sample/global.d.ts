@@ -446,6 +446,34 @@ interface VarsApi {
   get(name: string): string | null;
 }
 
+// exec.*：外部命令执行（v0.1.75，config `platform.exec` 段授权）。
+// 授权模型 = argv 模板白名单（literal token 逐字相等 + ${path:NAME}/${raw:NAME} 占位符
+// 恰吸收一个 token）+ 无 shell：argv 必须恰命中一条授权模板（歧义命中报错，不静默择一）。
+// ${path:} 值按路径校验（fs.root ∪ trusted_paths）；${raw:} 拒 `-` 开头与绝对形态。
+// exec 授权与 platform.modules 相互独立；缺省全 deny（fail-closed）。
+interface ExecRunOpts {
+  /** 缺省 30_000，硬上限 600_000（超出钳制）。大 DDL / 大 stdin 显式调大。 */
+  timeoutMs?: number;
+  /** 一次性写入子进程 stdin 后关闭写端；写入也在超时窗口内。 */
+  stdin?: string;
+}
+interface ExecResult {
+  /** 进程退出码：非 0 也正常返回（不抛错）；信号终止 = 128 + signal。 */
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+interface ExecApi {
+  /**
+   * 执行一条授权模板匹配后的外部命令（无 shell；cwd 钉在 fs.root，env 默认空表仅
+   * 白名单透传、PATH 不继承；argv[0] 为宿主解析后的绝对路径——"oj" 即服务进程自身）。
+   * 抛错边界：未授权 / 模板失配 / 歧义 / 路径越界 → NotCapable；超时（整组击杀）/
+   * 输出超限（stdout+stderr 合计 10MB） / spawn 失败 / 非 UTF-8 输出 → 普通 Error。
+   * 未配 `fs:` 段或 tasks/WS 上下文（无模块归属）恒拒。
+   */
+  run(argv: string[], opts?: ExecRunOpts): Promise<ExecResult>;
+}
+
 declare global {
   interface Function {
     route?: string;
@@ -525,6 +553,8 @@ declare global {
   const sess: WsSess;
   const blob: BlobApi;
   const fs: FsApi;
+  // 外部命令执行（v0.1.75，platform.exec 段授权；见 ExecApi JSDoc 与 api-manual §6「exec」）。
+  const exec: ExecApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。

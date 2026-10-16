@@ -923,7 +923,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
   **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
   不写裸 `?` 运算符——它无法与占位符区分。
 
-### 总表（27 组）
+### 总表（28 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -936,6 +936,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
 | `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
+| `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -1577,6 +1578,90 @@ fs:
 > 路径）；`fs.readonly: true` 时写类 API 对 trusted_paths 同样全拒。越出集合报
 > `NotCapable: path escapes fs.root: …`（文案不变，判定集合已扩为并集）。
 > 配置写法见 §10「platform」。
+
+### exec —— 外部命令执行（v0.1.75，`platform.exec` 段授权）
+
+```ts
+exec.run(argv: string[], opts?: {
+  timeoutMs?: number;   // 缺省 30_000，硬上限 600_000（传更大值被钳到上限，不报错）
+  stdin?: string;       // 可选，一次性写入后关闭写端（子进程读到 EOF）
+}): Promise<{ code: number; stdout: string; stderr: string }>
+```
+
+外部命令原语：**无 shell**——spawn 只接受「授权模板匹配后重建的 argv」。安全形态 =
+config 白名单 + argv 模板 + 平台特权限定，全部 fail-closed：
+
+```yaml
+platform:
+  exec:
+    ojm-installer:              # 模块名 → exec 授权；列出该模块 = 授权其 exec
+      allow:                    # argv 模板：literal token 逐字相等，JS 只能填占位符
+        - "tar -xzf ${path:archive} -C ${path:dest}"
+        - "tar -tzf ${path:archive}"
+      env: ["OJ_SECRET_KEY"]    # 透传环境变量白名单（值不进 JS 面）
+```
+
+- **授权与 `platform.modules` 相互独立**：exec 特权只看 `platform.exec.<模块>` 是否列出该
+  模块——「有平台 API 特权无 exec」或反之都合法；两处都未配 = 该面全 deny。
+- **模板匹配**：argv 逐 token 对 `allow` 条目匹配。literal token 必须**逐字相等**（tar 的
+  `--use-compress-program` / 任意 `-f` 之类 option 注入因此无从下手）；占位符**恰吸收一个
+  token**；token 数不齐 / literal 失配 → 0 命中，报 `exec template mismatch`；同一 argv
+  命中 ≥2 条模板 → `exec template ambiguous`（歧义拒绝，不静默择一）。
+- **两类占位符**：
+  - `${path:NAME}`：吸收一个 token，值按**路径**校验——相对路径按 fs.root 折叠 +
+    canonicalize，解析结果必须落在 **`fs.root ∪ trusted_paths`** 内（与 fs 轴特权扩展同一
+    实现，无第二套语义）；放行后以 canonical 绝对路径传给子进程。
+  - `${raw:NAME}`：仅字面收集，拒 `-` 开头（option 注入）与绝对形态（`/`、`\`、盘符起手），
+    拒收以 `exec template mismatch` 报出（中段 `-`/`/` 合法，只看起手形态）。
+  - 占位符名须匹配 `[A-Za-z_][A-Za-z0-9_]*`；未知占位符类型 / 嵌入 / 未闭合 / 非法名等模板
+    语法错在**调用期** fail-closed 抛 `exec template parse failed (<raw>): …`（配置面原样
+    保存、解析期报错是设计约定的时点）。
+- **命令解析（模板首 token）**：必须是**裸名**——不接受占位符、不含 `/` `\` 路径分隔符。
+  `"oj"` 特判解析为服务进程自身（`current_exe()`，serve 进程即 bin/oj，同版本自保证）；
+  其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
+  PATH，宿主侧解析消除 execvp 回落默认路径的不确定性）。解析失败 →
+  `exec: command resolve failed for '<name>': …`。注意：**子进程拿到的 argv[0] 是解析后的
+  绝对路径**，不是模板首 token 原文。
+- **返回 vs 抛错边界**：进程正常跑到退出（**含非 0 退出码**）= 返回 `{code, stdout, stderr}`
+  （信号终止映射 `code = 128 + signal`，TERM=15 → 143）；执行环境失败 = **抛错**——未授权 /
+  模板失配 / 歧义 / 占位符路径越界为 `NotCapable` 类，超时 / 输出超限 / spawn 失败 /
+  UTF-8 解码失败为普通 Error 类（文案见下表）。
+- **硬限制**：
+  - stdout + stderr **流式合计 10MB 上限**（边读边计数；超限 kill 进程组 + 抛错，已收部分
+    不随错返回）；
+  - `timeoutMs` 缺省 30_000、硬上限 600_000（超出钳制）；到期先 `kill(-pgid, SIGKILL)` 整组
+    击杀（含孙进程）再兜底杀直接子进程（Windows 无进程组对应物，仅杀直接子进程）；**stdin
+    写入也在超时窗口内**——子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（大 DDL /
+    大输入显式调大 `timeoutMs`）；
+  - stdout / stderr 强制 UTF-8 解码，非法序列抛错（二进制输出不在本原语范围）；
+  - 子进程 cwd = **fs.root**；env 默认**空表**，仅 `env` 白名单透传（值不进 JS 面，PATH
+    不继承）。cwd 钉定**不构成隔离边界**（无 OS 级 chroot）——文件可达性由 `${path:}` 校验
+    承载，**不要**给子进程传越出授权集合的路径；
+  - **未配 `fs:` 段 → exec 整体不可用**（`NotCapable: exec requires fs.root …`）；
+  - tasks / WS 上下文无模块归属 → 恒拒（`exec requires module ownership …`）。
+- **tar 解压范式**：`tar -tzf` 预检只是快速失败优化；**权威校验 = 解压后对目标目录全量
+  walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、总体积对账），配合 `.staging` 原子
+  落位——完整三步范式见 `scenarios.md` 场景 34。
+
+**错误文案速查**（文案以实现为准；「类」= 错误分类，`NotCapable` 为授权面，其余为普通
+Error）：
+
+| 文案 | 类 | 触发 |
+|---|---|---|
+| `exec not configured (config platform: section missing)` | NotCapable | 未配 `platform.exec` 段 |
+| `exec requires module ownership (request has no module context)` | NotCapable | tasks / WS 等无模块归属的上下文 |
+| `module '<m>' is not authorized for exec` | NotCapable | 模块不在 `platform.exec` 授权表 |
+| `exec requires fs.root (config fs: section missing)` | NotCapable | 未配 `fs:` 段 |
+| `exec template mismatch: <reason>` | NotCapable | 0 命中：literal 失配 / token 数不齐 / `${raw:}` 拒 `-` 开头或绝对形态 |
+| `exec template ambiguous: argv matches <N> authorized templates` | NotCapable | ≥2 条模板同时命中（不静默择一） |
+| `exec ${path:NAME}: path outside fs.root and trusted_paths: <p> (resolved <abs>)` | NotCapable | 路径占位符越出 `fs.root ∪ trusted_paths` |
+| `exec template parse failed (<raw>): <e>` | Error | 模板语法错（未知占位符类型 / 未闭合 / 非法名 / 首 token 含路径分隔符等） |
+| `exec: command resolve failed for '<name>': …` | Error | 命令名解析失败（含 `command '<name>' not found in PATH`） |
+| `exec: spawn failed for '<abs>': <e>` | Error | 进程启动失败 |
+| `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀） |
+| `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB |
+| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8 |
+| `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
 
 ### bus —— 订阅发布
 
@@ -2979,9 +3064,11 @@ platform:
   modules: ["ojm-installer"]      # 平台特权模块名单
   root: "./platform-modules"      # 受控挂载根（modules 非空时必配，须同时列为 mounts[].api 条目）
   trusted_paths: ["./config.yaml", "./dist"]   # 额外授权路径根（canonical，装配期 fail-fast）
-  exec:                           # 【预留段】本版解析但不生效——exec 全局随后续版本交付
+  exec:                           # exec 授权（v0.1.75 生效；与 modules 相互独立，缺省 = 全 deny）
     ojm-installer:
-      allow: ["tar -xzf ${path:archive} -C ${path:dest}"]
+      allow:                      # argv 模板：literal 逐字 + ${path:}/${raw:} 占位符（见 §6「exec」）
+        - "tar -xzf ${path:archive} -C ${path:dest}"
+        - "tar -tzf ${path:archive}"
       env: ["OJ_SECRET_KEY"]
 ```
 
@@ -2996,8 +3083,8 @@ platform:
 |---|---|
 | `modules` | 平台特权模块名白名单。非名单模块报 `NotCapable: module 'x' is not platform-privileged` |
 | `root` | 受控挂载根：特权模块的**唯一**正经部署目录（相对 config_dir 解析）。`modules` 非空时必配，且该目录必须同时列为 **`mounts[].api` 条目**——模块归属与路由只能来自挂载 discover。特权模块只能由部署方放入该目录 |
-| `trusted_paths` | 额外授权路径根（相对 config_dir 解析；canonical 化，路径不存在 → 装配 fail-fast）。**本版生效面 = fs 轴扩展**：特权模块的 fs 读写范围 = `fs.root ∪ trusted_paths`（见 §6 fs「平台特权 fs 扩展」；`fs:` 未配置时不生效，非特权模块行为不变） |
-| `exec` | 【预留段】本版解析并保存形状（argv 模板 + env 白名单），但**不生效**——`exec` 全局随后续版本交付 |
+| `trusted_paths` | 额外授权路径根（相对 config_dir 解析；canonical 化，路径不存在 → 装配 fail-fast）。生效面 = 特权模块的 **fs 读写范围**（`fs.root ∪ trusted_paths`，见 §6 fs「平台特权 fs 扩展」；`fs:` 未配置时 fs 轴不生效，非特权模块行为不变）与 **exec `${path:}` 占位符的校验集合**（§6「exec」） |
+| `exec` | **exec 全局授权**（v0.1.75 生效）：模块名 → `{ allow: [argv 模板], env: [透传环境变量白名单] }`。列出该模块 = 授权其 `exec.run`；**与 `modules` 相互独立**（只配一边拿不到另一边）。模板 literal token 逐字相等、`${path:NAME}`/`${raw:NAME}` 占位符恰吸一 token；模板语法错在调用期 fail-closed 点名。签名、语义与错误文案见 §6「exec」 |
 
 装配期抢注/绊线防护（全部启动 fail-fast，不等第一个请求）：
 
@@ -3696,7 +3783,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `crypto.verifyEd25519` 编码面（v0.1.75） | `sigBase64` 仅标准 base64（STANDARD/NO_PAD，**base64url 不支持**）；`msg` 仅 UTF-8 字符串；`publicKey` 须 hex/base64 编码的 **32 字节原始 key**（**PEM/SPKI 不支持**）。格式错抛错（文案 `verifyEd25519: …` 起头），格式合法验签不过返回 `false` |
 | `crypto.sha256Hex` 非 string/二进制入参抛 TypeError（v0.1.75 **行为变更**） | 旧版把 number/null 等经 `String()` 强转求摘要（静默产出垃圾摘要）；现 fail-loud 抛 TypeError——旧脚本传非 string/二进制入参的要先改（`String(x)` 显式转或改传 `Uint8Array`） |
 | `crypto.md5Hex` 已密码学破损（v0.1.75） | MD5 仅限**非安全场景**（缓存键/etag/旧系统兼容），**不得用于凭据/签名/完整性校验**；入参分流同 `sha256Hex`（string 走 UTF-8，`Uint8Array`/`ArrayBuffer` 走原始字节，其余抛 TypeError） |
-| `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面本版仅 fs 轴扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）；tasks/WS 上下文无模块归属 → 特权恒不可用；`exec` 段本版解析不生效 |
+| `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面 = 特权模块 fs 读写扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）+ `exec.run`（见下两条）；tasks/WS 上下文无模块归属 → 特权恒不可用 |
+| `exec.run` 授权 ≠ `platform.modules`（v0.1.75） | **两名单相互独立**：exec 特权只看 `platform.exec.<模块>` 是否列出该模块——只配 `modules` 不配 `exec`（或反之）拿不到对应面；未授权/模板失配/歧义/`${path:}` 越界一律 `NotCapable` 点名（文案见 §6「exec」错误表） |
+| `exec.run` 运行面硬限制（v0.1.75） | stdout+stderr **流式合计 10MB** 上限（超限杀进程组抛错，已收部分不返回）；`timeoutMs` 缺省 30s、硬上限 600s（超出**钳制**不报错）；输出强制 UTF-8（二进制不支持）；cwd 钉在 fs.root 但**非隔离边界**（路径防线在 `${path:}` 占位符校验，勿传越界相对路径）；未配 `fs:` → exec 整体不可用；子进程 argv[0] 是宿主解析后的**绝对路径**（非模板首 token 原文）；信号终止 `code = 128 + signal`，非 0 退出码**不抛错**照常返回 |
 | `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 
 ### 常见陷阱清单

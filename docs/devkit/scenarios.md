@@ -33,7 +33,8 @@
 | [27](#场景-27泛型轴插件调用axisnamev0154) | 泛型轴插件调用——`axis(name).op(...)`（v0.1.54；泛型轴零 ABI 变更，含 oj-ldap 迁移版调用面） | §6 axis(name) / §10 plugins |
 | [31](#场景-31一个文件多个同动词端点嵌套-handler-组v0164) | 一个文件多个同动词端点——嵌套 handler 组（实体为根）+ 组级 `.route`（v0.1.64；动词/子组判别红线，不再静默丢弃） | §4 编写 api.ts |
 | [32](#场景-32用-ddd-规划组级-api实体为根--组级-routeschema-平衡) | 用 DDD 规划组级 API：聚合根→实体组、从属资源→子组、独立聚合→拆目录；组级 `.route`/`.schema` 统一声明公共前缀与公共入参 | §4 编写 api.ts |
-| [33](#场景-33特权模块受控挂载最小配置platformv0175) | 平台特权模块最小配置：`platform:` 段 + `mounts[].api` 条目 + 特权 fs 读 trusted 文件（v0.1.75；fail-closed，装配期抢注防护；exec 段预留不生效） | §6 fs / §10 platform |
+| [33](#场景-33特权模块受控挂载最小配置platformv0175) | 平台特权模块最小配置：`platform:` 段 + `mounts[].api` 条目 + 特权 fs 读 trusted 文件 + `exec` 授权（v0.1.75；fail-closed，装配期抢注防护） | §6 fs / §6 exec / §10 platform |
+| [34](#场景-34tar-解压安全落位exectar-三步范式v0175) | 用 `exec.run` 跑系统 tar 安全解压发行包：`-tzf` 预检 + 成员名复检 → 解压到 `.staging` → 解压后 walk 校验（symlink 零容忍 + 体积对账）→ 原子落位（v0.1.75；argv 模板白名单，无 shell） | §6 exec / §10 platform |
 
 ---
 
@@ -2292,9 +2293,10 @@ GET  /v1/api/project/{pid}/schema     → 404（元数据不生成路由；契�
 ## 场景 33：特权模块受控挂载最小配置（platform，v0.1.75）
 
 > 何时抄我：你要部署一个**平台特权模块**（如 ojm 安装器），它需要读 jail 之外的
-> 受信文件（config、发行产物）。本场景给最小可跑配置——**只写本版可用 API**
-> （生效面 = 特权模块 fs 读写范围扩为 `fs.root ∪ trusted_paths`；`exec` 全局尚未交付）。
-> 手册 §10「platform」、§6 fs「平台特权 fs 扩展」。
+> 受信文件（config、发行产物）或执行外部命令（tar 解压等）。本场景给最小可跑配置——
+> 生效面 = 特权模块 fs 读写范围扩为 `fs.root ∪ trusted_paths` + `exec` 全局授权；
+> tar 解压三步范式见场景 34。
+> 手册 §10「platform」、§6 fs「平台特权 fs 扩展」、§6「exec」。
 
 ### ① 目录布局（特权模块只能部署方手工放入受控根，不进市场安装树）
 
@@ -2327,10 +2329,10 @@ platform:
   root: "./platform-modules"                 # modules 非空时必配；须同时列为 mounts[].api 条目
   trusted_paths: ["."]                       # 额外授权根：相对 config_dir 解析（此处=项目根，
                                              # 覆盖 config.yaml 等受信文件；须已存在，否则装配 fail-fast）
-  # exec:                                    # 【预留段】本版解析但不生效，exec 全局随后续版本交付
-  #   ojm-installer:
-  #     allow: ["tar -xzf ${path:archive} -C ${path:dest}"]
-  #     env: ["OJ_SECRET_KEY"]
+  exec:                                      # exec 授权（v0.1.75 生效；与 modules 相互独立，
+    ojm-installer:                           #   列出该模块 = 授权其 exec.run）
+      allow: ["tar -tzf ${path:archive}", "tar -xzf ${path:archive} -C ${path:dest}"]
+      env: ["OJ_SECRET_KEY"]                 # 透传环境变量白名单（值不进 JS 面）
 ```
 
 ### ③ handler（特权模块里 fs 读 trusted 文件）
@@ -2367,6 +2369,115 @@ curl -s http://localhost:9778/v1/platform/ojm-installer/   # {"code":0,"data":{"
 | 启动报 `platform.root (…) must not overlap another api mount (…)` | 受控根与其他挂载树同径或互为父子（含父目录形态）——绊线会被静默穿透，装配期直接拒绝 |
 | 启动报 `… is not deployed under platform.root (dangling privilege…)` | 名单悬空：`platform.root` 下没有这个模块——部署它或从名单删掉 |
 | 启动报 `platform.trusted_paths canonicalize failed` | trusted_paths 条目路径不存在——相对 config_dir 解析，先建目录或改路径 |
+| `exec.run` 报 `module 'x' is not authorized for exec` | **exec 授权 ≠ `platform.modules`**（两名单独立）——`platform.exec.<模块>` 里列出该模块并给匹配的 argv 模板（场景 34） |
+
+---
+
+## 场景 34：tar 解压安全落位——`exec.run` + tar 三步范式（v0.1.75）
+
+> 何时抄我：特权模块要解压发行包（安装闭环「下载 → 校验 → 解压落位」的落位段）。
+> `exec.run` 无 shell，argv 必须恰命中一条 `platform.exec.<模块>.allow` 授权模板；
+> **安全判定后置**——`tar -tzf` 预检只是快速失败优化，权威校验 = 解压后对目标目录
+> 全量 walk。手册 §6「exec」、§10「platform」。
+
+### ① 配置（在场景 33 基础上给 exec 加 tar 模板）
+
+```yaml
+fs:
+  root: ./data
+  readonly: false
+
+platform:
+  modules: ["ojm-installer"]
+  root: "./platform-modules"
+  trusted_paths: ["."]
+  exec:
+    ojm-installer:
+      allow:
+        - "tar -tzf ${path:archive}"                       # 预检：列成员（快速失败）
+        - "tar -xzf ${path:archive} -C ${path:dest}"       # 解压：两路径都过 ${path:} 校验
+      env: []                                              # tar 不需要环境变量；缺省空表
+```
+
+模板红线：literal token 逐字相等——handler 里多传/换掉任何 literal（如给 tar 夹
+`--use-compress-program=…`）都报 `exec template mismatch`；`${path:}` 值按路径校验
+（须落在 `fs.root ∪ trusted_paths` 内），`${raw:}` 拒 `-` 开头与绝对形态。
+
+### ② handler（三步范式：预检 + 成员名复检 → 解压到 .staging → walk 校验 → 原子落位）
+
+```ts
+// platform-modules/ojm-installer/extract/api.ts —— POST /v1/platform/ojm-installer/extract/
+// body: { archive: "uploads/pkg-1.0.0.tgz", name: "pkg", version: "1.0.0" }（相对 fs.root）
+const SIZE_CAP = 512 * 1024 * 1024;   // 解压结果体积对账上限（按需定，防归档炸弹填盘）
+
+async function post() {
+  const { archive, name, version } = http.body as { archive: string; name: string; version: string };
+  const staging = `dist/.staging/${name}-${version}-${Date.now()}`;
+
+  // ① 预检（快速失败）+ 成员名复检：组件级拒 `..` / 绝对形态 / 控制字符
+  //    （按 / 分段判，不做子串匹配——`a..b` 是合法文件名）
+  const listed = (await exec.run(["tar", "-tzf", archive])).stdout;
+  for (const line of listed.split("\n")) {
+    const m = line.trim();
+    if (!m) continue;
+    if (m.startsWith("/") || m.includes("\0") || m.split("/").some((c) => c === "..")) {
+      throw new Error(`rejected archive member: ${m}`);
+    }
+  }
+
+  // ② 解压到 .staging（jail 内；cwd 已钉在 fs.root，${path:} 值经路径校验）
+  await exec.run(["tar", "-xzf", archive, "-C", staging]);
+
+  // ③ 权威校验：解压后对 staging 全量 walk——symlink/hardlink/设备零容忍 + 体积对账
+  let total = 0;
+  async function walk(p: string): Promise<void> {
+    for await (const e of await fs.readDir(p)) {
+      const full = `${p}/${e.name}`;
+      if (e.isSymlink) throw new Error(`symlink rejected: ${full}`);
+      const st = await fs.stat(full);
+      if (e.isDirectory) { await walk(full); continue; }
+      total += st.size;
+      if (total > SIZE_CAP) throw new Error(`extracted size exceeds ${SIZE_CAP}`);
+    }
+  }
+  await walk(staging);
+
+  // ④ 原子落位：同盘 rename 原子（生产建议：目标已存在先 rename 到 <target>.old-<rand>，
+  //    成功后回收；staging 命名与 manifests.yaml 的 <module>-<version> 约定一致）
+  const target = `dist/${name}-${version}`;
+  await fs.rename(staging, target);
+  json.ok({ target, totalBytes: total });
+}
+export default { post };
+```
+
+任一步抛错：预检/成员名阶段还没落盘；walk 阶段应删掉整个 staging 目录再抛
+（不部分落盘——示例从简，生产把 ③ 包进 try/catch 补 `fs.remove(staging, {recursive: true})`）。
+
+### ③ 验证
+
+```bash
+# 造一个测试包塞进 jail
+mkdir -p data/uploads data/dist && tar -czf data/uploads/pkg-1.0.0.tgz -C data .
+curl -s -X POST http://localhost:9778/v1/platform/ojm-installer/extract/ \
+  -H 'content-type: application/json' \
+  -d '{"archive":"uploads/pkg-1.0.0.tgz","name":"pkg","version":"1.0.0"}'
+# → {"code":0,"data":{"target":"dist/pkg-1.0.0","totalBytes":…}}
+ls data/dist/pkg-1.0.0
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `NotCapable: … not authorized for exec` / `template mismatch` | 模块没进 `platform.exec` 授权表；或 argv 与模板 literal 不逐字 / token 数不齐 / `${raw:}` 收到 `-` 开头 token。**exec 授权 ≠ `platform.modules`**，两名单独立 |
+| `exec template ambiguous: argv matches N authorized templates` | 同一 argv 命中 ≥2 条模板（如 `tar -tzf ${path:a}` 与 `tar ${raw:x} ${path:a}` 都能吃 `tar -tzf a.tgz`）——收紧模板消除歧义，宿主不静默择一 |
+| `NotCapable: exec ${path:archive}: path outside fs.root and trusted_paths …` | 归档/目标路径越出 `fs.root ∪ trusted_paths`——把所在目录根加进 `trusted_paths`，或把文件挪进 jail |
+| `exec: command resolve failed for 'tar': … not found in PATH` | 部署机没有 tar——依赖由部署文档声明（macOS bsdtar / Linux GNU tar 方言差异被后置 walk 校验天然覆盖） |
+| `exec output limit exceeded` / `exec timed out after N ms` | `tar -tzf` 大包成员列表可超 stdout 合计 10MB；大包解压超缺省 30s——显式调大 `timeoutMs`（硬上限 600s） |
+| 只做 `-tzf` 预检就信任归档 | 预检与解压之间归档可被同 jail 模块置换（TOCTOU）；**权威校验是解压后 walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、体积对账）——三步一步都不能省 |
+| 给 `${raw:}` 传文件路径 | `${raw:}` 拒 `-` 开头与绝对形态（`/`、`\`、盘符起手），传路径请用 `${path:}`（它才做 jail 校验） |
+| 子进程拿到的 argv[0] 不是 "tar" 原文 | 预期：宿主把模板首 token 解析为绝对路径（按宿主 PATH）再传给子进程；模板首 token 必须是裸名 |
 
 ---
 
