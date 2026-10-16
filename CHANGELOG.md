@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.76（未打标签）
+## v0.1.76
 
 - `http.module`：模块路由分发注入只读模块身份 `{name, version}`（dev 版本取 `src/<m>/manifest.yaml`，release 取 `dist/<m>-<v>/manifest.yaml`）。判定依据是 handler 文件所在模块目录而非请求来源——无模块上下文（任务桥 / WS 帧 / `run_with` / 启动期内省）为 `null`；页面 meta 合成派发在模块目录内有值；
 - 只读语义：返回对象已 `Object.freeze`——strict（ESM / api 文件 CJS 包装）下写 / delete 抛 `TypeError: Cannot assign to read only property …`，`require()` 引入的 CJS 代码（sloppy）写它静默无效。两条路径都改不了框架授信面（跨模块表归属守卫 / bound_db 重定向 / 平台特权换装）——JS 只持 `op_http_info` 快照拷贝；

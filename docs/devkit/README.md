@@ -37,7 +37,7 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
-v0.1.76（未打标签）已落地部分：**`http.module`**——模块路由分发时注入的**只读**模块
+v0.1.76 已落地部分：**`http.module`**——模块路由分发时注入的**只读**模块
 身份 `{name, version}`（dev 取 `src/<m>/manifest.yaml` 的 version，release 取
 `dist/<m>-<v>/manifest.yaml`；无模块上下文——任务桥 / WS 帧 / `run_with` / 启动期
 内省——为 `null`，页面 meta 合成派发在模块目录内**有值**）。对象已冻结：strict
