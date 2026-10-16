@@ -34,6 +34,7 @@ pub mod db_backend;
 mod embedded_js;
 mod envelope;
 mod es;
+pub mod exec;
 pub(crate) mod ffi;
 pub mod frame_pool;
 pub mod fs;
@@ -465,6 +466,7 @@ deno_core::extension!(
         ldap::op_ldap_call,
         generic_axis::op_axis_call,
         fs::op_fs_resolve,
+        exec::op_exec_run,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },

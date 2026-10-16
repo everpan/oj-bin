@@ -4534,6 +4534,7 @@ dependencies = [
  "httptest",
  "jsonwebtoken 9.3.1",
  "lettre",
+ "libc",
  "libloading 0.9.0",
  "md-5 0.10.6",
  "notify",

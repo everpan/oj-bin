@@ -109,6 +109,7 @@ import {
   op_ws_broadcast,
   op_ws_room_size,
   op_fs_resolve,
+  op_exec_run,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -191,6 +192,19 @@ globalThis.fs = {
   rename: (a, b) => ojFs.rename(ojFsResolve(a), ojFsResolve(b)),
   stat: (p) => ojFs.stat(ojFsResolve(p)),
   readDir: (p) => ojFs.readDir(ojFsResolve(p)),
+};
+
+// ----- exec: external command primitive (argv templates; ojm batch) -----
+// Runs ONLY an authorized argv template: literal tokens must match exactly and
+// typed placeholders absorb exactly one token each (${path:NAME} is checked
+// against fs.root + trusted_paths; ${raw:NAME} rejects option-like/absolute
+// forms). No shell. cwd is fs.root; env is empty except the configured
+// whitelist (values never enter JS); stdout+stderr combined 10MB cap; timeout
+// defaults to 30s, hard cap 600s (larger values are clamped). A process that
+// runs to exit (ANY code) resolves {code, stdout, stderr} (signal death maps
+// to 128+signal); authorization/template/timeout/limit/spawn failures throw.
+globalThis.exec = {
+  run: (argv, opts) => op_exec_run(argv, opts === undefined ? null : opts),
 };
 
 // ----- json: unified envelope + response headers -----

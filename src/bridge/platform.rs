@@ -60,11 +60,26 @@ impl PlatformGrant {
     }
 }
 
+/// 命令解析器（DIP，设计稿 §1.1「模板首 token 宿主侧解析」）：模板首 token →
+/// 绝对路径。默认实现 [`crate::bridge::exec::default_resolve_command`]
+/// （`"oj"` → `current_exe()`，其余父进程 PATH 解析）；测试注入哨兵解析器。
+pub type CommandResolver = std::sync::Arc<dyn Fn(&str) -> Result<PathBuf, String> + Send + Sync>;
+
 /// exec 授权（config `platform.exec:` 段；阶段 3 `exec.run` 消费）。
-#[derive(Debug)]
+/// resolver 字段不参与 Debug 输出（函数对象），手写实现。
 pub struct ExecGrant {
     /// 模块名 → 授权（列出该模块 = 授权其 exec）。
     pub per_module: BTreeMap<String, ModuleExecGrant>,
+    /// 命令解析器（生产默认 + 测试注入，见 [`CommandResolver`]）。
+    pub resolver: CommandResolver,
+}
+
+impl std::fmt::Debug for ExecGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecGrant")
+            .field("per_module", &self.per_module)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 单模块 exec 授权：argv 模板原样保存（阶段 3 解析匹配），env 透传白名单。
@@ -76,12 +91,25 @@ pub struct ModuleExecGrant {
 
 impl ExecGrant {
     /// 装配期构建：本阶段只搬运形状，不校验模板语法（阶段 3 解析期报错点名）。
+    /// 解析器取生产默认（`"oj"` → current_exe，其余 PATH 解析）。
     pub fn new(per_module: BTreeMap<String, (Vec<String>, Vec<String>)>) -> Self {
+        Self::with_resolver(
+            per_module,
+            std::sync::Arc::new(crate::bridge::exec::default_resolve_command),
+        )
+    }
+
+    /// 同 [`ExecGrant::new`]，但显式指定命令解析器（测试注入哨兵路径）。
+    pub fn with_resolver(
+        per_module: BTreeMap<String, (Vec<String>, Vec<String>)>,
+        resolver: CommandResolver,
+    ) -> Self {
         Self {
             per_module: per_module
                 .into_iter()
                 .map(|(m, (templates, env))| (m, ModuleExecGrant { templates, env }))
                 .collect(),
+            resolver,
         }
     }
 }
