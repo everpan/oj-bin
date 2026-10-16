@@ -81,6 +81,13 @@ pub fn op_http_info(state: &mut OpState) -> serde_json::Value {
         },
         "tenantId": s.req.tenant_id,
         "user": s.req.user,
+        // 模块身份（路由分发时注入；name/version 恒同生同灭）。无模块上下文
+        // （任务桥/WS/run_with/内省期）→ null；JS 侧经 bootstrap Proxy 冻结只读。
+        // Some(name)+None(version) 是框架缺陷态——整体 null 比半对象诚实。
+        "module": match (&s.module, &s.module_version) {
+            (Some(n), Some(v)) => json!({ "name": n, "version": v }),
+            _ => Value::Null,
+        },
         "files": s.req.files.iter().map(|f| json!({
             "field": f.field,
             "filename": f.filename,

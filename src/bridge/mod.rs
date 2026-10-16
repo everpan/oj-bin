@@ -114,12 +114,17 @@ use deno_core::{JsRuntime, ModuleSpecifier, OpState, PollEventLoopOptions, op2};
 /// 契约实现（DataAccessor/KVStore）的统一错误返回（stdlib，不泄漏 deno 类型）。
 pub type BridgeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// 模块执行上下文（P2 §5.3）：manifest 的 db/deps 声明 + 模块名。
+/// 模块执行上下文（P2 §5.3）：manifest 的 db/deps 声明 + 模块名 + 版本。
 /// 装配期从 manifest.yaml 汇总，按模块目录绝对路径存入 StableState.modules；
-/// 派发时 `run_module` 经 api_path 祖先目录命中后写入 `ReqState.module`。
+/// 派发时 `run_module` 经 api_path 祖先目录命中后写入 `ReqState.module`
+/// （+ `module_version`，`http.module` 的数据源）。
 #[derive(Clone)]
 pub struct ModuleCtx {
     pub name: String,
+    /// manifest version：dev = src/<m>/manifest.yaml；release = dist/<m>-<v>/manifest.yaml。
+    /// `http.module.version` 的数据源（装配期冻结，运行期不可变）。
+    /// JS 可见面只经 `op_http_info` 显式投影——禁对本结构 derive Serialize（防 DTO 腐化）。
+    pub version: String,
     /// manifest deps 声明的模块名集合（跨模块表访问守卫的放行依据）。
     pub deps: Arc<std::collections::HashSet<String>>,
     /// manifest db 绑定：Some(name) → 模块的 "default" 库调用重定向到该命名库。
@@ -321,6 +326,9 @@ pub struct ReqState {
     pub ws_sess: Option<serde_json::Value>,
     /// 本请求所属模块名（§5.3 执行上下文；run_module 按目录命中注入；None = 无上下文）。
     pub module: Option<String>,
+    /// 本请求所属模块版本（与 module 同点注入，唯一写点在 checkout_reset；
+    /// `http.module.version` 的数据源；None = 无上下文）。
+    pub module_version: Option<String>,
     /// db.asSystem() 逃生口：本请求以系统身份绕过租户防护（reset 即失效；
     /// sql_guard 活跃时调用处记审计日志）。默认 false。
     pub system: bool,
@@ -364,6 +372,7 @@ impl ReqState {
         self.ws_close = false;
         self.ws_sess = None;
         self.module = None;
+        self.module_version = None;
         self.system = false;
         self.stream_tx.borrow_mut().take();
         self.stream_rx.borrow_mut().take();
@@ -868,7 +877,7 @@ impl Bridge {
     async fn checkout_reset(
         &self,
         req: RequestInfo,
-        module: Option<&str>,
+        module: Option<&ModuleCtx>,
     ) -> Result<JsRuntime, RunError> {
         let rt = self.pool.checkout().await?;
         let stable = self.pool.stable().clone();
@@ -878,7 +887,11 @@ impl Bridge {
             {
                 let rs = g.borrow_mut::<ReqState>();
                 rs.reset(req);
-                rs.module = module.map(|s| s.to_string());
+                // http.module {name, version} 与 Rust 侧授信面（归属守卫/bound_db/
+                // 平台特权换装）同源于 ModuleCtx——唯一写点，两者恒同生同灭。
+                rs.module = module.map(|c| c.name.clone());
+                rs.module_version = module.map(|c| c.version.clone());
+                debug_assert_eq!(rs.module.is_some(), rs.module_version.is_some());
             }
             // fs 轴第二道防线按模块特权级换装（ojm 批次，设计稿 §1.6）：特权模块
             // （ReqState.module ∈ platform.modules）的 read/write 授权面 =
@@ -891,7 +904,7 @@ impl Bridge {
             g.put(fs::container_for_module(
                 stable.fs.as_deref(),
                 stable.platform.as_deref(),
-                module,
+                module.map(|c| c.name.as_str()),
             ));
         }
         Ok(rt)
@@ -904,7 +917,7 @@ impl Bridge {
         &self,
         req: RequestInfo,
         timeout: std::time::Duration,
-        module: Option<&str>,
+        module: Option<&ModuleCtx>,
     ) -> Result<JsRuntime, RunError> {
         let mut rt = self.checkout_reset(req, module).await?;
         let handle = rt.v8_isolate().thread_safe_handle();
@@ -1287,6 +1300,8 @@ impl Bridge {
         let code = driver_script(&body);
         // §5.3 执行上下文：api_path 祖先目录命中模块目录 → 本请求归该模块
         // （归属守卫 / bound_db 重定向依据；Map 键 = 模块目录绝对路径，装配期注入）。
+        // 命中即取整个 ModuleCtx——name 进 Rust 授信面，name+version 经
+        // op_http_info 投影为 JS 只读 http.module。
         let stable = self.pool.stable();
         // 入参契约校验（v0.1.44）：**在 V8 之前**拦住不合规输入 → 400。
         // 与「handler 未导出 → 405」同处一个执行切面：两者都是「进 JS 之前」的契约失败。
@@ -1312,11 +1327,11 @@ impl Bridge {
                 stream: None,
             });
         }
-        let mut module: Option<&str> = None;
+        let mut module: Option<&ModuleCtx> = None;
         let mut anc = api_path.parent();
         while let Some(d) = anc {
             if let Some(ctx) = stable.modules.get(&d.to_string_lossy().into_owned()) {
-                module = Some(ctx.name.as_str());
+                module = Some(ctx);
                 break;
             }
             anc = d.parent();
@@ -1494,7 +1509,7 @@ impl Bridge {
         req: RequestInfo,
         code: String,
         timeout: std::time::Duration,
-        module: Option<&str>,
+        module: Option<&ModuleCtx>,
     ) -> Result<Capture, RunError> {
         let mut rt = self.checkout_armed(req, timeout, module).await?;
         // `__ojRun` catch 后经 op_driver_error 回传；promise 恒 resolve，event loop
@@ -1734,6 +1749,198 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["t"], "t-9");
+    }
+
+    /// http.module {name, version}：run_module 按目录命中注入（v0.1.76）；
+    /// op_http_info 投影 + bootstrap Proxy 冻结。同一 runtime 归还后再借
+    /// （run_with，module=None）→ reset 归 null（LIFO 取回同一 runtime）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_exposes_module_identity_and_resets() {
+        let (base, api) = mod_fx(&[(
+            "m/api.js",
+            "export function get() { json.ok({ mod: http.module }); }\nexport default { get };\n",
+        )]);
+        let modules = Arc::new(HashMap::from([(
+            base.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                version: "9.9.9".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        let b = module_bridge_ex(&base, SchemaRegistry::new(), modules, false, HashMap::new());
+        let t = std::time::Duration::from_secs(5);
+        let cap = b
+            .run_module(&api, "get", RequestInfo::default(), t)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["mod"]["name"], "m", "{v}");
+        assert_eq!(v["data"]["mod"]["version"], "9.9.9", "{v}");
+        // reset：模块上下文不跨请求残留（无模块上下文的 run_with → null）。
+        let cap = b
+            .run_with(
+                r#"json.ok({ mod: http.module === null ? "null" : "leaked" });"#,
+                RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["mod"], "null", "{v}");
+    }
+
+    /// api 文件不在任何模块目录内（挂载根级直置）→ http.module === null。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_module_null_without_module_context() {
+        let (base, api) = mod_fx(&[(
+            "api.js",
+            "export function get() { json.ok({ mod: http.module }); }\nexport default { get };\n",
+        )]);
+        let b = module_bridge(&base);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(v["data"]["mod"].is_null(), "{v}");
+    }
+
+    /// api 文件 CJS 探针（v0.1.76）：wrap_cjs 包装器自身是 ESM（`export default`）
+    /// → 模块 strict → 按 spec 其中定义的 IIFE **继承 strict** → 写冻结同样抛
+    /// TypeError（不是 sloppy；sloppy 只在 require() 的 new Function 路径，见下一探针）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_module_frozen_cjs_api_file_write_throws() {
+        let (base, api) = mod_fx(&[(
+            "m/api.js",
+            "module.exports = { get() { http.module.name = \"evil\"; json.ok(1); } };\n",
+        )]);
+        let modules = Arc::new(HashMap::from([(
+            base.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                version: "9.9.9".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        let b = module_bridge_ex(&base, SchemaRegistry::new(), modules, false, HashMap::new());
+        let e = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("read only"),
+            "CJS api 文件（ESM 包装 → strict）写冻结应抛 TypeError：{e}"
+        );
+    }
+
+    /// require() CJS 探针（v0.1.76）：require 的代码经 __ojRequire 的 new Function
+    /// 执行（sloppy）——写冻结对象静默无效不抛，读回不变。与 strict 路径的
+    /// TypeError 互补：两条路径都动不了 Rust 授信面（JS 只持 op_http_info 快照拷贝）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_module_frozen_via_require_cjs_sloppy_ignored() {
+        let (base, api) = mod_fx(&[
+            (
+                "m/api.js",
+                "module.exports = { get() { const h = require(\"./helper\"); json.ok({ poked: h.poke(http.module), mod: http.module }); } };\n",
+            ),
+            (
+                "m/helper.js",
+                "module.exports = { poke(m) { m.name = \"evil\"; return m.name; } };\n",
+            ),
+        ]);
+        let modules = Arc::new(HashMap::from([(
+            base.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                version: "9.9.9".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        let b = module_bridge_ex(&base, SchemaRegistry::new(), modules, false, HashMap::new());
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["poked"], "m", "sloppy 写应静默无效：{v}");
+        assert_eq!(v["data"]["mod"]["name"], "m", "{v}");
+        assert_eq!(v["data"]["mod"]["version"], "9.9.9", "{v}");
+    }
+
+    /// 对抗性探测（v0.1.76）：http.module 冻结只读——isFrozen、strict 写抛
+    /// TypeError、Proxy 无 set 陷阱（`http.module = x` 惰性无效，读回不变）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_module_is_frozen_and_rejects_writes() {
+        let (base, api) = mod_fx(&[(
+            "m/api.js",
+            r#"export function get() {
+                 const frozen = Object.isFrozen(http.module);
+                 let err = null;
+                 try { http.module.name = "evil"; } catch (e) { err = String(e); }
+                 let delErr = null;
+                 try { delete http.module.version; } catch (e) { delErr = String(e); }
+                 http.module = { name: "evil", version: "0" };
+                 const after = http.module;
+                 json.ok({ frozen, err, delErr, name: after.name, version: after.version });
+               }
+               export default { get };"#,
+        )]);
+        let modules = Arc::new(HashMap::from([(
+            base.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                version: "9.9.9".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        let b = module_bridge_ex(&base, SchemaRegistry::new(), modules, false, HashMap::new());
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["frozen"], true, "{v}");
+        assert!(
+            v["data"]["err"]
+                .as_str()
+                .unwrap_or("")
+                .contains("read only"),
+            "strict 写冻结对象应抛 TypeError：{v}"
+        );
+        assert!(
+            v["data"]["delErr"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Cannot delete"),
+            "delete 冻结属性应抛 TypeError：{v}"
+        );
+        // 赋值落隐藏 target，get 仍走快照——读回恒为真实模块身份。
+        assert_eq!(v["data"]["name"], "m", "{v}");
+        assert_eq!(v["data"]["version"], "9.9.9", "{v}");
     }
 
     /// blob 未配置（Extras 缺省）：JS 侧 blob.* 报 "blob not configured"。
@@ -3343,6 +3550,7 @@ mod tests {
                 root.join("m").to_string_lossy().into_owned(),
                 ModuleCtx {
                     name: "m".into(),
+                    version: "0.1.0".into(),
                     deps: Arc::new(std::collections::HashSet::new()),
                     db: None,
                 },
@@ -3457,6 +3665,7 @@ mod tests {
                 root.join("m_a").to_string_lossy().into_owned(),
                 ModuleCtx {
                     name: "m_a".into(),
+                    version: "0.1.0".into(),
                     deps: Arc::new(std::collections::HashSet::new()),
                     db: Some("db_a".into()),
                 },
@@ -3465,6 +3674,7 @@ mod tests {
                 root.join("m_b").to_string_lossy().into_owned(),
                 ModuleCtx {
                     name: "m_b".into(),
+                    version: "0.1.0".into(),
                     deps: Arc::new(std::collections::HashSet::new()),
                     db: Some("db_b".into()),
                 },
@@ -3515,6 +3725,7 @@ mod tests {
             root.join("m").to_string_lossy().into_owned(),
             ModuleCtx {
                 name: "m".into(),
+                version: "0.1.0".into(),
                 deps: Arc::new(std::collections::HashSet::new()),
                 db: None,
             },
@@ -3558,6 +3769,7 @@ mod tests {
             root.join("m").to_string_lossy().into_owned(),
             ModuleCtx {
                 name: "m".into(),
+                version: "0.1.0".into(),
                 deps: Arc::new(std::collections::HashSet::new()),
                 db: Some("analytics".into()),
             },
@@ -4195,6 +4407,7 @@ mod tests {
             base.join("plat").to_string_lossy().into_owned(),
             ModuleCtx {
                 name: "plat".into(),
+                version: "0.1.0".into(),
                 deps: Arc::new(std::collections::HashSet::new()),
                 db: None,
             },

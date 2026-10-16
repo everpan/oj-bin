@@ -823,6 +823,7 @@ export default {
                 dir.to_string_lossy().into_owned(),
                 ModuleCtx {
                     name: n.to_string(),
+                    version: "0.1.0".into(),
                     deps: Arc::new(HashSet::new()),
                     db: None,
                 },

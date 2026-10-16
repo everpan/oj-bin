@@ -419,6 +419,7 @@ mod tests {
             base.join("plat").to_string_lossy().into_owned(),
             ModuleCtx {
                 name: "plat".into(),
+                version: "0.1.0".into(),
                 deps: Arc::new(std::collections::HashSet::new()),
                 db: None,
             },
@@ -476,6 +477,7 @@ mod tests {
             base.join("plat").to_string_lossy().into_owned(),
             ModuleCtx {
                 name: "plain".into(),
+                version: "0.1.0".into(),
                 deps: Arc::new(std::collections::HashSet::new()),
                 db: None,
             },

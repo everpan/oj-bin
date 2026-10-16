@@ -452,6 +452,9 @@ async fn build_schema_and_modules(
                 mdir.to_string_lossy().into_owned(),
                 ModuleCtx {
                     name: name.clone(),
+                    // http.module.version 数据源：dev = src/<m>/manifest.yaml；
+                    // release = dist/<m>-<v>/manifest.yaml（build 时原样拷贝）。
+                    version: mf.version.clone(),
                     deps: Arc::new(mf.deps.keys().cloned().collect()),
                     db: mf.db.clone(),
                 },
@@ -1564,6 +1567,17 @@ impl App {
                         return Err(format!(
                             "manifest name {:?} != module {module:?} (in {})",
                             m.name,
+                            mf.display()
+                        ));
+                    }
+                    // version 一致性（http.module.version 的正确性前提）：manifest 的
+                    // version 必须等于目录后缀 <module>-<version>。错位/手改的 dist
+                    // manifest 会让 http.module.version 与真实加载版本静默不符——
+                    // 正是该注入要防的误判源，与 name 校验同款 fail-fast。
+                    if m.version != *version {
+                        return Err(format!(
+                            "manifest version {:?} != directory suffix {version:?} (in {}) — stale or hand-edited dist? run `oj build`",
+                            m.version,
                             mf.display()
                         ));
                     }

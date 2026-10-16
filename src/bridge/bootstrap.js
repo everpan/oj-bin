@@ -471,6 +471,14 @@ globalThis.http = new Proxy({}, {
     if (p === "file") return (i) => op_http_file(i | 0);
     // raw bytes of the current request / WS frame (text and binary frames alike).
     if (p === "bodyBytes") return () => op_http_body_bytes();
+    // module identity (name + version) injected at route dispatch; frozen so a
+    // handler cannot rewrite the framework's trust basis (ownership guard / bound_db
+    // / platform privilege swap all key off it). null when there is no module
+    // context (task bridge / WS frames / run_with / introspection).
+    if (p === "module") {
+      const m = httpInfo().module;
+      return m === null ? null : Object.freeze(m);
+    }
     return httpInfo()[p];
   },
 });
