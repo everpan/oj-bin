@@ -467,6 +467,133 @@ type JwtOidcCfg = (
     Option<Arc<only_js::bridge::oidc::OidcState>>,
 );
 
+/// platform 段装配产物（grants 对；`platform:` 缺省 = (None, None) 全 deny）。
+type PlatformGrants = (
+    Option<Arc<only_js::bridge::platform::PlatformGrant>>,
+    Option<Arc<only_js::bridge::platform::ExecGrant>>,
+);
+
+/// platform 段装配（ojm 批次，设计稿 §1.2「抢注防护与受控挂载」）：
+/// ① **受控挂载根**（特权名单非空时必配）：`platform.root` 须作为 api mount 接入
+///    装配（模块归属/路由只能来自挂载树 discover，目录祖先命中机制不变）；其
+///    discover 产物名 P 豁免抢注检查，且 `modules` ⊆ P（悬空特权 fail-fast）。
+/// ② **抢注防护**（fail-fast）：特权名出现在市场安装树（api 挂载树 discover 产物）
+///    且不在 P 中 → Err 点名——「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断；
+///    同名同时出现在受控根与另一挂载树由 build_schema_and_modules 的跨树唯一性
+///    检查先行拦截。特权模块只能由部署方放入 `platform.root`。
+/// ③ grants 构建：[`PlatformGrant`]（canonical trusted 集合，fs.root 自动并入，
+///    trusted_paths 相对 config_dir 解析、不存在 fail-fast）与 [`ExecGrant`]
+///    （argv 模板原样保存，阶段 3 解析匹配）。`platform:` 缺省 = (None, None) 全 deny。
+pub(crate) fn build_platform_grants(
+    cfg: &Config,
+    config_dir: &Path,
+    fs_grant: &Option<Arc<only_js::bridge::fs::FsGrant>>,
+    trees: &[(PathBuf, bool)],
+    installed: &std::collections::HashSet<String>,
+) -> Result<PlatformGrants, String> {
+    let Some(p) = &cfg.platform else {
+        return Ok((None, None));
+    };
+    // 受控挂载根校验（特权名单非空时）：root 必配 + 必须已挂载为 api mount +
+    // discover 产物名集合 P。
+    let p_names: Option<std::collections::HashSet<String>> = if p.modules.is_empty() {
+        None
+    } else {
+        let Some(root_cfg) = p.root.as_deref() else {
+            return Err("platform.modules is set but platform.root is missing — \
+                 privileged modules need a controlled mount root"
+                .into());
+        };
+        let raw = Path::new(root_cfg);
+        let proot = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            config_dir.join(raw)
+        };
+        let proot = proot.canonicalize().map_err(|e| {
+            format!(
+                "platform.root canonicalize failed ({}): {e}",
+                proot.display()
+            )
+        })?;
+        // 互斥校验：受控根与任何**其它** api 挂载树不得同径或互为父子（前缀关系）——
+        // 防部署方误把受控根指到市场安装树（含父目录形态：受控根本身并非挂载树，
+        // 其子树里的市场产物会静默穿透抢注绊线）。同径重复树由跨树唯一性检查拦截。
+        for (t, _) in trees {
+            if *t == proot {
+                continue;
+            }
+            if t.starts_with(&proot) || proot.starts_with(t) {
+                return Err(format!(
+                    "platform.root ({}) must not overlap another api mount ({}) — \
+                     the anti-squatting tripwire would be silently disabled",
+                    proot.display(),
+                    t.display()
+                ));
+            }
+        }
+        let (troot, tts) = trees.iter().find(|(r, _)| *r == proot).ok_or_else(|| {
+            format!(
+                "platform.root ({}) must be mounted as an api mount \
+                 to give platform modules routes and ownership",
+                proot.display()
+            )
+        })?;
+        Some(
+            crate::manifest::discover(troot, *tts)?
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect(),
+        )
+    };
+    for name in &p.modules {
+        // 抢注（豁免受控根产物 P）：特权名出现在市场安装树且不在受控根下 → fail-fast。
+        if installed.contains(name) && !p_names.as_ref().is_some_and(|s| s.contains(name)) {
+            return Err(format!(
+                "platform module '{name}' must not come from an install tree \
+                 (deploy it in a platform-controlled directory under platform.root)"
+            ));
+        }
+    }
+    if let Some(p_names) = &p_names {
+        for name in &p.modules {
+            if !p_names.contains(name) {
+                return Err(format!(
+                    "platform module '{name}' is not deployed under platform.root \
+                     (dangling privilege: no module implementation)"
+                ));
+            }
+        }
+    }
+    // trusted_paths 相对 config_dir 解析（对齐 fs.root 的 static_dir 同形）；
+    // canonicalize + 不存在 fail-fast 归 platform.rs 单点。
+    let trusted_raw: Vec<PathBuf> = p
+        .trusted_paths
+        .iter()
+        .map(|tp| {
+            let pp = Path::new(tp);
+            if pp.is_absolute() {
+                pp.to_path_buf()
+            } else {
+                config_dir.join(pp)
+            }
+        })
+        .collect();
+    let fs_root = fs_grant.as_ref().map(|g| g.root.clone());
+    let platform = Arc::new(only_js::bridge::platform::PlatformGrant::new(
+        p.modules.clone(),
+        &trusted_raw,
+        fs_root.as_deref(),
+    )?);
+    let exec = Arc::new(only_js::bridge::platform::ExecGrant::new(
+        p.exec
+            .iter()
+            .map(|(m, c)| (m.clone(), (c.allow.clone(), c.env.clone())))
+            .collect(),
+    ));
+    Ok((Some(platform), Some(exec)))
+}
+
 /// jwt / oidc 原语配置（装配第 14 步）。auth 与 OIDC 解耦：核心只留原语，端点在 JS；
 /// 装配期构造失败即 fail-fast。
 fn build_jwt_and_oidc(cfg: &Config, config_dir: &Path) -> Result<JwtOidcCfg, String> {
@@ -1006,6 +1133,13 @@ pub async fn assemble_backend(
     // §4.8 归属图 + SchemaRegistry 复活。
     let (registry, modules) =
         build_schema_and_modules(trees, sql_guard, &cfg.tenant.shared_allow).await?;
+    // platform 段装配（ojm 批次）：受控挂载根校验 + 抢注防护（特权名 ∩ 安装树
+    // 模块名，豁免受控根产物 → fail-fast）+ grants 冻结。必须在
+    // build_schema_and_modules 之后——安装树模块名集合取自其产物。
+    let installed: std::collections::HashSet<String> =
+        modules.values().map(|m| m.name.clone()).collect();
+    let (platform_grant, exec_grant) =
+        build_platform_grants(cfg, config_dir, &fs_grant, trees, &installed)?;
     // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
     // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
     let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
@@ -1103,6 +1237,9 @@ pub async fn assemble_backend(
         let input_contracts = input_contracts.clone();
         let fs_grant = fs_grant.clone();
         let generic_axes = generic_axes.clone();
+        // platform/exec grants（ojm 批次；下方 build_platform_grants 产物，同一 Arc）。
+        let platform_grant = platform_grant.clone();
+        let exec_grant = exec_grant.clone();
         // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 oj_info 仍供 StableState 使用）。
         let oj_info = oj_info.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
@@ -1144,6 +1281,9 @@ pub async fn assemble_backend(
                     input_contracts: Some(input_contracts.clone()),
                     // fs 授权（v0.1.53；config fs: 段）：与 StableState.fs 同一 Arc。
                     fs: fs_grant.clone(),
+                    // platform/exec 授权（ojm 批次；config platform: 段）：与 StableState 同一 Arc。
+                    platform: platform_grant.clone(),
+                    exec: exec_grant.clone(),
                     // 泛型轴注册表：与 StableState.generic_axes 同一 Arc。
                     generic_axes: Some(generic_axes.clone()),
                     // ojInfo() 数据源：与 StableState.oj_info 同一 Arc（`oj info` CLI 同源）。
@@ -1187,6 +1327,8 @@ pub async fn assemble_backend(
         input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。
+        platform: platform_grant.clone(), // 与 make_bridge 的 Extras.platform 同一 Arc。
+        exec: exec_grant.clone(), // 与 make_bridge 的 Extras.exec 同一 Arc。
         generic_axes,         // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
         oj_info,              // 与 make_bridge 的 Extras.oj_info 同一 Arc（ojInfo() 数据源）。
     });
@@ -1873,6 +2015,322 @@ mod tests {
         let e = validate_html_meta_handler(&cfg, &tables).unwrap_err();
         assert!(e.contains("不在任何 api 挂载前缀下"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- platform 段装配（ojm 批次，BDD S4：抢注防护 + trusted_paths fail-fast）----
+
+    /// S4（设计稿 §1.2「抢注防护与受控挂载」）：特权名单非空 → platform.root 必配
+    /// 且已挂载；特权名出现在安装树且不在受控根产物中 → Err；受控根产物豁免；
+    /// 名单悬空 → Err；trusted_paths 不存在 → Err；canonical 集合含 fs.root。
+    #[test]
+    fn platform_grants_squatting_protection() {
+        let dir = std::env::temp_dir().join(format!("oj-platasm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // macOS 下 temp_dir 经 symlink：统一 canonical（build_platform_grants 内部
+        // 对 platform.root canonicalize 后与 trees 比对，两侧须同形态）。
+        let dir = dir.canonicalize().unwrap();
+        // 布局：dist/ = 市场安装树（挂载）；platform-modules/ = 受控挂载根。
+        // discover 可发现（dev 判定，name==目录名）。
+        for (rel, name) in [
+            ("dist/ojm-installer", "ojm-installer"),
+            ("platform-modules/inst", "inst"),
+        ] {
+            std::fs::create_dir_all(dir.join(rel)).unwrap();
+            std::fs::write(
+                dir.join(rel).join("manifest.yaml"),
+                format!("name: {name}\ndesc: d\nversion: 0.1.0\n"),
+            )
+            .unwrap();
+        }
+        let dist = dir.join("dist");
+        let proot = dir.join("platform-modules");
+        let trees = vec![(dist.clone(), true), (proot.clone(), true)];
+        let installed: std::collections::HashSet<String> = trees
+            .iter()
+            .flat_map(|(r, ts)| {
+                crate::manifest::discover(r, *ts)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(n, _)| n)
+            })
+            .collect();
+        assert!(installed.contains("ojm-installer") && installed.contains("inst"));
+
+        let pcfg = |modules: Vec<&str>, root: Option<&str>| only_js::config::PlatformCfg {
+            modules: modules.into_iter().map(String::from).collect(),
+            root: root.map(String::from),
+            trusted_paths: vec![],
+            exec: Default::default(),
+        };
+
+        // ① 名单非空但缺 platform.root → Err（受控挂载根必配，fail-fast）。
+        let cfg = Config {
+            platform: Some(pcfg(vec!["inst"], None)),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        assert!(e.contains("platform.root is missing"), "{e}");
+
+        // ② root 未挂载为 api mount（trees 不含）→ Err（归属/路由无从产生）。
+        let cfg = Config {
+            platform: Some(pcfg(vec!["inst"], Some("./platform-modules"))),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &[(dist.clone(), true)], &installed)
+            .unwrap_err();
+        assert!(e.contains("must be mounted as an api mount"), "{e}");
+
+        // ②b 第 8 态（互斥校验）：root 为某挂载树的**父目录**（前缀重叠）→ Err——
+        //    受控根本身并非挂载树，其子树里的市场产物会静默穿透抢注绊线。
+        std::fs::create_dir_all(dir.join("deploy/deploy-dist/ojm-installer")).unwrap();
+        std::fs::write(
+            dir.join("deploy/deploy-dist/ojm-installer/manifest.yaml"),
+            "name: ojm-installer\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        let nested_trees = vec![(dir.join("deploy/deploy-dist"), true)];
+        let installed_nested: std::collections::HashSet<String> =
+            crate::manifest::discover(&dir.join("deploy/deploy-dist"), true)
+                .unwrap()
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+        let cfg = Config {
+            platform: Some(pcfg(vec!["ojm-installer"], Some("./deploy"))),
+            ..Default::default()
+        };
+        let e =
+            build_platform_grants(&cfg, &dir, &None, &nested_trees, &installed_nested).unwrap_err();
+        assert!(
+            e.contains("must not overlap another api mount")
+                && e.contains("anti-squatting tripwire"),
+            "{e}"
+        );
+
+        // ②c 反方向（root 指到挂载树内部的子目录）→ 同拒。
+        std::fs::create_dir_all(dir.join("dist/sub")).unwrap();
+        let cfg = Config {
+            platform: Some(pcfg(vec!["inst"], Some("./dist/sub"))),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        assert!(e.contains("must not overlap another api mount"), "{e}");
+
+        // ③ 抢注：特权名在安装树（dist）且不在受控根产物中 → Err 点名。
+        let cfg = Config {
+            platform: Some(pcfg(vec!["ojm-installer"], Some("./platform-modules"))),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        assert!(
+            e.contains("platform module 'ojm-installer' must not come from an install tree"),
+            "{e}"
+        );
+
+        // ④ 悬空：名单含受控根下不存在的模块 → Err。
+        let cfg = Config {
+            platform: Some(pcfg(vec!["inst", "ghost"], Some("./platform-modules"))),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        assert!(
+            e.contains("platform module 'ghost' is not deployed under platform.root"),
+            "{e}"
+        );
+
+        // ⑤ 正经部署（受控根产物豁免抢注）→ Ok；exec 矩阵随 grant 原样带入。
+        let mut exec = std::collections::BTreeMap::new();
+        exec.insert(
+            "inst".to_string(),
+            only_js::config::ExecAllowCfg {
+                allow: vec!["tar -tzf ${path:archive}".to_string()],
+                env: vec!["OJ_SECRET_KEY".to_string()],
+            },
+        );
+        let cfg = Config {
+            platform: Some(only_js::config::PlatformCfg {
+                modules: vec!["inst".to_string()],
+                root: Some("./platform-modules".to_string()),
+                trusted_paths: vec![],
+                exec,
+            }),
+            ..Default::default()
+        };
+        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap();
+        let pg = pg.expect("platform grant present");
+        assert!(pg.modules.contains("inst"));
+        assert!(
+            eg.expect("exec grant present")
+                .per_module
+                .contains_key("inst")
+        );
+
+        // ⑥ trusted_paths 不存在 → Err 点名（canonicalize fail-fast，对齐 FsGrant::new）。
+        let cfg = Config {
+            platform: Some(only_js::config::PlatformCfg {
+                modules: vec![],
+                root: None,
+                trusted_paths: vec!["no-such-path".to_string()],
+                exec: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        assert!(
+            e.contains("platform.trusted_paths canonicalize failed"),
+            "{e}"
+        );
+
+        // ⑦ trusted_paths canonical + fs.root 自动并入（重复项去重）。
+        std::fs::write(dir.join("config.yaml"), b"cfg").unwrap();
+        let fs_root = dir.join("data");
+        std::fs::create_dir_all(&fs_root).unwrap();
+        let fs_grant = Arc::new(only_js::bridge::fs::FsGrant::new(&fs_root, false).unwrap());
+        let cfg = Config {
+            platform: Some(only_js::config::PlatformCfg {
+                modules: vec![],
+                root: None,
+                trusted_paths: vec!["./config.yaml".to_string(), "data".to_string()],
+                exec: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let (pg, _) =
+            build_platform_grants(&cfg, &dir, &Some(fs_grant), &trees, &installed).unwrap();
+        let pg = pg.unwrap();
+        assert!(pg.trusted.contains(&fs_root.canonicalize().unwrap()));
+        assert!(
+            pg.trusted
+                .contains(&dir.join("config.yaml").canonicalize().unwrap())
+        );
+        assert_eq!(pg.trusted.len(), 2, "fs.root ∪ trusted_paths 去重后恰两项");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 受控挂载根归属（BDD 补充，设计稿 §1.2 ①）：platform.root 下的模块经
+    /// 真实装配获得归属——特权模块读 trusted 文件可及、普通挂载树模块同路径
+    /// 仍 NotCapable；归属名喂给 assert_platform 直接调用逐态验证。
+    #[tokio::test(flavor = "current_thread")]
+    async fn platform_root_mount_gives_privileged_module_ownership() {
+        use only_js::bridge::platform::assert_platform;
+        let dir = std::env::temp_dir().join(format!("oj-platown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::create_dir_all(dir.join("src/plain")).unwrap();
+        std::fs::create_dir_all(dir.join("platform-modules/inst")).unwrap();
+        std::fs::write(dir.join("config.yaml"), b"cfg-content").unwrap();
+        for (rel, name) in [("src/plain", "plain"), ("platform-modules/inst", "inst")] {
+            std::fs::write(
+                dir.join(rel).join("manifest.yaml"),
+                format!("name: {name}\ndesc: d\nversion: 0.1.0\n"),
+            )
+            .unwrap();
+        }
+        let cfg_path = dir.join("config.yaml");
+        let api_js = format!(
+            "export async function readCfg() {{\n\
+             \x20 const t = await fs.readTextFile(\"{}\");\n\
+             \x20 json.ok({{ t }});\n\
+             }}\n\
+             export default {{ readCfg }};\n",
+            cfg_path.display()
+        );
+        std::fs::write(dir.join("src/plain/api.js"), &api_js).unwrap();
+        std::fs::write(dir.join("platform-modules/inst/api.js"), &api_js).unwrap();
+
+        let cfg = Config {
+            fs: Some(only_js::config::FsSection {
+                root: "data".into(),
+                readonly: false,
+            }),
+            platform: Some(only_js::config::PlatformCfg {
+                modules: vec!["inst".to_string()],
+                root: Some("./platform-modules".to_string()),
+                trusted_paths: vec!["./config.yaml".to_string()],
+                exec: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let trees = vec![
+            (dir.join("src"), true),
+            (dir.join("platform-modules"), true),
+        ];
+        let backend = assemble_backend(
+            &cfg,
+            &serde_json::Value::Null,
+            &dir,
+            &trees,
+            "/v1/api",
+            true,
+            &ResourceProfiles::default(),
+        )
+        .await
+        .unwrap();
+        let stable = backend.stable().clone();
+        assert!(
+            stable
+                .platform
+                .as_deref()
+                .is_some_and(|p| p.modules.contains("inst")),
+            "platform grant assembled"
+        );
+        let t = std::time::Duration::from_secs(5);
+
+        // ① 受控根模块：归属成立 + 特权可及（trusted 文件读取走完整 fs 链路）。
+        let cap = backend.make_bridge()()
+            .run_module(
+                &dir.join("platform-modules/inst/api.js"),
+                "readCfg",
+                only_js::bridge::RequestInfo::default(),
+                t,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200, "{}", String::from_utf8_lossy(&cap.body));
+        assert!(
+            String::from_utf8_lossy(&cap.body).contains("cfg-content"),
+            "{}",
+            String::from_utf8_lossy(&cap.body)
+        );
+
+        // ② 普通挂载树模块：同路径仍 NotCapable（特权面不随挂载树扩散）。
+        let e = backend.make_bridge()()
+            .run_module(
+                &dir.join("src/plain/api.js"),
+                "readCfg",
+                only_js::bridge::RequestInfo::default(),
+                t,
+            )
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("NotCapable"), "{e}");
+
+        // ③ assert_platform 直接调用（run_module 后的归属形态）：
+        //    受控根归属名过、普通名拒、无归属拒。
+        let opstate_for = |module: Option<&str>| {
+            use deno_core::OpState;
+            let mut st = OpState::new(None);
+            st.put(stable.clone());
+            // ReqState 含 pub(crate) 字段，跨 crate 只能 default + 逐字段赋值。
+            let mut rs = only_js::bridge::ReqState::default();
+            rs.module = module.map(String::from);
+            st.put(rs);
+            st
+        };
+        assert_platform(&opstate_for(Some("inst"))).expect("controlled-root module passes");
+        let e = assert_platform(&opstate_for(Some("plain"))).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("module 'plain' is not platform-privileged"),
+            "{e}"
+        );
+        assert!(assert_platform(&opstate_for(None)).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- v0.1.58：resolve_mounts 矩阵（归一/配对/根/缺目录/同类重复）----

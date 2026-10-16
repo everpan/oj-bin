@@ -1,7 +1,7 @@
 //! oj 配置（cli2.md 预案 schema）：server(host/port/app_path) + db/redis 的 URL 风格 DSN map。
 //! 旧三层 env 叠加已删（预案即单文件）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -293,6 +293,43 @@ impl Default for FsSection {
             readonly: false,
         }
     }
+}
+
+/// platform 段（ojm 地基，设计稿 §1.1）：平台特权统管——`modules` 管平台 API
+/// 特权（reloadConfig 等）；`trusted_paths` 管路径授权根（fs 轴与 exec 路径占位符
+/// 共用，缺省 = [fs.root]）；`exec` = 模块 × 命令授权矩阵（argv 模板，阶段 3 消费）。
+/// 两名单独立；缺省省略 = 全 deny（fail-closed，对齐 `fs:` 未配置即 deny 的惯例）。
+/// 本段只做形状解析：模板语法 / 路径存在性在装配期校验（见 bridge::platform 与 app.rs）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformCfg {
+    /// 平台特权模块名（config 白名单认定特权，设计稿关键决策 3）。
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// 受控挂载根（设计稿 §1.2「抢注防护与受控挂载」）：特权模块的正经部署目录，
+    /// 相对 config_dir 解析。名单非空时必配，且须作为 api mount 接入装配——
+    /// 该根下的模块经 discover 获得归属与路由；其产物名豁免抢注检查，且
+    /// `modules` 名单必须是它的子集（防「有特权无实现」的悬空配置）。
+    #[serde(default)]
+    pub root: Option<String>,
+    /// 额外授权路径根（相对 config_dir 解析；不存在装配期 fail-fast）。
+    #[serde(default)]
+    pub trusted_paths: Vec<String>,
+    /// 模块名 → exec 授权；列出该模块 = 授权其 exec。
+    #[serde(default)]
+    pub exec: BTreeMap<String, ExecAllowCfg>,
+}
+
+/// 单模块 exec 授权（`platform.exec.<module>`）：argv 模板 + 环境变量白名单。
+/// `allow` 条目 = argv 模板（literal token 逐字相等、占位符吸收一个 token——
+/// 形态详见设计稿 §1.1；本阶段原样保存，阶段 3 解析匹配）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecAllowCfg {
+    pub allow: Vec<String>,
+    /// 透传环境变量白名单（值不进 JS 面，设计稿 §1.1；缺省空表 = 全 deny）。
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 /// blob 段（spec §2 命名多后端）：平铺字段 = 旧单后端语法糖（等价 backends.default）；
@@ -1262,6 +1299,9 @@ pub struct Config {
     pub blob: Option<BlobSection>,
     /// None = 不启用 fs（`fs.*` 全局报 NotCapable）；段存在即 jail 到 root。
     pub fs: Option<FsSection>,
+    /// None = 不启用平台特权（`platform` 地基，ojm 批次）：assert_platform /
+    /// exec / trusted_paths 全 deny（fail-closed）。段存在即按白名单放行。
+    pub platform: Option<PlatformCfg>,
     /// None = 不启用 mail（`mail.*` 全局报 "mail not configured"）；段存在即启用。
     /// 段由 `oj-mail` 插件投递、宿主持白名单校验与附件解析（见 [`SmtpSection`]）。
     pub smtp: Option<SmtpSection>,
@@ -1354,6 +1394,7 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
         "tasks",
         "secrets",
         "ws",
+        "platform",
     ]
 }
 
@@ -1698,6 +1739,65 @@ cache:
             ),
             (5, 3, 60000)
         );
+    }
+
+    /// `platform:` 段（ojm 地基）：三键形状解析 + 未知键拒绝 + 缺省全空（fail-closed）。
+    #[test]
+    fn platform_section_parse_and_deny_unknown() {
+        let dir = std::env::temp_dir().join(format!("oj-platcfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.yaml"),
+            "platform:\n  \
+             modules: [\"ojm-installer\"]\n  \
+             root: ./platform-modules\n  \
+             trusted_paths: [\"./config.yaml\", \"./dist\"]\n  \
+             exec:\n    \
+             ojm-installer:\n      \
+             allow:\n        - \"tar -xzf ${path:archive} -C ${path:dest}\"\n      \
+             env: [\"OJ_SECRET_KEY\"]\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, None).unwrap();
+        let p = c.platform.expect("platform section parsed");
+        assert_eq!(p.modules, vec!["ojm-installer".to_string()]);
+        assert_eq!(p.root.as_deref(), Some("./platform-modules"));
+        assert_eq!(
+            p.trusted_paths,
+            vec!["./config.yaml".to_string(), "./dist".to_string()]
+        );
+        let allow = p.exec.get("ojm-installer").expect("exec entry");
+        assert_eq!(allow.allow.len(), 1);
+        assert!(allow.allow[0].starts_with("tar -xzf "));
+        assert_eq!(allow.env, vec!["OJ_SECRET_KEY".to_string()]);
+
+        // 未知键拒绝（deny_unknown_fields）：段级与 exec 条目级都点名。
+        std::fs::write(dir.join("config.yaml"), "platform:\n  unknown: 1\n").unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("unknown"), "{e}");
+        std::fs::write(
+            dir.join("config.yaml"),
+            "platform:\n  exec:\n    m:\n      allow: [\"x\"]\n      extra: 1\n",
+        )
+        .unwrap();
+        let e = load_from(&dir, None).unwrap_err();
+        assert!(e.contains("extra"), "{e}");
+
+        // 空映射 = 合法且全空（缺省省略 = 全 deny 的 fail-closed 面）；
+        // 显式 null（`platform:` 空键）对齐 `auth:`/`fs:` 惯例解为 None（未启用）。
+        std::fs::write(dir.join("config.yaml"), "platform: {}\n").unwrap();
+        let c = load_from(&dir, None).unwrap();
+        let p = c.platform.expect("empty mapping is Some");
+        assert!(p.modules.is_empty() && p.trusted_paths.is_empty() && p.exec.is_empty());
+        std::fs::write(dir.join("config.yaml"), "platform:\n").unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert!(c.platform.is_none());
+        // 段缺省 = None。
+        std::fs::write(dir.join("config.yaml"), "server: { host: h }\n").unwrap();
+        let c = load_from(&dir, None).unwrap();
+        assert!(c.platform.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `vars:` 段（v0.1.25）：标量按 YAML 字面量读成字符串（数字/布尔不必加引号）；

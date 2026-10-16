@@ -96,10 +96,15 @@ platform:
   - **tasks 与 WS 上下文无归属**（`task_connect`/`ws_connect` 以 `module=None`
     checkout）→ 平台 API 与 exec 恒 NotCapable。若安装器需要任务化触发，须另行改造
     任务路径的模块归属推导（独立改造项，不默认可用）。
-  - **抢注防护**：模块名来自第三方 bundle manifest，按名锚定可被抢注。装配期校验：
-    `platform.modules` 列出的模块，其物理目录必须位于**平台受控目录**（config/mount
-    解析的市场安装树之外）；特权名单中的名字出现在安装树内 → 装配 fail-fast。
-    api-manual 写明：「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断。
+  - **抢注防护与受控挂载**：模块名来自第三方 bundle manifest，按名锚定可被抢注。
+    装配期校验：`platform.modules` 列出的模块名出现在**市场安装树**（config mounts /
+    `-d` dist 树的 discover 产物）→ 装配 fail-fast。特权模块的正经部署形态是
+    **`platform.root` 受控挂载根**（config 显式指向的本地目录，如 `./platform-modules`）：
+    ① 该根下的模块同样经 discover 产生归属（目录祖先命中机制不变）；② 其产物模块名
+    **豁免**抢注检查；③ `platform.modules` 名单必须是 `platform.root` 产物名的子集
+    （名单中存在但受控根下不存在的模块 → 装配 fail-fast，防「有特权无实现」的悬空
+    配置）。api-manual 写明：「安装名为 X 的 bundle = 继承 X 特权」被装配校验阻断；
+    特权模块只能由部署方放入 `platform.root`。
 
 ### 1.3 `exec` 全局（`src/bridge/exec.rs` 新文件）
 

@@ -158,6 +158,11 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 - Step 2：装配期构建 grants；抢注校验（特权名 ∩ 安装树模块名 → fail-fast）。
 - Step 3：fs 轴特权扩展——`StableState.fs` 裁决对特权模块追加 trusted_paths（在 `op_fs_resolve` 前置裁决点实现，改 `fs.rs` 判定入口）→ PASS。
 
+**阶段 2 实施偏差记录**（评审后修订）：
+1. **装配位置**：grants 构建/抢注防护落在 `oj/src/app.rs assemble_backend`（`build_platform_grants`），非计划原文的 `serve_cmd.rs`——StableState 唯一构造点在该处，注入路径最短。
+2. **checkout_reset 换装**：deno fs op 有第二道防线（PermissionsContainer，per-runtime），trusted 可及性必须按请求换装容器；`Bridge::checkout_reset` 是全部借出路径（含 inspector 挂载前借出）的唯一重置点，`inspector()` 因此从裸 checkout 改走 checkout_reset（防特权容器经调试器求值触达）。
+3. **platform.root 受控挂载**（设计稿 §1.2 修订）：抢注检查豁免受控根 discover 产物，`modules` ⊆ 受控根产物（悬空 fail-fast）；受控根与任何其它 api 挂载树同径或互为父子（前缀重叠）→ fail-fast（防抢注绊线被静默穿透）；不引入隐式 mount——受控根以既有 mounts 条目接入（部署方把 `platform.root` 目录写进 `mounts[].api`），校验挂在「挂载树 discover 产物 + 受控根 discover 产物」两份集合上，零新装配面。
+
 **阶段提交**：`feat(platform): platform 段（modules/trusted_paths/exec 授权）+ 特权裁决 + 抢注防护`。
 
 ---
