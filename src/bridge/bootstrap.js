@@ -112,6 +112,7 @@ import {
   op_exec_run,
   op_yaml_parse,
   op_yaml_stringify,
+  op_server_reload_config,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -219,6 +220,19 @@ globalThis.exec = {
 globalThis.yaml = {
   parse: (text) => op_yaml_parse(String(text)),
   stringify: (value) => op_yaml_stringify(value === undefined ? null : value),
+};
+
+// ----- server: platform-level controls (ojm batch) -----
+// reloadConfig triggers the in-process config hot reload. It shares the SAME
+// executor instance and the SAME reload lock as the HTTP POST
+// {base}/_system/config endpoint: a concurrent trigger fails with a busy
+// error (409 semantics, never silently queued). Requires the caller module to
+// be platform-privileged (config platform.modules); outside `oj serve`
+// (oj test / embedded) it throws "reload not available". While the reload
+// runs (seconds: DB verify + transpile) the actor executing this handler is
+// occupied and is not returned to the pool until it completes.
+globalThis.server = {
+  reloadConfig: () => op_server_reload_config(),
 };
 
 // ----- json: unified envelope + response headers -----

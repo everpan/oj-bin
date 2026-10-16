@@ -1004,6 +1004,7 @@ pub struct ResourceProfiles {
 /// `base` = blob 下载 URL 前缀（local driver 的 `LocalBlob::named` 烘焙进注册表）：
 /// server 传 CLI 解析值（`-b` 覆盖 > `server.api_prefix`），保持路由表与 blob URL
 /// 同源不分裂；exec 无 CLI 覆盖，传 config 派生值。
+#[allow(clippy::too_many_arguments)]
 pub async fn assemble_backend(
     cfg: &Config,
     top: &serde_json::Value,
@@ -1014,6 +1015,10 @@ pub async fn assemble_backend(
     base: &str,
     ts: bool,
     profiles: &ResourceProfiles,
+    // 热更触发槽（ojm PR-3）：`oj serve` 传入共享槽 Arc（ Extras/StableState 注入
+    // 同一 Arc，槽指针构造期冻结、内容后填）；None = 空槽（oj test / exec / 嵌入式
+    // 零接线，op 报 reload not available，fail-closed）。
+    reload_slot: Option<Arc<only_js::bridge::reload_bridge::ReloadSlot>>,
 ) -> Result<Backend, String> {
     // PR-4：单 isolate 堆限额（u64 copy 提前取出，避免闭包借用 &Config）。
     let js_heap_limit = Some(cfg.server.js_heap_limit_bytes as usize);
@@ -1210,6 +1215,10 @@ pub async fn assemble_backend(
     let allow_as_tenant = cfg.tenant.allow_as_tenant;
     // SQL 执行追踪（v0.1.51）：dev 默认开、release 默认关，config 段可强制覆盖。
     let sql_trace = only_js::bridge::sql_trace::SqlTraceConfig::resolve(&cfg.db_trace, ts);
+    // 热更触发槽（ojm PR-3）：None → 空槽（oj test / exec / 嵌入式形态，op 报
+    // reload not available，fail-closed）。解析成 owned Arc——工厂闭包 Extras 与
+    // StableState 注入同一 Arc，槽指针构造期冻结、内容由装配层后填。
+    let reload_slot = reload_slot.unwrap_or_else(|| Arc::new(std::sync::OnceLock::new()));
     let make_bridge_of = {
         let (dbs, kv, loader, es, bus) = (
             dbs.clone(),
@@ -1240,6 +1249,8 @@ pub async fn assemble_backend(
         // platform/exec grants（ojm 批次；下方 build_platform_grants 产物，同一 Arc）。
         let platform_grant = platform_grant.clone();
         let exec_grant = exec_grant.clone();
+        // 热更触发槽（ojm PR-3）：闭包带走副本，与 StableState.reload 同一 Arc。
+        let reload_slot = reload_slot.clone();
         // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 oj_info 仍供 StableState 使用）。
         let oj_info = oj_info.clone();
         move |tasks_flag: Option<Arc<std::sync::atomic::AtomicBool>>| {
@@ -1284,6 +1295,8 @@ pub async fn assemble_backend(
                     // platform/exec 授权（ojm 批次；config platform: 段）：与 StableState 同一 Arc。
                     platform: platform_grant.clone(),
                     exec: exec_grant.clone(),
+                    // 热更触发槽（ojm PR-3）：与 StableState.reload 同一 Arc（槽位后填）。
+                    reload: reload_slot.clone(),
                     // 泛型轴注册表：与 StableState.generic_axes 同一 Arc。
                     generic_axes: Some(generic_axes.clone()),
                     // ojInfo() 数据源：与 StableState.oj_info 同一 Arc（`oj info` CLI 同源）。
@@ -1329,8 +1342,11 @@ pub async fn assemble_backend(
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。
         platform: platform_grant.clone(), // 与 make_bridge 的 Extras.platform 同一 Arc。
         exec: exec_grant.clone(), // 与 make_bridge 的 Extras.exec 同一 Arc。
-        generic_axes,         // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
-        oj_info,              // 与 make_bridge 的 Extras.oj_info 同一 Arc（ojInfo() 数据源）。
+        // 热更触发槽（ojm PR-3）：与 make_bridge 的 Extras.reload 同一 Arc
+        // （槽指针构造期冻结；oj serve 装配层在 ReloadState 就绪后 set）。
+        reload: reload_slot,
+        generic_axes, // 与 make_bridge 的 Extras.generic_axes 同一 Arc。
+        oj_info,      // 与 make_bridge 的 Extras.oj_info 同一 Arc（ojInfo() 数据源）。
     });
     Ok(Backend {
         stable,
@@ -1361,6 +1377,10 @@ impl App {
         // 热更复用：Some(旧 Backend) → 跳过 `assemble_backend`（不重建任何后端连接池，
         // 不二次 init 插件），仅重建路由层 + 任务池 + JS 模块树；None = 现状零变化。
         reuse_backend: Option<Arc<Backend>>,
+        // 热更触发槽（ojm PR-3）：`oj serve` 传入共享槽 Arc，穿参至 `assemble_backend`
+        // → Extras/StableState（同一 Arc，槽位后填）。热更复用路径不重建 Extras——
+        // 复用的 Backend 已持有同一槽 Arc，槽内容跨代持续有效；形参仅为签名统一。
+        reload_slot: Option<Arc<only_js::bridge::reload_bridge::ReloadSlot>>,
     ) -> Result<App, String> {
         // 挂载解析（v0.1.58）：结构校验（程序化构造的 cfg 不经 load 层，这里兜底）→
         // 归一 / canonicalize / 逐条目 dev-release（规则 4）。primary = 第一条 api 挂载
@@ -1397,7 +1417,17 @@ impl App {
         let backend = match reuse_backend {
             Some(b) => b,
             None => Arc::new(
-                assemble_backend(&cfg, top, config_dir, &trees, &base, ts, profiles).await?,
+                assemble_backend(
+                    &cfg,
+                    top,
+                    config_dir,
+                    &trees,
+                    &base,
+                    ts,
+                    profiles,
+                    reload_slot,
+                )
+                .await?,
             ),
         };
         let stable = backend.stable().clone();
@@ -2267,6 +2297,7 @@ mod tests {
             "/v1/api",
             true,
             &ResourceProfiles::default(),
+            None,
         )
         .await
         .unwrap();
@@ -2538,6 +2569,7 @@ mod tests {
             "/v1/api",
             true,
             &ResourceProfiles::default(),
+            None,
         )
         .await
         .unwrap();

@@ -938,6 +938,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
 | `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
+| `server.reloadConfig()` | 进程内触发热更（v0.1.76，`platform.modules` 特权）：与 `POST {base}/_system/config` 同一 executor 与串行锁，返回恒定形状三清单；`oj test` / 嵌入式抛 `reload not available`，见下「server」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -1711,6 +1712,35 @@ yaml.stringify(value: object): Promise<string>;  // 仅承诺机器产物（mani
 | `yaml.parse: invalid YAML at line N column M: <detail>` | 语法错（带行列） |
 | `yaml.parse: timed out after 5s` | hang 兜底（预算内正常解析为毫秒级） |
 | `yaml.stringify: <e>` | 不可序列化值 |
+
+### server —— 平台级控制（v0.1.76，platform 特权）
+
+```ts
+server.reloadConfig(): Promise<{
+  generation: number; unchanged: boolean;
+  applied: string[]; restart_pending: string[]; kept_listener: string[];
+}>
+```
+
+进程内触发热更，与 `POST {base}/_system/config` 调**同一 executor 实例、同一把串行
+锁**（响应三清单语义见第 10 章「配置热更新（reload_api）」）：
+
+- **特权**：仅 `platform.modules` 名单内的模块可调（特权是请求级归属，见 `platform:`
+  段说明）；tasks/WS 上下文无归属恒 `NotCapable`。
+- **返回形状恒定**：`unchanged=true` 时三清单为空数组，JS 无需分支。
+- **不可用形态**：`oj test` / 嵌入式（无热更执行器）抛 `reload not available`。
+- **并发**：与 HTTP POST 共享串行锁——撞锁一方抛 busy 错误，**不静默排队**。
+- **⚠️ actor 占用**：热更在独立线程跑影子装配（**秒级**：DB verify + 模块转译），
+  **触发 reload 的 handler 所在 actor 在此期间被占用**、不归还池；大规模热更期间
+  该 actor 的后续请求短暂排队。避免在流量高峰频繁触发。
+
+| 错误文案 | 说明 |
+|---|---|
+| `NotCapable: module 'x' is not platform-privileged` | 调用模块不在 `platform.modules` |
+| `NotCapable: platform APIs require module ownership (request has no module context)` | tasks/WS 上下文无归属 |
+| `reload not available (not running under oj serve)` | `oj test` / 嵌入式无执行器 |
+| `server.reloadConfig: reload in progress (busy)` | 并发触发撞串行锁（HTTP 侧同语义 409） |
+| `server.reloadConfig: HTTP 400: <原因>` | 归一/装配失败（旧代继续服务，不破坏在跑实例） |
 
 ### bus —— 订阅发布
 
@@ -2923,11 +2953,11 @@ mounts:
 
 > **保留路径**：`_system` 是平台保留前缀，业务模块勿占用；`{base}/_system/config`（`GET`/`POST`）与 `{base}/_system/health` 由外层 fallback 直接响应，不经业务路由，也不走证书过期门禁（运维换证窗口仍可探活）。
 
-**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
+**触发**：`POST {base}/_system/config`（**空 body**，非空 body 一律 400），或特权模块在 JS 侧调 `server.reloadConfig()`（同一 executor 实例与同一把串行锁，见「server」一节）。服务端重新 `load_cfg` → `fold_cli_mounts` 重放 CLI 覆盖 → 证书/公钥路径重放 → `admission_gate`，再与当前代做幂等/段 diff：
 
 - **幂等**：归一后落盘文件 sha256 与当前代相同 → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）——已验证合法，但本代沿用旧连接池/旧插件 vtable，**重启后生效**。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）与**特权面段（`platform`/`fs`）**——已验证合法，但本代沿用旧连接池/旧插件 vtable/旧授权面，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
   - `applied`：其余段（如 `vars` 部署期常量）——本代即生效。
 
@@ -2935,7 +2965,7 @@ mounts:
 
 **守卫**：`server.reload_api` 开启后 `_system/config` 受保护——`auth:` 配置了 → 需 Bearer 验签（401 详情在响应体）；未配 `auth:` → 仅**回环地址**（loopback）可调，非回环 403（响应体 `"reload_api requires loopback or auth"`）。`GET` 同样受此守卫。
 
-**并发**：同一时刻只允许一个热更；第二个并发 `POST` 在拿不到串行锁时返回 **409 `reload in progress`**。
+**并发**：同一时刻只允许一个热更（HTTP POST 与 JS `server.reloadConfig()` 共享同一把串行锁）；第二个并发触发在拿不到锁时返回 **409 `reload in progress`**（JS 侧抛 `server.reloadConfig: reload in progress (busy)`）。
 
 **代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation}`；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
 

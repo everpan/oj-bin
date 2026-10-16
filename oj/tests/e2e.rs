@@ -1149,6 +1149,7 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
             ..Default::default()
         },
         None,
+        None,
     )
     .await
     .expect("from_config with db_override");
@@ -2303,4 +2304,326 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
         .status();
     let _ = child.wait();
     let _ = std::fs::remove_file(&cfg_path);
+}
+
+// ----- ojm PR-3：server.reloadConfig() 进程内热更（设计稿 §3；BDD S1–S6） -----
+
+/// reloadConfig e2e 夹具：独立临时项目——`src/reloadplain`（无特权探针）+
+/// `platform-modules/reloadinst`（受控根特权模块），双 api 挂载 + platform 段 +
+/// fs 段 + vars 段 + reload_api。证书复用 sample 示例证书（拷入临时根）。
+/// 返回 (临时根, config 路径, config 原文)。
+fn reload_platform_fixture(name: &str, port: u16) -> (PathBuf, PathBuf, String) {
+    let raw = std::env::temp_dir().join(format!("oj-e2e-reloadplat-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&raw);
+    std::fs::create_dir_all(&raw).unwrap();
+    let root = raw.canonicalize().unwrap();
+    // 证书（sample 示例证书拷入；路径相对 config_dir）。
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::copy(
+        sample().join("config/public.pem"),
+        root.join("config/public.pem"),
+    )
+    .unwrap();
+    std::fs::copy(
+        sample().join("config/cert.jws"),
+        root.join("config/cert.jws"),
+    )
+    .unwrap();
+    // fs root（目录须存在）。
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    // 无特权探针模块（市场安装树 src/）。
+    std::fs::create_dir_all(root.join("src/reloadplain/probe")).unwrap();
+    std::fs::write(
+        root.join("src/reloadplain/manifest.yaml"),
+        "name: reloadplain\ndesc: reload probe\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/reloadplain/probe/api.ts"),
+        r#"export default {
+  async get() {
+    try {
+      const r = await server.reloadConfig();
+      json.ok({ reloaded: r });
+    } catch (e) {
+      json.ok({ err: String(e) });
+    }
+  },
+};
+"#,
+    )
+    .unwrap();
+    // 特权模块（受控根 platform-modules/）。dev 内省要求根级只放动词键：
+    // 并发 pair 场景放独立子目录（pair/api.ts）。
+    std::fs::create_dir_all(root.join("platform-modules/reloadinst/reload")).unwrap();
+    std::fs::create_dir_all(root.join("platform-modules/reloadinst/pair")).unwrap();
+    std::fs::write(
+        root.join("platform-modules/reloadinst/manifest.yaml"),
+        "name: reloadinst\ndesc: installer\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("platform-modules/reloadinst/reload/api.ts"),
+        r#"export default {
+  async get() {
+    try {
+      const r = await server.reloadConfig();
+      json.ok({ reloaded: r });
+    } catch (e) {
+      json.ok({ err: String(e) });
+    }
+  },
+};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("platform-modules/reloadinst/pair/api.ts"),
+        r#"export default {
+  async get() {
+    const p1 = server.reloadConfig();
+    const p2 = server.reloadConfig();
+    const fmt = (r) =>
+      r.status === "fulfilled" ? r : { status: "rejected", reason: String(r.reason) };
+    const [r1, r2] = await Promise.allSettled([p1, p2]);
+    json.ok({ pair: [fmt(r1), fmt(r2)] });
+  },
+};
+"#,
+    )
+    .unwrap();
+    let dsn = oj_plugin_ffi::path_util::sqlite_file_dsn(&root.join("data/db.sqlite"));
+    let cfg = format!(
+        "server:\n  host: \"127.0.0.1\"\n  port: {port}\n  reload_api: true\n  public_key_path: \"config/public.pem\"\n  certificate_path: \"config/cert.jws\"\ndb:\n  default: \"{dsn}\"\nmounts:\n  - prefix: \"/v1/api\"\n    api: \"src\"\n  - prefix: \"/pf/api\"\n    api: \"platform-modules\"\nplatform:\n  modules: [\"reloadinst\"]\n  root: \"./platform-modules\"\n  trusted_paths: [\"./config.yaml\"]\nfs:\n  root: \"./data\"\n  readonly: false\nvars:\n  FOO: \"bar\"\n",
+    );
+    let cfg_path = root.join("config.yaml");
+    std::fs::write(&cfg_path, &cfg).unwrap();
+    (root, cfg_path, cfg)
+}
+
+/// spawn `oj serve` 子进程并轮询 health 至就绪（≤120s）。返回 (child, 诊断缓冲)。
+async fn boot_reload_serve(
+    cfg_path: &Path,
+    port: u16,
+) -> (
+    std::process::Child,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oj"))
+        .args(["serve", "-c", &cfg_path.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oj serve child");
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut readers = Vec::new();
+    for stream in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    ] {
+        let Some(stream) = stream else { continue };
+        let buf = out_buf.clone();
+        readers.push(std::thread::spawn(move || {
+            use std::io::BufRead;
+            for l in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                buf.lock().unwrap().push_str(&format!("{l}\n"));
+            }
+        }));
+    }
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let health_url = format!("http://{addr}/pf/api/_system/health");
+    loop {
+        let ready =
+            matches!(client.get(&health_url).send().await, Ok(r) if r.status().as_u16() == 200);
+        if ready {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server not ready in time:\n{}",
+            out_buf.lock().unwrap()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    (child, out_buf)
+}
+
+async fn stop_reload_serve(child: &mut std::process::Child) {
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+    let _ = child.wait();
+}
+
+/// reloadConfig e2e 专用请求：返回 (status, 原文)——空体不炸（诊断可见）。
+async fn req_raw(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, String) {
+    let c = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let r = c
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+            format!("http://{addr}{path}"),
+        )
+        .send()
+        .await
+        .expect("request send");
+    let st = r.status().as_u16();
+    (st, r.text().await.unwrap_or_default())
+}
+
+/// req_raw + JSON 解码（空体归 Null，失败信息由上层断言携带）。
+async fn req_rel(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, serde_json::Value) {
+    let (st, txt) = req_raw(addr, method, path).await;
+    (
+        st,
+        serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// BDD S1/S2/S5/S6（特权 JS 回调路径）：非特权模块 NotCapable；特权模块改盘上
+/// vars 段触发 reloadConfig → applied 含段名 + generation+1；再触发 unchanged；
+/// 并发双触发一方 busy（文案点名）。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn given_reload_api_when_privileged_module_calls_reload_config_then_applies() {
+    let _g = lock();
+    let (root, cfg_path, cfg) = reload_platform_fixture("js", 19988);
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19988).await;
+    let addr: std::net::SocketAddr = "127.0.0.1:19988".parse().unwrap();
+
+    // S5：非特权模块 → NotCapable: not platform-privileged。
+    let (st, body) = req_rel(addr, "GET", "/v1/api/reloadplain/probe/").await;
+    assert_eq!(st, 200, "probe: {body}");
+    let err = body["data"]["err"].as_str().expect("err string");
+    assert!(err.contains("NotCapable"), "{err}");
+    assert!(err.contains("not platform-privileged"), "{err}");
+
+    // S1：改盘上 vars 段 → 特权模块 reloadConfig → applied 含段名、generation+1。
+    let cfg2 = cfg.replace("FOO: \"bar\"", "FOO: \"baz\"");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req_rel(addr, "GET", "/pf/api/reloadinst/reload/").await;
+    assert_eq!(st, 200, "reload1: {body}\n{}", out_buf.lock().unwrap());
+    let r = &body["data"]["reloaded"];
+    assert_eq!(r["unchanged"], serde_json::json!(false), "{body}");
+    assert_eq!(r["generation"], serde_json::json!(1), "{body}");
+    let applied = r["applied"].as_array().expect("applied array");
+    assert!(
+        applied.iter().any(|v| v.as_str() == Some("vars")),
+        "vars in applied: {body}"
+    );
+
+    // S2：盘上无变化再触发 → unchanged=true、generation 不动、三清单空数组。
+    let (st, body) = req_rel(addr, "GET", "/pf/api/reloadinst/reload/").await;
+    assert_eq!(st, 200, "reload2: {body}");
+    let r = &body["data"]["reloaded"];
+    assert_eq!(r["unchanged"], serde_json::json!(true), "{body}");
+    assert_eq!(r["generation"], serde_json::json!(1), "{body}");
+    assert_eq!(r["applied"], serde_json::json!([]), "{body}");
+    assert_eq!(r["restart_pending"], serde_json::json!([]), "{body}");
+    assert_eq!(r["kept_listener"], serde_json::json!([]), "{body}");
+
+    // S6：并发双触发 → 一方 busy 报错（文案点名，非静默排队）。先改盘上配置，
+    // 让先抢到锁的一方走完整影子装配（秒级），busy 窗口确定相交。
+    let cfg3 = cfg2.replace("FOO: \"baz\"", "FOO: \"qux\"");
+    std::fs::write(&cfg_path, &cfg3).unwrap();
+    let (st, body) = req_rel(addr, "GET", "/pf/api/reloadinst/pair/").await;
+    assert_eq!(st, 200, "pair: {body}");
+    let pair = body["data"]["pair"].as_array().expect("pair array");
+    assert_eq!(pair.len(), 2);
+    let ok = pair
+        .iter()
+        .find(|r| r["status"] == serde_json::json!("fulfilled"))
+        .expect("one fulfilled");
+    assert_eq!(ok["value"]["generation"], serde_json::json!(2), "{body}");
+    let busy = pair
+        .iter()
+        .find(|r| r["status"] == serde_json::json!("rejected"))
+        .expect("one rejected");
+    let reason = busy["reason"].as_str().expect("reason string");
+    assert!(reason.contains("busy"), "{reason}");
+    assert!(reason.contains("reload in progress"), "{reason}");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BDD S3/S4（安全验收项，自提权封堵）：改 platform / fs 段 → HTTP POST 返回
+/// restart_pending 含段名且**不热生效**；撤销特权后特权模块仍可调用（授予未变，
+/// 须重启生效）。
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn given_reload_api_when_privilege_segments_change_then_restart_pending_and_grants_unchanged()
+{
+    let _g = lock();
+    let (root, cfg_path, cfg) = reload_platform_fixture("seg", 19989);
+    let (mut child, out_buf) = boot_reload_serve(&cfg_path, 19989).await;
+    let addr: std::net::SocketAddr = "127.0.0.1:19989".parse().unwrap();
+
+    // S4：改 fs 段（readonly）→ restart_pending 含 fs，不进 applied。
+    let cfg2 = cfg.replace("readonly: false", "readonly: true");
+    std::fs::write(&cfg_path, &cfg2).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "fs seg: {body}\n{}", out_buf.lock().unwrap());
+    assert_eq!(body["code"], 0, "{body}");
+    assert_eq!(body["data"]["generation"], 1, "{body}");
+    let rp = body["data"]["restart_pending"].as_array().expect("rp");
+    assert!(rp.iter().any(|v| v.as_str() == Some("fs")), "{body}");
+    assert!(
+        !body["data"]["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("fs")),
+        "{body}"
+    );
+
+    // S3：改 platform 段（撤销 reloadinst 特权）→ restart_pending 含 platform，
+    // 不热生效——击穿断言：reload 后特权授予未变（特权模块仍可 reloadConfig，
+    // 且因盘上无再变化走 unchanged 幂等）。
+    let cfg3 = cfg2.replace("modules: [\"reloadinst\"]", "modules: []");
+    std::fs::write(&cfg_path, &cfg3).unwrap();
+    let (st, body) = req_rel(addr, "POST", "/v1/api/_system/config").await;
+    assert_eq!(st, 200, "platform seg: {body}");
+    assert_eq!(body["code"], 0, "{body}");
+    assert_eq!(body["data"]["generation"], 2, "{body}");
+    let rp = body["data"]["restart_pending"].as_array().expect("rp");
+    assert!(rp.iter().any(|v| v.as_str() == Some("platform")), "{body}");
+    assert!(
+        !body["data"]["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("platform")),
+        "{body}"
+    );
+    // 击穿断言：撤销特权的配置已落盘且 reload 已跑，但特权授予未热生效。
+    let (st, body) = req_rel(addr, "GET", "/pf/api/reloadinst/reload/").await;
+    assert_eq!(st, 200, "privileged after revoke: {body}");
+    let r = &body["data"]["reloaded"];
+    assert_eq!(
+        r["unchanged"],
+        serde_json::json!(true),
+        "grants must not hot apply: {body}"
+    );
+    assert_eq!(r["generation"], serde_json::json!(2), "{body}");
+
+    stop_reload_serve(&mut child).await;
+    let _ = std::fs::remove_dir_all(&root);
 }

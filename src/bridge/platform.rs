@@ -220,6 +220,7 @@ mod tests {
             fs: None,
             platform,
             exec,
+            reload: Arc::new(std::sync::OnceLock::new()),
             generic_axes: crate::bridge::generic_axis::GenericAxisRegistry::default(),
             oj_info: Arc::new(serde_json::json!({})),
         })

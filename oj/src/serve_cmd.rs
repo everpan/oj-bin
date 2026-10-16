@@ -144,6 +144,10 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
         .unwrap_or_else(|| config_dir.join("config.yaml"));
     // reload_api 开关须在读 cfg 前捕获（cfg 随后移入 App::from_config）。
     let reload_api = cfg.server.reload_api;
+    // 热更触发槽（ojm PR-3）：槽指针此刻创建并随 from_config 冻结进 Extras/
+    // StableState；内容在 ReloadState 构造 + set_executor 之后由
+    // serve_hot_reload_branch 后填（槽位后填，解 App↔ReloadState 构造环）。
+    let reload_slot = Arc::new(std::sync::OnceLock::new());
     let mut app = App::from_config(
         cfg,
         &top,
@@ -151,6 +155,7 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
         false,
         &ResourceProfiles::default(),
         None,
+        Some(reload_slot.clone()),
     )
     .await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
@@ -187,6 +192,7 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
             ts,
             prefixes,
             config_path,
+            reload_slot,
         )
         .await;
     }
@@ -248,6 +254,9 @@ async fn serve_hot_reload_branch(
     ts: bool,
     prefixes: Vec<String>,
     config_path: PathBuf,
+    // 热更触发槽（ojm PR-3）：run() 创建并已随首代 App::from_config 冻结进
+    // Extras/StableState；本函数在 ReloadState + set_executor 之后 set 内容。
+    reload_slot: Arc<std::sync::OnceLock<only_js::bridge::reload_bridge::ReloadExecutorLike>>,
 ) -> Result<(), String> {
     // 首代归一 raw 文档作为幂等/diff 基线（reload 路径一致，稳定）。
     // 用 raw 文档而非解析后的 `Config`：避免对核心 `Config` 强加 `Serialize` /
@@ -272,6 +281,9 @@ async fn serve_hot_reload_branch(
         tasking: tokio::sync::Mutex::new(initial_tasking),
         current_task_flag: Arc::new(tokio::sync::Mutex::new(task_flag)),
         committer: tokio::sync::OnceCell::new(),
+        // 热更触发槽（ojm PR-3）：do_reload 每代重建 App 时随 from_config 穿参，
+        // 保证槽指针跨代同一（槽内容本代已填，重建桥后 reloadConfig 依旧有效）。
+        reload_slot: reload_slot.clone(),
     });
 
     let rs = serve::reload::ReloadState::new(
@@ -285,6 +297,16 @@ async fn serve_hot_reload_branch(
     let committer = rs.committer();
     ctx.set_committer(committer);
     rs.set_executor(build_reload_executor(ctx.clone())).await;
+    // 槽位后填（ojm PR-3）：闭包走 ReloadState 共享处理体（trigger_sync）——
+    // 与 HTTP POST 同一 executor 实例、同一把 reload_lock。OnceLock set 失败 =
+    // 二次装配；本进程 ReloadState 只构造一次，理论不可达，保留首填（同一 rs，
+    // 语义等价）仅记 warn。
+    let rs_for_slot = rs.clone();
+    let slot_exec: only_js::bridge::reload_bridge::ReloadExecutorLike =
+        Arc::new(move || rs_for_slot.trigger_sync());
+    if reload_slot.set(slot_exec).is_err() {
+        eprintln!("warn: reload slot already set; keeping the first executor");
+    }
 
     let (bound, h) = app
         .serve_hot_reload(addr, rs, shutdown_signal(ctx.current_task_flag.clone()))
@@ -347,6 +369,9 @@ struct HotReloadCtx {
     current_task_flag: Arc<tokio::sync::Mutex<Arc<std::sync::atomic::AtomicBool>>>,
     /// 提交句柄（构造 ReloadState 后注入，避免循环依赖）。
     committer: tokio::sync::OnceCell<serve::reload::Committer>,
+    /// 热更触发槽（ojm PR-3）：与首代 Extras/StableState.reload 同一 Arc；
+    /// do_reload 每代重建 App 时随 from_config 穿参，槽指针跨代同一。
+    reload_slot: Arc<std::sync::OnceLock<only_js::bridge::reload_bridge::ReloadExecutorLike>>,
 }
 
 impl HotReloadCtx {
@@ -425,6 +450,9 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
         false,
         &ctx.profiles,
         Some(ctx.backend.clone()),
+        // 槽指针随代传递（ojm PR-3）：复用 Backend 时 Extras 不重建，但同一 Arc
+        // 的传入保证「每代热更新建 App 同样带槽」，热更一次后 reloadConfig 不失效。
+        Some(ctx.reload_slot.clone()),
     )
     .await
     .map_err(|e| (400u16, e))?;
@@ -513,6 +541,11 @@ fn diff_configs(
             | "rabbits" | "plugins" | "plugins_dir" | "secrets" => {
                 restart_pending.push((*key).to_string())
             }
+            // 特权面段（ojm PR-3 安全阻塞项 3 修复，显式验收项）：platform.modules
+            // （reloadConfig 等平台 API 资格）与 fs（jail 授权面）若随热更生效 =
+            // 特权模块可热改自己的白名单（自提权链）。归 restart_pending：验证合法
+            // 但必须重启生效，HTTP 与 JS 回调两侧一致。
+            "platform" | "fs" => restart_pending.push((*key).to_string()),
             "server" => kept_listener.push((*key).to_string()),
             _ => applied.push((*key).to_string()),
         }
@@ -1164,12 +1197,14 @@ pub async fn start(
         headers: Default::default(),
     });
     // top 传 Null：测试入口不依赖顶层未知段（config key 解析），保持旧签名零改动。
+    // 槽位 None：cargo test 环境性入口无热更执行器（fail-closed）。
     let app = App::from_config(
         cfg,
         &serde_json::Value::Null,
         config_dir,
         false,
         &ResourceProfiles::default(),
+        None,
         None,
     )
     .await?;
@@ -4180,6 +4215,33 @@ vars: { FOO: "bar" }
         assert!(applied.contains(&"vars".to_string()));
         assert!(!restart_pending.contains(&"vars".to_string()));
         assert!(!kept.contains(&"vars".to_string()));
+    }
+
+    /// 特权面段（ojm PR-3 安全阻塞项 3 修复，对抗单测）：platform / fs 段变更
+    /// 归 restart_pending——若随热更生效，特权模块可热改自己的 API/exec/fs
+    /// 白名单（自提权链）。HTTP 与 JS 回调共享此分类。
+    #[test]
+    fn diff_privilege_segments_never_hot_apply() {
+        for key in ["platform", "fs"] {
+            let old = base_doc();
+            let mut new = base_doc();
+            new[key] = serde_yaml::from_str(if key == "platform" {
+                r#"{ modules: ["attacker"], root: "./p", trusted_paths: [] }"#
+            } else {
+                r#"{ root: "./elsewhere", readonly: false }"#
+            })
+            .unwrap();
+            let (applied, restart_pending, kept) = diff_configs(&old, &new);
+            assert!(
+                restart_pending.contains(&key.to_string()),
+                "{key} must be restart_pending: applied={applied:?} rp={restart_pending:?}"
+            );
+            assert!(
+                !applied.contains(&key.to_string()),
+                "{key} must not hot apply"
+            );
+            assert!(!kept.contains(&key.to_string()));
+        }
     }
 
     #[test]

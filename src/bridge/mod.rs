@@ -60,6 +60,7 @@ pub mod plugin_loader;
 mod plugins_op;
 mod query;
 mod registry;
+pub mod reload_bridge;
 mod runtime;
 pub mod sql_trace;
 pub mod sso;
@@ -213,6 +214,11 @@ pub struct StableState {
     /// exec 授权（config `platform.exec:` 段；阶段 3 `exec.run` 消费）；
     /// None = exec 恒 NotCapable。
     pub exec: Option<Arc<platform::ExecGrant>>,
+    /// 热更触发槽（ojm PR-3）：`oj serve` 装配期后填的 executor 闭包；槽空 =
+    /// 非 serve 形态（`oj test` / 嵌入式）→ op 报 `reload not available`。
+    /// 槽指针构造期冻结、内容后填（不触 `Arc::get_mut` 红线）；桥池多实例
+    /// 共享同一槽（同一 `Arc<OnceLock>`），每代热更重建桥后依旧有效。
+    pub reload: Arc<reload_bridge::ReloadSlot>,
     /// 泛型轴注册表（插件自报的非类型化轴；bootstrap `axis(name)` 的数据源）。
     /// 空表 = 无泛型轴，`axis(name).op()` 报 unknown axis 并列可用轴名。
     pub generic_axes: generic_axis::GenericAxisRegistry,
@@ -281,6 +287,11 @@ pub struct Extras {
     pub platform: Option<Arc<platform::PlatformGrant>>,
     /// exec 授权（config `platform.exec:` 段；阶段 3 消费）；None = exec 恒 NotCapable。
     pub exec: Option<Arc<platform::ExecGrant>>,
+    /// 热更触发槽（ojm PR-3）：缺省空槽 = `server.reloadConfig` 报
+    /// `reload not available`（Extras 是 Default 的，`oj test` / 嵌入式零接线
+    /// 即 fail-closed）。`oj serve` 装配层传入共享槽 Arc 并在 ReloadState
+    /// 就绪后 `set`（槽位后填，照搬 `ReloadState::set_executor` 解环惯例）。
+    pub reload: Arc<reload_bridge::ReloadSlot>,
     /// 泛型轴注册表（None = 空 registry，`axis(name)` 一律报 unknown axis——与
     /// vars 同哲学：未注入 = 空表而非 None）。
     pub generic_axes: Option<generic_axis::GenericAxisRegistry>,
@@ -470,6 +481,7 @@ deno_core::extension!(
         exec::op_exec_run,
         yaml::op_yaml_parse,
         yaml::op_yaml_stringify,
+        reload_bridge::op_server_reload_config,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
@@ -783,6 +795,7 @@ impl Bridge {
             fs: extras.fs,
             platform: extras.platform,
             exec: extras.exec,
+            reload: extras.reload,
             generic_axes: extras.generic_axes.unwrap_or_default(),
             oj_info: extras
                 .oj_info
@@ -2276,6 +2289,7 @@ mod tests {
             fs: None,
             platform: None,
             exec: None,
+            reload: Arc::new(std::sync::OnceLock::new()),
             generic_axes: Arc::new(HashMap::new()),
             oj_info: Arc::new(serde_json::json!({})),
         });
