@@ -16,6 +16,18 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.75（未打标签，实施中）
+
+本版承载「ojm 后端原生化」批次（设计稿与实施计划见 `docs/plans/2026-10-16-ojm-native-exec-*`），
+随各阶段合入逐步填充；条目以最终用户可见变更为准：
+
+- `crypto.verifyEd25519`：Ed25519 验签原语（格式错抛错、验签不过 false）+ `crypto.sha256Hex` 支持二进制入参；
+- `exec.run`：外部命令原语（`platform.exec` argv 模板白名单 + 路径占位符校验，缺省全 deny）；
+- `platform:` 配置段：平台特权模块（modules）与授权路径根（trusted_paths），特权面 = reloadConfig；
+- `server.reloadConfig()`：配置热更进程内触发（与 `POST _system/config` 同一处理体；`platform`/`fs` 段变更归 restart_pending）；
+- `yaml.parse` / `yaml.stringify`：YAML 读写原语（节点/别名/深度三预算防炸弹）；
+- `oj migrate`：`--format json`（逐模块成败 + 错误脱敏）+ `<module>-<version>` 定向目录。
+
 ## v0.1.74
 
 **fix（introspect/d.ts）：`.response` 空值语义统一 + 保留键提示。**
