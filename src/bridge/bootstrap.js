@@ -110,6 +110,8 @@ import {
   op_ws_room_size,
   op_fs_resolve,
   op_exec_run,
+  op_yaml_parse,
+  op_yaml_stringify,
 } from "ext:core/ops";
 
 // Outbound WHATWG WebSocket client (deno_websocket ext). Registered by
@@ -205,6 +207,18 @@ globalThis.fs = {
 // to 128+signal); authorization/template/timeout/limit/spawn failures throw.
 globalThis.exec = {
   run: (argv, opts) => op_exec_run(argv, opts === undefined ? null : opts),
+};
+
+// ----- yaml: bounded parse / stringify (ojm batch) -----
+// parse runs on the blocking pool with its own 5s deadline behind three budgets
+// (1 MiB input, 100k nodes incl. alias replay, nesting depth 128); errors are
+// named (budget exceeded / line+column for syntax). Out-of-range integers arrive
+// as decimal strings; duplicate mapping keys: last one wins. stringify is for
+// MACHINE ARTIFACTS ONLY (manifests.yaml round-trip) -- it loses comments, so
+// never use it to rewrite config.yaml (do text surgery instead).
+globalThis.yaml = {
+  parse: (text) => op_yaml_parse(String(text)),
+  stringify: (value) => op_yaml_stringify(value === undefined ? null : value),
 };
 
 // ----- json: unified envelope + response headers -----

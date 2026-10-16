@@ -923,7 +923,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
   **铁律：PG 下 jsonb 存在性判断一律写 `jsonb_exists(doc, 'key')`**（PG 内建同名函数），
   不写裸 `?` 运算符——它无法与占位符区分。
 
-### 总表（28 组）
+### 总表（29 组）
 
 | 全局 | 说明 |
 |---|---|
@@ -937,6 +937,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
+| `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
 | `bus.publish / subscribe / kind` | 主题广播（HTTP 发布、WS 订阅） |
 | `es.search / index / del` | Elasticsearch 薄客户端（`es:` 段启用） |
 | `Mail(key)` / `mail` | 邮件投递（`smtp:` 段 + `oj-mail` 插件启用）：`send / sendSync / enqueue / result / sendRaw`，见下「mail」 |
@@ -1662,6 +1663,54 @@ Error）：
 | `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB |
 | `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8 |
 | `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
+
+### yaml —— YAML 读写原语（v0.1.75，无特权，始终可用）
+
+```ts
+yaml.parse(text: string): Promise<unknown>;      // 只读解析（异步：Rust 阻塞池执行，须 await）
+yaml.stringify(value: object): Promise<string>;  // 仅承诺机器产物（manifests.yaml）往返（异步）
+```
+
+纯解析原语，不占 platform 授权面（所有模块、tasks/WS 上下文均可用）。parse 在 Rust
+阻塞池执行（不卡 isolate），带独立 5s deadline 与**三预算**，超限一律抛错点名：
+
+- **输入 1 MiB**：超限报 `yaml.parse: input exceeds 1 MiB limit (N bytes)`；
+- **节点总数 100_000**（含 alias 引用展开出的每个节点）：billion laughs 链式放大
+  （`a1: &a1 [*a0,*a0]` 逐层翻倍）在展开侧计节点，超限报
+  `yaml.parse: node budget exceeded`；serde_yaml 内建的 alias 重放上限先触发时映射为
+  `yaml.parse: alias budget exceeded (alias replay amplification)`；
+- **嵌套深度 128**：约 20 万 `[` 即合法 1MB 输入而递归下降栈溢出不可捕获——超限报
+  `yaml.parse: nesting depth limit exceeded (128)`（进程存活，不崩）。
+
+语义细则（实测钉死，serde_yaml 0.9.34）：
+
+- **重复键**：后键覆盖（`a: 1\na: 2` → `{a: 2}`），不报错；
+- **多文档**（`---` 分隔）→ 抛 `expected a single YAML document`；
+- **非字符串键**（`1: a` / `null: a`）→ 抛 `non-string mapping key not supported`；
+- **NaN / `.inf` / `.nan`** → 抛 `non-finite number (NaN/Inf) not supported`（取更严取向）；
+- **大整数**：超出 2^53-1 一律十进制字符串（i128/u128 级在解析器内即转；i64/u64 级出口过
+  数值护栏，与「大整数与 i64」一节同形态），`json.ok` 不会 500；
+- **空文档**（空串/纯空白）→ `null`；
+- **非法 YAML** → `yaml.parse: invalid YAML at line N column M: <detail>`（带行列）。
+
+> ⚠️ **stringify 禁用于 config.yaml 回写**：serde_yaml 往返丢注释与空白。改 config 只走
+> 文本手术三步模式（`fs.readTextFile` → 只改目标段 → `yaml.parse` 语义复检 → 写回，
+> 路径授权见第 10 章 `trusted_paths`）。stringify 只承诺**机器产物**（manifests.yaml
+> 形状的 map/list/标量）往返；**对象键输出保留 JS 对象键插入序（整数型键先行），
+> 不排序**——需确定序请在 stringify 前自行归序（键序由单测钉死，运行时依赖
+> deno_core 传递开启的 serde_json `preserve_order`，该 feature 撤销即测试红）。
+
+| 错误文案 | 说明 |
+|---|---|
+| `yaml.parse: input exceeds 1 MiB limit (N bytes)` | 输入超限 |
+| `yaml.parse: node budget exceeded` / `yaml.parse: alias budget exceeded (alias replay amplification)` | 节点 / alias 重放预算超限 |
+| `yaml.parse: nesting depth limit exceeded (128)` | 嵌套超深 |
+| `yaml.parse: expected a single YAML document (multi-document input rejected)` | 多文档输入 |
+| `yaml.parse: non-string mapping key not supported` | 非字符串键 |
+| `yaml.parse: non-finite number (NaN/Inf) not supported` | NaN / `.inf` / `.nan` |
+| `yaml.parse: invalid YAML at line N column M: <detail>` | 语法错（带行列） |
+| `yaml.parse: timed out after 5s` | hang 兜底（预算内正常解析为毫秒级） |
+| `yaml.stringify: <e>` | 不可序列化值 |
 
 ### bus —— 订阅发布
 
@@ -3786,6 +3835,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面 = 特权模块 fs 读写扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）+ `exec.run`（见下两条）；tasks/WS 上下文无模块归属 → 特权恒不可用 |
 | `exec.run` 授权 ≠ `platform.modules`（v0.1.75） | **两名单相互独立**：exec 特权只看 `platform.exec.<模块>` 是否列出该模块——只配 `modules` 不配 `exec`（或反之）拿不到对应面；未授权/模板失配/歧义/`${path:}` 越界一律 `NotCapable` 点名（文案见 §6「exec」错误表） |
 | `exec.run` 运行面硬限制（v0.1.75） | stdout+stderr **流式合计 10MB** 上限（超限杀进程组抛错，已收部分不返回）；`timeoutMs` 缺省 30s、硬上限 600s（超出**钳制**不报错）；输出强制 UTF-8（二进制不支持）；cwd 钉在 fs.root 但**非隔离边界**（路径防线在 `${path:}` 占位符校验，勿传越界相对路径）；未配 `fs:` → exec 整体不可用；子进程 argv[0] 是宿主解析后的**绝对路径**（非模板首 token 原文）；信号终止 `code = 128 + signal`，非 0 退出码**不抛错**照常返回 |
+| `yaml.parse` 三预算（v0.1.75） | 输入 1 MiB / 节点 100_000（含 alias 展开）/ 深度 128，超限抛错点名**不崩进程**；重复键后键覆盖，多文档 / 非字符串键 / NaN·Inf 一律拒绝（不静默强转）；**stringify 禁用于 config.yaml 回写**（serde_yaml 丢注释，回写走文本手术三步模式） |
 | `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 
 ### 常见陷阱清单

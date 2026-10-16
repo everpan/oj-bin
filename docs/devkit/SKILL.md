@@ -210,6 +210,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `oj exec` import 报 escapes project root / 找不到 `./util` | 相对导入钳制在项目根（config 所在目录）内且**必须显式扩展名**（`import "./util.ts"`）；脚本放项目外连 `./util.ts` 都导不了 |
 | `oj exec -e/--code` / `--repl` 里 `import "./util"` 报找不到 | 内联代码与 REPL 行**无基准目录**，不支持相对 import——要复用抽出的模块请改走 `oj exec <file>` |
 | `oj exec` 报迁移相关意外 | exec 迁移默认 **off**（serve dev 缺省 auto，两命令相反）；config 显式 `migrate_on_start` 才执行 |
+| `yaml.parse` 报 `node budget exceeded` / `alias budget exceeded` | 输入在 1MB 内但 alias 链式展开超预算（billion laughs 防护，v0.1.75）——压缩引用层数；正常 manifests.yaml（千节点级）远离预算。超 2^53-1 的整数为十进制字符串，不是 number |
+| `yaml.stringify` 回写 config.yaml 后注释全丢 | stringify 是 serde_yaml 往返，只保语义不保文本——**禁用于 config.yaml**；回写走文本手术三步模式（`fs.readTextFile` → 只改目标段 → `yaml.parse` 复检 → 写回） |
+| `yaml.parse` 报 `non-string mapping key` / `expected a single YAML document` | int/bool/null 键与多文档（`---`）都不接受——需键值对齐 machine 产物形态；重复键后键覆盖（不报错） |
 | `oj exec --log-file` 没生成文件 | 打开失败只 stderr warn 一次、不中断脚本——看 stderr 首行 warn（路径不可写等） |
 | 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |

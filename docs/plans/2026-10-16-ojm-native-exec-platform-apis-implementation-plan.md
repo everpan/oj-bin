@@ -276,7 +276,7 @@ Config 增 `pub platform: Option<PlatformCfg>`；对账表加 `"platform"` → P
 
 ## 阶段 7：文档 / 样例 / 版本（任务 #8）
 
-1. **devkit 四件**逐条对齐：api-manual（总表 27 组 → 新增 `exec`/`server`/`yaml` 组；错误/限制表：NotCapable 文案、模板失配、输出超限、YAML 预算、unchanged 形状、tasks/WS 无特权、sig 仅 base64、公钥非 PEM、PEM 不支持等，**另登记**：`sha256Hex` 非 string/二进制入参现抛 TypeError（旧版 `String(s)` 强转，fail-loud 行为变更））、SKILL.md 陷阱速查（config.yaml 在 jail 外须 trusted_paths、大 DDL 须显式 timeoutMs、base64url 公钥不支持）、scenarios.md（安装闭环场景：下载→校验→解压→迁移→回写→热更）、README.md。
+1. **devkit 四件**逐条对齐：api-manual（总表 27 组 → 新增 `exec`/`server`/`yaml` 组；错误/限制表：NotCapable 文案、模板失配、输出超限、YAML 预算、unchanged 形状、tasks/WS 无特权、sig 仅 base64、公钥非 PEM、PEM 不支持等，**另登记**：`sha256Hex` 非 string/二进制入参现抛 TypeError（旧版 `String(s)` 强转，fail-loud 行为变更））、SKILL.md 陷阱速查（config.yaml 在 jail 外须 trusted_paths、大 DDL 须显式 timeoutMs、base64url 公钥不支持）、scenarios.md（安装闭环场景：下载→校验→解压→迁移→回写→热更）、README.md。**批次收尾登记（yaml 阶段审查遗留）**：① 错误表补「自定义 tag（`!Foo …`）不支持」一行；② devkit README v0.1.75 已落地清单补 yaml 摘要；③ 打版前逐条核对增量同步轮次已覆盖面（crypto/platform/exec/yaml 均已随阶段同步，阶段 7 收敛余量）。
 2. `sample/global.d.ts`：`exec`/`server`/`yaml` interface + `crypto.verifyEd25519`/`sha256Hex` 重载。
 3. `docs/dev-guide.md`（platform 段走读）、`docs/ops-manual.md`（tar 依赖与方言、`OJ_SECRET_KEY` 透传、无 tar 环境 exec 报错）、`docs/bridge.md`（op↔global 对应面）。
 4. `sample/src/` 增 `platform_demo` 模块 + `sample/config.yaml` 补 `platform:` 段示例。

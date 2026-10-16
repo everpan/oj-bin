@@ -474,6 +474,22 @@ interface ExecApi {
   run(argv: string[], opts?: ExecRunOpts): Promise<ExecResult>;
 }
 
+// yaml.*：YAML 读写原语（v0.1.75，无特权，始终可用）。
+// parse: 三预算防炸弹（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128），Rust 阻塞池
+// 执行 + 独立 5s deadline；重复键后键覆盖；多文档 / 非字符串键 / NaN·Inf 拒绝；
+// 非法 YAML 抛带行列错误；超 2^53-1 的整数为十进制字符串（json.ok 安全）。
+// stringify: 仅承诺机器产物（manifests.yaml）往返——serde_yaml 丢注释，
+// 禁用于 config.yaml 回写（走文本手术）。
+interface YamlApi {
+  parse(text: string): Promise<unknown>;
+  /**
+   * 仅承诺机器产物（manifests.yaml）往返——serde_yaml 丢注释，禁用于 config.yaml
+   * 回写（走文本手术）。对象键输出保留 JS 对象键插入序（整数型键先行），不排序；
+   * 需确定序请在 stringify 前自行归序。
+   */
+  stringify(value: object): Promise<string>;
+}
+
 declare global {
   interface Function {
     route?: string;
@@ -555,6 +571,8 @@ declare global {
   const fs: FsApi;
   // 外部命令执行（v0.1.75，platform.exec 段授权；见 ExecApi JSDoc 与 api-manual §6「exec」）。
   const exec: ExecApi;
+  // YAML 读写原语（v0.1.75，无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
+  const yaml: YamlApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。

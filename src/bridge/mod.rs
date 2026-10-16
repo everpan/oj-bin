@@ -68,6 +68,7 @@ pub mod task_pool;
 pub mod transpile;
 mod vars;
 mod ws;
+mod yaml;
 
 pub use accessor_sqlx::SqlxAccessor;
 pub use auth::AuthGuard;
@@ -467,6 +468,8 @@ deno_core::extension!(
         generic_axis::op_axis_call,
         fs::op_fs_resolve,
         exec::op_exec_run,
+        yaml::op_yaml_parse,
+        yaml::op_yaml_stringify,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     options = { stable: Arc<StableState> },
