@@ -16,6 +16,14 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.77（未打标签）
+
+- `mounts[].api` 支持 `http(s)://` URL：装配期拉取「dist 根 tarball」并解压到内容寻址缓存（`<cache>/<sha256>/`，`cache` 缺省 `<config_dir>/.oj-cache`），以 release 语义服务；完整性锚 = 声明 `sha256`（64 hex），下载内容 sha256 不符即拒启（防篡改 / CDN 漂移）；产物根含 `manifests.yaml` 才视为合法 dist 根；
+- 解压器逐条目 fail-fast：拒绝 tar-slip / 符号链接 / 特殊文件 / pax·gnu 元数据，并对下载量（512 MiB）/ 解压总量（4 GiB）/ 条目数（10 万）/ 单条目（1 GiB）设上限防炸弹；命中缓存按 sha256 复用、损坏自动重拉；per-sha256 互斥串行化同 URL 物化；
+- `oj build --bundle`：把整棵 dist（manifests.yaml + 各 `<module>-<version>/`）打成空前缀 tarball `<out>/<name>.tgz` 并打印 sha256，供上面的远程挂载声明完整性锚（手工等价 `tar czf app.tgz -C dist .`）；
+- `--api-path` CLI 不接受 URL（远程挂载的 sha256 上下文只在 config 声明期存在，CLI 折叠期无此上下文 → 报错引导走 config）；
+- `MountConf` 派生 `Default`，`validate_mounts` 新增 URL scheme（仅 http/https）+ 必带 64 hex sha256 校验、本地 Windows 风格路径（如 `c:/dist`，无 `://`）按本地目录处理；`reqwest` 由 dev-dep 提升为发行依赖（mount_fetch 跑在生产 serve 路径）。
+
 ## v0.1.76
 
 - `http.module`：模块路由分发注入只读模块身份 `{name, version}`（dev 版本取 `src/<m>/manifest.yaml`，release 取 `dist/<m>-<v>/manifest.yaml`）。判定依据是 handler 文件所在模块目录而非请求来源——无模块上下文（任务桥 / WS 帧 / `run_with` / 启动期内省）为 `null`；页面 meta 合成派发在模块目录内有值；

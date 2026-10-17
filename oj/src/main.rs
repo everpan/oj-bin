@@ -155,6 +155,7 @@ mod tests {
             out: d.join("dist").display().to_string(),
             minify: true,
             check: false,
+            bundle: false,
         };
         let code = run_command(Command::Build(a)).await;
         assert_eq!(code, 0);

@@ -88,7 +88,105 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     }
     assert_dist_consistent(&roots)?;
     println!("oj build: {} module(s) → {}", names.len(), out.display());
+    // --bundle：把整棵 dist（manifests.yaml + 各 module-version/）打成「dist 根 tarball」
+    // （空前缀，根 = manifests.yaml + 子目录），供 mounts[].api = URL 远程挂载。
+    if a.bundle {
+        bundle_dist(&out)?;
+    }
     Ok(())
+}
+
+/// 打包 dist 根为内容寻址 tarball：整目录以空前缀打成 `<out>/<name>.tgz`（根 =
+/// manifests.yaml + module-version/），并打印 sha256 摘要，供远程 URL 挂载声明完整性锚。
+/// 跳过既有 `*.tgz`（含上轮 bundle 产物）以防自包含递归。
+fn bundle_dist(out: &Path) -> Result<String, String> {
+    if !out.join("manifests.yaml").is_file() {
+        return Err(
+            "oj build --bundle: out dir must contain manifests.yaml (run a normal build first, \
+             or point -o at an existing dist)"
+                .into(),
+        );
+    }
+    let name = out
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let tmp = std::env::temp_dir().join(format!(".oj-bundle-{name}-{}.tgz", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("bundle: create {tmp}: {e}", tmp = tmp.display()))?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(enc);
+        append_tree(&mut builder, out, out)?;
+        let enc = builder
+            .into_inner()
+            .map_err(|e| format!("bundle: into_inner: {e}"))?;
+        enc.finish()
+            .map_err(|e| format!("bundle: gzip finish: {e}"))?;
+    }
+    let sha = {
+        let data = std::fs::read(&tmp).map_err(|e| format!("bundle: read back {tmp}: {e}", tmp = tmp.display()))?;
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&data);
+        hex(&h.finalize())
+    };
+    let final_tgz = out.join(format!("{name}.tgz"));
+    std::fs::copy(&tmp, &final_tgz)
+        .map_err(|e| format!("bundle: write {final_tgz}: {e}", final_tgz = final_tgz.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    println!(
+        "oj build --bundle: wrote {} (sha256 {sha})",
+        final_tgz.display()
+    );
+    Ok(sha)
+}
+
+/// 递归把 `dir` 的内容（相对 `root`）写入 tar；跳过 `*.tgz` 防自包含递归。
+fn append_tree<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    dir: &Path,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("bundle: read_dir {dir}: {e}", dir = dir.display()))? {
+        let entry = entry.map_err(|e| format!("bundle: read_dir entry: {e}"))?;
+        let path = entry.path();
+        let name = path
+            .strip_prefix(root)
+            .map_err(|e| format!("bundle: strip prefix: {e}"))?;
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("bundle: file_type {path}: {e}", path = path.display()))?;
+        if ft.is_dir() {
+            builder
+                .append_dir(&name, &path)
+                .map_err(|e| format!("bundle: append_dir {name}: {e}", name = name.display()))?;
+            append_tree(builder, root, &path)?;
+        } else if ft.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("tgz") {
+                continue; // 跳过既有 bundle / 每模块 tgz，避免自包含与冗余
+            }
+            let mut f = std::fs::File::open(&path)
+                .map_err(|e| format!("bundle: open {path}: {e}", path = path.display()))?;
+            builder
+                .append_file(name, &mut f)
+                .map_err(|e| format!("bundle: append_file {name}: {e}", name = name.display()))?;
+        }
+        // 符号链接 / 特殊文件：打包态不存在（构建产物皆为常规文件/目录），跳过。
+    }
+    Ok(())
+}
+
+/// 字节转 hex 串（sha256 摘要展示 / 完整性锚）。
+fn hex(d: &[u8]) -> String {
+    let mut s = String::with_capacity(d.len() * 2);
+    for b in d {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// 读 config（build 专用）：解析失败**不致命**（build 不装配服务，缺文件也照建），但
@@ -1232,6 +1330,7 @@ mod tests {
             out: t.join("dist").display().to_string(),
             minify: true,
             check: false,
+            bundle: false,
         }
     }
 

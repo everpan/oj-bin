@@ -859,8 +859,36 @@ pub(crate) fn resolve_mounts(
         seen.push((p.clone(), is_api));
         match (&m.api, &m.web) {
             (Some(api), None) => {
-                let dir = static_dir(config_dir, api).map_err(|e| format!("mounts[{i}]: {e}"))?;
-                let ts = !crate::serve_cmd::is_release(&dir);
+                let (dir, ts) = if config::is_http_url(api) {
+                    // URL 形态：装配期拉取并物化到内容寻址缓存，release 语义服务。
+                    // 校验层（validate_mounts）已保证此处 sha256 必存在且为 64 hex。
+                    let sha = m
+                        .sha256
+                        .as_deref()
+                        .ok_or_else(|| {
+                            format!("mounts[{i}]: URL api requires sha256 integrity anchor")
+                        })?;
+                    let cache_root = match &m.cache {
+                        Some(c) => {
+                            let p = Path::new(c);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                config_dir.join(p)
+                            }
+                        }
+                        None => config_dir.join(".oj-cache"),
+                    };
+                    let dir = crate::mount_fetch::materialize(api, sha, &cache_root)
+                        .map_err(|e| format!("mounts[{i}]: {e}"))?;
+                    let ts = !crate::serve_cmd::is_release(&dir);
+                    (dir, ts)
+                } else {
+                    let dir =
+                        static_dir(config_dir, api).map_err(|e| format!("mounts[{i}]: {e}"))?;
+                    let ts = !crate::serve_cmd::is_release(&dir);
+                    (dir, ts)
+                };
                 out.push(ResolvedMount {
                     prefix: p,
                     kind: ResolvedMountKind::Api { dir, ts },
@@ -2503,7 +2531,9 @@ mod tests {
             web: web.map(Into::into),
             spa,
             headers: Default::default(),
-        }
+        
+..Default::default()
+}
     }
 
     #[test]

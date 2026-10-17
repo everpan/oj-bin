@@ -326,6 +326,26 @@ db_query:                    # 构造器 LIMIT 策略（v0.1.20；顶层查询�
   - api 挂载：`{prefix, api: dir}` 服务该目录的模块路由；目录不存在/含 manifests.yaml
     与否（dev/release）逐条目判定，缺失启动即报错。**同前缀一条 api + 一条 web 合法**
     （配对；api 优先，配对 web 不开 spa 回落）；同类重复报错。
+  - **URL api 挂载（v0.1.77）**：`api` 可填 `http(s)://` 远程 tarball，装配期拉取并解压到
+    内容寻址缓存（`<cache>/<sha256>/`，`cache` 缺省 `<config_dir>/.oj-cache`）以 release 语义服务。
+    **必须配 `sha256`（64 hex 完整性锚）**：下载内容 sha256 与声明不符即拒启（防篡改 / CDN 漂移）。
+    tarball 必须是「dist 根」形态（根含 `manifests.yaml` + `<module>-<version>/` 子目录，与
+    `oj build` 产物同构）；解压器逐条目 fail-fast——拒绝 tar-slip / 符号链接 / 特殊文件 /
+    pax·gnu 元数据，并对下载量（512 MiB）/ 解压总量（4 GiB）/ 条目数（10 万）/ 单条目（1 GiB）设上限。
+    `--api-path` CLI 不接受 URL（远程挂载的 sha256 上下文只在 config 声明期存在）。
+    ```yaml
+    mounts:
+      - prefix: /v1/api
+        api: https://cdn.example.com/app-0.1.0.tgz
+        sha256: <64-hex>          # 必填完整性锚
+        # cache: .oj-cache         # 可选，相对 config 目录
+    ```
+  - **`oj build --bundle`（v0.1.77）**：把整棵 dist（manifests.yaml + 各 `<module>-<version>/`）
+    打成空前缀 tarball `<out>/<name>.tgz`（根 = manifests.yaml + 子目录）并打印 sha256，供上面的
+    远程挂载声明完整性锚；手工等价 `tar czf app.tgz -C dist .`（注意必须空前缀，否则解压出嵌套目录）。
+    ```bash
+    ./bin/oj build -d src -o dist --bundle   # 生成 dist/<name>.tgz + 打印 sha256
+    ```
   - web 挂载：`{prefix, web: dir}` 静态服务，仅 GET/HEAD（其余方法 **405**）；前缀根 →
     `index.html`；穿越段（含 `%2F` 编码）按 404。`spa: true` 显式开启深链回落（默认
     false），且要求同前缀无 api 挂载（否则报错——嵌套 api 挂载经最长前缀命中本来就

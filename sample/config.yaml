@@ -16,6 +16,13 @@ mounts:
   - prefix: "/_platform" # 平台特权挂载：受控根 platform-root（与 /v1/api=src、/=dist 均不同径，
                          # 不触发 anti-squatting 绊线）。其下模块经 discover 获得归属与路由。
     api: "platform-root"
+  # --- URL 形态 api 挂载（v0.1.77，远程 dist 根 tarball）示例（默认不启用）---
+  # 装配期拉取 tarball 并解压到内容寻址缓存（<cache>/<sha256>/），release 语义服务；
+  # 必须配 sha256（64 hex）完整性锚，下载内容不符即拒启。tarball 用 `oj build --bundle` 产出。
+  # - prefix: "/remote"
+  #   api: "https://cdn.example.com/app-0.1.0.tgz"
+  #   sha256: "<64-hex>"      # 必填，与 tarball sha256 一致
+  #   # cache: .oj-cache       # 可选，相对 config 目录
 
 server:
   host: "localhost"

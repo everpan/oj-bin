@@ -81,7 +81,9 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         web: None,
         spa: None,
         headers: Default::default(),
-    });
+    
+..Default::default()
+});
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = serve::test_support::now_secs();
     serve::test_support::write_cert_into(
@@ -104,6 +106,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
             out: dist.display().to_string(),
             minify: true,
             check: false,
+            bundle: false,
         })
         .await
         .unwrap();
@@ -405,6 +408,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     // routes.js：.route 行 + 镜像行（pattern 无 base 含模块段，file 为同名产物）
@@ -471,6 +475,7 @@ async fn underscore_dir_param_dev_serves_and_release_round_trips() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     let routes = std::fs::read_to_string(t.join("dist/u-0.1.0/routes.js")).unwrap();
@@ -527,6 +532,7 @@ async fn nested_handler_group_dev_and_release_serve_end_to_end() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     let routes = std::fs::read_to_string(t.join("dist/u-0.1.0/routes.js")).unwrap();
@@ -585,6 +591,7 @@ async fn nested_group_route_suppresses_mirror_and_hyphen_segment_hits() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     let (addr, _h) = serve_cmd::start(base_cfg(&t), &t, t.join("dist"), "/v1/api".into())
@@ -630,6 +637,7 @@ async fn nested_group_mixed_verbs_and_subgroups_with_schema_isolation() {
                 out: t.join("dist").display().to_string(),
                 minify: true,
                 check: false,
+                bundle: false,
             };
             oj::build_cmd::run(&a).await.unwrap();
         }
@@ -678,6 +686,7 @@ async fn release_routes_js_illegal_handler_chain_fails_startup() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     };
     oj::build_cmd::run(&a).await.unwrap();
     let rjs = t.join("dist/u-0.1.0/routes.js");
@@ -725,6 +734,7 @@ async fn build_then_release_serves_end_to_end() {
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
+        bundle: false,
     })
     .await
     .unwrap();
@@ -1155,7 +1165,9 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
         web: None,
         spa: None,
         headers: Default::default(),
-    });
+    
+..Default::default()
+});
     let app = oj::app::App::from_config(
         cfg,
         &serde_json::Value::Null,
@@ -1239,7 +1251,9 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
         web: Some(site.canonicalize().unwrap().display().to_string()),
         spa: Some(true),
         headers: Default::default(),
-    });
+    
+..Default::default()
+});
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     cfg.server.html_cache_control = Some("no-cache".into());
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
@@ -1315,14 +1329,18 @@ async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
             web: Some("docs".into()),
             spa: None,
             headers: Default::default(),
-        },
+        
+..Default::default()
+},
         only_js::config::MountConf {
             prefix: "/".into(),
             api: None,
             web: Some("web".into()),
             spa: None,
             headers: Default::default(),
-        },
+        
+..Default::default()
+},
     ];
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
@@ -2718,7 +2736,9 @@ async fn meta_dispatch_injects_module_identity() {
         web: Some(site.canonicalize().unwrap().display().to_string()),
         spa: Some(true),
         headers: Default::default(),
-    });
+    
+..Default::default()
+});
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await

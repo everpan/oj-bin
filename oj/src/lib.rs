@@ -15,6 +15,7 @@ pub mod info_cmd;
 pub mod manifest;
 pub mod migrate;
 pub mod migrate_cmd;
+pub mod mount_fetch;
 pub mod openapi_cmd;
 pub mod pack;
 pub mod schema;

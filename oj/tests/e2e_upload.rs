@@ -123,7 +123,9 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
         web: Some(t.join("docs").to_string_lossy().into()),
         spa: None,
         headers: std::collections::BTreeMap::from([("x-oj-e2e".into(), "docs".into())]),
-    });
+    
+..Default::default()
+});
     // oj-5c：slow 路由 1s 超时（全局 30s 不可能等到——408 必是覆盖生效）。
     cfg.server
         .route_timeouts
@@ -137,7 +139,9 @@ async fn upload_route_timeout_range_and_custom_headers_end_to_end() {
         web: Some(t.join("web").to_string_lossy().into()),
         spa: None,
         headers: Default::default(),
-    });
+    
+..Default::default()
+});
     cfg.blob = Some(only_js::config::BlobSection {
         driver: "local".into(),
         root: t.join("blob-root").to_string_lossy().into(),

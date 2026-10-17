@@ -88,6 +88,10 @@ pub struct BuildArgs {
     pub minify: bool,
     /// 只跑结构检查（S001–S008）不落盘（§5.2 CI 门禁 / 本地快查）。
     pub check: bool,
+    /// 打包 dist 根为「内容寻址 tarball」：整目录（manifests.yaml + 各 `module-version/`
+    /// 子目录）以空前缀打成 `<out>/<name>.tgz`，并打印其 sha256，供 `mounts[].api = URL`
+    /// 远程挂载（声明 sha256 完整性锚）。仅当 `-o dist` 已存在 manifests.yaml 时有意义。
+    pub bundle: bool,
 }
 
 /// `oj openapi [-c config] [-d dir] [--base B] [--check] [-o out.json]`：
@@ -304,6 +308,10 @@ enum Commands {
         /// 只跑结构检查（S001–S008），不写任何产物（CI 门禁）
         #[arg(long)]
         check: bool,
+        /// 打包 dist 根为内容寻址 tarball（空前缀根 = manifests.yaml + module-version/），
+        /// 输出 <out>/<name>.tgz 并打印 sha256，供 mounts[].api = URL 远程挂载
+        #[arg(long)]
+        bundle: bool,
     },
     /// 应用模块迁移到最新（migrations/*.sql → 目标库；部署 = build && migrate && serve）
     Migrate {
@@ -593,6 +601,7 @@ fn to_command(cli: Cli) -> Command {
             out,
             no_minify,
             check,
+            bundle,
         } => Command::Build(BuildArgs {
             module,
             config,
@@ -600,6 +609,7 @@ fn to_command(cli: Cli) -> Command {
             out,
             minify: !no_minify,
             check,
+            bundle,
         }),
         Commands::Test {
             config,

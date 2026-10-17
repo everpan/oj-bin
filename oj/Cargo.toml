@@ -1,6 +1,6 @@
 [package]
 name = "oj"
-version = "0.1.76"
+version = "0.1.77"
 edition = "2024"
 authors = ["everpan <unix@vip.qq.com>"]
 
@@ -17,6 +17,10 @@ serde_json = "1"
 serde_yaml = "0.9"
 tar = "0.4"
 flate2 = "1"
+# URL api mount（v0.1.77）：装配期拉取 dist 根 tarball + sha256 校验 + 内容寻址缓存。
+# 由 [dev-dependencies] 提升为发行依赖（mount_fetch 跑在生产 serve 路径）；
+# json feature 仅测试用到，保留以兼容 e2e。
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 # 测试框架（L1）：进程内 dispatch + 真实 deno_core 运行时内跑 TS 用例。
 axum = { version = "0.8", features = ["ws"] }
@@ -48,7 +52,6 @@ rustyline = "14"
 libc = "0.2"
 
 [dev-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
 # 正向用例签发测试 JWT，验证 oj-auth 守卫验签链路（oj 用 11.0.0；oj-auth 与根测试仍 9.3.1，树内双版本）。
 # v11 无后端 feature 无法自动选定 CryptoProvider（签名即 panic）→ 显式 aws_lc_rs（依赖树已有，零新增节点）。
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }

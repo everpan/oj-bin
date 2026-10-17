@@ -741,9 +741,16 @@ mod tests {
         // "oj" → current_exe（serve 进程即 bin/oj；测试里即测试二进制自身）。
         let oj = default_resolve_command("oj").unwrap();
         assert_eq!(oj, std::env::current_exe().unwrap());
-        // 裸名 → 父进程 PATH 解析为绝对路径（sh 恒在）。
-        let sh = default_resolve_command("sh").unwrap();
-        assert!(sh.is_absolute(), "{sh:?}");
+        // 裸名 → 父进程 PATH 解析为绝对路径。探测名取「该平台恒在」者：
+        // unix 用 sh；Windows 无 sh，用 System32 常在 PATH 的 cmd.exe——带扩展名
+        // 是因为 default_resolve_command 的 Windows 分支只 is_file()、不探测
+        // PATHEXT（裸名 cmd 匹配不到 cmd.exe；该缺口另立 OJ-8，不混进本测试）。
+        #[cfg(unix)]
+        let probe = "sh";
+        #[cfg(windows)]
+        let probe = "cmd.exe";
+        let resolved = default_resolve_command(probe).unwrap();
+        assert!(resolved.is_absolute(), "{probe} -> {resolved:?}");
         // 未知命令 → Err 点名。
         let e = default_resolve_command("oj-no-such-command-xyz").unwrap_err();
         assert!(e.contains("not found in PATH"), "{e}");
@@ -779,7 +786,16 @@ mod tests {
         )
     }
 
-    /// 全场景 handler 表（占位符经 replace 注入实际路径/变量名）。
+    /// 路径嵌进 JS 双引号串字面量前的转义：canonicalize 在 Windows 得
+    /// verbatim `\\?\C:\...`，反斜杠会被 JS 字符串当转义吃掉（`\r`→CR、
+    /// `\U`→U……）毁掉路径（同 oj/src/app.rs 测试 2026-10-17 的坑）。
+    /// unix 路径无反斜杠，no-op。
+    fn js_path(p: &Path) -> String {
+        p.display().to_string().replace('\\', "\\\\")
+    }
+
+    /// 全场景 handler 表（unix 命令形态；Windows 对应面见 `api_src_win`）。
+    /// 占位符经 replace 注入实际路径/变量名。
     fn api_src(jail: &Path, outside: &Path, var_on: &str, var_off: &str) -> String {
         r#"
 export default {
@@ -800,8 +816,8 @@ export default {
   s12_badutf8: async () => json.ok(await exec.run(["sh", "-c", "printf '\\200' >&2"])),
 };
 "#
-        .replace("__JAIL__", &jail.display().to_string())
-        .replace("__OUT__", &outside.display().to_string())
+        .replace("__JAIL__", &js_path(jail))
+        .replace("__OUT__", &js_path(outside))
         .replace("__VON__", var_on)
         .replace("__VOFF__", var_off)
     }
@@ -848,7 +864,9 @@ export default {
         )
     }
 
-    /// worker 模块的模板表（覆盖 echo/cat/tar/sh/printenv/oj 形态）。
+    /// worker 模块的模板表（unix 形态：echo/cat/tar/sh/printenv/oj）。
+    /// Windows 对应面见 `worker_grant_win`。
+    #[cfg(unix)]
     fn worker_grant(env: Vec<String>, resolver: CommandResolver) -> ExecGrant {
         ExecGrant::with_resolver(
             [(
@@ -870,6 +888,10 @@ export default {
         )
     }
 
+    // S1–S12 主场景（unix 命令形态；Windows 对应面见
+    // `exec_bdd_main_scenarios_windows`——契约断言同源，差异仅限平台
+    // 命令形态：CRLF、echo %VAR% 字面量回落、ping 代 sleep、无信号/组杀）。
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn exec_bdd_main_scenarios() {
         // macOS temp_dir 经 symlink：统一 canonical（前缀比对防形态打穿）。
@@ -1016,6 +1038,220 @@ export default {
                 "{m}"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&jail);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ----- BDD Windows 对应面（cmd.exe 形态；契约断言与 unix 面同源） -----
+    //
+    // 平台差异均为「命令语义」而非契约差异：
+    // - echo/type/exit 经 cmd /c（Windows 无独立 echo/cat 可执行）；
+    // - cmd 的 echo 输出 CRLF → stdout 断言按平台取 \r\n；
+    // - 白名单外变量经 echo %VAR% 原样打出字面量（printenv 的 exit 1
+    //   无对应物）→ 断言「值不可见」而非「空输出」；
+    // - 超时用 ping -n 31（≈30s；timeout.exe 不支持输入重定向会立即退出）；
+    // - 信号终止 / 非 UTF-8 stderr / 组杀残留无 Windows 对应物（kill_tree
+    //   仅杀直接子进程，api-manual §6 已声明）——留 unix 面覆盖，编解码与
+    //   模板账本逻辑本身平台无关。
+
+    /// Windows 场景 handler 表（占位符经 replace 注入实际路径/变量名）。
+    #[cfg(windows)]
+    fn api_src_win(jail: &Path, outside: &Path, var_on: &str, var_off: &str) -> String {
+        r#"
+export default {
+  s1_echo: async () => json.ok(await exec.run(["cmd", "/c", "echo", "hello"])),
+  s1_cat: async () => json.ok(await exec.run(["cmd", "/c", "type", "__JAIL__/in.txt"])),
+  s2_inject: async () => json.ok(await exec.run(["cmd", "--bad", "/c", "type", "__JAIL__/in.txt"])),
+  s3_escape: async () => json.ok(await exec.run(["cmd", "/c", "type", "__OUT__/secret.txt"])),
+  s3_raw_opt: async () => json.ok(await exec.run(["sh", "-c", "-x"])),
+  s3_raw_abs: async () => json.ok(await exec.run(["sh", "-c", "/abs"])),
+  s4_env_on: async () => json.ok(await exec.run(["cmd", "/c", "echo", "%__VON__%"])),
+  s4_env_off: async () => json.ok(await exec.run(["cmd", "/c", "echo", "%__VOFF__%"])),
+  s5_big: async () => json.ok(await exec.run(["cmd", "/c", "type", "__JAIL__/big.bin"])),
+  s6_timeout: async () => json.ok(await exec.run(["ping", "-n", "31", "127.0.0.1"], { timeoutMs: 400 })),
+  s7_exit3: async () => json.ok(await exec.run(["cmd", "/c", "exit", "3"])),
+  s9_oj: async () => json.ok(await exec.run(["oj", "/c", "echo", "ping"])),
+  s10_amb: async () => json.ok(await exec.run(["echo", "hi"])),
+};
+"#
+        .replace("__JAIL__", &js_path(jail))
+        .replace("__OUT__", &js_path(outside))
+        .replace("__VON__", var_on)
+        .replace("__VOFF__", var_off)
+    }
+
+    /// worker 模块的模板表（Windows 形态：cmd /c 家族 + ping）。sh -c 条目
+    /// 仅供 S3 的 ${raw:} pre-spawn 拒绝——匹配期即拒，"sh" 无需在 Windows 存在。
+    #[cfg(windows)]
+    fn worker_grant_win(env: Vec<String>, resolver: CommandResolver) -> ExecGrant {
+        ExecGrant::with_resolver(
+            [(
+                "worker".to_string(),
+                (
+                    vec![
+                        "cmd /c echo ${raw:word}".to_string(),
+                        "cmd /c type ${path:file}".to_string(),
+                        "cmd /c echo %${raw:NAME}%".to_string(),
+                        "cmd /c exit ${raw:code}".to_string(),
+                        "ping -n ${raw:count} 127.0.0.1".to_string(),
+                        "oj /c echo ${raw:msg}".to_string(),
+                        "sh -c ${raw:script}".to_string(),
+                    ],
+                    env,
+                ),
+            )]
+            .into(),
+            resolver,
+        )
+    }
+
+    /// 跑一个 handler 取 data（envelope code 必须为 0）。
+    #[cfg(windows)]
+    async fn data_of(b: &Bridge, api: &Path, h: &str) -> serde_json::Value {
+        let cap = b
+            .run_module(
+                api,
+                h,
+                Default::default(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{h} failed: {e}"));
+        let v: serde_json::Value =
+            serde_json::from_slice(&cap.body).unwrap_or_else(|e| panic!("{h} envelope: {e}"));
+        assert_eq!(v["code"], 0, "{}: {}", h, v["msg"]);
+        v["data"].clone()
+    }
+
+    /// NotCapable 类失败（未授权 / 模板失配 / 占位符校验）。
+    #[cfg(windows)]
+    async fn denied_of(b: &Bridge, api: &Path, h: &str, part: &str) {
+        let e = b
+            .run_module(
+                api,
+                h,
+                Default::default(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains("NotCapable") && m.contains(part), "{h} -> {m}");
+    }
+
+    /// 环境/运行期失败（超时 / 输出超限），非 NotCapable 类。
+    #[cfg(windows)]
+    async fn fails_of(b: &Bridge, api: &Path, h: &str, part: &str) {
+        let e = b
+            .run_module(
+                api,
+                h,
+                Default::default(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+        let m = e.to_string();
+        assert!(m.contains(part), "{h} -> {m}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_bdd_main_scenarios_windows() {
+        let jail = tmp("jail").canonicalize().unwrap();
+        let outside = tmp("outside").canonicalize().unwrap();
+        std::fs::write(jail.join("in.txt"), b"hello-jail").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
+
+        // env 白名单夹具：白名单内 / 外各一个宿主变量（echo %VAR% 断言可见性）。
+        let var_on = format!("OJ_EXEC_TEST_ON_{}", std::process::id());
+        let var_off = format!("OJ_EXEC_TEST_OFF_{}", std::process::id());
+        // SAFETY: 测试夹具（对齐 plugin_loader/tests.rs 惯例）；变量名带 pid 唯一。
+        unsafe { std::env::set_var(&var_on, "oj-exec-visible") };
+        unsafe { std::env::set_var(&var_off, "oj-exec-hidden") };
+
+        let base = tmp("mods").canonicalize().unwrap();
+        let api_js = api_src_win(&jail, &outside, &var_on, &var_off);
+        // SystemRoot 直取（不依赖 PATH 形态）；"oj" 映射到 cmd.exe 得确定输出。
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let cmd_exe = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned();
+        let ping_exe = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("ping.exe")
+            .to_string_lossy()
+            .into_owned();
+        let (resolver, seen) = test_resolver(&[
+            ("cmd", cmd_exe.as_str()),
+            ("ping", ping_exe.as_str()),
+            ("oj", cmd_exe.as_str()),
+        ]);
+        let b = make_bridge(
+            &base,
+            &[("worker", "worker"), ("plain", "plain")],
+            &api_js,
+            &jail,
+            Some(worker_grant_win(vec![var_on.clone()], resolver)),
+            Some(PlatformGrant::new(vec!["worker".into()], &[], Some(&jail)).unwrap()),
+        );
+        let api = base.join("worker").join("api.js");
+        let plain_api = base.join("plain").join("api.js");
+
+        // S1：合法模板 + jail 内路径 → code=0，stdout 正确（cmd echo 为 CRLF）。
+        let d = data_of(&b, &api, "s1_echo").await;
+        assert_eq!(d["code"], 0);
+        assert_eq!(d["stdout"], "hello\r\n");
+        let d = data_of(&b, &api, "s1_cat").await;
+        assert_eq!(d["code"], 0);
+        assert_eq!(d["stdout"], "hello-jail\r\n");
+
+        // S2：literal 被替换（argv 夹 --bad）→ 模板失配 NotCapable。
+        denied_of(&b, &api, "s2_inject", "template mismatch").await;
+
+        // S3：${path:} 越界 → NotCapable；${raw:} 收 -x / /abs → 拒绝。
+        denied_of(&b, &api, "s3_escape", "path outside fs.root").await;
+        denied_of(&b, &api, "s3_raw_opt", "option-like").await;
+        denied_of(&b, &api, "s3_raw_abs", "absolute-form").await;
+
+        // S4：白名单内值可见；白名单外不可见（cmd 对未定义变量原样打出
+        // %NAME% 字面量 → 断言「值不出现」而非「空输出」）。
+        let d = data_of(&b, &api, "s4_env_on").await;
+        assert_eq!(d["code"], 0);
+        assert_eq!(d["stdout"], "oj-exec-visible\r\n");
+        let d = data_of(&b, &api, "s4_env_off").await;
+        assert!(
+            !d["stdout"].as_str().unwrap().contains("oj-exec-hidden"),
+            "{d}"
+        );
+
+        // S5：输出 >10MB → 抛错点名。
+        fails_of(&b, &api, "s5_big", "output limit exceeded").await;
+
+        // S6：timeoutMs 到期 → 抛错点名（ping -n 31 ≈ 30s；Windows 无进程组，
+        // kill_tree 仅杀直接子进程）。
+        fails_of(&b, &api, "s6_timeout", "timed out").await;
+
+        // S7：非 0 退出 → 返回 {code:非0} 不抛（信号终止无 Windows 对应物）。
+        let d = data_of(&b, &api, "s7_exit3").await;
+        assert_eq!(d["code"], 3);
+
+        // S9："oj" 模板 → 解析器以 "oj" 调用（注入 cmd.exe，stdout 确定）。
+        let d = data_of(&b, &api, "s9_oj").await;
+        assert_eq!(d["stdout"], "ping\r\n");
+        assert!(
+            seen.lock().unwrap().iter().any(|n| n == "oj"),
+            "resolver calls: {:?}",
+            seen.lock().unwrap()
+        );
+
+        // S8：非特权模块（plain 不在 exec 授权表）→ NotCapable。
+        denied_of(&b, &plain_api, "s1_echo", "not authorized for exec").await;
 
         let _ = std::fs::remove_dir_all(&jail);
         let _ = std::fs::remove_dir_all(&outside);

@@ -65,14 +65,15 @@ where
 /// serve_cmd::resolve_app_prefix（首斜杠、无尾斜杠、`/` 允许）；api/web 目录相对
 /// config 目录（CLI 折叠进来的条目已按 CWD 预绝对化）。
 /// `headers` 用 BTreeMap 保证输出定序（serve 端转 `Vec<(String,String)>`）。
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct MountConf {
     pub prefix: String,
     /// api 挂载：服务该目录下的模块路由（src 源码树或 oj build 产物 dist）。
+    /// 亦支持 http(s):// URL（远程 dist 根 tarball），此时须配 `sha256` 完整性锚。
     #[serde(default)]
     pub api: Option<String>,
     /// web 挂载：静态站点根目录；`spa: true` 显式开启 SPA 深链接回落（默认 false，
-    /// 继承 v0.1.20「静默 404→200 掩盖错配」的立论）。
+    /// 继承 v0.1.20「静默 404→200 掩盖错配」的立论）。web 仅支持本地目录，不接受 URL。
     #[serde(default)]
     pub web: Option<String>,
     #[serde(default)]
@@ -81,6 +82,28 @@ pub struct MountConf {
     /// 里同名的全局头；框架自有头（Content-Type/Content-Length 等）永远优先。
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// URL api mount 专用：完整性锚（64 hex）。声明值与下载内容 sha256 不符即拒启。
+    /// 本地目录 mount 不得配置（配置即误用，校验报错）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// URL api mount 专用：内容寻址缓存根（相对 config_dir）；缺省 `<config_dir>/.oj-cache`。
+    /// 本地目录 mount 不得配置。
+    #[serde(default)]
+    pub cache: Option<String>,
+}
+
+/// 是否 http/https URL：含 `://` 且 scheme 为 http/https（大小写不敏感）。
+/// 不含 `://` 一律判本地——Windows `C:\\dist` / `c:/dist` 均无 `://`，不误伤；
+/// 仅 `Url::parse` 会把 `c:/dist` 误判 scheme=c，故先查字面 `://` 再校验 scheme。
+pub fn is_http_url(s: &str) -> bool {
+    let Some(idx) = s.find("://") else { return false; };
+    let scheme = s[..idx].to_ascii_lowercase();
+    scheme == "http" || scheme == "https"
+}
+
+/// 校验 sha256 十六进制串：长度 64 且全为 ASCII 十六进制数字。
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// v0.1.58 删除的旧站点键（`server.*`）：出现即报错并输出迁移后的 `mounts:` YAML
@@ -687,12 +710,38 @@ pub fn validate_mounts(mounts: &[MountConf]) -> Result<(), String> {
             (None, None) => {
                 return Err(at("exactly one of `api` or `web` is required".into()));
             }
-            (Some(a), None) | (None, Some(a)) => {
+            (Some(a), None) => {
                 if a.trim().is_empty() {
-                    let key = if m.api.is_some() { "api" } else { "web" };
-                    return Err(at(format!(
-                        "{key} must not be empty (omit the key instead)"
-                    )));
+                    return Err(at("api must not be empty (omit the key instead)".into()));
+                }
+                if a.contains("://") {
+                    if !is_http_url(a) {
+                        return Err(at("unsupported URL scheme in api (only http/https)".into()));
+                    }
+                    match &m.sha256 {
+                        None => {
+                            return Err(at("URL api mount requires sha256 integrity anchor (compute: shasum -a 256 file)".into()));
+                        }
+                        Some(h) if !is_sha256_hex(h) => {
+                            return Err(at("sha256 must be 64 hex chars".into()));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    if m.sha256.is_some() {
+                        return Err(at("sha256 only applies to URL api mounts".into()));
+                    }
+                    if m.cache.is_some() {
+                        return Err(at("cache only applies to URL api mounts".into()));
+                    }
+                }
+            }
+            (None, Some(w)) => {
+                if w.trim().is_empty() {
+                    return Err(at("web must not be empty (omit the key instead)".into()));
+                }
+                if w.contains("://") {
+                    return Err(at("web mounts are local directories only (URL not allowed)".into()));
                 }
             }
         }
@@ -2073,7 +2122,9 @@ cache:
             web: web.map(Into::into),
             spa,
             headers: Default::default(),
-        };
+        
+..Default::default()
+};
         // api/web 双写 → Err；双缺 → Err。
         assert!(validate_mounts(&[m("/p", Some("a"), Some("w"), None)]).is_err());
         assert!(validate_mounts(&[m("/p", None, None, None)]).is_err());
