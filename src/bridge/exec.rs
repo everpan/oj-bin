@@ -49,6 +49,18 @@ pub mod template {
         Lit(String),
         Path(String),
         Raw(String),
+        /// 占位符被字面前缀/后缀包裹，仍属**同一 argv token**。用于 Windows
+        /// `cmd.exe` 的 `%VAR%` 形态：模板写 `cmd /c echo %${raw:NAME}%`，
+        /// 占位符吸收中间子串 `NAME`（`%…%` 为 cmd 的变量定界符，无法拆成
+        /// 独立 token），重建时以模板前缀/后缀原样还原为 `%NAME%`。
+        /// 一个 token 至多一个占位符；前缀/后缀为空时退化为整 token 占位符。
+        /// 安全不变量不变：占位符仍吸收恰一个 argv token，前后字面量来自
+        /// 受信模板（非用户输入），重建不产生新的 token / 不引入注入面。
+        Wrapped {
+            prefix: String,
+            inner: Box<Token>,
+            suffix: String,
+        },
     }
 
     /// 解析后的 argv 模板。首 token 恒为 literal（命令名，宿主解析器覆盖）。
@@ -67,9 +79,10 @@ pub mod template {
         Ambiguous { count: usize },
     }
 
-    /// 解析模板：空白拆 token。token 形态：literal（逐字）或整体恰为
-    /// `${path:NAME}` / `${raw:NAME}`；未知占位符类型 / 语法错 / 首 token 非
-    /// literal / 首 token 含路径分隔符 → Err 点名。
+    /// 解析模板：空白拆 token。token 形态：literal（逐字）或恰含一个占位符
+    /// `${path:NAME}` / `${raw:NAME}`（整 token，或前后带字面前缀/后缀）；
+    /// 未知占位符类型 / 语法错 / 首 token 非 literal / 首 token 含路径分隔符
+    /// / 一个 token 含多占位符 → Err 点名。
     pub fn parse_template(s: &str) -> Result<ExecTemplate, String> {
         let mut tokens = Vec::new();
         for (i, tok) in s.split_whitespace().enumerate() {
@@ -98,17 +111,27 @@ pub mod template {
         })
     }
 
-    /// 单个非首 token：不含 `${` = literal；含则必须整体恰为一个合法占位符。
+    /// 单个非首 token：不含 `${` = literal；含则必须恰有一个连续占位符 `${kind:NAME}`，其前后可带字面前缀/后缀（同一 argv token 内，用于 Windows `cmd /c echo %VAR%` 的 `%…%` 定界）。前缀/后缀逐字还原；占位符吸收 token 中间子串作为绑定值。
     fn parse_token(tok: &str) -> Result<Token, String> {
-        if !tok.contains("${") {
+        let Some(open) = tok.find("${") else {
             return Ok(Token::Lit(tok.to_string()));
+        };
+        let rest = &tok[open..];
+        let close_rel = rest.find('}').ok_or_else(|| {
+            format!("invalid placeholder token '{tok}' (missing closing '}}')")
+        })?;
+        if rest[1..close_rel].contains("${") {
+            return Err(format!(
+                "invalid placeholder token '{tok}' (nested placeholder not allowed)"
+            ));
         }
-        let inner = tok
-            .strip_prefix("${")
-            .and_then(|r| r.strip_suffix('}'))
-            .ok_or_else(|| {
-                format!("invalid placeholder token '{tok}' (placeholder must be the whole token)")
-            })?;
+        if rest[close_rel + 1..].contains("${") {
+            return Err(format!(
+                "invalid placeholder token '{tok}' (only one placeholder per token allowed)"
+            ));
+        }
+        let close = open + close_rel;
+        let inner = &tok[open + 2..close];
         let (kind, name) = inner.split_once(':').ok_or_else(|| {
             format!("invalid placeholder token '{tok}' (expected ${{kind:NAME}})")
         })?;
@@ -117,12 +140,23 @@ pub mod template {
                 "invalid placeholder name in '{tok}' (NAME must match [A-Za-z_][A-Za-z0-9_]*)"
             ));
         }
-        match kind {
-            "path" => Ok(Token::Path(name.to_string())),
-            "raw" => Ok(Token::Raw(name.to_string())),
-            other => Err(format!(
-                "unknown placeholder type '${{{other}:...}}' in '{tok}' (supported: path, raw)"
-            )),
+        let core = match kind {
+            "path" => Token::Path(name.to_string()),
+            "raw" => Token::Raw(name.to_string()),
+            other => {
+                return Err(format!(
+                    "unknown placeholder type '${{{other}:...}}' in '{tok}' (supported: path, raw)"
+                ))
+            }
+        };
+        if open == 0 && close == tok.len() - 1 {
+            Ok(core)
+        } else {
+            Ok(Token::Wrapped {
+                prefix: tok[..open].to_string(),
+                inner: Box::new(core),
+                suffix: tok[close + 1..].to_string(),
+            })
         }
     }
 
@@ -135,9 +169,22 @@ pub mod template {
         b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
     }
 
+    /// raw 占位符取值校验：拒绝 `-` 起手（option 注入）与绝对形态（路径注入）。
+    /// 文案不含模板前缀，由调用方拼接 `template '...': `。
+    fn check_raw(name: &str, value: &str) -> Result<(), String> {
+        if value.starts_with('-') {
+            return Err(format!("${{raw:{name}}} rejects option-like token '{value}'"));
+        }
+        if is_absolute_form(value) {
+            return Err(format!("${{raw:{name}}} rejects absolute-form token '{value}'"));
+        }
+        Ok(())
+    }
+
     /// 单模板匹配：literal 逐字相等；占位符吸收**恰一个** token；返回绑定表
     /// （name, value）。长度不齐 / literal 失配 / raw 非法形态 → Err（携原因）。
     /// `${path:}` 的值校验（jail 集合）不在纯函数层——需 fs 状态，op 层做。
+    /// `Wrapped` 占位符：argv token 须以模板前缀起手、后缀收尾，中间子串即绑定值。
     pub fn match_template(
         t: &ExecTemplate,
         argv: &[String],
@@ -163,19 +210,30 @@ pub mod template {
                 }
                 Token::Path(name) => bindings.push((name.clone(), arg.clone())),
                 Token::Raw(name) => {
-                    if arg.starts_with('-') {
-                        return Err(format!(
-                            "template '{}': ${{raw:{name}}} rejects option-like token '{arg}'",
-                            t.raw
-                        ));
-                    }
-                    if is_absolute_form(arg) {
-                        return Err(format!(
-                            "template '{}': ${{raw:{name}}} rejects absolute-form token '{arg}'",
-                            t.raw
-                        ));
-                    }
+                    check_raw(name, arg)
+                        .map_err(|e| format!("template '{}': {e}", t.raw))?;
                     bindings.push((name.clone(), arg.clone()));
+                }
+                Token::Wrapped { prefix, inner, suffix } => {
+                    let a = arg.as_str();
+                    if !a.starts_with(prefix) || !a.ends_with(suffix) {
+                        return Err(format!(
+                            "template '{}': token expects '{prefix}${{...}}{suffix}', got '{arg}'",
+                            t.raw
+                        ));
+                    }
+                    let inner_val = &a[prefix.len()..a.len() - suffix.len()];
+                    match inner.as_ref() {
+                        Token::Path(name) => {
+                            bindings.push((name.clone(), inner_val.to_string()))
+                        }
+                        Token::Raw(name) => {
+                            check_raw(name, inner_val)
+                                .map_err(|e| format!("template '{}': {e}", t.raw))?;
+                            bindings.push((name.clone(), inner_val.to_string()));
+                        }
+                        _ => unreachable!("Wrapped inner is Path or Raw"),
+                    }
                 }
             }
         }
@@ -199,6 +257,9 @@ pub mod template {
             .zip(argv.iter())
             .take_while(|(t, a)| match t {
                 Token::Lit(l) => l == *a,
+                Token::Wrapped { prefix, suffix, .. } => {
+                    a.starts_with(prefix) && a.ends_with(suffix)
+                }
                 _ => true,
             })
             .count()
@@ -363,6 +424,25 @@ fn prepare_exec(
                     .map(|(_, v)| v)
                     .expect("bindings align with placeholders 1:1"),
             ),
+            template::Token::Wrapped { prefix, inner, suffix } => {
+                let val = bound
+                    .next()
+                    .map(|(_, v)| v)
+                    .expect("bindings align with placeholders 1:1");
+                let resolved = match inner.as_ref() {
+                    template::Token::Path(name) => super::platform::resolve_allowed(
+                        &fs.root,
+                        trusted,
+                        &val,
+                    )
+                    .map_err(|e| not_capable(format!("exec ${{path:{name}}}: {e}")))?
+                    .to_string_lossy()
+                    .into_owned(),
+                    template::Token::Raw(_) => val,
+                    _ => unreachable!("Wrapped inner is Path or Raw"),
+                };
+                final_argv.push(format!("{prefix}{resolved}{suffix}"));
+            }
         }
     }
 
@@ -977,8 +1057,20 @@ mod tests {
         // 未知占位符类型点名。
         let e = parse_template("x ${exec:name}").unwrap_err();
         assert!(e.contains("unknown placeholder type"), "{e}");
-        // 语法错：嵌入 / 未闭合 / 空名 / 非法名 / 多冒号 / 空占位。
-        assert!(parse_template("x a${path:n}").is_err());
+        // 占位符可被字面前缀/后缀包裹（同一 token 内；Windows cmd `%VAR%` 形态）。
+        let w = parse_template("cmd /c echo %${raw:NAME}%").unwrap();
+        assert!(matches!(
+            w.tokens.last(),
+            Some(Token::Wrapped { prefix, inner, suffix })
+                if prefix == "%"
+                    && suffix == "%"
+                    && matches!(inner.as_ref(), Token::Raw(n) if n == "NAME")
+        ));
+        // 前缀附着（无后缀）同样合法。
+        assert!(parse_template("x a${path:n}").is_ok());
+        // 一个 token 多占位符 → 拒绝。
+        assert!(parse_template("x a${path:n}${raw:m}").is_err());
+        // 语法错：未闭合 / 空名 / 非法名 / 多冒号 / 空占位。
         assert!(parse_template("x ${path:n").is_err());
         assert!(parse_template("x ${path:}").is_err());
         assert!(parse_template("x ${path:9bad}").is_err());
