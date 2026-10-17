@@ -117,9 +117,9 @@ pub mod template {
             return Ok(Token::Lit(tok.to_string()));
         };
         let rest = &tok[open..];
-        let close_rel = rest.find('}').ok_or_else(|| {
-            format!("invalid placeholder token '{tok}' (missing closing '}}')")
-        })?;
+        let close_rel = rest
+            .find('}')
+            .ok_or_else(|| format!("invalid placeholder token '{tok}' (missing closing '}}')"))?;
         if rest[1..close_rel].contains("${") {
             return Err(format!(
                 "invalid placeholder token '{tok}' (nested placeholder not allowed)"
@@ -146,7 +146,7 @@ pub mod template {
             other => {
                 return Err(format!(
                     "unknown placeholder type '${{{other}:...}}' in '{tok}' (supported: path, raw)"
-                ))
+                ));
             }
         };
         if open == 0 && close == tok.len() - 1 {
@@ -173,10 +173,14 @@ pub mod template {
     /// 文案不含模板前缀，由调用方拼接 `template '...': `。
     fn check_raw(name: &str, value: &str) -> Result<(), String> {
         if value.starts_with('-') {
-            return Err(format!("${{raw:{name}}} rejects option-like token '{value}'"));
+            return Err(format!(
+                "${{raw:{name}}} rejects option-like token '{value}'"
+            ));
         }
         if is_absolute_form(value) {
-            return Err(format!("${{raw:{name}}} rejects absolute-form token '{value}'"));
+            return Err(format!(
+                "${{raw:{name}}} rejects absolute-form token '{value}'"
+            ));
         }
         Ok(())
     }
@@ -210,11 +214,14 @@ pub mod template {
                 }
                 Token::Path(name) => bindings.push((name.clone(), arg.clone())),
                 Token::Raw(name) => {
-                    check_raw(name, arg)
-                        .map_err(|e| format!("template '{}': {e}", t.raw))?;
+                    check_raw(name, arg).map_err(|e| format!("template '{}': {e}", t.raw))?;
                     bindings.push((name.clone(), arg.clone()));
                 }
-                Token::Wrapped { prefix, inner, suffix } => {
+                Token::Wrapped {
+                    prefix,
+                    inner,
+                    suffix,
+                } => {
                     let a = arg.as_str();
                     if !a.starts_with(prefix) || !a.ends_with(suffix) {
                         return Err(format!(
@@ -224,9 +231,7 @@ pub mod template {
                     }
                     let inner_val = &a[prefix.len()..a.len() - suffix.len()];
                     match inner.as_ref() {
-                        Token::Path(name) => {
-                            bindings.push((name.clone(), inner_val.to_string()))
-                        }
+                        Token::Path(name) => bindings.push((name.clone(), inner_val.to_string())),
                         Token::Raw(name) => {
                             check_raw(name, inner_val)
                                 .map_err(|e| format!("template '{}': {e}", t.raw))?;
@@ -424,20 +429,22 @@ fn prepare_exec(
                     .map(|(_, v)| v)
                     .expect("bindings align with placeholders 1:1"),
             ),
-            template::Token::Wrapped { prefix, inner, suffix } => {
+            template::Token::Wrapped {
+                prefix,
+                inner,
+                suffix,
+            } => {
                 let val = bound
                     .next()
                     .map(|(_, v)| v)
                     .expect("bindings align with placeholders 1:1");
                 let resolved = match inner.as_ref() {
-                    template::Token::Path(name) => super::platform::resolve_allowed(
-                        &fs.root,
-                        trusted,
-                        &val,
-                    )
-                    .map_err(|e| not_capable(format!("exec ${{path:{name}}}: {e}")))?
-                    .to_string_lossy()
-                    .into_owned(),
+                    template::Token::Path(name) => {
+                        super::platform::resolve_allowed(&fs.root, trusted, &val)
+                            .map_err(|e| not_capable(format!("exec ${{path:{name}}}: {e}")))?
+                            .to_string_lossy()
+                            .into_owned()
+                    }
                     template::Token::Raw(_) => val,
                     _ => unreachable!("Wrapped inner is Path or Raw"),
                 };
