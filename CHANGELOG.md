@@ -18,10 +18,12 @@
 
 ## v0.1.79（未打标签）
 
+- exec 模板占位符支持**字面前后缀**（v0.1.79）：占位符可被同一 argv token 内的字面量包裹——Windows `cmd /c echo %VAR%` 的 `%…%` 是 cmd 变量定界符、无法拆成独立 token，现模板写 `cmd /c echo %${raw:NAME}%` 即可（匹配取中间子串为绑定值、重建时以模板前后缀原样还原）；`${raw:}` 的 option-like / 绝对形态校验作用在**中间子串**上。此前这类模板在解析期即被拒（旧规则要求占位符占满整 token），Windows 上无法为 `echo %VAR%` 建模；
 - Windows 上 exec 的输出形态文档化（**用户可见行为补录，非行为变更**）：`cmd /c echo` 恒以 CRLF 收尾、`cmd /c type <file>` 原样吐文件字节（不补行尾）；exec 返回子进程**原始字节**、不做 CRLF→LF 归一（与 `Deno.Command.output` / Node `child_process` 同口径）——跨平台文本比对请用 `trimEnd()` / `split(/\r?\n/)`，别写死 `"\n"`；
 - Windows 子进程输出是本地代码页（GBK / CP1252），含非 ASCII（中文路径 / 报错 / `ping` 本地化文案）时即落 `exec: stdout is not valid UTF-8`（stderr 同文案）——要 UTF-8 输出，把 `chcp 65001` 写进 `cmd /c` 语句；此为 Windows 控制台既有行为，非 oj 限制；
 - 配套：devkit 四件同步（api-manual §6「Windows 平台命令形态」两条 + 错误表非 UTF-8 条目、SKILL 陷阱速查两条、scenarios 场景 39/40 各一条、README 版本行）、`oj/Cargo.toml` 升 0.1.79、`cargo xtask build` 归置 `bin/devkit/`。
 
+- **fix（Windows CI）**：`exec_bdd_main_scenarios_windows` 的 S4（env 白名单可见性）报 `NotCapable: exec template ambiguous: argv matches 2 authorized templates`——夹具同时配了 `cmd /c echo ${raw:word}` 与 S4 用的 `cmd /c echo %${raw:NAME}%`，而裸 raw 是 `%…%` 包裹 raw 的**超集**：上一条能力落地前 `%${raw:NAME}%` 在解析期就失败、从未走到匹配期，落地后 `%VAR%` 形态 argv 首次同时命中两条。**生产语义未动**（命中 ≥2 即歧义拒绝、不静默择一是设计约定），改的是夹具：`cmd /c echo` 家族改为每种取值一条全字面模板。同时新增**平台无关**单测 `windows_fixture_templates_are_unambiguous`，直接对夹具模板表断言「每个场景 argv 恰命中 1 条」+ 反例钉死「同位置裸 raw 与 `%…%` 包裹 raw → `Ambiguous{count:2}`」，把这类只能由 Windows CI 暴露的缺陷挡在 unix 面；另修 `exec_bdd_streaming_scenarios_windows` 的 SS8——上一版收敛行尾期望值时漏了这一处（仍写死 `"compat\n"`，而 cmd echo 恒 CRLF），现改经 `echo_out`；
 - **fix（Windows CI）**：`src/bridge/exec.rs` 两个 `#[cfg(windows)]` BDD 用例的行尾期望值此前散落在 8 处字面，修完一处下一处接着红。现两处夹具一律经新增的「行尾真相源」拼装——`s1_cat` 的期望值与写入文件的 `IN_TXT` 同源（`type` 不补行尾），echo 类断言一律经 `echo_out`（cmd 的 `echo` 恒补 CRLF）；大文件夹具（10MiB）显式 `timeoutMs: 40000`，避免 `cmd /c type` 在慢机器上让 30s 缺省先到、把「输出超限」误呈为「超时」。生产代码未改。
 
 ## v0.1.78

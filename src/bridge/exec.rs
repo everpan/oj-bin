@@ -1149,6 +1149,58 @@ mod tests {
         assert_eq!(b, vec![("w".to_string(), "hi".to_string())]);
     }
 
+    /// Windows 夹具模板表的「恰一命中」契约——**平台无关**（unix 上也跑）。
+    ///
+    /// 动机：Windows 夹具在本机既编不到也跑不了，v0.1.79 上连续两次由 CI
+    /// 打脸（先是 `%${raw:NAME}%` 在解析期失败，修好后又撞上「裸 raw 与
+    /// `%…%` 包裹 raw 同位置 → 恒歧义」）。故直接对真夹具表
+    /// [`WIN_TEMPLATES`] 断言，把这类缺陷挡在 unix 面。
+    #[test]
+    fn windows_fixture_templates_are_unambiguous() {
+        let ts: Vec<ExecTemplate> = WIN_TEMPLATES
+            .iter()
+            .map(|s| parse_template(s).unwrap_or_else(|e| panic!("{s}: {e}")))
+            .collect();
+        // 各场景的 argv 形态（S1/SS1、SS7、SS8、S4、s1_cat、S7、S6/SS2、
+        // S9、S3）在夹具里都恰命中 1 条。
+        for argv in [
+            vec!["cmd", "/c", "echo", "hello"],
+            vec!["cmd", "/c", "echo", "x"],
+            vec!["cmd", "/c", "echo", "compat"],
+            vec!["cmd", "/c", "echo", "%OJ_EXEC_TEST_ON%"],
+            vec!["cmd", "/c", "type", "C:\\jail\\in.txt"],
+            vec!["cmd", "/c", "exit", "3"],
+            vec!["ping", "-n", "31", "127.0.0.1"],
+            vec!["oj", "/c", "echo", "ping"],
+            vec!["sh", "-c", "script"],
+        ] {
+            let a = sargv(&argv);
+            let got = match_all(&ts, &a);
+            assert!(
+                got.is_ok(),
+                "argv {argv:?} 在夹具里未恰命中 1 条模板: {got:?}"
+            );
+        }
+        // 反例钉死本次踩到的语义：同一位置的裸 raw 与 `%…%` 包裹 raw 天然
+        // 重叠——`%X%` 形态恒 2 命中（ambiguous），非 `%…%` 形态只命中裸 raw。
+        let overlapping = vec![p("cmd /c echo ${raw:word}"), p("cmd /c echo %${raw:NAME}%")];
+        assert_eq!(
+            match_all(&overlapping, &sargv(&["cmd", "/c", "echo", "%VAR%"])),
+            Err(MatchError::Ambiguous { count: 2 })
+        );
+        let (i, b) = match_all(&overlapping, &sargv(&["cmd", "/c", "echo", "hi"])).unwrap();
+        assert_eq!(i, 0);
+        assert_eq!(b, vec![("word".to_string(), "hi".to_string())]);
+        // 包裹 raw 的校验作用在**中间子串**上：`%…%` 内的 option-like /
+        // 绝对形态仍被拒（Windows 面删掉裸 echo 模板后，该覆盖只在此处）。
+        let t = p("cmd /c echo %${raw:NAME}%");
+        for bad in ["-x", "/abs", "C:\\x"] {
+            let a = sargv(&["cmd", "/c", "echo", &format!("%{bad}%")]);
+            let e = match_template(&t, &a).unwrap_err();
+            assert!(e.contains("${raw:NAME} rejects"), "{bad} -> {e}");
+        }
+    }
+
     // ----- 默认命令解析器（"oj" 特判 / PATH 解析 / 未知名点名） -----
 
     #[test]
@@ -1523,23 +1575,37 @@ export default {
 
     /// worker 模块的模板表（Windows 形态：cmd /c 家族 + ping）。sh -c 条目
     /// 仅供 S3 的 ${raw:} pre-spawn 拒绝——匹配期即拒，"sh" 无需在 Windows 存在。
+    ///
+    /// **平台无关常量**（unix 上也编译）：供
+    /// [`windows_fixture_templates_are_unambiguous`] 直接对**真夹具**做匹配
+    /// 断言。Windows 夹具在本机既编不到也跑不了，只能等 CI 打脸——这类缺陷
+    /// 已反复漏网（v0.1.79 两次），故把「夹具自身不歧义」钉在 unix 也能跑的
+    /// 地方。
+    const WIN_TEMPLATES: &[&str] = &[
+        // `cmd /c echo` 家族刻意每条一个**全字面**模板，而不是一条
+        // `cmd /c echo ${raw:word}`：后者会与 S4 用的 `cmd /c echo
+        // %${raw:NAME}%` 天然重叠（%…% 形态是裸 raw 的子集），任何 `%X%`
+        // argv 都同时命中两条 → 恒报 `exec template ambiguous`（生产语义是
+        // 歧义拒绝、不静默择一）。裸 raw 的覆盖不靠它——`oj /c echo
+        // ${raw:msg}`（resolver 同指 cmd.exe）、`cmd /c exit ${raw:code}`、
+        // `ping -n ${raw:count}`、`sh -c ${raw:script}` 已覆盖正向与负向。
+        "cmd /c echo hello",
+        "cmd /c echo x",
+        "cmd /c echo compat",
+        "cmd /c echo %${raw:NAME}%",
+        "cmd /c type ${path:file}",
+        "cmd /c exit ${raw:code}",
+        "ping -n ${raw:count} 127.0.0.1",
+        "oj /c echo ${raw:msg}",
+        "sh -c ${raw:script}",
+    ];
+
     #[cfg(windows)]
     fn worker_grant_win(env: Vec<String>, resolver: CommandResolver) -> ExecGrant {
         ExecGrant::with_resolver(
             [(
                 "worker".to_string(),
-                (
-                    vec![
-                        "cmd /c echo ${raw:word}".to_string(),
-                        "cmd /c type ${path:file}".to_string(),
-                        "cmd /c echo %${raw:NAME}%".to_string(),
-                        "cmd /c exit ${raw:code}".to_string(),
-                        "ping -n ${raw:count} 127.0.0.1".to_string(),
-                        "oj /c echo ${raw:msg}".to_string(),
-                        "sh -c ${raw:script}".to_string(),
-                    ],
-                    env,
-                ),
+                (WIN_TEMPLATES.iter().map(|s| s.to_string()).collect(), env),
             )]
             .into(),
             resolver,
@@ -2136,11 +2202,7 @@ export default {
         // SS8：向后兼容 exec.run(argv) 无 opts -> 缓冲 {code,stdout}。
         let d = data!("s8_compat");
         assert_eq!(d["code"], 0);
-        assert_eq!(
-            d["out"],
-            "compat
-"
-        );
+        assert_eq!(d["out"], echo_out("compat"));
 
         // SS9：未授权模块 spawn -> NotCapable（fail-closed）。
         denied!("plain", "s9_unauth", "not authorized for exec");

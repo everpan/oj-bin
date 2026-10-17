@@ -1680,10 +1680,16 @@ platform:
   - 占位符名须匹配 `[A-Za-z_][A-Za-z0-9_]*`；未知占位符类型 / 一个 token 含多占位符 /
     未闭合 / 非法名等模板语法错在**调用期** fail-closed 抛
     `exec template parse failed (<raw>): …`（配置面原样保存、解析期报错是设计约定的时点）。
-  - 占位符可带**字面前后缀**（同一 token 内），用于 Windows `cmd /c echo %VAR%` 的 `%…%`
-    变量定界：`cmd /c echo %${raw:NAME}%` 中 `%` 为字面定界符，占位符吸收中间子串 `NAME`，
-    重建时以模板前缀/后缀原样还原为 `%NAME%`；安全不变量不变——占位符仍吸收恰一个 argv
-    token，前后字面量来自受信模板、不引入注入面。
+  - 占位符可带**字面前后缀**（同一 token 内，v0.1.79），用于 Windows `cmd /c echo %VAR%`
+    的 `%…%` 变量定界：`cmd /c echo %${raw:NAME}%` 中 `%` 为字面定界符，占位符吸收中间子串
+    `NAME`，重建时以模板前缀/后缀原样还原为 `%NAME%`；安全不变量不变——占位符仍吸收恰一个
+    argv token，前后字面量来自受信模板、不引入注入面。`${raw:}` 的 option-like / 绝对形态
+    校验作用在**中间子串**上（`%…%` 内填 `-x` / `/abs` 同样被拒）。
+  - **同位置不要既配裸 raw 又配带定界符的 raw**：`cmd /c echo ${raw:word}` 是
+    `cmd /c echo %${raw:NAME}%` 的**超集**，两条并存时任何 `%X%` 形态 argv 都同时命中 →
+    恒报 `exec template ambiguous`（只给命中条数）。要同时支持「echo 任意词」与
+    「echo 环境变量」，就把其中一条写成全字面模板（`cmd /c echo hello`）或换用不同的
+    命令名 / literal 段落错开。
 - **命令解析（模板首 token）**：必须是**裸名**——不接受占位符、不含 `/` `\` 路径分隔符。
   `"oj"` 特判解析为服务进程自身（`current_exe()`，serve 进程即 bin/oj，同版本自保证）；
   其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
@@ -1740,6 +1746,11 @@ WSL / MSYS**：
   （stderr 同文案）。要 UTF-8 输出，把 `chcp 65001` 写进 `cmd /c` 语句
   （`["cmd","/c","chcp 65001 >nul && echo <语句>"]`）——这是 Windows 控制台的既有
   行为，不是 oj 的限制。
+- **`%VAR%` 要用带字面前后缀的占位符**（v0.1.79）：`cmd /c echo %VAR%` 的 `%…%` 是 cmd 的
+  变量定界符、无法拆成独立 token，模板写成 `cmd /c echo %${raw:NAME}%`，JS 侧照旧传
+  `["cmd","/c","echo","%VAR%"]`。**别与 `cmd /c echo ${raw:word}` 并存**——后者是前者的
+  超集，`%X%` 形态 argv 恒判 `exec template ambiguous`；两者要共存就把其一写成全字面
+  模板或换不同命令名。
 
 #### exec 流式形态（v0.1.78）：exec.spawn 句柄 + exec.run 回调
 
