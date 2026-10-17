@@ -1761,11 +1761,16 @@ WSL / MSYS**：
       ["sh", "-c", "for i in 1 2 3; do echo $i; sleep .2; done"],
       { timeoutMs: 30000 },
     );
-    for await (const chunk of h.stdout) log(new TextDecoder().decode(chunk));
+    // 逐块解码多字节文本（含中文）时**复用同一个 decoder 实例**或攒够字节再解：
+    // 每块 new 一个 TextDecoder 会在块边界把 UTF-8 序列切坏 → U+FFFD。
+    const dec = new TextDecoder();
+    for await (const chunk of h.stdout) log(dec.decode(chunk, { stream: true }));
     const code = (await h.exit()).code;   // 信号终止 128+sig（TERM=15 到 143）
     h.kill();                            // 主动整组击杀（unix: kill(-pgid, SIGKILL)）
 
-    // A：回调式（扩展现有）——增量转发，返回 { code }（不缓冲整段，回调即真相源）
+    // A：回调式（扩展现有）——逐块转发给回调，**同时**攒下全量；返回
+    // { code, stdout, stderr }（stdout/stderr 为全量 merge 后的**有损**解码，
+    // 非法 UTF-8 → U+FFFD，不抛；受 10MB 合计上限约束——v0.1.79 订正）
     const r = await exec.run(["sh", "-c", "..."], {
       onStdout: (chunk) => process.stdout.write(chunk),
       onStderr: (chunk) => process.stderr.write(chunk),
@@ -1773,12 +1778,22 @@ WSL / MSYS**：
     });
 
 - **exec.spawn(argv, opts?)** 返回句柄 { rid, pid, stdout, stderr, kill, exit }：h.stdout / h.stderr 为 AsyncIterable<Uint8Array>，EOF 时迭代自然结束；h.exit() 等待子进程退出返回 { code }；h.kill() 主动整组击杀。
-- **exec.run(argv, opts?)** 向后兼容：无 onStdout / onStderr 时，行为、返回形状与 v0.1.75 完全一致（{ code, stdout, stderr }）；带回调时改为增量转发并返回 { code }（不缓冲整段 stdout，回调即真相源，避免与回调语义冲突）。
-- **opts 共用**：timeoutMs?（缺省 30_000，硬上限 600_000，超出钳制）、stdin?（一次性写入后关闭写端）；两形态共用同一套钳制与超时整组击杀语义。
+- **exec.run(argv, opts?)** 向后兼容：无 onStdout / onStderr 时，行为、返回形状与 v0.1.75 完全一致（{ code, stdout, stderr }，非 UTF-8 输出**抛**）；带回调时逐块转发给回调，返回形状**同样是 { code, stdout, stderr }**（v0.1.79 订正：此前文档称「返回 { code }、不缓冲整段」，实现实际是把全部分块攒在内存后 merge，只是解码改走**有损** TextDecoder、非法 UTF-8 变 U+FFFD 而**不抛**）。要真正的逐块流式（不占内存、拿原始字节）请用 `exec.spawn`。
+- **opts 差异**：timeoutMs?（缺省 30_000，硬上限 600_000，超出钳制）两形态共用；**stdin? 只有无回调的 `exec.run` 支持**（一次性写入后关闭写端）——`exec.spawn` 与回调形态的子进程 stdin 恒为 null，传了会被静默丢弃。
 - **背压（重要）**：stdout/stderr 经有界 mpsc（16 槽 x 8KiB）送消费端；JS 不 for await 拉取 到 通道满 到 drain 在 send 上挂起 到 子进程管道满 到 子进程自然暂停（真实子进程语义，正确背压）。不消费流 = 子进程在输出填满管道时阻塞，不是 bug，也别指望 exit() 在流未消费时返回——先消费（或 break）再 exit()。
 - **资源回收（每请求）**：句柄 rid 进 OpState.resource_table；close()（JS 释放 / runtime 归还 / 异常丢弃都覆盖）同步整组击杀子进程，杜绝跨请求/租户泄漏与 next_rid 回绕 panic。drain 任务与子进程同生命周期：handle close 到 kill 到 管道 EOF 到 drain 自然结束。
 - **rid 仅本 runtime 可达**：进程内 ResourceId，跨模块/跨请求无法凭 rid 触达他人会话；kill 只能杀自己 spawn 的会话（无 pid 入参，只接受本会话 rid）。
-- 输出 10MiB 上限、timeoutMs 整组击杀、UTF-8 强制解码、cwd = fs.root、env 空表等硬限制，与缓冲形态完全一致（见上「硬限制」）。
+- cwd = fs.root、env 空表（仅 `env` 白名单透传）、命令解析与全部安全闸门，三形态**完全一致**（见上「硬限制」）。
+- **差异只在「超限时怎么告诉你」**（v0.1.79 订正：此前称「与缓冲形态完全一致」，不准确）：
+
+  | 情形 | 无回调 `exec.run`（缓冲） | `exec.run` 带回调 | `exec.spawn` 流式 |
+  |---|---|---|---|
+  | 输出合计 > 10MiB | **抛** `exec output limit exceeded` | 不抛：整组击杀，`code = 137`，回调收到的块被截断 | 同左（流提前 EOF，`code = 137`） |
+  | `timeoutMs` 到期 | **抛** `exec timed out after N ms` | 不抛：整组击杀，`code = 137` | 同左（`code = 137`） |
+  | 输出非 UTF-8 | **抛** `exec: stdout is not valid UTF-8` | 不抛：`stdout` / `stderr` 为有损解码（U+FFFD） | 不抛：给原始 `Uint8Array`，JS 自行解码 |
+  | 内存占用 | 全量（≤10MiB 封顶） | 全量（≤10MiB 封顶） | 仅当前块（16 槽 × 8KiB 背压） |
+
+  **别用 `try/catch` 的成功当「跑完了」**：回调 / 流式形态下超时与超限不抛错，只把 `code` 打成 137 并截断输出——必须同时校验 `code`，且不要拿被截断的 stdout 当完整结果（安全判定只认原始字节，见上表）。
 
 错误文案速查**（文案以实现为准；「类」= 错误分类，`NotCapable` 为授权面，其余为普通
 Error）：
@@ -1795,9 +1810,9 @@ Error）：
 | `exec template parse failed (<raw>): <e>` | Error | 模板语法错（未知占位符类型 / 未闭合 / 非法名 / 首 token 含路径分隔符等） |
 | `exec: command resolve failed for '<name>': …` | Error | 命令名解析失败（含 `command '<name>' not found in PATH`） |
 | `exec: spawn failed for '<abs>': <e>` | Error | 进程启动失败 |
-| `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀） |
-| `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB |
-| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8（Windows 上本地代码页（GBK / CP1252）输出含非 ASCII 即落此条，见 §6「Windows 平台命令形态」，v0.1.79） |
+| `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀）——**仅无回调的 `exec.run` 抛**；回调 / `exec.spawn` 形态不抛，只把 `code` 打成 137 并截断输出（v0.1.79 订正） |
+| `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB——**仅无回调的 `exec.run` 抛**；回调 / `exec.spawn` 形态同上为 `code = 137` + 截断（v0.1.79 订正） |
+| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8——**仅无回调的 `exec.run` 抛**（Windows 上本地代码页（GBK / CP1252）输出含非 ASCII 即落此条，见 §6「Windows 平台命令形态」，v0.1.79）；回调形态改走有损解码（U+FFFD）、`exec.spawn` 给原始字节，两者均不抛 |
 | `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
 
 ### yaml —— YAML 读写原语（v0.1.75，无特权，始终可用）

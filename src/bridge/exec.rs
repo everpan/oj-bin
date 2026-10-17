@@ -1281,6 +1281,20 @@ export default {
   s9_oj: async () => json.ok(await exec.run(["oj", "ping"])),
   s10_amb: async () => json.ok(await exec.run(["echo", "hi"])),
   s12_badutf8: async () => json.ok(await exec.run(["sh", "-c", "printf '\\200' >&2"])),
+  // 同一条非 UTF-8 输出的另外三种消费形态（钉死「缓冲形态抛、回调/流式形态不抛」
+  // 这条不对称契约——文档 §6 据此订正，见「形态 × 非 UTF-8 行为」表）。
+  s12_badutf8_out: async () => json.ok(await exec.run(["sh", "-c", "printf '\\200'"])),
+  s12_badutf8_cb: async () => {
+    const r = await exec.run(["sh", "-c", "printf '\\200'"], { onStdout: () => {} });
+    return json.ok({ code: r.code, out: r.stdout });
+  },
+  s12_badutf8_spawn: async () => {
+    const h = await exec.spawn(["sh", "-c", "printf '\\200'"]);
+    const bytes = [];
+    for await (const c of h.stdout) bytes.push(...c);
+    const { code } = await h.exit();
+    return json.ok({ code, n: bytes.length, first: bytes[0] });
+  },
 };
 "#
         .replace("__JAIL__", &js_path(jail))
@@ -1491,6 +1505,43 @@ export default {
                 .unwrap_err();
             let m = e.to_string();
             assert!(m.contains("stderr") && m.contains("UTF-8"), "{m}");
+        }
+        // S12 续：同一条非 UTF-8 输出的其它三种形态——**只有缓冲形态抛**。
+        // 缓冲形态（stdout 侧，补 s12_badutf8 未覆盖的 stdout）：抛点名。
+        {
+            let e = b
+                .run_module(&api("worker"), "s12_badutf8_out", Default::default(), t)
+                .await
+                .unwrap_err();
+            let m = e.to_string();
+            assert!(m.contains("stdout") && m.contains("UTF-8"), "{m}");
+        }
+        // 回调形态：不抛，返回 { code, stdout }，stdout 为**有损**解码（U+FFFD）。
+        {
+            let cap = b
+                .run_module(&api("worker"), "s12_badutf8_cb", Default::default(), t)
+                .await
+                .expect("callback form must not throw on non-UTF-8");
+            let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{v}");
+            let out = v["data"]["out"]
+                .as_str()
+                .expect("callback form 仍返回 stdout");
+            assert!(
+                out.contains('\u{FFFD}'),
+                "回调形态应为有损解码（U+FFFD），实际: {out:?}"
+            );
+        }
+        // spawn 流式形态：不抛，给原始字节（0x80），由 JS 自行解码。
+        {
+            let cap = b
+                .run_module(&api("worker"), "s12_badutf8_spawn", Default::default(), t)
+                .await
+                .expect("spawn form must not throw on non-UTF-8");
+            let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{v}");
+            assert_eq!(v["data"]["n"], 1, "{v}");
+            assert_eq!(v["data"]["first"], 0x80, "流式形态必须给原始字节: {v}");
         }
 
         // S8：非特权模块（plain 不在 exec 授权表）→ NotCapable。

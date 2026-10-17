@@ -891,6 +891,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `strip_verbatim` 是**纯字符串函数**，此前只被下面的 `#[cfg(windows)]` 用例
+    /// 覆盖（本机编不到也跑不了）。这里补一组平台无关断言：unix 上也编译运行，
+    /// 让该函数的语义不再只能靠 Windows CI 兜底。
+    ///
+    /// 已知缺口（登记项，本次不改）：UNC 形态 `\\?\UNC\server\share` 现实现剥成
+    /// `UNC\server\share`（错误语义）——网络盘 / UNC 部署场景才遇得到，属生产行为
+    /// 变更，需独立 spec（见 docs/plans/2026-10-18-exec-template-ambiguity-fixture-fix.md
+    /// 的复查登记节）。
+    #[test]
+    fn strip_verbatim_is_prefix_only_and_platform_agnostic() {
+        // 剥 verbatim 前缀（`\\?\`）。
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+        // 无前缀 / unix 形态 → 原样返回。
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\a\b")),
+            PathBuf::from(r"C:\a\b")
+        );
+        assert_eq!(strip_verbatim(Path::new("/tmp/a")), PathBuf::from("/tmp/a"));
+        // 幂等：只剥一层，剥过之后再调用不变（不递归剥、不剥中段）。
+        let once = strip_verbatim(Path::new(r"\\?\C:\a"));
+        assert_eq!(once, PathBuf::from(r"C:\a"));
+        assert_eq!(strip_verbatim(&once), once);
+    }
+
     /// 回归（Windows）：`canonicalize` 给 referrer 目录加 `\\?\` 前缀，而
     /// `ModuleSpecifier::to_file_path` 还原时剥掉——同一条长名路径仅差此前缀。
     /// `module_root_of` 此前用词法 `starts_with`，前缀不一致即误判「未找到模块根」

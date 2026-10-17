@@ -270,7 +270,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |
 | Windows 上 `exec.run(["sh","-c",...])` 必败（`command resolve failed`） | Windows 无 `sh` 可执行、且不自动探测 Git Bash——跨平台模板别写 `sh -c`，改用 `cmd /c`：`["cmd","/c","echo","hello"]` / `["cmd","/c","type","__JAIL__/in.txt"]`；`cmd` 由 resolver 解析为绝对路径（如 `C:\Windows\System32\cmd.exe`）后 spawn（v0.1.75 既有行为，文档补全） |
 | Windows 上 exec 输出比对总差一个 `\r` | `cmd /c echo` 恒以 CRLF 收尾、`cmd /c type` 原样吐文件字节（不补行尾），oj **不做** CRLF→LF 归一（与 `Deno.Command.output` / Node 同口径）——跨平台文本比对用 `trimEnd()` / `split(/\r?\n/)`，别写死 `"\n"`（v0.1.79） |
-| Windows 上 exec 跑输出中文的命令报 `not valid UTF-8` | 子进程输出是本地代码页（GBK / CP1252），exec 强制 UTF-8 解码 → 抛 `exec: stdout is not valid UTF-8`；把 `chcp 65001` 写进 `cmd /c` 语句（v0.1.79） |
+| Windows 上 exec 跑输出中文的命令报 `not valid UTF-8` | 子进程输出是本地代码页（GBK / CP1252），exec 强制 UTF-8 解码 → 抛 `exec: stdout is not valid UTF-8`；把 `chcp 65001` 写进 `cmd /c` 语句。**只有无回调的 `exec.run` 会抛**：带 `onStdout`/`onStderr` 的回调形态改走有损解码（U+FFFD）、`exec.spawn` 给原始字节，都不抛（v0.1.79 订正） |
 | Windows 上 `cmd /c echo` 同时配了 `${raw:word}` 和 `%${raw:NAME}%`，`echo %VAR%` 恒报 `exec template ambiguous` | 同一位置的**裸 raw 是 `%…%` 包裹 raw 的超集**：`%X%` 形态 argv 同时命中两条 → 歧义拒绝（不静默择一，报错只给命中条数不给模板原文）。错开办法：其中一条写成全字面模板（`cmd /c echo hello`），或换不同命令名 / 不同 literal 段落（v0.1.79） |
 | 安装器靠 `oj migrate --format json` 的 JSON 解析成功就当迁移成功 | json `error` 字段已脱敏（`<scheme>://***@host`，不漏密码），但**退出码**才是成败真源：任一模块失败 json 仍成功解析、只是 `results[]` 里 `ok=false` 且进程退非 0——安装器必须校验 exit code，不能只 `JSON.parse` 成功 |
 | 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
@@ -279,8 +279,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `http.module` 是 `null`，`http.module.name` 直接 TypeError | 按 handler 文件所在目录判定（非请求来源）：任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期无模块上下文——先判 `null`（与 `http.user` 匿名同款）；页面 meta 合成派发在模块目录内**有值**（v0.1.76） |
 | 把 `http.module.version` 回显给外部客户端 | version 是指纹面——日志/内部打点用即可，勿进响应体/错误消息外发给客户端（v0.1.76） |
 | `exec.spawn` 后不 `for await` 消费，子进程卡住不退 | 真实子进程背压：stdout 经有界 mpsc（16 槽 × 8KiB）送达，JS 不拉取 → 通道满 → drain 在 send 挂起 → 子进程管道满 → 子进程自然暂停。不是 bug；先消费（或 break）再 `h.exit()` 才会返回（v0.1.78） |
-| `exec.run` 带 `onStdout`/`onStderr` 回调后还想要整段 stdout | 回调形态**不缓冲**整段输出，只回 `{ code }`——整段需自己累计回调里的 chunk；要整段用无回调的 `exec.run`（返回 `{ code, stdout, stderr }`）（v0.1.78） |
+| `exec.run` 带 `onStdout`/`onStderr` 回调后还想要整段 stdout | 回调形态**其实也缓冲**（v0.1.79 订正：实现把全部分块攒在内存后 merge，返回 `{ code, stdout, stderr }`，只是解码为**有损**、非 UTF-8 不抛）——真正不占内存、拿原始字节的是 `exec.spawn` 逐块消费；用回调形态仍受 10MB 合计上限约束 |
 | 拿 `exec.spawn` 的 `rid` 去 kill 别人的进程 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；`kill` 只杀自己 spawn 的会话，无 pid 入参，跨模块 / 跨请求不可达（v0.1.78） |
+| `exec.run` 带回调 / `exec.spawn` 时超时或输出超限却没抛错，以为跑成功了 | **只有无回调的缓冲形态抛** `exec timed out` / `output limit exceeded`；回调与流式形态是整组击杀后把 `code` 打成 **137** 并截断输出（不抛）。别用 `try/catch` 判成功——必须同时校验 `code`，且别把截断的 stdout 当完整结果（v0.1.79） |
 
 ## 手册
 

@@ -60,6 +60,11 @@ Windows 夹具是 unix 夹具的复制品，而「echo 输出行尾」这条**�
 - 工程师（review-engineer）：已到齐；逐条核对各 scenario 的 Windows 语义，指出 10MiB
   `type` 与 30s 缺省超时窗的条件性第 3 红（→ 已做 `timeoutMs`），并指出 SS2 的本地化
   ping 输出是「非 UTF-8」登记项的真实引爆位。
+  **2026-10-18 订正**：这条判断不成立——SS2 带 `onStdout`，走 `runExecStreaming`
+  （bootstrap.js:255-284）逐块转发 + **有损**解码，非 UTF-8 不抛。真正强制 UTF-8 并抛错的
+  只有**无回调的缓冲形态**（`exec.rs:877 String::from_utf8`），Windows 面仅 `s6_timeout`
+  属此形态，而它在超时分支（`:861`）直接返回、不解码。完整口径见
+  `2026-10-18-exec-streaming-contract-audit.md`。
 - 架构师（review-architect）：已到齐；否掉夹具合并式参数化，定「真相源 = 平台适配函数」
   而非裸常量，定生产侧不做行尾归一。
 - 产品（review-product）：已到齐；定文档另起、不混进测试修复，给出 devkit 四件具体落点；
