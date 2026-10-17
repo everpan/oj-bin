@@ -397,20 +397,26 @@ mod tests {
         std::fs::create_dir_all(base.join("plat")).unwrap();
         let cfg_path = trusted_dir.join("config.yaml");
         let out_path = trusted_dir.join("out.txt");
+        // canonicalized 路径（Windows 上为 verbatim `\\?\C:\...`）嵌 JS 前必须把
+        // 反斜杠转义成 `\\`：JS 双引号串字面量会把 `\r` 当 CR、`\U` 当 U……路径被毁
+        // 成含控制字符的相对路径，落回 jail 内骗过门面，再被 deno_permissions 拒掉
+        // （dunce 不肯剥含控制字符路径的 verbatim 前缀，与已剥前缀的 allow 根失配）。
+        // 不可像 fs_escape_root_denied 那样换正斜杠——verbatim 前缀 `\\?\` 只认反斜杠，
+        // `//?/` 形态连文件都打不开。unix 路径无反斜杠，本替换为 no-op。
+        let cfg_js = cfg_path.display().to_string().replace('\\', "\\\\");
+        let out_js = out_path.display().to_string().replace('\\', "\\\\");
         std::fs::write(
             base.join("plat/api.js"),
             format!(
                 "export async function readTrusted() {{\n\
-                 \x20 const t = await fs.readTextFile(\"{cfg}\");\n\
+                 \x20 const t = await fs.readTextFile(\"{cfg_js}\");\n\
                  \x20 json.ok({{ t }});\n\
                  }}\n\
                  export async function writeTrusted() {{\n\
-                 \x20 await fs.writeTextFile(\"{out}\", \"hi\");\n\
+                 \x20 await fs.writeTextFile(\"{out_js}\", \"hi\");\n\
                  \x20 json.ok({{ done: true }});\n\
                  }}\n\
                  export default {{ readTrusted, writeTrusted }};\n",
-                cfg = cfg_path.display(),
-                out = out_path.display(),
             ),
         )
         .unwrap();
@@ -458,15 +464,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "hi");
 
         // ② 非特权（run_with 无模块归属）：同一路径两态皆拒（门面 NotCapable）。
+        //    路径同样走转义后的形态：不转义时 Windows 上被毁的路径虽也逃不过拒绝，
+        //    但拦住它的是 deno_permissions（含 CR 的 verbatim 前缀剥不掉）而非门面，
+        //    断言会绿色地测不到想测的那层。
         for code in [
-            format!(
-                r#"(async () => {{ await fs.readTextFile("{}"); }})();"#,
-                cfg_path.display()
-            ),
-            format!(
-                r#"(async () => {{ await fs.writeTextFile("{}", "x"); }})();"#,
-                out_path.display()
-            ),
+            format!(r#"(async () => {{ await fs.readTextFile("{cfg_js}"); }})();"#,),
+            format!(r#"(async () => {{ await fs.writeTextFile("{out_js}", "x"); }})();"#,),
         ] {
             let e = b.run_with(&code, Default::default()).await.unwrap_err();
             assert!(e.to_string().contains("NotCapable"), "{code} -> {e}");

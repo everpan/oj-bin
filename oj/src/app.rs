@@ -2363,13 +2363,18 @@ mod tests {
             .unwrap();
         }
         let cfg_path = dir.join("config.yaml");
+        // Windows canonicalize 得 verbatim `\\?\C:\...`：反斜杠进 JS 双引号串字面量
+        // 会被当转义吃掉（`\r`→CR、`\U`→U……），路径被毁成相对路径落回 jail 内，
+        // 再被 deno_permissions 拒掉（毁错的路径含 CR 控制字符，dunce 不肯剥
+        // verbatim 前缀，与已剥前缀的 allow 根比对失配 → NotCapable）。嵌入 JS
+        // 前先把 `\` 转义成 `\\`（unix 路径无反斜杠，no-op）。
+        let cfg_js = cfg_path.display().to_string().replace('\\', "\\\\");
         let api_js = format!(
             "export async function readCfg() {{\n\
-             \x20 const t = await fs.readTextFile(\"{}\");\n\
+             \x20 const t = await fs.readTextFile(\"{cfg_js}\");\n\
              \x20 json.ok({{ t }});\n\
              }}\n\
              export default {{ readCfg }};\n",
-            cfg_path.display()
         );
         std::fs::write(dir.join("src/plain/api.js"), &api_js).unwrap();
         std::fs::write(dir.join("platform-modules/inst/api.js"), &api_js).unwrap();
