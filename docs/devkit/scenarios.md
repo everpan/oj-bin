@@ -36,6 +36,11 @@
 | [33](#场景-33特权模块受控挂载最小配置platformv0175) | 平台特权模块最小配置：`platform:` 段 + `mounts[].api` 条目 + 特权 fs 读 trusted 文件 + `exec` 授权（v0.1.75；fail-closed，装配期抢注防护） | §6 fs / §6 exec / §10 platform |
 | [34](#场景-34tar-解压安全落位exectar-三步范式v0175) | 用 `exec.run` 跑系统 tar 安全解压发行包：`-tzf` 预检 + 成员名复检 → 解压到 `.staging` → 解压后 walk 校验（symlink 零容忍 + 体积对账）→ 原子落位（v0.1.75；argv 模板白名单，无 shell） | §6 exec / §10 platform |
 | [35](#场景-35解决方案市场模块安装闭环v0175) | 市场模块安装端到端闭环：`fetch` 下载 → `sha256Hex` 比对 → `verifyEd25519` 验签 → `exec.run` tar 解压 → `yaml.parse` 读 manifest → `platform.trusted_paths` 文本手术回写 config → `exec.run` `oj migrate --format json` → `server.reloadConfig` 热更（v0.1.75；各步 fail-closed） | §6 fetch / §6 crypto / §6 exec / §6 yaml / §6 server / §10 platform |
+| [36](#sc36) | 按模块版本做观测打点与兼容分支——`http.module` 提供 `{name, version}` 只读身份（v0.1.76） | §6 http |
+| [37](#sc37) | 远程分发 dist 根挂载：`mounts[].api` 填 `http(s)://` URL + `sha256` 完整性锚（v0.1.77） | §10 配置 / §12 运维 |
+| [38](#sc38) | 用 `oj build --bundle` 打出整站 dist 根 tarball 并打印 sha256，供远程挂载校验（v0.1.77） | §11 `oj build` |
+| [39](#sc39) | 实时日志流式消费：`exec.spawn` 句柄（`for await` stdout/stderr）/ `exec.run` onStdout/onStderr 回调（v0.1.78） | §6 exec |
+| [40](#sc40) | 长任务中途 kill：`exec.run` 超时整组击杀 / `exec.spawn().kill()` 主动击杀（v0.1.78） | §6 exec |
 
 ---
 
@@ -2728,3 +2733,208 @@ curl -s http://localhost:9778/v1/api/<module>/diag/whoami/
 | 写 `http.module.name = "x"` 抛 `TypeError: Cannot assign to read only property` | 预期：模块身份是框架授信依据（归属守卫/bound_db/平台特权）故冻结；strict 下写/delete 抛错，`require()` 的 CJS 代码写它静默无效——只读用即可 |
 | dev 与 release 版本不一致 | 改了 `src/<m>/manifest.yaml` 的 version 但没 `oj build`——release 装配期校验 manifest version == 目录后缀，不一致（stale/手改 dist）启动即 fail-fast；重新 `oj build` 即可 |
 | 拿 version 做 A/B 分流 | 版本分流在 `manifests.yaml` 锁与挂载层（同 pattern 多版本竞争由锁裁决）；handler 内按自身 version 分支只适合观测打点与兼容分支，别当分流机制用 |
+## 场景 37：远程分发 dist 根挂载（URL + sha256 完整性锚，v0.1.77）
+
+把构建产物发到 CDN / 对象存储，serve 端用 `mounts[].api` 指向 tarball URL + 声明 `sha256`，
+启动即拉取、校验、解压到内容寻址缓存并以 release 语义服务——适合多实例共享同一份构建物、
+或边缘节点零本地构建分发。
+
+### ① 配置（config.yaml，路径相对 config 目录）
+
+```yaml
+mounts:
+  - prefix: '/v1/api'
+    api: 'https://cdn.example.com/myapp/dist.tgz'   # 整站 dist 根 tarball
+    sha256: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'  # 64 hex，必填
+    cache: '.oj-cache'                                # 可选；绝对路径原样用
+  - prefix: '/'
+    web: 'public'
+```
+
+### ② 发布侧（先构建，再打成可分发根包）
+
+```bash
+./bin/oj build -d src -o dist
+./bin/oj build --bundle -d src -o /tmp/sd     # 产出 /tmp/sd/sd.tgz
+# 把 sd.tgz 传到 https://cdn.example.com/myapp/dist.tgz，并把其 sha256 填进上面的 config
+```
+
+### ③ 验证
+
+```bash
+./bin/oj serve -c config.yaml
+curl -s http://localhost:9778/v1/api/user/account/?id=1     # 与本地 dist 行为一致
+# 改坏 config 里的 sha256 → 重启即拒启（sha256 mismatch），不会静默用错版本
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 漏填 `sha256` 启动报 `URL api requires sha256 integrity anchor` | 远程挂载**必须**声明 64 hex 完整性锚（v0.1.77）；不声明就拒启，不会「信任」任何 CDN |
+| 启动报 `sha256 mismatch` | 下载内容与声明不符——CDN 漂移 / 被篡改 / 缓存损坏；重新 `oj build --bundle` 核对 sha256 |
+| 报 `dist root missing manifests.yaml` / `extraction rejected` | dist 根须含 `manifests.yaml`；条目带符号链接 / tar-slip / 特殊文件会被解压器 fail-fast 拒启（发布前先本地 `oj build` 验证） |
+| 把 per-module `*.tgz` 当远程源 | `--bundle` 打的是「整站 dist 根」空前缀包，解压即 dist 根；单模块 `*.tgz` 根里是版本目录，不是合法 dist 根 |
+
+## 场景 38：用 `oj build --bundle` 产出可校验分发包（v0.1.77）
+
+CI 里构建后顺手打一个「整站 dist 根」tarball 并打印 sha256，把 sha256 随部署清单固定，
+下游 serve 用 `mounts[].api` 拉取即获内容寻址 + 完整性校验，无需信任传输通道。
+
+### ① CI 片段（bash）
+
+```bash
+./bin/oj build -d src -o dist
+./bin/oj build --bundle -d src -o artifacts
+# 上一行打印：oj build --bundle: wrote artifacts/<name>.tgz (sha256 <hex>)
+# 把 <hex> 写进部署配置 / 镜像标签 / 审计记录
+```
+
+### ② 验证
+
+```bash
+mkdir -p /tmp/verify && tar xzf artifacts/<name>.tgz -C /tmp/verify
+ls /tmp/verify/manifests.yaml /tmp/verify/*/api.js     # 空前缀：解压即 dist 根
+```
+
+### ③ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `--bundle` 报 `manifest not found` | 先 `oj build` 生成 `dist/manifests.yaml`，`--bundle` 依赖它 |
+| 解压后根不对（多一层目录） | `--bundle` 是空前缀 tarball（等价 `tar czf app.tgz -C dist .`）；若用 `tar czf x.tgz dist` 会多一层 `dist/`，解压落 `<cache>/<sha256>/dist/...` 而非合法 dist 根 |
+| 想校验但不想远程挂载 | `--bundle` 的 sha256 也可用于自有发布校验 / 审计，不一定非要配 `mounts[].api` |
+
+## 场景 39：实时日志流式消费（exec.spawn 句柄 / exec.run 回调，v0.1.78）
+
+**什么时候用**：你跑一个会边跑边吐日志的外部命令（构建、ffmpeg、数据导入、长导出），想在前端 / 调用方实时看到进度，而不是等它跑完才一次性拿到整段 stdout。v0.1.78 在 `exec.run` 之上新增流式形态，两种形态复用同一套安全闸门（argv 模板白名单、路径占位符、整组击杀），无第二套读循环、不新增命令构造面：
+
+- **B `exec.spawn(argv, opts)`** 返回句柄，stdout/stderr 是 `AsyncIterable<Uint8Array>`，可 `for await` 逐块消费；
+- **A `exec.run(argv, opts)`** 扩展 `onStdout` / `onStderr` 回调，增量转发、返回 `{ code }`。
+
+### ① 配置（在场景 33 / 34 的基础上给命令加模板）
+
+```yaml
+platform:
+  modules:
+    - installer
+  trusted_paths:
+    - ./scripts
+  exec:
+    installer:
+      allow:
+        - "sh -c ${raw:cmd}"
+        - "ffmpeg -i ${path:src} -f null -"
+```
+
+### ② handler（exec.spawn 句柄：实时透传并累计字节）
+
+```ts
+export async function post() {
+  const h = await exec.spawn(
+    ["sh", "-c", "for i in 1 2 3 4 5; do echo progress $i; sleep .2; done"],
+  );
+  let bytes = 0;
+  for await (const chunk of h.stdout) {
+    bytes += chunk.length;
+    process.stdout.write(chunk);        // 实时透传
+  }
+  const { code } = await h.exit();      // 等待整组退出，取返回码
+  return json.ok({ code, bytes });
+}
+```
+
+### ③ handler（exec.run 回调：增量转发，返回 { code }）
+
+```ts
+export async function post() {
+  const r = await exec.run(
+    ["sh", "-c", "for i in 1 2 3; do echo $i; sleep .2; done"],
+    {
+      onStdout: (chunk) => process.stdout.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+      timeoutMs: 5000,
+    },
+  );
+  // 回调形态不缓冲整段 stdout，r 只含 { code } —— 回调即真相源
+  return json.ok({ code: r.code });
+}
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 不 `for await` 消费，子进程却卡住不退出 | 真实子进程背压：stdout 经有界 mpsc（16 槽 × 8KiB）送达，JS 不拉取 → 通道满 → drain 在 send 挂起 → 子进程管道满 → 子进程自然暂停。不是 bug；先消费（或 break）再 `h.exit()` 才会返回 |
+| 回调形态想要整段 stdout | `exec.run` 带 `onStdout` / `onStderr` 时**不缓冲**整段输出，只回 `{ code }`；整段需自己累计回调里的 chunk |
+| rid 跨请求 / 跨模块共享 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；只有自己 spawn 的会话能把 rid 传给 `kill`，跨模块 / 跨请求不可达 |
+| 忘了 `exit()` 也能回收 | 句柄 close（JS 释放 / runtime 归还 / 异常丢弃）会同步整组击杀子进程，不会泄漏；但显式 `await h.exit()` 才能拿到退出码 |
+| 输出二进制 | exec 强制 UTF-8 解码，非 UTF-8 输出直接抛 `exec: stdout is not valid UTF-8` |
+
+## 场景 40：长任务中途 kill（超时整组击杀 / 主动 kill，v0.1.78）
+
+**什么时候用**：跑一个可能失控的外部命令（网络拉取、无限重试、超大导出），需要在超时或业务条件满足时**中途整组击杀**，而不是干等它自然结束；或要在拿到足够输出后主动终止。两种形态都支持：
+
+- `exec.run(..., { timeoutMs })`：超时到期由框架整组击杀（unix SIGKILL），抛出 `exec timed out after <N> ms (process group killed)`；
+- `exec.spawn(...).kill()`：主动整组击杀。
+
+### ① 配置（同上，给命令加模板）
+
+```yaml
+platform:
+  modules: [ installer ]
+  trusted_paths: [ ./scripts ]
+  exec:
+    installer:
+      allow:
+        - "sh -c ${raw:cmd}"
+```
+
+### ② handler（exec.run 超时整组击杀）
+
+```ts
+export async function post() {
+  try {
+    await exec.run(
+      ["sh", "-c", "i=0; while true; do echo tick $i; i=$((i+1)); sleep 1; done"],
+      { timeoutMs: 2000 },
+    );
+    return json.ok({ killed: false });
+  } catch (e) {
+    // exec timed out after 2000 ms (process group killed)
+    return json.ok({ killed: true, err: String(e) });
+  }
+}
+```
+
+### ③ handler（exec.spawn 主动 kill + 中途拿输出）
+
+```ts
+export async function post() {
+  const h = await exec.spawn(
+    ["sh", "-c", "i=0; while true; do echo tick $i; i=$((i+1)); sleep 1; done"],
+  );
+  const dec = new TextDecoder();
+  let got = "";
+  for await (const chunk of h.stdout) {
+    got += dec.decode(chunk);
+    if (got.includes("tick 2")) {     // 业务条件满足：拿到第 3 个 tick 就停
+      h.kill();                       // 主动整组击杀
+      break;
+    }
+  }
+  const { code } = await h.exit();    // 主动 kill 在 unix 上返回 128+9 = 137
+  return json.ok({ code, got });
+}
+```
+
+### ④ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `exec.run` 超时后没有返回码 | 超时形态直接**抛错**（`exec timed out after <N> ms (process group killed)`），不是返回 `{ code: 137 }`；捕获异常即可 |
+| kill 之后 `exit()` 拿到的码 | 主动 kill（unix SIGKILL）整组，退出码 = `128 + 9 = 137`；超时被框架 kill 同理 |
+| 只 kill 没消费，`exit` 不返回 | 同场景 39 背压：先 break 退出 `for await`，再 `await h.exit()` |
+| 误以为能杀别人的进程 | rid 仅本 runtime 可达；`kill` 只杀自己 spawn 的会话，无 pid 入参 |
+| `timeoutMs` 想设很大 | 硬上限 600_000（10 分钟），超出被钳制；信号 kill 整组包含其子孙，避免僵尸 |
+

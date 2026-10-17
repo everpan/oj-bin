@@ -110,6 +110,11 @@ import {
   op_ws_room_size,
   op_fs_resolve,
   op_exec_run,
+  op_exec_spawn,
+  op_exec_read,
+  op_exec_kill,
+  op_exec_exit,
+  op_close,
   op_yaml_parse,
   op_yaml_stringify,
   op_server_reload_config,
@@ -206,8 +211,86 @@ globalThis.fs = {
 // defaults to 30s, hard cap 600s (larger values are clamped). A process that
 // runs to exit (ANY code) resolves {code, stdout, stderr} (signal death maps
 // to 128+signal); authorization/template/timeout/limit/spawn failures throw.
+// ----- exec: external command execution (ojm batch) -----
+// Two shapes (design doc 2026-10-17-exec-streaming-design.md):
+//  - exec.run(argv, opts?)     buffered: returns { code, stdout, stderr } when no
+//                              onStdout/onStderr; when opts carries onStdout/
+//                              onStderr, streams each chunk to the callback and
+//                              resolves to { code, stdout, stderr }.
+//  - exec.spawn(argv, opts?)   handle: { rid, pid, stdout, stderr, kill, exit };
+//                              stdout/stderr are AsyncIterable<Uint8Array>.
+// CONTRACT: the AsyncIterable streams MUST be fully consumed (for-await) or
+// backpressure blocks the child (bounded pipe, 16*8KiB). The buffered/callback
+// forms drain both streams concurrently so they never deadlock.
+
+async function spawnExec(argv, opts) {
+  const o = await op_exec_spawn(argv, opts === undefined ? null : opts);
+  const mkStream = (rid) => {
+    return (async function* () {
+      try {
+        while (true) {
+          const chunk = await op_exec_read(rid, 65536);
+          if (chunk.byteLength === 0) break;
+          yield chunk;
+        }
+      } finally {
+        op_close(rid);
+      }
+    })();
+  };
+  return {
+    rid: o.rid,
+    pid: o.pid,
+    stdout: mkStream(o.stdout_rid),
+    stderr: mkStream(o.stderr_rid),
+    kill: () => op_exec_kill(o.rid),
+    exit: async () => {
+      const r = await op_exec_exit(o.rid);
+      op_close(o.rid);
+      return r;
+    },
+  };
+}
+
+async function runExecStreaming(argv, opts) {
+  const h = await spawnExec(argv, opts);
+  const dec = new TextDecoder();
+  const outBuf = [];
+  const errBuf = [];
+  const sink = (stream, buf, cb) => {
+    return (async () => {
+      for await (const chunk of stream) {
+        buf.push(chunk);
+        if (cb) cb(chunk);
+      }
+    })();
+  };
+  const t1 = sink(h.stdout, outBuf, opts.onStdout);
+  const t2 = sink(h.stderr, errBuf, opts.onStderr);
+  const r = await h.exit();
+  await Promise.all([t1, t2]);
+  const merge = (parts) => {
+    let len = 0;
+    for (const p of parts) len += p.byteLength;
+    const u = new Uint8Array(len);
+    let off = 0;
+    for (const p of parts) {
+      u.set(p, off);
+      off += p.byteLength;
+    }
+    return dec.decode(u);
+  };
+  return { code: r.code, stdout: merge(outBuf), stderr: merge(errBuf) };
+}
+
 globalThis.exec = {
-  run: (argv, opts) => op_exec_run(argv, opts === undefined ? null : opts),
+  run: (argv, opts) => {
+    if (opts && (opts.onStdout || opts.onStderr)) {
+      return runExecStreaming(argv, opts);
+    }
+    return op_exec_run(argv, opts === undefined ? null : opts);
+  },
+  spawn: (argv, opts) => spawnExec(argv, opts),
 };
 
 // ----- yaml: bounded parse / stringify (ojm batch) -----

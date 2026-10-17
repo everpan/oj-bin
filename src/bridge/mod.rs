@@ -488,6 +488,10 @@ deno_core::extension!(
         generic_axis::op_axis_call,
         fs::op_fs_resolve,
         exec::op_exec_run,
+        exec::op_exec_spawn,
+        exec::op_exec_read,
+        exec::op_exec_kill,
+        exec::op_exec_exit,
         yaml::op_yaml_parse,
         yaml::op_yaml_stringify,
         reload_bridge::op_server_reload_config,
@@ -906,6 +910,18 @@ impl Bridge {
                 stable.platform.as_deref(),
                 module.map(|c| c.name.as_str()),
             ));
+            // 资源回收门禁（评审 CRITICAL，v0.1.78）：借出重置时兜底清空 ResourceTable，
+            // 防御 runtime 被异常路径丢弃未走 checkin 的情形；覆盖 ExecHandleResource::close
+            // 同步 kill_tree，杜绝跨请求/租户泄漏子进程/句柄 + next_rid 回绕 panic。
+            {
+                let rids: Vec<deno_core::ResourceId> =
+                    g.resource_table.names().map(|(rid, _)| rid).collect();
+                for rid in rids {
+                    if let Ok(resource) = g.resource_table.take_any(rid) {
+                        resource.close();
+                    }
+                }
+            }
         }
         Ok(rt)
     }

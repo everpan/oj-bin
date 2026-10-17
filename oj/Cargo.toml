@@ -1,6 +1,6 @@
 [package]
 name = "oj"
-version = "0.1.77"
+version = "0.1.78"
 edition = "2024"
 authors = ["everpan <unix@vip.qq.com>"]
 
@@ -20,7 +20,7 @@ flate2 = "1"
 # URL api mount（v0.1.77）：装配期拉取 dist 根 tarball + sha256 校验 + 内容寻址缓存。
 # 由 [dev-dependencies] 提升为发行依赖（mount_fetch 跑在生产 serve 路径）；
 # json feature 仅测试用到，保留以兼容 e2e。
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json", "stream"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 # 测试框架（L1）：进程内 dispatch + 真实 deno_core 运行时内跑 TS 用例。
 axum = { version = "0.8", features = ["ws"] }

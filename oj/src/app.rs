@@ -862,12 +862,9 @@ pub(crate) fn resolve_mounts(
                 let (dir, ts) = if config::is_http_url(api) {
                     // URL 形态：装配期拉取并物化到内容寻址缓存，release 语义服务。
                     // 校验层（validate_mounts）已保证此处 sha256 必存在且为 64 hex。
-                    let sha = m
-                        .sha256
-                        .as_deref()
-                        .ok_or_else(|| {
-                            format!("mounts[{i}]: URL api requires sha256 integrity anchor")
-                        })?;
+                    let sha = m.sha256.as_deref().ok_or_else(|| {
+                        format!("mounts[{i}]: URL api requires sha256 integrity anchor")
+                    })?;
                     let cache_root = match &m.cache {
                         Some(c) => {
                             let p = Path::new(c);
@@ -2531,9 +2528,9 @@ mod tests {
             web: web.map(Into::into),
             spa,
             headers: Default::default(),
-        
-..Default::default()
-}
+
+            ..Default::default()
+        }
     }
 
     #[test]

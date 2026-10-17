@@ -27,6 +27,15 @@ use deno_core::op2;
 use deno_error::JsErrorBox;
 use serde::{Deserialize, Serialize};
 
+use deno_core::AsyncResult;
+use deno_core::BufView;
+use deno_core::Resource;
+use deno_core::ResourceId;
+use std::borrow::Cow;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+
 use super::ReqState;
 use super::StableState;
 
@@ -235,9 +244,10 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ExecOpts {
+    #[serde(rename = "timeoutMs")]
     timeout_ms: Option<u64>,
+    #[serde(rename = "stdin")]
     stdin: Option<String>,
 }
 
@@ -252,17 +262,34 @@ fn not_capable(msg: impl Into<String>) -> JsErrorBox {
     JsErrorBox::new("NotCapable", msg.into())
 }
 
-/// exec.run(argv, opts?) —— 设计稿 §1.3 全条款。
-/// opts: `{ timeoutMs?, stdin? }`。
-#[op2]
-#[serde]
-pub async fn op_exec_run(
-    state: Rc<RefCell<OpState>>,
-    #[serde] argv: Vec<String>,
-    #[serde] opts: Option<ExecOpts>,
-) -> Result<ExecResult, JsErrorBox> {
-    let opts = opts.unwrap_or_default();
-    // StableState/ReqState 句柄先取出，不跨 await 持有 OpState 借用。
+// ============================================================================
+// 流式执行（v0.1.78，设计稿 §2-§4）：spawn -> 双管道并发 drain 进有界 mpsc ->
+// 边读边推进；exec.spawn（B 句柄）/ exec.run 回调（A 糖）均建在其上。复用
+// prepare_exec 的全部安全闸门（授权 / 模板 / ${path:}/${raw:} / 解析 / env 白名单）。
+// 资源回收：ExecHandleResource::close 同步发 kill 信号，配合 runtime.rs::checkin
+// 与 mod.rs::checkout_reset 的 resource_table 枚举 close 门禁，杜绝跨请求/租户
+// 泄漏子进程组与 next_rid 回绕 panic（评审 CRITICAL）。
+// ============================================================================
+
+/// 单流 drain 缓冲队列容量（槽数）。JS 不消费 -> 队列满 -> drain 在 send 上挂起
+/// -> 子进程管道满 -> 子进程自然暂停（真实子进程语义，正确背压）。
+const STREAM_CHANNEL_BOUND: usize = 16;
+
+/// prepare_exec：授权裁决 + 模板解析/匹配 + 命令解析 + argv 重建（设计稿 §4.2）。
+/// 不含 spawn/kill_tree——缓冲路径（op_exec_run）与流式路径（op_exec_spawn）共用。
+struct PreparedExec {
+    prog: PathBuf,
+    final_argv: Vec<String>,
+    env_names: Vec<String>,
+    cwd: PathBuf,
+    timeout_ms: u64,
+}
+
+fn prepare_exec(
+    state: &Rc<RefCell<OpState>>,
+    argv: Vec<String>,
+    opts: &ExecOpts,
+) -> Result<PreparedExec, JsErrorBox> {
     let (exec, fs, platform, module) = {
         let st = state.borrow();
         let stable = st.borrow::<Arc<StableState>>();
@@ -274,8 +301,6 @@ pub async fn op_exec_run(
         )
     };
 
-    // ① 授权裁决（exec 与 platform.modules 相互独立，设计稿 §1.1）：未配 /
-    //    模块不在 per_module 表 → NotCapable（fail-closed）。
     let exec = exec
         .ok_or_else(|| not_capable("exec not configured (config platform.exec section missing)"))?;
     let module = module.ok_or_else(|| {
@@ -286,16 +311,12 @@ pub async fn op_exec_run(
         .get(&module)
         .ok_or_else(|| not_capable(format!("module '{module}' is not authorized for exec")))?;
 
-    // ② cwd = fs.root：fs: 未配置 → exec 整体不可用（设计稿 §1.3.2）。
     let fs = fs.ok_or_else(|| not_capable("exec requires fs.root (config fs: section missing)"))?;
-    // ${path:} 校验集合 = fs.root ∪ trusted_paths（resolve_allowed 单点）。
     let trusted: &[PathBuf] = platform
         .as_deref()
         .map(|p| p.trusted.as_slice())
         .unwrap_or(&[]);
 
-    // ③ 模板解析（配置面语法错 fail-closed：任一模板解析失败即抛错点名，
-    //    不静默跳过——装配期原样保存，解析期报错是设计约定的时点）。
     let mut templates = Vec::with_capacity(grant.templates.len());
     for raw in &grant.templates {
         templates.push(template::parse_template(raw).map_err(|e| {
@@ -303,7 +324,6 @@ pub async fn op_exec_run(
         })?);
     }
 
-    // ④ 模板匹配：0 命中 = 失配 / ≥2 = 歧义（三类文案：未授权 / 模板失配 / 歧义）。
     let (idx, bindings) = template::match_all(&templates, &argv).map_err(|e| match e {
         template::MatchError::NoMatch { reason } => {
             not_capable(format!("exec template mismatch: {reason}"))
@@ -314,7 +334,6 @@ pub async fn op_exec_run(
     })?;
     let matched = &templates[idx];
 
-    // ⑤ 命令解析（DIP）：模板首 token（parse 期已保证 literal）→ 绝对路径。
     let first = match &matched.tokens[0] {
         template::Token::Lit(s) => s.clone(),
         _ => unreachable!("parse_template enforces a literal command token"),
@@ -323,9 +342,6 @@ pub async fn op_exec_run(
         JsErrorBox::generic(format!("exec: command resolve failed for '{first}': {e}"))
     })?;
 
-    // ⑥ 重建 argv：literal 原样；${path:} 值经 resolve_allowed（fs.root ∪
-    //    trusted_paths）校验后取 canonical 绝对路径；${raw:} 值已在匹配期
-    //    校验（拒 `-` 开头 / 绝对形态），原样传递。
     let mut final_argv: Vec<String> = Vec::with_capacity(matched.tokens.len());
     final_argv.push(first);
     let mut bound = bindings.into_iter();
@@ -350,14 +366,318 @@ pub async fn op_exec_run(
         }
     }
 
-    // ⑦ spawn：解析后的绝对路径 + 空 env（仅白名单透传，值不进 JS 面）+
-    //    cwd = fs.root + argv 原样。unix 上 process_group(0)——子进程自成
-    //    进程组，超时/超限时可整组击杀。
-    let mut cmd = tokio::process::Command::new(&prog);
-    cmd.args(&final_argv[1..]);
-    cmd.current_dir(&fs.root);
+    let timeout_ms = opts
+        .timeout_ms
+        .unwrap_or(DEFAULT_TIMEOUT_MS)
+        .min(MAX_TIMEOUT_MS);
+    Ok(PreparedExec {
+        prog,
+        final_argv,
+        env_names: grant.env.clone(),
+        cwd: fs.root.clone(),
+        timeout_ms,
+    })
+}
+
+/// 单流 drain：stdout/stderr 管道读块经有界 mpsc 送消费端；合计超 OUTPUT_LIMIT
+/// 触发整组击杀（kill_tx）+ 停读；消费端关闭（tx 丢弃）亦停读（背压）。
+async fn drain_to_mpsc<R: tokio::io::AsyncRead + Unpin>(
+    mut pipe: R,
+    total: Arc<AtomicUsize>,
+    tx: mpsc::Sender<Vec<u8>>,
+    kill_tx: mpsc::UnboundedSender<()>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let prev = total.fetch_add(n, Ordering::Relaxed);
+                if prev + n > OUTPUT_LIMIT {
+                    let _ = kill_tx.send(());
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    // tx 在此丢弃 -> 接收端 recv() 返回 None（EOF）
+}
+
+/// 退出码换算（与 run_managed 同口径：信号终止 = 128 + signal）。
+fn compute_code(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        match status.signal() {
+            Some(sig) => 128 + sig,
+            None => status.code().unwrap_or(-1),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(-1)
+    }
+}
+
+/// 流资源：stdout/stderr 任一管道接收端；read 拉一块，EOF 返回空 BufView。
+struct StreamResource {
+    // Option 包裹：next_chunk 取出 receiver 后释放 RefCell 借用再 await，
+    // 避免跨 await 持有 RefMut（clippy::await_holding_refcell_ref）。
+    rx: Rc<RefCell<Option<mpsc::Receiver<Vec<u8>>>>>,
+}
+
+impl StreamResource {
+    async fn next_chunk(&self, limit: usize) -> Result<Vec<u8>, JsErrorBox> {
+        let mut rx = self
+            .rx
+            .borrow_mut()
+            .take()
+            .expect("exec stream receiver already taken");
+        let chunk = rx.recv().await;
+        *self.rx.borrow_mut() = Some(rx);
+        match chunk {
+            Some(mut buf) => {
+                if limit > 0 && buf.len() > limit {
+                    buf.truncate(limit);
+                }
+                Ok(buf)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+impl Resource for StreamResource {
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed("exec_stream")
+    }
+    fn read(self: Rc<Self>, limit: usize) -> AsyncResult<BufView> {
+        Box::pin(async move {
+            let chunk = self.next_chunk(limit).await?;
+            Ok(BufView::from(chunk))
+        })
+    }
+}
+
+/// 句柄资源：持有 kill 信号发送端 + 退出码 watch 接收端 + pid。close() 同步发
+/// kill 信号（覆盖 JS 释放 / runtime 回收 / 异常丢弃等全部路径），由 supervisor
+/// 任务据此整组击杀子进程，杜绝孤儿进程组（评审 CRITICAL 资源回收）。
+struct ExecHandleResource {
+    kill_tx: mpsc::UnboundedSender<()>,
+    exit: watch::Receiver<Option<i32>>,
+}
+
+impl Resource for ExecHandleResource {
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed("exec_handle")
+    }
+    fn close(self: Rc<Self>) {
+        let _ = self.kill_tx.send(());
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExecSpawnResult {
+    rid: u32,
+    pid: u32,
+    stdout_rid: u32,
+    stderr_rid: u32,
+}
+
+#[derive(Serialize)]
+struct ExecExitResult {
+    code: i32,
+}
+
+/// op_exec_spawn：流式底座（B 句柄）。spawn 子进程，启动 supervisor 任务拥有
+/// child 并广播退出码；双管道 drain 进有界 mpsc；三资源入表（两流 + 一句柄）。
+#[op2]
+#[serde]
+pub async fn op_exec_spawn(
+    state: Rc<RefCell<OpState>>,
+    #[serde] argv: Vec<String>,
+    #[serde] opts: serde_json::Value,
+) -> Result<ExecSpawnResult, JsErrorBox> {
+    let opts: ExecOpts = serde_json::from_value(opts).unwrap_or_default();
+    let p = prepare_exec(&state, argv, &opts)?;
+    let mut cmd = tokio::process::Command::new(&p.prog);
+    cmd.args(&p.final_argv[1..]);
+    cmd.current_dir(&p.cwd);
     cmd.env_clear();
-    for name in &grant.env {
+    for name in &p.env_names {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| {
+        JsErrorBox::generic(format!(
+            "exec: spawn failed for '{}': {e}",
+            p.prog.display()
+        ))
+    })?;
+    let pid = child.id().unwrap_or(0);
+    let stdout_pipe = child.stdout.take().expect("stdout piped");
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+
+    let (so_tx, so_rx) = mpsc::channel::<Vec<u8>>(STREAM_CHANNEL_BOUND);
+    let (se_tx, se_rx) = mpsc::channel::<Vec<u8>>(STREAM_CHANNEL_BOUND);
+    let (kill_tx, mut kill_rx) = mpsc::unbounded_channel::<()>();
+    let kill_tx_sup = kill_tx.clone();
+    let (exit_tx, exit_rx) = watch::channel::<Option<i32>>(None);
+    let timeout_ms = p.timeout_ms;
+
+    // supervisor：拥有 child 强引用；监听 kill 信号与超时；退出码经 watch 广播。
+    tokio::spawn(async move {
+        let total = Arc::new(AtomicUsize::new(0));
+        let dh1 = tokio::spawn(drain_to_mpsc(
+            stdout_pipe,
+            total.clone(),
+            so_tx,
+            kill_tx_sup.clone(),
+        ));
+        let dh2 = tokio::spawn(drain_to_mpsc(
+            stderr_pipe,
+            total.clone(),
+            se_tx,
+            kill_tx_sup.clone(),
+        ));
+        // 关键：kill 信号必须优先于「子进程自然退出」被采信，且一旦请求过 kill，
+        // 退出码强制为 137（SIGKILL），不受 kill 信号到达前子进程已将缓冲数据写完
+        // 并以 0 退出的竞态影响（评审 CRITICAL：OUTPUT_LIMIT/超时/显式 kill 必须
+        // 稳定命中 137，否则下游按「已成功」误判）。
+        // biased 保证 kill_rx 优先；recv() 返回 None 表示发送端已全部丢弃（自然
+        // 完成，句柄未关闭前不会触发），此时仍走自然退出码。
+        let mut killed = false;
+        let status = tokio::select! {
+            biased;
+            r = kill_rx.recv() => {
+                killed = r.is_some();
+                if killed {
+                    kill_tree(&mut child);
+                }
+                child.wait().await
+            }
+            status = child.wait() => status,
+            _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                killed = true;
+                kill_tree(&mut child);
+                child.wait().await
+            }
+        };
+        let code: i32 = if killed {
+            137
+        } else {
+            status.map(compute_code).unwrap_or(-1)
+        };
+        let _ = exit_tx.send(Some(code));
+        // 给 drain 一个收尾窗口（管道关闭后自然结束），避免截断已就绪未 flush 的块。
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = dh1.await;
+            let _ = dh2.await;
+        })
+        .await;
+    });
+
+    let stdout_rid = state.borrow_mut().resource_table.add(StreamResource {
+        rx: Rc::new(RefCell::new(Some(so_rx))),
+    });
+    let stderr_rid = state.borrow_mut().resource_table.add(StreamResource {
+        rx: Rc::new(RefCell::new(Some(se_rx))),
+    });
+    let handle_rid = state.borrow_mut().resource_table.add(ExecHandleResource {
+        kill_tx,
+        exit: exit_rx,
+    });
+    let r = ExecSpawnResult {
+        rid: handle_rid,
+        pid,
+        stdout_rid,
+        stderr_rid,
+    };
+    Ok(r)
+}
+
+/// op_exec_read：从流资源拉一块（零长 = EOF）。配合 bootstrap.js 的异步迭代。
+#[op2]
+#[buffer]
+pub async fn op_exec_read(
+    state: Rc<RefCell<OpState>>,
+    #[smi] rid: ResourceId,
+    #[smi] limit: i32,
+) -> Result<Vec<u8>, JsErrorBox> {
+    let res = state
+        .borrow()
+        .resource_table
+        .get::<StreamResource>(rid)
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let chunk = res.next_chunk(limit.max(0) as usize).await?;
+    Ok(chunk)
+}
+
+/// op_exec_kill：经本会话句柄 rid 发整组击杀信号（仅能杀自己 spawn 的会话）。
+#[op2(fast)]
+pub fn op_exec_kill(state: Rc<RefCell<OpState>>, #[smi] rid: ResourceId) -> Result<(), JsErrorBox> {
+    let res = state
+        .borrow()
+        .resource_table
+        .get::<ExecHandleResource>(rid)
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let _ = res.kill_tx.send(());
+    Ok(())
+}
+
+/// op_exec_exit：等退出码广播，返回 { code }（设计稿 §3.1）。
+#[op2]
+#[serde]
+pub async fn op_exec_exit(
+    state: Rc<RefCell<OpState>>,
+    #[serde] rid: ResourceId,
+) -> Result<ExecExitResult, JsErrorBox> {
+    let mut exit_rx = {
+        let st = state.borrow();
+        st.resource_table
+            .get::<ExecHandleResource>(rid)
+            .map_err(|e| JsErrorBox::generic(e.to_string()))?
+            .exit
+            .clone()
+    };
+    loop {
+        if let Some(code) = *exit_rx.borrow() {
+            return Ok(ExecExitResult { code });
+        }
+        if exit_rx.changed().await.is_err() {
+            return Ok(ExecExitResult { code: -1 });
+        }
+    }
+}
+
+/// exec.run(argv, opts?) —— 设计稿 §1.3 全条款。
+/// opts: `{ timeoutMs?, stdin? }`。
+#[op2]
+#[serde]
+pub async fn op_exec_run(
+    state: Rc<RefCell<OpState>>,
+    #[serde] argv: Vec<String>,
+    #[serde] opts: serde_json::Value,
+) -> Result<ExecResult, JsErrorBox> {
+    let opts: ExecOpts = serde_json::from_value(opts).unwrap_or_default();
+    let p = prepare_exec(&state, argv, &opts)?;
+    let mut cmd = tokio::process::Command::new(&p.prog);
+    cmd.args(&p.final_argv[1..]);
+    cmd.current_dir(&p.cwd);
+    cmd.env_clear();
+    for name in &p.env_names {
         if let Some(v) = std::env::var_os(name) {
             cmd.env(name, v);
         }
@@ -369,21 +689,17 @@ pub async fn op_exec_run(
     });
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    // KillSwitch drop op future 的兜底：future 被 drop（不再走错误路径的
-    // kill_tree）时杀掉直接子进程，封最常见的孤儿面；组杀仍由显式
-    // kill_tree 承担（评审 Medium 2）。
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn().map_err(|e| {
-        JsErrorBox::generic(format!("exec: spawn failed for '{}': {e}", prog.display()))
+        JsErrorBox::generic(format!(
+            "exec: spawn failed for '{}': {e}",
+            p.prog.display()
+        ))
     })?;
 
-    let timeout_ms = opts
-        .timeout_ms
-        .unwrap_or(DEFAULT_TIMEOUT_MS)
-        .min(MAX_TIMEOUT_MS);
-    match run_managed(&mut child, opts.stdin.as_deref(), timeout_ms).await {
+    match run_managed(&mut child, opts.stdin.as_deref(), p.timeout_ms).await {
         Ok(r) => Ok(r),
         Err(e) => {
             // 所有 spawn 之后的失败路径统一组杀 + 兜底 reap（不留残留进程）。
@@ -1321,6 +1637,402 @@ export default {
 
         let _ = std::fs::remove_dir_all(&jail);
         let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ----- BDD SS1-SS9 流式（spawn 句柄 / 回调 / 向后兼容；真实子进程） -----
+    // 复用本模块既有夹具：make_bridge / test_resolver / worker_grant /
+    // worker_grant_win / tmp / js_path。平台差异仅限命令形态（同 S 主场景）。
+
+    /// 流式场景 handler 表（unix 命令形态）。占位符 __BIG__ 注入 jail/big.bin。
+    #[cfg(unix)]
+    fn api_src_stream(jail: &Path) -> String {
+        let big = js_path(&jail.join("big.bin"));
+        r#"
+export default {
+  s1_spawn: async () => {
+    const h = await exec.spawn(["echo", "hello"]);
+    let out = "";
+    for await (const c of h.stdout) out += new TextDecoder().decode(c);
+    const { code } = await h.exit();
+    return json.ok({
+      rid: h.rid,
+      pid: h.pid,
+      hasStdout: typeof h.stdout[Symbol.asyncIterator] === "function",
+      hasStderr: typeof h.stderr[Symbol.asyncIterator] === "function",
+      code,
+      out,
+    });
+  },
+  s2_realtime: async () => {
+    const parts = [];
+    await exec.run(["sh", "-c", "echo a; sleep 0.15; echo b"], {
+      onStdout: (c) => parts.push(new TextDecoder().decode(c)),
+    });
+    return json.ok({ parts: parts.join("") });
+  },
+  s3_exit: async () => {
+    const h = await exec.spawn(["sh", "-c", "exit 7"]);
+    for await (const _ of h.stdout) {}
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s4_kill: async () => {
+    const h = await exec.spawn(["sh", "-c", "sleep 30"]);
+    h.kill();
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s5_big: async () => {
+    const h = await exec.spawn(["sh", "-c", "cat __BIG__"]);
+    let n = 0;
+    for await (const c of h.stdout) n += c.byteLength;
+    const { code } = await h.exit();
+    return json.ok({ code, bytes: n });
+  },
+  s6_timeout: async () => {
+    const h = await exec.spawn(["sh", "-c", "sleep 30"], { timeoutMs: 400 });
+    for await (const _ of h.stdout) {}
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s7_callback: async () => {
+    const parts = [];
+    const r = await exec.run(["sh", "-c", "echo x; echo y"], {
+      onStdout: (c) => parts.push(new TextDecoder().decode(c)),
+    });
+    return json.ok({ code: r.code, out: parts.join(""), full: r.stdout });
+  },
+  s8_compat: async () => {
+    const r = await exec.run(["echo", "compat"]);
+    return json.ok({ code: r.code, out: r.stdout });
+  },
+  s9_unauth: async () => {
+    await exec.spawn(["echo", "hi"]);
+    return json.ok({});
+  },
+};
+"#
+        .replace("__BIG__", &big)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_bdd_streaming_scenarios() {
+        let jail = tmp("stream-jail").canonicalize().unwrap();
+        std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
+        let base = tmp("stream-mods").canonicalize().unwrap();
+        let api_js = api_src_stream(&jail);
+        let (resolver, _seen) = test_resolver(&[
+            ("echo", "/bin/echo"),
+            ("cat", "/bin/cat"),
+            ("sh", "/bin/sh"),
+            ("oj", "/bin/echo"),
+        ]);
+        let b = make_bridge(
+            &base,
+            &[("worker", "worker"), ("plain", "plain")],
+            &api_js,
+            &jail,
+            Some(worker_grant(vec![], resolver)),
+            Some(PlatformGrant::new(vec!["worker".into()], &[], Some(&jail)).unwrap()),
+        );
+        let api = |m: &str| base.join(m).join("api.js");
+        let t = std::time::Duration::from_secs(60);
+
+        macro_rules! data {
+            ($h:expr) => {{
+                let cap = b
+                    .run_module(&api("worker"), $h, Default::default(), t)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} failed: {e}", $h));
+                let v: serde_json::Value = serde_json::from_slice(&cap.body)
+                    .unwrap_or_else(|e| panic!("{} envelope: {e}", $h));
+                assert_eq!(v["code"], 0, "{}: {}", $h, v["msg"]);
+                v["data"].clone()
+            }};
+        }
+        macro_rules! denied {
+            ($m:expr, $h:expr, $part:expr) => {{
+                let e = b
+                    .run_module(&api($m), $h, Default::default(), t)
+                    .await
+                    .unwrap_err();
+                let m = e.to_string();
+                assert!(
+                    m.contains("NotCapable") && m.contains($part),
+                    "{} -> {m}",
+                    $h
+                );
+            }};
+        }
+
+        // SS1：spawn 返回句柄，含 rid/pid 与两个 AsyncIterable 流，stdout 增量正确。
+        let d = data!("s1_spawn");
+        assert!(d["rid"].is_u64(), "rid: {d}");
+
+        // SS2：回调形态实时收到分块（echo a / sleep / echo b 串联）。
+        let d = data!("s2_realtime");
+        let p = d["parts"].as_str().unwrap();
+        assert!(
+            p.contains(
+                "a
+"
+            ),
+            "{p}"
+        );
+        assert!(
+            p.contains(
+                "b
+"
+            ),
+            "{p}"
+        );
+
+        // SS3：h.exit() 返回退出码（exit 7）。
+        let d = data!("s3_exit");
+        assert_eq!(d["code"], 7);
+
+        // SS4：h.kill() 中途击杀长睡任务 -> SIGKILL(137)。
+        let d = data!("s4_kill");
+        assert_eq!(d["code"], 137);
+
+        // SS5：输出 >10MiB 触发 OUTPUT_LIMIT 组杀 -> 137，且至少流出部分数据。
+        let d = data!("s5_big");
+        assert_eq!(d["code"], 137);
+        assert!(d["bytes"].as_u64().unwrap() > 1_000_000, "{}", d["bytes"]);
+
+        // SS6：timeoutMs 短于命令 -> 超时组杀 -> 137。
+        let d = data!("s6_timeout");
+        assert_eq!(d["code"], 137);
+
+        // SS7：回调形态 onStdout 累计 + 返回完整 stdout。
+        let d = data!("s7_callback");
+        assert_eq!(d["code"], 0);
+        assert_eq!(
+            d["out"],
+            "x
+y
+"
+        );
+        assert_eq!(
+            d["full"],
+            "x
+y
+"
+        );
+
+        // SS8：向后兼容 exec.run(argv) 无 opts -> 缓冲 {code,stdout}。
+        let d = data!("s8_compat");
+        assert_eq!(d["code"], 0);
+        assert_eq!(
+            d["out"],
+            "compat
+"
+        );
+
+        // SS9：未授权模块 spawn -> NotCapable（fail-closed）。
+        denied!("plain", "s9_unauth", "not authorized for exec");
+
+        let _ = std::fs::remove_dir_all(&jail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 流式场景 handler 表（Windows 命令形态；契约断言与 unix 面同源，
+    /// 仅命令语义差异：cmd /c / ping，CRLF，击杀码为「非 0」而非固定 137）。
+    #[cfg(windows)]
+    fn api_src_stream_win(jail: &Path) -> String {
+        let big = js_path(&jail.join("big.bin"));
+        r#"
+export default {
+  s1_spawn: async () => {
+    const h = await exec.spawn(["cmd", "/c", "echo", "hello"]);
+    let out = "";
+    for await (const c of h.stdout) out += new TextDecoder().decode(c);
+    const { code } = await h.exit();
+    return json.ok({
+      rid: h.rid,
+      pid: h.pid,
+      hasStdout: typeof h.stdout[Symbol.asyncIterator] === "function",
+      hasStderr: typeof h.stderr[Symbol.asyncIterator] === "function",
+      code,
+      out,
+    });
+  },
+  s2_realtime: async () => {
+    const parts = [];
+    await exec.run(["ping", "-n", "3", "127.0.0.1"], {
+      onStdout: (c) => parts.push(new TextDecoder().decode(c)),
+    });
+    return json.ok({ parts: parts.join("") });
+  },
+  s3_exit: async () => {
+    const h = await exec.spawn(["cmd", "/c", "exit", "7"]);
+    for await (const _ of h.stdout) {}
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s4_kill: async () => {
+    const h = await exec.spawn(["ping", "-n", "31", "127.0.0.1"]);
+    h.kill();
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s5_big: async () => {
+    const h = await exec.spawn(["cmd", "/c", "type", "__BIG__"]);
+    let n = 0;
+    for await (const c of h.stdout) n += c.byteLength;
+    const { code } = await h.exit();
+    return json.ok({ code, bytes: n });
+  },
+  s6_timeout: async () => {
+    const h = await exec.spawn(["ping", "-n", "31", "127.0.0.1"], { timeoutMs: 400 });
+    for await (const _ of h.stdout) {}
+    const { code } = await h.exit();
+    return json.ok({ code });
+  },
+  s7_callback: async () => {
+    const parts = [];
+    const r = await exec.run(["cmd", "/c", "echo", "x"], {
+      onStdout: (c) => parts.push(new TextDecoder().decode(c)),
+    });
+    return json.ok({ code: r.code, out: parts.join(""), full: r.stdout });
+  },
+  s8_compat: async () => {
+    const r = await exec.run(["cmd", "/c", "echo", "compat"]);
+    return json.ok({ code: r.code, out: r.stdout });
+  },
+  s9_unauth: async () => {
+    await exec.spawn(["cmd", "/c", "echo", "hi"]);
+    return json.ok({});
+  },
+};
+"#
+        .replace("__BIG__", &big)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_bdd_streaming_scenarios_windows() {
+        let jail = tmp("stream-jail").canonicalize().unwrap();
+        std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
+        let base = tmp("stream-mods").canonicalize().unwrap();
+        let api_js = api_src_stream_win(&jail);
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:/Windows".to_string());
+        let cmd_exe = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned();
+        let ping_exe = std::path::Path::new(&sysroot)
+            .join("System32")
+            .join("ping.exe")
+            .to_string_lossy()
+            .into_owned();
+        let (resolver, _seen) = test_resolver(&[
+            ("cmd", cmd_exe.as_str()),
+            ("ping", ping_exe.as_str()),
+            ("oj", cmd_exe.as_str()),
+        ]);
+        let b = make_bridge(
+            &base,
+            &[("worker", "worker"), ("plain", "plain")],
+            &api_js,
+            &jail,
+            Some(worker_grant_win(vec![], resolver)),
+            Some(PlatformGrant::new(vec!["worker".into()], &[], Some(&jail)).unwrap()),
+        );
+        let api = |m: &str| base.join(m).join("api.js");
+        let t = std::time::Duration::from_secs(60);
+
+        macro_rules! data {
+            ($h:expr) => {{
+                let cap = b
+                    .run_module(&api("worker"), $h, Default::default(), t)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} failed: {e}", $h));
+                let v: serde_json::Value = serde_json::from_slice(&cap.body)
+                    .unwrap_or_else(|e| panic!("{} envelope: {e}", $h));
+                assert_eq!(v["code"], 0, "{}: {}", $h, v["msg"]);
+                v["data"].clone()
+            }};
+        }
+        macro_rules! denied {
+            ($m:expr, $h:expr, $part:expr) => {{
+                let e = b
+                    .run_module(&api($m), $h, Default::default(), t)
+                    .await
+                    .unwrap_err();
+                let m = e.to_string();
+                assert!(
+                    m.contains("NotCapable") && m.contains($part),
+                    "{} -> {m}",
+                    $h
+                );
+            }};
+        }
+
+        // SS1：spawn 返回句柄，含 rid/pid 与两个 AsyncIterable 流（CRLF 输出）。
+        let d = data!("s1_spawn");
+        assert!(d["rid"].is_u64(), "rid: {d}");
+        assert!(d["pid"].is_u64(), "pid: {d}");
+        assert_eq!(d["hasStdout"], true);
+        assert_eq!(d["hasStderr"], true);
+        assert_eq!(d["code"], 0);
+        assert_eq!(
+            d["out"],
+            "hello
+"
+        );
+
+        // SS2：回调形态实时收到分块（ping 多行输出）。
+        let d = data!("s2_realtime");
+        assert!(!d["parts"].as_str().unwrap().is_empty(), "{}", d["parts"]);
+
+        // SS3：h.exit() 返回退出码（exit 7）。
+        let d = data!("s3_exit");
+        assert_eq!(d["code"], 7);
+
+        // SS4：h.kill() 中途击杀 -> 非 0（Windows 无信号码，仅判非 0）。
+        let d = data!("s4_kill");
+        assert_ne!(d["code"], 0);
+
+        // SS5：输出 >10MiB 触发 OUTPUT_LIMIT 组杀 -> 非 0，且至少流出部分数据。
+        let d = data!("s5_big");
+        assert_ne!(d["code"], 0);
+        assert!(d["bytes"].as_u64().unwrap() > 1_000_000, "{}", d["bytes"]);
+
+        // SS6：timeoutMs 短于命令 -> 超时组杀 -> 非 0。
+        let d = data!("s6_timeout");
+        assert_ne!(d["code"], 0);
+
+        // SS7：回调形态 onStdout 累计 + 返回完整 stdout。
+        let d = data!("s7_callback");
+        assert_eq!(d["code"], 0);
+        assert_eq!(
+            d["out"],
+            "x
+"
+        );
+        assert_eq!(
+            d["full"],
+            "x
+"
+        );
+
+        // SS8：向后兼容 exec.run(argv) 无 opts -> 缓冲 {code,stdout}。
+        let d = data!("s8_compat");
+        assert_eq!(d["code"], 0);
+        assert_eq!(
+            d["out"],
+            "compat
+"
+        );
+
+        // SS9：未授权模块 spawn -> NotCapable（fail-closed）。
+        denied!("plain", "s9_unauth", "not authorized for exec");
+
+        let _ = std::fs::remove_dir_all(&jail);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

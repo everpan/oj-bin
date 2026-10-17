@@ -128,15 +128,20 @@ fn bundle_dist(out: &Path) -> Result<String, String> {
             .map_err(|e| format!("bundle: gzip finish: {e}"))?;
     }
     let sha = {
-        let data = std::fs::read(&tmp).map_err(|e| format!("bundle: read back {tmp}: {e}", tmp = tmp.display()))?;
+        let data = std::fs::read(&tmp)
+            .map_err(|e| format!("bundle: read back {tmp}: {e}", tmp = tmp.display()))?;
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(&data);
         hex(&h.finalize())
     };
     let final_tgz = out.join(format!("{name}.tgz"));
-    std::fs::copy(&tmp, &final_tgz)
-        .map_err(|e| format!("bundle: write {final_tgz}: {e}", final_tgz = final_tgz.display()))?;
+    std::fs::copy(&tmp, &final_tgz).map_err(|e| {
+        format!(
+            "bundle: write {final_tgz}: {e}",
+            final_tgz = final_tgz.display()
+        )
+    })?;
     let _ = std::fs::remove_file(&tmp);
     println!(
         "oj build --bundle: wrote {} (sha256 {sha})",
@@ -151,7 +156,9 @@ fn append_tree<W: std::io::Write>(
     root: &Path,
     dir: &Path,
 ) -> Result<(), String> {
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("bundle: read_dir {dir}: {e}", dir = dir.display()))? {
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| format!("bundle: read_dir {dir}: {e}", dir = dir.display()))?
+    {
         let entry = entry.map_err(|e| format!("bundle: read_dir entry: {e}"))?;
         let path = entry.path();
         let name = path
@@ -162,7 +169,7 @@ fn append_tree<W: std::io::Write>(
             .map_err(|e| format!("bundle: file_type {path}: {e}", path = path.display()))?;
         if ft.is_dir() {
             builder
-                .append_dir(&name, &path)
+                .append_dir(name, &path)
                 .map_err(|e| format!("bundle: append_dir {name}: {e}", name = name.display()))?;
             append_tree(builder, root, &path)?;
         } else if ft.is_file() {

@@ -1640,6 +1640,8 @@ exec.run(argv: string[], opts?: {
 }): Promise<{ code: number; stdout: string; stderr: string }>
 ```
 
+另有流式消费形态：句柄式 `exec.spawn`（`for await` 消费 stdout/stderr）+ `exec.run` 的 `onStdout`/`onStderr` 回调，详见下方「exec 流式形态（v0.1.78）」小节。
+
 外部命令原语：**无 shell**——spawn 只接受「授权模板匹配后重建的 argv」。安全形态 =
 config 白名单 + argv 模板 + 平台特权限定，全部 fail-closed：
 
@@ -1695,7 +1697,54 @@ platform:
   walk**（symlink/hardlink/设备零容忍、组件级拒 `..`、总体积对账），配合 `.staging` 原子
   落位——完整三步范式见 `scenarios.md` 场景 34。
 
-**错误文案速查**（文案以实现为准；「类」= 错误分类，`NotCapable` 为授权面，其余为普通
+#### Windows 平台命令形态
+
+Windows 无独立 `echo` / `cat` / `sh` 等可执行（这些只是 shell 内建），且**不自动探测 Git Bash /
+WSL / MSYS**：
+
+- 需要 shell 语义时，模板直接写成 `cmd /c <语句>`——例如   `["cmd","/c","echo","hello"]`、
+  `["cmd","/c","type","__JAIL__/in.txt"]`；`cmd` 经 resolver 解析为绝对路径（如
+  `C:\Windows\System32\cmd.exe`）后 spawn，与 unix 同语义。
+- 命令名按 PATH 或 resolver 解析为绝对路径，跨平台一致；裸名 `sh` / `bash` 在 Windows 上
+  不存在 → 解析失败抛 `command resolve failed`——**不要**在跨平台模板里写 `sh -c ...`，否则
+  同一份配置在 Windows 部署即失败；unix 面用 `sh -c` 的模板，Windows 面须改写为 `cmd /c`
+  等价形态（路径占位符、`${raw:}` 注入规则完全一致，只换最外层命令）。
+- **刻意不引入 Git Bash 自动探测**：自动探测会 (1) 扩大命令解析面、引入 PATH / 注入歧义；
+  (2) 与「命令名由配置白名单显式声明」的安全边界冲突；(3) 使同一模板在有无 Git Bash 的机器
+  上行为不一致。Windows 命令形态请在模板里直接写 `cmd /c`，不要依赖 sh 仿真层。
+- kill_tree 在 Windows 上无进程组对应物，仅 `start_kill()` 杀直接子进程（与 unix 整组击杀
+  语义不同）；超时 / 输出超限仍触发兜底 kill，但孙进程可能残留——设计已声明此差异。
+
+**
+#### exec 流式形态（v0.1.78）：exec.spawn 句柄 + exec.run 回调
+
+**exec** 提供两种消费形态，统一建在 Rust 侧「spawn 到 双管道并发 drain 到 边读边推进」的流式底座之上；A（回调）是 B（句柄）之上的 JS 糖，不引入第二套读循环、不新增命令构造面（安全闸门全复用）。
+
+    // B：句柄式（新增）——stdout/stderr 为 AsyncIterable<Uint8Array>
+    const h = await exec.spawn(
+      ["sh", "-c", "for i in 1 2 3; do echo $i; sleep .2; done"],
+      { timeoutMs: 30000 },
+    );
+    for await (const chunk of h.stdout) log(new TextDecoder().decode(chunk));
+    const code = (await h.exit()).code;   // 信号终止 128+sig（TERM=15 到 143）
+    h.kill();                            // 主动整组击杀（unix: kill(-pgid, SIGKILL)）
+
+    // A：回调式（扩展现有）——增量转发，返回 { code }（不缓冲整段，回调即真相源）
+    const r = await exec.run(["sh", "-c", "..."], {
+      onStdout: (chunk) => process.stdout.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+      timeoutMs: 5000,
+    });
+
+- **exec.spawn(argv, opts?)** 返回句柄 { rid, pid, stdout, stderr, kill, exit }：h.stdout / h.stderr 为 AsyncIterable<Uint8Array>，EOF 时迭代自然结束；h.exit() 等待子进程退出返回 { code }；h.kill() 主动整组击杀。
+- **exec.run(argv, opts?)** 向后兼容：无 onStdout / onStderr 时，行为、返回形状与 v0.1.75 完全一致（{ code, stdout, stderr }）；带回调时改为增量转发并返回 { code }（不缓冲整段 stdout，回调即真相源，避免与回调语义冲突）。
+- **opts 共用**：timeoutMs?（缺省 30_000，硬上限 600_000，超出钳制）、stdin?（一次性写入后关闭写端）；两形态共用同一套钳制与超时整组击杀语义。
+- **背压（重要）**：stdout/stderr 经有界 mpsc（16 槽 x 8KiB）送消费端；JS 不 for await 拉取 到 通道满 到 drain 在 send 上挂起 到 子进程管道满 到 子进程自然暂停（真实子进程语义，正确背压）。不消费流 = 子进程在输出填满管道时阻塞，不是 bug，也别指望 exit() 在流未消费时返回——先消费（或 break）再 exit()。
+- **资源回收（每请求）**：句柄 rid 进 OpState.resource_table；close()（JS 释放 / runtime 归还 / 异常丢弃都覆盖）同步整组击杀子进程，杜绝跨请求/租户泄漏与 next_rid 回绕 panic。drain 任务与子进程同生命周期：handle close 到 kill 到 管道 EOF 到 drain 自然结束。
+- **rid 仅本 runtime 可达**：进程内 ResourceId，跨模块/跨请求无法凭 rid 触达他人会话；kill 只能杀自己 spawn 的会话（无 pid 入参，只接受本会话 rid）。
+- 输出 10MiB 上限、timeoutMs 整组击杀、UTF-8 强制解码、cwd = fs.root、env 空表等硬限制，与缓冲形态完全一致（见上「硬限制」）。
+
+错误文案速查**（文案以实现为准；「类」= 错误分类，`NotCapable` 为授权面，其余为普通
 Error）：
 
 | 文案 | 类 | 触发 |
@@ -2971,6 +3020,30 @@ mounts:
 | 根 `/` | 允许：api 挂载路由 `/<module>`；web 挂载全路径兜底 |
 | CLI 折叠 | `--api-path d [-b B]` → upsert `{prefix: B(默认 /v1/api), api: d}`（裸 `-b` 报错）；`--app-path d` → upsert `{prefix: "/", web: d}`、`--app-path /p=d` → upsert 同前缀 web 条目（保留 headers/spa） |
 
+#### 远程 dist 挂载（v0.1.77）
+
+`api` 字段除了本地目录，还可以是 `http(s)://` URL：装配期按 URL 拉取「dist 根 tarball」
+（产物根须含 `manifests.yaml`，否则视为非法 dist 根拒启），解压到**内容寻址缓存**
+`<cache>/<sha256>/`（`cache` 缺省 `<config_dir>/.oj-cache`），以 release 语义服务。
+
+```yaml
+mounts:
+  - prefix: '/remote'
+    api: 'https://cdn.example.com/app/dist.tgz'   # 远程 dist 根 tarball
+    sha256: 'a1b2c3d4e5f6...64hex'                 # 完整性锚（必填，64 hex）
+    cache: '.oj-cache'                              # 可选，相对 config 目录；绝对路径原样用
+```
+
+- **完整性锚 = 声明 `sha256`**：下载内容 sha256 与声明不符即拒启（防篡改 / CDN 漂移 /
+  缓存投毒）；缺 `sha256` 或 scheme 非 http/https → 装配期 fail-fast。
+- **解压 fail-fast**：逐条目拒绝 tar-slip（路径逃逸 `/` 父目录 / 盘符前缀）、符号链接 /
+  硬链接 / 字符·块·FIFO 特殊文件、pax·gnu 扩展元数据；并对下载量（512 MiB）/ 解压总量
+  （4 GiB）/ 条目数（10 万）/ 单条目（1 GiB）设上限防炸弹。命中缓存按 sha256 复用，
+  损坏自动重拉；同 URL 物化按 sha256 互斥串行化。
+- **`--api-path` 不接受 URL**：远程挂载的 sha256 上下文只在 config 声明期存在，CLI 折叠期
+  无此上下文，故 `oj serve --api-path <url>` 直接报错并引导改走 config 的 `mounts[].api`。
+
+
 ### server
 
 | 字段 | 默认 | 说明 |
@@ -3483,6 +3556,12 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | `no mounts configured — …` | 准入门（v0.1.58）：`mounts:`（config + CLI 折叠后）为空——加一条挂载或传 `--api-path`/`--app-path` |
 | `api path not found: …` | `--api-path` 指定了就必须存在（静态站点存在性不在此判，见下行） |
 | `mounts[i]: duplicate … mount prefix` / `mounts[i]: 挂载目录 …: No such file or directory` | （v0.1.58）装配期挂载解析 fail-fast：同类前缀重复或挂载目录缺失/非目录（api+web 同前缀配对合法） |
+| `mounts[i]: URL api requires sha256 integrity anchor` | （v0.1.77）`api` 为 `http(s)://` 但未提供 64 hex `sha256` —— 装配期 fail-fast（防未锚定的远程 dist 被静默替换） |
+| `mounts[i]: <url> scheme not allowed (only http/https)` | （v0.1.77）`api` URL 的 scheme 非 http/https（如 `ftp:`、`file:`）→ 拒启 |
+| `mounts[i]: <url> sha256 mismatch (got …, expected …)` | （v0.1.77）下载内容 sha256 与声明不符 → 拒启（不静默当明文 / 降级） |
+| `mounts[i]: dist root missing manifests.yaml` / `extraction rejected: <reason>` | （v0.1.77）远程 dist 根解压后无 `manifests.yaml`，或单条目触发 tar-slip / 符号链接 / 特殊文件 / 超预算 → 拒启（解压器 fail-fast） |
+| `api path '<url>' is a URL — declare remote dist via mounts[].api in config` | （v0.1.77）`--api-path` 收到 URL → 报错引导走 config（CLI 折叠期无 sha256 上下文） |
+
 | `server.html_meta_handler` 未命中 GET 路由 | `server.html_meta_handler: "…" 不在路由表（拼错了？）` / `未映射 GET 方法` 退出（v0.1.25；后果只在爬虫侧可见，故不留到运行期） |
 | config 里有 `ENC[…]` 但找不到私钥 / 解密失败 | `config has ENC[...] sealed values but …` 退出（v0.1.33；**不静默把密文当明文用**） |
 | `vars:` 段值不是标量（嵌套 map/list） | 解析期报错（值只能是字符串/数字/布尔） |
@@ -3522,6 +3601,24 @@ S003 跨模块 SQL 须声明 deps、S004 deps 版本范围可满足、S005 `tabl
 | `<module>-<version>/manifest.yaml` | 原样复制 |
 | `dist/manifests.yaml` | 模块 → 锁定版本（原子写，保留其他模块条目）；多版本目录可共存，锁决定 release 加载哪个 |
 | `dist/<module>-<version>.tgz` | 确定性发布包（同输入字节一致，可校验完整性） |
+
+#### `oj build --bundle`（v0.1.77）
+
+把整棵已构建 `dist/`（根 `manifests.yaml` + 各 `<module>-<version>/`）打成**空前缀**
+tarball `<out>/<name>.tgz`（`name` 取输出目录名）并打印 sha256 —— 产物可直接声明为上面
+远程挂载的 `sha256` 完整性锚（手工等价 `tar czf app.tgz -C dist .`）。
+
+```bash
+./bin/oj build -d src -o dist
+./bin/oj build --bundle -d src -o /tmp/sd     # 产出 /tmp/sd/sd.tgz + 打印 sha256
+```
+
+- 要求 `dist/manifests.yaml` 存在（先 `oj build`）；只收目录与 `manifests.yaml`，跳过各
+  per-module `*.tgz`，保证解压后根即 dist 根（空前缀 → 解压落到 `<cache>/<sha256>/` 即为
+  合法 dist 根）。
+- 与 `oj build` 普通产物（`dist/<module>-<version>.tgz`）的区别：普通产物是单模块包；
+  `--bundle` 是「整站 dist 根」包，专供远程挂载分发。
+
 
 跨模块相对导入构建期改写为指向目标模块版本目录的相对路径；目标模块未构建过则报错
 （先 `oj build user`）。npm 依赖不打包进 tgz（裸 specifier 运行时沿 `node_modules`

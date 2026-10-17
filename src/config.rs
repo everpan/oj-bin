@@ -96,7 +96,9 @@ pub struct MountConf {
 /// 不含 `://` 一律判本地——Windows `C:\\dist` / `c:/dist` 均无 `://`，不误伤；
 /// 仅 `Url::parse` 会把 `c:/dist` 误判 scheme=c，故先查字面 `://` 再校验 scheme。
 pub fn is_http_url(s: &str) -> bool {
-    let Some(idx) = s.find("://") else { return false; };
+    let Some(idx) = s.find("://") else {
+        return false;
+    };
     let scheme = s[..idx].to_ascii_lowercase();
     scheme == "http" || scheme == "https"
 }
@@ -741,7 +743,9 @@ pub fn validate_mounts(mounts: &[MountConf]) -> Result<(), String> {
                     return Err(at("web must not be empty (omit the key instead)".into()));
                 }
                 if w.contains("://") {
-                    return Err(at("web mounts are local directories only (URL not allowed)".into()));
+                    return Err(at(
+                        "web mounts are local directories only (URL not allowed)".into(),
+                    ));
                 }
             }
         }
@@ -2122,9 +2126,9 @@ cache:
             web: web.map(Into::into),
             spa,
             headers: Default::default(),
-        
-..Default::default()
-};
+
+            ..Default::default()
+        };
         // api/web 双写 → Err；双缺 → Err。
         assert!(validate_mounts(&[m("/p", Some("a"), Some("w"), None)]).is_err());
         assert!(validate_mounts(&[m("/p", None, None, None)]).is_err());

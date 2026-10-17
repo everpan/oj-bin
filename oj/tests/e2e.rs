@@ -81,9 +81,9 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         web: None,
         spa: None,
         headers: Default::default(),
-    
-..Default::default()
-});
+
+        ..Default::default()
+    });
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = serve::test_support::now_secs();
     serve::test_support::write_cert_into(
@@ -1165,9 +1165,9 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
         web: None,
         spa: None,
         headers: Default::default(),
-    
-..Default::default()
-});
+
+        ..Default::default()
+    });
     let app = oj::app::App::from_config(
         cfg,
         &serde_json::Value::Null,
@@ -1251,9 +1251,9 @@ async fn html_meta_handler_injects_per_route_tags_end_to_end() {
         web: Some(site.canonicalize().unwrap().display().to_string()),
         spa: Some(true),
         headers: Default::default(),
-    
-..Default::default()
-});
+
+        ..Default::default()
+    });
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     cfg.server.html_cache_control = Some("no-cache".into());
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
@@ -1329,18 +1329,18 @@ async fn multi_static_sites_serve_by_longest_prefix_end_to_end() {
             web: Some("docs".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-},
+
+            ..Default::default()
+        },
         only_js::config::MountConf {
             prefix: "/".into(),
             api: None,
             web: Some("web".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-},
+
+            ..Default::default()
+        },
     ];
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await
@@ -2736,9 +2736,9 @@ async fn meta_dispatch_injects_module_identity() {
         web: Some(site.canonicalize().unwrap().display().to_string()),
         spa: Some(true),
         headers: Default::default(),
-    
-..Default::default()
-});
+
+        ..Default::default()
+    });
     cfg.server.html_meta_handler = Some("/v1/api/meta/html".into());
     let (addr, _h) = serve_cmd::start(cfg, &t, t.join("src"), "/v1/api".into())
         .await

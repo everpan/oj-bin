@@ -16,6 +16,14 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.78（未打标签）
+
+- exec 流式形态（v0.1.78）：`exec.spawn(argv, opts?)` 返回句柄 { rid, pid, stdout, stderr, kill, exit }，stdout/stderr 为 `AsyncIterable<Uint8Array>`，`for await` 逐块消费、`h.exit()` 等退出码、`h.kill()` 整组击杀；`exec.run(argv, opts?)` 扩展 `onStdout`/`onStderr` 回调（增量转发、返回 `{ code }`，不缓冲整段），无回调时与 v0.1.75 行为 / 返回形状完全一致；
+- 共用 opts（timeoutMs 缺省 30_000、硬上限 600_000 钳制；stdin 一次性写入后关写端）；背压经有界 mpsc（16 槽 × 8KiB）实现真实子进程背压——不消费流则子进程在输出填满管道时阻塞，非 bug；
+- 句柄 rid 进 OpState.resource_table，close（JS 释放 / runtime 归还 / 异常丢弃）同步整组击杀子进程，杜绝跨请求 / 租户泄漏与 next_rid 回绕 panic；rid 仅本 runtime 可达，只能 kill 自己 spawn 的会话；
+- 输出 10MiB 上限、超时整组击杀、UTF-8 强制解码、cwd = fs.root、env 空表等硬限制与缓冲形态一致；复用全部既有安全闸门（per_module 授权、argv 模板白名单、`${path:}`/`${raw:}` 占位符、整组 kill）；
+- 配套：devkit 四件同步（api-manual §6 新增「exec 流式形态」小节 + 错误/限制表、scenarios 场景 39/40、SKILL 三条陷阱）、`oj/Cargo.toml` 升 0.1.78、`cargo xtask build` 归置 bin/devkit/。
+
 ## v0.1.77（未打标签）
 
 - `mounts[].api` 支持 `http(s)://` URL：装配期拉取「dist 根 tarball」并解压到内容寻址缓存（`<cache>/<sha256>/`，`cache` 缺省 `<config_dir>/.oj-cache`），以 release 语义服务；完整性锚 = 声明 `sha256`（64 hex），下载内容 sha256 不符即拒启（防篡改 / CDN 漂移）；产物根含 `manifests.yaml` 才视为合法 dist 根；

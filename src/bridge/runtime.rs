@@ -190,6 +190,22 @@ impl RuntimePool {
             eprintln!("warn: runtime discarded (js heap limit fired; not returned to pool)");
             return;
         }
+        // 资源回收门禁（评审 CRITICAL，v0.1.78）：归还前清空 ResourceTable，覆盖
+        // ExecHandleResource::close 同步 kill_tree，杜绝跨请求/租户泄漏子进程/句柄 +
+        // next_rid u32 回绕 panic（DoS）。异常丢弃的 runtime 由 ExecHandleResource::Drop
+        // 兜底（其 close/Drop 均 kill_tree）。
+        {
+            let state = op_state(&rt);
+            let rids: Vec<deno_core::ResourceId> = {
+                let st = state.borrow();
+                st.resource_table.names().map(|(rid, _)| rid).collect()
+            };
+            for rid in rids {
+                if let Ok(resource) = state.borrow_mut().resource_table.take_any(rid) {
+                    resource.close();
+                }
+            }
+        }
         let mut idle = self.idle.borrow_mut();
         if idle.len() < self.max_idle {
             idle.push(rt);

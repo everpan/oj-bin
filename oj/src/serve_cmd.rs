@@ -59,9 +59,9 @@ fn fold_cli_mounts(cfg: &mut Config, a: &ServeArgs) -> Result<(), String> {
             web: None,
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-};
+
+            ..Default::default()
+        };
         match idx {
             Some(i) => cfg.mounts[i] = entry,
             None => cfg.mounts.push(entry),
@@ -1001,9 +1001,9 @@ pub fn load_app_config(
                     web: None,
                     spa: None,
                     headers: Default::default(),
-                
-..Default::default()
-}),
+
+                    ..Default::default()
+                }),
             }
             PathBuf::from(d)
         }
@@ -1043,9 +1043,9 @@ pub fn load_app_config(
                     web: None,
                     spa: None,
                     headers: Default::default(),
-                
-..Default::default()
-}),
+
+                    ..Default::default()
+                }),
             }
             p
         }
@@ -1169,9 +1169,9 @@ fn upsert_web(cfg: &mut Config, prefix: &str, dir: String) {
             web: Some(dir),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-}),
+
+            ..Default::default()
+        }),
     }
 }
 
@@ -1211,9 +1211,9 @@ pub async fn start(
         web: None,
         spa: None,
         headers: Default::default(),
-    
-..Default::default()
-});
+
+        ..Default::default()
+    });
     // top 传 Null：测试入口不依赖顶层未知段（config key 解析），保持旧签名零改动。
     // 槽位 None：cargo test 环境性入口无热更执行器（fail-closed）。
     let app = App::from_config(
@@ -2669,9 +2669,9 @@ mod tests {
             web: Some("web".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         assert!(admission_gate(&c).is_ok());
     }
 
@@ -2693,9 +2693,9 @@ mod tests {
             web: Some("old".into()),
             spa: Some(true),
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         fold_cli_app_paths(&mut c, &["/docs=new".into(), "/app=dist/app".into()]).unwrap();
         assert_eq!(c.mounts.len(), 2);
         let docs = c.mounts.iter().find(|m| m.prefix == "/docs").unwrap();
@@ -2711,9 +2711,9 @@ mod tests {
             web: Some("old-root".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         fold_cli_app_paths(&mut c, &["web".into(), "/x=dx".into()]).unwrap();
         assert_eq!(c.mounts.len(), 2);
         assert!(c.mounts[0].web.as_deref().unwrap().ends_with("web"));
@@ -2725,9 +2725,9 @@ mod tests {
             web: None,
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         fold_cli_app_paths(&mut c, &["/docs=d".into()]).unwrap();
         assert_eq!(c.mounts.len(), 2);
         assert!(c.mounts[0].api.is_some() && c.mounts[1].web.is_some());
@@ -2745,9 +2745,9 @@ mod tests {
             web: None,
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         let a = ServeArgs {
             api_path: Some("src".into()),
             base: Some("/cli".into()),
@@ -3321,9 +3321,9 @@ mod tests {
             web: Some(".".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .unwrap();
@@ -3345,9 +3345,9 @@ mod tests {
             web: Some("no-such-dir".into()),
             spa: None,
             headers: Default::default(),
-        
-..Default::default()
-});
+
+            ..Default::default()
+        });
         let e = start(cfg, &t.0, t.0.join("src"), "/v1/api".into())
             .await
             .err()

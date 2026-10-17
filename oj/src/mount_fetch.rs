@@ -23,11 +23,12 @@ const MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// 条目数上限。
 const MAX_ENTRIES: usize = 100_000;
 /// 单条目逻辑大小上限。
-const MAX_ENTRY_BYTES: u64 = 1 * 1024 * 1024 * 1024;
+const MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// per-sha256 进程内互斥，串行化同 URL 的物化（消并发 rename 竞态 / 崩溃窗口死锁）。
-static SHA_LOCKS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static SHA_LOCKS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// 取（或创建）该 sha256 的专用锁。
 fn sha_lock(sha: &str) -> std::sync::Arc<Mutex<()>> {
@@ -128,7 +129,10 @@ async fn do_fetch(url: &str, sha: &str, cache_root: &Path) -> Result<PathBuf, St
         .map_err(|e| format!("mounts: fetch {url} failed: {e}"))?;
     if !resp.status().is_success() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("mounts: fetch {url} bad status {status}", status = resp.status()));
+        return Err(format!(
+            "mounts: fetch {url} bad status {status}",
+            status = resp.status()
+        ));
     }
     let mut stream = resp.bytes_stream();
     let mut hasher = Sha256::new();
@@ -145,13 +149,13 @@ async fn do_fetch(url: &str, sha: &str, cache_root: &Path) -> Result<PathBuf, St
             return Err("mounts: download exceeds 512 MiB cap".into());
         }
         hasher.update(&chunk);
-        tmpf.write_all(&chunk)
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                format!("mounts: write temp: {e}")
-            })?;
+        tmpf.write_all(&chunk).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("mounts: write temp: {e}")
+        })?;
     }
-    tmpf.flush().map_err(|e| format!("mounts: flush temp: {e}"))?;
+    tmpf.flush()
+        .map_err(|e| format!("mounts: flush temp: {e}"))?;
     drop(tmpf);
 
     let got = hex(&hasher.finalize());
@@ -184,34 +188,18 @@ async fn do_fetch(url: &str, sha: &str, cache_root: &Path) -> Result<PathBuf, St
     std::fs::write(stage.join(".complete"), b"")
         .map_err(|e| format!("mounts: write .complete: {e}"))?;
 
-    // 5) O_EXCL 占位 target，再 rename staging → target。
-    let placeholder = cache_root.join(format!(".ph-{sha}-{pid}-0"));
-    let _ = std::fs::remove_file(&placeholder);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&placeholder)
-    {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if target.join(".complete").is_file() {
-                let _ = std::fs::remove_file(&placeholder);
-                let _ = std::fs::remove_dir_all(&stage);
-                return Ok(target);
-            }
-            return Err(format!("mounts: target {target} already exists", target = target.display()));
-        }
-        Err(e) => return Err(format!("mounts: create target placeholder: {e}")),
-    }
-    let _ = std::fs::remove_file(&placeholder);
-
+    // 5) 原子 rename staging → target 即 O_EXCL 提交：多数平台下把目录 rename 到已存在
+    //    的非空 target 会失败（AlreadyExists），以此天然防并发重复提交；命中即视为已落盘。
     match std::fs::rename(&stage, &target) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if target.join(".complete").is_file() {
                 return Ok(target);
             }
-            return Err(format!("mounts: target {target} already exists", target = target.display()));
+            return Err(format!(
+                "mounts: target {target} already exists",
+                target = target.display()
+            ));
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&target);
@@ -251,7 +239,10 @@ fn extract_tarball(tgz: &Path, dest: &Path) -> Result<(), String> {
         // pax / gnu 元数据 / 稀疏 / 未知类型：SKIP（不写出、不拒绝）。
         match etype {
             EntryType::Regular | EntryType::Directory => {}
-            EntryType::Symlink | EntryType::Link | EntryType::Char | EntryType::Block
+            EntryType::Symlink
+            | EntryType::Link
+            | EntryType::Char
+            | EntryType::Block
             | EntryType::Fifo => {
                 return Err(format!(
                     "mounts: archive entry {name_lossy} rejected: unsupported entry type"

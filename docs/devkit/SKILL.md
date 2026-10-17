@@ -29,6 +29,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    crontab.yaml，管理面 `{base}/tasks`，v0.1.28）。
    **发邮件 → §6「mail」**（配置顶层 `smtp:` + `oj-mail` 插件；`send/sendSync/enqueue/result/sendRaw`；
    **发件人/收件人白名单 fail-closed**，空表即拒；附件用 `{blobKey}`/`{path}` 引用，勿内联 base64）。
+   **跑外部命令 → §6「exec」**；实时日志流式（`exec.spawn` 句柄）/ 中途 kill（整组击杀）→ scenarios 场景 39/40（v0.1.78）。
    完整手册见仓库 `docs/mail-smtp.md`。
    **LDAP/AD 登录鉴证或目录查询 → §6「ldap」**（配置顶层 `ldap:` + `oj-ldap` 插件；
    v0.1.54 起调用面为 `axis("ldap").bind/search/search_paged/whoami/compare`，reject 模型，
@@ -158,6 +159,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `Kafka("x")` / `RabbitMQ("x")` 是 undefined | config `kafkas:`/`rabbits:` 段没配该实例名（或对应插件未装配） |
 | poll 报 "requires a task context" | 消费方法只能在 `src/tasks/` 任务文件里用；HTTP/WS 侧发消息用 `send`/`publish` |
 | 任务里 `setTimeout` 报 not defined | 运行时无 timer 全局——用 `await tasks.sleep(ms)` |
+| `mounts[].api` 填了 URL 但启动报 `URL api requires sha256 integrity anchor` | 远程挂载必须声明 64 hex `sha256` 完整性锚（v0.1.77）——不声明就拒启，别指望它「信任」任何 CDN |
+| 远程挂载启动报 `sha256 mismatch` | 下载内容摘要与 config 声明不符——CDN 漂移 / 被篡改 / 缓存损坏都会触发；本地用 `oj build --bundle` 打出并打印 sha256 重新核对 |
+| 远程挂载报 `dist root missing manifests.yaml` / `extraction rejected` | dist 根 tarball 解压后须含 `manifests.yaml`；条目若带符号链接 / tar-slip / 特殊文件会被解压器 fail-fast 拒启（与本地 `dist/` 一致，发布前先本地 `oj build` 验证） |
+| `oj build --bundle` 报 `manifest not found` 或产物根不对 | `--bundle` 要求先有 `dist/manifests.yaml`；它打的是「整站 dist 根」空前缀包（解压即 dist 根），不是单模块 `*.tgz`——别把 per-module `*.tgz` 当远程挂载源 |
+| `--api-path` 传了 URL 启动报错 | 远程挂载的 sha256 只在 config 声明期存在，CLI 折叠期无此上下文——改在 `config.yaml` 的 `mounts[].api` 里声明（v0.1.77） |
+
 | poll 报 "instance busy" | 同一实例已有活跃 poller（任务上下文单 poller）——别并发 poll |
 | 任务收不到消息就退了/killed | `timeoutMs` 应远小于 `stop_grace_secs`；被 killed = 宽限到期看门狗强杀（不响应 `tasks.stopping()`） |
 | 重启后整段消息重复消费 | commit 按 offset+1 推进该分区——多分区主题按分区各 commit 一次（at-least-once，处理须幂等） |
@@ -261,12 +268,16 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | exec 子进程里 `argv[0]` 和模板首 token 不一致 | 预期：宿主侧把首 token 解析为**绝对路径**（"oj"→服务进程自身，其余 PATH 解析）再传给子进程；模板首 token 必须是裸名（路径分隔符直接拒）（v0.1.75） |
 | `exec.run` 大 stdin 报 `exec timed out after N ms` | stdin 写入也在超时窗口内：子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（缺省 30s）——大 DDL / 大输入显式调大 `timeoutMs`（硬上限 600s，超出钳制）（v0.1.75） |
 | `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |
+| Windows 上 `exec.run(["sh","-c",...])` 必败（`command resolve failed`） | Windows 无 `sh` 可执行、且不自动探测 Git Bash——跨平台模板别写 `sh -c`，改用 `cmd /c`：`["cmd","/c","echo","hello"]` / `["cmd","/c","type","__JAIL__/in.txt"]`；`cmd` 由 resolver 解析为绝对路径（如 `C:\Windows\System32\cmd.exe`）后 spawn（v0.1.75 既有行为，文档补全） |
 | 安装器靠 `oj migrate --format json` 的 JSON 解析成功就当迁移成功 | json `error` 字段已脱敏（`<scheme>://***@host`，不漏密码），但**退出码**才是成败真源：任一模块失败 json 仍成功解析、只是 `results[]` 里 `ok=false` 且进程退非 0——安装器必须校验 exit code，不能只 `JSON.parse` 成功 |
 | 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
 | `crypto.md5Hex` 用在凭据/签名/完整性校验上 | MD5 已密码学破损——仅限**非安全场景**（缓存键/etag/旧系统兼容），安全用途改 `sha256Hex` 或 `bcrypt`（v0.1.75） |
 | 写 `http.module.name = "x"` 抛 `TypeError: Cannot assign to read only property` | 预期（v0.1.76）：`http.module` 是框架授信依据（归属守卫/bound_db/平台特权）故冻结只读。strict（ESM / api 文件 CJS 包装）下写/delete 抛错；`require()` 的 CJS 代码（sloppy）写它静默无效——两条路径都改不了框架状态。只读用即可；测试要伪造身份走真实路由 |
 | `http.module` 是 `null`，`http.module.name` 直接 TypeError | 按 handler 文件所在目录判定（非请求来源）：任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期无模块上下文——先判 `null`（与 `http.user` 匿名同款）；页面 meta 合成派发在模块目录内**有值**（v0.1.76） |
 | 把 `http.module.version` 回显给外部客户端 | version 是指纹面——日志/内部打点用即可，勿进响应体/错误消息外发给客户端（v0.1.76） |
+| `exec.spawn` 后不 `for await` 消费，子进程卡住不退 | 真实子进程背压：stdout 经有界 mpsc（16 槽 × 8KiB）送达，JS 不拉取 → 通道满 → drain 在 send 挂起 → 子进程管道满 → 子进程自然暂停。不是 bug；先消费（或 break）再 `h.exit()` 才会返回（v0.1.78） |
+| `exec.run` 带 `onStdout`/`onStderr` 回调后还想要整段 stdout | 回调形态**不缓冲**整段输出，只回 `{ code }`——整段需自己累计回调里的 chunk；要整段用无回调的 `exec.run`（返回 `{ code, stdout, stderr }`）（v0.1.78） |
+| 拿 `exec.spawn` 的 `rid` 去 kill 别人的进程 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；`kill` 只杀自己 spawn 的会话，无 pid 入参，跨模块 / 跨请求不可达（v0.1.78） |
 
 ## 手册
 
