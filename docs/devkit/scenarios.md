@@ -656,7 +656,7 @@ SQL trace sql="select * from account where id = ?" db=default ms=1.23 rows=1 tx=
 ### ② 在 handler 里取本请求画像
 
 ```ts
-const rows = await db.query("select * from account where id = ?", [id]);
+const rows = await db.table("account").where({ field: "id", op: "eq", value: id }).all();
 const prof = db.sqlProfile();
 // { count, totalMs, slow:[{sql,ms,db}], byDb:{default:{count,ms}}, events:[{sql,params,db,inTx,source,ms,rows,ok,error}] }
 log.info(`ran ${prof.count} SQL in ${prof.totalMs.toFixed(1)}ms`);
@@ -944,12 +944,15 @@ auto，两命令相反）——脚本操作前先确认 `oj migrate` 已跑过�
 ```ts
 // 一次性修复：role 为空的历史账号补默认角色；--dry-run 只对账不改数据。
 const dry = args.includes("--dry-run");
-const rows = await db.query("select id, name from account where role is null or role = ''", []);
+const rows = await db.table("account")
+  .select(["id", "name"])
+  .where({ or: [{ field: "role", op: "isnull" }, { field: "role", op: "eq", value: "" }] })
+  .all();
 console.log(`待修复 ${rows.length} 条`);
 for (const r of rows) {
   console.log("  fix", r.id, r.name);
   if (!dry) {
-    await db.exec("update account set role = ? where id = ?", ["member", r.id]);
+    await db.table("account").where({ field: "id", op: "eq", value: r.id }).update({ role: "member" }).run();
   }
 }
 log.info("done", "fixed", dry ? 0 : rows.length);
@@ -1631,7 +1634,7 @@ UTF-8 文本而失真（图片/压缩包乱码）。
 ```ts
 export default {
   async get({ id }: { id: string }) {
-    const rows = await db.query("select data, name from attachment where id = ?", [id]);
+    const rows = await db.table("attachment").select(["data", "name"]).where({ field: "id", op: "eq", value: id }).all();
     const s = json.stream({
       contentType: "application/octet-stream",
       fileName: String(rows[0].name),  // → Content-Disposition: attachment; filename*=UTF-8''<pct-encoded>

@@ -1091,6 +1091,8 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
 | `db.dialect()` | `dialect(): "sqlite" \| "mysql" \| "postgres"` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 
+> **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
+
 **SQL 执行追踪**（v0.1.51，开发期可观测性）：
 
 dev 模式（无 `dist/manifests.yaml`）默认开启 SQL 追踪，release 默认关闭（可由 `db_trace.enabled: true` 强制开）。所有 SQL（`db.query/exec/stream`、`db.tx` 内 `tx.query/exec`、`db.nextSeq`）在 op 层统一计时并产出事件，同时喂给两个出口：
@@ -1117,6 +1119,14 @@ db_trace:
 
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
+
+- **业务优先用构造器**：业务读写应优先用 `db.table(...)` 构造器，而非手写 `db.query` /
+  `db.exec` 裸 SQL。构造器按目标方言（sqlite/mysql/postgres）**自动生成正确 SQL**，业务无需
+  关心方言差异，因此同一份 handler 可在多库 / 跨引擎间迁移——**这是获得多库迁移能力的关键前提**：
+  裸 `db.query` 一旦写死方言特有语法（如 `INSERT IGNORE`、反引号标识符、MySQL 分页 `limit a,b`
+  等）就会锁死到单一引擎，迁移时须逐条改写。**仅当构造器不支持的语句（DDL、部分非 CRUD 语义）
+  才退回 `db.query` / `db.exec`**，且仍须用 `?` 绑定参数、避免方言特有语法（见下「同一段 SQL、三
+  引擎跑通」）。
 
 ```ts
 const rows = await db.table("account")
@@ -1667,9 +1677,13 @@ platform:
     实现，无第二套语义）；放行后以 canonical 绝对路径传给子进程。
   - `${raw:NAME}`：仅字面收集，拒 `-` 开头（option 注入）与绝对形态（`/`、`\`、盘符起手），
     拒收以 `exec template mismatch` 报出（中段 `-`/`/` 合法，只看起手形态）。
-  - 占位符名须匹配 `[A-Za-z_][A-Za-z0-9_]*`；未知占位符类型 / 嵌入 / 未闭合 / 非法名等模板
-    语法错在**调用期** fail-closed 抛 `exec template parse failed (<raw>): …`（配置面原样
-    保存、解析期报错是设计约定的时点）。
+  - 占位符名须匹配 `[A-Za-z_][A-Za-z0-9_]*`；未知占位符类型 / 一个 token 含多占位符 /
+    未闭合 / 非法名等模板语法错在**调用期** fail-closed 抛
+    `exec template parse failed (<raw>): …`（配置面原样保存、解析期报错是设计约定的时点）。
+  - 占位符可带**字面前后缀**（同一 token 内），用于 Windows `cmd /c echo %VAR%` 的 `%…%`
+    变量定界：`cmd /c echo %${raw:NAME}%` 中 `%` 为字面定界符，占位符吸收中间子串 `NAME`，
+    重建时以模板前缀/后缀原样还原为 `%NAME%`；安全不变量不变——占位符仍吸收恰一个 argv
+    token，前后字面量来自受信模板、不引入注入面。
 - **命令解析（模板首 token）**：必须是**裸名**——不接受占位符、不含 `/` `\` 路径分隔符。
   `"oj"` 特判解析为服务进程自身（`current_exe()`，serve 进程即 bin/oj，同版本自保证）；
   其余裸名在**宿主侧**按父进程 PATH 解析为**绝对路径**后 spawn（子进程 env 已清空、不继承
