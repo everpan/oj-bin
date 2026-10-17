@@ -1463,13 +1463,34 @@ export default {
     //
     // 平台差异均为「命令语义」而非契约差异：
     // - echo/type/exit 经 cmd /c（Windows 无独立 echo/cat 可执行）；
-    // - cmd 的 echo 输出 CRLF → stdout 断言按平台取 \r\n；
+    // - cmd 的 echo 输出 CRLF、type 不补行尾 → stdout 断言一律经下方
+    //   「行尾真相源」（IN_TXT / echo_out）拼装；
     // - 白名单外变量经 echo %VAR% 原样打出字面量（printenv 的 exit 1
     //   无对应物）→ 断言「值不可见」而非「空输出」；
     // - 超时用 ping -n 31（≈30s；timeout.exe 不支持输入重定向会立即退出）；
     // - 信号终止 / 非 UTF-8 stderr / 组杀残留无 Windows 对应物（kill_tree
     //   仅杀直接子进程，api-manual §6 已声明）——留 unix 面覆盖，编解码与
     //   模板账本逻辑本身平台无关。
+
+    // ----- Windows 夹具的「行尾真相源」 -----
+    // cmd 家族有两条输出约定，缺一不可（违反任一条都会让断言变红）：
+    // - `echo` 的输出一律以 CRLF 收尾；
+    // - `type` 原样吐文件字节，**不**补行尾（文件无行尾 → 输出亦无行尾）。
+    // 因此所有 stdout / out 断言一律经下面这两个构造器拼装，**禁止在断言里
+    // 手写 "\r\n" / "\n"**：行尾字面散落在 8 处时，只能逐个被 CI 打出来，
+    // 修完一处下一处接着红（v0.1.79 前已反复发生）。
+
+    /// in.txt 夹具内容：`type` 原样吐字节，故 `s1_cat` 的期望值必须与写入
+    /// 内容**同源**（此前断言写死 "hello-jail\r\n"、文件写的却是无行尾的
+    /// "hello-jail"，两处一旦漂移就红）。
+    #[cfg(windows)]
+    const IN_TXT: &str = "hello-jail";
+
+    /// `cmd /c echo <s>` 的输出（echo 恒以 CRLF 收尾）。
+    #[cfg(windows)]
+    fn echo_out(s: &str) -> String {
+        format!("{s}\r\n")
+    }
 
     /// Windows 场景 handler 表（占位符经 replace 注入实际路径/变量名）。
     #[cfg(windows)]
@@ -1484,7 +1505,10 @@ export default {
   s3_raw_abs: async () => json.ok(await exec.run(["sh", "-c", "/abs"])),
   s4_env_on: async () => json.ok(await exec.run(["cmd", "/c", "echo", "%__VON__%"])),
   s4_env_off: async () => json.ok(await exec.run(["cmd", "/c", "echo", "%__VOFF__%"])),
-  s5_big: async () => json.ok(await exec.run(["cmd", "/c", "type", "__JAIL__/big.bin"])),
+  // 10MiB 经 cmd /c type 吐出的速率受机器负载与实时防护扫描影响，显式放宽到
+  // 40s（仍在下方用例 60s 窗口内）：否则 30s 缺省可能先到，报 timed out 而
+  // 拿不到本场景要点的 output limit exceeded 文案。
+  s5_big: async () => json.ok(await exec.run(["cmd", "/c", "type", "__JAIL__/big.bin"], { timeoutMs: 40000 })),
   s6_timeout: async () => json.ok(await exec.run(["ping", "-n", "31", "127.0.0.1"], { timeoutMs: 400 })),
   s7_exit3: async () => json.ok(await exec.run(["cmd", "/c", "exit", "3"])),
   s9_oj: async () => json.ok(await exec.run(["oj", "/c", "echo", "ping"])),
@@ -1577,7 +1601,7 @@ export default {
     async fn exec_bdd_main_scenarios_windows() {
         let jail = tmp("jail").canonicalize().unwrap();
         let outside = tmp("outside").canonicalize().unwrap();
-        std::fs::write(jail.join("in.txt"), b"hello-jail").unwrap();
+        std::fs::write(jail.join("in.txt"), IN_TXT.as_bytes()).unwrap();
         std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
         std::fs::write(jail.join("big.bin"), vec![b'a'; OUTPUT_LIMIT + 1]).unwrap();
 
@@ -1621,10 +1645,10 @@ export default {
         // S1：合法模板 + jail 内路径 → code=0，stdout 正确（cmd echo 为 CRLF）。
         let d = data_of(&b, &api, "s1_echo").await;
         assert_eq!(d["code"], 0);
-        assert_eq!(d["stdout"], "hello\r\n");
+        assert_eq!(d["stdout"], echo_out("hello"));
         let d = data_of(&b, &api, "s1_cat").await;
         assert_eq!(d["code"], 0);
-        assert_eq!(d["stdout"], "hello-jail\r\n");
+        assert_eq!(d["stdout"], IN_TXT);
 
         // S2：literal 被替换（argv 夹 --bad）→ 模板失配 NotCapable。
         denied_of(&b, &api, "s2_inject", "template mismatch").await;
@@ -1638,7 +1662,7 @@ export default {
         // %NAME% 字面量 → 断言「值不出现」而非「空输出」）。
         let d = data_of(&b, &api, "s4_env_on").await;
         assert_eq!(d["code"], 0);
-        assert_eq!(d["stdout"], "oj-exec-visible\r\n");
+        assert_eq!(d["stdout"], echo_out("oj-exec-visible"));
         let d = data_of(&b, &api, "s4_env_off").await;
         assert!(
             !d["stdout"].as_str().unwrap().contains("oj-exec-hidden"),
@@ -1658,7 +1682,7 @@ export default {
 
         // S9："oj" 模板 → 解析器以 "oj" 调用（注入 cmd.exe，stdout 确定）。
         let d = data_of(&b, &api, "s9_oj").await;
-        assert_eq!(d["stdout"], "ping\r\n");
+        assert_eq!(d["stdout"], echo_out("ping"));
         assert!(
             seen.lock().unwrap().iter().any(|n| n == "oj"),
             "resolver calls: {:?}",
@@ -1978,7 +2002,9 @@ export default {
     return json.ok({ code });
   },
   s5_big: async () => {
-    const h = await exec.spawn(["cmd", "/c", "type", "__BIG__"]);
+    // 同主场景 s5_big：cmd /c type 吐 10MiB 的速率不可控，放宽超时窗（缺省
+    // 30s 可能先到，把「超限击杀」误呈为「超时击杀」）。
+    const h = await exec.spawn(["cmd", "/c", "type", "__BIG__"], { timeoutMs: 40000 });
     let n = 0;
     for await (const c of h.stdout) n += c.byteLength;
     const { code } = await h.exit();
@@ -2078,11 +2104,7 @@ export default {
         assert_eq!(d["hasStdout"], true);
         assert_eq!(d["hasStderr"], true);
         assert_eq!(d["code"], 0);
-        assert_eq!(
-            d["out"],
-            "hello
-"
-        );
+        assert_eq!(d["out"], echo_out("hello"));
 
         // SS2：回调形态实时收到分块（ping 多行输出）。
         let d = data!("s2_realtime");
@@ -2108,16 +2130,8 @@ export default {
         // SS7：回调形态 onStdout 累计 + 返回完整 stdout。
         let d = data!("s7_callback");
         assert_eq!(d["code"], 0);
-        assert_eq!(
-            d["out"],
-            "x
-"
-        );
-        assert_eq!(
-            d["full"],
-            "x
-"
-        );
+        assert_eq!(d["out"], echo_out("x"));
+        assert_eq!(d["full"], echo_out("x"));
 
         // SS8：向后兼容 exec.run(argv) 无 opts -> 缓冲 {code,stdout}。
         let d = data!("s8_compat");

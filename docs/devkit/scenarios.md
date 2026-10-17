@@ -2873,6 +2873,7 @@ export async function post() {
 | rid 跨请求 / 跨模块共享 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；只有自己 spawn 的会话能把 rid 传给 `kill`，跨模块 / 跨请求不可达 |
 | 忘了 `exit()` 也能回收 | 句柄 close（JS 释放 / runtime 归还 / 异常丢弃）会同步整组击杀子进程，不会泄漏；但显式 `await h.exit()` 才能拿到退出码 |
 | 输出二进制 | exec 强制 UTF-8 解码，非 UTF-8 输出直接抛 `exec: stdout is not valid UTF-8` |
+| Windows 上行尾 / 编码 / 分块解码 | `cmd /c echo` 输出以 CRLF 收尾（oj 不归一，跨平台比对用 `trimEnd()`）；输出含中文时为本地代码页、会被 UTF-8 解码拒（先 `chcp 65001`）；流式逐块解码要在块边界合并字节，别逐块新建 `TextDecoder`（v0.1.79） |
 
 ## 场景 40：长任务中途 kill（超时整组击杀 / 主动 kill，v0.1.78）
 
@@ -2940,4 +2941,5 @@ export async function post() {
 | 只 kill 没消费，`exit` 不返回 | 同场景 39 背压：先 break 退出 `for await`，再 `await h.exit()` |
 | 误以为能杀别人的进程 | rid 仅本 runtime 可达；`kill` 只杀自己 spawn 的会话，无 pid 入参 |
 | `timeoutMs` 想设很大 | 硬上限 600_000（10 分钟），超出被钳制；信号 kill 整组包含其子孙，避免僵尸 |
+| Windows 上以为 kill 后子进程就没了 | Windows 无进程组，只杀直接子进程：子进程再派生的孙进程会残留（设计已声明）——别依赖「杀干净」做互斥（v0.1.79） |
 

@@ -269,6 +269,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `exec.run` 大 stdin 报 `exec timed out after N ms` | stdin 写入也在超时窗口内：子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（缺省 30s）——大 DDL / 大输入显式调大 `timeoutMs`（硬上限 600s，超出钳制）（v0.1.75） |
 | `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |
 | Windows 上 `exec.run(["sh","-c",...])` 必败（`command resolve failed`） | Windows 无 `sh` 可执行、且不自动探测 Git Bash——跨平台模板别写 `sh -c`，改用 `cmd /c`：`["cmd","/c","echo","hello"]` / `["cmd","/c","type","__JAIL__/in.txt"]`；`cmd` 由 resolver 解析为绝对路径（如 `C:\Windows\System32\cmd.exe`）后 spawn（v0.1.75 既有行为，文档补全） |
+| Windows 上 exec 输出比对总差一个 `\r` | `cmd /c echo` 恒以 CRLF 收尾、`cmd /c type` 原样吐文件字节（不补行尾），oj **不做** CRLF→LF 归一（与 `Deno.Command.output` / Node 同口径）——跨平台文本比对用 `trimEnd()` / `split(/\r?\n/)`，别写死 `"\n"`（v0.1.79） |
+| Windows 上 exec 跑输出中文的命令报 `not valid UTF-8` | 子进程输出是本地代码页（GBK / CP1252），exec 强制 UTF-8 解码 → 抛 `exec: stdout is not valid UTF-8`；把 `chcp 65001` 写进 `cmd /c` 语句（v0.1.79） |
 | 安装器靠 `oj migrate --format json` 的 JSON 解析成功就当迁移成功 | json `error` 字段已脱敏（`<scheme>://***@host`，不漏密码），但**退出码**才是成败真源：任一模块失败 json 仍成功解析、只是 `results[]` 里 `ok=false` 且进程退非 0——安装器必须校验 exit code，不能只 `JSON.parse` 成功 |
 | 升级后 `crypto.sha256Hex(123)` / `sha256Hex(null)` 抛 TypeError | v0.1.75 行为变更（fail-loud）：非 string/二进制入参旧版经 `String()` 强转求摘要，现直接抛错——旧脚本显式 `String(x)` 再传，或改传 `Uint8Array` |
 | `crypto.md5Hex` 用在凭据/签名/完整性校验上 | MD5 已密码学破损——仅限**非安全场景**（缓存键/etag/旧系统兼容），安全用途改 `sha256Hex` 或 `bcrypt`（v0.1.75） |

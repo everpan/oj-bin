@@ -16,6 +16,14 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.79（未打标签）
+
+- Windows 上 exec 的输出形态文档化（**用户可见行为补录，非行为变更**）：`cmd /c echo` 恒以 CRLF 收尾、`cmd /c type <file>` 原样吐文件字节（不补行尾）；exec 返回子进程**原始字节**、不做 CRLF→LF 归一（与 `Deno.Command.output` / Node `child_process` 同口径）——跨平台文本比对请用 `trimEnd()` / `split(/\r?\n/)`，别写死 `"\n"`；
+- Windows 子进程输出是本地代码页（GBK / CP1252），含非 ASCII（中文路径 / 报错 / `ping` 本地化文案）时即落 `exec: stdout is not valid UTF-8`（stderr 同文案）——要 UTF-8 输出，把 `chcp 65001` 写进 `cmd /c` 语句；此为 Windows 控制台既有行为，非 oj 限制；
+- 配套：devkit 四件同步（api-manual §6「Windows 平台命令形态」两条 + 错误表非 UTF-8 条目、SKILL 陷阱速查两条、scenarios 场景 39/40 各一条、README 版本行）、`oj/Cargo.toml` 升 0.1.79、`cargo xtask build` 归置 `bin/devkit/`。
+
+- **fix（Windows CI）**：`src/bridge/exec.rs` 两个 `#[cfg(windows)]` BDD 用例的行尾期望值此前散落在 8 处字面，修完一处下一处接着红。现两处夹具一律经新增的「行尾真相源」拼装——`s1_cat` 的期望值与写入文件的 `IN_TXT` 同源（`type` 不补行尾），echo 类断言一律经 `echo_out`（cmd 的 `echo` 恒补 CRLF）；大文件夹具（10MiB）显式 `timeoutMs: 40000`，避免 `cmd /c type` 在慢机器上让 30s 缺省先到、把「输出超限」误呈为「超时」。生产代码未改。
+
 ## v0.1.78
 
 - exec 流式形态（v0.1.78）：`exec.spawn(argv, opts?)` 返回句柄 { rid, pid, stdout, stderr, kill, exit }，stdout/stderr 为 `AsyncIterable<Uint8Array>`，`for await` 逐块消费、`h.exit()` 等退出码、`h.kill()` 整组击杀；`exec.run(argv, opts?)` 扩展 `onStdout`/`onStderr` 回调（增量转发、返回 `{ code }`，不缓冲整段），无回调时与 v0.1.75 行为 / 返回形状完全一致；

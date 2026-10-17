@@ -1728,8 +1728,19 @@ WSL / MSYS**：
   上行为不一致。Windows 命令形态请在模板里直接写 `cmd /c`，不要依赖 sh 仿真层。
 - kill_tree 在 Windows 上无进程组对应物，仅 `start_kill()` 杀直接子进程（与 unix 整组击杀
   语义不同）；超时 / 输出超限仍触发兜底 kill，但孙进程可能残留——设计已声明此差异。
+- **输出行尾随平台不同，oj 刻意不做归一**（v0.1.79）：`cmd /c echo x` 的 stdout 是
+  `"x\r\n"`（cmd 的 `echo` 恒以 CRLF 收尾），而 `cmd /c type <file>` **原样吐文件字节**、
+  不补行尾（文件无行尾 → 输出亦无行尾）。exec 返回子进程**原始字节**（与
+  `Deno.Command.output` / Node `child_process` 同口径），不做 CRLF→LF 归一——
+  二进制 / 压缩包管道必须保真；跨平台文本比对请用 `trimEnd()` 或 `split(/\r?\n/)`，
+  **不要**在跨平台代码里写死 `"\n"`。
+- **Windows 子进程输出是本地代码页（GBK / CP1252 等），不是 UTF-8**（v0.1.79）：
+  输出含非 ASCII（中文路径、中文报错、`ping` 的本地化文案等）时，exec 的 UTF-8
+  强制解码即抛 `exec: stdout is not valid UTF-8 (binary output unsupported)`
+  （stderr 同文案）。要 UTF-8 输出，把 `chcp 65001` 写进 `cmd /c` 语句
+  （`["cmd","/c","chcp 65001 >nul && echo <语句>"]`）——这是 Windows 控制台的既有
+  行为，不是 oj 的限制。
 
-**
 #### exec 流式形态（v0.1.78）：exec.spawn 句柄 + exec.run 回调
 
 **exec** 提供两种消费形态，统一建在 Rust 侧「spawn 到 双管道并发 drain 到 边读边推进」的流式底座之上；A（回调）是 B（句柄）之上的 JS 糖，不引入第二套读循环、不新增命令构造面（安全闸门全复用）。
@@ -1775,7 +1786,7 @@ Error）：
 | `exec: spawn failed for '<abs>': <e>` | Error | 进程启动失败 |
 | `exec timed out after <N> ms (process group killed)` | Error | 超时到期（整组击杀） |
 | `exec output limit exceeded (10485760 bytes cap, stdout+stderr combined)` | Error | 输出合计超 10MB |
-| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8 |
+| `exec: stdout is not valid UTF-8 (binary output unsupported)` / `exec: stderr is not valid UTF-8 (binary output unsupported)` | Error | 输出流非 UTF-8（Windows 上本地代码页（GBK / CP1252）输出含非 ASCII 即落此条，见 §6「Windows 平台命令形态」，v0.1.79） |
 | `exec: stdin write failed: <e>` | Error | stdin 写入失败 |
 
 ### yaml —— YAML 读写原语（v0.1.75，无特权，始终可用）
