@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.78（未打标签）
+## v0.1.78
 
 - exec 流式形态（v0.1.78）：`exec.spawn(argv, opts?)` 返回句柄 { rid, pid, stdout, stderr, kill, exit }，stdout/stderr 为 `AsyncIterable<Uint8Array>`，`for await` 逐块消费、`h.exit()` 等退出码、`h.kill()` 整组击杀；`exec.run(argv, opts?)` 扩展 `onStdout`/`onStderr` 回调（增量转发、返回 `{ code }`，不缓冲整段），无回调时与 v0.1.75 行为 / 返回形状完全一致；
 - 共用 opts（timeoutMs 缺省 30_000、硬上限 600_000 钳制；stdin 一次性写入后关写端）；背压经有界 mpsc（16 槽 × 8KiB）实现真实子进程背压——不消费流则子进程在输出填满管道时阻塞，非 bug；
