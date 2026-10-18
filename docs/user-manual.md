@@ -49,7 +49,7 @@ oj exec    [<file> | -e <code> | --repl] [-c config.yaml] [-d dir] [--db name] [
 oj migrate [-c config.yaml] [-d <src|dist>] [--db name] [--baseline] [--module M]
 oj test fixture [-c config.yaml] [-d <src|dist>] [--db name] [--module M]
 oj schema diff [-c config.yaml] [-d <src|dist>] [--db name]
-oj secret  keygen [--out-dir D] [--force] | seal [-k pub.pem] [VALUE] | open [-k priv.pem] [VALUE]
+oj secret  keygen [--out-dir D] [--force] [--alg x25519|ed25519] | seal [-k pub.pem] [VALUE] | open [-k priv.pem] [VALUE]
 oj openapi [-c config.yaml] [-d dir] [--base B] [--check] [-o out.json]
 ```
 

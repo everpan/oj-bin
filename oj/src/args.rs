@@ -143,12 +143,24 @@ pub struct FixtureArgs {
     pub db: Option<String>,
 }
 
-/// `oj secret keygen [--out-dir D] [--force]`：生成密封密钥对（X25519，唯一信封算法）。
+/// `oj secret keygen` 的密钥算法族（v0.1.80）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SecretKeygenAlg {
+    /// X25519 密封密钥对（默认；`secrets-*.pem`，供 `seal`/`open` 的 `ENC[...]` 信封）。
+    X25519,
+    /// Ed25519 签名密钥对（`ed25519-*`，供 `crypto.verifyEd25519` / bundle 签名校验的作者侧）。
+    Ed25519,
+}
+
+/// `oj secret keygen [--out-dir D] [--force] [--alg x25519|ed25519]`。
+/// X25519（默认）= 密封密钥对（唯一信封算法）；Ed25519 = 签名密钥对（与密封互不可用）。
 pub struct SecretKeygenArgs {
     /// 输出目录：`<dir>/secrets-private.pem` 与 `<dir>/secrets-public.pem`。
     pub out_dir: String,
     /// 覆盖已存在文件（默认拒绝，防误删在用私钥）。
     pub force: bool,
+    /// 密钥算法族（缺省 x25519，行为零变化）。
+    pub alg: SecretKeygenAlg,
 }
 
 /// `oj secret seal [-k pub.pem] [VALUE]`：把明文封成 `ENC[...]`（无 VALUE 时读 stdin）。
@@ -515,14 +527,18 @@ pub enum TestSub {
 /// `oj secret <sub>`。
 #[derive(Debug, Subcommand)]
 pub enum SecretCmd {
-    /// 生成密封密钥对（X25519；私钥留在部署机，公钥可随仓库走）
+    /// 生成密钥对：密封（X25519，默认）或签名（Ed25519，--alg ed25519；私钥留在本机）
     Keygen {
-        /// 输出目录（落 secrets-private.pem / secrets-public.pem）
+        /// 输出目录（X25519 落 secrets-private.pem / secrets-public.pem；Ed25519 落 ed25519-*）
         #[arg(long, default_value = ".")]
         out_dir: String,
         /// 覆盖已存在文件（默认拒绝）
         #[arg(long)]
         force: bool,
+        /// 密钥算法族：x25519=密封（seal/open 的 ENC[...] 信封，默认）；ed25519=签名
+        /// （crypto.verifyEd25519 的作者侧，产 PKCS#8 私钥 + raw 32B 公钥 hex/指纹）
+        #[arg(long, value_enum, default_value_t = SecretKeygenAlg::X25519)]
+        alg: SecretKeygenAlg,
     },
     /// 把明文封成 `ENC[...]`（密文可直接写进 config.yaml）
     Seal {
@@ -681,8 +697,17 @@ fn to_command(cli: Cli) -> Command {
             command: SchemaCmd::Diff { config, dir, db },
         } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
         Commands::Secret {
-            command: SecretCmd::Keygen { out_dir, force },
-        } => Command::SecretKeygen(SecretKeygenArgs { out_dir, force }),
+            command:
+                SecretCmd::Keygen {
+                    out_dir,
+                    force,
+                    alg,
+                },
+        } => Command::SecretKeygen(SecretKeygenArgs {
+            out_dir,
+            force,
+            alg,
+        }),
         Commands::Secret {
             command: SecretCmd::Seal { key, config, value },
         } => Command::SecretSeal(SecretSealArgs { key, config, value }),
@@ -967,16 +992,29 @@ mod tests {
 
     #[test]
     fn secret_subcommands_map_through() {
-        // keygen：--out-dir / --force（无 --bits/--alg，X25519 是唯一信封算法）。
+        // keygen：--out-dir / --force；--alg 缺省 = x25519（密封，行为零变化）。
         let Command::SecretKeygen(a) = cmd(&["secret", "keygen", "--out-dir", "keys", "--force"])
         else {
             panic!()
         };
-        assert_eq!((a.out_dir.as_str(), a.force), ("keys", true));
+        assert_eq!(
+            (a.out_dir.as_str(), a.force, a.alg),
+            ("keys", true, SecretKeygenAlg::X25519)
+        );
         let Command::SecretKeygen(a) = cmd(&["secret", "keygen"]) else {
             panic!()
         };
-        assert_eq!((a.out_dir.as_str(), a.force), (".", false));
+        assert_eq!(
+            (a.out_dir.as_str(), a.force, a.alg),
+            (".", false, SecretKeygenAlg::X25519)
+        );
+        // --alg ed25519（签名密钥对，v0.1.80）：显式传入可解析。
+        let Command::SecretKeygen(a) =
+            cmd(&["secret", "keygen", "--out-dir", "keys", "--alg", "ed25519"])
+        else {
+            panic!()
+        };
+        assert_eq!(a.alg, SecretKeygenAlg::Ed25519);
         // seal/open：positional VALUE 可省（省则读 stdin），-k 与 -c 均可选。
         let Command::SecretSeal(a) = cmd(&["secret", "seal", "-k", "pub.pem", "hunter2"]) else {
             panic!()

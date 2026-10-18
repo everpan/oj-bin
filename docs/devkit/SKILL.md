@@ -184,6 +184,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `ENC[…]` 解不开 / 报 `aes-gcm open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
 | 报 `sealed value is v1 (RSA) — v1 信封已移除` | 手头是旧版 RSA(v1) 密文，新版已不再支持；用 `oj secret seal` 以 X25519 重新加密（v1 已整体移除，密钥配置只认 X25519 一套） |
 | 想让密文更短 | 信封本就是 X25519 + AES-256-GCM，密文≈明文+62B；`oj secret keygen --out-dir keys` 生成即可，无需额外开关 |
+| 拿 `keygen --alg ed25519` 的产物去 `seal`/`open` | 不行——ed25519 是**签名**密钥（`crypto.verifyEd25519` 的作者侧），密封只认 X25519；报 `not a OJ X25519 … PEM` 就是喂错了密钥。反之 `ed25519-public.hex`（raw 32B hex）才是喂 `verifyEd25519` 的，别喂 PEM（v0.1.80） |
 | 想把 `--value` 写进 shell 命令 | 别——命令行参数进 shell history 与 `ps`；用 `echo -n 'pwd' \| ./bin/oj secret seal -k pub.pem`（尾换行会被剥除） |
 | `/tasks/{name}/start` 对 cron 任务报 400 | 跨 kind 命令被拒：cron 用 `enable`/`disable`，long 用 `start`/`stop`（v0.1.28） |
 | `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |

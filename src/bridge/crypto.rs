@@ -591,6 +591,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn keygen_ed25519_sign_and_verify_roundtrip() {
+        // v0.1.80 `oj secret keygen --alg ed25519` 的往返 smoke：上游 keygen 产物
+        // （PKCS#8 私钥 PEM + raw 32B 公钥 hex）→ ring 以 PKCS#8 重读并签名（模拟
+        // 作者侧 Node `crypto.sign("ed25519", …)`，sig 走标准 base64 无 pad）→
+        // 真 bridge 里 `crypto.verifyEd25519` 验签 = true；换 msg = false（不抛）。
+        use base64::Engine;
+        use ring::signature::KeyPair;
+
+        let (priv_pem, pk) = crate::secret::keygen_ed25519().unwrap();
+        assert_eq!(pk.len(), 32);
+        let pk_hex = {
+            let mut s = String::with_capacity(64);
+            for b in pk {
+                s.push_str(&format!("{b:02x}"));
+            }
+            s
+        };
+        // PEM 体：标准 base64（64 字符换行），剥标签后解码回 DER。
+        let b64: String = priv_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("pkcs8 pem body");
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&der).expect("reparse pkcs8");
+        assert_eq!(pair.public_key().as_ref(), &pk[..], "公钥须与私钥配对");
+        // 规范串（bundle 校验同形）：<name>@<version>:<sha256>。
+        let msg = "app@0.1.80:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let sig = pair.sign(msg.as_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(sig.as_ref());
+
+        let b = bridge(None);
+        let js = format!(
+            r#"(async () => {{
+                const pk = "{pk_hex}";
+                const ok = crypto.verifyEd25519(pk, "{msg}", "{sig_b64}");
+                const bad = crypto.verifyEd25519(pk, "other-msg", "{sig_b64}");
+                json.ok({{ ok, bad }});
+            }})().catch((e) => json.fail(500, String(e)));"#
+        );
+        let cap = b.run_with(&js, Default::default()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["ok"], true, "{v}");
+        assert_eq!(v["data"]["bad"], false, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn sha256_hex_accepts_binary_input() {
         // 场景9：sha256Hex 扩二进制 —— Uint8Array / ArrayBuffer 等价；非 UTF-8 字节不炸。
         let b = bridge(None);

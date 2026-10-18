@@ -1950,6 +1950,8 @@ mod tests {
     use only_js::bridge::plugin_loader::kv_backend_connect;
 
     /// env 相关测试串行化（同进程并行测试会互踩环境变量）。
+    /// 使用者均为下方 `#[cfg(unix)]` 用例，Windows 编译下随门避免 dead_code。
+    #[cfg(unix)]
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Tmp(PathBuf);

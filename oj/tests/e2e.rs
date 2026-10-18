@@ -2347,6 +2347,8 @@ async fn given_reload_api_when_backend_and_listener_segments_change_then_classif
 /// `platform-modules/reloadinst`（受控根特权模块），双 api 挂载 + platform 段 +
 /// fs 段 + vars 段 + reload_api。证书复用 sample 示例证书（拷入临时根）。
 /// 返回 (临时根, config 路径, config 原文)。
+/// 使用者均为下方 `#[cfg(unix)]` reload 用例（Windows 编译下避免 dead_code）。
+#[cfg(unix)]
 fn reload_platform_fixture(name: &str, port: u16) -> (PathBuf, PathBuf, String) {
     let raw = std::env::temp_dir().join(format!("oj-e2e-reloadplat-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&raw);
@@ -2437,6 +2439,7 @@ fn reload_platform_fixture(name: &str, port: u16) -> (PathBuf, PathBuf, String) 
 }
 
 /// spawn `oj serve` 子进程并轮询 health 至就绪（≤120s）。返回 (child, 诊断缓冲)。
+#[cfg(unix)]
 async fn boot_reload_serve(
     cfg_path: &Path,
     port: u16,
@@ -2497,6 +2500,8 @@ async fn boot_reload_serve(
     (child, out_buf)
 }
 
+// 仅 reload 相关 unix 用例使用（`kill -TERM` 不可移植；Windows 编译下避免 dead_code）。
+#[cfg(unix)]
 async fn stop_reload_serve(child: &mut std::process::Child) {
     let _ = std::process::Command::new("kill")
         .arg("-TERM")
@@ -2506,6 +2511,7 @@ async fn stop_reload_serve(child: &mut std::process::Child) {
 }
 
 /// reloadConfig e2e 专用请求：返回 (status, 原文)——空体不炸（诊断可见）。
+#[cfg(unix)]
 async fn req_raw(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, String) {
     let c = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -2524,6 +2530,7 @@ async fn req_raw(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, 
 }
 
 /// req_raw + JSON 解码（空体归 Null，失败信息由上层断言携带）。
+#[cfg(unix)]
 async fn req_rel(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, serde_json::Value) {
     let (st, txt) = req_raw(addr, method, path).await;
     (

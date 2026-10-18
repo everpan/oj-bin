@@ -2404,7 +2404,8 @@ atob/btoa）经 L1 实测可用，wasm 引擎包可进 oj runtime。
 > （错公钥/错 msg/无效曲线点）返回 `false` 而非抛错。编码限制：
 > ① `sigBase64` 仅**标准 base64**（STANDARD / NO_PAD，**base64url 不支持**）；
 > ② `msg` 仅 UTF-8 字符串；③ `publicKey` 须是 hex / base64 编码的 **32 字节原始公钥**
-> （**PEM/SPKI 不支持**）。
+> （**PEM/SPKI 不支持**）。作者侧密钥生成：`oj secret keygen --alg ed25519`（v0.1.80，
+> 产 PKCS#8 私钥 PEM + `ed25519-public.hex` 原始公钥 hex，见「secrets」一节）。
 
 bundle 签名校验典型用法（规范串 `"<name>@<version>:<sha256>"` + Ed25519；发布方对规范串
 签名，安装方用发布方公钥验签）：
@@ -3515,6 +3516,8 @@ vars:
 ```bash
 # 生成 X25519 密钥对（私钥自动 0o600，已存在则拒绝覆盖）：
 ./bin/oj secret keygen --out-dir keys   # keys/secrets-private.pem + secrets-public.pem
+# 生成 Ed25519 签名密钥对（v0.1.80；bundle 签名校验的作者侧，与密封密钥互不可用）：
+./bin/oj secret keygen --alg ed25519 --out-dir sign-keys
 echo -n 'hunter2' | ./bin/oj secret seal -k keys/secrets-public.pem   # → ENC[BASE64…]
 ./bin/oj secret open -c config.yaml 'ENC[BASE64…]'  # 排障：确认密文与私钥对得上
 ```
@@ -3568,9 +3571,18 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
   里会提示换写法。密文也不能当**键**用（`ENC[...]: 1` 直接报错）。
 - **日志面**：DSN / URL 出现在错误信息与 warn 里时**凭据段打 `***`**
   （如 `mysql://***@127.0.0.1:3306/app`），排障认得 host 就够。
-- `keygen` 只生成 X25519 密钥对（无需 `--bits` / `--alg` 旗标）；密文格式固定为
-  X25519 + AES-256-GCM，密文长度≈明文+62B。RSA(v1) 信封已整体移除（v1 无人使用，移除以
-  避免密钥配置歧义）；手上若有旧版 RSA(v1) 密文，用 `oj secret seal` 以 X25519 重新加密。
+- `keygen` 密钥算法族（`--alg`，v0.1.80）：缺省 `x25519` = 密封密钥对（`secrets-private.pem`
+  / `secrets-public.pem`，`BEGIN OJ X25519 …` 标签，供 `seal`/`open`），行为零变化；
+  `--alg ed25519` = 签名密钥对，产出三文件——`ed25519-private.pem`（标准 PKCS#8
+  `BEGIN PRIVATE KEY`，openssl / Node `crypto.createPrivateKey` 可直接读；0600）、
+  `ed25519-public.hex`（32 字节**原始公钥**的 64 hex 字符——**必须 raw 32B**，
+  `crypto.verifyEd25519` 喂 PEM/SPKI 会抛 `key not hex/base64`）与 `ed25519-public.fp`
+  （sha256(rawPublicKey) hex，运维核对 / 信任库 mismatch diff 用）。
+  **两算法族不可互用**：X25519 是密钥协商（ECDH）、做不了签名；ed25519 密钥拿去
+  `seal`/`open`/`secrets.private_key_path` 会报 `not a OJ X25519 … PEM`。覆盖拒绝同规
+  （已存在须 `--force`）。密文格式仍固定为 X25519 + AES-256-GCM，密文长度≈明文+62B。
+  RSA(v1) 信封已整体移除（v1 无人使用，移除以避免密钥配置歧义）；手上若有旧版 RSA(v1)
+  密文，用 `oj secret seal` 以 X25519 重新加密。
 
 完整手册（威胁模型、密文格式、轮换与迁移步骤、排障）见仓库 `docs/secrets.md`。
 
@@ -4058,6 +4070,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `blob.copy` / `blob.move` 的 `src == dst`（v0.1.47） | 明确 **no-op**（`fs::copy` 同文件语义未定义、会截断文件）——不是「复制一份给自己」；`move` 后 src 一定不存在，`copy` 后 src 一定还在 |
 | blob 搬运 / 区间读的能力回落（v0.1.47） | 后端不支持时宿主回落：`copy` → `get`+`put`（**2× 峰值，字节进 V8**）、`readRange` → `get` 全量切片。JS 侧永不因后端能力失败，但回落不便宜——local/s3 均原生支持，回落只是第三方后端的保险 |
 | `crypto.verifyEd25519` 编码面（v0.1.75） | `sigBase64` 仅标准 base64（STANDARD/NO_PAD，**base64url 不支持**）；`msg` 仅 UTF-8 字符串；`publicKey` 须 hex/base64 编码的 **32 字节原始 key**（**PEM/SPKI 不支持**）。格式错抛错（文案 `verifyEd25519: …` 起头），格式合法验签不过返回 `false` |
+| Ed25519 签名密钥 ≠ 密封密钥（v0.1.80） | `oj secret keygen --alg ed25519` 产的是**签名**密钥（PKCS#8 私钥 + raw 32B 公钥 hex/fp），拿去 `seal`/`open`/`secrets.private_key_path` 会报 `not a OJ X25519 … PEM`——密封只认 X25519；反之 X25519 公钥喂 `verifyEd25519` 也不合法（两算法族不同，不可互用） |
 | `crypto.sha256Hex` 非 string/二进制入参抛 TypeError（v0.1.75 **行为变更**） | 旧版把 number/null 等经 `String()` 强转求摘要（静默产出垃圾摘要）；现 fail-loud 抛 TypeError——旧脚本传非 string/二进制入参的要先改（`String(x)` 显式转或改传 `Uint8Array`） |
 | `crypto.md5Hex` 已密码学破损（v0.1.75） | MD5 仅限**非安全场景**（缓存键/etag/旧系统兼容），**不得用于凭据/签名/完整性校验**；入参分流同 `sha256Hex`（string 走 UTF-8，`Uint8Array`/`ArrayBuffer` 走原始字节，其余抛 TypeError） |
 | `platform:` 段 fail-closed（v0.1.75） | 不配 = 全部平台特权不可用（`NotCapable: platform not configured …`）；特权面 = 特权模块 fs 读写扩展（`fs.root ∪ trusted_paths`，且 `fs:` 须已配置）+ `exec.run`（见下两条）；tasks/WS 上下文无模块归属 → 特权恒不可用 |

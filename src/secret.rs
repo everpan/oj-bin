@@ -257,6 +257,44 @@ pub fn keygen() -> Result<(String, String), String> {
     Ok((priv_pem, pub_pem))
 }
 
+/// 生成 Ed25519 签名密钥对（v0.1.80，`oj secret keygen --alg ed25519`）。
+///
+/// 与密封密钥（`keygen()` 的 X25519）**算法族不同、不可互用**：X25519 是密钥协商（ECDH），
+/// 做不了签名；`crypto.verifyEd25519` 只接受 hex/base64 的 32 字节原始公钥（喂 PEM/SPKI
+/// 会抛 `key not hex/base64`）。返回
+/// `(PKCS#8 私钥 PEM, 32 字节原始公钥)`——私钥是标准 `BEGIN PRIVATE KEY` 标签
+/// （openssl / Node `crypto.createPrivateKey` 可直接读），公钥侧由调用方按需出 hex/fp。
+pub fn keygen_ed25519() -> Result<(String, [u8; 32]), String> {
+    use ring::signature::KeyPair;
+    let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .map_err(|e| format!("ed25519 keygen: {e}"))?;
+    // 重读一遍：保证落盘的 PKCS#8 一定可被标准解析（写盘前自证，坏密钥不出门）。
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref())
+        .map_err(|e| format!("ed25519 keygen: generated pkcs8 failed to reparse: {e}"))?;
+    let pk: [u8; 32] = pair
+        .public_key()
+        .as_ref()
+        .try_into()
+        .map_err(|_| "ed25519 public key not 32 bytes".to_string())?;
+    Ok((pem_wrap_std("PRIVATE KEY", doc.as_ref())?, pk))
+}
+
+/// 标准 PEM 包装（STANDARD base64、64 字符换行）——PKCS#8 等通用格式用，
+/// 与本项目自有的 `BEGIN OJ X25519 …` 标签（URL_SAFE_NO_PAD 单行）区分开。
+fn pem_wrap_std(label: &str, der: &[u8]) -> Result<String, String> {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let body: Vec<&str> = b64
+        .as_bytes()
+        .chunks(64)
+        .map(std::str::from_utf8)
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("pem wrap: {e}"))?;
+    Ok(format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        body.join("\n")
+    ))
+}
+
 /// 私钥加载：env 内联 PEM > env 文件 > config 的 `secrets.private_key_path`
 /// （相对 config 目录）。三处都没有 → 明确报错（绝不静默把密文当明文用）。
 pub fn load_private_key(cfg_path: Option<&str>, config_dir: &Path) -> Result<PrivKey, String> {

@@ -16,6 +16,33 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.80（未打标签）
+
+- `oj secret keygen` 新增 `--alg`（v0.1.80）：`x25519`（缺省，行为零变化）/ `ed25519`——为
+  v0.1.75 的 `crypto.verifyEd25519` 补齐**作者侧密钥生成**（bundle 签名校验链路：发布方签 →
+  安装方隔离舱验；此前作者只能手写 Node 脚本）。为什么不能复用 X25519：X25519 是密钥协商
+  （ECDH）、做不了 Ed25519 签名，且 `verifyEd25519` 明确只收 32 字节原始公钥——算法族不同，
+  必须分开生成；
+- `--alg ed25519` 产出（`--out-dir`，覆盖拒绝沿用 `--force`）：`ed25519-private.pem`
+  （标准 PKCS#8 `BEGIN PRIVATE KEY`，openssl / Node `crypto.createPrivateKey` 可直接读，
+  0600 创建）、`ed25519-public.hex`（32 字节**原始公钥**的 64 hex 字符——**必须 raw 32B**，
+  喂 PEM/SPKI 会抛 `key not hex/base64`）、`ed25519-public.fp`（sha256(rawPublicKey) hex，
+  运维核对 / 信任库 mismatch diff 用）；
+- 测试钉死：往返 smoke（keygen 产物 → ring 以 PKCS#8 重读并签名规范串 `<name>@<version>:<sha256>`
+  → 标准 base64 无 pad → 真 bridge 里 `verifyEd25519` = true / 换 msg = false）+ 对抗面
+  （64 hex 格式门、指纹独立重算比对、0600 权限、覆盖拒绝、两算法互不串扰、PKCS#8 标签
+  不得混入密封标签）；args 解析面（缺省 = x25519、`--alg ed25519` 可解析、非法值 clap 拒）；
+- 配套：devkit 四件同步（api-manual §secrets 与 §crypto 的 verifyEd25519 注 + 错误/限制表
+  「Ed25519 签名密钥 ≠ 密封密钥」条、SKILL 陷阱速查、scenarios 场景 18 提示、README 版本行）
+  + `docs/secrets.md`（§2/§3/§11）+ `docs/user-manual.md` CLI 行、`oj/Cargo.toml` 升 0.1.80。
+
+- **fix（xtask smoke）**：`SourceHider` 残留处理补两种中断态——① **半途失败不还原**：`new`
+  在 hide 序列中失败时 `Self` 尚未构造、Drop 接管不到，已隐藏路径（含仓库内两个 bootstrap.js）
+  被留在缺失状态，后续任何构建当场报 `include_str` 找不到文件；现失败即就地还原。② **双份
+  并存**：上次中断后 cargo 重新解包出 orig、孤儿 `.oj-smoke-bak` 同时在场，rename 撞非空目录
+  报 os error 66、smoke 永远过不去；现认 orig 为真相（registry 目录由 crates.io 哨兵钉死）
+  并清掉孤儿 bak。配套两个对抗用例钉死（部分失败还原 / 双份清障）。
+
 ## v0.1.79（未打标签）
 
 - exec 模板占位符支持**字面前后缀**（v0.1.79）：占位符可被同一 argv token 内的字面量包裹——Windows `cmd /c echo %VAR%` 的 `%…%` 是 cmd 变量定界符、无法拆成独立 token，现模板写 `cmd /c echo %${raw:NAME}%` 即可（匹配取中间子串为绑定值、重建时以模板前后缀原样还原）；`${raw:}` 的 option-like / 绝对形态校验作用在**中间子串**上。此前这类模板在解析期即被拒（旧规则要求占位符占满整 token），Windows 上无法为 `echo %VAR%` 建模；

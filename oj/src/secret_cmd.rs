@@ -9,17 +9,33 @@ use std::path::{Path, PathBuf};
 
 use only_js::secret;
 
-use crate::args::{SecretKeygenArgs, SecretOpenArgs, SecretSealArgs};
+use crate::args::{SecretKeygenAlg, SecretKeygenArgs, SecretOpenArgs, SecretSealArgs};
 
 /// 私钥文件名（`oj secret keygen` 产出）。
 pub const PRIVATE_FILE: &str = "secrets-private.pem";
 /// 公钥文件名。
 pub const PUBLIC_FILE: &str = "secrets-public.pem";
 
+/// Ed25519 私钥文件名（`--alg ed25519` 产出；PKCS#8，openssl/Node 可直接读）。
+pub const ED_PRIVATE_FILE: &str = "ed25519-private.pem";
+/// Ed25519 公钥文件名：32 字节**原始公钥**的 hex（64 字符）——`crypto.verifyEd25519`
+/// 只吃 hex/base64 的 raw 32B，绝不是 PEM/SPKI。
+pub const ED_PUBLIC_HEX_FILE: &str = "ed25519-public.hex";
+/// Ed25519 公钥指纹：sha256(rawPublicKey) hex，供运维核对 / 信任库 mismatch diff。
+pub const ED_PUBLIC_FP_FILE: &str = "ed25519-public.fp";
+
 /// `oj secret keygen`：生成密钥对；已存在则拒绝（除非 --force）。
 pub fn run_keygen(a: &SecretKeygenArgs) -> Result<(), String> {
     let dir = PathBuf::from(&a.out_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    match a.alg {
+        SecretKeygenAlg::X25519 => run_keygen_x25519(a, &dir),
+        SecretKeygenAlg::Ed25519 => run_keygen_ed25519(a, &dir),
+    }
+}
+
+/// X25519 密封密钥对（默认）：`secrets-*.pem`，供 `seal`/`open` 的 `ENC[...]` 信封。
+fn run_keygen_x25519(a: &SecretKeygenArgs, dir: &Path) -> Result<(), String> {
     let priv_path = dir.join(PRIVATE_FILE);
     let pub_path = dir.join(PUBLIC_FILE);
     for p in [&priv_path, &pub_path] {
@@ -31,14 +47,56 @@ pub fn run_keygen(a: &SecretKeygenArgs) -> Result<(), String> {
         }
     }
     let (priv_pem, pub_pem) = secret::keygen()?;
-    write_pem(&priv_path, &priv_pem)?;
-    write_pem(&pub_path, &pub_pem)?;
+    write_file(&priv_path, &priv_pem, true)?;
+    write_file(&pub_path, &pub_pem, false)?;
     println!("wrote {}", priv_path.display());
     println!("wrote {}", pub_path.display());
     println!();
     println!("  {}  留在部署机（chmod 600，别进 git）", PRIVATE_FILE);
     println!("  {}  可随仓库走（只用于加密）", PUBLIC_FILE);
     Ok(())
+}
+
+/// Ed25519 签名密钥对（v0.1.80）：`ed25519-*`，供 `crypto.verifyEd25519` 的作者侧。
+/// 与 X25519 密封密钥**不可互用**（算法族不同；`seal`/`open` 只认 X25519）。
+fn run_keygen_ed25519(a: &SecretKeygenArgs, dir: &Path) -> Result<(), String> {
+    let priv_path = dir.join(ED_PRIVATE_FILE);
+    let hex_path = dir.join(ED_PUBLIC_HEX_FILE);
+    let fp_path = dir.join(ED_PUBLIC_FP_FILE);
+    for p in [&priv_path, &hex_path, &fp_path] {
+        if p.exists() && !a.force {
+            return Err(format!(
+                "{} already exists (refusing to overwrite a key that may be in use; pass --force)",
+                p.display()
+            ));
+        }
+    }
+    let (priv_pem, pk) = secret::keygen_ed25519()?;
+    let hex = hex_encode(&pk);
+    // 指纹 = sha256(rawPublicKey) hex：核对两台机器拿的是不是同一把公钥。
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(pk);
+    let fp = format!("{:x}", h.finalize());
+    write_file(&priv_path, &priv_pem, true)?;
+    write_file(&hex_path, &format!("{hex}\n"), false)?;
+    write_file(&fp_path, &format!("{fp}\n"), false)?;
+    println!("wrote {}", priv_path.display());
+    println!("wrote {}", hex_path.display());
+    println!("wrote {}", fp_path.display());
+    println!();
+    println!("  {}  签名私钥（PKCS#8，0600，别进 git）", ED_PRIVATE_FILE);
+    println!(
+        "  {}  原始公钥 hex（喂 crypto.verifyEd25519）",
+        ED_PUBLIC_HEX_FILE
+    );
+    println!("  {}  公钥指纹（sha256，核对用）", ED_PUBLIC_FP_FILE);
+    Ok(())
+}
+
+/// 小写 hex（无分隔）。
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `oj secret seal`：明文 → `ENC[...]`。
@@ -172,26 +230,26 @@ fn secrets_key_path(config: &Path, key: &str, cfg_dir: &Path) -> Result<String, 
     })
 }
 
-fn write_pem(path: &Path, pem: &str) -> Result<(), String> {
-    // 私钥以 0o600 **创建**（先写后 chmod 会在宽 umask 下留一个可被同机他账号读的窗口）。
+/// 写产物文件；`private` = 私钥，以 0o600 **创建**（先写后 chmod 会在宽 umask 下
+/// 留一个可被同机他账号读的窗口）。
+fn write_file(path: &Path, body: &str, private: bool) -> Result<(), String> {
     #[cfg(unix)]
-    {
+    if private {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        if path.file_name().is_some_and(|n| n == PRIVATE_FILE) {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| format!("write {}: {e}", path.display()))?;
-            return f
-                .write_all(pem.as_bytes())
-                .map_err(|e| format!("write {}: {e}", path.display()));
-        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        return f
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("write {}: {e}", path.display()));
     }
-    std::fs::write(path, pem).map_err(|e| format!("write {}: {e}", path.display()))
+    let _ = private;
+    std::fs::write(path, body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -205,6 +263,7 @@ mod tests {
         let a = SecretKeygenArgs {
             out_dir: dir.display().to_string(),
             force: false,
+            alg: SecretKeygenAlg::X25519,
         };
         run_keygen(&a).unwrap();
         assert!(dir.join(PRIVATE_FILE).is_file() && dir.join(PUBLIC_FILE).is_file());
@@ -224,6 +283,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Ed25519（--alg ed25519）：三文件落盘、权限/格式/指纹正确；
+    /// 覆盖拒绝与 X25519 同规；两种算法互不串扰（adversarial：不传 --force 必拒）。
+    #[test]
+    fn keygen_ed25519_files_formats_and_refusals() {
+        let dir = std::env::temp_dir().join(format!("oj-sec-ed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = SecretKeygenArgs {
+            out_dir: dir.display().to_string(),
+            force: false,
+            alg: SecretKeygenAlg::Ed25519,
+        };
+        run_keygen(&a).unwrap();
+
+        // ① 私钥 0600（unix）+ 标准 PKCS#8 标签（绝不是 OJ X25519 标签）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(dir.join(ED_PRIVATE_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(m & 0o777, 0o600);
+        }
+        let pem = std::fs::read_to_string(dir.join(ED_PRIVATE_FILE)).unwrap();
+        assert!(pem.contains("-----BEGIN PRIVATE KEY-----"), "{pem}");
+        assert!(!pem.contains("OJ X25519"), "Ed25519 产物不得带密封密钥标签");
+
+        // ② public.hex：trim 后恰 64 字符全 hex（= raw 32B；不是 PEM/SPKI）。
+        let hex = std::fs::read_to_string(dir.join(ED_PUBLIC_HEX_FILE)).unwrap();
+        let hex = hex.trim();
+        assert_eq!(hex.len(), 64, "{hex}");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{hex}");
+
+        // ③ fp = sha256(rawPublicKey) hex（与文件内容独立重算比对）。
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>(),
+        );
+        let fp = std::fs::read_to_string(dir.join(ED_PUBLIC_FP_FILE)).unwrap();
+        assert_eq!(fp.trim(), format!("{:x}", h.finalize()));
+
+        // ④ 覆盖拒绝：三文件任一存在且未 --force 都拒。
+        assert!(run_keygen(&a).unwrap_err().contains("--force"));
+        // ⑤ 互不串扰：ed25519 目录里没有 secrets-*；同目录再生成 X25519 也不受 ed25519 文件影响。
+        assert!(!dir.join(PRIVATE_FILE).exists() && !dir.join(PUBLIC_FILE).exists());
+        run_keygen(&SecretKeygenArgs {
+            out_dir: a.out_dir.clone(),
+            force: false,
+            alg: SecretKeygenAlg::X25519,
+        })
+        .unwrap();
+        assert!(dir.join(PRIVATE_FILE).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// seal → open 端到端（含「config 里取公钥」通道）。
     #[test]
     fn seal_then_open_roundtrip_via_config_paths() {
@@ -233,6 +351,7 @@ mod tests {
         run_keygen(&SecretKeygenArgs {
             out_dir: dir.display().to_string(),
             force: false,
+            alg: SecretKeygenAlg::X25519,
         })
         .unwrap();
         std::fs::write(
@@ -279,6 +398,7 @@ mod tests {
         run_keygen(&SecretKeygenArgs {
             out_dir: dir.display().to_string(),
             force: true,
+            alg: SecretKeygenAlg::X25519,
         })
         .unwrap();
         let token = secret::seal_pub(

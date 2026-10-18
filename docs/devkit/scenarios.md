@@ -1264,6 +1264,11 @@ echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys
 # → ENC[Ab3…]  （同一明文每次不同：X25519 临时公钥 + 随机 nonce 保证密文不可重放）
 ```
 
+> **顺带分清两把钥匙（v0.1.80）**：`--alg ed25519` 生成的是**签名**密钥（`crypto.verifyEd25519`
+> 的作者侧，产 `ed25519-private.pem` PKCS#8 + `ed25519-public.hex` raw 32B hex + `.fp` 指纹），
+> 与这里的密封密钥**不可互用**——X25519 做加密协商、ed25519 做签名；拿 ed25519 产物去
+> `seal`/`open` 会报 `not a OJ X25519 … PEM`。
+
 ### ③ 写进 config
 
 ```yaml

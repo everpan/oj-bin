@@ -49,8 +49,8 @@
 - 随机 nonce + 临时密钥：同一明文两次加密结果不同（无法比对两个密文是否同源）。
 - **版本字节**：首字节 `0x02` 标识本信封；旧版 v1（RSA-OAEP）已移除，遇到 v1 密文解密时
   明确报错、提示用 `oj secret seal` 以 X25519 重新加密，不静默降级。
-- **RSA(v1) 已移除**：`oj secret keygen` 现在只生成 X25519 密钥，配置里只有一种密钥、
-  不再有「RSA 还是 X25519」的歧义。
+- **RSA(v1) 已移除**：`oj secret keygen` 的密封密钥只生成 X25519（`--alg ed25519` 生成的是
+  **签名**密钥，见 §3），配置里只有一种密封密钥、不再有「RSA 还是 X25519」的歧义。
 
 ---
 
@@ -67,11 +67,18 @@ echo -n 'mysql://root:hunter2@127.0.0.1:3306/app' | ./bin/oj secret seal -k keys
 
 # ③ 排障解密（走与启动同一条私钥通道）
 ./bin/oj secret open -c config.yaml 'ENC[Ab3…]'
+
+# （另一算法族）Ed25519 签名密钥对（v0.1.80；crypto.verifyEd25519 的作者侧，
+# 与密封密钥互不可用——X25519 做密钥协商、做不了签名）
+./bin/oj secret keygen --alg ed25519 --out-dir sign-keys
+# sign-keys/ed25519-private.pem（PKCS#8 BEGIN PRIVATE KEY，600）+
+# sign-keys/ed25519-public.hex（32 字节原始公钥的 64 hex，喂 verifyEd25519）+
+# sign-keys/ed25519-public.fp（sha256(rawPublicKey) hex，核对用）
 ```
 
 | 子命令 | 关键参数 | 说明 |
 |---|---|---|
-| `keygen` | `--out-dir`、`--force` | 产出 `secrets-private.pem` / `secrets-public.pem`（X25519，32 字节，`BEGIN OJ X25519 …` 标签） |
+| `keygen` | `--out-dir`、`--force`、`--alg x25519\|ed25519`（缺省 x25519） | x25519：`secrets-private.pem` / `secrets-public.pem`（32 字节，`BEGIN OJ X25519 …` 标签）；ed25519：`ed25519-private.pem`（PKCS#8）/ `ed25519-public.hex`（raw 32B 的 64 hex）/ `ed25519-public.fp`（sha256 指纹） |
 | `seal` | `-k <pub.pem>` 或 `-c <config.yaml>`（取 `secrets.public_key_path`）；`[VALUE]` 可省（省则读 stdin） | 明文 → `ENC[...]`（X25519 信封），尾换行剥除一个 |
 | `open` | `-k <priv.pem>` 或 `-c <config.yaml>`；`[VALUE]` 可省 | 密文 → 明文 |
 
@@ -214,6 +221,11 @@ redis://***@127.0.0.1:6379/1
 | 算法 / 格式 | RSA（`BEGIN PRIVATE KEY`，RS256 签名） | X25519（`BEGIN OJ X25519 PRIVATE KEY`，ECDH 派生会话密钥） |
 | 私钥用途 | **签名**（签发 cert.jws） | **ECDH 解密**（解开 config 密文） |
 | 私钥该在哪 | **签发方**（构建机 / 离线冷存；签发才拿出来） | **每台部署机**（否则起不来服务） |
+
+> **第三把钥匙：Ed25519 签名密钥（v0.1.80，`--alg ed25519`）**。为 `crypto.verifyEd25519`
+> 的作者侧补齐的密钥生成——PKCS#8 私钥（`BEGIN PRIVATE KEY`）+ raw 32B 公钥 hex/fp。
+> 与密封密钥同样**不可互用**（算法族不同：X25519 = 密钥协商，Ed25519 = 签名），也与证书
+> 的 RSA 各归各；`secret::parse_private_key` 只认 X25519，谁也替代不了谁。
 | 公钥去哪 | 部署机（`server.public_key_path`，ring 验签） | 开发者 / CI（加密用，可进仓库） |
 | 轮换触发 | 证书续期（renew 重签） | 重封全部密文 |
 

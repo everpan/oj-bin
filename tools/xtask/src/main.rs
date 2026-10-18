@@ -360,6 +360,7 @@ fn smoke_targets() -> Result<Vec<PathBuf>, String> {
 }
 
 /// 临时改名守护：Drop 时还原（含 panic 展开；进程被硬杀除外 —— `new` 会先做残留恢复）。
+#[derive(Debug)]
 struct SourceHider {
     /// (原路径, 备份路径)
     pairs: Vec<(PathBuf, PathBuf)>,
@@ -367,19 +368,41 @@ struct SourceHider {
 
 impl SourceHider {
     fn new(targets: Vec<PathBuf>) -> Result<Self, String> {
-        let mut pairs = Vec::new();
-        for orig in targets {
-            let bak = bak_path(&orig);
-            // 上次中断残留：先还原再隐藏，避免把仓库/registry 留在缺失状态。
-            if !orig.exists() && bak.exists() {
-                fs::rename(&bak, &orig).map_err(|e| format!("recover {}: {e}", orig.display()))?;
-                println!("smoke: recovered leftover {}", orig.display());
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let hide = |pairs: &mut Vec<(PathBuf, PathBuf)>| -> Result<(), String> {
+            for orig in targets {
+                let bak = bak_path(&orig);
+                // 上次中断残留：先还原再隐藏，避免把仓库/registry 留在缺失状态。
+                if !orig.exists() && bak.exists() {
+                    fs::rename(&bak, &orig)
+                        .map_err(|e| format!("recover {}: {e}", orig.display()))?;
+                    println!("smoke: recovered leftover {}", orig.display());
+                }
+                // 双份并存（上次中断于 hide 后，cargo 又重新解包出 orig）：orig 是 cargo
+                // 认的真相（registry src 目录由 crates.io 哨兵钉死、内容同版本必然一致），
+                // 孤儿 bak 只会挡住下面的 rename（os error 66）——清掉。
+                if orig.exists() && bak.exists() {
+                    fs::remove_dir_all(&bak)
+                        .map_err(|e| format!("drop orphan bak {}: {e}", bak.display()))?;
+                    println!("smoke: dropped orphan bak {}", bak.display());
+                }
+                if !orig.exists() {
+                    return Err(format!("smoke: 待隐藏路径不存在：{}", orig.display()));
+                }
+                fs::rename(&orig, &bak).map_err(|e| format!("hide {}: {e}", orig.display()))?;
+                pairs.push((orig, bak));
             }
-            if !orig.exists() {
-                return Err(format!("smoke: 待隐藏路径不存在：{}", orig.display()));
+            Ok(())
+        };
+        if let Err(e) = hide(&mut pairs) {
+            // 半途失败：Self 尚未构造、Drop 接管不到——必须就地还原已隐藏的路径，
+            // 否则仓库/registry 被留在缺失状态（构建当场报 include_str 找不到文件）。
+            for (orig, bak) in &pairs {
+                if bak.exists() {
+                    let _ = fs::rename(bak, orig);
+                }
             }
-            fs::rename(&orig, &bak).map_err(|e| format!("hide {}: {e}", orig.display()))?;
-            pairs.push((orig, bak));
+            return Err(e);
         }
         Ok(Self { pairs })
     }
@@ -609,6 +632,58 @@ mod tests {
             assert!(!file.exists());
         }
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 半途失败（第 2 个目标缺失）：第 1 个已隐藏的路径必须就地还原，
+    /// 不能把仓库留在缺失状态（旧实现在此丢失 pairs，include_str 当场炸）。
+    #[test]
+    fn given_partial_failure_when_hider_new_errs_then_hidden_pairs_restored() {
+        let dir = std::env::temp_dir().join(format!("oj-xtask-pfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("bootstrap.js");
+        std::fs::write(&good, "x").unwrap();
+        let e = SourceHider::new(vec![good.clone(), dir.join("no-such-path")]).unwrap_err();
+        assert!(e.contains("待隐藏路径不存在"), "{e}");
+        // 已隐藏的第 1 个目标回到在场、bak 消失。
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "x");
+        assert!(!bak_path(&good).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 双份并存（上次中断于 hide 后、cargo 又重新解包出 orig）：孤儿 bak 必须被清掉，
+    /// 否则 hide 的 rename 撞非空目录报 os error 66、smoke 永远过不去。
+    #[test]
+    fn given_orphan_bak_alongside_orig_when_hider_new_then_bak_dropped_and_hide_succeeds() {
+        let dir = std::env::temp_dir().join(format!("oj-xtask-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub = dir.join("deno_x-0.1.0");
+        // orig 完整（cargo 重新解包后的真相）+ 上次中断留下的孤儿 bak。
+        std::fs::create_dir_all(sub.join("lib")).unwrap();
+        std::fs::write(sub.join("lib/mod.js"), "orig").unwrap();
+        let bak = bak_path(&sub);
+        std::fs::create_dir_all(&bak).unwrap();
+        std::fs::write(bak.join("stale.txt"), "old").unwrap();
+        {
+            let _hider = SourceHider::new(vec![sub.clone()]).unwrap();
+            // 隐藏成功（没撞 os error 66）：orig 被换到 bak 位，孤儿内容不复存在。
+            assert!(!sub.exists());
+            assert!(bak.is_dir());
+            assert_eq!(
+                std::fs::read_to_string(bak.join("lib/mod.js")).unwrap(),
+                "orig",
+                "bak 应是当前 orig 的隐藏态，而非孤儿残留"
+            );
+        }
+        // Drop 还原：orig 回到在场，bak 消失。
+        assert!(sub.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(sub.join("lib/mod.js")).unwrap(),
+            "orig"
+        );
+        assert!(!bak.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
