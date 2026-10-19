@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.81（未打标签）
+## v0.1.81
 
 - **db.table() 构造器补齐 7 项能力**（v0.1.81）——下游模板 `docs/sql-builder-missing-capabilities-pr.md`
   的 7 条诉求经复核后落地。诉求来源复核结果：1 条误报（动态 WHERE 已可用）、1 条部分误报
