@@ -114,7 +114,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | CI 里 `oj openapi --check` 非零退出 | 路由表生成的 OpenAPI 与已提交 `openapi.json` 漂移（加了路由/`.schema` 没重新生成）；跑 `oj openapi -c … -d … [--base …] [-o …]` 重新落盘提交即可。`.schema.params` 与路由 pattern 不一致也会在此步 fail-fast。**升 v0.1.70 必须重生成一次**：产物新增 `tags`（模块归属）、`responses.200` 落地、`x-oj-file` 改相对路径 |
 | `oj openapi` 报 `operationId … is derived from two different routes` | 两条路由（如 `/user/profile` 与 `/user-profile`）派生出同名 operationId —— 下游 codegen 按它命名符号会静默覆盖；给其中一条设显式 `.route` 改名 |
 | seed 没生效/语法错 | `seed.sql` 按 `;` 切分，语句内不得含分号字面量；语句前置 `--` 注释行允许（v0.1.66 起，方言改写判定先剥注释——此前注释打头会让 `INSERT OR IGNORE` 原样下发 mysql → 1064） |
-| 自写 LIKE 要转义 `%`/`_` | 别用 `ESCAPE '\'`——mysql 默认 sql_mode 下反斜杠吃掉收尾引号即 1064；统一 `ESCAPE '!'` 并转义 `!`/`%`/`_`（`_shared/search` 已照此） |
+| 模糊搜索想手写 `LIKE '%x%'` | **别手写**——用语义化 op：`contains` / `startswith` / `endswith`（v0.1.81），引擎自动转义 `%`/`_`/`!` 并渲染 `LIKE ? ESCAPE '!'`，业务零转义、零方言知识；`like` 只留作高级/框架内部逃生舱（其 `escape` 仅收单字符白名单 `! / \| ~ # @`，**显式拒 `\`**——mysql 默认 `sql_mode` 下 `ESCAPE '\'` 即 1064） |
+| `orIgnore()` 写完用 `if (n === 1)` 判幂等 | **错**：三方言 affected-rows 不一致——mysql 协商 `CLIENT_FOUND_ROWS` 命中重复键返回**匹配行 1**，pg/sqlite `ON CONFLICT DO NOTHING` 返回 **0**；应靠唯一约束/事务保证「不重复写」，行数只读「写几条」 |
+| `fromSelect` 列对不齐 / select 自带 tenant | 目标 `cols` 与源 select 列按位置一一对齐，列数不符报 `insert declares N columns but the source select yields M`；`cols` 含 `tenant_id` 直接拒（tenant 由服务端按当前租户注入）；`values` 与 `fromSelect` 二选一 |
+| `select(["*"])` 带 join | 直接报错——全列展开只出基表列，join 列会丢、`undefined` 拿去做授权判断即隐患；要 join 列就显式列名 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
 | cookie 登录后 GET 通、POST 401 `missing or invalid csrf token` | CSRF 双提交：非安全方法须带 `csrf_header`（默认 `x-csrf-token`），值 = csrf cookie 值；Bearer 命中的请求不查 |
@@ -139,7 +142,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `axis("x")` 报 `unknown generic axis '<x>'` | 轴没装上（插件未加载/ABI 不匹配）或名字拼错——报错里的 available 列表即当前已注册泛型轴；确认插件在 `plugins:` 清单或扫描目录里 |
 | 打包发行版（deploy.sh / npm 启动器）启动报 `no auth plugin loaded`（插件文件齐全）或 `oj serve --daemon` 秒退 | v0.1.55 及更早：glibc 打包形态进程映像是 ld-linux，`current_exe()` 指向加载器，插件发现候选与 daemon re-exec 全部落空——升 v0.1.56+；临时绕法：显式 `OJ_PLUGINS_DIR` |
 | `oj serve --daemon` 报 `daemon child (pid N) exited during startup: …` | 子进程启动期失败（config / 证书 / 插件 / 端口任一环节），**真因即冒号后内容**——父进程已从「假成功」改为带因并非零退出，按报错修配置即可；若真因不可捕获（子进程被 kill -9 / 段错误），提示转 server logs 目录 |
-| 泛型轴插件撞名（插件作者） | 泛型轴名**避开 9 个保留名**（es/db/blob/bus/kv/auth/mq/mail/ldap）——pre-kind 旧宿主按名 cast，会把 GenericVtable 误当类型化 vtable；同名泛型轴多插件提供 → 装配期 fail-fast |
+| 泛型轴插件撞名（插件作者） | 泛型轴名**避开 9 个保留名**（es/db/blob/bus/kv/auth/mq/mail/ldap）——撞名的泛型轴会被宿主按名字直接当成定型后端处理；同名泛型轴多插件提供 → 装配期 fail-fast |
 | `ldap.search` 报 size limit | 服务端返回上限（AD 默认 1000 条）——换 `axis("ldap").search_paged(base, { pageSize: 500 })` |
 | ldap 查询结果对不上 | `scope` 默认 `sub`（整棵子树）；只查下一层要显式 `scope: "one"`；`filter` 记得 RFC 4515 转义用户输入 |
 | `ldap:` 段改了不生效并报错双配置 | 同时写了顶层 `ldap:` 段与非空 `plugins.ldap` 透传——二选一（透传静默胜出，装配期报错拦截） |
@@ -175,10 +178,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `blob.readRange` 拿到的数组比 `len` 短 / 是空的（v0.1.47） | 短读截断是契约：`offset+len` 越尾只读到实际末尾，`offset` 过尾返回空数组——按 `head.length` 判分支，别假设拿满 |
 | `blob.readRange` 报 `offset must be a non-negative integer`（v0.1.47） | `offset` / `len` 传了负数、小数或 NaN（数据截断比静默取整安全）——取整后再传 |
 | `blob.move` 之后 src 读不到 / `blob.copy` 之后 src 还在（v0.1.47） | 就是语义：`move` = 搬移（src 消失）、`copy` = 复制（src 保留）；`src == dst` 两者都是 no-op |
-| `db.stream` 在 mysql/pg 上报错/变全量 | v0.1.38 起第一方插件真流式（ABI 10）；第三方插件未实现流式槽时宿主静默回落 `db.query` 全量（仅丢内存优势）。事务内 `db.stream` 恒报错——流式只走直连池 |
+| `db.stream` 在 `db.tx` 里报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 流式查询只走直连池，事务内不支持——先 `db.query` 取 id 集，或把 `db.stream` 挪到 `db.tx` 外 |
+| `db.stream` 报 `backend does not support streaming` | 该后端没有逐行拉取能力。**真流式**的是核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 两个插件；其余后端要么回落全量（不报错）、要么直接报这个错——改用 `db.query` + 分页 |
+| `db.stream` 没报错但内存照样爆 | 后端不支持逐行拉取时宿主会一次取全量（行为等同 `db.query`，只失去内存优势，**不报错**）——按结果集大小分页，或换到 `oj-db-mysql` / `oj-db-postgres` 后端 |
 | `db.stream` 取消在 pg/mysql 下是「真取消」，sqlite 只是「协作式」 | v0.1.42 起：`postgres://`/`mysql://` DSN 游标走**专用连接**，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端慢查询立即终止；core/Any（sqlite 等）无服务端句柄，只能**协作式**（下一批返回 `{"error":"cancelled"}`）。别指望 sqlite 的取消能打断正在跑的查询 |
-| `db.stream` 在 `db.tx` 里报 `…not supported in Phase A (ABI 10 required)` | Phase A 只支持直连池，不支持事务内流式——先 `db.query` 取 id 集，或把流式挪到 tx 外 |
-| 插件库（`oj-db-*`）调 `db.stream` 报 `backend does not support streaming (ABI 10 required)` | Phase A 仅核心 `SqlxAccessor`（sqlite/mysql/postgres `Any` 驱动）真流式；FFI 插件要等 PR-2 Phase B（ABI 10 vtable） |
 | 用了 `json.stream` 又 `json.ok` | 流式响应已接管 body，二者互斥——`json.stream`/`sse` 后 handler 直接 `return`，别再包信封 |
 | 启动报 `config has ENC[...] sealed values but no decryption key: …` | config 里有密封值却找不到私钥——设 `OJ_SECRET_KEY`（PEM）/ `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`。**不会**静默把密文当明文用（v0.1.33） |
 | `ENC[…]` 解不开 / 报 `aes-gcm open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
@@ -190,7 +193,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `run-once` 对 long 任务报 400 | `run-once` 仅 cron 任务（v0.1.28）；long 任务的「立即跑一轮」= `reload` 或等下一轮 |
 | 任务池 CPU 飙高 / `runCount` 暴涨 | `interval_ms` 太小或为 0（0 = 不限制，压测语义）——默认 100ms≈10 轮/s；实测无节奏 4 任务聚合 24.8 万轮/s、CPU 134%（多核空转）。先算写放大（轮率 × 每轮 IO）再调小（§6「性能特征与调优」） |
 | `PATCH /tasks/{name}` 报 400 | 只接受 `{enabled, cron}` 两字段（无用户可传脚本路径入口，结构性白名单） |
-| `server.reload_api: true` 改了 `db:`/`redis:`/`plugins:` 等后端段没即时换 | 这些是 `restart_pending`：热更**复用首代连接池与插件 vtable**，不重建后端——返回清单提示，实际生效要**重启进程**（`_system/config` 看 `restart_pending`） |
+| `server.reload_api: true` 改了 `db:`/`redis:`/`plugins:` 等后端段没即时换 | 这些是 `restart_pending`：热更**复用首代连接池与插件后端实例**，不重建后端——返回清单提示，实际生效要**重启进程**（`_system/config` 看 `restart_pending`） |
 | `server.reload_api: true` 改了 `server.port`/`host`/证书路径没生效 | `server` 段是 `kept_listener`：listener 永生，改了也下个进程才生效（`_system/config` 看 `kept_listener`） |
 | `POST {base}/_system/config` 报 403 | 未配 `auth:` 时只允许**回环**调用；远程调度走 Bearer 守卫须先配 `auth:` 段 |
 | `POST {base}/_system/config` 报 409 | 上一次热更还在跑（串行锁占用）——等上一次完成再发 |

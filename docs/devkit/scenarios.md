@@ -41,6 +41,7 @@
 | [38](#sc38) | 用 `oj build --bundle` 打出整站 dist 根 tarball 并打印 sha256，供远程挂载校验（v0.1.77） | §11 `oj build` |
 | [39](#sc39) | 实时日志流式消费：`exec.spawn` 句柄（`for await` stdout/stderr）/ `exec.run` onStdout/onStderr 回调（v0.1.78） | §6 exec |
 | [40](#sc40) | 长任务中途 kill：`exec.run` 超时整组击杀 / `exec.spawn().kill()` 主动击杀（v0.1.78） | §6 exec |
+| [41](#场景-41通知回执合并--幂等写入构造器补齐能力v0181) | 通知回执合并 + 幂等写入：join ON 值条件 / 字面量列 `scope` / `orIgnore` / `fromSelect`（v0.1.81 补齐，替代手写 `db.query`） | §6 db / 查询构造器 |
 
 ---
 
@@ -1555,9 +1556,16 @@ curl -s 'http://localhost:9778/v1/api/user/enc/?id=1' | head -c 200
 内存，结果集越大越容易撑爆 handler 内存、或撞上信封体积上限。`db.stream` 逐行拉取，常驻内存只
 一行，配合 `json.stream` 边收边推，毫无压力。
 
-**红线先说**：Phase A 仅 **核心 `SqlxAccessor`**（sqlite / mysql / postgres，经 `Any` 驱动）支持真
-流式；在 `db.tx` 内调用、或后端是插件（`oj-db-*` FFI）时都会直接报错（详见 `api-manual.md` §6 db
-节 `db.stream` 与 §13 已知限制全表）。内容与 `db.query` 全量**一致**，差异只在内存形态。
+**红线先说**（两条，动手前先看）：
+
+1. **只走直连池**——在 `db.tx` 内调用会报错
+   `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。
+2. **不是所有后端都真流式**——真流式的是核心 sqlite / mysql / postgres 连接与
+   `oj-db-mysql` / `oj-db-postgres` 两个插件后端；其余后端没有逐行拉取能力，宿主会**一次取全量**
+   （不报错，行为等同 `db.query`，只是内存优势没了），彻底不支持时直接报
+   `backend does not support streaming`。
+
+（详见 `api-manual.md` §6 db 节 `db.stream` 与 §13 已知限制全表）
 
 ### ① handler（CSV 流式导出）
 
@@ -1623,10 +1631,10 @@ curl -s 'http://localhost:9778/v1/api/account/export/' | head -c 200
 | 报错 / 现象 | 原因 |
 |---|---|
 | `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 在 `db.tx(...)` 回调里调用了 `db.stream`——流式只走直连池。先 `db.query` 取 id 集再在 tx 内逐条处理，或把流式放到 tx 外 |
-| `db.stream` 在第三方插件后端上"能跑但不省内存" | 该插件未实现 ABI 10 流式槽（open 哨兵 `{"unsupported":true}`）→ 宿主静默回落 `db.query` 全量。第一方 `oj-db-mysql`/`oj-db-postgres`（v0.1.38 起）真流式 |
+| `db.stream` 在插件后端上"能跑但不省内存" | 该插件没有逐行拉取能力 → 宿主静默改用一次取全量（等同 `db.query`）。真流式的是核心 sqlite / mysql / postgres 连接与 `oj-db-mysql` / `oj-db-postgres`（v0.1.38 起）——用它们才省内存 |
 | 取消不是立即生效（插件后端） | 插件取消是**协作式**（批间生效）：`stream_cancel` 置标志后，下一批返回 `{"error":"cancelled"}`；core 后端 = 中途 drop（best-effort） |
 | 写了 `json.ok(...)` 又 `json.stream` | 流式响应已接管 body，二者互斥——用了 `json.stream` 就别再 `json.ok/fail`，handler 直接 `return` |
-| `for await` 拿到的 `row` 是 `undefined` | 流结束哨兵是 `null`，但迭代器形态已为你消化；直接在循环体用 `row` 即可，不要等 `undefined` |
+| `for await` 拿到的 `row` 是 `undefined` | 流以 `null` 标记结束，异步迭代器形态已替你消化掉这一帧；直接在循环体用 `row` 即可，不要等 `undefined` |
 | 取消后已处理的行「回滚」了 | `signal` 只中止**后续拉取**，已回调/已迭代的行不会回滚——取消前的数据已是最终态 |
 
 ### ⑥ 鉴权后二进制附件下载（v0.1.65）
@@ -2949,4 +2957,69 @@ export async function post() {
 | 误以为能杀别人的进程 | rid 仅本 runtime 可达；`kill` 只杀自己 spawn 的会话，无 pid 入参 |
 | `timeoutMs` 想设很大 | 硬上限 600_000（10 分钟），超出被钳制；信号 kill 整组包含其子孙，避免僵尸 |
 | Windows 上以为 kill 后子进程就没了 | Windows 无进程组，只杀直接子进程：子进程再派生的孙进程会残留（设计已声明）——别依赖「杀干净」做互斥（v0.1.79） |
+
+## 场景 41：通知回执合并 + 幂等写入（构造器补齐能力，v0.1.81）
+
+**什么时候用**：广播消息后，要把每个用户的「已读回执」合并进一张汇总表，且写入必须**幂等**
+（同一条回执重复到达不报错、不重复落）。此前这类查询只能回退 `db.query` 手写 SQL（join ON
+值条件、`'svc' as scope`、INSERT OR IGNORE、INSERT…SELECT 构造器都表达不了），是模板里
+`db.query` 迟迟无法清零的主要阻塞点。v0.1.81 起全部可用构造器表达，跨引擎可移植。
+
+### ① 配置
+
+无需特殊配置；回报表 `notify_receipt(user_id, broadcast_id, scope)` 照常进 SchemaRegistry。
+
+### ② handler（join ON 带值条件 + 字面量列 scope，合并读回执）
+
+```ts
+export async function post({ id }: { id: number }) {
+  // 一张 broadcast 表 b + 回执表 r：LEFT JOIN 时 ON 既列对列、又列对常量（当前用户）
+  const rows = await db.table("notify_receipt").as("r")
+    .join("broadcast", [
+      { left: "r.broadcast_id", right: "b.id" },
+      { left: "r.user_id", op: "eq", value: id },   // ON r.user_id = ?
+    ], "left", "b")
+    .select([
+      "r.user_id",
+      { lit: "svc", as: "scope" },                  // 常量列：'svc' AS "scope"
+    ])
+    .all();
+  return json.ok({ rows });
+}
+```
+
+### ③ handler（幂等写入回执：orIgnore）
+
+```ts
+// 同一条回执重复到达 → 撞唯一键静默跳过（不报错、不重复落）
+await db.table("notify_receipt")
+  .insert({ user_id: id, broadcast_id: bid, scope: "svc" })
+  .orIgnore()
+  .run();
+// 注意：不要写 `if (n === 1)` 判幂等——mysql 命中重复键返回匹配行 1，pg/sqlite DO NOTHING 返回 0
+```
+
+### ④ handler（批量快照：INSERT … SELECT 配 orIgnore）
+
+```ts
+// 把当天 notify 聚合结果批量搬进 notify_daily，撞键跳过
+await db.table("notify_daily")
+  .fromSelect(
+    db.table("notify").select(["user_id", "cnt"]).where({ field: "day", op: "eq", value: d }),
+    ["user_id", "cnt"],                   // 与源 select 列按位置对齐
+  )
+  .orIgnore()
+  .run();
+```
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 模糊搜想要 `%x%` | 用 `contains`（自动转义），别手写 `LIKE '%x%'`——`%`/`_` 会被当通配 |
+| `orIgnore` 后读 affected 判幂等 | 三方言不一致：mysql 命中重复键返回 1，pg/sqlite 返回 0；行数只读「写几条」 |
+| mysql 上 `orIgnore + returning` | 直接报错——mysql 无 RETURNING，无法同语句回带自增 id |
+| `fromSelect` 列对不齐 | 目标 cols 与源 select 列按位置对齐，列数不符报 `insert declares N columns but the source select yields M` |
+| `select(["*"])` 带 join | 直接报错——全列只出基表列，join 列会丢 |
+| 表别名让租户/归属守卫失效 | 不会：v0.1.81 起别名只用于列限定，守卫始终按真名，update/delete 带别名直接拒 |
 

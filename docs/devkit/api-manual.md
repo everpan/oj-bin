@@ -960,7 +960,7 @@ const n = await db.exec("update user set name = ? where id = ?", ["b", 1]);
 | `DB(name)` | 命名库实例（未配置的名字返回 `undefined`） |
 | `kv.get/set/del/expire/incr` | KV 存储（配 `redis.default` → 真 Redis，否则进程内存 KV） |
 | `redis.get/set/del/expire/incr` | 与 `kv` 同源同面（真连时二者同栈，auth 会话同库） |
-| `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47（ABI 11）起 |
+| `blob.put/get/del/url/contentType/copy/move/readRange`（可调用：`blob("name")`） | 对象存储（`blob:` 段启用）；`copy` / `move` / `readRange` 自 v0.1.47 起 |
 | `fs.readFile/readTextFile/writeFile/writeTextFile/mkdir/remove/rename/stat/readDir` | 本地文件系统（`fs:` 段启用，v0.1.53）；jail 到 `fs.root`，未配置/越界抛 `NotCapable` |
 | `exec.run(argv, opts?)` | 外部命令执行（v0.1.75，`platform.exec` 段授权）：argv 模板白名单 + 路径占位符校验，无 shell；未配置/未授权抛 `NotCapable`，见下「exec」 |
 | `yaml.parse(text)` / `yaml.stringify(value)` | YAML 读写原语（v0.1.75，无特权，始终可用）：三预算防炸弹解析（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128）+ Rust 阻塞池执行不卡 isolate；stringify 仅承诺机器产物往返，见下「yaml」 |
@@ -1081,7 +1081,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 |---|---|---|
 | `db.query` | `query(sql: string, params?: unknown[]): Promise<Row[]>` | 参数化查询 → 行数组 |
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
-| `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal }): Promise<void> \| AsyncIterable<Row>` | **流式查询**（v0.1.37，PR-2 Phase A）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。两种形态见下 |
+| `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal }): Promise<void> \| AsyncIterable<Row>` | **流式查询**（v0.1.37）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。**只走直连池**（`db.tx` 内会报错），且**只有部分后端真逐行拉取**（其余回落全量或直接报错，详见下节）。两种形态见下 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持。`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
@@ -1120,13 +1120,14 @@ db_trace:
 
 **查询构造器**（流式、结构化；SQL 由服务端按库方言生成）：
 
+> **专题指南**：SQL 构造器的**能力矩阵、三方言语义差异**（受影响行数 / `orIgnore` / `fromSelect`
+> / 字面量列 `CAST` / 模糊搜索转义）、**红线与逃生舱**、**从 `db.query` 迁移路径**，统一见
+> **`sql-builder-guide.md`**。本章只列 API 契约（签名、允许形态、报错文案）。
+
 - **业务优先用构造器**：业务读写应优先用 `db.table(...)` 构造器，而非手写 `db.query` /
   `db.exec` 裸 SQL。构造器按目标方言（sqlite/mysql/postgres）**自动生成正确 SQL**，业务无需
-  关心方言差异，因此同一份 handler 可在多库 / 跨引擎间迁移——**这是获得多库迁移能力的关键前提**：
-  裸 `db.query` 一旦写死方言特有语法（如 `INSERT IGNORE`、反引号标识符、MySQL 分页 `limit a,b`
-  等）就会锁死到单一引擎，迁移时须逐条改写。**仅当构造器不支持的语句（DDL、部分非 CRUD 语义）
-  才退回 `db.query` / `db.exec`**，且仍须用 `?` 绑定参数、避免方言特有语法（见下「同一段 SQL、三
-  引擎跑通」）。
+  关心方言差异，同一份 handler 可在多库 / 跨引擎间迁移；**仅当构造器不支持的语句（DDL、部分非
+  CRUD 语义）才退回 `db.query` / `db.exec`**，且仍须用 `?` 绑定参数、避免方言特有语法。
 
 ```ts
 const rows = await db.table("account")
@@ -1140,8 +1141,22 @@ const rows = await db.table("account")
 ```
 
 - `WhereCond`：`{ field: string; op?: string; value?: unknown }`。
-  操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/ like / isnull`；未知操作符直接报错。
+  操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/ like / isnull / contains / startswith / endswith`；
+  未知操作符直接报错。`contains` / `startswith` / `endswith` 是**语义化模糊匹配**（转义与
+  `like` 逃生舱口径见 `sql-builder-guide.md` §3.5）：
+  业务层零转义负担、零方言知识，引擎自动把 `%` `_` `!` 转义后渲染 `LIKE ? ESCAPE '!'`。
 - `OrderByItem`：`{ field: string; dir?: "asc" | "desc" | null }`。
+- **`select(["*"])`（v0.1.81）**：显式拉全列。必须是唯一元素
+  （`select(["*", "id"])` 直接报 `select '*' must be the only column`）；**带 join 时直接报错**
+  （`select '*' does not accept joins`）——全列展开只出基表列，业务拿 join 列做授权判断会拿到 `undefined`。
+- **`whereIf(test, cond)`（v0.1.81）**：条件化 where。`test` 为 `undefined` / `null` / `false` /
+  **空数组 `[]`** 时整条跳过；`0` 与 `""` 照常保留（它们是合法过滤值，例如 `status = 0`）。
+  用来把「可选筛选」写成一行而不用 `if (x) q.where(...)`：
+  ```ts
+  db.table("order")
+    .whereIf(id, { field: "id", op: "eq", value: id })        // id 为假值→跳过
+    .whereIf(ids && ids.length, { field: "id", op: "in", value: ids });  // 空数组→跳过（避免 IN () 静默 0 行）
+  ```
 - **红线**：标识符（表/列/别名）只来自 SchemaRegistry 白名单（启动内省所得），值一律经绑定参数。
   SQL 注入面为零；未知表/列报错，排序列另有可排序白名单。`limit` 缺省 100、硬上限 1000。
 - 构造器自动按库方言出 SQL（sqlite/mysql/postgres），业务无需手写方言差异。
@@ -1178,19 +1193,56 @@ if (!scope.has("tenant_id")) throw new Error("tenant scope required");  // 多�
 - 条件对象**不可变**：`c.and(x)` / `c.or(x)` / `c.not()` 返回新对象，不改 `c`。
 - `.tree()` 取纯 JSON 树；`.fields()` 取去重字段名列表；`.has(f)` 判断是否涉及某字段。
 
-**join 联表**：
+**模糊搜索（v0.1.81）——`contains` / `startswith` / `endswith`**：
+
+```ts
+await db.table("user").where({ field: "name", op: "contains", value: "100%" }).all();
+// → WHERE name LIKE ? ESCAPE '!'  with param '%100!%'  （业务零转义，% 被当字面量）
+await db.table("order").where({ field: "code", op: "startswith", value: "AB_" }).all();
+// → LIKE 'AB!_%' ESCAPE '!'
+await db.table("file").where({ field: "path", op: "endswith", value: ".log" }).all();
+// → LIKE '%\.log' ESCAPE '!'  （注意 . 也被转义，不会匹配任意字符）
+```
+
+- 语义：`contains` ⇒ `%v%`、`startswith` ⇒ `v%`、`endswith` ⇒ `%v`；引擎自动转义 `%`/`_`/`!`
+  并渲染 `LIKE ? ESCAPE '!'`，业务零转义、零方言知识。转义原理、`like` 的 `escape` 逃生舱
+  （白名单 `! / | ~ # @`、显式拒 `\`）、`in` 空数组守卫的口径，统一见
+  `sql-builder-guide.md` §3.5。
+
+**join 联表（v0.1.81 支持表别名与 ON 值条件）**：
 
 ```ts
 await db.table("account")
   .join("user", [{ left: "account.user_id", right: "user.id" }], "left")
   .select(["account.id", "user.name"])
   .all();
+
+// ON 值条件（v0.1.81）：列对列 + 列对常量混合
+await db.table("receipt").as("r")
+  .join("broadcast", [{ left: "r.broadcast_id", right: "b.id" },
+                      { left: "r.user_id", op: "eq", value: uid }], "left", "b")
+  .all();
+// → ... JOIN broadcast b ON r.broadcast_id = b.id AND r.user_id = ?
 ```
 
-- `on` 只支持列对列等值（`{left, right}` 数组，非空）；`kind` 省略为 `inner`，可选 `left`。
-- 列可写 `"表.列"`（表 ∈ 基表 ∪ join 表）或裸列名。裸列名**只解析基表**，有歧义直接拒绝；
-  联表查询建议全限定。
-- join 表同样过租户/所有权守卫；**自 join 不支持**（无表别名）。
+- `on` 条目两形：`{left, right}`（列=列）或 `{left, op, value}`（列 `<比较op>` 值）。可混合
+  出现在同一 `on` 数组。列可写 `"表.列"`（表 ∈ 基表 ∪ join 表）或裸列名（只解析基表，歧义拒）。
+- `op` 限**比较类**（`eq/ne/gt/gte/lt/lte/in` 等）；`contains`/`startswith`/`endswith`/`isnull`
+  等模式/空值类 op 在 ON 值条件里直接拒绝（`join on 'r.user_id' takes a compare op, not 'contains'`）。
+  `value` 过 `encodeParams`（BigInt 标记不丢）。
+- 第 4 参数 `alias` 给**被 join 的表**起别名；基表别名用 `db.table("x").as("b")`（v0.1.81）。
+  别名只用于列限定，**归属感/租户守卫始终按真名生效**（见下「表别名与归属/租户守卫」）。
+- `kind` 省略为 `inner`，可选 `left`。自 join 现已放开（基表/被 join 表均可别名）。
+- `select(["*"])` 与 join 互斥（全列展开只出基表列，join 列会丢）。
+
+**表别名与归属/租户守卫（v0.1.81）**：
+
+- `db.table("x").as("b")` 让基表以别名 `b` 出现（列限定写成 `b.col`）；`join` 的第 4 参数给被
+  join 表起别名。别名**只作用于列限定与 SQL 渲染**；归属/租户守卫始终按**真名**生效（此前
+  「别名混入真名」会让两条守卫同时静默失效的缺陷已修，背景见 `sql-builder-guide.md` §3）。
+- 别名**只支持 select / join**：`update` / `delete` 带别名直接报
+  `table alias is not supported on insert/update/delete`（mysql 的 `DELETE FROM t AS b` 需
+  8.0.16+，跨引擎不保证，故构造器直接拒）。
 
 **聚合 / groupBy / having / distinct**：
 
@@ -1224,42 +1276,45 @@ await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).
 - **红线**：`update`/`delete` 必须带 where 且叶子数 ≥ 1。JS 链层早抛（`update requires where`），
   op 侧同样强制——`fromJSON` 可完全绕过 JS 链层，所以动词×字段矩阵以 **op 侧校验为权威**。
 - 动词×字段矩阵：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/having`，
-  `values` 非空且多行键集一致；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`，
-  `update` 的 `sets` 非空；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
+  `values` 与 `from_select` 二选一（都给报 `insert takes either values or fromSelect, not both`、
+  都空报 `insert needs at least one row`）；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`
+  （及 `values`/`from_select`/`or_ignore`）；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
 - insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
+- 表别名只用于 select/join（见上）：`insert/update/delete` 带 `.as(...)` 直接报
+  `table alias is not supported on insert/update/delete`。
 - `db.tx` 内构造的 DML 自动走事务同连接（见下）。
 
-**受影响行数的三方言语义（跨引擎可移植的关键差异）**：
-
-`run()` 的返回值 = WHERE **匹配行数**——mysql / postgres / sqlite 在 oj 运行时上一致：
-
-| 引擎 | 协议原生默认 | oj 运行时 |
-|---|---|---|
-| mysql | **实际变更行**（同值 UPDATE 得 0） | 匹配行（连接协商 `CLIENT_FOUND_ROWS`） |
-| postgres | 匹配行（命令标签 `UPDATE n`） | 匹配行 |
-| sqlite | 匹配行（`changes()`） | 匹配行 |
-
-mysql 协议默认只数「值真的变了」的行——裸 mysql 客户端（`ROW_COUNT()` 即此语义）
-对**幂等重写**是陷阱：把 `is_read` 已是 1 的行再置 1 得 0。oj 的 mysql 插件（sqlx）
-连接时协商 `CLIENT_FOUND_ROWS`，服务端改报匹配行，与 sqlite / pg 拉齐（oj-db-mysql
-真库契约测试钉死：同值重复 UPDATE → 1、WHERE 不匹配 → 0）。**但别把这当保险**：
-用行数判「行存在 / 归属我」（`affected > 0`）只在匹配语义下成立，换连接方式
-（裸驱动、未来的插件实现）即翻车。正确姿势是**先断言再写、行数不读**：
+**幂等写入（v0.1.81）——`orIgnore()` 与 `fromSelect(q, cols)`**：
 
 ```ts
-// 跨引擎安全的幂等写：先按 (id, user_id) 断言归属，再无条件 UPDATE
-const owned = await db.table("notifications").select(["id"]).where({ and: [
-	{ field: "id", op: "eq", value: id },
-	{ field: "user_id", op: "eq", value: uid },
-] }).limit(1).all();
-if (owned.length === 0)
-	json.fail(403, "forbidden");      // 非本人/不存在——SELECT 断言，不看行数
-else
-	await db.table("notifications").update({ is_read: 1 })
-		.where({ field: "id", op: "eq", value: id }).run();  // 行数不读：重复已读幂等成功
+// 撞主键/唯一键则跳过（不报错、不写入），用于「已存在就忽略」的幂等导入
+await db.table("notify").insert({ id: 1, user_id: uid }).orIgnore().run();
+
+// INSERT ... SELECT：从一张查询的结果批量写入（两列列表按位置对齐）
+await db.table("notify_daily").fromSelect(
+  db.table("notify").select(["user_id", "cnt"]).where({ field: "day", op: "eq", value: d }),
+  ["user_id", "cnt"],
+).run();
+// 也可叠加 .orIgnore()：fromSelect(...).orIgnore().run()
 ```
 
-DELETE 无此坑（删行必「变更」，匹配行 = 变更行），但归属判断同样推荐先 SELECT 断言。
+- **`orIgnore()`**：撞主键/任意唯一键的行被跳过。sqlite / postgres 渲染 `ON CONFLICT DO NOTHING`；
+  mysql 走 `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式、命中冲突即跳过），**要求表有主键**——
+  无主键表报 `orIgnore on mysql requires a primary key on table '...'`；mysql 上 `orIgnore` 与
+  `returning` **互斥**（`orIgnore with returning is not supported on mysql`）。**三方言 affected-rows
+  不一致**（mysql 命中重复键返回匹配行 1，pg/sqlite 返回 0），勿用 `if (n === 1)` 判幂等——
+  口径与「为什么不用 `INSERT IGNORE`」见 `sql-builder-guide.md` §3.2。
+- **`fromSelect(q, cols)`**：`q` 是另一个 `db.table(...)` 构造器（或纯 JSON 请求）；`cols` 是目标
+  表写入列、与 `q` 的 select 列**按位置一一对齐**。列数不符报
+  `insert declares N columns but the source select yields M`；`cols` 为空报
+  `insert fromSelect needs insert columns`；`values` 与 `fromSelect` 二选一。`cols` 含 `tenant_id`
+  直接报 `fromSelect must not declare tenant column 'tenant_id'`（tenant 由服务端按当前租户注入）。
+- `db.tx` 内构造的 DML 自动走事务同连接（见下）。
+
+**受影响行数的三方言语义**：`run()` 返回值 = WHERE **匹配行数**，三方言在 oj 运行时上一致（mysql
+协商 `CLIENT_FOUND_ROWS`）。「用行数判行存在 / 归属」只在匹配语义下成立，跨连接方式即翻车——正确
+姿势是**先断言再写、行数不读**（示例见 `sql-builder-guide.md` §3.1）。三方言完整对照表与
+`orIgnore` 的 affected-rows 差异，见 `sql-builder-guide.md` §3.1。
 
 **insert 取回主键 `.returning([...])`**（`run()` 改返回行数组，不返回行数）：
 
@@ -1357,7 +1412,7 @@ await db.table("vip").select(["id", "name"])
   成员禁 order_by/limit/offset（`union member does not accept order_by/limit/offset`）。
 - 成员同样过租户守卫；`intersect`/`except` 不做。
 
-**case 列 / 窗口函数列**（select 列的对象形）：
+**case 列 / 窗口函数列 / 字面量列**（select 列的对象形）：
 
 ```ts
 await db.table("account").select([
@@ -1368,9 +1423,18 @@ await db.table("account").select([
     ], else: "normal" }, as: "level" },          // → CASE WHEN ... THEN ? ... ELSE ? END
   { window: { fn: "row_number", partition_by: ["user_id"],
       order_by: [{ field: "amount", dir: "desc" }] }, as: "rn" },
+  { lit: "svc", as: "scope" },                    // → 'svc' AS "scope"（按方言 CAST，见下）
 ]).all();
 ```
 
+- **字面量列（v0.1.81）**：`{ lit: <值>, as: "<别名>" }` 把常量作为一列输出。值走**绑定参数**
+  （永远不会拼进 SQL 文本），并按目标方言做类型转换——sqlite 裸 `?`、mysql `CAST(? AS CHAR)`、
+  postgres `CAST(? AS TEXT)`。用途：给结果打固定标记列（如 `scope = 'svc'`）、与真实列拼接。
+  - `lit` 必须是**标量**（数组/对象/嵌套会报 `lit column must be a scalar`）；`as` 必填且过别名
+    形状（`^[A-Za-z_][A-Za-z0-9_]*$`，违例 `illegal alias`），与 `*` 混用直接拒
+    （`literal column cannot mix with select '*'`）。
+  - **真正的计算列请用 `case`**：`{case:{when:[...],else:...},as:"x"}` 已支持条件表达式；
+    `lit` 只承载常量，不承载表达式。注意 op 拼写是 `isnull` 不是 `isNull`。
 - case：searched case；`cond` 与 where 条件树同形；`then`/`else` **只允许 JSON 值**（绑定参数，
   不接受列名/标识符）；`as` 必填过别名形状。
 - window：`fn ∈ row_number / rank / dense_rank`；`partition_by` 列过白名单；frame 不做；`as` 必填。
@@ -1399,7 +1463,22 @@ await db.table("rich")
   （默认 1000）clamp；两者均可在配置中调整（硬顶 100000）。顶层结果为数组且行数 ≥ 生效
   上限时，响应带 `X-OJ-Row-Limit: <上限>` 头提示可能被截断。
 
-#### 流式查询 db.stream（v0.1.37，PR-2 Phase A）
+#### 流式查询 db.stream（v0.1.37）
+
+> **两条限制（动手前先看）**：
+> 1. **只走直连池**：在 `db.tx` 内调用报
+>    `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`
+>    ——先 `db.query` 取 id 集，或把流式挪到事务外。
+> 2. **不是所有后端都真逐行拉取**，分三档：
+>    - **真流式**（逐行推）：核心 sqlite / mysql / postgres 连接，以及 `oj-db-mysql` /
+>      `oj-db-postgres` 两个插件后端——大表遍历内存恒定。
+>    - **回落全量**（v0.1.38 起）：后端没有逐行能力时，宿主改成一次取全量——**结果与
+>      `db.query` 完全一致，不报错，只是内存优势没了**。
+>    - **彻底不支持**：直接报 `backend does not support streaming`，此时请换 `db.query` 分页。
+>
+>    想确认走的是哪一档：真流式的耗时随结果集分批推进（边收边出），回落全量的耗时会
+>    在首行之前一次性卡住。
+
 
 `db.query` 一次性把整张结果集拉进内存再序列化回 JS；结果集很大（导出、ETL、大表遍历）时
 会撑爆 handler 内存或触碰信封体积上限。`db.stream` 改为**逐行**从后端拉取，由 JS 一边收一边
@@ -1447,10 +1526,10 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
 **限制与边界**：
 - 仅支持**非事务**目标（`DB(name)` 的直连池）。在 `db.tx(...)` 内部调用 `db.stream` 直接报错
   `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。
-- **后端支持**（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
-  InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）均
-  **真流式**。第三方插件若未实现流式槽（open 哨兵 `{"unsupported":true}`），宿主**回落
-  `db.query` 全量**（行为等同 `db.query`，仅失去流式内存优势，不报错）。
+- **后端能力分三档**（v0.1.38 起，见本节开头的「两条限制」）：核心 sqlite / mysql /
+  postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 插件后端**真流式**；没有逐行能力的后端
+  **回落 `db.query` 全量**（行为一致、不报错，仅失去内存优势）；彻底不支持的报
+  `backend does not support streaming`。
 - `db.stream` 与 `db.query` 返回**内容一致**（同一查询的逐行等价于全量数组）；差异只在内存形态。
 - 取消（`signal`）按后端分两档：
   - **第一方插件 `oj-db-postgres` / `oj-db-mysql` 在 `postgres://` / `mysql://` DSN 下走
@@ -1546,9 +1625,9 @@ auth 会话也在同一 Redis（多实例共享的前提）；未配置时均为
 | `blob.url` | `url(key: string): Promise<string>` | 下载地址：local = `{base}/blob/{key}`；s3 = presigned URL（15min） |
 | `blob.uploadUrl` | `uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>` | 上传直传预签名（v0.1.30）：s3 后端返回 15min 预签名 PUT URL，客户端直传**不经 handler**（绕开 `max_upload_bytes`/30s）；`opts` 缺省 `{"kind":"put"}`，multipart 形态暂返回 Err。local 后端无预签名——报 `local blob backend has no upload presign; use the direct PUT upload route`，改用直传路由 |
 | `blob.contentType` | `contentType(key: string): Promise<string \| null>` | Content-Type（local 读 sidecar / 按扩展名推断；缺失且无法推断返回空串；s3 无 Content-Type 返回 `null`） |
-| `blob.copy` | `copy(src: string, dst: string): Promise<boolean>` | **服务端复制（v0.1.47，ABI 11）：src 保留**。local = `fs::copy`；s3 = CopyObject。**字节不进 V8**——大文件搬运的替代写法（不要 `get` + `put`）。`src == dst` 为 no-op；src 不存在报错 |
-| `blob.move` | `move(src: string, dst: string): Promise<boolean>` | **服务端搬移（v0.1.47，ABI 11）：src 不再存在**。local 同父目录 = `fs::rename`（原子、零字节），跨目录 = copy + unlink；s3 = CopyObject + DeleteObject。`src == dst` 为 no-op |
-| `blob.readRange` | `readRange(key: string, offset: number, len: number): Promise<Uint8Array>` | **区间读（v0.1.47，ABI 11）：短读截断**——`offset + len` 越过对象尾部只返回实际可读字节（可能短于 `len`），`offset` 已过尾部返回**空数组**；key 不存在报错；`offset`/`len` 为负 / 非整数 / NaN 报错（`blob readRange: offset must be a non-negative integer`）。后端不支持区间读时宿主回落 `get` 全量再切片（local/s3 均原生支持） |
+| `blob.copy` | `copy(src: string, dst: string): Promise<boolean>` | **服务端复制（v0.1.47）：src 保留**。local = `fs::copy`；s3 = CopyObject。**字节不进 V8**——大文件搬运的替代写法（不要 `get` + `put`）。`src == dst` 为 no-op；src 不存在报错 |
+| `blob.move` | `move(src: string, dst: string): Promise<boolean>` | **服务端搬移（v0.1.47）：src 不再存在**。local 同父目录 = `fs::rename`（原子、零字节），跨目录 = copy + unlink；s3 = CopyObject + DeleteObject。`src == dst` 为 no-op |
+| `blob.readRange` | `readRange(key: string, offset: number, len: number): Promise<Uint8Array>` | **区间读（v0.1.47）：短读截断**——`offset + len` 越过对象尾部只返回实际可读字节（可能短于 `len`），`offset` 已过尾部返回**空数组**；key 不存在报错；`offset`/`len` 为负 / 非整数 / NaN 报错（`blob readRange: offset must be a non-negative integer`）。后端不支持区间读时宿主回落 `get` 全量再切片（local/s3 均原生支持） |
 
 **上传四件套完整例子**（摘自 `src/upload/api.ts`）：
 
@@ -1585,7 +1664,7 @@ Content-Type，s3 302 跳 presigned URL）。key 按 `/` 分段白名单校验
 （下载/外链地址）；**≤ `max_upload` 的小文件行为完全不变**（`http.file(i)` 照常给字节）。
 服务端代分配的 key 形如 `uploads/<时间戳>-<序号>-<安全化文件名>`。
 
-**服务端搬运与区间读（v0.1.47，ABI 11）**：大文件的三件事不该让字节进 V8——
+**服务端搬运与区间读（v0.1.47）**：大文件的三件事不该让字节进 V8——
 
 ```ts
 // ① 搬运：流式落盘的临时对象转正（不要 blob.get + blob.put，那是 2× 峰值）
@@ -3132,7 +3211,7 @@ mounts:
 
 - **幂等**：归一后落盘文件 sha256 与当前代相同 → 返回 `{"code":0,"msg":"unchanged","generation":<n>}`，不装配、不 swap。
 - **段 diff 三清单**（每次成功 swap 返回）：
-  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）与**特权面段（`platform`/`fs`）**——已验证合法，但本代沿用旧连接池/旧插件 vtable/旧授权面，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）。
+  - `restart_pending`：后端段（`db`/`redis`/`blob`/`es`/`broker`/`smtp`/`ldap`/`auth`/`kafkas`/`rabbits`/`plugins`/`plugins_dir`/`secrets`）与**特权面段（`platform`/`fs`）**——已验证合法，但本代沿用旧连接池/旧插件后端/旧授权面，**重启后生效**。特权面段不热生效是安全语义：特权模块不能热改自己的 API/exec/fs 白名单（防自提权）。
   - `kept_listener`：`server` 段（port/host/证书路径）——listener 永生，本代沿旧，改了也**下个进程**才生效。
   - `applied`：其余段（如 `vars` 部署期常量）——本代即生效。
 
@@ -3145,7 +3224,7 @@ mounts:
 **代际与可观测**：`GET {base}/_system/config` 返回 `{config_path, sha256, loaded_at, generation}`；`GET {base}/_system/health` 返回 `{status:"OK", generation, config_path}`（旧路径 `{base}/health` 仍可用，但会告警建议改用 `_system/health`）。
 
 **限制（v1 边界）**：
-- 热更**复用首代已建立的连接池与插件 vtable**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。
+- 热更**复用首代已建立的连接池与插件后端**——不重建后端、不二次 `init` 插件、迁移强制 `verify`-only（dev 默认 `auto` 会打生产库，故热更路径强制 `verify`）、不重放 seed。需要新后端/新迁移的改动请走 `restart_pending` 提示并**重启进程**。
 - 触发源是**落盘配置文件**：进程生命周期内 CLI 覆盖（`--api-path`/`--cert-path`）不变，故以文件内容为热更真触发源。改文件 → `POST` 即生效。
 - 装配失败（如 `admission_gate` 不通过、新模块编译错）→ `POST` 返回 400 + 原因，**旧代继续服务**（失败不破坏在跑实例）；任务池交接为先建新池 fail-fast、再停旧池，新池建不起来则旧池仍跑（回滚完整）。
 
@@ -4033,7 +4112,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
-| `db.stream` 仅非事务目标（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 SqlxAccessor（sqlite/mysql/postgres）+ 第一方插件（`oj-db-mysql`/`oj-db-postgres`，vtable 批量 pull ≤100 行/次）真流式；第三方插件未实现流式槽 → 回落 `db.query` 全量（不报错，仅失去内存优势）。内容等价于 `db.query` 全量，差异仅在内存形态 |
+| `db.stream` 仅非事务目标 + 后端能力分档（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 插件后端**真流式**（逐行拉，内存恒定）；没有逐行能力的后端**回落 `db.query` 全量**（内容等价、不报错，仅失去内存优势）；彻底不支持时报 `backend does not support streaming`，改走 `db.query` 分页 |
 | 流式取消（`signal`）= 干净提前结束（v0.1.39；v0.1.42 起 pg/mysql 真取消） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done。**第一方插件 `oj-db-postgres`/`oj-db-mysql` 在 `postgres://`/`mysql://` DSN 下走专用连接，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端查询立即终止（真取消）**；core（sqlite）与 Any 回退路径为协作式（批间生效）。已回调的行不回滚 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |

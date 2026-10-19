@@ -16,6 +16,53 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.81（未打标签）
+
+- **db.table() 构造器补齐 7 项能力**（v0.1.81）——下游模板 `docs/sql-builder-missing-capabilities-pr.md`
+  的 7 条诉求经复核后落地。诉求来源复核结果：1 条误报（动态 WHERE 已可用）、1 条部分误报
+  （`select *` 仅「省略 select」可用）、1 条漏报（**表别名**，实为 notify.ts 的真正阻塞点）；
+  **`expr` 任意表达式模板经四路评审砍除**（理由见设计稿 §13：PG 占位符为 `$N` 而非 `?`、
+  字符白名单挡不住 `pg_sleep`/`load_file`、无下游真实需求举证、模板串迁移不可逆）。
+  设计稿 `docs/plans/2026-10-19-sql-builder-capabilities-design.md`，
+  实施计划 `docs/plans/2026-10-19-sql-builder-capabilities-implementation-plan.md`；
+- **#1 模糊搜索根治**：新增 `contains` / `startswith` / `endswith` 三个 op（**全小写**，与
+  既有 `gte`/`lte`/`isnull` 同族）。引擎内部统一转义 `%` `_` `!` 并渲染 `LIKE ? ESCAPE '!'`，
+  **业务层零转义负担、零方言知识**。保留 `like` 的 `escape` 逃生舱（`len==1` + 白名单
+  `! / | ~ # @`，**显式拒绝 `\`**——mysql 默认 `sql_mode` 下 `ESCAPE '\'` 即 1064），
+  定位为高级/框架内部，不在 op 清单主行展示；
+- **#2 join ON 值条件**：`join(t, [{left,right},{left,op,value}])`，可表达
+  `ON r.broadcast_id = b.id AND r.user_id = ?`；op 限比较类（`contains`/`isnull` 等拒），
+  value 过 `encodeParams`（BigInt 标记不丢）；
+- **#3 字面量列**：`{lit: v, as: "x"}` 走绑定参数、按方言 `CAST`（sqlite 裸 `?` /
+  mysql `CAST(? AS CHAR)` / pg `CAST(? AS TEXT)`）。**计算列请用现成的 `case`**
+  （`{case:{when:[...],else:...},as:"x"}`），注意 op 拼写是 `isnull` 不是 `isNull`；
+- **#4 幂等写入**：`orIgnore()` 与 `fromSelect(q, cols)`。
+  **mysql 走 `ON DUPLICATE KEY UPDATE <pk> = <pk>` 而非 `INSERT IGNORE`**
+  （后者会把 NOT NULL/截断等**所有**错误降级为警告，属静默数据损坏面；
+  且 sea-query 该路径上游零测试、组合后疑似产出非法 `ON DUPLICATE KEY IGNORE`）；
+  mysql 无主键表直接 Err；**`orIgnore` + `returning` 在 mysql 上直接 Err**；
+  **注意三方言 affected-rows 不一致**（mysql 协商 `CLIENT_FOUND_ROWS` → 命中重复键返回匹配行
+  1；pg/sqlite `DO NOTHING` 返回 0），**不要写 `if (n === 1)` 判定幂等**；
+- **#5 全表 delete 不豁免**：守卫（`bootstrap.js` JS 侧 + `query.rs` Rust 侧）保持双层，
+  本次未引入任何绕过路径；
+- **#6 动态 WHERE**：新增 `whereIf(cond, c)` 糖（`undefined`/`null`/`false`/**空数组 `[]`**
+  均跳过）；引擎侧新增 `Op::In` 空数组守卫（`IN ()` 直接 Err）；
+- **#7 `select(["*"])`**：显式全列展开；`["*"]` 必须是唯一元素，
+  **带 join 时直接 Err**（全列展开只出基表列，业务拿 join 列做授权判断会拿到 `undefined`）；
+- **#8 表别名**：`db.table("x").as("b")` / `.join(..., "left")`，放开自 join。
+  **仅 select/join 生效**，update/delete 带别名直接 Err（mysql `DELETE FROM t AS b`
+  需 8.0.16+）。实现上引入 `TableRef` 类型并在入口一次归一化，
+  **修掉了「别名会让归属守卫与租户守卫同时静默失效」的严重缺陷**
+  （`owner_of("t as b")` → None → judge 放行；`scoped("t as b")` → None → 不注入 tenant）；
+- **内部重构**：三个 `QueryReq` 遍历器（`guard_req` / `apply_tenant` / `validate_nested`）
+  统一走 `child_reqs()` 单一出口，`INSERT … SELECT` 这条新嵌套边不再可能漏遍历
+  （漏则跨租户读写 + 归属绕过）；`Op` 加 `class()` 消除三处重复的 op 子集判定；
+- 文档：新建 **`docs/devkit/sql-builder-guide.md`**（SQL 构造器专题：能力矩阵 / 方言差异 /
+  红线与逃生舱 / 迁移路径）；devkit 四件同步（详见下）。
+  既有文档订正：`api-manual.md` op 清单 `isnull` 拼写、`select *` 说明、
+  「union requires explicit columns」提示；
+  **`SKILL.md` 原第 117 行「手写 ESCAPE 转义」条目已改写**（与新方案直接冲突）。
+
 ## v0.1.80（未打标签）
 
 - `oj secret keygen` 新增 `--alg`（v0.1.80）：`x25519`（缺省，行为零变化）/ `ed25519`——为
