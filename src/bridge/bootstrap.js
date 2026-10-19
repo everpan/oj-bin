@@ -1027,14 +1027,19 @@ globalThis.db = globalThis.DB("default");
 // module's bound db (snapshot `db` is only the JS-visible name it was created with).
 function builderFromReq(snap) {
   const req = Object.assign(
-    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [], with: [], returning: [] },
+    { db: "default", table: "", columns: [], conditions: [], order_by: [], limit: null, offset: null, verb: "select", values: [], sets: {}, joins: [], group_by: [], having: null, distinct: false, unions: [], with: [], returning: [], or_ignore: false, from_select: null, insert_cols: [] },
     snap,
   );
-  req.db = String(req.db); req.table = String(req.table);
+  req.db = String(req.db);
+  // table may be an {name, as?} object (aliased, v0.1.81) -- do not String() it.
+  if (typeof req.table === "string") req.table = String(req.table);
   const api = {
     select(cols) {
       req.columns = (cols || []).map((c) => {
         if (typeof c === "string") return String(c);
+        // constant column (v0.1.81): `select(["name", { lit: "svc", as: "scope" }])`.
+        // The value is a bound param like any other -- never spliced into the SQL text.
+        if (c && c.lit !== undefined) return encodeParams({ lit: c.lit, as: String(c.as) });
         // deep-unwrap case when conds (condObj/builder, same as where/having)
         if (c && c.case && c.case.when) {
           // CASE carries values too (when[].then / else) -- encode the whole node.
@@ -1045,6 +1050,16 @@ function builderFromReq(snap) {
       return api;
     },
     where(cond) { req.conditions.push(encodeParams(unwrapTree(cond))); return api; },
+    // Dynamic filter (v0.1.81): skip when the guard value is absent.
+    // 0 and "" are KEPT (status=0 is a legitimate filter value); empty arrays are
+    // skipped because `IN ()` is a permanently-false predicate in the engine and
+    // would silently return 0 rows, indistinguishable from "no match".
+    whereIf(test, cond) {
+      if (test === undefined || test === null || test === false) return api;
+      if (Array.isArray(test) && test.length === 0) return api;
+      req.conditions.push(encodeParams(unwrapTree(cond)));
+      return api;
+    },
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
@@ -1055,9 +1070,55 @@ function builderFromReq(snap) {
     // single sea-query RETURNING statement; mysql has no RETURNING and takes
     // LAST_INSERT_ID() in a second step on the same connection (use db.tx for safety).
     returning(cols) { req.returning = (cols || []).map(String); return api; },
+    // Insert-from-select (v0.1.81): `db.table("t").fromSelect(db.table("s").select(["id","name"]), ["id","name"])`.
+    // The two column lists must line up by position -- the engine rejects any arity
+    // mismatch instead of silently writing the source rows into the wrong columns.
+    fromSelect(sub, cols) {
+      req.verb = "insert";
+      req.from_select = unwrapSub(sub);
+      req.insert_cols = (cols || []).map(String);
+      return api;
+    },
+    // Skip rows that collide with a unique key / primary key (v0.1.81).
+    // sqlite/pg render ON CONFLICT DO NOTHING; mysql has no DO NOTHING and falls back
+    // to the identity update `ON DUPLICATE KEY UPDATE <pk> = <pk>` (needs a primary key).
+    orIgnore() { req.or_ignore = true; return api; },
     update(sets) { req.verb = "update"; req.sets = encodeParams({ ...sets }); return api; },
     delete() { req.verb = "delete"; return api; },
-    join(table, on, kind) { req.joins.push({ table: String(table), on: (on || []).map((p) => ({ left: String(p.left), right: String(p.right) })), kind: kind ? String(kind) : "inner" }); return api; },
+    // Base-table alias (v0.1.81): `db.table("a").as("x")`. Names the base table for
+    // column qualification; ownership/tenant guards still key off the REAL name.
+    as(alias) {
+      const base = typeof req.table === "string" ? { name: req.table } : req.table;
+      req.table = { name: String(base.name), as: String(alias) };
+      return api;
+    },
+    // join(table, on, kind, alias?): `on` entries are either {left,right} (col=col) or
+    // {left,op,value} (col <op> value, v0.1.81). `value` goes through encodeParams so
+    // toBigInt() markers survive. The optional 4th arg aliases the JOINED table.
+    join(table, on, kind, alias) {
+      const jt = typeof table === "string" ? { name: table } : table;
+      const t = alias === undefined || alias === null
+        ? { name: String(jt.name) }
+        : { name: String(jt.name), as: String(alias) };
+      req.joins.push({
+        table: t,
+        on: (on || []).map((p) => {
+          // Keep BOTH shapes faithfully: serde_v8 drops `undefined` values, so a
+          // half-written {left,right,op} must still reach Rust to be rejected there
+          // (the engine is the authoritative entry point, not this chain layer).
+          const e = { left: String(p.left) };
+          const has = (x) => x !== undefined && x !== null;
+          if (has(p.right)) e.right = String(p.right);
+          if (has(p.op)) {
+            e.op = String(p.op);
+            e.value = has(p.value) ? encodeParams(p.value) : null;
+          }
+          return e;
+        }),
+        kind: kind ? String(kind) : "inner",
+      });
+      return api;
+    },
     distinct() { req.distinct = true; return api; },
     groupBy(cols) { req.group_by = (cols || []).map(String); return api; },
     having(cond) { req.having = encodeParams(unwrapTree(cond)); return api; },
@@ -1067,8 +1128,8 @@ function builderFromReq(snap) {
       if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
         throw new Error(req.verb + " requires where");
       }
-      if (req.verb === "insert" && req.values.length === 0) {
-        throw new Error("insert needs at least one row");
+      if (req.verb === "insert" && req.values.length === 0 && !req.from_select) {
+        throw new Error("insert needs either values or fromSelect");
       }
       return op_db_query_build(req);
     },

@@ -15,8 +15,8 @@ use std::sync::Arc;
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
 use sea_query::{
-    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, Order, OverStatement, Query, ReturningClause,
-    SelectStatement, SimpleExpr, SqliteQueryBuilder, Value as Qv,
+    Alias, Expr, ExprTrait, IntoColumnRef, LikeExpr, OnConflict, Order, OverStatement, Query,
+    ReturningClause, SelectStatement, SimpleExpr, SqliteQueryBuilder, Value as Qv,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -39,6 +39,10 @@ enum Op {
     In,
     Like,
     IsNull,
+    /// v0.1.81：语义化模糊 op —— pattern 由值派生，值里的 `%` / `_` 是**字面量**。
+    Contains,
+    StartsWith,
+    EndsWith,
 }
 
 /// 单条过滤条件（列名 + 操作符 + 值；subquery 见 Phase 8——值/子查询互斥在编译期报）。
@@ -49,6 +53,9 @@ struct Cond {
     op: Op,
     #[serde(default)]
     value: Option<Value>,
+    #[serde(default)]
+    /// LIKE 的 ESCAPE 转义符（单个字符，缺省 `\`）。只影响 `like` 与语义化模糊 op。
+    escape: Option<String>,
     #[serde(default)]
     subquery: Option<Box<QueryReq>>,
 }
@@ -120,6 +127,97 @@ struct OrderBy {
     dir: Option<String>,
 }
 
+/// 表引用：`name` 是 registry 真名（归属守卫 / 租户判定 / 列类型查询一律用它），
+/// `alias` 是 SQL 侧别名（渲染 FROM / JOIN / 限定列前缀一律用 `sql_name()`）。
+///
+/// 二者**必须分开**：别名曾与真名混在同一个 `String` 里，导致
+/// `guard::check_table("t as u")` 查不到归属 → `owner_of` 返回 None → 守卫静默放行，
+/// 以及 `scoped("t as u")` → `reg.get` 为 None → **租户条件完全不注入**。
+/// 类型化后入口只解析一次，此后两个用途在类型上就分开了（v0.1.81）。
+#[derive(Debug, Clone)]
+struct TableRef {
+    name: String,
+    alias: Option<String>,
+}
+
+impl TableRef {
+    /// SQL 侧表标识：有别名则用别名（FROM 已渲染成 `t AS u`），否则用真名。
+    fn sql_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// FROM：有别名渲染 `t AS u`，否则逐字节保持现状（v0.1.81）。
+fn from_or_as(q: &mut SelectStatement, t: &TableRef) {
+    match &t.alias {
+        Some(a) => {
+            q.from_as(Alias::new(&t.name), Alias::new(a));
+        }
+        None => {
+            q.from(Alias::new(&t.name));
+        }
+    }
+}
+
+/// JOIN：与 `from_or_as` 同形（别名可缺席），ON 子句原样带入。
+fn join_or_as(
+    q: &mut SelectStatement,
+    kind: sea_query::JoinType,
+    t: &TableRef,
+    on: sea_query::Condition,
+) {
+    match &t.alias {
+        Some(a) => {
+            q.join_as(kind, Alias::new(&t.name), Alias::new(a), on);
+        }
+        None => {
+            q.join(kind, Alias::new(&t.name), on);
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TableRef {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        match Value::deserialize(d)? {
+            Value::String(s) => {
+                let (name, alias) = split_table_alias(&s);
+                Ok(TableRef { name, alias })
+            }
+            Value::Object(mut m) => {
+                let name = m
+                    .remove("name")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .ok_or_else(|| Error::custom("table object needs string 'name'"))?;
+                let alias = m.remove("as").and_then(|v| v.as_str().map(str::to_string));
+                if !m.is_empty() {
+                    let keys: Vec<&String> = m.keys().collect();
+                    return Err(Error::custom(format!(
+                        "table object takes only name/as, unknown keys {keys:?}"
+                    )));
+                }
+                Ok(TableRef { name, alias })
+            }
+            _ => Err(Error::custom(
+                "table must be a string or an object {name, as?}",
+            )),
+        }
+    }
+}
+
+/// `"t as u"` → `("t", Some("u"))`。
+/// **只认「空格 as 空格」单一形态**——表名里含 "as" 子串（如 `cast_as`）不会被误切，
+/// 且形态唯一可避免因 `as`/`AS`/多空格产生的解析分歧。
+fn split_table_alias(s: &str) -> (String, Option<String>) {
+    match s.split_once(" as ") {
+        Some((t, a)) if !t.is_empty() && !a.is_empty() => (t.to_string(), Some(a.to_string())),
+        _ => (s.to_string(), None),
+    }
+}
+
 /// join 种类（right 不做：sqlite 旧版本不支持且无用例）。
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -129,17 +227,86 @@ enum JoinKind {
     Left,
 }
 
-/// on 条件：列对列等值（无 op 字段，deny_unknown_fields 防自以为能写 op）。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OnPair {
-    left: String,
-    right: String,
+/// join 的 on 条件，两种形态互斥（v0.1.81 起支持「列 op 值」）：
+/// - `Cols`：列对列等值 `{left, right}`，**不许带 op**。
+/// - `Val`：列对值 `{left, op, value}`，op 只收比较类（见 `Op::class`）。
+///
+/// 手写 Deserialize 而非 untagged：untagged 下 `deny_unknown_fields` 不生效，
+/// `{left, right, op}` 这种自以为能写 op 的形态会被**静默降级**成列对列（旧实现
+/// 正是靠 derive + deny_unknown_fields 挡住的，改枚举不能把这个保障丢掉）。
+#[derive(Debug, Clone)]
+enum OnPair {
+    Cols { left: String, right: String },
+    Val { left: String, op: Op, value: Value },
+}
+
+impl<'de> Deserialize<'de> for OnPair {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let m = serde_json::Map::<String, Value>::deserialize(d)?;
+        let left = m
+            .get("left")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::custom("join on needs string 'left'"))?
+            .to_string();
+        let extra = |keep: &[&str]| -> Vec<&String> {
+            m.keys().filter(|k| !keep.contains(&k.as_str())).collect()
+        };
+        if let Some(right) = m.get("right") {
+            // `{left, right, op}` 是自以为能写 op 的形态：两种 on 形态互斥，
+            // 宁可报错也不猜（否则 op 被静默丢弃，`col = col` 多捞出数据）。
+            if m.contains_key("op") {
+                return Err(Error::custom(format!(
+                    "join on '{left}' takes either right or op/value, not both"
+                )));
+            }
+            let unknown = extra(&["left", "right"]);
+            if !unknown.is_empty() {
+                return Err(Error::custom(format!(
+                    "join on '{left}' takes only right, unknown keys {unknown:?}"
+                )));
+            }
+            let right = right
+                .as_str()
+                .ok_or_else(|| Error::custom("join on needs string 'right'"))?;
+            return Ok(OnPair::Cols {
+                left,
+                right: right.to_string(),
+            });
+        }
+        let op_v = m
+            .get("op")
+            .ok_or_else(|| Error::custom(format!("join on '{left}' needs op and value")))?;
+        let op = Op::deserialize(op_v.clone()).map_err(Error::custom)?;
+        // 只收比较类 op（`col <op> <value>`）：pattern 类（contains 等）在 ON 里
+        // 无用例，nullary 类（isnull）无值、与「列 = 值」形态冲突。
+        // 挡在**解析期**而不是渲染期——fromJSON 是权威入口，挡晚了就是两套判定。
+        if op.class() != OpClass::Compare {
+            return Err(Error::custom(format!(
+                "join on '{left}' does not support op '{}'",
+                op.name()
+            )));
+        }
+        let value = m
+            .get("value")
+            .ok_or_else(|| Error::custom(format!("join on '{left}' needs value")))?
+            .clone();
+        let unknown = extra(&["left", "op", "value"]);
+        if !unknown.is_empty() {
+            return Err(Error::custom(format!(
+                "join on '{left}' takes only op/value, unknown keys {unknown:?}"
+            )));
+        }
+        Ok(OnPair::Val { left, op, value })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Join {
-    table: String,
+    table: TableRef,
     #[serde(default)]
     kind: JoinKind,
     on: Vec<OnPair>,
@@ -183,6 +350,17 @@ struct AggSpec {
     field: Option<String>,
     #[serde(rename = "as", default)]
     r#as: Option<String>,
+}
+
+/// 字面量列 `{lit: <value>, as: <alias>}`（v0.1.81）：给结果集补一列常量，
+/// 例如 `select([{lit:"svc", as:"scope"}])` 给每行打上来源标记。
+/// 值走绑定参数；三方言对裸参数的容忍度不同，故按方言决定是否套 CAST。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LitSpec {
+    lit: Value,
+    #[serde(rename = "as")]
+    r#as: String,
 }
 
 /// case 列 `{case:{when,else?}, as}`（searched case only；then/else 只允许 JSON 值，
@@ -247,6 +425,10 @@ struct WindowBody {
 #[derive(Debug, Clone)]
 enum ColSpec {
     Name(String),
+    /// `select(["*"])` 的全列形态（v0.1.81）：展开为 registry 全列，
+    /// 与「不写 select」同义，只允许单独出现。
+    Star,
+    Lit(LitSpec),
     Agg(AggSpec),
     Case(CaseSpec),
     Window(WindowSpec),
@@ -259,6 +441,7 @@ impl<'de> Deserialize<'de> for ColSpec {
     {
         use serde::de::Error;
         match Value::deserialize(d)? {
+            Value::String(s) if s == "*" => Ok(ColSpec::Star),
             Value::String(s) => Ok(ColSpec::Name(s)),
             v @ Value::Object(_) => {
                 let m = v.as_object().expect("object");
@@ -272,12 +455,17 @@ impl<'de> Deserialize<'de> for ColSpec {
                         .map(ColSpec::Window)
                         .map_err(Error::custom);
                 }
+                if m.contains_key("lit") {
+                    return serde_json::from_value::<LitSpec>(v)
+                        .map(ColSpec::Lit)
+                        .map_err(Error::custom);
+                }
                 serde_json::from_value::<AggSpec>(v)
                     .map(ColSpec::Agg)
                     .map_err(Error::custom)
             }
             _ => Err(Error::custom(
-                "column must be a string or an object {fn|case|window, ...}",
+                "column must be a string or an object {fn|case|window|lit, ...}",
             )),
         }
     }
@@ -302,7 +490,7 @@ struct QueryReq {
     /// 目标命名库（bootstrap 的 queryBuilder 填入；缺省 default）。
     #[serde(default = "default_db")]
     db: String,
-    table: String,
+    table: TableRef,
     #[serde(default)]
     verb: Verb,
     #[serde(default)]
@@ -336,6 +524,17 @@ struct QueryReq {
     unions: Vec<UnionArm>,
     #[serde(default)]
     with: Vec<CteReq>,
+    /// 幂等插入（v0.1.81）：主键冲突时跳过而非报错。
+    /// sqlite/pg 渲染 `ON CONFLICT DO NOTHING`；mysql 无原生 DO NOTHING，
+    /// 退化成 `ON DUPLICATE KEY UPDATE <pk> = <pk>` 恒等式。
+    #[serde(default)]
+    or_ignore: bool,
+    /// insert 的数据源改为一条 select（v0.1.81）：与 `values` 互斥。
+    #[serde(default)]
+    from_select: Option<Box<QueryReq>>,
+    /// `from_select` 路径下的目标列清单（必须与源 select 输出列数一致）。
+    #[serde(default)]
+    insert_cols: Vec<String>,
 }
 
 /// union 种类（Intersect/Except 不做：mysql 旧版本不支持且无用例）。
@@ -459,10 +658,161 @@ fn to_qv(v: &Value) -> Qv {
     }
 }
 
-/// op 编译为谓词表达式（泛化：左操作数可为任意 ExprTrait——having 别名展开 Phase 6 复用）。
-fn apply_op<T: ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsErrorBox> {
+/// op 的能力分类（v0.1.81）：决定一个 op 能出现在哪些语境。
+/// - `Compare`：`col <op> <value>`，右操作数是调用方给的字面值。
+/// - `Pattern`：`col LIKE <pattern>`，pattern 由值派生（`contains` 等），
+///   值的 `%` / `_` 已被转义成字面量。
+/// - `Nullary`：无右操作数（`isnull`）。
+///
+/// 单一职责：分类只回答「这个 op 是什么形态」，编译谓词由 `Op::apply` 负责。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpClass {
+    Compare,
+    Pattern,
+    Nullary,
+}
+
+/// LIKE 默认转义符。
+const LIKE_ESCAPE: char = '\\';
+
+/// 把值里的 LIKE 元字符（`%` / `_` / 转义符自身）转成字面量。
+/// 顺序要紧：先处理转义符本身，否则 `a\b` 会漏掉反斜杠的元语义。
+fn escape_like(s: &str, esc: char) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c == esc || c == '%' || c == '_' {
+            out.push(esc);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 字面量列的三方言形态（v0.1.81）：值一律绑定参数，差异只在要不要套 CAST。
+/// - sqlite：裸 `?` 可用（`SELECT ? AS x` 合法），不套。
+/// - mysql：`CAST(? AS CHAR)`——裸参数的列类型由驱动推断，与 UNION / 字符串比较
+///   混用时类型不可靠，套一层统一成 CHAR。
+/// - postgres：**必须** `CAST($1 AS TEXT)`——裸参数会报
+///   `could not determine data type of parameter $1`。
+///
+/// 字面列能承载的值形态（v0.1.81）：标量，或大整数标记对象（`toBigInt()` 的产物，
+/// 它本身就是标量的载体）。对象/数组一律不算 —— 它们会被串成 `{"a":1}` 这种文本。
+fn lit_is_scalar(v: &Value) -> bool {
+    v.is_null()
+        || matches!(v, Value::String(_) | Value::Bool(_) | Value::Number(_))
+        || oj_plugin_ffi::jsint::marker_i64(v).is_some()
+        || oj_plugin_ffi::jsint::marker_u64(v).is_some()
+}
+
+/// 类型名按裸标识符传入（不是 `Alias`）：`Alias` 会被渲染成 `"CHAR"` 而变成列名。
+fn lit_expr(v: &Value, dialect: Dialect) -> SimpleExpr {
+    let e = Expr::val(to_qv(v));
+    match dialect {
+        Dialect::Sqlite => e,
+        Dialect::MySql => e.cast_as("CHAR"),
+        Dialect::Postgres => e.cast_as("TEXT"),
+    }
+}
+
+/// `col LIKE <pattern> ESCAPE <esc>`：pattern 与转义符都是**绑定参数**，
+/// 不落进 SQL 文本（否则 `%` / `'` 就是拼接注入面）。
+///
+/// 嵌套方向要紧：ESCAPE 必须是 LIKE 的**右**操作数
+/// （`Binary(col, Like, Binary(pattern, Escape, esc))`）。反过来的
+/// `Binary(Binary(col, Like, pattern), Escape, esc)` 会被 sea-query 的括号化渲染成
+/// `(col LIKE ?) ESCAPE ?` —— 语法错误。
+fn like_pred<T: ExprTrait>(t: T, pattern: &str, esc: char) -> SimpleExpr {
+    let rhs = Expr::val(pattern.to_string())
+        .binary(sea_query::BinOper::Escape, Expr::val(esc.to_string()));
+    t.binary(sea_query::BinOper::Like, rhs)
+}
+
+impl Op {
+    /// 该 op 的线上名字（`{op: "<name>"}` 里写的那个），报错文案用它。
+    fn name(self) -> &'static str {
+        match self {
+            Op::Eq => "eq",
+            Op::Ne => "ne",
+            Op::Gt => "gt",
+            Op::Gte => "gte",
+            Op::Lt => "lt",
+            Op::Lte => "lte",
+            Op::In => "in",
+            Op::Like => "like",
+            Op::IsNull => "isnull",
+            Op::Contains => "contains",
+            Op::StartsWith => "startswith",
+            Op::EndsWith => "endswith",
+        }
+    }
+
+    fn class(self) -> OpClass {
+        match self {
+            Op::Eq | Op::Ne | Op::Gt | Op::Gte | Op::Lt | Op::Lte | Op::In | Op::Like => {
+                OpClass::Compare
+            }
+            Op::Contains | Op::StartsWith | Op::EndsWith => OpClass::Pattern,
+            Op::IsNull => OpClass::Nullary,
+        }
+    }
+
+    /// 比较类 op 编译为谓词（`col <op> <value>`），值必填。
+    /// 只服务 join ON 语境（那里没有 `escape` 字段，一律用默认转义符）。
+    fn apply<T: ExprTrait>(self, t: T, val: &Value) -> Result<SimpleExpr, JsErrorBox> {
+        let esc = LIKE_ESCAPE;
+        Ok(match (self, val) {
+            (Op::Eq, v) => t.eq(Expr::val(to_qv(v))),
+            (Op::Ne, v) => t.ne(Expr::val(to_qv(v))),
+            (Op::Gt, v) => t.gt(Expr::val(to_qv(v))),
+            (Op::Gte, v) => t.gte(Expr::val(to_qv(v))),
+            (Op::Lt, v) => t.lt(Expr::val(to_qv(v))),
+            (Op::Lte, v) => t.lte(Expr::val(to_qv(v))),
+            (Op::In, Value::Array(a)) => {
+                if a.is_empty() {
+                    return Err(JsErrorBox::generic("in needs non-empty array"));
+                }
+                t.is_in(a.iter().map(|v| Expr::val(to_qv(v))))
+            }
+            (Op::In, _) => {
+                return Err(JsErrorBox::generic("in needs array value"));
+            }
+            (Op::Like, v) => like_pred(t, &text_of(v), esc),
+            // 其余（pattern / nullary 类）由调用方按 `class()` 提前挡掉。
+            other => {
+                return Err(JsErrorBox::generic(format!(
+                    "op '{}' is not supported here",
+                    other.0.name()
+                )));
+            }
+        })
+    }
+}
+
+/// 取 LIKE 转义符：缺省 `\`；给了就必须是**单个**字符（多字符会被静默截断成第一个，
+/// 宁可报错）。
+fn escape_char_of(c: &Cond) -> Result<char, JsErrorBox> {
+    match &c.escape {
+        None => Ok(LIKE_ESCAPE),
+        Some(s) => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(ch), None) => Ok(ch),
+                _ => Err(JsErrorBox::generic(format!(
+                    "escape must be a single char, got '{}'",
+                    s
+                ))),
+            }
+        }
+    }
+}
+
+/// op 编译为谓词表达式（泛化：左操作数可为任意 ExprTrait——having 别名展开复用）。
+/// `value` 为 None 时按 op 分派：eq/ne 取 NULL 右值、isnull 无值，其余报「needs value」。
+fn apply_op<T: ExprTrait>(t: T, c: &Cond) -> Result<SimpleExpr, JsErrorBox> {
+    let val = &c.value;
     let rhs = |v: &Value| Expr::val(to_qv(v));
-    Ok(match op {
+    let esc = escape_char_of(c)?;
+    Ok(match c.op {
         Op::Eq => t.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
         Op::Ne => t.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
         Op::Gt => t.gt(rhs(val
@@ -482,6 +832,11 @@ fn apply_op<T: ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Result<SimpleExp
                 .as_ref()
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| JsErrorBox::generic("in needs array value"))?;
+            // 空集会被 sea-query 渲染成恒假（`IN ()` / `IN (NULL)`），
+            // 结果是**静默 0 行**——与「查到 0 条」无法区分，故显式拒绝（v0.1.81）。
+            if arr.is_empty() {
+                return Err(JsErrorBox::generic("in needs non-empty array"));
+            }
             let vals: Vec<Expr> = arr.iter().map(rhs).collect();
             t.is_in(vals)
         }
@@ -489,14 +844,36 @@ fn apply_op<T: ExprTrait>(t: T, op: Op, val: &Option<Value>) -> Result<SimpleExp
             let v = val
                 .as_ref()
                 .ok_or_else(|| JsErrorBox::generic("like needs value"))?;
-            let pat = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
+            // 裸 like：pattern 由用户给，`escape` 给了才挂 ESCAPE 子句。
+            let pat = text_of(v);
+            match &c.escape {
+                Some(_) => like_pred(t, &pat, esc),
+                None => t.like(LikeExpr::new(pat)),
+            }
+        }
+        // 语义化模糊 op：pattern 由值派生，值里的 % / _ 一律当字面量。
+        Op::Contains | Op::StartsWith | Op::EndsWith => {
+            let v = val
+                .as_ref()
+                .ok_or_else(|| JsErrorBox::generic(format!("{} needs value", c.op.name())))?;
+            let core = escape_like(&text_of(v), esc);
+            let pat = match c.op {
+                Op::Contains => format!("%{core}%"),
+                Op::StartsWith => format!("{core}%"),
+                _ => format!("%{core}"),
             };
-            t.like(LikeExpr::new(pat))
+            like_pred(t, &pat, esc)
         }
         Op::IsNull => t.is_null(),
     })
+}
+
+/// Cond 值的文本形态（数值/布尔等非字符串按 JSON 文本，与既有行为一致）。
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// 表来源：真实表（registry）或 CTE 虚拟表（声明列）。
@@ -537,6 +914,15 @@ struct ColCtx<'a> {
     joins: Vec<(&'a str, TableSrc<'a>)>,
     /// 顶层 with 声明（未参与 FROM 的直接引用也可解析列——由 SQL 侧报错兜底）。
     ctes: Vec<(&'a str, TableSrc<'a>)>,
+}
+
+/// 构造期共享上下文（registry + 方言）：替代把两个值逐层透传的长参数表。
+/// 方言是必需的——`lit` 的 CAST 形态与 `orIgnore` 的方言分派都要它，
+/// 而它们可能出现在任意嵌套层（子查询 / CTE / union 成员），不能只在顶层可见。
+#[derive(Clone, Copy)]
+struct Build<'a> {
+    reg: &'a SchemaRegistry,
+    dialect: Dialect,
 }
 
 impl ColCtx<'_> {
@@ -598,6 +984,9 @@ const REQ_NEST_MAX: u8 = 4;
 /// 单个 CASE 列的 when 子句上限。
 const CASE_WHEN_MAX: usize = 16;
 
+/// insert-from-select 的租户常量列别名（守卫内部注入，用户不可指定同名列）。
+const TENANT_LIT_ALIAS: &str = "__oj_tenant";
+
 /// 嵌套 select 通用约束（site 用于报错定位：subquery/exists/union/cte）。
 /// with 的禁带判断由 Task 18 落地字段后补上（unions 已落地）。
 fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorBox> {
@@ -631,15 +1020,24 @@ fn validate_nested(req: &QueryReq, depth: u8, site: &str) -> Result<(), JsErrorB
 fn leaf_subquery(
     c: &Cond,
     ctx: &ColCtx<'_>,
-    reg: &SchemaRegistry,
+    bx: Build<'_>,
     sel_depth: u8,
     site: &str,
 ) -> Result<Option<SimpleExpr>, JsErrorBox> {
     let Some(sub) = c.subquery.as_deref() else {
         return Ok(None);
     };
-    if c.op == Op::IsNull {
-        return Err(JsErrorBox::generic("isnull does not accept subquery"));
+    // 按 class 判定而不是逐个点名（v0.1.81）：pattern 类（contains 等）与
+    // nullary 类（isnull）形态上就构不成 `col <op> (SELECT ...)`，
+    // 新增 op 只要分好类就自动落进这条守卫，不必再改这里。
+    match c.op.class() {
+        OpClass::Pattern | OpClass::Nullary => {
+            return Err(JsErrorBox::generic(format!(
+                "{} does not accept subquery",
+                c.op.name()
+            )));
+        }
+        OpClass::Compare => {}
     }
     if c.op == Op::Like {
         return Err(JsErrorBox::generic("like does not accept subquery"));
@@ -652,7 +1050,7 @@ fn leaf_subquery(
     validate_nested(sub, sel_depth + 1, "subquery")?;
     ctx.check_col(&c.field, site)?;
     let col = col_simple_expr(&c.field);
-    let sel = build_select_stmt(sub, reg, sel_depth + 1)?;
+    let sel = build_select_stmt(sub, bx, sel_depth + 1)?;
     // ExprTrait 的 eq/ne/gt/gte/lt/lte 接受 R: Into<Expr>（SelectStatement 可转）；
     // in 走 in_subquery——比较 op 渲染为 `col = (SELECT ...)` 标量子查询。
     Ok(Some(match c.op {
@@ -663,7 +1061,9 @@ fn leaf_subquery(
         Op::Gte => Expr::expr(col).gte(sel),
         Op::Lt => Expr::expr(col).lt(sel),
         Op::Lte => Expr::expr(col).lte(sel),
-        Op::Like | Op::IsNull => unreachable!("rejected above"),
+        Op::Like | Op::IsNull | Op::Contains | Op::StartsWith | Op::EndsWith => {
+            unreachable!("rejected above")
+        }
     }))
 }
 
@@ -722,7 +1122,7 @@ fn cond_expr_generic(
 fn cond_expr(
     t: &CondTree,
     ctx: &ColCtx<'_>,
-    reg: &SchemaRegistry,
+    bx: Build<'_>,
     sel_depth: u8,
     depth: usize,
     leaves: &mut usize,
@@ -730,15 +1130,15 @@ fn cond_expr(
     cond_expr_generic(
         t,
         &mut |c| {
-            if let Some(e) = leaf_subquery(c, ctx, reg, sel_depth, "where")? {
+            if let Some(e) = leaf_subquery(c, ctx, bx, sel_depth, "where")? {
                 return Ok(e);
             }
             ctx.check_col(&c.field, "where")?;
-            apply_op(col_simple_expr(&c.field), c.op, &c.value)
+            apply_op(col_simple_expr(&c.field), c)
         },
         &mut |sub| {
             validate_nested(sub, sel_depth + 1, "exists")?;
-            Ok(Expr::exists(build_select_stmt(sub, reg, sel_depth + 1)?))
+            Ok(Expr::exists(build_select_stmt(sub, bx, sel_depth + 1)?))
         },
         depth,
         leaves,
@@ -751,7 +1151,7 @@ fn cond_expr_having(
     t: &CondTree,
     ctx: &ColCtx<'_>,
     aliases: &HashMap<String, SimpleExpr>,
-    reg: &SchemaRegistry,
+    bx: Build<'_>,
     sel_depth: u8,
     depth: usize,
     leaves: &mut usize,
@@ -759,21 +1159,21 @@ fn cond_expr_having(
     cond_expr_generic(
         t,
         &mut |c| {
-            if let Some(e) = leaf_subquery(c, ctx, reg, sel_depth, "having")? {
+            if let Some(e) = leaf_subquery(c, ctx, bx, sel_depth, "having")? {
                 return Ok(e);
             }
             if ctx.check_col(&c.field, "having").is_ok() {
-                apply_op(col_simple_expr(&c.field), c.op, &c.value)
+                apply_op(col_simple_expr(&c.field), c)
             } else {
                 let e = aliases.get(&c.field).ok_or_else(|| {
                     JsErrorBox::generic(format!("unknown column '{}' in having", c.field))
                 })?;
-                apply_op(Expr::expr(e.clone()), c.op, &c.value)
+                apply_op(Expr::expr(e.clone()), c)
             }
         },
         &mut |sub| {
             validate_nested(sub, sel_depth + 1, "exists")?;
-            Ok(Expr::exists(build_select_stmt(sub, reg, sel_depth + 1)?))
+            Ok(Expr::exists(build_select_stmt(sub, bx, sel_depth + 1)?))
         },
         depth,
         leaves,
@@ -784,13 +1184,15 @@ fn cond_expr_having(
 /// 虚拟表无归属）；条件树（含 having）内所有子查询/exists 的嵌套 req 递归过守卫；
 /// 每个 cte.query 递归过守卫。
 fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsErrorBox> {
+    // 归属守卫只认**真名**：别名一旦混进来，`owner_of("t as u")` 查不到条目 →
+    // 返回 None → judge 直接放行，守卫在 deny 模式下也会失效（v0.1.81 修）。
     let cte_name = |n: &str| req.with.iter().any(|c| c.name == n);
-    if !cte_name(&req.table) {
-        super::guard::check_table(state, &req.table)?;
+    if !cte_name(&req.table.name) {
+        super::guard::check_table(state, &req.table.name)?;
     }
     for j in &req.joins {
-        if !cte_name(&j.table) {
-            super::guard::check_table(state, &j.table)?;
+        if !cte_name(&j.table.name) {
+            super::guard::check_table(state, &j.table.name)?;
         }
     }
     for c in &req.conditions {
@@ -851,16 +1253,19 @@ fn apply_tenant(
         return Ok(());
     }
     let cte_name = |n: &str| req.with.iter().any(|c| c.name == n);
+    // `scoped` 只认真名：别名混进来时 `reg.get("t as u")` 为 None → 恒判为「非租户表」
+    // → 租户条件被静默跳过（v0.1.81 修）。
     let scoped =
         |name: &str| !cte_name(name) && reg.get(name).is_some_and(|t| t.is_tenant_scoped());
     // 本层受约束表（基表 + join 表；用于 tid=None 判定与写侧校验）。
+    // 存真名：报错文案 `table(s) {touched:?}` 形态由既有测试锁定，不能带别名信息。
     let mut touched = vec![];
-    if scoped(&req.table) {
-        touched.push(req.table.clone());
+    if scoped(&req.table.name) {
+        touched.push(req.table.name.clone());
     }
     for j in &req.joins {
-        if scoped(&j.table) {
-            touched.push(j.table.clone());
+        if scoped(&j.table.name) {
+            touched.push(j.table.name.clone());
         }
     }
     if !touched.is_empty() {
@@ -868,14 +1273,33 @@ fn apply_tenant(
             Some(tid) => match req.verb {
                 Verb::Select | Verb::Update | Verb::Delete => {
                     // 限定列注入：join 场景下裸 tenant_id 会撞歧义（两表同名列）。
+                    // 前缀用 **sql_name()**（别名）——FROM 已渲染成 `t AS u`，
+                    // 用真名会得到不存在的限定表 → SQL 报错（v0.1.81）。
                     req.conditions.push(CondTree::Leaf(Cond {
-                        field: format!("{}.tenant_id", req.table),
+                        field: format!("{}.tenant_id", req.table.sql_name()),
                         op: Op::Eq,
-                        value: Some(tenant_value(reg, &req.table, tid)?),
+                        value: Some(tenant_value(reg, &req.table.name, tid)?),
+                        escape: None,
                         subquery: None,
                     }));
                 }
                 Verb::Insert => {
+                    // v0.1.81：fromSelect 路径没有 `values` 可注入 → 租户列必须由
+                    // **常量列**补上（`INSERT ... SELECT c1, c2, ? AS __oj_tenant`）。
+                    // 少了这一步，租户表上的 insert-from-select 会写出 tenant_id 为空的
+                    // 行——守卫不是「拦错租户」，而是「根本没写租户」。
+                    if let Some(src) = &mut req.from_select {
+                        if req.insert_cols.iter().any(|c| c == "tenant_id") {
+                            return Err(JsErrorBox::generic(
+                                "tenant guard: insert fromSelect must not supply tenant_id",
+                            ));
+                        }
+                        src.columns.push(ColSpec::Lit(LitSpec {
+                            lit: tenant_value(reg, &req.table.name, tid)?,
+                            r#as: TENANT_LIT_ALIAS.into(),
+                        }));
+                        req.insert_cols.push("tenant_id".into());
+                    }
                     // v0.1.24：等值判定复用 `param_is_tenant`（字符串/数字/i64 标记/u64 标记
                     // 四形态等价）——此前只认字符串，数值型 tenant_id 列因此无法插入。
                     for row in &mut req.values {
@@ -886,7 +1310,10 @@ fn apply_tenant(
                                 )));
                             }
                             _ => {
-                                row.insert("tenant_id".into(), tenant_value(reg, &req.table, tid)?);
+                                row.insert(
+                                    "tenant_id".into(),
+                                    tenant_value(reg, &req.table.name, tid)?,
+                                );
                             }
                         }
                     }
@@ -907,7 +1334,7 @@ fn apply_tenant(
         // update 写侧逃逸：sets 显式 tenant_id 必须等于当前租户（比 insert 更隐蔽，
         // update({tenant_id:"victim"}) 会把本租户行迁移到他租户）。
         if req.verb == Verb::Update
-            && scoped(&req.table)
+            && scoped(&req.table.name)
             && let Some(v) = req.sets.get("tenant_id")
             && (tid.is_none() || !tid.is_some_and(|t| super::guard::param_is_tenant(v, t)))
         {
@@ -920,8 +1347,8 @@ fn apply_tenant(
         // （评审 P0——is_none() 放行会让攻击者选定他租户 ON 条件）。
         if let Some(tid) = tid {
             for j in &mut req.joins {
-                if scoped(&j.table) {
-                    j.tenant_id = Some(tenant_value(reg, &j.table, tid)?);
+                if scoped(&j.table.name) {
+                    j.tenant_id = Some(tenant_value(reg, &j.table.name, tid)?);
                 }
             }
         }
@@ -945,6 +1372,11 @@ fn apply_tenant(
     }
     for c in &mut req.with {
         apply_tenant(&mut c.query, reg, tid, guard, false)?;
+    }
+    // fromSelect 的源 select 也是一次完整读取：不递归就等于允许
+    // `insert into 我的表 select * from 租户表`（跨租户搬运，v0.1.81）。
+    if let Some(s) = &mut req.from_select {
+        apply_tenant(s, reg, tid, guard, false)?;
     }
     Ok(())
 }
@@ -1010,6 +1442,13 @@ fn apply_tenant_tree(
 fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
     let reject =
         |verb: &str, f: &str| Err(JsErrorBox::generic(format!("{verb} does not accept {f}")));
+    // 别名只在 select/join 成立（方言的 INSERT/UPDATE/DELETE 不支持 `AS` 别名），
+    // 带别名的 DML 会让列限定指向一张 SQL 里不存在的表 → 显式拒绝（v0.1.81）。
+    if req.table.alias.is_some() && !matches!(req.verb, Verb::Select) {
+        return Err(JsErrorBox::generic(
+            "table alias is not supported on insert/update/delete",
+        ));
+    }
     match req.verb {
         Verb::Select => {
             if !req.values.is_empty() {
@@ -1021,10 +1460,52 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if !req.returning.is_empty() {
                 return reject("select", "returning");
             }
+            // orIgnore / fromSelect 是 INSERT 的尾部子句，挂在其他动词上无处可渲染
+            // → 显式拒绝，而不是静默丢弃（v0.1.81）。
+            if req.or_ignore {
+                return reject("select", "orIgnore");
+            }
+            if req.from_select.is_some() || !req.insert_cols.is_empty() {
+                return reject("select", "fromSelect");
+            }
         }
         Verb::Insert => {
-            if req.values.is_empty() {
-                return Err(JsErrorBox::generic("insert needs at least one row"));
+            // values 与 fromSelect 互斥且必居其一（v0.1.81）：两条都走的语义无法定义
+            // （是插入字面量行还是插入查询结果？），宁可报错也不猜。
+            if !req.values.is_empty() && req.from_select.is_some() {
+                return Err(JsErrorBox::generic(
+                    "insert takes either values or fromSelect, not both",
+                ));
+            }
+            if req.values.is_empty() && req.from_select.is_none() {
+                return Err(JsErrorBox::generic(
+                    "insert needs either values or fromSelect",
+                ));
+            }
+            if req.from_select.is_some() && req.insert_cols.is_empty() {
+                return Err(JsErrorBox::generic(
+                    "insert fromSelect needs insert columns",
+                ));
+            }
+            // 列清单只在 fromSelect 路径上有意义（values 路径的列名取自行对象）——
+            // 给了却不用 = 用户以为生效了，必须报错。
+            if req.from_select.is_none() && !req.insert_cols.is_empty() {
+                return Err(JsErrorBox::generic(
+                    "insert columns are only allowed with fromSelect",
+                ));
+            }
+            // 源 select 与 union 臂同一把尺子（动词/嵌套深度/with-unions/裸 offset）。
+            if let Some(src) = req.from_select.as_deref() {
+                validate_nested(src, 0, "fromSelect")?;
+                // 源列必须逐个点名：`select(["*"])` 与「不写 select」都按 registry 的
+                // HashMap 顺序摊成全列，而 INSERT ... SELECT 是按**位置**对齐的——
+                // 顺序不定等于列名串位（name 写进 age）。宁可要用户多敲几个字。
+                if src.columns.is_empty() || src.columns.iter().any(|c| matches!(c, ColSpec::Star))
+                {
+                    return Err(JsErrorBox::generic(
+                        "fromSelect source needs explicit columns (no '*' / omission)",
+                    ));
+                }
             }
             if !req.conditions.is_empty() {
                 return reject("insert", "where");
@@ -1085,6 +1566,12 @@ fn validate_verb(req: &QueryReq) -> Result<(), JsErrorBox> {
             if req.verb == Verb::Update && req.sets.is_empty() {
                 return Err(JsErrorBox::generic("update needs non-empty sets"));
             }
+            if req.or_ignore {
+                return reject("update/delete", "orIgnore");
+            }
+            if req.from_select.is_some() || !req.insert_cols.is_empty() {
+                return reject("update/delete", "fromSelect");
+            }
             // 空 and/or 组在 CondTree Deserialize 已拒 → 非空即叶子 ≥ 1。
             if req.conditions.is_empty() {
                 return Err(JsErrorBox::generic(format!(
@@ -1108,6 +1595,7 @@ fn build_statement(
     dialect: Dialect,
 ) -> Result<(String, Vec<Value>), JsErrorBox> {
     validate_verb(req)?;
+    let bx = Build { reg, dialect };
     let params_of =
         |(sql, values): (String, sea_query::Values)| -> Result<(String, Vec<Value>), JsErrorBox> {
             let params = values.iter().map(value_to_json).collect::<Result<_, _>>()?;
@@ -1120,38 +1608,100 @@ fn build_statement(
             let clause = if req.with.is_empty() {
                 None
             } else {
-                Some(build_with_clause(req, reg, 0)?)
+                Some(build_with_clause(req, bx, 0)?)
             };
-            let sel = build_select_stmt(req, reg, 0)?;
+            let sel = build_select_stmt(req, bx, 0)?;
             match clause {
                 None => params_of(build_sql(dialect, &sel)),
                 Some(c) => params_of(build_sql(dialect, &sel.with(c))),
             }
         }
         Verb::Insert => {
-            let table = reg
-                .get(&req.table)
-                .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
-            let keys: Vec<String> = req.values[0].keys().cloned().collect();
-            for k in &keys {
-                if !table.has_column(k) {
-                    return Err(JsErrorBox::generic(format!(
-                        "unknown column '{k}' in insert values"
-                    )));
+            let table = reg.get(&req.table.name).ok_or_else(|| {
+                JsErrorBox::generic(format!("unknown table '{}'", req.table.name))
+            })?;
+            let mut ins = Query::insert();
+            // INSERT 无 FROM 语义需求 → 恒用真名（别名在动词矩阵里已被拒）。
+            ins.into_table(Alias::new(&req.table.name));
+            if let Some(src) = req.from_select.as_deref() {
+                // 目标列同样走白名单：写侧列名一律来自 registry，拼接面只在
+                // `Alias::new`（sea-query 侧）和这里（注入面）。
+                for c in &req.insert_cols {
+                    if !table.has_column(c) {
+                        return Err(JsErrorBox::generic(format!(
+                            "unknown column '{c}' in insert columns"
+                        )));
+                    }
+                }
+                ins.columns(req.insert_cols.iter().map(Alias::new));
+                let sel = build_select_stmt(src, bx, 0)?;
+                // 列数与源产出列数由 sea-query 在 `select_from` 里对齐：
+                // 少了漏列、多了串行，两种错都是运行时才炸的 INSERT 语法错。
+                // sea-query 的 Error 当前只有列数/值数不匹配一种形态。
+                let mismatch = |sea_query::error::Error::ColValNumMismatch { col_len, val_len }| {
+                    JsErrorBox::generic(format!(
+                        "insert declares {col_len} columns but the source select yields {val_len}"
+                    ))
+                };
+                ins.select_from(sel).map_err(mismatch)?;
+            } else {
+                let keys: Vec<String> = req.values[0].keys().cloned().collect();
+                for k in &keys {
+                    if !table.has_column(k) {
+                        return Err(JsErrorBox::generic(format!(
+                            "unknown column '{k}' in insert values"
+                        )));
+                    }
+                }
+                ins.columns(keys.iter().map(Alias::new));
+                for row in &req.values {
+                    if row.len() != keys.len() || !row.keys().all(|k| keys.contains(k)) {
+                        return Err(JsErrorBox::generic(
+                            "insert rows must share identical key sets",
+                        ));
+                    }
+                    let vals: Vec<Expr> = keys.iter().map(|k| Expr::val(to_qv(&row[k]))).collect();
+                    ins.values(vals)
+                        .map_err(|e| JsErrorBox::generic(format!("insert values: {e}")))?;
                 }
             }
-            let mut ins = Query::insert();
-            ins.into_table(Alias::new(&req.table))
-                .columns(keys.iter().map(Alias::new));
-            for row in &req.values {
-                if row.len() != keys.len() || !row.keys().all(|k| keys.contains(k)) {
+            // orIgnore（v0.1.81）：冲突行静默跳过，不抛唯一键冲突。
+            // - sqlite / pg：`ON CONFLICT DO NOTHING`（无参）；
+            // - mysql：无 DO NOTHING；8.0.20+ 才认，旧版只有
+            //   `ON DUPLICATE KEY UPDATE <pk> = <pk>` 这个恒等赋值可用，
+            //   故必须知道主键列名——没有主键就无从构造，直接拒绝而不是猜列名。
+            if req.or_ignore {
+                // sqlite 的 upsert 子句只能跟在 VALUES 后面：
+                // `INSERT ... SELECT ... ON CONFLICT DO NOTHING` 是语法错
+                // （sqlite 直接报 `near "DO": syntax error`），加 target 也不行。
+                // 让 sqlite 吐这句谁也看不懂的错，不如在构造期就说清楚。
+                if req.from_select.is_some() && dialect == Dialect::Sqlite {
                     return Err(JsErrorBox::generic(
-                        "insert rows must share identical key sets",
+                        "orIgnore with fromSelect is not supported on sqlite \
+                         (its upsert clause only follows VALUES)",
                     ));
                 }
-                let vals: Vec<Expr> = keys.iter().map(|k| Expr::val(to_qv(&row[k]))).collect();
-                ins.values(vals)
-                    .map_err(|e| JsErrorBox::generic(format!("insert values: {e}")))?;
+                match dialect {
+                    Dialect::MySql => {
+                        if table.primary_key.is_empty() {
+                            return Err(JsErrorBox::generic(format!(
+                                "orIgnore on mysql requires a primary key on table '{}'",
+                                req.table.name
+                            )));
+                        }
+                        // mysql 渲染时丢弃 target 列表，只有 action 用得上（恒等赋值）。
+                        let mut oc = OnConflict::new();
+                        ins.on_conflict(
+                            oc.do_nothing_on(
+                                table.primary_key.iter().map(|c| Alias::new(c.as_str())),
+                            )
+                            .to_owned(),
+                        );
+                    }
+                    _ => {
+                        ins.on_conflict(OnConflict::new().do_nothing().to_owned());
+                    }
+                }
             }
             // returning 列：白名单校验（限定名自然被 has_column 拒）→ 渲染 RETURNING。
             // mysql 无 RETURNING：只接受单列，由 op 侧在同一目标上两步取 LAST_INSERT_ID()。
@@ -1182,17 +1732,17 @@ fn build_statement(
         }
         Verb::Update => {
             // DML 带 joins/with 已被动词矩阵拒绝 → 条件上下文恒为真实基表、无联表。
-            let table = reg
-                .get(&req.table)
-                .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+            let table = reg.get(&req.table.name).ok_or_else(|| {
+                JsErrorBox::generic(format!("unknown table '{}'", req.table.name))
+            })?;
             let ctx = ColCtx {
-                base_name: &req.table,
+                base_name: &req.table.name,
                 base: TableSrc::Real(table),
                 joins: Vec::new(),
                 ctes: Vec::new(),
             };
             let mut up = Query::update();
-            up.table(Alias::new(&req.table));
+            up.table(Alias::new(&req.table.name));
             for (k, v) in &req.sets {
                 if !table.has_column(k) {
                     return Err(JsErrorBox::generic(format!(
@@ -1205,7 +1755,7 @@ fn build_statement(
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, &ctx, reg, 0, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, bx, 0, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 up.and_where(e);
@@ -1214,20 +1764,20 @@ fn build_statement(
         }
         Verb::Delete => {
             let ctx = ColCtx {
-                base_name: &req.table,
-                base: TableSrc::Real(reg.get(&req.table).ok_or_else(|| {
-                    JsErrorBox::generic(format!("unknown table '{}'", req.table))
+                base_name: &req.table.name,
+                base: TableSrc::Real(reg.get(&req.table.name).ok_or_else(|| {
+                    JsErrorBox::generic(format!("unknown table '{}'", req.table.name))
                 })?),
                 joins: Vec::new(),
                 ctes: Vec::new(),
             };
             let mut del = Query::delete();
-            del.from_table(Alias::new(&req.table));
+            del.from_table(Alias::new(&req.table.name));
             let mut leaves = 0usize;
             for e in req
                 .conditions
                 .iter()
-                .map(|c| cond_expr(c, &ctx, reg, 0, 1, &mut leaves))
+                .map(|c| cond_expr(c, &ctx, bx, 0, 1, &mut leaves))
                 .collect::<Result<Vec<_>, _>>()?
             {
                 del.and_where(e);
@@ -1242,7 +1792,7 @@ fn build_statement(
 /// 不单独 build（参数由 sea-query 跨整棵语句树统一收集）。
 fn build_select_stmt(
     req: &QueryReq,
-    reg: &SchemaRegistry,
+    bx: Build<'_>,
     depth: u8,
 ) -> Result<SelectStatement, JsErrorBox> {
     // CTE 虚拟表集合（本层 with 声明；嵌套层 validate_nested 已保证为空）。
@@ -1257,7 +1807,7 @@ fn build_select_stmt(
         if let Some(cols) = cte_cols(name) {
             return Ok(TableSrc::Cte(cols));
         }
-        Ok(TableSrc::Real(reg.get(name).ok_or_else(|| {
+        Ok(TableSrc::Real(bx.reg.get(name).ok_or_else(|| {
             JsErrorBox::generic(format!("unknown table '{name}'"))
         })?))
     };
@@ -1266,25 +1816,34 @@ fn build_select_stmt(
         .iter()
         .map(|c| (c.name.as_str(), TableSrc::Cte(c.columns.as_slice())))
         .collect();
-    let base = resolve(&req.table)?;
+    let base = resolve(&req.table.name)?;
     // join 表先行解析（自 join / 空 on / 未知表在此拒绝；join 表可为 CTE 名）。
     let mut join_defs: Vec<(&str, TableSrc<'_>)> = Vec::new();
     for j in &req.joins {
-        if j.table == req.table {
-            return Err(JsErrorBox::generic(
-                "self join not supported (no table alias)",
-            ));
+        // 判定改为按 **sql_name()**（v0.1.81）：两侧都指向同一张表但别名不同
+        // → 放行（`a AS x` JOIN `a AS y`）；SQL 侧标识撞车（含都无别名）→ 仍拒。
+        // 文案按成因分开：同真名是自 join 没起别名，异真名是别名撞车。
+        if j.table.sql_name() == req.table.sql_name() {
+            let msg = if j.table.name == req.table.name {
+                format!(
+                    "self join needs distinct table aliases (got '{}')",
+                    j.table.sql_name()
+                )
+            } else {
+                format!("duplicate table alias '{}'", j.table.sql_name())
+            };
+            return Err(JsErrorBox::generic(msg));
         }
         if j.on.is_empty() {
             return Err(JsErrorBox::generic(format!(
                 "join '{}' needs non-empty on",
-                j.table
+                j.table.name
             )));
         }
-        join_defs.push((j.table.as_str(), resolve(&j.table)?));
+        join_defs.push((j.table.sql_name(), resolve(&j.table.name)?));
     }
     let ctx = ColCtx {
-        base_name: &req.table,
+        base_name: req.table.sql_name(),
         base,
         joins: join_defs,
         ctes,
@@ -1292,7 +1851,20 @@ fn build_select_stmt(
     let mut q = Query::select();
     // 聚合别名台账（alias → 原表达式），having 展开用（Task 11）。
     let mut agg_aliases: HashMap<String, SimpleExpr> = HashMap::new();
-    if req.columns.is_empty() {
+    // `select(["*"])`：与「不写 select」同义（展开 registry 全列）。
+    // 与显式列混用 / 与 join 混用一律拒绝——SQL 里的 `*` 在 join 下会把两表列
+    // 全捞出来（同名 id 撞名），与「基表全列」不是一回事，宁可报错也不猜（v0.1.81）。
+    let star = req.columns.iter().any(|c| matches!(c, ColSpec::Star));
+    if star {
+        if req.columns.len() != 1 {
+            return Err(JsErrorBox::generic("select '*' must be the only column"));
+        }
+        if !req.joins.is_empty() {
+            return Err(JsErrorBox::generic("select '*' is not allowed with joins"));
+        }
+    }
+    let cols: &[ColSpec] = if star { &[] } else { req.columns.as_slice() };
+    if cols.is_empty() {
         // 全列；带 join 时全部限定为基表列（两表同名列如 id 歧义）。
         let names = ctx.base.col_names();
         let cols: Vec<SimpleExpr> = if req.joins.is_empty() {
@@ -1300,15 +1872,29 @@ fn build_select_stmt(
         } else {
             names
                 .iter()
-                .map(|c| col_simple_expr(&format!("{}.{c}", req.table)))
+                .map(|c| col_simple_expr(&format!("{}.{c}", req.table.sql_name())))
                 .collect()
         };
         q.exprs(cols);
     } else {
         // site 复刻既有报错文案形态 `unknown column '<c>' on '<table>'`（既有测试锁定）。
-        let site = format!("on '{}'", req.table);
-        for spec in &req.columns {
+        let site = format!("on '{}'", req.table.sql_name());
+        for spec in cols {
             match spec {
+                ColSpec::Star => unreachable!("star is filtered out above"),
+                ColSpec::Lit(l) => {
+                    // 别名形状与其他列规格同一把尺子（注入面在 Alias::new 之外再挡一层）。
+                    check_alias(&l.r#as)?;
+                    // 值必须是标量：对象/数组会被 to_qv 串成 `{"a":1}` / `["x"]`
+                    // 这种谁也没想写的文本 —— 大整数标记对象除外（它是标量的载体）。
+                    if !lit_is_scalar(&l.lit) {
+                        return Err(JsErrorBox::generic(format!(
+                            "lit column '{}' needs a scalar value (string/number/bool/null)",
+                            l.r#as
+                        )));
+                    }
+                    q.expr_as(lit_expr(&l.lit, bx.dialect), Alias::new(&l.r#as));
+                }
                 ColSpec::Name(c) => {
                     ctx.check_col(c, &site)?;
                     q.expr(col_simple_expr(c));
@@ -1359,7 +1945,7 @@ fn build_select_stmt(
                     // 所有 when 共享每棵条件树 64 叶预算（F-3：原每 when 独立预算）。
                     let mut leaves = 0usize;
                     for w in &c.case.when {
-                        let e = cond_expr(&w.cond, &ctx, reg, depth, 1, &mut leaves)?;
+                        let e = cond_expr(&w.cond, &ctx, bx, depth, 1, &mut leaves)?;
                         case = case.case(
                             sea_query::Condition::all().add(e),
                             Expr::val(to_qv(&w.then)),
@@ -1402,28 +1988,42 @@ fn build_select_stmt(
     if req.distinct {
         q.distinct();
     }
-    q.from(Alias::new(&req.table));
+    // FROM：有别名渲染 `t AS u`，否则逐字节保持现状（v0.1.81）。
+    from_or_as(&mut q, &req.table);
     for j in &req.joins {
         let mut on = sea_query::Condition::all();
         for p in &j.on {
-            ctx.check_col(&p.left, "join on")?;
-            ctx.check_col(&p.right, "join on")?;
-            on = on.add(col_simple_expr(&p.left).equals(col_ref(&p.right)));
+            match p {
+                OnPair::Cols { left, right } => {
+                    ctx.check_col(left, "join on")?;
+                    ctx.check_col(right, "join on")?;
+                    on = on.add(col_simple_expr(left).equals(col_ref(right)));
+                }
+                // 值条件只收比较类 op（解析期已挡，见 `OnPair::deserialize`）。
+                OnPair::Val { left, op, value } => {
+                    ctx.check_col(left, "join on")?;
+                    on = on.add(op.apply(col_simple_expr(left), value)?);
+                }
+            }
         }
         // 多租户防护注入（apply_tenant 填充）：join 表 tenant_id 进 ON 子句。
+        // 限定前缀用 **sql_name()**（别名）——JOIN 已渲染成 `t AS u`，
+        // 用真名会得到不存在的限定表 → SQL 报错（v0.1.81）。
         if let Some(tid) = &j.tenant_id {
-            on = on
-                .add(col_simple_expr(&format!("{}.tenant_id", j.table)).eq(Expr::val(to_qv(tid))));
+            on = on.add(
+                col_simple_expr(&format!("{}.tenant_id", j.table.sql_name()))
+                    .eq(Expr::val(to_qv(tid))),
+            );
         }
         let jt = match j.kind {
             JoinKind::Inner => sea_query::JoinType::InnerJoin,
             JoinKind::Left => sea_query::JoinType::LeftJoin,
         };
-        q.join(jt, Alias::new(&j.table), on);
+        join_or_as(&mut q, jt, &j.table, on);
     }
     let mut leaves = 0usize;
     for c in &req.conditions {
-        q.and_where(cond_expr(c, &ctx, reg, depth, 1, &mut leaves)?);
+        q.and_where(cond_expr(c, &ctx, bx, depth, 1, &mut leaves)?);
     }
     for g in &req.group_by {
         ctx.check_col(g, "groupBy")?;
@@ -1436,7 +2036,7 @@ fn build_select_stmt(
     }
     if let Some(h) = &req.having {
         let mut leaves = 0;
-        let e = cond_expr_having(h, &ctx, &agg_aliases, reg, depth, 1, &mut leaves)?;
+        let e = cond_expr_having(h, &ctx, &agg_aliases, bx, depth, 1, &mut leaves)?;
         let mut cond = sea_query::Condition::all();
         cond = cond.add(e);
         q.cond_having(cond);
@@ -1489,7 +2089,7 @@ fn build_select_stmt(
                     "union member does not accept order_by/limit/offset",
                 ));
             }
-            let member = build_select_stmt(m, reg, depth + 1)?;
+            let member = build_select_stmt(m, bx, depth + 1)?;
             let ty = match arm.kind {
                 UnionKind::All => sea_query::UnionType::All,
                 UnionKind::Distinct => sea_query::UnionType::Distinct,
@@ -1505,7 +2105,7 @@ fn build_select_stmt(
 /// name/columns 过别名形状校验；成员过 validate_nested（禁 with/unions/非 select）。
 fn build_with_clause(
     req: &QueryReq,
-    reg: &SchemaRegistry,
+    bx: Build<'_>,
     depth: u8,
 ) -> Result<sea_query::WithClause, JsErrorBox> {
     let mut clause = sea_query::WithClause::new();
@@ -1521,7 +2121,7 @@ fn build_with_clause(
         let mut cte = sea_query::CommonTableExpression::new();
         cte.table_name(Alias::new(&c.name));
         cte.columns(c.columns.iter().map(Alias::new));
-        cte.query(build_select_stmt(&c.query, reg, depth + 1)?);
+        cte.query(build_select_stmt(&c.query, bx, depth + 1)?);
         clause.cte(cte);
     }
     Ok(clause)
@@ -2230,7 +2830,12 @@ mod tests {
             ),
             (
                 r#"db.table("a").join("a",[{left:"a.id",right:"a.id"}]).select(["a.id"]).all()"#,
-                "self join not supported",
+                "self join needs distinct table aliases",
+            ),
+            (
+                // 不同真名但别名撞车：SQL 侧两个都是 "x"
+                r#"db.table("a").as("x").join("b",[{left:"x.id",right:"x.aid"}],"inner","x").select(["x.id"]).all()"#,
+                "duplicate table alias 'x'",
             ),
             (
                 r#"db.table("a").join("b",[{left:"a.id",right:"b.nope"}]).select(["a.id"]).all()"#,
@@ -2493,11 +3098,11 @@ mod tests {
                 .to_string()
                 .contains("select does not accept values")
         );
-        // insert：空 values / 带 where / 带 limit
+        // insert：values 与 fromSelect 两缺 / 带 where / 带 limit
         assert!(
             bad(r#"{"table":"t","verb":"insert"}"#)
                 .to_string()
-                .contains("at least one row")
+                .contains("insert needs either values or fromSelect")
         );
         assert!(bad(
             r#"{"table":"t","verb":"insert","values":[{"a":1}],"conditions":[{"field":"a","op":"eq","value":1}]}"#
@@ -3988,6 +4593,909 @@ mod tests {
         assert_eq!(
             (&v["data"]["gone"], &v["data"]["b1"]),
             (&json!(0), &json!("b1")),
+            "{v}"
+        );
+    }
+
+    /// 含 LIKE 元字符的夹具：% 与 _ 是数据，不是通配符。
+    async fn seeded_bridge_like() -> Bridge {
+        let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table t (id integer primary key, name text)", &[])
+            .await
+            .unwrap();
+        for n in ["a%b", "a_b", "abc", "xyz", "100%"] {
+            db.exec_with_params("insert into t (name) values (?)", &[json!(n)])
+                .await
+                .unwrap();
+        }
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        Bridge::with_opts(db, Arc::new(InMemoryKV::new()), reg, false)
+    }
+
+    /// `cond` 下按 id 升序取回的 name 列表。
+    async fn names_where(b: &Bridge, cond: &str) -> Value {
+        let cap = b
+            .run(&format!(
+                r#"db.table("t").select(["name"]).where({cond}).orderBy([{{field:"id",dir:"asc"}}]).all()
+                   .then(r => json.ok({{ names: r.map(x => x.name) }}))
+                   .catch(e => json.fail(500, String(e)));"#
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "query failed: {v}");
+        v["data"]["names"].clone()
+    }
+
+    /// 语义化模糊 op（v0.1.81）：值里的 % 与 _ 被当**字面量**，
+    /// 旧 `like` 直接把 `%` 当用户输入的通配符 → 数据里的 % 会多命中。
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_like_ops_treat_wildcards_as_literals() {
+        let b = seeded_bridge_like().await;
+        // 关键一条：contains("a%") 只命中字面含 "a%" 的 a%b——
+        // 未转义时 "%" 会被当通配符，把 abc / a_b 也捞进来。
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"contains",value:"a%"}"#).await,
+            json!(["a%b"]),
+        );
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"contains",value:"_b"}"#).await,
+            json!(["a_b"]),
+        );
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"startswith",value:"a"}"#).await,
+            json!(["a%b", "a_b", "abc"]),
+        );
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"endswith",value:"b"}"#).await,
+            json!(["a%b", "a_b"]),
+        );
+        // 数据里的 `%`：字面结尾是 % 的只有 100% 一条。
+        // 未转义时 `%%` 等于「以任意串结尾」→ 全表 5 条都被捞进来。
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"endswith",value:"%"}"#).await,
+            json!(["100%"]),
+        );
+        // 对照：裸 like 仍按用户给的 pattern 走（% 是通配符）。
+        assert_eq!(
+            names_where(&b, r#"{field:"name",op:"like",value:"a%"}"#).await,
+            json!(["a%b", "a_b", "abc"]),
+        );
+    }
+
+    /// 模糊 op 的 pattern 与 ESCAPE 符都进 params（绑定参数），
+    /// 与裸 like 一样不落进 SQL 文本——否则 `%` / `'` 就是拼接注入面。
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_like_ops_bind_pattern_and_escape() {
+        let b = seeded_bridge_like().await;
+        let cap = b
+            .run(
+                r#"json.ok(db.table("t").select(["name"]).where({field:"name",op:"contains",value:"a%b"}).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let sql = v["data"]["sql"].as_str().unwrap();
+        let params = v["data"]["params"].as_array().unwrap();
+        // 形状必须对：`col LIKE ? ESCAPE ?`（不是 `(col LIKE ?) ESCAPE ?`）。
+        assert!(sql.contains("LIKE ? ESCAPE ?"), "{sql}");
+        // 值本身绝不能出现在 SQL 文本里。
+        assert!(!sql.contains("a%b"), "{sql}");
+        assert_eq!(params[0], json!("%a\\%b%"), "{v}");
+        assert_eq!(params[1], json!("\\"), "{v}");
+    }
+
+    /// escape 逃生舱：默认 `\` 与输入冲突时可换转义符（v0.1.81）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn like_escape_char_is_overridable() {
+        let b = seeded_bridge_like().await;
+        let cap = b
+            .run(
+                r#"json.ok(db.table("t").select(["name"])
+                     .where({field:"name",op:"contains",value:"a_b",escape:"!"}).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let params = v["data"]["params"].as_array().unwrap();
+        assert_eq!(params[0], json!("%a!_b%"), "{v}");
+        assert_eq!(params[1], json!("!"), "{v}");
+        // 裸 like 也认 escape：用户自带 pattern + 自定义转义符。
+        let cap = b
+            .run(
+                r#"json.ok(db.table("t").select(["name"])
+                     .where({field:"name",op:"like",value:"a!%b",escape:"!"}).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let params = v["data"]["params"].as_array().unwrap();
+        assert_eq!(params[0], json!("a!%b"), "{v}");
+        assert_eq!(params[1], json!("!"), "{v}");
+    }
+
+    /// escape 必须是**单个**字符：多字符会静默截断成第一个，宁可报错。
+    #[tokio::test(flavor = "current_thread")]
+    async fn like_escape_rejects_non_single_char() {
+        let b = seeded_bridge_like().await;
+        for esc in [r#""""#, r#""ab""#] {
+            let cap = b
+                .run(&format!(
+                    r#"db.table("t").select(["name"])
+                       .where({{field:"name",op:"contains",value:"a",escape:{esc}}})
+                       .all().then(() => json.ok({{}}))
+                       .catch(e => json.fail(500, String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(
+                v["msg"]
+                    .as_str()
+                    .unwrap()
+                    .contains("escape must be a single char"),
+                "{esc}: {v}"
+            );
+        }
+    }
+
+    /// `in []` 必须报错：`is_in` 空集在 sea-query 里渲染成恒假 SQL，
+    /// 静默返回 0 行会伪装成「没有匹配数据」（v0.1.81）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_in_is_rejected() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).where({field:"age",op:"in",value:[]})
+                   .all().then(() => json.ok({}))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("in needs non-empty array"),
+            "{v}"
+        );
+    }
+
+    /// `js` 是不含 `.then` 的链式片段，返回命中行数。
+    async fn rows_of(b: &Bridge, js: &str) -> u64 {
+        let cap = b
+            .run(&format!(
+                r#"{js}.all().then(r => json.ok({{ n: r.length }})).catch(e => json.fail(500, String(e)));"#
+            ))
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "query failed: {v}");
+        v["data"]["n"].as_u64().unwrap()
+    }
+
+    /// `whereIf`：假值跳过、`0`/`""` 保留（`status=0` 是合法过滤值），
+    /// 且空数组跳过（避免 `IN ()`）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn where_if_skips_only_nullish_and_empty_array() {
+        let b = seeded_bridge().await;
+        let base = r#"db.table("t").select(["name"])"#;
+        // 跳过：undefined / null / false / []
+        for skip in ["undefined", "null", "false"] {
+            let js = format!(r#"{base}.whereIf({skip},{{field:"age",op:"lt",value:0}})"#);
+            assert_eq!(rows_of(&b, &js).await, 4, "{js}");
+        }
+        assert_eq!(
+            rows_of(
+                &b,
+                &format!(r#"{base}.whereIf([],{{field:"id",op:"in",value:[]}})"#)
+            )
+            .await,
+            4
+        );
+        // 保留：0 / "" 是真过滤值（`status=0` 是合法的业务值）
+        assert_eq!(
+            rows_of(
+                &b,
+                &format!(r#"{base}.whereIf(0,{{field:"ok",op:"eq",value:0}})"#)
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            rows_of(
+                &b,
+                &format!(r#"{base}.whereIf("",{{field:"tag",op:"isnull"}})"#)
+            )
+            .await,
+            1
+        );
+        // 非空数组照常拼
+        assert_eq!(
+            rows_of(
+                &b,
+                &format!(r#"{base}.whereIf([1],{{field:"id",op:"in",value:[1]}})"#)
+            )
+            .await,
+            1
+        );
+    }
+
+    /// `select(["*"])`：展开 registry 全列；与显式列混用 / 与 join 混用一律拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn select_star_expands_columns_and_rejects_mixing() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"db.table("t").select(["*"]).orderBy([{field:"id",dir:"asc"}]).all()
+                   .then(r => json.ok({ first: r[0], keys: Object.keys(r[0]).sort() }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(
+            v["data"]["keys"],
+            json!(["age", "id", "name", "ok", "tag"]),
+            "{v}"
+        );
+        assert_eq!(v["data"]["first"]["name"], json!("a"), "{v}");
+        for (js, want) in [
+            (
+                r#"db.table("t").select(["*","id"]).all()"#,
+                "select '*' must be the only column",
+            ),
+            (
+                r#"db.table("t").select(["id","*"]).all()"#,
+                "select '*' must be the only column",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(() => json.ok({{}})).catch(e => json.fail(500, String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
+        // 与 join 混用：全列在两表同名列（id）上会歧义 → 直接拒绝。
+        let b2 = seeded_bridge_2t().await;
+        let cap = b2
+            .run(
+                r#"db.table("a").join("b",[{left:"a.id",right:"b.aid"}]).select(["*"]).all()
+                   .then(() => json.ok({})).catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("select '*' is not allowed with joins"),
+            "{v}"
+        );
+    }
+
+    /// 表别名（v0.1.81）：FROM 渲染 `a AS x`，列限定用别名；
+    /// **归属守卫与租户判定仍按真名**——别名混进真名字段会静默绕过这两道防线。
+    #[tokio::test(flavor = "current_thread")]
+    async fn table_alias_renders_as_and_keeps_guards_on_real_name() {
+        let b = seeded_bridge_2t().await;
+        let cap = b
+            .run(r#"json.ok(db.table("a").as("x").select(["x.name"]).toSQL());"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let sql = v["data"]["sql"].as_str().unwrap();
+        assert!(sql.contains("FROM"), "{sql}");
+        assert!(sql.contains("AS"), "{sql}");
+        assert!(sql.contains("AS \"x\""), "{sql}");
+        // 真名仍被认：别名 ≠ 归属守卫的钥匙，列白名单按真名 a 解析。
+        let cap = b
+            .run(
+                r#"db.table("a").as("x").select(["x.name"]).orderBy([{field:"name",dir:"asc"}]).all()
+                   .then(r => json.ok({ n: r.length, first: r[0].name }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(
+            (&v["code"], &v["data"]["n"], &v["data"]["first"]),
+            (&json!(0), &json!(2), &json!("x")),
+            "{v}"
+        );
+        // 自 join 靠别名区分：两侧真名都是 a，但 SQL 标识不同 → 放行。
+        let cap = b
+            .run(
+                r#"json.ok(db.table("a").as("l").join("a",[{left:"l.id",right:"r.id"}],"inner","r")
+                     .select(["l.name"]).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let sql = v["data"]["sql"].as_str().unwrap();
+        assert!(sql.contains("AS \"l\""), "{sql}");
+        assert!(sql.contains("AS \"r\""), "{sql}");
+    }
+
+    /// 别名只属于 select：INSERT/UPDATE/DELETE 用别名会让列限定指向不存在的表。
+    #[tokio::test(flavor = "current_thread")]
+    async fn alias_rejected_on_write_verbs() {
+        let b = seeded_bridge().await;
+        for (js, want) in [
+            (
+                r#"db.table("t").as("x").update({name:"z"}).where({field:"id",op:"eq",value:1}).run()"#,
+                "table alias is not supported on insert/update/delete",
+            ),
+            (
+                r#"db.table("t").as("x").delete().where({field:"id",op:"eq",value:1}).run()"#,
+                "table alias is not supported on insert/update/delete",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(() => json.ok({{}})).catch(e => json.fail(500, String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
+    }
+
+    /// join ON 的「列 op 值」（v0.1.81）：值进 params，非比较类 op 直接拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn join_on_value_condition_binds_and_rejects_bad_ops() {
+        let b = seeded_bridge_2t().await;
+        let cap = b
+            .run(
+                r#"json.ok(db.table("a").join("b",[{left:"b.aid",right:"a.id"},{left:"b.aid",op:"eq",value:1}])
+                     .select(["a.name"]).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let sql = v["data"]["sql"].as_str().unwrap();
+        assert!(sql.contains("JOIN"), "{sql}");
+        assert!(sql.contains("= ?"), "{sql}");
+        assert!(
+            v["data"]["params"].as_array().unwrap().contains(&json!(1)),
+            "{v}"
+        );
+        for (js, want) in [
+            (
+                r#"db.table("a").join("b",[{left:"b.aid",op:"contains",value:"x"}]).select(["a.name"]).all()"#,
+                "join on 'b.aid' does not support op 'contains'",
+            ),
+            (
+                r#"db.table("a").join("b",[{left:"b.aid",op:"isnull"}]).select(["a.name"]).all()"#,
+                "join on 'b.aid' does not support op 'isnull'",
+            ),
+            (
+                r#"db.table("a").join("b",[{left:"b.aid",right:"a.id",op:"eq"}]).select(["a.name"]).all()"#,
+                "takes either right or op/value, not both",
+            ),
+        ] {
+            let cap = b
+                .run(&format!(
+                    r#"{js}.then(() => json.ok({{}})).catch(e => json.fail(500, String(e)));"#
+                ))
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert!(v["msg"].as_str().unwrap().contains(want), "{want}: {v}");
+        }
+    }
+
+    /// `req` JSON 在三个方言下各自渲染（纯构造，不跑库）。
+    fn sql_in(reg: &SchemaRegistry, req: &str, d: Dialect) -> Result<String, JsErrorBox> {
+        let req: QueryReq = serde_json::from_str(req).unwrap();
+        build_statement(&req, reg, d).map(|(s, _)| s)
+    }
+
+    /// 空白归一：sea-query 固定拼 " ON CONFLICT " + " DO NOTHING"（空 target），
+    /// 断言按语义比对而不是按字节，才不会把上游的排版当接口契约。
+    fn norm_ws(s: String) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `lit` 字面列（v0.1.81）：值一律绑定参数，三方言的 CAST 形态各不相同——
+    /// PG 裸 `?` 会报「could not determine data type of parameter」，必须 CAST。
+    #[test]
+    fn lit_column_casts_per_dialect() {
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let req = r#"{"table":"t","columns":["name",{"lit":"svc","as":"scope"}]}"#;
+        let sq = sql_in(&reg, req, Dialect::Sqlite).unwrap();
+        assert!(sq.contains("? AS \"scope\""), "{sq}");
+        let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+        assert!(my.contains("CAST(? AS CHAR)"), "{my}");
+        let pg = sql_in(&reg, req, Dialect::Postgres).unwrap();
+        assert!(pg.contains("CAST($1 AS TEXT)"), "{pg}");
+        // 值绝不进 SQL 文本。
+        for s in [&sq, &my, &pg] {
+            assert!(!s.contains("svc"), "{s}");
+        }
+        // 别名形状仍受既有别名校验约束。
+        let bad = r#"{"table":"t","columns":[{"lit":"svc","as":"a-b"}]}"#;
+        assert!(sql_in(&reg, bad, Dialect::Sqlite).is_err());
+    }
+
+    /// `orIgnore`（v0.1.81）：sqlite/pg 走 ON CONFLICT DO NOTHING；
+    /// mysql 无原生支持 → `DO NOTHING` 在 8.0.20+ 才认，旧版只认 DO UPDATE 恒等式。
+    #[test]
+    fn or_ignore_renders_per_dialect() {
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let req =
+            r#"{"table":"t","verb":"insert","values":[{"id":1,"name":"a"}],"or_ignore":true}"#;
+        // 裸 DO NOTHING（不带 target）才会忽略**任意**唯一键冲突——写成
+        // `ON CONFLICT ("id")` 只管 id，别处唯一键撞车照样报错（实测 sqlite 3.54）。
+        for d in [Dialect::Sqlite, Dialect::Postgres] {
+            let s = norm_ws(sql_in(&reg, req, d).unwrap());
+            assert!(s.contains("ON CONFLICT DO NOTHING"), "{s}");
+            assert!(!s.contains("ON CONFLICT ("), "{s}");
+        }
+        let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+        assert!(my.contains("ON DUPLICATE KEY UPDATE `id` = `id`"), "{my}");
+        // mysql 无主键表：DO UPDATE 的恒等列无处可取 → 拒绝。
+        let nopk = SchemaRegistry::new().table("t", &[], &["id", "name"]);
+        let e = sql_in(
+            &nopk,
+            r#"{"table":"t","verb":"insert","values":[{"name":"a"}],"or_ignore":true}"#,
+            Dialect::MySql,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("orIgnore on mysql requires a primary key on table 't'"),
+            "{e}"
+        );
+    }
+
+    /// orIgnore + fromSelect 的方言差异（v0.1.81）：pg/mysql 都能挂上去，
+    /// sqlite 的 upsert 子句只能跟 VALUES——实测 `INSERT ... SELECT ... ON CONFLICT`
+    /// 报 `near "DO": syntax error`，加 target 也没用（sqlite 3.54 直接不支持）。
+    #[test]
+    fn or_ignore_with_from_select_renders_per_dialect() {
+        let reg = SchemaRegistry::new()
+            .table("t", &["id"], &["id", "name"])
+            .table("s", &["id"], &["id", "name"]);
+        let req = r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["id","name"]},"insert_cols":["id","name"],"or_ignore":true}"#;
+        let pg = norm_ws(sql_in(&reg, req, Dialect::Postgres).unwrap());
+        assert!(pg.contains("SELECT"), "{pg}");
+        assert!(pg.contains("ON CONFLICT DO NOTHING"), "{pg}");
+        let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+        assert!(my.contains("SELECT"), "{my}");
+        assert!(my.contains("ON DUPLICATE KEY UPDATE `id` = `id`"), "{my}");
+        let e = sql_in(&reg, req, Dialect::Sqlite).unwrap_err().to_string();
+        assert!(
+            e.contains("orIgnore with fromSelect is not supported on sqlite"),
+            "{e}"
+        );
+    }
+
+    /// `fromSelect`（v0.1.81）：列数必须与源 select 一致，且与 values 互斥。
+    #[test]
+    fn from_select_checks_arity_and_exclusivity() {
+        let reg = SchemaRegistry::new()
+            .table("t", &["id"], &["id", "name"])
+            .table("s", &["id"], &["id", "name"]);
+        let src = r#"{"table":"s","columns":["id","name"]}"#;
+        let ok = format!(
+            r#"{{"table":"t","verb":"insert","from_select":{src},"insert_cols":["id","name"]}}"#
+        );
+        let s = sql_in(&reg, &ok, Dialect::Sqlite).unwrap();
+        assert!(s.contains("INSERT INTO"), "{s}");
+        // 声明 2 列、源产出 3 列（全列展开）→ 拒
+        let bad =
+            format!(r#"{{"table":"t","verb":"insert","from_select":{src},"insert_cols":["id"]}}"#);
+        let e = sql_in(&reg, &bad, Dialect::Sqlite).unwrap_err().to_string();
+        assert!(
+            e.contains("declares 1 columns but the source select yields 2"),
+            "{e}"
+        );
+        // 与 values 互斥 / 两者都缺
+        let both = format!(
+            r#"{{"table":"t","verb":"insert","values":[{{"id":1}}],"from_select":{src},"insert_cols":["id","name"]}}"#
+        );
+        let e = sql_in(&reg, &both, Dialect::Sqlite)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("insert takes either values or fromSelect, not both"),
+            "{e}"
+        );
+        let e = sql_in(&reg, r#"{"table":"t","verb":"insert"}"#, Dialect::Sqlite)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("insert needs either values or fromSelect"),
+            "{e}"
+        );
+    }
+
+    /// orIgnore / fromSelect 是 insert 的尾部子句（v0.1.81）：挂在其他动词上
+    /// 无处可渲染 → 一律拒绝，而不是静默丢弃（用户会以为生效了）。
+    #[test]
+    fn insert_only_clauses_rejected_on_other_verbs() {
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let bad = |req: &str| sql_in(&reg, req, Dialect::Sqlite).unwrap_err().to_string();
+        for (req, want) in [
+            (
+                r#"{"table":"t","or_ignore":true}"#,
+                "select does not accept orIgnore",
+            ),
+            (
+                r#"{"table":"t","from_select":{"table":"t","columns":["name"]},"insert_cols":["name"]}"#,
+                "select does not accept fromSelect",
+            ),
+            (
+                r#"{"table":"t","verb":"update","sets":{"name":"a"},"conditions":[{"field":"id","op":"eq","value":1}],"or_ignore":true}"#,
+                "update/delete does not accept orIgnore",
+            ),
+            (
+                r#"{"table":"t","verb":"delete","conditions":[{"field":"id","op":"eq","value":1}],"from_select":{"table":"t","columns":["name"]}}"#,
+                "update/delete does not accept fromSelect",
+            ),
+            (
+                r#"{"table":"t","verb":"insert","values":[{"id":1}],"insert_cols":["id"]}"#,
+                "insert columns are only allowed with fromSelect",
+            ),
+        ] {
+            let e = bad(req);
+            assert!(e.contains(want), "{want}: {e}");
+        }
+    }
+
+    /// 源列必须点名（v0.1.81）：`*` / 省略都按 registry 的 HashMap 顺序摊列，
+    /// 而 INSERT...SELECT 按位置对齐 → 顺序不定等于列名串位。
+    #[test]
+    fn from_select_source_needs_explicit_columns() {
+        let reg = SchemaRegistry::new()
+            .table("t", &["id"], &["id", "name"])
+            .table("s", &["id"], &["id", "name"]);
+        let err = |req: &str| sql_in(&reg, req, Dialect::Sqlite).unwrap_err().to_string();
+        let e = err(
+            r#"{"table":"t","verb":"insert","from_select":{"table":"s"},"insert_cols":["id","name"]}"#,
+        );
+        assert!(
+            e.contains("fromSelect source needs explicit columns"),
+            "{e}"
+        );
+        let e = err(
+            r#"{"table":"t","verb":"insert","from_select":{"table":"s","columns":["*"]},"insert_cols":["id","name"]}"#,
+        );
+        assert!(
+            e.contains("fromSelect source needs explicit columns"),
+            "{e}"
+        );
+    }
+
+    /// fromSelect 端到端：真拷贝行；带上 orIgnore 后主键冲突行静默跳过（v0.1.81）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_select_copies_rows_and_pairs_with_or_ignore() {
+        let b = seeded_bridge().await;
+        // 不带 id（自增）：4 → 8 行。
+        let cap = b
+            .run(
+                r#"db.table("t").fromSelect(db.table("t").select(["name","age"]), ["name","age"]).run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(4)), "{v}");
+        // 带 id：撞主键 → 裸 insert 报错（证明 orIgnore 确实在做事）。
+        let cap = b
+            .run(
+                r#"db.table("t").fromSelect(db.table("t").select(["id","name"]), ["id","name"]).run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        // sqlite 上 orIgnore 与 fromSelect 不能共存 → 构造期就拒（不是把 sqlite 的
+        // `near "DO": syntax error` 抛给用户）。
+        let cap = b
+            .run(
+                r#"db.table("t").fromSelect(db.table("t").select(["id","name"]), ["id","name"]).orIgnore().run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("orIgnore with fromSelect is not supported on sqlite"),
+            "{v}"
+        );
+        // 失败的语句没写进任何行：仍是 8 行（4 原 + 4 副本）。
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).all()
+                   .then(r => json.ok({ n: r.length }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(8)), "{v}");
+    }
+
+    /// 租户守卫对抗（v0.1.81）：fromSelect 是「读+写」两条路径合一——
+    /// 源 select 必须同样被租户收窄（否则把 b1 搬进自己表），
+    /// 目标行的 tenant_id 必须由守卫补常量列（否则落成无租户行）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_select_is_tenant_narrowed_and_stamped() {
+        let b = guarded_bridge().await;
+        // SQL 形态：常量列盖章 + 源侧条件，两个租户参数。
+        let cap = b
+            .run_with(
+                r#"json.ok(db.table("t").fromSelect(db.table("t").select(["name"]), ["name"]).toSQL());"#,
+                req_tenant("t1"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let sql = v["data"]["sql"].as_str().unwrap();
+        assert!(sql.contains("__oj_tenant"), "{sql}");
+        assert!(sql.contains("tenant_id"), "{sql}");
+        assert_eq!(v["data"]["params"], json!(["t1", "t1"]), "{v}");
+        // 执行：只搬 t1 的两行，盖 t1 章。
+        let cap = b
+            .run_with(
+                r#"db.table("t").fromSelect(db.table("t").select(["name"]), ["name"]).run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+                req_tenant("t1"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(2)), "{v}");
+        // 新行确实属于 t1（不是空租户的幽灵行）。
+        let cap = b
+            .run_with(
+                r#"db.table("t").select(["name","tenant_id"]).where({field:"name",op:"eq",value:"a1"}).all()
+                   .then(r => json.ok({ n: r.length, tid: r[0].tenant_id }))
+                   .catch(e => json.fail(500, String(e)));"#,
+                req_tenant("t1"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(
+            (&v["data"]["n"], &v["data"]["tid"]),
+            (&json!(2), &json!("t1")),
+            "{v}"
+        );
+        // b1 未被搬走：系统视角下仍是 4 行（a1,a2,b1 + 两行副本）。
+        let cap = b
+            .run_with(
+                r#"db.asSystem().table("t").select(["name"]).all()
+                   .then(r => json.ok(r.map(x => x.name).sort()))
+                   .catch(e => json.fail(500, String(e)));"#,
+                req_tenant("t1"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], json!(["a1", "a1", "a2", "a2", "b1"]), "{v}");
+    }
+
+    /// 攻击者自己塞 tenant_id 列（v0.1.81）：常量列会被盖掉一半，直接拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_select_rejects_declared_tenant_column() {
+        let b = guarded_bridge().await;
+        let cap = b
+            .run_with(
+                r#"db.table("t").fromSelect(db.table("t").select(["name"]), ["name","tenant_id"]).run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+                req_tenant("t1"),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        assert!(
+            v["msg"]
+                .as_str()
+                .unwrap()
+                .contains("insert fromSelect must not supply tenant_id"),
+            "{v}"
+        );
+    }
+
+    /// lit 列的三条边界（v0.1.81）：非标量值拒绝、`*` 混用拒绝、别名缺失拒绝。
+    /// 三条都不是「渲染出来能用就行」——它们是把 `{"a":1}` 串成文本那类静默垃圾挡在门外。
+    #[test]
+    fn lit_column_rejects_nonscalar_missing_alias_and_star_mixing() {
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let err = |req: &str| sql_in(&reg, req, Dialect::Sqlite).unwrap_err().to_string();
+        for (req, want) in [
+            (
+                r#"{"table":"t","columns":[{"lit":{"a":1},"as":"x"}]}"#,
+                "lit column 'x' needs a scalar value",
+            ),
+            (
+                r#"{"table":"t","columns":[{"lit":["a"],"as":"x"}]}"#,
+                "lit column 'x' needs a scalar value",
+            ),
+        ] {
+            let e = err(req);
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        // 缺 as 在反序列化层就被拦（LitSpec 要求别名齐备）。
+        let e = serde_json::from_str::<QueryReq>(r#"{"table":"t","columns":[{"lit":1}]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("missing field `as`"), "{e}");
+        // `*` 必须独占列清单（混入 lit 常量列同样算混用）。
+        let e = err(r#"{"table":"t","columns":["*",{"lit":"s","as":"x"}]}"#);
+        assert!(e.contains("select '*' must be the only column"), "{e}");
+        // 标量四形态都放行（含 null）。
+        for lit in ["1", "true", "null"] {
+            let req = format!(r#"{{"table":"t","columns":[{{"lit":{lit},"as":"x"}}]}}"#);
+            assert!(sql_in(&reg, &req, Dialect::Sqlite).is_ok(), "{req}");
+        }
+    }
+
+    /// lit 常量列在嵌套层（子查询/CTE）同样成立：它只是列清单的一档形状。
+    #[tokio::test(flavor = "current_thread")]
+    async fn lit_column_works_inside_subquery_and_cte() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"]).where({field:"id",op:"in",subquery:
+                       db.table("t").select([{lit:1,as:"k"}])}).all()
+                   .then(r => json.ok({ n: r.length }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!((&v["code"], &v["data"]["n"]), (&json!(0), &json!(1)), "{v}");
+        // CTE 内部带常量列。
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name"])
+                     .with("c", ["name","k"], db.table("t").select(["name",{lit:1,as:"k"}]))
+                     .all()
+                   .then(r => json.ok({ n: r.length }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!((v["code"] == 0), "{v}");
+    }
+
+    /// mysql orIgnore 的联合主键（v0.1.81）：恒等赋值按主键列逐个展开。
+    #[test]
+    fn or_ignore_renders_composite_primary_key_on_mysql() {
+        let reg = SchemaRegistry::new().table("t", &["a", "b"], &["a", "b", "name"]);
+        let req =
+            r#"{"table":"t","verb":"insert","values":[{"a":1,"b":2,"name":"x"}],"or_ignore":true}"#;
+        let my = sql_in(&reg, req, Dialect::MySql).unwrap();
+        assert!(
+            my.contains("ON DUPLICATE KEY UPDATE `a` = `a`, `b` = `b`"),
+            "{my}"
+        );
+    }
+
+    /// fromSelect 的目标列同样走白名单（v0.1.81）：写侧列名一律来自 registry。
+    #[test]
+    fn from_select_validates_target_columns() {
+        let reg = SchemaRegistry::new()
+            .table("t", &["id"], &["id", "name"])
+            .table("s", &["id"], &["id", "name"]);
+        let src = r#"{"table":"s","columns":["id","name"]}"#;
+        for cols in [
+            r#"["id","nope"]"#,
+            r#"["s.id","name"]"#,
+            r#"["id","name","extra"]"#,
+        ] {
+            let req = format!(
+                r#"{{"table":"t","verb":"insert","from_select":{src},"insert_cols":{cols}}}"#
+            );
+            let e = sql_in(&reg, &req, Dialect::Sqlite).unwrap_err().to_string();
+            assert!(e.contains("unknown column"), "{cols}: {e}");
+        }
+    }
+
+    /// 快照往返（v0.1.81）：fromSelect / orIgnore 必须跟着 toJSON→fromJSON 走完，
+    /// 否则跨模块传递的请求会静默丢掉「忽略冲突」这个意图。
+    #[tokio::test(flavor = "current_thread")]
+    async fn insert_only_clauses_survive_snapshot_roundtrip() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"json.ok(db.table("t").fromSelect(db.table("t").select(["id","name"]), ["id","name"]).orIgnore().toJSON());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["or_ignore"], true, "{v}");
+        assert_eq!(v["data"]["insert_cols"], json!(["id", "name"]), "{v}");
+        assert!(v["data"]["from_select"]["table"] == "t", "{v}");
+        // sqlite 上这对组合本就不可用 → 重建后同样被拒（往返没把意图吞掉）。
+        let cap = b
+            .run(
+                r#"const snap = db.table("t").insert({id:1,name:"a"}).orIgnore().toJSON();
+                   json.ok({ sql: db.fromJSON(snap).toSQL().sql, params: db.fromJSON(snap).toSQL().params });"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(
+            norm_ws(v["data"]["sql"].as_str().unwrap().to_string())
+                .contains("ON CONFLICT DO NOTHING"),
+            "{v}"
+        );
+    }
+
+    /// 端到端：lit / orIgnore 在真 sqlite 上跑通。
+    #[tokio::test(flavor = "current_thread")]
+    async fn lit_and_or_ignore_run_on_sqlite() {
+        let b = seeded_bridge().await;
+        let cap = b
+            .run(
+                r#"db.table("t").select(["name",{lit:"svc",as:"scope"}]).orderBy([{field:"id",dir:"asc"}]).all()
+                   .then(r => json.ok({ n: r.length, scope: r[0].scope }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 4, "{v}");
+        assert_eq!(v["data"]["scope"], "svc", "{v}");
+        // 幂等插入：主键冲突时静默跳过，返回 0 行受影响。
+        let cap = b
+            .run(
+                r#"db.table("t").insert({id:1,name:"a"}).orIgnore().run()
+                   .then(n => json.ok({ n }))
+                   .catch(e => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["n"], 0, "{v}");
+    }
+
+    /// toJSON → fromJSON 往返保留别名：快照是可信入口，别名不能被吞掉。
+    #[tokio::test(flavor = "current_thread")]
+    async fn alias_survives_snapshot_roundtrip() {
+        let b = seeded_bridge_2t().await;
+        let cap = b
+            .run(
+                r#"const snap = db.table("a").as("x").select(["x.name"]).toJSON();
+                   json.ok(db.fromJSON(snap).toSQL());"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(
+            v["data"]["sql"].as_str().unwrap().contains("AS \"x\""),
             "{v}"
         );
     }

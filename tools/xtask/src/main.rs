@@ -599,6 +599,8 @@ mod tests {
         assert!(dk.join("api-manual.md").exists());
         // 场景速查（照抄就能跑）随包分发；SKILL.md 工作流会引用它。
         assert!(dk.join("scenarios.md").exists());
+        // SQL 构造器专题指引（v0.1.81 起）随包分发；api-manual「查询构造器」章指向它。
+        assert!(dk.join("sql-builder-guide.md").exists());
     }
 
     #[test]
