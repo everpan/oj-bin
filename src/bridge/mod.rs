@@ -3770,6 +3770,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn ownership_guard_covers_from_select_source() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "m/api.ts",
+            "export default { get() { db.table(\"t\").fromSelect(db.table(\"secret\")\n\
+             \x20 .select([\"id\"]), [\"id\"]).run()\n\
+             \x20 .then((r) => json.ok(r)).catch((e) => json.fail(500, String(e))); } };\n",
+        )]);
+        let reg = SchemaRegistry::new()
+            .table_owned("m", "t", &["id"], &["id", "name"])
+            .table_owned("other", "secret", &["id"], &["id"]);
+        let mods = Arc::new(HashMap::from([(
+            root.join("m").to_string_lossy().into_owned(),
+            ModuleCtx {
+                name: "m".into(),
+                version: "0.1.0".into(),
+                deps: Arc::new(std::collections::HashSet::new()),
+                db: None,
+            },
+        )]));
+        // deny：fromSelect 的源 secret（owner=other ∉ {m} ∪ deps）必须被拒——
+        // 守卫不递归源 select 的话，INSERT...SELECT 就是跨模块搬运（v0.1.83；
+        // apply_tenant 对源递归在先，此处补齐归属守卫的同一覆盖）。
+        let dbs = HashMap::from([(
+            "default".to_string(),
+            Arc::new(InMemoryAccessor::new()) as Arc<dyn DataAccessor>,
+        )]);
+        let b = module_bridge_ex(&root, reg, mods, true, dbs);
+        let cap = b
+            .run_module(
+                &api,
+                "get",
+                RequestInfo::default(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert!(
+            v["msg"].as_str().unwrap_or_default().contains("ownership"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn bound_db_redirects_default_for_bound_module() {
         let _t = transpile_serial();
         let (root, api) = mod_fx(&[(

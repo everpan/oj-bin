@@ -14,6 +14,7 @@ use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, 
 use serve::routes;
 
 use crate::args::BuildArgs;
+use crate::hex_encode;
 
 /// 构建入口：单模块或全部（None）。内省器自带独立线程 runtime；async 仅因内存库初始化。
 pub async fn run(a: &BuildArgs) -> Result<(), String> {
@@ -128,12 +129,14 @@ fn bundle_dist(out: &Path) -> Result<String, String> {
             .map_err(|e| format!("bundle: gzip finish: {e}"))?;
     }
     let sha = {
-        let data = std::fs::read(&tmp)
+        // 流式读回哈希（整读进内存只为算摘要，产物大时白趟 RSS 尖峰）。
+        let mut f = std::fs::File::open(&tmp)
             .map_err(|e| format!("bundle: read back {tmp}: {e}", tmp = tmp.display()))?;
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
-        h.update(&data);
-        hex(&h.finalize())
+        std::io::copy(&mut f, &mut h)
+            .map_err(|e| format!("bundle: read back {tmp}: {e}", tmp = tmp.display()))?;
+        hex_encode(&h.finalize())
     };
     let final_tgz = out.join(format!("{name}.tgz"));
     std::fs::copy(&tmp, &final_tgz).map_err(|e| {
@@ -185,15 +188,6 @@ fn append_tree<W: std::io::Write>(
         // 符号链接 / 特殊文件：打包态不存在（构建产物皆为常规文件/目录），跳过。
     }
     Ok(())
-}
-
-/// 字节转 hex 串（sha256 摘要展示 / 完整性锚）。
-fn hex(d: &[u8]) -> String {
-    let mut s = String::with_capacity(d.len() * 2);
-    for b in d {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// 读 config（build 专用）：解析失败**不致命**（build 不装配服务，缺文件也照建），但

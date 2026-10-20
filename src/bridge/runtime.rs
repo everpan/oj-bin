@@ -190,10 +190,10 @@ impl RuntimePool {
             eprintln!("warn: runtime discarded (js heap limit fired; not returned to pool)");
             return;
         }
-        // 资源回收门禁（评审 CRITICAL，v0.1.78）：归还前清空 ResourceTable，覆盖
-        // ExecHandleResource::close 同步 kill_tree，杜绝跨请求/租户泄漏子进程/句柄 +
-        // next_rid u32 回绕 panic（DoS）。异常丢弃的 runtime 由 ExecHandleResource::Drop
-        // 兜底（其 close/Drop 均 kill_tree）。
+        // 资源回收门禁（评审 CRITICAL，v0.1.78）：归还前清空 ResourceTable，经
+        // ExecHandleResource::Drop 同步发组杀信号，杜绝跨请求/租户泄漏子进程/句柄 +
+        // next_rid u32 回绕 panic（DoS）。异常丢弃的 runtime（如 heap-limit 不回池）
+        // 同样由 ExecHandleResource::Drop 兜底（v0.1.83 起该 Drop 真实存在）。
         {
             let state = op_state(&rt);
             let rids: Vec<deno_core::ResourceId> = {

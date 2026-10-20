@@ -16,6 +16,8 @@ use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use tar::EntryType;
 
+use crate::hex_encode;
+
 /// 下载上限（单文件）。
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 /// 解压后累计字节上限（防 zip 炸弹）。
@@ -95,11 +97,14 @@ pub fn materialize(url: &str, sha256: &str, cache_root: &Path) -> Result<PathBuf
         .map_err(|e| format!("mounts: fetch thread died: {e}"))?
 }
 
-/// 命中复验：重算 target/.artifact.tgz 的 sha256 与声明比对。
+/// 命中复验：重算 target/.artifact.tgz 的 sha256 与声明比对（流式——产物可达
+/// 512 MiB，整读进内存只为算摘要是纯浪费，每次 serve 启动都会来一遍）。
 fn reverify(target: &Path, sha: &str) -> Result<(), String> {
     let tgz = target.join(".artifact.tgz");
-    let data = std::fs::read(&tgz).map_err(|e| format!("cache reverify read: {e}"))?;
-    let got = hex(&Sha256::digest(&data));
+    let mut f = std::fs::File::open(&tgz).map_err(|e| format!("cache reverify read: {e}"))?;
+    let mut h = Sha256::new();
+    std::io::copy(&mut f, &mut h).map_err(|e| format!("cache reverify read: {e}"))?;
+    let got = hex_encode(&h.finalize());
     if got != sha {
         return Err(format!("cache sha256 mismatch: declared {sha}, got {got}"));
     }
@@ -158,7 +163,7 @@ async fn do_fetch(url: &str, sha: &str, cache_root: &Path) -> Result<PathBuf, St
         .map_err(|e| format!("mounts: flush temp: {e}"))?;
     drop(tmpf);
 
-    let got = hex(&hasher.finalize());
+    let got = hex_encode(&hasher.finalize());
     if got != sha {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
@@ -320,13 +325,4 @@ fn extract_tarball(tgz: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// 字节转 hex 串。
-fn hex(d: &[u8]) -> String {
-    let mut s = String::with_capacity(d.len() * 2);
-    for b in d {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }

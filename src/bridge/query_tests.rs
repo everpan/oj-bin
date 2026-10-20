@@ -2634,6 +2634,33 @@ fn from_select_checks_arity_and_exclusivity() {
     );
 }
 
+/// 表别名与 lit/agg/case/window/CTE 的别名走同一道 check_alias 门（v0.1.83）：
+/// 空串/怪形在反序列化期点名拒绝（`illegal alias`），不再漏到 SQL 渲染换回一句
+/// 看不懂的 DB 报错。
+#[test]
+fn table_alias_validated_like_other_alias_slots() {
+    // 反序列化期即拒（sql_in 只吃合法 req，故无效形态直接打 serde 层）。
+    for req in [
+        // 对象形态：as 空串（JS .as("") 即此形）。
+        r#"{"table":{"name":"t","as":""}}"#,
+        // 字符串形态：" as " 切出的别名同门。
+        r#"{"table":"t as 9bad"}"#,
+        // join 表别名同一条反序列化路径，同样被拦。
+        r#"{"table":"t","joins":[{"table":{"name":"t","as":""},"on":[]}]}"#,
+    ] {
+        let e = serde_json::from_str::<QueryReq>(req)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("illegal alias"), "{req} -> {e}");
+    }
+    // 合法别名照常反序列化 + 渲染（此前语义不变）。
+    let r = serde_json::from_str::<QueryReq>(r#"{"table":"t as u1"}"#).unwrap();
+    assert_eq!(r.table.alias.as_deref(), Some("u1"));
+    let reg = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+    let s = sql_in(&reg, r#"{"table":"t as u1"}"#, Dialect::Sqlite).unwrap();
+    assert!(s.contains("u1"), "{s}");
+}
+
 /// orIgnore / fromSelect 是 insert 的尾部子句（v0.1.81）：挂在其他动词上
 /// 无处可渲染 → 一律拒绝，而不是静默丢弃（用户会以为生效了）。
 #[test]

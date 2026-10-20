@@ -223,7 +223,13 @@ pub mod template {
                     suffix,
                 } => {
                     let a = arg.as_str();
-                    if !a.starts_with(prefix) || !a.ends_with(suffix) {
+                    // 长度先判：arg 比前后缀合计还短时 starts/ends 仍双过（如
+                    // arg "%" vs prefix/suffix 各 "%"），直接切片是 slice-index
+                    // panic（单字符参数打穿宿主，v0.1.83）。
+                    if a.len() < prefix.len() + suffix.len()
+                        || !a.starts_with(prefix)
+                        || !a.ends_with(suffix)
+                    {
                         return Err(format!(
                             "template '{}': token expects '{prefix}${{...}}{suffix}', got '{arg}'",
                             t.raw
@@ -551,9 +557,11 @@ impl Resource for StreamResource {
     }
 }
 
-/// 句柄资源：持有 kill 信号发送端 + 退出码 watch 接收端 + pid。close() 同步发
-/// kill 信号（覆盖 JS 释放 / runtime 回收 / 异常丢弃等全部路径），由 supervisor
-/// 任务据此整组击杀子进程，杜绝孤儿进程组（评审 CRITICAL 资源回收）。
+/// 句柄资源：持有 kill 信号发送端 + 退出码 watch 接收端 + pid。Drop 同步发
+/// kill 信号（覆盖 JS op_close 释放 / checkin 资源回收 / runtime 异常丢弃如
+/// heap-limit 不回池等全部路径），由 supervisor 任务据此整组击杀子进程，杜绝
+/// 孤儿进程组（评审 CRITICAL 资源回收；v0.1.83 起 Drop 真实存在——此前只有
+/// close()，注释承诺的 Drop 兜底缺失，异常丢弃路径会漏杀到超时为止）。
 struct ExecHandleResource {
     kill_tx: mpsc::UnboundedSender<()>,
     exit: watch::Receiver<Option<i32>>,
@@ -563,7 +571,10 @@ impl Resource for ExecHandleResource {
     fn name(&self) -> Cow<'_, str> {
         Cow::Borrowed("exec_handle")
     }
-    fn close(self: Rc<Self>) {
+}
+
+impl Drop for ExecHandleResource {
+    fn drop(&mut self) {
         let _ = self.kill_tx.send(());
     }
 }
@@ -601,7 +612,11 @@ pub async fn op_exec_spawn(
             cmd.env(name, v);
         }
     }
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(if opts.stdin.is_some() {
+        std::process::Stdio::piped()
+    } else {
+        std::process::Stdio::null()
+    });
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -616,6 +631,16 @@ pub async fn op_exec_spawn(
     let pid = child.id().unwrap_or(0);
     let stdout_pipe = child.stdout.take().expect("stdout piped");
     let stderr_pipe = child.stderr.take().expect("stderr piped");
+    // stdin：与缓冲路径（op_exec_run）同语义——有则一次性写入后关闭。此前流式
+    // 形态静默丢弃 opts.stdin（管道恒 null），`sh -c cat` 直接吃空输入还不报错
+    // （v0.1.83）。阻塞写入（子进程不读 + >64KB）由 supervisor 超时组杀收尾。
+    if let (Some(mut si), Some(data)) = (child.stdin.take(), opts.stdin) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = si.write_all(data.as_bytes()).await;
+            let _ = si.shutdown().await;
+        });
+    }
 
     let (so_tx, so_rx) = mpsc::channel::<Vec<u8>>(STREAM_CHANNEL_BOUND);
     let (se_tx, se_rx) = mpsc::channel::<Vec<u8>>(STREAM_CHANNEL_BOUND);
@@ -1126,6 +1151,18 @@ mod tests {
         assert!(match_template(&t, &sargv(&["sh", "-c", "sleep 30 & wait"])).is_ok());
         assert!(match_template(&t, &sargv(&["sh", "-c", "a-b"])).is_ok());
         assert!(match_template(&t, &sargv(&["sh", "-c", "a/b"])).is_ok());
+    }
+
+    #[test]
+    fn wrapped_token_shorter_than_affixes_is_named_error_not_panic() {
+        // arg 比前后缀合计还短（"%" vs prefix/suffix 各 "%"）：starts/ends 双过，
+        // 切片前不判长度就是 slice-index panic——单字符 argv 可打穿宿主（v0.1.83）。
+        let t = p("cmd /c echo %${raw:NAME}%");
+        let e = match_template(&t, &sargv(&["cmd", "/c", "echo", "%"])).unwrap_err();
+        assert!(e.contains("expects '%${...}%'"), "{e}");
+        // 恰好等长仍是合法命中（空内串；此前即此语义，保持不变）。
+        let b = match_template(&t, &sargv(&["cmd", "/c", "echo", "%%"])).unwrap();
+        assert_eq!(b, vec![("NAME".to_string(), String::new())]);
     }
 
     #[test]
@@ -1947,6 +1984,14 @@ export default {
     const r = await exec.run(["echo", "compat"]);
     return json.ok({ code: r.code, out: r.stdout });
   },
+  s10_stdin: async () => {
+    const parts = [];
+    const r = await exec.run(["sh", "-c", "cat"], {
+      stdin: "pipe-through",
+      onStdout: (c) => parts.push(new TextDecoder().decode(c)),
+    });
+    return json.ok({ code: r.code, out: parts.join(""), full: r.stdout });
+  },
   s9_unauth: async () => {
     await exec.spawn(["echo", "hi"]);
     return json.ok({});
@@ -2070,6 +2115,13 @@ y
             "compat
 "
         );
+
+        // SS10（v0.1.83）：回调/流式形态同样吃 opts.stdin（此前静默丢弃，
+        // `sh -c cat` 直接吃空输入）。与缓冲形态同语义：写入后关管道。
+        let d = data!("s10_stdin");
+        assert_eq!(d["code"], 0, "{}", d);
+        assert_eq!(d["out"], "pipe-through");
+        assert_eq!(d["full"], "pipe-through");
 
         // SS9：未授权模块 spawn -> NotCapable（fail-closed）。
         denied!("plain", "s9_unauth", "not authorized for exec");

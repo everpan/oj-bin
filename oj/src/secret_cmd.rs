@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use only_js::secret;
 
 use crate::args::{SecretKeygenAlg, SecretKeygenArgs, SecretOpenArgs, SecretSealArgs};
+use crate::hex_encode;
 
 /// 私钥文件名（`oj secret keygen` 产出）。
 pub const PRIVATE_FILE: &str = "secrets-private.pem";
@@ -92,11 +93,6 @@ fn run_keygen_ed25519(a: &SecretKeygenArgs, dir: &Path) -> Result<(), String> {
     );
     println!("  {}  公钥指纹（sha256，核对用）", ED_PUBLIC_FP_FILE);
     Ok(())
-}
-
-/// 小写 hex（无分隔）。
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `oj secret seal`：明文 → `ENC[...]`。

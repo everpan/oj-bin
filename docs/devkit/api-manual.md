@@ -1241,6 +1241,9 @@ await db.table("receipt").as("r")
 - `db.table("x").as("b")` 让基表以别名 `b` 出现（列限定写成 `b.col`）；`join` 的第 4 参数给被
   join 表起别名。别名**只作用于列限定与 SQL 渲染**；归属/租户守卫始终按**真名**生效（此前
   「别名混入真名」会让两条守卫同时静默失效的缺陷已修，背景见 `sql-builder-guide.md` §3）。
+- 表别名形状与聚合/CTE 等其他别名位**同一道门**（v0.1.83）：`^[A-Za-z_][A-Za-z0-9_]*$`，
+  违例（含空串 `.as("")`）在请求反序列化期报 `illegal alias '<a>'`——此前表别名不做校验，
+  空串/怪形会漏到 SQL 渲染，换回一句看不懂的 DB 原生报错。
 - 别名**只支持 select / join**：`update` / `delete` 带别名直接报
   `table alias is not supported on insert/update/delete`（mysql 的 `DELETE FROM t AS b` 需
   8.0.16+，跨引擎不保证，故构造器直接拒）。
@@ -1329,6 +1332,9 @@ await db.table("notify_daily").fromSelect(
   `insert declares N columns but the source select yields M`；`cols` 为空报
   `insert fromSelect needs insert columns`；`values` 与 `fromSelect` 二选一。`cols` 含 `tenant_id`
   直接报 `fromSelect must not declare tenant column 'tenant_id'`（tenant 由服务端按当前租户注入）。
+  **两条守卫都递归源 select**：租户注入 v0.1.81 已覆盖；**归属守卫 v0.1.83 起同样覆盖**——
+  `ownership_guard: deny` 下源表不在本模块或 `deps:` 声明内即拒（报错同跨模块表访问），堵住
+  「`insert into 我的表 select * from 别人的表`」这条此前绕过归属守卫的搬运通道。
 - `db.tx` 内构造的 DML 自动走事务同连接（见下）。
 
 **受影响行数的三方言语义**：`run()` 返回值 = WHERE **匹配行数**，三方言在 oj 运行时上一致（mysql
@@ -1749,7 +1755,7 @@ exec.run(argv: string[], opts?: {
 }): Promise<{ code: number; stdout: string; stderr: string }>
 ```
 
-另有流式消费形态：句柄式 `exec.spawn`（`for await` 消费 stdout/stderr）+ `exec.run` 的 `onStdout`/`onStderr` 回调，详见下方「exec 流式形态（v0.1.78）」小节。
+另有流式消费形态：句柄式 `exec.spawn`（`for await` 消费 stdout/stderr）+ `exec.run` 的 `onStdout`/`onStderr` 回调，详见下方「exec 流式形态（v0.1.78）」小节。`stdin?` 自 v0.1.83 起**三形态一致支持**（含回调与 `exec.spawn`）。
 
 外部命令原语：**无 shell**——spawn 只接受「授权模板匹配后重建的 argv」。安全形态 =
 config 白名单 + argv 模板 + 平台特权限定，全部 fail-closed：
@@ -1878,7 +1884,7 @@ WSL / MSYS**：
 
 - **exec.spawn(argv, opts?)** 返回句柄 { rid, pid, stdout, stderr, kill, exit }：h.stdout / h.stderr 为 AsyncIterable<Uint8Array>，EOF 时迭代自然结束；h.exit() 等待子进程退出返回 { code }；h.kill() 主动整组击杀。
 - **exec.run(argv, opts?)** 向后兼容：无 onStdout / onStderr 时，行为、返回形状与 v0.1.75 完全一致（{ code, stdout, stderr }，非 UTF-8 输出**抛**）；带回调时逐块转发给回调，返回形状**同样是 { code, stdout, stderr }**（v0.1.79 订正：此前文档称「返回 { code }、不缓冲整段」，实现实际是把全部分块攒在内存后 merge，只是解码改走**有损** TextDecoder、非法 UTF-8 变 U+FFFD 而**不抛**）。要真正的逐块流式（不占内存、拿原始字节）请用 `exec.spawn`。
-- **opts 差异**：timeoutMs?（缺省 30_000，硬上限 600_000，超出钳制）两形态共用；**stdin? 只有无回调的 `exec.run` 支持**（一次性写入后关闭写端）——`exec.spawn` 与回调形态的子进程 stdin 恒为 null，传了会被静默丢弃。
+- **opts 差异**：timeoutMs?（缺省 30_000，硬上限 600_000，超出钳制）两形态共用；**stdin? 三形态都支持**（v0.1.83 订正：此前仅无回调的 `exec.run` 支持，回调 / `exec.spawn` 形态传了会被**静默丢弃**、子进程 stdin 恒为 null）——语义一致：一次性写入后关闭写端；子进程不读且输入大导致 write 阻塞时，由超时兜底组杀（与缓冲形态同窗口）。
 - **背压（重要）**：stdout/stderr 经有界 mpsc（16 槽 x 8KiB）送消费端；JS 不 for await 拉取 到 通道满 到 drain 在 send 上挂起 到 子进程管道满 到 子进程自然暂停（真实子进程语义，正确背压）。不消费流 = 子进程在输出填满管道时阻塞，不是 bug，也别指望 exit() 在流未消费时返回——先消费（或 break）再 exit()。
 - **资源回收（每请求）**：句柄 rid 进 OpState.resource_table；close()（JS 释放 / runtime 归还 / 异常丢弃都覆盖）同步整组击杀子进程，杜绝跨请求/租户泄漏与 next_rid 回绕 panic。drain 任务与子进程同生命周期：handle close 到 kill 到 管道 EOF 到 drain 自然结束。
 - **rid 仅本 runtime 可达**：进程内 ResourceId，跨模块/跨请求无法凭 rid 触达他人会话；kill 只能杀自己 spawn 的会话（无 pid 入参，只接受本会话 rid）。

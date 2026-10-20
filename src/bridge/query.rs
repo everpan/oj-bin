@@ -185,6 +185,11 @@ impl<'de> Deserialize<'de> for TableRef {
         match Value::deserialize(d)? {
             Value::String(s) => {
                 let (name, alias) = split_table_alias(&s);
+                if let Some(a) = &alias {
+                    // 与 lit/agg/case/window/CTE 的别名同一道门（空串/怪形直达
+                    // SQL 渲染只会换回一句看不懂的 DB 报错，v0.1.83）。
+                    check_alias(a).map_err(|e| Error::custom(e.to_string()))?;
+                }
                 Ok(TableRef { name, alias })
             }
             Value::Object(mut m) => {
@@ -193,6 +198,9 @@ impl<'de> Deserialize<'de> for TableRef {
                     .and_then(|v| v.as_str().map(str::to_string))
                     .ok_or_else(|| Error::custom("table object needs string 'name'"))?;
                 let alias = m.remove("as").and_then(|v| v.as_str().map(str::to_string));
+                if let Some(a) = &alias {
+                    check_alias(a).map_err(|e| Error::custom(e.to_string()))?;
+                }
                 if !m.is_empty() {
                     let keys: Vec<&String> = m.keys().collect();
                     return Err(Error::custom(format!(
@@ -1223,6 +1231,12 @@ fn guard_req(state: &Rc<RefCell<OpState>>, req: &QueryReq) -> Result<(), JsError
     }
     for c in &req.with {
         guard_req(state, &c.query)?;
+    }
+    // fromSelect 的源 select 同样是一次跨表读取：不递归等于允许
+    // `insert into 我的表 select * from 别人的表`（apply_tenant 早已递归，
+    // 此处是同一漏洞的归属守卫面，v0.1.83）。
+    if let Some(s) = &req.from_select {
+        guard_req(state, s)?;
     }
     Ok(())
 }

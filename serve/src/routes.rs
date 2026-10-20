@@ -271,6 +271,10 @@ pub struct RouteTable {
     /// api 根（dev 的 `src` / release 的 `dist`）：v0.1.70 起留存，供
     /// `rel_file`（对外产物不带绝对路径）与 `module_of`（模块归属）使用。
     root: PathBuf,
+    /// release 直载布局（`from_entries`=true / `build`=false）：`module_of` 是否剥
+    /// 首段 `<module>-<version>` 的版本后缀。dev 模块目录允许同形名（如
+    /// `preview-0.9`），误剥会把 openapi tags / 生成客户端归错模块（v0.1.83）。
+    release: bool,
 }
 
 const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
@@ -285,6 +289,7 @@ impl Default for RouteTable {
             rows: Vec::new(),
             files: Vec::new(),
             root: PathBuf::new(),
+            release: false,
         }
     }
 }
@@ -382,6 +387,7 @@ impl RouteTable {
     pub fn from_entries(root: &Path, entries: &[RouteEntry]) -> (Self, Vec<String>) {
         let mut t = RouteTable {
             root: root.to_path_buf(),
+            release: true,
             ..Default::default()
         };
         let mut failures = Vec::new();
@@ -573,8 +579,10 @@ impl RouteTable {
     /// 路由所属**模块名**（v0.1.70）：供 `oj openapi` 出 `tags`，下游据此把
     /// `__client` 分模块落盘（生成代码必须知道归属，光有 operationId 不够）。
     ///
-    /// - dev：`src/<module>/<...>/api.ts` 的首段；
-    /// - release：`routes.js` 的 `<module>-<version>/...` 首段剥掉版本后缀。
+    /// - dev（`build` 建表）：`src/<module>/<...>/api.ts` 的首段**原样保留**；
+    /// - release（`from_entries` 建表）：`routes.js` 的 `<module>-<version>/...`
+    ///   首段剥掉版本后缀（v0.1.83 起仅 release 剥——dev 的 `preview-0.9` 这类
+    ///   同形模块名此前被误剥成 `preview`）。
     ///
     /// 只剩一层（api 根的裸 `api.ts` / `api.js`）→ None（无模块归属）。
     pub fn module_of(&self, id: FileId) -> Option<String> {
@@ -582,18 +590,19 @@ impl RouteTable {
         let mut it = rel.components();
         let first = it.next()?.as_os_str().to_string_lossy().into_owned();
         it.next()?; // 根的裸 api 文件，不属于任何模块
-        // `<module>-<version>`：尾段是「数字与点」且含点才剥（模块名本身允许连字符，
-        // `my-module` 的尾段 `module` 不是版本号，不会被误剥）。
-        match first.rsplit_once('-') {
-            Some((m, v))
+        if self.release {
+            // `<module>-<version>`：尾段是「数字与点」且含点才剥（模块名本身允许
+            // 连字符，`my-module` 的尾段 `module` 不是版本号，不会被误剥）。
+            if let Some((m, v)) = first.rsplit_once('-') {
                 if !m.is_empty()
                     && v.contains('.')
-                    && v.chars().all(|c| c.is_ascii_digit() || c == '.') =>
-            {
-                Some(m.to_string())
+                    && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+                {
+                    return Some(m.to_string());
+                }
             }
-            _ => Some(first),
         }
+        Some(first)
     }
 
     /// 全表 `.schema` **声明合法性审计**（v0.1.70 唯一入口）。
@@ -1243,6 +1252,36 @@ mod tests {
         );
         // 只剩一层（release 根的裸 api.js）→ 无模块归属
         assert_eq!(mk("api.js").0.module_of(mk("api.js").1), None);
+    }
+
+    #[test]
+    fn module_of_keeps_version_like_module_name_in_dev_layout() {
+        // dev（build 建表，release=false）：`preview-0.9` 是合法模块目录名，
+        // 不得当版本后缀剥掉（v0.1.83——此前 dev/release 不分一律剥，openapi
+        // tags / 生成客户端会被归到不存在的 `preview` 模块）。
+        let dir = fixture(&[]);
+        let mk = |file: &str| -> (RouteTable, FileId) {
+            let (t, f) = RouteTable::from_entries(
+                &dir,
+                &[RouteEntry {
+                    method: "get".to_string(),
+                    pattern: "/v1/api/x".to_string(),
+                    file: file.to_string(),
+                    handler: None,
+                    schema: None,
+                }],
+            );
+            assert!(f.is_empty(), "{f:?}");
+            let id = t.listing()[0].file;
+            (t, id)
+        };
+        let (t, id) = mk("preview-0.9/api.ts");
+        // from_entries 即 release 布局：仍剥（既有语义不变）。
+        assert_eq!(t.module_of(id).as_deref(), Some("preview"));
+        // 同一文件在 dev 布局表：整段保留。
+        let mut dev = t;
+        dev.release = false;
+        assert_eq!(dev.module_of(id).as_deref(), Some("preview-0.9"));
     }
 
     #[test]

@@ -118,6 +118,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 模糊搜索想手写 `LIKE '%x%'` | **别手写**——用语义化 op：`contains` / `startswith` / `endswith`（v0.1.81），引擎自动转义 `%`/`_`/`!` 并渲染 `LIKE ? ESCAPE '!'`，业务零转义、零方言知识；`like` 只留作高级/框架内部逃生舱（其 `escape` 仅收单字符白名单 `! / \| ~ # @`，**显式拒 `\`**——mysql 默认 `sql_mode` 下 `ESCAPE '\'` 即 1064） |
 | `orIgnore()` 写完用 `if (n === 1)` 判幂等 | **错**：三方言 affected-rows 不一致——mysql 协商 `CLIENT_FOUND_ROWS` 命中重复键返回**匹配行 1**，pg/sqlite `ON CONFLICT DO NOTHING` 返回 **0**；应靠唯一约束/事务保证「不重复写」，行数只读「写几条」 |
 | `fromSelect` 列对不齐 / select 自带 tenant | 目标 `cols` 与源 select 列按位置一一对齐，列数不符报 `insert declares N columns but the source select yields M`；`cols` 含 `tenant_id` 直接拒（tenant 由服务端按当前租户注入）；`values` 与 `fromSelect` 二选一 |
+| 升级到 v0.1.83 后 `fromSelect` 报跨模块表访问被拒（`ownership_guard: deny`） | 预期收紧：**源 select 也在归属守卫覆盖内**（此前源表绕过守卫，等于 `INSERT...SELECT` 跨模块搬运）——源表属其他模块就在 manifest 补 `deps:` 声明，或改走已授权路径 |
+| `.as("")` / 数字开头等怪表别名报 `illegal alias '<a>'` | v0.1.83 起表别名与聚合/CTE 别名**同一道形状门**（`^[A-Za-z_][A-Za-z0-9_]*$`），请求反序列化期点名拒绝——此前漏到 SQL 渲染只换回一句看不懂的 DB 原生报错 |
 | sqlite 上 `fromSelect(...).orIgnore()` 运行时报错（v0.1.82 明文） | 构造期即拒：`orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`——sqlite 的 upsert 子句只能跟 VALUES。pg / mysql 组合可用。sqlite 绕行：裸 `db.exec("insert or ignore into … select …", [...])`（`OR IGNORE` 连 NOT NULL/CHECK 违例都静默跳过，数据面更宽，自行权衡） |
 | 去重计数用 `distinct().all()` 拉行再 `.length` | **静默漏算**：顶层 select 未给 limit 隐式补 100、显式也被 clamp 到 max_limit（默认 1000）——总数超限就少算。用 `select([{fn:"count",distinct:true,field,as}])`（v0.1.82）：聚合一行返回，与 LIMIT 无关 |
 | 「清空整表」写裸 `db.exec("delete from t", [])` | 用 `db.table("t").truncate().run()`（v0.1.82）：命名式明示、可 grep。**租户表上只清当前租户的行**（守卫照常注入，清不出租户边界）——要整库清空在 `db.asSystem` 下执行；带 where 报 `truncate does not accept where` |
@@ -276,6 +278,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `exec.run` 里给子进程传相对路径就以为出不了 jail | cwd 钉在 fs.root 但**不构成隔离边界**——路径越界防线在 `${path:}` 占位符校验（`fs.root ∪ trusted_paths`），别把越出集合的路径交给子进程（v0.1.75） |
 | exec 子进程里 `argv[0]` 和模板首 token 不一致 | 预期：宿主侧把首 token 解析为**绝对路径**（"oj"→服务进程自身，其余 PATH 解析）再传给子进程；模板首 token 必须是裸名（路径分隔符直接拒）（v0.1.75） |
 | `exec.run` 大 stdin 报 `exec timed out after N ms` | stdin 写入也在超时窗口内：子进程不读 stdin 且输入大时 write 阻塞 → 超时兜底组杀（缺省 30s）——大 DDL / 大输入显式调大 `timeoutMs`（硬上限 600s，超出钳制）（v0.1.75） |
+| `exec.run` 回调形态 / `exec.spawn` 里传 `stdin` 没生效 | v0.1.83 订正：此前仅无回调的 `exec.run` 支持 `stdin`，回调 / `spawn` 形态**静默丢弃**（子进程 stdin 恒 null，`sh -c cat` 直接吃空输入）；现在三形态语义一致（一次性写入后关写端）——老代码里为绕过而写的临时方案可以删了 |
 | `exec.run` 跑 `oj migrate` 大 DDL 报 `exec timed out after 30000 ms` | 经 `exec.run` 调 `oj migrate` 执行大表 `ALTER`/索引迁移时，30s 默认超时不够（迁移**不**走 stdin 写入，但仍受同一 `timeoutMs` 窗口约束）——显式 `timeoutMs` 调大（< 600s 硬上限），否则超时组杀留下半截账本（v0.1.75） |
 | Windows 上 `exec.run(["sh","-c",...])` 必败（`command resolve failed`） | Windows 无 `sh` 可执行、且不自动探测 Git Bash——跨平台模板别写 `sh -c`，改用 `cmd /c`：`["cmd","/c","echo","hello"]` / `["cmd","/c","type","__JAIL__/in.txt"]`；`cmd` 由 resolver 解析为绝对路径（如 `C:\Windows\System32\cmd.exe`）后 spawn（v0.1.75 既有行为，文档补全） |
 | Windows 上 exec 输出比对总差一个 `\r` | `cmd /c echo` 恒以 CRLF 收尾、`cmd /c type` 原样吐文件字节（不补行尾），oj **不做** CRLF→LF 归一（与 `Deno.Command.output` / Node 同口径）——跨平台文本比对用 `trimEnd()` / `split(/\r?\n/)`，别写死 `"\n"`（v0.1.79） |

@@ -5,6 +5,13 @@
 
 //! oj 库面：bin 与集成测试共用（oj/tests/ 经 `use oj::...` 触达装配层，
 //! 纯 bin crate 的 `pub mod` 对外不可见，故 lib + bin 双 target）。
+
+/// 字节转小写 hex 串（sha256 摘要 / 密钥指纹：mount_fetch / build_cmd /
+/// secret_cmd 共用一份，v0.1.83 前是三处逐字重复）。
+pub(crate) fn hex_encode(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub mod app;
 pub mod args;
 pub mod build_cmd;

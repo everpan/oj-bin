@@ -16,6 +16,38 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.83
+
+- **exec：回调/句柄形态支持 `stdin`（订正静默丢弃）**。`exec.run` 带 `onStdout`/`onStderr`
+  的回调形态与 `exec.spawn` 此前把 `opts.stdin` 静默丢弃（子进程 stdin 恒 null）——同一 API
+  两种形态行为分叉且不报错（`sh -c cat` 吃空输入仍返回 code 0）。现在三形态语义一致：
+  一次性写入后关闭写端；子进程不读且输入大导致 write 阻塞由 supervisor 超时组杀兜底（与
+  缓冲形态同窗口）。
+- **exec：Wrapped 模板短参数由宿主 panic 改命名报错**。`cmd /c echo %${raw:NAME}%` 这类
+  Wrapped 占位符收到「以前缀起手、后缀收尾，但总长比前后缀合计还短」的 argv token（如单
+  字符 `%`）时，切片前不判长度直接 slice-index panic——JS 可触发的宿主 panic（500/毒化
+  runtime）。现在并入既有失配报错 `template '...': token expects '%${...}%', got '%'`。
+- **exec：句柄资源补真实的 `Drop` 兜底**。runtime 回收注释承诺的 `ExecHandleResource::Drop`
+  此前不存在（只有显式 `close()`）——heap-limit 触发等异常丢弃路径不回池也不清资源表，
+  孤儿子进程组要等到 supervisor 超时臂才被击杀（最长 600s）。现在 Drop 即发组杀信号，实现
+  与注释一致。
+- **SQL 构造器：表别名与聚合/CTE 别名同门校验**。`db.table("t").as("")` / join 表别名 /
+  `"t as 9bad"` 此前不做形状校验，空串/怪形漏到 SQL 渲染（`FROM "t" AS ""`）换回一句看不懂
+  的 DB 原生报错（租户表上还会拼出 `.tenant_id` 的迷惑限定列）。现在反序列化期报
+  `illegal alias '<a>'`。
+- **SQL 构造器：fromSelect 源 select 纳入归属守卫**。`guard_req` 此前不递归 `from_select`
+  （`apply_tenant` 的递归在先）——`ownership_guard: deny` 下 A 模块可
+  `db.table("自己的表").fromSelect(db.table("别人的表").select(...), ...)` 把他人模块的行
+  搬进自己的表（等价明查会被拒，绕一层 fromSelect 即穿）。现在源 select 与 union/cte/
+  条件子查询同列递归覆盖。
+- **`oj openapi`：dev 模块目录名不再被误剥版本后缀**。`module_of` 此前不分 dev/release 一律
+  剥首段 `<module>-<版本号>` 尾段——dev 目录树里 `src/preview-0.9/` 这类合法模块名被归到
+  不存在的 `preview` 模块（tags / `x-oj-file` / 生成客户端分组全错）。版本剥离现在仅对
+  release 直载表（`from_entries`）生效。
+- **性能/去重**：URL 挂载命中复验与 `oj build --bundle` 的 sha256 改流式计算（此前把整个
+  .tgz 读进内存才算摘要——512 MiB 产物即 512 MiB RSS 尖峰，复验每次 serve 启动每个 URL
+  挂载都发生）；三处逐字重复的 hex 编码 helper 收敛为 `oj` crate 一份（`hex_encode`）。
+
 ## v0.1.82
 
 - **SQL 构造器 v0.1.82：三项能力补齐，清零下游最后 4 处方言分支/裸 SQL 逃生口**。诉求来自下游
