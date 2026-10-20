@@ -3023,3 +3023,75 @@ await db.table("notify_daily")
 | `select(["*"])` 带 join | 直接报错——全列只出基表列，join 列会丢 |
 | 表别名让租户/归属守卫失效 | 不会：v0.1.81 起别名只用于列限定，守卫始终按真名，update/delete 带别名直接拒 |
 
+
+## 场景 42：模块卸载清理与整表清空（`db.listTables` / `truncate` / `count distinct`，v0.1.82）
+
+模块卸载（`_lifecycle/uninstall.ts` 类 handler）、测试夹具复位、巡检对账时，需要「枚举当前库
+实际存在的表」「无条件清空一张表」「精确数去重计数」——三者都曾被迫按方言分支裸 SQL
+（`information_schema` vs `sqlite_master` + 手工 `ESCAPE`）或退回裸 `db.exec("delete from …")`。
+v0.1.82 起一句构造器/目录 API 搞定，三方言同一份代码。
+
+### ① 卸载清理：按模块前缀扫表并上报
+
+```ts
+// 枚举当前库全部业务可见表（含未登记 registry 的遗留表/api-only 方案的表），
+// 按名称排序；前缀过滤的 %/_ 由引擎转义后走绑定参数——前缀来自配置也不注入。
+const tables = await db.listTables("myapp_");
+if (tables.length > 0 && !confirmed) json.fail(400, `found ${tables.length} tables: ${tables.join(", ")}`);
+// 清行：登记过的表走 truncate()（守卫/租户语义不缺席）
+for (const t of ["myapp_settings", "myapp_cache"]) {
+  await db.table(t).truncate().run();
+}
+// 删表（DDL）是逃生舱的正当场景：表名来自引擎目录、语句常量，不掺用户输入
+for (const t of tables) {
+  await db.exec(`drop table if exists ${JSON.stringify(t).replace(/"/g, "")}`, []); // 见下方坑表
+}
+```
+
+### ② 夹具/排障复位：明示的整表清空
+
+```ts
+// 之前：db.exec("delete from sys_login_throttle", [])——像漏写 where 的 delete，审查不可见
+await db.table("sys_login_throttle").truncate().run();   // 命名式「清空」，返回受影响行数
+```
+
+### ③ 受影响用户数：去重计数不拉行
+
+```ts
+// 之前：distinct().all() 拉行 .length —— 顶层隐式 LIMIT 100 / 显式 clamp 1000 静默漏算
+const [{ c }] = await db.table("audit")
+  .select([{ fn: "count", distinct: true, field: "user_id", as: "c" }])
+  .where({ field: "action", op: "eq", value: "login_failed" })
+  .all();
+```
+
+### ④ 附：构造器分页工厂（count + list 复用同一组条件）
+
+```ts
+// 模板 _shared 里放一个工厂函数——条件写一份，count/list 各跑一次（引擎零依赖）：
+export async function paged(mk: () => QueryBuilder, { page = 1, size = 20 } = {}) {
+  const [{ c: total }] = await mk().select([{ fn: "count", as: "c" }]).all();
+  const list = total === 0
+    ? []
+    : await mk().orderBy([{ field: "id", dir: "desc" }]).limit(size).offset((page - 1) * size).all();
+  return { list, total, page, size, truncated: total > page * size };
+}
+// 用法：await paged(() => db.table("oplog").whereIf(kw, { field: "action", op: "contains", value: kw }))
+```
+
+### ⑤ 验证
+
+```sh
+curl "http://localhost:9778/v1/api/_lifecycle/uninstall/?module=myapp"   # 返回清理的表清单
+```
+
+### ⑥ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `truncate()` 在租户表上以为清了整库 | **只清当前租户的行**（租户守卫照常注入，构造性 fail-safe）；真整库清空在 `db.asSystem` 下执行 |
+| `truncate()` 又接了 `.where(...)` | 直接报 `truncate does not accept where`——带条件的清空用 `delete`，别用 truncate 表达 |
+| `listTables()` 返回的表名直接拼进 SQL | 名字来自引擎目录而非 registry 白名单——拼接本身不违背红线（非用户输入），但**行数据操作仍须值绑定**；要删整表（DDL）本就该走迁移，不在 handler 里 drop |
+| `count(distinct)` 忘了 `field` / 用在 sum 上 | 报 `count distinct needs a field` / `distinct is only supported on count`——显式拒绝，不静默忽略 |
+| sqlite 上 `fromSelect(...).orIgnore()` | 不支持（构造期报 `orIgnore with fromSelect is not supported on sqlite`）——见场景 41 与 sql-builder-guide §3.3 |
+| `drop table "${t}"` 在 mysql 上 1064 | mysql 默认不认双引号包标识符——DDL 逃生舱里按方言换反引号（此类语句本就是方言语义，分支可接受；表名来自 `db.listTables`，非用户输入） |

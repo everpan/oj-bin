@@ -35,6 +35,7 @@ import {
   op_db_query_build,
   op_db_query_sql,
   op_db_dialect,
+  op_db_list_tables,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -927,6 +928,10 @@ globalThis.DB = function (name) {
       // `_oj_sequences` is created on first use (see docs/db-guide.md).
       nextSeq: (n) => op_db_next_seq(name, String(n)),
       dialect: () => op_db_dialect(name),
+      // Dialect-agnostic catalog introspection (v0.1.82): names of all business-visible
+      // tables in the current database, INCLUDING tables unknown to the schema registry
+      // (api-only plans / legacy tables). Optional prefix filter (escaped, bound param).
+      listTables: (prefix) => op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix)),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -996,6 +1001,8 @@ globalThis.DB = function (name) {
             // Engine name for dialect-aware SQL in shared libs; isTx marks the tx-scoped
             // handle (DDL must never run inside db.tx -- MySQL implicit commit).
             dialect: () => op_db_dialect(name),
+            // Catalog introspection rides the active tx session (same connection).
+            listTables: (prefix) => op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix)),
             isTx: true,
             // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
             sqlProfile: () => op_db_sql_profile(),
@@ -1085,6 +1092,11 @@ function builderFromReq(snap) {
     orIgnore() { req.or_ignore = true; return api; },
     update(sets) { req.verb = "update"; req.sets = encodeParams({ ...sets }); return api; },
     delete() { req.verb = "delete"; return api; },
+    // truncate(): explicit clear-all (v0.1.82). Named destructive verb instead of a
+    // forgotten where; renders DELETE FROM t. Tenant guard still applies -- on a
+    // tenant-scoped table it clears the CURRENT tenant's rows only (db.asSystem for all).
+    // A user-supplied where is rejected by the engine ("truncate does not accept where").
+    truncate() { req.verb = "delete"; req.truncate = true; return api; },
     // Base-table alias (v0.1.81): `db.table("a").as("x")`. Names the base table for
     // column qualification; ownership/tenant guards still key off the REAL name.
     as(alias) {
@@ -1125,7 +1137,7 @@ function builderFromReq(snap) {
     union(other, kind) { req.unions.push({ kind: kind ? String(kind) : "distinct", query: unwrapSub(other) }); return api; },
     with(name, columns, query) { req.with.push({ name: String(name), columns: (columns || []).map(String), query: unwrapSub(query) }); return api; },
     run() {
-      if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0) {
+      if ((req.verb === "update" || req.verb === "delete") && req.conditions.length === 0 && !req.truncate) {
         throw new Error(req.verb + " requires where");
       }
       if (req.verb === "insert" && req.values.length === 0 && !req.from_select) {

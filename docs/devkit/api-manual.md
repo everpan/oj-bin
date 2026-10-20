@@ -1090,6 +1090,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
 | `db.dialect()` | `dialect(): "sqlite" \| "mysql" \| "postgres"` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
+| `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。方言无关（SQL 文本引擎常量），替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
 
@@ -1258,27 +1259,40 @@ await db.table("order")
   .all();
 ```
 
-- 聚合列 `{ fn: "count"|"sum"|"avg"|"min"|"max", field?: string, as?: string }`；
+- 聚合列 `{ fn: "count"|"sum"|"avg"|"min"|"max", field?: string, as?: string, distinct?: boolean }`；
   别名形状 `^[A-Za-z_][A-Za-z0-9_]*$`（违例报 `illegal alias`）。
+- **`count(distinct col)`（v0.1.82）**：`{ fn: "count", distinct: true, field: "user_id", as: "c" }`
+  → `COUNT(DISTINCT user_id)`，聚合一行返回、不受 LIMIT 钳制。仅 count 支持
+  （其他聚合带 `distinct` 报 `distinct is only supported on count`）；必须带具名 `field`
+  （缺省或 `"*"` 报 `count distinct needs a field`）。**别再**用 `distinct().all()` 拉行后
+  `.length` 计数——顶层 select 隐式 LIMIT 会静默截断（受影响用户数 >1000 即漏算）。
 - `having` 白名单列优先，未命中按 select 聚合别名展开（`unknown column '...' in having`）。
   PG 不允许 HAVING 引用输出别名，展开能消灭方言分叉；orderBy 不支持聚合别名（仍走列白名单）。
 - `.distinct()` 去重（仅 select）。
 
-**DML：insert / update / delete**（`.run()` 终执行，返回受影响行数；`.all()` 仅 select）：
+**DML：insert / update / delete / truncate**（`.run()` 终执行，返回受影响行数；`.all()` 仅 select）：
 
 ```ts
 await db.table("user").insert({ name: "neo", age: 1 }).run();        // 单行
 await db.table("user").insert([{ name: "a" }, { name: "b" }]).run(); // 多行（键集须一致）
 await db.table("user").update({ age: 2 }).where({ field: "id", op: "eq", value: 1 }).run();
 await db.table("user").delete().where({ field: "id", op: "in", value: [1, 2] }).run();
+await db.table("sys_login_throttle").truncate().run();               // 整表清空（v0.1.82）
 ```
 
 - **红线**：`update`/`delete` 必须带 where 且叶子数 ≥ 1。JS 链层早抛（`update requires where`），
   op 侧同样强制——`fromJSON` 可完全绕过 JS 链层，所以动词×字段矩阵以 **op 侧校验为权威**。
+  **唯一例外是 `truncate()`（v0.1.82）**：明示的整表清空，取代「退回裸 `db.exec("delete from …")`」。
+- **`truncate()`（v0.1.82）**：无 where 的显式清空，渲染 `DELETE FROM t`（三方言通用——sqlite 无
+  TRUNCATE 语句，sea-query 的 TruncateStatement 不可移植）。**租户守卫照常注入**：租户表上只清
+  **当前租户**的行（真整库清空在 `db.asSystem` 下执行）；非租户表 / 系统态 = 整表清空。自带
+  where 报 `truncate does not accept where`（带条件的清空用 `delete`）；`update` 携带 truncate
+  报 `update does not accept truncate`。
 - 动词×字段矩阵：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/having`，
   `values` 与 `from_select` 二选一（都给报 `insert takes either values or fromSelect, not both`、
   都空报 `insert needs at least one row`）；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`
-  （及 `values`/`from_select`/`or_ignore`）；`select` 拒 `values/sets`。违例报 `<verb> does not accept <field>`。
+  （及 `values`/`from_select`/`or_ignore`；`truncate` 仅 delete 承载）；`select` 拒 `values/sets`。
+  违例报 `<verb> does not accept <field>`。
 - insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
 - 表别名只用于 select/join（见上）：`insert/update/delete` 带 `.as(...)` 直接报
   `table alias is not supported on insert/update/delete`。
@@ -1295,7 +1309,7 @@ await db.table("notify_daily").fromSelect(
   db.table("notify").select(["user_id", "cnt"]).where({ field: "day", op: "eq", value: d }),
   ["user_id", "cnt"],
 ).run();
-// 也可叠加 .orIgnore()：fromSelect(...).orIgnore().run()
+// 也可叠加 .orIgnore()：fromSelect(...).orIgnore().run()——**sqlite 除外**（见下）
 ```
 
 - **`orIgnore()`**：撞主键/任意唯一键的行被跳过。sqlite / postgres 渲染 `ON CONFLICT DO NOTHING`；
@@ -1304,6 +1318,12 @@ await db.table("notify_daily").fromSelect(
   `returning` **互斥**（`orIgnore with returning is not supported on mysql`）。**三方言 affected-rows
   不一致**（mysql 命中重复键返回匹配行 1，pg/sqlite 返回 0），勿用 `if (n === 1)` 判幂等——
   口径与「为什么不用 `INSERT IGNORE`」见 `sql-builder-guide.md` §3.2。
+  **sqlite 上 `orIgnore()` 与 `fromSelect()` 不可组合**（v0.1.82 明文）：报
+  `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`
+  ——sqlite 的 upsert 子句只能跟在 VALUES 之后（引擎在构造期显式拒绝，pg / mysql 的
+  ON CONFLICT / ON DUPLICATE KEY 支持 SELECT 源，不受限）。绕行：裸
+  `db.exec("insert or ignore into … select …", [...])`（注意 sqlite 的 `OR IGNORE` 会把
+  NOT NULL / CHECK 违例**一并静默跳过**，数据面比 ON CONFLICT 宽，自行权衡），或先查后插。
 - **`fromSelect(q, cols)`**：`q` 是另一个 `db.table(...)` 构造器（或纯 JSON 请求）；`cols` 是目标
   表写入列、与 `q` 的 select 列**按位置一一对齐**。列数不符报
   `insert declares N columns but the source select yields M`；`cols` 为空报
@@ -4119,6 +4139,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
 | WS 二进制状态（Yjs awareness 等）不进 `sess.state` | `sess.state` 必须可 JSON 序列化；二进制状态走 base64 字符串存 `sess.state`/kv，或分片放 kv |
 | `WhereCond.and/or` 嵌套未展开 | 多个 `where()` 即 AND；复杂条件用 `db.query` 参数化 SQL |
+| `orIgnore()` + `fromSelect()` 组合在 **sqlite** 不支持（v0.1.82 明文，构造期拒绝） | sqlite 的 upsert 子句只能跟 VALUES；报 `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`。pg / mysql 支持 SELECT 源。绕行走裸 `db.exec("insert or ignore into … select …", [...])`（`OR IGNORE` 会把 NOT NULL/CHECK 违例一并静默跳过，数据面比 ON CONFLICT 宽）或先查后插 |
 | schema 回滚无自动机制 | 迁移只前向；破坏性变更前备份，反向变更写新 seq 迁移 |
 | fixtures/ 不进 release 产物 | 演示数据走 fixtures（oj test / oj test fixture）；参考数据走模块 seed.sql |
 | `db param: u64 value … is not supported on this path`（v0.1.24） | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text，或把该列放到 MySQL `BIGINT UNSIGNED` |

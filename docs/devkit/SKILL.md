@@ -117,6 +117,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 模糊搜索想手写 `LIKE '%x%'` | **别手写**——用语义化 op：`contains` / `startswith` / `endswith`（v0.1.81），引擎自动转义 `%`/`_`/`!` 并渲染 `LIKE ? ESCAPE '!'`，业务零转义、零方言知识；`like` 只留作高级/框架内部逃生舱（其 `escape` 仅收单字符白名单 `! / \| ~ # @`，**显式拒 `\`**——mysql 默认 `sql_mode` 下 `ESCAPE '\'` 即 1064） |
 | `orIgnore()` 写完用 `if (n === 1)` 判幂等 | **错**：三方言 affected-rows 不一致——mysql 协商 `CLIENT_FOUND_ROWS` 命中重复键返回**匹配行 1**，pg/sqlite `ON CONFLICT DO NOTHING` 返回 **0**；应靠唯一约束/事务保证「不重复写」，行数只读「写几条」 |
 | `fromSelect` 列对不齐 / select 自带 tenant | 目标 `cols` 与源 select 列按位置一一对齐，列数不符报 `insert declares N columns but the source select yields M`；`cols` 含 `tenant_id` 直接拒（tenant 由服务端按当前租户注入）；`values` 与 `fromSelect` 二选一 |
+| sqlite 上 `fromSelect(...).orIgnore()` 运行时报错（v0.1.82 明文） | 构造期即拒：`orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`——sqlite 的 upsert 子句只能跟 VALUES。pg / mysql 组合可用。sqlite 绕行：裸 `db.exec("insert or ignore into … select …", [...])`（`OR IGNORE` 连 NOT NULL/CHECK 违例都静默跳过，数据面更宽，自行权衡） |
+| 去重计数用 `distinct().all()` 拉行再 `.length` | **静默漏算**：顶层 select 未给 limit 隐式补 100、显式也被 clamp 到 max_limit（默认 1000）——总数超限就少算。用 `select([{fn:"count",distinct:true,field,as}])`（v0.1.82）：聚合一行返回，与 LIMIT 无关 |
+| 「清空整表」写裸 `db.exec("delete from t", [])` | 用 `db.table("t").truncate().run()`（v0.1.82）：命名式明示、可 grep。**租户表上只清当前租户的行**（守卫照常注入，清不出租户边界）——要整库清空在 `db.asSystem` 下执行；带 where 报 `truncate does not accept where` |
+| 卸载/巡检要枚举当前库的表，按方言分支 `information_schema`/`sqlite_master` | 用 `db.listTables(prefix?)`（v0.1.82）：方言无关、前缀转义引擎做（绑定参数）、未登记 registry 的表也返回、按名排序。sqlite 内部表（`sqlite_*`）已排除 |
 | `select(["*"])` 带 join | 直接报错——全列展开只出基表列，join 列会丢、`undefined` 拿去做授权判断即隐患；要 join 列就显式列名 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |

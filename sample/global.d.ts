@@ -51,6 +51,10 @@ interface QueryBuilder {
   insert(rows: object | object[]): QueryBuilder;
   update(sets: object): QueryBuilder;
   delete(): QueryBuilder;
+  // 整表清空（v0.1.82）：唯一的无 where 写动词，明示使用——渲染 `DELETE FROM t`。
+  // 租户守卫照常注入：租户表上只清**当前租户**的行（清整库用 db.asSystem）。
+  // 自带 where 报 `truncate does not accept where`；update 携带 truncate 报错。
+  truncate(): QueryBuilder;
   returning(cols?: string[]): QueryBuilder;
   // JOIN：on = 左右列对；kind 缺省 "inner"（left/right/... 依服务端支持）。
   join(
@@ -577,6 +581,11 @@ declare global {
     /** 连接引擎名（v0.1.61）：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
      * 诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，慎用。 */
     dialect(): "sqlite" | "mysql" | "postgres";
+    /** 目录自省（v0.1.82）：当前库全部业务可见表名（**含未登记 registry 的表**——api-only
+     * 方案 / 历史遗留表），按名称排序。可选前缀过滤（%/_ 按字面量匹配，绑定参数）。
+     * sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。
+     * 替代「按方言分支 information_schema / sqlite_master」的裸 db.query。 */
+    listTables(prefix?: string): Promise<string[]>;
     asTenant(id: string): DBInstance;
     // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。

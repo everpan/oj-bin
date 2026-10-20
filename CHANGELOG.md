@@ -16,6 +16,46 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.82（未打标签）
+
+- **SQL 构造器 v0.1.82：三项能力补齐，清零下游最后 4 处方言分支/裸 SQL 逃生口**。诉求来自下游
+  模板（`_lifecycle/uninstall.ts` / `rate.ts` / `_shared/service/infra/query.ts` / `oplog.ts`）
+  的五项需求评审（A 目录自省 / B 整表清空 / C 分页 / D count distinct / E like escape）+ 一条
+  `orIgnore × fromSelect` 下游反馈（F）：
+  - **D `count(distinct col)`**：`select([{fn:"count",distinct:true,field:"user_id",as:"c"}])`。
+    聚合一行返回、不受 LIMIT 钳制——替换「`distinct().all()` 拉行 `.length` + `limit` 硬顶」
+    的静默漏算形态（显式 limit 本就被 clamp 到 `max_limit` 默认 1000，`limit(100_000)` 实际
+    只到 1000）。仅 count 支持；缺 `field`/`"*"` 报 `count distinct needs a field`，其他聚合
+    带 `distinct` 报 `distinct is only supported on count`（显式拒绝，不静默忽略）；
+  - **A `db.listTables(prefix?)`**（方言无关目录自省，新 op `op_db_list_tables`，归位 `db.rs`）：
+    返回当前库全部业务可见表名（**含未登记 registry 的表**），按名排序，可选前缀过滤——SQL
+    文本引擎常量 + 前缀经 `escape_like` 转义后绑定参数（`LIKE ? ESCAPE '|'`，'|' 不与任何方言
+    字符串转义规则冲突）；sqlite 经 `sqlite_master`（substr 排除 `sqlite_*` 内部表），mysql/pg
+    共用 `information_schema` 限当前库/schema，占位符经 `normalize_and_trace` 统一改写（PG
+    `$n`）；`db` 与 `db.tx` 对象同签名。消除 uninstall 的 #1/#2 两个方言分支裸 SQL；
+  - **B `db.table(t).truncate().run()`**（显式整表清空）：渲染 `DELETE FROM t`（sqlite 无
+    TRUNCATE 语句，sea-query 的 TruncateStatement 不可移植）。**租户守卫照常注入**——租户表上
+    只清当前租户（构造性 fail-safe，清不出租户边界），整库清空在 `db.asSystem` 下执行。用户
+    自带 where 在租户注入**前**由 `validate_truncate` 拒绝（报 `truncate does not accept where`），
+    `update` 携带 truncate 报 `update does not accept truncate`；JS 链层 `requires where` 门禁
+    对 truncate 放行。消除 rate.ts 的 #3 逃生口（裸 `db.exec("delete from …")`）；
+  - **F `orIgnore × fromSelect`（sqlite）明文化**：引擎在 v0.1.81 即构造期显式拒绝（sqlite 的
+    upsert 子句只能跟 VALUES），本次把限制写进 api-manual（含错误/限制表）、sql-builder-guide
+    §3.3 与 SKILL 陷阱速查，附绕行口径（裸 `db.exec("insert or ignore … select")` 及其
+    NOT NULL/CHECK 静默跳过的数据面代价）；
+  - **E 无代码**：`like` + `escape`（白名单 `! / | ~ # @`）与 `contains` 的字面/模糊匹配能力
+    v0.1.81 已具备，本次写进迁移清单第 8 条（匹配字面 `%`/`_`）；
+  - **C 引擎零改动**：分页 = 构造器原语（count 聚合 + limit/offset + contains）之上的模板层
+    工厂函数（`scenarios.md` 场景 42 给了照抄实现），不在引擎加 `db.paginate`；
+- **结构重构（行为不变）**：`src/bridge/query.rs`（5547 行）测试模块（3016 行）拆至
+  `src/bridge/query_tests.rs`（`#[path]` 子模块），生产文件减半、保持构造器语义单一内聚；
+  目录自省 op 归位 `db.rs`（库级 op 与 `op_db_query` 同类，SRP），`escape_like` 转 `pub(crate)`；
+- **测试**：新增 6 个用例（count distinct 聚合/形状/两处门禁、truncate 清空/两处拒绝、
+  listTables 含未登记表排序 + 前缀转义 %/\_ 字面量）+ `raw_sql_op_exits_are_pinned` 白名单
+  增补；`cargo test --release -p only-js` 690 通过；
+- **文档**：devkit 四件 + `sql-builder-guide.md` 逐条对齐（能力矩阵 +3 行、迁移清单 +4 条、
+  场景 42、陷阱速查 +4 行、`sample/global.d.ts` 类型同步）。
+
 ## v0.1.81
 
 - **db.table() 构造器补齐 7 项能力**（v0.1.81）——下游模板 `docs/sql-builder-missing-capabilities-pr.md`

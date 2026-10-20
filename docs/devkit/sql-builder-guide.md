@@ -13,7 +13,7 @@
 PG 的 `$N` 占位符自管）就会锁死到单一引擎，迁移时须逐条改写。**仅当构造器不支持的语句
 （DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`**，且仍须用 `?` 绑定参数、避免方言特有语法。
 
-## 2. 能力矩阵（v0.1.81）
+## 2. 能力矩阵（v0.1.82）
 
 | 能力 | 构造器写法 | 方言可移植 | 备注 |
 |---|---|---|---|
@@ -28,10 +28,13 @@ PG 的 `$N` 占位符自管）就会锁死到单一引擎，迁移时须逐条�
 | 字面量列 | `{ lit: v, as: "x" }` | ✅ | 绑定参数 + 方言 `CAST` |
 | 计算列 | `{ case: {when,else}, as }` | ✅ | 条件表达式 |
 | 聚合 / groupBy / having / distinct | `select([{fn,...}])/groupBy/having/distinct` | ✅ | |
+| count(distinct col) | `select([{fn:"count",distinct:true,field,as}])` | ✅ | v0.1.82；聚合一行、免拉行计数（受 LIMIT 钳制的 `distinct().all()+length` 是陷阱） |
+| 整表清空 | `.truncate().run()` | ✅ | v0.1.82；渲染 `DELETE FROM t`；**租户守卫照常注入**（租户表=清当前租户，整库清用 asSystem） |
 | 子查询 / exists / union / with CTE | `subquery / exists / union / with` | ✅ | 嵌套 ≤ 4 |
 | 取回主键 | `.returning([...])` | ⚠️ | mysql 仅单列（两步取） |
-| 幂等写入 | `.orIgnore()` | ⚠️ | 见 §3 |
+| 幂等写入 | `.orIgnore()` | ⚠️ | 见 §3；**与 fromSelect 组合在 sqlite 不支持** |
 | 批量写入（查询插入） | `.fromSelect(q, cols)` | ⚠️ | 见 §3 |
+| 目录自省 | `db.listTables(prefix?)` | ✅ | v0.1.82；当前库全部表名（含未登记 registry），替代按方言分支 `information_schema`/`sqlite_master` |
 | 流式读取 | `db.stream` | ⚠️ | 见 api-manual「db.stream」三档 |
 | 任意 SQL 表达式 / DDL | — | ❌ | 退回 `db.query` / `db.exec` |
 
@@ -99,6 +102,13 @@ DELETE 无此坑（删行必「变更」，匹配行 = 变更行），但归属�
   tenant 由服务端按当前租户注入，禁止 select 自带。
 - 源 select 的**租户收窄**继承到写入侧（跨租户读写被守卫拦截）；源 select 须 `select` 动词、
   深度 ≤ 4、禁 with/unions（见 api-manual「嵌套通用约束」）。
+- **sqlite 上 `orIgnore()` + `fromSelect()` 不可组合**（构造期显式拒绝，v0.1.82 明文）：
+  `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`。
+  根因：sqlite 的 upsert 子句只能跟在 VALUES 之后，`INSERT … SELECT … ON CONFLICT DO NOTHING`
+  是语法错；而 sqlite 原生的 `INSERT OR IGNORE … SELECT` 会把 NOT NULL / CHECK 违例**一并静默
+  跳过**（数据面比 ON CONFLICT 宽），与引擎「把静默损坏面收窄到唯一键冲突」的取向相悖，故不实现。
+  pg（ON CONFLICT）与 mysql（ON DUPLICATE KEY）的子句本就支持 SELECT 源，组合可用。sqlite 侧确需
+  该语义时退回裸 `db.exec("insert or ignore into … select …", [...])`，注释写明根因。
 
 ### 3.4 字面量列的方言 `CAST`
 
@@ -141,8 +151,15 @@ v0.1.81 前「别名混入真名」会让归属与租户两条守卫**同时静�
 - **不要**为「构造器不支持」而裸拼标识符进 `db.query`（表名/列名来自 JS 字符串 = 注入面）。
 - **逃生舱**：构造器确实不支持的语句（DDL、特殊方言语法）用 `db.query` / `db.exec`，但仍须 `?`
   绑定值、避免方言特有语法；`like` 的 `escape` 是高级逃生舱（白名单 `! / | ~ # @`、显式拒 `\`）。
-- **表别名不削弱守卫**：v0.1.81 起别名只用于列限定，归属/租户守卫始终按**真名**；`update`/`delete`
-  带别名直接报错。
+  **匹配字面 `%` / `_`** 用 `{op:"like", value:"a!_b", escape:"!"}`（模式原样成形 + 自选转义符）；
+  纯模糊包含用 `contains` 即可（v0.1.82 起写进迁移清单第 7 条）。
+- **`truncate()` 是唯一无 where 的写动词**（v0.1.82）：命名式、可 grep 的「明示清空」，取代
+  「退回裸 `db.exec("delete from t")`」。租户守卫照常注入——租户表上只清当前租户（构造性
+  fail-safe：永远清不出租户边界），整库清空在 `db.asSystem` 下执行；语义出处见 api-manual §6。
+- **目录自省不再分支方言**（v0.1.82）：「枚举当前库的表」（卸载清理、按前缀扫表）用
+  `db.listTables(prefix?)`——SQL 文本引擎常量 + 前缀绑定参数，能力面严格弱于 `db.query`，
+  价值在跨方言可移植。返回名可含**未登记 registry** 的表；要拿它们的行数据仍须走裸 SQL
+  （值绑定参数）。
 
 ## 5. 从 `db.query` 迁移（清零手写 SQL）
 
@@ -151,7 +168,15 @@ v0.1.81 前「别名混入真名」会让归属与租户两条守卫**同时静�
 1. **模糊搜索** `LIKE '%' || ? || '%' ESCAPE '!'` → `op: "contains"`。
 2. **join ON 带值条件** `... AND r.user_id = ?` → `join(t, [{left,right},{left:"r.user_id",op:"eq",value:id}])`。
 3. **字面量/标记列** `'svc' as scope` → `{ lit: "svc", as: "scope" }`；条件表达式 → `{ case: {...} }`。
-4. **INSERT OR IGNORE / INSERT … SELECT** → `.orIgnore()` / `.fromSelect(q, cols)`。
+4. **INSERT OR IGNORE / INSERT … SELECT** → `.orIgnore()` / `.fromSelect(q, cols)`（sqlite 的
+   orIgnore+fromSelect 组合除外，见 §3.3）。
 5. **动态 WHERE** `if (x) q.where(...)` → `q.whereIf(x, ...)`（空数组也自动跳过，避免 `IN ()` 静默 0 行）。
+6. **目录扫描**（v0.1.82）：`information_schema.tables` / `sqlite_master` 按方言分支 + `LIKE ? ESCAPE`
+   手工转义 → `db.listTables(prefix?)` 一句（前缀转义引擎做，绑定参数）。
+7. **无 where 清空**（v0.1.82）：裸 `db.exec("delete from t", [])` → `db.table("t").truncate().run()`
+   （命名式明示、租户守卫不缺席）；**去重计数** `select distinct …` 拉行 `.length` →
+   `select([{fn:"count",distinct:true,field,as}])`（聚合一行，免受 LIMIT 钳制静默漏算）。
+8. **字面 `%`/`_` 匹配**（v0.1.82 明文）：`{op:"like", value:"a!_b", escape:"!"}`——模式原样成形，
+   自选转义符（白名单 `! / | ~ # @`）；纯模糊搜仍用 `contains`。
 
 迁移后同一 handler 在多引擎跑通，无需按方言分支。

@@ -20,3 +20,4 @@ secrets-private.pem
 
 # git worktrees（superpowers 隔离工作区）
 .worktrees/
+/mutants.out/

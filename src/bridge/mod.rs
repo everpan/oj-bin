@@ -423,6 +423,7 @@ deno_core::extension!(
         query::op_db_query_build,
         query::op_db_query_sql,
         db::op_db_dialect,
+        db::op_db_list_tables,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,

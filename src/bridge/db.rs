@@ -477,6 +477,13 @@ pub async fn op_db_query(
     Ok(rows)
 }
 
+/// `Instant` → 毫秒（trace 计时用）。单拧出来是为了变异测试：`* 1000.0` 的量纲换算
+/// 有自己的时钟钉子测试（`elapsed_ms_scales_to_millis`）——内联在 op 里时 `*`→`+`/`/`
+/// 的变异体只是改了「记出来的数字大小」，运行期不可断言，必然静默存活。
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 /// 在 db op 内调用：构造 `SqlEvent` 并交给 `sql_trace::record_sql`（配置未开则零开销直接返回）。
 /// `rows` 为影响/返回行数（stream/未知传 None）；`ok`/`err` 描述执行结果。
 ///
@@ -834,6 +841,100 @@ pub fn op_db_dialect(
     .into())
 }
 
+/// db.listTables(prefix?)（v0.1.82）：方言无关的目录自省，返回当前库业务可见表名
+/// （含未登记进 SchemaRegistry 的表——api-only 方案 / 历史遗留表），消除「按方言分支
+/// information_schema / sqlite_master」的裸 db.query。SQL 文本一律引擎常量、前缀经
+/// `escape_like` 转义后走绑定参数（LIKE ? ESCAPE '|'——'|' 不与任何方言的字符串转义
+/// 规则冲突，避开 mysql 反斜杠转义 / PG standard_conforming_strings 的分叉）。能力面
+/// 严格弱于 db.query，价值纯在跨方言可移植；表名是返回的数据，不进 SQL 拼接。
+#[op2]
+#[serde]
+pub async fn op_db_list_tables(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] prefix: Option<String>,
+) -> Result<Vec<String>, JsErrorBox> {
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let dialect = match &target {
+        Target::Tx(t) => t.dialect,
+        Target::Pool(da) => da.dialect(),
+    };
+    // 投影列统一叫 `name`：sqlite_master 本就叫 name；information_schema 的
+    // table_name 取别名。系统表排除只在 sqlite 需要（mysql/pg 已被
+    // DATABASE()/current_schema() 的范围天然排除）。
+    let mut sql = match dialect {
+        Dialect::Sqlite => "SELECT name FROM sqlite_master WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_'".to_string(),
+        Dialect::MySql => {
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = DATABASE()"
+                .to_string()
+        }
+        Dialect::Postgres => {
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema()"
+                .to_string()
+        }
+    };
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(p) = prefix {
+        // 前缀列不能用投影别名（mysql 的 WHERE 不认 SELECT 别名），按方言落真列名。
+        let col = match dialect {
+            Dialect::Sqlite => "name",
+            _ => "table_name",
+        };
+        sql.push_str(&format!(" AND {col} LIKE ? ESCAPE '|'"));
+        params.push(Value::String(format!(
+            "{}%",
+            super::query::escape_like(&p, '|')
+        )));
+    }
+    sql.push_str(" ORDER BY name");
+    // 占位符统一改写（0.1.67）：`?` 是 oj 唯一占位符，PG 由宿主改写 `$n`——
+    // 与三个裸 SQL op 同一插桩点，不许绕过。
+    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
+    let start = std::time::Instant::now();
+    let res = match target {
+        Target::Pool(da) => da.query_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
+    };
+    let ms = elapsed_ms(start);
+    match res {
+        Ok(rows) => {
+            trace_sql(
+                &state,
+                &sql,
+                &params,
+                &name,
+                in_tx,
+                ms,
+                Some(rows.len() as i64),
+                true,
+                None,
+            );
+            // 契约是 Promise<string[]>：投影列固定叫 name，抽出来摊平（防驱动把
+            // 表名包成对象/带 schema 前缀——只取纯名字）。
+            Ok(rows
+                .into_iter()
+                .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(String::from))
+                .collect())
+        }
+        Err(e) => {
+            let em = e.to_string();
+            trace_sql(
+                &state,
+                &sql,
+                &params,
+                &name,
+                in_tx,
+                ms,
+                None,
+                false,
+                Some(em.clone()),
+            );
+            Err(JsErrorBox::generic(em))
+        }
+    }
+}
+
 /// 每个库**一次**地确保平台序列表存在（Bridge 级缓存；DDL 幂等）。
 ///
 /// 缓存放在 `StableState`（而非全局 static）：每个 Bridge 对应一份 DB 配置与池，全局缓存会在
@@ -959,6 +1060,18 @@ fn pick_v(rows: Vec<Row>) -> Result<Row, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 量纲钉子（变异测试）：`elapsed_ms` 的 `*`→`+`/`/` 变异必死。
+    /// sleep(3ms) 的下界由时钟语义保证、上界千倍宽松——这不是「固定 sleep 当同步」
+    /// 的 flake 形态，被测对象就是计时本身。
+    #[test]
+    fn elapsed_ms_scales_to_millis() {
+        let start = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let ms = elapsed_ms(start);
+        assert!(ms >= 3.0, "ms {ms}");
+        assert!(ms < 1_000.0, "ms {ms}");
+    }
     use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
     use serde_json::json;
     use std::sync::Arc;
@@ -968,12 +1081,13 @@ mod tests {
     /// 本白名单（属裸 SQL 出口则插桩 normalize_and_trace，否则更新此表并说明）。
     #[test]
     fn raw_sql_op_exits_are_pinned() {
-        const WHITELIST: [&str; 17] = [
+        const WHITELIST: [&str; 18] = [
             "op_db_as_system",
             "op_db_as_tenant",
             "op_db_dialect",
             "op_db_exec",
             "op_db_has",
+            "op_db_list_tables",
             "op_db_next_seq",
             "op_db_query",
             "op_db_query_build",
