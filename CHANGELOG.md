@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.82（未打标签）
+## v0.1.82
 
 - **SQL 构造器 v0.1.82：三项能力补齐，清零下游最后 4 处方言分支/裸 SQL 逃生口**。诉求来自下游
   模板（`_lifecycle/uninstall.ts` / `rate.ts` / `_shared/service/infra/query.ts` / `oplog.ts`）
