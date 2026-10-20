@@ -142,15 +142,80 @@ struct RabbitBroker {
     core: Arc<RabbitCore>,
     /// topic 交换名（默认 "oj-bus"；可由 `topic_prefix` 配置覆盖）。
     exchange: String,
+    /// 复用 channel（v0.1.84：lapin 2.5 的 Channel 无 Drop→close，逐次新建即弃会泄漏
+    /// 连接上的 channel，打满 channel_max 被 broker 杀连接——与 mq 面 reuse_channel 同款）。
+    channel: tokio::sync::Mutex<Option<lapin::Channel>>,
     /// close = drop 发送端 → push 消费任务收场（评审 S1 泄漏修复，同 kafka 插件）。
     stop_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// 取复用 channel：连接存活直接 clone（廉价句柄），断线/失效置 None 重建。
+/// bus / mq 两面共用（slot + core 由调用方持有）。
+async fn reuse_channel(
+    slot: &tokio::sync::Mutex<Option<lapin::Channel>>,
+    core: &RabbitCore,
+) -> Result<lapin::Channel, String> {
+    let mut g = slot.lock().await;
+    if let Some(ch) = g.as_ref() {
+        if ch.status().connected() {
+            return Ok(ch.clone());
+        }
+        *g = None;
+    }
+    let ch = core.channel().await?;
+    *g = Some(ch.clone());
+    Ok(ch)
+}
+
+/// 单次消费面搭建（bus 面）：channel → 排他自动删除队列（每订阅者独立，断连自动回收）
+/// → 绑定 topic → 消费者。首次订阅与断连后的重建共用（v0.1.84 订阅自愈）。
+async fn setup_consumer(
+    core: &RabbitCore,
+    exchange: &str,
+    topic: &str,
+) -> Result<lapin::Consumer, String> {
+    let channel = core.channel().await?;
+    let queue = channel
+        .queue_declare(
+            "",
+            QueueDeclareOptions {
+                exclusive: true,
+                auto_delete: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| format!("rabbitmq queue declare: {e}"))?;
+    let queue_name = queue.name().as_str().to_string();
+    channel
+        .queue_bind(
+            &queue_name,
+            exchange,
+            topic,
+            QueueBindOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| format!("rabbitmq queue bind {topic}: {e}"))?;
+    channel
+        .basic_consume(
+            &queue_name,
+            "",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .map_err(|e| format!("rabbitmq consume {topic}: {e}"))
 }
 
 impl RabbitBroker {
     async fn new(cfg: &BrokerCfgJson) -> Result<Self, String> {
         let core = Arc::new(RabbitCore::new(cfg).await?);
         let exchange = cfg.topic_prefix.clone().unwrap_or_else(|| "oj-bus".into());
-        let ch = core.channel().await?;
+        // 交换声明用的 channel 进复用槽（不再用完即弃——同款 channel 泄漏，量小但同为泄漏）。
+        let channel = tokio::sync::Mutex::new(None);
+        let ch = reuse_channel(&channel, &core).await?;
         ch.exchange_declare(
             &exchange,
             ExchangeKind::Topic,
@@ -166,6 +231,7 @@ impl RabbitBroker {
         Ok(Self {
             core,
             exchange,
+            channel,
             stop_tx,
         })
     }
@@ -205,16 +271,7 @@ impl MqInstance {
 
     /// 取复用 channel：连接存活直接 clone（廉价句柄），断线/失效重建。
     async fn reuse_channel(&self) -> Result<lapin::Channel, String> {
-        let mut g = self.channel.lock().await;
-        if let Some(ch) = g.as_ref() {
-            if ch.status().connected() {
-                return Ok(ch.clone());
-            }
-            *g = None;
-        }
-        let ch = self.core.channel().await?;
-        *g = Some(ch.clone());
-        Ok(ch)
+        reuse_channel(&self.channel, &self.core).await
     }
 
     /// poll：逐队列轮转 basic_get（每条一个 round-trip，评审 nit：非批量；prefetch 留升级），
@@ -367,7 +424,9 @@ impl BusPluginState {
 
     async fn do_publish(&self, handle: u64, topic: &str, data: &[u8]) -> Result<Vec<u8>, String> {
         let b = self.broker(handle)?;
-        let channel = b.core.channel().await?;
+        // 复用 channel（v0.1.84：原逐次新建即弃——Channel 无 Drop→close，泄漏打满
+        // channel_max 被 broker 杀连接；同 mq 面 reuse_channel）。
+        let channel = reuse_channel(&b.channel, &b.core).await?;
         // 投递到 topic 交换，路由键 = topic；不阻塞等待 broker confirm（与 core 一致）。
         channel
             .basic_publish(
@@ -384,61 +443,58 @@ impl BusPluginState {
 
     async fn do_subscribe(&self, handle: u64, topic: &str) -> Result<Vec<u8>, String> {
         let b = self.broker(handle)?;
-        let channel = b.core.channel().await?;
-        // 排他、自动删除队列（每订阅者独立，断连自动回收）。
-        let queue = channel
-            .queue_declare(
-                "",
-                QueueDeclareOptions {
-                    exclusive: true,
-                    auto_delete: true,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| format!("rabbitmq queue declare: {e}"))?;
-        let queue_name = queue.name().as_str().to_string();
-        channel
-            .queue_bind(
-                &queue_name,
-                &b.exchange,
-                topic,
-                QueueBindOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| format!("rabbitmq queue bind {topic}: {e}"))?;
-        let mut consumer = channel
-            .basic_consume(
-                &queue_name,
-                "",
-                BasicConsumeOptions::default(),
-                FieldTable::default(),
-            )
-            .await
-            .map_err(|e| format!("rabbitmq consume {topic}: {e}"))?;
+        // 首次搭建同步执行：broker 不可达仍让 vtable.subscribe 以 Err 透出（宿主回滚
+        // 刚注册的通道），语义与既有装配一致。
+        let mut consumer = setup_consumer(&b.core, &b.exchange, topic).await?;
         let host = HOST
             .get()
             .cloned()
             .expect("oj-bus-rabbitmq: init before subscribe");
         let logical = topic.to_string();
+        let core = Arc::clone(&b.core);
+        let exchange = b.exchange.clone();
         let mut stop = b.stop_tx.subscribe();
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop.changed() => break,   // close(handle) 显式停（评审 S1）
-                    msg = consumer.next() => match msg {
-                        Some(Ok(delivery)) => {
-                            // 原始字节上送（ABI 8；JSON 信封/二进制帧型由宿主侧判定）。
-                            delivery.ack(BasicAckOptions::default()).await.ok();
-                            (host.deliver)(
-                                RString::from(logical.as_str()),
-                                to_rbytes(&delivery.data),
-                            );
+            // v0.1.84：连接/通道级错误不再永久退出（原 `Some(Err(_)) => break`——一次
+            // 抖动即静默杀死订阅，排他自动删除队列随断连消失，topic 停摆到进程重启）。
+            // 错误 → 退避后重建 队列+绑定+消费者；成功收到消息即重置退避。
+            let mut backoff = Duration::from_millis(500);
+            const BACKOFF_MAX: Duration = Duration::from_secs(10);
+            'outer: loop {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => break 'outer,   // close(handle) 显式停（评审 S1）
+                        msg = consumer.next() => match msg {
+                            Some(Ok(delivery)) => {
+                                // 原始字节上送（ABI 8；JSON 信封/二进制帧型由宿主侧判定）。
+                                delivery.ack(BasicAckOptions::default()).await.ok();
+                                (host.deliver)(
+                                    RString::from(logical.as_str()),
+                                    to_rbytes(&delivery.data),
+                                );
+                                backoff = Duration::from_millis(500); // 连接健康，重置退避
+                            }
+                            // 瞬时错误：退出内层 → 退避后重建队列/消费者（订阅存活）。
+                            Some(Err(e)) => {
+                                eprintln!(
+                                    "[oj-bus-rabbitmq] subscribe {logical}: consume error, \
+                                     rebuilding: {e}"
+                                );
+                                break;
+                            }
+                            None => break,
                         }
-                        Some(Err(_)) => break,
-                        None => break,
+                    }
+                }
+                tokio::select! {
+                    _ = stop.changed() => break 'outer,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+                match setup_consumer(&core, &exchange, &logical).await {
+                    Ok(c) => consumer = c,
+                    Err(e) => {
+                        eprintln!("[oj-bus-rabbitmq] subscribe {logical}: rebuild: {e}");
                     }
                 }
             }

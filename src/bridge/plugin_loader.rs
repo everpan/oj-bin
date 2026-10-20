@@ -532,6 +532,14 @@ fn classify_axes<'a>(
     let mut generic = Vec::new();
     for d in decls {
         let name = d.name[..].to_string();
+        // v0.1.84：空 vtable 与回退路径同款跳过（dlsym 侧有 is_null 检查，清单侧此前没有
+        // ——裸 cast 出空 & 直接进了 Registrations/generic_axes，首次调用即 SIGSEGV）。
+        if d.vtable.is_null() {
+            eprintln!(
+                "[oj-plugin] '{plugin_name}': axis '{name}' declared with null vtable, ignoring"
+            );
+            continue;
+        }
         if d.kind == AXIS_KIND_GENERIC {
             // 安全前提：插件按 GenericVtable 形状构造该 vtable（信任边界同既有轴）。
             generic.push((name, unsafe {

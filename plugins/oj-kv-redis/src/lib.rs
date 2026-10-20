@@ -108,8 +108,13 @@ impl RedisKV {
 
     async fn expire(&self, key: &str, ttl_secs: u64) -> Result<bool, String> {
         use redis::AsyncCommands;
+        // v0.1.84：u64 → i64 回绕会把超大 ttl 变负值，而 Redis EXPIRE 负数 = 立即删键
+        // （静默错动作）——越界响亮报错，不回绕。
+        let ttl = i64::try_from(ttl_secs).map_err(|_| {
+            format!("kv expire: ttl_secs {ttl_secs} exceeds i64 range — rejected (a wrapped negative ttl would delete the key)")
+        })?;
         let mut c = self.conn.clone();
-        c.expire(key, ttl_secs as i64)
+        c.expire(key, ttl)
             .await
             .map_err(|e| format!("redis expire: {e}"))
     }

@@ -16,6 +16,35 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.84（未打标签）
+
+插件/FFI 层审计修复（七项：rabbitmq ×2、kafka、db 双插件、blob、kv、宿主 loader）。
+
+- **bus(rabbitmq)：publish 复用 channel（修 channel 泄漏打满 channel_max）**。bus 面逐次
+  publish 新建即弃 channel（lapin 2.5 的 Channel 无 Drop→close），约 2000 次后 broker
+  杀连接——publish 全挂且该连接上全部推送订阅断线。现在与 mq 面同款复用通道
+  （断线/失效自动重建），交换声明用的 channel 一并归入复用槽。
+- **bus(rabbitmq)：推送订阅自愈（断连不再永久静默）**。消费循环遇连接/通道级错误此前
+  `break` 永久退出——一次抖动即 topic 停摆到进程重启（排他自动删除队列随断连消失，
+  停摆窗口内的消息一并丢失）。现在退避（0.5s 起、上限 10s、成功收信即重置）后重建
+  队列+绑定+消费者；**首次**搭建仍同步执行并报错（宿主失败回滚语义不变）。
+- **bus(kafka)：消费错误日志节流**。持续性错误（认证失败/集群失联）librdkafka 逐拍
+  上报，此前逐条 stderr 刷爆 logs/——现在同一订阅 30s 至多一条，成功收信即重置。
+- **db(mysql/postgres)：流式游标专用连接并发上限（8）**。typed 游标每条单开一条池外
+  连接且原无上限——并发大结果集可打满服务端 max_connections（此后连池查询一并失败，
+  全库不可用）。现在超限 fail-loud：`db stream_open: too many concurrent cursors
+  (limit 8) — close or cancel running streams first`；游标收口（done/err/cancel/close）
+  即释放配额；Any 回退路径走池不占闸。
+- **blob：直传/上传 pump 增断连兜底 abort**。客户端断连/超时取消会丢弃 pump future，
+  此前 finish/abort 都不执行——s3 multipart 留 orphan parts（持续计费）且插件侧会话
+  条目永久泄漏。现在流式会话在场即持守卫，Drop 兜底 fire `put_stream_abort`
+  （幂等）；显式错误路径与正常 finish 语义不变。
+- **kv(redis)：expire 的 ttl 越 i64 拒绝**。`ttl_secs`（u64）此前 `as i64` 回绕，超大
+  值变负数——而 Redis EXPIRE 负数即立即删键（静默错动作）。现在响亮报错。
+- **宿主：泛型轴清单空 vtable 跳过**。`oj_plugin_axes` 声明 kind=GENERIC 且 vtable=null
+  的畸形插件此前裸 cast 出空引用进注册表，首次 `axis()` 调用即 SIGSEGV——现在与 dlsym
+  回退路径同款：告警并跳过该轴。
+
 ## v0.1.83
 
 - **exec：回调/句柄形态支持 `stdin`（订正静默丢弃）**。`exec.run` 带 `onStdout`/`onStderr`

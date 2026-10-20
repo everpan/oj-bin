@@ -433,6 +433,9 @@ impl BusPluginState {
             .expect("oj-bus-kafka: init before subscribe");
         let logical = topic.to_string();
         let mut stop = b.stop_tx.subscribe();
+        // 错误日志节流（v0.1.84）：持续错误（认证失败/集群失联）librdkafka 逐拍上报，
+        // 原样 eprintln 会刷爆 logs/——同一订阅 30s 至多一条；成功收到消息即重置。
+        let mut last_err_log: Option<std::time::Instant> = None;
         // 将 consumer 移入任务：MessageStream 借用 consumer，须同生命周期存活于任务内。
         tokio::spawn(async move {
             let mut stream = consumer.stream();
@@ -447,9 +450,16 @@ impl BusPluginState {
                                 RString::from(logical.as_str()),
                                 to_rbytes(p),
                             );
+                            last_err_log = None;
                         }
                         Some(Err(e)) => {
-                            eprintln!("[oj-bus-kafka] consume error on {physical}: {e}");
+                            let now = std::time::Instant::now();
+                            if last_err_log.is_none_or(|t| {
+                                now.duration_since(t) >= std::time::Duration::from_secs(30)
+                            }) {
+                                eprintln!("[oj-bus-kafka] consume error on {physical}: {e}");
+                                last_err_log = Some(now);
+                            }
                         }
                         None => break, // 发送端 drop（close）→ stream 结束
                     }

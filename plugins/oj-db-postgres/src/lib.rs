@@ -135,6 +135,9 @@ struct Client {
     /// ABI 10 流式游标（stream_id → 行流 + 协作式取消标志）。
     streams: Mutex<HashMap<u64, Arc<StreamHandle>>>,
     next_stream: AtomicU64,
+    /// 流式专用连接闸（v0.1.84，`STREAM_MAX_CONNS`）：typed 游标先占配额再拨号，
+    /// 条目移除（done/err/cancel/close）随 handle drop 释放。
+    stream_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// 流式游标句柄：行流（async-stream 自持 SQL/参数/连接）独立成 tokio Mutex（批量
@@ -152,10 +155,18 @@ struct StreamHandle {
     backend_pid: Option<i32>,
     /// 错误延迟上报：错误发生时本批已有行 → 行先交付，错误下一拍给出。
     pending_error: std::sync::Mutex<Option<String>>,
+    /// 流式专用连接闸配额（v0.1.84）：typed 游标持有，条目移除（done/err/cancel/close）
+    /// 即随 handle drop 释放；Any 回退路径无专用连接，为 None。（仅 Drop 有意义，故 `_` 前缀。）
+    _gate: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// 每次 stream_next 的批量行数上限（spec §1.4：砍逐行 FFI 往返）。
 const STREAM_BATCH: usize = 100;
+
+/// 流式游标专用连接并发上限（v0.1.84）：typed 路径每游标单开一条池外连接，原无上限——
+/// 并发大结果集打满服务端 max_connections 后连池路径也拿不到连接（全库不可用）。
+/// 上限 8（sqlx 池缺省 10，留余量）；超限 fail-loud。
+const STREAM_MAX_CONNS: usize = 8;
 
 struct Tx {
     tx: tokio::sync::Mutex<Option<sqlx::Transaction<'static, Any>>>,
@@ -337,6 +348,7 @@ impl Client {
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
             next_stream: AtomicU64::new(0),
+            stream_gate: Arc::new(tokio::sync::Semaphore::new(STREAM_MAX_CONNS)),
         })
     }
 
@@ -352,6 +364,18 @@ impl Client {
         let params: Vec<serde_json::Value> = params.to_vec();
         let is_pg = self.dialect == Dialect::Postgres;
         let mut backend_pid: Option<i32> = None;
+        // typed 专用连接占闸（v0.1.84）：拿到配额才拨号；此后任一步失败配额随局部
+        // permit drop 归还。Any 回退路径走池（池自身有界），不占闸。
+        let gate = if is_pg {
+            Some(self.stream_gate.clone().try_acquire_owned().map_err(|_| {
+                format!(
+                    "db stream_open: too many concurrent cursors (limit {STREAM_MAX_CONNS}) \
+                             — close or cancel running streams first"
+                )
+            })?)
+        } else {
+            None
+        };
         let rows: DbStream = if is_pg {
             // typed 专用连接：连接的所有权随生成器走；cancel = pg_cancel_backend(pid)
             // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
@@ -426,6 +450,7 @@ impl Client {
                 typed: is_pg,
                 backend_pid,
                 pending_error: std::sync::Mutex::new(None),
+                _gate: gate,
             }),
         );
         Ok(id)

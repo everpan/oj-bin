@@ -1773,6 +1773,35 @@ fn is_multipart(headers: &HeaderMap) -> bool {
         .is_some_and(|s| s.starts_with("multipart/form-data"))
 }
 
+/// 流式上传会话守卫（v0.1.84）：pump future 被丢弃（客户端断连/超时取消）时
+/// Drop fire `put_stream_abort`——s3 multipart 不 abort 会留 orphan parts 烧钱，
+/// 且插件侧会话条目永久泄漏（v0.1.38 起两路 pump 只覆盖显式错误路径）。
+/// 显式 abort/finish 前先 `disarm()`；abort 本身幂等（未知 id 返回 Err 被丢弃）。
+struct PutStreamGuard {
+    blob: Arc<dyn BlobBackend>,
+    upload_id: u64,
+    armed: bool,
+}
+
+impl PutStreamGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PutStreamGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let blob = Arc::clone(&self.blob);
+            let id = self.upload_id;
+            // Drop 发生在 axum/hyper 的 runtime 线程上（取消即就地 drop future）——spawn 可用。
+            tokio::spawn(async move {
+                let _ = blob.put_stream_abort(id).await;
+            });
+        }
+    }
+}
+
 /// blob 直传 PUT 的执行体（v0.1.38）：流式 `put_stream_*` 优先（内存恒定，总量闸
 /// blob_upload_max，超限 abort + 信封 413）；后端不支持流式（put_stream_open Err，
 /// 如旧形态后端/网关类实现）→ 回落整段缓冲 put（上限 blob_upload_max，语义同旧版）。
@@ -1801,6 +1830,11 @@ async fn blob_put_direct(
     };
     match blob.put_stream_open(key, ct.as_deref()).await {
         Ok(upload_id) => {
+            let mut guard = PutStreamGuard {
+                blob: Arc::clone(&blob),
+                upload_id,
+                armed: true,
+            };
             let mut total: u64 = 0;
             let mut too_large = false;
             let mut err: Option<String> = None;
@@ -1826,6 +1860,7 @@ async fn blob_put_direct(
                 }
             }
             if too_large || err.is_some() {
+                guard.disarm();
                 let _ = blob.put_stream_abort(upload_id).await;
                 if too_large {
                     return fail_response(413, "upload too large");
@@ -1837,6 +1872,7 @@ async fn blob_put_direct(
                 );
                 return fail_response(500, "blob upload failed");
             }
+            guard.disarm();
             match blob.put_stream_finish(upload_id).await {
                 Ok(()) => ok_resp(),
                 Err(_) => fail_response(500, "blob upload failed"),
@@ -1960,6 +1996,9 @@ async fn stream_multipart(
             // 文件字段：缓冲到 max_upload 为止；超过转流式（blob_cap 闸）。
             let mut buf: Vec<u8> = Vec::new();
             let mut session: Option<(u64, String)> = None;
+            // v0.1.84：session 在场即持守卫——future 被丢弃（客户端断连/取消）时 Drop
+            // 兜底 abort（s3 multipart 不 abort 留 orphan parts）；显式 abort/finish 前 disarm。
+            let mut guard: Option<PutStreamGuard> = None;
             let mut total: u64 = 0;
             let mut too_large = false;
             loop {
@@ -1976,6 +2015,9 @@ async fn stream_multipart(
                             match blob.put_stream_open(&key, content_type.as_deref()).await {
                                 Ok(id) => {
                                     if let Err(e) = blob.put_stream_chunk(id, &buf).await {
+                                        if let Some(g) = guard.as_mut() {
+                                            g.disarm();
+                                        }
                                         let _ = blob.put_stream_abort(id).await;
                                         return Err(Box::new(fail_response(
                                             500,
@@ -1984,6 +2026,11 @@ async fn stream_multipart(
                                     }
                                     buf = Vec::new();
                                     session = Some((id, key));
+                                    guard = Some(PutStreamGuard {
+                                        blob: Arc::clone(blob),
+                                        upload_id: id,
+                                        armed: true,
+                                    });
                                 }
                                 Err(_) => {
                                     // 后端不支持流式且文件 > max_upload：无可回落面（
@@ -1994,6 +2041,9 @@ async fn stream_multipart(
                         }
                         if let Some((id, _)) = session.as_ref() {
                             if let Err(e) = blob.put_stream_chunk(*id, &chunk).await {
+                                if let Some(g) = guard.as_mut() {
+                                    g.disarm();
+                                }
                                 let _ = blob.put_stream_abort(*id).await;
                                 return Err(Box::new(fail_response(
                                     500,
@@ -2006,6 +2056,9 @@ async fn stream_multipart(
                     }
                     Ok(None) => break,
                     Err(e) => {
+                        if let Some(g) = guard.as_mut() {
+                            g.disarm();
+                        }
                         if let Some((id, _)) = session.take() {
                             let _ = blob.put_stream_abort(id).await;
                         }
@@ -2014,12 +2067,18 @@ async fn stream_multipart(
                 }
             }
             if too_large {
+                if let Some(g) = guard.as_mut() {
+                    g.disarm();
+                }
                 if let Some((id, _)) = session.take() {
                     let _ = blob.put_stream_abort(id).await;
                 }
                 return Err(Box::new(fail_response(413, "upload too large")));
             }
             if let Some((id, key)) = session {
+                if let Some(g) = guard.as_mut() {
+                    g.disarm();
+                }
                 // 流式完成：bytes 不回填，key/url 交给 handler
                 match blob.put_stream_finish(id).await {
                     Ok(()) => {
