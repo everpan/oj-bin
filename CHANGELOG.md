@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.84（未打标签）
+## v0.1.84
 
 插件/FFI 层审计修复（七项：rabbitmq ×2、kafka、db 双插件、blob、kv、宿主 loader）。
 

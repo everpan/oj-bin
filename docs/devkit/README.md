@@ -39,6 +39,14 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.84 已落地部分：**插件/FFI 层审计修复七项**——rabbitmq bus 面 publish 复用 channel（修逐次
+泄漏打满 channel_max 被 broker 杀连接）、推送订阅退避自愈（断连不再 topic 永久停摆，首次搭建
+仍同步报错）、kafka 消费错误日志 30s 节流、mysql/postgres 流式游标专用连接并发上限 8（超限报
+`too many concurrent cursors (limit 8)`，收口即释放）、blob 直传/上传 pump 断连兜底 abort（s3
+不再留计费 orphan parts）、redis expire 的 ttl 越 i64 报错（此前回绕成负数 = 立即删键）、宿主
+loader 对空 vtable 的畸形插件轴告警跳过（不再 SIGSEGV）。见 api-manual「db.stream」「bus」
+「kv」对应小节与错误文案、SKILL 陷阱速查。
+
 v0.1.83 已落地部分：**三处行为订正（exec stdin 全形态 + 表别名形状门 + fromSelect 归属守卫）**——
 ① `exec.run` 回调形态与 `exec.spawn` 现在支持 `opts.stdin`（语义与缓冲形态一致：一次性写入后关写端；此前传了被**静默丢弃**，子进程 stdin 恒 null）；② 表别名（`.as(...)` / join 第 4 参 / `"t as u"`）与聚合/CTE 别名走同一道形状门 `^[A-Za-z_][A-Za-z0-9_]*$`，空串等怪形在请求反序列化期报 `illegal alias '<a>'`（此前漏到 SQL 渲染只换回 DB 原生报错）；③ `ownership_guard: deny` 下 `fromSelect` 的**源 select** 同样过归属守卫（此前源表绕过守卫，`INSERT...SELECT` 可跨模块搬运；源表属其他模块需在 manifest 补 `deps:`）；另修 exec Wrapped 模板（`%${raw:N}%`）收到比前后缀还短的 argv 时的宿主 panic（改为命名报错）、dev 目录树里 `preview-0.9` 这类同形模块名不再被 `oj openapi` 误剥成 `preview`。见 api-manual「exec 流式形态」「表别名与归属/租户守卫」「fromSelect」、SKILL 陷阱速查。
 

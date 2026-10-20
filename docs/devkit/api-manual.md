@@ -1566,6 +1566,11 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
     `{"error":"cancelled"}`）。
   - 取消 = **流干净提前结束**（消费端收到 done，不报错；服务端行缓冲有界——64 行——消费端不
     拉取时后端拉取同步暂停）；已回调/已迭代的行不回滚。
+- **专用连接并发上限 8**（v0.1.84，mysql / postgres 的 typed 直连路径）：每条游标独占一条
+  池外连接（真取消语义的前提），并发超限 **fail-loud**：
+  `db stream_open: too many concurrent cursors (limit 8) — close or cancel running streams first`
+  ——此前无上限，并发大结果集可打满服务端 `max_connections`（此后连池查询一并失败，全库
+  不可用）。游标收口（done / err / cancel / close）即释放配额；Any 回退路径走池、不占闸。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -1626,7 +1631,7 @@ const seq = Number(rows[0].m) + 1;
 | `kv.get` | `get(key: string): Promise<string \| null>` | 取值（缺失 `null`） |
 | `kv.set` | `set(key: string, value: string): Promise<boolean>` | 写值 |
 | `kv.del` | `del(key: string): Promise<boolean>` | 删键 |
-| `kv.expire` | `expire(key: string, ttlSec: number): Promise<boolean>` | 设过期（秒）；真 Redis 走 EXPIRE，内存 KV 惰性过期 |
+| `kv.expire` | `expire(key: string, ttlSec: number): Promise<boolean>` | 设过期（秒）；真 Redis 走 EXPIRE，内存 KV 惰性过期。`ttlSec` 越出 i64 值域**报错**（v0.1.84——此前回绕成负数会被 Redis 理解为「立即删键」） |
 | `kv.incr` | `incr(key: string): Promise<number>` | 自增返回新值（键不存在从 0 起） |
 
 （`redis.get / redis.set / redis.del / redis.expire / redis.incr` 与上表同签名——二者同源同面。）
@@ -2018,6 +2023,9 @@ bus.subscribe("news");
 ```
 
 缺省 `broker` 为进程内总线（跨实例不互通）；`broker.kind: kafka|rabbitmq` 需对应插件。
+**rabbitmq 推送订阅自愈**（v0.1.84）：消费循环遇连接/通道级错误按退避重建（0.5s 起、上限
+10s、成功收信即重置），不再一次抖动即 topic 永久停摆；**首次**搭建失败仍同步报错（失败回滚
+语义不变）。自愈窗口内消息会延迟，至多 ~10s 一轮。
 
 ### es —— Elasticsearch（`es:` 段启用，未配置调用报 `es not configured`）
 

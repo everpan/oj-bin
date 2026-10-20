@@ -189,6 +189,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.stream` 报 `backend does not support streaming` | 该后端没有逐行拉取能力。**真流式**的是核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 两个插件；其余后端要么回落全量（不报错）、要么直接报这个错——改用 `db.query` + 分页 |
 | `db.stream` 没报错但内存照样爆 | 后端不支持逐行拉取时宿主会一次取全量（行为等同 `db.query`，只失去内存优势，**不报错**）——按结果集大小分页，或换到 `oj-db-mysql` / `oj-db-postgres` 后端 |
 | `db.stream` 取消在 pg/mysql 下是「真取消」，sqlite 只是「协作式」 | v0.1.42 起：`postgres://`/`mysql://` DSN 游标走**专用连接**，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端慢查询立即终止；core/Any（sqlite 等）无服务端句柄，只能**协作式**（下一批返回 `{"error":"cancelled"}`）。别指望 sqlite 的取消能打断正在跑的查询 |
+| `db.stream` 报 `too many concurrent cursors (limit 8)` | v0.1.84：pg/mysql 的 typed 游标每条独占一条池外连接（真取消语义的前提），并发上限 8、超限 fail-loud——并行大导出改串行，或及时 abort/close 释放配额（Any 回退路径走池不占闸） |
 | 用了 `json.stream` 又 `json.ok` | 流式响应已接管 body，二者互斥——`json.stream`/`sse` 后 handler 直接 `return`，别再包信封 |
 | 启动报 `config has ENC[...] sealed values but no decryption key: …` | config 里有密封值却找不到私钥——设 `OJ_SECRET_KEY`（PEM）/ `OJ_SECRET_KEY_FILE` / `secrets.private_key_path`。**不会**静默把密文当明文用（v0.1.33） |
 | `ENC[…]` 解不开 / 报 `aes-gcm open failed` | 私钥与加密用的公钥不是一对（换机器时只拷了 config 没拷私钥） |
