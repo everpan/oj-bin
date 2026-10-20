@@ -20,6 +20,11 @@ interface WhereCond {
   field?: string;
   op?: string; // eq/neq/gt/gte/lt/lte/like/in/nin/null/notnull/... 依服务端支持
   value?: unknown;
+  // 子查询（v0.1.81）：in/eq/ne/gt/gte/lt/lte 叶子以 subquery 代 value（builder 或纯 JSON
+  // 请求）；value 与 subquery 互斥；isnull/like 不接受子查询。
+  subquery?: QueryBuilder | object;
+  // exists 节点（v0.1.81）：`{ exists: <子查询> }`，不得携带其他键。
+  exists?: QueryBuilder | object;
   and?: WhereCond[];
   or?: WhereCond[];
   not?: WhereCond;
@@ -35,6 +40,9 @@ interface OrderByItem {
 interface QueryBuilder {
   select(cols?: (string | object)[]): QueryBuilder;
   where(cond: WhereCond): QueryBuilder;
+  // 动态 WHERE（v0.1.81）：test 为 undefined/null/false 或空数组时跳过该条件；
+  // 0 与 "" 是合法值、保留（空数组跳过是防 IN () 恒假静默 0 行）。
+  whereIf(test: unknown, cond: WhereCond): QueryBuilder;
   orderBy(items?: OrderByItem[]): QueryBuilder;
   // LIMIT/OFFSET（v0.1.20 起可配，见 config `db_query` 段——不能写进 `db:` 段）：
   // 未给 limit 的**顶层** select 隐式补 `db_query.default_limit`（默认 100）；显式 limit
@@ -56,12 +64,25 @@ interface QueryBuilder {
   // 自带 where 报 `truncate does not accept where`；update 携带 truncate 报错。
   truncate(): QueryBuilder;
   returning(cols?: string[]): QueryBuilder;
-  // JOIN：on = 左右列对；kind 缺省 "inner"（left/right/... 依服务端支持）。
+  // 幂等写入（v0.1.81）：撞主键/任意唯一键的行跳过（sqlite/pg = ON CONFLICT DO NOTHING，
+  // mysql 回落 identity update、需主键且与 returning 互斥）。sqlite 上与 fromSelect
+  // 不可组合（v0.1.82 明文报错）。
+  orIgnore(): QueryBuilder;
+  // 查询插入（v0.1.81）：从子查询写入；cols 与子查询输出列**按位置**对齐（数量不匹配
+  // 报错）。与 insert 的 values 互斥（都给报错）。
+  fromSelect(sub: QueryBuilder | object, cols: string[]): QueryBuilder;
+  // JOIN：on 条目两形——{left,right}（列=列）或 {left,op,value}（列=值，v0.1.81，op 限
+  // 比较类；contains/isnull 等模式/空值类直接拒绝）。kind 缺省 "inner"（可选 left）；
+  // 第 4 参数 alias 给被 join 的表起别名（v0.1.81）——归属/租户守卫仍按真名。
   join(
     table: string,
-    on: { left: string; right: string }[],
+    on: ({ left: string; right: string } | { left: string; op: string; value?: unknown })[],
     kind?: string,
+    alias?: string,
   ): QueryBuilder;
+  // 基表别名（v0.1.81）：列限定写 "别名.列"；仅 select/join 生效（写动词带 as 报错），
+  // 守卫始终按真名。
+  as(alias: string): QueryBuilder;
   // DISTINCT / GROUP BY / HAVING / UNION / CTE（WITH）。
   distinct(): QueryBuilder;
   groupBy(cols?: string[]): QueryBuilder;
@@ -75,10 +96,35 @@ interface QueryBuilder {
   toJSON(): object;
 }
 
-// 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）。
+// db.sqlProfile() 的返回（v0.1.51）：本请求 SQL 画像。追踪未开启（release 默认 /
+// `db_trace.enabled:false`）时为空对象 {}。
+interface SqlProfile {
+  count: number;
+  totalMs: number;
+  // 慢查询速览（超 db_trace.slow_ms 阈值的语句）。
+  slow: { sql: string; ms: number; db: string }[];
+  // 按库聚合：{ "default": { count, ms }, ... }。
+  byDb: Record<string, { count: number; ms: number }>;
+  // 逐条回放；params 恒为 "N params" 形式的脱敏串（redact_params 默认 true，
+  // 绝不把参数原值送进响应）。
+  events: {
+    sql: string;
+    params: string;
+    db: string;
+    inTx: boolean;
+    source: string;
+    ms: number;
+    rows: number;
+    ok: boolean;
+    error?: string;
+  }[];
+}
+
+// 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）、没有 stream
+// （流式只走直连池，tx 内报错）。
 // isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
 // （MySQL 的 DDL 会隐式提交调用方事务）。
-type TxInstance = Omit<DBInstance, "tx"> & { isTx?: true };
+type TxInstance = Omit<DBInstance, "tx" | "stream"> & { isTx?: true };
 
 // json.* ：统一响应信封 + 响应头。
 interface JsonApi {
@@ -586,6 +632,19 @@ declare global {
      * sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。
      * 替代「按方言分支 information_schema / sqlite_master」的裸 db.query。 */
     listTables(prefix?: string): Promise<string[]>;
+    /** 流式查询（v0.1.37）：逐行拉取大结果集，避免 db.query 全量驻留。给 onRow 回调
+     * （逐行富化/转写，如写 json.stream）返回 Promise<void>；省略则返回 AsyncIterable<Row>
+     * 供 for-await。opts.signal 触发 abort 即取消（pg/mysql 是真取消——KILL QUERY+断连，
+     * sqlite 协作式）。只走直连池——db.tx 内调用报错；非直连后端回落全量（不报错）
+     * 或报 backend does not support streaming。 */
+    stream(
+      sql: string,
+      params?: unknown[],
+      opts?: { onRow?: (row: Row) => void; signal?: AbortSignal },
+    ): Promise<void> | AsyncIterable<Row>;
+    /** SQL 执行追踪（v0.1.51，dev 默认开）：本请求累计画像；同一请求内调用，
+     * 跨请求重置。追踪关闭返回空对象 {}。 */
+    sqlProfile(): SqlProfile;
     asTenant(id: string): DBInstance;
     // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。

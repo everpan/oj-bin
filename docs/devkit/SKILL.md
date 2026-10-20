@@ -47,7 +47,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 统一返回。
 4. **测试**：先 L2 vitest 测逻辑（快，不起服务），再 L1 `oj test` 测端到端（真，连真实 DB）。
-   两层都绿才算完（§9）。
+   两层都绿才算完（§9）。`oj test` 的写法走读（生命周期 / 测试库隔离 / 照抄样板 / 坑）
+   见 `oj-test-guide.md`。
 5. **发布检查**：`oj build` → 确认 `dist/manifests.yaml` 锁与版本目录产物（§11）。
    release 启动默认 `migrate_on_start: verify`，**先 `oj migrate`**；config `db:` 段有命名库时
    逐个 `oj migrate -c config.yaml -d dist --db <name>`（未声明库名会报错，不会回落 default）。

@@ -601,6 +601,8 @@ mod tests {
         assert!(dk.join("scenarios.md").exists());
         // SQL 构造器专题指引（v0.1.81 起）随包分发；api-manual「查询构造器」章指向它。
         assert!(dk.join("sql-builder-guide.md").exists());
+        // oj test 测试专题指引随包分发；api-manual §9 与 SKILL 工作流指向它。
+        assert!(dk.join("oj-test-guide.md").exists());
     }
 
     #[test]

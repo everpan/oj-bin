@@ -2983,7 +2983,9 @@ oj 仓库 `sample/`（github.com/everpan/oj-bin）的「OIDC 演示」；实现�
 
 ## 9. 测试
 
-> 何时读我：写模块测试或搭 CI 时。
+> 何时读我：写模块测试或搭 CI 时。本章只列契约（旗标 / 注入 API 表）；**写法走读**——
+> 运行生命周期、测试库隔离口径、可照抄样板、fixtures/seed 纪律与坑——见专题篇
+> `oj-test-guide.md`。
 
 两层测试互补：**L1 `oj test`**（进程内真实 v8 + 真实路由/鉴权/租户管线 + 真实后端，
 零 TCP）；**L2 vitest 纯 mock**（Node 直调 handler，mock 全局，毫秒级）。
