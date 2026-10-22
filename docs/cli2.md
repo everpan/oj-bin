@@ -46,15 +46,22 @@
         └── manifest.yaml # user 模块的清单
   ```
 
+  --module-root dir（v0.1.85）以 `dir` 为**源码树根**：在其子树内**递归**发现
+                 `manifest.yaml`（命中即停），模块名取 manifest 的 `name`（目录名只作定位，
+                 模块可放任意深度）；URL 前缀取 manifest 可选 `prefix`（缺省 = `name`）。
+                 与 `--api-path` 互斥（同时给即报错）；命中 0 个 manifest 或指向 release
+                 树（含 manifests.yaml）均非零退出。
+
   其他旗标：`--app-path <dir>`（静态站点目录，相对 CWD；config 中的 `server.app_path` 相对 config 目录）、`--cert-path` / `--key-path`（JWS 证书与
   公钥路径）、`--console-log`（打开终端输出，默认只落盘 server.logs_dir；启动失败的
   最终退出原因无论开关都直写终端）。
 
    每个模块目录下包含一个配置文件 manifest.yaml 用于记录该模块的相关清单，其案例结构如下
   ```yaml
-    name: "user" # 与模块名文件夹同名，即父目录名，约束条件
+    name: "user" # 模块名：平铺树下须与父目录名相同；--module-root 递归模式下任意（身份取此名）
     desc: "用户信息相关，记录账号、地址等个人信息" # 模块的简短描述
     version: "0.1.0" # 当前的版本，打包的时候加入打包路径
+    prefix: "sys/user" # 可选（v0.1.85）：URL 前缀（可含 / 分段），缺省/空串 = name
     config: # 本模块的其他设置信息
   ```
 ### 访问规则
@@ -91,10 +98,12 @@
 
   参数：
 ```
-    oj build [module] -d src -o dist [--no-minify]
+    oj build [module] -d src -o dist [--no-minify] [--module-root DIR]
 ```
       module  可选，指定要编译的模块名；缺省为全部模块
-      -d      源码目录，默认 `src`
+      -d      源码目录，默认 `src`（与 --module-root 互斥）
+      --module-root 源码树根（v0.1.85）：子树内递归发现 manifest.yaml，模块名取 manifest
+               `name`（目录名只作定位），URL 前缀取 manifest `prefix`（缺省 = name）
       -o      产物目录，默认 `dist`
       --no-minify  关闭产物 minify（多行可读，排障用；默认开启）
 

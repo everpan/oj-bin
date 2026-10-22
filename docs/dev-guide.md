@@ -397,6 +397,28 @@ import 解析报错、热重载不生效、dev/release 行为不一致时读这�
 模式自动判定（`oj/src/serve_cmd.rs` 的 `is_release`）：目录含 `dist/manifests.yaml` ⇒
 release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](cli2.md)。
 
+### 模块索引 ModuleIndex（v0.1.85，`src/bridge/module_scan.rs`）
+
+`--module-root <dir>` 的递归发现收敛在单一事实源 `ModuleIndex { base, modules:
+BTreeMap<name, ModuleEntry{root, version, prefix}> }`（`resolve_roots(root, recursive,
+skip)` 构造，`recursive=false` 即今日平铺语义、`true` 即递归发现）：
+
+- **递归发现**（`scan_recursive`）：含 `manifest.yaml` 即命中并停止深入（模块根互不
+  嵌套）；跳过 `node_modules`/点目录、不跟随目录 symlink，深度/命中数有上限；
+  命中 0 个即报错（显式指定却空扫 = 配置错误，防 CI 假绿）。
+- **身份两名字**：`name` = 身份（产物目录/锁键/tgz/别名首段/位置参数），`prefix` = 仅
+  URL 前缀（缺省 = name，可含 `/`）。递归模式下 `name` 不再受「== 目录名」约束，故
+  name/version/prefix 在发现期即过白名单（它们进产物目录名与路由 pattern）。
+- **装配注入一次**：`StableState`/`Extras` 持 `Option<Arc<ModuleIndex>>`（默认 None =
+  今日语义），`RouteTable` 亦持一份；loader 的 `#/m/x` 解析、`serve`/`openapi` 的 dev
+  路由建表、`build_cmd`/`checks`/`manifest` 的目录发现全部走索引（OCP：消费者不重新
+  推导布局）。
+- **dev/release URL 一致**：dev 路由 pattern 由 `index.locate(file)` → 模块
+  `prefix` + 模块内相对目录拼出（`serve/src/routes.rs::dev_rel`），与 build 期
+  `rel_pattern` 同口径；不带 `--module-root` 时回退今日 `strip_prefix(root)`。
+- **S008**：模块根之下再出现 `manifest.yaml`（嵌套会改写别名锚点）→ `stray_manifests`
+  报错。
+
 ### import 解析细节（module_loader.rs）
 
 - `resolve_inner`：已是绝对 `file://` URL 直接返回（**不再 `ensure_within`**。这是信任模型：
@@ -408,7 +430,8 @@ release，否则 dev。命令与构建产物见 `./bin/oj --help` 与 [cli2.md](
   天然一致，不需要把 api 根路径穿透到装配点。别名路径禁 `..`/空段；引用方在 `node_modules`
   内不启用（不劫持第三方包的 `package.json#imports` 语义）；模块外（tests 目录 / 任务池）
   无锚点 → 明确报错。`oj build` 侧用**同一份探针**实化（见 `build_cmd::resolve_to_segs`），
-  故 dev/release 命中同一文件。
+  故 dev/release 命中同一文件。v0.1.85：`#/m/x` 的 `m` 经 `ModuleIndex` 按 **manifest
+  `name`** 解析（递归发现下与目录名脱钩）；命中即从尾路径消费首段再锚到该模块根。
 - `resolve_bare`（v0.1.30 重写）：裸 specifier 从当前文件目录逐级向上找
   `node_modules/<pkg>`（至 project root；**不 realpath**——pnpm 符号链接布局直读），
   按 `package.json` `exports` 封闭语义解析（条件对象/子路径键/`./x/*` 模式/数组 fallback；

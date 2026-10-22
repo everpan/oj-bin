@@ -18,6 +18,7 @@ use deno_core::{
 };
 
 use super::StableState;
+use super::module_scan::ModuleIndex;
 use super::transpile::cached_transpile;
 
 /// loader 共享配置（project_root 用于 node_modules 回溯上界与 CJS require）。
@@ -31,6 +32,9 @@ pub struct LoaderShared {
 /// 内部状态经 Arc 跨 actor 共享（转译缓存在 transpile 模块全局）。
 pub struct OjModuleLoader {
     pub inner: Arc<LoaderShared>,
+    /// 模块索引（`--module-root` 等可配置模块根布局下的发现结果）。空 = 今日布局
+    /// （源码树首层子目录 = 模块根），别名解析回落到「首段即模块目录名」。
+    pub module_index: Option<Arc<ModuleIndex>>,
 }
 
 impl deno_core::ModuleLoader for OjModuleLoader {
@@ -69,7 +73,13 @@ impl OjModuleLoader {
         } else if specifier.starts_with('#') && !under_node_modules(&ref_dir) {
             // 别名（`#` 模块根 / `#/` src 根）。node_modules 内的文件不启用——那是
             // 第三方包自己的 `#`（Node package.json#imports）语义，不劫持。
-            resolve_alias(specifier, &ref_dir, &self.inner.project_root, self.inner.ts)?
+            resolve_alias(
+                specifier,
+                &ref_dir,
+                &self.inner.project_root,
+                self.inner.ts,
+                self.module_index.as_deref(),
+            )?
         } else {
             resolve_bare(specifier, &ref_dir, &self.inner.project_root)?
         };
@@ -157,9 +167,15 @@ pub fn resolve_relative(base_dir: &Path, spec: &str, ts: bool) -> Result<PathBuf
 /// Windows 返回 `\\?\C:\...`，而 `ModuleSpecifier::to_file_path` 还原时**剥掉**该前缀，
 /// 二者词法前缀不一致会让 `module_root_of` 的 `starts_with(project_root)` 误判——此处
 /// 归一后再比。非 Windows 为 no-op。
+///
+/// **UNC 专项**：canonicalize 对网络共享返回 `\\?\UNC\server\share\...`。盲目剥
+/// `\\?\` 会得到 `UNC\server\share\...`——一个没有根锚的坏路径（`from_file_path`
+/// 建不出 URL、`starts_with` 全线失配）。verbatim UNC 的正确还原是 `\\server\share\...`。
 pub fn strip_verbatim(p: &Path) -> PathBuf {
     let s = p.as_os_str().to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
         PathBuf::from(rest)
     } else {
         p.to_path_buf()
@@ -199,8 +215,29 @@ pub(crate) fn try_symlink(target: &Path, link: &Path, dir: bool) -> bool {
 pub fn module_root_of(from_dir: &Path, root: &Path) -> Option<PathBuf> {
     // Windows：`canonicalize` 给出的 referrer 带 `\\?\`，project_root 可能不带（或反之），
     // 先归一再比，避免词法前缀不一致误判「未找到模块根」（见 alias_build_materializes_to_versioned_relative_paths）。
-    let from_dir = strip_verbatim(from_dir);
-    let root = strip_verbatim(root);
+    // 同理（且更常见）：referrer 来自 file URL（`versioned_specifier` 对模块路径先
+    // canonicalize 再建 URL，url crate 的 to_file_path 还原时剥掉 `\\?\`；macOS 上
+    // `/tmp` → `/private/tmp` 即此路径），而 project_root 常是原样 CLI/config 路径——
+    // **双侧 canonical 化**后比较，否则「明明在模块内」也会误判未找到。canonicalize 失败
+    // （目录不存在，如纯静态占位根 / 推演用的虚拟目录）→ 回落词法口径；此时若 root
+    // 已 canonical 化，把 from_dir 的词法前缀换成 canonical root，保证两侧同形态。
+    //
+    // **大小写**：Rust 的 starts_with/strip_prefix 按分量大小写敏感比较，而 Windows
+    // 文件系统大小写不敏感。本函数无需额外处理：成功侧两侧都来自 canonicalize
+    // （GetFinalPathNameByHandleW 给出磁盘真名，大小写天然一致）；词法回落侧 root 与
+    // from_dir 同源（同一 CLI/config 值派生的路径串，大小写逐字相同）。canonicalize
+    // 亦顺带归一 8.3 短名（`RUNNER~1` → 长名），两侧同走该口径。
+    let croot = std::fs::canonicalize(root)
+        .map(|p| strip_verbatim(&p))
+        .unwrap_or_else(|_| strip_verbatim(root));
+    let from_dir = match std::fs::canonicalize(from_dir) {
+        Ok(p) => strip_verbatim(&p),
+        Err(_) => strip_verbatim(from_dir)
+            .strip_prefix(strip_verbatim(root))
+            .map(|tail| croot.join(tail))
+            .unwrap_or_else(|_| strip_verbatim(from_dir)),
+    };
+    let root = croot;
     let mut cur = Some(from_dir.as_path());
     while let Some(d) = cur {
         if !d.starts_with(&root) {
@@ -222,14 +259,19 @@ fn under_node_modules(p: &Path) -> bool {
     p.components().any(|c| c.as_os_str() == "node_modules")
 }
 
-/// 别名解析：`#<path>` = 本模块根锚点；`#/<path>` = src 根锚点（首段须为模块目录名）。
+/// 别名解析：`#<path>` = 本模块根锚点；`#/<path>` = 模块索引锚点（首段 = **`manifest.name`**）。
 /// 后缀探针与相对导入同口径（复用 resolve_relative）。别名路径禁 `..`/空段/`\`
 /// ——纵深防御：别名不得借路径段逃逸锚点，也不与「相对导入逃逸即报错」语义分叉。
+///
+/// `index`：模块索引（可配置模块根布局下的发现结果）。**空 = 今日布局**，此时首段按
+/// 「src 根下的模块目录名」探测（行为逐字不变）；非空则首段一律按 `manifest.name` 解析
+/// ——模块根可不在首层后，「目录名 == 模块名」不再成立，锚点只能由索引给出。
 pub fn resolve_alias(
     spec: &str,
     from_dir: &Path,
     root: &Path,
     ts: bool,
+    index: Option<&ModuleIndex>,
 ) -> Result<PathBuf, String> {
     // release（ts=false）下别名不应存在：`oj build` 已把它们实化为版本目录相对路径，并断言
     // 产物内无残留 `#`。走到这里若"半可解析"（同模块命中、跨模块悬空）比直接报错更坏。
@@ -258,32 +300,70 @@ pub fn resolve_alias(
             root.display()
         )
     })?;
+    // `#/m/x` 的剩余段：锚点落在目标模块根时首段（模块名）已被消费，只留其后的路径；
+    // 锚点在 src 根时首段是目录名，须保留（今日布局下两者同值）。
+    let mut tail: &str = &segs.join("/");
     let anchor = if from_src_root {
-        let src_root = module_root.parent().ok_or_else(|| {
-            format!(
-                "module root {} has no parent (src root)",
-                module_root.display()
-            )
-        })?;
         let first = segs[0];
-        if !src_root.join(first).join("manifest.yaml").is_file() {
-            let known = module_names(src_root);
-            return Err(format!(
-                "cannot resolve alias '{spec}': 首段 {first:?} 不是模块目录（{} 下无 {first}/manifest.yaml）{}\n  \
-                 下一步：改用已存在的模块名，或把共享代码放进某个模块",
-                src_root.display(),
-                if known.is_empty() {
-                    String::new()
-                } else {
-                    format!("；现有模块：[{}]", known.join(", "))
+        // 索引优先：首段是模块名（`manifest.name`），锚点即该模块的模块根。
+        let by_name = index.and_then(|idx| idx.get(first));
+        let known = known_module_names(index, &module_root);
+        match by_name {
+            Some(e) => {
+                tail = rel[first.len()..].trim_start_matches('/');
+                if tail.is_empty() {
+                    return Err(format!(
+                        "cannot resolve alias '{spec}': `#/{first}` 只给了模块名，未指向模块内文件\n  \
+                         下一步：`#/{first}/<模块内相对路径>`"
+                    ));
                 }
-            ));
+                e.root.clone()
+            }
+            // 无索引（今日布局）→ 沿用「首段 = src 根下的模块目录名」探测。
+            None if index.is_none() => {
+                let src_root = module_root.parent().ok_or_else(|| {
+                    format!(
+                        "module root {} has no parent (src root)",
+                        module_root.display()
+                    )
+                })?;
+                if !src_root.join(first).join("manifest.yaml").is_file() {
+                    return Err(unknown_module_err(
+                        spec,
+                        first,
+                        &src_root.display().to_string(),
+                        &known,
+                    ));
+                }
+                src_root.to_path_buf()
+            }
+            None => return Err(unknown_module_err(spec, first, "模块索引", &known)),
         }
-        src_root.to_path_buf()
     } else {
         module_root
     };
-    resolve_relative(&anchor, &segs.join("/"), ts)
+    resolve_relative(&anchor, tail, ts)
+}
+
+/// 别名报错用的已知模块名：有索引取索引（= `manifest.name`），无索引回落到 src 根扫描。
+fn known_module_names(index: Option<&ModuleIndex>, module_root: &Path) -> Vec<String> {
+    if let Some(idx) = index {
+        return idx.names().cloned().collect();
+    }
+    module_root.parent().map(module_names).unwrap_or_default()
+}
+
+/// 「首段不是模块」的统一报错（下一步提示 + 现有模块清单）。
+fn unknown_module_err(spec: &str, first: &str, scope: &str, known: &[String]) -> String {
+    format!(
+        "cannot resolve alias '{spec}': 首段 {first:?} 不是模块名（{scope} 中没有它）{}\n  \
+         下一步：改用已存在的模块名（manifest.yaml 的 name），或把共享代码放进某个模块",
+        if known.is_empty() {
+            String::new()
+        } else {
+            format!("；现有模块：[{}]", known.join(", "))
+        }
+    )
 }
 
 /// src 根下含 manifest.yaml 的目录名（别名报错提示用；仅在错误路径调用）。
@@ -830,33 +910,92 @@ mod tests {
         let (root, deep) = alias_fx("ok");
         // 本模块根锚点：与目录深度无关。
         assert!(
-            resolve_alias("#_shared/validate", &deep, &root, true)
+            resolve_alias("#_shared/validate", &deep, &root, true, None)
                 .unwrap()
                 .ends_with("src/m1/_shared/validate.ts")
         );
         // 显式后缀（用户原话的 `import 'xxx.ts'` 形态）。
         assert!(
-            resolve_alias("#_shared/validate.ts", &deep, &root, true)
+            resolve_alias("#_shared/validate.ts", &deep, &root, true, None)
                 .unwrap()
                 .ends_with("validate.ts")
         );
         // 目录索引。
         assert!(
-            resolve_alias("#_shared/mod", &deep, &root, true)
+            resolve_alias("#_shared/mod", &deep, &root, true, None)
                 .unwrap()
                 .ends_with("mod/index.ts")
         );
         // src 根锚点（跨模块）。
         assert!(
-            resolve_alias("#/user/_shared/util", &deep, &root, true)
+            resolve_alias("#/user/_shared/util", &deep, &root, true, None)
                 .unwrap()
                 .ends_with("src/user/_shared/util.ts")
         );
         // 深目录与模块根等价（同模块）。
         assert_eq!(
-            resolve_alias("#_shared/validate", &deep, &root, true).unwrap(),
-            resolve_alias("#_shared/validate", &root.join("src/m1"), &root, true).unwrap()
+            resolve_alias("#_shared/validate", &deep, &root, true, None).unwrap(),
+            resolve_alias("#_shared/validate", &root.join("src/m1"), &root, true, None).unwrap()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 嵌套布局夹具：`src/foo/api`（name=m1）、`src/bar/api`（name=m2）。
+    /// 返回 (src 根, m1 内的深层目录)。
+    fn alias_fx_nested(tag: &str) -> (PathBuf, PathBuf) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "oj-alias-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let files: Vec<(String, String)> = vec![
+            (
+                "src/foo/api/manifest.yaml".into(),
+                "name: m1\ndesc: d\nversion: 0.1.0\n".into(),
+            ),
+            (
+                "src/bar/api/manifest.yaml".into(),
+                "name: m2\ndesc: d\nversion: 0.1.0\n".into(),
+            ),
+            (
+                "src/bar/api/_shared/util.ts".into(),
+                "export const u = 1;\n".into(),
+            ),
+        ];
+        for (rel, content) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        let deep = root.join("src/foo/api/a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        (root, deep)
+    }
+
+    /// BDD：模块根可不在首层（目录名 ≠ 模块名）时，`#/m/x` 仍按 `manifest.name` 解析——
+    /// 旧实现取 `module_root.parent()` 当 src 根，在嵌套布局下会算出 `src/apps` 而非
+    /// `src`，跨模块别名必然落空。
+    #[test]
+    fn given_nested_module_roots_when_alias_cross_module_then_resolves_by_manifest_name() {
+        // Given: 模块根在第二层，目录名与模块名无关
+        let (root, deep) = alias_fx_nested("nested");
+        let idx = crate::bridge::resolve_roots(&root.join("src"), true, None).unwrap();
+
+        // When: 从 m1 深层目录跨模块引用 m2（按 manifest.name，不是目录名）
+        let got = resolve_alias("#/m2/_shared/util", &deep, &root, true, Some(&idx)).unwrap();
+
+        // Then: 命中 m2 的模块根（目录名 foo/bar 不参与解析）
+        assert!(got.ends_with("bar/api/_shared/util.ts"), "{got:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Given 同上一例，但**不给索引**（今日布局）：`src/m1` 首段即模块名，行为不变。
+    #[test]
+    fn given_flat_tree_without_index_when_alias_cross_module_then_today_semantics() {
+        let (root, deep) = alias_fx("flat");
+        let got = resolve_alias("#/user/_shared/util", &deep, &root, true, None).unwrap();
+        assert!(got.ends_with("src/user/_shared/util.ts"), "{got:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -864,17 +1003,17 @@ mod tests {
     fn alias_errors_are_actionable() {
         let (root, deep) = alias_fx("err");
         // 未知模块名 → 列出实际存在的模块 + 下一步。
-        let e = resolve_alias("#/nope/x", &deep, &root, true).unwrap_err();
+        let e = resolve_alias("#/nope/x", &deep, &root, true, None).unwrap_err();
         assert!(
             e.contains("nope") && e.contains("m1") && e.contains("下一步"),
             "{e}"
         );
         // 目标不存在 → 列出尝试过的候选（resolve_relative 口径）。
-        let e = resolve_alias("#_shared/nope", &deep, &root, true).unwrap_err();
+        let e = resolve_alias("#_shared/nope", &deep, &root, true, None).unwrap_err();
         assert!(e.contains("tried"), "{e}");
         // 别名路径不得含空段 / `.` / `..` / `\`（纵深防御）。
         for bad in ["#../x", "#/user/../x", "#//x", "#_shared//x", "#a\\b", "#."] {
-            let e = resolve_alias(bad, &deep, &root, true).unwrap_err();
+            let e = resolve_alias(bad, &deep, &root, true, None).unwrap_err();
             assert!(e.contains("不得含"), "{bad}: {e}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -886,7 +1025,7 @@ mod tests {
         let root = fx(&[("tests/x.test.ts", "export const x = 1;\n")]);
         let outside = root.join("tests");
         assert!(module_root_of(&outside, &root).is_none());
-        let e = resolve_alias("#_shared/validate", &outside, &root, true).unwrap_err();
+        let e = resolve_alias("#_shared/validate", &outside, &root, true, None).unwrap_err();
         assert!(e.contains("manifest.yaml") && e.contains("相对路径"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -895,16 +1034,26 @@ mod tests {
     /// 覆盖（本机编不到也跑不了）。这里补一组平台无关断言：unix 上也编译运行，
     /// 让该函数的语义不再只能靠 Windows CI 兜底。
     ///
-    /// 已知缺口（登记项，本次不改）：UNC 形态 `\\?\UNC\server\share` 现实现剥成
-    /// `UNC\server\share`（错误语义）——网络盘 / UNC 部署场景才遇得到，属生产行为
-    /// 变更，需独立 spec（见 docs/plans/2026-10-18-exec-template-ambiguity-fixture-fix.md
-    /// 的复查登记节）。
+    /// UNC 专项（v0.1.85 销账）：`\\?\UNC\server\share` 曾盲目剥成
+    /// `UNC\server\share`（无根锚的坏路径，此前只在本用例的文档注释里登记为已知
+    /// 缺口）。`module_root_of` 双侧 canonicalize 后该形态走上主路径（UNC 部署 +
+    /// `#` 别名必踩），故本期修掉。
     #[test]
     fn strip_verbatim_is_prefix_only_and_platform_agnostic() {
         // 剥 verbatim 前缀（`\\?\`）。
         assert_eq!(
             strip_verbatim(Path::new(r"\\?\C:\a\b")),
             PathBuf::from(r"C:\a\b")
+        );
+        // UNC verbatim → 还原成标准 UNC（`\\server\share`），不是 `UNC\server\share`。
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\proj\src")),
+            PathBuf::from(r"\\server\share\proj\src")
+        );
+        // 已是标准 UNC → 原样（不递归剥）。
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\server\share\a")),
+            PathBuf::from(r"\\server\share\a")
         );
         // 无前缀 / unix 形态 → 原样返回。
         assert_eq!(
@@ -951,9 +1100,74 @@ mod tests {
     }
 
     #[test]
+    fn module_root_of_tolerates_symlinked_project_root() {
+        // 生产形态：referrer 来自 file URL（deno_core 已 realpath → /private/var/…），
+        // 而 project_root 是原样 CLI/config 路径（macOS 上含 /var → /private/var symlink，
+        // Windows 上可能是 subst/ junctions）——词法前缀比较会把「明明在模块内」误判成
+        // 未找到模块根（oj openapi --module-root 实测复现）。双侧 canonicalize 修复。
+        let (root, _deep) = alias_fx("symlink-root");
+        let canon = root.canonicalize().unwrap();
+        // 经符号链接访问项目根（链接名 ≠ 真实路径的最后一段）。
+        let link = std::env::temp_dir().join(format!(
+            "oj-alias-symlinked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        if !try_symlink(&canon, &link, true) {
+            eprintln!("skip: symlink unsupported on this host");
+            return;
+        }
+        let referrer_dir = canon.join("src/m1/a/b"); // deno_core 侧：realpath 形态
+        let project_root = link.clone(); // CLI/config 侧：经 symlink 的形态
+        let want = canon.join("src/m1");
+
+        assert_eq!(
+            module_root_of(&referrer_dir, &project_root),
+            Some(want),
+            "symlinked project_root vs realpath referrer 应命中模块根"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&link);
+    }
+
+    #[test]
+    fn module_root_of_tolerates_virtual_dir_under_symlinked_root() {
+        // 纯路径推演：referrer 目录**可以不存在**（`oj build` 的导入改写按目录串计算，
+        // 不落盘）——canonicalize(from_dir) 失败时不能直接把词法路径与已 canonical 化的
+        // root 混比（形态不一致 → 误判未找到）。按词法前缀换根，两侧保持同形态。
+        let (root, _deep) = alias_fx("virtual");
+        let canon = root.canonicalize().unwrap();
+        let link = std::env::temp_dir().join(format!(
+            "oj-alias-virtual-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        if !try_symlink(&canon, &link, true) {
+            eprintln!("skip: symlink unsupported on this host");
+            return;
+        }
+        // 经 symlink 的、且**不存在**的深层目录。
+        let virtual_dir = link.join("src/m1/a/b/not/created/yet");
+        assert_eq!(
+            module_root_of(&virtual_dir, &link),
+            Some(canon.join("src/m1")),
+            "虚拟目录 + symlink 根应仍命中模块根"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&link);
+    }
+
+    #[test]
     fn resolve_inner_enables_alias_only_outside_node_modules() {
         let (root, deep) = alias_fx("nm");
         let loader = OjModuleLoader {
+            module_index: None,
             inner: Arc::new(LoaderShared {
                 project_root: root.clone(),
                 ts: true,
@@ -985,7 +1199,7 @@ mod tests {
     #[test]
     fn alias_rejected_in_release_mode() {
         let (root, deep) = alias_fx("rel");
-        let e = resolve_alias("#_shared/validate", &deep, &root, false).unwrap_err();
+        let e = resolve_alias("#_shared/validate", &deep, &root, false, None).unwrap_err();
         assert!(e.contains("release") && e.contains("oj build"), "{e}");
         assert!(e.contains("相对路径"), "{e}");
         let _ = std::fs::remove_dir_all(&root);
@@ -1060,6 +1274,7 @@ mod tests {
         ]);
         let root = base.join("proj");
         let loader = OjModuleLoader {
+            module_index: None,
             inner: Arc::new(LoaderShared {
                 project_root: root.clone(),
                 ts: true,

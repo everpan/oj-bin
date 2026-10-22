@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use only_js::bridge::ModuleIndex;
+
 /// 目录镜像路由器。ts=true（--dev）找 api.ts，否则 api.js。
 #[derive(Clone)]
 pub struct Routes {
@@ -275,6 +277,9 @@ pub struct RouteTable {
     /// 首段 `<module>-<version>` 的版本后缀。dev 模块目录允许同形名（如
     /// `preview-0.9`），误剥会把 openapi tags / 生成客户端归错模块（v0.1.83）。
     release: bool,
+    /// 模块索引（`--module-root` 的递归发现结果；None = 今日首层语义）：模块归属与
+    /// URL 前缀都由它给，避免首段（目录名）被当成模块名（v0.1.85）。
+    modules: Option<ModuleIndex>,
 }
 
 const METHODS: [&str; 7] = ["get", "post", "put", "del", "patch", "head", "options"];
@@ -290,6 +295,7 @@ impl Default for RouteTable {
             files: Vec::new(),
             root: PathBuf::new(),
             release: false,
+            modules: None,
         }
     }
 }
@@ -299,10 +305,16 @@ impl RouteTable {
     /// 返回 (表, 失败/冲突清单)。纯逻辑（依赖倒置：不依赖 JS 运行时），
     /// CLI/测试注入真实或假内省。v0.1.64：链来自 `introspect_module` 的扁平 leaf
     /// （组前缀已在 JS 侧解析为有效路由）；动词取链尾，METHODS 白名单作纵深防线。
+    ///
+    /// `index`（仅 `--module-root` 下有值）：模块根可不在挂载根首层时，路由的模块段
+    /// 与模块内路径**只能**由索引给出（`dev_rel`）——否则 dev 会按挂载根拼出
+    /// `/{base}/foo/api/xxx/yyy`，而 release（`build_cmd::rel_pattern`）以模块根为基，
+    /// 两侧 URL 分叉。None = 今日语义（相对挂载 api 根，flat 布局下逐字等价）。
     pub fn build(
         base: &str,
         root: &Path,
         ts: bool,
+        index: Option<&ModuleIndex>,
         introspect: impl Fn(
             &Path,
         )
@@ -312,6 +324,7 @@ impl RouteTable {
         let mut failures = Vec::new();
         let mut t = RouteTable {
             root: root.to_path_buf(),
+            modules: index.cloned(),
             ..Default::default()
         };
         for file in api_files(root, ts) {
@@ -322,12 +335,7 @@ impl RouteTable {
                     continue;
                 }
             };
-            let rel = file
-                .parent()
-                .and_then(|p| p.strip_prefix(root).ok())
-                .unwrap_or(Path::new(""))
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = dev_rel(root, &file, index);
             // v0.1.27：fs 段 `_name_` → `{name}`（rel 已归一为正斜杠；逐段转换，含模块段）。
             let dir_base = if rel.is_empty() {
                 format!("/{b}")
@@ -579,13 +587,21 @@ impl RouteTable {
     /// 路由所属**模块名**（v0.1.70）：供 `oj openapi` 出 `tags`，下游据此把
     /// `__client` 分模块落盘（生成代码必须知道归属，光有 operationId 不够）。
     ///
-    /// - dev（`build` 建表）：`src/<module>/<...>/api.ts` 的首段**原样保留**；
+    /// - 有索引（`--module-root`）：归属由索引按最长前缀给出 —— 模块根可不在首层，
+    ///   首段是目录名（`foo`），而下游分组要的是 `manifest.yaml` 的 `name`（v0.1.85）；
+    /// - dev（无索引，`build` 建表）：`src/<module>/<...>/api.ts` 的首段**原样保留**；
     /// - release（`from_entries` 建表）：`routes.js` 的 `<module>-<version>/...`
     ///   首段剥掉版本后缀（v0.1.83 起仅 release 剥——dev 的 `preview-0.9` 这类
     ///   同形模块名此前被误剥成 `preview`）。
     ///
     /// 只剩一层（api 根的裸 `api.ts` / `api.js`）→ None（无模块归属）。
     pub fn module_of(&self, id: FileId) -> Option<String> {
+        if let Some(idx) = &self.modules {
+            // 索引认领该文件 → 模块名即身份（与 URL 前缀、产物目录同源）。
+            if let Some((name, _, _)) = idx.locate(self.file_path(id)) {
+                return Some(name.to_string());
+            }
+        }
         let rel = self.rel_file(id);
         let mut it = rel.components();
         let first = it.next()?.as_os_str().to_string_lossy().into_owned();
@@ -646,6 +662,40 @@ impl RouteTable {
         }
         out
     }
+}
+
+/// dev 路由的「模块内相对路径」（含 URL 前缀段；已归一为正斜杠）。
+///
+/// - 索引命中：`{prefix}/{模块根内目录}`——目录名（`foo/api`）不进 URL，模块段取
+///   `manifest.yaml` 的 `prefix`（缺省 = 模块名），与 release 的 `rel_pattern` 同源；
+/// - 索引缺失或未命中该文件（模块外的 `tasks/`、挂载根散文件）→ 今日语义：
+///   相对挂载 api 根（flat 布局下与上一条逐字等价）。
+fn dev_rel(root: &Path, file: &Path, index: Option<&ModuleIndex>) -> String {
+    let Some(idx) = index else {
+        return plain_rel(root, file);
+    };
+    let Some((_, e, rel)) = idx.locate(file) else {
+        return plain_rel(root, file);
+    };
+    let inner = rel
+        .parent()
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+    if inner.is_empty() {
+        e.prefix.clone()
+    } else {
+        format!("{}/{inner}", e.prefix)
+    }
+}
+
+/// 今日语义：api 文件所在目录相对挂载 api 根（flat 布局下模块名段即首段）。
+fn plain_rel(root: &Path, file: &Path) -> String {
+    file.parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// root 下全部 api 文件（排序 → 冲突裁决顺序确定）。
@@ -1103,7 +1153,7 @@ mod tests {
                 },
             ));
         }
-        RouteTable::build("/v1/api", &root, true, |p: &Path| {
+        RouteTable::build("/v1/api", &root, true, None, |p: &Path| {
             // 跨平台：file 路径在 Windows 用反斜杠，而 decls 的 key 用正斜杠，
             // 统一转正斜杠再查表，否则 Windows 下 key 不匹配 → 整表空注册。
             let key = p
@@ -1580,7 +1630,7 @@ mod tests {
     #[test]
     fn table_introspect_failure_skips_file() {
         let root = fixture(&["bad/api.ts", "good/api.ts"]);
-        let (t, f) = RouteTable::build("/v1/api", &root, true, |p: &Path| {
+        let (t, f) = RouteTable::build("/v1/api", &root, true, None, |p: &Path| {
             if p.ends_with("bad/api.ts") {
                 Err("syntax error".into())
             } else {

@@ -40,11 +40,16 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    可照抄代码见 `scenarios.md` 场景 28。
    **全文检索（不上 ES）→ §6「db.dialect」+ `src/_platform/_shared/search.ts`**
    （三引擎原生 FTS 统一面；ensureIndex 禁入 db.tx；sqlite 短词自动 LIKE 回退），可照抄
-   代码见 `scenarios.md` 场景 29。**内容版本化 / 历史 / diff / 回滚 →
+   代码见 `scenarios.md` 场景 29。   **内容版本化 / 历史 / diff / 回滚 →
    `src/_platform/_shared/versions.ts`**（CAS 去重 + UNIQUE 乐观锁 + 行级 diff；
    撞版本 409），见 `scenarios.md` 场景 30。
+   **模块要放任意深度目录 / monorepo 聚合 / URL 前缀要改名 → `--module-root`
+   + manifest `prefix`**（v0.1.85，递归发现，身份取 name），见 `scenarios.md` 场景 43。
 2. **脚手架**：模块 = `src/<模块名>/`（首层子目录），内放 `manifest.yaml`
    （`name` 必须等于目录名，违反启动失败）+ 子目录 `api.ts`。
+   **v0.1.85 起模块可放任意深度目录**：`oj serve/build --module-root <目录>` 在该子树
+   内递归发现 `manifest.yaml`，模块身份取 manifest 的 `name`（目录名只作定位）；
+   此时 `name` 不必等于目录名，URL 前缀由 manifest 可选 `prefix` 决定（缺省 = `name`）。
 3. **写 handler**：遵守下方红线；响应一律 `json.ok` / `json.fail` 统一返回。
 4. **测试**：先 L2 vitest 测逻辑（快，不起服务），再 L1 `oj test` 测端到端（真，连真实 DB）。
    两层都绿才算完（§9）。`oj test` 的写法走读（生命周期 / 测试库隔离 / 照抄样板 / 坑）
@@ -82,7 +87,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 - [ ] 响应全部走 `json.ok`/`json.fail`（重定向走 `json.redirect`，别用 `header`+`fail` 拼）；错误码符合 §7 场景表
 - [ ] SQL 全部参数化；动态标识符全部走构造器
 - [ ] 共享代码用别名（`#_shared/x` 本模块根 / `#/user/_shared/x` src 根），不再数 `../`；
-      跨模块别名已在 `manifest.deps` 声明；本地导入目标都是 `.ts`
+      跨模块别名已在 `manifest.deps` 声明；本地导入目标都是 `.ts`。
+      **跨模块导入首选 `#/m/x`**（`m` = 模块名，v0.1.85 起与目录名无关）——不随目录
+      结构调整失效，dev/release 同解析；相对路径留给目录固定且相邻的存量代码
 - [ ] 用了 `mail`？→ `smtp:` 段已配对应 profile，且 `allowed_from`/`allowed_recipients` **非空**
       （空表 fail-closed）；附件用 `{blobKey}`/`{path}` 引用而非内联
 - [ ] L2 + L1 测试跑过并全绿
@@ -98,7 +105,13 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | release 启动报 `illegal handler chain` | `routes.js` 的 `handler` 段非法（含 `/`、空段、`__proto__`/`constructor`/`prototype`，或段间多一个 `.`）——手改产物恢复或重新 `oj build`；嵌套上限 4 层、自引用在内省期即失败 |
 | 组 `.route` 挂了之后目录镜像 404 | 符合预期：组动词各自替换目录镜像（与顶层 `.route` 同语义）；要镜像可达就别挂 `.route` |
 | 端点该拆目录、用嵌套组还是平铺（选型） | 同实体多端点用嵌套组、**以实体对象为根**（组名=实体，子组=子资源）；端点独立演化/多人分权拆目录；≤3 个同形端点平铺——详见 api-manual §4「何时采用」与场景 31 |
-| 启动失败 manifest | `name` 与目录名不一致 |
+| 启动失败 manifest | `name` 与目录名不一致（仅平铺树 `-d`；`--module-root` 递归模式下 name 与目录名无关，v0.1.85） |
+| `-d` 与 `--module-root` 同时给报错（v0.1.85） | 两者都是「源码树根」，clap 层互斥（exit 2）——嵌套/任意深度布局用 `--module-root`，平铺树继续 `-d` |
+| `--module-root` 报 `no manifest.yaml under module root …`（v0.1.85） | 显式指定却命中 0 个 manifest → 非零退出（防 CI 假绿）。确认指向的是含 `<模块>/manifest.yaml` 的源码树根 |
+| `--module-root` 报 `is a release tree`（v0.1.85） | 指向了 build 产物（含 `manifests.yaml`）——`--module-root` 只认源码树；产物树用 `-d dist` |
+| `--module-root` 下 URL 不是预期路径 / 404（v0.1.85） | URL 前缀取 manifest 可选 `prefix`（缺省 = `name`），**不再由目录结构决定**：`<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`。核对 manifest 的 `prefix` 与 `name` |
+| 启动报 `url prefix '…' declared by both module …` / `illegal url prefix '…'`（v0.1.85） | 两个模块 URL 前缀相同（含默认 = name 撞车）→ 给一个加 `prefix` 改名；`prefix` 形状白名单：分段 `[A-Za-z0-9_-]`，禁空段/`.`/`..`/`\`/首尾斜杠 |
+| `#/m/x` 跨模块导入在 `--module-root` 下找不到（v0.1.85） | `m` 是 **manifest `name`** 不是目录名——嵌套布局下按 name 写（`#/user/_shared/x`），勿用目录名 |
 | postgres 占位符 | **0.1.67 起三引擎统一用 `?`**（宿主对 postgres 自动改写 `$n`）；存量 `$n` 继续有效（`$n`+`?` 混用按序号续接）。计数不匹配在 PG 上提前报 `placeholder count N != params M`；jsonb 存在性判断用 `jsonb_exists(doc,'key')`，**别写裸 `?` 运算符** |
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |

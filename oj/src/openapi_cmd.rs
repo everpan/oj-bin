@@ -9,7 +9,7 @@
 //! - 漂移校验对生成物与已提交 `openapi.json` 做**键序规范化**比较，不一致即非零退出
 //!   （CI 门禁），并打印重生成命令。
 
-use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry};
+use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, ModuleIndex, SchemaRegistry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,16 +18,27 @@ use std::sync::Arc;
 use crate::args::OpenApiArgs;
 
 /// 双模路由发现：dev(ts=true) 走 V8 内省；release(ts=false) 走 dist 直载。
+/// `index`（`--module-root` 下有值）：dev 侧路由的模块段与模块内路径由索引给出，
+/// 与 `serve` 装配（`app.rs`）同源——`oj openapi --check` 比的就是这两条路径的产物。
 pub fn discover_routes(
     dir: &Path,
     ts: bool,
     base: &str,
+    index: Option<&ModuleIndex>,
 ) -> Result<serve::routes::RouteTable, String> {
     if ts {
         // dev：与 serve 装配同构（app.rs 的 dev 分支）——自建最小 Bridge + bridge_introspector。
+        // v0.1.85：dev 侧的 ESM 别名（`#/m/x`）与 serve 装配同源——须把模块索引带进
+        // loader，否则内省时按目录名猜模块，跨模块 import 直接失败（与 app.rs dev 分支一致）。
+        let mi: Option<Arc<ModuleIndex>> = index.map(|i| Arc::new(i.clone()));
         let make = {
-            let root = dir.to_path_buf();
+            // project_root 须 canonicalize：referrer 来自 file URL（已 realpath），词法
+            // 前缀不一致会让 `module_root_of` 误判「未找到模块根」（macOS /tmp 实测）。
+            let root = only_js::bridge::strip_verbatim(
+                &dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+            );
             let ts_load = ts;
+            let mi = mi.clone();
             move || {
                 Bridge::with_dbs_and_loader(
                     HashMap::new(),
@@ -38,7 +49,10 @@ pub fn discover_routes(
                         project_root: root.clone(),
                         ts: ts_load,
                     })),
-                    Extras::default(),
+                    Extras {
+                        module_index: mi.clone(),
+                        ..Default::default()
+                    },
                 )
             }
         };
@@ -46,6 +60,7 @@ pub fn discover_routes(
             base,
             dir,
             ts,
+            index,
             serve::routes::bridge_introspector(make),
         );
         if !failures.is_empty() {
@@ -69,7 +84,10 @@ pub fn discover_routes(
         ));
     }
     let make = {
-        let root = dir.to_path_buf();
+        // 同 dev 分支：canonicalize 对齐 referrer 的 realpath 形态。
+        let root = only_js::bridge::strip_verbatim(
+            &dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+        );
         let ts_load = ts;
         move || {
             Bridge::with_dbs_and_loader(
@@ -282,16 +300,23 @@ fn envelope_schema(data: &Value) -> Value {
 
 /// 命令入口：生成或漂移校验。返回进程退出码（0 成功 / 1 漂移或错误）。
 pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
-    let (_cfg, _top, _config_dir, dir, ts, base) = crate::serve_cmd::load_app_config(
+    let loaded = crate::serve_cmd::load_app_config(
         a.config.as_deref(),
         a.site.as_deref(),
         a.dir.as_deref(),
         a.base.as_deref(),
         true,
-    )
-    .map_err(|e| format!("oj openapi: {e}"))?;
+        a.module_root.as_deref(),
+    )?;
+    let crate::serve_cmd::AppConfig {
+        dir,
+        ts,
+        base,
+        module_index,
+        ..
+    } = loaded;
 
-    let table = discover_routes(&dir, ts, &base)?;
+    let table = discover_routes(&dir, ts, &base, module_index.as_deref())?;
     let spec = generate(&table, &base)?;
     let explicit_out = a.out.is_some();
     let out_path: PathBuf = a
@@ -551,7 +576,7 @@ mod tests {
         .unwrap();
         let root = dir.clone();
         let rc = root.clone();
-        let (t, _fail) = RouteTable::build("/v1/api", &root, true, move |f: &Path| {
+        let (t, _fail) = RouteTable::build("/v1/api", &root, true, None, move |f: &Path| {
             let rel = f
                 .strip_prefix(&rc)
                 .unwrap()
@@ -983,7 +1008,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("user/broken")).unwrap();
         std::fs::write(dir.join("user/broken/api.ts"), "this is not ?? valid ts").unwrap();
-        let err = match discover_routes(&dir, true, "/v1/api") {
+        let err = match discover_routes(&dir, true, "/v1/api", None) {
             Ok(_) => panic!("dev 内省失败须报错退出（fail-fast）"),
             Err(e) => e,
         };

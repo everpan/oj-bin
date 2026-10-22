@@ -26,8 +26,8 @@ use only_js::bridge::mail::{FfiMailBackend, MailBackend, MailConfig};
 use only_js::bridge::mq::MqInstance;
 use only_js::bridge::plugin_loader::kv_backend_connect;
 use only_js::bridge::{
-    Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, NamedRegistry,
-    SchemaRegistry,
+    Bridge, EsBackend, Extras, InMemoryKV, JwtCfg, KVStore, LoaderShared, ModuleCtx, ModuleIndex,
+    NamedRegistry, SchemaRegistry,
 };
 use only_js::bridge::{EventBroker, SqlGuard, StableState};
 use only_js::config::{self, Config};
@@ -401,6 +401,7 @@ async fn build_schema_and_modules(
     trees: &[(PathBuf, bool)],
     guard: SqlGuard,
     shared_allow: &[String],
+    module_index: Option<&ModuleIndex>,
 ) -> Result<
     (
         SchemaRegistry,
@@ -414,7 +415,7 @@ async fn build_schema_and_modules(
     let mut module_owner: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
     for (dir, ts) in trees {
-        for (name, mdir) in manifest::discover(dir, *ts)? {
+        for (name, mdir) in manifest::discover(dir, *ts, module_index)? {
             if let Some(prev) = module_owner.get(&name) {
                 return Err(format!(
                     "module {name:?} declared in multiple places ({} and {}) — module names must be unique across api mounts",
@@ -493,6 +494,7 @@ pub(crate) fn build_platform_grants(
     fs_grant: &Option<Arc<only_js::bridge::fs::FsGrant>>,
     trees: &[(PathBuf, bool)],
     installed: &std::collections::HashSet<String>,
+    module_index: Option<&ModuleIndex>,
 ) -> Result<PlatformGrants, String> {
     let Some(p) = &cfg.platform else {
         return Ok((None, None));
@@ -543,7 +545,7 @@ pub(crate) fn build_platform_grants(
             )
         })?;
         Some(
-            crate::manifest::discover(troot, *tts)?
+            crate::manifest::discover(troot, *tts, module_index)?
                 .into_iter()
                 .map(|(n, _)| n)
                 .collect(),
@@ -1047,6 +1049,10 @@ pub async fn assemble_backend(
     // 同一 Arc，槽指针构造期冻结、内容后填）；None = 空槽（oj test / exec / 嵌入式
     // 零接线，op 报 reload not available，fail-closed）。
     reload_slot: Option<Arc<only_js::bridge::reload_bridge::ReloadSlot>>,
+    // 模块索引（v0.1.85 `--module-root`）：None = 今日布局（源树首层子目录 = 模块根）。
+    // 装配期构造一次，注入 StableState 与 Extras——运行期别名、schema 归属、迁移、
+    // 路由共用同一份判定。
+    module_index: Option<Arc<ModuleIndex>>,
 ) -> Result<Backend, String> {
     // PR-4：单 isolate 堆限额（u64 copy 提前取出，避免闭包借用 &Config）。
     let js_heap_limit = Some(cfg.server.js_heap_limit_bytes as usize);
@@ -1164,15 +1170,26 @@ pub async fn assemble_backend(
     let ownership_deny = ownership_deny_of(cfg)?;
     let sql_guard = sql_guard_of(cfg);
     // §4.8 归属图 + SchemaRegistry 复活。
-    let (registry, modules) =
-        build_schema_and_modules(trees, sql_guard, &cfg.tenant.shared_allow).await?;
+    let (registry, modules) = build_schema_and_modules(
+        trees,
+        sql_guard,
+        &cfg.tenant.shared_allow,
+        module_index.as_deref(),
+    )
+    .await?;
     // platform 段装配（ojm 批次）：受控挂载根校验 + 抢注防护（特权名 ∩ 安装树
     // 模块名，豁免受控根产物 → fail-fast）+ grants 冻结。必须在
     // build_schema_and_modules 之后——安装树模块名集合取自其产物。
     let installed: std::collections::HashSet<String> =
         modules.values().map(|m| m.name.clone()).collect();
-    let (platform_grant, exec_grant) =
-        build_platform_grants(cfg, config_dir, &fs_grant, trees, &installed)?;
+    let (platform_grant, exec_grant) = build_platform_grants(
+        cfg,
+        config_dir,
+        &fs_grant,
+        trees,
+        &installed,
+        module_index.as_deref(),
+    )?;
     // 鉴权：守卫由 oj-auth 插件提供（缺插件 fail-fast 已在 build_registries 完成）；
     // jwt 原语配置注入 bridge Extras（JS 端点 jwt.sign/verify 用）。
     let auth: Option<Arc<dyn only_js::bridge::AuthGuard>> = match &cfg.auth {
@@ -1277,6 +1294,8 @@ pub async fn assemble_backend(
         // platform/exec grants（ojm 批次；下方 build_platform_grants 产物，同一 Arc）。
         let platform_grant = platform_grant.clone();
         let exec_grant = exec_grant.clone();
+        // 模块索引（v0.1.85）：闭包带走副本，与 StableState.module_index 同一 Arc。
+        let module_index = module_index.clone();
         // 热更触发槽（ojm PR-3）：闭包带走副本，与 StableState.reload 同一 Arc。
         let reload_slot = reload_slot.clone();
         // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 oj_info 仍供 StableState 使用）。
@@ -1289,6 +1308,7 @@ pub async fn assemble_backend(
                 false,
                 Some(loader.clone()),
                 Extras {
+                    module_index: module_index.clone(),
                     blobs: blobs.clone(),
                     es: es.clone(),
                     bus: Some(bus.clone()),
@@ -1341,6 +1361,7 @@ pub async fn assemble_backend(
         dbs: dbs.clone(),
         registry: Arc::new(registry),
         loader: Some(loader.clone()),
+        module_index: module_index.clone(),
         blobs: blobs
             .clone()
             .unwrap_or_else(|| Arc::new(BlobRegistry::new())),
@@ -1409,6 +1430,10 @@ impl App {
         // → Extras/StableState（同一 Arc，槽位后填）。热更复用路径不重建 Extras——
         // 复用的 Backend 已持有同一槽 Arc，槽内容跨代持续有效；形参仅为签名统一。
         reload_slot: Option<Arc<only_js::bridge::reload_bridge::ReloadSlot>>,
+        // 模块索引（v0.1.85 `--module-root`）：None = 今日布局（源树首层子目录 = 模块根）。
+        // 装配期构造一次并注入 StableState / Extras —— 运行期别名、schema 归属、迁移、
+        // seed、路由共用同一份「哪个目录是模块」的判定。
+        module_index: Option<Arc<ModuleIndex>>,
     ) -> Result<App, String> {
         // 挂载解析（v0.1.58）：结构校验（程序化构造的 cfg 不经 load 层，这里兜底）→
         // 归一 / canonicalize / 逐条目 dev-release（规则 4）。primary = 第一条 api 挂载
@@ -1454,6 +1479,7 @@ impl App {
                     ts,
                     profiles,
                     reload_slot,
+                    module_index.clone(),
                 )
                 .await?,
             ),
@@ -1493,12 +1519,20 @@ impl App {
                 // v0.1.58 多挂载：逐 api 树 apply + reconcile（同一目标库；表名冲突由
                 // build_schema_and_modules 的 S002 先行拦截，走不到这里）。
                 for (tdir, tts) in &trees {
-                    crate::migrate::apply_all(stable.dbs.get(db_key), tdir, *tts, false).await?;
+                    crate::migrate::apply_all(
+                        stable.dbs.get(db_key),
+                        tdir,
+                        *tts,
+                        false,
+                        module_index.as_deref(),
+                    )
+                    .await?;
                     for l in crate::schema::reconcile_all(
                         stable.dbs.get(db_key).map(|a| a.as_ref()),
                         tdir,
                         *tts,
                         db_key,
+                        module_index.as_deref(),
                     )
                     .await?
                     {
@@ -1508,7 +1542,13 @@ impl App {
             }
             "verify" => {
                 for (tdir, tts) in &trees {
-                    crate::migrate::verify_all(stable.dbs.get(db_key), tdir, *tts).await?;
+                    crate::migrate::verify_all(
+                        stable.dbs.get(db_key),
+                        tdir,
+                        *tts,
+                        module_index.as_deref(),
+                    )
+                    .await?;
                 }
             }
             "off" => {}
@@ -1522,13 +1562,14 @@ impl App {
         // （种子是一次性初始化，重载不应再灌库，§5 ②）。
         if !reused {
             for (tdir, _) in &trees {
-                crate::seed::replay_all(stable.dbs.get(db_key), tdir).await?;
+                crate::seed::replay_all(stable.dbs.get(db_key), tdir, module_index.as_deref())
+                    .await?;
             }
         }
         // fixtures/ 演示数据（§4.5）：仅 oj test（fixtures=true）灌入；server 不灌。
         if fixtures {
             for (tdir, tts) in &trees {
-                let modules = crate::manifest::discover(tdir, *tts)?;
+                let modules = crate::manifest::discover(tdir, *tts, module_index.as_deref())?;
                 crate::migrate_cmd::load_fixtures(stable.dbs.get(db_key), &modules).await?;
             }
         }
@@ -1549,13 +1590,16 @@ impl App {
                 None => unreachable!("filtered above"),
             };
             let (table, mount_failures) = if mts {
-                for md in manifest::load_modules(mdir, Some(&cfg.tasks.dir))? {
+                for md in
+                    manifest::load_modules(mdir, Some(&cfg.tasks.dir), module_index.as_deref())?
+                {
                     eprintln!("module {} v{} — {}", md.name, md.version, md.desc);
                 }
                 routes::RouteTable::build(
                     prefix,
                     mdir,
                     mts,
+                    module_index.as_deref(),
                     routes::bridge_introspector(make_bridge.clone()),
                 )
             } else {
@@ -2118,7 +2162,7 @@ mod tests {
         let installed: std::collections::HashSet<String> = trees
             .iter()
             .flat_map(|(r, ts)| {
-                crate::manifest::discover(r, *ts)
+                crate::manifest::discover(r, *ts, None)
                     .unwrap()
                     .into_iter()
                     .map(|(n, _)| n)
@@ -2138,7 +2182,7 @@ mod tests {
             platform: Some(pcfg(vec!["inst"], None)),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap_err();
         assert!(e.contains("platform.root is missing"), "{e}");
 
         // ② root 未挂载为 api mount（trees 不含）→ Err（归属/路由无从产生）。
@@ -2146,7 +2190,7 @@ mod tests {
             platform: Some(pcfg(vec!["inst"], Some("./platform-modules"))),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &[(dist.clone(), true)], &installed)
+        let e = build_platform_grants(&cfg, &dir, &None, &[(dist.clone(), true)], &installed, None)
             .unwrap_err();
         assert!(e.contains("must be mounted as an api mount"), "{e}");
 
@@ -2160,7 +2204,7 @@ mod tests {
         .unwrap();
         let nested_trees = vec![(dir.join("deploy/deploy-dist"), true)];
         let installed_nested: std::collections::HashSet<String> =
-            crate::manifest::discover(&dir.join("deploy/deploy-dist"), true)
+            crate::manifest::discover(&dir.join("deploy/deploy-dist"), true, None)
                 .unwrap()
                 .into_iter()
                 .map(|(n, _)| n)
@@ -2169,8 +2213,8 @@ mod tests {
             platform: Some(pcfg(vec!["ojm-installer"], Some("./deploy"))),
             ..Default::default()
         };
-        let e =
-            build_platform_grants(&cfg, &dir, &None, &nested_trees, &installed_nested).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &nested_trees, &installed_nested, None)
+            .unwrap_err();
         assert!(
             e.contains("must not overlap another api mount")
                 && e.contains("anti-squatting tripwire"),
@@ -2183,7 +2227,7 @@ mod tests {
             platform: Some(pcfg(vec!["inst"], Some("./dist/sub"))),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap_err();
         assert!(e.contains("must not overlap another api mount"), "{e}");
 
         // ③ 抢注：特权名在安装树（dist）且不在受控根产物中 → Err 点名。
@@ -2191,7 +2235,7 @@ mod tests {
             platform: Some(pcfg(vec!["ojm-installer"], Some("./platform-modules"))),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap_err();
         assert!(
             e.contains("platform module 'ojm-installer' must not come from an install tree"),
             "{e}"
@@ -2202,7 +2246,7 @@ mod tests {
             platform: Some(pcfg(vec!["inst", "ghost"], Some("./platform-modules"))),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap_err();
         assert!(
             e.contains("platform module 'ghost' is not deployed under platform.root"),
             "{e}"
@@ -2226,7 +2270,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap();
+        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap();
         let pg = pg.expect("platform grant present");
         assert!(pg.modules.contains("inst"));
         assert!(
@@ -2245,7 +2289,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap_err();
+        let e = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap_err();
         assert!(
             e.contains("platform.trusted_paths canonicalize failed"),
             "{e}"
@@ -2266,7 +2310,7 @@ mod tests {
             ..Default::default()
         };
         let (pg, _) =
-            build_platform_grants(&cfg, &dir, &Some(fs_grant), &trees, &installed).unwrap();
+            build_platform_grants(&cfg, &dir, &Some(fs_grant), &trees, &installed, None).unwrap();
         let pg = pg.unwrap();
         assert!(pg.trusted.contains(&fs_root.canonicalize().unwrap()));
         assert!(
@@ -2319,7 +2363,7 @@ mod tests {
         let installed: std::collections::HashSet<String> = trees
             .iter()
             .flat_map(|(r, ts)| {
-                crate::manifest::discover(r, *ts)
+                crate::manifest::discover(r, *ts, None)
                     .unwrap()
                     .into_iter()
                     .map(|(n, _)| n)
@@ -2348,7 +2392,7 @@ mod tests {
         };
 
         // 缺省 fs grant（fs: 未配置）→ 装配不应 fail-fast，且特权集合含 ojm-demo。
-        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed).unwrap();
+        let (pg, eg) = build_platform_grants(&cfg, &dir, &None, &trees, &installed, None).unwrap();
         let pg = pg.expect("platform grant present");
         assert!(pg.modules.contains("ojm-demo"));
         assert!(
@@ -2429,6 +2473,7 @@ mod tests {
             "/v1/api",
             true,
             &ResourceProfiles::default(),
+            None,
             None,
         )
         .await
@@ -2656,7 +2701,7 @@ mod tests {
             .unwrap();
         }
         let trees = vec![(dirs[0].clone(), true), (dirs[1].clone(), true)];
-        let e = build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
+        let e = build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[], None)
             .await
             .err()
             .unwrap_or_else(|| panic!("expected cross-tree dup error"));
@@ -2664,7 +2709,7 @@ mod tests {
         // 同一树两份没问题（不触发跨树重名）。
         let trees = vec![(dirs[0].clone(), true)];
         assert!(
-            build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[])
+            build_schema_and_modules(&trees, only_js::bridge::SqlGuard::Off, &[], None)
                 .await
                 .is_ok()
         );
@@ -2703,6 +2748,7 @@ mod tests {
             "/v1/api",
             true,
             &ResourceProfiles::default(),
+            None,
             None,
         )
         .await

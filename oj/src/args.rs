@@ -15,6 +15,9 @@ pub struct ServeArgs {
     /// 后端 API 目录（src 源码树或 oj build 产物 dist），相对 CWD；模式按目录内容
     /// 自动判定。None → server 不开 API 功能（须配置静态站点，否则拒绝启动）。
     pub api_path: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// 静态站点目录（相对 CWD）；可重复（v0.1.27）。裸 `dir` = 覆盖 config 的主站点
     /// server.app_path（至多一次）；`prefix=dir` = 覆盖/新增 server.static_sites 中
     /// 该前缀的条目（CLI 优先）。
@@ -42,6 +45,9 @@ pub struct TestArgs {
     pub site: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// 测试用例目录：绝对路径原样；相对 → 相对 config_dir（项目根）。默认 "tests"。
     pub tests: Option<String>,
     /// 报告格式：human（默认，可读摘要）/ tap / junit / json，便于 CI 统一收口。
@@ -82,6 +88,9 @@ pub struct BuildArgs {
     /// 配置文件（读 tasks.dir 决定镜像目录名；缺文件回落默认 "tasks"）。
     pub config: Option<String>,
     pub dir: String,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     pub out: String,
     /// 转译产物 minify（swc 全量压缩 + 函数内局部变量名混淆）。默认开；
     /// `--no-minify` 排障逃生门（多行可读产物）。
@@ -105,6 +114,9 @@ pub struct OpenApiArgs {
     pub site: Option<String>,
     /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
     pub base: Option<String>,
     /// 只校验漂移：生成物与已提交 openapi.json 比对，不一致非零退出（CI 门禁）
@@ -118,6 +130,9 @@ pub struct MigrateArgs {
     pub site: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// 存量库接入门：全部迁移记为已应用而不执行（P0 建过表的库，Q5）。
     pub baseline: bool,
     /// 只迁移指定模块。裸模块名精确匹配（现状）；未命中时按 dist 版本目录名
@@ -137,6 +152,9 @@ pub struct FixtureArgs {
     /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
     pub site: Option<String>,
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// 只灌指定模块。
     pub module: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
@@ -209,6 +227,9 @@ pub struct SchemaDiffArgs {
     pub config: Option<String>,
     /// None → 默认目录（自 config 同级向上逐级搜：每层 src 优先、dist 次之）；模式按目录内容自动判定。
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     /// 目标库：config `db:` 段的 profile 名（None → "default"）。未声明的库名 fail-fast。
     pub db: Option<String>,
 }
@@ -227,6 +248,9 @@ pub struct ExecArgs {
     /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
     pub site: Option<String>,
     pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块（模块名取
+    /// `manifest.yaml` 的 name）；None = 今日语义（`-d`/`--api-path` 首层子目录 = 模块根）。
+    pub module_root: Option<String>,
     pub db: Option<String>,
     /// redis 命名 profile（config.redis 段）选为默认源；缺省 default；未声明 fail-fast。
     pub redis: Option<String>,
@@ -280,6 +304,11 @@ enum Commands {
         /// 静态站点（server.app_path / --app-path）则拒绝启动。
         #[arg(long = "api-path")]
         api_path: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "api_path")]
+        module_root: Option<String>,
         /// 静态站点目录（相对 CWD；可重复，v0.1.27）：裸 `dir` 覆盖 config 的
         /// server.app_path（至多一次）；`prefix=dir`（如 `--app-path /docs=dist/docs`）
         /// 覆盖/新增 server.static_sites 中该前缀的条目（CLI 优先于 config）。
@@ -311,6 +340,11 @@ enum Commands {
         /// 源码目录
         #[arg(short, long, default_value = "src")]
         dir: String,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 产物目录
         #[arg(short, long, default_value = "dist")]
         out: String,
@@ -336,6 +370,11 @@ enum Commands {
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
         #[arg(long)]
         db: Option<String>,
@@ -364,6 +403,11 @@ enum Commands {
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 测试用例目录（默认 tests）；相对 config_dir（项目根）
         #[arg(short, long)]
         tests: Option<String>,
@@ -438,6 +482,11 @@ enum Commands {
         /// 服务目录（schema 白名单来源）；缺省自动探测（src 优先 dist 次之）
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 字面 "default" 的库调用重定向到该库（未声明即 fail-fast）
         #[arg(long)]
         db: Option<String>,
@@ -484,6 +533,11 @@ enum Commands {
         /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
         #[arg(short, long)]
         base: Option<String>,
@@ -516,6 +570,11 @@ pub enum TestSub {
         /// 服务目录；模式自动判定。默认：src 目录存在取 src，否则 dist
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
         #[arg(long)]
         db: Option<String>,
@@ -575,6 +634,11 @@ pub enum SchemaCmd {
         /// 服务目录（模式自动判定）；缺省自 config 同级向上逐级搜，src 优先、dist 次之
         #[arg(short, long)]
         dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`，命中即停；
+        /// 后端模块名取 `manifest.yaml` 的 `name`（目录名只作定位，不参与身份）。
+        /// 与 `-d` 互斥——两者都是「源码树根」，同时给即报错。
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
         /// 目标库（整轮）：config `db:` 段的 profile 名，缺省 default；未声明即 fail-fast
         #[arg(long)]
         db: Option<String>,
@@ -595,6 +659,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             base,
             api_path,
+            module_root,
             app_path,
             cert_path,
             key_path,
@@ -604,6 +669,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             base,
             api_path,
+            module_root,
             app_path,
             cert_path,
             key_path,
@@ -614,6 +680,7 @@ fn to_command(cli: Cli) -> Command {
             module,
             config,
             dir,
+            module_root,
             out,
             no_minify,
             check,
@@ -622,6 +689,7 @@ fn to_command(cli: Cli) -> Command {
             module,
             config,
             dir,
+            module_root,
             out,
             minify: !no_minify,
             check,
@@ -632,6 +700,7 @@ fn to_command(cli: Cli) -> Command {
             base,
             site,
             dir,
+            module_root,
             tests,
             format,
             output,
@@ -650,6 +719,7 @@ fn to_command(cli: Cli) -> Command {
                 base,
                 site,
                 dir,
+                module_root,
                 tests,
                 format,
                 output,
@@ -666,12 +736,14 @@ fn to_command(cli: Cli) -> Command {
                 config,
                 site,
                 dir,
+                module_root,
                 db,
                 module,
             }) => Command::Test(TestCmd::Fixture(FixtureArgs {
                 config,
                 site,
                 dir,
+                module_root,
                 module,
                 db,
             })),
@@ -680,6 +752,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             db,
             baseline,
             module,
@@ -688,14 +761,26 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             baseline,
             module,
             db,
             format,
         }),
         Commands::Schema {
-            command: SchemaCmd::Diff { config, dir, db },
-        } => Command::SchemaDiff(SchemaDiffArgs { config, dir, db }),
+            command:
+                SchemaCmd::Diff {
+                    config,
+                    dir,
+                    module_root,
+                    db,
+                },
+        } => Command::SchemaDiff(SchemaDiffArgs {
+            config,
+            dir,
+            module_root,
+            db,
+        }),
         Commands::Secret {
             command:
                 SecretCmd::Keygen {
@@ -721,6 +806,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             db,
             redis,
             blob,
@@ -737,6 +823,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             db,
             redis,
             blob,
@@ -751,6 +838,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             base,
             check,
             out,
@@ -758,6 +846,7 @@ fn to_command(cli: Cli) -> Command {
             config,
             site,
             dir,
+            module_root,
             base,
             check,
             out,
@@ -837,6 +926,55 @@ mod tests {
                 && a.kafka.is_none()
                 && a.rabbit.is_none()
         );
+    }
+
+    /// BDD（v0.1.85）：`--module-root` 与 `-d`/`--api-path` 都是「源码树根」，
+    /// 同时给必须由 clap 挡下（exit 2），不能靠后到者静默覆盖前者。
+    #[test]
+    fn given_both_dir_and_module_root_when_parse_then_conflict_error() {
+        let cli =
+            |argv: &[&str]| Cli::try_parse_from(std::iter::once("oj").chain(argv.iter().copied()));
+        // build：`-d` 有 default_value="src"，仅显式给出才算冲突。
+        let e = cli(&["build", "-d", "src", "--module-root", "src"]).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{e}");
+        // serve：与 --api-path 互斥。
+        let e = cli(&[
+            "serve",
+            "-c",
+            "c.yaml",
+            "--api-path",
+            "src",
+            "--module-root",
+            "src",
+        ])
+        .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{e}");
+        // openapi / migrate / test / schema diff 同口径。
+        for cmd in [
+            vec!["openapi", "-d", "src"],
+            vec!["migrate", "-d", "src"],
+            vec!["test", "-d", "src"],
+            vec!["schema", "diff", "-d", "src"],
+        ] {
+            let mut argv = cmd.clone();
+            argv.extend(["--module-root", "src"]);
+            let e = cli(&argv).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::ArgumentConflict, "{argv:?}: {e}");
+        }
+    }
+
+    /// BDD：`--module-root` 单给可解析（default_value 的 `-d` 不触发冲突）。
+    #[test]
+    fn given_only_module_root_when_parse_then_reaches_subcommand_args() {
+        let Command::Build(a) = cmd(&["build", "--module-root", "src", "-o", "dist"]) else {
+            panic!()
+        };
+        assert_eq!(a.module_root.as_deref(), Some("src"));
+        let Command::Serve(a) = cmd(&["serve", "-c", "c.yaml", "--module-root", "src"]) else {
+            panic!()
+        };
+        assert_eq!(a.module_root.as_deref(), Some("src"));
+        assert!(a.api_path.is_none());
     }
 
     #[test]

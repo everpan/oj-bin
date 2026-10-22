@@ -2376,6 +2376,7 @@ pub(crate) mod tests {
             base,
             &root,
             ts,
+            None,
             crate::routes::bridge_introspector(make),
         );
         if !failures.is_empty() {

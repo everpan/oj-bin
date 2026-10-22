@@ -8,7 +8,7 @@ use std::sync::Arc;
 use only_js::bridge::DataAccessor;
 
 use crate::args::{FixtureArgs, MigrateArgs, SchemaDiffArgs};
-use crate::serve_cmd::{Registries, assemble_plugins, connect_dbs, load_app_config};
+use crate::serve_cmd::{AppConfig, Registries, assemble_plugins, connect_dbs, load_app_config};
 
 /// 瘦身装配产物：目标库句柄（`--db` 选定的 config profile）+ 模块列表（可被 `--module` 过滤）。
 struct Slim {
@@ -23,9 +23,18 @@ async fn slim(
     dir_override: Option<&str>,
     module: Option<&str>,
     db: Option<&str>,
+    module_root: Option<&str>,
 ) -> Result<Slim, String> {
-    let (cfg, top, config_dir, dir, ts, _base) =
-        load_app_config(config, site, dir_override, None, true)?;
+    let loaded = load_app_config(config, site, dir_override, None, true, module_root)?;
+    let AppConfig {
+        cfg,
+        top,
+        config_dir,
+        dir,
+        ts,
+        module_index,
+        ..
+    } = loaded;
     // 迁移/fixtures 作用于 api 目录下的 SQL；强依赖 api 目录（无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(
@@ -55,7 +64,7 @@ async fn slim(
         })?
         .clone();
     tracing::info!(db = key, "target db selected");
-    let mut modules = crate::manifest::discover(&dir, ts)?;
+    let mut modules = crate::manifest::discover(&dir, ts, module_index.as_deref())?;
     if let Some(m) = module {
         // 定向匹配两级：① 裸模块名精确匹配（现状保持）；② 未命中时按 dist 版本
         // 目录名 `<module>-<version>` 定向（release 锁聚合形态 `<dir>/<m>-<v>/`；
@@ -259,6 +268,7 @@ pub async fn run_migrate(a: &MigrateArgs) -> Result<(), String> {
         a.dir.as_deref(),
         a.module.as_deref(),
         a.db.as_deref(),
+        a.module_root.as_deref(),
     )
     .await
     {
@@ -316,6 +326,7 @@ pub async fn run_fixture(a: &FixtureArgs) -> Result<(), String> {
         a.dir.as_deref(),
         a.module.as_deref(),
         a.db.as_deref(),
+        a.module_root.as_deref(),
     )
     .await?;
     let n = load_fixtures(Some(&s.target), &s.modules).await?;
@@ -332,6 +343,7 @@ pub async fn run_schema_diff(a: &SchemaDiffArgs) -> Result<(), String> {
         a.dir.as_deref(),
         None,
         a.db.as_deref(),
+        a.module_root.as_deref(),
     )
     .await?;
     let mut mods = Vec::new();
@@ -538,6 +550,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -552,6 +565,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -564,6 +578,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             module: None,
             db: None,
         })
@@ -574,6 +589,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: Some("ghost".into()),
             db: None,
@@ -599,6 +615,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: Some("test".into()),
@@ -619,6 +636,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             module: None,
             db: Some("test".into()),
         })
@@ -628,6 +646,7 @@ mod tests {
         run_schema_diff(&SchemaDiffArgs {
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             db: Some("test".into()),
         })
         .await
@@ -635,6 +654,7 @@ mod tests {
         let e = run_schema_diff(&SchemaDiffArgs {
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             db: None,
         })
         .await
@@ -646,6 +666,7 @@ mod tests {
                 site: None,
                 config: Some(cfg(&t)),
                 dir: src(&t),
+                module_root: None,
                 baseline: false,
                 module: None,
                 db: Some("ghost".into()),
@@ -657,6 +678,7 @@ mod tests {
                 site: None,
                 config: Some(cfg(&t)),
                 dir: src(&t),
+                module_root: None,
                 module: None,
                 db: Some("ghost".into()),
             })
@@ -665,6 +687,7 @@ mod tests {
             run_schema_diff(&SchemaDiffArgs {
                 config: Some(cfg(&t)),
                 dir: src(&t),
+                module_root: None,
                 db: Some("ghost".into()),
             })
             .await
@@ -686,6 +709,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: Some(String::new()),
@@ -705,6 +729,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -718,6 +743,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: Some("test".into()),
@@ -737,6 +763,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: true,
             module: None,
             db: None,
@@ -757,6 +784,7 @@ mod tests {
         run_schema_diff(&SchemaDiffArgs {
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             db: None,
         })
         .await
@@ -771,6 +799,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -781,6 +810,7 @@ mod tests {
         run_schema_diff(&SchemaDiffArgs {
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             db: None,
         })
         .await
@@ -796,6 +826,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -812,6 +843,7 @@ mod tests {
         let e = run_schema_diff(&SchemaDiffArgs {
             config: Some(cfg(&t)),
             dir: src(&t),
+            module_root: None,
             db: None,
         })
         .await
@@ -958,6 +990,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -988,6 +1021,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -1025,6 +1059,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -1038,6 +1073,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: None,
             db: None,
@@ -1094,6 +1130,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: Some("modA-1.0.0".into()),
             db: None,
@@ -1126,6 +1163,7 @@ mod tests {
             site: None,
             config: Some(cfg(&t)),
             dir: Some(t.join("dist").display().to_string()),
+            module_root: None,
             baseline: false,
             module: Some("modA".into()),
             db: None,
@@ -1148,6 +1186,7 @@ mod tests {
             site: None,
             config: None,
             dir: None,
+            module_root: None,
             baseline: false,
             module: None,
             db: None,

@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use only_js::bridge::{DataAccessor, Dialect};
+use only_js::bridge::{DataAccessor, Dialect, ModuleIndex};
 use sea_query::{Alias, ColumnDef, Index};
 
 /// 列类型最小集（§4.7 映射层；其余类型走手写 migrations/）。
@@ -526,9 +526,10 @@ pub async fn reconcile_all(
     dir: &Path,
     ts: bool,
     db_key: &str,
+    module_index: Option<&ModuleIndex>,
 ) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
-    for (name, mdir) in crate::manifest::discover(dir, ts)? {
+    for (name, mdir) in crate::manifest::discover(dir, ts, module_index)? {
         if let Some(f) = SchemaFile::load(&mdir)? {
             let acc = acc.ok_or_else(|| format!("schema.yaml requires db '{db_key}'"))?;
             log.extend(reconcile(acc, &name, &f).await?);
@@ -611,7 +612,7 @@ tables:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let acc = only_js::bridge::InMemoryAccessor::new();
-        let lines = reconcile_all(Some(&acc), &dir, true, "default")
+        let lines = reconcile_all(Some(&acc), &dir, true, "default", None)
             .await
             .unwrap();
         assert!(lines.is_empty());

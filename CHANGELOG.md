@@ -16,6 +16,49 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.85
+
+模块根可配置：`--module-root` 递归发现 + `manifest.yaml` 新增可选 `prefix`。
+
+- **新增 `--module-root <dir>`（serve / build / openapi / test / migrate / exec / schema
+  diff）**：在该目录子树内**递归**发现 `manifest.yaml`，命中即停（不深入，模块根互不
+  嵌套）。模块身份改取 `manifest.yaml` 的 `name`——**目录名只作定位，不再参与身份**，
+  monorepo / 存量仓库里的模块可以放在任意深度的目录下（如 `services/user/api/`）。
+  与 `-d`/`--api-path` **互斥**（clap 层即报错）：两者都是「源码树根」。
+- **`manifest.yaml` 新增可选 `prefix`**：该模块的 URL 前缀（进路由 pattern，可含 `/`
+  分段如 `sys/user`）；**缺省或空串 = 用 `name`**。URL 由目录镜像改由前缀决定：
+  `<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`；dev 与 release 同口径
+  （dev 路由表按模块根建，不再按首层目录）。prefix 进路由 pattern 前过形状白名单
+  （`illegal url prefix '<p>'`），且全局唯一——两个模块争同一条 URL 直接拒启。
+- **`#/m/x` 别名解析按模块名（manifest `name`）而非目录名**，与 `--module-root`
+  配套：嵌套布局下跨模块导入不再依赖目录名碰巧一致。**`#/m/x` 是跨模块导入的首选
+  写法**（目录搬动不用改引用）；`#x` 锚本模块根不变。
+- **fail-fast 收窄**：显式给了 `--module-root` 却命中 0 个 manifest → exit 1
+  （`no manifest.yaml under module root … 下一步：…`，防 CI 假绿）；`--module-root`
+  指向 release 树（含 `manifests.yaml`）→ exit 1 引导指回 src 树；`name`/`version`/
+  `prefix` 在递归发现期即过白名单（要进产物目录名与路由 pattern，不留给运行期）。
+- **S008 覆盖模块根嵌套**：模块根之下再出现 `manifest.yaml` 报 S008（嵌套会改写别名
+  锚点）；模块名/前缀重名同样 fail-fast。
+- **源码树内就地 build 不再撞车**：递归扫描整棵跳过 release 树（含 `manifests.yaml` 锁
+  的目录）——否则 `dist/<m>-<v>/manifest.yaml` 的**原样副本**会把同一模块重复登记成
+  第二个模块根（实测报 `declared in multiple module roots`）；S008 的 stray 扫描同口径。
+- **修 `module_root_of` 符号链接误判（存量缺陷，`--module-root` 放大）**：referrer 来自
+  file URL（已 realpath，macOS `/tmp` → `/private/tmp`），project_root 是原样 CLI/config
+  路径——词法前缀比较把「明明在模块内」误判成「逐级上溯未找到模块根」（`oj openapi
+  --module-root` 实测复现）。两侧 canonicalize 后比较（与 `ensure_within` 同款；
+  canonicalize 失败的虚拟目录按词法前缀换根，保持两侧同形态）；openapi 的 dev/release
+  内省 LoaderShared 同批改 canonicalize 口径。附带修掉 openapi 启动错误的双重
+  `oj openapi: ` 前缀。
+- **Windows：`strip_verbatim` 修 UNC verbatim 还原**（存量缺陷，本期负载化）。
+  `canonicalize` 对网络共享返回 `\\?\UNC\server\share\...`，此前盲目剥 `\\?\` 得到
+  `UNC\server\share\...`——无根锚的坏路径（`from_file_path` 建不出 URL、前缀比较全线
+  失配）。现在正确还原为 `\\server\share\...`；`module_root_of` 的双侧 canonicalize
+  在 UNC 部署（网络盘项目根）下依赖该还原。`resolve_to_segs` / S008 的 canonical
+  兜底同批归一：不剥前缀时，verbatim 形态在 Windows 上永远剥不动一旁的非 verbatim
+  路径（`to_file_path` 侧已剥），兜底退化成死分支。
+- **兼容性**：不带 `--module-root` 时全部路径走今日语义——`-d src` 平铺树的构建产物
+  （含 tgz 字节）与 `oj openapi` 生成物与 v0.1.84 **逐字节一致**（基线二进制对比实测）。
+
 ## v0.1.84
 
 插件/FFI 层审计修复（七项：rabbitmq ×2、kafka、db 双插件、blob、kv、宿主 loader）。

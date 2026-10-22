@@ -10,7 +10,9 @@ use std::sync::Arc;
 use only_js::bridge::import_scan::{
     is_alias, is_local, is_relative, rewrite_specifiers, specifier_spans,
 };
-use only_js::bridge::{Bridge, Extras, InMemoryKV, LoaderShared, SchemaRegistry, transpile};
+use only_js::bridge::{
+    Bridge, Extras, InMemoryKV, LoaderShared, ModuleIndex, SchemaRegistry, transpile,
+};
 use serve::routes;
 
 use crate::args::BuildArgs;
@@ -21,29 +23,65 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
     // canonicalize 解析 8.3 短名（Windows `RUNNER~1` ↔ 长名）并归一；strip_verbatim 去
     // `\\?\` 前缀，使后续所有本地路径（含 `resolve_to_segs` 的 `strip_prefix`、loader 的
     // `module_root_of`）与 referrer 目录词法一致，避免 Windows 上别名解析误判「未找到模块根」。
-    let src = only_js::bridge::strip_verbatim(
-        &PathBuf::from(&a.dir)
-            .canonicalize()
-            .map_err(|e| format!("src dir '{}': {e}", a.dir))?,
-    );
+    // `--module-root` 与 `-d` 互斥（clap）：两者都是「源码树根」，取其一。
+    let src_arg = a.module_root.as_deref().unwrap_or(a.dir.as_str());
+    let src =
+        only_js::bridge::strip_verbatim(&PathBuf::from(src_arg).canonicalize().map_err(|e| {
+            format!("src dir '{src_arg}': {e}\n  下一步：--module-root 须指向存在的后端源码树根")
+        })?);
     let out = PathBuf::from(&a.out);
     // 跨模块导入的版本视图：单模块 = 锁；全量 = 锁 ∪ src 各模块 manifest（src 在建，覆盖锁）。
     let tasks_dir = tasks_dir_of(a.config.as_deref());
+    // 模块索引（仅 `--module-root` 时构造）：模块根可不在首层，发现 / 别名 / 跨模块
+    // 归属 / 路由段都从它取——「哪个目录是模块」不允许有两处判定。
+    let index = match a.module_root.as_deref() {
+        Some(_) => {
+            // 产物树（release dist）没有「模块根」概念：它的 `manifests.yaml` 是版本锁，
+            // 子目录是 `<name>-<version>/` 产物而非模块。指到这里会静默产出一堆空壳
+            // 版本目录（实测：0 api file 却「构建成功」），故 fail-fast。
+            if src.join("manifests.yaml").is_file() {
+                return Err(format!(
+                    "--module-root is a source-tree option: {} is a release tree (contains \
+                     manifests.yaml) — point it at the src tree, or drop --module-root",
+                    src.display()
+                ));
+            }
+            Some(only_js::bridge::resolve_roots(
+                &src,
+                true,
+                Some(&tasks_dir),
+            )?)
+        }
+        None => None,
+    };
     let mut view = crate::manifest::load_lock(&out.join("manifests.yaml"))?;
     let mut names: Vec<String> = match &a.module {
         Some(m) => {
             crate::manifest::validate_module(m)?;
-            let mf = src.join(m).join("manifest.yaml");
+            // 索引下按模块名定位（`[MODULE]` 位置参数是身份，不是目录名）。
+            let mf = match index.as_ref().and_then(|i| i.get(m)) {
+                Some(e) => e.root.join("manifest.yaml"),
+                None => src.join(m).join("manifest.yaml"),
+            };
             if !mf.is_file() {
+                let known = index
+                    .as_ref()
+                    .map(|i| i.names().map(String::as_str).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                let hint = if known.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n  下一步：可选模块名（manifest.yaml 的 name）：{known}")
+                };
                 return Err(format!(
-                    "module {m:?}: no manifest.yaml under {}",
+                    "module {m:?}: no manifest.yaml under {}{hint}",
                     src.display()
                 ));
             }
             view.insert(m.clone(), crate::manifest::parse_one(&mf)?.version);
             vec![m.clone()]
         }
-        None => crate::manifest::load_modules(&src, Some(&tasks_dir))?
+        None => crate::manifest::load_modules(&src, Some(&tasks_dir), index.as_ref())?
             .into_iter()
             .map(|m| {
                 view.insert(m.name.clone(), m.version);
@@ -67,13 +105,14 @@ pub async fn run(a: &BuildArgs) -> Result<(), String> {
         &names,
         &view,
         sql_guard_of_config(a.config.as_deref()),
+        index.as_ref(),
     )?;
     if a.check {
         println!("oj build --check: {} module(s) OK", names.len());
         return Ok(());
     }
     for name in &names {
-        build_one(&src, &out, name, &view, a.minify).await?;
+        build_one(&src, &out, name, &view, a.minify, index.as_ref()).await?;
     }
     // tasks 目录转译镜像（T10，评审 F2）：非版本化资产，不进锁/tgz。
     mirror_tasks(&src, &out, &tasks_dir, a.minify)?;
@@ -414,15 +453,27 @@ fn rel_dir(rel: &Path) -> String {
 
 /// 单模块构建：清场同名版本目录 → 落盘 → 内省产 routes.js → lock upsert → tgz。
 /// view = 跨模块导入目标的版本表（run 构建）；minify = 转译产物压缩开关。
+/// `index`（`--module-root`）：模块根与 URL 前缀的来源（模块根可不在首层）。
 async fn build_one(
     src: &Path,
     out: &Path,
     module: &str,
     view: &std::collections::BTreeMap<String, String>,
     minify: bool,
+    index: Option<&ModuleIndex>,
 ) -> Result<(), String> {
-    let mdir = src.join(module);
     crate::manifest::validate_module(module)?; // 两路径共用的白名单（全量路径同样过）
+    // 模块根：索引下由 name 定位（目录名不参与身份）；否则今日 `src/<name>/`。
+    let mdir = match index.and_then(|i| i.get(module)) {
+        Some(e) => e.root.clone(),
+        None => src.join(module),
+    };
+    // URL 前缀：manifest 的 `prefix`（缺省 = 模块名）。release 的 rel_pattern 以它为
+    // 模块段，dev 侧由 `routes::dev_rel` 取同一份——两侧 URL 同源。
+    let prefix = index
+        .and_then(|i| i.get(module))
+        .map(|e| e.prefix.clone())
+        .unwrap_or_else(|| module.to_string());
     let m = crate::manifest::parse_one(&mdir.join("manifest.yaml"))?;
     if m.name != module {
         return Err(format!("manifest name {:?} != module {:?}", m.name, module));
@@ -478,6 +529,7 @@ async fn build_one(
                 &m.version,
                 &rel_dir(rel),
                 view,
+                index,
                 // 报错带违规文件路径（三要素：文件 + 原因 + 下一步；原因带候选清单）
             )
             .map_err(|e| format!("{}: {e}", rel.display()))?;
@@ -502,7 +554,7 @@ async fn build_one(
 
     // 3. 内省（内存库）→ 校验/告警 → routes.js：pattern 无 base 含模块段（rel_pattern），
     //    file = 同名产物相对版本目录根（正斜杠；根级 api.ts 为裸 api.js）
-    let decls = introspect_module_files(src, &mdir, &files).await?;
+    let decls = introspect_module_files(src, &mdir, &files, index).await?;
     let n_api = decls.len();
     // v0.1.27 告警：`_name_` 形态模块名 → 路由参数段，同位异名双模块会在部署启动期结构冲突。
     if routes::looks_like_underscore_param(module) {
@@ -530,7 +582,7 @@ async fn build_one(
                     "warn: {file}: .route value {r:?} looks like `_name_` fs-param syntax; in .route it stays a literal segment (use {{name}} for params)"
                 );
             }
-            let pat = rel_pattern(module, dir, route.as_deref());
+            let pat = rel_pattern(&prefix, dir, route.as_deref());
             pats.push(pat.clone());
             rows_out.push((
                 file.clone(),
@@ -608,6 +660,7 @@ async fn introspect_module_files(
     src: &Path,
     mdir: &Path,
     files: &[(PathBuf, bool)],
+    index: Option<&ModuleIndex>,
 ) -> Result<
     Vec<(
         String,
@@ -629,8 +682,11 @@ async fn introspect_module_files(
             .await
             .map_err(|e| format!("open build db: {e}"))?,
     );
+    // 索引要先克隆成 owned Arc：内省闭包是 'static 的，抓不住借用。
+    let index_arc: Option<Arc<ModuleIndex>> = index.map(|i| Arc::new(i.clone()));
     let make = {
         let dbs = dbs.clone();
+        let index_arc = index_arc.clone();
         move || {
             Bridge::with_dbs_and_loader(
                 dbs.clone(),
@@ -643,6 +699,9 @@ async fn introspect_module_files(
                 })),
                 Extras {
                     boot: boot.clone(),
+                    // 与 dev 同源的模块索引：内省期解析 `#/m/x` 要靠它（模块根可不在
+                    // 首层，`module_root.parent()` 在嵌套下算不出 src 根）。
+                    module_index: index_arc.clone(),
                     ..Default::default()
                 },
             )
@@ -737,12 +796,13 @@ fn fix_import_specifiers(
     version: &str,
     rel_dir: &str,
     view: &std::collections::BTreeMap<String, String>,
+    index: Option<&ModuleIndex>,
 ) -> Result<String, String> {
     rewrite_specifiers(src, |spec| {
         if !is_local(spec) {
             return Ok(None);
         }
-        let segs = resolve_to_segs(src_root, module, rel_dir, spec)?;
+        let segs = resolve_to_segs(src_root, module, rel_dir, spec, index)?;
         let target_dir = if segs[0] == module {
             format!("{module}-{version}")
         } else {
@@ -771,24 +831,52 @@ fn resolve_to_segs(
     module: &str,
     rel_dir: &str,
     spec: &str,
+    index: Option<&ModuleIndex>,
 ) -> Result<Vec<String>, String> {
+    // 索引下模块根由 name 定位（`src/<name>/` 在嵌套布局下不是模块根）；否则今日语义。
+    let mroot = match index.and_then(|i| i.get(module)) {
+        Some(e) => e.root.clone(),
+        None => src_root.join(module),
+    };
     let from_dir = if rel_dir.is_empty() {
-        src_root.join(module)
+        mroot
     } else {
-        src_root.join(module).join(rel_dir)
+        mroot.join(rel_dir)
     };
     let file = if is_alias(spec) {
-        only_js::bridge::resolve_alias(spec, &from_dir, src_root, true)?
+        only_js::bridge::resolve_alias(spec, &from_dir, src_root, true, index)?
     } else {
         only_js::bridge::resolve_relative(&from_dir, spec, true)?
     };
-    let rel = file
-        .strip_prefix(src_root)
-        .map_err(|_| format!("import {spec:?} escapes src/ (from {module}/{rel_dir})"))?;
-    let segs: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
+    // 段列表（首段 = 目标模块名）：索引下 = [模块名, 模块根内相对路径…]——目录名
+    // （`foo/api`）不进产物路径，落盘又以模块根为基，故两侧必须同一口径，否则悬空。
+    let segs: Vec<String> = match index.and_then(|i| i.locate(&file)) {
+        Some((name, _, rel)) => std::iter::once(name.to_string())
+            .chain(
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+            )
+            .collect(),
+        // 模块外（tasks 池、src 根散文件）→ 回落今日语义与原文案。
+        None => {
+            // `resolve_alias` 给出的 file 是 canonical 形态（module_root_of 双侧
+            // canonicalize），src_root 却可能是原样 CLI 路径（macOS /tmp → /private/tmp
+            // 即词法不一致）——先按 canonical 剥，不行再按原样剥。
+            // Windows 专项：canonicalize 带 `\\?\` 前缀，不剥就永远配不上一旁非
+            // verbatim 的 file（url crate 的 to_file_path 侧已剥）——与 module_root_of
+            // 同口径先 strip_verbatim 再比。
+            let src_canon = only_js::bridge::strip_verbatim(
+                &std::fs::canonicalize(src_root).unwrap_or_else(|_| src_root.to_path_buf()),
+            );
+            let rel = file
+                .strip_prefix(&src_canon)
+                .or_else(|_| file.strip_prefix(src_root))
+                .map_err(|_| format!("import {spec:?} escapes src/ (from {module}/{rel_dir})"))?;
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect()
+        }
+    };
     if segs.is_empty() {
         return Err(format!("import {spec:?} resolves to src/ root"));
     }
@@ -835,12 +923,20 @@ fn product_spec(module: &str, version: &str, rel_dir: &str, mut to: Vec<String>)
     }
 }
 
-/// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块名段。
+/// 相对 pattern（spec §2.1）：无首斜杠无 base，含模块段。
 /// None/空 route → 目录镜像（v0.1.27：模块段与 rel_dir 逐段过 `fs_seg_to_pattern`，
 /// `_name_` → `{name}`）；相对声明 → 目录 + route；根级声明（/ 开头）→ 剥首斜杠
 /// 不加模块段。route 值**不转换**（matchit 语法，`{name}` 才是参数）。
-fn rel_pattern(module: &str, rel_dir: &str, route: Option<&str>) -> String {
-    let m = routes::fs_seg_to_pattern(module);
+///
+/// 模块段取 `prefix`（v0.1.85）：`manifest.yaml` 声明了 `prefix` 就用它，否则等于
+/// 模块名（`resolve_prefix` 归一）。dev 侧 `routes::dev_rel` 取同一份值——dev 与
+/// release 的 URL 由此同源；`prefix` 可含 `/`（逐段转换）。
+fn rel_pattern(prefix: &str, rel_dir: &str, route: Option<&str>) -> String {
+    let m = prefix
+        .split('/')
+        .map(routes::fs_seg_to_pattern)
+        .collect::<Vec<_>>()
+        .join("/");
     let conv_dir = |d: &str| {
         d.split('/')
             .map(routes::fs_seg_to_pattern)
@@ -953,7 +1049,7 @@ mod tests {
         rel_dir: &str,
         view: &std::collections::BTreeMap<String, String>,
     ) -> String {
-        fix_import_specifiers(src_root, src, "a", "0.1.0", rel_dir, view).unwrap()
+        fix_import_specifiers(src_root, src, "a", "0.1.0", rel_dir, view, None).unwrap()
     }
 
     /// 版本视图 {b: 0.2.0}。
@@ -1014,6 +1110,7 @@ mod tests {
                 "0.1.0",
                 "item",
                 &Default::default(),
+                None,
             )
             .unwrap_err();
             assert!(e.contains("不会进产物") && e.contains(spec), "{spec}: {e}");
@@ -1149,6 +1246,7 @@ mod tests {
             "0.1.0",
             "",
             &Default::default(),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("b") && e.contains("oj build"), "{e}");
@@ -1160,6 +1258,7 @@ mod tests {
             "0.1.0",
             "",
             &Default::default(),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("b") && e.contains("oj build"), "{e}");
@@ -1171,6 +1270,7 @@ mod tests {
             "0.1.0",
             "",
             &view_b(),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("tried"), "{e}");
@@ -1328,11 +1428,219 @@ mod tests {
             module: module.map(str::to_string),
             config: Some(t.join("config.yaml").display().to_string()),
             dir: t.join("src").display().to_string(),
+            module_root: None,
             out: t.join("dist").display().to_string(),
             minify: true,
             check: false,
             bundle: false,
         }
+    }
+
+    /// `--module-root` 形态的 BuildArgs（与 `-d` 互斥，故 dir 字段不再参与）。
+    fn module_root_args(t: &std::path::Path, module: Option<&str>) -> BuildArgs {
+        BuildArgs {
+            module: module.map(str::to_string),
+            config: Some(t.join("config.yaml").display().to_string()),
+            dir: String::new(),
+            module_root: Some(t.join("src").display().to_string()),
+            out: t.join("dist").display().to_string(),
+            minify: true,
+            check: false,
+            bundle: false,
+        }
+    }
+
+    /// 嵌套模块根夹具：模块根在第二层（目录名 ≠ 模块名），m2 声明了 URL 前缀。
+    /// m1 跨模块引用 m2（走 `#/m2/…` 别名，已声明 deps）。
+    fn nested_fixture(t: &std::path::Path) {
+        let src = t.join("src");
+        std::fs::create_dir_all(src.join("foo/api/xxx/yyy")).unwrap();
+        std::fs::create_dir_all(src.join("bar/api/shared")).unwrap();
+        std::fs::write(
+            src.join("foo/api/manifest.yaml"),
+            "name: m1\ndesc: d\nversion: 0.1.0\ndeps:\n  m2: \"^0.2.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("bar/api/manifest.yaml"),
+            "name: m2\ndesc: d\nversion: 0.2.0\nprefix: sys/user\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("bar/api/shared/u.ts"), "export const u = 1;\n").unwrap();
+        std::fs::write(
+            src.join("bar/api/api.ts"),
+            "function get(){ json.ok({}); }\nexport default { get };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("foo/api/xxx/yyy/api.ts"),
+            "import { u } from \"#/m2/shared/u\";\nfunction get(){ json.ok({u}); }\nexport default { get };\n",
+        )
+        .unwrap();
+    }
+
+    /// routes.js 里的 pattern 清单（产物形态：`pattern: "xxx"`）。
+    fn routes_patterns(vdir: &std::path::Path) -> Vec<String> {
+        let txt = std::fs::read_to_string(vdir.join("routes.js")).unwrap();
+        txt.match_indices("pattern: \"")
+            .map(|(i, _)| {
+                let rest = &txt[i + "pattern: \"".len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect()
+    }
+
+    /// BDD：模块根可不在首层时，URL 的模块段取 `manifest.yaml` 的 `prefix`
+    /// （缺省 = name），目录名（`foo/api`）不进 URL；产物路径以模块根为基。
+    #[tokio::test]
+    async fn given_nested_module_root_when_build_then_url_uses_prefix_and_dir_names_absent() {
+        let t = std::env::temp_dir().join(format!("oj-build-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        nested_fixture(&t);
+        run(&module_root_args(&t, None)).await.unwrap();
+
+        // Then ①：URL 前缀 = manifest 的 prefix（缺省 = name），目录名不出现
+        let m1 = std::fs::read_to_string(t.join("dist/m1-0.1.0/routes.js")).unwrap();
+        assert!(m1.contains("pattern: \"m1/xxx/yyy\""), "{m1}");
+        assert!(m1.contains("file: \"xxx/yyy/api.js\""), "{m1}");
+        let m2 = std::fs::read_to_string(t.join("dist/m2-0.2.0/routes.js")).unwrap();
+        assert!(m2.contains("pattern: \"sys/user\""), "{m2}");
+
+        // Then ②：跨模块别名按**模块名**解析并落到目标版本目录（目录名不进产物路径）
+        let api = std::fs::read_to_string(t.join("dist/m1-0.1.0/xxx/yyy/api.js")).unwrap();
+        assert!(api.contains("m2-0.2.0/shared/u.js"), "{api}");
+        assert!(!api.contains("bar"), "{api}");
+        assert!(!api.contains('#'), "{api}");
+
+        // Then ③：位置参数是**模块名**（`oj build m1`），不是目录名
+        std::fs::remove_dir_all(t.join("dist")).unwrap();
+        // 先出 m1 的依赖（deps 校验口径），再单出 m1
+        run(&module_root_args(&t, Some("m2"))).await.unwrap();
+        run(&module_root_args(&t, Some("m1"))).await.unwrap();
+        assert!(t.join("dist/m1-0.1.0").is_dir());
+        // 单模块构建不牵连他人：版本锁保留既有条目（PRD §7-7）
+        let lock = std::fs::read_to_string(t.join("dist/manifests.yaml")).unwrap();
+        assert!(lock.contains("m2: 0.2.0"), "{lock}");
+        assert!(lock.contains("m1: 0.1.0"), "{lock}");
+        // 目录名当模块名用不了（索引里只有 m1/m2）
+        let e = run(&module_root_args(&t, Some("foo"))).await.unwrap_err();
+        assert!(e.contains("foo"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（PRD §7-1 兼容）：**旧布局**下 `--module-root src` 的产物与 `-d src` 逐字节一致
+    /// （oj 为确定性构建；`.tgz` 含打包时间戳，只比存在性与文件名）。
+    #[tokio::test]
+    async fn given_flat_layout_when_module_root_then_dist_is_byte_identical_to_plain_d() {
+        let t = std::env::temp_dir().join(format!("oj-build-compat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+
+        run(&build_args(&t, None)).await.unwrap();
+        let a = dist_snapshot(&t.join("dist"));
+        std::fs::remove_dir_all(t.join("dist")).unwrap();
+
+        run(&module_root_args(&t, None)).await.unwrap();
+        let b = dist_snapshot(&t.join("dist"));
+
+        assert!(!a.is_empty(), "夹具应产出文件");
+        assert_eq!(a, b, "`--module-root` 在旧布局下不得改变产物");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（PRD §7-6）：`--module-root` 命中 0 个模块 → 非零（Err）+ 可读下一步，
+    /// 不得像默认口径那样静默成功（静默会产出空 dist 并让下游误判「构建通过」）。
+    #[tokio::test]
+    async fn given_module_root_without_any_manifest_when_build_then_fails_with_next_step() {
+        let t = std::env::temp_dir().join(format!("oj-build-nohit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("src/web")).unwrap();
+        std::fs::write(t.join("src/web/index.ts"), "export const a = 1;\n").unwrap();
+
+        let e = run(&module_root_args(&t, None)).await.unwrap_err();
+        assert!(
+            e.contains("no manifest.yaml") && e.contains("--module-root"),
+            "{e}"
+        );
+        assert!(e.contains("下一步"), "{e}");
+        // 对照：默认口径（`-d`）对空树仍是今日语义（0 模块亦成功），故不在此断言。
+        assert!(!t.join("dist").exists(), "失败不得落盘半成品");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（评审 R2 / 实测事故）：`--module-root` 指到 **release 产物树** → fail-fast。
+    /// 产物树的 `manifests.yaml` 是版本锁、子目录是 `<name>-<version>/`，按模块根扫会
+    /// 静默产出一堆空壳版本目录（0 api file 却「构建成功」）。
+    #[tokio::test]
+    async fn given_release_tree_when_module_root_then_fails_fast() {
+        let t = std::env::temp_dir().join(format!("oj-build-reltree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        src_fixture(&t);
+        run(&build_args(&t, None)).await.unwrap();
+
+        let mut a = module_root_args(&t, None);
+        a.module_root = Some(t.join("dist").display().to_string());
+        let e = run(&a).await.unwrap_err();
+        assert!(e.contains("--module-root is a source-tree option"), "{e}");
+        assert!(e.contains("release tree"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// dist 快照：相对路径 → 内容（`.tgz` 只记文件名，内含打包时间戳不可比）。
+    fn dist_snapshot(dist: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        let mut stack = vec![dist.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let rel = p.strip_prefix(dist).unwrap().display().to_string();
+                let v = if rel.ends_with(".tgz") {
+                    String::from("<tgz>")
+                } else {
+                    std::fs::read_to_string(&p).unwrap_or_default()
+                };
+                m.insert(rel, v);
+            }
+        }
+        m
+    }
+
+    /// BDD：dev 路由表与 release 产物 URL **逐条一致**（评审发现丙：两者会分叉）。
+    #[tokio::test]
+    async fn given_nested_module_root_when_serve_dev_then_urls_match_release_artifacts() {
+        let t = std::env::temp_dir().join(format!("oj-build-urls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        nested_fixture(&t);
+        // canonicalize：/var → /private/var（macOS），保证与 loader 看到的路径同形态
+        let src = t.join("src").canonicalize().unwrap();
+        let idx = only_js::bridge::resolve_roots(&src, true, None).unwrap();
+        run(&module_root_args(&t, None)).await.unwrap();
+
+        // When：dev 侧按同一份索引建路由表（`oj serve --module-root` / `oj openapi` 同路径）
+        let table = crate::openapi_cmd::discover_routes(&src, true, "/v1/api", Some(&idx)).unwrap();
+        let mut dev: Vec<String> = table
+            .listing()
+            .iter()
+            .map(|r| r.pattern.trim_start_matches("/v1/api/").to_string())
+            .collect();
+        dev.sort();
+
+        // Then：与 release 产物的 pattern 逐条一致（去掉前导 base 后比对）
+        let mut rel = routes_patterns(&t.join("dist/m1-0.1.0"));
+        rel.extend(routes_patterns(&t.join("dist/m2-0.2.0")));
+        rel.sort();
+        assert_eq!(dev, rel, "dev 与 release 的 URL 必须同源");
+        assert!(dev.iter().any(|p| p == "m1/xxx/yyy"), "{dev:?}");
+        assert!(dev.iter().any(|p| p == "sys/user"), "{dev:?}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     /// BDD（T10，评审 F2）：src/tasks 存在 → 全部 .ts 转译镜像到 dist/tasks/

@@ -22,7 +22,7 @@ use tokio::runtime::Builder as TokioBuilder;
 
 use crate::app::{App, ClientTransport, ResourceProfiles};
 use crate::args::TestArgs;
-use crate::serve_cmd::load_app_config;
+use crate::serve_cmd::{AppConfig, load_app_config};
 use crate::test_ext::oj_test_ext_init;
 
 /// Rust 侧测试结果汇总（serde_v8 从 JS `__testSummary` 反序列化）。
@@ -67,14 +67,23 @@ fn collect_test_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()>
 
 /// 入口：解析配置 → 钉线程起 runtime → 跑用例 → 返回退出码。
 pub fn run(a: TestArgs) -> Result<i32, String> {
-    let (cfg, top, config_dir, dir, _ts, _base) = load_app_config(
+    let loaded = load_app_config(
         a.config.as_deref(),
         a.site.as_deref(),
         a.dir.as_deref(),
         a.base.as_deref(),
         // test 无需配置文件（无后端执行），未找到 config 时静默回落内置默认。
         false,
+        a.module_root.as_deref(),
     )?;
+    let AppConfig {
+        cfg,
+        top,
+        config_dir,
+        dir,
+        module_index,
+        ..
+    } = loaded;
     // test 强依赖 api 目录（用例针对 handler；无「纯静态」形态）。
     if !dir.is_dir() {
         return Err(format!(
@@ -147,8 +156,17 @@ pub fn run(a: TestArgs) -> Result<i32, String> {
             rt.block_on(async move {
                 // 槽位 None：oj test 无热更执行器（`server.reloadConfig` 报
                 // reload not available，fail-closed）。
-                let app =
-                    App::from_config(cfg, &top, &config_dir, true, &profiles, None, None).await?;
+                let app = App::from_config(
+                    cfg,
+                    &top,
+                    &config_dir,
+                    true,
+                    &profiles,
+                    None,
+                    None,
+                    module_index,
+                )
+                .await?;
                 run_on_runtime(app, &files, &fmt, out.as_deref(), anonymous).await
             })
         })
@@ -171,8 +189,12 @@ async fn run_on_runtime(
     let start = Instant::now();
     let stable = app.stable();
     let loader = stable.loader.clone();
-    let module_loader: Option<Rc<dyn ModuleLoader>> =
-        loader.map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
+    let module_loader: Option<Rc<dyn ModuleLoader>> = loader.map(|inner| {
+        Rc::new(OjModuleLoader {
+            inner,
+            module_index: stable.module_index.clone(),
+        }) as Rc<dyn ModuleLoader>
+    });
 
     // bootstrap.js 顶部静态 import ext:deno_websocket/...，缺模块会让 boot
     // 求值失败——与生产 runtime 同步拼装 WS 客户端扩展面。

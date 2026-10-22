@@ -1,7 +1,15 @@
-//! manifest.yaml：模块清单（name 必须等于目录名——启动期强约束）。
+//! manifest.yaml：模块清单。
+//!
+//! **两种发现口径**（分支只在此文件与 `bridge::module_scan`）：
+//! - 无索引（今日默认）：`dir` 首层子目录 = 模块根，且 `name` 必须等于目录名；
+//! - 有索引（`--module-root`）：模块根由索引给出，`name` 取 `manifest.yaml` 的 name，
+//!   目录名只作定位。索引由装配期一次性构造（`bridge::resolve_roots`），dev/serve/
+//!   build/migrate 共用同一份——「哪个目录是模块」不允许有两处判定。
 
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use only_js::bridge::ModuleIndex;
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -21,29 +29,16 @@ pub struct Manifest {
     pub deps: std::collections::HashMap<String, String>,
 }
 
-/// module 白名单：非空、[A-Za-z0-9_-]，禁路径字符与 ..（进路径拼接，信任边界）。
-pub fn validate_module(m: &str) -> Result<(), String> {
-    let ok = !m.is_empty()
-        && m.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("illegal module name {m:?}"))
-    }
-}
+/// name / version 白名单：与运行期发现（`bridge::module_scan`）**同一份实现**——
+/// 两处各写一份必然漂移，而 name 要进产物目录名与锁键，错一处就是路径穿越面。
+pub use only_js::bridge::{validate_module, validate_version};
 
-/// version 白名单：非空、[A-Za-z0-9.]，拒连续点（兼容 0.1.0-beta 缺横线也放行——含 '-'）。
-pub fn validate_version(v: &str) -> Result<(), String> {
-    let ok = !v.is_empty()
-        && !v.contains("..")
-        && v.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("illegal version {v:?}"))
-    }
+/// 索引是否覆盖 `dir`：多挂载下每棵树各自判定（`--module-root` 只指定了一棵树，
+/// 索引不能越树生效——否则第二棵树的首层目录会被误判成「索引里的模块」）。
+pub(crate) fn covers<'a>(index: Option<&'a ModuleIndex>, dir: &Path) -> Option<&'a ModuleIndex> {
+    let idx = index?;
+    let c = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    (only_js::bridge::strip_verbatim(&c) == idx.base).then_some(idx)
 }
 
 /// 单个 manifest.yaml → Manifest（load_modules 复用此解析，DRY）。
@@ -74,9 +69,21 @@ pub fn save_lock(
     std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))
 }
 
-/// 加载 dir 首层全部模块清单并校验 name==目录名。
+/// 加载模块清单：`index` 覆盖 `dir` 时按索引（模块根可不在首层、name 取 manifest）；
+/// 否则今日语义（首层子目录 = 模块根，校验 name==目录名）。
 /// `skip`：保留目录名（如 tasks.dir 的任务池——非模块）；None = 不跳过。
-pub fn load_modules(dir: &Path, skip: Option<&str>) -> Result<Vec<Manifest>, String> {
+pub fn load_modules(
+    dir: &Path,
+    skip: Option<&str>,
+    index: Option<&ModuleIndex>,
+) -> Result<Vec<Manifest>, String> {
+    if let Some(idx) = covers(index, dir) {
+        let mut out = Vec::new();
+        for e in idx.modules.values() {
+            out.push(parse_one(&e.root.join("manifest.yaml"))?);
+        }
+        return Ok(out);
+    }
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -113,14 +120,25 @@ pub fn load_modules(dir: &Path, skip: Option<&str>) -> Result<Vec<Manifest>, Str
     Ok(out)
 }
 
-/// 模块发现（迁移门禁 / fixture / `oj migrate` 共用）：dev（ts）= 首层子目录
-/// （load_modules 已保证 name==目录名）；release = 锁 `dist/manifests.yaml`
-/// {m: v} → `<dir>/<m>-<v>/`。返回 (模块名, 模块目录)，按模块名排序。
-pub fn discover(dir: &Path, ts: bool) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+/// 模块发现（迁移门禁 / fixture / `oj migrate` 共用）：`index` 覆盖 `dir` 时按索引；
+/// 否则 dev（ts）= 首层子目录（load_modules 已保证 name==目录名）；release = 锁
+/// `dist/manifests.yaml` {m: v} → `<dir>/<m>-<v>/`。返回 (模块名, 模块目录)，按模块名排序。
+pub fn discover(
+    dir: &Path,
+    ts: bool,
+    index: Option<&ModuleIndex>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    if let Some(idx) = covers(index, dir) {
+        return Ok(idx
+            .modules
+            .iter()
+            .map(|(n, e)| (n.clone(), e.root.clone()))
+            .collect());
+    }
     if ts {
         // 任务池保留目录按约定默认跳过（tasks.dir 改名 + migrate 的组合不识别——
         // build/serve 路径已按配置名跳过；ponytail: 命名场景把 migrate 也接配置再补）。
-        let mut out: Vec<_> = load_modules(dir, Some("tasks"))?
+        let mut out: Vec<_> = load_modules(dir, Some("tasks"), None)?
             .into_iter()
             .map(|m| {
                 let p = dir.join(&m.name);
@@ -180,7 +198,7 @@ mod tests {
             d.0.join("user/manifest.yaml"),
             "name: user\ndesc: d\nversion: 0.1.0\n",
         );
-        let ms = load_modules(&d.0, None).unwrap();
+        let ms = load_modules(&d.0, None, None).unwrap();
         assert_eq!(ms[0].name, "user");
 
         let bad = tmp("mf-bad");
@@ -188,13 +206,65 @@ mod tests {
             bad.0.join("order/manifest.yaml"),
             "name: orderr\ndesc: d\nversion: 0.1.0\n",
         );
-        let e = load_modules(&bad.0, None).unwrap_err();
+        let e = load_modules(&bad.0, None, None).unwrap_err();
         assert!(e.contains("orderr") && e.contains("order"), "{e}");
 
         let none = tmp("mf-none");
         write(none.0.join("x/keep.txt"), "");
-        let e2 = load_modules(&none.0, None).unwrap_err();
+        let e2 = load_modules(&none.0, None, None).unwrap_err();
         assert!(e2.contains("manifest.yaml"), "{e2}");
+    }
+
+    /// BDD：索引覆盖时，模块身份取 `manifest.yaml` 的 name，目录名只作定位——
+    /// 发现结果必须与「哪个目录是模块」的唯一判据（索引）一致。
+    #[test]
+    fn given_index_covers_dir_when_load_modules_then_names_come_from_manifest() {
+        // Given: 模块根在第二层，目录名与模块名无关
+        let d = tmp("mf-index");
+        write(
+            d.0.join("foo/api/manifest.yaml"),
+            "name: m1\ndesc: d\nversion: 0.1.0\n",
+        );
+        write(
+            d.0.join("bar/api/manifest.yaml"),
+            "name: m2\ndesc: d\nversion: 0.2.0\n",
+        );
+        let idx = only_js::bridge::resolve_roots(&d.0, true, None).unwrap();
+
+        // When: 按索引加载
+        let mut ms = load_modules(&d.0, None, Some(&idx)).unwrap();
+        ms.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Then: 身份与版本都来自 manifest（目录名不出现）
+        assert_eq!(
+            ms.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert_eq!(ms[1].version, "0.2.0");
+    }
+
+    /// BDD：索引**不覆盖**该树（多挂载下另一棵树）时不得生效——否则那棵树的首层
+    /// 目录会被误判成「索引里的模块」。
+    #[test]
+    fn given_index_of_another_tree_when_load_modules_then_today_semantics() {
+        let d = tmp("mf-other");
+        write(
+            d.0.join("user/manifest.yaml"),
+            "name: user\ndesc: d\nversion: 0.1.0\n",
+        );
+        let other = tmp("mf-other-idx");
+        write(
+            other.0.join("x/api/manifest.yaml"),
+            "name: m1\ndesc: d\nversion: 0.1.0\n",
+        );
+        let idx = only_js::bridge::resolve_roots(&other.0, true, None).unwrap();
+
+        // When: 用别的树的索引加载本树
+        let ms = load_modules(&d.0, None, Some(&idx)).unwrap();
+
+        // Then: 走今日语义（name == 目录名校验仍在）
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].name, "user");
     }
 
     #[test]
@@ -257,7 +327,7 @@ mod tests {
             d.0.join("order/manifest.yaml"),
             "name: order\ndesc: d\nversion: 0.1.0\n",
         );
-        let ms = discover(&d.0, true).unwrap();
+        let ms = discover(&d.0, true, None).unwrap();
         assert_eq!(
             ms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             vec!["order", "user"]
@@ -272,10 +342,10 @@ mod tests {
             "order: 0.1.0\nghost: 9.9.9\n",
         )
         .unwrap();
-        let e = discover(&d.0.join("dist"), false).unwrap_err();
+        let e = discover(&d.0.join("dist"), false, None).unwrap_err();
         assert!(e.contains("ghost-9.9.9"), "{e}");
         std::fs::write(d.0.join("dist/manifests.yaml"), "order: 0.1.0\n").unwrap();
-        let ms = discover(&d.0.join("dist"), false).unwrap();
+        let ms = discover(&d.0.join("dist"), false, None).unwrap();
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].0, "order");
         assert!(ms[0].1.ends_with("order-0.1.0"));

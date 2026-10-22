@@ -11,14 +11,28 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use only_js::bridge::{DataAccessor, Dialect};
+use only_js::bridge::{DataAccessor, Dialect, ModuleIndex};
 
 /// 模块种子文件名。
 const SEED_FILE: &str = "seed.sql";
 
-/// 收集 `dir` 首层各模块的 `seed.sql`（dev: `src/<m>/`，release: `dist/<m>-<v>/`），
-/// 按模块名排序。返回 (模块标签=目录名, 文件路径)。
-pub fn collect(dir: &Path) -> Vec<(String, PathBuf)> {
+/// 收集各模块的 `seed.sql`（dev: `src/<m>/`，release: `dist/<m>-<v>/`），按模块名排序。
+/// 返回 (模块标签=模块名, 文件路径)。
+///
+/// `index` 覆盖 `dir` 时按索引定位模块根（模块根可不在首层，首层扫会**静默漏掉种子**——
+/// 评审（丁）：种子不灌且无报错比启动失败更坏）；否则今日语义（首层子目录）。
+/// 复用 `manifest::discover` 而非自己扫目录：模块集合的判定只应有一处。
+pub fn collect(dir: &Path, index: Option<&ModuleIndex>) -> Vec<(String, PathBuf)> {
+    if let Some(idx) = index {
+        let mut out = Vec::new();
+        for (name, e) in &idx.modules {
+            let p = e.root.join(SEED_FILE);
+            if p.is_file() {
+                out.push((name.clone(), p));
+            }
+        }
+        return out;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -175,8 +189,12 @@ pub fn translate_insert<'a>(stmt: &'a str, d: Dialect) -> Cow<'a, str> {
 /// 无种子文件 → 静默返回；有种子但 default 库缺失 → warn 跳过。
 /// 三方言都重放（幂等靠 S006 门禁 + 方言改写 + SQL 自身）；先全量冲突检查（S002）
 /// 再执行——失败不落任何副作用。
-pub async fn replay_all(default: Option<&Arc<dyn DataAccessor>>, dir: &Path) -> Result<(), String> {
-    let modules = collect(dir);
+pub async fn replay_all(
+    default: Option<&Arc<dyn DataAccessor>>,
+    dir: &Path,
+    index: Option<&ModuleIndex>,
+) -> Result<(), String> {
+    let modules = collect(dir, index);
     if modules.is_empty() {
         return Ok(());
     }
@@ -355,7 +373,7 @@ mod tests {
             .connect("sqlite::memory:", root)
             .await
             .map_err(|e| e.to_string())?;
-        replay_all(Some(&db), dir).await?;
+        replay_all(Some(&db), dir, None).await?;
         db.query_with_params(
             "select name from sqlite_master where type='table' order by name",
             &[],
@@ -399,7 +417,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&t);
         write(t.join("src/u/seed.sql"), "CREATE TABLE r (x);");
         // 无 default 库 → warn 跳过（有库时三方言都重放，无方言豁免）。
-        replay_all(None, &t).await.unwrap();
+        replay_all(None, &t, None).await.unwrap();
         let _ = std::fs::remove_dir_all(&t);
     }
 

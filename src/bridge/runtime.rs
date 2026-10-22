@@ -109,10 +109,12 @@ impl RuntimePool {
     /// 新建一个 runtime（模块加载器取 StableState.loader，单一事实来源；
     /// devserver 旧路径 None → 不配）。
     fn spawn(stable: &Arc<StableState>, inspect: bool) -> JsRuntime {
-        let module_loader = stable
-            .loader
-            .clone()
-            .map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>);
+        let module_loader = stable.loader.clone().map(|inner| {
+            Rc::new(OjModuleLoader {
+                inner,
+                module_index: stable.module_index.clone(),
+            }) as Rc<dyn ModuleLoader>
+        });
         // PR-4：Some(limit) = create_params.heap_limits + near-heap-limit 回调；
         // 超限 terminate → fired 标志置位 → checkin 丢弃（不回池）。
         let create_params = stable.js_heap_limit.map(heap_create_params);

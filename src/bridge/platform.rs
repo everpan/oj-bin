@@ -194,6 +194,7 @@ mod tests {
             input_contracts: None,
             seq_ensured: std::sync::Mutex::new(HashSet::new()),
             loader: None,
+            module_index: None,
             blobs: Arc::new(crate::bridge::blob::BlobRegistry::new()),
             bus: Arc::new(crate::bridge::bus::Bus::new()),
             es: None,

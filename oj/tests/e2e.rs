@@ -103,6 +103,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
             module: None,
             config: Some("config.yaml".into()),
             dir: root.join("src").display().to_string(),
+            module_root: None,
             out: dist.display().to_string(),
             minify: true,
             check: false,
@@ -120,7 +121,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
                 .connect(cfg.db.get("default").unwrap(), &root)
                 .await
                 .unwrap();
-            oj::migrate::apply_all(Some(&acc), &dir, false, false)
+            oj::migrate::apply_all(Some(&acc), &dir, false, false, None)
                 .await
                 .unwrap();
         }
@@ -405,6 +406,7 @@ async fn build_emits_routes_js_strips_route_then_release_serves() {
         module: Some("u".into()),
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -472,6 +474,7 @@ async fn underscore_dir_param_dev_serves_and_release_round_trips() {
         module: Some("u".into()),
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -529,6 +532,7 @@ async fn nested_handler_group_dev_and_release_serve_end_to_end() {
         module: Some("u".into()),
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -588,6 +592,7 @@ async fn nested_group_route_suppresses_mirror_and_hyphen_segment_hits() {
         module: Some("u".into()),
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -634,6 +639,7 @@ async fn nested_group_mixed_verbs_and_subgroups_with_schema_isolation() {
                 module: Some("u".into()),
                 config: Some("config.yaml".into()),
                 dir: t.join("src").display().to_string(),
+                module_root: None,
                 out: t.join("dist").display().to_string(),
                 minify: true,
                 check: false,
@@ -683,6 +689,7 @@ async fn release_routes_js_illegal_handler_chain_fails_startup() {
         module: Some("u".into()),
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -731,6 +738,7 @@ async fn build_then_release_serves_end_to_end() {
         module: None,
         config: Some("config.yaml".into()),
         dir: t.join("src").display().to_string(),
+        module_root: None,
         out: t.join("dist").display().to_string(),
         minify: true,
         check: false,
@@ -1177,6 +1185,7 @@ async fn test_db_override_builds_schema_on_test_db_not_dev() {
             db: Some("test".into()),
             ..Default::default()
         },
+        None,
         None,
         None,
     )

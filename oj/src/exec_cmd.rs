@@ -22,7 +22,7 @@ use tokio::runtime::Builder as TokioBuilder;
 use crate::app::{Backend, ResourceProfiles, assemble_backend};
 use crate::args::ExecArgs;
 use crate::exec_ext::{ExecOptions, oj_exec_ext_init};
-use crate::serve_cmd::load_app_config;
+use crate::serve_cmd::{AppConfig, load_app_config};
 
 /// exec 执行目标：文件 / 内联代码 / 交互式 REPL（三者互斥；缺省 = REPL）。
 pub(crate) enum ExecTarget {
@@ -52,7 +52,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         // 三者缺省（裸 `oj exec`）= REPL（v0.1.55，替代原报错）。
         (None, None, false) => ExecTarget::Repl,
     };
-    let (cfg, top, config_dir, dir, _ts, base) = load_app_config(
+    let loaded = load_app_config(
         a.config.as_deref(),
         a.site.as_deref(),
         a.dir.as_deref(),
@@ -60,7 +60,17 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         // exec 无需配置文件（纯静态脚本执行），未找到 config 时静默回落内置默认，
         // 不打 `note: no config.yaml found`（与 `oj info` 同口径）。
         false,
+        a.module_root.as_deref(),
     )?;
+    let AppConfig {
+        cfg,
+        top,
+        config_dir,
+        dir,
+        base,
+        module_index,
+        ..
+    } = loaded;
     // exec 恒 dev 语义（spec §3.4）：脚本没有 release 形态；dir 仅作 schema 白名单来源。
     // 各资源根 key 的默认 profile 选择（--db/--redis/--blob/--es/--broker/--kafka/--rabbit），
     // 缺省 default；未声明 fail-fast（装配层统一校验）。
@@ -89,6 +99,9 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
         None => None,
     };
     let args = a.args;
+    // 模块索引（v0.1.85 `--module-root`）：主线程解析、exec 线程带走（同一 Arc，
+    // 与 StableState / OjModuleLoader 同源）。
+    let module_index = module_index.clone();
     let handle = std::thread::Builder::new()
         .name("oj-exec".into())
         .spawn(move || {
@@ -106,6 +119,7 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                     true,
                     &profiles,
                     None,
+                    module_index.clone(),
                 )
                 .await?;
                 // 迁移门禁（spec §3.1）：exec 缺省全跳过（与 server dev 缺省 auto 相反，
@@ -116,13 +130,20 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                     let db_key = profiles.db.as_deref().unwrap_or("default");
                     match gate {
                         "auto" => {
-                            crate::migrate::apply_all(stable.dbs.get(db_key), &dir, true, false)
-                                .await?;
+                            crate::migrate::apply_all(
+                                stable.dbs.get(db_key),
+                                &dir,
+                                true,
+                                false,
+                                module_index.as_deref(),
+                            )
+                            .await?;
                             for l in crate::schema::reconcile_all(
                                 stable.dbs.get(db_key).map(|a| a.as_ref()),
                                 &dir,
                                 true,
                                 db_key,
+                                module_index.as_deref(),
                             )
                             .await?
                             {
@@ -130,7 +151,13 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
                             }
                         }
                         "verify" => {
-                            crate::migrate::verify_all(stable.dbs.get(db_key), &dir, true).await?
+                            crate::migrate::verify_all(
+                                stable.dbs.get(db_key),
+                                &dir,
+                                true,
+                                module_index.as_deref(),
+                            )
+                            .await?
                         }
                         "off" => {}
                         other => {
@@ -175,8 +202,12 @@ pub fn run(a: ExecArgs) -> Result<i32, String> {
 fn build_runtime(backend: &Backend, options: ExecOptions) -> JsRuntime {
     let stable = backend.stable();
     let loader = stable.loader.clone();
-    let module_loader: Option<Rc<dyn deno_core::ModuleLoader>> =
-        loader.map(|inner| Rc::new(OjModuleLoader { inner }) as Rc<dyn deno_core::ModuleLoader>);
+    let module_loader: Option<Rc<dyn deno_core::ModuleLoader>> = loader.map(|inner| {
+        Rc::new(OjModuleLoader {
+            inner,
+            module_index: stable.module_index.clone(),
+        }) as Rc<dyn deno_core::ModuleLoader>
+    });
 
     let mut extensions = ws_client_extensions();
     extensions.push(bridge_ext_init(stable.clone()));
@@ -401,6 +432,7 @@ mod tests {
             true,
             &ResourceProfiles::default(),
             None,
+            None,
         )
         .await
         .unwrap()
@@ -545,6 +577,7 @@ mod tests {
             site: None,
             file: Some(script.to_string_lossy().into()),
             code: None,
+            module_root: None,
             repl: false,
             config: Some(tmp.join("config.yaml").to_string_lossy().into()),
             dir: Some(tmp.to_string_lossy().into()),
@@ -604,6 +637,7 @@ mod tests {
                 site: None,
                 file: Some(script.to_string_lossy().into()),
                 code: None,
+                module_root: None,
                 repl: false,
                 config: Some(p.to_string_lossy().into()),
                 dir: Some(tmp.join("src").to_string_lossy().into()),

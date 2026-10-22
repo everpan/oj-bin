@@ -10,18 +10,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use only_js::bridge::import_scan::specifier_spans;
+use only_js::bridge::{ModuleIndex, stray_manifests};
 
 use crate::manifest::{self, Manifest};
 
 /// 检查 `names` 列出的模块（归属图按 src 全部模块构建，S002 只报涉及被查模块的冲突；
 /// 旁目录缺 manifest.yaml 不在此报——S001 归 load_modules/既有路径）。
 /// view = 跨模块版本视图（dist/manifests.yaml 锁 ∪ src 各模块 manifest，build 已构造）。
+/// `index`（`--module-root`）：模块根可不在首层，`src/<name>/` 不再成立——模块根、
+/// 别名目标、S008 归属一律由索引给出。None = 今日语义。
 /// 返回全部违规（一次给全，不逐条 fail-fast——CI 修复体验）。
 pub fn run(
     src: &Path,
     names: &[String],
     view: &BTreeMap<String, String>,
     guard: only_js::bridge::SqlGuard,
+    index: Option<&ModuleIndex>,
 ) -> Result<(), String> {
     let mut v: Vec<String> = Vec::new();
 
@@ -29,7 +33,7 @@ pub fn run(
     let mut owner: BTreeMap<String, String> = BTreeMap::new();
     let mut schemas: BTreeMap<String, crate::schema::SchemaFile> = BTreeMap::new();
     let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
-    for (name, mdir) in scan_modules(src)? {
+    for (name, mdir) in scan_modules(src, index)? {
         let mf = mdir.join("manifest.yaml");
         if mf.is_file() {
             manifests.insert(name.clone(), manifest::parse_one(&mf)?);
@@ -52,7 +56,7 @@ pub fn run(
     // S008（项目级）：别名锚点必须唯一——manifest.yaml 只允许出现在模块根
     // （`src/<m>/manifest.yaml`）。嵌套的会被 `#` 别名的「向上最近 manifest.yaml」
     // 规则当作锚点，静默改写整个子树的语义。
-    for f in nested_manifests(src)? {
+    for f in nested_manifests(src, index)? {
         v.push(format!(
             "S008: src/{f}: manifest.yaml 只能出现在模块根（src/<module>/manifest.yaml）\n  \
              原因：`#` 别名以「向上最近的 manifest.yaml」为模块根锚点，嵌套声明会改写该子树内\
@@ -79,7 +83,11 @@ pub fn run(
     }
 
     for name in names {
-        let mdir = src.join(name);
+        // 模块根：索引下按 name 定位（目录名不参与身份）；否则 `src/<name>/`。
+        let mdir = match index.and_then(|i| i.get(name)) {
+            Some(e) => e.root.clone(),
+            None => src.join(name),
+        };
         let Some(m) = manifests.get(name) else {
             continue;
         };
@@ -144,7 +152,7 @@ pub fn run(
                 if !spec.starts_with('#') {
                     continue;
                 }
-                match only_js::bridge::resolve_alias(&spec, &dir, src, true) {
+                match only_js::bridge::resolve_alias(&spec, &dir, src, true, index) {
                     Err(e) => v.push(format!(
                         "S008: {}: 别名 {spec} 无法解析\n  {e}\n  \
                          下一步：改用相对路径，或修正别名目标（`#x` 相对本模块根、\
@@ -152,11 +160,26 @@ pub fn run(
                         f.display()
                     )),
                     Ok(file) => {
-                        let target = file
-                            .strip_prefix(src)
-                            .ok()
-                            .and_then(|r| r.components().next())
-                            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+                        // 目标模块：索引下按最长前缀归属（首段在嵌套布局里是目录名，
+                        // 不是模块名——取错会让 S008 报出「未声明的依赖 foo」）。
+                        let target = match index.and_then(|i| i.locate(&file)) {
+                            Some((t, _, _)) => Some(t.to_string()),
+                            // file 来自 resolve_alias（canonical 形态），src 可能是原样
+                            // CLI 路径——canonical 剥不动时按原样再试一次。
+                            None => file
+                                .strip_prefix(src)
+                                .ok()
+                                .or_else(|| {
+                                    // Windows 专项：canonicalize 带 `\\?\` 前缀，须剥后
+                                    // 再比（file 来自 resolve_alias，已是非 verbatim 形态）。
+                                    let c = only_js::bridge::strip_verbatim(
+                                        &std::fs::canonicalize(src).ok()?,
+                                    );
+                                    file.strip_prefix(&c).ok()
+                                })
+                                .and_then(|r| r.components().next())
+                                .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+                        };
                         if let Some(t) = target
                             && t != *name
                             && !deps.contains_key(&t)
@@ -256,7 +279,15 @@ pub fn run(
 
 /// src 首层子目录扫描（宽容版 discover：缺 manifest.yaml 的目录跳过而非报错——
 /// S001 属 load_modules/既有构建路径；YAML 解析错仍传播）。
-fn scan_modules(src: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+/// `index` 覆盖 `src` 时改按索引（模块根可不在首层）。
+fn scan_modules(src: &Path, index: Option<&ModuleIndex>) -> Result<Vec<(String, PathBuf)>, String> {
+    if let Some(idx) = crate::manifest::covers(index, src) {
+        return Ok(idx
+            .modules
+            .iter()
+            .map(|(n, e)| (n.clone(), e.root.clone()))
+            .collect());
+    }
     let rd = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     let mut out = Vec::new();
     for e in rd.flatten() {
@@ -330,9 +361,16 @@ fn collect_ts(mdir: &Path) -> Vec<PathBuf> {
 /// 模块根 = `src/<m>/manifest.yaml`；其下再出现 manifest.yaml 会让 `#` 别名的锚点
 /// （「向上最近的 manifest.yaml」）指向该嵌套目录 → 子树内所有别名的语义被静默改写，
 /// 且 src 根锚点（`#/m/x`）随之失效。这是锚点唯一性的硬前提，故 fail-fast。
-fn nested_manifests(src: &Path) -> Result<Vec<String>, String> {
+///
+/// 索引下模块根可不在首层（发现乙）：判据改为「base 下含 `manifest.yaml` 但**不在
+/// 索引 roots 集合内**的目录」——否则 `src/foo/api/manifest.yaml` 会被当成嵌套，
+/// 带 `--module-root` 的构建直接 S008 硬失败。
+fn nested_manifests(src: &Path, index: Option<&ModuleIndex>) -> Result<Vec<String>, String> {
+    if let Some(idx) = crate::manifest::covers(index, src) {
+        return Ok(stray_manifests(idx));
+    }
     let mut out = Vec::new();
-    for (_, mdir) in scan_modules(src)? {
+    for (_, mdir) in scan_modules(src, None)? {
         let mut stack = vec![mdir.clone()];
         while let Some(d) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&d) else {
@@ -489,7 +527,7 @@ mod tests {
     }
 
     fn names(src: &Path) -> Vec<String> {
-        manifest::load_modules(src, None)
+        manifest::load_modules(src, None, None)
             .unwrap()
             .into_iter()
             .map(|m| m.name)
@@ -509,7 +547,8 @@ mod tests {
                 &t.join("src"),
                 &names(&t.join("src")),
                 &view,
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -529,6 +568,7 @@ mod tests {
             &names(&t.join("src")),
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -547,7 +587,8 @@ mod tests {
                 &t.join("src"),
                 &names(&t.join("src")),
                 &view,
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -566,6 +607,7 @@ mod tests {
             &["order".to_string()],
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S006") && e.contains("account"), "{e}");
@@ -580,7 +622,8 @@ mod tests {
                 &t.join("src"),
                 &["order".to_string()],
                 &view,
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -600,6 +643,7 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S004") && e.contains("^0.2.0"), "{e}");
@@ -610,7 +654,8 @@ mod tests {
                 &t.join("src"),
                 &["order".to_string()],
                 &view,
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -620,6 +665,7 @@ mod tests {
             &["order".to_string()],
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("不在 dist/manifests.yaml"), "{e}");
@@ -629,6 +675,7 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("不可解析"), "{e}");
@@ -642,6 +689,7 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("非法"), "{e}");
@@ -660,6 +708,7 @@ mod tests {
             &["order".to_string()],
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S005") && e.contains("ghost"), "{e}");
@@ -672,6 +721,7 @@ mod tests {
             &["order".to_string()],
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S005") && e.contains("orders"), "{e}");
@@ -690,6 +740,7 @@ mod tests {
             &["order".to_string()],
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S006") && e.contains("CREATE"), "{e}");
@@ -717,7 +768,8 @@ mod tests {
                 &t.join("src"),
                 &["order".to_string()],
                 &BTreeMap::new(),
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -726,6 +778,7 @@ mod tests {
             &names(&t.join("src")),
             &BTreeMap::new(),
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -759,7 +812,8 @@ mod tests {
                     &t.join("src"),
                     &[n.to_string()],
                     &view,
-                    only_js::bridge::SqlGuard::Off
+                    only_js::bridge::SqlGuard::Off,
+                    None,
                 )
                 .is_ok(),
                 "{n}"
@@ -775,6 +829,7 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S008") && e.contains("tried"), "{e}");
@@ -792,6 +847,7 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -808,7 +864,8 @@ mod tests {
                 &t.join("src"),
                 &["order".to_string()],
                 &view,
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );
@@ -822,9 +879,114 @@ mod tests {
             &["order".to_string()],
             &view,
             only_js::bridge::SqlGuard::Off,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("S008") && e.contains("nope"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（PRD §7-4，评审乙）：索引下跨模块别名按 **模块名** 判归属——缺 `deps`
+    /// 仍报 S008，且点名模块名（`user`），目录名（`aa`）不参与身份、不进诊断。
+    #[test]
+    fn given_nested_module_roots_when_alias_cross_module_without_deps_then_s008_names_module() {
+        let t = std::env::temp_dir().join(format!("oj-chk-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        // 目录名（aa/bb）与模块名（user/order）刻意不一致
+        write(
+            &t.join("src/aa/api/manifest.yaml"),
+            &manifest("user", "tables: [account]\n"),
+        );
+        write(
+            &t.join("src/aa/api/schema.yaml"),
+            "tables:\n  account:\n    pk: id\n    columns:\n      id: { type: integer }\n",
+        );
+        write(
+            &t.join("src/aa/api/_shared/validate.ts"),
+            "export const v = 1;\n",
+        );
+        write(
+            &t.join("src/bb/api/manifest.yaml"),
+            &manifest("order", "tables: [orders]\n"),
+        );
+        write(
+            &t.join("src/bb/api/schema.yaml"),
+            "tables:\n  orders:\n    pk: id\n    columns:\n      id: { type: integer }\n",
+        );
+        write(
+            &t.join("src/bb/api/list/api.ts"),
+            "import { v } from \"#/user/_shared/validate\";\nexport default {};\n",
+        );
+        let src = t.join("src").canonicalize().unwrap();
+        let idx = only_js::bridge::resolve_roots(&src, true, None).unwrap();
+        let view = BTreeMap::from([
+            ("user".to_string(), "0.1.0".to_string()),
+            ("order".to_string(), "0.1.0".to_string()),
+        ]);
+        // When：跨模块别名未声明 deps
+        let e = run(
+            &src,
+            &["order".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+            Some(&idx),
+        )
+        .unwrap_err();
+        // Then：S008 点名模块名与下一步；目录名不出现
+        assert!(e.contains("S008") && e.contains("deps"), "{e}");
+        assert!(e.contains("user"), "{e}");
+        assert!(!e.contains("aa/"), "{e}");
+        // 声明 deps 后放行（索引重建：manifest 已改）
+        write(
+            &t.join("src/bb/api/manifest.yaml"),
+            &manifest("order", "tables: [orders]\ndeps:\n  user: \"^0.1.0\"\n"),
+        );
+        let idx = only_js::bridge::resolve_roots(&src, true, None).unwrap();
+        assert!(
+            run(
+                &src,
+                &["order".to_string()],
+                &view,
+                only_js::bridge::SqlGuard::Off,
+                Some(&idx),
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// BDD（评审甲）：索引下模块内再放 `manifest.yaml`（stray）→ S008 点名该模块，
+    /// 且**不**指向父模块根（否则等于鼓励把子目录当模块）。
+    #[test]
+    fn given_index_when_manifest_nested_inside_module_then_s008_points_at_the_module() {
+        let t = std::env::temp_dir().join(format!("oj-chk-stray-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        write(
+            &t.join("src/aa/api/manifest.yaml"),
+            &manifest("user", "tables: [account]\n"),
+        );
+        write(
+            &t.join("src/aa/api/schema.yaml"),
+            "tables:\n  account:\n    pk: id\n    columns:\n      id: { type: integer }\n",
+        );
+        write(
+            &t.join("src/aa/api/sub/manifest.yaml"),
+            &manifest("sub", ""),
+        );
+        let src = t.join("src").canonicalize().unwrap();
+        // 索引照建（stray 不阻断发现，交由 S008 报）
+        let idx = only_js::bridge::resolve_roots(&src, true, None).unwrap();
+        assert!(idx.get("sub").is_none(), "嵌套声明不得被认作模块");
+        let view = BTreeMap::from([("user".to_string(), "0.1.0".to_string())]);
+        let e = run(
+            &src,
+            &["user".to_string()],
+            &view,
+            only_js::bridge::SqlGuard::Off,
+            Some(&idx),
+        )
+        .unwrap_err();
+        assert!(e.contains("S008") && e.contains("sub"), "{e}");
         let _ = std::fs::remove_dir_all(&t);
     }
 
@@ -847,7 +1009,8 @@ mod tests {
                 &t.join("src"),
                 &["order".to_string()],
                 &BTreeMap::new(),
-                only_js::bridge::SqlGuard::Off
+                only_js::bridge::SqlGuard::Off,
+                None,
             )
             .is_ok()
         );

@@ -51,6 +51,7 @@ mod loader;
 mod log;
 pub mod mail;
 mod module_loader;
+pub mod module_scan;
 pub mod mq;
 mod named_registry;
 pub mod oidc;
@@ -91,6 +92,12 @@ pub use loader::HandlerStore;
 pub use module_loader::{
     LoaderShared, OjModuleLoader, resolve_alias, resolve_relative, strip_verbatim,
     versioned_specifier,
+};
+// 模块索引：源码树 → 模块根 → 模块名 / URL 前缀。运行期（别名解析）与构建期（导入实化、
+// 路由、检查）共用同一份发现结果，避免「dev 认、build 不认」的分叉。
+pub use module_scan::{
+    ModuleEntry, ModuleIndex, manifest_head, resolve_prefix, resolve_roots, stray_manifests,
+    validate_module, validate_prefix, validate_version,
 };
 pub use mq::MqInstance;
 pub use named_registry::NamedRegistry;
@@ -152,6 +159,9 @@ pub struct StableState {
     /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
     /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
     pub loader: Option<Arc<module_loader::LoaderShared>>,
+    /// 模块索引（`--module-root` 递归发现的结果；None = 今日布局「src 根首层子目录 =
+    /// 模块根」）。别名 `#/<name>/…` 首段按 `manifest.name` 在此查锚点。装配期冻结、只读。
+    pub module_index: Option<Arc<ModuleIndex>>,
     /// blob 注册表（阶段 0 单后端形态：至多一个 "default"；阶段 1 命名多后端）。
     pub blobs: Arc<blob::BlobRegistry>,
     /// 事件总线（统一契约 `EventBroker`）：进程内 `Bus` 或分布式 Kafka/RabbitMQ；
@@ -236,6 +246,8 @@ pub struct StableState {
 /// bridge 可选能力注入（构造期一次）。
 #[derive(Default)]
 pub struct Extras {
+    /// 模块索引（`--module-root` 递归发现结果）；缺省 None = 今日布局（别名按目录名解析）。
+    pub module_index: Option<Arc<ModuleIndex>>,
     /// None = 零后端（blob.* 报 notConfigured）。
     pub blobs: Option<Arc<blob::BlobRegistry>>,
     /// Some = 共享总线（server 跨连接广播）；None = 每 Bridge 自带新 Bus（进程内）。
@@ -775,6 +787,7 @@ impl Bridge {
             dbs,
             registry: Arc::new(registry),
             loader,
+            module_index: extras.module_index,
             seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
             blobs: extras
                 .blobs
@@ -2483,6 +2496,7 @@ mod tests {
             registry: Arc::new(SchemaRegistry::new()),
             input_contracts: None, // 单测路径不注入契约（默认不校验）
             seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
+            module_index: None,
             loader: Some(Arc::new(LoaderShared {
                 project_root: root.clone(),
                 ts: false,

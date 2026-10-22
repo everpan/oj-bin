@@ -12,7 +12,9 @@ use only_js::bridge::plugin_loader::{
     LoadedPlugin, PluginManifestEntry, blob_backend_connect, bus_backend, db_backend, es_backend,
     host_context, load_manifest, load_scanned, resolve_plugins_dir,
 };
-use only_js::bridge::{BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, PluginInfo};
+use only_js::bridge::{
+    BusBackendRegistry, DataAccessor, DbBackendRegistry, EsBackend, ModuleIndex, PluginInfo,
+};
 use only_js::config::{self, Config, LoadedConfig};
 
 use crate::app::{App, ResourceProfiles};
@@ -29,13 +31,20 @@ pub const DEFAULT_API_PREFIX: &str = "/v1/api";
 /// `prefix=dir` → 同 prefix 条目替换否则追加。`-b` 无 `--api-path` → Err
 /// （裸 -b 在挂载模型下无处附着，静默忽略等于部署假配置）。
 fn fold_cli_mounts(cfg: &mut Config, a: &ServeArgs) -> Result<(), String> {
-    if a.base.is_some() && a.api_path.is_none() {
+    if a.api_path.is_some() && a.module_root.is_some() {
+        return Err(
+            "--module-root and --api-path are mutually exclusive (both mean the source tree root)"
+                .into(),
+        );
+    }
+    // --module-root 与 --api-path 同为「源码树根」：-b 附着任一条都成立。
+    if a.base.is_some() && a.api_path.is_none() && a.module_root.is_none() {
         return Err("--base/-b requires --api-path (api mounts carry their own prefix)".into());
     }
     if !a.app_path.is_empty() {
         fold_cli_app_paths(cfg, &a.app_path)?;
     }
-    if let Some(d) = &a.api_path {
+    if let Some(d) = a.api_path.as_deref().or(a.module_root.as_deref()) {
         // URL api mount 只能经 config 的 mounts[].api 声明（含 sha256 完整性锚），
         // --api-path 仅接受本地目录（远程 tarball 在 CLI 折叠期无 sha256 上下文）。
         if only_js::config::is_http_url(d) {
@@ -88,8 +97,27 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
 
 async fn run_inner(a: ServeArgs) -> Result<(), String> {
     let (mut cfg, top, config_dir) = load_cfg(a.config.as_deref(), true)?;
-    // CLI 挂载折叠：--api-path / --app-path 全部 upsert 进 cfg.mounts（CLI 优先）。
+    // CLI 挂载折叠：--api-path / --module-root / --app-path 全部 upsert 进 cfg.mounts
+    // （CLI 优先）。
     fold_cli_mounts(&mut cfg, &a)?;
+    // 模块索引（`--module-root`）：装配期一次发现，贯穿 StableState / 路由 / 迁移 / 种子。
+    let module_index: Option<Arc<ModuleIndex>> = match a.module_root.as_deref() {
+        None => None,
+        Some(mr) => {
+            let root = PathBuf::from(absolutize_cwd(
+                &std::env::current_dir().map_err(|e| format!("resolve --module-root: {e}"))?,
+                mr,
+            ));
+            // 产物树（release）没有「模块根」概念——静默忽略会让下游以为生效了。
+            if is_release(&root) {
+                return Err(format!(
+                    "--module-root is a source-tree option: {} is a release tree (contains manifests.yaml) — point it at the src tree, or drop --module-root",
+                    root.display()
+                ));
+            }
+            Some(Arc::new(only_js::bridge::resolve_roots(&root, true, None)?))
+        }
+    };
     if let Some(p) = a.cert_path.clone() {
         cfg.server.certificate_path = p;
     }
@@ -166,6 +194,7 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
         &ResourceProfiles::default(),
         None,
         Some(reload_slot.clone()),
+        module_index.clone(),
     )
     .await?;
     // 任务域事件化（PRD v2 §6/§9 阶段 1）：扫描 → 探测 loop_body 导出分流——
@@ -203,6 +232,7 @@ async fn run_inner(a: ServeArgs) -> Result<(), String> {
             prefixes,
             config_path,
             reload_slot,
+            module_index,
         )
         .await;
     }
@@ -267,6 +297,8 @@ async fn serve_hot_reload_branch(
     // 热更触发槽（ojm PR-3）：run() 创建并已随首代 App::from_config 冻结进
     // Extras/StableState；本函数在 ReloadState + set_executor 之后 set 内容。
     reload_slot: Arc<std::sync::OnceLock<only_js::bridge::reload_bridge::ReloadExecutorLike>>,
+    // 模块索引（`--module-root`）：跨代同一 Arc（布局由命令行给定，热更不重新发现）。
+    module_index: Option<Arc<ModuleIndex>>,
 ) -> Result<(), String> {
     // 首代归一 raw 文档作为幂等/diff 基线（reload 路径一致，稳定）。
     // 用 raw 文档而非解析后的 `Config`：避免对核心 `Config` 强加 `Serialize` /
@@ -288,6 +320,7 @@ async fn serve_hot_reload_branch(
         current_doc: tokio::sync::Mutex::new(baseline_doc),
         current_sha: tokio::sync::Mutex::new(baseline_sha),
         config_path: config_path.clone(),
+        module_index: module_index.clone(),
         tasking: tokio::sync::Mutex::new(initial_tasking),
         current_task_flag: Arc::new(tokio::sync::Mutex::new(task_flag)),
         committer: tokio::sync::OnceCell::new(),
@@ -382,6 +415,9 @@ struct HotReloadCtx {
     /// 热更触发槽（ojm PR-3）：与首代 Extras/StableState.reload 同一 Arc；
     /// do_reload 每代重建 App 时随 from_config 穿参，槽指针跨代同一。
     reload_slot: Arc<std::sync::OnceLock<only_js::bridge::reload_bridge::ReloadExecutorLike>>,
+    /// 模块索引（`--module-root`）：跨代同一 Arc——模块布局由命令行给定，热更只换
+    /// 配置与路由，不重新发现模块（新增模块目录需重启，见文档）。
+    module_index: Option<Arc<ModuleIndex>>,
 }
 
 impl HotReloadCtx {
@@ -463,6 +499,7 @@ async fn do_reload(ctx: &HotReloadCtx) -> Result<serve::reload::ReloadOutcome, (
         // 槽指针随代传递（ojm PR-3）：复用 Backend 时 Extras 不重建，但同一 Arc
         // 的传入保证「每代热更新建 App 同样带槽」，热更一次后 reloadConfig 不失效。
         Some(ctx.reload_slot.clone()),
+        ctx.module_index.clone(),
     )
     .await
     .map_err(|e| (400u16, e))?;
@@ -932,17 +969,26 @@ pub fn load_cfg(
 ///   优先、dist 次之）。`-b` 改写第一条 api 挂载的前缀（无挂载 → 以该前缀新增）。
 /// - ts = 目录即模式（`is_release`）。目录缺失不在此拦截：test/migrate 强依赖 api
 ///   目录、各自就地报错；from_config 对缺失目录全程容忍（模块扫描 NotFound = 空）。
+/// - `--module-root`（v0.1.85）与 `-d` 同为「源码树根」，二者互斥；给了即在子树内
+///   **递归**发现模块（模块名取 `manifest.yaml` 的 name），索引随结果一并返回。
 pub fn load_app_config(
     config: Option<&str>,
     site: Option<&str>,
     dir_override: Option<&str>,
     base_override: Option<&str>,
     note_on_default: bool,
-) -> Result<(Config, serde_json::Value, PathBuf, PathBuf, bool, String), String> {
+    module_root: Option<&str>,
+) -> Result<AppConfig, String> {
     let (mut cfg, top, config_dir) = load_cfg(config, note_on_default)?;
+    if dir_override.is_some() && module_root.is_some() {
+        return Err(
+            "--module-root and -d/--dir are mutually exclusive (both mean the source tree root)"
+                .into(),
+        );
+    }
     if site.is_some() {
-        if dir_override.is_some() {
-            return Err("--site and -d/--dir are mutually exclusive".into());
+        if dir_override.is_some() || module_root.is_some() {
+            return Err("--site and -d/--dir/--module-root are mutually exclusive".into());
         }
         if base_override.is_some() {
             return Err("--site and -b/--base are mutually exclusive".into());
@@ -984,10 +1030,19 @@ pub fn load_app_config(
         if let Some(m) = picked {
             cfg.mounts = vec![m];
         }
-        return Ok((cfg, top, config_dir, dir, ts, prefix));
+        return Ok(AppConfig {
+            cfg,
+            top,
+            config_dir,
+            dir,
+            ts,
+            base: prefix,
+            module_index: None,
+        });
     }
-    // -d：覆盖第一条 api 挂载的目录（无挂载 → 以默认前缀新增一条）。
-    let dir = match dir_override {
+    // -d / --module-root：覆盖第一条 api 挂载的目录（无挂载 → 以默认前缀新增一条）。
+    // 二者 clap 层已互斥，此处 `.or()` 只为「同一个语义、一个入口」——下游只认 dir。
+    let dir = match dir_override.or(module_root) {
         Some(d) => {
             let p = absolutize_cwd(
                 &std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?,
@@ -1055,7 +1110,48 @@ pub fn load_app_config(
             .unwrap_or_else(|| DEFAULT_API_PREFIX.to_string()),
     };
     let ts = !is_release(&dir);
-    Ok((cfg, top, config_dir, dir, ts, base))
+    // --module-root：递归发现模块索引（模块名取 manifest.yaml 的 name，目录名不参与身份）。
+    // 产物树（release）没有「模块根」概念——静默忽略会让下游以为生效了，故 fail-fast。
+    let module_index = match module_root {
+        None => None,
+        Some(_) if !ts => {
+            return Err(format!(
+                "--module-root is a source-tree option: {} is a release tree (contains dist manifests.yaml) — point it at the src tree, or drop --module-root",
+                dir.display()
+            ));
+        }
+        Some(mr) => {
+            let cwd = std::env::current_dir().map_err(|e| format!("resolve cwd: {e}"))?;
+            let abs = PathBuf::from(absolutize_cwd(&cwd, mr));
+            Some(Arc::new(only_js::bridge::resolve_roots(&abs, true, None)?))
+        }
+    };
+    Ok(AppConfig {
+        cfg,
+        top,
+        config_dir,
+        dir,
+        ts,
+        base,
+        module_index,
+    })
+}
+
+/// `load_app_config` 的返回（v0.1.85：6 元组改为具名结构——加了模块索引后元组已
+/// 长到读不出字段含义）。
+pub struct AppConfig {
+    pub cfg: Config,
+    /// 顶层全量段 JSON（插件自报 config key 的查找面）。
+    pub top: serde_json::Value,
+    pub config_dir: PathBuf,
+    /// api 树根（源码树 src / 产物树 dist）。
+    pub dir: PathBuf,
+    /// dev（ts）模式。
+    pub ts: bool,
+    /// URL 前缀（base）。
+    pub base: String,
+    /// 模块索引（`--module-root` 的递归发现结果）；None = 今日首层语义。
+    pub module_index: Option<Arc<ModuleIndex>>,
 }
 
 /// 缺省 api 目录搜索（无 `-d`、无 api 挂载时的兜底）：自 config 同级（无 config 时
@@ -1222,6 +1318,7 @@ pub async fn start(
         config_dir,
         false,
         &ResourceProfiles::default(),
+        None,
         None,
         None,
     )
@@ -2217,19 +2314,19 @@ mod tests {
         std::fs::create_dir_all(t.0.join("dist")).unwrap();
         std::fs::write(t.0.join("config.yaml"), "{}\n").unwrap();
         let cfg = t.0.join("config.yaml");
-        let (_, _, _, dir, ts, _) =
-            load_app_config(Some(cfg.to_str().unwrap()), None, None, None, false).unwrap();
-        assert_eq!(dir, t.0.join("src"));
-        assert!(ts);
+        let ac =
+            load_app_config(Some(cfg.to_str().unwrap()), None, None, None, false, None).unwrap();
+        assert_eq!(ac.dir, t.0.join("src"));
+        assert!(ac.ts);
 
         // 同级只有 dist → dist。
         let t2 = tmpdir("defdir-dist");
         std::fs::create_dir_all(t2.0.join("dist")).unwrap();
         std::fs::write(t2.0.join("config.yaml"), "{}\n").unwrap();
         let cfg2 = t2.0.join("config.yaml");
-        let (_, _, _, dir2, _, _) =
-            load_app_config(Some(cfg2.to_str().unwrap()), None, None, None, false).unwrap();
-        assert_eq!(dir2, t2.0.join("dist"));
+        let ac =
+            load_app_config(Some(cfg2.to_str().unwrap()), None, None, None, false, None).unwrap();
+        assert_eq!(ac.dir, t2.0.join("dist"));
 
         // config 下钻一层（sub/config.yaml），src 在父级 → 向上搜索命中。
         let t3 = tmpdir("defdir-up");
@@ -2237,9 +2334,9 @@ mod tests {
         std::fs::create_dir_all(t3.0.join("sub")).unwrap();
         std::fs::write(t3.0.join("sub/config.yaml"), "{}\n").unwrap();
         let cfg3 = t3.0.join("sub/config.yaml");
-        let (_, _, _, dir3, _, _) =
-            load_app_config(Some(cfg3.to_str().unwrap()), None, None, None, false).unwrap();
-        assert_eq!(dir3, t3.0.join("src"));
+        let ac =
+            load_app_config(Some(cfg3.to_str().unwrap()), None, None, None, false, None).unwrap();
+        assert_eq!(ac.dir, t3.0.join("src"));
     }
 
     /// search_api_dir 只认「像业务树」的候选：非业务 src（如源码仓自己的 Rust 树，
@@ -2279,14 +2376,16 @@ mod tests {
         // 全链（回归 v0.1.58 exec e2e 用的形态）：config={}/src=空 → load_app_config
         // 必须解析出该 src（而非占位）。
         std::fs::write(t4.0.join("cfg2.yaml"), "{}\n").unwrap();
-        let (_, _, _, dir2, _, _) = load_app_config(
+        let dir2 = load_app_config(
             Some(t4.0.join("cfg2.yaml").to_str().unwrap()),
             None,
             None,
             None,
             false,
+            None,
         )
-        .unwrap();
+        .unwrap()
+        .dir;
         assert_eq!(dir2, t4.0.join("src"), "空 src 须被全链解析命中");
     }
 
@@ -3198,7 +3297,7 @@ mod tests {
 
     /// 测试辅助：release 布局 apply_all（等价 `oj migrate -d dist`）。
     async fn oj_migrate_apply(dist: &Path, acc: &Arc<dyn DataAccessor>) {
-        crate::migrate::apply_all(Some(acc), dist, false, false)
+        crate::migrate::apply_all(Some(acc), dist, false, false, None)
             .await
             .unwrap();
     }

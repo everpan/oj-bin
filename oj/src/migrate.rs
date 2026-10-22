@@ -15,7 +15,7 @@ use refinery_core::{Migration, Report, Target};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use only_js::bridge::{DataAccessor, Dialect};
+use only_js::bridge::{DataAccessor, Dialect, ModuleIndex};
 
 /// refinery 契约要求的 Error newtype（String 载体）。
 #[derive(Debug)]
@@ -505,12 +505,13 @@ pub async fn apply_all(
     dir: &Path,
     ts: bool,
     baseline: bool,
+    module_index: Option<&ModuleIndex>,
 ) -> Result<(), String> {
     let Some(acc) = default else {
         eprintln!("warn: migrate skipped (no default db)");
         return Ok(());
     };
-    for (name, mdir) in crate::manifest::discover(dir, ts)? {
+    for (name, mdir) in crate::manifest::discover(dir, ts, module_index)? {
         let applied = apply_module(acc, &name, &mdir, baseline)
             .await
             .map_err(|e| format!("module {name}: {e}"))?;
@@ -534,11 +535,12 @@ pub async fn verify_all(
     default: Option<&Arc<dyn DataAccessor>>,
     dir: &Path,
     ts: bool,
+    module_index: Option<&ModuleIndex>,
 ) -> Result<(), String> {
     let Some(acc) = default else {
         return Ok(());
     };
-    for (name, mdir) in crate::manifest::discover(dir, ts)? {
+    for (name, mdir) in crate::manifest::discover(dir, ts, module_index)? {
         verify_module(acc, &name, &mdir)
             .await
             .map_err(|e| format!("module {name}: {e}"))?;

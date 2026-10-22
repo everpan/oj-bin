@@ -39,6 +39,18 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.85 已落地部分：**模块根可配置（`--module-root` + manifest `prefix`）**——
+① serve/build/openapi/test/migrate/exec/schema diff 新增 `--module-root <目录>`：子树内
+**递归**发现 `manifest.yaml`（命中即停），模块身份取 manifest 的 `name`（目录名只作定位），
+monorepo/存量仓库的模块可放任意深度；与 `-d`/`--api-path` 互斥；命中 0 个 manifest 或指向
+release 树均非零退出（树内就地 build 过的 `dist/ 会被扫描自动跳过，不重复登记）。
+② `manifest.yaml` 新增可选 `prefix`：模块 URL 前缀（可含 `/`
+分段），缺省/空串 = `name`，全局唯一——URL 由前缀决定（`<prefix>/xxx/yyy/api.ts` →
+`GET <prefix>/xxx/yyy`），dev 与 release 同口径。③ `#/m/x` 跨模块别名按 manifest
+`name` 解析（与目录名脱钩），**为跨模块导入首选写法**。不带 `--module-root` 时行为与
+v0.1.84 逐字节一致（平铺树构建产物/openapi 生成物实测比对）。见 api-manual §2「源码树/
+manifest.yaml」与「模块根可配置」、§5「别名导入」、§11、§13 错误/限制表、SKILL 陷阱速查。
+
 v0.1.84 已落地部分：**插件/FFI 层审计修复七项**——rabbitmq bus 面 publish 复用 channel（修逐次
 泄漏打满 channel_max 被 broker 杀连接）、推送订阅退避自愈（断连不再 topic 永久停摆，首次搭建
 仍同步报错）、kafka 消费错误日志 30s 节流、mysql/postgres 流式游标专用连接并发上限 8（超限报

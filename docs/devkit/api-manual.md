@@ -105,6 +105,8 @@ export default {
 ```bash
 ./bin/oj serve -c config.yaml --api-path src
 # 仓库内：先 cargo xtask build 产出 bin/oj，再从仓库根执行同形命令
+# v0.1.85：模块不在 src 首层时改用 --module-root（子树内递归发现 manifest.yaml）
+./bin/oj serve -c config.yaml --module-root services
 ```
 
 `serve` 按 `--api-path` 目录**自动判定模式**：目录里有 `dist/manifests.yaml`（即「构建锁」，
@@ -184,18 +186,53 @@ curl 'http://localhost:9778/v1/api/hello/'
   没有 `api` 文件的目录不是路由，可作共享工具目录（如 `_shared/`）。
 - 同目录可放 `ws.ts` 产生一条 WebSocket 路由（第 4 章）。
 
+#### 模块根可配置：`--module-root`（v0.1.85）
+
+模块不必再钉在 src 首层。给 `--module-root <dir>` 即在该目录子树内**递归**找
+`manifest.yaml`，命中即停（不再深入，模块根互不嵌套；跳过 `node_modules` 与点目录、
+不跟随目录符号链接）：
+
+```bash
+# 存量 monorepo：模块在任意深度的目录下，目录名只作定位
+./bin/oj serve -c config.yaml --module-root services
+# services/user/api/manifest.yaml（name: user）→ GET {base}/user/…
+# services/order/api/manifest.yaml（name: order）→ GET {base}/order/…
+```
+
+- **模块身份取 `manifest.yaml` 的 `name`**（产物目录 `dist/<name>-<version>/`、锁键、
+  tgz 名、URL 前缀、`#/m/x` 别名解析，全部按 name）；目录名与 name 不必一致。
+- **URL 前缀由 `prefix` 决定**（见下节），dev 与 release 同口径。
+- `-d`/`--api-path` 与 `--module-root` **互斥**（clap 层报错）——两者都是「源码树根」。
+- 显式指定却命中 0 个 manifest → 非零退出（`no manifest.yaml under module root …`，
+  下一步：确认该目录是后端源码树根）；指向 release 树（含 `manifests.yaml`）同样
+  fail-fast——`--module-root` 只认源码树。
+- 树内就地 build 过的 `dist/`（与模块根同级或在下层）会被扫描**整棵跳过**（锁目录剪枝）：
+  产物里的 manifest 是原样副本，不跳过会把同一模块重复登记成第二个模块根。
+
 ### manifest.yaml（模块清单）
 
 ```yaml
-name: "user"        # 必须等于父目录名（强校验，否则启动失败）
+name: "user"        # 模块名：平铺树（-d src）须等于父目录名；--module-root 下任意（递归发现）
 desc: "用户信息相关，记录账号、地址等个人信息"
 version: "0.1.0"
+# prefix: "sys/user"  # 可选（v0.1.85）：URL 前缀，可含 / 分段；缺省/空串 = 用 name
 # tables: [account]   # 有表模块必配：拥有的表清单（与 schema.yaml 双向一致 S005）
 # deps: { user: "^0.1.0" }  # 跨模块表访问声明（ownership_guard 校验依据）
 # config: {}        # 可选，本模块的其他设置
 ```
 
-`name` ≠ 目录名 → 启动报 `manifest name "x" != directory name "y"` 退出（防止模块名与路由脱节）。
+- 平铺树（`-d src`，不带 `--module-root`）：`name` ≠ 目录名 → 启动报
+  `manifest name "x" != directory name "y"` 退出（防止模块名与路由脱节）——
+  **与既往行为一致**。
+- `--module-root` 递归模式：`name` 不再受「== 目录名」约束（发现期改过白名单
+  `[A-Za-z0-9_-]`——它要进产物目录名与路由 pattern）。
+- **`prefix`（v0.1.85）**：该模块 URL 的第一段（们）。缺省或空串 = `prefix = name`；
+  非空时允许 `/` 分段（如 `sys/user`），每段 `[A-Za-z0-9_-]`，禁空段 / `.` / `..` /
+  首尾斜杠——前缀进路由 pattern，不得借路径段逃逸挂载根。**全局唯一**：两个模块
+  （含默认 = name 的）争同一条 URL → 拒启
+  （`url prefix "x" declared by both module "a" (…) and "b" (…)`）。
+  URL 因此由前缀而非目录结构决定：`<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`，
+  dev 与 release 一致。
 
 ### seed.sql（可选）
 
@@ -836,18 +873,22 @@ export default {
 
 > 何时读我：import 报错或想抽公共代码时。
 
-### 别名导入（共享库推荐写法）
+### 别名导入（共享库推荐写法；**跨模块首选 `#/m/x`**）
 
-`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**（`m` = 模块目录名）。与目录深度无关，
-目录搬动不用改引用：
+`#x` 锚在**本模块根**、`#/m/x` 锚在 **src 根**（`m` = 模块名，v0.1.85 起 =
+`manifest.yaml` 的 `name`，与目录名无关）。与目录深度无关，目录搬动不用改引用：
 
 ```ts
 // src/user/profile/detail/api.ts —— 无论嵌套多深，写法完全一样
 import { positiveId } from "#_shared/validate";        // → src/user/_shared/validate.ts
 import { v } from "#_shared";                          // → src/user/_shared/index.ts（目录索引）
 import { p } from "#_shared/validate.ts";              // 显式后缀
-import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必须是模块目录名
+import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段是模块名（manifest name）
 ```
+
+**跨模块导入请首选 `#/m/x` 别名**（而非相对路径）：按模块名寻址，不随目录结构调整
+失效；dev / release 共用同一套解析逻辑，产物里实化为版本目录相对路径。
+相对跨模块导入仅建议用于「目标模块目录固定且相邻」的存量代码。
 
 规则与边界：
 
@@ -856,6 +897,8 @@ import { requireRole } from "#/user/_shared/validate"; // 跨模块：首段必�
   `manifest.yaml` 祖先。`src/tests` 用例目录与任务池在模块外 → 没有锚点，继续用相对路径。
   运行期与构建期**共用同一套路径解析逻辑**（`resolve_relative` / `resolve_alias`），所以 dev 与
   release 对同一 specifier 必然命中同一文件（含目录索引）。
+- **`#/m/x` 的 `m` 是模块名**：平铺树下 = 首层目录名；`--module-root` 递归发现下 =
+  manifest `name`（目录名不再参与身份，v0.1.85）。
 - **跨模块别名需声明依赖**：`manifest.yaml` 的 `deps` 缺目标模块 → `oj build` 报 S008
   （与表归属 S003 同一套归属图）。既有**相对**跨模块引用不追溯（升级不破坏）。
 - release：build 期实化为版本目录相对路径，跨模块目标按 `dist/manifests.yaml` 锁钉版本，
@@ -3021,6 +3064,7 @@ oj 仓库 `sample/`（github.com/everpan/oj-bin）的「OIDC 演示」；实现�
 | `-c/--config` | 配置文件（v0.1.57 起可省：CWD 逐级向上 → `$HOME/.oj/config.yaml` 搜索，未找到用内置默认） |
 | `-b/--base` | API 基础前缀覆盖（server：`--api-path` 折叠挂载的 prefix，默认 `/v1/api`，裸 `-b` 报错；openapi/test：覆盖路由前缀） |
 | `-d/--dir` | 源码目录 `src` 或产物 `dist`（默认自动判定） |
+| `--module-root` | 源码树根（v0.1.85）：子树内递归发现模块（模块名取 manifest `name`）；与 `-d` 互斥。serve / build / openapi / test / migrate / exec / schema diff 同口径 |
 | `-t/--tests` | 测试目录，相对 config 目录（默认 `tests`） |
 | `--format` | `human`（默认）/ `tap` / `junit` / `json` |
 | `--output` | 报告落盘文件；省略打到 stdout（机器格式 stdout 纯净） |
@@ -3728,7 +3772,7 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | config 声明 `es:` 但无 es 插件 | fail fast 退出 |
 | `-d` 目录不存在 | 启动即报错 |
 | 首层子目录缺 `manifest.yaml` | `missing manifest.yaml` 退出 |
-| `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出 |
+| `manifest.yaml` 的 `name` ≠ 目录名 | `manifest name "x" != directory name "y"` 退出（仅平铺树 `-d`；v0.1.85 起 `--module-root` 递归模式下 name 与目录名无关，发现期改过白名单） |
 | 版本目录名碰撞 | `version dir collision` 退出 |
 | release：`manifests.yaml` 缺失/损坏/指向不存在版本 | 报错提示先 `oj build` |
 | `no mounts configured — …` | 准入门（v0.1.58）：`mounts:`（config + CLI 折叠后）为空——加一条挂载或传 `--api-path`/`--app-path` |
@@ -3739,6 +3783,14 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 | `mounts[i]: <url> sha256 mismatch (got …, expected …)` | （v0.1.77）下载内容 sha256 与声明不符 → 拒启（不静默当明文 / 降级） |
 | `mounts[i]: dist root missing manifests.yaml` / `extraction rejected: <reason>` | （v0.1.77）远程 dist 根解压后无 `manifests.yaml`，或单条目触发 tar-slip / 符号链接 / 特殊文件 / 超预算 → 拒启（解压器 fail-fast） |
 | `api path '<url>' is a URL — declare remote dist via mounts[].api in config` | （v0.1.77）`--api-path` 收到 URL → 报错引导走 config（CLI 折叠期无 sha256 上下文） |
+| `-d` 与 `--module-root` 同时给 | （v0.1.85）clap 层 `conflicts_with` 报错（exit 2）——两者都是「源码树根」，二选一 |
+| `no manifest.yaml under module root … (--module-root)` + `下一步：…` | （v0.1.85）显式指定模块根却命中 0 个 manifest → 非零退出（配置错误而非空项目，防 CI 假绿）。确认该目录是后端源码树根，或改指正确的目录 |
+| `--module-root is a source-tree option: … is a release tree (contains manifests.yaml)` | （v0.1.85）`--module-root` 指向 build 产物树 → 非零退出；指回 src 树或去掉该旗标 |
+| `illegal url prefix '<p>'` | （v0.1.85）manifest 的 `prefix` 形状非法（空段 / `.` / `..` / `\` / 首尾斜杠 / 段内白名单外字符）→ 发现期拒启 |
+| `url prefix '<p>' declared by both module '<a>' (…) and '<b>' (…)` | （v0.1.85）两个模块 URL 前缀相同（含默认 = name 的）→ 拒启；给其中一个加 `prefix` 改名 |
+| `module '<n>' declared in multiple module roots (… and …)` | （v0.1.85）同名模块出现在两个模块根下 → 拒启（重名会抢产物目录与锁键） |
+| `illegal module name '<n>'` / `illegal version '<v>'` | （v0.1.85）`--module-root` 递归发现期白名单（name：`[A-Za-z0-9_-]`；version：`[A-Za-z0-9._-]`、拒连续点）——它们要进产物目录名与路由 pattern，不留给运行期 |
+| `--module-root` 下嵌套 manifest.yaml | （v0.1.85）S008：模块根之下再出现 `manifest.yaml` 即报（嵌套会改写别名锚点）；`too many module roots (> 上限)` 同理——确认指向的是模块树而非仓库根 |
 
 | `server.html_meta_handler` 未命中 GET 路由 | `server.html_meta_handler: "…" 不在路由表（拼错了？）` / `未映射 GET 方法` 退出（v0.1.25；后果只在爬虫侧可见，故不留到运行期） |
 | config 里有 `ENC[…]` 但找不到私钥 / 解密失败 | `config has ENC[...] sealed values but …` 退出（v0.1.33；**不静默把密文当明文用**） |
@@ -3755,13 +3807,20 @@ ldap:                            # 不透明段里的 bind_pw 同样支持
 
 > 何时读我：dev 跑通后要交付时。
 
-### `oj build [module] [-d src] [-o dist] [--no-minify]`
+### `oj build [module] [-d src] [-o dist] [--no-minify] [--module-root DIR]`
 
 ```bash
 ./bin/oj build -d src -o dist          # 全部模块
 ./bin/oj build user -d src -o dist     # 单模块
 ./bin/oj build user --no-minify        # 排障：多行可读产物（含内联 sourcemap）
+# v0.1.85：模块在任意深度目录下（递归发现，模块名取 manifest.yaml 的 name）
+./bin/oj build --module-root services -o dist      # 全部模块
+./bin/oj build user --module-root services -o dist # 单模块（位置参数 = 模块名，不是目录名）
 ```
+
+`--module-root`（v0.1.85）与 `-d` 互斥；位置参数是**模块名**（manifest `name`）而非
+目录名。URL 前缀取 manifest 的 `prefix`（缺省 = `name`）——routes.js 的 pattern 由它决定，
+与 dev 路由表同口径。
 
 `oj build` 内建结构检查 S001–S008：S001 模块目录/manifest 合法性、S002 表归属唯一、
 S003 跨模块 SQL 须声明 deps、S004 deps 版本范围可满足、S005 `tables` 与 schema.yaml
@@ -4118,6 +4177,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - blob key 白名单：按 `/` 分段，`.` / `..` / `\` / NUL / 空段拒绝。下载路由
   `{base}/blob/{key}` **公开免鉴权**——不要把需鉴权的对象放进去。
 - import 解析结果钳制在 project root 内，`..` 逃逸报错（第 5 章）。
+- manifest 的 `prefix`（v0.1.85）与模块 `name` 是**进路由 pattern / 产物目录名**的
+  仓库内容：发现期即过形状白名单（`prefix` 分段禁 `.`/`..`/`\`/空段；`name` 限
+  `[A-Za-z0-9_-]`），且前缀全局唯一——不把合法性检查留到运行期。
 - handler 链段名（嵌套组，v0.1.64）禁 `/`、空段与 `__proto__`/`constructor`/`prototype`：
   内省期权威校验，运行期 driver 与 release `from_entries` 双保险——手改 `routes.js`
   注入这些段 → 记 failure 不注册（dev）/ 启动失败（release）。
