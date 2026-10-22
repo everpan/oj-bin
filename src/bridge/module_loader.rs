@@ -1122,7 +1122,10 @@ mod tests {
         }
         let referrer_dir = canon.join("src/m1/a/b"); // deno_core 侧：realpath 形态
         let project_root = link.clone(); // CLI/config 侧：经 symlink 的形态
-        let want = canon.join("src/m1");
+        // Windows 上 canonicalize 给 verbatim（`\\?\`）路径，而 module_root_of 按契约
+        // 返回剥前缀的归一形态（见 module_root_of_tolerates_verbatim_prefix_mismatch），
+        // 期望值须同口径，否则仅在 Windows CI 红。
+        let want = strip_verbatim(&canon.join("src/m1"));
 
         assert_eq!(
             module_root_of(&referrer_dir, &project_root),
@@ -1154,9 +1157,10 @@ mod tests {
         }
         // 经 symlink 的、且**不存在**的深层目录。
         let virtual_dir = link.join("src/m1/a/b/not/created/yet");
+        // 同上：期望值与 module_root_of 的返回口径一致（剥 verbatim 前缀）。
         assert_eq!(
             module_root_of(&virtual_dir, &link),
-            Some(canon.join("src/m1")),
+            Some(strip_verbatim(&canon.join("src/m1"))),
             "虚拟目录 + symlink 根应仍命中模块根"
         );
         let _ = std::fs::remove_dir_all(&root);
