@@ -16,6 +16,22 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.86
+
+修 `--module-root` 下 `oj openapi` dev 内省锚点错误（裸包解析被截断）。
+
+- **fix(openapi)**：`oj openapi --module-root` 的 loader `project_root` 曾锚 `dir`
+  （源码树根 `src/`），裸包 `node_modules` 行走被截断在 `src`（工程根
+  `node_modules` 在其外）——模板预生成 `web/__client/api.ts`（import
+  `@oj-module/runtime/...`）内省即 fail-fast，`oj openapi → ojm api` 契约链在
+  module-root 工程不可用。现改锚 `config_dir`，与 serve 装配（`app.rs` dev
+  分支）同语义；dev / serve 两态 openapi 重新同源。
+- **fix(openapi)**：regen 提示在 module-root 模式下原给 `-d`（与 `--module-root`
+  互斥，原样复跑即 clap 报错或静默退回平铺语义），改给 `--module-root <dir>`。
+- **fix(test)**：Windows 上两例 `module_root_of` symlink 用例期望值未剥
+  verbatim 前缀（`\\?\C:\...` → 归一形态，契约由
+  `module_root_of_tolerates_verbatim_prefix_mismatch` 钉死）。
+
 ## v0.1.85
 
 模块根可配置：`--module-root` 递归发现 + `manifest.yaml` 新增可选 `prefix`。
