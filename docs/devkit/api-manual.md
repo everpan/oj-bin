@@ -233,6 +233,10 @@ version: "0.1.0"
   （`url prefix "x" declared by both module "a" (…) and "b" (…)`）。
   URL 因此由前缀而非目录结构决定：`<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`，
   dev 与 release 一致。
+- **同一口径覆盖 `ws.ts`（v0.1.87）**：模块根内的 `ws.ts` 同样取
+  `{prefix}/{模块根内路径}/ws`——`src/wiki/api/ws.ts`（manifest 在 `src/wiki/api/`）
+  → `GET {base}/wiki/ws`，**不是** `{base}/wiki/api/ws`（`api` 是模块根即布局分隔符，
+  不是路由段）。v0.1.86 及以前 WS 多出这一层，前端按文档连即 404。
 
 ### seed.sql（可选）
 
@@ -787,7 +791,20 @@ handler 链 / 文件）。以前这类键被**静默忽略**——拼错的通�
 
 目录内放 `ws.ts`（dev）/ `ws.js`（release，约定同 `api.ts`）即产生一条 WebSocket 路由
 `GET {base}/{...path}/ws`：`src/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
-同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。
+同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先（release 下 `.js` 优先）。
+
+**路径口径与 `api.ts` 同源（v0.1.87）**：`--module-root` 布局下由模块索引给出
+`{prefix}/{模块根内路径}`——中间的 `api` 是**布局分隔符**（模块根本身），不是路由段：
+
+```text
+src/wiki/api/manifest.yaml   # 模块根 = src/wiki/api（name: wiki）
+src/wiki/api/ws.ts        →  GET /api/wiki/ws        ✅（不是 /api/wiki/api/ws）
+src/wiki/api/tree/ws.ts   →  GET /api/wiki/tree/ws
+```
+
+v0.1.86 及以前 WS 按「文件父目录相对挂载根」平铺计算，比 `api.ts` 多一层 `api` 段
+（`/api/wiki/api/ws`），前端按文档连 `/api/wiki/ws` 恒 404；且守卫面同为 `/wiki/api/ws`，
+`anonymous_paths` 里写 `/wiki/ws` 也命中不了（握手 401）。v0.1.87 起两口径统一。
 
 **契约（v0.1.9 起，钩子签名不变）**：default 导出生命周期钩子对象，按事件触发：
 
@@ -832,8 +849,14 @@ export default {
 };
 ```
 
-注意：release 下 root=dist，WS URL 含模块版本段（如 `…/news-0.1.0/ws`）——v0.2 已知限制
+注意：release 下 root=dist，WS URL 含模块版本段（如 `…/news-0.1.0/ws`）——**dev 与 release
+的 WS 路径不同源**（dev `…/news/ws`），前端按环境配前缀，勿硬编码；v0.2 已知限制
 （第 13 章）。bus 的发布/订阅方向约定见第 6 章 bus 小节。
+
+**WS 不进路由表、不进 `openapi.json`**：唯一权威面是 `oj serve` 启动时打印的挂载清单
+（`ws: N mount(s)` + 每条 `GET <路径> → <源文件>`，命中 `auth.anonymous_paths` 的标
+`[anonymous]`）。下游工具据此核对，不要从目录结构自行推算 WS 路径。
+新增/删除 `ws.ts` 需**重启**进程（dev 无文件监听，`api.ts` 的 `?v=mtime` 热重载不覆盖 WS）。
 
 ### 帧内发布：`ws.ts` 里直接 `bus.publish`
 
@@ -4208,7 +4231,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 多挂载（v0.1.58） | 同类前缀归一后重复 → 启动报错；挂载目录缺失/非目录 → 启动报错；命中挂载内 miss **不跨挂载**回落；`spa` 逐挂载显式（配对 web 恒无回落）；`html_meta`/`html_cache_control` 是全局键、按命中挂载根生效 |
 | search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 实现仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音；pg 实现 v0.1.68 修复（自写 `$n` 与统一占位符计数校验冲突 + `ts_headline` 签名错——highlight 的 fragments 键为 `_doc` 文档级片段）；短词回退大小写三方言一致（pg 用 `ILIKE`，v0.1.68 起） |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
-| release 下 WS URL 含版本段 | `…/news-0.1.0/ws`；客户端发现 WS 地址时注意拼版本段 |
+| release 下 WS URL 含版本段（v0.2） | `…/news-0.1.0/ws`，与 dev 的 `…/news/ws` **不同源**；客户端发现 WS 地址时按环境拼（勿硬编码）。WS 路径不做 `_name_` → `{param}` 转换（`_id_/ws.ts` 是字面段）；新增/删除 `ws.ts` 需重启（dev 无文件监听）。WS 不在路由表与 `openapi.json` 内，唯一权威面是启动打印的 `ws: N mount(s)` 清单 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `db.stream` 仅非事务目标 + 后端能力分档（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 插件后端**真流式**（逐行拉，内存恒定）；没有逐行能力的后端**回落 `db.query` 全量**（内容等价、不报错，仅失去内存优势）；彻底不支持时报 `backend does not support streaming`，改走 `db.query` 分页 |
 | 流式取消（`signal`）= 干净提前结束（v0.1.39；v0.1.42 起 pg/mysql 真取消） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done。**第一方插件 `oj-db-postgres`/`oj-db-mysql` 在 `postgres://`/`mysql://` DSN 下走专用连接，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端查询立即终止（真取消）**；core（sqlite）与 Any 回退路径为协作式（批间生效）。已回调的行不回滚 |

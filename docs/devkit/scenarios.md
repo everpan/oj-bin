@@ -3177,6 +3177,7 @@ curl localhost:9778/v1/api/sys/order/list/           # prefix 含 / 分段
 | `--module-root` 与 `-d src` 同时给 | clap 互斥（exit 2）——两者都是源码树根，二选一 |
 | 目录名当模块名用（`oj build api`、`#/api/x`） | 递归模式下身份是 manifest `name`——用 `user`/`order`，目录名（如 `api`）不在索引里 |
 | URL 404 但文件确实在 | URL 前缀由 `prefix`（缺省 = `name`）决定，不再由目录结构决定——核对 manifest，别按目录猜 |
+| WS 端点连不上（v0.1.87） | `ws.ts` 与 `api.ts` 同口径：`services/wiki/api/ws.ts` → `GET {base}/wiki/ws`（不是 `…/wiki/api/ws`）；`anonymous_paths` 按守卫面写 `/wiki/ws`；release 仍带版本段。启动时看 `ws: N mount(s)` 清单（命中匿名的标 `[anonymous]`） |
 | 两个模块 URL 撞车 | `url prefix '…' declared by both module …` 拒启（含默认 = name 撞车）——给其一加 `prefix` 改名；`prefix` 形状白名单：分段 `[A-Za-z0-9_-]`，禁空段/`.`/`..`/`\`/首尾斜杠 |
 | `--module-root` 指向 dist 或仓库根 | 前者报 `is a release tree`（只认源码树）；后者可能命中过多（`too many module roots`）或把非业务目录里的 manifest 卷进来——指向真正的模块树根 |
 | 树内就地 build 过（`dist/` 与模块根同级）再用 `--module-root .` | 不会撞车：扫描整棵跳过含 `manifests.yaml` 锁的 release 树（产物里的 manifest 是原样副本，跳过即不重复登记）；但 release 跑法仍用 `-d dist` |

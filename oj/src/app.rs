@@ -1800,30 +1800,57 @@ impl App {
             // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
             blob: stable.blobs.default(),
         };
-        // WS 目录镜像挂载：逐 api 挂载（<挂载dir>/ws.ts → {挂载prefix}/<dir>/ws）。
+        // WS 目录镜像挂载：逐 api 挂载。路径口径与 api.ts **同源**（`ws::ws_mounts`
+        // 走 `routes::mirror_rel`）——`--module-root` 下由模块索引给 `{prefix}/{模块根内路径}`，
+        // 不再按挂载根平铺（v0.1.87：平铺会让 `src/wiki/api/ws.ts` 挂成 `/api/wiki/api/ws`）。
         let ws_opts = serve::ws::WsOptions {
             max_connections: cfg.ws.max_connections,
             workers_per_route: cfg.ws.workers_per_route,
             idle_linger_ms: cfg.ws.idle_linger_ms,
         };
         let mut ws_router = Router::new();
+        // (挂载目录, 挂载)——清单按各自挂载根取相对路径显示。
+        let mut ws_mounts: Vec<(PathBuf, ws::WsMount)> = Vec::new();
         for m in resolved.iter().filter(|m| m.kind.api().is_some()) {
-            let (prefix, mdir) = match m.kind.api() {
-                Some((d, _)) => (m.prefix.as_str(), d),
+            let (prefix, mdir, ts) = match m.kind.api() {
+                Some((d, ts)) => (m.prefix.as_str(), d, ts),
                 None => unreachable!("filtered above"),
             };
+            // 碰撞（两个不同目录的 ws 文件映射到同一 path）→ 拒启：胜者决定执行哪份 JS。
+            let mounts = ws::ws_mounts(prefix, mdir, ts, module_index.as_deref())?;
             ws_router = ws_router.merge(ws::mirror_routes(
-                prefix,
-                mdir,
+                &mounts,
                 timeout.unwrap_or(Duration::from_secs(30)),
                 make_bridge.clone(),
-                serve::ws::WsOptions {
-                    max_connections: ws_opts.max_connections,
-                    workers_per_route: ws_opts.workers_per_route,
-                    idle_linger_ms: ws_opts.idle_linger_ms,
-                },
+                ws_opts,
                 auth.clone(),
             ));
+            ws_mounts.extend(mounts.into_iter().map(|mo| (mdir.to_path_buf(), mo)));
+        }
+        // 挂载清单（外显）：WS 不进路由表也不进 openapi.json，启动打印是唯一权威面——
+        // 下游工具据此核对，不得再从目录结构推 WS 路径。`[anonymous]` = 命中
+        // `auth.anonymous_paths`：浏览器 WS 发不了 Authorization 头，匿名是其唯一入口，
+        // 命中即「该端点全程匿名可达」（一次验、持续用），故显式点名。
+        if !ws_mounts.is_empty() {
+            let anon = cfg
+                .auth
+                .as_ref()
+                .map(|a| config::anon_paths(&a.anonymous_paths))
+                .unwrap_or_default();
+            eprintln!("ws: {} mount(s)", ws_mounts.len());
+            for (mdir, mo) in &ws_mounts {
+                let rel = mo.file.strip_prefix(mdir).unwrap_or(&mo.file).display();
+                let tag = if auth.is_some() {
+                    if serve::path_matches(&anon, &mo.path_no_base) {
+                        " [anonymous]"
+                    } else {
+                        " [guarded]"
+                    }
+                } else {
+                    ""
+                };
+                eprintln!("  GET {} → {}{}", mo.path, rel, tag);
+            }
         }
         // server.html_meta_handler（v0.1.25）：必须在（某个挂载的）路由表里命中 GET
         // 路由——拼错 fail-fast（静默降级会让「已注入 meta」变成一句只在爬虫侧才暴露

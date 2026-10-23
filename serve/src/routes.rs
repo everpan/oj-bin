@@ -335,18 +335,14 @@ impl RouteTable {
                     continue;
                 }
             };
-            let rel = dev_rel(root, &file, index);
+            let rel = mirror_rel(root, &file, index);
             // v0.1.27：fs 段 `_name_` → `{name}`（rel 已归一为正斜杠；逐段转换，含模块段）。
-            let dir_base = if rel.is_empty() {
-                format!("/{b}")
-            } else {
-                let conv = rel
-                    .split('/')
-                    .map(fs_seg_to_pattern)
-                    .collect::<Vec<_>>()
-                    .join("/");
-                format!("/{b}/{conv}")
-            };
+            let conv = rel
+                .split('/')
+                .map(fs_seg_to_pattern)
+                .collect::<Vec<_>>()
+                .join("/");
+            let dir_base = join_url(b, &conv);
             for (chain, route, schema) in decls {
                 // 动词 = 链尾（内省保证只有 verb 键成 leaf；此处为纵深防线）。
                 let method = chain.rsplit('.').next().unwrap_or(&chain);
@@ -366,8 +362,8 @@ impl RouteTable {
                 }
                 let pattern = match &route {
                     None => dir_base.clone(),
-                    Some(r) if r.starts_with('/') => format!("/{b}{r}"), // 根级（base 根下）
-                    Some(r) => format!("{dir_base}/{r}"),                // 相对
+                    Some(r) if r.starts_with('/') => join_url(b, r), // 根级（base 根下）
+                    Some(r) => join_url(&dir_base, r),               // 相对
                 };
                 // 有效路由非空 = 声明了显式 pattern（自身或组 .route）→ 该 (file, verb)
                 // 的目录镜像不得被 dev 兜底复活。顶层动词无 .route 不标记（旧语义）。
@@ -664,13 +660,17 @@ impl RouteTable {
     }
 }
 
-/// dev 路由的「模块内相对路径」（含 URL 前缀段；已归一为正斜杠）。
+/// 目录镜像的「模块内相对路径」（含 URL 前缀段；已归一为正斜杠）。
+///
+/// api.ts 与 ws.ts **同源**——WS 的目录镜像曾各算一套（`file.parent()` 相对挂载根），
+/// 在 `--module-root` 布局下比 api.ts 多出一层布局段（`src/wiki/api/ws.ts` 挂成
+/// `/api/wiki/api/ws`，v0.1.87 修）。任何新增的目录镜像面都必须走本函数。
 ///
 /// - 索引命中：`{prefix}/{模块根内目录}`——目录名（`foo/api`）不进 URL，模块段取
 ///   `manifest.yaml` 的 `prefix`（缺省 = 模块名），与 release 的 `rel_pattern` 同源；
 /// - 索引缺失或未命中该文件（模块外的 `tasks/`、挂载根散文件）→ 今日语义：
 ///   相对挂载 api 根（flat 布局下与上一条逐字等价）。
-fn dev_rel(root: &Path, file: &Path, index: Option<&ModuleIndex>) -> String {
+pub(crate) fn mirror_rel(root: &Path, file: &Path, index: Option<&ModuleIndex>) -> String {
     let Some(idx) = index else {
         return plain_rel(root, file);
     };
@@ -698,6 +698,22 @@ fn plain_rel(root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// URL 段拼接（base + 目录镜像相对段）：逐段过滤空段，恒以单个 `/` 开头。
+///
+/// 挂载前缀可为根（`/`，`resolve_app_prefix` 允许）——裸 `format!("/{base}/{rel}")`
+/// 会拼出 `//ws` 这类双斜杠路径（注册成功却永远匹配不到）。api.ts 与 ws.ts 共用。
+pub(crate) fn join_url(base: &str, rel: &str) -> String {
+    let segs: Vec<&str> = base
+        .split('/')
+        .chain(rel.split('/'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.is_empty() {
+        return "/".to_string();
+    }
+    format!("/{}", segs.join("/"))
+}
+
 /// root 下全部 api 文件（排序 → 冲突裁决顺序确定）。
 fn api_files(root: &Path, ts: bool) -> Vec<PathBuf> {
     let ext = if ts { "api.ts" } else { "api.js" };
@@ -707,15 +723,26 @@ fn api_files(root: &Path, ts: bool) -> Vec<PathBuf> {
     out
 }
 
+/// 递归收集 `ext` 文件。剪枝与模块发现同口径（`module_scan::scan_recursive`）：
+/// 跳过点目录与 `node_modules`、**不跟随目录符号链接**——挂载根下的
+/// `node_modules/**/ws.ts`（或被引到仓库外的链接目录）不该变成一条对外端点。
 pub(crate) fn walk_files(dir: &Path, ext: &str, acc: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
         let p = e.path();
-        if p.is_dir() {
+        // file_type() 不跟随链接：`is_symlink()` 的目录链接整棵跳过。
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            if ft.is_symlink() || name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
             walk_files(&p, ext, acc);
-        } else if e.file_name().to_string_lossy() == ext {
+        } else if name == ext {
             acc.push(p);
         }
     }

@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use only_js::bridge::frame_pool::{FrameError, RoutePool};
-use only_js::bridge::{Bridge, WsOutcome, WsSend};
+use only_js::bridge::{Bridge, ModuleIndex, WsOutcome, WsSend};
 
 /// 全局 WS 并发连接闸门（config ws.max_connections；0 = 不限）。
 static WS_LIVE: AtomicU64 = AtomicU64::new(0);
@@ -153,55 +153,103 @@ fn fail_response(status: u16, msg: &str) -> Response {
     r
 }
 
-/// 生产目录镜像 WS 挂载（oj server）：<root>/<dir>/ws.ts（优先）/ws.js → GET {base}/<dir>/ws；
-/// 根级 ws.ts → {base}/ws；无 WS 文件返回空 Router（merge 无副作用）。
-/// release 下 root=dist，URL 含模块版本段（news-0.1.0/ws）——v0.2 已知限制，见 user-manual。
-/// guard（oj-4）：WS 握手升级前过鉴权（path_no_base = {rel}/ws，与 anonymous_paths 同根）。
-pub fn mirror_routes(
+/// 一条 WS 目录镜像挂载。装配（注册路由）、启动清单、下游核对**同一份数据**——
+/// 下游工具不得再从目录结构自行推算 WS 路径（那正是 v0.1.87 前口径分叉的来源）。
+#[derive(Clone, Debug)]
+pub struct WsMount {
+    /// 完整 HTTP 路径（含挂载 base）：`/v1/api/wiki/ws`。
+    pub path: String,
+    /// 守卫面路径（剥 base，与 `auth.anonymous_paths` 同根）：`/wiki/ws`。
+    pub path_no_base: String,
+    /// ws.ts（dev）/ ws.js（release）源文件。
+    pub file: PathBuf,
+}
+
+/// 目录镜像挂载计算（装配与启动清单同源）。
+///
+/// `<模块根>/<dir>/ws.ts` → `GET {base}/{prefix}/{dir}/ws`；模块根级 ws.ts →
+/// `GET {base}/{prefix}/ws`；模块外（挂载根散文件）→ `GET {base}/ws`。
+///
+/// **与 api.ts 同源**：rel 一律走 `routes::mirror_rel`（`--module-root` 下由模块索引
+/// 给出 `{prefix}/{模块根内路径}`）。此前按「文件父目录相对挂载根」平铺计算，
+/// `src/wiki/api/ws.ts` 会挂成 `/api/wiki/api/ws`——多出一层**布局**段（`api` 是模块根
+/// 本身，不是路由段），与 api.ts 的 `/api/wiki/tree` 自相矛盾（v0.1.87 修）。
+///
+/// `ts`：dev=true（`ws.ts` 优先）/ release=false（`ws.js` 优先，dist 残留的 `ws.ts`
+/// 不得抢先）。
+///
+/// 同 path 由**不同目录**的两个文件映射而来 → **Err 拒启**：胜者决定执行哪份 JS
+/// （会话状态、`bus.subscribe` 出口都在其中），不能交给文件遍历顺序。同目录的
+/// `ws.ts`/`ws.js` 兄弟是先到先得，不在此列。
+pub fn ws_mounts(
     base: &str,
     root: &Path,
+    ts: bool,
+    index: Option<&ModuleIndex>,
+) -> Result<Vec<WsMount>, String> {
+    let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for file in ws_files(root, ts) {
+        let rel = crate::routes::mirror_rel(root, &file, index);
+        let tail = if rel.is_empty() {
+            "ws".to_string()
+        } else {
+            format!("{rel}/ws")
+        };
+        let path = crate::routes::join_url(base, &tail);
+        // path_no_base（守卫面）：与 HTTP 管线的 path_no_base 同根——{rel}/ws，
+        // 根级 ws 为 "/ws"；anonymous_paths 里 WS 路由按此形态声明。
+        let path_no_base = format!("/{tail}");
+        match seen.get(&path) {
+            Some(prev) if prev.parent() == file.parent() => continue, // 同目录 ts/js 兄弟：先到者胜
+            Some(prev) => {
+                return Err(format!(
+                    "ws mount conflict: {} and {} both map to GET {path}\n  \
+                     下一步：删除或改名其中一个（胜者决定执行哪份 JS）",
+                    rel_show(prev, root),
+                    rel_show(&file, root)
+                ));
+            }
+            None => {}
+        }
+        seen.insert(path.clone(), file.clone());
+        out.push(WsMount {
+            path,
+            path_no_base,
+            file,
+        });
+    }
+    Ok(out)
+}
+
+/// 清单/报错用：相对挂载根显示（启动日志不落本机绝对路径）。
+fn rel_show(p: &Path, root: &Path) -> String {
+    p.strip_prefix(root).unwrap_or(p).display().to_string()
+}
+
+/// 按 `ws_mounts` 的挂载清单注册路由（无 WS 文件 → 空 Router，merge 无副作用）。
+/// release 下 root=dist，URL 含模块版本段（news-0.1.0/ws）——v0.2 已知限制，见 user-manual。
+pub fn mirror_routes(
+    mounts: &[WsMount],
     timeout: std::time::Duration,
     make_bridge: impl Fn() -> Bridge + Send + Sync + 'static,
     opts: WsOptions,
     guard: Option<Arc<dyn only_js::bridge::AuthGuard>>,
 ) -> axum::Router {
     let make = Arc::new(make_bridge);
-    let base = format!("/{}/", base.trim_matches('/'));
-    let mut seen = std::collections::HashSet::new();
     let mut router = axum::Router::new();
-    for file in ws_files(root) {
-        let rel = file
-            .parent()
-            .and_then(|p| p.strip_prefix(root).ok())
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        // rel 为空 = 根级 ws.ts → {base}/ws（不得拼成 {base}//ws 双斜杠）。
-        let path = if rel.is_empty() {
-            format!("{base}ws")
-        } else {
-            format!("{base}{rel}/ws")
-        };
-        if !seen.insert(path.clone()) {
-            continue; // 同目录 ws.ts 与 ws.js 并存：先到者（.ts）胜
-        }
-        // path_no_base（守卫面）：与 HTTP 管线的 path_no_base 同根——{rel}/ws，
-        // 根级 ws 为 "/ws"；anonymous_paths 里 WS 路由按此形态声明。
-        let path_no_base = if rel.is_empty() {
-            "/ws".to_string()
-        } else {
-            format!("/{rel}/ws")
-        };
+    for m in mounts {
         // 每路由一池：worker 数与空池保活来自 ws 配置段。
         let pool = RoutePool::new(
-            file,
+            m.file.clone(),
             make.clone(),
             timeout,
             opts.workers_per_route,
             opts.idle_linger_ms,
         );
         router = router.merge(js_route_guarded(
-            &path,
-            &path_no_base,
+            &m.path,
+            &m.path_no_base,
             pool,
             opts,
             guard.clone(),
@@ -210,16 +258,22 @@ pub fn mirror_routes(
     router
 }
 
-/// root 下全部 WS 处理器：ws.ts 全部在前（优先），ws.js 在后；各自排序保证注册序确定。
-fn ws_files(root: &Path) -> Vec<PathBuf> {
-    let mut ts = Vec::new();
-    crate::routes::walk_files(root, "ws.ts", &mut ts);
-    let mut js = Vec::new();
-    crate::routes::walk_files(root, "ws.js", &mut js);
-    ts.sort();
-    js.sort();
-    ts.extend(js);
-    ts
+/// root 下全部 WS 处理器：主扩展名全部在前（优先），次扩展名在后；各自排序保证注册序确定。
+/// dev（ts=true）`ws.ts` 优先；release `ws.js` 优先。
+fn ws_files(root: &Path, ts: bool) -> Vec<PathBuf> {
+    let (first, second) = if ts {
+        ("ws.ts", "ws.js")
+    } else {
+        ("ws.js", "ws.ts")
+    };
+    let mut a = Vec::new();
+    crate::routes::walk_files(root, first, &mut a);
+    let mut b = Vec::new();
+    crate::routes::walk_files(root, second, &mut b);
+    a.sort();
+    b.sort();
+    a.extend(b);
+    a
 }
 
 /// upgrade 后的连接处理：整个连接搬到专用 OS 线程（current_thread runtime）。
@@ -1152,6 +1206,7 @@ mod tests {
                 },
             )
         };
+        let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
         let addr = spawn(
             app(
                 vec![crate::RuntimeMount::Api {
@@ -1170,8 +1225,7 @@ mod tests {
                 None,
             )
             .merge(mirror_routes(
-                "/v1/api",
-                &t.0,
+                &mounts,
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),
@@ -1222,6 +1276,7 @@ mod tests {
                 Extras::default(),
             )
         };
+        let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
         let addr = spawn(
             app(
                 vec![crate::RuntimeMount::Api {
@@ -1240,8 +1295,7 @@ mod tests {
                 None,
             )
             .merge(mirror_routes(
-                "/v1/api",
-                &t.0,
+                &mounts,
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),
@@ -1255,6 +1309,192 @@ mod tests {
         c.send_text("hi").await;
         let env = c.read_text().await;
         assert!(env.contains("\"root\":true"), "{env}");
+    }
+
+    /// module-root 布局：WS 挂载与 api.ts **同源**——`src/wiki/api/ws.ts` → `{base}/wiki/ws`。
+    /// 回归钉：v0.1.87 前按挂载根平铺算 rel，多出一层布局段（`api` 是模块根本身，不是
+    /// 路由段）→ 文档契约里的 `/api/wiki/ws` 恒 404，而真实的 `/api/wiki/api/ws` 无人知道。
+    #[test]
+    fn ws_mounts_module_root_strips_layout_segment() {
+        let t = crate::tests::routes(&[
+            (
+                "wiki/api/manifest.yaml",
+                "name: wiki\nversion: 0.1.0\nprefix: wiki\n",
+            ),
+            (
+                "wiki/api/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+            (
+                "wiki/api/tree/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+        ]);
+        let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+        let mounts = ws_mounts("/api", &t.0, true, Some(&idx)).unwrap();
+        let paths: Vec<&str> = mounts.iter().map(|m| m.path.as_str()).collect();
+        assert!(paths.contains(&"/api/wiki/ws"), "{paths:?}");
+        assert!(paths.contains(&"/api/wiki/tree/ws"), "{paths:?}");
+        // 守卫面（anonymous_paths 同根）：配置里写 /wiki/ws 即命中（修复前是 /wiki/api/ws）。
+        let wiki = mounts.iter().find(|m| m.path == "/api/wiki/ws").unwrap();
+        assert_eq!(wiki.path_no_base, "/wiki/ws");
+        let sub = mounts
+            .iter()
+            .find(|m| m.path == "/api/wiki/tree/ws")
+            .unwrap();
+        assert_eq!(sub.path_no_base, "/wiki/tree/ws");
+    }
+
+    /// 平铺布局（无模块索引）逐字不变：`src/news/ws.ts` → `{base}/news/ws`（兼容面锚）。
+    #[test]
+    fn ws_mounts_flat_layout_unchanged() {
+        let t = crate::tests::routes(&[(
+            "news/ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        )]);
+        let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0].path, "/v1/api/news/ws");
+        assert_eq!(mounts[0].path_no_base, "/news/ws");
+    }
+
+    /// 根前缀挂载（prefix = `/`）不得拼出 `{base}//ws` 双斜杠。
+    #[test]
+    fn ws_mounts_root_prefix_has_no_double_slash() {
+        let t = crate::tests::routes(&[(
+            "ws.ts",
+            "export default { connection() { json.ok({ok:1}); } };\n",
+        )]);
+        let mounts = ws_mounts("/", &t.0, true, None).unwrap();
+        assert_eq!(mounts[0].path, "/ws");
+    }
+
+    /// release 维持现状：`dist/<name>-<version>/ws.js` → `{base}/<name>-<version>/ws`
+    /// （v0.2 已知限制；dev 与 release 的 WS 分叉见 api-manual 限制表）。
+    #[test]
+    fn ws_mounts_release_keeps_version_segment() {
+        let t = crate::tests::routes(&[
+            (
+                "wiki-0.1.0/ws.js",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+            (
+                "wiki-0.1.0/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+        ]);
+        let mounts = ws_mounts("/api", &t.0, false, None).unwrap();
+        // release 下 ws.js 优先（dist 残留的 ws.ts 不得抢先），同目录兄弟只挂一条。
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0].path, "/api/wiki-0.1.0/ws");
+        assert!(mounts[0].file.ends_with("ws.js"), "{:?}", mounts[0].file);
+    }
+
+    /// 碰撞 fail-fast：模块内 `wiki/api/ws.ts` 与模块外散文件 `wiki/ws.ts` 映射到同一
+    /// path → 拒启并点名两侧（胜者决定执行哪份 JS，不能交给文件遍历顺序）。
+    #[test]
+    fn ws_mounts_conflict_rejects_startup() {
+        let t = crate::tests::routes(&[
+            ("wiki/api/manifest.yaml", "name: wiki\nversion: 0.1.0\n"),
+            (
+                "wiki/api/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+            (
+                "wiki/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+        ]);
+        let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+        let err = ws_mounts("/api", &t.0, true, Some(&idx)).unwrap_err();
+        assert!(err.contains("ws mount conflict"), "{err}");
+        assert!(err.contains("/api/wiki/ws"), "{err}");
+    }
+
+    /// 挂载根下的 `node_modules` 不进挂载面（剪枝与模块发现同口径）。
+    #[test]
+    fn ws_mounts_skips_node_modules() {
+        let t = crate::tests::routes(&[
+            (
+                "news/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+            (
+                "node_modules/pkg/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+            (
+                ".hidden/ws.ts",
+                "export default { connection() { json.ok({ok:1}); } };\n",
+            ),
+        ]);
+        let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
+        assert_eq!(mounts.len(), 1, "{mounts:?}");
+        assert_eq!(mounts[0].path, "/v1/api/news/ws");
+    }
+
+    /// module-root 下真实握手：文档契约里的 `/v1/api/wiki/ws` 必须能连上
+    /// （修复前该 URL 404，只有多一层布局段的 `/v1/api/wiki/api/ws` 存在）。
+    #[tokio::test]
+    async fn mirror_routes_module_root_handshake() {
+        let _e2e = ws_e2e_lock();
+        use crate::actor::JsActor;
+        use only_js::bridge::{Extras, LoaderShared, SchemaRegistry};
+        use std::collections::HashMap;
+        let t = crate::tests::routes(&[
+            ("wiki/api/manifest.yaml", "name: wiki\nversion: 0.1.0\n"),
+            (
+                "wiki/api/ws.ts",
+                "export default { connection() { json.ok({ wiki: true }); } };\n",
+            ),
+        ]);
+        let root = t.0.clone();
+        let make = move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared {
+                    project_root: root.clone(),
+                    ts: true,
+                })),
+                Extras::default(),
+            )
+        };
+        let idx = only_js::bridge::resolve_roots(&t.0, true, None).unwrap();
+        let mounts = ws_mounts("/v1/api", &t.0, true, Some(&idx)).unwrap();
+        assert!(mounts.iter().any(|m| m.path == "/v1/api/wiki/ws"));
+        let addr = spawn(
+            app(
+                vec![crate::RuntimeMount::Api {
+                    prefix: "/v1/api".to_string(),
+                    table: crate::tests::build_table(&t.0, true, "/v1/api"),
+                    fallback: Some(crate::Routes::new("/v1/api", t.0.clone(), true)),
+                    web: None,
+                }],
+                JsActor::pool(1, make.clone()),
+                None,
+                crate::StaticOpts::default(),
+                crate::Pipeline::default(),
+                Arc::new(std::sync::RwLock::new(crate::CertificateStatus::Valid)),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::default(),
+                None,
+            )
+            .merge(mirror_routes(
+                &mounts,
+                std::time::Duration::from_secs(2),
+                make,
+                WsOptions::default(),
+                None,
+            )),
+        )
+        .await;
+
+        let mut c = WsClient::connect(addr, "/v1/api/wiki/ws").await;
+        let env = c.read_text().await;
+        assert!(env.contains("\"wiki\":true"), "{env}");
     }
 
     /// 移植 Go TestWSHandle_Connection_MissingFile：handler 文件缺失不 panic，连接直接关闭。
@@ -1444,6 +1684,7 @@ mod tests {
                 },
             )
         };
+        let mounts = ws_mounts("/v1/api", &t.0, true, None).unwrap();
         let addr = spawn(
             app(
                 vec![crate::RuntimeMount::Api {
@@ -1462,8 +1703,7 @@ mod tests {
                 None,
             )
             .merge(mirror_routes(
-                "/v1/api",
-                &t.0,
+                &mounts,
                 std::time::Duration::from_secs(2),
                 make,
                 WsOptions::default(),

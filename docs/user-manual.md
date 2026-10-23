@@ -869,7 +869,7 @@ Content-Type；s3 驱动 302 跳 presigned URL。key 按 `/` 分段，段非法�
 
 **WS 目录镜像**：目录内放 `ws.ts`（dev）/ `ws.js`（release，同 `api.ts` 约定）即产生一条 WebSocket
 路由 `GET {base}/{...path}/ws`——`<root>/news/ws.ts` → `/v1/api/news/ws`；根级 `ws.ts` → `/v1/api/ws`。
-同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先。连接升级后，本文件按 **生命周期钩子** 执行：
+同目录 `ws.ts` 与 `ws.js` 并存时 `.ts` 优先（release `.js` 优先）。连接升级后，本文件按 **生命周期钩子** 执行：
 `export default { connection, message, close, error }`（至少导出一个钩子）。connection 在
 连接建立后恰好触发一次，message 每帧触发（帧内容经 `http.body` 读取），close/error 收尾与
 兜底。执行模型为**帧池**（v0.1.10）：每路由 `ws.workers_per_route` 个无状态 Worker 共享
@@ -903,6 +903,11 @@ sample 的 `sample/src/news/`（`api.ts` 发布 + `ws.ts` 订阅）是可运行�
 `/v1/api/news/ws`（连接建立即订阅，无需发帧），再 `POST /v1/api/news`，连接即收到
 `{"topic":"news",…}` 广播帧。
 release 下 root=dist，URL 含模块版本段（`news-0.1.0/ws`）。这是已知限制。
+`--module-root` 布局（v0.1.85）下路径与 `api.ts` **同口径**：模块根是含 `manifest.yaml`
+的目录，其目录名（如 `api`）是**布局分隔符**不进 URL——`src/wiki/api/ws.ts` →
+`{base}/wiki/ws`（v0.1.87 起；此前为 `{base}/wiki/api/ws`，与 api.ts 矛盾）。WS 路由不进
+`openapi.json`，启动时打印 `ws: N mount(s)` 清单（含路径与源文件，命中
+`auth.anonymous_paths` 的标 `[anonymous]`）——这是 WS 挂载的唯一权威面。
 
 **KV 扩展**：`kv.expire(key, ttlSec)` 设过期（真 Redis 走 EXPIRE；内存 KV 惰性过期），
 `kv.incr(key)` 自增返回新值（键不存在从 0 起）。`redis` 全局与 `kv` 同源：`redis.default`

@@ -109,7 +109,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `-d` 与 `--module-root` 同时给报错（v0.1.85） | 两者都是「源码树根」，clap 层互斥（exit 2）——嵌套/任意深度布局用 `--module-root`，平铺树继续 `-d` |
 | `--module-root` 报 `no manifest.yaml under module root …`（v0.1.85） | 显式指定却命中 0 个 manifest → 非零退出（防 CI 假绿）。确认指向的是含 `<模块>/manifest.yaml` 的源码树根 |
 | `--module-root` 报 `is a release tree`（v0.1.85） | 指向了 build 产物（含 `manifests.yaml`）——`--module-root` 只认源码树；产物树用 `-d dist` |
-| `--module-root` 下 URL 不是预期路径 / 404（v0.1.85） | URL 前缀取 manifest 可选 `prefix`（缺省 = `name`），**不再由目录结构决定**：`<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`。核对 manifest 的 `prefix` 与 `name` |
+| `--module-root` 下 URL 不是预期路径 / 404（v0.1.85） | URL 前缀取 manifest 可选 `prefix`（缺省 = `name`），**不再由目录结构决定**：`<prefix>/xxx/yyy/api.ts` → `GET <prefix>/xxx/yyy`。核对 manifest 的 `prefix` 与 `name`（`ws.ts` 同口径，v0.1.87） |
 | 启动报 `url prefix '…' declared by both module …` / `illegal url prefix '…'`（v0.1.85） | 两个模块 URL 前缀相同（含默认 = name 撞车）→ 给一个加 `prefix` 改名；`prefix` 形状白名单：分段 `[A-Za-z0-9_-]`，禁空段/`.`/`..`/`\`/首尾斜杠 |
 | `#/m/x` 跨模块导入在 `--module-root` 下找不到（v0.1.85） | `m` 是 **manifest `name`** 不是目录名——嵌套布局下按 name 写（`#/user/_shared/x`），勿用目录名 |
 | postgres 占位符 | **0.1.67 起三引擎统一用 `?`**（宿主对 postgres 自动改写 `$n`）；存量 `$n` 继续有效（`$n`+`?` 混用按序号续接）。计数不匹配在 PG 上提前报 `placeholder count N != params M`；jsonb 存在性判断用 `jsonb_exists(doc,'key')`，**别写裸 `?` 运算符** |
@@ -219,7 +219,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `POST {base}/_system/config` 报 403 | 未配 `auth:` 时只允许**回环**调用；远程调度走 Bearer 守卫须先配 `auth:` 段 |
 | `POST {base}/_system/config` 报 409 | 上一次热更还在跑（串行锁占用）——等上一次完成再发 |
 | `POST {base}/_system/config` 报 400 且 body 非空 | 该端点**只接受空 body**，改配置请直接改落盘文件再 POST 触发 |
-| WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定） |
+| `--module-root` 下 WS 路由 404 / 握手 401（v0.1.87） | WS 与 api.ts **同口径**：`src/wiki/api/ws.ts`（manifest 在 `src/wiki/api/`）→ `GET {base}/wiki/ws`，`api` 是模块根（布局分隔符）不是路由段；`anonymous_paths` 按守卫面写 `/wiki/ws`。release 仍带版本段（`…/wiki-0.1.0/ws`），与 dev 不同源。新增/删除 `ws.ts` 要重启。**唯一权威面是启动打印的 `ws: N mount(s)` 清单**——别从目录结构推 |
+| WS 路由 404（文件明明在） | 文件名必须小写 `ws.ts`/`ws.js`——`WS.ts` 无效（v0.1.5 约定）；路径拿不准就看启动打印的挂载清单 |
 | （v0.1.9 已消除）旧帧循环的 const 重复声明 | 新契约为生命周期钩子：模块每 Worker 预载一次——无需处理；可变跨帧状态放 `sess.state`（模块作用域只是只读缓存），见 api-manual §ws.ts |
 | WS 帧内 `bus.publish` 自己也收到 | 自回声语义：fan-out 不排除本连接——按字段客户端过滤或发布到别的 topic |
 | 查询被拦截 / 启动报 `tenant_id` 相关错（v0.1.15 sql_guard） | `sql_guard: "deny"` 拦截租户条件不匹配的查询（`"warn"` 只告警）：跨租户操作（对账/报表）走 `await db.asSystem()`（请求级 + 审计日志）；共享表须 schema.yaml `tenant: false` **且** config `tenant.shared_allow` 列出，双声明才豁免 |

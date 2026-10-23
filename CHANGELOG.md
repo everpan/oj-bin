@@ -16,6 +16,38 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.87
+
+WS 目录镜像路由与 `api.ts` 同口径（`--module-root` 下剥布局段）+ 挂载清单外显。
+
+- **fix(ws)**：`--module-root` 布局下 `ws.ts` 的目录镜像路径曾按「文件父目录相对**挂载根**」
+  计算，比 `api.ts`（走模块索引的 `{prefix}/{模块根内路径}`）多出一层布局段——
+  `src/wiki/api/ws.ts` 挂成 `GET /api/wiki/api/ws`，而文档契约是 `/api/wiki/ws`
+  （`api` 是模块根即布局分隔符，不是路由段）。前端按文档连即恒 404。现两侧共用
+  `routes::mirror_rel`，平铺布局（无 `--module-root`）路径逐字不变。
+- **fix(ws)**：上一条连带的守卫面错位——`path_no_base` 曾为 `/wiki/api/ws`，
+  `auth.anonymous_paths` 里按文档写的 `/wiki/ws` 命中不了，浏览器 WS 握手 401
+  （浏览器 `WebSocket` 发不了 `Authorization` 头）。现同源推导为 `/wiki/ws`。
+- **新增（外显）**：启动打印 WS 挂载清单 `ws: N mount(s)` + 每条 `GET <路径> → <源文件>`，
+  命中 `anonymous_paths` 的标 `[anonymous]`。WS 不进路由表也不进 `openapi.json`，
+  该清单是唯一权威面——下游工具据此核对，勿从目录结构自行推算。
+- **fix(ws)**：两个**不同目录**的 `ws.ts` 映射到同一 URL → 拒启（`ws mount conflict: …`，
+  点名两侧文件）。口径统一后该碰撞成为可能，而胜者决定执行哪份 JS
+  （会话状态与 `bus.subscribe` 出口都在其中），不能交给文件遍历顺序。
+  同目录 `ws.ts`/`ws.js` 兄弟仍是先到先得（release 下 `ws.js` 优先）。
+- **fix(ws/api)**：扫描剪枝与模块发现同口径——跳过点目录、`node_modules` 与目录符号链接
+  （挂载根下的 `node_modules/**/ws.ts` 不该变成对外端点）。
+- **fix(路由)**：根前缀挂载（`prefix: /`）拼出 `{base}//ws`、`//tree` 双斜杠路径
+  （注册成功却永远匹配不到）。新增 `routes::join_url` 供 api.ts 与 ws.ts 共用。
+- **行为变更（升级注意）**：仅 `--module-root` 且 `ws.ts` 在模块根内时 URL 改变
+  （`/api/wiki/api/ws` → `/api/wiki/ws`，旧 URL 变 404），`anonymous_paths` 的守卫面
+  同步改变（原 `/wiki/api/ws` 条目失效；表内 `/wiki/*` 之类条目可能让该 WS **变为
+  匿名可达**——启动清单会标 `[anonymous]`，请核对）。平铺布局与 release 均不受影响。
+- **已知限制（维持）**：release 的 WS URL 仍含模块版本段（`…/news-0.1.0/ws`，dev 是
+  `…/news/ws`，两者不同源）；WS 不做 `_name_` → `{param}` 转换；新增/删除 `ws.ts` 需
+  重启（dev 无文件监听）。dev/release 分叉的收敛（`oj build` 落 ws 行进 `routes.js`）
+  单开工单，不在本版。
+
 ## v0.1.86
 
 修 `--module-root` 下 `oj openapi` dev 内省锚点错误（裸包解析被截断）。

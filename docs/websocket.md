@@ -177,15 +177,23 @@ release 模式：先 `oj build`（`ws.ts` 随模块一起转译成 `dist/<mod>-<
 涉及三层，自上而下：
 
 ```
-oj/src/app.rs             装配：mirror_routes(base, dir, timeout, make_bridge, opts) merge 进 Router
+oj/src/app.rs             装配：ws_mounts(base, dir, ts, index) → mirror_routes(&mounts, timeout, make_bridge, opts, guard) merge 进 Router
 serve/src/ws.rs          连接生命周期：upgrade → 闸门 → 三任务流水线（全 Send，跑在 axum runtime）
 src/bridge/frame_pool.rs  帧调度：Scheduler（per-conn 在飞=1 保序）+ W Worker + Rust 会话表
 src/bridge/mod.rs         帧执行：ws_connect 预载钩子 → ws_event（每事件一次）→ WsOutcome
 ```
 
-**挂载**（`mirror_routes`）：递归扫 `ws.ts`（优先）/`ws.js`
-（`ws_files`，同目录并存时 `.ts` 胜），每个文件一条 `GET …/ws` 路由，**每个文件一池**
-（`RoutePool::new(file, make, timeout, workers_per_route, idle_linger_ms)`）。源码与
+**挂载**（`ws_mounts` + `mirror_routes`）：递归扫 `ws.ts`（dev 优先）/`ws.js`
+（release 优先；同目录并存时主扩展名胜；跳过点目录/`node_modules`/目录符号链接），
+每个文件一条 `GET …/ws` 路由，**每个文件一池**
+（`RoutePool::new(file, make, timeout, workers_per_route, idle_linger_ms)`）。
+
+路径**与 `api.ts` 同源**（v0.1.87）：`ws_mounts` 走 `routes::mirror_rel`，`--module-root`
+下由模块索引给 `{prefix}/{模块根内路径}`——`src/wiki/api/ws.ts` → `{base}/wiki/ws`
+（`api` 是模块根本身，不是路由段）。此前按挂载根平铺计算，多出一层布局段（404）。
+`path_no_base`（守卫面，`auth.anonymous_paths` 比对用）由同一处推导。同 path 由两个
+**不同目录**的文件映射而来 → 拒启（胜者决定执行哪份 JS）。挂载清单由 `ws_mounts`
+返回，`oj serve` 启动时打印（`ws: N mount(s)`）。源码与
 `api.ts` 共用同一套 `transpile::cached_transpile`（mtime 缓存、TS 剥类型）。
 
 **线程模型**：`JsRuntime` 是 `!Send` 的。这条约束沉到 Worker：每 Worker 一条专用
@@ -273,6 +281,13 @@ dispatcher `finally` 把 `__sess` 快照交还 `ReqState.ws_sess`（帧池状态
 | `js_route_ws_send_order_and_close` | §2 顺序契约：`ws.send` 先、信封后、`ws.close` 终连 |
 | `mirror_routes_mount_directory_ws` | §1 挂载 + bus 跨会话广播（HTTP publish → WS 收帧） |
 | `mirror_routes_root_ws` | 根级 `ws.ts` → `{base}/ws`（无双斜杠） |
+| `ws_mounts_module_root_strips_layout_segment` | §挂载：`--module-root` 下与 api.ts 同口径（`src/wiki/api/ws.ts` → `{base}/wiki/ws`，守卫面 `/wiki/ws`，v0.1.87） |
+| `mirror_routes_module_root_handshake` | 同上，真实握手（该 URL 修复前 404） |
+| `ws_mounts_flat_layout_unchanged` | 兼容面：平铺布局路径逐字不变 |
+| `ws_mounts_release_keeps_version_segment` | release 维持版本段 + `ws.js` 优先（v0.2 已知限制） |
+| `ws_mounts_conflict_rejects_startup` | 同 path 两个不同目录的 ws 文件 → 拒启 |
+| `ws_mounts_skips_node_modules` | 扫描剪枝：点目录 / `node_modules` 不进挂载面 |
+| `ws_mounts_root_prefix_has_no_double_slash` | 根前缀挂载（`prefix: /`）不拼出 `//ws` |
 | `js_route_missing_handler_closes_quietly` | 编译失败 → 干净关闭 |
 | `ws_bus_subscribe_receives_http_publish` | `bus.subscribe` 幂等与广播帧形状 |
 | `js_route_ws_binary_echo_roundtrip` | §1.1 二进制帧往返：Binary 入 → `bodyBytes()` → Binary 出，字节相等（v0.1.16） |

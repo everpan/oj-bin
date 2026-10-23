@@ -39,6 +39,16 @@ cp bin/devkit/global.d.ts bin/devkit/oj-modules.d.ts .                       # �
 手册与 skill 随 oj 版本一起发布。升级 oj 后，用新包里的 `devkit/` 覆盖旧拷贝即可。
 源文件与反馈入口在仓库 `docs/devkit/`。
 
+v0.1.87 已落地部分：**WS 路由与 api.ts 同口径 + 挂载清单外显**——① `--module-root` 布局下
+`ws.ts` 的路径由模块索引给出（`{prefix}/{模块根内路径}/ws`），不再按挂载根平铺：
+`src/wiki/api/ws.ts` → `GET {base}/wiki/ws`（`api` 是模块根即布局分隔符，不是路由段；此前
+多出一层 → 文档契约里的 URL 恒 404，且守卫面错位使 `anonymous_paths` 配 `/wiki/ws` 也 401）。
+② 启动时打印 `ws: N mount(s)` 清单（路径 + 源文件，命中 `auth.anonymous_paths` 的标
+`[anonymous]`）——WS 不进路由表与 `openapi.json`，这是唯一权威面，下游工具据此核对。
+③ 两个不同目录的 `ws.ts` 映射到同一 URL → 拒启；扫描跳过点目录/`node_modules`/目录符号链接。
+平铺布局 URL 逐字不变；release 仍带版本段（`…/<name>-<version>/ws`，v0.2 已知限制，与 dev
+不同源）。见 api-manual §ws.ts 与 §13 限制表、SKILL 陷阱速查、scenarios 场景 43。
+
 v0.1.85 已落地部分：**模块根可配置（`--module-root` + manifest `prefix`）**——
 ① serve/build/openapi/test/migrate/exec/schema diff 新增 `--module-root <目录>`：子树内
 **递归**发现 `manifest.yaml`（命中即停），模块身份取 manifest 的 `name`（目录名只作定位），
