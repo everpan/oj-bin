@@ -1625,7 +1625,8 @@ mod tests {
         run(&module_root_args(&t, None)).await.unwrap();
 
         // When：dev 侧按同一份索引建路由表（`oj serve --module-root` / `oj openapi` 同路径）
-        let table = crate::openapi_cmd::discover_routes(&src, true, "/v1/api", Some(&idx)).unwrap();
+        let table =
+            crate::openapi_cmd::discover_routes(&src, &t, true, "/v1/api", Some(&idx)).unwrap();
         let mut dev: Vec<String> = table
             .listing()
             .iter()

@@ -20,8 +20,14 @@ use crate::args::OpenApiArgs;
 /// 双模路由发现：dev(ts=true) 走 V8 内省；release(ts=false) 走 dist 直载。
 /// `index`（`--module-root` 下有值）：dev 侧路由的模块段与模块内路径由索引给出，
 /// 与 `serve` 装配（`app.rs`）同源——`oj openapi --check` 比的就是这两条路径的产物。
+///
+/// `project_root`：bridge loader 的裸包解析行走上限（Node node_modules 算法），
+/// 必须锚 **config 所在目录**（`app.rs` dev 分支同语义）——module-root 下 `dir` 是
+/// 源码树根（src/），锚它会把行走截断在 src（工程根 node_modules 在其外），预生成
+/// `web/__client/api.ts`（import `@oj-module/runtime/...`）内省即 fail-fast（2026-10-23 实测）。
 pub fn discover_routes(
     dir: &Path,
+    project_root: &Path,
     ts: bool,
     base: &str,
     index: Option<&ModuleIndex>,
@@ -35,7 +41,9 @@ pub fn discover_routes(
             // project_root 须 canonicalize：referrer 来自 file URL（已 realpath），词法
             // 前缀不一致会让 `module_root_of` 误判「未找到模块根」（macOS /tmp 实测）。
             let root = only_js::bridge::strip_verbatim(
-                &dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+                &project_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| project_root.to_path_buf()),
             );
             let ts_load = ts;
             let mi = mi.clone();
@@ -313,10 +321,11 @@ pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
         ts,
         base,
         module_index,
+        config_dir,
         ..
     } = loaded;
 
-    let table = discover_routes(&dir, ts, &base, module_index.as_deref())?;
+    let table = discover_routes(&dir, &config_dir, ts, &base, module_index.as_deref())?;
     let spec = generate(&table, &base)?;
     let explicit_out = a.out.is_some();
     let out_path: PathBuf = a
@@ -324,9 +333,15 @@ pub async fn run(a: &OpenApiArgs) -> Result<i32, String> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| dir.join("openapi.json"));
+    // regen 提示须可原样复跑：module-root 模式给 `--module-root`（与 `-d` 互斥，给 `-d`
+    // 会 clap 报错或静默退回平铺语义）。
+    let source_arg = match &a.module_root {
+        Some(mr) => format!("--module-root {mr}"),
+        None => format!("-d {}", dir.display()),
+    };
     let mut regen = match &a.config {
-        Some(c) => format!("oj openapi -c {c} -d {}", dir.display()),
-        None => format!("oj openapi -d {}", dir.display()),
+        Some(c) => format!("oj openapi -c {c} {source_arg}"),
+        None => format!("oj openapi {source_arg}"),
     };
     if let Some(b) = &a.base {
         regen.push_str(&format!(" --base {b}"));
@@ -1008,7 +1023,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("user/broken")).unwrap();
         std::fs::write(dir.join("user/broken/api.ts"), "this is not ?? valid ts").unwrap();
-        let err = match discover_routes(&dir, true, "/v1/api", None) {
+        let err = match discover_routes(&dir, &dir, true, "/v1/api", None) {
             Ok(_) => panic!("dev 内省失败须报错退出（fail-fast）"),
             Err(e) => e,
         };
@@ -1017,6 +1032,53 @@ mod tests {
             "dev 内省失败须报错退出（fail-fast）：{err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dev_module_root_bare_import_resolves_from_project_root_node_modules() {
+        // 回归（2026-10-23 框架演练实测）：module-root 下 loader 的 project_root 曾锚
+        // dir=src，裸包 node_modules 行走被截断在 src → 模板预生成 `web/__client/api.ts`
+        // （import `@oj-module/runtime/...`）内省 fail-fast，整条 `oj openapi --module-root`
+        // 链不可用。修复后锚 config_dir（app.rs dev 分支同语义）：工程根 node_modules
+        // 可达，内省通过，且零动词的 __client 文件不混入路由表。
+        let proj = unique_tmp("oj-oa-mrroot");
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(proj.join("src/m1/api/ping")).unwrap();
+        std::fs::create_dir_all(proj.join("src/m1/web/__client")).unwrap();
+        std::fs::create_dir_all(proj.join("node_modules/@fake/pkg")).unwrap();
+        std::fs::write(
+            proj.join("node_modules/@fake/pkg/package.json"),
+            r#"{"name":"@fake/pkg","version":"1.0.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("node_modules/@fake/pkg/index.js"),
+            "export const x = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("src/m1/api/manifest.yaml"),
+            "name: m1\ndesc: d\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("src/m1/api/ping/api.ts"),
+            "export default { get() { json.ok({ok:true}); } };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("src/m1/web/__client/api.ts"),
+            "import { x } from \"@fake/pkg\";\nexport const c = x;\n",
+        )
+        .unwrap();
+        let src = proj.join("src").canonicalize().unwrap();
+        let idx = only_js::bridge::resolve_roots(&src, true, None).unwrap();
+        let table = discover_routes(&src, &proj, true, "/api", Some(&idx))
+            .expect("project_root 锚工程根：__client 内省须通过");
+        let mut patterns: Vec<String> = table.listing().iter().map(|r| r.pattern.clone()).collect();
+        patterns.sort();
+        assert_eq!(patterns, vec!["/api/m1/ping"]);
+        let _ = std::fs::remove_dir_all(&proj);
     }
 
     #[test]
