@@ -1208,8 +1208,10 @@ const rows = await db.table("account")
 ```
 
 - `WhereCond`：`{ field: string; op?: string; value?: unknown }`。
-  操作符：`eq / ne / gt / gte / lt / lte / in（值须数组）/ like / isnull / contains / startswith / endswith`；
-  未知操作符直接报错。`contains` / `startswith` / `endswith` 是**语义化模糊匹配**（转义与
+  操作符：`eq / ne / gt / gte / lt / lte / in（值须非空数组）/ like / isnull / contains / startswith / endswith`；
+  未知操作符直接报错。**`eq`/`ne` 省略 `value` 渲染成 `= NULL` / `<> NULL`——三值逻辑下恒不成立，
+  判空请用 `isnull`**；`in` 传空数组直接拒（`in needs non-empty array`，`IN ()` 会静默 0 行）。
+  `contains` / `startswith` / `endswith` 是**语义化模糊匹配**（转义与
   `like` 逃生舱口径见 `sql-builder-guide.md` §3.5）：
   业务层零转义负担、零方言知识，引擎自动把 `%` `_` `!` 转义后渲染 `LIKE ? ESCAPE '!'`。
 - `OrderByItem`：`{ field: string; dir?: "asc" | "desc" | null }`。
@@ -1358,11 +1360,14 @@ await db.table("sys_login_throttle").truncate().run();               // 整表�
   **当前租户**的行（真整库清空在 `db.asSystem` 下执行）；非租户表 / 系统态 = 整表清空。自带
   where 报 `truncate does not accept where`（带条件的清空用 `delete`）；`update` 携带 truncate
   报 `update does not accept truncate`。
-- 动词×字段矩阵：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/having`，
-  `values` 与 `from_select` 二选一（都给报 `insert takes either values or fromSelect, not both`、
-  都空报 `insert needs at least one row`）；`update`/`delete` 拒 `joins/distinct/groupBy/having/limit/offset`
-  （及 `values`/`from_select`/`or_ignore`；`truncate` 仅 delete 承载）；`select` 拒 `values/sets`。
-  违例报 `<verb> does not accept <field>`。
+- 动词×字段矩阵（op 侧权威）：`insert` 拒 `where/orderBy/limit/offset/joins/distinct/groupBy/
+  having/unions/with/columns`，`values` 与 `from_select` **二选一**（都给报
+  `insert takes either values or fromSelect, not both`，都空报 `insert needs either values or
+  fromSelect`）；`update`/`delete` 拒 `joins/columns/returning/distinct/groupBy/having/unions/
+  with/limit/offset/orIgnore/fromSelect`（`truncate` 仅 delete 承载，`update` 带它报
+  `update does not accept truncate`）；`select` 拒 `values/sets/returning/orIgnore/fromSelect`。
+  `update`/`delete` 共用拒绝分支，违例文案的动词字样是字面 `update/delete`（如
+  `update/delete does not accept returning`），其余为 `insert` / `select`。
 - insert 键 / update 键均过白名单（`unknown column '<k>' in insert values / update sets`）。
 - 表别名只用于 select/join（见上）：`insert/update/delete` 带 `.as(...)` 直接报
   `table alias is not supported on insert/update/delete`。
@@ -3130,6 +3135,11 @@ tenant_id」时 warn 告警 / deny 拦截。guard 非 Off 时 schema.yaml 声明
 --anonymous`）；③ `id` 非空。生效后 `tenant_id` 被填为 `id`，构造器查询照常强制注入
 租户条件；**请求级且只能设一次**（已带租户头 / 已设过 → 抛错，防运行期切换身份）。
 典型用途：公开分享页、OIDC 回调等无头请求仍需按 URL 里的租户读取数据。
+
+两个逃生口都是**请求级**（`ReqState` 重置即失效）。注意 `tx.asSystem()` / `tx.asTenant(id)`
+返回的是**外层池句柄**（丢掉 `isTx` 标记）——别指望借它「离开事务」：执行路由按库名判定，
+语句仍在事务会话里跑，反倒是靠 `isTx` 认事务域的共享库（DDL 拒绝）会因此失明。要绕租户就
+在进 `db.tx` 之前调 `db.asSystem()`。
 
 新人向白话文档见 `docs/tenant-guide.md`；**注意租户头目前是客户端自报，防伪造需 JWT claims
 绑定（规划见设计文档 §7）**。

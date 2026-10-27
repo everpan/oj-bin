@@ -183,11 +183,70 @@ deps: { user: "^0.1.0" }   # 声明后 order 模块可读 user 模块的表
 ```yaml
 tenant:
   enable: true
-  header_key: "X-TENANT-ID"   # 缺失 → 400
+  header_key: "X-TENANT-ID"        # 缺失/空 → 400 `missing tenant header: X-TENANT-ID`
+  sql_guard: deny                  # off（默认）| warn | deny；也认 bool（true=deny / false=off）
+  require_signed_claim: false      # true：租户只认验签后的 user.claims.tenant
+  shared_allow: [dict, geo]        # 共享表白名单（schema.yaml `tenant: false` 才生效）
+  allow_as_tenant: false           # 放行 db.asTenant(id)
+  anonymous_paths: ["/v1/api/oidc/*"]   # 免租户头（OIDC 回跳带不了自定义头）
 ```
 
-启用后请求头值注入 `http.tenantId`。oj **不在 SQL 层自动拼租户条件**——过滤靠你的
-where（构造器条件对象自带 `.has("tenant_id")` 检查，见 [§5.3](#53-检查与内省)）。
+`enable: true` 后请求头值注入 `http.tenantId`；`require_signed_claim: true` 时改用验签
+claim（`user.claims.tenant`），裸头只做一致性复核——不符 `tenant header does not match
+signed claim`，缺 claim `tenant requires a signed claim (user.claims.tenant missing)`。
+装配期校验：`require_signed_claim` 必须同时有 `tenant.enable=true` 与 `auth:` 段。
+
+**SQL 层是否自动拼租户条件，由 `sql_guard` 决定**（默认 `off` = 完全不注入，
+「过滤靠你的 where」只在这个默认档成立）：
+
+| 档位 | 构造器（`db.table()`） | 裸 SQL（`db.query/exec/stream`） |
+|---|---|---|
+| `off`（默认） | 不注入、不校验 | 不校验 |
+| `warn` | 缺失租户头 → `eprintln!` 告警后**不注入**放行；有头则照常注入 | 缺 `tenant_id` / 无租户头 → 告警放行（warn 只查「文本里有没有 `tenant_id`」，不核对绑定值） |
+| `deny` | 缺失租户头 → 拒；其余同 `warn` 的注入路径但违规即拒 | 缺 `tenant_id` / 参数不含当前租户 / 碰 DDL → 拒 |
+
+`warn` / `deny` 下构造器的注入是全自动的（`build_statement` 之前做，`toSQL()` 产物
+同样已注入，可安全回跑 `db.query`）：
+
+- `select` / `update` / `delete`：追加 `{表别名}.tenant_id = ?`（用别名限定，避免 join 歧义）。
+- `insert`：强制写入当前租户值；行里已带 `tenant_id` 且不等 → `tenant guard: insert
+  tenant_id mismatch (got …, want …)`；`update` 的 `sets.tenant_id` 一律拒
+  （`tenant guard: update sets.tenant_id not allowed (got …)`）。
+- `insert…fromSelect`：源 select 当作常量列补 `tenant_id`，`insert_cols` 显式带
+  `tenant_id` → `tenant guard: insert fromSelect must not supply tenant_id`。
+- join 表：租户条件进 `ON`（不是 `WHERE`）；条件树 / `having` / `case when` / 子查询 /
+  `exists` / union 臂 / CTE / `fromSelect` 全部递归覆盖。
+- 缺失租户头时：`tenant guard: table(s) ["t"] require tenant context (missing tenant
+  header; use db.asSystem() for system tasks)`。
+
+**哪些表算租户表**：`!shared && has_column("tenant_id")`。共享表要在 schema.yaml 标
+`tenant: false`，**并且**列进 `tenant.shared_allow`——白名单为空时该标记被忽略（fail-closed，
+仍按受租户约束校验 `tenant_id`）。
+
+`sql_guard` 非 `off` 时的声明期硬约束（serve 启动 / `oj build` / `oj migrate` 三处校验）：
+schema.yaml 里声明的业务表**必须有 `tenant_id` 列**（`schema: [m] 表 "t" 缺 tenant_id 列…`，
+共享表双声明豁免）；`tenant_id` 列类型只能是 `text` / `integer` / `bigint`
+（`double` / `boolean` / `blob` 没有等值租户 id 语义，直接拒）。注入值按**声明类型**绑：
+`text` → 字符串，`integer` / `bigint` → 数值形态（小值 number、更宽 i64/u64 标记）。
+数值列上租户头必须是**十进制字面量**，否则 `tenant guard: tenant id "…" is not a valid
+integer for numeric column t.tenant_id`——**`warn` 档也硬失败**（warn 只放行「无法判定」，
+不放行「判定为不匹配」）。
+
+裸 SQL 是**文本级 best-effort**（清洗注释/引号后找 `tenant_id` 字样 + 参数等值），
+不等于语义分析：`tenant guard: raw sql on ["t"] lacks tenant_id condition (use db.table()
+builder)`、`tenant guard: raw sql params must include current tenant id ("t1") under deny
+mode`；另有两条 fail-closed——DML/DDL 命中却**提取不到已登记表**
+（`tenant guard: {KW} touches no registered table (cannot verify tenant scope)`）、
+`TRUNCATE/ALTER/DROP/CREATE` 触碰已登记表（`tenant guard: {KW} on registered table(s) […]
+not allowed under sql_guard`）——都无法注入条件，deny 拒、warn 只告警。
+
+**两个逃生口**：`db.asSystem()`（请求级绕过、`ReqState` 重置即失效，日志留
+`warn: db.asSystem() invoked (tenant guard bypass for this request)`，只给审计/运维类
+handler）；`db.asTenant(id)`（匿名请求声明租户，**不绕过**防护——租户条件照常注入，只是
+id 由 handler 给。三道门禁：`allow_as_tenant: true`、请求匿名且尚无租户头、`id` 非空）。
+报错文案：`db.asTenant is disabled: set tenant.allow_as_tenant=true to let anonymous handlers
+declare a tenant` / `db.asTenant is only allowed on anonymous requests (anonymous_paths hit,
+no tenant header)` / `db.asTenant: id must not be empty`。
 
 ---
 
@@ -259,9 +318,9 @@ for await (const row of db.stream("select id, name from account order by id")) {
   流**干净提前结束**（消费端收到 done，不报错）；服务端行缓冲有界，消费端不拉取时后端
   拉取同步暂停；已回调的行不会回滚。
 - **事务内不可用**：`db.stream` 只走 `DB(name)` 直连池，在 `db.tx(...)` 内调用直接报错。
-- 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
-  InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）
-  真流式；**未声明** `stream` 的插件（或旧插件返回 `{"unsupported":true}`）→ 回落
+- 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（内置只承载 sqlite）、测试用
+  InMemory，以及第一方插件 `oj-db-mysql`/`oj-db-postgres`（typed 直连，vtable 批量 pull，
+  ≤100 行/次）真流式；**未声明** `stream` 的插件（或旧插件返回 `{"unsupported":true}`）→ 回落
   `db.query` 全量（不报错，仅失去内存优势）。
   **声明了 `stream` 却返回 unsupported** 是能力契约违规 → 结构化 `OJ_DB_UNSUPPORTED`
   （`e.data.capability = "stream"`，v0.1.88），不静默回落；反过来「未声明却真提供了流」
@@ -289,6 +348,10 @@ const out = await db.tx(async (tx) => {
 - `tx` 回调拿到的对象与 `db` 同面（`query`/`exec`/`table`/`fromJSON`/`nextSeq`/`listTables`/
   `dialect`/`sqlProfile`/`asSystem`/`asTenant` + 条件工厂，另有 `isTx: true`；**没有 `stream`**），
   全部路由到**同一连接**上。
+- **例外：`tx.asSystem()` / `tx.asTenant(id)` 返回的是外层池句柄**（不带 `isTx` 标记）。别指望
+  它「离开事务」——执行路由按**库名**判定，语句照样进事务会话；反倒是靠 `isTx` 认事务域的
+  共享库（如 `search.ensureIndex` 的 DDL 拒绝）会因此失明。要绕租户就在进 `db.tx` 之前调
+  `db.asSystem()`（逃生位是请求级的）。
 - 事务期间（包括构造器 `.run()/.all()`）同库操作自动骑到事务会话；
   **碰别的库**报错：`transaction active on db 'x' (finish it before touching db 'y')`。
 - 不支持嵌套：`transaction already active (nested tx not supported)`。
@@ -356,7 +419,7 @@ const { sql, params } = db.table("account")
 
 | op | value 要求 |
 |---|---|
-| `eq` `ne` | 任意 JSON 值（省略 = NULL 比较） |
+| `eq` `ne` | 任意 JSON 值；**省略 value 渲染成 `= NULL` / `<> NULL`（三值逻辑，恒不成立——判空用 `isnull`）** |
 | `gt` `gte` `lt` `lte` | 必填（`gt needs value`） |
 | `in` | 必须**非空**数组（非数组 `in needs array value`；空数组 `in needs non-empty array`——`IN ()` 是永久假谓词，会静默 0 行） |
 | `like` | 必填（**已成形**的 LIKE 模式，不转义；需要转义就用 `escape:"!"` 逃生舱） |
@@ -447,14 +510,24 @@ await db.table("account").delete()
   .where({ field: "id", op: "in", value: [8, 9] }).run();
 ```
 
-动词×字段**兼容矩阵在 op 侧权威校验**（`fromJSON` 也绕不过）：
+动词×字段**兼容矩阵在 op 侧权威校验**（`fromJSON` 也绕不过）。注意 `update`/`delete` 共用一个
+拒绝分支，报错里的动词字样就是字面 `update/delete`：
 
-| 动词 | 允许 | 拒绝（报 `X does not accept Y`） |
+| 动词 | 允许 | 拒绝（`<verb> does not accept <field>`） |
 |---|---|---|
-| select | where/joins/columns/groupBy/having/orderBy/limit/offset/distinct/unions/with | values, sets, returning |
-| insert | values（≥1 行）、returning | where, orderBy, limit/offset, joins, distinct, groupBy, having, unions, with, columns |
-| update | sets（非空）+ where（≥1 叶子） | joins, columns, distinct, groupBy, having, unions, with, limit/offset, returning |
-| delete | where（≥1 叶子） | 同 update + sets |
+| select | where/joins/columns/groupBy/having/orderBy/limit/offset/distinct/unions/with | values, sets, returning, orIgnore, fromSelect |
+| insert | values 或 fromSelect（**二选一**）、returning、orIgnore | where, orderBy, limit/offset, joins, distinct, groupBy, having, unions, with, columns |
+| update | sets（非空）+ where（≥1 叶子） | joins, columns, distinct, groupBy, having, unions, with, limit/offset, returning, orIgnore, fromSelect, truncate |
+| delete | where（≥1 叶子）或 `truncate()`（此时不得带 where） | joins, columns, distinct, groupBy, having, unions, with, limit/offset, returning, orIgnore, fromSelect |
+
+`truncate` 不是独立动词：`.truncate()` 置 `verb=delete` + 标志位（矩阵里只在 update 行拒绝；
+`delete` 行不列它）。`sets` 只有 `update` 渲染 `SET`——`fromJSON` 让 delete 带上 `sets` 不会被
+拒，会被静默忽略。
+
+其它 op 侧兜底（矩阵外）：`table alias is not supported on insert/update/delete`；
+`insert takes either values or fromSelect, not both` / `insert needs either values or fromSelect`；
+`insert fromSelect needs insert columns` / `insert columns are only allowed with fromSelect`；
+`fromSelect source needs explicit columns (no '*' / omission)`。
 
 insert 行数组必须**键集完全一致**（`insert rows must share identical key sets`）；
 键/sets 逐一过白名单（`unknown column 'k' in insert values` / `in update sets`）。
@@ -475,7 +548,8 @@ const id = rows[0].id;
   列过白名单。
 - pg / sqlite：渲染 `INSERT ... RETURNING "id"`，**单语句一次往返**（不再需要
   「exec 之后查 `last_insert_rowid()`」这种会串号的写法）。
-- mysql：方言无 RETURNING，只接受**单列**，在同一连接上两步取 `LAST_INSERT_ID()`
+- mysql：方言无 RETURNING，只接受**单列**（`mysql returning accepts exactly one column
+  (no RETURNING support)`），在同一连接上两步取 `LAST_INSERT_ID()`
   ——并发请放 `db.tx` 内。
 
 同一 `resolve_target` 路由：有活跃事务走会话，否则走池——DML 与查询天然同事务。
@@ -574,7 +648,9 @@ db.table("user").where({
 
 - 子查询 op ∈ `in/eq/ne/gt/gte/lt/lte`；`like does not accept subquery`、
   `isnull does not accept subquery`、`value and subquery are mutually exclusive`。
-- 嵌套层数 ≤ **4**（`REQ_NEST_MAX`，超限 `subquery: nested select too deep`）。
+- 嵌套深度上限 `REQ_NEST_MAX = 4`：顶层算 `depth 0`，最深只能用到 `depth 3`（即最多 3 层
+  嵌套），再深即 `subquery: nested select too deep`（site 换成 `exists` / `union` / `cte` /
+  `fromSelect`）。
 - 嵌套 req 只能是 select（`nested select must be select`）且**禁带 with/unions**
   （`nested select does not accept with/unions (v1)`）。
 - 子查询/exists 同样支持写在 **having** 叶子里，且递归过归属守卫。
@@ -923,9 +999,10 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 1. **动态标识符只来自白名单**。表名/列名绝不允许来自请求拼 SQL——注入防线的根。
    构造器里一切标识符都过 SchemaRegistry（或 CTE 声明列）；裸 SQL 的标识符只能写死。
 2. **值只走绑定参数**。构造器值、`?` 占位符（三引擎统一，0.1.67 起）；永不字符串拼接。
-3. **update/delete 必须带 where 且叶子 ≥ 1**——防全表误伤，JS 与 op 双层强制。
-4. 数量级：条件树深度 ≤ 8、叶子 ≤ 64；嵌套 select ≤ 4 层；limit 显式受
-   `db_query.max_limit` 约束（**默认 1000**，可配至硬顶 **100000**）。
+3. **update/delete 必须带 where 且叶子 ≥ 1**——防全表误伤，JS 与 op 双层强制。唯一显式例外是
+   `.truncate()`（命名式整表清空，见 §7.1）。
+4. 数量级：条件树深度 ≤ 8、叶子 ≤ 64；嵌套 select 最多 3 层（`REQ_NEST_MAX=4`，顶层算 0 层）；
+   limit 显式受 `db_query.max_limit` 约束（**默认 1000**，可配至硬顶 **100000**）。
 5. **多写 .toSQL()**：与执行同管线，报错前先看它渲染出了什么。
 6. **64 位整数（雪花 id）读出来是字符串**（v0.1.22）：`|v| > 2^53-1` 的 i64 一律以十进制
    字符串交付（超界给 bigint 会让 `json.ok` 直接 500）；回写用 `toBigInt()`——
@@ -964,7 +1041,8 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `ownership: 表 "x" 属于模块 "y"…`（deny 模式） | 跨模块访问未声明依赖 | manifest `deps: [y]` 或改契约调用 |
 | `unknown column 'x' in <site>` | 列不在白名单 / 未限定 | 补 schema；join 场景用 `表.列` |
 | `unknown table 'x' in <site>` | 限定名表段不是基表/join/CTE | 检查限定名拼写 |
-| `insert needs at least one row` | `.insert()` 空参 | 传对象或非空数组 |
+| `insert needs either values or fromSelect` | `.insert()` 空参（或 `fromJSON` 里两条都缺） | 传对象/非空数组，或改用 `.fromSelect(q, cols)` |
+| `insert takes either values or fromSelect, not both` | 同一请求里两条路都给了 | 二选一（upsert 语义请用 `orIgnore`） |
 | `insert rows must share identical key sets` | 行数组键不一致 | 对齐每行键 |
 | `orIgnore on mysql requires a primary key on table 't'` | mysql 的 `orIgnore` 靠 `ON DUPLICATE KEY UPDATE pk=pk`，无主键无从恒等 | 给表加主键，或改用唯一约束 + 先查后写 |
 | `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)` | sqlite 的 upsert 只能跟 VALUES | 裸 `insert or ignore … select`（注意它连 NOT NULL/CHECK 也静默跳过），或 pg/mysql |
@@ -974,8 +1052,10 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `lit column 'x' needs a scalar value (string/number/bool/null)` | `{lit: …}` 给了数组/对象 | 标量；表达式请用 `case` |
 | `db.nextSeq: no value returned` | `memory://` 假后端不执行 SQL | 换 `sqlite::memory:` 或真库 |
 | `unknown db scheme in dsn '…' (known: […])` | DSN scheme 不认识，或对应插件没装上（`known` 列表按实际后端） | 装插件 / 改 DSN |
+| `tenant guard: table(s) ["t"] require tenant context (missing tenant header; …)` | `sql_guard` 开着但请求没带租户头（deny 档） | 带 `X-TENANT-ID`，或系统任务改 `db.asSystem()` |
+| `schema: [m] 表 "t" 缺 tenant_id 列（tenant.sql_guard 启用中…）` | 开了 `sql_guard` 但表没声明 `tenant_id` 列 | 补列；共享表标 `tenant: false` 并列进 `shared_allow` |
 | `update needs non-empty sets` | `.update({})` | 至少一列 |
-| `Update requires where (leaf count >= 1)` | update/delete 无 where | 补 `.where(...)` |
+| `Update requires where (leaf count >= 1)`（delete 同款，动词首字母大写） | update/delete 无 where（绕过 JS `run()` 预检时由 op 兜底） | 补 `.where(...)`，或明示 `.truncate()` |
 | `<verb> does not accept <field>` | 动词×字段矩阵拒绝 | 见 §7 表 |
 | `condition tree too deep (max 8)` / `too large (max 64 leaves)` | 条件树超限 | 拍平/拆分条件 |
 | `in needs array value` / `in needs non-empty array` | `op:"in"` 值非数组 / 空数组 | 传非空数组（空集请在 JS 侧直接短路，别发查询） |
@@ -985,10 +1065,10 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | 主键 `duplicate key`，被撞值末几位是 0 | `Number(max(id)) + 1` 坍缩到 f64 网格值 | 改 `toBigInt(max) + 1n`（`docs/numeric-limits.md` §3） |
 | `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
 | `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | v0.1.24 前：同一 SQL 文本混用字符串/数字参数（sqlx 语句缓存按文本 key） | **v0.1.24 起平台自动按参数形态分缓存键**，无需再规避；若仍出现，检查 PG 插件是否随宿主重建 |
-| `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()` | 该值改存 text，或把列放到 MySQL `BIGINT UNSIGNED` |
+| `db param: u64 value … is not supported on this path` | `toUBigInt()` 的值走了一条不能承载 u64 的路径（PG/SQLite 全部；MySQL 的 sqlx::Any 回落路径） | 该值改存 text，或确保走 `BIGINT UNSIGNED` 的 typed 直连（`mysql://` DSN + 插件） |
 | ``db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `cast(x as char) as x`); see docs/numeric-limits.md §4.3``（v0.1.24） | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`select cast(x as char) as x from t`；避免 `select *` |
 | MySQL `BOOLEAN` 读出是 `1`/`0` | `BOOLEAN` 即 `TINYINT(1)`，协议层无长度元数据可区分 | 按整数读；需要布尔语义就在 SQL 里转：`select flag = 1 as flag from t` |
-| `subquery: nested select too deep` | 嵌套 > 4 层 | 减层或拆 CTE |
+| `<site>: nested select too deep`（site ∈ `subquery`/`exists`/`union`/`cte`/`fromSelect`） | 嵌套 > 3 层（depth ≥ 4） | 减层或拆 CTE |
 | `nested select does not accept with/unions (v1)` | 子查询/union 成员带了 with/unions | 移到顶层 |
 | `union requires explicit columns` | union 侧省略 select 列 | 双方显式列且列数一致 |
 | `union member does not accept order_by/limit/offset` | 成员带排序分页 | 排序分页放最外层 |
@@ -999,7 +1079,7 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `cte needs non-empty columns` | `.with(name, [], q)` | 声明列清单 |
 | `transaction active on db 'x' …` | 事务中碰了别的库 | 先 commit/rollback |
 | `transaction already active (nested tx not supported)` | 嵌套 `db.tx` | 复用当前 tx 回调对象 |
-| `db: instance 'x' not configured` | `DB("x")` 未在 config.db 声明 | 补 DSN 或改库名 |
+| `db: instance 'x' not configured` | 执行期按名取不到库：多半是 `manifest.yaml` 的 `db: x` 指向了 config 未声明的库（`DB("x")` 本身对未声明名返回 `undefined`，不会抛这条） | 在 `db:` 段补 DSN，或改 manifest 的绑定 |
 | `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 事务内调 `db.stream` | 移到事务外（流式只走直连池，见 §3.1） |
 
 ---
