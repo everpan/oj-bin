@@ -6,7 +6,7 @@
 ## 是什么
 
 `tasks` 全局对象（`src/bridge/task_pool.rs` 的任务池 + `src/bridge/mq.rs` 的两个 op，
-`bootstrap.js` 527~532 行挂载）只有**两个方法**，是长任务循环里的上下文原语：
+`bootstrap.js` 690~695 行挂载）只有**两个方法**，是长任务循环里的上下文原语：
 
 - `tasks.stopping()` —— 停机信号。服务收到 SIGINT/SIGTERM 后 flag 置位，任务循环据此
   自然收场；**任务桥之外恒为 `false`**（HTTP/WS handler 里调用无意义但不报错）。
@@ -18,9 +18,11 @@
 
 - **TLA 监督器任务**：顶层 await 循环写法（`while (!tasks.stopping())`），每任务一条
   专用线程 + 独立 V8 runtime，崩溃按 1s→2s→…cap 60s 退避重启。
-- **池化任务**（v0.1.28）：导出 `loop_body` 命名导出即走任务池——`tasks.pool.workers`
-  个 Worker 线程每轮驱动一次 `setup/loop_body/teardown` 三钩子，**不需要**
-  `tasks.stopping()` 轮询；停机时先跑 `teardown` 再退出。cron 定时任务由
+- **池化任务**（v0.1.28）：导出 `loop_body` 命名导出即走任务池——池大小由配置
+  `tasks.pool.workers`（默认 4）决定，N 个 Worker 线程轮转驱动。三钩子不是每轮全跑：
+  `task_connect` 时加载模块并**执行一次 `setup`（模块作用域即任务 ctx）**，之后每轮
+  只跑 `loop_body`，停机或异常路径才跑一次 `teardown`。池化任务**不需要**
+  `tasks.stopping()` 轮询；cron 定时任务由
   `tasks.crontab` 清单（5 字段 crontab）到点整模块跑一次。
 
 **与 mq 轴的分工**：`Kafka(name)` / `RabbitMQ(name)` 客户端的 `poll/commit/ack/nack`
@@ -38,7 +40,7 @@ tasks:
   # stop_grace_secs: 30       # 停机宽限（TLA 看门狗 / 池化 teardown 共用）
   pool:
     workers: 4                # 池化/cron 任务 worker 线程数（静态轮转分配）
-    loop_body_timeout_ms: 5000  # 单轮 loop_body 看门狗超时（超时 → teardown → failed）
+    loop_body_timeout_ms: 5000  # 单轮 loop_body 看门狗超时（超时 → failed，runtime 毒化，teardown 不承诺）
     interval_ms: 100          # 轮间节奏：每轮返回后 sleep 再调下一轮（防空转独占 Worker）
                               #   0 = 不限制（压测语义，生产会打满多核）
   crontab: task/crontab.yaml  # cron 清单（相对 tasks.dir，5 字段：分 时 日 月 周  相对路径）；缺省不启用
@@ -72,15 +74,15 @@ tasks:
 | cron 宏（`@daily` 等） | 解析报错 | `cron: macros (@daily etc.) not supported, use 5-field form` |
 | cron 字段越界 / 非法 | 解析报错 | `cron: '{part}' out of range {lo}-{hi}` / `cron: bad value '{part}'` / `cron: step 0 in '{part}'` |
 | 停机后仍有 run-once 作业入队 | 拒绝执行（不触碰任务状态） | `task pool stopping: run_once '{name}' rejected` |
-| `loop_body` 单轮超时 | 任务置 `failed`（teardown 尽力执行，runtime 毒化丢弃） | `loop_body timeout ({ms}ms)` |
+| `loop_body` 单轮超时 | 任务置 `failed`（runtime 已 terminate 并丢弃，**teardown 不承诺执行**） | `loop_body timeout ({ms}ms)` |
 | `loop_body` JS 堆超限 | 任务置 `failed` | `loop_body js heap limit exceeded (limit … server.js_heap_limit_bytes)` |
 
 ## 限制
 
 - **无 timer 全局**：`setTimeout/setInterval` 不存在；任务里等待一律
   `await tasks.sleep(ms)`。
-- **任务文件是 ES 模块**：用顶层 `await` 必须带一句 `export {};`（否则按 CJS 包装
-  直接 SyntaxError）。池化任务靠命名导出天然是模块。
+- **任务文件是 ES 模块**：一律按 **side-module** 直接加载（不经 loader 的 CJS
+  启发式），顶层 `await` 直接可用，`export {};` 可有可无。
 - **无热重载**：改任务文件需重启进程（转译缓存按 mtime 自动失效；池化任务可用管理面
   `reload` 重连单个任务）。
 - **`timeoutMs`（MQ poll）与 `stop_grace_secs`（默认 30s）的互动**：停机 flag 置位后
@@ -132,7 +134,7 @@ export async function loop_body() {
   log.info(`watch tick #${n + 1}`);
 }
 export async function teardown() {
-  log.info("watch down（尽力而为：超时不保证跑完）");
+  log.info("watch down（仅在停机/异常路径执行；单轮超时后 runtime 毒化，不会调用）");
 }
 ```
 
@@ -152,8 +154,7 @@ curl http://localhost:9778/v1/api/tasks/watch/logs
 
 ```ts
 // src/tasks/jobs/report.ts —— cron 脚本：顶层 await 即执行体，跑完释放 Worker
-export {};
-const rows = db.table("account").select(["id"]).all();
+const rows = await db.table("account").select(["id"]).all();
 log.info(`report: ${rows.length} accounts`);
 ```
 

@@ -17,7 +17,9 @@ HTTP handler（或 ws 帧钩子）发布，WebSocket 连接订阅。
   订阅的 WS 连接（分布式扇出，多实例互通）。插件未装而配置了对应 kind → 启动报错。
 
 订阅方即 WS 连接的 `bus_tx`：serve 层 ws.rs 每连接建 channel，帧循环把 bus 帧转写回
-socket。publish 对所有订阅者 `try_send`，满/closed 即清——**无背压、不阻塞发布者**。
+socket。publish 对订阅者用 **unbounded** channel 发送（不阻塞发布者、无背压），只有
+**接收端已关闭**的订阅者被惰性清理——「慢消费者」不会丢帧，但会无限堆积内存，别把
+大流量 topic 挂在慢 WS 客户端上。
 
 **广播帧形态**（订阅的 WS 客户端实际收到的帧，v0.1.16 起）：
 

@@ -19,7 +19,7 @@ phpinfo 风格的**装配期声明面诊断**。两个出口共用同一装配�
 
 | 段 | 内容 | 零值泄漏语义 |
 |---|---|---|
-| `build` | `oj` 版本、`profile`（release/debug）、`host_triple`、`v8` 版本、`exe` 绝对路径、（CLI 时）`config_path` | 无敏感面 |
+| `build` | `oj` 版本、`profile`（release/debug）、`host_triple`、`v8` 版本、`exe` 绝对路径、`config_path`（**仅 `oj info` 显式传 `-c` 时存在**；不传 `-c` 或走 JS `ojInfo()` 时该键缺省） | 无敏感面 |
 | `abi` | `abi_version`（当前 12）、`host_fingerprint`（rustc/契约 crate/triple 指纹） | 无敏感面 |
 | `plugins` | 每个已加载插件 `{name, semver, abi_version, fingerprint, description, host_abi_version, caps}`；`caps` 仅 db 轴插件有值，形态与插件 `describe()` 同词汇（`{"dialect":"mysql","capabilities":["placeholder_q","id_two_step","stream"]}`），非 db 轴为 `null` | desc 为插件作者自述，勿写机密 |
 | `backends` | 声明面：`db_schemes.declared`（config `db:` 键）、`blob_configured`、`kv_plugin`/`auth_plugin`/`mail_plugin`/`ldap_plugin`/`es_plugin`（槽位有无）、`mq_plugins`、`bus_kinds`、`dbs_registered` | **不 connect** 任何库/broker——纯注册表快照 |
@@ -33,6 +33,11 @@ phpinfo 风格的**装配期声明面诊断**。两个出口共用同一装配�
   stderr 打 `[oj-serve] unconsumed config sections: […] (typo? or plugin not loaded)`。
   典型成因：段名拼错（`cahce`），或对应插件没装/没进清单。
 - CLI 首行即声明红线：`oj info — declaration surface only (no connections, no config values)`。
+- **两个出口的 `caps` 渲染不同**：JSON（`ojInfo()` / `GET {base}/plugins`）是结构化
+  `{dialect, capabilities[]}`；`oj info` 纯文本走 `DialectInfo::summary()`，只打
+  `caps: placeholder=? id=two_step stream`——**不含方言名**（启动横幅同形，也看不到名字）。
+  要确认「这个插件声明的方言叫什么、能力位是哪几个」，看 JSON 出口
+  （`ojInfo().plugins[].caps` 或 `GET {base}/plugins`）。
 
 ## 错误
 

@@ -4,10 +4,10 @@
 
 ## 是什么
 
-`http` 是**只读、懒加载**的请求上下文对象（`bootstrap.js` 394 行的 `Proxy`）：除
-`param` / `file` / `bodyBytes` 三个方法外，任意属性访问都实时取当前请求的快照
-（`op_http_info`），保证拿到的是**本请求**的最新数据——池化复用的 runtime 不会串请求。
-WS 帧钩子（`ws.ts`）里同样可用（帧即「请求」）。
+`http` 是**只读、懒加载**的请求上下文对象（`bootstrap.js` 的 `globalThis.http` Proxy）：除
+`param` / `file` / `bodyBytes` 三个方法（外加 `module` 常量）外，任意属性访问都实时取当前
+请求的快照（`op_http_info`），保证拿到的是**本请求**的最新数据——池化复用的 runtime 不会
+串请求。WS 帧钩子（`ws.ts`）里同样可用（帧即「请求」）。
 
 ## 配置
 
@@ -15,7 +15,11 @@ WS 帧钩子（`ws.ts`）里同样可用（帧即「请求」）。
 
 ```yaml
 server:
-  max_upload_bytes: 8388608   # multipart 小文件阈值：≤ 此值进 http.file(i)；超出由服务端流式直落 blob
+  max_upload_bytes: 10485760  # 上传/请求体上限（默认 10 MiB）；超限 413 信封
+  # 一个值两项作用（v0.1.30 起）：
+  #  1) 非 multipart / 未配 blob：整体缓冲上限（axum body limit = 2x 此值，超 2x 裸 413）
+  #  2) multipart 且已配 blob：单文件「缓冲 vs 流式」分界——≤ 此值进 http.file(i)，
+  #     > 此值转流式直落 blob（单文件上限 blob_upload_max_bytes，默认 1 GiB），内存恒定
 tenant:
   enable: true                # 启用后从租户头提取 http.tenantId
   header_key: "X-TENANT-ID"   # 默认即此名；缺头且未豁免 → 400

@@ -27,7 +27,7 @@
 | `fingerprint` | `string` | 构建指纹（核对外发产物一致性） |
 | `description` | `string` | 插件作者自述（descriptor 必填项） |
 | `host_abi_version` | `number` | **宿主**当前 ABI 版本（每条记录重复携行，方便逐条比对） |
-| `caps` | `object \| null` | **db 轴插件**的方言能力声明（ABI 12 起），与插件 `describe()` 同一套词汇：`{dialect, capabilities[]}`；能力串闭集见 `docs/dev-guide.md`。非 db 轴插件为 `null`。用途：确认「这个库的方言被宿主识别成什么、支持哪些原语」 |
+| `caps` | `object \| null` | **db 轴插件**的方言能力声明（ABI 12 起），与插件 `describe()` 同一套词汇：`{dialect, capabilities[]}`；能力串闭集见 `docs/db-guide.md` §10.5 的能力位对照表。非 db 轴插件为 `null`。用途：确认「这个库的方言被宿主识别成什么、支持哪些原语」 |
 
 ## 错误
 
@@ -68,10 +68,13 @@ export default { get };
 ```bash
 curl http://localhost:9778/v1/api/plugins        # 内置公共端点（无需 token）
 # → {"code":0,"msg":"ok","data":[
-#     {"name":"oj-db-mysql","semver":"0.1.2","abi_version":12,"fingerprint":"…",
-#      "description":"MySQL db backend","host_abi_version":12,
+#     {"name":"db-mysql","semver":"0.1.2","abi_version":12,"fingerprint":"…",
+#      "description":"db 轴 mysql cdylib 插件：…","host_abi_version":12,
 #      "caps":{"dialect":"mysql","capabilities":["placeholder_q","id_two_step","stream","cancel"]}}, …]}
 ```
+
+> `name` 是插件 `describe()` 的自报名（`db-mysql` / `db-postgres` / `kv-redis` / …），**不带**
+> `oj-` 前缀；`oj-` 只出现在 crate / 产物文件名上（`cargo xtask plugin db-mysql` 用的也是短名）。
 
 ### 升级核对：ABI 一致性自检
 

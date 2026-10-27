@@ -11,8 +11,8 @@ cdylib 插件 `oj-blob-s3` 承载（blob 轴）。JS 侧暴露 `blob` 全局对�
 
 配套内置路由（serve 层，不经 handler）：
 
-- `GET {base}/blob/{key}` —— 下载（免鉴权；local 直出字节 + Content-Type，s3 302 跳
-  presigned URL；local 内联腿支持单区间 `Range` 请求 → 206）。
+- `GET {base}/blob/{key}` —— 下载（免鉴权；local 直出字节 + Content-Type，s3 回
+  **303 See Other** 跳 presigned URL；local 内联腿支持单区间 `Range` 请求 → 206）。
 - `PUT {base}/blob/{key}` —— 大文件直传上传（**过鉴权守卫**；体积上限独立
   `server.blob_upload_max_bytes`，默认 1 GiB；不经 JsActor，无 handler 30s 限制）。
 
@@ -70,7 +70,7 @@ s3 后端（`oj-blob-s3` 插件）每后端连接收的字段：
 | `get` | `(key: string) => Promise<Uint8Array>` | 读对象（不存在报错 `blob get: ...`） |
 | `del` | `(key: string) => Promise<boolean>` | 删对象（**幂等**：不存在视为成功；local 一并清 sidecar） |
 | `url` | `(key: string) => Promise<string>` | 下载地址：local = `{base}/blob/{key}`（**仅 default 后端可用**，非 default 报错）；s3 = presigned URL（15min） |
-| `uploadUrl` | `(key: string, opts?: {kind: string}) => Promise<{url: string}>` | 上传直传预签名（v0.1.30）：**仅 s3 后端**（15min 预签名 PUT URL）；`opts` 缺省 `{"kind":"put"}`，multipart 形态暂返回 Err。local 报 `local blob backend has no upload presign; use the direct PUT upload route`，改用 `PUT {base}/blob/{key}` 直传路由 |
+| `uploadUrl` | `(key: string, opts?: {kind: string}) => Promise<string>` | 上传直传预签名（v0.1.30）：**仅 s3 后端**（15min 预签名 PUT URL）；`opts` 缺省 `{"kind":"put"}`，multipart 形态暂返回 Err。**返回 JSON 文本**（形如 `{"url":"..."}`），要对象请 `JSON.parse`。local 报 `local blob backend has no upload presign; use the direct PUT upload route`，改用 `PUT {base}/blob/{key}` 直传路由 |
 | `contentType` | `(key: string) => Promise<string>` | local 读 sidecar / 按扩展名推断；缺失且无法推断返回**空串**。s3 后端恒返回空串（Content-Type 由 S3 对象自身元数据负责） |
 | `copy` | `(src: string, dst: string) => Promise<boolean>` | **服务端复制（v0.1.47，ABI 11）：src 保留**。local = `fs::copy`（字节不进 V8）；s3 = CopyObject。`src == dst` 为 no-op；src 不存在报错。ct 随行 |
 | `move` | `(src: string, dst: string) => Promise<boolean>` | **服务端搬移（v0.1.47，ABI 11）：src 不再存在**。local 同父目录 = `fs::rename`（原子、零字节），跨目录 = copy + unlink；s3 = CopyObject + DeleteObject。`src == dst` 为 no-op |

@@ -131,8 +131,10 @@ oj-mail 是提供 `mail` 轴的 cdylib 插件，底层 `lettre` 0.11 SMTP。负�
 依赖与构建注意：
 
 - rustls 钉 `=0.23.40`，与框架同 provider（aws-lc-rs，不引 ring）。
-- init 首语句必须装 aws-lc-rs 默认 CryptoProvider；`TlsParameters::new` 立即构建
-  rustls `ClientConfig`，未装则 panic。
+- `build_profiles` 首语句必须装 aws-lc-rs 默认 CryptoProvider（幂等）；`TlsParameters::new`
+  立即构建 rustls `ClientConfig`，未装则 panic。init 的顺序是「先 `MailConfig::parse`
+  校验 → 告警明文 profile → `MailEngine::new`（内部 `build_profiles`）」，坏配置在构建
+  transport 之前就被拒。
 - lettre `pool` 在构建与 Drop 时都 `tokio::spawn` → transport 的创建/使用/销毁
   必须全程在插件自身 runtime 内（已保证）。
 - `tls: none` 且走网络的 profile，启动时打 warn 级告警（含 profile 名与
@@ -142,7 +144,7 @@ oj-mail 是提供 `mail` 轴的 cdylib 插件，底层 `lettre` 0.11 SMTP。负�
 
 备注：
 
-- 新增 `mail` 轴零 ABI 变更：`AXES` 加 `"mail"` 不 bump `ABI_VERSION`，既有插件无需重编。
+- 新增 `mail` 轴零 ABI 变更：`TYPED_AXES` 里加 `"mail"` 不 bump `ABI_VERSION`，既有插件无需重编。
 - 附件字节由宿主解析后经 FFI 直传插件（引用式，不经 base64 / 不经 JS）；插件不读盘、不碰 bus。
 - 已知限制：跨进程 `mail.result` 仅本地扇出；XOAuth2 仅静态 token；SMTP 错误细分
   （code 2/3）未启用，5xx 与鉴权失败均归 code 1。

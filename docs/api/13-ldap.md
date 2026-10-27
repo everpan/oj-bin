@@ -42,7 +42,7 @@ ldap:
 | 实例字段 | 说明 |
 |---|---|
 | `url` | 仅 `ldap://` / `ldaps://`；未知 scheme / 坏 url → 启动报错 |
-| `bind_dn` / `bind_pw` | 服务账号，成对出现（只配一个 → 报错）；都不配则匿名绑定 |
+| `bind_dn` / `bind_pw` | 服务账号。`bind_dn` 可单独配（DN 非密码）；只配 `bind_pw` 而无 `bind_dn` → 启动报错；都不配则匿名绑定 |
 | `timeout_ms` | 连接与操作超时（100..=3600000，默认 5000） |
 | `start_tls` | 仅用于 `ldap://` 口；配在 `ldaps://` 上 → 启动报错 |
 | `tls_skip_verify` | 跳过服务端证书校验，仅测试环境 |
@@ -97,13 +97,13 @@ type Entry = {
 | 插件未装/未进清单 | `unknown generic axis 'ldap' (available: […])` |
 | 旧 `ldap.*` 调用（迁移版插件已装） | `ldap not configured (config ldap: section missing, or oj-ldap plugin not loaded)` |
 | 实例名未声明 | `ldap: unknown instance '<key>'（known: <已知名单>）` |
-| 必填字符串缺失/为空 | `ldap.<op>: 'dn' must be a non-empty string` / `'base' must not be empty` 等 |
+| 必填字符串缺失/为空 | `ldap.<op>: 'dn' must be a non-empty string`（旧 `ldap.*` 路径文案为 `'dn' must not be empty`） |
 | scope 非法 | `ldap.search: scope must be 'base'\|'one'\|'sub' (got '<s>')` |
-| attrs 形态错 | `ldap.<op>: 'attrs' must be an array` / `'attrs' must be string[]` |
+| attrs 形态错 | `ldap.<op>: 'attrs' must be string[]`（旧 `ldap.*` 路径为 `'attrs' must be an array`） |
 | pageSize 越界/形态错 | `ldap.search_paged: page_size must be 1..=10000` / `'page_size' must be a number` |
 | 未知 op | `ldap: unknown op '<op>'（known: bind\|search\|search_paged\|whoami\|compare）` |
 | compare 缺 val | `ldap.compare: 'val' must be a string` |
-| 网络/拒连 | `ldap: connect ldap://…: io error` |
+| 网络/拒连 | `ldap: connect <url>: <ldap3 原文>`（如 `I/O error: Connection refused (os error 111)`） |
 | 服务账号凭据错 | `ldap: service bind …: rc=49 …` |
 | config 只配了密码 | `bind_pw requires bind_dn (set both in config, or supply bindPw per search call)` |
 

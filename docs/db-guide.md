@@ -439,7 +439,7 @@ const cond = and(
   or(leaf("role", "eq", "admin"), not(leaf("tag", "eq", "hidden"))),
 );
 
-db.table("account").where(cond).all();
+await db.table("account").where(cond).all();   // .all() 是 async，必须 await
 ```
 
 - 工厂产物是**不可变**条件对象：`.and(c)` / `.or(c)` / `.not()` 返回新对象，不改原树。

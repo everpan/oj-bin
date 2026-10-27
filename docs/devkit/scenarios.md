@@ -1092,11 +1092,14 @@ auth:
 ```ts
 // src/auth/login/api.ts
 export default {
-  post() {
+  async post() {
     const { username, password } = http.body;
-    const row = db.table("users").where("username", username).first();
-    if (!row || !bcrypt.verify(password, row.password_hash)) json.fail(401, "invalid credentials");
-    const token = jwt.sign({ sub: row.id, roles: JSON.parse(row.roles) }, { expiresIn: 86400 });
+    // where 收 {field,op,value} 条件树；没有 first()，取一行用 .all() + 解构首元素
+    const [row] = await db.table("users")
+      .where({ field: "username", op: "eq", value: username }).all();
+    if (!row || !(await bcrypt.verify(password, row.password_hash))) json.fail(401, "invalid credentials");
+    // jwt.sign 只收 payload（exp 由 config 的 access_token_duration 决定，不接受 expiresIn）
+    const token = jwt.sign({ sub: String(row.id), roles: JSON.parse(row.roles) });
     // v0.1.46 起同名头可重复：两枚 cookie 同响应双发（此前响应头单值，csrf 只能
     // 经 body 下发 + 前端写 document.cookie）。oj_csrf 非 HttpOnly——双提交要 JS 读得到。
     json.header("set-cookie",
@@ -1506,7 +1509,7 @@ export default {
     // 应用层加密：输出 base64(nonce12 ‖ ciphertext ‖ tag16)，每次密文都不同（随机 nonce）
     const ct = crypto.aesGcmEncrypt(phone, KEY);
 
-    await db.table("user").insert({ name: http.param("name", ""), phone_enc: ct }).exec();
+    await db.table("user").insert({ name: http.param("name", ""), phone_enc: ct }).run();
     json.ok({ ok: true });
   },
 };
@@ -1774,7 +1777,7 @@ export default {
     // ② 搬运：服务端 rename / CopyObject，字节不过桥（src 转正后即消失）
     await blob.move(key, dst);
     const body = isText ? new TextDecoder().decode(await blob.get(dst)) : "";
-    db.table("file").insert({ id, key: dst, body, binary: !isText }).save();
+    await db.table("file").insert({ id, key: dst, body, binary: !isText }).run();
     json.ok({ key: dst, url: await blob.url(dst), binary: !isText });
   },
 };

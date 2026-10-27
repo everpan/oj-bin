@@ -6,7 +6,7 @@
 
 ## 是什么
 
-`oidc` 全局对象（`src/bridge/oidc.rs`，`bootstrap.js` 934~945 行挂载）：OIDC 所需的
+`oidc` 全局对象（`src/bridge/oidc.rs`，`bootstrap.js` 1253~1265 行挂载）：OIDC 所需的
 **RS256 JWS 签发/验签原语** + 装配期配置只读透出。密钥不出 Rust（DIP）——JS 只见
 sign/verify/jwks 接口与配置值，私钥 PEM 永远拿不到。
 

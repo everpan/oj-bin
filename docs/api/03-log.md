@@ -53,7 +53,8 @@ SQL 追踪两出口（配置开启时）：
 
 ## 错误
 
-`log.*` 本身不抛错（fast op，无失败路径）：
+`log.*` 不因日志设施失败而抛错（级别被过滤时整条跳过）；但字段是**在 JS 侧先序列化**
+再交给 Rust op，不可序列化的字段会在调用点抛：
 
 | 场景 | 行为 |
 |---|---|
@@ -66,9 +67,13 @@ SQL 追踪两出口（配置开启时）：
 - 只有 4 个级别，无 `trace`/`fatal`；级别过滤完全交给 `RUST_LOG`。
 - kv 是**交替参数**不是对象：`log.info("m", {id: 1})` 会把对象当成「键」`String(...)`
   化——要传对象请展开成 `"id", 1` 或包进某个值位。
-- `log.*` 写 stderr（tracing-subscriber），不落文件、不进响应；要审计落库请自行 `db` 写表。
-- SQL 追踪仅覆盖 bridge 的 db op（`db.query/exec/stream`、`tx.*`、`db.nextSeq`）；
-  `redact_params: false` 只在本地排障时临时开，生产勿开（参数原值进日志）。
+- `log.*` 写 stderr（tracing-subscriber），**由服务端 tee 全量镜像落盘**——每次启动一个
+  `logs/server-<启动秒>_<pid>.log`（目录 `server.logs_dir`，默认相对 config 目录），按大小
+  滚动、最多保留 10 个；`server.console_log` 默认 **false**（终端反而静默，只落盘）。
+  不进响应；要审计落库请自行 `db` 写表。
+- SQL 追踪覆盖**所有经 bridge 的 db 执行路径**：构造器 `db.table(...)` 的 `.all()` / `.run()`、
+  `db.query` / `db.exec` / `db.stream`、`db.listTables`、`db.nextSeq`、`tx.*`（`.toSQL()` 只
+  构造不执行，不入画像）；`redact_params: false` 只在本地排障时临时开，生产勿开（参数原值进日志）。
 
 ## 案例
 

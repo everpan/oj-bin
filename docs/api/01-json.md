@@ -17,7 +17,7 @@
 | API | 签名 | 说明 |
 |---|---|---|
 | `json.ok` | `ok(data?: unknown): void` | 成功信封 `{"code":0,"msg":"ok","data":...}`，HTTP 200 |
-| `json.fail` | `fail(code: number, msg: string, data?: unknown): void` | 失败信封 `{"code":code,"msg":...,"data":...}`，HTTP 状态 = `code`（`code<=0` 映射 500；超 u16 范围 clamp 到 65535，信封内 code 保留原值） |
+| `json.fail` | `fail(code: number, msg: string, data?: unknown): void` | 失败信封 `{"code":code,"msg":...,"data":...}`，HTTP 状态 = `code`（`code<=0` 映射 500；**非法状态码（<100 或 >999）回落 500**，信封内 code 保留原值） |
 | `json.header` | `header(name: string, value: string): void` | 追加响应头（有序、同名可重复）：`Set-Cookie` 合法多值并存（登录双发 `oj_sess` + `oj_csrf` 的通道）；其余同名头**最后一个生效**。空名忽略 |
 | `json.redirect` | `redirect(url: string, code?: number): void` | 3xx 重定向：写 `Location` 头 + RFC 9110 §15.4 短超文本注记（HEAD 请求为空 body），content-type 默认 `text/html; charset=utf-8`。`code` 缺省 302；**非 3xx 一律回落 302**（杜绝「200 + Location」畸形响应）；空 url 不写 `Location` |
 | `json.redirect.*` | `movedPermanently(url)` / `found(url)` / `seeOther(url)` / `temporaryRedirect(url)` / `permanentRedirect(url)` | 具名封装：301 / 302 / 303（跟随后改 GET）/ 307（方法/体保持）/ 308（永久 + 方法保持） |
@@ -42,7 +42,7 @@
 | 场景 | 行为 |
 |---|---|
 | `json.fail(code<=0, ...)` | 信封 code 与 HTTP 状态均取 500 |
-| `json.fail(70000, ...)` | HTTP 状态 clamp 到 65535；信封 body 内 code 保留 70000 全精度 |
+| `json.fail(70000, ...)` | HTTP 状态回落 500（>999 不是合法状态码；`json.fail(50, ...)` 同理，<100 也不合法）；信封 body 内 code 保留 70000 全精度 |
 | `json.redirect(url, 200/404/...)` | 非 3xx 一律回落 302 |
 | handler 抛异常 / 超时 | serve 层兜底：异常 → 500 信封 `{code:500,msg,...}`；超时熔断 → 408 |
 | handler 未写任何响应 | HTTP 500、空 body（`Capture` 默认 status=0 非法，serve 层映射 500）——业务代码必须调用一次 `json.*` |

@@ -4,7 +4,7 @@
 
 ## 是什么
 
-三个全局对象（`src/bridge/crypto.rs`，`bootstrap.js` 920~965 行挂载）——核心只留
+三个全局对象（`src/bridge/crypto.rs`，`bootstrap.js` 1239~1303 行挂载）——核心只留
 **原语**，业务语义（登录/刷新/守卫）在 JS 端点与 oj-auth 插件：
 
 - **`jwt`**：HMAC JWT 签发/验签。secret/算法/有效期由 config `auth:` 段在装配期注入，
@@ -50,14 +50,17 @@ auth:
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `crypto.sha256Hex` | `sha256Hex(s: string): string` | UTF-8 编码后的 sha256 十六进制摘要 |
+| `crypto.sha256Hex` | `sha256Hex(data: string \| Uint8Array \| ArrayBuffer): string` | 字符串按 UTF-8 编码求摘要；视图/缓冲按原始字节求（非 UTF-8 载荷用这条），返回十六进制 |
+| `crypto.md5Hex` | `md5Hex(data: string \| Uint8Array \| ArrayBuffer): string` | 同上形态的 MD5 十六进制。**密码学已破损，仅限缓存键 / etag / 旧系统兼容**，不得用于凭据、签名、完整性校验 |
+| `crypto.verifyEd25519` | `verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean` | Ed25519 验签（bundle 签名校验用）。公钥为 hex/base64 的 **32 字节裸钥**（不收 PEM/SPKI），签名只收 base64（不收 base64url）；格式错抛错，签名不匹配返回 `false` |
 | `crypto.randomHex` | `randomHex(nBytes?: number): string` | `nBytes` 字节随机数的 hex；缺省 32 字节（→ 64 字符，refresh token 用），上限 1024 字节 |
 | `crypto.getRandomValues` | `getRandomValues(view: ArrayBufferView): ArrayBufferView` | WebCrypto 形态：填充任意 TypedArray view 并返回原 view（v0.1.30）；单次 ≤65536 字节；非 view 抛 `TypeError` |
 | `crypto.aesGcmEncrypt` | `aesGcmEncrypt(plaintext: string, key: string): string` | AES-GCM 应用层加密（v0.1.35）：明文 UTF-8，key 为 16/32 字节原始密钥的 hex 或 base64 编码；返回 `base64(nonce12 ‖ ct ‖ tag16)` |
 | `crypto.aesGcmDecrypt` | `aesGcmDecrypt(ciphertext: string, key: string): string` | 输入 `aesGcmEncrypt` 的密文返回原文；密钥错 / 篡改（GCM tag 校验失败）抛错 |
 
-另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30；非法输入抛
-`InvalidCharacterError`）。
+另：全局 `atob(s)` / `btoa(s)` 标准 base64（v0.1.30）。非法输入抛的是**普通 `Error`**，
+消息以 `InvalidCharacterError: …` 开头——不是 `DOMException` 实例，别按
+`e.name === "InvalidCharacterError"` 判定，按 `String(e).includes("InvalidCharacterError")`。
 
 ## 错误
 
@@ -66,7 +69,7 @@ auth:
 | 未配置 `auth:` 段调用 `jwt.*` | 抛 `Error` | `jwt not configured (config auth: section missing)` |
 | `jwt.sign` 的 payload 无字符串 `sub` | 抛 `Error` | `jwt.sign: payload.sub must be a string` |
 | `jwt.verify` 篡改 / 过期 / 算法不符 | 抛 `Error`（jsonwebtoken 原始文案） | 如 `ExpiredSignature` / `InvalidSignature` |
-| 装配期 `signing_method` 非法 | 启动 fail-fast | `auth.signing_method '{m}' not supported (HS256|HS384|HS512)` |
+| 装配期 `signing_method` 非法 | 启动 fail-fast | `auth.signing_method '{m}' not supported (HS256\|HS384\|HS512)` |
 | 装配期 duration 非法 | 启动 fail-fast | `auth.access_token_duration: …` / `auth.refresh_token_duration: …` |
 | `bcrypt.verify` hash 非法 | **返回 `false`**（不抛错） | —— |
 | `crypto.getRandomValues` 非 view 参数 | 抛 `TypeError` | `crypto.getRandomValues: argument must be a TypedArray view` |
@@ -101,16 +104,19 @@ auth:
 // src/auth/login/api.ts —— 查用户 → 校验密码 → 签 access + 发不透明 refresh
 async function post() {
   const { username, password } = http.body ?? {};
-  const row = db.table("users").select(["id", "roles", "password_hash"])
-    .where("username", "=", String(username ?? "")).first();
+  // where 收 {field,op,value} 条件树；构造器没有 first()，取一行用 .all() + [0]
+  const [row] = await db.table("users").select(["id", "roles", "password_hash"])
+    .where({ field: "username", op: "eq", value: String(username ?? "") }).all();
   if (!row || !(await bcrypt.verify(String(password ?? ""), row.password_hash))) {
     json.fail(401, "bad credentials");
     return;
   }
   const access = jwt.sign({ sub: String(row.id), roles: row.roles ?? [] });
   const refresh = crypto.randomHex();                       // 64 字符不透明串
-  await kv.set("AUTH-SESSION:" + crypto.sha256Hex(refresh), String(row.id),
-    { ex: jwt.refreshDuration });
+  // kv.set 只有 (key, value) 两参；TTL 是独立调用 kv.expire(key, 秒)
+  const sess = "AUTH-SESSION:" + crypto.sha256Hex(refresh);
+  await kv.set(sess, String(row.id));
+  await kv.expire(sess, jwt.refreshDuration);
   json.ok({ access, refresh, expires_in: jwt.accessDuration });
 }
 export default { post };
@@ -140,8 +146,10 @@ async function post() {
   const { username, password } = http.body ?? {};
   if (!username || !password) { json.fail(400, "username/password required"); return; }
   const hash = await bcrypt.hash(String(password));         // cost 缺省 12
-  const id = db.table("users").insert({ username, password_hash: hash, roles: ["user"] });
-  json.ok({ id });
+  // insert 必须 .run()；不写 .returning 时 run() 返回受影响行数（拿不到主键）
+  const rows = await db.table("users")
+    .insert({ username, password_hash: hash, roles: ["user"] }).returning(["id"]).run();
+  json.ok({ id: rows[0].id });
 }
 export default { post };
 ```
@@ -154,12 +162,15 @@ async function post() {
   const key = vars.get("FIELD_KEY");                        // 32 字节 hex
   if (!key) { json.fail(500, "FIELD_KEY not set"); return; }
   const blob = crypto.aesGcmEncrypt(String(http.body.ssn), key);
-  db.table("profile").where("id", "=", String(http.body.id)).update({ ssn_enc: blob });
+  await db.table("profile")
+    .where({ field: "id", op: "eq", value: String(http.body.id) })
+    .update({ ssn_enc: blob }).run();
   json.ok({ bytes: blob.length });
 }
 async function get() {
   const key = vars.get("FIELD_KEY");
-  const row = db.table("profile").select(["ssn_enc"]).where("id", "=", String(http.query.id)).first();
+  const [row] = await db.table("profile").select(["ssn_enc"])
+    .where({ field: "id", op: "eq", value: String(http.query.id) }).all();
   json.ok({ ssn: row ? crypto.aesGcmDecrypt(row.ssn_enc, key) : null });
 }
 export default { post, get };

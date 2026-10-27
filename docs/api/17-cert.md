@@ -4,7 +4,7 @@
 
 ## 是什么
 
-`cert` 全局对象（`src/bridge/cert.rs`，`bootstrap.js` 913~918 行挂载）：JWS 证书
+`cert` 全局对象（`src/bridge/cert.rs`，`bootstrap.js` 1233~1236 行挂载）：JWS 证书
 （header `{"alg":"RS256","typ":"JWT"}` + payload `{nbf,exp}`，b64url no-pad 三段式）
 的**签发与续签原语**，桥接自 `tools/oj-cert`（格式契约的单一事实来源；CLI 与本全局
 同源）。RSA 密钥生成与 RS256 签名都在 Rust 侧完成，返回纯内存字符串，**不落盘**。
