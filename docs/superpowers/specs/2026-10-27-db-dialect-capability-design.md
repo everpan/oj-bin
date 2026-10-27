@@ -54,6 +54,7 @@ dbx 项目（Java 多数据库客户端）用四个机制支撑了 54 个数据�
 - ABI：`oj-plugin-ffi` 的 `ABI_VERSION` 11 → 12，严格相等门禁（双道：符号 + descriptor，`plugin_loader.rs:428-433`）。宿主与插件由 `cargo xtask build` 同版本一次性产出、整体拷贝部署——ABI 破坏可接受。
 - `AbiMismatch` 错误体附双方 `HOST_FINGERPRINT` / plugin fingerprint，文案统一附处置指引「重新整体拷贝 bin/，禁止增量覆盖」；升级窗口用现成的 `GET {base}/plugins`（`host_abi_version` 字段）核对。
 - 兼容定义（用户确认）：**业务侧 JS API**。插件 ABI 不在兼容承诺内。既有方言的 JS 错误消息文本逐字节冻结（业务 handler 可能在 catch 里匹配文本）；新增错误条件（unsupported 等）以新增稳定错误码暴露，不影响旧文本。
+  **冻结范围的唯一例外**（与 §5.1「db 轴 adapter 不再做 `ffi_err` 前缀包装」直接冲突处，落地时按 §5.1 执行）：宿主侧 `ffi <op>: ` 前缀被移除。ABI 11 及以前该前缀与插件自身文案叠加为 `ffi db query: db query: <sqlx 原文>`，现为 `db query: <sqlx 原文>` —— message 主体逐字不变，仅去掉重复前缀；`db_error_text_snapshot_is_frozen` 钉死该文本。
 - 安全语义零变化：`SchemaRegistry` 白名单（`src/bridge/registry.rs`）、tenant guard（`src/bridge/guard.rs`）、占位符 `normalize_sql` 单漏斗，全部保留；占位符改写仅「触发条件从枚举比较换成能力查表」，行为逐字节等价。
 - 回归安全网：见 §8 M1 验收——env-gated 真库测试列为必跑，「env 未设 = 不算绿」。
 - 回滚单元 = `bin/`（含 plugins）+ `dist/` + `config.yaml` 三者同版本；新方言 DSN 投产后，包回滚只能回到最近一个支持该 scheme 的版本，更早版本回滚须先摘除新方言 DSN（ops-manual §8 增补，M3）。
