@@ -587,6 +587,42 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 
 ---
 
+## 10.5 方言能力矩阵（v0.1.88，ABI 12）
+
+宿主只对**它认识的三种方言**替你生成 SQL；其他方言（由插件 `describe()` 声明）上一期只开放
+**裸 SQL 路径**。能力缺失一律 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名是哪个 API），
+**绝不**静默按 sqlite 语义生成一段错误 SQL。
+
+| API | sqlite | mysql | postgres | 其他方言 |
+|---|---|---|---|---|
+| `db.query` / `db.exec` / `db.tx` | ✅ | ✅ | ✅ | ✅（裸 SQL 全量可用） |
+| `db.stream` | ✅ | ✅（typed 直连，真流式） | ✅（typed 直连，真流式） | 取决于插件是否声明 `stream`；未声明回落 `db.query` 全量 |
+| `db.stream` 的 `signal` 取消 | 协作式（批间） | ✅ `KILL QUERY` | ✅ `pg_cancel_backend` | 取决于插件是否声明 `cancel` |
+| `db.table(...)` 构造器（含 DML / join / CTE / 聚合） | ✅ | ✅ | ✅ | ❌ `OJ_DB_UNSUPPORTED` |
+| `db.listTables` | ✅ | ✅ | ✅ | ❌ |
+| `db.nextSeq` | ❌（`memory://`/sqlite 不支持） | ✅ | ✅ | ❌ |
+| `_shared/search.ts` / `_shared/versions.ts` | ✅ | ✅ | ✅ | ❌ |
+| `oj migrate` / `oj seed` | ✅ | ✅ | ✅ | ❌（迁移须用该方言自己的工具） |
+
+三个内置方言的**能力位**（`plugins()` / `GET {base}/plugins` 的 `caps` 列同源）：
+
+| 方言 | 占位符 | 取自增 | stream | cancel |
+|---|---|---|---|---|
+| sqlite | `placeholder_q`（`?`） | `id_two_step`（`last_insert_rowid`，有 RETURNING 时才用未必要） | ✅ | ❌ |
+| mysql | `placeholder_q` | `id_two_step`（`LAST_INSERT_ID()` 两步） | ✅ | ✅ |
+| postgres | `placeholder_dollar`（`$n`，JS 侧仍写 `?`，宿主改写） | `id_returning`（`RETURNING`） | ✅ | ✅ |
+
+**接新方言（插件作者）**：在 `describe()` 返回 `{"dialect": "<名>", "capabilities": [...]}`
+（能力串是闭集：`placeholder_q|placeholder_dollar|placeholder_colon`、`id_returning|id_two_step|id_none`、
+`stream`、`cancel`；两个组各必选一）。宿主装配期严格校验，写错/漏项直接拒绝该插件并点名——
+宁可拒绝启动，也不让错配活到运行期。详见 `docs/plugins/plugin-development.md` §3。
+
+**错误诊断**：db 的 reject 自带 `e.code` / `e.retryable` / `e.sessionDisposition` / `e.data`
+（含引擎原始码 `data.vendor_code`）——不要解析 message 文本。完整口径见
+`docs/devkit/api-manual.md`「结构化数据库错误」。
+
+---
+
 ## 11. 边界与红线（新人必读）
 
 1. **动态标识符只来自白名单**。表名/列名绝不允许来自请求拼 SQL——注入防线的根。

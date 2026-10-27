@@ -16,12 +16,15 @@ use sqlx::query::Query;
 use sqlx::{Column, Row};
 
 use super::db::{Dialect, dialect_of};
+use super::dialect_caps::{DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle};
 use super::{BridgeResult, DataAccessor, Row as JsRow};
 
 /// 基于 sqlx AnyPool 的 DataAccessor 实现。
 pub struct SqlxAccessor {
     pool: Pool<Any>,
     dialect: Dialect,
+    /// 方言描述符（T6：两层模型；镜像当前 SqlxAccessor 行为，随真实实现推进）。
+    dialect_info: DialectInfo,
 }
 
 impl SqlxAccessor {
@@ -38,15 +41,36 @@ impl SqlxAccessor {
             .connect(url)
             .await
             .map_err(|e| format!("sqlx connect: {e}"))?;
+        let dialect = dialect_of(url);
         Ok(Self {
             pool,
-            dialect: dialect_of(url),
+            dialect,
+            dialect_info: Self::dialect_info_for(dialect),
         })
     }
 
     /// 便捷构造 Arc 句柄。
     pub async fn arc(url: &str) -> BridgeResult<Arc<dyn DataAccessor>> {
         Ok(Arc::new(Self::connect(url).await?) as Arc<dyn DataAccessor>)
+    }
+
+    /// SqlxAccessor 的方言描述符（T6）：镜像当前 sqlx 行为——
+    /// 占位 `?`（sqlite/mysql）/ `$n`（postgres），取 ID 两步（sqlite/mysql）/ RETURNING（postgres），
+    /// 支持流式（stream_query 已实现），无 cancel（sqlx Any 无语句级取消）。
+    fn dialect_info_for(d: Dialect) -> DialectInfo {
+        let (placeholder, id) = match d {
+            Dialect::Postgres => (PlaceholderStyle::Dollar, IdStrategy::Returning),
+            _ => (PlaceholderStyle::Q, IdStrategy::TwoStep),
+        };
+        DialectInfo {
+            name: d.as_str().to_string(),
+            caps: DialectCaps {
+                placeholder,
+                id,
+                stream: true,
+                cancel: false,
+            },
+        }
     }
 }
 
@@ -126,6 +150,9 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
 /// Option 被 take 后（已完结）再调用报 "tx finished"。
 struct SqlxTx {
     tx: tokio::sync::Mutex<Option<sqlx::Transaction<'static, Any>>>,
+    /// 事务级方言描述符（T6）：begin 时从 accessor 快照。缺失会让 in-tx 路径落回默认
+    /// sqlite 描述符——cancel 报错会点名错误方言，占位符查表也可能错。
+    info: DialectInfo,
 }
 
 #[async_trait]
@@ -191,12 +218,20 @@ impl super::db::TxSession for SqlxTx {
             .map_err(|e| format!("sqlx tx rollback: {e}"))?;
         Ok(())
     }
+
+    fn dialect_info(&self) -> &DialectInfo {
+        &self.info
+    }
 }
 
 #[async_trait]
 impl DataAccessor for SqlxAccessor {
     fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    fn dialect_info(&self) -> &DialectInfo {
+        &self.dialect_info
     }
 
     async fn begin(&self) -> BridgeResult<Box<dyn super::db::TxSession>> {
@@ -207,6 +242,7 @@ impl DataAccessor for SqlxAccessor {
             .map_err(|e| format!("sqlx tx begin: {e}"))?;
         Ok(Box::new(SqlxTx {
             tx: tokio::sync::Mutex::new(Some(tx)),
+            info: self.dialect_info.clone(),
         }))
     }
 

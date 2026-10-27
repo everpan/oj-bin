@@ -902,6 +902,40 @@ function condFactories() {
   };
 }
 const dbCache = new Map();
+
+// T9: structured db errors (BridgeError) carry `code`/`data`/`retryable`/
+// `sessionDisposition` as own props on the JS Error (attached by deno_core). `data`
+// arrives as a JSON string; parse it in place so handlers can read
+// `e.data.capability` directly. `retryable` arrives as 1/0 (PropertyValue only knows
+// String/Number) and is normalized to a boolean here. name/message are preserved
+// verbatim (existing catch text matches stay byte-for-byte unchanged).
+function normDbErr(e) {
+  if (!e) { return e; }
+  if (typeof e.data === "string") {
+    try { e.data = JSON.parse(e.data); } catch (_) {}
+  }
+  if (typeof e.retryable === "number") {
+    e.retryable = e.retryable !== 0;
+  }
+  return e;
+}
+
+// single entry point for db ops. async ops (query/exec/nextSeq/listTables/query_build)
+// surface errors as Promise rejections that an outer try/catch cannot catch, so we
+// attach a rejection handler here. sync ops (dialect/query_sql etc.) keep their
+// try/catch; for a non-Promise we pass through unchanged to preserve sync semantics.
+// `data` still arrives as a JSON string; normDbErr parses it in place so a handler can
+// read e.data.capability directly.
+function dbOpWrap(p) {
+  if (p && typeof p.then === "function") {
+    return p.then(
+      (r) => r,
+      (e) => { throw normDbErr(e); },
+    );
+  }
+  return p;
+}
+
 globalThis.DB = function (name) {
   name = String(name);
   if (!dbCache.has(name)) {
@@ -909,8 +943,8 @@ globalThis.DB = function (name) {
     dbCache.set(name, {
       ...condFactories(),
       // raw SQL + bound params (params optional).
-      query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : encodeParams(params)),
-      exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params)),
+      query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params))),
+      exec: (sql, params) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params))),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
       // system escape hatch (tenant sql_guard): this request bypasses tenant
@@ -926,12 +960,12 @@ globalThis.DB = function (name) {
       // platform sequence allocator (v0.1.24): single-statement atomic next value.
       // Race-free replacement for `select max(id) + 1`; the platform table
       // `_oj_sequences` is created on first use (see docs/db-guide.md).
-      nextSeq: (n) => op_db_next_seq(name, String(n)),
-      dialect: () => op_db_dialect(name),
+      nextSeq: (n) => dbOpWrap(op_db_next_seq(name, String(n))),
+      dialect: () => { try { return op_db_dialect(name); } catch (e) { throw normDbErr(e); } },
       // Dialect-agnostic catalog introspection (v0.1.82): names of all business-visible
       // tables in the current database, INCLUDING tables unknown to the schema registry
       // (api-only plans / legacy tables). Optional prefix filter (escaped, bound param).
-      listTables: (prefix) => op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix)),
+      listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -942,7 +976,7 @@ globalThis.DB = function (name) {
       // first next()/onRow so this arrow need not be async (for-await needs a sync async-iterable).
       stream: (sql, params, opts) => {
         let idP = null;
-        const openId = () => (idP ||= op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params)));
+        const openId = () => (idP ||= dbOpWrap(op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params))));
         const swallow = (p) => { p.then(() => {}).catch(() => {}); };
         const wireAbort = () => swallow(openId().then((id) => op_db_stream_abort(id)));
         const signal = opts && opts.signal;
@@ -958,7 +992,7 @@ globalThis.DB = function (name) {
             try {
               const id = await openId();
               for (;;) {
-                const row = await op_db_stream_next(id);
+                const row = await dbOpWrap(op_db_stream_next(id));
                 if (row === null) break;
                 opts.onRow(row);
               }
@@ -973,7 +1007,7 @@ globalThis.DB = function (name) {
               next: async () => {
                 try {
                   const id = await openId();
-                  const row = await op_db_stream_next(id);
+                  const row = await dbOpWrap(op_db_stream_next(id));
                   if (row === null) { close(); return { done: true, value: undefined }; }
                   return { done: false, value: row };
                 } catch (e) {
@@ -989,20 +1023,20 @@ globalThis.DB = function (name) {
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.
       tx: async (fn) => {
-        await op_db_tx_begin(name);
+        await dbOpWrap(op_db_tx_begin(name));
         try {
           const out = await fn({
             ...condFactories(),
-            query: (sql, params) => op_db_query(name, String(sql), params === undefined ? null : encodeParams(params)),
-            exec: (sql, params) => op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params)),
+            query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params))),
+            exec: (sql, params) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params))),
             table: (t) => queryBuilder(name, String(t)),
             // Same-connection allocator: MySQL's LAST_INSERT_ID is session-scoped.
-            nextSeq: (n) => op_db_next_seq(name, String(n)),
+            nextSeq: (n) => dbOpWrap(op_db_next_seq(name, String(n))),
             // Engine name for dialect-aware SQL in shared libs; isTx marks the tx-scoped
             // handle (DDL must never run inside db.tx -- MySQL implicit commit).
-            dialect: () => op_db_dialect(name),
+            dialect: () => { try { return op_db_dialect(name); } catch (e) { throw normDbErr(e); } },
             // Catalog introspection rides the active tx session (same connection).
-            listTables: (prefix) => op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix)),
+            listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
             isTx: true,
             // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
             sqlProfile: () => op_db_sql_profile(),
@@ -1010,7 +1044,7 @@ globalThis.DB = function (name) {
             asSystem: () => { op_db_as_system(); return dbCache.get(name); },
             asTenant: (id) => { op_db_as_tenant(String(id)); return dbCache.get(name); },
           });
-          await op_db_tx_commit(name);
+          await dbOpWrap(op_db_tx_commit(name));
           return out;
         } catch (e) {
           // Rollback is best-effort: its own failure must never mask the business error.
@@ -1070,7 +1104,7 @@ function builderFromReq(snap) {
     orderBy(items) { req.order_by = (items || []).map((i) => ({ field: String(i.field), dir: i.dir ? String(i.dir) : null })); return api; },
     limit(n) { req.limit = n | 0; return api; },
     offset(n) { req.offset = n | 0; return api; },
-    all() { return op_db_query_build(req); },
+    all() { return dbOpWrap(op_db_query_build(req)); },
     insert(rows) { req.verb = "insert"; req.values = (Array.isArray(rows) ? rows : [rows]).map((r) => encodeParams({ ...r })); return api; },
     // Insert returning clause (whitelisted columns, e.g. ["id"]): run() then resolves
     // to a row array [{id: n}] instead of the affected-row count. pg/sqlite render a
@@ -1143,9 +1177,9 @@ function builderFromReq(snap) {
       if (req.verb === "insert" && req.values.length === 0 && !req.from_select) {
         throw new Error("insert needs either values or fromSelect");
       }
-      return op_db_query_build(req);
+      return dbOpWrap(op_db_query_build(req));
     },
-    toSQL() { return op_db_query_sql(req); },
+    toSQL() { try { return op_db_query_sql(req); } catch (e) { throw normDbErr(e); } },
     toJSON() { return encodeSnapshot(req); },
     // Internal: expose req for subquery/union/cte embedding (not documented API).
     __req: req,

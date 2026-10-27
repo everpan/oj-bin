@@ -1621,7 +1621,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     let es = es_plugins.first().and_then(|p| es_backend(p));
     let mut dbs = DbBackendRegistry::builtin();
     for p in loaded {
-        if let Some(be) = db_backend(p) {
+        if let Some(be) = db_backend(p).map_err(|e| format!("plugins db assembly: {e}"))? {
             dbs.register(be)
                 .map_err(|e| format!("plugins db register: {e}"))?;
         }
@@ -1825,7 +1825,31 @@ pub async fn assemble_plugins(
     if !unused.is_empty() {
         eprintln!("[oj-serve] unconsumed config sections: {unused:?} (typo? or plugin not loaded)");
     }
+    // T13 启动能力位一览：宿主 ABI + 每插件 abi/fingerprint/caps（caps 仅 db 轴插件有）。
+    eprintln!(
+        "[oj-serve] host ABI_VERSION = {}",
+        oj_plugin_ffi::ABI_VERSION
+    );
+    for p in &loaded {
+        eprintln!("{}", plugin_banner_line(p));
+    }
     Ok((loaded.iter().map(PluginInfo::from).collect(), loaded))
+}
+
+/// T13：单个插件的启动横幅行。抽成独立函数以便单测断言 caps 串（无需真装配）。
+fn plugin_banner_line(p: &only_js::bridge::plugin_loader::LoadedPlugin) -> String {
+    let caps = p
+        .caps
+        .as_ref()
+        .map(|c| format!(" | caps: {}", c.summary()))
+        .unwrap_or_default();
+    format!(
+        "[oj-serve] plugin {} abi={} fp={}{}",
+        &p.descriptor.name[..],
+        p.descriptor.abi_version,
+        &p.descriptor.fingerprint[..],
+        caps
+    )
 }
 
 /// oj_info（phpinfo 对应物）单一事实源。两出口（CLI / JS ojInfo()）共用。
@@ -1872,6 +1896,11 @@ impl OjInfo {
                 "- {} {} (abi {})\n  desc: {}\n",
                 p.name, p.semver, p.abi_version, p.description
             ));
+            // db 轴插件的方言能力位与启动横幅同口径（T13）：两个出口都看得见，
+            // 否则「横幅有、info 没有」会让你在排障时用错工具。
+            if let Some(c) = &p.caps {
+                o.push_str(&format!("  caps: {}\n", c.summary()));
+            }
         }
         line(
             &mut o,
@@ -2580,6 +2609,7 @@ mod tests {
                 registrations: Default::default(),
                 generic_axes: Vec::new(),
                 config_key: key.map(Into::into),
+                caps: None,
             }
         }
         let cfg = Config::default();
@@ -2611,6 +2641,55 @@ mod tests {
             unconsumed_sections(&top, &cfg, &loaded_v),
             ["cache", "vendor", "lonely"]
         );
+    }
+
+    /// T13：启动横幅每插件一行，db 轴插件追加 caps 串，非 db 轴插件不追加。
+    #[test]
+    fn banner_line_shows_abi_fingerprint_and_db_caps() {
+        use only_js::bridge::dialect_caps::{
+            DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle,
+        };
+
+        fn plugin(name: &str, caps: Option<DialectInfo>) -> LoadedPlugin {
+            LoadedPlugin {
+                descriptor: oj_plugin_ffi::PluginDescriptor {
+                    name: name.into(),
+                    semver: "0.1.0".into(),
+                    abi_version: oj_plugin_ffi::ABI_VERSION,
+                    fingerprint: "fp-1".into(),
+                    desc: "".into(),
+                },
+                registrations: Default::default(),
+                generic_axes: Vec::new(),
+                config_key: None,
+                caps,
+            }
+        }
+
+        let db = plugin(
+            "oj-db-postgres",
+            Some(DialectInfo {
+                name: "postgres".into(),
+                caps: DialectCaps {
+                    placeholder: PlaceholderStyle::Dollar,
+                    id: IdStrategy::Returning,
+                    stream: true,
+                    cancel: true,
+                },
+            }),
+        );
+        let line = plugin_banner_line(&db);
+        assert!(line.contains("oj-db-postgres"), "{line}");
+        assert!(line.contains("fp=fp-1"), "{line}");
+        assert!(
+            line.contains("caps: placeholder=$ id=returning stream cancel"),
+            "{line}"
+        );
+
+        // 非 db 轴插件：无 caps 段。
+        let kv = plugin("oj-kv-redis", None);
+        let line = plugin_banner_line(&kv);
+        assert!(!line.contains("caps:"), "{line}");
     }
 
     /// spec Part 3：config key 查找面是全量顶层 Value——撞宿主已知段名（config: "redis"）

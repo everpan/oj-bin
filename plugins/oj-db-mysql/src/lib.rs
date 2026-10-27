@@ -15,6 +15,7 @@ use oj_plugin_ffi::{
     RString, RVec,
 };
 use sqlx::any::{Any, AnyArguments, AnyRow};
+use sqlx::error::ErrorKind;
 use sqlx::mysql::{MySql, MySqlArguments, MySqlConnection, MySqlRow};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
@@ -33,6 +34,83 @@ enum Dialect {
 
 /// 流式游标的行流类型（typed 专用连接 / Any 回退路径共用同一形状）。
 type DbStream = Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>>;
+
+/// sqlx 错误 → 结构化信封（T11）。vtable `Err(RString)` 载荷恒为信封 JSON：
+/// `{category, retryable, session_disposition, message, data}`。宿主 ffi.rs `parse_raw`
+/// 单点解析。`vendor_code`：mysql 数值错误码（如 1062）/ pg SQLSTATE 串，原样透传，禁止猜。
+fn sqlx_category(e: &sqlx::Error) -> (&'static str, bool, &'static str) {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::Tls(_) => {
+            ("connection", true, "close")
+        }
+        // 池排队超时是**超时**不是连接故障（连接本身可用）——分错类会让告警打到 infra。
+        sqlx::Error::PoolTimedOut => ("timeout", true, "keep"),
+        sqlx::Error::Database(db) => match db.kind() {
+            ErrorKind::UniqueViolation
+            | ErrorKind::ForeignKeyViolation
+            | ErrorKind::NotNullViolation
+            | ErrorKind::CheckViolation
+            | ErrorKind::ExclusionViolation => ("constraint", false, "keep"),
+            // sqlx 的 kind 只覆盖常见几类；其余按 SQLSTATE 前两位分类（标准五字符码，
+            // MySQL 同样给出 SQLSTATE）——否则 syntax/timeout/capacity/cancelled 永远没有生产者。
+            _ => sqlstate_class(db.code().as_deref()).unwrap_or(("internal", false, "keep")),
+        },
+        _ => ("internal", false, "keep"),
+    }
+}
+
+/// SQLSTATE 类别 → (category, retryable, session_disposition)。
+/// 只认标准类（MySQL 与 PG 共用）；未知类返回 None → 调用方落 internal（禁止猜）。
+pub(crate) fn sqlstate_class(code: Option<&str>) -> Option<(&'static str, bool, &'static str)> {
+    let class = code?.get(..2)?;
+    Some(match class {
+        "08" => ("connection", true, "close"),
+        "23" => ("constraint", false, "keep"),
+        "40" => ("timeout", true, "keep"),
+        "42" => ("syntax", false, "keep"),
+        "53" => ("capacity", true, "keep"),
+        "57" => ("cancelled", false, "keep"),
+        _ => return None,
+    })
+}
+
+fn sqlx_vendor_code(e: &sqlx::Error) -> serde_json::Value {
+    match e {
+        sqlx::Error::Database(db) => {
+            // mysql 生产路径走 typed 驱动：原生 errno（u16，如 1062 重复键）比 SQLSTATE
+            // 更贴近下游判断，原样透传；非 mysql 驱动（离线 Any 路径）回落 SQLSTATE 串。
+            if let Some(m) = db.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>() {
+                return serde_json::Value::from(m.number() as i64);
+            }
+            // 非 typed 驱动（离线 Any 路径）：只有 SQLSTATE 可用，**原样透传为字符串**。
+            // 不做 `parse::<i64>()`——那会把 `23000` 之类包装成数字，与原生 errno 无法区分，
+            // 违反「未知码禁止猜」。
+            match db.code() {
+                Some(code) => serde_json::Value::from(code.as_ref()),
+                None => serde_json::Value::Null,
+            }
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// 构造 db 轴结构化错误信封（op 阶段名保留在 message 中，宿主 parse_raw 不丢弃）。
+fn map_sqlx_err(op: &str, e: &sqlx::Error) -> String {
+    let (category, retryable, disposition) = sqlx_category(e);
+    let mut data = serde_json::Map::new();
+    let vendor = sqlx_vendor_code(e);
+    if !vendor.is_null() {
+        data.insert("vendor_code".to_string(), vendor);
+    }
+    serde_json::json!({
+        "category": category,
+        "retryable": retryable,
+        "session_disposition": disposition,
+        "message": format!("{op}: {e}"),
+        "data": serde_json::Value::Object(data),
+    })
+    .to_string()
+}
 
 /// DSN 前缀 → 方言（本插件只接 mysql；dialect 上送 host 选 sea-query builder）。
 fn dialect_of(dsn: &str) -> Dialect {
@@ -328,25 +406,15 @@ fn column_json_any(row: &AnyRow, ordinal: usize) -> Option<serde_json::Value> {
 }
 
 impl Client {
-    async fn connect(dsn: &str) -> Result<Self, String> {
+    async fn connect(dsn: &str) -> Result<Self, sqlx::Error> {
         let pool = if dsn.starts_with("mysql://") {
             // 生产路径：**typed 驱动**才能精确承载 u64 / `BIGINT UNSIGNED`
             // （sqlx 的 Any 层没有 u64 的 Encode/Decode，读会回绕、写直接编译不过）。
-            Pooled::MySql(
-                PoolOptions::<MySql>::new()
-                    .connect(dsn)
-                    .await
-                    .map_err(|e| format!("db connect: {e}"))?,
-            )
+            Pooled::MySql(PoolOptions::<MySql>::new().connect(dsn).await?)
         } else {
             // 离线/测试路径（sqlite DSN 等）：Any 池，保证 CI 无 MySQL 服务时仍有全路径覆盖。
             sqlx::any::install_default_drivers();
-            Pooled::Any(
-                PoolOptions::<Any>::new()
-                    .connect(dsn)
-                    .await
-                    .map_err(|e| format!("db connect: {e}"))?,
-            )
+            Pooled::Any(PoolOptions::<Any>::new().connect(dsn).await?)
         };
         Ok(Self {
             pool,
@@ -385,12 +453,12 @@ impl Client {
             // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
             let mut conn = MySqlConnection::connect(&self.dsn)
                 .await
-                .map_err(|e| format!("db stream_open: connect: {e}"))?;
+                .map_err(|e| map_sqlx_err("db stream_open: connect", &e))?;
             conn_id = Some(
                 sqlx::query_scalar::<_, u64>("select connection_id()")
                     .fetch_one(&mut conn)
                     .await
-                    .map_err(|e| format!("db stream_open: connection id: {e}"))?,
+                    .map_err(|e| map_sqlx_err("db stream_open: connection id", &e))?,
             );
             Box::pin(async_stream::stream! {
                 let mut q: Query<'_, MySql, MySqlArguments> =
@@ -557,7 +625,10 @@ impl Client {
                 for v in params {
                     q = bind_value_mysql(q, v);
                 }
-                let rows = q.fetch_all(p).await.map_err(|e| format!("db query: {e}"))?;
+                let rows = q
+                    .fetch_all(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db query", &e))?;
                 let json: Result<Vec<_>, String> = rows.iter().map(row_to_json_mysql).collect();
                 serde_json::to_vec(&json?).map_err(|e| format!("db query serialize: {e}"))
             }
@@ -571,7 +642,10 @@ impl Client {
                 for v in params {
                     q = bind_value_any(q, v);
                 }
-                let rows = q.fetch_all(p).await.map_err(|e| format!("db query: {e}"))?;
+                let rows = q
+                    .fetch_all(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db query", &e))?;
                 serde_json::to_vec(&rows.iter().map(row_to_json_any).collect::<Vec<_>>())
                     .map_err(|e| format!("db query serialize: {e}"))
             }
@@ -585,7 +659,10 @@ impl Client {
                 for v in params {
                     q = bind_value_mysql(q, v);
                 }
-                let res = q.execute(p).await.map_err(|e| format!("db exec: {e}"))?;
+                let res = q
+                    .execute(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db exec", &e))?;
                 serde_json::to_vec(&(res.rows_affected() as i64))
                     .map_err(|e| format!("db exec serialize: {e}"))
             }
@@ -598,7 +675,10 @@ impl Client {
                 for v in params {
                     q = bind_value_any(q, v);
                 }
-                let res = q.execute(p).await.map_err(|e| format!("db exec: {e}"))?;
+                let res = q
+                    .execute(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db exec", &e))?;
                 serde_json::to_vec(&(res.rows_affected() as i64))
                     .map_err(|e| format!("db exec serialize: {e}"))
             }
@@ -608,10 +688,14 @@ impl Client {
     async fn begin(&self) -> Result<u64, String> {
         let inner = match &self.pool {
             Pooled::MySql(p) => TxInner::MySql(tokio::sync::Mutex::new(Some(
-                p.begin().await.map_err(|e| format!("db tx begin: {e}"))?,
+                p.begin()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx begin", &e))?,
             ))),
             Pooled::Any(p) => TxInner::Any(tokio::sync::Mutex::new(Some(
-                p.begin().await.map_err(|e| format!("db tx begin: {e}"))?,
+                p.begin()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx begin", &e))?,
             ))),
         };
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst) + 1;
@@ -651,7 +735,7 @@ impl Client {
                 let rows = q
                     .fetch_all(&mut **t)
                     .await
-                    .map_err(|e| format!("db tx query: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx query", &e))?;
                 let json: Result<Vec<_>, String> = rows.iter().map(row_to_json_mysql).collect();
                 serde_json::to_vec(&json?).map_err(|e| format!("db tx query serialize: {e}"))
             }
@@ -671,7 +755,7 @@ impl Client {
                 let rows = q
                     .fetch_all(&mut **t)
                     .await
-                    .map_err(|e| format!("db tx query: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx query", &e))?;
                 serde_json::to_vec(&rows.iter().map(row_to_json_any).collect::<Vec<_>>())
                     .map_err(|e| format!("db tx query serialize: {e}"))
             }
@@ -698,7 +782,7 @@ impl Client {
                 let res = q
                     .execute(&mut **t)
                     .await
-                    .map_err(|e| format!("db tx exec: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx exec", &e))?;
                 serde_json::to_vec(&(res.rows_affected() as i64))
                     .map_err(|e| format!("db tx exec serialize: {e}"))
             }
@@ -718,7 +802,7 @@ impl Client {
                 let res = q
                     .execute(&mut **t)
                     .await
-                    .map_err(|e| format!("db tx exec: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx exec", &e))?;
                 serde_json::to_vec(&(res.rows_affected() as i64))
                     .map_err(|e| format!("db tx exec serialize: {e}"))
             }
@@ -737,13 +821,17 @@ impl Client {
                 let Some(t) = m.lock().await.take() else {
                     return Err("tx finished".into());
                 };
-                t.commit().await.map_err(|e| format!("db tx commit: {e}"))?;
+                t.commit()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx commit", &e))?;
             }
             TxInner::Any(m) => {
                 let Some(t) = m.lock().await.take() else {
                     return Err("tx finished".into());
                 };
-                t.commit().await.map_err(|e| format!("db tx commit: {e}"))?;
+                t.commit()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx commit", &e))?;
             }
         }
         Ok(b"".to_vec())
@@ -763,7 +851,7 @@ impl Client {
                 };
                 t.rollback()
                     .await
-                    .map_err(|e| format!("db tx rollback: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
             }
             TxInner::Any(m) => {
                 let Some(t) = m.lock().await.take() else {
@@ -771,7 +859,7 @@ impl Client {
                 };
                 t.rollback()
                     .await
-                    .map_err(|e| format!("db tx rollback: {e}"))?;
+                    .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
             }
         }
         Ok(b"".to_vec())
@@ -856,7 +944,9 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
         let st = state();
         oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
             let dsn = cfg[..].to_string();
-            let client = Client::connect(&dsn).await?;
+            let client = Client::connect(&dsn)
+                .await
+                .map_err(|e| map_sqlx_err("db connect", &e))?;
             let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
             st.clients.lock().unwrap().insert(handle, Arc::new(client));
             Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
@@ -1003,6 +1093,13 @@ extern "C" fn schemes() -> RVec<RString> {
     )
 }
 
+/// ABI 12：工厂级方言描述符（临时终稿——真实能力声明在 M1 T11 复核映射表后钉死）。
+extern "C" fn describe() -> RString {
+    RString::from(
+        r#"{"dialect":"mysql","capabilities":["placeholder_q","id_two_step","stream","cancel"]}"#,
+    )
+}
+
 static VTABLE: DataAccessorVtable = DataAccessorVtable {
     connect,
     query,
@@ -1019,6 +1116,7 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
     stream_next,
     stream_cancel,
     stream_close,
+    describe,
 };
 
 // ---- 入口 ----
@@ -1472,6 +1570,72 @@ mod tests {
         ))
         .await
         .expect_err("unknown handle after close");
+    }
+
+    /// T11 结构化错误信封（env-gated，`OJ_TEST_MYSQL=mysql://…`）：
+    /// - 重复主键插入 → `category=="constraint"` + `data.vendor_code==1062`（mysql 错误码原样透传）。
+    /// - 连向关闭端口 → `category=="connection"` + `session_disposition=="close"`（Io 类）。
+    /// 未设 env 直接跳过（不进网络）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_envelope_classifies_constraint_and_connection() {
+        let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        drive(&mut exec(
+            handle,
+            RString::from("drop table if exists oj_env_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("drop");
+        drive(&mut exec(
+            handle,
+            RString::from("create table oj_env_t (id int primary key, u int unique, v text)"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("create");
+        drive(&mut exec(
+            handle,
+            RString::from("insert into oj_env_t (id, u, v) values (?, ?, ?)"),
+            RString::from(r#"[1,10,"a"]"#),
+        ))
+        .await
+        .expect("insert1");
+
+        // 重复唯一键 → constraint + 厂商码 1062。
+        let e = drive(&mut exec(
+            handle,
+            RString::from("insert into oj_env_t (id, u, v) values (?, ?, ?)"),
+            RString::from(r#"[2,10,"b"]"#),
+        ))
+        .await
+        .unwrap_err();
+        let env: serde_json::Value = serde_json::from_str(&e).expect("envelope must be json");
+        assert_eq!(env["category"], "constraint", "{e}");
+        assert_eq!(env["data"]["vendor_code"], 1062, "{e}");
+        assert_eq!(env["session_disposition"], "keep", "{e}");
+    }
+
+    /// T11 错误分类纯单测（不触网，确定性强）：Io 类 → connection/close。约束类落在
+    /// `Database`（由上面的真库用例覆盖 1062 透传）。本例只钉死分类映射本身。
+    #[test]
+    fn sqlx_category_maps_io_to_connection_and_close() {
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "x",
+        ));
+        let (cat, retry, disp) = sqlx_category(&io);
+        assert_eq!((cat, retry, disp), ("connection", true, "close"));
     }
 
     /// 大整数参数（v0.1.22）：`toBigInt()` 的标记形态 → i64 → bigint 列，精确往返。

@@ -69,6 +69,10 @@ pub struct SqlEvent {
     pub rows: Option<i64>,
     pub ok: bool,
     pub error: Option<String>,
+    /// 结构化错误类别（T12）：来自 `BridgeError.category`；成功/非 BridgeError 为 `None`（省字节）。
+    pub category: Option<String>,
+    /// 是否可重试（T12）：与 `category` 同源；缺省 `None`。
+    pub retryable: Option<bool>,
 }
 
 /// 每请求 SQL 画像（存 ReqState，reset 时清空）。
@@ -103,7 +107,8 @@ impl SqlProfile {
             .events
             .iter()
             .map(|e| {
-                json!({
+                // category / retryable 仅在有值时出现，省字节（成功查询两字段缺省）。
+                let mut ev = json!({
                     "sql": e.sql,
                     "params": e.params,
                     "db": e.db,
@@ -113,7 +118,14 @@ impl SqlProfile {
                     "rows": e.rows,
                     "ok": e.ok,
                     "error": e.error,
-                })
+                });
+                if let Some(c) = &e.category {
+                    ev["category"] = json!(c);
+                }
+                if let Some(r) = e.retryable {
+                    ev["retryable"] = json!(r);
+                }
+                ev
             })
             .collect();
         let slow: Vec<Value> = self
@@ -182,6 +194,8 @@ pub fn record_sql(state: &Rc<RefCell<OpState>>, e: SqlEvent, log_params: String)
             src = %e.source,
             status = status,
             err = e.error.as_deref().unwrap_or(""),
+            category = e.category.as_deref().unwrap_or(""),
+            retryable = e.retryable.unwrap_or(false),
             "SQL trace"
         );
     }
@@ -203,6 +217,8 @@ mod tests {
             rows,
             ok: true,
             error: None,
+            category: None,
+            retryable: None,
         }
     }
 
@@ -237,5 +253,41 @@ mod tests {
         p.record(ev("b", 999.0, None), 0.0);
         assert_eq!(p.slow.len(), 2, "slow_ms=0 时 slow 列表应收全量");
         assert_eq!(p.count, 2);
+    }
+
+    #[test]
+    fn snapshot_carries_category_and_retryable_when_present() {
+        let mut p = SqlProfile::default();
+        p.record(
+            SqlEvent {
+                sql: "insert ...".into(),
+                params: "1 params".into(),
+                db: "default".into(),
+                in_tx: false,
+                source: "m".into(),
+                ms: 3.0,
+                rows: Some(1),
+                ok: false,
+                error: Some("dup".into()),
+                category: Some("constraint".into()),
+                retryable: Some(false),
+            },
+            0.0,
+        );
+        let s = p.snapshot();
+        let e = &s["events"].as_array().unwrap()[0];
+        assert_eq!(e["category"], json!("constraint"));
+        assert_eq!(e["retryable"], json!(false));
+    }
+
+    #[test]
+    fn snapshot_omits_category_when_absent() {
+        // 成功查询：两字段缺省（省字节）。
+        let mut p = SqlProfile::default();
+        p.record(ev("select 1", 2.0, Some(1)), 0.0);
+        let s = p.snapshot();
+        let e = &s["events"].as_array().unwrap()[0];
+        assert!(e.get("category").is_none(), "成功事件不含 category：{e}");
+        assert!(e.get("retryable").is_none(), "成功事件不含 retryable：{e}");
     }
 }

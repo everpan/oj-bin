@@ -18,3 +18,31 @@ services:
     volumes:
       - ./sample:/app
     command: ["-c", "config.docker.yaml", "--api-path", "src"]
+
+  # 真库测试服务（M1 起必跑；不参与演示部署，仅供 env-gated 用例）。
+  # 参 docs/testing.md「真库套件」节；账号/库与约定 env 一致。
+  test-mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ojtest
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  test-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ojtest
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ojtest"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

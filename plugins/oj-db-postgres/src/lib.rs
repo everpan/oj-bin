@@ -12,6 +12,7 @@ use oj_plugin_ffi::{
 };
 use sqlx::Connection as _;
 use sqlx::any::{Any, AnyArguments, AnyRow};
+use sqlx::error::ErrorKind;
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::postgres::{PgArguments, PgConnection, PgRow, Postgres};
 use sqlx::query::Query;
@@ -30,6 +31,76 @@ enum Dialect {
 
 /// 流式游标的行流类型（typed 专用连接 / Any 回退路径共用同一形状）。
 type DbStream = Pin<Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>>;
+
+/// sqlx 错误 → 结构化信封（T11）。vtable `Err(RString)` 载荷恒为信封 JSON：
+/// `{category, retryable, session_disposition, message, data}`。宿主 ffi.rs `parse_raw`
+/// 单点解析。`vendor_code`：mysql 数值错误码（如 1062）/ pg SQLSTATE 串，原样透传，禁止猜。
+fn sqlx_category(e: &sqlx::Error) -> (&'static str, bool, &'static str) {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::Tls(_) => {
+            ("connection", true, "close")
+        }
+        // 池排队超时是**超时**不是连接故障（连接本身可用）——分错类会让告警打到 infra。
+        sqlx::Error::PoolTimedOut => ("timeout", true, "keep"),
+        sqlx::Error::Database(db) => match db.kind() {
+            ErrorKind::UniqueViolation
+            | ErrorKind::ForeignKeyViolation
+            | ErrorKind::NotNullViolation
+            | ErrorKind::CheckViolation
+            | ErrorKind::ExclusionViolation => ("constraint", false, "keep"),
+            // sqlx 的 kind 只覆盖常见几类；其余按 SQLSTATE 前两位分类（标准五字符码，
+            // PG 全量实现）——否则 syntax/timeout/capacity/cancelled 永远没有生产者。
+            _ => sqlstate_class(db.code().as_deref()).unwrap_or(("internal", false, "keep")),
+        },
+        _ => ("internal", false, "keep"),
+    }
+}
+
+/// SQLSTATE 类别 → (category, retryable, session_disposition)。
+/// 只认标准类（PG 与 MySQL 共用）；未知类返回 None → 调用方落 internal（禁止猜）。
+pub(crate) fn sqlstate_class(code: Option<&str>) -> Option<(&'static str, bool, &'static str)> {
+    let class = code?.get(..2)?;
+    Some(match class {
+        "08" => ("connection", true, "close"),
+        "23" => ("constraint", false, "keep"),
+        "40" => ("timeout", true, "keep"),
+        "42" => ("syntax", false, "keep"),
+        "53" => ("capacity", true, "keep"),
+        "57" => ("cancelled", false, "keep"),
+        _ => return None,
+    })
+}
+
+fn sqlx_vendor_code(e: &sqlx::Error) -> serde_json::Value {
+    // PG 的厂商码即 SQLSTATE（5 位定长串，如除法溢出 `22012`、唯一违例 `23505`）——
+    // 原样透传为字符串，绝不解析成数字（否则 `23505` 等会被误当整型，下游字符串匹配失效）。
+    let code = match e {
+        sqlx::Error::Database(db) => db.code(),
+        _ => None,
+    };
+    match code {
+        Some(c) => serde_json::Value::from(c.as_ref()),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// 构造 db 轴结构化错误信封（op 阶段名保留在 message 中，宿主 parse_raw 不丢弃）。
+fn map_sqlx_err(op: &str, e: &sqlx::Error) -> String {
+    let (category, retryable, disposition) = sqlx_category(e);
+    let mut data = serde_json::Map::new();
+    let vendor = sqlx_vendor_code(e);
+    if !vendor.is_null() {
+        data.insert("vendor_code".to_string(), vendor);
+    }
+    serde_json::json!({
+        "category": category,
+        "retryable": retryable,
+        "session_disposition": disposition,
+        "message": format!("{op}: {e}"),
+        "data": serde_json::Value::Object(data),
+    })
+    .to_string()
+}
 
 /// 给 SQL **前置**参数形态签名（v0.1.24，债务①「同文本换参数类型 → 协议级错误」）。
 ///
@@ -334,12 +405,11 @@ fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
 }
 
 impl Client {
-    async fn connect(dsn: &str) -> Result<Self, String> {
+    async fn connect(dsn: &str) -> Result<Self, sqlx::Error> {
         sqlx::any::install_default_drivers();
         let pool = PoolOptions::<Any>::new()
             .connect(&with_stmt_cache_capacity(dsn, 512))
-            .await
-            .map_err(|e| format!("db connect: {e}"))?;
+            .await?;
         Ok(Self {
             pool,
             dsn: dsn.to_string(),
@@ -381,12 +451,12 @@ impl Client {
             // （服务端立即中断查询）。sqlx Drop 不通知服务器，cancel 必须显式发。
             let mut conn = PgConnection::connect(&self.dsn)
                 .await
-                .map_err(|e| format!("db stream_open: connect: {e}"))?;
+                .map_err(|e| map_sqlx_err("db stream_open: connect", &e))?;
             backend_pid = Some(
                 sqlx::query_scalar::<_, i32>("select pg_backend_pid()")
                     .fetch_one(&mut conn)
                     .await
-                    .map_err(|e| format!("db stream_open: backend pid: {e}"))?,
+                    .map_err(|e| map_sqlx_err("db stream_open: backend pid", &e))?,
             );
             Box::pin(async_stream::stream! {
                 let mut q: Query<'_, Postgres, PgArguments> =
@@ -561,7 +631,7 @@ impl Client {
         let rows = q
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| format!("db query: {e}"))?;
+            .map_err(|e| map_sqlx_err("db query", &e))?;
         let out = rows
             .iter()
             .map(row_to_json)
@@ -582,7 +652,7 @@ impl Client {
         let res = q
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("db exec: {e}"))?;
+            .map_err(|e| map_sqlx_err("db exec", &e))?;
         serde_json::to_vec(&(res.rows_affected() as i64))
             .map_err(|e| format!("db exec serialize: {e}"))
     }
@@ -592,7 +662,7 @@ impl Client {
             .pool
             .begin()
             .await
-            .map_err(|e| format!("db tx begin: {e}"))?;
+            .map_err(|e| map_sqlx_err("db tx begin", &e))?;
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst) + 1;
         self.txs.lock().unwrap().insert(
             id,
@@ -635,7 +705,7 @@ impl Client {
         let rows = q
             .fetch_all(&mut **t)
             .await
-            .map_err(|e| format!("db tx query: {e}"))?;
+            .map_err(|e| map_sqlx_err("db tx query", &e))?;
         let out = rows
             .iter()
             .map(row_to_json)
@@ -666,7 +736,7 @@ impl Client {
         let res = q
             .execute(&mut **t)
             .await
-            .map_err(|e| format!("db tx exec: {e}"))?;
+            .map_err(|e| map_sqlx_err("db tx exec", &e))?;
         serde_json::to_vec(&(res.rows_affected() as i64))
             .map_err(|e| format!("db tx exec serialize: {e}"))
     }
@@ -681,7 +751,9 @@ impl Client {
         let Some(t) = tx.tx.lock().await.take() else {
             return Err("tx finished".into());
         };
-        t.commit().await.map_err(|e| format!("db tx commit: {e}"))?;
+        t.commit()
+            .await
+            .map_err(|e| map_sqlx_err("db tx commit", &e))?;
         Ok(b"".to_vec())
     }
 
@@ -697,7 +769,7 @@ impl Client {
         };
         t.rollback()
             .await
-            .map_err(|e| format!("db tx rollback: {e}"))?;
+            .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
         Ok(b"".to_vec())
     }
 }
@@ -780,7 +852,9 @@ extern "C" fn connect(cfg: RString) -> FfiFuture {
         let st = state();
         oj_plugin_ffi::spawn_ffi_future(&st.rt, async move {
             let dsn = cfg[..].to_string();
-            let client = Client::connect(&dsn).await?;
+            let client = Client::connect(&dsn)
+                .await
+                .map_err(|e| map_sqlx_err("db connect", &e))?;
             let handle = st.next_handle.fetch_add(1, Ordering::SeqCst) + 1;
             st.clients.lock().unwrap().insert(handle, Arc::new(client));
             Ok(format!(r#"{{"handle":{handle}}}"#).into_bytes())
@@ -928,6 +1002,13 @@ extern "C" fn schemes() -> RVec<RString> {
     )
 }
 
+/// ABI 12：工厂级方言描述符（临时终稿——真实能力声明在 M1 T11 复核映射表后钉死）。
+extern "C" fn describe() -> RString {
+    RString::from(
+        r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning","stream","cancel"]}"#,
+    )
+}
+
 static VTABLE: DataAccessorVtable = DataAccessorVtable {
     connect,
     query,
@@ -944,6 +1025,7 @@ static VTABLE: DataAccessorVtable = DataAccessorVtable {
     stream_next,
     stream_cancel,
     stream_close,
+    describe,
 };
 
 // ---- 入口 ----
@@ -1318,7 +1400,11 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        let slow = "/*oj-cancel-test*/ select i, pg_sleep(0.02) from generate_series(1,1000) g(i)";
+        // 两列都显式转 text：typed 流式对未解码类型（int4/void 等）响亮报错，一旦行转换
+        // 报错条目即被移除、cancel 变 no-op（用例会假失败）。`cast(pg_sleep(...) as text)`
+        // 是 target list 里的 volatile 调用——逐行求值，保证服务端真在跑 ~20s。
+        let slow = "/*oj-cancel-test*/ select cast(i as text) as i, cast(pg_sleep(0.02) as text) as s \
+                    from generate_series(1,1000) g(i)";
         let bytes = drive(&mut stream_open(
             h,
             RString::from(slow),
@@ -1497,6 +1583,53 @@ mod tests {
         .expect_err("unknown handle after close");
     }
 
+    /// T11 结构化错误信封（env-gated，`OJ_TEST_PG=postgres://…`）：
+    /// - `select 1/0` 除法溢出 → SQLSTATE `22012` 原样透传为 `data.vendor_code`（字符串厂商码）。
+    /// - 连向关闭端口 → `category=="connection"` + `session_disposition=="close"`（Io 类）。
+    /// 未设 env 直接跳过（不进网络）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_postgres_envelope_classifies_sqlstate_and_connection() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let mut c = connect(RString::from(url.as_str()));
+        let bytes = drive(&mut c).await.expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        // 除法溢出 → SQLSTATE 22012 透传为厂商码（字符串）。
+        let e = drive(&mut query(
+            handle,
+            RString::from("select 1/0"),
+            RString::from("[]"),
+        ))
+        .await
+        .unwrap_err();
+        let env: serde_json::Value = serde_json::from_str(&e).expect("envelope must be json");
+        let cat = env["category"].as_str().expect("category must be string");
+        assert!(
+            matches!(cat, "constraint" | "connection" | "internal"),
+            "unexpected category: {e}"
+        );
+        assert_eq!(env["data"]["vendor_code"], "22012", "{e}");
+    }
+
+    /// T11 错误分类纯单测（不触网，确定性强）：Io 类 → connection/close。约束类落在
+    /// `Database`（由上面的真库用例覆盖 22012 透传）。本例只钉死分类映射本身。
+    #[test]
+    fn sqlx_category_maps_io_to_connection_and_close() {
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "x",
+        ));
+        let (cat, retry, disp) = sqlx_category(&io);
+        assert_eq!((cat, retry, disp), ("connection", true, "close"));
+    }
+
     /// 不可解码列类型响亮报错（env-gated，`OJ_TEST_PG`）：PG 的 jsonb 等类型 sqlx Any
     /// 不支持——池路径在 fetch 阶段即 AnyDriverError；typed 流式路径必须走
     /// `undecodable_column` 点名列名+类型，**绝不静默 null 返回错值**。
@@ -1535,10 +1668,14 @@ mod tests {
         let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
             .as_u64()
             .unwrap();
-        let e = drive(&mut stream_next(h, sid)).await.unwrap_err();
+        // 流式的错误**在带内**（`{"error":"…"}`，见 `stream_next` 的响应契约），
+        // 不像 `query` 那样走 `Err` 通道。
+        let b = drive(&mut stream_next(h, sid)).await.expect("stream next");
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let e = v["error"].as_str().unwrap_or_default();
         assert!(
             e.contains("payload") && e.contains("decode"),
-            "typed 流式必须点名 jsonb 列而非静默 null: {e}"
+            "typed 流式必须点名 jsonb 列而非静默 null: {v}"
         );
         close(h);
     }

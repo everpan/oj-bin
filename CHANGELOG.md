@@ -16,6 +16,42 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.88（未打标签）
+
+数据库方言能力模型（M1）：ABI 12（describe 工厂级能力槽 + 结构化错误信封）、两层方言模型
+（枚举保留为 known 子集 + 边界描述符 + 六门控点 + 删除 Sqlite 回落）、default-throw cancel、
+mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_trace 扩展、清单锁装配 + 启动能力位一览。
+
+### feat(db)
+
+- ABI 12：DataAccessorVtable 增工厂级 `describe()` 槽，返回 `{dialect, capabilities}` JSON；
+  `ABI_VERSION` 11 → 12（严格相等门禁），宿主 + 插件同产物重编发布。
+  `oj-plugin-ffi` 0.1.2 → 0.1.3、`oj-db-mysql` 0.1.1 → 0.1.2、`oj-db-postgres` 0.1.0 → 0.1.1。
+- 方言契约从闭集枚举演进为「开放方言名 + 能力位」：新增方言接入零宿主逻辑分支。
+- 结构化错误信封（category/retryable/session_disposition/message/data）跨 FFI，宿主单点
+  `parse_raw`；未知方言六门控点统一返回 `OJ_DB_UNSUPPORTED`（builder/exec_route/list_tables/
+  next_seq/search.*/migrate/seed），无 Sqlite 回落。
+- **裸 SQL 路径对开放方言全量可用**：`db.query` / `db.exec` / `db.stream` / `db.tx` 不再受方言
+  门控（门控只覆盖宿主替你生成 SQL 的六处）。新方言接入的可用面因此非零。
+- JS 错误面：既有方言错误消息文本逐字节冻结；新错误条件以稳定 `code`/`data` 暴露
+  （`OJ_DB_UNSUPPORTED` + `data.capability` + `data.dialect`）。
+  **冻结范围界定（唯一例外，设计 §5.1）**：db 轴宿主侧的 `ffi <op>: ` 前缀被移除——ABI 11 及
+  以前该前缀与插件自身文案叠加成 `ffi db query: db query: <sqlx 原文>` 双前缀，现为
+  `db query: <sqlx 原文>`（message 主体逐字不变）。若 handler 曾匹配 `^ffi db ` 请改为匹配
+  主体前缀；快照测试 `db_error_text_snapshot_is_frozen` 钉死该文本。
+- JS 错误面（外显补齐）：除 `e.code` / `e.data` 外，db 错误现另带 `e.retryable`（布尔）与
+  `e.sessionDisposition`（`keep`/`reset`/`close`）——重试决策不必解析 `data`。`db.tx` 内、
+  构造器路径、`db.stream` 的错误同样携带（此前 builder / tx / stream 的异步入口会退化成
+  纯文案，属实现缺口，现统一）。
+- 插件与诊断面：`plugins()` / `ojInfo()` / `GET {base}/plugins` 增 `caps` 列
+  （`{dialect, capabilities[]}`，与插件 `describe()` 同词汇；非 db 轴插件为 `null`）；
+  `oj info` 文本输出补 db 插件的能力行（与启动横幅同口径）。
+- 插件清单锁：`cargo xtask build` 末尾写 `bin/plugins/<triple>/plugins.lock.json`
+  （`[{name, abi, fingerprint}]`）；扫描装配时锁外库文件**拒载并点名**（增量覆盖残留旧插件的
+  典型症状），锁内条目缺失或 abi/fingerprint 与实物不符则 stderr 告警（整体拷贝不完整的信号）。
+
+（逐任务明细见各 commit；本段为 M1 总览，任务级 fix/feat 随提交补充。）
+
 ## v0.1.87
 
 WS 目录镜像路由与 `api.ts` 同口径（`--module-root` 下剥布局段）+ 挂载清单外显。

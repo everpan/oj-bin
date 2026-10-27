@@ -229,6 +229,50 @@ fn copy_devkit() -> Result<(), String> {
     Ok(())
 }
 
+/// build 末尾产出 `bin/plugins/<triple>/plugins.lock.json`：随包发布的插件清单
+/// `[{name, abi, fingerprint}]`。运行期 loader 据此拒绝锁外残留 `.so`（增量覆盖的典型症状，
+/// 详见 plugin_loader::PluginLoadError::ExtraPluginFile）。abi/fingerprint 取自真实加载到的
+/// 插件描述符（与运行期装配同一 `load_manifest` 入口），确保锁与产物严格一致。
+fn write_plugins_lock() -> Result<(), String> {
+    let dir = bin_dir().join("plugins").join(host_triple());
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let manifest: Vec<PluginManifestEntry> = PLUGINS
+        .iter()
+        .map(|n| PluginManifestEntry {
+            name: n.to_string(),
+            semver_pin: None,
+        })
+        .collect();
+    let host = host_context();
+    // 占位 cfg：需要装配期 cfg 的插件（如 auth）给 jwt_secret 占位，其余 `{}`——
+    // 与 `check` 同一取值路径（端点配置校验在服务器装配层做，此处只验证可加载性）。
+    let cfg_for = |name: &str, _config_key: Option<&str>| -> String {
+        match name {
+            "auth" => r#"{"jwt_secret":"precheck"}"#.to_string(),
+            _ => "{}".to_string(),
+        }
+    };
+    let loaded = load_manifest(&dir, &manifest, host, &cfg_for)
+        .map_err(|e| format!("plugins lock: load failed: {e}"))?;
+    let lock: Vec<serde_json::Value> = loaded
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.descriptor.name[..],
+                "abi": p.descriptor.abi_version,
+                "fingerprint": p.descriptor.fingerprint[..],
+            })
+        })
+        .collect();
+    let path = dir.join("plugins.lock.json");
+    fs::write(&path, serde_json::to_string_pretty(&lock).unwrap())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    println!("wrote plugins lock -> {}", path.display());
+    Ok(())
+}
+
 /// 预检：经 PluginLoader（与真实装配同一入口）加载校验。cfg 传 `{}`（端点配置校验在
 /// 服务器装配层做，此处只验证可加载性）。
 fn check(name: &str) -> Result<(), String> {
@@ -495,7 +539,9 @@ fn main() -> Result<(), String> {
             for p in PLUGINS {
                 build_and_copy(p)?;
             }
-            copy_devkit()
+            copy_devkit()?;
+            write_plugins_lock()?;
+            Ok(())
         }
         "plugin" => {
             if args.len() < 3 {

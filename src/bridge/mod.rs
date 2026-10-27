@@ -31,6 +31,8 @@ pub mod cert;
 mod crypto;
 mod db;
 pub mod db_backend;
+pub mod db_error;
+pub mod dialect_caps;
 mod embedded_js;
 mod envelope;
 mod es;

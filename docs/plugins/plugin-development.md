@@ -39,7 +39,7 @@ v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平�
 
 1. **load**：`dlopen`（`ffi::load_forget`），句柄**进程期泄漏**（设计如此，不
    dlclose；vtable 指针永久有效）。
-2. **ABI 门禁**：`oj_plugin_abi_version()` 与宿主 `ABI_VERSION`（当前 **11**）
+2. **ABI 门禁**：`oj_plugin_abi_version()` 与宿主 `ABI_VERSION`（当前 **12**）
    **严格相等**才继续；不等 → fail fast（`plugin ABI mismatch: plugin=N host=M`）。
    构建指纹（rustc/契约 crate/triple）仅诊断，不匹配只告警。
 3. **init**：`oj_plugin_init(host, cfg)`——宏内 `catch_unwind` 把 panic 收敛为
@@ -62,7 +62,7 @@ v0.1.54 起任意自命名泛型轴）抽成**动态链接库**，宿主按平�
 
 ```mermaid
 flowchart TD
-    A["宿主打开插件动态库<br/>（加载后常驻，不会卸载）"] --> B{"ABI 版本对得上吗？<br/>（双方都必须是 11）"}
+    A["宿主打开插件动态库<br/>（加载后常驻，不会卸载）"] --> B{"ABI 版本对得上吗？<br/>（双方都必须是 12）"}
     B -->|对不上| X1["拒绝加载，启动失败<br/>（报 plugin ABI mismatch）"]
     B -->|对得上| C["调用插件初始化 init<br/>（插件在此建运行时、校验配置；<br/>崩溃会被拦下变成错误）"]
     C -->|初始化失败| X2["拒绝加载，启动失败"]
@@ -98,6 +98,44 @@ flowchart TD
 轴，不返回 `FfiFuture`）：`verify(path_no_base, method, authorization, headers_json)
 -> RResult<RString, RString>`，ok 值 JSON `null` = 匿名放行、对象 = 注入 `http.user`，
 Err = 401 消息。请求级热路径，参考第一方 `plugins/oj-auth`。
+
+### db 轴：工厂级 `describe()` + 结构化错误信封（ABI 12）
+
+db 轴是唯一带**能力协商**的轴。`DataAccessorVtable` 的 `describe()` 在 connect 之前
+返回该插件的方言描述符 JSON：
+
+```jsonc
+{ "dialect": "oracle", "capabilities": ["placeholder_colon", "id_none", "stream"] }
+```
+
+- **能力串是闭集**（宿主 `dialect_caps.rs` 的 8 个常量）：
+  - 占位符组（**必选一**）：`placeholder_q` / `placeholder_dollar` / `placeholder_colon`
+  - 自增 ID 组（**必选一**）：`id_returning` / `id_two_step` / `id_none`
+  - 可选：`stream`（实现 `stream_open/next/cancel/close`）、`cancel`（语句级取消）
+- 装配期**严格校验**：缺组、组内多项、未知串（typo）一律拒绝该 db 插件并点名
+  （`plugin db capability error: …`）；`dialect` 为空同样拒绝。宁可拒绝启动，
+  也不让「裸 `?` 发给 Oracle」这类错配活到运行期。
+- **方言名是开放集**，不是枚举：宿主不再把未知名回落成 sqlite。代价是「宿主替你
+  生成 SQL」的能力（查询构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` /
+  `seed`）对未识别方言明确 `OJ_DB_UNSUPPORTED`；**裸 SQL 路径（`db.query` /
+  `db.exec` / `db.stream` / `db.tx`）对任何方言全量可用**——新方言接入零宿主逻辑
+  分支（§10 的 ABI 纪律：能力位是渐进面，不要求宿主认识你）。
+- **能力矩阵**（`ffi.rs`）：声明了但调用返回 unsupported → 如实报错（宿主不替你兜
+  默认实现）；未声明但实现了 → 采纳并 stderr 告警（说明 describe 写漏了）；声明的
+  `cancel` 落到默认实现 → unsupported（声明即承诺）。
+
+错误一律走**信封**（`Err(RString)` 载荷是 JSON，**不是**裸文案）：
+
+```jsonc
+{ "category": "constraint", "retryable": false, "session_disposition": "keep",
+  "message": "db query: Duplicate entry 'a' for key 'PRIMARY'", "data": { "vendor_code": 1062 } }
+```
+
+`category` ∈ syntax / constraint / timeout / connection / capacity / unsupported /
+cancelled / internal；未知值宿主按 `internal` 处理（**禁止猜**）。`data.vendor_code`
+原样透传（mysql 用引擎错误号，pg 用 SQLSTATE 串），宿主不改写。宿主的
+`message` 就是这里的原文（不再叠 `ffi <op>: ` 前缀）；JS 侧另有 `e.code`
+（`OJ_DB_*`）/ `e.retryable` / `e.sessionDisposition` / `e.data`。
 
 ## 4. `oj_plugin_entry!` 范式全解
 

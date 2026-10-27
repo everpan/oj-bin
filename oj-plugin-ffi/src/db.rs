@@ -44,4 +44,9 @@ pub struct DataAccessorVtable {
     /// 显式 reclaim 游标（完成/出错/取消后都必须调用；**勿用 cancel 兼任清理**——
     /// 否则每 aborted 查询泄漏一个 HashMap 条目）。
     pub stream_close: extern "C" fn(handle: u64, stream_id: u64) -> FfiFuture,
+    /// ABI 12 起：工厂级方言描述符（无 handle，装配期读一次）。返回 `caps_from_json`
+    /// 可解析的 JSON：`{"dialect":"...","capabilities":["..."]}`。能力串常量见
+    /// `only-js::bridge::dialect_caps`（placeholder_q/dollar/colon、id_returning/two_step/none、
+    /// stream、cancel）。`dialect` 槽降级为诊断——连接级一致性校验改用本槽。
+    pub describe: extern "C" fn() -> RString,
 }

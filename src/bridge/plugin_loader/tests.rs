@@ -284,10 +284,21 @@ fn manifest_abi_mismatch() {
     }];
     let err = load_manifest(&dir, &manifest, host_context(), &no_cfg).unwrap_err();
     unsafe { std::env::remove_var("MINI_FAKE_ABI") };
+    let msg = err.to_string();
     match err {
-        PluginLoadError::AbiMismatch { plugin, host } => {
+        PluginLoadError::AbiMismatch {
+            plugin,
+            host,
+            plugin_fp,
+            host_fp,
+        } => {
             assert_eq!(plugin, 999);
             assert_eq!(host, ABI_VERSION);
+            // 双方 fingerprint + 处置指引（重新整体拷贝 bin/，禁止增量覆盖）。
+            assert!(host_fp.contains("oj-plugin-ffi"));
+            assert!(msg.contains("重新整体拷贝 bin/"), "msg: {msg}");
+            assert!(msg.contains("禁止增量覆盖"), "msg: {msg}");
+            assert!(msg.contains(&plugin_fp), "msg: {msg}");
         }
         other => panic!("expected AbiMismatch, got {other}"),
     }
@@ -880,7 +891,12 @@ fn plugin_load_error_display_messages() {
             path: PathBuf::from("/p/x"),
             loader_text: "read_dir: EACCES".into(),
         },
-        PluginLoadError::AbiMismatch { plugin: 7, host: 8 },
+        PluginLoadError::AbiMismatch {
+            plugin: 7,
+            host: 8,
+            plugin_fp: "plugin-fp".into(),
+            host_fp: "host-fp".into(),
+        },
         PluginLoadError::SymbolMissing {
             path: PathBuf::from("/p/x"),
             symbol: "oj_plugin_init",
@@ -926,6 +942,7 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
         registrations: Registrations::default(),
         generic_axes: Vec::new(),
         config_key: None,
+        caps: None,
     };
     let info: PluginInfo = (&loaded).into();
     assert_eq!(info.name, "mini");
@@ -934,7 +951,8 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
     assert_eq!(info.fingerprint, "fp-1");
     assert_eq!(info.description, "test plugin");
     assert_eq!(info.host_abi_version, ABI_VERSION);
-    // v0.1.58 移除恒空的 unknown_axes：序列化键集固定为六键（消费方契约钉）。
+    // v0.1.58 移除恒空的 unknown_axes：序列化键集固定为六键（消费方契约钉）；
+    // T13 起加第七键 caps（非 db 轴插件为 null）。
     assert_eq!(
         serde_json::to_value(&info).unwrap(),
         serde_json::json!({
@@ -944,8 +962,139 @@ fn loaded_plugin_into_plugin_info_maps_all_fields() {
             "fingerprint": "fp-1",
             "description": "test plugin",
             "host_abi_version": oj_plugin_ffi::ABI_VERSION,
+            "caps": null,
         })
     );
+    assert_eq!(PluginInfo::serialized_keys().len(), 7);
+}
+
+/// T13：锁内登记面校验——目录多出未登记的库文件 → 点名该文件（增量覆盖残留的典型症状）。
+#[test]
+fn lock_rejects_extra_library_file_and_names_it() {
+    let lock = vec![PluginLockEntry {
+        name: "oj-db-mysql".into(),
+        abi: ABI_VERSION,
+        fingerprint: "fp".into(),
+    }];
+    // 违规：锁里没有 oj-db-old。
+    let files = vec![
+        PathBuf::from("/p").join(ffi::plugin_file_name("oj-db-mysql")),
+        PathBuf::from("/p").join(ffi::plugin_file_name("oj-db-old")),
+    ];
+    let e = reject_unlocked_files(&files, &lock).expect_err("extra file must be rejected");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("oj-db-old"),
+        "must name the offending file: {msg}"
+    );
+    assert!(msg.contains("plugins.lock.json"), "{msg}");
+    // 合规：目录 ⊆ 锁 → 通过（锁里多出的条目不算错，允许先发锁后发插件）。
+    let ok_files = vec![PathBuf::from("/p").join(ffi::plugin_file_name("oj-db-mysql"))];
+    assert!(reject_unlocked_files(&ok_files, &lock).is_ok());
+}
+
+/// T13：lock 文件缺失 → 不强制（老发布物继续按扫描装配）；存在但坏 JSON → 亦不强制
+/// （宁可扫描，不可因锁损坏让整个服务起不来）。
+#[test]
+fn read_plugins_lock_absent_or_malformed_is_none() {
+    let dir = std::env::temp_dir().join(format!("oj-lock-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(read_plugins_lock(&dir).is_none(), "absent lock -> None");
+    std::fs::write(dir.join("plugins.lock.json"), b"not json").unwrap();
+    assert!(read_plugins_lock(&dir).is_none(), "malformed lock -> None");
+    std::fs::write(
+        dir.join("plugins.lock.json"),
+        br#"[{"name":"mini","abi":12,"fingerprint":"f"}]"#,
+    )
+    .unwrap();
+    let lock = read_plugins_lock(&dir).expect("valid lock parsed");
+    assert_eq!(lock.len(), 1);
+    assert_eq!(lock[0].name, "mini");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// should-fix：锁 ↔ 实物**反向**对账。「只查多出来的文件」是半把锁——少拷与混版同样是
+/// 整体拷贝失败的证据，而且症状更隐蔽（缺插件的能力表现为 unsupported、混版表现为
+/// fingerprint 不符）。两者都只告警不拒载，故断言的是文案而非 Err。
+#[test]
+fn lock_divergences_report_missing_and_mismatched_entries() {
+    use oj_plugin_ffi::{PluginDescriptor, RString};
+    let mk = |name: &str, abi: u32, fp: &str| LoadedPlugin {
+        descriptor: PluginDescriptor {
+            name: RString::from(name),
+            semver: RString::from("0.1.0"),
+            abi_version: abi,
+            fingerprint: RString::from(fp),
+            desc: RString::from("test plugin"),
+        },
+        registrations: Registrations::default(),
+        generic_axes: Vec::new(),
+        config_key: None,
+        caps: None,
+    };
+    let lock = vec![
+        PluginLockEntry {
+            name: "oj-db-mysql".into(),
+            abi: ABI_VERSION,
+            fingerprint: "fp-a".into(),
+        },
+        PluginLockEntry {
+            name: "mini-kv".into(),
+            abi: ABI_VERSION,
+            fingerprint: "fp-b".into(),
+        },
+    ];
+
+    // 一致：零告警（不放行任何噪音，否则告警会被无视）。
+    let same = vec![
+        mk("oj-db-mysql", ABI_VERSION, "fp-a"),
+        mk("mini-kv", ABI_VERSION, "fp-b"),
+    ];
+    assert!(lock_divergences(&same, &lock).is_empty());
+
+    // 混版：fingerprint 不符（同 abi）→ 点名 + 带双方值。
+    let mixed = vec![
+        mk("oj-db-mysql", ABI_VERSION, "fp-STALE"),
+        mk("mini-kv", ABI_VERSION, "fp-b"),
+    ];
+    let w = lock_divergences(&mixed, &lock);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("oj-db-mysql"), "{w:?}");
+    assert!(w[0].contains("fp-STALE") && w[0].contains("fp-a"), "{w:?}");
+    assert!(w[0].contains("plugins.lock.json"), "{w:?}");
+
+    // 少拷：锁里 mini-kv 没有实物 → 点名缺失清单。
+    let missing = vec![mk("oj-db-mysql", ABI_VERSION, "fp-a")];
+    let w = lock_divergences(&missing, &lock);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("mini-kv"), "{w:?}");
+    assert!(w[0].contains("missing"), "{w:?}");
+    // 加载出锁外插件（扫描模式已拒载）不在此重复报。
+    let extra = vec![mk("ghost", ABI_VERSION, "fp-z")];
+    let w = lock_divergences(&extra, &lock);
+    assert_eq!(w.len(), 1, "只应报两条缺失，不报未登记项: {w:?}");
+}
+
+/// T13：ABI 不匹配文案必须同时给出双方 fingerprint 与「整体拷贝、禁止增量覆盖」处置。
+#[test]
+fn abi_mismatch_message_carries_both_fingerprints_and_remedy() {
+    let e = PluginLoadError::AbiMismatch {
+        plugin: 11,
+        host: 12,
+        plugin_fp: "plugin-fp".into(),
+        host_fp: "host-fp".into(),
+    };
+    let msg = e.to_string();
+    assert!(
+        msg.contains("plugin=11") && msg.contains("host=12"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("plugin-fp") && msg.contains("host-fp"),
+        "{msg}"
+    );
+    assert!(msg.contains("禁止增量覆盖"), "{msg}");
 }
 
 /// blob 装配期 connect 成功 + 三类失败（同 kv：合一个用例避免并行互踩模式开关）。

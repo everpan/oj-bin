@@ -62,6 +62,17 @@ export interface Hit { id: unknown; score: number; fragments?: Record<string, st
 
 export function createSearch(dbi: DBInstance) {
   const d: Dialect = dbi.dialect();
+  // T9：未知方言（不在 builder-known 子集）一期 raw-only，平台原语 search.* 显式拒绝，
+  // 结构化为 OJ_DB_UNSUPPORTED（与宿主门控同形），禁止静默落 pg 分支生成错误 SQL。
+  const SUPPORTED: Dialect[] = ["sqlite", "mysql", "postgres"];
+  if (!SUPPORTED.includes(d)) {
+    const e = new Error(
+      `search is not supported on dialect "${d}" yet. See docs/db-guide.md 方言能力矩阵.`,
+    );
+    (e as unknown as { code: string; data: unknown }).code = "OJ_DB_UNSUPPORTED";
+    (e as unknown as { code: string; data: unknown }).data = { capability: "search", dialect: d };
+    throw e;
+  }
   const pks = new Map<string, string>();
   const fieldsOf = new Map<string, string[]>();
 

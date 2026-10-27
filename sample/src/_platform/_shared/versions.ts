@@ -60,6 +60,19 @@ export function lineDiff(a: string, b: string): DiffLine[] {
 
 export function createVersions(dbi: DBInstance) {
   const d = dbi.dialect();
+  // T9：未知方言（不在 builder-known 子集）一期 raw-only，内容版本化原语显式拒绝，
+  // 结构化为 OJ_DB_UNSUPPORTED（与宿主门控同形），禁止静默落 pg 分支生成错误 SQL。
+  // 注意：`dbi.dialect()` 在宿主侧**已不再**对未知方言 fail-loud（开放契约下它原样返回
+  // 插件声明的方言名），所以本段是这一层唯一的防线，不能省。
+  const SUPPORTED = ["sqlite", "mysql", "postgres"];
+  if (!SUPPORTED.includes(d)) {
+    const e = new Error(
+      `versions is not supported on dialect "${d}" yet. See docs/db-guide.md 方言能力矩阵.`,
+    ) as Error & { code: string; data: unknown };
+    e.code = "OJ_DB_UNSUPPORTED";
+    e.data = { capability: "versions", dialect: d };
+    throw e;
+  }
   const P = (n: number) => (d === "postgres" ? `$${n + 1}` : "?");
   const insIgnore = d === "sqlite" ? "INSERT OR IGNORE INTO"
     : d === "mysql" ? "INSERT IGNORE INTO"

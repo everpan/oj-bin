@@ -203,6 +203,12 @@ pub async fn replay_all(
         eprintln!("warn: seed skipped (no default db)");
         return Ok(());
     };
+    // 门控（T8）：未知方言（不在 builder-known 子集）一律 fail-loud，错误文本点名方言，
+    // 绝不回落 Sqlite。复用 db_error::unsupported 构造器渲染文本。
+    let dialect_name = db.dialect_info().name.clone();
+    if Dialect::known(&dialect_name).is_none() {
+        return Err(only_js::bridge::db_error::unsupported(&dialect_name, "seed").message);
+    }
     let mut texts = Vec::new();
     for (name, p) in &modules {
         let t = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", show(p)))?;
@@ -254,6 +260,22 @@ fn leak_str(s: String) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Given oracle 方言 When replay_all 入口门控（seed）
+    /// Then fail-loud：Dialect::known 不接受 oracle，unsupported 文本点名方言与能力名 seed。
+    /// （与 migrate 同形：直接测门控 predicate，避免跨 crate mock accessor 的 async_trait
+    /// 生命期陷阱。）
+    #[test]
+    fn oracle_seed_is_unsupported() {
+        let name = "oracle";
+        assert!(
+            Dialect::known(name).is_none(),
+            "oracle 不应在 builder-known 子集"
+        );
+        let err = only_js::bridge::db_error::unsupported(name, "seed").message;
+        assert!(err.contains("oracle"), "{err}");
+        assert!(err.contains("seed"), "{err}");
+    }
 
     #[test]
     fn create_tables_extracts_names() {

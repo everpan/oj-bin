@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use deno_core::{OpState, op2};
@@ -23,6 +23,8 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 
 use super::{BridgeResult, StableState};
+use crate::bridge::db_error::{BridgeError, unsupported};
+use crate::bridge::dialect_caps::{DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle};
 
 /// 数据访问返回的单行（JSON 对象）。
 pub type Row = Value;
@@ -46,6 +48,63 @@ pub fn dialect_of(dsn: &str) -> Dialect {
     }
 }
 
+/// 方言名 → known 子集（`mysql`/`postgres`/`sqlite`）；未知方言返回 `None`
+///（由上层门控点拦截，绝不冒充已知方言）。T5/T6 两层方言模型的核心查询。
+pub fn known_dialect(name: &str) -> Option<Dialect> {
+    match name {
+        "mysql" => Some(Dialect::MySql),
+        "postgres" | "postgresql" => Some(Dialect::Postgres),
+        "sqlite" => Some(Dialect::Sqlite),
+        _ => None,
+    }
+}
+
+/// 门控：方言名不在 builder-known 子集时，一律结构化 `unsupported`，绝不回落 Sqlite。
+/// 设计 §5.2：未知方言是开放契约下的有效状态，oj 生成的 SQL 路径（builder/list_tables/
+/// next_seq/migrate/seed）必须先过此门控；raw SQL 路径（db.query/exec 由插件承载方言）不受限。
+pub(crate) fn require_known_dialect(
+    info: &DialectInfo,
+    capability: &str,
+) -> Result<Dialect, crate::bridge::db_error::BridgeError> {
+    match Dialect::known(&info.name) {
+        Some(d) => Ok(d),
+        None => Err(crate::bridge::db_error::unsupported(&info.name, capability)),
+    }
+}
+
+impl Dialect {
+    /// 见 [`known_dialect`]：方言名 → known 子集。
+    pub fn known(name: &str) -> Option<Dialect> {
+        known_dialect(name)
+    }
+
+    /// 方言名（用于描述符 name 字段）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "sqlite",
+            Dialect::MySql => "mysql",
+            Dialect::Postgres => "postgres",
+        }
+    }
+}
+
+/// 内置 accessor（sqlite/memory）的默认方言描述符（T6：两层模型 default 锚点）。
+/// 占位 `?` + 两步取 ID（`last_insert_rowid`）+ 支持流式（sqlx 游标）+ 无 cancel。
+static SQLITE_DIALECT_INFO: OnceLock<DialectInfo> = OnceLock::new();
+
+/// 取默认 sqlite 方言描述符的 `&'static` 引用（懒初始化）。
+pub fn sqlite_dialect_info() -> &'static DialectInfo {
+    SQLITE_DIALECT_INFO.get_or_init(|| DialectInfo {
+        name: "sqlite".to_string(),
+        caps: DialectCaps {
+            placeholder: PlaceholderStyle::Q,
+            id: IdStrategy::TwoStep,
+            stream: true,
+            cancel: false,
+        },
+    })
+}
+
 /// 活跃事务会话（`DataAccessor::begin` 产出的运行期事务句柄）。
 /// commit/rollback 取 `&self`（内部 take，二次调用报 "tx finished"）——
 /// 会话存于 per-request 状态并被 `tokio::sync::Mutex` 串行化，不能按值交出。
@@ -55,6 +114,14 @@ pub trait TxSession: Send {
     async fn exec(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
     async fn commit(&self) -> BridgeResult<()>;
     async fn rollback(&self) -> BridgeResult<()>;
+    /// 取消能力（与 DataAccessor::cancel 同源默认哨兵；事务级取消沿用 accessor 的默认 unsupported）。
+    async fn cancel(&self, _stream_id: u64) -> BridgeResult<()> {
+        Err(unsupported(&self.dialect_info().name, "cancel").into())
+    }
+    /// 事务级方言描述符（T6：begin 时从 accessor 完整快照，in-tx 改写/exec 用此而非再次查询）。
+    fn dialect_info(&self) -> &DialectInfo {
+        sqlite_dialect_info()
+    }
 }
 
 /// 数据访问统一契约（接口隔离 + 依赖倒置）。
@@ -64,6 +131,12 @@ pub trait DataAccessor: Send + Sync {
     /// 库方言（构造器选 builder 用；默认 sqlite，fake/未知驱动走默认）。
     fn dialect(&self) -> Dialect {
         Dialect::Sqlite
+    }
+
+    /// 方言描述符（T6：两层模型——边界描述符，装配期冻结，运行期纯查表）。
+    /// 默认 sqlite 静态描述符；FfiDataAccessor/SqlxAccessor 覆盖为各自真实描述符。
+    fn dialect_info(&self) -> &DialectInfo {
+        sqlite_dialect_info()
     }
 
     /// 开启事务（不支持事务的 accessor 走默认 Err）。
@@ -96,6 +169,14 @@ pub trait DataAccessor: Send + Sync {
         _params: &[Value],
     ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
         Err("backend does not support streaming".into())
+    }
+
+    /// 取消能力（M2 Oracle/DM 覆盖之；宿主侧仅在此声明默认哨兵）。
+    /// 默认 `unsupported`——能力矩阵（ffi.rs `stream_query` / `cancel`）据声明能力决定
+    /// 采纳或 fail-loud；声明了却未提供该能力的 accessor 必须 fail-loud，不可静默降级。
+    /// `stream_id` 为协作式取消目标（缺失/未知时为 0，由插件自决）。
+    async fn cancel(&self, _stream_id: u64) -> BridgeResult<()> {
+        Err(unsupported(&self.dialect_info().name, "cancel").into())
     }
 }
 
@@ -212,9 +293,10 @@ pub fn op_db_has(state: &mut OpState, #[string] name: &str) -> bool {
 pub struct ActiveTx {
     pub db: String,
     pub session: tokio::sync::Mutex<Box<dyn TxSession>>,
-    /// 连接方言（begin 时从 accessor 快照；0.1.67 占位符统一改写需要）。
-    /// 不走 TxSession trait/FFI vtable 的理由见 op_db_tx_begin 注释。
-    pub dialect: Dialect,
+    /// 连接方言描述符（T6：begin 时从 accessor 完整快照，in-tx 改写/exec 据此查表）。
+    /// 只存描述符、不存 known 枚举：开放方言下枚举会 panic（未知名不在子集），
+    /// 而事务是裸 SQL 路径的一部分，必须对新方言可用（设计 §5.5）。
+    pub dialect_info: DialectInfo,
 }
 
 /// 当前请求的活跃事务句柄（无则 None）。借用即取即还。
@@ -252,13 +334,13 @@ pub(crate) fn resolve_target(
 #[allow(clippy::too_many_arguments)]
 fn normalize_and_trace<'a>(
     state: &Rc<RefCell<OpState>>,
-    dialect: Dialect,
+    placeholder: PlaceholderStyle,
     in_tx: bool,
     name: &str,
     sql: &'a str,
     params: &[Value],
 ) -> Result<Cow<'a, str>, JsErrorBox> {
-    match super::placeholder::normalize_sql(dialect, sql, params) {
+    match super::placeholder::normalize_sql(placeholder, sql, params) {
         Ok(norm) => Ok(norm),
         Err(e) => {
             trace_sql(
@@ -271,6 +353,8 @@ fn normalize_and_trace<'a>(
                 None,
                 false,
                 Some(e.clone()),
+                None,
+                None,
             );
             Err(JsErrorBox::generic(e))
         }
@@ -326,17 +410,15 @@ pub async fn op_db_tx_begin(
         ));
     }
     let da = super::query::lookup(&state, &name)?;
-    let session = da
-        .begin()
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let session = da.begin().await.map_err(to_js_err)?;
     // 方言快照进 ActiveTx（而非 TxSession trait 加方法 / FFI ABI 演进）：方言是
-    // accessor 静态属性，begin 时可从 da.dialect() 拿到；前者要改 SqlxTx/InMemoryTx
+    // accessor 静态属性，begin 时可从 da.dialect_info() 拿到；前者要改 SqlxTx/InMemoryTx
     // 及全部夹具，后者要 bump ABI_VERSION（严格相等门禁）——代价与收益不成比例。
+    // 注意：**不调用 da.dialect()**（开放方言下它会 panic），只存描述符。
     state.borrow_mut().borrow_mut::<super::ReqState>().tx = Some(Arc::new(ActiveTx {
         db: name,
         session: tokio::sync::Mutex::new(session),
-        dialect: da.dialect(),
+        dialect_info: da.dialect_info().clone(),
     }));
     Ok(true)
 }
@@ -348,12 +430,7 @@ pub async fn op_db_tx_commit(
     #[string] name: String,
 ) -> Result<bool, JsErrorBox> {
     let t = take_tx(&state, &name)?;
-    t.session
-        .lock()
-        .await
-        .commit()
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    t.session.lock().await.commit().await.map_err(to_js_err)?;
     Ok(true)
 }
 
@@ -364,12 +441,7 @@ pub async fn op_db_tx_rollback(
     #[string] name: String,
 ) -> Result<bool, JsErrorBox> {
     let t = take_tx(&state, &name)?;
-    t.session
-        .lock()
-        .await
-        .rollback()
-        .await
-        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    t.session.lock().await.rollback().await.map_err(to_js_err)?;
     Ok(true)
 }
 
@@ -424,6 +496,35 @@ pub fn op_db_as_tenant(state: &mut OpState, #[string] id: String) -> Result<bool
     Ok(true)
 }
 
+/// accessor 抛出的 `Box<dyn Error>` 可能内含 `BridgeError`（来自 ffi 侧 `parse_raw` 单点解析的
+/// 结构化信封）。优先还原 `code`/`data` 透传到 JS；否则退化为 generic（保留原文），不丢信息。
+pub(crate) fn to_js_err(e: Box<dyn std::error::Error + Send + Sync>) -> JsErrorBox {
+    match e.downcast::<BridgeError>() {
+        Ok(be) => (*be).into(),
+        Err(e) => JsErrorBox::generic(e.to_string()),
+    }
+}
+
+/// 从 `BridgeResult` 错误抽取结构化 `(category, retryable)`（T12，供 `trace_sql` 落画像）。
+/// 非 `BridgeError`（占位符/JS 层错误）返回 `(None, None)`。调用方须在 `.map_err(to_js_err)`
+/// 之前调用——转换后 `BridgeError` 被包进 `JsErrorBox`，无法再还原 category。
+pub(crate) fn err_meta<T>(res: &BridgeResult<T>) -> (Option<String>, Option<bool>) {
+    match res {
+        Err(e) => err_meta_of(e.as_ref()),
+        Ok(_) => (None, None),
+    }
+}
+
+/// 单错版 `err_meta`：只拿到 `Box<dyn Error>` 的调用点（builder 路径）用。
+/// `BridgeError` → `(Some(category), Some(retryable))`；其余 `(None, None)`。
+pub(crate) fn err_meta_of(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+) -> (Option<String>, Option<bool>) {
+    e.downcast_ref::<BridgeError>().map_or((None, None), |b| {
+        (Some(b.category.as_str().to_string()), Some(b.retryable))
+    })
+}
+
 /// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
 #[op2]
 #[serde]
@@ -439,25 +540,17 @@ pub async fn op_db_query(
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
-    let dialect = match &target {
-        Target::Tx(t) => t.dialect,
-        Target::Pool(da) => da.dialect(),
+    let placeholder = match &target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
     };
-    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
+    let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
-    let res: Result<Vec<Row>, JsErrorBox> = match target {
-        Target::Pool(da) => da
-            .query_with_params(&norm, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
-        Target::Tx(t) => t
-            .session
-            .lock()
-            .await
-            .query(&norm, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
+    let res: BridgeResult<Vec<Row>> = match target {
+        Target::Pool(da) => da.query_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
     };
+    let (cat, retry) = err_meta(&res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     trace_sql(
         &state,
@@ -469,9 +562,11 @@ pub async fn op_db_query(
         res.as_ref().ok().map(|r| r.len() as i64),
         res.is_ok(),
         res.as_ref().err().map(|e| e.to_string()),
+        cat,
+        retry,
     );
 
-    let mut rows = res?;
+    let mut rows = res.map_err(to_js_err)?;
     // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
     super::jsnum::sanitize_rows(&mut rows);
     Ok(rows)
@@ -499,6 +594,8 @@ pub(crate) fn trace_sql(
     rows: Option<i64>,
     ok: bool,
     err: Option<String>,
+    category: Option<String>,
+    retryable: Option<bool>,
 ) {
     // 关闭即零开销：先判 enabled，再算任何东西（含 module clone / 参数摘要）。
     let enabled = state
@@ -539,6 +636,8 @@ pub(crate) fn trace_sql(
             rows,
             ok,
             error: err,
+            category,
+            retryable,
         },
         log_params,
     );
@@ -554,30 +653,25 @@ pub async fn op_db_exec(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<i64, JsErrorBox> {
     let params = params.unwrap_or_default();
+    // 裸 SQL 路径（query/exec/stream）对开放方言**全量可用**，不做 known 子集门控
+    // （设计 §5.5：门控只覆盖 builder / exec_route / list_tables / nextSeq /
+    // search.* / CLI 六处）——方言知识只体现在占位符能力位。
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
-    let dialect = match &target {
-        Target::Tx(t) => t.dialect,
-        Target::Pool(da) => da.dialect(),
+    let placeholder = match &target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
     };
-    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
+    let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
-    let res: Result<i64, JsErrorBox> = match target {
-        Target::Pool(da) => da
-            .exec_with_params(&norm, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
-        Target::Tx(t) => t
-            .session
-            .lock()
-            .await
-            .exec(&norm, &params)
-            .await
-            .map_err(|e| JsErrorBox::generic(e.to_string())),
+    let res: BridgeResult<i64> = match target {
+        Target::Pool(da) => da.exec_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.exec(&norm, &params).await,
     };
+    let (cat, retry) = err_meta(&res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     trace_sql(
         &state,
@@ -589,9 +683,11 @@ pub async fn op_db_exec(
         res.as_ref().ok().copied(),
         res.is_ok(),
         res.as_ref().err().map(|e| e.to_string()),
+        cat,
+        retry,
     );
 
-    res
+    res.map_err(to_js_err)
 }
 
 /// db.stream 打开（PR-2 Phase A）：先 `guard::check_raw` / `check_tenant_raw`（open 前校验，同
@@ -615,10 +711,18 @@ pub async fn op_db_stream_open(
             ));
         }
     };
-    // stream 明确拒绝事务，方言直接取 accessor（无需 ActiveTx 快照）。
-    let norm = normalize_and_trace(&state, da.dialect(), false, &name, &sql, &params)?;
+    // stream 明确拒绝事务，占位风格直接取 accessor（无需 ActiveTx 快照）。
+    let norm = normalize_and_trace(
+        &state,
+        da.dialect_info().caps.placeholder,
+        false,
+        &name,
+        &sql,
+        &params,
+    )?;
     let start = std::time::Instant::now();
     let stream_res = da.stream_query(&norm, &params).await;
+    let (cat, retry) = err_meta(&stream_res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     // 流式只追踪「打开」（首行拉取开始）；整条流耗时由 `db.stream` 的逐行消费决定，未计入。
     trace_sql(
@@ -631,8 +735,10 @@ pub async fn op_db_stream_open(
         None,
         stream_res.is_ok(),
         stream_res.as_ref().err().map(|e| e.to_string()),
+        cat,
+        retry,
     );
-    let mut stream = stream_res.map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    let mut stream = stream_res.map_err(to_js_err)?;
     let (tx, rx) = mpsc::channel::<Result<Row, String>>(DB_STREAM_CHANNEL_CAP);
     let shared = Arc::new(DbStreamShared {
         rx: tokio::sync::Mutex::new(rx),
@@ -781,6 +887,8 @@ pub async fn op_db_next_seq(
     }
     let err = |e: String| JsErrorBox::generic(e);
     let da = super::query::lookup(&state, &name)?;
+    // 门控（T8）：未知方言（不在 builder-known 子集）一律结构化 unsupported，绝不回落 Sqlite。
+    let _dialect = require_known_dialect(da.dialect_info(), "next_seq")?;
     // ① **先确保序列表存在**（每库一次，Bridge 级缓存）。DDL 走池、绝不在调用方事务里做：
     //    MySQL 的 DDL 会隐式提交调用方事务；PG 里事务内失败语句会让事务进入 aborted 态
     //    （后续一律 25P02）——若把建表放在「先试后建」的失败路径上，**首次在 db.tx 里用新序列名
@@ -816,6 +924,8 @@ pub async fn op_db_next_seq(
         None,
         alloc_res.is_ok(),
         alloc_res.as_ref().err().map(|e| e.to_string()),
+        None,
+        None,
     );
     let mut out = alloc_res?;
     // 出口护栏：超界整数降十进制字符串（与 DB 读值同契约，见 jsnum）。
@@ -832,13 +942,10 @@ pub fn op_db_dialect(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
 ) -> Result<String, JsErrorBox> {
+    // 直接报描述符声明名（开放契约下可能是 mysql/postgres/sqlite 之外的方言名，
+    // 不再经 known 子集映射——消除「未知方言静默回落 sqlite」的旧行为）。
     let da = super::query::lookup(&state, &name)?;
-    Ok(match da.dialect() {
-        Dialect::MySql => "mysql",
-        Dialect::Postgres => "postgres",
-        Dialect::Sqlite => "sqlite",
-    }
-    .into())
+    Ok(da.dialect_info().name.clone())
 }
 
 /// db.listTables(prefix?)（v0.1.82）：方言无关的目录自省，返回当前库业务可见表名
@@ -856,9 +963,10 @@ pub async fn op_db_list_tables(
 ) -> Result<Vec<String>, JsErrorBox> {
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
+    // 门控（T8）：未知方言（不在 builder-known 子集）一律结构化 unsupported，绝不回落 Sqlite。
     let dialect = match &target {
-        Target::Tx(t) => t.dialect,
-        Target::Pool(da) => da.dialect(),
+        Target::Tx(t) => require_known_dialect(&t.dialect_info, "list_tables")?,
+        Target::Pool(da) => require_known_dialect(da.dialect_info(), "list_tables")?,
     };
     // 投影列统一叫 `name`：sqlite_master 本就叫 name；information_schema 的
     // table_name 取别名。系统表排除只在 sqlite 需要（mysql/pg 已被
@@ -890,7 +998,11 @@ pub async fn op_db_list_tables(
     sql.push_str(" ORDER BY name");
     // 占位符统一改写（0.1.67）：`?` 是 oj 唯一占位符，PG 由宿主改写 `$n`——
     // 与三个裸 SQL op 同一插桩点，不许绕过。
-    let norm = normalize_and_trace(&state, dialect, in_tx, &name, &sql, &params)?;
+    let placeholder = match &target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
+    };
+    let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
     let res = match target {
         Target::Pool(da) => da.query_with_params(&norm, &params).await,
@@ -908,6 +1020,8 @@ pub async fn op_db_list_tables(
                 ms,
                 Some(rows.len() as i64),
                 true,
+                None,
+                None,
                 None,
             );
             // 契约是 Promise<string[]>：投影列固定叫 name，抽出来摊平（防驱动把
@@ -929,6 +1043,8 @@ pub async fn op_db_list_tables(
                 None,
                 false,
                 Some(em.clone()),
+                None,
+                None,
             );
             Err(JsErrorBox::generic(em))
         }
@@ -1510,6 +1626,289 @@ mod tests {
         assert_eq!(dialect_of("postgresql://h/d"), Dialect::Postgres);
         // 未知前缀回落 sqlite
         assert_eq!(dialect_of("weird://x"), Dialect::Sqlite);
+    }
+
+    // ── T6：方言能力模型 —— known() 边界 + 两层模型 dialect_info() ──
+    #[test]
+    fn known_dialect_rejects_unknown_and_accepts_known() {
+        // Given known("oracle") → None（未进入 known 子集即为开放契约下的「未知」）
+        assert_eq!(Dialect::known("oracle"), None);
+        assert_eq!(Dialect::known("sqlserver"), None);
+        // Given known("postgres") → Some(Postgres) 等已知子集
+        assert_eq!(Dialect::known("postgres"), Some(Dialect::Postgres));
+        assert_eq!(Dialect::known("postgresql"), Some(Dialect::Postgres));
+        assert_eq!(Dialect::known("mysql"), Some(Dialect::MySql));
+        assert_eq!(Dialect::known("sqlite"), Some(Dialect::Sqlite));
+    }
+
+    #[test]
+    fn sqlite_dialect_info_is_default_anchor() {
+        let info = sqlite_dialect_info();
+        assert_eq!(info.name, "sqlite");
+        assert_eq!(info.caps.placeholder, PlaceholderStyle::Q);
+        assert_eq!(info.caps.id, IdStrategy::TwoStep);
+        assert!(info.caps.stream);
+        assert!(!info.caps.cancel);
+        // 懒初始化幂等：多次取是同一 &'static
+        assert!(std::ptr::eq(info, sqlite_dialect_info()));
+    }
+
+    #[test]
+    fn inmemory_accessor_and_tx_default_dialect_info_is_sqlite() {
+        // Given 默认 accessor（InMemoryAccessor）When dialect_info() Then 与 sqlite 默认锚一致
+        let da = InMemoryAccessor::new();
+        assert_eq!(da.dialect_info().name, "sqlite");
+        assert_eq!(da.dialect_info().caps, sqlite_dialect_info().caps);
+        // 默认 TxSession（begin 产出的 InMemoryTx）走 default → 同样 sqlite 锚
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let tx = rt.block_on(da.begin()).unwrap();
+        assert_eq!(tx.dialect_info().name, "sqlite");
+        assert_eq!(tx.dialect_info().caps, sqlite_dialect_info().caps);
+    }
+
+    #[test]
+    fn active_tx_carries_dialect_info_snapshot() {
+        // Given tx begin When 后续 in-tx 改写/exec 路径 Then 使用 ActiveTx.dialect_info
+        // （begin 时已快照，而非再次查询 accessor）。此处钉死「快照随 ActiveTx 走」的契约。
+        let info = DialectInfo {
+            name: "postgres".to_string(),
+            caps: DialectCaps {
+                placeholder: PlaceholderStyle::Dollar,
+                id: IdStrategy::Returning,
+                stream: true,
+                cancel: true,
+            },
+        };
+        let tx = ActiveTx {
+            db: "default".to_string(),
+            session: tokio::sync::Mutex::new(Box::new(InMemoryTx {
+                inner: Arc::new(RwLock::new(Default::default())),
+            })),
+            dialect_info: info.clone(),
+        };
+        // in-tx 路径（db.rs:501/621/918 的 Target::Tx(t) => t.dialect_info）读此快照
+        assert_eq!(tx.dialect_info.name, "postgres");
+        assert_eq!(tx.dialect_info.caps.placeholder, PlaceholderStyle::Dollar);
+        assert_eq!(tx.dialect_info.caps.id, IdStrategy::Returning);
+    }
+
+    // ── T8：六门控点 —— 未知方言（不在 builder-known 子集）一律结构化 unsupported ──
+
+    /// 门控核心：oracle 不在 known 子集 → Err(BridgeError::unsupported)，
+    /// code==OJ_DB_UNSUPPORTED、data.capability==对应能力名；已知方言透传枚举。
+    #[test]
+    fn require_known_dialect_gates_unknown_and_passes_known() {
+        let oracle = DialectInfo {
+            name: "oracle".to_string(),
+            caps: DialectCaps {
+                placeholder: PlaceholderStyle::Colon,
+                id: IdStrategy::None,
+                stream: false,
+                cancel: false,
+            },
+        };
+        let err = require_known_dialect(&oracle, "query_build").unwrap_err();
+        assert_eq!(
+            err.category,
+            crate::bridge::db_error::DbErrorCategory::Unsupported
+        );
+        assert_eq!(
+            crate::bridge::db_error::code_of(err.category),
+            "OJ_DB_UNSUPPORTED"
+        );
+        assert_eq!(
+            err.data.get("capability").and_then(Value::as_str),
+            Some("query_build")
+        );
+        assert_eq!(
+            err.data.get("dialect").and_then(Value::as_str),
+            Some("oracle")
+        );
+        assert!(err.message.contains("oracle"), "{}", err.message);
+        assert!(err.message.contains("query_build"), "{}", err.message);
+
+        // 已知方言正常透传
+        let pg = sqlite_dialect_info().clone();
+        assert_eq!(
+            require_known_dialect(&pg, "query_build").unwrap(),
+            Dialect::Sqlite
+        );
+        let my = DialectInfo {
+            name: "mysql".to_string(),
+            caps: DialectCaps {
+                placeholder: PlaceholderStyle::Q,
+                id: IdStrategy::TwoStep,
+                stream: true,
+                cancel: false,
+            },
+        };
+        assert_eq!(
+            require_known_dialect(&my, "query_build").unwrap(),
+            Dialect::MySql
+        );
+    }
+
+    /// 测试用「未知方言」accessor：声明 oracle，但 oj 不认识它的 builder（无 sea-query 构造器）。
+    struct OracleAccessor;
+    #[async_trait]
+    impl DataAccessor for OracleAccessor {
+        async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
+            // 裸 SQL 路径对开放方言可用（§5.5）——mock 如实返回空结果集。
+            Ok(Vec::new())
+        }
+        async fn exec_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+            // 同上：裸 exec 不打 known 子集门控，调用必须能到达 accessor。
+            Ok(7)
+        }
+        fn dialect_info(&self) -> &DialectInfo {
+            static INFO: OnceLock<DialectInfo> = OnceLock::new();
+            INFO.get_or_init(|| DialectInfo {
+                name: "oracle".to_string(),
+                caps: DialectCaps {
+                    placeholder: PlaceholderStyle::Colon,
+                    id: IdStrategy::None,
+                    stream: false,
+                    cancel: false,
+                },
+            })
+        }
+    }
+
+    /// Given oracle accessor When db.table(...).select().all()（query_build 路径）
+    /// Then 结构化 unsupported，message 点名 oracle 与能力名（不回落 Sqlite、不静默执行）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_query_build_is_unsupported() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(r#"db.table("t").select(["id"]).all().then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500);
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("oracle"), "{msg}");
+        assert!(msg.contains("query_build"), "{msg}");
+    }
+
+    /// Given oracle accessor When db.listTables()（list_tables 门控）
+    /// Then 结构化 unsupported，message 点名 oracle 与 list_tables。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_list_tables_is_unsupported() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(r#"db.listTables().then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500);
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("oracle"), "{msg}");
+        assert!(msg.contains("list_tables"), "{msg}");
+    }
+
+    /// Given oracle accessor When db.nextSeq("s")（next_seq 门控）
+    /// Then 结构化 unsupported，message 点名 oracle 与 next_seq。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_next_seq_is_unsupported() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(r#"db.nextSeq("s").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500);
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("oracle"), "{msg}");
+        assert!(msg.contains("next_seq"), "{msg}");
+    }
+
+    /// Given oracle accessor When db.exec / db.query（裸 SQL 路径）
+    /// Then 不门控、直达 accessor（设计 §5.5：raw 路径对开放方言全量可用）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_raw_exec_and_query_are_available() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(r#"db.exec("update t set a = 1").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"], 7, "exec 必须直达 accessor: {v}");
+
+        let cap = b
+            .run(r#"db.query("select 1 from dual").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"].as_array().is_some_and(|a| a.is_empty()), "{v}");
+    }
+
+    /// Given oracle accessor When db.nextSeq 抛结构化 unsupported Then JS 侧 `e.code` /
+    /// `e.data` / `e.retryable` / `e.sessionDisposition` 透传（data 经 normDbErr 从 JSON 串
+    /// 解析为对象、retryable 从 1/0 归一为布尔），handler 可据此结构化判别能力缺失，
+    /// 而非只能靠 message 文本匹配。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_error_exposes_code_and_data_to_js() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(
+                r#"db.nextSeq("s").then(r => json.ok(r)).catch(e => json.ok({ code: e.code, data: e.data, retryable: e.retryable, sd: e.sessionDisposition, msg: e.message }));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        // 信封 code 为 0（handler 成功返回）；结构化信息在 data 载荷内。
+        assert_eq!(v["code"], 0, "{v}");
+        let p = &v["data"];
+        assert_eq!(p["code"], "OJ_DB_UNSUPPORTED");
+        // e.data 已被 normDbErr 解析为对象（capability / dialect）。
+        assert_eq!(p["data"]["capability"], "next_seq");
+        assert_eq!(p["data"]["dialect"], "oracle");
+        // retryable 从 1/0 归一为布尔；sessionDisposition 为小写串。
+        assert_eq!(p["retryable"], false, "e.retryable 必须是布尔: {v}");
+        assert_eq!(p["sd"], "keep", "e.sessionDisposition: {v}");
+        assert!(p["msg"].as_str().unwrap().contains("oracle"), "{v}");
+    }
+
+    /// T9 文本冻结快照：既有方言的 db 错误抵达 JS 时 `e.message` **逐字节**等于插件给出的
+    /// message 原文。宿主不再叠 `ffi <op>: ` 前缀（设计 §5.1）——ABI 11 及以前该前缀与插件
+    /// 自身的 `db query: ` 叠加成 `ffi db query: db query: …` 双前缀；本条钉死去重后的文本，
+    /// 任何再改（含重新加前缀）都必须显式更新此断言并写 CHANGELOG。
+    #[test]
+    fn db_error_text_snapshot_is_frozen() {
+        use deno_error::JsErrorClass;
+        let raw = r#"{"category":"constraint","retryable":false,"session_disposition":"keep","message":"db query: Duplicate entry 'neo' for key 'PRIMARY'","data":{"vendor_code":1062}}"#;
+        let js = to_js_err(Box::new(crate::bridge::db_error::parse_raw(raw)));
+        let msg = JsErrorClass::get_message(&js);
+        assert_eq!(
+            msg, "db query: Duplicate entry 'neo' for key 'PRIMARY'",
+            "既有 db 错误文本必须逐字节冻结（设计 §5.1：宿主不叠 ffi 前缀）"
+        );
+        // 反向断言：宿主前缀一旦回流，上面那条会红；这条把「为什么红」写清楚。
+        assert!(!msg.starts_with("ffi "), "宿主不得再叠 ffi 前缀: {msg}");
+        // 非信封（裸文本）路径同样原样透传，不额外加壳。
+        let js = to_js_err("dialect not supported".into());
+        assert_eq!(JsErrorClass::get_message(&js), "dialect not supported");
+    }
+
+    /// 回归：已知三方言的既有行为零改动（sqlite builder 正常出结果）。
+    /// 构造器走 with_opts + SchemaRegistry（db.table 查询构造器按白名单解析表/列）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn known_sqlite_query_build_still_works() {
+        let db = Arc::new(InMemoryAccessor::new());
+        db.seed([json!({"id": 1, "name": "neo"})]);
+        let registry = SchemaRegistry::new().table("t", &["id"], &["id", "name"]);
+        let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
+        let cap = b
+            .run(r#"db.table("t").select(["id","name"]).all().then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"][0]["name"], "neo");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2180,7 +2579,7 @@ mod tests {
             .expect("load oj-db-postgres plugin");
             loaded
                 .iter()
-                .find_map(crate::bridge::plugin_loader::db_backend)
+                .find_map(|p| crate::bridge::plugin_loader::db_backend(p).ok().flatten())
         })
         .clone()
     }

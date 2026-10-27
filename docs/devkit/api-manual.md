@@ -1155,7 +1155,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
-| `db.dialect()` | `dialect(): "sqlite" \| "mysql" \| "postgres"` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
+| `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**（不再收窄成三个字面量，也**不再**对未识别方言报错）——要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 | `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。方言无关（SQL 文本引擎常量），替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
@@ -1637,6 +1637,55 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
   `db stream_open: too many concurrent cursors (limit 8) — close or cancel running streams first`
   ——此前无上限，并发大结果集可打满服务端 `max_connections`（此后连池查询一并失败，全库
   不可用）。游标收口（done / err / cancel / close）即释放配额；Any 回退路径走池、不占闸。
+
+**结构化数据库错误**（v0.1.88，ABI 12）：`db.*` 的失败不再是「只能读文案的字符串」。所有
+数据库 op（含构造器、`db.tx`、`db.stream`）reject 的 Error 都带四个结构化自有属性：
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `e.message` | `string` | 人类可读原文（既有方言的文本**保持原样**；宿主不再叠 `ffi <op>: ` 前缀） |
+| `e.code` | `string` | 稳定错误码，见下表 |
+| `e.retryable` | `boolean` | 该错误**重试是否有意义**（如死锁/超时可重试，唯一键冲突不可）。已是布尔，无需再解析 |
+| `e.sessionDisposition` | `"keep" \| "reset" \| "close"` | 会话处置：`keep` 连接可继续用；`reset` 需重置会话状态；`close` 应丢弃该连接 |
+| `e.data` | `object` | 附加数据（**已解析为对象**，不是 JSON 串）：`data.vendor_code` 为引擎原始错误码（mysql 数字如 `1062`、pg SQLSTATE 串如 `"22012"`）；能力缺失时另有 `data.capability` / `data.dialect` |
+
+`e.code` 取值：
+
+| code | 含义 | 典型来源 |
+|---|---|---|
+| `OJ_DB_SYNTAX` | SQL 语法 / 对象不存在 | SQLSTATE 42xxx、mysql 1064 |
+| `OJ_DB_CONSTRAINT` | 约束冲突（唯一键/外键/非空） | SQLSTATE 23xxx、mysql 1062 |
+| `OJ_DB_TIMEOUT` | 超时（含连接池等待超时） | SQLSTATE 40xxx、`PoolTimedOut` |
+| `OJ_DB_CONNECTION` | 连接失败/已断开 | SQLSTATE 08xxx、io/tls 错 |
+| `OJ_DB_CAPACITY` | 容量/资源耗尽 | SQLSTATE 53xxx |
+| `OJ_DB_CANCELLED` | 查询被取消 | SQLSTATE 57xxx、流取消 |
+| `OJ_DB_UNSUPPORTED` | **该方言不支持这个能力** | 查询构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` 遇到宿主未识别的方言 |
+| `OJ_DB_INTERNAL` | 其余（含未知厂商码） | 未映射的错误 |
+
+```js
+try {
+  await db.table("account").insert({ id: 1, name: "neo" }).run();
+} catch (e) {
+  if (e.code === "OJ_DB_CONSTRAINT" && e.data.vendor_code === 1062) {
+    json.fail(409, "account already exists"); return;
+  }
+  if (e.retryable && e.sessionDisposition === "keep") {
+    /* 可以安全重试（如死锁） */
+  }
+  throw e;
+}
+```
+
+> **升级注意（v0.1.88）**：ABI 11 及以前，db 错误的 message 前面会再叠一层宿主前缀，形成
+> `ffi db query: db query: <引擎原文>` 的**双前缀**；现在只保留 `db query: <引擎原文>`。
+> 若你在 catch 里匹配过 `^ffi db `，改成匹配主体前缀即可；不要去解析 `e.message`——
+> 用 `e.code` / `e.data.vendor_code` 判别。
+
+> **方言边界**：宿主只对 **sqlite / mysql / postgres** 生成 SQL（构造器、`listTables`、
+> `nextSeq`、`search.*`、`migrate`/`seed`）。其他方言（插件声明 `describe()` 里的
+> `dialect`）上一期只开放**裸 SQL 路径**（`db.query` / `db.exec` / `db.stream` / `db.tx`），
+> 构造器类 API 一律 `OJ_DB_UNSUPPORTED`（`data.capability` 点名是哪个 API）——不会再
+> 悄悄按 sqlite 语义生成错误 SQL。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -2429,7 +2478,8 @@ wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj t
 ### plugins —— 插件自省
 
 签名：`plugins(): any[]`。返回已加载插件清单
-`[{name, semver, abi_version, fingerprint, description, host_abi_version}]`——用于升级核对窗口
+`[{name, semver, abi_version, fingerprint, description, host_abi_version, caps}]`
+（`caps` 仅 db 轴插件有值，v0.1.88 起；形态 `{dialect, capabilities[]}`，与插件 `describe()` 同词汇）——用于升级核对窗口
 （第 11 章插件升级）；`description` 为插件作者自述。v0.1.54 起插件**自报轴清单**
 （`oj_plugin_axes()`）；v0.1.58 起插件声明了但宿主不认识的类型化轴名在装配期 stderr 告警后忽略（不再出现在 `plugins()`/`{base}/plugins` 输出里）
 （旧插件无此字段）。同一清单经内置端点 `GET {base}/plugins` 公开（不走 Bearer，运维/监控用）。
@@ -2468,9 +2518,10 @@ JS 出口：handler 里 `ojInfo()` **同步**返回五段诊断对象（装配�
 ```jsonc
 {
   "build":   { "oj": "0.1.54", "profile": "release", "host_triple": "…", "v8": "…", "exe": "…" },  // config_path 仅 oj info CLI 出，JS ojInfo() 无此字段
-  "abi":     { "abi_version": 11, "host_fingerprint": "…" },
-  "plugins": [ { "name": "…", "semver": "…", "abi_version": 11, "fingerprint": "…",
-                 "description": "…", "host_abi_version": 11 } ],
+  "abi":     { "abi_version": 12, "host_fingerprint": "…" },
+  "plugins": [ { "name": "…", "semver": "…", "abi_version": 12, "fingerprint": "…",
+                 "description": "…", "host_abi_version": 12,
+                 "caps": { "dialect": "postgres", "capabilities": ["placeholder_dollar","id_returning","stream"] } } ],
   "backends":{ "db_schemes": {"declared": ["default"]}, "blob_configured": true, "kv_plugin": true,
                "auth_plugin": true, "mail_plugin": false, "ldap_plugin": false, "es_plugin": false,
                "mq_plugins": ["kafka"], "bus_kinds": ["local"], "dbs_registered": ["sqlite", "mysql", "postgres", "memory"] },

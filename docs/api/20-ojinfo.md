@@ -20,8 +20,8 @@ phpinfo 风格的**装配期声明面诊断**。两个出口共用同一装配�
 | 段 | 内容 | 零值泄漏语义 |
 |---|---|---|
 | `build` | `oj` 版本、`profile`（release/debug）、`host_triple`、`v8` 版本、`exe` 绝对路径、（CLI 时）`config_path` | 无敏感面 |
-| `abi` | `abi_version`（当前 11）、`host_fingerprint`（rustc/契约 crate/triple 指纹） | 无敏感面 |
-| `plugins` | 每个已加载插件 `{name, semver, abi_version, fingerprint, description, host_abi_version}` | desc 为插件作者自述，勿写机密 |
+| `abi` | `abi_version`（当前 12）、`host_fingerprint`（rustc/契约 crate/triple 指纹） | 无敏感面 |
+| `plugins` | 每个已加载插件 `{name, semver, abi_version, fingerprint, description, host_abi_version, caps}`；`caps` 仅 db 轴插件有值，形态与插件 `describe()` 同词汇（`{"dialect":"mysql","capabilities":["placeholder_q","id_two_step","stream"]}`），非 db 轴为 `null` | desc 为插件作者自述，勿写机密 |
 | `backends` | 声明面：`db_schemes.declared`（config `db:` 键）、`blob_configured`、`kv_plugin`/`auth_plugin`/`mail_plugin`/`ldap_plugin`/`es_plugin`（槽位有无）、`mq_plugins`、`bus_kinds`、`dbs_registered` | **不 connect** 任何库/broker——纯注册表快照 |
 | `config` | `sections`（顶层 config 段名排序清单）+ `unconsumed`（未被消费的段名） | **只出键名不出值**——DSN、`bind_pw`、`ENC[...]` 明文不可能经此泄漏 |
 
@@ -68,13 +68,13 @@ phpinfo 风格的**装配期声明面诊断**。两个出口共用同一装配�
 # config_path: config.yaml
 #
 # ## abi
-# abi_version: 11
+# abi_version: 12
 # host_fingerprint: rustc-…
 #
 # ## plugins
-# - kv-redis 0.1.0 (abi 11)
+# - kv-redis 0.1.0 (abi 12)
 #   desc: kv 轴 Redis 插件：redis crate 异步客户端
-# - ldap 0.1.0 (abi 11)
+# - ldap 0.1.0 (abi 12)
 #   desc: LDAP directory search + bind-as-auth (ldap3); generic axis, requires host >= v0.1.54
 # generic_axes: ["ldap"]
 ```

@@ -3182,3 +3182,86 @@ curl localhost:9778/v1/api/sys/order/list/           # prefix 含 / 分段
 | `--module-root` 指向 dist 或仓库根 | 前者报 `is a release tree`（只认源码树）；后者可能命中过多（`too many module roots`）或把非业务目录里的 manifest 卷进来——指向真正的模块树根 |
 | 树内就地 build 过（`dist/` 与模块根同级）再用 `--module-root .` | 不会撞车：扫描整棵跳过含 `manifests.yaml` 锁的 release 树（产物里的 manifest 是原样副本，跳过即不重复登记）；但 release 跑法仍用 `-d dist` |
 | 平铺树项目以为要改命令 | 不需要——不带 `--module-root` 时全部路径走今日语义（`name` = 目录名强校验仍在），构建产物与 openapi 生成物与 v0.1.84 逐字节一致 |
+
+## 场景 44：把数据库错误分流成「可重试 / 冲突 / 能力缺失」（结构化错误面，v0.1.88）
+
+**要解决的**：以前 db 报错只能读文案——`if (e.message.includes("Duplicate"))` 一改版就碎，
+重试决策靠猜。v0.1.88 起每个 db 错误都带稳定 `code` 与结构化属性。
+
+### ① 一次性分类（推荐写法）
+
+```ts
+// _shared/dberr.ts —— 全项目共用
+export function dbFail(e: unknown): never {
+  const err = e as { code?: string; retryable?: boolean; sessionDisposition?: string;
+                     data?: { vendor_code?: unknown; capability?: string; dialect?: string };
+                     message?: string };
+  switch (err.code) {
+    case "OJ_DB_CONSTRAINT":
+      throw new HttpError(409, "conflict");            // 唯一键 / 外键
+    case "OJ_DB_TIMEOUT":
+    case "OJ_DB_CONNECTION":
+    case "OJ_DB_CAPACITY":
+      throw new HttpError(503, "database busy, retry later");  // err.retryable 通常为 true
+    case "OJ_DB_UNSUPPORTED":
+      throw new HttpError(500, `db capability missing: ${err.data?.capability}`);
+    case "OJ_DB_CANCELLED":
+      throw new HttpError(499, "cancelled");
+    default:
+      log.error("db failed", { code: err.code, msg: err.message });
+      throw new HttpError(500, "internal database error");
+  }
+}
+```
+
+### ② 幂等插入：冲突当成功
+
+```ts
+export async function ensureUser(id: number, name: string) {
+  try {
+    await db.table("account").insert({ id, name }).orIgnore().run();
+  } catch (e) {
+    const err = e as { code?: string; data?: { vendor_code?: number | string } };
+    if (err.code === "OJ_DB_CONSTRAINT") return;   // 已存在
+    throw e;
+  }
+}
+```
+
+### ③ 有界重试（只重试可重试的，且尊重会话处置）
+
+```ts
+export async function withDbRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const err = e as { retryable?: boolean; sessionDisposition?: string };
+      last = e;
+      if (err.retryable !== true) throw e;                 // 语法错/约束错重试无意义
+      if (err.sessionDisposition === "close") throw e;      // 连接已废，重试也拿不到好连接
+      await tasks.sleep(50 * 2 ** i);                       // 退避
+    }
+  }
+  throw last;
+}
+```
+
+### ④ 验证
+
+```bash
+curl -X POST localhost:9778/v1/api/user/account/ -d '{"id":1,"name":"a"}'   # 首次 200
+curl -X POST localhost:9778/v1/api/user/account/ -d '{"id":1,"name":"a"}'   # 幂等路径：200（不 500）
+# 关掉数据库后再请求 → {"code":503,...}（不是笼统 500）；dev 日志里有 _sql 画像
+```
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 用 `e.message` 匹配错误类型 | 用 `e.code`；引擎原始码看 `e.data.vendor_code`（mysql 数字如 `1062`、pg SQLSTATE 串如 `"23505"`）。**未知厂商码不会瞎猜**，一律落 `OJ_DB_INTERNAL` |
+| 升级后 `^ffi db ` 匹配失效 | v0.1.88 去掉了宿主的重复前缀：`ffi db query: db query: <原文>` → `db query: <原文>`（`e.code` 等结构化字段不受影响） |
+| 以为 `e.data` 是 JSON 字符串 | 已解析为对象（`e.data.capability` 直接可用）；`e.retryable` 已是布尔 |
+| 无脑 `while(true)` 重试 | 先判 `e.retryable === true`；`sessionDisposition === "close"` 时重试只会继续打挂库 |
+| 新方言插件上构造器报 `OJ_DB_UNSUPPORTED` 就以为坏了 | 预期：宿主只为 sqlite/mysql/postgres 生成 SQL，其他方言上一期只有裸 SQL 路径；`e.data.capability` 会点名是哪个 API |

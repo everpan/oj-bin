@@ -1,6 +1,6 @@
 [package]
 name = "oj-db-postgres"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "db 轴 postgres cdylib 插件：sqlx Any 单方言（postgres）迁移自 core SqlxAccessor"
 

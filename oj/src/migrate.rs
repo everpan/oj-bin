@@ -339,6 +339,17 @@ fn dialect_tag(d: Dialect) -> &'static str {
     }
 }
 
+/// CLI 侧门控（T8）：未知方言 fail-loud 并点名方言，绝不回落 Sqlite。
+///
+/// 返回 builder-known 枚举供 `load_migrations` 用；**绝不调用 `acc.dialect()` 来取得它**
+/// ——FFI 适配层对未知方言是 panic（`ffi.rs` 的 fail-loud 兜底），CLI 必须在触碰之前
+/// 用 `dialect_info().name` 拦截，否则 `oj migrate` / release 启动校验会以 Rust panic
+/// 收场，而不是可读的 unsupported 文本。
+fn known_dialect_of(acc: &Arc<dyn DataAccessor>, op: &str) -> Result<Dialect, String> {
+    let name = acc.dialect_info().name.clone();
+    Dialect::known(&name).ok_or_else(|| only_js::bridge::db_error::unsupported(&name, op).message)
+}
+
 /// 单模块迁移：账本 `_oj_migrations`（module 列区分模块），abort_divergent/
 /// abort_missing=true、grouped=false（mysql DDL 隐式提交下 grouped 必裂）、
 /// Target 由调用方给（Latest=正常迁移；Fake=`--baseline` 全量记账不执行，Q5）。
@@ -348,6 +359,12 @@ pub async fn run_module(
     migrations: &[Migration],
     target: Target,
 ) -> Result<Report, String> {
+    // 门控（T8）：未知方言（不在 builder-known 子集）一律 fail-loud，错误文本点名方言，
+    // 绝不回落 Sqlite。复用 db_error::unsupported 构造器渲染文本。
+    let dialect_name = acc.dialect_info().name.clone();
+    if Dialect::known(&dialect_name).is_none() {
+        return Err(only_js::bridge::db_error::unsupported(&dialect_name, "migrate").message);
+    }
     let mut conn = OjConn {
         acc,
         module: module.to_string(),
@@ -417,7 +434,8 @@ pub async fn apply_module(
     mdir: &Path,
     baseline: bool,
 ) -> Result<Vec<AppliedInfo>, String> {
-    let migs = load_migrations(&mdir.join("migrations"), acc.dialect())?;
+    let dialect = known_dialect_of(acc, "migrate")?;
+    let migs = load_migrations(&mdir.join("migrations"), dialect)?;
     if migs.is_empty() {
         return Ok(Vec::new());
     }
@@ -451,7 +469,8 @@ pub async fn verify_module(
     module: &str,
     mdir: &Path,
 ) -> Result<(), String> {
-    let migs = load_migrations(&mdir.join("migrations"), acc.dialect())?;
+    let dialect = known_dialect_of(acc, "migrate")?;
+    let migs = load_migrations(&mdir.join("migrations"), dialect)?;
     if migs.is_empty() {
         return Ok(());
     }
@@ -601,6 +620,22 @@ mod tests {
             )
         })
         .collect()
+    }
+
+    /// T8：migrate 门控谓词 —— run_module 入口用 `Dialect::known(name).is_none()`
+    /// 判定未知方言并复用 `unsupported(name, "migrate")` 渲染 fail-loud 文本。跨 crate
+    /// 实现 `DataAccessor` 受 async_trait 展开限制，故在谓词层钉死门控语义（与
+    /// `only-js` 内 `require_known_dialect` 单测同源）；已知方言路径由 `fresh_apply_*` 覆盖。
+    #[test]
+    fn oracle_migrate_is_unsupported() {
+        let name = "oracle";
+        assert!(
+            Dialect::known(name).is_none(),
+            "oracle 必须在 known 子集之外"
+        );
+        let err = only_js::bridge::db_error::unsupported(name, "migrate").message;
+        assert!(err.contains("oracle"), "{err}");
+        assert!(err.contains("migrate"), "{err}");
     }
 
     /// spike 主验证：refinery 全链路（建账本 → apply → 幂等重跑 → 账本行齐）。

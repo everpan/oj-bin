@@ -37,6 +37,30 @@ fn exec_route_matrix() {
     }
 }
 
+/// 能力位**不能**替代本路由（评审 should-fix 的书面结论 + 守护）：
+/// `id_two_step` 是「取自增需要两条语句」的一般描述，sqlite 同样声明它，但 insert+returning
+/// 走 RETURNING 单语句；回取语句（`SELECT LAST_INSERT_ID()` / `last_insert_rowid()`）是
+/// 方言私有的，宿主无法从能力位推出。故 LastId 分支只能绑定已知方言名——本测试把
+/// 「caps.id == TwoStep」与「路由 == LastId」不是恒等式这件事钉死，防止有人按能力位重写。
+#[test]
+fn lastid_route_is_mysql_only_not_equivalent_to_id_two_step() {
+    let sqlite = crate::bridge::db::sqlite_dialect_info();
+    assert_eq!(
+        sqlite.caps.id,
+        crate::bridge::dialect_caps::IdStrategy::TwoStep,
+        "sqlite 仍声明 two_step（last_insert_rowid），前提变了要复核本测试"
+    );
+    assert_eq!(
+        exec_route(Verb::Insert, false, Dialect::Sqlite),
+        ExecRoute::Rows,
+        "声明 two_step ≠ 走 LastId：sqlite 有 RETURNING"
+    );
+    assert_eq!(
+        exec_route(Verb::Insert, false, Dialect::MySql),
+        ExecRoute::LastId
+    );
+}
+
 /// 相同条件三种方言的占位符风格：sqlite/mysql 用 `?`，postgres 用 `$1`（builder 职责）。
 #[test]
 fn placeholder_per_dialect() {

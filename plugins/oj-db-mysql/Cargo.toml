@@ -1,6 +1,6 @@
 [package]
 name = "oj-db-mysql"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "db 轴 mysql cdylib 插件：sqlx Any 单方言（mysql）迁移自 core SqlxAccessor"
 

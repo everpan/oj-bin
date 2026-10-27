@@ -262,6 +262,47 @@ steps:
 
 ---
 
+## 真库套件（env-gated，M1 起必跑）
+
+> **M1 起硬约束：方言路径的真库用例（`plugins/oj-db-mysql` / `plugins/oj-db-postgres` 内
+> `OJ_TEST_MYSQL` / `OJ_TEST_PG` env-gated 用例）是验收必跑项；env 未设 = 该插件套件不算绿。**
+> 默认 `cargo test --workspace` 下这些用例静默跳过——**跳过 ≠ 通过**，发版前必须显式拉起真库。
+
+### 起服务（docker compose）
+
+根 `docker-compose.yml` 已增补 `test-mysql` / `test-postgres` 两个服务（不参与演示部署，
+仅供测试）：
+
+```bash
+docker compose up -d test-mysql test-postgres
+```
+
+| 服务 | 端口 | 账号 / 库 |
+|---|---|---|
+| `test-mysql` | 3306 | `root` / `root`，库 `ojtest` |
+| `test-postgres` | 5432 | `postgres` / `postgres`，库 `ojtest` |
+
+### 约定 env 变量
+
+```bash
+export OJ_TEST_MYSQL='mysql://root:root@127.0.0.1:3306/ojtest'
+export OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest'
+```
+
+### 必跑命令（验收口径）
+
+```bash
+OJ_TEST_MYSQL='mysql://root:root@127.0.0.1:3306/ojtest' \
+  cargo test --release -p oj-db-mysql
+OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' \
+  cargo test --release -p oj-db-postgres
+```
+
+- env 已设 → 真库用例执行，输出**无** db 相关 `skipped` 计数；
+- env 未设 → 维持现状跳过（本约定不改插件代码，仅明确「未设不算绿」）。
+
+---
+
 ## 依赖管理
 
 - L2 的 `vitest` 与 `typescript`（typecheck 用）声明在 **`sample/unit/package.json` 的

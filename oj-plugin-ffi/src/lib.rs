@@ -84,7 +84,10 @@ pub struct GenericVtable {
 ///     服务端流式 multipart/PUT 直传落盘。v0.1.38）。
 /// 11 = blob 搬运与区间读起（BlobBackendVtable 增 copy / move_to / read_range 三槽——
 ///     服务端复制与搬移让大文件不进 V8；区间读让嗅探/lazy 读只读样本字节。v0.1.47）。
-pub const ABI_VERSION: u32 = 11;
+/// 12 = 数据库方言能力模型起（DataAccessorVtable 增工厂级 `describe()` 槽——返回
+///      `{dialect, capabilities}` JSON；结构化错误信封经 db 轴 Err(RString) 载荷升级；
+///     未知方言不再回落 Sqlite。宿主 + 插件同产物重编发布。M1，v0.1.88）。
+pub const ABI_VERSION: u32 = 12;
 
 /// 构建指纹：rustc 版本 + oj-plugin-ffi 版本 + target triple（诊断用，不匹配仅告警）。
 pub const HOST_FINGERPRINT: &str = concat!(

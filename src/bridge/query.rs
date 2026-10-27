@@ -21,7 +21,7 @@ use sea_query::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::db::Dialect;
+use super::db::{Dialect, require_known_dialect};
 use super::registry::{SchemaRegistry, TableDef};
 use super::{BridgeResult, DataAccessor, StableState};
 
@@ -2187,23 +2187,20 @@ enum Exec<'a> {
 }
 
 impl Exec<'_> {
-    async fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>, String> {
+    /// 错误保持 `BridgeResult`（`Box<dyn Error>`）形态，**不得**在此 `to_string()` 压平：
+    /// 压平会丢掉 ffi 侧的结构化信封（code/data/category/retryable），builder 路径
+    /// 就退化成 generic 文案（T12 审查 blocker）。
+    async fn query(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Value>> {
         match self {
-            Exec::Pool(da) => da
-                .query_with_params(sql, params)
-                .await
-                .map_err(|e| e.to_string()),
-            Exec::Tx(s) => s.query(sql, params).await.map_err(|e| e.to_string()),
+            Exec::Pool(da) => da.query_with_params(sql, params).await,
+            Exec::Tx(s) => s.query(sql, params).await,
         }
     }
 
-    async fn exec(&self, sql: &str, params: &[Value]) -> Result<i64, String> {
+    async fn exec(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
         match self {
-            Exec::Pool(da) => da
-                .exec_with_params(sql, params)
-                .await
-                .map_err(|e| e.to_string()),
-            Exec::Tx(s) => s.exec(sql, params).await.map_err(|e| e.to_string()),
+            Exec::Pool(da) => da.exec_with_params(sql, params).await,
+            Exec::Tx(s) => s.exec(sql, params).await,
         }
     }
 }
@@ -2213,6 +2210,11 @@ impl Exec<'_> {
 /// 其余 DML → 受影响行数。**只有 insert+returning 才能进 LastId**——历史上曾用
 /// `rows && dialect == MySql` 判定，把构造器 SELECT（也是行集）误路由进两步
 /// 分支，`returning[0]` 越界 panic（v0.1.66 修复）。
+///
+/// 为什么不能改成按 `caps.id` 路由：`id_two_step` 只说明「取自增需要两条语句」，
+/// **回取语句是后端方言私有的**（mysql `SELECT LAST_INSERT_ID()`、sqlite
+/// `last_insert_rowid()`），不能由宿主从能力位推出。故 LastId 分支必须绑定到
+/// 已知方言；`exec_route_matches_known_dialect_caps` 是对应守护（能力位改口径时它会红）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecRoute {
     Rows,
@@ -2250,11 +2252,13 @@ pub async fn op_db_query_build(
     // LIMIT 归一化（v0.1.20，db_query: 段）：顶层 select 未给 limit → 补 default_limit；
     // 显式 limit → clamp 到 max_limit。返回值用于截断可观测。
     let applied = normalize_limit(&state, &mut req);
-    let dialect = lookup(&state, &req.db)?.dialect();
+    // 门控（T8）：未知方言（不在 builder-known 子集）一律结构化 unsupported，绝不回落 Sqlite。
+    let da = lookup(&state, &req.db)?;
+    let dialect = require_known_dialect(da.dialect_info(), "query_build")?;
     let (sql, params) = build_statement(&req, &reg, dialect)?;
     // 执行路由：行集 / mysql 两步取自增 id / 受影响行数（判定见 ExecRoute）。
     let route = exec_route(req.verb, req.returning.is_empty(), dialect);
-    let err = |e: String| JsErrorBox::generic(e);
+    let err = |e: Box<dyn std::error::Error + Send + Sync>| super::db::to_js_err(e);
 
     // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
     let target = super::db::resolve_target(&state, &req.db)?;
@@ -2279,11 +2283,16 @@ pub async fn op_db_query_build(
                     Some(r.len() as i64),
                     true,
                     None,
+                    None,
+                    None,
                 );
                 Ok(Value::Array(r))
             }
             Err(e) => {
                 let em = e.to_string();
+                // 结构化错误（来自 FFI 信封）必须原样带到 JS：code/data 经 to_js_err 还原，
+                // category/retryable 同时落 SQL 画像（T12 在 builder 路径的对应半边）。
+                let (cat, retry) = super::db::err_meta_of(e.as_ref());
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state,
@@ -2294,16 +2303,20 @@ pub async fn op_db_query_build(
                     ms,
                     None,
                     false,
-                    Some(em.clone()),
+                    Some(em),
+                    cat,
+                    retry,
                 );
-                Err(JsErrorBox::generic(em))
+                Err(super::db::to_js_err(e))
             }
         }
     } else if route == ExecRoute::LastId {
         match ex.exec(&sql, &params).await {
             Ok(_) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
-                super::db::trace_sql(&state, &sql, &params, &db_name, in_tx, ms, None, true, None);
+                super::db::trace_sql(
+                    &state, &sql, &params, &db_name, in_tx, ms, None, true, None, None, None,
+                );
                 // mysql 无 RETURNING：再发一次 LAST_INSERT_ID 取回自增主键。
                 let r = ex
                     .query("SELECT LAST_INSERT_ID() AS id", &[])
@@ -2320,6 +2333,8 @@ pub async fn op_db_query_build(
                     Some(r.len() as i64),
                     true,
                     None,
+                    None,
+                    None,
                 );
                 let v = r
                     .first()
@@ -2332,6 +2347,9 @@ pub async fn op_db_query_build(
             }
             Err(e) => {
                 let em = e.to_string();
+                // 结构化错误（来自 FFI 信封）必须原样带到 JS：code/data 经 to_js_err 还原，
+                // category/retryable 同时落 SQL 画像（T12 在 builder 路径的对应半边）。
+                let (cat, retry) = super::db::err_meta_of(e.as_ref());
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state,
@@ -2342,9 +2360,11 @@ pub async fn op_db_query_build(
                     ms,
                     None,
                     false,
-                    Some(em.clone()),
+                    Some(em),
+                    cat,
+                    retry,
                 );
-                Err(JsErrorBox::generic(em))
+                Err(super::db::to_js_err(e))
             }
         }
     } else {
@@ -2361,11 +2381,16 @@ pub async fn op_db_query_build(
                     Some(n),
                     true,
                     None,
+                    None,
+                    None,
                 );
                 Ok(Value::from(n))
             }
             Err(e) => {
                 let em = e.to_string();
+                // 结构化错误（来自 FFI 信封）必须原样带到 JS：code/data 经 to_js_err 还原，
+                // category/retryable 同时落 SQL 画像（T12 在 builder 路径的对应半边）。
+                let (cat, retry) = super::db::err_meta_of(e.as_ref());
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state,
@@ -2376,9 +2401,11 @@ pub async fn op_db_query_build(
                     ms,
                     None,
                     false,
-                    Some(em.clone()),
+                    Some(em),
+                    cat,
+                    retry,
                 );
-                Err(JsErrorBox::generic(em))
+                Err(super::db::to_js_err(e))
             }
         }
     };
@@ -2438,7 +2465,10 @@ pub fn op_db_query_sql(
     apply_tenant_guard(&state, &mut req, &reg)?;
     // 与执行路径同款归一化 —— toSQL 必须反映真实 SQL（含隐式 LIMIT）。
     let _ = normalize_limit(&state, &mut req);
-    let (sql, params) = build_statement(&req, &reg, lookup(&state, &req.db)?.dialect())?;
+    // 门控（T8）：toSQL 同样属 oj 生成 SQL 路径，未知方言不回落 Sqlite。
+    let da = lookup(&state, &req.db)?;
+    let dialect = require_known_dialect(da.dialect_info(), "query_sql")?;
+    let (sql, params) = build_statement(&req, &reg, dialect)?;
     // 出口护栏（见 jsnum）：`toSQL().params` 里的大整数同样会以 BigInt 交给 JS（json.ok 会 500）。
     let mut out = serde_json::json!({ "sql": sql, "params": params });
     super::jsnum::sanitize_js_numbers(&mut out);

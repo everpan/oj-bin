@@ -5,7 +5,7 @@
 `kv` / `blob` / `bus` / `es` / `fetch` / `log` / `ws` / `plugins` / `cert` / `jwt` /
 `bcrypt` / `crypto` / `finish`）。Rust 侧捕获统一的 `{code,msg,data}` 信封（即统一响应外壳），
 由 HTTP 服务写回。数据库、KV、对象存储、事件总线、ES 等后端能力在启动时作为 **cdylib 插件**
-通过 C-ABI FFI 契约（`oj-plugin-ffi`，ABI 11）加载。
+通过 C-ABI FFI 契约（`oj-plugin-ffi`，ABI 12）加载。
 
 这份文档写给**要改 oj 本身**的人（框架开发者）。只想用 oj 写业务接口的，去读
 [user-manual.md](user-manual.md)。
@@ -174,7 +174,7 @@ serve/                 # crate: serve（axum HTTP 层）
 ├── actor.rs          # JsActor：线程化执行、Send bridge 工厂
 ├── certificate.rs    # 证书验签与状态判定（valid/grace/expired）
 └── ws.rs             # WebSocket：闸门 + js_route/mirror_routes + frame_loop（帧池连接侧）
-oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=11）
+oj-plugin-ffi/        # crate: FFI 契约（宿主与插件唯一共享；repr(C) 类型 + ABI_VERSION=12）
 plugins/              # 10 个 cdylib 插件：oj-es、oj-db-mysql、oj-db-postgres、oj-blob-s3、
                       #   oj-bus-kafka、oj-bus-rabbitmq、oj-kv-redis、oj-auth、oj-mail、oj-ldap
 tools/xtask/          # crate: cargo xtask bin/plugin/build 构建 + 归置到 bin/
@@ -269,7 +269,7 @@ JS 全局对象速查（以 `src/bridge/bootstrap.js` 挂载为准；完整签�
 | `oidc.sign/verify/jwks` + `oidc.issuer/rp/clients` | RS256 JWS 原语 + 装配期配置 | `oidc:` 段启用；私钥留在 Rust（`src/bridge/oidc.rs`） |
 | `crypto.sha256Hex / randomHex / getRandomValues` + 全局 `atob/btoa` | 摘要与随机数；wasm 胶水面（v0.1.30） | `getRandomValues` 为 oj 实现（原生不存在）：TypedArray view、≤65536 字节/次 |
 | `ws.send/close` + `ws.join/leave/broadcast/roomSize` | WS 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）；房间原语（v0.1.30） | 仅 WS 连接内有意义；broadcast 除己语义，跨实例扇出走 bus |
-| `plugins()` | 已装配插件自省 | 同源 `GET {base}/plugins` |
+| `plugins()` | 已装配插件自省 | 同源 `GET {base}/plugins`；db 轴插件另有 `caps`（方言能力位，v0.1.88） |
 | `finish()` | 标记会话完成但不写响应 | 少用 |
 
 另有 `__ojRequire(name, referrerPath)`（CJS 互操作，模块加载器内部使用，业务代码不直接调）。
@@ -842,7 +842,7 @@ rm -rf target/llvm-cov-target target/debug
 profile）。适配器层 `FfiXxxBackend` 把插件 vtable 包装成 core trait 供 op 消费（构造放
 core，装配层只经安全入口）。
 
-**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 11，**严格相等**门禁）、`PluginDescriptor
+**契约**（`oj-plugin-ffi`）：`ABI_VERSION`（当前 12，**严格相等**门禁）、`PluginDescriptor
 {name, semver, abi_version, fingerprint, desc}`、各轴 repr(C) vtable（es/db/blob/bus/kv/auth）、
 `HostContext`（log + deliver 回调）。`oj_plugin_entry!(init, kv => &VT)` 生成
 `oj_plugin_abi_version()`、`oj_plugin_init()` 与每轴一个 `oj_plugin_axis_<name>` 符号
@@ -869,7 +869,12 @@ core，装配层只经安全入口）。
   `axis("name").op(...)`。
 - 门禁：`ABI_VERSION` 严格相等唯一硬门禁；指纹不符仅告警。`op_plugins` / JS `plugins()` /
   公共端点 `GET {base}/plugins` 输出插件名/semver/ABI/指纹/**自描述 desc** + 宿主
-  ABI_VERSION（升级核对窗口）。
+  ABI_VERSION（升级核对窗口）；db 轴插件另有 `caps`（`{dialect, capabilities[]}`，与插件
+  `describe()` 同词汇）。
+- 清单锁（v0.1.88）：`cargo xtask build` 末尾写 `bin/plugins/<triple>/plugins.lock.json`
+  （`[{name, abi, fingerprint}]`）。扫描装配时，目录里出现锁未登记的库文件 → **拒载并点名**
+  （增量覆盖残留旧插件的典型症状）；锁内条目在目录中缺失、或 abi/fingerprint 与实物不符 →
+  stderr 告警（整体拷贝不完整的信号）。`cargo xtask plugin <name>` 只拷单库、**不刷新锁**。
 
 **各轴接线**（serve_cmd `build_registries`）：
 

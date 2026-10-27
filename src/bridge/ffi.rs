@@ -119,6 +119,10 @@ pub(crate) fn workspace_root() -> PathBuf {
 // ---- core 侧适配器层（spec §3）：每轴一个 FfiXxxBackend，插件永不直接产 dyn Trait 跨界 ----
 
 use crate::bridge::db::{DataAccessor, Dialect, Row, TxSession};
+use crate::bridge::db_error::{
+    BridgeError, DbErrorCategory, SessionDisposition, parse_raw, unsupported,
+};
+use crate::bridge::dialect_caps::DialectInfo;
 use crate::bridge::{
     BlobBackend, BlobServed, BridgeResult, BusBackend, BusPayload, DbBackend, EsBackend,
     EventBroker, KVStore, WsSend,
@@ -331,11 +335,17 @@ pub struct FfiDbBackend {
     name: String,
     schemes: Vec<String>,
     vtable: &'static DataAccessorVtable,
+    /// 装配期一次解析的能力闭集（T5：描述符冻结，运行期纯查表）。
+    dialect_info: DialectInfo,
 }
 
 impl FfiDbBackend {
-    /// 构造即调 vtable.schemes() 读认领列表（装配期一次）。
-    pub fn new(name: impl Into<String>, vtable: &'static DataAccessorVtable) -> Self {
+    /// 构造即调 vtable.schemes() / describe() 读认领列表与能力（装配期一次）。
+    pub fn new(
+        name: impl Into<String>,
+        vtable: &'static DataAccessorVtable,
+        dialect_info: DialectInfo,
+    ) -> Self {
         let schemes: Vec<String> = (vtable.schemes)()
             .iter()
             .map(|s| s[..].to_string())
@@ -344,6 +354,7 @@ impl FfiDbBackend {
             name: name.into(),
             schemes,
             vtable,
+            dialect_info,
         }
     }
 }
@@ -358,13 +369,30 @@ impl DbBackend for FfiDbBackend {
     }
     async fn connect(&self, dsn: &str, _config_dir: &Path) -> BridgeResult<Arc<dyn DataAccessor>> {
         let fut = (self.vtable.connect)(RString::from(dsn));
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db connect", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         let handle = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| ffi_err("db connect decode", e))?
             .get("handle")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| ffi_err("db connect", "missing handle"))?;
-        Ok(Arc::new(FfiDataAccessor::new(handle, self.vtable)))
+        // 连接级一致性校验（T5）：describe().dialect 必须与插件运行时 dialect(handle) 一致，
+        // 不一致 fail-fast 拒绝该连接（与 scheme 冲突同风格）。
+        let runtime_dialect = (self.vtable.dialect)(handle);
+        if runtime_dialect[..] != self.dialect_info.name {
+            return Err(ffi_err(
+                "db connect",
+                format!(
+                    "dialect mismatch: describe()=\"{}\" but dialect(handle)=\"{}\"",
+                    self.dialect_info.name,
+                    &runtime_dialect[..]
+                ),
+            ));
+        }
+        Ok(Arc::new(FfiDataAccessor::new(
+            handle,
+            self.vtable,
+            self.dialect_info.clone(),
+        )))
     }
 }
 
@@ -372,22 +400,17 @@ impl DbBackend for FfiDbBackend {
 pub struct FfiDataAccessor {
     handle: u64,
     vtable: &'static DataAccessorVtable,
-    /// 方言（0.1.67 构造期缓存）：方言是连接的静态属性，免得每条 SQL 一次 vtable 往返
-    /// （op 层占位符统一改写每次都要读方言；做法对齐 FfiDbBackend 构造期读 schemes）。
-    dialect: Dialect,
+    /// 方言描述符（装配期经工厂 describe() 冻结，T5：不再 per-connect 派生，删除 Sqlite 兜底）。
+    info: DialectInfo,
 }
 
 impl FfiDataAccessor {
-    pub fn new(handle: u64, vtable: &'static DataAccessorVtable) -> Self {
-        let dialect = match &(vtable.dialect)(handle)[..] {
-            "mysql" => Dialect::MySql,
-            "postgres" => Dialect::Postgres,
-            _ => Dialect::Sqlite,
-        };
+    /// 由工厂携带的 `DialectInfo` 构造（describe() 已解析过，运行期纯查表）。
+    pub fn new(handle: u64, vtable: &'static DataAccessorVtable, info: DialectInfo) -> Self {
         Self {
             handle,
             vtable,
-            dialect,
+            info,
         }
     }
 }
@@ -403,18 +426,34 @@ fn params_json(
 #[async_trait::async_trait]
 impl DataAccessor for FfiDataAccessor {
     fn dialect(&self) -> Dialect {
-        self.dialect
+        // 描述符名 → known 子集。未知方言必须由上层门控点（T8）先行拦截，
+        // 此处不再静默回落 Sqlite；若出现未知方言说明门控遗漏，直接 fail-loud。
+        Dialect::known(&self.info.name).unwrap_or_else(|| {
+            panic!(
+                "dialect '{}' 不在 builder-known 子集；必须先在门控点拦截，不可回落 Sqlite",
+                self.info.name
+            )
+        })
+    }
+
+    fn dialect_info(&self) -> &DialectInfo {
+        &self.info
     }
 
     async fn begin(&self) -> BridgeResult<Box<dyn TxSession>> {
         let fut = (self.vtable.begin)(self.handle);
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db begin", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         let tx_id = serde_json::from_slice::<serde_json::Value>(&bytes)
             .map_err(|e| ffi_err("db begin decode", e))?
             .get("tx_id")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| ffi_err("db begin", "missing tx_id"))?;
-        Ok(Box::new(FfiTxSession::new(self.handle, tx_id, self.vtable)))
+        Ok(Box::new(FfiTxSession::new(
+            self.handle,
+            tx_id,
+            self.vtable,
+            self.info.clone(),
+        )))
     }
 
     async fn query_with_params(
@@ -424,15 +463,47 @@ impl DataAccessor for FfiDataAccessor {
     ) -> BridgeResult<Vec<Row>> {
         let p = params_json(params)?;
         let fut = (self.vtable.query)(self.handle, RString::from(sql), p);
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db query", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db query decode", e))
     }
 
     async fn exec_with_params(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<i64> {
         let p = params_json(params)?;
         let fut = (self.vtable.exec)(self.handle, RString::from(sql), p);
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db exec", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db exec decode", e))
+    }
+
+    /// 协作式取消：转发到 vtable `stream_cancel`。能力矩阵（T10）：
+    /// - 声明 cancel 却返回 unsupported → 契约违反，fail-loud（不让调用方误以为已取消）。
+    /// - 未声明 cancel 但插件确实提供了取消 → 采信 + warn（best-effort 取消本就允许静默成功）。
+    async fn cancel(&self, stream_id: u64) -> BridgeResult<()> {
+        let fut = (self.vtable.stream_cancel)(self.handle, stream_id);
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
+        // 空体是「已取消/无需载荷」的合法回执（mysql/pg 插件即返回 `Ok(b"")`）——
+        // 不能当解码错误，否则「声明 cancel + 提供 cancel」象限永远失败。
+        let v: serde_json::Value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).map_err(|e| ffi_err("db stream_cancel decode", e))?
+        };
+        if v.get("unsupported")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
+        {
+            if self.info.caps.cancel {
+                return Err(unsupported(&self.info.name, "cancel").into());
+            }
+            return Ok(());
+        }
+        if !self.info.caps.cancel {
+            tracing::warn!(
+                target: "db",
+                backend = %self.info.name,
+                "cancel provided but capability 'cancel' not declared in describe(); accepting (add \"cancel\")"
+            );
+        }
+        Ok(())
     }
 
     /// ABI 10 流式：经 vtable `stream_open/next` 批量 pull（≤100 行/次）。
@@ -449,19 +520,31 @@ impl DataAccessor for FfiDataAccessor {
     ) -> BridgeResult<Pin<Box<dyn Stream<Item = Result<Row, String>> + Send>>> {
         let p = params_json(params)?;
         let fut = (self.vtable.stream_open)(self.handle, RString::from(sql), p);
-        let bytes = await_ffi(fut)
-            .await
-            .map_err(|e| ffi_err("db stream_open", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| ffi_err("db stream_open decode", e))?;
         if v.get("unsupported")
             .and_then(|b| b.as_bool())
             .unwrap_or(false)
         {
+            // 能力一致性矩阵（T10）：
+            // - 声明 stream 却返回 unsupported → 契约违反，op 级 unsupported（不回退 fetch_all）。
+            // - 未声明 stream → 标准兜底 fetch_all（保留既有行为，兼容旧插件）。
+            if self.info.caps.stream {
+                return Err(unsupported(&self.info.name, "stream").into());
+            }
             let rows = self.query_with_params(sql, params).await?;
             return Ok(Box::pin(futures::stream::iter(
                 rows.into_iter().map(Ok::<Row, String>),
             )));
+        }
+        // 插件实际提供了流：未声明能力 → 采信 + warn（插件能力超出声明，容忍但点名）。
+        if !self.info.caps.stream {
+            tracing::warn!(
+                target: "db",
+                backend = %self.info.name,
+                "streaming provided but capability 'stream' not declared in describe(); accepting (add \"stream\")"
+            );
         }
         let stream_id = v
             .get("stream_id")
@@ -492,8 +575,23 @@ impl DataAccessor for FfiDataAccessor {
                                 break;
                             }
                         };
-                        if let Some(e) = env.get("error").and_then(|x| x.as_str()) {
-                            yield Err(e.to_string());
+                        if let Some(err) = env.get("error") {
+                            // 设计 §5.1：stream_next 的 error 字段与 db 轴错误信封同构。
+                            // 插件可给信封对象 / 信封 JSON 串 / legacy 纯文本，一律经
+                            // parse_raw 归一；交给上游的是 **message 原文**（不再拼
+                            // `ffi <ctx>: ` 前缀，也不把 JSON 塞进用户可见文本）。
+                            let be = match err {
+                                serde_json::Value::String(s) if s == "cancelled" => BridgeError {
+                                    category: DbErrorCategory::Cancelled,
+                                    retryable: false,
+                                    session_disposition: SessionDisposition::Keep,
+                                    message: "cancelled".to_string(),
+                                    data: Default::default(),
+                                },
+                                serde_json::Value::String(s) => parse_raw(s),
+                                other => parse_raw(&other.to_string()),
+                            };
+                            yield Err(be.message);
                             break;
                         }
                         if env.get("done").and_then(|x| x.as_bool()).unwrap_or(false) {
@@ -548,51 +646,57 @@ pub struct FfiTxSession {
     tx_id: u64,
     vtable: &'static DataAccessorVtable,
     finished: AtomicBool,
+    /// 事务级方言描述符（begin 时从 accessor 完整快照；in-tx 改写/exec 据此查表）。
+    info: DialectInfo,
 }
 
 impl FfiTxSession {
-    fn new(handle: u64, tx_id: u64, vtable: &'static DataAccessorVtable) -> Self {
+    fn new(
+        handle: u64,
+        tx_id: u64,
+        vtable: &'static DataAccessorVtable,
+        info: DialectInfo,
+    ) -> Self {
         Self {
             handle,
             tx_id,
             vtable,
             finished: AtomicBool::new(false),
+            info,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl TxSession for FfiTxSession {
+    fn dialect_info(&self) -> &DialectInfo {
+        &self.info
+    }
+
     async fn query(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<Vec<Row>> {
         let p = params_json(params)?;
         let fut = (self.vtable.tx_query)(self.handle, self.tx_id, RString::from(sql), p);
-        let bytes = await_ffi(fut)
-            .await
-            .map_err(|e| ffi_err("db tx_query", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db tx_query decode", e))
     }
 
     async fn exec(&self, sql: &str, params: &[serde_json::Value]) -> BridgeResult<i64> {
         let p = params_json(params)?;
         let fut = (self.vtable.tx_exec)(self.handle, self.tx_id, RString::from(sql), p);
-        let bytes = await_ffi(fut).await.map_err(|e| ffi_err("db tx_exec", e))?;
+        let bytes = await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         serde_json::from_slice(&bytes).map_err(|e| ffi_err("db tx_exec decode", e))
     }
 
     async fn commit(&self) -> BridgeResult<()> {
         let fut = (self.vtable.tx_commit)(self.handle, self.tx_id);
-        await_ffi(fut)
-            .await
-            .map_err(|e| ffi_err("db tx_commit", e))?;
+        await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn rollback(&self) -> BridgeResult<()> {
         let fut = (self.vtable.tx_rollback)(self.handle, self.tx_id);
-        await_ffi(fut)
-            .await
-            .map_err(|e| ffi_err("db tx_rollback", e))?;
+        await_ffi(fut).await.map_err(|e| Box::new(parse_raw(&e)))?;
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1088,6 +1192,7 @@ impl Drop for FfiKVStore {
 #[allow(clippy::await_holding_lock)]
 mod adapter_tests {
     use super::*;
+    use async_trait::async_trait;
     use oj_plugin_ffi::{RBytes, ready_err, ready_ok};
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1296,19 +1401,31 @@ mod adapter_tests {
     /// vtable 自报方言：0=postgres；1=mysql；2=未知方言。
     static DB_DIALECT_MODE: Mutex<u8> = Mutex::new(0);
 
-    /// DB_CALL_MODE 驱动的 query 类返回体。
-    fn db_call_result(ok: &[u8]) -> FfiFuture {
+    /// DB_CALL_MODE 驱动的 query 类返回体。`stage` 进信封 message（宿主 parse_raw 单点解析，
+    /// 既保留阶段名又结构化为 BridgeError——T11 起插件 Err 载荷恒为信封）。
+    fn db_call_result(stage: &str, ok: &[u8]) -> FfiFuture {
         match *DB_CALL_MODE.lock().unwrap() {
-            1 => ready(Err("call down".into())),
+            1 => ready(Err(format!(
+                r#"{{"category":"internal","retryable":false,"session_disposition":"keep","message":"{}: call down","data":{{}}}}"#,
+                stage
+            ))),
             2 => ready(Ok(b"gibberish".to_vec())),
             _ => ready(Ok(ok.to_vec())),
         }
     }
 
+    /// 阶段化错误信封（mock 用）：message = "stage: msg"，经 ffi.rs 的 parse_raw 单点解析为 BridgeError。
+    fn stage_err(stage: &str, msg: &str) -> String {
+        format!(
+            r#"{{"category":"internal","retryable":false,"session_disposition":"keep","message":"{}: {}","data":{{}}}}"#,
+            stage, msg
+        )
+    }
+
     extern "C" fn mock_db_connect(cfg: RString) -> FfiFuture {
         *DB_CONNECTED_CFG.lock().unwrap() = cfg[..].to_string();
         match *DB_CONNECT_MODE.lock().unwrap() {
-            1 => ready(Err("db down".into())),
+            1 => ready(Err(stage_err("db connect", "db down"))),
             2 => ready(Ok(b"gibberish".to_vec())),
             3 => ready(Ok(br#"{}"#.to_vec())),
             _ => ready(Ok(br#"{"handle":42}"#.to_vec())),
@@ -1316,14 +1433,14 @@ mod adapter_tests {
     }
     extern "C" fn mock_db_query(handle: u64, sql: RString, params: RString) -> FfiFuture {
         *DB_QUERY.lock().unwrap() = (handle, sql[..].to_string(), params[..].to_string());
-        db_call_result(br#"[{"c":1,"t":"a"}]"#)
+        db_call_result("db query", br#"[{"c":1,"t":"a"}]"#)
     }
     extern "C" fn mock_db_exec(_h: u64, _s: RString, _p: RString) -> FfiFuture {
-        db_call_result(br#"3"#)
+        db_call_result("db exec", br#"3"#)
     }
     extern "C" fn mock_db_begin(_handle: u64) -> FfiFuture {
         match *DB_BEGIN_MODE.lock().unwrap() {
-            1 => ready(Err("begin down".into())),
+            1 => ready(Err(stage_err("db begin", "begin down"))),
             2 => ready(Ok(b"gibberish".to_vec())),
             3 => ready(Ok(br#"{}"#.to_vec())),
             _ => ready(Ok(br#"{"tx_id":7}"#.to_vec())),
@@ -1336,32 +1453,35 @@ mod adapter_tests {
         params: RString,
     ) -> FfiFuture {
         *DB_TX_QUERY.lock().unwrap() = (handle, tx_id, sql[..].to_string(), params[..].to_string());
-        db_call_result(br#"[{"c":9}]"#)
+        db_call_result("db tx_query", br#"[{"c":9}]"#)
     }
     extern "C" fn mock_db_tx_exec(_h: u64, _t: u64, _s: RString, _p: RString) -> FfiFuture {
-        db_call_result(br#"1"#)
+        db_call_result("db tx_exec", br#"1"#)
     }
     extern "C" fn mock_db_tx_commit(_h: u64, tx_id: u64) -> FfiFuture {
         DB_COMMITTED.store(tx_id, AtomicOrdering::SeqCst);
         if *DB_TX_END_MODE.lock().unwrap() == 1 {
-            return ready(Err("commit down".into()));
+            return ready(Err(stage_err("db tx_commit", "commit down")));
         }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_db_tx_rollback(_h: u64, tx_id: u64) -> FfiFuture {
         DB_ROLLED_BACK.store(tx_id, AtomicOrdering::SeqCst);
         if *DB_TX_END_MODE.lock().unwrap() == 1 {
-            return ready(Err("rollback down".into()));
+            return ready(Err(stage_err("db tx_rollback", "rollback down")));
         }
         ready(Ok(b"".to_vec()))
     }
     extern "C" fn mock_db_dialect(_handle: u64) -> RString {
+        DB_DIALECT_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
         RString::from(match *DB_DIALECT_MODE.lock().unwrap() {
             1 => "mysql",
             2 => "weirddb",
             _ => "postgres",
         })
     }
+    /// dialect(handle) 调用计数（T5：验证 FfiDataAccessor::new 不再 per-connect 派生方言）。
+    static DB_DIALECT_CALLS: AtomicU64 = AtomicU64::new(0);
     extern "C" fn mock_db_close(handle: u64) {
         DB_CLOSED.store(handle, AtomicOrdering::SeqCst);
     }
@@ -1370,6 +1490,15 @@ mod adapter_tests {
         v.push(RString::from("mysql://"));
         v.push(RString::from("mariadb://"));
         v
+    }
+    extern "C" fn mock_db_describe() -> RString {
+        // 与 mock_db_dialect 默认（postgres）一致；DB_DIALECT_MODE 仅测连接级校验用。
+        RString::from(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning","stream","cancel"]}"#,
+        )
+    }
+    fn mock_dialect_info() -> crate::bridge::dialect_caps::DialectInfo {
+        crate::bridge::dialect_caps::caps_from_json(&mock_db_describe()[..]).unwrap()
     }
 
     // ---- db 流式 mock（ABI 10）：MODE 0=unsupported（回落 fetch_all）；1=真游标 ----
@@ -1394,9 +1523,16 @@ mod adapter_tests {
             _ => ready(Ok(br#"{"done":true}"#.to_vec())),
         }
     }
+    // cancel 行为开关：0 = 返回 unsupported 哨兵；其它 = 正常取消（空对象）。
+    static DB_CANCEL_MODE: Mutex<u8> = Mutex::new(1);
     extern "C" fn mock_db_stream_cancel(_h: u64, _sid: u64) -> FfiFuture {
         DB_STREAM_CANCELLED.fetch_add(1, AtomicOrdering::SeqCst);
-        ready(Ok(b"".to_vec()))
+        match *DB_CANCEL_MODE.lock().unwrap() {
+            0 => ready(Ok(br#"{"unsupported":true}"#.to_vec())),
+            // 2 = 真插件形态：取消成功且无载荷（空体）。宿主不得当成解码失败。
+            2 => ready(Ok(Vec::new())),
+            _ => ready(Ok(b"{}".to_vec())),
+        }
     }
     extern "C" fn mock_db_stream_close(_h: u64, _sid: u64) -> FfiFuture {
         DB_STREAM_CLOSED.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1420,13 +1556,14 @@ mod adapter_tests {
             stream_next: mock_db_stream_next,
             stream_cancel: mock_db_stream_cancel,
             stream_close: mock_db_stream_close,
+            describe: mock_db_describe,
         }))
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn db_backend_schemes_and_connect_dispatch() {
         let _g = T_LOCK.lock().unwrap();
-        let be = FfiDbBackend::new("db-mysql", mock_db_vtable());
+        let be = FfiDbBackend::new("db-mysql", mock_db_vtable(), mock_dialect_info());
         assert_eq!(be.name(), "db-mysql");
         assert_eq!(be.schemes(), vec!["mysql://", "mariadb://"]);
         let da = be
@@ -1441,10 +1578,54 @@ mod adapter_tests {
         );
     }
 
+    // T5：FfiDataAccessor::new 不再 per-connect 调 dialect(handle)（方言来自装配期冻结的描述符）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_accessor_new_does_not_call_dialect() {
+        let _g = T_LOCK.lock().unwrap();
+        let before = DB_DIALECT_CALLS.load(AtomicOrdering::SeqCst);
+        let _da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
+        assert_eq!(
+            DB_DIALECT_CALLS.load(AtomicOrdering::SeqCst),
+            before,
+            "FfiDataAccessor::new must not call dialect(handle); descriptor is factory-cached"
+        );
+    }
+
+    // T6：两层模型 —— FfiDataAccessor.dialect_info() 返回装配期注入的描述符（运行期纯查表）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ffi_data_accessor_dialect_info_returns_injected() {
+        let _g = T_LOCK.lock().unwrap();
+        let info = crate::bridge::dialect_caps::caps_from_json(
+            r#"{"dialect":"mysql","capabilities":["placeholder_q","id_two_step","stream","cancel"]}"#,
+        )
+        .unwrap();
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info.clone());
+        assert_eq!(da.dialect_info().name, "mysql");
+        assert_eq!(da.dialect_info().caps, info.caps);
+    }
+
+    // T5：connect 校验 describe().dialect 与运行时 dialect(handle) 一致，不一致 fail-fast 拒连接。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_connect_rejects_dialect_mismatch() {
+        let _g = T_LOCK.lock().unwrap();
+        let oracle = crate::bridge::dialect_caps::caps_from_json(
+            r#"{"dialect":"oracle","capabilities":["placeholder_colon","id_none"]}"#,
+        )
+        .unwrap();
+        let be = FfiDbBackend::new("db-oracle-mismatch", mock_db_vtable(), oracle);
+        let res = be
+            .connect("mysql://u:p@h/d", std::path::Path::new("/tmp"))
+            .await;
+        assert!(
+            res.is_err(),
+            "dialect mismatch must fail-fast the connection"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn db_query_and_exec_forward_params_and_decode() {
         let _g = T_LOCK.lock().unwrap();
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let rows = da
             .query_with_params(
                 "select ? as c",
@@ -1459,14 +1640,19 @@ mod adapter_tests {
         assert_eq!(da.exec_with_params("delete from t", &[]).await.unwrap(), 3);
     }
 
-    /// ABI 10：插件报 `{"unsupported":true}` 哨兵 → 回落 fetch_all（db.query 全量）。
+    /// ABI 10 / T10：插件报 `{"unsupported":true}` 哨兵且**未声明** stream → 回落 fetch_all（db.query 全量）。
     #[tokio::test(flavor = "multi_thread")]
     async fn db_stream_unsupported_sentinel_falls_back_to_fetch_all() {
         let _g = T_LOCK.lock().unwrap();
         *DB_STREAM_MODE.lock().unwrap() = 0;
         DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
         DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        // 未声明 stream → 标准兜底 fetch_all（保留既有行为，兼容旧插件）。
+        let info = crate::bridge::dialect_caps::caps_from_json(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning"]}"#,
+        )
+        .unwrap();
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
         let mut s = da.stream_query("select 1", &[]).await.unwrap();
         let mut rows = Vec::new();
         while let Some(r) = futures::StreamExt::next(&mut s).await {
@@ -1485,7 +1671,7 @@ mod adapter_tests {
         DB_STREAM_NEXT_CALLS.store(0, AtomicOrdering::SeqCst);
         DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
         DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let mut s = da.stream_query("select 1", &[]).await.unwrap();
         let mut rows = Vec::new();
         while let Some(r) = futures::StreamExt::next(&mut s).await {
@@ -1508,11 +1694,153 @@ mod adapter_tests {
         DB_STREAM_NEXT_CALLS.store(0, AtomicOrdering::SeqCst);
         DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
         DB_STREAM_CANCELLED.store(0, AtomicOrdering::SeqCst);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let s = da.stream_query("select 1", &[]).await.unwrap();
         drop(s); // 中途放弃 = abort 语义
         assert_eq!(DB_STREAM_CANCELLED.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(DB_STREAM_CLOSED.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    // ---- T10：能力一致性矩阵四象限（mock 可切换 caps 与行为）----
+
+    fn matrix_info(caps_json: &str) -> DialectInfo {
+        crate::bridge::dialect_caps::caps_from_json(caps_json).unwrap()
+    }
+
+    // Q1：声明 stream 且插件返回 unsupported → op 级 unsupported（不回退 fetch_all）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matrix_stream_declared_but_unsupported_is_op_unsupported() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 0;
+        let info = matrix_info(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning","stream"]}"#,
+        );
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
+        let res = da.stream_query("select 1", &[]).await;
+        assert!(
+            res.is_err(),
+            "declared stream + unsupported must be op-level unsupported, not fallback"
+        );
+        assert!(
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("stream is not supported")
+        );
+    }
+
+    // Q2：未声明 stream 且插件返回 unsupported → 标准兜底 fetch_all（保留既有行为）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matrix_stream_undeclared_and_unsupported_falls_back() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 0;
+        DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
+        let info = matrix_info(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning"]}"#,
+        );
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
+        let mut s = da.stream_query("select 1", &[]).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(r) = futures::StreamExt::next(&mut s).await {
+            rows.push(r.unwrap());
+        }
+        assert_eq!(rows, vec![serde_json::json!({"c":1,"t":"a"})]);
+        assert_eq!(DB_STREAM_CLOSED.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    // 矩阵分支：未声明 stream 却提供了流 → 采信（成功返回行）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matrix_stream_provided_but_undeclared_is_accepted() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_STREAM_MODE.lock().unwrap() = 1;
+        DB_STREAM_NEXT_CALLS.store(0, AtomicOrdering::SeqCst);
+        DB_STREAM_CLOSED.store(0, AtomicOrdering::SeqCst);
+        let info = matrix_info(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning"]}"#,
+        );
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
+        let mut s = da.stream_query("select 1", &[]).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(r) = futures::StreamExt::next(&mut s).await {
+            rows.push(r.unwrap());
+        }
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"c":1}), serde_json::json!({"c":2})]
+        );
+    }
+
+    // Q3：未声明 cancel 且插件实现了 cancel（可用）→ 成功（warn 由 ffi.rs 侧发出）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matrix_cancel_undeclared_but_provided_succeeds() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_CANCEL_MODE.lock().unwrap() = 1;
+        let info = matrix_info(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning"]}"#,
+        );
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
+        let res = da.cancel(0).await;
+        assert!(
+            res.is_ok(),
+            "undeclared cancel but provided must succeed: {res:?}"
+        );
+    }
+
+    // Q4 续：声明 cancel **且** 插件真提供取消、回执为空体（mysql/pg 插件形态）→ 成功。
+    #[tokio::test(flavor = "current_thread")]
+    async fn matrix_cancel_declared_and_provided_with_empty_body_succeeds() {
+        let _g = T_LOCK.lock().unwrap();
+        *DB_CANCEL_MODE.lock().unwrap() = 2;
+        let info = matrix_info(
+            r#"{"dialect":"postgres","capabilities":["placeholder_dollar","id_returning","cancel"]}"#,
+        );
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), info);
+        let res = da.cancel(0).await;
+        assert!(
+            res.is_ok(),
+            "declared+provided cancel with empty body must succeed: {res:?}"
+        );
+        *DB_CANCEL_MODE.lock().unwrap() = 0;
+    }
+
+    // Q4：声明 cancel 且 accessor 为默认实现 → unsupported 错误（default-throw 哨兵）。
+    struct MatrixMockDA {
+        info: DialectInfo,
+    }
+    #[async_trait]
+    impl DataAccessor for MatrixMockDA {
+        fn dialect_info(&self) -> &DialectInfo {
+            &self.info
+        }
+        async fn query_with_params(
+            &self,
+            _s: &str,
+            _p: &[serde_json::Value],
+        ) -> BridgeResult<Vec<Row>> {
+            Ok(vec![])
+        }
+        async fn exec_with_params(&self, _s: &str, _p: &[serde_json::Value]) -> BridgeResult<i64> {
+            Ok(0)
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matrix_cancel_declared_but_default_impl_is_unsupported() {
+        let _g = T_LOCK.lock().unwrap();
+        let info = matrix_info(
+            r#"{"dialect":"oracle","capabilities":["placeholder_colon","id_none","cancel"]}"#,
+        );
+        let da = MatrixMockDA { info };
+        let res = da.cancel(0).await;
+        assert!(
+            res.is_err(),
+            "declared cancel + default impl must be unsupported"
+        );
+        assert!(
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("cancel is not supported")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1520,7 +1848,7 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         DB_COMMITTED.store(0, AtomicOrdering::SeqCst);
         DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let tx = da.begin().await.unwrap();
         let rows = tx.query("select 1", &[]).await.unwrap();
         assert_eq!(rows[0]["c"], serde_json::json!(9));
@@ -1536,7 +1864,7 @@ mod adapter_tests {
     async fn db_tx_drop_without_finish_fires_rollback() {
         let _g = T_LOCK.lock().unwrap();
         DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let tx = da.begin().await.unwrap();
         drop(tx); // 未 commit/rollback → drop 保底回滚
         assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 7);
@@ -1546,7 +1874,11 @@ mod adapter_tests {
     fn db_accessor_drop_closes_handle() {
         let _g = T_LOCK.lock().unwrap();
         DB_CLOSED.store(0, AtomicOrdering::SeqCst);
-        drop(FfiDataAccessor::new(42, mock_db_vtable()));
+        drop(FfiDataAccessor::new(
+            42,
+            mock_db_vtable(),
+            mock_dialect_info(),
+        ));
         assert_eq!(DB_CLOSED.load(AtomicOrdering::SeqCst), 42);
     }
 
@@ -2471,7 +2803,7 @@ mod adapter_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn given_db_connect_failures_when_connect_then_errs_name_the_stage() {
         let _g = T_LOCK.lock().unwrap();
-        let be = FfiDbBackend::new("db-mysql", mock_db_vtable());
+        let be = FfiDbBackend::new("db-mysql", mock_db_vtable(), mock_dialect_info());
         {
             let _m = Mode::set(&DB_CONNECT_MODE, 1);
             let e = expect_err(be.connect("dsn", std::path::Path::new("/tmp")).await);
@@ -2493,7 +2825,7 @@ mod adapter_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn given_db_begin_failures_when_begin_then_errs_name_the_stage() {
         let _g = T_LOCK.lock().unwrap();
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         {
             let _m = Mode::set(&DB_BEGIN_MODE, 1);
             let e = expect_err(da.begin().await);
@@ -2516,7 +2848,7 @@ mod adapter_tests {
     async fn given_db_calls_fail_when_query_exec_tx_then_errs_name_the_call() {
         let _g = T_LOCK.lock().unwrap();
         let _m = Mode::set(&DB_CALL_MODE, 1);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let e = da
             .query_with_params("s", &[])
             .await
@@ -2537,7 +2869,7 @@ mod adapter_tests {
     async fn given_db_calls_return_gibberish_when_query_exec_tx_then_decode_errs() {
         let _g = T_LOCK.lock().unwrap();
         let _m = Mode::set(&DB_CALL_MODE, 2);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let e = da
             .query_with_params("s", &[])
             .await
@@ -2553,30 +2885,49 @@ mod adapter_tests {
         assert!(e.contains("db tx_exec decode"), "{e}");
     }
 
-    /// 方言自报映射：mysql → MySql；未知方言兜底 Sqlite（宿主不改插件契约）。
-    /// 0.1.67 起方言在**构造期**缓存（连接的静态属性，免每条 SQL 一次 vtable 往返）
-    /// ——故模式须在构造前设定，构造后不再随 vtable 变化。
+    /// T6 两层模型：dialect() / dialect_info() 由**构造期注入的 DialectInfo** 派生，
+    /// 不再调用 vtable `dialect(handle)`（连接级静态属性，运行期纯查表）。
+    /// - known 名称（postgres）→ 对应枚举 + 描述符一致；
+    /// - 未知名称（oracle）→ dialect() 兜底 Sqlite，但 dialect_info().name 保留原始声明
+    ///   （「未知方言」是开放契约下的有效状态，门禁在 T8 的六处 gate 点报 structured unsupported）；
+    /// - dialect() 对未知方言 fail-loud（回落 Sqlite 已删除）：描述符仍然保留原始声明，
+    ///   Dialect::known 不接受，dialect() 调用即 panic（收尾安全网，正常路径由 gate 先行拦截）。
     #[test]
-    fn given_dialect_variants_when_reported_then_mapped_with_sqlite_fallback() {
+    fn ffi_accessor_dialect_derives_from_injected_info_not_vtable() {
+        use crate::bridge::dialect_caps::caps_from_json;
         let _g = T_LOCK.lock().unwrap();
-        {
-            let _m = Mode::set(&DB_DIALECT_MODE, 1);
-            let da = FfiDataAccessor::new(42, mock_db_vtable());
-            assert_eq!(da.dialect(), Dialect::MySql);
-        }
-        {
-            let _m = Mode::set(&DB_DIALECT_MODE, 2);
-            let da = FfiDataAccessor::new(42, mock_db_vtable());
-            assert_eq!(da.dialect(), Dialect::Sqlite);
-        }
-        // 默认模式（postgres）+ 构造后切模式不再生效（缓存语义钉死）
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+
+        // 默认注入：postgres 描述符
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         assert_eq!(da.dialect(), Dialect::Postgres);
-        let _m = Mode::set(&DB_DIALECT_MODE, 1);
+        assert_eq!(da.dialect_info().name, "postgres");
         assert_eq!(
-            da.dialect(),
-            Dialect::Postgres,
-            "构造期缓存：构造后不随 vtable 变化"
+            da.dialect_info().caps.placeholder,
+            crate::bridge::dialect_caps::PlaceholderStyle::Dollar
+        );
+        assert_eq!(
+            da.dialect_info().caps.id,
+            crate::bridge::dialect_caps::IdStrategy::Returning
+        );
+
+        // 未知名称：描述符 name 保留原始声明；Dialect::known 不接受，门控点据此拒绝。
+        // dialect() 对未知方言 fail-loud（不再静默回落 Sqlite）——直接调用应 panic。
+        let oracle = caps_from_json(
+            r#"{"dialect":"oracle","capabilities":["placeholder_colon","id_none"]}"#,
+        )
+        .unwrap();
+        let da2 = FfiDataAccessor::new(42, mock_db_vtable(), oracle.clone());
+        assert_eq!(da2.dialect_info().name, "oracle", "描述符保留原始声明");
+        assert!(
+            Dialect::known(&da2.dialect_info().name).is_none(),
+            "oracle 不在 builder-known 子集"
+        );
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = da2.dialect();
+        }));
+        assert!(
+            r.is_err(),
+            "dialect() 对未知方言必须 fail-loud（不再静默回落 Sqlite）"
         );
     }
 
@@ -2588,7 +2939,7 @@ mod adapter_tests {
         DB_COMMITTED.store(0, AtomicOrdering::SeqCst);
         DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
         let _m = Mode::set(&DB_TX_END_MODE, 1);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let tx = da.begin().await.unwrap();
         let e = tx.commit().await.unwrap_err().to_string();
         assert!(
@@ -2605,7 +2956,7 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
         let _m = Mode::set(&DB_TX_END_MODE, 1);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let tx = da.begin().await.unwrap();
         let e = tx.rollback().await.unwrap_err().to_string();
         assert!(
@@ -2623,7 +2974,7 @@ mod adapter_tests {
         let _g = T_LOCK.lock().unwrap();
         DB_ROLLED_BACK.store(0, AtomicOrdering::SeqCst);
         let _m = Mode::set(&DB_TX_END_MODE, 1);
-        let da = FfiDataAccessor::new(42, mock_db_vtable());
+        let da = FfiDataAccessor::new(42, mock_db_vtable(), mock_dialect_info());
         let tx = da.begin().await.unwrap();
         drop(tx); // 保底回滚 fire-and-forget：结果放弃，不因插件失败 panic/泄漏
         assert_eq!(DB_ROLLED_BACK.load(AtomicOrdering::SeqCst), 7);

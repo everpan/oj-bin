@@ -9,14 +9,14 @@
 //! （`$1,$1` 复用合法、`$2` 缺口合法，与 PG prepare 语义一致）；未闭合 dollar-quote
 //! 报专用错误。
 //!
-//! `normalize_sql`：「何时改写」的决策面——仅 `dialect == postgres && !params.is_empty()`
-//! 触发；改写后占位符数 ≠ params.len() 时 fail-loud（文案进单测断言）。
+//! `normalize_sql`：「何时改写」的决策面——仅 `placeholder == Dollar`（postgres 等）
+//! 且 `!params.is_empty()` 触发；改写后占位符数 ≠ params.len() 时 fail-loud（文案进单测断言）。
 //!
 //! 已知限制（devkit 限制矩阵同源）：JSONB 裸 `?` + 非空参无法区分（一律 jsonb_exists）。
 
 use std::borrow::Cow;
 
-use super::db::Dialect;
+use super::dialect_caps::PlaceholderStyle;
 use serde_json::Value;
 
 /// 把裸 `?` 占位符按出现顺序改写为 `$n`。
@@ -161,14 +161,16 @@ pub fn normalize_placeholders(sql: &str) -> Result<(Cow<'_, str>, usize), String
     Ok((Cow::Owned(out), n_max + qpos.len()))
 }
 
-/// 「何时改写」决策：仅 postgres 且带参时改写并做计数校验；其余原样透传。
+/// 「何时改写」决策：仅 `placeholder == Dollar`（postgres 等）且带参时改写并做计数校验；
+/// 其余（Q/Colon 占位风格或空参）原样透传。判定基于**能力位**而非方言枚举——
+/// 开放契约下新增 Dollar 风格方言无需改此处（T7：字节等价改写 Postgres 行为）。
 pub fn normalize_sql<'a>(
-    dialect: Dialect,
+    placeholder: PlaceholderStyle,
     sql: &'a str,
     params: &[Value],
 ) -> Result<Cow<'a, str>, String> {
-    // 触发条件（设计 §1 规则 6）：sqlite/mysql/空参路径零扫描零分配。
-    if dialect != Dialect::Postgres || params.is_empty() {
+    // 触发条件（设计 §1 规则 6）：非 Dollar 占位风格 / 空参路径零扫描零分配。
+    if placeholder != PlaceholderStyle::Dollar || params.is_empty() {
         return Ok(Cow::Borrowed(sql));
     }
     let (sql, count) = normalize_placeholders(sql)?;
@@ -359,7 +361,14 @@ mod tests {
         let (sql, n) = rw("where a = $1 or b = $1");
         assert_eq!(sql, "where a = $1 or b = $1");
         assert_eq!(n, 1);
-        assert!(normalize_sql(Dialect::Postgres, "where a = $1 or b = $1", &[json!(1)]).is_ok());
+        assert!(
+            normalize_sql(
+                PlaceholderStyle::Dollar,
+                "where a = $1 or b = $1",
+                &[json!(1)]
+            )
+            .is_ok()
+        );
     }
 
     // 18 缺口合法：`$2` 无 `$1`，PG prepare 参数个数 = max n = 2，params 2 通过。
@@ -368,14 +377,21 @@ mod tests {
         let (sql, n) = rw("where a = $2");
         assert_eq!(sql, "where a = $2");
         assert_eq!(n, 2);
-        assert!(normalize_sql(Dialect::Postgres, "where a = $2", &[json!(1), json!(2)]).is_ok());
+        assert!(
+            normalize_sql(
+                PlaceholderStyle::Dollar,
+                "where a = $2",
+                &[json!(1), json!(2)]
+            )
+            .is_ok()
+        );
     }
 
     // 19 计数 fail-loud：占位符数 ≠ 参数数，文案含两个数字 + 正解 hint（评审 P3）。
     #[test]
     fn t19_count_mismatch_fail_loud() {
         let err = normalize_sql(
-            Dialect::Postgres,
+            PlaceholderStyle::Dollar,
             "insert into t (a, b) values (?, ?)",
             &[json!(1)],
         )
@@ -388,7 +404,7 @@ mod tests {
     // 20 空参数短路（评审 A3）：无参 SQL 的 `?` 多为 jsonb 运算符，整条不改写（零分配）。
     #[test]
     fn t20_empty_params_short_circuit() {
-        let r = normalize_sql(Dialect::Postgres, "select doc ? 'a'", &[])
+        let r = normalize_sql(PlaceholderStyle::Dollar, "select doc ? 'a'", &[])
             .expect("empty params must pass through");
         assert!(matches!(r, Cow::Borrowed(_)), "must be zero-copy: {r:?}");
         assert_eq!(r, "select doc ? 'a'");
@@ -430,32 +446,32 @@ mod tests {
         assert_rw("-- c\r\nwhere id = ?", "-- c\r\nwhere id = $1", 1);
     }
 
-    // —— §3② 集成面前置：方言分支钉死（sqlite/mysql 透传零开销） ——
+    // —— §3② 集成面前置：占位风格分支钉死（非 Dollar 透传零开销） ——
 
     #[test]
-    fn t25_sqlite_and_mysql_pass_through() {
+    fn t25_q_and_colon_pass_through() {
         let r = normalize_sql(
-            Dialect::Sqlite,
+            PlaceholderStyle::Q,
             "update account set name = ? where id = ?",
             &[json!("n"), json!(1)],
         )
-        .expect("sqlite must pass through");
+        .expect("Q placeholder must pass through");
         assert!(matches!(r, Cow::Borrowed(_)), "must be zero-copy: {r:?}");
         assert_eq!(r, "update account set name = ? where id = ?");
-        let r =
-            normalize_sql(Dialect::MySql, "a = ?", &[json!(1)]).expect("mysql must pass through");
+        let r = normalize_sql(PlaceholderStyle::Colon, "a = ?", &[json!(1)])
+            .expect("Colon placeholder must pass through");
         assert!(matches!(r, Cow::Borrowed(_)), "must be zero-copy: {r:?}");
     }
 
-    // postgres 正向路径（经决策面）：改写 + 计数对上后原样放行。
+    // Dollar 正向路径（经决策面）：改写 + 计数对上后原样放行。
     #[test]
-    fn t26_postgres_decision_path_rewrites() {
+    fn t26_dollar_decision_path_rewrites() {
         let r = normalize_sql(
-            Dialect::Postgres,
+            PlaceholderStyle::Dollar,
             "select * from t where id = ? and name = ?",
             &[json!(1), json!("n")],
         )
-        .expect("postgres rewrite must succeed");
+        .expect("dollar rewrite must succeed");
         assert_eq!(r, "select * from t where id = $1 and name = $2");
     }
 }

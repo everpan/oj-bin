@@ -6,3 +6,4 @@ description = "开发工具：独立编译插件 + 拷入 bin/plugins/<triple>/ 
 
 [dependencies]
 only-js = { path = "../.." }
+serde_json = "1"

@@ -2,6 +2,7 @@
 //! 约定：ABI_VERSION 严格相等是唯一硬门禁；构建指纹不符仅告警（eprintln）。
 
 use super::ffi;
+use crate::bridge::dialect_caps::{CapsError, DialectInfo, caps_from_json};
 use oj_plugin_ffi::{
     ABI_VERSION, AXIS_KIND_GENERIC, HOST_FINGERPRINT, HostContext, PluginDescriptor, RArc, RString,
 };
@@ -28,10 +29,22 @@ pub enum PluginLoadError {
     AbiMismatch {
         plugin: u32,
         host: u32,
+        /// 插件构建指纹（descriptor 内报告；abi 符号门禁早于 descriptor 时记为 "<unknown>"）。
+        plugin_fp: String,
+        /// 宿主构建指纹（HOST_FINGERPRINT）。
+        host_fp: String,
+    },
+    /// 清单锁 `plugins.lock.json` 存在时，目录中多出未登记的 `.so`（增量覆盖/残留旧插件的典型症状）。
+    ExtraPluginFile {
+        path: PathBuf,
     },
     SymbolMissing {
         path: PathBuf,
         symbol: &'static str,
+    },
+    /// db 轴 `describe()` 能力集解析失败（互斥组缺/多、未知串、缺 dialect）。fail-loud 且点名违规串。
+    BadCaps {
+        source: CapsError,
     },
     IdentityMismatch {
         expected: String,
@@ -58,10 +71,26 @@ impl fmt::Display for PluginLoadError {
                     path.display()
                 )
             }
-            Self::AbiMismatch { plugin, host } => {
+            Self::AbiMismatch {
+                plugin,
+                host,
+                plugin_fp,
+                host_fp,
+            } => {
                 write!(
                     f,
-                    "plugin ABI mismatch: plugin={plugin} host={host} (rebuild plugin against oj-plugin-ffi ABI {host})"
+                    "plugin ABI mismatch: plugin={plugin} host={host} (rebuild plugin against oj-plugin-ffi ABI {host}); \
+                     plugin fingerprint [{plugin_fp}] host fingerprint [{host_fp}]; \
+                     请重新整体拷贝 bin/，禁止增量覆盖（partial copy 会让新能力表现为 unsupported）"
+                )
+            }
+            Self::ExtraPluginFile { path } => {
+                write!(
+                    f,
+                    "plugin file not in plugins.lock.json: {} (lock 要求整体拷贝 bin/，禁止增量覆盖；\
+                     删除该文件或重新 `cargo xtask build`——注意 `cargo xtask plugin <name>` 只拷单个库、\
+                     不刷新锁)",
+                    path.display()
                 )
             }
             Self::SymbolMissing { path, symbol } => {
@@ -70,6 +99,9 @@ impl fmt::Display for PluginLoadError {
                     "plugin symbol missing: {} (symbol `{symbol}`)",
                     path.display()
                 )
+            }
+            Self::BadCaps { source } => {
+                write!(f, "plugin db capability error: {source}")
             }
             Self::IdentityMismatch { expected, actual } => {
                 write!(
@@ -115,6 +147,9 @@ pub struct LoadedPlugin {
     pub generic_axes: Vec<(String, &'static oj_plugin_ffi::GenericVtable)>,
     /// init 前探测的声明配置段键（oj_plugin_config_key；旧插件 None）。
     pub config_key: Option<String>,
+    /// db 轴声明的能力集（T5 `caps_from_json` 解析结果；非 db 轴插件为 None）。
+    /// 启动横幅 / `plugins()` op 的 caps 列同源。
+    pub caps: Option<DialectInfo>,
 }
 
 impl fmt::Debug for LoadedPlugin {
@@ -140,6 +175,8 @@ pub struct PluginInfo {
     pub description: String,
     /// 宿主当前 ABI_VERSION（插件不必与此一致，运维据此核对升级窗口）。
     pub host_abi_version: u32,
+    /// db 轴声明的能力位（T13：启动横幅与 `plugins()` op 同源；非 db 轴插件为 None）。
+    pub caps: Option<DialectInfo>,
 }
 
 impl PluginInfo {
@@ -153,6 +190,7 @@ impl PluginInfo {
             "fingerprint",
             "description",
             "host_abi_version",
+            "caps",
         ]
     }
 }
@@ -166,6 +204,8 @@ impl From<&LoadedPlugin> for PluginInfo {
             fingerprint: p.descriptor.fingerprint[..].to_string(),
             description: p.descriptor.desc[..].to_string(),
             host_abi_version: ABI_VERSION,
+            // 序列化口径 = describe 词汇（DialectInfo 的 Serialize 走 to_wire）。
+            caps: p.caps.clone(),
         }
     }
 }
@@ -192,13 +232,22 @@ pub fn es_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::EsBack
 }
 
 /// 从已加载插件的 db 注册槽构造 core 工厂（scheme 由插件 vtable 自报，Task 4.1）。
-pub fn db_backend(loaded: &LoadedPlugin) -> Option<Arc<dyn crate::bridge::DbBackend>> {
-    loaded.registrations.db.map(|vt| {
-        Arc::new(super::ffi::FfiDbBackend::new(
-            &loaded.descriptor.name[..],
-            vt,
-        )) as Arc<dyn crate::bridge::DbBackend>
-    })
+/// 装配期解析 `describe()` 为闭集 `DialectInfo`：失败（互斥组缺/多、未知串、缺 dialect）
+/// 即 `BadCaps` 拒载，错误点名违规串（T5：fail-loud，杜绝 typo 插件把裸 `?` 发给 Oracle）。
+pub fn db_backend(
+    loaded: &LoadedPlugin,
+) -> Result<Option<Arc<dyn crate::bridge::DbBackend>>, PluginLoadError> {
+    let vt = match loaded.registrations.db {
+        Some(vt) => vt,
+        None => return Ok(None),
+    };
+    let info: DialectInfo =
+        caps_from_json(&(vt.describe)()[..]).map_err(|e| PluginLoadError::BadCaps { source: e })?;
+    Ok(Some(Arc::new(super::ffi::FfiDbBackend::new(
+        &loaded.descriptor.name[..],
+        vt,
+        info.clone(),
+    )) as Arc<dyn crate::bridge::DbBackend>))
 }
 
 /// 从已加载插件的 bus 注册槽构造 core 工厂（kind 由插件名去 "bus-" 前缀推断，
@@ -381,6 +430,8 @@ fn load_one(
         return Err(PluginLoadError::AbiMismatch {
             plugin: plugin_abi,
             host: ABI_VERSION,
+            plugin_fp: "<unknown before init>".to_string(),
+            host_fp: HOST_FINGERPRINT.to_string(),
         });
     }
 
@@ -429,6 +480,8 @@ fn load_one(
         return Err(PluginLoadError::AbiMismatch {
             plugin: descriptor.abi_version,
             host: ABI_VERSION,
+            plugin_fp: descriptor.fingerprint[..].to_string(),
+            host_fp: HOST_FINGERPRINT.to_string(),
         });
     }
 
@@ -465,12 +518,112 @@ fn load_one(
     // vtable 指针永久有效，探测后不持有 lib 引用。
     let (registrations, generic_axes) = unsafe { probe_axes(lib, &probe) };
 
+    // db 轴声明的能力集（T5 门禁同款解析）：仅 db 轴插件有；解析失败在此**告警点名**，
+    // 真正的拒载仍由装配层 `db_backend` 负责（那里有 cfg 上下文与统一错误出口）。
+    // 不静默 `.ok()`：否则 typo 能力串的插件在 `/plugins` 只表现为 `caps: null`，无从排障。
+    let caps = match registrations.db {
+        Some(vt) => match caps_from_json(&(vt.describe)()[..]) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!(
+                    "[oj-plugin] '{}': describe() rejected: {e} (assembly will refuse this db plugin)",
+                    &descriptor.name[..]
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     Ok(LoadedPlugin {
         descriptor,
         registrations,
         generic_axes,
         config_key,
+        caps,
     })
+}
+
+/// 清单锁：build 末尾由 xtask 产出 `plugins.lock.json`，列出随包发布的插件
+/// `[{name, abi, fingerprint}]`。目录中存在但未登记的 `.so` 视为增量覆盖残留 → 拒载。
+#[derive(serde::Deserialize)]
+struct PluginLockEntry {
+    name: String,
+    #[allow(dead_code)]
+    abi: u32,
+    #[allow(dead_code)]
+    fingerprint: String,
+}
+
+/// 读取目录内的 `plugins.lock.json`（不存在 → None，不强制锁）。
+fn read_plugins_lock(dir: &Path) -> Option<Vec<PluginLockEntry>> {
+    let p = dir.join("plugins.lock.json");
+    let Ok(s) = std::fs::read_to_string(&p) else {
+        return None;
+    };
+    serde_json::from_str(&s).ok()
+}
+
+/// 锁 ↔ 实物**反向**对账（should-fix）：只查「目录里多了什么」是半把锁——「锁里登记了但
+/// 目录里没有」（少拷）与「加载出的 abi/fingerprint 与锁不符」（混入别的构建产物）同样说明
+/// 这次部署不是一次整体拷贝。
+///
+/// 两者都只 **stderr 告警**、不拒载：安全边界由 ABI 严格相等门禁 + 未登记文件拒载承担；
+/// 这两种情形不产生「旧能力被当成新能力」的错误语义，只是部署不完整的早期信号。
+/// 返回文案（而非直接打印）便于单测断言。
+fn lock_divergences(loaded: &[LoadedPlugin], lock: &[PluginLockEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in loaded {
+        let name = &p.descriptor.name[..];
+        seen.insert(name);
+        let Some(e) = lock.iter().find(|e| e.name == name) else {
+            continue; // 未登记：扫描模式已由 reject_unlocked_files 拒载，此处不重复报。
+        };
+        if e.abi != p.descriptor.abi_version || e.fingerprint != p.descriptor.fingerprint[..] {
+            out.push(format!(
+                "[oj-plugin] '{name}': loaded abi/fingerprint differ from plugins.lock.json \
+                 (lock abi={} fingerprint={}; loaded abi={} fingerprint={}) — bin/ 不是同一次构建的整体拷贝",
+                e.abi,
+                e.fingerprint,
+                p.descriptor.abi_version,
+                p.descriptor.fingerprint
+            ));
+        }
+    }
+    let mut missing: Vec<&str> = lock
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| !seen.contains(n))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        out.push(format!(
+            "[oj-plugin] plugins.lock.json lists {} plugin(s) missing from this directory: {} — \
+             整体拷贝不完整（缺插件的能力会表现为 unsupported）",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    out
+}
+
+/// 锁内登记面校验：目录里出现锁未登记的库文件 → 报错点名（按文件名字典序取第一个，
+/// 保证确定性可复现）。抽成独立函数是为了能在不 dlopen 的前提下单测。
+fn reject_unlocked_files(
+    files: &[PathBuf],
+    lock: &[PluginLockEntry],
+) -> Result<(), PluginLoadError> {
+    let locked: std::collections::HashSet<&str> = lock.iter().map(|e| e.name.as_str()).collect();
+    let mut extra: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| !locked.contains(file_stem_name(p).as_str()))
+        .collect();
+    extra.sort();
+    match extra.first() {
+        Some(p) => Err(PluginLoadError::ExtraPluginFile { path: (*p).clone() }),
+        None => Ok(()),
+    }
 }
 
 /// 宿主认识的类型化轴（9 个）。清单按名匹配的右值表 + 回退逐轴 dlsym 共用。
@@ -625,6 +778,7 @@ pub fn load_scanned(
     if !dir.is_dir() {
         return Ok(vec![]);
     }
+    let lock = read_plugins_lock(dir);
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| PluginLoadError::DependencyResolution {
             path: dir.to_path_buf(),
@@ -633,10 +787,20 @@ pub fn load_scanned(
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| ffi::is_plugin_file(p))
         .collect();
+    // 清单锁存在 → 未在锁内登记的 `.so` 直接拒载（点名文件），杜绝增量覆盖残留旧插件
+    // 偷偷被加载、却因 ABI/能力不对等而上演「新能力表现为 unsupported」。
+    if let Some(lock) = &lock {
+        reject_unlocked_files(&files, lock)?;
+    }
     files.sort();
     let mut out = Vec::with_capacity(files.len());
     for path in files {
         out.push(load_one(&path, None, host.clone(), cfg_for)?);
+    }
+    if let Some(lock) = &lock {
+        for w in lock_divergences(&out, lock) {
+            eprintln!("{w}");
+        }
     }
     Ok(out)
 }
