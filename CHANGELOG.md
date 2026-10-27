@@ -72,9 +72,9 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
 - `docs/db-guide.md` 新增 **§10.6 类型映射表与值契约（跨方言）**：六类 schema 类型 ×
   sqlite/mysql/pg/oracle/DM8 的 DDL 映射（后两列标注「M2 方案级 / 待真库复核」，不作生产依据）、
   读侧 JSON/JS 值契约、三内置方言读侧边界表（点名 **sqlite 仍会静默 `null`** 属历史包袱、新插件勿照抄），
-  以及新方言四条硬要求——其中「禁止 `Unknown` 静默当 text」是当前 `ColumnType::from_schema_type`
-  的真实缺口（`type: varchar` 会归 `Unknown` 按文本处理，租户守卫因此在 PG 上退化成
-  `operator does not exist: bigint = text`）。
+  以及新方言四条硬要求——其中「禁止 `Unknown` 静默当 text」在写下时确有其事（核心侧
+  `from_schema_type` 兜底把 `type: varchar` 归 `Unknown` 按文本处理，租户守卫因此在 PG 上退化成
+  `operator does not exist: bigint = text`）；该缺口已由下节 `fix(schema)` 闭合，本段留作背景。
 - `docs/plugins/plugin-development.md` 新增 **§15 新增数据库方言 conformance 清单**：五步接入、
   8 能力位注册表（逐能力位写明宿主消费点 + 正例 + 反例）、错误映射骨架（含 dbx 侧二手证据的达梦
   错误码 `-5669` / `-6118` / `-3325` / `-2207`，明确标注待 M2 真库复核且**不得照搬 Oracle 编号**）、
@@ -87,6 +87,31 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
   不进 workspace members（与既有泛型轴模板 `tools/plugin-template` 同款：拷贝使用的骨架）。
 - 交叉引用：§10.5 能力矩阵、§10.6、§15 与模板 README 四向互指，运维侧仍以 `api-manual.md`
   「结构化数据库错误」为准。
+
+### fix(schema) — 列类型不再静默降级成 text
+
+- **复核结论（先纠正一处自己的文档判断）**：`schema.yaml` 这条路上未知类型**本来就被拒**——
+  `SchemaFile::parse` 在声明期点名原串 + 列出支持清单（`type: varchar` 会得到
+  `schema: 表 "t".tenant_id: 未知列类型 "varchar"（支持 integer/bigint/text/boolean/double/blob；
+  其余类型请写 migrations/NNNN__desc.sql）`）。真正的静默降级只存在于核心侧：`ColumnType::
+  from_schema_type` 的兜底分支把不认识的串归 `Unknown`，而 `Unknown` 的语义是「按 text 处理」。
+- 收紧为**不可能静默**：`ColumnType::from_schema_type` 返回 `Option<Self>`（不再兜底），并新增
+  `ColumnType::SCHEMA_TYPES` 作为六类词汇表的唯一来源（解析、错误文案、校验共用，杜绝两处清单
+  漂移）；`SchemaFile::registry_tables()` 返回 `Result`，未识别类型**拒载并点名 表.列**——
+  即使有人绕过 `parse()` 直接反序列化，也走不到「当 text」。
+- 顺带删掉 `oj/src/schema.rs` 里与核心重复的 `ColType` 枚举（同一份词汇表原本有两处定义），
+  DDL 生成与 `validate_tenant` 改为直接判 `ColumnType`。
+- 影响面：`schema.yaml` 正常路径**文案与行为逐字不变**（错误串仍由同一份词汇表拼出）；只有
+  「绕过 parse 的路径」从静默降级变为拒载。`Unknown` 语义收窄为「列类型未声明」（旧装配路径
+  `table()` / 既有夹具），仍按 v0.1.23 行为处理——这条向后兼容契约有专测钉死
+  （`unknown_column_type_tenant_still_binds_text`：取「纯数字租户头」做判别，`Unknown` 一旦
+  被误当数值，绑定参数会从 `"7"` 变 `7`，断言立刻红）。
+- 测试：`from_schema_type_maps_exactly_the_six_declared_names`（六项全命中且不落 `Unknown`）、
+  `from_schema_type_never_silently_falls_back`（11 个应拒串：`varchar`/`VARCHAR(64)`/`jsonb`/
+  `INTEGER`/`int`/空白变体等一律 `None`）、`registry_tables_rejects_unknown_type_even_when_parse_is_bypassed`
+  （刻意用 `serde_yaml` 绕过 parse 的对抗用例）、`unknown_column_type_tenant_still_binds_text`
+  （旧路径 `Unknown` 仍绑字符串，锁死兼容面）+ 真机 `oj serve` 双向验证（`varchar` 拒启并点名、
+  改 `text` 后正常建表启动）。
 
 ## v0.1.87
 

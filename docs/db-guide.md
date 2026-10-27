@@ -627,9 +627,9 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 
 ## 10.6 类型映射表与值契约（跨方言）
 
-`schema.yaml` 的列类型词汇是**固定的六类**（`src/bridge/registry.rs` 的
-`ColumnType::from_schema_type`）。任何方言插件都必须能把六类建成表、并读回 JS 可用的值；
-对不上要**报错**，不许静默兜底。
+`schema.yaml` 的列类型词汇是**固定的六类**（唯一来源 `src/bridge/registry.rs` 的
+`ColumnType::SCHEMA_TYPES`：`integer` / `bigint` / `text` / `boolean` / `double` / `blob`）。
+任何方言插件都必须能把六类建成表、并读回 JS 可用的值；对不上要**报错**，不许静默兜底。
 
 ### 1) 建表映射（DDL）
 
@@ -668,11 +668,13 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 
 ### 4) 新方言接入的硬要求
 
-1. **禁止 `Unknown` 静默当 text**：`schema.yaml` 声明的类型若该方言没有映射，**装配期**就得拒载
-   并点名（类型 + 方言）。现状是 `ColumnType::from_schema_type` 把不认识的字符串（如
-   `type: varchar`）静默归 `Unknown` → 按 text 处理；新方言接入前必须补这道 fail-fast，否则
-   租户守卫会把 `tenant_id` 当文本绑定，在 PG 上退化成一个难懂的
-   `operator does not exist: bigint = text`。
+1. **列类型必须闭集**：禁止 `Unknown` 静默当 text。`SchemaFile::parse` 在声明期就拒未知
+   类型（点名原串 + 列出支持清单 + 指引「其余类型请写 `migrations/NNNN__desc.sql`」）；v0.1.88
+   起核心侧也收紧——`ColumnType::from_schema_type` 返回 `Option`（不再兜底 `Unknown`），
+   `registry_tables()` 对未识别类型同样拒载并点名，**即使有人绕过 `parse` 直接反序列化**也走不到
+   「当 text」。`Unknown` 只剩一个含义：**列类型未声明**（旧装配路径 `table()`，按 v0.1.23 行为）。
+   为什么必须这样：把 `varchar` 当 text，租户守卫会给 `tenant_id` 绑字符串，在 PG 上退化成一句
+   难懂的 `operator does not exist: bigint = text`——看起来像方言 bug，实际是声明写错。
 2. **读侧不许静默 `null`**：解不出的列类型必须报错（mysql/pg 插件的既有做法）。sqlite 的静默
    `null` 是历史包袱，新插件**不要照抄**。
 3. 上表第 2 节的**值契约是跨方言契约**，逐项写进插件 conformance 清单验收（见

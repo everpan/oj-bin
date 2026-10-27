@@ -1659,6 +1659,43 @@ async fn tenant_select_scoped() {
     );
 }
 
+/// **向后兼容钉死（v0.1.23 契约）**：旧装配路径 `.table()` 不声明列类型 ⇒
+/// `ColumnType::Unknown` ⇒ 租户值必须仍按**字符串**绑定。
+///
+/// 判别手法：给一个「纯数字租户头」，若 `Unknown` 被误当数值，
+/// 绑定参数会变成 `7`（数字）而不是 `"7"`（字符串）——断言立刻红。
+/// 这条路径与 `ColumnType::from_schema_type` 的 `None` 收紧互不干扰：
+/// 收紧的是「声明了但宿主不认识」（schema.yaml，声明期拒载），这里是「压根没声明」。
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_column_type_tenant_still_binds_text() {
+    let b = guarded_bridge().await; // .table(...) ⇒ 所有列均为 Unknown
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const s = db.table("t").select(["name"]).toSQL();
+                 const j = db.table("t").select(["t.name"])
+                   .join("u", [{left:"t.id",right:"u.id"}], "left").toSQL();
+                 json.ok({ params: s.params, joinParams: j.params });
+               })().catch(e => json.fail(500, String(e)));"#,
+            req_tenant("7"),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    for key in ["params", "joinParams"] {
+        let ps = v["data"][key].as_array().unwrap();
+        assert!(
+            ps.contains(&json!("7")),
+            "Unknown 列必须按字符串绑定（{key}）：{v}"
+        );
+        assert!(
+            !ps.contains(&json!(7)),
+            "Unknown 列不得绑成数字（{key}）：{v}"
+        );
+    }
+}
+
 /// asTenant 夹具：与 guarded_bridge 同数据，但开启 `tenant.allow_as_tenant`。
 async fn guarded_bridge_allow_as_tenant(allow: bool) -> Bridge {
     let db = SqlxAccessor::arc("sqlite::memory:").await.unwrap();

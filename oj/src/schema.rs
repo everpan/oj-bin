@@ -9,58 +9,47 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use only_js::bridge::{DataAccessor, Dialect, ModuleIndex};
+use only_js::bridge::{ColumnType, DataAccessor, Dialect, ModuleIndex};
 use sea_query::{Alias, ColumnDef, Index};
 
-/// 列类型最小集（§4.7 映射层；其余类型走手写 migrations/）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColType {
-    Integer,
-    BigInt,
-    Text,
-    Boolean,
-    Double,
-    Blob,
+/// 列类型词汇表在核心（`ColumnType::SCHEMA_TYPES`），此处只做「声明期 fail-fast」的包装：
+/// 未识别的类型串一律报错并列出受支持清单——绝不静默当 text（那样租户守卫会给
+/// `tenant_id` 绑字符串，在 PG 上退化成 `operator does not exist: bigint = text`）。
+fn parse_col_type(s: &str) -> Result<ColumnType, String> {
+    ColumnType::from_schema_type(s).ok_or_else(|| {
+        format!(
+            "未知列类型 {s:?}（支持 {}；其余类型请写 migrations/NNNN__desc.sql）",
+            ColumnType::SCHEMA_TYPES.join("/")
+        )
+    })
 }
 
-impl ColType {
-    fn parse(s: &str) -> Result<Self, String> {
-        Ok(match s {
-            "integer" => Self::Integer,
-            "bigint" => Self::BigInt,
-            "text" => Self::Text,
-            "boolean" => Self::Boolean,
-            "double" => Self::Double,
-            "blob" => Self::Blob,
-            other => {
-                return Err(format!(
-                    "未知列类型 {other:?}（支持 integer/bigint/text/boolean/double/blob；\
-                     其余类型请写 migrations/NNNN__desc.sql）"
-                ));
-            }
-        })
-    }
-
-    fn apply(&self, cd: &mut ColumnDef) {
-        match self {
-            Self::Integer => {
-                cd.integer();
-            }
-            Self::BigInt => {
-                cd.big_integer();
-            }
-            Self::Text => {
-                cd.text();
-            }
-            Self::Boolean => {
-                cd.boolean();
-            }
-            Self::Double => {
-                cd.double();
-            }
-            Self::Blob => {
-                cd.binary();
-            }
+/// 类型 → sea-query 列定义（DDL 生成；只接受已过 [`parse_col_type`] 的类型）。
+fn apply_ddl_type(ty: ColumnType, cd: &mut ColumnDef) {
+    match ty {
+        ColumnType::Integer => {
+            cd.integer();
+        }
+        ColumnType::BigInt => {
+            cd.big_integer();
+        }
+        ColumnType::Text => {
+            cd.text();
+        }
+        ColumnType::Boolean => {
+            cd.boolean();
+        }
+        ColumnType::Double => {
+            cd.double();
+        }
+        ColumnType::Blob => {
+            cd.binary();
+        }
+        // `Unknown` 只表示「列类型未声明」，DDL 只服务 schema.yaml 声明的列（必经
+        // parse_col_type）。走到这里说明绕过了解析——响亮 panic 而不是回落 text，
+        // 回落的后果是静默建出错误列型。
+        ColumnType::Unknown => {
+            unreachable!("DDL 需要已声明的列类型（SchemaFile::parse 已校验）")
         }
     }
 }
@@ -77,9 +66,10 @@ pub struct ColumnSchema {
 }
 
 impl ColumnSchema {
-    /// 类型（parse() 已验证，此处 unwrap 不可达）。
-    fn ty(&self) -> ColType {
-        ColType::parse(&self.col_type).expect("column type validated at parse")
+    /// 类型（`SchemaFile::parse` 已验证；绕过解析则 panic —— 绝不静默当 text）。
+    fn ty(&self) -> ColumnType {
+        ColumnType::from_schema_type(&self.col_type)
+            .unwrap_or_else(|| panic!("column type {:?} validated at parse", self.col_type))
     }
 }
 
@@ -172,7 +162,7 @@ impl SchemaFile {
                 if !is_ident(c) {
                     return Err(format!("schema: 表 {t:?} 非法列名 {c:?}"));
                 }
-                ColType::parse(&cs.col_type).map_err(|e| format!("schema: 表 {t:?}.{c}: {e}"))?;
+                parse_col_type(&cs.col_type).map_err(|e| format!("schema: 表 {t:?}.{c}: {e}"))?;
                 if cs.autoincrement && !ts.pk.iter().any(|p| p == c) {
                     return Err(format!(
                         "schema: 表 {t:?} 列 {c:?} autoincrement 仅允许主键列"
@@ -212,24 +202,26 @@ impl SchemaFile {
     ///
     /// v0.1.24 起带上 `col_type`：租户守卫要按 `tenant_id` 的列类型生成绑定值
     /// （数值列绑数值，否则 PG 报 `operator does not exist: bigint = text`）。
-    pub fn registry_tables(&self) -> Vec<RegistryTable<'_>> {
+    ///
+    /// **返回 `Result`（v0.1.88）**：未识别的列类型在此**拒载并点名**，不再静默当 text。
+    /// 正常路径上 [`SchemaFile::parse`] 已校验过，这里的错误只可能来自「绕过 parse 直接
+    /// 反序列化」——但那种路径一旦存在，静默降级的代价（租户条件绑错类型）远大于报错。
+    pub fn registry_tables(&self) -> Result<Vec<RegistryTable<'_>>, String> {
         self.tables
             .iter()
             .map(|(name, t)| {
-                (
+                let mut cols = Vec::with_capacity(t.columns.len());
+                for (cn, cs) in &t.columns {
+                    let ty = parse_col_type(&cs.col_type)
+                        .map_err(|e| format!("schema: 表 {name:?}.{cn}: {e}"))?;
+                    cols.push((cn.as_str(), ty));
+                }
+                Ok((
                     name.as_str(),
                     t.pk.iter().map(|s| s.as_str()).collect(),
-                    t.columns
-                        .iter()
-                        .map(|(cn, cs)| {
-                            (
-                                cn.as_str(),
-                                only_js::bridge::ColumnType::from_schema_type(&cs.col_type),
-                            )
-                        })
-                        .collect(),
+                    cols,
                     t.tenant,
-                )
+                ))
             })
             .collect()
     }
@@ -250,14 +242,20 @@ impl SchemaFile {
                      共享表请显式 tenant: false 并加入 config tenant.shared_allow）"
                 ));
             };
-            match tid.col_type.as_str() {
-                "text" | "integer" | "bigint" => {}
-                other => {
+            // 按**解析后的枚举**判定，不比对原始字面量：词汇表只有一份
+            // （`ColumnType::SCHEMA_TYPES`），将来扩类型也不会漏改这里。
+            match parse_col_type(&tid.col_type) {
+                Ok(ColumnType::Text | ColumnType::Integer | ColumnType::BigInt) => {}
+                Ok(_) => {
                     return Err(format!(
-                        "schema: [{module}] 表 {name:?} 的 tenant_id 类型 {other:?} 不受支持\
-                         （仅 text / integer / bigint；数值列请确保租户头是该类型的十进制字面量）"
+                        "schema: [{module}] 表 {name:?} 的 tenant_id 类型 {:?} 不受支持\
+                         （仅 text / integer / bigint；数值列请确保租户头是该类型的十进制字面量）",
+                        tid.col_type
                     ));
                 }
+                // 未识别的类型串：parse() 本该更早拒掉；走到这里说明绕过了校验，
+                // 仍按「拒绝 + 点名」处理，绝不当 text 放过去。
+                Err(e) => return Err(format!("schema: [{module}] 表 {name:?}.tenant_id: {e}")),
             }
         }
         Ok(())
@@ -277,7 +275,7 @@ impl SchemaFile {
 
 fn column_def(name: &str, c: &ColumnSchema, is_pk: bool) -> ColumnDef {
     let mut cd = ColumnDef::new(Alias::new(name));
-    c.ty().apply(&mut cd);
+    apply_ddl_type(c.ty(), &mut cd);
     if c.autoincrement {
         cd.auto_increment();
     }
@@ -645,10 +643,19 @@ tables:
             vec!["id".to_string()]
         );
 
-        // 未知类型
-        let e = SchemaFile::parse("tables:\n  t:\n    columns:\n      a: { type: jsonb }\n")
+        // 未知类型：点名原串 + 列 + 支持清单（用户据此改声明，而不是去猜）
+        for bad in ["jsonb", "varchar", "INTEGER"] {
+            let e = SchemaFile::parse(&format!(
+                "tables:\n  t:\n    columns:\n      a: {{ type: {bad} }}\n"
+            ))
             .unwrap_err();
-        assert!(e.contains("jsonb"), "{e}");
+            assert!(e.contains(bad), "必须点名 {bad}: {e}");
+            assert!(
+                e.contains("integer/bigint/text/boolean/double/blob"),
+                "必须列出支持清单: {e}"
+            );
+            assert!(e.contains("migrations/"), "必须给出出路: {e}");
+        }
         // autoincrement 非主键
         let e = SchemaFile::parse(
             "tables:\n  t:\n    columns:\n      a: { type: integer, autoincrement: true }\n",
@@ -925,10 +932,42 @@ tables:
             "tables:\n  a:\n    columns:\n      id: { type: integer }\n      tenant_id: { type: text }\n  b:\n    tenant: false\n    columns:\n      id: { type: integer }\n",
         )
         .unwrap();
-        let r = f.registry_tables();
+        let r = f.registry_tables().expect("all types declared");
         assert_eq!(r.len(), 2);
         assert!(r.iter().any(|(n, _, _, t)| *n == "a" && *t));
         assert!(r.iter().any(|(n, _, _, t)| *n == "b" && !*t));
+        // 列类型随条目带出（v0.1.24 租户守卫据此绑定数值/字符串）。
+        let (_, _, cols, _) = r.iter().find(|(n, ..)| *n == "a").expect("table a");
+        assert_eq!(
+            cols.iter()
+                .find(|(c, _)| *c == "tenant_id")
+                .map(|(_, ty)| *ty),
+            Some(only_js::bridge::ColumnType::Text)
+        );
+    }
+
+    /// 回归（v0.1.88）：**绕过 `SchemaFile::parse`** 直接反序列化时，未识别的列类型也
+    /// 必须在喂给 SchemaRegistry 前被拒——静默当 text 会让租户守卫给 `tenant_id` 绑字符串。
+    ///
+    /// 构造方式刻意绕开 `parse()`（`serde_yaml` 直接反序列化），因为正常路径上 parse 已经
+    /// 拦住了；这条用例钉死的是「第二条路也不能悄悄降级」。
+    #[test]
+    fn registry_tables_rejects_unknown_type_even_when_parse_is_bypassed() {
+        let f: SchemaFile = serde_yaml::from_str(
+            "tables:\n  t:\n    columns:\n      id: { type: integer }\n      tenant_id: { type: varchar }\n",
+        )
+        .expect("yaml 本身合法——校验发生在 parse，不在反序列化");
+        let e = f.registry_tables().expect_err("未识别类型必须拒载");
+        assert!(e.contains("varchar"), "必须点名类型串: {e}");
+        assert!(e.contains("tenant_id"), "必须点名列: {e}");
+        assert!(
+            e.contains("integer/bigint/text/boolean/double/blob"),
+            "必须给出支持清单: {e}"
+        );
+
+        // 同理：tenant_id 校验也不许把 varchar 当 text 放过。
+        let e = f.validate_tenant("m").expect_err("未识别类型必须拒");
+        assert!(e.contains("varchar") && e.contains("tenant_id"), "{e}");
     }
 
     #[test]

@@ -425,11 +425,18 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
    排障行、回滚三元组）——告警映射需要真实新方言的错误码分布，`abi/fingerprint` 排障行的
    **文案**要与 M2 落地后的实际报错逐字对齐（M3 验收条件即「ops 表与实际错误文本一致」）。
 
-**顺带记录的两处缺口（不属本切片，均登记不改实现）**
+**顺带记录的两处缺口（均登记不改实现）**
 
-1. `ColumnType::from_schema_type` 把未识别的 schema 类型串（如 `type: varchar`）静默归 `Unknown`
-   → 按 text 处理。这正是 §10.6 第 4 节第 1 条「禁止 `Unknown` 静默当 text」所指——**当前实现
-   尚未 fail-fast**，新方言接入前必须补。
+1. ~~`ColumnType::from_schema_type` 把未识别的 schema 类型串（如 `type: varchar`）静默归
+   `Unknown` → 按 text 处理~~ ——**已修（v0.1.88，本切片后跟进，见 CHANGELOG `fix(schema)`）**。
+   复核结论：`schema.yaml` 这条路**本来就是 fail-fast 的**（`SchemaFile::parse` 在声明期拒未知
+   类型、点名原串并列出支持清单，v0.1.24 起如此），静默降级只存在于核心侧的
+   `ColumnType::from_schema_type` 兜底分支与 `registry_tables()` 的喂料路径。现两处都收紧：
+   `from_schema_type` → `Option`（词汇表唯一来源 `ColumnType::SCHEMA_TYPES`）、`registry_tables()`
+   → `Result`（未识别即拒载并点名 表.列），并删掉 `oj/src/schema.rs` 里与核心重复的 `ColType`
+   枚举。`Unknown` 仅保留「列类型未声明」语义。面向兼容面另配专测
+   `unknown_column_type_tenant_still_binds_text`：旧 `table()` 路径的 `tenant_id` 仍绑**字符串**
+   （用纯数字租户头判别，误判成数值即红），`Option` 化不会顺手改掉 v0.1.23 契约。
 2. 能力位解析失败的文案只点名**轴**不点名**插件**：`plugins db assembly: plugin db capability
    error: unknown capability "…"`（单 db 插件时无歧义，T2 串容易定位；两个 db 插件同时在场时
    无法一眼看出是哪个）。建议 M3 落 ops 排障行时连带补上插件名——**本次不改**，避免在收尾切片里

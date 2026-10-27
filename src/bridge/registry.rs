@@ -27,23 +27,34 @@ pub enum ColumnType {
     Boolean,
     Double,
     Blob,
-    /// 未声明 / 未识别的类型（旧路径）。按 text 处理，保持向后兼容。
+    /// **列类型未声明**（旧装配路径 `table()` / `table_owned()`、全部既有夹具）——
+    /// 按 text 处理以保持向后兼容。**不表示「不认识这个类型串」**：
+    /// 那种情况由 [`ColumnType::from_schema_type`] 返回 `None`，调用方必须 fail-fast。
     #[default]
     Unknown,
 }
 
 impl ColumnType {
-    /// `schema.yaml` 的 `type` 字面量 → 类型（未知值归 `Unknown`，不 fail——声明期另有校验）。
-    pub fn from_schema_type(s: &str) -> Self {
-        match s {
+    /// `schema.yaml` 的 `type` 字面量全集（唯一词汇表：解析、声明期校验的错误文案共用）。
+    pub const SCHEMA_TYPES: [&'static str; 6] =
+        ["integer", "bigint", "text", "boolean", "double", "blob"];
+
+    /// `schema.yaml` 的 `type` 字面量 → 类型；**未识别返回 `None`**（绝不静默当 text）。
+    ///
+    /// 这不是「宽容解析」的场合：把 `varchar` / `jsonb` / `INTEGER`（大小写）当成 text，
+    /// 会让租户守卫给 `tenant_id` 绑字符串，在 PG 上退化成一句
+    /// `operator does not exist: bigint = text`——排障方向完全错（看起来像方言 bug，
+    /// 实际是声明写错）。调用方要么在声明期报错点名，要么显式决定降级并写清理由。
+    pub fn from_schema_type(s: &str) -> Option<Self> {
+        Some(match s {
             "integer" => ColumnType::Integer,
             "bigint" => ColumnType::BigInt,
             "text" => ColumnType::Text,
             "boolean" => ColumnType::Boolean,
             "double" => ColumnType::Double,
             "blob" => ColumnType::Blob,
-            _ => ColumnType::Unknown,
-        }
+            _ => return None,
+        })
     }
 
     /// 是否可承载数值型租户 id（`apply_tenant` 与声明期校验共用）。
@@ -295,5 +306,48 @@ mod tests {
         assert!(t.has_column("x"));
         assert!(t.has_column("y"));
         assert!(r.has_table("t"));
+    }
+
+    #[test]
+    fn from_schema_type_maps_exactly_the_six_declared_names() {
+        // 词汇表就是 SCHEMA_TYPES：每一项都能解析，且解析结果不是 Unknown。
+        for name in ColumnType::SCHEMA_TYPES {
+            let ty =
+                ColumnType::from_schema_type(name).unwrap_or_else(|| panic!("{name} 必须可解析"));
+            assert_ne!(ty, ColumnType::Unknown, "{name} 不得落到 Unknown");
+        }
+        assert_eq!(
+            ColumnType::from_schema_type("integer"),
+            Some(ColumnType::Integer)
+        );
+        assert_eq!(ColumnType::from_schema_type("blob"), Some(ColumnType::Blob));
+    }
+
+    /// 回归（v0.1.88）：未识别的类型串**不得**静默降级成 text。
+    ///
+    /// 曾经的 `from_schema_type` 兜底返回 `Unknown`（= 按 text 处理），调用方一见 `Ok` 就
+    /// 拿它去绑租户条件——`type: varchar` 的 `tenant_id` 会在 PG 上变成
+    /// `operator does not exist: bigint = text`。现在返回 `None`，由调用方 fail-fast。
+    #[test]
+    fn from_schema_type_never_silently_falls_back() {
+        for junk in [
+            "",
+            "varchar",
+            "VARCHAR(64)",
+            "jsonb",
+            "INTEGER",
+            "int",
+            "timestamptz",
+            "decimal",
+            "float",
+            " blob",
+            "blob ",
+        ] {
+            assert_eq!(
+                ColumnType::from_schema_type(junk),
+                None,
+                "{junk:?} 必须判为未识别（大小写/空白都不宽容），不得回落 Unknown/text"
+            );
+        }
     }
 }

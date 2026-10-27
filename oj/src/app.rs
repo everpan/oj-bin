@@ -436,7 +436,10 @@ async fn build_schema_and_modules(
                         }
                     }
                 }
-                for (t, pk, cols, tenant_flag) in f.registry_tables() {
+                // 列类型未识别 → 拒载并点名（不再静默当 text；见 SchemaFile::registry_tables）。
+                for (t, pk, cols, tenant_flag) in
+                    f.registry_tables().map_err(|e| format!("[{name}] {e}"))?
+                {
                     if registry.has_table(t) {
                         return Err(format!(
                             "S002: 表 {t:?} 被多个模块声明（{} 与 {name}）",
