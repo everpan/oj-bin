@@ -2516,6 +2516,28 @@ wss 自 v0.1.8 起可用（webpki-roots 根集，见上「fetch」节）。`oj t
 json.ok(plugins());
 ```
 
+`caps.capabilities` 的串是**闭集（8 个）**，含义与三内置方言取值：
+
+| 能力串 | 含义（声明 = 承诺） | sqlite | mysql | postgres |
+|---|---|---|---|---|
+| `placeholder_q` | 原生占位符 `?` | ✅ | ✅ | — |
+| `placeholder_dollar` | 原生占位符 `$n`（宿主把 `?` 改写成 `$1..$n`） | — | — | ✅ |
+| `placeholder_colon` | 原生占位符 `:n`（宿主不改写，插件内部改） | — | — | — |
+| `id_returning` | insert 单语句 `RETURNING` 取自增 | — | — | ✅ |
+| `id_two_step` | 取自增需二次查询（`LAST_INSERT_ID()` / `last_insert_rowid()`） | ✅ | ✅ | — |
+| `id_none` | 不提供自增 id（主键由客户端 / `db.nextSeq` 生成） | — | — | — |
+| `stream` | 真逐行流式（`db.stream` 的内存优势来自它） | ✅ | ✅ | ✅ |
+| `cancel` | 语句级真取消（`signal` 中止能打到服务端） | — | ✅ | ✅ |
+
+- 组约束：`placeholder_*` 三选一**必选**、`id_*` 三选一**必选**；`stream` / `cancel` 可选。
+  写错/漏项插件**装配期即被拒载**并点名（`unknown capability "…"` / `missing capability group "…"`）。
+- **哪个位影响执行**：`placeholder_*`（决定占位符改写）、`stream`、`cancel` 影响执行；
+  `id_*` 只是**登记与对账**——取 id 由构造器按具体方言决定（只有 mysql 走两步
+  `LAST_INSERT_ID()`），别自己据 `caps.id` 分派。
+- 三内置方言的完整串（与启动横幅 `[oj-serve] plugin … | caps: …`、`oj info` 逐字同源）：
+  `placeholder=? id=two_step stream`（sqlite）/ `placeholder=? id=two_step stream cancel`（mysql）
+  / `placeholder=$ id=returning stream cancel`（postgres）。
+
 ### axis(name) —— 泛型插件轴调用面（v0.1.54）
 
 插件经入口宏 `generic(name) => &VT` 声明的**泛型轴**（不占 9 个类型化轴槽、零 ABI 变更）

@@ -709,24 +709,53 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 > 都直接回夹具行、不执行 SQL，`db.nextSeq` 因此拿不到返回值（`db.nextSeq: no value
 > returned`）。要验真实 SQL 语义请用 `sqlite::memory:`。
 
-三个内置方言的**能力位**（`plugins()` / `GET {base}/plugins` 的 `caps` 列同源）：
+### 能力位对照表（8 个串 × 三内置方言）
 
-| 方言 | 占位符 | 取自增 | stream | cancel |
-|---|---|---|---|---|
-| sqlite | `placeholder_q`（`?`） | `id_two_step`（`last_insert_rowid`；但构造器 `.returning([...])` 走 `RETURNING` 单语句，两者不是同一件事） | ✅ | ❌ |
-| mysql | `placeholder_q` | `id_two_step`（`LAST_INSERT_ID()` 两步） | ✅ | ✅ |
-| postgres | `placeholder_dollar`（`$n`，JS 侧仍写 `?`，宿主改写） | `id_returning`（`RETURNING`） | ✅ | ✅ |
+插件在 `describe()` 里声明**它真做得到**的能力位；宿主装配期解析成
+`DialectCaps { placeholder, id, stream, cancel }`，运行期纯查表。下表是**声明面**的逐位对照
+（`plugins()` / `GET {base}/plugins` 的 `caps` 列、启动横幅 `| caps: …` 同源，
+串由 `DialectInfo::summary()` 拼装）：
+
+| 能力串 | 语义（声明 = 承诺） | sqlite | mysql | postgres | 宿主消费点 / 执行期影响 |
+|---|---|---|---|---|---|
+| `placeholder_q` | 原生占位符 `?` | ✅ | ✅ | — | `placeholder.rs` **不改写**，JS 写的 `?` 原样下发。**参与执行** |
+| `placeholder_dollar` | 原生占位符 `$n` | — | — | ✅ | `placeholder.rs` 把 `?` 依次改写成 `$1..$n`（`?` 个数与参数个数不符提前报 `placeholder count <n> != params <m>`）。**参与执行** |
+| `placeholder_colon` | 原生占位符 `:n` | — | — | — | 宿主**不改写**（透传），`:n` 改写归**插件内部**。**参与执行（插件侧）** |
+| `id_returning` | insert 单语句 `RETURNING` 取自增 | — | — | ✅ | **仅登记**：构造器取 id 按具体方言选路，不读这一位（见下） |
+| `id_two_step` | 取自增需二次查询 | ✅ | ✅ | — | **仅登记**（同上）：mysql `LAST_INSERT_ID()`、sqlite `last_insert_rowid()` |
+| `id_none` | 不提供自增 id（主键由客户端 / `db.nextSeq` 生成） | — | — | — | **仅登记**：上层要 id 时给「无 id」，不报错 |
+| `stream` | 实现 `stream_open/next/cancel/close` | ✅ | ✅ | ✅ | `db.stream` 走 vtable 批量 pull（≤100 行/次）。**参与执行** |
+| `cancel` | 语句级真取消（服务端中断） | — | ✅ | ✅ | `signal` 中止活跃游标时调 `stream_cancel`（mysql `KILL QUERY` / pg `pg_cancel_backend`）。**参与执行** |
+
+**三内置方言的完整能力串**（启动横幅与 `oj info` 里逐字可见）：
+
+```
+sqlite    placeholder=? id=two_step stream
+mysql     placeholder=? id=two_step stream cancel
+postgres  placeholder=$ id=returning stream cancel
+```
+
+> **组的约束**（装配期校验，错即拒载并点名）：`placeholder_*` 三选一**必选**、`id_*` 三选一
+> **必选**；`stream` / `cancel` 独立可选（缺省 false）。同组出现两个（如 `id_returning` +
+> `id_two_step`）算错。四种失败各有固定文案：`unknown capability "…"`（typo）、
+> `describe json invalid: …`（JSON 本身坏了）、`missing capability group "placeholder"|"id"|"dialect"`、
+> `duplicate capability in group "placeholder"|"id"|"stream"|"cancel"`。
 
 > `id` 组的现实口径：**登记与对账用，不参与执行路由**。构造器取 id 的路由按具体方言
-> 判定（只有 mysql 进「两步 `LAST_INSERT_ID()`」，其余走 `RETURNING`）——因为回取语句是
+> 判定（只有 mysql 进「两步 `LAST_INSERT_ID()`」，其余走 `RETURNING`）——所以 sqlite 虽然
+> 声明 `id_two_step`，`.returning(["id"])` 生成的却是**单语句 `RETURNING`**。因为回取语句是
 > 方言私有的，宿主无法从能力位推出来。`query.rs::exec_route` 的注释与
 > `lastid_route_is_mysql_only_not_equivalent_to_id_two_step` 用例钉死了这条边界。
 
-**接新方言（插件作者）**：在 `describe()` 返回 `{"dialect": "<名>", "capabilities": [...]}`
-（能力串是闭集：`placeholder_q|placeholder_dollar|placeholder_colon`、`id_returning|id_two_step|id_none`、
-`stream`、`cancel`；两个组各必选一）。宿主装配期严格校验，写错/漏项直接拒绝该插件并点名——
-宁可拒绝启动，也不让错配活到运行期。接入全流程与验收口径见
-`docs/plugins/plugin-development.md` §15（conformance 清单），起手骨架见
+> **能力位齐全 ≠ 业务 API 可用**：新方言的每格都由它自己的 `describe()` 决定，规则与上表
+> 完全一致；但构造器 / `listTables` / `nextSeq` / `migrate` / `seed` 还要求方言名落在宿主
+> known 子集（`sqlite` / `mysql` / `postgres`），否则一律 `OJ_DB_UNSUPPORTED`（见本节上方
+> API 矩阵的「其他方言」列）。
+
+**接新方言（插件作者）**：在 `describe()` 返回 `{"dialect": "<名>", "capabilities": [...]}`，
+能力串只能取上表 8 个之一（两个互斥组各必选一，`stream` / `cancel` 可选）。宿主装配期严格
+校验，写错/漏项直接拒绝该插件并点名——宁可拒绝启动，也不让错配活到运行期。接入全流程与
+验收口径见 `docs/plugins/plugin-development.md` §15（conformance 清单），起手骨架见
 [`tools/plugin-template-db`](../tools/plugin-template-db/README.md)；类型/值契约见本节 §10.6。
 
 **错误诊断**：db 的 reject 自带 `e.code` / `e.retryable` / `e.sessionDisposition` / `e.data`

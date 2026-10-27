@@ -49,7 +49,8 @@ v0.1.88 已落地部分：**数据库方言能力模型（ABI 12）+ 结构化�
 能力位」：插件在 `describe()` 声明 `{dialect, capabilities[]}`，宿主据此装配；`db.dialect()`
 返回声明名——此前是封闭三值枚举（未识别的 DSN 前缀被当作 sqlite，`dialect()` 于是报 `"sqlite"`），
 现在原样返回真名。
-`plugins()` / `ojInfo()` / `GET {base}/plugins` 新增 `caps` 列（与 `describe()` 同词汇）。
+`plugins()` / `ojInfo()` / `GET {base}/plugins` 新增 `caps` 列（与 `describe()` 同词汇；
+8 个能力串的语义与三内置方言取值见 api-manual「plugins —— 插件自省」的能力位对照表）。
 宿主只为 sqlite/mysql/postgres 生成 SQL——其他方言上一期只开放裸 SQL 路径
 （`db.query`/`db.exec`/`db.stream`/`db.tx`），构造器（`query_build`/`query_sql`）/
 `listTables` / `nextSeq` / `migrate` / `seed` 一律 `OJ_DB_UNSUPPORTED`
