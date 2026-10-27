@@ -1,0 +1,26 @@
+[package]
+name = "oj-db-demo" # 拷贝模板后改成你的插件包名（oj-db-<dialect> 惯例）
+version = "0.1.0"
+edition = "2024"
+description = "db 轴插件开发模板：最小可运行骨架（进程内 demo 驱动，仅作范式载体）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oj-plugin-ffi = { path = "../../oj-plugin-ffi" }
+serde_json = "1"
+# worker 只做 driver 的 IO 转发，2 个足够（缺省 = 全核白占线程，照 oj-db-mysql）。
+# 真实 driver 若自带 runtime / 阻塞 API，改成 `new_current_thread` + 你自己的独占线程。
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# 模板骨架：不进根 workspace members（拷贝使用）。空 [workspace] 使本 crate 自成
+# workspace 根，避免「believes it's in a workspace when it's not」报错；
+# 拷贝进 plugins/ 后删掉本段，并调整上方 path 依赖。
+[workspace]
+
+# 必须 unwind：`oj_plugin_entry!` 与 catch_future 都靠 catch_unwind 收敛跨边界 panic，
+# abort 会让插件里的任何 panic 直接杀掉宿主进程。
+# （拷贝进 plugins/ 后继承根 Cargo.toml 的 [profile.release]，本段可删。）
+[profile.release]
+panic = "unwind"

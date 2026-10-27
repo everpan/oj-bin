@@ -511,3 +511,105 @@ sequenceDiagram
 > 原方案全文（进程内 trait 路线的完整设计与分阶段计划，未执行）留存于 git 历史
 > （`docs/plugins/plugin-architecture.md`，已删除）。
 
+
+## 15. 新增数据库方言：从零接入的 conformance 清单
+
+> 面向第三方插件作者。**能力位闭集**（§3 的 db 轴）决定了能声明什么；本节决定「怎么算接入
+> 完成」。除「裸 SQL 能跑」之外的每一条都要有测试，且每能力位**一正一反**。
+
+### 15.1 五步接入
+
+1. **`describe()` 定能力位**——只声明你**真做得到**的：声明即承诺（宿主不会替你兜默认实现）。
+2. **错误信封**——插件侧 `Err(RString)` 恒为信封 JSON（§3），每条失败路径都要过映射函数。
+3. **值映射**——六类 schema 类型 × 读侧 JSON 契约，见 `docs/db-guide.md` §10.6。
+4. **驱动生命周期**——进程内驱动（cdylib 直接连）或子进程 sidecar（本节 15.4）。
+5. **发布形态**——`bin/plugins/<triple>/` 整体拷贝 + 清单锁 + 能力位在启动横幅可见（15.5）。
+
+> **起手用骨架**：[`tools/plugin-template-db`](../../tools/plugin-template-db/README.md) 是可拷贝的
+> db 轴 cdylib 模板——上列五步的代码面已经摆好（`describe()` 能力位自报、信封构造函数、
+> 流式三态信封、句柄/事务/游标生命周期），并带 11 个自检用例（对应 15.6）。真实驱动只需替换
+> 12 个 `do_*`；能力位与行为由同一组常量驱动，翻一个布尔值两侧同时翻转，不会漂移。
+
+### 15.2 能力位注册表（8 个，一正一反）
+
+| 能力串 | 语义 | 宿主消费点 | 正例（必须做） | 反例（必须拒绝/降级） |
+|---|---|---|---|---|
+| `placeholder_q` | 原生占位符是 `?` | `placeholder.rs`（不改写） | `select * from t where id = ?` 直接下发 | ——（三选一必选） |
+| `placeholder_dollar` | 原生是 `$n` | `placeholder.rs` 把 `?` 依次改写为 `$1..$n` | 带 2 个参数时产出 `$1`/`$2` | 参数量不符 → `count mismatch` 报错，不静默 |
+| `placeholder_colon` | 原生是 `:n` | 宿主**不改写**（`:n` 改写归插件内部） | 宿主原样透传 `:1`/`:2` | 插件内部改写失败 → `syntax` 信封 |
+| `id_returning` | 插入可 `RETURNING` 取自增 | `query.rs::exec_route` | 单条 insert 拿到 id | 批量插入 → 走「无 id」路径，不假装 |
+| `id_two_step` | 需 `LAST_INSERT_ID()` 类二次查询 | 同上 | 取到正确 id | 无自增列时 → `id_none` 语义，无 id |
+| `id_none` | 不取自增（客户端生成主键） | 同上 | 返回「无 id」而不报错 | 上层要 id → 由 `db.nextSeq` 或业务生成 |
+| `stream` | 实现 `stream_open/next/cancel/close` | `op_db_stream_open` | 分批取行、`done` 收尾 | 未实现却声明 → 四象限矩阵第一格：**如实 unsupported**，不回退 `fetch_all` |
+| `cancel` | 语句级真取消（服务端中断） | `stream_cancel` | 慢查询在 ≤5s 内从服务端消失 | 未声明 → 走标准兜底；声明却落默认实现 → unsupported |
+
+> 反例纪律：**未声明**某能力但运行时出现了 → 采纳 + stderr 告警（说明 describe 写漏）；
+> **声明了**却返回 unsupported → 如实报错（不改写成「看起来能用」）。
+
+### 15.3 错误映射骨架
+
+`sqlx` 驱动按 `ErrorKind` + SQLSTATE 类别分；非 sqlx 驱动（go-ora / DPI / JDBC）按厂商码查表。
+**未知厂商码 → `internal` + `retryable=false` + `data.vendor_code` 原样透传，禁止猜**。
+
+| category | retryable | session_disposition | 判据（示例） |
+|---|---|---|---|
+| `constraint` | false | keep | 唯一/外键/非空/检查违例（SQLSTATE `23`；mysql 1062；Oracle `ORA-00001`/`ORA-02291`/`ORA-02292`） |
+| `syntax` | false | keep | 语法错、对象/列不存在、权限不足（SQLSTATE `42`；Oracle `ORA-00942`/`ORA-00904`） |
+| `timeout` | true | keep | 语句/锁等待超时、死锁（SQLSTATE `40`；Oracle `ORA-00060`） |
+| `connection` | true | close | 断连、握手失败、TLS 失败（SQLSTATE `08`；Oracle `ORA-03135`/`ORA-12170`） |
+| `capacity` | true | keep | 资源不足：连接/表空间/临时段（SQLSTATE `53`） |
+| `cancelled` | false | keep | 用户主动取消（SQLSTATE `57`；Oracle `ORA-01013`） |
+| `unsupported` | false | keep | 宿主侧门控（能力位缺失），**不由插件产生** |
+| `internal` | false | keep | 兜底：未识别厂商码、驱动内部错误 |
+
+**达梦（DM8）已核实的样例码**（来自 dbx `agents/drivers/dameng` 的既有处理，二手证据，M2 真库复核）：
+`-5669` 权限不足、`-6118` 元数据 DATETIME 转换失败、`-3325`/`-2207` 元数据不可用——均为
+`internal`（目录/工具面问题，不是语句错误，重试无益）。约束/语法/超时类码**必须**在 M2 由真库
+用例钉死，不许照抄 Oracle 的编号（DM 与 Oracle 错误号不通用）。
+
+### 15.4 驱动生命周期（子进程 sidecar 形态）
+
+进程内驱动跳过本节。sidecar（如 Oracle 的 go-ora）必须满足五条，缺一条就是运行期事故：
+
+1. **协议纯净**：请求/响应带自增 id，一请求一响应；**stdout 只走协议**，日志全部走 stderr
+   （否则一行日志就能撑爆 64KB 管道缓冲，或永久阻塞一个请求）。
+2. **读看门狗**：超时（默认小于 `server.timeout`）= kill 进程组 + `category=timeout`、
+   `session_disposition=reset`。
+3. **父子同命**：进程组 + Linux `prctl(PDEATHSIG)`；插件内异步 reaper 收尸（distroless/PID 1
+   形态没有 init 帮你回收僵尸）。
+4. **崩溃处置**：该 sidecar 的全部会话 → `connection` / `close`；重启走指数退避 + 连续失败熔断。
+5. **两形态验收**：`--daemon`（setsid，物理机）与容器各一条用例：`kill <pid>` 后 sidecar 必须消失。
+
+实物随 `bin/plugins/<triple>/` 以**版本钉死的同级文件**发布（不做嵌入抽取）；`xtask` 需能按
+triple 构建它（Go 工具链进构建矩阵是 M2 入口项）。
+
+### 15.5 发布形态与排障入口
+
+- `cargo xtask build` 产出的 `bin/plugins/<triple>/plugins.lock.json` 记录 `{name, abi, fingerprint}`；
+  目录里多出的未登记 `.so` 会被**拒载并点名**（增量覆盖残留旧库的典型症状）。
+- 启动横幅打印 host ABI 与每插件的 `abi / fp / caps`；`plugins()` 与 `GET {base}/plugins`
+  的 `caps` 列同源——**先看这里**确认能力位真的生效了。
+- 只换了单个库（`cargo xtask plugin <name>`）而没刷新锁 → 可能撞锁；收尾一律 `cargo xtask build`。
+
+### 15.6 验收清单（可拷贝进 PR）
+
+下表是人工/CI 自查项。骨架侧已有机器可跑的对应物：
+`cd tools/plugin-template-db && cargo test --release`（11 用例，逐条映射见该目录 README 的
+「自检」表）；把它当作「第 0 版实现」，缺哪条补哪条。
+
+```markdown
+- [ ] `describe()` 能力位闭集合法（两组各一项 + 可选 stream/cancel），装配期无告警
+- [ ] 占位符：正例（带参改写/透传）+ 参数量不符反例
+- [ ] 取 ID：`id_*` 与实际行为一致（含批量/无自增列的反例）
+- [ ] `stream`：分批 + done + 中途错误（带内 `{"error":…}`）+ 与 `db.query` 逐值一致
+- [ ] `cancel`：真库 ≤5s 服务端查询消失；未声明时走标准兜底
+- [ ] 四象限矩阵：声明+unsupported 不回退、未声明+unsupported 回退、未声明+实现 告警采纳、声明+默认实现 unsupported
+- [ ] 错误信封：六类各一条真实错误 → category/retryable/disposition/vendor_code 断言
+- [ ] 未知厂商码 → internal + vendor_code 原样透传（禁止猜）
+- [ ] 值映射：六类 schema 类型建表 + 读回契约（超精度 → 十进制串、ISO 8601、blob 约定）
+- [ ] 读侧未识别列类型**报错**而非静默 null（点名列名 + 类型 + cast 指引）
+- [ ] 未知方言六门控点（构造器 / exec_route / 占位符 / listTables / nextSeq / search.*）→ `OJ_DB_UNSUPPORTED`
+- [ ] 裸 SQL 四条路径（query/exec/stream/tx）在该方言上全量可用
+- [ ] sidecar（若有）：五条生命周期契约 + `kill` 用例（daemon/容器各一）
+- [ ] 发布：`cargo xtask build` 后锁与指纹一致，启动横幅 caps 正确
+```

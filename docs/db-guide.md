@@ -615,11 +615,70 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 **接新方言（插件作者）**：在 `describe()` 返回 `{"dialect": "<名>", "capabilities": [...]}`
 （能力串是闭集：`placeholder_q|placeholder_dollar|placeholder_colon`、`id_returning|id_two_step|id_none`、
 `stream`、`cancel`；两个组各必选一）。宿主装配期严格校验，写错/漏项直接拒绝该插件并点名——
-宁可拒绝启动，也不让错配活到运行期。详见 `docs/plugins/plugin-development.md` §3。
+宁可拒绝启动，也不让错配活到运行期。接入全流程与验收口径见
+`docs/plugins/plugin-development.md` §15（conformance 清单），起手骨架见
+[`tools/plugin-template-db`](../tools/plugin-template-db/README.md)；类型/值契约见本节 §10.6。
 
 **错误诊断**：db 的 reject 自带 `e.code` / `e.retryable` / `e.sessionDisposition` / `e.data`
 （含引擎原始码 `data.vendor_code`）——不要解析 message 文本。完整口径见
 `docs/devkit/api-manual.md`「结构化数据库错误」。
+
+---
+
+## 10.6 类型映射表与值契约（跨方言）
+
+`schema.yaml` 的列类型词汇是**固定的六类**（`src/bridge/registry.rs` 的
+`ColumnType::from_schema_type`）。任何方言插件都必须能把六类建成表、并读回 JS 可用的值；
+对不上要**报错**，不许静默兜底。
+
+### 1) 建表映射（DDL）
+
+| 逻辑类型 | sqlite | mysql | postgres | oracle（M2 · 方案级） | 达梦 DM8（M2 · 待真库复核） |
+|---|---|---|---|---|---|
+| `integer` | `INTEGER` | `INT` | `int4` | `NUMBER(38)` | `INT` |
+| `bigint` | `INTEGER` | `BIGINT` | `int8` | `NUMBER(20)` | `BIGINT` |
+| `text` | `TEXT` | `TEXT` / `VARCHAR(n)` | `text` | `VARCHAR2(4000)`；超长 `CLOB` | `VARCHAR(n)` / `CLOB` |
+| `boolean` | `INTEGER`（0/1） | `TINYINT(1)` | `boolean` | `NUMBER(1)` + `CHECK (c IN (0,1))` | `BIT` / `TINYINT`（M2 定） |
+| `double` | `REAL` | `DOUBLE` | `float8` | `BINARY_DOUBLE` | `DOUBLE` |
+| `blob` | `BLOB` | `BLOB` | `bytea` | `BLOB` | `BLOB` |
+
+> 后两列来自设计 §5.6 的方案结论，**M2 落地时以真库 DDL 复核后回填**——不要据此直接生产建表。
+
+### 2) 读侧值契约（JSON / JS）
+
+| 逻辑类型 | JS 侧拿到 | 备注 |
+|---|---|---|
+| `integer` / `bigint` | `number`；**超出 ±(2^53-1) 的 i64 → 十进制字符串** | 见 `docs/numeric-limits.md`；回写超界整数用 `toBigInt()` |
+| `double` | `number` | 二进制浮点，别用来放钱 |
+| `boolean` | `true` / `false`；**MySQL 读出 `1` / `0`** | MySQL 无独立布尔类型（`TINYINT(1)`） |
+| `text` | `string` | |
+| `blob` | `string`（**UTF-8 lossy 转换**） | 真二进制请自己 base64 后存 `text`；二进制不会原样穿过 JSON |
+| 日期时间（**不在六类内**） | 用 `text` 存 ISO 8601 | 引擎原生 DATE/TIMESTAMP 属「受限列」，需显式 `cast`（见下表） |
+
+### 3) 三内置方言的读侧边界
+
+| 方言 | 可读 | 报错（点名列名 + 类型，给 `cast` 指路） | 未识别时静默 `null`？ |
+|---|---|---|---|
+| sqlite | 整数 / 浮点 / 文本 / BLOB（动态类型） | —— | **是**（`row_to_json` 兜 `Value::Null`，既有行为，未收紧） |
+| mysql | 整数家族（含 `BIGINT UNSIGNED`）/ 文本家族 / 二进制 / `FLOAT` / `DOUBLE` | `DECIMAL`、日期时间、`JSON`、`BIT`、`GEOMETRY` | 否 |
+| postgres | `boolean`、`int2` / `int4` / `int8`、`float8`、`text` / `varchar` / `char`、`bytea` | `real`（float4）、`numeric`、`json` / `jsonb`、`uuid`、日期时间、数组、`void` | 否 |
+
+`db.query` 与 `db.stream` 用**同一套判据**（v0.1.88 起流式补齐 `smallint`/`integer`；此前流式
+读这两类会误报「未解码」，而同样的查询走 `db.query` 却正常）。
+
+### 4) 新方言接入的硬要求
+
+1. **禁止 `Unknown` 静默当 text**：`schema.yaml` 声明的类型若该方言没有映射，**装配期**就得拒载
+   并点名（类型 + 方言）。现状是 `ColumnType::from_schema_type` 把不认识的字符串（如
+   `type: varchar`）静默归 `Unknown` → 按 text 处理；新方言接入前必须补这道 fail-fast，否则
+   租户守卫会把 `tenant_id` 当文本绑定，在 PG 上退化成一个难懂的
+   `operator does not exist: bigint = text`。
+2. **读侧不许静默 `null`**：解不出的列类型必须报错（mysql/pg 插件的既有做法）。sqlite 的静默
+   `null` 是历史包袱，新插件**不要照抄**。
+3. 上表第 2 节的**值契约是跨方言契约**，逐项写进插件 conformance 清单验收（见
+   `docs/plugins/plugin-development.md` §15「新增数据库方言」）；起手用
+   [`tools/plugin-template-db`](../tools/plugin-template-db/README.md) 骨架，它已把这四条
+   摆成代码面（含未声明/已声明 `stream`·`cancel` 的一致性用例）。
 
 ---
 

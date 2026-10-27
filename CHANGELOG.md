@@ -64,6 +64,30 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
   （ABI 不变，可原地替换）。仍未解码的类型（`real`/`jsonb`/`numeric`/`uuid`/时间戳/数组等）
   继续响亮报错并给出 `cast` 指引。
 
+### docs(db) / tools — 方言接入资料与 db 轴模板（阶段三的无库切片）
+
+`oj-db-oracle` / `oj-db-dameng`（阶段二）仍卡在达梦 DPI 再分发许可与 Go triple 矩阵两道外部门禁上，
+故先落地**不需要真库与外部许可**的那部分：类型映射表、conformance 清单、可拷贝的 db 轴骨架。
+
+- `docs/db-guide.md` 新增 **§10.6 类型映射表与值契约（跨方言）**：六类 schema 类型 ×
+  sqlite/mysql/pg/oracle/DM8 的 DDL 映射（后两列标注「M2 方案级 / 待真库复核」，不作生产依据）、
+  读侧 JSON/JS 值契约、三内置方言读侧边界表（点名 **sqlite 仍会静默 `null`** 属历史包袱、新插件勿照抄），
+  以及新方言四条硬要求——其中「禁止 `Unknown` 静默当 text」是当前 `ColumnType::from_schema_type`
+  的真实缺口（`type: varchar` 会归 `Unknown` 按文本处理，租户守卫因此在 PG 上退化成
+  `operator does not exist: bigint = text`）。
+- `docs/plugins/plugin-development.md` 新增 **§15 新增数据库方言 conformance 清单**：五步接入、
+  8 能力位注册表（逐能力位写明宿主消费点 + 正例 + 反例）、错误映射骨架（含 dbx 侧二手证据的达梦
+  错误码 `-5669` / `-6118` / `-3325` / `-2207`，明确标注待 M2 真库复核且**不得照搬 Oracle 编号**）、
+  sidecar 五条生命周期契约、发布形态与排障入口，以及 14 条可直接拷进 PR 的验收清单。
+- 新增 `tools/plugin-template-db`：**db 轴 cdylib 插件骨架**（`demo` 方言，进程内，不连真库）。
+  `describe()` 能力位自报 / 结构化错误信封（8 类 × 5 字段，用枚举而非字符串防 typo）/
+  流式三态信封（`rows`·`done`·`error`，绝不裸 `null`）/ 句柄·事务·游标生命周期全部摆全，
+  11 个自检用例逐条对应 §15.6。能力位与行为由**同一组常量**驱动：翻转 `SUPPORTS_STREAM` /
+  `SUPPORTS_CANCEL` 后套件仍全绿（声明与实现不会漂移）。真实驱动只需替换 12 个 `do_*`。
+  不进 workspace members（与既有泛型轴模板 `tools/plugin-template` 同款：拷贝使用的骨架）。
+- 交叉引用：§10.5 能力矩阵、§10.6、§15 与模板 README 四向互指，运维侧仍以 `api-manual.md`
+  「结构化数据库错误」为准。
+
 ## v0.1.87
 
 WS 目录镜像路由与 `api.ts` 同口径（`--module-root` 下剥布局段）+ 挂载清单外显。

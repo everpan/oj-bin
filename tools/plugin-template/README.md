@@ -9,6 +9,11 @@
 > 骨架自带的空 `[workspace]` 段只为了让模板在 oj 仓库内能被独立
 > `cargo build` 验收；**拷贝使用时按下面路径 A 删掉它**。
 
+> 要接的是**数据库方言**（进宿主已有的 SQL 能力面，而不是新开一个能力面）？
+> 用隔壁的 [db 轴模板](../plugin-template-db/README.md)：它带 `describe()` 能力位自报、
+> 结构化错误信封、流式三态信封与句柄/事务/游标生命周期，配套
+> `docs/plugins/plugin-development.md` §15 的 conformance 清单。
+
 ## 命名三方对齐（先读这段）
 
 xtask 约定三者用同一个 `<name>`（本模板 = `cache`）：

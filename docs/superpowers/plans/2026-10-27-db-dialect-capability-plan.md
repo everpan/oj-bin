@@ -36,7 +36,12 @@
 |---|---|---|---|---|
 | 一 M1 契约与宿主 | ✅ 完成（T1–T14；改动待用户提交） | 无 | 已终审（四路 + 逐条处置） | 见文末「阶段一小结」 |
 | 二 M2 验证方言 | ☐ 未开始 | 达梦 DPI 许可书面结论；Go 工具链进 xtask/CI 确认（**均未取得 → 门禁未过，不开工**） | 阶段终审 | 阶段小结 |
-| 三 M3 收尾 | ☐ 未开始 | M2 通过 | 阶段终审 | 阶段小结 |
+| 三 M3 收尾 | ◐ 无库切片已落地（3/5 域；其余待 M2） | M2 通过（**未满足**） | 阶段终审（未启动） | 见「阶段三·无库切片」 |
+
+> **阶段三为何有「◐」**：M3 的 5 个任务域里，有 3 个不依赖真库与外部许可（方言接入章节 /
+> db 轴模板 / 方言矩阵与类型映射）。用户 2026-10-27 决策：先做这 3 个可本地验证的部分，
+> 剩余 2 个（`db.dialect()` 迁移范式、ops-manual §1/§6/§7/§8 增补）仍随 M3 整体等 M2。
+> **M3 本身未启动、未终审**——这里不改变阶段门禁，只登记已完成的无库工作。
 
 > **进度登记（本工作区，改动尚未由用户提交）：** T1 真库基座 / T2 `dialect_caps` / T3 `db_error`
 > / T4 ABI 12 / T5 装配期 describe / T6 DataAccessor.dialect_info / T7 占位符查表 / T8 六门控点
@@ -389,6 +394,46 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
 **任务域：** `plugin-development.md`「新增数据库方言」章节（能力位注册表、错误映射骨架含 Oracle/DM 样例行）；`tools/plugin-template` db 轴骨架 + 方言 conformance checklist（每能力位一正一反 + unsupported 一致性）；`db-guide.md` 方言矩阵（含 §5.6 类型映射表与 JS 错误码速查）；`db.dialect()` 红字与迁移范式；ops-manual §1/§6/§7/§8 增补（发布物、告警映射、`plugin abi mismatch`/`fingerprint mismatch` 排障行、回滚三元组）。
 **验收：** 文档交叉引用全部可达；模板按 checklist 自检通过；ops 表与实际错误文本一致。
 **终审 + 小结：** 同 Task 14 协议。
+
+## 阶段三·无库切片（2026-10-27，用户决策先行）
+
+**背景**：阶段二两道入口门禁（达梦 DPI 再分发书面许可、Go triple 矩阵进 CI）均未取得，且本机
+无可达的 Oracle / 达梦真库（`container` 缓存只有 mysql/pg，无 Oracle/DM 镜像）。M3 的五个任务域里
+有三个**完全不依赖真库与外部许可**，故先做这三个，避免整条链空转。
+
+**已完成（3/5 域）**
+
+| 域 | 落点 | 验收口径 |
+|---|---|---|
+| 方言接入章节（能力位注册表 + 错误映射骨架 + 清单） | `docs/plugins/plugin-development.md` §15（15.1–15.6，606 行文件） | 8 能力位每格齐「宿主消费点 + 正例 + 反例」；错误映射表六类 × (category, retryable, disposition)；DM 错误码标注「二手证据 / 待 M2 真库复核」且明确禁止照搬 Oracle 编号 |
+| db 轴模板骨架 | `tools/plugin-template-db/`（新增，不进 workspace members） | `cargo build --release` / `cargo fmt --check` / `cargo clippy --release --all-targets -D warnings` 全绿；`cargo test --release` **11 passed**；`SUPPORTS_STREAM`/`SUPPORTS_CANCEL` 翻 `false` 后**仍 11 passed**（声明与行为同源，不漂移） |
+
+| 方言矩阵 + 类型映射表 | `docs/db-guide.md` §10.5 补交叉引用；新增 §10.6（六类 × 五方言 DDL、读侧值契约、三内置方言读侧边界、新方言四条硬要求） | Oracle/DM 两列标注「M2 方案级 / 待真库复核」；sqlite 静默 `null` 被显式标为历史包袱；§10.5 / §10.6 / §15 / 模板 README 四向互指可达 |
+
+**模板的真实宿主验收（2026-10-27，`bin/oj serve` + `OJ_PLUGINS_DIR` 指向自建目录）**
+
+| 场景 | 结果 |
+|---|---|
+| 正确 `describe()` | 装配成功，日志 `[oj-serve] host ABI_VERSION = 12` / `plugin db-demo abi=12 fp=… \| caps: placeholder=: id=none stream cancel`——能力位确由 describe 解析而来 |
+| 把 `CAP_PLACEHOLDER` 写成 `placeholder_colon_`（typo） | **拒启**并逐字点名：`plugins db assembly: plugin db capability error: unknown capability "placeholder_colon_"` |
+
+**未做（2/5 域，随 M3 整体等 M2）**
+
+1. `db.dialect()` 红字与迁移范式——要等新方言（Oracle/DM）实际接入后才有可写的迁移路径，
+   否则只是空泛的「不要依赖 dialect()」；
+2. `ops-manual` §1/§6/§7/§8 增补（发布物、告警映射、`plugin abi mismatch` / `fingerprint mismatch`
+   排障行、回滚三元组）——告警映射需要真实新方言的错误码分布，`abi/fingerprint` 排障行的
+   **文案**要与 M2 落地后的实际报错逐字对齐（M3 验收条件即「ops 表与实际错误文本一致」）。
+
+**顺带记录的两处缺口（不属本切片，均登记不改实现）**
+
+1. `ColumnType::from_schema_type` 把未识别的 schema 类型串（如 `type: varchar`）静默归 `Unknown`
+   → 按 text 处理。这正是 §10.6 第 4 节第 1 条「禁止 `Unknown` 静默当 text」所指——**当前实现
+   尚未 fail-fast**，新方言接入前必须补。
+2. 能力位解析失败的文案只点名**轴**不点名**插件**：`plugins db assembly: plugin db capability
+   error: unknown capability "…"`（单 db 插件时无歧义，T2 串容易定位；两个 db 插件同时在场时
+   无法一眼看出是哪个）。建议 M3 落 ops 排障行时连带补上插件名——**本次不改**，避免在收尾切片里
+   动装配层文案（该文案未进冻结快照，改动成本低，留待与 ops 表一起对齐）。
 
 ---
 
