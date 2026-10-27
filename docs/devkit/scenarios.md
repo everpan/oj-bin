@@ -3265,3 +3265,77 @@ curl -X POST localhost:9778/v1/api/user/account/ -d '{"id":1,"name":"a"}'   # �
 | 以为 `e.data` 是 JSON 字符串 | 已解析为对象（`e.data.capability` 直接可用）；`e.retryable` 已是布尔 |
 | 无脑 `while(true)` 重试 | 先判 `e.retryable === true`；`sessionDisposition === "close"` 时重试只会继续打挂库 |
 | 新方言插件上构造器报 `OJ_DB_UNSUPPORTED` 就以为坏了 | 预期：宿主只为 sqlite/mysql/postgres 生成 SQL，其他方言上一期只有裸 SQL 路径；`e.data.capability` 会点名是哪个 API |
+
+## 场景 45：把 `db.dialect()` 分支迁移成「能力位 + 白名单」（v0.1.88）
+
+**要解决的**：v0.1.88 起方言名是**开放集**（插件 `describe()` 声明什么就是什么），
+`db.dialect()` 不再收窄成三个字面量、也不再对未知名报错。存量代码里的
+`if (db.dialect() === "mysql") A else B` 会在新方言接入后把 B **静默**发给它——
+`ON DUPLICATE KEY` 发给 Oracle、`$1` 发给 sqlite，报错却落在引擎侧，看着像方言 bug。
+
+### ① 先删：这些分支平台已经替你做了
+
+| 存量写法 | 替换 |
+|---|---|
+| 拼占位符：`d === "postgres" ? sql.replace(/\?/g, () => `$${++i}`) : sql` | 一律写 `?`——宿主按能力位改写（`placeholder_dollar` → `$n`；`placeholder_colon` 由插件内部改写） |
+| 取自增 id：`d === "postgres" ? sql + " returning id" : …` | `await db.table("t").insert({...}).run()` 的返回值（按 `id_returning`/`id_two_step`/`id_none` 自动选路） |
+| 列目录：`d === "sqlite" ? "select name from sqlite_master …" : "select table_name from information_schema …"` | `await db.listTables("user_")`（方言无关，SQL 是引擎常量） |
+| 取号：`select max(id)+1`（并为此分支） | `await db.nextSeq("order_no")` |
+
+### ② 保留：真方言特有的 SQL 走白名单 + 响亮失败
+
+```ts
+// _shared/dialect.ts —— 全项目唯一的方言分派点，集中受审
+const UPSERT_SQL = {
+  sqlite:   "insert into account (id,name) values (?,?) on conflict(id) do update set name=excluded.name",
+  postgres: "insert into account (id,name) values (?,?) on conflict(id) do update set name=excluded.name",
+  mysql:    "insert into account (id,name) values (?,?) on duplicate key update name=values(name)",
+} as const;
+type UpsertDialect = keyof typeof UPSERT_SQL;
+
+export async function upsertAccount(id: number, name: string): Promise<void> {
+  const d = db.dialect();                       // 声明名，可能是任何值（含 "oracle"）
+  if (!(d in UPSERT_SQL)) {
+    // 关键：不猜、不兜底、不当成 mysql/postgres 硬跑
+    throw new Error(`upsertAccount: dialect ${d} 未适配（已支持 ${Object.keys(UPSERT_SQL).join("/")}）`);
+  }
+  await db.exec(UPSERT_SQL[d as UpsertDialect], [id, name]);
+}
+```
+
+要点：白名单**用对象键**（新增方言必须补键，忘了编译期就红）；**不写 `else` 兜底**；
+错误信息点名「函数 + 方言 + 已支持集」，比引擎的 `ORA-00933` 好排一百倍。
+
+### ③ 能力问题不要问方言，直接调用
+
+```ts
+async function listReportIds(): Promise<unknown[]> {
+  try {
+    return await db.table("report").select(["id"]).all();
+  } catch (e: any) {
+    if (e.code !== "OJ_DB_UNSUPPORTED") throw e;    // 宿主不替该方言生成 SQL
+    return db.query("select id from report");       // 裸 SQL 路径始终可用
+  }
+}
+```
+
+### ④ 验证
+
+```bash
+# 1) 三内置方言：改造前后行为应逐字一致（占位符/取 id/列目录结果不变）
+# 2) 方言能力面：看装上的插件声明了什么
+./bin/oj info | sed -n '/^## plugins/,/^## generic_axes/p'   # caps: placeholder=? id=two_step stream cancel
+curl -s localhost:9778/v1/api/user/account/          # 构造器可用则正常返回
+# 3) 若接了新方言插件：构造器路径应 500 且 e.data.capability 点名 API；
+#    upsert 路径应报「未适配（已支持 …）」，而不是引擎语法错误
+```
+
+### ⑤ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| `d === "mysql" ? A : B` | **最危险的写法**：新方言静默拿 B。改成白名单 + `throw` |
+| 用 `db.dialect()` 判断「能不能用构造器」 | 问不出正确答案（能力位不在这条通道上）；直接调用并接 `OJ_DB_UNSUPPORTED` |
+| 在 handler 里读 `plugins()` 的 `caps` 自己分派 | `caps` 是给运维核对装配的外显（`GET {base}/plugins`、`oj info`），不是业务能力探测入口 |
+| 把 `db.dialect()` 缓存成模块常量 | `db = DB(name)`，命名库之间可能不同方言；`db.tx` 句柄同面——缓存会跨库读错 |
+| 以为新方言上 `?` 也要自己改 | JS 侧永远写 `?`；改写归宿主（`$n`）或插件内部（`:n`） |

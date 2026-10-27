@@ -36,12 +36,15 @@
 |---|---|---|---|---|
 | 一 M1 契约与宿主 | ✅ 完成（T1–T14；改动待用户提交） | 无 | 已终审（四路 + 逐条处置） | 见文末「阶段一小结」 |
 | 二 M2 验证方言 | ☐ 未开始 | 达梦 DPI 许可书面结论；Go 工具链进 xtask/CI 确认（**均未取得 → 门禁未过，不开工**） | 阶段终审 | 阶段小结 |
-| 三 M3 收尾 | ◐ 无库切片已落地（3/5 域；其余待 M2） | M2 通过（**未满足**） | 阶段终审（未启动） | 见「阶段三·无库切片」 |
+| 三 M3 收尾 | ◐ 5/5 域已落地（2 域含「M2 回填点」） | M2 通过（**未满足**） | 阶段终审（未启动） | 见「阶段三·无库切片」 |
 
-> **阶段三为何有「◐」**：M3 的 5 个任务域里，有 3 个不依赖真库与外部许可（方言接入章节 /
-> db 轴模板 / 方言矩阵与类型映射）。用户 2026-10-27 决策：先做这 3 个可本地验证的部分，
-> 剩余 2 个（`db.dialect()` 迁移范式、ops-manual §1/§6/§7/§8 增补）仍随 M3 整体等 M2。
-> **M3 本身未启动、未终审**——这里不改变阶段门禁，只登记已完成的无库工作。
+> **阶段三为何有「◐」**：M3 的 5 个任务域里，有 3 个完全不依赖真库与外部许可（方言接入章节 /
+> db 轴模板 / 方言矩阵与类型映射），已先做（用户 2026-10-27 决策）。**剩余 2 个**（`db.dialect()`
+> 红字与迁移范式、ops-manual §1/§6/§7/§8 增补）中的结构性内容也已写完——迁移范式不依赖具体新方言
+> （其**方向**正是「不要按方言名分派」），运维手册的报错文案逐字取自**当前已实现**的代码。
+> 剩的只是 M2 落地后需要回填的少数行（Oracle/DM 厂商错误码分布、advisory 锁类告警），已在文档里
+> 显式标为「M2 回填」。
+> **M3 本身未终审**——这里不改变阶段门禁，只登记已完成的无库工作。
 
 > **进度登记（本工作区，改动尚未由用户提交）：** T1 真库基座 / T2 `dialect_caps` / T3 `db_error`
 > / T4 ABI 12 / T5 装配期 describe / T6 DataAccessor.dialect_info / T7 占位符查表 / T8 六门控点
@@ -399,16 +402,18 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
 
 **背景**：阶段二两道入口门禁（达梦 DPI 再分发书面许可、Go triple 矩阵进 CI）均未取得，且本机
 无可达的 Oracle / 达梦真库（`container` 缓存只有 mysql/pg，无 Oracle/DM 镜像）。M3 的五个任务域里
-有三个**完全不依赖真库与外部许可**，故先做这三个，避免整条链空转。
+有三个**完全不依赖真库与外部许可**，故先做这三个，避免整条链空转；余下两个随后补齐
+（2026-10-27 第二轮，见下表第 4/5 行）。
 
-**已完成（3/5 域）**
+**已完成（5/5 域）**
 
 | 域 | 落点 | 验收口径 |
 |---|---|---|
 | 方言接入章节（能力位注册表 + 错误映射骨架 + 清单） | `docs/plugins/plugin-development.md` §15（15.1–15.6，606 行文件） | 8 能力位每格齐「宿主消费点 + 正例 + 反例」；错误映射表六类 × (category, retryable, disposition)；DM 错误码标注「二手证据 / 待 M2 真库复核」且明确禁止照搬 Oracle 编号 |
 | db 轴模板骨架 | `tools/plugin-template-db/`（新增，不进 workspace members） | `cargo build --release` / `cargo fmt --check` / `cargo clippy --release --all-targets -D warnings` 全绿；`cargo test --release` **11 passed**；`SUPPORTS_STREAM`/`SUPPORTS_CANCEL` 翻 `false` 后**仍 11 passed**（声明与行为同源，不漂移） |
-
 | 方言矩阵 + 类型映射表 | `docs/db-guide.md` §10.5 补交叉引用；新增 §10.6（六类 × 五方言 DDL、读侧值契约、三内置方言读侧边界、新方言四条硬要求） | Oracle/DM 两列标注「M2 方案级 / 待真库复核」；sqlite 静默 `null` 被显式标为历史包袱；§10.5 / §10.6 / §15 / 模板 README 四向互指可达 |
+| `db.dialect()` 红字与迁移范式 | `docs/db-guide.md` **§10.7**（红字 + 6 行「分档迁移表」+ 第 ③ 档模板 + 反例）；`docs/devkit/api-manual.md` 的 `db.dialect()` 行与「方言边界」块；**场景 45**（可照抄）；SKILL 陷阱速查 +1 行 | 三档覆盖「删掉 / 换问法 / 保留」；反例明确写 `else` 兜底的失效方式（新方言静默拿错 SQL）；模板**白名单用对象键 + `throw`**，不出现任何兜底分支；§10.5 → §10.7 → 场景 45 可达 |
+| `ops-manual` §1/§6/§7/§8 增补 | `docs/ops-manual.md`：§1.2 插件目录与清单锁；§6.1 装配期日志（逐字表）；§7 排障 +8 行；§8.1 回滚三元组 | 每条文案**逐字取自代码**（`plugin_loader.rs` 的 `Display` 实现、`serve_cmd.rs` 的横幅格式），不写「预计」「大约是」；回滚步骤给出可执行命令与三项核对 |
 
 **模板的真实宿主验收（2026-10-27，`bin/oj serve` + `OJ_PLUGINS_DIR` 指向自建目录）**
 
@@ -417,13 +422,22 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
 | 正确 `describe()` | 装配成功，日志 `[oj-serve] host ABI_VERSION = 12` / `plugin db-demo abi=12 fp=… \| caps: placeholder=: id=none stream cancel`——能力位确由 describe 解析而来 |
 | 把 `CAP_PLACEHOLDER` 写成 `placeholder_colon_`（typo） | **拒启**并逐字点名：`plugins db assembly: plugin db capability error: unknown capability "placeholder_colon_"` |
 
-**未做（2/5 域，随 M3 整体等 M2）**
+**M3 验收自检（2026-10-27）**
 
-1. `db.dialect()` 红字与迁移范式——要等新方言（Oracle/DM）实际接入后才有可写的迁移路径，
-   否则只是空泛的「不要依赖 dialect()」；
-2. `ops-manual` §1/§6/§7/§8 增补（发布物、告警映射、`plugin abi mismatch` / `fingerprint mismatch`
-   排障行、回滚三元组）——告警映射需要真实新方言的错误码分布，`abi/fingerprint` 排障行的
-   **文案**要与 M2 落地后的实际报错逐字对齐（M3 验收条件即「ops 表与实际错误文本一致」）。
+| 验收条件 | 证据 |
+|---|---|
+| 文档交叉引用全部可达 | §10.5 → §10.7 → 场景 45 → api-manual「方言边界」→ SKILL 陷阱 四向互指；§10.6/§15/模板 README 侧既有链路未动。新增链接逐条 grep 命中 |
+| ops 表与实际错误文本一致 | `plugin ABI mismatch` / `plugin file not in plugins.lock.json` / `plugin identity mismatch` / `plugin symbol missing` / `plugin db capability error` ← `src/bridge/plugin_loader.rs` 的 `Display` 四变体 + `BadCaps`；两条 `[oj-plugin]` 告警 ← 同文件 `eprintln!` / `lock_divergences`；横幅格式 ← `oj/src/serve_cmd.rs::plugin_banner_line`；`host ABI_VERSION` ← `serve_cmd.rs` 装配日志；失败行前缀 `oj serve: ` ← `oj/src/main.rs` |
+| devkit 产物与源一致 | `cargo test --release -p xtask` **10 passed**（`copy_devkit` 后断言四件 + OIDC 两份 + 两份 `.d.ts`）；`diff` 校验 `docs/devkit` 与 `bin/devkit` 同文 |
+
+**M2 回填点（不是缺口，是依赖真库才能填的少数行）**
+
+1. `ops-manual` §6.1 / §7 的**告警映射**目前只覆盖「与 M2 无关、已实现」的装配类日志（ABI /
+   fingerprint / 清单锁 / 能力串）。Oracle / 达梦特有的厂商错误码分布（如 DM `-5669` / `-6118`
+   落 `syntax` 还是 `constraint`）待 M2 真库复核后补入 §7 与 `plugin-development.md` §15 的映射表。
+2. `db-guide` §10.6 的 Oracle/DM 两列、§10.5 能力矩阵里「其他方言」列的具体取值，同样待 M2 回填。
+3. `bin/devkit/` 产物须在回填后重新 `cargo xtask build` 归置（`cargo test --release -p xtask`
+   的 devkit 契约用例会校验源与产物一致）。
 
 **顺带记录的两处缺口（均登记不改实现）**
 
@@ -439,8 +453,9 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
    （用纯数字租户头判别，误判成数值即红），`Option` 化不会顺手改掉 v0.1.23 契约。
 2. 能力位解析失败的文案只点名**轴**不点名**插件**：`plugins db assembly: plugin db capability
    error: unknown capability "…"`（单 db 插件时无歧义，T2 串容易定位；两个 db 插件同时在场时
-   无法一眼看出是哪个）。建议 M3 落 ops 排障行时连带补上插件名——**本次不改**，避免在收尾切片里
-   动装配层文案（该文案未进冻结快照，改动成本低，留待与 ops 表一起对齐）。
+   无法一眼看出是哪个）。**ops 排障行已按现状收录该文案**（`ops-manual` §7，处置栏写「修插件」）；
+   仍未在装配层补插件名——该改动会动到 `plugin_loader` 的 `BadCaps` 变体，不在文档切片范围内，
+   登记待办（成本低，与 M2 的第二个 db 插件一起做更划算）。
 
 ---
 

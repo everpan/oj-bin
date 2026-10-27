@@ -623,6 +623,9 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 （含引擎原始码 `data.vendor_code`）——不要解析 message 文本。完整口径见
 `docs/devkit/api-manual.md`「结构化数据库错误」。
 
+**业务代码要不要按方言分支？** 多半不需要，且 `db.dialect()` 不是判断能力的正确工具——
+迁移分档与模板见 §10.7。
+
 ---
 
 ## 10.6 类型映射表与值契约（跨方言）
@@ -681,6 +684,86 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
    `docs/plugins/plugin-development.md` §15「新增数据库方言」）；起手用
    [`tools/plugin-template-db`](../tools/plugin-template-db/README.md) 骨架，它已把这四条
    摆成代码面（含未声明/已声明 `stream`·`cancel` 的一致性用例）。
+
+---
+
+## 10.7 `db.dialect()` 的红字与迁移范式（v0.1.88）
+
+> **红字：不要用 `db.dialect()` 判断「这个库能干什么」。**
+> 方言名是**开放集**（插件 `describe()` 声明什么就是什么，`"oracle"` / `"dameng"` / 私有的
+> `"demo"` 都合法），宿主也不再对未知名报错或回落 sqlite。能力位
+> `{placeholder, id, stream, cancel}` 才是宿主认识的契约，但它是**宿主 ↔ 插件**之间的契约，
+> 不是给业务 handler 的分派开关。
+>
+> 危害是**静默**的：`if (d === "mysql") A else B` 在新方言接入后会把 B 直接发给它——
+> 占位符风格对不上、取 id 走错路、`ON DUPLICATE KEY` 发给 Oracle，报错落在引擎侧
+> （`ORA-00933`、`near "?"`…），看起来像方言 bug，实际是分支兜底。
+
+`db.dialect()` 只剩三种正当用途：**诊断/日志**、**确属方言特有的 SQL**（第 ③ 档，必须白名单
++ 响亮失败）、**共享模块的集中适配层**（`_shared/dialect.ts` 这一类，业务代码不直接看它）。
+`db.tx` 回调对象是同面（`tx.dialect()`），语义一致。
+
+### 迁移分档：先问「这段分支能不能删」
+
+| 档 | 原来在分支什么 | 现在怎么写 | 为什么不用问方言 |
+|---|---|---|---|
+| ① 删掉 | 拼占位符（`?` / `$n` / `:n`） | 一律写 `?` | 按 `placeholder` 能力位改写：`placeholder_dollar` 宿主改 `$n`；`placeholder_colon` 宿主**不改写**，由插件内部把 `?` 改 `:n` |
+| ① 删掉 | 取自增 id（`RETURNING` vs `LAST_INSERT_ID`） | `db.table(...).insert({...}).run()` 的返回值 | 构造器按 `id_returning` / `id_two_step` / `id_none` 自动选路 |
+| ① 删掉 | 列目录（`sqlite_master` / `information_schema`） | `db.listTables(prefix?)` | 方言无关，SQL 是引擎常量 |
+| ① 删掉 | `limit n` 语法 / `select max(id)+1` 取号 | 构造器 `.limit(n)` / `db.nextSeq(name)` | 构造器与序列原语自己处理方言差异 |
+| ② 换问法 | 「这个 API 支持吗」 | **直接调用，接住 `OJ_DB_UNSUPPORTED`** | 宿主抛结构化错误，`e.data.capability` 点名是哪个 API；不用猜 |
+| ③ 保留 | 真方言特有 SQL（upsert 语法、窗口函数差异、受限列型 `cast`、DDL） | 白名单 + 未知方言**响亮失败**（模板见下） | 这类差异确实存在，但必须「不认识就报错」而不是兜底 |
+
+**第 ② 档的写法**——不要「先问再调」，直接调：
+
+```ts
+async function listReportIds(): Promise<unknown[]> {
+  try {
+    return await db.table("report").select(["id"]).all();
+  } catch (e: any) {
+    if (e.code === "OJ_DB_UNSUPPORTED") {          // 该方言不支持构造器
+      return db.query("select id from report");    // 裸 SQL 路径始终可用
+    }
+    throw e;
+  }
+}
+```
+
+这比 `if (["sqlite","mysql","postgres"].includes(db.dialect()))` 更准：白名单写错会骗自己，
+结构化错误不会。
+
+### 第 ③ 档的模板（白名单 + 禁止静默兜底）
+
+```ts
+// _shared/dialect.ts —— 全项目唯一的方言分派点，集中受审
+const UPSERT_SQL = {
+  sqlite:   "insert into account (id,name) values (?,?) on conflict(id) do update set name=excluded.name",
+  postgres: "insert into account (id,name) values (?,?) on conflict(id) do update set name=excluded.name",
+  mysql:    "insert into account (id,name) values (?,?) on duplicate key update name=values(name)",
+} as const;
+type UpsertDialect = keyof typeof UPSERT_SQL;   // 新增方言时编译器会在这里报错
+
+export async function upsertAccount(id: number, name: string): Promise<void> {
+  const d = db.dialect();                       // 可能是任何声明名，包括 "oracle"
+  if (!(d in UPSERT_SQL)) {
+    throw new Error(`upsertAccount: dialect ${d} 未适配（已支持 ${Object.keys(UPSERT_SQL).join("/")}）`);
+  }
+  await db.exec(UPSERT_SQL[d as UpsertDialect], [id, name]);
+}
+```
+
+要点：
+
+- **白名单用对象/数组并 `in`/`includes` 判定**，键集合随类型走——新增方言忘改会编译期红，
+  不会运行期静默。
+- **失败信息点名函数 + 方言 + 已支持集**：排障时一眼定位，比引擎原始码有用。
+- **别把 `db.dialect()` 存进模块级常量**：命名库之间可以不同方言，`db` 是 `DB(name)`，
+  `db.tx` 句柄同面——缓存会导致跨库读错。
+- **别在 handler 里按 `plugins()` 的 `caps` 自己分派**：`caps` 是留给运维核对装配的
+  外显（`GET {base}/plugins`、`oj info`），不是业务能力探测入口；能力探测请走第 ② 档。
+
+完整可照抄场景见 `docs/devkit/scenarios.md` 场景 45；能力位全表见 §10.5，插件侧接入见
+`docs/plugins/plugin-development.md` §15。
 
 ---
 

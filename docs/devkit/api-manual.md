@@ -1155,7 +1155,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
-| `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**（不再收窄成三个字面量，也**不再**对未识别方言报错）——要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
+| `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**（不再收窄成三个字面量，也**不再**对未识别方言报错）——要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。**不得用它判断能力**：方言名是开放集，`if (d === "mysql") A else B` 会把 B 静默发给新方言——能力问题直接调用并接 `OJ_DB_UNSUPPORTED`，确需方言特有 SQL 时用白名单 + 响亮失败（scenarios 场景 45）。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 | `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。方言无关（SQL 文本引擎常量），替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
@@ -1686,6 +1686,12 @@ try {
 > `dialect`）上一期只开放**裸 SQL 路径**（`db.query` / `db.exec` / `db.stream` / `db.tx`），
 > 构造器类 API 一律 `OJ_DB_UNSUPPORTED`（`data.capability` 点名是哪个 API）——不会再
 > 悄悄按 sqlite 语义生成错误 SQL。
+>
+> **别用 `db.dialect()` 判断「能干什么」**：方言名是开放集（`"oracle"` / `"dameng"` / 插件
+> 自定名都合法），`if (d === "mysql") A else B` 在新方言接入后会把 B **静默**发给它
+> （占位符风格错、`ON DUPLICATE KEY` 发给 Oracle），报错却落在引擎侧。正确做法：
+> ①能力问题**直接调用**并接 `OJ_DB_UNSUPPORTED`；②确属方言特有的 SQL（upsert 语法等）
+> 用白名单 + 未知方言**响亮失败**，别写 `else` 兜底。可照抄模板见 scenarios 场景 45。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 

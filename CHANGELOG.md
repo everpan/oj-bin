@@ -113,6 +113,35 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
   （旧路径 `Unknown` 仍绑字符串，锁死兼容面）+ 真机 `oj serve` 双向验证（`varchar` 拒启并点名、
   改 `text` 后正常建表启动）。
 
+### docs(db) / ops — `db.dialect()` 迁移范式 + 运维插件面（M3 收尾切片）
+
+M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/模板；本节补余下 2 个）。
+两域原本挂在「等 M2 真库」上，复核后确认**结构性内容不依赖真库**：迁移范式的方向恰恰是
+「不要按方言名分派」，而运维手册里的报错文案可以**逐字取自当前已实现的代码**。
+
+- `docs/db-guide.md` 新增 **§10.7 `db.dialect()` 的红字与迁移范式**：方言名是开放集（插件
+  `describe()` 声明什么就是什么），`if (d === "mysql") A else B` 会在新方言接入后把 B **静默**
+  发给它（占位符风格错、`ON DUPLICATE KEY` 发给 Oracle），报错却落在引擎侧。给出三档迁移
+  （① 删掉：占位符 / 取 id / 列目录 / 取号都由宿主或平台 API 吸收；② 换问法：能力问题直接调用
+  并接 `OJ_DB_UNSUPPORTED`；③ 保留：真方言特有 SQL 用**白名单对象键 + 未知方言 `throw`**），
+  附反面样例与「别把 `dialect()` 缓存成模块常量」「别在 handler 里按 `caps` 分派」两条边界。
+- `docs/devkit/api-manual.md`：`db.dialect()` 行与「方言边界」块补同一条红线；**scenarios 新增
+  场景 45**（删分支对照表 + 可照抄的 `_shared/dialect.ts` + 验证步骤 + 五个常见坑）；
+  `SKILL.md` 陷阱速查 +1 行（同口径）；`devkit/README.md` v0.1.88 段落纳入场景 45。
+- `docs/ops-manual.md`：**§1.2 插件目录与清单锁**（发布物形态、三条纪律、锁与实物不一致的
+  四种情形逐字表）、**§6.1 装配期日志**（7 行逐字日志 + 级别 + 含义，`host ABI_VERSION` /
+  `plugin … | caps:` 为权威现场）、**§7 排障表 +8 行**（ABI mismatch、锁外文件、identity
+  mismatch、符号缺失、能力串 typo、fingerprint 告警、运行期 `OJ_DB_UNSUPPORTED` 的两种成因、
+  插件没装上）、**§8.1 回滚三元组**（`bin/oj` + `bin/plugins/<triple>/` + `dist/` 为什么不能
+  单换、五步回滚命令、回滚后三项核对、迁移不回滚）。
+- 文案一致性口径：`plugin ABI mismatch` / `plugin file not in plugins.lock.json` /
+  `plugin identity mismatch` / `plugin symbol missing` / `plugin db capability error` 及两条
+  `[oj-plugin]` 告警，全部逐字对齐 `src/bridge/plugin_loader.rs` 的 `Display` 实现；
+  横幅格式对齐 `oj/src/serve_cmd.rs::plugin_banner_line`。**M2 落地后需回填**的只剩
+  Oracle/DM 厂商错误码分布与 §10.6 两列（已在计划文档「M2 回填点」登记）。
+- `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
+  产物与源一致。
+
 ## v0.1.87
 
 WS 目录镜像路由与 `api.ts` 同口径（`--module-root` 下剥布局段）+ 挂载清单外显。

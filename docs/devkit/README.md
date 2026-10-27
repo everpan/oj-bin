@@ -53,7 +53,8 @@ v0.1.88 已落地部分：**数据库方言能力模型（ABI 12）+ 结构化�
 构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` 一律 `OJ_DB_UNSUPPORTED`
 （`data.capability` 点名 API，**不再**静默按 sqlite 语义生成错误 SQL）。④ 插件清单锁
 `plugins.lock.json`：增量覆盖残留旧插件 → 拒载点名；建议整体拷贝 `bin/`。见 api-manual
-「结构化数据库错误」与 `db.dialect()`、SKILL 陷阱速查、scenarios 场景 44。
+「结构化数据库错误」与 `db.dialect()`「方言边界」、SKILL 陷阱速查、scenarios 场景 44（错误分流）
+/ 场景 45（`dialect()` 分支迁移）。
 
 v0.1.87 已落地部分：**WS 路由与 api.ts 同口径 + 挂载清单外显**——① `--module-root` 布局下
 `ws.ts` 的路径由模块索引给出（`{prefix}/{模块根内路径}/ws`），不再按挂载根平铺：

@@ -94,6 +94,41 @@ ACTIONS_ID_TOKEN_REQUEST_URL=x ACTIONS_ID_TOKEN_REQUEST_TOKEN=y \
 - 启用 musl 目标前必须先定 libc 策略——`os`/`cpu` 无法区分 `gnu` 与 `musl`，
   同 `(os,cpu)` 两个 triple 会在第 2 步撞车。
 
+### 1.2 插件目录与清单锁（ABI 12）
+
+插件是**独立 cdylib**，与二进制之间靠 FFI 契约（`ABI_VERSION`，当前 **12**，**严格相等**）。
+`cargo xtask build` 归置出的目录形态：
+
+```
+bin/oj
+bin/plugins/<host-triple>/
+    liboj-db-mysql.dylib      # 文件名 = lib<descriptor.name>.dylib（macOS）/.so（Linux）/<name>.dll（Windows，无 lib 前缀）
+    liboj-db-postgres.dylib
+    …
+    plugins.lock.json         # [{"name","abi","fingerprint"}]，xtask 构建末尾写入
+```
+
+三条纪律（全部有代码门禁兜底，违反会在启动期被点名）：
+
+1. **`bin/oj` 与 `bin/plugins/<triple>/` 必须来自同一次构建**。ABI 严格相等：拿 ABI 11 的插件
+   配 ABI 12 的二进制 → **拒载**（`plugin ABI mismatch: …`），服务起不来。跨版本升级时两者一起换。
+2. **整体拷贝，禁止增量覆盖**。目录里出现锁未登记的库文件 → **拒载**并点名
+   （`plugin file not in plugins.lock.json: …`，典型成因：只拷了新插件、旧的没删）。
+3. **`cargo xtask plugin <name>` 只拷单个库、不刷新锁**——它适合开发期快速替换，**不要**用它
+   产出发布物；发布/部署一律 `cargo xtask build` 或直接整体拷贝 `bin/`。
+
+锁与实物不一致的四种情形（**行为列为准**：锁外文件与 ABI 不等是拒载，另两种只告警）：
+
+| 情形 | 行为 | 文案（stderr，逐字前缀） |
+|---|---|---|
+| 目录里多了锁未登记的库 | **拒载**（点名文件） | `plugin file not in plugins.lock.json: <path> …` |
+| 目录里有库但 `abi` 与宿主不等 | **拒载** | `plugin ABI mismatch: plugin=<p> host=<h> …` |
+| 锁登记了、目录里没有（少拷） | 告警 | `[oj-plugin] plugins.lock.json lists N plugin(s) missing from this directory: …` |
+| 加载出的 `abi`/`fingerprint` 与锁不符（混入别的构建） | 告警 | `[oj-plugin] '<name>': loaded abi/fingerprint differ from plugins.lock.json …` |
+
+`fingerprint`（构建机 rustc/特性指纹）不一致本身**只告警**（`[oj-plugin] fingerprint mismatch: …`）
+——它不改变 ABI 形状，但意味着这对二进制/插件不是在同一个工具链下产出的，出问题时不作支持基线。
+
 ## 2. 运行
 
 ```bash
@@ -235,6 +270,21 @@ server dev 不写 `migrate_on_start` 时缺省 `auto`（启动即应用迁移）
 RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 ```
 
+### 6.1 插件装配期日志（逐字，v0.1.88）
+
+插件只在**启动期**加载一次，装完即冻结——下列行是排查插件问题的第一现场（`stderr`，
+不受 `RUST_LOG` 影响）。装配失败时整行以 `oj serve: ` 开头并退出码 1。
+
+| 日志（逐字形态） | 级别 | 含义 |
+|---|---|---|
+| `[oj-serve] host ABI_VERSION = 12` | info | 宿主 ABI。与插件横幅的 `abi=` 必须相等 |
+| `[oj-serve] plugin <name> abi=<n> fp=<fp>[ \| caps: placeholder=<p> id=<i>[ stream][ cancel]]` | info | 每个成功装配的插件一行；`caps` 仅 db 轴插件有（`placeholder=?\|$\|:`、`id=returning\|two_step\|none`）。**这是能力位的权威现场**——排障时先看这行，不要猜 |
+| `[oj-plugin] fingerprint mismatch: plugin '<name>' built with [<fp>], host [<host-fp>]` | warn | 二进制与插件不是同一工具链产物（ABI 相同才走到这里）。可运行，但不作支持基线 |
+| `[oj-plugin] '<name>': loaded abi/fingerprint differ from plugins.lock.json (lock abi=… fingerprint=…; loaded abi=… fingerprint=…) — bin/ 不是同一次构建的整体拷贝` | warn | 混入了别的构建产物（锁对不上实物的那一半） |
+| `[oj-plugin] plugins.lock.json lists N plugin(s) missing from this directory: a, b — 整体拷贝不完整（缺插件的能力会表现为 unsupported）` | warn | 锁登记了但目录里没有——少拷了 |
+| `[oj-plugin] panic while loading plugin '<name>' (host fingerprint: <fp>)` | error | 插件 `init` 里 panic（已 `catch_unwind`，不会带崩宿主）；带宿主指纹便于对账 |
+| `[oj-serve] unconsumed config sections: ["xxx"] (typo? or plugin not loaded)` | warn | config 里有段落没被任何插件消费——通常是段名拼错，或对应插件没装上 |
+
 ## 7. 排障表
 
 | 症状 | 原因 | 处置 |
@@ -300,6 +350,14 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | `oj schema diff` 报 D001/D002 退出 1 | 声明（schema.yaml）与实库漂移——手工改库、漏迁移、删除列未走迁移 | 按 diff 报告逐条补迁移或修正声明；发布前跑一次作巡检 |
 | `oj migrate` / `test fixture` / `schema diff` 报 `--db "x" not declared in config (db keys: […])` | `--db` 给的 profile 不在 config `db:` 段；工具**不回落** default（防迁错库） | 核对 `db:` 段的键名拼写；多库部署逐 profile 各跑一遍 |
 | 启动/build 报结构检查违规（S001–S008） | manifest 合法性（S001）、表归属冲突（S002）、跨模块表未声明 deps（S003）、deps 版本不满足（S004）、tables 与 schema.yaml 不一致（S005）、seed 纪律（S006）、迁移文件序列（S007）、导入别名/deps 门禁（S008） | 按报错「下一步」修复；只查不落盘用 `oj build --check` |
+| 启动报 `plugin ABI mismatch: plugin=<p> host=<h> (rebuild plugin against oj-plugin-ffi ABI <h>); plugin fingerprint [<p-fp>] host fingerprint [<h-fp>]; 请重新整体拷贝 bin/，禁止增量覆盖（partial copy 会让新能力表现为 unsupported）` | 二进制与插件跨版本混用（ABI 严格相等，差 1 即拒载）；或插件是同版本但用旧 ABI 头编的 | 用**同一次** `cargo xtask build` 的 `bin/oj` + `bin/plugins/<triple>/` 整体替换；不要只换一侧 |
+| 启动报 `plugin file not in plugins.lock.json: <path> …`（后缀为「lock 要求整体拷贝 bin/，禁止增量覆盖；删除该文件或重新 cargo xtask build——注意 cargo xtask plugin <name> 只拷单个库、不刷新锁」） | 增量覆盖残留：目录里多了锁未登记的库（典型：只拷新插件、没删旧文件） | 删该文件，或 `cargo xtask build` 重写锁后整体拷贝；部署不使用 `cargo xtask plugin` |
+| 启动报 `plugin identity mismatch: expected '<x>', got '<y>'` | 配置 `plugins:` 清单里指定的名字/版本与库文件的 `descriptor` 不符（文件名须为 `lib<descriptor.name>.so\|dylib\|dll`；清单带 semver 时须逐字相等） | 对齐文件名与清单；或改清单条目 |
+| 启动报 `plugin symbol missing: <path> (symbol <符号名>)` | 库文件构建不完整、或用手写符号绕过了 `oj_plugin_entry!`、或与宿主 ABI 不一致导致符号名不同 | 用 `oj_plugin_entry!` 重编插件；`cargo xtask plugin <name> --check` 可预检 ABI/身份/符号 |
+| 启动报 `plugins db assembly: plugin db capability error: unknown capability "…"` / 缺组 / 组内多项 | 插件 `describe()` 的能力串不在闭集（8 个）内、两个必选组缺一或重复（typo 最常见，如 `placeholder_colon_`） | 修插件 `describe()` 后重编；宿主**故意拒启**——不让错配活到运行期（契约见 `docs/plugins/plugin-development.md` §15） |
+| 启动 warn `[oj-plugin] fingerprint mismatch: plugin '<name>' built with [<p-fp>], host [<h-fp>]` | 二进制与插件来自不同工具链/特性组合（ABI 相同，故只告警） | 生产环境按「整体拷贝 bin/」重拷；留着跑不算故障，但出问题时不作支持基线 |
+| 运行期 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 API） | 两种完全不同的原因：①方言不是 sqlite/mysql/postgres，宿主不生成 SQL（**预期**）；②插件没声明 `stream`/`cancel` 等能力 | ①改用裸 SQL（`db.query`/`db.exec`/`db.tx` 始终可用）；②按报错点名补插件能力。别自己按 sqlite 语义拼 SQL 绕（`docs/db-guide.md` §10.5 / §10.7） |
+| 配了 `plugins:` 但启动横幅里没有该插件 | 发现路径不对（5 级：`OJ_PLUGINS_DIR` > config `plugins_dir` > 打包布局 > `<exe>/plugins` > `<workspace>/bin/plugins`，再拼 `<host-triple>/`），或文件名不符合 `lib<name>.so` / `lib<name>.dylib` / `<name>.dll`（platform 决定前缀） | 用 `oj info` 的 `plugins` 段核对实际装了什么；对齐目录与文件名；启动横幅 + `host ABI_VERSION` 行是权威现场 |
 
 ## 8. 回滚与恢复
 
@@ -310,3 +368,34 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 - 外部依赖可选且默认关闭：不配 `redis:`/`es:` 段即纯本地（sqlite + 内存 KV），故障面最小——
   主要是「二进制 + dist 不一致」→ 保持二者同版本发布。配了 Redis/ES 则它们的可用性进入启动
   契约（fail-fast），发布/巡检时先确认目标实例可达。
+
+### 8.1 回滚三元组：`bin/oj` + `bin/plugins/<triple>/` + `dist/`
+
+有插件之后，**「回滚二进制」不再是一个文件的事**。必须整体回到同一次构建的产物：
+
+| 成员 | 为什么不能单独换 |
+|---|---|
+| `bin/oj` | 单方前进 → 旧插件 ABI 不等 → **全部插件拒载、服务起不来**（`plugin ABI mismatch`）。单方后退 → 新插件同样拒载 |
+| `bin/plugins/<triple>/`（含 `plugins.lock.json`） | 只换插件不换锁 → 启动告警「loaded abi/fingerprint differ from plugins.lock.json」（能跑，但部署已不是整体拷贝）；换同名库 → ABI 不等即**拒载**，ABI 相同但 fingerprint 不同则告警；新增/改名的库 → `plugin file not in plugins.lock.json` **拒载** |
+| `dist/` | `oj build` 产物与二进制能力面对齐（新 API/新校验在新版本才有）。旧 dist 配新二进制通常可跑但会缺新能力；新 dist 配旧二进制 → 调用新 API 报错或行为分叉 |
+
+**回滚步骤**（假设上一版整包在 `/opt/oj/<ver>/`）：
+
+```bash
+systemctl stop oj                                  # 1. 先停（迁移不回滚，见下）
+cp -a /opt/oj/<prev>/bin/oj /opt/oj/current/bin/   # 2. 二进制 + 插件目录 + 锁一起换
+rm -rf /opt/oj/current/bin/plugins && cp -a /opt/oj/<prev>/bin/plugins /opt/oj/current/bin/
+cp -a /opt/oj/<prev>/dist/. /opt/oj/current/dist/  # 3. dist 一起回退（含 manifests.yaml）
+./bin/oj info | sed -n '/^## plugins/,/^## generic_axes/p'   # 4. 核对：装了什么、abi 多少、caps 是什么
+systemctl start oj                                 # 5. 起服务，看横幅三行
+```
+
+**回滚后必须核对三件事**（前两项来自启动横幅，第三项是健康面）：
+
+1. `[oj-serve] host ABI_VERSION = <n>` 与每个插件行的 `abi=<n>` **相等**；
+2. 每个 db 插件行都带 `| caps: …`——**没有 `caps` 说明它不是 db 轴插件**（插件行本身缺失才是没装上）；
+3. `GET {base}/plugins` 与 `oj info` 的 `plugins` 段一致（`caps` 列与横幅同源）。
+
+**迁移不回滚**：`oj migrate` 是前向的（账本 `_oj_migrations` 只增），回滚二进制不撤销已应用的
+迁移。回滚前评估「新版本的迁移是否被旧版本代码接受」——加列/加表通常安全，**改列型/删列不安全**，
+必要时用备份恢复数据库而非反向迁移。sqlite 直接换回升级前的 `*.sqlite` 备份最省事。
