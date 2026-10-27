@@ -216,6 +216,7 @@ mod tests {
             sql_memo: std::sync::Mutex::new(HashMap::new()),
             mail: None,
             ldap: None,
+            db_access: Arc::new(Default::default()),
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
             fs: None,

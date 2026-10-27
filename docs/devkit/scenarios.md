@@ -3365,3 +3365,113 @@ curl -s localhost:9778/v1/api/user/account/          # 构造器可用则正常�
 | 在 handler 里读 `plugins()` 的 `caps` 自己分派 | `caps` 是给运维核对装配的外显（`GET {base}/plugins`、`oj info`），不是业务能力探测入口 |
 | 把 `db.dialect()` 缓存成模块常量 | `db = DB(name)`，命名库之间可能不同方言；`db.tx` 句柄同面——缓存会跨库读错 |
 | 以为新方言上 `?` 也要自己改 | JS 侧永远写 `?`；改写归宿主（`$n`）或插件内部（`:n`） |
+
+## 场景 46：给库上访问控制（只读库 / 谁可以访问哪个库，v0.1.89）
+
+**要解决的**：一个进程里挂了多个库（`db:` 段），任何模块的 handler 都能 `DB("analytics")`
+读写任何一个——没有库级授权。`db_access:` 段补上这一层：谁能访问哪个库、能做什么。
+
+> 它是**宿主侧护栏层**，不是数据库权限：`read_only` 是文本级判定（真写防线仍是 DB 账号
+> GRANT），`max_rows` 对 `db.query` 是取回后截断（不是限流）。两者都要配才算设防。
+
+### ① 先灰度：`warn` 档看日志，别直接 `deny`
+
+```yaml
+# config.yaml
+db:
+  default:   "sqlite://db.sqlite"
+  analytics: "mysql://root@10.0.0.5:3306/olap"
+
+db_access:
+  defaults:
+    enforce: warn          # 只告警放行 —— 分类是词法，先看清有没有误判
+  analytics:
+    read_only: true        # 拦 write / ddl
+    max_rows: 1000         # 缺省=不限；范围 [1, 100000]
+    allow:                 # 四维并集；不写 = 不限制
+      roles: [admin, dba]
+```
+
+`warn` 档语句照常执行，服务端落前缀 `DB_ACCESS_DENY` 的日志（按 `(alias, reason)` 聚合
+计数，不会被刷爆）。跑一周确认无误报，再把 `defaults.enforce` 改成 `deny`。
+
+### ② 为什么要写 `enforce` 在 `defaults` 里
+
+`analytics:` 是**覆盖条目**，未声明的键**逐键继承** `defaults`。所以下面这种写法
+**等于没设防**（该库 `enforce` 继承 `off`）：
+
+```yaml
+db_access:
+  analytics:
+    read_only: true        # ❌ 没有 enforce，read_only 不生效
+```
+
+这正是逐键继承要防的事：设好全局 `deny` 后，给某库加一条局部微调不会把设防悄悄打回原点。
+逐库不想继承就把 `enforce` 显式写一遍。
+
+### ③ 定时任务怎么授权
+
+任务桥跑 `run_task`，没有 user / 没有模块上下文 / 没有租户——`roles`、`modules`、
+`tenants` 三维**都取不到身份**，只能靠 `sources`：
+
+```yaml
+db_access:
+  defaults:
+    enforce: deny
+    allow:
+      sources: [http]
+  analytics:
+    read_only: true
+    allow:
+      sources: [http, task]    # ← 定时任务走 task
+```
+
+⚠️ `sources` **只有** `http` / `task` 两个取值：WS 帧跑在 HTTP 桥上按 `http` 计，
+写 `ws` / `anon` 永不命中。
+
+### ④ 前端列库用 `db.allowed()`，不要硬编码别名
+
+```ts
+// src/admin/db_picker/api.ts
+export async function get() {
+  // 只列当前调用主体**有权限**的库（含能力位），未授权的不出现
+  const list = db.allowed();
+  // [{ alias:"default", dialect:"sqlite", read_only:false, allow_ddl:false,
+  //    allow_dangerous:false, max_rows:null, enforce:"off" }, …]
+  return json.ok({ list: list.map((x) => ({
+    alias: x.alias,
+    writable: !x.read_only,
+    capped: x.max_rows,
+  })) });
+}
+```
+
+硬编码 `db:` 段的全部别名 = **假入口**：列出来点了才报错。
+
+### ⑤ `deny` 档被拒时怎么修
+
+| 报错里的 `reason` | 含义 | 修法 |
+|---|---|---|
+| `db_not_granted` | `allow` 四维全不中（或取不到身份） | 找管理员给对应维度授权；定时任务加 `sources: [task]` |
+| `db_read_only` | 该库只读而语句被判写类 | 改只读语句，或放开 `read_only` |
+| `db_ddl_denied` | DDL 未放开 | 放开 `allow_ddl`，或走 `oj migrate` |
+| `db_dangerous_write` | UPDATE/DELETE 无 WHERE（或多表 / 恒真谓词） | 补 WHERE，或放开 `allow_dangerous` |
+| `db_unknown_risk` | 词法分不出类别（fail-closed） | **改用 `db.table()` 构造器**——它走精确意图判定，不依赖词法 |
+
+```ts
+// 裸 SQL 在 deny 档被判 unknown 的典型：串未闭合 / 注释断词 / CTE / 窗口函数
+await db.query("select * from t where name like '%a\\%'");   // ❌ db_unknown_risk
+// 构造器路径不猜词法：意图由 verb 决定，不会落 unknown
+const rows = await db.table("t").select(["id", "name"]).where({ field: "name", op: "like", value: "a%" }).all();
+```
+
+### ⑥ 常见坑
+
+| 坑 | 说明 |
+|---|---|
+| 只写 `read_only: true` 没写 `enforce` | 该库 `enforce` 继承 defaults（默认 `off`）→ **等于没设防** |
+| `allow` 写多维以为更严 | 是**并集**：任一维度命中即过，声明更多维只会**放宽**。「且」语义本阶段做不到 |
+| `allow: { roles: [] }` | 声明且为空 = **无人可过**，不是「不限制」 |
+| 用 `db.asTenant()` 命中 `tenants` 维 | 不作数：`tenants` 只认服务端注入的租户（否则匿名 handler 可自授租户） |
+| 用 `db.asSystem()` 绕过 | `asSystem` **只绕过租户防护**，不豁免访问控制（v0.1.89 有意的行为变更） |
+| 配了 `db_access` 就以为库安全了 | 不约束平台自生成 SQL 与 `oj migrate` 等 CLI 通道；`read_only` 也不是 DB GRANT 的替代品 |

@@ -6,9 +6,10 @@
 > 本手册讲「怎么上手、为什么这样设计」。逐 API 的穷举式参考见
 > [`docs/devkit/api-manual.md`](devkit/api-manual.md) 第 6 章「db / DB(name)」。
 > 所有 API 名、字段名、报错文案均与源码（`src/bridge/bootstrap.js`、`src/bridge/query.rs`、
-> `src/bridge/db.rs`、`src/bridge/dialect_caps.rs`）逐字核对，**版本 0.1.88 / ABI 12**。
+> `src/bridge/db.rs`、`src/bridge/dialect_caps.rs`、`src/bridge/db_policy.rs`）逐字核对，
+> **版本 0.1.89 / ABI 12**。
 > 方言能力模型（开放方言名 + 能力位）与结构化数据库错误是 0.1.88 的两处结构性变更，
-> 见 §10.5 与 §10.7。
+> 见 §10.5 与 §10.7；库级访问控制（`db_access:` 段）是 0.1.89 的新增面，见 §11.5。
 >
 > 文中「fail-fast」= 发现问题立刻报错退出；「白名单」= 只有预先声明过的表/列才能被
 > 访问，其余一律拒绝。
@@ -1081,6 +1082,110 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `transaction already active (nested tx not supported)` | 嵌套 `db.tx` | 复用当前 tx 回调对象 |
 | `db: instance 'x' not configured` | 执行期按名取不到库：多半是 `manifest.yaml` 的 `db: x` 指向了 config 未声明的库（`DB("x")` 本身对未声明名返回 `undefined`，不会抛这条） | 在 `db:` 段补 DSN，或改 manifest 的绑定 |
 | `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)` | 事务内调 `db.stream` | 移到事务外（流式只走直连池，见 §3.1） |
+| `db access: alias "x" not granted to this caller (…)` | `db_access` 的 `allow` 未命中（四维全不中/取不到身份） | 找管理员在 `allow` 里给对应维度授权（reason: `db_not_granted`） |
+| `db access: alias "x" is read_only; statement classified write` | 该库 `read_only: true` 而语句被判为写类 | 改只读语句，或放开 `read_only`（reason: `db_read_only`） |
+| `db access: alias "x" does not allow DDL` | DDL 未放开 | 放开 `allow_ddl`，或走迁移通道（reason: `db_ddl_denied`） |
+| `db access: alias "x": dangerous write without an effective WHERE (…)` | UPDATE/DELETE 无 WHERE（或多表 / 恒真谓词） | 补 WHERE，或放开 `allow_dangerous`（reason: `db_dangerous_write`） |
+| `db access: statement classification failed; denied by fail-closed` | 词法分不出类别（串未闭合 / 断词 / 未知语句） | 改用构造器 `db.table()`——它走精确意图判定，不依赖词法（reason: `db_unknown_risk`） |
+
+---
+
+## 11.5 db 访问控制（`db_access:` 段，v0.1.89）
+
+一句话：`db:` 只定义「有哪些库、怎么连」，`db_access:` 定义「谁能对这些库做什么」。
+两者**分开配置**——`db:` 仍是纯粹的 `别名 -> DSN` map，不塞任何策略。
+
+### 11.5.1 配置形态
+
+```yaml
+db:                        # 不动：name -> DSN
+  default: "sqlite://db.sqlite"
+  analytics: "mysql://root@10.0.0.5:3306/olap"
+
+db_access:
+  defaults:                # 全局默认档（缺省 = off，与升级前完全一致）
+    enforce: off           # off | warn | deny
+  analytics:
+    read_only: true
+    max_rows: 1000         # 缺省 = 不限；范围 [1, 100000]
+    allow:                 # 四维并集；缺省 = 不限制
+      roles: [admin, dba]
+      sources: [http]      # http | task
+```
+
+**继承语义**：`db_access.<alias>` 是**覆盖条目**，未声明的键**逐键继承** `defaults`
+（`allow` 是**逐维**覆盖）。这不只是一个口味问题——若整条覆盖，运维设好
+`defaults.enforce: deny` 后再给某库加一条 `read_only: true`，该库的 `enforce`
+会悄悄回落 off：**全局设防被一次局部微调静默解除**。
+
+装配期校验（fail-loud，不静默取其一）：`max_rows` 越界、`read_only: true` +
+`allow_ddl: true` 矛盾、未知键（点名 `db_access.<alias>.<key>`）、非法档位。
+
+### 11.5.2 谁可以访问：四维并集
+
+主体四维：`modules`（请求所属模块）/ `roles`（`user.roles`）/ `tenants` /
+`sources`（`http` | `task`）。
+
+- 语义是**并集**：任一**已声明**的维度命中即放行；未声明的维度不参与限制。
+- ⚠️ **声明多维不会提高强度，只会降低**（任一命中即过）。要「同时满足」本阶段做不到。
+- `allow: {}`（或整段不写）= 不限制；`allow: { roles: [] }` = 声明且为空 → **无人可过**。
+- fail-closed：声明了某维而请求取不到该维身份 → 该维不命中（**不因「取不到」而放行**）。
+- `tenants` 维**只认 server 注入的租户**：`db.asTenant()` 自填的租户不作数
+  （否则匿名 handler 可自造租户命中白名单 → 借道跨租户）。
+- `db.asSystem()` **不豁免**访问控制（它只绕过租户注入）；管理员通道请走 `allow.roles`。
+- `sources` 维是为了解决**任务桥恒无身份**（定时任务没有 user/module/tenant）：
+  给它们声明 `sources: [task]`。WS 帧跑在 HTTP 桥上，source 记 `http`
+  （**没有 `ws` / `anon` 两个取值**，写了永不命中）。
+
+### 11.5.3 做什么：风险分类与策略位
+
+语句按词法分成五类：`readonly` / `write` / `ddl` / `tx` / `unknown`。
+`unknown` 一律按最严档处置（**fail-closed**）——分不出来就当最坏的看。
+
+- `read_only: true` → 拦 `write` 与 `ddl`。
+- `allow_ddl: false`（默认）→ 拦 `ddl`。
+- `allow_dangerous: false`（默认）→ 拦**危险写**：`UPDATE`/`DELETE` 无 WHERE、
+  多表（`update a, b` / JOIN / USING）、恒真谓词（`where 1=1`、`where a=a`）。
+- `max_rows` → raw `query` 取回后截断（响应打 `X-OJ-Row-Limit`）；`db.stream`
+  达上限**提前终止**；构造器路径取 `min(声明 limit, max_rows)`。
+
+### 11.5.4 档位与自省
+
+`enforce`：`off`（默认，零开销早退）/ `warn`（告警放行，灰度用）/ `deny`（拒）。
+`warn` 与 `deny` 都落结构化日志，前缀 **`DB_ACCESS_DENY`**，按 `(alias, reason)`
+聚合计数（warn 档逐条落会被刷爆、且可被当成刷盘放大器）。
+
+`db.allowed()` 返回**当前主体可用**的库列表（含各库能力位）：
+
+```js
+const list = db.allowed();
+// [{ alias: "default", dialect: "sqlite", read_only: false, allow_ddl: false,
+//    allow_dangerous: false, max_rows: null, enforce: "off" }]
+```
+
+没有这个出口，前端只能列出全部连接、点了才报错——那是**假入口**。
+
+### 11.5.5 承诺 / 不承诺
+
+| 承诺 | 不承诺 |
+|---|---|
+| 库级授权（谁可以访问哪个 `db` 别名） | 行级 / 列级授权（已有 `SchemaRegistry` 白名单 + 租户守卫，不重叠建设） |
+| 语句风险分类 + 危险写门 | 分类是 **best-effort 词法**，不是 SQL 解析器；复杂语句会落 `unknown` 并被拒 |
+| `read_only` 位（**宿主侧文本判定**） | **不是**数据库账号权限的替代品——真正的写防线仍是 DB 侧 GRANT |
+| `max_rows` 截断（raw）/ 提前终止（stream） | **不是**限流 / DoS 防线：raw 是先取回全量再截断，扫描与传输照旧 |
+| 决策可观测（`DB_ACCESS_DENY` + `SqlEvent.risk/operator`） | **不是**审计系统：无防篡改、无持久化、无回溯 |
+| `db.allowed()` 只列已授权的库 | 不回显 `allow` 名单（否则 403 响应可被用来枚举库与授权名单） |
+| 约束 **JS 提交的 SQL** | **不约束**平台自生成 SQL（`db.nextSeq` 序列表 DDL、`db.listTables` 内省）与 CLI 通道（`oj migrate` / `oj schema` / `oj build` 不经 bridge） |
+| 模块 / 角色 / 租户 / 来源 四维白名单 | 无黑名单形态；多维是**并集**（声明更多维只会放宽） |
+
+### 11.5.6 升级须知
+
+- 默认 `enforce: off` → **不配 `db_access:` 与升级前行为完全一致**（包括 `db.asSystem()`
+  跑写语句的既有 handler 不受影响）。
+- 一旦把某库设成 `deny` 档，用 `db.asSystem()` 跑写语句的 handler **会被拒**
+  （asSystem 不豁免访问控制）——这是有意的行为变更。
+- `sql_guard=deny` 站点上「raw SELECT 未登记表」的敞口**原样保留**：本策略只管
+  alias + risk，只读语句一律放行。不要把本节读成「该敞口已修」。
 
 ---
 

@@ -73,6 +73,12 @@ pub struct SqlEvent {
     pub category: Option<String>,
     /// 是否可重试（T12）：与 `category` 同源；缺省 `None`。
     pub retryable: Option<bool>,
+    /// 操作者（v0.1.89）：auth 启用时的 `user.id`；无身份（匿名/任务/未启用）为 `None`。
+    /// 与 `source` 的关系：`source` 记执行面（module/anon/task），`operator` 记**谁**。
+    pub operator: Option<String>,
+    /// db 访问控制的语句风险分类（v0.1.89；`readonly`/`write`/`ddl`/`tx`/`unknown`）。
+    /// 仅在主控开启时计算（trace 关闭时零开销）。
+    pub risk: Option<String>,
 }
 
 /// 每请求 SQL 画像（存 ReqState，reset 时清空）。
@@ -124,6 +130,12 @@ impl SqlProfile {
                 }
                 if let Some(r) = e.retryable {
                     ev["retryable"] = json!(r);
+                }
+                if let Some(o) = &e.operator {
+                    ev["operator"] = json!(o);
+                }
+                if let Some(rk) = &e.risk {
+                    ev["risk"] = json!(rk);
                 }
                 ev
             })
@@ -219,6 +231,8 @@ mod tests {
             error: None,
             category: None,
             retryable: None,
+            operator: None,
+            risk: None,
         }
     }
 
@@ -271,6 +285,8 @@ mod tests {
                 error: Some("dup".into()),
                 category: Some("constraint".into()),
                 retryable: Some(false),
+                operator: None,
+                risk: None,
             },
             0.0,
         );

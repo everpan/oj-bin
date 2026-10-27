@@ -1400,6 +1400,11 @@ pub struct Config {
     /// **不能塞进 `db:`**——`db` 是 name → DSN 的 map，键即库名。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_query: crate::bridge::QueryLimits,
+    /// db 访问控制策略（v0.1.89，`db_access:` 段）：键 = db 别名，`defaults` 兜底未声明的库。
+    /// **与 `db:` 分离**——`db` 是 name → DSN 的 map，键即库名，策略另立一段（L3 动态连接
+    /// 可直接复用同一张策略表）。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_access: crate::bridge::db_policy::DbAccessSection,
     /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_trace: SqlTraceCfg,
@@ -2040,6 +2045,59 @@ cache:
         .unwrap();
         let e = load_from(&dir, None).unwrap_err();
         assert!(e.contains("invalid type"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `db_access:` 段（v0.1.89）：与 `db:` 分离，缺席/空键落默认（off 档 = 零行为变化），
+    /// 但**写错必须 fail-loud**（非法档位 / 未知键 / 越界 max_rows 都不静默吞）。
+    #[test]
+    fn db_access_section_parses_and_rejects_bad_values() {
+        let dir = std::env::temp_dir().join(format!("ojcfgdba-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |s: &str| {
+            std::fs::write(dir.join("config.yaml"), s).unwrap();
+            load_from(&dir, None)
+        };
+        // 缺席 / 空键 → 默认（off）
+        let c = write("db:\n  default: sqlite://a.db\nauth:\n  jwt_secret: s\n").unwrap();
+        assert_eq!(
+            c.db_access.defaults.enforce,
+            crate::bridge::db_policy::Enforce::Off
+        );
+        assert!(c.db_access.by_db.is_empty());
+        let c =
+            write("db_access:\ndb:\n  default: sqlite://a.db\nauth:\n  jwt_secret: s\n").unwrap();
+        assert!(c.db_access.by_db.is_empty());
+        // 正常解析 + 逐库条目
+        let c = write(concat!(
+            "db:\n  default: sqlite://a.db\n  analytics: sqlite://b.db\n",
+            "db_access:\n",
+            "  defaults:\n    enforce: warn\n",
+            "  analytics:\n    read_only: true\n    max_rows: 50\n",
+            "    allow:\n      roles: [admin]\n",
+            "auth:\n  jwt_secret: s\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            c.db_access.defaults.enforce,
+            crate::bridge::db_policy::Enforce::Warn
+        );
+        let a = c.db_access.policy_for("analytics");
+        assert!(a.read_only && a.max_rows == Some(50));
+        assert_eq!(a.allow.roles.as_deref(), Some(&["admin".to_string()][..]));
+        // 未声明的库走 defaults
+        assert_eq!(
+            c.db_access.policy_for("default").enforce,
+            crate::bridge::db_policy::Enforce::Warn
+        );
+        // 非法档位 fail-loud
+        let e = write("db_access:\n  defaults:\n    enforce: maybe\nauth:\n  jwt_secret: s\n")
+            .unwrap_err();
+        assert!(e.contains("enforce"), "{e}");
+        // 未知键 fail-loud
+        let e =
+            write("db_access:\n  analytics:\n    nope: 1\nauth:\n  jwt_secret: s\n").unwrap_err();
+        assert!(e.contains("nope"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

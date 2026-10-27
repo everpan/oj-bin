@@ -142,6 +142,69 @@ M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/�
 - `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
   产物与源一致。
 
+## v0.1.89（未打标签）
+
+**db 访问控制核心（L1）**：对齐 dbx 多库能力的第一步——顶层 `db_access:` 段提供库级授权、
+语句风险分类、危险写门、只读位、行数限额与决策可观测。宿主侧实现，**不动 FFI**（`ABI_VERSION`
+仍为 12，无插件 bump）。默认 `enforce: off` → **不配 `db_access:` 与升级前行为完全一致**。
+设计文档见 `docs/plans/2026-10-27-db-access-control-core.md`（含四路评审记录与待做登记）。
+
+### feat(db_access)
+
+- 新增 `src/bridge/db_policy.rs`：库级策略表 + 语句风险分类（`readonly`/`write`/`ddl`/`tx`/
+  `unknown`）+ 授权判定 + 限额 + SQL 脱敏。
+- 顶层 `db_access:` 段（`defaults` + 逐库覆盖条目）：`enforce`（off|warn|deny）、`read_only`、
+  `allow_ddl`、`allow_dangerous`、`max_rows`、`allow.{modules,roles,tenants,sources}`。
+  逐库条目**逐键继承** `defaults`（`allow` 逐维覆盖）——避免「全局设防被一次局部微调静默解除」。
+- 授权四维**并集**：任一已声明维度命中即放行；未声明维度不参与限制。声明为空数组 = 无人可过。
+  fail-closed：取不到身份的维度一律不命中。
+- 危险写门：UPDATE/DELETE 无 WHERE / 多表 / 恒真谓词 → `db_dangerous_write`（主判据是有无
+  WHERE，恒真集只用于收紧）。
+- 挂载点：`op_db_query` / `op_db_exec` / `op_db_stream_open`（词法分类）与 `op_db_query_build`
+  （构造器走精确意图，不经词法）。`enforce: off` 零开销早退。
+- 限额：`max_rows` 对 raw `db.query` 是**取回后截断**（响应打 `X-OJ-Row-Limit`），对 `db.stream`
+  是**提前终止**（真省后端拉取），构造器路径取 `min(声明 limit, max_rows)`。范围 `[1, 100000]`。
+- 自省：新增 `op_db_allowed` / JS `db.allowed()`——只列**当前主体有权限**的库别名与能力位
+  （数据面板的库选择器以此为准；硬编码 `db:` 段别名会列出「点了才报错」的假入口）。
+- 观测：`SqlEvent` 增 `risk` / `operator`（`user.id`）；拒绝与告警落前缀 `DB_ACCESS_DENY` 的
+  结构化日志，按 `(alias, reason)` 聚合计数（warn 档逐条落会被刷爆）。
+- 装配期 fail-loud：未知键点名、`max_rows` 越界、`read_only` + `allow_ddl` 矛盾、非法档位
+  一律启动报错（不静默取其一）。
+- 分类自带**独立**词法器（保留 MySQL 可执行注释 `/*! */` 内容），`guard.rs` 一行未改——
+  复用 `strip_literals` 会让 `DELETE FROM t WHERE 1=1 /*! tenant_id */` 借注释伪造租户命中。
+
+### 行为变更（默认档下不生效）
+
+- `db.asSystem()` **不豁免** db 访问控制（它只保留租户守卫豁免的既有语义）。升级到 `deny` 档
+  前须检查存量 `asSystem` handler。
+- `db.asTenant()` 自填的租户在 `tenants` 维**不作数**——该维只认服务端注入的租户（否则匿名
+  handler 可自授租户借道跨租户）。
+
+### 边界（文档已明示，不是安全边界）
+
+- `read_only` 是**宿主侧文本级判定**，真写防线仍是 DB 账号 GRANT。
+- `max_rows` 对 raw 是**取回后截断**（响应整形，非限流 / DoS 防线）。
+- 本策略**只约束 JS 提交的 SQL**：平台自生成 SQL（`db.nextSeq` 序列表 DDL、`db.listTables`
+  内省）与 CLI 通道（`oj migrate` / `oj schema` / `oj build`，不经 bridge）不适用。
+- 分类是 best-effort 词法，不是解析器：复杂语句落 `unknown` 并按最严档拒（fail-closed）。
+- `sources` 只有 `http` / `task` 两个取值（WS 帧按 `http` 计）。
+- `sql_guard=deny` 下「raw SELECT 未登记表」的敞口**原样保留**，不得读成已修复。
+
+### docs
+
+- `docs/db-guide.md` 新增 §11.5「db 访问控制」（配置 / 授权 / 分类 / 限额 / 自省 +
+  **承诺 / 不承诺**两栏表 + 升级须知）+ 报错速查 5 行。
+- devkit 四件同步：`api-manual.md`（§6 `db.allowed()`、§10 `db_access` 段、§13 限制表 7 行 +
+  陷阱 4 条）、`scenarios.md` 场景 46、`SKILL.md` 陷阱 7 条、`README.md` v0.1.89 段落；
+  `sample/global.d.ts` 增 `DbAllowedEntry` 与 `DBInstance.allowed()`。`cargo xtask build` 归置
+  `bin/devkit/`（`cargo test --release -p xtask` 的 devkit 契约用例校验产物与源一致）。
+
+### 待做登记（不在本版）
+
+- T1 `guard.rs` 的 `first_kw` 同样被 `WITH ... DELETE FROM` 打穿（既有租户守卫语义变更，需单独评审）。
+- T2 档位类型归一（`ownership_deny` / `SqlGuard` / `Enforce` 三套并存）。
+- T3 sqlparser 引入（触发条件：需要判定「谓词是否覆盖到正确列」时）。
+
 ## v0.1.87
 
 WS 目录镜像路由与 `api.ts` 同口径（`--module-root` 下剥布局段）+ 挂载清单外显。

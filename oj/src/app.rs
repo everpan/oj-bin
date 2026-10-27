@@ -1254,6 +1254,15 @@ pub async fn assemble_backend(
     // 部署期常量（config `vars:` 段，v0.1.25）：装配期冻结成只读 Arc（`vars.get` 唯一
     // 数据源），与 make_bridge 的 Extras.vars 同源。
     let vars = Arc::new(cfg.vars.clone());
+    // db 访问控制策略表（`db_access:` 段，v0.1.89）：装配期校验（越界/矛盾 fail-loud）
+    // 后冻结成只读 Arc，与 make_bridge 的 Extras.db_access 同源。
+    let db_access = Arc::new(cfg.db_access.clone());
+    db_access.defaults.validate("defaults")?;
+    // 逐库条目是**覆盖**而非整条策略：校验的是合并后的生效策略（否则
+    // `read_only` + `allow_ddl` 的矛盾可能只在合并后才浮现，装配期漏检）。
+    for (alias, ov) in &db_access.by_db {
+        ov.merge(&db_access.defaults).validate(alias)?;
+    }
     // db 默认库重定向需进入 'static 工厂闭包，先取出 owned（profiles 是借用，不能捕获）。
     let db_override = profiles.db.clone();
     // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
@@ -1290,6 +1299,8 @@ pub async fn assemble_backend(
         // db_override 已是 owned（上方从 profiles.db 克隆），闭包内直接复用。
         // 影子绑定：`move` 捕获的是这里的副本（外层 vars 仍供后续 StableState 使用）。
         let vars = vars.clone();
+        // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 db_access 仍供 StableState 使用）。
+        let db_access = db_access.clone();
         // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
         let input_contracts = input_contracts.clone();
         let fs_grant = fs_grant.clone();
@@ -1338,6 +1349,7 @@ pub async fn assemble_backend(
                     mail: mail.clone(),
                     // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
                     ldap: ldap.clone(),
+                    db_access: Some(db_access.clone()),
                     vars: vars.clone(),
                     js_heap_limit,
                     input_contracts: Some(input_contracts.clone()),
@@ -1389,6 +1401,7 @@ pub async fn assemble_backend(
         mail: mail.clone(), // 与 make_bridge 的 Extras.mail 同源（同一 Arc）。
         ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
+        db_access: db_access.clone(), // 与 make_bridge 的 Extras.db_access 同源（同一 Arc）。
         input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。

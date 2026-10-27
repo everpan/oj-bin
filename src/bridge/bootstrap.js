@@ -29,6 +29,7 @@ import {
   op_db_next_seq,
   op_db_sql_profile,
   op_db_has,
+  op_db_allowed,
   op_db_as_system,
   op_db_as_tenant,
   op_db_query,
@@ -969,6 +970,10 @@ globalThis.DB = function (name) {
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
+      // db access control introspection (v0.1.89): aliases this caller may reach, with
+      // the capability bits that apply. Without it a UI can only list every connection
+      // and fail on click -- a fake entry. Sync op; executes no SQL.
+      allowed: () => op_db_allowed(),
       // PR-2 Phase A streaming query. Primary form: callback (onRow enriches/transforms each
       // row, e.g. writing to json.stream). Otherwise returns an async iterable (escape hatch via
       // for-await). signal is wired through the abort event to op_db_stream_abort.

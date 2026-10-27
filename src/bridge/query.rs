@@ -2247,11 +2247,24 @@ pub async fn op_db_query_build(
     let reg = registry(&state)?;
     guard_req(&state, &req)?;
     validate_truncate(&req)?;
+    // db 访问控制（v0.1.89）：构造器路径走**精确意图**判定——verb 已知，不经词法，
+    // 因此不存在「分类失败」的误报面（与裸 SQL 路径的 best-effort 分类相对）。
+    let alias = super::guard::bound_db(&state, &req.db);
+    let intent = super::db_policy::Classified {
+        risk: match req.verb {
+            Verb::Select => super::db_policy::Risk::ReadOnly,
+            Verb::Insert | Verb::Update | Verb::Delete => super::db_policy::Risk::Write,
+        },
+        // 无条件的 update/delete = 全表写 → 危险写（受 allow_dangerous 门）。
+        dangerous: matches!(req.verb, Verb::Update | Verb::Delete) && req.conditions.is_empty(),
+        statements: 1,
+    };
+    let row_cap = super::db_policy::check_access_intent(&state, &alias, &intent)?;
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;
     // LIMIT 归一化（v0.1.20，db_query: 段）：顶层 select 未给 limit → 补 default_limit；
     // 显式 limit → clamp 到 max_limit。返回值用于截断可观测。
-    let applied = normalize_limit(&state, &mut req);
+    let applied = normalize_limit(&state, &mut req, row_cap);
     // 门控（T8）：未知方言（不在 builder-known 子集）一律结构化 unsupported，绝不回落 Sqlite。
     let da = lookup(&state, &req.db)?;
     let dialect = require_known_dialect(da.dialect_info(), "query_build")?;
@@ -2440,12 +2453,20 @@ fn validate_truncate(req: &QueryReq) -> Result<(), JsErrorBox> {
 
 /// 顶层 select 的 LIMIT 归一化（`db_query:` 段；v0.1.20）。
 /// 非 select（insert/update/delete 不接受 limit）返回 None。
-fn normalize_limit(state: &Rc<RefCell<OpState>>, req: &mut QueryReq) -> Option<u32> {
+fn normalize_limit(
+    state: &Rc<RefCell<OpState>>,
+    req: &mut QueryReq,
+    row_cap: Option<u32>,
+) -> Option<u32> {
     if req.verb != Verb::Select {
         return None;
     }
     let limits = state.borrow().borrow::<Arc<StableState>>().query_limits;
-    let applied = limits.applied(req.limit);
+    // db 访问控制的 `max_rows` 与 `db_query` 生效值取小（两者都声明时以更严者为准）。
+    let applied = match row_cap {
+        Some(cap) => std::cmp::Ord::min(limits.applied(req.limit), cap),
+        None => limits.applied(req.limit),
+    };
     req.limit = Some(applied);
     Some(applied)
 }
@@ -2464,7 +2485,7 @@ pub fn op_db_query_sql(
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;
     // 与执行路径同款归一化 —— toSQL 必须反映真实 SQL（含隐式 LIMIT）。
-    let _ = normalize_limit(&state, &mut req);
+    let _ = normalize_limit(&state, &mut req, None);
     // 门控（T8）：toSQL 同样属 oj 生成 SQL 路径，未知方言不回落 Sqlite。
     let da = lookup(&state, &req.db)?;
     let dialect = require_known_dialect(da.dialect_info(), "query_sql")?;

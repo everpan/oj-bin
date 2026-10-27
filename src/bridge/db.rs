@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -373,6 +373,19 @@ pub(crate) type DbStreamRegistry = tokio::sync::Mutex<HashMap<u32, Arc<DbStreamS
 pub(crate) struct DbStreamShared {
     pub rx: tokio::sync::Mutex<mpsc::Receiver<Result<Row, String>>>,
     pub abort: Arc<Notify>,
+    /// 所属库别名（限额日志用）。
+    pub alias: String,
+    /// db 访问控制的 `max_rows`（v0.1.89）：达到即提前终止（真省资源，区别于 raw 的
+    /// 「取回后截断」）。None = 不限。
+    pub max_rows: Option<u32>,
+    /// 已交付行数（与 `max_rows` 配合做提前终止）。
+    pub delivered: AtomicU32,
+    /// 达 `max_rows` 后置位：下一次 `next` 直接 done。
+    ///
+    /// 为什么需要独立标志位：`abort` 只是通知 pump 停止拉取，**通道里已缓冲的行
+    /// 仍会被 recv 出来**（有界背压使然），故不能在达上限时把第 cap 行换成 done
+    /// （少给一行），也不能指望通道立刻见底。done 由本标志显式钉住。
+    pub done: AtomicBool,
 }
 
 /// pump → 消费端的行缓冲上限（有界背压；abort 后缓冲行继续交付 = "流提前结束"）。
@@ -537,6 +550,9 @@ pub async fn op_db_query(
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
+    // db 访问控制（v0.1.89）：授权 → 风险分类 → 策略位；返回本库生效的行数上限。
+    let alias = super::guard::bound_db(&state, &name);
+    let row_cap = super::db_policy::check_access(&state, &alias, &sql)?;
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
@@ -567,6 +583,17 @@ pub async fn op_db_query(
     );
 
     let mut rows = res.map_err(to_js_err)?;
+    // db 访问控制的行数上限（raw 路径 = **取回后截断**：全量扫描/传输已发生，这是响应整形
+    // 而非 DoS 防线，边界写进 db-guide）。
+    if let Some(cap) = row_cap
+        && rows.len() as u32 > cap
+    {
+        rows.truncate(cap as usize);
+        let mut g = state.borrow_mut();
+        g.borrow_mut::<super::ReqState>()
+            .headers
+            .push(("X-OJ-Row-Limit".into(), cap.to_string()));
+    }
     // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
     super::jsnum::sanitize_rows(&mut rows);
     Ok(rows)
@@ -636,6 +663,13 @@ pub(crate) fn trace_sql(
             rows,
             ok,
             error: err,
+            // db 访问控制（v0.1.89）：操作者与风险分类。仅在 trace 开启时计算（上面已
+            // 早退，关闭态零开销）；`operator` 取 `user.id`（无身份记 None）。
+            operator: {
+                let g = state.borrow();
+                super::db_policy::operator_of(g.borrow::<super::ReqState>().req.user.as_ref())
+            },
+            risk: Some(super::db_policy::classify(sql).risk.as_str().to_string()),
             category,
             retryable,
         },
@@ -658,6 +692,9 @@ pub async fn op_db_exec(
     // search.* / CLI 六处）——方言知识只体现在占位符能力位。
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
+    // db 访问控制（v0.1.89）：写类语句在此被 read_only / 危险语句门拦下。
+    let alias = super::guard::bound_db(&state, &name);
+    super::db_policy::check_access(&state, &alias, &sql)?;
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
@@ -703,6 +740,9 @@ pub async fn op_db_stream_open(
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
+    // db 访问控制（v0.1.89）：与 query/exec 同一入口；行数上限走「提前终止」而非截断。
+    let alias = super::guard::bound_db(&state, &name);
+    let row_cap = super::db_policy::check_access(&state, &alias, &sql)?;
     let da = match resolve_target(&state, &name)? {
         Target::Pool(da) => da,
         Target::Tx(_) => {
@@ -743,6 +783,10 @@ pub async fn op_db_stream_open(
     let shared = Arc::new(DbStreamShared {
         rx: tokio::sync::Mutex::new(rx),
         abort: Arc::new(Notify::new()),
+        alias: alias.clone(),
+        max_rows: row_cap,
+        delivered: AtomicU32::new(0),
+        done: AtomicBool::new(false),
     });
     let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
     let reg = state
@@ -796,12 +840,98 @@ pub async fn op_db_stream_next(
             "db stream {stream_id} not found (already closed or never opened)"
         ))
     })?;
+    // 达上限后的终态：返回 done 而不是「再 recv 一次」（通道里可能还有缓冲行）。
+    if shared.done.load(Ordering::SeqCst) {
+        return Ok(Row::Null);
+    }
     let mut rx = shared.rx.lock().await;
     match rx.recv().await {
-        Some(Ok(row)) => Ok(row),
+        Some(Ok(row)) => {
+            // db 访问控制的行数上限：交付第 cap 行后即停（关闭游标、不再向后端拉取）。
+            // 与 raw 的「取回后截断」不同，stream 提前终止是真省资源。
+            let n = shared.delivered.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(cap) = shared.max_rows
+                && n >= cap
+            {
+                shared.done.store(true, Ordering::SeqCst);
+                drop(rx);
+                super::db_policy::log_row_limit(&shared.alias, cap);
+                // 只通知 pump 停止；**不摘注册表条目**——下一次 next 需经它返回 done。
+                shared.abort.notify_waiters();
+            }
+            Ok(row)
+        }
         Some(Err(e)) => Err(JsErrorBox::generic(e)),
         None => Ok(Row::Null), // done
     }
+}
+
+/// db 访问控制自省（v0.1.89）：当前主体可用的库列表 + 每库能力位。
+///
+/// dbx 形态的首屏是连接树——没有这个出口，前端只能列出全部连接、点了才报错（= 假入口）。
+#[op2]
+#[serde]
+pub fn op_db_allowed(state: &mut OpState) -> Result<Vec<Value>, JsErrorBox> {
+    let st = state.borrow::<Arc<super::StableState>>().clone();
+    let mut roles: Vec<String> = Vec::new();
+    let rs = state.borrow::<super::ReqState>();
+    let module = rs.module.clone();
+    if let Some(a) = rs
+        .req
+        .user
+        .as_ref()
+        .and_then(|u| u.get("roles"))
+        .and_then(|u| u.as_array())
+    {
+        roles = a
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    let tenant: Option<String> = if rs.req.anonymous {
+        None
+    } else {
+        rs.req.tenant_id.clone()
+    };
+    let source = if st.tasks_flag.is_some() {
+        "task"
+    } else {
+        "http"
+    };
+    let ctx = super::db_policy::AccessCtx {
+        module: module.as_deref(),
+        roles,
+        tenant: tenant.as_deref(),
+        source,
+    };
+    let mut out: Vec<Value> = Vec::new();
+    let mut names: Vec<&String> = st.dbs.keys().collect();
+    names.sort();
+    for alias in names {
+        let policy = st.db_access.policy_for(alias);
+        if !super::db_policy::granted(&policy.allow, &ctx) {
+            continue;
+        }
+        let dialect = st
+            .dbs
+            .get(alias)
+            .map(|d| d.dialect_info().name.clone())
+            .unwrap_or_default();
+        out.push(serde_json::json!({
+            "alias": alias,
+            "dialect": dialect,
+            "read_only": policy.read_only,
+            "allow_ddl": policy.allow_ddl,
+            "allow_dangerous": policy.allow_dangerous,
+            "max_rows": policy.max_rows,
+            "enforce": match policy.enforce {
+                super::db_policy::Enforce::Off => "off",
+                super::db_policy::Enforce::Warn => "warn",
+                super::db_policy::Enforce::Deny => "deny",
+            },
+        }));
+    }
+    Ok(out)
 }
 
 /// db.stream 关闭（PR-2 Phase A）：触发中止并移除注册表条目（条目移除后 Arc 仍被 pump / 进行中的
@@ -1195,9 +1325,13 @@ mod tests {
     /// 守护测试（0.1.67，评审 A1）：把「裸 SQL 出口 ⊆ {query, exec, stream_open}」
     /// 从文档承诺变成 CI 资产——枚举 op 注册表的全部 op_db_*，新增 op 必须先过
     /// 本白名单（属裸 SQL 出口则插桩 normalize_and_trace，否则更新此表并说明）。
+    ///
+    /// `op_db_allowed`（v0.1.89）：访问控制自省出口，**不执行** SQL，故无需插桩
+    /// normalize_and_trace——登记为已知非裸 SQL 出口。
     #[test]
     fn raw_sql_op_exits_are_pinned() {
-        const WHITELIST: [&str; 18] = [
+        const WHITELIST: [&str; 19] = [
+            "op_db_allowed",
             "op_db_as_system",
             "op_db_as_tenant",
             "op_db_dialect",

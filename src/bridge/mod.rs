@@ -32,6 +32,7 @@ mod crypto;
 mod db;
 pub mod db_backend;
 pub mod db_error;
+pub mod db_policy;
 pub mod dialect_caps;
 mod embedded_js;
 mod envelope;
@@ -217,6 +218,9 @@ pub struct StableState {
     pub mail: Option<Arc<dyn mail::MailBackend>>,
     /// ldap 后端（装配层按 ldap: 段 + oj-ldap 插件注入）；None = ldap.* 报 "ldap not configured"。
     pub ldap: Option<Arc<dyn ldap::LdapBackend>>,
+    /// db 访问控制策略表（config `db_access:` 段，v0.1.89）：键 = db 别名，
+    /// `defaults` 兜底未声明的库。装配期冻结、只读。
+    pub db_access: Arc<db_policy::DbAccessSection>,
     /// 部署期常量（config `vars:` 段，v0.1.25）：`vars.get(name)` 的唯一数据源。
     /// **fail-closed**：只有这里声明的键可读（空表 = 全 null）。装配期冻结、只读。
     pub vars: Arc<HashMap<String, String>>,
@@ -291,6 +295,8 @@ pub struct Extras {
     pub rabbits: Option<Arc<NamedRegistry<mq::MqInstance>>>,
     /// 任务上下文标志（Some 仅注入任务 Bridge，评审 M2）。
     pub tasks_flag: Option<Arc<AtomicBool>>,
+    /// db 访问控制策略表（`db_access:` 段）；None = 空表（全库不设防，与升级前一致）。
+    pub db_access: Option<Arc<db_policy::DbAccessSection>>,
     /// 部署期常量（config `vars:` 段，v0.1.25）；缺省空表 = `vars.get` 恒 null。
     pub vars: Arc<HashMap<String, String>>,
     /// PR-4 单 isolate 堆限额（字节）；None = 不限额（测试/嵌入式默认）。
@@ -421,6 +427,7 @@ deno_core::extension!(
         kv::op_kv_expire,
         kv::op_kv_incr,
         db::op_db_has,
+        db::op_db_allowed,
         db::op_db_as_system,
         db::op_db_as_tenant,
         db::op_db_query,
@@ -819,6 +826,7 @@ impl Bridge {
             sql_memo: Mutex::new(HashMap::new()),
             mail: extras.mail,
             ldap: extras.ldap,
+            db_access: extras.db_access.unwrap_or_default(),
             vars: extras.vars,
             js_heap_limit: extras.js_heap_limit,
             fs: extras.fs,
@@ -2524,6 +2532,7 @@ mod tests {
             sql_memo: Mutex::new(HashMap::new()),
             mail: None,
             ldap: None,
+            db_access: Arc::new(db_policy::DbAccessSection::default()),
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
             fs: None,

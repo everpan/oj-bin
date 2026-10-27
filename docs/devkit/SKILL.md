@@ -314,6 +314,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `exec.run` 带 `onStdout`/`onStderr` 回调后还想要整段 stdout | 回调形态**其实也缓冲**（v0.1.79 订正：实现把全部分块攒在内存后 merge，返回 `{ code, stdout, stderr }`，只是解码为**有损**、非 UTF-8 不抛）——真正不占内存、拿原始字节的是 `exec.spawn` 逐块消费；用回调形态仍受 10MB 合计上限约束 |
 | 拿 `exec.spawn` 的 `rid` 去 kill 别人的进程 | 句柄 rid 是本次 runtime 的 ResourceId，进程内局部；`kill` 只杀自己 spawn 的会话，无 pid 入参，跨模块 / 跨请求不可达（v0.1.78） |
 | `exec.run` 带回调 / `exec.spawn` 时超时或输出超限却没抛错，以为跑成功了 | **只有无回调的缓冲形态抛** `exec timed out` / `output limit exceeded`；回调与流式形态是整组击杀后把 `code` 打成 **137** 并截断输出（不抛）。别用 `try/catch` 判成功——必须同时校验 `code`，且别把截断的 stdout 当完整结果（v0.1.79） |
+| 给某库配了 `db_access.<alias>.read_only: true` 却没生效（v0.1.89） | 该库条目的 `enforce` **继承** `defaults`（默认 `off`）= 不设防。要么把 `enforce: deny` 写进 `defaults`，要么在该库条目里显式再写一遍——**整条覆盖的直觉在这里是错的**（逐键继承正是为了防「全局设防被局部微调静默解除」） |
+| `db_access` 的 `allow.sources` 写了 `ws` / `anon` 永不命中（v0.1.89） | source **只有** `http` / `task` 两个取值：WS 帧跑在 HTTP 桥上记 `http`，没有 `ws`/`anon`。定时任务（无 user/module/tenant）走 `sources: [task]` |
+| 定时任务访问被授权库报 `db_not_granted`（v0.1.89） | 任务桥 `run_task` 走默认 `RequestInfo` = 无 user、无 module、无 tenant，只有 `sources` 维可命中——别指望 roles/tenants/modules 维 |
+| `db.asSystem()` 之后 `db_access` 仍然拒绝（v0.1.89） | asSystem **只绕过租户防护**，不豁免访问控制（有意设计：否则它就是 access control 的万能逃生口）。升级到 `deny` 档前先查存量 asSystem handler |
+| 裸 SQL 在 `deny` 档被判 `db_unknown_risk` 但业务看着很正常（v0.1.89） | 风险分类是**词法**不是解析器：串未闭合（反斜杠）、注释断词、CTE/窗口/存储过程体都会落 `unknown` 并按最严档拒。修法就是文案里那句——**改用 `db.table()` 构造器**（走精确意图判定，不依赖词法）；真要裸 SQL 就先 `warn` 灰度看日志 |
+| 配了 `db_access` 就以为库被保护住了（v0.1.89） | 它是**宿主侧护栏层**：`read_only` 是文本级判定（真写防线仍是 DB 账号 GRANT），`max_rows` 对 `db.query` 是**取回后截断**（不是限流）。且**不约束**平台自生成 SQL 与 `oj migrate` 等 CLI 通道 |
 
 ## 手册
 

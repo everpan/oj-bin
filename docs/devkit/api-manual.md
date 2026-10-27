@@ -1157,6 +1157,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
 | `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**——此前是封闭三值枚举（未识别的 DSN 前缀被当作 sqlite 处理，`dialect()` 于是报 `"sqlite"`），现在原样返回真名。要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。**不得用它判断能力**：方言名是开放集，`if (d === "mysql") A else B` 会把 B 静默发给新方言——能力问题直接调用并接 `OJ_DB_UNSUPPORTED`，确需方言特有 SQL 时用白名单 + 响亮失败（scenarios 场景 45）。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 | `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。对**宿主认识的三种方言**同口径（SQL 文本引擎常量，不需业务分支）——其他方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_tables"`，v0.1.88）。替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
+| `db.allowed()` | `allowed(): Array<{ alias: string; dialect: string; read_only: boolean; allow_ddl: boolean; allow_dangerous: boolean; max_rows: number \| null; enforce: "off" \| "warn" \| "deny" }>` | **访问控制自省**（v0.1.89）。只列**当前调用主体有权限访问**的库别名及其能力位（按 alias 排序）；未授权的库不出现在列表里。管理员后台 / 数据面板的「库选择器」应以此为准，不要硬编码 `db:` 段的全部别名（那是**假入口**：列出来点了才报错）。同步 op；不执行任何 SQL。`db.tx` 回调对象同签名 |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
 
@@ -3557,6 +3558,52 @@ curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<titl
 - DSN 带密码时写成 `"ENC[…]"` 密文（v0.1.33，见「secrets —— 凭据密封」）：整条 DSN
   一起封即可，不必拆出密码字段。
 
+### db_access —— 库级访问控制（v0.1.89）
+
+`db:` 只定义「有哪些库、怎么连」；`db_access:` 定义「谁能对这些库做什么」。两者分开，
+`db:` 仍是纯粹的 `别名 → DSN` map。**不配这段 = 与升级前完全一致**（默认 `enforce: off`）。
+
+```yaml
+db_access:
+  defaults:                # 全局默认档（缺省 = off）
+    enforce: off           # off（不设防） | warn（告警放行） | deny（拒）
+  analytics:
+    read_only: true        # 拦 write / ddl
+    allow_ddl: false       # 单独放开 DDL（与 read_only 互斥，装配期报错）
+    allow_dangerous: false # 放开「无 WHERE 的 UPDATE/DELETE」等危险写
+    max_rows: 1000         # 缺省 = 不限；范围 [1, 100000]
+    allow:                 # 四维并集；不写 = 不限制
+      modules: [sales]
+      roles: [admin, dba]
+      tenants: ["t1"]
+      sources: [http]      # 只有 http | task 两个取值
+```
+
+要点（写错会付出真代价，逐条看）：
+
+- **逐键继承**：`analytics:` 是**覆盖条目**，未声明的键继承 `defaults`（`allow` 是逐维
+  覆盖）。若整条覆盖，设好 `defaults.enforce: deny` 后再给某库加一条 `read_only: true`
+  会把该库的 `enforce` 悄悄打回 off——**全局设防被一次局部微调静默解除**。
+- `allow` 是**并集**：任一已声明维度命中即放行。⚠️ **声明多维不会提高强度，只会降低**
+  （任一命中即过）。`allow: { roles: [] }` 是「无人可过」，不是「不限制」。
+- fail-closed：声明了某维而请求取不到该维身份 → 该维**不命中**（不因取不到而放行）。
+- `tenants` 维**只认服务端注入的租户**：`db.asTenant()` 自填的租户不作数。
+- `db.asSystem()` **不豁免**访问控制（它只绕过租户注入）。
+- `sources` 只有 `http` / `task`：**没有** `ws` / `anon`（WS 帧跑在 HTTP 桥上记 `http`，
+  写了永不命中）。定时任务无 user/module/tenant，靠 `sources: [task]` 授权。
+- 装配期 fail-loud：未知键、`max_rows` 越界、`read_only` + `allow_ddl` 矛盾都启动报错。
+- 只约束 **JS 提交的 SQL**：`db.nextSeq` 的平台表 DDL、`db.listTables` 的内省查询，以及
+  `oj migrate` / `oj schema` 等 CLI 通道（不经 bridge）**不受本策略约束**。
+
+被拒时 JS 拿到的是错误（文案形如 `db access: alias "analytics" is read_only;
+statement classified write`），`reason` 稳定串有五个，供告警 grep：
+`db_not_granted` / `db_read_only` / `db_ddl_denied` / `db_dangerous_write` /
+`db_unknown_risk`。服务端同时落前缀 `DB_ACCESS_DENY` 的结构化日志（按 `(alias, reason)`
+聚合计数）。分类失败的修复指向很明确：**改用 `db.table()` 构造器**——它走精确意图判定，
+不依赖词法。
+
+JS 侧自省：`db.allowed()` 只列**当前主体有权限**的库（含能力位）。
+
 ### redis
 
 ```yaml
@@ -4393,6 +4440,12 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `platform.root` 不得与其他 api 挂载树同径或互为父子（v0.1.75） | 启动报错（`… anti-squatting tripwire would be silently disabled`）——受控根必须独立于市场安装树；特权模块只能由部署方放入 `platform.root` 并把该目录列为 `mounts[].api` 条目 |
 | `http.module` 写属性抛 `TypeError: Cannot assign to read only property …`（v0.1.76） | `http.module` 是框架授信依据（归属守卫 / bound_db / 平台特权换装）故冻结只读：strict（ESM / api 文件 CJS 包装）下写 / delete 抛 TypeError；`require()` 引入的 CJS 代码（`new Function`，sloppy）写它**静默无效**。两条路径都改不了框架状态（JS 只持快照拷贝）——只读用即可，测试要伪造模块身份走真实路由（e2e 同款），无可写变体 |
 | `http.module` 为 `null` 的上下文（v0.1.76） | 任务桥、WS 帧（含模块目录内的 `ws.ts`）、`run_with`、启动期内省期——按 handler 文件所在目录判定，不是请求来源。访问前判 `null`（与 `http.user` 匿名时同款体验）；页面 meta 合成派发在模块目录内**有值** |
+| `db_access` 是**宿主侧护栏层**，不是数据库权限（v0.1.89） | `read_only` 是**文本级**判定（对 JS 提交的 SQL 做词法分类），真正的写防线仍是 DB 账号 GRANT——两个都配才算设防。`max_rows` 对 `db.query` 是**取回后截断**（全量扫描/传输已发生），不是限流 / DoS 防线；只有 `db.stream` 是真提前终止。**不做** SQL 改写（不自动加 LIMIT、不注入谓词） |
+| `db_access.max_rows` 无法表达「该库显式不限」（v0.1.89） | `Option` 被「继承 defaults」占掉了。defaults 设了上限而某库要放开时，改为 defaults 不设、逐库声明——不提供 `0=不限` 之类的暗号 |
+| `db_access.allow` 四维是并集，多维只会放宽（v0.1.89） | 「模块 X **且**角色 admin 才可访问」本阶段做不到：写两维 = 任一命中即过。需要「且」语义请在 handler 里自己判 |
+| 语句风险分类是 best-effort 词法（v0.1.89） | 不是 SQL 解析器：CTE / 窗口函数 / 存储过程体 / 串未闭合等复杂形态会落 `unknown` 并**按最严档拒**（fail-closed）。`deny` 档上线前先用 `warn` 灰度看日志，别直接 deny |
+| `db_access` 不约束平台自生成 SQL 与 CLI 通道（v0.1.89） | `db.nextSeq` 的序列表 DDL、`db.listTables` 的内省查询不适用；`oj migrate` / `oj schema` / `oj build` 不经 bridge，也不适用 |
+| `sql_guard=deny` 下 raw SELECT 未登记表的敞口**原样保留**（v0.1.89） | 本策略只管「库别名 + 风险类别」，只读语句一律放行——不要把 `db_access` 读成「该敞口已修」 |
 
 ### 常见陷阱清单
 
@@ -4411,6 +4464,15 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - 挂 `.route` 后目录镜像路径 404（替换语义）；`{*path}` 至少匹配一段。
 - `redis.default` 配置即真连且 fail-fast——CI/离线环境注释掉该段即用内存 KV。
 - 每请求至多一个 `db.tx`；漏 await 会在请求结束时自动回滚并打 warn。
+- `db_access` 里给某库写了 `read_only: true` 却只加这一条 → 该库的 `enforce` 仍继承
+  `defaults`（若 defaults 是 `off`，**等于没设防**）。要设防就把 `enforce: deny` 写在
+  `defaults` 里，或在该库条目里显式写一遍（v0.1.89）。
+- 配了 `allow: { sources: [ws] }` 或 `[anon]` 却永不命中：source **只有** `http` / `task`
+  两个取值，WS 帧按 `http` 计（v0.1.89）。
+- 定时任务访问被授权的库报 `db_not_granted`：任务桥没有 user/module/tenant，只能靠
+  `sources: [task]` 授权（v0.1.89）。
+- `db.asSystem()` 救不了 `db_access` 的拒绝——它只绕过**租户**防护，不豁免访问控制
+  （v0.1.89 有意的行为变更，升级到 `deny` 档前先查存量 `asSystem` handler）。
 - `beforeEach` 是单一全局钩子，跨 `describe` 被覆盖——多 describe 文件在各 `it` 内联准备。
 - WS Binary 帧 `http.body` 是 `null` 不是乱码——取字节用 `http.bodyBytes()`（v0.1.16）。
 - `ws.send` 的帧型由**参数类型**决定：string → Text、Uint8Array → Binary——回显二进制协议时

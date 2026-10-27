@@ -120,6 +120,21 @@ interface SqlProfile {
   }[];
 }
 
+// db.allowed() 的返回（v0.1.89）：当前调用主体**有权限访问**的库别名 + 能力位。
+// 未授权的库不出现在列表里（数据面板的库选择器应以此为准，别硬编码 `db:` 段别名
+// ——那会列出点了才报错的假入口）。
+interface DbAllowedEntry {
+  alias: string;
+  // 方言名（开放集，v0.1.88 起由插件 describe() 声明）。
+  dialect: string;
+  read_only: boolean;
+  allow_ddl: boolean;
+  allow_dangerous: boolean;
+  // null = 不限。
+  max_rows: number | null;
+  enforce: "off" | "warn" | "deny";
+}
+
 // 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）、没有 stream
 // （流式只走直连池，tx 内报错）。
 // isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
@@ -645,6 +660,9 @@ declare global {
     /** SQL 执行追踪（v0.1.51，dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;
+    /** 访问控制自省（v0.1.89）：只列当前主体有权限访问的库 + 各库能力位。
+     * `db_access:` 段未配置时全部库都在列表里（默认 enforce: off = 不设防）。 */
+    allowed(): DbAllowedEntry[];
     asTenant(id: string): DBInstance;
     // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
