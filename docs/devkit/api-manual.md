@@ -1149,14 +1149,14 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
 | `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal }): Promise<void> \| AsyncIterable<Row>` | **流式查询**（v0.1.37）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。**只走直连池**（`db.tx` 内会报错），且**只有部分后端真逐行拉取**（其余回落全量或直接报错，详见下节）。两种形态见下 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
-| `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；`memory://` 不支持。`db.tx` 内调用搭车同一连接 |
+| `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；只在 sqlite/mysql/postgres 上可用（其他方言 `OJ_DB_UNSUPPORTED`）；`memory://` 假后端拿不到返回值（`no value returned`）。`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
 | `db.asSystem` | `asSystem(): DBInstance` | 本请求以系统身份绕过租户防护（v0.1.15，仅 tenant.sql_guard 活跃时有意义；请求级生效 + 审计日志，业务 handler 禁用） |
 | `db.asTenant` | `asTenant(id: string): DBInstance` | 匿名请求**声明**租户身份（v0.1.20）——仍强制租户条件，只是把 `tenant_id` 由 `id` 填充；需 `tenant.allow_as_tenant: true` 且请求为匿名（见下） |
 | `DB(name)` | `(name: string) => DBInstance \| undefined` | 命名库实例；全部方法与 `db` 同签名 |
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
-| `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**（不再收窄成三个字面量，也**不再**对未识别方言报错）——要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。**不得用它判断能力**：方言名是开放集，`if (d === "mysql") A else B` 会把 B 静默发给新方言——能力问题直接调用并接 `OJ_DB_UNSUPPORTED`，确需方言特有 SQL 时用白名单 + 响亮失败（scenarios 场景 45）。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
-| `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。方言无关（SQL 文本引擎常量），替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
+| `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**——此前是封闭三值枚举（未识别的 DSN 前缀被当作 sqlite 处理，`dialect()` 于是报 `"sqlite"`），现在原样返回真名。要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。**不得用它判断能力**：方言名是开放集，`if (d === "mysql") A else B` 会把 B 静默发给新方言——能力问题直接调用并接 `OJ_DB_UNSUPPORTED`，确需方言特有 SQL 时用白名单 + 响亮失败（scenarios 场景 45）。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
+| `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。对**宿主认识的三种方言**同口径（SQL 文本引擎常量，不需业务分支）——其他方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_tables"`，v0.1.88）。替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
 
@@ -1215,7 +1215,7 @@ const rows = await db.table("account")
 - `OrderByItem`：`{ field: string; dir?: "asc" | "desc" | null }`。
 - **`select(["*"])`（v0.1.81）**：显式拉全列。必须是唯一元素
   （`select(["*", "id"])` 直接报 `select '*' must be the only column`）；**带 join 时直接报错**
-  （`select '*' does not accept joins`）——全列展开只出基表列，业务拿 join 列做授权判断会拿到 `undefined`。
+  （`select '*' is not allowed with joins`）——全列展开只出基表列，业务拿 join 列做授权判断会拿到 `undefined`。
 - **`whereIf(test, cond)`（v0.1.81）**：条件化 where。`test` 为 `undefined` / `null` / `false` /
   **空数组 `[]`** 时整条跳过；`0` 与 `""` 照常保留（它们是合法过滤值，例如 `status = 0`）。
   用来把「可选筛选」写成一行而不用 `if (x) q.where(...)`：
@@ -1225,7 +1225,8 @@ const rows = await db.table("account")
     .whereIf(ids && ids.length, { field: "id", op: "in", value: ids });  // 空数组→跳过（避免 IN () 静默 0 行）
   ```
 - **红线**：标识符（表/列/别名）只来自 SchemaRegistry 白名单（启动内省所得），值一律经绑定参数。
-  SQL 注入面为零；未知表/列报错，排序列另有可排序白名单。`limit` 缺省 100、硬上限 1000。
+  SQL 注入面为零；未知表/列报错，排序列另有可排序白名单。`limit` 缺省 100；显式 limit 被
+  `db_query.max_limit` clamp（**默认 1000**，可配至硬顶 **100000**）。
 - 构造器自动按库方言出 SQL（sqlite/mysql/postgres），业务无需手写方言差异。
 
 **条件树（where 嵌套）**：
@@ -1383,8 +1384,10 @@ await db.table("notify_daily").fromSelect(
 
 - **`orIgnore()`**：撞主键/任意唯一键的行被跳过。sqlite / postgres 渲染 `ON CONFLICT DO NOTHING`；
   mysql 走 `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式、命中冲突即跳过），**要求表有主键**——
-  无主键表报 `orIgnore on mysql requires a primary key on table '...'`；mysql 上 `orIgnore` 与
-  `returning` **互斥**（`orIgnore with returning is not supported on mysql`）。**三方言 affected-rows
+  无主键表报 `orIgnore on mysql requires a primary key on table '...'`。**mysql 上别把
+  `orIgnore()` 和 `returning(['id'])` 组合**：恒等赋值不会刷新 `LAST_INSERT_ID()`，跳过重复行时
+  两步取 id 会拿到该连接上的旧值——要「幂等 + 拿到 id」就先用唯一键 `select` 出 id（或改用普通
+  `insert` 并接 `OJ_DB_CONSTRAINT`）。**三方言 affected-rows
   不一致**（mysql 命中重复键返回匹配行 1，pg/sqlite 返回 0），勿用 `if (n === 1)` 判幂等——
   口径与「为什么不用 `INSERT IGNORE`」见 `sql-builder-guide.md` §3.2。
   **sqlite 上 `orIgnore()` 与 `fromSelect()` 不可组合**（v0.1.82 明文）：报
@@ -1522,9 +1525,10 @@ await db.table("account").select([
 - **字面量列（v0.1.81）**：`{ lit: <值>, as: "<别名>" }` 把常量作为一列输出。值走**绑定参数**
   （永远不会拼进 SQL 文本），并按目标方言做类型转换——sqlite 裸 `?`、mysql `CAST(? AS CHAR)`、
   postgres `CAST(? AS TEXT)`。用途：给结果打固定标记列（如 `scope = 'svc'`）、与真实列拼接。
-  - `lit` 必须是**标量**（数组/对象/嵌套会报 `lit column must be a scalar`）；`as` 必填且过别名
-    形状（`^[A-Za-z_][A-Za-z0-9_]*$`，违例 `illegal alias`），与 `*` 混用直接拒
-    （`literal column cannot mix with select '*'`）。
+  - `lit` 必须是**标量**（数组/对象/嵌套报 `lit column '<as>' needs a scalar value
+    (string/number/bool/null)`）；`as` 必填且过别名形状
+    （`^[A-Za-z_][A-Za-z0-9_]*$`，违例 `illegal alias`），与 `*` 混用报
+    `select '*' must be the only column`（`*` 只能独占一列）。
   - **真正的计算列请用 `case`**：`{case:{when:[...],else:...},as:"x"}` 已支持条件表达式；
     `lit` 只承载常量，不承载表达式。注意 op 拼写是 `isnull` 不是 `isNull`。
 - case：searched case；`cond` 与 where 条件树同形；`then`/`else` **只允许 JSON 值**（绑定参数，
@@ -1564,9 +1568,14 @@ await db.table("rich")
 > 2. **不是所有后端都真逐行拉取**，分三档：
 >    - **真流式**（逐行推）：核心 sqlite / mysql / postgres 连接，以及 `oj-db-mysql` /
 >      `oj-db-postgres` 两个插件后端——大表遍历内存恒定。
->    - **回落全量**（v0.1.38 起）：后端没有逐行能力时，宿主改成一次取全量——**结果与
->      `db.query` 完全一致，不报错，只是内存优势没了**。
->    - **彻底不支持**：直接报 `backend does not support streaming`，此时请换 `db.query` 分页。
+>    - **回落全量**（v0.1.38 起）：插件**未声明** `stream`（或旧插件返回
+>      `{"unsupported":true}`）时，宿主改成一次取全量——**结果与 `db.query` 完全一致，
+>      不报错，只是内存优势没了**。反过来「未声明却真提供了流」宿主采信 + warn（插件该补
+>      `"stream"`）。
+>    - **彻底不支持**：进程内后端若未实现 `stream_query`（默认实现），报
+>      `backend does not support streaming`；插件**声明了** `stream` 却回 unsupported 是能力
+>      契约违规，报结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability = "stream"`）。两种都请换
+>      `db.query` 分页。
 >
 >    想确认走的是哪一档：真流式的耗时随结果集分批推进（边收边出），回落全量的耗时会
 >    在首行之前一次性卡住。
@@ -1659,8 +1668,13 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
 | `OJ_DB_CONNECTION` | 连接失败/已断开 | SQLSTATE 08xxx、io/tls 错 |
 | `OJ_DB_CAPACITY` | 容量/资源耗尽 | SQLSTATE 53xxx |
 | `OJ_DB_CANCELLED` | 查询被取消 | SQLSTATE 57xxx、流取消 |
-| `OJ_DB_UNSUPPORTED` | **该方言不支持这个能力** | 查询构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` 遇到宿主未识别的方言 |
+| `OJ_DB_UNSUPPORTED` | **该方言不支持这个能力** | 查询构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` / `seed` 遇到宿主未识别的方言 |
 | `OJ_DB_INTERNAL` | 其余（含未知厂商码） | 未映射的错误 |
+
+`OJ_DB_UNSUPPORTED` 的 `e.data.capability` 取值（**闭集**，可安全 switch）：
+`query_build` / `query_sql`（构造器 `.all()/.run()` 与 `.toSQL()`）、`list_tables`、
+`next_seq`、`migrate` / `seed`（CLI 侧，不进 JS 运行时）、`stream` / `cancel`（插件声明了
+能力却回 unsupported = 契约违规）。同一错误另有 `e.data.dialect` = 声明名。
 
 ```js
 try {
@@ -1682,10 +1696,11 @@ try {
 > 用 `e.code` / `e.data.vendor_code` 判别。
 
 > **方言边界**：宿主只对 **sqlite / mysql / postgres** 生成 SQL（构造器、`listTables`、
-> `nextSeq`、`search.*`、`migrate`/`seed`）。其他方言（插件声明 `describe()` 里的
+> `nextSeq`、`migrate`/`seed`）。其他方言（插件声明 `describe()` 里的
 > `dialect`）上一期只开放**裸 SQL 路径**（`db.query` / `db.exec` / `db.stream` / `db.tx`），
 > 构造器类 API 一律 `OJ_DB_UNSUPPORTED`（`data.capability` 点名是哪个 API）——不会再
-> 悄悄按 sqlite 语义生成错误 SQL。
+> 悄悄按 sqlite 语义生成错误 SQL。sample 的 `_shared/search`、`_shared/versions` 是**模块
+> 自带的**方言白名单（不是宿主门控），抛同码但 `data.capability` 为 `search` / `versions`。
 >
 > **别用 `db.dialect()` 判断「能干什么」**：方言名是开放集（`"oracle"` / `"dameng"` / 插件
 > 自定名都合法），`if (d === "mysql") A else B` 在新方言接入后会把 B **静默**发给它
@@ -3357,7 +3372,7 @@ mounts:
 | `html_meta` | 无 | （v0.1.20）**构建期** per-route meta 目录名（相对各 web 挂载根）：送 HTML 前读 `<挂载根>/<dir>/<path>.json`，把 `title`/`description`/`canonical`/`og:*`/`twitter:*` 注入 `<head>`（值 HTML 转义、**不注入脚本**；目录自身不可公开访问）。只覆盖构建期已知路由 |
 | `html_meta_handler` | 无 | （v0.1.25）**动态** meta 源 = 业务 handler 的路由路径，见下「静态站点与 per-route meta」。静态 JSON 打底、动态按 key 覆盖；装配期校验它必须命中一个 **GET** 路由（拼错启动即报错） |
 | `html_cache_control` | 无 | （v0.1.25）HTML 响应的 `Cache-Control`（**只管 HTML**，js/css/图片不受影响）。动态 handler 返回的 `cache_control` 优先；两项都没有 = 不加头 |
-| `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建
+| `logs_dir` | 无（= config 目录下 `./logs`） | 日志目录（终端输出完整镜像落盘；每次启动新建文件 `server-<启动秒>_<pid>.log`，按 `logs_max_m` 滚动、保留 `logs_keep_files` 个）；不存在自动创建 |
 | `logs_max_m` | `100` | 单个日志文件大小上限（单位 M；**<100 按 100 生效**），超过滚动为 `base.1.log` 依次后移 |
 | `logs_keep_files` | `10` | 日志文件保留个数（含活动文件，超出删除；最小生效值 2） |
 | `console_log` | `false` | 终端输出开关。**默认 false = 只落盘**，终端保持干净（stdout 与 stderr 一起静默，因为 tracing 控制台层写的是 stderr）。`true` = 额外回写终端；CLI `--console-log` 亦可打开（与配置取「或」）。**非 unix 平台无落盘，此时强制保留终端输出并告警**。启动失败的最终退出原因无论开关都直写终端（`echo_terminal`，原始 stderr fd 副本） |

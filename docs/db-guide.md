@@ -6,7 +6,9 @@
 > 本手册讲「怎么上手、为什么这样设计」。逐 API 的穷举式参考见
 > [`docs/devkit/api-manual.md`](devkit/api-manual.md) 第 6 章「db / DB(name)」。
 > 所有 API 名、字段名、报错文案均与源码（`src/bridge/bootstrap.js`、`src/bridge/query.rs`、
-> `src/bridge/db.rs`）逐字核对，版本 0.1.37。
+> `src/bridge/db.rs`、`src/bridge/dialect_caps.rs`）逐字核对，**版本 0.1.88 / ABI 12**。
+> 方言能力模型（开放方言名 + 能力位）与结构化数据库错误是 0.1.88 的两处结构性变更，
+> 见 §10.5 与 §10.7。
 >
 > 文中「fail-fast」= 发现问题立刻报错退出；「白名单」= 只有预先声明过的表/列才能被
 > 访问，其余一律拒绝。
@@ -27,6 +29,7 @@ db:
 ```
 
 DSN 支持 `sqlite://`、`mysql://`、`postgres://`，可混用（见 [§1](#1-db-配置)）。
+test-only 还有 `sqlite::memory:`（真 sqlite，重启即丢）与 `memory://`（**假后端**，不执行 SQL）。
 
 ### 2) 声明表（白名单的源头）
 
@@ -113,7 +116,15 @@ db:
   warehouse: "postgres://127.0.0.1:5432/app"
 ```
 
-- 键 = **库名**，值 = DSN。方言由 DSN scheme 决定：`sqlite://` / `mysql://` / `postgres://`。
+- 键 = **库名**，值 = DSN。DSN scheme 只负责**选后端**（`sqlite://` 内建、
+  `mysql://` → `oj-db-mysql`、`postgres://` → `oj-db-postgres`）；**方言名由后端自己声明**
+  （插件 `describe()` 的 `dialect`，v0.1.88 起是开放集），不是宿主从前缀猜的。
+  未知 scheme 启动即拒：`unknown db scheme in dsn '<脱敏>' (known: ["sqlite://", …])`——
+  `known` 列表随**实际装上**的后端变，看不出 mysql 就是插件没装上（不是配置写错）。
+- 仅测试可用的两个 DSN：`sqlite::memory:`（真 sqlite，进程退出即丢）与 `memory://`
+  （`InMemoryAccessor`，**假后端**：不执行 SQL，`query`/`exec` 一律回夹具行）。因此
+  `memory://` 上 `db.nextSeq` 拿不到返回值（`no value returned`）——它不是「内存版
+  sqlite」，别拿它验业务 SQL。
 - JS 侧 `db` 就是 `DB("default")`；其他库用 `DB("analytics")` 取。名字不存在时
   `DB(name)` 返回 `undefined`（`op_db_has` 探测）。
 - **模块默认库重定向**：模块 `manifest.yaml` 可写 `db: warehouse`，此后该模块里的
@@ -125,8 +136,10 @@ db:
 
 ### 1.2 数据库插件
 
-方言能力由 cdylib 插件提供：`oj-db-mysql`、`oj-db-postgres`（sqlite 内建）。
-装配走 `config.yaml` 的 `plugins:` 段，一段三用：
+方言能力由 cdylib 插件提供：`oj-db-mysql`、`oj-db-postgres`（sqlite 由内置 sqlx 访问器承载）。
+插件在 `describe()` 里声明方言名与能力位（`placeholder_*` / `id_*` / `stream` / `cancel`），
+宿主装配期严格校验，写错直接拒启——能力位全表见 §10.5，运维面（`plugins.lock.json`、
+整体拷贝 `bin/`）见 `docs/ops-manual.md` §1.2。装配走 `config.yaml` 的 `plugins:` 段，一段三用：
 
 ```yaml
 plugins:
@@ -191,6 +204,15 @@ where（构造器条件对象自带 `.has("tenant_id")` 检查，见 [§5.3](#53
 | `fromJSON` | `fromJSON(snapshot)` | 查询构造器 | 从 toJSON 快照恢复 |
 | `tx` | `tx(async (tx) => {...})` | `Promise<fn 返回值>` | 事务 |
 | `leaf` / `and` / `or` / `not` | 工厂 | 条件对象 | 条件组合（§5.2） |
+| `nextSeq` | `nextSeq(name)` | `Promise<number \| string>` | 平台序列取号（§11 第 7 条） |
+| `listTables` | `listTables(prefix?)` | `Promise<string[]>` | 目录自省（v0.1.82；三内置方言同口径，其他方言 `OJ_DB_UNSUPPORTED`） |
+| `dialect` | `dialect()` | `string` | 后端声明的方言名——**别拿它当能力探测**（§10.7） |
+| `sqlProfile` | `sqlProfile()` | `{count,totalMs,slow,byDb,events}` | 本请求 SQL 画像（dev 默认开；追踪关时 `{}`） |
+| `asSystem` | `asSystem()` | 本实例 | 本请求以系统身份绕过租户防护（审计日志；业务禁用） |
+| `asTenant` | `asTenant(id)` | 本实例 | 匿名请求**声明**租户身份（仍需 `tenant.allow_as_tenant`） |
+
+除 `stream` 外，所有方法在**命名库实例**（`DB(name)`）与 **`tx` 回调对象**上同面；`tx` 对象另有
+`isTx: true` 标记（DDL 必须拒绝在此句柄上执行），且**不提供 `stream`**（流式只走直连池，见 §3.1）。
 
 ---
 
@@ -239,7 +261,15 @@ for await (const row of db.stream("select id, name from account order by id")) {
 - **事务内不可用**：`db.stream` 只走 `DB(name)` 直连池，在 `db.tx(...)` 内调用直接报错。
 - 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（sqlite/mysql/postgres）、内置
   InMemory 与第一方插件 `oj-db-mysql`/`oj-db-postgres`（vtable 批量 pull，≤100 行/次）
-  真流式；第三方插件未实现流式槽 → 回落 `db.query` 全量（不报错，仅失去内存优势）。
+  真流式；**未声明** `stream` 的插件（或旧插件返回 `{"unsupported":true}`）→ 回落
+  `db.query` 全量（不报错，仅失去内存优势）。
+  **声明了 `stream` 却返回 unsupported** 是能力契约违规 → 结构化 `OJ_DB_UNSUPPORTED`
+  （`e.data.capability = "stream"`，v0.1.88），不静默回落；反过来「未声明却真提供了流」
+  宿主采信但打 warn（插件该补 `"stream"`）。
+- **专用连接并发上限 8**（v0.1.84，mysql/postgres 的 typed 直连路径）：每条游标独占一条
+  池外连接（真取消语义的前提），超限报
+  `db stream_open: too many concurrent cursors (limit 8) — close or cancel running streams first`。
+  并行导出请改成串行或复用单流——打满会连累同库的池查询。
 - 裸 SQL 同样过归属守卫与多租户防护（与 `db.query` 相同）。
 
 ---
@@ -256,7 +286,8 @@ const out = await db.tx(async (tx) => {
 });                                                  // 正常 resolve → 自动 commit
 ```
 
-- `tx` 回调拿到的对象与 `db` 同构（query/exec/table/fromJSON + 条件工厂），
+- `tx` 回调拿到的对象与 `db` 同面（`query`/`exec`/`table`/`fromJSON`/`nextSeq`/`listTables`/
+  `dialect`/`sqlProfile`/`asSystem`/`asTenant` + 条件工厂，另有 `isTx: true`；**没有 `stream`**），
   全部路由到**同一连接**上。
 - 事务期间（包括构造器 `.run()/.all()`）同库操作自动骑到事务会话；
   **碰别的库**报错：`transaction active on db 'x' (finish it before touching db 'y')`。
@@ -296,6 +327,16 @@ const rows = await db.table("account")
 - **截断不再静默**：返回行数达到实际生效上限时，响应带 `X-OJ-Row-Limit: <n>` 头
   （含「显式 limit 被 clamp」这一类）。显式给了 limit 且行数未达上限 → 不写头。
 - 多次 `.where()` 条件之间 **AND**（`.having()` 是整体替换，单树）。
+- **可选筛选写 `whereIf(test, cond)`**（v0.1.81）：`test` 为 `undefined` / `null` / `false` /
+  **空数组** 时整条跳过；`0` 与 `""` **保留**（`status = 0` 是合法过滤值）。用来避免
+  `in []` 这种「永久假谓词静默返回 0 行」：
+  ```ts
+  db.table("order")
+    .whereIf(id, { field: "id", op: "eq", value: id })
+    .whereIf(ids?.length, { field: "id", op: "in", value: ids });
+  ```
+- **`select(["*"])`**（v0.1.81）必须唯一（`select '*' must be the only column`），且不能带
+  join（`select '*' is not allowed with joins`）；不写 `select` 与写 `["*"]` 同义。
 - `.orderBy` 的列必须是表/join/CTE 白名单里的**真实列**（聚合别名不行，见 §8）。
 
 #### 调试：`.toSQL()`
@@ -317,9 +358,13 @@ const { sql, params } = db.table("account")
 |---|---|
 | `eq` `ne` | 任意 JSON 值（省略 = NULL 比较） |
 | `gt` `gte` `lt` `lte` | 必填（`gt needs value`） |
-| `in` | 必须数组（`in needs array value`） |
-| `like` | 必填（模式串） |
+| `in` | 必须**非空**数组（非数组 `in needs array value`；空数组 `in needs non-empty array`——`IN ()` 是永久假谓词，会静默 0 行） |
+| `like` | 必填（**已成形**的 LIKE 模式，不转义；需要转义就用 `escape:"!"` 逃生舱） |
 | `isnull` | 不需要 value |
+| `contains` `startswith` `endswith` | 必填（v0.1.81）。把值当**普通搜索词**：引擎自动转义 `%` `_` `!` 并渲染 `LIKE ? ESCAPE '!'`，业务零转义、零方言知识 |
+
+> 模糊搜索优先用语义化三兄弟（`contains` / `startswith` / `endswith`）；`like` 只留给框架内部
+> 与确有「模式已成形」需求的场景——详见 `docs/devkit/sql-builder-guide.md` §3.5。
 
 组合树：`{and: [...]}` / `{or: [...]}` / `{not: 叶子}`。手工写嵌套树容易错，推荐工厂：
 
@@ -361,12 +406,28 @@ const rows = await db.table("order")
 ```
 
 - `kind`：`"inner"`（默认）/ `"left"`。**right join 不做**。
-- `on` 是**列对列等值**数组 `{left, right}`——没有 op 字段（多余键直接报错）。
+- `on` 是**列对列等值**数组 `{left, right}`；v0.1.81 起也收**列对常量** `{left, op, value}`
+  且可与列对列混排（op 限比较类，`contains`/`isnull` 等模式类直接拒）：
+  ```ts
+  db.table("receipt").as("r")
+    .join("broadcast", [{ left: "r.broadcast_id", right: "b.id" },
+                        { left: "r.user_id", op: "eq", value: uid }], "left", "b");
+  // → ... JOIN broadcast b ON r.broadcast_id = b.id AND r.user_id = ?
+  ```
 - 限定名 `"表.列"`：表段 ∈ {基表, join 表, CTE 名}；**非限定列只解析基表**
   （两表同名列天然无歧义）。列不存在：`unknown column 'x' in join on`。
-- **自 join 拒绝**：`self join not supported (no table alias)`；on 不能为空：
-  `join 'x' needs non-empty on`。
-- join 表同样过归属守卫。select 省略 columns 时展开**基表**全列（带 join 时自动限定）。
+- **表别名**（v0.1.81）：基表用 `db.table("x").as("b")`，被 join 表用第 4 参数
+  `join(t, on, kind, "b")`。别名只作用于列限定与 SQL 渲染——**归属/租户守卫始终按真名**
+  生效（守卫失效的那次缺陷就是别名混进真名导致的）。
+- **自 join 需起别名**（v0.1.81）：`db.table("a").as("x").join("a", [...], "inner", "y")`
+  可用；两侧同真名且 `sql_name()` 撞车才拒——`self join needs distinct table aliases
+  (got 'a')`（同真名）或 `duplicate table alias 'a'`（异真名、别名撞车）。
+- `update`/`delete` **不接受别名**（mysql 的 `DELETE FROM t AS b` 需 8.0.16+，跨引擎不保证）：
+  `table alias is not supported on insert/update/delete`。
+- on 不能为空：`join 'x' needs non-empty on`；join 表同样过归属守卫。
+- select 省略 columns 时展开**基表**全列（带 join 时自动限定）；显式 `select(["*"])`
+  （v0.1.81）与 join **互斥**（`select '*' is not allowed with joins`）——全列只出基表，
+  join 列会丢。
 
 ---
 
@@ -419,6 +480,37 @@ const id = rows[0].id;
 
 同一 `resolve_target` 路由：有活跃事务走会话，否则走池——DML 与查询天然同事务。
 
+### 7.1 幂等写入 / 查询插入 / 整表清空（v0.1.81–0.1.82）
+
+```ts
+// 撞主键/任意唯一键就跳过（不报错、不写入）——幂等导入
+await db.table("notify").insert({ id: 1, user_id: uid }).orIgnore().run();
+
+// INSERT ... SELECT：目标列与源 select 列按位置对齐
+await db.table("notify_daily").fromSelect(
+  db.table("notify").select(["user_id", "cnt"]).where(leaf("day", "eq", d)),
+  ["user_id", "cnt"],
+).run();
+
+// 命名式整表清空（渲染 DELETE FROM t；租户表上只清当前租户）
+await db.table("sys_login_throttle").truncate().run();
+```
+
+- **`orIgnore()`**：sqlite/pg 渲染 `ON CONFLICT DO NOTHING`，mysql 渲染
+  `ON DUPLICATE KEY UPDATE <pk> = <pk>`（恒等式）——所以 mysql **要求表有主键**
+  （`orIgnore on mysql requires a primary key on table '…'`）。**别把 `orIgnore()` 与
+  `returning(["id"])` 一起用**（mysql 上恒等赋值不刷新 `LAST_INSERT_ID()`，跳过重复行时会拿到
+  连接上的旧值）——要幂等+id 就先按唯一键 `select`。**affected-rows 三方言不一致**（mysql 命中
+  重复键给 1，pg/sqlite 给 0）：别用 `if (n === 1)` 判幂等，靠唯一约束 + 事务保证「不会重复写」。
+- **sqlite 上 `orIgnore()` + `fromSelect()` 不可组合**（upsert 子句只能跟在 VALUES 后）：
+  `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`；
+  pg/mysql 组合可用。
+- **`fromSelect(q, cols)`**：列数不符 `insert declares N columns but the source select yields M`；
+  `cols` 含 `tenant_id` 直接拒（租户由服务端注入）；源 select 递归过租户与归属守卫
+  （`ownership_guard: deny` 下跨模块搬运同样被挡）。
+- **`truncate()`** 是唯一无 where 的写动词（明示整表清空，取代裸 `delete from`）：带 where 报
+  `truncate does not accept where`；**租户表上只清当前租户**（要整库清空走 `db.asSystem()`）。
+
 ---
 
 ## 8. 聚合 / 分组 / having / distinct
@@ -441,6 +533,15 @@ const rows = await db.table("account")
 - `.having()` 引用列优先按真实列解析，未命中查**聚合别名台账**展开——所以 having 里
   可以直接写 `avg_age`（PG 不允许 HAVING 引用输出别名，展开消灭了方言分叉）。
   两者都不是：`unknown column 'x' in having`。
+- **`count(distinct col)`**（v0.1.82）：`{ fn: "count", distinct: true, field: "user_id", as: "c" }`
+  → `COUNT(DISTINCT user_id)`，聚合成一行、不受 LIMIT 钳制。仅 count 支持
+  （`distinct is only supported on count`），且必须带具名 field（`count distinct needs a field`）。
+  **别再用 `distinct().all()` 拉行后取 `.length` 计数**——顶层隐式 LIMIT 会静默截断，
+  受影响用户数 > 1000 就漏算。
+- **字面量列**（v0.1.81）：`{ lit: "svc", as: "scope" }` 把常量作为一列输出，值走**绑定参数**
+  并按方言 `CAST`（sqlite 裸 `?`、mysql `CAST(? AS CHAR)`、postgres `CAST(? AS TEXT)`）。
+  `lit` 必须是标量（`lit column 'x' needs a scalar value …`）；要与 `*` 同时用会报
+  `select '*' must be the only column`。计算列请用 `case`。
 - `.distinct()` 去重。`orderBy` 不认聚合别名（只解析真实列），排聚合结果请子查询或
   在 SQL 侧处理。
 - case/window 列也走 `.select([...])` 对象形式，见 §9.3。
@@ -530,8 +631,8 @@ db.table("account").select([
 什么时候需要它：
 
 - **可读性**：嵌套子查询套到第三层就读不动了，把每层拆成具名步骤，像读流水账。
-- **自 join 替代**：构造器拒绝同表自 join（无别名机制，见 §6），把同一张表用 CTE
-  复制一份出来就能 join。
+- **自 join 的替代**：v0.1.81 起同表自 join 只要两侧起不同别名就能写（见 §6）；但同一张表
+  被引用三处以上时，CTE 复制一份读起来更像流水账。
 - **复用**：一个定义，主查询里可以当基表、也可以进 join 条件引用它。
 
 ```ts
@@ -600,17 +701,26 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `db.stream` 的 `signal` 取消 | 协作式（批间） | ✅ `KILL QUERY` | ✅ `pg_cancel_backend` | 取决于插件是否声明 `cancel` |
 | `db.table(...)` 构造器（含 DML / join / CTE / 聚合） | ✅ | ✅ | ✅ | ❌ `OJ_DB_UNSUPPORTED` |
 | `db.listTables` | ✅ | ✅ | ✅ | ❌ |
-| `db.nextSeq` | ❌（`memory://`/sqlite 不支持） | ✅ | ✅ | ❌ |
+| `db.nextSeq` | ✅ | ✅ | ✅ | ❌ |
 | `_shared/search.ts` / `_shared/versions.ts` | ✅ | ✅ | ✅ | ❌ |
 | `oj migrate` / `oj seed` | ✅ | ✅ | ✅ | ❌（迁移须用该方言自己的工具） |
+
+> **`memory://` 不在上表三列里**：它是测试**假后端**（见 §1.1），`query`/`exec`/`stream`
+> 都直接回夹具行、不执行 SQL，`db.nextSeq` 因此拿不到返回值（`db.nextSeq: no value
+> returned`）。要验真实 SQL 语义请用 `sqlite::memory:`。
 
 三个内置方言的**能力位**（`plugins()` / `GET {base}/plugins` 的 `caps` 列同源）：
 
 | 方言 | 占位符 | 取自增 | stream | cancel |
 |---|---|---|---|---|
-| sqlite | `placeholder_q`（`?`） | `id_two_step`（`last_insert_rowid`，有 RETURNING 时才用未必要） | ✅ | ❌ |
+| sqlite | `placeholder_q`（`?`） | `id_two_step`（`last_insert_rowid`；但构造器 `.returning([...])` 走 `RETURNING` 单语句，两者不是同一件事） | ✅ | ❌ |
 | mysql | `placeholder_q` | `id_two_step`（`LAST_INSERT_ID()` 两步） | ✅ | ✅ |
 | postgres | `placeholder_dollar`（`$n`，JS 侧仍写 `?`，宿主改写） | `id_returning`（`RETURNING`） | ✅ | ✅ |
+
+> `id` 组的现实口径：**登记与对账用，不参与执行路由**。构造器取 id 的路由按具体方言
+> 判定（只有 mysql 进「两步 `LAST_INSERT_ID()`」，其余走 `RETURNING`）——因为回取语句是
+> 方言私有的，宿主无法从能力位推出来。`query.rs::exec_route` 的注释与
+> `lastid_route_is_mysql_only_not_equivalent_to_id_two_step` 用例钉死了这条边界。
 
 **接新方言（插件作者）**：在 `describe()` 返回 `{"dialect": "<名>", "capabilities": [...]}`
 （能力串是闭集：`placeholder_q|placeholder_dollar|placeholder_colon`、`id_returning|id_two_step|id_none`、
@@ -622,6 +732,16 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 **错误诊断**：db 的 reject 自带 `e.code` / `e.retryable` / `e.sessionDisposition` / `e.data`
 （含引擎原始码 `data.vendor_code`）——不要解析 message 文本。完整口径见
 `docs/devkit/api-manual.md`「结构化数据库错误」。
+
+`OJ_DB_UNSUPPORTED` 的 `e.data.capability` 是**闭集**（业务代码可以安全 switch）：
+
+| capability | 触发点 |
+|---|---|
+| `query_build` / `query_sql` | `db.table(...).all()/run()` 与 `.toSQL()`（宿主生成 SQL） |
+| `list_tables` | `db.listTables()` |
+| `next_seq` | `db.nextSeq()` |
+| `migrate` / `seed` | `oj migrate` / `oj seed`（CLI 侧 fail-loud，不进 JS） |
+| `stream` / `cancel` | 插件声明了该能力却回 unsupported（契约违规） |
 
 **业务代码要不要按方言分支？** 多半不需要，且 `db.dialect()` 不是判断能力的正确工具——
 迁移分档与模板见 §10.7。
@@ -691,7 +811,9 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 
 > **红字：不要用 `db.dialect()` 判断「这个库能干什么」。**
 > 方言名是**开放集**（插件 `describe()` 声明什么就是什么，`"oracle"` / `"dameng"` / 私有的
-> `"demo"` 都合法），宿主也不再对未知名报错或回落 sqlite。能力位
+> `"demo"` 都合法）。v0.1.88 起宿主**不再把它回落成 `"sqlite"`**（旧行为是封闭三值枚举：
+> 未识别的 DSN 前缀一律当 sqlite 处理，`dialect()` 于是报 `"sqlite"`，让一切都「看起来支持」），
+> 也不再据此生成 SQL。能力位
 > `{placeholder, id, stream, cancel}` 才是宿主认识的契约，但它是**宿主 ↔ 插件**之间的契约，
 > 不是给业务 handler 的分派开关。
 >
@@ -708,8 +830,8 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | 档 | 原来在分支什么 | 现在怎么写 | 为什么不用问方言 |
 |---|---|---|---|
 | ① 删掉 | 拼占位符（`?` / `$n` / `:n`） | 一律写 `?` | 按 `placeholder` 能力位改写：`placeholder_dollar` 宿主改 `$n`；`placeholder_colon` 宿主**不改写**，由插件内部把 `?` 改 `:n` |
-| ① 删掉 | 取自增 id（`RETURNING` vs `LAST_INSERT_ID`） | `db.table(...).insert({...}).run()` 的返回值 | 构造器按 `id_returning` / `id_two_step` / `id_none` 自动选路 |
-| ① 删掉 | 列目录（`sqlite_master` / `information_schema`） | `db.listTables(prefix?)` | 方言无关，SQL 是引擎常量 |
+| ① 删掉 | 取自增 id（`RETURNING` vs `LAST_INSERT_ID`） | `db.table(...).insert({...}).returning(["id"]).run()`（mysql 只收单列） | 取 id 路线由构造器按**具体方言**决定（只有 mysql 走两步 `LAST_INSERT_ID()`，其余 `RETURNING`）——不是按 `caps.id` 推的，回取语句是方言私有 |
+| ① 删掉 | 列目录（`sqlite_master` / `information_schema`） | `db.listTables(prefix?)` | 三内置方言同口径（SQL 是引擎常量），业务侧不用写分支 |
 | ① 删掉 | `limit n` 语法 / `select max(id)+1` 取号 | 构造器 `.limit(n)` / `db.nextSeq(name)` | 构造器与序列原语自己处理方言差异 |
 | ② 换问法 | 「这个 API 支持吗」 | **直接调用，接住 `OJ_DB_UNSUPPORTED`** | 宿主抛结构化错误，`e.data.capability` 点名是哪个 API；不用猜 |
 | ③ 保留 | 真方言特有 SQL（upsert 语法、窗口函数差异、受限列型 `cast`、DDL） | 白名单 + 未知方言**响亮失败**（模板见下） | 这类差异确实存在，但必须「不认识就报错」而不是兜底 |
@@ -773,7 +895,8 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
    构造器里一切标识符都过 SchemaRegistry（或 CTE 声明列）；裸 SQL 的标识符只能写死。
 2. **值只走绑定参数**。构造器值、`?` 占位符（三引擎统一，0.1.67 起）；永不字符串拼接。
 3. **update/delete 必须带 where 且叶子 ≥ 1**——防全表误伤，JS 与 op 双层强制。
-4. 数量级：条件树深度 ≤ 8、叶子 ≤ 64；嵌套 select ≤ 4 层；limit 显式 ≤ 1000。
+4. 数量级：条件树深度 ≤ 8、叶子 ≤ 64；嵌套 select ≤ 4 层；limit 显式受
+   `db_query.max_limit` 约束（**默认 1000**，可配至硬顶 **100000**）。
 5. **多写 .toSQL()**：与执行同管线，报错前先看它渲染出了什么。
 6. **64 位整数（雪花 id）读出来是字符串**（v0.1.22）：`|v| > 2^53-1` 的 i64 一律以十进制
    字符串交付（超界给 bigint 会让 `json.ok` 直接 500）；回写用 `toBigInt()`——
@@ -794,7 +917,8 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
    - **`name` 用服务端常量**，别直接取用户输入——否则序列表行数可被外部无限放大。
    - **需要 DDL 权限**（首次使用要 `create table if not exists`）；生产账号若只有 DML 权限，
      请用迁移**预建** `_oj_sequences(name, v)`。
-   - **`memory://` 后端不支持**（拿不到返回值）。
+   - **`memory://` 假后端不支持**（`no value returned`）；`sqlite://` / `sqlite::memory:`
+     正常。平台序列表是普通表，`db.nextSeq` 只在**宿主认识的三种方言**上可用（§10.5）。
    - 序列值**不随调用方事务回滚而回退**（一次独立的原子自增）——按「只增不复用」理解。
 8. **MySQL 读侧的列类型边界（v0.1.24）**：类型化路径下**可读** = 整数家族（含
    `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`；
@@ -813,11 +937,19 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `unknown table 'x' in <site>` | 限定名表段不是基表/join/CTE | 检查限定名拼写 |
 | `insert needs at least one row` | `.insert()` 空参 | 传对象或非空数组 |
 | `insert rows must share identical key sets` | 行数组键不一致 | 对齐每行键 |
+| `orIgnore on mysql requires a primary key on table 't'` | mysql 的 `orIgnore` 靠 `ON DUPLICATE KEY UPDATE pk=pk`，无主键无从恒等 | 给表加主键，或改用唯一约束 + 先查后写 |
+| `orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)` | sqlite 的 upsert 只能跟 VALUES | 裸 `insert or ignore … select`（注意它连 NOT NULL/CHECK 也静默跳过），或 pg/mysql |
+| `insert declares N columns but the source select yields M` | `fromSelect` 目标列与源列数不符 | 按位置对齐列清单 |
+| `truncate does not accept where` | `.truncate()` 自带条件 | 走 `.delete().where(...)` |
+| `count distinct needs a field` / `distinct is only supported on count` | `{fn:"count",distinct:true}` 缺 field / 给非 count 聚合加了 distinct | 写 `{fn:"count", distinct:true, field:"col"}` |
+| `lit column 'x' needs a scalar value (string/number/bool/null)` | `{lit: …}` 给了数组/对象 | 标量；表达式请用 `case` |
+| `db.nextSeq: no value returned` | `memory://` 假后端不执行 SQL | 换 `sqlite::memory:` 或真库 |
+| `unknown db scheme in dsn '…' (known: […])` | DSN scheme 不认识，或对应插件没装上（`known` 列表按实际后端） | 装插件 / 改 DSN |
 | `update needs non-empty sets` | `.update({})` | 至少一列 |
 | `Update requires where (leaf count >= 1)` | update/delete 无 where | 补 `.where(...)` |
 | `<verb> does not accept <field>` | 动词×字段矩阵拒绝 | 见 §7 表 |
 | `condition tree too deep (max 8)` / `too large (max 64 leaves)` | 条件树超限 | 拍平/拆分条件 |
-| `in needs array value` | `op:"in"` 值非数组 | 传数组 |
+| `in needs array value` / `in needs non-empty array` | `op:"in"` 值非数组 / 空数组 | 传非空数组（空集请在 JS 侧直接短路，别发查询） |
 | `value and subquery are mutually exclusive` | 叶子同时给了 value 和 subquery | 二选一 |
 | `column "x" is of type bigint but expression is of type text`（PG） | 回写给 bigint 列传了**字符串** | 用 `toBigInt(...)`（见 §11 第 6 条） |
 | `operator does not exist: bigint = text`（PG） | `where bigint 列 = $1` 传了字符串 | 同上 |
@@ -825,13 +957,15 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
 | `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | v0.1.24 前：同一 SQL 文本混用字符串/数字参数（sqlx 语句缓存按文本 key） | **v0.1.24 起平台自动按参数形态分缓存键**，无需再规避；若仍出现，检查 PG 插件是否随宿主重建 |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()` | 该值改存 text，或把列放到 MySQL `BIGINT UNSIGNED` |
-| `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`select cast(x as char) as x from t`；避免 `select *` |
+| ``db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `cast(x as char) as x`); see docs/numeric-limits.md §4.3``（v0.1.24） | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`select cast(x as char) as x from t`；避免 `select *` |
 | MySQL `BOOLEAN` 读出是 `1`/`0` | `BOOLEAN` 即 `TINYINT(1)`，协议层无长度元数据可区分 | 按整数读；需要布尔语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | `subquery: nested select too deep` | 嵌套 > 4 层 | 减层或拆 CTE |
 | `nested select does not accept with/unions (v1)` | 子查询/union 成员带了 with/unions | 移到顶层 |
 | `union requires explicit columns` | union 侧省略 select 列 | 双方显式列且列数一致 |
 | `union member does not accept order_by/limit/offset` | 成员带排序分页 | 排序分页放最外层 |
-| `self join not supported (no table alias)` | 同表自联 | CTE 复制一份再 join |
+| `self join needs distinct table aliases (got 'a')` / `duplicate table alias 'a'` | 同表自联没起别名 / 别名撞车（v0.1.81 起带别名可用） | 基表 `.as("x")`、被 join 表第 4 参起别名 |
+| `table alias is not supported on insert/update/delete` | 别名只用于 select/join | 去掉 `.as()`，或先查后写 |
+| `select '*' must be the only column` / `select '*' is not allowed with joins` | `*` 与显式列/join 混用 | 要么只写 `["*"]`，要么列清单写全 |
 | `illegal alias 'x'` | 别名形状不合法 | 字母/下划线开头 |
 | `cte needs non-empty columns` | `.with(name, [], q)` | 声明列清单 |
 | `transaction active on db 'x' …` | 事务中碰了别的库 | 先 commit/rollback |

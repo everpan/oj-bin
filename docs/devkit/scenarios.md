@@ -3191,25 +3191,38 @@ curl localhost:9778/v1/api/sys/order/list/           # prefix 含 / 分段
 ### ① 一次性分类（推荐写法）
 
 ```ts
-// _shared/dberr.ts —— 全项目共用
-export function dbFail(e: unknown): never {
+// _shared/dberr.ts —— 全项目共用。返回 { code, msg } 交给 json.fail，
+// 不要发明 HttpError 之类的全局（oj 的响应只经 json.ok / json.fail 写回）。
+export function dbFail(e: unknown): { code: number; msg: string } {
   const err = e as { code?: string; retryable?: boolean; sessionDisposition?: string;
                      data?: { vendor_code?: unknown; capability?: string; dialect?: string };
                      message?: string };
   switch (err.code) {
     case "OJ_DB_CONSTRAINT":
-      throw new HttpError(409, "conflict");            // 唯一键 / 外键
+      return { code: 409, msg: "conflict" };                    // 唯一键 / 外键
     case "OJ_DB_TIMEOUT":
     case "OJ_DB_CONNECTION":
     case "OJ_DB_CAPACITY":
-      throw new HttpError(503, "database busy, retry later");  // err.retryable 通常为 true
+      return { code: 503, msg: "database busy, retry later" };  // err.retryable 通常为 true
     case "OJ_DB_UNSUPPORTED":
-      throw new HttpError(500, `db capability missing: ${err.data?.capability}`);
+      return { code: 500, msg: `db capability missing: ${err.data?.capability}` };
     case "OJ_DB_CANCELLED":
-      throw new HttpError(499, "cancelled");
+      return { code: 499, msg: "cancelled" };
     default:
       log.error("db failed", { code: err.code, msg: err.message });
-      throw new HttpError(500, "internal database error");
+      return { code: 500, msg: "internal database error" };
+  }
+}
+```
+
+```ts
+// handler 里这样用（json.ok / json.fail 才是写回通道，别在 .catch 里 fire-and-forget）：
+export async function get(): Promise<void> {
+  try {
+    json.ok(await db.table("account").select(["id"]).all());
+  } catch (e) {
+    const f = dbFail(e);
+    json.fail(f.code, f.msg);
   }
 }
 ```
@@ -3217,16 +3230,20 @@ export function dbFail(e: unknown): never {
 ### ② 幂等插入：冲突当成功
 
 ```ts
-export async function ensureUser(id: number, name: string) {
+export async function ensureUser(id: number, name: string): Promise<void> {
   try {
-    await db.table("account").insert({ id, name }).orIgnore().run();
+    await db.table("account").insert({ id, name }).run();
   } catch (e) {
-    const err = e as { code?: string; data?: { vendor_code?: number | string } };
-    if (err.code === "OJ_DB_CONSTRAINT") return;   // 已存在
+    if ((e as { code?: string }).code === "OJ_DB_CONSTRAINT") return;   // 已存在 → 幂等成功
     throw e;
   }
 }
 ```
+
+> 换成 `.orIgnore()` 也能幂等，但那时**唯一键冲突根本不会抛**（mysql 渲染
+> `ON DUPLICATE KEY UPDATE <pk> = <pk>`，pg/sqlite 渲染 `ON CONFLICT DO NOTHING`）——
+> 再写 `catch OJ_DB_CONSTRAINT` 就是死代码；`orIgnore` 下该 catch 只兜 NOT NULL / 外键等
+> **非**唯一键约束。
 
 ### ③ 有界重试（只重试可重试的，且尊重会话处置）
 
@@ -3278,8 +3295,8 @@ curl -X POST localhost:9778/v1/api/user/account/ -d '{"id":1,"name":"a"}'   # �
 | 存量写法 | 替换 |
 |---|---|
 | 拼占位符：`d === "postgres" ? sql.replace(/\?/g, () => `$${++i}`) : sql` | 一律写 `?`——宿主按能力位改写（`placeholder_dollar` → `$n`；`placeholder_colon` 由插件内部改写） |
-| 取自增 id：`d === "postgres" ? sql + " returning id" : …` | `await db.table("t").insert({...}).run()` 的返回值（按 `id_returning`/`id_two_step`/`id_none` 自动选路） |
-| 列目录：`d === "sqlite" ? "select name from sqlite_master …" : "select table_name from information_schema …"` | `await db.listTables("user_")`（方言无关，SQL 是引擎常量） |
+| 取自增 id：`d === "postgres" ? sql + " returning id" : …` | `await db.table("t").insert({...}).returning(["id"]).run()`——取 id 路线由构造器按**具体方言**决定（mysql 两步 `LAST_INSERT_ID()`，其余 `RETURNING`），不是按 `caps.id` 推的 |
+| 列目录：`d === "sqlite" ? "select name from sqlite_master …" : "select table_name from information_schema …"` | `await db.listTables("user_")`（三内置方言同口径，SQL 是引擎常量；其他方言 `OJ_DB_UNSUPPORTED`） |
 | 取号：`select max(id)+1`（并为此分支） | `await db.nextSeq("order_no")` |
 
 ### ② 保留：真方言特有的 SQL 走白名单 + 响亮失败
@@ -3324,7 +3341,13 @@ async function listReportIds(): Promise<unknown[]> {
 ```bash
 # 1) 三内置方言：改造前后行为应逐字一致（占位符/取 id/列目录结果不变）
 # 2) 方言能力面：看装上的插件声明了什么
-./bin/oj info | sed -n '/^## plugins/,/^## generic_axes/p'   # caps: placeholder=? id=two_step stream cancel
+./bin/oj info | sed -n '/^## plugins/,/^## generic_axes/p'
+# db 轴插件每项形如：
+#   - oj-db-mysql 0.1.x (abi 12)
+#     desc: …
+#     caps: placeholder=? id=two_step stream cancel
+# （sqlite 那行没有 cancel；postgres 是 placeholder=$ id=returning stream cancel；
+#   能力串由 DialectInfo::summary() 生成，与启动横幅同源）
 curl -s localhost:9778/v1/api/user/account/          # 构造器可用则正常返回
 # 3) 若接了新方言插件：构造器路径应 500 且 e.data.capability 点名 API；
 #    upsert 路径应报「未适配（已支持 …）」，而不是引擎语法错误

@@ -38,8 +38,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
    **新增登录来源（企业 HTTP 表单 / CAS SSO）→ 不改 oj-auth 插件**——它只是守卫
    （验签 + 匿名路径 + CSRF），登录端点全是普通业务模块；照抄 `src/oidc/`，
    可照抄代码见 `scenarios.md` 场景 28。
-   **全文检索（不上 ES）→ §6「db.dialect」+ `src/_platform/_shared/search.ts`**
-   （三引擎原生 FTS 统一面；ensureIndex 禁入 db.tx；sqlite 短词自动 LIKE 回退），可照抄
+   **全文检索（不上 ES）→ §6「db」+ `src/_platform/_shared/search.ts`**
+   （三引擎原生 FTS 统一面；ensureIndex 禁入 db.tx；sqlite 短词自动 LIKE 回退；
+   模块内部自带方言白名单，未知方言抛 `OJ_DB_UNSUPPORTED`——业务别自己按 `db.dialect()` 分派），可照抄
    代码见 `scenarios.md` 场景 29。   **内容版本化 / 历史 / diff / 回滚 →
    `src/_platform/_shared/versions.ts`**（CAS 去重 + UNIQUE 乐观锁 + 行级 diff；
    撞版本 409），见 `scenarios.md` 场景 30。
@@ -114,7 +115,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `#/m/x` 跨模块导入在 `--module-root` 下找不到（v0.1.85） | `m` 是 **manifest `name`** 不是目录名——嵌套布局下按 name 写（`#/user/_shared/x`），勿用目录名 |
 | postgres 占位符 | **0.1.67 起三引擎统一用 `?`**（宿主对 postgres 自动改写 `$n`）；存量 `$n` 继续有效（`$n`+`?` 混用按序号续接）。计数不匹配在 PG 上提前报 `placeholder count N != params M`；jsonb 存在性判断用 `jsonb_exists(doc,'key')`，**别写裸 `?` 运算符** |
 | 在 catch 里按 `e.message` 前缀判别错误类型（或升级 v0.1.88 后 `^ffi db ` 匹配失效） | db 的 reject 自带 `e.code` / `e.retryable` / `e.sessionDisposition` / `e.data`（v0.1.88）——**按 `e.code` 判别**（`OJ_DB_CONSTRAINT` / `OJ_DB_TIMEOUT` / `OJ_DB_UNSUPPORTED` …），引擎原始码看 `e.data.vendor_code`（mysql 数字 / pg SQLSTATE 串）。同时宿主去掉了重复的 `ffi <op>: ` 前缀：`ffi db query: db query: <原文>` → `db query: <原文>` |
-| 接了新方言插件后，构造器 / `listTables` / `nextSeq` / `search.*` 报 `OJ_DB_UNSUPPORTED` 但 `db.query` 能用 | **预期（v0.1.88）**：宿主只对 `sqlite`/`mysql`/`postgres` 生成 SQL；其他方言上一期只开放裸 SQL 路径（`db.query`/`db.exec`/`db.stream`/`db.tx`）。`e.data.capability` 会点名是哪个 API。别自己按 sqlite 语义拼 SQL 绕 |
+| 接了新方言插件后，构造器 / `listTables` / `nextSeq` / `search.*` / `oj migrate` / `oj seed` 报 `OJ_DB_UNSUPPORTED` 但 `db.query` 能用 | **预期（v0.1.88）**：宿主只对 `sqlite`/`mysql`/`postgres` 生成 SQL；其他方言上一期只开放裸 SQL 路径（`db.query`/`db.exec`/`db.stream`/`db.tx`）。`e.data.capability` 会点名是哪个 API（`query_build`/`query_sql`/`list_tables`/`next_seq`/`migrate`/`seed`）。别自己按 sqlite 语义拼 SQL 绕 |
 | 用 `db.dialect()` 猜能力（`d === "mysql" ? A : B`） | 方言名是**开放集**（v0.1.88 起插件 `describe()` 声明什么就是什么），新方言接入后 `else` 分支会把错 SQL **静默**发给它（占位符/`ON DUPLICATE KEY` 全错，报错落在引擎侧）。能力问题**直接调用**并接 `OJ_DB_UNSUPPORTED`；确需方言特有 SQL 用白名单 + 未知方言 `throw`（api-manual「方言边界」/ 场景 45） |
 | `cargo xtask plugin <name>` 之后 `oj serve` 报 `plugin file not in plugins.lock.json: …` | 清单锁（v0.1.88）：`xtask plugin` 只拷单库、**不刷新** `plugins.lock.json`。新增/替换插件后跑 `cargo xtask build`（整体归置 + 重写锁）；部署时整体拷贝 `bin/`，禁止增量覆盖 |
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
@@ -140,7 +141,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | sqlite 上 `fromSelect(...).orIgnore()` 运行时报错（v0.1.82 明文） | 构造期即拒：`orIgnore with fromSelect is not supported on sqlite (its upsert clause only follows VALUES)`——sqlite 的 upsert 子句只能跟 VALUES。pg / mysql 组合可用。sqlite 绕行：裸 `db.exec("insert or ignore into … select …", [...])`（`OR IGNORE` 连 NOT NULL/CHECK 违例都静默跳过，数据面更宽，自行权衡） |
 | 去重计数用 `distinct().all()` 拉行再 `.length` | **静默漏算**：顶层 select 未给 limit 隐式补 100、显式也被 clamp 到 max_limit（默认 1000）——总数超限就少算。用 `select([{fn:"count",distinct:true,field,as}])`（v0.1.82）：聚合一行返回，与 LIMIT 无关 |
 | 「清空整表」写裸 `db.exec("delete from t", [])` | 用 `db.table("t").truncate().run()`（v0.1.82）：命名式明示、可 grep。**租户表上只清当前租户的行**（守卫照常注入，清不出租户边界）——要整库清空在 `db.asSystem` 下执行；带 where 报 `truncate does not accept where` |
-| 卸载/巡检要枚举当前库的表，按方言分支 `information_schema`/`sqlite_master` | 用 `db.listTables(prefix?)`（v0.1.82）：方言无关、前缀转义引擎做（绑定参数）、未登记 registry 的表也返回、按名排序。sqlite 内部表（`sqlite_*`）已排除 |
+| 卸载/巡检要枚举当前库的表，按方言分支 `information_schema`/`sqlite_master` | 用 `db.listTables(prefix?)`（v0.1.82）：三内置方言同口径（其他方言 `OJ_DB_UNSUPPORTED`）、前缀转义引擎做（绑定参数）、未登记 registry 的表也返回、按名排序。sqlite 内部表（`sqlite_*`）已排除 |
 | `select(["*"])` 带 join | 直接报错——全列展开只出基表列，join 列会丢、`undefined` 拿去做授权判断即隐患；要 join 列就显式列名 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
