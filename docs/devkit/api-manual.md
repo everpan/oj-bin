@@ -1556,7 +1556,8 @@ await db.table("rich")
 
 **嵌套通用约束**（子查询 / exists / union 成员 / CTE 一致）：
 
-- 层数上限 4（`<site>: nested select too deep`，site 为出错位置）；嵌套必须 select
+- 层数上限 **3 层嵌套**（内部 `REQ_NEST_MAX = 4`，顶层算 depth 0，第 4 层即
+  `<site>: nested select too deep`，site 为出错位置）；嵌套必须 select
   （`<site>: nested select must be select`）；嵌套禁 with/unions
   （`<site>: nested select does not accept with/unions (v1)`）。
 - 隐式默认 limit 只作用于**顶层**查询；嵌套/成员不隐式截断（显式 limit 一律生效）。

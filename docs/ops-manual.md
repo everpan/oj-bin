@@ -302,9 +302,9 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | 405 `method 'del' not exported` | `DELETE` 请求但 handler 没导出 `del`（不是 `delete`） | 改导出名 |
 | 500 信封含 `api.ts` 字样 | TS 编译/解析错误 | 看 msg 定位行号 |
 | 408 | handler 死循环/超时 | 查死循环，或调大 `server.timeout` |
-| 未知 DSN scheme 启动失败 | 仅支持 sqlite/mysql/postgres | 检查 `db:` 各 DSN 前缀 |
+| 启动报 `unknown db scheme in dsn '…' (known: […])` | 没有任何**已装后端**认领该 DSN scheme（v0.1.88 起按认领路由，不再是封闭枚举） | 先看 `known` 里有没有目标 scheme：没有 `mysql://`/`postgres://` = 对应插件没装（`cargo xtask build` 或核对 `OJ_PLUGINS_DIR`）；有的则是 DSN 前缀写错 |
 | mysql/pg 连接失败启动即退 | fail-fast 语义（连接串错/库未建） | 核对 DSN 与目标库可达性 |
-| 启动 warn `seed.sql skipped` | default 库非 sqlite，seed 不重放 | mysql/pg 建库归运维 |
+| 启动 warn `seed skipped (no default db)` | `db:` 段里没有名为 `default` 的库（seed 只对默认库重放） | 加 `default:` 条目，或用 `oj serve --db <name>` 指定 |
 | `redis` 数据不跨实例 | `redis.default` 未配置 → 进程内存 KV | 配真 Redis（配置即真连，多实例共享会话/KV） |
 | 启动报 `ext_boot: …` 且拒绝启动 | `ext_boot.js` 语法错/导入失败/顶层 await 抛错（启动期预热即 fail-fast） | 看报错定位；改完重启 |
 | 启动未打印 `ext_boot: loaded` 但文件已放好 | 文件不在 **config.yaml 同目录**，或名字不是 `ext_boot.js` | 挪到 config 同级；确认文件名 |
