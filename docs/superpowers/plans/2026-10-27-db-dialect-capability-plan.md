@@ -468,11 +468,13 @@ OJ_TEST_PG='postgres://postgres:postgres@127.0.0.1:5432/ojtest' cargo test -p oj
 
 ## 风险与遗留
 
-1. **【既有缺陷，本阶段未修】typed pg 流式不解码 `int4`/`int2`**（`column_json_pg` 只有 bool/i64/f64/
-   String/bytes 分支，sqlx 的 `i64::compatible` 不收 INT4；Any 路径因按类型名匹配而正常）。现由用例的
-   `cast(... as text)` 绕过，业务侧 `db.stream` 读 `int` 列会命中「未解码列类型」硬错误。修法很小
-   （补 `try_get::<Option<i32>>` 分支 + 真库用例），但属类型映射范畴，按设计 §5.6 并入 M2 的类型映射表
-   一并处理，不在 M1 夹带。
+1. **【已修，M1 后跟进】typed pg 流式不解码 `int4`/`int2`**（`column_json_pg` 只有 bool/i64/f64/
+   String/bytes 分支，sqlx 的 `i64::compatible` 只认 INT8；Any 路径的 `compatible` 是
+   `is_integer()`，所以 `db.query` 正常、只有 `db.stream` 报「未解码列类型」）。已补 `i16`/`i32`
+   分支，真库回归 `real_pg_stream_decodes_common_numeric_types` 逐值对齐两条路径；`real`（FLOAT4）
+   经核实**两条路径都不支持**（Any 的 `f64::compatible` 同样严格等值），故一并钉死「统一不支持 +
+   cast 指引」，不做单边补齐。`oj-db-postgres` 0.1.1 → 0.1.2（ABI 不变）。剩余的
+   `jsonb`/`numeric`/`uuid`/时间戳/数组仍按设计 §5.6 并入 M2 类型映射表。
 2. **`cargo xtask plugin <name>` 只拷单个库、不刷新 `plugins.lock.json`**，增量覆盖后可能撞锁告警/硬拒。
    已在 loader 报错文案与 devkit 陷阱表写明「改插件后用 `cargo xtask build` 整体归置」。
 3. **`yuescript`/`dbx` 侧未对齐**：本阶段只改 oj-bin（其余仓库只读），下游若仍按「三方言枚举」写守卫，

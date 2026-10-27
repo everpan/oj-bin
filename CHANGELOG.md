@@ -26,7 +26,7 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
 
 - ABI 12：DataAccessorVtable 增工厂级 `describe()` 槽，返回 `{dialect, capabilities}` JSON；
   `ABI_VERSION` 11 → 12（严格相等门禁），宿主 + 插件同产物重编发布。
-  `oj-plugin-ffi` 0.1.2 → 0.1.3、`oj-db-mysql` 0.1.1 → 0.1.2、`oj-db-postgres` 0.1.0 → 0.1.1。
+  `oj-plugin-ffi` 0.1.2 → 0.1.3、`oj-db-mysql` 0.1.1 → 0.1.2、`oj-db-postgres` 0.1.0 → 0.1.2。
 - 方言契约从闭集枚举演进为「开放方言名 + 能力位」：新增方言接入零宿主逻辑分支。
 - 结构化错误信封（category/retryable/session_disposition/message/data）跨 FFI，宿主单点
   `parse_raw`；未知方言六门控点统一返回 `OJ_DB_UNSUPPORTED`（builder/exec_route/list_tables/
@@ -51,6 +51,18 @@ mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_
   典型症状），锁内条目缺失或 abi/fingerprint 与实物不符则 stderr 告警（整体拷贝不完整的信号）。
 
 （逐任务明细见各 commit；本段为 M1 总览，任务级 fix/feat 随提交补充。）
+
+### fix(db) — postgres 流式整数类型
+
+- **`db.stream`（typed 流式）在 postgres 上读 `int4`/`int2`（`integer`/`smallint`）列会硬报错**
+  「column 'x' has type 'INT4' which this plugin does not decode yet」。根因：sqlx 的
+  `Type<Postgres>` 是**严格等值**匹配（`i64::compatible` 只认 `INT8`），而 `column_json_pg`
+  只试了 `i64`；Any 回退路径的 `i64::compatible` 是 `is_integer()`（全整数宽度），所以
+  `db.query` 一直正常，只有流式受影响。现补 `i16`/`i32` 两个分支，与查询路径逐值对齐。
+  真库回归用例 `real_pg_stream_decodes_common_numeric_types`（同时钉死 `real`/FLOAT4 在**两条**
+  路径上都保持「不支持 + cast 指引」，避免只补一头造成分叉）。`oj-db-postgres` 0.1.1 → 0.1.2
+  （ABI 不变，可原地替换）。仍未解码的类型（`real`/`jsonb`/`numeric`/`uuid`/时间戳/数组等）
+  继续响亮报错并给出 `cast` 指引。
 
 ## v0.1.87
 

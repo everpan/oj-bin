@@ -372,8 +372,23 @@ fn row_to_json_pg(row: &PgRow) -> Result<serde_json::Value, String> {
 }
 
 fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
+    // 逐类型试解（sqlx 的 `Type<Postgres>` 是**严格等值**匹配：`i64::compatible` 只认
+    // INT8，所以 INT4/INT2 用 i64 解会失败——必须各自单列，缺一列就落到
+    // `undecodable_column` 硬报错。Any 回退路径按类型名匹配，才没有这个陷阱。）
     if let Ok(v) = row.try_get::<Option<bool>, _>(ordinal) {
         return Some(serde_json::Value::from(v));
+    }
+    if let Ok(v) = row.try_get::<Option<i16>, _>(ordinal) {
+        return Some(match v {
+            Some(i) => serde_json::Value::from(i),
+            None => serde_json::Value::Null,
+        });
+    }
+    if let Ok(v) = row.try_get::<Option<i32>, _>(ordinal) {
+        return Some(match v {
+            Some(i) => serde_json::Value::from(i),
+            None => serde_json::Value::Null,
+        });
     }
     if let Ok(v) = row.try_get::<Option<i64>, _>(ordinal) {
         return Some(match v {
@@ -381,6 +396,9 @@ fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
             None => serde_json::Value::Null,
         });
     }
+    // 注意**不**加 `f32`（`real`）：Any 路径的 `f64::compatible` 是严格等值（只认 FLOAT8），
+    // 所以 `db.query` 读 `real` 列本来就报错；这里补上会让两条路径对同一列给出不同结论
+    // （流的通、查的错），比「统一不支持、统一给 cast 指引」更糟。
     if let Ok(v) = row.try_get::<Option<f64>, _>(ordinal) {
         return Some(match v {
             Some(f) => serde_json::Number::from_f64(f)
@@ -1676,6 +1694,75 @@ mod tests {
         assert!(
             e.contains("payload") && e.contains("decode"),
             "typed 流式必须点名 jsonb 列而非静默 null: {v}"
+        );
+        close(h);
+    }
+
+    /// typed 流式的**常规整数类型**必须可解（回归：`i64::compatible` 只认 INT8，
+    /// INT4/INT2 曾整类落到「未解码列类型」硬报错，而 `db.stream` 走的正是这条路）。
+    /// 真库才有意义：列类型由服务端元数据给出，mock 造不出来。env-gated：`OJ_TEST_PG=…`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_pg_stream_decodes_common_numeric_types() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        let bytes = drive(&mut stream_open(
+            h,
+            RString::from(
+                "select 2147483647::int4 as i4, (-32768)::int2 as i2, 9007199254740993::int8 as i8, \
+                 2.25::float8 as r8, true as b, 'txt'::text as t",
+            ),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+
+        let b = drive(&mut stream_next(h, sid)).await.expect("stream next");
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let row = &v["rows"][0];
+        assert_eq!(row["i4"], serde_json::json!(2147483647_i32), "{v}");
+        assert_eq!(row["i2"], serde_json::json!(-32768_i16), "{v}");
+        assert_eq!(row["i8"], serde_json::json!(9007199254740993_i64), "{v}");
+        assert_eq!(row["r8"], serde_json::json!(2.25), "{v}");
+        assert_eq!(row["b"], serde_json::json!(true), "{v}");
+        assert_eq!(row["t"], serde_json::json!("txt"), "{v}");
+        assert!(v["error"].is_null(), "不应有带内错误: {v}");
+
+        // 与 `db.query`（Any 路径）逐值对齐：同一列在流式与查询上不许给出不同结论。
+        // `real`/FLOAT4 两条路径都**不支持**（Any 的 `f64::compatible` 只认 FLOAT8），
+        // 这里把「统一不支持」也钉住，避免将来只补一头造成分叉。
+        let b = drive(&mut query(
+            h,
+            RString::from("select 2147483647::int4 as i4, (-32768)::int2 as i2"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("query ints");
+        let vq: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(row["i4"], vq[0]["i4"], "stream/query i4 必须一致: {vq}");
+        assert_eq!(row["i2"], vq[0]["i2"], "stream/query i2 必须一致: {vq}");
+        let e = drive(&mut query(
+            h,
+            RString::from("select 1.1::real as r4"),
+            RString::from("[]"),
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            e.contains("REAL") && e.contains("decode"),
+            "`real` 在查询路径应保持响亮报错: {e}"
         );
         close(h);
     }

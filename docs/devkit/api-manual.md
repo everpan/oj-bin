@@ -1737,6 +1737,13 @@ const seq = Number(rows[0].m) + 1;
   `JSON`、`BIT`、`GEOMETRY`。报错会点名列名与 MySQL 类型并给指路，**不会静默变 `null`**。
   需要读这些列时**在 SQL 里显式转换**：`select cast(amount as char) as amount from t`。
   另：`BOOLEAN`/`TINYINT(1)` 读出的是 **`1`/`0`（number）**，不是 `true`/`false`。
+- **PostgreSQL 读侧的列类型边界**：**可读** = `boolean`、整数家族（`smallint`/`integer`/
+  `bigint`）、`double precision`、文本家族（`text`/`varchar`/`char`）、`bytea`（按 UTF-8 lossy
+  转字符串，真二进制请自行 base64）。**其余一律报错**：`real`（`float4`）、`numeric`/`decimal`、
+  `json`/`jsonb`、`uuid`、日期时间与区间、数组、`void` 等——报错点名列名与 PG 类型并给 `cast`
+  指引，**不会静默变 `null`**。`db.query` 与 `db.stream` 用**同一套判据**（v0.1.88 起流式补齐
+  `smallint`/`integer`；此前流式读这两类会误报「未解码」，而同样的查询用 `db.query` 却正常）。
+  需要读受限列时在 SQL 里显式转换：`select cast(amount as char) as amount from t`。
 - 完整契约、判据表与排障见仓库 `docs/numeric-limits.md`；另见 `scenarios.md` 场景 7。
 
 ### kv / redis —— KV 存储
