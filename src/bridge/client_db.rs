@@ -72,20 +72,83 @@ pub struct ClientDbRegistry {
     epoch: Mutex<HashMap<String, u64>>,
     /// per-process 硬上限（连接池数封顶）。
     max_entries: usize,
+    /// U-7 v0.1.97：per-owner（registered_by）登记上限。
+    max_per_owner: usize,
+    /// U-7 v0.1.97：动态库**全局**并发流预算。permit 由 pump task 持有，随流结束
+    /// （自然/abort/close 任一路）释放；满了 `try_acquire` 即拒（不排队——排队会把
+    /// 预算变成隐形队列，背压语义应上抛给调用方）。
+    streams: Arc<tokio::sync::Semaphore>,
+    /// U-7 v0.1.97：拨号连续失败计数（防 `db.client.test/register` 沦为内网端口扫描）。
+    /// owner → (连续失败次数, 锁退截止时刻)。
+    scan: Mutex<HashMap<String, (u32, std::time::Instant)>>,
 }
+
+/// 拨号超时（`db.client.test`/`register`/`reRegister` 的 connect 包一层；scan-protection 的一部分）。
+const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 连续 connect 失败阈值：达到即锁退（扫描器打内网全是不通端口，失败会快速累积）。
+const SCAN_FAIL_THRESHOLD: u32 = 8;
+/// 锁退时长（锁退期内一律在**拨号之前**拒绝，不给探测流量出网）。
+const SCAN_LOCKOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl ClientDbRegistry {
     pub fn new(max_entries: usize) -> Self {
+        Self::with_caps(max_entries, 8, 32)
+    }
+
+    pub fn with_caps(max_entries: usize, max_per_owner: usize, max_streams: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
             epoch: Mutex::new(HashMap::new()),
             max_entries,
+            max_per_owner,
+            streams: Arc::new(tokio::sync::Semaphore::new(max_streams)),
+            scan: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn cap(&self) -> usize {
         self.max_entries
+    }
+
+    /// U-7：动态库全局并发流预算——占一个名额（不排队）。Ok(permit) 为 owned，
+    /// 随 pump task 结束自动释放。
+    pub fn try_acquire_stream(&self) -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
+        Arc::clone(&self.streams)
+            .try_acquire_owned()
+            .map_err(|_| {
+                "db client stream budget exhausted (db_client.max_streams); close running streams or raise the cap"
+            })
+    }
+
+    /// U-7：拨号前检查锁退。Err(剩余锁退时长) = 拒拨。
+    pub fn dial_allowed(&self, owner: &str) -> Result<(), std::time::Duration> {
+        let g = self.scan.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, until)) = g.get(owner) {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left > std::time::Duration::ZERO {
+                return Err(left);
+            }
+        }
+        Ok(())
+    }
+
+    /// U-7：拨号后记账。成功清零；失败累加，达阈值即锁退（返回 true = 本次触发了锁退）。
+    pub fn note_dial(&self, owner: &str, ok: bool) -> bool {
+        let mut g = self.scan.lock().unwrap_or_else(|e| e.into_inner());
+        if ok {
+            g.remove(owner);
+            return false;
+        }
+        let e = g
+            .entry(owner.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        e.0 += 1;
+        if e.0 >= SCAN_FAIL_THRESHOLD {
+            e.1 = std::time::Instant::now() + SCAN_LOCKOUT;
+            return true;
+        }
+        false
     }
 
     /// U-3 v0.1.93：取别名的当前世代号（未登记 = 0）。host 权威，供 `op_db_epoch` 读取。
@@ -111,7 +174,7 @@ impl ClientDbRegistry {
             .contains_key(name)
     }
 
-    /// 登记（重名 / 超配额 → Err）。锁前已完成 connect（异步），此处仅短暂加锁。
+    /// 登记（重名 / 超配额 / 超 per-owner 上限 → Err）。锁前已完成 connect（异步），此处仅短暂加锁。
     pub fn register(&self, name: &str, entry: ClientDbEntry) -> Result<(), String> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.contains_key(name) {
@@ -121,6 +184,18 @@ impl ClientDbRegistry {
             return Err(format!(
                 "client db registry full (cap {})",
                 self.max_entries
+            ));
+        }
+        // U-7：per-owner 上限（同一 registered_by 最多 max_per_owner 个）。
+        let owned = g
+            .values()
+            .filter(|e| e.registered_by == entry.registered_by)
+            .count();
+        if owned >= self.max_per_owner {
+            return Err(format!(
+                "client db registry per-owner cap {} reached (owner {:?}); delete an alias before registering another",
+                self.max_per_owner,
+                entry.registered_by.as_deref().unwrap_or("-")
             ));
         }
         g.insert(name.to_string(), Arc::new(entry));
@@ -265,6 +340,63 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// U-7：拨号操作的主体键（与 `ClientDbEntry.registered_by` 同源；无身份记 `"-"`）。
+fn dial_owner(state: &Rc<RefCell<OpState>>) -> String {
+    let g = state.borrow();
+    db_policy::operator_of(g.borrow::<super::ReqState>().req.user.as_ref())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// U-7：配额/预算拒绝的结构化日志（与 `DB_CLIENT_AUDIT` 同形态；U-9 归一时的出口之一）。
+fn deny_log(action: &str, reason: &str, owner: &str, alias: &str) {
+    eprintln!("DB_CLIENT_DENY: action={action} reason={reason} owner={owner} alias={alias}");
+}
+
+/// U-7：拨号守卫——锁退检查 → 5s 超时 connect → 记账（成功清零 / 失败累加，达阈值锁退）。
+/// test/register/reRegister 三个会拨号的 op 共用（扫描面一致）。
+async fn guarded_connect(
+    st: &Arc<StableState>,
+    dsn: &str,
+    owner: &str,
+) -> Result<Arc<dyn DataAccessor>, String> {
+    if let Err(left) = st.client_dbs.dial_allowed(owner) {
+        return Err(format!(
+            "db client dial blocked: too many consecutive connect failures from this caller; retry in {}s",
+            left.as_secs().max(1)
+        ));
+    }
+    let res = tokio::time::timeout(DIAL_TIMEOUT, st.db_backend.connect(dsn, &st.config_dir)).await;
+    match res {
+        Err(_) => {
+            let locked = st.client_dbs.note_dial(owner, false);
+            Err(format!(
+                "db client connect timed out after {}s{}",
+                DIAL_TIMEOUT.as_secs(),
+                if locked {
+                    "; further dials are temporarily blocked (too many consecutive failures)"
+                } else {
+                    ""
+                }
+            ))
+        }
+        Ok(Err(e)) => {
+            let locked = st.client_dbs.note_dial(owner, false);
+            Err(format!(
+                "db client connect failed: {e}{}",
+                if locked {
+                    "; further dials are temporarily blocked (too many consecutive failures)"
+                } else {
+                    ""
+                }
+            ))
+        }
+        Ok(Ok(a)) => {
+            st.client_dbs.note_dial(owner, true);
+            Ok(a)
+        }
+    }
+}
+
 #[op2]
 #[serde]
 pub async fn op_db_client_register(
@@ -290,11 +422,11 @@ pub async fn op_db_client_register(
         )));
     }
     // connect 是异步且会开真实连接池——锁前完成，绝不持锁跨 await。
-    let accessor = st
-        .db_backend
-        .connect(&dsn, &st.config_dir)
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("db client connect failed: {e}")))?;
+    let owner = dial_owner(&state);
+    let accessor = guarded_connect(&st, &dsn, &owner).await.map_err(|e| {
+        deny_log("register", "dial_rejected", &owner, &name);
+        JsErrorBox::generic(e)
+    })?;
     let dialect = accessor.dialect_info().name.clone();
     let dsn_redacted = crate::secret::redact(&dsn);
     let registered_by =
@@ -330,10 +462,12 @@ pub async fn op_db_client_test(
         .clone();
     client_gate(&state, &section)?;
     let st = state.borrow().borrow::<Arc<StableState>>().clone();
-    let accessor = match st.db_backend.connect(&dsn, &st.config_dir).await {
+    let owner = dial_owner(&state);
+    let accessor = match guarded_connect(&st, &dsn, &owner).await {
         Ok(a) => a,
         Err(e) => {
-            return Ok(serde_json::json!({ "ok": false, "error": format!("connect failed: {e}") }));
+            deny_log("test", "dial_rejected", &owner, "-");
+            return Ok(serde_json::json!({ "ok": false, "error": e }));
         }
     };
     let dialect = accessor.dialect_info().name.clone();
@@ -391,11 +525,11 @@ pub async fn op_db_client_re_register(
             "client db '{name}' not registered (use register to add)"
         )));
     }
-    let accessor = st
-        .db_backend
-        .connect(&dsn, &st.config_dir)
-        .await
-        .map_err(|e| JsErrorBox::generic(format!("db client connect failed: {e}")))?;
+    let owner = dial_owner(&state);
+    let accessor = guarded_connect(&st, &dsn, &owner).await.map_err(|e| {
+        deny_log("reRegister", "dial_rejected", &owner, &name);
+        JsErrorBox::generic(e)
+    })?;
     let dialect = accessor.dialect_info().name.clone();
     let dsn_redacted = crate::secret::redact(&dsn);
     let registered_by =
@@ -622,6 +756,62 @@ mod tests {
         assert!(!valid_client_alias(&format!("bad{u}name", u = '\u{0007}'))); // 控制字符
         assert!(!valid_client_alias(&format!("bad{u}name", u = '\u{0000}'))); // NUL
         assert!(!valid_client_alias(&"x".repeat(129)));
+    }
+
+    /// U-7：per-owner 登记上限——同 owner 第 N+1 个被拒且错误可辨识；异 owner 不受影响；
+    /// delete 释放名额。
+    #[test]
+    fn per_owner_cap_blocks_n_plus_one() {
+        let r = ClientDbRegistry::with_caps(8, 1, 8);
+        let mk = |by: Option<&str>| ClientDbEntry {
+            accessor: Arc::new(crate::bridge::db::InMemoryAccessor::new()),
+            dsn_redacted: "sqlite::memory:".into(),
+            dialect: "sqlite".into(),
+            registered_by: by.map(|s| s.to_string()),
+            registered_at_ms: 0,
+            queries: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+        };
+        r.register("a", mk(Some("u"))).unwrap();
+        let err = r.register("b", mk(Some("u"))).unwrap_err();
+        assert!(err.contains("per-owner cap 1"), "{err}");
+        // 异 owner / 匿名桶不受影响
+        r.register("c", mk(Some("v"))).unwrap();
+        r.register("d", mk(None)).unwrap();
+        // delete 释放
+        assert!(r.remove("a"));
+        r.register("e", mk(Some("u"))).unwrap();
+    }
+
+    /// U-7：拨号锁退——连续失败达阈值即拒拨（异 owner 不受影响）；成功记账即清零。
+    #[test]
+    fn scan_lockout_after_consecutive_dial_failures() {
+        let r = ClientDbRegistry::with_caps(8, 8, 8);
+        assert!(r.dial_allowed("u").is_ok());
+        for i in 0..SCAN_FAIL_THRESHOLD - 1 {
+            assert!(!r.note_dial("u", false), "第 {} 次失败还不该锁", i + 1);
+        }
+        assert!(r.note_dial("u", false), "第 8 次失败应触发锁退");
+        let left = r.dial_allowed("u").unwrap_err();
+        assert!(left <= SCAN_LOCKOUT && left > std::time::Duration::ZERO);
+        // 异 owner 照常
+        assert!(r.dial_allowed("v").is_ok());
+        // 成功记账清零（锁退态被显式成功解除——记账单一真源）
+        r.note_dial("u", true);
+        assert!(r.dial_allowed("u").is_ok());
+    }
+
+    /// U-7：全局流预算——占满后 try_acquire 拒绝且错误点名配置键。
+    #[test]
+    fn stream_budget_exhausts_distinctly() {
+        let r = ClientDbRegistry::with_caps(8, 8, 2);
+        let a = r.try_acquire_stream().unwrap();
+        let b = r.try_acquire_stream().unwrap();
+        let err = r.try_acquire_stream().unwrap_err();
+        assert!(err.contains("db_client.max_streams"), "{err}");
+        drop(a);
+        let _ = r.try_acquire_stream().unwrap(); // 释放后可再占
+        drop(b);
     }
 
     // 无关 `AllowList` 默认形态（确保引用不被误删）。

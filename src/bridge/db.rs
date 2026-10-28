@@ -828,6 +828,25 @@ pub async fn op_db_stream_open(
             ));
         }
     };
+    // U-7：动态库全局流预算——开流前占名额（满了拒，不排队）；permit 由 pump task 持有，
+    // 随流结束（自然/abort/close 任一路）释放。
+    let stream_permit = {
+        let st = state.borrow().borrow::<Arc<StableState>>().clone();
+        if !st.dbs.contains_key(&alias) && st.client_dbs.contains(&alias) {
+            match st.client_dbs.try_acquire_stream() {
+                Ok(p) => Some(p),
+                Err(msg) => {
+                    eprintln!(
+                        "DB_CLIENT_DENY: action=stream reason=budget_exhausted owner={:?} alias={alias}",
+                        super::db_session::owner_of(&state.borrow()).user
+                    );
+                    return Err(JsErrorBox::generic(msg.to_string()));
+                }
+            }
+        } else {
+            None
+        }
+    };
     // stream 明确拒绝事务，占位风格直接取 accessor（无需 ActiveTx 快照）。
     let norm = normalize_and_trace(
         &state,
@@ -892,6 +911,8 @@ pub async fn op_db_stream_open(
     // probe_stream_abort_releases_connection 抓到的回归）。
     let abort = shared.abort.clone();
     tokio::spawn(async move {
+        // U-7 流预算 permit：随本 task 结束（任一退出路径）自动释放。
+        let _stream_permit = stream_permit;
         use futures::StreamExt;
         loop {
             tokio::select! {
@@ -3242,6 +3263,8 @@ mod tests {
                 db_client: Some(Arc::new(DbClientSection {
                     enabled,
                     max_entries: max,
+                    max_per_owner: 8,
+                    max_streams: 32,
                     allow,
                 })),
                 client_dbs: Some(Arc::new(ClientDbRegistry::new(max))),

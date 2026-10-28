@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.97（未打标签）
+
+**dbx Web 对齐 · U-7（client 轴配额与预算）**：动态数据源三道闸 + 拨号守卫。设计文档
+`docs/plans/2026-10-28-dbx-web-u7-client-quota.md`。**零 ABI/插件改动**（纯 host 侧 + 配置段）。
+
+### feat(db_client)
+
+- **`db_client.max_per_owner`（缺省 8）**：per-owner（registered_by）登记上限。锁内重判
+  （防并发超额）；`delete` 释放名额；0 或 `> max_entries` 装配期 fail-loud 拒启动。
+- **`db_client.max_streams`（缺省 32）**：动态库**全局**并发流预算——`op_db_stream_open`
+  对动态别名 `try_acquire_owned` 占名额（满即拒、不排队，错误点名配置键）；permit 由 pump
+  task 持有，随流结束（自然 / `signal` / `db.cancel` / close 任一路）自动释放。
+- **拨号守卫**：`db.client.test` / `register` / `reRegister` 的 connect 统一 5s 拨号超时；
+  同主体**连续 8 次 connect 失败**（含超时/认证失败）→ 锁退 60s，期间在**拨号之前**拒绝
+  （防内网端口扫描），错误带 retry 秒数；成功一次清零。阈值/时长/超时为常量（登记于设计文档）。
+- **`DB_CLIENT_DENY` 结构化拒绝日志**：配额 / 预算 / 拨号拒绝统一出口
+  （action/reason/owner/alias），与 `DB_CLIENT_AUDIT` 同形态（U-9 归一时的出口之一）。
+
+### 已知限制（诚实登记）
+
+- **查询超时与结果集字节上限未覆盖**：raw `db.query` 平台级无查询超时（非 client 轴独有）；
+  行数上限按别名配 `db_access.<name>.max_rows`。字节上限需平台级方案，另期。
+- 锁退按 operator 串记账（无身份同入 `"-"` 桶）；认证成功但后续查询失败不记失败
+  （scan 防护只盯拨号面）。
+
 ## v0.1.96
 
 **dbx Web 对齐 · U-5（execution-id 跨请求取消）**：新增 `db.cancel(executionId)` —— 跨请求

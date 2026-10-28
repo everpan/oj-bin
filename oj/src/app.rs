@@ -1270,6 +1270,19 @@ pub async fn assemble_backend(
         if db_client.max_entries == 0 {
             return Err("db_client.enabled=true requires db_client.max_entries >= 1".to_string());
         }
+        // U-7（v0.1.97）：0 = 不设限（DoS 面）；per-owner 上限大于全局上限是配置矛盾。
+        if db_client.max_per_owner == 0 {
+            return Err("db_client.enabled=true requires db_client.max_per_owner >= 1".to_string());
+        }
+        if db_client.max_streams == 0 {
+            return Err("db_client.enabled=true requires db_client.max_streams >= 1".to_string());
+        }
+        if db_client.max_per_owner > db_client.max_entries {
+            return Err(format!(
+                "db_client.max_per_owner ({}) > db_client.max_entries ({}) is contradictory",
+                db_client.max_per_owner, db_client.max_entries
+            ));
+        }
         if db_client.allow.is_unrestricted() {
             return Err(
                 "db_client.enabled=true requires db_client.allow to declare at least one of \
@@ -1341,9 +1354,11 @@ pub async fn assemble_backend(
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
-    // 运行期动态登记注册表（per-process 硬上限 = max_entries）。
-    let client_dbs = Arc::new(only_js::bridge::ClientDbRegistry::new(
+    // 运行期动态登记注册表（per-process 硬上限 = max_entries；U-7：per-owner 与流预算同源配置）。
+    let client_dbs = Arc::new(only_js::bridge::ClientDbRegistry::with_caps(
         db_client.max_entries,
+        db_client.max_per_owner,
+        db_client.max_streams,
     ));
     // 运行期动态授权表（U-1 v0.1.93）：壳 Arc 不可变、内部 Mutex 变动，起始空。
     // 仅作用于动态登记别名（见 db_policy::policy_for），静态 config 兜底不受影响。

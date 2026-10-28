@@ -70,6 +70,17 @@ PG `UUID`（→ 规范文本）、PG **一维数组**（→ JSON 数组，元素
 并给 `cast`/`ST_AsText` 指路。见 db-guide §10.6（值契约与边界表）、api-manual §6「db」读侧
 边界段 + §13 限制表、scenarios 场景 48（读写范式与 42804 排障）、SKILL 陷阱速查。
 
+v0.1.97 已落地部分：**dbx Web 对齐 · U-7（client 轴配额与预算）**——动态数据源补齐三道闸：
+① `db_client.max_per_owner`（缺省 8）：单主体（registered_by）登记上限，`delete` 释放名额，
+0 或 `> max_entries` 装配期拒启动；② `db_client.max_streams`（缺省 32）：动态库**全局**并发流
+预算——所有动态别名的 `db.stream` 游标总数封顶，permit 随流结束（自然/`signal`/`db.cancel`/
+close）自动释放，满即拒点名配置键；③ **拨号守卫**：`test/register/reRegister` 的 connect 包
+5s 超时，同主体连续 8 次 connect 失败锁退 60s（拨号前即拒，防 `db.client.test` 沦为内网端口
+扫描），成功清零；拒绝/锁退统一落 `DB_CLIENT_DENY` 结构化日志。容量规划：真实并发 ≈
+`max_entries × (池 + 8)`（算式入 db-guide §11.6）。**已知限制**：查询超时与结果集字节上限未
+覆盖（raw `db.query` 平台级无查询超时；行数上限按别名配 `db_access.<name>.max_rows`）。
+见 db-guide §11.6、api-manual §13、SKILL 陷阱速查。
+
 v0.1.96 已落地部分：**dbx Web 对齐 · U-5（执行 id 跨请求取消 `db.cancel`）**——`db.stream` 的
 `AbortSignal` 只能被同一个请求触发，「请求 A 发起长导出、请求 B 点停止」够不着。现在开流后发放
 **执行 id**（`exec_<4hex>_<32hex>`，回调形态 `opts.onOpen(xid)`、迭代形态 `it.executionId()`）：

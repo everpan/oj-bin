@@ -284,13 +284,44 @@ impl<'de> Deserialize<'de> for DbAccessSection {
 /// delete/reRegister/list）。`max_entries` 是 per-process 硬上限（连接池数封顶）。
 ///
 /// 装配期 fail-loud 约束（见 `oj/src/app.rs`）：`enabled=true` 且 `allow` 四维全缺
-/// （`is_unrestricted()`）→ 拒启动，防止「开了忘配」就全开（SSRF / 内网横向移动面）。
-#[derive(Debug, Clone, Default, Deserialize)]
+/// （`is_unrestricted()`）→ 拒启动，防止「开了忘配」就全开（SSRF / 内网横向移动面）；
+/// `max_per_owner` / `max_streams` 为 0 同样拒启（U-7 v0.1.97）。
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DbClientSection {
     pub enabled: bool,
     pub max_entries: usize,
+    /// per-owner（registered_by）登记上限（U-7）：一个主体最多登记多少个动态库。
+    /// 缺省 8；0 非法（装配期拒启）。
+    #[serde(default = "default_max_per_owner")]
+    pub max_per_owner: usize,
+    /// 动态库**全局**并发流预算（U-7）：所有动态别名上的 `db.stream` 游标总数上限。
+    /// 缺省 32；0 非法（装配期拒启）。
+    #[serde(default = "default_max_streams")]
+    pub max_streams: usize,
     pub allow: AllowList,
+}
+
+fn default_max_per_owner() -> usize {
+    8
+}
+
+fn default_max_streams() -> usize {
+    32
+}
+
+// 手写 Default（保留 `max_entries=0` 的旧语义——enabled=true 时装配期仍要求显式 >=1；
+// 新键给非零缺省，旧配置不写它们也照常启动）。
+impl Default for DbClientSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: 0,
+            max_per_owner: default_max_per_owner(),
+            max_streams: default_max_streams(),
+            allow: AllowList::default(),
+        }
+    }
 }
 
 /// 跨请求事务配置段（`db_session:`，U-4 v0.1.95）。

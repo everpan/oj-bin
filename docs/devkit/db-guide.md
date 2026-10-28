@@ -1396,13 +1396,22 @@ query/exec/stream**——**不另起平行的 `db.client.query` API**（使用�
 db_client:
   enabled: true            # 默认 false（fail-closed）。false 时 register/test/... 全拒。
   max_entries: 16          # 单进程连接池硬上限（=0 装配期 fail-loud 拒启动）。
+  max_per_owner: 8         # U-7（v0.1.97）：单主体（registered_by）最多登记几个动态库。缺省 8；=0 拒启动。
+  max_streams: 32          # U-7（v0.1.97）：动态库全局并发流预算（所有动态别名 db.stream 游标总数）。缺省 32；=0 拒启动。
   allow:                   # 登记门：谁能调 register/test/delete/reRegister/list。
     roles: [dba]           # 四维并集；任一命中即放行。全缺 = 不限制。
     sources: [task]        # 可限定 http / task 来源。
 ```
 
 **装配期 fail-loud**：`enabled=true` 且 `allow` 四维全缺（无限制）→ **拒启动**（防「开了忘配」就全开，
-SSRF / 内网横向移动面）；`max_entries==0` 同样拒启动。
+SSRF / 内网横向移动面）；`max_entries==0`、`max_per_owner==0`、`max_streams==0`、
+`max_per_owner > max_entries` 同样拒启动。
+
+**真实并发算式（U-7，容量规划必读）**：一个动态库的连接峰值 = **池连接 + 8**（typed 流式游标
+独占池外连接，插件侧每别名闸 8）；全进程动态轴峰值 ≈ `max_entries × (池 + 8)`。`max_streams`
+是**全局**游标预算（不排队，满了 `db.stream` 直接报错点名 `db_client.max_streams`），用来把这个
+乘法封顶；行数上限按别名配 `db_access.<name>.max_rows`。**查询超时与结果集字节上限未覆盖**
+（raw `db.query` 平台级无查询超时，登记为已知限制）。
 
 #### 11.6.2 管理面（`db.client`）
 
@@ -1421,7 +1430,12 @@ db.client.has("rep");                                // 同步 bool（探活用�
   删后再 `DB("rep")` 拿到**陈旧实例**。
 - **`dsn` 全脱敏**：`user:pass@` → `***`，host/库名保留排障；连接失败错误同样脱敏。
 - **审计**：register / delete / reRegister 落 `DB_CLIENT_AUDIT`（operator/module/tenant/source），
-  非防篡改但比 deny_log 更适合安全敏感事件。
+  非防篡改但比 deny_log 更适合安全敏感事件。配额/预算/拨号拒绝落 `DB_CLIENT_DENY`
+  （action/reason/owner/alias，U-7）。
+- **拨号守卫（U-7，v0.1.97，防内网端口扫描）**：`test` / `register` / `reRegister` 的 connect
+  统一包 **5s 拨号超时**；同一主体**连续 8 次 connect 失败**（含超时/认证失败）→ 锁退 60s，
+  期间一律在**拨号之前**拒绝（不给探测流量出网），错误带 retry 秒数；成功一次即清零。
+  超限/锁退落 `DB_CLIENT_DENY`。
 
 #### 11.6.3 安全红线（四路评审 [安全·阻断] 裁决）
 
@@ -1444,6 +1458,12 @@ db.client.has("rep");                                // 同步 bool（探活用�
 - **不跨进程**：本进程登记的别名，别的进程看不到；若都连同一真实 DB 并各自回放，语义一致（DB 实例本就是
   per-process 连接池）。
 - **`max_entries` 封顶**：超过返回 `OJ_DB_CLIENT_FULL`。
+- **`max_per_owner` 封顶（U-7）**：同一主体登记数达上限 → register 报
+  `client db registry per-owner cap N reached (owner …); delete an alias before registering another`；
+  delete 释放名额。
+- **`max_streams` 全局预算（U-7）**：动态别名上的流游标总数达上限 → `db.stream` 报
+  `db client stream budget exhausted (db_client.max_streams); close running streams or raise the cap`。
+  permit 随流结束（自然/`signal`/`db.cancel`/close）自动释放。
 - **与 L1 `enforce` 一致**：动态库未声明即 deny；声明后按 `db_access.<name>` 的档位走。
 
 #### 11.6.5 错误码
