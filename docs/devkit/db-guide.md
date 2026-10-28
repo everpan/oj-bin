@@ -262,7 +262,8 @@ no tenant header)` / `db.asTenant: id must not be empty`。
 | `stream` | `stream(sql, params?, opts?)` | `Promise<void>` \| `AsyncIterable<行>` | 流式查询（逐行拉取，v0.1.37，见 §3.1） |
 | `table` | `table(name)` | 查询构造器 | 安全构造器（本手册主角） |
 | `fromJSON` | `fromJSON(snapshot)` | 查询构造器 | 从 toJSON 快照恢复 |
-| `tx` | `tx(async (tx) => {...})` | `Promise<fn 返回值>` | 事务 |
+| `tx` | `tx(async (tx) => {...})` | `Promise<fn 返回值>` | 请求内事务（§4） |
+| `session` | `session.begin()` / `attach(id)` / … | `Promise<…>` | **跨请求**事务会话（v0.1.95，§4.5） |
 | `leaf` / `and` / `or` / `not` | 工厂 | 条件对象 | 条件组合（§5.2） |
 | `nextSeq` | `nextSeq(name)` | `Promise<number \| string>` | 平台序列取号（§11 第 7 条） |
 | `listTables` | `listTables(prefix?)` | `Promise<string[]>` | 目录自省（v0.1.82；三内置方言同口径，其他方言 `OJ_DB_UNSUPPORTED`） |
@@ -360,6 +361,92 @@ const out = await db.tx(async (tx) => {
   所以 `tx.table(...)` 与 `db.table(...)` 的改写完全一致（select 收窄、insert 强制写
   当前租户、update/delete 收窄）。裸 SQL 只有「文本里有没有 tenant_id」的 best-effort
   检查——事务里也请优先用构造器。
+
+---
+
+## 4.5 跨请求事务：`db.session`（v0.1.95）
+
+`db.tx` 的事务活在**一个请求**里：handler 返回即提交/回滚。多步表单向导（步骤 1 存草稿、
+步骤 2 改行、步骤 3 提交）横跨多个人类请求，塞不进一个 handler——这就是 `db.session`：
+
+```ts
+// 步骤 1（请求 A）：开会话 + 写草稿，把 id 存进你的业务表/前端
+const s = await db.session.begin();          // → { id, alias, dialect, expiresInMs, … }
+await db.session.exec(s.id, "insert into draft (uid, body) values (?, ?)", [uid, body]);
+// s.id 是 **bearer token**：存服务端的会话记录里（或加密后给前端），别写进日志/URL
+
+// 步骤 2（请求 B，可能是几小时后）：绑到本请求，之后 db.query/table 全走这条连接
+await db.session.attach(s.id);
+await db.table("draft").update({ body: body2 }).where({ field: "uid", op: "eq", value: uid }).run();
+
+// 步骤 3（请求 C）：提交（或 rollback 丢弃全部）
+await db.session.commit(s.id);
+```
+
+### 配置（默认关）
+
+```yaml
+db_session:
+  enabled: true                     # 缺省 false：能力不存在，db.session.begin 直接报错点名怎么开
+  allow:                            # 谁能开会话（四维并集，任一声明维度命中即放行）
+    roles: ["draft-editor"]
+  max_sessions: 32                  # 进程级并发上限（含「正在连接」的占位）
+  max_per_owner: 8                  # 同一 (tenant,user) 的上限
+  idle_timeout_secs: 300            # 空闲多久自动回滚
+  max_lifetime_secs: 1800           # 无论多活跃，最长存活
+  require_identity: true            # 无 user.id 且无 tenant 的调用方拒建（匿名部署别关）
+```
+
+装配期 fail-loud（拒绝启动）：`enabled: true` 但 `allow` 四维全空；`max_sessions`/`max_per_owner`
+为 0；`max_per_owner > max_sessions`；`idle_timeout_secs` 为 0；`max_lifetime < idle_timeout`。
+配置段改动归热更的 `restart_pending`（**改了要重启**）；但**已开的会话跨热更存活**——会话表挂在
+进程级的 `StableState` 上，热更只替换模块代码。
+
+### 方法面
+
+| 方法 | 返回 | 说明 |
+|---|---|---|
+| `begin(name?)` | `Promise<{id, alias, dialect, state, ageMs, idleMs, expiresInMs, ops, createdBy}>` | 在 `DB(name)` 上开（默认 `DB("default")`）；`id` = `tx_<4hex>_<32hex>` |
+| `attach(id)` | `Promise<true>` | 本请求绑定；之后 `db.query`/`db.exec`/`db.table()`/`nextSeq`/`listTables` 全走该连接 |
+| `detach()` | `Promise<true>` | 解绑（会话本身仍在） |
+| `query(id, sql, params?)` | `Promise<行数组>` | 不绑定也可逐语句显式执行 |
+| `exec(id, sql, params?)` | `Promise<受影响行数>` | 同上 |
+| `commit(id)` / `rollback(id)` | `Promise<true>` | 结束会话（失败也摘表，不允许续用） |
+| `close(id)` | `Promise<true>` | **幂等**收尾（`finally` 用）：best-effort 回滚，失败不上抛 |
+| `touch(id)` | `Promise<{expiresInMs}>` | 只推空闲计时，不延长最长寿命（长表单用） |
+| `closeAll()` | `Promise<number>` | 关掉**本主体**全部会话（登出用） |
+| `list()` | `Promise<摘要数组>` | 本主体的活跃会话（绝不列他人） |
+| `info(id)` | `Promise<摘要>` | 单条；已结束的会话会给出「已回滚 + 原因」的诊断 |
+| `stats()` | `Promise<{enabled, active, maxSessions, maxPerOwner, idleTimeoutSecs, maxLifetimeSecs, timedOut, discarded, rejected, boot}>` | 运维观察面（只统计本主体） |
+
+### 六条硬规则（踩了会静默错或假回滚）
+
+1. **`begin` 与 `attach` 必须落在同一个库别名上**。绑定后去 `DB("另一库").query(...)` 直接报
+   `db session is attached to db 'x', not 'y' (detach first)`——判权用会话登记的别名，绝不按当前
+   请求的模块绑定重算（否则就是「A 库判权、B 库执行」）。
+2. **会话内禁止事务控制与会话状态语句**：`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/
+   `START`/`SET`/`USE`/`ATTACH`/`DETACH`/`PRAGMA` 一律报错。原因很实在：MySQL 上这些语句
+   **隐式提交**，先写、再 `BEGIN`、最后 `rollback` 会得到「假回滚」——数据其实已经落库。
+3. **会话与 `db.tx` 互斥**（双向拒绝）。要请求内事务就别开跨请求会话。
+4. **`db.stream` 在会话内不可用**（流式只走直连池）：报
+   `db.stream within an active transaction is not supported`。
+5. **`db_access` 照样生效**：会话里每条语句都重新过授权与风险分类——只读库在会话里也写不进去。
+6. **id 是 bearer token**：他人拿到也调不动（归属按 tenant+user 判定，错误文案与「不存在」完全
+   一致，不泄露存在性）；日志与错误只出现前 8 字符（`tx_ab12_…`）。别把完整 id 回给最终用户。
+
+### 生命周期
+
+- 空闲超时 / 超最长寿命 → 后台回收器**先 rollback 再摘表**，并记一条
+  `DB_SESSION_TIMEOUT`；之后调它得到「已过期（原因）；已回滚」。
+- 会话内语句把剩余寿命耗尽 → 该语句失败、会话判死（连接状态不可信，不再复用）。
+- 动态数据源 `db.client.delete` / `reRegister` → 该别名上的会话全部判死（`DB_SESSION_DISCARD`）。
+- 进程退出 / 关闭会话 → 未提交的一律回滚。**没有任何「自动提交」路径**。
+
+### sqlite 上的现实
+
+内置 sqlite accessor 的池刻意只有 **1 条连接**（`:memory:` 与写锁语义使然）。开一个会话就占满
+它：同别名上的其他查询会一直等到会话结束（40s 后报错）。装配期会为此打一条 `warn:`。
+**跨请求事务请用在 mysql/postgres 上**，sqlite 只适合单请求串行验证。
 
 ---
 
@@ -875,25 +962,48 @@ postgres  placeholder=$ id=returning stream cancel
 
 ### 2) 读侧值契约（JSON / JS）
 
-| 逻辑类型 | JS 侧拿到 | 备注 |
+| 逻辑类型 / 引擎列型 | JS 侧拿到 | 备注 |
 |---|---|---|
 | `integer` / `bigint` | `number`；**超出 ±(2^53-1) 的 i64 → 十进制字符串** | 见 `docs/numeric-limits.md`；回写超界整数用 `toBigInt()` |
-| `double` | `number` | 二进制浮点，别用来放钱 |
+| `double` / `float8` | `number` | 二进制浮点，别用来放钱 |
+| `real` / `float4` | `number` | **4 字节**：`1.1::real` 读回 `1.100000023841858`（这是该列的真实值，不做舍入粉饰） |
 | `boolean` | `true` / `false`；**MySQL 读出 `1` / `0`** | MySQL 无独立布尔类型（`TINYINT(1)`） |
 | `text` | `string` | |
-| `blob` | `string`（**UTF-8 lossy 转换**） | 真二进制请自己 base64 后存 `text`；二进制不会原样穿过 JSON |
-| 日期时间（**不在六类内**） | 用 `text` 存 ISO 8601 | 引擎原生 DATE/TIMESTAMP 属「受限列」，需显式 `cast`（见下表） |
+| `blob` / `bytea` | `string`（**UTF-8 lossy 转换**） | 真二进制请自己 base64 后存 `text`；二进制不会原样穿过 JSON |
+| `DECIMAL` / `NUMERIC` | `string`（十进制文本，**不经 f64**） | MySQL 保留列声明精度（`numeric(10,2)` 的 `12.30` → `"12.30"`）；PG 走**去尾零规范形式**（→ `"12.3"`），原因见下 |
+| `DATE` | `string` `"YYYY-MM-DD"` | |
+| `TIME` | `string` `"HH:MM:SS[.ffffff]"` | 小数秒按值给，无小数秒则不带点 |
+| `DATETIME` / `TIMESTAMP`（无时区） | `string` `"YYYY-MM-DDTHH:MM:SS[.ffffff]"` | ISO 8601，**无**时区后缀 |
+| `TIMESTAMP`（MySQL，UTC 语义）/ `TIMESTAMPTZ` | `string` `"…Z"` | ISO 8601 + `Z` |
+| `JSON` / `JSONB` | `string`（**JSON 文本**） | **不自动 `JSON.parse`**，由业务侧决定（见 §3 示例） |
+| `BIT(n)`（MySQL） | `string`（位串，如 `b'10101'` → `"10101"`） | 无前导零（sqlx 不暴露位宽）；PG 的 `BIT` / `VARBIT` 目前**不支持** |
+| `UUID`（PG） | `string`（规范 8-4-4-4-12） | |
+| 数组（PG，一维） | `array` | 元素按上面同口径转换（`numeric[]` → 字符串数组）；元素 `NULL` → `null`；**多维不支持** |
+| `GEOMETRY` 家族、`TIMETZ`、范围/复合/`point` 等 | —— | **报错**，点名列名 + 类型 + 可执行 `cast`/`ST_AsText` 提示 |
+
+> **新增的类型都是只读的。** 上面那张表的每一行都只在**读**侧成立；写侧 `bind_value` 只绑
+> `null` / 布尔 / 数字 / 字符串，没有对称编码。要把值写回 `numeric`/`jsonb`/`uuid`/数组列，
+> 必须在 SQL 里显式转换：`insert into t (n) values (?::numeric)`（PG 直接绑字符串会报
+> `42804`）。这是有意的：隐式编码会让「字符串到底是文本还是 JSON」变成方言猜谜。
+>
+> **为什么 PG 的 `NUMERIC` 要去尾零**：sqlx 的 `TryFrom<&PgNumeric> for BigDecimal` **丢弃
+> 服务端 dscale**，把标度硬算成 4 的倍数（`sqlx-postgres/src/types/bigdecimal.rs`），
+> 于是 `1.5` 会读成 `1.5000`。值本身精确（没经 f64），但字符串带假精度比丢尾零更误导，
+> 故统一 `normalized()`：只去尾零、不动有效位。MySQL 的 `DECIMAL` 由协议**文本**解析而来，
+> 标度是服务端给的，原样保留。
 
 ### 3) 三内置方言的读侧边界
 
 | 方言 | 可读 | 报错（点名列名 + 类型，给 `cast` 指路） | 未识别时静默 `null`？ |
 |---|---|---|---|
 | sqlite | 整数 / 浮点 / 文本 / BLOB（动态类型） | —— | **是**（`row_to_json` 兜 `Value::Null`，既有行为，未收紧） |
-| mysql | 整数家族（含 `BIGINT UNSIGNED`）/ 文本家族 / 二进制 / `FLOAT` / `DOUBLE` | `DECIMAL`、日期时间、`JSON`、`BIT`、`GEOMETRY` | 否 |
-| postgres | `boolean`、`int2` / `int4` / `int8`、`float8`、`text` / `varchar` / `char`、`bytea` | `real`（float4）、`numeric`、`json` / `jsonb`、`uuid`、日期时间、数组、`void` | 否 |
+| mysql | 整数家族（含 `BIGINT UNSIGNED`）/ 文本家族 / 二进制 / `FLOAT` / `DOUBLE` / `DECIMAL`、`DATE`、`TIME`、`DATETIME`、`TIMESTAMP`、`YEAR`、`JSON`、`BIT` | `GEOMETRY` 家族、`SET` 等其余列型 | 否 |
+| postgres | `boolean`、`int2` / `int4` / `int8`、`float4` / `float8`、`text` / `varchar` / `char`、`bytea`、`numeric`、`date` / `time` / `timestamp` / `timestamptz`、`json` / `jsonb`、`uuid`、一维数组（见上加白名单） | `timetz`、`bit` / `varbit`、范围类型、几何、复合类型、多维数组 | 否 |
 
-`db.query` 与 `db.stream` 用**同一套判据**（v0.1.88 起流式补齐 `smallint`/`integer`；此前流式
-读这两类会误报「未解码」，而同样的查询走 `db.query` 却正常）。
+**`db.query` / `db.tx(...)` 内的查询 / `db.stream` 三条路径用同一套判据**（v0.1.93 起
+`oj-db-postgres` 的 `query` / `exec` / `tx_*` 也从 `sqlx::Any` 换成 typed `Pool<Postgres>`——
+此前这些类型只有流式能读，同样的查询走 `db.query` 会报「未解码」，属于**同一列两种结论**的
+分叉，已消除）。
 
 ### 4) 新方言接入的硬要求
 
@@ -1027,12 +1137,17 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
    - **`memory://` 假后端不支持**（`no value returned`）；`sqlite://` / `sqlite::memory:`
      正常。平台序列表是普通表，`db.nextSeq` 只在**宿主认识的三种方言**上可用（§10.5）。
    - 序列值**不随调用方事务回滚而回退**（一次独立的原子自增）——按「只增不复用」理解。
-8. **MySQL 读侧的列类型边界（v0.1.24）**：类型化路径下**可读** = 整数家族（含
-   `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`；
-   **其余报错**：`DECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、`JSON`、`BIT`、
-   `GEOMETRY`——报错点名列名与类型，**不会静默给 `null`**。读这些列请在 SQL 里显式转换
-   （`select cast(amount as char) as amount from t`），别用 `select *` 兜。`BOOLEAN`/`TINYINT(1)`
+8. **MySQL 读侧的列类型边界（v0.1.24 起；v0.1.94 扩到十进制/时间/JSON/BIT/YEAR）**：
+   类型化路径下**可读** = 整数家族（含 `BIGINT UNSIGNED`）、文本家族
+   （`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`，以及
+   `DECIMAL`/`NUMERIC`（→ 十进制字符串，保留声明标度）、`DATE`/`TIME`/`DATETIME`
+   （→ ISO 8601）、`TIMESTAMP`（→ ISO 8601 带 `Z`）、`YEAR`（→ number）、`JSON`
+   （→ JSON 文本）、`BIT(n)`（→ 位串，如 `b'10101'` → `"10101"`）；`BOOLEAN`/`TINYINT(1)`
    按整数读出 `1`/`0`（MySQL 无独立 boolean 类型）。
+   **仍然报错**：`GEOMETRY` 家族（`POINT`/`LINESTRING`/`POLYGON`/…）、空间类型、
+   `SET`、以及无法判定的自定义类型——报错点名列名与类型，**不会静默给 `null`**。读这些列
+   请在 SQL 里显式转换（`select ST_AsText(shape) as shape from t`），别用 `select *` 兜。
+   与 PostgreSQL 共用同一判据：`db.query` / `db.stream` / 事务内查询**结论一致**（详见 §10.6）。
 
 ### 常见报错速查
 
@@ -1067,7 +1182,10 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
 | `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | v0.1.24 前：同一 SQL 文本混用字符串/数字参数（sqlx 语句缓存按文本 key） | **v0.1.24 起平台自动按参数形态分缓存键**，无需再规避；若仍出现，检查 PG 插件是否随宿主重建 |
 | `db param: u64 value … is not supported on this path` | `toUBigInt()` 的值走了一条不能承载 u64 的路径（PG/SQLite 全部；MySQL 的 sqlx::Any 回落路径） | 该值改存 text，或确保走 `BIGINT UNSIGNED` 的 typed 直连（`mysql://` DSN + 插件） |
-| ``db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `cast(x as char) as x`); see docs/numeric-limits.md §4.3``（v0.1.24） | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`select cast(x as char) as x from t`；避免 `select *` |
+| ``db(mysql): column 'x' has MySQL type 'GEOMETRY' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `ST_AsText(x) as x`); see docs/devkit/db-guide.md §10.6``（v0.1.24；v0.1.94 收窄到**剩余**类型） | MySQL 读侧**仍未支持**的列类型（`GEOMETRY` 家族、`SET` 等）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`cast(x as char) as x` / `ST_AsText(x) as x`；避免 `select *`。`DECIMAL`/时间/`JSON`/`BIT` 自 v0.1.94 起可直接读（见 §10.6） |
+| ``db(postgres): column 'x' has type 'POINT' … see docs/devkit/db-guide.md §10.6``（v0.1.94） | PG 读侧**仍未支持**的类型（`timetz`、`bit`/`varbit`、范围、几何、复合、多维数组） | `cast(x as text) as x`；`numeric`/时间/`json(b)`/`uuid`/一维数组自 v0.1.94 起可直接读 |
+| PG `numeric` 读回 `12.3`（不是 `"12.30"`）；MySQL 读回 `"12.30"` | PG 侧统一 `normalized()` 去尾零（sqlx 解 numeric 会丢服务端 dscale，不规范化会出 `1.5000` 假精度）；MySQL 的标度来自协议文本 | 数值精确、不经 f64；要固定小数位在 SQL 里 `to_char(n,'FM999999990.00')` |
+| PG `42804 column "n" is of type numeric but expression is of type text` | v0.1.94 新支持的类型（`numeric`/时间/`jsonb`/`uuid`/数组）**只读**，写侧无对称编码 | 回写须显式转换：`values (?::numeric)`、`?::jsonb`、`?::uuid`、`?::int4[]` |
 | MySQL `BOOLEAN` 读出是 `1`/`0` | `BOOLEAN` 即 `TINYINT(1)`，协议层无长度元数据可区分 | 按整数读；需要布尔语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | `<site>: nested select too deep`（site ∈ `subquery`/`exists`/`union`/`cte`/`fromSelect`） | 嵌套 > 3 层（depth ≥ 4） | 减层或拆 CTE |
 | `nested select does not accept with/unions (v1)` | 子查询/union 成员带了 with/unions | 移到顶层 |

@@ -16,6 +16,139 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.95（未打标签）
+
+**dbx Web 对齐 · L7（U-4 跨请求事务）**：新增 `db.session` —— 把事务从「一个请求」提升为
+**进程内按 id 路由**的会话，多步表单 / 审批 / 批量导入确认不必挤进一个 handler。设计文档
+`docs/plans/2026-10-28-dbx-web-l7-u4-cross-request-tx.md`（含四路评审 30 项处置表）。
+**不改 ABI_VERSION**（纯 host 侧 + JS 全局），插件无需重建。
+
+### feat(db)
+
+- **`db.session`（跨请求事务会话）**：13 个方法 —— `begin(name?)` / `attach(id)` / `detach()` /
+  `query(id, sql, params?)` / `exec(id, sql, params?)` / `commit(id)` / `rollback(id)` /
+  `close(id)`（幂等收尾）/ `touch(id)`（只推空闲计时）/ `closeAll()` / `list()` / `info(id)` /
+  `stats()`。`begin` 返回 `tx_<4hex boot>_<32hex>` **id**（不是句柄，走不了端口）；`attach(id)`
+  之后 `db.query` / `db.exec` / `db.table()` 构造器 / `nextSeq` / `listTables` 与三个内省 op
+  **全部**落到那条连接与那个事务上（复用既有 `Target::Tx` 分支，占位符改写 / 追踪 / 行数上限
+  与 `db.tx` 逐项一致）。会话表挂在**进程级** `StableState`（`TxSessionRegistry`），因此
+  **跨热更存活**；`db_session` 段改动归 `restart_pending`。
+- **三道门**：`db_session.enabled` + `allow`（四维并集，**每个 op 重判** → 撤权即时生效）、
+  既有 `db_access` 逐语句授权与风险分类、`require_identity`（默认 true，无 user/tenant 拒建）。
+  **默认关**：不配这段等于能力不存在，`begin` 直接报错点名怎么开。
+- **生命周期**：空闲 `idle_timeout_secs`（默认 300）/ 总寿命 `max_lifetime_secs`（默认 1800）
+  到期 → reaper 先 `ROLLBACK`（5s 上限）再判死并摘表，日志 `DB_SESSION_TIMEOUT`；绑定会话的
+  语句按剩余寿命 `timeout`，到点判死（连接状态不可信、不归还）；`db.client.delete` /
+  `reRegister` 判死该别名全部会话（`DB_SESSION_DISCARD`）；**没有任何自动提交路径**。
+- **容量与并发**：`max_sessions`（32）/ `max_per_owner`（8）双上限，先占位再建连（防并发超额）；
+  满了**拒绝新会话，绝不驱逐他人会话**；同一 id 的并发 op 由 `tokio::sync::Mutex` 串行排队。
+- **观测**：单一 `emit()` 出口（`DB_SESSION_TIMEOUT` / `DB_SESSION_TIMEOUT_ROLLBACK_FAILED` /
+  `DB_SESSION_DISCARD` / `DB_SESSION_CLOSE_ERR`，带 tenant/user/alias/id 前缀/ops/age_ms），
+  `stats()` 给 `active/maxSessions/timedOut/discarded/rejected/boot`。
+- **共用件** `src/bridge/handle_core.rs`：`Owner` / `new_id` / `id_is_wellformed` / `id_prefix` /
+  `expires_in` / `expired_reason` —— U-5（execution-id 取消）可直接复用，不建泛型表。
+
+### fix(db)
+
+- **sqlite 错误文案被脱敏成 `"***"`**（自 U-8 起）：`accessor_sqlx.rs` 对**每条**错误文本调
+  `secret::redact`，而 `redact` 对「不含 `://` 的串」一律返回 `***` —— 所有 sqlite 报错退化成
+  `***`（跨请求会话的用例因此全红才暴露）。现改为 `redact_msg`：**只有文本里真的出现凭据 URL**
+  时才替换凭据段，其余原样保留。
+
+### docs
+
+- `db-guide.md` 新增 **§4.5 跨请求事务**（三步向导、最小配置、装配期 fail-loud、13 行方法表、
+  六条硬规则、生命周期、sqlite 1 连接现实）；`api-manual.md` §6 db 指针段与 §11 指针、§13 限制表
+  新增 3 行、排障表新增 7 行；`scenarios.md` 新增**场景 49**（三步向导 + 常见坑）；
+  `SKILL.md` 陷阱速查新增 6 行；`devkit/README.md` 新增 v0.1.95 段并同步文件职责表；
+  `docs/api/06-db.md` 增方法行 + 「跨请求事务」小节；`docs/plugins/plugin-development.md`
+  新增 **§15.7**（事务可能跨请求存活：`TxSession: Send` / 不捕获请求级身份 / 收尾可能永不到来 /
+  不自行发事务控制语句 / 语句要能被打断）。
+
+### 装配期 fail-loud（拒启）
+
+`enabled: true` 但 `allow` 四维全空（拒绝开放无授权名额）；`max_sessions` / `max_per_owner` 为 0；
+`max_per_owner > max_sessions`；`idle_timeout_secs` 为 0；`max_lifetime_secs < idle_timeout_secs`。
+sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占该别名）。
+
+### 待做（诚实登记）
+
+- 语句**不可中断**：寿命到达只判死会话、不声称能中止后端正在跑的语句（U-5 execution-id 取消
+  仍未实现）；reaper 对正在持锁的会话只跳过（`try_lock`），靠语句侧的硬截止兜底。
+
+### 测试
+
+`src/bridge/db_session.rs` 15 用例（临时文件库跑 `Bridge::run`，一 run = 一请求）+
+`src/bridge/handle_core.rs` 5 用例：跨请求可见性（只有 commit 才对外可见）、rollback + tombstone、
+请求边界不回收、默认关闭、`allow` 逐 op 重判、`require_identity`、未知/他人/畸形 id **同一文案**
+（断言完整 id 不出现在错误里）、容量上限、事务控制与会话状态语句 7 条全拒、与 `db.tx` 双向互斥、
+跨别名拒绝、`discard_alias`、空闲过期 + 回滚、`close` 幂等 + `stats`、`touch` 报剩余寿命。
+
+## v0.1.94（未打标签）
+
+> 与 v0.1.95 **同批提交**：两期改动在同一工作树里，且文档文件（api-manual / db-guide /
+> scenarios / SKILL）两期的编辑交织不可切分，故未单独切出 v0.1.94 发布点；
+> `oj/Cargo.toml` 直接记 0.1.95。版本分界以 0.1.95 那次提交为准。
+
+**dbx Web 对齐 · L6（U-6 插件侧方言解码）**：`oj-db-mysql` / `oj-db-postgres` 补齐读侧受限类型，
+并修掉一个**静默错值**与一处**同列两结论**的分叉。设计文档
+`docs/plans/2026-10-28-dbx-web-l6-u6-dialect-decode.md`（含四路评审处置表）。**不改 ABI_VERSION**
+（纯插件内部 + 文档；`oj-plugin-ffi` 未动），但**两个插件须与本版同批重建**（各自 0.1.2 → 0.1.3）。
+
+### feat(db)
+
+- **U-6 mysql 读侧补齐**（`oj-db-mysql` 0.1.3）：`DECIMAL`/`NEWDECIMAL` → **十进制字符串**
+  （不经 f64，保精度）；`DATE`/`TIME`/`DATETIME` → ISO 8601（`TIMESTAMP` 是 UTC 语义 → 带 `Z`）；
+  `YEAR` → number；`JSON` → **JSON 文本**（不自动 `JSON.parse`）；`BIT(n)` → **位串**
+  （`b'10101'` → `"10101"`）。分派点在既有六条探测链**之后**，不改任何既有列的判定顺序。
+  仍未覆盖的（`GEOMETRY` 家族、`SET` 等）继续响亮报错，文案加 `ST_AsText(x)` / `cast(x as char)`
+  可执行提示与 `docs/devkit/db-guide.md §10.6` 锚点。
+- **U-6 postgres 读侧补齐**（`oj-db-postgres` 0.1.3）：`numeric` → **十进制字符串**；`date`/`time`/
+  `timestamp`/`timestamptz` → ISO 8601（后者带 `Z`）；`json`/`jsonb` → JSON 文本；`uuid` → 规范文本；
+  **一维数组** → JSON 数组（白名单 19 个元素类型，元素 `NULL` → `null`，用 `Vec<Option<T>>` 解码）；
+  `float4` → number（4 字节，`1.1::real` 读回 `1.100000023841858`，不做舍入粉饰）。
+  仍未覆盖的（`timetz`、`bit`/`varbit`、范围、几何、复合、多维数组）响亮报错。
+- **`oj-db-postgres` 池 typed 化**：`query`/`exec`/`tx_*` 由 `Pool<Any>` 改为 `Pool<Postgres>`，
+  `Tx` 改为 `TxInner` 双路枚举（与 `oj-db-mysql` 的 `Pooled` 同构）；`sqlx` 增 `chrono`/
+  `bigdecimal`/`uuid` feature。**为什么必须改**：`sqlx::Any` 只实现 `bool/i16/i32/i64/f32/f64/
+  String/Vec<u8>` 的解码（`sqlx-core/src/any/types/`），上面这些类型在 Any 上取不出——只修
+  `column_json_pg` 会得到「`db.stream` 能读、`db.query` 报错」的**同列两结论**分叉。
+
+### fix(db)
+
+- **MySQL `BIT(n>1)` 静默错值**（自 typed 化起长期存在）：`bool::compatible` 无条件包含
+  `ColumnType::Bit`、UNSIGNED 的 `u64::compatible` 也含 `Bit`/`Year`，探测链把 `BIT(5)` 读成
+  `true` 或数字。现按**类型名**在探测链之前短路（`YEAR` 同理：`int.rs` 没有 Year 分支）。
+  真库用例 `real_mysql_dialect_types_decode_readable` 钉死位串输出。
+- **PG `numeric` 标度假精度**：sqlx 的 `TryFrom<&PgNumeric> for BigDecimal` 丢弃服务端 dscale，
+  把标度硬算成 4 的倍数（`sqlx-postgres/src/types/bigdecimal.rs`）——`1.5` 会读成 `1.5000`。
+  统一 `normalized()` 去尾零（值精确、不动有效位）。MySQL 的 `DECIMAL` 由协议文本解析，标度
+  是服务端给的，**原样保留**（`12.30` 仍是 `"12.30"`）——两方言的口径差异已写进文档。
+- **错误串标识符消毒**：两个插件的列名进错误文案前过滤控制字符并截断到 64 字符
+  （日志注入面），补离线用例钉住（含多字节列名不得误加省略号）。
+
+### docs
+
+- `db-guide.md` §10.6 重写「读侧值契约」与「三方言读侧边界」两表（新增 12 行类型 + 「只读」
+  红线 + PG 去尾零成因）；`api-manual.md` §6 db 读侧边界段与 §13 限制表同步；`SKILL.md`
+  陷阱速查换 3 行（GEOMETRY 仍报错 / PG 去尾零 / `42804` 写回须 `::type`）；`scenarios.md`
+  新增**场景 48**（读写范式 + `JSON.parse` + `select *` 陷阱）；`plugin-development.md` §15.6
+  验收清单新增「扩展类型三路径逐值一致」与「`sqlx::Any` 解不出就池 typed 化」两条；
+  `numeric-limits.md` §4 第 10 项扩写 + 新增第 11 项（PG 边界）。
+
+### 测试与挂账
+
+- mysql：`real_mysql_dialect_types_decode_readable`（宽表 `query` + `stream` 双路径）、
+  `real_mysql_unsupported_column_types_error_loudly`（收窄到 GEOMETRY，钉 `ST_AsText` 提示）、
+  `given_hostile_column_name_when_safe_ident_then_control_chars_stripped`。本机已用
+  macOS `container` 起 `mysql:8.4` 实跑 **17/17 全绿**。
+- pg：`real_pg_dialect_types_decode_readable`（`query` + `stream` + `tx_query` 三路径逐值一致）、
+  `real_postgres_unsupported_column_types_error_loudly`（改钉 `point`）、
+  `given_padded_scale_when_decimal_text_then_trailing_zeros_stripped`、
+  `given_hostile_column_name_when_safe_ident_...`。本机 `postgres:16-alpine` 实跑 **19/19 全绿**。
+- **CI 挂账**：上述真库用例 env-gated（`OJ_TEST_MYSQL` / `OJ_TEST_PG`），CI 无 service →
+  未设环境变量时**静默 skip（skip-as-pass）**，故 CI 绿不代表这两种方言的行形状被覆盖。
+
 ## v0.1.93（未打标签）
 
 **dbx Web 对齐 · L5（P0 主旅程）**：U-8（sqlite 错误信封化）、U-6（读侧解码扩展）、U-1（动态授权运行期生效 + 热更分类）、U-3（跨 isolate 失效广播）。设计文档 `docs/plans/2026-10-28-dbx-web-l5-p0-main-journey.md`（含四路评审 16 项处置）。**不改 ABI_VERSION**（纯 host 侧 + JS 全局）。

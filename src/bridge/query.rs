@@ -2273,11 +2273,28 @@ pub async fn op_db_query_build(
     let route = exec_route(req.verb, req.returning.is_empty(), dialect);
     let err = |e: Box<dyn std::error::Error + Send + Sync>| super::db::to_js_err(e);
 
-    // 活跃事务路由：本库 tx 会话 / 无 tx 池 / 他库 tx 报错（同 db.rs）。
+    // 活跃事务路由：会话（跨请求事务）/ 本库 tx / 无 tx 池 / 他库 tx 报错（同 db.rs）。
     let target = super::db::resolve_target(&state, &req.db)?;
     let ex = match &target {
         super::db::Target::Pool(da) => Exec::Pool(da),
-        super::db::Target::Tx(t) => Exec::Tx(t.session.lock().await),
+        super::db::Target::Tx(t) => {
+            // 会话有寿命：等锁也要封顶（长查询会把锁占到过期之后）。查询本身不另设超时
+            // ——与 `db.tx` 同口径（sqlx 无语句级取消，强杀会把连接留在未知状态）。
+            let guard = match super::db_session::attached_deadline(&state) {
+                Some(left) => match tokio::time::timeout(left, t.session.lock()).await {
+                    Ok(g) => g,
+                    Err(_) => {
+                        super::db_session::kill_attached(&state, "lifetime_exceeded");
+                        return Err(JsErrorBox::generic(
+                            "db session lifetime exhausted while waiting for the connection; \
+                             the session was discarded (transaction rolled back)",
+                        ));
+                    }
+                },
+                None => t.session.lock().await,
+            };
+            Exec::Tx(guard)
+        }
     };
     let in_tx = matches!(&target, super::db::Target::Tx(_));
     let db_name = req.db.clone();

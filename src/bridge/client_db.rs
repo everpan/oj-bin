@@ -359,6 +359,9 @@ pub async fn op_db_client_delete(
     let st = state.borrow().borrow::<Arc<StableState>>().clone();
     let removed = st.client_dbs.remove(&name);
     if removed {
+        // 跨请求事务会话（L7）：别名已消失，其上的会话必须当场判死（回滚在后台/下次
+        // 触碰时完成）——绝不允许继续在一条「已注销」的连接上写。
+        st.tx_sessions.discard_alias(&name);
         audit(&state, "delete", &name, "");
     }
     Ok(removed)
@@ -409,6 +412,9 @@ pub async fn op_db_client_re_register(
     st.client_dbs
         .re_register(&name, entry)
         .map_err(JsErrorBox::generic)?;
+    // 跨请求事务会话（L7）：连接已被换掉，旧连接上的在写事务必须失效（否则「提交了
+    // 但写的是旧库」）。登记成功后再判死，避免 connect 失败白白回滚用户会话。
+    st.tx_sessions.discard_alias(&name);
     audit(&state, "reRegister", &name, &dialect);
     let e = st.client_dbs.get(&name).unwrap();
     Ok(e.summary(&name))

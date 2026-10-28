@@ -1411,6 +1411,12 @@ pub struct Config {
     /// 见 `docs/plans/2026-10-28-db-client-axis-l3.md`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_client: crate::bridge::db_policy::DbClientSection,
+    /// 跨请求事务会话（L7，v0.1.95，`db_session:` 段）：把事务提升为宿主级、按 id 路由的
+    /// 会话，让多步向导跨请求完成。`enabled` 默认 false（fail-closed：长事务占连接、放大
+    /// 脏读窗口）；`allow` 复用 db_access 的四维放行表作为会话门。
+    /// 见 `docs/plans/2026-10-28-dbx-web-l7-u4-cross-request-tx.md`。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_session: crate::bridge::db_policy::DbSessionSection,
     /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_trace: SqlTraceCfg,
@@ -1461,6 +1467,7 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
         "platform",
         "db_access",
         "db_client",
+        "db_session",
     ]
 }
 
@@ -1744,9 +1751,9 @@ cache:
             keys.iter().collect::<std::collections::HashSet<_>>().len()
         );
         for k in keys {
-            // `db_access` / `db_client` 是 mapping 类型（不接受 null），其余已知段用
-            // `null` 探测即可（取默认值且不落入 extra）。
-            let yaml = if *k == "db_access" || *k == "db_client" {
+            // `db_access` / `db_client` / `db_session` 是 mapping 类型（不接受 null），
+            // 其余已知段用 `null` 探测即可（取默认值且不落入 extra）。
+            let yaml = if *k == "db_access" || *k == "db_client" || *k == "db_session" {
                 format!("{k}: {{}}\n")
             } else {
                 format!("{k}: null\n")

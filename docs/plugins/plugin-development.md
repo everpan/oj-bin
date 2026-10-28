@@ -607,9 +607,47 @@ triple 构建它（Go 工具链进构建矩阵是 M2 入口项）。
 - [ ] 错误信封：六类各一条真实错误 → category/retryable/disposition/vendor_code 断言
 - [ ] 未知厂商码 → internal + vendor_code 原样透传（禁止猜）
 - [ ] 值映射：六类 schema 类型建表 + 读回契约（超精度 → 十进制串、ISO 8601、blob 约定）
-- [ ] 读侧未识别列类型**报错**而非静默 null（点名列名 + 类型 + cast 指引）
+- [ ] 读侧扩展类型（v0.1.94 口径，可选但**建议**）：`DECIMAL`/`NUMERIC`、`DATE`/`TIME`/
+      `DATETIME`/`TIMESTAMP`(±TZ)、`JSON`/`JSONB`、`BIT`、`UUID`、一维数组——每个类型
+      **query / stream / tx 三条路径逐值一致**（同一 `row_to_json` 实现是唯一可靠做法；
+      分头实现会出现「流式能读、查询报错」）
+- [ ] 若走 `sqlx::Any`：确认它**解得出**你要声明的类型（`Any` 只实现 bool/i16/i32/i64/f32/
+      f64/String/Vec<u8> 的解码，`NUMERIC`/`JSON`/`UUID`/数组一律取不出）——取不出就把
+      池 typed 化（参照 `oj-db-postgres` 的 `Pooled` / `TxInner` 双路枚举），别只修行转换函数
+- [ ] 读侧未识别列类型**报错**而非静默 null（点名列名 + 类型 + cast 指引 + 文档锚点）
 - [ ] 未知方言六门控点（构造器 / exec_route / 占位符 / listTables / nextSeq / search.*）→ `OJ_DB_UNSUPPORTED`
 - [ ] 裸 SQL 四条路径（query/exec/stream/tx）在该方言上全量可用
 - [ ] sidecar（若有）：五条生命周期契约 + `kill` 用例（daemon/容器各一）
 - [ ] 发布：`cargo xtask build` 后锁与指纹一致，启动横幅 caps 正确
+```
+
+### 15.7 事务可能**跨请求**存活（v0.1.95 起的额外契约）
+
+宿主在 v0.1.95 引入 `db.session`（跨请求事务，见 `docs/devkit/db-guide.md` §4.5）：`tx_begin`
+返回的事务不再是「请求结束就收尾」的短命对象，而是挂在**进程级注册表**里、按 id 路由的
+长事务，寿命由 `db_session.idle_timeout_secs` / `max_lifetime_secs` 约束（默认 300s / 1800s，
+上限内可能空转很久）。插件侧因此多五条要求：
+
+1. **`TxSession: Send`**（宿主契约本就如此，`ActiveTx` 用 `tokio::sync::Mutex<Box<dyn TxSession>>`
+   装它并挂在 `StableState` 上）。不要把 `!Send` 的句柄（裸 `Rc`、`RefCell`、线程绑定游标）
+   塞进事务对象——单请求事务下侥幸不炸，跨请求一定炸。
+2. **不得把请求级身份烧进事务对象**：`tx_begin` 时捕获的 tenant / user / module / `ReqState` /
+   trace span 在后续请求里全是**错的**（甚至属于别人）。判权一律由宿主在每个 op 重判
+   （`db_session.allow` + `db_access` + `require_identity`）；插件只负责「按 SQL 干活」。
+   需要审计维度就从宿主传入的参数取，不要自己缓存「谁开的」。
+3. **`tx_commit` / `tx_rollback` 可能与 `tx_begin` 不在同一个请求、同一个 isolate、同一个线程**：
+   别依赖调用栈连续、别在事务对象上挂 `LocalSet` 任务或「等着被同一请求取走」的 channel。
+4. **收尾可能永远不会到来**：超时判定后宿主先 `rollback` 再**丢弃**（判死，连接不归还）；
+   进程崩溃则连 rollback 都没有。所以① 连接/事务的 `Drop` 必须安全（断开即可，别留后台任务
+   持有它）；② 依赖服务端的事务/空闲超时做最后兜底；③ 别在插件里做「跨语句累积状态」
+   假设（如自己维护 SAVEPOINT 栈）——宿主已在会话内**禁止** `BEGIN`/`COMMIT`/`ROLLBACK`/
+   `SAVEPOINT`/`RELEASE`/`START`/`SET`/`USE`/`ATTACH`/`DETACH`/`PRAGMA`（MySQL 隐式提交会让
+   回滚变假回滚），插件也不要偷偷补发这些语句。
+5. **`tx_query`/`tx_exec` 要能被打断**：宿主对绑定会话的语句施加寿命上限（到点即判死事务），
+   故单次调用不要做无界重试、不要自行 sleep 退避到超时之后——重试策略留在业务层。
+
+自查补一条（接在 15.6 清单末尾）：
+
+```markdown
+- [ ] 事务跨请求：`TxSession: Send`；无请求级身份/`!Send` 句柄被捕获；`Drop` 安全；不自行发事务控制语句
 ```

@@ -293,6 +293,60 @@ pub struct DbClientSection {
     pub allow: AllowList,
 }
 
+/// 跨请求事务配置段（`db_session:`，U-4 v0.1.95）。
+///
+/// `enabled` 默认 **false**（fail-closed，零行为变化）：跨请求事务会**长期占住一条连接**，
+/// 且期间持有行锁——比单次查询更强的特权面，必须显式开启。
+///
+/// 三道门（缺一不可）：
+/// 1. `enabled` + `allow`（本段）：谁能开/续用会话（AllowList 四维并集，与 `db_client` 同形）；
+/// 2. `db_access`（每语句）：会话里每条语句仍过授权 + 风险分类，`read_only` 库写不进去；
+/// 3. `require_identity`：无 `user.id` 且无 tenant 时拒建（匿名部署滥用面）。
+///
+/// 装配期 fail-loud 约束（`oj/src/app.rs`）：`enabled=true` 且 `allow` 四维全缺 → 拒启动；
+/// `max_sessions` / `max_per_owner` 为 0 或 `max_per_owner > max_sessions` → 拒启动；
+/// `idle_timeout_secs == 0` 或 `idle > max_lifetime` → 拒启动。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DbSessionSection {
+    pub enabled: bool,
+    /// per-process 会话硬上限（每会话占一条连接）。
+    pub max_sessions: usize,
+    /// 单主体（tenant+user）上限：防单主体占满全局额度饿死他人。
+    pub max_per_owner: usize,
+    /// 滑动空闲超时（每次成功 op / `touch` 续期）。
+    pub idle_timeout_secs: u64,
+    /// 绝对寿命（从 begin 起算，不可续）。到期强制回收。
+    pub max_lifetime_secs: u64,
+    /// 无 `user.id` 且无 tenant 时拒建（本地开发/`oj test` 显式置 false）。
+    pub require_identity: bool,
+    /// 会话操作授权门。
+    pub allow: AllowList,
+}
+
+impl Default for DbSessionSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions: 32,
+            max_per_owner: 8,
+            idle_timeout_secs: 300,
+            max_lifetime_secs: 1800,
+            require_identity: true,
+            allow: AllowList::default(),
+        }
+    }
+}
+
+impl DbSessionSection {
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_timeout_secs.max(1))
+    }
+    pub fn max_lifetime(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_lifetime_secs.max(1))
+    }
+}
+
 impl<'de> Deserialize<'de> for Enforce {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -812,7 +866,13 @@ pub(crate) fn policy_for_state(st: &StableState, alias: &str) -> DbAccess {
 pub(crate) fn identity(
     state: &Rc<RefCell<OpState>>,
 ) -> (Option<String>, Vec<String>, Option<String>, &'static str) {
-    let g = state.borrow();
+    identity_of(&state.borrow())
+}
+
+/// [`identity`] 的 `&OpState` 版本（同步辅助函数复用；不构造 `Rc` 视图）。
+pub(crate) fn identity_of(
+    g: &OpState,
+) -> (Option<String>, Vec<String>, Option<String>, &'static str) {
     let st = g.borrow::<Arc<StableState>>();
     let rs = g.borrow::<ReqState>();
     let roles = rs

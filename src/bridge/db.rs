@@ -305,7 +305,7 @@ pub(crate) fn current_tx(state: &Rc<RefCell<OpState>>) -> Option<Arc<ActiveTx>> 
     state.borrow().borrow::<super::ReqState>().tx.clone()
 }
 
-/// 查询/执行的目标：本库活跃事务 → 会话；他库活跃事务 → 报错；无 → 池。
+/// 查询/执行的目标：会话（跨请求事务）→ 本库活跃事务 → 池。
 pub(crate) enum Target {
     Tx(Arc<ActiveTx>),
     Pool(Arc<dyn DataAccessor>),
@@ -315,6 +315,11 @@ pub(crate) fn resolve_target(
     state: &Rc<RefCell<OpState>>,
     name: &str,
 ) -> Result<Target, JsErrorBox> {
+    // 跨请求事务会话优先：一旦 attach，本请求所有裸 SQL 与构造器都必须落在同一条连接上
+    // （否则「会话里读到的是别的连接」＝静默错误）。会话与 db.tx 互斥（begin/attach 双向拒绝）。
+    if let Some(t) = super::db_session::attached_target(state, name)? {
+        return Ok(Target::Tx(t));
+    }
     if let Some(t) = current_tx(state) {
         if t.db == name {
             return Ok(Target::Tx(t));
@@ -325,6 +330,31 @@ pub(crate) fn resolve_target(
         )));
     }
     Ok(Target::Pool(super::query::lookup(state, name)?))
+}
+
+/// 在事务/会话上跑一次调用，并按**会话剩余寿命**封顶（无会话绑定 = 无额外超时）。
+///
+/// 为什么需要：后台回收器只用 `try_lock` 跳过「正在跑」的会话（绝不阻塞运行时），
+/// 于是长查询会让过期回收永远够不着它——必须由在飞侧自己按剩余寿命判死（评审 S5）。
+/// 命中超时即判死会话：连接状态不可知，不再复用（宁可让调用方重开）。
+async fn on_tx<T, F>(state: &Rc<RefCell<OpState>>, what: &str, f: F) -> BridgeResult<T>
+where
+    F: std::future::Future<Output = BridgeResult<T>>,
+{
+    match super::db_session::attached_deadline(state) {
+        Some(left) => match tokio::time::timeout(left, f).await {
+            Ok(r) => r,
+            Err(_) => {
+                super::db_session::kill_attached(state, "lifetime_exceeded");
+                Err(format!(
+                    "db session lifetime exhausted during {what}; the session was discarded \
+                     (transaction rolled back)"
+                )
+                .into())
+            }
+        },
+        None => f.await,
+    }
 }
 
 /// 占位符统一改写（0.1.67，design docs/plans/2026-10-13-unified-db-placeholder-design.md）：
@@ -421,6 +451,11 @@ pub async fn op_db_tx_begin(
     if current_tx(&state).is_some() {
         return Err(JsErrorBox::generic(
             "transaction already active (nested tx not supported)",
+        ));
+    }
+    if state.borrow().borrow::<super::ReqState>().session.is_some() {
+        return Err(JsErrorBox::generic(
+            "a db session is attached to this request; db.tx cannot nest inside it (detach first)",
         ));
     }
     let da = super::query::lookup(&state, &name)?;
@@ -548,7 +583,21 @@ pub async fn op_db_query(
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<Vec<Row>, JsErrorBox> {
-    let params = params.unwrap_or_default();
+    query_impl(state, name, sql, params.unwrap_or_default()).await
+}
+
+/// `db.query` 的实体：`op_db_query` 与跨请求会话的显式形态 `db.session.query(id, …)`
+/// 共用同一条通路（守卫/授权/占位符改写/追踪/行数整形一处生效，不复制）。
+///
+/// 绑定会话时额外做两件事（评审 S1/S5）：会话内语句禁令（`BEGIN`/`SET` 等会隐式提交，
+/// 制造假回滚）；按会话剩余寿命给在飞查询封顶。
+pub(crate) async fn query_impl(
+    state: Rc<RefCell<OpState>>,
+    name: String,
+    sql: String,
+    params: Vec<Value>,
+) -> Result<Vec<Row>, JsErrorBox> {
+    super::db_session::forbid_in_session(&state, &sql)?;
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
     // db 访问控制（v0.1.89）：授权 → 风险分类 → 策略位；返回本库生效的行数上限。
@@ -565,7 +614,12 @@ pub async fn op_db_query(
     let start = std::time::Instant::now();
     let res: BridgeResult<Vec<Row>> = match target {
         Target::Pool(da) => da.query_with_params(&norm, &params).await,
-        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
+        Target::Tx(t) => {
+            on_tx(&state, "query", async {
+                t.session.lock().await.query(&norm, &params).await
+            })
+            .await
+        }
     };
     let (cat, retry) = err_meta(&res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -687,7 +741,17 @@ pub async fn op_db_exec(
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<i64, JsErrorBox> {
-    let params = params.unwrap_or_default();
+    exec_impl(state, name, sql, params.unwrap_or_default()).await
+}
+
+/// `db.exec` 的实体（与 `db.session.exec` 共用；理由同 [`query_impl`]）。
+pub(crate) async fn exec_impl(
+    state: Rc<RefCell<OpState>>,
+    name: String,
+    sql: String,
+    params: Vec<Value>,
+) -> Result<i64, JsErrorBox> {
+    super::db_session::forbid_in_session(&state, &sql)?;
     // 裸 SQL 路径（query/exec/stream）对开放方言**全量可用**，不做 known 子集门控
     // （设计 §5.5：门控只覆盖 builder / exec_route / list_tables / nextSeq /
     // search.* / CLI 六处）——方言知识只体现在占位符能力位。
@@ -707,7 +771,12 @@ pub async fn op_db_exec(
     let start = std::time::Instant::now();
     let res: BridgeResult<i64> = match target {
         Target::Pool(da) => da.exec_with_params(&norm, &params).await,
-        Target::Tx(t) => t.session.lock().await.exec(&norm, &params).await,
+        Target::Tx(t) => {
+            on_tx(&state, "exec", async {
+                t.session.lock().await.exec(&norm, &params).await
+            })
+            .await
+        }
     };
     let (cat, retry) = err_meta(&res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;

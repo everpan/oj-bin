@@ -1,6 +1,6 @@
 [package]
 name = "oj-db-mysql"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "db 轴 mysql cdylib 插件：sqlx Any 单方言（mysql）迁移自 core SqlxAccessor"
 
@@ -18,6 +18,10 @@ sqlx = { version = "0.9", default-features = false, features = [
     "any",
     "mysql",
     "json",
+    # v0.1.3（L6 / U-6）：读侧受限类型解码——DECIMAL/numeric → 十进制字符串、
+    # 日期时间 → ISO 8601。`bigdecimal` 同时引入 num-bigint/num-traits。
+    "chrono",
+    "bigdecimal",
     # MySQL 8 默认 caching_sha2_password：明文连接要用 RSA 公钥交换换密码，
     # 没有这个 feature 连不上（报 "RSA auth backend disabled"）。
     "mysql-rsa",

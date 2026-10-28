@@ -16,9 +16,12 @@ use oj_plugin_ffi::{
 };
 use sqlx::any::{Any, AnyArguments, AnyRow};
 use sqlx::error::ErrorKind;
-use sqlx::mysql::{MySql, MySqlArguments, MySqlConnection, MySqlRow};
+use sqlx::mysql::{MySql, MySqlArguments, MySqlColumn, MySqlConnection, MySqlRow};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
+use sqlx::types::BigDecimal;
+use sqlx::types::Json;
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::{Column, Connection as _, Row, TypeInfo};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -177,6 +180,29 @@ fn bind_value_mysql<'q>(
     }
 }
 
+/// 错误文案里的标识符消毒（v0.1.3 / L6 安全评审）：过滤控制字符（防日志注入）并截断。
+fn safe_ident(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::new();
+    let mut n = 0usize;
+    let mut truncated = false;
+    for c in s.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if n == MAX {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+        n += 1;
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
 /// 单行 MySqlRow -> serde_json::Value（typed 路径）。
 ///
 /// 出现**本插件还不会解码的列类型**时**响亮报错**（`Err`），绝不落成静默 `null`：
@@ -185,13 +211,18 @@ fn bind_value_mysql<'q>(
 fn row_to_json_mysql(row: &MySqlRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
-        let name = col.name().to_string();
-        let val = column_json_mysql(row, col.ordinal()).ok_or_else(|| {
+        let name = safe_ident(col.name());
+        let ty = col.type_info().name();
+        let val = column_json_mysql(row, col).ok_or_else(|| {
+            let hint = if matches!(ty, "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON") {
+                format!("`ST_AsText({name}) as {name}`")
+            } else {
+                format!("`cast({name} as char) as {name}`")
+            };
             format!(
-                "db(mysql): column '{name}' has MySQL type '{}' which this plugin does not \
-                 decode yet — select explicit columns and cast it in SQL (e.g. \
-                 `cast({name} as char) as {name}`); see docs/numeric-limits.md §4.3",
-                col.type_info().name()
+                "db(mysql): column '{name}' has MySQL type '{ty}' which this plugin does not \
+                 decode yet — select explicit columns and cast it in SQL (e.g. {hint}); \
+                 see docs/devkit/db-guide.md §10.6"
             )
         })?;
         obj.insert(name, val);
@@ -200,9 +231,12 @@ fn row_to_json_mysql(row: &MySqlRow) -> Result<serde_json::Value, String> {
 }
 
 /// 逐列按**固定的安全顺序**探测（typed 路径）：
-/// `u64 → i64 → bool → f64 → String → Vec<u8>`。
+/// `BIT/YEAR 类型名短路 → u64 → i64 → bool → f64 → String → Vec<u8> → 受限类型分派`。
 ///
 /// 顺序为什么是安全的（Any 侧做不到这一点）：
+/// - `BIT` / `YEAR` 必须最先按**类型名**短路：`bool::compatible` 无条件包含
+///   `ColumnType::Bit`、`u64::compatible` 在 UNSIGNED 时也含 `Bit`/`Year`，若走探测链
+///   `BIT(5)` 会被当成 bool/number **静默返回错值**（L6 修真，见 `CHANGELOG` v0.1.94）；
 /// - `u64::compatible` 只接受 `BIGINT UNSIGNED`（`sqlx-mysql/src/types/uint.rs`）→ 放最前，
 ///   `> i64::MAX` 的无符号值**不再回绕成负数**（Any 的 `AnyValueKind::BigInt(i64)` 会）；
 /// - `i64` 只接受非 unsigned 整数；
@@ -210,15 +244,45 @@ fn row_to_json_mysql(row: &MySqlRow) -> Result<serde_json::Value, String> {
 ///   若把它们排在整数之前，任意 BIGINT 列会被当成 bool（值 256 → `false`）——这是必须避免的
 ///   静默错值，也正是本函数不能沿用「`if let Ok` 盲探测」的原因。
 ///
-/// 两条**能力边界**（真库用例 `real_mysql_unsupported_column_types_error_loudly` 钉住）：
+/// 能力边界（真库用例 `real_mysql_unsupported_column_types_error_loudly` 钉住）：
 /// - `bool` 分支实际上**不可达**（`bool::compatible` 的整型集合是 `int_compatible` 的子集，
 ///   而 `i64` 已在前面命中）→ MySQL 的 `BOOLEAN` / `TINYINT(1)` 读出 **1/0（number）**，
 ///   不是 `true`/`false`。保留该分支是作为顺序被重排时的显式意图标记，勿删；
 /// - `String` / `Vec<u8>` 的 `compatible` 只认 `VarChar|*Blob|String|VarString|Enum`
-///   （`str` 另需非 BINARY collation）→ **`DECIMAL`/`NEWDECIMAL`/`JSON`/`DATE`/`TIME`/
-///   `DATETIME`/`TIMESTAMP`/`YEAR`/`BIT`/`GEOMETRY` 一律走到 `None` → 由调用方报错**。
+///   （`str` 另需非 BINARY collation）；
+/// - 剩下的 `DECIMAL|NEWDECIMAL|DATE|TIME|DATETIME|TIMESTAMP|JSON` 交给
+///   [`column_json_mysql_restricted`]（v0.1.3 / L6 / U-6 补齐）；
+///   **仍未覆盖**的（`GEOMETRY` 家族、`BIT` 之外的位类型、`SET` 等）返回 `None` →
+///   由调用方响亮报错，绝不静默落 `null`。
 ///   （说明：MySQL 的 `TEXT` 家族在协议里就是 `Blob` + 非 BINARY collation，故可正常读出。）
-fn column_json_mysql(row: &MySqlRow, ordinal: usize) -> Option<serde_json::Value> {
+fn column_json_mysql(row: &MySqlRow, col: &MySqlColumn) -> Option<serde_json::Value> {
+    let ordinal = col.ordinal();
+    // v0.1.3（L6 / U-6）：`BIT` / `YEAR` 必须在通用探测链**之前**按类型名短路。
+    // 原因：`bool::compatible` 无条件包含 `ColumnType::Bit`、`u64::compatible` 在 UNSIGNED
+    // 时也含 Bit —— BIT(n>1) 会被前两条探测吃掉，**静默返回 true/数字（错值）**。
+    // `YEAR` 同理：`int.rs` 没有 Year 分支，只有 UNSIGNED 的 `u16` 能匹配。
+    match col.type_info().name() {
+        "BIT" => {
+            return row
+                .try_get::<Option<u64>, _>(ordinal)
+                .ok()
+                .map(|v| match v {
+                    // 位串文本（无前导零——sqlx 不暴露 BIT 宽度）。
+                    Some(bits) => serde_json::Value::String(format!("{bits:b}")),
+                    None => serde_json::Value::Null,
+                });
+        }
+        "YEAR" => {
+            return row
+                .try_get::<Option<u16>, _>(ordinal)
+                .ok()
+                .map(|v| match v {
+                    Some(y) => serde_json::Value::from(y),
+                    None => serde_json::Value::Null,
+                });
+        }
+        _ => {}
+    }
     if let Ok(v) = row.try_get::<Option<u64>, _>(ordinal) {
         return Some(match v {
             Some(u) => serde_json::Value::from(u),
@@ -254,7 +318,64 @@ fn column_json_mysql(row: &MySqlRow, ordinal: usize) -> Option<serde_json::Value
             None => serde_json::Value::Null,
         });
     }
-    None
+    // L6（U-6）：既有六类全部落空后才进受限类型分派——不改上面任何既有列的判定顺序。
+    column_json_mysql_restricted(row, ordinal, col.type_info().name())
+}
+
+/// 受限类型分派（v0.1.3 / L6，PRD U-6）：`None` = 未覆盖 → 调用方响亮报错。
+///
+/// 输出口径见 `docs/devkit/db-guide.md` §10.6：
+/// 十进制字符串 / ISO 8601 / JSON 文本；**只读**（写侧仍须显式 cast）。
+fn column_json_mysql_restricted(
+    row: &MySqlRow,
+    ordinal: usize,
+    ty: &str,
+) -> Option<serde_json::Value> {
+    fn s(v: String) -> serde_json::Value {
+        serde_json::Value::String(v)
+    }
+    match ty {
+        "DECIMAL" | "NEWDECIMAL" => row
+            .try_get::<Option<BigDecimal>, _>(ordinal)
+            .ok()
+            .map(|v| v.map_or(serde_json::Value::Null, |d| s(d.to_string()))),
+        "DATE" => row.try_get::<Option<NaiveDate>, _>(ordinal).ok().map(|v| {
+            v.map_or(serde_json::Value::Null, |d| {
+                s(d.format("%Y-%m-%d").to_string())
+            })
+        }),
+        "TIME" => row.try_get::<Option<NaiveTime>, _>(ordinal).ok().map(|v| {
+            v.map_or(serde_json::Value::Null, |t| {
+                s(t.format("%H:%M:%S%.f").to_string())
+            })
+        }),
+        "DATETIME" => row
+            .try_get::<Option<NaiveDateTime>, _>(ordinal)
+            .ok()
+            .map(|v| {
+                v.map_or(serde_json::Value::Null, |t| {
+                    s(t.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                })
+            }),
+        // MySQL TIMESTAMP 是 UTC 语义；`NaiveDateTime::compatible` 只认 Datetime，
+        // 必须用 `DateTime<Utc>`（见 sqlx-mysql `types/chrono.rs`）。
+        "TIMESTAMP" => row
+            .try_get::<Option<DateTime<Utc>>, _>(ordinal)
+            .ok()
+            .map(|v| {
+                // 与 DATETIME 同形，仅多一个 UTC 时区后缀（`sqlx::types::chrono`
+                // 只再导出类型、不含 `SecondsFormat`，故用显式格式串而非 `to_rfc3339_opts`）。
+                v.map_or(serde_json::Value::Null, |t| {
+                    s(t.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+                })
+            }),
+        // `String` 不兼容 `ColumnType::Json`，只能走 `Json<T>`。
+        "JSON" => row
+            .try_get::<Option<Json<serde_json::Value>>, _>(ordinal)
+            .ok()
+            .map(|v| v.map_or(serde_json::Value::Null, |j| s(j.0.to_string()))),
+        _ => None,
+    }
 }
 
 /// 池的二选一（v0.1.24）：**生产 DSN（`mysql://`）走 typed**，其余（离线测试的 sqlite）走 Any。
@@ -1866,10 +1987,14 @@ mod tests {
     /// 列类型能力边界（v0.1.24，env-gated；修开发侧评审 P0）：**不会解码的列类型必须响亮报错，
     /// 不能静默 null**。
     ///
-    /// 背景：`sqlx::Any` 时代这类列（`DECIMAL`/时间/`JSON`/`BIT`…）在列转换就抛
-    /// `AnyDriverError`（`sqlx-mysql/src/any.rs` 的 `TryFrom<&MySqlTypeInfo>` 只认
-    /// Null/Short/Long/LongLong/Float/Double + str/bytes 可兼容者）。typed 化后若沿用
-    /// `unwrap_or(Null)`，就把「报错」退化成「错值」——踩本仓「静默错值不可接受」的红线。
+    /// 背景：`sqlx::Any` 时代这类列在列转换就抛 `AnyDriverError`（`sqlx-mysql/src/any.rs` 的
+    /// `TryFrom<&MySqlTypeInfo>` 只认 Null/Short/Long/LongLong/Float/Double + str/bytes
+    /// 可兼容者）。typed 化后若沿用 `unwrap_or(Null)`，就把「报错」退化成「错值」——踩本仓
+    /// 「静默错值不可接受」的红线。
+    ///
+    /// v0.1.3（L6 / U-6）分家：`DECIMAL`/`DATETIME`/`JSON` 等已能解码（见
+    /// `real_mysql_dialect_types_decode_readable`），本用例只钉**仍未覆盖**的
+    /// `GEOMETRY` 家族必须响亮报错并给出 `ST_AsText` 提示。
     ///
     /// 同时钉住**可读**的边界：`TEXT` 家族（协议里是 `Blob` + 非 BINARY collation）与
     /// `BOOLEAN`（= `TINYINT(1)`，按整数读成 1/0，不是 true/false）。
@@ -1898,14 +2023,16 @@ mod tests {
         ex("drop table if exists oj_types_t", "[]").await.unwrap();
         ex(
             "create table oj_types_t (id int primary key, amount decimal(20,4), \
-             made_at datetime, payload json, note text, flag boolean, ub bigint unsigned)",
+             made_at datetime, payload json, note text, flag boolean, ub bigint unsigned, \
+             shape geometry)",
             "[]",
         )
         .await
         .expect("create");
         ex(
-            "insert into oj_types_t values (1, 12.3456, '2026-09-19 10:00:00', \
-             '{\"a\":1}', 'hi', true, 18446744073709551615)",
+            "insert into oj_types_t (id, amount, made_at, payload, note, flag, ub, shape) values \
+             (1, 12.3456, '2026-09-19 10:00:00', '{\"a\":1}', 'hi', true, \
+             18446744073709551615, ST_GeomFromText('POINT(1 2)'))",
             "[]",
         )
         .await
@@ -1931,24 +2058,155 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
         assert_eq!(v[0]["flag"], serde_json::json!(1), "BOOLEAN 边界：{v}");
 
-        // ③ 未支持的类型必须**报错**（点名列 + 类型），绝不静默 null。
-        for (sql, needle) in [
-            ("select amount from oj_types_t", "DECIMAL"),
-            ("select made_at from oj_types_t", "DATETIME"),
-            ("select payload from oj_types_t", "JSON"),
-        ] {
-            let e = qy(sql, "[]")
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{sql} 必须报错而不是返回静默 null"));
-            assert!(
-                e.contains(needle),
-                "{sql}: 错误信息应点名 MySQL 类型 {needle}，实得 {e}"
-            );
-        }
+        // ③ 仍未覆盖的类型必须**报错**（点名列 + 类型 + 可执行提示），绝不静默 null。
+        let e = qy("select shape from oj_types_t", "[]")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("select shape 必须报错而不是返回静默 null"));
+        assert!(
+            e.contains("GEOMETRY"),
+            "错误信息应点名 MySQL 类型 GEOMETRY，实得 {e}"
+        );
+        assert!(
+            e.contains("ST_AsText(shape)"),
+            "GEOMETRY 应给出可执行的 SQL 提示，实得 {e}"
+        );
+        assert!(!e.contains('\n'), "错误串不得含裸换行（日志注入面）：{e}");
 
         ex("drop table if exists oj_types_t", "[]").await.unwrap();
         close(handle);
+    }
+
+    /// 方言类型解码（v0.1.3 / L6 / PRD U-6，env-gated 真库）：`DECIMAL` / 日期时间 /
+    /// `YEAR` / `JSON` / `BIT` 的可读性，且**`query` 与 `stream` 两条路径同口径**。
+    ///
+    /// 输出口径（`docs/devkit/db-guide.md` §10.6）：十进制走**字符串**（不经 f64，保精度）、
+    /// 日期时间走 ISO 8601（`DATETIME` 无时区，`TIMESTAMP` 带 `Z`）、`JSON` 走 **JSON 文本**、
+    /// `BIT(n)` 走**位串文本**、`YEAR` 走数字。
+    ///
+    /// 反回归重点（评审 S1）：`BIT(5)` 在 v0.1.92 及以前会被 `bool::compatible` /
+    /// `u64::compatible` 吃掉，**静默返回 true 或数字**——此处断言位串，钉死该错值路径。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_dialect_types_decode_readable() {
+        let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let ex = |sql: &str, params: &str| {
+            let mut f = exec(handle, RString::from(sql), RString::from(params));
+            async move { drive(&mut f).await }
+        };
+        let qy = |sql: &str, params: &str| {
+            let mut f = query(handle, RString::from(sql), RString::from(params));
+            async move { drive(&mut f).await }
+        };
+
+        ex("drop table if exists oj_dialect_t", "[]").await.unwrap();
+        ex(
+            "create table oj_dialect_t (\
+               id int primary key, \
+               amount decimal(18,4), \
+               made_on date, \
+               made_at time(6), \
+               made_dt datetime(6), \
+               stamped timestamp null, \
+               yr year, \
+               payload json, \
+               flags bit(5), \
+               nullable_dec decimal(10,2) null)",
+            "[]",
+        )
+        .await
+        .expect("create");
+        ex(
+            "insert into oj_dialect_t values \
+             (1, 1234.5678, '2026-09-19', '10:11:12.345678', '2026-09-19 10:11:12.345678', \
+              '2026-09-19 10:11:12', 2026, '{\"a\":1,\"b\":[2,3]}', b'10101', null)",
+            "[]",
+        )
+        .await
+        .expect("insert");
+
+        let rows = qy(
+            "select id, amount, made_on, made_at, made_dt, stamped, yr, payload, flags, nullable_dec \
+             from oj_dialect_t",
+            "[]",
+        )
+        .await
+        .expect("dialect columns must read (query path)");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        let r = &v[0];
+        // DECIMAL 保精度：`1234.5678` 原样，不经 f64 往返。
+        assert_eq!(r["amount"], serde_json::json!("1234.5678"), "{v}");
+        assert_eq!(r["made_on"], serde_json::json!("2026-09-19"), "{v}");
+        assert_eq!(r["made_at"], serde_json::json!("10:11:12.345678"), "{v}");
+        assert_eq!(
+            r["made_dt"],
+            serde_json::json!("2026-09-19T10:11:12.345678"),
+            "{v}"
+        );
+        // TIMESTAMP 是 UTC 语义 → 带 `Z`。
+        assert_eq!(
+            r["stamped"],
+            serde_json::json!("2026-09-19T10:11:12Z"),
+            "{v}"
+        );
+        assert_eq!(r["yr"], serde_json::json!(2026), "{v}");
+        // JSON 走 JSON 文本（PRD U-6 口径：不做自动 JSON.parse，由业务侧决定）。
+        let payload = r["payload"].as_str().expect("JSON 应为字符串");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(payload).unwrap(),
+            serde_json::json!({"a": 1, "b": [2, 3]}),
+            "{v}"
+        );
+        // BIT(5) = 21 = 0b10101 —— 必须是位串，不能是 true 或 21。
+        assert_eq!(r["flags"], serde_json::json!("10101"), "{v}");
+        // NULL 保持 null。
+        assert!(r["nullable_dec"].is_null(), "{v}");
+
+        // stream 路径同口径（同一 `row_to_json_mysql`，此处钉住未分叉）。
+        let bytes = drive(&mut stream_open(
+            handle,
+            RString::from("select amount, flags, yr from oj_dialect_t"),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        let bytes = drive(&mut stream_next(handle, sid)).await.expect("next");
+        let sv: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let srow = &sv["rows"][0];
+        assert_eq!(srow["amount"], serde_json::json!("1234.5678"), "{sv}");
+        assert_eq!(srow["flags"], serde_json::json!("10101"), "{sv}");
+        assert_eq!(srow["yr"], serde_json::json!(2026), "{sv}");
+        drive(&mut stream_close(handle, sid)).await.expect("close");
+
+        ex("drop table if exists oj_dialect_t", "[]").await.unwrap();
+        close(handle);
+    }
+
+    /// `safe_ident` 的消毒/截断（离线，无需真库）：错误串是日志注入面。
+    #[test]
+    fn given_hostile_column_name_when_safe_ident_then_control_chars_stripped() {
+        assert_eq!(super::safe_ident("col"), "col");
+        assert_eq!(super::safe_ident("a\nb\tc"), "abc");
+        assert_eq!(super::safe_ident("x\u{0}y"), "xy");
+        let long: String = "a".repeat(100);
+        let out = super::safe_ident(&long);
+        assert_eq!(out.chars().count(), 65, "64 字符 + 省略号");
+        assert!(out.ends_with('…'));
+        // 未截断时不得画蛇添足加省略号（含多字节字符的列名也不能误判）。
+        assert_eq!(super::safe_ident("列名"), "列名");
     }
 
     /// 并发驱动多个 FfiFuture（FfiFuture 非 Send）：在单个任务里轮询全部——调度已在插件

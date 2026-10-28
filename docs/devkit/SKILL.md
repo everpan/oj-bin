@@ -78,6 +78,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
   运算与回写一律 `toBigInt(row.id) + 1n` 并把结果直接当参数传回（§6「大整数与 i64」）。
   **取号优先用 `db.nextSeq(name)`**（v0.1.24，原子且并发安全），别再自己写 `max+1`；
   无符号 64 位（仅 MySQL `BIGINT UNSIGNED`）用 `toUBigInt()`。
+- **事务边界**：一个请求内的事务用 `db.tx`；要跨请求（向导/审批）用 `db.session`——
+  它的 id 是 **bearer 凭据**，绝不回给客户端、不写日志、不进 URL；会话内**禁**手写
+  `BEGIN`/`COMMIT`/`ROLLBACK`/`SET`/`USE` 等（MySQL 隐式提交 ⇒ 假回滚），提交/回滚只用
+  `db.session.commit/rollback`，且与 `db.tx` 互斥（v0.1.95，§4.5）。
 
 ## 新模块 checklist
 
@@ -258,7 +262,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `oj exec --log-file` 没生成文件 | 打开失败只 stderr warn 一次、不中断脚本——看 stderr 首行 warn（路径不可写等） |
 | 并发取号撞主键 / 序号重复 | 手写 `select max(id)+1` 的竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子；见 `scenarios.md` 场景 7） |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`（它们的 bigint 是 i64）——改存 text 或换 MySQL `BIGINT UNSIGNED` |
-| `db(mysql): column 'x' has MySQL type 'DECIMAL' … does not decode yet` | MySQL 读侧不支持该列类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）——**报错而非静默给 `null`**。在 SQL 里显式转换：`select cast(x as char) as x from t`，别用 `select *`。另：MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0`，不是 `true`/`false` |
+| `db(mysql): column 'x' has MySQL type 'GEOMETRY' … does not decode yet` | MySQL 读侧**仍未支持**的类型（`GEOMETRY` 家族、`SET` 等）——**报错而非静默给 `null`**。`DECIMAL`/`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`/`JSON`/`BIT` 自 **v0.1.94** 起可直接读（十进制与 JSON 出**字符串**，时间出 ISO 8601，`BIT` 出位串），无需再 cast。另：MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0`，不是 `true`/`false` |
+| PG 读出来 `12.3` 而不是 `12.30`；`1.5` 也不会变 `1.5000`（v0.1.94） | PG `numeric` 走**去尾零规范形式**（sqlx 解 numeric 会丢服务端 dscale，不规范化会出 `1.5000` 这种假精度）。数值精确、不经 f64；要固定小数位用 `to_char(n,'FM999990.00')`。MySQL `DECIMAL` 则保留声明标度（`12.30` → `"12.30"`） |
+| `column "n" is of type numeric but expression is of type text`（PG `42804`） | v0.1.94 新支持的类型（`numeric`/日期时间/`jsonb`/`uuid`/数组）**只读**：回写须显式转换 `values (?::numeric)`；数组 `?::int4[]` |
 | `tenant guard: tenant id "…" is not a valid integer for numeric column …` | `tenant_id` 列是数值类型但租户头不是十进制字面量——用数字租户 id，或把列改成 text。**注意：`sql_guard: warn` 也硬失败**（warn 只放行「无法判定」，不放行「判定为不匹配」） |
 | 启动 / `oj build` / `oj migrate` 报 `tenant_id` 类型非法（v0.1.24） | `tenant_id` 声明类型只能是 `text` / `integer` / `bigint`——`double`/`boolean`/`blob` 直接 fail-fast（没有「等值租户 id」语义）。数值列上 insert/update 的租户等值接受字符串/数字/`toBigInt`/`toUBigInt` 四种形态 |
 | 雪花 id / 大整数算错、主键 dup 500 | i64 超 `2^53-1` 读出来是**字符串**；`Number(row.id) + 1` 会静默坍缩到 f64 网格值（下次分配撞主键）。范式：`toBigInt(rows[0].m) + 1n` → 直接回写 `db.exec(..., [next])`（v0.1.22，见 `scenarios.md` 场景 7） |
@@ -336,6 +342,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 以为 `db.access.grant` 能覆盖 config 的 `deny`/`read_only`/`max_rows`（v0.1.93） | 运行期 grant **只注入放行维 allow**，不放开 config 的 `read_only`/`max_rows`——防提权；config 无 allow 时 grant 成为白名单（`off` 抬到 `deny`），已有 allow 时逐维并集追加 |
 | 以为 `enforce: deny` = 拒所有人（v0.1.93 校正） | `deny` 是「拒绝违规」：写了 `allow` 就是白名单（命中放行）；没写 `allow`（= 不限制主体）则主体全放行、策略位照常执行。拒所有人要用动态库未声明或 `allow: {roles: []}` |
 | 跨 isolate 失效依赖 `db.epoch` 当安全边界（v0.1.93） | 查询 op 始终按名从 host registry 重解析 accessor，正确性不依赖 JS 持有的 epoch；即便恶意 handler 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记） |
+| 多步流程想把一个事务跨请求（把 `db.tx` 回调里 `await` 下一个请求 / 自己存连接） | 做不到——`db.tx` 的事务边界就是**一个请求**，handler 返回即提交。跨请求用 **`db.session`**（v0.1.95）：`begin()` 拿 `tx_ab12_…` id，后续请求 `attach(id)` 后所有 `db.query`/`db.table()` 都落同一条连接，最后 `commit(id)`。缺省**关闭**（`db_session.enabled: true` 且 `allow` 命中），不开就报 `db session: cross-request transactions are disabled (set db_session.enabled: true and declare db_session.allow)` |
+| 把 `db.session` 的 id 当普通业务字段回给前端 / 写进日志 | id 是 **bearer token**（谁拿到谁能改这个事务的未提交数据）。日志与报错只出现 `tx_ab12_…` 前 8 字符；存服务端会话记录或加密下发，别放 URL / 埋点 |
+| 会话里手写 `BEGIN` / `SET` / `USE` 想「控制事务」 | 一律拒绝：`... is not allowed inside a cross-request transaction`。**为什么**：MySQL 这些语句**隐式提交**，先写→`BEGIN`→`rollback` 会得到假回滚（数据已落库）。提交/回滚只用 `db.session.commit/rollback`；会话里也别开 `db.tx`（双向互斥），`db.stream` 也不可用 |
+| 一个 `db.session` 想跨两个库别名 / attach 后另一个库照常查 | 会话锁**一个别名**的一条连接：跨别名报 `db session is attached to db 'x', not 'y' (detach first)`；判权用会话登记的别名而非当前请求的模块绑定（防「A 库判权、B 库执行」）。要换库先 `detach()` |
+| 开了会话后同别名其它请求莫名卡住（sqlite） | sqlite 池刻意只有 **1** 条连接，会话独占它直到 commit/rollback/超时。装配期已 `warn:`——跨请求事务只用 mysql/postgres |
+| 会话里的数据过一会「自己没了」/ 进程重启后 id 失效 | 生命周期归 host：空闲 `idle_timeout_secs`、总寿命 `max_lifetime_secs` 到期 → 先 rollback 再摘表（`DB_SESSION_TIMEOUT`），**没有自动提交**；`db.client.delete/reRegister` 会判死该别名全部会话。长流程每步 `touch(id)` 只推空闲计时；真要持久化请落业务表 |
 
 ## 手册
 

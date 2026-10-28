@@ -193,21 +193,41 @@ unique constraint` → 业务接口 500。且从"静默写错"到"爆发 500"有
    **新增声明期 fail-fast**：`tenant_id` 列类型 ∉ {`text`,`integer`,`bigint`} →
    启动即报错（`double`/`boolean`/`blob` 没有「等值租户 id」语义）。
    注意 SQLite 是动态类型：列声明为 INTEGER 就必须存整数形态。
-10. **MySQL 读侧的列类型边界（v0.1.24 定稿）**：typed 路径（`sqlx::MySql`）下**可读**的列类型是
-    **整数家族**（含 `BIGINT UNSIGNED` → u64）、**文本家族**（`TEXT` 在 MySQL 协议里就是
-    `Blob` + 非 BINARY collation）、**二进制**、`FLOAT`/`DOUBLE`；**其余一律报错**：
-    `DECIMAL`/`NEWDECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、`JSON`、`BIT`、
-    `GEOMETRY`。
+10. **MySQL 读侧的列类型边界（v0.1.24 定稿，v0.1.94 扩到十进制/时间/JSON/位串）**：typed 路径
+    （`sqlx::MySql`）下**可读**的列类型是 **整数家族**（含 `BIGINT UNSIGNED` → u64）、
+    **文本家族**（`TEXT` 在 MySQL 协议里就是 `Blob` + 非 BINARY collation）、**二进制**、
+    `FLOAT`/`DOUBLE`，以及 v0.1.94 新增的 `DECIMAL`/`NEWDECIMAL`（→ **十进制字符串**）、
+    `DATE`/`TIME`/`DATETIME`/`TIMESTAMP`（→ **ISO 8601**，`TIMESTAMP` 带 `Z`）、`YEAR`（→ number）、
+    `JSON`（→ **JSON 文本**）、`BIT`（→ **位串**，`b'10101'` 读成 `"10101"`）；**其余一律报错**：
+    `GEOMETRY` 家族、`SET` 等。
     - 报错信息**点名列名与 MySQL 类型**并给指路：
-      `db(mysql): column 'amount' has MySQL type 'DECIMAL' which this plugin does not decode yet
-      — select explicit columns and cast it in SQL (e.g. \`cast(amount as char) as amount\`)`。
-      **绝不会静默变成 `null`**（静默错值是本仓红线）。
-    - 需要读这些列时**在 SQL 里显式转换**：`cast(amount as char) as amount`、`cast(made_at as char)`、
-      `cast(payload as char)`。转换后按文本读出。
+      `db(mysql): column 'shape' has MySQL type 'GEOMETRY' which this plugin does not decode yet
+      — select explicit columns and cast it in SQL (e.g. \`ST_AsText(shape) as shape\`);
+      see docs/devkit/db-guide.md §10.6`。**绝不会静默变成 `null`**（静默错值是本仓红线）。
+    - 仍未支持的列**在 SQL 里显式转换**：`cast(x as char) as x` / `ST_AsText(shape) as shape`。
     - `BOOLEAN` / `TINYINT(1)` 读出的是 **number `1`/`0`**，不是 `true`/`false`
       （MySQL 无列长度元数据可区分「boolean 语义的 TINYINT」）。
+    - **v0.1.94 修的真错值**：`BIT(n>1)` 以前会被 `bool::compatible`（无条件含 `ColumnType::Bit`）
+      或 UNSIGNED 的 `u64::compatible` 吃掉，**静默返回 `true` 或数字**——现在最先按类型名
+      短路成位串。`YEAR` 同理（`int.rs` 没有 Year 分支，只有 UNSIGNED 的 `u16` 能匹配）。
     - 对照 v0.1.23（全程 `sqlx::Any`）：上述不可读类型当时同样读不出来，但错误是 sqlx 的
       `AnyDriverError`（不点名列）；且 `TINYINT`/`BOOLEAN` 当时**直接报错**，现在可读。
+11. **PostgreSQL 读侧的列类型边界（v0.1.94）**：typed 路径下**可读** = `boolean`、`int2`/`int4`/`int8`、
+    `float4`/`float8`、文本家族、`bytea`、`numeric`（→ **十进制字符串**）、`date`/`time`/
+    `timestamp`/`timestamptz`（→ ISO 8601，后者带 `Z`）、`json`/`jsonb`（→ JSON 文本）、
+    `uuid`（→ 规范文本）、**一维数组**（→ JSON 数组，元素同口径，元素 `NULL` → `null`）；
+    **仍未支持**：`timetz`、`bit`/`varbit`、范围类型、几何、复合类型、**多维数组**。
+    - **`numeric` 去尾零是刻意为之**：sqlx 的 `TryFrom<&PgNumeric> for BigDecimal` 丢弃服务端
+      dscale，把标度硬算成 4 的倍数（`sqlx-postgres/src/types/bigdecimal.rs` 的
+      `scale = (digits.len() - weight - 1) * 4`），于是 `1.5` 会读成 `1.5000`。值精确（不经 f64），
+      但字符串带假精度比丢尾零更误导 → 统一 `normalized()` 只去尾零、不动有效位。
+      MySQL 的 `DECIMAL` 由协议**文本**解析，标度是服务端给的，原样保留（`12.30` 仍是 `"12.30"`）。
+    - **v0.1.94 同时把 `query`/`exec`/`tx_*` 从 `Pool<Any>` 换成 `Pool<Postgres>`**：`sqlx::Any`
+      只实现 `bool/i16/i32/i64/f32/f64/String/Vec<u8>` 的解码，上面这些类型在 Any 上**根本取不出**。
+      只修行转换函数会得到「流式能读、查询报错」的分叉，故池必须 typed 化。
+    - **新类型只读**：写侧 `bind_value` 只绑 null/bool/number/string，没有对称编码。回写须在 SQL 里
+      显式转换（`values (?::numeric)`、`?::jsonb`、`?::uuid`、`?::int4[]`），否则 PG 报
+      `42804 column "x" is of type numeric but expression is of type text`。
 
 ---
 

@@ -105,6 +105,18 @@ fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &Value) -> Query<'q, Any, 
 /// 与 FFI 面同形（`DbErrorCategory` 八值 + `retryable` + `sessionDisposition`）。
 /// 关键纪律：**凭据脱敏**——sqlx 错误含 DSN（含凭据），`message` 必须过 `redact`。
 /// 映射按 SQLite 主错误码：5/6=BUSY/LOCKED（连接级、可重试、Reset）；19=CONSTRAINT；
+/// 错误文本脱敏：**只有文本里真的出现凭据 URL**（`scheme://…@…`）时才替换凭据段。
+///
+/// 不能直接对任意错误文本调 [`redact`]：它对「不含 `://` 的串」一律返回 `***`（那是给
+/// 裸密码用的语义），于是所有 sqlite 报错都退化成 "***"，排障没有任何信息（旧缺陷）。
+fn redact_msg(s: &str) -> String {
+    if s.contains("://") {
+        redact(s)
+    } else {
+        s.to_string()
+    }
+}
+
 /// 1=SQLITE_ERROR（语法）；Io/PoolTimedOut/WorkerCrashed=连接；其余=Internal。
 fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {
     use DbErrorCategory as C;
@@ -122,7 +134,7 @@ fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {
         },
         _ => (C::Internal, false, SessionDisposition::Keep),
     };
-    let message = redact(&format!("sqlx {ctx}: {e}"));
+    let message = redact_msg(&format!("sqlx {ctx}: {e}"));
     BridgeError {
         category,
         retryable,
@@ -355,7 +367,7 @@ impl DataAccessor for SqlxAccessor {
                     },
                     // 流内错误脱敏（sqlx 错误可能含 DSN/凭据），保持与 query 同纪律。
                     Err(e) => {
-                        yield Err(redact(&e.to_string()));
+                        yield Err(redact_msg(&e.to_string()));
                         break;
                     }
                 }

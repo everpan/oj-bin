@@ -1142,9 +1142,10 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
   manifest）；release 装配期校验二者一致，不一致（stale/手改 dist）启动即 fail-fast。
 
 db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布，与本手册同源）：
-`DB(name)` / `db.query` / `db.exec` / `db.table` / `db.tx` / `db.stream` / 结构内省 /
-`db.client` 动态数据源登记 / `db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、
-查询构造器、SQL 执行追踪等，统一见 `db-guide.md`（DB API 参考章）。
+`DB(name)` / `db.query` / `db.exec` / `db.table` / `db.tx`（请求内事务）/ `db.stream` /
+`db.session`（跨请求事务，v0.1.95）/ 结构内省 / `db.client` 动态数据源登记 /
+`db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、查询构造器、SQL 执行追踪等，
+统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5）。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -1190,20 +1191,29 @@ const seq = Number(rows[0].m) + 1;
 - **保留键红线**：`$oj$` 前缀是平台内部线格式（`toBigInt()` 编码为 `{"$oj$i64":"<十进制>"}`，
   `toUBigInt()` 为 `{"$oj$u64":"<十进制>"}`）——业务 JSON 数据不得以这类 `$oj$` 键为唯一键，
   否则在**参数位置**会被当作整数绑定。
-- **MySQL 读侧的列类型边界（v0.1.24 定稿，MySQL 用户必读）**：**可读** = 整数家族（含
-  `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`；
-  **其余一律报错**：`DECIMAL`/`NEWDECIMAL`、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`、
-  `JSON`、`BIT`、`GEOMETRY`。报错会点名列名与 MySQL 类型并给指路，**不会静默变 `null`**。
-  需要读这些列时**在 SQL 里显式转换**：`select cast(amount as char) as amount from t`。
-  另：`BOOLEAN`/`TINYINT(1)` 读出的是 **`1`/`0`（number）**，不是 `true`/`false`。
-- **PostgreSQL 读侧的列类型边界**：**可读** = `boolean`、整数家族（`smallint`/`integer`/
-  `bigint`）、`double precision`、文本家族（`text`/`varchar`/`char`）、`bytea`（按 UTF-8 lossy
-  转字符串，真二进制请自行 base64）。**其余一律报错**：`real`（`float4`）、`numeric`/`decimal`、
-  `json`/`jsonb`、`uuid`、日期时间与区间、数组、`void` 等——报错点名列名与 PG 类型并给 `cast`
-  指引，**不会静默变 `null`**。`db.query` 与 `db.stream` 用**同一套判据**（v0.1.88 起流式补齐
-  `smallint`/`integer`；此前流式读这两类会误报「未解码」，而同样的查询用 `db.query` 却正常）。
-  需要读受限列时在 SQL 里显式转换：`select cast(amount as char) as amount from t`。
-- 完整契约、判据表与排障见仓库 `docs/numeric-limits.md`；另见 `scenarios.md` 场景 7。
+- **MySQL 读侧的列类型边界（v0.1.94 起扩到十进制/时间/JSON/位串）**：**可读** = 整数家族（含
+  `BIGINT UNSIGNED`）、文本家族（`TEXT`/`VARCHAR`/`CHAR`/`ENUM`）、二进制、`FLOAT`/`DOUBLE`、
+  `DECIMAL`（十进制**字符串**）、`DATE`/`TIME`/`DATETIME`/`TIMESTAMP`/`YEAR`（ISO 8601，
+  `TIMESTAMP` 带 `Z`；`YEAR` 数字）、`JSON`（**JSON 文本**，不自动 `JSON.parse`）、
+  `BIT(n)`（**位串**，`b'10101'` → `"10101"`）；**其余一律报错**：`GEOMETRY` 家族、`SET` 等。
+  报错会点名列名与 MySQL 类型并给指路（`cast(x as char)` / `ST_AsText(x)`），
+  **不会静默变 `null`**。另：`BOOLEAN`/`TINYINT(1)` 读出的是 **`1`/`0`（number）**，
+  不是 `true`/`false`。
+- **PostgreSQL 读侧的列类型边界（v0.1.94 起扩到 numeric/时间/JSON/UUID/数组）**：**可读** =
+  `boolean`、整数家族（`smallint`/`integer`/`bigint`）、`float4`/`float8`、文本家族
+  （`text`/`varchar`/`char`）、`bytea`（按 UTF-8 lossy 转字符串，真二进制请自行 base64）、
+  `numeric`（十进制**字符串**，去尾零）、`date`/`time`/`timestamp`/`timestamptz`（ISO 8601，
+  后者带 `Z`）、`json`/`jsonb`（**JSON 文本**）、`uuid`（规范文本）、**一维数组**（→ JSON
+  数组，元素同口径，元素 `NULL` → `null`）。**其余一律报错**：`timetz`、`bit`/`varbit`、
+  范围类型、几何、复合类型、多维数组——点名列名与 PG 类型并给 `cast` 指引，**不会静默变
+  `null`**。
+  `db.query` / `db.tx` 内的查询 / `db.stream` 用**同一套判据**（v0.1.94 起 `query`/`exec`/
+  `tx_*` 也走 typed `Pool<Postgres>`；此前只有流式能读这些类型，同一列在两条路径结论不同）。
+- **新增的这些类型只读**：写侧没有对称编码，回写须在 SQL 里显式转换
+  （`insert into t (n) values (?::numeric)`；PG 直接绑字符串报 `42804`）。
+- 完整契约（含 PG `numeric` 去尾零的成因、MySQL/PG 的标度差异）见
+  `docs/devkit/db-guide.md` §10.6；判据表与排障另见仓库 `docs/numeric-limits.md`；
+  `JSON.parse` 用法与读写范式见 `scenarios.md` 场景 48。
 
 ### kv / redis —— KV 存储
 
@@ -2972,8 +2982,9 @@ export default {
 curl -s -H 'Accept: text/html' http://127.0.0.1:9778/issues/abc | grep -i '<title>\|og:'
 ```
 
-库级访问控制（`db_access:` 段）与动态数据源登记（`db_client:` 段）的完整说明已并入
-`db-guide.md` §11.5 / §11.6（含运行期动态授权 `db.access` 与跨 isolate 失效 `db.epoch`）。
+库级访问控制（`db_access:` 段）、动态数据源登记（`db_client:` 段）与跨请求事务会话
+（`db_session:` 段）的完整说明已并入 `db-guide.md` §11.5 / §11.6 / §4.5（含运行期动态授权
+`db.access` 与跨 isolate 失效 `db.epoch`）。
 
 ### redis
 
@@ -3660,6 +3671,14 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | 401 `missing or invalid bearer token` | auth 启用且路径不匿名 | 走 `/auth/login` 换 token |
 | 500 `transaction already active` | 嵌套 `db.tx` | 合并为一个事务回调 |
 | 日志 `open transaction … rolled back at request end` | `db.tx` 漏 await | 修 handler；数据已按未提交丢弃 |
+| 500 `db session: cross-request transactions are disabled (set db_session.enabled: true and declare db_session.allow)` | `db_session.enabled` 缺省为 false（能力不存在） | 按文案开 `db_session.enabled: true` 并配 `allow`（见 `db-guide.md` §4.5） |
+| 500 `db session: not granted to this caller (module=…, roles=…, tenant=…, source=…)` | `db_session.allow` 四维都没命中该主体；或运行期被撤权 | 按报错里的维度补 `allow`；撤权即刻生效（每个 op 重判），无需重启 |
+| 500 `tx session tx_ab12_… not found (unknown, expired, or owned by another caller)`（未知 / 他人 / 畸形 id **同一文案**） | id 拼错、已 commit/rollback、已被回收，或跨主体使用 | 核对 id；id 是 **bearer 凭据**——日志/报错只回显 `tx_ab12_…` 前缀，别把完整 id 打进前端日志。自己的已结束会话会得到更具体的 `tx session … is closed (commit); …` / `expired (idle_timeout); it was rolled back` |
+| 500 `db session: BEGIN is not allowed inside a cross-request transaction (use db.session.commit/rollback to end it)` | 在会话里手写事务控制/会话状态 SQL（MySQL 隐式提交会让 rollback 变假回滚） | 改用 `db.session.commit/rollback`；`SET`/`USE` 类语句放会话外 |
+| 500 `db session is attached to db 'x', not 'y' (detach first)` | attach 后跨别名查询：一个会话只锁一个连接/别名 | 先 `db.session.detach()`，或用原别名 |
+| 500 `db session lifetime exhausted during query` / `… while waiting for the connection` | 单会话超过 `max_lifetime_secs`（或在等连接时耗尽） | 拆批/缩短事务；进程内还停在事务里的长查询会被判死并 **回滚丢弃**（不归还连接） |
+| 日志 `DB_SESSION_TIMEOUT` / `DB_SESSION_DISCARD` | reaper 回收空闲/超寿命会话（已 rollback）；后者是别名被 `db.client.delete`/`reRegister` 或世代号变化 | 长流程要续期就在每步之间 `db.session.touch(id)`；别把会话当持久存储 |
+| 开了会话后同别名其它请求卡住（sqlite） | sqlite 池只有 **1** 条连接，会话独占它 | 装配期已 warn；跨请求事务用 `mysql`/`postgres` 别名 |
 | `bus.publish` 收不到广播 | bus 缺省为进程内，跨实例不互通 | 发布与订阅须同实例 |
 | `GET {base}/…/ws` 404 | release 未重新 build，或 URL 含版本段 | 先 `oj build`；release URL 为 `…/news-0.1.0/ws` |
 | 改 `api.ts` 不生效 | release 下 dist 未更新 / 换版本未重启 | 同步 dist；必要时重启 |
@@ -3763,6 +3782,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段（v0.2） | `…/news-0.1.0/ws`，与 dev 的 `…/news/ws` **不同源**；客户端发现 WS 地址时按环境拼（勿硬编码）。WS 路径不做 `_name_` → `{param}` 转换（`_id_/ws.ts` 是字面段）；新增/删除 `ws.ts` 需重启（dev 无文件监听）。WS 不在路由表与 `openapi.json` 内，唯一权威面是启动打印的 `ws: N mount(s)` 清单 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
+| `db.session` 缺省**关闭**（v0.1.95） | `db_session.enabled: false` 时该能力不存在——`db.session.begin()` 直接报错点名怎么开（兼容优先，不做隐式放行）。开启须过装配期 fail-loud：`allow` 四维不能全空、`max_sessions`/`max_per_owner` 非 0、`max_per_owner ≤ max_sessions`、`idle_timeout_secs` 非 0、`max_lifetime_secs ≥ idle_timeout_secs` |
+| `db.session` = 一个 id 锁**一个别名**的一条连接 | attach 后跨别名查询报 `attached to db 'x', not 'y' (detach first)`；换别名须先 detach。会话内**禁止**事务控制/会话状态 SQL（`BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/START/SET/USE/ATTACH/DETACH/PRAGMA`）——MySQL 的隐式提交会让 `rollback()` 变成假回滚，故一律拒绝而不是"尽力而为" |
+| `db.session` 与 `db.tx` 互斥；`db.stream` 不可用 | 请求内已 attach 会话 → `db.tx` 报 `cannot nest inside it (detach first)`；反之 `db.tx` 存活时 `db.session.begin()` 报已有请求内事务。会话内 `db.stream` 按事务目标处理（`not supported (streaming queries run on the connection pool only)`），大结果集请分页 `db.query` |
+| `db.session` 生命周期由 host 管，**不自动提交** | 空闲 `idle_timeout_secs`（默认 300s）/ 总寿命 `max_lifetime_secs`（默认 1800s）到期 → reaper 先 `ROLLBACK` 再丢弃（日志 `DB_SESSION_TIMEOUT`），连接**不归还**（状态不可信）。容量满时拒绝新会话，绝不驱逐他人会话。id 是 **bearer token**：未知 / 他人 / 畸形 id 一律同一文案，日志只打 `tx_ab12_…` 前缀 |
 | `db.stream` 仅非事务目标 + 后端能力分档（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 插件后端**真流式**（逐行拉，内存恒定）；没有逐行能力的后端**回落 `db.query` 全量**（内容等价、不报错，仅失去内存优势）；彻底不支持时报 `backend does not support streaming`，改走 `db.query` 分页 |
 | 流式取消（`signal`）= 干净提前结束（v0.1.39；v0.1.42 起 pg/mysql 真取消） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done。**第一方插件 `oj-db-postgres`/`oj-db-mysql` 在 `postgres://`/`mysql://` DSN 下走专用连接，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端查询立即终止（真取消）**；core（sqlite）与 Any 回退路径为协作式（批间生效）。已回调的行不回滚 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
@@ -3781,7 +3804,10 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `tenant guard: tenant id "acme" is not a valid integer for numeric column …`（v0.1.24） | `tenant_id` 列声明为 integer/bigint，但租户头不是十进制字面量；数值租户列请用数字租户 id，或把列改成 text |
 | i64 超界读出来是字符串，不是 number（v0.1.22） | `\|v\| > 2^53-1`（雪花 id 常态）按值域分流为十进制字符串——改过 `typeof id === "number"` 判断的代码要复查；回写用 `toBigInt()`，别用 `Number()`（会静默坍缩） |
 | `Number("<大整数串>")` 平台拦不住 | 语言语义，只能靠范式：`toBigInt(rows[0].m) + 1n`（`toBigInt` 对已坍缩的值会抛错） |
-| `db(mysql): column 'x' has MySQL type 'DECIMAL' which this plugin does not decode yet`（v0.1.24） | MySQL 读侧不支持的类型（`DECIMAL`/`JSON`/`DATE`/`DATETIME`/`TIMESTAMP`/`TIME`/`YEAR`/`BIT`/`GEOMETRY`）**报错而非给 `null`**；在 SQL 里显式转换：`select cast(x as char) as x from t`。不要用 `select *` 兜住这些列 |
+| `db(mysql): column 'x' has MySQL type 'GEOMETRY' which this plugin does not decode yet`（v0.1.24，v0.1.94 收窄到剩余类型） | MySQL 读侧**仍未支持**的类型（`GEOMETRY` 家族、`SET` 等）**报错而非给 `null`**；在 SQL 里显式转换：`cast(x as char) as x` 或 `ST_AsText(x) as x`。`DECIMAL`/时间/`JSON`/`BIT` 自 v0.1.94 起可直接读，不必再 cast |
+| `db(postgres): column 'x' has type 'POINT' …`（v0.1.94） | PG 读侧**仍未支持**的类型（`timetz`、`bit`/`varbit`、范围、几何、复合、多维数组）；`cast(x as text) as x`。`numeric`/时间/`json(b)`/`uuid`/一维数组自 v0.1.94 起可直接读 |
+| PG 的 `numeric` 读出来尾零没了（`12.30` → `"12.3"`，v0.1.94） | 有意为之：sqlx 解 numeric 会丢服务端 dscale（硬算成 4 的倍数，`1.5` 会变 `1.5000`），统一 `normalized()` 去尾零。数值精确，只是不再保留声明标度；要固定小数位请在 SQL 里 `to_char(n, 'FM999999990.00')` |
+| `column "n" is of type numeric but expression is of type text`（`42804`） | 新支持的类型**只读**：回写要显式转换 `insert into t (n) values (?::numeric)`；`jsonb`/`uuid`/数组同理 |
 | MySQL `BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` 而不是 `true`/`false`（v0.1.24） | MySQL 没有独立 boolean 类型（`BOOLEAN` 即 `TINYINT(1)`），协议层无列长度元数据可区分；按整数读。需要 boolean 语义就在 SQL 里转：`select flag = 1 as flag from t` |
 | 迁移工具 `--db` 不解析模块级 `manifest.db`（v0.1.21） | `oj migrate` / `test fixture` / `schema diff --db X` 把**全部**模块作用于 X（运行期绑定只影响路由）；模块各自绑不同库的项目须 `--db X --module M` 逐组合跑——见 `scenarios.md` 场景 6 |
 | ldap 无连接池（每调用独立 connect/bind/unbind） | 设计取向：bind(dn,pw) 用户凭据绝不共享连接；LAN 上 AD 连接建立为毫秒级。热路径（每请求多次 LDAP 调用）先用 `search` 一次取全所需字段，仍不够再评估给插件加 ldap3 pool |
@@ -3843,6 +3869,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 - 挂 `.route` 后目录镜像路径 404（替换语义）；`{*path}` 至少匹配一段。
 - `redis.default` 配置即真连且 fail-fast——CI/离线环境注释掉该段即用内存 KV。
 - 每请求至多一个 `db.tx`；漏 await 会在请求结束时自动回滚并打 warn。
+- 要跨请求保持事务用 `db.session`（v0.1.95）：id 是 **bearer 凭据**（不回给客户端、不写日志、
+  不进 URL），会话只锁一个别名，会话内禁事务控制/会话状态 SQL，与 `db.tx` 双向互斥，
+  **无自动提交**（空闲/超寿命由 host 回滚判死）——详见 `db-guide.md` §4.5。
 - `db_access` 里给某库写了 `read_only: true` 却只加这一条 → 该库的 `enforce` 仍继承
   `defaults`（若 defaults 是 `off`，**等于没设防**）。要设防就把 `enforce: deny` 写在
   `defaults` 里，或在该库条目里显式写一遍（v0.1.89）。

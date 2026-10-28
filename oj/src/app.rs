@@ -1279,6 +1279,62 @@ pub async fn assemble_backend(
             );
         }
     }
+    // 跨请求事务会话（`db_session:`，L7 v0.1.95）：装配期 fail-loud 校验。
+    // 与 db_client 同哲学——能力默认关，开了就必须配清楚（长事务占连接 + 放大脏读窗口）。
+    let db_session = Arc::new(cfg.db_session.clone());
+    if db_session.enabled {
+        if db_session.allow.is_unrestricted() {
+            return Err(
+                "db_session.enabled=true requires db_session.allow to declare at least one of \
+                 modules/roles/tenants/sources (refusing to open an unauthorized long-transaction \
+                 surface)"
+                    .to_string(),
+            );
+        }
+        if db_session.max_sessions == 0 {
+            return Err(
+                "db_session.enabled=true requires db_session.max_sessions >= 1".to_string(),
+            );
+        }
+        if db_session.max_per_owner == 0 {
+            return Err(
+                "db_session.enabled=true requires db_session.max_per_owner >= 1".to_string(),
+            );
+        }
+        if db_session.max_per_owner > db_session.max_sessions {
+            return Err(format!(
+                "db_session.max_per_owner ({}) must not exceed db_session.max_sessions ({})",
+                db_session.max_per_owner, db_session.max_sessions
+            ));
+        }
+        if db_session.idle_timeout_secs == 0 {
+            return Err(
+                "db_session.enabled=true requires db_session.idle_timeout_secs >= 1".to_string(),
+            );
+        }
+        if db_session.max_lifetime_secs < db_session.idle_timeout_secs {
+            return Err(format!(
+                "db_session.max_lifetime_secs ({}) must be >= db_session.idle_timeout_secs ({})",
+                db_session.max_lifetime_secs, db_session.idle_timeout_secs
+            ));
+        }
+        // sqlite 的进程内池刻意限 1 条连接（`:memory:` 与写锁语义使然）：一个存活会话会
+        // 独占唯一连接，其余请求只能等 acquire 超时。生产用 mysql/postgres，这里只告警。
+        for (alias, dsn) in &cfg.db {
+            if dsn.starts_with("sqlite") {
+                eprintln!(
+                    "warn: db_session is enabled but db alias '{alias}' is sqlite \
+                     (single pooled connection) — an open session will block other queries \
+                     on this alias until it is committed/rolled back"
+                );
+            }
+        }
+    }
+    // 会话注册表（进程级）：装配层构造一次，Extras 与 StableState 共享同一 Arc——
+    // 热更只 clone StableState，故已开会话跨热更存活（跨请求语义的应有结果）。
+    let tx_sessions = Arc::new(only_js::bridge::db_session::TxSessionRegistry::new(
+        (*db_session).clone(),
+    ));
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
@@ -1332,6 +1388,9 @@ pub async fn assemble_backend(
         // 影子绑定：同 db_access —— 闭包带走的是这里的副本（外层 db_client/client_dbs/
         // db_backend/config_dir 仍供下方直接 StableState 使用）。
         let db_client = db_client.clone();
+        // 影子绑定：同 db_client —— 会话配置与注册表也须与 StableState 同一 Arc。
+        let db_session = db_session.clone();
+        let tx_sessions = tx_sessions.clone();
         let client_dbs = client_dbs.clone();
         let db_access_rt = db_access_rt.clone();
         let db_backend = db_backend.clone();
@@ -1386,6 +1445,8 @@ pub async fn assemble_backend(
                     ldap: ldap.clone(),
                     db_access: Some(db_access.clone()),
                     db_client: Some(db_client.clone()),
+                    db_session: Some(db_session.clone()),
+                    tx_sessions: Some(tx_sessions.clone()),
                     client_dbs: Some(client_dbs.clone()),
                     db_access_rt: Some(db_access_rt.clone()),
                     db_backend: Some(db_backend.clone()),
@@ -1443,7 +1504,9 @@ pub async fn assemble_backend(
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
         db_access: db_access.clone(), // 与 make_bridge 的 Extras.db_access 同源（同一 Arc）。
         db_client: db_client.clone(), // 与 make_bridge 的 Extras.db_client 同源（同一 Arc）。
+        db_session: db_session.clone(), // 与 make_bridge 的 Extras.db_session 同源（同一 Arc）。
         client_dbs: client_dbs.clone(), // 与 make_bridge 的 Extras.client_dbs 同源（同一 Arc）。
+        tx_sessions: tx_sessions.clone(), // 与 make_bridge 的 Extras.tx_sessions 同一注册表。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。

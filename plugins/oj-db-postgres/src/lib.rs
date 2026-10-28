@@ -14,8 +14,12 @@ use sqlx::Connection as _;
 use sqlx::any::{Any, AnyArguments, AnyRow};
 use sqlx::error::ErrorKind;
 use sqlx::pool::{Pool, PoolOptions};
-use sqlx::postgres::{PgArguments, PgConnection, PgRow, Postgres};
+use sqlx::postgres::{PgArguments, PgColumn, PgConnection, PgRow, Postgres};
 use sqlx::query::Query;
+use sqlx::types::BigDecimal;
+use sqlx::types::Json;
+use sqlx::types::Uuid;
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::{Column, Row, TypeInfo};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -197,7 +201,7 @@ struct DbPluginState {
 }
 
 struct Client {
-    pool: Pool<Any>,
+    pool: Pooled,
     /// 原始 DSN（PR-2 真取消：流式游标按方言单开专用 typed 连接用）。
     dsn: String,
     dialect: Dialect,
@@ -209,6 +213,28 @@ struct Client {
     /// 流式专用连接闸（v0.1.84，`STREAM_MAX_CONNS`）：typed 游标先占配额再拨号，
     /// 条目移除（done/err/cancel/close）随 handle drop 释放。
     stream_gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// 池的二选一（v0.1.3 / L6）：**生产 DSN（`postgres://`）走 typed**，其余（离线测试的 sqlite）
+/// 走 Any。
+///
+/// 为什么必须 typed（L6 评审阻塞项）：`sqlx::Any` 只实现 `bool/i16/i32/i64/f32/f64/String/
+/// Vec<u8>` 的解码（`sqlx-core/src/any/types/`），`NUMERIC`/`JSON`/`UUID`/数组在 Any 上
+/// **根本取不出来**——只在 `column_json_pg` 里补类型毫无意义，`query`/`exec`/`tx_*` 必须
+/// 一起走 typed，否则同一张表 `db.query` 报错、`db.stream` 成功。
+///
+/// `Pooled::Any` 分支是**仅测试用**的（不是受支持的运行时路径）：它只在「非 postgres DSN」
+/// 时出现，而生产装配按 scheme 路由——`postgres://` 必进本插件且必走 typed。故它只覆盖
+/// 「编排/绑定通路」；PG 行形状的回归靠 env-gated 真库用例（见 `CHANGELOG` 的 CI 挂账）。
+enum Pooled {
+    Pg(Pool<Postgres>),
+    Any(Pool<Any>),
+}
+
+/// 事务内层（与池同型分流）。
+enum TxInner {
+    Pg(tokio::sync::Mutex<Option<sqlx::Transaction<'static, Postgres>>>),
+    Any(tokio::sync::Mutex<Option<sqlx::Transaction<'static, Any>>>),
 }
 
 /// 流式游标句柄：行流（async-stream 自持 SQL/参数/连接）独立成 tokio Mutex（批量
@@ -240,7 +266,7 @@ const STREAM_BATCH: usize = 100;
 const STREAM_MAX_CONNS: usize = 8;
 
 struct Tx {
-    tx: tokio::sync::Mutex<Option<sqlx::Transaction<'static, Any>>>,
+    tx: TxInner,
 }
 
 static PLUGIN: OnceLock<DbPluginState> = OnceLock::new();
@@ -280,12 +306,37 @@ fn bind_value<'q>(
 }
 
 /// 解不出类型/值时的响亮报错（含列名/类型线索）——绝不静默 `null`（静默 null =
-/// 返回错值）。对齐 oj-db-mysql `row_to_json_mysql` 纪律（见 docs/numeric-limits.md）。
+/// 返回错值）。对齐 oj-db-mysql `row_to_json_mysql` 纪律（见 `docs/numeric-limits.md`、
+/// 读侧口径见 `docs/devkit/db-guide.md` §10.6）。
 fn undecodable_column(name: &str, type_name: &str) -> String {
     format!(
         "db(postgres): column '{name}' has type '{type_name}' which this plugin does not \
-         decode yet — cast it in SQL (e.g. `cast({name} as text) as {name}`)"
+         decode yet — cast it in SQL (e.g. `cast({name} as text) as {name}`); \
+         see docs/devkit/db-guide.md §10.6"
     )
+}
+
+/// 错误文案里的标识符消毒（v0.1.3 / L6 安全评审）：过滤控制字符（防日志注入）并截断。
+fn safe_ident(s: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::new();
+    let mut n = 0usize;
+    let mut truncated = false;
+    for c in s.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if n == MAX {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+        n += 1;
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
 }
 
 fn row_to_json(row: &AnyRow) -> Result<serde_json::Value, String> {
@@ -362,19 +413,26 @@ fn bind_value_pg<'q>(
 fn row_to_json_pg(row: &PgRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
-        let name = col.name().to_string();
-        let ordinal = col.ordinal();
-        let val = column_json_pg(row, ordinal)
+        let name = safe_ident(col.name());
+        let val = column_json_pg(row, col)
             .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
         obj.insert(name, val);
     }
     Ok(serde_json::Value::Object(obj))
 }
 
-fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
-    // 逐类型试解（sqlx 的 `Type<Postgres>` 是**严格等值**匹配：`i64::compatible` 只认
-    // INT8，所以 INT4/INT2 用 i64 解会失败——必须各自单列，缺一列就落到
-    // `undecodable_column` 硬报错。Any 回退路径按类型名匹配，才没有这个陷阱。）
+/// 逐列按**固定顺序**探测（typed 路径）：`bool → i16 → i32 → i64 → f64 → String →
+/// Vec<u8> → 受限类型分派`。
+///
+/// 顺序要点：PG 的 `Type<Postgres>` 是**严格等值**匹配（`i64::compatible` 只认 INT8），
+/// 所以 INT4/INT2 用 i64 解会失败——必须各自单列，缺一列就落到 `undecodable_column`
+/// 硬报错。Any 回退路径按类型名匹配，才没有这个陷阱。
+///
+/// 探测链覆盖不到的类型（`NUMERIC`/日期时间/`JSON`/`UUID`/数组/`FLOAT4`）交给
+/// [`column_json_pg_restricted`]（v0.1.3 / L6 / U-6 补齐）；仍未覆盖的（`TIMETZ`、
+/// 范围类型、几何、复合类型等）返回 `None` → 调用方响亮报错。
+fn column_json_pg(row: &PgRow, col: &PgColumn) -> Option<serde_json::Value> {
+    let ordinal = col.ordinal();
     if let Ok(v) = row.try_get::<Option<bool>, _>(ordinal) {
         return Some(serde_json::Value::from(v));
     }
@@ -396,9 +454,6 @@ fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
             None => serde_json::Value::Null,
         });
     }
-    // 注意**不**加 `f32`（`real`）：Any 路径的 `f64::compatible` 是严格等值（只认 FLOAT8），
-    // 所以 `db.query` 读 `real` 列本来就报错；这里补上会让两条路径对同一列给出不同结论
-    // （流的通、查的错），比「统一不支持、统一给 cast 指引」更糟。
     if let Ok(v) = row.try_get::<Option<f64>, _>(ordinal) {
         return Some(match v {
             Some(f) => serde_json::Number::from_f64(f)
@@ -419,19 +474,172 @@ fn column_json_pg(row: &PgRow, ordinal: usize) -> Option<serde_json::Value> {
             None => serde_json::Value::Null,
         });
     }
-    None
+    column_json_pg_restricted(row, ordinal, col.type_info().name())
+}
+
+/// 受限类型分派（v0.1.3 / L6，PRD U-6）：`None` = 未覆盖 → 调用方响亮报错。
+///
+/// 输出口径见 `docs/devkit/db-guide.md` §10.6：`NUMERIC` → 十进制字符串（不经 f64，
+/// 保精度）/ 日期时间 → ISO 8601（`TIMESTAMP` 无时区、`TIMESTAMPTZ` 带 `Z`）/ `JSON`、
+/// `JSONB` → JSON 文本 / `UUID` → 规范文本 / 数组 → **JSON 数组**（元素同口径）。
+/// **只读**：这些类型没有对称的写入编码（`bind_value_pg` 只绑 str/num/bool/null），
+/// 写回须显式 `::type` 转换。
+fn column_json_pg_restricted(row: &PgRow, ordinal: usize, ty: &str) -> Option<serde_json::Value> {
+    fn s(v: String) -> serde_json::Value {
+        serde_json::Value::String(v)
+    }
+    match ty {
+        "NUMERIC" => row
+            .try_get::<Option<BigDecimal>, _>(ordinal)
+            .ok()
+            .map(|v| v.map_or(serde_json::Value::Null, |d| s(decimal_text(&d)))),
+        "DATE" => row.try_get::<Option<NaiveDate>, _>(ordinal).ok().map(|v| {
+            v.map_or(serde_json::Value::Null, |d| {
+                s(d.format("%Y-%m-%d").to_string())
+            })
+        }),
+        "TIME" => row.try_get::<Option<NaiveTime>, _>(ordinal).ok().map(|v| {
+            v.map_or(serde_json::Value::Null, |t| {
+                s(t.format("%H:%M:%S%.f").to_string())
+            })
+        }),
+        "TIMESTAMP" => row
+            .try_get::<Option<NaiveDateTime>, _>(ordinal)
+            .ok()
+            .map(|v| {
+                v.map_or(serde_json::Value::Null, |t| {
+                    s(t.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+                })
+            }),
+        "TIMESTAMPTZ" => row
+            .try_get::<Option<DateTime<Utc>>, _>(ordinal)
+            .ok()
+            .map(|v| {
+                // `sqlx::types::chrono` 只再导出类型、不含 `SecondsFormat`，
+                // 故用显式格式串而非 `to_rfc3339_opts`。
+                v.map_or(serde_json::Value::Null, |t| {
+                    s(t.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+                })
+            }),
+        // PG 没有 `Type<Postgres> for serde_json::Value`，只能走 `Json<T>`；
+        // `Json` 的 `compatible` 同时认 `json` 与 `jsonb`。
+        "JSON" | "JSONB" => row
+            .try_get::<Option<Json<serde_json::Value>>, _>(ordinal)
+            .ok()
+            .map(|v| v.map_or(serde_json::Value::Null, |j| s(j.0.to_string()))),
+        "UUID" => row
+            .try_get::<Option<Uuid>, _>(ordinal)
+            .ok()
+            .map(|v| v.map_or(serde_json::Value::Null, |u| s(u.to_string()))),
+        // `real`：探测链里 `f64::compatible` 只认 FLOAT8，FLOAT4 必须单列。
+        "FLOAT4" => row
+            .try_get::<Option<f32>, _>(ordinal)
+            .ok()
+            .map(|v| match v {
+                Some(f) => serde_json::Number::from_f64(f as f64)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+                None => serde_json::Value::Null,
+            }),
+        // ---- 数组（类型名形如 `INT4[]`；`name()` 与 `display_name()` 同口径）----
+        "BOOL[]" => array_json::<bool, _>(row, ordinal, |v| serde_json::Value::from(*v)),
+        "INT2[]" => array_json::<i16, _>(row, ordinal, |v| serde_json::Value::from(*v)),
+        "INT4[]" => array_json::<i32, _>(row, ordinal, |v| serde_json::Value::from(*v)),
+        "INT8[]" => array_json::<i64, _>(row, ordinal, |v| serde_json::Value::from(*v)),
+        "FLOAT4[]" => array_json::<f32, _>(row, ordinal, |v| {
+            serde_json::Number::from_f64(*v as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }),
+        "FLOAT8[]" => array_json::<f64, _>(row, ordinal, |v| {
+            serde_json::Number::from_f64(*v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }),
+        // `String` 的数组兼容性覆盖 text/varchar/bpchar/name/char 五族
+        // （`CHAR[]` 是 bpchar，`"CHAR"[]` 是 char，两者名字不同但同一实现）。
+        "TEXT[]" | "VARCHAR[]" | "CHAR[]" | "\"CHAR\"[]" | "NAME[]" => {
+            array_json::<String, _>(row, ordinal, |v| serde_json::Value::String(v.clone()))
+        }
+        "NUMERIC[]" => array_json::<BigDecimal, _>(row, ordinal, |v| s(decimal_text(v))),
+        "DATE[]" => {
+            array_json::<NaiveDate, _>(row, ordinal, |v| s(v.format("%Y-%m-%d").to_string()))
+        }
+        "TIME[]" => {
+            array_json::<NaiveTime, _>(row, ordinal, |v| s(v.format("%H:%M:%S%.f").to_string()))
+        }
+        "TIMESTAMP[]" => array_json::<NaiveDateTime, _>(row, ordinal, |v| {
+            s(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+        }),
+        "TIMESTAMPTZ[]" => array_json::<DateTime<Utc>, _>(row, ordinal, |v| {
+            s(v.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string())
+        }),
+        "UUID[]" => array_json::<Uuid, _>(row, ordinal, |v| s(v.to_string())),
+        // `Json<T>` 的数组兼容性同时认 `JSON[]` 与 `JSONB[]`。
+        "JSON[]" | "JSONB[]" => {
+            array_json::<Json<serde_json::Value>, _>(row, ordinal, |v| s(v.0.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// `NUMERIC` 的文本化口径（v0.1.3 / L6）：**去尾零的规范十进制字符串**。
+///
+/// 为什么必须规范化：sqlx 的 `TryFrom<&PgNumeric> for BigDecimal` **丢弃服务端 dscale**，
+/// 把标度硬算成「4 的倍数」（`sqlx-postgres/src/types/bigdecimal.rs`：
+/// `scale = (digits.len() - weight - 1) * 4`）——于是 `1.5` 会读成 `1.5000`、`0.1` 读成
+/// `0.1000`。值本身是精确的（没经 f64），但字符串带假精度，比丢尾零更误导。
+/// `normalized()` 只去尾零、不动有效位，故精度仍然完整。
+///
+/// 与 MySQL 的差异（见 `docs/devkit/db-guide.md` §10.6）：MySQL 的 `DECIMAL` 由协议文本
+/// 解析而来，**保留列声明精度**（`numeric(10,2)` 的 `12.30` 读回 `12.30`）；PG 走规范
+/// 形式（`12.3`）。两者数值相等。
+fn decimal_text(d: &BigDecimal) -> String {
+    d.normalized().to_string()
+}
+
+/// 一维数组解码（v0.1.3 / L6）：SQL NULL → JSON `null`，元素 NULL → JSON `null`。
+///
+/// 必须用 `Vec<Option<T>>`：`Vec<T>` 在遇到 NULL 元素时按 `T::decode` 直接报错。
+/// sqlx 只支持一维数组（多维在 `array.rs` 显式拒绝）→ 多维列走到 `None` 响亮报错。
+fn array_json<T, F>(row: &PgRow, ordinal: usize, conv: F) -> Option<serde_json::Value>
+where
+    T: for<'a> sqlx::Decode<'a, Postgres> + sqlx::Type<Postgres> + sqlx::postgres::PgHasArrayType,
+    F: Fn(&T) -> serde_json::Value,
+{
+    let v = row.try_get::<Option<Vec<Option<T>>>, _>(ordinal).ok()?;
+    Some(match v {
+        Some(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(|it| it.as_ref().map_or(serde_json::Value::Null, &conv))
+                .collect(),
+        ),
+        None => serde_json::Value::Null,
+    })
 }
 
 impl Client {
     async fn connect(dsn: &str) -> Result<Self, sqlx::Error> {
         sqlx::any::install_default_drivers();
-        let pool = PoolOptions::<Any>::new()
-            .connect(&with_stmt_cache_capacity(dsn, 512))
-            .await?;
+        let dialect = dialect_of(dsn);
+        let dsn_with_cache = with_stmt_cache_capacity(dsn, 512);
+        let pool = match dialect {
+            // 生产路径：typed PG 池（唯一能解 NUMERIC/JSON/UUID/数组的路径）。
+            Dialect::Postgres => Pooled::Pg(
+                PoolOptions::<Postgres>::new()
+                    .connect(&dsn_with_cache)
+                    .await?,
+            ),
+            // 离线测试（sqlite）回退：Any 池——生产不会走到（装配按 scheme 路由）。
+            Dialect::Sqlite | Dialect::MySql => {
+                Pooled::Any(PoolOptions::<Any>::new().connect(&dsn_with_cache).await?)
+            }
+        };
         Ok(Self {
             pool,
             dsn: dsn.to_string(),
-            dialect: dialect_of(dsn),
+            dialect,
             next_tx: AtomicU64::new(0),
             txs: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
@@ -503,7 +711,10 @@ impl Client {
             })
         } else {
             // Any 回退（sqlite 等）：池路径（协作式取消）。
-            let pool = self.pool.clone();
+            let pool = match &self.pool {
+                Pooled::Any(p) => p.clone(),
+                Pooled::Pg(_) => unreachable!("is_pg false ⇒ Any pool"),
+            };
             Box::pin(async_stream::stream! {
                 let mut q: Query<'_, Any, AnyArguments> =
                     sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
@@ -642,19 +853,32 @@ impl Client {
             "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
         )?;
         let sql = shape_tag(sql, params);
-        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for p in params {
-            q = bind_value(q, p);
+        match &self.pool {
+            Pooled::Pg(p) => {
+                let mut q: Query<'_, Postgres, PgArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value_pg(q, v);
+                }
+                let rows = q
+                    .fetch_all(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db query", &e))?;
+                let json: Result<Vec<_>, String> = rows.iter().map(row_to_json_pg).collect();
+                serde_json::to_vec(&json?).map_err(|e| format!("db query serialize: {e}"))
+            }
+            Pooled::Any(p) => {
+                let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value(q, v);
+                }
+                let rows = q
+                    .fetch_all(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db query", &e))?;
+                let json: Result<Vec<_>, String> = rows.iter().map(row_to_json).collect();
+                serde_json::to_vec(&json?).map_err(|e| format!("db query serialize: {e}"))
+            }
         }
-        let rows = q
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_err("db query", &e))?;
-        let out = rows
-            .iter()
-            .map(row_to_json)
-            .collect::<Result<Vec<_>, _>>()?;
-        serde_json::to_vec(&out).map_err(|e| format!("db query serialize: {e}"))
     }
 
     async fn exec(&self, sql: &str, params: &[serde_json::Value]) -> Result<Vec<u8>, String> {
@@ -663,31 +887,52 @@ impl Client {
             "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
         )?;
         let sql = shape_tag(sql, params);
-        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for p in params {
-            q = bind_value(q, p);
+        match &self.pool {
+            Pooled::Pg(p) => {
+                let mut q: Query<'_, Postgres, PgArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value_pg(q, v);
+                }
+                let res = q
+                    .execute(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db exec", &e))?;
+                serde_json::to_vec(&(res.rows_affected() as i64))
+                    .map_err(|e| format!("db exec serialize: {e}"))
+            }
+            Pooled::Any(p) => {
+                let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value(q, v);
+                }
+                let res = q
+                    .execute(p)
+                    .await
+                    .map_err(|e| map_sqlx_err("db exec", &e))?;
+                serde_json::to_vec(&(res.rows_affected() as i64))
+                    .map_err(|e| format!("db exec serialize: {e}"))
+            }
         }
-        let res = q
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_err("db exec", &e))?;
-        serde_json::to_vec(&(res.rows_affected() as i64))
-            .map_err(|e| format!("db exec serialize: {e}"))
     }
 
     async fn begin(&self) -> Result<u64, String> {
-        let tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| map_sqlx_err("db tx begin", &e))?;
+        let inner = match &self.pool {
+            Pooled::Pg(p) => TxInner::Pg(tokio::sync::Mutex::new(Some(
+                p.begin()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx begin", &e))?,
+            ))),
+            Pooled::Any(p) => TxInner::Any(tokio::sync::Mutex::new(Some(
+                p.begin()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx begin", &e))?,
+            ))),
+        };
         let id = self.next_tx.fetch_add(1, Ordering::SeqCst) + 1;
-        self.txs.lock().unwrap().insert(
-            id,
-            Arc::new(Tx {
-                tx: tokio::sync::Mutex::new(Some(tx)),
-            }),
-        );
+        self.txs
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(Tx { tx: inner }));
         Ok(id)
     }
 
@@ -707,28 +952,45 @@ impl Client {
         params: &[serde_json::Value],
     ) -> Result<Vec<u8>, String> {
         let tx = self.tx(tx_id)?;
-        let mut g = tx.tx.lock().await;
-        let Some(t) = g.as_mut() else {
-            return Err("tx finished".into());
-        };
         oj_plugin_ffi::jsint::reject_u64_markers(
             params,
             "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
         )?;
         let sql = shape_tag(sql, params);
-        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for p in params {
-            q = bind_value(q, p);
+        match &tx.tx {
+            TxInner::Pg(m) => {
+                let mut g = m.lock().await;
+                let Some(t) = g.as_mut() else {
+                    return Err("tx finished".into());
+                };
+                let mut q: Query<'_, Postgres, PgArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value_pg(q, v);
+                }
+                let rows = q
+                    .fetch_all(&mut **t)
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx query", &e))?;
+                let json: Result<Vec<_>, String> = rows.iter().map(row_to_json_pg).collect();
+                serde_json::to_vec(&json?).map_err(|e| format!("db tx query serialize: {e}"))
+            }
+            TxInner::Any(m) => {
+                let mut g = m.lock().await;
+                let Some(t) = g.as_mut() else {
+                    return Err("tx finished".into());
+                };
+                let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value(q, v);
+                }
+                let rows = q
+                    .fetch_all(&mut **t)
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx query", &e))?;
+                let json: Result<Vec<_>, String> = rows.iter().map(row_to_json).collect();
+                serde_json::to_vec(&json?).map_err(|e| format!("db tx query serialize: {e}"))
+            }
         }
-        let rows = q
-            .fetch_all(&mut **t)
-            .await
-            .map_err(|e| map_sqlx_err("db tx query", &e))?;
-        let out = rows
-            .iter()
-            .map(row_to_json)
-            .collect::<Result<Vec<_>, _>>()?;
-        serde_json::to_vec(&out).map_err(|e| format!("db tx query serialize: {e}"))
     }
 
     async fn tx_exec(
@@ -738,25 +1000,45 @@ impl Client {
         params: &[serde_json::Value],
     ) -> Result<Vec<u8>, String> {
         let tx = self.tx(tx_id)?;
-        let mut g = tx.tx.lock().await;
-        let Some(t) = g.as_mut() else {
-            return Err("tx finished".into());
-        };
         oj_plugin_ffi::jsint::reject_u64_markers(
             params,
             "postgres bigint is i64 — store it as text, or use a MySQL BIGINT UNSIGNED column",
         )?;
         let sql = shape_tag(sql, params);
-        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
-        for p in params {
-            q = bind_value(q, p);
+        match &tx.tx {
+            TxInner::Pg(m) => {
+                let mut g = m.lock().await;
+                let Some(t) = g.as_mut() else {
+                    return Err("tx finished".into());
+                };
+                let mut q: Query<'_, Postgres, PgArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value_pg(q, v);
+                }
+                let res = q
+                    .execute(&mut **t)
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx exec", &e))?;
+                serde_json::to_vec(&(res.rows_affected() as i64))
+                    .map_err(|e| format!("db tx exec serialize: {e}"))
+            }
+            TxInner::Any(m) => {
+                let mut g = m.lock().await;
+                let Some(t) = g.as_mut() else {
+                    return Err("tx finished".into());
+                };
+                let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+                for v in params {
+                    q = bind_value(q, v);
+                }
+                let res = q
+                    .execute(&mut **t)
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx exec", &e))?;
+                serde_json::to_vec(&(res.rows_affected() as i64))
+                    .map_err(|e| format!("db tx exec serialize: {e}"))
+            }
         }
-        let res = q
-            .execute(&mut **t)
-            .await
-            .map_err(|e| map_sqlx_err("db tx exec", &e))?;
-        serde_json::to_vec(&(res.rows_affected() as i64))
-            .map_err(|e| format!("db tx exec serialize: {e}"))
     }
 
     async fn tx_commit(&self, tx_id: u64) -> Result<Vec<u8>, String> {
@@ -766,12 +1048,24 @@ impl Client {
             .unwrap()
             .remove(&tx_id)
             .ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
-        let Some(t) = tx.tx.lock().await.take() else {
-            return Err("tx finished".into());
-        };
-        t.commit()
-            .await
-            .map_err(|e| map_sqlx_err("db tx commit", &e))?;
+        match &tx.tx {
+            TxInner::Pg(m) => {
+                let Some(t) = m.lock().await.take() else {
+                    return Err("tx finished".into());
+                };
+                t.commit()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx commit", &e))?;
+            }
+            TxInner::Any(m) => {
+                let Some(t) = m.lock().await.take() else {
+                    return Err("tx finished".into());
+                };
+                t.commit()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx commit", &e))?;
+            }
+        }
         Ok(b"".to_vec())
     }
 
@@ -782,12 +1076,24 @@ impl Client {
             .unwrap()
             .remove(&tx_id)
             .ok_or_else(|| format!("db: unknown tx {tx_id}"))?;
-        let Some(t) = tx.tx.lock().await.take() else {
-            return Err("tx finished".into());
-        };
-        t.rollback()
-            .await
-            .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
+        match &tx.tx {
+            TxInner::Pg(m) => {
+                let Some(t) = m.lock().await.take() else {
+                    return Err("tx finished".into());
+                };
+                t.rollback()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
+            }
+            TxInner::Any(m) => {
+                let Some(t) = m.lock().await.take() else {
+                    return Err("tx finished".into());
+                };
+                t.rollback()
+                    .await
+                    .map_err(|e| map_sqlx_err("db tx rollback", &e))?;
+            }
+        }
         Ok(b"".to_vec())
     }
 }
@@ -1115,6 +1421,46 @@ mod tests {
         let e = undecodable_column("amount", "NUMERIC");
         assert!(e.contains("amount") && e.contains("NUMERIC"), "{e}");
         assert!(e.contains("cast"), "报错须给出改写线索: {e}");
+        assert!(e.contains("db-guide.md"), "报错须指到读侧口径文档: {e}");
+    }
+
+    /// `NUMERIC` 文本化口径（v0.1.3 / L6，离线）：去尾零、保有效位。
+    ///
+    /// 这条钉的是 sqlx 的标度失真（`scale = (digits.len()-weight-1)*4`）：真库读出 `1.5`
+    /// 时 `BigDecimal` 的标度是 4，直接 `to_string()` 会给出 `1.5000`（假精度）。
+    #[test]
+    fn given_padded_scale_when_decimal_text_then_trailing_zeros_stripped() {
+        use std::str::FromStr;
+        let cases = [
+            ("1.5000", "1.5"),
+            ("0.1000", "0.1"),
+            ("1234.5678", "1234.5678"),
+            ("0.12345000", "0.12345"),
+            ("10000", "10000"),
+            ("-2.5000", "-2.5"),
+            ("0.0000", "0"),
+        ];
+        for (raw, want) in cases {
+            let d = BigDecimal::from_str(raw).unwrap();
+            assert_eq!(decimal_text(&d), want, "输入 {raw}");
+        }
+        // 精度不得被削减：20 位小数原样保留。
+        let d = BigDecimal::from_str("0.12345678901234567890").unwrap();
+        assert_eq!(decimal_text(&d), "0.1234567890123456789");
+    }
+
+    /// `safe_ident` 的消毒/截断（离线）：错误串是日志注入面。
+    #[test]
+    fn given_hostile_column_name_when_safe_ident_then_control_chars_stripped() {
+        assert_eq!(safe_ident("col"), "col");
+        assert_eq!(safe_ident("a\nb\tc"), "abc");
+        assert_eq!(safe_ident("x\u{0}y"), "xy");
+        let long = "a".repeat(100);
+        let out = safe_ident(&long);
+        assert_eq!(out.chars().count(), 65, "64 字符 + 省略号");
+        assert!(out.ends_with('…'));
+        // 未截断时不得画蛇添足加省略号（含多字节字符的列名也不能误判）。
+        assert_eq!(safe_ident("列名"), "列名");
     }
 
     /// 离线 sqlite 全路径 roundtrip（dev 构建统一出 sqlite 驱动，生产 cdylib 仍单方言）：
@@ -1648,9 +1994,12 @@ mod tests {
         assert_eq!((cat, retry, disp), ("connection", true, "close"));
     }
 
-    /// 不可解码列类型响亮报错（env-gated，`OJ_TEST_PG`）：PG 的 jsonb 等类型 sqlx Any
-    /// 不支持——池路径在 fetch 阶段即 AnyDriverError；typed 流式路径必须走
-    /// `undecodable_column` 点名列名+类型，**绝不静默 null 返回错值**。
+    /// 未解码的列类型必须响亮报错（env-gated，`OJ_TEST_PG`）：`point` / `interval` 这类
+    /// 本插件不覆盖的类型，池路径与 typed 流式路径**都要**走 `undecodable_column`
+    /// 点名列名+类型，**绝不静默 null 返回错值**。
+    ///
+    /// v0.1.3（L6 / U-6）把 `jsonb` 从本例移出（已可解码，见
+    /// `real_pg_dialect_types_decode_readable`），改钉仍不支持的 `point`。
     #[tokio::test(flavor = "multi_thread")]
     async fn real_postgres_unsupported_column_types_error_loudly() {
         let Ok(url) = std::env::var("OJ_TEST_PG") else {
@@ -1665,20 +2014,25 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        // 池路径（Any）：行转换在 fetch 阶段即报错（点名列名）。
+        // 池路径（typed PG）：行转换报错（点名列名 + 可执行提示）。
         let e = drive(&mut query(
             h,
-            RString::from("select '[1,2]'::jsonb as payload"),
+            RString::from("select point(1,2) as shape"),
             RString::from("[]"),
         ))
         .await
         .unwrap_err();
-        assert!(e.contains("payload"), "报错须点名 jsonb 列: {e}");
+        assert!(e.contains("shape"), "报错须点名 shape 列: {e}");
+        assert!(e.contains("POINT"), "报错须点名 PG 类型 POINT: {e}");
+        assert!(
+            e.contains("cast(shape as text)"),
+            "应给出可执行的 SQL 提示: {e}"
+        );
 
         // typed 流式路径：行转换响亮报错（本修复守护的分支）。
         let bytes = drive(&mut stream_open(
             h,
-            RString::from("select '[1,2]'::jsonb as payload"),
+            RString::from("select point(1,2) as shape"),
             RString::from("[]"),
         ))
         .await
@@ -1692,8 +2046,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         let e = v["error"].as_str().unwrap_or_default();
         assert!(
-            e.contains("payload") && e.contains("decode"),
-            "typed 流式必须点名 jsonb 列而非静默 null: {v}"
+            e.contains("shape") && e.contains("decode"),
+            "typed 流式必须点名 shape 列而非静默 null: {v}"
         );
         close(h);
     }
@@ -1740,9 +2094,9 @@ mod tests {
         assert_eq!(row["t"], serde_json::json!("txt"), "{v}");
         assert!(v["error"].is_null(), "不应有带内错误: {v}");
 
-        // 与 `db.query`（Any 路径）逐值对齐：同一列在流式与查询上不许给出不同结论。
-        // `real`/FLOAT4 两条路径都**不支持**（Any 的 `f64::compatible` 只认 FLOAT8），
-        // 这里把「统一不支持」也钉住，避免将来只补一头造成分叉。
+        // 与 `db.query`（同为 typed 池，v0.1.3 / L6 起）逐值对齐：同一列在流式与查询上
+        // 不许给出不同结论。`real`/FLOAT4 过去两条路径都**不支持**，L6 起两条都支持，
+        // 此处把「一致」钉住，避免将来只补一头造成分叉。
         let b = drive(&mut query(
             h,
             RString::from("select 2147483647::int4 as i4, (-32768)::int2 as i2"),
@@ -1753,17 +2107,148 @@ mod tests {
         let vq: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(row["i4"], vq[0]["i4"], "stream/query i4 必须一致: {vq}");
         assert_eq!(row["i2"], vq[0]["i2"], "stream/query i2 必须一致: {vq}");
-        let e = drive(&mut query(
+        let b = drive(&mut query(
             h,
             RString::from("select 1.1::real as r4"),
             RString::from("[]"),
         ))
         .await
-        .unwrap_err();
-        assert!(
-            e.contains("REAL") && e.contains("decode"),
-            "`real` 在查询路径应保持响亮报错: {e}"
+        .expect("query real");
+        let vq: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        // FLOAT4 是 4 字节浮点，1.1 的真实值就是 1.100000023841858（不回退成 1.1，
+        // 那才是静默错值）。
+        assert_eq!(
+            vq[0]["r4"],
+            serde_json::json!(1.1f32 as f64),
+            "real 应可解码: {vq}"
         );
+        close(h);
+    }
+
+    /// 方言类型解码（v0.1.3 / L6 / PRD U-6，env-gated 真库）：`NUMERIC` / 日期时间 / `JSON(B)` /
+    /// `UUID` / 数组 / `FLOAT4` 的可读性，且 **`query` 与 `stream` 两条路径同口径**。
+    ///
+    /// 输出口径（`docs/devkit/db-guide.md` §10.6）：`NUMERIC` 走**字符串**（不经 f64，保精度）、
+    /// 日期时间走 ISO 8601（`TIMESTAMP` 无时区，`TIMESTAMPTZ` 带 `Z`）、`JSON`/`JSONB` 走
+    /// **JSON 文本**、`UUID` 走规范文本、数组走 **JSON 数组**（元素 NULL → JSON `null`）。
+    ///
+    /// 这条用例同时是「typed 池化」的验收：v0.1.2 及以前 `query`/`tx_*` 走 `Pool<Any>`，
+    /// 这些类型在 Any 上**根本取不出来**——只补 `column_json_pg` 会让流式能读、查询报错。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_pg_dialect_types_decode_readable() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        let sql = "select 1234.5678::numeric(18,4) as amount, \
+                          '2026-09-19'::date as made_on, \
+                          '10:11:12.345678'::time as made_at, \
+                          '2026-09-19 10:11:12.345678'::timestamp as made_ts, \
+                          '2026-09-19 10:11:12.345678+00'::timestamptz as made_tstz, \
+                          '{\"a\":1}'::jsonb as payload_b, \
+                          '{\"a\":1}'::json as payload, \
+                          '2f9e8f3a-1c4b-4d5e-8f6a-7b8c9d0e1f2a'::uuid as uid, \
+                          array[1, null, 3]::int4[] as i4s, \
+                          array['x', null]::text[] as texts, \
+                          array[1.5, 2.5]::numeric[] as nums, \
+                          1.1::real as r4, \
+                          null::numeric as nullable_num";
+        let b = drive(&mut query(h, RString::from(sql), RString::from("[]")))
+            .await
+            .expect("dialect types must read (query path)");
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let r = &v[0];
+        assert_eq!(r["amount"], serde_json::json!("1234.5678"), "{v}");
+        assert_eq!(r["made_on"], serde_json::json!("2026-09-19"), "{v}");
+        assert_eq!(r["made_at"], serde_json::json!("10:11:12.345678"), "{v}");
+        assert_eq!(
+            r["made_ts"],
+            serde_json::json!("2026-09-19T10:11:12.345678"),
+            "{v}"
+        );
+        assert_eq!(
+            r["made_tstz"],
+            serde_json::json!("2026-09-19T10:11:12.345678Z"),
+            "{v}"
+        );
+        // JSON 走 JSON 文本（PRD U-6 口径：不自动 JSON.parse，由业务侧决定）。
+        for k in ["payload_b", "payload"] {
+            let txt = r[k]
+                .as_str()
+                .unwrap_or_else(|| panic!("{k} 应为字符串: {v}"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(txt).unwrap(),
+                serde_json::json!({"a": 1}),
+                "{k}: {v}"
+            );
+        }
+        assert_eq!(
+            r["uid"],
+            serde_json::json!("2f9e8f3a-1c4b-4d5e-8f6a-7b8c9d0e1f2a"),
+            "{v}"
+        );
+        // 数组 → JSON 数组；元素 NULL → null（这才是 `Vec<Option<T>>` 的意义）。
+        assert_eq!(r["i4s"], serde_json::json!([1, null, 3]), "{v}");
+        assert_eq!(r["texts"], serde_json::json!(["x", null]), "{v}");
+        assert_eq!(r["nums"], serde_json::json!(["1.5", "2.5"]), "{v}");
+        assert_eq!(r["r4"], serde_json::json!(1.1f32 as f64), "{v}");
+        assert!(r["nullable_num"].is_null(), "{v}");
+
+        // stream 路径同口径。
+        let bytes = drive(&mut stream_open(h, RString::from(sql), RString::from("[]")))
+            .await
+            .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        let b = drive(&mut stream_next(h, sid)).await.expect("stream next");
+        let sv: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(sv["error"].is_null(), "不应有带内错误: {sv}");
+        let sr = &sv["rows"][0];
+        for k in [
+            "amount",
+            "made_on",
+            "made_at",
+            "made_ts",
+            "made_tstz",
+            "payload_b",
+            "payload",
+            "uid",
+            "i4s",
+            "texts",
+            "nums",
+            "r4",
+        ] {
+            assert_eq!(sr[k], r[k], "stream/query 的 {k} 必须一致: {sv}");
+        }
+
+        // 事务路径（`TxInner::Pg`）：v0.1.2 及以前 `tx_query` 走 `Pool<Any>` 的连接，
+        // 同样读不出这些类型——这是 typed 池化最容易漏的一处，必须显式钉住。
+        let b = drive(&mut begin(h)).await.expect("begin");
+        let tx_id = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["tx_id"]
+            .as_u64()
+            .unwrap();
+        let b = drive(&mut tx_query(
+            h,
+            tx_id,
+            RString::from(sql),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("tx_query must decode dialect types");
+        let tv: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        for k in ["amount", "uid", "i4s", "nums", "made_tstz"] {
+            assert_eq!(tv[0][k], r[k], "tx/query 的 {k} 必须一致: {tv}");
+        }
+        drive(&mut tx_rollback(h, tx_id)).await.expect("rollback");
         close(h);
     }
 

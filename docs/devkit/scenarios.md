@@ -639,7 +639,7 @@ expect(toBigInt(m.toString()) + 1n === m + 1n).toBe(true);   // BigInt 精确
 | 并发下仍然分配出重复序号 | `max+1` 本身有竞态——改用 `db.nextSeq(name)`（v0.1.24，单语句原子） |
 | 同一条 SQL 混用字符串/数字参数后报 `invalid byte sequence … 0x00` | **v0.1.24 起平台自动按参数形态分缓存键，无需再规避**；若仍出现，检查 PG 插件是否随宿主重建 |
 | `db param: u64 value … is not supported on this path` | 在 PG/SQLite 上用了 `toUBigInt()`——它们的 bigint 是 i64；改存 text 或换 MySQL `BIGINT UNSIGNED` |
-| MySQL: `column 'x' has MySQL type 'DECIMAL' … does not decode yet` | 读侧不支持该列类型（`DECIMAL`/`JSON`/时间/`BIT`/`GEOMETRY`）——**报错而非静默给 `null`**；在 SQL 里 `cast(x as char) as x`，别用 `select *`。`BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` |
+| MySQL: `column 'x' has MySQL type 'GEOMETRY' … does not decode yet` | 读侧**仍未支持**的类型（`GEOMETRY` 家族、`SET` 等）——**报错而非静默给 `null`**；`cast(x as char) as x` / `ST_AsText(x) as x`。`DECIMAL`/时间/`JSON`/`BIT` 自 v0.1.94 起可直接读（见场景 48）。`BOOLEAN`/`TINYINT(1)` 读出是 `1`/`0` |
 
 > 完整契约（值域分流表、接受/拒绝矩阵、u64 与已知债）见仓库 `docs/numeric-limits.md`。
 
@@ -3628,3 +3628,193 @@ const ep = db.epoch("rep");
 
 > 正确性不依赖 JS 持有的 epoch：查询 op 始终按名从 host registry 重解析 accessor。即便恶意 handler
 > 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记）。
+
+## 场景 48：读写十进制 / 时间 / JSON / UUID / 数组列（v0.1.94）
+
+> 一句话：**读**这些列不用再 cast（v0.1.94 起 mysql / postgres 插件直接解码），**写**仍然要显式
+> `::type` —— 新类型只读，没有对称编码。
+
+### ① 表结构（真库里早已存在的普通列）
+
+```sql
+-- postgres
+create table invoice (
+  id       int4 primary key,
+  amount   numeric(18,4) not null,
+  paid_at  timestamptz,
+  meta     jsonb,
+  ext_id   uuid,
+  tags     text[]
+);
+```
+
+```sql
+-- mysql
+create table invoice (
+  id      int primary key,
+  amount  decimal(18,4) not null,
+  paid_at timestamp null,
+  meta    json,
+  flags   bit(5)
+);
+```
+
+### ② 读：类型 → JS 值（照抄可用）
+
+```ts
+import type { Ctx } from "oj";
+
+export async function get(ctx: Ctx): Promise<unknown> {
+  const id = Number(ctx.query.id);
+  const [row] = await db.query(
+    "select id, amount, paid_at, meta, ext_id, tags from invoice where id = ?", [id],
+  );
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    // 十进制是**字符串**：要算钱用字符串/大数运算，别 Number()（会丢精度）
+    amount: row.amount,            //  "1234.5678"
+    amountFen: Math.round(Number(row.amount) * 100),   //  只在小额时这么干
+    paidAt: row.paid_at,           //  "2026-09-19T10:11:12.345678Z"（带 Z = UTC）
+    // JSON 列是 **JSON 文本**，要不要 parse 由你决定
+    meta: row.meta === null ? null : JSON.parse(row.meta as string),
+    extId: row.ext_id,             //  "2f9e8f3a-1c4b-4d5e-8f6a-7b8c9d0e1f2a"
+    tags: row.tags,                //  ["a", null, "c"] —— 数组元素 NULL 保留为 null
+  };
+}
+```
+
+### ③ 写：必须显式转回列类型（PG 严格类型）
+
+```ts
+// 正确：在 SQL 里给参数定型
+await db.exec(
+  "insert into invoice (id, amount, paid_at, meta, ext_id, tags) \
+   values (?, ?::numeric, ?::timestamptz, ?::jsonb, ?::uuid, ?::text[])",
+  [1, "1234.5678", "2026-09-19T10:11:12.345678Z", JSON.stringify({ a: 1 }),
+   "2f9e8f3a-1c4b-4d5e-8f6a-7b8c9d0e1f2a", ["a", "c"]],
+);
+
+// 错误：直接绑字符串 → column "amount" is of type numeric but expression is of type text (42804)
+await db.exec("insert into invoice (id, amount) values (?, ?)", [1, "1234.5678"]);
+```
+
+MySQL 会隐式转换，但**别依赖**——同一段代码搬到 PG 就炸。
+
+### ④ 排障：还剩哪些列不能读
+
+- MySQL 仍报错的：`GEOMETRY` 家族、`SET` → `select ST_AsText(shape) as shape` 或
+  `cast(x as char) as x`；
+- PG 仍报错的：`timetz`、`bit`/`varbit`、范围类型、几何（`point`/`line`…）、复合类型、
+  **多维数组** → `cast(x as text) as x`；
+- 别对遗留宽表用 `select *`：一列不支持就整行报错（这是有意的，静默 `null` 是错值）。
+  列出需要的列，或先把不支持的类型 cast 掉。
+
+> 完整口径（每个类型的输出格式、PG `numeric` 去尾零的成因、MySQL/PG 标度差异）见
+> `db-guide.md` §10.6；报错文案与限制表见 `api-manual.md` §13。
+
+## 场景 49：多步表单跨请求事务（`db.session`，v0.1.95）
+
+> 一句话：一个事务要横跨多个 HTTP 请求（向导、审批、批量导入确认），就别想「把连接留住」——
+> 用**会话 id**（`tx_ab12_…`）当凭据，服务端按 id 找回那条连接与事务。
+
+`db.tx` 的事务边界是**一个请求**：handler 返回即提交。多步流程每步一个请求，必须用 `db.session`。
+
+### ① 开配置（默认关，不开就是「能力不存在」）
+
+```yaml
+db_session:
+  enabled: true
+  allow: { roles: ["draft-editor"] }   # 空 allow 会被装配期拒绝启动
+  max_sessions: 32
+  max_per_owner: 8
+  idle_timeout_secs: 300               # 5 分钟没人动 → 自动回滚
+  max_lifetime_secs: 1800              # 无论如何最长 30 分钟
+  require_identity: true               # 匿名请求不能开会话
+```
+
+改这段要**重启**（热更归类 `restart_pending`），但重启外的热更**不会**丢掉已开的会话。
+
+### ② 步骤 1：开会话 + 写草稿 + 把 id 存到会话外
+
+```ts
+// src/draft/start/api.ts
+export async function post(ctx: Ctx) {
+  const uid = http.user?.id;
+  if (!uid) { json.fail(401, "login required"); return; }
+
+  const s = await db.session.begin();            // 默认 DB("default")
+  // 事务内的写入在提交前对别的请求不可见 —— id 必须存到事务**外**（kv / 另一条连接）
+  await db.session.exec(s.id,
+    "insert into draft (uid, body, state) values (?, ?, 'open')", [uid, http.body.text]);
+
+  await kv.set(`draft-session:${uid}`, s.id);   // 生产建议存进你自己的业务表
+  await kv.expire(`draft-session:${uid}`, 900); // 别让它比会话活得久
+  json.ok({ sessionId: s.id.slice(0, 8) });     // 前端只需要知道"有待续的会话"
+}
+```
+
+`s.id` 是 **bearer token**：拿到就能改你的事务。不要放进 URL / 前端日志 / 错误上报。
+
+### ③ 步骤 2：后续请求 attach，之后所有写法都走这条连接
+
+```ts
+// src/draft/continue/api.ts
+export async function post(ctx: Ctx) {
+  const uid = http.user?.id;
+  const id = await kv.get(`draft-session:${uid}`);
+  if (!id) { json.fail(409, "no open draft session (it may have expired)"); return; }
+
+  await db.session.attach(id);                   // 本请求绑定
+  // 下面三条全部落在同一个事务里
+  await db.exec("update draft set body = ? where uid = ?", [http.body.text, uid]);
+  const rows = await db.table("draft").where({ field: "uid", op: "eq", value: uid }).all();
+  await db.session.touch(id);                    // 长表单：只推空闲计时，不延长总寿命
+  json.ok({ rows });
+}
+```
+
+`attach` 是**请求级**的：请求结束自动解绑，会话本身留着。一个请求只能绑一个别名。
+
+### ④ 步骤 3：提交或放弃；`finally` 里用 `close` 兜底
+
+```ts
+// src/draft/submit/api.ts
+export async function post(ctx: Ctx) {
+  const uid = http.user?.id;
+  const id = await kv.get(`draft-session:${uid}`);
+  if (!id) { json.fail(409, "no open draft session"); return; }
+
+  try {
+    if (http.body.action === "discard") {
+      await db.session.rollback(id);
+      json.ok({ ok: true, discarded: true });
+      return;
+    }
+    await db.session.exec(id, "update draft set state = 'submitted' where uid = ?", [uid]);
+    await db.session.commit(id);
+    json.ok({ ok: true });
+  } finally {
+    await kv.del(`draft-session:${uid}`).catch(() => {});
+    // close 是幂等的：已 commit/rollback 过就什么都不做，失败也不上抛
+    await db.session.close(id).catch(() => {});
+  }
+}
+```
+
+### ⑤ 常见坑
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `db session: cross-request transactions are disabled (set db_session.enabled: true …)` | 没开 `db_session.enabled` | 按文案开配置并重启；`allow` 必须命中调用方 |
+| `tx session tx_ab12_… not found (unknown, expired, or owned by another caller)`（和「别人的会话」文案一样） | id 拼错 / 已结束 / 已过期 / 主体不同 | 刻意不区分，防探测；检查生命周期与归属（自己的已结束会话会给更具体的 `is closed (commit)` / `expired (idle_timeout)`） |
+| `db session: BEGIN is not allowed inside a cross-request transaction` | 会话里手写事务控制（`SET`/`USE` 同禁） | 用 `commit`/`rollback` 结束；MySQL 这些语句隐式提交会让回滚变成假回滚 |
+| `attached to db 'x', not 'y' (detach first)` | `begin` 与后续语句不在同一别名 | detach 后用开始会话的那个别名 |
+| `a db session is attached to this request; db.tx cannot nest inside it (detach first)` | 请求里已 attach 会话又开 `db.tx` | 二选一，别叠加；反向是 `per-request transaction active on this request; finish db.tx before opening a session` |
+| `db session lifetime exhausted during query` | 超过 `max_lifetime_secs` | 拆批；到点的会话会被回滚丢弃（连接不归还） |
+| 开了会话后同别名别的请求卡住 | **sqlite 池只有 1 条连接** | 跨请求事务只用 mysql/postgres |
+| 每隔几分钟数据「自己没了」 | 空闲超时回收（日志 `DB_SESSION_TIMEOUT`） | 每步之间 `touch`；别把会话当持久存储，落盘由业务表负责 |
+
+> 方法面、三道门（`enabled`+`allow` / `db_access` / 身份）、六条硬规则见 `db-guide.md` §4.5；
+> 报错文案与限制表见 `api-manual.md` §13。

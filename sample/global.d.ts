@@ -716,6 +716,14 @@ declare global {
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
     // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
     tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
+    /** 跨请求事务会话（v0.1.95）：`begin()` 拿 `tx_…` id，后续请求 `attach(id)` 之后
+     * `db.query` / `db.exec` / `db.table()` / `nextSeq` / `listTables` 全部落在同一条连接与
+     * 同一个事务上。默认**关闭**（`db_session.enabled: true` + `allow` 命中才可用）。
+     * 红线：id 是 **bearer 凭据**（别回给最终用户/别写日志）；会话只锁一个别名；会话内禁
+     * `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/`START`/`SET`/`USE`/`ATTACH`/`DETACH`/
+     * `PRAGMA`（MySQL 隐式提交 ⇒ 假回滚）；与 `db.tx` 双向互斥；`db.stream` 不可用；
+     * 生命周期归 host（空闲/超寿命即回滚判死），**没有自动提交**。 */
+    session: DBSessionApi;
     /** 动态数据源登记（client 轴，v0.1.91）：运行期把 DSN 登记为命名数据源。
      * 登记后别名进 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream）；
      * 此处只暴露**管理面**，使用面一律走 `DB(name)`。`delete` 自动驱逐 `DB()` 缓存，
@@ -737,6 +745,75 @@ declare global {
     registeredAtMs: number;
     /** 命中计数（query/exec/stream/内省经 `lookup` 自动累加）。 */
     queries: number;
+  }
+
+  /** 跨请求事务会话（`db.session`，v0.1.95）。配置段 `db_session:`（`enabled` 默认 false）。 */
+  interface DBSessionApi {
+    /** 开会话（`DB(name)` 上调用；默认 `default`）→ 摘要（含 id / 有效期）。
+     * 缺身份（无 `user.id` 且无 tenant）时被 `require_identity` 拒。 */
+    begin(name?: string): Promise<DbSessionSummary>;
+    /** 把会话绑到**本请求**：之后 `db.query`/`db.exec`/`db.table()`/`nextSeq`/`listTables`
+     * 全走该连接。一个请求只能绑一个会话、一个别名；已存在请求内 `db.tx` 时拒绝。 */
+    attach(id: string): Promise<boolean>;
+    /** 解除本请求的绑定（会话本身仍在）。 */
+    detach(): Promise<boolean>;
+    /** 不绑定也可逐语句执行（同 `db.tx` 内的 tx 句柄语义）。 */
+    query(id: string, sql: string, params?: unknown[]): Promise<Row[]>;
+    exec(id: string, sql: string, params?: unknown[]): Promise<number>;
+    /** 提交；超时（5s）时文案明示 outcome UNCERTAIN。失败也摘表，不允许续用。 */
+    commit(id: string): Promise<boolean>;
+    /** 回滚并销毁。 */
+    rollback(id: string): Promise<boolean>;
+    /** 幂等收尾（`finally` 用）：best-effort 回滚；失败不外抛。 */
+    close(id: string): Promise<boolean>;
+    /** 只推空闲计时（长表单续期），**不**延长 `max_lifetime_secs`。 */
+    touch(id: string): Promise<{ expiresInMs: number }>;
+    /** 关掉**本主体**全部会话（登出用）→ 关闭数量。 */
+    closeAll(): Promise<number>;
+    /** 本主体的活跃会话摘要（绝不列他人）。 */
+    list(): Promise<DbSessionSummary[]>;
+    /** 单条摘要；已结束的会话给「死法 + 原因」诊断（他人/未知 id 与 not found 同文案）。 */
+    info(id: string): Promise<DbSessionSummary>;
+    /** 运维观察面：只统计**本主体**的活跃数与全局回收计数。 */
+    stats(): Promise<DbSessionStats>;
+  }
+
+  /** 会话摘要（`db.session.begin/info/list` 的元素）。 */
+  interface DbSessionSummary {
+    /** `tx_<4hex boot>_<32hex>`。**bearer 凭据**：日志/报错只应出现前缀。 */
+    id: string;
+    /** 物理别名（判权权威；会话只锁这个别名）。 */
+    alias: string;
+    dialect: string;
+    /** `open` = 活跃（死掉的会话不会出现在返回值里，而是以错误 + 墓碑诊断给出）。 */
+    state: "open" | "discarded";
+    ageMs: number;
+    idleMs: number;
+    /** 距被判死还有多久（空闲/总寿命取小）；0 = 已到期。 */
+    expiresInMs: number;
+    /** 已执行语句数。 */
+    ops: number;
+    /** 建会话的 `user.id`（匿名 null）。 */
+    createdBy: string | null;
+  }
+
+  /** `db.session.stats()` 的返回。 */
+  interface DbSessionStats {
+    enabled: boolean;
+    /** 本主体当前活跃会话数。 */
+    active: number;
+    maxSessions: number;
+    maxPerOwner: number;
+    idleTimeoutSecs: number;
+    maxLifetimeSecs: number;
+    /** 超时回收计数。 */
+    timedOut: number;
+    /** 判死/丢弃计数（别名变更、寿命耗尽）。 */
+    discarded: number;
+    /** 因容量上限被拒的开会话请求数。 */
+    rejected: number;
+    /** 进程启动标记（id 前缀里那 4 个 hex 的来源）。 */
+    boot: string;
   }
 
   /** 动态数据源登记管理面（`db.client`）。配置段 `db_client:`（`enabled` 默认 false）。 */

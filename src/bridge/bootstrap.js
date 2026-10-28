@@ -49,6 +49,19 @@ import {
   op_db_access_grant,
   op_db_access_revoke,
   op_db_epoch,
+  op_db_session_begin,
+  op_db_session_attach,
+  op_db_session_detach,
+  op_db_session_query,
+  op_db_session_exec,
+  op_db_session_commit,
+  op_db_session_rollback,
+  op_db_session_close,
+  op_db_session_touch,
+  op_db_session_close_all,
+  op_db_session_list,
+  op_db_session_info,
+  op_db_session_stats,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -954,6 +967,20 @@ function dbOpWrap(p) {
   return p;
 }
 
+// v0.1.95: one awaitable surface for db.session. Some of its ops are sync (attach/detach/
+// list/info/stats/touch/closeAll); wrapping them keeps "every session call returns a Promise"
+// true, so a failure always arrives as a rejection at the caller's `await` instead of as a
+// synchronous throw that an outer try/catch around a promise chain would miss.
+function dbSessionCall(fn) {
+  return async (...args) => {
+    try {
+      return await fn(...args);
+    } catch (e) {
+      throw normDbErr(e);
+    }
+  };
+}
+
 globalThis.DB = function (name) {
   name = String(name);
   // U-3 v0.1.93: re-check epoch on EVERY call (host-authoritative generation counter).
@@ -1093,6 +1120,31 @@ globalThis.DB = function (name) {
           } catch (_) {}
           throw e;
         }
+      },
+      // U-4 v0.1.95: cross-request transactions (db.session). A session is a host-owned
+      // transaction identified by an opaque id; it OUTLIVES the request that opened it, so
+      // a multi-step wizard can commit across several HTTP calls. Two ways to use it:
+      //   (a) attach(id) -> this request's db.query/exec/table all ride that connection;
+      //   (b) explicit session.query(id, sql, params) / session.exec(...) per statement.
+      // begin() requires db_session.enabled + an authorized caller. Sessions expire on
+      // idle/max-lifetime and are rolled back by the host; commit/rollback/close end them.
+      // Ids are bearer tokens: never log or return them to end users verbatim.
+      session: {
+        begin: dbSessionCall(() => op_db_session_begin(name)),
+        attach: dbSessionCall((id) => op_db_session_attach(String(id))),
+        detach: dbSessionCall(() => op_db_session_detach()),
+        query: dbSessionCall((id, sql, params) => op_db_session_query(String(id), String(sql), params === undefined ? null : encodeParams(params))),
+        exec: dbSessionCall((id, sql, params) => op_db_session_exec(String(id), String(sql), params === undefined ? null : encodeParams(params))),
+        commit: dbSessionCall((id) => op_db_session_commit(String(id))),
+        rollback: dbSessionCall((id) => op_db_session_rollback(String(id))),
+        // idempotent cleanup: best-effort rollback, never throws on an already-dead session.
+        close: dbSessionCall((id) => op_db_session_close(String(id))),
+        // push the idle timer without extending max lifetime; returns { expiresInMs }.
+        touch: dbSessionCall((id) => op_db_session_touch(String(id))),
+        closeAll: dbSessionCall(() => op_db_session_close_all()),
+        list: dbSessionCall(() => op_db_session_list()),
+        info: dbSessionCall((id) => op_db_session_info(String(id))),
+        stats: dbSessionCall(() => op_db_session_stats()),
       },
     });
   return dbCache.get(name);

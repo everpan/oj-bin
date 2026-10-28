@@ -1,6 +1,6 @@
 [package]
 name = "oj-db-postgres"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "db 轴 postgres cdylib 插件：sqlx Any 单方言（postgres）迁移自 core SqlxAccessor"
 
@@ -18,6 +18,11 @@ sqlx = { version = "0.9", default-features = false, features = [
     "any",
     "postgres",
     "json",
+    # v0.1.3（L6 / U-6）：读侧受限类型解码——NUMERIC → 十进制字符串、日期时间 →
+    # ISO 8601、UUID → 文本、数组 → JSON 数组。`bigdecimal` 同时引入 num-bigint/num-traits。
+    "chrono",
+    "bigdecimal",
+    "uuid",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "io-util", "time"] }
 

@@ -34,6 +34,7 @@ mod db;
 pub mod db_backend;
 pub mod db_error;
 pub mod db_policy;
+pub mod db_session;
 pub mod dialect_caps;
 mod embedded_js;
 mod envelope;
@@ -44,6 +45,7 @@ pub mod frame_pool;
 pub mod fs;
 pub mod generic_axis;
 pub mod guard;
+pub mod handle_core;
 mod http;
 pub mod import_scan;
 mod inspector;
@@ -227,9 +229,17 @@ pub struct StableState {
     /// 动态数据源登记配置段（`db_client:`，L3 v0.1.91）：登记门（谁能建连接）。
     /// 装配期冻结、只读。
     pub db_client: Arc<db_policy::DbClientSection>,
+    /// 跨请求事务会话配置段（`db_session:`，L7 v0.1.95）。缺省 enabled=false
+    /// （与升级前完全一致：无跨请求事务能力）。装配期冻结、只读。
+    pub db_session: Arc<db_policy::DbSessionSection>,
     /// 运行期动态数据源注册表（L3 v0.1.91）：壳 `Arc` 不可变、内部 `Mutex` 变动，
     /// 与 `reload: Arc<OnceLock>` 同哲学，不破 StableState 不可变红线。
     pub client_dbs: Arc<client_db::ClientDbRegistry>,
+    /// 跨请求事务会话注册表（L7 v0.1.95，U-4）：壳 `Arc` 不可变、内部 `Mutex` 变动。
+    /// **进程级生命周期**：热更沿用同一 `StableState`（`app::reuse_backend` 只
+    /// clone `stable`），故会话跨热更存活（这是「跨请求」的应有语义）；配置变更走
+    /// `restart_pending`（不与存活会话打架）。
+    pub tx_sessions: Arc<db_session::TxSessionRegistry>,
     /// 运行期动态授权表（U-1 v0.1.93）：壳 `Arc` 不可变、内部 `Mutex` 变动，不破红线。
     /// 仅作用于「动态登记别名」（client_dbs 命中且非 config `db_access.by_db` 声明）：
     /// grant 写入、revoke 移除；静态 config 兜底不受其影响（防运行时提权覆盖 config 的 deny）。
@@ -316,6 +326,11 @@ pub struct Extras {
     pub db_access: Option<Arc<db_policy::DbAccessSection>>,
     /// 动态数据源登记配置段（`db_client:`，L3 v0.1.91）。None = 默认（enabled=false）。
     pub db_client: Option<Arc<db_policy::DbClientSection>>,
+    /// 跨请求事务会话配置段（`db_session:`，L7 v0.1.95）。None = 默认（enabled=false）。
+    pub db_session: Option<Arc<db_policy::DbSessionSection>>,
+    /// 跨请求事务会话注册表（装配层构造后注入，以便热更前后同源）。
+    /// None = 按 `db_session` 配置现造一个（`oj test` / 嵌入式路径）。
+    pub tx_sessions: Option<Arc<db_session::TxSessionRegistry>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
     pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
     /// 运行期动态授权表（U-1 v0.1.93）。None = 空表（全库按 config 静态策略）。
@@ -364,6 +379,10 @@ pub struct ReqState {
     pub done: bool,
     /// 活跃事务（db.tx；每请求至多一个，reset 时丢弃 = drop 自带回滚）。
     pub tx: Option<Arc<db::ActiveTx>>,
+    /// 已绑定的**跨请求事务会话** id（L7 v0.1.95；`db.session.attach` 写入）。
+    /// 只存 id、句柄留在 `StableState.tx_sessions`——会话的生命周期与请求无关，
+    /// 请求结束不得回滚它（这正是跨请求事务存在的理由）。
+    pub session: Option<String>,
     /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
     pub ws_sends: Vec<WsSend>,
     /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
@@ -415,6 +434,7 @@ impl ReqState {
         self.headers.clear();
         self.done = false;
         self.tx = None;
+        self.session = None;
         self.ws_sends.clear();
         self.ws_close = false;
         self.ws_sess = None;
@@ -484,6 +504,19 @@ deno_core::extension!(
         client_db::op_db_access_grant,
         client_db::op_db_access_revoke,
         client_db::op_db_epoch,
+        db_session::op_db_session_begin,
+        db_session::op_db_session_attach,
+        db_session::op_db_session_detach,
+        db_session::op_db_session_query,
+        db_session::op_db_session_exec,
+        db_session::op_db_session_commit,
+        db_session::op_db_session_rollback,
+        db_session::op_db_session_close,
+        db_session::op_db_session_touch,
+        db_session::op_db_session_close_all,
+        db_session::op_db_session_list,
+        db_session::op_db_session_info,
+        db_session::op_db_session_stats,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,
@@ -830,6 +863,17 @@ impl Bridge {
         {
             dbs.insert("default".to_string(), first);
         }
+        // 跨请求事务会话：配置与注册表分开接（装配层可注入已存在的注册表，
+        // 使热更前后同源——会话是进程级资源，不能因一次 reload 就重开表）。
+        let db_session_cfg = extras
+            .db_session
+            .clone()
+            .unwrap_or_else(|| Arc::new(db_policy::DbSessionSection::default()));
+        let tx_sessions = extras.tx_sessions.clone().unwrap_or_else(|| {
+            Arc::new(db_session::TxSessionRegistry::new(
+                (*db_session_cfg).clone(),
+            ))
+        });
         let stable = Arc::new(StableState {
             kv,
             dbs,
@@ -867,9 +911,11 @@ impl Bridge {
             ldap: extras.ldap,
             db_access: extras.db_access.unwrap_or_default(),
             db_client: extras.db_client.unwrap_or_default(),
+            db_session: db_session_cfg,
             client_dbs: extras
                 .client_dbs
                 .unwrap_or_else(|| Arc::new(client_db::ClientDbRegistry::new(16))),
+            tx_sessions,
             db_access_rt: extras
                 .db_access_rt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
@@ -2586,7 +2632,9 @@ mod tests {
             ldap: None,
             db_access: Arc::new(db_policy::DbAccessSection::default()),
             db_client: Arc::new(db_policy::DbClientSection::default()),
+            db_session: Arc::new(db_policy::DbSessionSection::default()),
             client_dbs: Arc::new(client_db::ClientDbRegistry::new(16)),
+            tx_sessions: Arc::new(db_session::TxSessionRegistry::disabled()),
             db_access_rt: Arc::new(Mutex::new(HashMap::new())),
             db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),
