@@ -73,6 +73,7 @@ mod query;
 mod registry;
 pub mod reload_bridge;
 mod runtime;
+pub mod secret_axis;
 pub mod sql_trace;
 pub mod sso;
 mod stream;
@@ -255,6 +256,9 @@ pub struct StableState {
     pub mgmt_section: Arc<db_policy::MgmtSection>,
     pub mgmt_axes: generic_axis::GenericAxisRegistry,
     pub mgmt: Arc<mgmt::MgmtRegistry>,
+    /// 运行期凭据密钥（U-10 v0.1.101）：`secret.seal/open` 的装配期数据源。
+    /// None = 无密钥装配（op 层 fail-closed）。私钥**永不出 Rust 边界**。
+    pub secret_keys: Option<Arc<crate::secret::RuntimeKeys>>,
     /// 运行期动态授权表（U-1 v0.1.93）：壳 `Arc` 不可变、内部 `Mutex` 变动，不破红线。
     /// 仅作用于「动态登记别名」（client_dbs 命中且非 config `db_access.by_db` 声明）：
     /// grant 写入、revoke 移除；静态 config 兜底不受其影响（防运行时提权覆盖 config 的 deny）。
@@ -355,6 +359,9 @@ pub struct Extras {
     pub mgmt_section: Option<Arc<db_policy::MgmtSection>>,
     pub mgmt_axes: Option<generic_axis::GenericAxisRegistry>,
     pub mgmt: Option<Arc<mgmt::MgmtRegistry>>,
+    /// 运行期凭据密钥（U-10 v0.1.101，`secret.seal/open`）。None = 装配无密钥，
+    /// 两个 op fail-closed（报 not configured）。
+    pub secret_keys: Option<Arc<crate::secret::RuntimeKeys>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
     pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
     /// 运行期动态授权表（U-1 v0.1.93）。None = 空表（全库按 config 静态策略）。
@@ -536,6 +543,8 @@ deno_core::extension!(
         mgmt::op_mgmt_list,
         mgmt::op_mgmt_has,
         mgmt::op_mgmt_call,
+        secret_axis::op_secret_seal,
+        secret_axis::op_secret_open,
         db_session::op_db_session_begin,
         db_session::op_db_session_attach,
         db_session::op_db_session_detach,
@@ -927,6 +936,7 @@ impl Bridge {
                 mgmt_section.max_per_owner,
             ))
         });
+        let secret_keys = extras.secret_keys.clone();
         let stable = Arc::new(StableState {
             kv,
             dbs,
@@ -975,6 +985,7 @@ impl Bridge {
             mgmt_section,
             mgmt_axes,
             mgmt,
+            secret_keys,
             db_access_rt: extras
                 .db_access_rt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
@@ -2663,6 +2674,7 @@ mod tests {
             registry: Arc::new(SchemaRegistry::new()),
             input_contracts: None, // 单测路径不注入契约（默认不校验）
             seq_ensured: std::sync::Mutex::new(std::collections::HashSet::new()),
+            secret_keys: None,
             module_index: None,
             loader: Some(Arc::new(LoaderShared {
                 project_root: root.clone(),

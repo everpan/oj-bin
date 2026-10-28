@@ -1412,6 +1412,16 @@ pub async fn assemble_backend(
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
+    // 运行期凭据密钥（U-10 v0.1.101，`secret.seal/open`）：公钥 = secrets.public_key_path
+    // > 私钥推导（部署机为解封 ENC[...] 本就持有私钥）；皆缺 = None（op 层 fail-closed）。
+    // 显式 public_key_path 配错 → 装配期 fail-loud（配了就要对）。
+    let secret_keys = only_js::secret::load_runtime_keys(
+        cfg.secrets.public_key_path.as_deref(),
+        cfg.secrets.private_key_path.as_deref(),
+        config_dir,
+    )
+    .map_err(|e| format!("secrets: {e}"))?
+    .map(Arc::new);
     // 运行期动态登记注册表（per-process 硬上限 = max_entries；U-7：per-owner 与流预算同源配置）。
     let client_dbs = Arc::new(only_js::bridge::ClientDbRegistry::with_caps(
         db_client.max_entries,
@@ -1472,6 +1482,7 @@ pub async fn assemble_backend(
         let exec_sessions = exec_sessions.clone();
         let mgmt_section = mgmt_section.clone();
         let mgmt_axes = mgmt_axes.clone();
+        let secret_keys = secret_keys.clone();
         let mgmt = mgmt.clone();
         let client_dbs = client_dbs.clone();
         let db_access_rt = db_access_rt.clone();
@@ -1535,6 +1546,8 @@ pub async fn assemble_backend(
                     mgmt_section: Some(mgmt_section.clone()),
                     mgmt_axes: Some(mgmt_axes.clone()),
                     mgmt: Some(mgmt.clone()),
+                    // 运行期凭据密钥（U-10）：与 StableState.secret_keys 同源。
+                    secret_keys: secret_keys.clone(),
                     client_dbs: Some(client_dbs.clone()),
                     db_access_rt: Some(db_access_rt.clone()),
                     db_backend: Some(db_backend.clone()),
@@ -1601,6 +1614,7 @@ pub async fn assemble_backend(
         mgmt_section: mgmt_section.clone(), // 与 make_bridge 的 Extras.mgmt_section 同一 Arc。
         mgmt_axes: mgmt_axes.clone(), // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
         mgmt: mgmt.clone(), // 与 make_bridge 的 Extras.mgmt 同一登记表。
+        secret_keys: secret_keys.clone(), // 与 make_bridge 的 Extras.secret_keys 同源。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。

@@ -16,6 +16,30 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.101
+
+**U-10 运行期凭据轴（首批）**：`secret.seal/open` 全局对象（v0.1.101 面）。config `ENC[...]`
+的同一套 X25519 + AES-256-GCM 信封开给运行期：`seal` 用部署公钥加密（公钥装配期加载：
+`secrets.public_key_path`，缺省由私钥推导——零新增配置）；`open` 需部署私钥（私钥永不出
+Rust 边界；seal-only 装配报 `no private key`）；每次 `open` 落 `SECRET_OPEN` 审计
+（零凭据，`audit.query({kind:"SECRET_OPEN"})` 可查）；无密钥装配 fail-closed（报
+`secret axis not configured`，绝不静默当明文）。同一明文两次 seal 密文不同（随机化，
+不能拿密文判等）。文档：db-guide §11.9（新）、api-manual §13、SKILL 陷阱 3 条、
+scenarios 场景 52、global.d.ts `declare const secret`。
+
+**db_client 配额调整**：`max_per_owner` 缺省 8 → 32——per-owner 按 `registered_by` 计数，
+单一管理员常占满全部登记，8 条即被卡死（评审 R-03/R-06）；示例配置 `max_entries` 16 → 64。
+显式配置不受影响（升级注意：依赖旧缺省 8 的部署行为收紧为 32——只会更宽松）。
+
+**global.d.ts 整理**：全文去版本演进叙述（`（v0.1.NN）`/U-/G9/ABI 标签全数剥离，
+只留核心功能契约与陷阱）+ 十段分区横幅 + 重复注释去重（ldap 下线说明三处归一、
+yaml/sso/server/crypto 双写收敛、`asTenant` 错位文档归位）；1161 → 1108 行，
+tsc `--strict` 校验通过。
+
+**Windows CI 修复**：`db_exec` / `db_session` 测试助手改经全仓唯一 DSN 归一入口
+（`DbBackendRegistry::connect`）——手拼 `sqlite://` 直喂 sqlx 会被 Url 解析吞掉绝对路径
+（Windows 盘符成 host）→ `SQLITE_CANTOPEN (code 14)`。
+
 ## v0.1.100
 
 **dbx Web 对齐 P1/P2 第一批**：U-11（连接级能力探测）+ U-14 批 a（catalog 内省）+

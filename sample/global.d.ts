@@ -1,12 +1,9 @@
-// .route 声明的 TS 支持（编辑器不报错；dev server 不依赖此文件运行）。
-//
-// 下面为 src/bridge/bootstrap.js 在运行时注入的全局对象提供类型声明，
-// 使 sample/src 中的业务代码在编辑器内不报 TS 错误。
-//
-// ext_boot.js（config.yaml 同目录，可选）在运行时补充的全局**不在本文件声明** ——
-// 它们是项目自定义的，框架无法预知。用 ext_boot.js 增补了全局（如 `json.page()`）后，
-// 在业务项目里另建一个 .d.ts 自行声明（并加进 tsconfig 的 include），否则编辑器报
-// TS2339 "Property 'page' does not exist"。运行时不受影响——类型只影响编辑器与 tsc。
+// bootstrap.js 运行时注入的全局对象的 TS 声明（只影响编辑器 / tsc，dev server 不依赖）。
+// 本文件只放**类型 + 关键陷阱**，行为细节与叙事见 docs/devkit（api-manual / db-guide）。
+// ext_boot.js 自定义的全局不在此声明：另建 .d.ts 自行声明并进 tsconfig include，
+// 否则 TS2339。
+
+// ======== 一、基础值类型 ========
 
 // JSON 反序列化后可能出现的值（SQL 行 / KV / fetch body 等）。
 type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
@@ -14,16 +11,18 @@ type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
 // 数据库查询返回的一行（列名 -> 值）。
 type Row = Record<string, Json>;
 
+// ======== 二、查询构造器与结构内省（db.table / db.catalog 面） ========
+
 // db.table(...).where(cond) 的单个条件。叶子用 field/op/value；组合用 and/or/not
 // （也可经 db.leaf/db.and/db.or/db.not 构造）——故 field 可缺省（纯组合节点）。
 interface WhereCond {
   field?: string;
   op?: string; // eq/neq/gt/gte/lt/lte/like/in/nin/null/notnull/... 依服务端支持
   value?: unknown;
-  // 子查询（v0.1.81）：in/eq/ne/gt/gte/lt/lte 叶子以 subquery 代 value（builder 或纯 JSON
+  // 子查询：in/eq/ne/gt/gte/lt/lte 叶子以 subquery 代 value（builder 或纯 JSON
   // 请求）；value 与 subquery 互斥；isnull/like 不接受子查询。
   subquery?: QueryBuilder | object;
-  // exists 节点（v0.1.81）：`{ exists: <子查询> }`，不得携带其他键。
+  // exists 节点：`{ exists: <子查询> }`，不得携带其他键。
   exists?: QueryBuilder | object;
   and?: WhereCond[];
   or?: WhereCond[];
@@ -40,48 +39,37 @@ interface OrderByItem {
 interface QueryBuilder {
   select(cols?: (string | object)[]): QueryBuilder;
   where(cond: WhereCond): QueryBuilder;
-  // 动态 WHERE（v0.1.81）：test 为 undefined/null/false 或空数组时跳过该条件；
+  // 动态 WHERE：test 为 undefined/null/false 或空数组时跳过该条件；
   // 0 与 "" 是合法值、保留（空数组跳过是防 IN () 恒假静默 0 行）。
   whereIf(test: unknown, cond: WhereCond): QueryBuilder;
   orderBy(items?: OrderByItem[]): QueryBuilder;
-  // LIMIT/OFFSET（v0.1.20 起可配，见 config `db_query` 段——不能写进 `db:` 段）：
-  // 未给 limit 的**顶层** select 隐式补 `db_query.default_limit`（默认 100）；显式 limit
-  // 被 clamp 到 `db_query.max_limit`（默认 1000，硬顶 100000）。嵌套/子查询不隐式截断。
-  // 结果行数 ≥ 生效上限时，响应带 `X-OJ-Row-Limit: <上限>` 头（仅 json.* 路径）——
-  // 判「可能被截断」看该头，别猜。
+  // 顶层 select 未给 limit 隐式补 default_limit；显式值 clamp 到 max_limit（config
+  // `db_query` 段）。可能被截断看响应头 X-OJ-Row-Limit，别猜。
   limit(n: number): QueryBuilder;
   offset(n: number): QueryBuilder;
   // 行数组（每行是列名 → 值；与 db.query 的返回同形）。
   all(): Promise<Row[]>;
-  // DML：动词由 insert/update/delete 声明，run() 终执行（返回受影响行数）。
-  // insert + returning(["id"]) 时 run() 改返回行数组 [{ id: n }]——
-  // pg/sqlite 是单条 RETURNING 语句；mysql 同连接两步取 LAST_INSERT_ID()（建议放 db.tx）。
+  // DML：动词由 insert/update/delete 声明，run() 终执行（受影响行数）。
+  // insert + returning(["id"]) 时 run() 返回行数组 [{ id: n }]（mysql 建议放 db.tx）。
   insert(rows: object | object[]): QueryBuilder;
   update(sets: object): QueryBuilder;
   delete(): QueryBuilder;
-  // 整表清空（v0.1.82）：唯一的无 where 写动词，明示使用——渲染 `DELETE FROM t`。
-  // 租户守卫照常注入：租户表上只清**当前租户**的行（清整库用 db.asSystem）。
-  // 自带 where 报 `truncate does not accept where`；update 携带 truncate 报错。
+  // 整表清空：唯一的无 where 写动词；租户表上只清当前租户（清整库用 db.asSystem）。
   truncate(): QueryBuilder;
   returning(cols?: string[]): QueryBuilder;
-  // 幂等写入（v0.1.81）：撞主键/任意唯一键的行跳过（sqlite/pg = ON CONFLICT DO NOTHING，
-  // mysql 回落 identity update、需主键且与 returning 互斥）。sqlite 上与 fromSelect
-  // 不可组合（v0.1.82 明文报错）。
+  // 幂等写入：撞唯一键的行跳过（mysql 回落 identity update，需主键、与 returning 互斥）。
   orIgnore(): QueryBuilder;
-  // 查询插入（v0.1.81）：从子查询写入；cols 与子查询输出列**按位置**对齐（数量不匹配
-  // 报错）。与 insert 的 values 互斥（都给报错）。
+  // 查询插入：cols 与子查询输出列按位置对齐；与 insert 的 values 互斥。
   fromSelect(sub: QueryBuilder | object, cols: string[]): QueryBuilder;
-  // JOIN：on 条目两形——{left,right}（列=列）或 {left,op,value}（列=值，v0.1.81，op 限
-  // 比较类；contains/isnull 等模式/空值类直接拒绝）。kind 缺省 "inner"（可选 left）；
-  // 第 4 参数 alias 给被 join 的表起别名（v0.1.81）——归属/租户守卫仍按真名。
+  // JOIN：on 两形 {left,right}（列=列）/ {left,op,value}（列=值，op 限比较类）；
+  // kind 缺省 "inner"；alias 起别名——守卫仍按真名。
   join(
     table: string,
     on: ({ left: string; right: string } | { left: string; op: string; value?: unknown })[],
     kind?: string,
     alias?: string,
   ): QueryBuilder;
-  // 基表别名（v0.1.81）：列限定写 "别名.列"；仅 select/join 生效（写动词带 as 报错），
-  // 守卫始终按真名。
+  // 基表别名：列限定写 "别名.列"；仅 select/join 生效，守卫按真名。
   as(alias: string): QueryBuilder;
   // DISTINCT / GROUP BY / HAVING / UNION / CTE（WITH）。
   distinct(): QueryBuilder;
@@ -96,7 +84,7 @@ interface QueryBuilder {
   toJSON(): object;
 }
 
-// db.sqlProfile() 的返回（v0.1.51）：本请求 SQL 画像。追踪未开启（release 默认 /
+// db.sqlProfile() 的返回：本请求 SQL 画像。追踪未开启（release 默认 /
 // `db_trace.enabled:false`）时为空对象 {}。
 interface SqlProfile {
   count: number;
@@ -120,12 +108,12 @@ interface SqlProfile {
   }[];
 }
 
-// db.allowed() 的返回（v0.1.89）：当前调用主体**有权限访问**的库别名 + 能力位。
+// db.allowed() 的返回：当前调用主体**有权限访问**的库别名 + 能力位。
 // 未授权的库不出现在列表里（数据面板的库选择器应以此为准，别硬编码 `db:` 段别名
 // ——那会列出点了才报错的假入口）。
 interface DbAllowedEntry {
   alias: string;
-  // 方言名（开放集，v0.1.88 起由插件 describe() 声明）。
+  // 方言名（开放集 起由插件 describe() 声明）。
   dialect: string;
   read_only: boolean;
   allow_ddl: boolean;
@@ -135,7 +123,7 @@ interface DbAllowedEntry {
   enforce: "off" | "warn" | "deny";
 }
 
-// db.listColumns() 的返回（v0.1.90）：单列的结构信息。
+// db.listColumns() 的返回：单列的结构信息。
 interface ColumnInfo {
   name: string;
   // 方言声明文本（sqlite `type` / mysql `column_type` / pg `format_type`），零归一化。
@@ -146,7 +134,7 @@ interface ColumnInfo {
   primaryKey: boolean;
 }
 
-// db.listIndexes() 的返回（v0.1.90）：单索引的结构信息。
+// db.listIndexes() 的返回：单索引的结构信息。
 interface IndexInfo {
   name: string;
   unique: boolean;
@@ -157,7 +145,7 @@ interface IndexInfo {
   columns: string[];
 }
 
-// db.listForeignKeys() 的返回（v0.1.90）：单外键的结构信息。
+// db.listForeignKeys() 的返回：单外键的结构信息。
 interface ForeignKeyInfo {
   // sqlite 外键无约束名 → null。
   name: string | null;
@@ -173,6 +161,8 @@ interface ForeignKeyInfo {
 // （MySQL 的 DDL 会隐式提交调用方事务）。
 type TxInstance = Omit<DBInstance, "tx" | "stream"> & { isTx?: true };
 
+// ======== 三、请求上下文与响应信封（json / http / log） ========
+
 // json.* ：统一响应信封 + 响应头。
 interface JsonApi {
   ok(data?: unknown): void;
@@ -180,7 +170,7 @@ interface JsonApi {
   header(name: string, value: string): void;
   // 裸 JSON 200（不套信封）：标准协议端点（如 OIDC）用；错误仍走 fail()。
   raw(data?: unknown): void;
-  // 3xx 重定向原语（v0.1.26）：Location + RFC 9110 §15.4 短超文本注记（HEAD 为空 body）。
+  // 3xx 重定向原语：Location + RFC 9110 §15.4 短超文本注记（HEAD 为空 body）。
   // code 非 3xx 一律回落 302；具名封装对应五个标准 3xx，语义见名。
   redirect: {
     (url: string, code?: number): void;
@@ -190,7 +180,7 @@ interface JsonApi {
     temporaryRedirect(url: string): void; // 307 方法/体保持
     permanentRedirect(url: string): void; // 308 永久 + 方法保持
   };
-  // 流式响应（v0.1.35）：开流后逐块 write，绕过 {code,msg,data} 信封。
+  // 流式响应：开流后逐块 write，绕过 {code,msg,data} 信封。
   // opts：{ status?, contentType? }；返回 writer 必须显式 end()（或 handler 返回即自动关流）。
   stream(opts?: { status?: number; contentType?: string }): StreamWriter;
   // SSE 便捷封装：自动 text/event-stream + 数据帧 `data: <c>\n\n`；
@@ -211,24 +201,21 @@ interface HttpApi {
   query: Record<string, string>;
   headers: Record<string, string>;
   body: any;
-  // WS Binary 帧时 body 为 null；原始帧字节走 bodyBytes()（v0.1.16，文本帧亦可用）。
+  // WS Binary 帧时 body 为 null；原始帧字节走 bodyBytes()（文本帧亦可用）。
   bodyBytes(): Promise<Uint8Array>;
   // 取路由参数或 query 参数：路径参数优先，query 兜底，均缺失返回 def 原值。
   param(name: string, def?: unknown): any;
   // 租户 id（tenant 启用时从租户头提取；未启用为 null）。`db.asTenant(id)` 声明成功后
-  // 即为该 id（v0.1.20）。
+  // 即为该 id。
   tenantId: string | null;
   // 已验签用户（auth 启用且通过 Bearer 守卫；否则 null）。
   user: AuthUser | null;
-  // 本请求命中的模块身份（v0.1.76：路由分发时注入；无模块上下文——任务桥 /
-  // WS 帧 / run_with / 启动期内省——为 null）。**只读**：对象已冻结，strict 下
-  // 写属性抛 TypeError（CJS require 路径静默无效）。version 勿回显给外部客户端
-  // （指纹面）。
+  // 本请求命中的模块身份（无模块上下文为 null；对象已冻结）。version 勿回显外部（指纹面）。
   module: { name: string; version: string } | null;
   // multipart 上传文件元信息（非 multipart 为空数组）。
   files: UploadedFileMeta[];
   // 取第 i 个上传文件的字节（越界报错 no such file）。
-  // 仅小文件（≤ max_upload）有字节；流式大文件报错并指路 files[i].key/.url（v0.1.38）。
+  // 仅小文件（≤ max_upload）有字节；流式大文件报错并指路 files[i].key/.url。
   file(i: number): Promise<Uint8Array>;
 }
 
@@ -239,9 +226,7 @@ interface AuthUser {
   claims: Record<string, Json>;
 }
 
-// multipart 上传文件元信息。
-// 大文件（> max_upload）由服务端流式落 blob（v0.1.38）：bytes 拿不到（http.file 报错），
-// 用 key/url 取——blob.get(key) 读全文、url 直接下载/外链。
+// multipart 上传文件元信息（大文件流式落 blob：bytes 拿不到，用 key/url 取）。
 interface UploadedFileMeta {
   field: string;
   filename: string;
@@ -261,6 +246,8 @@ interface Logger {
   error(msg: string, ...kv: unknown[]): void;
 }
 
+// ======== 四、存储（kv / blob / fs / es） ========
+
 // redis.* / kv.* ：KV 存储（redis.default 配置即真 Redis，否则进程内存 KV）。
 interface KVApi {
   get(key: string): Promise<string | null>;
@@ -272,12 +259,14 @@ interface KVApi {
   incr(key: string): Promise<number>;
 }
 
+// ======== 五、实时与消息（ws / bus） ========
+
 // ws.* ：WebSocket 生命周期钩子内的主动发送/关闭控制（HTTP 路径 no-op）。
-// send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array → Binary 帧(0x2)（v0.1.16）。
+// send 帧型由参数类型决定：string → Text 帧(0x1)；Uint8Array → Binary 帧(0x2)。
 interface WSApi {
   send(data: string | Uint8Array): void;
   close(): void;
-  // 房间原语（v0.1.30，进程内单例 hub；跨实例扇出仍走 bus.publish）：
+  // 房间原语（进程内单例 hub；跨实例扇出仍走 bus.publish）：
   // join/leave 仅在 ws.ts 生命周期钩子内可用（连接身份自动取，断连自动摘除）；
   // broadcast 为 socket.io 除己语义（发送者要回声自己在 JS 里发），HTTP handler 可调
   // （无连接身份 = 不排除任何人）；roomSize 任意上下文可调。
@@ -287,10 +276,9 @@ interface WSApi {
   roomSize(room: string): number;
 }
 
-// sess.* ：WS 帧池的会话上下文（v0.1.10 帧池模型；**只在 ws.ts 的生命周期钩子内存在**——
-// HTTP / 任务桥路径没有这个全局）。
-// 执行模型：路由级 W 个无状态 Worker 共享执行，连接态必须外置到 sess.state（Rust 会话表
-// 持久、按连接隔离）；模块作用域只是 Worker 本地只读缓存，**不要**用来放连接状态。
+// sess.* ：WS 帧池会话上下文（**只在 ws.ts 生命周期钩子内存在**）。路由级无状态 Worker
+// 共享执行：连接态必须外置到 sess.state（按连接隔离）；模块作用域是 Worker 本地缓存，
+// **不要**放连接状态。
 interface WsSess {
   // 连接标识（进程内自增；同一连接的各帧相同）。
   readonly id: number;
@@ -308,24 +296,21 @@ interface BlobApi {
   del(key: string): Promise<boolean>;
   // local = {base}/blob/{key}；s3 = presigned URL（15min）。
   url(key: string): Promise<string>;
-  // 上传直传预签名（v0.1.30）：s3 返回 15min 预签名 PUT URL（客户端直传不经 handler，
-  // 绕开 max_upload_bytes/30s）；opts 缺省 {"kind":"put"}。local 后端无预签名——抛错，
-  // 改用直传路由 PUT {base}/blob/{key}（上限 server.blob_upload_max_bytes，默认 1 GiB）。
+  // s3 返回 15min 预签名 PUT URL（客户端直传）；local 无预签名——抛错，走 PUT {base}/blob/{key}。
   uploadUrl(key: string, opts?: { kind: string }): Promise<{ url: string }>;
   // local 缺失 sidecar 且无法按扩展名推断时返回空串；s3 无 Content-Type 时返回 null。
   contentType(key: string): Promise<string | null>;
-  // 服务端复制（v0.1.47，ABI 11）：src 保留。字节不进 JS——大文件搬运别用 get + put。
+  // 服务端复制：src 保留。字节不进 JS——大文件搬运别用 get + put。
   copy(src: string, dst: string): Promise<boolean>;
-  // 服务端搬移（v0.1.47，ABI 11）：src 不再存在（local 同目录 rename / s3 CopyObject+Delete）。
+  // 服务端搬移：src 不再存在（local 同目录 rename / s3 CopyObject+Delete）。
   move(src: string, dst: string): Promise<boolean>;
-  // 区间读（v0.1.47，ABI 11）：短读截断——越尾只给实际剩余字节，offset 过尾给空数组；
+  // 区间读：短读截断——越尾只给实际剩余字节，offset 过尾给空数组；
   // offset / len 为负、小数、NaN 即报错。
   readRange(key: string, offset: number, len: number): Promise<Uint8Array>;
 }
 
-// fs.* ：本地文件系统（v0.1.53；config `fs:` 段启用）。一次性 API（无 fd 句柄，
-// op 内自开自关）；相对路径解析到 jail 根 fs.root 之下（不是进程 cwd）。
-// 未配置 fs: / 越出 root（含 root 内 symlink 指向外部）/ readonly 下写 → 抛 NotCapable。
+// fs.* ：本地文件系统（config `fs:` 段启用；一次性 API，无 fd）。相对路径解析到 jail 根
+// fs.root 下；未配置 / 越出 root（含 symlink 外指）/ readonly 写 → 抛 NotCapable。
 interface FsApi {
   readFile(path: string): Promise<Uint8Array>;
   readTextFile(path: string): Promise<string>;
@@ -366,11 +351,13 @@ interface FsDirEntry {
 // bus.* ：主题广播。publish 广播给订阅 topic 的全部 WS 会话，返回接收方数；
 // subscribe 仅 WS 会话内可用（HTTP 路径报错）；kind 报告活跃 broker 类型。
 interface BusApi {
-  // data 为 Uint8Array/ArrayBuffer → Binary 帧原字节（不包信封，v0.1.16）；其余 → JSON 信封 Text 帧。
+  // data 为 Uint8Array/ArrayBuffer → Binary 帧原字节（不包信封）；其余 → JSON 信封 Text 帧。
   publish(topic: string, data?: unknown): Promise<number>;
   subscribe(topic: string): Promise<void>;
   kind(): Promise<string>;
 }
+
+// ======== 六、认证与身份（cert / jwt / oidc / sso / bcrypt） ========
 
 // cert.* ：JWS 证书生成/重签（RSA + RS256 在 Rust 侧；纯内存，不落盘）。
 interface CertApi {
@@ -421,7 +408,7 @@ interface OidcApi {
   readonly clients: Record<string, { secret: string; redirect_uris: string[]; tenant: string }>;
 }
 
-// sso.* ：HTTP 表单 / CAS SSO 提供者注册表（v0.1.61，config `http_sso:` 段注入；
+// sso.* ：HTTP 表单 / CAS SSO 提供者注册表（config `http_sso:` 段注入；
 // 未配置调用报 http sso not configured）。字段语义与校验规则见 api-manual §sso。
 interface SsoProviderCfg {
   kind: "form" | "cas2";
@@ -440,13 +427,11 @@ interface SsoApi {
   readonly providers: Record<string, SsoProviderCfg>;
 }
 
-// mail / Mail(key) ：邮件投递（config smtp: 段 + oj-mail 插件启用；未配置调用报
-// mail not configured）。宿主做校验/附件解析，插件做投递；所有方法**都 resolve 信封**
-// （校验失败 = {code:5}，不抛），只有「未配置」抛异常。
-// code：0 成功（data.messageId 为投递凭据、data.jobId 为作业号）/ 1 网络/超时（**以及
-// 一切投递期失败**，含 SMTP 5xx 与鉴权失败）/ 4 队列满 / 5 入参校验（地址、白名单、正文、
-// 附件、profile）。**2（SMTP 5xx）/ 3（鉴权）为保留未启用**：两类都归 1，判失败请用
-// `code !== 0`（见 docs/mail-smtp.md §3）。
+// ======== 七、投递与工具面（mail / ldap 载荷 / vars / exec / yaml / server） ========
+
+// mail / Mail(key) ：邮件投递（smtp: 段 + oj-mail 插件；未配置调用抛 mail not configured）。
+// 方法都 resolve 信封（校验失败不抛）。code：0 成功 / 1 投递期一切失败（含 SMTP 5xx、鉴权）
+// / 4 队列满 / 5 入参校验；2/3 保留未启用——判失败用 `code !== 0`（docs/mail-smtp.md §3）。
 interface MailEnvelope {
   code: number;
   msg: string;
@@ -482,10 +467,9 @@ interface MailRawRequest extends MailSendRequest {
   raw: string;
 }
 
-// ldap 泛型轴载荷形状（v0.1.54 起 `ldap`/`LDAP` 全局已下线，调用面为
-// `axis("ldap").<op>`，op 为 snake_case：bind/search/search_paged/whoami/compare；
-// axis 返回 any，cast 到下列形状）。错误模型同 db：**除「未配置」外，校验/协议/
-// 网络错一律 reject**——只有 bind 的「凭据被 LDAP 拒绝」是正常返回 false（含 rc 49）。
+// ldap 泛型轴载荷形状：`ldap`/`LDAP` 全局已下线，调用面 `axis("ldap").<op>`
+// （op 为 snake_case：bind/search/search_paged/whoami/compare；axis 返回 any）。错误模型：
+// 除「未配置」外一律 reject，唯 bind 凭据被拒是正常返回 false（rc 49）。
 interface LdapSearchOpts {
   // 默认 "sub"（整棵子树）；"one" = 仅 base 下一层；"base" = 只查 base 自身。
   scope?: "base" | "one" | "sub";
@@ -493,9 +477,7 @@ interface LdapSearchOpts {
   filter?: string;
   // 要读的属性名；缺省/空数组 = 服务端默认属性集。
   attrs?: string[];
-  // 可选：覆盖本次查询的绑定凭据（与 config ldap:<inst> 的 bind_dn/bind_pw 合并——
-  // 二者取一即可，另一个回落 config）。用于把密码作为运行时参数传入，避免落配置。
-  // 仅 search / search_paged 支持；whoami/compare/bind 仍用 config 服务账号或各自入参。
+  // 可选：覆盖本次绑定凭据（与 config 合并，二者取一）；仅 search/search_paged 支持。
   bindDn?: string;
   bindPw?: string;
 }
@@ -507,10 +489,6 @@ interface LdapEntry {
   // 二进制属性（jpegPhoto 等）：base64 编码字符串。
   bin: Record<string, string[]>;
 }
-
-// ldap / LDAP 全局已随 oj-ldap 迁移泛型轴下线（v0.1.54）——调用面为
-// `axis("ldap").<op>`（返回 any），op 为 snake_case：bind / search / search_paged /
-// whoami / compare（载荷形状见上 LdapSearchOpts / LdapEntry）。
 
 interface MailApi {
   // 异步 transport；resolve 投递结果信封。
@@ -539,20 +517,16 @@ interface BcryptApi {
   verify(password: string, hash: string): Promise<boolean>;
 }
 
-// vars.* ：部署期常量读口（config `vars:` 段，v0.1.25）。
-// **同步**（装配期冻结的表，无 IO）；**fail-closed**：只有 config 里声明的键可读，
-// 其余恒 null（没有「读任意 OS env / 任意 config 键」的通道）。值按 YAML 标量文本成串
-// （`PORT: 3000` → `"3000"`；嵌套 map/list 是配置解析错误）。
-//   const web = vars.get("WEB_URL") ?? "http://localhost:3000";
+// vars.* ：部署期常量读口（config `vars:` 段）。同步、fail-closed：只有 config 声明的键
+// 可读，其余恒 null；值按 YAML 标量文本成串（`PORT: 3000` → `"3000"`）。
 interface VarsApi {
   get(name: string): string | null;
 }
 
-// exec.*：外部命令执行（v0.1.75，config `platform.exec` 段授权）。
-// 授权模型 = argv 模板白名单（literal token 逐字相等 + ${path:NAME}/${raw:NAME} 占位符
-// 恰吸收一个 token）+ 无 shell：argv 必须恰命中一条授权模板（歧义命中报错，不静默择一）。
-// ${path:} 值按路径校验（fs.root ∪ trusted_paths）；${raw:} 拒 `-` 开头与绝对形态。
-// exec 授权与 platform.modules 相互独立；缺省全 deny（fail-closed）。
+// exec.*：外部命令执行（config `platform.exec` 段授权）。授权 = argv 模板白名单
+// （literal 逐字相等 + ${path:}/${raw:} 占位符恰吸收一个 token）+ 无 shell；argv 须恰命中
+// 一条模板（歧义报错）。${path:} 按 fs.root ∪ trusted_paths 校验；${raw:} 拒 `-` 开头与
+// 绝对路径。缺省全 deny（fail-closed）。
 interface ExecRunOpts {
   /** 缺省 30_000，硬上限 600_000（超出钳制）。大 DDL / 大 stdin 显式调大。 */
   timeoutMs?: number;
@@ -566,22 +540,14 @@ interface ExecResult {
   stderr: string;
 }
 interface ExecApi {
-  /**
-   * 执行一条授权模板匹配后的外部命令（无 shell；cwd 钉在 fs.root，env 默认空表仅
-   * 白名单透传、PATH 不继承；argv[0] 为宿主解析后的绝对路径——"oj" 即服务进程自身）。
-   * 抛错边界：未授权 / 模板失配 / 歧义 / 路径越界 → NotCapable；超时（整组击杀）/
-   * 输出超限（stdout+stderr 合计 10MB） / spawn 失败 / 非 UTF-8 输出 → 普通 Error。
-   * 未配 `fs:` 段或 tasks/WS 上下文（无模块归属）恒拒。
-   */
+  /** 执行授权模板匹配后的外部命令（无 shell；cwd = fs.root，env 白名单透传、PATH 不继承；
+   * "oj" 即服务进程自身）。未授权/模板失配/越界 → NotCapable；超时/输出超限(10MB)/
+   * 非 UTF-8 → 普通 Error；未配 fs: 或无模块归属恒拒。 */
   run(argv: string[], opts?: ExecRunOpts): Promise<ExecResult>;
 }
 
-// yaml.*：YAML 读写原语（v0.1.75，无特权，始终可用）。
-// parse: 三预算防炸弹（1 MiB 输入 / 10 万节点含 alias 展开 / 深度 128），Rust 阻塞池
-// 执行 + 独立 5s deadline；重复键后键覆盖；多文档 / 非字符串键 / NaN·Inf 拒绝；
-// 非法 YAML 抛带行列错误；超 2^53-1 的整数为十进制字符串（json.ok 安全）。
-// stringify: 仅承诺机器产物（manifests.yaml）往返——serde_yaml 丢注释，
-// 禁用于 config.yaml 回写（走文本手术）。
+// yaml.*：YAML 读写原语（无特权）。parse：三预算防炸弹（1 MiB / 10 万节点 / 深 128）+
+// 5s deadline；重复键后键覆盖；多文档/非字符串键/NaN·Inf 拒绝；超 2^53-1 整数为十进制串。
 interface YamlApi {
   parse(text: string): Promise<unknown>;
   /**
@@ -592,10 +558,10 @@ interface YamlApi {
   stringify(value: object): Promise<string>;
 }
 
-// server.*：平台级控制（v0.1.75，platform 特权）。
-// reloadConfig：进程内触发热更，与 `POST {base}/_system/config` 同一 executor 与串行锁。
-// 返回恒定形状五键：`unchanged=true` 时三清单为空数组；tasks/WS 上下文无归属 → NotCapable；
-// `oj test` / 嵌入式 → `reload not available`；并发撞锁 → `server.reloadConfig: reload in progress (busy)`。
+// server.*：平台级控制（platform 特权）。
+// reloadConfig：进程内触发热更（与 `POST {base}/_system/config` 同一 executor 与串行锁）；
+// tasks/WS 上下文无归属 → NotCapable；`oj test` / 嵌入式 → `reload not available`；
+// 并发撞锁 → `server.reloadConfig: reload in progress (busy)`。
 interface ServerReloadResult {
   /** 代际 id（每次成功 swap +1；unchanged 时不变）。 */
   generation: number;
@@ -612,28 +578,30 @@ interface ServerApi {
   reloadConfig(): Promise<ServerReloadResult>;
 }
 
+// ======== 八、运行时全局绑定（declare global） ========
+
 declare global {
   interface Function {
     route?: string;
-    /** handler 入参契约（v0.1.44 `.schema`；嵌套组动词同样可挂，键 = (文件, handler 链)） */
+    /** handler 入参契约（`.schema`；嵌套组动词同样可挂，键 = (文件, handler 链)） */
     schema?: Record<string, unknown>;
-    /** handler 出参契约（v0.1.72）：与 `.schema` 平级声明，语义同 `.schema.response`
+    /** handler 出参契约：与 `.schema` 平级声明，语义同 `.schema.response`
      * （`json.ok(data)` 的 data payload；运行期不校验，只喂 `oj openapi` / client 生成）。
      * 优先级：动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response` */
     response?: Record<string, unknown>;
   }
 
-  // 嵌套组（v0.1.64）：以实体对象为根的组同样可挂组级 `.route`（整组默认前缀）、
-  // 组级 `.schema`（整组默认入参契约）与组级 `.response`（整组默认出参，v0.1.72），
+  // 嵌套组：以实体对象为根的组同样可挂组级 `.route`（整组默认前缀）、
+  // 组级 `.schema`（整组默认入参契约）与组级 `.response`（整组默认出参），
   // 与 handler 级同语义。组是普通对象字面量，
   // 故在 `Object` 上声明，使 `anchor.route = "/x/{anchor}/upload"` 之类不报 TS2339。
   // 运行时：组级 `.schema` 作继承默认，动词自身 `.schema` 在其上合并（通道级
   // required 并集 / properties 逐键覆盖）；组级 `.response` 同样沿嵌套层层继承。
   interface Object {
     route?: string;
-    /** 组级入参契约（v0.1.64 嵌套组）：整组默认，动词 `.schema` 在其上合并 */
+    /** 组级入参契约（嵌套组）：整组默认，动词 `.schema` 在其上合并 */
     schema?: Record<string, unknown>;
-    /** 组级出参契约（v0.1.72）：整组默认，沿嵌套继承，动词 `.response` 整体覆盖。
+    /** 组级出参契约：整组默认，沿嵌套继承，动词 `.response` 整体覆盖。
      * ⚠️ 保留键：组对象上的 `response` 被当作声明读走，**不能**用来命名嵌套子组
      * （子组命名为 response 会静默不产生路由，与 `schema`/`route` 相同） */
     response?: Record<string, unknown>;
@@ -658,56 +626,42 @@ declare global {
     // 系统逃生通道（tenant sql_guard）：本请求绕过租户注入/校验。显式且被审计，
     // 业务 handler 不得使用。
     asSystem(): DBInstance;
-    // 匿名请求声明租户（v0.1.20）。公开页 handler 用**服务端派生**的租户 id 声明本次请求
-    // 的身份（典型派生链：分享 token → 查共享表 → 租户 id）。**与 asSystem 不同——租户条件
-    // 仍然强制注入**，只是身份由 handler 给。
-    // 三道门禁全过才生效，缺一即抛错（不是静默忽略）：
-    //   ① config `tenant.allow_as_tenant: true`（默认关）；
-    //   ② 请求是匿名请求（命中 `tenant.anonymous_paths` 且未带租户头；`oj test --anonymous`）；
-    //   ③ id 非空。
-    // 另：请求级且**只能调用一次**（已带租户头的请求、或同一请求内二次调用 → 抛错，防运行期
-    // 切换身份）；生效后 `http.tenantId` 即该值，并记一条审计日志。
-    // 红线：id 必须服务端派生，**绝不可**直接取请求参数（否则等于把租户交给调用方）。
-    /** 平台序列分配（v0.1.24）：单语句原子取号，`max+1` 竞态的终态。
+    /** 平台序列分配：单语句原子取号，`max+1` 竞态的终态。
      * 首次使用自动建平台表 `_oj_sequences`；返回值 ≤2^53-1 是 number，超出是十进制字符串。 */
     nextSeq(name: string): Promise<number | string>;
-    /** 连接引擎名（v0.1.61）：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
+    /** 连接引擎名：`"sqlite" | "mysql" | "postgres"`。供 `_shared` 共享模块与
      * 诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，慎用。 */
     dialect(): "sqlite" | "mysql" | "postgres";
-    /** 目录自省（v0.1.82）：当前库全部业务可见表名（**含未登记 registry 的表**——api-only
+    /** 目录自省：当前库全部业务可见表名（**含未登记 registry 的表**——api-only
      * 方案 / 历史遗留表），按名称排序。可选前缀过滤（%/_ 按字面量匹配，绑定参数）。
      * sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。
      * 替代「按方言分支 information_schema / sqlite_master」的裸 db.query。 */
     listTables(prefix?: string): Promise<string[]>;
-    /** 结构内省（v0.1.90）：单表的列信息（三方言同构）。
+    /** 结构内省：单表的列信息（三方言同构）。
      * `{name, nativeType, nullable, default, primaryKey}[]`，按声明序。
      * `nativeType` 是方言**声明文本**（sqlite `type` / mysql `column_type` / pg `format_type`），
      * 零归一化；`default` 是原始 DDL 文本（sqlite 字符串默认带引号）。表名经绑定参数，
      * 无对应表/不可见 → 空数组（不区分「不存在 / 无权限 / 别的 schema」）。
      * 未知方言抛 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 `list_columns`）。 */
     listColumns(table: string): Promise<ColumnInfo[]>;
-    /** 结构内省（v0.1.90）：单表的索引信息（三方言同构）。
+    /** 结构内省：单表的索引信息（三方言同构）。
      * `{name, unique, primary, origin, columns}[]`，按名再按列序。
      * `origin` ∈ `c`(普通) / `u`(唯一) / `pk`(主键)——三方言统一口径，UI 不再分支。
      * `columns` 为组成该索引的列（已按序聚合）。 */
     listIndexes(table: string): Promise<IndexInfo[]>;
-    /** 结构内省（v0.1.90）：单表的外键信息（三方言同构）。
+    /** 结构内省：单表的外键信息（三方言同构）。
      * `{name, columns, refTable, refColumns}[]`，按约束名再按列序。
      * sqlite 外键无约束名 → `name` 为 null；复合外键两端**按位配对**（`columns[i]`↔`refColumns[i]`）。 */
     listForeignKeys(table: string): Promise<ForeignKeyInfo[]>;
-    /** 目录类内省（U-14 批 a，v0.1.100）：新一代信封 `{kind, dialect, items}`（L2 三件
+    /** 目录类内省：新一代信封 `{kind, dialect, items}`（L2 三件
      * 保持裸数组不动）。kind：views / routines / sequences / ddl / comment / constraints /
      * stats；ddl/comment/constraints 吃 `arg`（对象名），其余全库清单。能力矩阵见
      * db-guide §6——unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默。 */
     catalog(kind: "views" | "routines" | "sequences" | "ddl" | "comment" | "constraints" | "stats", arg?: string):
       Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
-    /** 流式查询（v0.1.37）：逐行拉取大结果集，避免 db.query 全量驻留。给 onRow 回调
-     * （逐行富化/转写，如写 json.stream）返回 Promise<void>；省略则返回 AsyncIterable<Row>
-     * 供 for-await。opts.signal 触发 abort 即取消（pg/mysql 是真取消——KILL QUERY+断连，
-     * sqlite 协作式）。只走直连池——db.tx 内调用报错；非直连后端回落全量（不报错）
-     * 或报 backend does not support streaming。opts.onOpen(executionId)（v0.1.96）在开流后
-     * 回调跨请求取消句柄（异步迭代形式用 `it.executionId()`）。被 `db.cancel` 取消后，
-     * 下一次拉取抛 `… cancelled via db.cancel` 错误（不是静默结束）。 */
+    /** 流式查询：逐行拉取大结果集。给 onRow 返回 Promise<void>；省略则返回
+     * AsyncIterable<Row>。opts.signal 触发 abort 即取消（pg/mysql 真取消）；db.tx 内报错；
+     * opts.onOpen(executionId) 回调跨请求取消句柄（迭代形式用 it.executionId()）。 */
     stream(
       sql: string,
       params?: unknown[],
@@ -717,33 +671,30 @@ declare global {
         onOpen?: (executionId: string) => void;
       },
     ): Promise<void> | AsyncIterable<Row> & { executionId(): Promise<string> };
-    /** SQL 执行追踪（v0.1.51，dev 默认开）：本请求累计画像；同一请求内调用，
+    /** SQL 执行追踪（dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;
-    /** 访问控制自省（v0.1.89）：只列当前主体有权限访问的库 + 各库能力位。
+    /** 访问控制自省：只列当前主体有权限访问的库 + 各库能力位。
      * `db_access:` 段未配置时全部库都在列表里（默认 enforce: off = 不设防）。 */
     allowed(): DbAllowedEntry[];
+    /** 匿名请求声明租户：租户条件仍强制注入，只是身份由 handler 给。三道门禁
+     * （config 开关 / 匿名请求 / id 非空）缺一即抛；请求级且只能调一次。
+     * 红线：id 必须服务端派生，**绝不可**取请求参数。 */
     asTenant(id: string): DBInstance;
     // 事务：回调 resolve 提交 / throw 回滚再抛；tx.query/exec/table 同签名走同一连接。
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
     // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
     tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
-    /** 跨请求事务会话（v0.1.95）：`begin()` 拿 `tx_…` id，后续请求 `attach(id)` 之后
-     * `db.query` / `db.exec` / `db.table()` / `nextSeq` / `listTables` 全部落在同一条连接与
-     * 同一个事务上。默认**关闭**（`db_session.enabled: true` + `allow` 命中才可用）。
-     * 红线：id 是 **bearer 凭据**（别回给最终用户/别写日志）；会话只锁一个别名；会话内禁
-     * `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/`START`/`SET`/`USE`/`ATTACH`/`DETACH`/
-     * `PRAGMA`（MySQL 隐式提交 ⇒ 假回滚）；与 `db.tx` 双向互斥；`db.stream` 不可用；
-     * 生命周期归 host（空闲/超寿命即回滚判死），**没有自动提交**。 */
+    /** 跨请求事务会话：begin() 拿 id，attach(id) 后本请求全落同一连接/事务。
+     * 默认关闭（db_session.enabled + allow 才可用）。红线：id 是 **bearer 凭据**（不回显、
+     * 不写日志）；会话只锁一个别名，内禁事务控制/SET/USE/PRAGMA（MySQL 隐式提交 ⇒ 假回滚）；
+     * 与 db.tx 互斥；无 db.stream；host 管生命周期，**没有自动提交**。 */
     session: DBSessionApi;
-    /** 跨请求取消执行（v0.1.96）：按 `db.stream` 给出的 `executionId`（`exec_…`）取消该流式
-     * 查询——同一主体的任意请求可调（跨请求停止长导出）。重复取消幂等（同返回值）；
-     * 未知/已结束/他人 id 一律 `… not found`（不泄露存在性）。取消后发起方的下一次拉取抛
-     * `… cancelled via db.cancel`；后端真取消（mysql `KILL QUERY` / pg `pg_cancel_backend`），
-     * 其余协作式（游标丢弃、连接回池）。**只覆盖流式执行**——非流式 `db.query/exec` 无
-     * 后端句柄，登记为已知限制。id 是 bearer 凭据：只出前 8 字符于日志/错误。 */
+    /** 跨请求取消执行：按 db.stream 的 executionId 取消该流式查询；幂等；
+     * 未知/他人 id 一律 not found（不泄露存在性）。**只覆盖流式执行**——非流式 query/exec
+     * 无句柄（已知限制）。id 是 bearer 凭据：日志只出前 8 字符。 */
     cancel(executionId: string): Promise<{ cancelled: boolean; alias: string }>;
-    /** 动态数据源登记（client 轴，v0.1.91）：运行期把 DSN 登记为命名数据源。
+    /** 动态数据源登记（client 轴）：运行期把 DSN 登记为命名数据源。
      * 登记后别名进 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream）；
      * 此处只暴露**管理面**，使用面一律走 `DB(name)`。`delete` 自动驱逐 `DB()` 缓存，
      * 否则删后再 `DB(name)` 拿到陈旧实例。 */
@@ -762,7 +713,7 @@ declare global {
     registeredBy: string | null;
     /** 登记时刻（Unix 毫秒）。 */
     registeredAtMs: number;
-    /** server 版本串（U-11：探测失败/开放方言 null——降级不阻断登记）。 */
+    /** server 版本串（探测失败/开放方言 null——降级不阻断登记）。 */
     serverVersion: string | null;
     /** 探测时刻（Unix 毫秒；未探测 0）。 */
     probedAtMs: number;
@@ -770,11 +721,11 @@ declare global {
     queries: number;
   }
 
-  /** 跨请求事务会话（`db.session`，v0.1.95）。配置段 `db_session:`（`enabled` 默认 false）。 */
+  /** 跨请求事务会话（`db.session`）。配置段 `db_session:`（`enabled` 默认 false）。 */
   interface DBSessionApi {
     /** 开会话（`DB(name)` 上调用；默认 `default`）→ 摘要（含 id / 有效期）。
      * 缺身份（无 `user.id` 且无 tenant）时被 `require_identity` 拒。
-     * `opts.readOnly`（v0.1.99，G9）：只读会话位——begin 时定死、不可变；该会话上
+     * `opts.readOnly`：只读会话位——begin 时定死、不可变；该会话上
      * Write/DDL 在 op 层一律拒（直发 op 也拦得住），错误 `e.sessionDisposition === "keep"`。 */
     begin(opts?: { readOnly?: boolean }): Promise<DbSessionSummary>;
     /** 把会话绑到**本请求**：之后 `db.query`/`db.exec`/`db.table()`/`nextSeq`/`listTables`
@@ -820,7 +771,7 @@ declare global {
     ops: number;
     /** 建会话的 `user.id`（匿名 null）。 */
     createdBy: string | null;
-    /** 只读会话位（G9）：true = 该会话 Write/Ddl 在 op 层被拒。 */
+    /** 只读会话位：true = 该会话 Write/Ddl 在 op 层被拒。 */
     readOnly: boolean;
   }
 
@@ -869,17 +820,16 @@ declare global {
   const sess: WsSess;
   const blob: BlobApi;
   const fs: FsApi;
-  // 外部命令执行（v0.1.75，platform.exec 段授权；见 ExecApi JSDoc 与 api-manual §6「exec」）。
+  // 外部命令执行（platform.exec 段授权；见 ExecApi JSDoc 与 api-manual §6「exec」）。
   const exec: ExecApi;
-  // YAML 读写原语（v0.1.75，无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
+  // YAML 读写原语（无特权；见 YamlApi JSDoc 与 api-manual §6「yaml」）。
   const yaml: YamlApi;
-  // server.*：平台级控制（v0.1.75，platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
+  // server.*：平台级控制（platform 特权；见 ServerApi JSDoc 与 api-manual §6「server」）。
   const server: ServerApi;
   const bus: BusApi;
   const es: EsApi;
   // 默认 profile（"default"）的 mail 实例；其它 profile 用 new Mail("name")。
   const mail: MailApi;
-  // ldap 全局已下线（v0.1.54）：调用面 axis("ldap").<op>（op 为 snake_case）。
   const Mail: Mail;
 
   // 命名数据库实例；未配置的名字返回 undefined。
@@ -889,17 +839,14 @@ declare global {
   const cert: CertApi;
   const jwt: JwtApi;
   const oidc: OidcApi;
-  // sso.*：HTTP 表单 / CAS SSO 提供者注册表（config `http_sso:` 段注入；未配置调用报
-  // http sso not configured）。登录端点（业务模块）读它分派上游；详见 api-manual §sso。
+  // sso.*：HTTP 表单 / CAS SSO 提供者注册表（见 SsoApi 前导；api-manual §sso）。
   const sso: SsoApi;
   const bcrypt: BcryptApi;
   // 部署期常量（config `vars:` 段；未声明的键恒 null）。
   const vars: VarsApi;
 
-  // ---- 大整数（v0.1.22；u64 见 v0.1.24；详见 docs/numeric-limits.md）----
-  // DB 的 i64 超出安全整数范围（|v| > 2^53-1，雪花 id 常态）时，读出来是**十进制字符串**；
-  // 写回去必须用 toBigInt()（字符串是文本意图，PG 上写 bigint 列会直接报错）。
-  // 两者都 fail-loud：非规范十进制 / 已坍缩的 number 一律抛错，不静默取近似。
+  // ---- 大整数：|v| > 2^53-1 的 i64 读出为十进制字符串；写回用 toBigInt()（详见
+  // docs/numeric-limits.md）。转换全部 fail-loud，不静默取近似。----
   /** 十进制整数字符串 | 安全范围内的 number | bigint → bigint（精确 64 位，范围 [-2^63, 2^63-1]）。 */
   function toBigInt(v: string | number | bigint): bigint;
   /** 同上但为**无符号** 64 位 `[0, 2^64-1]`：只有 MySQL `BIGINT UNSIGNED` 列能承载，
@@ -908,11 +855,8 @@ declare global {
   /** number | 数字串（含科学计数法）| bigint → number（f64，**显式接受精度丢失**）。 */
   function toDouble(v: string | number | bigint): number;
 
-  // crypto 增补（bootstrap 对 crypto 做 Object.assign 合并）：
-  // sha256Hex = 十六进制摘要；randomHex = nBytes 字节随机数的 hex（默认 32 字节）；
-  // getRandomValues（v0.1.30）= oj 实现（原生不存在）：任意 TypedArray view 填充后
-  // 返回原 view，非 view 抛 TypeError，单次 ≤65536 字节（对齐 WebCrypto；lib.dom 的
-  // 同名声明只是兜底，运行时是 oj 实现）。
+  // crypto 增补（bootstrap 对 crypto 做 Object.assign 合并；getRandomValues 是 oj
+  // 实现——原生不存在，lib.dom 的同名声明只是兜底）。
   interface Crypto {
     /** string 走 UTF-8 摘要；Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）。 */
     sha256Hex(data: string | Uint8Array | ArrayBuffer): string;
@@ -920,9 +864,12 @@ declare global {
      * 不得用于凭据/签名/完整性校验。** 入参分流同 sha256Hex：string 走 UTF-8；
      * Uint8Array / ArrayBuffer 走原始字节摘要（非 UTF-8 字节安全）；其余抛 TypeError。 */
     md5Hex(data: string | Uint8Array | ArrayBuffer): string;
+    /** nBytes 字节随机数的 hex（默认 32 字节）。 */
     randomHex(nBytes?: number): string;
+    /** 任意 TypedArray view 填充随机字节后返回原 view；非 view 抛 TypeError；
+     * 单次 ≤65536 字节（对齐 WebCrypto）。 */
     getRandomValues<T extends ArrayBufferView>(view: T): T;
-    // AES-GCM 应用级加密（v0.1.35）：key 为 hex/base64 编码的原始 16/32 字节
+    // AES-GCM 应用级加密：key 为 hex/base64 编码的原始 16/32 字节
     // （按长度选 Aes128/256；aes-gcm 0.10 不含 AES-192），来自 vars.get(...)；明文 utf8 进，
     // base64(nonce12 ‖ ct ‖ tag16) 出。密钥缺失/非法由调用方 json.fail。
     aesGcmEncrypt(plaintext: string, key: string): string;
@@ -934,9 +881,7 @@ declare global {
     verifyEd25519(publicKey: string, msg: string, sigBase64: string): boolean;
   }
 
-  // ---- oj test L1 测试 SDK（oj test 运行时注入；仅测试文件使用） ----
-  // 进程内 HTTP 派发助手，对标 Go Fiber app.Test：client.get/post/... 触发真实
-  // 路由 + 真实运行时 + 真实后端（零 TCP）。path 为相对 base 的路径（如 "/user/account"）。
+  // ---- oj test L1 测试 SDK（仅测试文件）：进程内派发，真实路由/运行时/后端，零 TCP ----
   interface ClientResp {
     status: number;
     headers: Record<string, string>;
@@ -947,7 +892,7 @@ declare global {
     headers?: Record<string, string>;
     body?: string;
   }
-  // WS 帧测试面（v0.1.16）：path 形如 "/echo-bin/ws"（相对 base）。
+  // WS 帧测试面：path 形如 "/echo-bin/ws"（相对 base）。
   // 帧型判别：binary = true 为二进制帧（data 为 Uint8Array），false 为文本帧（data 为 string）。
   interface TestWsFrame {
     binary: boolean;
@@ -1017,10 +962,10 @@ declare global {
   }): Promise<OjFetchResponse>;
   // 已加载插件自省：[{name, semver, abi_version, fingerprint, host_abi_version}]。
   function plugins(): any[];
-  // 泛型插件轴调用面（v0.1.54）：axis("cache").get("k")——任意方法名 = 该轴的一个 op，
+  // 泛型插件轴调用面：axis("cache").get("k")——任意方法名 = 该轴的一个 op，
   // 参数位置传、末位对象 = opts（轴自定义）。未知轴抛错并列出可用轴名。
   function axis(name: string): any;
-  // 装配期固化诊断（v0.1.54；与 `oj info` CLI 同源，同步无 IO）：build/abi/plugins/
+  // 装配期固化诊断（与 `oj info` CLI 同源，同步无 IO）：build/abi/plugins/
   // backends/config 五段；config 只出键名不出值；无公共 HTTP 端点。
   function ojInfo(): any;
 
@@ -1036,13 +981,15 @@ declare global {
   };
 }
 
+// ======== 九、MQ 客户端类型（Kafka / RabbitMQ 返回） ========
+
 interface OjMqMessage {
   topic: string;
   partition?: number;
   offset?: number;
   key?: string;
   value: any;
-  // 非 UTF-8 载荷时 value 为 null，value_b64 为 base64 字符串（v0.1.16）；生产侧传
+  // 非 UTF-8 载荷时 value 为 null，value_b64 为 base64 字符串；生产侧传
   // Uint8Array 亦编码进 value_b64（record 载荷 = 原始字节）。
   value_b64?: string;
   headers?: Record<string, string>;
@@ -1067,14 +1014,13 @@ interface OjRabbitClient {
   metadata(): Promise<any>;
 }
 
-// oj 的导入别名 `#x`（本模块根）/ `#/m/x`（src 根）是「引用方所在模块」相对的，
-// tsconfig 的 `paths` 无法表达模块相对解析，只能枚举模块目录（见 tsconfig.json），
-// 因此仅能命中**已存在**的文件。无法静态定位的别名（如尚未创建的 `#_shared/view`）
-// 由 `types/oj-modules.d.ts`（非模块，真 ambient `declare module "#*"`）兜底为 `any`
-// 而非报 TS2307；已存在、能被 `paths` 命中的别名仍走真实文件类型。运行时由 oj 的
-// loader 解析，本文件与该兜底只影响编辑器 / tsc。
+// 导入别名 `#x` / `#/m/x` 是模块相对的，tsconfig paths 只能枚举已存在目录；静态定位不到的
+// 别名由 `types/oj-modules.d.ts`（ambient `declare module "#*"`）兜底为 any 而非 TS2307。
+// 运行时由 oj loader 解析，两份声明只影响编辑器 / tsc。
 
-/** 一条安全审计事件（`audit.query()` 的元素，v0.1.98）。零凭据：只有 alias/动作/前缀 id。 */
+// ======== 十、特权检索面（audit / mgmt / secret） ========
+
+/** 一条安全审计事件（`audit.query()` 的元素）。零凭据：只有 alias/动作/前缀 id。 */
 interface AuditEntry {
   /** 事件时刻（Unix 毫秒）。 */
   tsMs: number;
@@ -1093,7 +1039,7 @@ interface AuditEntry {
 }
 
 /**
- * 安全审计检索（v0.1.98，`audit:` 段）。统一出口：`DB_CLIENT_*` / `DB_ACCESS_AUDIT` /
+ * 安全审计检索（`audit:` 段）。统一出口：`DB_CLIENT_*` / `DB_ACCESS_AUDIT` /
  * `DB_SESSION_*` 全部落此。进程内有界环形缓冲（缺省 2000 条 / 24h，双限自动清理），
  * **不跨重启**；读门 = `audit.allow`（每调用重判）。`query` 即导出通道。
  * filter 各维可选：kind / user / tenant / alias / sinceMs / untilMs / limit（缺省 100，硬顶 1000）。
@@ -1126,7 +1072,7 @@ interface MgmtEntry {
 }
 
 /**
- * 管理面 connector（U-15，`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
+ * 管理面 connector（`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
  * 泛型轴**不进** `axis()` 公开面；register/delete/非只读 call 走 `mgmt.allow`，只读 call
  * 与 list 走 `mgmt.allow_read`（缺省复用 allow）；每动作落 `MGMT_AUDIT`/`MGMT_DENY` 审计
  * （全字段零凭据）。未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）。
@@ -1142,6 +1088,20 @@ declare const mgmt: {
   has(name: string): boolean;
   /** 管理调用（args 必须是 JSON object；`__handle` 由宿主注入）。 */
   call(name: string, op: string, args?: Record<string, unknown>): Promise<unknown>;
+};
+
+/**
+ * 运行期凭据轴。与 config `ENC[...]` 同一套 X25519 + AES-256-GCM 信封：
+ * `seal` 用部署公钥（`secrets.public_key_path`，缺省由私钥推导）加密；`open` 需部署私钥，
+ * 每次落 `SECRET_OPEN` 审计（零凭据）。装配无密钥 → 两者都抛
+ * `secret axis not configured`（fail-closed）；只有公钥（seal-only）→ `open` 抛
+ * `no private key`。私钥永不出 Rust 边界。同一明文两次 seal 密文不同（临时密钥随机化）。
+ */
+declare const secret: {
+  /** 加密为 `ENC[...]` 密文（可存自有表/回传前端；解密只能靠部署私钥）。 */
+  seal(plaintext: string): string;
+  /** 解开 `secret.seal`（或 `oj secret seal`）产出的 `ENC[...]`。 */
+  open(token: string): string;
 };
 
 export {};

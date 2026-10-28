@@ -21,7 +21,7 @@
 //! 解不出密码。不防：私钥本身泄漏（那就全完了）、内存取证（明文必然在内存里）。
 //! 收益是把「N 个密码」收敛成「1 个私钥」，并让加密权（公钥，可进仓库）与解密权分离。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -59,7 +59,7 @@ const TAG_LEN: usize = 16;
 pub struct PrivKey(pub [u8; 32]);
 
 /// 公钥：`PrivKey` 的公开侧（32 字节 u 坐标）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubKey(pub [u8; 32]);
 
 /// 本项目 X25519 密钥的 PEM 标签（与 RSA 的 `BEGIN PRIVATE KEY` 等区分）。
@@ -418,6 +418,48 @@ fn sys_random(dest: &mut [u8]) -> Result<(), String> {
     getrandom::getrandom(dest).map_err(|e| format!("os random unavailable: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// 运行期密钥面（U-10）：`secret.seal` / `secret.open` 的装配期数据源。
+// ---------------------------------------------------------------------------
+
+/// 私钥推导公钥（X25519 公钥可从种子无损导出）——部署机为解封 config 本就持有私钥，
+/// 运行期 seal 不需要新增配置。
+pub fn public_of(key: &PrivKey) -> PubKey {
+    PubKey(*X25519Public::from(&StaticSecret::from(key.0)).as_bytes())
+}
+
+/// 运行期密钥（装配期一次，进 `StableState`；**私钥永不出 Rust 边界**，JS 只见
+/// seal 的密文与 open 的明文）。
+#[derive(Debug, Clone)]
+pub struct RuntimeKeys {
+    pub pub_key: PubKey,
+    /// None = 部署机无私钥（构建机/只读面）：`secret.open` fail-closed，`seal` 仍可用。
+    pub priv_key: Option<PrivKey>,
+}
+
+/// 装配期加载运行期密钥：公钥 = `secrets.public_key_path` 显式配置 > 私钥推导；
+/// 两者皆缺 → `Ok(None)`（运行期 seal/open 报 not configured，fail-closed 不静默）。
+/// 私钥通道复用 [`load_private_key`]（env 内联 > env 文件 > `secrets.private_key_path`）。
+pub fn load_runtime_keys(
+    public_key_path: Option<&str>,
+    private_key_path: Option<&str>,
+    config_dir: &Path,
+) -> Result<Option<RuntimeKeys>, String> {
+    let priv_key = load_private_key(private_key_path, config_dir).ok();
+    let pub_key = match public_key_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let full = if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                config_dir.join(p)
+            };
+            Some(load_public_key(&full)?)
+        }
+        None => priv_key.as_ref().map(public_of),
+    };
+    Ok(pub_key.map(|pub_key| RuntimeKeys { pub_key, priv_key }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +467,43 @@ mod tests {
     /// 测试专用密钥对（X25519；每用例现生成，不落盘）。
     fn keypair() -> (String, String) {
         keygen().unwrap()
+    }
+
+    /// 摸 env 的用例（`load_private_key` 会读 `OJ_SECRET_KEY*`）共用一把串行锁。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 运行期密钥装配：私钥推导公钥（零新增配置）＞显式 public_key_path＞皆缺 = None。
+    #[test]
+    fn runtime_keys_load_and_derive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env(ENV_KEY);
+        clear_env(ENV_KEY_FILE);
+        let (priv_pem, pub_pem) = keypair();
+        let dir = std::env::temp_dir().join(format!("oj-rtkeys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("k.pem"), &priv_pem).unwrap();
+        std::fs::write(dir.join("pub.pem"), &pub_pem).unwrap();
+        // ① 私钥推导公钥：seal→open 往返，且与 PEM 公钥同源。
+        let keys = load_runtime_keys(None, Some("k.pem"), &dir)
+            .unwrap()
+            .unwrap();
+        let tok = seal_pub(&keys.pub_key, "dsn").unwrap();
+        assert_eq!(
+            open_pem(keys.priv_key.as_ref().unwrap(), &tok).unwrap(),
+            "dsn"
+        );
+        assert_eq!(keys.pub_key, parse_public_key(&pub_pem).unwrap());
+        // ② 显式 public_key_path：无私钥也能 seal（open 由 op 层 fail-closed）。
+        let keys = load_runtime_keys(Some("pub.pem"), None, &dir)
+            .unwrap()
+            .unwrap();
+        assert!(seal_pub(&keys.pub_key, "x").is_ok());
+        assert!(keys.priv_key.is_none());
+        // ③ 显式路径不存在 → fail-loud（配了就要对）。
+        assert!(load_runtime_keys(Some("nope.pem"), None, &dir).is_err());
+        // ④ 什么都没有 → None（运行期报 not configured）。
+        assert!(load_runtime_keys(None, None, &dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -652,9 +731,7 @@ mod tests {
     /// 串行化，否则会与其它的 env 读写互相污染。
     #[test]
     fn private_key_source_precedence() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let (priv_pem, _) = keypair();
         let dir = std::env::temp_dir().join(format!("oj-secret-{}", std::process::id()));

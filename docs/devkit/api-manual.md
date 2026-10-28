@@ -1149,7 +1149,8 @@ db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布
 统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1，
 `db.catalog` 见其 §6 与能力矩阵）。
 安全审计检索 `audit.query`（v0.1.98，全局对象）见 `db-guide.md` §11.7；管理面 connector
-`globalThis.mgmt`（v0.1.100，特权面）见 `db-guide.md` §11.8。
+`globalThis.mgmt`（v0.1.100，特权面）见 `db-guide.md` §11.8；运行期凭据
+`secret.seal/open`（v0.1.101，U-10）见 `db-guide.md` §11.9。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -3796,6 +3797,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.client` 配额三件（U-7，v0.1.97） | ① 同主体登记数达 `db_client.max_per_owner` → register 报 `per-owner cap N reached`（delete 释放）；② 动态库全局流预算达 `db_client.max_streams` → `db.stream` 报 `stream budget exhausted`（随流结束自动释放，不排队）；③ `test/register/reRegister` 拨号 5s 超时，同主体**连续 8 次 connect 失败锁退 60s**（拨号前即拒，错误带 retry 秒数；成功清零）。拒绝落 `DB_CLIENT_DENY` 日志。详见 `db-guide.md` §11.6 |
 | G9 服务端防护门三件（v0.1.99，op 层强制——不经任何包 handler 直发 op 也拦得住） | ① **只读会话位**：`db.session.begin({readOnly: true})` → 该会话 Write/DDL 拒，错误 `db session on alias '…' is read-only; …`，`e.sessionDisposition === "keep"`（会话保留）；② **写拦截**即①的 op 层强制（attach 路径与 `db.session.query/exec` 双入口）+ 既有 `db_access.read_only` 文本级拦截；③ **危险语句确认门**：`db_access.<alias>.dangerous_confirm_token` 配置后，危险写（无 WHERE/恒真）须请求头 `x-oj-confirm` 精确匹配，否则报 `… requires confirmation for dangerous statements…`；放行即落 `DB_DANGEROUS_CONFIRM` 审计。见 `db-guide.md` §4.5 / §11.5 |
 | `db.catalog` 能力矩阵与 unsupported（v0.1.100） | kind × 方言不支持 → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名），**不静默回落**。批 a 矩阵：sqlite 仅 `views`/`ddl`；mysql 全部（`sequences` 为 auto_increment 模拟）；pg 除 mysql 式 `sequences` 外全部；`ddl` × pg 仅视图定义。未知 kind → `db catalog: unknown kind …`。行数上限 1000；`stats` 只估算。见 `db-guide.md` §6 表与 §10 |
+| `secret.seal/open`（v0.1.101，U-10） | 装配无密钥 → `secret axis not configured`（fail-closed，**不静默当明文**）；只有公钥（seal-only）→ `open` 报 `no private key`；每次 `open` 落 `SECRET_OPEN` 审计；同一明文两次 seal 密文不同（**不能拿密文判等**，要比对先 `open`）。见 `db-guide.md` §11.9 |
 | `mgmt` 管理面（v0.1.100，M1 宿主面） | 缺省 disabled（`mgmt.*` 报 `mgmt is disabled…`）；`mgmt.axes` 收编的轴从 `axis()` 公开面消失（旁路封堵）；未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）；register 探活失败即拒；双档 allow（read/write，缺省 fail-closed，enabled 时 allow 全缺拒启）。**readOnly 是插件自报、宿主不可验证**（connector 须第一方）。mongo 真 connector（M2）未交付。见 `db-guide.md` §11.8 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |

@@ -3537,7 +3537,7 @@ sqlite）登记成命名库，前端立刻用 `DB("rep")` 读写，无需重启/
 ```yaml
 db_client:
   enabled: true
-  max_entries: 16
+  max_entries: 64
   allow:
     roles: [dba]          # 谁能调 register/test/delete/reRegister/list（四维并集）
 ```
@@ -3919,3 +3919,32 @@ const cons = await db.catalog("constraints", "t"); // [{name, type: "pk"|"uq"|"c
 | mysql 的 `ddl` 对视图返回 `Create View` 语义但字段叫 `ddl` | 统一信封字段名 | 前端只读 `items[].ddl`/`.name`，别依赖底层列名 |
 | `constraints` 的 `columns` 在 pg 上是 `[]` | pg 的 `definition`（`pg_get_constraintdef`）自带列信息 | 前端优先渲染 `definition`，`columns` 作 mysql 路径的补充 |
 | `stats.rowsEstimate` 与真实行数差一个量级 | 统计是估算（`reltuples`/`information_schema`），且非实时 | 展示时标「约」；要精确数走 `db.query("select count(*) …")` |
+
+## 场景 52：连接凭据加密入库与重放（`secret.seal/open`，v0.1.101）
+
+> 一句话：方案包要把用户登记的 DSN 存进自有表、进程重启后重放 `db.client.register`——
+> DSN 用部署公钥加密落库（表泄漏不带出密码），重放时用部署私钥解出（每次落审计）。
+
+```ts
+// POST /dbx/connections：登记 → 加密入库 → db.client.register
+const tok = secret.seal(dsn);                       // "ENC[...]"：同一明文两次密文不同
+await db.table("my_connections").insert({ name, dsn_cipher: tok }).run();
+await db.client.register(name, dsn);
+
+// boot 重放（进程重启后 db_client 是内存态，须从自有表灌回）：
+const rows = await db.table("my_connections").select(["name", "dsn_cipher"]).all();
+for (const r of rows) {
+  const dsn = secret.open(r.dsn_cipher);            // 需部署私钥；每次落 SECRET_OPEN 审计
+  await db.client.register(r.name, dsn);
+}
+```
+
+### 常见坑
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `secret axis not configured` | 该装配没有任何密钥（无私钥且无 `secrets.public_key_path`） | 配 `secrets.private_key_path`（或 `OJ_SECRET_KEY`/`OJ_SECRET_KEY_FILE`）；仅加密需求可只配 `secrets.public_key_path`（seal-only） |
+| `secret.open` 报 `no private key` | 装配是 seal-only（只有公钥，如构建机） | 解密权在部署机；开发期本地放一份私钥或回退模块自有加密（`crypto.aesGcm`） |
+| 拿密文做等值查询/判重 | 信封随机化：同一明文两次 seal 密文必然不同 | 密文列只存取，不检索；要判重另存明文哈希列 |
+| 改了 `secrets.public_key_path` 后旧密文解不开 | 公钥换了但私钥没换（两把钥匙不成对） | 密钥对要成对轮换：旧私钥解 → 新公钥重封；表里留 `key_version` 列提示重录 |
+| 密文里含 `ENC[` 开头被 config 解析盯上？ | 不会——config 解密只发生在 config.yaml 加载期 | 业务表里的 `ENC[...]` 与 config 无关，只经 `secret.open` 解 |

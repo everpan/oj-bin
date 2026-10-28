@@ -337,7 +337,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `oj serve` 重启后动态登记的库全没了（v0.1.92） | 框架**不**自动落盘：`db.client.register` 构造的实例是进程内存的，进程退出 / HUP 全量重建后全部丢失。要跨重启保留，由**应用侧**负责——应用在自己表里存 `(name, ENC[...] 密文 dsn)`，启动初始化 handler 里逐条 `db.client.register` 重建；框架不提供 `db_client.persistence` 之类的自动落盘配置 |
 | `db.client.test` 连试几口内网地址后被锁一阵（v0.1.97） | 刻意的防扫描锁退：同主体**连续 8 次 connect 失败**（含 5s 拨号超时 / 认证失败）→ 60s 内一律在**拨号之前**拒绝（错误带 retry 秒数），成功一次即清零。批量试连请逐个验证 DSN 正确性，别把 `test` 当扫描器；被锁等 60s 或重启进程 |
 | 动态库上开很多 `db.stream` 报 `stream budget exhausted (db_client.max_streams)`（v0.1.97） | 所有动态别名共享一条**全局**流游标预算（缺省 32，不排队）。关掉跑完的流（`signal`/`db.cancel`/close 都会自动释放名额）或调大 `db_client.max_streams`；容量规划看 db-guide §11.6 的真实并发算式（`max_entries × (池 + 8)`） |
-| 同一用户登记到第 9 个动态库被拒 `per-owner cap`（v0.1.97） | 单主体登记上限（缺省 8）：先 `db.client.delete` 腾名额，或管理员调大 `db_client.max_per_owner`（不得大于 `max_entries`，装配期会拒启动） |
+| 同一用户登记到第 33 个动态库被拒 `per-owner cap`（v0.1.97） | 单主体登记上限（缺省 32）：先 `db.client.delete` 腾名额，或管理员调大 `db_client.max_per_owner`（不得大于 `max_entries`，装配期会拒启动） |
 | 日志里 grep 不到 `DB_SESSION_*` / `DB_CLIENT_AUDIT` 前缀了（v0.1.98） | 审计事件 stderr 归一为 **`OJ_AUDIT: kind=…`** 单一格式（旧散点前缀退役，日志解析器要更新）；同时事件入进程内环形存储，用 `audit.query({kind, user, alias, sinceMs, limit})` 检索（读门 = `audit.allow`，缺省不限制 → 装配期 warn） |
 | `audit.query` 查不到重启前的操作 / 审计被删 | 审计存储是**进程内**环形缓冲（缺省 2000 条 / 24h，双限自动清理），**不跨重启**、无防篡改——要持久化/防篡改接外部 sink（导出走 `audit.query`，或从宿主 `audit::emit` 单一出口接） |
 | 想让应用自己落盘 DSN 却直接存明文（v0.1.92） | 应用侧持久化 DSN 必须复用既有 `ENC[...]` 密封（`secret.seal`），绝不写明文；解封失败（无 `OJ_SECRET_KEY`）应 fail-loud，不当明文用 |
@@ -357,6 +357,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 危险语句靠 `allow_dangerous: true` 一刀放开（G9，v0.1.99） | 加 `dangerous_confirm_token`：配 token 后即便 `allow_dangerous: true` / `enforce: off`，危险写仍须请求头 `x-oj-confirm` **逐字**匹配（前端「确认执行」弹窗的用武之地）；放行每条落 `DB_DANGEROUS_CONFIRM` 审计。token 只来自 config——运行期 `db.access.grant` 绕不过 |
 | `db.catalog("sequences")` 在 sqlite / `db.catalog("ddl","表")` 在 pg 报 `OJ_DB_UNSUPPORTED`（v0.1.100） | 刻意的：catalog 是 **kind × 方言能力矩阵**（sqlite 批 a 只有 views/ddl；pg 的表 DDL 无原生等价、仅视图定义）——**报错不静默回落**。矩阵见 db-guide §6；缺的能力等批 b 或走业务 handler |
 | 想用 `axis("mongo")` 直调管理面 connector（v0.1.100） | 调不到——`mgmt.axes` 收编的轴在装配期从 `axis()` 公开面**消失**（特权旁路封堵，防绕过双档 allow/审计/并发闸）。管理调用只走 `mgmt.call`；`readOnly` 是插件自报（宿主不可验证），connector 须第一方 |
+| `secret.seal` 报 `secret axis not configured`（v0.1.101） | 该装配没有任何密钥：配置 `secrets.private_key_path` / `OJ_SECRET_KEY`（私钥，open 必需）或 `secrets.public_key_path`（仅 seal）。报错是 fail-closed 设计，不会静默当明文用；见 db-guide §11.9 |
+| 拿 `secret.seal` 的密文判等 / 当查询条件（v0.1.101） | 不行——信封每次随机（临时密钥 + 随机 nonce），同一明文两次 seal 密文必然不同。要比对就先 `secret.open` 再比明文；等值检索存明文哈希列 |
+| `secret.open` 报 `no private key`（v0.1.101） | 该装配配了 `secrets.public_key_path`（seal-only）但没有私钥——解密权只在部署机。每次 open 落 `SECRET_OPEN` 审计（`audit.query({kind:"SECRET_OPEN"})` 可查） |
 | 跳板机后的库连不上，想让 oj 内置 SSH 隧道（U-16） | 平台不做（条件项未触发）。用部署级隧道：`ssh -L`/autossh/socat 配方见 `deploy-tunnel-recipe.md`（devkit）；隧道断开在 oj 的表现 = 普通连接失败（category `connection`） |
 | 把「取消长导出」做成让前端断开请求（以为服务端会停） | 不会——断开不停止后端拉取。用 **`db.cancel(executionId)`**（v0.1.96）：`db.stream` 的 `onOpen`/`it.executionId()` 拿 `exec_…` 句柄存 `kv`，同一主体的任意请求调用即停（mysql/pg 真取消，其余协作式）。**只覆盖流式**——非流式查询要可取消，请改 `db.stream` |
 | 取消后把流的中断当「导出完成」 | `db.cancel` 后发起方**下一次拉取抛错** `… was cancelled via db.cancel`（不是静默 done）；`onRow` 形态的 Promise reject。按错误分流，已交付的行保留 |

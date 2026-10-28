@@ -1068,13 +1068,14 @@ mod tests {
     fn tmp_dsn(tag: &str) -> String {
         let p = std::env::temp_dir().join(format!("oj-sess-{}-{tag}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        // sqlx 默认不创建文件库（create_if_missing=false）：先落一个空文件。
-        std::fs::File::create(&p).unwrap();
         format!("sqlite://{}", p.display())
     }
 
     async fn sqlite(tag: &str) -> Arc<dyn DataAccessor> {
-        crate::bridge::SqlxAccessor::arc(&tmp_dsn(tag))
+        // 走全仓唯一的 DSN 归一入口（建文件 + Windows 盘符坑）；手拼 `sqlite://` 直喂
+        // sqlx 会被 Url 解析吞掉绝对路径（盘符成 host）→ SQLITE_CANTOPEN。
+        crate::bridge::db_backend::DbBackendRegistry::builtin()
+            .connect(&tmp_dsn(tag), &std::env::temp_dir())
             .await
             .unwrap()
     }

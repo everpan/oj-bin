@@ -1403,8 +1403,8 @@ query/exec/stream**——**不另起平行的 `db.client.query` API**（使用�
 ```yaml
 db_client:
   enabled: true            # 默认 false（fail-closed）。false 时 register/test/... 全拒。
-  max_entries: 16          # 单进程连接池硬上限（=0 装配期 fail-loud 拒启动）。
-  max_per_owner: 8         # U-7（v0.1.97）：单主体（registered_by）最多登记几个动态库。缺省 8；=0 拒启动。
+  max_entries: 64          # 单进程连接池硬上限（=0 装配期 fail-loud 拒启动）。
+  max_per_owner: 32        # U-7（v0.1.97）：单主体（registered_by）最多登记几个动态库。缺省 32；=0 拒启动。
   max_streams: 32          # U-7（v0.1.97）：动态库全局并发流预算（所有动态别名 db.stream 游标总数）。缺省 32；=0 拒启动。
   allow:                   # 登记门：谁能调 register/test/delete/reRegister/list。
     roles: [dba]           # 四维并集；任一命中即放行。全缺 = 不限制。
@@ -2345,3 +2345,31 @@ await mgmt.delete("mongo");
 - **容量与并发**：`max_entries` / `max_per_owner`（U-7 同款锁内重判）；每 connector
   并发闸 4（满即拒不排队）。
 - 首个 connector（mongo）**未交付**（M2 另期）；M1 交付宿主面 + 契约测试夹具。
+
+---
+
+## 11.9 运行期凭据（`secret.seal` / `secret.open`，U-10 v0.1.101）
+
+把 config `ENC[...]` 的同一套 X25519 + AES-256-GCM 信封开给运行期：handler 可以把敏感值
+（DSN、token）**加密后落自有表**，解密只能靠部署私钥——「配置文件可以进 git」的同一威胁
+模型延伸到「业务表里的凭据」。
+
+- **密钥来源（装配期一次）**：公钥 = `secrets.public_key_path` 显式配置 > 由私钥推导
+  （部署机为解封 config `ENC[...]` 本就持有私钥，零新增配置）。两者皆缺 = 无密钥装配，
+  `secret.*` 报 `secret axis not configured`（fail-closed，不静默当明文用）。
+- **`secret.open` 需部署私钥**：只有公钥的装配（seal-only，如构建机）seal 可用、open 报
+  `no private key`。**私钥永不出 Rust 边界**，JS 只见密文与解出的明文。
+- **审计**：每次 `open` 落 `SECRET_OPEN`（U-9 统一出口，`audit.query({kind:"SECRET_OPEN"})`
+  可查；零凭据——不记 token 与明文）。`seal` 不落审计。
+- **随机化**：同一明文两次 seal 密文不同（临时密钥 + 随机 nonce）——**不能拿密文判等**，
+  要比对就先 `open`。
+
+```js
+// 登记连接时把 DSN 加密入库（重启后 replay 用 open 解出再 db.client.register）：
+const tok = secret.seal(dsn);                    // "ENC[...]"，可存自有表
+const dsn2 = secret.open(tok);                   // 需部署私钥；明文只在本次请求内
+```
+
+- **与 `crypto.aesGcm` 的分工**：`secret.seal/open` 的密钥是**部署机**的（模块不可导出、
+  跨模块共享同一信任根）；`crypto.aesGcm(key, ...)` 的密钥由模块自带（如 `vars` 里的
+  模块级密钥）。要「跟着部署走、模块摸不到密钥」用前者；要「模块自治、可导出迁移」用后者。

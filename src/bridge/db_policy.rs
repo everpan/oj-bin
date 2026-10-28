@@ -308,7 +308,8 @@ pub struct DbClientSection {
     pub enabled: bool,
     pub max_entries: usize,
     /// per-owner（registered_by）登记上限（U-7）：一个主体最多登记多少个动态库。
-    /// 缺省 8；0 非法（装配期拒启）。
+    /// 缺省 32（v0.1.101：8 → 32——按 registered_by 计数时单一管理员常占满全部登记，
+    /// 8 条即被卡死）；0 非法（装配期拒启）。
     #[serde(default = "default_max_per_owner")]
     pub max_per_owner: usize,
     /// 动态库**全局**并发流预算（U-7）：所有动态别名上的 `db.stream` 游标总数上限。
@@ -319,7 +320,7 @@ pub struct DbClientSection {
 }
 
 fn default_max_per_owner() -> usize {
-    8
+    32
 }
 
 fn default_max_streams() -> usize {

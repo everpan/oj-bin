@@ -73,6 +73,8 @@ import {
   op_mgmt_list,
   op_mgmt_has,
   op_mgmt_call,
+  op_secret_seal,
+  op_secret_open,
   op_db_stream_open,
   op_db_stream_next,
   op_db_stream_close,
@@ -1239,6 +1241,15 @@ globalThis.mgmt = {
   has: (name) => op_mgmt_has(String(name)),
   call: (name, op, args) =>
     dbOpWrap(op_mgmt_call(String(name), String(op), args === undefined ? "{}" : JSON.stringify(args))),
+};
+// ----- U-10 v0.1.101: runtime credential face (same X25519+AES-GCM envelope as config
+// ENC[...]). seal encrypts with the deployment public key (secrets.public_key_path, or
+// derived from the private key); open decrypts with the deployment private key and lands
+// a zero-credential SECRET_OPEN audit event per call. Both fail closed when the assembly
+// has no keypair (error names how to configure). The private key never crosses into JS.
+globalThis.secret = {
+  seal: (plaintext) => op_secret_seal(String(plaintext)),
+  open: (token) => op_secret_open(String(token)),
 };
 
 // ----- safe query builder (fluent, structured) -----

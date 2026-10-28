@@ -71,6 +71,14 @@ PG `UUID`（→ 规范文本）、PG **一维数组**（→ JSON 数组，元素
 并给 `cast`/`ST_AsText` 指路。见 db-guide §10.6（值契约与边界表）、api-manual §6「db」读侧
 边界段 + §13 限制表、scenarios 场景 48（读写范式与 42804 排障）、SKILL 陷阱速查。
 
+v0.1.101 已落地部分：**U-10 运行期凭据轴**——`secret.seal/open`（db-guide
+§11.9）：与 config `ENC[...]` 同一套 X25519+AES-GCM 信封开给运行期，handler 可把敏感值
+加密后落自有表（方案包「连接凭据入库 + boot 重放」的正路）。公钥装配期加载
+（`secrets.public_key_path` 缺省由私钥推导，零新增配置）；open 需部署私钥（seal-only
+装配 open 报 `no private key`）；每次 open 落 `SECRET_OPEN` 审计（零凭据）；无密钥装配
+fail-closed。同一明文两次 seal 密文不同（不能拿密文判等）。同批：`db_client.max_per_owner`
+缺省 8 → 32（单一管理员不再被 per-owner 卡死；示例 `max_entries` 16 → 64）。
+
 v0.1.100 已落地部分：**dbx Web 对齐 P1/P2 第一批（U-11 + U-14 批 a + U-15 M1）**——
 ① **连接级能力探测**：`db.client.list/register/test` 透出 `serverVersion`/`probedAtMs`
 （3s 超时、失败降级 null、开放方言跳过、静态库不透出）；② **`db.catalog(kind, arg?)`**：
@@ -106,7 +114,7 @@ v0.1.98 已落地部分：**dbx Web 对齐 · U-9（安全审计归一 + 可检�
 §11.7）。见 db-guide §11.7、api-manual §6 指针、SKILL 陷阱速查。
 
 v0.1.97 已落地部分：**dbx Web 对齐 · U-7（client 轴配额与预算）**——动态数据源补齐三道闸：
-① `db_client.max_per_owner`（缺省 8）：单主体（registered_by）登记上限，`delete` 释放名额，
+① `db_client.max_per_owner`（缺省 32）：单主体（registered_by）登记上限，`delete` 释放名额，
 0 或 `> max_entries` 装配期拒启动；② `db_client.max_streams`（缺省 32）：动态库**全局**并发流
 预算——所有动态别名的 `db.stream` 游标总数封顶，permit 随流结束（自然/`signal`/`db.cancel`/
 close）自动释放，满即拒点名配置键；③ **拨号守卫**：`test/register/reRegister` 的 connect 包

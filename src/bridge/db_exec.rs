@@ -272,9 +272,10 @@ mod tests {
     async fn exec_bridge(tag: &str) -> Bridge {
         let p = std::env::temp_dir().join(format!("oj-exec-{}-{tag}.db", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        // sqlx 不代建文件库：先落空文件。
-        std::fs::File::create(&p).unwrap();
-        let db = crate::bridge::SqlxAccessor::arc(&format!("sqlite://{}", p.display()))
+        // 走全仓唯一的 DSN 归一入口（建文件 + Windows 盘符坑）；手拼 `sqlite://` 直喂
+        // sqlx 会被 Url 解析吞掉绝对路径（盘符成 host）→ SQLITE_CANTOPEN。
+        let db = crate::bridge::db_backend::DbBackendRegistry::builtin()
+            .connect(&format!("sqlite://{}", p.display()), &std::env::temp_dir())
             .await
             .unwrap();
         db.exec_with_params("create table t (id integer primary key)", &[])
