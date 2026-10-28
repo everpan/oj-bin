@@ -111,7 +111,7 @@ TIMEOUT_ROLLBACK_FAILED,DISCARD,CLOSE_ERR}`）；`db.session.stats()` 给 `activ
 | 4 | ~~U-9 审计落存储~~ **已完成**（v0.1.98） | 四族出口归一 `audit::emit` 单一出口 + 进程内环形存储（`audit:` 段，2000 条/24h 双限）+ `audit.query` 检索（读门 `audit.allow`）。stderr 归一 `OJ_AUDIT:` 格式（**旧前缀退役**）。已知限制：不跨重启、无防篡改（外部 sink 另期）；sql_trace 不归审计轴 | plan：`plans/2026-10-28-dbx-web-u9-audit.md` |
 | 5 | ~~G9 服务端防护门~~ **已完成**（v0.1.99） | ① `begin({readOnly:true})` 只读会话位（op 层双入口，信封 `disposition=keep`）；② 写拦截即①的强制 + 既有 read_only 回归锚；③ `dangerous_confirm_token` 确认门（头 `x-oj-confirm`，放行落 `DB_DANGEROUS_CONFIRM`）。连接级硬保证仍是 DB GRANT（登记 db-guide） | plan：`plans/2026-10-28-dbx-web-g9-op-gates.md` |
 | 6 | ~~U-13 补 tag~~ **已完成**（2026-10-28，本地；push 需显式 `origin`） | v0.1.88/89/91/92/93/95/96 已打 annotated tag；**v0.1.90（L2/L3 并版）与 v0.1.94（L6/L7 并版）无分界提交，未补**——方案包钉 `peerOj` 下限时避开这两个版本 | |
-| 7 | U-11 能力探测 / U-14 内省扩展 / U-15 管理面 connector / U-16（条件项） | **四份设计稿已写**（2026-10-28）：`plans/2026-10-28-u11-connection-capability-probe.md`（单期，建议与 U-14 批 a 同车）/ `-u14-introspection-expansion.md`（宿主侧 SQL 常量三批次，零 ABI）/ `-u15-admin-connector-axis.md`（泛型轴承载，零新 ABI，首个 mongo）/ `-u16-ssh-tunnel-conditional.md`（立项申请书，条件未触发） | 各稿 §「待评审问题」即四路评审议程；**过评审才动工** |
+| 7 | U-11 能力探测 / U-14 内省扩展 / U-15 管理面 connector / U-16（条件项） | **四份设计稿已过三路专家评审（架构/工程/产品，2026-10-28）并处置落稿**（各稿 §处置表；共 50 条意见：采纳 47、部分采纳 2、未采纳 0+1 项部分）：U-11 放行（与 U-14 批 a 同车 v0.1.100）；U-14 修订后放行（批次重切「先树后详情」）；U-15 两处阻断已重写（装配隔离堵 `axis()` 旁路 + 能力位改 `__ops__` 约定承载，仍零 ABI）；U-16 **产品裁决不立项**（触发条件加严，先出部署级隧道 recipe 文档） | **可以动工的顺序：U-11+U-14a → U-14b → U-15（M1→M3）**；各稿估时见 §分期 |
 
 **明确不做**（PRD §6/§7，别重复讨论）：U-10 运行期凭据轴、U-12 LOB 轴、PL/SQL 调试协议、
 Oracle/达梦方言（门禁未过）、导出格式生成、SQL 文本函数、AI/MCP、连接持久化（**已裁决由方案包自管**）。
