@@ -1153,6 +1153,14 @@ pub async fn assemble_backend(
                  (add the generic axis names to claim them off the public axis() surface)"
             );
         }
+    } else if !mgmt_section.axes.is_empty() {
+        // 评审 R.1-P8：disabled 却收编轴 = 公开面静默少一个轴（违背 fail-loud）。
+        eprintln!(
+            "warn: mgmt is disabled but mgmt.axes is non-empty ({:?}) -- these axes are \
+             claimed off the public axis() surface and unreachable; remove mgmt.axes or \
+             set mgmt.enabled: true",
+            mgmt_section.axes
+        );
     }
     // blob：blob 段存在即启用；未声明 → None。`--blob` 选中的 profile 别名为 "default"。
     let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {

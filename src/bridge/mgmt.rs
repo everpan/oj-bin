@@ -10,7 +10,7 @@
 //!
 //! connector 的 `GenericVtable.call` 必须实现三个保留 op（与 db 插件的 vtable 纪律同 philosophy：
 //! 传输零 ABI，语义靠约定 + fail-loud）：
-//! - `__ops__` → `[{"op":…,"readOnly":bool}, …]`（能力表；缺 op 即 `OJ_MGMT_UNSUPPORTED`）
+//! - `__ops__` → `[{"op":…,"readOnly":bool}, …]`（能力表；缺失即登记拒绝）
 //! - `__connect__`（args `{"dsn":…}`）→ `{"handle":…}`（登记时调用；返回句柄随每次业务调用注入）
 //! - `__disconnect__`（args `{"handle":…}`）（删除时尽力而为）
 //!
@@ -222,7 +222,7 @@ async fn read_caps(
         let ro = it.get("readOnly").and_then(Value::as_bool).unwrap_or(false);
         ops.insert(op.to_string(), ro);
     }
-    if !ops.contains_key("ping") {
+    if ops.get("ping") != Some(&true) {
         return Err("mgmt connector must declare a read-only 'ping' op in __ops__".to_string());
     }
     Ok(ops)
@@ -266,20 +266,29 @@ pub async fn op_mgmt_register(
     let owner_str =
         db_policy::operator_of(state.borrow().borrow::<super::ReqState>().req.user.as_ref());
     let registry = &st.mgmt;
-    registry
-        .insert(
-            name.clone(),
-            MgmtEntry {
-                registered_by: owner_str.clone(),
-                registered_at_ms: now_ms(),
-                dsn_redacted: crate::secret::redact(&dsn),
-                handle,
-                ops,
-            },
+    if let Err(e) = registry.insert(
+        name.clone(),
+        MgmtEntry {
+            registered_by: owner_str.clone(),
+            registered_at_ms: now_ms(),
+            dsn_redacted: crate::secret::redact(&dsn),
+            handle: handle.clone(),
+            ops,
+        },
+    ) {
+        // 容量/per-owner/重名拒绝：已建立的连接必须回收（评审 R.1：满员重试会泄漏真连接）。
+        let _ = call_axis(
+            vt,
+            "__disconnect__",
+            &json!({ "handle": handle }).to_string(),
         )
-        .map_err(JsErrorBox::generic)?;
+        .await;
+        return Err(JsErrorBox::generic(e));
+    }
     mgmt_emit(&state.borrow(), "MGMT_AUDIT", &name, "action=register");
-    let e = registry.entry(&name).unwrap();
+    let e = registry
+        .entry(&name)
+        .ok_or_else(|| JsErrorBox::generic("mgmt: entry vanished after insert".to_string()))?;
     Ok(summary(&name, &e))
 }
 
@@ -327,7 +336,8 @@ pub fn op_mgmt_has(state: &mut OpState, #[string] name: &str) -> bool {
     st.mgmt.contains(name)
 }
 
-/// 管理调用：能力位分档 → 并发闸 → `__handle` 注入 → 审计。
+/// 管理调用：**先过门再查信息**（评审 R.1-P9：未授权调用方不得探测已登记 connector
+/// 与 op 清单）→ 能力位分档 → 并发闸 → `__handle` 注入 → 审计。
 #[op2]
 #[serde]
 pub async fn op_mgmt_call(
@@ -340,15 +350,28 @@ pub async fn op_mgmt_call(
         let s = state.borrow();
         s.borrow::<Arc<StableState>>().clone()
     };
+    // 读档先过（存在性与 ops 查询也是信息面）；写档在 readOnly 判定后再过一次。
+    let _ = require_gate(&state.borrow(), false)?;
     let Some(entry) = st.mgmt.entry(&name) else {
         return Err(JsErrorBox::generic(format!(
             "unknown mgmt connector '{name}' (not registered; use mgmt.register)"
         )));
     };
     let Some(read_only) = entry.ops.get(&op).copied() else {
-        return Err(JsErrorBox::generic(format!(
-            "op '{op}' is not declared by mgmt connector '{name}'"
-        )));
+        // 结构化 unsupported（评审 R.1-P1：能力位声明未实现 = 带 capability 的报错，
+        // 前端按 `e.code === "OJ_DB_UNSUPPORTED"` + `e.data.capability` 分流）。
+        return Err(crate::bridge::db_error::BridgeError {
+            category: crate::bridge::db_error::DbErrorCategory::Unsupported,
+            retryable: false,
+            session_disposition: crate::bridge::db_error::SessionDisposition::Keep,
+            message: format!("op '{op}' is not declared by mgmt connector '{name}'"),
+            data: {
+                let mut m = serde_json::Map::new();
+                m.insert("capability".to_string(), Value::String(op.clone()));
+                m
+            },
+        }
+        .into());
     };
     let _ = require_gate(&state.borrow(), !read_only)?;
     let permit = st.mgmt.try_gate(&name).map_err(JsErrorBox::generic)?;
@@ -360,7 +383,24 @@ pub async fn op_mgmt_call(
         return Err(JsErrorBox::generic("mgmt args must be a JSON object"));
     }
     body["__handle"] = entry.handle.clone();
-    let out = call_axis(vt, &op, &body.to_string()).await?;
+    let out = match call_axis(vt, &op, &body.to_string()).await {
+        Ok(v) => v,
+        Err(e) => {
+            // connector 侧失败也落审计（评审 R.1：观察/排障面）；detail 只带错误类，不带 args/响应。
+            let class = if e.to_string().contains("panic") {
+                "panic"
+            } else {
+                "error"
+            };
+            mgmt_emit(
+                &state.borrow(),
+                "MGMT_AUDIT",
+                &name,
+                &format!("action=call_error op={op} class={class}"),
+            );
+            return Err(e);
+        }
+    };
     drop(permit);
     mgmt_emit(
         &state.borrow(),
@@ -372,8 +412,13 @@ pub async fn op_mgmt_call(
 }
 
 fn summary(name: &str, e: &MgmtEntry) -> Value {
-    let mut ops: Vec<&String> = e.ops.keys().collect();
-    ops.sort();
+    // ops 带 readOnly 位（评审 R.1-P7：前端要能预判哪个 op 会打写档门）；按名排序。
+    let mut ops: Vec<Value> = e
+        .ops
+        .iter()
+        .map(|(op, ro)| json!({ "name": op, "readOnly": ro }))
+        .collect();
+    ops.sort_by_key(|o| o["name"].as_str().unwrap_or("").to_string());
     json!({
         "connector": name,
         "dsn": e.dsn_redacted,
@@ -522,7 +567,11 @@ mod tests {
         )
         .await;
         assert_eq!(v["code"], 0, "{v}");
-        assert_eq!(v["data"]["ops"], json!(["kill", "ping"]), "{v}");
+        assert_eq!(
+            v["data"]["ops"],
+            json!([{"name": "kill", "readOnly": false}, {"name": "ping", "readOnly": true}]),
+            "{v}"
+        );
         let bypass = v["data"]["bypass"].as_str().unwrap_or_default();
         assert!(bypass.contains("unknown generic axis"), "旁路必须封堵：{v}");
         let unsup = v["data"]["unsup"].as_str().unwrap_or_default();

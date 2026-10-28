@@ -368,9 +368,18 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
                         break;
                     }
                     cur = Some(name.clone());
+                    // 词表跨方言统一（评审 R.1）：mysql 的 "PRIMARY KEY"/"UNIQUE" 归一为
+                    // pg 口径的 pk/uq/ck。
+                    let t = str_of(r, "type");
+                    let ty = match t.to_uppercase().as_str() {
+                        "PRIMARY KEY" => "pk",
+                        "UNIQUE" => "uq",
+                        "CHECK" => "ck",
+                        _ => &t,
+                    };
                     out.push(json!({
                         "name": name,
-                        "type": str_of(r, "type").to_lowercase(),
+                        "type": ty,
                         "definition": opt_str(r.get("definition")),
                         "columns": Vec::<Value>::new(),
                     }));
@@ -387,10 +396,22 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
             .iter()
             .take(MAX_ROWS)
             .map(|r| match kind {
-                Kind::Views | Kind::Ddl => json!({
-                    "name": str_of(r, "name"),
-                    "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))),
-                }),
+                Kind::Views | Kind::Ddl => {
+                    // mysql SHOW CREATE 的列名是 `Table`/`Create Table`（View 同理）——
+                    // name/ddl 都要兜回退（评审 R.1：mysql 侧 name 恒空串）。
+                    let name = {
+                        let n = str_of(r, "name");
+                        if n.is_empty() {
+                            str_of(r, "Table")
+                        } else {
+                            n
+                        }
+                    };
+                    json!({
+                        "name": name,
+                        "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))).or_else(|| opt_str(r.get("Create View"))),
+                    })
+                }
                 Kind::Routines | Kind::Sequences => json!({
                     "name": str_of(r, "name"),
                     "type": str_of(r, "type"),
@@ -757,7 +778,7 @@ mod tests {
             ],
         );
         assert_eq!(cs.len(), 2, "{cs:?}");
-        assert_eq!(cs[0]["type"], json!("primary key"));
+        assert_eq!(cs[0]["type"], json!("pk"));
         assert_eq!(cs[0]["columns"], json!(["id", "code"]));
 
         let st = catalog(

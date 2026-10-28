@@ -3890,3 +3890,32 @@ db stream exec_c90… was cancelled via db.cancel (cursor closed; rows already d
 | 给前端返回了完整 id | id 是 bearer 凭据 | 只回前 8 字符（`xid.slice(0, 8)`）；日志/错误里引擎只出前缀 |
 
 > 机制与红线见 `db-guide.md` §3.1 的 `db.cancel` 条目；报错文案见 `api-manual.md` §13。
+
+---
+
+## 场景 51：对象浏览器目录内省（`db.catalog`，v0.1.100）
+
+> 一句话：连接树要「有哪些视图/函数/序列」，点开对象要「源码/注释/约束/行数」——
+> 一个 `db.catalog(kind, arg?)` 出口，三方言统一信封 `{kind, dialect, items}`。
+
+```ts
+// 连接树二级节点（全库清单，无 arg）
+const views = await db.catalog("views");      // [{name, ddl}]
+const routines = await db.catalog("routines"); // [{name, type: "FUNCTION"|"PROCEDURE"}]
+const seqs = await db.catalog("sequences");   // pg 原生 / mysql 为 auto_increment 模拟
+const stats = await db.catalog("stats");      // [{name, rowsEstimate, sizeBytes}]（只估算）
+
+// 点开对象（arg = 对象名）
+const ddl = await db.catalog("ddl", "v_report");   // [{name, ddl}]
+const cmts = await db.catalog("comment", "t");     // [{table, column, comment}]
+const cons = await db.catalog("constraints", "t"); // [{name, type: "pk"|"uq"|"ck", definition, columns}]
+```
+
+### 常见坑
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名） | kind × 方言不在能力矩阵（批 a：sqlite 仅 views/ddl；`ddl`×pg 仅视图定义） | **报错不静默回落**——按 capability 分流禁用入口，或等批 b |
+| mysql 的 `ddl` 对视图返回 `Create View` 语义但字段叫 `ddl` | 统一信封字段名 | 前端只读 `items[].ddl`/`.name`，别依赖底层列名 |
+| `constraints` 的 `columns` 在 pg 上是 `[]` | pg 的 `definition`（`pg_get_constraintdef`）自带列信息 | 前端优先渲染 `definition`，`columns` 作 mysql 路径的补充 |
+| `stats.rowsEstimate` 与真实行数差一个量级 | 统计是估算（`reltuples`/`information_schema`），且非实时 | 展示时标「约」；要精确数走 `db.query("select count(*) …")` |

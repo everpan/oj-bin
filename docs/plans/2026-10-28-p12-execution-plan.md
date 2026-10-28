@@ -1,6 +1,7 @@
 # P1/P2 执行计划与任务跟踪（U-11 / U-14 / U-15 / U-16）
 
-> 状态：**执行中**（本文件是唯一任务真相源：状态、小结、增量记录都在这里，随做随更）。
+> 状态：**本批完成**（T11/T14 批 a/T15 M1/T16.1 + R.1 合并审查全部 ✅；待办仅余批 b/M2，见 §3）。
+> （本文件是唯一任务真相源：状态、小结、增量记录都在这里，随做随更。）
 > 依据：四份已过三路评审的设计稿（`-u11-…` / `-u14-…` / `-u15-…` / `-u16-…`，2026-10-28 处置落稿）。
 > 原则：SOLID（单一职责：探测/内省/管理面各自独立模块；依赖倒置：全部经既有 trait/通道）+
 > DRY（探测 helper 三处复用、内省走同一 `introspect()` 通路、审计走 `audit::emit` 单一出口）+
@@ -32,7 +33,7 @@
 | T15.3 | `__ops__` 能力位 + read/write 双档门 + 配额 + 审计 | Given 未启用 → fail-closed；op 未自报 → 拒；register ping 失败 → 拒；审计零凭据 | ✅ | 三保留 op 契约；双档（allow_read 缺省复用 allow）；并发闸 4/connector；MGMT_AUDIT/DENY 入 audit.query |
 | T15.4 | JS 面 + mini connector 契约测试 | Given 假 vtable connector，When 全锚用例，Then 测试锚全绿 | ✅* | Bridge 级假 vtable（进程内）全绿；**cdylib 版 mini-mgmt 夹具未做**（缺符号路径，随 M2 补） |
 | T16.1 | 部署级隧道 recipe 文档 | Given 运维要接跳板机后的库，When 照 recipe，Then ssh -L/autossh/socat 配方可复制 | ✅ | `docs/devkit/deploy-tunnel-recipe.md`（README 清单已登记） |
-| R.1 | **合并审查**：三路评审人对 P-1~P-3 全部 diff 复审 | Given 全部阶段 diff，When 三路复审，Then 阻断=0（或修复后=0） | ☐ | 待本轮门禁绿后启动 |
+| R.1 | **合并审查**：三路评审人对 P-1~P-3 全部 diff 复审 | Given 全部阶段 diff，When 三路复审，Then 阻断=0（或修复后=0） | ✅ | 三路（架构/工程/产品）均「修复后放行」；约 20 条发现全部处置（修 17/记录 3），全门禁复绿 |
 
 ## 2. 增量记录（随做随更）
 
@@ -46,6 +47,23 @@
   （serve_cmd 分流）+ `mgmt:` 段五处登记 + `globalThis.mgmt` + global.d.ts + Bridge 级假
   vtable 契约测试 3 件（旁路封堵/分档/审计）。全量 lib 869 绿。
 - **T16.1**：`deploy-tunnel-recipe.md`（ssh -L/autossh/socat + 安全要点）。
+- **R.1 合并审查（三路，diff 23c4322..262ca10）→ 修复**：
+  - 代码：`op_mgmt_call` 门禁前置（read 门 → 条目/ops 查找 → 结构化 Unsupported → write 门
+    → 并发闸）；`mgmt.register` 插入失败补 best-effort `__disconnect__`；未声明 op 统一
+    `OJ_DB_UNSUPPORTED`（capability=op 名，弃虚构的 `OJ_MGMT_UNSUPPORTED`）；call_error 入审计；
+    unwrap → ok_or_else；disabled+axes 装配 warn；ops 透出 `readOnly`；
+    能力矩阵纠错（pg 有原生 sequences，db-guide/api-manual/CHANGELOG 三处）；
+    mysql ddl `name` 空串回落 `Table` 列；constraints 词表统一 pk/uq/ck；
+    `db.client.test` 签名与 `serverVersion` 对齐。
+  - 测试：开放方言 `db.catalog` 命名用例（oracle → 结构化 unsupported，
+    `data.capability=="views"`）；mgmt 3 件 + introspect 35 件 + client_db 8 件复绿。
+  - 文档：db-guide mgmt 章红线（`__connect__` 参数含明文 DSN）；scenarios 场景 51；
+    global.d.ts（`db.catalog` + `MgmtEntry.ops`）；SKILL/api-manual 错误码同步。
+  - 记录性处置（不修，登记）：allow_read 无限制仅 warn（决策）；probe warn 频次维持每次
+    fail；LIMIT 截断先于 constraints 聚合的边界（批 b）；U-14 批 b 备忘（mysql CHECK、
+    Create View）。
+  - 门禁复绿：fmt / clippy `-D warnings` / workspace **1616** 全绿 / `cargo xtask build`
+    + smoke ok / xtask 契约 10 绿。
 
 ## 3. 诚实登记（避免遗忘）
 

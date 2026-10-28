@@ -16,13 +16,19 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.100（未打标签）
+## v0.1.100
 
 **dbx Web 对齐 P1/P2 第一批**：U-11（连接级能力探测）+ U-14 批 a（catalog 内省）+
 U-15 M1（管理面 connector 宿主面）。设计稿与三路评审处置：
 `docs/plans/2026-10-28-u11-…` / `-u14-…` / `-u15-…`；执行跟踪 `…-p12-execution-plan.md`。
 U-16 维持不立项（部署级隧道 recipe 文档已交付 `docs/devkit/deploy-tunnel-recipe.md`）。
 **零 ABI 变更**（12 保持）。
+
+**合并审查修订**（三路复审 diff 后「修复后放行」，约 20 条全处置）：`mgmt.call` 门禁前置 +
+未声明 op 统一结构化 `OJ_DB_UNSUPPORTED`（弃虚构 `OJ_MGMT_UNSUPPORTED`）；register 插入
+失败补 `__disconnect__`；call_error 入审计；装配 disabled+axes warn；能力矩阵纠错（**pg
+有原生 sequences**）；mysql ddl `name` 空串回落；constraints 词表统一 pk/uq/ck；开放方言
+`db.catalog` 命名用例；文档四件同步（场景 51 / global.d.ts / mgmt 红线）。
 
 ### feat(db_client) — U-11
 
@@ -36,8 +42,9 @@ U-16 维持不立项（部署级隧道 recipe 文档已交付 `docs/devkit/deplo
 - 新增 **`db.catalog(kind, arg?)`**：目录类内省，信封 `{kind, dialect, items}`（L2 三件
   listColumns/Indexes/ForeignKeys 保持裸数组不动——两代约定）。kind：`views` / `routines` /
   `sequences` / `ddl` / `comment` / `constraints` / `stats`（行数上限 1000）。
-- 能力矩阵（批 a）：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟）；
-  pg 除 mysql 式 sequences 外全部。**unsupported 报结构化 `OJ_DB_UNSUPPORTED`，不静默**。
+- 能力矩阵（批 a）：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟，
+  constraints 批 a 仅 PK/UQ）；pg 全部（sequences 原生）。**unsupported 报结构化
+  `OJ_DB_UNSUPPORTED`，不静默**。
 - mysql `SHOW CREATE` 是零内联铁律的唯一成文例外（白名单字符集 + 反引号转义）；
   静态守卫测试扩展到全部新 SQL 常量（`::text`/`current_schema()`/无 LIKE/参数位计数）。
 - `granted_only` 授权链与 L2 同源；`stats` 只做估算（无 precise 全表扫描开关）。
@@ -50,7 +57,8 @@ U-16 维持不立项（部署级隧道 recipe 文档已交付 `docs/devkit/deplo
   （缺省复用 allow）；两档缺省 fail-closed。
 - connector 契约（零 ABI，架在泛型传输上）：保留 op `__ops__`（能力表，**readOnly 为插件
   自报、宿主不可验证**——红线成文）/ `__connect__` / `__disconnect__`；未声明 op →
-  `OJ_MGMT_UNSUPPORTED`。登记探活 fail-loud（ping 失败 = 拒绝）。
+  结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）。登记探活 fail-loud（ping
+  失败 = 拒绝）。
 - 审计 `MGMT_AUDIT`/`MGMT_DENY` 走 `audit::emit` 单一出口，全字段零凭据；
   per-connector 并发闸（4，满即拒不排队）；`max_entries`/`max_per_owner` 容量。
 - 段改动归 `restart_pending`；`oj serve` 装配校验（0 值拒启 / allow 全缺拒启）。
@@ -58,7 +66,10 @@ U-16 维持不立项（部署级隧道 recipe 文档已交付 `docs/devkit/deplo
 ### 已知限制（诚实登记）
 
 - **U-15 M2（oj-mgmt-mongo 真 connector）未交付**——M1 仅有宿主面 + 测试用 mini connector
-  契约覆盖；M2/M3（真 connector + 发版文档）另期。
+  契约覆盖；M2/M3（真 connector + 发版文档）另期。**登记后的惰性重探（`alive:false`
+  两段式后半）未实现**——探活仅登记时 fail-loud 一次（评审锚 8 后半随 M2）。
+- **`__connect__` args 含明文 DSN**（宿主审计零凭据，但 connector 侧日志须自行脱敏——
+  db-guide §11.8 红线已登记）。
 - U-14 批 b（triggers/partitions/types + sqlite 模拟）未交付；批 c 默认不排期。
 - `mgmt.readOnly` 位不可验证（插件自报）——connector 须第一方。
 

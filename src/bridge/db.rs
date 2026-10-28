@@ -2380,6 +2380,26 @@ mod tests {
         }
     }
 
+    /// U-14 批 a R.1-P5（开放方言命名用例）：Given oracle accessor When db.catalog("views")
+    /// Then 结构化 `OJ_DB_UNSUPPORTED` 信封，`data.capability=="views"`、message 点名 oracle。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_db_catalog_is_unsupported() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        let cap = b
+            .run(
+                r#"db.catalog("views").then(r => json.ok(r)).catch(e => json.fail(500, String(e), e.data));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 500, "{v}");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("oracle"), "{msg}");
+        let data = &v["data"];
+        assert_eq!(data["capability"], json!("views"), "{v}");
+        assert_eq!(data["dialect"], json!("oracle"), "{v}");
+    }
+
     /// Given oracle accessor When db.nextSeq("s")（next_seq 门控）
     /// Then 结构化 unsupported，message 点名 oracle 与 next_seq。
     #[tokio::test(flavor = "current_thread")]

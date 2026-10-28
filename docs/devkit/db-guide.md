@@ -1424,11 +1424,11 @@ SSRF / 内网横向移动面）；`max_entries==0`、`max_per_owner==0`、`max_s
 #### 11.6.2 管理面（`db.client`）
 
 ```js
-const r = await db.client.register("rep", "mysql://user:pass@host/db"); // 返回 {alias,dialect,dsn,registeredBy,registeredAtMs,queries}
+const r = await db.client.register("rep", "mysql://user:pass@host/db"); // 返回 {alias,dialect,dsn,registeredBy,registeredAtMs,serverVersion,probedAtMs,queries}
 await db.client.test("mysql://user:pass@host/db");   // {ok, dialect?, error?}（不落库）
 await db.client.reRegister("rep", "mysql://...");    // 替换已登记连接（不存在则错）
 const ok = await db.client.delete("rep");            // 删库 + 驱逐 dbCache（见下）
-const names = await db.client.list();                // [{alias,dialect,dsn,registeredBy,registeredAtMs,queries}]（dsn 已脱敏）
+const names = await db.client.list();                // [{alias,dialect,dsn,registeredBy,registeredAtMs,serverVersion,probedAtMs,queries}]（dsn 已脱敏）
 db.client.has("rep");                                // 同步 bool（探活用，不经过登记门）
 ```
 
@@ -1600,10 +1600,10 @@ const evs = await audit.query({ kind: "DB_SESSION_TIMEOUT", sinceMs: Date.now() 
 | `db.listColumns` | `listColumns(table: string): Promise<Array<{ name: string; nativeType: string; nullable: boolean; default: string \| null; primaryKey: boolean }>>` | **列结构内省**（v0.1.90）。当前库单表的列信息，按声明序；`nativeType` 是方言**声明文本**（sqlite `type` / mysql `column_type` / pg `format_type`，零归一化），`default` 是原始 DDL 文本（sqlite 字符串默认带引号）；表名只经绑定参数。表不存在/不可见 → 空数组（不区分）。未知方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_columns"`）。`db.tx` 回调同签名 |
 | `db.listIndexes` | `listIndexes(table: string): Promise<Array<{ name: string; unique: boolean; primary: boolean; origin: "c" \| "u" \| "pk"; columns: string[] }>>` | **索引结构内省**（v0.1.90）。`origin` 三方言统一为 `c`(普通) / `u`(唯一) / `pk`(主键)——UI 不再分支；`columns` 为已按序聚合的组成列。其余口径同 `listColumns`；能力缺失码 `list_indexes` |
 | `db.listForeignKeys` | `listForeignKeys(table: string): Promise<Array<{ name: string \| null; columns: string[]; refTable: string; refColumns: string[] }>>` | **外键结构内省**（v0.1.90）。sqlite 外键无约束名 → `name` 为 `null`；复合外键 `columns[i]` ↔ `refColumns[i]` 按位配对。其余口径同 `listColumns`；能力缺失码 `list_foreign_keys` |
-| `db.catalog` | `catalog(kind: "views" \| "routines" \| "sequences" \| "ddl" \| "comment" \| "constraints" \| "stats", arg?: string): Promise<{ kind: string; dialect: string; items: object[] }>` | **目录类内省**（U-14 批 a，v0.1.100；新一代信封——L2 三件保持裸数组不动）。`views`=清单+定义、`routines`=函数/过程清单、`sequences`=序列（mysql 为 auto_increment 模拟）、`ddl`=单对象源码（`arg`=对象名；mysql 走 `SHOW CREATE` 白名单例外；pg 仅视图定义）、`comment`=列注释（`arg`=表名）、`constraints`=PK/UQ/CHECK（`arg`=表名；FK 走 listForeignKeys）、`stats`=估算行数/大小（**只估算**，无全表扫描开关）。行数上限 1000。**能力矩阵**：sqlite 仅 views/ddl；mysql 全部；pg 除 mysql 式 sequences 外全部——**unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默**。授权链同 L2（`granted_only`） |
+| `db.catalog` | `catalog(kind: "views" \| "routines" \| "sequences" \| "ddl" \| "comment" \| "constraints" \| "stats", arg?: string): Promise<{ kind: string; dialect: string; items: object[] }>` | **目录类内省**（U-14 批 a，v0.1.100；新一代信封——L2 三件保持裸数组不动）。`views`=清单+定义、`routines`=函数/过程清单、`sequences`=序列（mysql 为 auto_increment 模拟）、`ddl`=单对象源码（`arg`=对象名；mysql 走 `SHOW CREATE` 白名单例外；pg 仅视图定义）、`comment`=列注释（`arg`=表名）、`constraints`=PK/UQ/CHECK（`arg`=表名；FK 走 listForeignKeys）、`stats`=估算行数/大小（**只估算**，无全表扫描开关）。行数上限 1000。**能力矩阵**：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟；constraints 批 a 仅 PK/UQ）；pg 全部（sequences 原生）——**unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默**。授权链同 L2（`granted_only`） |
 | `db.allowed()` | `allowed(): Array<{ alias: string; dialect: string; read_only: boolean; allow_ddl: boolean; allow_dangerous: boolean; max_rows: number \| null; enforce: "off" \| "warn" \| "deny" }>` | **访问控制自省**（v0.1.89）。只列**当前调用主体有权限访问**的库别名及其能力位（按 alias 排序）；未授权的库不出现在列表里。管理员后台 / 数据面板的「库选择器」应以此为准，不要硬编码 `db:` 段的全部别名（那是**假入口**：列出来点了才报错）。同步 op；不执行任何 SQL。`db.tx` 回调对象同签名 |
 | `db.client.register` | `register(name: string, dsn: string): Promise<ClientDbEntry>` | **动态数据源登记**（client 轴，v0.1.91）。运行期把 DSN 登记为命名数据源；登记后别名进入 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream），此处只暴露**管理面**。重名 / 超 `max_entries` 抛错。未配置的名字返回 `undefined` 的地方同理：`db.client` 仅在 `db`（即 `DB("default")`）存在时挂载 |
-| `db.client.test` | `test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string }>` | 试连（**不落库**）；返回 `{ok, dialect?, error?}` |
+| `db.client.test` | `test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string; serverVersion?: string \| null; probedAtMs?: number }>` | 试连（**不落库**）；返回 `{ok, dialect?, serverVersion?, probedAtMs?, error?}`（U-11：探测成功即带版本） |
 | `db.client.reRegister` | `reRegister(name: string, dsn: string): Promise<ClientDbEntry>` | 替换已登记连接（不存在则抛 `not registered`） |
 | `db.client.delete` | `delete(name: string): Promise<boolean>` | 删除数据源；**自动驱逐 `DB()` 缓存**（否则删后再 `DB(name)` 拿到陈旧实例）；返回是否删除成功 |
 | `db.client.list` | `list(): Promise<ClientDbEntry[]>` | 列出全部已登记数据源（`dsn` 已脱敏：`user:pass@` → `***`） |
@@ -2322,7 +2322,7 @@ mgmt:
   enabled: true             # 缺省 false（fail-closed）
   axes: ["mongo"]           # 收编名单（这些轴从 axis() 消失）
   allow: { roles: [dba] }   # 写档：register/delete/非只读 call；enabled 时必须显式（否则拒启）
-  allow_read: { roles: [monitor, dba] }   # 读档：list/has/只读 call；缺省复用 allow
+  allow_read: { roles: [monitor, dba] }   # 读档：list/只读 call；缺省复用 allow（has 无特权语义，仅探活）
   max_entries: 8
   max_per_owner: 4
 ```
@@ -2337,11 +2337,11 @@ await mgmt.delete("mongo");
 
 - **能力位契约**（零 ABI，架在泛型传输上）：connector 实现保留 op `__ops__`（返回
   `[{"op","readOnly"}]`）/ `__connect__` / `__disconnect__`；未声明 op →
-  `OJ_MGMT_UNSUPPORTED`（fail-loud，不透传）。
+  结构化错误 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名；fail-loud，不透传）。
 - **红线：readOnly 是插件自报、宿主不可验证**——分档判权据此，但插件谎报即绕过；
   connector 须第一方（红线成文于评审处置）。
 - **审计**：register/delete/call 逐条 `MGMT_AUDIT`；拒绝 `MGMT_DENY`；全字段零凭据
-  （连接串入库即脱敏，args 永不入审计）。
+  （连接串入库即脱敏，args 永不入审计）。`__connect__` 的 args 含**明文 DSN**——connector 侧日志须自行脱敏（红线）。
 - **容量与并发**：`max_entries` / `max_per_owner`（U-7 同款锁内重判）；每 connector
   并发闸 4（满即拒不排队）。
 - 首个 connector（mongo）**未交付**（M2 另期）；M1 交付宿主面 + 契约测试夹具。

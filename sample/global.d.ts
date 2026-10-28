@@ -695,6 +695,12 @@ declare global {
      * `{name, columns, refTable, refColumns}[]`，按约束名再按列序。
      * sqlite 外键无约束名 → `name` 为 null；复合外键两端**按位配对**（`columns[i]`↔`refColumns[i]`）。 */
     listForeignKeys(table: string): Promise<ForeignKeyInfo[]>;
+    /** 目录类内省（U-14 批 a，v0.1.100）：新一代信封 `{kind, dialect, items}`（L2 三件
+     * 保持裸数组不动）。kind：views / routines / sequences / ddl / comment / constraints /
+     * stats；ddl/comment/constraints 吃 `arg`（对象名），其余全库清单。能力矩阵见
+     * db-guide §6——unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默。 */
+    catalog(kind: "views" | "routines" | "sequences" | "ddl" | "comment" | "constraints" | "stats", arg?: string):
+      Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
     /** 流式查询（v0.1.37）：逐行拉取大结果集，避免 db.query 全量驻留。给 onRow 回调
      * （逐行富化/转写，如写 json.stream）返回 Promise<void>；省略则返回 AsyncIterable<Row>
      * 供 for-await。opts.signal 触发 abort 即取消（pg/mysql 是真取消——KILL QUERY+断连，
@@ -1115,15 +1121,15 @@ interface MgmtEntry {
   registeredBy: string | null;
   /** 登记时刻（Unix 毫秒）。 */
   registeredAtMs: number;
-  /** 插件 `__ops__` 自报的 op 名单（readOnly 位以插件文档为准——宿主不可验证）。 */
-  ops: string[];
+  /** 插件 `__ops__` 自报的 op 清单（readOnly 位以插件文档为准——宿主不可验证，仅用于预判分档门）。 */
+  ops: Array<{ name: string; readOnly: boolean }>;
 }
 
 /**
  * 管理面 connector（U-15，`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
  * 泛型轴**不进** `axis()` 公开面；register/delete/非只读 call 走 `mgmt.allow`，只读 call
  * 与 list 走 `mgmt.allow_read`（缺省复用 allow）；每动作落 `MGMT_AUDIT`/`MGMT_DENY` 审计
- * （全字段零凭据）。未声明 op → `OJ_MGMT_UNSUPPORTED`。
+ * （全字段零凭据）。未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）。
  */
 declare const mgmt: {
   /** 登记（探 `__ops__` + `__connect__` + ping，失败即拒）。 */
