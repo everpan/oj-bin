@@ -328,6 +328,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db_client.enabled` 没开就报 `db_client_disabled`（v0.1.91） | 默认 false（fail-closed）。`enabled=true` 且 `allow` 四维全缺会被装配期拒启动（防「开了忘配」全开，SSRF 面）；`max_entries==0` 同样拒启动 |
 | `db.asSystem()` 之后 `db.client.register` 仍被拒（v0.1.91） | 登记门与库级访问控制一致：`identity` 不读 `ReqState.system`，asSystem 只绕过租户防护、不豁免授权。管理员通道走 `db_client.allow.roles` |
 | `db.client.delete` 后立刻 `DB(name)` 拿到陈旧实例（v0.1.91） | `delete` **已自动** `dbCache.delete(name)`；若业务绕过 `delete` 自行改注册表、或直接复用一个被删别名，须自己驱逐 `DB()` 缓存，否则读到陈旧连接 |
+| `oj serve` 重启后动态登记的库全没了（v0.1.92） | 框架**不**自动落盘：`db.client.register` 构造的实例是进程内存的，进程退出 / HUP 全量重建后全部丢失。要跨重启保留，由**应用侧**负责——应用在自己表里存 `(name, ENC[...] 密文 dsn)`，启动初始化 handler 里逐条 `db.client.register` 重建；框架不提供 `db_client.persistence` 之类的自动落盘配置 |
+| 想让应用自己落盘 DSN 却直接存明文（v0.1.92） | 应用侧持久化 DSN 必须复用既有 `ENC[...]` 密封（`secret.seal`），绝不写明文；解封失败（无 `OJ_SECRET_KEY`）应 fail-loud，不当明文用 |
 
 ## 手册
 

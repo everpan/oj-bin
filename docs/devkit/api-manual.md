@@ -1170,12 +1170,16 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
 
-#### 动态数据源登记（`db.client`，client 轴，v0.1.91）
+#### 动态数据源登记（`db.client`，client 轴，v0.1.91；实例化能力 L4 v0.1.92）
 
 运行期把任意 DSN 登记为**命名数据源**，对齐 dbx 的「运行期增删连接」。登记后别名直接进入
 `DB(name)` 解析路径，**复用 L1 访问控制（§`db_access`）+ L2 结构内省 + 全部 query/exec/stream**——
 **不另起平行的 `db.client.query` API**（使用面一律走 `DB(name)`）。连接经与装配期**同集**的
 `DbBackendRegistry`：`sqlite` / `memory` 内置，`mysql` / `postgres` 由插件注册。
+
+**建模视角（L4）**：`db.client.register(name, dsn)` 即 **构造一个 DB 实例实体**（`db = new DB(name, dsn)`）——
+`register` / `reRegister` / `delete` 是其实例的**生命周期**（构造 / 替换 / 销毁），`list` / `has` / `test`
+是探活面。框架**只提供实例化能力**；**落盘持久化由应用侧负责**（见下「耐久登记」）。
 
 **配置（`db_client:`）**：
 
@@ -1197,8 +1201,11 @@ db_client:
 - **审计**：register / delete / reRegister 落 `DB_CLIENT_AUDIT`（operator/module/tenant/source）。
 - **未声明 `db_access.<name>` 的动态库默认 `deny`**（fail-closed）：要放开必须显式写
   `db_access.<name>.allow`（见下「库级访问控制」）——否则任何人可查该内网库。
-- **限制**：不持久化（进程内存）、不跨进程、`max_entries` 封顶；`register` 后热重载保留、`kill -HUP`
-  整进程重建丢失。
+- **框架不落盘（关键陷阱，L4）**：`register` 构造的实例是**进程内存**的，`register` 后热重载保留、`kill -HUP`
+  / 重启整进程重建后**丢失**（与 L3 一致）；不跨进程。`max_entries` 封顶。需要**跨重启耐久**的登记，由
+  **应用侧**负责——应用在自己的表里存 `(name, 密文 dsn)`（`ENC[...]` 密封，复用 `secret.seal`，绝不存明文），
+  在启动初始化 handler 里逐条 `db.client.register` 重建（单条不可达 → 跳过 + warn，不 brick 启动）。
+  框架**不**提供 `db_client.persistence` 之类的自动落盘配置；存储介质 / 加密 / 备份都是应用关切。
 
 **`ClientDbEntry`**（`db.client.list()` 元素）：`{ alias, dialect, dsn, registeredBy, registeredAtMs, queries }`
 （`dsn` 已脱敏；`queries` 是经 `lookup` 自动累加的命中计数）。

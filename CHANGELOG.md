@@ -142,6 +142,31 @@ M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/�
 - `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
   产物与源一致。
 
+## v0.1.92（未打标签）
+
+**动态数据源登记的实例化能力（L4，client 轴）**：把 L3 的 `db.client.register` / `reRegister` / `delete` /
+`list` / `has` / `test` 正式确立为 **DB 实例的实例化 / 生命周期 API**——`register(name, dsn)` 即
+`db = new DB(name, dsn)` 构造实例、`delete` 销毁 + 驱逐缓存、`reRegister` 替换底层连接。
+
+**范围收窄（实施前用户拍板）**：四路评审初拟的「`default` 库 `oj_client_db_registry` 表写穿 + 回放」方案
+**不落地**——框架**只提供实例化能力，落盘持久化由应用侧负责**。故本版**不**引入 `db_client.persistence`
+配置、`ClientDbStore`、`client_store` 等任何框架级落盘代码。设计文档 `docs/plans/2026-10-28-db-client-axis-l4.md`
+记录评审与最终拍板。
+
+**耐久登记的应用侧配方**：应用在自己表里存 `(name, ENC[...] 密文 dsn)`（`secret.seal` 密封，绝不存明文），
+启动初始化 handler 里逐条 `db.client.register` 重建（单条不可达 → 跳过 + warn，不 brick 启动）。存储介质 /
+加密 / 备份全是应用关切；多实例各自回放、都指向同一真实 DB 即一致（DB 实例本就是 per-process 连接池）。
+
+### feat(db_client)
+
+- 明确 `db.client.register` 为实例化原语（L4 建模视角）：构造 DB 实例实体、`DB(name)` 立即可用。
+- 文档契约：api-manual §6 `db.client` 标注「框架不落盘，耐久由应用负责」+ §13 限制表、scenarios 场景 42
+  新增应用侧持久化配方、SKILL 陷阱速查、`docs/db-guide.md` §11.6 扩写、README 版本同步段。
+
+### fix(db_client)
+
+- 无框架级代码改动（L4 为范围收窄 + 文档）；既有 L3 实例化 / 生命周期 / 访问控制 / 脱敏红线全部保留。
+
 ## v0.1.91（未打标签）
 
 **动态数据源登记（L3，client 轴）**：运行期把任意 DSN（复用装配期同集的 `DbBackendRegistry`——

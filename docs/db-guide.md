@@ -1242,7 +1242,7 @@ const fk   = await db.listForeignKeys("user");    // {name, columns, refTable, r
 
 ---
 
-### 11.6 动态数据源登记（`db_client:` 段 + `db.client`，v0.1.91）
+### 11.6 动态数据源登记（`db_client:` 段 + `db.client`，v0.1.91；实例化能力 L4 v0.1.92）
 
 运行期把任意 DSN 登记为**命名数据源**，对齐 dbx 的多数据库连接树「运行期增删连接」。登记后别名
 直接进入 `DB(name)` 解析路径，**复用 L1 访问控制（§11.5）+ L2 结构内省（§11.5.7）+ 全部
@@ -1295,9 +1295,14 @@ db.client.has("rep");                                // 同步 bool（探活用�
 
 #### 11.6.4 限制（与 dbx 对齐时的边界）
 
-- **不持久化**：登记只存在进程内存（`StableState` 的 `client_dbs` 是壳 `Arc` + 内部 `Mutex`，不破不可变
-  红线）；热重载保留同一 `Arc`（登记存活），整进程重建丢失（L4）。
-- **不跨进程**：本进程登记的别名，别的进程看不到。
+- **框架不落盘（L4 关键边界）**：`register` 构造的实例只存在进程内存（`StableState` 的 `client_dbs` 是壳
+  `Arc` + 内部 `Mutex`，不破不可变红线）；热重载保留同一 `Arc`（登记存活），**整进程重建（重启 / HUP）丢失**。
+  框架**只提供实例化能力，不自动持久化**——没有 `db_client.persistence` 之类的自动落盘配置。
+- **耐久登记由应用侧负责**：应用需跨重启保留时，在自己表里存 `(name, ENC[...] 密文 dsn)`（`secret.seal`
+  密封，绝不存明文），启动初始化 handler 里逐条 `db.client.register` 重建（单条不可达 → 跳过 + warn，不 brick
+  启动）。存储介质 / 加密 / 备份全是应用关切。
+- **不跨进程**：本进程登记的别名，别的进程看不到；若都连同一真实 DB 并各自回放，语义一致（DB 实例本就是
+  per-process 连接池）。
 - **`max_entries` 封顶**：超过返回 `OJ_DB_CLIENT_FULL`。
 - **与 L1 `enforce` 一致**：动态库未声明即 deny；声明后按 `db_access.<name>` 的档位走。
 

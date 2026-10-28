@@ -3570,3 +3570,26 @@ const cols = await DB("rep").listColumns("t");
 - 登记门 `db.asSystem()` **不豁免**；管理员通道走 `db_client.allow.roles`。
 - 连接错误与 `db.client.list` 的 `dsn` 全脱敏（`user:pass@` → `***`）。
 - 不持久化（进程内存）、不跨进程、`max_entries` 封顶；热重载保留、`kill -HUP` 整进程重建丢失。
+
+**耐久登记（应用侧负责，L4）**：框架只提供 `register` 实例化能力、**不**自动落盘。需要跨重启保留，应用自己
+存 `(name, 密文 dsn)` 并启动时回放：
+
+```js
+// 登记时：实例化 + 应用自己落盘（dsn 经 ENC[...] 密封，绝不存明文）
+const enc = await secret.seal(dsn);                              // 复用既有凭据密封
+await db.query("insert into app_db_registry(alias, enc_dsn) values (?, ?)", [name, enc]);
+await db.client.register(name, dsn);
+
+// 删除时：销毁实例 + 应用自己删行
+await db.client.delete(name);
+await db.query("delete from app_db_registry where alias = ?", [name]);
+
+// 启动初始化（init handler）：读行解封 + 逐条重建（单条不可达 → 跳过，不 brick 启动）
+for (const { alias, enc_dsn } of await db.query("select alias, enc_dsn from app_db_registry")) {
+  try { await db.client.register(alias, await secret.open(enc_dsn)); }
+  catch (e) { log.warn(`skip re-register ${alias}: ${e}`); }
+}
+```
+
+> 存储介质 / 表结构 / 加密 / 备份全是应用关切；框架不感知、不提供 `db_client.persistence` 这类自动落盘配置。
+> 多实例各自回放、都指向同一真实 DB 即可保持一致（DB 实例本就是 per-process 连接池）。
