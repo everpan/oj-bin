@@ -1187,7 +1187,131 @@ const list = db.allowed();
 - `sql_guard=deny` 站点上「raw SELECT 未登记表」的敞口**原样保留**：本策略只管
   alias + risk，只读语句一律放行。不要把本节读成「该敞口已修」。
 
+### 11.5.7 结构内省（`listColumns` / `listIndexes` / `listForeignKeys`，v0.1.90）
+
+把「表名级」的 `db.listTables` 扩到**列 / 索引 / 外键**三级，三方言同构返回，
+供前端画连接树（连接 → 库 → 表 → 列/索引/外键）而不必裸 `db.query` 拼方言 SQL。
+
+```js
+const cols = await db.listColumns("user");        // {name, nativeType, nullable, default, primaryKey}[]
+const idx  = await db.listIndexes("user");        // {name, unique, primary, origin, columns}[]
+const fk   = await db.listForeignKeys("user");    // {name, columns, refTable, refColumns}[]
+// 事务内同签名：const cols = await db.tx(async t => t.listColumns("user"));
+```
+
+要点：
+
+- **表名只经绑定参数**，零标识符内联；`_lazy` 里面含 `%` / `_` 是按字面量等值匹配，
+  **不是 LIKE 通配符**（`listColumns("foo_bar")` 能查到，不会变成「前缀模糊」）。
+- **`nativeType` 是方言原始声明文本**，零归一化：sqlite `type`、mysql `column_type`
+  （含长度 `varchar(64)` / `decimal(10,2)`）、pg `format_type`（含数组 `int[]` /
+  `character varying(32)`）。需要跨方言归一化请业务侧自己做。
+- **`origin` 三方言统一**为 `c`(普通) / `u`(唯一) / `pk`(主键)。注意 sqlite 的
+  `create unique index` 在 `pragma_index_list.origin` 里归 `c`（那是「创建方式」不是
+  「唯一性」），本能力已按 unique/origin 派生成统一口径，UI 不再分支。
+- **`primaryKey` 以 `listColumns` 为准**：sqlite rowid 表在 `listIndexes` 里可能无索引项。
+- **`ForeignKey.name` 可为 null**（sqlite 外键无约束名）；复合外键 `columns[i]` ↔
+  `refColumns[i]` 按位配对。
+- **表不存在 / 不可见 / 在别的 schema → 一律空数组**，不区分原因；要校验表名先用
+  `db.listTables(prefix)`。
+- **表名入参校验**：长度 > 128、含 NUL / 控制字符、或（sqlite）含 `.` → 空数组
+  （挡 `other.secrets` 形式的跨库内省、避免畸形输入变 500）。
+- **授权**：三个 op 与 `db.listTables` 一并过 `db_access` 的**授权维**（`granted_only`）。
+  `asSystem()` **不豁免**；`warn` 档放行并落 `DB_ACCESS_DENY`；`deny` 档未授权主体
+  返回 `OJ_DB_DENIED`（`db_not_granted`）。内省恒只读，故不受 `read_only` 限制
+  （只读库也必须能看结构，否则 UI 连展开都做不到）。
+- **未知方言**：结构化 `OJ_DB_UNSUPPORTED`，`e.data.capability` 点名
+  `list_columns` / `list_indexes` / `list_foreign_keys`，**绝不回落 sqlite**。
+  调用前可用 `db.dialect()` 预判。
+- **每 op 硬上限 1000 行**（元数据规模天然小，正常站点碰不到）。
+
+> **红线**：内省结果是**目录读**，不是标识符白名单。**禁止**把列名回填构造器或拼进
+> 裸 SQL——构造器的标识符只认 `SchemaRegistry`（未登记表 `db.table("x")` 报
+> `unknown table`）。内省也不回显 `allow` 名单。
+
+#### 三方言差异对照（前端自检用）
+
+| 维度 | sqlite | mysql | postgres |
+|---|---|---|---|
+| 列 `nativeType` | `type`（声明原文） | `column_type`（含长度） | `format_type(atttypid,attypmod)`（含数组/域） |
+| 列 `default` | 原始 DDL（字符串带引号 `'x'`） | `column_default`（表达式文本） | `column_default::text` |
+| 索引 `origin` | 按 unique/origin 派生 `c/u/pk` | `PRIMARY`→`pk`，`non_unique=0`→`u`，余 `c` | `indisprimary`→`pk`，`indisunique`→`u`，余 `c` |
+| 外键 `name` | 恒 `null`（无约束名） | `constraint_name` | `conname` |
+| 复合外键配对 | `pragma_foreign_key_list` 按 `seq` | `position_in_unique_constraint` | `conkey`/`confkey` 按 ordinality |
+| schema 范围 | 单库（文件） | `DATABASE()` | `current_schema()` |
+
 ---
+
+### 11.6 动态数据源登记（`db_client:` 段 + `db.client`，v0.1.91）
+
+运行期把任意 DSN 登记为**命名数据源**，对齐 dbx 的多数据库连接树「运行期增删连接」。登记后别名
+直接进入 `DB(name)` 解析路径，**复用 L1 访问控制（§11.5）+ L2 结构内省（§11.5.7）+ 全部
+query/exec/stream**——**不另起平行的 `db.client.query` API**（使用面一律走 `DB(name)`）。
+
+连接经与装配期**同集**的 `DbBackendRegistry`：`sqlite` / `memory` 内置，`mysql` / `postgres` 由
+插件注册（与静态库走完全一样的后端）。
+
+#### 11.6.1 配置（`db_client:`）
+
+```yaml
+db_client:
+  enabled: true            # 默认 false（fail-closed）。false 时 register/test/... 全拒。
+  max_entries: 16          # 单进程连接池硬上限（=0 装配期 fail-loud 拒启动）。
+  allow:                   # 登记门：谁能调 register/test/delete/reRegister/list。
+    roles: [dba]           # 四维并集；任一命中即放行。全缺 = 不限制。
+    sources: [task]        # 可限定 http / task 来源。
+```
+
+**装配期 fail-loud**：`enabled=true` 且 `allow` 四维全缺（无限制）→ **拒启动**（防「开了忘配」就全开，
+SSRF / 内网横向移动面）；`max_entries==0` 同样拒启动。
+
+#### 11.6.2 管理面（`db.client`）
+
+```js
+const r = await db.client.register("rep", "mysql://user:pass@host/db"); // 返回 {alias,dialect,dsn,registeredBy,registeredAtMs,queries}
+await db.client.test("mysql://user:pass@host/db");   // {ok, dialect?, error?}（不落库）
+await db.client.reRegister("rep", "mysql://...");    // 替换已登记连接（不存在则错）
+const ok = await db.client.delete("rep");            // 删库 + 驱逐 dbCache（见下）
+const names = await db.client.list();                // [{alias,dialect,dsn,registeredBy,registeredAtMs,queries}]（dsn 已脱敏）
+db.client.has("rep");                                // 同步 bool（探活用，不经过登记门）
+```
+
+- **使用面走 `DB(name)`**：登记后 `DB("rep").query(...)` 与静态库完全一致（访问控制 / 内省 / 流 /
+  查询计数全复用）。
+- **`delete` 必须再 `DB(name)` 前驱逐缓存**：`db.client.delete` 已自动 `dbCache.delete(name)`，否则
+  删后再 `DB("rep")` 拿到**陈旧实例**。
+- **`dsn` 全脱敏**：`user:pass@` → `***`，host/库名保留排障；连接失败错误同样脱敏。
+- **审计**：register / delete / reRegister 落 `DB_CLIENT_AUDIT`（operator/module/tenant/source），
+  非防篡改但比 deny_log 更适合安全敏感事件。
+
+#### 11.6.3 安全红线（四路评审 [安全·阻断] 裁决）
+
+- **未声明 `db_access.<name>` 的动态库默认 `deny`**（fail-closed）：`policy_for` 对未声明动态别名
+  **清空 `allow` + `enforce=Deny`**，杜绝「登记即全员可查内网库」。要放开某动态库，必须显式写
+  `db_access.<name>.allow`（与静态库同形）。
+- **登记门 `asSystem()` 不豁免**（`identity` 不读 `ReqState.system`）；管理员通道请走 `allow.roles`。
+- **开放端绝不回显凭据**：错误文案与 `list` 的 `dsn` 全经 `secret::redact`。
+- **未知 scheme**：结构化错误（列已知 scheme 清单），**绝不伪造条目 / 绝不静默回落 sqlite**。
+
+#### 11.6.4 限制（与 dbx 对齐时的边界）
+
+- **不持久化**：登记只存在进程内存（`StableState` 的 `client_dbs` 是壳 `Arc` + 内部 `Mutex`，不破不可变
+  红线）；热重载保留同一 `Arc`（登记存活），整进程重建丢失（L4）。
+- **不跨进程**：本进程登记的别名，别的进程看不到。
+- **`max_entries` 封顶**：超过返回 `OJ_DB_CLIENT_FULL`。
+- **与 L1 `enforce` 一致**：动态库未声明即 deny；声明后按 `db_access.<name>` 的档位走。
+
+#### 11.6.5 错误码
+
+| 文案 / 码 | 含义 | 修复 |
+| --- | --- | --- |
+| `reason: db_client_disabled` | `db_client.enabled=false` | 管理员开启 `db_client.enabled`。 |
+| `reason: db_client_not_authorized` | 登记门 `allow` 未命中 | 找管理员在 `db_client.allow` 给对应维度授权。 |
+| `already registered` | 重名登记 | 用 `reRegister` 替换或先 `delete`。 |
+| `registry full (cap N)` | 超 `max_entries` | 调大 `max_entries` 或删旧条目。 |
+| `not registered (use register to add)` | `reRegister` 目标不存在 | 先 `register`。 |
+| `unknown db scheme in dsn '…' (known: […])` | DSN scheme 不在后端集 | 检查 scheme（sqlite:// / sqlite: / memory:// / mysql:// / postgres://）。 |
+| `db access: … (reason: db_not_granted)` | 未声明 `db_access.<name>` 的动态库被查 | 在 `db_access.<name>.allow` 显式授权。 |
 
 ## 12. 延伸阅读
 

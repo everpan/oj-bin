@@ -253,6 +253,22 @@ impl<'de> Deserialize<'de> for DbAccessSection {
     }
 }
 
+/// 动态数据源登记配置段（`db_client:`，L3 v0.1.91）。
+///
+/// `enabled` 默认 **false**（fail-closed）：动态接库是特权能力，默认不开。
+/// `allow` 复用 [`AllowList`] 四维并集——登记操作的授权门（谁能调 register/test/
+/// delete/reRegister/list）。`max_entries` 是 per-process 硬上限（连接池数封顶）。
+///
+/// 装配期 fail-loud 约束（见 `oj/src/app.rs`）：`enabled=true` 且 `allow` 四维全缺
+/// （`is_unrestricted()`）→ 拒启动，防止「开了忘配」就全开（SSRF / 内网横向移动面）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DbClientSection {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub allow: AllowList,
+}
+
 impl<'de> Deserialize<'de> for Enforce {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -277,13 +293,17 @@ impl<'de> Deserialize<'de> for Enforce {
 // ---------------------------------------------------------------------------
 
 /// 带副作用的 SELECT 内建函数（命中即归 Write）。
-const SIDE_EFFECT_FNS: [&str; 6] = [
+///
+/// `SET_CONFIG`（v0.1.90）：PG 的 `set_config('search_path', …)` 是**会话级**改写，
+/// 在池化连接上会污染同连接的后续请求（并改写内省可见范围），按写处置。
+const SIDE_EFFECT_FNS: [&str; 7] = [
     "NEXTVAL",
     "SETVAL",
     "PG_TERMINATE_BACKEND",
     "PG_CANCEL_BACKEND",
     "LO_IMPORT",
     "LO_EXPORT",
+    "SET_CONFIG",
 ];
 
 fn severity(r: Risk) -> u8 {
@@ -541,15 +561,20 @@ fn classify_stmt(w: &[String]) -> (Risk, bool) {
             (Risk::Transaction, false)
         }
         // 会话/全局变量改写是写操作；裸 SET 不猜 → Unknown。
+        // `SET search_path = …`（v0.1.90）：PG 的 search_path 是会话级，池化连接上会污染
+        // 后续请求（内省范围随之漂移），按写处置。
         "SET" => {
-            if has("GLOBAL") || has("SESSION") {
+            if has("GLOBAL") || has("SESSION") || has("SEARCH_PATH") {
                 (Risk::Write, false)
             } else {
                 (Risk::Unknown, false)
             }
         }
         "COPY" | "LOAD" | "CALL" | "EXECUTE" => (Risk::Write, false),
-        "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "PRAGMA" | "USE" | "ANALYZE" | "VALUES" => {
+        // `USE <db>`（mysql）/ `ATTACH[DATABASE]`、`DETACH`（sqlite）同为**会话级**改写：
+        // 池化连接上会污染后续请求并改写内省可见范围 → 按写处置（v0.1.90）。
+        "USE" | "ATTACH" | "DETACH" => (Risk::Write, false),
+        "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "PRAGMA" | "ANALYZE" | "VALUES" => {
             (Risk::ReadOnly, false)
         }
         _ => (Risk::Unknown, false),
@@ -685,11 +710,20 @@ pub fn evaluate(p: &DbAccess, ctx: &AccessCtx, c: &Classified) -> Verdict {
 /// 取某库的策略副本（装配期冻结，运行期只读）。
 fn policy_for(state: &Rc<RefCell<OpState>>, alias: &str) -> DbAccess {
     let g = state.borrow();
-    g.borrow::<Arc<StableState>>().db_access.policy_for(alias)
+    let st = g.borrow::<Arc<StableState>>();
+    let mut p = st.db_access.policy_for(alias);
+    // L3 fail-closed（v0.1.91）：动态登记别名若未在 `db_access.<name>` 显式声明，
+    // **默认 deny**——不让「登记即全员可查内网库」。置 `enforce=Deny`，由下方门禁统一拦截
+    // （`AllowList` 无「拒绝所有人」表达，故走 enforce 硬拦截，而非动 allow）。静态未知库仍
+    // 回落 defaults（向后兼容）。
+    if st.client_dbs.contains(alias) && !st.db_access.by_db.contains_key(alias) {
+        p.enforce = Enforce::Deny;
+    }
+    p
 }
 
 /// 调用主体快照（module / roles / tenant / source）。
-fn identity(
+pub(crate) fn identity(
     state: &Rc<RefCell<OpState>>,
 ) -> (Option<String>, Vec<String>, Option<String>, &'static str) {
     let g = state.borrow();
@@ -754,6 +788,14 @@ pub fn check_access_intent(
     if policy.enforce == Enforce::Off {
         return Ok(policy.max_rows); // 零开销：不分类、不取身份
     }
+    // enforce=Deny：硬拦截（fail-closed），授权维/风险分类不再放行——含 L3 未声明动态库。
+    if policy.enforce == Enforce::Deny {
+        let msg = format!(
+            "db access: alias {alias:?} is denied (enforce=deny)\n  (reason: db_not_granted)"
+        );
+        deny_log("deny", alias, Reason::NotGranted, &msg);
+        return Err(JsErrorBox::generic(msg));
+    }
     let (module, roles, tenant, source) = identity(state);
     let ctx = AccessCtx {
         module: module.as_deref(),
@@ -814,6 +856,55 @@ pub fn check_access(
     }
     let c = classify(sql);
     check_access_intent(state, alias, &c)
+}
+
+/// **只判授权维**（v0.1.90）：给「平台自生成 SQL」的内省 op 用。
+///
+/// 与 [`check_access`] 的差别：不分类风险、不套 `read_only` / `allow_ddl` / `allow_dangerous`
+/// 等策略位——内省 SQL 恒为只读，只读库也必须能看结构（否则 UI 连展开都做不到）。
+/// 但**授权维必须过**：未授权主体不该靠内省枚举出别的库的表 / 列 / 外键指向（元数据泄露），
+/// 否则 `db.allowed()` 的「只列已授权库」就成了假承诺。
+///
+/// `alias` 必须是 `guard::bound_db` 后的**物理库名**（`op_db_exec` 同款），否则
+/// `manifest.db` 把字面 `"default"` 重定向到别的库的站点会被整条绕过。
+/// `db.asSystem()` **不豁免**（`identity` 不读 `ReqState.system`）；`warn` 档放行、`deny` 档拒。
+pub fn granted_only(state: &Rc<RefCell<OpState>>, alias: &str) -> Result<(), JsErrorBox> {
+    let policy = policy_for(state, alias);
+    if policy.enforce == Enforce::Off {
+        return Ok(());
+    }
+    // enforce=Deny：硬拦截（fail-closed），授权维不再放行——含 L3 未声明动态库。
+    if policy.enforce == Enforce::Deny {
+        let msg = format!(
+            "db access: alias {alias:?} is denied (enforce=deny)\n  (reason: db_not_granted)"
+        );
+        deny_log("deny", alias, Reason::NotGranted, &msg);
+        return Err(JsErrorBox::generic(msg));
+    }
+    let (module, roles, tenant, source) = identity(state);
+    let ctx = AccessCtx {
+        module: module.as_deref(),
+        roles,
+        tenant: tenant.as_deref(),
+        source,
+    };
+    if granted(&policy.allow, &ctx) {
+        return Ok(());
+    }
+    let detail = format!(
+        "alias {alias:?} not granted to this caller (module={:?}, roles={:?}, tenant={:?}, source={source})",
+        ctx.module, ctx.roles, ctx.tenant
+    );
+    let msg = format!(
+        "db access: {detail}\n  修复：由管理员在 db_access.<alias>.allow 为对应维度授权\n  (reason: {})",
+        Reason::NotGranted.as_str()
+    );
+    if policy.enforce == Enforce::Warn {
+        deny_log("warn", alias, Reason::NotGranted, &msg);
+        return Ok(());
+    }
+    deny_log("deny", alias, Reason::NotGranted, &msg);
+    Err(JsErrorBox::generic(msg))
 }
 
 /// 操作者（`user.id`，字符串或数字形态；无身份则 None）。
@@ -1634,5 +1725,325 @@ mod behavior {
         let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
         let (_, _, data) = run(&b, RequestInfo::default(), JS_WRITE).await;
         assert_eq!(data["ok"], json!(true), "warn 档不得拦：{data}");
+    }
+
+    // ───────── db 结构内省（L2，v0.1.90）行为测试 ─────────
+
+    /// off 档下，三 op 返回的形状 / 排序 / 布尔位 / 默认值与 sqlite 实测一致。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_columns_indexes_fk_shape() {
+        let (_d, db) = file_sqlite().await;
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection::default(),
+            false,
+            false,
+        );
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => {
+              await db.exec("create table if not exists parent (pid integer primary key, pname text)");
+              await db.exec("create table if not exists child (cid integer primary key, pid integer references parent(pid), name text default 'x', extra text)");
+              await db.exec("create index if not exists ix_child_extra on child(extra)");
+              await db.exec("create unique index if not exists ux_child_cid_extra on child(cid, extra)");
+              const cols = await db.listColumns('child');
+              const idx = await db.listIndexes('child');
+              const fk = await db.listForeignKeys('child');
+              json.ok({cols, idx, fk});
+            })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{data}");
+
+        // 列：声明序 = cid / pid / name / extra；PK 只认 listColumns。
+        let cols = data["cols"].as_array().unwrap();
+        assert_eq!(cols.len(), 4, "{cols:?}");
+        assert_eq!(cols[0]["name"], json!("cid"));
+        assert_eq!(cols[0]["primaryKey"], json!(true));
+        assert_eq!(cols[0]["nativeType"], json!("INTEGER"));
+        assert_eq!(cols[1]["name"], json!("pid"));
+        assert_eq!(cols[1]["primaryKey"], json!(false));
+        assert_eq!(cols[1]["nullable"], json!(true));
+        assert_eq!(cols[2]["name"], json!("name"));
+        // sqlite 的 pragma_table_info.dflt_value 是原始 DDL 文本（含引号）。
+        assert_eq!(cols[2]["default"], json!("'x'"));
+        assert_eq!(cols[3]["name"], json!("extra"));
+
+        // 索引：按名聚合列；ux_ 是 unique（origin=u）、ix_ 是普通（origin=c）。
+        let idx = data["idx"].as_array().unwrap();
+        assert!(idx.len() >= 2, "{idx:?}");
+        let ux = idx
+            .iter()
+            .find(|i| i["name"] == json!("ux_child_cid_extra"))
+            .unwrap();
+        assert_eq!(ux["unique"], json!(true));
+        assert_eq!(ux["origin"], json!("u"));
+        assert_eq!(ux["columns"], json!(["cid", "extra"]));
+        let ix = idx
+            .iter()
+            .find(|i| i["name"] == json!("ix_child_extra"))
+            .unwrap();
+        assert_eq!(ix["unique"], json!(false));
+        assert_eq!(ix["origin"], json!("c"));
+        assert_eq!(ix["columns"], json!(["extra"]));
+
+        // 外键：sqlite 无名 → name 为 null；按位配对 pid -> pid。
+        let fk = data["fk"].as_array().unwrap();
+        assert_eq!(fk.len(), 1, "{fk:?}");
+        assert_eq!(fk[0]["name"], json!(null));
+        assert_eq!(fk[0]["columns"], json!(["pid"]));
+        assert_eq!(fk[0]["refTable"], json!("parent"));
+        assert_eq!(fk[0]["refColumns"], json!(["pid"]));
+    }
+
+    /// 含 `.` 的表名（sqlite）被挡为跨库内省 → 空数组，而非 500。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_dotted_table_returns_empty() {
+        let (_d, db) = file_sqlite().await;
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection::default(),
+            false,
+            false,
+        );
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => {
+              const c = await db.listColumns('other.secrets');
+              json.ok({c});
+            })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{data}");
+        assert_eq!(data["c"], json!([]), "含 . 的表名必须空数组而非报错");
+    }
+
+    /// 含 NUL / 控制字符的表名 → 空数组（不让驱动把畸形输入变 500）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_control_char_table_returns_empty() {
+        let (_d, db) = file_sqlite().await;
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection::default(),
+            false,
+            false,
+        );
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => {
+              const c = await db.listColumns("ta\u0000ble");
+              json.ok({c});
+            })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{data}");
+        assert_eq!(data["c"], json!([]));
+    }
+
+    /// 正对照：`_` 在表名里是字面量（等值匹配），不是 LIKE 通配符——能查到。
+    #[tokio::test(flavor = "current_thread")]
+    async fn underscore_table_name_is_literal_not_like() {
+        let (_d, db) = file_sqlite().await;
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection::default(),
+            false,
+            false,
+        );
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => {
+              await db.exec("create table if not exists foo_bar (a integer)");
+              const c = await db.listColumns('foo_bar');
+              json.ok({c});
+            })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{data}");
+        let c = data["c"].as_array().unwrap();
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0]["name"], json!("a"));
+    }
+
+    /// 授权维：deny + allow.roles:[admin] 下，无身份 / 非 admin → db_not_granted；
+    /// admin → 放行。listTables 一并收紧（安全 B1）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_granted_only_blocks_unauthorized() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Deny,
+                allow: AllowList {
+                    roles: Some(vec!["admin".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+
+        // 无身份 → 拒
+        let (code, msg, _) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => { const c = await db.listColumns('t'); json.ok({c}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_ne!(code, 0, "无身份应被拒");
+        assert!(msg.contains("db_not_granted"), "{msg}");
+
+        // 非 admin 角色 → 拒
+        let (code2, msg2, _) = run(
+            &b,
+            req_user(&["viewer"]),
+            r#"(async () => { const c = await db.listTables(); json.ok({c}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_ne!(code2, 0, "非 admin 应被拒");
+        assert!(msg2.contains("db_not_granted"), "{msg2}");
+
+        // admin → 放行
+        let (code3, _m, data3) = run(
+            &b,
+            req_user(&["admin"]),
+            r#"(async () => { const c = await db.listColumns('t'); json.ok({c}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code3, 0, "{data3}");
+        assert_eq!(data3["c"].as_array().unwrap().len(), 1, "{data3:?}");
+    }
+
+    /// `db.asSystem()` **不豁免**内省授权（与 evaluate 不读 ReqState.system 同口径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_as_system_does_not_exempt() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Deny,
+                allow: AllowList {
+                    roles: Some(vec!["admin".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let (code, msg, _) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => { const c = await db.asSystem().listColumns('t'); json.ok({c}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_ne!(code, 0, "asSystem 不得豁免内省授权");
+        assert!(msg.contains("db_not_granted"), "{msg}");
+    }
+
+    /// warn 档：未授权主体不拦，放行并通过。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_warn_tier_passes_through() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Warn,
+                allow: AllowList {
+                    roles: Some(vec!["admin".to_string()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => { const c = await db.listColumns('t'); json.ok({c}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "warn 档须放行：{data}");
+        assert_eq!(data["c"].as_array().unwrap().len(), 1, "{data:?}");
+    }
+
+    /// 事务内路径：db.tx 回调对象同样支持三 op（走活跃事务连接）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn introspect_in_tx_uses_tx_connection() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer primary key, name text)", &[])
+            .await
+            .unwrap();
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection::default(),
+            false,
+            false,
+        );
+        let (code, _m, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => {
+              const r = await db.tx(async (t) => {
+                const cols = await t.listColumns('t');
+                const idx = await t.listIndexes('t');
+                const fk = await t.listForeignKeys('t');
+                return { cols, idx, fk };
+              });
+              json.ok(r);
+            })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_eq!(code, 0, "{data}");
+        assert_eq!(data["cols"].as_array().unwrap().len(), 2, "{data:?}");
+        assert_eq!(data["fk"].as_array().unwrap().len(), 0, "{data:?}");
+    }
+
+    /// 会话级改写（USE / SET search_path / ATTACH）被分类为 Write：deny + read_only 站点
+    /// 下 `db.exec("USE other")` 被拦（安全 B2 处置①）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_switch_classified_as_write_blocks_under_deny() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Deny,
+                read_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        // sqlite 无 USE；用 ATTACH 验证（同属会话级改写 → Write）。
+        let (code, msg, _) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => { await db.exec("ATTACH DATABASE ':memory:' AS other"); json.ok({ok: true}); })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await;
+        assert_ne!(code, 0, "ATTACH 在 deny 站点应被拦");
+        assert!(
+            msg.contains("db_read_only") || msg.contains("db_not_granted"),
+            "{msg}"
+        );
     }
 }

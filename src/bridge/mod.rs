@@ -28,6 +28,7 @@ pub mod broker;
 mod bus;
 pub mod bus_backend;
 pub mod cert;
+pub mod client_db;
 mod crypto;
 mod db;
 pub mod db_backend;
@@ -46,6 +47,7 @@ pub mod guard;
 mod http;
 pub mod import_scan;
 mod inspector;
+mod introspect;
 mod jsnum;
 mod json;
 mod kv;
@@ -80,6 +82,7 @@ pub use auth::AuthGuard;
 pub use blob::{BlobBackend, BlobServed, LocalBlob, valid_key};
 pub use bus::{Bus, BusPayload, EventBroker};
 pub use bus_backend::{BusBackend, BusBackendRegistry};
+pub use client_db::{ClientDbEntry, ClientDbRegistry};
 pub use crypto::JwtCfg;
 pub use db::{DataAccessor, Dialect, InMemoryAccessor, Row};
 pub use db_backend::{DbBackend, DbBackendRegistry};
@@ -221,6 +224,16 @@ pub struct StableState {
     /// db 访问控制策略表（config `db_access:` 段，v0.1.89）：键 = db 别名，
     /// `defaults` 兜底未声明的库。装配期冻结、只读。
     pub db_access: Arc<db_policy::DbAccessSection>,
+    /// 动态数据源登记配置段（`db_client:`，L3 v0.1.91）：登记门（谁能建连接）。
+    /// 装配期冻结、只读。
+    pub db_client: Arc<db_policy::DbClientSection>,
+    /// 运行期动态数据源注册表（L3 v0.1.91）：壳 `Arc` 不可变、内部 `Mutex` 变动，
+    /// 与 `reload: Arc<OnceLock>` 同哲学，不破 StableState 不可变红线。
+    pub client_dbs: Arc<client_db::ClientDbRegistry>,
+    /// 运行期连接工厂（与装配期同集：内置 sqlite/memory + 插件 mysql/postgres）。
+    pub db_backend: Arc<db_backend::DbBackendRegistry>,
+    /// sqlite 相对路径归一基准（connect DSN 用）；断言期 = config 目录。
+    pub config_dir: Arc<std::path::PathBuf>,
     /// 部署期常量（config `vars:` 段，v0.1.25）：`vars.get(name)` 的唯一数据源。
     /// **fail-closed**：只有这里声明的键可读（空表 = 全 null）。装配期冻结、只读。
     pub vars: Arc<HashMap<String, String>>,
@@ -297,6 +310,14 @@ pub struct Extras {
     pub tasks_flag: Option<Arc<AtomicBool>>,
     /// db 访问控制策略表（`db_access:` 段）；None = 空表（全库不设防，与升级前一致）。
     pub db_access: Option<Arc<db_policy::DbAccessSection>>,
+    /// 动态数据源登记配置段（`db_client:`，L3 v0.1.91）。None = 默认（enabled=false）。
+    pub db_client: Option<Arc<db_policy::DbClientSection>>,
+    /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
+    pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
+    /// 运行期连接工厂（含插件 mysql/postgres）。None = 内置 builtin（sqlite/memory）。
+    pub db_backend: Option<Arc<db_backend::DbBackendRegistry>>,
+    /// sqlite 相对路径归一基准（connect 用）。None = 当前目录。
+    pub config_dir: Option<Arc<std::path::PathBuf>>,
     /// 部署期常量（config `vars:` 段，v0.1.25）；缺省空表 = `vars.get` 恒 null。
     pub vars: Arc<HashMap<String, String>>,
     /// PR-4 单 isolate 堆限额（字节）；None = 不限额（测试/嵌入式默认）。
@@ -445,6 +466,15 @@ deno_core::extension!(
         query::op_db_query_sql,
         db::op_db_dialect,
         db::op_db_list_tables,
+        db::op_db_list_columns,
+        db::op_db_list_indexes,
+        db::op_db_list_foreign_keys,
+        client_db::op_db_client_register,
+        client_db::op_db_client_test,
+        client_db::op_db_client_delete,
+        client_db::op_db_client_re_register,
+        client_db::op_db_client_list,
+        client_db::op_db_client_has,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,
@@ -827,6 +857,16 @@ impl Bridge {
             mail: extras.mail,
             ldap: extras.ldap,
             db_access: extras.db_access.unwrap_or_default(),
+            db_client: extras.db_client.unwrap_or_default(),
+            client_dbs: extras
+                .client_dbs
+                .unwrap_or_else(|| Arc::new(client_db::ClientDbRegistry::new(16))),
+            db_backend: extras
+                .db_backend
+                .unwrap_or_else(|| Arc::new(db_backend::DbBackendRegistry::builtin())),
+            config_dir: extras
+                .config_dir
+                .unwrap_or_else(|| Arc::new(std::path::PathBuf::from("."))),
             vars: extras.vars,
             js_heap_limit: extras.js_heap_limit,
             fs: extras.fs,
@@ -2533,6 +2573,10 @@ mod tests {
             mail: None,
             ldap: None,
             db_access: Arc::new(db_policy::DbAccessSection::default()),
+            db_client: Arc::new(db_policy::DbClientSection::default()),
+            client_dbs: Arc::new(client_db::ClientDbRegistry::new(16)),
+            db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
+            config_dir: Arc::new(std::path::PathBuf::from(".")),
             vars: Arc::new(HashMap::new()),
             js_heap_limit: None,
             fs: None,

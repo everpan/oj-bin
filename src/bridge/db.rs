@@ -285,7 +285,8 @@ impl TxSession for InMemoryTx {
 /// DB(name) 存在性检查：bootstrap 的 DB 构造器用，未配置则 JS 侧返回 undefined。
 #[op2(fast)]
 pub fn op_db_has(state: &mut OpState, #[string] name: &str) -> bool {
-    state.borrow::<Arc<StableState>>().dbs.contains_key(name)
+    let st = state.borrow::<Arc<StableState>>();
+    st.dbs.contains_key(name) || st.client_dbs.contains(name)
 }
 
 /// 每请求活跃事务（存 ReqState；Mutex 串行并发 op，Arc 跨 await 共享——
@@ -905,9 +906,16 @@ pub fn op_db_allowed(state: &mut OpState) -> Result<Vec<Value>, JsErrorBox> {
         source,
     };
     let mut out: Vec<Value> = Vec::new();
-    let mut names: Vec<&String> = st.dbs.keys().collect();
+    let mut names: Vec<String> = st.dbs.keys().cloned().collect();
+    // L3：动态登记库仅在 `db_access.<name>` 显式声明时才进连接树（避免「假入口」——
+    // 未声明的动态库默认 deny，不该出现在「可用连接」列表里）。
+    for n in st.client_dbs.names() {
+        if st.db_access.by_db.contains_key(&n) {
+            names.push(n);
+        }
+    }
     names.sort();
-    for alias in names {
+    for alias in &names {
         let policy = st.db_access.policy_for(alias);
         if !super::db_policy::granted(&policy.allow, &ctx) {
             continue;
@@ -1098,6 +1106,10 @@ pub async fn op_db_list_tables(
         Target::Tx(t) => require_known_dialect(&t.dialect_info, "list_tables")?,
         Target::Pool(da) => require_known_dialect(da.dialect_info(), "list_tables")?,
     };
+    // 授权维（安全 B1，v0.1.90）：内省也须过授权，否则 db.allowed() 的
+    // 「只列已授权库」是假承诺——未授权主体不该靠 listTables 枚举出别的库的表结构。
+    let alias = super::guard::bound_db(&state, &name);
+    super::db_policy::granted_only(&state, &alias)?;
     // 投影列统一叫 `name`：sqlite_master 本就叫 name；information_schema 的
     // table_name 取别名。系统表排除只在 sqlite 需要（mysql/pg 已被
     // DATABASE()/current_schema() 的范围天然排除）。
@@ -1108,7 +1120,9 @@ pub async fn op_db_list_tables(
                 .to_string()
         }
         Dialect::Postgres => {
-            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema()"
+            // `table_name` 是 `sql_identifier`（`name`）域，sqlx Any 驱动解不了该 OID，
+            // 且「空库不触发、建表后才崩」——必须 `::text`（与 introspect.rs 同口径）。
+            "SELECT table_name::text AS name FROM information_schema.tables WHERE table_schema = current_schema()"
                 .to_string()
         }
     };
@@ -1179,6 +1193,146 @@ pub async fn op_db_list_tables(
             Err(JsErrorBox::generic(em))
         }
     }
+}
+
+/// 表名入参校验（安全 B3 / B4）：长度 > 128、含 NUL / 控制字符、或（sqlite）
+/// 含 `.` → 视为非法，内省 op 返回空数组而非把畸形输入交给驱动（避免 500，也挡
+/// `other.secrets` 形式的跨库内省）。
+fn valid_introspect_table(dialect: Dialect, table: &str) -> bool {
+    if table.len() > 128 {
+        return false;
+    }
+    if table.bytes().any(|b| b == 0 || b < 0x20) {
+        return false;
+    }
+    if dialect == Dialect::Sqlite && table.contains('.') {
+        return false;
+    }
+    true
+}
+
+/// `db.listColumns(table)` / `listIndexes(table)` / `listForeignKeys(table)`（v0.1.90，L2）。
+///
+/// 三者共用 [`introspect`] 的方言 SQL 常量（表名**只经绑定参数**，零标识符内联），
+/// 由宿主按方言固定 `LIMIT` 截断到 [`introspect::MAX_ROWS`]。返回结构与排序三方言一致
+/// （见 `introspect.rs` 的 `columns` / `indexes` / `foreign_keys`）。
+///
+/// 授权：只过 [`db_policy::granted_only`]（内省恒只读，但授权维必须过——见该 fn 文档）。
+/// 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`（`data.capability` 点名），绝不回落 sqlite。
+async fn introspect(
+    state: Rc<RefCell<OpState>>,
+    name: String,
+    table: String,
+    kind: super::introspect::Kind,
+) -> Result<Vec<Value>, JsErrorBox> {
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let dialect = match &target {
+        Target::Tx(t) => require_known_dialect(&t.dialect_info, kind.capability())?,
+        Target::Pool(da) => require_known_dialect(da.dialect_info(), kind.capability())?,
+    };
+    // 授权维（安全 B1）：未授权主体不该枚举出别的库的表结构。
+    let alias = super::guard::bound_db(&state, &name);
+    super::db_policy::granted_only(&state, &alias)?;
+
+    // 表名入参校验：畸形 / 跨库前缀 → 空数组（不报错、不泄漏）。
+    if !valid_introspect_table(dialect, &table) {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = super::introspect::sql(kind, dialect).to_string();
+    sql.push_str(&format!(" LIMIT {}", super::introspect::MAX_ROWS));
+    let params = vec![Value::String(table)];
+
+    let placeholder = match &target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
+    };
+    let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
+    let start = std::time::Instant::now();
+    // 强制脱敏（安全 B6）：trace 的 params 记为占位，表名不因 `redact=false` 进日志。
+    let trace_params = &[Value::String("<db introspection>".to_string())];
+    let res = match &target {
+        Target::Pool(da) => da.query_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    match res {
+        Ok(rows) => {
+            let out = match kind {
+                super::introspect::Kind::Columns => super::introspect::columns(rows),
+                super::introspect::Kind::Indexes => super::introspect::indexes(rows),
+                super::introspect::Kind::ForeignKeys => super::introspect::foreign_keys(rows),
+            };
+            trace_sql(
+                &state,
+                &sql,
+                trace_params,
+                &name,
+                in_tx,
+                ms,
+                Some(out.len() as i64),
+                true,
+                None,
+                None,
+                None,
+            );
+            Ok(out)
+        }
+        Err(e) => {
+            let em = e.to_string();
+            trace_sql(
+                &state,
+                &sql,
+                trace_params,
+                &name,
+                in_tx,
+                ms,
+                None,
+                false,
+                Some(em.clone()),
+                None,
+                None,
+            );
+            Err(JsErrorBox::generic(em))
+        }
+    }
+}
+
+/// db.listColumns(table)（v0.1.90）：列结构内省。
+/// 返回 `{name, nativeType, nullable, default, primaryKey}[]`。
+#[op2]
+#[serde]
+pub async fn op_db_list_columns(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] table: String,
+) -> Result<Vec<Value>, JsErrorBox> {
+    introspect(state, name, table, super::introspect::Kind::Columns).await
+}
+
+/// db.listIndexes(table)（v0.1.90）：索引内省。
+/// 返回 `{name, unique, primary, origin, columns}[]`（origin ∈ `c`/`u`/`pk`）。
+#[op2]
+#[serde]
+pub async fn op_db_list_indexes(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] table: String,
+) -> Result<Vec<Value>, JsErrorBox> {
+    introspect(state, name, table, super::introspect::Kind::Indexes).await
+}
+
+/// db.listForeignKeys(table)（v0.1.90）：外键内省。
+/// 返回 `{name, columns, refTable, refColumns}[]`（sqlite 无名 → `name` 为 null）。
+#[op2]
+#[serde]
+pub async fn op_db_list_foreign_keys(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] table: String,
+) -> Result<Vec<Value>, JsErrorBox> {
+    introspect(state, name, table, super::introspect::Kind::ForeignKeys).await
 }
 
 /// 每个库**一次**地确保平台序列表存在（Bridge 级缓存；DDL 幂等）。
@@ -1318,8 +1472,15 @@ mod tests {
         assert!(ms >= 3.0, "ms {ms}");
         assert!(ms < 1_000.0, "ms {ms}");
     }
+    use crate::bridge::Extras;
+    use crate::bridge::client_db::ClientDbRegistry;
+    use crate::bridge::db_backend::DbBackendRegistry;
+    use crate::bridge::db_policy::{
+        AllowList, DbAccess, DbAccessOverride, DbAccessSection, DbClientSection,
+    };
     use crate::bridge::{Bridge, InMemoryAccessor, InMemoryKV, SchemaRegistry};
     use serde_json::json;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     /// 守护测试（0.1.67，评审 A1）：把「裸 SQL 出口 ⊆ {query, exec, stream_open}」
@@ -1330,13 +1491,16 @@ mod tests {
     /// normalize_and_trace——登记为已知非裸 SQL 出口。
     #[test]
     fn raw_sql_op_exits_are_pinned() {
-        const WHITELIST: [&str; 19] = [
+        const WHITELIST: [&str; 22] = [
             "op_db_allowed",
             "op_db_as_system",
             "op_db_as_tenant",
             "op_db_dialect",
             "op_db_exec",
             "op_db_has",
+            "op_db_list_columns",
+            "op_db_list_foreign_keys",
+            "op_db_list_indexes",
             "op_db_list_tables",
             "op_db_next_seq",
             "op_db_query",
@@ -1940,6 +2104,34 @@ mod tests {
         let msg = v["msg"].as_str().unwrap();
         assert!(msg.contains("oracle"), "{msg}");
         assert!(msg.contains("list_tables"), "{msg}");
+    }
+
+    /// 未知方言（oracle）下，三个结构内省 op 同样走 known 子集门控 → 结构化
+    /// `OJ_DB_UNSUPPORTED`、`data.capability` 点名对应能力（绝不回落 sqlite）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn oracle_introspect_ops_are_unsupported() {
+        let b = Bridge::new(Arc::new(OracleAccessor), Arc::new(InMemoryKV::new()));
+        for (js, cap) in [
+            (
+                r#"db.listColumns('t').then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#,
+                "list_columns",
+            ),
+            (
+                r#"db.listIndexes('t').then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#,
+                "list_indexes",
+            ),
+            (
+                r#"db.listForeignKeys('t').then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#,
+                "list_foreign_keys",
+            ),
+        ] {
+            let resp = b.run(js).await.unwrap();
+            let v: Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(v["code"], 500, "{v}");
+            let msg = v["msg"].as_str().unwrap();
+            assert!(msg.contains("oracle"), "{msg}");
+            assert!(msg.contains(cap), "{cap} not in {msg}");
+        }
     }
 
     /// Given oracle accessor When db.nextSeq("s")（next_seq 门控）
@@ -2918,6 +3110,293 @@ mod tests {
             sqls.iter()
                 .all(|s| !s.as_str().unwrap_or("").contains("$1")),
             "trace 不得记改写后 SQL: {v}"
+        );
+    }
+
+    // ---------- L3 动态数据源登记（client 轴，v0.1.91）行为测试 ----------
+
+    /// 构造一个带 `db_client` 配置段的 Bridge（default 库存在 ⇒ `globalThis.db.client` 已挂载）。
+    fn client_bridge_with(
+        enabled: bool,
+        allow: AllowList,
+        max: usize,
+        db_access: Option<Arc<DbAccessSection>>,
+    ) -> Bridge {
+        let def = Arc::new(InMemoryAccessor::new());
+        Bridge::with_dbs_and_loader(
+            HashMap::from([("default".to_string(), def as Arc<dyn DataAccessor>)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                db_client: Some(Arc::new(DbClientSection {
+                    enabled,
+                    max_entries: max,
+                    allow,
+                })),
+                client_dbs: Some(Arc::new(ClientDbRegistry::new(max))),
+                db_backend: Some(Arc::new(DbBackendRegistry::builtin())),
+                config_dir: Some(Arc::new(PathBuf::from("."))),
+                db_access,
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn run_json(b: &Bridge, js: &str) -> serde_json::Value {
+        let cap = b.run(js).await.expect("run must not transport-error");
+        let v: serde_json::Value =
+            serde_json::from_slice(&cap.body).expect("capsule body must be json");
+        // 运行响应统一包成 {code,msg,data}；这里取下 data 层，测试断言更直读。
+        v.get("data").cloned().unwrap_or(serde_json::Value::Null)
+    }
+
+    fn unrestricted() -> AllowList {
+        AllowList::default()
+    }
+
+    // 登记门关闭（默认 off）：register 必须结构化拒绝，不得静默放行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_disabled_gate_blocks_register() {
+        let b = client_bridge_with(false, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                try { await db.client.register("rep", "memory://"); return json.ok({ok:true}); }
+                catch (e) { return json.ok({ok:false, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["ok"], false, "{v}");
+        assert!(
+            v["err"].as_str().unwrap().contains("db_client_disabled"),
+            "{v}"
+        );
+    }
+
+    // 全生命周期：register → has → list(脱敏) → delete → has=false。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_register_has_list_delete_lifecycle() {
+        let b = client_bridge_with(true, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                const r = await db.client.register("rep", "memory://");
+                const has = db.client.has("rep");
+                const list = await db.client.list();
+                const names = list.map(x => x.alias);
+                const del = await db.client.delete("rep");
+                const has2 = db.client.has("rep");
+                return json.ok({ dialect: r.dialect, dsn: r.dsn, has, names, del, has2 });
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["dialect"], "sqlite", "{v}");
+        assert_eq!(v["has"], true, "{v}");
+        assert!(
+            v["names"].as_array().unwrap().contains(&json!("rep")),
+            "{v}"
+        );
+        assert_eq!(v["del"], true, "{v}");
+        assert_eq!(v["has2"], false, "{v}");
+        // DSN 脱敏：memory:// 无凭据，且绝不回显任何 host/库名外的秘密段。
+        let dsn = v["dsn"].as_str().unwrap();
+        assert!(dsn.starts_with("memory://"), "{dsn}");
+    }
+
+    // 重名登记必须拒绝（不得覆盖）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_duplicate_register_rejected() {
+        let b = client_bridge_with(true, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("rep", "memory://");
+                try { await db.client.register("rep", "memory://"); return json.ok({dup:false}); }
+                catch (e) { return json.ok({dup:true, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["dup"], true, "{v}");
+        assert!(
+            v["err"].as_str().unwrap().contains("already registered"),
+            "{v}"
+        );
+    }
+
+    // 超配额必须拒绝（连接池数封顶）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_over_capacity_rejected() {
+        let b = client_bridge_with(true, unrestricted(), 1, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("a", "memory://");
+                try { await db.client.register("b", "memory://"); return json.ok({full:false}); }
+                catch (e) { return json.ok({full:true, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["full"], true, "{v}");
+        assert!(v["err"].as_str().unwrap().contains("registry full"), "{v}");
+    }
+
+    // 未知 scheme：结构化错误 + 凭据脱敏（不得回显 secret）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_unknown_scheme_redacted_error() {
+        let b = client_bridge_with(true, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                try { await db.client.register("x", "oracle://user:secret@db/host"); return json.ok({err:false}); }
+                catch (e) { return json.ok({err:true, msg:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["err"], true, "{v}");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("unknown db scheme"), "{msg}");
+        assert!(!msg.contains("secret"), "凭据不得回显: {msg}");
+    }
+
+    // 登记门授权维：不匹配 caller 必须拒绝（asSystem 不豁免）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_register_requires_allow_and_as_system_no_exempt() {
+        // 仅放行 source=task；http caller（默认）应被拒。
+        let allow = AllowList {
+            sources: Some(vec!["task".to_string()]),
+            ..Default::default()
+        };
+        let b = client_bridge_with(true, allow, 8, None);
+        let plain = run_json(
+            &b,
+            r#"(async () => {
+                try { await db.client.register("rep", "memory://"); return json.ok({auth:true}); }
+                catch (e) { return json.ok({auth:false, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(plain["auth"], false, "{plain}");
+        assert!(
+            plain["err"]
+                .as_str()
+                .unwrap()
+                .contains("db_client_not_authorized"),
+            "{plain}"
+        );
+        // asSystem 显式开后仍被拒（identity 不读 ReqState.system）。
+        let via_system = run_json(
+            &b,
+            r#"(async () => {
+                try { db.asSystem(); await db.client.register("rep", "memory://"); return json.ok({auth:true}); }
+                catch (e) { return json.ok({auth:false, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(via_system["auth"], false, "{via_system}");
+        assert!(
+            via_system["err"]
+                .as_str()
+                .unwrap()
+                .contains("db_client_not_authorized"),
+            "{via_system}"
+        );
+    }
+
+    // 未声明 db_access.<alias> 的动态库：fail-closed deny（登记成功但查询/内省被拒）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn undeclared_client_alias_query_denied() {
+        let b = client_bridge_with(true, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("rep", "memory://");
+                try { await DB("rep").query("select 1"); return json.ok({q:true}); }
+                catch (e) { return json.ok({q:false, err:String(e)}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["q"], false, "{v}");
+        let err = v["err"].as_str().unwrap();
+        assert!(err.contains("db access"), "{err}");
+        assert!(err.contains("db_not_granted"), "{err}");
+    }
+
+    // 显式声明 db_access.<alias> 的动态库：登记后可正常查询（复用 L1 访问控制）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_client_alias_query_allowed() {
+        let db_access = Arc::new(DbAccessSection {
+            defaults: DbAccess::default(),
+            by_db: HashMap::from([(
+                "rep".to_string(),
+                DbAccessOverride {
+                    allow: Some(AllowList::default()),
+                    ..Default::default()
+                },
+            )]),
+        });
+        let b = client_bridge_with(true, unrestricted(), 8, Some(db_access));
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("rep", "memory://");
+                const rows = await DB("rep").query("select 1 as v");
+                return json.ok({q:true, rows});
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["q"], true, "{v}");
+    }
+
+    // reRegister：已存在则替换；不存在则拒绝。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_re_register_swaps_and_rejects_missing() {
+        let b = client_bridge_with(true, unrestricted(), 8, None);
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("rep", "memory://");
+                await db.client.reRegister("rep", "memory://");
+                try { await db.client.reRegister("nope", "memory://"); return json.ok({bad:false, has:db.client.has("rep")}); }
+                catch (e) { return json.ok({bad:true, err:String(e), has:db.client.has("rep")}); }
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["bad"], true, "{v}");
+        assert!(v["err"].as_str().unwrap().contains("not registered"), "{v}");
+        assert_eq!(v["has"], true, "{v}");
+    }
+
+    // 查询/内省经 lookup 自动累加命中计数（声明别名后才可查，故需 declared 配置）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_queries_counter_increments() {
+        let db_access = Arc::new(DbAccessSection {
+            defaults: DbAccess::default(),
+            by_db: HashMap::from([(
+                "rep".to_string(),
+                DbAccessOverride {
+                    allow: Some(AllowList::default()),
+                    ..Default::default()
+                },
+            )]),
+        });
+        let b = client_bridge_with(true, unrestricted(), 8, Some(db_access));
+        let v = run_json(
+            &b,
+            r#"(async () => {
+                await db.client.register("rep", "memory://");
+                await DB("rep").query("select 1 as v");
+                await DB("rep").query("select 1 as v");
+                const list = await db.client.list();
+                const e = list.find(x => x.alias === "rep");
+                return json.ok({queries: e.queries});
+            })()"#,
+        )
+        .await;
+        assert!(
+            v["queries"].as_u64().unwrap() >= 2,
+            "lookup 命中计数应累加: {v}"
         );
     }
 }

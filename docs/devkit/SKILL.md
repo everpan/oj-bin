@@ -142,6 +142,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 去重计数用 `distinct().all()` 拉行再 `.length` | **静默漏算**：顶层 select 未给 limit 隐式补 100、显式也被 clamp 到 max_limit（默认 1000）——总数超限就少算。用 `select([{fn:"count",distinct:true,field,as}])`（v0.1.82）：聚合一行返回，与 LIMIT 无关 |
 | 「清空整表」写裸 `db.exec("delete from t", [])` | 用 `db.table("t").truncate().run()`（v0.1.82）：命名式明示、可 grep。**租户表上只清当前租户的行**（守卫照常注入，清不出租户边界）——要整库清空在 `db.asSystem` 下执行；带 where 报 `truncate does not accept where` |
 | 卸载/巡检要枚举当前库的表，按方言分支 `information_schema`/`sqlite_master` | 用 `db.listTables(prefix?)`（v0.1.82）：三内置方言同口径（其他方言 `OJ_DB_UNSUPPORTED`）、前缀转义引擎做（绑定参数）、未登记 registry 的表也返回、按名排序。sqlite 内部表（`sqlite_*`）已排除 |
+| 按方言拼 `information_schema`/`pragma_*` 拿列/索引/外键 | 用 `db.listColumns`/`db.listIndexes`/`db.listForeignKeys`（v0.1.90）：三方言同构返回、`nativeType` 是方言原始声明文本（零归一化）、`origin` 统一为 `c`/`u`/`pk`、`name` 只有 sqlite 外键为 null。表名只经绑定参数，不内联 |
+| 把 `listColumns` 返回的列名回填 `db.table()` 构造器或拼进裸 SQL | **禁止**：内省是目录读，不是标识符白名单；构造器只认 `SchemaRegistry`（未登记表报 `unknown table`）。需要白名单走 schema.yaml |
+| 把 `listColumns/Indexes/ForeignKeys` 的空数组当成「查询出错」 | 空数组 = 当前账号在当前 schema 下**看不到该表**（不存在/无权限/在别的 schema 都归空数组），不报错不区分。要校验表名先用 `db.listTables(prefix)` |
+| `listColumns("foo_bar")` 的 `_` 当成 LIKE 通配符去「前缀模糊匹配」 | 表名是**等值绑定参数**，`_` 是字面量，能精确查到名为 `foo_bar` 的表 |
 | `select(["*"])` 带 join | 直接报错——全列展开只出基表列，join 列会丢、`undefined` 拿去做授权判断即隐患；要 join 列就显式列名 |
 | 上传 413 | 超 `max_upload_bytes`（axum 2x 兜底 + handle 双闸）；**直传路由 `PUT {base}/blob/{key}` 的 413 看 `blob_upload_max_bytes`（默认 1 GiB），两者独立** |
 | WS 握手 401 / 连不上（v0.1.30 行为变更） | WS 升级过 oj-auth 守卫了——把 ws 路径加进 `auth.anonymous_paths` 才匿名；浏览器走 cookie 会话天然带 Cookie，CLI 挂 `Authorization` 头 |
@@ -320,6 +324,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.asSystem()` 之后 `db_access` 仍然拒绝（v0.1.89） | asSystem **只绕过租户防护**，不豁免访问控制（有意设计：否则它就是 access control 的万能逃生口）。升级到 `deny` 档前先查存量 asSystem handler |
 | 裸 SQL 在 `deny` 档被判 `db_unknown_risk` 但业务看着很正常（v0.1.89） | 风险分类是**词法**不是解析器：串未闭合（反斜杠）、注释断词、CTE/窗口/存储过程体都会落 `unknown` 并按最严档拒。修法就是文案里那句——**改用 `db.table()` 构造器**（走精确意图判定，不依赖词法）；真要裸 SQL 就先 `warn` 灰度看日志 |
 | 配了 `db_access` 就以为库被保护住了（v0.1.89） | 它是**宿主侧护栏层**：`read_only` 是文本级判定（真写防线仍是 DB 账号 GRANT），`max_rows` 对 `db.query` 是**取回后截断**（不是限流）。且**不约束**平台自生成 SQL 与 `oj migrate` 等 CLI 通道 |
+| 用 `db.client.register` 登记了数据源，查询却报 `db_not_granted`（v0.1.91） | 未声明 `db_access.<name>` 的动态库**默认 deny**（fail-closed，防「登记即全员可查内网库」）：必须在 `db_access.<name>.allow` 显式授权后才能 `DB(name).query/exec/introspect`。`db.client` 只暴露**管理面**，使用面一律 `DB(name)` |
+| `db_client.enabled` 没开就报 `db_client_disabled`（v0.1.91） | 默认 false（fail-closed）。`enabled=true` 且 `allow` 四维全缺会被装配期拒启动（防「开了忘配」全开，SSRF 面）；`max_entries==0` 同样拒启动 |
+| `db.asSystem()` 之后 `db.client.register` 仍被拒（v0.1.91） | 登记门与库级访问控制一致：`identity` 不读 `ReqState.system`，asSystem 只绕过租户防护、不豁免授权。管理员通道走 `db_client.allow.roles` |
+| `db.client.delete` 后立刻 `DB(name)` 拿到陈旧实例（v0.1.91） | `delete` **已自动** `dbCache.delete(name)`；若业务绕过 `delete` 自行改注册表、或直接复用一个被删别名，须自己驱逐 `DB()` 缓存，否则读到陈旧连接 |
 
 ## 手册
 

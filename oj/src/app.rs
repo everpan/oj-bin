@@ -1263,6 +1263,29 @@ pub async fn assemble_backend(
     for (alias, ov) in &db_access.by_db {
         ov.merge(&db_access.defaults).validate(alias)?;
     }
+    // 动态数据源登记配置段（`db_client:`，L3 v0.1.91）：装配期 fail-loud 校验。
+    // 安全红线：enabled=true 但 allow 四维全缺（is_unrestricted）→ 拒启动，防「开了忘配」全开（SSRF 面）。
+    let db_client = Arc::new(cfg.db_client.clone());
+    if db_client.enabled {
+        if db_client.max_entries == 0 {
+            return Err("db_client.enabled=true requires db_client.max_entries >= 1".to_string());
+        }
+        if db_client.allow.is_unrestricted() {
+            return Err(
+                "db_client.enabled=true requires db_client.allow to declare at least one of \
+                 modules/roles/tenants/sources (refusing to start with an open-but-unauthorized \
+                 client registration surface)"
+                    .to_string(),
+            );
+        }
+    }
+    // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
+    let db_backend = Arc::new(registries.dbs.clone());
+    let config_dir_arc = Arc::new(config_dir.to_path_buf());
+    // 运行期动态登记注册表（per-process 硬上限 = max_entries）。
+    let client_dbs = Arc::new(only_js::bridge::ClientDbRegistry::new(
+        db_client.max_entries,
+    ));
     // db 默认库重定向需进入 'static 工厂闭包，先取出 owned（profiles 是借用，不能捕获）。
     let db_override = profiles.db.clone();
     // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
@@ -1301,6 +1324,12 @@ pub async fn assemble_backend(
         let vars = vars.clone();
         // 影子绑定：同 vars —— 闭包带走的是这里的副本（外层 db_access 仍供 StableState 使用）。
         let db_access = db_access.clone();
+        // 影子绑定：同 db_access —— 闭包带走的是这里的副本（外层 db_client/client_dbs/
+        // db_backend/config_dir 仍供下方直接 StableState 使用）。
+        let db_client = db_client.clone();
+        let client_dbs = client_dbs.clone();
+        let db_backend = db_backend.clone();
+        let config_dir_arc = config_dir_arc.clone();
         // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
         let input_contracts = input_contracts.clone();
         let fs_grant = fs_grant.clone();
@@ -1350,6 +1379,10 @@ pub async fn assemble_backend(
                     // ldap 后端（ldap: 段 + oj-ldap 插件；未配置/未加载 = None）。
                     ldap: ldap.clone(),
                     db_access: Some(db_access.clone()),
+                    db_client: Some(db_client.clone()),
+                    client_dbs: Some(client_dbs.clone()),
+                    db_backend: Some(db_backend.clone()),
+                    config_dir: Some(config_dir_arc.clone()),
                     vars: vars.clone(),
                     js_heap_limit,
                     input_contracts: Some(input_contracts.clone()),
@@ -1402,6 +1435,10 @@ pub async fn assemble_backend(
         ldap: ldap.clone(), // 与 make_bridge 的 Extras.ldap 同源（同一 Arc）。
         vars: vars.clone(), // 与 make_bridge 的 Extras.vars 同源（同一 Arc）。
         db_access: db_access.clone(), // 与 make_bridge 的 Extras.db_access 同源（同一 Arc）。
+        db_client: db_client.clone(), // 与 make_bridge 的 Extras.db_client 同源（同一 Arc）。
+        client_dbs: client_dbs.clone(), // 与 make_bridge 的 Extras.client_dbs 同源（同一 Arc）。
+        db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
+        config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。
         input_contracts: Some(input_contracts.clone()),
         js_heap_limit,
         fs: fs_grant.clone(), // 与 make_bridge 的 Extras.fs 同一 Arc。

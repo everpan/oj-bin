@@ -378,7 +378,7 @@ fn sql_tables(d: Dialect) -> String {
                 .into()
         }
         Dialect::Postgres => "SELECT table_name::text FROM information_schema.tables \
-             WHERE table_schema = 'public'"
+             WHERE table_schema = current_schema()"
             .into(),
     }
 }
@@ -393,7 +393,7 @@ fn sql_columns(d: Dialect, table: &str) -> String {
         ),
         Dialect::Postgres => format!(
             "SELECT column_name::text FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = '{table}'"
+             WHERE table_schema = current_schema() AND table_name = '{table}'"
         ),
     }
 }
@@ -410,7 +410,7 @@ fn sql_indexes(d: Dialect, table: &str) -> String {
         ),
         Dialect::Postgres => format!(
             "SELECT indexname::text FROM pg_indexes \
-             WHERE schemaname = 'public' AND tablename = '{table}'"
+             WHERE schemaname = current_schema() AND tablename = '{table}'"
         ),
     }
 }

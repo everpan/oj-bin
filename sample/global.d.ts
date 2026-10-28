@@ -135,6 +135,38 @@ interface DbAllowedEntry {
   enforce: "off" | "warn" | "deny";
 }
 
+// db.listColumns() 的返回（v0.1.90）：单列的结构信息。
+interface ColumnInfo {
+  name: string;
+  // 方言声明文本（sqlite `type` / mysql `column_type` / pg `format_type`），零归一化。
+  nativeType: string;
+  nullable: boolean;
+  // 原始 DDL 文本（sqlite 字符串默认带引号）；无默认值为 null。
+  default: string | null;
+  primaryKey: boolean;
+}
+
+// db.listIndexes() 的返回（v0.1.90）：单索引的结构信息。
+interface IndexInfo {
+  name: string;
+  unique: boolean;
+  primary: boolean;
+  // 三方言统一口径：`c`(普通) / `u`(唯一) / `pk`(主键)。
+  origin: "c" | "u" | "pk";
+  // 组成该索引的列（已按声明序聚合）。
+  columns: string[];
+}
+
+// db.listForeignKeys() 的返回（v0.1.90）：单外键的结构信息。
+interface ForeignKeyInfo {
+  // sqlite 外键无约束名 → null。
+  name: string | null;
+  // 复合外键按位配对：`columns[i]` ↔ `refColumns[i]`。
+  columns: string[];
+  refTable: string;
+  refColumns: string[];
+}
+
 // 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）、没有 stream
 // （流式只走直连池，tx 内报错）。
 // isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
@@ -647,6 +679,22 @@ declare global {
      * sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。
      * 替代「按方言分支 information_schema / sqlite_master」的裸 db.query。 */
     listTables(prefix?: string): Promise<string[]>;
+    /** 结构内省（v0.1.90）：单表的列信息（三方言同构）。
+     * `{name, nativeType, nullable, default, primaryKey}[]`，按声明序。
+     * `nativeType` 是方言**声明文本**（sqlite `type` / mysql `column_type` / pg `format_type`），
+     * 零归一化；`default` 是原始 DDL 文本（sqlite 字符串默认带引号）。表名经绑定参数，
+     * 无对应表/不可见 → 空数组（不区分「不存在 / 无权限 / 别的 schema」）。
+     * 未知方言抛 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 `list_columns`）。 */
+    listColumns(table: string): Promise<ColumnInfo[]>;
+    /** 结构内省（v0.1.90）：单表的索引信息（三方言同构）。
+     * `{name, unique, primary, origin, columns}[]`，按名再按列序。
+     * `origin` ∈ `c`(普通) / `u`(唯一) / `pk`(主键)——三方言统一口径，UI 不再分支。
+     * `columns` 为组成该索引的列（已按序聚合）。 */
+    listIndexes(table: string): Promise<IndexInfo[]>;
+    /** 结构内省（v0.1.90）：单表的外键信息（三方言同构）。
+     * `{name, columns, refTable, refColumns}[]`，按约束名再按列序。
+     * sqlite 外键无约束名 → `name` 为 null；复合外键两端**按位配对**（`columns[i]`↔`refColumns[i]`）。 */
+    listForeignKeys(table: string): Promise<ForeignKeyInfo[]>;
     /** 流式查询（v0.1.37）：逐行拉取大结果集，避免 db.query 全量驻留。给 onRow 回调
      * （逐行富化/转写，如写 json.stream）返回 Promise<void>；省略则返回 AsyncIterable<Row>
      * 供 for-await。opts.signal 触发 abort 即取消（pg/mysql 是真取消——KILL QUERY+断连，
@@ -668,6 +716,43 @@ declare global {
     // 每请求至多一个活跃事务（嵌套报错）；请求结束未完结自动回滚。
     // 回调参数**不含 tx 自身**（嵌套事务直接被拒，故类型上也拿不到——见 TxInstance）。
     tx(fn: (tx: TxInstance) => unknown): Promise<unknown>;
+    /** 动态数据源登记（client 轴，v0.1.91）：运行期把 DSN 登记为命名数据源。
+     * 登记后别名进 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream）；
+     * 此处只暴露**管理面**，使用面一律走 `DB(name)`。`delete` 自动驱逐 `DB()` 缓存，
+     * 否则删后再 `DB(name)` 拿到陈旧实例。 */
+    client: DBClientApi;
+  }
+
+  /** 动态登记数据源的逐别名记账条目（`db.client.list()` 的元素）。 */
+  interface ClientDbEntry {
+    /** 登记别名。 */
+    alias: string;
+    /** 连接引擎名：`"sqlite" | "mysql" | "postgres"`。 */
+    dialect: string;
+    /** 脱敏 DSN（`user:pass@` → `***`；host/库名保留排障）。 */
+    dsn: string;
+    /** 登记操作者（`user.id`；无身份 null）。 */
+    registeredBy: string | null;
+    /** 登记时刻（Unix 毫秒）。 */
+    registeredAtMs: number;
+    /** 命中计数（query/exec/stream/内省经 `lookup` 自动累加）。 */
+    queries: number;
+  }
+
+  /** 动态数据源登记管理面（`db.client`）。配置段 `db_client:`（`enabled` 默认 false）。 */
+  interface DBClientApi {
+    /** 登记一个 DSN 为命名数据源；返回记账条目。重名 / 超 `max_entries` 抛错。 */
+    register(name: string, dsn: string): Promise<ClientDbEntry>;
+    /** 试连（不落库）；返回 `{ok, dialect?, error?}`。 */
+    test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string }>;
+    /** 替换已登记连接（不存在则抛错）。 */
+    reRegister(name: string, dsn: string): Promise<ClientDbEntry>;
+    /** 删除数据源；自动驱逐 `DB()` 缓存；返回是否删除成功。 */
+    delete(name: string): Promise<boolean>;
+    /** 列出全部已登记数据源（dsn 已脱敏）。 */
+    list(): Promise<ClientDbEntry[]>;
+    /** 是否已登记（同步；探活用，不经过登记门）。 */
+    has(name: string): boolean;
   }
 
   const json: JsonApi;

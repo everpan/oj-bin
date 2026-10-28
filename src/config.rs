@@ -1405,6 +1405,12 @@ pub struct Config {
     /// 可直接复用同一张策略表）。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_access: crate::bridge::db_policy::DbAccessSection,
+    /// 动态数据源登记（L3，v0.1.91，`db_client:` 段）：运行期把 DSN 登记为命名数据源。
+    /// `enabled` 默认 false（fail-closed，动态接库是特权能力）；`allow` 复用 db_access
+    /// 的 AllowList 四维并集作为登记门；`max_entries` 为 per-process 连接池数上限。
+    /// 见 `docs/plans/2026-10-28-db-client-axis-l3.md`。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_client: crate::bridge::db_policy::DbClientSection,
     /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_trace: SqlTraceCfg,

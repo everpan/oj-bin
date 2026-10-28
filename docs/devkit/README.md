@@ -56,6 +56,23 @@ handler。⑦ 它是**宿主侧护栏层**不是数据库权限：`read_only` �
 `oj migrate` 等 CLI 通道。见 api-manual §10「db_access」与 §6「db / DB(name)」、§13 限制表、
 SKILL 陷阱速查、scenarios 场景 46。
 
+v0.1.90 已落地部分：**db 结构内省（L2，对齐 dbx 连接树）**——① 新增 `db.listColumns(table)` /
+`db.listIndexes(table)` / `db.listForeignKeys(table)` 三个 op，把「表名级」的 `db.listTables`
+扩到列/索引/外键三级；三方言**同构返回**（`nativeType` 是方言原始声明文本、零归一化；
+`origin` 统一为 `c`/`u`/`pk`；sqlite 外键 `name` 为 null、复合外键按位配对）。② 表名只经**绑定
+参数**（零标识符内联），`_`（含 `%`）是字面量等值匹配不是 LIKE 通配符；表不存在/不可见/在别的
+schema 一律返回**空数组**（不报错不区分）。③ 未知方言结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability`
+点名 `list_columns` / `list_indexes` / `list_foreign_keys`，**绝不回落 sqlite**）。④ 授权：三 op 与
+`db.listTables` 一并过 `db_access` 的**授权维**（`granted_only`）——未授权主体连表结构都枚举不到；
+`db.asSystem()` 不豁免、`warn` 档放行并落 `DB_ACCESS_DENY`、内省恒只读不受 `read_only` 限制。⑤
+表名入参校验：超长 / 含 NUL·控制字符 /（sqlite）含 `.` → 空数组（挡 `other.secrets` 跨库内省、
+畸形输入不化 500）。⑥ 每 op 硬上限 1000 行（元数据规模天然小）。⑦ 分类补丁：会话级语句
+`USE` / `SET search_path` / `set_config('search_path',…)` / `ATTACH` / `DETACH` 由只读改判为
+**写**（池化连接上会污染后续请求、改写内省可见范围），`deny` + `read_only` 站点即被挡。⑧ **红线**：
+内省是目录读**不是标识符白名单**，禁止把列名回填构造器或拼进裸 SQL（构造器只认 `SchemaRegistry`）。
+见 api-manual §6「db / DB(name)」三方法行 + 类型表 + §13 限制表 + 陷阱清单、scenarios 场景 47、
+SKILL 陷阱速查。
+
 v0.1.88 已落地部分：**数据库方言能力模型（ABI 12）+ 结构化数据库错误**——① db 的失败不再
 只能读文案：reject 的 Error 自带 `e.code`（`OJ_DB_SYNTAX` / `OJ_DB_CONSTRAINT` / `OJ_DB_TIMEOUT` /
 `OJ_DB_CONNECTION` / `OJ_DB_CAPACITY` / `OJ_DB_CANCELLED` / `OJ_DB_UNSUPPORTED` / `OJ_DB_INTERNAL`）、

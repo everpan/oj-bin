@@ -142,6 +142,103 @@ M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/�
 - `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
   产物与源一致。
 
+## v0.1.91（未打标签）
+
+**动态数据源登记（L3，client 轴）**：运行期把任意 DSN（复用装配期同集的 `DbBackendRegistry`——
+内置 sqlite/memory，mysql/postgres 经插件）登记为命名数据源。登记后别名直接进入 `DB(name)` 解析路径，
+复用 L1 访问控制（v0.1.89）+ L2 结构内省（v0.1.90）+ 全部 query/exec/stream，**不另起平行 API**。
+
+新增配置段 `db_client:`（`enabled` 默认 false，fail-closed）；装配期 fail-loud：
+`enabled=true` 且 `allow` 四维全缺（无限制）直接拒启动（防「开了忘配」全开，SSRF / 内网横向移动面）。
+新增六 op：`op_db_client_register` / `test` / `delete` / `re_register` / `list` / `has`，经
+`db.client.{register,test,delete,reRegister,list,has}` 暴露。
+
+安全红线（四路评审 [安全·阻断] 裁决）：
+- 未声明 `db_access.<name>` 的动态库**默认 deny**（fail-closed）——`policy_for` 对未声明动态别名清空
+  `allow` + `enforce=Deny`，杜绝「登记即全员可查内网库」。
+- 登记门 `asSystem()` **不豁免**（`identity` 不读 `ReqState.system`）。
+- 连接错误与 `list` 输出均经 `secret::redact` 脱敏，绝不回显 `user:pass@`。
+- 审计日志 `DB_CLIENT_AUDIT`（register/delete/reRegister）。
+
+设计文档见 `docs/plans/2026-10-27-db-access-control-core.md` §「动态连接登记（client 轴）」与
+`docs/plans/2026-10-28-db-client-axis-l3.md` §10（四路评审裁决）。
+
+### feat(db_client)
+
+- 运行期动态数据源登记（client 轴）：register / test / delete / re_register / list / has 六 op。
+- `db_client:` 配置段：`enabled` / `max_entries` / `allow`（四维并集，缺省 fail-loud）。
+- 未声明 `db_access.<name>` 的动态库默认 deny（fail-closed）。
+- `config_dir` 注入 `DbBackendRegistry::connect` 的 sqlite 相对路径归一基准。
+
+### fix(db_client)
+
+- 登记门 `enabled=false` 结构化拒绝（`reason: db_client_disabled`）；非授权 caller 拒绝
+  （`reason: db_client_not_authorized`）。
+- 连接失败错误与 `db.client.list` 的 `dsn` 字段均脱敏。
+
+## v0.1.90（未打标签）
+
+**db 结构内省（L2）**：把 `db.listTables` 的「表名级」扩到列 / 索引 / 外键三级，对齐 dbx 的连接树
+展开。宿主侧实现，**不动 FFI**（`ABI_VERSION` 仍为 12，无插件 bump）。SQL 由宿主生成、表名只经绑定
+参数。设计文档见 `docs/plans/2026-10-28-db-introspection-l2.md`（含四路评审记录与待做登记 T8–T11）。
+
+### feat(db_introspect)
+
+- 新增 `src/bridge/introspect.rs`：三方言 SQL 引擎常量 + 方言选择 + 结果上限（`MAX_ROWS = 1000`）。
+  投影列别名三方言统一，由 `columns` / `indexes` / `foreign_keys` 三个聚合函数消费成 JS 契约形态。
+  只放 SQL 常量与方言知识（不含执行），运行期 op 与 CLI（`oj schema`）共用同一份方言知识，
+  避免 CL/运维两套各自漂移（T5：`'public'` → `current_schema()` 已同步 `oj/src/schema.rs`）。
+- 新增三个 op：`op_db_list_columns` / `op_db_list_indexes` / `op_db_list_foreign_keys`
+  （+ JS `db.listColumns` / `listIndexes` / `listForeignKeys`，`db.tx` 回调同签名）。
+- 三方言**同构返回**：`nativeType` 是方言**原始声明文本**（sqlite `type` / mysql `column_type` /
+  pg `format_type`，零归一化）；`origin` 统一为 `c`(普通) / `u`(唯一) / `pk`(主键)——sqlite 的
+  `create unique index` 在 `pragma_index_list.origin` 里归 `c`，已按 unique/origin 派生统一口径；
+  复合外键 `columns[i]` ↔ `refColumns[i]` 按位配对；sqlite 外键 `name` 恒 `null`。
+- 表名一律**绑定参数**（零标识符内联）；`%` / `_` 在表名里是字面量等值匹配，**不是 LIKE**
+  通配符。表不存在 / 不可见 / 在别的 schema → 一律**空数组**（不报错不区分），先校验表名用
+  `db.listTables(prefix)`。
+- 表名入参校验：长度 > 128、含 NUL / 控制字符、或（sqlite）含 `.`（挡 `other.secrets` 跨库内省）→
+  空数组（不把畸形输入变 500）。
+- 每 op 硬上限 1000 行（元数据规模天然小）。
+- 与 `db.listTables` 一并过 `db_access` 的**授权维**（`granted_only`，新增于 v0.1.89 设计）：
+  未授权主体连表结构都枚举不到；`db.asSystem()` **不豁免**、`warn` 档放行并落 `DB_ACCESS_DENY`、
+  内省恒只读不受 `read_only` 限制（只读库也必须能看结构）。别名用 `guard::bound_db` 后的物理名。
+- 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 `list_columns` /
+  `list_indexes` / `list_foreign_keys`），**绝不回落 sqlite**。
+- 顺带修 `op_db_list_tables` 的 PG 分支漏 `::text`（`information_schema.tables.table_name` 是
+  `name` 域，sqlx Any 驱动解不了该 OID，且「空库不触发、建表后才崩」）——与 `introspect.rs` 同口径。
+
+### 行为变更
+
+- 会话级语句 `USE` / `SET search_path` / `set_config('search_path', …)` / `ATTACH` / `DETACH`
+  由只读 / 未知 **改判为写**：池化连接上这些是会话级改写，会污染后续请求并改写内省可见范围；
+  `deny` + `read_only` 站点即被挡（属既有敞口的补强，原按只读放行）。
+- `db.listTables` 与三个新 op 现在受 `db_access` 授权维约束（`deny` 档未授权主体无法枚举表结构）。
+
+### 边界（文档已明示，不是安全边界）
+
+- 内省是**目录读**，**不是**标识符白名单：禁止把列名回填 `db.table()` 构造器或拼进裸 SQL
+  （构造器只认 `SchemaRegistry`）；`information_schema` 只返回当前连接账号可见的对象，不等于
+  「库的完整结构」。
+- 内省只覆盖当前库 / 当前 schema（PG `current_schema()` / mysql `DATABASE()` / sqlite 单文件），
+  不跨 schema；视图 / 触发器 / 数据类型字典 / CHECK 不在内省范围（待做）。
+- `nativeType` 不做跨方言归一化（归一化 = 半套 DDL 还原，越界）。
+
+### docs
+
+- `docs/db-guide.md` 新增 §11.5.7「结构内省」+ 三方言差异对照表 + 红线。
+- devkit 四件同步：`api-manual.md`（§6 三方法行 + 类型表 + `OJ_DB_UNSUPPORTED` 闭集增三项 +
+  §13 限制表 3 行 + 陷阱 5 条）、`scenarios.md` 场景 47、`SKILL.md` 陷阱 5 条、
+  `README.md` v0.1.90 段落；`sample/global.d.ts` 增三 interface 与三方法。
+  `cargo xtask build` 归置 `bin/devkit/`（`cargo test --release -p xtask` 校验一致）。
+
+### 待做登记（不在本版）
+
+- T8：是否补 `db.describeTable()` 聚合 op（等产品有前端反馈）。
+- T9：内省范围装配期冻结（db/schema 从 DSN 解析，需评估多 schema 部署）。
+- T10：CLI `oj/src/schema.rs` 完整迁移到 `introspect.rs`（本期只做了 `'public'` → `current_schema()`）。
+- T11：视图 / 数据类型字典 / 触发器 / CHECK（`db.listViews` 等）。
+
 ## v0.1.89（未打标签）
 
 **db 访问控制核心（L1）**：对齐 dbx 多库能力的第一步——顶层 `db_access:` 段提供库级授权、

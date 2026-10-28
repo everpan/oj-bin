@@ -42,6 +42,7 @@
 | [39](#sc39) | 实时日志流式消费：`exec.spawn` 句柄（`for await` stdout/stderr）/ `exec.run` onStdout/onStderr 回调（v0.1.78） | §6 exec |
 | [40](#sc40) | 长任务中途 kill：`exec.run` 超时整组击杀 / `exec.spawn().kill()` 主动击杀（v0.1.78） | §6 exec |
 | [41](#场景-41通知回执合并--幂等写入构造器补齐能力v0181) | 通知回执合并 + 幂等写入：join ON 值条件 / 字面量列 `scope` / `orIgnore` / `fromSelect`（v0.1.81 补齐，替代手写 `db.query`） | §6 db / 查询构造器 |
+| [42](#场景-42运行期动态登记数据源-client-轴v0191) | 运行期把 DSN 登记为命名库：`db.client.register("rep", dsn)` → `DB("rep")` 直接可用（复用 L1 访问控制 + L2 内省）；未声明 `db_access.<name>` 的动态库默认 deny | §6 db / `db.client` |
 
 ---
 
@@ -3475,3 +3476,97 @@ const rows = await db.table("t").select(["id", "name"]).where({ field: "name", o
 | 用 `db.asTenant()` 命中 `tenants` 维 | 不作数：`tenants` 只认服务端注入的租户（否则匿名 handler 可自授租户） |
 | 用 `db.asSystem()` 绕过 | `asSystem` **只绕过租户防护**，不豁免访问控制（v0.1.89 有意的行为变更） |
 | 配了 `db_access` 就以为库安全了 | 不约束平台自生成 SQL 与 `oj migrate` 等 CLI 通道；`read_only` 也不是 DB GRANT 的替代品 |
+
+## 场景 47：画连接树（库 → 表 → 列/索引/外键，v0.1.90）
+
+**要解决的**：管理后台要像 dbx 一样把库结构展开成树。以前只能 `db.listTables` 拿表名，列/索引/
+外键得自己按方言拼 `information_schema`——而 oj 宿主认识的三种方言各有各的写法。`db.listColumns`
+/ `listIndexes` / `listForeignKeys` 把这三层都成了**同构返回**，业务零分支。
+
+### ① 三 op 并发拉一棵树节点
+
+```ts
+export async function describeTable(table: string) {
+  const [cols, idx, fk] = await Promise.all([
+    db.listColumns(table),
+    db.listIndexes(table),
+    db.listForeignKeys(table),
+  ]);
+  // cols:  {name, nativeType, nullable, default, primaryKey}[]
+  // idx:   {name, unique, primary, origin, columns}[]
+  // fk:    {name, columns, refTable, refColumns}[]   (sqlite 的 name 为 null)
+  return json.ok({ cols, idx, fk });
+}
+```
+
+三个 op 是**独立能力**，未知方言各自 `OJ_DB_UNSUPPORTED`（不会「部分成功」逼出半截语义）。
+`origin` 已是 `c`/`u`/`pk` 统一口径，**前端不再按方言分支**画图标。
+
+### ② 先 `listTables` 校验表名，再内省（空数组 ≠ 失败）
+
+内省 op 对「表不存在 / 不可见 / 在别的 schema」一律返回**空数组**，不报错也不区分原因——所以
+空数组不能当成「出错了」。要校验就用 `listTables` 先问：
+
+```ts
+const tables = await db.listTables();
+if (!tables.includes(table)) return json.fail(404, "table not found");
+const info = await describeTable(table);   // 此时空数组才是真异常
+```
+
+sqlite 表名含 `.`（跨库前缀）、超长、含控制字符 → 同样空数组（被挡）；`listColumns("foo_bar")`
+的 `_` 是字面量不是通配符。
+
+### ③ 类型不是归一化的——前端自己映射
+
+`nativeType` 是方言**原始声明文本**：sqlite `INTEGER`、mysql `varchar(64)`、pg
+`character varying(32)` / `integer[]`。要显示成统一类型请前端写映射表，**别假设三方言同串**。
+
+### ④ `db_access` 授权维也会挡内省
+
+`deny` 档 + 未授权主体，连 `listTables` 一起都枚举不到（`db_not_granted`）。前端库选择器应
+**先 `db.allowed()` 再内省**，不要对硬编码别名调 `listColumns`（点了才报错 = 假入口）。
+只读库（read_only）**不影响内省**——内省恒只读，否则 UI 连展开都做不到。
+
+## 场景 42：运行期动态登记数据源（client 轴，v0.1.91）
+
+**什么时候用**：dbx 的「运行期增删连接」——运维/管理后台在运行期把一个 DSN（mysql/postgres/
+sqlite）登记成命名库，前端立刻用 `DB("rep")` 读写，无需重启/改配置。
+
+**配置（`db_client:`）**：
+
+```yaml
+db_client:
+  enabled: true
+  max_entries: 16
+  allow:
+    roles: [dba]          # 谁能调 register/test/delete/reRegister/list（四维并集）
+```
+
+> 装配期 fail-loud：`enabled=true` 且 `allow` 四维全缺 → 拒启动；`max_entries==0` 同样拒启动。
+
+**登记（管理面，只此一处暴露；使用面走 `DB(name)`）**：
+
+```js
+const r = await db.client.register("rep", "mysql://user:pass@host/db");
+// r = {alias, dialect, dsn, registeredBy, registeredAtMs, queries}（dsn 已脱敏）
+await db.client.test("mysql://user:pass@host/db");          // {ok, dialect?, error?}（不落库）
+await db.client.reRegister("rep", "mysql://...");            // 替换已登记连接
+const names = await db.client.list();                        // dsn 已脱敏
+db.client.has("rep");                                        // 同步 bool
+await db.client.delete("rep");                               // 删库 + 自动驱逐 DB() 缓存
+```
+
+**使用面（与静态库完全一致）**：
+
+```js
+const rows = await DB("rep").query("select * from t where id = ?", [id]);
+const cols = await DB("rep").listColumns("t");
+```
+
+**红线**：
+
+- 未声明 `db_access.<name>` 的动态库**默认 deny**（fail-closed）——登记成功后直接 `DB("rep").query`
+  仍报 `db_not_granted`。要放开，必须在 `db_access.<name>.allow` 显式授权（与静态库同形）。
+- 登记门 `db.asSystem()` **不豁免**；管理员通道走 `db_client.allow.roles`。
+- 连接错误与 `db.client.list` 的 `dsn` 全脱敏（`user:pass@` → `***`）。
+- 不持久化（进程内存）、不跨进程、`max_entries` 封顶；热重载保留、`kill -HUP` 整进程重建丢失。

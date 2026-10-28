@@ -37,6 +37,15 @@ import {
   op_db_query_sql,
   op_db_dialect,
   op_db_list_tables,
+  op_db_list_columns,
+  op_db_list_indexes,
+  op_db_list_foreign_keys,
+  op_db_client_register,
+  op_db_client_test,
+  op_db_client_delete,
+  op_db_client_re_register,
+  op_db_client_list,
+  op_db_client_has,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -967,6 +976,9 @@ globalThis.DB = function (name) {
       // tables in the current database, INCLUDING tables unknown to the schema registry
       // (api-only plans / legacy tables). Optional prefix filter (escaped, bound param).
       listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
+      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table))),
+      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table))),
+      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table))),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -1042,6 +1054,9 @@ globalThis.DB = function (name) {
             dialect: () => { try { return op_db_dialect(name); } catch (e) { throw normDbErr(e); } },
             // Catalog introspection rides the active tx session (same connection).
             listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
+      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table))),
+      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table))),
+      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table))),
             isTx: true,
             // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
             sqlProfile: () => op_db_sql_profile(),
@@ -1064,6 +1079,29 @@ globalThis.DB = function (name) {
   return dbCache.get(name);
 };
 globalThis.db = globalThis.DB("default");
+
+// L3 dynamic data-source registration (client axis, v0.1.91): register a DSN
+// as a named data source at runtime. The alias then enters the DB(name) resolution
+// path (reusing L1 access control + L2 introspection + all query/exec/stream), so
+// only the "admin" surface is exposed here; consumption always goes through DB(name).
+// NOTE: delete must evict dbCache (DB() caches instances by name), otherwise after a
+// delete, DB(name) would still return the stale instance.
+// Guarded: `db` is undefined when no default db is configured (some test/probe
+// contexts); the client ops are still reachable via the registered op names directly.
+if (globalThis.db) {
+  globalThis.db.client = {
+  register: (name, dsn) => dbOpWrap(op_db_client_register(String(name), String(dsn))),
+  test: (dsn) => dbOpWrap(op_db_client_test(String(dsn))),
+  delete: async (name) => {
+    const ok = await dbOpWrap(op_db_client_delete(String(name)));
+    dbCache.delete(String(name));
+    return ok;
+  },
+  reRegister: (name, dsn) => dbOpWrap(op_db_client_re_register(String(name), String(dsn))),
+  list: () => dbOpWrap(op_db_client_list()),
+  has: (name) => op_db_client_has(String(name)),
+  };
+}
 
 // ----- safe query builder (fluent, structured) -----
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})

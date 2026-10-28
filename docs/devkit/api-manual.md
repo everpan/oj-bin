@@ -1157,9 +1157,57 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 | `db.sqlProfile()` | `sqlProfile(): { count: number; totalMs: number; slow: Array<{sql,ms,db}>; byDb: Record<string,{count,ms}>; events: Array<{sql,params,db,inTx,source,ms,rows,ok,error}> }` | **SQL 执行追踪**（v0.1.51，dev 默认开）：本请求累计的 SQL 统计 + 慢查询 + 逐条事件；追踪关闭时返回空对象 |
 | `db.dialect()` | `dialect(): string` | **连接引擎名**（v0.1.61）。供 `_shared` 共享模块（search/versions）与诊断分派方言 SQL；业务 handler 分支方言 = 放弃跨引擎可移植承诺，**慎用**。v0.1.88 起返回插件 `describe()` **声明的方言名**——此前是封闭三值枚举（未识别的 DSN 前缀被当作 sqlite 处理，`dialect()` 于是报 `"sqlite"`），现在原样返回真名。要判别「宿主是否替你生成 SQL」请比较 `"sqlite"｜"mysql"｜"postgres"` 白名单，而非假设不会出现其他值。**不得用它判断能力**：方言名是开放集，`if (d === "mysql") A else B` 会把 B 静默发给新方言——能力问题直接调用并接 `OJ_DB_UNSUPPORTED`，确需方言特有 SQL 时用白名单 + 响亮失败（scenarios 场景 45）。`db.tx` 回调对象同面（另有 `isTx: true` 标记事务域句柄——DDL 必须拒绝在此类句柄上执行） |
 | `db.listTables` | `listTables(prefix?: string): Promise<string[]>` | **目录自省**（v0.1.82）。当前库全部业务可见表名，**含未登记 registry 的表**（api-only 方案 / 历史遗留表），按名称排序；可选前缀过滤（`%`/`_` 按字面量匹配，绑定参数）。sqlite 排除 `sqlite_*` 内部表；mysql/pg 经 information_schema 限当前库/schema。对**宿主认识的三种方言**同口径（SQL 文本引擎常量，不需业务分支）——其他方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_tables"`，v0.1.88）。替代「按方言分支 `information_schema` / `sqlite_master`」的裸 `db.query`。`db.tx` 回调对象同签名（搭车事务连接） |
+| `db.listColumns` | `listColumns(table: string): Promise<Array<{ name: string; nativeType: string; nullable: boolean; default: string \| null; primaryKey: boolean }>>` | **列结构内省**（v0.1.90）。当前库单表的列信息，按声明序；`nativeType` 是方言**声明文本**（sqlite `type` / mysql `column_type` / pg `format_type`，零归一化），`default` 是原始 DDL 文本（sqlite 字符串默认带引号）；表名只经绑定参数。表不存在/不可见 → 空数组（不区分）。未知方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_columns"`）。`db.tx` 回调同签名 |
+| `db.listIndexes` | `listIndexes(table: string): Promise<Array<{ name: string; unique: boolean; primary: boolean; origin: "c" \| "u" \| "pk"; columns: string[] }>>` | **索引结构内省**（v0.1.90）。`origin` 三方言统一为 `c`(普通) / `u`(唯一) / `pk`(主键)——UI 不再分支；`columns` 为已按序聚合的组成列。其余口径同 `listColumns`；能力缺失码 `list_indexes` |
+| `db.listForeignKeys` | `listForeignKeys(table: string): Promise<Array<{ name: string \| null; columns: string[]; refTable: string; refColumns: string[] }>>` | **外键结构内省**（v0.1.90）。sqlite 外键无约束名 → `name` 为 `null`；复合外键 `columns[i]` ↔ `refColumns[i]` 按位配对。其余口径同 `listColumns`；能力缺失码 `list_foreign_keys` |
 | `db.allowed()` | `allowed(): Array<{ alias: string; dialect: string; read_only: boolean; allow_ddl: boolean; allow_dangerous: boolean; max_rows: number \| null; enforce: "off" \| "warn" \| "deny" }>` | **访问控制自省**（v0.1.89）。只列**当前调用主体有权限访问**的库别名及其能力位（按 alias 排序）；未授权的库不出现在列表里。管理员后台 / 数据面板的「库选择器」应以此为准，不要硬编码 `db:` 段的全部别名（那是**假入口**：列出来点了才报错）。同步 op；不执行任何 SQL。`db.tx` 回调对象同签名 |
+| `db.client.register` | `register(name: string, dsn: string): Promise<ClientDbEntry>` | **动态数据源登记**（client 轴，v0.1.91）。运行期把 DSN 登记为命名数据源；登记后别名进入 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream），此处只暴露**管理面**。重名 / 超 `max_entries` 抛错。未配置的名字返回 `undefined` 的地方同理：`db.client` 仅在 `db`（即 `DB("default")`）存在时挂载 |
+| `db.client.test` | `test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string }>` | 试连（**不落库**）；返回 `{ok, dialect?, error?}` |
+| `db.client.reRegister` | `reRegister(name: string, dsn: string): Promise<ClientDbEntry>` | 替换已登记连接（不存在则抛 `not registered`） |
+| `db.client.delete` | `delete(name: string): Promise<boolean>` | 删除数据源；**自动驱逐 `DB()` 缓存**（否则删后再 `DB(name)` 拿到陈旧实例）；返回是否删除成功 |
+| `db.client.list` | `list(): Promise<ClientDbEntry[]>` | 列出全部已登记数据源（`dsn` 已脱敏：`user:pass@` → `***`） |
+| `db.client.has` | `has(name: string): boolean` | 是否已登记（同步；探活用，不经过登记门） |
 
 > **业务 SQL 写法红线**：业务读写优先用 `db.table` 构造器（见下「查询构造器」），由服务端按目标方言自动生成 SQL，从而获得**多库 / 跨引擎迁移能力**；仅在构造器不支持的语句（DDL、部分非 CRUD 语义）才退回 `db.query` / `db.exec`，且仍须用 `?` 绑定参数、避免方言特有语法。
+
+#### 动态数据源登记（`db.client`，client 轴，v0.1.91）
+
+运行期把任意 DSN 登记为**命名数据源**，对齐 dbx 的「运行期增删连接」。登记后别名直接进入
+`DB(name)` 解析路径，**复用 L1 访问控制（§`db_access`）+ L2 结构内省 + 全部 query/exec/stream**——
+**不另起平行的 `db.client.query` API**（使用面一律走 `DB(name)`）。连接经与装配期**同集**的
+`DbBackendRegistry`：`sqlite` / `memory` 内置，`mysql` / `postgres` 由插件注册。
+
+**配置（`db_client:`）**：
+
+```yaml
+db_client:
+  enabled: true            # 默认 false（fail-closed）；false 时全部 db.client.* 拒。
+  max_entries: 16          # 单进程连接池硬上限（=0 装配期 fail-loud 拒启动）。
+  allow:                   # 登记门：谁能调 register/test/delete/reRegister/list。
+    roles: [dba]           # 四维并集；任一命中即放行，全缺 = 不限制。
+    sources: [task]
+```
+
+- **装配期 fail-loud**：`enabled=true` 且 `allow` 四维全缺（无限制）→ **拒启动**（防「开了忘配」全开，
+  SSRF / 内网横向移动面）；`max_entries==0` 同样拒启动。
+- **登记门 `asSystem()` 不豁免**（`identity` 不读 `ReqState.system`）；管理员通道走 `allow.roles`。
+- **使用面走 `DB(name)`**：`DB("rep").query(...)` 与静态库完全一致（访问控制 / 内省 / 流 / 计数复用）。
+- **`delete` 自动驱逐 `DB()` 缓存**：已内建，业务无需手动做；漏做会读到陈旧实例。
+- **`dsn` 全脱敏**：`user:pass@` → `***`；连接失败错误同样脱敏。
+- **审计**：register / delete / reRegister 落 `DB_CLIENT_AUDIT`（operator/module/tenant/source）。
+- **未声明 `db_access.<name>` 的动态库默认 `deny`**（fail-closed）：要放开必须显式写
+  `db_access.<name>.allow`（见下「库级访问控制」）——否则任何人可查该内网库。
+- **限制**：不持久化（进程内存）、不跨进程、`max_entries` 封顶；`register` 后热重载保留、`kill -HUP`
+  整进程重建丢失。
+
+**`ClientDbEntry`**（`db.client.list()` 元素）：`{ alias, dialect, dsn, registeredBy, registeredAtMs, queries }`
+（`dsn` 已脱敏；`queries` 是经 `lookup` 自动累加的命中计数）。
+
+**错误码**：`OJ_DB_CLIENT_DISABLED`（`reason: db_client_disabled`）／
+`OJ_DB_CLIENT_NOT_AUTHORIZED`（`reason: db_client_not_authorized`）／`OJ_DB_CLIENT_FULL`
+（`registry full (cap N)`）／`OJ_DB_CLIENT_EXISTS`（`already registered`）／
+`OJ_DB_CLIENT_NOT_REGISTERED`（`not registered (use register to add)`）／
+`OJ_DB_UNSUPPORTED`（`unknown db scheme in dsn '…' (known: […])`，绝不回落 sqlite）。
 
 **SQL 执行追踪**（v0.1.51，开发期可观测性）：
 
@@ -1680,6 +1728,7 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
 
 `OJ_DB_UNSUPPORTED` 的 `e.data.capability` 取值（**闭集**，可安全 switch）：
 `query_build` / `query_sql`（构造器 `.all()/.run()` 与 `.toSQL()`）、`list_tables`、
+`list_columns` / `list_indexes` / `list_foreign_keys`（结构内省三 op，v0.1.90）、
 `next_seq`、`migrate` / `seed`（CLI 侧，不进 JS 运行时）、`stream` / `cancel`（插件声明了
 能力却回 unsupported = 契约违规）。同一错误另有 `e.data.dialect` = 声明名。
 
@@ -4446,6 +4495,9 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 语句风险分类是 best-effort 词法（v0.1.89） | 不是 SQL 解析器：CTE / 窗口函数 / 存储过程体 / 串未闭合等复杂形态会落 `unknown` 并**按最严档拒**（fail-closed）。`deny` 档上线前先用 `warn` 灰度看日志，别直接 deny |
 | `db_access` 不约束平台自生成 SQL 与 CLI 通道（v0.1.89） | `db.nextSeq` 的序列表 DDL、`db.listTables` 的内省查询不适用；`oj migrate` / `oj schema` / `oj build` 不经 bridge，也不适用 |
 | `sql_guard=deny` 下 raw SELECT 未登记表的敞口**原样保留**（v0.1.89） | 本策略只管「库别名 + 风险类别」，只读语句一律放行——不要把 `db_access` 读成「该敞口已修」 |
+| 结构内省只覆盖「当前库 / 当前 schema」（v0.1.90） | PG 走 `current_schema()`、mysql 走 `DATABASE()`、sqlite 单文件单库；**不跨 schema**（多 schema 部署只能内省默认 schema）。视图 / 触发器 / 数据类型字典 / CHECK 不在内省范围（待做） |
+| 内省是目录读，不是标识符白名单（v0.1.90） | `listColumns` 的列名不可回填构造器或裸 SQL；构造器只认 `SchemaRegistry`。`information_schema` 只返回**当前连接账号可见**的对象，不等于「库的完整结构」 |
+| 内省与 `db.listTables` 一并过 `db_access` 授权维（v0.1.90） | `deny` 档 + 未授权主体无法枚举任何表结构；`asSystem()` 不豁免、`warn` 档放行并落 `DB_ACCESS_DENY`。内省恒只读，不受 `read_only` 限制（只读库也要能看结构） |
 
 ### 常见陷阱清单
 
@@ -4473,6 +4525,17 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   `sources: [task]` 授权（v0.1.89）。
 - `db.asSystem()` 救不了 `db_access` 的拒绝——它只绕过**租户**防护，不豁免访问控制
   （v0.1.89 有意的行为变更，升级到 `deny` 档前先查存量 `asSystem` handler）。
+- `db.listColumns(c).nativeType` 是方言**原始声明文本**、零归一化（sqlite `INTEGER`、
+  mysql `varchar(64)`、pg `character varying(32)`/`integer[]`）——要跨方言判断类型请
+  自己写映射，别假设三方言给出同一种串（v0.1.90）。
+- 内省结果**不是标识符白名单**：`listColumns` 返回的列名**禁止**回填 `db.table()` 构造器
+  或拼进裸 SQL——构造器只认 `SchemaRegistry`（未登记表报 `unknown table`）。内省是目录读，
+  不是授权后的建表契约（v0.1.90）。
+- `listColumns/Indexes/ForeignKeys` 对「表不存在 / 不可见 / 在别的 schema」一律返回**空数组**
+  （不报错、不区分原因）；sqlite 表名含 `.`（跨库前缀）或畸形（超长 / 控制字符）也返回空数组。
+  别把空数组当成「查询出错」——要校验表名先用 `db.listTables(prefix)`（v0.1.90）。
+- `listColumns("foo_bar")` 里的 `_` 是**字面量**（等值匹配），不是 LIKE 通配符——能精确查到
+  名为 `foo_bar` 的表；误以为它会「前缀模糊匹配」是常见错（v0.1.90）。
 - `beforeEach` 是单一全局钩子，跨 `describe` 被覆盖——多 describe 文件在各 `it` 内联准备。
 - WS Binary 帧 `http.body` 是 `null` 不是乱码——取字节用 `http.bodyBytes()`（v0.1.16）。
 - `ws.send` 的帧型由**参数类型**决定：string → Text、Uint8Array → Binary——回显二进制协议时

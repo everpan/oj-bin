@@ -24,7 +24,7 @@ pub trait DbBackend: Send + Sync {
 }
 
 /// 有序注册表：首个 scheme 命中者胜出；未知 scheme 明确报错。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DbBackendRegistry {
     backends: Vec<Arc<dyn DbBackend>>,
 }

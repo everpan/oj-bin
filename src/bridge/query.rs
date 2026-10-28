@@ -2587,13 +2587,18 @@ pub(crate) fn lookup(
     name: &str,
 ) -> Result<Arc<dyn DataAccessor>, JsErrorBox> {
     let name = super::guard::bound_db(state, name);
-    state
-        .borrow()
-        .borrow::<Arc<StableState>>()
-        .dbs
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| JsErrorBox::generic(format!("db: instance '{name}' not configured")))
+    let g = state.borrow();
+    let st = g.borrow::<Arc<StableState>>();
+    // 静态库优先；miss 再回落运行期动态登记库（L3 v0.1.91）。
+    if let Some(d) = st.dbs.get(&name) {
+        return Ok(d.clone());
+    }
+    if let Some(a) = st.client_dbs.accessor_and_count(&name) {
+        return Ok(a);
+    }
+    Err(JsErrorBox::generic(format!(
+        "db: instance '{name}' not configured"
+    )))
 }
 
 /// 仅用于 trait 约束引用，避免 unused import 警告。
