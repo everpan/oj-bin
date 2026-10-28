@@ -1459,6 +1459,8 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
         "secrets",
         "ws",
         "platform",
+        "db_access",
+        "db_client",
     ]
 }
 
@@ -1742,7 +1744,13 @@ cache:
             keys.iter().collect::<std::collections::HashSet<_>>().len()
         );
         for k in keys {
-            let yaml = format!("{k}: null\n");
+            // `db_access` / `db_client` 是 mapping 类型（不接受 null），其余已知段用
+            // `null` 探测即可（取默认值且不落入 extra）。
+            let yaml = if *k == "db_access" || *k == "db_client" {
+                format!("{k}: {{}}\n")
+            } else {
+                format!("{k}: null\n")
+            };
             let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
             let extra = split_extra(&v);
             assert!(extra.get(*k).is_none(), "known key '{k}' leaked into extra");

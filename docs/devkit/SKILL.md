@@ -330,6 +330,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.client.delete` 后立刻 `DB(name)` 拿到陈旧实例（v0.1.91） | `delete` **已自动** `dbCache.delete(name)`；若业务绕过 `delete` 自行改注册表、或直接复用一个被删别名，须自己驱逐 `DB()` 缓存，否则读到陈旧连接 |
 | `oj serve` 重启后动态登记的库全没了（v0.1.92） | 框架**不**自动落盘：`db.client.register` 构造的实例是进程内存的，进程退出 / HUP 全量重建后全部丢失。要跨重启保留，由**应用侧**负责——应用在自己表里存 `(name, ENC[...] 密文 dsn)`，启动初始化 handler 里逐条 `db.client.register` 重建；框架不提供 `db_client.persistence` 之类的自动落盘配置 |
 | 想让应用自己落盘 DSN 却直接存明文（v0.1.92） | 应用侧持久化 DSN 必须复用既有 `ENC[...]` 密封（`secret.seal`），绝不写明文；解封失败（无 `OJ_SECRET_KEY`）应 fail-loud，不当明文用 |
+| 改 `db_access` / `db_client` 段以为热更即时生效（v0.1.93） | 这两段不在热更即时生效范围（StableState 不可变），改了会被标 `restart_pending` 提示重启，不会静默盲区。运行期零重启改授权请用 `db.access.grant/revoke` |
+| `db.access.revoke` 当「删库」用（v0.1.93） | revoke 只撤运行期授权项、别名**回落 config**（非删 config）；对纯 config 兜底项 revoke 显式报错（防越权/DoS 撤销他人静态授权）。真删库是 `db.client.delete` |
+| `db.access.grant` 填空 allow 想「对全员放行」（v0.1.93） | 空 allow 被 host 拒（运行时授权严禁对全员放行）。必须至少限制 `modules`/`roles`/`tenants`/`sources` 一维 |
+| 以为 `db.access.grant` 能覆盖 config 的 `deny`/`read_only`/`max_rows`（v0.1.93） | 运行期 grant **只注入放行维 allow**，不放开 config 的 `read_only`/`max_rows`——防提权；config 无 allow 时 grant 成为白名单（`off` 抬到 `deny`），已有 allow 时逐维并集追加 |
+| 以为 `enforce: deny` = 拒所有人（v0.1.93 校正） | `deny` 是「拒绝违规」：写了 `allow` 就是白名单（命中放行）；没写 `allow`（= 不限制主体）则主体全放行、策略位照常执行。拒所有人要用动态库未声明或 `allow: {roles: []}` |
+| 跨 isolate 失效依赖 `db.epoch` 当安全边界（v0.1.93） | 查询 op 始终按名从 host registry 重解析 accessor，正确性不依赖 JS 持有的 epoch；即便恶意 handler 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记） |
 
 ## 手册
 

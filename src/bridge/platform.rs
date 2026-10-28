@@ -219,6 +219,7 @@ mod tests {
             db_access: Arc::new(Default::default()),
             db_client: Arc::new(Default::default()),
             client_dbs: Arc::new(crate::bridge::client_db::ClientDbRegistry::new(16)),
+            db_access_rt: Arc::new(std::sync::Mutex::new(HashMap::new())),
             db_backend: Arc::new(crate::bridge::db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),
             vars: Arc::new(HashMap::new()),

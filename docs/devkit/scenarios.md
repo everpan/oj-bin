@@ -569,7 +569,7 @@ db: analytics        # ★ 该模块里字面 db.* 的调用落到 analytics（�
 | `--db analytics` 报了别的库连不上的错 | 深瘦身装配会打开 config 里**所有** `db:` 连接；任一 DSN 打不开即失败，与 `--db` 指向哪个库无关 |
 | 想用 `oj serve --db` 切库 | 没有这个旗标：运行期按模块 `manifest.db` 路由，`serve` 恒以 `default` 为基库 |
 
-> 机制与边界详见仓库 `docs/migration.md` §3.8、`docs/db-guide.md` §1.1。
+> 机制与边界详见仓库 `docs/migration.md` §3.8、`docs/devkit/db-guide.md` §1.1。
 
 ---
 
@@ -3593,3 +3593,38 @@ for (const { alias, enc_dsn } of await db.query("select alias, enc_dsn from app_
 
 > 存储介质 / 表结构 / 加密 / 备份全是应用关切；框架不感知、不提供 `db_client.persistence` 这类自动落盘配置。
 > 多实例各自回放、都指向同一真实 DB 即可保持一致（DB 实例本就是 per-process 连接池）。
+
+**变体：运行期动态授权（U-1，v0.1.93）——零重启放行角色**
+
+`register` 只构造实例、实例默认 deny（见上「红线」）。要让某个**角色**在**不重启**的前提下查该库，用
+`db.access.grant`（与 `db.client` 同特权门；`db_client.enabled=false` 或 caller 不在 `allow` → 拒）：
+
+```js
+// 管理 handler：登记后立刻按角色放行（默认只读）
+await db.client.register("rep", dsn);
+await db.access.grant("rep", { roles: ["analyst"] });   // analyst 角色即可查，无需重启
+
+// 任意其它 handler（含不同模块、不同 isolate）按名解析即吃到新策略：
+const rows = await DB("rep").query("select * from t where id = ?", [id]);
+
+// 撤销 → 回落 config（非删 config）；对纯 config 兜底项 revoke 会显式报错（防越权/DoS）
+await db.access.revoke("rep");
+```
+
+要点：grant 必须至少限制 allow 一维（空 allow = 对全员放行，被 host 拒）；运行期 grant 只注入放行维、
+不覆盖 config 的 `enforce`/`read_only`/`max_rows`（防提权）；grant/revoke 落 `DB_ACCESS_AUDIT`。
+
+**变体：跨 isolate 连接失效（U-3，v0.1.93）**
+
+`db.client.delete` / `reRegister` 把别名 epoch +1；`DB(name)` 每次调用比对 epoch 自动失效 JS 缓存。
+但需要跨 isolate 强一致的应用（如「随用随取」回放），可用 `db.epoch` 主动探测：
+
+```js
+// 应用侧「随用随取」配方：缺失则回放登记；epoch 变化说明连接被删/轮换，重新回放
+if (!db.client.has("rep")) await db.client.register("rep", dsn);
+const ep = db.epoch("rep");
+// 把 ep 存起来，下次请求比对；不一致 → 重新 register 回放（host 重解析 accessor，天然一致）
+```
+
+> 正确性不依赖 JS 持有的 epoch：查询 op 始终按名从 host registry 重解析 accessor。即便恶意 handler
+> 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记）。

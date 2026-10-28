@@ -16,131 +16,47 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.88（未打标签）
+## v0.1.93（未打标签）
 
-数据库方言能力模型（M1）：ABI 12（describe 工厂级能力槽 + 结构化错误信封）、两层方言模型
-（枚举保留为 known 子集 + 边界描述符 + 六门控点 + 删除 Sqlite 回落）、default-throw cancel、
-mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_trace 扩展、清单锁装配 + 启动能力位一览。
+**dbx Web 对齐 · L5（P0 主旅程）**：U-8（sqlite 错误信封化）、U-6（读侧解码扩展）、U-1（动态授权运行期生效 + 热更分类）、U-3（跨 isolate 失效广播）。设计文档 `docs/plans/2026-10-28-dbx-web-l5-p0-main-journey.md`（含四路评审 16 项处置）。**不改 ABI_VERSION**（纯 host 侧 + JS 全局）。
 
 ### feat(db)
 
-- ABI 12：DataAccessorVtable 增工厂级 `describe()` 槽，返回 `{dialect, capabilities}` JSON；
-  `ABI_VERSION` 11 → 12（严格相等门禁），宿主 + 插件同产物重编发布。
-  `oj-plugin-ffi` 0.1.2 → 0.1.3、`oj-db-mysql` 0.1.1 → 0.1.2、`oj-db-postgres` 0.1.0 → 0.1.2。
-- 方言契约从闭集枚举演进为「开放方言名 + 能力位」：新增方言接入零宿主逻辑分支。
-- 结构化错误信封（category/retryable/session_disposition/message/data）跨 FFI，宿主单点
-  `parse_raw`；未知方言六门控点统一返回 `OJ_DB_UNSUPPORTED`（builder/exec_route/list_tables/
-  next_seq/search.*/migrate/seed），无 Sqlite 回落。
-- **裸 SQL 路径对开放方言全量可用**：`db.query` / `db.exec` / `db.stream` / `db.tx` 不再受方言
-  门控（门控只覆盖宿主替你生成 SQL 的六处）。新方言接入的可用面因此非零。
-- JS 错误面：既有方言错误消息文本逐字节冻结；新错误条件以稳定 `code`/`data` 暴露
-  （`OJ_DB_UNSUPPORTED` + `data.capability` + `data.dialect`）。
-  **冻结范围界定（唯一例外，设计 §5.1）**：db 轴宿主侧的 `ffi <op>: ` 前缀被移除——ABI 11 及
-  以前该前缀与插件自身文案叠加成 `ffi db query: db query: <sqlx 原文>` 双前缀，现为
-  `db query: <sqlx 原文>`（message 主体逐字不变）。若 handler 曾匹配 `^ffi db ` 请改为匹配
-  主体前缀；快照测试 `db_error_text_snapshot_is_frozen` 钉死该文本。
-- JS 错误面（外显补齐）：除 `e.code` / `e.data` 外，db 错误现另带 `e.retryable`（布尔）与
-  `e.sessionDisposition`（`keep`/`reset`/`close`）——重试决策不必解析 `data`。`db.tx` 内、
-  构造器路径、`db.stream` 的错误同样携带（此前 builder / tx / stream 的异步入口会退化成
-  纯文案，属实现缺口，现统一）。
-- 插件与诊断面：`plugins()` / `ojInfo()` / `GET {base}/plugins` 增 `caps` 列
-  （`{dialect, capabilities[]}`，与插件 `describe()` 同词汇；非 db 轴插件为 `null`）；
-  `oj info` 文本输出补 db 插件的能力行（与启动横幅同口径）。
-- 插件清单锁：`cargo xtask build` 末尾写 `bin/plugins/<triple>/plugins.lock.json`
-  （`[{name, abi, fingerprint}]`）；扫描装配时锁外库文件**拒载并点名**（增量覆盖残留旧插件的
-  典型症状），锁内条目缺失或 abi/fingerprint 与实物不符则 stderr 告警（整体拷贝不完整的信号）。
+- **U-8 sqlite 错误信封化**：`accessor_sqlx.rs` 8 处纯文本错误 + `stream_query` 内联 `e.to_string()` 全部走 `sqlite_err(e, ctx)`，按 sqlx 变体映射到既有 `DbErrorCategory` 八值（`Syntax`/`Constraint`/`Timeout`/`Connection`/`Capacity`/`Unsupported`/`Cancelled`/`Internal`），携带 `retryable`/`sessionDisposition`；message 经 `secret::redact` 脱敏，**绝不回显 DSN/凭据**。sqlite 专用纯文本回退删除。
+- **U-6 读侧解码扩展**：`column_json` 原 `unwrap_or(Null)` 静默丢值改为**显式报错**（含列类型名）；未知/不支持类型不再静默回退。sqlite 路径规范化（仅吃 sqlite 行，Any 驱动经类型名反射归一，不引入未实现 `Decode<Any>` 的强类型）。
+- **U-1 动态授权运行期生效**：新增 `db.access.grant(alias, allow, opts?)` / `db.access.revoke(alias)`——
+  把「放行维」(角色/主体四维并集) 注入运行表，无需重启即对被授权主体放行（默认 read-only）；
+  `revoke` 仅回落 config（非删 config）、拒绝撤销 config 兜底项（显式报错）。与 `db.client` 同特权门
+  （`db_client.allow` 四维并集、fail-closed），安全敏感度更高 → 必发 `DB_ACCESS_AUDIT`。
+  合并语义：运行时项只动 `allow`，不放开 config 的 `read_only`/`max_rows`/DDL/危险写（防提权）；
+  未声明动态别名仍 fail-closed。
+- **U-1 热更分类**：`db_access` / `db_client` 纳入 config diff 已知键并标 `restart_pending`（改这两段须重启），消除旧授权静默盲区（旧版误标 `applied`）。
 
-（逐任务明细见各 commit；本段为 M1 总览，任务级 fix/feat 随提交补充。）
+### feat(db_client)
 
-### fix(db) — postgres 流式整数类型
+- **U-3 跨 isolate 失效（epoch）**：`ClientDbRegistry` 增逐别名世代号 `epoch`，register/re_register/remove 各 +1；
+  新增 `db.epoch(name)`（host 权威）与 `op_db_epoch`。`DB(name)` 缓存**每次调用**校验 epoch（修复 cache-hit 短路），
+  delete/reRegister 后 JS 侧及时失效。正确性不依赖 JS 持有的 epoch（查询 op 按名从 host registry 重解析 accessor），
+  恶意 handler 覆写缓存 epoch 也无法复用已删连接。
 
-- **`db.stream`（typed 流式）在 postgres 上读 `int4`/`int2`（`integer`/`smallint`）列会硬报错**
-  「column 'x' has type 'INT4' which this plugin does not decode yet」。根因：sqlx 的
-  `Type<Postgres>` 是**严格等值**匹配（`i64::compatible` 只认 `INT8`），而 `column_json_pg`
-  只试了 `i64`；Any 回退路径的 `i64::compatible` 是 `is_integer()`（全整数宽度），所以
-  `db.query` 一直正常，只有流式受影响。现补 `i16`/`i32` 两个分支，与查询路径逐值对齐。
-  真库回归用例 `real_pg_stream_decodes_common_numeric_types`（同时钉死 `real`/FLOAT4 在**两条**
-  路径上都保持「不支持 + cast 指引」，避免只补一头造成分叉）。`oj-db-postgres` 0.1.1 → 0.1.2
-  （ABI 不变，可原地替换）。仍未解码的类型（`real`/`jsonb`/`numeric`/`uuid`/时间戳/数组等）
-  继续响亮报错并给出 `cast` 指引。
+### fix(db)
 
-### docs(db) / tools — 方言接入资料与 db 轴模板（阶段三的无库切片）
-
-`oj-db-oracle` / `oj-db-dameng`（阶段二）仍卡在达梦 DPI 再分发许可与 Go triple 矩阵两道外部门禁上，
-故先落地**不需要真库与外部许可**的那部分：类型映射表、conformance 清单、可拷贝的 db 轴骨架。
-
-- `docs/db-guide.md` 新增 **§10.6 类型映射表与值契约（跨方言）**：六类 schema 类型 ×
-  sqlite/mysql/pg/oracle/DM8 的 DDL 映射（后两列标注「M2 方案级 / 待真库复核」，不作生产依据）、
-  读侧 JSON/JS 值契约、三内置方言读侧边界表（点名 **sqlite 仍会静默 `null`** 属历史包袱、新插件勿照抄），
-  以及新方言四条硬要求——其中「禁止 `Unknown` 静默当 text」在写下时确有其事（核心侧
-  `from_schema_type` 兜底把 `type: varchar` 归 `Unknown` 按文本处理，租户守卫因此在 PG 上退化成
-  `operator does not exist: bigint = text`）；该缺口已由下节 `fix(schema)` 闭合，本段留作背景。
-- `docs/plugins/plugin-development.md` 新增 **§15 新增数据库方言 conformance 清单**：五步接入、
-  8 能力位注册表（逐能力位写明宿主消费点 + 正例 + 反例）、错误映射骨架（含 dbx 侧二手证据的达梦
-  错误码 `-5669` / `-6118` / `-3325` / `-2207`，明确标注待 M2 真库复核且**不得照搬 Oracle 编号**）、
-  sidecar 五条生命周期契约、发布形态与排障入口，以及 14 条可直接拷进 PR 的验收清单。
-- 新增 `tools/plugin-template-db`：**db 轴 cdylib 插件骨架**（`demo` 方言，进程内，不连真库）。
-  `describe()` 能力位自报 / 结构化错误信封（8 类 × 5 字段，用枚举而非字符串防 typo）/
-  流式三态信封（`rows`·`done`·`error`，绝不裸 `null`）/ 句柄·事务·游标生命周期全部摆全，
-  11 个自检用例逐条对应 §15.6。能力位与行为由**同一组常量**驱动：翻转 `SUPPORTS_STREAM` /
-  `SUPPORTS_CANCEL` 后套件仍全绿（声明与实现不会漂移）。真实驱动只需替换 12 个 `do_*`。
-  不进 workspace members（与既有泛型轴模板 `tools/plugin-template` 同款：拷贝使用的骨架）。
-- 交叉引用：§10.5 能力矩阵、§10.6、§15 与模板 README 四向互指，运维侧仍以 `api-manual.md`
-  「结构化数据库错误」为准。
-
-### fix(schema) — 列类型不再静默降级成 text
-
-- **复核结论（先纠正一处自己的文档判断）**：`schema.yaml` 这条路上未知类型**本来就被拒**——
-  `SchemaFile::parse` 在声明期点名原串 + 列出支持清单（`type: varchar` 会得到
-  `schema: 表 "t".tenant_id: 未知列类型 "varchar"（支持 integer/bigint/text/boolean/double/blob；
-  其余类型请写 migrations/NNNN__desc.sql）`）。真正的静默降级只存在于核心侧：`ColumnType::
-  from_schema_type` 的兜底分支把不认识的串归 `Unknown`，而 `Unknown` 的语义是「按 text 处理」。
-- 收紧为**不可能静默**：`ColumnType::from_schema_type` 返回 `Option<Self>`（不再兜底），并新增
-  `ColumnType::SCHEMA_TYPES` 作为六类词汇表的唯一来源（解析、错误文案、校验共用，杜绝两处清单
-  漂移）；`SchemaFile::registry_tables()` 返回 `Result`，未识别类型**拒载并点名 表.列**——
-  即使有人绕过 `parse()` 直接反序列化，也走不到「当 text」。
-- 顺带删掉 `oj/src/schema.rs` 里与核心重复的 `ColType` 枚举（同一份词汇表原本有两处定义），
-  DDL 生成与 `validate_tenant` 改为直接判 `ColumnType`。
-- 影响面：`schema.yaml` 正常路径**文案与行为逐字不变**（错误串仍由同一份词汇表拼出）；只有
-  「绕过 parse 的路径」从静默降级变为拒载。`Unknown` 语义收窄为「列类型未声明」（旧装配路径
-  `table()` / 既有夹具），仍按 v0.1.23 行为处理——这条向后兼容契约有专测钉死
-  （`unknown_column_type_tenant_still_binds_text`：取「纯数字租户头」做判别，`Unknown` 一旦
-  被误当数值，绑定参数会从 `"7"` 变 `7`，断言立刻红）。
-- 测试：`from_schema_type_maps_exactly_the_six_declared_names`（六项全命中且不落 `Unknown`）、
-  `from_schema_type_never_silently_falls_back`（11 个应拒串：`varchar`/`VARCHAR(64)`/`jsonb`/
-  `INTEGER`/`int`/空白变体等一律 `None`）、`registry_tables_rejects_unknown_type_even_when_parse_is_bypassed`
-  （刻意用 `serde_yaml` 绕过 parse 的对抗用例）、`unknown_column_type_tenant_still_binds_text`
-  （旧路径 `Unknown` 仍绑字符串，锁死兼容面）+ 真机 `oj serve` 双向验证（`varchar` 拒启并点名、
-  改 `text` 后正常建表启动）。
-
-### docs(db) / ops — `db.dialect()` 迁移范式 + 运维插件面（M3 收尾切片）
-
-M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/模板；本节补余下 2 个）。
-两域原本挂在「等 M2 真库」上，复核后确认**结构性内容不依赖真库**：迁移范式的方向恰恰是
-「不要按方言名分派」，而运维手册里的报错文案可以**逐字取自当前已实现的代码**。
-
-- `docs/db-guide.md` 新增 **§10.7 `db.dialect()` 的红字与迁移范式**：方言名是开放集（插件
-  `describe()` 声明什么就是什么），`if (d === "mysql") A else B` 会在新方言接入后把 B **静默**
-  发给它（占位符风格错、`ON DUPLICATE KEY` 发给 Oracle），报错却落在引擎侧。给出三档迁移
-  （① 删掉：占位符 / 取 id / 列目录 / 取号都由宿主或平台 API 吸收；② 换问法：能力问题直接调用
-  并接 `OJ_DB_UNSUPPORTED`；③ 保留：真方言特有 SQL 用**白名单对象键 + 未知方言 `throw`**），
-  附反面样例与「别把 `dialect()` 缓存成模块常量」「别在 handler 里按 `caps` 分派」两条边界。
-- `docs/devkit/api-manual.md`：`db.dialect()` 行与「方言边界」块补同一条红线；**scenarios 新增
-  场景 45**（删分支对照表 + 可照抄的 `_shared/dialect.ts` + 验证步骤 + 五个常见坑）；
-  `SKILL.md` 陷阱速查 +1 行（同口径）；`devkit/README.md` v0.1.88 段落纳入场景 45。
-- `docs/ops-manual.md`：**§1.2 插件目录与清单锁**（发布物形态、三条纪律、锁与实物不一致的
-  四种情形逐字表）、**§6.1 装配期日志**（7 行逐字日志 + 级别 + 含义，`host ABI_VERSION` /
-  `plugin … | caps:` 为权威现场）、**§7 排障表 +8 行**（ABI mismatch、锁外文件、identity
-  mismatch、符号缺失、能力串 typo、fingerprint 告警、运行期 `OJ_DB_UNSUPPORTED` 的两种成因、
-  插件没装上）、**§8.1 回滚三元组**（`bin/oj` + `bin/plugins/<triple>/` + `dist/` 为什么不能
-  单换、五步回滚命令、回滚后三项核对、迁移不回滚）。
-- 文案一致性口径：`plugin ABI mismatch` / `plugin file not in plugins.lock.json` /
-  `plugin identity mismatch` / `plugin symbol missing` / `plugin db capability error` 及两条
-  `[oj-plugin]` 告警，全部逐字对齐 `src/bridge/plugin_loader.rs` 的 `Display` 实现；
-  横幅格式对齐 `oj/src/serve_cmd.rs::plugin_banner_line`。**M2 落地后需回填**的只剩
-  Oracle/DM 厂商错误码分布与 §10.6 两列（已在计划文档「M2 回填点」登记）。
-- `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
-  产物与源一致。
+- `known_top_level_keys` 补 `db_access` / `db_client`（消 `unconsumed config sections` 噪声 + 使其进入 diff 分类）。
+- **`enforce: deny` 语义校正（v0.1.91 回归修复）**：L3 在 `granted_only` / `check_access_intent` 里加的
+  Deny 短路会**忽略 `allow` 硬拦所有人**——`db_access: {defaults: {enforce: deny, allow: {roles: [admin]}}}`
+  连 admin 都拿 `db_not_granted`，等于白名单完全失效。现恢复 L1 语义：`deny` = **拒绝违规**
+  （命中 `allow` 放行；未写 `allow` 时主体全放行、`read_only`/DDL/危险写/`unknown` 策略位照常执行）。
+  L3 的「动态库默认拒所有人」改用「声明且为空」的 `allow` 表达（空表 `allow` 本义是「不限制」，
+  无法表达拒绝）。顺带修复 `db_policy::behavior` 6 个长期红的用例（`role_grant_hit_and_miss` /
+  `as_tenant_voids_the_tenant_dimension` / `task_bridge_reports_source_task` /
+  `introspect_granted_only_blocks_unauthorized` / `deny_read_only_blocks_write` /
+  `as_system_does_not_exempt_access_control`）。
+- **`db.access.grant` 改为真授权**：运行期项 `enforce` 由 `warn`（只记日志不拒）改为 `deny`——
+  否则「授权」对未授权主体毫无约束力。静态别名上 grant 时若 config 未限制主体则**成为白名单**
+  并把 `off` 抬到 `deny`（`off` 档没有授权判定，grant 会是空操作）；config 已有白名单则按
+  **逐维并集**追加（原先整体替换会挤掉 config 已授权的角色）。
+- **`db.allowed()` 与运行期授权同源**：改用含 grant 表的归一策略，并让运行期授权的动态别名进入
+  连接树（此前只看 config，运行期授权的库在 `db.allowed()` 里仍是「假入口」）。
 
 ## v0.1.92（未打标签）
 
@@ -326,6 +242,132 @@ M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/�
 - T1 `guard.rs` 的 `first_kw` 同样被 `WITH ... DELETE FROM` 打穿（既有租户守卫语义变更，需单独评审）。
 - T2 档位类型归一（`ownership_deny` / `SqlGuard` / `Enforce` 三套并存）。
 - T3 sqlparser 引入（触发条件：需要判定「谓词是否覆盖到正确列」时）。
+
+## v0.1.88（未打标签）
+
+数据库方言能力模型（M1）：ABI 12（describe 工厂级能力槽 + 结构化错误信封）、两层方言模型
+（枚举保留为 known 子集 + 边界描述符 + 六门控点 + 删除 Sqlite 回落）、default-throw cancel、
+mysql/pg/sqlite 迁移、占位符触发条件切换（逐字节等价）、sql_trace 扩展、清单锁装配 + 启动能力位一览。
+
+### feat(db)
+
+- ABI 12：DataAccessorVtable 增工厂级 `describe()` 槽，返回 `{dialect, capabilities}` JSON；
+  `ABI_VERSION` 11 → 12（严格相等门禁），宿主 + 插件同产物重编发布。
+  `oj-plugin-ffi` 0.1.2 → 0.1.3、`oj-db-mysql` 0.1.1 → 0.1.2、`oj-db-postgres` 0.1.0 → 0.1.2。
+- 方言契约从闭集枚举演进为「开放方言名 + 能力位」：新增方言接入零宿主逻辑分支。
+- 结构化错误信封（category/retryable/session_disposition/message/data）跨 FFI，宿主单点
+  `parse_raw`；未知方言六门控点统一返回 `OJ_DB_UNSUPPORTED`（builder/exec_route/list_tables/
+  next_seq/search.*/migrate/seed），无 Sqlite 回落。
+- **裸 SQL 路径对开放方言全量可用**：`db.query` / `db.exec` / `db.stream` / `db.tx` 不再受方言
+  门控（门控只覆盖宿主替你生成 SQL 的六处）。新方言接入的可用面因此非零。
+- JS 错误面：既有方言错误消息文本逐字节冻结；新错误条件以稳定 `code`/`data` 暴露
+  （`OJ_DB_UNSUPPORTED` + `data.capability` + `data.dialect`）。
+  **冻结范围界定（唯一例外，设计 §5.1）**：db 轴宿主侧的 `ffi <op>: ` 前缀被移除——ABI 11 及
+  以前该前缀与插件自身文案叠加成 `ffi db query: db query: <sqlx 原文>` 双前缀，现为
+  `db query: <sqlx 原文>`（message 主体逐字不变）。若 handler 曾匹配 `^ffi db ` 请改为匹配
+  主体前缀；快照测试 `db_error_text_snapshot_is_frozen` 钉死该文本。
+- JS 错误面（外显补齐）：除 `e.code` / `e.data` 外，db 错误现另带 `e.retryable`（布尔）与
+  `e.sessionDisposition`（`keep`/`reset`/`close`）——重试决策不必解析 `data`。`db.tx` 内、
+  构造器路径、`db.stream` 的错误同样携带（此前 builder / tx / stream 的异步入口会退化成
+  纯文案，属实现缺口，现统一）。
+- 插件与诊断面：`plugins()` / `ojInfo()` / `GET {base}/plugins` 增 `caps` 列
+  （`{dialect, capabilities[]}`，与插件 `describe()` 同词汇；非 db 轴插件为 `null`）；
+  `oj info` 文本输出补 db 插件的能力行（与启动横幅同口径）。
+- 插件清单锁：`cargo xtask build` 末尾写 `bin/plugins/<triple>/plugins.lock.json`
+  （`[{name, abi, fingerprint}]`）；扫描装配时锁外库文件**拒载并点名**（增量覆盖残留旧插件的
+  典型症状），锁内条目缺失或 abi/fingerprint 与实物不符则 stderr 告警（整体拷贝不完整的信号）。
+
+（逐任务明细见各 commit；本段为 M1 总览，任务级 fix/feat 随提交补充。）
+
+### fix(db) — postgres 流式整数类型
+
+- **`db.stream`（typed 流式）在 postgres 上读 `int4`/`int2`（`integer`/`smallint`）列会硬报错**
+  「column 'x' has type 'INT4' which this plugin does not decode yet」。根因：sqlx 的
+  `Type<Postgres>` 是**严格等值**匹配（`i64::compatible` 只认 `INT8`），而 `column_json_pg`
+  只试了 `i64`；Any 回退路径的 `i64::compatible` 是 `is_integer()`（全整数宽度），所以
+  `db.query` 一直正常，只有流式受影响。现补 `i16`/`i32` 两个分支，与查询路径逐值对齐。
+  真库回归用例 `real_pg_stream_decodes_common_numeric_types`（同时钉死 `real`/FLOAT4 在**两条**
+  路径上都保持「不支持 + cast 指引」，避免只补一头造成分叉）。`oj-db-postgres` 0.1.1 → 0.1.2
+  （ABI 不变，可原地替换）。仍未解码的类型（`real`/`jsonb`/`numeric`/`uuid`/时间戳/数组等）
+  继续响亮报错并给出 `cast` 指引。
+
+### docs(db) / tools — 方言接入资料与 db 轴模板（阶段三的无库切片）
+
+`oj-db-oracle` / `oj-db-dameng`（阶段二）仍卡在达梦 DPI 再分发许可与 Go triple 矩阵两道外部门禁上，
+故先落地**不需要真库与外部许可**的那部分：类型映射表、conformance 清单、可拷贝的 db 轴骨架。
+
+- `docs/db-guide.md` 新增 **§10.6 类型映射表与值契约（跨方言）**：六类 schema 类型 ×
+  sqlite/mysql/pg/oracle/DM8 的 DDL 映射（后两列标注「M2 方案级 / 待真库复核」，不作生产依据）、
+  读侧 JSON/JS 值契约、三内置方言读侧边界表（点名 **sqlite 仍会静默 `null`** 属历史包袱、新插件勿照抄），
+  以及新方言四条硬要求——其中「禁止 `Unknown` 静默当 text」在写下时确有其事（核心侧
+  `from_schema_type` 兜底把 `type: varchar` 归 `Unknown` 按文本处理，租户守卫因此在 PG 上退化成
+  `operator does not exist: bigint = text`）；该缺口已由下节 `fix(schema)` 闭合，本段留作背景。
+- `docs/plugins/plugin-development.md` 新增 **§15 新增数据库方言 conformance 清单**：五步接入、
+  8 能力位注册表（逐能力位写明宿主消费点 + 正例 + 反例）、错误映射骨架（含 dbx 侧二手证据的达梦
+  错误码 `-5669` / `-6118` / `-3325` / `-2207`，明确标注待 M2 真库复核且**不得照搬 Oracle 编号**）、
+  sidecar 五条生命周期契约、发布形态与排障入口，以及 14 条可直接拷进 PR 的验收清单。
+- 新增 `tools/plugin-template-db`：**db 轴 cdylib 插件骨架**（`demo` 方言，进程内，不连真库）。
+  `describe()` 能力位自报 / 结构化错误信封（8 类 × 5 字段，用枚举而非字符串防 typo）/
+  流式三态信封（`rows`·`done`·`error`，绝不裸 `null`）/ 句柄·事务·游标生命周期全部摆全，
+  11 个自检用例逐条对应 §15.6。能力位与行为由**同一组常量**驱动：翻转 `SUPPORTS_STREAM` /
+  `SUPPORTS_CANCEL` 后套件仍全绿（声明与实现不会漂移）。真实驱动只需替换 12 个 `do_*`。
+  不进 workspace members（与既有泛型轴模板 `tools/plugin-template` 同款：拷贝使用的骨架）。
+- 交叉引用：§10.5 能力矩阵、§10.6、§15 与模板 README 四向互指，运维侧仍以 `api-manual.md`
+  「结构化数据库错误」为准。
+
+### fix(schema) — 列类型不再静默降级成 text
+
+- **复核结论（先纠正一处自己的文档判断）**：`schema.yaml` 这条路上未知类型**本来就被拒**——
+  `SchemaFile::parse` 在声明期点名原串 + 列出支持清单（`type: varchar` 会得到
+  `schema: 表 "t".tenant_id: 未知列类型 "varchar"（支持 integer/bigint/text/boolean/double/blob；
+  其余类型请写 migrations/NNNN__desc.sql）`）。真正的静默降级只存在于核心侧：`ColumnType::
+  from_schema_type` 的兜底分支把不认识的串归 `Unknown`，而 `Unknown` 的语义是「按 text 处理」。
+- 收紧为**不可能静默**：`ColumnType::from_schema_type` 返回 `Option<Self>`（不再兜底），并新增
+  `ColumnType::SCHEMA_TYPES` 作为六类词汇表的唯一来源（解析、错误文案、校验共用，杜绝两处清单
+  漂移）；`SchemaFile::registry_tables()` 返回 `Result`，未识别类型**拒载并点名 表.列**——
+  即使有人绕过 `parse()` 直接反序列化，也走不到「当 text」。
+- 顺带删掉 `oj/src/schema.rs` 里与核心重复的 `ColType` 枚举（同一份词汇表原本有两处定义），
+  DDL 生成与 `validate_tenant` 改为直接判 `ColumnType`。
+- 影响面：`schema.yaml` 正常路径**文案与行为逐字不变**（错误串仍由同一份词汇表拼出）；只有
+  「绕过 parse 的路径」从静默降级变为拒载。`Unknown` 语义收窄为「列类型未声明」（旧装配路径
+  `table()` / 既有夹具），仍按 v0.1.23 行为处理——这条向后兼容契约有专测钉死
+  （`unknown_column_type_tenant_still_binds_text`：取「纯数字租户头」做判别，`Unknown` 一旦
+  被误当数值，绑定参数会从 `"7"` 变 `7`，断言立刻红）。
+- 测试：`from_schema_type_maps_exactly_the_six_declared_names`（六项全命中且不落 `Unknown`）、
+  `from_schema_type_never_silently_falls_back`（11 个应拒串：`varchar`/`VARCHAR(64)`/`jsonb`/
+  `INTEGER`/`int`/空白变体等一律 `None`）、`registry_tables_rejects_unknown_type_even_when_parse_is_bypassed`
+  （刻意用 `serde_yaml` 绕过 parse 的对抗用例）、`unknown_column_type_tenant_still_binds_text`
+  （旧路径 `Unknown` 仍绑字符串，锁死兼容面）+ 真机 `oj serve` 双向验证（`varchar` 拒启并点名、
+  改 `text` 后正常建表启动）。
+
+### docs(db) / ops — `db.dialect()` 迁移范式 + 运维插件面（M3 收尾切片）
+
+M3 的 5 个任务域至此全部落地（前 3 个见上一节的方言资料/模板；本节补余下 2 个）。
+两域原本挂在「等 M2 真库」上，复核后确认**结构性内容不依赖真库**：迁移范式的方向恰恰是
+「不要按方言名分派」，而运维手册里的报错文案可以**逐字取自当前已实现的代码**。
+
+- `docs/db-guide.md` 新增 **§10.7 `db.dialect()` 的红字与迁移范式**：方言名是开放集（插件
+  `describe()` 声明什么就是什么），`if (d === "mysql") A else B` 会在新方言接入后把 B **静默**
+  发给它（占位符风格错、`ON DUPLICATE KEY` 发给 Oracle），报错却落在引擎侧。给出三档迁移
+  （① 删掉：占位符 / 取 id / 列目录 / 取号都由宿主或平台 API 吸收；② 换问法：能力问题直接调用
+  并接 `OJ_DB_UNSUPPORTED`；③ 保留：真方言特有 SQL 用**白名单对象键 + 未知方言 `throw`**），
+  附反面样例与「别把 `dialect()` 缓存成模块常量」「别在 handler 里按 `caps` 分派」两条边界。
+- `docs/devkit/api-manual.md`：`db.dialect()` 行与「方言边界」块补同一条红线；**scenarios 新增
+  场景 45**（删分支对照表 + 可照抄的 `_shared/dialect.ts` + 验证步骤 + 五个常见坑）；
+  `SKILL.md` 陷阱速查 +1 行（同口径）；`devkit/README.md` v0.1.88 段落纳入场景 45。
+- `docs/ops-manual.md`：**§1.2 插件目录与清单锁**（发布物形态、三条纪律、锁与实物不一致的
+  四种情形逐字表）、**§6.1 装配期日志**（7 行逐字日志 + 级别 + 含义，`host ABI_VERSION` /
+  `plugin … | caps:` 为权威现场）、**§7 排障表 +8 行**（ABI mismatch、锁外文件、identity
+  mismatch、符号缺失、能力串 typo、fingerprint 告警、运行期 `OJ_DB_UNSUPPORTED` 的两种成因、
+  插件没装上）、**§8.1 回滚三元组**（`bin/oj` + `bin/plugins/<triple>/` + `dist/` 为什么不能
+  单换、五步回滚命令、回滚后三项核对、迁移不回滚）。
+- 文案一致性口径：`plugin ABI mismatch` / `plugin file not in plugins.lock.json` /
+  `plugin identity mismatch` / `plugin symbol missing` / `plugin db capability error` 及两条
+  `[oj-plugin]` 告警，全部逐字对齐 `src/bridge/plugin_loader.rs` 的 `Display` 实现；
+  横幅格式对齐 `oj/src/serve_cmd.rs::plugin_banner_line`。**M2 落地后需回填**的只剩
+  Oracle/DM 厂商错误码分布与 §10.6 两列（已在计划文档「M2 回填点」登记）。
+- `cargo xtask build` 归置 `bin/devkit/`；`cargo test --release -p xtask` 的 devkit 契约用例校验
+  产物与源一致。
 
 ## v0.1.87
 

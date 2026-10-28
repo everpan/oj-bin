@@ -907,16 +907,17 @@ pub fn op_db_allowed(state: &mut OpState) -> Result<Vec<Value>, JsErrorBox> {
     };
     let mut out: Vec<Value> = Vec::new();
     let mut names: Vec<String> = st.dbs.keys().cloned().collect();
-    // L3：动态登记库仅在 `db_access.<name>` 显式声明时才进连接树（避免「假入口」——
-    // 未声明的动态库默认 deny，不该出现在「可用连接」列表里）。
+    // L3：动态登记库仅在 `db_access.<name>` 显式声明（或 U-1 运行期 grant）时才进连接树
+    // （避免「假入口」——未声明的动态库默认拒所有人，不该出现在「可用连接」列表里）。
     for n in st.client_dbs.names() {
-        if st.db_access.by_db.contains_key(&n) {
+        if st.db_access.by_db.contains_key(&n) || super::db_policy::has_runtime_grant(&st, &n) {
             names.push(n);
         }
     }
     names.sort();
     for alias in &names {
-        let policy = st.db_access.policy_for(alias);
+        // 必须走含运行期 grant 的归一策略，否则运行期授权的库在 `db.allowed()` 里仍是假入口。
+        let policy = super::db_policy::policy_for_state(&st, alias);
         if !super::db_policy::granted(&policy.allow, &ctx) {
             continue;
         }

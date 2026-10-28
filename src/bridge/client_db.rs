@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::StableState;
 use super::db::DataAccessor;
-use super::db_policy::{self, DbClientSection};
+use super::db_policy::{self, AllowList, DbAccess, DbClientSection, Enforce};
 
 /// 已登记动态数据源的逐别名记账条目。
 pub struct ClientDbEntry {
@@ -67,6 +67,9 @@ impl ClientDbEntry {
 pub struct ClientDbRegistry {
     inner: Mutex<HashMap<String, Arc<ClientDbEntry>>>,
     order: Mutex<Vec<String>>,
+    /// U-3 v0.1.93：逐别名世代号。register/re_register/remove 各 +1，作为跨 isolate
+    /// 失效单源（host 权威；JS 仅借 epoch 优化 wrapper 新鲜度，正确性不依赖 JS 持有的 epoch）。
+    epoch: Mutex<HashMap<String, u64>>,
     /// per-process 硬上限（连接池数封顶）。
     max_entries: usize,
 }
@@ -76,12 +79,29 @@ impl ClientDbRegistry {
         Self {
             inner: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            epoch: Mutex::new(HashMap::new()),
             max_entries,
         }
     }
 
     pub fn cap(&self) -> usize {
         self.max_entries
+    }
+
+    /// U-3 v0.1.93：取别名的当前世代号（未登记 = 0）。host 权威，供 `op_db_epoch` 读取。
+    pub fn epoch_of(&self, name: &str) -> u64 {
+        self.epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 世代号 +1（register/re_register/remove 共用）。
+    fn bump_epoch(&self, name: &str) {
+        let mut g = self.epoch.lock().unwrap_or_else(|e| e.into_inner());
+        *g.entry(name.to_string()).or_insert(0) += 1;
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -109,6 +129,7 @@ impl ClientDbRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(name.to_string());
+        self.bump_epoch(name);
         Ok(())
     }
 
@@ -121,6 +142,7 @@ impl ClientDbRegistry {
             ));
         }
         g.insert(name.to_string(), Arc::new(entry));
+        self.bump_epoch(name);
         Ok(())
     }
 
@@ -153,6 +175,7 @@ impl ClientDbRegistry {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|n| n != name);
+            self.bump_epoch(name);
         }
         removed
     }
@@ -184,7 +207,11 @@ fn client_err(reason: &str, detail: &str) -> JsErrorBox {
 }
 
 /// 登记门：enforce=false → disabled；否则按 `allow` 四维并集判定（asSystem 不豁免）。
-fn client_gate(state: &Rc<RefCell<OpState>>, section: &DbClientSection) -> Result<(), JsErrorBox> {
+/// `pub(crate)`：U-1 的 `db.access.grant/revoke` op（db.rs）复用同一特权门。
+pub(crate) fn client_gate(
+    state: &Rc<RefCell<OpState>>,
+    section: &DbClientSection,
+) -> Result<(), JsErrorBox> {
     if !section.enabled {
         return Err(client_err(
             "db_client_disabled",
@@ -412,6 +439,140 @@ pub fn op_db_client_list(
 #[op2(fast)]
 pub fn op_db_client_has(state: &mut OpState, #[string] name: &str) -> bool {
     state.borrow::<Arc<StableState>>().client_dbs.contains(name)
+}
+
+/// U-3 v0.1.93：取别名的当前世代号（host 权威）。同步读 map，无特权。JS 侧 `DB(name)`
+/// 借 epoch 判断 wrapper 是否过期——但**正确性不依赖 JS 持有的 epoch**（查询 op 按名从
+/// host registry 重解析 accessor），恶意 handler 覆写 `cached.epoch` 也无法复用已删连接。
+#[op2]
+#[serde]
+pub fn op_db_epoch(state: &mut OpState, #[string] name: &str) -> u64 {
+    state.borrow::<Arc<StableState>>().client_dbs.epoch_of(name)
+}
+
+/// U-1 v0.1.93：动态授权审计（安全敏感度高于 register）：结构化事件，含 allow 维。
+fn audit_access(state: &Rc<RefCell<OpState>>, action: &str, alias: &str, allow: &AllowList) {
+    let g = state.borrow();
+    let st = g.borrow::<Arc<StableState>>();
+    let rs = g.borrow::<super::ReqState>();
+    let module = rs.module.clone();
+    let source = if st.tasks_flag.is_some() {
+        "task"
+    } else {
+        "http"
+    };
+    let operator = db_policy::operator_of(rs.req.user.as_ref());
+    let tenant = if rs.req.anonymous {
+        None
+    } else {
+        rs.req.tenant_id.clone()
+    };
+    eprintln!(
+        "DB_ACCESS_AUDIT: action={action} alias={alias} allow={allow:?} operator={operator:?} module={module:?} tenant={tenant:?} source={source}"
+    );
+}
+
+/// U-1 v0.1.93：运行期动态授权 `grant`。命名归 `db.access.grant`（访问控制域，非
+/// `db.client` 登记域）。与 `db.client.register` **同特权门**（`db_client.allow` 四维并集、
+/// fail-closed），且必须发 `audit()`。
+///
+/// 语义：把 `alias` 的访问**放行维**（allow：角色/主体四维并集）注入运行表，使被授权主体
+/// 无需重启即对该库可读（默认 read-only）。撤销见 [`op_db_access_revoke`]。
+///
+/// 安全约束：
+/// - `allow` 必须非空（任一维已声明）；空 allow 视为「对全员放行」→ 拒（对抗用例）。
+/// - 只注入放行维，绝不携带 `enforce=Off` 覆盖 config 的 Deny/Read-only/max_rows（防提权）。
+/// - 撤销他人的 config 兜底（无运行期项）显式报错；`revoke` 仅回落 config（非删 config）。
+#[op2]
+#[serde]
+pub async fn op_db_access_grant(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[serde] allow: serde_json::Value,
+    #[serde] opts: Option<serde_json::Value>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let section = state
+        .borrow()
+        .borrow::<Arc<StableState>>()
+        .db_client
+        .clone();
+    client_gate(&state, &section)?;
+    let st = state.borrow().borrow::<Arc<StableState>>().clone();
+    // 别名必须存在（静态 config 库或动态登记库）；不允许对不存在的库授权。
+    if !st.dbs.contains_key(&name) && !st.client_dbs.contains(&name) {
+        return Err(JsErrorBox::generic(format!(
+            "db access grant: alias {name:?} does not exist (configure it under db: or register via db.client first)"
+        )));
+    }
+    let allow_list: AllowList = serde_json::from_value(allow.clone())
+        .map_err(|e| JsErrorBox::generic(format!("db access grant: invalid allow: {e}")))?;
+    // 空 allow = 对全员放行，运行时授权严禁（违背「按角色授权」）→ 拒。
+    if allow_list.is_unrestricted() {
+        return Err(JsErrorBox::generic(
+            "db access grant: allow must restrict at least one dimension (modules/roles/tenants/sources); granting to everyone is forbidden",
+        ));
+    }
+    // read_only 默认 true（安全默认：运行期 grant 即读授权）；仅动态别名生效，静态别名
+    // 忽略（config 兜底的安全位不可被运行期项放通）。
+    let read_only = opts
+        .as_ref()
+        .and_then(|o| o.get("readOnly"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let entry = DbAccess {
+        // v0.1.93：grant = 白名单制（`deny` 档命中 allow 才放行）。用 `warn` 会变成
+        // 「只记日志不拒」，未授权主体照样能查——那不是授权。
+        enforce: Enforce::Deny,
+        read_only,
+        allow_ddl: false,
+        allow_dangerous: false,
+        max_rows: None,
+        allow: allow_list.clone(),
+    };
+    st.db_access_rt
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.clone(), entry);
+    audit_access(&state, "grant", &name, &allow_list);
+    Ok(serde_json::json!({
+        "ok": true,
+        "alias": name,
+        "readOnly": read_only,
+        "allow": allow,
+    }))
+}
+
+/// U-1 v0.1.93：运行期动态授权 `revoke`。与 `grant` 同特权门、同审计。
+///
+/// 只接受**运行期表项**；若别名仅有 config 兜底（无运行期 grant）则显式报错（不静默），
+/// 防「任何过 allow 的主体撤销他人运行时授权」的越权 / DoS。revoke 后该别名回落 config
+/// （非删 config）。
+#[op2]
+pub async fn op_db_access_revoke(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+) -> Result<bool, JsErrorBox> {
+    let section = state
+        .borrow()
+        .borrow::<Arc<StableState>>()
+        .db_client
+        .clone();
+    client_gate(&state, &section)?;
+    let st = state.borrow().borrow::<Arc<StableState>>().clone();
+    let (removed, removed_allow) = {
+        let mut g = st.db_access_rt.lock().unwrap_or_else(|e| e.into_inner());
+        match g.remove(&name) {
+            Some(entry) => (true, entry.allow),
+            None => (false, AllowList::default()),
+        }
+    };
+    if !removed {
+        return Err(JsErrorBox::generic(format!(
+            "db access revoke: alias {name:?} has no runtime access grant (only config-backed policy exists; nothing to revoke, config unchanged)"
+        )));
+    }
+    audit_access(&state, "revoke", &name, &removed_allow);
+    Ok(removed)
 }
 
 #[cfg(test)]

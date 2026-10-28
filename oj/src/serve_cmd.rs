@@ -593,6 +593,10 @@ fn diff_configs(
             // 特权模块可热改自己的白名单（自提权链）。归 restart_pending：验证合法
             // 但必须重启生效，HTTP 与 JS 回调两侧一致。
             "platform" | "fs" => restart_pending.push((*key).to_string()),
+            // U-1 v0.1.93：访问控制策略段（`db_access:` / `db_client:`）改动**不强行热生效**
+            // —— StableState 不可变，强行热改会破坏红线。纳入已知键并标 restart_pending，
+            // 让运维明确知道「改了这两段必须重启」，消除旧授权静默盲区的误标 `applied`。
+            "db_access" | "db_client" => restart_pending.push((*key).to_string()),
             "server" => kept_listener.push((*key).to_string()),
             _ => applied.push((*key).to_string()),
         }

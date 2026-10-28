@@ -14,7 +14,7 @@
 | 文档 | 用途 |
 |---|---|
 | `docs/plugins/plugin-development.md` §15 | 接入全流程；§15.2 能力位注册表（每能力位一正一反），§15.6 可直接拷进 PR 的自查表 |
-| `docs/db-guide.md` §10.6 | 六类 schema 类型的 DDL 映射 + 读侧 JS 值契约 |
+| `docs/devkit/db-guide.md` §10.6 | 六类 schema 类型的 DDL 映射 + 读侧 JS 值契约 |
 | `docs/plugins/plugin-development.md` §6 | FfiFuture 异步桥（唯一异步路径） |
 
 模板 crate **不进 workspace members**（它不是构建目标，是被拷贝的骨架）。骨架自带的空
@@ -133,7 +133,7 @@ OJ_PLUGINS_DIR=<plugins_dir> ./bin/oj serve -c <config.yaml> --api-path <src>
 
 - **不连真库、不做类型映射**：`query` 回显 SQL/参数，`exec` 恒返回 `0`。行转换三条硬要求
   （未识别列类型报错 / `>2^53-1` 出十进制串 / 布尔统一）写在 `do_query` 的注释里，
-  契约在 `docs/db-guide.md` §10.6；
+  契约在 `docs/devkit/db-guide.md` §10.6；
 - **`cancel` 只置标志**：真实驱动必须真的去杀服务端查询，否则超时看门狗白等；
 - **`stream` 游标全部物化在内存**：真实驱动应持服务端游标或分批 fetch；
 - **无 sidecar**：走子进程形态（如 Go/JDBC 桥）时，`§15.4` 的五条生命周期契约

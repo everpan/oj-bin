@@ -230,6 +230,10 @@ pub struct StableState {
     /// 运行期动态数据源注册表（L3 v0.1.91）：壳 `Arc` 不可变、内部 `Mutex` 变动，
     /// 与 `reload: Arc<OnceLock>` 同哲学，不破 StableState 不可变红线。
     pub client_dbs: Arc<client_db::ClientDbRegistry>,
+    /// 运行期动态授权表（U-1 v0.1.93）：壳 `Arc` 不可变、内部 `Mutex` 变动，不破红线。
+    /// 仅作用于「动态登记别名」（client_dbs 命中且非 config `db_access.by_db` 声明）：
+    /// grant 写入、revoke 移除；静态 config 兜底不受其影响（防运行时提权覆盖 config 的 deny）。
+    pub db_access_rt: Arc<Mutex<HashMap<String, db_policy::DbAccess>>>,
     /// 运行期连接工厂（与装配期同集：内置 sqlite/memory + 插件 mysql/postgres）。
     pub db_backend: Arc<db_backend::DbBackendRegistry>,
     /// sqlite 相对路径归一基准（connect DSN 用）；断言期 = config 目录。
@@ -314,6 +318,8 @@ pub struct Extras {
     pub db_client: Option<Arc<db_policy::DbClientSection>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
     pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
+    /// 运行期动态授权表（U-1 v0.1.93）。None = 空表（全库按 config 静态策略）。
+    pub db_access_rt: Option<Arc<Mutex<HashMap<String, db_policy::DbAccess>>>>,
     /// 运行期连接工厂（含插件 mysql/postgres）。None = 内置 builtin（sqlite/memory）。
     pub db_backend: Option<Arc<db_backend::DbBackendRegistry>>,
     /// sqlite 相对路径归一基准（connect 用）。None = 当前目录。
@@ -475,6 +481,9 @@ deno_core::extension!(
         client_db::op_db_client_re_register,
         client_db::op_db_client_list,
         client_db::op_db_client_has,
+        client_db::op_db_access_grant,
+        client_db::op_db_access_revoke,
+        client_db::op_db_epoch,
         blob::op_blob_put,
         blob::op_blob_get,
         blob::op_blob_del,
@@ -861,6 +870,9 @@ impl Bridge {
             client_dbs: extras
                 .client_dbs
                 .unwrap_or_else(|| Arc::new(client_db::ClientDbRegistry::new(16))),
+            db_access_rt: extras
+                .db_access_rt
+                .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             db_backend: extras
                 .db_backend
                 .unwrap_or_else(|| Arc::new(db_backend::DbBackendRegistry::builtin())),
@@ -2575,6 +2587,7 @@ mod tests {
             db_access: Arc::new(db_policy::DbAccessSection::default()),
             db_client: Arc::new(db_policy::DbClientSection::default()),
             client_dbs: Arc::new(client_db::ClientDbRegistry::new(16)),
+            db_access_rt: Arc::new(Mutex::new(HashMap::new())),
             db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),
             vars: Arc::new(HashMap::new()),

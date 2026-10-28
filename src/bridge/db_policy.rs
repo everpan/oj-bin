@@ -126,6 +126,30 @@ impl AllowList {
             && self.tenants.is_none()
             && self.sources.is_none()
     }
+
+    /// 逐维并集（U-1 运行期 grant 叠加到 config 白名单用）。
+    ///
+    /// 语义仍是「任一已声明维度命中即放行」，所以并集**只会放宽、不会收紧**：
+    /// 某维在任一侧未声明（= 不限制）时保持未声明。这正是「grant 只叠加、不删除」的含义——
+    /// 不会把 config 已授权的角色挤掉。
+    pub fn union_with(&mut self, other: &AllowList) {
+        fn merge(a: &mut Option<Vec<String>>, b: &Option<Vec<String>>) {
+            match (&mut *a, b) {
+                (None, _) | (_, None) => {} // 任一侧未声明 = 该维不限制
+                (Some(dst), Some(src)) => {
+                    for v in src {
+                        if !dst.contains(v) {
+                            dst.push(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        merge(&mut self.modules, &other.modules);
+        merge(&mut self.roles, &other.roles);
+        merge(&mut self.tenants, &other.tenants);
+        merge(&mut self.sources, &other.sources);
+    }
 }
 
 /// 单个库的访问策略。
@@ -704,20 +728,82 @@ pub fn evaluate(p: &DbAccess, ctx: &AccessCtx, c: &Classified) -> Verdict {
     }
 }
 
+/// 「拒绝所有人」的 allow 表达：**声明**了 `modules` 维但为空。
+///
+/// `AllowList` 的空表默认是「不限制」（`is_unrestricted`），无法用它表达拒绝；
+/// 而声明且为空的维在 `granted` 里永不命中——这正是 L3 动态库 fail-closed 需要的形态。
+fn deny_all_allow() -> AllowList {
+    AllowList {
+        modules: Some(Vec::new()),
+        ..Default::default()
+    }
+}
+
+/// 运行期是否给该别名发过 grant（U-1 v0.1.93）。
+pub(crate) fn has_runtime_grant(st: &StableState, alias: &str) -> bool {
+    st.db_access_rt
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(alias)
+}
+
 /// op 边界的访问控制入口：授权 → 分类 → 策略位 → 限额。
 ///
 /// `enforce: off`（默认）零开销早退，与升级前行为完全一致。
-/// 取某库的策略副本（装配期冻结，运行期只读）。
+/// 取某库的策略副本（装配期冻结，运行期只读 + U-1 运行期 grant 表）。
 fn policy_for(state: &Rc<RefCell<OpState>>, alias: &str) -> DbAccess {
     let g = state.borrow();
     let st = g.borrow::<Arc<StableState>>();
+    policy_for_state(st, alias)
+}
+
+/// `policy_for` 的纯函数内核（`db.allowed()` 只有 `&StableState`，也走同一套归一）。
+pub(crate) fn policy_for_state(st: &StableState, alias: &str) -> DbAccess {
+    // config 基线（defaults + 逐库覆盖合并）。
     let mut p = st.db_access.policy_for(alias);
-    // L3 fail-closed（v0.1.91）：动态登记别名若未在 `db_access.<name>` 显式声明，
-    // **默认 deny**——不让「登记即全员可查内网库」。置 `enforce=Deny`，由下方门禁统一拦截
-    // （`AllowList` 无「拒绝所有人」表达，故走 enforce 硬拦截，而非动 allow）。静态未知库仍
-    // 回落 defaults（向后兼容）。
-    if st.client_dbs.contains(alias) && !st.db_access.by_db.contains_key(alias) {
-        p.enforce = Enforce::Deny;
+    // L3 fail-closed（v0.1.91）判定用的「动态别名」标志：已动态登记且未在 `db_access.<name>`
+    // 显式声明 → 无 config 兜底，缺 grant 即 deny。
+    let is_dynamic = st.client_dbs.contains(alias) && !st.db_access.by_db.contains_key(alias);
+    // 档位语义（v0.1.93 校正）：`deny` 是「**拒绝违规**」，不是「忽略 allow 硬拦所有人」。
+    // L3 曾在 `granted_only` 里加过 Deny 短路，把 L1 的 allow 授权彻底废掉
+    // （`db_access: {defaults: {enforce: deny, allow: {roles: [admin]}}}` 连 admin 都进不去）；
+    // 同时 `deny` + 未写 `allow`（=`不限制主体`）也只剩「策略位照常执行」这一层含义。
+    // U-1 v0.1.93：运行期 grant 表（只增补 allow，不动 config 的安全位）。
+    let rt = st
+        .db_access_rt
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(alias)
+        .cloned();
+    match rt {
+        Some(entry) => {
+            if is_dynamic {
+                // 动态别名无 config 兜底：运行表项是完整策略（含其 read_only/max_rows 等）。
+                p = entry;
+            } else {
+                // 静态 / config 兜底别名：只动「放行维」allow，保留 config 的安全位
+                // （enforce/read_only/max_rows/allow_ddl/allow_dangerous）。
+                // config 未限制主体（allow 全缺省）→ grant 直接成为白名单；
+                // config 已有白名单 → 逐维并集（放宽，但不挤掉 config 已授权的角色）。
+                if p.allow.is_unrestricted() {
+                    p.allow = entry.allow.clone();
+                } else {
+                    p.allow.union_with(&entry.allow);
+                }
+                // grant 即「启用白名单制」：`off` 档下根本没有 enforce 判定，grant 会变成空操作，
+                // 故抬到 `deny`（命中放行 / 未命中拒），而不是 `warn`（只记日志、不拒）。
+                if p.enforce == Enforce::Off {
+                    p.enforce = Enforce::Deny;
+                }
+            }
+        }
+        None if is_dynamic => {
+            // L3 fail-closed：动态登记别名未声明于 `db_access.<name>` 且未运行期 grant →
+            // **默认拒所有人**——杜绝「登记即全员可查内网库」。静态未知库仍回落 defaults。
+            p.enforce = Enforce::Deny;
+            p.allow = deny_all_allow();
+        }
+        None => { /* 静态别名无运行表 → 原样 config 基线 */ }
     }
     p
 }
@@ -788,14 +874,8 @@ pub fn check_access_intent(
     if policy.enforce == Enforce::Off {
         return Ok(policy.max_rows); // 零开销：不分类、不取身份
     }
-    // enforce=Deny：硬拦截（fail-closed），授权维/风险分类不再放行——含 L3 未声明动态库。
-    if policy.enforce == Enforce::Deny {
-        let msg = format!(
-            "db access: alias {alias:?} is denied (enforce=deny)\n  (reason: db_not_granted)"
-        );
-        deny_log("deny", alias, Reason::NotGranted, &msg);
-        return Err(JsErrorBox::generic(msg));
-    }
+    // `enforce=deny` 不再短路硬拦：deny 是白名单制，未命中 allow 由 `evaluate` → `NotGranted`
+    // 精确拒绝；「拒绝所有人」已在 `policy_for` 规范化为声明且为空的 allow。
     let (module, roles, tenant, source) = identity(state);
     let ctx = AccessCtx {
         module: module.as_deref(),
@@ -873,14 +953,8 @@ pub fn granted_only(state: &Rc<RefCell<OpState>>, alias: &str) -> Result<(), JsE
     if policy.enforce == Enforce::Off {
         return Ok(());
     }
-    // enforce=Deny：硬拦截（fail-closed），授权维不再放行——含 L3 未声明动态库。
-    if policy.enforce == Enforce::Deny {
-        let msg = format!(
-            "db access: alias {alias:?} is denied (enforce=deny)\n  (reason: db_not_granted)"
-        );
-        deny_log("deny", alias, Reason::NotGranted, &msg);
-        return Err(JsErrorBox::generic(msg));
-    }
+    // `enforce=deny` 不再短路硬拦：deny 是白名单制，命中 allow 放行、未命中由下方 `granted`
+    // 拒绝；「拒绝所有人」已由 `policy_for` 规范化为声明且为空的 allow。
     let (module, roles, tenant, source) = identity(state);
     let ctx = AccessCtx {
         module: module.as_deref(),
@@ -1328,6 +1402,26 @@ mod behavior {
         )
     }
 
+    /// U-1 运行期授权的特权门（`db_client.allow`），供 grant/revoke 用例复用。
+    fn bridge_with_client(
+        db: Arc<dyn DataAccessor>,
+        policy: DbAccessSection,
+        client: DbClientSection,
+    ) -> Bridge {
+        Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                db_access: Some(Arc::new(policy)),
+                db_client: Some(Arc::new(client)),
+                ..Default::default()
+            },
+        )
+    }
+
     /// 跑一段 JS，返回信封；失败（code != 0）返回 msg 便于断言原因串。
     async fn run(b: &Bridge, req: RequestInfo, js: &str) -> (i64, String, serde_json::Value) {
         let cap = b.run_with(js, req).await.unwrap();
@@ -1705,6 +1799,230 @@ mod behavior {
         assert_eq!(list[0]["read_only"], json!(true));
         assert_eq!(list[0]["max_rows"], json!(5));
         assert_eq!(list[0]["enforce"], json!("deny"));
+    }
+
+    // ---- U-1 运行期动态授权（v0.1.93） ----
+    //
+    // 对抗性口径：grant 必须真的「拒」未授权主体（`warn` 档只记日志、不拒——那不是授权）；
+    // 必须不能放宽 config 的安全位；必须不能被无特权主体调用。
+
+    /// `off` 档（默认）上一旦 grant，该别名立刻变成**白名单**：命中放行、未命中拒。
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_grant_turns_off_tier_into_a_whitelist() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let b = bridge_with_client(
+            db,
+            DbAccessSection::default(),
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let grant = r#"(async () => {
+            const r = await db.access.grant("default", { roles: ["admin"] });
+            json.ok({ r, epoch: db.epoch("no-such-alias") });
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (code, msg, data) = run(&b, req_user(&["admin"]), grant).await;
+        assert_eq!(code, 0, "grant 本身不得失败：{msg}");
+        assert_eq!(data["r"]["ok"], json!(true), "{data}");
+        // 未知别名的 epoch 恒为 0（不是错误、不是随机值——JS 侧据此判断缓存新鲜度）。
+        assert_eq!(data["epoch"], json!(0), "{data}");
+        // 命中 → 放行
+        let (_, _, data) = run(&b, req_user(&["admin"]), JS_READ).await;
+        assert_eq!(data["n"], json!(0), "grant 命中应放行：{data}");
+        // 未命中 → 拒（grant 之前是 off = 全员放通；grant 之后必须拒，否则「授权」是假的）
+        let (_, _, data) = run(&b, req_user(&["guest"]), JS_READ).await;
+        assert!(
+            data["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("db_not_granted"),
+            "未授权角色不得放行：{data}"
+        );
+        let (_, _, data) = run(&b, RequestInfo::default(), JS_READ).await;
+        assert!(
+            data["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("db_not_granted"),
+            "无身份不得放行：{data}"
+        );
+        // `db.allowed()` 与授权同源：授权角色看得到，未授权角色看到的是空表（不留假入口）。
+        let (_, _, data) = run(&b, req_user(&["admin"]), "json.ok({list: db.allowed()});").await;
+        assert_eq!(data["list"].as_array().unwrap().len(), 1, "{data}");
+        let (_, _, data) = run(&b, req_user(&["guest"]), "json.ok({list: db.allowed()});").await;
+        assert_eq!(data["list"], json!([]), "未授权不得进连接树：{data}");
+    }
+
+    /// grant **只注入放行维**：`opts.readOnly=false` 也不得放开 config 的 `read_only`。
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_grant_never_relaxes_config_policy_bits() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Deny,
+                read_only: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with_client(
+            db,
+            pol,
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let grant = r#"(async () => {
+            const r = await db.access.grant("default", { roles: ["admin"] }, { readOnly: false });
+            json.ok({ r });
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (code, msg, _) = run(&b, req_user(&["admin"]), grant).await;
+        assert_eq!(code, 0, "{msg}");
+        // config 的 read_only 是安全位，运行期 grant 不得削它 → 写仍被拒（原因仍是 db_read_only，
+        // 不是 db_not_granted：说明授权已过、拦在策略位上）。
+        let (_, _, data) = run(&b, req_user(&["admin"]), JS_WRITE).await;
+        let err = data["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("db_read_only"),
+            "grant 不得放开 read_only：{err}"
+        );
+        assert!(!err.contains("db_not_granted"), "授权应已通过：{err}");
+    }
+
+    /// config 已有白名单时，grant 是**逐维并集**：不挤掉 config 已授权的角色。
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_grant_unions_with_config_allow() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                enforce: Enforce::Deny,
+                allow: AllowList {
+                    roles: Some(vec!["admin".into()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with_client(
+            db,
+            pol,
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let grant = r#"(async () => {
+            const r = await db.access.grant("default", { roles: ["guest"] });
+            json.ok({ r });
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (code, msg, _) = run(&b, req_user(&["admin"]), grant).await;
+        assert_eq!(code, 0, "{msg}");
+        // config 里的 admin 仍在（并集，不是替换）
+        let (_, _, data) = run(&b, req_user(&["admin"]), JS_READ).await;
+        assert_eq!(
+            data["n"],
+            json!(0),
+            "config 已授权的主语不得被 grant 挤掉：{data}"
+        );
+        // 新授予的 guest 也进得来
+        let (_, _, data) = run(&b, req_user(&["guest"]), JS_READ).await;
+        assert_eq!(data["n"], json!(0), "grant 追加的主语应放行：{data}");
+        // 都没声明的角色仍被拒（并集不等于「全员放通」）
+        let (_, _, data) = run(&b, req_user(&["ops"]), JS_READ).await;
+        assert!(
+            data["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("db_not_granted"),
+            "{data}"
+        );
+    }
+
+    /// revoke 只撤运行期项、回落 config；没有运行期项时**显式报错**（不静默、不代表删了 config）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoke_without_runtime_grant_is_explicit_error() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let b = bridge_with_client(
+            db,
+            DbAccessSection::default(),
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let js = r#"(async () => {
+            try { await db.access.revoke("default"); json.ok({ok: true}); }
+            catch (e) { json.ok({err: String(e)}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_, _, data) = run(&b, req_user(&["admin"]), js).await;
+        let err = data["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("no runtime access grant"),
+            "应显式说明无运行期项：{err}"
+        );
+        // grant → revoke → 回落 config（off = 全员放通）
+        let round = r#"(async () => {
+            await db.access.grant("default", { roles: ["admin"] });
+            await db.access.revoke("default");
+            json.ok({ok: true});
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (code, msg, _) = run(&b, req_user(&["admin"]), round).await;
+        assert_eq!(code, 0, "{msg}");
+        let (_, _, data) = run(&b, RequestInfo::default(), JS_READ).await;
+        assert_eq!(
+            data["n"],
+            json!(0),
+            "revoke 后应回落 config（off 档全员放通）：{data}"
+        );
+    }
+
+    /// grant / revoke 走 `db_client.allow` 特权门：未授权主体不得改他人的运行期授权。
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_grant_requires_client_gate() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let b = bridge_with_client(
+            db,
+            DbAccessSection::default(),
+            DbClientSection {
+                enabled: true,
+                allow: AllowList {
+                    roles: Some(vec!["admin".into()]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let js = r#"(async () => {
+            try { await db.access.grant("default", { roles: ["guest"] }); json.ok({ok: true}); }
+            catch (e) { json.ok({err: String(e)}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_, _, data) = run(&b, req_user(&["guest"]), js).await;
+        let err = data["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("db_client_not_authorized"),
+            "越权 grant 必须被门挡：{err}"
+        );
+        // 特权主体可以
+        let (_, _, data) = run(&b, req_user(&["admin"]), js).await;
+        assert_eq!(data["ok"], json!(true), "{data}");
     }
 
     /// warn 档：只告警放行（灰度用），语句照常执行。

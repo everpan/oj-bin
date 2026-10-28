@@ -9,15 +9,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::Stream;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::any::{Any, AnyArguments};
 use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
-use sqlx::{Column, Row};
+use sqlx::{Column, Row, TypeInfo};
 
 use super::db::{Dialect, dialect_of};
+use super::db_error::{BridgeError, DbErrorCategory, SessionDisposition};
 use super::dialect_caps::{DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle};
 use super::{BridgeResult, DataAccessor, Row as JsRow};
+use crate::secret::redact;
 
 /// 基于 sqlx AnyPool 的 DataAccessor 实现。
 pub struct SqlxAccessor {
@@ -40,7 +42,7 @@ impl SqlxAccessor {
         let pool = opts
             .connect(url)
             .await
-            .map_err(|e| format!("sqlx connect: {e}"))?;
+            .map_err(|e| sqlite_err(&e, "connect"))?;
         let dialect = dialect_of(url);
         Ok(Self {
             pool,
@@ -98,33 +100,67 @@ fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &Value) -> Query<'q, Any, 
     }
 }
 
+/// sqlite 错误 → 结构化信封（U-8，v0.1.93）。
+///
+/// 与 FFI 面同形（`DbErrorCategory` 八值 + `retryable` + `sessionDisposition`）。
+/// 关键纪律：**凭据脱敏**——sqlx 错误含 DSN（含凭据），`message` 必须过 `redact`。
+/// 映射按 SQLite 主错误码：5/6=BUSY/LOCKED（连接级、可重试、Reset）；19=CONSTRAINT；
+/// 1=SQLITE_ERROR（语法）；Io/PoolTimedOut/WorkerCrashed=连接；其余=Internal。
+fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {
+    use DbErrorCategory as C;
+    let (category, retryable, session_disposition) = match e {
+        sqlx::Error::Io(_) => (C::Connection, false, SessionDisposition::Keep),
+        sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
+            (C::Connection, true, SessionDisposition::Reset)
+        }
+        sqlx::Error::RowNotFound => (C::Internal, false, SessionDisposition::Keep),
+        sqlx::Error::Database(d) => match d.code().and_then(|c| c.parse::<i32>().ok()) {
+            Some(5) | Some(6) => (C::Connection, true, SessionDisposition::Reset),
+            Some(19) => (C::Constraint, false, SessionDisposition::Keep),
+            Some(1) => (C::Syntax, false, SessionDisposition::Keep),
+            _ => (C::Internal, false, SessionDisposition::Keep),
+        },
+        _ => (C::Internal, false, SessionDisposition::Keep),
+    };
+    let message = redact(&format!("sqlx {ctx}: {e}"));
+    BridgeError {
+        category,
+        retryable,
+        session_disposition,
+        message,
+        data: Map::new(),
+    }
+}
+
 /// 单行 AnyRow -> serde_json::Value（逐列按类型探测）。
-/// ponytail: 列名键必须 owned String（serde_json::Map 契约），无法整体免分配——
-/// 真要消掉得换流式序列化直写输出，收益配不上改动面。with_capacity 只免宽行 rehash。
-fn row_to_json(row: &sqlx::any::AnyRow) -> Value {
+///
+/// 返回 `Result`：未知列类型**显式报错**，绝不静默丢值为 `Null`（U-6 / 对抗用例）。
+fn row_to_json(row: &sqlx::any::AnyRow) -> Result<Value, String> {
     let mut obj = serde_json::Map::with_capacity(row.columns().len());
     for col in row.columns() {
         let name = col.name().to_string();
         let ordinal = col.ordinal();
-        let val = column_json(row, ordinal).unwrap_or(Value::Null);
+        let val = column_json(row, ordinal)?;
         obj.insert(name, val);
     }
-    Value::Object(obj)
+    Ok(Value::Object(obj))
 }
 
 /// 逐列尝试常见类型，首个成功者转 JSON。
-fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
+///
+/// 未知类型（sqlite 动态类型下极罕见）→ 显式 `Err`，由 `row_to_json` 上抛，不静默丢值。
+fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Result<Value, String> {
     if let Ok(v) = row.try_get::<Option<bool>, _>(ordinal) {
-        return Some(Value::from(v));
+        return Ok(Value::from(v));
     }
     if let Ok(v) = row.try_get::<Option<i64>, _>(ordinal) {
-        return Some(match v {
+        return Ok(match v {
             Some(i) => Value::from(i),
             None => Value::Null,
         });
     }
     if let Ok(v) = row.try_get::<Option<f64>, _>(ordinal) {
-        return Some(match v {
+        return Ok(match v {
             Some(f) => serde_json::Number::from_f64(f)
                 .map(Value::Number)
                 .unwrap_or(Value::Null),
@@ -132,18 +168,21 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
         });
     }
     if let Ok(v) = row.try_get::<Option<String>, _>(ordinal) {
-        return Some(match v {
+        return Ok(match v {
             Some(s) => Value::String(s),
             None => Value::Null,
         });
     }
     if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(ordinal) {
-        return Some(match v {
+        return Ok(match v {
             Some(b) => Value::String(String::from_utf8_lossy(&b).into_owned()),
             None => Value::Null,
         });
     }
-    None
+    let ty = row.column(ordinal).type_info().name().to_string();
+    Err(format!(
+        "unsupported sqlite column type: {ty} (column ordinal {ordinal})"
+    ))
 }
 
 /// sqlx 事务会话：`Pool::begin` 产 `Transaction<'static, Any>`；Mutex 串行并发 op，
@@ -175,8 +214,11 @@ impl super::db::TxSession for SqlxTx {
         let rows = q
             .fetch_all(&mut **tx)
             .await
-            .map_err(|e| format!("sqlx tx query: {e}"))?;
-        Ok(rows.iter().map(row_to_json).collect())
+            .map_err(|e| sqlite_err(&e, "tx query"))?;
+        Ok(rows
+            .iter()
+            .map(row_to_json)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn exec(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
@@ -195,7 +237,7 @@ impl super::db::TxSession for SqlxTx {
         let res = q
             .execute(&mut **tx)
             .await
-            .map_err(|e| format!("sqlx tx exec: {e}"))?;
+            .map_err(|e| sqlite_err(&e, "tx exec"))?;
         Ok(res.rows_affected() as i64)
     }
 
@@ -203,9 +245,7 @@ impl super::db::TxSession for SqlxTx {
         let Some(tx) = self.tx.lock().await.take() else {
             return Err("tx finished".into());
         };
-        tx.commit()
-            .await
-            .map_err(|e| format!("sqlx tx commit: {e}"))?;
+        tx.commit().await.map_err(|e| sqlite_err(&e, "tx commit"))?;
         Ok(())
     }
 
@@ -215,7 +255,7 @@ impl super::db::TxSession for SqlxTx {
         };
         tx.rollback()
             .await
-            .map_err(|e| format!("sqlx tx rollback: {e}"))?;
+            .map_err(|e| sqlite_err(&e, "tx rollback"))?;
         Ok(())
     }
 
@@ -239,7 +279,7 @@ impl DataAccessor for SqlxAccessor {
             .pool
             .begin()
             .await
-            .map_err(|e| format!("sqlx tx begin: {e}"))?;
+            .map_err(|e| sqlite_err(&e, "tx begin"))?;
         Ok(Box::new(SqlxTx {
             tx: tokio::sync::Mutex::new(Some(tx)),
             info: self.dialect_info.clone(),
@@ -258,8 +298,11 @@ impl DataAccessor for SqlxAccessor {
         let rows = q
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| format!("sqlx query: {e}"))?;
-        Ok(rows.iter().map(row_to_json).collect())
+            .map_err(|e| sqlite_err(&e, "query"))?;
+        Ok(rows
+            .iter()
+            .map(row_to_json)
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
@@ -274,7 +317,7 @@ impl DataAccessor for SqlxAccessor {
         let res = q
             .execute(&self.pool)
             .await
-            .map_err(|e| format!("sqlx exec: {e}"))?;
+            .map_err(|e| sqlite_err(&e, "exec"))?;
         Ok(res.rows_affected() as i64)
     }
 
@@ -302,8 +345,19 @@ impl DataAccessor for SqlxAccessor {
             use futures::StreamExt;
             while let Some(r) = rows.next().await {
                 match r {
-                    Ok(row) => yield Ok(row_to_json(&row)),
-                    Err(e) => { yield Err(e.to_string()); break; }
+                    Ok(row) => match row_to_json(&row) {
+                        Ok(v) => yield Ok(v),
+                        // 解码错误（如未知列类型）显式上报，不静默丢值。
+                        Err(e) => {
+                            yield Err(e);
+                            break;
+                        }
+                    },
+                    // 流内错误脱敏（sqlx 错误可能含 DSN/凭据），保持与 query 同纪律。
+                    Err(e) => {
+                        yield Err(redact(&e.to_string()));
+                        break;
+                    }
                 }
             }
         };

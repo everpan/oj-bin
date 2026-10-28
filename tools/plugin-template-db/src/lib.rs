@@ -8,7 +8,7 @@
 //! 配套文档（先读）：
 //! - `docs/plugins/plugin-development.md` §15「新增数据库方言 conformance 清单」
 //!   ——§15.2 是能力位注册表（每能力位一正一反），§15.6 是可直接拷进 PR 的自查表；
-//! - `docs/db-guide.md` §10.6「类型映射表与值契约」——六类 schema 类型的 DDL 映射与
+//! - `docs/devkit/db-guide.md` §10.6「类型映射表与值契约」——六类 schema 类型的 DDL 映射与
 //!   读侧 JS 值契约（超精度、布尔、blob、未识别列类型必须报错）。
 //!
 //! # db 轴四契约（违反任一条 = 加载失败 / 调用出错 / UB）
@@ -308,7 +308,7 @@ fn do_query(handle: u64, sql: &str, params: &str) -> Result<Vec<u8>, String> {
     let params = parse_params("db query", params)?;
     with_conn("db query", handle, |_c| {
         // 真实驱动在此 `fetch_all(sql, &params).await`。行转换三条硬要求
-        // （`docs/db-guide.md` §10.6）：
+        // （`docs/devkit/db-guide.md` §10.6）：
         //   * 未识别的列类型 → **报错**（列名 + 类型 + cast 指引），不许静默 null；
         //   * i64 超出 2^53-1 → 十进制字符串（JS number 会掉精度），不是 JSON number；
         //   * 布尔统一出 true/false；blob 按 UTF-8 lossy 出串。

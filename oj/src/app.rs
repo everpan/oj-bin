@@ -1286,6 +1286,11 @@ pub async fn assemble_backend(
     let client_dbs = Arc::new(only_js::bridge::ClientDbRegistry::new(
         db_client.max_entries,
     ));
+    // 运行期动态授权表（U-1 v0.1.93）：壳 Arc 不可变、内部 Mutex 变动，起始空。
+    // 仅作用于动态登记别名（见 db_policy::policy_for），静态 config 兜底不受影响。
+    let db_access_rt: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, only_js::bridge::db_policy::DbAccess>>,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // db 默认库重定向需进入 'static 工厂闭包，先取出 owned（profiles 是借用，不能捕获）。
     let db_override = profiles.db.clone();
     // 单一工厂（内省 / actor 池 / WS 连接共享同一 Bus 与 Extras）——闭包捕获全 Arc，
@@ -1328,6 +1333,7 @@ pub async fn assemble_backend(
         // db_backend/config_dir 仍供下方直接 StableState 使用）。
         let db_client = db_client.clone();
         let client_dbs = client_dbs.clone();
+        let db_access_rt = db_access_rt.clone();
         let db_backend = db_backend.clone();
         let config_dir_arc = config_dir_arc.clone();
         // 影子绑定：同 vars/js_heap_limit —— 闭包带走的是这里的副本。
@@ -1381,6 +1387,7 @@ pub async fn assemble_backend(
                     db_access: Some(db_access.clone()),
                     db_client: Some(db_client.clone()),
                     client_dbs: Some(client_dbs.clone()),
+                    db_access_rt: Some(db_access_rt.clone()),
                     db_backend: Some(db_backend.clone()),
                     config_dir: Some(config_dir_arc.clone()),
                     vars: vars.clone(),
@@ -1437,6 +1444,7 @@ pub async fn assemble_backend(
         db_access: db_access.clone(), // 与 make_bridge 的 Extras.db_access 同源（同一 Arc）。
         db_client: db_client.clone(), // 与 make_bridge 的 Extras.db_client 同源（同一 Arc）。
         client_dbs: client_dbs.clone(), // 与 make_bridge 的 Extras.client_dbs 同源（同一 Arc）。
+        db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。
         input_contracts: Some(input_contracts.clone()),

@@ -521,7 +521,7 @@ sequenceDiagram
 
 1. **`describe()` 定能力位**——只声明你**真做得到**的：声明即承诺（宿主不会替你兜默认实现）。
 2. **错误信封**——插件侧 `Err(RString)` 恒为信封 JSON（§3），每条失败路径都要过映射函数。
-3. **值映射**——六类 schema 类型 × 读侧 JSON 契约，见 `docs/db-guide.md` §10.6。
+3. **值映射**——六类 schema 类型 × 读侧 JSON 契约，见 `docs/devkit/db-guide.md` §10.6。
 4. **驱动生命周期**——进程内驱动（cdylib 直接连）或子进程 sidecar（本节 15.4）。
 5. **发布形态**——`bin/plugins/<triple>/` 整体拷贝 + 清单锁 + 能力位在启动横幅可见（15.5）。
 

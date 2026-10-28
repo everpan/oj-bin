@@ -51,6 +51,9 @@ v0.1.92 已落地部分：**动态数据源登记的实例化能力（L4，clien
 不豁免登记门。④ 设计文档 `docs/plans/2026-10-28-db-client-axis-l4.md` 记录评审与最终拍板。见 api-manual
 §6「db.client」register 行 + §13 限制表、scenarios 场景 42（含应用侧持久化配方）、SKILL 陷阱速查。
 
+v0.1.93 已落地部分：**dbx Web 对齐 · L5（P0 主旅程）**——U-8（sqlite 错误信封化）/ U-6（读侧解码扩展）/ U-1（动态授权运行期生效 + 热更分类）/ U-3（跨 isolate 失效）。① **U-8**：sqlite 全部错误（`accessor_sqlx.rs` 8 处 + `stream_query` 内联）走 `sqlite_err` 映射既有 `DbErrorCategory` 八值，携带 `retryable`/`sessionDisposition`，message 经 `secret::redact` 脱敏（绝不回显 DSN/凭据）。② **U-6**：`column_json` 未知类型由「静默丢值 `Null`」改为**显式报错**（含列类型名），sqlite 路径规范化。③ **U-1**：新增 `db.access.grant(alias, allow, opts?)` / `db.access.revoke(alias)`——运行期把「放行维」(角色/主体四维并集) 注入运行表，零重启即对被授权主体放行（默认只读）；revoke 只回落 config、拒撤销纯 config 项；与 `db.client` 同特权门、必发 `DB_ACCESS_AUDIT`；运行期项只注入放行维、不覆盖 config 的 `enforce`/`read_only`/`max_rows`（防提权）。`db_access`/`db_client` 两段纳入热更 diff 的 `restart_pending`（消除旧授权静默盲区）。④ **U-3**：`db.epoch(name)` + `DB(name)` 每次调用校验 epoch（修复 cache-hit 短路）；host 始终按名重解析 accessor，正确性不依赖 JS epoch。见 api-manual §6「db」`db.access.*`/`db.epoch` 行 + §13 限制表、scenarios 场景 42（grant/revoke + 跨 isolate 失效）、SKILL 陷阱速查。
+
+
 v0.1.89 已落地部分：**db 访问控制（`db_access:` 段）**——① 顶层 `db_access:` 段补上库级
 授权：谁能访问哪个库（`allow` 四维并集：modules / roles / tenants / sources）、能做什么
 （`read_only` / `allow_ddl` / `allow_dangerous`）、最多拿多少行（`max_rows`）；语句按风险

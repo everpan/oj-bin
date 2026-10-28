@@ -27,7 +27,7 @@
 | `fingerprint` | `string` | 构建指纹（核对外发产物一致性） |
 | `description` | `string` | 插件作者自述（descriptor 必填项） |
 | `host_abi_version` | `number` | **宿主**当前 ABI 版本（每条记录重复携行，方便逐条比对） |
-| `caps` | `object \| null` | **db 轴插件**的方言能力声明（ABI 12 起），与插件 `describe()` 同一套词汇：`{dialect, capabilities[]}`；能力串闭集见 `docs/db-guide.md` §10.5 的能力位对照表。非 db 轴插件为 `null`。用途：确认「这个库的方言被宿主识别成什么、支持哪些原语」 |
+| `caps` | `object \| null` | **db 轴插件**的方言能力声明（ABI 12 起），与插件 `describe()` 同一套词汇：`{dialect, capabilities[]}`；能力串闭集见 `docs/devkit/db-guide.md` §10.5 的能力位对照表。非 db 轴插件为 `null`。用途：确认「这个库的方言被宿主识别成什么、支持哪些原语」 |
 
 ## 错误
 

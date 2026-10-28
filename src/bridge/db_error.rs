@@ -241,10 +241,10 @@ pub fn parse_raw(raw: &str) -> BridgeError {
 /// DRY 单构造器：未知方言 / 未声明能力的结构化 unsupported。
 ///
 /// message 模板（设计 §5.5）：`{capability} is not supported on dialect "{dialect}" yet.
-/// See docs/db-guide.md 方言能力矩阵.`
+/// See docs/devkit/db-guide.md 方言能力矩阵.`
 pub fn unsupported(dialect: &str, capability: &str) -> BridgeError {
     let message = format!(
-        "{capability} is not supported on dialect \"{dialect}\" yet. See docs/db-guide.md 方言能力矩阵."
+        "{capability} is not supported on dialect \"{dialect}\" yet. See docs/devkit/db-guide.md 方言能力矩阵."
     );
     let mut data = Map::new();
     data.insert(
@@ -333,7 +333,7 @@ mod tests {
             e.message
         );
         assert!(
-            e.message.contains("docs/db-guide.md"),
+            e.message.contains("docs/devkit/db-guide.md"),
             "message must carry guidance: {}",
             e.message
         );

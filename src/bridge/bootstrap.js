@@ -46,6 +46,9 @@ import {
   op_db_client_re_register,
   op_db_client_list,
   op_db_client_has,
+  op_db_access_grant,
+  op_db_access_revoke,
+  op_db_epoch,
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
@@ -912,6 +915,11 @@ function condFactories() {
   };
 }
 const dbCache = new Map();
+// U-3 v0.1.93: per-alias generation counter tracked separately from the wrapper so
+// DB(name) can revalidate on EVERY call (not just on cache-miss). Kept in a module-local
+// Map; correctness never depends on this value (query ops re-resolve the accessor by
+// name in the host), it only refreshes the JS wrapper promptly after delete/reRegister.
+const dbEpoch = new Map();
 
 // T9: structured db errors (BridgeError) carry `code`/`data`/`retryable`/
 // `sessionDisposition` as own props on the JS Error (attached by deno_core). `data`
@@ -948,9 +956,21 @@ function dbOpWrap(p) {
 
 globalThis.DB = function (name) {
   name = String(name);
-  if (!dbCache.has(name)) {
-    if (!op_db_has(name)) return undefined;
-    dbCache.set(name, {
+  // U-3 v0.1.93: re-check epoch on EVERY call (host-authoritative generation counter).
+  // cache-hit now revalidates instead of short-circuiting, so a deleted/reRegistered
+  // client db is invalidated in JS promptly. Correctness never depends on the JS-held
+  // epoch: query ops re-resolve the accessor by name against the host registry.
+  const epoch = op_db_epoch(name);
+  if (dbCache.has(name) && dbEpoch.get(name) === epoch) {
+    return dbCache.get(name);
+  }
+  if (!op_db_has(name)) {
+    dbCache.delete(name);
+    dbEpoch.delete(name);
+    return undefined;
+  }
+  dbEpoch.set(name, epoch);
+  dbCache.set(name, {
       ...condFactories(),
       // raw SQL + bound params (params optional).
       query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params))),
@@ -1075,7 +1095,6 @@ globalThis.DB = function (name) {
         }
       },
     });
-  }
   return dbCache.get(name);
 };
 globalThis.db = globalThis.DB("default");
@@ -1095,12 +1114,28 @@ if (globalThis.db) {
   delete: async (name) => {
     const ok = await dbOpWrap(op_db_client_delete(String(name)));
     dbCache.delete(String(name));
+    dbEpoch.delete(String(name));
     return ok;
   },
   reRegister: (name, dsn) => dbOpWrap(op_db_client_re_register(String(name), String(dsn))),
   list: () => dbOpWrap(op_db_client_list()),
   has: (name) => op_db_client_has(String(name)),
   };
+  // U-1 v0.1.93 runtime dynamic authorization (access-control domain; same privilege
+  // gate and fail-closed as db.client). grant(alias, allow, opts?) injects the "allow"
+  // dimension (roles/subjects four-dim union) into the runtime table so authorized
+  // callers can read the db without a restart (default readOnly=true); revoke(alias)
+  // falls back to config (not deleted). allow must restrict at least one dimension;
+  // an empty allow (grant-to-everyone) is rejected by the host.
+  globalThis.db.access = {
+    grant: (name, allow, opts) =>
+      dbOpWrap(op_db_access_grant(String(name), allow, opts === undefined ? null : opts)),
+    revoke: (name) => dbOpWrap(op_db_access_revoke(String(name))),
+  };
+  // U-3 v0.1.93: host-authoritative generation counter for a db alias. Lets a handler
+  // detect that a client db was deleted/reRegistered across isolates (compare against a
+  // previously seen value). Read-only; no privilege.
+  globalThis.db.epoch = (name) => op_db_epoch(String(name));
 }
 
 // ----- safe query builder (fluent, structured) -----

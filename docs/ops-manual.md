@@ -356,7 +356,7 @@ RUST_LOG=oj=info ./oj serve -c config.yaml --api-path dist
 | 启动报 `plugin symbol missing: <path> (symbol <符号名>)` | 库文件构建不完整、或用手写符号绕过了 `oj_plugin_entry!`、或与宿主 ABI 不一致导致符号名不同 | 用 `oj_plugin_entry!` 重编插件；`cargo xtask plugin <name> --check` 可预检 ABI/身份/符号 |
 | 启动报 `plugins db assembly: plugin db capability error: unknown capability "…"` / 缺组 / 组内多项 | 插件 `describe()` 的能力串不在闭集（8 个）内、两个必选组缺一或重复（typo 最常见，如 `placeholder_colon_`） | 修插件 `describe()` 后重编；宿主**故意拒启**——不让错配活到运行期（契约见 `docs/plugins/plugin-development.md` §15） |
 | 启动 warn `[oj-plugin] fingerprint mismatch: plugin '<name>' built with [<p-fp>], host [<h-fp>]` | 二进制与插件来自不同工具链/特性组合（ABI 相同，故只告警） | 生产环境按「整体拷贝 bin/」重拷；留着跑不算故障，但出问题时不作支持基线 |
-| 运行期 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 API） | 两种完全不同的原因：①方言不是 sqlite/mysql/postgres，宿主不生成 SQL（**预期**）；②插件没声明 `stream`/`cancel` 等能力 | ①改用裸 SQL（`db.query`/`db.exec`/`db.tx` 始终可用）；②按报错点名补插件能力。别自己按 sqlite 语义拼 SQL 绕（`docs/db-guide.md` §10.5 / §10.7） |
+| 运行期 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名 API） | 两种完全不同的原因：①方言不是 sqlite/mysql/postgres，宿主不生成 SQL（**预期**）；②插件没声明 `stream`/`cancel` 等能力 | ①改用裸 SQL（`db.query`/`db.exec`/`db.tx` 始终可用）；②按报错点名补插件能力。别自己按 sqlite 语义拼 SQL 绕（`docs/devkit/db-guide.md` §10.5 / §10.7） |
 | 配了 `plugins:` 但启动横幅里没有该插件 | 发现路径不对（5 级：`OJ_PLUGINS_DIR` > config `plugins_dir` > 打包布局 > `<exe>/plugins` > `<workspace>/bin/plugins`，再拼 `<host-triple>/`），或文件名不符合 `lib<name>.so` / `lib<name>.dylib` / `<name>.dll`（platform 决定前缀） | 用 `oj info` 的 `plugins` 段核对实际装了什么；对齐目录与文件名；启动横幅 + `host ABI_VERSION` 行是权威现场 |
 
 ## 8. 回滚与恢复
