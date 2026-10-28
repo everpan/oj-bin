@@ -16,6 +16,52 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.100（未打标签）
+
+**dbx Web 对齐 P1/P2 第一批**：U-11（连接级能力探测）+ U-14 批 a（catalog 内省）+
+U-15 M1（管理面 connector 宿主面）。设计稿与三路评审处置：
+`docs/plans/2026-10-28-u11-…` / `-u14-…` / `-u15-…`；执行跟踪 `…-p12-execution-plan.md`。
+U-16 维持不立项（部署级隧道 recipe 文档已交付 `docs/devkit/deploy-tunnel-recipe.md`）。
+**零 ABI 变更**（12 保持）。
+
+### feat(db_client) — U-11
+
+- `db.client.list` / `register` / `test` 透出 **`serverVersion` / `probedAtMs`**：connect 后
+  一条版本查询（mysql/pg `select version()`、sqlite `select sqlite_version()`），
+  **3s 超时 + 失败降级 None**（探测是观测增强不是登记门）；开放方言跳过；静态库不透出。
+  主力消费者是内省 golden 快照定位键（U-14）。
+
+### feat(db) — U-14 批 a
+
+- 新增 **`db.catalog(kind, arg?)`**：目录类内省，信封 `{kind, dialect, items}`（L2 三件
+  listColumns/Indexes/ForeignKeys 保持裸数组不动——两代约定）。kind：`views` / `routines` /
+  `sequences` / `ddl` / `comment` / `constraints` / `stats`（行数上限 1000）。
+- 能力矩阵（批 a）：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟）；
+  pg 除 mysql 式 sequences 外全部。**unsupported 报结构化 `OJ_DB_UNSUPPORTED`，不静默**。
+- mysql `SHOW CREATE` 是零内联铁律的唯一成文例外（白名单字符集 + 反引号转义）；
+  静态守卫测试扩展到全部新 SQL 常量（`::text`/`current_schema()`/无 LIKE/参数位计数）。
+- `granted_only` 授权链与 L2 同源；`stats` 只做估算（无 precise 全表扫描开关）。
+
+### feat(mgmt) — U-15 M1（宿主面）
+
+- 新增 `mgmt:` 配置段 + `globalThis.mgmt`（register/delete/list/has/call）。**特权面**：
+  `mgmt.axes` 收编的泛型轴**不进 `axis()` 公开面**（特权旁路封堵——评审阻断①）；
+  register/delete/非只读 call 走 `mgmt.allow`，只读 call/list 走 `mgmt.allow_read`
+  （缺省复用 allow）；两档缺省 fail-closed。
+- connector 契约（零 ABI，架在泛型传输上）：保留 op `__ops__`（能力表，**readOnly 为插件
+  自报、宿主不可验证**——红线成文）/ `__connect__` / `__disconnect__`；未声明 op →
+  `OJ_MGMT_UNSUPPORTED`。登记探活 fail-loud（ping 失败 = 拒绝）。
+- 审计 `MGMT_AUDIT`/`MGMT_DENY` 走 `audit::emit` 单一出口，全字段零凭据；
+  per-connector 并发闸（4，满即拒不排队）；`max_entries`/`max_per_owner` 容量。
+- 段改动归 `restart_pending`；`oj serve` 装配校验（0 值拒启 / allow 全缺拒启）。
+
+### 已知限制（诚实登记）
+
+- **U-15 M2（oj-mgmt-mongo 真 connector）未交付**——M1 仅有宿主面 + 测试用 mini connector
+  契约覆盖；M2/M3（真 connector + 发版文档）另期。
+- U-14 批 b（triggers/partitions/types + sqlite 模拟）未交付；批 c 默认不排期。
+- `mgmt.readOnly` 位不可验证（插件自报）——connector 须第一方。
+
 ## v0.1.99（未打标签）
 
 **dbx Web 对齐 · G9（服务端防护门）**：三条防护门各自独立在 op 层生效；验收判据 = 前端绕不过

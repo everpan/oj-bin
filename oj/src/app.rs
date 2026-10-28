@@ -1124,6 +1124,36 @@ pub async fn assemble_backend(
     // 与 make_bridge 的 Extras.generic_axes / StableState.generic_axes 同源。
     let generic_axes =
         only_js::bridge::generic_axis::registry_from(std::mem::take(&mut registries.generic));
+    // U-15：管理面收编轴（`mgmt:` 段 `axes` 名单）——**不进** `axis()` 公开面，仅供 mgmt 面。
+    let mgmt_axes =
+        only_js::bridge::generic_axis::registry_from(std::mem::take(&mut registries.mgmt_generic));
+    let mgmt_section = Arc::new(cfg.mgmt.clone());
+    // 管理面登记表（进程级）：装配层构造一次，热更前后同一 Arc（与 tx_sessions 同款）。
+    let mgmt = Arc::new(only_js::bridge::mgmt::MgmtRegistry::new(
+        mgmt_section.max_entries,
+        mgmt_section.max_per_owner,
+    ));
+    if mgmt_section.enabled {
+        if mgmt_section.max_entries == 0 || mgmt_section.max_per_owner == 0 {
+            return Err(
+                "mgmt.enabled=true requires mgmt.max_entries >= 1 and mgmt.max_per_owner >= 1"
+                    .to_string(),
+            );
+        }
+        if mgmt_section.allow.is_unrestricted() {
+            return Err(
+                "mgmt.enabled=true requires mgmt.allow to declare at least one of \
+                 modules/roles/tenants/sources (refusing an unrestricted management surface)"
+                    .to_string(),
+            );
+        }
+        if mgmt_section.axes.is_empty() {
+            eprintln!(
+                "warn: mgmt is enabled but mgmt.axes is empty -- no connector can register \
+                 (add the generic axis names to claim them off the public axis() surface)"
+            );
+        }
+    }
     // blob：blob 段存在即启用；未声明 → None。`--blob` 选中的 profile 别名为 "default"。
     let blobs: Option<Arc<BlobRegistry>> = match &cfg.blob {
         None => None,
@@ -1432,6 +1462,9 @@ pub async fn assemble_backend(
         let audit = audit.clone();
         let audit_store = audit_store.clone();
         let exec_sessions = exec_sessions.clone();
+        let mgmt_section = mgmt_section.clone();
+        let mgmt_axes = mgmt_axes.clone();
+        let mgmt = mgmt.clone();
         let client_dbs = client_dbs.clone();
         let db_access_rt = db_access_rt.clone();
         let db_backend = db_backend.clone();
@@ -1491,6 +1524,9 @@ pub async fn assemble_backend(
                     audit_section: Some(audit.clone()),
                     audit: Some(audit_store.clone()),
                     exec_sessions: Some(exec_sessions.clone()),
+                    mgmt_section: Some(mgmt_section.clone()),
+                    mgmt_axes: Some(mgmt_axes.clone()),
+                    mgmt: Some(mgmt.clone()),
                     client_dbs: Some(client_dbs.clone()),
                     db_access_rt: Some(db_access_rt.clone()),
                     db_backend: Some(db_backend.clone()),
@@ -1554,6 +1590,9 @@ pub async fn assemble_backend(
         audit_section: audit.clone(), // 与 make_bridge 的 Extras.audit_section 同一 Arc。
         audit: audit_store.clone(), // 与 make_bridge 的 Extras.audit 同一存储。
         exec_sessions: exec_sessions.clone(), // 与 make_bridge 的 Extras.exec_sessions 同一注册表。
+        mgmt_section: mgmt_section.clone(), // 与 make_bridge 的 Extras.mgmt_section 同一 Arc。
+        mgmt_axes: mgmt_axes.clone(), // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
+        mgmt: mgmt.clone(), // 与 make_bridge 的 Extras.mgmt 同一登记表。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。

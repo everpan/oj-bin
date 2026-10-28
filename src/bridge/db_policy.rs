@@ -394,6 +394,37 @@ impl DbSessionSection {
     }
 }
 
+/// 管理面 connector 配置段（`mgmt:` 段，U-15）。`enabled` 缺省 **false**（fail-closed：
+/// 管理操作是特权面）。`axes` 是装配期收编名单——这些泛型轴**不进 `axis()` 公开面**
+/// （特权旁路封堵，评审阻断①）。`allow` = 写档；`allow_read` 缺省复用 `allow`
+/// （产品路：通常同主体）。enabled=true 时 `allow` 必须显式声明（装配期拒 unrestricted）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MgmtSection {
+    pub enabled: bool,
+    /// 装配期收编为管理面的泛型轴名。
+    pub axes: Vec<String>,
+    /// 写档门（register/delete/非只读 call）。
+    pub allow: AllowList,
+    /// 读档门（list/has/只读 call）；缺省复用 `allow`。
+    pub allow_read: Option<AllowList>,
+    pub max_entries: usize,
+    pub max_per_owner: usize,
+}
+
+impl Default for MgmtSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            axes: Vec::new(),
+            allow: AllowList::default(),
+            allow_read: None,
+            max_entries: 8,
+            max_per_owner: 4,
+        }
+    }
+}
+
 /// 安全审计配置段（`audit:`，U-9 v0.1.98）。缺省**开**（有界环形缓冲，零凭据事件）；
 /// 读面 `allow` 缺省不限制（单进程、零凭据，装配期 warn 提示收紧）。
 /// `max_entries` / `retention_secs` 为 0 装配期拒启（= 不设限的 DoS 面）。

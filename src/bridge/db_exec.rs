@@ -375,4 +375,41 @@ mod tests {
         assert!(msg.contains(&xid[..8]), "{msg}");
         assert!(!msg.contains(&xid), "{msg}");
     }
+
+    /// U-14 批 a：catalog 信封 / sqlite 矩阵（views ✓ ddl ✓ 其余 unsupported）/
+    /// 未知 kind 报错 / 畸形表名空结果（与 L2 同口径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_envelope_sqlite_matrix_and_unsupported() {
+        let b = exec_bridge("catalog").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              await db.exec("create view v_t as select id from t");
+              const views = await db.catalog("views");
+              const ddl = await db.catalog("ddl", "v_t");
+              let unsup = null, unsupCap = null;
+              try { await db.catalog("sequences"); } catch (e) { unsup = String(e); unsupCap = e.data && e.data.capability; }
+              let unknown = null;
+              try { await db.catalog("nope"); } catch (e) { unknown = String(e); }
+              let badTable = null;
+              try { await db.catalog("ddl", "x; drop"); } catch (e) { badTable = String(e); }
+              return json.ok({ kind: views.kind, dialect: views.dialect,
+                               itemName: views.items[0] && views.items[0].name,
+                               ddlHasView: String(ddl.items[0].ddl).includes("VIEW"),
+                               unsup, unsupCap, unknown, badTable });
+            })().catch((e) => json.fail(500, String(e)))"#,
+        )
+        .await;
+        assert_eq!(v["code"], 0, "{v}");
+        assert_eq!(v["data"]["kind"], json!("views"), "{v}");
+        assert_eq!(v["data"]["dialect"], json!("sqlite"), "{v}");
+        assert_eq!(v["data"]["itemName"], json!("v_t"), "{v}");
+        assert_eq!(v["data"]["ddlHasView"], json!(true), "{v}");
+        let unsup = v["data"]["unsup"].as_str().unwrap_or_default();
+        assert!(unsup.contains("not supported"), "{v}");
+        assert_eq!(v["data"]["unsupCap"], json!("sequences"), "{v}");
+        let unknown = v["data"]["unknown"].as_str().unwrap_or_default();
+        assert!(unknown.contains("unknown kind"), "{v}");
+        assert_eq!(v["data"]["badTable"], json!(null), "{v}");
+    }
 }

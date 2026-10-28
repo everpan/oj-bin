@@ -1101,6 +1101,120 @@ pub async fn op_db_stream_abort(state: Rc<RefCell<OpState>>, stream_id: f64) {
     }
 }
 
+/// db.catalog（U-14 批 a，v0.1.100）：目录类内省——views / routines / sequences / ddl /
+/// comment / constraints / stats，信封 `{kind, dialect, items}`。与 L2 三件（listColumns/
+/// Indexes/ForeignKeys，裸数组）分代：旧件不动（兼容），新 kind 一律走本 op。
+/// 授权链与 L2 同（`granted_only`）；kind × 方言 unsupported → 结构化 `OJ_DB_UNSUPPORTED`
+/// （能力矩阵见 db-guide §10，报错不静默）。
+#[op2]
+#[serde]
+pub async fn op_db_catalog(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] kind: String,
+    #[string] arg: Option<String>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let kind = super::introspect::Kind::parse_catalog(&kind).ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "db catalog: unknown kind {kind:?} (views|routines|sequences|ddl|comment|constraints|stats)"
+        ))
+    })?;
+    let target = resolve_target(&state, &name)?;
+    let in_tx = matches!(&target, Target::Tx(_));
+    let dialect = match &target {
+        Target::Tx(t) => require_known_dialect(&t.dialect_info, kind.capability())?,
+        Target::Pool(da) => require_known_dialect(da.dialect_info(), kind.capability())?,
+    };
+    let alias = super::guard::bound_db(&state, &name);
+    super::db_policy::granted_only(&state, &alias)?;
+
+    let mut sql = match super::introspect::catalog_sql(kind, dialect) {
+        Some(s) => s.to_string(),
+        None => {
+            return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
+                dialect.as_str(),
+                kind.capability(),
+            ))));
+        }
+    };
+    if kind.catalog_limit() {
+        sql.push_str(&format!(" LIMIT {}", super::introspect::MAX_ROWS));
+    }
+    // mysql SHOW 族 = 零内联铁律的唯一成文例外（introspect.rs 模块注释），白名单校验在 helper。
+    let params = if kind == super::introspect::Kind::Ddl && dialect == Dialect::MySql {
+        match super::introspect::mysql_show_create(arg.as_deref().unwrap_or("")) {
+            Ok(s) => {
+                sql = s;
+                vec![]
+            }
+            Err(e) => return Err(JsErrorBox::generic(e)),
+        }
+    } else if kind.catalog_param() {
+        let t = arg.as_deref().unwrap_or("");
+        if !valid_introspect_table(dialect, t) {
+            // 畸形 / 跨库前缀 → 空结果（与 L2 同口径：不报错、不泄漏）。
+            return Ok(serde_json::json!({
+                "kind": kind.capability(), "dialect": dialect.as_str(), "items": []
+            }));
+        }
+        vec![Value::String(t.to_string())]
+    } else {
+        vec![]
+    };
+
+    let placeholder = match &target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
+    };
+    let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
+    let start = std::time::Instant::now();
+    let trace_params = &[Value::String("<db introspection>".to_string())];
+    let res = match &target {
+        Target::Pool(da) => da.query_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    match res {
+        Ok(rows) => {
+            let items = super::introspect::catalog(kind, rows);
+            trace_sql(
+                &state,
+                &sql,
+                trace_params,
+                &name,
+                in_tx,
+                ms,
+                Some(items.len() as i64),
+                true,
+                None,
+                None,
+                None,
+            );
+            Ok(serde_json::json!({
+                "kind": kind.capability(), "dialect": dialect.as_str(), "items": items
+            }))
+        }
+        Err(e) => {
+            let (cat, retry) = err_meta_of(e.as_ref());
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            trace_sql(
+                &state,
+                &sql,
+                trace_params,
+                &name,
+                in_tx,
+                ms,
+                None,
+                false,
+                Some(e.to_string()),
+                cat,
+                retry,
+            );
+            Err(to_js_err(e))
+        }
+    }
+}
+
 /// 平台序列分配原语（v0.1.24，债务④）：`db.nextSeq(name)` → 下一个序号。
 ///
 /// **要解决的问题**：业务用 `SELECT max(id) + 1` 取号在并发下会分配出相同序号（下游 U38 的
@@ -1392,6 +1506,8 @@ async fn introspect(
                 super::introspect::Kind::Columns => super::introspect::columns(rows),
                 super::introspect::Kind::Indexes => super::introspect::indexes(rows),
                 super::introspect::Kind::ForeignKeys => super::introspect::foreign_keys(rows),
+                // catalog 类只从 op_db_catalog 进（parse_catalog 白名单），L2 通路不可达。
+                _ => unreachable!("catalog kinds do not flow through the L2 introspect path"),
             };
             trace_sql(
                 &state,
@@ -1620,10 +1736,11 @@ mod tests {
     /// normalize_and_trace——登记为已知非裸 SQL 出口。
     #[test]
     fn raw_sql_op_exits_are_pinned() {
-        const WHITELIST: [&str; 22] = [
+        const WHITELIST: [&str; 23] = [
             "op_db_allowed",
             "op_db_as_system",
             "op_db_as_tenant",
+            "op_db_catalog",
             "op_db_dialect",
             "op_db_exec",
             "op_db_has",

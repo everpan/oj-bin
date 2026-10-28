@@ -67,6 +67,12 @@ import {
   op_db_tx_commit,
   op_db_tx_rollback,
   op_db_cancel,
+  op_db_catalog,
+  op_mgmt_register,
+  op_mgmt_delete,
+  op_mgmt_list,
+  op_mgmt_has,
+  op_mgmt_call,
   op_db_stream_open,
   op_db_stream_next,
   op_db_stream_close,
@@ -1028,6 +1034,12 @@ globalThis.DB = function (name) {
       listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table))),
       listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table))),
       listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table))),
+      // U-14 batch a (v0.1.100): catalog introspection -- new-generation envelope
+      // {kind, dialect, items}. kinds: views | routines | sequences | ddl | comment |
+      // constraints | stats (per-dialect support matrix in db-guide section 10; unsupported
+      // kinds reject with OJ_DB_UNSUPPORTED, never silent). ddl/comment/constraints
+      // take a table name arg; views/routines/sequences/stats are whole-db.
+      catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg))),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -1214,6 +1226,19 @@ globalThis.audit = {
       throw normDbErr(e);
     }
   },
+};
+// ----- U-15: management connector surface (privileged; NOT reachable via axis() --
+// mgmt.axes claimed at assembly are removed from the public generic-axis registry).
+// register(name, dsn) probes __ops__ + __connect__ + ping (fail-loud); call dispatches
+// through the read/write allow tiers (readOnly is connector-self-reported) with a
+// per-connector concurrency gate; every action lands in the audit log (zero credentials).
+globalThis.mgmt = {
+  register: (name, dsn) => dbOpWrap(op_mgmt_register(String(name), String(dsn))),
+  delete: (name) => dbOpWrap(op_mgmt_delete(String(name))),
+  list: () => dbOpWrap(op_mgmt_list()),
+  has: (name) => op_mgmt_has(String(name)),
+  call: (name, op, args) =>
+    dbOpWrap(op_mgmt_call(String(name), String(op), args === undefined ? "{}" : JSON.stringify(args))),
 };
 
 // ----- safe query builder (fluent, structured) -----

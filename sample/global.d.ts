@@ -756,6 +756,10 @@ declare global {
     registeredBy: string | null;
     /** 登记时刻（Unix 毫秒）。 */
     registeredAtMs: number;
+    /** server 版本串（U-11：探测失败/开放方言 null——降级不阻断登记）。 */
+    serverVersion: string | null;
+    /** 探测时刻（Unix 毫秒；未探测 0）。 */
+    probedAtMs: number;
     /** 命中计数（query/exec/stream/内省经 `lookup` 自动累加）。 */
     queries: number;
   }
@@ -838,7 +842,7 @@ declare global {
     /** 登记一个 DSN 为命名数据源；返回记账条目。重名 / 超 `max_entries` 抛错。 */
     register(name: string, dsn: string): Promise<ClientDbEntry>;
     /** 试连（不落库）；返回 `{ok, dialect?, error?}`。 */
-    test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string }>;
+    test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string; serverVersion?: string | null; probedAtMs?: number }>;
     /** 替换已登记连接（不存在则抛错）。 */
     reRegister(name: string, dsn: string): Promise<ClientDbEntry>;
     /** 删除数据源；自动驱逐 `DB()` 缓存；返回是否删除成功。 */
@@ -1099,6 +1103,39 @@ declare const audit: {
     untilMs?: number;
     limit?: number;
   }): Promise<AuditEntry[]>;
+};
+
+/** 一个已登记管理面 connector（`mgmt.list()` 的元素，U-15）。 */
+interface MgmtEntry {
+  /** connector 名（= 收编的泛型轴名）。 */
+  connector: string;
+  /** 脱敏连接串（`user:pass@` → `***`）。 */
+  dsn: string;
+  /** 登记操作者（`user.id`；无身份 null）。 */
+  registeredBy: string | null;
+  /** 登记时刻（Unix 毫秒）。 */
+  registeredAtMs: number;
+  /** 插件 `__ops__` 自报的 op 名单（readOnly 位以插件文档为准——宿主不可验证）。 */
+  ops: string[];
+}
+
+/**
+ * 管理面 connector（U-15，`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
+ * 泛型轴**不进** `axis()` 公开面；register/delete/非只读 call 走 `mgmt.allow`，只读 call
+ * 与 list 走 `mgmt.allow_read`（缺省复用 allow）；每动作落 `MGMT_AUDIT`/`MGMT_DENY` 审计
+ * （全字段零凭据）。未声明 op → `OJ_MGMT_UNSUPPORTED`。
+ */
+declare const mgmt: {
+  /** 登记（探 `__ops__` + `__connect__` + ping，失败即拒）。 */
+  register(name: string, dsn: string): Promise<MgmtEntry>;
+  /** 删除（尽力 `__disconnect__` 后摘表；幂等）。 */
+  delete(name: string): Promise<boolean>;
+  /** 清单（读档）。 */
+  list(): Promise<MgmtEntry[]>;
+  /** 探活（未启用/未登记 = false）。 */
+  has(name: string): boolean;
+  /** 管理调用（args 必须是 JSON object；`__handle` 由宿主注入）。 */
+  call(name: string, op: string, args?: Record<string, unknown>): Promise<unknown>;
 };
 
 export {};

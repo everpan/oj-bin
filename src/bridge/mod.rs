@@ -59,6 +59,7 @@ pub mod ldap;
 mod loader;
 mod log;
 pub mod mail;
+pub mod mgmt;
 mod module_loader;
 pub mod module_scan;
 pub mod mq;
@@ -250,6 +251,10 @@ pub struct StableState {
     /// 执行登记表（U-5 v0.1.96）：`db.cancel(executionId)` 的跨请求路由表。
     /// 进程级生命周期（热更存活），无配置段（取消判权只看归属主体）。
     pub exec_sessions: Arc<db_exec::ExecRegistry>,
+    /// 管理面配置段（U-15）+ 装配期收编的泛型轴（**不进** `axis()` 公开面）+ 运行期登记表。
+    pub mgmt_section: Arc<db_policy::MgmtSection>,
+    pub mgmt_axes: generic_axis::GenericAxisRegistry,
+    pub mgmt: Arc<mgmt::MgmtRegistry>,
     /// 运行期动态授权表（U-1 v0.1.93）：壳 `Arc` 不可变、内部 `Mutex` 变动，不破红线。
     /// 仅作用于「动态登记别名」（client_dbs 命中且非 config `db_access.by_db` 声明）：
     /// grant 写入、revoke 移除；静态 config 兜底不受其影响（防运行时提权覆盖 config 的 deny）。
@@ -346,6 +351,10 @@ pub struct Extras {
     pub audit: Option<Arc<audit::AuditStore>>,
     /// 执行登记表（装配层构造后注入，以便热更前后同源）。None = 进程内新表。
     pub exec_sessions: Option<Arc<db_exec::ExecRegistry>>,
+    /// 管理面（U-15）：段 + 收编轴 + 登记表。None = 缺省。
+    pub mgmt_section: Option<Arc<db_policy::MgmtSection>>,
+    pub mgmt_axes: Option<generic_axis::GenericAxisRegistry>,
+    pub mgmt: Option<Arc<mgmt::MgmtRegistry>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
     pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
     /// 运行期动态授权表（U-1 v0.1.93）。None = 空表（全库按 config 静态策略）。
@@ -510,6 +519,7 @@ deno_core::extension!(
         db::op_db_list_columns,
         db::op_db_list_indexes,
         db::op_db_list_foreign_keys,
+        db::op_db_catalog,
         client_db::op_db_client_register,
         client_db::op_db_client_test,
         client_db::op_db_client_delete,
@@ -521,6 +531,11 @@ deno_core::extension!(
         client_db::op_db_epoch,
         db_exec::op_db_cancel,
         audit::op_audit_query,
+        mgmt::op_mgmt_register,
+        mgmt::op_mgmt_delete,
+        mgmt::op_mgmt_list,
+        mgmt::op_mgmt_has,
+        mgmt::op_mgmt_call,
         db_session::op_db_session_begin,
         db_session::op_db_session_attach,
         db_session::op_db_session_detach,
@@ -898,6 +913,20 @@ impl Bridge {
             ))
         });
         let exec_sessions = extras.exec_sessions.clone().unwrap_or_default();
+        let mgmt_section = extras
+            .mgmt_section
+            .clone()
+            .unwrap_or_else(|| Arc::new(db_policy::MgmtSection::default()));
+        let mgmt_axes = extras
+            .mgmt_axes
+            .clone()
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+        let mgmt = extras.mgmt.clone().unwrap_or_else(|| {
+            Arc::new(mgmt::MgmtRegistry::new(
+                mgmt_section.max_entries,
+                mgmt_section.max_per_owner,
+            ))
+        });
         let stable = Arc::new(StableState {
             kv,
             dbs,
@@ -943,6 +972,9 @@ impl Bridge {
             audit_section,
             audit: audit_store,
             exec_sessions,
+            mgmt_section,
+            mgmt_axes,
+            mgmt,
             db_access_rt: extras
                 .db_access_rt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
@@ -2665,6 +2697,9 @@ mod tests {
             audit_section: Arc::new(db_policy::AuditSection::default()),
             audit: Arc::new(audit::AuditStore::new(&db_policy::AuditSection::default())),
             exec_sessions: Arc::new(db_exec::ExecRegistry::default()),
+            mgmt_section: Arc::new(db_policy::MgmtSection::default()),
+            mgmt_axes: Arc::new(HashMap::new()),
+            mgmt: Arc::new(mgmt::MgmtRegistry::new(8, 4)),
             db_access_rt: Arc::new(Mutex::new(HashMap::new())),
             db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),

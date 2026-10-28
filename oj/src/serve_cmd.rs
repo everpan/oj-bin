@@ -596,7 +596,7 @@ fn diff_configs(
             // U-1 v0.1.93：访问控制策略段（`db_access:` / `db_client:`）改动**不强行热生效**
             // —— StableState 不可变，强行热改会破坏红线。纳入已知键并标 restart_pending，
             // 让运维明确知道「改了这两段必须重启」，消除旧授权静默盲区的误标 `applied`。
-            "db_access" | "db_client" | "db_session" | "audit" => {
+            "db_access" | "db_client" | "db_session" | "audit" | "mgmt" => {
                 restart_pending.push((*key).to_string())
             }
             "server" => kept_listener.push((*key).to_string()),
@@ -1460,6 +1460,8 @@ pub struct Registries {
     /// 泛型轴（插件自报的非类型化轴，不在 plugin_loader::TYPED_AXES 内）：
     /// (轴名, 插件名, vtable)；跨插件同名冲突在 build_registries fail fast。
     pub generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
+    /// U-15：`mgmt.axes` 收编的管理面泛型轴（**不进**公开 `generic`——特权旁路封堵）。
+    pub mgmt_generic: Vec<(String, String, &'static oj_plugin_ffi::GenericVtable)>,
 }
 
 /// 装配层把宿主侧解析出的跨后端参数经 cfg JSON 注入插件（spec §3 有意的边界；
@@ -1706,8 +1708,12 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
     }
     let ldap = ldap_plugins.first().and_then(|p| p.registrations.ldap);
     // 泛型轴：跨插件轴名冲突 fail-fast（与「不静默跳过」哲学一致）。
+    // U-15：`mgmt.axes` 收编的轴**不进** `axis()` 公开面（特权旁路封堵，评审阻断①），
+    // 单独归集给管理面注册表（`StableState.mgmt_axes`）。
+    let mgmt_claimed = &cfg.mgmt.axes;
     let mut seen: HashMap<&str, &str> = HashMap::new();
     let mut generic = Vec::new();
+    let mut mgmt_generic = Vec::new();
     for p in loaded {
         for (axis, vt) in &p.generic_axes {
             if let Some(prev) = seen.insert(axis, &p.descriptor.name[..]) {
@@ -1717,7 +1723,11 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
                     &p.descriptor.name[..]
                 ));
             }
-            generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
+            if mgmt_claimed.contains(axis) {
+                mgmt_generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
+            } else {
+                generic.push((axis.clone(), p.descriptor.name[..].to_string(), *vt));
+            }
         }
     }
     Ok(Registries {
@@ -1731,6 +1741,7 @@ fn build_registries(cfg: &Config, loaded: &[LoadedPlugin]) -> Result<Registries,
         mail,
         ldap,
         generic,
+        mgmt_generic,
     })
 }
 

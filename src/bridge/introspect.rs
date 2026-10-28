@@ -31,6 +31,14 @@ pub enum Kind {
     Columns,
     Indexes,
     ForeignKeys,
+    // ---- U-14 批 a（v0.1.100）：catalog 类（`catalog_sql` + `{kind,dialect,items}` 信封）----
+    Views,
+    Routines,
+    Sequences,
+    Ddl,
+    Comment,
+    Constraints,
+    Stats,
 }
 
 impl Kind {
@@ -40,7 +48,38 @@ impl Kind {
             Kind::Columns => "list_columns",
             Kind::Indexes => "list_indexes",
             Kind::ForeignKeys => "list_foreign_keys",
+            Kind::Views => "views",
+            Kind::Routines => "routines",
+            Kind::Sequences => "sequences",
+            Kind::Ddl => "ddl",
+            Kind::Comment => "comment",
+            Kind::Constraints => "constraints",
+            Kind::Stats => "stats",
         }
+    }
+
+    /// catalog 类是否吃**表名参数**（false = 全库清单，无参数位）。
+    pub fn catalog_param(self) -> bool {
+        matches!(self, Kind::Ddl | Kind::Comment | Kind::Constraints)
+    }
+
+    /// catalog 类是否可追加 `LIMIT`（Ddl 单对象 → false；mysql 的 SHOW 族本来就不接 LIMIT）。
+    pub fn catalog_limit(self) -> bool {
+        !matches!(self, Kind::Ddl)
+    }
+
+    /// 字符串 → catalog Kind（op 入参解析；L2 三件不在 catalog 面）。
+    pub fn parse_catalog(s: &str) -> Option<Kind> {
+        Some(match s {
+            "views" => Kind::Views,
+            "routines" => Kind::Routines,
+            "sequences" => Kind::Sequences,
+            "ddl" => Kind::Ddl,
+            "comment" => Kind::Comment,
+            "constraints" => Kind::Constraints,
+            "stats" => Kind::Stats,
+            _ => return None,
+        })
     }
 }
 
@@ -170,6 +209,205 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
              WHERE con.contype = 'f' AND t.relname = ? AND n.nspname = current_schema() \
              ORDER BY con.conname, ck.ord"
         }
+        // L2 三件三方言全覆盖；catalog 类只走 `catalog_sql`，此表不可达。
+        _ => "",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U-14 批 a：catalog 类（连接树 + 对象详情）。与 L2 的 `sql()` 分表而治：
+// catalog kind 支持「kind × 方言 = unsupported」矩阵（`catalog_sql` 返回 None），
+// 且响应走 `{kind, dialect, items}` 信封（L2 三件保持裸数组——两代约定，db-guide §10）。
+// ---------------------------------------------------------------------------
+
+/// mysql `SHOW CREATE TABLE` 是**唯一**允许标识符内联的成文例外（铁律 1）：
+/// SHOW 族不接受绑定参数。防线 = 严格白名单字符集（`[A-Za-z0-9_$]`）+ 反引号引用
+/// （校验后本已无反引号，翻倍是纵深）。违规 → Err（`OJ_DB_UNSUPPORTED` 由调用方构造）。
+pub fn mysql_show_create(table: &str) -> Result<String, String> {
+    if table.is_empty()
+        || !table
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+    {
+        return Err(format!("invalid identifier for SHOW CREATE: {table:?}"));
+    }
+    Ok(format!("SHOW CREATE TABLE `{}`", table.replace('`', "``")))
+}
+
+/// catalog 类的方言 SQL（`None` = kind × 方言 unsupported——**报错不静默**，能力矩阵见
+/// db-guide §10）。参数位约定：吃表名的 kind 固定 1 个 `?`；全库清单 0 个。
+/// pg 铁律 2/3 照守（`::text` / `current_schema()` 限定）。
+pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
+    match (kind, d) {
+        // ---------------- views（清单 + 定义）----------------
+        (Kind::Views, Dialect::Sqlite) => Some(
+            "SELECT name AS name, 'view' AS type, sql AS ddl \
+                  FROM sqlite_master WHERE type = 'view' ORDER BY name",
+        ),
+        (Kind::Views, Dialect::MySql) => Some(
+            "SELECT table_name AS name, 'view' AS type, view_definition AS ddl \
+                  FROM information_schema.views \
+                  WHERE table_schema = DATABASE() ORDER BY table_name",
+        ),
+        (Kind::Views, Dialect::Postgres) => Some(
+            "SELECT c.relname::text AS name, 'view' AS type, \
+                  pg_get_viewdef(c.oid)::text AS ddl \
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind IN ('v','m') AND n.nspname = current_schema() \
+                  ORDER BY c.relname",
+        ),
+        // ---------------- routines（函数/存储过程清单）----------------
+        (Kind::Routines, Dialect::MySql) => Some(
+            "SELECT routine_name AS name, routine_type AS type \
+                  FROM information_schema.routines \
+                  WHERE routine_schema = DATABASE() ORDER BY routine_name, routine_type",
+        ),
+        (Kind::Routines, Dialect::Postgres) => Some(
+            "SELECT p.proname::text AS name, \
+                  CASE WHEN p.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS type \
+                  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = current_schema() ORDER BY p.proname",
+        ),
+        // ---------------- sequences（sqlite 无 catalog → unsupported；mysql 为模拟）----------------
+        (Kind::Sequences, Dialect::MySql) => Some(
+            "SELECT table_name AS name, 'auto_increment' AS type \
+                  FROM information_schema.tables \
+                  WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+                        AND auto_increment IS NOT NULL ORDER BY table_name",
+        ),
+        (Kind::Sequences, Dialect::Postgres) => Some(
+            "SELECT sequencename::text AS name, 'sequence' AS type \
+                  FROM pg_sequences WHERE schemaname = current_schema() ORDER BY sequencename",
+        ),
+        // ---------------- ddl（单对象源码；mysql 走 SHOW 例外，见 `mysql_show_create`）----------------
+        (Kind::Ddl, Dialect::Sqlite) => {
+            Some("SELECT name AS name, sql AS ddl FROM sqlite_master WHERE name = ?")
+        }
+        (Kind::Ddl, Dialect::Postgres) => {
+            // pg 无原生 `SHOW CREATE TABLE`（真表 DDL 需拼接器）——批 a 只覆盖视图定义，
+            // 表 → 空结果不报错（能力矩阵如实：`ddl` × pg = 仅视图）。
+            Some(
+                "SELECT c.relname::text AS name, pg_get_viewdef(c.oid)::text AS ddl \
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind IN ('v','m') AND c.relname = ? \
+                        AND n.nspname = current_schema()",
+            )
+        }
+        // ---------------- comment（列注释；sqlite 无注释语义 → unsupported）----------------
+        (Kind::Comment, Dialect::MySql) => Some(
+            "SELECT table_name AS table_name, column_name AS column_name, \
+                  column_comment AS comment \
+                  FROM information_schema.columns \
+                  WHERE table_schema = DATABASE() AND table_name = ? \
+                  ORDER BY ordinal_position",
+        ),
+        (Kind::Comment, Dialect::Postgres) => Some(
+            "SELECT c.relname::text AS table_name, a.attname::text AS column_name, \
+                  col_description(a.attrelid, a.attnum)::text AS comment \
+                  FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relname = ? \
+                        AND n.nspname = current_schema()",
+        ),
+        // ---------------- constraints（PK/UQ/CHECK；FK 走既有 ForeignKeys）----------------
+        // sqlite：CHECK 只存在于建表文本，目录无来源 → unsupported（文本解析归批 b）。
+        (Kind::Constraints, Dialect::MySql) => Some(
+            "SELECT tc.constraint_name AS name, tc.constraint_type AS type, \
+                  NULL AS definition, kcu.column_name AS column, kcu.ordinal_position AS pos \
+                  FROM information_schema.table_constraints tc \
+                  JOIN information_schema.key_column_usage kcu \
+                       ON kcu.constraint_schema = tc.constraint_schema \
+                      AND kcu.constraint_name = tc.constraint_name \
+                  WHERE tc.table_schema = DATABASE() AND tc.table_name = ? \
+                        AND tc.constraint_type IN ('PRIMARY KEY','UNIQUE') \
+                  ORDER BY tc.constraint_name, kcu.ordinal_position",
+        ),
+        (Kind::Constraints, Dialect::Postgres) => Some(
+            "SELECT con.conname::text AS name, \
+                  CASE con.contype WHEN 'p' THEN 'pk' WHEN 'u' THEN 'uq' ELSE 'ck' END AS type, \
+                  pg_get_constraintdef(con.oid)::text AS definition, \
+                  NULL AS column, NULL AS pos \
+                  FROM pg_constraint con \
+                  JOIN pg_class t ON t.oid = con.conrelid \
+                  JOIN pg_namespace n ON n.oid = t.relnamespace \
+                  WHERE con.contype IN ('p','u','c') AND t.relname = ? \
+                        AND n.nspname = current_schema() ORDER BY con.conname",
+        ),
+        // ---------------- stats（估算行数/大小；sqlite 无 catalog 来源 → unsupported）----------------
+        (Kind::Stats, Dialect::MySql) => Some(
+            "SELECT table_name AS name, \
+                  COALESCE(table_rows, 0) AS rows_estimate, \
+                  COALESCE(data_length + index_length, 0) AS size_bytes \
+                  FROM information_schema.tables \
+                  WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+                  ORDER BY table_name",
+        ),
+        (Kind::Stats, Dialect::Postgres) => Some(
+            "SELECT c.relname::text AS name, \
+                  GREATEST(c.reltuples, 0)::bigint::text AS rows_estimate, \
+                  pg_total_relation_size(c.oid)::text AS size_bytes \
+                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind = 'r' AND n.nspname = current_schema() ORDER BY c.relname",
+        ),
+        _ => None,
+    }
+}
+
+/// catalog 行 → 统一 item 形态（截断到 [`MAX_ROWS`]；三方言同构）。
+/// constraints 按 `name` 聚合 `columns`（mysql 的 key_column_usage 是按列多行；
+/// pg 的 definition 自带列信息，`column` 为 NULL 不入聚合）。
+pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
+    match kind {
+        Kind::Constraints => {
+            let mut out: Vec<Value> = Vec::new();
+            let mut cur: Option<String> = None;
+            for r in rows.iter() {
+                let name = str_of(r, "name");
+                if cur.as_deref() != Some(name.as_str()) {
+                    if out.len() >= MAX_ROWS {
+                        break;
+                    }
+                    cur = Some(name.clone());
+                    out.push(json!({
+                        "name": name,
+                        "type": str_of(r, "type").to_lowercase(),
+                        "definition": opt_str(r.get("definition")),
+                        "columns": Vec::<Value>::new(),
+                    }));
+                }
+                if let Some(last) = out.last_mut()
+                    && let Some(col) = opt_str(r.get("column"))
+                {
+                    last["columns"].as_array_mut().unwrap().push(json!(col));
+                }
+            }
+            out
+        }
+        _ => rows
+            .iter()
+            .take(MAX_ROWS)
+            .map(|r| match kind {
+                Kind::Views | Kind::Ddl => json!({
+                    "name": str_of(r, "name"),
+                    "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))),
+                }),
+                Kind::Routines | Kind::Sequences => json!({
+                    "name": str_of(r, "name"),
+                    "type": str_of(r, "type"),
+                }),
+                Kind::Comment => json!({
+                    "table": str_of(r, "table_name"),
+                    "column": str_of(r, "column_name"),
+                    "comment": opt_str(r.get("comment")),
+                }),
+                Kind::Stats => json!({
+                    "name": str_of(r, "name"),
+                    "rowsEstimate": num_of(r, "rows_estimate"),
+                    "sizeBytes": num_of(r, "size_bytes"),
+                }),
+                _ => json!({}),
+            })
+            .collect(),
     }
 }
 
@@ -423,7 +661,117 @@ mod tests {
         assert_eq!(fk[0]["columns"], json!(["b_id", "c_id"]));
         assert_eq!(fk[0]["refColumns"], json!(["id", "code"]));
         assert_eq!(fk[0]["refTable"], json!("p"));
+    }
 
+    // ---- U-14 批 a：catalog 类的静态守卫（同一组离线防线扩展）----
+
+    const CATALOG: [Kind; 7] = [
+        Kind::Views,
+        Kind::Routines,
+        Kind::Sequences,
+        Kind::Ddl,
+        Kind::Comment,
+        Kind::Constraints,
+        Kind::Stats,
+    ];
+
+    /// PG 投影列 `::text` 守卫扩到 catalog 常量（铁律 2：空库不触发、建表后才崩）。
+    #[test]
+    fn catalog_pg_constants_cast_identifiers() {
+        for kind in CATALOG {
+            let Some(s) = catalog_sql(kind, Dialect::Postgres) else {
+                continue;
+            };
+            for id in ["attname", "relname", "conname", "proname", "sequencename"] {
+                let bare = String::from(id) + " AS";
+                let cast = String::from(id) + "::text";
+                assert!(
+                    !s.contains(&bare) || s.contains(&cast),
+                    "{kind:?}: PG 投影列 {id} 缺 ::text: {s}"
+                );
+            }
+            assert!(
+                s.contains("current_schema()"),
+                "{kind:?}: PG 缺 schema 限定: {s}"
+            );
+        }
+    }
+
+    /// catalog 常量：无 LIKE；参数位与 `catalog_param` 一致（0 或 1）；
+    /// 不可 LIMIT 的 kind（Ddl）不得自带 LIMIT 之外的可追加语义冲突。
+    #[test]
+    fn catalog_constants_param_count_and_no_like() {
+        for kind in CATALOG {
+            for d in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+                let Some(s) = catalog_sql(kind, d) else {
+                    continue;
+                };
+                assert!(!s.contains("LIKE"), "{kind:?}/{d:?} 不该用 LIKE: {s}");
+                let want = usize::from(kind.catalog_param());
+                assert_eq!(
+                    s.matches('?').count(),
+                    want,
+                    "{kind:?}/{d:?} 参数位应为 {want}: {s}"
+                );
+            }
+        }
+    }
+
+    /// 能力矩阵锚：批 a 的 sqlite 只覆盖 views/ddl，其余 unsupported（报错不静默）。
+    #[test]
+    fn catalog_sqlite_matrix_matches_plan() {
+        assert!(catalog_sql(Kind::Views, Dialect::Sqlite).is_some());
+        assert!(catalog_sql(Kind::Ddl, Dialect::Sqlite).is_some());
+        for kind in [
+            Kind::Routines,
+            Kind::Sequences,
+            Kind::Comment,
+            Kind::Constraints,
+            Kind::Stats,
+        ] {
+            assert!(
+                catalog_sql(kind, Dialect::Sqlite).is_none(),
+                "{kind:?} × sqlite 应为 unsupported"
+            );
+        }
+    }
+
+    /// mysql SHOW 例外：白名单字符集 + 反引号引用；非法标识符拒绝。
+    #[test]
+    fn mysql_show_create_whitelist() {
+        assert_eq!(mysql_show_create("t").unwrap(), "SHOW CREATE TABLE `t`");
+        for bad in ["t; DROP TABLE x", "t`", "", "粗", "t a"] {
+            assert!(mysql_show_create(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// catalog 归一：constraints 按名聚合列；stats 解析字符串数值（pg ::text 口径）。
+    #[test]
+    fn catalog_normalization() {
+        let cs = catalog(
+            Kind::Constraints,
+            vec![
+                json!({"name": "pk_t", "type": "PRIMARY KEY", "definition": null, "column": "id", "pos": 1}),
+                json!({"name": "pk_t", "type": "PRIMARY KEY", "definition": null, "column": "code", "pos": 2}),
+                json!({"name": "uq_t", "type": "UNIQUE", "definition": null, "column": "email", "pos": 1}),
+            ],
+        );
+        assert_eq!(cs.len(), 2, "{cs:?}");
+        assert_eq!(cs[0]["type"], json!("primary key"));
+        assert_eq!(cs[0]["columns"], json!(["id", "code"]));
+
+        let st = catalog(
+            Kind::Stats,
+            vec![json!({"name": "t", "rows_estimate": "42", "size_bytes": "8192"})],
+        );
+        assert_eq!(st[0]["rowsEstimate"], json!(42.0));
+        assert_eq!(st[0]["sizeBytes"], json!(8192.0));
+    }
+
+    /// 列归一（aggregation_shapes 的余段，评审修订时被拆分——语义不变）：
+    /// sqlite rowid PK 仍可空、default null。
+    #[test]
+    fn columns_rowid_pk_shape() {
         let col = columns(vec![json!({"name": "id", "native_type": "integer",
                                       "not_null": 0, "default": null, "is_pk": 1})]);
         assert_eq!(col[0]["nullable"], json!(true), "sqlite rowid PK 仍可空");

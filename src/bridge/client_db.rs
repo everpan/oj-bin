@@ -47,6 +47,11 @@ pub struct ClientDbEntry {
     /// 登记操作者（`db_policy::operator_of` 取 `user.id`；无身份 None）。
     pub registered_by: Option<String>,
     pub registered_at_ms: u64,
+    /// U-11：连接级能力探测——server 版本串（探测失败/开放方言 = None，降级不阻断登记）。
+    /// 构造期定死（探测在 entry 构造前一次完成），非 Mutex。
+    pub server_version: Option<String>,
+    /// U-11：探测时刻（Unix 毫秒；未探测 = 0）。
+    pub probed_at_ms: u64,
     /// 命中计数（query/exec/stream/内省 经 `lookup` 自动累加）。
     pub queries: AtomicU64,
     pub last_error: Mutex<Option<String>>,
@@ -60,8 +65,54 @@ impl ClientDbEntry {
             "dsn": self.dsn_redacted,
             "registeredBy": self.registered_by,
             "registeredAtMs": self.registered_at_ms,
+            "serverVersion": self.server_version,
+            "probedAtMs": self.probed_at_ms,
             "queries": self.queries.load(Ordering::Relaxed),
         })
+    }
+}
+
+/// U-11：连接级能力探测——一条版本查询 + 3s 超时；失败/超时/开放方言一律 `None`
+/// （降级不阻断：探测是观测增强，不是登记门）。register / reRegister / `db.client.test`
+/// 三处共用（DRY）。
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn probe_version(accessor: &Arc<dyn DataAccessor>, dialect: &str) -> Option<(String, u64)> {
+    probe_version_with(accessor, dialect, PROBE_TIMEOUT).await
+}
+
+/// 超时可参（测试用短超时；生产 [`PROBE_TIMEOUT`]）。
+async fn probe_version_with(
+    accessor: &Arc<dyn DataAccessor>,
+    dialect: &str,
+    timeout: std::time::Duration,
+) -> Option<(String, u64)> {
+    let sql = match dialect {
+        "mysql" | "postgres" => "select version()",
+        "sqlite" => "select sqlite_version()",
+        _ => return None, // 开放方言：不猜 SQL，跳过（None，无 warn——是规划内跳过非故障）
+    };
+    let res = tokio::time::timeout(timeout, accessor.query_with_params(sql, &[])).await;
+    let Ok(Ok(rows)) = res else {
+        eprintln!(
+            "warn: db client capability probe failed for dialect '{dialect}' (degraded; registration unaffected)"
+        );
+        return None;
+    };
+    fn first_str(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(a) => a.first().and_then(first_str),
+            Value::Object(o) => o.values().next().and_then(first_str),
+            _ => None,
+        }
+    }
+    match rows.first().and_then(first_str) {
+        Some(s) => Some((s, now_ms())),
+        None => {
+            eprintln!("warn: db client capability probe returned no row for dialect '{dialect}'");
+            None
+        }
     }
 }
 
@@ -458,6 +509,10 @@ pub async fn op_db_client_register(
         JsErrorBox::generic(e)
     })?;
     let dialect = accessor.dialect_info().name.clone();
+    let (server_version, probed_at_ms) = probe_version(&accessor, &dialect)
+        .await
+        .map(|(s, t)| (Some(s), t))
+        .unwrap_or((None, 0));
     let dsn_redacted = crate::secret::redact(&dsn);
     let registered_by =
         db_policy::operator_of(state.borrow().borrow::<super::ReqState>().req.user.as_ref());
@@ -467,6 +522,8 @@ pub async fn op_db_client_register(
         dialect: dialect.clone(),
         registered_by,
         registered_at_ms: now_ms(),
+        server_version,
+        probed_at_ms,
         queries: AtomicU64::new(0),
         last_error: Mutex::new(None),
     };
@@ -502,7 +559,16 @@ pub async fn op_db_client_test(
     };
     let dialect = accessor.dialect_info().name.clone();
     match accessor.query_with_params("select 1", &[]).await {
-        Ok(_) => Ok(serde_json::json!({ "ok": true, "dialect": dialect })),
+        Ok(_) => {
+            let (server_version, probed_at_ms) = probe_version(&accessor, &dialect)
+                .await
+                .map(|(s, t)| (Some(s), t))
+                .unwrap_or((None, 0));
+            Ok(serde_json::json!({
+                "ok": true, "dialect": dialect,
+                "serverVersion": server_version, "probedAtMs": probed_at_ms,
+            }))
+        }
         Err(e) => {
             Ok(serde_json::json!({ "ok": false, "dialect": dialect, "error": e.to_string() }))
         }
@@ -561,6 +627,10 @@ pub async fn op_db_client_re_register(
         JsErrorBox::generic(e)
     })?;
     let dialect = accessor.dialect_info().name.clone();
+    let (server_version, probed_at_ms) = probe_version(&accessor, &dialect)
+        .await
+        .map(|(s, t)| (Some(s), t))
+        .unwrap_or((None, 0));
     let dsn_redacted = crate::secret::redact(&dsn);
     let registered_by =
         db_policy::operator_of(state.borrow().borrow::<super::ReqState>().req.user.as_ref());
@@ -570,6 +640,8 @@ pub async fn op_db_client_re_register(
         dialect: dialect.clone(),
         registered_by,
         registered_at_ms: now_ms(),
+        server_version,
+        probed_at_ms,
         queries: AtomicU64::new(0),
         last_error: Mutex::new(None),
     };
@@ -740,6 +812,8 @@ pub async fn op_db_access_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::db::InMemoryAccessor;
+    use serde_json::json;
 
     #[test]
     fn registry_register_and_overwrite() {
@@ -750,6 +824,8 @@ mod tests {
             dialect: "sqlite".into(),
             registered_by: None,
             registered_at_ms: 0,
+            server_version: None,
+            probed_at_ms: 0,
             queries: AtomicU64::new(0),
             last_error: Mutex::new(None),
         };
@@ -791,6 +867,8 @@ mod tests {
             dialect: "sqlite".into(),
             registered_by: by.map(|s| s.to_string()),
             registered_at_ms: 0,
+            server_version: None,
+            probed_at_ms: 0,
             queries: AtomicU64::new(0),
             last_error: Mutex::new(None),
         };
@@ -834,6 +912,109 @@ mod tests {
         drop(a);
         let _ = r.try_acquire_stream().unwrap(); // 释放后可再占
         drop(b);
+    }
+
+    // ---- U-11 连接级能力探测 ----
+
+    /// 挂起 accessor（超时路径夹具；查询永不返回）。
+    struct HangingAccessor;
+
+    #[async_trait::async_trait]
+    impl DataAccessor for HangingAccessor {
+        async fn query_with_params(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> crate::bridge::BridgeResult<Vec<Value>> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(vec![])
+        }
+        async fn exec_with_params(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> crate::bridge::BridgeResult<i64> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(0)
+        }
+    }
+
+    /// 探测三态：成功取串 / 失败与超时降级 None / 开放方言跳过。
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_version_degrades_and_times_out() {
+        let ok = Arc::new(InMemoryAccessor::new());
+        ok.seed(vec![serde_json::json!("3.45.1")]);
+        let ok: Arc<dyn DataAccessor> = ok;
+        assert_eq!(
+            probe_version(&ok, "sqlite").await.unwrap().0,
+            "3.45.1",
+            "成功路径取首行首列"
+        );
+        // 开放方言：跳过（不发 SQL 也拿不到）
+        assert!(probe_version(&ok, "oracle").await.is_none());
+        // 失败 → None（InMemoryAccessor::set_error）
+        let failing = Arc::new(InMemoryAccessor::new());
+        failing.set_error("boom");
+        let failing: Arc<dyn DataAccessor> = failing;
+        assert!(probe_version(&failing, "sqlite").await.is_none());
+        // 超时 → None（短超时 + 挂起 accessor）
+        let hang: Arc<dyn DataAccessor> = Arc::new(HangingAccessor);
+        assert!(
+            probe_version_with(&hang, "sqlite", std::time::Duration::from_millis(50))
+                .await
+                .is_none()
+        );
+    }
+
+    /// Bridge 级：register 真库（temp sqlite）后 list 透出版本；test 同样返回。
+    #[tokio::test(flavor = "current_thread")]
+    async fn register_probes_server_version() {
+        use crate::bridge::db_backend::DbBackendRegistry;
+        use crate::bridge::{Bridge, Extras, InMemoryKV, SchemaRegistry};
+        use std::path::PathBuf;
+        let p = std::env::temp_dir().join(format!("oj-probe-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        std::fs::File::create(&p).unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                Arc::new(InMemoryAccessor::new()) as _,
+            )]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                db_client: Some(Arc::new(DbClientSection {
+                    enabled: true,
+                    max_entries: 8,
+                    max_per_owner: 8,
+                    max_streams: 8,
+                    allow: Default::default(),
+                })),
+                db_backend: Some(Arc::new(DbBackendRegistry::builtin())),
+                config_dir: Some(Arc::new(PathBuf::from("."))),
+                ..Default::default()
+            },
+        );
+        let src = format!(
+            r#"(async () => {{
+              await db.client.register("rep", "sqlite://{}");
+              const e = (await db.client.list())[0];
+              const t = await db.client.test("sqlite://{}");
+              return json.ok({{ v: e.serverVersion, probed: e.probedAtMs > 0,
+                                tv: t.serverVersion }});
+            }})().catch(e => json.fail(500, String(e)))"#,
+            p.display(),
+            p.display()
+        );
+        let cap = b.run(&src).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        let s = v["data"]["v"].as_str().unwrap_or_default();
+        assert!(s.starts_with('3'), "sqlite 版本串形如 3.x.y：{v}");
+        assert_eq!(v["data"]["probed"], json!(true), "{v}");
+        assert_eq!(v["data"]["tv"], v["data"]["v"], "test 与 list 同源：{v}");
     }
 
     // 无关 `AllowList` 默认形态（确保引用不被误删）。

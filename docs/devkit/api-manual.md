@@ -1143,11 +1143,13 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 
 db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布，与本手册同源）：
 `DB(name)` / `db.query` / `db.exec` / `db.table` / `db.tx`（请求内事务）/ `db.stream` /
-`db.cancel`（跨请求取消，v0.1.96）/ `db.session`（跨请求事务，v0.1.95）/ 结构内省 / `db.client` 动态数据源登记 /
+`db.cancel`（跨请求取消，v0.1.96）/ `db.session`（跨请求事务，v0.1.95）/ 结构内省（含
+`db.catalog`，v0.1.100）/ `db.client` 动态数据源登记（含 `serverVersion` 探测，v0.1.100）/
 `db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、查询构造器、SQL 执行追踪等，
-统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1）。
-安全审计检索 `audit.query`（v0.1.98，全局对象；`DB_CLIENT_*` / `DB_ACCESS_AUDIT` / `DB_SESSION_*`
-统一出口 + 进程内环形存储）见 `db-guide.md` §11.7。
+统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1，
+`db.catalog` 见其 §6 与能力矩阵）。
+安全审计检索 `audit.query`（v0.1.98，全局对象）见 `db-guide.md` §11.7；管理面 connector
+`globalThis.mgmt`（v0.1.100，特权面）见 `db-guide.md` §11.8。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -3793,6 +3795,8 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.cancel` 跨请求取消只覆盖**流式**执行（v0.1.96） | `executionId` 来自 `db.stream` 的 `onOpen`/`executionId()`；同一主体任意请求可消，重复取消幂等。取消后发起方**下一次拉取抛错** `db stream exec_… was cancelled via db.cancel`（不是静默 done）；未知/已结束/他人 id 一律 `execution exec_… not found`（不泄露存在性，日志/错误只出前 8 字符）。非流式 `db.query/exec` 无后端句柄 → 报 not found；长查询要可取消请改 `db.stream`（见 `db-guide.md` §3.1） |
 | `db.client` 配额三件（U-7，v0.1.97） | ① 同主体登记数达 `db_client.max_per_owner` → register 报 `per-owner cap N reached`（delete 释放）；② 动态库全局流预算达 `db_client.max_streams` → `db.stream` 报 `stream budget exhausted`（随流结束自动释放，不排队）；③ `test/register/reRegister` 拨号 5s 超时，同主体**连续 8 次 connect 失败锁退 60s**（拨号前即拒，错误带 retry 秒数；成功清零）。拒绝落 `DB_CLIENT_DENY` 日志。详见 `db-guide.md` §11.6 |
 | G9 服务端防护门三件（v0.1.99，op 层强制——不经任何包 handler 直发 op 也拦得住） | ① **只读会话位**：`db.session.begin({readOnly: true})` → 该会话 Write/DDL 拒，错误 `db session on alias '…' is read-only; …`，`e.sessionDisposition === "keep"`（会话保留）；② **写拦截**即①的 op 层强制（attach 路径与 `db.session.query/exec` 双入口）+ 既有 `db_access.read_only` 文本级拦截；③ **危险语句确认门**：`db_access.<alias>.dangerous_confirm_token` 配置后，危险写（无 WHERE/恒真）须请求头 `x-oj-confirm` 精确匹配，否则报 `… requires confirmation for dangerous statements…`；放行即落 `DB_DANGEROUS_CONFIRM` 审计。见 `db-guide.md` §4.5 / §11.5 |
+| `db.catalog` 能力矩阵与 unsupported（v0.1.100） | kind × 方言不支持 → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` 点名），**不静默回落**。批 a 矩阵：sqlite 仅 `views`/`ddl`；mysql 全部（`sequences` 为 auto_increment 模拟）；pg 除 mysql 式 `sequences` 外全部；`ddl` × pg 仅视图定义。未知 kind → `db catalog: unknown kind …`。行数上限 1000；`stats` 只估算。见 `db-guide.md` §6 表与 §10 |
+| `mgmt` 管理面（v0.1.100，M1 宿主面） | 缺省 disabled（`mgmt.*` 报 `mgmt is disabled…`）；`mgmt.axes` 收编的轴从 `axis()` 公开面消失（旁路封堵）；未声明 op → `OJ_MGMT_UNSUPPORTED`；register 探活失败即拒；双档 allow（read/write，缺省 fail-closed，enabled 时 allow 全缺拒启）。**readOnly 是插件自报、宿主不可验证**（connector 须第一方）。mongo 真 connector（M2）未交付。见 `db-guide.md` §11.8 |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |
