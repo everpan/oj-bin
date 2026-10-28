@@ -1524,6 +1524,39 @@ const ep = db.epoch("rep");   // host 权威；存起来下次比对，不一致
 > 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记）——U-3 的 epoch 只是优化 JS 缓存新鲜度，
 > 不是安全边界。
 
+## 11.7 安全审计（`audit:` 段 + `audit.query`，U-9 v0.1.98）
+
+安全审计事件**统一出口**：`DB_CLIENT_AUDIT`（register/delete/reRegister）、`DB_CLIENT_DENY`
+（配额/预算/拨号拒绝，U-7）、`DB_ACCESS_AUDIT`（grant/revoke，U-1）、`DB_SESSION_*`
+（会话 begin/commit/rollback/timeout/discard，U-4——**reaper 后台判死也入库**）。
+每条事件一个类型：`{tsMs, kind, user, tenant, module, source, alias, detail}`——**零凭据**
+（只有 alias / 动作 / 前 8 字符 id，无 DSN 无密码）。
+
+```yaml
+audit:
+  enabled: true           # 缺省开（有界环形、零凭据事件）；false 时只打日志不落存储。
+  max_entries: 2000       # 环形缓冲上限（超限丢最旧）。0 拒启动。
+  retention_secs: 86400   # 留存时长（超龄自动清理，push/query 双点清）。0 拒启动。
+  allow: { roles: [auditor] }  # audit.query 的读取门（每调用重判）。缺省不限制 → 装配期 warn。
+```
+
+```js
+const evs = await audit.query({ kind: "DB_SESSION_TIMEOUT", sinceMs: Date.now() - 3600e3, limit: 50 });
+// → [{tsMs, kind, user, tenant, module, source, alias, detail}, …]（最新在前）
+```
+
+- **stderr 行归一**：所有事件统一打 `OJ_AUDIT: kind=… user=… tenant=… alias=… detail="…"`
+  （v0.1.98 起，旧的 `DB_CLIENT_AUDIT:` / `DB_SESSION_*:` 散点前缀退役——**日志解析器需更新**）。
+- **存储是进程内有界环形缓冲**：条数 + 年龄双限自动清理（无后台 reaper，push/query 顺带清）；
+  **不跨重启**（进程退出即清零）。跨重启持久化 / 防篡改需接外部 sink（从 `audit::emit` 单一出口接，
+  不散点）——登记为已知限制。
+- **`audit.query` 即导出通道**：过滤器 `kind / user / tenant / alias / sinceMs / untilMs / limit`
+  （缺省 100 条，硬顶 1000，最新在前）；handler 拿到 JSON 自行服务（CSV/下载/前端表格皆可）。
+- **读取门**：`audit.allow` 四维并集（同 `db_client.allow` 形态），每个调用重判；缺省不限制
+  （事件进程内、零凭据）——**生产应收紧**，装配期会 warn 点名。
+- **与 `db.sqlProfile()` 的边界**：SQL 级画像（耗时/行数/成败/逐条 SQL）走 sql_trace 的 per-request
+  出口（dev 画像，不进审计存储——全量 SQL 入库内存不可控）；`audit` 只收**安全事件**。
+
 ## 12. 延伸阅读
 
 - [`docs/devkit/api-manual.md`](api-manual.md) —— 权威 API 参考（§6「db / DB(name)」

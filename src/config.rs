@@ -1417,6 +1417,11 @@ pub struct Config {
     /// 见 `docs/plans/2026-10-28-dbx-web-l7-u4-cross-request-tx.md`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_session: crate::bridge::db_policy::DbSessionSection,
+    /// 安全审计（U-9，v0.1.98，`audit:` 段）：统一事件出口 + 进程内有界环形存储。
+    /// `enabled` 缺省 **true**（零凭据事件、双限自动清理）；`allow` 缺省不限制
+    /// （`audit.query` 的读取门；enabled 且不限制时装配期 warn 提示收紧）。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub audit: crate::bridge::db_policy::AuditSection,
     /// SQL 执行追踪（v0.1.51）：`enabled` 缺省时 dev 自动开、release 自动关；其余字段见 `SqlTraceCfg`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_trace: SqlTraceCfg,
@@ -1468,6 +1473,7 @@ pub fn known_top_level_keys() -> &'static [&'static str] {
         "db_access",
         "db_client",
         "db_session",
+        "audit",
     ]
 }
 
@@ -1751,13 +1757,14 @@ cache:
             keys.iter().collect::<std::collections::HashSet<_>>().len()
         );
         for k in keys {
-            // `db_access` / `db_client` / `db_session` 是 mapping 类型（不接受 null），
+            // `db_access` / `db_client` / `db_session` / `audit` 是 mapping 类型（不接受 null），
             // 其余已知段用 `null` 探测即可（取默认值且不落入 extra）。
-            let yaml = if *k == "db_access" || *k == "db_client" || *k == "db_session" {
-                format!("{k}: {{}}\n")
-            } else {
-                format!("{k}: null\n")
-            };
+            let yaml =
+                if *k == "db_access" || *k == "db_client" || *k == "db_session" || *k == "audit" {
+                    format!("{k}: {{}}\n")
+                } else {
+                    format!("{k}: null\n")
+                };
             let v: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
             let extra = split_extra(&v);
             assert!(extra.get(*k).is_none(), "known key '{k}' leaked into extra");

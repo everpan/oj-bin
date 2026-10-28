@@ -1343,10 +1343,30 @@ pub async fn assemble_backend(
             }
         }
     }
+    // 安全审计（`audit:`，U-9 v0.1.98）：缺省开（有界环形、零凭据）；0 值拒启；
+    // 读面不限制只 warn（新段不 brick 既有部署，但生产应收紧）。
+    let audit = Arc::new(cfg.audit.clone());
+    if audit.enabled {
+        if audit.max_entries == 0 {
+            return Err("audit.enabled=true requires audit.max_entries >= 1".to_string());
+        }
+        if audit.retention_secs == 0 {
+            return Err("audit.enabled=true requires audit.retention_secs >= 1".to_string());
+        }
+        if audit.allow.is_unrestricted() {
+            eprintln!(
+                "warn: audit is enabled but audit.allow is unrestricted — any caller may query \
+                 audit events via audit.query (events are in-process and credential-free); \
+                 tighten audit.allow in production"
+            );
+        }
+    }
+    let audit_store = Arc::new(only_js::bridge::audit::AuditStore::new(&audit));
     // 会话注册表（进程级）：装配层构造一次，Extras 与 StableState 共享同一 Arc——
     // 热更只 clone StableState，故已开会话跨热更存活（跨请求语义的应有结果）。
     let tx_sessions = Arc::new(only_js::bridge::db_session::TxSessionRegistry::new(
         (*db_session).clone(),
+        audit_store.clone(),
     ));
     // 执行登记表（U-5 v0.1.96）：同 tx_sessions——装配层构造一次，热更前后同一 Arc
     // （存活流的可取消性跨热更有效）。
@@ -1409,6 +1429,8 @@ pub async fn assemble_backend(
         // 影子绑定：同 db_client —— 会话配置与注册表也须与 StableState 同一 Arc。
         let db_session = db_session.clone();
         let tx_sessions = tx_sessions.clone();
+        let audit = audit.clone();
+        let audit_store = audit_store.clone();
         let exec_sessions = exec_sessions.clone();
         let client_dbs = client_dbs.clone();
         let db_access_rt = db_access_rt.clone();
@@ -1466,6 +1488,8 @@ pub async fn assemble_backend(
                     db_client: Some(db_client.clone()),
                     db_session: Some(db_session.clone()),
                     tx_sessions: Some(tx_sessions.clone()),
+                    audit_section: Some(audit.clone()),
+                    audit: Some(audit_store.clone()),
                     exec_sessions: Some(exec_sessions.clone()),
                     client_dbs: Some(client_dbs.clone()),
                     db_access_rt: Some(db_access_rt.clone()),
@@ -1527,6 +1551,8 @@ pub async fn assemble_backend(
         db_session: db_session.clone(), // 与 make_bridge 的 Extras.db_session 同源（同一 Arc）。
         client_dbs: client_dbs.clone(), // 与 make_bridge 的 Extras.client_dbs 同源（同一 Arc）。
         tx_sessions: tx_sessions.clone(), // 与 make_bridge 的 Extras.tx_sessions 同一注册表。
+        audit_section: audit.clone(), // 与 make_bridge 的 Extras.audit_section 同一 Arc。
+        audit: audit_store.clone(), // 与 make_bridge 的 Extras.audit 同一存储。
         exec_sessions: exec_sessions.clone(), // 与 make_bridge 的 Extras.exec_sessions 同一注册表。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。

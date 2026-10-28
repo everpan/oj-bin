@@ -1060,4 +1060,41 @@ interface OjRabbitClient {
 // 而非报 TS2307；已存在、能被 `paths` 命中的别名仍走真实文件类型。运行时由 oj 的
 // loader 解析，本文件与该兜底只影响编辑器 / tsc。
 
+/** 一条安全审计事件（`audit.query()` 的元素，v0.1.98）。零凭据：只有 alias/动作/前缀 id。 */
+interface AuditEntry {
+  /** 事件时刻（Unix 毫秒）。 */
+  tsMs: number;
+  /** 事件族：`DB_CLIENT_AUDIT` / `DB_CLIENT_DENY` / `DB_ACCESS_AUDIT` / `DB_SESSION_*`。 */
+  kind: string;
+  /** 操作者（`user.id`；无身份 null）。 */
+  user: string | null;
+  tenant: string | null;
+  module: string | null;
+  /** 请求来源：`http` / `task`。 */
+  source: string;
+  /** 库别名。 */
+  alias: string;
+  /** 动作与原因（如 `action=register dialect=mysql`、`id=tx_ab12_… reason=idle_timeout`）。 */
+  detail: string;
+}
+
+/**
+ * 安全审计检索（v0.1.98，`audit:` 段）。统一出口：`DB_CLIENT_*` / `DB_ACCESS_AUDIT` /
+ * `DB_SESSION_*` 全部落此。进程内有界环形缓冲（缺省 2000 条 / 24h，双限自动清理），
+ * **不跨重启**；读门 = `audit.allow`（每调用重判）。`query` 即导出通道。
+ * filter 各维可选：kind / user / tenant / alias / sinceMs / untilMs / limit（缺省 100，硬顶 1000）。
+ * 返回最新在前。
+ */
+declare const audit: {
+  query(filter?: {
+    kind?: string;
+    user?: string;
+    tenant?: string;
+    alias?: string;
+    sinceMs?: number;
+    untilMs?: number;
+    limit?: number;
+  }): Promise<AuditEntry[]>;
+};
+
 export {};

@@ -1146,6 +1146,8 @@ db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布
 `db.cancel`（跨请求取消，v0.1.96）/ `db.session`（跨请求事务，v0.1.95）/ 结构内省 / `db.client` 动态数据源登记 /
 `db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、查询构造器、SQL 执行追踪等，
 统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1）。
+安全审计检索 `audit.query`（v0.1.98，全局对象；`DB_CLIENT_*` / `DB_ACCESS_AUDIT` / `DB_SESSION_*`
+统一出口 + 进程内环形存储）见 `db-guide.md` §11.7。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 

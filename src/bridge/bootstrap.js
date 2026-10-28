@@ -49,6 +49,7 @@ import {
   op_db_access_grant,
   op_db_access_revoke,
   op_db_epoch,
+  op_audit_query,
   op_db_session_begin,
   op_db_session_attach,
   op_db_session_detach,
@@ -1201,6 +1202,19 @@ if (globalThis.db) {
   // previously seen value). Read-only; no privilege.
   globalThis.db.epoch = (name) => op_db_epoch(String(name));
 }
+// ----- U-9 v0.1.98: security audit query (unified exit for DB_CLIENT_*/DB_ACCESS_AUDIT/DB_SESSION_*)
+// In-process bounded ring buffer; retention by count+age. Gated by audit.allow (re-checked per
+// call). filter: {kind?, user?, tenant?, alias?, sinceMs?, untilMs?, limit?}; newest first.
+// This doubles as the export channel (handlers serve the JSON as they see fit).
+globalThis.audit = {
+  query: async (filter) => {
+    try {
+      return await op_audit_query(filter === undefined ? null : filter);
+    } catch (e) {
+      throw normDbErr(e);
+    }
+  },
+};
 
 // ----- safe query builder (fluent, structured) -----
 // usage: db.table("user").select(["id","name"]).where({field:"age",op:"gte",value:18})

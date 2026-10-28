@@ -22,6 +22,7 @@
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
 mod accessor_sqlx;
+pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod broker;
@@ -241,6 +242,11 @@ pub struct StableState {
     /// clone `stable`），故会话跨热更存活（这是「跨请求」的应有语义）；配置变更走
     /// `restart_pending`（不与存活会话打架）。
     pub tx_sessions: Arc<db_session::TxSessionRegistry>,
+    /// 安全审计配置段（U-9 v0.1.98，`audit:`）：`audit.query` 的读取门在查询时用。
+    pub audit_section: Arc<db_policy::AuditSection>,
+    /// 安全审计存储（U-9 v0.1.98）：统一事件出口的进程内有界环形缓冲。热更存活
+    /// （装配层注入同一 Arc，与 tx_sessions 同款）。
+    pub audit: Arc<audit::AuditStore>,
     /// 执行登记表（U-5 v0.1.96）：`db.cancel(executionId)` 的跨请求路由表。
     /// 进程级生命周期（热更存活），无配置段（取消判权只看归属主体）。
     pub exec_sessions: Arc<db_exec::ExecRegistry>,
@@ -335,6 +341,9 @@ pub struct Extras {
     /// 跨请求事务会话注册表（装配层构造后注入，以便热更前后同源）。
     /// None = 按 `db_session` 配置现造一个（`oj test` / 嵌入式路径）。
     pub tx_sessions: Option<Arc<db_session::TxSessionRegistry>>,
+    /// 安全审计段与存储（装配层构造后注入，以便热更前后同源）。None = 缺省段 + 新存储。
+    pub audit_section: Option<Arc<db_policy::AuditSection>>,
+    pub audit: Option<Arc<audit::AuditStore>>,
     /// 执行登记表（装配层构造后注入，以便热更前后同源）。None = 进程内新表。
     pub exec_sessions: Option<Arc<db_exec::ExecRegistry>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
@@ -511,6 +520,7 @@ deno_core::extension!(
         client_db::op_db_access_revoke,
         client_db::op_db_epoch,
         db_exec::op_db_cancel,
+        audit::op_audit_query,
         db_session::op_db_session_begin,
         db_session::op_db_session_attach,
         db_session::op_db_session_detach,
@@ -876,9 +886,15 @@ impl Bridge {
             .db_session
             .clone()
             .unwrap_or_else(|| Arc::new(db_policy::DbSessionSection::default()));
+        let audit_section = extras.audit_section.clone().unwrap_or_default();
+        let audit_store = extras
+            .audit
+            .clone()
+            .unwrap_or_else(|| Arc::new(audit::AuditStore::new(&audit_section)));
         let tx_sessions = extras.tx_sessions.clone().unwrap_or_else(|| {
             Arc::new(db_session::TxSessionRegistry::new(
                 (*db_session_cfg).clone(),
+                audit_store.clone(),
             ))
         });
         let exec_sessions = extras.exec_sessions.clone().unwrap_or_default();
@@ -924,6 +940,8 @@ impl Bridge {
                 .client_dbs
                 .unwrap_or_else(|| Arc::new(client_db::ClientDbRegistry::new(16))),
             tx_sessions,
+            audit_section,
+            audit: audit_store,
             exec_sessions,
             db_access_rt: extras
                 .db_access_rt
@@ -2644,6 +2662,8 @@ mod tests {
             db_session: Arc::new(db_policy::DbSessionSection::default()),
             client_dbs: Arc::new(client_db::ClientDbRegistry::new(16)),
             tx_sessions: Arc::new(db_session::TxSessionRegistry::disabled()),
+            audit_section: Arc::new(db_policy::AuditSection::default()),
+            audit: Arc::new(audit::AuditStore::new(&db_policy::AuditSection::default())),
             exec_sessions: Arc::new(db_exec::ExecRegistry::default()),
             db_access_rt: Arc::new(Mutex::new(HashMap::new())),
             db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),

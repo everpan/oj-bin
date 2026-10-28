@@ -32,8 +32,10 @@ use deno_error::JsErrorBox;
 use serde_json::Value;
 
 use super::StableState;
+use super::audit;
 use super::db::DataAccessor;
 use super::db_policy::{self, AllowList, DbAccess, DbClientSection, Enforce};
+use super::handle_core::Owner;
 
 /// 已登记动态数据源的逐别名记账条目。
 pub struct ClientDbEntry {
@@ -311,25 +313,39 @@ pub(crate) fn client_gate(
     Ok(())
 }
 
-/// 审计日志（结构化；非防篡改，但比 `deny_log` 更适合安全敏感事件）。
-fn audit(state: &Rc<RefCell<OpState>>, action: &str, alias: &str, dialect: &str) {
+/// 审计事件上下文（U-9 归一）：owner（tenant/user/module/source）+ 审计存储。
+/// DB_CLIENT_AUDIT / DB_ACCESS_AUDIT / DB_CLIENT_DENY 三族共用，别再散点 `eprintln!`。
+fn audit_ctx(state: &Rc<RefCell<OpState>>) -> (Owner, Arc<StableState>) {
     let g = state.borrow();
-    let st = g.borrow::<Arc<StableState>>();
+    let st = g.borrow::<Arc<StableState>>().clone();
     let rs = g.borrow::<super::ReqState>();
-    let module = rs.module.clone();
     let source = if st.tasks_flag.is_some() {
         "task"
     } else {
         "http"
     };
-    let operator = db_policy::operator_of(rs.req.user.as_ref());
-    let tenant = if rs.req.anonymous {
-        None
-    } else {
-        rs.req.tenant_id.clone()
+    let owner = Owner {
+        tenant: if rs.req.anonymous {
+            None
+        } else {
+            rs.req.tenant_id.clone()
+        },
+        user: db_policy::operator_of(rs.req.user.as_ref()),
+        module: rs.module.clone(),
+        source,
     };
-    eprintln!(
-        "DB_CLIENT_AUDIT: action={action} alias={alias} dialect={dialect} operator={operator:?} module={module:?} tenant={tenant:?} source={source}"
+    (owner, st)
+}
+
+/// 审计日志（结构化；非防篡改，但比 deny 更适合安全敏感事件）。U-9：经统一出口。
+fn audit(state: &Rc<RefCell<OpState>>, action: &str, alias: &str, dialect: &str) {
+    let (owner, st) = audit_ctx(state);
+    audit::emit(
+        &st.audit,
+        "DB_CLIENT_AUDIT",
+        &owner,
+        alias,
+        &format!("action={action} dialect={dialect}"),
     );
 }
 
@@ -347,9 +363,22 @@ fn dial_owner(state: &Rc<RefCell<OpState>>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// U-7：配额/预算拒绝的结构化日志（与 `DB_CLIENT_AUDIT` 同形态；U-9 归一时的出口之一）。
-fn deny_log(action: &str, reason: &str, owner: &str, alias: &str) {
-    eprintln!("DB_CLIENT_DENY: action={action} reason={reason} owner={owner} alias={alias}");
+/// U-7：配额/预算拒绝的结构化日志。U-9：经统一出口（owner 从请求推导，`owner` 串进 detail）。
+pub(crate) fn deny_log(
+    state: &Rc<RefCell<OpState>>,
+    action: &str,
+    reason: &str,
+    owner: &str,
+    alias: &str,
+) {
+    let (o, st) = audit_ctx(state);
+    audit::emit(
+        &st.audit,
+        "DB_CLIENT_DENY",
+        &o,
+        alias,
+        &format!("action={action} reason={reason} caller={owner}"),
+    );
 }
 
 /// U-7：拨号守卫——锁退检查 → 5s 超时 connect → 记账（成功清零 / 失败累加，达阈值锁退）。
@@ -424,7 +453,7 @@ pub async fn op_db_client_register(
     // connect 是异步且会开真实连接池——锁前完成，绝不持锁跨 await。
     let owner = dial_owner(&state);
     let accessor = guarded_connect(&st, &dsn, &owner).await.map_err(|e| {
-        deny_log("register", "dial_rejected", &owner, &name);
+        deny_log(&state, "register", "dial_rejected", &owner, &name);
         JsErrorBox::generic(e)
     })?;
     let dialect = accessor.dialect_info().name.clone();
@@ -466,7 +495,7 @@ pub async fn op_db_client_test(
     let accessor = match guarded_connect(&st, &dsn, &owner).await {
         Ok(a) => a,
         Err(e) => {
-            deny_log("test", "dial_rejected", &owner, "-");
+            deny_log(&state, "test", "dial_rejected", &owner, "-");
             return Ok(serde_json::json!({ "ok": false, "error": e }));
         }
     };
@@ -527,7 +556,7 @@ pub async fn op_db_client_re_register(
     }
     let owner = dial_owner(&state);
     let accessor = guarded_connect(&st, &dsn, &owner).await.map_err(|e| {
-        deny_log("reRegister", "dial_rejected", &owner, &name);
+        deny_log(&state, "reRegister", "dial_rejected", &owner, &name);
         JsErrorBox::generic(e)
     })?;
     let dialect = accessor.dialect_info().name.clone();
@@ -590,25 +619,15 @@ pub fn op_db_epoch(state: &mut OpState, #[string] name: &str) -> u64 {
     state.borrow::<Arc<StableState>>().client_dbs.epoch_of(name)
 }
 
-/// U-1 v0.1.93：动态授权审计（安全敏感度高于 register）：结构化事件，含 allow 维。
+/// U-1 v0.1.93：动态授权审计（安全敏感度高于 register）。U-9：经统一出口。
 fn audit_access(state: &Rc<RefCell<OpState>>, action: &str, alias: &str, allow: &AllowList) {
-    let g = state.borrow();
-    let st = g.borrow::<Arc<StableState>>();
-    let rs = g.borrow::<super::ReqState>();
-    let module = rs.module.clone();
-    let source = if st.tasks_flag.is_some() {
-        "task"
-    } else {
-        "http"
-    };
-    let operator = db_policy::operator_of(rs.req.user.as_ref());
-    let tenant = if rs.req.anonymous {
-        None
-    } else {
-        rs.req.tenant_id.clone()
-    };
-    eprintln!(
-        "DB_ACCESS_AUDIT: action={action} alias={alias} allow={allow:?} operator={operator:?} module={module:?} tenant={tenant:?} source={source}"
+    let (owner, st) = audit_ctx(state);
+    audit::emit(
+        &st.audit,
+        "DB_ACCESS_AUDIT",
+        &owner,
+        alias,
+        &format!("action={action} allow={allow:?}"),
     );
 }
 

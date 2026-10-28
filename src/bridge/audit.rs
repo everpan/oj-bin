@@ -21,16 +21,16 @@
 //! 完整凭据 id（`handle_core::id_prefix` 负责遮蔽，构造方负责不喂明文）。
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use super::StableState;
 use super::db_policy::{self, AccessCtx, AuditSection};
 use super::handle_core::Owner;
-use super::{ReqState, StableState};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -115,34 +115,33 @@ impl AuditStore {
     }
 
     /// 检索（最新在前；过滤器各维独立生效）。顺带清超龄。
-    pub fn query(
-        &self,
-        kind: Option<&str>,
-        user: Option<&str>,
-        tenant: Option<&str>,
-        alias: Option<&str>,
-        since_ms: Option<u64>,
-        until_ms: Option<u64>,
-        limit: usize,
-    ) -> Vec<AuditEvent> {
+    pub(crate) fn query(&self, f: &AuditFilter) -> Vec<AuditEvent> {
         let now = ms_now();
         let mut g = lock(&self.inner);
         let cutoff = now.saturating_sub(self.retention.as_millis() as u64);
-        while g.front().is_some_and(|f| f.ts_ms < cutoff) {
+        while g.front().is_some_and(|x| x.ts_ms < cutoff) {
             g.pop_front();
         }
         let mut out: Vec<AuditEvent> = g
             .iter()
-            .filter(|e| kind.is_none_or(|k| e.kind == k))
-            .filter(|e| user.is_none_or(|u| e.user.as_deref() == Some(u)))
-            .filter(|e| tenant.is_none_or(|t| e.tenant.as_deref() == Some(t)))
-            .filter(|e| alias.is_none_or(|a| e.alias == a))
-            .filter(|e| since_ms.is_none_or(|s| e.ts_ms >= s))
-            .filter(|e| until_ms.is_none_or(|u| e.ts_ms <= u))
+            .filter(|e| f.kind.as_deref().is_none_or(|k| e.kind == k))
+            .filter(|e| {
+                f.user
+                    .as_deref()
+                    .is_none_or(|u| e.user.as_deref() == Some(u))
+            })
+            .filter(|e| {
+                f.tenant
+                    .as_deref()
+                    .is_none_or(|t| e.tenant.as_deref() == Some(t))
+            })
+            .filter(|e| f.alias.as_deref().is_none_or(|a| e.alias == a))
+            .filter(|e| f.since_ms.is_none_or(|s| e.ts_ms >= s))
+            .filter(|e| f.until_ms.is_none_or(|u| e.ts_ms <= u))
             .cloned()
             .collect();
         out.reverse(); // 最新在前
-        out.truncate(limit);
+        out.truncate(f.limit);
         out
     }
 
@@ -151,6 +150,7 @@ impl AuditStore {
     }
 
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         lock(&self.inner).len()
     }
@@ -161,6 +161,17 @@ fn ms_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// `audit.query` 的过滤器（各维可选；Rust 侧结构，op 层从 JSON 归一）。
+pub(crate) struct AuditFilter {
+    kind: Option<String>,
+    user: Option<String>,
+    tenant: Option<String>,
+    alias: Option<String>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    limit: usize,
 }
 
 /// 统一 emit：stderr 归一行 + 入库（store disabled 时只打日志）。
@@ -189,7 +200,7 @@ fn require_gate(state: &OpState) -> Result<(), JsErrorBox> {
             "audit is disabled (set audit.enabled: true to record and query audit events)",
         ));
     }
-    let (module, roles, tenant, source) = db_policy::identity(state);
+    let (module, roles, tenant, source) = db_policy::identity_of(state);
     let ctx = AccessCtx {
         module: module.as_deref(),
         roles,
@@ -222,24 +233,17 @@ pub fn op_audit_query(
         .and_then(|v| v.as_u64())
         .map(|v| v.min(1000) as usize)
         .unwrap_or(100);
-    let rows = st.audit.query(
-        s("kind").as_deref(),
-        s("user").as_deref(),
-        s("tenant").as_deref(),
-        s("alias").as_deref(),
-        n("sinceMs"),
-        n("untilMs"),
+    let filter = AuditFilter {
+        kind: s("kind"),
+        user: s("user"),
+        tenant: s("tenant"),
+        alias: s("alias"),
+        since_ms: n("sinceMs"),
+        until_ms: n("untilMs"),
         limit,
-    );
+    };
+    let rows = st.audit.query(&filter);
     Ok(rows.iter().map(|e| e.to_json()).collect())
-}
-
-/// 请求侧便捷：从 OpState 取「emit 所需上下文」（owner + stable）。db_session / client_db
-/// 的事件构造方共用，避免各自再拆一遍 ReqState。
-pub(crate) fn context_of(state: &OpState) -> (Owner, std::sync::Arc<StableState>) {
-    let owner = super::db_session::owner_of(state);
-    let st = state.borrow::<Arc<StableState>>().clone();
-    (owner, st)
 }
 
 #[cfg(test)]
@@ -277,17 +281,48 @@ mod tests {
         }
     }
 
+    /// 测试便捷：位置参数 → AuditFilter。
+    #[allow(clippy::too_many_arguments)]
+    fn f(
+        kind: Option<&str>,
+        user: Option<&str>,
+        tenant: Option<&str>,
+        alias: Option<&str>,
+        since: Option<u64>,
+        until: Option<u64>,
+        limit: usize,
+    ) -> AuditFilter {
+        AuditFilter {
+            kind: kind.map(Into::into),
+            user: user.map(Into::into),
+            tenant: tenant.map(Into::into),
+            alias: alias.map(Into::into),
+            since_ms: since,
+            until_ms: until,
+            limit,
+        }
+    }
+
     /// 双限：超条数丢最旧；超龄条目在下次 push/query 时被清。
     #[test]
     fn store_enforces_cap_and_retention() {
         let s = AuditStore::new(&section());
+        let base = ms_now();
         for i in 0..6 {
-            s.push(ev("K", Some("u"), "a", 1000 + i));
+            s.push(ev("K", Some("u"), "a", base - 5000 + i));
         }
         assert_eq!(s.len(), 4, "cap=4 丢最旧");
-        let rows = s.query(None, None, None, None, None, None, 100);
-        assert_eq!(rows[0].ts_ms, 5005, "最新在前");
-        // 超龄清理：当前时刻远超 retention → 清空
+        let rows = s.query(&AuditFilter {
+            kind: None,
+            user: None,
+            tenant: None,
+            alias: None,
+            since_ms: None,
+            until_ms: None,
+            limit: 100,
+        });
+        assert_eq!(rows[0].ts_ms, base - 4995, "最新在前");
+        // 超龄清理：retention=1s，前一条已 60s 老 → 清空
         let mut aged = section();
         aged.retention_secs = 1;
         let s2 = AuditStore::new(&aged);
@@ -300,29 +335,56 @@ mod tests {
     #[test]
     fn query_filters_apply_independently() {
         let s = AuditStore::new(&section());
-        s.push(ev("DB_CLIENT_AUDIT", Some("u"), "a", 1));
-        s.push(ev("DB_SESSION_BEGIN", Some("u"), "a", 2));
-        s.push(ev("DB_SESSION_BEGIN", Some("v"), "b", 3));
+        let base = ms_now();
+        s.push(ev("DB_CLIENT_AUDIT", Some("u"), "a", base + 1));
+        s.push(ev("DB_SESSION_BEGIN", Some("u"), "a", base + 2));
+        s.push(ev("DB_SESSION_BEGIN", Some("v"), "b", base + 3));
         assert_eq!(
-            s.query(Some("DB_SESSION_BEGIN"), None, None, None, None, None, 100).len(),
+            s.query(&f(
+                Some("DB_SESSION_BEGIN"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                100
+            ))
+            .len(),
             2
         );
         assert_eq!(
-            s.query(None, Some("u"), None, None, None, None, 100).len(),
+            s.query(&f(None, Some("u"), None, None, None, None, 100))
+                .len(),
             2
         );
-        assert_eq!(s.query(None, None, None, Some("b"), None, None, 100).len(), 1);
         assert_eq!(
-            s.query(None, None, None, None, Some(2), Some(2), 100).len(),
+            s.query(&f(None, None, None, Some("b"), None, None, 100))
+                .len(),
+            1
+        );
+        assert_eq!(
+            s.query(&f(
+                None,
+                None,
+                None,
+                None,
+                Some(base + 2),
+                Some(base + 2),
+                100
+            ))
+            .len(),
             1,
             "since/until 时间窗"
         );
         assert_eq!(
-            s.query(None, None, None, None, None, None, 1).len(),
+            s.query(&f(None, None, None, None, None, None, 1)).len(),
             1,
             "limit 截断"
         );
-        assert_eq!(s.query(None, None, None, None, None, None, 100).len(), 3);
+        assert_eq!(
+            s.query(&f(None, None, None, None, None, None, 100)).len(),
+            3
+        );
     }
 
     /// 零凭据：stderr 行只含前缀 id（构造方喂前缀），不含完整 id / 控制字符注入。
@@ -353,5 +415,101 @@ mod tests {
         let s = AuditStore::new(&sec);
         emit(&s, "K", &owner(Some("u")), "a", "d");
         assert_eq!(s.len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Bridge 级（请求边界）：register 动作入库 + audit.query 可检索 + 读门。
+    // -------------------------------------------------------------------
+
+    use crate::bridge::db::InMemoryAccessor;
+    use crate::bridge::db_backend::DbBackendRegistry;
+    use crate::bridge::db_policy::DbClientSection;
+    use crate::bridge::{Bridge, Extras, InMemoryKV, RequestInfo, SchemaRegistry};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc as StdArc;
+
+    async fn run_as(b: &Bridge, user: Option<Value>, src: &str) -> Value {
+        let req = RequestInfo {
+            user,
+            ..RequestInfo::default()
+        };
+        let cap = b.run_with(src, req).await.unwrap();
+        serde_json::from_slice(&cap.body).unwrap()
+    }
+
+    fn audit_bridge(sec: AuditSection) -> Bridge {
+        Bridge::with_dbs_and_loader(
+            HashMap::from([(
+                "default".to_string(),
+                StdArc::new(InMemoryAccessor::new()) as _,
+            )]),
+            StdArc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                db_client: Some(StdArc::new(DbClientSection {
+                    enabled: true,
+                    max_entries: 8,
+                    max_per_owner: 8,
+                    max_streams: 8,
+                    allow: Default::default(),
+                })),
+                audit_section: Some(StdArc::new(sec.clone())),
+                audit: Some(StdArc::new(AuditStore::new(&sec))),
+                db_backend: Some(StdArc::new(DbBackendRegistry::builtin())),
+                config_dir: Some(StdArc::new(PathBuf::from("."))),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 主旅程：登记动作入库，`audit.query` 按 kind 检索到（零凭据），读门拒绝未授权主体。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_register_lands_in_queryable_store() {
+        let p = std::env::temp_dir().join(format!("oj-audit-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        std::fs::File::create(&p).unwrap();
+        let b = audit_bridge(AuditSection::default());
+        let src = format!(
+            r#"(async () => {{
+              await db.client.register("rep", "sqlite://{}");
+              const evs = await audit.query({{ kind: "DB_CLIENT_AUDIT" }});
+              return json.ok({{ n: evs.length, alias: evs[0] && evs[0].alias,
+                                action: evs[0] && evs[0].detail }});
+            }})()"#,
+            p.display()
+        );
+        let v = run_as(&b, Some(json!({"id": "dba"})), &src).await;
+        assert_eq!(v["data"]["n"], json!(1), "{v}");
+        assert_eq!(v["data"]["alias"], json!("rep"), "{v}");
+        let d = v["data"]["action"].as_str().unwrap_or_default();
+        assert!(d.contains("action=register"), "{d}");
+        // 零凭据：事件串里不含 DSN 明文
+        assert!(!d.contains("sqlite://"), "{d}");
+    }
+
+    /// 读门：`audit.allow` 未命中的主体 query 被拒（错误不回显 allow）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_gate_denies_unauthorized_callers() {
+        let sec = AuditSection {
+            allow: crate::bridge::db_policy::AllowList {
+                roles: Some(vec!["auditor".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = audit_bridge(sec);
+        let v = run_as(
+            &b,
+            Some(json!({"id": "mallory"})),
+            r#"audit.query({}).then((r) => json.ok({ n: r.length }))
+                .catch((e) => json.fail(500, String(e)))"#,
+        )
+        .await;
+        let msg = v["msg"].as_str().unwrap_or_default();
+        assert!(msg.contains("not granted"), "{v}");
+        assert!(!msg.contains("auditor"), "错误不得回显 allow：{msg}");
     }
 }

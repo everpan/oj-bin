@@ -148,6 +148,8 @@ pub struct TxSessionRegistry {
     tombstones: Mutex<VecDeque<(String, Tombstone)>>,
     boot: String,
     config: DbSessionSection,
+    /// U-9：审计存储克隆——让 **reaper 后台路径**（TIMEOUT 判死，无 OpState）也能入库。
+    audit: Arc<super::audit::AuditStore>,
     started: AtomicBool,
     timed_out: AtomicU64,
     discarded: AtomicU64,
@@ -155,7 +157,7 @@ pub struct TxSessionRegistry {
 }
 
 impl TxSessionRegistry {
-    pub fn new(config: DbSessionSection) -> Self {
+    pub fn new(config: DbSessionSection, audit: Arc<super::audit::AuditStore>) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 sessions: HashMap::new(),
@@ -165,6 +167,7 @@ impl TxSessionRegistry {
             tombstones: Mutex::new(VecDeque::new()),
             boot: handle_core::new_boot_tag(),
             config,
+            audit,
             started: AtomicBool::new(false),
             timed_out: AtomicU64::new(0),
             discarded: AtomicU64::new(0),
@@ -174,11 +177,38 @@ impl TxSessionRegistry {
 
     /// 未配置/未开启时的默认表（`oj test` 与嵌入式构造用）。
     pub fn disabled() -> Self {
-        Self::new(DbSessionSection::default())
+        Self::new(
+            DbSessionSection::default(),
+            Arc::new(super::audit::AuditStore::new(
+                &super::db_policy::AuditSection::default(),
+            )),
+        )
     }
 
     pub fn config(&self) -> &DbSessionSection {
         &self.config
+    }
+
+    pub fn audit(&self) -> &Arc<super::audit::AuditStore> {
+        &self.audit
+    }
+
+    /// U-9：会话事件统一出口（reaper 后台路径与 op 路径共用；kind ∈ BEGIN/COMMIT/…）。
+    fn emit(&self, kind: &str, entry: &TxSessionEntry, reason: Option<&str>) {
+        let detail = format!(
+            "id={} ops={} age_ms={} reason={}",
+            handle_core::id_prefix(PREFIX, &entry.id),
+            entry.ops.load(Ordering::Relaxed),
+            entry.created.elapsed().as_millis(),
+            reason.unwrap_or("-"),
+        );
+        super::audit::emit(
+            &self.audit,
+            &format!("DB_SESSION_{kind}"),
+            &entry.owner,
+            &entry.alias,
+            &detail,
+        );
     }
 
     fn get(&self, id: &str) -> Option<Arc<TxSessionEntry>> {
@@ -298,7 +328,7 @@ impl TxSessionRegistry {
                 "discarded",
                 &format!("alias '{alias}' deleted or re-registered"),
             );
-            emit("DISCARD", e, Some("alias_changed"));
+            self.emit("DISCARD", e, Some("alias_changed"));
         }
         targets.len()
     }
@@ -335,7 +365,7 @@ impl TxSessionRegistry {
             drop(guard);
             self.kill(&entry, "expired", reason);
             self.timed_out.fetch_add(1, Ordering::Relaxed);
-            emit(
+            self.emit(
                 if rolled.is_err() {
                     "TIMEOUT_ROLLBACK_FAILED"
                 } else {
@@ -383,24 +413,7 @@ impl TxSessionRegistry {
     }
 }
 
-/// 会话 op 的固定日志前缀（`eprintln`；U-9 事件外发的单一出口）。
-fn emit(kind: &str, entry: &TxSessionEntry, reason: Option<&str>) {
-    eprintln!(
-        "DB_SESSION_{kind}: id={} alias={} tenant={} user={} ops={} age_ms={} reason={}",
-        handle_core::id_prefix(PREFIX, &entry.id),
-        safe(&entry.alias),
-        safe(entry.owner.tenant.as_deref().unwrap_or("-")),
-        safe(entry.owner.user.as_deref().unwrap_or("-")),
-        entry.ops.load(Ordering::Relaxed),
-        entry.created.elapsed().as_millis(),
-        reason.unwrap_or("-"),
-    );
-}
-
-/// 日志字段脱敏：控制字符（含换行）一律剔除，防日志伪造/多行注入。
-fn safe(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(96).collect()
-}
+// 会话事件统一走 TxSessionRegistry::emit（U-9：stderr 归一 `OJ_AUDIT:` + 入库）。
 
 // ---------------------------------------------------------------------------
 // 调用主体与条目解析（一律以 `&OpState` 取快照，绝不跨 await 持有借用）
@@ -492,7 +505,7 @@ fn lookup_entry(g: &OpState, id: &str) -> Result<Arc<TxSessionEntry>, JsErrorBox
     ) {
         reg.kill(&entry, "expired", reason);
         reg.timed_out.fetch_add(1, Ordering::Relaxed);
-        emit("TIMEOUT", &entry, Some(reason));
+        reg.emit("TIMEOUT", &entry, Some(reason));
         return Err(JsErrorBox::generic(format!(
             "tx session {shown} expired ({reason}); it was rolled back"
         )));
@@ -508,7 +521,7 @@ fn lookup_entry(g: &OpState, id: &str) -> Result<Arc<TxSessionEntry>, JsErrorBox
             "discarded",
             &format!("alias '{}' changed", entry.alias),
         );
-        emit("DISCARD", &entry, Some("alias_changed"));
+        reg.emit("DISCARD", &entry, Some("alias_changed"));
         return Err(JsErrorBox::generic(format!(
             "tx session {shown} refers to db alias '{}' whose registration changed; session discarded",
             entry.alias
@@ -618,7 +631,7 @@ pub(crate) fn kill_attached(state: &Rc<RefCell<OpState>>, reason: &str) {
     let reg = registry_of(&g);
     if let Some(entry) = reg.get(&id) {
         reg.kill(&entry, "discarded", reason);
-        emit("DISCARD", &entry, Some(reason));
+        reg.emit("DISCARD", &entry, Some(reason));
     }
 }
 
@@ -693,7 +706,7 @@ pub async fn op_db_session_begin(
     let out = entry.summary(Instant::now(), &cfg);
     reg.insert(entry.clone(), &owner);
     reg.start_reaper();
-    emit("BEGIN", &entry, None);
+    reg.emit("BEGIN", &entry, None);
     Ok(out)
 }
 
@@ -812,7 +825,7 @@ pub async fn op_db_session_commit(
         }
     };
     reg.kill(&entry, "closed", "commit");
-    emit("COMMIT", &entry, None);
+    reg.emit("COMMIT", &entry, None);
     out
 }
 
@@ -837,7 +850,7 @@ pub async fn op_db_session_rollback(
         }
     };
     reg.kill(&entry, "closed", "rollback");
-    emit("ROLLBACK", &entry, None);
+    reg.emit("ROLLBACK", &entry, None);
     out
 }
 
@@ -860,7 +873,7 @@ pub async fn op_db_session_close(
             .await
             .is_err()
         {
-            emit("CLOSE_ERR", &entry, Some("rollback_timeout"));
+            reg.emit("CLOSE_ERR", &entry, Some("rollback_timeout"));
         }
     }
     reg.kill(&entry, "closed", "close");

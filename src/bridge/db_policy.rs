@@ -378,6 +378,30 @@ impl DbSessionSection {
     }
 }
 
+/// 安全审计配置段（`audit:`，U-9 v0.1.98）。缺省**开**（有界环形缓冲，零凭据事件）；
+/// 读面 `allow` 缺省不限制（单进程、零凭据，装配期 warn 提示收紧）。
+/// `max_entries` / `retention_secs` 为 0 装配期拒启（= 不设限的 DoS 面）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditSection {
+    pub enabled: bool,
+    pub max_entries: usize,
+    pub retention_secs: u64,
+    /// `audit.query` 的读取授权门（每 op 重判）。
+    pub allow: AllowList,
+}
+
+impl Default for AuditSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 2000,
+            retention_secs: 86400,
+            allow: AllowList::default(),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for Enforce {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;

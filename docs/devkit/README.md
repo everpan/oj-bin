@@ -70,6 +70,16 @@ PG `UUID`（→ 规范文本）、PG **一维数组**（→ JSON 数组，元素
 并给 `cast`/`ST_AsText` 指路。见 db-guide §10.6（值契约与边界表）、api-manual §6「db」读侧
 边界段 + §13 限制表、scenarios 场景 48（读写范式与 42804 排障）、SKILL 陷阱速查。
 
+v0.1.98 已落地部分：**dbx Web 对齐 · U-9（安全审计归一 + 可检索存储）**——`DB_CLIENT_AUDIT` /
+`DB_CLIENT_DENY` / `DB_ACCESS_AUDIT` / `DB_SESSION_*` 四族散点 stderr 出口归一为**单一事件类型 +
+单一 emit 出口**：stderr 行统一 `OJ_AUDIT: kind=… user=… tenant=… alias=… detail="…"`
+（**旧前缀退役，日志解析器需更新**）；事件入进程内有界环形缓冲（`audit:` 段，缺省 2000 条 /
+24h，条数+年龄双限自动清理，零凭据，reaper 后台判死事件照常入库）。新增全局 **`audit.query(filter)`**
+（`kind/user/tenant/alias/sinceMs/untilMs/limit`，最新在前，缺省 100 条硬顶 1000）——检索即导出；
+读门 = `audit.allow`（每调用重判，缺省不限制 → 装配期 warn 提示收紧）。**已知限制**：存储不跨
+重启、无防篡改（外部 sink 另期）；`SqlEvent`（sql_trace）是 dev 画像不归审计轴（边界见 db-guide
+§11.7）。见 db-guide §11.7、api-manual §6 指针、SKILL 陷阱速查。
+
 v0.1.97 已落地部分：**dbx Web 对齐 · U-7（client 轴配额与预算）**——动态数据源补齐三道闸：
 ① `db_client.max_per_owner`（缺省 8）：单主体（registered_by）登记上限，`delete` 释放名额，
 0 或 `> max_entries` 装配期拒启动；② `db_client.max_streams`（缺省 32）：动态库**全局**并发流

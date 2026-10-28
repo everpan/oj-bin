@@ -16,6 +16,41 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.98（未打标签）
+
+**dbx Web 对齐 · U-9（安全审计归一 + 可检索存储）**：四族散点 stderr 审计出口统一为单一事件
+类型 + 单一 emit 出口；事件入进程内有界环形缓冲；新增 `audit.query(filter)` 检索/导出通道。
+设计文档 `docs/plans/2026-10-28-dbx-web-u9-audit.md`。**零 ABI/插件改动**。
+
+### feat(audit)
+
+- **统一事件类型** `{tsMs, kind, user, tenant, module, source, alias, detail}`：零凭据
+  （alias / 动作 / 前 8 字符 id；无 DSN 无密码）。覆盖 `DB_CLIENT_AUDIT`（register/delete/
+  reRegister）、`DB_CLIENT_DENY`（U-7 配额/预算/拨号拒绝）、`DB_ACCESS_AUDIT`（grant/revoke）、
+  `DB_SESSION_*`（begin/commit/rollback/TIMEOUT/TIMEOUT_ROLLBACK_FAILED/DISCARD/CLOSE_ERR）。
+- **单一出口** `audit::emit`：db_session / client_db 全部事件构造方改走此出口；会话 reaper
+  （后台、无 OpState）经 `TxSessionRegistry` 持有的存储克隆照常入库。
+- **进程内环形存储**（`audit:` 段，`StableState.audit`，热更存活）：`max_entries`（缺省 2000，
+  超限丢最旧）+ `retention_secs`（缺省 86400，超龄自动清理）双限；0 值装配期拒启。
+- **`audit.query(filter)`**（全局对象）：`kind/user/tenant/alias/sinceMs/untilMs/limit` 各维
+  可选（最新在前；limit 缺省 100、硬顶 1000）——检索即导出。读门 = `audit.allow`（每调用重判）。
+- **配置段** `audit:`：`enabled` 缺省 true（零行为破坏——原本就打日志，现在多了有界存储）；
+  `allow` 缺省不限制（事件进程内、零凭据），enabled 且不限制 → 装配期 **warn** 提示收紧。
+  段改动归 `restart_pending`。
+
+### changed
+
+- **审计 stderr 行格式归一**：`DB_CLIENT_AUDIT:` / `DB_CLIENT_DENY:` / `DB_ACCESS_AUDIT:` /
+  `DB_SESSION_*:` 散点前缀退役，统一为 `OJ_AUDIT: kind=<原前缀名> user=… tenant=… module=…
+  source=… alias=… detail="…"`。**依赖旧前缀的日志解析器需要更新**（kind 字段保留原前缀名）。
+
+### 已知限制（诚实登记）
+
+- **存储不跨重启**（进程退出即清零）、**无防篡改**：PRD 的持久化/留存策略/防篡改需外部 sink
+  （从 `audit::emit` 单一出口接），另期。
+- **`SqlEvent`（sql_trace）不在审计轴**：per-request dev 画像（全量 SQL 入库不可控）；耗时/行数/
+  成败继续走 `db.sqlProfile()`。边界写进 db-guide §11.7。
+
 ## v0.1.97（未打标签）
 
 **dbx Web 对齐 · U-7（client 轴配额与预算）**：动态数据源三道闸 + 拨号守卫。设计文档

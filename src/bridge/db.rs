@@ -836,10 +836,7 @@ pub async fn op_db_stream_open(
             match st.client_dbs.try_acquire_stream() {
                 Ok(p) => Some(p),
                 Err(msg) => {
-                    eprintln!(
-                        "DB_CLIENT_DENY: action=stream reason=budget_exhausted owner={:?} alias={alias}",
-                        super::db_session::owner_of(&state.borrow()).user
-                    );
+                    super::client_db::deny_log(&state, "stream", "budget_exhausted", "-", &alias);
                     return Err(JsErrorBox::generic(msg.to_string()));
                 }
             }
