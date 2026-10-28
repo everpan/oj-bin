@@ -314,8 +314,9 @@ pub(crate) fn client_gate(
 }
 
 /// 审计事件上下文（U-9 归一）：owner（tenant/user/module/source）+ 审计存储。
-/// DB_CLIENT_AUDIT / DB_ACCESS_AUDIT / DB_CLIENT_DENY 三族共用，别再散点 `eprintln!`。
-fn audit_ctx(state: &Rc<RefCell<OpState>>) -> (Owner, Arc<StableState>) {
+/// DB_CLIENT_AUDIT / DB_ACCESS_AUDIT / DB_CLIENT_DENY / DB_DANGEROUS_CONFIRM 四族共用，
+/// 别再散点 `eprintln!`。
+pub(crate) fn audit_ctx(state: &Rc<RefCell<OpState>>) -> (Owner, Arc<StableState>) {
     let g = state.borrow();
     let st = g.borrow::<Arc<StableState>>().clone();
     let rs = g.borrow::<super::ReqState>();
@@ -686,6 +687,8 @@ pub async fn op_db_access_grant(
         allow_ddl: false,
         allow_dangerous: false,
         max_rows: None,
+        // G9：grant 只注入放行维；确认 token 是 config 安全位，不随 grant 注入。
+        dangerous_confirm_token: None,
         allow: allow_list.clone(),
     };
     st.db_access_rt

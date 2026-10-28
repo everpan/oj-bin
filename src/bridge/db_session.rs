@@ -87,6 +87,8 @@ pub struct TxSessionEntry {
     accessor: Arc<dyn DataAccessor>,
     /// 复用既有事务通路（`db::Target::Tx`）。
     tx: Arc<ActiveTx>,
+    /// G9：只读会话位（begin 时定死、不可变）。Write/Ddl 在 op 层一律拒（`readonly_gate`）。
+    read_only: bool,
     created: Instant,
     last_used: Mutex<Instant>,
     ops: AtomicU64,
@@ -110,6 +112,7 @@ impl TxSessionEntry {
             "alias": self.alias,
             "dialect": self.tx.dialect_info.name,
             "state": if self.is_dead() { "discarded" } else { "open" },
+            "readOnly": self.read_only,
             "ageMs": now.saturating_duration_since(self.created).as_millis() as u64,
             "idleMs": now.saturating_duration_since(self.last_used_at()).as_millis() as u64,
             "expiresInMs": handle_core::expires_in(
@@ -605,6 +608,63 @@ pub(crate) fn forbid_in_session(state: &Rc<RefCell<OpState>>, sql: &str) -> Resu
     Ok(())
 }
 
+/// G9：op 层拒绝但**会话保留**的错误（信封 `session_disposition=keep`，JS 面
+/// `e.sessionDisposition`——G9 验收点）。
+pub(crate) fn keep_err(msg: String) -> JsErrorBox {
+    super::db::to_js_err(Box::new(super::db_error::BridgeError {
+        category: super::db_error::DbErrorCategory::Unsupported,
+        retryable: false,
+        session_disposition: super::db_error::SessionDisposition::Keep,
+        message: msg,
+        data: Default::default(),
+    }))
+}
+
+/// G9 只读会话位 + 写拦截（op 层强制——不经任何 handler、直发 op 也拦得住）。
+/// `ReadOnly` 位 = true 时 Write/Ddl 一律拒；会话本身保留（只读拒绝不判死）。
+fn reject_readonly(alias: &str, sql: &str) -> Result<(), JsErrorBox> {
+    let c = db_policy::classify(sql);
+    if matches!(c.risk, db_policy::Risk::Write | db_policy::Risk::Ddl) {
+        return Err(keep_err(format!(
+            "db session on alias '{alias}' is read-only; statement classified {} was rejected \
+             (begin a session without readOnly, or use a writable alias)",
+            c.risk.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// attach 路径的门（`db::query_impl`/`exec_impl` 在 `forbid_in_session` 旁调用）。
+pub(crate) fn readonly_gate(state: &Rc<RefCell<OpState>>, sql: &str) -> Result<(), JsErrorBox> {
+    let g = state.borrow();
+    let Some(id) = g.borrow::<ReqState>().session.clone() else {
+        return Ok(());
+    };
+    let reg = registry_of(&g);
+    let Some(entry) = reg.get(&id) else {
+        return Ok(());
+    };
+    drop(g);
+    if entry.read_only {
+        reject_readonly(&entry.alias, sql)?;
+    }
+    Ok(())
+}
+
+/// 显式 op 路径的门（`db.session.query/exec` 按 id 路由，不经 attach）。
+fn gate_session_sql(state: &Rc<RefCell<OpState>>, id: &str, sql: &str) -> Result<(), JsErrorBox> {
+    let g = state.borrow();
+    let reg = registry_of(&g);
+    let Some(entry) = reg.get(id) else {
+        return Ok(()); // 未知 id 交给 run_attached 的统一报错
+    };
+    drop(g);
+    if entry.read_only {
+        reject_readonly(&entry.alias, sql)?;
+    }
+    Ok(())
+}
+
 /// 已绑定会话的剩余寿命（`db::query_impl`/`exec_impl` 据此做在飞封顶，评审 S5）。
 ///
 /// `None` = 本请求没绑定会话（走池或 `db.tx`，无额外封顶）。
@@ -645,7 +705,14 @@ pub(crate) fn kill_attached(state: &Rc<RefCell<OpState>>, reason: &str) {
 pub async fn op_db_session_begin(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
+    #[serde] opts: Option<Value>,
 ) -> Result<serde_json::Value, JsErrorBox> {
+    // G9：只读会话位（begin 时定死，不可变——要写就开新会话）。
+    let read_only = opts
+        .as_ref()
+        .and_then(|o| o.get("readOnly"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let (reg, owner) = {
         let g = state.borrow();
         (require_gate(&g)?, owner_of(&g))
@@ -698,6 +765,7 @@ pub async fn op_db_session_begin(
             session: tokio::sync::Mutex::new(session),
             dialect_info: info,
         }),
+        read_only,
         created: Instant::now(),
         last_used: Mutex::new(Instant::now()),
         ops: AtomicU64::new(0),
@@ -757,6 +825,7 @@ pub async fn op_db_session_query(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<Vec<Row>, JsErrorBox> {
     let params = params.unwrap_or_default();
+    gate_session_sql(&state, &id, &sql)?; // G9 只读会话位（直发 op 也拦）
     run_attached(&state, &id, move |st, alias| async move {
         super::db::query_impl(st, alias, sql, params).await
     })
@@ -773,6 +842,7 @@ pub async fn op_db_session_exec(
     #[serde] params: Option<Vec<Value>>,
 ) -> Result<i64, JsErrorBox> {
     let params = params.unwrap_or_default();
+    gate_session_sql(&state, &id, &sql)?; // G9 只读会话位（直发 op 也拦）
     run_attached(&state, &id, move |st, alias| async move {
         super::db::exec_impl(st, alias, sql, params).await
     })
@@ -1518,5 +1588,57 @@ mod tests {
     #[allow(dead_code)]
     fn _in_memory_is_a_data_accessor() {
         let _: Arc<dyn DataAccessor> = Arc::new(InMemoryAccessor::new());
+    }
+
+    /// G9：只读会话位——attach 路径与显式 op 双入口都拦 Write；SELECT 照常；
+    /// 错误信封 `sessionDisposition=keep`（会话不被判死）；summary 透出 readOnly 位。
+    #[tokio::test(flavor = "current_thread")]
+    async fn readonly_session_blocks_writes_at_op_layer() {
+        let b = bridge_t("g9ro", cfg(|_| {})).await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const s = await db.session.begin({ readOnly: true });
+              await db.session.attach(s.id);
+              let err = null, disp = null;
+              try { await db.exec("insert into t (v) values ('x')"); }
+              catch (e) { err = String(e); disp = e.sessionDisposition; }
+              let err2 = null;
+              try { await db.session.exec(s.id, "insert into t (v) values ('y')"); }
+              catch (e) { err2 = String(e); }
+              const c = await db.query("select count(*) c from t");
+              const info = await db.session.info(s.id);
+              return json.ok({ err, disp, err2, count: c[0].c, ro: info.readOnly });
+            })().catch((e) => json.fail(500, String(e)))"#,
+        )
+        .await;
+        let err = v["data"]["err"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no err: {v}"));
+        assert!(err.contains("is read-only"), "{err}");
+        assert_eq!(v["data"]["disp"], json!("keep"), "{v}");
+        let err2 = v["data"]["err2"].as_str().unwrap_or_default();
+        assert!(err2.contains("is read-only"), "{err2}");
+        assert_eq!(v["data"]["count"], json!(0), "两条写都必须被拒：{v}");
+        assert_eq!(v["data"]["ro"], json!(true), "{v}");
+    }
+
+    /// G9 回归锚：缺省（不给 readOnly）会话写照常——位缺省 false 不改既有行为。
+    #[tokio::test(flavor = "current_thread")]
+    async fn writable_session_default_still_writes() {
+        let b = bridge_t("g9rw", cfg(|_| {})).await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const s = await db.session.begin();
+              if (s.readOnly !== false) return json.fail(500, "readOnly must default false");
+              await db.session.attach(s.id);
+              await db.exec("insert into t (v) values ('ok')");
+              const c = await db.query("select count(*) c from t");
+              return json.ok({ count: c[0].c });
+            })().catch((e) => json.fail(500, String(e)))"#,
+        )
+        .await;
+        assert_eq!(v["data"]["count"], json!(1), "{v}");
     }
 }

@@ -417,7 +417,7 @@ db_session:
 
 | 方法 | 返回 | 说明 |
 |---|---|---|
-| `begin(name?)` | `Promise<{id, alias, dialect, state, ageMs, idleMs, expiresInMs, ops, createdBy}>` | 在 `DB(name)` 上开（默认 `DB("default")`）；`id` = `tx_<4hex>_<32hex>` |
+| `begin(opts?)` | `Promise<{id, alias, dialect, state, readOnly, ageMs, idleMs, expiresInMs, ops, createdBy}>` | 在 `DB(name)` 上开（默认 `DB("default")`；名字由 `DB(name)` 绑定，参数不是别名）；`id` = `tx_<4hex>_<32hex>`。**`opts.readOnly`（G9，v0.1.99）**：只读会话位——begin 时定死、不可变；该会话上 Write/DDL 在 op 层一律拒（attach 路径与 `db.session.query/exec` 双入口都拦，直发 op 也拦得住），错误 `e.sessionDisposition === "keep"`（会话不被判死）；SELECT 照常 |
 | `attach(id)` | `Promise<true>` | 本请求绑定；之后 `db.query`/`db.exec`/`db.table()`/`nextSeq`/`listTables` 全走该连接 |
 | `detach()` | `Promise<true>` | 解绑（会话本身仍在） |
 | `query(id, sql, params?)` | `Promise<行数组>` | 不绑定也可逐语句显式执行 |
@@ -442,7 +442,9 @@ db_session:
 4. **`db.stream` 在会话内不可用**（流式只走直连池）：报
    `db.stream within an active transaction is not supported`。
 5. **`db_access` 照样生效**：会话里每条语句都重新过授权与风险分类——只读库在会话里也写不进去。
-6. **id 是 bearer token**：他人拿到也调不动（归属按 tenant+user 判定，错误文案与「不存在」完全
+6. **只读会话位（G9）**：`begin(name, {readOnly: true})` 的会话，Write/DDL 在 op 层被拒——
+   即使别名本身可写。这是**会话级**的收窄（连接级硬保证仍是 DB 账号 GRANT，与 §11.5 同口径）。
+7. **id 是 bearer token**：他人拿到也调不动（归属按 tenant+user 判定，错误文案与「不存在」完全
    一致，不泄露存在性）；日志与错误只出现前 8 字符（`tx_ab12_…`）。别把完整 id 回给最终用户。
 
 ### 生命周期
@@ -1275,6 +1277,12 @@ db_access:
 - `allow_ddl: false`（默认）→ 拦 `ddl`。
 - `allow_dangerous: false`（默认）→ 拦**危险写**：`UPDATE`/`DELETE` 无 WHERE、
   多表（`update a, b` / JOIN / USING）、恒真谓词（`where 1=1`、`where a=a`）。
+- **`dangerous_confirm_token`（G9，v0.1.99）**：危险语句**确认门**——配置 token 后（即便
+  `allow_dangerous: true` / `enforce: off`），危险写一律要求请求头 **`x-oj-confirm`** 精确匹配
+  才放行（键名大小写不敏感，值必须逐字相等）；放行即每条落审计 `DB_DANGEROUS_CONFIRM`
+  （`audit.query` 可检索）。典型链路：前端弹「确认执行？」→ 用户确认 → 前端带头发请求——
+  **op 层强制，不经任何方案包 handler 也拦得住**。token 只从 config 来（运行期
+  `db.access.grant` 不覆盖安全位）；空串装配期拒启。
 - `max_rows` → raw `query` 取回后截断（响应打 `X-OJ-Row-Limit`）；`db.stream`
   达上限**提前终止**；构造器路径取 `min(声明 limit, max_rows)`。
 

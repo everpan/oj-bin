@@ -603,6 +603,7 @@ pub(crate) async fn query_impl(
     params: Vec<Value>,
 ) -> Result<Vec<Row>, JsErrorBox> {
     super::db_session::forbid_in_session(&state, &sql)?;
+    super::db_session::readonly_gate(&state, &sql)?; // G9 只读会话位（attach 路径）
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
     // db 访问控制（v0.1.89）：授权 → 风险分类 → 策略位；返回本库生效的行数上限。
@@ -757,6 +758,7 @@ pub(crate) async fn exec_impl(
     params: Vec<Value>,
 ) -> Result<i64, JsErrorBox> {
     super::db_session::forbid_in_session(&state, &sql)?;
+    super::db_session::readonly_gate(&state, &sql)?; // G9 只读会话位（attach 路径）
     // 裸 SQL 路径（query/exec/stream）对开放方言**全量可用**，不做 known 子集门控
     // （设计 §5.5：门控只覆盖 builder / exec_route / list_tables / nextSeq /
     // search.* / CLI 六处）——方言知识只体现在占位符能力位。

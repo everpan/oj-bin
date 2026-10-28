@@ -70,6 +70,17 @@ PG `UUID`（→ 规范文本）、PG **一维数组**（→ JSON 数组，元素
 并给 `cast`/`ST_AsText` 指路。见 db-guide §10.6（值契约与边界表）、api-manual §6「db」读侧
 边界段 + §13 限制表、scenarios 场景 48（读写范式与 42804 排障）、SKILL 陷阱速查。
 
+v0.1.99 已落地部分：**dbx Web 对齐 · G9（服务端防护门，op 层三件）**——判据「不经任何方案包
+handler、直接打 op 也拦得住」：① **只读会话位** `db.session.begin({readOnly: true})`——
+位 begin 时定死不可变，该会话 Write/DDL 在 op 层一律拒（attach 路径与 `db.session.query/exec`
+双入口），错误信封 `sessionDisposition: "keep"`（会话保留）；② **写拦截**即①的 op 层强制 +
+既有 `db_access.read_only` 文本级拦截（回归锚钉住）；③ **危险语句确认门**
+`db_access.<alias>.dangerous_confirm_token`——配置后（即便 `allow_dangerous: true` /
+`enforce: off`）危险写须请求头 `x-oj-confirm` 逐字匹配，放行每条落 `DB_DANGEROUS_CONFIRM`
+审计（`audit.query` 可检索）；token 只从 config 来，运行期 grant 绕不过；空串装配期拒启。
+**边界**：连接级硬保证仍是 DB 账号 GRANT（与 L1 同口径，登记 db-guide）。
+见 db-guide §4.5 / §11.5、api-manual §13、SKILL 陷阱速查。
+
 v0.1.98 已落地部分：**dbx Web 对齐 · U-9（安全审计归一 + 可检索存储）**——`DB_CLIENT_AUDIT` /
 `DB_CLIENT_DENY` / `DB_ACCESS_AUDIT` / `DB_SESSION_*` 四族散点 stderr 出口归一为**单一事件类型 +
 单一 emit 出口**：stderr 行统一 `OJ_AUDIT: kind=… user=… tenant=… alias=… detail="…"`

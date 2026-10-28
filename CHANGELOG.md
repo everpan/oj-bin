@@ -16,6 +16,35 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.99（未打标签）
+
+**dbx Web 对齐 · G9（服务端防护门）**：三条防护门各自独立在 op 层生效；验收判据 = 前端绕不过
+（不经任何方案包 handler、直接打 op 也拦得住）。设计文档
+`docs/plans/2026-10-28-dbx-web-g9-op-gates.md`。**零 ABI/插件改动**。
+
+### feat(db)
+
+- **只读会话位**：`db.session.begin(name?, {readOnly: true})`——`TxSessionEntry.read_only`
+  begin 时定死、不可变；该会话上 Write/DDL 在 op 层一律拒。两个入口都有门：attach 路径
+  （`db.rs` query_impl/exec_impl）与显式 `db.session.query/exec`（`gate_session_sql`）。
+  错误用 `BridgeError`（`category=unsupported`、`session_disposition=keep`、`retryable=false`）
+  ——**信封语义正确**（G9 验收点：只读拒绝不判死会话，JS 面 `e.sessionDisposition === "keep"`）。
+  summary 透出 `readOnly` 位。
+- **危险语句确认门**：`db_access.<alias>.dangerous_confirm_token`（serde 缺省 None；空串
+  装配期拒启）。配置后危险写（无 WHERE / 多表 / 恒真，既有分类器口径）一律要求请求头
+  `x-oj-confirm` **逐字匹配**（键名大小写不敏感）；放行即每条落审计 `DB_DANGEROUS_CONFIRM`
+  （U-9 单一出口，`audit.query` 可检索）。门在 `enforce==Off` 早退**之前**生效（两个入口：
+  裸 SQL `check_access` 与构造器路径）——显式配 token 就是高于 off 的意志。
+- **token 是 config 安全位**：运行期 `db.access.grant` 与模块 override 均不注入/覆盖
+  （从基线策略透传），运行期无法绕过确认门。
+
+### 已知限制（诚实登记）
+
+- 「连接级」落到**会话级位**：真正的连接级 read_only（sqlite `mode=ro` / mysql
+  `SET SESSION TRANSACTION READ ONLY` / pg `default_transaction_read_only`）在 sqlx 池与
+  插件建连参数里，动它要碰插件/ABI——由 db_access 文本级 read_only（op 层先拒）+ 本期会话位
+  双层覆盖；连接级硬保证仍是 DB 账号 GRANT（与 L1 既有口径一致，登记 db-guide）。
+
 ## v0.1.98（未打标签）
 
 **dbx Web 对齐 · U-9（安全审计归一 + 可检索存储）**：四族散点 stderr 审计出口统一为单一事件

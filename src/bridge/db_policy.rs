@@ -162,12 +162,26 @@ pub struct DbAccess {
     pub allow_dangerous: bool,
     /// raw/stream 结果行数上限（缺省 = 不限）。
     pub max_rows: Option<u32>,
+    /// G9：危险语句确认 token（缺省 None = 不设确认门）。配置后，该别名的危险语句
+    /// （无 WHERE / 恒真的写）须请求头 `x-oj-confirm` 精确匹配才放行（放行即审计
+    /// `DB_DANGEROUS_CONFIRM`）。token 只从 config 来——运行期 grant 不覆盖安全位。
+    pub dangerous_confirm_token: Option<String>,
     pub allow: AllowList,
 }
 
 impl DbAccess {
     /// 装配期校验（fail-loud，点名违规键）。
     pub fn validate(&self, alias: &str) -> Result<(), String> {
+        if self
+            .dangerous_confirm_token
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(format!(
+                "db_access.{alias}.dangerous_confirm_token must be a non-empty token \
+                 (remove the key to disable the confirm gate)"
+            ));
+        }
         if let Some(n) = self.max_rows
             && (n == 0 || n > MAX_ROWS_CAP)
         {
@@ -221,6 +235,8 @@ impl DbAccessOverride {
             allow_ddl: self.allow_ddl.unwrap_or(base.allow_ddl),
             allow_dangerous: self.allow_dangerous.unwrap_or(base.allow_dangerous),
             max_rows: self.max_rows.or(base.max_rows),
+            // G9：token 是安全位，只从 config 来（运行期 grant/module override 不覆盖）。
+            dangerous_confirm_token: base.dangerous_confirm_token.clone(),
             allow: AllowList {
                 modules: a(ov, |x| x.modules.as_ref()),
                 roles: a(ov, |x| x.roles.as_ref()),
@@ -924,6 +940,17 @@ pub(crate) fn identity(
     identity_of(&state.borrow())
 }
 
+/// G9：取请求头（大小写不敏感；server 层存原样键）。
+fn req_header(state: &Rc<RefCell<OpState>>, name: &str) -> Option<String> {
+    let g = state.borrow();
+    g.borrow::<ReqState>()
+        .req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
 /// [`identity`] 的 `&OpState` 版本（同步辅助函数复用；不构造 `Rc` 视图）。
 pub(crate) fn identity_of(
     g: &OpState,
@@ -987,7 +1014,7 @@ pub fn check_access_intent(
 ) -> Result<Option<u32>, JsErrorBox> {
     let policy = policy_for(state, alias);
     if policy.enforce == Enforce::Off {
-        return Ok(policy.max_rows); // 零开销：不分类、不取身份
+        return Ok(policy.max_rows); // 零开销：不分类、不取身份（确认门由调用方在早退前过）
     }
     // `enforce=deny` 不再短路硬拦：deny 是白名单制，未命中 allow 由 `evaluate` → `NotGranted`
     // 精确拒绝；「拒绝所有人」已在 `policy_for` 规范化为声明且为空的 allow。
@@ -1045,12 +1072,52 @@ pub fn check_access(
     alias: &str,
     sql: &str,
 ) -> Result<Option<u32>, JsErrorBox> {
+    let c = classify(sql);
+    // G9 确认门在 `enforce==Off` 早退**之前**（显式配 token = 要它生效，off 不豁免）。
+    dangerous_confirm_gate(state, alias, &c)?;
     let policy = policy_for(state, alias);
     if policy.enforce == Enforce::Off {
         return Ok(policy.max_rows);
     }
-    let c = classify(sql);
     check_access_intent(state, alias, &c)
+}
+
+/// G9 危险语句确认门：`db_access.<alias>.dangerous_confirm_token` 配置后，危险语句
+/// （无 WHERE / 恒真写）须请求头 `x-oj-confirm` **精确匹配** token 才放行；放行即审计
+/// `DB_DANGEROUS_CONFIRM`（每条一条）。token 只从 config 来（运行期 grant 不覆盖安全位）。
+/// 调用点约定：**必须在 `enforce==Off` 早退之前**（显式配 token = 要它生效，off 不豁免）
+/// ——现有两处入口：`check_access`（裸 SQL）与 query.rs 构造器路径。
+pub(crate) fn dangerous_confirm_gate(
+    state: &Rc<RefCell<OpState>>,
+    alias: &str,
+    c: &Classified,
+) -> Result<(), JsErrorBox> {
+    if !c.dangerous {
+        return Ok(());
+    }
+    let policy = policy_for(state, alias);
+    let Some(tok) = &policy.dangerous_confirm_token else {
+        return Ok(());
+    };
+    let given = req_header(state, "x-oj-confirm");
+    if given.as_deref() != Some(tok.as_str()) {
+        return Err(super::db_session::keep_err(format!(
+            "alias {alias:?} requires confirmation for dangerous statements: set request \
+             header 'x-oj-confirm' to db_access.{alias}.dangerous_confirm_token"
+        )));
+    }
+    let (owner, st) = super::client_db::audit_ctx(state);
+    super::audit::emit(
+        &st.audit,
+        "DB_DANGEROUS_CONFIRM",
+        &owner,
+        alias,
+        &format!(
+            "action=confirmed_dangerous risk={} sql_class=dangerous",
+            c.risk.as_str()
+        ),
+    );
+    Ok(())
 }
 
 /// **只判授权维**（v0.1.90）：给「平台自生成 SQL」的内省 op 用。
@@ -2478,5 +2545,111 @@ mod behavior {
             msg.contains("db_read_only") || msg.contains("db_not_granted"),
             "{msg}"
         );
+    }
+
+    /// G9：危险语句确认门——配 token 后，无 WHERE 的写无头/错头拒、对头放行且落审计。
+    #[tokio::test(flavor = "current_thread")]
+    async fn dangerous_statements_require_confirm_token() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let policy = DbAccessSection {
+            defaults: DbAccess {
+                allow_dangerous: true,
+                dangerous_confirm_token: Some("s3cret".into()),
+                ..Default::default()
+            },
+            by_db: HashMap::new(),
+        };
+        let b = bridge_with_client(
+            db,
+            policy,
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        const JS: &str = r#"(async () => {
+            await db.exec("delete from t");
+            json.ok({ ok: true });
+          })().catch(e => json.fail(500, String(e)));"#;
+        // 无头 → 拒（enforce=off 也要生效：显式配 token = 要它生效）
+        let (code, msg, _) = run(&b, RequestInfo::default(), JS).await;
+        assert_ne!(code, 0, "无确认头应被拒");
+        assert!(msg.contains("confirmation"), "{msg}");
+        // 错头 → 拒
+        let bad = RequestInfo {
+            headers: HashMap::from([("X-OJ-Confirm".to_string(), "wrong".to_string())]),
+            ..RequestInfo::default()
+        };
+        let (code, msg, _) = run(&b, bad, JS).await;
+        assert_ne!(code, 0, "错头应被拒");
+        assert!(msg.contains("confirmation"), "{msg}");
+        // 对头（键大小写不同）→ 放行 + 审计
+        let ok = RequestInfo {
+            headers: HashMap::from([("x-oj-confirm".to_string(), "s3cret".to_string())]),
+            ..RequestInfo::default()
+        };
+        let (code, _m, data) = run(&b, ok, JS).await;
+        assert_eq!(code, 0, "对头应放行");
+        assert_eq!(data["ok"], serde_json::json!(true), "{data}");
+        // 放行落 DB_DANGEROUS_CONFIRM，audit.query 可检索
+        let (_, _, data) = run(
+            &b,
+            RequestInfo::default(),
+            r#"audit.query({ kind: "DB_DANGEROUS_CONFIRM" }).then((r) => json.ok({ n: r.length }))"#,
+        )
+        .await;
+        assert!(data["n"].as_u64().unwrap() >= 1, "{data}");
+    }
+
+    /// G9：确认 token 是 config 安全位——运行期 grant 后仍生效（防运行期绕过）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirm_token_survives_runtime_grant() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let policy = DbAccessSection {
+            defaults: DbAccess {
+                allow_dangerous: true,
+                dangerous_confirm_token: Some("s3cret".into()),
+                ..Default::default()
+            },
+            by_db: HashMap::new(),
+        };
+        let b = bridge_with_client(
+            db,
+            policy,
+            DbClientSection {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        // 先 grant（带确认头），再不带头试危险语句 → 仍拒
+        let (code, msg, _) = run(
+            &b,
+            RequestInfo {
+                headers: HashMap::from([("x-oj-confirm".to_string(), "s3cret".to_string())]),
+                ..RequestInfo::default()
+            },
+            r#"(async () => {
+            const r = await db.access.grant("default", { roles: ["admin"] });
+            json.ok({ r });
+          })().catch(e => json.fail(500, String(e)))"#,
+        )
+        .await;
+        assert_eq!(code, 0, "grant 应成功：{msg}");
+        // grant 后主体命中 allow，但确认门仍要求头
+        let (code2, msg2, _) = run(
+            &b,
+            RequestInfo::default(),
+            r#"(async () => { await db.exec("delete from t"); json.ok({ ok: true }); })()
+               .catch(e => json.fail(500, String(e)))"#,
+        )
+        .await;
+        assert_ne!(code2, 0, "grant 后确认门仍应生效");
+        assert!(msg2.contains("confirmation"), "{msg2}");
     }
 }

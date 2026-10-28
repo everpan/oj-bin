@@ -2259,6 +2259,8 @@ pub async fn op_db_query_build(
         dangerous: matches!(req.verb, Verb::Update | Verb::Delete) && req.conditions.is_empty(),
         statements: 1,
     };
+    // G9：危险语句确认门在 off 早退前过（intent 内部有早退，见 db_policy 调用点约定）。
+    super::db_policy::dangerous_confirm_gate(&state, &alias, &intent)?;
     let row_cap = super::db_policy::check_access_intent(&state, &alias, &intent)?;
     let mut req = req;
     apply_tenant_guard(&state, &mut req, &reg)?;

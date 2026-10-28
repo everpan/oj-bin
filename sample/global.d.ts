@@ -763,8 +763,10 @@ declare global {
   /** 跨请求事务会话（`db.session`，v0.1.95）。配置段 `db_session:`（`enabled` 默认 false）。 */
   interface DBSessionApi {
     /** 开会话（`DB(name)` 上调用；默认 `default`）→ 摘要（含 id / 有效期）。
-     * 缺身份（无 `user.id` 且无 tenant）时被 `require_identity` 拒。 */
-    begin(name?: string): Promise<DbSessionSummary>;
+     * 缺身份（无 `user.id` 且无 tenant）时被 `require_identity` 拒。
+     * `opts.readOnly`（v0.1.99，G9）：只读会话位——begin 时定死、不可变；该会话上
+     * Write/DDL 在 op 层一律拒（直发 op 也拦得住），错误 `e.sessionDisposition === "keep"`。 */
+    begin(opts?: { readOnly?: boolean }): Promise<DbSessionSummary>;
     /** 把会话绑到**本请求**：之后 `db.query`/`db.exec`/`db.table()`/`nextSeq`/`listTables`
      * 全走该连接。一个请求只能绑一个会话、一个别名；已存在请求内 `db.tx` 时拒绝。 */
     attach(id: string): Promise<boolean>;
@@ -808,6 +810,8 @@ declare global {
     ops: number;
     /** 建会话的 `user.id`（匿名 null）。 */
     createdBy: string | null;
+    /** 只读会话位（G9）：true = 该会话 Write/Ddl 在 op 层被拒。 */
+    readOnly: boolean;
   }
 
   /** `db.session.stats()` 的返回。 */

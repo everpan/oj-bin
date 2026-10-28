@@ -1143,7 +1143,7 @@ globalThis.DB = function (name) {
       // idle/max-lifetime and are rolled back by the host; commit/rollback/close end them.
       // Ids are bearer tokens: never log or return them to end users verbatim.
       session: {
-        begin: dbSessionCall(() => op_db_session_begin(name)),
+        begin: dbSessionCall((opts) => op_db_session_begin(name, opts === undefined ? null : opts)),
         attach: dbSessionCall((id) => op_db_session_attach(String(id))),
         detach: dbSessionCall(() => op_db_session_detach()),
         query: dbSessionCall((id, sql, params) => op_db_session_query(String(id), String(sql), params === undefined ? null : encodeParams(params))),
