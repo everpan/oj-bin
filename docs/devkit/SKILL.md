@@ -348,6 +348,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 一个 `db.session` 想跨两个库别名 / attach 后另一个库照常查 | 会话锁**一个别名**的一条连接：跨别名报 `db session is attached to db 'x', not 'y' (detach first)`；判权用会话登记的别名而非当前请求的模块绑定（防「A 库判权、B 库执行」）。要换库先 `detach()` |
 | 开了会话后同别名其它请求莫名卡住（sqlite） | sqlite 池刻意只有 **1** 条连接，会话独占它直到 commit/rollback/超时。装配期已 `warn:`——跨请求事务只用 mysql/postgres |
 | 会话里的数据过一会「自己没了」/ 进程重启后 id 失效 | 生命周期归 host：空闲 `idle_timeout_secs`、总寿命 `max_lifetime_secs` 到期 → 先 rollback 再摘表（`DB_SESSION_TIMEOUT`），**没有自动提交**；`db.client.delete/reRegister` 会判死该别名全部会话。长流程每步 `touch(id)` 只推空闲计时；真要持久化请落业务表 |
+| 把「取消长导出」做成让前端断开请求（以为服务端会停） | 不会——断开不停止后端拉取。用 **`db.cancel(executionId)`**（v0.1.96）：`db.stream` 的 `onOpen`/`it.executionId()` 拿 `exec_…` 句柄存 `kv`，同一主体的任意请求调用即停（mysql/pg 真取消，其余协作式）。**只覆盖流式**——非流式查询要可取消，请改 `db.stream` |
+| 取消后把流的中断当「导出完成」 | `db.cancel` 后发起方**下一次拉取抛错** `… was cancelled via db.cancel`（不是静默 done）；`onRow` 形态的 Promise reject。按错误分流，已交付的行保留 |
+| 把 `db.cancel` 的 `exec_…` id 回给前端 / 写日志 | id 是 **bearer 凭据**（同主体可停别人的流）。日志与错误只出前 8 字符；完整 id 存服务端（`kv`/业务表），前端只回 `slice(0, 8)` |
 
 ## 手册
 

@@ -16,7 +16,42 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.95（未打标签）
+## v0.1.96
+
+**dbx Web 对齐 · U-5（execution-id 跨请求取消）**：新增 `db.cancel(executionId)` —— 跨请求
+停止流式查询（「请求 A 发起长导出、请求 B 点停止」）。设计文档
+`docs/plans/2026-10-28-dbx-web-u5-execution-cancel.md`。
+**不改 ABI_VERSION、不动插件**（纯 host 侧 + JS 全局）：取消 = 宿主级登记表路由到既有
+`DbStreamShared.abort`，后端真取消链原样复用（pump 停止拉取 → `StreamCursorGuard::drop` →
+插件 `stream_cancel`）。
+
+### feat(db)
+
+- **`db.cancel(executionId)`**：同一主体（tenant+user）的任意请求可取消 `db.stream` 开出的
+  流式执行。重复取消**幂等**（同返回值 `{cancelled: true, alias}`）；未知/已结束/他人/畸形
+  id 一律同一条 `execution exec_… not found`（不泄露存在性）；id 是 bearer 凭据，日志/错误
+  只出前 8 字符（复用 `handle_core`）。
+- **执行句柄发放**：`db.stream` 开流后经 `opts.onOpen(executionId)`（回调形态）或
+  `it.executionId()`（异步迭代形态）给出 `exec_<4hex boot>_<32hex>` id。`op_db_stream_open`
+  返回形状从裸 `f64` 变 `{id, executionId}`（JS 包装已适配，`v.id` 语义不变）。
+- **取消后的发起方观感**：下一次拉取抛 `db stream exec_… was cancelled via db.cancel
+  (cursor closed; rows already delivered are kept)` —— **报错而非静默 done**（消费方不得
+  误以为数据取完）；已交付的行保留。后端效果：mysql `KILL QUERY` / pg `pg_cancel_backend`
+  真取消，其余协作式（游标丢弃、连接回池）。
+- **登记表** `src/bridge/db_exec.rs`（`ExecRegistry`，挂 `StableState.exec_sessions`）：
+  进程级生命周期（热更存活，装配层注入同一 Arc，与 `tx_sessions` 同款）；无配置段（流本身
+  已过 `db_access` 逐语句授权，取消判权只看归属主体）；登记项懒惰清扫（close 摘除 +
+  open/cancel 顺带清 done 与超龄项，24h 硬顶），无后台 reaper。
+- **与既有流内 abort 并存**：`AbortSignal` → `op_db_stream_abort` 路径不变。
+
+### 已知限制（诚实登记）
+
+- **只覆盖流式执行**：非流式 `db.query/exec` 无后端句柄，宿主侧取消只能丢 future（连接中途
+  报废、服务端查询照跑）= 假取消，不做。长查询要可取消请改 `db.cancel` 可达的 `db.stream`。
+  真覆盖需插件侧 one-shot 执行登记，随 ABI 演进另期。
+- 流 close（自然结束/出错）后登记即摘，迟到的 cancel 与未知 id 同文案（登记单次性）。
+
+## v0.1.95
 
 **dbx Web 对齐 · L7（U-4 跨请求事务）**：新增 `db.session` —— 把事务从「一个请求」提升为
 **进程内按 id 路由**的会话，多步表单 / 审批 / 批量导入确认不必挤进一个 handler。设计文档
@@ -149,7 +184,7 @@ sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占
 - **CI 挂账**：上述真库用例 env-gated（`OJ_TEST_MYSQL` / `OJ_TEST_PG`），CI 无 service →
   未设环境变量时**静默 skip（skip-as-pass）**，故 CI 绿不代表这两种方言的行形状被覆盖。
 
-## v0.1.93（未打标签）
+## v0.1.93
 
 **dbx Web 对齐 · L5（P0 主旅程）**：U-8（sqlite 错误信封化）、U-6（读侧解码扩展）、U-1（动态授权运行期生效 + 热更分类）、U-3（跨 isolate 失效广播）。设计文档 `docs/plans/2026-10-28-dbx-web-l5-p0-main-journey.md`（含四路评审 16 项处置）。**不改 ABI_VERSION**（纯 host 侧 + JS 全局）。
 
@@ -191,7 +226,7 @@ sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占
 - **`db.allowed()` 与运行期授权同源**：改用含 grant 表的归一策略，并让运行期授权的动态别名进入
   连接树（此前只看 config，运行期授权的库在 `db.allowed()` 里仍是「假入口」）。
 
-## v0.1.92（未打标签）
+## v0.1.92
 
 **动态数据源登记的实例化能力（L4，client 轴）**：把 L3 的 `db.client.register` / `reRegister` / `delete` /
 `list` / `has` / `test` 正式确立为 **DB 实例的实例化 / 生命周期 API**——`register(name, dsn)` 即
@@ -216,7 +251,7 @@ sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占
 
 - 无框架级代码改动（L4 为范围收窄 + 文档）；既有 L3 实例化 / 生命周期 / 访问控制 / 脱敏红线全部保留。
 
-## v0.1.91（未打标签）
+## v0.1.91
 
 **动态数据源登记（L3，client 轴）**：运行期把任意 DSN（复用装配期同集的 `DbBackendRegistry`——
 内置 sqlite/memory，mysql/postgres 经插件）登记为命名数据源。登记后别名直接进入 `DB(name)` 解析路径，
@@ -313,7 +348,7 @@ sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占
 - T10：CLI `oj/src/schema.rs` 完整迁移到 `introspect.rs`（本期只做了 `'public'` → `current_schema()`）。
 - T11：视图 / 数据类型字典 / 触发器 / CHECK（`db.listViews` 等）。
 
-## v0.1.89（未打标签）
+## v0.1.89
 
 **db 访问控制核心（L1）**：对齐 dbx 多库能力的第一步——顶层 `db_access:` 段提供库级授权、
 语句风险分类、危险写门、只读位、行数限额与决策可观测。宿主侧实现，**不动 FFI**（`ABI_VERSION`
@@ -376,7 +411,7 @@ sqlite 别名上启用 → 打 `warn:`（池只有 1 条连接，会话会独占
 - T2 档位类型归一（`ownership_deny` / `SqlGuard` / `Enforce` 三套并存）。
 - T3 sqlparser 引入（触发条件：需要判定「谓词是否覆盖到正确列」时）。
 
-## v0.1.88（未打标签）
+## v0.1.88
 
 数据库方言能力模型（M1）：ABI 12（describe 工厂级能力槽 + 结构化错误信封）、两层方言模型
 （枚举保留为 known 子集 + 边界描述符 + 六门控点 + 删除 Sqlite 回落）、default-throw cancel、

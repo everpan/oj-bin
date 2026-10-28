@@ -417,6 +417,11 @@ pub(crate) struct DbStreamShared {
     /// 仍会被 recv 出来**（有界背压使然），故不能在达上限时把第 cap 行换成 done
     /// （少给一行），也不能指望通道立刻见底。done 由本标志显式钉住。
     pub done: AtomicBool,
+    /// 跨请求取消标志（U-5 v0.1.96）：`db.cancel(executionId)` 置位。`next` 在 recv 前
+    /// 检查——取消必须抛错而非静默 done（消费方不得误以为数据取完）。
+    pub cancelled: AtomicBool,
+    /// 反向句柄：本流在 `StableState.exec_sessions` 的执行 id（open 时登记，close 摘除）。
+    pub exec_id: OnceLock<String>,
 }
 
 /// pump → 消费端的行缓冲上限（有界背压；abort 后缓冲行继续交付 = "流提前结束"）。
@@ -799,14 +804,16 @@ pub(crate) async fn exec_impl(
 
 /// db.stream 打开（PR-2 Phase A）：先 `guard::check_raw` / `check_tenant_raw`（open 前校验，同
 /// `op_db_query`）→ 取 accessor → `stream_query` 开流 → spawn **脱离式 pump**（current_thread 运行时
-/// 内）逐行推入通道；op 立即返回 stream_id。插件后端（FfiDataAccessor）走默认实现报错。
+/// 内）逐行推入通道；op 立即返回 `{id, executionId}`（后者是 U-5 跨请求取消的句柄）。
+/// 插件后端（FfiDataAccessor）走默认实现报错。
 #[op2]
+#[serde]
 pub async fn op_db_stream_open(
     state: Rc<RefCell<OpState>>,
     #[string] name: String,
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
-) -> Result<f64, JsErrorBox> {
+) -> Result<serde_json::Value, JsErrorBox> {
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
     super::guard::check_tenant_raw(&state, &sql, &params)?; // 多租户防护（独立于 module_ctx）
@@ -857,6 +864,8 @@ pub async fn op_db_stream_open(
         max_rows: row_cap,
         delivered: AtomicU32::new(0),
         done: AtomicBool::new(false),
+        cancelled: AtomicBool::new(false),
+        exec_id: std::sync::OnceLock::new(),
     });
     let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
     let reg = state
@@ -865,6 +874,18 @@ pub async fn op_db_stream_open(
         .db_streams
         .clone();
     reg.lock().await.insert(id, shared.clone());
+    // U-5：登记进进程级执行表（`db.cancel` 的跨请求路由），id 写回共享句柄供 close 摘除。
+    let exec_id = {
+        let exec = state
+            .borrow()
+            .borrow::<Arc<StableState>>()
+            .exec_sessions
+            .clone();
+        let owner = super::db_session::owner_of(&state.borrow());
+        exec.register(owner, alias.clone(), shared.clone())
+            .map_err(JsErrorBox::generic)?
+    };
+    let _ = shared.exec_id.set(exec_id.clone());
     // 脱离式 pump：监听流与取消信号，逐行推入通道（通道关闭 = done）。
     // **有界通道 + 阻塞投递**：消费端不拉取时 pump 停在 send 上——abort 一到即
     // 停止后端拉取（真取消）；unbounded 会把结果集提前灌满、取消扑空（探测
@@ -888,7 +909,7 @@ pub async fn op_db_stream_open(
         // tx 丢弃 → 接收端 recv 返回 None = 流结束（done）。abort 后缓冲中的
         // 已拉行继续交付（"流提前结束"），已交付行不回滚。
     });
-    Ok(id as f64)
+    Ok(serde_json::json!({ "id": id as f64, "executionId": exec_id }))
 }
 
 /// db.stream 拉取下一行（PR-2 Phase A）：返回一行（`Value::Object`）；流结束返回 `Value::Null`
@@ -913,6 +934,17 @@ pub async fn op_db_stream_next(
     // 达上限后的终态：返回 done 而不是「再 recv 一次」（通道里可能还有缓冲行）。
     if shared.done.load(Ordering::SeqCst) {
         return Ok(Row::Null);
+    }
+    // U-5 跨请求取消：置位即抛错——取消必须可辨（静默 done 会让消费方误以为数据取完）。
+    // recv 前检查：即使通道里还有缓冲行/已见底，取消语义优先。
+    if shared.cancelled.load(Ordering::SeqCst) {
+        let shown = super::handle_core::id_prefix(
+            super::db_exec::PREFIX,
+            shared.exec_id.get().map(|s| s.as_str()).unwrap_or(""),
+        );
+        return Err(JsErrorBox::generic(format!(
+            "db stream {shown} was cancelled via db.cancel (cursor closed; rows already delivered are kept)"
+        )));
     }
     let mut rx = shared.rx.lock().await;
     match rx.recv().await {
@@ -1013,7 +1045,7 @@ pub fn op_db_allowed(state: &mut OpState) -> Result<Vec<Value>, JsErrorBox> {
 }
 
 /// db.stream 关闭（PR-2 Phase A）：触发中止并移除注册表条目（条目移除后 Arc 仍被 pump / 进行中的
-/// next 持有至排空，无泄漏）；不强制 await，尽快归还。
+/// next 持有至排空，无泄漏）；不强制 await，尽快归还。U-5：顺带摘除进程级执行登记。
 #[op2]
 pub async fn op_db_stream_close(state: Rc<RefCell<OpState>>, stream_id: f64) {
     let stream_id = stream_id as u32;
@@ -1024,6 +1056,13 @@ pub async fn op_db_stream_close(state: Rc<RefCell<OpState>>, stream_id: f64) {
         .clone();
     if let Some(s) = reg.lock().await.remove(&stream_id) {
         s.abort.notify_one();
+        if let Some(xid) = s.exec_id.get() {
+            state
+                .borrow()
+                .borrow::<Arc<StableState>>()
+                .exec_sessions
+                .remove(xid);
+        }
     }
 }
 

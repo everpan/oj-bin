@@ -699,12 +699,18 @@ declare global {
      * （逐行富化/转写，如写 json.stream）返回 Promise<void>；省略则返回 AsyncIterable<Row>
      * 供 for-await。opts.signal 触发 abort 即取消（pg/mysql 是真取消——KILL QUERY+断连，
      * sqlite 协作式）。只走直连池——db.tx 内调用报错；非直连后端回落全量（不报错）
-     * 或报 backend does not support streaming。 */
+     * 或报 backend does not support streaming。opts.onOpen(executionId)（v0.1.96）在开流后
+     * 回调跨请求取消句柄（异步迭代形式用 `it.executionId()`）。被 `db.cancel` 取消后，
+     * 下一次拉取抛 `… cancelled via db.cancel` 错误（不是静默结束）。 */
     stream(
       sql: string,
       params?: unknown[],
-      opts?: { onRow?: (row: Row) => void; signal?: AbortSignal },
-    ): Promise<void> | AsyncIterable<Row>;
+      opts?: {
+        onRow?: (row: Row) => void;
+        signal?: AbortSignal;
+        onOpen?: (executionId: string) => void;
+      },
+    ): Promise<void> | AsyncIterable<Row> & { executionId(): Promise<string> };
     /** SQL 执行追踪（v0.1.51，dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;
@@ -724,6 +730,13 @@ declare global {
      * `PRAGMA`（MySQL 隐式提交 ⇒ 假回滚）；与 `db.tx` 双向互斥；`db.stream` 不可用；
      * 生命周期归 host（空闲/超寿命即回滚判死），**没有自动提交**。 */
     session: DBSessionApi;
+    /** 跨请求取消执行（v0.1.96）：按 `db.stream` 给出的 `executionId`（`exec_…`）取消该流式
+     * 查询——同一主体的任意请求可调（跨请求停止长导出）。重复取消幂等（同返回值）；
+     * 未知/已结束/他人 id 一律 `… not found`（不泄露存在性）。取消后发起方的下一次拉取抛
+     * `… cancelled via db.cancel`；后端真取消（mysql `KILL QUERY` / pg `pg_cancel_backend`），
+     * 其余协作式（游标丢弃、连接回池）。**只覆盖流式执行**——非流式 `db.query/exec` 无
+     * 后端句柄，登记为已知限制。id 是 bearer 凭据：只出前 8 字符于日志/错误。 */
+    cancel(executionId: string): Promise<{ cancelled: boolean; alias: string }>;
     /** 动态数据源登记（client 轴，v0.1.91）：运行期把 DSN 登记为命名数据源。
      * 登记后别名进 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream）；
      * 此处只暴露**管理面**，使用面一律走 `DB(name)`。`delete` 自动驱逐 `DB()` 缓存，

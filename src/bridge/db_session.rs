@@ -410,7 +410,7 @@ fn registry_of(g: &OpState) -> Arc<TxSessionRegistry> {
     g.borrow::<Arc<StableState>>().tx_sessions.clone()
 }
 
-fn owner_of(g: &OpState) -> Owner {
+pub(crate) fn owner_of(g: &OpState) -> Owner {
     let rs = g.borrow::<ReqState>();
     let (_, _, tenant, source) = db_policy::identity_of(g);
     Owner {

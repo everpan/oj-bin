@@ -65,6 +65,7 @@ import {
   op_db_tx_begin,
   op_db_tx_commit,
   op_db_tx_rollback,
+  op_db_cancel,
   op_db_stream_open,
   op_db_stream_next,
   op_db_stream_close,
@@ -1036,27 +1037,31 @@ globalThis.DB = function (name) {
       // PR-2 Phase A streaming query. Primary form: callback (onRow enriches/transforms each
       // row, e.g. writing to json.stream). Otherwise returns an async iterable (escape hatch via
       // for-await). signal is wired through the abort event to op_db_stream_abort.
-      // op_db_stream_open is an async op (returns a Promise<id>); the id is resolved lazily on the
-      // first next()/onRow so this arrow need not be async (for-await needs a sync async-iterable).
+      // op_db_stream_open is an async op (returns a Promise<{id, executionId}>); it is resolved
+      // lazily on the first next()/onRow so this arrow need not be async (for-await needs a sync
+      // async-iterable). executionId (U-5) is the cross-request handle for db.cancel(); it
+      // surfaces via opts.onOpen(executionId) or it.executionId().
       stream: (sql, params, opts) => {
-        let idP = null;
-        const openId = () => (idP ||= dbOpWrap(op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params))));
+        let idsP = null;
+        const openIds = () => (idsP ||= dbOpWrap(op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params))));
         const swallow = (p) => { p.then(() => {}).catch(() => {}); };
-        const wireAbort = () => swallow(openId().then((id) => op_db_stream_abort(id)));
+        const wireAbort = () => swallow(openIds().then((v) => op_db_stream_abort(v.id)));
         const signal = opts && opts.signal;
         if (signal) signal.addEventListener("abort", wireAbort);
         const close = () => {
           if (signal) signal.removeEventListener("abort", wireAbort);
           // open may itself have failed (guard/unsupported): a second rejection here
           // would surface as an unhandled rejection on top of the consumer's error.
-          swallow(openId().then((id) => op_db_stream_close(id)));
+          swallow(openIds().then((v) => op_db_stream_close(v.id)));
         };
+        const emitOpen = (v) => { if (opts && typeof opts.onOpen === "function") opts.onOpen(v.executionId); };
         if (opts && typeof opts.onRow === "function") {
           return (async () => {
             try {
-              const id = await openId();
+              const v = await openIds();
+              emitOpen(v);
               for (;;) {
-                const row = await dbOpWrap(op_db_stream_next(id));
+                const row = await dbOpWrap(op_db_stream_next(v.id));
                 if (row === null) break;
                 opts.onRow(row);
               }
@@ -1066,12 +1071,15 @@ globalThis.DB = function (name) {
           })();
         }
         return {
+          // U-5 v0.1.96: the cross-request cancellation handle (triggers open as a side effect).
+          executionId: () => openIds().then((v) => v.executionId),
           [Symbol.asyncIterator]() {
             return {
               next: async () => {
                 try {
-                  const id = await openId();
-                  const row = await dbOpWrap(op_db_stream_next(id));
+                  const v = await openIds();
+                  emitOpen(v);
+                  const row = await dbOpWrap(op_db_stream_next(v.id));
                   if (row === null) { close(); return { done: true, value: undefined }; }
                   return { done: false, value: row };
                 } catch (e) {
@@ -1083,6 +1091,10 @@ globalThis.DB = function (name) {
           },
         };
       },
+      // U-5 v0.1.96: cancel a streaming execution opened by ANY request of the same subject
+      // (id comes from onOpen/executionId()). Idempotent while the execution is registered;
+      // unknown/finished/foreign ids reject with the same "not found" message.
+      cancel: dbSessionCall((id) => op_db_cancel(String(id))),
       // transaction: db.tx(async (tx) => { await tx.exec(...); ... })
       // commit on resolve, rollback on throw/reject; tx rides the same connection
       // (query/exec/table route to the active tx). Nested tx is rejected by the op.

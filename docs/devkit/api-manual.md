@@ -1143,9 +1143,9 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 
 db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布，与本手册同源）：
 `DB(name)` / `db.query` / `db.exec` / `db.table` / `db.tx`（请求内事务）/ `db.stream` /
-`db.session`（跨请求事务，v0.1.95）/ 结构内省 / `db.client` 动态数据源登记 /
+`db.cancel`（跨请求取消，v0.1.96）/ `db.session`（跨请求事务，v0.1.95）/ 结构内省 / `db.client` 动态数据源登记 /
 `db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、查询构造器、SQL 执行追踪等，
-统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5）。
+统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1）。
 
 ### 大整数与 i64（v0.1.22）——雪花 id / 长主键必读
 
@@ -3788,6 +3788,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | `db.session` 生命周期由 host 管，**不自动提交** | 空闲 `idle_timeout_secs`（默认 300s）/ 总寿命 `max_lifetime_secs`（默认 1800s）到期 → reaper 先 `ROLLBACK` 再丢弃（日志 `DB_SESSION_TIMEOUT`），连接**不归还**（状态不可信）。容量满时拒绝新会话，绝不驱逐他人会话。id 是 **bearer token**：未知 / 他人 / 畸形 id 一律同一文案，日志只打 `tx_ab12_…` 前缀 |
 | `db.stream` 仅非事务目标 + 后端能力分档（v0.1.37；v0.1.38 起插件后端真流式） | 在 `db.tx` 内调用报 `db.stream within an active transaction is not supported (streaming queries run on the connection pool only)`。核心 sqlite/mysql/postgres 连接与 `oj-db-mysql` / `oj-db-postgres` 插件后端**真流式**（逐行拉，内存恒定）；没有逐行能力的后端**回落 `db.query` 全量**（内容等价、不报错，仅失去内存优势）；彻底不支持时报 `backend does not support streaming`，改走 `db.query` 分页 |
 | 流式取消（`signal`）= 干净提前结束（v0.1.39；v0.1.42 起 pg/mysql 真取消） | abort 后**停止后端拉取**（有界行缓冲背压），缓冲行交付完即 done。**第一方插件 `oj-db-postgres`/`oj-db-mysql` 在 `postgres://`/`mysql://` DSN 下走专用连接，取消 = `pg_cancel_backend`/`KILL QUERY` + 断连 → 服务端查询立即终止（真取消）**；core（sqlite）与 Any 回退路径为协作式（批间生效）。已回调的行不回滚 |
+| `db.cancel` 跨请求取消只覆盖**流式**执行（v0.1.96） | `executionId` 来自 `db.stream` 的 `onOpen`/`executionId()`；同一主体任意请求可消，重复取消幂等。取消后发起方**下一次拉取抛错** `db stream exec_… was cancelled via db.cancel`（不是静默 done）；未知/已结束/他人 id 一律 `execution exec_… not found`（不泄露存在性，日志/错误只出前 8 字符）。非流式 `db.query/exec` 无后端句柄 → 报 not found；长查询要可取消请改 `db.stream`（见 `db-guide.md` §3.1） |
 | `http.file(i)` 对流式大文件报错（v0.1.38） | > `max_upload` 的 multipart 文件由服务端流式落 blob（字节不进 handler）——报错文案指路 `files[i].key`/`.url`；小文件行为不变 |
 | `bus` 缺省进程内，跨实例不互通 | 需要跨实例广播配 `broker.kind` |
 | bus 二进制 wire 约定（v0.1.16） | JSON → record/信封文本帧；字节 → record payload = 原始字节、投递为 Binary 帧。消费侧启发式：UTF-8 且为含 `topic`+`data` 的 JSON 对象才按文本信封，否则按二进制透传——**恰为该形状 JSON 的二进制载荷会以文本帧投递**（无害，自辨） |

@@ -3818,3 +3818,75 @@ export async function post(ctx: Ctx) {
 
 > 方法面、三道门（`enabled`+`allow` / `db_access` / 身份）、六条硬规则见 `db-guide.md` §4.5；
 > 报错文案与限制表见 `api-manual.md` §13。
+
+---
+
+## 场景 50：跨请求取消长导出（`db.cancel`，v0.1.96）
+
+> 一句话：请求 A 开了条大导出流，用户在页面 B 点「停止」——用**执行 id**（`exec_…`）当凭据，
+> 同一主体的任意请求都能把这条流停掉。
+
+`db.stream` 的 `AbortSignal` 只能被**同一个请求**触发；要跨请求停止（前端取消按钮、管理员
+终止失控导出），走 `db.cancel(executionId)`。
+
+### ① 发起方：开流时把执行 id 存起来
+
+```ts
+// src/export/run/api.ts
+export async function post(ctx: Ctx) {
+  const uid = http.user?.id;
+  const s = json.stream({ contentType: "text/csv" });
+  s.write("id,name\n");
+  await db.stream("select id, name from account order by id", null, {
+    onOpen: (xid) => kv.set(`export-run:${uid}`, xid),   // 存到请求外，B 才拿得到
+    onRow: (row) => s.write(`${row.id},${row.name}\n`),
+  });
+  s.end();
+  await kv.del(`export-run:${uid}`);
+  json.ok({ done: true });
+}
+```
+
+异步迭代形态用 `it.executionId()`：
+
+```ts
+const it = db.stream(sql, params);
+const xid = await it.executionId();   // 触发开流；拿句柄后再开始消费
+for await (const row of it) { /* … */ }
+```
+
+### ② 停止方：同一主体的任意请求
+
+```ts
+// src/export/stop/api.ts
+export async function post(ctx: Ctx) {
+  const xid = await kv.get(`export-run:${http.user.id}`);
+  if (!xid) { json.ok({ stopped: false }); return; }
+  // 幂等：重复 cancel 返回同值；未知/已结束/他人 id 一律 "execution … not found"
+  const r = await db.cancel(xid);
+  json.ok({ stopped: r.cancelled });
+}
+```
+
+### ③ 发起方的观感
+
+被取消后，发起方**下一次拉取抛错**（不是静默结束——别把取消误判成「数据取完了」）：
+
+```
+db stream exec_c90… was cancelled via db.cancel (cursor closed; rows already delivered are kept)
+```
+
+已交付的行保留；后端真取消（mysql `KILL QUERY` / pg `pg_cancel_backend`），sqlite 等协作式
+（游标丢弃、连接回池）。
+
+### ④ 常见坑
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| `execution exec_… not found`（和「别人的执行」文案一样） | id 拼错 / 流已结束并 close / 主体不同 | 刻意不区分，防探测；`executionId` 只在流**登记期内**可消（close/收尾后即失效，重复 cancel 也可能落在此文案） |
+| 取消后业务把「导出中断」当成「导出完成」 | 发起方没接住 cancelled 错误 | `onRow` 回调形态的 Promise 会 reject；迭代形态下一次拉取抛错——按错误分流，别吞 |
+| `db.cancel` 报 not found 但流明明在跑 | 执行 id 没存住（只在 `onOpen` 里一闪而过） | `onOpen` / `executionId()` 拿到后先落 `kv`/业务表，再开始消费 |
+| 非流式查询想取消 | `db.cancel` **只覆盖流式执行** | 非流式 `db.query/exec` 无后端句柄，是已知限制；长查询请改 `db.stream`（顺带获得取消能力） |
+| 给前端返回了完整 id | id 是 bearer 凭据 | 只回前 8 字符（`xid.slice(0, 8)`）；日志/错误里引擎只出前缀 |
+
+> 机制与红线见 `db-guide.md` §3.1 的 `db.cancel` 条目；报错文案见 `api-manual.md` §13。

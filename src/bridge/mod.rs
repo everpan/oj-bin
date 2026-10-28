@@ -33,6 +33,7 @@ mod crypto;
 mod db;
 pub mod db_backend;
 pub mod db_error;
+pub mod db_exec;
 pub mod db_policy;
 pub mod db_session;
 pub mod dialect_caps;
@@ -240,6 +241,9 @@ pub struct StableState {
     /// clone `stable`），故会话跨热更存活（这是「跨请求」的应有语义）；配置变更走
     /// `restart_pending`（不与存活会话打架）。
     pub tx_sessions: Arc<db_session::TxSessionRegistry>,
+    /// 执行登记表（U-5 v0.1.96）：`db.cancel(executionId)` 的跨请求路由表。
+    /// 进程级生命周期（热更存活），无配置段（取消判权只看归属主体）。
+    pub exec_sessions: Arc<db_exec::ExecRegistry>,
     /// 运行期动态授权表（U-1 v0.1.93）：壳 `Arc` 不可变、内部 `Mutex` 变动，不破红线。
     /// 仅作用于「动态登记别名」（client_dbs 命中且非 config `db_access.by_db` 声明）：
     /// grant 写入、revoke 移除；静态 config 兜底不受其影响（防运行时提权覆盖 config 的 deny）。
@@ -331,6 +335,8 @@ pub struct Extras {
     /// 跨请求事务会话注册表（装配层构造后注入，以便热更前后同源）。
     /// None = 按 `db_session` 配置现造一个（`oj test` / 嵌入式路径）。
     pub tx_sessions: Option<Arc<db_session::TxSessionRegistry>>,
+    /// 执行登记表（装配层构造后注入，以便热更前后同源）。None = 进程内新表。
+    pub exec_sessions: Option<Arc<db_exec::ExecRegistry>>,
     /// 运行期动态数据源注册表（L3 v0.1.91）。None = 空 registry。
     pub client_dbs: Option<Arc<client_db::ClientDbRegistry>>,
     /// 运行期动态授权表（U-1 v0.1.93）。None = 空表（全库按 config 静态策略）。
@@ -504,6 +510,7 @@ deno_core::extension!(
         client_db::op_db_access_grant,
         client_db::op_db_access_revoke,
         client_db::op_db_epoch,
+        db_exec::op_db_cancel,
         db_session::op_db_session_begin,
         db_session::op_db_session_attach,
         db_session::op_db_session_detach,
@@ -874,6 +881,7 @@ impl Bridge {
                 (*db_session_cfg).clone(),
             ))
         });
+        let exec_sessions = extras.exec_sessions.clone().unwrap_or_default();
         let stable = Arc::new(StableState {
             kv,
             dbs,
@@ -916,6 +924,7 @@ impl Bridge {
                 .client_dbs
                 .unwrap_or_else(|| Arc::new(client_db::ClientDbRegistry::new(16))),
             tx_sessions,
+            exec_sessions,
             db_access_rt: extras
                 .db_access_rt
                 .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
@@ -2635,6 +2644,7 @@ mod tests {
             db_session: Arc::new(db_policy::DbSessionSection::default()),
             client_dbs: Arc::new(client_db::ClientDbRegistry::new(16)),
             tx_sessions: Arc::new(db_session::TxSessionRegistry::disabled()),
+            exec_sessions: Arc::new(db_exec::ExecRegistry::default()),
             db_access_rt: Arc::new(Mutex::new(HashMap::new())),
             db_backend: Arc::new(db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),

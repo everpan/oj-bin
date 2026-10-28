@@ -221,6 +221,7 @@ mod tests {
             db_session: Arc::new(Default::default()),
             client_dbs: Arc::new(crate::bridge::client_db::ClientDbRegistry::new(16)),
             tx_sessions: Arc::new(crate::bridge::db_session::TxSessionRegistry::disabled()),
+            exec_sessions: Arc::new(crate::bridge::db_exec::ExecRegistry::default()),
             db_access_rt: Arc::new(std::sync::Mutex::new(HashMap::new())),
             db_backend: Arc::new(crate::bridge::db_backend::DbBackendRegistry::builtin()),
             config_dir: Arc::new(std::path::PathBuf::from(".")),

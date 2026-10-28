@@ -6,10 +6,10 @@
 
 ## 0. 一句话状态
 
-PRD 的 P0（U-1/U-3/U-6/U-8）与 P0-b 的 **U-4（跨请求事务 `db.session`）已全部落地**，
-代码与文档门禁全绿；**但 L6 + L7 两期改动仍未提交**（工作树跨了 v0.1.94 / v0.1.95 两个版本），
-`git tag` 仍停在 **v0.1.87**。下一步最自然的两个动作：先提交 L6、L7（各自一版），再决定是否补 tag；
-功能上则从 **U-5（execution-id 取消）** 接着做。
+（2026-10-28 更新）L6/L7 已提交；**U-5（execution-id 取消 `db.cancel`）已落地为 v0.1.96**；
+**U-13 补 tag 已做**——v0.1.88/89/91/92/93/95/96 有 annotated tag，**v0.1.90 与 v0.1.94 因
+并版没有分界提交、未补 tag**（CHANGELOG 节标题保留「未打标签」）。GA 门禁三件
+（U-7 / U-9 / G9）与 P1/P2（U-11/U-14/U-15/U-16）未动。
 
 ## 1. 仓库现在处于什么状态
 
@@ -105,11 +105,11 @@ TIMEOUT_ROLLBACK_FAILED,DISCARD,CLOSE_ERR}`）；`db.session.stats()` 给 `activ
 | 序 | 条目 | 缺口（现状） | 第一刀 |
 |---|---|---|---|
 | 1 | ~~提交 L6 / L7~~ **已完成**（2026-10-28） | 两期同批提交为一个 commit（文档交织不可切分，CHANGELOG v0.1.94 节已注明），版本记 0.1.95 | 后续每版仍按「一次 bump 提交 = 一个发布点」 |
-| 2 | **U-5 execution-id 取消** | `op_db_stream_abort` 只查本请求 `ReqState.db_streams`；`TxSession::cancel` 有默认 unsupported 哨兵；会话寿命到点只判死、**不声称能中止语句** | 照抄 `TxSessionRegistry` 的形状做一个 execution 登记表（`handle_core` 的 id/归属/双计时直接复用）；记录 `stream_id → 后端句柄`，跨请求 `cancel(id)`；mysql `KILL QUERY` / pg `pg_cancel_backend` 已有实现可参照；sqlite 声明不支持 |
+| 2 | ~~U-5 execution-id 取消~~ **已完成**（v0.1.96） | `db.cancel(executionId)` 跨请求取消流式执行；实现走「宿主级 `ExecRegistry` 路由到既有 pump abort」——**零 ABI/插件改动**（后端真取消经 `StreamCursorGuard::drop` 原样复用）。已知限制：只覆盖流式执行（非流式无后端句柄） | 设计文档 `plans/2026-10-28-dbx-web-u5-execution-cancel.md`；非流式真覆盖需插件侧 one-shot 登记，另期 |
 | 3 | **U-7 client 轴配额** | stream 闸是**每 Client 一把**（`STREAM_MAX_CONNS = 8`，`plugins/oj-db-mysql/src/lib.rs:147`），`max_entries` 是进程级（`client_db.rs:74`）；无全局预算 / per-owner / 行数字节上限 / 拨号超时与失败熔断 | 先把「真实并发 = max_entries × (池 + 8)」写进文档，再在 `client_db` 侧加全局预算与 per-owner 计数（参照 `db_session` 的 reserve 模式）；`db.client.test` 要防内网端口扫描 |
 | 4 | **U-9 审计落存储** | `SqlEvent`（`sql_trace.rs`）与 `DB_CLIENT_AUDIT`（`client_db.rs:257`）、`DB_SESSION_*`（`db_session.rs:389`）都是 stderr | 三个出口先归一到统一事件类型，再谈落存储（保留/检索/租户隔离/零明文） |
 | 5 | **G9 服务端防护门** | 无连接级只读会话位、无写拦截 op 层强制、无危险语句确认 token | 三条**各自**在 op 层生效（判据：不经任何方案包 handler、直接打 op 也拦得住）；错误信封要给对 `session_disposition` |
-| 6 | **U-13 补 tag** | tag 停 v0.1.87，落后 8 版 | 先把未提交的两期提交，再按版本分界补 annotated tag（方案包要钉 `peerOj` 下限） |
+| 6 | ~~U-13 补 tag~~ **已完成**（2026-10-28，本地；push 需显式 `origin`） | v0.1.88/89/91/92/93/95/96 已打 annotated tag；**v0.1.90（L2/L3 并版）与 v0.1.94（L6/L7 并版）无分界提交，未补**——方案包钉 `peerOj` 下限时避开这两个版本 | |
 | 7 | U-11 能力探测 / U-14 内省扩展 / U-15 管理面 connector / U-16（条件项） | 见 PRD §5 | 每条先写一份 plan 过四路评审再动工 |
 
 **明确不做**（PRD §6/§7，别重复讨论）：U-10 运行期凭据轴、U-12 LOB 轴、PL/SQL 调试协议、

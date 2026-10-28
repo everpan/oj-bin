@@ -1335,6 +1335,9 @@ pub async fn assemble_backend(
     let tx_sessions = Arc::new(only_js::bridge::db_session::TxSessionRegistry::new(
         (*db_session).clone(),
     ));
+    // 执行登记表（U-5 v0.1.96）：同 tx_sessions——装配层构造一次，热更前后同一 Arc
+    // （存活流的可取消性跨热更有效）。
+    let exec_sessions = Arc::new(only_js::bridge::db_exec::ExecRegistry::default());
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
@@ -1391,6 +1394,7 @@ pub async fn assemble_backend(
         // 影子绑定：同 db_client —— 会话配置与注册表也须与 StableState 同一 Arc。
         let db_session = db_session.clone();
         let tx_sessions = tx_sessions.clone();
+        let exec_sessions = exec_sessions.clone();
         let client_dbs = client_dbs.clone();
         let db_access_rt = db_access_rt.clone();
         let db_backend = db_backend.clone();
@@ -1447,6 +1451,7 @@ pub async fn assemble_backend(
                     db_client: Some(db_client.clone()),
                     db_session: Some(db_session.clone()),
                     tx_sessions: Some(tx_sessions.clone()),
+                    exec_sessions: Some(exec_sessions.clone()),
                     client_dbs: Some(client_dbs.clone()),
                     db_access_rt: Some(db_access_rt.clone()),
                     db_backend: Some(db_backend.clone()),
@@ -1507,6 +1512,7 @@ pub async fn assemble_backend(
         db_session: db_session.clone(), // 与 make_bridge 的 Extras.db_session 同源（同一 Arc）。
         client_dbs: client_dbs.clone(), // 与 make_bridge 的 Extras.client_dbs 同源（同一 Arc）。
         tx_sessions: tx_sessions.clone(), // 与 make_bridge 的 Extras.tx_sessions 同一注册表。
+        exec_sessions: exec_sessions.clone(), // 与 make_bridge 的 Extras.exec_sessions 同一注册表。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。
