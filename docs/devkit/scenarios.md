@@ -4078,3 +4078,35 @@ schema；mysql 建第二个库同理（schema≡database，两腿同源）。
 | pg 想 forDatabase 跨库 | database=独立连接，物理不可行；listDatabases 只出清单，跨库=再登记别名 |
 | forSchema(畸形名) 拿到 [] 当成功 | 空数组=无对象或名畸形（不报错不泄漏）；先 listSchemas 确认 |
 | 句柄上没有 query/exec | 有意收窄：内视句柄只读。要跑 SQL 用原实例（受 db_access 管辖） |
+
+## 场景 56：看一条 SQL 的执行计划（`db.explain`，G3，v0.1.108）
+
+**需求**：慢查询排查 / 验证索引有没有被用上，要在 handler 里拿到跨方言统一的计划树。
+
+**代码**（pg / mysql 通用；sqlite 与不支持方言结构化报错）：
+
+```ts
+export async function get() {
+  const { plan } = await db.explain(
+    "select * from orders where user_id = ? order by created_at desc limit 20",
+    [42],
+  );
+  // plan: { category, operation, relation, accessPath, cost:{startup,total},
+  //         rowsEstimate, width, extra, children: PlanNode[] }
+  return { plan };
+}
+```
+
+**验证**：pg 下 `operation` 可能是 `Index Scan`、`accessPath` 出 `using index …`、
+`cost.total`/`rowsEstimate` 有值；mysql 下 `operation` 是 `access_type`（`ALL`/`ref`/
+`range`…）、`cost` 来自 `cost_info.prefix_cost`。带参语句走绑定参数，不是拼串。
+
+**常见坑**：
+
+| 坑 | 解 |
+|---|---|
+| 想拿「真实执行」的行数（ANALYZE） | `db.explain` 只出优化器估算，**不执行语句**、无副作用；实测跑一遍或用数据库自带 ANALYZE |
+| 传了 `EXPLAIN select …` 全串 | 只传内层语句，前缀框架自己拼（pg 文本计划 / mysql `FORMAT=JSON`） |
+| 部署版本老的引擎上 `db.explain(...)` TypeError | v0.1.108 才有；跨版本先探 `typeof db.explain === "function"` 再调 |
+| sqlite 上报 `OJ_DB_UNSUPPORTED`（capability=`explain`） | 预期——目前只 pg/mysql；看错误/限制表 |
+| `db_access` Deny 的库上 explain | 一样拒（内层语句先过租户/访问护栏，`explain select …; drop table` 按 DDL 拒） |

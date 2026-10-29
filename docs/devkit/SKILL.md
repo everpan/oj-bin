@@ -376,6 +376,9 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 把「取消长导出」做成让前端断开请求（以为服务端会停） | 不会——断开不停止后端拉取。用 **`db.cancel(executionId)`**（v0.1.96）：`db.stream` 的 `onOpen`/`it.executionId()` 拿 `exec_…` 句柄存 `kv`，同一主体的任意请求调用即停（mysql/pg 真取消，其余协作式）。**只覆盖流式**——非流式查询要可取消，请改 `db.stream` |
 | 取消后把流的中断当「导出完成」 | `db.cancel` 后发起方**下一次拉取抛错** `… was cancelled via db.cancel`（不是静默 done）；`onRow` 形态的 Promise reject。按错误分流，已交付的行保留 |
 | 把 `db.cancel` 的 `exec_…` id 回给前端 / 写日志 | id 是 **bearer 凭据**（同主体可停别人的流）。日志与错误只出前 8 字符；完整 id 存服务端（`kv`/业务表），前端只回 `slice(0, 8)` |
+| 以为 `db.explain` 会真执行语句（ANALYZE 语义）/ 有副作用（v0.1.108） | 不会——`EXPLAIN` 只出计划不执行。要实测代价得显式 `ANALYZE` 或跑一遍；`db.explain` 永不触发写副作用，可安全对生产只读库使用 |
+| 在 sqlite（或第三方不支持方言）上跑 `db.explain` 报 `OJ_DB_UNSUPPORTED`（v0.1.108） | 预期：目前只有 postgres/mysql 支持，`capability` 字段是 `explain`，错误/限制表可查；老版本引擎上 `db.explain` 是 `undefined`，跨版本代码先探 `typeof db.explain === "function"` 再调用 |
+| 给 `db.explain` 传 `EXPLAIN ...` 前缀 SQL（v0.1.108） | 不用——只传内层语句，框架按方言自己拼前缀（pg 文本计划 / mysql `FORMAT=JSON`）；手拼前缀会被剥掉或触发护栏分类（`explain ...; drop table` 照样按 DDL 拒） |
 
 ## 手册
 

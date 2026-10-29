@@ -16,6 +16,25 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.108
+
+**feat（db）**：`db.explain(sql, params?, opts?)`——G3 跨方言执行计划归一（dbx PR-1 解锁）：
+
+- 返回 `{ plan: PlanNode }` 归一节点树：`category`（scan/join/aggregate/sort/other，宿主侧
+  枚举，前端渲染选图标/着色）、`operation`、`relation`、`accessPath`、`cost{startup,total}`
+  （字段级 null）、`rowsEstimate`、`width`（MySQL 恒 null）、`extra`（PG 全部谓词字段 /
+  MySQL used_key_parts/ref/filtered/attached_condition）、`children`。
+- 实现 = **同一条通路**：内层 SQL 剥 EXPLAIN 前缀先过租户守卫（Deny 模式 fail-closed 补偿，
+  静态钉死）→ 方言分派 → 复用 `db.query` 原函数（守卫/配额/trace/session 零复制，
+  `opts.timeoutMs` 与 db.query 同口径）。
+- PG 用**文本计划**（真机实测：`EXPLAIN (FORMAT JSON)` 的 json 输出列 sqlx Any 驱动不解，
+  有/无参数同样报错），Rust 解析缩进树；MySQL 用 `FORMAT=JSON` 通用容器 walker
+  （单表/UNION/GROUP BY/nested_loop 真机样本钉死，禁特判）。
+- 真机实测（oj-test PG16 / MySQL 8.4）：两方言带参 EXPLAIN 均可用——预写的
+  「params×mysql 结构化回落」不启用。
+- sqlite / 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`（capability=`explain`），不回落不静默。
+- 无 ANALYZE 由构造保证（前缀是宿主常量），EXPLAIN 非 ANALYZE 不执行内层语句。
+
 ## v0.1.107
 
 **fix（db）**：PG 显式 schema 作用域（`db.forSchema(name).listIndexes/listForeignKeys` 等）

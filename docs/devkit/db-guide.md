@@ -260,6 +260,7 @@ no tenant header)` / `db.asTenant: id must not be empty`。
 | `query` | `query(sql, params?)` | `Promise<行数组>` | 原生参数化查询 |
 | `exec` | `exec(sql, params?)` | `Promise<受影响行数>` | 原生参数化执行 |
 | `stream` | `stream(sql, params?, opts?)` | `Promise<void>` \| `AsyncIterable<行>` | 流式查询（逐行拉取，v0.1.37，见 §3.1） |
+| `explain` | `explain(sql, params?, opts?)` | `Promise<{plan: PlanNode}>` | 执行计划归一树（G3 v0.1.108，见 §3.2；sqlite/未知方言 unsupported） |
 | `table` | `table(name)` | 查询构造器 | 安全构造器（本手册主角） |
 | `fromJSON` | `fromJSON(snapshot)` | 查询构造器 | 从 toJSON 快照恢复 |
 | `tx` | `tx(async (tx) => {...})` | `Promise<fn 返回值>` | 请求内事务（§4） |
@@ -346,6 +347,35 @@ for await (const row of db.stream("select id, name from account order by id")) {
   `db stream_open: too many concurrent cursors (limit 8) — close or cancel running streams first`。
   并行导出请改成串行或复用单流——打满会连累同库的池查询。
 - 裸 SQL 同样过归属守卫与多租户防护（与 `db.query` 相同）。
+
+### 3.2 执行计划（`db.explain`，G3，v0.1.108）
+
+```ts
+const { plan } = await db.explain("select * from account where id = ?", [42]);
+// plan: { category, operation, relation, accessPath, cost{startup,total},
+//         rowsEstimate, width, extra, children: PlanNode[] }
+```
+
+`EXPLAIN` 的跨方言归一：PG 文本计划与 MySQL `FORMAT=JSON` 在宿主侧解析成**同一棵
+PlanNode 树**，前端一条渲染路径覆盖（`category` 是宿主侧枚举 `scan|join|aggregate|sort|other`，
+渲染选图标/着色；`operation` 保原文——PG 物理算子名如 `Index Scan`/`Nested Loop`，
+MySQL `access_type` 如 `const`/`ref`/`ALL`）。
+
+- 字段级 null 口径：`cost.startup` 仅 PG 有（MySQL 恒 `null`，`total` 取 `prefix_cost`）；
+  `width` 仅 PG 有；`rowsEstimate` 与 PG `Plan Rows` 同为「输出行数」语义（MySQL 取
+  `rows_produced_per_join`）；`extra` 为谓词/附属信息多行文本（PG：`Index Cond`/`Filter`/
+  `Hash Cond` 等；MySQL：`used_key_parts`/`ref`/`filtered`/`attached_condition`）。
+- **授权面与 `db.query` 同门**：包上 EXPLAIN 前缀的整句复用 `db.query` 同一通路
+  （归属/租户守卫、风险分类、REQ-05 配额 `opts.timeoutMs` 同口径、trace）。「能 explain」
+  不蕴含「能真跑」：EXPLAIN 被归只读，`read_only` 连接可 explain 一条 UPDATE 的计划
+  （不执行、无副作用——无 ANALYZE 由构造保证）。
+- **多租户 Deny 站点**：内层语句先剥前缀过租户守卫——`EXPLAIN UPDATE <未注册表>`
+  与传统 UPDATE 同样被拒。
+- **方言边界**：sqlite / 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`
+  （`e.data.capability === "explain"`）。**版本错位能力探测**：
+  `typeof db.explain === "function"`（旧二进制上是 TypeError，勿版本号嗅探）。
+- PG 侧实现注记：`EXPLAIN (FORMAT JSON)` 的 json 输出列驱动不解（v0.1.108 实测），
+  故走文本计划解析；绑定参数两方言均支持（`?` 统一占位符）。
 
 ---
 

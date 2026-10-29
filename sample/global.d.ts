@@ -610,6 +610,24 @@ declare global {
     columns: string[];
   }
 
+  // db.explain() 的归一计划节点（G3，v0.1.108）：PG/MySQL 同构，字段级 null 口径——
+  // cost.startup 仅 PG 有；width 仅 PG 有；MySQL rowsEstimate 取 rows_produced_per_join
+  // （与 PG Plan Rows 同为「输出行数」语义）；extra 为谓词/附属信息多行文本或 null。
+  interface PlanNode {
+    category: "scan" | "join" | "aggregate" | "sort" | "other";
+    // PG 物理算子名（"Index Scan"/"Nested Loop"/"HashAggregate"…）或
+    // MySQL access_type（"const"/"ref"/"ALL"…）；容器为键名（"query_block"/"nested_loop"…）。
+    operation: string;
+    relation: string | null;
+    // PG 索引名 / MySQL key。
+    accessPath: string | null;
+    cost: { startup: number | null; total: number | null } | null;
+    rowsEstimate: number | null;
+    width: number | null;
+    extra: string | null;
+    children: PlanNode[];
+  }
+
   // db.listForeignKeys() 的返回：单外键的结构信息。
   interface ForeignKeyInfo {
     // sqlite 外键无约束名 → null。
@@ -650,6 +668,12 @@ declare global {
     query(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<Row[]>;
     // 执行写操作，返回受影响行数。opts 同 query。
     exec(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<number>;
+    /** 跨方言执行计划归一（G3，v0.1.108）：返回单根 PlanNode 树。
+     * PG 走文本计划解析、MySQL 走 FORMAT=JSON 容器 walker，前端一条渲染路径覆盖。
+     * 授权面与 db.query 同门（守卫/配额/trace 复用同一通路）；无 ANALYZE、不执行内层语句。
+     * sqlite/未知方言 → OJ_DB_UNSUPPORTED（e.data.capability === "explain"）。
+     * 能力探测：`typeof db.explain === "function"`（版本错位期防 TypeError）。 */
+    explain(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<{ plan: PlanNode }>;
     // 安全查询构造器（标识符白名单 + 参数化值）。
     table(name: string): QueryBuilder;
     // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
