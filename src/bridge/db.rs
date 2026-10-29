@@ -178,6 +178,14 @@ pub trait DataAccessor: Send + Sync {
     async fn cancel(&self, _stream_id: u64) -> BridgeResult<()> {
         Err(unsupported(&self.dialect_info().name, "cancel").into())
     }
+
+    /// 语句 deadline 竞速到点后，被弃的在飞语句是否**服务端真死**（REQ-05
+    /// `data.cancelled` 诚实口径）：SqlxAccessor（sqlite 内置）= true——停止客户端
+    /// 拉取、嵌入式无服务端残留；插件轴 = false——宿主弃 FfiFuture 只 free state，
+    /// 语句可能仍在服务端烧资源（真取消 = ABI 13 车，见执行计划批次 2 spike 结论）。
+    fn server_cancel_on_abandon(&self) -> bool {
+        false
+    }
 }
 
 /// DataAccessor 的内存实现（fake）。接口与 sqlx 实现一致（Liskov 可替换）。
@@ -579,6 +587,14 @@ pub(crate) fn err_meta_of(
     })
 }
 
+/// db.query/db.exec 的每调用侧选项（REQ-05 §4.1）。
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct DbCallOpts {
+    /// 语句级超时毫秒；只能收紧配置 `statement_timeout_ms`，传更大值结构化拒（点名键）。
+    #[serde(rename = "timeoutMs", default)]
+    pub timeout_ms: Option<u64>,
+}
+
 /// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
 #[op2]
 #[serde]
@@ -587,8 +603,16 @@ pub async fn op_db_query(
     #[string] name: String,
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
+    #[serde] opts: Option<DbCallOpts>,
 ) -> Result<Vec<Row>, JsErrorBox> {
-    query_impl(state, name, sql, params.unwrap_or_default()).await
+    query_impl(
+        state,
+        name,
+        sql,
+        params.unwrap_or_default(),
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .await
 }
 
 /// `db.query` 的实体：`op_db_query` 与跨请求会话的显式形态 `db.session.query(id, …)`
@@ -601,6 +625,7 @@ pub(crate) async fn query_impl(
     name: String,
     sql: String,
     params: Vec<Value>,
+    call_timeout_ms: Option<u64>,
 ) -> Result<Vec<Row>, JsErrorBox> {
     super::db_session::forbid_in_session(&state, &sql)?;
     super::db_session::readonly_gate(&state, &sql)?; // G9 只读会话位（attach 路径）
@@ -609,6 +634,11 @@ pub(crate) async fn query_impl(
     // db 访问控制（v0.1.89）：授权 → 风险分类 → 策略位；返回本库生效的行数上限。
     let alias = super::guard::bound_db(&state, &name);
     let row_cap = super::db_policy::check_access(&state, &alias, &sql)?;
+    // REQ-05：语句级超时（配置上限 × 调用侧收紧，只能收紧）。
+    let quota = super::db_policy::quota_for(&state, &alias);
+    let timeout_ms =
+        super::db_quota::effective_timeout_ms(quota.statement_timeout_ms, call_timeout_ms)
+            .map_err(JsErrorBox::from)?;
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
@@ -619,12 +649,34 @@ pub(crate) async fn query_impl(
     let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
     let res: BridgeResult<Vec<Row>> = match target {
-        Target::Pool(da) => da.query_with_params(&norm, &params).await,
-        Target::Tx(t) => {
-            on_tx(&state, "query", async {
-                t.session.lock().await.query(&norm, &params).await
-            })
+        Target::Pool(da) => {
+            let cancelled = da.server_cancel_on_abandon();
+            super::db_quota::race_statement(
+                da.query_with_params(&norm, &params),
+                &alias,
+                timeout_ms,
+                cancelled,
+            )
             .await
+        }
+        Target::Tx(t) => {
+            let fut = on_tx(&state, "query", async {
+                t.session.lock().await.query(&norm, &params).await
+            });
+            // attach 会话：语句超时 = 判死会话（kill_attached 先例，设计 §6.1）；
+            // plain db.tx 不叠语句超时（连接状态不可知，维持寿命封顶口径——成文裁决）。
+            match (timeout_ms, super::db_session::attached_deadline(&state)) {
+                (Some(ms), Some(_)) => {
+                    match tokio::time::timeout(std::time::Duration::from_millis(ms), fut).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            super::db_session::kill_attached(&state, "statement_timeout");
+                            Err(super::db_quota::stmt_timeout_error(&alias, ms, false).into())
+                        }
+                    }
+                }
+                _ => fut.await,
+            }
         }
     };
     let (cat, retry) = err_meta(&res);
@@ -746,8 +798,16 @@ pub async fn op_db_exec(
     #[string] name: String,
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
+    #[serde] opts: Option<DbCallOpts>,
 ) -> Result<i64, JsErrorBox> {
-    exec_impl(state, name, sql, params.unwrap_or_default()).await
+    exec_impl(
+        state,
+        name,
+        sql,
+        params.unwrap_or_default(),
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .await
 }
 
 /// `db.exec` 的实体（与 `db.session.exec` 共用；理由同 [`query_impl`]）。
@@ -756,6 +816,7 @@ pub(crate) async fn exec_impl(
     name: String,
     sql: String,
     params: Vec<Value>,
+    call_timeout_ms: Option<u64>,
 ) -> Result<i64, JsErrorBox> {
     super::db_session::forbid_in_session(&state, &sql)?;
     super::db_session::readonly_gate(&state, &sql)?; // G9 只读会话位（attach 路径）
@@ -767,6 +828,11 @@ pub(crate) async fn exec_impl(
     // db 访问控制（v0.1.89）：写类语句在此被 read_only / 危险语句门拦下。
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::check_access(&state, &alias, &sql)?;
+    // REQ-05：语句级超时（口径同 query_impl）。
+    let quota = super::db_policy::quota_for(&state, &alias);
+    let timeout_ms =
+        super::db_quota::effective_timeout_ms(quota.statement_timeout_ms, call_timeout_ms)
+            .map_err(JsErrorBox::from)?;
 
     let target = resolve_target(&state, &name)?;
     let in_tx = matches!(&target, Target::Tx(_));
@@ -777,12 +843,32 @@ pub(crate) async fn exec_impl(
     let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
     let res: BridgeResult<i64> = match target {
-        Target::Pool(da) => da.exec_with_params(&norm, &params).await,
-        Target::Tx(t) => {
-            on_tx(&state, "exec", async {
-                t.session.lock().await.exec(&norm, &params).await
-            })
+        Target::Pool(da) => {
+            let cancelled = da.server_cancel_on_abandon();
+            super::db_quota::race_statement(
+                da.exec_with_params(&norm, &params),
+                &alias,
+                timeout_ms,
+                cancelled,
+            )
             .await
+        }
+        Target::Tx(t) => {
+            let fut = on_tx(&state, "exec", async {
+                t.session.lock().await.exec(&norm, &params).await
+            });
+            match (timeout_ms, super::db_session::attached_deadline(&state)) {
+                (Some(ms), Some(_)) => {
+                    match tokio::time::timeout(std::time::Duration::from_millis(ms), fut).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            super::db_session::kill_attached(&state, "statement_timeout");
+                            Err(super::db_quota::stmt_timeout_error(&alias, ms, false).into())
+                        }
+                    }
+                }
+                _ => fut.await,
+            }
         }
     };
     let (cat, retry) = err_meta(&res);

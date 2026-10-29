@@ -958,6 +958,12 @@ pub(crate) fn has_runtime_grant(st: &StableState, alias: &str) -> bool {
         .contains_key(alias)
 }
 
+/// op 边界的配额聚合出口（REQ-05）：策略 → Quota（DRY——query/exec/stream/builder
+/// 四处调用点共用，不各自 policy_for）。限额与闸无关：off 档也生效（同 max_rows）。
+pub(crate) fn quota_for(state: &Rc<RefCell<OpState>>, alias: &str) -> super::db_quota::Quota {
+    super::db_quota::Quota::of(&policy_for(state, alias))
+}
+
 /// op 边界的访问控制入口：授权 → 分类 → 策略位 → 限额。
 ///
 /// `enforce: off`（默认）零开销早退，与升级前行为完全一致。
@@ -1755,6 +1761,135 @@ mod behavior {
             user: Some(json!({"id": 7, "roles": roles})),
             ..Default::default()
         }
+    }
+
+    /// REQ-05 Q3：语句 deadline 竞速（ yielding 后端证明接线；sqlite 同步步进饿死
+    /// 定时器的架构限制另行成文）。Given 后端 query 睡 5s + 配置 50ms，When db.query，
+    /// Then ~50ms 拿 OJ_DB_TIMEOUT（不是 5s 后跑完）。
+    struct SleepyAccessor;
+    #[async_trait::async_trait]
+    impl DataAccessor for SleepyAccessor {
+        async fn query_with_params(
+            &self,
+            _sql: &str,
+            _params: &[serde_json::Value],
+        ) -> super::super::BridgeResult<Vec<crate::bridge::db::Row>> {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(vec![])
+        }
+        async fn exec_with_params(
+            &self,
+            _sql: &str,
+            _params: &[serde_json::Value],
+        ) -> super::super::BridgeResult<i64> {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok(0)
+        }
+    }
+
+    fn sleepy_bridge(statement_timeout_ms: u64) -> Bridge {
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                statement_timeout_ms: Some(statement_timeout_ms),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        bridge_with(
+            Arc::new(SleepyAccessor),
+            SchemaRegistry::new(),
+            pol,
+            false,
+            false,
+        )
+    }
+
+    const JS_TIMEOUT_PROBE: &str = r#"(async () => {
+        const t0 = Date.now();
+        try {
+          await db.query("select 1", null, {timeoutMs: 50});
+          json.ok({err: "no-timeout", ms: Date.now() - t0});
+        } catch (e) {
+          json.ok({code: e.code, cancelled: e.data && e.data.cancelled, ms: Date.now() - t0});
+        }
+      })().catch(e => json.fail(500, String(e)));"#;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stmt_timeout_race_fires_and_returns_structured_error() {
+        let b = sleepy_bridge(5_000); // 配置 5s；调用侧收紧到 50ms
+        let (_c, _m, data) = run(&b, RequestInfo::default(), JS_TIMEOUT_PROBE).await;
+        assert_eq!(data["code"], json!("OJ_DB_TIMEOUT"), "{data}");
+        let ms = data["ms"].as_i64().unwrap_or(9999);
+        assert!(ms < 2_000, "竞速必须在 ~50ms 触发，而非 5s 跑完：{ms}ms");
+        // 假后端不宣称服务端取消（data.cancelled 按后端诚实标注）
+        assert_eq!(data["cancelled"], json!(false), "{data}");
+    }
+
+    /// 配置侧单独生效（无 per-call opt）：Given 配置 50ms，When db.query，Then OJ_DB_TIMEOUT。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stmt_timeout_config_side_alone_applies() {
+        let b = sleepy_bridge(50);
+        let (_c, _m, data) = run(&b, RequestInfo::default(), JS_TIMEOUT_PROBE).await;
+        assert_eq!(data["code"], json!("OJ_DB_TIMEOUT"), "{data}");
+    }
+
+    /// exec 路径同闸。Given 配置 50ms，When 慢 exec，Then OJ_DB_TIMEOUT。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stmt_timeout_applies_to_exec() {
+        let b = sleepy_bridge(50);
+        let js = r#"(async () => {
+            try {
+              await db.exec("delete from t");
+              json.ok({err: "no-timeout"});
+            } catch (e) { json.ok({code: e.code}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_TIMEOUT"), "{data}");
+    }
+
+    /// 只能收紧：调用侧 timeoutMs > 配置 → 结构化拒，message 点名 statement_timeout_ms。
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_timeout_above_config_rejected_naming_key() {
+        let b = sleepy_bridge(5_000);
+        let js = r#"(async () => {
+            try {
+              await db.query("select 1", null, {timeoutMs: 6000});
+              json.ok({err: "no-reject"});
+            } catch (e) { json.ok({code: e.code, msg: String(e.message || e)}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+        assert!(
+            data["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("statement_timeout_ms"),
+            "{data}"
+        );
+    }
+
+    /// 快语句不受闸影响（regression sanity）：sqlite 真库 + 5s 配置 + 速查 → 正常返回。
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_query_unaffected_by_stmt_timeout() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id integer)", &[])
+            .await
+            .unwrap();
+        let b = bridge_with(
+            db,
+            SchemaRegistry::new(),
+            DbAccessSection {
+                defaults: DbAccess {
+                    statement_timeout_ms: Some(5_000),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+        let (_c, _m, data) = run(&b, RequestInfo::default(), JS_READ).await;
+        assert_eq!(data["n"], json!(0), "{data}");
     }
 
     /// `enforce: off`（默认档）必须完全透明：`read_only` 也写在配置里也不设防。

@@ -124,6 +124,25 @@ pub fn row_bytes(row: &Value) -> u64 {
     serde_json::to_vec(row).map(|v| v.len() as u64).unwrap_or(0)
 }
 
+/// 语句竞速：deadline 到点即弃在飞 future（宿主侧 select!，零 ABI——FfiFuture 已
+/// `unsafe impl Send`，网络型后端（插件轴）在 await_ffi 的 poll 间隙让出，定时器
+/// 可准点触发；sqlite 内置的同步步进会饿死 current_thread 定时器，见模块头与手册
+/// 的架构限制节）。到点返回结构化 `OJ_DB_TIMEOUT`，`cancelled` 由后端能力位诚实标注。
+pub async fn race_statement<T>(
+    fut: impl std::future::Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+    alias: &str,
+    timeout_ms: Option<u64>,
+    cancelled: bool,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(ms) = timeout_ms else {
+        return fut.await;
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(ms), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(stmt_timeout_error(alias, ms, cancelled).into()),
+    }
+}
+
 /// 语句超时结构化错误（`OJ_DB_TIMEOUT`）。`cancelled` 按后端诚实标注：
 /// sqlite 内置真早停 = true；插件轴宿主弃句柄（语句可能仍在服务端跑）= false。
 pub fn stmt_timeout_error(alias: &str, timeout_ms: u64, cancelled: bool) -> BridgeError {
@@ -173,8 +192,14 @@ mod tests {
     #[test]
     fn effective_timeout_tighten_only() {
         // Given 配置 30s：调用侧收紧 → 生效调用值；等于配置 → 可；更大 → 拒且点名键
-        assert_eq!(effective_timeout_ms(Some(30_000), Some(5_000)), Ok(Some(5_000)));
-        assert_eq!(effective_timeout_ms(Some(30_000), Some(30_000)), Ok(Some(30_000)));
+        assert_eq!(
+            effective_timeout_ms(Some(30_000), Some(5_000)),
+            Ok(Some(5_000))
+        );
+        assert_eq!(
+            effective_timeout_ms(Some(30_000), Some(30_000)),
+            Ok(Some(30_000))
+        );
         let e = effective_timeout_ms(Some(30_000), Some(30_001)).unwrap_err();
         assert_eq!(e.category, DbErrorCategory::Capacity);
         assert_eq!(code_of(e.category), "OJ_DB_CAPACITY");

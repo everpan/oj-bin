@@ -298,6 +298,11 @@ impl DataAccessor for SqlxAccessor {
         }))
     }
 
+    fn server_cancel_on_abandon(&self) -> bool {
+        // sqlite 嵌入式：弃拉取即停客户端步进，无服务端语句残留（REQ-05 data.cancelled）。
+        true
+    }
+
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
         oj_plugin_ffi::jsint::reject_u64_markers(
             params,

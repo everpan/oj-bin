@@ -827,7 +827,7 @@ pub async fn op_db_session_query(
     let params = params.unwrap_or_default();
     gate_session_sql(&state, &id, &sql)?; // G9 只读会话位（直发 op 也拦）
     run_attached(&state, &id, move |st, alias| async move {
-        super::db::query_impl(st, alias, sql, params).await
+        super::db::query_impl(st, alias, sql, params, None).await
     })
     .await
 }
@@ -844,7 +844,7 @@ pub async fn op_db_session_exec(
     let params = params.unwrap_or_default();
     gate_session_sql(&state, &id, &sql)?; // G9 只读会话位（直发 op 也拦）
     run_attached(&state, &id, move |st, alias| async move {
-        super::db::exec_impl(st, alias, sql, params).await
+        super::db::exec_impl(st, alias, sql, params, None).await
     })
     .await
 }

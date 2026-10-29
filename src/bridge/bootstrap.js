@@ -977,6 +977,14 @@ function dbOpWrap(p) {
   return p;
 }
 
+// REQ-05 (U-18 batch Q3): per-call opts for db.query/db.exec. Only `timeoutMs` exists and
+// it can only TIGHTEN the configured db_access.<alias>.statement_timeout_ms -- a larger
+// value is rejected with a structured OJ_DB_CAPACITY naming the config key.
+function callOpts(opts) {
+  if (!opts || opts.timeoutMs === undefined || opts.timeoutMs === null) return null;
+  return { timeoutMs: opts.timeoutMs };
+}
+
 // v0.1.95: one awaitable surface for db.session. Some of its ops are sync (attach/detach/
 // list/info/stats/touch/closeAll); wrapping them keeps "every session call returns a Promise"
 // true, so a failure always arrives as a rejection at the caller's `await` instead of as a
@@ -1010,8 +1018,8 @@ globalThis.DB = function (name) {
   dbCache.set(name, {
       ...condFactories(),
       // raw SQL + bound params (params optional).
-      query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params))),
-      exec: (sql, params) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params))),
+      query: (sql, params, opts) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
+      exec: (sql, params, opts) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
       // system escape hatch (tenant sql_guard): this request bypasses tenant
@@ -1118,8 +1126,8 @@ globalThis.DB = function (name) {
         try {
           const out = await fn({
             ...condFactories(),
-            query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params))),
-            exec: (sql, params) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params))),
+            query: (sql, params) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params), null)),
+            exec: (sql, params) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params), null)),
             table: (t) => queryBuilder(name, String(t)),
             // Same-connection allocator: MySQL's LAST_INSERT_ID is session-scoped.
             nextSeq: (n) => dbOpWrap(op_db_next_seq(name, String(n))),
