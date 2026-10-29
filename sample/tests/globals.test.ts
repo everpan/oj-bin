@@ -2,7 +2,7 @@
 // 本文件以业务模块形态（无 import）编译并运行——global.d.ts 把某全局声明进错的作用域
 // （如曾发生在 audit/mgmt/secret 上的模块作用域事故）时，这里第一个红。
 // 圈定口径：只断言**无条件挂载**的全局；条件挂载面（mail/es/cert/jwt/oidc/sso/blob/fs/
-// exec/server/Kafka/RabbitMQ/redis 等，随配置缺席）不进清单（已知限制，见执行计划 §4）。
+// exec/server/Kafka/RabbitMQ/redis）与上下文条件面（sess=仅 WS 钩子、tasks=仅长任务）不进清单。
 
 describe("runtime globals golden (unconditional surface)", () => {
   it("top-level globals exist and are visible module-free", () => {
@@ -14,7 +14,6 @@ describe("runtime globals golden (unconditional surface)", () => {
       "db",
       "DB",
       "ws",
-      "sess",
       "bus",
       "vars",
       "bcrypt",
@@ -32,10 +31,10 @@ describe("runtime globals golden (unconditional surface)", () => {
       "mgmt",
       "secret",
     ];
-    for (const n of fns) {
-      const v = (globalThis as Record<string, unknown>)[n];
-      expect(v !== undefined && v !== null).toBeTruthy();
-    }
+    const missing = fns.filter(
+      (n) => (globalThis as Record<string, unknown>)[n] === undefined,
+    );
+    if (missing.length) throw new Error("missing globals: " + missing.join(", "));
   });
 
   it("db sub-surfaces exist (access/epoch/client/session/cancel/catalog)", () => {

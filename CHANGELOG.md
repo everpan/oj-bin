@@ -16,6 +16,30 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.102
+
+**上游 REQ-01 + REQ-02 处置（U-18 批次 1；需求源 `oj-dbx/docs/upstream`）**：
+
+- **route_timeouts 装配期校验（fail-fast）**：pattern 匹配不到任何已注册路由 → 拒启动并点名
+  （保留路径 /health、/plugins 与 WS 挂载不经此机制；pattern 含 `{param}` 段 → 拒，请用
+  `*`/`**`）；每次装配（含热更）生效。**粒度成文**：看门狗 25ms 轮询，短于 ~25ms 的 timeout
+  不保证精确。**边界成文**：管得住 JS 忙循环，已下推的慢语句跑完才 408——慢 SQL 护栏 =
+  语句级真取消（REQ-05，下一批 GA 门禁）。新增 `RouteTable::patterns()` 访问器 +
+  `validate_route_timeouts` 纯函数 + 三形态 e2e（408）+ 真装配拒启集成测试。
+- **类型面补齐（REQ-02）**：`db.access`（DBAccessApi：grant/revoke）、`db.epoch(name)`、
+  `json.stream/sse` 的 `fileName`/`disposition` 选项进 global.d.ts（能力运行时早已存在，
+  类型漏声明致 TS2339）。**附带修复**：`audit`/`mgmt`/`secret` 曾声明在 `export {}` 模块
+  作用域内——业务模块引用 TS2304（audit 自 v0.1.98 带病）；已移入 `declare global`。
+- **db.client/access 返回真 Promise（REQ-06）**：`list/register/reRegister/delete/test` 与
+  `access.grant/revoke` 运行期曾回裸值（`.catch is not a function`）；统一经 dbSessionCall
+  包装为真 Promise（instanceof Promise、.catch/.finally 可链），`has` 保持同步布尔。
+- **防漂移门禁双腿**：① `sample/tests/globals.test.ts` 运行时 golden（无条件全局清单，
+  业务模块形态裸引用——作用域事故第一现场即红）；② `sample/tests/type-usage.ts` tsc 用法
+  测试（按文档写法逐一调用，声明缺失/漂移即红）。
+
+**发版自查**：CHANGELOG 本节 + devkit 四件对齐（api-manual route_timeouts 行）+ xtask 归置 +
+契约 10 绿 + 全门禁复绿后打标推送。
+
 ## v0.1.101
 
 **U-10 运行期凭据轴（首批）**：`secret.seal/open` 全局对象（v0.1.101 面）。config `ENC[...]`

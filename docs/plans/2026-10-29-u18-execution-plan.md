@@ -19,17 +19,17 @@
 
 | # | 任务 | BDD 验收（Given/When/Then） | 状态 | 小结 |
 |---|---|---|---|---|
-| T1.1 | `RouteTable::patterns()` 访问器（注册 pattern 串含 `{param}`） | Given 建表注册 `/a/{id}` 与 `/a`，When patterns()，Then 含两者 | ☐ | |
-| T1.2 | `validate_route_timeouts(patterns, route_keys)` 纯函数（app.rs） | Given 命中 pattern → Ok；零命中 → Err 点名 pattern+路由数；含 `{}` → Err；`/**` → Ok | ☐ | |
-| T1.3 | 接线：Pipeline 构造前校验（tables 在作用域），热更同路径 | Given 零命中配置，When 装配/reload，Then 拒且文案点名 | ☐ | |
-| T1.4 | serve_cmd 集成：真装配拒启 | Given config 含悬空 pattern，When `oj serve` 装配，Then 启动失败含点名 | ☐ | |
+| T1.1 | `RouteTable::patterns()` 访问器（注册 pattern 串含 `{param}`） | Given 建表注册 `/a/{id}` 与 `/a`，When patterns()，Then 含两者 | ✅ | ✅ | patterns() 访问器（slots 键集） |
+| T1.2 | `validate_route_timeouts(patterns, route_keys)` 纯函数（app.rs） | Given 命中 pattern → Ok；零命中 → Err 点名 pattern+路由数；含 `{}` → Err；`/**` → Ok | ✅ | ✅ | 纯函数 + 矩阵单测（含 {} 拒、零命中点名） |
+| T1.3 | 接线：Pipeline 构造前校验（tables 在作用域），热更同路径 | Given 零命中配置，When 装配/reload，Then 拒且文案点名 | ✅ | ✅ | tables 后内联校验，每次装配（含热更）生效 |
+| T1.4 | serve_cmd 集成：真装配拒启 | Given config 含悬空 pattern，When `oj serve` 装配，Then 启动失败含点名 | ✅ | ✅ | 集成：悬空拒启点名 / 命中正常起服（fixture 需 manifest.yaml 教训入档） |
 | T1.5 | serve e2e：spawn_pipeline 注 route_timeouts × {字面含 base, 尾 `/*`, `**`} × busy handler | Given 三形态命中 busy handler，When GET，Then 408（≥25ms 粒度余量） | ☐ | |
-| T1.6 | api-manual `route_timeouts` 行：25ms 粒度 / fail-fast / DB 阻塞语义（跑完才 408）/ 保留路径与 WS 不受约束 / `{}` 拒 | 文档与实现逐条对齐 | ☐ | |
-| T2.1 | global.d.ts 三处声明：`DBInstance.access: DBAccessApi`（grant/revoke）、`epoch(name): number`、`stream/sse` opts + `fileName`/`disposition` | 对照 op 签名（client_db.rs:691/720）| ☐ | |
+| T1.6 | api-manual `route_timeouts` 行：25ms 粒度 / fail-fast / DB 阻塞语义（跑完才 408）/ 保留路径与 WS 不受约束 / `{}` 拒 | 文档与实现逐条对齐 | ✅ | ✅ | 四要素齐：粒度/fail-fast/DB 阻塞/保留路径 |
+| T2.1 | global.d.ts 三处声明：`DBInstance.access: DBAccessApi`（grant/revoke）、`epoch(name): number`、`stream/sse` opts + `fileName`/`disposition` | 对照 op 签名（client_db.rs:691/720）| ✅ | ✅ | DBAccessApi/epoch/stream|sse opts（tsc 绿） |
 | T2.2 | typeof golden（腿①）：sample/tests/globals.test.ts，裸引用无条件全局清单（含 audit/mgmt/secret——可见性回归锚） | Given 业务模块形态，When 逐个 typeof，Then 全部非 undefined；删任一声明 → tsc 红 | ☐ | |
-| T2.3 | tsc 用法测试（腿②）：sample/tests/type-usage.ts 按文档写法逐一调用 | Given 按文档写法，When `tsc --noEmit`，Then 绿；去掉某声明 → 红 | ☐ | |
-| T2.4 | 归置 bin/devkit + xtask 契约（既有 10 项） | xtask build 后契约全绿 | ☐ | |
-| T2.5 | REQ-06：`db.client.{list,register,reRegister,delete,test}` + `db.access.{grant,revoke}` 运行期返回真 Promise（instanceof Promise、.catch/.finally 可用）；`has` 保持同步 | Given 业务模块，When 调 list()，Then `instanceof Promise === true` 且 `.catch` 可链；`list().catch(()=>[])` 不抛 TypeError | ☐ | |
+| T2.3 | tsc 用法测试（腿②）：sample/tests/type-usage.ts 按文档写法逐一调用 | Given 按文档写法，When `tsc --noEmit`，Then 绿；去掉某声明 → 红 | ✅ | ✅ | type-usage.ts 编译绿；负向验证（剥 secret 声明→红） |
+| T2.4 | 归置 bin/devkit + xtask 契约（既有 10 项） | xtask build 后契约全绿 | ✅ | ✅ | xtask 契约 10 绿 |
+| T2.5 | REQ-06：`db.client.{list,register,reRegister,delete,test}` + `db.access.{grant,revoke}` 运行期返回真 Promise（instanceof Promise、.catch/.finally 可用）；`has` 保持同步 | Given 业务模块，When 调 list()，Then `instanceof Promise === true` 且 `.catch` 可链；`list().catch(()=>[])` 不抛 TypeError | ✅ | ✅ | dbSessionCall 复用（DRY），instanceof Promise 断言 RED→GREEN |
 | T3 | 发版：bump v0.1.102 + CHANGELOG + 全门禁（fmt/clippy/workspace/xtask+smoke）+ tag + push | 五步自查清单全过 | ☐ | |
 
 ## 2. 任务跟踪（批次 2-4，动工时细化）
