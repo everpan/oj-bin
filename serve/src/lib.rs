@@ -774,12 +774,6 @@ async fn run_route(
     params: HashMap<String, String>,
     handler: String,
 ) -> Response {
-    // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
-    // 防两处准入语义漂移）。401/400 以 Response 返回。
-    let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base) {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
     // v0.1.38（ABI 10）：multipart + blob 已配置 → **流式**解析（文件字段直落 blob，
     // 内存恒定；大文件不再受 max_upload 硬顶约束，单文件上限 blob_upload_max）；
     // 其余（非 multipart，或未配 blob）维持整体缓冲（上限 2x max_upload；超 max_upload
@@ -811,6 +805,70 @@ async fn run_route(
             (buffered.to_vec(), Vec::new())
         }
     };
+    match run_capture(
+        st,
+        headers,
+        verb,
+        query,
+        path_no_base,
+        full_path,
+        file,
+        params,
+        handler,
+        body_bytes,
+        files,
+    )
+    .await
+    {
+        Ok(cap) => {
+            let mut resp = capture_response(cap);
+            apply_custom_headers(&mut resp, &st.static_opts.response_headers);
+            resp
+        }
+        // 准入拒绝（401/400）/ 超时熔断（408）/ 执行失败（500）：fail 语义与
+        // 拆分前一致（这些路径从不施加自定义响应头）。
+        Err(e) => fail_response(i32::from(e.status), &e.msg),
+    }
+}
+
+/// 合成准入失败的 RunFail（401/400 信封体很小，直接读出 msg 供 MCP isError 使用）。
+async fn run_fail_from_response(resp: Response) -> RunFail {
+    let status = resp.status().as_u16();
+    let msg = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("msg").and_then(|m| m.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "request rejected".to_string());
+    RunFail { status, msg }
+}
+
+/// 共享 dispatch（MCP 双线路 R2）：admit + RequestInfo 合成 + route_timeouts 首个
+/// 命中 + run_module(validate=true)。run_route（axum 缝合层）与 MCP/JSON-RPC handler
+/// **唯一**分发入口——准入/租户/超时/契约校验语义单一，两处实现不得漂移。
+///
+/// 外部输入一律 validate=true（`src/bridge/mod.rs` 的既定红线）；框架内部合成派发
+/// （dispatch_meta_handler 的 meta 注入）不在此入口，仍走其私有路径。
+#[allow(clippy::too_many_arguments)] // 分发入参即请求的全部材料；打包成结构体只会加构造样板
+pub(crate) async fn run_capture(
+    st: &AppState,
+    headers: &HeaderMap,
+    verb: &str,
+    query: HashMap<String, String>,
+    path_no_base: Option<&str>,
+    full_path: &str,
+    file: PathBuf,
+    params: HashMap<String, String>,
+    handler: String,
+    body_bytes: Vec<u8>,
+    files: Vec<UploadedFile>,
+) -> Result<only_js::bridge::Capture, RunFail> {
+    // 前置管线（鉴权 + 租户）统一进口：run_route 与 blob 直传 PUT 共用（v0.1.30 抽出，
+    // 防两处准入语义漂移）。401/400 以 RunFail 返回（run_route 转为 Response）。
+    let (user, tenant_id, anonymous, hdr_map) = match admit(st, headers, verb, path_no_base) {
+        Ok(v) => v,
+        Err(resp) => return Err(run_fail_from_response(*resp).await),
+    };
     let req = RequestInfo {
         method: verb.to_string(),
         params,
@@ -837,14 +895,20 @@ async fn run_route(
         .find(|(p, _)| path_matches(std::slice::from_ref(p), full_path))
         .map(|(_, d)| *d)
         .or(st.timeout);
-    let mut resp = match st.actor.run_module(file, handler, req, timeout, true).await {
-        Ok(cap) => capture_response(cap),
-        // 超时熔断 → 408。
-        Err(e) if e.timeout => fail_response(408, &e.msg),
-        Err(e) => fail_response(500, &e.msg),
-    };
-    apply_custom_headers(&mut resp, &st.static_opts.response_headers);
-    resp
+    st.actor
+        .run_module(file, handler, req, timeout, true)
+        .await
+        .map_err(|e| RunFail {
+            status: if e.timeout { 408 } else { 500 },
+            msg: e.msg,
+        })
+}
+
+/// 共享 dispatch 的失败载体：HTTP 状态 + 信封 msg（MCP 侧映射 isError，run_route 侧
+/// 转 fail_response）。
+pub(crate) struct RunFail {
+    pub status: u16,
+    pub msg: String,
 }
 
 /// 前置管线准入（v0.1.30 抽出）：鉴权（ABI 9 四参守卫）+ 租户提取。
