@@ -1037,6 +1037,33 @@ pub struct ResourceProfiles {
 /// `base` = blob 下载 URL 前缀（local driver 的 `LocalBlob::named` 烘焙进注册表）：
 /// server 传 CLI 解析值（`-b` 覆盖 > `server.api_prefix`），保持路由表与 blob URL
 /// 同源不分裂；exec 无 CLI 覆盖，传 config 派生值。
+/// U-18 批 T1.2：`server.route_timeouts` 装配期校验（fail-fast）。
+/// 规则：pattern 含 `{`/`}` → 拒（运行期比对真实请求路径，`{param}` 永不出现，允许即静默
+/// 无保护）；用 [`serve::path_matches`] 对全部已注册路由 pattern 试匹配，命中 0 条 → 拒并
+/// 点名 pattern 与路由数。匹配集 = 各 api 挂载路由表全键（保留路径 /health、/plugins 与 WS
+/// 挂载不经 run_route、不消费 route_timeouts，天然不在集合内——只命中它们的配置会被拒）。
+fn validate_route_timeouts(patterns: &[String], route_keys: &[String]) -> Result<(), String> {
+    for p in patterns {
+        if p.contains('{') || p.contains('}') {
+            return Err(format!(
+                "server.route_timeouts: pattern '{p}' contains a '{{param}}' segment — \
+                 route_timeouts matches real request paths, so such a pattern can never fire; \
+                 use '*' (one segment) or '**' (multi-segment) instead"
+            ));
+        }
+        let hit = route_keys.iter().any(|k| serve::path_matches(std::slice::from_ref(p), k));
+        if !hit {
+            return Err(format!(
+                "server.route_timeouts: pattern '{p}' matches none of {} registered routes — \
+                 refusing to start with a timeout rule that can never apply (reserved /health, \
+                 /plugins and WS mounts are not covered either)",
+                route_keys.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_backend(
     cfg: &Config,
@@ -2299,6 +2326,43 @@ impl ClientTransport for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- U-18 批 T1.2：route_timeouts 装配期校验（纯函数） ----
+
+    #[test]
+    fn validate_route_timeouts_matrix() {
+        let keys = vec![
+            "/v1/api/a".to_string(),
+            "/v1/api/orders/{id}".to_string(),
+            "/v1/api/deep/x/y".to_string(),
+        ];
+        // Given pattern 命中（字面含 base / 单段 `*` 对 `{param}` / `**`），When 校验，Then Ok。
+        for ok in [
+            "/v1/api/a",
+            "/v1/api/orders/*",
+            "/v1/api/**",
+            "/**",
+        ] {
+            assert!(
+                validate_route_timeouts(&[ok.to_string()], &keys).is_ok(),
+                "{ok} 应命中"
+            );
+        }
+        // Given 零命中 pattern，When 校验，Then Err 点名 pattern 与路由数。
+        let e = validate_route_timeouts(&["/v1/api/nope".to_string()], &keys).unwrap_err();
+        assert!(e.contains("/v1/api/nope"), "{e}");
+        assert!(e.contains('3'), "{e}");
+        // Given pattern 含 `{}`（运行期永不命中的具体实例写法），When 校验，Then Err。
+        let e = validate_route_timeouts(&["/v1/api/orders/{id}".to_string()], &keys).unwrap_err();
+        assert!(e.contains("{id}"), "{e}");
+        // 多条中一条零命中 → 整体 Err 且点名那一条。
+        let e = validate_route_timeouts(
+            &["/v1/api/a".to_string(), "/v1/api/ghost".to_string()],
+            &keys,
+        )
+        .unwrap_err();
+        assert!(e.contains("ghost"), "{e}");
+    }
 
     // ---- v0.1.34：资源根 key 多源选择（connect_kv 的 --redis 解析） ----
 

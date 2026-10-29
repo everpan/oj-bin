@@ -310,6 +310,12 @@ impl RouteTable {
     /// 与模块内路径**只能**由索引给出（`dev_rel`）——否则 dev 会按挂载根拼出
     /// `/{base}/foo/api/xxx/yyy`，而 release（`build_cmd::rel_pattern`）以模块根为基，
     /// 两侧 URL 分叉。None = 今日语义（相对挂载 api 根，flat 布局下逐字等价）。
+    /// 注册 pattern 全集（含 base 与 `{param}` 段；slots 的键集）。U-18 批 T1.1：
+    /// 装配期 route_timeouts 校验的匹配集来源。
+    pub fn patterns(&self) -> Vec<&str> {
+        self.slots.keys().map(String::as_str).collect()
+    }
+
     pub fn build(
         base: &str,
         root: &Path,
@@ -1163,6 +1169,21 @@ mod tests {
     }
 
     // ----- RouteTable（纯逻辑，假内省闭包） -----
+
+    #[test]
+    fn patterns_exposes_registered_url_patterns() {
+        // U-18 批 T1.1：装配期 route_timeouts 校验需要注册 pattern 全集。
+        // Given 建表含字面路由与 {param} 路由，When patterns()，Then 两者都在（含 base）。
+        let (t, f) = tbl(
+            &["a/api.ts"],
+            &[("a/api.ts", "get", ""), ("a/api.ts", "post", "{id}")],
+        );
+        assert!(f.is_empty(), "{f:?}");
+        let ps = t.patterns();
+        assert!(ps.iter().any(|&p| p == "/v1/api/a"), "{ps:?}");
+        assert!(ps.iter().any(|&p| p == "/v1/api/a/{id}"), "{ps:?}");
+    }
+
 
     fn tbl(files: &[&str], decls: &[(&str, &str, &str)]) -> (RouteTable, Vec<String>) {
         // decls: (文件相对路径, handler 链, 有效 .route 值；空串 = 未挂)。
