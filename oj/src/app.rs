@@ -2114,6 +2114,8 @@ impl App {
             mcp: mcp_cfg.enabled.then(|| serve::McpConfig {
                 modules: mcp_cfg.modules.clone(),
                 allow_anonymous: mcp_cfg.allow_anonymous,
+                // serverInfo.version 与 `oj --version` 同一来源。
+                server_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
             rpc: cfg.server.rpc.enabled,
         };

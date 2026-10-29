@@ -11,6 +11,8 @@ pub mod certificate_watcher;
 pub mod logging;
 /// OpenAPI spec → MCP tool 列表（纯函数；MCP 双线路共享核心 R3/R4）。
 pub mod mcp;
+/// `POST {base}/mcp`（MCP streamable HTTP stateless 子集）与 `{base}/rpc`（裸 JSON-RPC）。
+pub mod mcp_http;
 /// 路由表 → OpenAPI 3.1 生成（自 oj 迁入，MCP 双线路 R1；字节级不变约束）。
 pub mod openapi;
 /// 配置热更新传输层（v1）：外层单一 fallback + watch 通道 + reload_api 门禁。
@@ -171,6 +173,9 @@ pub struct McpConfig {
     pub modules: Option<Vec<String>>,
     /// 装配期已消费（无 auth fail-fast 在 oj/src/app.rs）；运行期仅作记录。
     pub allow_anonymous: bool,
+    /// oj 版本号（MCP `initialize` 的 serverInfo.version，与 `oj --version` 同源；
+    /// 装配层自 oj crate 的 CARGO_PKG_VERSION 注入）。
+    pub server_version: String,
 }
 
 impl Default for Pipeline {
@@ -252,6 +257,44 @@ pub fn app(
         router = router
             .route(&format!("{p}/health"), axum::routing::get(health_handler))
             .route(&format!("{p}/plugins"), axum::routing::get(plugins_handler));
+        // MCP / 裸 JSON-RPC 端点（spec 2026-10-30，配置门控，默认不挂）。
+        if pipeline.mcp.is_some() {
+            router = router.route(
+                &format!("{p}/mcp"),
+                axum::routing::post(crate::mcp_http::handle),
+            );
+            // 保留路径遮蔽告警（与 /health、/plugins 同款语义）。
+            if let RuntimeMount::Api { table, .. } = m {
+                let reserved = format!("{p}/mcp");
+                if table
+                    .patterns()
+                    .iter()
+                    .any(|k| k.trim_end_matches('/') == reserved.as_str())
+                {
+                    tracing::warn!(
+                        "reserved path {reserved} shadows a business route of the same path"
+                    );
+                }
+            }
+        }
+        if pipeline.rpc {
+            router = router.route(
+                &format!("{p}/rpc"),
+                axum::routing::post(crate::mcp_http::rpc_handle),
+            );
+            if let RuntimeMount::Api { table, .. } = m {
+                let reserved = format!("{p}/rpc");
+                if table
+                    .patterns()
+                    .iter()
+                    .any(|k| k.trim_end_matches('/') == reserved.as_str())
+                {
+                    tracing::warn!(
+                        "reserved path {reserved} shadows a business route of the same path"
+                    );
+                }
+            }
+        }
     }
     router = router
         .fallback(any(handle))
