@@ -2529,12 +2529,19 @@ async fn explain_plan_real_pg_mysql() {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 0, "{tag}: explain 端到端失败: {v}");
         let d = &v["data"];
-        assert!(d["op"].as_str().unwrap_or("").len() > 1, "{tag}: operation 空: {v}");
         assert!(
-            ["scan", "join", "aggregate", "sort", "other"].contains(&d["cat"].as_str().unwrap_or("")),
+            d["op"].as_str().unwrap_or("").len() > 1,
+            "{tag}: operation 空: {v}"
+        );
+        assert!(
+            ["scan", "join", "aggregate", "sort", "other"]
+                .contains(&d["cat"].as_str().unwrap_or("")),
             "{tag}: category 非法: {v}"
         );
-        assert!(d["total"].is_number() || d["total"].is_null(), "{tag}: cost.total 形态: {v}");
+        assert!(
+            d["total"].is_number() || d["total"].is_null(),
+            "{tag}: cost.total 形态: {v}"
+        );
         assert_eq!(d["kids"], json!(true), "{tag}: children 必须为数组: {v}");
         let _ = b;
     }
