@@ -36,6 +36,7 @@ pub mod db_backend;
 pub mod db_error;
 pub mod db_exec;
 pub mod db_policy;
+pub mod db_quota;
 pub mod db_session;
 pub mod dialect_caps;
 mod embedded_js;

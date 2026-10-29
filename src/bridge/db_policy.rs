@@ -44,6 +44,13 @@ pub enum OnExceed {
     Truncate,
 }
 
+impl Default for OnExceed {
+    /// REQ §4.2-2：默认 fail-fast，不静默截断。
+    fn default() -> Self {
+        OnExceed::Fail
+    }
+}
+
 /// 处置档位（与既有 `SqlGuard` 同形的三档；档位类型归一是后续待做 T2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enforce {
