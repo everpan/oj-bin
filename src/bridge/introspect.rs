@@ -432,6 +432,85 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F1（批次 4 / REQ-04，v0.1.105）：库-schema 清单面 + forSchema 范围变换。
+// 清单面走独立 op（不加 catalog kind——避免 `db.catalog("schemas")` 与 `db.listSchemas()`
+// 双入口，Ruling 见计划 §2d）；系统目录过滤口径统一在本模块，调用方零 if-else。
+// ---------------------------------------------------------------------------
+
+/// 库 / schema 清单面（REQ-04 §5.1）。mysql schema≡database（同一份 schemata）；
+/// pg schemas = 当前 database 的 namespace，databases = 集群共享目录 pg_database；
+/// sqlite 无 schema 概念，两条腿都给 `PRAGMA database_list`（main + attached，
+/// 唯一诚实的答案）。未知方言由调用方过 `require_known_dialect` 门控。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    Schemas,
+    Databases,
+}
+
+pub fn listing_sql(l: Listing, d: Dialect) -> Option<&'static str> {
+    match (l, d) {
+        (Listing::Schemas | Listing::Databases, Dialect::Sqlite) => Some(
+            "SELECT name AS name, (name = 'main') AS is_default \
+             FROM pragma_database_list ORDER BY name",
+        ),
+        (Listing::Schemas | Listing::Databases, Dialect::MySql) => Some(
+            "SELECT schema_name AS name, (schema_name = DATABASE()) AS is_default \
+             FROM information_schema.schemata \
+             WHERE schema_name NOT IN ('information_schema','mysql','performance_schema','sys') \
+             ORDER BY schema_name",
+        ),
+        (Listing::Schemas, Dialect::Postgres) => Some(
+            "SELECT schema_name::text AS name, schema_owner::text AS owner, \
+             (schema_name = current_schema()) AS is_default \
+             FROM information_schema.schemata \
+             WHERE schema_name <> 'pg_catalog' AND schema_name <> 'information_schema' \
+                   AND schema_name NOT LIKE 'pg_toast%' \
+             ORDER BY schema_name",
+        ),
+        (Listing::Databases, Dialect::Postgres) => Some(
+            "SELECT d.datname::text AS name, r.rolname::text AS owner, \
+             (d.datname = current_database()) AS is_default, \
+             obj_description(d.oid, 'pg_database')::text AS comment \
+             FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba \
+             WHERE NOT d.datistemplate ORDER BY d.datname",
+        ),
+    }
+}
+
+/// 清单行 → 跨方言同构 `{name, owner?, isDefault?, comment?}`（可选键 NULL 不落）；
+/// `is_default` 由 SQL 投影、布尔走宽容判定（三方言 0/1/'YES'/true 不统一）。
+pub fn listing(rows: Vec<Value>) -> Vec<Value> {
+    rows.iter()
+        .take(MAX_ROWS)
+        .map(|r| {
+            let mut o = serde_json::Map::new();
+            o.insert("name".to_string(), json!(str_of(r, "name")));
+            if let Some(owner) = opt_str(r.get("owner")) {
+                o.insert("owner".to_string(), json!(owner));
+            }
+            o.insert("isDefault".to_string(), json!(truthy(r.get("is_default"))));
+            if let Some(c) = opt_str(r.get("comment")) {
+                o.insert("comment".to_string(), json!(c));
+            }
+            Value::Object(o)
+        })
+        .collect()
+}
+
+/// forSchema 范围变换（REQ-04 §5.2 方案 B）：活动 scope 时把范围谓词
+/// `DATABASE()` / `current_schema()` 改写为绑定参数（`?`），由调用方把 scope 值
+/// **前置**进参数数组（范围谓词在 WHERE 中先于表名谓词出现）。
+/// sqlite → None（无 schema 概念，调用方报 `OJ_DB_UNSUPPORTED` capability=for_schema）。
+/// mysql SHOW 例外（Ddl）不接受绑定参数，调用方在 scoped 模式直接 unsupported、不经此函数。
+pub fn scoped_sql(base: &str, d: Dialect) -> Option<String> {
+    match d {
+        Dialect::Sqlite => None,
+        Dialect::MySql => Some(base.replace("DATABASE()", "?")),
+        Dialect::Postgres => Some(base.replace("current_schema()", "?")),
+    }
+}
+
 /// 结果 → JS 契约形态（三方言同构），并截断到 [`MAX_ROWS`]。
 pub fn columns(rows: Vec<Value>) -> Vec<Value> {
     rows.iter()
@@ -798,5 +877,144 @@ mod tests {
         assert_eq!(col[0]["nullable"], json!(true), "sqlite rowid PK 仍可空");
         assert_eq!(col[0]["primaryKey"], json!(true));
         assert_eq!(col[0]["default"], json!(null));
+    }
+
+    // -----------------------------------------------------------------
+    // F1（批次 4 / REQ-04，v0.1.105）：库-schema 清单面 + forSchema 范围变换
+    // -----------------------------------------------------------------
+
+    /// 清单 SQL 矩阵：mysql schema≡database 同源（schemata）；pg schemas 走
+    /// information_schema.schemata、databases 走集群共享目录 pg_database；
+    /// sqlite 两条腿都给 database_list（main + attached，是唯一诚实的答案）。
+    #[test]
+    fn listing_sql_matrix() {
+        assert_eq!(
+            listing_sql(Listing::Schemas, Dialect::MySql),
+            listing_sql(Listing::Databases, Dialect::MySql),
+            "mysql schema≡database，须同源"
+        );
+        let my = listing_sql(Listing::Schemas, Dialect::MySql).unwrap();
+        for sys in [
+            "'information_schema'",
+            "'mysql'",
+            "'performance_schema'",
+            "'sys'",
+        ] {
+            assert!(my.contains(sys), "mysql 系统库过滤缺 {sys}: {my}");
+        }
+        let pg = listing_sql(Listing::Schemas, Dialect::Postgres).unwrap();
+        assert!(pg.contains("information_schema.schemata"), "{pg}");
+        assert!(pg.contains("'pg_catalog'"), "{pg}");
+        assert!(pg.contains("pg_toast%"), "pg_toast 系列过滤: {pg}");
+        assert!(pg.contains("::text"), "pg 标识符域铁律: {pg}");
+        let pgd = listing_sql(Listing::Databases, Dialect::Postgres).unwrap();
+        assert!(pgd.contains("pg_database"), "{pgd}");
+        assert!(pgd.contains("datistemplate"), "模板库过滤: {pgd}");
+        assert!(pgd.contains("current_database()"), "isDefault 判定: {pgd}");
+        let lite = listing_sql(Listing::Schemas, Dialect::Sqlite).unwrap();
+        assert!(lite.contains("database_list"), "{lite}");
+    }
+
+    /// 未知方言（插件轴开放契约态）：清单面与内视面一样结构化 unsupported，不回落。
+    #[test]
+    fn listing_sql_unknown_dialect_is_none() {
+        // Dialect 只有三 known 变体；矩阵用全遍历钉死——新增方言必须显式给清单 SQL。
+        for l in [Listing::Schemas, Listing::Databases] {
+            for d in [Dialect::Sqlite, Dialect::MySql, Dialect::Postgres] {
+                assert!(listing_sql(l, d).is_some(), "{l:?}/{d:?} 缺清单 SQL");
+            }
+        }
+    }
+
+    /// 清单归一：字段可选、跨方言同构；布尔宽容（0/1/'YES'/true）。
+    #[test]
+    fn listing_normalization() {
+        let rows = vec![
+            json!({"name": "app", "owner": "alice", "is_default": 1, "comment": null}),
+            json!({"name": "public", "owner": "postgres", "is_default": 0}),
+        ];
+        let out = listing(rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["name"], json!("app"));
+        assert_eq!(out[0]["owner"], json!("alice"));
+        assert_eq!(out[0]["isDefault"], json!(true));
+        assert!(
+            !out[0].as_object().unwrap().contains_key("comment"),
+            "NULL 不落键"
+        );
+        assert!(
+            !out[1].as_object().unwrap().contains_key("ownerMap"),
+            "无垃圾键"
+        );
+        assert_eq!(out[1]["isDefault"], json!(false));
+    }
+
+    /// forSchema 范围变换：mysql/pg 的全部内视常量（L2 三件 + catalog 全类 +
+    /// list_tables 骨架同规则）把范围谓词改为恰好一个绑定参数；sqlite → None。
+    #[test]
+    fn scoped_sql_replaces_exactly_one_scope_predicate() {
+        for kind in [Kind::Columns, Kind::Indexes, Kind::ForeignKeys] {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let base = sql(kind, d);
+                let scoped = scoped_sql(base, d).unwrap();
+                assert!(
+                    !scoped.contains("DATABASE()") && !scoped.contains("current_schema()"),
+                    "{kind:?}/{d:?}: 残留范围谓词: {scoped}"
+                );
+                assert_eq!(
+                    scoped.matches('?').count(),
+                    base.matches('?').count() + 1,
+                    "{kind:?}/{d:?}: scope 参数位须恰增 1"
+                );
+            }
+        }
+        for kind in [
+            Kind::Views,
+            Kind::Routines,
+            Kind::Sequences,
+            Kind::Comment,
+            Kind::Constraints,
+            Kind::Stats,
+        ] {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let base = catalog_sql(kind, d).unwrap();
+                let scoped = scoped_sql(base, d).unwrap();
+                assert!(
+                    !scoped.contains("DATABASE()") && !scoped.contains("current_schema()"),
+                    "{kind:?}/{d:?}: 残留范围谓词: {scoped}"
+                );
+            }
+        }
+        assert!(scoped_sql(sql(Kind::Columns, Dialect::Sqlite), Dialect::Sqlite).is_none());
+        // mysql SHOW 例外（Ddl）走标识符内联白名单、不接受绑定参数——scoped 模式由
+        // 调用方直接报 unsupported，不经过 scoped_sql。
+    }
+
+    /// 范围谓词恰出现一次（变换正确性的前置不变量）：
+    /// 若某常量漏写范围限定（如 pg 索引忘加 nspname），上面的替换会静默 no-op——
+    /// 用「非 sqlite 常量必含范围谓词」钉死。
+    #[test]
+    fn network_constants_all_carry_scope_predicate() {
+        for kind in [Kind::Columns, Kind::Indexes, Kind::ForeignKeys] {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let base = sql(kind, d);
+                let has = base.contains("DATABASE()") || base.contains("current_schema()");
+                assert!(has, "{kind:?}/{d:?}: 内视 SQL 缺范围谓词: {base}");
+            }
+        }
+        for kind in [
+            Kind::Views,
+            Kind::Routines,
+            Kind::Sequences,
+            Kind::Comment,
+            Kind::Constraints,
+            Kind::Stats,
+        ] {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let base = catalog_sql(kind, d).unwrap();
+                let has = base.contains("DATABASE()") || base.contains("current_schema()");
+                assert!(has, "{kind:?}/{d:?}: catalog SQL 缺范围谓词: {base}");
+            }
+        }
     }
 }

@@ -16,6 +16,45 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.105
+
+**上游 REQ-04 处置（U-17 批；需求源 `oj-dbx/docs/upstream`）——库/schema 层内省：
+清单两件 + forSchema 只读受限视图**：
+
+- **`db.listSchemas(prefix?)` / `db.listDatabases(prefix?)`**：跨方言同构
+  `{name, owner?, isDefault?, comment?}`（可选键 NULL 不落键）。系统目录过滤由
+  平台统一口径（mysql 滤 `information_schema`/`mysql`/`performance_schema`/`sys`；
+  pg schema 滤 `pg_catalog`/`pg_toast%`/`information_schema`；pg database 滤模板库）；
+  账号级可见性跟随 DB 账号自身权限模型（成文差异）。mysql 两腿同源（schema≡
+  database）；sqlite 给 `PRAGMA database_list` 实际项（main + attached，TVF 形态
+  投影 isDefault）；pg database 清单经集群共享目录 `pg_database` 由任意库连出——
+  **不换连接即可拿到名字**。prefix 过滤 Rust 侧 `starts_with`（清单基数天然小）。
+- **`db.forSchema(name)` 受限视图（REQ-04 §5.2 方案 B）**：只读内视五件
+  （listTables/listColumns/listIndexes/listForeignKeys/catalog），**无
+  query/exec/stream**；池面 only（无 tx/session 变体，成文）。机制 =
+  `introspect::scoped_sql` 把内视 SQL 的范围谓词 `DATABASE()` /
+  `current_schema()` 改写为绑定参数（scope 值前置进参数数组）——**零 ABI**，
+  插件轴零改动免费获得。sqlite 无 schema 概念 → 各件结构化
+  `OJ_DB_UNSUPPORTED`（capability=`for_schema`）；mysql SHOW 例外（Ddl）在
+  scoped 模式显式 unsupported（不接受绑定参数，不内联 schema 名）；pg 的
+  `forDatabase` 视图同为 unsupported（capability=`for_database`——database =
+  独立连接，物理不可行，「一连接=一库」边界成文）。scope 名只走绑定参数，
+  允许 `.`（库名含点合法）；畸形（>128 / 控制字符）→ 空结果（不报错不泄漏，
+  与表名畸形同口径）。
+- **安全链与既有内视面同**：`granted_only` 授权维、known 方言门控（未知方言
+  结构化 unsupported 点名能力）、`MAX_ROWS` 截断、trace 脱敏、占位符统一改写。
+  env-gated 真库矩阵腿（pg/mysql 双容器）一次全绿：跨 schema/库取表、系统目录
+  过滤、isDefault、schema≡database 同源、畸形 scope 空结果。
+- **源码拆分（同版顺手债）**：`db.rs`（4333 行）按职责拆为
+  `db.rs`（核：方言类型/解析/trace 管线，617 行）+ `db_tx.rs` / `db_query.rs` /
+  `db_stream.rs` / `db_introspect.rs` / `db_seq.rs`；测试整体移 `db_tests.rs`
+  （照 `query_tests.rs` 先例，纯移动零行为变更，920 例全绿）。
+- **类型面**：`SchemaInfo`/`DatabaseInfo`/`IntrospectScope` 三类型 +
+  `DBInstance.listSchemas/listDatabases/forSchema` 声明入 `global.d.ts` 的
+  `declare global`（业务可点名）；顺带修复 `ColumnInfo`/`IndexInfo`/
+  `ForeignKeyInfo` 原在模块作用域、业务代码点名即 TS2304 的潜在债。
+  tsc 锚 `schemaListingUsage`。
+
 ## v0.1.104
 
 **U-18 / REQ-03 任务式导出（批次 3；需求源 `oj-dbx/docs/upstream`，设计 §3）**：

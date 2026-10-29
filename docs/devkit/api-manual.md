@@ -1144,7 +1144,7 @@ if (http.module.version.startsWith("0.1.")) { /* 旧版兼容分支 */ }
 db 的**全部操作与相关内容**已并入 `db-guide.md`（随 devkit 发布，与本手册同源）：
 `DB(name)` / `db.query` / `db.exec` / `db.table` / `db.tx`（请求内事务）/ `db.stream` / `db.export` 任务式导出三件（v0.1.104）/ 
 `db.cancel`（跨请求取消，v0.1.96）/ `db.session`（跨请求事务，v0.1.95）/ 结构内省（含
-`db.catalog`，v0.1.100）/ `db.client` 动态数据源登记（含 `serverVersion` 探测，v0.1.100）/
+`db.catalog`，v0.1.100；库/schema 清单 + `forSchema` 受限视图，REQ-04 v0.1.105）/ `db.client` 动态数据源登记（含 `serverVersion` 探测，v0.1.100）/
 `db.access` 运行期动态授权 / `db.epoch` 跨 isolate 失效、查询构造器、SQL 执行追踪等，
 统一见 `db-guide.md`（DB API 参考章；`db.session` 见其 §4.5，`db.cancel` 见其 §3.1，
 `db.catalog` 见其 §6 与能力矩阵）。
@@ -3858,7 +3858,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | 语句风险分类是 best-effort 词法（v0.1.89） | 不是 SQL 解析器：CTE / 窗口函数 / 存储过程体 / 串未闭合等复杂形态会落 `unknown` 并**按最严档拒**（fail-closed）。`deny` 档上线前先用 `warn` 灰度看日志，别直接 deny |
 | `db_access` 不约束平台自生成 SQL 与 CLI 通道（v0.1.89） | `db.nextSeq` 的序列表 DDL、`db.listTables` 的内省查询不适用；`oj migrate` / `oj schema` / `oj build` 不经 bridge，也不适用 |
 | `sql_guard=deny` 下 raw SELECT 未登记表的敞口**原样保留**（v0.1.89） | 本策略只管「库别名 + 风险类别」，只读语句一律放行——不要把 `db_access` 读成「该敞口已修」 |
-| 结构内省只覆盖「当前库 / 当前 schema」（v0.1.90） | PG 走 `current_schema()`、mysql 走 `DATABASE()`、sqlite 单文件单库；**不跨 schema**（多 schema 部署只能内省默认 schema）。视图 / 触发器 / 数据类型字典 / CHECK 不在内省范围（待做） |
+| 结构内省默认钉在当前库 / 当前 schema；跨 schema 走 `forSchema`（v0.1.90 → v0.1.105 REQ-04） | 默认件 PG 走 `current_schema()`、mysql 走 `DATABASE()`；`db.forSchema(name)` 受限句柄（只读五件内视，scope 走绑定参数）可跨 schema/mysql 跨库。**边界**：sqlite 无 schema 概念（forSchema 各件 `OJ_DB_UNSUPPORTED`，capability=`for_schema`）；pg 的 forDatabase 视图同 unsupported（database=独立连接）——`listDatabases()` 只出清单。视图 / 触发器 / 数据类型字典 / CHECK 不在内省范围（待做） |
 | 内省是目录读，不是标识符白名单（v0.1.90） | `listColumns` 的列名不可回填构造器或裸 SQL；构造器只认 `SchemaRegistry`。`information_schema` 只返回**当前连接账号可见**的对象，不等于「库的完整结构」 |
 | 内省与 `db.listTables` 一并过 `db_access` 授权维（v0.1.90） | `deny` 档 + 未授权主体无法枚举任何表结构；`asSystem()` 不豁免、`warn` 档放行并落 `DB_ACCESS_DENY`。内省恒只读，不受 `read_only` 限制（只读库也要能看结构） |
 | `db.access.grant` 只注入放行维，不放松 config（v0.1.93） | 运行期 grant 只动 `allow`，不放开 config 的 `read_only` / `max_rows` / `allow_ddl` / `allow_dangerous`——防提权；config 未限制主体时 grant 成为白名单（并把 `off` 抬到 `deny`），已有白名单时逐维并集追加 |

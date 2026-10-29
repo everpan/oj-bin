@@ -1,6 +1,6 @@
 # U-18 批执行计划与任务跟踪（REQ-01/02 → REQ-05 → U-18/REQ-03 → U-17/REQ-04）
 
-> 状态：**批次 3（v0.1.104 U-18 任务式导出）已交付**（E1–E8 ✅，未提交——终审后等用户发版指令）。
+> 状态：批次 1–3 **已提交**（b0ec1c0，tag v0.1.103/v0.1.104，未推送）；**批次 4（v0.1.105 REQ-04 库-schema 层）F1–F6 全部 ✅，门禁全绿——发版动作等用户指令**（2026-10-29 重评取消 M3/M4 等待提前并入，Ruling 见 §2d）。
 > （本文件是唯一任务真相源：状态、小结、增量记录都在这里，随做随更。）
 > 依据：设计稿 `docs/plans/2026-10-29-u18-upstream-reqs.md`（v2，三路评审已处置）+ `oj-dbx/docs/upstream/REQ-01..05`。
 > 原则：SOLID（校验纯函数/装配接线/门禁三腿各自独立）+ DRY（路径匹配复用 `path_matches` 单一实现、
@@ -13,7 +13,7 @@
 | **1** | REQ-01 装配校验 + REQ-02 类型面补齐与防漂移 | **bump v0.1.102**（CHANGELOG + 门禁全绿后提交打标推送） |
 | 2 | REQ-05 语句级超时 + max_result_bytes（GA 门禁；导出原语先行） | bump v0.1.103 |
 | 3 | U-18 / REQ-03 任务式导出（复用批 2 原语） | bump v0.1.104 |
-| 4 | U-17 / REQ-04 库-schema 层（清单 + forSchema 收窄版） | 另期（M3/M4 窗口） |
+| 4 | U-17 / REQ-04 库-schema 层（清单 + forSchema 收窄版） | **提前并入本期**：v0.1.105（重评：零 ABI + 护栏全现成，见 §2d） |
 
 ## 1. 任务跟踪（批次 1 · v0.1.102）
 
@@ -94,6 +94,27 @@
 | E6 | TTL 回收器：tokio interval 按台账年龄清扫（TTL 自 put_stream_open 起算），live 任务 key 豁免；`oj test` 可注入短 TTL/短间隔 | Given 短 TTL 注入，When 轮询清扫，Then 过期 key 被删、live 豁免 | ✅ | | 懒启动 interval 清扫器（每注册表一次）+ sweep 豁免 live；单位层过期/新鲜/live 三分支用例（集成走短周期段注入）
 | E7 | 审计事件：发起/完成/取消/maxBytes 中止（主体/tenant/alias/rows/bytes/终态；SQL 全文不入审计）；taskId/blobKey 日志只出前 8 字符 | 审计 store 断言 kind 与字段 | ✅ | | start/done/failed/cancelled 四事件；SQL 全文不入审计用例钉死
 | E8 | bootstrap.js db.export/exportStatus/exportCancel + global.d.ts + tsc 锚 + 文档四件 + CHANGELOG + bump v0.1.104 + 全门禁 | 同 Q8 五步；发版动作等用户指令 | ✅ | | d.ts 三件 + tsc 锚 exportUsage + 文档四件 + CHANGELOG + bump；发版提交动作等用户指令
+
+## 2d. 任务跟踪（批次 4 · v0.1.105 U-17/REQ-04 库-schema 层，2026-10-29 重评后提前并入本期）
+
+**重评结论（取消 M3/M4 等待）**：内省 SQL 全部宿主生成（`introspect.rs` 常量，插件轴只承载执行），
+范围钉死点 = `DATABASE()`/`current_schema()` 约 15 处谓词——`forSchema` = 把这些谓词改为绑定
+参数的机械变换，**零 ABI**；granted_only / MAX_ROWS / trace 脱敏 / 占位符改写护栏全部现成。
+REQ-04 自己警告「等连接树挂满后再改返工成本变大」，成本既已降到「一个中等批次」，立即做正省钱。
+M3/M4 真正该等的只剩 ABI 13 车厢（插件真取消）。
+
+**Ruling**：计划 §2b 行「catalog kinds `schemas`/`databases`」**改为独立 op、不加 catalog kind**——
+再加两个 kind 会造出清单双入口（`db.catalog("schemas")` vs `db.listSchemas()`），违背
+listTables 系列「清单即 op」先例。成本若错：将来合并入口 = 一次纯 JS 面重定向。
+
+| # | 任务 | BDD 验收（Given/When/Then） | 状态 | 小结 |
+|---|---|---|---|---|
+| F1 | `introspect.rs` 清单面：`Listing{Schemas,Databases}` + `listing_sql`（系统库过滤统一口径：mysql information_schema/mysql/performance_schema/sys；pg schema pg_catalog/pg_toast%/information_schema；pg database datistemplate）+ `listing` 归一化（{name,owner?,isDefault?,comment?}）+ `scoped_sql`（DATABASE()/current_schema()→绑定参数；sqlite→None） | 纯单测：三方言 SQL 文本矩阵、系统过滤断言、scoped 变换参数计数、sqlite None | ✅ | introspect.rs：Listing 三方言 SQL 矩阵 + listing 归一化（可选键 NULL 不落）+ scoped_sql（范围谓词→绑定参数，sqlite→None）；4 新单测 |
+| F2 | `op_db_list_schemas`/`op_db_list_databases`：同 list_tables 骨架（门控→granted_only→prefix LIKE→LIMIT→trace 脱敏）；WHITELIST 白名单 +2；mod.rs 注册；sqlite 腿（PRAGMA database_list→main） | Given sqlite 内存库，When db.listSchemas()，Then [{name:"main",isDefault:true}]；oracle → unsupported 点名 | ✅ | op_db_list_schemas/list_databases + listing_impl（prefix Rust 侧 starts_with——PRAGMA 不接 WHERE）；WHITELIST+2；sqlite 腿 TVF `pragma_database_list`（isDefault=name==main）；oracle 门控 |
+| F3 | 五件内视 op 加尾参 `scope`：活动 scope 时 scoped_sql + scope 参数前置（表名参数后移）；sqlite scope → OJ_DB_UNSUPPORTED(capability=for_schema)；畸形 scope → 空结果不泄漏；mysql Ddl SHOW 例外在 scoped 模式 → unsupported | 单测：scoped SQL 参数序、sqlite/SHOW 两道 unsupported、畸形输入空结果 | ✅ | Scope/resolve_scope（sqlite→unsupported 点名 for_schema；畸形→Empty；点号合法）；五件 op 尾参 scope，参数前置序钉死；mysql SHOW 例外 scoped 模式显式 unsupported |
+| F4 | bootstrap.js `forSchema(name)` 受限句柄（五件只读内视，无 query/exec）+ 实例 `listSchemas/listDatabases`；global.d.ts（SchemaInfo/DatabaseInfo/IntrospectScope）+ type-usage.ts tsc 锚 | tsc 绿；golden 全局清单不变（无新全局） | ✅ | bootstrap.js forSchema 受限句柄（五件只读）+ listSchemas/listDatabases；d.ts 三类型入 declare global（顺带修 Column/Index/FKInfo 模块作用域 TS2304 潜在债）；tsc 锚 schemaListingUsage |
+| F5 | env-gated 真库腿（OJ_TEST_PG/OJ_TEST_MYSQL）：pg 建 schema+表 → listSchemas 含之、forSchema('x').listTables 跨 schema 取表；mysql 建 2 业务库 → listDatabases 过滤系统库、forDatabase≡forSchema 同实现成文 | env 缺席 skip 诚实登记 | ✅ | pg 腿：oj_req04 schema 建表→listSchemas 含之/forSchema 取表/默认 listTables 不越 schema/pg_database 模板过滤；mysql 腿：oj_req04 建库→系统库过滤/schema≡database 同源/isDefault；双容器一次全绿 |
+| F6 | 文档四件（api-manual 章节+限制表、SKILL 陷阱、scenarios 场景 55、README 场景表）+ db-guide 指针 + CHANGELOG v0.1.105 + bump + 全门禁 | 同 Q8 五步；发版动作等用户指令 | ✅ | CHANGELOG v0.1.105 + devkit 四件 + db-guide §11.5.8/§2 表 + bump；门禁全绿（含 clippy）：fmt/clippy/workspace 1674/1674（真库腿在内）/xtask build+smoke/契约/oj test | |
 
 ## 3. 增量记录（随做随更）
 

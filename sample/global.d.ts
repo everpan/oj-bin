@@ -123,38 +123,6 @@ interface DbAllowedEntry {
   enforce: "off" | "warn" | "deny";
 }
 
-// db.listColumns() 的返回：单列的结构信息。
-interface ColumnInfo {
-  name: string;
-  // 方言声明文本（sqlite `type` / mysql `column_type` / pg `format_type`），零归一化。
-  nativeType: string;
-  nullable: boolean;
-  // 原始 DDL 文本（sqlite 字符串默认带引号）；无默认值为 null。
-  default: string | null;
-  primaryKey: boolean;
-}
-
-// db.listIndexes() 的返回：单索引的结构信息。
-interface IndexInfo {
-  name: string;
-  unique: boolean;
-  primary: boolean;
-  // 三方言统一口径：`c`(普通) / `u`(唯一) / `pk`(主键)。
-  origin: "c" | "u" | "pk";
-  // 组成该索引的列（已按声明序聚合）。
-  columns: string[];
-}
-
-// db.listForeignKeys() 的返回：单外键的结构信息。
-interface ForeignKeyInfo {
-  // sqlite 外键无约束名 → null。
-  name: string | null;
-  // 复合外键按位配对：`columns[i]` ↔ `refColumns[i]`。
-  columns: string[];
-  refTable: string;
-  refColumns: string[];
-}
-
 // 事务内的库实例：与 DBInstance 同面，但没有 tx（嵌套事务不支持）、没有 stream
 // （流式只走直连池，tx 内报错）。
 // isTx 标记事务域句柄——DDL（如 search.ensureIndex）必须拒绝在此类句柄上执行
@@ -618,6 +586,61 @@ declare global {
     response?: Record<string, unknown>;
   }
 
+  // REQ-04（v0.1.105）db.listSchemas()/listDatabases() 的返回：跨方言同构，
+  // 可选键缺省不出现（方言差异不归一化）。
+  // db.listColumns() 的返回：单列的结构信息。
+  interface ColumnInfo {
+    name: string;
+    // 方言声明文本（sqlite `type` / mysql `column_type` / pg `format_type`），零归一化。
+    nativeType: string;
+    nullable: boolean;
+    // 原始 DDL 文本（sqlite 字符串默认带引号）；无默认值为 null。
+    default: string | null;
+    primaryKey: boolean;
+  }
+
+  // db.listIndexes() 的返回：单索引的结构信息。
+  interface IndexInfo {
+    name: string;
+    unique: boolean;
+    primary: boolean;
+    // 三方言统一口径：`c`(普通) / `u`(唯一) / `pk`(主键)。
+    origin: "c" | "u" | "pk";
+    // 组成该索引的列（已按声明序聚合）。
+    columns: string[];
+  }
+
+  // db.listForeignKeys() 的返回：单外键的结构信息。
+  interface ForeignKeyInfo {
+    // sqlite 外键无约束名 → null。
+    name: string | null;
+    // 复合外键按位配对：`columns[i]` ↔ `refColumns[i]`。
+    columns: string[];
+    refTable: string;
+    refColumns: string[];
+  }
+
+  interface SchemaInfo {
+    name: string;
+    // pg 给属主角色名；mysql/sqlite 无此来源 → 缺省。
+    owner?: string;
+    // 是否连接默认库/schema（sqlite：name=="main"）。
+    isDefault: boolean;
+    // pg database 给 obj_description；其余方言无来源 → 缺省。
+    comment?: string;
+  }
+  type DatabaseInfo = SchemaInfo;
+
+  // REQ-04（v0.1.105）db.forSchema() 的只读内视受限视图：五件内视、无 query/exec/stream。
+  interface IntrospectScope {
+    listTables(prefix?: string): Promise<string[]>;
+    listColumns(table: string): Promise<ColumnInfo[]>;
+    listIndexes(table: string): Promise<IndexInfo[]>;
+    listForeignKeys(table: string): Promise<ForeignKeyInfo[]>;
+    catalog(kind: "views" | "routines" | "sequences" | "ddl" | "comment" | "constraints" | "stats", arg?: string):
+      Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
+  }
+
   // DB(name) 返回的命名数据库实例。（在 declare global 内：业务代码要能**点名**
   // 这个类型（如 `function f(dbi: DBInstance)`）；放模块作用域会 TS2304。）
   interface DBInstance {
@@ -672,6 +695,23 @@ declare global {
      * db-guide §6——unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默。 */
     catalog(kind: "views" | "routines" | "sequences" | "ddl" | "comment" | "constraints" | "stats", arg?: string):
       Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
+    /** REQ-04（v0.1.105）库/schema 清单：跨方言同构 `{name, owner?, isDefault?, comment?}`。
+     * 系统目录由平台统一过滤（mysql 滤 information_schema/mysql/performance_schema/sys；
+     * pg schema 滤 pg_catalog/pg_toast%/information_schema；pg database 滤模板库）；
+     * 账号级可见性跟随 DB 账号自身权限模型。mysql 上两者同源（schema≡database）；
+     * sqlite 给 `database_list` 实际项（main + attached）。 */
+    listSchemas(prefix?: string): Promise<SchemaInfo[]>;
+    /** REQ-04（v0.1.105）database 清单：同 {@link listSchemas} 字段口径。
+     * pg 上由任意库连出集群共享目录（不换连接即可拿到名字）；只出清单不出视图——
+     * pg 的 forDatabase 受限视图是 OJ_DB_UNSUPPORTED（capability=for_database，
+     * database=独立连接，物理不可行，「一连接=一库」边界成文）。 */
+    listDatabases(prefix?: string): Promise<DatabaseInfo[]>;
+    /** REQ-04（v0.1.105）§5.2 方案 B：钉住一个 schema/database 的**只读内视受限视图**
+     * （listTables/listColumns/listIndexes/listForeignKeys/catalog 五件；无 query/exec/stream）。
+     * mysql schema≡database（forDatabase 用同一句柄心智）；pg 限当前 database 的 namespace；
+     * sqlite 无 schema 概念 → 各件 OJ_DB_UNSUPPORTED（capability=for_schema）。
+     * scope 名只走绑定参数；畸形名 → 空结果（不报错不泄漏）。 */
+    forSchema(schema: string): IntrospectScope;
     /** 流式查询：逐行拉取大结果集。给 onRow 返回 Promise<void>；省略则返回
      * AsyncIterable<Row>。opts.signal 触发 abort 即取消（pg/mysql 真取消）；db.tx 内报错；
      * opts.onOpen(executionId) 回调跨请求取消句柄（迭代形式用 it.executionId()）。

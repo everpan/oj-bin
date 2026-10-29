@@ -45,6 +45,21 @@ export async function callOptsUsage(): Promise<void> {
   void opts;
 }
 
+/** REQ-04 库-schema 层（v0.1.105）类型锚：清单两件 + forSchema 受限视图五件。 */
+export async function schemaListingUsage(): Promise<void> {
+  const schemas: SchemaInfo[] = await DB("rep").listSchemas();
+  const dbs: DatabaseInfo[] = await DB("rep").listDatabases("app");
+  const s0: string = schemas[0].name;
+  const dflt: boolean = dbs[0].isDefault;
+  const scope: IntrospectScope = DB("rep").forSchema("public");
+  const tables: string[] = await scope.listTables();
+  const cols: ColumnInfo[] = await scope.listColumns(tables[0] ?? "t");
+  const idx: IndexInfo[] = await scope.listIndexes("t");
+  const fk: ForeignKeyInfo[] = await scope.listForeignKeys("t");
+  const cat = await scope.catalog("views");
+  void [s0, dflt, cols, idx, fk, cat];
+}
+
 /** U-18 任务式导出（v0.1.104）类型锚：按文档写法逐一调用。 */
 export async function exportUsage(): Promise<void> {
   const { taskId } = await DB("rep").export({

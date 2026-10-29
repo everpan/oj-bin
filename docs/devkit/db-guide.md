@@ -267,6 +267,9 @@ no tenant header)` / `db.asTenant: id must not be empty`。
 | `leaf` / `and` / `or` / `not` | 工厂 | 条件对象 | 条件组合（§5.2） |
 | `nextSeq` | `nextSeq(name)` | `Promise<number \| string>` | 平台序列取号（§11 第 7 条） |
 | `listTables` | `listTables(prefix?)` | `Promise<string[]>` | 目录自省（v0.1.82；三内置方言同口径，其他方言 `OJ_DB_UNSUPPORTED`） |
+| `listSchemas` | `listSchemas(prefix?)` | `Promise<SchemaInfo[]>` | schema 清单（REQ-04 v0.1.105；系统目录平台过滤；mysql 与 listDatabases 同源） |
+| `listDatabases` | `listDatabases(prefix?)` | `Promise<DatabaseInfo[]>` | database 清单（pg 由任意库连出 pg_database，不换连接拿名字） |
+| `forSchema` | `forSchema(name)` | 只读内视句柄 | 钉住一个 schema/database 的受限视图（五件内视；sqlite/pg-forDatabase unsupported） |
 | `dialect` | `dialect()` | `string` | 后端声明的方言名——**别拿它当能力探测**（§10.7） |
 | `sqlProfile` | `sqlProfile()` | `{count,totalMs,slow,byDb,events}` | 本请求 SQL 画像（dev 默认开；追踪关时 `{}`） |
 | `asSystem` | `asSystem()` | 本实例 | 本请求以系统身份绕过租户防护（审计日志；业务禁用） |
@@ -1386,6 +1389,33 @@ const fk   = await db.listForeignKeys("user");    // {name, columns, refTable, r
 | 外键 `name` | 恒 `null`（无约束名） | `constraint_name` | `conname` |
 | 复合外键配对 | `pragma_foreign_key_list` 按 `seq` | `position_in_unique_constraint` | `conkey`/`confkey` 按 ordinality |
 | schema 范围 | 单库（文件） | `DATABASE()` | `current_schema()` |
+
+---
+
+### 11.5.8 库/schema 层：清单 + `forSchema` 受限视图（REQ-04，v0.1.105）
+
+把对象树从「连接(=库) → 表」补齐到「连接 → 库 → schema → 表」。清单两件跨方言同构
+`{name, owner?, isDefault?, comment?}`（可选键缺省不出现）；系统目录由平台统一过滤
+（mysql 滤 `information_schema`/`mysql`/`performance_schema`/`sys`；pg schema 滤
+`pg_catalog`/`pg_toast%`/`information_schema`；pg database 滤模板库），调用方零
+if-else。账号级可见性跟随 DB 账号自身权限模型（pg_database 有 per-database ACL；
+mysql 的 schemata 对可连接账号可见库名）——平台不越权代做账号级过滤。
+
+```js
+const dbs = await db.listDatabases();        // pg：集群共享目录，不换连接拿名字
+const schemas = await db.listSchemas("app"); // mysql：与 listDatabases 同源（schema≡database）
+const scope = db.forSchema("app_log");       // 只读内视受限句柄：五件内视、无 query/exec/stream
+const tables = await scope.listTables();
+```
+
+- **机制**：内视 SQL 的范围谓词（`DATABASE()` / `current_schema()`）在 scoped 模式
+  改写为**绑定参数**——schema 名零标识符内联，`.` 合法（库名含点），畸形名
+  （>128 / 控制字符）返回空结果（不报错不泄漏，与表名同口径）。
+- **unsupported 矩阵（报错不静默， capability 点名）**：sqlite 的 forSchema 各件
+  （无 schema 概念）；pg 的跨 database 视图（database=独立连接，物理不可行，
+  「一连接=一库」）；mysql `catalog("ddl")` 的 SHOW 例外（不接受绑定参数）。
+- **安全**：与既有内视面同链——`granted_only` 授权维、known 方言门控、
+  `MAX_ROWS` 截断、trace 脱敏；句柄池面 only（无 tx/session 变体）。
 
 ---
 

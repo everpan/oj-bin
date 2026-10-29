@@ -4046,3 +4046,35 @@ await db.exportCancel(taskId);
 | 重启后轮询报 not found | 有意语义：旧 taskId 一律 not found（不是 failed，防误读成 SQL 错）；跨重启恢复不做 |
 | 产物链接 404 | TTL 24h 到点清扫（live 任务豁免）；长任务产物要在窗口内下载 |
 | 并发发起被拒 | 「global … limit reached」= 全局满，「per-subject …」= 本人满——文案区分，前端可分别提示 |
+
+## 场景 55：对象树画出「库 / schema」层（REQ-04，v0.1.105）
+
+桌面 dbx 迁移过来的连接树缺「库 → schema」两级——不是不会画，是旧内视全部钉死在
+DSN 那一个库。`listSchemas` / `listDatabases` 给清单，`forSchema` 给**钉住一个
+schema 的只读内视句柄**，连接树四级「连接 → 库 → schema → 表」可画满。
+
+**代码**：
+
+```ts
+// 连接下展开：库/schema 清单（系统目录平台已滤；跨方言同构）
+const dbs = await db.listDatabases();          // [{name, owner?, isDefault?, comment?}]
+const schemas = await db.listSchemas("app");   // 可选前缀过滤
+
+// 点开某个 schema：受限句柄（只读五件内视，无 query/exec/stream）
+const scope = db.forSchema("app_log");
+const tables = await scope.listTables();       // 该 schema 的表
+const cols = await scope.listColumns(tables[0]);
+```
+
+**验证**：pg 建 `create schema s1; create table s1.t(...)` 后 `listSchemas()` 含
+`s1`、`forSchema("s1").listTables()` 返回 `t`、默认 `listTables()` **不越**
+schema；mysql 建第二个库同理（schema≡database，两腿同源）。
+
+**常见坑**：
+
+| 坑 | 解 |
+|---|---|
+| sqlite 上 forSchema 报 unsupported | 预期：sqlite 无 schema 概念；清单腿给 database_list（main + attached） |
+| pg 想 forDatabase 跨库 | database=独立连接，物理不可行；listDatabases 只出清单，跨库=再登记别名 |
+| forSchema(畸形名) 拿到 [] 当成功 | 空数组=无对象或名畸形（不报错不泄漏）；先 listSchemas 确认 |
+| 句柄上没有 query/exec | 有意收窄：内视句柄只读。要跑 SQL 用原实例（受 db_access 管辖） |

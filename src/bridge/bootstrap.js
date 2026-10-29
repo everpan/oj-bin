@@ -68,6 +68,8 @@ import {
   op_db_tx_rollback,
   op_db_cancel,
   op_db_catalog,
+  op_db_list_schemas,
+  op_db_list_databases,
   op_mgmt_register,
   op_mgmt_delete,
   op_mgmt_list,
@@ -1049,16 +1051,38 @@ globalThis.DB = function (name) {
       // Dialect-agnostic catalog introspection (v0.1.82): names of all business-visible
       // tables in the current database, INCLUDING tables unknown to the schema registry
       // (api-only plans / legacy tables). Optional prefix filter (escaped, bound param).
-      listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
-      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table))),
-      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table))),
-      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table))),
+      listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix), null)),
+      // REQ-04 (v0.1.105): schema/database listing (REQ-04 section 5.1). Cross-dialect
+      // homogeneous {name, owner?, isDefault?, comment?}; system catalogs filtered by
+      // the platform (mysql: information_schema/mysql/performance_schema/sys; pg schema:
+      // pg_catalog/pg_toast%/information_schema; pg database: templates). Account-level
+      // visibility follows the DB account's own privilege model.
+      listSchemas: (prefix) => dbOpWrap(op_db_list_schemas(name, prefix === undefined || prefix === null ? null : String(prefix))),
+      listDatabases: (prefix) => dbOpWrap(op_db_list_databases(name, prefix === undefined || prefix === null ? null : String(prefix))),
+      // REQ-04 (v0.1.105) section 5.2 option B: restricted read-only introspection
+      // view pinned to one schema/database (mysql: schema==database; pg: namespace;
+      // sqlite: OJ_DB_UNSUPPORTED capability=for_schema). No query/exec/stream on
+      // the handle; pool-scoped only (no tx/session variant). Malformed scope names
+      // return empty results, never errors, never leak.
+      forSchema: (schema) => {
+        const s = String(schema);
+        return {
+          listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix), s)),
+          listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table), s)),
+          listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table), s)),
+          listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table), s)),
+          catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg), s)),
+        };
+      },
+      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table), null)),
+      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table), null)),
+      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table), null)),
       // U-14 batch a (v0.1.100): catalog introspection -- new-generation envelope
       // {kind, dialect, items}. kinds: views | routines | sequences | ddl | comment |
       // constraints | stats (per-dialect support matrix in db-guide section 10; unsupported
       // kinds reject with OJ_DB_UNSUPPORTED, never silent). ddl/comment/constraints
       // take a table name arg; views/routines/sequences/stats are whole-db.
-      catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg))),
+      catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg), null)),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
@@ -1164,10 +1188,10 @@ globalThis.DB = function (name) {
             // handle (DDL must never run inside db.tx -- MySQL implicit commit).
             dialect: () => { try { return op_db_dialect(name); } catch (e) { throw normDbErr(e); } },
             // Catalog introspection rides the active tx session (same connection).
-            listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix))),
-      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table))),
-      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table))),
-      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table))),
+            listTables: (prefix) => dbOpWrap(op_db_list_tables(name, prefix === undefined || prefix === null ? null : String(prefix), null)),
+      listColumns: (table) => dbOpWrap(op_db_list_columns(name, String(table), null)),
+      listIndexes: (table) => dbOpWrap(op_db_list_indexes(name, String(table), null)),
+      listForeignKeys: (table) => dbOpWrap(op_db_list_foreign_keys(name, String(table), null)),
             isTx: true,
             // SQL execution profile (v0.1.51, on by default in dev): same per-request profile as db.sqlProfile().
             sqlProfile: () => op_db_sql_profile(),

@@ -36,9 +36,14 @@ pub mod db_backend;
 pub mod db_error;
 pub mod db_exec;
 pub mod db_export;
+mod db_introspect;
 pub mod db_policy;
+mod db_query;
 pub mod db_quota;
+mod db_seq;
 pub mod db_session;
+mod db_stream;
+mod db_tx;
 pub mod dialect_caps;
 mod embedded_js;
 mod envelope;
@@ -517,29 +522,31 @@ deno_core::extension!(
         db::op_db_allowed,
         db::op_db_as_system,
         db::op_db_as_tenant,
-        db::op_db_query,
-        db::op_db_exec,
-        db::op_db_next_seq,
+        db_query::op_db_query,
+        db_query::op_db_exec,
+        db_seq::op_db_next_seq,
         db::op_db_sql_profile,
-        db::op_db_tx_begin,
-        db::op_db_tx_commit,
-        db::op_db_tx_rollback,
-        db::op_db_stream_open,
-        db::op_db_stream_next,
-        db::op_db_stream_info,
+        db_tx::op_db_tx_begin,
+        db_tx::op_db_tx_commit,
+        db_tx::op_db_tx_rollback,
+        db_stream::op_db_stream_open,
+        db_stream::op_db_stream_next,
+        db_stream::op_db_stream_info,
         db_export::op_db_export,
         db_export::op_db_export_status,
         db_export::op_db_export_cancel,
-        db::op_db_stream_close,
-        db::op_db_stream_abort,
+        db_stream::op_db_stream_close,
+        db_stream::op_db_stream_abort,
         query::op_db_query_build,
         query::op_db_query_sql,
         db::op_db_dialect,
-        db::op_db_list_tables,
-        db::op_db_list_columns,
-        db::op_db_list_indexes,
-        db::op_db_list_foreign_keys,
-        db::op_db_catalog,
+        db_introspect::op_db_list_tables,
+        db_introspect::op_db_list_schemas,
+        db_introspect::op_db_list_databases,
+        db_introspect::op_db_list_columns,
+        db_introspect::op_db_list_indexes,
+        db_introspect::op_db_list_foreign_keys,
+        db_introspect::op_db_catalog,
         client_db::op_db_client_register,
         client_db::op_db_client_test,
         client_db::op_db_client_delete,

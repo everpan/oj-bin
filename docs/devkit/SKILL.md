@@ -129,6 +129,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | REQ-05 语句超时 sqlite「不生效」（单条递归 CTE 跑完才返回） | sqlite 驱动同步步进**饿死 current_thread 定时器**——deadline 只在让步点触发；网络型后端（mysql/pg 插件轴）准点。sqlite 大查询用 `max_result_bytes`（边拉边计真早停）+ `max_rows` 挡（api-manual §13 架构边界行） |
 | 超时后 UI 宣称「已向数据库下发取消」 | 插件轴 `e.data.cancelled=false`——宿主只弃句柄，服务端语句可能仍在跑（真取消 = ABI 13 车）；只有 sqlite 内置是 `true`。UI 说「已超时」即可 |
 | `db.stream` 想拿「是否截断」只看行数 | 用 `it.info()`：`{rows, bytes, truncated}`——truncate 档的显式信令；fail 档（缺省）以中途错行 `OJ_DB_CAPACITY` 表达。`timeoutMs` 超配置拒 `OJ_DB_CAPACITY` 点名 `statement_timeout_ms`（只能收紧） |
+| `db.forSchema("x")` 在 sqlite 上报 `OJ_DB_UNSUPPORTED` | **预期**：sqlite 无 schema 概念，不静默给垃圾数据（capability=`for_schema`）。sqlite 的「库」清单用 `db.listDatabases()`（database_list：main + attached） |
+| pg 上 `forSchema` 想跨 **database** | pg 的 database = 独立连接，物理不可行——`listDatabases()` 只出**清单**（任意库连出 pg_database，不换连接）；跨 database 内视 = 再登记一个别名（一连接=一库）。mysql 无此问题：schema≡database，`forSchema` 即跨库 |
+| `forSchema("不存在")` 拿空数组当出错 | 空数组 = scope 下无对象或 scope 名畸形（>128 / 控制字符）——两者**都**返回空（不报错不泄漏），与 listColumns 的「不存在/无权限/别的 schema」同口径。先 `listSchemas()` 确认名字 |
+| mysql 上 `listSchemas()` 与 `listDatabases()` 结果一样 | **预期**：mysql schema≡database，两腿同一份 schemata（系统库已滤）。别当 bug 重报 |
+
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
 | `oj exec` 报 `module '…' missing manifest.yaml` 或 `service dir not found` | 裸 `oj exec` 在没有 config/mounts/`-d` 时会向上**猜** api 目录——在源码仓根会撞上仓库自己的 `src/`。exec **不需要** config.yaml：纯计算脚本直接 `-e` 跑；要后端就 `-c <项目config>` 或 `-d <api目录>` 显式给（v0.1.58 起探测只认「像业务树」的候选，非业务 `src/` 已跳过） |
