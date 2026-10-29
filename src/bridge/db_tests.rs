@@ -2483,3 +2483,59 @@ async fn explain_accepts_bind_params_real_pg_mysql() {
         eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
     }
 }
+
+/// G3（v0.1.108，env-gated 真库腿）：db.explain 在真实 PG / MySQL 上的端到端归一——
+/// 带参 explain 断言 operation/category/cost/children 形态；PG 文本计划与 MySQL
+/// FORMAT=JSON 两方言同构输出。未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（诚实登记）。
+#[tokio::test(flavor = "current_thread")]
+async fn explain_plan_real_pg_mysql() {
+    let pg = std::env::var("OJ_TEST_PG").ok().filter(|s| !s.is_empty());
+    let my = std::env::var("OJ_TEST_MYSQL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if pg.is_none() && my.is_none() {
+        eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
+        return;
+    }
+    for (url, tag) in [(pg, "pg"), (my, "mysql")] {
+        let Some(url) = url else { continue };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let js = r#"(async () => {
+                const ddl = await db.dialect();
+                if (ddl === "postgres") {
+                    await db.exec("drop table if exists oj_explain_t");
+                    await db.exec("create table oj_explain_t (id int primary key, val text)");
+                } else {
+                    await db.exec("drop table if exists oj_explain_t");
+                    await db.exec("create table oj_explain_t (id int primary key, val varchar(64))");
+                }
+                await db.exec("insert into oj_explain_t (id, val) values (1, 'a')");
+                const p = (await db.explain("select * from oj_explain_t where id = ?", [1])).plan;
+                json.ok({ op: p.operation, cat: p.category, total: p.cost && p.cost.total,
+                          rows: p.rowsEstimate, kids: Array.isArray(p.children) });
+              })().catch(e => json.fail(500, String(e)))"#;
+        let cap = b
+            .run_with(js, crate::bridge::RequestInfo::default())
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{tag}: explain 端到端失败: {v}");
+        let d = &v["data"];
+        assert!(d["op"].as_str().unwrap_or("").len() > 1, "{tag}: operation 空: {v}");
+        assert!(
+            ["scan", "join", "aggregate", "sort", "other"].contains(&d["cat"].as_str().unwrap_or("")),
+            "{tag}: category 非法: {v}"
+        );
+        assert!(d["total"].is_number() || d["total"].is_null(), "{tag}: cost.total 形态: {v}");
+        assert_eq!(d["kids"], json!(true), "{tag}: children 必须为数组: {v}");
+        let _ = b;
+    }
+}
