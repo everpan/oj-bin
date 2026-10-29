@@ -647,7 +647,8 @@ declare global {
     nullable?: boolean;
     default?: string | null;
     primaryKey?: boolean;
-    // pg identity 列标记（"always"/"byDefault"）：跳过 default 文本比对（nextval 派生）。
+    // pg identity 列标记（"always"/"byDefault"）：跳过 default 文本比对（nextval 派生）；
+    // pg 专属——mysql 结构里出现 → 参数错误。翻转（加/去 identity）出 changed（field="identity"）+ ADD/DROP IDENTITY。
     identity?: string;
     comment?: string | null;
   }
@@ -679,8 +680,9 @@ declare global {
     indexes?: DdlIndexSpec[];
     foreignKeys?: DdlForeignKeySpec[];
   }
-  // statements 有序可重放：DROP（FK→约束→索引→列）→ 列变更 → ADD → 约束/索引 → FK 最后。
-  // 执行仍走 db.exec + allow_ddl；ddlDiff 本身零 DB I/O。
+  // statements 有序可重放：DROP（FK→约束→索引→列）→ 列变更 → ADD → 约束/索引 → FK 最后；
+  // 同名 changed 约束/索引/FK 先 DROP 再 ADD（重放不撞已存在对象）。
+  // 执行仍走 db.exec + allow_ddl；ddlDiff 本身零 DB I/O。建表路径（from=null）diff 同此形状（全 added）。
   interface DdlDiffResult {
     diff: {
       columns: { added: string[]; removed: string[]; changed: Record<string, unknown>[] };

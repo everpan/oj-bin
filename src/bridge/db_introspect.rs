@@ -204,6 +204,12 @@ pub(crate) async fn pg_stitch(
             .and_then(|r| r.get("comment"))
             .and_then(|v| v.as_str())
             .map(String::from);
+        let partkeydef = q(insp::PG_STITCH_PARTKEY)
+            .await?
+            .first()
+            .and_then(|r| r.get("def"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let ddl = insp::pg_create_table(
             &table,
             &cols,
@@ -211,6 +217,7 @@ pub(crate) async fn pg_stitch(
             &idxs,
             &comments,
             table_comment.as_deref(),
+            partkeydef.as_deref(),
         );
         Ok(vec![serde_json::json!({"name": table, "ddl": ddl})])
     };

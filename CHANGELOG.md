@@ -42,6 +42,17 @@
   verbatim 片段（nativeType/default/definition）拒含 `;`。
 - sqlite / 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`（capability=`ddl_diff`），不回落。
 
+**fix（db，终审一轮）**：`db.ddlDiff` 数据安全与重放口径加固——
+
+- 列维度任一端缺省 = 不参与 diff（此前缺省端被当空表 → 全量 ADD/DROP COLUMN，毁表面）。
+- 同名 changed 约束 / 索引 / 外键：先 DROP 再 ADD（此前只 ADD，重放撞已存在对象必炸）；
+  MySQL 约束 DROP 按类型分派（pk → DROP PRIMARY KEY；uq → DROP INDEX；ck → DROP CHECK）。
+- identity 翻转出 changed（field=`identity`）+ PG `ADD/DROP IDENTITY` 语句；identity 为
+  PG 专属，MySQL 结构里出现 → 参数错误（不产非法 SQL）。
+- 列名 / 索引组成列名 NUL/控制字符 → 参数错误（parse 期校验，不许落成裸标识符）。
+- 建表路径（from = null）diff 形状与 alter 路径一致（四维 added/removed/changed）。
+- PG 分区表（relkind 'p'）ddl 附 `PARTITION BY`（pg_get_partkeydef 尽力而为，子分区不产出）。
+
 ## v0.1.108
 
 **feat（db）**：`db.explain(sql, params?, opts?)`——G3 跨方言执行计划归一（dbx PR-1 解锁）：

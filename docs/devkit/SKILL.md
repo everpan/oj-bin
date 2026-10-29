@@ -139,6 +139,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.ddlDiff` 里塞带 `;` 的 default/类型/约束定义（v0.1.109） | 预期被拒——verbatim 片段（nativeType/default/definition）拒含 `;`（防语句拆分注入）；标识符只做方言引号+翻倍（合法名可含非 ASCII/空格），NUL/控制字符也拒 |
 | 拿 `db.ddlDiff` 给 serial 表加列后期望它建序列（v0.1.109） | ddlDiff **不生成序列对象**——serial 的 `CREATE SEQUENCE` 不在 ALTER 流里；identity 列自管序列（渲染 `GENERATED ... AS IDENTITY`），且 identity 列跳过 default 文本比对（nextval 是派生物） |
 | pg 的 diff 视图里看不到列位置变化 / mysql 出 `AFTER`（v0.1.109） | 预期——pg 无列位置 DDL（位置差忽略，changed 无 position 项）；mysql 位置差产 `AFTER`/`FIRST` |
+| 给 `db.ddlDiff` 的列加 `identity` 在 mysql 上报参数错误（v0.1.109） | 预期——identity 是 **pg-only** 能力（`GENERATED ... AS IDENTITY` 非 MySQL 语法）；mysql 的自增是 `AUTO_INCREMENT`（须配 key），不在 ddlDiff 抽象里。pg 上翻转 identity 出 changed + `ADD/DROP IDENTITY` 语句 |
 
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |

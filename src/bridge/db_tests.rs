@@ -2954,3 +2954,58 @@ async fn ddl_diff_mysql_real() {
     assert!(stmts.contains("ADD COLUMN `age` int"), "{stmts}");
     assert!(stmts.contains("AFTER `name`"), "{stmts}");
 }
+
+/// U-14（v0.1.109）PG 分区表 ddl：拼接器附 PARTITION BY（best-effort，子分区不产出）。
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_ddl_pg_partitioned_real() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    let db_cleanup = db.clone();
+    db.exec_with_params("drop table if exists oj_ddl_part", &[])
+        .await
+        .unwrap();
+    db.exec_with_params(
+        "create table oj_ddl_part (id int not null, created_at date not null) \
+         partition by range (created_at)",
+        &[],
+    )
+    .await
+    .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const r = await db.catalog("ddl", "oj_ddl_part");
+                 json.ok({ ddl: r.items[0].ddl });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let ddl = v["data"]["ddl"].as_str().unwrap_or("");
+    assert!(
+        ddl.contains("PARTITION BY"),
+        "分区表 ddl 须含 PARTITION BY: {ddl}"
+    );
+    assert!(ddl.contains("(created_at)"), "分区键须保留: {ddl}");
+    db_cleanup
+        .exec_with_params("drop table if exists oj_ddl_part", &[])
+        .await
+        .unwrap();
+}

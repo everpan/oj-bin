@@ -325,6 +325,11 @@ pub const PG_STITCH_COLUMN_COMMENTS: &str = "SELECT a.attname::text AS name, col
            AND col_description(a.attrelid, a.attnum) IS NOT NULL \
      ORDER BY a.attnum";
 
+/// 分区键（relkind 'p'；非分区表 pg_get_partkeydef 返 NULL → None，渲染跳过）。
+pub const PG_STITCH_PARTKEY: &str = "SELECT pg_get_partkeydef(c.oid)::text AS def \
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = current_schema() AND c.relname = ?";
+
 /// 表注释：**双参数形态** obj_description(oid, 'pg_class')（单参数已废弃）。
 pub const PG_STITCH_TABLE_COMMENT: &str = "SELECT obj_description(c.oid, 'pg_class')::text AS comment \
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -425,6 +430,7 @@ pub fn pg_create_table(
     idxs: &[Value],
     comments: &[Value],
     table_comment: Option<&str>,
+    partkeydef: Option<&str>,
 ) -> String {
     let t = pg_quote_ident(name);
     let mut stmts: Vec<String> = Vec::new();
@@ -466,10 +472,12 @@ pub fn pg_create_table(
             s
         })
         .collect();
-    stmts.push(format!(
-        "CREATE TABLE {t} (\n  {}\n)",
-        col_sql.join(",\n  ")
-    ));
+    let mut create = format!("CREATE TABLE {t} (\n  {}\n)", col_sql.join(",\n  "));
+    // 分区表（relkind 'p'）：pg_get_partkeydef 尽力而为——子分区不在此产出。
+    if let Some(def) = partkeydef {
+        create.push_str(&format!(" PARTITION BY {def}"));
+    }
+    stmts.push(create);
     // 约束 / 索引 / 注释。
     for con in cons {
         stmts.push(format!(
@@ -1268,6 +1276,7 @@ mod tests {
                      "definition": "CREATE INDEX ix_email ON public.oj_ddl_t USING btree (email)"})],
             &[json!({"column": "email", "comment": "登录邮箱"})],
             Some("业务表"),
+            None,
         );
         assert!(
             ddl.contains("CREATE SEQUENCE IF NOT EXISTS \"oj_ddl_t_id_seq\""),
@@ -1302,6 +1311,37 @@ mod tests {
         assert!(i_seq < i_tbl && i_tbl < i_own, "顺序钉死: {ddl}");
     }
 
+    /// 分区表：partkeydef 非空 → CREATE TABLE 附 PARTITION BY（best-effort，子分区不产出）。
+    #[test]
+    fn pg_stitch_partitioned_appends_partition_by() {
+        let ddl = pg_create_table(
+            "m",
+            &[
+                json!({"name": "id", "nativeType": "integer", "nullable": false,
+                     "default": null, "primaryKey": true}),
+            ],
+            &[],
+            &[],
+            &[],
+            None,
+            Some("RANGE (created_at)"),
+        );
+        assert!(ddl.contains(") PARTITION BY RANGE (created_at)"), "{ddl}");
+        let plain = pg_create_table(
+            "m",
+            &[
+                json!({"name": "id", "nativeType": "integer", "nullable": false,
+                     "default": null, "primaryKey": true}),
+            ],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+        );
+        assert!(!plain.contains("PARTITION BY"), "{plain}");
+    }
+
     /// generated 列渲染 GENERATED ALWAYS AS (expr) STORED 且无 DEFAULT；
     /// identity 列渲染 GENERATED ALWAYS AS IDENTITY 且不产序列语句。
     #[test]
@@ -1318,6 +1358,7 @@ mod tests {
             &[],
             &[],
             &[],
+            None,
             None,
         );
         assert!(

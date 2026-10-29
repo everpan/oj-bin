@@ -87,6 +87,7 @@ fn parse_columns(dim: &str, v: Option<&Value>) -> Result<Option<Vec<ColSpec>>, S
             .and_then(Value::as_str)
             .ok_or_else(|| format!("ddlDiff: {dim}.columns[] missing name"))?
             .to_string();
+        quote_ident(Dialect::Postgres, &name)?;
         let nt = c
             .get("nativeType")
             .and_then(Value::as_str)
@@ -141,6 +142,16 @@ fn parse_named_defs(
         if let Some(def) = e.get("definition").and_then(Value::as_str) {
             check_fragment(def)?;
         }
+        for k in ["columns", "refColumns"] {
+            if let Some(members) = e.get(k).and_then(Value::as_array) {
+                for m in members {
+                    let s = m
+                        .as_str()
+                        .ok_or_else(|| format!("ddlDiff: {dim}[] {k} must be strings"))?;
+                    quote_ident(Dialect::Postgres, s)?;
+                }
+            }
+        }
     }
     Ok(Some(arr.clone()))
 }
@@ -163,6 +174,19 @@ fn col_diff_entries(from: &[ColSpec], to: &[ColSpec]) -> Vec<Value> {
         }
         if fc.nullable != tc.nullable {
             push("nullable", json!(fc.nullable), json!(tc.nullable));
+        }
+        if fc.identity != tc.identity {
+            push(
+                "identity",
+                fc.identity
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+                tc.identity
+                    .clone()
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
         }
         // identity 列跳 default 文本比对（nextval 派生，恒假 changed）。
         let identity_col = fc.identity.is_some() || tc.identity.is_some();
@@ -269,9 +293,16 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     )?;
     let to_fks = parse_named_defs("to.foreignKeys", to.get("foreignKeys"), None)?;
 
-    let empty_cols: Vec<ColSpec> = Vec::new();
-    let f_cols = from_cols.as_ref().unwrap_or(&empty_cols);
-    let t_cols = to_cols.as_ref().unwrap_or(&empty_cols);
+    // identity 是 PG 专属能力：MySQL 结构里出现 → 参数错误（GENERATED AS IDENTITY 非 MySQL 语法）。
+    if d == Dialect::MySql {
+        for c in from_cols.iter().flatten().chain(to_cols.iter().flatten()) {
+            if c.identity.is_some() {
+                return Err(
+                    "ddlDiff: identity columns are postgres-only; not supported on mysql".into(),
+                );
+            }
+        }
+    }
 
     let mut diff = serde_json::Map::new();
     let mut stmts: Vec<String> = Vec::new();
@@ -348,10 +379,24 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                 stmts.push(fk_add_sql(d, &t, f)?);
             }
         }
+        // diff 形状与 alter 路径一致：四维 added/removed/changed（建表 = 全 added）。
+        let dim = |added: Vec<Value>| json!({"added": added, "removed": [], "changed": []});
+        let names = |v: &Option<Vec<Value>>| -> Vec<Value> {
+            v.as_ref()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| str_field(e, "name").map(Value::String))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         diff.insert(
-            "addedColumns".into(),
-            json!(t_cols.iter().map(|c| json!(c.name)).collect::<Vec<_>>()),
+            "columns".into(),
+            dim(t_cols.iter().map(|c| json!(c.name)).collect()),
         );
+        diff.insert("constraints".into(), dim(names(&to_cons)));
+        diff.insert("indexes".into(), dim(names(&to_idxs)));
+        diff.insert("foreignKeys".into(), dim(names(&to_fks)));
         return Ok(json!({ "diff": Value::Object(diff), "statements": stmts }));
     }
 
@@ -364,21 +409,22 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
 
     // ---------------- 维度缺省 = 不参与 diff；空数组 = DROP 全量 ----------------
     // 列。
-    let added_c: Vec<Value> = match &to_cols {
-        Some(tc) => tc
+    // 列维度任一端缺省 = 不参与（与具名维度同语义——否则缺省端会被当空表全量 ADD/DROP）。
+    let added_c: Vec<Value> = match (&from_cols, &to_cols) {
+        (Some(f), Some(t)) => t
             .iter()
-            .filter(|c| !f_cols.iter().any(|f| f.name == c.name))
+            .filter(|c| !f.iter().any(|x| x.name == c.name))
             .map(|c| json!(c.name))
             .collect(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
-    let removed_c: Vec<Value> = match &from_cols {
-        Some(fc) => fc
+    let removed_c: Vec<Value> = match (&from_cols, &to_cols) {
+        (Some(f), Some(t)) => f
             .iter()
-            .filter(|c| !t_cols.iter().any(|t| t.name == c.name))
+            .filter(|c| !t.iter().any(|x| x.name == c.name))
             .map(|c| json!(c.name))
             .collect(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     let changed_c = match (&from_cols, &to_cols) {
         (Some(f), Some(t)) => col_diff_entries(f, t),
@@ -435,14 +481,27 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     );
 
     // ---------------- statements：DROP（FK → 约束 → 索引 → 列）→ 列变更 → ADD ----------------
+    let changed_names =
+        |diff: &(Vec<Value>, Vec<Value>, Vec<Value>)| -> std::collections::HashSet<String> {
+            diff.2
+                .iter()
+                .filter_map(|e| e["name"].as_str().map(String::from))
+                .collect()
+        };
+    let cons_changed = changed_names(&cons_diff);
+    let idx_changed = changed_names(&idx_diff);
+    let fk_changed = changed_names(&fk_diff);
     if let Some(fks) = &from_fks {
-        // 维度缺省 = 不参与；to 显式数组（可空）→ 名字集合差出 DROP。
+        // 维度缺省 = 不参与；to 显式数组（可空）→ 名字集合差出 DROP；
+        // 同名 changed（定义差）同样须先 DROP，否则重放撞已存在对象。
         let dropped: Vec<&Value> = match &to_fks {
             Some(tv) => fks
                 .iter()
                 .filter(|f| {
+                    let n = str_field(f, "name").unwrap_or_default();
                     !tv.iter()
-                        .any(|t| str_field(t, "name") == str_field(f, "name"))
+                        .any(|t| str_field(t, "name").as_deref() == Some(n.as_str()))
+                        || fk_changed.contains(&n)
                 })
                 .collect(),
             None => Vec::new(),
@@ -461,8 +520,10 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             Some(tc) => cons
                 .iter()
                 .filter(|c| {
+                    let n = str_field(c, "name").unwrap_or_default();
                     !tc.iter()
-                        .any(|t| str_field(t, "name") == str_field(c, "name"))
+                        .any(|t| str_field(t, "name").as_deref() == Some(n.as_str()))
+                        || cons_changed.contains(&n)
                 })
                 .collect(),
             None => Vec::new(),
@@ -470,7 +531,13 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         for c in dropped {
             let n = quote_ident(d, str_field(c, "name").as_deref().unwrap_or(""))?;
             stmts.push(match d {
-                Dialect::MySql => format!("ALTER TABLE {t} DROP CHECK {n}"),
+                // MySQL 无统一 DROP CONSTRAINT：pk → DROP PRIMARY KEY（无名）、
+                // uq → DROP INDEX（支撑索引）、ck → DROP CHECK。
+                Dialect::MySql => match str_field(c, "type").as_deref() {
+                    Some("pk") => format!("ALTER TABLE {t} DROP PRIMARY KEY"),
+                    Some("uq") => format!("ALTER TABLE {t} DROP INDEX {n}"),
+                    _ => format!("ALTER TABLE {t} DROP CHECK {n}"),
+                },
                 _ => format!("ALTER TABLE {t} DROP CONSTRAINT {n}"),
             });
         }
@@ -481,8 +548,10 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             Some(ti) => idxs
                 .iter()
                 .filter(|i| {
+                    let n = str_field(i, "name").unwrap_or_default();
                     !ti.iter()
-                        .any(|t| str_field(t, "name") == str_field(i, "name"))
+                        .any(|t| str_field(t, "name").as_deref() == Some(n.as_str()))
+                        || idx_changed.contains(&n)
                 })
                 .collect(),
             None => Vec::new(),
@@ -554,6 +623,17 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                             stmts.push(format!("ALTER TABLE {t} ALTER COLUMN {cn} DROP DEFAULT"))
                         }
                     },
+                    "identity" => match e["to"].as_str() {
+                        Some("always") => stmts.push(format!(
+                            "ALTER TABLE {t} ALTER COLUMN {cn} ADD GENERATED ALWAYS AS IDENTITY"
+                        )),
+                        Some(_) => stmts.push(format!(
+                            "ALTER TABLE {t} ALTER COLUMN {cn} ADD GENERATED BY DEFAULT AS IDENTITY"
+                        )),
+                        None => {
+                            stmts.push(format!("ALTER TABLE {t} ALTER COLUMN {cn} DROP IDENTITY"))
+                        }
+                    },
                     "comment" => match e["to"].as_str() {
                         Some(cm) => stmts.push(format!(
                             "COMMENT ON COLUMN {t}.{cn} IS {}",
@@ -567,10 +647,10 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         }
     }
 
-    // ADD 列。
-    if let Some(tc) = &to_cols {
+    // ADD 列（列维度任一端缺省 = 不参与，同 DROP）。
+    if let (Some(f), Some(tc)) = (&from_cols, &to_cols) {
         for c in tc {
-            if !f_cols.iter().any(|f| f.name == c.name) {
+            if !f.iter().any(|x| x.name == c.name) {
                 let after = {
                     let pos = tc.iter().position(|x| x.name == c.name).unwrap_or(0);
                     if pos == 0 {
@@ -587,7 +667,7 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         }
     }
 
-    // 约束 ADD（changed 约束 = drop 已在上 + add 在此）。
+    // 约束 ADD（含 changed：同名定义差 → DROP 已在上一步，此处重新 ADD）。
     if let Some(cons) = &to_cons {
         for c in cons {
             let is_new = from_cons
@@ -943,18 +1023,249 @@ mod tests {
         assert!(check_fragment("a\nb").is_err());
     }
 
-    /// identity 列跳 default 文本比对（nextval 派生，否则恒假 changed）。
+    /// identity 恒等时跳 default 文本比对（nextval 派生，否则恒假 changed）。
     #[test]
     fn identity_column_skips_default_compare() {
         let spec = json!({
             "objectType": "table", "name": "t",
             "from": {"columns": [{"name": "id", "nativeType": "integer", "nullable": false,
+                                  "identity": "always",
                                   "default": "nextval('t_id_seq'::regclass)", "primaryKey": true}]},
             "to": {"columns": [{"name": "id", "nativeType": "integer", "nullable": false,
                                 "primaryKey": true, "identity": "always"}]},
         });
-        let (pg, _) = both(spec);
+        let pg = ddl_diff(Dialect::Postgres, &spec).unwrap();
         assert_eq!(pg["diff"]["columns"]["changed"], json!([]), "{pg:?}");
+    }
+
+    /// identity 翻转（加/去）→ changed 出 identity 项，PG 产 ADD/DROP IDENTITY 语句
+    ///（spec 列 identity 为 changedColumns 字段之一；静默缺失 = 假 diff，禁止）。
+    #[test]
+    fn identity_flip_emits_changed_and_pg_statement() {
+        let plain = json!({"columns": [{"name": "id", "nativeType": "integer",
+                                        "nullable": false, "primaryKey": true}]});
+        let ident = json!({"columns": [{"name": "id", "nativeType": "integer",
+                                        "nullable": false, "primaryKey": true,
+                                        "identity": "always"}]});
+        let up = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType": "table", "name": "t", "from": plain.clone(), "to": ident.clone()}),
+        )
+        .unwrap();
+        let ch = up["diff"]["columns"]["changed"].as_array().unwrap();
+        assert!(
+            ch.iter()
+                .any(|e| e["field"] == json!("identity") && e["to"] == json!("always")),
+            "{ch:?}"
+        );
+        let text: String = up["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            text.contains("ALTER COLUMN \"id\" ADD GENERATED ALWAYS AS IDENTITY"),
+            "{text}"
+        );
+        let down = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType": "table", "name": "t", "from": ident, "to": plain}),
+        )
+        .unwrap();
+        let text2: String = down["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            text2.contains("ALTER COLUMN \"id\" DROP IDENTITY"),
+            "{text2}"
+        );
+    }
+
+    /// identity 是 PG 专属能力：MySQL 结构里出现 identity → 参数错误（不产非法 SQL）。
+    #[test]
+    fn mysql_rejects_identity_columns() {
+        let spec = json!({
+            "objectType": "table", "name": "t", "from": null,
+            "to": {"columns": [{"name": "id", "nativeType": "int", "nullable": false,
+                                "primaryKey": true, "identity": "always"}]},
+        });
+        let r = ddl_diff(Dialect::MySql, &spec);
+        assert!(r.is_err(), "mysql 须拒 identity: {r:?}");
+        assert!(r.unwrap_err().contains("identity"), "错误须点名 identity");
+    }
+
+    /// 列维度一端缺省 = 不参与 diff：绝不许全表 ADD/DROP COLUMN（数据安全）。
+    #[test]
+    fn absent_columns_dimension_means_no_column_add_drop() {
+        let from = json!({
+            "columns": [{"name": "a", "nativeType": "int", "nullable": true}],
+            "indexes": [{"name": "ix_a", "unique": false, "primary": false,
+                         "origin": "c", "columns": ["a"]}],
+        });
+        // to 缺省 columns → 列维度不参与：只有 DROP INDEX，零列语句。
+        let spec = json!({"objectType": "table", "name": "t", "from": from.clone(),
+                          "to": {"indexes": []}});
+        let pg = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        let ss: Vec<&str> = pg["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(ss.len(), 1, "{ss:?}");
+        assert!(ss[0].contains("DROP INDEX \"ix_a\""), "{ss:?}");
+        assert_eq!(pg["diff"]["columns"]["added"], json!([]), "{pg:?}");
+        assert_eq!(pg["diff"]["columns"]["removed"], json!([]), "{pg:?}");
+        // from 缺省 columns（to 有列）→ 同样不参与：零列语句。
+        let spec2 = json!({"objectType": "table", "name": "t",
+                           "from": {"indexes": []},
+                           "to": {"columns": [{"name": "b", "nativeType": "int", "nullable": true}],
+                                  "indexes": []}});
+        let pg2 = ddl_diff(Dialect::Postgres, &spec2).unwrap();
+        let text2: String = pg2["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!text2.contains("COLUMN"), "{text2}");
+    }
+
+    /// 同名 changed 约束/索引/外键：先 DROP 再 ADD（否则重放撞已存在对象必炸）。
+    #[test]
+    fn changed_named_dims_drop_before_add() {
+        let from = json!({
+            "columns": [{"name": "id", "nativeType": "int", "nullable": false}],
+            "constraints": [{"name": "ck_v", "type": "ck", "definition": "CHECK (id > 0)",
+                             "columns": []}],
+            "indexes": [{"name": "ix_id", "unique": false, "primary": false,
+                         "origin": "c", "columns": ["id"]}],
+            "foreignKeys": [{"name": "fk_p", "columns": ["id"], "refTable": "p",
+                             "refColumns": ["id"]}],
+        });
+        let to = json!({
+            "columns": [{"name": "id", "nativeType": "int", "nullable": false}],
+            "constraints": [{"name": "ck_v", "type": "ck", "definition": "CHECK (id > 10)",
+                             "columns": []}],
+            "indexes": [{"name": "ix_id", "unique": true, "primary": false,
+                         "origin": "c", "columns": ["id"]}],
+            "foreignKeys": [{"name": "fk_p", "columns": ["id"], "refTable": "q",
+                             "refColumns": ["id"]}],
+        });
+        let pg = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType": "table", "name": "t", "from": from, "to": to}),
+        )
+        .unwrap();
+        let ss: Vec<&str> = pg["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let pos = |needle: &str| {
+            ss.iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or(usize::MAX)
+        };
+        assert!(
+            pos("DROP CONSTRAINT \"ck_v\"") < pos("ADD CONSTRAINT \"ck_v\" CHECK (id > 10)"),
+            "{ss:?}"
+        );
+        assert!(
+            pos("DROP INDEX \"ix_id\"") < pos("CREATE UNIQUE INDEX \"ix_id\""),
+            "{ss:?}"
+        );
+        assert!(
+            pos("DROP CONSTRAINT \"fk_p\"") < pos("ADD CONSTRAINT \"fk_p\" FOREIGN KEY"),
+            "{ss:?}"
+        );
+    }
+
+    /// MySQL 约束 DROP 按类型分派：pk → DROP PRIMARY KEY；uq → DROP INDEX；ck → DROP CHECK。
+    #[test]
+    fn mysql_constraint_drop_uses_type_specific_syntax() {
+        let from = json!({
+            "columns": [{"name": "id", "nativeType": "int", "nullable": false}],
+            "constraints": [
+                {"name": "pk_t", "type": "pk", "definition": "PRIMARY KEY (id)",
+                 "columns": ["id"]},
+                {"name": "uq_a", "type": "uq", "definition": "UNIQUE (id)", "columns": ["id"]},
+                {"name": "ck_a", "type": "ck", "definition": "CHECK (id > 0)", "columns": []},
+            ],
+        });
+        let spec = json!({"objectType": "table", "name": "t", "from": from.clone(),
+                          "to": {"columns": from["columns"].clone(), "constraints": []}});
+        let my = ddl_diff(Dialect::MySql, &spec).unwrap();
+        let text: String = my["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(text.contains("ALTER TABLE `t` DROP PRIMARY KEY"), "{text}");
+        assert!(text.contains("DROP INDEX `uq_a`"), "{text}");
+        assert!(text.contains("DROP CHECK `ck_a`"), "{text}");
+        assert!(!text.contains("DROP CHECK `pk_t`"), "{text}");
+        assert!(!text.contains("DROP CHECK `uq_a`"), "{text}");
+        // PG 仍统一 DROP CONSTRAINT。
+        let pg = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        let ptext: String = pg["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(ptext.contains("DROP CONSTRAINT \"pk_t\""), "{ptext}");
+        assert!(ptext.contains("DROP CONSTRAINT \"uq_a\""), "{ptext}");
+    }
+
+    /// 列名 / 索引组成列名含 NUL → 参数错误（不许静默落成裸标识符）。
+    #[test]
+    fn nul_in_column_and_member_names_rejected() {
+        let bad_col_alter = json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int", "nullable": true}]},
+            "to": {"columns": [{"name": "a\u{0}b", "nativeType": "int", "nullable": true}]},
+        });
+        let r = ddl_diff(Dialect::Postgres, &bad_col_alter);
+        let msg = r.unwrap_err();
+        assert!(msg.contains("ddlDiff"), "{msg}");
+        let bad_col_create = json!({
+            "objectType": "table", "name": "t", "from": null,
+            "to": {"columns": [{"name": "a\u{0}b", "nativeType": "int", "nullable": true}]},
+        });
+        let r2 = ddl_diff(Dialect::Postgres, &bad_col_create);
+        assert!(r2.is_err(), "{r2:?}");
+        let bad_member = json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int", "nullable": true}]},
+            "to": {"columns": [{"name": "a", "nativeType": "int", "nullable": true}],
+                   "indexes": [{"name": "ix_a", "columns": ["a\u{0}b"]}]},
+        });
+        let r3 = ddl_diff(Dialect::Postgres, &bad_member);
+        assert!(r3.is_err(), "{r3:?}");
+    }
+
+    /// 建表路径（from = null）diff 形状与 alter 路径一致：四维 added/removed/changed。
+    #[test]
+    fn create_path_diff_shape_matches_alter_path() {
+        let spec = json!({
+            "objectType": "table", "name": "t", "from": null,
+            "to": {"columns": [{"name": "id", "nativeType": "int", "nullable": false,
+                                "primaryKey": true}]},
+        });
+        let pg = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        for dim in ["columns", "constraints", "indexes", "foreignKeys"] {
+            for side in ["added", "removed", "changed"] {
+                assert!(pg["diff"][dim][side].is_array(), "{dim}.{side}: {pg:?}");
+            }
+        }
+        assert_eq!(pg["diff"]["columns"]["added"], json!(["id"]), "{pg:?}");
     }
 
     /// 语句排序：DROP（FK → 约束 → 索引 → 列）→ 列变更 → ADD → 约束/索引 → FK 最后。
