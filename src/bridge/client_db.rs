@@ -1017,6 +1017,48 @@ mod tests {
         assert_eq!(v["data"]["tv"], v["data"]["v"], "test 与 list 同源：{v}");
     }
 
+    /// U-18 批 T2.5（REQ-06）：`db.client.*` / `db.access.*` 异步方法返回**真 Promise**
+    /// （`instanceof Promise`、`.catch` 可链）——类型面声明 `Promise<...>`，运行期曾回裸值。
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_and_access_surfaces_return_real_promises() {
+        use crate::bridge::{Bridge, Extras, InMemoryKV, SchemaRegistry};
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([(
+                "default".to_string(),
+                Arc::new(InMemoryAccessor::new()) as _,
+            )]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras::default(),
+        );
+        // client 未启用：方法应返回「被拒绝的真 Promise」，而非同步抛或裸值。
+        let cap = b
+            .run(
+                r#"(async () => {
+                     const p = db.client.list();
+                     const g = db.access.grant("x", { roles: ["r"] });
+                     const caught = await p.catch(() => "rejected");
+                     const gCaught = await g.catch(() => "rejected");
+                     const entries = await db.client.list().catch(() => []);
+                     return json.ok({ isP: p instanceof Promise,
+                                      hasCatch: typeof p.catch === "function",
+                                      caught, gIsP: g instanceof Promise, gCaught,
+                                      n: entries.length });
+                   })()"#,
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["isP"], true, "{v}");
+        assert_eq!(v["data"]["hasCatch"], true, "{v}");
+        assert_eq!(v["data"]["caught"], "rejected", "{v}");
+        assert_eq!(v["data"]["gIsP"], true, "{v}");
+        assert_eq!(v["data"]["gCaught"], "rejected", "{v}");
+        assert_eq!(v["data"]["n"], 0, "{v}");
+    }
+
     // 无关 `AllowList` 默认形态（确保引用不被误删）。
     #[test]
     fn allow_list_default_unrestricted() {

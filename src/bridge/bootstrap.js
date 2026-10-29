@@ -1187,17 +1187,20 @@ globalThis.db = globalThis.DB("default");
 // Guarded: `db` is undefined when no default db is configured (some test/probe
 // contexts); the client ops are still reachable via the registered op names directly.
 if (globalThis.db) {
-  globalThis.db.client = {
-  register: (name, dsn) => dbOpWrap(op_db_client_register(String(name), String(dsn))),
-  test: (dsn) => dbOpWrap(op_db_client_test(String(dsn))),
-  delete: async (name) => {
-    const ok = await dbOpWrap(op_db_client_delete(String(name)));
+  // U-18 T2.5 (REQ-06): these surfaces are typed `Promise<...>` in global.d.ts, so every
+// async method must return a REAL Promise (instanceof Promise, .catch/.finally chainable) --
+// sync op values are wrapped via dbSessionCall, keeping normDbErr rejection semantics.
+globalThis.db.client = {
+  register: dbSessionCall((name, dsn) => op_db_client_register(String(name), String(dsn))),
+  test: dbSessionCall((dsn) => op_db_client_test(String(dsn))),
+  delete: dbSessionCall(async (name) => {
+    const ok = await op_db_client_delete(String(name));
     dbCache.delete(String(name));
     dbEpoch.delete(String(name));
     return ok;
-  },
-  reRegister: (name, dsn) => dbOpWrap(op_db_client_re_register(String(name), String(dsn))),
-  list: () => dbOpWrap(op_db_client_list()),
+  }),
+  reRegister: dbSessionCall((name, dsn) => op_db_client_re_register(String(name), String(dsn))),
+  list: dbSessionCall(() => op_db_client_list()),
   has: (name) => op_db_client_has(String(name)),
   };
   // U-1 v0.1.93 runtime dynamic authorization (access-control domain; same privilege
@@ -1207,9 +1210,10 @@ if (globalThis.db) {
   // falls back to config (not deleted). allow must restrict at least one dimension;
   // an empty allow (grant-to-everyone) is rejected by the host.
   globalThis.db.access = {
-    grant: (name, allow, opts) =>
-      dbOpWrap(op_db_access_grant(String(name), allow, opts === undefined ? null : opts)),
-    revoke: (name) => dbOpWrap(op_db_access_revoke(String(name))),
+    grant: dbSessionCall(
+      (name, allow, opts) => op_db_access_grant(String(name), allow, opts === undefined ? null : opts),
+    ),
+    revoke: dbSessionCall((name) => op_db_access_revoke(String(name))),
   };
   // U-3 v0.1.93: host-authoritative generation counter for a db alias. Lets a handler
   // detect that a client db was deleted/reRegistered across isolates (compare against a
