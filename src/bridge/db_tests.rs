@@ -2615,3 +2615,60 @@ async fn catalog_ddl_mysql_show_create_real() {
     );
     assert_eq!(d["scoped"]["capability"], "for_schema", "{d}");
 }
+
+/// U-14（v0.1.109，env-gated 真库腿）：PG `db.catalog("ddl")` 的 relkind 路由——
+/// 视图走既有 pg_get_viewdef（行为钉死不动）；不存在的表 → items 空数组（不报错）；
+/// 序列（relkind 'S'）→ 空数组（绝不落拼接器，假 DDL 比空结果更糟）。
+/// 仅 OJ_TEST_PG 有 DSN 才跑；未设则 skip。Table 路由的拼接器由 Task 3 钉死。
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_ddl_pg_route_real() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    let _ = db
+        .exec_with_params("drop view if exists oj_ddl_v", &[])
+        .await
+        .unwrap();
+    db.exec_with_params("create view oj_ddl_v as select 1 as v", &[])
+        .await
+        .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const view = await db.catalog("ddl", "oj_ddl_v");
+                 const missing = await db.catalog("ddl", "oj_ddl_no_such");
+                 const seq = await db.catalog("ddl", "oj_ddl_no_such_seq");
+                 json.ok({ view, missing, seq });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    // 视图：既有行为（pg_get_viewdef 输出）不变。
+    let vitems = d["view"]["items"].as_array().expect("view items");
+    assert_eq!(vitems.len(), 1, "视图须出定义: {d}");
+    assert!(
+        vitems[0]["ddl"].as_str().unwrap_or("").contains("SELECT"),
+        "视图 ddl 须为 SELECT 定义: {d}"
+    );
+    // 不存在 / 序列：空数组不报错。
+    assert_eq!(d["missing"]["items"], json!([]), "{d}");
+    assert_eq!(d["seq"]["items"], json!([]), "{d}");
+}

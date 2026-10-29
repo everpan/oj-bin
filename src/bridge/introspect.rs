@@ -234,6 +234,36 @@ pub fn mysql_show_create(table: &str) -> Result<String, String> {
     Ok(format!("SHOW CREATE TABLE `{}`", table.replace('`', "``")))
 }
 
+// ---------------------------------------------------------------------------
+// U-14（v0.1.109）：PG `db.catalog("ddl")` 的 relkind 探测 + 路由。
+// 探测先行：'v'/'m' → 既有 pg_get_viewdef 路径（输出逐字节不动）；'r'/'p' → 拼接器；
+// 其余（'f'/'i'/'S'/'c'/'t'）→ items:[]（假 DDL 比空结果更糟，绝不落拼接器）。
+// ---------------------------------------------------------------------------
+
+/// relkind 探测（单参数 = 表名；`relkind` 是 `char` 域，投影必须 `::text`）。
+pub const PG_DDL_RELKIND: &str = "SELECT c.relkind::text AS relkind FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = current_schema() AND c.relname = ?";
+
+/// PG ddl 路由（spec relkind 矩阵钉死）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgDdlRoute {
+    /// 视图 / 物化视图 → 既有 pg_get_viewdef 路径。
+    View,
+    /// 表 / 分区表 → 拼接器（'p' 附 pg_get_partkeydef，best-effort）。
+    Table,
+    /// 外部表 / 索引 / 序列 / 复合类型 / toast 表，或不存在 → 空结果。
+    Empty,
+}
+
+pub fn pg_ddl_route(relkind: Option<&str>) -> PgDdlRoute {
+    match relkind {
+        Some("v") | Some("m") => PgDdlRoute::View,
+        Some("r") | Some("p") => PgDdlRoute::Table,
+        _ => PgDdlRoute::Empty,
+    }
+}
+
 /// catalog 类的方言 SQL（`None` = kind × 方言 unsupported——**报错不静默**，能力矩阵见
 /// db-guide §10）。参数位约定：吃表名的 kind 固定 1 个 `?`；全库清单 0 个。
 /// pg 铁律 2/3 照守（`::text` / `current_schema()` 限定）。
@@ -888,6 +918,31 @@ mod tests {
         for bad in ["t; DROP TABLE x", "t`", "", "粗", "t a"] {
             assert!(mysql_show_create(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// U-14（v0.1.109）relkind 路由矩阵（spec 钉死）：v/m→View、r/p→Table、
+    /// 其余（f/i/S/c/t）与不存在（None）→Empty——假 DDL 比空结果更糟。
+    #[test]
+    fn pg_ddl_route_matrix() {
+        assert_eq!(pg_ddl_route(Some("v")), PgDdlRoute::View);
+        assert_eq!(pg_ddl_route(Some("m")), PgDdlRoute::View);
+        assert_eq!(pg_ddl_route(Some("r")), PgDdlRoute::Table);
+        assert_eq!(pg_ddl_route(Some("p")), PgDdlRoute::Table);
+        for k in ["f", "i", "S", "c", "t"] {
+            assert_eq!(pg_ddl_route(Some(k)), PgDdlRoute::Empty, "{k}");
+        }
+        assert_eq!(pg_ddl_route(None), PgDdlRoute::Empty);
+    }
+
+    /// relkind 探测常量守卫（PG 铁律 2/3 + 参数位）：`::text`、current_schema()、
+    /// `?` 恰 1、无 LIKE。
+    #[test]
+    fn pg_ddl_relkind_guard() {
+        let s = PG_DDL_RELKIND;
+        assert!(s.contains("relkind::text"), "char 域投影必须 ::text: {s}");
+        assert!(s.contains("current_schema()"), "schema 限定: {s}");
+        assert_eq!(s.matches('?').count(), 1, "参数位恰 1: {s}");
+        assert!(!s.contains("LIKE"), "等值匹配，非 LIKE: {s}");
     }
 
     /// catalog 归一：constraints 按名聚合列；stats 解析字符串数值（pg ::text 口径）。

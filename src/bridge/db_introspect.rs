@@ -40,6 +40,11 @@ pub async fn op_db_catalog(
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::granted_only(&state, &alias)?;
 
+    // U-14（v0.1.109）PG 路由：Ddl × Postgres 先 relkind 探测再分派
+    // （视图行为钉死 / 表 → Task 3 拼接器 / 其余 → 空结果）。
+    if kind == super::introspect::Kind::Ddl && dialect == Dialect::Postgres {
+        return pg_ddl_dispatch(state, target, name, kind, dialect, arg, scope).await;
+    }
     // U-14（v0.1.109）MySQL 激活：`catalog_sql(Ddl, MySql)` 为 None，查表先行会让
     // 下面的 SHOW 拦截成为死代码——故 Ddl × MySql 在查表**之前**定 SQL。顺序钉死：
     // scoped 先例（for_schema unsupported）必须先于 SHOW（SHOW 不接受绑定参数）。
@@ -85,6 +90,131 @@ pub async fn op_db_catalog(
         vec![]
     };
     run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
+}
+
+/// U-14（v0.1.109）PG ddl 分派：relkind 探测先行（单参数表名，scoped 经
+/// resolve_scope 前置 scope 值），再按 [`PgDdlRoute`] 走视图 / 拼接器 / 空。
+async fn pg_ddl_dispatch(
+    state: Rc<RefCell<OpState>>,
+    target: Target,
+    name: String,
+    kind: super::introspect::Kind,
+    dialect: Dialect,
+    arg: Option<String>,
+    scope: Option<String>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let empty = || {
+        serde_json::json!({
+            "kind": kind.capability(), "dialect": dialect.as_str(), "items": []
+        })
+    };
+    let t = arg.as_deref().unwrap_or("");
+    if !valid_introspect_table(dialect, t) {
+        return Ok(empty());
+    }
+    let params = vec![Value::String(t.to_string())];
+    let rows = match catalog_query_rows(
+        &state,
+        &target,
+        &name,
+        super::introspect::PG_DDL_RELKIND,
+        params.clone(),
+        scope.clone(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return Err(e),
+    };
+    let relkind = rows
+        .first()
+        .and_then(|r| r.get("relkind"))
+        .and_then(|v| v.as_str());
+    match super::introspect::pg_ddl_route(relkind) {
+        super::introspect::PgDdlRoute::Empty => Ok(empty()),
+        super::introspect::PgDdlRoute::View => {
+            // 既有 pg_get_viewdef 路径逐字节不动（v0.1.100 已发布行为）。
+            let sql = super::introspect::catalog_sql(kind, dialect)
+                .expect("Ddl × PG 常量存在")
+                .to_string();
+            run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
+        }
+        // 表 / 分区表 → 拼接器（Task 3 填充；此前诚实返回空信封，绝不产假 DDL）。
+        super::introspect::PgDdlRoute::Table => Ok(empty()),
+    }
+}
+
+/// catalog 单次查询（占位符改写 + 查询 + trace），返回原始行。
+async fn catalog_query_rows(
+    state: &Rc<RefCell<OpState>>,
+    target: &Target,
+    name: &str,
+    base_sql: &str,
+    params: Vec<Value>,
+    scope: Option<String>,
+) -> Result<Vec<Value>, JsErrorBox> {
+    let in_tx = matches!(target, Target::Tx(_));
+    let dialect = match target {
+        Target::Tx(t) => require_known_dialect(&t.dialect_info, "ddl")?,
+        Target::Pool(da) => require_known_dialect(da.dialect_info(), "ddl")?,
+    };
+    let mut params = params;
+    let sql = match resolve_scope(base_sql, dialect, scope.as_deref()) {
+        Ok(Scope::Plain) => base_sql.to_string(),
+        Ok(Scope::Scoped(s, sc)) => {
+            params.insert(0, Value::String(sc));
+            s
+        }
+        Ok(Scope::Empty) => return Ok(Vec::new()),
+        Err(e) => return Err(to_js_err(Box::new(e))),
+    };
+    let placeholder = match target {
+        Target::Tx(t) => t.dialect_info.caps.placeholder,
+        Target::Pool(da) => da.dialect_info().caps.placeholder,
+    };
+    let norm = normalize_and_trace(state, placeholder, in_tx, name, &sql, &params)?;
+    let start = std::time::Instant::now();
+    let trace_params = &[Value::String("<db introspection>".to_string())];
+    let res = match target {
+        Target::Pool(da) => da.query_with_params(&norm, &params).await,
+        Target::Tx(t) => t.session.lock().await.query(&norm, &params).await,
+    };
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    match res {
+        Ok(rows) => {
+            trace_sql(
+                state,
+                &sql,
+                trace_params,
+                name,
+                in_tx,
+                ms,
+                None,
+                true,
+                None,
+                None,
+                None,
+            );
+            Ok(rows)
+        }
+        Err(e) => {
+            let (cat, retry) = err_meta_of(e.as_ref());
+            trace_sql(
+                state,
+                &sql,
+                trace_params,
+                name,
+                in_tx,
+                ms,
+                None,
+                false,
+                Some(e.to_string()),
+                cat,
+                retry,
+            );
+            Err(to_js_err(e))
+        }
+    }
 }
 
 /// catalog 查询的执行尾段（F3 scope 解析 + 占位符改写 + 查询 + trace + 归一出信封）。
