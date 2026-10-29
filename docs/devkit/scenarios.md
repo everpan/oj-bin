@@ -4110,3 +4110,47 @@ export async function get() {
 | 部署版本老的引擎上 `db.explain(...)` TypeError | v0.1.108 才有；跨版本先探 `typeof db.explain === "function"` 再调 |
 | sqlite 上报 `OJ_DB_UNSUPPORTED`（capability=`explain`） | 预期——目前只 pg/mysql；看错误/限制表 |
 | `db_access` Deny 的库上 explain | 一样拒（内层语句先过租户/访问护栏，`explain select …; drop table` 按 DDL 拒） |
+
+## 场景 57：DDL 生成——正向取表定义 + 反向出 ALTER 集（U-14，v0.1.109）
+
+**需求**：表结构页显示建表语句（PR-2）、结构比较页出 ALTER 预览（PR-9）。
+
+**代码**（pg / mysql 通用；sqlite 结构化报错）：
+
+```ts
+// 正向：单对象源码
+export async function get() {
+  const { items } = await db.catalog("ddl", "orders");
+  return { ddl: items[0]?.ddl ?? "" };
+}
+
+// 反向：listColumns/listIndexes/listForeignKeys 拼 from，UI 改 to → diff + ALTER 集
+export async function post() {
+  const { http } = globalThis as any;
+  const body = http.body;
+  const from = {
+    columns: await db.listColumns("orders"),
+    indexes: await db.listIndexes("orders"),
+    foreignKeys: await db.listForeignKeys("orders"),
+  };
+  const { diff, statements } = await db.ddlDiff({
+    objectType: "table", name: "orders", from, to: body.to,
+  });
+  return { diff, statements }; // UI 确认后逐条 exec（DDL 须 allow_ddl）
+}
+```
+
+**验证**：pg 下 `catalog("ddl")` 对普通表出拼接 DDL（`CREATE TABLE` + 序列 +
+`ADD CONSTRAINT` + `CREATE INDEX` + `COMMENT ON`），对视图出 `CREATE VIEW` 原文；
+mysql 出 `SHOW CREATE TABLE`。`ddlDiff` 加一列 → `statements` 尾段一条
+`ADD COLUMN`（pg 双引号 / mysql 反引号），`diff.columns.added` 含新列名。
+
+**常见坑**：
+
+| 坑 | 解 |
+|---|---|
+| `to` 只传 `columns`，旧索引/约束去向不明 | 缺省维度 = **不参与** diff，不是删除——`to` 要全维度都带（from 照上面三件拼）；只有显式 `indexes: []` 才是「删全部索引」 |
+| 照抄 mysql `SHOW CREATE` 重放后自增计数不对 | 输出含 `AUTO_INCREMENT=<当前值>` 是实时计数器；固化前剥掉该行或接受该值 |
+| 事务里重放 ddlDiff 语句 | MySQL DDL 隐式提交断事务；走 `db.exec` + `allow_ddl`，逐条执行 |
+| pg 跨库重放报 `relation "ix_x" already exists` | 索引名同 schema 唯一——重放前自行换索引名（生成器不管这个） |
+| 老引擎上 `db.ddlDiff` TypeError | v0.1.109 才有；跨版本先探 `typeof db.ddlDiff === "function"`（与 explain 同款） |

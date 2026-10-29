@@ -381,6 +381,40 @@ MySQL `access_type` 如 `const`/`ref`/`ALL`）。
 
 ---
 
+### 3.3 DDL 生成（正向 `db.catalog("ddl")` + 反向 `db.ddlDiff`，U-14，v0.1.109）
+
+正向取对象源码、反向从结构差出 ALTER——dbx PR-2（DDL 展示/复制）与 PR-9（结构比较）
+的服务端底座。
+
+```ts
+// 正向：单对象源码（信封 {kind:"ddl", dialect, items:[{name, ddl}]}）
+const { items } = await db.catalog("ddl", "orders");
+// pg 普通表 → 拼接器还原（serial 序列 + OWNED BY / identity / 约束 / 索引 / 注释）；
+// pg 视图/物化视图 → pg_get_viewdef 原样；mysql → SHOW CREATE TABLE。
+
+// 反向：结构 diff + 有序可重放 statements（零 DB I/O，执行走 db.exec + allow_ddl）
+const from = { columns: await db.listColumns("orders") };
+const to = { columns: [...from.columns, { name: "priority", nativeType: "int", nullable: true }] };
+const { diff, statements } = await db.ddlDiff({
+  objectType: "table", name: "orders", from, to,
+});
+for (const s of statements) await db.asSystem().exec(s); // DDL 须 allow_ddl 通道
+```
+
+- **缺省 vs 空数组（数据安全语义）**：维度字段**缺省 = 不参与 diff**；**空数组 = 期望为空**
+  （出 DROP）。`to` 只给 `columns` 时，旧表上的索引/约束/外键一个不动；显式 `indexes: []`
+  才会 DROP 全部索引。`from = null` → `CREATE TABLE`（主键内联，其余约束/FK 随后）。
+- **方言差**：pg 改类型 `ALTER COLUMN c TYPE t USING c::t`；mysql 无 USING，位置差产
+  `AFTER`/`FIRST`（pg 无列位置 DDL，位置差忽略——changed 里也不出现 position 项）；
+  mysql 列注释内联 `MODIFY ... COMMENT`，pg 走 `COMMENT ON COLUMN`；MySQL DDL **隐式提交**，
+  事务里跑 ddlDiff 语句会断事务。
+- **正向快照口径**：pg 拼接器是 best-effort 快照（5 查询无事务），Pool 臂可落在不同连接，
+  高并发 DDL 下偶发不一致；行数触顶 → `OJ_DB_CAPACITY`（拒绝不完整 DDL）。跨 schema/跨库
+  重放时索引名同 schema 唯一，须自行换名（`pg_get_indexdef` 裸索引名）。
+- **边界**：sqlite / 未知方言 → `OJ_DB_UNSUPPORTED`（`capability = "ddl_diff"`）；
+  `ddlDiff` 不生成序列对象（serial 的 `CREATE SEQUENCE` 不在 ALTER 流里）；版本错位先探
+  `typeof db.ddlDiff === "function"`。
+
 ## 4. 事务
 
 ```ts
@@ -1712,7 +1746,8 @@ const evs = await audit.query({ kind: "DB_SESSION_TIMEOUT", sinceMs: Date.now() 
 | `db.listColumns` | `listColumns(table: string): Promise<Array<{ name: string; nativeType: string; nullable: boolean; default: string \| null; primaryKey: boolean }>>` | **列结构内省**（v0.1.90）。当前库单表的列信息，按声明序；`nativeType` 是方言**声明文本**（sqlite `type` / mysql `column_type` / pg `format_type`，零归一化），`default` 是原始 DDL 文本（sqlite 字符串默认带引号）；表名只经绑定参数。表不存在/不可见 → 空数组（不区分）。未知方言 `OJ_DB_UNSUPPORTED`（`e.data.capability = "list_columns"`）。`db.tx` 回调同签名 |
 | `db.listIndexes` | `listIndexes(table: string): Promise<Array<{ name: string; unique: boolean; primary: boolean; origin: "c" \| "u" \| "pk"; columns: string[] }>>` | **索引结构内省**（v0.1.90）。`origin` 三方言统一为 `c`(普通) / `u`(唯一) / `pk`(主键)——UI 不再分支；`columns` 为已按序聚合的组成列。其余口径同 `listColumns`；能力缺失码 `list_indexes` |
 | `db.listForeignKeys` | `listForeignKeys(table: string): Promise<Array<{ name: string \| null; columns: string[]; refTable: string; refColumns: string[] }>>` | **外键结构内省**（v0.1.90）。sqlite 外键无约束名 → `name` 为 `null`；复合外键 `columns[i]` ↔ `refColumns[i]` 按位配对。其余口径同 `listColumns`；能力缺失码 `list_foreign_keys` |
-| `db.catalog` | `catalog(kind: "views" \| "routines" \| "sequences" \| "ddl" \| "comment" \| "constraints" \| "stats", arg?: string): Promise<{ kind: string; dialect: string; items: object[] }>` | **目录类内省**（U-14 批 a，v0.1.100；新一代信封——L2 三件保持裸数组不动）。`views`=清单+定义、`routines`=函数/过程清单、`sequences`=序列（mysql 为 auto_increment 模拟）、`ddl`=单对象源码（`arg`=对象名；mysql 走 `SHOW CREATE` 白名单例外；pg 仅视图定义）、`comment`=列注释（`arg`=表名）、`constraints`=PK/UQ/CHECK（`arg`=表名；FK 走 listForeignKeys）、`stats`=估算行数/大小（**只估算**，无全表扫描开关）。行数上限 1000。**能力矩阵**：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟；constraints 批 a 仅 PK/UQ）；pg 全部（sequences 原生）——**unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默**。授权链同 L2（`granted_only`） |
+| `db.catalog` | `catalog(kind: "views" \| "routines" \| "sequences" \| "ddl" \| "comment" \| "constraints" \| "stats", arg?: string): Promise<{ kind: string; dialect: string; items: object[] }>` | **目录类内省**（U-14 批 a，v0.1.100；新一代信封——L2 三件保持裸数组不动）。`views`=清单+定义、`routines`=函数/过程清单、`sequences`=序列（mysql 为 auto_increment 模拟）、`ddl`=单对象源码（`arg`=对象名；v0.1.109 起 `ddl` 全量：pg 走**拼接器**（普通表还原 serial/identity/约束/索引/列注释+表注释；视图/物化视图原样 `pg_get_viewdef`；序列等其余对象 → 空结果；30s 整体预算 + 行数触顶 `OJ_DB_CAPACITY`），mysql 走 `SHOW CREATE`（输出含 `AUTO_INCREMENT=<当前计数值>`，属实时计数器非纯定义））、`comment`=列注释（`arg`=表名）、`constraints`=PK/UQ/CHECK（`arg`=表名；FK 走 listForeignKeys）、`stats`=估算行数/大小（**只估算**，无全表扫描开关）。行数上限 1000。**能力矩阵**：sqlite 仅 views/ddl；mysql 全部（sequences 为 auto_increment 模拟；constraints 批 a 仅 PK/UQ）；pg 全部（sequences 原生；`ddl`=表/视图/物化视图）——**unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默**。授权链同 L2（`granted_only`） |
+| `db.ddlDiff` | `ddlDiff(spec: { objectType: "table"; name: string; from?: Structure \| null; to: Structure }): Promise<{ diff, statements }>` | **反向 DDL 渲染**（U-14，v0.1.109）。diff 为结构化四维比较（columns/constraints/indexes/foreignKeys × added/removed/changed，PR-9 比较视图直接渲染）；statements 有序可重放——DROP（FK→约束→索引→列）→ 列变更 → ADD → 约束/索引 → FK 最后；`from = null` → `CREATE TABLE`（主键内联）。**纯渲染器，零 DB I/O**；执行仍走 `db.exec` + `allow_ddl`。维度字段**缺省 = 不参与 diff；空数组 = 期望为空（出 DROP）**——省略 `indexes` 绝不生成 DROP INDEX 全家桶。方言差：pg 改类型产 `USING col::type`；mysql 位置差产 `AFTER`/`FIRST`（pg 无列位置 DDL → 忽略）；identity 列跳过 default 文本比对；**不生成序列对象**。verbatim 片段（nativeType/default/definition）拒含 `;`；标识符方言引号+翻倍（合法名可含非 ASCII/空格）。sqlite / 未知方言 → `OJ_DB_UNSUPPORTED`（`e.data.capability = "ddl_diff"`）。授权链同 L2（`granted_only`） |
 | `db.allowed()` | `allowed(): Array<{ alias: string; dialect: string; read_only: boolean; allow_ddl: boolean; allow_dangerous: boolean; max_rows: number \| null; enforce: "off" \| "warn" \| "deny" }>` | **访问控制自省**（v0.1.89）。只列**当前调用主体有权限访问**的库别名及其能力位（按 alias 排序）；未授权的库不出现在列表里。管理员后台 / 数据面板的「库选择器」应以此为准，不要硬编码 `db:` 段的全部别名（那是**假入口**：列出来点了才报错）。同步 op；不执行任何 SQL。`db.tx` 回调对象同签名 |
 | `db.client.register` | `register(name: string, dsn: string): Promise<ClientDbEntry>` | **动态数据源登记**（client 轴，v0.1.91）。运行期把 DSN 登记为命名数据源；登记后别名进入 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream），此处只暴露**管理面**。重名 / 超 `max_entries` 抛错。未配置的名字返回 `undefined` 的地方同理：`db.client` 仅在 `db`（即 `DB("default")`）存在时挂载 |
 | `db.client.test` | `test(dsn: string): Promise<{ ok: boolean; dialect?: string; error?: string; serverVersion?: string \| null; probedAtMs?: number }>` | 试连（**不落库**）；返回 `{ok, dialect?, serverVersion?, probedAtMs?, error?}`（U-11：探测成功即带版本） |

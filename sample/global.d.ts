@@ -638,6 +638,59 @@ declare global {
     refColumns: string[];
   }
 
+  // U-14（v0.1.109）db.ddlDiff() 的输入/输出类型。Structure 四维字段全部可选——
+  // **缺省 = 不参与 diff；空数组 = 期望为空（出 DROP）**。省略 `indexes` 绝不生成
+  // DROP INDEX 全家桶（数据安全语义）。
+  interface DdlColumnSpec {
+    name: string;
+    nativeType: string;
+    nullable?: boolean;
+    default?: string | null;
+    primaryKey?: boolean;
+    // pg identity 列标记（"always"/"byDefault"）：跳过 default 文本比对（nextval 派生）。
+    identity?: string;
+    comment?: string | null;
+  }
+  interface DdlConstraintSpec {
+    name: string;
+    // pk / uq / ck。
+    type: string;
+    // 方言 DDL 文本（如 "CHECK (v > 0)" / "UNIQUE (email)"）。
+    definition: string;
+    columns?: string[];
+  }
+  interface DdlIndexSpec {
+    name: string;
+    unique?: boolean;
+    // 主键索引走约束维度，ddlDiff 忽略 primary=true 的索引条目。
+    primary?: boolean;
+    origin?: string;
+    columns?: string[];
+  }
+  interface DdlForeignKeySpec {
+    name: string;
+    columns: string[];
+    refTable: string;
+    refColumns: string[];
+  }
+  interface Structure {
+    columns?: DdlColumnSpec[];
+    constraints?: DdlConstraintSpec[];
+    indexes?: DdlIndexSpec[];
+    foreignKeys?: DdlForeignKeySpec[];
+  }
+  // statements 有序可重放：DROP（FK→约束→索引→列）→ 列变更 → ADD → 约束/索引 → FK 最后。
+  // 执行仍走 db.exec + allow_ddl；ddlDiff 本身零 DB I/O。
+  interface DdlDiffResult {
+    diff: {
+      columns: { added: string[]; removed: string[]; changed: Record<string, unknown>[] };
+      constraints: { added: string[]; removed: string[]; changed: Record<string, unknown>[] };
+      indexes: { added: string[]; removed: string[]; changed: Record<string, unknown>[] };
+      foreignKeys: { added: string[]; removed: string[]; changed: Record<string, unknown>[] };
+    };
+    statements: string[];
+  }
+
   interface SchemaInfo {
     name: string;
     // pg 给属主角色名；mysql/sqlite 无此来源 → 缺省。
@@ -674,6 +727,13 @@ declare global {
      * sqlite/未知方言 → OJ_DB_UNSUPPORTED（e.data.capability === "explain"）。
      * 能力探测：`typeof db.explain === "function"`（版本错位期防 TypeError）。 */
     explain(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<{ plan: PlanNode }>;
+    /** U-14（v0.1.109）反向 DDL：结构 diff + 有序可重放 ALTER 集。纯渲染器，零 DB I/O。
+     * `{objectType:"table", name, from, to}` → `{diff, statements}`；from = null → CREATE TABLE。
+     * 维度字段缺省 = 不参与 diff，空数组 = DROP 全量；执行走 db.exec + allow_ddl。
+     * PG 改类型产 USING；MySQL 位置差产 AFTER/FIRST（PG 无列位置 DDL → 忽略）。
+     * sqlite/未知方言 → OJ_DB_UNSUPPORTED（e.data.capability === "ddl_diff"）。
+     * 能力探测：`typeof db.ddlDiff === "function"`（版本错位期防 TypeError）。 */
+    ddlDiff(spec: { objectType: "table"; name: string; from?: Structure | null; to: Structure }): Promise<DdlDiffResult>;
     // 安全查询构造器（标识符白名单 + 参数化值）。
     table(name: string): QueryBuilder;
     // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
@@ -715,8 +775,10 @@ declare global {
     listForeignKeys(table: string): Promise<ForeignKeyInfo[]>;
     /** 目录类内省：新一代信封 `{kind, dialect, items}`（L2 三件
      * 保持裸数组不动）。kind：views / routines / sequences / ddl / comment / constraints /
-     * stats；ddl/comment/constraints 吃 `arg`（对象名），其余全库清单。能力矩阵见
-     * db-guide §6——unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默。 */
+     * stats；ddl/comment/constraints 吃 `arg`（对象名），其余全库清单。
+     * v0.1.109 起 ddl 全量激活：PG 表走拼接器（serial/identity/约束/索引/注释还原，
+     * 视图原样 viewdef），MySQL 走 SHOW CREATE TABLE；能力矩阵见 db-guide §6/§10——
+     * unsupported 报 `OJ_DB_UNSUPPORTED`（`e.data.capability`），不静默。 */
     catalog(kind: "views" | "routines" | "sequences" | "ddl" | "comment" | "constraints" | "stats", arg?: string):
       Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
     /** REQ-04（v0.1.105）库/schema 清单：跨方言同构 `{name, owner?, isDefault?, comment?}`。

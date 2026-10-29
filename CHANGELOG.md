@@ -16,6 +16,32 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.109
+
+**feat（db）**：U-14 DDL 生成（正向 + 反向，dbx PR-2/PR-9 解锁）：
+
+- 正向：`db.catalog("ddl", table)` 激活两方言——MySQL 走 `SHOW CREATE TABLE`
+  （零内联铁律的唯一成文例外；scoped `forSchema` 模式显式 `OJ_DB_UNSUPPORTED`
+  capability=`for_schema`，先例不破坏）；PG 先 relkind 探测再分派：视图/物化视图
+  行为钉死（`pg_get_viewdef` 原样信封）、普通表走**拼接器**（pg_class 后 5 查询：
+  列含 identity/生成列、约束、索引、列注释、表注释；serial 还原为
+  `CREATE SEQUENCE IF NOT EXISTS` + `OWNED BY`，identity 渲染
+  `GENERATED ALWAYS/BY DEFAULT AS IDENTITY`），序列等其余对象 → 空结果。
+  拼接器 30s 整体预算（`STITCH_BUDGET_MS`）；行数触顶 → `OJ_DB_CAPACITY`，
+  拒绝产出不完整 DDL。
+- 反向：`db.ddlDiff(spec)`——`{objectType:"table", name, from, to}` →
+  `{diff, statements}`。**纯渲染器，零 DB I/O**；执行仍走 `db.exec` + `allow_ddl`。
+  结构化 diff 四维（columns/constraints/indexes/foreignKeys × added/removed/changed），
+  statements 有序可重放：DROP（FK→约束→索引→列）→ 列变更 → ADD → 约束/索引 → FK 最后。
+  维度字段**缺省 = 不参与 diff；空数组 = DROP 全量**（省略 `indexes` 绝不生成
+  DROP INDEX 全家桶）。from = null → CREATE TABLE（主键内联）。
+- 方言差异：PG 改类型产 `USING col::type`；MySQL 位置差产 `AFTER`/`FIRST`
+  （PG 无列位置 DDL → 忽略）；MySQL COMMENT 内联 MODIFY、PG 走
+  `COMMENT ON COLUMN`；identity 列跳过 default 文本比对。
+- 注入防线：标识符只做方言引号 + 翻倍（**不复用** charset 白名单；NUL/控制字符拒）；
+  verbatim 片段（nativeType/default/definition）拒含 `;`。
+- sqlite / 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`（capability=`ddl_diff`），不回落。
+
 ## v0.1.108
 
 **feat（db）**：`db.explain(sql, params?, opts?)`——G3 跨方言执行计划归一（dbx PR-1 解锁）：

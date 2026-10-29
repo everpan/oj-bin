@@ -133,6 +133,12 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | pg 上 `forSchema` 想跨 **database** | pg 的 database = 独立连接，物理不可行——`listDatabases()` 只出**清单**（任意库连出 pg_database，不换连接）；跨 database 内视 = 再登记一个别名（一连接=一库）。mysql 无此问题：schema≡database，`forSchema` 即跨库 |
 | `forSchema("不存在")` 拿空数组当出错 | 空数组 = scope 下无对象或 scope 名畸形（>128 / 控制字符）——两者**都**返回空（不报错不泄漏），与 listColumns 的「不存在/无权限/别的 schema」同口径。先 `listSchemas()` 确认名字 |
 | mysql 上 `listSchemas()` 与 `listDatabases()` 结果一样 | **预期**：mysql schema≡database，两腿同一份 schemata（系统库已滤）。别当 bug 重报 |
+| 以为 `db.catalog("ddl")` 的输出是纯定义文本（v0.1.109） | mysql 的 `SHOW CREATE TABLE` 输出**含 `AUTO_INCREMENT=<当前计数值>`**——照抄重放会把计数器固化；pg 拼接器是 best-effort 快照（5 查询无事务），Pool 臂可落不同连接，高并发 DDL 下偶发不一致；跨库重放须自行换索引名（同 schema 唯一） |
+| `db.ddlDiff` 把 `to` 写成 `{columns: [...]}` 后 diff 视图全是 DROP / 或以为旧索引会被保留（v0.1.109） | **缺省维度 = 不参与 diff；空数组 = 期望为空（出 DROP）**——`to` 只给 `columns` 时旧表的索引/约束/外键一个不动（这是对的）；显式 `indexes: []` 才会 DROP 全部索引。给 UI 传 to-Structure 时全维度都要带（from 用 `listColumns`/`listIndexes`/`listForeignKeys` 拼） |
+| 拿 `db.ddlDiff` 的 statements 直接 `db.tx` 里跑（v0.1.109） | 别——MySQL DDL **隐式提交**，事务里跑会断事务。走 `db.exec` + `allow_ddl`（如 `db.asSystem().exec`）逐条执行 |
+| `db.ddlDiff` 里塞带 `;` 的 default/类型/约束定义（v0.1.109） | 预期被拒——verbatim 片段（nativeType/default/definition）拒含 `;`（防语句拆分注入）；标识符只做方言引号+翻倍（合法名可含非 ASCII/空格），NUL/控制字符也拒 |
+| 拿 `db.ddlDiff` 给 serial 表加列后期望它建序列（v0.1.109） | ddlDiff **不生成序列对象**——serial 的 `CREATE SEQUENCE` 不在 ALTER 流里；identity 列自管序列（渲染 `GENERATED ... AS IDENTITY`），且 identity 列跳过 default 文本比对（nextval 是派生物） |
+| pg 的 diff 视图里看不到列位置变化 / mysql 出 `AFTER`（v0.1.109） | 预期——pg 无列位置 DDL（位置差忽略，changed 无 position 项）；mysql 位置差产 `AFTER`/`FIRST` |
 
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
