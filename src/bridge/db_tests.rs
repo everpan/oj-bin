@@ -417,10 +417,13 @@ async fn listing_and_for_schema_matrix_pg_mysql() {
 }
 
 /// 缺陷修复（env-gated 真库矩阵腿）：listIndexes / listForeignKeys 的投影别名含
-/// 保留字（column / unique / primary），MySQL 8 / PG 下裸投影必现语法错误。真库各建
-/// 一对带普通索引 + PK + 外键的表，断言两件不报错且形状正确。未设 OJ_TEST_PG /
-/// OJ_TEST_MYSQL 则 skip（诚实登记；CI 离线防线 =
-/// introspect::tests::reserved_word_aliases_quoted_per_dialect）。
+/// 保留字（column / unique / primary），MySQL 8 / PG 下裸投影必现语法错误；以及
+/// scoped（forSchema）下 PG 的 scope 占位符序错致静默空结果
+/// （BUG-pg-scoped-introspect-param-binding）。真库各建一对带普通索引 + PK +
+/// 外键的表（默认库 + 独立 schema/库 两份），断言两件不报错且形状正确。
+/// 未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（诚实登记；CI 离线防线 =
+/// introspect::tests::reserved_word_aliases_quoted_per_dialect 与
+/// scope_predicate_precedes_first_param）。
 #[tokio::test(flavor = "current_thread")]
 async fn list_indexes_and_foreign_keys_real_pg_mysql() {
     for (env, tag) in [("OJ_TEST_PG", "pg"), ("OJ_TEST_MYSQL", "mysql")] {
@@ -443,6 +446,29 @@ async fn list_indexes_and_foreign_keys_real_pg_mysql() {
         ] {
             db.exec_with_params(s, &[]).await.unwrap();
         }
+        // scoped 腿：独立 schema（pg）/ 独立库（mysql）再建同构一对表。
+        let scoped: &[&str] = if tag == "pg" {
+            &[
+                "drop schema if exists oj_ixfk cascade",
+                "create schema oj_ixfk",
+                "create table oj_ixfk.s_ixfk_p(id int primary key)",
+                "create table oj_ixfk.s_ixfk_c(id int primary key, p_id int, \
+                 foreign key (p_id) references oj_ixfk.s_ixfk_p(id))",
+                "create index s_c_ix on oj_ixfk.s_ixfk_c(p_id)",
+            ]
+        } else {
+            &[
+                "drop database if exists oj_ixfk",
+                "create database oj_ixfk",
+                "create table oj_ixfk.s_ixfk_p(id int primary key)",
+                "create table oj_ixfk.s_ixfk_c(id int primary key, p_id int, \
+                 foreign key (p_id) references oj_ixfk.s_ixfk_p(id))",
+                "create index s_c_ix on oj_ixfk.s_ixfk_c(p_id)",
+            ]
+        };
+        for s in scoped {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
         let b = Bridge::with_dbs_and_loader(
             std::collections::HashMap::from([("default".to_string(), db as _)]),
             Arc::new(InMemoryKV::new()),
@@ -458,6 +484,9 @@ async fn list_indexes_and_foreign_keys_real_pg_mysql() {
                      const fks = await db.listForeignKeys('oj_ixfk_c');
                      const ix = idx.find((i) => i.name === 'oj_ixfk_c_ix');
                      const pk = idx.find((i) => i.primary === true);
+                     const sIdx = await db.forSchema('oj_ixfk').listIndexes('s_ixfk_c');
+                     const sFks = await db.forSchema('oj_ixfk').listForeignKeys('s_ixfk_c');
+                     const sIx = sIdx.find((i) => i.name === 's_c_ix');
                      json.ok({
                        ixCols: ix && ix.columns,
                        pkCols: pk && pk.columns,
@@ -465,6 +494,9 @@ async fn list_indexes_and_foreign_keys_real_pg_mysql() {
                        fkTable: fks[0] && fks[0].refTable,
                        fkCols: fks[0] && fks[0].columns,
                        fkRefs: fks[0] && fks[0].refColumns,
+                       sIxCols: sIx && sIx.columns,
+                       sFkLen: sFks.length,
+                       sFkTable: sFks[0] && sFks[0].refTable,
                      });
                    })().catch(e => json.fail(500, String(e)))"#,
                 crate::bridge::RequestInfo::default(),
@@ -479,6 +511,17 @@ async fn list_indexes_and_foreign_keys_real_pg_mysql() {
         assert_eq!(v["data"]["fkTable"], json!("oj_ixfk_p"), "{tag}: {v}");
         assert_eq!(v["data"]["fkCols"], json!(["p_id"]), "{tag}: {v}");
         assert_eq!(v["data"]["fkRefs"], json!(["id"]), "{tag}: {v}");
+        assert_eq!(
+            v["data"]["sIxCols"],
+            json!(["p_id"]),
+            "{tag}: scoped 索引: {v}"
+        );
+        assert_eq!(v["data"]["sFkLen"], json!(1), "{tag}: scoped 外键: {v}");
+        assert_eq!(
+            v["data"]["sFkTable"],
+            json!("s_ixfk_p"),
+            "{tag}: scoped 外键引用表: {v}"
+        );
     }
 }
 

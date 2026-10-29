@@ -169,7 +169,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              CROSS JOIN unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
-             WHERE t.relname = ? AND n.nspname = current_schema() \
+             WHERE n.nspname = current_schema() AND t.relname = ? \
              ORDER BY c.relname, k.ord"
         }
 
@@ -206,7 +206,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
              JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = ck.ord \
              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum \
              JOIN pg_attribute ra ON ra.attrelid = rt.oid AND ra.attnum = fk.attnum \
-             WHERE con.contype = 'f' AND t.relname = ? AND n.nspname = current_schema() \
+             WHERE con.contype = 'f' AND n.nspname = current_schema() AND t.relname = ? \
              ORDER BY con.conname, ck.ord"
         }
         // L2 三件三方言全覆盖；catalog 类只走 `catalog_sql`，此表不可达。
@@ -289,8 +289,8 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
             Some(
                 "SELECT c.relname::text AS name, pg_get_viewdef(c.oid)::text AS ddl \
                   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                  WHERE c.relkind IN ('v','m') AND c.relname = ? \
-                        AND n.nspname = current_schema()",
+                  WHERE c.relkind IN ('v','m') AND n.nspname = current_schema() \
+                        AND c.relname = ?",
             )
         }
         // ---------------- comment（列注释；sqlite 无注释语义 → unsupported）----------------
@@ -306,8 +306,8 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
                   col_description(a.attrelid, a.attnum)::text AS comment \
                   FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
                   JOIN pg_namespace n ON n.oid = c.relnamespace \
-                  WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relname = ? \
-                        AND n.nspname = current_schema()",
+                  WHERE a.attnum > 0 AND NOT a.attisdropped AND n.nspname = current_schema() \
+                        AND c.relname = ?",
         ),
         // ---------------- constraints（PK/UQ/CHECK；FK 走既有 ForeignKeys）----------------
         // sqlite：CHECK 只存在于建表文本，目录无来源 → unsupported（文本解析归批 b）。
@@ -330,8 +330,8 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
                   FROM pg_constraint con \
                   JOIN pg_class t ON t.oid = con.conrelid \
                   JOIN pg_namespace n ON n.oid = t.relnamespace \
-                  WHERE con.contype IN ('p','u','c') AND t.relname = ? \
-                        AND n.nspname = current_schema() ORDER BY con.conname",
+                  WHERE con.contype IN ('p','u','c') AND n.nspname = current_schema() \
+                        AND t.relname = ? ORDER BY con.conname",
         ),
         // ---------------- stats（估算行数/大小；sqlite 无 catalog 来源 → unsupported）----------------
         (Kind::Stats, Dialect::MySql) => Some(
@@ -501,6 +501,10 @@ pub fn listing(rows: Vec<Value>) -> Vec<Value> {
 /// forSchema 范围变换（REQ-04 §5.2 方案 B）：活动 scope 时把范围谓词
 /// `DATABASE()` / `current_schema()` 改写为绑定参数（`?`），由调用方把 scope 值
 /// **前置**进参数数组（范围谓词在 WHERE 中先于表名谓词出现）。
+/// **该顺序是调用方 `params.insert(0, scope)` 的硬契约**——由
+/// [`tests::scope_predicate_precedes_first_param`] 钉死：新增/修改常量时不得把
+/// 表名 `?` 写到范围谓词之前（PG scoped 内省曾因此错绑参数、静默空结果，
+/// BUG-pg-scoped-introspect-param-binding，v0.1.106 实测暴露）。
 /// sqlite → None（无 schema 概念，调用方报 `OJ_DB_UNSUPPORTED` capability=for_schema）。
 /// mysql SHOW 例外（Ddl）不接受绑定参数，调用方在 scoped 模式直接 unsupported、不经此函数。
 pub fn scoped_sql(base: &str, d: Dialect) -> Option<String> {
@@ -1031,8 +1035,42 @@ mod tests {
         // 调用方直接报 unsupported，不经过 scoped_sql。
     }
 
-    /// 范围谓词恰出现一次（变换正确性的前置不变量）：
-    /// 若某常量漏写范围限定（如 pg 索引忘加 nspname），上面的替换会静默 no-op——
+    /// F3 硬契约钉死：凡带参数位的非 sqlite 内视常量，范围谓词必须先于**第一个 `?`**
+    /// 出现——调用方 `params.insert(0, scope)` 依赖此序。PG 的 Indexes/ForeignKeys 与
+    /// catalog 的 Ddl/Comment/Constraints 曾把 `n.nspname = current_schema()` 写在表名
+    /// `?` 之后 → scoped 改写后 scope 占位符不再是首位，错绑表名位、静默空结果
+    /// （BUG-pg-scoped-introspect-param-binding，v0.1.106 实测暴露）。
+    #[test]
+    fn scope_predicate_precedes_first_param() {
+        let pred = |d: Dialect| match d {
+            Dialect::MySql => "DATABASE()",
+            _ => "current_schema()",
+        };
+        for kind in [Kind::Columns, Kind::Indexes, Kind::ForeignKeys] {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let s = sql(kind, d);
+                let Some(q) = s.find('?') else { continue };
+                assert!(
+                    s[..q].contains(pred(d)),
+                    "{kind:?}/{d:?}: 范围谓词须在第一个 ? 之前（insert(0, scope) 契约）: {s}"
+                );
+            }
+        }
+        for kind in CATALOG {
+            for d in [Dialect::MySql, Dialect::Postgres] {
+                let Some(s) = catalog_sql(kind, d) else {
+                    continue;
+                };
+                let Some(q) = s.find('?') else { continue };
+                assert!(
+                    s[..q].contains(pred(d)),
+                    "{kind:?}/{d:?}: 范围谓词须在第一个 ? 之前（insert(0, scope) 契约）: {s}"
+                );
+            }
+        }
+    }
+
+    /// 范围谓词恰出现一次（变换正确性的前置不变量）：    /// 若某常量漏写范围限定（如 pg 索引忘加 nspname），上面的替换会静默 no-op——
     /// 用「非 sqlite 常量必含范围谓词」钉死。
     #[test]
     fn network_constants_all_carry_scope_predicate() {

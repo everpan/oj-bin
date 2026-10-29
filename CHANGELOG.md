@@ -16,7 +16,26 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.107
+
+**fix（db）**：PG 显式 schema 作用域（`db.forSchema(name).listIndexes/listForeignKeys` 等）
+下 scoped 内省**静默返回空**——`scoped_sql` 改写后 scope 占位符不再是第一个 `?`，而调用方
+`params.insert(0, scope)` 恒绑首位：scope 被错绑到表名位、真表名绑到 schema 位，查询恒空。
+MySQL 常量范围谓词本就在表名 `?` 之前故不受影响，仅 PG 命中：
+
+- 根因修复：5 个 PG 常量的 WHERE 谓词对调，范围谓词（`n.nspname = current_schema()`）
+  一律先于表名 `?`（AND 可交换，语义不变）——L2 的 Indexes / ForeignKeys + catalog 的
+  Ddl / Comment / Constraints（后三件缺陷单未列，同根因一并修）；
+- `scoped_sql` 文档明示「scope 占位符恒为第一个 `?`」是调用方硬契约；
+- 新增静态守卫 `scope_predicate_precedes_first_param`：凡带参数位的非 sqlite 内视常量，
+  范围谓词必须先于第一个 `?` 出现（离线钉死，防回归）；
+- env-gated 真库矩阵腿 `list_indexes_and_foreign_keys_real_pg_mysql` 扩 scoped 段：
+  独立 schema/库建同构表，断言 forSchema 下索引/外键形状（未设 DSN skip 并诚实登记）。
+
 ## v0.1.106
+
+（注：v0.1.106 tag 已推，但其 release run 在平台构建中被取消、npm 未发布；以下内容
+以 v0.1.107 为首个实际发布载体。）
 
 **fix（db）**：`db.listIndexes` / `db.listForeignKeys` 在真实 MySQL / PostgreSQL 上必现语法
 错误——内省 SQL 的投影别名未按方言转义保留字：
