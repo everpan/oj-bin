@@ -14,8 +14,12 @@
 //! 3. **参数值绝不内联**：绑定失败是方言能力问题，结构化报错，禁止拼进 SQL 文本。
 
 /// PG 前缀：文本计划（默认格式）。Any 驱动限制见模块头铁律 2。
+// v0.1.108：Task 5 op 接入前暂挂 allow，op 接线后删除。
+#[allow(dead_code)]
 pub(crate) const PG_EXPLAIN_PREFIX: &str = "EXPLAIN ";
 /// MySQL 前缀：JSON 格式，输出列可被 sqlx Any 解码。
+// v0.1.108：Task 5 op 接入前暂挂 allow，op 接线后删除。
+#[allow(dead_code)]
 pub(crate) const MYSQL_EXPLAIN_PREFIX: &str = "EXPLAIN FORMAT=JSON ";
 
 // ---------------------------------------------------------------------------
@@ -27,8 +31,10 @@ pub(crate) const MYSQL_EXPLAIN_PREFIX: &str = "EXPLAIN FORMAT=JSON ";
 // ---------------------------------------------------------------------------
 
 /// 解析 PG 文本计划（EXPLAIN 默认格式）为归一 PlanNode。
+// v0.1.108：Task 5 op 接入前的暂挂 allow（clippy -D warnings 门禁），op 接线后删除。
+#[allow(dead_code)]
 pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
-    use serde_json::{Value, json};
+    use serde_json::json;
     // 栈元素：(附属行缩进, 该节点在 out 树中的路径)。用索引栈定位父节点。
     let mut stack: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut lines = text.lines().peekable();
@@ -46,7 +52,6 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
     let mut tree = root;
     stack.push((2_usize, Vec::new())); // 根附属行缩进 = 2
     let mut cur_path: Vec<usize> = Vec::new(); // 当前节点路径（根的子为 [i]…）
-    let mut cur_extra_indent = 2_usize;
     for raw in lines {
         if is_trailer_line(raw) {
             continue;
@@ -70,8 +75,7 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
             let mut my_path = parent_path;
             my_path.push(idx);
             cur_path = my_path.clone();
-            cur_extra_indent = indent + 6;
-            stack.push((cur_extra_indent, my_path));
+            stack.push((indent + 6, my_path));
         } else {
             // 附属行：挂当前节点。附属行理论上缩进 == cur_extra_indent，宽容处理。
             let _ = indent;
@@ -193,6 +197,176 @@ fn pg_category(operation: &str) -> &'static str {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// MySQL FORMAT=JSON 归一（真机 oj-test-mysql 8.4 捕获样本钉死，v0.1.108）。
+// 结果外层是 `{ "EXPLAIN": "<json 字符串>" }`（op 层先 from_str 再进本函数）。
+// 归一器是递归下降**任意容器键**的通用 walker——禁止 nested_loop 特判：
+// nested_loop / grouping_operation / duplicates_removal / ordering_operation /
+// union_result(query_specifications[]) / materialized_from_subquery /
+// attached_subqueries[] / query_block 都是容器；table 是叶子。
+// ---------------------------------------------------------------------------
+
+/// 容器键的固定遍历优先级（一个节点极少同时持多个；次序确定性靠这里）。
+const MYSQL_CONTAINER_KEYS: [&str; 10] = [
+    "ordering_operation",
+    "duplicates_removal",
+    "grouping_operation",
+    "nested_loop",
+    "union_result",
+    "query_specifications", // union_result 的臂数组（元素包 query_block）
+    "materialized_from_subquery",
+    "attached_subqueries",
+    "query_block",
+    "table", // 叶子槽位在末位：容器持有 table 时降级为单子节点，不吞容器自身
+];
+
+/// 解析 MySQL EXPLAIN FORMAT=JSON（已 serde 解析的 `{query_block: ...}` 根）为归一 PlanNode。
+// v0.1.108：Task 5 op 接入前的暂挂 allow（clippy -D warnings 门禁），op 接线后删除。
+#[allow(dead_code)]
+pub(crate) fn normalize_mysql_plan(explain_json: &serde_json::Value) -> serde_json::Value {
+    match explain_json.get("query_block") {
+        Some(qb) => mysql_node_of(qb, "query_block"),
+        None => empty_node("query_block"),
+    }
+}
+
+fn empty_node(operation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "category": "other", "operation": operation, "relation": null, "accessPath": null,
+        "cost": null, "rowsEstimate": null, "width": null, "extra": null, "children": [],
+    })
+}
+
+/// 容器节点：operation = 命中的容器键名，children = 各容器键的递归结果。
+/// union_result 等容器自身可带 table 形态字段（table_name/access_type），relation 照收。
+fn mysql_node_of(v: &serde_json::Value, operation: &str) -> serde_json::Value {
+    use serde_json::json;
+    let mut children: Vec<serde_json::Value> = Vec::new();
+    for key in MYSQL_CONTAINER_KEYS {
+        match v.get(key) {
+            Some(serde_json::Value::Array(arr)) => {
+                // nested_loop 是**有名字的连接容器**（category=join），臂作它的 children；
+                // query_specifications / attached_subqueries 是透明数组，元素直接进当前节点。
+                if key == "nested_loop" {
+                    let arms: Vec<serde_json::Value> = arr.iter().map(mysql_array_item).collect();
+                    children.push(serde_json::json!({
+                        "category": "join",
+                        "operation": "nested_loop",
+                        "relation": null,
+                        "accessPath": null,
+                        "cost": null,
+                        "rowsEstimate": null,
+                        "width": null,
+                        "extra": null,
+                        "children": arms,
+                    }));
+                    continue;
+                }
+                for item in arr {
+                    children.push(mysql_array_item(item));
+                }
+            }
+            Some(obj @ serde_json::Value::Object(_)) if key == "table" => {
+                children.push(mysql_table_leaf(obj));
+            }
+            Some(obj @ serde_json::Value::Object(_)) => {
+                children.push(mysql_node_of(obj, key));
+            }
+            _ => {}
+        }
+    }
+    let relation = v
+        .get("table_name")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+    let cost = v
+        .get("cost_info")
+        .and_then(|c| c.get("query_cost").or_else(|| c.get("prefix_cost")))
+        .and_then(|n| n.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
+    let category = match operation {
+        "nested_loop" => "join",
+        "grouping_operation" => "aggregate",
+        _ => "other",
+    };
+    json!({
+        "category": category,
+        "operation": operation,
+        "relation": relation,
+        "accessPath": null,
+        "cost": { "startup": null, "total": cost },
+        "rowsEstimate": null,
+        "width": null,
+        "extra": null,
+        "children": children,
+    })
+}
+
+/// 数组元素三态归一：{"table": …} → 叶子；{"query_block": …} → 解包容器；裸容器 → 递归。
+fn mysql_array_item(item: &serde_json::Value) -> serde_json::Value {
+    if let Some(t) = item.get("table") {
+        mysql_table_leaf(t)
+    } else if let Some(qb) = item.get("query_block") {
+        mysql_node_of(qb, "query_block")
+    } else {
+        mysql_node_of(item, "container")
+    }
+}
+
+/// table 叶子：operation=access_type、accessPath=key、rowsEstimate=rows_produced_per_join、
+/// cost.total=prefix_cost（MySQL 给字符串，解析为数值）；extra 收集 used_key_parts/ref/
+/// filtered/attached_condition（存在的才进）。
+fn mysql_table_leaf(t: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+    let str_of = |k: &str| t.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let extra_parts: Vec<String> = [
+        ("used_key_parts", t.get("used_key_parts").and_then(|a| {
+            a.as_array().map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        })),
+        ("ref", t.get("ref").and_then(|a| {
+            a.as_array().map(|xs| {
+                xs.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        })),
+        ("filtered", str_of("filtered")),
+        ("attached_condition", str_of("attached_condition")),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|s| format!("{k}: {s}")))
+    .collect();
+    let extra = if extra_parts.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!(extra_parts.join("\n"))
+    };
+    json!({
+        "category": "scan",
+        "operation": str_of("access_type").unwrap_or_else(|| "table".into()),
+        "relation": str_of("table_name"),
+        "accessPath": str_of("key"),
+        "cost": {
+            "startup": null,
+            "total": t.get("cost_info")
+                .and_then(|c| c.get("prefix_cost"))
+                .and_then(|n| n.as_str())
+                .and_then(|s| s.parse::<f64>().ok()),
+        },
+        "rowsEstimate": t.get("rows_produced_per_join").cloned().unwrap_or(serde_json::Value::Null),
+        "width": null,
+        "extra": extra,
+        "children": [],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -257,5 +431,86 @@ mod tests {
         assert_eq!(scan["category"], "scan");
         assert_eq!(scan["rowsEstimate"], 1111);
         assert_eq!(scan["extra"], "Filter: (val ~~ 'v1%'::text)");
+    }
+
+    // 以下四份样本为 oj-test-mysql 8.4 真机捕获（v0.1.108），字段名/值逐字节保真
+    //（仅裁剪 used_columns/possible_keys 等长数组，不碰结构）。归一规则：
+    // operation=access_type（table 叶）/容器键名（容器）；accessPath=key；
+    // rowsEstimate=rows_produced_per_join（对齐 PG 输出行语义）；cost.total=prefix_cost
+    // （字符串解析）；cost.startup/width MySQL 恒 null。
+    const SAMPLE_SINGLE: &str = r#"{"query_block":{"select_id":1,"cost_info":{"query_cost":"1.00"},"table":{"table_name":"oj_explain_parent","access_type":"const","possible_keys":["PRIMARY"],"key":"PRIMARY","used_key_parts":["id"],"key_length":"4","ref":["const"],"rows_examined_per_scan":1,"rows_produced_per_join":1,"filtered":"100.00","cost_info":{"read_cost":"0.00","eval_cost":"0.10","prefix_cost":"0.00","data_read_per_join":"264"},"used_columns":["id","name"]}}}"#;
+
+    const SAMPLE_JOIN: &str = r#"{"query_block":{"select_id":1,"cost_info":{"query_cost":"200.25"},"nested_loop":[{"table":{"table_name":"p","access_type":"const","possible_keys":["PRIMARY"],"key":"PRIMARY","used_key_parts":["id"],"ref":["const"],"rows_examined_per_scan":1,"rows_produced_per_join":1,"filtered":"100.00","using_index":true,"cost_info":{"prefix_cost":"0.00"},"used_columns":["id"]}},{"table":{"table_name":"c","access_type":"ALL","rows_examined_per_scan":2000,"rows_produced_per_join":200,"filtered":"10.00","cost_info":{"prefix_cost":"200.25"},"used_columns":["id","pid","val"],"attached_condition":"(`ojtest`.`c`.`pid` = 42)"}}]}}"#;
+
+    const SAMPLE_GROUP: &str = r#"{"query_block":{"select_id":1,"cost_info":{"query_cost":"1311.25"},"ordering_operation":{"using_filesort":false,"grouping_operation":{"using_temporary_table":true,"table":{"table_name":"oj_explain_child","access_type":"ALL","rows_examined_per_scan":2000,"rows_produced_per_join":1110,"filtered":"55.55","cost_info":{"prefix_cost":"200.25"},"attached_condition":"(`ojtest`.`oj_explain_child`.`val` like 'v1%')"}}}}}"#;
+
+    const SAMPLE_UNION: &str = r#"{"query_block":{"union_result":{"using_temporary_table":true,"table_name":"<union1,2>","access_type":"ALL","query_specifications":[{"query_block":{"select_id":1,"cost_info":{"query_cost":"1.00"},"table":{"table_name":"oj_explain_parent","access_type":"const","key":"PRIMARY","rows_produced_per_join":1,"filtered":"100.00","cost_info":{"prefix_cost":"0.00"}}}},{"query_block":{"select_id":2,"cost_info":{"query_cost":"1.00"},"table":{"table_name":"oj_explain_child","access_type":"const","key":"PRIMARY","rows_produced_per_join":1,"filtered":"100.00","cost_info":{"prefix_cost":"0.00"}}}}]}}}"#;
+
+    fn mysql_plan(sample: &str) -> serde_json::Value {
+        let outer: serde_json::Value = serde_json::from_str(sample).unwrap();
+        super::normalize_mysql_plan(&outer)
+    }
+
+    #[test]
+    fn mysql_single_table_leaf() {
+        let p = mysql_plan(SAMPLE_SINGLE);
+        assert_eq!(p["operation"], "query_block");
+        assert_eq!(p["category"], "other");
+        assert_eq!(p["cost"]["total"], 1.0);
+        let t = &p["children"][0];
+        assert_eq!(t["category"], "scan");
+        assert_eq!(t["operation"], "const");
+        assert_eq!(t["relation"], "oj_explain_parent");
+        assert_eq!(t["accessPath"], "PRIMARY");
+        assert_eq!(t["rowsEstimate"], 1);
+        assert_eq!(t["cost"], serde_json::json!({"startup": null, "total": 0.0}));
+        assert_eq!(t["width"], serde_json::Value::Null);
+        let extra = t["extra"].as_str().unwrap();
+        assert!(extra.contains("used_key_parts: id"), "{extra}");
+        assert!(extra.contains("filtered: 100.00"), "{extra}");
+    }
+
+    #[test]
+    fn mysql_nested_loop_order_preserved() {
+        let p = mysql_plan(SAMPLE_JOIN);
+        assert_eq!(p["operation"], "query_block");
+        let nl = &p["children"][0];
+        assert_eq!(nl["category"], "join");
+        assert_eq!(nl["operation"], "nested_loop");
+        let c = nl["children"].as_array().unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0]["relation"], "p");
+        assert_eq!(c[0]["accessPath"], "PRIMARY");
+        assert_eq!(c[1]["relation"], "c");
+        assert_eq!(c[1]["operation"], "ALL");
+        assert_eq!(c[1]["rowsEstimate"], 200);
+        assert!(c[1]["extra"].as_str().unwrap().contains("attached_condition"), "{}", c[1]["extra"]);
+    }
+
+    #[test]
+    fn mysql_groupby_container_pierced() {
+        let p = mysql_plan(SAMPLE_GROUP);
+        let ord = &p["children"][0];
+        assert_eq!(ord["operation"], "ordering_operation");
+        let grp = &ord["children"][0];
+        assert_eq!(grp["category"], "aggregate");
+        assert_eq!(grp["operation"], "grouping_operation");
+        let t = &grp["children"][0];
+        assert_eq!(t["relation"], "oj_explain_child");
+        assert_eq!(t["rowsEstimate"], 1110);
+        assert!(t["extra"].as_str().unwrap().contains("attached_condition"));
+    }
+
+    #[test]
+    fn mysql_union_arms_are_children() {
+        let p = mysql_plan(SAMPLE_UNION);
+        let ur = &p["children"][0];
+        assert_eq!(ur["operation"], "union_result");
+        assert_eq!(ur["relation"], "<union1,2>");
+        let arms = ur["children"].as_array().unwrap();
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0]["operation"], "query_block");
+        assert_eq!(arms[0]["children"][0]["relation"], "oj_explain_parent");
+        assert_eq!(arms[1]["children"][0]["relation"], "oj_explain_child");
     }
 }
