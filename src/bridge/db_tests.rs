@@ -30,13 +30,16 @@ use std::sync::Arc;
 /// normalize_and_trace——登记为已知非裸 SQL 出口。
 #[test]
 fn raw_sql_op_exits_are_pinned() {
-    const WHITELIST: [&str; 26] = [
+    const WHITELIST: [&str; 27] = [
         "op_db_allowed",
         "op_db_as_system",
         "op_db_as_tenant",
         "op_db_catalog",
         "op_db_dialect",
         "op_db_exec",
+        // G3（v0.1.108）：经 db_query::query_impl 内 normalize_and_trace 插桩（占位符统一），
+        // 本身不直接触驱动——登记为已插桩出口。
+        "op_db_explain",
         "op_db_has",
         "op_db_list_columns",
         "op_db_list_databases",
@@ -67,7 +70,13 @@ fn raw_sql_op_exits_are_pinned() {
         };
         if !matches!(
             module,
-            "db" | "db_tx" | "db_query" | "db_stream" | "db_introspect" | "db_seq" | "query"
+            "db" | "db_tx"
+                | "db_query"
+                | "db_explain"
+                | "db_stream"
+                | "db_introspect"
+                | "db_seq"
+                | "query"
         ) {
             continue;
         }
@@ -2448,18 +2457,16 @@ async fn client_queries_counter_increments() {
 async fn explain_accepts_bind_params_real_pg_mysql() {
     let mut ran = false;
     for (env, tag, sql) in [
-        (
-            "OJ_TEST_PG",
-            "pg",
-            "EXPLAIN SELECT 1 AS v WHERE 1 = $1",
-        ),
+        ("OJ_TEST_PG", "pg", "EXPLAIN SELECT 1 AS v WHERE 1 = $1"),
         (
             "OJ_TEST_MYSQL",
             "mysql",
             "EXPLAIN FORMAT=JSON SELECT 1 AS v WHERE 1 = ?",
         ),
     ] {
-        let Ok(url) = std::env::var(env) else { continue };
+        let Ok(url) = std::env::var(env) else {
+            continue;
+        };
         if url.is_empty() {
             continue;
         }

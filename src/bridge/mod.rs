@@ -525,6 +525,7 @@ deno_core::extension!(
         db::op_db_as_tenant,
         db_query::op_db_query,
         db_query::op_db_exec,
+        db_explain::op_db_explain,
         db_seq::op_db_next_seq,
         db::op_db_sql_profile,
         db_tx::op_db_tx_begin,

@@ -1493,8 +1493,9 @@ mod tests {
         assert_eq!(risk_of("copy t to '/tmp/x'"), Risk::Write);
         assert_eq!(risk_of("set global max_connections = 1"), Risk::Write);
         assert_eq!(risk_of("set names utf8"), Risk::Unknown, "裸 SET 不猜");
-        // 7) 多语句取最严
+        // 7) 多语句取最严（EXPLAIN 前缀同理：classify 看整句，第二段抬级生效）
         assert_eq!(risk_of("select 1; drop table t"), Risk::Ddl);
+        assert_eq!(risk_of("explain select 1; drop table t"), Risk::Ddl);
         // 8) 引用标识符里的表名不影响分类
         assert_eq!(risk_of("update `t` set a = 1 where id = 1"), Risk::Write);
         assert_eq!(risk_of(r#"update "t" set a = 1 where id = 1"#), Risk::Write);

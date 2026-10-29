@@ -35,6 +35,7 @@ import {
   op_db_query,
   op_db_query_build,
   op_db_query_sql,
+  op_db_explain,
   op_db_dialect,
   op_db_list_tables,
   op_db_list_columns,
@@ -1026,6 +1027,8 @@ globalThis.DB = function (name) {
       // raw SQL + bound params (params optional).
       query: (sql, params, opts) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
       exec: (sql, params, opts) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
+      // G3 (v0.1.108): cross-dialect execution plan, normalized to a single PlanNode tree.
+      explain: (sql, params, opts) => dbOpWrap(op_db_explain(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
       // U-18 task-based export (v0.1.104): returns {taskId} immediately; a Rust
       // consumer task drains the cursor into a blob artifact (csv/jsonl).
       export: (args) => dbOpWrap(op_db_export(name, args)),

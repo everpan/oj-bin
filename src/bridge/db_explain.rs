@@ -13,13 +13,11 @@
 //!    可用。MySQL 维持 FORMAT=JSON（Any 可解，带参可用）。
 //! 3. **参数值绝不内联**：绑定失败是方言能力问题，结构化报错，禁止拼进 SQL 文本。
 
+use deno_core::{OpState, op2};
+
 /// PG 前缀：文本计划（默认格式）。Any 驱动限制见模块头铁律 2。
-// v0.1.108：Task 5 op 接入前暂挂 allow，op 接线后删除。
-#[allow(dead_code)]
 pub(crate) const PG_EXPLAIN_PREFIX: &str = "EXPLAIN ";
 /// MySQL 前缀：JSON 格式，输出列可被 sqlx Any 解码。
-// v0.1.108：Task 5 op 接入前暂挂 allow，op 接线后删除。
-#[allow(dead_code)]
 pub(crate) const MYSQL_EXPLAIN_PREFIX: &str = "EXPLAIN FORMAT=JSON ";
 
 // ---------------------------------------------------------------------------
@@ -31,8 +29,6 @@ pub(crate) const MYSQL_EXPLAIN_PREFIX: &str = "EXPLAIN FORMAT=JSON ";
 // ---------------------------------------------------------------------------
 
 /// 解析 PG 文本计划（EXPLAIN 默认格式）为归一 PlanNode。
-// v0.1.108：Task 5 op 接入前的暂挂 allow（clippy -D warnings 门禁），op 接线后删除。
-#[allow(dead_code)]
 pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
     use serde_json::json;
     // 栈元素：(附属行缩进, 该节点在 out 树中的路径)。用索引栈定位父节点。
@@ -41,9 +37,11 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
     // 首个节点行即根
     let root_line = loop {
         match lines.next() {
-            None => return json!({ "category": "other", "operation": "unknown", "relation": null,
+            None => {
+                return json!({ "category": "other", "operation": "unknown", "relation": null,
                 "accessPath": null, "cost": null, "rowsEstimate": null, "width": null,
-                "extra": null, "children": [] }),
+                "extra": null, "children": [] });
+            }
             Some(l) if !is_trailer_line(l) => break l,
             Some(_) => continue,
         }
@@ -58,7 +56,10 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
         }
         let indent = raw.len() - raw.trim_start().len();
         let body = &raw[indent..];
-        if let Some(content) = body.strip_prefix("->  ").or_else(|| body.strip_prefix("-> ")) {
+        if let Some(content) = body
+            .strip_prefix("->  ")
+            .or_else(|| body.strip_prefix("-> "))
+        {
             // 节点行：弹出比本节点更深的栈帧，父 = 附属行缩进 == indent 的帧
             while stack.last().map(|(ei, _)| *ei) != Some(indent) && !stack.is_empty() {
                 if stack.last().unwrap().0 < indent {
@@ -70,7 +71,10 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
             let node = pg_node_of(content.trim_end());
             // 挂到父路径下
             let parent = node_at_mut(&mut tree, &parent_path);
-            let idx = parent["children"].as_array_mut().map(|a| a.len()).unwrap_or(0);
+            let idx = parent["children"]
+                .as_array_mut()
+                .map(|a| a.len())
+                .unwrap_or(0);
             parent["children"].as_array_mut().unwrap().push(node);
             let mut my_path = parent_path;
             my_path.push(idx);
@@ -95,7 +99,9 @@ pub(crate) fn normalize_pg_text_plan(text: &str) -> serde_json::Value {
 
 fn is_trailer_line(l: &str) -> bool {
     let t = l.trim_start();
-    t.starts_with("Planning Time:") || t.starts_with("Execution Time:") || t.starts_with("Query Identifier:")
+    t.starts_with("Planning Time:")
+        || t.starts_with("Execution Time:")
+        || t.starts_with("Query Identifier:")
 }
 
 /// 按路径取树内节点（路径元素 = 各层 children 下标）。
@@ -197,7 +203,6 @@ fn pg_category(operation: &str) -> &'static str {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // MySQL FORMAT=JSON 归一（真机 oj-test-mysql 8.4 捕获样本钉死，v0.1.108）。
 // 结果外层是 `{ "EXPLAIN": "<json 字符串>" }`（op 层先 from_str 再进本函数）。
@@ -222,8 +227,6 @@ const MYSQL_CONTAINER_KEYS: [&str; 10] = [
 ];
 
 /// 解析 MySQL EXPLAIN FORMAT=JSON（已 serde 解析的 `{query_block: ...}` 根）为归一 PlanNode。
-// v0.1.108：Task 5 op 接入前的暂挂 allow（clippy -D warnings 门禁），op 接线后删除。
-#[allow(dead_code)]
 pub(crate) fn normalize_mysql_plan(explain_json: &serde_json::Value) -> serde_json::Value {
     match explain_json.get("query_block") {
         Some(qb) => mysql_node_of(qb, "query_block"),
@@ -321,22 +324,28 @@ fn mysql_table_leaf(t: &serde_json::Value) -> serde_json::Value {
     use serde_json::json;
     let str_of = |k: &str| t.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let extra_parts: Vec<String> = [
-        ("used_key_parts", t.get("used_key_parts").and_then(|a| {
-            a.as_array().map(|xs| {
-                xs.iter()
-                    .filter_map(|x| x.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-        })),
-        ("ref", t.get("ref").and_then(|a| {
-            a.as_array().map(|xs| {
-                xs.iter()
-                    .filter_map(|x| x.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-        })),
+        (
+            "used_key_parts",
+            t.get("used_key_parts").and_then(|a| {
+                a.as_array().map(|xs| {
+                    xs.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            }),
+        ),
+        (
+            "ref",
+            t.get("ref").and_then(|a| {
+                a.as_array().map(|xs| {
+                    xs.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            }),
+        ),
         ("filtered", str_of("filtered")),
         ("attached_condition", str_of("attached_condition")),
     ]
@@ -365,6 +374,108 @@ fn mysql_table_leaf(t: &serde_json::Value) -> serde_json::Value {
         "extra": extra,
         "children": [],
     })
+}
+
+// ---------------------------------------------------------------------------
+// op 壳：守卫先行 → 方言分派 → query_impl 原函数（同一条通路）→ 归一。
+// ---------------------------------------------------------------------------
+
+/// db.explain(sql, params?, opts?)：Promise<{plan: PlanNode}>。
+/// PG 文本计划多行（每行一节点），逐行拼接后整树解析；MySQL 首行首列为 JSON 字符串。
+#[op2]
+#[serde]
+pub async fn op_db_explain(
+    state: std::rc::Rc<std::cell::RefCell<OpState>>,
+    #[string] name: String,
+    #[string] sql: String,
+    #[serde] params: Option<Vec<serde_json::Value>>,
+    #[serde] opts: Option<super::db_query::DbCallOpts>,
+) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    let params = params.unwrap_or_default();
+    // 守卫先行（与 query_impl 同序）：**剥掉 EXPLAIN 前缀的内层 SQL** 先过租户守卫——
+    // 不剥则首词 = EXPLAIN，Deny 模式的 DML/DDL fail-closed 分派被绕过（评审 M3，
+    // static 钉死见 tests::explain_inner_sql_passes_tenant_guard_deny）。
+    super::guard::check_tenant_raw(&state, inner_sql_of(&sql), &params)?;
+    let da = super::query::lookup(&state, &name)?;
+    let dialect = da.dialect_info().name.clone();
+    let prefix = match dialect.as_str() {
+        "postgres" => PG_EXPLAIN_PREFIX,
+        "mysql" => MYSQL_EXPLAIN_PREFIX,
+        other => {
+            return Err(super::db::to_js_err(Box::new(
+                super::db_error::unsupported(other, "explain"),
+            )));
+        }
+    };
+    let rows = super::db_query::query_impl(
+        state,
+        name,
+        format!("{prefix}{sql}"),
+        params,
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .await?;
+    // 首行首列按位置取（按名取 QUERY PLAN/EXPLAIN 有版本风险）。
+    let cell = |r: &serde_json::Value| {
+        r.as_object()
+            .and_then(|m| m.values().next())
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let plan = match dialect.as_str() {
+        "postgres" => {
+            // 文本计划多行：全部行的首列拼回整树（节点行 + 附属行 + 尾部统计行）。
+            let mut text = String::new();
+            for r in &rows {
+                if let Some(s) = cell(r) {
+                    text.push_str(&s);
+                    text.push('\n');
+                }
+            }
+            normalize_pg_text_plan(&text)
+        }
+        _ => {
+            let raw = rows
+                .first()
+                .and_then(|r| r.as_object())
+                .and_then(|m| m.values().next().cloned())
+                .ok_or_else(|| deno_error::JsErrorBox::generic("explain: empty result"))?;
+            let v: serde_json::Value = match &raw {
+                serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
+                    deno_error::JsErrorBox::generic(format!("explain: bad plan json: {e}"))
+                })?,
+                other => other.clone(),
+            };
+            normalize_mysql_plan(&v)
+        }
+    };
+    Ok(serde_json::json!({ "plan": plan }))
+}
+
+/// 剥 EXPLAIN 前缀，返回内层语句（租户守卫/风险语义都应以它为准）。
+/// 覆盖两种宿主前缀形态：`EXPLAIN `（PG 文本）与 `EXPLAIN FORMAT=JSON `（MySQL），
+/// 以及 PG 选项子句 `EXPLAIN (...) ...`。剥不掉的输入原样返回（守卫看到 EXPLAIN
+/// 首词 = 传统只读路径，与 db.query 的口径一致）。
+fn inner_sql_of(sql: &str) -> &str {
+    let t = sql.trim_start();
+    let low = t.to_ascii_lowercase();
+    if !low.starts_with("explain") {
+        return sql;
+    }
+    let rest_t = t["explain".len()..].trim_start();
+    if let Some(after) = rest_t.strip_prefix('(') {
+        if let Some(end) = after.find(')') {
+            return after[end + 1..].trim_start();
+        }
+    }
+    let low2 = rest_t.to_ascii_lowercase();
+    for opt in ["format=json", "format=traditional", "format=tree"] {
+        if let Some(after) = low2.strip_prefix(opt) {
+            // 按字节长度切回原串（rest_t 与 low2 等长，ASCII 前缀安全）。
+            return rest_t[after.len()..].trim_start();
+        }
+    }
+    rest_t
 }
 
 #[cfg(test)]
@@ -463,7 +574,10 @@ mod tests {
         assert_eq!(t["relation"], "oj_explain_parent");
         assert_eq!(t["accessPath"], "PRIMARY");
         assert_eq!(t["rowsEstimate"], 1);
-        assert_eq!(t["cost"], serde_json::json!({"startup": null, "total": 0.0}));
+        assert_eq!(
+            t["cost"],
+            serde_json::json!({"startup": null, "total": 0.0})
+        );
         assert_eq!(t["width"], serde_json::Value::Null);
         let extra = t["extra"].as_str().unwrap();
         assert!(extra.contains("used_key_parts: id"), "{extra}");
@@ -484,7 +598,14 @@ mod tests {
         assert_eq!(c[1]["relation"], "c");
         assert_eq!(c[1]["operation"], "ALL");
         assert_eq!(c[1]["rowsEstimate"], 200);
-        assert!(c[1]["extra"].as_str().unwrap().contains("attached_condition"), "{}", c[1]["extra"]);
+        assert!(
+            c[1]["extra"]
+                .as_str()
+                .unwrap()
+                .contains("attached_condition"),
+            "{}",
+            c[1]["extra"]
+        );
     }
 
     #[test]
@@ -499,6 +620,82 @@ mod tests {
         assert_eq!(t["relation"], "oj_explain_child");
         assert_eq!(t["rowsEstimate"], 1110);
         assert!(t["extra"].as_str().unwrap().contains("attached_condition"));
+    }
+
+    // ---- op 层（Task 5）：bridge 级行为 ----
+
+    async fn sqlite_bridge(extra: Option<crate::bridge::Extras>) -> crate::bridge::Bridge {
+        let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::bridge::Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            std::sync::Arc::new(crate::bridge::InMemoryKV::new()),
+            crate::bridge::SchemaRegistry::new(),
+            false,
+            None,
+            extra.unwrap_or_default(),
+        )
+    }
+
+    async fn run_explain_js(
+        b: &crate::bridge::Bridge,
+        req: crate::bridge::RequestInfo,
+        inner: &str,
+    ) -> serde_json::Value {
+        let js = format!(
+            r#"(async () => {{
+                 try {{
+                   const r = await db.explain({inner});
+                   json.ok({{ ok: true, plan: r.plan }});
+                 }} catch (e) {{
+                   json.ok({{ ok: false, code: e.code,
+                             capability: e.data && e.data.capability, msg: String(e) }});
+                 }}
+               }})().catch(e => json.fail(500, String(e)))"#
+        );
+        let cap = b.run_with(&js, req).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        v["data"].clone()
+    }
+
+    /// sqlite（及未知方言）：结构化 OJ_DB_UNSUPPORTED，capability=explain，不回落不 panic。
+    #[tokio::test(flavor = "current_thread")]
+    async fn explain_sqlite_reports_structured_unsupported() {
+        let b = sqlite_bridge(None).await;
+        let d = run_explain_js(&b, crate::bridge::RequestInfo::default(), r#""select 1""#).await;
+        assert_eq!(d["ok"], false, "{d}");
+        assert_eq!(d["code"], "OJ_DB_UNSUPPORTED", "{d}");
+        assert_eq!(d["capability"], "explain", "{d}");
+    }
+
+    /// Deny 租户守卫：EXPLAIN 前缀会绕过首词 fail-closed 分派——内层 SQL 必须先过
+    /// check_tenant_raw。`EXPLAIN UPDATE <未注册表>` 必须被拒（且先于方言能力判断）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn explain_inner_sql_passes_tenant_guard_deny() {
+        let b = sqlite_bridge(Some(crate::bridge::Extras {
+            sql_guard: crate::bridge::SqlGuard::Deny,
+            ..Default::default()
+        }))
+        .await;
+        let req = crate::bridge::RequestInfo {
+            tenant_id: Some("t1".into()),
+            ..Default::default()
+        };
+        let d = run_explain_js(&b, req, r#""EXPLAIN UPDATE u SET x = 1""#).await;
+        assert_eq!(
+            d["ok"], false,
+            "Deny 下未注册表的 EXPLAIN UPDATE 必须被拒: {d}"
+        );
+        assert!(
+            d["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("tenant"),
+            "拒绝须来自租户守卫: {d}"
+        );
     }
 
     #[test]
