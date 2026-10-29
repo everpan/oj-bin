@@ -99,12 +99,12 @@ PlanNode = {
 | relkind | 对象 | 路由 |
 |---|---|---|
 | 'v' / 'm' | 视图 / 物化视图 | 既有 `pg_get_viewdef` 路径，**输出逐字节保持已发布行为** |
-| 'r' / 'p' | 表 / 分区表 | 拼接器（'p' 附 `pg_get_partkeydef`，best-effort） |
+| 'r' / 'p' | 表 / 分区表 | 拼接器（'p' 附 `pg_get_partkeydef`，best-effort） |（✅ v0.1.109 终审已落地：PARTITION BY 随 ddl 产出，子分区不产出）
 | 其余（'f'/'i'/'S'/'c'/'t'） | 外部表等 | `items: []`，**绝不落拼接器**（假 DDL 比空结果更糟） |
 
 静态守卫 + 单测矩阵钉死上表；不存在的表名 → `items: []`。
 
-拼接器 = 探测 + 4 条查询（Pool 臂各取连接，**整体包一个 deadline**——REQ-05 接线是逐调用点的，catalog 通路现状为零接线，绝不允许 4 条慢查询拖死池槽位）：
+拼接器 = 探测 + 4 条查询（Pool 臂各取连接，**整体包一个 deadline**——REQ-05 接线是逐调用点的，catalog 通路现状为零接线，绝不允许 4 条慢查询拖死池槽位；实施为 6 常量：列/约束/索引/列注释/表注释拆分/partkey，见 feedback B-表#4）：
 
 1. **列**（新常量，**进 introspect.rs + 守卫遍历**）：`pg_attribute` 必须 `attnum > 0 AND NOT attisdropped`（dropped 列是 `........pg.dropped.N........` 占位行）；取 `format_type` / not_null / default / is_pk / **`attidentity`** / **`attgenerated`**（`pg_get_expr(adbin, adrelid)` 渲染 `GENERATED ALWAYS AS (expr) STORED`）。
 2. **约束**（新常量）：`pg_constraint` `contype IN ('p','u','c','f','x')` + `pg_get_constraintdef(oid)`（**含排他约束 'x'**，重放丢约束违反不静默口径）；拼接 `ADD CONSTRAINT "name" <definition>`——**定义文本不含约束名，名字要方言引号**。注：PG18 把 NOT NULL 收编为 contype='n'，届时两路径口径差一行注释。
@@ -126,6 +126,11 @@ db.ddlDiff({
   to: Structure
 }): {
   diff: {                     // 结构化 diff——PR-9 比较视图直接渲染它，statements 供执行
+    // ⚠️ 实施校正（v0.1.109 发布裁决，详见同目录 feedback 文档 B1）：实际发布为**嵌套**形状——
+    // diff.<dim>.{added, removed, changed[]}（dim ∈ columns/constraints/indexes/foreignKeys；
+    // changed 条目 { name, field, from, to }，field: nativeType/nullable/default/identity/
+    // comment/position + 具名维度的 type/definition/unique/columns/refTable）。
+    // 本节扁平键草图（addedColumns/…）为早期示意，勿据其实现。
     addedColumns: [...], removedColumns: [...],
     changedColumns: [{ name, field, from, to }],   // field: nativeType/nullable/default/identity/comment/position
     addedConstraints/removedConstraints/changedConstraints: [...],
