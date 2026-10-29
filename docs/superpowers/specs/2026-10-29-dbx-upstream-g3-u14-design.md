@@ -71,20 +71,17 @@ PlanNode = {
 
 `op_db_explain` = 校验方言 → **对剥掉前缀的内层 SQL 显式过一遍 `check_tenant_raw`**（Deny 模式下 `EXPLAIN UPDATE <未注册表>` 必须拒，否则首词分派被 EXPLAIN 前缀绕过 fail-closed 分支）→ `format!("{EXPLAIN_PREFIX}{sql}")` 直接调 **`query_impl` 原函数**（守卫/配额/trace/session 行为零新代码、零漂移面；Pool 臂天然继承 race_statement + ByteMeter，Tx 臂按 db_query 成文裁决无语句超时——限制表登记 api-manual）→ 取**首行首列**（按名取 `QUERY PLAN`/`EXPLAIN` 有版本风险）→ 归一纯函数。
 
-- PG 前缀：`EXPLAIN (FORMAT JSON) `；结果 `[0].Plan` 递归 `Plans`（CTE/SubPlan/ModifyTable 全覆盖）。
-- MySQL 前缀：`EXPLAIN FORMAT=JSON `；归一器是**递归下降任意容器键**的通用 walker（`nested_loop` / `grouping_operation` / `duplicates_removal` / `ordering_operation` / `union_result.query_specifications[]` / `materialized_from_subquery` / update·delete 标志），叶子是 `table` 节点——**禁止 nested_loop 特判**。
+- PG 前缀：`EXPLAIN `（**文本计划**）。真机实测（v0.1.108 契约实验，oj-test-postgres 16）：`EXPLAIN (FORMAT JSON)` 输出 json 类型列，sqlx Any 驱动不解（`PgTypeInfo(Json)`，有无参数同炸）；文本格式绑定参数可用 → PG 归一输入 = 文本计划的缩进树，由 Rust 解析器 `normalize_pg_text_plan` 转 PlanNode（extra 收 Index Cond/Filter/Hash Cond 等缩进附属行）。
+- MySQL 前缀：`EXPLAIN FORMAT=JSON `（真机实测带参可用）。归一器是**递归下降任意容器键**的通用 walker（`nested_loop` / `grouping_operation` / `duplicates_removal` / `ordering_operation` / `union_result.query_specifications[]` / `materialized_from_subquery` / update·delete 标志），叶子是 `table` 节点——**禁止 nested_loop 特判**。
 - 授权语义如实表述：「explain 不获得执行能力；副作用维与真跑等价（非 ANALYZE 零执行），风险维按 EXPLAIN 归 ReadOnly 放宽」——**不承诺「能 explain ⊆ 能真跑」**（read_only 下 EXPLAIN UPDATE 可 explain 不可跑）。
 
-### 契约裁决点（写代码前先做真库实验）
+### 契约裁决点（已完成：v0.1.108 真机实验）
 
-MySQL 带参 `EXPLAIN FORMAT=JSON ... WHERE pk = ?` 的可预备性按版本有坑（sqlx 恒走 COM_STMT_PREPARE 二进制协议；8.0.46 实测可 prepare，但 `?` 在被解释语句内这一形态无权威确认）。**v0.1.108 第一步 = OJ_TEST_PG / OJ_TEST_MYSQL 真机实验**：
-- 成功 → 按上表契约实现；
-- MySQL 失败 → params 非空 × MySQL 结构化报错（点名最低版本要求），params 空不受影响；**绝不内联参数值**。
-- env-gated 腿首要断言即带参 explain；发布前真机跑通并登记结果（CI 无服务容器，恒 skip——惯例：诚实登记）。
+**结论（oj-test-postgres 16 / oj-test-mysql 8.4 实测）**：带参 EXPLAIN 两方言均可用——PG 需 `$n` 原生占位（op 通路由 normalize_and_trace 做 `?` → `$n`），MySQL `?` 直接可用；预写「params×mysql 结构化回落」**不启用**。另实测发现：PG `EXPLAIN (FORMAT JSON)` 的 json 输出列 sqlx Any 驱动不解（有/无参数同样报错）→ PG 归一输入定为文本计划（见上节）。env-gated 腿发布前真机跑通并登记结果（CI 无服务容器恒 skip——惯例：诚实登记）。
 
 ### 测试
 
-- 静态守卫：PG 前缀常量含 `FORMAT JSON` 且不含 `ANALYZE`；MySQL 前缀常量含 `FORMAT=JSON`。
+- 静态守卫：PG 前缀不含 `ANALYZE`（文本格式）；MySQL 前缀常量含 `FORMAT=JSON` 且不含 `ANALYZE`；两者以空格结尾。
 - 单测样本快照：PG 索引扫描（含 Filter/Index Cond → extra）；MySQL **单表扫描 + UNION + GROUP BY 三种**（容器 walker 钉死）+ nested_loop 样本。
 - 守卫链：Deny 模式下 `EXPLAIN UPDATE <未注册表>` → 拒（钉死内层租户检查）。
 - env-gated 真库腿：PG / MySQL 带参 `EXPLAIN SELECT ... WHERE pk = ?` 断言 operation/relation/cost 非空、children 为数组。
