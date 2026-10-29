@@ -169,19 +169,18 @@ fn raw_pattern_for(table: &RouteTable, oa_path: &str, method: &str) -> Option<St
 /// path 模板填充：单段参数 encodeURIComponent（值含 `/` 将正确 miss），
 /// catch-all `{*name}` 原样插入（其中的 `/` 是真实分隔符）。
 fn fill_path(raw_pattern: &str, args: Option<&Map<String, Value>>) -> Option<String> {
-    let args = args?;
     let mut out = String::new();
     for seg in raw_pattern.split('/').filter(|s| !s.is_empty()) {
         out.push('/');
         if let Some(name) = seg.strip_prefix("{*").and_then(|s| s.strip_suffix('}')) {
-            let v = args.get(name)?;
+            let v = args?.get(name)?;
             out.push_str(
                 &v.as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| v.to_string()),
             );
         } else if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            let v = args.get(name)?;
+            let v = args?.get(name)?;
             out.push_str(&enc(&v
                 .as_str()
                 .map(str::to_string)
@@ -650,6 +649,21 @@ mod tests {
     fn fill_path_missing_arg_is_none() {
         assert!(fill_path("/v1/api/user/{id}", Some(&Map::new())).is_none());
         assert!(fill_path("/v1/api/user/{id}", None).is_none());
+    }
+
+    // Given 无参数模板（e2e 抓出的回归：曾把缺省 path 对象一律判 -32602）
+    // Then None 参数合法，原样返回
+    #[test]
+    fn fill_path_paramless_needs_no_args() {
+        // 尾斜杠由 routes::normalize 收敛，fill_path 不保证保留。
+        assert_eq!(
+            fill_path("/v1/api/user/account/", None).unwrap(),
+            "/v1/api/user/account"
+        );
+        assert_eq!(
+            fill_path("/v1/api/user/account/", Some(&Map::new())).unwrap(),
+            "/v1/api/user/account"
+        );
     }
 
     // ---- R3/R6：结果映射 ----

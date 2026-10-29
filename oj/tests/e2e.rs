@@ -41,6 +41,15 @@ fn sample() -> PathBuf {
 }
 
 async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
+    boot_inner(dev, |_| {}).await.unwrap()
+}
+
+/// boot 的可调变体：tweak 在装配前修改 config（MCP/RPC 端点门控等用例用）。
+/// 返回 Result 供「装配期 fail-fast」用例直接断言 Err。
+async fn boot_inner(
+    dev: bool,
+    tweak: impl FnOnce(&mut Config),
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>, PathBuf), String> {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // config_dir = sample 项目根（loader 的 project_root 钳制要求 api 在根内）；
@@ -84,6 +93,7 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
 
         ..Default::default()
     });
+    tweak(&mut cfg);
     // 证书必配（无逃生口）：启动需真实签名证书，随测试临时目录生成（有效期 1 年）。
     let n = serve::test_support::now_secs();
     serve::test_support::write_cert_into(
@@ -113,23 +123,21 @@ async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, 
         .unwrap();
         dist
     };
-    let (addr, h) = {
-        // release 语义（README 部署故事）：build 后先 `oj migrate` 再 server——
-        // release verify 门禁要求账本与产物齐平，空库首启必须先显式迁移。
-        if !dev {
-            let acc = only_js::bridge::DbBackendRegistry::builtin()
-                .connect(cfg.db.get("default").unwrap(), &root)
-                .await
-                .unwrap();
-            oj::migrate::apply_all(Some(&acc), &dir, false, false, None)
-                .await
-                .unwrap();
-        }
-        serve_cmd::start(cfg, &root, dir, "/v1/api".into())
+    // release 语义（README 部署故事）：build 后先 `oj migrate` 再 server——
+    // release verify 门禁要求账本与产物齐平，空库首启必须先显式迁移。
+    if !dev {
+        let acc = only_js::bridge::DbBackendRegistry::builtin()
+            .connect(cfg.db.get("default").unwrap(), &root)
             .await
-            .unwrap()
-    };
-    (addr, h, tmp)
+            .unwrap();
+        oj::migrate::apply_all(Some(&acc), &dir, false, false, None)
+            .await
+            .unwrap();
+    }
+    serve_cmd::start(cfg, &root, dir, "/v1/api".into())
+        .await
+        .map_err(|e| e.to_string())
+        .map(|(addr, h)| (addr, h, tmp))
 }
 
 async fn req(
@@ -2799,4 +2807,229 @@ async fn http_module_frozen_enforced_through_serve_stack() {
         "strict 写冻结对象应经 500 信封回传 TypeError：{v}"
     );
     let _ = std::fs::remove_dir_all(&t);
+}
+
+// ── MCP / 裸 JSON-RPC 端点（spec 2026-10-30，R5/R7/R8/R9）──────────────────
+
+/// MCP/JSON-RPC 端点请求辅助：406 门拒绝 reqwest 默认的 `Accept: */*`，必须显式声明。
+async fn rpc_req(addr: std::net::SocketAddr, path: &str, body: &str) -> (u16, serde_json::Value) {
+    let c = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let resp = c
+        .post(format!("http://{addr}{path}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap())
+}
+
+/// Given server.mcp 未配置 When POST {base}/mcp Then 404（tool 面默认不外露，R8）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_disabled_gate_404() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    let (s, _v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(s, 404);
+}
+
+/// Given mcp.enabled=true、无 auth 插件、allow_anonymous=false When start
+/// Then 装配期 fail-fast（R7：绝不静默暴露匿名 catalog）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_enabled_without_auth_fails_startup() {
+    let _g = lock();
+    let err = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            ..Default::default()
+        });
+    })
+    .await
+    .unwrap_err();
+    assert!(err.contains("server.mcp"), "{err}");
+}
+
+/// Given allow_anonymous=true When initialize → tools/list → tools/call
+/// Then 协商回显 + capabilities/serverInfo 齐备 + 已知 tool 在列 +
+/// call 成功为 content+structuredContent（无 isError）；未知 tool 为 -32601。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_full_flow() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            modules: None,
+        });
+    })
+    .await
+    .unwrap();
+    // initialize：协议协商 + 能力声明（严格客户端凭 capabilities 发 tools/list）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+    assert!(v["result"]["capabilities"]["tools"].is_object(), "{v}");
+    assert!(v["result"]["serverInfo"]["name"].is_string(), "{v}");
+    // tools/list：sample 的 user/account 路由必须出现在 catalog。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let tools = v["result"]["tools"].as_array().expect("tools 数组：{v}");
+    let get_tool = tools
+        .iter()
+        .find(|t| t["name"].as_str().unwrap_or("").contains("user_account"))
+        .unwrap_or_else(|| panic!("catalog 缺 user_account 系 tool：{v}"));
+    // tools/call：query 参数（字符串值）直透 envelope data。
+    let name = get_tool["name"].as_str().unwrap();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"{name}","arguments":{{"query":{{"id":"1"}}}}}}}}"#
+    );
+    let (s, v) = rpc_req(addr, "/v1/api/mcp", &call).await;
+    assert_eq!(s, 200, "{v}");
+    let r = &v["result"];
+    assert!(r.get("isError").is_none(), "成功不应带 isError：{v}");
+    assert_eq!(r["content"][0]["type"], "text");
+    assert!(
+        r["structuredContent"].is_array() || r["structuredContent"].is_object(),
+        "{v}"
+    );
+    // 未知 tool：JSON-RPC 方法级错误（-32601），不是 isError。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["error"]["code"], -32601, "{v}");
+}
+
+/// Given 业务 handler 返回 code!=0（POST 缺 name → 400 信封）
+/// When tools/call Then HTTP 200 + isError:true + 业务 msg（R3：非 JSON-RPC error）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_business_error_is_iserror_result() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            modules: None,
+        });
+    })
+    .await
+    .unwrap();
+    // 先取 user_account 系 POST tool 的真实净化名。
+    let (_s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    let tools = v["result"]["tools"].as_array().unwrap();
+    // POST tool：非只读（GET 带 readOnlyHint）。
+    let post_tool = tools
+        .iter()
+        .find(|t| {
+            t["name"].as_str().unwrap_or("").contains("user_account")
+                && t["annotations"].get("readOnlyHint").is_none()
+        })
+        .unwrap_or_else(|| panic!("无 user_account 写 tool：{v}"));
+    let name = post_tool["name"].as_str().unwrap();
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{name}","arguments":{{"body":{{}}}}}}}}"#
+    );
+    let (s, v) = rpc_req(addr, "/v1/api/mcp", &call).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("name"), "业务 msg 应透传：{v}");
+}
+
+/// Given modules 白名单与任何模块都不匹配 When tools/list Then 空列表
+///（R9 fail-closed：绝不回落全集）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_modules_whitelist_fail_closed() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            modules: Some(vec!["no_such_module".into()]),
+        });
+    })
+    .await
+    .unwrap();
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 0, "{v}");
+}
+
+/// Given server.rpc.enabled=true When POST {base}/rpc（method=operationId）
+/// Then 裸 JSON-RPC result 直透 envelope data；业务错误为 error 对象（取业务 code）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_rpc_parity() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.rpc.enabled = true;
+    })
+    .await
+    .unwrap();
+    // GET 成功：result = envelope.data（list 数组）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/rpc",
+        r#"{"jsonrpc":"2.0","id":1,"method":"user_account_get","params":{"query":{"id":"1"}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["result"].is_array() || v["result"].is_object(), "{v}");
+    // 业务错误（POST 缺 name → 400 信封）：error 对象，code = 业务 code。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/rpc",
+        r#"{"jsonrpc":"2.0","id":2,"method":"user_account_post","params":{"body":{}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_ne!(v["error"]["code"], 0, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("name"),
+        "{v}"
+    );
+    // 未开门时 404（默认 off）。
+    let (addr2, _h2, _t2) = boot(true).await;
+    let (s, _v) = rpc_req(
+        addr2,
+        "/v1/api/rpc",
+        r#"{"jsonrpc":"2.0","id":1,"method":"user_account_get","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 404);
 }
