@@ -463,10 +463,10 @@ fn inner_sql_of(sql: &str) -> &str {
         return sql;
     }
     let rest_t = t["explain".len()..].trim_start();
-    if let Some(after) = rest_t.strip_prefix('(') {
-        if let Some(end) = after.find(')') {
-            return after[end + 1..].trim_start();
-        }
+    if let Some(after) = rest_t.strip_prefix('(')
+        && let Some(end) = after.find(')')
+    {
+        return after[end + 1..].trim_start();
     }
     let low2 = rest_t.to_ascii_lowercase();
     for opt in ["format=json", "format=traditional", "format=tree"] {
