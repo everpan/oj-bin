@@ -2247,6 +2247,70 @@ mod behavior {
         assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
     }
 
+    /// REQ-05 Q5：构造器路径同闸。Given max_result_bytes=20 + 两行 ~15 字节，When
+    /// db.table().select().all()，Then fail 档 OJ_DB_CAPACITY / truncate 档部分行 + 信令。
+    #[tokio::test(flavor = "current_thread")]
+    async fn builder_path_applies_max_result_bytes() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let reg = SchemaRegistry::new().table("t", &["id"], &["id"]);
+        // fail 档（缺省）
+        let b = bridge_with(
+            db.clone(),
+            reg.clone(),
+            DbAccessSection {
+                defaults: DbAccess {
+                    max_result_bytes: Some(20),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+        let js = r#"(async () => {
+            try {
+              const r = await db.table("t").select(["id"]).orderBy([{field:"id",dir:"asc"}]).all();
+              json.ok({n: r.length});
+            } catch (e) { json.ok({code: e.code}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+        // truncate 档
+        let b = bridge_with(
+            db,
+            reg,
+            DbAccessSection {
+                defaults: DbAccess {
+                    max_result_bytes: Some(20),
+                    on_exceed: Some(OnExceed::Truncate),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+        let cap = b.run_with(js, RequestInfo::default()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], json!(1), "{v}");
+        assert!(
+            cap.headers
+                .iter()
+                .any(|(k, _)| k == "X-OJ-Result-Truncated"),
+            "构造器 truncate 必须打信令头：{:?}",
+            cap.headers
+        );
+    }
+
     /// `stream` 达 `max_rows` → 提前 done（不是截断：真省后端拉取）。
     #[tokio::test(flavor = "current_thread")]
     async fn stream_stops_early_at_max_rows() {

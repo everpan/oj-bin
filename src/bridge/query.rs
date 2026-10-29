@@ -2190,9 +2190,16 @@ impl Exec<'_> {
     /// 错误保持 `BridgeResult`（`Box<dyn Error>`）形态，**不得**在此 `to_string()` 压平：
     /// 压平会丢掉 ffi 侧的结构化信封（code/data/category/retryable），builder 路径
     /// 就退化成 generic 文案（T12 审查 blocker）。
-    async fn query(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Value>> {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[Value],
+        meter: &mut super::db_quota::ByteMeter,
+    ) -> BridgeResult<Vec<Value>> {
         match self {
-            Exec::Pool(da) => da.query_with_params(sql, params).await,
+            // REQ-05：pool 臂走字节计量拉取（触顶早停由 accessor 实现决定）；
+            // tx 臂不计量（REQ 只列 query/stream/构造器三路径的 pool 形态）。
+            Exec::Pool(da) => da.query_with_params_metered(sql, params, meter).await,
             Exec::Tx(s) => s.query(sql, params).await,
         }
     }
@@ -2300,9 +2307,26 @@ pub async fn op_db_query_build(
     };
     let in_tx = matches!(&target, super::db::Target::Tx(_));
     let db_name = req.db.clone();
+    // REQ-05：构造器路径的语句超时（只吃配置侧——裁决：per-call opts 只给裸 SQL 面）
+    // 与行级字节计量。tx 臂不叠语句超时（与 db.tx 同口径，连接状态不可知）。
+    let quota = super::db_policy::quota_for(&state, &alias);
+    let timeout_ms = super::db_quota::effective_timeout_ms(quota.statement_timeout_ms, None)
+        .map_err(JsErrorBox::from)?;
+    let mut meter = super::db_quota::ByteMeter::new(quota.max_result_bytes, quota.on_exceed);
+    let (arm_timeout, cancelled) = match &ex {
+        Exec::Pool(da) => (timeout_ms, da.server_cancel_on_abandon()),
+        Exec::Tx(_) => (None, false),
+    };
     let start = std::time::Instant::now();
     let mut out = if route == ExecRoute::Rows {
-        match ex.query(&sql, &params).await {
+        match super::db_quota::race_statement(
+            ex.query(&sql, &params, &mut meter),
+            &alias,
+            arm_timeout,
+            cancelled,
+        )
+        .await
+        {
             Ok(r) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
@@ -2343,17 +2367,28 @@ pub async fn op_db_query_build(
             }
         }
     } else if route == ExecRoute::LastId {
-        match ex.exec(&sql, &params).await {
+        match super::db_quota::race_statement(
+            ex.exec(&sql, &params),
+            &alias,
+            arm_timeout,
+            cancelled,
+        )
+        .await
+        {
             Ok(_) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state, &sql, &params, &db_name, in_tx, ms, None, true, None, None, None,
                 );
                 // mysql 无 RETURNING：再发一次 LAST_INSERT_ID 取回自增主键。
-                let r = ex
-                    .query("SELECT LAST_INSERT_ID() AS id", &[])
-                    .await
-                    .map_err(err)?;
+                let r = super::db_quota::race_statement(
+                    ex.query("SELECT LAST_INSERT_ID() AS id", &[], &mut meter),
+                    &alias,
+                    arm_timeout,
+                    cancelled,
+                )
+                .await
+                .map_err(err)?;
                 let ms2 = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
                     &state,
@@ -2400,7 +2435,14 @@ pub async fn op_db_query_build(
             }
         }
     } else {
-        match ex.exec(&sql, &params).await {
+        match super::db_quota::race_statement(
+            ex.exec(&sql, &params),
+            &alias,
+            arm_timeout,
+            cancelled,
+        )
+        .await
+        {
             Ok(n) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 super::db::trace_sql(
@@ -2441,6 +2483,26 @@ pub async fn op_db_query_build(
             }
         }
     };
+    // REQ-05：字节触顶分档（同 raw 路径口径）——fail → 结构化 OJ_DB_CAPACITY；
+    // truncate → 交付已取行 + X-OJ-Result-Truncated 信令。查询本身已失败时原错误优先。
+    if meter.exceeded && out.is_ok() {
+        match quota.on_exceed {
+            super::db_policy::OnExceed::Fail => {
+                return Err(JsErrorBox::from(super::db_quota::result_too_large_error(
+                    &alias,
+                    quota.max_result_bytes.unwrap_or(0),
+                    meter.counted,
+                )));
+            }
+            super::db_policy::OnExceed::Truncate => {
+                state
+                    .borrow_mut()
+                    .borrow_mut::<super::ReqState>()
+                    .headers
+                    .push(("X-OJ-Result-Truncated".into(), meter.counted.to_string()));
+            }
+        }
+    }
     // 出口护栏（见 jsnum）：行/合成行/受影响行数里的超界整数降十进制字符串，防 JS 侧 BigInt。
     if let Ok(v) = out.as_mut() {
         super::jsnum::sanitize_js_numbers(v);
