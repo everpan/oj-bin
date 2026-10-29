@@ -4154,3 +4154,58 @@ mysql 出 `SHOW CREATE TABLE`。`ddlDiff` 加一列 → `statements` 尾段一�
 | 事务里重放 ddlDiff 语句 | MySQL DDL 隐式提交断事务；走 `db.exec` + `allow_ddl`，逐条执行 |
 | pg 跨库重放报 `relation "ix_x" already exists` | 索引名同 schema 唯一——重放前自行换索引名（生成器不管这个） |
 | 老引擎上 `db.ddlDiff` TypeError | v0.1.109 才有；跨版本先探 `typeof db.ddlDiff === "function"`（与 explain 同款） |
+
+## 场景 58：给 agent 开接口——MCP 双线路（v0.1.110）
+
+让 Claude / Cursor 等 agent 直接调 oj 接口。两条线路共享同一份 tool 定义
+（OpenAPI 链），按分发场景选：
+
+**线路 B（推荐，服务在线时）**：serve 内建端点，路由变更自动反映。
+
+```yaml
+# config.yaml
+server:
+  mcp: { enabled: true }        # {base}/mcp（streamable HTTP MCP）
+  rpc: { enabled: true }        # {base}/rpc（裸 JSON-RPC 2.0，可选）
+```
+
+```bash
+# MCP client 直接配 URL（Claude Code / Cursor 的 remote server 形态）
+# url: http://<host>:9778/v1/api/mcp    headers: Authorization: Bearer <jwt>
+```
+
+**线路 A（服务在别处 / 要给第三方文件）**：离线生成零依赖 stdio server。
+
+```bash
+./bin/oj mcp -c config.yaml -d src -o mcp/mcp-server.js
+OJ_BASE=http://localhost:9778 OJ_TOKEN=<jwt> node mcp/mcp-server.js
+```
+
+```json
+{ "mcpServers": { "oj": { "command": "node", "args": ["mcp/mcp-server.js"],
+  "env": { "OJ_BASE": "http://localhost:9778", "OJ_TOKEN": "<jwt>" } } } }
+```
+
+裸 JSON-RPC（无 MCP client 的脚本环境）：
+
+```bash
+curl -s http://localhost:9778/v1/api/rpc -H 'content-type: application/json' \
+  -H 'accept: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"user_account_get","params":{"query":{"id":"1"}}}'
+# → {"jsonrpc":"2.0","id":1,"result":[...]}        # 成功：result = 信封 data
+curl -s http://localhost:9778/v1/api/rpc -H 'content-type: application/json' -d \
+  '{"jsonrpc":"2.0","id":2,"method":"user_account_post","params":{"body":{}}}'
+# → {"jsonrpc":"2.0","id":2,"error":{"code":400,"message":"name required"}}
+#   业务错误 = JSON-RPC error 对象（code 取业务码；MCP 侧则是 isError:true）
+```
+
+| 坑 | 解 |
+|---|---|
+| 启动 fail-fast：`server.mcp.enabled requires an auth plugin` | `mcp.enabled`/`rpc.enabled` 但无 `auth:` 段——装 oj-auth 配 `auth:`，或显式对应 `allow_anonymous: true`（仅内网演示；`sample/` 故意不带） |
+| `tools/list` 空 | `server.mcp.modules` 白名单 fail-closed（无交集 = 空 catalog，不回落全集）——核对模块名 |
+| 直接 `curl {base}/mcp` 吃 406 | 须显式 `Accept: application/json`（`*/*` 被拒） |
+| agent 把写接口当只读直接调 | GET tool 带 `readOnlyHint`——写操作别注册成 GET；DELETE 自动带 `destructiveHint` 走确认链 |
+| 线路 A 缺新接口 | 路由变更须**重跑 `oj mcp`**（文件型快照）；线路 B 自动。产物头注释 spec_hash 可比对 |
+| `tools/call` 业务报错却是 HTTP 200 | MCP 结果映射与 HTTP 状态解耦：看 `result.isError` + `content[0].text`（业务 msg），不是 JSON-RPC error |
+| SSE 流式端点（`json.stream`/`json.sse`）经 MCP 恒报错 | 有意：不缓冲流——MCP/JSON-RPC 只接统一信封端点 |
+| 非 localhost `http://` 分发线路 A | 产物启动时 stderr 警告 Bearer 明文——上 https 或 SSH 隧道 |

@@ -156,14 +156,22 @@ pub fn spec_to_tools(spec: &Value) -> Result<Vec<McpTool>, String> {
 }
 
 /// 由 operation 的 parameters/requestBody 拼 inputSchema；返回 (schema, 是否声明了契约)。
+///
+/// 形状与执行侧**逐字同构**（终审 blocker：曾平铺公布，client 按 schema 发的
+/// `{"id":1}` 在执行侧找不到 `arguments.path.id`）：顶层固定三键——
+/// `path`（path 参数对象，全部必填）、`query`（query 参数对象，required 随契约）、
+/// `body`（requestBody schema）。顶层 required 指出**哪个键**必填，键内 required
+/// 指出键内哪些字段必填。
 fn build_input_schema(op: &Value, tool_name: &str) -> Result<(Value, bool), String> {
     if op.to_string().contains("$ref") {
         return Err(format!(
             "tool `{tool_name}` inputSchema contains $ref — inline it in .schema"
         ));
     }
-    let mut properties = serde_json::Map::new();
-    let mut required: Vec<String> = Vec::new();
+    let mut path_props = serde_json::Map::new();
+    let mut path_req: Vec<String> = Vec::new();
+    let mut query_props = serde_json::Map::new();
+    let mut query_req: Vec<String> = Vec::new();
     if let Some(params) = op.get("parameters").and_then(|p| p.as_array()) {
         for p in params {
             let pname = p
@@ -175,15 +183,45 @@ fn build_input_schema(op: &Value, tool_name: &str) -> Result<(Value, bool), Stri
                 .get("schema")
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "string" }));
-            properties.insert(pname.clone(), schema);
             let is_path = p.get("in").and_then(|v| v.as_str()) == Some("path");
             let is_required = p.get("required").and_then(|v| v.as_bool()) == Some(true);
-            if (is_path || is_required) && !required.contains(&pname) {
-                required.push(pname);
+            if is_path {
+                // path 参数恒入键内 required（填充缺参 → -32602）。
+                path_props.insert(pname.clone(), schema);
+                if !path_req.contains(&pname) {
+                    path_req.push(pname);
+                }
+            } else {
+                query_props.insert(pname.clone(), schema);
+                if is_required && !query_req.contains(&pname) {
+                    query_req.push(pname);
+                }
             }
         }
     }
-    let mut declared = !properties.is_empty();
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<String> = Vec::new();
+    if !path_props.is_empty() {
+        let mut s = json!({ "type": "object", "properties": Value::Object(path_props) });
+        if !path_req.is_empty() {
+            s.as_object_mut()
+                .unwrap()
+                .insert("required".to_string(), json!(path_req));
+        }
+        properties.insert("path".to_string(), s);
+        required.push("path".to_string());
+    }
+    let mut declared = !query_props.is_empty();
+    if !query_props.is_empty() {
+        let mut s = json!({ "type": "object", "properties": Value::Object(query_props) });
+        if !query_req.is_empty() {
+            s.as_object_mut()
+                .unwrap()
+                .insert("required".to_string(), json!(query_req));
+            required.push("query".to_string());
+        }
+        properties.insert("query".to_string(), s);
+    }
     if let Some(body) = op
         .get("requestBody")
         .and_then(|r| r.get("content"))
@@ -201,6 +239,7 @@ fn build_input_schema(op: &Value, tool_name: &str) -> Result<(Value, bool), Stri
             required.push("body".to_string());
         }
     }
+    declared = declared || !properties.is_empty();
     let mut schema = json!({ "type": "object", "properties": Value::Object(properties) });
     if !required.is_empty() {
         schema
@@ -288,7 +327,8 @@ mod tests {
 
     // Given 契约齐备的 POST（path id:integer + query page:required + body name:required）
     // When spec_to_tools
-    // Then required 含 id/page/body，properties 含 body 且 id type integer，body 子 schema 的 required 原样内嵌
+    // Then 顶层三键嵌套：path 全必填、query 按契约、body 子 schema required 原样内嵌——
+    //      与执行侧读取的 arguments.path/query/body 形状逐字同构（终审 blocker 修复）
     #[test]
     fn contract_route_builds_merged_input_schema() {
         let s = spec(&[(
@@ -314,16 +354,74 @@ mod tests {
         )]);
         let tools = spec_to_tools(&s).unwrap();
         let schema = &tools[0].tool["inputSchema"];
-        let req: Vec<&str> = schema["required"]
+        let top_req: Vec<&str> = schema["required"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(req.contains(&"id") && req.contains(&"page") && req.contains(&"body"));
-        assert!(!req.contains(&"kw"), "可选 query 不得入 required");
-        assert_eq!(schema["properties"]["id"]["type"], "integer");
+        assert!(
+            top_req.contains(&"path") && top_req.contains(&"query") && top_req.contains(&"body"),
+            "顶层 required 应指出哪个键必填：{top_req:?}"
+        );
+        let path_req: Vec<&str> = schema["properties"]["path"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(path_req, vec!["id"], "path 参数恒入键内 required");
+        assert_eq!(
+            schema["properties"]["path"]["properties"]["id"]["type"],
+            "integer"
+        );
+        let query_req: Vec<&str> = schema["properties"]["query"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            query_req,
+            vec!["page"],
+            "可选 query（kw）不得入键内 required"
+        );
+        assert!(
+            schema["properties"]["query"]["properties"]
+                .get("kw")
+                .is_some()
+        );
         assert_eq!(schema["properties"]["body"]["required"][0], "name");
+    }
+
+    // Given 契约只有 path 参数（无 query/body）
+    // Then 顶层只有 path 键（无 query/body 空对象噪音）
+    #[test]
+    fn path_only_contract_has_no_empty_sibling_keys() {
+        let s = spec(&[(
+            "/v1/api/user/{id}",
+            "get",
+            op(
+                "user__id__get",
+                json!({
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true,
+                          "schema": { "type": "string" } }
+                    ]
+                }),
+            ),
+        )]);
+        let tools = spec_to_tools(&s).unwrap();
+        let props = tools[0].tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap();
+        assert!(props.contains_key("path"));
+        assert!(
+            !props.contains_key("query"),
+            "无 query 参数不得生成空 query 键"
+        );
+        assert!(!props.contains_key("body"));
+        assert_eq!(tools[0].tool["inputSchema"]["required"], json!(["path"]));
     }
 
     // Given 契约里任意深度嵌 $ref

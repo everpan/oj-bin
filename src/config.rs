@@ -148,10 +148,16 @@ pub struct McpCfg {
 
 /// 裸 JSON-RPC 2.0 端点（spec 2026-10-30）：`server.rpc.enabled: true` → 挂
 /// `{base}/rpc`（method = operationId，与 MCP 解耦的独立门）。
+/// v0.1.110 终审 major：与 mcp 同口径的 auth fail-fast（enabled 而无 auth 插件
+/// 且未显式 allow_anonymous → 拒启）——/rpc 与 /mcp 共用执行链，暴露面相同，
+/// 门控口径不得一严一宽。
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 pub struct RpcCfg {
     #[serde(default)]
     pub enabled: bool,
+    /// 显式允许无 auth 插件时暴露（默认 false：enabled && auth 未装配 → 拒启）。
+    #[serde(default)]
+    pub allow_anonymous: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -386,12 +386,21 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 以为 `db.explain` 会真执行语句（ANALYZE 语义）/ 有副作用（v0.1.108） | 不会——`EXPLAIN` 只出计划不执行。要实测代价得显式 `ANALYZE` 或跑一遍；`db.explain` 永不触发写副作用，可安全对生产只读库使用 |
 | 在 sqlite（或第三方不支持方言）上跑 `db.explain` 报 `OJ_DB_UNSUPPORTED`（v0.1.108） | 预期：目前只有 postgres/mysql 支持，`capability` 字段是 `explain`，错误/限制表可查；老版本引擎上 `db.explain` 是 `undefined`，跨版本代码先探 `typeof db.explain === "function"` 再调用 |
 | 给 `db.explain` 传 `EXPLAIN ...` 前缀 SQL（v0.1.108） | 不用——只传内层语句，框架按方言自己拼前缀（pg 文本计划 / mysql `FORMAT=JSON`）；手拼前缀会被剥掉或触发护栏分类（`explain ...; drop table` 照样按 DDL 拒） |
+| MCP `{base}/mcp` 返回 406（v0.1.110） | `Accept: */*` 被拒——端点要求显式 `Accept: application/json`（curl 加 `-H 'accept: application/json'`；MCP client 自带） |
+| MCP `{base}/mcp` 启动即 fail-fast：`server.mcp.enabled requires an auth plugin...`（v0.1.110） | `mcp.enabled: true` 但 config 无 `auth:` 段——tool 枚举面绝不静默匿名外露：装 oj-auth 插件并配 `auth:`，或显式 `allow_anonymous: true`（仅内网/演示） |
+| `{base}/rpc` 启动同样 fail-fast（v0.1.110 终审） | `rpc.enabled: true` 与 mcp 同口径——无 `auth:` 段须显式 `rpc.allow_anonymous: true`；两端共用执行链，门控一严一宽就是口子 |
+| `tools/list` 是空列表（v0.1.110） | `server.mcp.modules` 白名单 fail-closed：与任何模块 tag 无交集 = 空 catalog（**不回落全集**）——核对模块名（= manifest `name`/tag）；没配 `modules` 则不过滤 |
+| `tools/call` 返回 `missing/invalid path argument`（-32602，v0.1.110） | path 参数恒必填且须字符串可编码：单段参数值含 `/` 会 encode 后正确 miss（不是走私）；catch-all `{*name}` 才接受带 `/` 的值 |
+| `tools/call` 成功但无 `structuredContent`（v0.1.110） | 上游不是统一信封（`json.raw`）或业务 `code!=0`（→ `isError:true`）——MCP 结果映射与 HTTP 状态码解耦，先看 `isError` 再看 `content` |
+| 把写操作注册成 GET 给 agent 用（v0.1.110） | 不要——GET tool 带 `readOnlyHint`，agent 会免确认直接调；写操作走 POST/PUT/PATCH/DELETE（DELETE 带 `destructiveHint`），让 agent 的确认链生效 |
+| 线路 A（`oj mcp` 产物）少了新加的接口（v0.1.110） | 文件型快照，不自动跟随路由表——**路由变更须重跑 `oj mcp`**；线路 B（serve 内建）则自动。产物头注释的 spec_hash 可比对漂移 |
+| `oj mcp` 生成的 stdio server 连不上服务 / 401（v0.1.110） | 运行时 env：`OJ_BASE`（必，含 origin 不含 base path）、`OJ_TOKEN`（Bearer JWT）；config 声明租户头时还要 `OJ_TENANT`（头名已内嵌，值走 env）。诊断全在 stderr（stdout 只出协议） |
 
 ## 手册
 
 `api-manual.md`（同目录）共 13 章：1 快速开始 / 2 项目结构与模块约定 / 3 模块数据层 /
 4 编写 api.ts / 5 导入解析 / 6 全局对象 API 参考 / 7 响应信封与错误码 / 8 鉴权与多租户 / 9 测试 /
-10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制。
+10 配置 config.yaml / 11 构建与发布 / 12 运维要点 / 13 安全红线与已知限制 / 14 MCP 与 JSON-RPC（agent 接入）.
 
 `scenarios.md`（同目录）场景速查：公开分享页匿名读租户数据 / SPA 深链回落与 meta 注入 /
 测试库隔离 / LIMIT 分页 / 匿名路径通配 / 多库项目按库迁移与对账（`--db`）/

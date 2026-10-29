@@ -2341,6 +2341,7 @@ pub(crate) mod tests {
             ],
             body: b"{\"code\":0}".to_vec(),
             stream: None,
+            raw: false,
         };
         let r = capture_response(cap);
         let cookies: Vec<_> = r

@@ -1066,19 +1066,41 @@ fn validate_route_timeouts(patterns: &[String], route_keys: &[String]) -> Result
     Ok(())
 }
 
-/// MCP 装配防线（spec 2026-10-30 R7/R9）：`enabled` 且未装配 auth 插件且未显式
-/// `allow_anonymous` → 拒启。否则 `/mcp` 匿名暴露全路由的机器可读目录 + 调用面，
-/// 比业务路由自身的暴露面更糟（机器可枚举、广告化）。
-fn validate_mcp_gate(mcp: &config::McpCfg, auth_present: bool) -> Result<(), String> {
-    if mcp.enabled && !auth_present && !mcp.allow_anonymous {
-        return Err(
-            "server.mcp.enabled requires an auth plugin (oj-auth) — refusing to expose a \
-             machine-readable route catalog anonymously; set server.mcp.allow_anonymous: true \
+/// MCP/RPC 装配防线（spec 2026-10-30 R7/R9 + v0.1.110 终审）：`enabled` 且未装配
+/// auth 插件且未显式 `allow_anonymous` → 拒启。否则端点匿名暴露全路由的机器可读
+/// 目录 + 调用面，比业务路由自身的暴露面更糟（机器可枚举、广告化）。两端口径
+/// 必须一致：/rpc 与 /mcp 共用执行链，暴露面相同。
+fn validate_mcp_gate(gate: &impl GateLike, what: &str, auth_present: bool) -> Result<(), String> {
+    if gate.enabled() && !auth_present && !gate.allow_anonymous() {
+        return Err(format!(
+            "server.{what}.enabled requires an auth plugin (oj-auth) — refusing to expose a \
+             machine-readable route catalog anonymously; set server.{what}.allow_anonymous: true \
              to override explicitly"
-                .to_string(),
-        );
+        ));
     }
     Ok(())
+}
+
+/// McpCfg/RpcCfg 的门控公共形状（避免为两条配置各写一份校验）。
+trait GateLike {
+    fn enabled(&self) -> bool;
+    fn allow_anonymous(&self) -> bool;
+}
+impl GateLike for config::McpCfg {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn allow_anonymous(&self) -> bool {
+        self.allow_anonymous
+    }
+}
+impl GateLike for config::RpcCfg {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn allow_anonymous(&self) -> bool {
+        self.allow_anonymous
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2064,10 +2086,12 @@ impl App {
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
         config::validate_tenant_binding(&cfg, auth.is_some())?;
-        // MCP 装配防线（spec 2026-10-30 R7/R9）：enabled 但未装配 auth 插件且未
-        // 显式 allow_anonymous → 拒启——否则 `/mcp` 匿名暴露全路由机器可读目录。
+        // MCP/RPC 装配防线（spec 2026-10-30 R7/R9 + v0.1.110 终审）：enabled 但未
+        // 装配 auth 插件且未显式 allow_anonymous → 拒启——否则端点匿名暴露全路由
+        // 机器可读目录。两端共用执行链，门控口径一致。
         let mcp_cfg = cfg.server.mcp.clone().unwrap_or_default();
-        validate_mcp_gate(&mcp_cfg, auth.is_some())?;
+        validate_mcp_gate(&mcp_cfg, "mcp", auth.is_some())?;
+        validate_mcp_gate(&cfg.server.rpc, "rpc", auth.is_some())?;
         if !mcp_cfg.enabled {
             let n_routes: usize = tables.iter().map(|(_, t)| t.listing().len()).sum();
             if n_routes > 0 {
@@ -2398,7 +2422,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let err = validate_mcp_gate(&mcp, false).unwrap_err();
+        let err = validate_mcp_gate(&mcp, "mcp", false).unwrap_err();
         assert!(err.contains("server.mcp") && err.contains("auth"), "{err}");
         // Given 同上但 allow_anonymous=true，Then 装配通过（显式逃生门）。
         let mcp_anon = config::McpCfg {
@@ -2406,9 +2430,26 @@ mod tests {
             allow_anonymous: true,
             ..Default::default()
         };
-        assert!(validate_mcp_gate(&mcp_anon, false).is_ok());
+        assert!(validate_mcp_gate(&mcp_anon, "mcp", false).is_ok());
         // Given auth 已装配，Then 任意 mcp 配置都通过。
-        assert!(validate_mcp_gate(&mcp, true).is_ok());
+        assert!(validate_mcp_gate(&mcp, "mcp", true).is_ok());
+    }
+
+    // Given rpc.enabled=true、无 auth、未显式 allow_anonymous（v0.1.110 终审 major）
+    // Then 同 mcp 口径拒启（/rpc 与 /mcp 共用执行链，门控不得一严一宽）
+    #[test]
+    fn rpc_without_auth_plugin_fails_fast() {
+        let rpc = config::RpcCfg {
+            enabled: true,
+            ..Default::default()
+        };
+        let err = validate_mcp_gate(&rpc, "rpc", false).unwrap_err();
+        assert!(err.contains("server.rpc") && err.contains("auth"), "{err}");
+        let rpc_anon = config::RpcCfg {
+            enabled: true,
+            allow_anonymous: true,
+        };
+        assert!(validate_mcp_gate(&rpc_anon, "rpc", false).is_ok());
     }
 
     // Given mcp.enabled=false（缺省）
@@ -2416,7 +2457,7 @@ mod tests {
     #[test]
     fn mcp_disabled_never_blocks_assembly() {
         let mcp = config::McpCfg::default();
-        assert!(validate_mcp_gate(&mcp, false).is_ok());
+        assert!(validate_mcp_gate(&mcp, "mcp", false).is_ok());
     }
 
     // ---- U-18 批 T1.2：route_timeouts 装配期校验（纯函数） ----

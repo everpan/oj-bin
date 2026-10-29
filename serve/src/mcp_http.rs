@@ -59,15 +59,23 @@ fn negotiate_protocol(client: Option<&str>) -> &'static str {
 
 /// Accept 须含 application/json 或 text/event-stream（`*/*` 不含两者 → 拒，
 /// 406；浏览器 form-CSRF 发不出这两种 Accept，配合 Content-Type 门形成双保险）。
+/// 按逗号列表逐项取 `;` 前的媒体类型精确比对（子串匹配会把 application/jsonx
+/// 误放——终审 minor）。
 fn accept_ok(headers: &HeaderMap) -> bool {
-    let Some(a) = headers
+    headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    let a = a.to_ascii_lowercase();
-    a.contains("application/json") || a.contains("text/event-stream")
+        .is_some_and(|a| {
+            a.split(',').any(|item| {
+                let mt = item
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                mt == "application/json" || mt == "text/event-stream"
+            })
+        })
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -144,27 +152,35 @@ fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> V
         .collect()
 }
 
-/// 由 table 找回 raw pattern（oa_path 已把 `{*x}` 收敛为 `{x}`，丢失 catch-all
-/// 信息；填充编码策略必须按 raw pattern 段判定）。pub：`oj mcp` codegen 复用
-/// （线路 A 需同款反查来回补 ToolDispatch.catch_all）。
-pub fn raw_pattern_for(table: &RouteTable, oa_path: &str, method: &str) -> Option<String> {
+/// oa_path（`{*x}` 已收敛 `{x}`）+ method → 路由表行反查谓词。
+fn row_matches(r: &crate::routes::RouteRow, oa_path: &str, method: &str) -> bool {
+    let oa_of_row = r
+        .pattern
+        .split('/')
+        .map(|s| s.replacen("{*", "{", 1))
+        .collect::<Vec<_>>()
+        .join("/");
+    let m = {
+        let m = r.method.to_lowercase();
+        if m == "del" { "delete".to_string() } else { m }
+    };
+    oa_of_row == oa_path && m == method
+}
+
+fn listing_row_for<'a>(
+    table: &'a RouteTable,
+    oa_path: &str,
+    method: &str,
+) -> Option<&'a crate::routes::RouteRow> {
     table
         .listing()
         .iter()
-        .find(|r| {
-            let oa_of_row = r
-                .pattern
-                .split('/')
-                .map(|s| s.replacen("{*", "{", 1))
-                .collect::<Vec<_>>()
-                .join("/");
-            let m = {
-                let m = r.method.to_lowercase();
-                if m == "del" { "delete".to_string() } else { m }
-            };
-            oa_of_row == oa_path && m == method
-        })
-        .map(|r| r.pattern.clone())
+        .find(|r| row_matches(r, oa_path, method))
+}
+
+/// 由 table 找回 raw pattern（pub：`oj mcp` codegen 复用，回补 catch_all）。
+pub fn raw_pattern_for(table: &RouteTable, oa_path: &str, method: &str) -> Option<String> {
+    listing_row_for(table, oa_path, method).map(|r| r.pattern.clone())
 }
 
 /// path 模板填充：单段参数 encodeURIComponent（值含 `/` 将正确 miss），
@@ -240,7 +256,8 @@ fn capture_to_result(cap: &Capture) -> Value {
         return is_error(&String::from_utf8_lossy(&cap.body));
     }
     match serde_json::from_slice::<Value>(&cap.body) {
-        Ok(v) if is_envelope(&v) => {
+        // raw（json.raw）豁免信封检测：裸业务数据恰好带 code/msg/data 键不得误判。
+        Ok(v) if !cap.raw && is_envelope(&v) => {
             if v["code"].as_i64() == Some(0) {
                 ok_result(&v["data"])
             } else {
@@ -336,6 +353,17 @@ async fn read_inbound(
             "invalid request",
         )));
     };
+    // 组帧红线：缺 jsonrpc=="2.0" 或 method 非字符串（含带 id 的 response 消息
+    // 误入请求端点）→ -32600，不按通知吞掉（终审 minor）。
+    if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0")
+        || obj.get("method").and_then(|m| m.as_str()).is_none()
+    {
+        return Err(json_rpc_response(&rpc_err(
+            obj.get("id").cloned().unwrap_or(Value::Null),
+            -32600,
+            "invalid request",
+        )));
+    }
     let Some(id) = obj.get("id") else {
         return Ok(Inbound::Notification);
     };
@@ -441,7 +469,8 @@ fn capture_to_rpc_result(cap: &Capture) -> Result<Value, (i64, String)> {
         ));
     }
     match serde_json::from_slice::<Value>(&cap.body) {
-        Ok(v) if is_envelope(&v) => {
+        // raw（json.raw）豁免信封检测（与 MCP 变体同口径）。
+        Ok(v) if !cap.raw && is_envelope(&v) => {
             if v["code"].as_i64() == Some(0) {
                 Ok(v["data"].clone())
             } else {
@@ -488,10 +517,11 @@ async fn run_tool(
     tool: &McpTool,
     args: Option<&Map<String, Value>>,
 ) -> Result<Capture, (&'static str, String)> {
-    let raw = raw_pattern_for(table, &tool.dispatch.oa_path, &tool.dispatch.method).ok_or((
+    let row = listing_row_for(table, &tool.dispatch.oa_path, &tool.dispatch.method).ok_or((
         "-32603",
         "route row vanished between list and call".to_string(),
     ))?;
+    let raw = row.pattern.clone();
     let path_args = args.and_then(|a| a.get("path")).and_then(|v| v.as_object());
     let Some(concrete) = fill_path(&raw, path_args) else {
         return Err((
@@ -509,7 +539,21 @@ async fn run_tool(
             file,
             params,
             handler,
-        } => (file, params, handler),
+        } => {
+            // 终审 major：matchit 静态段优先——白名单内 catch-all tool 填充后可能
+            // 命中同前缀下被 modules 滤掉的更具体路由；命中行必须即本 tool 的行，
+            // 否则「modules = agent 可见调用面」fail-closed 承诺失守。
+            if file != table.file_path(row.file) || handler != row.handler {
+                return Err((
+                    "-32603",
+                    format!(
+                        "path resolves to a different route than tool `{}` (shadowed)",
+                        tool.name
+                    ),
+                ));
+            }
+            (file, params, handler)
+        }
         Lookup::Conflict(m) => return Err(("-32603", format!("route conflict: {m}"))),
         Lookup::MethodNotAllowed => {
             return Err(("-32603", format!("method {verb} not allowed on {norm}")));
@@ -525,9 +569,21 @@ async fn run_tool(
         .and_then(|a| a.get("body"))
         .map(|b| serde_json::to_vec(b).unwrap_or_default())
         .unwrap_or_default();
+    // hop-by-hop 与信封自身的头不转进 handler 面（终审 minor：content-length/host
+    // 是 JSON-RPC 信封的值而非 tool 调用）；admit 已在 read_inbound 用原始头判过。
+    let mut fwd = HeaderMap::new();
+    for (k, v) in headers.iter() {
+        if matches!(
+            k.as_str(),
+            "content-length" | "host" | "connection" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        fwd.append(k.clone(), v.clone());
+    }
     run_capture(
         st,
-        headers,
+        &fwd,
         &verb,
         query_of(query_args),
         path_no_base.as_deref(),
@@ -552,6 +608,7 @@ fn fail_capture(status: u16, msg: &str) -> Capture {
         body: serde_json::to_vec(&json!({ "code": status, "msg": msg, "data": null }))
             .unwrap_or_default(),
         stream: None,
+        raw: false,
     }
 }
 
@@ -678,6 +735,7 @@ mod tests {
             body: serde_json::to_vec(&json!({ "code": 0, "msg": "ok", "data": { "n": 1 } }))
                 .unwrap(),
             stream: None,
+            raw: false,
         };
         let r = capture_to_result(&cap);
         assert_eq!(r["structuredContent"]["n"], 1);
@@ -702,6 +760,7 @@ mod tests {
             headers: vec![],
             body: vec![],
             stream: Some(rx),
+            raw: false,
         };
         let r = capture_to_result(&cap);
         assert_eq!(r["isError"], true);
@@ -722,6 +781,7 @@ mod tests {
             headers: vec![],
             body: serde_json::to_vec(&json!({ "anything": true })).unwrap(),
             stream: None,
+            raw: false,
         };
         let r = capture_to_result(&cap);
         assert!(r.get("structuredContent").is_none());
@@ -729,6 +789,27 @@ mod tests {
             r["content"][0]["text"],
             serde_json::to_string(&json!({ "anything": true })).unwrap()
         );
+    }
+
+    // Given raw（json.raw）端点返回的数据**恰好带 code/msg/data 键**（终审 major：
+    // 无 raw 标志时会被 is_envelope 误判成错误信封）
+    // Then raw:true 豁免信封检测：原样 text content，无 isError；/rpc 变体同理（result 非 error）
+    #[test]
+    fn raw_flag_exempts_envelope_shaped_business_data() {
+        let body = json!({ "code": 7, "msg": "batch imported", "data": [1, 2] });
+        let cap = Capture {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            stream: None,
+            raw: true,
+        };
+        let r = capture_to_result(&cap);
+        assert!(r.get("isError").is_none(), "{r}");
+        assert!(r.get("structuredContent").is_none(), "{r}");
+        assert_eq!(r["content"][0]["text"], body.to_string());
+        let rpc = capture_to_rpc_result(&cap).expect("raw 数据不得变 JSON-RPC error");
+        assert_eq!(rpc, body);
     }
 
     // ---- query 字符串化 ----

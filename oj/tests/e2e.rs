@@ -2995,6 +2995,7 @@ async fn mcp_e2e_rpc_parity() {
     let _g = lock();
     let (addr, _h, _t) = boot_inner(true, |c| {
         c.server.rpc.enabled = true;
+        c.server.rpc.allow_anonymous = true; // e2e 不装配 auth（装配门 v0.1.110 终审）
     })
     .await
     .unwrap();
@@ -3108,4 +3109,50 @@ async fn generated_stdio_server_handshakes() {
     assert!(r["structuredContent"].is_array(), "{v}");
     drop(stdin);
     let _ = child.wait().await;
+}
+
+/// 评审盲区补钉：inputSchema 公布的嵌套形状（arguments.path）必须能真调通
+/// 参数化路由（终审 blocker 修复的回归钉——曾 schema 平铺公布、执行嵌套读取）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_e2e_path_param_tool_roundtrip() {
+    let _g = lock();
+    let (addr, _h, _t) = boot_inner(true, |c| {
+        c.server.mcp = Some(only_js::config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            modules: None,
+        });
+    })
+    .await
+    .unwrap();
+    // tools/list：参数化路由的 tool 公布嵌套 schema（path 键、id 在键内 required）。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let tools = v["result"]["tools"].as_array().unwrap();
+    let t = tools
+        .iter()
+        .find(|t| t["name"] == "user__id__get")
+        .unwrap_or_else(|| panic!("缺 user__id__get：{v}"));
+    assert_eq!(t["inputSchema"]["required"], serde_json::json!(["path"]));
+    assert_eq!(
+        t["inputSchema"]["properties"]["path"]["required"],
+        serde_json::json!(["id"])
+    );
+    // tools/call：按公布的嵌套形状发 path 参数 → 命中参数化路由成功。
+    let (s, v) = rpc_req(
+        addr,
+        "/v1/api/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"user__id__get","arguments":{"path":{"id":"1"}}}}"#,
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["result"].get("isError").is_none(),
+        "嵌套 path 参数必须调通：{v}"
+    );
 }

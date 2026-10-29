@@ -311,6 +311,7 @@ tables:
 | `oj openapi -c config.yaml [-d dir] [--base B] [-o out.json]` | 从路由表生成 OpenAPI 3.1（dev 内省 `.route` / release 读 `dist/routes.js`），打印或落盘（v0.1.43）；v0.1.52 起 dev 分支内省失败同样 fail-fast（对齐 release，不再静默缺路由）；**v0.1.70 起补齐响应侧**：`.schema.response`（v0.1.72 起亦可写平级 `.response`，优先级 动词 `.response` > 组 `.response` > 动词 `.schema.response` > 组 `.schema.response`）→ `responses.200`（外裹 `{code,msg,data}` 信封）、每个 operation 与 spec 根带 **`tags: [<module>]`**、生成前审计全部 `.schema`（非法契约不再原样进 spec）、`operationId` 重复即报错、**v0.1.73 起 `del` 动词归一为 `delete` 操作键**（OpenAPI 3.x 只认标准 HTTP 方法） |
 | `oj build --check` | 只跑结构检查 S001–S008 不落盘（CI 门禁） |
 | `oj openapi -c config.yaml --check` | 生成物与已提交 `openapi.json` 比对，键序规范化后不一致即非零退出（CI 漂移门禁，v0.1.43）；`--check` 时 `-o` 为待比对文件，缺省 `<dir>/openapi.json` |
+| `oj mcp -c config.yaml [-d dir \| --module-root root] [--base B] [-o mcp/mcp-server.js]` | （v0.1.110）离线生成零依赖 Node.js stdio MCP server（内嵌 tool 数组 + dispatch 表 + spec_hash）；运行时 env：`OJ_BASE`（必）、`OJ_TOKEN`（Bearer，选）、`OJ_TENANT`（租户值，config 声明租户头时）；路由变更须重新生成 |
 
 三条数据类命令（`migrate` / `test fixture` / `schema diff`）都接受 `--db <name>`（v0.1.21）：
 `name` 即 config `db:` 段的键，缺省 `default`；**未声明的库名直接报错**并列出可用键，
@@ -2862,6 +2863,8 @@ mounts:
 | `migrate_on_start` | `auto`（dev）/ `verify`（release） | 迁移门禁：auto 启动即应用；verify 账本落后拒启（M004，先 `oj migrate`）；`off` 迁移完全归运维 |
 | `ownership_guard` | `"warn"` | 表归属守卫：`warn` 跨模块表访问仅告警；`deny` 未声明 deps 拒绝执行（500 附修复指引） |
 | `reload_api` | `false` | （v1 配置热更新）开启后 `oj serve` 走「永生 listener + 外层单一 fallback」形态：监听 `POST {base}/_system/config` 触发热更、`GET {base}/_system/config` 看当前代际、`GET {base}/_system/health` 看健康 + 代际。详见下「配置热更新（reload_api）」。关闭则维持原 `serve_graceful` 行为（零变化） |
+| `mcp` | 无（= 不挂） | （v0.1.110）`{base}/mcp` streamable HTTP MCP 端点：`{enabled: bool, modules?: string[], allow_anonymous?: bool}`。`enabled && 无 auth 插件 && !allow_anonymous` → 启动 fail-fast；`modules` 为模块 tag 白名单，fail-closed（无交集 = 空 catalog）；详见 §14 |
+| `rpc` | `{enabled: false}` | （v0.1.110）`{base}/rpc` 裸 JSON-RPC 2.0 端点：`{enabled: bool, allow_anonymous?: bool}`（与 mcp 同口径 auth fail-fast），method = operationId；详见 §14 |
 
 #### 配置热更新（reload_api）
 
@@ -3786,6 +3789,7 @@ await db.query("select id from account where id = " + id, []);   // 禁止
 | search 引擎原生 FTS（v0.1.61） | sqlite trigram 对 **<3 字符查询静默零命中**（共享模块自动 LIKE 回退）；sqlite 实现仅支持整型自增 PK（外部内容表只认 rowid）；`sql_guard: deny` 模式与 FTS 裸查询互斥（deny 部署要么关守卫要么不用 search）；mysql InnoDB FULLTEXT 同事务可见性需实测（文档含糊区）；score 为引擎原始分不可跨引擎比较；`docs_fts*`/`oj_ver*` 影子表会进 `oj schema diff` 的 D002 噪音；pg 实现 v0.1.68 修复（自写 `$n` 与统一占位符计数校验冲突 + `ts_headline` 签名错——highlight 的 fragments 键为 `_doc` 文档级片段）；短词回退大小写三方言一致（pg 用 `ILIKE`，v0.1.68 起） |
 | 动态 meta 每次 HTML 请求**多派发一次 JS** | `server.html_meta_handler`（v0.1.25）：每次送 HTML 都调一次该 handler（无缓存层）。高流量站点请让 handler 只读缓存/轻查询，并用返回的 `cache_control` 让中间层替你挡住重复请求 |
 | release 下 WS URL 含版本段（v0.2） | `…/news-0.1.0/ws`，与 dev 的 `…/news/ws` **不同源**；客户端发现 WS 地址时按环境拼（勿硬编码）。WS 路径不做 `_name_` → `{param}` 转换（`_id_/ws.ts` 是字面段）；新增/删除 `ws.ts` 需重启（dev 无文件监听）。WS 不在路由表与 `openapi.json` 内，唯一权威面是启动打印的 `ws: N mount(s)` 清单 |
+| `{base}/mcp`、线路 A 产物的已知边界（v0.1.110） | stateless 子集：无 session 恢复/sampling/roots；SSE 流式 handler（`json.stream`/`json.sse`）经 MCP 调用恒 isError「streaming endpoint」；tool 名 = 净化 operationId（`[^a-zA-Z0-9_-]`→`_`，>64 截断 + 散列后缀），契约任意深度 `$ref` → 生成失败（须内联）；线路 A 是文件型快照——路由变更须重跑 `oj mcp`，线路 B 则每次请求读活路由表 |
 | `db.tx` 每请求至多一个；嵌套报错 | 合并事务回调 |
 | `db.session` 缺省**关闭**（v0.1.95） | `db_session.enabled: false` 时该能力不存在——`db.session.begin()` 直接报错点名怎么开（兼容优先，不做隐式放行）。开启须过装配期 fail-loud：`allow` 四维不能全空、`max_sessions`/`max_per_owner` 非 0、`max_per_owner ≤ max_sessions`、`idle_timeout_secs` 非 0、`max_lifetime_secs ≥ idle_timeout_secs` |
 | `db.session` = 一个 id 锁**一个别名**的一条连接 | attach 后跨别名查询报 `attached to db 'x', not 'y' (detach first)`；换别名须先 detach。会话内**禁止**事务控制/会话状态 SQL（`BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/START/SET/USE/ATTACH/DETACH/PRAGMA`）——MySQL 的隐式提交会让 `rollback()` 变成假回滚，故一律拒绝而不是"尽力而为" |
@@ -3927,3 +3931,105 @@ await db.query("select id from account where id = " + id, []);   // 禁止
   `ReferenceError`；v0.1.55 起通道分离——`console.log`/`info` 原样 stdout，
   `console.debug`/`warn`/`error` 与 `log.*` 走 stderr）。`oj exec` 迁移默认 off
   （serve dev 缺省 auto，两命令相反）。
+
+## 14. MCP 与 JSON-RPC（agent 接入，v0.1.110）
+
+> 何时读我：要让 Claude / Cursor / 其他 agent 工具直接调 oj 接口，或想要裸 JSON-RPC 通道时。
+
+oj 从 OpenAPI 链一键出 agent 接口，两条线路共享同一份 tool 定义（`oj openapi` 的
+生成链 + tool 净化/拼装），应对不同分发场景：
+
+| 线路 | 形态 | 适合 | 路由变更 |
+|---|---|---|---|
+| **B：serve 内建** | `server.mcp.enabled: true` → `{base}/mcp`（MCP streamable HTTP）；`server.rpc.enabled: true` → `{base}/rpc` | 服务在线、client 可直连 | **自动**——端点每次请求读活路由表（热更/reload 代际即时生效；dev 裸新增目录路由不进 RouteTable，与 HTTP 直访同口径） |
+| **A：离线 codegen** | `oj mcp` 生成零依赖 Node.js stdio server | 服务在别处 / 不给直连 / 要经 MCP client 配置分发 | 须**重跑 `oj mcp`**（文件型快照，头注释带 spec_hash 可比对） |
+
+### 配置
+
+```yaml
+server:
+  mcp:
+    enabled: true          # 挂 {base}/mcp（缺省不挂）
+    modules: [user, order] # 可选：模块 tag 白名单（fail-closed，无交集 = 空 catalog）
+    allow_anonymous: false # enabled 且未装配 auth 插件时缺省拒启；显式 true 才放行
+  rpc:
+    enabled: true          # 挂 {base}/rpc（缺省 false）
+    allow_anonymous: false # 与 mcp 同口径：enabled 且未装配 auth 插件时缺省拒启
+```
+
+`mcp.enabled`/`rpc.enabled` 而 config 无 `auth:` 段且未写对应 `allow_anonymous: true`
+→ **启动 fail-fast**（tool 枚举面绝不静默匿名外露；两端共用执行链，门控口径一致）。
+
+**arguments 形状**：`tools/call` 的 arguments 与公布的 inputSchema 逐字同构——
+顶层三键 `path`（path 参数对象，键内全部必填）、`query`（query 参数对象，
+required 随契约）、`body`（requestBody schema）。
+
+### 线路 B：`{base}/mcp`
+
+MCP 2025-06-18 streamable HTTP 的 **stateless 子集**（无 `Mcp-Session-Id` 概念，JSON
+响应合法）。方法集：`initialize`（协议协商：客户端版本在
+`2024-11-05 / 2025-03-26 / 2025-06-18` 内则回显，否则回最新）+ `capabilities` +
+`serverInfo`；`ping`；`tools/list`；`tools/call`。通知（无 `id`）→ 202 空响应；
+batch → `-32600`（MCP 已移除 batch）；`Accept: */*` → 406（须显式
+`Accept: application/json`）；非 JSON Content-Type → 415；体超 `server.max_upload` → 413。
+
+**tool 名** = 净化后的 operationId：`[^a-zA-Z0-9_-]` → `_`，超 64 字符截断 + 散列后缀
+（如 `file/{*path}` GET → `file___path__get`）。**输入**（嵌套三键，见上）：
+path 参数键内恒必填（单段值 `encodeURIComponent`——含 `/` 会正确 miss；catch-all
+`{*name}` 逐段编码、跨段 `/` 保留）；未声明契约的端点 description 标注
+`(no declared input contract — inspect source)`。
+
+**结果映射**（与 HTTP 语义解耦——解析从不 gate 在 HTTP 状态码）：
+
+| 上游 | tools/call 结果 |
+|---|---|
+| 信封 `code==0` | `content`（text）+ `structuredContent`（= data） |
+| 信封 `code!=0`（业务错） | `isError: true` + 业务 `msg`（HTTP 200，**不**是 JSON-RPC error） |
+| 非 envelope（如 `json.raw`） | 原样 text content，无 structuredContent（raw 响应**豁免**信封检测——裸业务数据恰好带 code/msg/data 键也不误判） |
+| `json.stream`/`json.sse`（SSE） | `isError`「streaming endpoint, not supported via MCP」（不缓冲） |
+| 传输失败 / 超时（30s） | `isError` |
+
+### `{base}/rpc`：裸 JSON-RPC 2.0
+
+method = operationId（如 `user_account_get`），params 形如
+`{"path": {...}, "query": {...}, "body": {...}}`（与 MCP arguments 同构）。成功：
+`result` = 信封 `data`；业务错误：JSON-RPC **error 对象**（code 取业务 code、message
+取业务 msg——MCP 用 isError 而裸 RPC 没有该概念，error 对象才是正确载体）。同一
+`initialize`/`ping`/通知/batch 纪律。
+
+```bash
+curl -s http://localhost:9778/v1/api/rpc -H 'content-type: application/json' \
+  -H 'accept: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"user_account_get","params":{"query":{"id":"1"}}}'
+# → {"jsonrpc":"2.0","id":1,"result":[...]}
+```
+
+### 线路 A：`oj mcp` 生成 stdio server
+
+```bash
+./bin/oj mcp -c config.yaml -d src          # → mcp/mcp-server.js（缺省输出）
+OJ_BASE=http://localhost:9778 OJ_TOKEN=<jwt> node mcp/mcp-server.js
+```
+
+产物为**自包含** JS（Node ≥18，零依赖）：内嵌 tool 数组 + dispatch 表 + spec_hash；
+NDJSON stdio（stdout 只出协议消息，诊断全走 stderr）。运行时 env：
+
+| env | 必需 | 说明 |
+|---|---|---|
+| `OJ_BASE` | 是 | 服务 origin（如 `http://localhost:9778`）；非 localhost `http://` 启动时 stderr 警告 Bearer 明文 |
+| `OJ_TOKEN` | 否 | Bearer token（与 CLI 同款 JWT） |
+| `OJ_TENANT` | config 声明租户头时 | 租户头**值**；头名（非密钥）生成时已自 config 内嵌 |
+
+MCP client 配置示例（Claude Code）：
+
+```json
+{ "mcpServers": { "oj": { "command": "node", "args": ["/path/to/mcp/mcp-server.js"],
+  "env": { "OJ_BASE": "http://localhost:9778", "OJ_TOKEN": "<jwt>" } } } }
+```
+
+对外的 `{base}/mcp` 端点同理：client 支持 streamable HTTP 时直接配 URL +
+`Authorization: Bearer <jwt>`，无需线路 A。
+
+> **对 MCP 都是 GET 的 `readOnlyHint`**：GET tool 标 `annotations.readOnlyHint`，
+> DELETE 标 `destructiveHint`——agent 侧据此决定是否需人工确认；业务写操作请仍走
+> POST/PUT/PATCH/DELETE，不要为「方便 agent」把写 verb 注册成 GET。

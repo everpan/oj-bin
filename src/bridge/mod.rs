@@ -421,6 +421,10 @@ pub struct ReqState {
     pub req: RequestInfo,
     pub response: Option<Vec<u8>>,
     pub status: u16,
+    /// `json.raw` 置位（v0.1.110）：body 是裸 JSON、无 `{code,msg,data}` 信封——
+    /// MCP/JSON-RPC 的结果映射据此豁免信封检测（raw 业务数据恰好带
+    /// code/msg/data 键时不得误判成错误信封）。
+    pub raw: bool,
     /// 响应头（有序、可重名——Set-Cookie 合法重复；写回时按名去重语义见 server capture_response）。
     pub headers: Vec<(String, String)>,
     pub done: bool,
@@ -477,6 +481,7 @@ impl ReqState {
         self.req = req;
         self.epoch = self.epoch.wrapping_add(1);
         self.response = None;
+        self.raw = false;
         self.status = 200;
         self.headers.clear();
         self.done = false;
@@ -854,6 +859,8 @@ pub struct Capture {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub stream: Option<tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>>,
+    /// `json.raw` 产物（无统一信封；MCP/JSON-RPC 信封检测豁免依据，ReqState.raw 镜像）。
+    pub raw: bool,
 }
 
 impl Capture {
@@ -1239,6 +1246,7 @@ impl Bridge {
             headers: rs.headers.clone(),
             body: rs.response.clone().unwrap_or_default(),
             stream: rx,
+            raw: rs.raw,
         }
     }
 
@@ -1564,6 +1572,7 @@ impl Bridge {
                 headers,
                 body,
                 stream: None,
+                raw: false,
             });
         }
         let mut module: Option<&ModuleCtx> = None;

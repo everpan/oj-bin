@@ -16,6 +16,63 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.110
+
+**feat（serve/oj）**：MCP 双线路 + 裸 JSON-RPC——OpenAPI 一键出 agent 接口
+（spec 2026-10-30，评审 R1–R9）：
+
+- **线路 B（serve 内建，随路由表自动反映）**：`server.mcp.enabled: true` → 挂
+  `{base}/mcp`（MCP streamable HTTP，stateless 子集：initialize 协议协商 /
+  ping / tools/list / tools/call；通知 → 202 空响应；batch → -32600；
+  `Accept: */*` → 406；非 JSON Content-Type → 415；体超 `server.max_upload` → 413；
+  非法 JSON → -32700）。`server.rpc.enabled: true` → 挂 `{base}/rpc`
+  （裸 JSON-RPC 2.0：method = operationId，业务错误为 error 对象且 code 取业务码）。
+  两条端点均默认关闭；动态加入的模块**无需重跑**——端点每次请求读活路由表。
+- **线路 A（离线 codegen，零依赖分发）**：`oj mcp [-c config] [-d dir] [-o mcp/mcp-server.js]`
+  渲染自包含 Node.js stdio MCP server（NDJSON；内嵌 tool 数组 + dispatch 表 +
+  spec_hash；env 注入 `OJ_BASE`/`OJ_TOKEN`/`OJ_TENANT`）。路由变更后须重新生成
+  （文件型分发，不自动跟随）。smoke 用例 env-gated：`OJ_E2E_NODE=1`。
+- **共享核心**：`oj openapi` 的生成本体迁入 `serve::openapi`（字节级不变，
+  `--check` 漂移门禁不受影响）；tool 净化（`[^a-zA-Z0-9_-]`→`_`，>64 截断 +
+  fnv 后缀）、净化后唯一性、inputSchema 拼装（path 恒必填 / body 键 / 任意深度
+  `$ref` → fail-fast）、GET readOnlyHint / DELETE destructiveHint 标注——
+  两线路消费同一份实现。tool 名 = 净化后的 operationId；未声明契约的端点在
+  description 标注 `(no declared input contract — inspect source)`。
+- **结果映射**：envelope `code==0` → `content` + `structuredContent`（= data）；
+  `code!=0` → `isError:true` + 业务 msg（HTTP 200，**不**是 JSON-RPC error）；
+  非 envelope → 原样 text；SSE/stream → isError「streaming endpoint, not
+  supported via MCP」（不缓冲）；解析从不 gate 在 HTTP 状态码。`/rpc` 变体：
+  业务错误为 JSON-RPC error 对象。
+- **配置面**（`server:` 段）：`mcp: { enabled, modules?, allow_anonymous? }`、
+  `rpc: { enabled }`。`mcp.enabled && 无 auth 插件 && !allow_anonymous` → 启动
+  fail-fast（绝不静默暴露匿名 catalog）；`modules` 白名单 fail-closed（无交集 =
+  空列表，不回落全集）；端点 admit 按各 tool 自身路径粒度（不摊平）。
+- **安全硬化（R9）**：3xx `redirect:"manual"` 当错误；非 localhost `http://`
+  → stderr 明文 Bearer 警告；租户头名（非密钥）自 config 内嵌进线路 A 产物，
+  值取 `OJ_TENANT` env；路径参数单段 `encodeURIComponent`（`/` 走私正确 miss）、
+  catch-all `{*x}` 原样插入；`sample/` 不带 `allow_anonymous`（手工冒烟需 token）。
+- **fix（v0.1.110 终审一轮）**：
+  - inputSchema 与 arguments 形状同构（终审 blocker）：schema 改为嵌套三键
+    `path`/`query`/`body`（键内 required 随通道），不再平铺公布——client 按
+    tools/list 发的参数此前在执行侧找不到而 -32602。
+  - 线路 A catch-all 逐段编码（终审 major）：原样插入会让 `..`/`?` 经 URL
+    归一化逃出 tool 前缀或走私 query。
+  - `server.rpc.allow_anonymous`（终审 major）：/rpc 与 /mcp 共用执行链，
+    auth fail-fast 门控口径对齐。
+  - `Capture.raw` 标志（终审 major）：`json.raw` 响应豁免信封检测——裸业务
+    数据恰好带 code/msg/data 键不再被误判成错误信封（MCP isError / RPC
+    error code 取业务码两类误判一并消除）。
+  - modules 白名单防静态遮蔽（终审 major）：catch-all tool 填充后 lookup
+    命中行必须即本 tool 的行，否则 -32603。
+  - 杂项：Accept 媒体类型精确比对（jsonx 不再误放）；组帧校验 jsonrpc=="2.0"
+    与 method 存在（-32600）；A 侧 id 回显不误吞 0/""；占位符替换顺序
+    （token 先行）；hop-by-hop/content-length/host 头不进 handler 面；
+    A/B is_envelope 同口径（data 键必在）；/rpc 文档示例补 accept 头；
+    「活路由表」措辞精确化（dev 裸新增目录不进 RouteTable）。
+- **e2e/单测**：serve 18 单测 + oj e2e 6 条（默认 404 门/拒启/list/call 全流/
+  isError/白名单 fail-closed/rpc 对parity）+ 渲染单测 6 条 + stdio 冒烟 1 条。
+  修复 e2e 抓出的 `fill_path` 回归（无参模板 + 缺省 path 对象误 -32602）。
+
 ## v0.1.109
 
 **feat（db）**：U-14 DDL 生成（正向 + 反向，dbx PR-2/PR-9 解锁）：

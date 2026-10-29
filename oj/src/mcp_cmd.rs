@@ -8,7 +8,8 @@
 //! 模板纪律（spec 线路 A + R9，逐字）：NDJSON stdio；stdout 纯净（诊断全走
 //! `console.error`）；方法集 initialize（协商+capabilities+serverInfo）/ping/
 //! tools/list/tools/call；通知不回写；batch → -32600；path 单段 `encodeURIComponent`、
-//! catch-all 走 `decodeURI` 原样插入；query 值 String() 化；解析**不 gate 在
+//! catch-all **逐段**编码（跨段 `/` 保留——原样插入会让 `..`/`?` 经 URL 归一化逃出
+//! tool 前缀，终审 major）；query 值 String() 化；解析**不 gate 在
 //! res.ok**（envelope 检测与 HTTP 状态解耦）；`text/event-stream` 或
 //! `AbortSignal.timeout(30s)` → isError「streaming endpoint, not supported via MCP」；
 //! token/base 全走 `process.env.OJ_TOKEN`/`OJ_BASE`；`redirect: "manual"`（3xx 当
@@ -62,7 +63,13 @@ function fillPath(tmpl, args, catchAll) {
       if (v === undefined || v === null) {
         throw { code: -32602, message: "missing path argument: " + name };
       }
-      segs.push(catchAll.has(name) ? decodeURI(String(v)) : encodeURIComponent(String(v)));
+      // catch-all 也逐段编码（终审 major：原样插入会让 `..`/`?` 经 URL 归一化
+      // 逃出 tool 前缀或走私 query）；跨段 `/` 保留为真实分隔符。
+      segs.push(
+        catchAll.has(name)
+          ? String(v).split("/").map((s) => encodeURIComponent(s)).join("/")
+          : encodeURIComponent(String(v))
+      );
     } else {
       segs.push(seg);
     }
@@ -124,7 +131,9 @@ async function callTool(name, args) {
   const text = await res.text();
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) { /* raw text below */ }
-  if (parsed && typeof parsed === "object" && typeof parsed.code === "number" && typeof parsed.msg === "string") {
+  // 与 Rust 侧 is_envelope 逐字同口径（终审 minor：data 键必在，防业务对象误判）。
+  if (parsed && typeof parsed === "object" && typeof parsed.code === "number" &&
+      typeof parsed.msg === "string" && "data" in parsed) {
     if (parsed.code === 0) {
       const data = parsed.data === undefined ? null : parsed.data;
       return {
@@ -143,10 +152,10 @@ async function dispatch(msg) {
     return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "batch not supported" } };
   }
   if (!msg || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
-    return { jsonrpc: "2.0", id: (msg && msg.id) || null, error: { code: -32600, message: "invalid request" } };
+    return { jsonrpc: "2.0", id: msg && "id" in msg ? msg.id : null, error: { code: -32600, message: "invalid request" } };
   }
   const isNotify = msg.id === undefined;
-  const err = (code, message) => ({ jsonrpc: "2.0", id: msg.id || null, error: { code, message } });
+  const err = (code, message) => ({ jsonrpc: "2.0", id: "id" in msg ? msg.id : null, error: { code, message } });
   switch (msg.method) {
     case "initialize": {
       if (isNotify) return undefined;
@@ -225,13 +234,15 @@ pub fn render_server(
         ),
         None => "const TENANT_HEADER = null;".to_string(),
     };
+    // 替换顺序有讲究（终审 minor）：token 先行、tools/dispatch 最后——tool 描述里
+    // 的字面 __HASH__ 不会被后续 replace 改写。
     TEMPLATE
-        .replace("__TOOLS_JSON__", &tools_json)
-        .replace("__DISPATCH_JSON__", &dispatch_json)
         .replace("__BASE_PATH__", base)
         .replace("__TENANT_HEADER__", &tenant_js)
         .replace("__HASH8__", spec_hash.get(..8).unwrap_or(spec_hash))
         .replace("__HASH__", spec_hash)
+        .replace("__TOOLS_JSON__", &tools_json)
+        .replace("__DISPATCH_JSON__", &dispatch_json)
 }
 
 /// spec JSON 的确定性短散列（fnv1a64 复用 serve::mcp，标注用，非密码学）。
@@ -324,7 +335,7 @@ mod tests {
 
     // Given 两个 tool（其一 catch-all）
     // When render_server
-    // Then 产物含两 dispatch 表项；catch-all 参数走 decodeURI 分支（fillPath 有该分支），
+    // Then 产物含两 dispatch 表项；catch-all 参数走逐段编码分支（fillPath 有该分支），
     //      且 catchAll 名单随 dispatch 内嵌
     #[test]
     fn render_embeds_tool_map_with_catchall_branch() {
@@ -342,8 +353,11 @@ mod tests {
             "{js}"
         );
         assert!(js.contains(r#""catchAll":["path"]"#), "{js}");
-        // catch-all 分支存在（decodeURI）且单段编码存在（encodeURIComponent）
-        assert!(js.contains("decodeURI(String(v))"), "{js}");
+        // catch-all 分支：逐段编码（终审 major——原样插入可路径穿越），单段编码在位
+        assert!(
+            js.contains("String(v).split(\"/\").map((s) => encodeURIComponent(s)).join(\"/\")"),
+            "{js}"
+        );
         assert!(js.contains("encodeURIComponent(String(v))"), "{js}");
     }
 

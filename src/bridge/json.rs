@@ -151,6 +151,7 @@ pub fn op_json_raw(state: &mut OpState, #[string] data_json: String) {
     let s = state.borrow_mut::<ReqState>();
     s.response = Some(data_json.into_bytes());
     s.status = 200;
+    s.raw = true;
     ensure_json_content_type(s);
     s.done = true;
 }
