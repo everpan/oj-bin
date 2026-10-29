@@ -16,6 +16,25 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.106
+
+**fix（db）**：`db.listIndexes` / `db.listForeignKeys` 在真实 MySQL / PostgreSQL 上必现语法
+错误——内省 SQL 的投影别名未按方言转义保留字：
+
+- PG 索引变体误用 MySQL 风格反引号（PG 不认），改为双引号 `"unique"` / `"primary"` /
+  `"column"`；
+- MySQL 索引/外键变体的保留字别名 `column` 补反引号；PG 外键变体的 `column` 补双引号；
+- 同类隐患一并修掉：catalog `constraints` 的 MySQL / PG 变体同样裸投影 `column`；
+- 别名键名保持不变（下游按 `column` / `unique` / `primary` 读取）；
+- 新增静态守卫 `reserved_word_aliases_quoted_per_dialect`：PG 变体不得含反引号、保留字
+  别名须被 `"` 包裹，MySQL 变体须被 `` ` `` 包裹（CI 无真实 PG/MySQL 的离线防线）；
+- 新增 env-gated 真库矩阵腿 `list_indexes_and_foreign_keys_real_pg_mysql`
+  （`src/bridge/db_tests.rs`，设 `OJ_TEST_PG` / `OJ_TEST_MYSQL` 时跑，未设 skip 并诚实登记）。
+
+**fix（CI）**：`scripts/npm-publish.sh` 发布后置信的 tarball 文件清单断言补退避 retry
+（8 次、与元数据同款节奏）。v0.1.105 发布实证：publish 后 ~4 分钟元数据已可见、tarball
+仍 404 致整个 job 假红（包实际发布成功，重跑验证腿才转绿）。retry 后此 flake 不再阻塞发版。
+
 ## v0.1.105
 
 **上游 REQ-04 处置（U-17 批；需求源 `oj-dbx/docs/upstream`）——库/schema 层内省：

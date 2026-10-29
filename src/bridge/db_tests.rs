@@ -416,6 +416,72 @@ async fn listing_and_for_schema_matrix_pg_mysql() {
     }
 }
 
+/// 缺陷修复（env-gated 真库矩阵腿）：listIndexes / listForeignKeys 的投影别名含
+/// 保留字（column / unique / primary），MySQL 8 / PG 下裸投影必现语法错误。真库各建
+/// 一对带普通索引 + PK + 外键的表，断言两件不报错且形状正确。未设 OJ_TEST_PG /
+/// OJ_TEST_MYSQL 则 skip（诚实登记；CI 离线防线 =
+/// introspect::tests::reserved_word_aliases_quoted_per_dialect）。
+#[tokio::test(flavor = "current_thread")]
+async fn list_indexes_and_foreign_keys_real_pg_mysql() {
+    for (env, tag) in [("OJ_TEST_PG", "pg"), ("OJ_TEST_MYSQL", "mysql")] {
+        let Ok(url) = std::env::var(env) else {
+            eprintln!("skip: {env} unset");
+            continue;
+        };
+        if url.is_empty() {
+            eprintln!("skip: {env} empty");
+            continue;
+        }
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for s in [
+            "drop table if exists oj_ixfk_c",
+            "drop table if exists oj_ixfk_p",
+            "create table oj_ixfk_p(id int primary key)",
+            "create table oj_ixfk_c(id int primary key, p_id int, \
+             foreign key (p_id) references oj_ixfk_p(id))",
+            "create index oj_ixfk_c_ix on oj_ixfk_c(p_id)",
+        ] {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let b = Bridge::with_dbs_and_loader(
+            std::collections::HashMap::from([("default".to_string(), db as _)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Default::default(),
+        );
+        let cap = b
+            .run_with(
+                r#"(async () => {
+                     const idx = await db.listIndexes('oj_ixfk_c');
+                     const fks = await db.listForeignKeys('oj_ixfk_c');
+                     const ix = idx.find((i) => i.name === 'oj_ixfk_c_ix');
+                     const pk = idx.find((i) => i.primary === true);
+                     json.ok({
+                       ixCols: ix && ix.columns,
+                       pkCols: pk && pk.columns,
+                       fkLen: fks.length,
+                       fkTable: fks[0] && fks[0].refTable,
+                       fkCols: fks[0] && fks[0].columns,
+                       fkRefs: fks[0] && fks[0].refColumns,
+                     });
+                   })().catch(e => json.fail(500, String(e)))"#,
+                crate::bridge::RequestInfo::default(),
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{tag}: 内省两件须不再语法错误: {v}");
+        assert_eq!(v["data"]["ixCols"], json!(["p_id"]), "{tag}: {v}");
+        assert_eq!(v["data"]["pkCols"], json!(["id"]), "{tag}: {v}");
+        assert_eq!(v["data"]["fkLen"], json!(1), "{tag}: {v}");
+        assert_eq!(v["data"]["fkTable"], json!("oj_ixfk_p"), "{tag}: {v}");
+        assert_eq!(v["data"]["fkCols"], json!(["p_id"]), "{tag}: {v}");
+        assert_eq!(v["data"]["fkRefs"], json!(["id"]), "{tag}: {v}");
+    }
+}
+
 /// REQ-05 Q7（env-gated，三方言矩阵的 pg/mysql 腿）：语句级超时在**网络型后端**
 /// 准点触发——5s 级慢语句（pg_sleep/sleep）+ 500ms 上限 → ~500ms 拿
 /// OJ_DB_TIMEOUT（data.cancelled=false：网络方言弃 future ≠ 服务端取消，内置

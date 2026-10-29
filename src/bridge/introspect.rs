@@ -150,7 +150,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
              (index_name = 'PRIMARY') AS `primary`, \
              CASE WHEN index_name = 'PRIMARY' THEN 'pk' \
                   WHEN non_unique = 0 THEN 'u' ELSE 'c' END AS origin, \
-             column_name AS column, seq_in_index AS seq \
+             column_name AS `column`, seq_in_index AS seq \
              FROM information_schema.statistics \
              WHERE table_schema = DATABASE() AND table_name = ? \
              ORDER BY index_name, seq_in_index"
@@ -158,11 +158,11 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
         // pg：`indkey` 是 `int2vector`（伪数组），`unnest` 必须显式转 `int2[]`；
         // `pg_*` 无 schema 列 → 靠 `relnamespace` + `current_schema()` 限定。
         (Kind::Indexes, Dialect::Postgres) => {
-            "SELECT c.relname::text AS name, i.indisunique AS `unique`, \
-             i.indisprimary AS `primary`, \
+            "SELECT c.relname::text AS name, i.indisunique AS \"unique\", \
+             i.indisprimary AS \"primary\", \
              CASE WHEN i.indisprimary THEN 'pk' WHEN i.indisunique THEN 'u' \
                   ELSE 'c' END AS origin, \
-             a.attname::text AS column, k.ord AS seq \
+             a.attname::text AS \"column\", k.ord AS seq \
              FROM pg_class t \
              JOIN pg_index i ON i.indrelid = t.oid \
              JOIN pg_class c ON c.oid = i.indexrelid \
@@ -185,7 +185,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
         // 复合外键的两端配对用 `position_in_unique_constraint`（不是 `ordinal_position`）。
         (Kind::ForeignKeys, Dialect::MySql) => {
             "SELECT constraint_name AS group_key, constraint_name AS name, \
-             column_name AS column, referenced_table_name AS ref_table, \
+             column_name AS `column`, referenced_table_name AS ref_table, \
              referenced_column_name AS ref_column, \
              ordinal_position AS col_pos, position_in_unique_constraint AS ref_pos \
              FROM information_schema.key_column_usage \
@@ -196,7 +196,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
         // pg：`conkey` / `confkey` 都是 `int2[]`，直接 `unnest` 并**按 ordinality 配对**。
         (Kind::ForeignKeys, Dialect::Postgres) => {
             "SELECT con.conname::text AS group_key, con.conname::text AS name, \
-             a.attname::text AS column, rt.relname::text AS ref_table, \
+             a.attname::text AS \"column\", rt.relname::text AS ref_table, \
              ra.attname::text AS ref_column, ck.ord AS col_pos, fk.ord AS ref_pos \
              FROM pg_constraint con \
              JOIN pg_class t ON t.oid = con.conrelid \
@@ -313,7 +313,7 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
         // sqlite：CHECK 只存在于建表文本，目录无来源 → unsupported（文本解析归批 b）。
         (Kind::Constraints, Dialect::MySql) => Some(
             "SELECT tc.constraint_name AS name, tc.constraint_type AS type, \
-                  NULL AS definition, kcu.column_name AS column, kcu.ordinal_position AS pos \
+                  NULL AS definition, kcu.column_name AS `column`, kcu.ordinal_position AS pos \
                   FROM information_schema.table_constraints tc \
                   JOIN information_schema.key_column_usage kcu \
                        ON kcu.constraint_schema = tc.constraint_schema \
@@ -326,7 +326,7 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
             "SELECT con.conname::text AS name, \
                   CASE con.contype WHEN 'p' THEN 'pk' WHEN 'u' THEN 'uq' ELSE 'ck' END AS type, \
                   pg_get_constraintdef(con.oid)::text AS definition, \
-                  NULL AS column, NULL AS pos \
+                  NULL AS \"column\", NULL AS pos \
                   FROM pg_constraint con \
                   JOIN pg_class t ON t.oid = con.conrelid \
                   JOIN pg_namespace n ON n.oid = t.relnamespace \
@@ -736,6 +736,47 @@ mod tests {
                 "{kind:?}: PG 缺 schema 限定: {s}"
             );
         }
+    }
+
+    /// 保留字别名须按方言加引号（CI 无真实 PG/MySQL 的离线防线）：
+    /// `column` 在 mysql 8 / pg 均为保留字，`unique`/`primary` 同理——裸投影直接语法错误。
+    /// pg 用双引号且**不得出现反引号**；mysql 用反引号。sqlite 不保留这些词，豁免。
+    #[test]
+    fn reserved_word_aliases_quoted_per_dialect() {
+        for kind in [Kind::Indexes, Kind::ForeignKeys] {
+            let my = sql(kind, Dialect::MySql);
+            assert!(
+                !my.contains("AS column"),
+                "mysql {kind:?} 裸保留字别名: {my}"
+            );
+            assert!(
+                my.contains("AS `column`"),
+                "mysql {kind:?} 缺 `column` 引用: {my}"
+            );
+            let pg = sql(kind, Dialect::Postgres);
+            assert!(!pg.contains('`'), "PG {kind:?} 不得出现反引号: {pg}");
+            assert!(
+                pg.contains("AS \"column\""),
+                "PG {kind:?} 缺 \"column\" 引用: {pg}"
+            );
+        }
+        // Indexes 另投影 unique/primary 两个保留字别名。
+        assert!(sql(Kind::Indexes, Dialect::MySql).contains("AS `unique`"));
+        assert!(sql(Kind::Indexes, Dialect::MySql).contains("AS `primary`"));
+        assert!(sql(Kind::Indexes, Dialect::Postgres).contains("AS \"unique\""));
+        assert!(sql(Kind::Indexes, Dialect::Postgres).contains("AS \"primary\""));
+        // catalog Constraints 同样投影 `column`（缺陷同类，一并钉死）。
+        assert!(
+            catalog_sql(Kind::Constraints, Dialect::MySql)
+                .unwrap()
+                .contains("AS `column`")
+        );
+        let pg_c = catalog_sql(Kind::Constraints, Dialect::Postgres).unwrap();
+        assert!(!pg_c.contains('`'), "PG constraints 不得出现反引号: {pg_c}");
+        assert!(
+            pg_c.contains("AS \"column\""),
+            "PG constraints 缺 \"column\" 引用: {pg_c}"
+        );
     }
 
     /// 聚合：索引按名合并列、外键按位配对、sqlite 无名 → null。

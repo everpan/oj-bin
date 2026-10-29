@@ -209,7 +209,17 @@ if [[ "${DRY_RUN:-0}" != "1" ]]; then
       darwin) want='package/oj$|\.dylib$' ;;
       *)      want='package/oj$|\.so$' ;;
     esac
-    list=$(curl -fsSL "$tb" | tar -tzf -) || { echo "::error::${pkg} tarball 获取/解压清单失败" >&2; exit 1; }
+    # tarball CDN 传播比元数据更慢（v0.1.105 实证：publish 后 ~4min 元数据已可见、
+    # tarball 仍 404）——与元数据同款退避 retry，勿单发即判失败。
+    list=""
+    for attempt in 1 2 3 4 5 6 7 8; do
+      if list=$(curl -fsSL --max-time 60 "$tb" | tar -tzf - 2>/dev/null) && [[ -n "$list" ]]; then
+        break
+      fi
+      list=""
+      [[ $attempt -lt 8 ]] && sleep $(( attempt * 15 > 60 ? 60 : attempt * 15 ))
+    done
+    [[ -n "$list" ]] || { echo "::error::${pkg} tarball 获取/解压清单失败（retry 8 次仍不可达，registry CDN 传播超时）: $tb" >&2; exit 1; }
     echo "$list" | grep -qE "$want" || { echo "::error::${pkg} tarball 文件清单断言失败" >&2; exit 1; }
     echo "verified ${pkg}@${VERSION} os=$os cpu=$cpu"
   done
