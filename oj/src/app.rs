@@ -2034,6 +2034,29 @@ impl App {
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
         config::validate_tenant_binding(&cfg, auth.is_some())?;
+        // U-18 批 T1.3：装配期 fail-fast——pattern 悬空（零命中/含 {}）在监听前拒绝，
+        // 热更路径复用同一装配，悬空 reload 同样被点名拒绝。
+        let route_timeouts: Vec<(String, std::time::Duration)> = cfg
+            .server
+            .route_timeouts
+            .iter()
+            .map(|r| {
+                if r.pattern.trim().is_empty() {
+                    return Err("server.route_timeouts: empty pattern".to_string());
+                }
+                config::parse_duration(&r.timeout)
+                    .map(|d| (r.pattern.clone(), d))
+                    .map_err(|e| format!("server.route_timeouts[{}]: {e}", r.pattern))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        {
+            let route_keys: Vec<String> = tables
+                .iter()
+                .flat_map(|(_, t)| t.patterns().into_iter().map(str::to_string))
+                .collect();
+            let pats: Vec<String> = route_timeouts.iter().map(|(p, _)| p.clone()).collect();
+            validate_route_timeouts(&pats, &route_keys)?;
+        }
         let pipeline = serve::Pipeline {
             tenant_header: cfg.tenant.enable.then(|| cfg.tenant.header_key.clone()),
             tenant_require_signed_claim: cfg.tenant.require_signed_claim,
@@ -2041,21 +2064,8 @@ impl App {
             auth: auth.clone(),
             max_upload: cfg.server.max_upload_bytes,
             blob_upload_max: cfg.server.blob_upload_max_bytes,
-            // oj-5c：路由级 timeout 覆盖——装配期解析 fail-fast（非法时长/空 pattern
-            // 都是配置错误，静默忽略等于部署了假保险）。
-            route_timeouts: cfg
-                .server
-                .route_timeouts
-                .iter()
-                .map(|r| {
-                    if r.pattern.trim().is_empty() {
-                        return Err("server.route_timeouts: empty pattern".to_string());
-                    }
-                    config::parse_duration(&r.timeout)
-                        .map(|d| (r.pattern.clone(), d))
-                        .map_err(|e| format!("server.route_timeouts[{}]: {e}", r.pattern))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
+            // oj-5c：路由级 timeout 覆盖（解析/校验见上方 T1.3：fail-fast 含悬空 pattern 拒启）。
+            route_timeouts,
             // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
             blob: stable.blobs.default(),
         };

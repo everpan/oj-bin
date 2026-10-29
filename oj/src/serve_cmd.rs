@@ -2853,6 +2853,45 @@ mod tests {
         );
     }
 
+    /// U-18 批 T1.4：route_timeouts 悬空 pattern → 真装配拒启（文案点名 pattern 与路由数）。
+    /// 反向：命中已注册路由的 pattern 正常起服务。
+    #[tokio::test]
+    async fn route_timeouts_dangling_pattern_rejects_boot() {
+        let t = tmpdir("rt-dangling");
+        let src = t.0.join("src");
+        std::fs::create_dir_all(src.join("m")).unwrap();
+        std::fs::write(
+            src.join("m/manifest.yaml"),
+            "name: m\ndesc: rt-test\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("m/api.ts"),
+            "export default { get() { return json.ok(1); } };",
+        )
+        .unwrap();
+        let mk = |pattern: &str| {
+            let mut cfg = cert_cfg(&t.0);
+            cfg.server.port = 0;
+            cfg.db.insert("default".into(), "sqlite://:memory:".into());
+            cfg.server.route_timeouts.push(config::RouteTimeoutConf {
+                pattern: pattern.into(),
+                timeout: "1s".into(),
+            });
+            cfg
+        };
+        let e = start(mk("/v1/api/ghost"), &t.0, src.clone(), "/v1/api".into())
+            .await
+            .unwrap_err();
+        assert!(e.contains("/v1/api/ghost"), "{e}");
+        assert!(e.contains("matches none of"), "{e}");
+        // 反向：命中真实路由 → 起服务成功（句柄立即关闭）。
+        let (_addr, h) = start(mk("/v1/api/m"), &t.0, src, "/v1/api".into())
+            .await
+            .unwrap();
+        h.abort();
+    }
+
     #[test]
     fn admission_gate_mounts() {
         // 规则 5：mounts（config + CLI 折叠后）空 → Err；任一挂载 → Ok。
