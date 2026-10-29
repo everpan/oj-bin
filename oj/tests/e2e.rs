@@ -3033,3 +3033,79 @@ async fn mcp_e2e_rpc_parity() {
     .await;
     assert_eq!(s, 404);
 }
+
+/// A 线路冒烟（env-gated：`OJ_E2E_NODE` 未设则诚实 skip 并打印提示）。
+/// Given node ≥18 可用且 e2e server（auth 关）已起
+/// When `oj mcp` 渲染产物以 stdio 驱动 initialize → tools/list → tools/call
+/// Then 协商回显 + catalog 含已知 tool + call 成功为 structuredContent（真 HTTP 回环）
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_stdio_server_handshakes() {
+    if std::env::var("OJ_E2E_NODE").is_err() {
+        eprintln!("SKIP generated_stdio_server_handshakes: set OJ_E2E_NODE=1 (needs node >= 18)");
+        return;
+    }
+    let _g = lock();
+    let (addr, _h, tmp) = boot(true).await;
+    // 渲染：对 sample src 离线生成（不经 serve 端点，纯 codegen 路径）。
+    let out = tmp.join("mcp-server.js");
+    let code = oj::mcp_cmd::run(&oj::args::McpArgs {
+        config: Some(sample().join("config.yaml").display().to_string()),
+        site: None,
+        dir: Some(sample().join("src").display().to_string()),
+        module_root: None,
+        base: None,
+        out: Some(out.display().to_string()),
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert!(out.is_file());
+    // spawn stdio server。
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut child = tokio::process::Command::new("node")
+        .arg(&out)
+        .env("OJ_BASE", format!("http://{addr}"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn node（OJ_E2E_NODE 已设：须可用）");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let send = async |stdin: &mut tokio::process::ChildStdin, msg: &str| {
+        stdin.write_all(msg.as_bytes()).await.unwrap();
+        stdin.write_all(b"\n").await.unwrap();
+        stdin.flush().await.unwrap();
+    };
+    // initialize → 协商回显 + capabilities。
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}"#).await;
+    let v: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(v["result"]["protocolVersion"], "2025-06-18", "{v}");
+    assert!(v["result"]["capabilities"]["tools"].is_object(), "{v}");
+    // tools/list → catalog 含 user_account_get。
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    )
+    .await;
+    let v: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let names: Vec<&str> = v["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"user_account_get"), "{names:?}");
+    // tools/call（query id=1）→ 成功无 isError，structuredContent = envelope data。
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"user_account_get","arguments":{"query":{"id":"1"}}}}"#).await;
+    let v: serde_json::Value =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let r = &v["result"];
+    assert!(r.get("isError").is_none(), "{v}");
+    assert_eq!(r["content"][0]["type"], "text", "{v}");
+    assert!(r["structuredContent"].is_array(), "{v}");
+    drop(stdin);
+    let _ = child.wait().await;
+}
