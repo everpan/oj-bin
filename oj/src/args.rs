@@ -124,6 +124,24 @@ pub struct OpenApiArgs {
     /// 输出文件；省略则写 stdout。`--check` 时作为待比对文件，缺省 `<dir>/openapi.json`
     pub out: Option<String>,
 }
+
+/// `oj mcp [-c config] [-d dir] [--base B] [-o mcp/mcp-server.js]`：
+/// 离线生成**零依赖** Node.js stdio MCP server（线路 A；spec 2026-10-30）。
+/// 与 `OpenApiArgs` 同构（无 `--check`——生成物是自包含 JS，漂移由 spec_hash 标注）。
+pub struct McpArgs {
+    /// 配置文件路径（租户头名来源；db/路由前缀来源）；缺省自动搜索
+    pub config: Option<String>,
+    /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录与前缀；与 -d/-b 互斥
+    pub site: Option<String>,
+    /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
+    pub dir: Option<String>,
+    /// 源码树根（`--module-root`）：Some = 在其子树内递归发现模块；None = 平铺语义
+    pub module_root: Option<String>,
+    /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
+    pub base: Option<String>,
+    /// 输出文件；缺省 `mcp/mcp-server.js`（相对当前目录）
+    pub out: Option<String>,
+}
 pub struct MigrateArgs {
     pub config: Option<String>,
     /// 选择挂载（v0.1.58 `--site <prefix>`）；与 `-d` 互斥。
@@ -213,6 +231,7 @@ pub enum Command {
     SecretSeal(SecretSealArgs),
     SecretOpen(SecretOpenArgs),
     OpenApi(OpenApiArgs),
+    Mcp(McpArgs),
     Info(InfoArgs),
 }
 
@@ -548,6 +567,28 @@ enum Commands {
         #[arg(short, long)]
         out: Option<String>,
     },
+    /// 离线生成零依赖 Node.js stdio MCP server（方法集 initialize/ping/tools/list/tools/call）
+    #[command(name = "mcp")]
+    Mcp {
+        /// 配置文件路径（租户头名来源；db/路由前缀来源）；缺省自动搜索
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 选择挂载（挂载 prefix，如 /v2）：命中 api 挂载 → 用其目录与前缀；与 -d/-b 互斥
+        #[arg(long = "site")]
+        site: Option<String>,
+        /// 服务目录（api 根：src 或 dist）；模式自动判定；缺省自 config 逐级搜 src 优先
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 源码树根（v0.1.85）：在该目录的子树内**递归**找 `manifest.yaml`；与 `-d` 互斥
+        #[arg(long = "module-root", conflicts_with = "dir")]
+        module_root: Option<String>,
+        /// API 基础路由前缀；缺省用第一条 api 挂载的 prefix（默认 /v1/api）
+        #[arg(short, long)]
+        base: Option<String>,
+        /// 输出文件；缺省 `mcp/mcp-server.js`（相对当前目录）
+        #[arg(short, long)]
+        out: Option<String>,
+    },
     /// phpinfo 风格诊断：版本/ABI/插件/后端注册/配置段（值不出）
     Info {
         /// 配置文件路径（缺省自动搜索；未找到用内置默认值）
@@ -849,6 +890,21 @@ fn to_command(cli: Cli) -> Command {
             module_root,
             base,
             check,
+            out,
+        }),
+        Commands::Mcp {
+            config,
+            site,
+            dir,
+            module_root,
+            base,
+            out,
+        } => Command::Mcp(McpArgs {
+            config,
+            site,
+            dir,
+            module_root,
+            base,
             out,
         }),
         Commands::Info { config } => Command::Info(InfoArgs { config }),

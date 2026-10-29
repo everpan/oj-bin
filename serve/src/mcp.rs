@@ -24,6 +24,10 @@ pub struct ToolDispatch {
     pub method: String,
     /// 带 base 前缀的 OpenAPI 路径（`{*x}` 已收敛为 `{x}`）。
     pub oa_path: String,
+    /// catch-all（`{*name}`）参数名集合（spec 丢失该信息，由消费方按路由表回补；
+    /// serve 端点不走它——raw_pattern_for 直接拿 raw 模板；`oj mcp` 模板据此决定
+    /// 「原样插入 vs encodeURIComponent」）。空 = 无 catch-all 参数。
+    pub catch_all: Vec<String>,
 }
 
 /// 净化 operationId 为合法 MCP tool 名：`[^a-zA-Z0-9_-]` → `_`；
@@ -48,7 +52,7 @@ pub fn sanitize_name(raw: &str) -> String {
 }
 
 /// fnv1a64：短输入的确定性散列（净化截断后缀与碰撞去重用，非密码学用途）。
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);
@@ -143,6 +147,7 @@ pub fn spec_to_tools(spec: &Value) -> Result<Vec<McpTool>, String> {
                     operation_id,
                     method: method.clone(),
                     oa_path: oa_path.clone(),
+                    catch_all: Vec::new(),
                 },
             });
         }

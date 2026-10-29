@@ -145,8 +145,9 @@ fn apply_modules_filter(tools: Vec<McpTool>, modules: Option<&Vec<String>>) -> V
 }
 
 /// 由 table 找回 raw pattern（oa_path 已把 `{*x}` 收敛为 `{x}`，丢失 catch-all
-/// 信息；填充编码策略必须按 raw pattern 段判定）。
-fn raw_pattern_for(table: &RouteTable, oa_path: &str, method: &str) -> Option<String> {
+/// 信息；填充编码策略必须按 raw pattern 段判定）。pub：`oj mcp` codegen 复用
+/// （线路 A 需同款反查来回补 ToolDispatch.catch_all）。
+pub fn raw_pattern_for(table: &RouteTable, oa_path: &str, method: &str) -> Option<String> {
     table
         .listing()
         .iter()
@@ -602,6 +603,7 @@ mod tests {
                 operation_id: "t".into(),
                 method: "get".into(),
                 oa_path: "/t".into(),
+                catch_all: Vec::new(),
             },
         };
         let tools = vec![mk_tool(json!(["user"])), mk_tool(Value::Null)];

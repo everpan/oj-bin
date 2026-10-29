@@ -20,6 +20,7 @@ pub mod exec_cmd;
 pub mod exec_ext;
 pub mod info_cmd;
 pub mod manifest;
+pub mod mcp_cmd;
 pub mod migrate;
 pub mod migrate_cmd;
 pub mod mount_fetch;

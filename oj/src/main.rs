@@ -99,6 +99,13 @@ pub async fn run_command(cmd: Command) -> i32 {
                 1
             }
         },
+        Command::Mcp(a) => match oj::mcp_cmd::run(&a).await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("oj mcp: {e}");
+                1
+            }
+        },
         Command::Info(a) => match oj::info_cmd::run(a.config.as_deref()).await {
             Ok(()) => 0,
             Err(e) => {
