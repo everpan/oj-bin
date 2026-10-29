@@ -157,6 +157,20 @@ pub struct Pipeline {
     /// Some = blob 启用：`{base}/blob/{key}` 公开下载（local 直出 / s3 302 presign）；
     /// PUT 同一前缀 = 守卫保护下的直传上传（v0.1.30）。
     pub blob: Option<Arc<dyn BlobBackend>>,
+    /// Some = MCP 启用：挂 `{base}/mcp`（streamable HTTP，spec 2026-10-30 R7/R8/R9）。
+    /// None = 不挂（默认）。modules 白名单 fail-closed；装配期已做无 auth fail-fast。
+    pub mcp: Option<McpConfig>,
+    /// true = 挂 `{base}/rpc`（裸 JSON-RPC 2.0，method=operationId）。独立门。
+    pub rpc: bool,
+}
+
+/// MCP 端点配置（serve 侧载体；config.rs 的 `McpCfg` 在装配层转来）。
+#[derive(Clone, Debug, Default)]
+pub struct McpConfig {
+    /// 模块/tag 白名单（fail-closed）：Some 时仅保留 tags 有交集的 tool。
+    pub modules: Option<Vec<String>>,
+    /// 装配期已消费（无 auth fail-fast 在 oj/src/app.rs）；运行期仅作记录。
+    pub allow_anonymous: bool,
 }
 
 impl Default for Pipeline {
@@ -170,6 +184,8 @@ impl Default for Pipeline {
             blob_upload_max: 1024 * 1024 * 1024, // 1GiB
             route_timeouts: Vec::new(),
             blob: None,
+            mcp: None,
+            rpc: false,
         }
     }
 }

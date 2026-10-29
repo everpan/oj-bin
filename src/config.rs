@@ -129,6 +129,31 @@ pub struct RouteTimeoutConf {
     pub timeout: String,
 }
 
+/// MCP 端点配置（spec 2026-10-30，R7/R8/R9）：`server.mcp` 段存在且
+/// `enabled: true` → 挂 `{base}/mcp`（streamable HTTP，stateless 子集）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct McpCfg {
+    /// 缺省 false：tool 枚举面默认不外露。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 模块/tag 白名单（R9 fail-closed）：Some 时仅保留 tags 与名单有交集的 tool，
+    /// 无 tags 的路由排除，名单匹配不到任何模块 → **空列表**（不得回落全集）。
+    /// None = 不过滤。
+    #[serde(default)]
+    pub modules: Option<Vec<String>>,
+    /// 显式允许无 auth 插件时暴露（默认 fail-fast：enabled && auth 未装配 → 拒启）。
+    #[serde(default)]
+    pub allow_anonymous: bool,
+}
+
+/// 裸 JSON-RPC 2.0 端点（spec 2026-10-30）：`server.rpc.enabled: true` → 挂
+/// `{base}/rpc`（method = operationId，与 MCP 解耦的独立门）。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct RpcCfg {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerCfg {
@@ -223,6 +248,12 @@ pub struct ServerCfg {
     /// 后端重装配），与业务路由裸奔不等价，必须显式开启。
     #[serde(default)]
     pub reload_api: bool,
+    /// MCP 端点（R7/R8/R9，spec 2026-10-30）：缺省 None = 不挂 `{base}/mcp`。
+    #[serde(default)]
+    pub mcp: Option<McpCfg>,
+    /// 裸 JSON-RPC 2.0 端点：缺省 disabled。与 mcp 解耦的独立门。
+    #[serde(default)]
+    pub rpc: RpcCfg,
 }
 
 impl Default for ServerCfg {
@@ -254,6 +285,8 @@ impl Default for ServerCfg {
             ownership_guard: None,
             cors: None,
             reload_api: false,
+            mcp: None,
+            rpc: RpcCfg::default(),
         }
     }
 }
@@ -2369,6 +2402,45 @@ cache:
         );
         assert!(ServerCfg::default().response_headers.is_empty());
         assert!(ServerCfg::default().route_timeouts.is_empty());
+        // MCP/RPC 缺省：不挂端点（R8 独立门，均默认关）。
+        assert!(ServerCfg::default().mcp.is_none());
+        assert!(!ServerCfg::default().rpc.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_and_rpc_sections_parse() {
+        // Given 完整 server.mcp 段 + server.rpc.enabled
+        // When 解析
+        // Then 字段全落；缺省段不拦解析
+        let dir = std::env::temp_dir().join(format!("ojcfgmcp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cfg.yaml"),
+            "mounts:\n  - { prefix: /, web: d }\nserver:\n  mcp:\n    enabled: true\n    modules: [user, wiki]\n    allow_anonymous: true\n  rpc:\n    enabled: true\n",
+        )
+        .unwrap();
+        let c = load_from(&dir, Some("cfg.yaml")).unwrap();
+        let mcp = c.server.mcp.expect("mcp 段应解析出");
+        assert!(mcp.enabled);
+        assert_eq!(
+            mcp.modules,
+            Some(vec!["user".to_string(), "wiki".to_string()])
+        );
+        assert!(mcp.allow_anonymous);
+        assert!(c.server.rpc.enabled);
+        // Given 只写 enabled（modules/allow_anonymous 缺省）
+        std::fs::write(
+            dir.join("cfg2.yaml"),
+            "mounts:\n  - { prefix: /, web: d }\nserver:\n  mcp:\n    enabled: true\n",
+        )
+        .unwrap();
+        let c2 = load_from(&dir, Some("cfg2.yaml")).unwrap();
+        let mcp2 = c2.server.mcp.expect("mcp 段应解析出");
+        assert!(mcp2.enabled);
+        assert_eq!(mcp2.modules, None);
+        assert!(!mcp2.allow_anonymous);
+        assert!(!c2.server.rpc.enabled, "rpc 缺省 false");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

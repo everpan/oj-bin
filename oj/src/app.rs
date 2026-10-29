@@ -1066,6 +1066,21 @@ fn validate_route_timeouts(patterns: &[String], route_keys: &[String]) -> Result
     Ok(())
 }
 
+/// MCP 装配防线（spec 2026-10-30 R7/R9）：`enabled` 且未装配 auth 插件且未显式
+/// `allow_anonymous` → 拒启。否则 `/mcp` 匿名暴露全路由的机器可读目录 + 调用面，
+/// 比业务路由自身的暴露面更糟（机器可枚举、广告化）。
+fn validate_mcp_gate(mcp: &config::McpCfg, auth_present: bool) -> Result<(), String> {
+    if mcp.enabled && !auth_present && !mcp.allow_anonymous {
+        return Err(
+            "server.mcp.enabled requires an auth plugin (oj-auth) — refusing to expose a \
+             machine-readable route catalog anonymously; set server.mcp.allow_anonymous: true \
+             to override explicitly"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn assemble_backend(
     cfg: &Config,
@@ -2049,6 +2064,18 @@ impl App {
         let (cert_status, cert_valid_until) = load_cert_with_watcher(&cfg, config_dir)?;
 
         config::validate_tenant_binding(&cfg, auth.is_some())?;
+        // MCP 装配防线（spec 2026-10-30 R7/R9）：enabled 但未装配 auth 插件且未
+        // 显式 allow_anonymous → 拒启——否则 `/mcp` 匿名暴露全路由机器可读目录。
+        let mcp_cfg = cfg.server.mcp.clone().unwrap_or_default();
+        validate_mcp_gate(&mcp_cfg, auth.is_some())?;
+        if !mcp_cfg.enabled {
+            let n_routes: usize = tables.iter().map(|(_, t)| t.listing().len()).sum();
+            if n_routes > 0 {
+                tracing::info!(
+                    "{n_routes} routes could be exposed via MCP: set server.mcp.enabled=true"
+                );
+            }
+        }
         // U-18 批 T1.3：装配期 fail-fast——pattern 悬空（零命中/含 {}）在监听前拒绝，
         // 热更路径复用同一装配，悬空 reload 同样被点名拒绝。
         let route_timeouts: Vec<(String, std::time::Duration)> = cfg
@@ -2083,6 +2110,12 @@ impl App {
             route_timeouts,
             // blob default 经 stable.blobs 暴露（stable 单源；拆分前为 blobs.default()）。
             blob: stable.blobs.default(),
+            // MCP / 裸 JSON-RPC 端点（R7/R8/R9）：enabled 才挂，白名单 fail-closed。
+            mcp: mcp_cfg.enabled.then(|| serve::McpConfig {
+                modules: mcp_cfg.modules.clone(),
+                allow_anonymous: mcp_cfg.allow_anonymous,
+            }),
+            rpc: cfg.server.rpc.enabled,
         };
         // WS 目录镜像挂载：逐 api 挂载。路径口径与 api.ts **同源**（`ws::ws_mounts`
         // 走 `routes::mirror_rel`）——`--module-root` 下由模块索引给 `{prefix}/{模块根内路径}`，
@@ -2351,6 +2384,38 @@ impl ClientTransport for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- MCP 装配防线（spec 2026-10-30 R7/R9） ----
+
+    // Given mcp.enabled=true 且未装配 auth 插件且 allow_anonymous 缺省（false）
+    // When validate_mcp_gate
+    // Then Err 且文案含 "server.mcp" 与 "auth"
+    #[test]
+    fn mcp_without_auth_plugin_fails_fast() {
+        let mcp = config::McpCfg {
+            enabled: true,
+            ..Default::default()
+        };
+        let err = validate_mcp_gate(&mcp, false).unwrap_err();
+        assert!(err.contains("server.mcp") && err.contains("auth"), "{err}");
+        // Given 同上但 allow_anonymous=true，Then 装配通过（显式逃生门）。
+        let mcp_anon = config::McpCfg {
+            enabled: true,
+            allow_anonymous: true,
+            ..Default::default()
+        };
+        assert!(validate_mcp_gate(&mcp_anon, false).is_ok());
+        // Given auth 已装配，Then 任意 mcp 配置都通过。
+        assert!(validate_mcp_gate(&mcp, true).is_ok());
+    }
+
+    // Given mcp.enabled=false（缺省）
+    // Then 永远通过（无 auth 也不拦——端点本就不挂）
+    #[test]
+    fn mcp_disabled_never_blocks_assembly() {
+        let mcp = config::McpCfg::default();
+        assert!(validate_mcp_gate(&mcp, false).is_ok());
+    }
 
     // ---- U-18 批 T1.2：route_timeouts 装配期校验（纯函数） ----
 
