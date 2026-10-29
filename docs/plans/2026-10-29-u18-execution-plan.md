@@ -1,6 +1,6 @@
 # U-18 批执行计划与任务跟踪（REQ-01/02 → REQ-05 → U-18/REQ-03 → U-17/REQ-04）
 
-> 状态：**批次 1（v0.1.102）执行中**（需求源新增 REQ-06：db.client/access 运行期非 Promise——并入本批，见 T2.5）。
+> 状态：**批次 3（v0.1.104 U-18 任务式导出）已交付**（E1–E8 ✅，未提交——终审后等用户发版指令）。
 > （本文件是唯一任务真相源：状态、小结、增量记录都在这里，随做随更。）
 > 依据：设计稿 `docs/plans/2026-10-29-u18-upstream-reqs.md`（v2，三路评审已处置）+ `oj-dbx/docs/upstream/REQ-01..05`。
 > 原则：SOLID（校验纯函数/装配接线/门禁三腿各自独立）+ DRY（路径匹配复用 `path_matches` 单一实现、
@@ -32,13 +32,68 @@
 | T2.5 | REQ-06：`db.client.{list,register,reRegister,delete,test}` + `db.access.{grant,revoke}` 运行期返回真 Promise（instanceof Promise、.catch/.finally 可用）；`has` 保持同步 | Given 业务模块，When 调 list()，Then `instanceof Promise === true` 且 `.catch` 可链；`list().catch(()=>[])` 不抛 TypeError | ✅ | ✅ | dbSessionCall 复用（DRY），instanceof Promise 断言 RED→GREEN |
 | T3 | 发版：bump v0.1.102 + CHANGELOG + 全门禁（fmt/clippy/workspace/xtask+smoke）+ tag + push | 五步自查清单全过 | ☐ | |
 
-## 2. 任务跟踪（批次 2-4，动工时细化）
+## 2. 任务跟踪（批次 2 · v0.1.103 REQ-05，动工时细化）
+
+**动工前 spike 结论（设计 §6.1 的两个待核查项）**：
+- **Spike 1（FfiFuture Send 界）✅ 无需 ABI**：`oj-plugin-ffi/src/future.rs` 已
+  `unsafe impl Send/Sync for FfiFuture`（字段全 raw/fn 指针），宿主 `await_ffi`
+  是普通 async fn——`tokio::time::timeout`/`select!` 竞速对插件轴同样可用。
+- **Spike 2（插件池弃连暴露面）→ 判给 ABI 13 单独成车**：宿主弃 FfiFuture 只 free
+  state（future.rs 头注释明文：插件任务允许跑完、不保证取消）；mysql/pg 服务端
+  真取消需插件侧协作（vtable 新槽或 opt-in 行为变更）。**批次 2 交付宿主侧竞速 +
+  结构化 OJ_DB_TIMEOUT（全后端）+ sqlite 内置真早停**；`data.cancelled` 按后端诚实标注；
+  插件轴真取消登记为 ABI 13 车，不阻塞本批。
+
+**裁决（Rulings，动工时定）**：
+- 字节口径 = 行 JSON 编码字节（`serde_json::to_vec(row).len()` 累加）——≥线上原始字节、
+  更严、确定性可测；写进 api-manual。
+- 触顶信令：truncate → 响应头 `X-OJ-Result-Truncated: <counted>`（raw 路径，对齐
+  X-OJ-Row-Limit 先例）+ db.stream 走 `op_db_stream_info`（{rows,bytes,truncated}）；
+  fail → 结构化错误（category=Capacity，data={limit_bytes,counted_bytes}）。
+- 收紧校验错误：调用侧 timeoutMs > 配置 statement_timeout_ms → category=Capacity、
+  message 点名 `statement_timeout_ms`（REQ §6 验收原文），code=OJ_DB_CAPACITY。
+- tx/attach 路径：attach 会话内语句超时 = 判死会话（kill_attached 先例，disposition
+  close）；plain db.tx 不叠语句超时（连接状态不可知先例，维持寿命封顶口径）。
+- 每调用侧 opts 只给 db.query/db.exec/db.stream（REQ 原文形态）；构造器路径只吃配置侧
+  （REQ 覆盖要求 = 三条路径都生效，配置侧即满足）。
+
+| # | 任务 | BDD 验收（Given/When/Then） | 状态 | 小结 |
+|---|---|---|---|---|
+| Q1 | db_policy 配置面：DbAccess/DbAccessOverride 增 `statement_timeout_ms`/`max_result_bytes`/`on_exceed`(fail\|truncate)，validate + 逐键继承 | Given defaults/alias 各键声明，When policy_for，Then 合并正确；0/超界/非法枚举 → 装配 Err 点名键 | ✅ | |
+| Q2 | `db_quota` 新模块：Quota 聚合（policy 单一出口）、timeout 收紧校验、ByteMeter（feed/Stop/超界）、结构化错误构造器 | 纯函数矩阵单测 | ✅ | |
+| Q3 | deadline 竞速接线：query_impl/exec_impl pool 臂 select!；attach 会话臂 race+kill_attached；op 签名加 opts(timeoutMs)；bootstrap.js/d.ts | Given 慢语句+短 deadline，When db.query，Then OJ_DB_TIMEOUT（elapsed≥deadline）；传大 timeoutMs → 拒并点名配置键 | ✅ | |
+| Q4 | max_result_bytes：trait 默认 metered 方法（默认全量后计量=插件轴/假件兼容）；SqlxAccessor 增量 fetch 早停；query_impl 接线 fail/truncate | Given 行集超字节上限，When db.query，Then fail=结构化 Err / truncate=部分行+X-OJ-Result-Truncated | ✅ | |
+| Q5 | 构造器路径接线（query.rs Exec::Pool → metered + deadline） | Given builder select 慢/大结果，When 执行，Then 同 raw 语义 | ✅ | |
+| Q6 | stream 路径：open opts.timeoutMs + pump 字节计量（fail→结构化 Err 行经 parse_raw 还原；truncate→done+标志）+ op_db_stream_info + JS info() | Given 流超字节，When next()，Then fail=抛结构化错 / truncate=干净 done 且 info().truncated=true | ✅ | |
+| Q7 | 矩阵与收紧用例：sqlite 真慢语句（递归 CTE）×三路径；pg/mysql env-gated 骨架（R-1.3 并入）；timeoutMs>配置 拒绝 | env 缺席则 skip（诚实登记） | ✅ | pg/mysql 双腿经 Apple container 真库亲跑全绿（504ms 触发 OJ_DB_TIMEOUT）；修出一处真问题：`server_cancel_on_abandon` 从「SqlxAccessor 恒 true」改为按方言（仅 sqlite=true），网络方言弃 future ≠ 服务端取消 | |
+| Q8 | 文档四件 + CHANGELOG + bump v0.1.103 + 全门禁 + tag + push | 同批次 1 T3 五步 | ✅ | |
+
+## 2b. 任务跟踪（批次 3-4，动工时细化）
 
 | 批次 | 任务骨架（INVEST：独立可发） | 前置 |
 |---|---|---|
 | 2（REQ-05） | 访问器层 deadline 竞速 + 弃连取消；`db_access.statement_timeout_ms`（只能收紧）；`max_result_bytes` 行级字节计费（fail/truncate 两档）；`OJ_DB_TIMEOUT` 结构化信封；三路径×三方言矩阵；db.session 上的判死语义 | 批 1 |
 | 3（U-18） | 同步开游标 + 自驱消费任务（节流）+ ExecRegistry 注册；csv/jsonl 汇聚落 blob；进度/状态/取消 ops；宿主 TTL 回收器；配额（全局/每主体/回落硬顶）；审计事件 | 批 2 原语 |
 | 4（U-17） | catalog kinds `schemas`/`databases`（系统库过滤 + granted_only）；`forSchema` 受限视图；sqlite unsupported 矩阵 | 独立 |
+
+## 2c. 任务跟踪（批次 3 · v0.1.104 U-18/REQ-03 任务式导出，动工时细化）
+
+**动工前结论（spike 已备）**：复用件全部在位——`da.stream_query` 开游标、`ExecRegistry` 壳
+（boot-tag id / Owner 归属 / Mutex 表）、`BlobBackend::{put_stream_open,chunk,finish,abort,del}`
+（**有 `del` 槽**：TTL 回收按宿主导出台账删 key，无需 list API，零 ABI 成立）、
+`db_quota::ByteMeter`（maxBytes 计费）、`AuditStore::push`（零凭据事件）。
+规格 `docs/plans/2026-10-29-u18-upstream-reqs.md` §3。
+
+| # | 任务 | BDD 验收（Given/When/Then） | 状态 | 小结 |
+|---|---|---|---|---|
+| E1 | config `db_export:` 段：全局并发 4 / 每主体 2 / maxBytes 缺省 / 回落硬顶 128MiB / TTL 24h / 清扫 cadence；validate fail-loud 点名键 | Given 非法组合（0/超界/回落硬顶<TTL 语义冲突），When 装配，Then Err 点名 | ✅ | DbExportSection 六键 + validate 十组矩阵（0/超界/fallback≥max_bytes 点名）| |
+| E2 | `db_export` 模块：ExportRegistry（ExecRegistry 同款壳）+ 状态机 running/done/failed/cancelled + 进度 {rows,bytes} + 配额（全局/每主体，错误文案分「全局满/本人满」）+ boot-tag not-found | 纯单测矩阵：登记/归属拒绝/配额满两文案/幂等 cancel/重启 id not found | ✅ | db_export.rs：7 用例（轮询/归属/not-found/双配额文案/幂等/跨注册表/清扫豁免）| |
+| E3 | `op_db_export`：同步开游标 + 占流预算 permit + 登记 + spawn 自驱消费任务（csv/jsonl 逐块 put_stream_chunk + 每 N 批 yield 节流）+ 同步返 taskId（<200ms 计时断言）；未知 format → OJ_DB_UNSUPPORTED（data.capability=format 名） | Given 慢查询大结果集，When db.export，Then 立即返 taskId；轮询 exportStatus 见 rows/bytes 递增 | ✅ | | op_db_export 三 op + 自驱消费任务（节流/双轨闸/取消链）；12 集成用例全绿（立即回执/跨请求存活/幂等取消/审计/maxBytes vs maxRows）
+| E4 | `op_db_export_status` / `op_db_export_cancel`：跨请求可达；他人/未知/跨重启一律 not found（不泄露）；cancel 幂等 → abort notify → pump 停 → put_stream_abort 清半成品 → state=cancelled | 断线重连用例：发起后 drop 请求，另起请求轮询递增 + 取消 | ✅ | |
+| E5 | maxRows 策略截断（done + truncated:true + truncatedReason:"max_rows"）vs maxBytes 超限 failed（错误≠策略双轨）；格式细节：csv 带 BOM/引号转义/NULL，jsonl 行 JSON | Given cap 配置，When 导出超 cap，Then 对应信令 | ✅ | | csv BOM+\r\n / jsonl 行 JSON；maxBytes failed vs max_rows done+truncated 双轨用例钉死
+| E6 | TTL 回收器：tokio interval 按台账年龄清扫（TTL 自 put_stream_open 起算），live 任务 key 豁免；`oj test` 可注入短 TTL/短间隔 | Given 短 TTL 注入，When 轮询清扫，Then 过期 key 被删、live 豁免 | ✅ | | 懒启动 interval 清扫器（每注册表一次）+ sweep 豁免 live；单位层过期/新鲜/live 三分支用例（集成走短周期段注入）
+| E7 | 审计事件：发起/完成/取消/maxBytes 中止（主体/tenant/alias/rows/bytes/终态；SQL 全文不入审计）；taskId/blobKey 日志只出前 8 字符 | 审计 store 断言 kind 与字段 | ✅ | | start/done/failed/cancelled 四事件；SQL 全文不入审计用例钉死
+| E8 | bootstrap.js db.export/exportStatus/exportCancel + global.d.ts + tsc 锚 + 文档四件 + CHANGELOG + bump v0.1.104 + 全门禁 | 同 Q8 五步；发版动作等用户指令 | ✅ | | d.ts 三件 + tsc 锚 exportUsage + 文档四件 + CHANGELOG + bump；发版提交动作等用户指令
 
 ## 3. 增量记录（随做随更）
 
@@ -52,15 +107,25 @@
   两层路由要写 `/v1/api/u/*`（e2e 初稿写错曾挂起 60s+，busy handler 无超时不会自愈）；
   ③ 后台跑 cargo 的陷阱：超时迁移=SIGSTOP（0% CPU 假跑）+ pkill 残留 flock——统一
   `run_in_background` 起跑 + `> 文件` 收输出。
+- **批次 2（v0.1.103）完成**：Q1–Q8 全 ✅。新增 `src/bridge/db_quota.rs` 纯原语模块
+  （Quota/effective_timeout_ms/ByteMeter/race_statement/结构化错误工厂），query/exec/stream/
+  构造器四路径接线，文档四件 + CHANGELOG 同步。门禁全绿；**真库矩阵腿经 Apple container
+  亲跑**（oj-test-postgres / oj-test-mysql 双容器）：pg 504ms / mysql ~500ms 触发
+  OJ_DB_TIMEOUT，验证「网络型后端准点触发」架构论断。
+- **真库跑出的第二处存量修复**：`search_shared_module_on_real_dbs`（search 模块真库腿，
+  同样从未本地亲跑）在 pg 挂 `unsupported sqlite column type: REAL`——sqlx Any 的 float4
+  （pg REAL / mysql FLOAT）是独立于 f64 的 TypeInfo，行解码探测链漏 `f32` 臂。补臂后绿。
+- **真库跑出的修复（TDD：测试先红后绿）**：`SqlxAccessor::server_cancel_on_abandon` 原实现
+  恒 `true`，pg 腿报 `cancelled=true` 与「弃 future ≠ 服务端取消」诚实口径矛盾 → 改为按方言
+  （仅 sqlite=true）。网络方言（内置 sqlx pg/mysql DSN 与插件轴）同口径 `false`。
 - Rulings 汇总见台账 `.superpowers/sdd/2026-10-29-u18-execution-plan/progress.md`（main 直跑、
   golden 剔 sess、REQ-06 复用 dbSessionCall、本仓执行纪律）。
 
 ## 4. 诚实登记（避免遗忘）
 
-- **R-1.3 慢语句用例（评审 Important，显式 Ruling）**：设计 §1.3 的 env-gated 真慢语句用例
-  （pg `pg_sleep` / mysql `SLEEP`，钉「跑完才 408」语义）本批未交付——本地无 pg/mysql 实例，
-  无法完成 TDD 的「亲眼看它失败再通过」；**显式并入批次 2（REQ-05）的三方言矩阵**（该批的
-  核心交付物即超时×方言×路径矩阵，天然覆盖）。语义本身已如实成文（api-manual/CHANGELOG）。
+- **R-1.3 慢语句用例（评审 Important）**：✅ 已闭环——并入批次 2 的
+  `statement_timeout_matrix_pg_mysql`，并经 Apple container 真库亲跑双腿全绿（本环境常驻
+  oj-test-postgres / oj-test-mysql 容器，DSN 经 `OJ_TEST_PG` / `OJ_TEST_MYSQL` env 注入）。
 - **评审 Minor 处置**：已修=golden 头注释与清单对齐（Kafka/RabbitMQ/tasks 实为无条件挂载）+
   CHANGELOG REQ-06 措辞收窄（仅 `list` 回裸值，其余六个本就是 async op）；缓议=`patterns()`
   文档错位（注释位置）、被保留路径遮蔽的同名业务路由键（极端窄径，可后续剔除）。

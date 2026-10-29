@@ -122,6 +122,13 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 接了新方言插件后，构造器 / `listTables` / `nextSeq` / `search.*` / `oj migrate` / `oj seed` 报 `OJ_DB_UNSUPPORTED` 但 `db.query` 能用 | **预期（v0.1.88）**：宿主只对 `sqlite`/`mysql`/`postgres` 生成 SQL；其他方言上一期只开放裸 SQL 路径（`db.query`/`db.exec`/`db.stream`/`db.tx`）。`e.data.capability` 会点名是哪个 API（`query_build`/`query_sql`/`list_tables`/`next_seq`/`migrate`/`seed`）。别自己按 sqlite 语义拼 SQL 绕 |
 | 用 `db.dialect()` 猜能力（`d === "mysql" ? A : B`） | 方言名是**开放集**（v0.1.88 起插件 `describe()` 声明什么就是什么），新方言接入后 `else` 分支会把错 SQL **静默**发给它（占位符/`ON DUPLICATE KEY` 全错，报错落在引擎侧）。能力问题**直接调用**并接 `OJ_DB_UNSUPPORTED`；确需方言特有 SQL 用白名单 + 未知方言 `throw`（api-manual「方言边界」/ 场景 45） |
 | `cargo xtask plugin <name>` 之后 `oj serve` 报 `plugin file not in plugins.lock.json: …` | 清单锁（v0.1.88）：`xtask plugin` 只拷单库、**不刷新** `plugins.lock.json`。新增/替换插件后跑 `cargo xtask build`（整体归置 + 重写锁）；部署时整体拷贝 `bin/`，禁止增量覆盖 |
+| `db.export` 重启后 taskId 报 not found | **有意语义**（非 bug）：id 内嵌 boot tag，跨重启一律 not found 不 failed——防把重启误读成 SQL 错。导出UI应在 not found 时引导重新发起，不是重试轮询 |
+| 导出想卡 statement_timeout_ms | 导出是长任务，**不吃**语句超时（合法导出天然超语句窗口）；导出自己的闸 = `maxBytes`（产物字节，超限 failed）。查询响应闸（max_result_bytes）与导出闸是两个 |
+| 导出并发被拒分不清是谁满 | 看文案：「global export concurrency limit」= 全局满（等别人）；「per-subject …」= 本人满（等自己的旧任务收尾/取消） |
+| 轮询 db.exportStatus 想要 percent | 流式无总行数（percent 需额外 COUNT + 竞态）——不确定进度条 + rows/bytes 文本；`totalRows` 是留档扩展位 |
+| REQ-05 语句超时 sqlite「不生效」（单条递归 CTE 跑完才返回） | sqlite 驱动同步步进**饿死 current_thread 定时器**——deadline 只在让步点触发；网络型后端（mysql/pg 插件轴）准点。sqlite 大查询用 `max_result_bytes`（边拉边计真早停）+ `max_rows` 挡（api-manual §13 架构边界行） |
+| 超时后 UI 宣称「已向数据库下发取消」 | 插件轴 `e.data.cancelled=false`——宿主只弃句柄，服务端语句可能仍在跑（真取消 = ABI 13 车）；只有 sqlite 内置是 `true`。UI 说「已超时」即可 |
+| `db.stream` 想拿「是否截断」只看行数 | 用 `it.info()`：`{rows, bytes, truncated}`——truncate 档的显式信令；fail 档（缺省）以中途错行 `OJ_DB_CAPACITY` 表达。`timeoutMs` 超配置拒 `OJ_DB_CAPACITY` 点名 `statement_timeout_ms`（只能收紧） |
 | 按受影响行数判存在/归属，幂等二写失灵（如「已读」再点误报 403） | `run()` 行数三方言在 oj 上都是**匹配行**——mysql 连接协商了 `CLIENT_FOUND_ROWS`（裸 mysql 客户端默认只算「实际变更行」，同值 UPDATE 得 0，这才是坑的来源；oj 运行时已拉齐）。**别依赖行数**：先 `SELECT` 按 `(id, user_id)` 断言归属，再无条件 UPDATE、行数不读——跨引擎安全的幂等写见 api-manual §6「受影响行数的三方言语义」 |
 | 启动即退出 | 证书两路径缺一（必配不可绕过）或 redis 连不上（fail-fast） |
 | `oj exec` 报 `module '…' missing manifest.yaml` 或 `service dir not found` | 裸 `oj exec` 在没有 config/mounts/`-d` 时会向上**猜** api 目录——在源码仓根会撞上仓库自己的 `src/`。exec **不需要** config.yaml：纯计算脚本直接 `-e` 跑；要后端就 `-c <项目config>` 或 `-d <api目录>` 显式给（v0.1.58 起探测只认「像业务树」的候选，非业务 `src/` 已跳过） |

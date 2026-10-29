@@ -45,6 +45,29 @@ export async function callOptsUsage(): Promise<void> {
   void opts;
 }
 
+/** U-18 任务式导出（v0.1.104）类型锚：按文档写法逐一调用。 */
+export async function exportUsage(): Promise<void> {
+  const { taskId } = await DB("rep").export({
+    sql: "select * from orders where status = ?",
+    params: ["paid"],
+    format: "csv",
+    fileName: "orders.csv",
+    maxBytes: 64 * 1024 * 1024,
+  });
+  const st = await DB("rep").exportStatus(taskId);
+  const state: "running" | "done" | "failed" | "cancelled" = st.state;
+  const rows: number = st.rows;
+  const bytes: number = st.bytes;
+  const truncated: boolean = st.truncated;
+  const reason: string | null = st.truncatedReason;
+  const blobKey: string | null = st.blobKey;
+  const error: string | null = st.error;
+  if (state === "done" && blobKey) void [rows, bytes, truncated, reason, error];
+  if (state === "failed") void error;
+  const { cancelled } = await DB("rep").exportCancel(taskId);
+  void cancelled;
+}
+
 // audit / mgmt / secret（特权检索与凭据面）。
 export async function privilegedUsage(): Promise<void> {
   const events = await audit.query({ kind: "SECRET_OPEN", limit: 10 });

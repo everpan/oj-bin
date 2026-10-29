@@ -3948,3 +3948,101 @@ for (const r of rows) {
 | 拿密文做等值查询/判重 | 信封随机化：同一明文两次 seal 密文必然不同 | 密文列只存取，不检索；要判重另存明文哈希列 |
 | 改了 `secrets.public_key_path` 后旧密文解不开 | 公钥换了但私钥没换（两把钥匙不成对） | 密钥对要成对轮换：旧私钥解 → 新公钥重封；表里留 `key_version` 列提示重录 |
 | 密文里含 `ENC[` 开头被 config 解析盯上？ | 不会——config 解密只发生在 config.yaml 加载期 | 业务表里的 `ENC[...]` 与 config 无关，只经 `secret.open` 解 |
+
+## 场景 53：慢查询护栏与结果集大小闸（REQ-05，v0.1.103）
+
+> 一句话：交互查询 30s、导出 10min、内省 10s 三档天然不同——全局单值超时兜不住；
+> 语句级超时（按别名配、调用侧收紧）+ 结果集字节上限（fail 缺省 / truncate 显式信令）
+> 各管一维，与 `max_rows` 并存先到先生效。
+
+```yaml
+# config.yaml
+db_access:
+  defaults:
+    statement_timeout_ms: 30000   # 上限；调用侧只能收紧，传更大值 OJ_DB_CAPACITY 点名本键
+    max_result_bytes: 67108864    # 行 JSON 编码字节；与 max_rows 并存
+    on_exceed: fail               # fail（缺省：结构化错）| truncate（部分行 + 显式信令）
+```
+
+```ts
+// 交互查询：按调用收紧
+try {
+  const rows = await db.query(sql, params, { timeoutMs: 5000 });
+} catch (e) {
+  if (e.code === "OJ_DB_TIMEOUT") { /* e.data.cancelled / e.data.timeout_ms；retryable=true */ }
+  if (e.code === "OJ_DB_CAPACITY") { /* e.data.limit_bytes / counted_bytes —— 结果太大 */ }
+}
+
+// 导出长档：pump 全程竞速（消费慢也计入）
+await db.stream(bigSql, params, { timeoutMs: 600000 });
+
+// truncate 档：拿「已截断」显式信令（fail 档则以中途错行表达，catch 同上）
+const it = db.stream(sql);
+for await (const row of it) { out.push(row); }
+const inf = await it.info();            // {rows, bytes, truncated}——迭代结束后仍可读
+if (inf.truncated) warn(`result truncated at ${inf.bytes} bytes`);
+```
+
+### 常见坑
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| sqlite 上单条递归 CTE 超时「不生效」 | 同步步进饿死 current_thread 定时器——deadline 只在驱动让步点触发 | 网络型后端（mysql/pg）准点生效；sqlite 大查询靠 `max_result_bytes` + `max_rows` 挡（见 api-manual §13 架构边界行） |
+| 超时了但 `e.data.cancelled === false` | 插件轴宿主只弃句柄，服务端语句可能仍在跑（真取消 = ABI 13 车） | UI 文案说「已超时」即可，**别说「已向数据库下发取消」**——除非后端是 sqlite 内置（cancelled=true） |
+| `timeoutMs` 传得比配置大，报 `OJ_DB_CAPACITY` | 只能收紧（REQ 单向阀） | 要放大上限改 config `db_access.<alias>.statement_timeout_ms` |
+| truncate 后拿 `it.info()` 报 not found | 旧用法：流 close 后注册表已摘 | v0.1.103 起 bootstrap 在自然结束前快照——`it.info()` 结束后照读；中途想看随时调 |
+
+## 场景 54：任务式导出大表（U-18，v0.1.104）
+
+Web 后台「导出全部订单」：请求不能挂着等 5 分钟——`db.export` 发起即返 taskId，
+Rust 消费任务把结果流式写成 blob 产物，前端轮询进度条。
+
+**配置**（`db_export:` 段，全有缺省，可省略）：
+
+```yaml
+db_export:
+  global_concurrency: 4      # 进程级并发上限
+  per_subject_concurrency: 2 # 每用户并发上限
+  max_bytes: 536870912       # 单任务产物上限（超限 failed，不静默截断）
+  ttl_secs: 86400            # 产物保留 24h，宿主清扫器自动删
+```
+
+**代码**：
+
+```ts
+// 发起（立即返回，不用等查询跑完）
+const { taskId } = await db.export({
+  sql: "select * from orders where status = ?",
+  params: ["paid"],
+  format: "csv",              // 或 "jsonl"（行 JSON）；未知格式 → OJ_DB_UNSUPPORTED
+  fileName: "orders-paid.csv", // 下载时浏览器另存为原名（local 后端保真）
+  maxBytes: 64 * 1024 * 1024, // 可选；缺省用配置上限，只能收紧
+});
+
+// 轮询（不确定进度条 + rows/bytes 文本；没有 percent——流式无总行数）
+for (;;) {
+  const st = await db.exportStatus(taskId);
+  if (st.state === "done") return redirect(await blob.url(st.blobKey));
+  if (st.state === "failed") throw new Error(st.error);
+  if (st.state === "cancelled") break;
+  ui.progress(`${st.rows} rows / ${st.bytes} bytes`);
+  await sleep(1000);
+}
+
+// 停止按钮：幂等，重复点不报错
+await db.exportCancel(taskId);
+```
+
+**验证**：done 后 `blob.url(st.blobKey)` 下载；csv 带 BOM/表头，`
+` 行尾恒定
+（数据交换格式，跨平台打开一致）。
+
+**常见坑**：
+
+| 坑 | 解 |
+|---|---|
+| 拿 taskId 当 SQL 句柄想改参数 | taskId 只代表任务；参数在发起时定死。重做 = 新 export |
+| 进度条想做 percent | 没有总行数（做 percent 需额外 COUNT 且有竞态）——用不确定进度条 + rows/bytes 文本 |
+| 重启后轮询报 not found | 有意语义：旧 taskId 一律 not found（不是 failed，防误读成 SQL 错）；跨重启恢复不做 |
+| 产物链接 404 | TTL 24h 到点清扫（live 任务豁免）；长任务产物要在窗口内下载 |
+| 并发发起被拒 | 「global … limit reached」= 全局满，「per-subject …」= 本人满——文案区分，前端可分别提示 |

@@ -35,6 +35,7 @@ mod db;
 pub mod db_backend;
 pub mod db_error;
 pub mod db_exec;
+pub mod db_export;
 pub mod db_policy;
 pub mod db_quota;
 pub mod db_session;
@@ -250,6 +251,10 @@ pub struct StableState {
     /// 安全审计存储（U-9 v0.1.98）：统一事件出口的进程内有界环形缓冲。热更存活
     /// （装配层注入同一 Arc，与 tx_sessions 同款）。
     pub audit: Arc<audit::AuditStore>,
+    /// 任务式导出（U-18 v0.1.104）：配置段 + 进程级任务登记表（配额/进度/状态机）。
+    /// None 缺省 = 段落缺省值 + 新表（与 exec_sessions 同款生命周期）。
+    pub export_section: Arc<db_policy::DbExportSection>,
+    pub export_registry: Arc<db_export::ExportRegistry>,
     /// 执行登记表（U-5 v0.1.96）：`db.cancel(executionId)` 的跨请求路由表。
     /// 进程级生命周期（热更存活），无配置段（取消判权只看归属主体）。
     pub exec_sessions: Arc<db_exec::ExecRegistry>,
@@ -356,6 +361,9 @@ pub struct Extras {
     pub audit: Option<Arc<audit::AuditStore>>,
     /// 执行登记表（装配层构造后注入，以便热更前后同源）。None = 进程内新表。
     pub exec_sessions: Option<Arc<db_exec::ExecRegistry>>,
+    /// 任务式导出段 + 登记表（U-18 v0.1.104，`db_export:`）。None = 段落缺省 + 新表。
+    pub export_section: Option<Arc<db_policy::DbExportSection>>,
+    pub export_registry: Option<Arc<db_export::ExportRegistry>>,
     /// 管理面（U-15）：段 + 收编轴 + 登记表。None = 缺省。
     pub mgmt_section: Option<Arc<db_policy::MgmtSection>>,
     pub mgmt_axes: Option<generic_axis::GenericAxisRegistry>,
@@ -519,6 +527,9 @@ deno_core::extension!(
         db::op_db_stream_open,
         db::op_db_stream_next,
         db::op_db_stream_info,
+        db_export::op_db_export,
+        db_export::op_db_export_status,
+        db_export::op_db_export_cancel,
         db::op_db_stream_close,
         db::op_db_stream_abort,
         query::op_db_query_build,
@@ -924,6 +935,11 @@ impl Bridge {
             ))
         });
         let exec_sessions = extras.exec_sessions.clone().unwrap_or_default();
+        let export_section = extras.export_section.clone().unwrap_or_default();
+        let export_registry = extras
+            .export_registry
+            .clone()
+            .unwrap_or_else(|| Arc::new(db_export::ExportRegistry::new(&export_section)));
         let mgmt_section = extras
             .mgmt_section
             .clone()
@@ -984,6 +1000,8 @@ impl Bridge {
             audit_section,
             audit: audit_store,
             exec_sessions,
+            export_section,
+            export_registry,
             mgmt_section,
             mgmt_axes,
             mgmt,
@@ -2711,6 +2729,8 @@ mod tests {
             audit_section: Arc::new(db_policy::AuditSection::default()),
             audit: Arc::new(audit::AuditStore::new(&db_policy::AuditSection::default())),
             exec_sessions: Arc::new(db_exec::ExecRegistry::default()),
+            export_section: Arc::new(db_policy::DbExportSection::default()),
+            export_registry: Arc::new(db_export::ExportRegistry::default()),
             mgmt_section: Arc::new(db_policy::MgmtSection::default()),
             mgmt_axes: Arc::new(HashMap::new()),
             mgmt: Arc::new(mgmt::MgmtRegistry::new(8, 4)),

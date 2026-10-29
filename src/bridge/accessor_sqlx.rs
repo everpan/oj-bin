@@ -179,6 +179,15 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Result<Value, String>
             None => Value::Null,
         });
     }
+    // pg REAL / mysql FLOAT = float4：sqlx 里是 f64 的独立 TypeInfo，f64 臂探不到。
+    if let Ok(v) = row.try_get::<Option<f32>, _>(ordinal) {
+        return Ok(match v {
+            Some(f) => serde_json::Number::from_f64(f as f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        });
+    }
     if let Ok(v) = row.try_get::<Option<String>, _>(ordinal) {
         return Ok(match v {
             Some(s) => Value::String(s),
@@ -300,7 +309,9 @@ impl DataAccessor for SqlxAccessor {
 
     fn server_cancel_on_abandon(&self) -> bool {
         // sqlite 嵌入式：弃拉取即停客户端步进，无服务端语句残留（REQ-05 data.cancelled）。
-        true
+        // 网络型方言（pg/mysql）：弃 future 不等于服务端取消（pg_sleep 类语句仍跑完，
+        // 真取消 = ABI 13 车），与插件轴同口径报 false——真库矩阵用例钉死此语义。
+        matches!(self.dialect, Dialect::Sqlite)
     }
 
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {

@@ -480,6 +480,74 @@ impl Default for MgmtSection {
     }
 }
 
+/// 任务式导出配置段（`db_export:`，U-18 v0.1.104）。配额 + 回落硬顶 + 产物 TTL。
+/// 全部 0/超界 → 装配期拒启并点名键（fail-loud 同 audit 段口径）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DbExportSection {
+    /// 进程级并发上限（缺省 4；>64 拒——回归测试/异常配置防线）。
+    pub global_concurrency: usize,
+    /// 每主体并发上限（缺省 2；>16 拒）。
+    pub per_subject_concurrency: usize,
+    /// 单任务产物字节上限（缺省 512 MiB；超限 failed，不静默截断）。
+    pub max_bytes: u64,
+    /// put_stream 回落路径（第三方插件缺流式时整段缓冲）硬顶（缺省 128 MiB）。
+    /// 必须 < max_bytes：回落整段缓冲的内存代价高于流式路径，不设更紧的顶无意义。
+    pub fallback_buffer_cap: u64,
+    /// 产物 TTL 秒（缺省 24h；时钟自 put_stream_open 起算，崩溃半成品同样可扫）。
+    pub ttl_secs: u64,
+    /// 回收器清扫间隔秒（缺省 1h；`oj test` 注入短周期断言删除）。
+    pub sweep_interval_secs: u64,
+}
+
+impl Default for DbExportSection {
+    fn default() -> Self {
+        Self {
+            global_concurrency: 4,
+            per_subject_concurrency: 2,
+            max_bytes: 512 * 1024 * 1024,
+            fallback_buffer_cap: 128 * 1024 * 1024,
+            ttl_secs: 24 * 3600,
+            sweep_interval_secs: 3600,
+        }
+    }
+}
+
+impl DbExportSection {
+    /// 装配期 fail-loud 校验：Err 文案点名键（同 DbAccess::validate 口径）。
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |ok: bool, key: &str, msg: &str| {
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("db_export.{key}: {msg}"))
+            }
+        };
+        check(
+            self.global_concurrency >= 1 && self.global_concurrency <= 64,
+            "global_concurrency",
+            "must be 1..=64",
+        )?;
+        check(
+            self.per_subject_concurrency >= 1 && self.per_subject_concurrency <= 16,
+            "per_subject_concurrency",
+            "must be 1..=16",
+        )?;
+        check(self.max_bytes >= 1, "max_bytes", "must be >= 1")?;
+        check(
+            self.fallback_buffer_cap >= 1 && self.fallback_buffer_cap < self.max_bytes,
+            "fallback_buffer_cap",
+            "must be >= 1 and < max_bytes",
+        )?;
+        check(self.ttl_secs >= 1, "ttl_secs", "must be >= 1")?;
+        check(
+            self.sweep_interval_secs >= 1,
+            "sweep_interval_secs",
+            "must be >= 1",
+        )
+    }
+}
+
 /// 安全审计配置段（`audit:`，U-9 v0.1.98）。缺省**开**（有界环形缓冲，零凭据事件）；
 /// 读面 `allow` 缺省不限制（单进程、零凭据，装配期 warn 提示收紧）。
 /// `max_entries` / `retention_secs` 为 0 装配期拒启（= 不设限的 DoS 面）。
@@ -1605,8 +1673,7 @@ mod tests {
             let e = s.by_db["a"]
                 .merge(&s.defaults)
                 .validate("a")
-                .err()
-                .expect("must reject");
+                .expect_err("must reject");
             assert!(e.contains(key), "{e} must name {key}");
         }
         // on_exceed 单配（无 max_result_bytes）无意义 → 拒（merge 后口径）
@@ -1845,6 +1912,119 @@ mod behavior {
           })().catch(e => json.fail(500, String(e)));"#;
         let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
         assert_eq!(data["code"], json!("OJ_DB_TIMEOUT"), "{data}");
+    }
+
+    /// 终审 I2（复核定级 Important）：语句超时与字节上限**同时**越界时，raw 路径不得把
+    /// OJ_DB_TIMEOUT 改写成 OJ_DB_CAPACITY——meter 判定必须有「查询已成功」守卫
+    /// （构造器路径 query.rs 已有 `meter.exceeded && out.is_ok()`，raw 路径当时漏写）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn simultaneous_timeout_and_byte_exceed_reports_timeout() {
+        // Given 假 accessor：边喂 meter 爆字节上限、边睡过语句 deadline
+        struct GreedySleepy;
+        #[async_trait::async_trait]
+        impl DataAccessor for GreedySleepy {
+            async fn query_with_params_metered(
+                &self,
+                _sql: &str,
+                _params: &[serde_json::Value],
+                meter: &mut super::super::db_quota::ByteMeter,
+            ) -> super::super::BridgeResult<Vec<crate::bridge::db::Row>> {
+                let row = serde_json::json!({ "v": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" });
+                // 喂到触顶（limit 配 16 字节），再继续喂——meter 在 future 被 drop 前已 exceeded。
+                for _ in 0..4 {
+                    meter.feed(&row);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(vec![row])
+            }
+            async fn query_with_params(
+                &self,
+                _sql: &str,
+                _params: &[serde_json::Value],
+            ) -> super::super::BridgeResult<Vec<crate::bridge::db::Row>> {
+                unreachable!("raw 池臂走 metered 出口")
+            }
+            async fn exec_with_params(
+                &self,
+                _sql: &str,
+                _params: &[serde_json::Value],
+            ) -> super::super::BridgeResult<i64> {
+                Ok(0)
+            }
+        }
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                statement_timeout_ms: Some(300),
+                max_result_bytes: Some(16),
+                on_exceed: Some(OnExceed::Fail),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(
+            Arc::new(GreedySleepy),
+            SchemaRegistry::new(),
+            pol,
+            false,
+            false,
+        );
+        let js = r#"(async () => {
+            try {
+              await db.query("select ?", ["x"]);
+              json.ok({err: "no-timeout"});
+            } catch (e) { json.ok({code: e.code}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(
+            data["code"],
+            json!("OJ_DB_TIMEOUT"),
+            "同时越界必须报超时（先到先生效），不得被字节档改写：{data}"
+        );
+    }
+
+    /// E1（U-18 批次 3）：`db_export:` 段解析 + fail-loud 校验（v0.1.104）。
+    /// 缺省值即规格值（全局 4 / 每主体 2 / 回落硬顶 128MiB / TTL 24h / 清扫 1h）；
+    /// 0/超界/回落硬顶 ≥ max_bytes → 点名键拒。
+    #[test]
+    fn export_section_parses_defaults_and_validates() {
+        // Given 空段，Then 全缺省
+        let s: DbExportSection = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(s.global_concurrency, 4);
+        assert_eq!(s.per_subject_concurrency, 2);
+        assert_eq!(s.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(s.fallback_buffer_cap, 128 * 1024 * 1024);
+        assert_eq!(s.ttl_secs, 24 * 3600);
+        assert_eq!(s.sweep_interval_secs, 3600);
+        // Given 全键声明，Then 原样取
+        let s: DbExportSection = serde_yaml::from_str(
+            "global_concurrency: 8\nper_subject_concurrency: 4\nmax_bytes: 4194304\nfallback_buffer_cap: 2097152\nttl_secs: 60\nsweep_interval_secs: 5\n",
+        )
+        .unwrap();
+        assert!(s.validate().is_ok(), "{s:?}");
+        assert_eq!(s.max_bytes, 4 * 1024 * 1024);
+        // When 非法值，Then Err 点名键
+        for (yaml, key) in [
+            ("global_concurrency: 0\n", "global_concurrency"),
+            ("global_concurrency: 65\n", "global_concurrency"),
+            ("per_subject_concurrency: 0\n", "per_subject_concurrency"),
+            ("per_subject_concurrency: 17\n", "per_subject_concurrency"),
+            ("max_bytes: 0\n", "max_bytes"),
+            ("fallback_buffer_cap: 0\n", "fallback_buffer_cap"),
+            ("fallback_buffer_cap: 107374182400\n", "fallback_buffer_cap"),
+            ("ttl_secs: 0\n", "ttl_secs"),
+            ("sweep_interval_secs: 0\n", "sweep_interval_secs"),
+            // 回落硬顶不得 ≥ 单任务字节上限（否则回落路径无意义）
+            (
+                "max_bytes: 1048576\nfallback_buffer_cap: 1048576\n",
+                "fallback_buffer_cap",
+            ),
+        ] {
+            let s: DbExportSection = serde_yaml::from_str(yaml).unwrap();
+            let e = s.validate().expect_err("must reject");
+            assert!(e.contains(key), "{e} must name {key}");
+        }
+        // 未知键 fail-loud（serde 默认拒绝）
+        assert!(serde_yaml::from_str::<DbExportSection>("concurency: 4\n").is_err());
     }
 
     /// 只能收紧：调用侧 timeoutMs > 配置 → 结构化拒，message 点名 statement_timeout_ms。
@@ -2342,6 +2522,51 @@ mod behavior {
           })().catch(e => json.fail(500, String(e)));"#;
         let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
         assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+    }
+
+    /// 终审 I1（复核定级 Important）：fail 档触顶后经迭代 catch 抛错——`it.info()` 仍须
+    /// 拿到 {rows,bytes,truncated} 快照（done 分支有快照、catch 分支当时漏了，info 退化为 null）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_info_snapshot_survives_fail_row_error() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        // fail 档触顶 → 迭代 next() 抛 OJ_DB_CAPACITY → 之后 info() 必须仍给快照。
+        let js = r#"(async () => {
+            const st = db.stream("select id from t");
+            const it = st[Symbol.asyncIterator]();
+            let code = null;
+            try {
+              for (;;) { const r = await it.next(); if (r.done) break; }
+            } catch (e) { code = e.code; }
+            const inf = await st.info();
+            json.ok({code, info: inf});
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+        let info = &data["info"];
+        assert!(info.is_object(), "错误路径 info() 不得退化为 null：{data}");
+        assert_eq!(info["rows"], json!(1), "{data}");
+        assert!(
+            info["bytes"].as_u64().unwrap_or(0) >= 20,
+            "bytes 应含触顶行计数：{data}"
+        );
+        assert_eq!(info["truncated"], json!(false), "{data}");
     }
 
     /// REQ-05 Q6：db.stream truncate 档——干净 done + info() 显式信令（rows/bytes/truncated）。

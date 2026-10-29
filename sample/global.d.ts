@@ -692,6 +692,35 @@ declare global {
       /** 流运行信息（REQ-05 触顶信令）：{rows, bytes, truncated}。 */
       info(): Promise<{ rows: number; bytes: number; truncated: boolean }>;
     };
+    /** 任务式导出（U-18，v0.1.104）：同步开游标 + 自驱消费任务，立即返 {taskId}；
+     * 产物落 blob（保留前缀 export/），经 db.exportStatus 轮询进度，db.exportCancel 幂等取消。
+     * 配额：全局/每主体并发（db_export 段），满则结构化拒；maxBytes 超限 → failed（不静默截断），
+     * max_rows 策略截断 → done + truncated + truncatedReason:"max_rows"（错误≠策略双轨）。
+     * 重启后旧 taskId 一律 not found；他人 id 不可见（bearer 语义，日志只出前 8 字符）。 */
+    export(args: {
+      sql: string;
+      params?: unknown[];
+      format: "csv" | "jsonl";
+      fileName?: string;
+      maxBytes?: number;
+    }): Promise<{ taskId: string }>;
+    /** 导出任务状态：{taskId, state:"running"|"done"|"failed"|"cancelled", alias, rows, bytes,
+     * truncated, truncatedReason, startedAtMs, finishedAtMs, error, blobKey}。 */
+    exportStatus(taskId: string): Promise<{
+      taskId: string;
+      state: "running" | "done" | "failed" | "cancelled";
+      alias: string;
+      rows: number;
+      bytes: number;
+      truncated: boolean;
+      truncatedReason: string | null;
+      startedAtMs: number;
+      finishedAtMs: number | null;
+      error: string | null;
+      blobKey: string | null;
+    }>;
+    /** 幂等取消：半成品经 put_stream_abort 清（防 s3 orphan parts）；终态任务 no-op。 */
+    exportCancel(taskId: string): Promise<{ cancelled: true }>;
     /** SQL 执行追踪（dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;

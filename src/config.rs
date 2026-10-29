@@ -1417,6 +1417,10 @@ pub struct Config {
     /// 见 `docs/plans/2026-10-28-dbx-web-l7-u4-cross-request-tx.md`。
     #[serde(default, deserialize_with = "null_as_default")]
     pub db_session: crate::bridge::db_policy::DbSessionSection,
+    /// 任务式导出（U-18，v0.1.104，`db_export:` 段）：并发配额（全局/每主体）、产物字节
+    /// 上限、回落硬顶、产物 TTL 与清扫间隔。装配期 validate fail-loud（0/超界点名键）。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub db_export: crate::bridge::db_policy::DbExportSection,
     /// 安全审计（U-9，v0.1.98，`audit:` 段）：统一事件出口 + 进程内有界环形存储。
     /// `enabled` 缺省 **true**（零凭据事件、双限自动清理）；`allow` 缺省不限制
     /// （`audit.query` 的读取门；enabled 且不限制时装配期 warn 提示收紧）。

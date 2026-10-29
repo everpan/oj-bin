@@ -1418,8 +1418,12 @@ SSRF / 内网横向移动面）；`max_entries==0`、`max_per_owner==0`、`max_s
 **真实并发算式（U-7，容量规划必读）**：一个动态库的连接峰值 = **池连接 + 8**（typed 流式游标
 独占池外连接，插件侧每别名闸 8）；全进程动态轴峰值 ≈ `max_entries × (池 + 8)`。`max_streams`
 是**全局**游标预算（不排队，满了 `db.stream` 直接报错点名 `db_client.max_streams`），用来把这个
-乘法封顶；行数上限按别名配 `db_access.<name>.max_rows`。**查询超时与结果集字节上限未覆盖**
-（raw `db.query` 平台级无查询超时，登记为已知限制）。
+乘法封顶；行数上限按别名配 `db_access.<name>.max_rows`。
+
+**查询超时与结果集字节上限（v0.1.103，REQ-05 已覆盖）**：`db_access.<name>.statement_timeout_ms`
+（调用侧 `timeoutMs` 只能收紧）+ `db_access.<name>.max_result_bytes` / `on_exceed`
+（行 JSON 编码字节，边拉边计；fail 档缺省，truncate 档打 `X-OJ-Result-Truncated` 信令）。
+语义与架构限制（sqlite 同步步进饿死定时器、插件轴 `data.cancelled=false`）见 §11.6.3。
 
 #### 11.6.2 管理面（`db.client`）
 
@@ -1531,6 +1535,52 @@ const ep = db.epoch("rep");   // host 权威；存起来下次比对，不一致
 > **正确性不依赖 JS 持有的 epoch**：查询 op 始终按名从 host registry 重解析 accessor。即便恶意 handler
 > 覆写缓存 epoch 跳过失效，也拿不到已删连接（host 直接报未登记）——U-3 的 epoch 只是优化 JS 缓存新鲜度，
 > 不是安全边界。
+
+### 11.6.3 语句级超时 + 结果集字节上限（REQ-05，v0.1.103）
+
+```yaml
+db_access:
+  defaults:
+    statement_timeout_ms: 30000    # 语句级超时上限；调用侧只能收紧
+    max_result_bytes: 67108864     # 结果集字节上限（与 max_rows 并存，先到先生效）
+    on_exceed: fail                # fail（缺省）| truncate
+```
+
+```js
+await db.query(sql, params, { timeoutMs: 5000 });   // 只能 ≤ 配置；更大 → OJ_DB_CAPACITY 点名 statement_timeout_ms
+await db.stream(sql, params, { timeoutMs: 600000 }); // pump 全程竞速（导出长档场景）
+const it = db.stream(sql);                            // truncate 档的信令：
+for await (const r of it) {...}
+const inf = await it.info();                          // {rows, bytes, truncated}——结束后仍可读
+```
+
+- **覆盖面**：`db.query` / `db.exec` / `db.stream` / `db.table()` 构造器四条 pool 路径。
+  tx / attach 会话路径不叠语句超时（连接状态不可知，维持会话寿命封顶口径）。
+- **错误信封**：超时 → `OJ_DB_TIMEOUT`（`retryable=true`、`sessionDisposition=close`、
+  `data={alias,timeout_ms,cancelled}`）；字节触顶（fail）→ `OJ_DB_CAPACITY`
+  （`data={alias,limit_bytes,counted_bytes}`）。截断信令：raw/构造器走响应头
+  `X-OJ-Result-Truncated: <counted>`；db.stream 走 `it.info().truncated`。
+- **字节口径**：行 **JSON 编码字节**累加（≥ 线上原始字节，更严、确定性可测）。边拉边计：
+  sqlite 内置触顶**真早停**（fetch 流 drop，连接随之关闭不复用）；把结果推过上限的那一行
+  计入 `counted` 但不交付。
+- **架构限制（诚实口径）**：
+  - sqlite 内置的**单条 CPU 密集语句**（如同步步进的递归 CTE）会饿死 current_thread
+    定时器——deadline 只能在驱动让步点触发。网络型后端（mysql/pg 插件轴，I/O 驱动）
+    准点触发（env-gated 用例：`statement_timeout_matrix_pg_mysql`）。
+  - 超时后 `data.cancelled` 按后端诚实标注：sqlite 内置 = `true`（真早停）；**网络型
+    方言 = `false`**——无论内置 sqlx（pg/mysql DSN）还是插件轴，宿主弃 future/FfiFuture
+    只停止客户端拉取，服务端语句可能仍在跑——mysql/pg 真取消（KILL QUERY /
+    pg_cancel_backend）需插件侧协作，**ABI 13 单独成车**；本车的护栏价值 = 调用侧准点
+    拿到结构化超时 + 字节闸不再 OOM。
+  - 未覆盖 metered 拉取的后端（内存 fake / 回落路径）字节计量为「拉完再计」：fail 仍拒、
+    truncate 交付全量 + 信令照打（无 OOM 防线）。
+
+## 11.6.4 任务式导出（U-18，v0.1.104）
+
+`db.export`/`db.exportStatus`/`db.exportCancel` 三件：发起即返 taskId，自驱消费任务把
+游标流式编码成 csv/jsonl 落 blob（`export/` 保留前缀，TTL 24h 宿主清扫，live 豁免）。
+配置 `db_export:` 段（并发配额/字节上限/回落硬顶/TTL）；与语句超时的分工、重启 not
+found 语义、错误≠策略双轨见 api-manual 限制表两行与 scenarios 场景 54。
 
 ## 11.7 安全审计（`audit:` 段 + `audit.query`，U-9 v0.1.98）
 

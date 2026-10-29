@@ -16,6 +16,65 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.104
+
+**U-18 / REQ-03 任务式导出（批次 3；需求源 `oj-dbx/docs/upstream`，设计 §3）**：
+
+- **`db.export` / `db.exportStatus` / `db.exportCancel` 三件**：发起即返 `{taskId}`
+  （同步开游标 + 登记，查询下推异步——大结果集 200ms 内回执）；新的 Rust 自驱消费任务
+  drain 游标，csv（BOM/引号转义/NULL，行尾恒定 `\r\n`）/ jsonl（行 JSON）逐块
+  `put_stream_chunk` 落 blob；泵每 256 行 yield 节流，防 current_thread 运行时饿死
+  JS isolate。`exportStatus` = `{taskId, state: running|done|failed|cancelled, rows,
+  bytes, truncated, truncatedReason, startedAtMs, finishedAtMs, error, blobKey}`。
+- **双轨闸**：`maxBytes` 超限 → **failed**（错误，不静默截断，半成品 put_stream_abort
+  清——防 s3 orphan parts）；`max_rows` 策略截断 → **done + `truncated:true` +
+  `truncatedReason:"max_rows"`**（策略可见化，与查询 X-OJ-Row-Limit 同哲学）。
+- **配额**：全局并发 4 / 每主体 2（`db_export:` 段可调，装配期 validate fail-loud
+  点名键），错误文案区分「global / per-subject 满」；`put_stream` 回落路径（插件缺
+  流式）整段缓冲硬顶 128 MiB（< max_bytes 校验）。导出与 db.query 同门过 db_access
+  判权；不吃语句超时（长任务语义，成文）。
+- **产物与回收（零 ABI）**：key = `export/<taskId>.<ext>`（随机不可预测）；TTL 24h
+  自 `put_stream_open` 起算（崩溃半成品可扫），宿主 tokio interval 清扫器按台账年龄
+  删（live 任务 key 豁免）；`fileName` 存 sidecar，local 首方下载带
+  Content-Disposition 原名（s3 腿尽力——无此元数据，成文差异）。
+- **安全语义**：taskId 内嵌 boot tag——重启后旧 id 一律 **not found**（不 failed，
+  防误读为 SQL 错；跨重启恢复为有意裁剪）；他人 id 不可见（bearer 语义，日志/错误
+  只出前 8 字符）；发起/终态落审计事件（主体/tenant/alias/rows/bytes/终态，SQL 全文
+  不入审计）。
+- 新模块 `src/bridge/db_export.rs`（ExportRegistry 壳照 ExecRegistry：状态机 + 归属 +
+  配额 + TTL 台账）+ blob 轴两个默认 no-op 元数据方法（`filename` /
+  `put_stream_filename` / `set_filename`，local 覆盖，s3 天然回落）。
+
+## v0.1.103
+
+**上游 REQ-05 处置（U-18 批次 2；需求源 `oj-dbx/docs/upstream`）——慢查询护栏与结果集大小闸 GA**：
+
+- **语句级超时**：`db.access` 新增 `statement_timeout_ms`（0/超 1h 拒，点名键）；裸 SQL
+  调用侧第三参 `{timeoutMs}` 只能**收紧**配置值（放宽 → `OJ_DB_CAPACITY` 点名
+  `statement_timeout_ms`，`data={configured_ms,requested_ms,capability}`）。宿主侧
+  `tokio::time::timeout` 竞速，零 ABI 变更。覆盖 `db.query` / `db.exec` / `db.stream` /
+  `db.table()` 构造器全路径；超时 → 结构化 `OJ_DB_TIMEOUT`（`retryable`、`sessionDisposition:
+  close`、`data={alias,timeout_ms,cancelled}`）。**事务面**：仅 `db.session` 附挂会话超时
+  的语句竞速（到期 `kill_attached`）；plain `db.tx` 不叠语句超时（连接状态不可知，
+  文档成文）。
+- **`max_result_bytes` + `on_exceed: fail|truncate`**：行 **JSON 编码字节**计量
+  （严于线上字节、确定性可测）。fail（缺省）→ 结构化 `OJ_DB_CAPACITY`；truncate →
+  `X-OJ-Result-Truncated: counted` 头 + `db.stream` 的 `it.info()` =
+  `{rows, bytes, truncated}` 显式信令（close 前快照）。SqlxAccessor 边拉边计真早停；
+  插件轴缺省事后计量。
+- **`data.cancelled` 诚实口径**：sqlite 内置 = `true`（真早停）；网络型方言 = `false`
+  （内置 sqlx 的 pg/mysql DSN 与插件轴同口径：宿主弃 future ≠ 服务端取消，真取消 =
+  ABI 13 车）。pg/mysql 真库 env-gated 用例经 Apple container 亲跑双腿全绿。
+- **架构边界成文**（api-manual §13 + SKILL 陷阱）：sqlite 同步步进饿死
+  current_thread 定时器，deadline 只在让步点触发；网络型后端（mysql/pg 插件轴，
+  I/O 驱动）准点。验收矩阵 env-gated（`OJ_TEST_PG` / `OJ_TEST_MYSQL`），本地 skip
+  诚实登记。
+- 新增 `db_quota` 纯原语模块（Quota / effective_timeout_ms / ByteMeter /
+  race_statement / 结构化错误工厂），供批次 3（task-based export）复用。
+- **真库跑出的存量修复**：sqlx Any 行解码补 `f32` 臂——pg `REAL` / mysql `FLOAT`
+  （float4）在 sqlx 里是独立于 f64 的 TypeInfo，原探测链探不到即报
+  `unsupported sqlite column type: REAL`（env-gated 真库腿首次亲跑暴露）。
+
 ## v0.1.102
 
 **上游 REQ-01 + REQ-02 处置（U-18 批次 1；需求源 `oj-dbx/docs/upstream`）**：

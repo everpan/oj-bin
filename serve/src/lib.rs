@@ -550,6 +550,23 @@ async fn handle_api(
                         ),
                     );
                 }
+                // U-18 导出产物：有原始文件名 sidecar（local 首方）→ 另存为原名。
+                // s3 腿无此元数据 = 不下发（尽力口径成文于 db-guide）。
+                if let Ok(Some(name)) = blob.filename(&key).await
+                    && !name.is_empty()
+                {
+                    let safe: String = name
+                        .chars()
+                        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
+                        .collect();
+                    r.headers_mut().insert(
+                        axum::http::header::CONTENT_DISPOSITION,
+                        axum::http::HeaderValue::from_str(&format!(
+                            "attachment; filename=\"{safe}\""
+                        ))
+                        .unwrap_or(axum::http::HeaderValue::from_static("attachment")),
+                    );
+                }
                 r
             }
             Ok(BlobServed::Redirect(url)) => {

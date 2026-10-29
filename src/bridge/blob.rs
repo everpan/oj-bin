@@ -56,6 +56,21 @@ pub trait BlobBackend: Send + Sync {
         Err("blob backend does not support streaming upload (ABI 10 required)".into())
     }
 
+    /// 原始文件名（下载 Content-Disposition 用；U-18 导出产物）。默认 None——
+    /// 后端不存元数据则不下发该头（s3 腿尽力口径的缺省形态）。
+    async fn filename(&self, _key: &str) -> BridgeResult<Option<String>> {
+        Ok(None)
+    }
+    /// 给在传的流式会话挂原始文件名（local finish 时落 `<key>.filename` sidecar；
+    /// 不支持的后端 no-op——下载头照缺）。**已消毒**（无控制字符/引号/路径段）。
+    async fn put_stream_filename(&self, _upload_id: u64, _filename: &str) -> BridgeResult<()> {
+        Ok(())
+    }
+    /// 整段 put 路径挂原始文件名（回落路径用；语义同 put_stream_filename）。
+    async fn set_filename(&self, _key: &str, _filename: &str) -> BridgeResult<()> {
+        Ok(())
+    }
+
     /// ---- ABI 11 服务端搬运 + 区间读 ----
     /// 复制（**src 保留**）。默认实现 `get` + `put`（字节进 V8）——能服务端复制的后端
     /// 必须覆盖，否则大文件搬运白付 2× 峰值。`src == dst` 为 no-op。
@@ -153,6 +168,8 @@ struct LocalPutSession {
     final_path: PathBuf,
     key: String,
     ct: Option<String>,
+    /// 原始文件名（U-18 导出；finish 时落 `<key>.filename` sidecar → 下载 Content-Disposition）。
+    filename: Option<String>,
     /// Some = 仍在写入；finish/abort 时 take（LocalPutSession 实现 Drop，不能 move 出字段）。
     file: Option<tokio::fs::File>,
     finished: bool,
@@ -188,6 +205,9 @@ impl LocalBlob {
     }
 
     /// sidecar 路径（content_type 持久化；local 专属）。
+    fn filename_path(&self, key: &str) -> PathBuf {
+        self.root.join(format!("{key}.filename"))
+    }
     fn ct_path(&self, key: &str) -> PathBuf {
         self.root.join(format!("{key}.ct"))
     }
@@ -310,6 +330,25 @@ impl BlobBackend for LocalBlob {
 
     /// 流式上传（ABI 10）：临时文件 append → finish rename 转正 + ct sidecar。
     /// 临时文件名带 pid+序号防并发互踩；Drop 守卫兜底清理（finish/abort 漏调也不泄漏）。
+    async fn filename(&self, key: &str) -> BridgeResult<Option<String>> {
+        os_path(key)?;
+        let p = self.filename_path(key);
+        match std::fs::read_to_string(&p) {
+            Ok(v) if !v.is_empty() => Ok(Some(v)),
+            Ok(_) | Err(_) => Ok(None), // 无 sidecar = 无原名（尽力口径）
+        }
+    }
+
+    async fn set_filename(&self, key: &str, filename: &str) -> BridgeResult<()> {
+        os_path(key)?;
+        let p = self.filename_path(key);
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("blob filename dir: {e}"))?;
+        }
+        std::fs::write(p, filename).map_err(|e| format!("blob filename write: {e}"))?;
+        Ok(())
+    }
+
     async fn put_stream_open(&self, key: &str, content_type: Option<&str>) -> BridgeResult<u64> {
         os_path(key)?;
         let id = self
@@ -329,11 +368,23 @@ impl BlobBackend for LocalBlob {
                 final_path: self.root.join(key),
                 key: key.to_string(),
                 ct: content_type.map(str::to_string),
+                filename: None,
                 file: Some(file),
                 finished: false,
             })),
         );
         Ok(id)
+    }
+
+    async fn put_stream_filename(&self, upload_id: u64, filename: &str) -> BridgeResult<()> {
+        let s = {
+            let m = self.uploads.lock().unwrap();
+            m.get(&upload_id)
+                .cloned()
+                .ok_or_else(|| format!("blob put_stream_filename: unknown upload {upload_id}"))?
+        };
+        s.lock().await.filename = Some(filename.to_string());
+        Ok(())
     }
 
     async fn put_stream_chunk(&self, upload_id: u64, bytes: &[u8]) -> BridgeResult<()> {
@@ -395,6 +446,19 @@ impl BlobBackend for LocalBlob {
             }
             None => {
                 let _ = std::fs::remove_file(self.ct_path(&key));
+            }
+        }
+        // 原始文件名 sidecar（显式给才写；没有则清掉旧值，避免改名后继承）。
+        match g.filename.take() {
+            Some(name) => {
+                let p = self.filename_path(&key);
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| format!("blob filename dir: {e}"))?;
+                }
+                std::fs::write(p, name).map_err(|e| format!("blob filename write: {e}"))?;
+            }
+            None => {
+                let _ = std::fs::remove_file(self.filename_path(&key));
             }
         }
         g.finished = true; // Drop 守卫不再删（tmp 已 rename 走，此处防御语义）
@@ -858,6 +922,47 @@ mod tests {
                 .contains("blob backend 'ghost' not configured"),
             "{v}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn put_stream_filename_sidecar_roundtrips_for_disposition() {
+        let root = tmp_root();
+        let b = LocalBlob::new(&root, "/v1/api").unwrap();
+        // 无原名：filename 查询 None
+        let id = b
+            .put_stream_open("export/a.csv", Some("text/csv"))
+            .await
+            .unwrap();
+        b.put_stream_chunk(id, b"x").await.unwrap();
+        b.put_stream_finish(id).await.unwrap();
+        assert_eq!(b.filename("export/a.csv").await.unwrap(), None);
+        // 有原名：finish 落 sidecar，可回读（下载路由据此下发 Content-Disposition）
+        let id2 = b
+            .put_stream_open("export/b.csv", Some("text/csv"))
+            .await
+            .unwrap();
+        b.put_stream_filename(id2, "orders-2026.csv").await.unwrap();
+        b.put_stream_finish(id2).await.unwrap();
+        assert_eq!(
+            b.filename("export/b.csv").await.unwrap().as_deref(),
+            Some("orders-2026.csv")
+        );
+        // set_filename（整段 put 回落路径）
+        b.put("export/c.csv", b"y", Some("text/csv")).await.unwrap();
+        b.set_filename("export/c.csv", "c-export.csv")
+            .await
+            .unwrap();
+        assert_eq!(
+            b.filename("export/c.csv").await.unwrap().as_deref(),
+            Some("c-export.csv")
+        );
+        // 第二次流式不带原名：旧 sidecar 被清（不继承）
+        let id3 = b
+            .put_stream_open("export/b.csv", Some("text/csv"))
+            .await
+            .unwrap();
+        b.put_stream_finish(id3).await.unwrap();
+        assert_eq!(b.filename("export/b.csv").await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

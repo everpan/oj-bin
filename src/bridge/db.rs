@@ -708,7 +708,9 @@ pub(crate) async fn query_impl(
     };
     // REQ-05：字节触顶分档——fail → 结构化 OJ_DB_CAPACITY（trace 记失败画像后抛）；
     // truncate → 交付已取行 + X-OJ-Result-Truncated 显式信令（对齐 X-OJ-Row-Limit 先例）。
-    if meter.exceeded {
+    // 「查询已成功」守卫（终审 I2）：超时与字节上限同时越界时先到先生效——
+    // 无守卫会把 OJ_DB_TIMEOUT 改写成 OJ_DB_CAPACITY（构造器路径同款守卫）。
+    if meter.exceeded && res.is_ok() {
         match quota.on_exceed {
             super::db_policy::OnExceed::Fail => {
                 let e = super::db_quota::result_too_large_error(
@@ -2208,8 +2210,9 @@ mod tests {
     }
 
     /// REQ-05 Q7（env-gated，三方言矩阵的 pg/mysql 腿）：语句级超时在**网络型后端**
-    /// 准点触发——60s 级慢语句（pg_sleep/sleep）+ 500ms 上限 → ~500ms 拿
-    /// OJ_DB_TIMEOUT（data.cancelled=false：插件轴宿主弃句柄，服务端真取消 = ABI 13 车）。
+    /// 准点触发——5s 级慢语句（pg_sleep/sleep）+ 500ms 上限 → ~500ms 拿
+    /// OJ_DB_TIMEOUT（data.cancelled=false：网络方言弃 future ≠ 服务端取消，内置
+    /// SqlxAccessor 与插件轴同口径；真取消 = ABI 13 车）。
     /// 未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（本地诚实登记：此腿未经亲跑）。
     /// flavor 必须 current_thread（同存量真库用例：multi_thread 下 op 内 spawn 断言 SIGABRT）。
     #[tokio::test(flavor = "current_thread")]

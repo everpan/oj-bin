@@ -78,6 +78,9 @@ import {
   op_db_stream_open,
   op_db_stream_next,
   op_db_stream_info,
+  op_db_export,
+  op_db_export_status,
+  op_db_export_cancel,
   op_db_stream_close,
   op_db_stream_abort,
   op_es_search,
@@ -1021,6 +1024,11 @@ globalThis.DB = function (name) {
       // raw SQL + bound params (params optional).
       query: (sql, params, opts) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
       exec: (sql, params, opts) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
+      // U-18 task-based export (v0.1.104): returns {taskId} immediately; a Rust
+      // consumer task drains the cursor into a blob artifact (csv/jsonl).
+      export: (args) => dbOpWrap(op_db_export(name, args)),
+      exportStatus: (taskId) => dbOpWrap(op_db_export_status(String(taskId))),
+      exportCancel: (taskId) => dbOpWrap(op_db_export_cancel(String(taskId))),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
       // system escape hatch (tenant sql_guard): this request bypasses tenant
@@ -1126,6 +1134,7 @@ globalThis.DB = function (name) {
                   }
                   return { done: false, value: row };
                 } catch (e) {
+                  await readInfo(); // snapshot final stats before close() deregisters
                   close();
                   throw e;
                 }

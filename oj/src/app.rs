@@ -1438,6 +1438,13 @@ pub async fn assemble_backend(
     // 执行登记表（U-5 v0.1.96）：同 tx_sessions——装配层构造一次，热更前后同一 Arc
     // （存活流的可取消性跨热更有效）。
     let exec_sessions = Arc::new(only_js::bridge::db_exec::ExecRegistry::default());
+    // 任务式导出（U-18 v0.1.104）：`db_export:` 段装配期校验（fail-loud 点名键），
+    // 注册表同 tx_sessions——热更前后同一 Arc（在跑导出任务跨热更存活）。
+    cfg.db_export.validate()?;
+    let export_section = Arc::new(cfg.db_export.clone());
+    let export_registry = Arc::new(only_js::bridge::db_export::ExportRegistry::new(
+        &cfg.db_export,
+    ));
     // 运行期连接工厂（与装配期同集：含插件 mysql/postgres）；config 目录作为 sqlite 相对路径基准。
     let db_backend = Arc::new(registries.dbs.clone());
     let config_dir_arc = Arc::new(config_dir.to_path_buf());
@@ -1506,6 +1513,8 @@ pub async fn assemble_backend(
         // 影子绑定：同 db_client —— 会话配置与注册表也须与 StableState 同一 Arc。
         let db_session = db_session.clone();
         let tx_sessions = tx_sessions.clone();
+        let export_section = export_section.clone();
+        let export_registry = export_registry.clone();
         let audit = audit.clone();
         let audit_store = audit_store.clone();
         let exec_sessions = exec_sessions.clone();
@@ -1572,6 +1581,8 @@ pub async fn assemble_backend(
                     audit_section: Some(audit.clone()),
                     audit: Some(audit_store.clone()),
                     exec_sessions: Some(exec_sessions.clone()),
+                    export_section: Some(export_section.clone()),
+                    export_registry: Some(export_registry.clone()),
                     mgmt_section: Some(mgmt_section.clone()),
                     mgmt_axes: Some(mgmt_axes.clone()),
                     mgmt: Some(mgmt.clone()),
@@ -1640,10 +1651,12 @@ pub async fn assemble_backend(
         audit_section: audit.clone(), // 与 make_bridge 的 Extras.audit_section 同一 Arc。
         audit: audit_store.clone(), // 与 make_bridge 的 Extras.audit 同一存储。
         exec_sessions: exec_sessions.clone(), // 与 make_bridge 的 Extras.exec_sessions 同一注册表。
+        export_section: export_section.clone(), // 与 make_bridge 的 Extras.export_section 同一 Arc。
+        export_registry: export_registry.clone(), // 与 make_bridge 的 Extras.export_registry 同一注册表。
         mgmt_section: mgmt_section.clone(), // 与 make_bridge 的 Extras.mgmt_section 同一 Arc。
-        mgmt_axes: mgmt_axes.clone(), // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
-        mgmt: mgmt.clone(), // 与 make_bridge 的 Extras.mgmt 同一登记表。
-        secret_keys: secret_keys.clone(), // 与 make_bridge 的 Extras.secret_keys 同源。
+        mgmt_axes: mgmt_axes.clone(),       // 与 make_bridge 的 Extras.mgmt_axes 同一注册表。
+        mgmt: mgmt.clone(),                 // 与 make_bridge 的 Extras.mgmt 同一登记表。
+        secret_keys: secret_keys.clone(),   // 与 make_bridge 的 Extras.secret_keys 同源。
         db_access_rt: db_access_rt.clone(), // 与 make_bridge 的 Extras.db_access_rt 同源（同一 Arc）。
         db_backend: db_backend.clone(), // 与 make_bridge 的 Extras.db_backend 同源（同一 Arc）。
         config_dir: config_dir_arc.clone(), // 与 make_bridge 的 Extras.config_dir 同源（同一 Arc）。
