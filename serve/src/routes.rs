@@ -1180,10 +1180,9 @@ mod tests {
         );
         assert!(f.is_empty(), "{f:?}");
         let ps = t.patterns();
-        assert!(ps.iter().any(|&p| p == "/v1/api/a"), "{ps:?}");
-        assert!(ps.iter().any(|&p| p == "/v1/api/a/{id}"), "{ps:?}");
+        assert!(ps.contains(&"/v1/api/a"), "{ps:?}");
+        assert!(ps.contains(&"/v1/api/a/{id}"), "{ps:?}");
     }
-
 
     fn tbl(files: &[&str], decls: &[(&str, &str, &str)]) -> (RouteTable, Vec<String>) {
         // decls: (文件相对路径, handler 链, 有效 .route 值；空串 = 未挂)。

@@ -3294,6 +3294,41 @@ pub(crate) mod tests {
         assert!(resp2.starts_with("HTTP/1.1 405"), "{resp2}");
     }
 
+    // U-18 批 T1.5（REQ-01）：route_timeouts 三形态命中 busy handler → 408。
+    // 全局 timeout 传 None：证明生效的是路由覆盖而非全局（粒度 ≥25ms 看门狗 tick）。
+    async fn route_timeout_shape_hits(shape: &str) -> bool {
+        let t = routes(&[(
+            "u/f/api.ts",
+            "export default { get() { while (true) {} } };",
+        )]);
+        let pl = Pipeline {
+            route_timeouts: vec![(shape.to_string(), std::time::Duration::from_millis(200))],
+            ..Pipeline::default()
+        };
+        let addr = spawn_pipeline("/v1/api", t.0.clone(), true, None, pl).await;
+        let resp = raw_http(
+            addr,
+            "GET /v1/api/u/f HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        resp.starts_with("HTTP/1.1 408")
+    }
+
+    #[tokio::test]
+    async fn route_timeout_literal_with_base_hits_408() {
+        assert!(route_timeout_shape_hits("/v1/api/u/f").await);
+    }
+
+    #[tokio::test]
+    async fn route_timeout_tail_one_segment_hits_408() {
+        assert!(route_timeout_shape_hits("/v1/api/u/*").await);
+    }
+
+    #[tokio::test]
+    async fn route_timeout_multi_segment_hits_408() {
+        assert!(route_timeout_shape_hits("/**").await);
+    }
+
     #[tokio::test]
     async fn handler_timeout_returns_408_envelope() {
         let t = routes(&[(
