@@ -33,6 +33,7 @@ pub mod client_db;
 mod crypto;
 mod db;
 pub mod db_backend;
+pub mod db_ddl;
 pub mod db_error;
 pub mod db_exec;
 mod db_explain;
@@ -525,6 +526,7 @@ deno_core::extension!(
         db::op_db_as_tenant,
         db_query::op_db_query,
         db_query::op_db_exec,
+        db_ddl::op_db_ddl_diff,
         db_explain::op_db_explain,
         db_seq::op_db_next_seq,
         db::op_db_sql_profile,

@@ -2799,3 +2799,158 @@ async fn catalog_ddl_pg_stitch_roundtrip_real() {
         "重放后结构须一致"
     );
 }
+
+/// U-14（v0.1.109）db.ddlDiff 反向渲染：sqlite 桥 → 结构化 unsupported
+/// （capability=ddl_diff，不静默回落）。
+#[tokio::test(flavor = "current_thread")]
+async fn ddl_diff_sqlite_unsupported() {
+    let db = crate::bridge::SqlxAccessor::arc("sqlite::memory:")
+        .await
+        .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"db.ddlDiff({ objectType: "table", name: "t", from: { columns: [] }, to: { columns: [] } })
+                 .then(() => json.ok({ ok: true }),
+                       (e) => json.ok({ ok: false, code: e.code, cap: e.data && e.data.capability }))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["ok"], false, "sqlite 必须 unsupported: {d}");
+    assert_eq!(d["code"], "OJ_DB_UNSUPPORTED", "{d}");
+    assert_eq!(d["cap"], "ddl_diff", "{d}");
+}
+
+/// U-14（v0.1.109）db.ddlDiff PG smoke（真实 PG16）：listColumns 喂 from，
+/// 改类型 + 加列 → USING 语句 + ADD COLUMN；零 DB I/O 渲染。
+#[tokio::test(flavor = "current_thread")]
+async fn ddl_diff_pg_real() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    db.exec_with_params("drop table if exists oj_ddldiff_t", &[])
+        .await
+        .unwrap();
+    db.exec_with_params(
+        "create table oj_ddldiff_t (id int primary key, name text)",
+        &[],
+    )
+    .await
+    .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const from = { columns: await db.listColumns("oj_ddldiff_t") };
+                 const toCols = from.columns.map(c => ({ ...c }));
+                 toCols[1].nativeType = "varchar(64)";
+                 toCols.push({ name: "age", nativeType: "integer", nullable: true });
+                 const r = await db.ddlDiff({
+                   objectType: "table", name: "oj_ddldiff_t", from, to: { columns: toCols },
+                 });
+                 json.ok({ added: r.diff.columns.added, stmts: r.statements });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["added"], json!(["age"]), "{d}");
+    let stmts: String = d["stmts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        stmts.contains("ALTER COLUMN \"name\" TYPE varchar(64) USING \"name\"::varchar(64)"),
+        "{stmts}"
+    );
+    assert!(stmts.contains("ADD COLUMN \"age\" integer"), "{stmts}");
+}
+
+/// U-14（v0.1.109）db.ddlDiff MySQL smoke（真实 MySQL 8.4）：加列带 AFTER 定位。
+#[tokio::test(flavor = "current_thread")]
+async fn ddl_diff_mysql_real() {
+    let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_MYSQL empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    db.exec_with_params("drop table if exists oj_ddldiff_t", &[])
+        .await
+        .unwrap();
+    db.exec_with_params(
+        "create table oj_ddldiff_t (id int auto_increment primary key, name varchar(64))",
+        &[],
+    )
+    .await
+    .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const from = { columns: await db.listColumns("oj_ddldiff_t") };
+                 const toCols = from.columns.map(c => ({ ...c }));
+                 toCols.push({ name: "age", nativeType: "int", nullable: true });
+                 const r = await db.ddlDiff({
+                   objectType: "table", name: "oj_ddldiff_t", from, to: { columns: toCols },
+                 });
+                 json.ok({ added: r.diff.columns.added, stmts: r.statements });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["added"], json!(["age"]), "{d}");
+    let stmts: String = d["stmts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(stmts.contains("ADD COLUMN `age` int"), "{stmts}");
+    assert!(stmts.contains("AFTER `name`"), "{stmts}");
+}

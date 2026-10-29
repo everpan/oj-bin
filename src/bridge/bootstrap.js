@@ -69,6 +69,7 @@ import {
   op_db_tx_rollback,
   op_db_cancel,
   op_db_catalog,
+  op_db_ddl_diff,
   op_db_list_schemas,
   op_db_list_databases,
   op_mgmt_register,
@@ -1086,6 +1087,12 @@ globalThis.DB = function (name) {
       // kinds reject with OJ_DB_UNSUPPORTED, never silent). ddl/comment/constraints
       // take a table name arg; views/routines/sequences/stats are whole-db.
       catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg), null)),
+      // U-14 reverse DDL (v0.1.109): pure renderer, zero DB I/O. {objectType:"table", name,
+      // from, to} -> {diff, statements}; absent dimension = skip, empty array = drop all.
+      // Execution stays on db.exec + allow_ddl. sqlite/unknown dialect -> OJ_DB_UNSUPPORTED
+      // (capability=ddl_diff). Identifiers are quoted per dialect (never a charset whitelist);
+      // verbatim fragments (nativeType/default/definition) reject ';' and NUL.
+      ddlDiff: (spec) => dbOpWrap(op_db_ddl_diff(name, spec)),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.
       sqlProfile: () => op_db_sql_profile(),
