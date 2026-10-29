@@ -1051,7 +1051,9 @@ fn validate_route_timeouts(patterns: &[String], route_keys: &[String]) -> Result
                  use '*' (one segment) or '**' (multi-segment) instead"
             ));
         }
-        let hit = route_keys.iter().any(|k| serve::path_matches(std::slice::from_ref(p), k));
+        let hit = route_keys
+            .iter()
+            .any(|k| serve::path_matches(std::slice::from_ref(p), k));
         if !hit {
             return Err(format!(
                 "server.route_timeouts: pattern '{p}' matches none of {} registered routes — \
@@ -2347,12 +2349,7 @@ mod tests {
             "/v1/api/deep/x/y".to_string(),
         ];
         // Given pattern 命中（字面含 base / 单段 `*` 对 `{param}` / `**`），When 校验，Then Ok。
-        for ok in [
-            "/v1/api/a",
-            "/v1/api/orders/*",
-            "/v1/api/**",
-            "/**",
-        ] {
+        for ok in ["/v1/api/a", "/v1/api/orders/*", "/v1/api/**", "/**"] {
             assert!(
                 validate_route_timeouts(&[ok.to_string()], &keys).is_ok(),
                 "{ok} 应命中"
