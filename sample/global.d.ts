@@ -181,11 +181,22 @@ interface JsonApi {
     permanentRedirect(url: string): void; // 308 永久 + 方法保持
   };
   // 流式响应：开流后逐块 write，绕过 {code,msg,data} 信封。
-  // opts：{ status?, contentType? }；返回 writer 必须显式 end()（或 handler 返回即自动关流）。
-  stream(opts?: { status?: number; contentType?: string }): StreamWriter;
+  // opts：{ status?, contentType?, fileName?, disposition? }——fileName + disposition:
+  // "attachment"（缺省）按原名附件下载、"inline" 内联。
+  stream(opts?: {
+    status?: number;
+    contentType?: string;
+    fileName?: string;
+    disposition?: "attachment" | "inline";
+  }): StreamWriter;
   // SSE 便捷封装：自动 text/event-stream + 数据帧 `data: <c>\n\n`；
   // opts：{ status?, heartbeatSecs? }（心跳默认 15s，保活穿透代理）。
-  sse(opts?: { status?: number; heartbeatSecs?: number }): StreamWriter;
+  sse(opts?: {
+    status?: number;
+    heartbeatSecs?: number;
+    fileName?: string;
+    disposition?: "attachment" | "inline";
+  }): StreamWriter;
 }
 
 // 流式写入器（json.stream/json.sse 返回）。
@@ -699,6 +710,20 @@ declare global {
      * 此处只暴露**管理面**，使用面一律走 `DB(name)`。`delete` 自动驱逐 `DB()` 缓存，
      * 否则删后再 `DB(name)` 拿到陈旧实例。 */
     client: DBClientApi;
+    /** 运行期动态授权（U-1，db_access 注入「allow」维度；特权面，fail-closed 同 client）。 */
+    access: DBAccessApi;
+    /** host 权威代际计数（U-3）：别名被删除/重登即递增——handler 据此感知跨 isolate 失效。 */
+    epoch(name: string): number;
+  }
+
+  /** 运行期动态授权面（`db.access`，U-1）。grant 至少一个维度非空（空 allow = 授权给所有人，拒）。 */
+  interface DBAccessApi {
+    grant(
+      alias: string,
+      allow: { roles?: string[]; users?: string[]; tenants?: string[]; modules?: string[] },
+      opts?: Record<string, unknown>,
+    ): Promise<unknown>;
+    revoke(alias: string): Promise<unknown>;
   }
 
   /** 动态登记数据源的逐别名记账条目（`db.client.list()` 的元素）。 */
@@ -809,6 +834,90 @@ declare global {
     /** 是否已登记（同步；探活用，不经过登记门）。 */
     has(name: string): boolean;
   }
+
+  /** 一条安全审计事件（`audit.query()` 的元素）。零凭据：只有 alias/动作/前缀 id。 */
+  interface AuditEntry {
+    /** 事件时刻（Unix 毫秒）。 */
+    tsMs: number;
+    /** 事件族：`DB_CLIENT_AUDIT` / `DB_CLIENT_DENY` / `DB_ACCESS_AUDIT` / `DB_SESSION_*`。 */
+    kind: string;
+    /** 操作者（`user.id`；无身份 null）。 */
+    user: string | null;
+    tenant: string | null;
+    module: string | null;
+    /** 请求来源：`http` / `task`。 */
+    source: string;
+    /** 库别名。 */
+    alias: string;
+    /** 动作与原因（如 `action=register dialect=mysql`、`id=tx_ab12_… reason=idle_timeout`）。 */
+    detail: string;
+  }
+
+  /** 一个已登记管理面 connector（`mgmt.list()` 的元素，U-15）。 */
+  interface MgmtEntry {
+    /** connector 名（= 收编的泛型轴名）。 */
+    connector: string;
+    /** 脱敏连接串（`user:pass@` → `***`）。 */
+    dsn: string;
+    /** 登记操作者（`user.id`；无身份 null）。 */
+    registeredBy: string | null;
+    /** 登记时刻（Unix 毫秒）。 */
+    registeredAtMs: number;
+    /** 插件 `__ops__` 自报的 op 清单（readOnly 位以插件文档为准——宿主不可验证，仅用于预判分档门）。 */
+    ops: Array<{ name: string; readOnly: boolean }>;
+  }
+
+  /**
+   * 安全审计检索（`audit:` 段）。统一出口：`DB_CLIENT_*` / `DB_ACCESS_AUDIT` /
+   * `DB_SESSION_*` 全部落此。进程内有界环形缓冲（缺省 2000 条 / 24h，双限自动清理），
+   * **不跨重启**；读门 = `audit.allow`（每调用重判）。`query` 即导出通道。
+   * filter 各维可选：kind / user / tenant / alias / sinceMs / untilMs / limit（缺省 100，硬顶 1000）。
+   * 返回最新在前。
+   */
+  const audit: {
+    query(filter?: {
+      kind?: string;
+      user?: string;
+      tenant?: string;
+      alias?: string;
+      sinceMs?: number;
+      untilMs?: number;
+      limit?: number;
+    }): Promise<AuditEntry[]>;
+  };
+
+  /**
+   * 管理面 connector（`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
+   * 泛型轴**不进** `axis()` 公开面；register/delete/非只读 call 走 `mgmt.allow`，只读 call
+   * 与 list 走 `mgmt.allow_read`（缺省复用 allow）；每动作落 `MGMT_AUDIT`/`MGMT_DENY` 审计
+   * （全字段零凭据）。未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）。
+   */
+  const mgmt: {
+    /** 登记（探 `__ops__` + `__connect__` + ping，失败即拒）。 */
+    register(name: string, dsn: string): Promise<MgmtEntry>;
+    /** 删除（尽力 `__disconnect__` 后摘表；幂等）。 */
+    delete(name: string): Promise<boolean>;
+    /** 清单（读档）。 */
+    list(): Promise<MgmtEntry[]>;
+    /** 探活（未启用/未登记 = false）。 */
+    has(name: string): boolean;
+    /** 管理调用（args 必须是 JSON object；`__handle` 由宿主注入）。 */
+    call(name: string, op: string, args?: Record<string, unknown>): Promise<unknown>;
+  };
+
+  /**
+   * 运行期凭据轴。与 config `ENC[...]` 同一套 X25519 + AES-256-GCM 信封：
+   * `seal` 用部署公钥（`secrets.public_key_path`，缺省由私钥推导）加密；`open` 需部署私钥，
+   * 每次落 `SECRET_OPEN` 审计（零凭据）。装配无密钥 → 两者都抛
+   * `secret axis not configured`（fail-closed）；只有公钥（seal-only）→ `open` 抛
+   * `no private key`。私钥永不出 Rust 边界。同一明文两次 seal 密文不同（临时密钥随机化）。
+   */
+  const secret: {
+    /** 加密为 `ENC[...]` 密文（可存自有表/回传前端；解密只能靠部署私钥）。 */
+    seal(plaintext: string): string;
+    /** 解开 `secret.seal`（或 `oj secret seal`）产出的 `ENC[...]`。 */
+    open(token: string): string;
+  };
 
   const json: JsonApi;
   const http: HttpApi;
@@ -1018,90 +1127,4 @@ interface OjRabbitClient {
 // 别名由 `types/oj-modules.d.ts`（ambient `declare module "#*"`）兜底为 any 而非 TS2307。
 // 运行时由 oj loader 解析，两份声明只影响编辑器 / tsc。
 
-// ======== 十、特权检索面（audit / mgmt / secret） ========
-
-/** 一条安全审计事件（`audit.query()` 的元素）。零凭据：只有 alias/动作/前缀 id。 */
-interface AuditEntry {
-  /** 事件时刻（Unix 毫秒）。 */
-  tsMs: number;
-  /** 事件族：`DB_CLIENT_AUDIT` / `DB_CLIENT_DENY` / `DB_ACCESS_AUDIT` / `DB_SESSION_*`。 */
-  kind: string;
-  /** 操作者（`user.id`；无身份 null）。 */
-  user: string | null;
-  tenant: string | null;
-  module: string | null;
-  /** 请求来源：`http` / `task`。 */
-  source: string;
-  /** 库别名。 */
-  alias: string;
-  /** 动作与原因（如 `action=register dialect=mysql`、`id=tx_ab12_… reason=idle_timeout`）。 */
-  detail: string;
-}
-
-/**
- * 安全审计检索（`audit:` 段）。统一出口：`DB_CLIENT_*` / `DB_ACCESS_AUDIT` /
- * `DB_SESSION_*` 全部落此。进程内有界环形缓冲（缺省 2000 条 / 24h，双限自动清理），
- * **不跨重启**；读门 = `audit.allow`（每调用重判）。`query` 即导出通道。
- * filter 各维可选：kind / user / tenant / alias / sinceMs / untilMs / limit（缺省 100，硬顶 1000）。
- * 返回最新在前。
- */
-declare const audit: {
-  query(filter?: {
-    kind?: string;
-    user?: string;
-    tenant?: string;
-    alias?: string;
-    sinceMs?: number;
-    untilMs?: number;
-    limit?: number;
-  }): Promise<AuditEntry[]>;
-};
-
-/** 一个已登记管理面 connector（`mgmt.list()` 的元素，U-15）。 */
-interface MgmtEntry {
-  /** connector 名（= 收编的泛型轴名）。 */
-  connector: string;
-  /** 脱敏连接串（`user:pass@` → `***`）。 */
-  dsn: string;
-  /** 登记操作者（`user.id`；无身份 null）。 */
-  registeredBy: string | null;
-  /** 登记时刻（Unix 毫秒）。 */
-  registeredAtMs: number;
-  /** 插件 `__ops__` 自报的 op 清单（readOnly 位以插件文档为准——宿主不可验证，仅用于预判分档门）。 */
-  ops: Array<{ name: string; readOnly: boolean }>;
-}
-
-/**
- * 管理面 connector（`mgmt:` 段；enabled 缺省 false）。特权面：connector 占用的
- * 泛型轴**不进** `axis()` 公开面；register/delete/非只读 call 走 `mgmt.allow`，只读 call
- * 与 list 走 `mgmt.allow_read`（缺省复用 allow）；每动作落 `MGMT_AUDIT`/`MGMT_DENY` 审计
- * （全字段零凭据）。未声明 op → 结构化 `OJ_DB_UNSUPPORTED`（`e.data.capability` = op 名）。
- */
-declare const mgmt: {
-  /** 登记（探 `__ops__` + `__connect__` + ping，失败即拒）。 */
-  register(name: string, dsn: string): Promise<MgmtEntry>;
-  /** 删除（尽力 `__disconnect__` 后摘表；幂等）。 */
-  delete(name: string): Promise<boolean>;
-  /** 清单（读档）。 */
-  list(): Promise<MgmtEntry[]>;
-  /** 探活（未启用/未登记 = false）。 */
-  has(name: string): boolean;
-  /** 管理调用（args 必须是 JSON object；`__handle` 由宿主注入）。 */
-  call(name: string, op: string, args?: Record<string, unknown>): Promise<unknown>;
-};
-
-/**
- * 运行期凭据轴。与 config `ENC[...]` 同一套 X25519 + AES-256-GCM 信封：
- * `seal` 用部署公钥（`secrets.public_key_path`，缺省由私钥推导）加密；`open` 需部署私钥，
- * 每次落 `SECRET_OPEN` 审计（零凭据）。装配无密钥 → 两者都抛
- * `secret axis not configured`（fail-closed）；只有公钥（seal-only）→ `open` 抛
- * `no private key`。私钥永不出 Rust 边界。同一明文两次 seal 密文不同（临时密钥随机化）。
- */
-declare const secret: {
-  /** 加密为 `ENC[...]` 密文（可存自有表/回传前端；解密只能靠部署私钥）。 */
-  seal(plaintext: string): string;
-  /** 解开 `secret.seal`（或 `oj secret seal`）产出的 `ENC[...]`。 */
-  open(token: string): string;
-};
-
-export {};
+export {}
