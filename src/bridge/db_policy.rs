@@ -2145,6 +2145,108 @@ mod behavior {
         assert_eq!(data["n"], json!(3), "raw 路径须截断到 max_rows：{data}");
     }
 
+    /// REQ-05 Q4：max_result_bytes fail 档（缺省）——触顶回结构化 OJ_DB_CAPACITY。
+    /// Given 两行各 ~15 JSON 字节、上限 20，When db.query，Then 抛错点名 max_result_bytes。
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_query_fails_at_max_result_bytes() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let js = r#"(async () => {
+            try {
+              const r = await db.query("select id from t");
+              json.ok({n: r.length});
+            } catch (e) { json.ok({code: e.code, msg: String(e.message || e)}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+        assert!(
+            data["msg"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_result_bytes"),
+            "{data}"
+        );
+    }
+
+    /// REQ-05 Q4：truncate 档——交付已取行 + X-OJ-Result-Truncated 显式信令（验收原文）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_query_truncates_at_max_result_bytes_with_header() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                on_exceed: Some(OnExceed::Truncate),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let js = r#"(async () => {
+            const r = await db.query("select id from t");
+            json.ok({n: r.length});
+          })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, RequestInfo::default()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], json!(1), "{v}");
+        // 显式信令：响应头（对齐 X-OJ-Row-Limit 先例）
+        assert!(
+            cap.headers
+                .iter()
+                .any(|(k, _)| k == "X-OJ-Result-Truncated"),
+            "truncate 必须打 X-OJ-Result-Truncated 头：{:?}",
+            cap.headers
+        );
+    }
+
+    /// 回落后端（未覆盖 metered 的 accessor）口径钉死：行已物化，fail 仍拒、
+    /// truncate 交付全量 + 信令照打（成文限制，ABI 13 车对齐 sqlite 真早停）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn metered_fallback_on_uncapped_accessor() {
+        let db = Arc::new(crate::bridge::InMemoryAccessor::new());
+        db.seed([json!({"id": "aaaaaaaaaa"}), json!({"id": "bbbbbbbbbb"})]);
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let js = r#"(async () => {
+            try {
+              const r = await db.query("select id from t");
+              json.ok({n: r.length});
+            } catch (e) { json.ok({code: e.code}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+    }
+
     /// `stream` 达 `max_rows` → 提前 done（不是截断：真省后端拉取）。
     #[tokio::test(flavor = "current_thread")]
     async fn stream_stops_early_at_max_rows() {

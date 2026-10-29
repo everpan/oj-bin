@@ -155,6 +155,27 @@ pub trait DataAccessor: Send + Sync {
     }
     /// 参数化查询（值经绑定，杜绝拼接注入）。
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Row>>;
+
+    /// 带字节计量器的查询（REQ-05 `max_result_bytes`）。
+    ///
+    /// 默认实现 = 全量拉取后逐行计量（插件轴/内存件兼容口径——行已物化，无 OOM
+    /// 防线，可观测照计；truncate 档交付全量行 + 信令照打，成文限制）。**SqlxAccessor
+    /// 覆盖为边拉边计、触顶早停**——把结果集推过上限的那一行计入 `meter.counted`
+    /// 但不交付，调用侧按 `meter.exceeded × on_exceed` 分档（fail → 结构化
+    /// `OJ_DB_CAPACITY`；truncate → 已取行 + `X-OJ-Result-Truncated` 信令）。
+    async fn query_with_params_metered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        meter: &mut super::db_quota::ByteMeter,
+    ) -> BridgeResult<Vec<Row>> {
+        let rows = self.query_with_params(sql, params).await?;
+        // 回落口径：全量计入（counted = 真实结果集大小），exceeded 首行越限即置位。
+        for r in &rows {
+            meter.feed(r);
+        }
+        Ok(rows)
+    }
     /// 参数化执行，返回受影响行数。
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
 
@@ -648,11 +669,13 @@ pub(crate) async fn query_impl(
     };
     let norm = normalize_and_trace(&state, placeholder, in_tx, &name, &sql, &params)?;
     let start = std::time::Instant::now();
-    let res: BridgeResult<Vec<Row>> = match target {
+    // REQ-05：行级字节计量器（仅 Pool 臂被 feed；tx 路径不适用——REQ 只列三路径）。
+    let mut meter = super::db_quota::ByteMeter::new(quota.max_result_bytes, quota.on_exceed);
+    let mut res: BridgeResult<Vec<Row>> = match target {
         Target::Pool(da) => {
             let cancelled = da.server_cancel_on_abandon();
             super::db_quota::race_statement(
-                da.query_with_params(&norm, &params),
+                da.query_with_params_metered(&norm, &params, &mut meter),
                 &alias,
                 timeout_ms,
                 cancelled,
@@ -679,6 +702,41 @@ pub(crate) async fn query_impl(
             }
         }
     };
+    // REQ-05：字节触顶分档——fail → 结构化 OJ_DB_CAPACITY（trace 记失败画像后抛）；
+    // truncate → 交付已取行 + X-OJ-Result-Truncated 显式信令（对齐 X-OJ-Row-Limit 先例）。
+    if meter.exceeded {
+        match quota.on_exceed {
+            super::db_policy::OnExceed::Fail => {
+                let e = super::db_quota::result_too_large_error(
+                    &alias,
+                    quota.max_result_bytes.unwrap_or(0),
+                    meter.counted,
+                );
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                trace_sql(
+                    &state,
+                    &sql,
+                    &params,
+                    &name,
+                    in_tx,
+                    ms,
+                    None,
+                    false,
+                    Some(e.message.clone()),
+                    Some(e.category.as_str().to_string()),
+                    Some(e.retryable),
+                );
+                return Err(JsErrorBox::from(e));
+            }
+            super::db_policy::OnExceed::Truncate => {
+                state
+                    .borrow_mut()
+                    .borrow_mut::<super::ReqState>()
+                    .headers
+                    .push(("X-OJ-Result-Truncated".into(), meter.counted.to_string()));
+            }
+        }
+    }
     let (cat, retry) = err_meta(&res);
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     trace_sql(

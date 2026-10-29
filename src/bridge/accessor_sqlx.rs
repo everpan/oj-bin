@@ -322,6 +322,36 @@ impl DataAccessor for SqlxAccessor {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// REQ-05：边拉边计、触顶早停（真 OOM 防线；区别于默认实现的「拉完再计」）。
+    /// 把结果推过上限的那一行计入 `meter.counted` 但不入结果集（fail/truncate 两档
+    /// 都不交付该行）；fetch 流被 drop 后 sqlx 回收连接时关闭而非复用（协议态不可知）。
+    async fn query_with_params_metered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        meter: &mut super::db_quota::ByteMeter,
+    ) -> BridgeResult<Vec<JsRow>> {
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for p in params {
+            q = bind_value(q, p);
+        }
+        let mut stream = q.fetch(&self.pool);
+        let mut out = Vec::new();
+        use futures::StreamExt;
+        while let Some(r) = stream.next().await {
+            let v = row_to_json(&r.map_err(|e| sqlite_err(&e, "query"))?)?;
+            if meter.feed(&v) == super::db_quota::Feed::Stop {
+                break;
+            }
+            out.push(v);
+        }
+        Ok(out)
+    }
+
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
         oj_plugin_ffi::jsint::reject_u64_markers(
             params,
