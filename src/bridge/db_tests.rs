@@ -2435,3 +2435,44 @@ async fn client_queries_counter_increments() {
         "lookup 命中计数应累加: {v}"
     );
 }
+
+/// G3 契约裁决实验（v0.1.108，PG16 / MySQL 8.4 真机实测结论）：
+/// ① 带参 EXPLAIN 两方言均可用（PG 用 `$n` 原生占位；op 通路由 normalize_and_trace 做 ? → $n）
+///    ——预写「params×mysql 结构化回落」**不启用**。
+/// ② PG `EXPLAIN (FORMAT JSON)` 输出 json 类型列，sqlx Any 驱动不解（实测报
+///    `Any driver does not support the Postgres type PgTypeInfo(Json)`），有无参数都同样炸；
+///    故 PG 归一输入定为**文本计划**（默认格式），MySQL 维持 FORMAT=JSON（Any 可解）。
+/// 占位符按方言原生形态（accessor 不改写；op 通路才改写）。
+/// 未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（诚实登记；CI 无服务容器恒 skip）。
+#[tokio::test(flavor = "current_thread")]
+async fn explain_accepts_bind_params_real_pg_mysql() {
+    let mut ran = false;
+    for (env, tag, sql) in [
+        (
+            "OJ_TEST_PG",
+            "pg",
+            "EXPLAIN SELECT 1 AS v WHERE 1 = $1",
+        ),
+        (
+            "OJ_TEST_MYSQL",
+            "mysql",
+            "EXPLAIN FORMAT=JSON SELECT 1 AS v WHERE 1 = ?",
+        ),
+    ] {
+        let Ok(url) = std::env::var(env) else { continue };
+        if url.is_empty() {
+            continue;
+        }
+        ran = true;
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        let r = db.query_with_params(sql, &[json!(1)]).await;
+        assert!(
+            r.is_ok(),
+            "{tag}: 带参 EXPLAIN 必须可用（实测契约）: {:?}",
+            r.err()
+        );
+    }
+    if !ran {
+        eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL unset");
+    }
+}
