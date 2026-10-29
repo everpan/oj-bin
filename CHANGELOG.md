@@ -30,9 +30,10 @@
   `json.stream/sse` 的 `fileName`/`disposition` 选项进 global.d.ts（能力运行时早已存在，
   类型漏声明致 TS2339）。**附带修复**：`audit`/`mgmt`/`secret` 曾声明在 `export {}` 模块
   作用域内——业务模块引用 TS2304（audit 自 v0.1.98 带病）；已移入 `declare global`。
-- **db.client/access 返回真 Promise（REQ-06）**：`list/register/reRegister/delete/test` 与
-  `access.grant/revoke` 运行期曾回裸值（`.catch is not a function`）；统一经 dbSessionCall
-  包装为真 Promise（instanceof Promise、.catch/.finally 可链），`has` 保持同步布尔。
+- **db.client/access 返回真 Promise（REQ-06）**：`list` 运行期曾回裸数组（`.catch is not a
+  function`）；`list/register/reRegister/delete/test` 与 `access.grant/revoke` 统一经
+  dbSessionCall 包装为真 Promise（instanceof Promise、.catch/.finally 可链；其中六个此前
+  已是真 Promise，此改统一形态），`has` 保持同步布尔。
 - **防漂移门禁双腿**：① `sample/tests/globals.test.ts` 运行时 golden（无条件全局清单，
   业务模块形态裸引用——作用域事故第一现场即红）；② `sample/tests/type-usage.ts` tsc 用法
   测试（按文档写法逐一调用，声明缺失/漂移即红）。

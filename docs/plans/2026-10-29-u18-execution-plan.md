@@ -57,6 +57,14 @@
 
 ## 4. 诚实登记（避免遗忘）
 
+- **R-1.3 慢语句用例（评审 Important，显式 Ruling）**：设计 §1.3 的 env-gated 真慢语句用例
+  （pg `pg_sleep` / mysql `SLEEP`，钉「跑完才 408」语义）本批未交付——本地无 pg/mysql 实例，
+  无法完成 TDD 的「亲眼看它失败再通过」；**显式并入批次 2（REQ-05）的三方言矩阵**（该批的
+  核心交付物即超时×方言×路径矩阵，天然覆盖）。语义本身已如实成文（api-manual/CHANGELOG）。
+- **评审 Minor 处置**：已修=golden 头注释与清单对齐（Kafka/RabbitMQ/tasks 实为无条件挂载）+
+  CHANGELOG REQ-06 措辞收窄（仅 `list` 回裸值，其余六个本就是 async op）；缓议=`patterns()`
+  文档错位（注释位置）、被保留路径遮蔽的同名业务路由键（极端窄径，可后续剔除）。
+
 - REQ-01 交付 ≠ 慢查询护栏：DB 阻塞语句跑完才 408（§1.1 已成文），真护栏 = 批次 2。
 - 批次 2 的插件轴 select! 竞速（FfiFuture Send 界）与弃连的池内暴露面未核查——动工时先做这两项
   spike，若必须动 vtable 则 ABI 13 单独成车。
