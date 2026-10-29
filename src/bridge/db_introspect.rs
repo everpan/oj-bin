@@ -139,8 +139,86 @@ async fn pg_ddl_dispatch(
                 .to_string();
             run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
         }
-        // 表 / 分区表 → 拼接器（Task 3 填充；此前诚实返回空信封，绝不产假 DDL）。
-        super::introspect::PgDdlRoute::Table => Ok(empty()),
+        // 表 / 分区表 → 拼接器（4+1 查询 + 渲染，整体 deadline + 容量防线）。
+        super::introspect::PgDdlRoute::Table => {
+            let items = pg_stitch(&state, &target, &name, t, scope.clone()).await?;
+            Ok(serde_json::json!({
+                "kind": kind.capability(), "dialect": dialect.as_str(), "items": items
+            }))
+        }
+    }
+}
+
+/// PG DDL 拼接器（U-14，v0.1.109）：列 / 约束 / 索引 / 列注释 / 表注释 5 查询顺序执行，
+/// 整体包一个 deadline（REQ-05 对 catalog 通路零接线，绝不允许慢查询拖死池槽位）；
+/// 任一路行数达 [`MAX_ROWS`] → `OJ_DB_CAPACITY`（绝不静默截断产出不完整 DDL）。
+/// 渲染 = [`introspect::pg_create_table`] 纯函数。
+pub(crate) async fn pg_stitch(
+    state: &Rc<RefCell<OpState>>,
+    target: &Target,
+    name: &str,
+    table: &str,
+    scope: Option<String>,
+) -> Result<Vec<Value>, JsErrorBox> {
+    use super::introspect as insp;
+    /// 5 查询共享的整体预算（与默认语句超时时同量级）。
+    const STITCH_BUDGET_MS: u64 = 30_000;
+    let table = table.to_string();
+    let state_c = state.clone();
+    let target_c = target;
+    let name_c = name.to_string();
+    let scope_c = scope.clone();
+    let work = async move {
+        let q = |sql: &'static str| {
+            let st = &state_c;
+            let tg = &target_c;
+            let nm = &name_c;
+            let tb = &table;
+            let sc = &scope_c;
+            async move {
+                let rows = catalog_query_rows(
+                    st,
+                    tg,
+                    nm,
+                    sql,
+                    vec![Value::String(tb.clone())],
+                    sc.clone(),
+                )
+                .await?;
+                if rows.len() >= insp::MAX_ROWS {
+                    return Err(to_js_err(Box::new(crate::bridge::db_error::capacity(
+                        "pg ddl stitch",
+                        insp::MAX_ROWS,
+                    ))));
+                }
+                Ok(rows)
+            }
+        };
+        let cols = insp::pg_stitch_columns(q(insp::PG_STITCH_COLUMNS).await?);
+        let cons = insp::pg_stitch_constraints(q(insp::PG_STITCH_CONSTRAINTS).await?);
+        let idxs = insp::pg_stitch_indexes(q(insp::PG_STITCH_INDEXES).await?);
+        let comments = insp::pg_stitch_column_comments(q(insp::PG_STITCH_COLUMN_COMMENTS).await?);
+        let table_comment = q(insp::PG_STITCH_TABLE_COMMENT)
+            .await?
+            .first()
+            .and_then(|r| r.get("comment"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ddl = insp::pg_create_table(
+            &table,
+            &cols,
+            &cons,
+            &idxs,
+            &comments,
+            table_comment.as_deref(),
+        );
+        Ok(vec![serde_json::json!({"name": table, "ddl": ddl})])
+    };
+    match tokio::time::timeout(std::time::Duration::from_millis(STITCH_BUDGET_MS), work).await {
+        Ok(r) => r,
+        Err(_) => Err(JsErrorBox::generic(format!(
+            "pg ddl stitch: exceeded overall budget of {STITCH_BUDGET_MS}ms"
+        ))),
     }
 }
 

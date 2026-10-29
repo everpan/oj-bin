@@ -261,6 +261,19 @@ pub fn unsupported(dialect: &str, capability: &str) -> BridgeError {
     }
 }
 
+/// 容量防线（U-14 拼接器）：行数触顶 → `OJ_DB_CAPACITY`，**禁止静默截断**产出不完整 DDL。
+pub fn capacity(what: &str, limit: usize) -> BridgeError {
+    let mut data = Map::new();
+    data.insert("limit".to_string(), Value::from(limit));
+    BridgeError {
+        category: DbErrorCategory::Capacity,
+        retryable: false,
+        session_disposition: SessionDisposition::Keep,
+        message: format!("{what} exceeded row capacity ({limit}); refusing to emit incomplete DDL"),
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

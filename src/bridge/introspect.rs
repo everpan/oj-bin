@@ -115,6 +115,7 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
              (c.is_nullable = 'YES') AS not_null, \
              c.column_default::text AS \"default\", \
              (kcu.column_name IS NOT NULL) AS is_pk, \
+             a.attidentity::text AS identity, \
              c.ordinal_position AS pos \
              FROM information_schema.columns c \
              JOIN pg_class cl ON cl.relname = c.table_name \
@@ -262,6 +263,253 @@ pub fn pg_ddl_route(relkind: Option<&str>) -> PgDdlRoute {
         Some("r") | Some("p") => PgDdlRoute::Table,
         _ => PgDdlRoute::Empty,
     }
+}
+
+// ---------------------------------------------------------------------------
+// U-14（v0.1.109）PG 拼接器：relkind 判定为表后的 4+1 条查询 + 纯渲染器。
+// 守卫（introspect.rs 铁律）：current_schema() 恰一次、`::text` 覆盖 name 域投影、
+// `?` 恰 1、等值匹配无 LIKE。容量防线在调用方（行数触 MAX_ROWS → OJ_DB_CAPACITY）。
+// ---------------------------------------------------------------------------
+
+/// 列：attnum > 0 AND NOT attisdropped（dropped 列是占位行）；identity / generated /
+/// serial 序列名经 pg_depend（'a' auto 依赖）——**绝不解析 nextval 文本**。
+pub const PG_STITCH_COLUMNS: &str = "SELECT a.attname::text AS name, format_type(a.atttypid, a.atttypmod) AS native_type, \
+     a.attnotnull AS not_null, pg_get_expr(def.adbin, def.adrelid)::text AS \"default\", \
+     (EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conrelid = a.attrelid \
+          AND con.contype = 'p' AND a.attnum = ANY(con.conkey))) AS is_pk, \
+     a.attidentity::text AS identity, a.attgenerated::text AS generated, \
+     s.relname::text AS seq_name, a.attnum AS pos \
+     FROM pg_attribute a \
+     JOIN pg_class cl ON cl.oid = a.attrelid \
+     JOIN pg_namespace n ON n.oid = cl.relnamespace \
+     LEFT JOIN pg_attrdef def ON def.adrelid = a.attrelid AND def.adnum = a.attnum \
+     LEFT JOIN pg_depend d ON d.refclassid = 'pg_class'::regclass \
+          AND d.refobjid = cl.oid AND d.refobjsubid = a.attnum \
+          AND d.classid = 'pg_class'::regclass AND d.deptype = 'a' \
+     LEFT JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+     WHERE n.nspname = current_schema() AND cl.relname = ? \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY a.attnum";
+
+/// 约束：contype p/u/c/f/x + pg_get_constraintdef（**含排他 'x' 与 FK 'f'**——重放丢约束
+/// 违反不静默口径）。PG18 把 NOT NULL 收编为 contype='n'，届时两路径口径差一行。
+pub const PG_STITCH_CONSTRAINTS: &str = "SELECT con.conname::text AS name, \
+     CASE con.contype WHEN 'p' THEN 'pk' WHEN 'u' THEN 'uq' WHEN 'c' THEN 'ck' \
+          WHEN 'f' THEN 'fk' ELSE 'x' END AS type, \
+     pg_get_constraintdef(con.oid)::text AS definition \
+     FROM pg_constraint con \
+     JOIN pg_class t ON t.oid = con.conrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     WHERE n.nspname = current_schema() AND t.relname = ? \
+           AND con.contype IN ('p','u','c','f','x') \
+     ORDER BY con.conname";
+
+/// 索引定义：**必须排除约束支撑索引**（否则与 ADD CONSTRAINT 重复产出，重放名冲突必炸）。
+/// 粗过滤 `NOT indisprimary AND NOT indisunique` 会误杀非约束 CREATE UNIQUE INDEX，禁止。
+pub const PG_STITCH_INDEXES: &str = "SELECT c.relname::text AS name, pg_get_indexdef(i.indexrelid)::text AS definition \
+     FROM pg_class t \
+     JOIN pg_index i ON i.indrelid = t.oid \
+     JOIN pg_class c ON c.oid = i.indexrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     WHERE n.nspname = current_schema() AND t.relname = ? \
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint con WHERE con.conindid = i.indexrelid) \
+     ORDER BY c.relname";
+
+/// 列注释（col_description；只出有注释的列）。
+pub const PG_STITCH_COLUMN_COMMENTS: &str = "SELECT a.attname::text AS name, col_description(a.attrelid, a.attnum)::text AS comment \
+     FROM pg_attribute a \
+     JOIN pg_class cl ON cl.oid = a.attrelid \
+     JOIN pg_namespace n ON n.oid = cl.relnamespace \
+     WHERE n.nspname = current_schema() AND cl.relname = ? \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+           AND col_description(a.attrelid, a.attnum) IS NOT NULL \
+     ORDER BY a.attnum";
+
+/// 表注释：**双参数形态** obj_description(oid, 'pg_class')（单参数已废弃）。
+pub const PG_STITCH_TABLE_COMMENT: &str = "SELECT obj_description(c.oid, 'pg_class')::text AS comment \
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = current_schema() AND c.relname = ?";
+
+/// 拼接器列行 → 归一形态（与 listColumns 同词汇 + identity/seqName/generated）。
+/// dropped 占位行纵深跳过（SQL 已过滤，归一再挡一道）。generated 列的表达式在
+/// `default` 列（pg_get_expr），归一为 generatedExpr 且**不落 default**。
+pub fn pg_stitch_columns(rows: Vec<Value>) -> Vec<Value> {
+    rows.iter()
+        .filter(|r| !str_of(r, "name").starts_with("........pg.dropped."))
+        .map(|r| {
+            let generated = str_of(r, "generated");
+            let default = opt_str(r.get("default"));
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), json!(str_of(r, "name")));
+            o.insert("nativeType".into(), json!(str_of(r, "native_type")));
+            o.insert("nullable".into(), json!(!truthy(r.get("not_null"))));
+            o.insert("primaryKey".into(), json!(truthy(r.get("is_pk"))));
+            o.insert("pos".into(), json!(num_of(r, "pos")));
+            if generated == "s" {
+                o.insert("generated".into(), json!("stored"));
+                if let Some(e) = default {
+                    o.insert("generatedExpr".into(), json!(e));
+                }
+            } else if let Some(d) = default {
+                o.insert("default".into(), json!(d));
+            }
+            match str_of(r, "identity").as_str() {
+                "a" => {
+                    o.insert("identity".into(), json!("always"));
+                }
+                "d" => {
+                    o.insert("identity".into(), json!("byDefault"));
+                }
+                _ => {}
+            }
+            if let Some(s) = opt_str(r.get("seq_name")) {
+                o.insert("seqName".into(), json!(s));
+            }
+            Value::Object(o)
+        })
+        .collect()
+}
+
+/// 约束行 → [{name, type, definition}]。
+pub fn pg_stitch_constraints(rows: Vec<Value>) -> Vec<Value> {
+    rows.iter()
+        .map(|r| {
+            json!({
+                "name": str_of(r, "name"),
+                "type": str_of(r, "type"),
+                "definition": opt_str(r.get("definition")),
+            })
+        })
+        .collect()
+}
+
+/// 索引行 → [{name, definition}]。
+pub fn pg_stitch_indexes(rows: Vec<Value>) -> Vec<Value> {
+    rows.iter()
+        .map(|r| {
+            json!({
+                "name": str_of(r, "name"),
+                "definition": opt_str(r.get("definition")),
+            })
+        })
+        .collect()
+}
+
+/// 列注释行 → [{column, comment}]。
+pub fn pg_stitch_column_comments(rows: Vec<Value>) -> Vec<Value> {
+    rows.iter()
+        .filter_map(|r| {
+            opt_str(r.get("comment")).map(|c| json!({"column": str_of(r, "name"), "comment": c}))
+        })
+        .collect()
+}
+
+/// PG 标识符引用（双引号 + 翻倍）——拼接器输出只服务 PG，不走路由。
+pub fn pg_quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// 字面量引用（单引号 + 翻倍）。
+fn pg_quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 渲染器（纯函数）：serial 前置 `CREATE SEQUENCE IF NOT EXISTS`，表后补
+/// `ALTER SEQUENCE ... OWNED BY`（DROP TABLE 后序列不成孤儿）；identity 列渲染
+/// GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY（自管序列，不产序列语句）；
+/// generated 列渲染 GENERATED ALWAYS AS (expr) STORED。语句以 ";\n" 连接。
+pub fn pg_create_table(
+    name: &str,
+    cols: &[Value],
+    cons: &[Value],
+    idxs: &[Value],
+    comments: &[Value],
+    table_comment: Option<&str>,
+) -> String {
+    let t = pg_quote_ident(name);
+    let mut stmts: Vec<String> = Vec::new();
+    // serial 序列前置（identity 列自管序列，不在此列）。
+    for c in cols {
+        if c.get("identity").is_none() && c.get("seqName").is_some() {
+            stmts.push(format!(
+                "CREATE SEQUENCE IF NOT EXISTS {}",
+                pg_quote_ident(&str_of(c, "seqName"))
+            ));
+        }
+    }
+    // CREATE TABLE 列定义。
+    let col_sql: Vec<String> = cols
+        .iter()
+        .map(|c| {
+            let mut s = format!(
+                "{} {}",
+                pg_quote_ident(&str_of(c, "name")),
+                str_of(c, "nativeType")
+            );
+            if let Some(id) = c.get("identity").and_then(|v| v.as_str()) {
+                s.push_str(match id {
+                    "always" => " GENERATED ALWAYS AS IDENTITY",
+                    _ => " GENERATED BY DEFAULT AS IDENTITY",
+                });
+            } else if let Some(expr) = c.get("generatedExpr").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" GENERATED ALWAYS AS ({expr}) STORED"));
+            }
+            if c.get("nullable") == Some(&json!(false)) {
+                s.push_str(" NOT NULL");
+            }
+            if c.get("identity").is_none()
+                && c.get("generatedExpr").is_none()
+                && let Some(d) = c.get("default").and_then(|v| v.as_str())
+            {
+                s.push_str(&format!(" DEFAULT {d}"));
+            }
+            s
+        })
+        .collect();
+    stmts.push(format!(
+        "CREATE TABLE {t} (\n  {}\n)",
+        col_sql.join(",\n  ")
+    ));
+    // 约束 / 索引 / 注释。
+    for con in cons {
+        stmts.push(format!(
+            "ALTER TABLE {t} ADD CONSTRAINT {} {}",
+            pg_quote_ident(&str_of(con, "name")),
+            str_of(con, "definition")
+        ));
+    }
+    for idx in idxs {
+        if let Some(def) = idx.get("definition").and_then(|v| v.as_str()) {
+            stmts.push(def.to_string());
+        }
+    }
+    for cm in comments {
+        if let Some(txt) = cm.get("comment").and_then(|v| v.as_str()) {
+            stmts.push(format!(
+                "COMMENT ON COLUMN {}.{} IS {}",
+                t,
+                pg_quote_ident(&str_of(cm, "column")),
+                pg_quote_literal(txt)
+            ));
+        }
+    }
+    if let Some(txt) = table_comment {
+        stmts.push(format!("COMMENT ON TABLE {t} IS {}", pg_quote_literal(txt)));
+    }
+    // serial 序列归属后置。
+    for c in cols {
+        if c.get("identity").is_none()
+            && let Some(seq) = c.get("seqName").and_then(|v| v.as_str())
+        {
+            stmts.push(format!(
+                "ALTER SEQUENCE {} OWNED BY {}.{}",
+                pg_quote_ident(seq),
+                t,
+                pg_quote_ident(&str_of(c, "name"))
+            ));
+        }
+    }
+    stmts.join(";\n") + ";"
 }
 
 /// catalog 类的方言 SQL（`None` = kind × 方言 unsupported——**报错不静默**，能力矩阵见
@@ -546,17 +794,33 @@ pub fn scoped_sql(base: &str, d: Dialect) -> Option<String> {
 }
 
 /// 结果 → JS 契约形态（三方言同构），并截断到 [`MAX_ROWS`]。
+/// identity 为**加性**输出（v0.1.109）：仅 PG 投影了 `identity` 列；
+/// 'a'→always、'd'→byDefault，其余/无投影不落键（mysql/sqlite 零行为变化）。
 pub fn columns(rows: Vec<Value>) -> Vec<Value> {
     rows.iter()
         .take(MAX_ROWS)
         .map(|r| {
-            json!({
-                "name": str_of(r, "name"),
-                "nativeType": str_of(r, "native_type"),
-                "nullable": !truthy(r.get("not_null")),
-                "default": opt_str(r.get("default")),
-                "primaryKey": truthy(r.get("is_pk")),
-            })
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), json!(str_of(r, "name")));
+            o.insert("nativeType".into(), json!(str_of(r, "native_type")));
+            o.insert("nullable".into(), json!(!truthy(r.get("not_null"))));
+            o.insert(
+                "default".into(),
+                opt_str(r.get("default"))
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+            o.insert("primaryKey".into(), json!(truthy(r.get("is_pk"))));
+            match r.get("identity").and_then(|v| v.as_str()) {
+                Some("a") => {
+                    o.insert("identity".into(), json!("always"));
+                }
+                Some("d") => {
+                    o.insert("identity".into(), json!("byDefault"));
+                }
+                _ => {}
+            }
+            Value::Object(o)
         })
         .collect()
 }
@@ -918,6 +1182,199 @@ mod tests {
         for bad in ["t; DROP TABLE x", "t`", "", "粗", "t a"] {
             assert!(mysql_show_create(bad).is_err(), "{bad:?}");
         }
+    }
+
+    // ---- U-14（v0.1.109）PG 拼接器：常量守卫 + 行归一 + 渲染器 ----
+
+    const STITCH_CONSTS: [&str; 5] = [
+        PG_STITCH_COLUMNS,
+        PG_STITCH_CONSTRAINTS,
+        PG_STITCH_INDEXES,
+        PG_STITCH_COLUMN_COMMENTS,
+        PG_STITCH_TABLE_COMMENT,
+    ];
+
+    /// 拼接器常量守卫（PG 铁律 2/3 + 参数位 + 等值匹配）。
+    #[test]
+    fn pg_stitch_constants_guard() {
+        for s in STITCH_CONSTS {
+            assert!(s.contains("current_schema()"), "schema 限定: {s}");
+            assert_eq!(
+                s.matches("current_schema()").count(),
+                1,
+                "范围谓词恰一次: {s}"
+            );
+            assert_eq!(s.matches('?').count(), 1, "参数位恰 1: {s}");
+            assert!(!s.contains("LIKE"), "等值匹配，非 LIKE: {s}");
+        }
+        // name 域投影必须 ::text（attname/relname/conname）。
+        assert!(PG_STITCH_COLUMNS.contains("attname::text"));
+        assert!(PG_STITCH_COLUMNS.contains("relname::text AS seq_name"));
+        assert!(PG_STITCH_CONSTRAINTS.contains("conname::text"));
+        assert!(PG_STITCH_INDEXES.contains("relname::text"));
+        // dropped 列过滤是硬要求（占位行进 DDL = 语法错误产物）。
+        assert!(PG_STITCH_COLUMNS.contains("NOT a.attisdropped"));
+        assert!(PG_STITCH_COLUMNS.contains("a.attnum > 0"));
+        // 约束支撑索引必须排除（否则与 ADD CONSTRAINT 重复产出，重放名冲突必炸）；
+        // 粗过滤 indisprimary AND NOT indisunique 会误杀非约束 CREATE UNIQUE INDEX，禁止。
+        assert!(PG_STITCH_INDEXES.contains("NOT EXISTS (SELECT 1 FROM pg_constraint"));
+        assert!(!PG_STITCH_INDEXES.contains("indisprimary"));
+        // serial 走 pg_depend 'a' auto 依赖取序列名，绝不解析 nextval 文本。
+        assert!(PG_STITCH_COLUMNS.contains("deptype = 'a'"));
+        assert!(!PG_STITCH_COLUMNS.contains("nextval"));
+        // 表注释必须双参数形态 obj_description(oid, 'pg_class')（单参数已废弃）。
+        assert!(PG_STITCH_TABLE_COMMENT.contains("obj_description(c.oid, 'pg_class')"));
+    }
+
+    /// 行归一：identity 映射（a→always/d→byDefault）、seqName、generated、
+    /// dropped 占位行纵深跳过（SQL 已过滤，归一再挡一道）。
+    #[test]
+    fn pg_stitch_columns_normalizes() {
+        let out = pg_stitch_columns(vec![
+            json!({"name": "id", "native_type": "integer", "not_null": true,
+                   "default": "nextval('t_id_seq'::regclass)", "is_pk": true,
+                   "identity": "", "generated": "", "seq_name": "t_id_seq", "pos": 1}),
+            json!({"name": "code", "native_type": "character varying(64)", "not_null": true,
+                   "default": null, "is_pk": false,
+                   "identity": "a", "generated": "", "seq_name": null, "pos": 2}),
+            json!({"name": "........pg.dropped.3........", "native_type": "text",
+                   "not_null": false, "default": null, "is_pk": false,
+                   "identity": "", "generated": "", "seq_name": null, "pos": 3}),
+        ]);
+        assert_eq!(out.len(), 2, "dropped 占位行不得入列: {out:?}");
+        assert_eq!(out[0]["name"], json!("id"));
+        assert_eq!(out[0]["nullable"], json!(false));
+        assert_eq!(out[0]["primaryKey"], json!(true));
+        assert_eq!(out[0]["seqName"], json!("t_id_seq"));
+        assert!(!out[0].as_object().unwrap().contains_key("identity"));
+        assert_eq!(out[1]["identity"], json!("always"));
+        assert!(!out[1].as_object().unwrap().contains_key("seqName"));
+    }
+
+    /// 渲染器：serial（CREATE SEQUENCE 前置 + OWNED BY 后置）+ 约束 + 索引 + 双注释。
+    #[test]
+    fn pg_stitch_renders_serial_and_constraints() {
+        let ddl = pg_create_table(
+            "oj_ddl_t",
+            &[
+                json!({"name": "id", "nativeType": "integer", "nullable": false,
+                       "default": null, "primaryKey": true, "seqName": "oj_ddl_t_id_seq"}),
+                json!({"name": "email", "nativeType": "character varying(64)",
+                       "nullable": false, "default": null, "primaryKey": false}),
+            ],
+            &[json!({"name": "oj_ddl_t_pkey", "type": "pk",
+                     "definition": "PRIMARY KEY (id)"})],
+            &[json!({"name": "ix_email",
+                     "definition": "CREATE INDEX ix_email ON public.oj_ddl_t USING btree (email)"})],
+            &[json!({"column": "email", "comment": "登录邮箱"})],
+            Some("业务表"),
+        );
+        assert!(
+            ddl.contains("CREATE SEQUENCE IF NOT EXISTS \"oj_ddl_t_id_seq\""),
+            "{ddl}"
+        );
+        assert!(ddl.contains("CREATE TABLE \"oj_ddl_t\""), "{ddl}");
+        assert!(ddl.contains("\"id\" integer NOT NULL"), "{ddl}");
+        assert!(
+            ddl.contains("ADD CONSTRAINT \"oj_ddl_t_pkey\" PRIMARY KEY (id)"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("CREATE INDEX ix_email ON public.oj_ddl_t USING btree (email)"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("COMMENT ON COLUMN \"oj_ddl_t\".\"email\" IS '登录邮箱'"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("COMMENT ON TABLE \"oj_ddl_t\" IS '业务表'"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("ALTER SEQUENCE \"oj_ddl_t_id_seq\" OWNED BY \"oj_ddl_t\".\"id\""),
+            "{ddl}"
+        );
+        // 顺序：序列在 CREATE TABLE 前，OWNED BY 在最后。
+        let i_seq = ddl.find("CREATE SEQUENCE").unwrap();
+        let i_tbl = ddl.find("CREATE TABLE").unwrap();
+        let i_own = ddl.find("OWNED BY").unwrap();
+        assert!(i_seq < i_tbl && i_tbl < i_own, "顺序钉死: {ddl}");
+    }
+
+    /// generated 列渲染 GENERATED ALWAYS AS (expr) STORED 且无 DEFAULT；
+    /// identity 列渲染 GENERATED ALWAYS AS IDENTITY 且不产序列语句。
+    #[test]
+    fn pg_stitch_generated_and_identity_columns() {
+        let ddl = pg_create_table(
+            "t",
+            &[
+                json!({"name": "id", "nativeType": "integer", "nullable": false,
+                       "default": null, "primaryKey": true, "identity": "always"}),
+                json!({"name": "total", "nativeType": "integer", "nullable": false,
+                       "default": null, "primaryKey": false,
+                       "generated": "stored", "generatedExpr": "a + b"}),
+            ],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        assert!(
+            ddl.contains("\"id\" integer GENERATED ALWAYS AS IDENTITY"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("CREATE SEQUENCE"), "identity 自管序列: {ddl}");
+        assert!(ddl.contains("GENERATED ALWAYS AS (a + b) STORED"), "{ddl}");
+        assert!(!ddl.contains("DEFAULT"), "generated 列无 DEFAULT: {ddl}");
+    }
+
+    /// 容量防线：db_error::capacity 结构化（category=Capacity → OJ_DB_CAPACITY，
+    /// data.limit 带出限额），拼接器任一路行数触顶即此错误，绝不静默截断。
+    #[test]
+    fn pg_stitch_capacity_error_shape() {
+        let e = crate::bridge::db_error::capacity("pg ddl stitch", MAX_ROWS);
+        assert_eq!(
+            e.category,
+            crate::bridge::db_error::DbErrorCategory::Capacity
+        );
+        assert_eq!(
+            e.data.get("limit").and_then(|v| v.as_u64()),
+            Some(MAX_ROWS as u64)
+        );
+    }
+
+    /// listColumns identity 加性输出（spec：Structure 契约与已发布内视同词汇）：
+    /// PG 行 attidentity='a'→always、'd'→byDefault；mysql/sqlite 无投影列 → 不落键。
+    #[test]
+    fn list_columns_identity_is_additive() {
+        let out = columns(vec![
+            json!({"name": "id", "native_type": "integer", "not_null": true,
+                   "default": null, "is_pk": true, "identity": "a"}),
+            json!({"name": "v", "native_type": "integer", "not_null": false,
+                   "default": null, "is_pk": false, "identity": "d"}),
+            json!({"name": "n", "native_type": "text", "not_null": false,
+                   "default": null, "is_pk": false, "identity": ""}),
+            // mysql 形态（无 identity 投影列）。
+            json!({"name": "m", "native_type": "int", "not_null": false,
+                   "default": null, "is_pk": false}),
+        ]);
+        assert_eq!(out[0]["identity"], json!("always"));
+        assert_eq!(out[1]["identity"], json!("byDefault"));
+        assert!(
+            !out[2].as_object().unwrap().contains_key("identity"),
+            "{:?}",
+            out[2]
+        );
+        assert!(
+            !out[3].as_object().unwrap().contains_key("identity"),
+            "{:?}",
+            out[3]
+        );
+        // 其余字段不破契约。
+        assert_eq!(out[0]["name"], json!("id"));
+        assert_eq!(out[0]["nullable"], json!(false));
+        assert_eq!(out[0]["primaryKey"], json!(true));
     }
 
     /// U-14（v0.1.109）relkind 路由矩阵（spec 钉死）：v/m→View、r/p→Table、

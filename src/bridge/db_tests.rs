@@ -2672,3 +2672,130 @@ async fn catalog_ddl_pg_route_real() {
     assert_eq!(d["missing"]["items"], json!([]), "{d}");
     assert_eq!(d["seq"]["items"], json!([]), "{d}");
 }
+
+/// U-14（v0.1.109，env-gated 真库腿）：PG 拼接器 round-trip——含 serial 主键 / 非空 /
+/// 默认值 / CHECK 约束 / 唯一索引 / 列注释 / 表注释的表，db.catalog("ddl") 产出
+/// 可重放 DDL（序列前置 + ADD CONSTRAINT + CREATE INDEX + 双 COMMENT + OWNED BY），
+/// 改名后 db.exec 重建成功且 listColumns 结构对账一致。
+/// 仅 OJ_TEST_PG 有 DSN 才跑；未设则 skip。
+#[tokio::test(flavor = "current_thread")]
+async fn catalog_ddl_pg_stitch_roundtrip_real() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    for s in [
+        "drop table if exists oj_ddl_full_2",
+        "drop table if exists oj_ddl_full",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+    db.exec_with_params(
+        "create table oj_ddl_full (\
+            id serial primary key, \
+            email varchar(64) not null, \
+            val int default 0, \
+            constraint ck_val check (val >= 0))",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.exec_with_params("create unique index ux_email on oj_ddl_full (email)", &[])
+        .await
+        .unwrap();
+    db.exec_with_params("comment on column oj_ddl_full.email is 'login email'", &[])
+        .await
+        .unwrap();
+    db.exec_with_params("comment on table oj_ddl_full is 'full table'", &[])
+        .await
+        .unwrap();
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const r = await db.catalog("ddl", "oj_ddl_full");
+                 const ddl = r.items[0].ddl;
+                 json.ok({
+                   ddl,
+                   hasSeq: ddl.includes("CREATE SEQUENCE IF NOT EXISTS"),
+                   hasCons: ddl.includes("ADD CONSTRAINT"),
+                   hasIdx: ddl.includes("CREATE UNIQUE INDEX ux_email"),
+                   hasColCmt: ddl.includes("COMMENT ON COLUMN"),
+                   hasTblCmt: ddl.includes("COMMENT ON TABLE"),
+                   hasOwned: ddl.includes("OWNED BY"),
+                 });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    for k in [
+        "hasSeq",
+        "hasCons",
+        "hasIdx",
+        "hasColCmt",
+        "hasTblCmt",
+        "hasOwned",
+    ] {
+        assert_eq!(d[k], json!(true), "{k} 缺: {}", d["ddl"]);
+    }
+    // 改名重放：序列/表名一并替换；索引名同 schema 唯一，也换名（ux_email → ux_email_2；
+    // 文档口径：pg_get_indexdef 带 schema 限定表名 + 裸索引名，同库重放须自行换索引名，
+    // 跨库/跨 schema 直迁不可移植）。
+    let ddl2 = d["ddl"]
+        .as_str()
+        .unwrap()
+        .replace("oj_ddl_full", "oj_ddl_full_2")
+        .replace("ux_email", "ux_email_2");
+    // 逐条重放：sqlx exec 走 prepared 协议，一条命令一次。
+    let stmts: Vec<&str> = ddl2
+        .split(";\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let js = format!(
+        r#"(async () => {{
+             for (const s of {stmts:?}) await db.asSystem().exec(s);
+             const a = await db.listColumns("oj_ddl_full");
+             const b2 = await db.listColumns("oj_ddl_full_2");
+             json.ok({{ a, b2 }});
+           }})().catch(e => json.fail(500, String(e)))"#
+    );
+    let cap2 = b
+        .run_with(&js, crate::bridge::RequestInfo::default())
+        .await
+        .unwrap();
+    let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
+    assert_eq!(v2["code"], 0, "{v2}");
+    let norm = |v: &Value| -> Value {
+        // 对账忽略 nextval 文本（序列名随改名变化）。
+        let mut arr = v.clone();
+        for c in arr.as_array_mut().unwrap() {
+            let dft = c["default"].as_str().unwrap_or("");
+            if dft.contains("nextval") {
+                c["default"] = json!("<seq>");
+            }
+        }
+        arr
+    };
+    assert_eq!(
+        norm(&v2["data"]["a"]),
+        norm(&v2["data"]["b2"]),
+        "重放后结构须一致"
+    );
+}
