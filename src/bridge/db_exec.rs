@@ -154,7 +154,7 @@ pub fn op_db_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
     use crate::bridge::{Bridge, DataAccessor, Extras, InMemoryKV, RequestInfo, SchemaRegistry};
     use serde_json::{Value, json};
@@ -169,6 +169,8 @@ mod tests {
             delivered: AtomicU32::new(0),
             done: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            truncated: AtomicBool::new(false),
+            result_bytes: AtomicU64::new(0),
             exec_id: OnceLock::new(),
         })
     }

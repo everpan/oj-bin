@@ -2311,6 +2311,145 @@ mod behavior {
         );
     }
 
+    /// REQ-05 Q6：db.stream 字节触顶 fail 档——pump 发结构化错行经通道，next() 还原
+    /// OJ_DB_CAPACITY（中途错误必须抛错，不静默 done——取消先例同口径）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_fails_at_max_result_bytes() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let js = r#"(async () => {
+            try {
+              const rows = [];
+              for await (const r of db.stream("select id from t")) rows.push(r);
+              json.ok({n: rows.length});
+            } catch (e) { json.ok({code: e.code}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_CAPACITY"), "{data}");
+    }
+
+    /// REQ-05 Q6：db.stream truncate 档——干净 done + info() 显式信令（rows/bytes/truncated）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_truncates_at_max_result_bytes_with_info_signal() {
+        let (_d, db) = file_sqlite().await;
+        db.exec_with_params("create table t (id text)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into t select 'aaaaaaaaaa' union all select 'bbbbbbbbbb'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                max_result_bytes: Some(20),
+                on_exceed: Some(OnExceed::Truncate),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(db, SchemaRegistry::new(), pol, false, false);
+        let js = r#"(async () => {
+            const it = db.stream("select id from t");
+            const rows = [];
+            for await (const r of it) rows.push(r);
+            const inf = await it.info();
+            json.ok({n: rows.length, truncated: inf.truncated, bytes: inf.bytes});
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["n"], json!(1), "msg={m} data={data}");
+        assert_eq!(data["truncated"], json!(true), "msg={m} data={data}");
+        assert!(
+            data["bytes"].as_i64().unwrap_or(0) > 20,
+            "msg={m} data={data}"
+        );
+    }
+
+    /// REQ-05 Q6：db.stream 语句超时（pump 全程竞速）：慢流（200ms/行）+ timeoutMs 350
+    /// → ~350ms 抛 OJ_DB_TIMEOUT，不是取完 10 行（2s）。
+    struct SlowStreamAccessor;
+    #[async_trait::async_trait]
+    impl DataAccessor for SlowStreamAccessor {
+        async fn query_with_params(
+            &self,
+            _sql: &str,
+            _params: &[serde_json::Value],
+        ) -> super::super::BridgeResult<Vec<crate::bridge::db::Row>> {
+            Ok(vec![])
+        }
+        async fn exec_with_params(
+            &self,
+            _sql: &str,
+            _params: &[serde_json::Value],
+        ) -> super::super::BridgeResult<i64> {
+            Ok(0)
+        }
+        async fn stream_query(
+            &self,
+            _sql: &str,
+            _params: &[serde_json::Value],
+        ) -> super::super::BridgeResult<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<serde_json::Value, String>> + Send>,
+            >,
+        > {
+            let s = async_stream::stream! {
+                for i in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    yield Ok(serde_json::json!({"n": i}));
+                }
+            };
+            Ok(Box::pin(s))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_statement_timeout_via_pump_race() {
+        let pol = DbAccessSection {
+            defaults: DbAccess {
+                statement_timeout_ms: Some(60_000), // 配置宽裕；调用侧收紧到 350ms
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let b = bridge_with(
+            Arc::new(SlowStreamAccessor),
+            SchemaRegistry::new(),
+            pol,
+            false,
+            false,
+        );
+        let js = r#"(async () => {
+            const t0 = Date.now();
+            try {
+              const rows = [];
+              for await (const r of db.stream("select 1", null, {timeoutMs: 350})) rows.push(r);
+              json.ok({err: "no-timeout", n: rows.length, ms: Date.now() - t0});
+            } catch (e) { json.ok({code: e.code, ms: Date.now() - t0}); }
+          })().catch(e => json.fail(500, String(e)));"#;
+        let (_c, _m, data) = run(&b, RequestInfo::default(), js).await;
+        assert_eq!(data["code"], json!("OJ_DB_TIMEOUT"), "{data}");
+        let ms = data["ms"].as_i64().unwrap_or(9999);
+        assert!(ms < 2_000, "流超时必须在 ~350ms 触发：{ms}ms");
+    }
+
     /// `stream` 达 `max_rows` → 提前 done（不是截断：真省后端拉取）。
     #[tokio::test(flavor = "current_thread")]
     async fn stream_stops_early_at_max_rows() {

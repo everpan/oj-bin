@@ -183,6 +183,19 @@ pub fn result_too_large_error(alias: &str, limit: u64, counted: u64) -> BridgeEr
     }
 }
 
+/// BridgeError → FFI 信封 JSON 串：db.stream 的 pump 经通道 Err 臂透传结构化错误，
+/// `op_db_stream_next` 单点 `parse_raw` 还原（code/data 不丢）。
+pub fn envelope_json(e: &BridgeError) -> String {
+    serde_json::json!({
+        "category": e.category.as_str(),
+        "retryable": e.retryable,
+        "session_disposition": e.session_disposition.as_str(),
+        "message": e.message,
+        "data": Value::Object(e.data.clone()),
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

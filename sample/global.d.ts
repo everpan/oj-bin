@@ -674,7 +674,10 @@ declare global {
       Promise<{ kind: string; dialect: string; items: Record<string, unknown>[] }>;
     /** 流式查询：逐行拉取大结果集。给 onRow 返回 Promise<void>；省略则返回
      * AsyncIterable<Row>。opts.signal 触发 abort 即取消（pg/mysql 真取消）；db.tx 内报错；
-     * opts.onOpen(executionId) 回调跨请求取消句柄（迭代形式用 it.executionId()）。 */
+     * opts.onOpen(executionId) 回调跨请求取消句柄（迭代形式用 it.executionId()）。
+     * opts.timeoutMs：语句超时（只能收紧 statement_timeout_ms；pump 全程竞速）；
+     * max_result_bytes 触顶——fail 档（缺省）以 OJ_DB_CAPACITY 错行抛错，truncate 档
+     * 干净结束且 it.info().truncated=true（it.info() 在迭代结束后仍可读）。 */
     stream(
       sql: string,
       params?: unknown[],
@@ -682,8 +685,13 @@ declare global {
         onRow?: (row: Row) => void;
         signal?: AbortSignal;
         onOpen?: (executionId: string) => void;
+        timeoutMs?: number;
       },
-    ): Promise<void> | AsyncIterable<Row> & { executionId(): Promise<string> };
+    ): Promise<void> | AsyncIterable<Row> & {
+      executionId(): Promise<string>;
+      /** 流运行信息（REQ-05 触顶信令）：{rows, bytes, truncated}。 */
+      info(): Promise<{ rows: number; bytes: number; truncated: boolean }>;
+    };
     /** SQL 执行追踪（dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;

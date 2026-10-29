@@ -77,6 +77,7 @@ import {
   op_secret_open,
   op_db_stream_open,
   op_db_stream_next,
+  op_db_stream_info,
   op_db_stream_close,
   op_db_stream_abort,
   op_es_search,
@@ -1066,7 +1067,18 @@ globalThis.DB = function (name) {
       // surfaces via opts.onOpen(executionId) or it.executionId().
       stream: (sql, params, opts) => {
         let idsP = null;
-        const openIds = () => (idsP ||= dbOpWrap(op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params))));
+        // REQ-05: final stats snapshot -- read BEFORE close() deregisters the stream, so
+        // it.info() keeps working after natural completion (truncate signal included).
+        let lastInfo = null;
+        const readInfo = () =>
+          openIds()
+            .then((v) => dbOpWrap(op_db_stream_info(v.id)))
+            .then((i) => {
+              lastInfo = i;
+              return i;
+            })
+            .catch(() => null);
+        const openIds = () => (idsP ||= dbOpWrap(op_db_stream_open(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))));
         const swallow = (p) => { p.then(() => {}).catch(() => {}); };
         const wireAbort = () => swallow(openIds().then((v) => op_db_stream_abort(v.id)));
         const signal = opts && opts.signal;
@@ -1096,6 +1108,10 @@ globalThis.DB = function (name) {
         return {
           // U-5 v0.1.96: the cross-request cancellation handle (triggers open as a side effect).
           executionId: () => openIds().then((v) => v.executionId),
+          // REQ-05 (U-18 batch Q6): stream runtime info -- {rows, bytes, truncated}.
+          // `truncated` is the explicit max_result_bytes signal (truncate mode); fail mode
+          // surfaces as a structured error row instead (OJ_DB_CAPACITY via next()).
+          info: () => (lastInfo ? Promise.resolve(lastInfo) : readInfo()),
           [Symbol.asyncIterator]() {
             return {
               next: async () => {
@@ -1103,7 +1119,11 @@ globalThis.DB = function (name) {
                   const v = await openIds();
                   emitOpen(v);
                   const row = await dbOpWrap(op_db_stream_next(v.id));
-                  if (row === null) { close(); return { done: true, value: undefined }; }
+                  if (row === null) {
+                    await readInfo(); // snapshot final stats before close() deregisters
+                    close();
+                    return { done: true, value: undefined };
+                  }
                   return { done: false, value: row };
                 } catch (e) {
                   close();

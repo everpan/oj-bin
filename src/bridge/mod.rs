@@ -518,6 +518,7 @@ deno_core::extension!(
         db::op_db_tx_rollback,
         db::op_db_stream_open,
         db::op_db_stream_next,
+        db::op_db_stream_info,
         db::op_db_stream_close,
         db::op_db_stream_abort,
         query::op_db_query_build,

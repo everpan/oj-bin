@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -449,6 +449,10 @@ pub(crate) struct DbStreamShared {
     /// 跨请求取消标志（U-5 v0.1.96）：`db.cancel(executionId)` 置位。`next` 在 recv 前
     /// 检查——取消必须抛错而非静默 done（消费方不得误以为数据取完）。
     pub cancelled: AtomicBool,
+    /// REQ-05：字节触顶（truncate 档）置位——`db.stream` 的显式截断信令（`info().truncated`）。
+    pub truncated: AtomicBool,
+    /// REQ-05：pump 累计的结果集字节（行 JSON 编码口径；fail 档触顶行也计入）。
+    pub result_bytes: AtomicU64,
     /// 反向句柄：本流在 `StableState.exec_sessions` 的执行 id（open 时登记，close 摘除）。
     pub exec_id: OnceLock<String>,
 }
@@ -671,7 +675,7 @@ pub(crate) async fn query_impl(
     let start = std::time::Instant::now();
     // REQ-05：行级字节计量器（仅 Pool 臂被 feed；tx 路径不适用——REQ 只列三路径）。
     let mut meter = super::db_quota::ByteMeter::new(quota.max_result_bytes, quota.on_exceed);
-    let mut res: BridgeResult<Vec<Row>> = match target {
+    let res: BridgeResult<Vec<Row>> = match target {
         Target::Pool(da) => {
             let cancelled = da.server_cancel_on_abandon();
             super::db_quota::race_statement(
@@ -959,6 +963,7 @@ pub async fn op_db_stream_open(
     #[string] name: String,
     #[string] sql: String,
     #[serde] params: Option<Vec<Value>>,
+    #[serde] opts: Option<DbCallOpts>,
 ) -> Result<serde_json::Value, JsErrorBox> {
     let params = params.unwrap_or_default();
     super::guard::check_raw(&state, &sql)?; // 表归属守卫（§5.3，无模块上下文不设防）
@@ -966,6 +971,15 @@ pub async fn op_db_stream_open(
     // db 访问控制（v0.1.89）：与 query/exec 同一入口；行数上限走「提前终止」而非截断。
     let alias = super::guard::bound_db(&state, &name);
     let row_cap = super::db_policy::check_access(&state, &alias, &sql)?;
+    // REQ-05：语句超时（open→pump 全程；timeoutMs 只能收紧）+ 行级字节计量档位。
+    let quota = super::db_policy::quota_for(&state, &alias);
+    let timeout_ms = super::db_quota::effective_timeout_ms(
+        quota.statement_timeout_ms,
+        opts.and_then(|o| o.timeout_ms),
+    )
+    .map_err(JsErrorBox::from)?;
+    let byte_limit = quota.max_result_bytes;
+    let on_exceed = quota.on_exceed;
     let da = match resolve_target(&state, &name)? {
         Target::Pool(da) => da,
         Target::Tx(_) => {
@@ -1027,6 +1041,8 @@ pub async fn op_db_stream_open(
         delivered: AtomicU32::new(0),
         done: AtomicBool::new(false),
         cancelled: AtomicBool::new(false),
+        truncated: AtomicBool::new(false),
+        result_bytes: AtomicU64::new(0),
         exec_id: std::sync::OnceLock::new(),
     });
     let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
@@ -1052,23 +1068,68 @@ pub async fn op_db_stream_open(
     // **有界通道 + 阻塞投递**：消费端不拉取时 pump 停在 send 上——abort 一到即
     // 停止后端拉取（真取消）；unbounded 会把结果集提前灌满、取消扑空（探测
     // probe_stream_abort_releases_connection 抓到的回归）。
+    // REQ-05：pump 全程吃语句 deadline（到点发结构化 OJ_DB_TIMEOUT 错行，不静默 done）；
+    // 行级字节计量——fail 档触顶发结构化 OJ_DB_CAPACITY 错行；truncate 档置 truncated
+    // 标志（info() 显式信令）后干净 done。触顶行计入 result_bytes 但不交付。
     let abort = shared.abort.clone();
+    let pump_shared = shared.clone();
     tokio::spawn(async move {
         // U-7 流预算 permit：随本 task 结束（任一退出路径）自动释放。
         let _stream_permit = stream_permit;
-        use futures::StreamExt;
-        loop {
-            tokio::select! {
-                biased;
-                _ = abort.notified() => break,
-                item = stream.next() => {
-                    match item {
-                        Some(Ok(row)) => { if tx.send(Ok(row)).await.is_err() { break; } }
-                        Some(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
-                        None => break,
+        let byte_limit_ref = byte_limit;
+        let pump = async {
+            let mut meter = super::db_quota::ByteMeter::new(byte_limit_ref, on_exceed);
+            use futures::StreamExt;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = abort.notified() => break,
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(row)) => {
+                                if meter.feed(&row) == super::db_quota::Feed::Stop {
+                                    pump_shared.result_bytes.store(meter.counted, Ordering::SeqCst);
+                                    if meter.exceeded {
+                                        match on_exceed {
+                                            super::db_policy::OnExceed::Fail => {
+                                                let e = super::db_quota::result_too_large_error(
+                                                    &alias, byte_limit_ref.unwrap_or(0), meter.counted,
+                                                );
+                                                let _ = tx.send(Err(super::db_quota::envelope_json(&e))).await;
+                                            }
+                                            super::db_policy::OnExceed::Truncate => {
+                                                pump_shared.truncated.store(true, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                                if tx.send(Ok(row)).await.is_err() { break; }
+                            }
+                            Some(Err(e)) => { let _ = tx.send(Err(e)).await; break; }
+                            None => break,
+                        }
                     }
                 }
             }
+            // 自然结束（无触顶）也落累计字节：info().bytes 恒可用。
+            if !pump_shared.truncated.load(Ordering::SeqCst) {
+                pump_shared
+                    .result_bytes
+                    .store(meter.counted, Ordering::SeqCst);
+            }
+        };
+        match timeout_ms {
+            Some(ms) => {
+                if tokio::time::timeout(std::time::Duration::from_millis(ms), pump)
+                    .await
+                    .is_err()
+                {
+                    let e = super::db_quota::stmt_timeout_error(&alias, ms, false);
+                    let _ = tx.send(Err(super::db_quota::envelope_json(&e))).await;
+                }
+            }
+            None => pump.await,
         }
         // tx 丢弃 → 接收端 recv 返回 None = 流结束（done）。abort 后缓冲中的
         // 已拉行继续交付（"流提前结束"），已交付行不回滚。
@@ -1127,9 +1188,43 @@ pub async fn op_db_stream_next(
             }
             Ok(row)
         }
-        Some(Err(e)) => Err(JsErrorBox::generic(e)),
+        Some(Err(e)) => {
+            // REQ-05：pump 下发的结构化错行（FFI 信封 JSON）在此单点还原——
+            // OJ_DB_TIMEOUT / OJ_DB_CAPACITY 保住 code/data；legacy 纯文本走 generic。
+            if e.trim_start().starts_with('{') {
+                Err(to_js_err(Box::new(super::db_error::parse_raw(&e))))
+            } else {
+                Err(JsErrorBox::generic(e))
+            }
+        }
         None => Ok(Row::Null), // done
     }
+}
+
+/// db.stream 运行信息（REQ-05 触顶显式信令）：已交付行数 / 累计结果集字节 /
+/// 是否被 max_result_bytes 截断（truncate 档）。fail 档的触顶以中途错行表达。
+#[op2]
+#[serde]
+pub async fn op_db_stream_info(
+    state: Rc<RefCell<OpState>>,
+    stream_id: f64,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let stream_id = stream_id as u32;
+    let reg = state
+        .borrow()
+        .borrow::<super::ReqState>()
+        .db_streams
+        .clone();
+    let shared = reg.lock().await.get(&stream_id).cloned().ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "db stream {stream_id} not found (already closed or never opened)"
+        ))
+    })?;
+    Ok(serde_json::json!({
+        "rows": shared.delivered.load(Ordering::SeqCst),
+        "bytes": shared.result_bytes.load(Ordering::SeqCst),
+        "truncated": shared.truncated.load(Ordering::SeqCst),
+    }))
 }
 
 /// db 访问控制自省（v0.1.89）：当前主体可用的库列表 + 每库能力位。
@@ -1880,7 +1975,7 @@ mod tests {
     /// normalize_and_trace——登记为已知非裸 SQL 出口。
     #[test]
     fn raw_sql_op_exits_are_pinned() {
-        const WHITELIST: [&str; 23] = [
+        const WHITELIST: [&str; 24] = [
             "op_db_allowed",
             "op_db_as_system",
             "op_db_as_tenant",
@@ -1899,6 +1994,7 @@ mod tests {
             "op_db_sql_profile",
             "op_db_stream_abort",
             "op_db_stream_close",
+            "op_db_stream_info",
             "op_db_stream_next",
             "op_db_stream_open",
             "op_db_tx_begin",
@@ -2108,6 +2204,81 @@ mod tests {
         }
         if let Some(url) = my {
             stream_eq_check(&url, "mysql").await;
+        }
+    }
+
+    /// REQ-05 Q7（env-gated，三方言矩阵的 pg/mysql 腿）：语句级超时在**网络型后端**
+    /// 准点触发——60s 级慢语句（pg_sleep/sleep）+ 500ms 上限 → ~500ms 拿
+    /// OJ_DB_TIMEOUT（data.cancelled=false：插件轴宿主弃句柄，服务端真取消 = ABI 13 车）。
+    /// 未设 OJ_TEST_PG / OJ_TEST_MYSQL 则 skip（本地诚实登记：此腿未经亲跑）。
+    /// flavor 必须 current_thread（同存量真库用例：multi_thread 下 op 内 spawn 断言 SIGABRT）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn statement_timeout_matrix_pg_mysql() {
+        let cases = [
+            ("OJ_TEST_PG", "select pg_sleep(5) as s"),
+            ("OJ_TEST_MYSQL", "select sleep(5) as s"),
+        ];
+        let mut ran = 0;
+        for (env, sleep_sql) in cases {
+            let Ok(url) = std::env::var(env) else {
+                eprintln!("skip: {env} unset");
+                continue;
+            };
+            if url.is_empty() {
+                eprintln!("skip: {env} empty");
+                continue;
+            }
+            ran += 1;
+            let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+            let b = Bridge::with_dbs_and_loader(
+                std::collections::HashMap::from([("default".to_string(), db as _)]),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                crate::bridge::Extras {
+                    db_access: Some(Arc::new(crate::bridge::db_policy::DbAccessSection {
+                        defaults: crate::bridge::db_policy::DbAccess {
+                            statement_timeout_ms: Some(60_000),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+            // 配置 60s 兜底；调用侧收紧到 500ms（只能收紧阀的单向验证同在路上）。
+            let js = format!(
+                r#"(async () => {{
+                     const t0 = Date.now();
+                     try {{
+                       await db.query({sleep_sql:?}, null, {{timeoutMs: 500}});
+                       json.ok({{err: "no-timeout"}});
+                     }} catch (e) {{
+                       json.ok({{code: e.code, ms: Date.now() - t0, cancelled: e.data && e.data.cancelled}});
+                     }}
+                   }})().catch(e => json.fail(500, String(e)));"#,
+            );
+            let cap = b
+                .run_with(&js, crate::bridge::RequestInfo::default())
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(
+                v["data"]["code"],
+                json!("OJ_DB_TIMEOUT"),
+                "[{env}] 慢语句必须在 deadline 触发结构化超时：{v}"
+            );
+            let ms = v["data"]["ms"].as_i64().unwrap_or(999_999);
+            assert!(
+                ms < 4_000,
+                "[{env}] 竞速必须在 ~500ms 触发而非 5s 跑完：{ms}ms"
+            );
+            // 插件轴诚实位：服务端真取消待 ABI 13 车（执行计划 spike 结论）。
+            assert_eq!(v["data"]["cancelled"], json!(false), "[{env}] {v}");
+        }
+        if ran == 0 {
+            eprintln!("statement_timeout_matrix_pg_mysql: 双腿皆 skip（env 未设）");
         }
     }
 
