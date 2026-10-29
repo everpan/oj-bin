@@ -2844,7 +2844,7 @@ mounts:
 | `host` | `"localhost"` | 监听地址 |
 | `port` | `9778` | 监听端口；<1024 属特权端口（需 root），不要配成 `778` 之类 |
 | `timeout` | `"30s"` | 单请求执行超时（超时熔断 → 408）；单位支持 `s/sec/secs/ms/m/min/h/d`。路由级覆盖见 `route_timeouts` |
-| `route_timeouts` | `[]` | （v0.1.30）路由级超时覆盖：`[{pattern: "/v1/api/convert/**", timeout: "5m"}]`；pattern 段语义同匿名路径（字面 / `*` 一段 / `**` 跨段），按声明序首个命中，匹配**含 base 全路径**；超时语义同全局（408）。pattern 空/时长非法 → 启动 fail-fast |
+| `route_timeouts` | `[]` | （v0.1.30）路由级超时覆盖：`[{pattern: "/v1/api/convert/**", timeout: "5m"}]`；pattern 段语义同匿名路径（字面 / `*` 一段 / `**` 跨段），按声明序首个命中，匹配**含 base 全路径**；超时语义同全局（408）。pattern 空/时长非法 → 启动 fail-fast。（v0.1.102）装配期校验 fail-fast：pattern **匹配不到任何已注册路由** → 拒启动并点名（保留路径 `/health`、`/plugins` 与 WS 挂载不经此机制、不受约束）；pattern 含 `{param}` 段 → 拒（匹配的是真实请求路径，请用 `*`/`**`）；热更后悬空同样拒绝该次 reload。**粒度**：看门狗 25ms 轮询，短于 ~25ms 的 timeout 不保证精确（验收探针 ≥100ms）。**边界**：管得住 JS 忙循环；已下推到数据库的慢语句**跑完后**才回 408——慢 SQL 护栏须等语句级真取消（上游 REQ-05） |
 | `pool_size` | `4` | JS 执行线程数 = 并行请求上限 |
 | `max_upload_bytes` | `10485760`（10MB） | handler 面（multipart 进 `http.file`）上传体积上限；超限 413。axum 层对非 blob 路径再乘 2 做硬顶（双闸，见第 13 章）。**不经 handler 的直传不受它管**——见 `blob_upload_max_bytes` |
 | `blob_upload_max_bytes` | `1073741824`（1 GiB） | （v0.1.30）直传路由 `PUT {base}/blob/{key}` 的体积上限（过鉴权守卫、不经 JsActor/30s）；超限 413 信封 |
