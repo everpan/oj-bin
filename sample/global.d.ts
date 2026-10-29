@@ -622,9 +622,11 @@ declare global {
   // 这个类型（如 `function f(dbi: DBInstance)`）；放模块作用域会 TS2304。）
   interface DBInstance {
     // 原始 SQL + 绑定参数（params 可选）。返回行数组。
-    query(sql: string, params?: unknown[]): Promise<Row[]>;
-    // 执行写操作，返回受影响行数。
-    exec(sql: string, params?: unknown[]): Promise<number>;
+    // opts.timeoutMs：语句级超时（只能收紧 db_access.<alias>.statement_timeout_ms，
+    // 传更大值以 OJ_DB_CAPACITY 拒并点名配置键）；超时回 OJ_DB_TIMEOUT。
+    query(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<Row[]>;
+    // 执行写操作，返回受影响行数。opts 同 query。
+    exec(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<number>;
     // 安全查询构造器（标识符白名单 + 参数化值）。
     table(name: string): QueryBuilder;
     // 条件构造器：leaf(field, op, value) / and / or / not，供 where/having 组合。
@@ -714,6 +716,12 @@ declare global {
     access: DBAccessApi;
     /** host 权威代际计数（U-3）：别名被删除/重登即递增——handler 据此感知跨 isolate 失效。 */
     epoch(name: string): number;
+  }
+
+  /** db.query/db.exec 的每调用侧选项（REQ-05）。 */
+  interface DBCallOpts {
+    /** 语句级超时毫秒：只能收紧配置上限，传更大值以 OJ_DB_CAPACITY 拒（点名 statement_timeout_ms）。 */
+    timeoutMs?: number;
   }
 
   /** 运行期动态授权面（`db.access`，U-1）。grant 至少一个维度非空（空 allow = 授权给所有人，拒）。 */

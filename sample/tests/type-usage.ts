@@ -36,6 +36,15 @@ export async function clientUsage(): Promise<void> {
   void exists;
 }
 
+// db 调用侧选项（REQ-05）：timeoutMs 收紧语句超时。
+export async function callOptsUsage(): Promise<void> {
+  await DB("rep").query("select 1", [], { timeoutMs: 5000 });
+  await DB("rep").exec("delete from t where id = ?", [1], { timeoutMs: 5000 });
+  // DBCallOpts 形状锚：只允许 timeoutMs 键。
+  const opts: DBCallOpts = { timeoutMs: 100 };
+  void opts;
+}
+
 // audit / mgmt / secret（特权检索与凭据面）。
 export async function privilegedUsage(): Promise<void> {
   const events = await audit.query({ kind: "SECRET_OPEN", limit: 10 });
