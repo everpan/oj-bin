@@ -33,7 +33,6 @@ pub async fn op_db_catalog(
         ))
     })?;
     let target = resolve_target(&state, &name)?;
-    let in_tx = matches!(&target, Target::Tx(_));
     let dialect = match &target {
         Target::Tx(t) => require_known_dialect(&t.dialect_info, kind.capability())?,
         Target::Pool(da) => require_known_dialect(da.dialect_info(), kind.capability())?,
@@ -41,6 +40,26 @@ pub async fn op_db_catalog(
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::granted_only(&state, &alias)?;
 
+    // U-14（v0.1.109）MySQL 激活：`catalog_sql(Ddl, MySql)` 为 None，查表先行会让
+    // 下面的 SHOW 拦截成为死代码——故 Ddl × MySql 在查表**之前**定 SQL。顺序钉死：
+    // scoped 先例（for_schema unsupported）必须先于 SHOW（SHOW 不接受绑定参数）。
+    if kind == super::introspect::Kind::Ddl && dialect == Dialect::MySql {
+        // F3（REQ-04）：scoped 模式下 mysql SHOW 例外（Ddl）不接受绑定参数——
+        // 显式拦截为 unsupported（capability=for_schema），绝不内联 schema 名。
+        if scope.is_some() {
+            return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
+                dialect.as_str(),
+                "for_schema",
+            ))));
+        }
+        // mysql SHOW 族 = 零内联铁律的唯一成文例外（introspect.rs 模块注释），白名单校验在 helper。
+        let sql = match super::introspect::mysql_show_create(arg.as_deref().unwrap_or("")) {
+            Ok(s) => s,
+            Err(e) => return Err(JsErrorBox::generic(e)),
+        };
+        // scoped 已在上面拒绝，此处恒无 scope。
+        return run_catalog_sql(state, target, name, kind, dialect, sql, Vec::new(), None).await;
+    }
     let mut sql = match super::introspect::catalog_sql(kind, dialect) {
         Some(s) => s.to_string(),
         None => {
@@ -53,24 +72,7 @@ pub async fn op_db_catalog(
     if kind.catalog_limit() {
         sql.push_str(&format!(" LIMIT {}", super::introspect::MAX_ROWS));
     }
-    // F3（REQ-04）：scoped 模式下 mysql SHOW 例外（Ddl）不接受绑定参数——
-    // 显式拦截为 unsupported（capability=for_schema），绝不内联 schema 名。
-    if scope.is_some() && kind == super::introspect::Kind::Ddl && dialect == Dialect::MySql {
-        return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
-            dialect.as_str(),
-            "for_schema",
-        ))));
-    }
-    // mysql SHOW 族 = 零内联铁律的唯一成文例外（introspect.rs 模块注释），白名单校验在 helper。
-    let mut params = if kind == super::introspect::Kind::Ddl && dialect == Dialect::MySql {
-        match super::introspect::mysql_show_create(arg.as_deref().unwrap_or("")) {
-            Ok(s) => {
-                sql = s;
-                vec![]
-            }
-            Err(e) => return Err(JsErrorBox::generic(e)),
-        }
-    } else if kind.catalog_param() {
+    let params = if kind.catalog_param() {
         let t = arg.as_deref().unwrap_or("");
         if !valid_introspect_table(dialect, t) {
             // 畸形 / 跨库前缀 → 空结果（与 L2 同口径：不报错、不泄漏）。
@@ -82,6 +84,24 @@ pub async fn op_db_catalog(
     } else {
         vec![]
     };
+    run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
+}
+
+/// catalog 查询的执行尾段（F3 scope 解析 + 占位符改写 + 查询 + trace + 归一出信封）。
+/// SHOW 快速路径（Task 1 前置拦截）与普通路径共用；scoped 已在调用侧定夺的
+/// MySQL SHOW 例外不会到达这里。
+#[allow(clippy::too_many_arguments)]
+async fn run_catalog_sql(
+    state: Rc<RefCell<OpState>>,
+    target: Target,
+    name: String,
+    kind: super::introspect::Kind,
+    dialect: Dialect,
+    sql: String,
+    mut params: Vec<Value>,
+    scope: Option<String>,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let in_tx = matches!(&target, Target::Tx(_));
     // F3（REQ-04）：活动 scope——scope 值前置（表名参数在其后）。sqlite →
     // unsupported；畸形 scope → 空信封。
     let sql = match resolve_scope(&sql, dialect, scope.as_deref()) {
