@@ -33,6 +33,17 @@ use super::{ReqState, StableState};
 /// `max_rows` 的绝对上界（配置可上调但不能无界；装配期校验）。
 pub const MAX_ROWS_CAP: u32 = 100_000;
 
+/// `statement_timeout_ms` 的绝对上界（1h：防手滑把毫秒写成秒/分，配置可上调但要有顶）。
+pub const MAX_STATEMENT_TIMEOUT_MS: u64 = 3_600_000;
+
+/// 结果集字节触顶策略（REQ-05：fail=结构化错误（缺省语义）；truncate=截断 + 显式信令）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnExceed {
+    Fail,
+    Truncate,
+}
+
 /// 处置档位（与既有 `SqlGuard` 同形的三档；档位类型归一是后续待做 T2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enforce {
@@ -162,6 +173,14 @@ pub struct DbAccess {
     pub allow_dangerous: bool,
     /// raw/stream 结果行数上限（缺省 = 不限）。
     pub max_rows: Option<u32>,
+    /// 语句级超时毫秒（REQ-05，GA 门禁）：调用侧 `timeoutMs` 只能收紧，传更大值拒。
+    /// 覆盖 db.query/db.exec/db.stream/构造器四条 pool 路径（tx/attach 维持寿命封顶口径）。
+    pub statement_timeout_ms: Option<u64>,
+    /// 结果集字节上限（REQ-05）：行级边拉边计（行 JSON 编码字节），与 max_rows 并存、
+    /// 先到先生效。缺省 = 不限。
+    pub max_result_bytes: Option<u64>,
+    /// 字节触顶策略（仅随 max_result_bytes 有意义；缺省 fail）。truncate 须配本键才启用。
+    pub on_exceed: Option<OnExceed>,
     /// G9：危险语句确认 token（缺省 None = 不设确认门）。配置后，该别名的危险语句
     /// （无 WHERE / 恒真的写）须请求头 `x-oj-confirm` 精确匹配才放行（放行即审计
     /// `DB_DANGEROUS_CONFIRM`）。token 只从 config 来——运行期 grant 不覆盖安全位。
@@ -187,6 +206,25 @@ impl DbAccess {
         {
             return Err(format!(
                 "db_access.{alias}.max_rows must be 1..{MAX_ROWS_CAP} (got {n})"
+            ));
+        }
+        if let Some(ms) = self.statement_timeout_ms
+            && (ms == 0 || ms > MAX_STATEMENT_TIMEOUT_MS)
+        {
+            return Err(format!(
+                "db_access.{alias}.statement_timeout_ms must be 1..{MAX_STATEMENT_TIMEOUT_MS} (got {ms})"
+            ));
+        }
+        if let Some(n) = self.max_result_bytes
+            && n == 0
+        {
+            return Err(format!(
+                "db_access.{alias}.max_result_bytes must be > 0 (got {n})"
+            ));
+        }
+        if self.on_exceed.is_some() && self.max_result_bytes.is_none() {
+            return Err(format!(
+                "db_access.{alias}.on_exceed requires max_result_bytes (nothing to act on)"
             ));
         }
         if self.read_only && self.allow_ddl {
@@ -216,6 +254,12 @@ pub struct DbAccessOverride {
     /// 需要在 defaults 有上限而某库放开时，改为 defaults 不设、逐库声明——不造
     /// `0=不限` 之类的暗号（历史上 `0` 被读成「零行」的代价远大于收益）。
     pub max_rows: Option<u32>,
+    /// `None` = 继承 `defaults`（口径同 max_rows）。
+    pub statement_timeout_ms: Option<u64>,
+    /// `None` = 继承 `defaults`（口径同 max_rows）。
+    pub max_result_bytes: Option<u64>,
+    /// `None` = 继承 `defaults`（口径同 max_rows）。
+    pub on_exceed: Option<OnExceed>,
     pub allow: Option<AllowList>,
 }
 
@@ -235,6 +279,9 @@ impl DbAccessOverride {
             allow_ddl: self.allow_ddl.unwrap_or(base.allow_ddl),
             allow_dangerous: self.allow_dangerous.unwrap_or(base.allow_dangerous),
             max_rows: self.max_rows.or(base.max_rows),
+            statement_timeout_ms: self.statement_timeout_ms.or(base.statement_timeout_ms),
+            max_result_bytes: self.max_result_bytes.or(base.max_result_bytes),
+            on_exceed: self.on_exceed.or(base.on_exceed),
             // G9：token 是安全位，只从 config 来（运行期 grant/module override 不覆盖）。
             dangerous_confirm_token: base.dangerous_confirm_token.clone(),
             allow: AllowList {
@@ -1511,6 +1558,47 @@ mod tests {
             .is_err()
         );
         assert!(DbAccess::default().validate("x").is_ok());
+    }
+
+    #[test]
+    fn quota_config_parses_merges_and_validates() {
+        // Given defaults 声明三键、某库只覆盖 on_exceed
+        let s: DbAccessSection = serde_yaml::from_str(
+            "defaults:\n  statement_timeout_ms: 30000\n  max_result_bytes: 65536\nrep:\n  on_exceed: truncate\n",
+        )
+        .unwrap();
+        // When policy_for，Then 逐键继承：rep 拿到 defaults 的两键 + 自己的 on_exceed
+        let p = s.policy_for("rep");
+        assert_eq!(p.statement_timeout_ms, Some(30_000));
+        assert_eq!(p.max_result_bytes, Some(65_536));
+        assert_eq!(p.on_exceed, Some(OnExceed::Truncate));
+        // 未覆盖库全取 defaults；on_exceed 缺省 None（fail 语义在计量层归一）
+        let d = s.policy_for("other");
+        assert_eq!(d.statement_timeout_ms, Some(30_000));
+        assert_eq!(d.on_exceed, None);
+        // 未知枚举 fail-loud
+        let bad = serde_yaml::from_str::<DbAccessSection>("a:\n  on_exceed: chop\n");
+        assert!(bad.is_err(), "{bad:?}");
+        // 校验走 merge 后策略（装配期口径，app.rs 同款）：0 / 超界语句超时、0 字节上限 → 点名键
+        for (yaml, key) in [
+            ("a:\n  statement_timeout_ms: 0\n", "statement_timeout_ms"),
+            (
+                "a:\n  statement_timeout_ms: 3600001\n",
+                "statement_timeout_ms",
+            ),
+            ("a:\n  max_result_bytes: 0\n", "max_result_bytes"),
+        ] {
+            let s: DbAccessSection = serde_yaml::from_str(yaml).unwrap();
+            let e = s.by_db["a"]
+                .merge(&s.defaults)
+                .validate("a")
+                .err()
+                .expect("must reject");
+            assert!(e.contains(key), "{e} must name {key}");
+        }
+        // on_exceed 单配（无 max_result_bytes）无意义 → 拒（merge 后口径）
+        let s: DbAccessSection = serde_yaml::from_str("a:\n  on_exceed: truncate\n").unwrap();
+        assert!(s.by_db["a"].merge(&s.defaults).validate("a").is_err());
     }
 
     #[test]

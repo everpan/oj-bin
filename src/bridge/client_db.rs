@@ -759,6 +759,10 @@ pub async fn op_db_access_grant(
         allow_ddl: false,
         allow_dangerous: false,
         max_rows: None,
+        // REQ-05：grant 不注入限额/超时位（同 max_rows 口径——安全位只从 config 来）。
+        statement_timeout_ms: None,
+        max_result_bytes: None,
+        on_exceed: None,
         // G9：grant 只注入放行维；确认 token 是 config 安全位，不随 grant 注入。
         dangerous_confirm_token: None,
         allow: allow_list.clone(),
