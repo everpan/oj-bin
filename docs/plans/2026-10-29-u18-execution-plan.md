@@ -42,7 +42,18 @@
 
 ## 3. 增量记录（随做随更）
 
-- （批次 1 动工前，无）
+- **批次 1（v0.1.102）完成并已推送**（tag `v0.1.102`，gitee main `09b2c1c`）：
+  T1.1-T1.6 + T2.1-T2.5 全 ✅，门禁全绿（fmt / clippy -D warnings / workspace 50 二进制 /
+  xtask build+smoke / 契约 10 / `oj test` 63/63）。
+- 关键提交：4550d7c（校验纯函数+访问器）→ 62d6336（接线+集成测试）→ b113cdc（REQ-06 真
+  Promise）→ 393d419（类型面+门禁双腿）→ fab3e3f（bump+CHANGELOG）→ 09b2c1c（三形态 e2e）。
+- **测试教训入档**：① serve 装配集成测试的 fixture 模块必须有 `manifest.yaml`（装配期
+  模块扫描 fail-loud 在我的校验之前，曾误判校验未生效）；② 尾段通配 `*` 只匹配一段——
+  两层路由要写 `/v1/api/u/*`（e2e 初稿写错曾挂起 60s+，busy handler 无超时不会自愈）；
+  ③ 后台跑 cargo 的陷阱：超时迁移=SIGSTOP（0% CPU 假跑）+ pkill 残留 flock——统一
+  `run_in_background` 起跑 + `> 文件` 收输出。
+- Rulings 汇总见台账 `.superpowers/sdd/2026-10-29-u18-execution-plan/progress.md`（main 直跑、
+  golden 剔 sess、REQ-06 复用 dbSessionCall、本仓执行纪律）。
 
 ## 4. 诚实登记（避免遗忘）
 
