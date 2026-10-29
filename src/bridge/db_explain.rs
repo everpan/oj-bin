@@ -138,7 +138,14 @@ fn pg_node_of(content: &str) -> serde_json::Value {
         }
         op_part[..u].trim_end()
     } else if let Some(o) = op_part.find(" on ") {
-        relation = Some(op_part[o + 4..].to_string());
+        // `Bitmap Index Scan on <名>` 的 on 命名的是**索引**（该节点无 using 子句），
+        // 索引名进 accessPath；其余裸 on（Seq Scan on t…）命名的是表，进 relation。
+        let name = &op_part[o + 4..];
+        if op_part[..o].contains("Index Scan") {
+            access = Some(name.to_string());
+        } else {
+            relation = Some(name.to_string());
+        }
         op_part[..o].trim_end()
     } else {
         op_part
@@ -209,11 +216,16 @@ fn pg_category(operation: &str) -> &'static str {
 // 归一器是递归下降**任意容器键**的通用 walker——禁止 nested_loop 特判：
 // nested_loop / grouping_operation / duplicates_removal / ordering_operation /
 // union_result(query_specifications[]) / materialized_from_subquery /
-// attached_subqueries[] / query_block 都是容器；table 是叶子。
+// shared_materialized_from_subquery / attached_subqueries[] /
+// buffered_attached_subqueries[] / select_list_subqueries[] / having_subqueries[] /
+// query_block 都是容器；table 是叶子。
 // ---------------------------------------------------------------------------
 
 /// 容器键的固定遍历优先级（一个节点极少同时持多个；次序确定性靠这里）。
-const MYSQL_CONTAINER_KEYS: [&str; 10] = [
+/// select_list_subqueries / having_subqueries / buffered_attached_subqueries 与
+/// attached_subqueries 同形（透明数组）；shared_materialized_from_subquery 与
+/// materialized_from_subquery 同形（对象容器）——漏收即静默丢子树（终审 Important-2）。
+const MYSQL_CONTAINER_KEYS: [&str; 14] = [
     "ordering_operation",
     "duplicates_removal",
     "grouping_operation",
@@ -221,7 +233,11 @@ const MYSQL_CONTAINER_KEYS: [&str; 10] = [
     "union_result",
     "query_specifications", // union_result 的臂数组（元素包 query_block）
     "materialized_from_subquery",
+    "shared_materialized_from_subquery",
     "attached_subqueries",
+    "buffered_attached_subqueries",
+    "select_list_subqueries",
+    "having_subqueries",
     "query_block",
     "table", // 叶子槽位在末位：容器持有 table 时降级为单子节点，不吞容器自身
 ];
@@ -407,6 +423,8 @@ pub async fn op_db_explain(
             )));
         }
     };
+    // query_impl 内部会对拼好前缀的整句再过一次守卫（首词 EXPLAIN = 传统只读路径）；
+    // 上面那次「剥前缀的守卫」是承重的 Deny fail-closed 补偿，不可省——勿「优化」成单次。
     let rows = super::db_query::query_impl(
         state,
         name,
@@ -496,6 +514,31 @@ mod tests {
     const SAMPLE_INDEX_SCAN: &str = "Index Scan using oj_explain_parent_pkey on oj_explain_parent  (cost=0.27..8.29 rows=1 width=8)\n  Index Cond: (id = 42)\n";
     const SAMPLE_NESTED_LOOP: &str = "Nested Loop  (cost=0.27..44.33 rows=4 width=13)\n  ->  Index Only Scan using oj_explain_parent_pkey on oj_explain_parent p  (cost=0.27..8.29 rows=1 width=4)\n        Index Cond: (id = 42)\n  ->  Seq Scan on oj_explain_child c  (cost=0.00..36.00 rows=4 width=13)\n        Filter: (pid = 42)\n";
     const SAMPLE_SORT_AGG: &str = "Sort  (cost=67.73..68.93 rows=480 width=12)\n  Sort Key: pid\n  ->  HashAggregate  (cost=41.56..46.36 rows=480 width=12)\n        Group Key: pid\n        ->  Seq Scan on oj_explain_child  (cost=0.00..36.00 rows=1111 width=4)\n              Filter: (val ~~ 'v1%'::text)\n";
+
+    // PG 文档标准 bitmap 计划：`Bitmap Index Scan on <索引名>` 的 on 命名的是**索引**
+    // （无 using 子句）——索引名必须进 accessPath 而非 relation（父 Bitmap Heap Scan
+    // 才携带表名）。终审 Important-1 钉死。
+    const SAMPLE_BITMAP: &str = "Bitmap Heap Scan on oj_explain_parent  (cost=4.36..88.54 rows=12 width=8)\n  Recheck Cond: (id < 100)\n  ->  Bitmap Index Scan on oj_explain_parent_pkey  (cost=0.00..4.36 rows=12 width=0)\n        Index Cond: (id < 100)\n";
+
+    #[test]
+    fn pg_text_bitmap_index_scan_names_index_not_relation() {
+        let p = super::normalize_pg_text_plan(SAMPLE_BITMAP);
+        assert_eq!(p["operation"], "Bitmap Heap Scan");
+        assert_eq!(p["relation"], "oj_explain_parent");
+        let c = &p["children"][0];
+        assert_eq!(c["operation"], "Bitmap Index Scan");
+        assert_eq!(
+            c["accessPath"], "oj_explain_parent_pkey",
+            "Bitmap Index Scan 的 on 是索引名，必须进 accessPath"
+        );
+        assert_eq!(
+            c["relation"],
+            serde_json::Value::Null,
+            "索引名不得错标为 relation（表在父节点）"
+        );
+        assert_eq!(c["extra"], "Index Cond: (id < 100)");
+        assert_eq!(p["extra"], "Recheck Cond: (id < 100)");
+    }
 
     #[test]
     fn pg_text_index_scan_normalizes() {
@@ -696,6 +739,34 @@ mod tests {
                 .contains("tenant"),
             "拒绝须来自租户守卫: {d}"
         );
+    }
+
+    // select_list / having 子查询容器：与 attached_subqueries 同形（透明数组），
+    // 历史上 walker 键表漏收致子树静默丢失——终审 Important-2 钉死。
+    const SAMPLE_SUBQUERIES: &str = r#"{"query_block":{"select_id":1,"cost_info":{"query_cost":"2.50"},"table":{"table_name":"oj_explain_parent","access_type":"ALL","rows_produced_per_join":10,"filtered":"100.00","cost_info":{"prefix_cost":"2.50"}},"select_list_subqueries":[{"query_block":{"select_id":2,"table":{"table_name":"oj_explain_child","access_type":"ALL","rows_produced_per_join":5,"filtered":"100.00","cost_info":{"prefix_cost":"1.00"}}}}],"having_subqueries":[{"query_block":{"select_id":3,"table":{"table_name":"oj_explain_child","access_type":"const","key":"PRIMARY","rows_produced_per_join":1,"filtered":"100.00","cost_info":{"prefix_cost":"0.00"}}}}]}}"#;
+
+    #[test]
+    fn mysql_select_list_and_having_subqueries_not_dropped() {
+        let p = mysql_plan(SAMPLE_SUBQUERIES);
+        let ops: Vec<&str> = p["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["operation"].as_str().unwrap())
+            .collect();
+        assert!(
+            ops.contains(&"query_block"),
+            "select_list/having 子查询不得静默丢失: {ops:?}"
+        );
+        let sub_rels: Vec<&str> = p["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["operation"] == "query_block")
+            .map(|c| c["children"][0]["relation"].as_str().unwrap())
+            .collect();
+        assert_eq!(sub_rels.len(), 2);
+        assert_eq!(sub_rels[0], "oj_explain_child");
     }
 
     #[test]

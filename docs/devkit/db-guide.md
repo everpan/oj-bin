@@ -371,6 +371,8 @@ MySQL `access_type` 如 `const`/`ref`/`ALL`）。
   （不执行、无副作用——无 ANALYZE 由构造保证）。
 - **多租户 Deny 站点**：内层语句先剥前缀过租户守卫——`EXPLAIN UPDATE <未注册表>`
   与传统 UPDATE 同样被拒。
+- **Tx 臂注意**：attached session（`db.session`）内无语句超时，`opts.timeoutMs`
+  对 `db.explain` 不生效（与 `db.query` Tx 臂口径一致）。
 - **方言边界**：sqlite / 未知方言 → 结构化 `OJ_DB_UNSUPPORTED`
   （`e.data.capability === "explain"`）。**版本错位能力探测**：
   `typeof db.explain === "function"`（旧二进制上是 TypeError，勿版本号嗅探）。
