@@ -9,6 +9,8 @@ pub mod actor;
 pub mod certificate;
 pub mod certificate_watcher;
 pub mod logging;
+/// OpenAPI spec → MCP tool 列表（纯函数；MCP 双线路共享核心 R3/R4）。
+pub mod mcp;
 /// 路由表 → OpenAPI 3.1 生成（自 oj 迁入，MCP 双线路 R1；字节级不变约束）。
 pub mod openapi;
 /// 配置热更新传输层（v1）：外层单一 fallback + watch 通道 + reload_api 门禁。
