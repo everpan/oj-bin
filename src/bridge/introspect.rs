@@ -25,6 +25,11 @@ use super::db::Dialect;
 /// 故在此硬编码。超限**截断**（元数据规模天然小，正常站点碰不到）。
 pub const MAX_ROWS: usize = 1000;
 
+/// catalog 抓取上限 = MAX_ROWS + 1：op 给 catalog SQL 追 `LIMIT` 后多取一行，
+/// 让 [`catalog`] 的 truncated 信令（rows.len() > MAX_ROWS）在生产路径可达
+/// （评审修复 v0.1.112：追 LIMIT MAX_ROWS 会让旗标恒 false）。
+pub const CATALOG_FETCH_CAP: usize = MAX_ROWS + 1;
+
 /// 内省能力（与 `OJ_DB_UNSUPPORTED` 的 `data.capability` 同词汇）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -1456,6 +1461,14 @@ mod tests {
         assert_eq!(it["body"], "BEGIN SET @a = 1; END");
         assert_eq!(it["order"], json!(1));
         assert_eq!(it["enabled"], Value::Null);
+    }
+
+    /// REQ-08 §3.5 评审修复（v0.1.112）：catalog 抓取上限必须比 MAX_ROWS 多一行——
+    /// op 给 catalog SQL 追 `LIMIT` 后，`catalog()` 的 truncated 信令（rows.len() > MAX_ROWS）
+    /// 只有抓过线才可能为真；追 LIMIT MAX_ROWS 会让旗标在生产路径恒 false（评审 Important）。
+    #[test]
+    fn catalog_fetch_cap_enables_truncated_signal() {
+        assert_eq!(CATALOG_FETCH_CAP, MAX_ROWS + 1);
     }
 
     /// REQ-08 §3.1（v0.1.112）：routines items 带元数据键集（缺省 null，schema 稳定）。

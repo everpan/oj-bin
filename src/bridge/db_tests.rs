@@ -3013,6 +3013,7 @@ async fn catalog_ddl_pg_stitch_roundtrip_real() {
                  const ddl = r.items[0].ddl;
                  json.ok({
                    ddl,
+                   truncated: r.truncated,
                    hasSeq: ddl.includes("CREATE SEQUENCE IF NOT EXISTS"),
                    hasCons: ddl.includes("ADD CONSTRAINT"),
                    hasIdx: ddl.includes("CREATE UNIQUE INDEX ux_email"),
@@ -3028,6 +3029,9 @@ async fn catalog_ddl_pg_stitch_roundtrip_real() {
     let v: Value = serde_json::from_slice(&cap.body).unwrap();
     assert_eq!(v["code"], 0, "{v}");
     let d = &v["data"];
+    // 评审修复（v0.1.112）：拼接器 Table 路由信封须带 truncated 键（恒 false——
+    // 容量触顶走 OJ_DB_CAPACITY 拒产，不静默截断），信封 schema 全路由稳定。
+    assert_eq!(d["truncated"], json!(false), "{d}");
     for k in [
         "hasSeq",
         "hasCons",

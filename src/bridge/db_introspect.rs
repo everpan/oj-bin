@@ -113,7 +113,7 @@ pub async fn op_db_catalog(
         }
     };
     if kind.catalog_limit() {
-        sql.push_str(&format!(" LIMIT {}", super::introspect::MAX_ROWS));
+        sql.push_str(&format!(" LIMIT {}", super::introspect::CATALOG_FETCH_CAP));
     }
     let params = if kind.catalog_param() {
         let t = arg.as_deref().unwrap_or("");
@@ -220,8 +220,11 @@ async fn pg_ddl_dispatch(
         // 表 / 分区表 → 拼接器（4+1 查询 + 渲染，整体 deadline + 容量防线）。
         super::introspect::PgDdlRoute::Table => {
             let items = pg_stitch(&state, &target, &name, t, scope.clone()).await?;
+            // truncated 恒 false：容量触顶走 OJ_DB_CAPACITY 拒产不完整 DDL，不静默截断；
+            // 键保持存在——信封 schema 全路由稳定（评审修复 v0.1.112）。
             Ok(serde_json::json!({
-                "kind": kind.capability(), "dialect": dialect.as_str(), "items": items
+                "kind": kind.capability(), "dialect": dialect.as_str(),
+                "items": items, "truncated": false
             }))
         }
     }
