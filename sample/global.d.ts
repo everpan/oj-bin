@@ -854,6 +854,51 @@ declare global {
     }>;
     /** 幂等取消：半成品经 put_stream_abort 清（防 s3 orphan parts）；终态任务 no-op。 */
     exportCancel(taskId: string): Promise<{ cancelled: true }>;
+    /** 任务式批量导入（REQ-12，v0.1.115）：立即返 {taskId}；Rust consumer 经
+     * blob 源（CSV/JSONL，read_range 流式）或内联 rows 多值 INSERT 分批落库。
+     * 守卫：scoped 表在 sql_guard 下结构化拒（capability="import_under_guard"）；
+     * Deny+未登记 → 拒（镜像裸 SQL）；replace = truncate 同档（allow_ddl + 危险写确认门）。
+     * 配额：全局/每主体并发（db_import 段）+ max_rows（内联登记前拒）+ max_bytes
+     * （blob 源中途 failed 点名键）；取消不回退已提交批。 */
+    import(args: {
+      table: string;
+      schema?: string;
+      /** 与 rows 恰一：blob 源 key（先经既有上传接口落 blob）。 */
+      blobKey?: string;
+      /** 与 blobKey 恰一：内联小数据集（max_rows 内）。 */
+      rows?: Record<string, unknown>[];
+      format: "csv" | "jsonl";
+      /** 缺省 = csv 表头 / 首行键（BTreeMap 排序序——生产用法请显式给）。 */
+      columns?: string[];
+      mode?: "append" | "upsert" | "replace";
+      /** upsert 必填（PG: ON CONFLICT / MySQL: 需唯一键 / sqlite: 仅 ["rowid"]）。 */
+      conflictKeys?: string[];
+      /** 实现按 65535/列数 与 100..=50000 收敛。 */
+      batchSize?: number;
+      /** csv 首行为表头（默认 true；表头与 columns 不符即参数错误 fail-fast）。 */
+      header?: boolean;
+      /** skip = 坏行进 samples 行不落库，超 maxErrors 整任务 failed。 */
+      onError?: "abort" | "skip";
+      maxErrors?: number;
+    }): Promise<{ taskId: string }>;
+    /** 导入任务状态：{taskId, state:"running"|"done"|"failed"|"cancelled", alias, table,
+     * rows（=已提交行数，取消不回退）, errors（=样本计数）, bytes, samples（≤20，
+     * line = 源文件绝对行号，1-based，header 计 1）, startedAtMs, finishedAtMs, error}。 */
+    importStatus(taskId: string): Promise<{
+      taskId: string;
+      state: "running" | "done" | "failed" | "cancelled";
+      alias: string;
+      table: string;
+      rows: number;
+      errors: number;
+      bytes: number;
+      samples?: { line: number; reason: string; raw?: string }[];
+      startedAtMs: number;
+      finishedAtMs: number | null;
+      error: string | null;
+    }>;
+    /** 幂等取消：批间协作（已提交批保留，未提交批不落库）；终态任务 no-op。 */
+    importCancel(taskId: string): Promise<{ cancelled: true }>;
     /** SQL 执行追踪（dev 默认开）：本请求累计画像；同一请求内调用，
      * 跨请求重置。追踪关闭返回空对象 {}。 */
     sqlProfile(): SqlProfile;

@@ -315,6 +315,26 @@ impl ImportRegistry {
         expired
     }
 
+    /// TTL 回收器（懒启动，每 Registry 至多一个）。到点 sweep 摘表即丢
+    /// （import 无 blob 产物，扫完无需清理外部存储）。
+    pub fn arm_reaper(self: &Arc<Self>, interval: std::time::Duration, ttl: std::time::Duration) {
+        if self
+            .reaper_armed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let reg = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // 首个 tick 立即到——跳过，按整间隔扫
+            loop {
+                tick.tick().await;
+                let _ = reg.sweep(ms_now(), ttl.as_millis() as u64);
+            }
+        });
+    }
 }
 
 /// CSV/JSONL 源解析 + 列类型转换（T3）。行号权威：ParsedRow.line = 源文件绝对行号
@@ -1339,5 +1359,479 @@ mod render_tests {
             .unwrap();
         assert_eq!(rows.len(), 2, "or replace 不增行");
         assert_eq!(rows[1]["b"], json!("z"), "row 1 被覆盖");
+    }
+}
+
+#[cfg(test)]
+mod op_tests {
+    use super::*;
+    use crate::bridge::{
+        Bridge, Extras, InMemoryAccessor, InMemoryKV, SchemaRegistry, SqlGuard,
+    };
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn import_bridge(
+        registry: SchemaRegistry,
+        import_section: super::super::db_policy::DbImportSection,
+        sql_guard: SqlGuard,
+    ) -> Bridge {
+        let mem = Arc::new(InMemoryAccessor::new());
+        Bridge::with_dbs_and_loader(
+            HashMap::from([("default".to_string(), mem as _)]),
+            Arc::new(InMemoryKV::new()),
+            registry,
+            false,
+            None,
+            Extras {
+                import_section: Some(Arc::new(import_section)),
+                db_access: Some(Arc::new(Default::default())),
+                sql_guard,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn scoped_registry() -> SchemaRegistry {
+        SchemaRegistry::new().table("orders", &["id"], &["id", "tenant_id", "name"])
+    }
+
+    /// 结构化错误收割：code + capability + data.format。
+    async fn import_err(b: &Bridge, args: &str) -> Value {
+        let js = format!(
+            r#"(async () => {{
+                 const r = await db.import({args}).then(
+                   () => null,
+                   (e) => ({{ code: e.code, capability: e.data && e.data.capability, format: e.data && e.data.format, msg: String(e.message || e) }}));
+                 json.ok(r);
+               }})().catch(e => json.fail(500, String(e)));"#,
+        );
+        let cap = b.run_with(&js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        v["data"].clone()
+    }
+
+    /// scoped 表 + guard=Warn/Deny 两档 → 结构化拒 capability=import_under_guard。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_guard_scoped_table_fail_closed() {
+        for guard in [SqlGuard::Warn, SqlGuard::Deny] {
+            let b = import_bridge(scoped_registry(), Default::default(), guard);
+            let d = import_err(
+                &b,
+                r#"{ table: "orders", format: "jsonl", columns: ["id", "name"], rows: [{ id: 1, name: "a" }] }"#,
+            )
+            .await;
+            assert_eq!(d["code"], json!("OJ_DB_UNSUPPORTED"), "{d}");
+            assert_eq!(d["capability"], json!("import_under_guard"), "{d}");
+        }
+    }
+
+    /// 未登记 + Deny → 拒（镜像裸 SQL「cannot verify tenant scope」）；
+    /// 未登记 + Warn → warn 放行（任务建起）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_guard_unregistered_warn_passes_deny_rejects() {
+        let deny = import_bridge(SchemaRegistry::new(), Default::default(), SqlGuard::Deny);
+        let d = import_err(
+            &deny,
+            r#"{ table: "ghost", format: "jsonl", columns: ["id"], rows: [{ id: 1 }] }"#,
+        )
+        .await;
+        assert_eq!(d["code"], json!(null), "{d}"); // 非结构化——守卫 generic 错误
+        assert!(d["msg"].as_str().unwrap().contains("cannot verify tenant scope"), "{d}");
+        let warn = import_bridge(SchemaRegistry::new(), Default::default(), SqlGuard::Warn);
+        let js = r#"(async () => {
+             const { taskId } = await db.import({ table: "ghost", format: "jsonl", columns: ["id"], rows: [{ id: 1 }] });
+             json.ok({ taskId });
+           })().catch(e => json.fail(500, String(e)));"#;
+        let cap = warn.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["taskId"].as_str().unwrap().starts_with("imp_"), "{v}");
+    }
+
+    /// 已登记但非 scoped + Deny → 放行（同裸 SQL）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_guard_registered_non_scoped_passes() {
+        let reg = SchemaRegistry::new().table("plain", &["id"], &["id", "name"]);
+        let b = import_bridge(reg, Default::default(), SqlGuard::Deny);
+        let js = r#"(async () => {
+             const { taskId } = await db.import({ table: "plain", format: "jsonl", columns: ["id", "name"], rows: [{ id: 1, name: "a" }] });
+             json.ok({ taskId });
+           })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["taskId"].as_str().unwrap().starts_with("imp_"), "{v}");
+    }
+
+    /// rs.system=true + scoped 表 + Deny → 预检与 check_tenant_raw 一致跳过 → 放行。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_as_system_skips_guard() {
+        let b = import_bridge(scoped_registry(), Default::default(), SqlGuard::Deny);
+        let js = r#"(async () => {
+             const { taskId } = await db.asSystem().import({ table: "orders", format: "jsonl", columns: ["id", "name"], rows: [{ id: 1, name: "a" }] });
+             json.ok({ taskId });
+           })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["taskId"].as_str().unwrap().starts_with("imp_"), "{v}");
+    }
+
+    /// 内联 rows 超 max_rows → 登记前拒（点名键）；拒后配额位不泄漏
+    /// （per_subject=1 下被拒后同主体立刻可再登记 = 无残留 entry）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_rows_over_quota_rejected_before_register() {
+        let section = super::super::db_policy::DbImportSection {
+            max_rows: 2,
+            per_subject_concurrency: 1,
+            ..Default::default()
+        };
+        let b = import_bridge(SchemaRegistry::new(), section, SqlGuard::Off);
+        let d = import_err(
+            &b,
+            r#"{ table: "t", format: "jsonl", columns: ["id"], rows: [{ id: 1 }, { id: 2 }, { id: 3 }] }"#,
+        )
+        .await;
+        assert!(d["msg"].as_str().unwrap().contains("max_rows"), "{d}");
+        // 登记无残留：同主体（per_subject=1）立刻可登记成功
+        let js = r#"(async () => {
+             const { taskId } = await db.import({ table: "t", format: "jsonl", columns: ["id"], rows: [{ id: 1 }] });
+             json.ok({ taskId });
+           })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+    }
+
+    /// 前缀隔离：importStatus(exp_id) / exportStatus(imp_id) 互 not found。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_prefix_isolation() {
+        let b = import_bridge(SchemaRegistry::new(), Default::default(), SqlGuard::Off);
+        let js = r#"(async () => {
+             const expId = "exp_ab12_00000000000000000000000000000000";
+             const impId = "imp_ab12_00000000000000000000000000000000";
+             const r1 = await db.importStatus(expId).then(() => "found", (e) => String(e.message || e));
+             const r2 = await db.exportStatus(impId).then(() => "found", (e) => String(e.message || e));
+             json.ok({ r1, r2 });
+           })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "{v}");
+        assert!(v["data"]["r1"].as_str().unwrap().contains("not found"), "{v}");
+        assert!(v["data"]["r2"].as_str().unwrap().contains("not found"), "{v}");
+    }
+
+    /// blobKey 与 rows 恰一；format 只注册 csv/jsonl。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_blob_and_rows_mutex_and_bad_format() {
+        let b = import_bridge(SchemaRegistry::new(), Default::default(), SqlGuard::Off);
+        let d = import_err(&b, r#"{ table: "t", format: "csv", blobKey: "k", rows: [{ id: 1 }] }"#).await;
+        assert!(d["msg"].as_str().unwrap().contains("blobKey"), "{d}");
+        let d = import_err(&b, r#"{ table: "t", format: "csv" }"#).await;
+        assert!(d["msg"].as_str().unwrap().contains("rows"), "{d}");
+        let d = import_err(&b, r#"{ table: "t", format: "xlsx", rows: [{ id: 1 }] }"#).await;
+        assert_eq!(d["code"], json!("OJ_DB_UNSUPPORTED"), "{d}");
+        assert_eq!(d["format"], json!("xlsx"), "{d}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ops（REQ-12 T5）：db.import / importStatus / importCancel——守卫矩阵 + 配额 + 登记
+// ---------------------------------------------------------------------------
+
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// `db.import(args)` 入参（spec §3 逐字段 camelCase）。
+#[derive(Debug, serde::Deserialize)]
+pub struct ImportArgs {
+    #[serde(rename = "table")]
+    pub table: String,
+    #[serde(rename = "schema", default)]
+    pub schema: Option<String>,
+    #[serde(rename = "blobKey", default)]
+    pub blob_key: Option<String>,
+    #[serde(rename = "rows", default)]
+    pub rows: Option<Vec<serde_json::Map<String, Value>>>,
+    #[serde(rename = "format")]
+    pub format: String,
+    #[serde(rename = "columns", default)]
+    pub columns: Option<Vec<String>>,
+    #[serde(rename = "mode", default)]
+    pub mode: Option<String>,
+    #[serde(rename = "conflictKeys", default)]
+    pub conflict_keys: Option<Vec<String>>,
+    #[serde(rename = "batchSize", default)]
+    pub batch_size: Option<usize>,
+    #[serde(rename = "header", default)]
+    pub header: Option<bool>,
+    #[serde(rename = "onError", default)]
+    pub on_error: Option<String>,
+    #[serde(rename = "maxErrors", default)]
+    pub max_errors: Option<u64>,
+}
+
+/// 解析后的导入模式（render::ImportMode 的 op 侧形态，含冲突键）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Append,
+    Upsert { conflict_keys: Vec<String> },
+    Replace,
+}
+
+impl Mode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Mode::Append => "append",
+            Mode::Upsert { .. } => "upsert",
+            Mode::Replace => "replace",
+        }
+    }
+}
+
+/// 结构化 unsupported（未知 format）：`OJ_DB_UNSUPPORTED`，data.capability 点名 format。
+fn format_unsupported(format: &str) -> JsErrorBox {
+    let mut e = super::db_error::unsupported("import", "format");
+    e.message =
+        format!("import format \"{format}\" is not supported (use \"csv\" or \"jsonl\")");
+    e.data.insert("format".into(), Value::String(format.into()));
+    JsErrorBox::from(e)
+}
+
+/// 结构化 import 预检拒绝：`OJ_DB_UNSUPPORTED(capability="import_under_guard")`。
+/// scoped 表在 sql_guard 下一律 fail-closed——守卫只能验「某参数=当前 tid」，
+/// 证明不了导入每行都属该租户（per-row 强制 = import 侧未来工作，spec §4.2）。
+fn import_under_guard(table: &str) -> JsErrorBox {
+    let mut e = super::db_error::unsupported("import", "import_under_guard");
+    e.message = format!(
+        "db.import on tenant-scoped table '{table}' is not supported under sql_guard (capability \"import_under_guard\"): per-row tenant enforcement is import-side work, tracked as future work"
+    );
+    JsErrorBox::from(e)
+}
+
+/// `db.import(args)`：守卫矩阵 → 配额 → 登记 → 审计 → 自驱 consumer，立即返 `{taskId}`。
+/// T5 落同步面 + 占位 consumer（立即 Done{0,0}）；T6 替换真实现。
+#[op2]
+#[serde]
+pub async fn op_db_import(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[serde] args: ImportArgs,
+) -> Result<serde_json::Value, JsErrorBox> {
+    // 0. 参数面：format / mode / onError / blobKey×rows 恰一。
+    match args.format.as_str() {
+        "csv" | "jsonl" => {}
+        other => return Err(format_unsupported(other)),
+    }
+    if let Some(s) = &args.schema {
+        return Err(JsErrorBox::generic(format!(
+            "db import: schema '{s}' is not supported yet (use table name only)"
+        )));
+    }
+    let mode = match args.mode.as_deref().unwrap_or("append") {
+        "append" => Mode::Append,
+        "replace" => Mode::Replace,
+        "upsert" => Mode::Upsert {
+            conflict_keys: args.conflict_keys.clone().unwrap_or_default(),
+        },
+        other => {
+            return Err(JsErrorBox::generic(format!(
+                "db import: mode \"{other}\" is not supported (use \"append\", \"upsert\" or \"replace\")"
+            )));
+        }
+    };
+    let on_error_skip = match args.on_error.as_deref().unwrap_or("abort") {
+        "abort" => false,
+        "skip" => true,
+        other => {
+            return Err(JsErrorBox::generic(format!(
+                "db import: onError \"{other}\" is not supported (use \"abort\" or \"skip\")"
+            )));
+        }
+    };
+    match (&args.blob_key, &args.rows) {
+        (Some(_), Some(_)) => {
+            return Err(JsErrorBox::generic(
+                "db import: pass exactly one of blobKey or rows",
+            ));
+        }
+        (None, None) => {
+            return Err(JsErrorBox::generic(
+                "db import: either blobKey or rows is required",
+            ));
+        }
+        _ => {}
+    }
+    // 1. 表归属守卫（同 db.table() 构造器路径）。
+    super::guard::check_table(&state, &args.table)?;
+    // 2. import 预检：guard != Off && !system && 已登记且 tenant-scoped → fail-closed。
+    {
+        let g = state.borrow();
+        let st = g.borrow::<Arc<super::StableState>>();
+        let rs = g.borrow::<super::ReqState>();
+        if st.sql_guard != super::SqlGuard::Off
+            && !rs.system
+            && st
+                .registry
+                .get(&args.table)
+                .is_some_and(|d| d.is_tenant_scoped())
+        {
+            return Err(import_under_guard(&args.table));
+        }
+    }
+    // 3. 合成 SQL 镜像裸 SQL 租户裁决（逐档复用 check_tenant_raw，不重写矩阵）。
+    let synthetic = match &mode {
+        Mode::Replace => format!("truncate table {}", args.table),
+        _ => format!("insert into {} values (?)", args.table),
+    };
+    super::guard::check_tenant_raw(&state, &synthetic, &[])?;
+    // 4. 访问控制：replace = truncate 分类（allow_ddl + G9 危险写确认门同档），
+    //    append/upsert = insert 分类——全在 check_access 内部按首关键字裁决。
+    let alias = super::guard::bound_db(&state, &name);
+    super::db_policy::check_access(&state, &alias, &synthetic)?;
+    // 5. 池臂（与 export 同口径：事务里跑导入无意义——连接随请求死）。
+    let da = match super::db::resolve_target(&state, &name)? {
+        super::db::Target::Pool(da) => da,
+        super::db::Target::Tx(_) => {
+            return Err(JsErrorBox::generic(
+                "db.import within an active transaction is not supported (import runs on the connection pool only)",
+            ));
+        }
+    };
+    let (section, registry, import_registry) = {
+        let g = state.borrow();
+        let st = g.borrow::<Arc<super::StableState>>();
+        (
+            st.import_section.clone(),
+            st.registry.clone(),
+            st.import_registry.clone(),
+        )
+    };
+    // 6. 列解析 + 白名单 + 内联行配额（登记前）。
+    //    blob 源的列在 consumer 首步从 csv 表头 / jsonl 首行键解析（读数前白名单校验）。
+    let columns: Vec<String> = match (&args.columns, &args.rows) {
+        (Some(c), _) => c.clone(),
+        (None, Some(rows)) if !rows.is_empty() => {
+            rows[0].keys().cloned().collect() // BTreeMap 键序 = 排序序（serde_json 无 preserve_order）
+        }
+        (None, Some(_)) => {
+            return Err(JsErrorBox::generic(
+                "db import: columns are required for an empty rows array",
+            ));
+        }
+        (None, None) => Vec::new(),
+    };
+    if let Some(t) = registry.get(&args.table) {
+        for c in &columns {
+            if !t.has_column(c) {
+                return Err(JsErrorBox::generic(format!(
+                    "unknown column '{c}' in import columns"
+                )));
+            }
+        }
+    }
+    if let Some(rows) = &args.rows {
+        if rows.len() as u64 > section.max_rows {
+            return Err(JsErrorBox::generic(format!(
+                "db import: rows exceed db_import.max_rows ({})",
+                section.max_rows
+            )));
+        }
+        for row in rows {
+            for k in row.keys() {
+                if !columns.iter().any(|c| c == k) {
+                    return Err(JsErrorBox::generic(format!(
+                        "db import: row key '{k}' not in columns"
+                    )));
+                }
+            }
+        }
+    }
+    let batch_size = args
+        .batch_size
+        .unwrap_or(section.default_batch_size)
+        .clamp(100, 50000);
+    let max_errors = args.max_errors.unwrap_or(10).max(1);
+    // 7. 登记 → 审计 → consumer（占位：T6 替换真实现）。
+    let owner = super::db_session::owner_of(&state.borrow());
+    let (task_id, _cancel) = import_registry
+        .register(owner.clone(), alias.clone(), args.table.clone())
+        .map_err(|e| JsErrorBox::generic(e.message()))?;
+    import_registry.arm_reaper(
+        std::time::Duration::from_secs(section.sweep_interval_secs),
+        std::time::Duration::from_secs(section.ttl_secs),
+    );
+    let audit = {
+        let g = state.borrow();
+        g.borrow::<Arc<super::StableState>>().audit.clone()
+    };
+    let task_short = &task_id[..task_id.len().min(12)];
+    audit.push(super::audit::AuditEvent {
+        ts_ms: ms_now(),
+        kind: "db.import.start".into(),
+        user: owner.user.clone(),
+        tenant: owner.tenant.clone(),
+        module: None,
+        source: "db.import",
+        alias: alias.clone(),
+        detail: format!(
+            "task={task_short} mode={} format={}",
+            mode.as_str(),
+            args.format
+        ),
+    });
+    // T5 占位 consumer：立即 Done（真实现在 T6 按 blob 流/批事务/skip/abort/cancel 落）。
+    let reg_c = import_registry.clone();
+    let tid_c = task_id.clone();
+    let _ = (da, on_error_skip, max_errors, batch_size); // T6 消费这些上下文
+    tokio::spawn(async move {
+        reg_c.finish(&tid_c, Finish::Done { rows: 0, bytes: 0 });
+    });
+    Ok(json!({ "taskId": task_id }))
+}
+
+/// `importStatus(taskId)`：归属校验；未知/他人/跨重启一律 not found（不泄露存在性）。
+#[op2]
+#[serde]
+pub async fn op_db_import_status(
+    state: Rc<RefCell<OpState>>,
+    #[string] task_id: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let (registry, owner) = {
+        let g = state.borrow();
+        let st = g.borrow::<Arc<super::StableState>>().clone();
+        (st.import_registry.clone(), super::db_session::owner_of(&g))
+    };
+    registry.status(&task_id, &owner).ok_or_else(|| {
+        JsErrorBox::generic(format!(
+            "import task {} not found",
+            super::handle_core::id_prefix(PREFIX, &task_id)
+        ))
+    })
+}
+
+/// `importCancel(taskId)`：幂等；not found 口径同 status。
+#[op2]
+#[serde]
+pub async fn op_db_import_cancel(
+    state: Rc<RefCell<OpState>>,
+    #[string] task_id: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let (registry, owner) = {
+        let g = state.borrow();
+        let st = g.borrow::<Arc<super::StableState>>().clone();
+        (st.import_registry.clone(), super::db_session::owner_of(&g))
+    };
+    match registry.cancel(&task_id, &owner) {
+        Some(_) => Ok(json!({ "cancelled": true })),
+        None => Err(JsErrorBox::generic(format!(
+            "import task {} not found",
+            super::handle_core::id_prefix(PREFIX, &task_id)
+        ))),
     }
 }

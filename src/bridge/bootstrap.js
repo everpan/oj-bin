@@ -90,6 +90,9 @@ import {
   op_db_export,
   op_db_export_status,
   op_db_export_cancel,
+  op_db_import,
+  op_db_import_status,
+  op_db_import_cancel,
   op_db_stream_close,
   op_db_stream_abort,
   op_es_search,
@@ -1089,6 +1092,12 @@ globalThis.DB = function (name) {
       export: (args) => dbOpWrap(op_db_export(name, args)),
       exportStatus: (taskId) => dbOpWrap(op_db_export_status(String(taskId))),
       exportCancel: (taskId) => dbOpWrap(op_db_export_cancel(String(taskId))),
+      // REQ-12 task-based bulk import (v0.1.115): returns {taskId} immediately;
+      // a Rust consumer task reads the blob source (or inline rows) and inserts
+      // in rendered multi-value batches (replace = delete + insert, one tx).
+      import: (args) => dbOpWrap(op_db_import(name, args)),
+      importStatus: (taskId) => dbOpWrap(op_db_import_status(String(taskId))),
+      importCancel: (taskId) => dbOpWrap(op_db_import_cancel(String(taskId))),
       // safe query builder: identifier whitelist + parameterized values.
       table: (t) => queryBuilder(name, String(t)),
       // system escape hatch (tenant sql_guard): this request bypasses tenant
