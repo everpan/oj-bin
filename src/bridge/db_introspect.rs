@@ -65,18 +65,18 @@ pub async fn op_db_catalog(
     // 下面的 SHOW 拦截成为死代码——故 Ddl × MySql 在查表**之前**定 SQL。顺序钉死：
     // scoped 先例（for_schema unsupported）必须先于 SHOW（SHOW 不接受绑定参数）。
     if kind == super::introspect::Kind::Ddl && dialect == Dialect::MySql {
-        // F3（REQ-04）：scoped 模式下 mysql SHOW 例外（Ddl）不接受绑定参数——
-        // 显式拦截为 unsupported（capability=for_schema），绝不内联 schema 名。
-        if scope.is_some() {
-            return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
-                dialect.as_str(),
-                "for_schema",
-            ))));
-        }
-        // mysql SHOW 族 = 零内联铁律的唯一成文例外（introspect.rs 模块注释），白名单校验在 helper。
+        // REQ-09-2：scoped 透传（仅 Ddl 放开；其他 kind 的 scope 拒绝在上方拦截不动）。
+        // scope 与 arg 各过白名单后拼两段标识符（校验在 helper，违规 → Err）。
+        // 类型探测查询恒查当前库（DATABASE() 谓词）：scope=当前库时探测正确；
+        // 跨库对象探测落空回退 TABLE 动词 → 跨库视图会拿到 MySQL 报错（fail-loud，
+        // 一期范围，devkit 登记）。
+        let a = arg.clone().unwrap_or_default();
+        let render_name = match &scope {
+            Some(s) => format!("{s}.{a}"),
+            None => a.clone(),
+        };
         // REQ-08 §3.2：先探测对象类型（表/视图/函数/过程）再选 SHOW 动词；探测落空
         // 回退 TABLE（保住「对象不存在」时今天的 fail-loud 报错形态）。
-        let a = arg.clone().unwrap_or_default();
         let probe_rows = catalog_query_rows(
             &state,
             &target,
@@ -96,11 +96,11 @@ pub async fn op_db_catalog(
             .and_then(|v| v.as_str())
             .unwrap_or("table")
             .to_string();
-        let sql = match super::introspect::mysql_show_create_typed(&a, &object_type) {
-            Ok(s) => s,
-            Err(e) => return Err(JsErrorBox::generic(e)),
-        };
-        // scoped 已在上面拒绝，此处恒无 scope。
+        let sql = match &scope {
+            Some(_) => super::introspect::mysql_show_create_scoped(&render_name, &object_type),
+            None => super::introspect::mysql_show_create_typed(&render_name, &object_type),
+        }
+        .map_err(JsErrorBox::generic)?;
         return run_catalog_sql(state, target, name, kind, dialect, sql, Vec::new(), None).await;
     }
     let mut sql = match super::introspect::catalog_sql(kind, dialect) {

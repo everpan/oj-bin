@@ -358,6 +358,15 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "ddlDiff: missing name".to_string())?;
     let t = quote_ident(d, name)?;
+    // REQ-09-2 schema 定向：可选独立 schema 段 → 表引用两段引用渲染（语句全走 t；
+    // diff 输出键仍用裸 name，零变化）。缺省行为与既有测试钉死的一致。
+    let t = match spec.get("schema").and_then(Value::as_str) {
+        Some(s) => format!(
+            "{}.{t}",
+            quote_ident(d, s).map_err(|e| format!("ddlDiff: invalid schema: {e}"))?
+        ),
+        None => t,
+    };
     let to = spec
         .get("to")
         .ok_or_else(|| "ddlDiff: missing to".to_string())?;
@@ -1110,6 +1119,60 @@ mod tests {
             ddl_diff(Dialect::Postgres, &spec).unwrap(),
             ddl_diff(Dialect::MySql, &spec).unwrap(),
         )
+    }
+
+    /// REQ-09-2（v0.1.112）：可选 schema 段 → 表引用两段引用渲染（create + alter 两路径）。
+    #[test]
+    fn schema_field_two_part_quoting_pg_mysql() {
+        let spec = json!({"objectType":"table","schema":"public","name":"t","from":Value::Null,
+          "to":{"columns":[{"name":"id","nativeType":"int4"}]}});
+        let (pg, my) = both(spec);
+        assert!(
+            pg["statements"][0]
+                .as_str()
+                .unwrap()
+                .contains("\"public\".\"t\"")
+        );
+        assert!(
+            my["statements"][0]
+                .as_str()
+                .unwrap()
+                .contains("`public`.`t`")
+        );
+        // alter 路径同样两段引用。
+        let spec2 = json!({"objectType":"table","schema":"app","name":"t",
+          "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+          "to":{"columns":[{"name":"id","nativeType":"int8"}]}});
+        let (pg2, my2) = both(spec2);
+        let p = pg2["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let m = my2["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(p.contains("ALTER TABLE \"app\".\"t\""), "{p}");
+        assert!(m.contains("ALTER TABLE `app`.`t`"), "{m}");
+        // diff 输出键仍用裸名。
+        assert_eq!(pg2["diff"]["columns"]["changed"][0]["name"], json!("id"));
+    }
+
+    /// schema 段 NUL/控制字符拒绝（注入防线同 quote_ident，错误须点名 schema）。
+    #[test]
+    fn schema_segment_nul_rejected() {
+        let spec = json!({"objectType":"table","schema":"a\u{0}b","name":"t","from":Value::Null,
+          "to":{"columns":[{"name":"id","nativeType":"int4"}]}});
+        let e = ddl_diff(Dialect::Postgres, &spec).unwrap_err();
+        assert!(e.contains("schema"), "{e}");
+        let e = ddl_diff(Dialect::MySql, &spec).unwrap_err();
+        assert!(e.contains("schema"), "{e}");
     }
 
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。

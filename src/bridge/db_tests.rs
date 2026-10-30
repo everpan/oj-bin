@@ -2832,8 +2832,9 @@ async fn explain_plan_real_pg_mysql() {
 
 /// U-14（v0.1.109，env-gated 真库腿）：MySQL `SHOW CREATE TABLE` 激活——
 /// `db.catalog("ddl", t)` 在 mysql 上产出 CREATE TABLE 源码（当前 catalog_sql 查表
-/// 先行返回 None，SHOW 拦截是死代码——本腿钉住前置修复）；scoped 先例不破：
-/// `forSchema(...).catalog("ddl", ...)` 仍 `OJ_DB_UNSUPPORTED(capability="for_schema")`。
+/// 先行返回 None，SHOW 拦截是死代码——本腿钉住前置修复）；REQ-09-2 修订：
+/// `forSchema(...).catalog("ddl", ...)` 改为两段引用透传（scope=当前库时与无 scope
+/// 等价；其余 kind 的 for_schema unsupported 语义不动）。
 /// 仅 OJ_TEST_MYSQL 有 DSN 才跑；未设则 skip。
 #[tokio::test(flavor = "current_thread")]
 async fn catalog_ddl_mysql_show_create_real() {
@@ -2869,9 +2870,8 @@ async fn catalog_ddl_mysql_show_create_real() {
             r#"(async () => {
                  try {
                    const r = await db.catalog("ddl", "oj_ddl_t");
-                   const scoped = await db.forSchema("ojtest").catalog("ddl", "oj_ddl_t")
-                     .then(() => null, (e) => ({ code: e.code, capability: e.data && e.data.capability }));
-                   json.ok({ ok: true, items: r.items, scoped });
+                   const scoped = await db.forSchema("ojtest").catalog("ddl", "oj_ddl_t");
+                   json.ok({ ok: true, items: r.items, scoped: scoped.items });
                  } catch (e) {
                    json.ok({ ok: false, code: e.code, msg: String(e) });
                  }
@@ -2892,11 +2892,12 @@ async fn catalog_ddl_mysql_show_create_real() {
         "ddl 须为 SHOW CREATE 输出: {ddl}"
     );
     assert!(ddl.contains("AUTO_INCREMENT"), "含自增声明: {ddl}");
-    assert_eq!(
-        d["scoped"]["code"], "OJ_DB_UNSUPPORTED",
-        "scoped 先例须保持: {d}"
+    // REQ-09-2：scoped 先例改为透传——scope=当前库时与无 scope 等价。
+    let sddl = d["scoped"][0]["ddl"].as_str().unwrap_or("");
+    assert!(
+        sddl.contains("CREATE TABLE `oj_ddl_t`"),
+        "scoped ddl 须为两段引用 SHOW CREATE 输出: {sddl}"
     );
-    assert_eq!(d["scoped"]["capability"], "for_schema", "{d}");
 }
 
 /// U-14（v0.1.109，env-gated 真库腿）：PG `db.catalog("ddl")` 的 relkind 路由——

@@ -264,6 +264,32 @@ pub fn mysql_show_create_typed(table: &str, object_type: &str) -> Result<String,
     ))
 }
 
+/// REQ-09-2：scoped（forSchema）形态——`schema.table` 两段各过 `[A-Za-z0-9_$]` 白名单，
+/// 渲染 `` `schema`.`table` ``。仅 Ddl 的 MySQL SHOW 例外路径使用。
+pub fn mysql_show_create_scoped(schema_table: &str, object_type: &str) -> Result<String, String> {
+    let Some((sch, tbl)) = schema_table.split_once('.') else {
+        return Err(format!(
+            "invalid scoped identifier for SHOW CREATE: {schema_table:?}"
+        ));
+    };
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+    };
+    if !ok(sch) || !ok(tbl) {
+        return Err(format!(
+            "invalid scoped identifier for SHOW CREATE: {schema_table:?}"
+        ));
+    }
+    Ok(format!(
+        "{} `{}`.`{}`",
+        mysql_show_verb(object_type),
+        sch.replace('`', "``"),
+        tbl.replace('`', "``")
+    ))
+}
+
 /// REQ-08 §3.2：MySQL ddl 路由的对象类型探测（名字跨表/视图/例程三查合一；
 /// 绑定参数 ×3，DATABASE() 谓词照铁律）。返回首行 object_type（无 → 空行集）。
 pub const MYSQL_OBJECT_TYPE: &str = "SELECT 'table' AS object_type \
@@ -1667,6 +1693,26 @@ mod tests {
         );
         for bad in ["t; DROP TABLE x", "t`", "", "粗", "t a"] {
             assert!(mysql_show_create_typed(bad, "table").is_err(), "{bad:?}");
+        }
+        // REQ-09-2：scoped 两段形态——各段独立白名单 + 反引号引用。
+        assert_eq!(
+            mysql_show_create_scoped("app.t", "table").unwrap(),
+            "SHOW CREATE TABLE `app`.`t`"
+        );
+        assert_eq!(
+            mysql_show_create_scoped("db1.v1", "view").unwrap(),
+            "SHOW CREATE VIEW `db1`.`v1`"
+        );
+        for bad in [
+            "app.t.x",
+            "app.t; DROP",
+            "app`.t",
+            ".t",
+            "app.",
+            "粗.t",
+            "app.粗",
+        ] {
+            assert!(mysql_show_create_scoped(bad, "table").is_err(), "{bad:?}");
         }
     }
 
