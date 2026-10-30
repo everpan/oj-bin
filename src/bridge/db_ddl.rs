@@ -455,11 +455,16 @@ fn ddl_diff_object(d: Dialect, spec: &Value) -> Result<Value, String> {
                         return Err(format!("ddlDiff: unknown routine type {other:?}"));
                     }
                 };
-                let args = from_v
-                    .get("args")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "ddlDiff: from.args is required for routine drop".to_string())?;
-                stmts.push(format!("DROP {kw} {t}({args})"));
+                // 评审 I-2：签名是 PG 专属语法（DROP FUNCTION name(args)）；MySQL
+                // DROP FUNCTION/PROCEDURE 只接裸名——给签名反而 1064。
+                if d == Dialect::MySql {
+                    stmts.push(format!("DROP {kw} {t}"));
+                } else {
+                    let args = from_v.get("args").and_then(Value::as_str).ok_or_else(|| {
+                        "ddlDiff: from.args is required for routine drop".to_string()
+                    })?;
+                    stmts.push(format!("DROP {kw} {t}({args})"));
+                }
             }
             "trigger" => stmts.push(format!("DROP TRIGGER {t}")),
             _ => unreachable!(),
@@ -528,23 +533,27 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         return Err("ddlDiff: to must not be null for objectType \"table\"".into());
     }
     // G4（REQ-09 §4.1 表改名缺口）：spec 顶层可选 previousName——与 name 相同或
-    // create 路径（from=null）时忽略（同列 rename 同名跳过语义）。
-    let table_rename: Option<(&str, String)> = match (
-        spec.get("previousName").and_then(Value::as_str),
-        spec.get("from").filter(|v| !v.is_null()),
-    ) {
-        (Some(p), Some(_)) if p != name => {
-            let t_old = quote_ident(d, p)?;
-            let t_old = match spec.get("schema").and_then(Value::as_str) {
-                Some(s) => format!(
-                    "{}.{t_old}",
-                    quote_ident(d, s).map_err(|e| format!("ddlDiff: invalid schema: {e}"))?
-                ),
-                None => t_old,
-            };
-            Some((p, t_old))
+    // create 路径（from=null）时忽略（同列 rename 同名跳过语义）。t_bare = RENAME TO
+    // 目标（裸标识符）；t_old = 旧引用（schema 段两段限定）。
+    let (table_rename, t_bare): (Option<(&str, String)>, String) = {
+        let t_bare = quote_ident(d, name)?;
+        match (
+            spec.get("previousName").and_then(Value::as_str),
+            spec.get("from").filter(|v| !v.is_null()),
+        ) {
+            (Some(p), Some(_)) if p != name => {
+                let t_old = quote_ident(d, p)?;
+                let t_old = match spec.get("schema").and_then(Value::as_str) {
+                    Some(s) => format!(
+                        "{}.{t_old}",
+                        quote_ident(d, s).map_err(|e| format!("ddlDiff: invalid schema: {e}"))?
+                    ),
+                    None => t_old,
+                };
+                (Some((p, t_old)), t_bare)
+            }
+            _ => (None, t_bare),
         }
-        _ => None,
     };
     let from_v = spec.get("from");
 
@@ -1187,9 +1196,10 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     }
 
     // G4：表改名——RENAME 恒首条（先于一切列/约束/索引语句），diff.renamed 表级挂点
-    // （与 diff.columns 平级；恒在，无改名为空数组）。
+    // （与 diff.columns 平级；恒在，无改名为空数组）。RENAME TO 目标只许裸标识符
+    // （评审 I-1：两方言同律）；旧引用保留 schema 段两段限定。
     if let Some((p, t_old)) = table_rename {
-        stmts.insert(0, format!("ALTER TABLE {t_old} RENAME TO {t}"));
+        stmts.insert(0, format!("ALTER TABLE {t_old} RENAME TO {t_bare}"));
         diff.insert("renamed".into(), json!([{"from": p, "to": name}]));
     } else {
         diff.insert("renamed".into(), json!([]));
@@ -1797,10 +1807,11 @@ mod tests {
         );
     }
 
-    /// G4：schema 段 + 表改名两段引用。
+    /// G4：schema 段 + 表改名——旧引用两段限定，但 RENAME TO 目标**只许裸标识符**
+    /// （评审 I-1：PG/MySQL 同律，跨 schema 移动是 SET SCHEMA / RENAME TABLE 的另语义）。
     #[test]
     fn table_rename_with_schema() {
-        let (pg, _) = both(
+        let (pg, my) = both(
             json!({"objectType":"table","schema":"public","name":"t_new",
             "previousName":"t_old",
             "from":{"columns":[{"name":"id","nativeType":"int4"}]},
@@ -1808,8 +1819,36 @@ mod tests {
         );
         assert_eq!(
             pg["statements"][0],
-            json!("ALTER TABLE \"public\".\"t_old\" RENAME TO \"public\".\"t_new\"")
+            json!("ALTER TABLE \"public\".\"t_old\" RENAME TO \"t_new\"")
         );
+        assert_eq!(
+            my["statements"][0],
+            json!("ALTER TABLE `public`.`t_old` RENAME TO `t_new`")
+        );
+    }
+
+    /// 评审 I-2：MySQL routine drop 不接受签名（PG 专属语法）——MySQL 分支渲染
+    /// 裸 `DROP FUNCTION/PROCEDURE name`，args 仅 PG 需要。
+    #[test]
+    fn mysql_routine_drop_omits_signature() {
+        let d = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"routine","name":"f",
+                "from":{"definition":"CREATE FUNCTION f() RETURNS int RETURN 1",
+                        "type":"function","args":""},
+                "to":Value::Null}),
+        )
+        .unwrap();
+        assert_eq!(d["statements"][0], json!("DROP FUNCTION `f`"));
+        let d2 = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"routine","name":"p",
+                "from":{"definition":"CREATE PROCEDURE p() BEGIN END",
+                        "type":"procedure","args":""},
+                "to":Value::Null}),
+        )
+        .unwrap();
+        assert_eq!(d2["statements"][0], json!("DROP PROCEDURE `p`"));
     }
 
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
@@ -2222,7 +2261,8 @@ mod tests {
         ] {
             db.exec_with_params(ddl, &[]).await.unwrap();
         }
-        let spec = json!({"objectType":"table","name":"t_g4_new","previousName":"t_g4_old",
+        let spec = json!({"objectType":"table","schema":"public","name":"t_g4_new",
+            "previousName":"t_g4_old",
             "from":{"columns":[{"name":"id","nativeType":"int4"}]},
             "to":{"columns":[{"name":"id","nativeType":"int4"}]}});
         let out = ddl_diff(Dialect::Postgres, &spec).unwrap();

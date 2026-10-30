@@ -4409,5 +4409,5 @@ export default {
 | 坑 | 解 |
 |---|---|
 | 和列改名混用 | 表 RENAME 恒首条，列 RENAME 次之且用新表名——顺序已钉，无需手工排 |
-| schema 段 | `"schema"."old"` RENAME TO `"schema"."new"` 两段引用 |
+| schema 段 | 旧引用两段限定（`"schema"."old"`），但 RENAME TO 目标只许裸名（`RENAME TO "new"`）——两方言同律，跨 schema 移动另走 SET SCHEMA |
 | `to: null` 想删表 | 参数错误（v0.1.113 起）——ddlDiff 不产 DROP TABLE，删表走显式迁移 |
