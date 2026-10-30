@@ -75,6 +75,8 @@ pub enum Finish {
         truncated: bool,
         truncated_reason: Option<&'static str>,
         blob_key: String,
+        /// REQ-07a：语句级降级清单（`$<type>:` 编码列的权威判定面；产物单元格原样）。
+        degraded: Vec<serde_json::Value>,
     },
     Failed {
         rows: u64,
@@ -99,6 +101,9 @@ struct ExportEntry {
     finished_at_ms: Option<u64>,
     error: Option<String>,
     blob_key: Option<String>,
+    /// REQ-07a：语句级降级清单（Done 终态写入；运行中为空——清单随 pump 累积后随
+    /// Finish 一次性提交）。
+    degraded: Vec<serde_json::Value>,
     /// 取消信令：exportCancel 置 `cancel_requested` 后 notify，消费任务 pump 循环监听。
     cancel: Arc<tokio::sync::Notify>,
     cancel_requested: bool,
@@ -188,6 +193,7 @@ impl ExportRegistry {
                 finished_at_ms: None,
                 error: None,
                 blob_key: None,
+                degraded: Vec::new(),
                 cancel: Arc::new(tokio::sync::Notify::new()),
                 cancel_requested: false,
             },
@@ -247,6 +253,7 @@ impl ExportRegistry {
                     truncated,
                     truncated_reason,
                     blob_key,
+                    degraded,
                 } => {
                     e.state = ExportState::Done;
                     e.rows = rows;
@@ -254,6 +261,7 @@ impl ExportRegistry {
                     e.truncated = truncated;
                     e.truncated_reason = truncated_reason;
                     e.blob_key = Some(blob_key.clone());
+                    e.degraded = degraded;
                     ledger_key = Some(blob_key);
                 }
                 Finish::Failed { rows, bytes, error } => {
@@ -298,6 +306,7 @@ impl ExportRegistry {
             "finishedAtMs": e.finished_at_ms,
             "error": e.error,
             "blobKey": e.blob_key,
+            "degraded": e.degraded,
         }))
     }
 
@@ -619,6 +628,8 @@ pub async fn op_db_export(
         let mut buf: Vec<u8> = Vec::new();
         let mut rows: u64 = 0;
         let mut bytes: u64 = 0;
+        // REQ-07a：降级列清单随 pump 累积（按 {col,type} 去重），随 Finish 一次提交。
+        let mut degraded_acc: Vec<serde_json::Value> = Vec::new();
         // 节流：每 N 行让出运行时（工程 B-3：防大导出饿死 current_thread 上的 JS）。
         const THROTTLE_EVERY: u64 = 256;
         enum End {
@@ -646,6 +657,11 @@ pub async fn op_db_export(
                     let written = enc.push(&row, &mut buf);
                     rows += 1;
                     bytes += written;
+                    for d in oj_plugin_ffi::cellenv::degraded_of(std::slice::from_ref(&row)) {
+                        if !degraded_acc.contains(&d) {
+                            degraded_acc.push(d);
+                        }
+                    }
                     if bytes > max_bytes {
                         break End::MaxBytes;
                     }
@@ -687,6 +703,7 @@ pub async fn op_db_export(
                         truncated,
                         truncated_reason: truncated.then_some("max_rows"),
                         blob_key: blob_key.clone(),
+                        degraded: degraded_acc,
                     }
                 } else {
                     Finish::Failed {
@@ -856,6 +873,54 @@ mod tests {
             user: Some(json!({ "id": id })),
             ..Default::default()
         }
+    }
+
+    /// REQ-07a：导出任务状态携带语句级降级清单（`degraded`）——CSV/JSONL 产物里
+    /// `$<type>:` 编码值的权威判定面（产物本身不改，单元格字符串原样落盘）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_status_carries_degraded_columns() {
+        let mem = Arc::new(InMemoryAccessor::new());
+        mem.seed([
+            json!({"ip": "$inet:AQI=", "name": "a"}),
+            json!({"ip": "$inet:AgM=", "name": "b"}),
+        ]);
+        let (_d, blobs) = tmp_blobs();
+        let b = export_bridge(mem, blobs.clone(), Default::default(), Default::default());
+        let js = r#"(async () => {
+            const { taskId } = await db.export({ sql: "select * from t", format: "csv" });
+            json.ok({ taskId });
+          })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let task_id = v["data"]["taskId"].as_str().unwrap().to_string();
+        let st = wait_terminal(&b, &task_id, &Default::default()).await;
+        assert_eq!(st["state"], json!("done"), "{st}");
+        // 按 {col,type} 去重。
+        assert_eq!(
+            st["degraded"],
+            json!([{"col": "ip", "type": "inet"}]),
+            "{st}"
+        );
+    }
+
+    /// REQ-07a 对照面：无降级单元格的导出显式给 `degraded: []`（schema 稳定，消费方
+    /// 不必判缺席）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn export_status_degraded_empty_when_clean() {
+        let mem = Arc::new(InMemoryAccessor::new());
+        mem.seed([json!({"id": 1, "name": "a"})]);
+        let (_d, blobs) = tmp_blobs();
+        let b = export_bridge(mem, blobs.clone(), Default::default(), Default::default());
+        let js = r#"(async () => {
+            const { taskId } = await db.export({ sql: "select * from t", format: "jsonl" });
+            json.ok({ taskId });
+          })().catch(e => json.fail(500, String(e)));"#;
+        let cap = b.run_with(js, Default::default()).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        let task_id = v["data"]["taskId"].as_str().unwrap().to_string();
+        let st = wait_terminal(&b, &task_id, &Default::default()).await;
+        assert_eq!(st["state"], json!("done"), "{st}");
+        assert_eq!(st["degraded"], json!([]), "{st}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1187,6 +1252,7 @@ mod tests {
                 truncated: true,
                 truncated_reason: Some("max_rows"),
                 blob_key: "export/abc".into(),
+                degraded: Vec::new(),
             },
         );
         let st = reg.status(&id, &owner("u1")).expect("own id");
@@ -1315,6 +1381,7 @@ mod tests {
                 truncated: false,
                 truncated_reason: None,
                 blob_key: "export/live".into(),
+                degraded: Vec::new(),
             },
         );
         lock(&reg.ledger).insert("export/live".into(), now - 25 * 3_600_000);
