@@ -39,6 +39,10 @@ pub enum Kind {
     Comment,
     Constraints,
     Stats,
+    // ---- REQ-10 一期（v0.1.112）：全实例/全库运维面（拒绝 scope，见 op 拦截）----
+    Processlist,
+    Users,
+    Roles,
 }
 
 impl Kind {
@@ -55,6 +59,9 @@ impl Kind {
             Kind::Comment => "comment",
             Kind::Constraints => "constraints",
             Kind::Stats => "stats",
+            Kind::Processlist => "processlist",
+            Kind::Users => "users",
+            Kind::Roles => "roles",
         }
     }
 
@@ -78,6 +85,9 @@ impl Kind {
             "comment" => Kind::Comment,
             "constraints" => Kind::Constraints,
             "stats" => Kind::Stats,
+            "processlist" => Kind::Processlist,
+            "users" => Kind::Users,
+            "roles" => Kind::Roles,
             _ => return None,
         })
     }
@@ -636,6 +646,32 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
                   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                   WHERE c.relkind = 'r' AND n.nspname = current_schema() ORDER BY c.relname",
         ),
+        // ---------------- REQ-10 一期：processlist / users / roles（全实例/全库，无范围谓词）----------------
+        (Kind::Processlist, Dialect::Postgres) => Some(
+            "SELECT pid AS id, usename::text AS \"user\", datname::text AS database, \
+                  client_addr::text AS host, state, \
+                  EXTRACT(EPOCH FROM now() - query_start)::bigint AS elapsed_sec, \
+                  query \
+                  FROM pg_stat_activity",
+        ),
+        (Kind::Processlist, Dialect::MySql) => Some(
+            "SELECT id, user, db AS `database`, host, command AS state, \
+                  time AS elapsed_sec, info AS query \
+                  FROM information_schema.processlist",
+        ),
+        (Kind::Users, Dialect::Postgres) => {
+            Some("SELECT usename::text AS name, NULL::text AS host FROM pg_user ORDER BY usename")
+        }
+        (Kind::Users, Dialect::MySql) => {
+            Some("SELECT user AS name, host FROM mysql.user ORDER BY user, host")
+        }
+        (Kind::Roles, Dialect::Postgres) => {
+            Some("SELECT rolname::text AS name FROM pg_roles ORDER BY rolname")
+        }
+        (Kind::Roles, Dialect::MySql) => Some(
+            "SELECT DISTINCT role_name AS name FROM information_schema.applicable_roles \
+                  ORDER BY role_name",
+        ),
         _ => None,
     }
 }
@@ -643,7 +679,11 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
 /// catalog 行 → 统一 item 形态（截断到 [`MAX_ROWS`]；三方言同构）。
 /// constraints 按 `name` 聚合 `columns`（mysql 的 key_column_usage 是按列多行；
 /// pg 的 definition 自带列信息，`column` 为 NULL 不入聚合）。
-pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
+///
+/// 返回 `(items, truncated)`：truncated = 入参行数超 `MAX_ROWS`（REQ-08 §3.5 信令；
+/// constraints 组的组数截断取行数口径近似——组数 ≤ 行数，旗标偏保守不丢信令）。
+pub fn catalog(kind: Kind, rows: Vec<Value>) -> (Vec<Value>, bool) {
+    let truncated = rows.len() > MAX_ROWS;
     match kind {
         Kind::Constraints => {
             let mut out: Vec<Value> = Vec::new();
@@ -677,45 +717,63 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> Vec<Value> {
                     last["columns"].as_array_mut().unwrap().push(json!(col));
                 }
             }
-            out
+            (out, truncated)
         }
-        _ => rows
-            .iter()
-            .take(MAX_ROWS)
-            .map(|r| match kind {
-                Kind::Views | Kind::Ddl => {
-                    // mysql SHOW CREATE 的列名是 `Table`/`Create Table`（View 同理）——
-                    // name/ddl 都要兜回退（评审 R.1：mysql 侧 name 恒空串）。
-                    let name = {
-                        let n = str_of(r, "name");
-                        if n.is_empty() {
-                            str_of(r, "Table")
-                        } else {
-                            n
-                        }
-                    };
-                    json!({
-                        "name": name,
-                        "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))).or_else(|| opt_str(r.get("Create View"))),
-                    })
-                }
-                Kind::Routines | Kind::Sequences => json!({
-                    "name": str_of(r, "name"),
-                    "type": str_of(r, "type"),
-                }),
-                Kind::Comment => json!({
-                    "table": str_of(r, "table_name"),
-                    "column": str_of(r, "column_name"),
-                    "comment": opt_str(r.get("comment")),
-                }),
-                Kind::Stats => json!({
-                    "name": str_of(r, "name"),
-                    "rowsEstimate": num_of(r, "rows_estimate"),
-                    "sizeBytes": num_of(r, "size_bytes"),
-                }),
-                _ => json!({}),
-            })
-            .collect(),
+        _ => (
+            rows.iter()
+                .take(MAX_ROWS)
+                .map(|r| match kind {
+                    Kind::Views | Kind::Ddl => {
+                        // mysql SHOW CREATE 的列名是 `Table`/`Create Table`（View 同理）——
+                        // name/ddl 都要兜回落（评审 R.1：mysql 侧 name 恒空串）。
+                        let name = {
+                            let n = str_of(r, "name");
+                            if n.is_empty() {
+                                str_of(r, "Table")
+                            } else {
+                                n
+                            }
+                        };
+                        json!({
+                            "name": name,
+                            "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))).or_else(|| opt_str(r.get("Create View"))),
+                        })
+                    }
+                    Kind::Routines | Kind::Sequences => json!({
+                        "name": str_of(r, "name"),
+                        "type": str_of(r, "type"),
+                    }),
+                    Kind::Comment => json!({
+                        "table": str_of(r, "table_name"),
+                        "column": str_of(r, "column_name"),
+                        "comment": opt_str(r.get("comment")),
+                    }),
+                    Kind::Stats => json!({
+                        "name": str_of(r, "name"),
+                        "rowsEstimate": num_of(r, "rows_estimate"),
+                        "sizeBytes": num_of(r, "size_bytes"),
+                    }),
+                    Kind::Processlist => json!({
+                        "id": r.get("id").cloned().unwrap_or(Value::Null),
+                        "user": str_of(r, "user"),
+                        "database": opt_str(r.get("database")),
+                        "host": opt_str(r.get("host")),
+                        "state": opt_str(r.get("state")),
+                        "elapsedSec": r.get("elapsed_sec").cloned().unwrap_or(Value::Null),
+                        "query": opt_str(r.get("query")),
+                    }),
+                    Kind::Users => json!({
+                        "name": str_of(r, "name"),
+                        "host": opt_str(r.get("host")),
+                    }),
+                    Kind::Roles => json!({
+                        "name": str_of(r, "name"),
+                    }),
+                    _ => json!({}),
+                })
+                .collect(),
+            truncated,
+        ),
     }
 }
 
@@ -1111,9 +1169,39 @@ mod tests {
         assert_eq!(fk[0]["refTable"], json!("p"));
     }
 
+    /// REQ-10 一期（v0.1.112）：全实例/全库语义的三个新 kind——形状 + truncated 旗标。
+    /// catalog() 返回 `(items, truncated)`（truncated = 入参行数 > MAX_ROWS）。
+    #[test]
+    fn catalog_new_kinds_shape_and_truncated() {
+        let (items, truncated) = catalog(
+            Kind::Processlist,
+            vec![json!({
+                "id": 1, "user": "u", "database": "d", "host": "h",
+                "state": "active", "elapsed_sec": 3, "query": "select 1"
+            })],
+        );
+        assert!(!truncated);
+        let it = &items[0];
+        assert_eq!(it["id"], json!(1));
+        assert_eq!(it["state"], "active");
+        assert!(it.get("elapsedSec").is_some(), "{it:?}");
+        assert!(
+            it.get("user").is_some() && it.get("query").is_some(),
+            "{it:?}"
+        );
+        let (_, t) = catalog(
+            Kind::Users,
+            vec![json!({"name": "u", "host": "h"}); MAX_ROWS + 1],
+        );
+        assert!(t, "超 MAX_ROWS 必须给 truncated 旗标");
+        let (roles, f) = catalog(Kind::Roles, vec![json!({"name": "r"})]);
+        assert!(!f);
+        assert_eq!(roles[0]["name"], "r");
+    }
+
     // ---- U-14 批 a：catalog 类的静态守卫（同一组离线防线扩展）----
 
-    const CATALOG: [Kind; 7] = [
+    const CATALOG: [Kind; 10] = [
         Kind::Views,
         Kind::Routines,
         Kind::Sequences,
@@ -1121,6 +1209,9 @@ mod tests {
         Kind::Comment,
         Kind::Constraints,
         Kind::Stats,
+        Kind::Processlist,
+        Kind::Users,
+        Kind::Roles,
     ];
 
     /// BUG-02 守卫：`key_column_usage` JOIN 必须含 table_name 关联。MySQL 全库 PK
@@ -1161,7 +1252,7 @@ mod tests {
                 .query_with_params(sql, &[serde_json::json!(table)])
                 .await
                 .unwrap();
-            let items = catalog(Kind::Constraints, rows);
+            let (items, _) = catalog(Kind::Constraints, rows);
             let mut cols: Vec<&str> = items
                 .iter()
                 .flat_map(|it| it["columns"].as_array().into_iter().flatten())
@@ -1185,6 +1276,10 @@ mod tests {
             let Some(s) = catalog_sql(kind, Dialect::Postgres) else {
                 continue;
             };
+            // REQ-10 一期：全实例/全库 kind 无 schema 范围语义，豁免范围限定与投影钉集。
+            if matches!(kind, Kind::Processlist | Kind::Users | Kind::Roles) {
+                continue;
+            }
             for id in ["attname", "relname", "conname", "proname", "sequencename"] {
                 let bare = String::from(id) + " AS";
                 let cast = String::from(id) + "::text";
@@ -1231,6 +1326,9 @@ mod tests {
             Kind::Comment,
             Kind::Constraints,
             Kind::Stats,
+            Kind::Processlist,
+            Kind::Users,
+            Kind::Roles,
         ] {
             assert!(
                 catalog_sql(kind, Dialect::Sqlite).is_none(),
@@ -1502,7 +1600,7 @@ mod tests {
     /// catalog 归一：constraints 按名聚合列；stats 解析字符串数值（pg ::text 口径）。
     #[test]
     fn catalog_normalization() {
-        let cs = catalog(
+        let (cs, _) = catalog(
             Kind::Constraints,
             vec![
                 json!({"name": "pk_t", "type": "PRIMARY KEY", "definition": null, "column": "id", "pos": 1}),
@@ -1514,7 +1612,7 @@ mod tests {
         assert_eq!(cs[0]["type"], json!("pk"));
         assert_eq!(cs[0]["columns"], json!(["id", "code"]));
 
-        let st = catalog(
+        let (st, _) = catalog(
             Kind::Stats,
             vec![json!({"name": "t", "rows_estimate": "42", "size_bytes": "8192"})],
         );

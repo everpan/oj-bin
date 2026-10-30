@@ -1085,7 +1085,9 @@ globalThis.DB = function (name) {
       // {kind, dialect, items}. kinds: views | routines | sequences | ddl | comment |
       // constraints | stats (per-dialect support matrix in db-guide section 10; unsupported
       // kinds reject with OJ_DB_UNSUPPORTED, never silent). ddl/comment/constraints
-      // take a table name arg; views/routines/sequences/stats are whole-db.
+      // take a table name arg; views/routines/sequences/stats are whole-db. REQ-10 (v0.1.112)
+      // adds processlist/users/roles (whole-instance, scope rejected) and a top-level
+      // `truncated: boolean` signal when rows exceed the 1000-row catalog cap.
       catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg), null)),
       // U-14 reverse DDL (v0.1.109): pure renderer, zero DB I/O. {objectType:"table", name,
       // from, to} -> {diff, statements, warnings}; absent dimension = skip, empty array = drop all.

@@ -29,7 +29,7 @@ pub async fn op_db_catalog(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let kind = super::introspect::Kind::parse_catalog(&kind).ok_or_else(|| {
         JsErrorBox::generic(format!(
-            "db catalog: unknown kind {kind:?} (views|routines|sequences|ddl|comment|constraints|stats)"
+            "db catalog: unknown kind {kind:?} (views|routines|sequences|ddl|comment|constraints|stats|processlist|users|roles)"
         ))
     })?;
     let target = resolve_target(&state, &name)?;
@@ -39,6 +39,21 @@ pub async fn op_db_catalog(
     };
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::granted_only(&state, &alias)?;
+
+    // REQ-10 一期：全实例/全库语义的 kind 拒绝 scope——scoped_sql 的绑定参数替换
+    // 模型套不上（无范围谓词可替换），显式 unsupported 绝不静默内联。
+    if matches!(
+        kind,
+        super::introspect::Kind::Processlist
+            | super::introspect::Kind::Users
+            | super::introspect::Kind::Roles
+    ) && scope.is_some()
+    {
+        return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
+            dialect.as_str(),
+            "for_schema",
+        ))));
+    }
 
     // U-14（v0.1.109）PG 路由：Ddl × Postgres 先 relkind 探测再分派
     // （视图行为钉死 / 表 → Task 3 拼接器 / 其余 → 空结果）。
@@ -82,7 +97,7 @@ pub async fn op_db_catalog(
         if !valid_introspect_table(dialect, t) {
             // 畸形 / 跨库前缀 → 空结果（与 L2 同口径：不报错、不泄漏）。
             return Ok(serde_json::json!({
-                "kind": kind.capability(), "dialect": dialect.as_str(), "items": []
+                "kind": kind.capability(), "dialect": dialect.as_str(), "items": [], "truncated": false
             }));
         }
         vec![Value::String(t.to_string())]
@@ -105,7 +120,7 @@ async fn pg_ddl_dispatch(
 ) -> Result<serde_json::Value, JsErrorBox> {
     let empty = || {
         serde_json::json!({
-            "kind": kind.capability(), "dialect": dialect.as_str(), "items": []
+            "kind": kind.capability(), "dialect": dialect.as_str(), "items": [], "truncated": false
         })
     };
     let t = arg.as_deref().unwrap_or("");
@@ -327,7 +342,7 @@ async fn run_catalog_sql(
         }
         Ok(Scope::Empty) => {
             return Ok(serde_json::json!({
-                "kind": kind.capability(), "dialect": dialect.as_str(), "items": []
+                "kind": kind.capability(), "dialect": dialect.as_str(), "items": [], "truncated": false
             }));
         }
         Err(e) => return Err(to_js_err(Box::new(e))),
@@ -347,7 +362,7 @@ async fn run_catalog_sql(
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     match res {
         Ok(rows) => {
-            let items = super::introspect::catalog(kind, rows);
+            let (items, truncated) = super::introspect::catalog(kind, rows);
             trace_sql(
                 &state,
                 &sql,
@@ -362,7 +377,8 @@ async fn run_catalog_sql(
                 None,
             );
             Ok(serde_json::json!({
-                "kind": kind.capability(), "dialect": dialect.as_str(), "items": items
+                "kind": kind.capability(), "dialect": dialect.as_str(),
+                "items": items, "truncated": truncated,
             }))
         }
         Err(e) => {
