@@ -409,13 +409,31 @@ fn bind_value_pg<'q>(
     }
 }
 
-/// typed PG 版行转换（镜像 `row_to_json` 的 try 链；未知类型响亮报错，不静默 null）。
+/// typed PG 版行转换（镜像 `row_to_json` 的 try 链；未解码类型降级为 cellenv 前缀
+/// 标量，拿原始字节失败才响亮报错）。
 fn row_to_json_pg(row: &PgRow) -> Result<serde_json::Value, String> {
     let mut obj = serde_json::Map::new();
     for col in row.columns() {
         let name = safe_ident(col.name());
-        let val = column_json_pg(row, col)
-            .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
+        let val = match column_json_pg(row, col) {
+            Some(v) => v,
+            None => {
+                // REQ-07a：未解码类型降级为 `$<type>:<base64>`（type 名由 encode 小写化）。
+                // 语句级权威降级清单由宿主扫描外发（X-OJ-Degraded）；原始字节也拿不到
+                // 时才维持 `undecodable_column` 整行错误——绝不产空信封（红线）。
+                let raw = row
+                    .try_get_raw(col.ordinal())
+                    .ok()
+                    .and_then(|v| v.as_bytes().ok());
+                match raw {
+                    Some(b) => serde_json::Value::String(oj_plugin_ffi::cellenv::encode(
+                        col.type_info().name(),
+                        b,
+                    )),
+                    None => return Err(undecodable_column(&name, col.type_info().name())),
+                }
+            }
+        };
         obj.insert(name, val);
     }
     Ok(serde_json::Value::Object(obj))
@@ -1994,14 +2012,13 @@ mod tests {
         assert_eq!((cat, retry, disp), ("connection", true, "close"));
     }
 
-    /// 未解码的列类型必须响亮报错（env-gated，`OJ_TEST_PG`）：`point` / `interval` 这类
-    /// 本插件不覆盖的类型，池路径与 typed 流式路径**都要**走 `undecodable_column`
-    /// 点名列名+类型，**绝不静默 null 返回错值**。
-    ///
-    /// v0.1.3（L6 / U-6）把 `jsonb` 从本例移出（已可解码，见
-    /// `real_pg_dialect_types_decode_readable`），改钉仍不支持的 `point`。
+    /// REQ-07a env-gated（`OJ_TEST_PG`）：未解码类型不再整条 400——`inet`/`interval`/
+    /// `money` 降级为 `$<type>:<base64>` 前缀标量（cellenv 契约；见
+    /// `docs/superpowers/specs/2026-10-30-dbx-gap-triage-design.md`）。语句级权威
+    /// 降级清单由宿主扫描外发（`X-OJ-Degraded` 头），本例钉**单元格编码**形态。
+    /// `try_get_raw` 拿不到原始字节的类型维持 `undecodable_column` 响亮报错（红线）。
     #[tokio::test(flavor = "multi_thread")]
-    async fn real_postgres_unsupported_column_types_error_loudly() {
+    async fn real_pg_undecoded_types_degrade_to_cellenv() {
         let Ok(url) = std::env::var("OJ_TEST_PG") else {
             eprintln!("skip: OJ_TEST_PG unset");
             return;
@@ -2014,22 +2031,66 @@ mod tests {
             .as_u64()
             .unwrap();
 
-        // 池路径（typed PG）：行转换报错（点名列名 + 可执行提示）。
-        let e = drive(&mut query(
+        let bytes = drive(&mut query(
+            h,
+            RString::from(
+                "select '1.2.3.4'::inet as ip, \
+                        '1 mon 2 days'::interval as iv, \
+                        '$1.50'::money as m",
+            ),
+            RString::from("[]"),
+        ))
+        .await
+        .expect("未解码类型应降级为前缀标量而非整条 400");
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for (col, ty) in [("ip", "inet"), ("iv", "interval"), ("m", "money")] {
+            let v = rows[0][col]
+                .as_str()
+                .unwrap_or_else(|| panic!("{col} 应为字符串标量: {rows}"));
+            let (t, payload) = oj_plugin_ffi::cellenv::decode(v)
+                .unwrap_or_else(|| panic!("{col} 应为 cellenv 信封: {v:?}"));
+            assert_eq!(t, ty, "{col} 类型段不符");
+            assert!(!payload.is_empty(), "{col} payload 不得为空（空信封=红线）");
+        }
+        close(h);
+    }
+
+    /// REQ-07a 行为变更登记（env-gated，`OJ_TEST_PG`）：`point` 这类未覆盖类型自
+    /// v0.1.111 起**降级为 cellenv 前缀标量**（原行为：整条 400 `undecodable_column`，
+    /// 见本用例旧版）。池路径与 typed 流式路径**都要**降级，且形态一致；语句级权威
+    /// 降级清单由宿主外发（`X-OJ-Degraded` 头）。「原始字节也拿不到 → 整行报错」的
+    /// fail-loud 窄场景无真库类型可钉，由单测级不变式守（`row_to_json_pg` 不产空信封）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_postgres_unsupported_column_types_degrade_loudly() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+
+        // 池路径（typed PG）：降级为 `$point:<base64>`。
+        let bytes = drive(&mut query(
             h,
             RString::from("select point(1,2) as shape"),
             RString::from("[]"),
         ))
         .await
-        .unwrap_err();
-        assert!(e.contains("shape"), "报错须点名 shape 列: {e}");
-        assert!(e.contains("POINT"), "报错须点名 PG 类型 POINT: {e}");
-        assert!(
-            e.contains("cast(shape as text)"),
-            "应给出可执行的 SQL 提示: {e}"
-        );
+        .expect("未解码类型应降级而非 400");
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let (t, payload) = oj_plugin_ffi::cellenv::decode(
+            rows[0]["shape"].as_str().unwrap_or_else(|| panic!("应为标量: {rows}")),
+        )
+        .unwrap_or_else(|| panic!("应为 cellenv 信封: {rows}"));
+        assert_eq!(t, "point");
+        assert!(!payload.is_empty());
 
-        // typed 流式路径：行转换响亮报错（本修复守护的分支）。
+        // typed 流式路径：同一降级形态（错误只在「原始字节也拿不到」时出现，带内信封）。
         let bytes = drive(&mut stream_open(
             h,
             RString::from("select point(1,2) as shape"),
@@ -2040,15 +2101,18 @@ mod tests {
         let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
             .as_u64()
             .unwrap();
-        // 流式的错误**在带内**（`{"error":"…"}`，见 `stream_next` 的响应契约），
-        // 不像 `query` 那样走 `Err` 通道。
         let b = drive(&mut stream_next(h, sid)).await.expect("stream next");
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        let e = v["error"].as_str().unwrap_or_default();
         assert!(
-            e.contains("shape") && e.contains("decode"),
-            "typed 流式必须点名 shape 列而非静默 null: {v}"
+            v["error"].is_null(),
+            "流式未解码类型应降级而非带内报错: {v}"
         );
+        let row = v["rows"][0].clone();
+        let (t, _) = oj_plugin_ffi::cellenv::decode(
+            row["shape"].as_str().unwrap_or_else(|| panic!("流式应为标量: {v}")),
+        )
+        .unwrap_or_else(|| panic!("流式应为 cellenv 信封: {v}"));
+        assert_eq!(t, "point");
         close(h);
     }
 
