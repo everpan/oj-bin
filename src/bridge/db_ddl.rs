@@ -365,8 +365,13 @@ pub fn unsupported_capability_from_spec(d: Dialect, spec: &Value) -> Option<&'st
     if spec.get("objectType").and_then(Value::as_str) != Some("table") {
         return None;
     }
-    let from = spec.get("from");
-    let to = spec.get("to");
+    let from = spec.get("from").filter(|v| !v.is_null());
+    let to = spec.get("to").filter(|v| !v.is_null());
+    // 仅 alter 路径判定（两侧皆非 null）：create（from=null）由渲染路径消费这些字段，
+    // drop（to=null）无 diff 可言——都不是「变更」。
+    if from.is_none() || to.is_none() {
+        return None;
+    }
     fn part(side: Option<&Value>) -> Option<&str> {
         side.and_then(|v| v.get("partitionBy"))
             .and_then(Value::as_str)
@@ -537,8 +542,44 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                 .join(", ");
             format!(",\n  PRIMARY KEY ({cols})")
         };
+        // G1（REQ-09 §4.2）：建表保真——partitionBy（两方言）与 MySQL options
+        // 拼在闭合括号之后。语句体信任类校验（NUL/限长），标识符仍全走 quote_ident。
+        let mut tail = String::new();
+        if let Some(p) = to.get("partitionBy").and_then(Value::as_str) {
+            validate_statement_body("partitionBy", p)?;
+            tail.push_str(&format!(" PARTITION BY {p}"));
+        }
+        if let Some(o) = to.get("options") {
+            if d != Dialect::MySql {
+                return Err("ddlDiff: options are mysql-only".into());
+            }
+            let str_opt = |k: &str| -> Result<Option<String>, String> {
+                match o.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(_) => Err(format!("ddlDiff: options.{k} must be a string")),
+                }
+            };
+            for (k, v) in o.as_object().iter().flat_map(|m| m.iter()) {
+                if !matches!(v, Value::Null) && v.as_str().is_none() {
+                    return Err(format!("ddlDiff: unknown or non-string options key {k:?}"));
+                }
+            }
+            if let Some(e) = str_opt("engine")? {
+                tail.push_str(&format!(" ENGINE={e}"));
+            }
+            if let Some(c) = str_opt("charset")? {
+                tail.push_str(&format!(" DEFAULT CHARSET={c}"));
+            }
+            if let Some(c) = str_opt("collate")? {
+                tail.push_str(&format!(" COLLATE={c}"));
+            }
+            if let Some(c) = str_opt("comment")? {
+                tail.push_str(&format!(" COMMENT={}", quote_literal(&c)));
+            }
+        }
         stmts.push(format!(
-            "CREATE TABLE {t} (\n  {}{}\n)",
+            "CREATE TABLE {t} (\n  {}{}\n){tail}",
             defs.join(",\n  "),
             pk_inline
         ));
@@ -1316,6 +1357,82 @@ mod tests {
         assert!(validate_statement_body("definition", "a\0b").is_err());
         let big = "x".repeat(64 * 1024 + 1);
         assert!(validate_statement_body("partitionBy", &big).is_err());
+    }
+
+    /// G1（REQ-09 §4.2）：from=null 建分区表——闭合括号后拼 PARTITION BY（两方言）。
+    #[test]
+    fn create_table_renders_partition_by_pg_mysql() {
+        let (pg, my) = both(json!({"objectType":"table","name":"t","from":Value::Null,
+            "to":{"columns":[{"name":"d","nativeType":"date"}],
+                  "partitionBy":"RANGE (d)"}}));
+        let pgs = pg["statements"][0].as_str().unwrap();
+        assert!(
+            pgs.starts_with("CREATE TABLE \"t\"") && pgs.ends_with("PARTITION BY RANGE (d)"),
+            "{pgs}"
+        );
+        let mys = my["statements"][0].as_str().unwrap();
+        assert!(
+            mys.starts_with("CREATE TABLE `t`") && mys.ends_with("PARTITION BY RANGE (d)"),
+            "{mys}"
+        );
+    }
+
+    /// G1：MySQL options 四键固定序 + comment 单引号翻倍（PG 直给 → 参数错误，见下测）。
+    #[test]
+    fn create_table_renders_mysql_options_in_fixed_order() {
+        let my = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"id","nativeType":"int"}],
+                      "options":{"engine":"InnoDB","charset":"utf8mb4",
+                                 "collate":"utf8mb4_bin","comment":"it's 业务"}}}),
+        )
+        .unwrap();
+        let s = my["statements"][0].as_str().unwrap();
+        assert!(
+            s.contains(
+                "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='it''s 业务'"
+            ),
+            "{s}"
+        );
+        // 部分键：只给 engine → 其余不渲染。
+        let my2 = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"id","nativeType":"int"}],"options":{"engine":"MyISAM"}}}),
+        )
+        .unwrap();
+        let s2 = my2["statements"][0].as_str().unwrap();
+        assert!(
+            s2.contains("ENGINE=MyISAM") && !s2.contains("CHARSET"),
+            "{s2}"
+        );
+    }
+
+    /// G1：PG 结构出现 options → 参数错误（fail-loud，不静默忽略）。
+    #[test]
+    fn pg_options_is_parameter_error() {
+        let err = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"id","nativeType":"int4"}],
+                      "options":{"engine":"InnoDB"}}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("options"), "{err}");
+    }
+
+    /// G1：partitionBy 带 NUL → 参数错误。
+    #[test]
+    fn partition_by_nul_rejected() {
+        let err = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"d","nativeType":"date"}],
+                      "partitionBy":"a\u{0}b"}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
     }
 
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
