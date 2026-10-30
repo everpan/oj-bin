@@ -36,7 +36,7 @@ use deno_error::JsErrorBox;
 use tokio::time::Instant;
 
 use super::StableState;
-use super::db::DbStreamShared;
+use super::db::{DbStreamShared, PoolExecShared};
 use super::handle_core::{self, Owner};
 
 /// id 前缀（形状白名单与日志遮蔽共用）。
@@ -54,8 +54,37 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 struct ExecEntry {
     owner: Owner,
     alias: String,
-    shared: Arc<DbStreamShared>,
+    handle: ExecHandle,
     created: Instant,
+}
+
+/// REQ-11：登记句柄两型——流式（既有）与非流式池执行（cancel 语义都是「置标志 + 唤醒」，
+/// 但 flag/notify 的载体不同，故枚举分流）。
+enum ExecHandle {
+    Stream(Arc<DbStreamShared>),
+    Pool(Arc<PoolExecShared>),
+}
+
+impl ExecHandle {
+    fn done(&self) -> bool {
+        match self {
+            ExecHandle::Stream(s) => s.done.load(Ordering::SeqCst),
+            ExecHandle::Pool(p) => p.done.load(Ordering::SeqCst),
+        }
+    }
+
+    fn fire_cancel(&self) {
+        match self {
+            ExecHandle::Stream(s) => {
+                s.cancelled.store(true, Ordering::SeqCst);
+                s.abort.notify_one();
+            }
+            ExecHandle::Pool(p) => {
+                p.cancel_requested.store(true, Ordering::SeqCst);
+                p.notify.notify_one();
+            }
+        }
+    }
 }
 
 /// 执行登记表：壳 `Arc` 不可变（挂在 `StableState`）、内部 `std::sync::Mutex` 变动。
@@ -80,21 +109,37 @@ impl ExecRegistry {
         alias: String,
         shared: Arc<DbStreamShared>,
     ) -> Result<String, String> {
+        self.insert(owner, alias, ExecHandle::Stream(shared))
+    }
+
+    /// REQ-11 G1：登记非流式池执行（`db.query/exec` 开跑后调用）。owner/alias 取自
+    /// `shared` 本体；清扫语义与流式共用。
+    pub(crate) fn register_pool(&self, shared: Arc<PoolExecShared>) -> Result<String, String> {
+        let owner = Owner {
+            tenant: shared.owner.tenant.clone(),
+            user: shared.owner.user.clone(),
+            module: shared.owner.module.clone(),
+            source: shared.owner.source.clone(),
+        };
+        let alias = shared.alias.clone();
+        self.insert(owner, alias, ExecHandle::Pool(shared))
+    }
+
+    fn insert(&self, owner: Owner, alias: String, handle: ExecHandle) -> Result<String, String> {
         // getrandom 失败 → Err，绝不退回可枚举 id（handle_core 红线）。
         let id = handle_core::new_id(PREFIX, &self.boot())?;
         let now = Instant::now();
         {
             let mut g = lock(&self.inner);
             g.retain(|_, e| {
-                !e.shared.done.load(Ordering::SeqCst)
-                    && now.saturating_duration_since(e.created) < EXEC_TTL
+                !e.handle.done() && now.saturating_duration_since(e.created) < EXEC_TTL
             });
             g.insert(
                 id.clone(),
                 ExecEntry {
                     owner,
                     alias,
-                    shared,
+                    handle,
                     created: now,
                 },
             );
@@ -114,9 +159,25 @@ impl ExecRegistry {
         if !e.owner.same_subject(owner) {
             return None;
         }
-        e.shared.cancelled.store(true, Ordering::SeqCst);
-        e.shared.abort.notify_one();
+        e.handle.fire_cancel();
         Some(e.alias.clone())
+    }
+
+    /// REQ-11 G2：挂断联动——按请求级 token 取消所有未 settle 的池执行（无判权：
+    /// token 本身即隔离，guard 只在丢失的 handler future 内触达本请求的 token）。
+    /// 返回触达数（0 = 空扫，幂等）。
+    pub(crate) fn cancel_by_token(&self, token: u64) -> usize {
+        let g = lock(&self.inner);
+        let mut n = 0;
+        for e in g.values() {
+            if let ExecHandle::Pool(p) = &e.handle {
+                if !p.done.load(Ordering::SeqCst) && p.cancel_token == Some(token) {
+                    e.handle.fire_cancel();
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     /// 摘除（`op_db_stream_close` 调；cancel **不**摘——幂等靠它）。
@@ -155,6 +216,7 @@ pub fn op_db_cancel(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+    use tokio::sync::Notify;
 
     use crate::bridge::{Bridge, DataAccessor, Extras, InMemoryKV, RequestInfo, SchemaRegistry};
     use serde_json::{Value, json};
@@ -183,6 +245,72 @@ mod tests {
             module: None,
             source: "http",
         }
+    }
+
+    // REQ-11 Task 1：Pool 变体登记/取消/清扫。
+    fn pool_shared(t: Option<u64>) -> Arc<PoolExecShared> {
+        Arc::new(PoolExecShared {
+            owner: owner(Some("t"), Some("u")),
+            alias: "d1".to_string(),
+            cancel_requested: AtomicBool::new(false),
+            notify: Arc::new(Notify::new()),
+            cancel_token: t,
+            done: AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
+            outcome: Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn register_pool_returns_exec_prefixed_id_and_cancel_sets_flag() {
+        let reg = ExecRegistry::default();
+        let p = pool_shared(None);
+        let id = reg.register_pool(p.clone()).unwrap();
+        assert!(handle_core::id_is_wellformed(PREFIX, &id));
+        assert_eq!(reg.len(), 1);
+        // 同主语 cancel：置标志 + 返回 alias；幂等（entry 不因 cancel 摘除）
+        assert_eq!(reg.cancel(&id, &owner(Some("t"), Some("u"))).unwrap(), "d1");
+        assert!(p.cancel_requested.load(Ordering::SeqCst));
+        assert_eq!(reg.cancel(&id, &owner(Some("t"), Some("u"))).unwrap(), "d1");
+        assert_eq!(reg.len(), 1);
+        // 他人/未知/畸形同既有语义：not-found
+        assert!(reg.cancel(&id, &owner(Some("t2"), Some("u"))).is_none());
+        assert!(
+            reg.cancel("exec_粗00_00000000000000000000000000000000", &owner(Some("t"), Some("u")))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancel_by_token_cancels_matching_unsettled_only() {
+        let reg = ExecRegistry::default();
+        let a = pool_shared(Some(7));
+        let b = pool_shared(Some(7));
+        let c = pool_shared(Some(8));
+        let _ = reg.register_pool(a.clone()).unwrap();
+        let _ = reg.register_pool(b.clone()).unwrap();
+        let _ = reg.register_pool(c.clone()).unwrap();
+        // b 已 settle：不得被 token cancel 触达
+        b.done.store(true, Ordering::SeqCst);
+        assert_eq!(reg.cancel_by_token(7), 1);
+        assert!(a.cancel_requested.load(Ordering::SeqCst));
+        assert!(!b.cancel_requested.load(Ordering::SeqCst));
+        assert!(!c.cancel_requested.load(Ordering::SeqCst));
+        // 无匹配 token：空扫
+        assert_eq!(reg.cancel_by_token(999), 0);
+    }
+
+    #[test]
+    fn pool_entry_swept_when_done() {
+        let reg = ExecRegistry::default();
+        let a = pool_shared(None);
+        let _ = reg.register_pool(a.clone()).unwrap();
+        a.done.store(true, Ordering::SeqCst);
+        let b = pool_shared(None);
+        let _ = reg.register_pool(b.clone()).unwrap();
+        // done 的 a 在下一次 register 时被清扫，未完成的 b 保留
+        assert_eq!(reg.len(), 1);
+        assert!(!a.cancel_requested.load(Ordering::SeqCst));
     }
 
     #[test]

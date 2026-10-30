@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 
 use super::{BridgeResult, StableState};
-use crate::bridge::db_error::{BridgeError, unsupported};
+use crate::bridge::db_error::{BridgeError, DbErrorCategory, unsupported};
 use crate::bridge::dialect_caps::{DialectCaps, DialectInfo, IdStrategy, PlaceholderStyle};
 
 /// 数据访问返回的单行（JSON 对象）。
@@ -437,6 +437,39 @@ pub(crate) struct DbStreamShared {
 
 /// pump → 消费端的行缓冲上限（有界背压；abort 后缓冲行继续交付 = "流提前结束"）。
 pub(crate) const DB_STREAM_CHANNEL_CAP: usize = 64;
+
+/// REQ-11 G3：非流式执行的相位事件（`onProgress` 数据源；JS 经 poll 批量取走）。
+pub(crate) struct CallEvent {
+    pub phase: &'static str,
+    pub elapsed_ms: u64,
+    pub rows: Option<u64>,
+}
+
+/// REQ-11：非流式池执行的结果载体（begin/poll/take 模型的 take 源）。
+pub(crate) enum PoolOutcome {
+    Rows(Vec<Row>),
+    Affected(i64),
+    Err { category: DbErrorCategory, msg: String },
+}
+
+/// REQ-11 G1/G2：非流式池执行（db.query/exec）的共享状态。与 `DbStreamShared` 同表异型
+/// 挂在 `ExecRegistry`。cancel = 置标志 + notify；执行侧 `select!` 观测后 drop 在飞
+/// fetch 并 `close_on_drop()` 真关 TCP（服务端语句即死，连接报废不回池——修正案 #2）。
+pub(crate) struct PoolExecShared {
+    pub owner: super::handle_core::Owner,
+    /// 所属库别名（cancel 返回与限额日志用）。
+    pub alias: String,
+    pub cancel_requested: AtomicBool,
+    pub notify: Arc<Notify>,
+    /// serve 挂断联动（G2）：本请求级 token；None = WS/任务/测试路径不联动。
+    pub cancel_token: Option<u64>,
+    /// 执行 settle（含出错）即置位——登记清扫与 take 的判据。
+    pub done: AtomicBool,
+    /// 相位事件队列（`sent`/`fetching`/`done`；done 事件恒在队尾）。
+    pub events: std::sync::Mutex<Vec<CallEvent>>,
+    /// 完成结果；take 时搬走。
+    pub outcome: std::sync::Mutex<Option<PoolOutcome>>,
+}
 
 /// stream_id 全局自增（每请求注册表独立，跨请求重复无妨；u32 足以覆盖请求生命周期内的并发流）。
 pub(crate) static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
