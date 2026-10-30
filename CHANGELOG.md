@@ -16,7 +16,7 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
-## v0.1.115（未打标签）
+## v0.1.115
 
 **feat（db，REQ-12 批量导入三件套）**：`db.import` / `db.importStatus` / `db.importCancel`。
 
@@ -68,7 +68,7 @@
   （空/控制字符）在 `pg_on_conflict`/`mysql_on_dup` 处由 `.expect()` 改为落 Err——
   原行为 panic 在 spawned consumer 里 = 任务永卡 running + 配额槽泄漏。
 
-## v0.1.114（未打标签）
+## v0.1.114
 
 **feat（db，REQ-11 非流式取消与执行进度全交付）**：
 
@@ -94,7 +94,7 @@
   stream vtable 实现取消（drop 行流 → `stream_cancel` 真杀）。限制：插件轴
   `exec_cancelable`（DML 真杀）不可达 → ABI 13 车。
 
-## v0.1.113（未打标签）
+## v0.1.113
 
 **feat（db.ddlDiff，REQ-09 剩余收口）**：
 
@@ -120,7 +120,7 @@
 **限制登记**：MySQL 分区 DDL 不受 prepared 协议支持——`db.exec` 重放含分区的建表
 语句会 1064，须走迁移/raw 执行通道。
 
-## v0.1.112（未打标签）
+## v0.1.112
 
 **breaking（db 插件）**：REQ-07b 二进制列恒定 cellenv 信封——PG `BYTEA`（池/流式/Any
 三路）与 MySQL `BLOB`/`BINARY`/`VARBINARY` 家族**含合法 UTF-8 内容**一律输出
