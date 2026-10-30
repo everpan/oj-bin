@@ -1156,11 +1156,11 @@ mod tests {
         }
         let sql = catalog_sql(Kind::Constraints, Dialect::MySql).unwrap();
         // t_b02_a：PK(id) + UQ(code)；t_b02_b：仅 PK(id)。串味时两表列集会相同。
-        for (table, want) in [
-            ("t_b02_a", vec!["code", "id"]),
-            ("t_b02_b", vec!["id"]),
-        ] {
-            let rows = db.query_with_params(sql, &[serde_json::json!(table)]).await.unwrap();
+        for (table, want) in [("t_b02_a", vec!["code", "id"]), ("t_b02_b", vec!["id"])] {
+            let rows = db
+                .query_with_params(sql, &[serde_json::json!(table)])
+                .await
+                .unwrap();
             let items = catalog(Kind::Constraints, rows);
             let mut cols: Vec<&str> = items
                 .iter()
@@ -1170,7 +1170,10 @@ mod tests {
             cols.sort();
             assert_eq!(cols, want, "{table} 约束串味: {items:?}");
         }
-        for ddl in ["drop table if exists t_b02_a", "drop table if exists t_b02_b"] {
+        for ddl in [
+            "drop table if exists t_b02_a",
+            "drop table if exists t_b02_b",
+        ] {
             db.exec_with_params(ddl, &[]).await.unwrap();
         }
     }

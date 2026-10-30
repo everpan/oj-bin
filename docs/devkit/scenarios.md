@@ -4209,3 +4209,40 @@ curl -s http://localhost:9778/v1/api/rpc -H 'content-type: application/json' -d 
 | `tools/call` 业务报错却是 HTTP 200 | MCP 结果映射与 HTTP 状态解耦：看 `result.isError` + `content[0].text`（业务 msg），不是 JSON-RPC error |
 | SSE 流式端点（`json.stream`/`json.sse`）经 MCP 恒报错 | 有意：不缓冲流——MCP/JSON-RPC 只接统一信封端点 |
 | 非 localhost `http://` 分发线路 A | 产物启动时 stderr 警告 Bearer 明文——上 https 或 SSH 隧道 |
+
+## 场景 59：读含未解码类型列的表（`$<type>:` 降级契约，v0.1.111）
+
+表里有个 `inet` / `point` / `interval` 列，旧版 `select *` 直接整条 400
+（`column 'ip' has type 'INET' which this plugin does not decode yet`）。v0.1.111 起
+PG 按**列声明类型**降级为可逆编码，整表可读。
+
+① 查询侧——降级清单走**响应头**（HTTP 消费方读，handler 内不感知）：
+
+```bash
+curl -s -D - http://localhost:9778/v1/api/server/?id=1 -H 'Authorization: Bearer <jwt>'
+# X-OJ-Degraded: [{"col":"ip","type":"inet"}]      ← 按 {col,type} 去重；干净结果不打头
+# body 里 ip 列的值 = "$inet:MCsrMi4zLjQ="（$<type>:<base64>，base64 = 协议原始字节）
+```
+
+② 导出侧——清单走任务状态（JS 可读），产物编码值原样落盘：
+
+```ts
+export default {
+  async post() {
+    const { taskId } = await db.export({ sql: "select * from server", format: "csv" });
+    // 轮询至 done 后：st.degraded = [{"col":"ip","type":"inet"}]（干净导出 []）
+    const st = await db.exportStatus(taskId);
+    json.ok({ taskId, degraded: st.degraded, blobKey: st.blobKey });
+  },
+};
+```
+
+③ 解码（消费方拿到清单后）：`atob(payload)` 得协议原始字节——**可逆不保证可读**；
+要可读文本请查询时就 `cast(ip as text) as ip`（那本来就不报错了）。
+
+| 坑 | 解 |
+|---|---|
+| 嗅探 `$` 前缀判定降级列 | 权威面只有 `X-OJ-Degraded` 头 / `exportStatus.degraded`；前缀是编码不是判定依据（TEXT 字面量可能撞形） |
+| handler 里想读 X-OJ-Degraded | 它是响应面元数据，handler 内不感知（`json.header` 只写不读）；handler 需要的场景走导出任务状态或 SQL 里显式 cast |
+| MySQL 表期待对称行为 | `GEOMETRY` 家族仍整条报错（sqlx-mysql 0.9 无公开字节出口，v0.1.111 未降级）；先 `ST_AsText(g) as g` |
+| 等 `db.stream` 批次也带降级汇总 | v0.1.111 暂无（随 REQ-07b 二进制批补齐）；流式大表导出走 `db.export` |

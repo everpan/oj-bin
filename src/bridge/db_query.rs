@@ -180,7 +180,10 @@ pub(crate) async fn query_impl(
             .borrow_mut()
             .borrow_mut::<super::ReqState>()
             .headers
-            .push(("X-OJ-Degraded".into(), serde_json::to_string(&degraded).unwrap()));
+            .push((
+                "X-OJ-Degraded".into(),
+                serde_json::to_string(&degraded).unwrap(),
+            ));
     }
     Ok(rows)
 }

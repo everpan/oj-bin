@@ -1068,7 +1068,20 @@ postgres  placeholder=$ id=returning stream cancel
 | `BIT(n)`（MySQL） | `string`（位串，如 `b'10101'` → `"10101"`） | 无前导零（sqlx 不暴露位宽）；PG 的 `BIT` / `VARBIT` 目前**不支持** |
 | `UUID`（PG） | `string`（规范 8-4-4-4-12） | |
 | 数组（PG，一维） | `array` | 元素按上面同口径转换（`numeric[]` → 字符串数组）；元素 `NULL` → `null`；**多维不支持** |
-| `GEOMETRY` 家族、`TIMETZ`、范围/复合/`point` 等 | —— | **报错**，点名列名 + 类型 + 可执行 `cast`/`ST_AsText` 提示 |
+| `GEOMETRY` 家族、`TIMETZ`、范围/复合/`point` 等 | —— | **PG（v0.1.111，REQ-07a）**：降级为 `$<type>:<base64>` 前缀标量（type 名小写，base64 = 协议原始字节、可逆；判别按**列声明类型**，非内容嗅探）。语句级权威清单 = `X-OJ-Degraded` 响应头（按 `{col,type}` 去重；`db.query` 裸 SQL 与构造器两路；干净结果不打头）/ 导出任务 `exportStatus.degraded`（干净导出 `[]`）。**MySQL**：仍**报错**（sqlx 0.9 无公开原始字节出口，v0.1.111 未随 PG 降级） |
+
+#### 未解码类型降级契约（REQ-07a，v0.1.111）
+
+- **grammar**：单元格值 = `$<type>:<base64>`，type 段 `[a-z0-9_]+`（方言类型名小写化；
+  非法字符落 `_`，跨 FFI 不 panic）。`<binary>` 段只能是 base64——JSON 字符串必须是合法
+  UTF-8，裸二进制无路可走（base64 1.33× 是文本编码地板价；体积敏感请导出到文件）。
+- **判定口径**：按列声明类型（type-driven），同列全行同形态；**不做内容嗅探**。
+- **权威判定面是语句级清单，不是前缀**：TEXT 列字面量可能恰好以 `$<type>:` 开头，
+  消费方只看 `X-OJ-Degraded` 头 / `exportStatus.degraded`（去重的 `{col,type}` 数组）。
+- **红线**：`try_get_raw` 拿不到原始字节的窄场景仍 `undecodable_column` 整行报错，
+  绝不产空信封；Any/sqlite 路径语义不变（sqlite 无未解码类型）。
+- **已知边界**：`db.stream` 流式批次暂不带降级汇总（随 REQ-07b 二进制批补齐）；
+  MySQL `GEOMETRY` 家族维持 fail-loud（见上表）。
 
 > **新增的类型都是只读的。** 上面那张表的每一行都只在**读**侧成立；写侧 `bind_value` 只绑
 > `null` / 布尔 / 数字 / 字符串，没有对称编码。要把值写回 `numeric`/`jsonb`/`uuid`/数组列，
@@ -1271,8 +1284,8 @@ export async function upsertAccount(id: number, name: string): Promise<void> {
 | `toBigInt: … is not a safe integer` | 传入的是已坍缩的 number | 传 DB 原样给出的十进制字符串 |
 | `invalid byte sequence for encoding "UTF8": 0x00` / `insufficient data left in message`（PG） | v0.1.24 前：同一 SQL 文本混用字符串/数字参数（sqlx 语句缓存按文本 key） | **v0.1.24 起平台自动按参数形态分缓存键**，无需再规避；若仍出现，检查 PG 插件是否随宿主重建 |
 | `db param: u64 value … is not supported on this path` | `toUBigInt()` 的值走了一条不能承载 u64 的路径（PG/SQLite 全部；MySQL 的 sqlx::Any 回落路径） | 该值改存 text，或确保走 `BIGINT UNSIGNED` 的 typed 直连（`mysql://` DSN + 插件） |
-| ``db(mysql): column 'x' has MySQL type 'GEOMETRY' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `ST_AsText(x) as x`); see docs/devkit/db-guide.md §10.6``（v0.1.24；v0.1.94 收窄到**剩余**类型） | MySQL 读侧**仍未支持**的列类型（`GEOMETRY` 家族、`SET` 等）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`cast(x as char) as x` / `ST_AsText(x) as x`；避免 `select *`。`DECIMAL`/时间/`JSON`/`BIT` 自 v0.1.94 起可直接读（见 §10.6） |
-| ``db(postgres): column 'x' has type 'POINT' … see docs/devkit/db-guide.md §10.6``（v0.1.94） | PG 读侧**仍未支持**的类型（`timetz`、`bit`/`varbit`、范围、几何、复合、多维数组） | `cast(x as text) as x`；`numeric`/时间/`json(b)`/`uuid`/一维数组自 v0.1.94 起可直接读 |
+| ``db(mysql): column 'x' has MySQL type 'GEOMETRY' which this plugin does not decode yet — select explicit columns and cast it in SQL (e.g. `ST_AsText(x) as x`); see docs/devkit/db-guide.md §10.6``（v0.1.24；v0.1.94 收窄到**剩余**类型；**v0.1.111 起 MySQL 维持报错**——sqlx-mysql 0.9 无公开原始字节出口） | MySQL 读侧**仍未支持**的列类型（`GEOMETRY` 家族、`SET` 等）——**报错而不再静默给 `null`** | 在 SQL 里显式转换：`cast(x as char) as x` / `ST_AsText(x) as x`；避免 `select *`。`DECIMAL`/时间/`JSON`/`BIT` 自 v0.1.94 起可直接读（见 §10.6） |
+| ``db(postgres): column 'x' has type 'POINT' … see docs/devkit/db-guide.md §10.6``（v0.1.94；**v0.1.111 起仅「原始字节也拿不到」的窄场景才出现**） | PG 未覆盖类型自 v0.1.111 起**降级为 `$<type>:<base64>` 前缀标量**（按列声明类型；协议原始字节、可逆），不再整条 400；语句级权威清单 = `X-OJ-Degraded` 头 / `exportStatus.degraded`（§10.6 降级契约小节） | 消费方按清单解码 base64；要文本可读仍 `cast(x as text) as x`。`numeric`/时间/`json(b)`/`uuid`/一维数组自 v0.1.94 起可直接读 |
 | PG `numeric` 读回 `12.3`（不是 `"12.30"`）；MySQL 读回 `"12.30"` | PG 侧统一 `normalized()` 去尾零（sqlx 解 numeric 会丢服务端 dscale，不规范化会出 `1.5000` 假精度）；MySQL 的标度来自协议文本 | 数值精确、不经 f64；要固定小数位在 SQL 里 `to_char(n,'FM999999990.00')` |
 | PG `42804 column "n" is of type numeric but expression is of type text` | v0.1.94 新支持的类型（`numeric`/时间/`jsonb`/`uuid`/数组）**只读**，写侧无对称编码 | 回写须显式转换：`values (?::numeric)`、`?::jsonb`、`?::uuid`、`?::int4[]` |
 | MySQL `BOOLEAN` 读出是 `1`/`0` | `BOOLEAN` 即 `TINYINT(1)`，协议层无长度元数据可区分 | 按整数读；需要布尔语义就在 SQL 里转：`select flag = 1 as flag from t` |

@@ -16,6 +16,31 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.111
+
+**fix（db 内省）**：BUG-02 MySQL `catalog("constraints")` 跨表串味修复——
+`key_column_usage` JOIN 补 `kcu.table_name = tc.table_name`。MySQL 全库主键约束同名
+`PRIMARY`，缺该条件时任意表的约束列会聚合**全库（乃至被 scope 异库）同名约束的列**
+（结构对比/编辑读到错误结构）。一行修复 + 守卫测试 + env-gated 真库回归。
+
+**feat（db 插件/宿主）**：REQ-07a 未解码类型降级契约（spec
+`docs/superpowers/specs/2026-10-30-dbx-gap-triage-design.md`）：
+
+- PG 未覆盖类型（`inet` / `cidr` / `macaddr` / `interval` / `money` / `point` 等）
+  不再**整条查询 400**：按**列声明类型**降级为 `$<type>:<base64>` 前缀标量（type 名
+  小写；base64 = 协议原始字节，可逆）。池 / 流式 / 事务三路同一形态。
+- 语句级**权威降级清单**：查询响应 `X-OJ-Degraded` 头（按 `{col,type}` 去重；
+  `db.query` 裸 SQL 与构造器两路都发；干净结果不打头）；导出任务 `exportStatus`
+  新增 `degraded` 字段（干净导出为 `[]`）。消费方判定降级列**只看头/字段**——前缀
+  只是单元格编码，TEXT 字面量可能撞前缀。
+- 红线不变：原始字节也拿不到（sqlx 不暴露出口的窄场景）仍 `undecodable_column`
+  整行报错，**绝不产空信封**。
+- **MySQL 侧维持 fail-loud**（`GEOMETRY` 家族仍报 `does not decode yet` + cast 提示）：
+  sqlx-mysql 0.9 将 `MySqlValueRef::as_bytes` 收为 `pub(crate)`，插件侧无公开原始字节
+  出口，降级待上游恢复或后续机制（裁决记录见上述 spec 评审）。
+- 边界：流式 `db.stream` 的降级汇总暂不外发（随 REQ-07b）；Any/sqlite 路径语义不变
+  （sqlite 无未解码类型）。
+
 ## v0.1.110
 
 **feat（serve/oj）**：MCP 双线路 + 裸 JSON-RPC——OpenAPI 一键出 agent 接口

@@ -3066,9 +3066,7 @@ async fn degraded_header_on_builder_path() {
     let v: Value = serde_json::from_slice(&cap.body).unwrap();
     assert_eq!(v["code"], 0, "{v}");
     assert!(
-        cap.headers
-            .iter()
-            .any(|(k, _)| k == "X-OJ-Degraded"),
+        cap.headers.iter().any(|(k, _)| k == "X-OJ-Degraded"),
         "构造器路须打 X-OJ-Degraded 头: {:?}",
         cap.headers
     );

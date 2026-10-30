@@ -31,11 +31,7 @@ pub fn encode(type_name: &str, bytes: &[u8]) -> String {
         .chars()
         .map(|c| {
             let c = c.to_ascii_lowercase();
-            if type_ok(c) {
-                c
-            } else {
-                '_'
-            }
+            if type_ok(c) { c } else { '_' }
         })
         .collect();
     format!(
@@ -106,7 +102,7 @@ mod tests {
             serde_json::json!({"ip": "$inet:AQI=", "name": "ok"}),
             serde_json::json!({"ip": "$inet:AgM=", "name": "$inet:not-really"}),
             serde_json::json!({"g": "$geometry:AAAA"}),
-            serde_json::json!([1, 2, 3]),          // 非对象行跳过
+            serde_json::json!([1, 2, 3]),            // 非对象行跳过
             serde_json::json!({"n": 42, "z": null}), // 非字符串跳过
         ];
         let d = degraded_of(&rows);

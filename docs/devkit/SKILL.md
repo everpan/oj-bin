@@ -103,6 +103,8 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 
 | 症状 | 原因 |
 |---|---|
+| 想判定哪些列被降级编码，于是嗅探 `$` 前缀（v0.1.111） | **权威面是语句级清单**：查询响应 `X-OJ-Degraded` 头（按 `{col,type}` 去重，干净结果不打头）/ 导出任务 `exportStatus(taskId).degraded`（干净导出 `[]`）。前缀 `$<type>:` 只是单元格编码——TEXT 列字面量可能恰好撞形，嗅探会误判 |
+| 导出 CSV / 查询结果里出现 `$inet:…` / `$point:…` 这类值（v0.1.111） | PG 未解码类型的 base64 编码（按列声明类型降级，替代旧「整条 400」）：查降级清单拿列名 → `atob(payload)` 解码；MySQL `GEOMETRY` 家族仍报错（sqlx 0.9 无字节出口），别期待对称行为 |
 | 命令用了「别人家」的配置 / 行为与预期不符（v0.1.57 起） | `-c` 省略时按 **CWD 逐级向上 → `$HOME/.oj/config.yaml`** 搜索——上级目录甚至 home 兜底有一份 config.yaml 就会被采用。`serve`/`migrate`/`openapi` 等依赖后端配置的场景若回落默认会向 stderr 打 `note: no config.yaml found …`；**`oj exec` / `oj info` 自 v0.1.60 起静默回落、不再打该 note**。排查：怀疑被「别人家」config 影响时显式 `-c` 锁定，或 `oj info` 看实际装配的配置段键名 |
 | DELETE 返回 405 | 方法名写成了 `delete`，应为 `del` |
 | release 下参数路由 404 | build 剥了 `.route`，路由以 routes.js 为准——确认先 `oj build` |

@@ -2084,7 +2084,9 @@ mod tests {
         .expect("未解码类型应降级而非 400");
         let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let (t, payload) = oj_plugin_ffi::cellenv::decode(
-            rows[0]["shape"].as_str().unwrap_or_else(|| panic!("应为标量: {rows}")),
+            rows[0]["shape"]
+                .as_str()
+                .unwrap_or_else(|| panic!("应为标量: {rows}")),
         )
         .unwrap_or_else(|| panic!("应为 cellenv 信封: {rows}"));
         assert_eq!(t, "point");
@@ -2109,7 +2111,9 @@ mod tests {
         );
         let row = v["rows"][0].clone();
         let (t, _) = oj_plugin_ffi::cellenv::decode(
-            row["shape"].as_str().unwrap_or_else(|| panic!("流式应为标量: {v}")),
+            row["shape"]
+                .as_str()
+                .unwrap_or_else(|| panic!("流式应为标量: {v}")),
         )
         .unwrap_or_else(|| panic!("流式应为 cellenv 信封: {v}"));
         assert_eq!(t, "point");
