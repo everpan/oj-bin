@@ -976,7 +976,12 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> (Vec<Value>, bool) {
                             })
                         }
                     }
-                    _ => json!({}),
+                    // 穷尽守卫：Constraints 被外层 match 的聚合臂分流；L2 三件只走 op 的
+                    // columns/indexes/foreign_keys 函数（parse_catalog 白名单不放行）——
+                    // 此处显式 unreachable，新增 catalog kind 漏 shape 臂即编译失败。
+                    Kind::Constraints | Kind::Columns | Kind::Indexes | Kind::ForeignKeys => {
+                        unreachable!("constraints 外层已分流；L2 kinds 不进 catalog()")
+                    }
                 })
                 .collect(),
             truncated,

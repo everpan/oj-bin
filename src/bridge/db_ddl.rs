@@ -597,6 +597,7 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         changed_c.push(json!({"name": t, "field": "name", "from": f, "to": t}));
     }
     // REQ-13 §4.4：显式 rename 已消掉真对子，余下的同型一删一增 = 疑似改名 → 告警不静默。
+    // 按 removed 列聚类：一列一条，列名全部同型 added 候选（避免 N×M 叉积刷屏）。
     let mut warnings: Vec<String> = Vec::new();
     if let (Some(fadj), Some(tlist)) = (&from_cols_adj, &to_cols) {
         for r in &removed_c {
@@ -604,16 +605,21 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             let Some(fc) = fadj.iter().find(|c| c.name == rn) else {
                 continue;
             };
-            for a in &added_c {
-                let an = a.as_str().unwrap_or("");
-                let Some(tc) = tlist.iter().find(|c| c.name == an) else {
-                    continue;
-                };
-                if fc.native_type == tc.native_type {
-                    warnings.push(format!(
-                        "疑似重命名：{rn} → {an}，将按删列 + 建列执行，数据会丢失"
-                    ));
-                }
+            let cands: Vec<&str> = added_c
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|an| {
+                    tlist
+                        .iter()
+                        .find(|c| c.name == *an)
+                        .is_some_and(|tc| fc.native_type == tc.native_type)
+                })
+                .collect();
+            if !cands.is_empty() {
+                warnings.push(format!(
+                    "疑似重命名：{rn} → {}，将按删列 + 建列执行，数据会丢失",
+                    cands.join(" / ")
+                ));
             }
         }
     }
@@ -1175,6 +1181,27 @@ mod tests {
         assert!(e.contains("schema"), "{e}");
     }
 
+    /// 评审 minor 修复：多个同型一删一增时告警按 removed 列聚合——一列一条、
+    /// 列名给出全部同型候选，不发 N×M 叉积。
+    #[test]
+    fn ambiguous_warnings_grouped_per_removed_column() {
+        let (pg, _) = both(json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"},
+                                 {"name": "c", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4"},
+                               {"name": "d", "nativeType": "int4"}]}}));
+        let warns = pg["warnings"].as_array().unwrap();
+        assert_eq!(warns.len(), 2, "{warns:?}");
+        let joined = warns
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains('a') && joined.contains('c'), "{joined}");
+        assert!(joined.contains('b') && joined.contains('d'), "{joined}");
+    }
+
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
     #[test]
     fn absent_field_means_skip_empty_array_means_drop_all() {
@@ -1451,6 +1478,35 @@ mod tests {
                 .await
                 .is_err()
         );
+        // 评审 minor 补齐：rename + 改类型真库重放（RENAME 在先、USING 新名）。
+        let spec = json!({"objectType": "table", "name": "t_req13",
+            "from": {"columns": [{"name": "b", "nativeType": "int4"},
+                                 {"name": "keep", "nativeType": "int"}]},
+            "to": {"columns": [{"name": "c", "nativeType": "int8", "previousName": "b"},
+                               {"name": "keep", "nativeType": "int"}]}});
+        let out = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 2, "{out:?}");
+        assert!(stmts[0].contains("RENAME COLUMN"), "{stmts:?}");
+        assert!(stmts[1].contains("\"c\"::int8"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select c, keep from t_req13", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["c"], json!(42), "{rows:?}");
+        assert!(
+            db.query_with_params("select b from t_req13", &[])
+                .await
+                .is_err()
+        );
         db.exec_with_params("drop table if exists t_req13", &[])
             .await
             .unwrap();
@@ -1499,6 +1555,35 @@ mod tests {
         assert_eq!(rows[0]["keep"], json!(7), "{rows:?}");
         assert!(
             db.query_with_params("select a from t_req13", &[])
+                .await
+                .is_err()
+        );
+        // 评审 minor 补齐：rename + 改类型真库重放（RENAME 在先、MODIFY 用新名）。
+        let spec = json!({"objectType": "table", "name": "t_req13",
+            "from": {"columns": [{"name": "b", "nativeType": "int"},
+                                 {"name": "keep", "nativeType": "int"}]},
+            "to": {"columns": [{"name": "c", "nativeType": "bigint", "previousName": "b"},
+                               {"name": "keep", "nativeType": "int"}]}});
+        let out = ddl_diff(Dialect::MySql, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 2, "{out:?}");
+        assert!(stmts[0].contains("RENAME COLUMN"), "{stmts:?}");
+        assert!(stmts[1].contains("MODIFY COLUMN `c`"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select c, keep from t_req13", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["c"], json!(42), "{rows:?}");
+        assert!(
+            db.query_with_params("select b from t_req13", &[])
                 .await
                 .is_err()
         );
