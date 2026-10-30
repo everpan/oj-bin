@@ -668,7 +668,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn real_pg_mysql_cancel_maps_oj_db_cancelled() {
         let cases = [
-            ("OJ_TEST_PG", "select pg_sleep(30) /* oj-req11-exec-cancel */ as s"),
+            (
+                "OJ_TEST_PG",
+                "select pg_sleep(30) /* oj-req11-exec-cancel */ as s",
+            ),
             ("OJ_TEST_MYSQL", "select sleep(30) as s"),
         ];
         let mut ran = 0;
@@ -718,6 +721,146 @@ mod tests {
         if ran == 0 {
             eprintln!("skip: OJ_TEST_PG / OJ_TEST_MYSQL both unset");
         }
+    }
+
+    /// Final-fix F2：cancel 单发竞速——`notify_waiters` 对每个 `Notified` future 是
+    /// 单发；行臂在同一次 poll 里赢一次 select，被唤醒的 `Notified` 被丢弃后永无
+    /// permit，cancel 彻底丢失（假取消：db.cancel 已返 `{cancelled:true}`，语句却
+    /// 跑完返回全量行）。全缓冲快行流（本地 sqlite）每轮两臂皆 ready——修复前每判
+    /// 取消 ~50% 丢失，10/10 全过的概率 ≈ 0.001；修复后 sticky 标志在循环头拦截，必中。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_fast_rows_cancel_not_lost_ten_trials() {
+        // 文件 DSN（非 :memory:）：取消 = 连接关闭级（close_on_drop），:memory: 每连接
+        // 独立库，trial 间连接被关后新连接看不到表。文件库跨连接数据恒在。
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("sqlite://{}/big.sqlite", dir.path().display());
+        // 走全仓唯一 DSN 归一入口（手拼直喂 sqlx 会被 Url 解析吞绝对路径 → CANTOPEN）。
+        let db = crate::bridge::db_backend::DbBackendRegistry::builtin()
+            .connect(&dsn, dir.path())
+            .await
+            .unwrap();
+        db.exec_with_params("create table big (n integer)", &[])
+            .await
+            .unwrap();
+        db.exec_with_params(
+            "insert into big with recursive c(x) as \
+             (select 1 union all select x+1 from c where x < 50000) select x from c",
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut dbs = std::collections::HashMap::new();
+        dbs.insert(
+            "default".to_string(),
+            db as Arc<dyn super::super::db::DataAccessor>,
+        );
+        let reg = Arc::new(ExecRegistry::default());
+        let b = crate::bridge::Bridge::with_dbs_and_loader(
+            dbs,
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                exec_sessions: Some(reg.clone()),
+                ..Extras::default()
+            },
+        );
+        let mut valid = 0;
+        for attempt in 0..40 {
+            if valid >= 10 {
+                break;
+            }
+            let v = run(
+                &b,
+                r#"(async () => {
+                  const v = await __ojCall.queryBegin("default", "select n from big", null, null);
+                  // 无效判：语句在 cancel 前已跑完（快 trial）——不计入，重来。
+                  const r = await __ojCall.poll(v.executionId, 5);
+                  if (r.done) return json.ok({ code: "DONE_BEFORE_CANCEL" });
+                  await db.cancel(v.executionId);
+                  for (;;) { const r2 = await __ojCall.poll(v.executionId, 1000); if (r2.done) break; }
+                  let code = "ROWS_RETURNED";
+                  try { await __ojCall.queryTake(v.executionId); } catch (e) { code = e.code || String(e); }
+                  return json.ok({ code });
+                })()"#,
+            )
+            .await;
+            let code = v["data"]["code"].as_str().unwrap_or_default();
+            if code == "DONE_BEFORE_CANCEL" {
+                continue;
+            }
+            valid += 1;
+            assert_eq!(
+                code, "OJ_DB_CANCELLED",
+                "valid trial {valid} (attempt {attempt}): {v}"
+            );
+        }
+        assert!(
+            valid >= 10,
+            "only {valid} valid in-flight cancel trials in 40 attempts"
+        );
+        assert_eq!(reg.len(), 0, "registry leak after trials");
+    }
+
+    /// Final-fix F1：回调面（begin/poll/take）语句超时——直路有 deadline 竞速
+    /// （race_statement），回调面把 `timeout_ms` 算出来却从未使用（执行体裸跑）。
+    /// pg_sleep(5) + timeoutMs 500 → 500ms 级 OJ_DB_TIMEOUT（data.timeout_ms=500 透传
+    /// take），绝不跑满 5s；cancelled 按 accessor 诚实位（内置 sqlx = close_on_drop 真杀）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_callback_surface_honors_timeout() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        if url.is_empty() {
+            eprintln!("skip: OJ_TEST_PG empty");
+            return;
+        }
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        let mut dbs = std::collections::HashMap::new();
+        dbs.insert(
+            "default".to_string(),
+            db as Arc<dyn super::super::db::DataAccessor>,
+        );
+        let reg = Arc::new(ExecRegistry::default());
+        let b = crate::bridge::Bridge::with_dbs_and_loader(
+            dbs,
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            None,
+            Extras {
+                exec_sessions: Some(reg.clone()),
+                ..Extras::default()
+            },
+        );
+        let t0 = std::time::Instant::now();
+        let v = run(
+            &b,
+            r#"(async () => {
+              const out = { code: "NO_ERROR", timeout_ms: null, cancelled: null };
+              try {
+                await db.query("select pg_sleep(5) /* oj-req11-cb-timeout */ as s", null,
+                               { onOpen: () => {}, timeoutMs: 500 });
+              } catch (e) {
+                out.code = e.code || String(e);
+                out.timeout_ms = e.data ? e.data.timeout_ms : null;
+                out.cancelled = e.data ? e.data.cancelled : null;
+              }
+              return json.ok(out);
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["code"], json!("OJ_DB_TIMEOUT"), "{v}");
+        assert_eq!(v["data"]["timeout_ms"], json!(500), "{v}");
+        assert_eq!(v["data"]["cancelled"], json!(true), "{v}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(4),
+            "timeout surface took {:?} (statement ran to completion?)",
+            t0.elapsed()
+        );
+        assert_eq!(reg.len(), 0, "registry leak after timeout");
     }
 
     /// 取消语义落在**请求边界**上：同一请求内开流 → cancel → 下一次 `next` 必须抛

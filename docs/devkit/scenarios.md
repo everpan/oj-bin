@@ -4449,7 +4449,7 @@ export default {
 
 | 坑 | 解 |
 |---|---|
-| 不带回调就指望能取消 | 只有带 `onOpen`/`onProgress` 的执行才进登记表面（跨请求句柄=入场券）；直路 `db.query` 无句柄，`db.cancel` 报 not found |
+| 不带回调就指望能取消 | executionId 只经 `onOpen`/`it.executionId()` 暴露给 JS——直路 `db.query` 无回调拿不到 id，`db.cancel` 报 not found（挂断联动 v0.1.114 起仍覆盖它） |
 | 取消后发起端当「没数据」 | 发起端 reject `db exec exec_… was cancelled via db.cancel`（`e.code=OJ_DB_CANCELLED`）——按错误分流（前端显示「已取消」，不是空结果） |
 | 挂在 `db.tx` / `db.session` 里 | 事务/会话内执行不登记（会话锁定单连接），取消语义只覆盖直连池执行 |
 | 把执行 id 回给前端 | bearer 凭据：存服务端 `kv`，前端只回 `slice(0, 8)` 用于对账 |

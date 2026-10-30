@@ -536,6 +536,15 @@ impl DataAccessor for FfiDataAccessor {
         let mut first = true;
         use futures::StreamExt;
         loop {
+            // Final-fix F2：sticky 标志循环头复查（notify_waiters 单发陷阱——行臂
+            // 同刻赢 select 即吞掉唤醒；与 accessor_sqlx 同口径）。
+            if shared
+                .cancel_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                drop(s); // guard drop → stream_cancel 真杀服务端语句
+                return Err(super::db_error::cancelled_error(&shared.alias).into());
+            }
             tokio::select! {
                 row = s.next() => {
                     match row {

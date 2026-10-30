@@ -416,6 +416,14 @@ impl DataAccessor for SqlxAccessor {
         let mut first = true;
         use futures::StreamExt;
         loop {
+            // Final-fix F2：sticky 标志循环头复查。`notify_waiters` 对每个 Notified
+            // future 单发——行臂同刻赢一次 select 即吞掉唤醒（假取消）；标志先于
+            // notify 置位，循环头必见，cancel 绝不丢失。
+            if shared.cancel_requested.load(Ordering::SeqCst) {
+                drop(stream); // 在飞 fetch 报废（协议态不可知）
+                conn.close_on_drop(); // 真关 TCP；绝不回池
+                return Err(super::db_error::cancelled_error(&shared.alias).into());
+            }
             tokio::select! {
                 row = stream.next() => {
                     let Some(r) = row else { break };
@@ -472,6 +480,13 @@ impl DataAccessor for SqlxAccessor {
         tokio::select! {
             res = q.execute(&mut *conn) => {
                 let r = res.map_err(|e| sqlite_err(&e, "exec"))?;
+                // Final-fix F2：execute 臂赢的当刻 cancel 同到（单发 Notified 被吞）
+                // ——成功返回前复查 sticky 标志，按取消收口（语句服务端已执行的事实
+                // 由调用方按取消语义吞掉，同 query 臂 drop 在流行口径）。
+                if shared.cancel_requested.load(Ordering::SeqCst) {
+                    conn.close_on_drop();
+                    return Err(super::db_error::cancelled_error(&shared.alias).into());
+                }
                 push_event(shared, "done", None);
                 Ok(r.rows_affected() as i64)
             }

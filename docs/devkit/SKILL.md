@@ -129,7 +129,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 导出并发被拒分不清是谁满 | 看文案：「global export concurrency limit」= 全局满（等别人）；「per-subject …」= 本人满（等自己的旧任务收尾/取消） |
 | 轮询 db.exportStatus 想要 percent | 流式无总行数（percent 需额外 COUNT + 竞态）——不确定进度条 + rows/bytes 文本；`totalRows` 是留档扩展位 |
 | REQ-05 语句超时 sqlite「不生效」（单条递归 CTE 跑完才返回） | sqlite 驱动同步步进**饿死 current_thread 定时器**——deadline 只在让步点触发；网络型后端（mysql/pg 插件轴）准点。sqlite 大查询用 `max_result_bytes`（边拉边计真早停）+ `max_rows` 挡（api-manual §13 架构边界行） |
-| 超时后 UI 宣称「已向数据库下发取消」 | 插件轴 `e.data.cancelled=false`——宿主只弃句柄，服务端语句可能仍在跑（真取消 = ABI 13 车）；只有 sqlite 内置是 `true`。UI 说「已超时」即可 |
+| 超时后 UI 宣称「已向数据库下发取消」 | 只有**插件轴** `e.data.cancelled=false`——宿主弃 FfiFuture 只 free state，服务端语句可能仍在跑（真取消 = ABI 13 车）；**内置 sqlx 三方言（sqlite/mysql/pg DSN）= `true`**（v0.1.114 close_on_drop 真关连接，语句即死）。UI 按 `e.data.cancelled` 措辞：true 说「已停止」、false 说「已超时」 |
 | `db.stream` 想拿「是否截断」只看行数 | 用 `it.info()`（**async，须 await**）：`{rows, bytes, truncated, degraded}`——truncate 档的显式信令；`degraded` 是本流 cellenv 降级清单 `[{col,type}]`（按值去重，干净流显式 `[]`，v0.1.112 起，与 `exportStatus.degraded` 同形态——流式无响应头通道，info() 是权威面）。fail 档（缺省）以中途错行 `OJ_DB_CAPACITY` 表达。`timeoutMs` 超配置拒 `OJ_DB_CAPACITY` 点名 `statement_timeout_ms`（只能收紧） |
 | `db.forSchema("x")` 在 sqlite 上报 `OJ_DB_UNSUPPORTED` | **预期**：sqlite 无 schema 概念，不静默给垃圾数据（capability=`for_schema`）。sqlite 的「库」清单用 `db.listDatabases()`（database_list：main + attached） |
 | pg 上 `forSchema` 想跨 **database** | pg 的 database = 独立连接，物理不可行——`listDatabases()` 只出**清单**（任意库连出 pg_database，不换连接）；跨 database 内视 = 再登记一个别名（一连接=一库）。mysql 无此问题：schema≡database，`forSchema` 即跨库 |
@@ -386,7 +386,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 拿 `secret.seal` 的密文判等 / 当查询条件（v0.1.101） | 不行——信封每次随机（临时密钥 + 随机 nonce），同一明文两次 seal 密文必然不同。要比对就先 `secret.open` 再比明文；等值检索存明文哈希列 |
 | `secret.open` 报 `no private key`（v0.1.101） | 该装配配了 `secrets.public_key_path`（seal-only）但没有私钥——解密权只在部署机。每次 open 落 `SECRET_OPEN` 审计（`audit.query({kind:"SECRET_OPEN"})` 可查） |
 | 跳板机后的库连不上，想让 oj 内置 SSH 隧道（U-16） | 平台不做（条件项未触发）。用部署级隧道：`ssh -L`/autossh/socat 配方见 `deploy-tunnel-recipe.md`（devkit）；隧道断开在 oj 的表现 = 普通连接失败（category `connection`） |
-| 把「取消长导出」做成让前端断开请求（v0.1.114 起**部分会停**） | 带 `onOpen`/`onProgress` 回调的执行（含 `db.stream`）已登记——客户端真 FIN 断开后 serve 层尽力取消在飞语句（pg/mysql 真杀）。**尽力而为**：已提交结果不写回；不带回调的执行无登记句柄，挂断后语句照样跑完。确定性取消仍用 **`db.cancel(executionId)`**（v0.1.96/114）：`onOpen`/`it.executionId()` 拿 `exec_…` 句柄存 `kv`，同一主体任意请求调用即停 |
+| 把「取消长导出」做成让前端断开请求（v0.1.114 起**部分会停**） | 直连池 `db.query`/`db.exec` 已全量登记——客户端真 FIN 断开后 serve 层尽力取消在飞语句（pg/mysql 真杀）。**尽力而为**：已提交结果不写回；`db.tx`/`db.session` 内执行与 WS 派发不登记。**不带回调也能挂断取消**，只是 JS 拿不到 executionId。确定性取消仍用 **`db.cancel(executionId)`**（v0.1.96/114）：`onOpen`/`it.executionId()` 拿 `exec_…` 句柄存 `kv`，同一主体任意请求调用即停 |
 | 取消后把流的中断当「导出完成」 | `db.cancel` 后发起方**下一次拉取抛错** `… was cancelled via db.cancel`（不是静默 done）；`onRow` 形态的 Promise reject。按错误分流，已交付的行保留 |
 | 把 `db.cancel` 的 `exec_…` id 回给前端 / 写日志 | id 是 **bearer 凭据**（同主体可停别人的执行）。日志与错误只出前 8 字符；完整 id 存服务端（`kv`/业务表），前端只回 `slice(0, 8)` |
 | `onOpen` 回调里抛异常把查询弄挂了（v0.1.114） | 不会——`onOpen` 抛异常只记 warn（尽力而为），语句照跑。但也别在 onOpen 里做重活：它在执行链路上同步调用，拖慢语句起跑 |

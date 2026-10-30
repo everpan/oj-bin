@@ -305,13 +305,16 @@ const n = await db.exec("update account set role = ? where id = ?", ["user", 7])
     `sent`（语句已下推服务端）→ `fetching`（首批行回流）→ `done`（**恒发一次**，
     必含 `rows`：query 为行数 / exec 为受影响数）。同相位 **100ms 节流**（快语句
     可能只见 sent + done 两个相位）。**带任一回调即走 begin/poll/take 登记模型**
-    （执行进入跨请求取消登记表，挂断联动因此能定位它）；不带回调维持原直路零开销。
+    （执行进入跨请求取消登记表，挂断联动因此能定位它）；不带回调也全量登记（挂断
+    联动同样覆盖），只是 JS 侧拿不到 executionId，无法 `db.cancel`。
   - `onOpen` 内抛异常只记 warn、**不杀执行**（进度/取消机制尽力而为，绝不让回调
     错误污染语句结果）。
 - **挂断取消（v0.1.114，尽力而为）**：HTTP 客户端断开（真 FIN）时，serve 层按
   本次请求的执行登记**尽力取消**在飞执行——已提交结果不会写回（客户端已走），
-  in-flight 语句经 pg `pg_cancel_backend` / mysql `KILL QUERY` 尽量真杀；不带回调的
-  执行无登记句柄，挂断后语句继续在服务端跑完（与 v0.1.103 前相同）。
+  in-flight 语句经 pg `pg_cancel_backend` / mysql `KILL QUERY` 尽量真杀。直连池
+  `db.query`/`db.exec` **全量登记**（v0.1.114 legacy 全量登记，含无回调直路）——
+  挂断同样取消，只是无回调执行 JS 拿不到 executionId；`db.tx`/`db.session` 会话内
+  执行与 WS/内部派发不登记（无请求连接/token）。
 
 ### 3.1 流式查询（`db.stream`，v0.1.37）
 
@@ -1559,7 +1562,8 @@ SSRF / 内网横向移动面）；`max_entries==0`、`max_per_owner==0`、`max_s
 **查询超时与结果集字节上限（v0.1.103，REQ-05 已覆盖）**：`db_access.<name>.statement_timeout_ms`
 （调用侧 `timeoutMs` 只能收紧）+ `db_access.<name>.max_result_bytes` / `on_exceed`
 （行 JSON 编码字节，边拉边计；fail 档缺省，truncate 档打 `X-OJ-Result-Truncated` 信令）。
-语义与架构限制（sqlite 同步步进饿死定时器、插件轴 `data.cancelled=false`）见 §11.6.3。
+语义与架构限制（sqlite 同步步进饿死定时器、内置 sqlx `data.cancelled=true` / 插件轴
+`false` 的诚实位口径）见 §11.6.3。
 
 #### 11.6.2 管理面（`db.client`）
 
@@ -1703,10 +1707,10 @@ const inf = await it.info();                          // {rows, bytes, truncated
   - sqlite 内置的**单条 CPU 密集语句**（如同步步进的递归 CTE）会饿死 current_thread
     定时器——deadline 只能在驱动让步点触发。网络型后端（mysql/pg 插件轴，I/O 驱动）
     准点触发（env-gated 用例：`statement_timeout_matrix_pg_mysql`）。
-  - 超时后 `data.cancelled` 按后端诚实标注：sqlite 内置 = `true`（真早停）；**网络型
-    方言 = `false`**——无论内置 sqlx（pg/mysql DSN）还是插件轴，宿主弃 future/FfiFuture
-    只停止客户端拉取，服务端语句可能仍在跑——mysql/pg 真取消（KILL QUERY /
-    pg_cancel_backend）需插件侧协作，**ABI 13 单独成车**；本车的护栏价值 = 调用侧准点
+  - 超时后 `data.cancelled` 按后端诚实标注（v0.1.114 口径）：**内置 sqlx 三方言
+    （sqlite/mysql/pg DSN）= `true`**——取消/超时走 `close_on_drop()` 真关 TCP，
+    服务端语句即死（连接关闭级语义）；**插件轴 = `false`**——宿主弃 FfiFuture 只 free
+    state，语句可能仍在服务端跑（真取消 = ABI 13 车）。本车的护栏价值 = 调用侧准点
     拿到结构化超时 + 字节闸不再 OOM。
   - 未覆盖 metered 拉取的后端（内存 fake / 回落路径）字节计量为「拉完再计」：fail 仍拒、
     truncate 交付全量 + 信令照打（无 OOM 防线）。

@@ -476,10 +476,13 @@ pub enum PoolOutcome {
     Rows(Vec<Row>),
     Affected(i64),
     /// retryable 一并保存——take 侧重建 BridgeError 时保真透传（不加则 Timeout 变 false）。
+    /// Final-fix F1：`data` 同样透传（`statement_timeout_ms` 的 `data.timeout_ms` /
+    /// `data.cancelled` 诚实位经 take 到 JS——不加则回调面超时丢结构化负载）。
     Err {
         category: DbErrorCategory,
         retryable: bool,
         msg: String,
+        data: serde_json::Map<String, Value>,
     },
 }
 

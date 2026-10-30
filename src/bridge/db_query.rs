@@ -197,12 +197,13 @@ async fn run_pool_query(
                                 category,
                                 retryable,
                                 msg,
+                                data,
                             } => Err(Box::new(BridgeError {
                                 category,
                                 retryable,
                                 session_disposition: SessionDisposition::Close,
                                 message: msg,
-                                data: Default::default(),
+                                data,
                             })),
                             PoolOutcome::Affected(_) => unreachable!("query arm"),
                         };
@@ -291,12 +292,13 @@ async fn run_pool_exec(
                                 category,
                                 retryable,
                                 msg,
+                                data,
                             } => Err(Box::new(BridgeError {
                                 category,
                                 retryable,
                                 session_disposition: SessionDisposition::Close,
                                 message: msg,
-                                data: Default::default(),
+                                data,
                             })),
                             PoolOutcome::Rows(_) => unreachable!("exec arm"),
                         };
@@ -654,11 +656,13 @@ fn settle_pool(shared: &PoolExecShared, res: BridgeResult<PoolOutcome>) {
                 category: be.category,
                 retryable: be.retryable,
                 msg: be.message,
+                data: be.data,
             },
             Err(e) => PoolOutcome::Err {
                 category: DbErrorCategory::Internal,
                 retryable: false,
                 msg: e.to_string(),
+                data: Default::default(),
             },
         },
     };
@@ -707,11 +711,52 @@ pub async fn op_db_query_begin(
     let norm = pre.norm.into_owned();
     let max_result_bytes = pre.max_result_bytes;
     let on_exceed = pre.on_exceed;
+    // Final-fix F1：回调面语句超时。直路有 race_statement deadline，begin 路径此前
+    // 算了 timeout_ms 却未用（执行体裸跑）——这里同款竞速：到点置取消标志，accessor
+    // 取消臂 close_on_drop 真杀后按 Timeout 类别收口（cancelled 按 accessor 诚实位）。
+    let timeout_ms = pre.timeout_ms;
+    let alias_c = pre.alias.clone();
+    let cancelled_on_abandon = da.server_cancel_on_abandon();
     tokio::spawn(async move {
         let mut meter = super::db_quota::ByteMeter::new(max_result_bytes, on_exceed);
-        let res = da
-            .query_cancelable(&norm, &params, &mut meter, &shared)
-            .await;
+        let res = match timeout_ms {
+            Some(ms) => {
+                let mut fut = Box::pin(da.query_cancelable(&norm, &params, &mut meter, &shared));
+                let mut delay = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(ms)));
+                let mut timed_out = false;
+                loop {
+                    tokio::select! {
+                        r = fut.as_mut() => break r,
+                        _ = delay.as_mut() => {
+                            timed_out = true;
+                            shared.cancel_requested.store(true, Ordering::SeqCst);
+                            shared.notify.notify_waiters();
+                            // 防重复触发：推迟到远未来，等 fut 经取消臂收口。
+                            delay.as_mut().reset(tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(3600));
+                        }
+                    }
+                }
+                .map_err(move |e| {
+                    if timed_out
+                        && e.downcast_ref::<BridgeError>()
+                            .is_some_and(|be| be.category == DbErrorCategory::Cancelled)
+                    {
+                        Box::new(super::db_quota::stmt_timeout_error(
+                            &alias_c,
+                            ms,
+                            cancelled_on_abandon,
+                        )) as Box<dyn std::error::Error + Send + Sync>
+                    } else {
+                        e
+                    }
+                })
+            }
+            None => {
+                da.query_cancelable(&norm, &params, &mut meter, &shared)
+                    .await
+            }
+        };
         *lock(&shared.meter_final) = Some(meter);
         settle_pool(&shared, res.map(PoolOutcome::Rows));
     });
@@ -753,8 +798,45 @@ pub async fn op_db_exec_begin(
         .register_pool(shared.clone())
         .map_err(JsErrorBox::generic)?;
     let norm = pre.norm.into_owned();
+    // Final-fix F1：exec 回调面同款 deadline 竞速（见 op_db_query_begin）。
+    let timeout_ms = pre.timeout_ms;
+    let alias_c = pre.alias.clone();
+    let cancelled_on_abandon = da.server_cancel_on_abandon();
     tokio::spawn(async move {
-        let res = da.exec_cancelable(&norm, &params, &shared).await;
+        let res = match timeout_ms {
+            Some(ms) => {
+                let mut fut = Box::pin(da.exec_cancelable(&norm, &params, &shared));
+                let mut delay = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(ms)));
+                let mut timed_out = false;
+                loop {
+                    tokio::select! {
+                        r = fut.as_mut() => break r,
+                        _ = delay.as_mut() => {
+                            timed_out = true;
+                            shared.cancel_requested.store(true, Ordering::SeqCst);
+                            shared.notify.notify_waiters();
+                            delay.as_mut().reset(tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(3600));
+                        }
+                    }
+                }
+                .map_err(move |e| {
+                    if timed_out
+                        && e.downcast_ref::<BridgeError>()
+                            .is_some_and(|be| be.category == DbErrorCategory::Cancelled)
+                    {
+                        Box::new(super::db_quota::stmt_timeout_error(
+                            &alias_c,
+                            ms,
+                            cancelled_on_abandon,
+                        )) as Box<dyn std::error::Error + Send + Sync>
+                    } else {
+                        e
+                    }
+                })
+            }
+            None => da.exec_cancelable(&norm, &params, &shared).await,
+        };
         settle_pool(&shared, res.map(PoolOutcome::Affected));
     });
     Ok(BeginReply { execution_id: id })
@@ -819,12 +901,13 @@ pub async fn op_db_query_take(
             category,
             retryable,
             msg,
+            data,
         } => Err(Box::new(BridgeError {
             category,
             retryable,
             session_disposition: SessionDisposition::Close,
             message: msg,
-            data: Default::default(),
+            data,
         })),
         PoolOutcome::Affected(_) => Err(Box::new(BridgeError {
             category: DbErrorCategory::Internal,
@@ -875,12 +958,13 @@ pub async fn op_db_exec_take(
             category,
             retryable,
             msg,
+            data,
         } => Err(Box::new(BridgeError {
             category,
             retryable,
             session_disposition: SessionDisposition::Close,
             message: msg,
-            data: Default::default(),
+            data,
         })),
         PoolOutcome::Rows(_) => Err(Box::new(BridgeError {
             category: DbErrorCategory::Internal,
