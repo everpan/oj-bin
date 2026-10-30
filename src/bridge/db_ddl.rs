@@ -389,10 +389,121 @@ pub fn unsupported_capability_from_spec(d: Dialect, spec: &Value) -> Option<&'st
     None
 }
 
+/// G3（REQ-09 §4.4）：非表对象 diff——view 支持 create/diff/drop；index/sequence/
+/// routine/trigger 只支持 create（from=null）与 drop（to=null），不做逐字段 diff。
+fn ddl_diff_object(d: Dialect, spec: &Value) -> Result<Value, String> {
+    let ty = spec.get("objectType").and_then(Value::as_str).unwrap_or("");
+    let name = spec
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ddlDiff: missing name".to_string())?;
+    let t = quote_ident(d, name)?;
+    let t = match spec.get("schema").and_then(Value::as_str) {
+        Some(s) => format!(
+            "{}.{t}",
+            quote_ident(d, s).map_err(|e| format!("ddlDiff: invalid schema: {e}"))?
+        ),
+        None => t,
+    };
+    let from = spec.get("from").filter(|v| !v.is_null());
+    let to = spec.get("to").filter(|v| !v.is_null());
+    let def_of = |side: Option<&Value>| -> Result<Option<String>, String> {
+        match side.and_then(|v| v.get("definition")) {
+            None => Ok(None),
+            Some(Value::String(s)) => {
+                validate_statement_body("definition", s)?;
+                Ok(Some(s.clone()))
+            }
+            Some(_) => Err("ddlDiff: definition must be a string".into()),
+        }
+    };
+    let mut stmts: Vec<String> = Vec::new();
+    let mut diff = serde_json::Map::new();
+    match (from, to) {
+        // create（from=null）
+        (None, Some(to_v)) => {
+            let Some(def) = def_of(Some(to_v))? else {
+                return Err(format!("ddlDiff: to.definition is required for {ty}"));
+            };
+            stmts.push(if ty == "view" {
+                format!("CREATE VIEW {t} AS {def}")
+            } else {
+                // index/sequence/routine/trigger：definition 即整条建对象语句。
+                def
+            });
+        }
+        // drop（to=null）
+        (Some(from_v), None) => match ty {
+            "view" => stmts.push(format!("DROP VIEW {t}")),
+            "index" => {
+                if d == Dialect::MySql {
+                    let tbl = from_v.get("table").and_then(Value::as_str).ok_or_else(|| {
+                        "ddlDiff: from.table is required for mysql index drop".to_string()
+                    })?;
+                    let t_tbl = quote_ident(d, tbl)?;
+                    stmts.push(format!("DROP INDEX {t} ON {t_tbl}"));
+                } else {
+                    stmts.push(format!("DROP INDEX {t}"));
+                }
+            }
+            "sequence" => stmts.push(format!("DROP SEQUENCE {t}")),
+            "routine" => {
+                let kw = match from_v.get("type").and_then(Value::as_str) {
+                    Some("procedure") => "PROCEDURE",
+                    Some("function") | None => "FUNCTION",
+                    Some(other) => {
+                        return Err(format!("ddlDiff: unknown routine type {other:?}"));
+                    }
+                };
+                let args = from_v
+                    .get("args")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ddlDiff: from.args is required for routine drop".to_string())?;
+                stmts.push(format!("DROP {kw} {t}({args})"));
+            }
+            "trigger" => stmts.push(format!("DROP TRIGGER {t}")),
+            _ => unreachable!(),
+        },
+        // diff：view 只比 definition 文本；其余四型不做逐字段 diff。
+        (Some(from_v), Some(to_v)) => {
+            if ty != "view" {
+                return Err(format!(
+                    "ddlDiff: {ty} does not support field-level diff (create/drop only)"
+                ));
+            }
+            let f = def_of(Some(from_v))?.unwrap_or_default();
+            let tdef = def_of(Some(to_v))?.unwrap_or_default();
+            if f != tdef {
+                diff.insert("definition".into(), json!({"from": f, "to": tdef}));
+                let kw = match d {
+                    Dialect::Postgres => "CREATE OR REPLACE VIEW",
+                    Dialect::MySql => "ALTER VIEW",
+                    Dialect::Sqlite => unreachable!("sqlite rejected at op level"),
+                };
+                stmts.push(format!("{kw} {t} AS {tdef}"));
+            }
+        }
+        (None, None) => {
+            return Err("ddlDiff: missing from/to (both null)".into());
+        }
+    }
+    Ok(json!({"diff": Value::Object(diff), "statements": stmts, "warnings": []}))
+}
+
 /// diff + 渲染。spec：`{objectType:"table", name, from: Structure|null, to: Structure}`。
 pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
-    if spec.get("objectType").and_then(Value::as_str) != Some("table") {
-        return Err("ddlDiff: objectType must be \"table\"".into());
+    // G3（REQ-09 §4.4）：objectType 扩六值——非表对象走独立分发。
+    match spec.get("objectType").and_then(Value::as_str) {
+        Some("table") => {}
+        Some("view" | "index" | "sequence" | "routine" | "trigger") => {
+            return ddl_diff_object(d, spec);
+        }
+        _ => {
+            return Err(
+                "ddlDiff: objectType must be \"table\"|\"view\"|\"index\"|\"sequence\"|\"routine\"|\"trigger\""
+                    .into(),
+            );
+        }
     }
     let name = spec
         .get("name")
@@ -411,6 +522,11 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     let to = spec
         .get("to")
         .ok_or_else(|| "ddlDiff: missing to".to_string())?;
+    // G3 边界（builder-check Q4）：table 的 to:null 曾是静默零语句——正是本批要消灭
+    // 的形态。DROP TABLE 是独立高危语义，不进 ddlDiff；显式参数错误。
+    if to.is_null() {
+        return Err("ddlDiff: to must not be null for objectType \"table\"".into());
+    }
     let from_v = spec.get("from");
 
     let from_cols = parse_columns("from", from_v.and_then(|v| v.get("columns")))?;
@@ -1433,6 +1549,151 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("NUL"), "{err}");
+    }
+
+    /// G3（REQ-09 §4.4）：view from=null → 单条 CREATE VIEW（两方言）。
+    #[test]
+    fn view_create_from_null() {
+        for (d, q) in [(Dialect::Postgres, "\""), (Dialect::MySql, "`")] {
+            let out = ddl_diff(
+                d,
+                &json!({"objectType":"view","name":"v","from":Value::Null,
+                    "to":{"definition":"SELECT 1 AS a"}}),
+            )
+            .unwrap();
+            assert_eq!(
+                out["statements"][0],
+                json!(format!("CREATE VIEW {q}v{q} AS SELECT 1 AS a"))
+            );
+            assert_eq!(out["warnings"], json!([]));
+        }
+    }
+
+    /// G3：view definition 差异 → PG CREATE OR REPLACE / MySQL ALTER VIEW + diff.definition。
+    #[test]
+    fn view_definition_diff_and_drop() {
+        let mk = |def: &str| {
+            json!({"objectType":"view","name":"v",
+                "from":{"definition":"SELECT 1"},"to":{"definition":def}})
+        };
+        let pg = ddl_diff(Dialect::Postgres, &mk("SELECT 2")).unwrap();
+        assert_eq!(
+            pg["statements"][0],
+            json!("CREATE OR REPLACE VIEW \"v\" AS SELECT 2")
+        );
+        assert_eq!(
+            pg["diff"]["definition"],
+            json!({"from":"SELECT 1","to":"SELECT 2"})
+        );
+        let my = ddl_diff(Dialect::MySql, &mk("SELECT 2")).unwrap();
+        assert!(
+            my["statements"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("ALTER VIEW `v` AS "),
+            "{my}"
+        );
+        // 相同 → 零语句。
+        let same = ddl_diff(Dialect::Postgres, &mk("SELECT 1")).unwrap();
+        assert_eq!(same["statements"], json!([]));
+        // drop（to=null）→ DROP VIEW。
+        let drop = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType":"view","name":"v",
+                "from":{"definition":"SELECT 1"},"to":Value::Null}),
+        )
+        .unwrap();
+        assert_eq!(drop["statements"][0], json!("DROP VIEW \"v\""));
+    }
+
+    /// G3：index/sequence/routine/trigger create（definition 原样）+ drop（PG 词法）。
+    #[test]
+    fn other_object_types_create_and_drop() {
+        let cases = [
+            (
+                "index",
+                "CREATE INDEX ix ON t (a)",
+                "DROP INDEX \"x\"",
+                json!({}),
+            ),
+            (
+                "sequence",
+                "CREATE SEQUENCE s START 100",
+                "DROP SEQUENCE \"x\"",
+                json!({}),
+            ),
+            (
+                "routine",
+                "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$",
+                "DROP FUNCTION \"x\"()",
+                json!({"type":"function","args":""}),
+            ),
+            (
+                "trigger",
+                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+                "DROP TRIGGER \"x\"",
+                json!({}),
+            ),
+        ];
+        for (ty, def, drop_sql, extra) in cases {
+            let from = if extra.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                json!({"definition":def, "type":extra["type"], "args":extra["args"]})
+            } else {
+                json!({"definition":def})
+            };
+            let out = ddl_diff(
+                Dialect::Postgres,
+                &json!({"objectType":ty,"name":"x","from":Value::Null,"to":{"definition":def}}),
+            )
+            .unwrap();
+            assert_eq!(out["statements"][0], json!(def), "{ty}");
+            let d = ddl_diff(
+                Dialect::Postgres,
+                &json!({"objectType":ty,"name":"x","from":from,"to":Value::Null}),
+            )
+            .unwrap();
+            assert_eq!(d["statements"][0], json!(drop_sql), "{ty}");
+        }
+    }
+
+    /// G3：边界——未知 objectType / 缺 definition / table to:null / MySQL index drop 缺 table。
+    #[test]
+    fn object_type_boundaries() {
+        assert!(
+            ddl_diff(
+                Dialect::Postgres,
+                &json!({"objectType":"materialized","name":"x",
+                "from":Value::Null,"to":{}})
+            )
+            .is_err()
+        );
+        assert!(
+            ddl_diff(
+                Dialect::Postgres,
+                &json!({"objectType":"view","name":"v",
+                "from":Value::Null,"to":{}})
+            )
+            .is_err(),
+            "缺 definition 参数错误"
+        );
+        assert!(
+            ddl_diff(
+                Dialect::Postgres,
+                &json!({"objectType":"table","name":"t",
+                "from":{"columns":[]},"to":Value::Null})
+            )
+            .is_err(),
+            "table to:null 参数错误"
+        );
+        assert!(
+            ddl_diff(
+                Dialect::MySql,
+                &json!({"objectType":"index","name":"ix",
+                "from":{"definition":"CREATE INDEX ix ON t (a)"},"to":Value::Null})
+            )
+            .is_err(),
+            "mysql index drop 缺 table 参数错误"
+        );
     }
 
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
