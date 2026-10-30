@@ -1088,10 +1088,13 @@ globalThis.DB = function (name) {
       // take a table name arg; views/routines/sequences/stats are whole-db.
       catalog: (kind, arg) => dbOpWrap(op_db_catalog(name, String(kind), arg === undefined ? null : String(arg), null)),
       // U-14 reverse DDL (v0.1.109): pure renderer, zero DB I/O. {objectType:"table", name,
-      // from, to} -> {diff, statements}; absent dimension = skip, empty array = drop all.
-      // Execution stays on db.exec + allow_ddl. sqlite/unknown dialect -> OJ_DB_UNSUPPORTED
-      // (capability=ddl_diff). Identifiers are quoted per dialect (never a charset whitelist);
-      // verbatim fragments (nativeType/default/definition) reject ';' and NUL.
+      // from, to} -> {diff, statements, warnings}; absent dimension = skip, empty array = drop all.
+      // Rename (REQ-13, v0.1.112): to.columns[].previousName emits RENAME COLUMN, shows up in
+      // diff.columns.renamed; a same-type drop+add without previousName lands in warnings
+      // (data loss) instead of staying silent. Execution stays on db.exec + allow_ddl.
+      // sqlite/unknown dialect -> OJ_DB_UNSUPPORTED (capability=ddl_diff). Identifiers are
+      // quoted per dialect (never a charset whitelist); verbatim fragments (nativeType/
+      // default/definition) reject ';' and NUL.
       ddlDiff: (spec) => dbOpWrap(op_db_ddl_diff(name, spec)),
       // SQL execution profile (v0.1.51, on by default in dev): per-request SQL stats + slow queries + events.
       // Returns { count, totalMs, slow, byDb, events }; empty object when tracing is off.

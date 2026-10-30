@@ -63,8 +63,8 @@ fn quote_literal(s: &str) -> String {
 // diff 主流程
 // ---------------------------------------------------------------------------
 
-/// Structure 列条目（与已发布 listColumns 同词汇 + identity/comment 可选）。
-#[derive(Debug)]
+/// Structure 列条目（与已发布 listColumns 同词汇 + identity/comment/previousName 可选）。
+#[derive(Debug, Clone)]
 struct ColSpec {
     name: String,
     native_type: String,
@@ -73,6 +73,8 @@ struct ColSpec {
     primary_key: bool,
     identity: Option<String>,
     comment: Option<String>,
+    /// REQ-13：to 侧声明「库里当前叫这个名字」→ 判 rename。
+    previous_name: Option<String>,
 }
 
 fn parse_columns(dim: &str, v: Option<&Value>) -> Result<Option<Vec<ColSpec>>, String> {
@@ -111,6 +113,13 @@ fn parse_columns(dim: &str, v: Option<&Value>) -> Result<Option<Vec<ColSpec>>, S
                 .unwrap_or(false),
             identity: c.get("identity").and_then(Value::as_str).map(String::from),
             comment: c.get("comment").and_then(Value::as_str).map(String::from),
+            previous_name: match c.get("previousName").and_then(Value::as_str) {
+                Some(p) => {
+                    quote_ident(Dialect::Postgres, p)?;
+                    Some(p.to_string())
+                }
+                None => None,
+            },
         });
     }
     Ok(Some(out))
@@ -154,6 +163,83 @@ fn parse_named_defs(
         }
     }
     Ok(Some(arr.clone()))
+}
+
+/// 词边界标识符替换（[A-Za-z0-9_$] 为标识符字符）——只用于 diff 比较，不进语句渲染。
+/// 已知窄窗：definition 字符串字面量内含与旧列名同形的词会被一并替换，
+/// 可能把「真变更」判成未变而漏发 DDL——devkit 登记，重放后人工核对此类约束。
+fn subst_idents(text: &str, map: &std::collections::HashMap<&str, &str>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() {
+                out.push_str(map.get(cur.as_str()).copied().unwrap_or(cur.as_str()));
+                cur.clear();
+            }
+            out.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        out.push_str(map.get(cur.as_str()).copied().unwrap_or(cur.as_str()));
+    }
+    out
+}
+
+/// REQ-13：rename 计划——只认 to 侧显式 previousName；启发式猜测不进自动路径。
+/// 六边界校验（REQ-13 §4.3），返回 (旧名, 新名) 对子（spec 顺序）。
+fn plan_renames(from: &[ColSpec], to: &[ColSpec]) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let from_names: std::collections::HashSet<&str> =
+        from.iter().map(|c| c.name.as_str()).collect();
+    for tc in to {
+        let Some(p) = tc.previous_name.as_deref() else {
+            continue;
+        };
+        if p == tc.name {
+            continue; // previousName === name → 普通同名列
+        }
+        if !from_names.contains(p) {
+            return Err(format!(
+                "ddlDiff: to.columns[].previousName {p:?} not found in from.columns"
+            ));
+        }
+        if out.iter().any(|(f, _)| f == p) {
+            return Err(format!(
+                "ddlDiff: to.columns[].previousName {p:?} is claimed by multiple columns"
+            ));
+        }
+        // 目标名冲突：from 已有同名列，且该列没有被其它 rename 换走。
+        if from_names.contains(tc.name.as_str())
+            && !to
+                .iter()
+                .any(|x| x.previous_name.as_deref() == Some(tc.name.as_str()))
+        {
+            return Err(format!(
+                "ddlDiff: rename target {:?} conflicts with an existing column",
+                tc.name
+            ));
+        }
+        out.push((p.to_string(), tc.name.clone()));
+    }
+    for tc in to {
+        if tc.previous_name.is_none() && out.iter().any(|(f, _)| *f == tc.name) {
+            return Err(format!(
+                "ddlDiff: column {:?} occupies a name being renamed away",
+                tc.name
+            ));
+        }
+    }
+    for (f, t) in &out {
+        if out.iter().any(|(f2, t2)| f2 == t && t2 == f) {
+            return Err(
+                "ddlDiff: rename swap is not supported (capability=ddl_diff_rename_swap)".into(),
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn str_field(e: &Value, k: &str) -> Option<String> {
@@ -304,6 +390,63 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         }
     }
 
+    // ---------------- REQ-13 rename 计划 ----------------
+    let renames: Vec<(String, String)> = match (from_cols.as_deref(), to_cols.as_deref()) {
+        (Some(f), Some(t)) => plan_renames(f, t)?,
+        // 列维度任一端缺省 = 不参与 diff，previousName 同样不生效。
+        _ => Vec::new(),
+    };
+    let rename_map: std::collections::HashMap<&str, &str> = renames
+        .iter()
+        .map(|(f, t)| (f.as_str(), t.as_str()))
+        .collect();
+    // from 侧列名对齐到新名：added/removed/changed 按新名配对，renamed-from 不再参与删/增。
+    let from_cols_adj: Option<Vec<ColSpec>> = from_cols.as_ref().map(|cs| {
+        cs.iter()
+            .map(|c| match rename_map.get(c.name.as_str()) {
+                Some(new) => ColSpec {
+                    name: new.to_string(),
+                    ..c.clone()
+                },
+                None => c.clone(),
+            })
+            .collect()
+    });
+    // 命名维度的列成员随改名对齐——PG/MySQL RENAME 自动跟随依赖对象，
+    // 对齐后未变的维度产零语句（不 DROP+重建）。
+    let subst_dim = |defs: &Option<Vec<Value>>| -> Option<Vec<Value>> {
+        defs.as_ref().map(|arr| {
+            arr.iter()
+                .map(|e| {
+                    let mut e2 = e.clone();
+                    // definition 片段同样随改名对齐（比较口径；语句永远渲染 to 侧原文）。
+                    if let Some(def) = e2.get("definition").and_then(Value::as_str) {
+                        e2["definition"] = json!(subst_idents(def, &rename_map));
+                    }
+                    for k in ["columns", "refColumns"] {
+                        if let Some(members) = e2.get(k).and_then(Value::as_array) {
+                            let sub: Vec<Value> = members
+                                .iter()
+                                .map(|m| match m.as_str() {
+                                    Some(s) => rename_map
+                                        .get(s)
+                                        .map(|n| json!(n))
+                                        .unwrap_or_else(|| m.clone()),
+                                    None => m.clone(),
+                                })
+                                .collect();
+                            e2[k] = json!(sub);
+                        }
+                    }
+                    e2
+                })
+                .collect()
+        })
+    };
+    let from_cons = subst_dim(&from_cons);
+    let from_idxs = subst_dim(&from_idxs);
+    let from_fks = subst_dim(&from_fks);
+
     let mut diff = serde_json::Map::new();
     let mut stmts: Vec<String> = Vec::new();
     // ---------------- 新建表（from = null）----------------
@@ -397,7 +540,12 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         diff.insert("constraints".into(), dim(names(&to_cons)));
         diff.insert("indexes".into(), dim(names(&to_idxs)));
         diff.insert("foreignKeys".into(), dim(names(&to_fks)));
-        return Ok(json!({ "diff": Value::Object(diff), "statements": stmts }));
+        // 建表路径无 from → 恒无告警；warnings 键恒在（schema 稳定）。
+        return Ok(json!({
+            "diff": Value::Object(diff),
+            "statements": stmts,
+            "warnings": Vec::<String>::new(),
+        }));
     }
 
     let mut push_dim = |key: &str, added: Vec<Value>, removed: Vec<Value>, changed: Vec<Value>| {
@@ -410,7 +558,7 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     // ---------------- 维度缺省 = 不参与 diff；空数组 = DROP 全量 ----------------
     // 列。
     // 列维度任一端缺省 = 不参与（与具名维度同语义——否则缺省端会被当空表全量 ADD/DROP）。
-    let added_c: Vec<Value> = match (&from_cols, &to_cols) {
+    let added_c: Vec<Value> = match (&from_cols_adj, &to_cols) {
         (Some(f), Some(t)) => t
             .iter()
             .filter(|c| !f.iter().any(|x| x.name == c.name))
@@ -418,7 +566,7 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             .collect(),
         _ => Vec::new(),
     };
-    let removed_c: Vec<Value> = match (&from_cols, &to_cols) {
+    let removed_c: Vec<Value> = match (&from_cols_adj, &to_cols) {
         (Some(f), Some(t)) => f
             .iter()
             .filter(|c| !t.iter().any(|x| x.name == c.name))
@@ -426,14 +574,39 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             .collect(),
         _ => Vec::new(),
     };
-    let changed_c = match (&from_cols, &to_cols) {
+    let mut changed_c = match (&from_cols_adj, &to_cols) {
         (Some(f), Some(t)) => col_diff_entries(f, t),
         _ => Vec::new(),
     };
+    // rename 对子进 changed（name 条目），语句单独发（RENAME），不进 MODIFY/ALTER dispatch。
+    for (f, t) in &renames {
+        changed_c.push(json!({"name": t, "field": "name", "from": f, "to": t}));
+    }
+    // REQ-13 §4.4：显式 rename 已消掉真对子，余下的同型一删一增 = 疑似改名 → 告警不静默。
+    let mut warnings: Vec<String> = Vec::new();
+    if let (Some(fadj), Some(tlist)) = (&from_cols_adj, &to_cols) {
+        for r in &removed_c {
+            let rn = r.as_str().unwrap_or("");
+            let Some(fc) = fadj.iter().find(|c| c.name == rn) else {
+                continue;
+            };
+            for a in &added_c {
+                let an = a.as_str().unwrap_or("");
+                let Some(tc) = tlist.iter().find(|c| c.name == an) else {
+                    continue;
+                };
+                if fc.native_type == tc.native_type {
+                    warnings.push(format!(
+                        "疑似重命名：{rn} → {an}，将按删列 + 建列执行，数据会丢失"
+                    ));
+                }
+            }
+        }
+    }
     // MySQL 位置 diff（PG 无列位置 DDL → 忽略，api-manual 写明）。
     let mut position_changes: Vec<Value> = Vec::new();
     if d == Dialect::MySql
-        && let (Some(f), Some(t)) = (&from_cols, &to_cols)
+        && let (Some(f), Some(t)) = (&from_cols_adj, &to_cols)
     {
         for tc in t {
             let Some(fc) = f.iter().find(|x| x.name == tc.name) else {
@@ -479,6 +652,19 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         fk_diff.1.clone(),
         fk_diff.2.clone(),
     );
+    // REQ-13：renamed 键恒在（干净为空数组），前端据此渲染「重命名」而非「删 A / 增 B」。
+    // 注意须在 push_dim 闭包用完之后（闭包持有 diff 的可变借用）。
+    if let Some(Value::Object(m)) = diff.get_mut("columns") {
+        m.insert(
+            "renamed".into(),
+            json!(
+                renames
+                    .iter()
+                    .map(|(f, t)| json!({"from": f, "to": t}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
 
     // ---------------- statements：DROP（FK → 约束 → 索引 → 列）→ 列变更 → ADD ----------------
     let changed_names =
@@ -567,6 +753,15 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             });
         }
     }
+    // REQ-13 §4.2：RENAME 先于一切列定义变更（在 DROP INDEX/CONSTRAINT 之后、DROP COLUMN 之前），
+    // 改类型等语句一律打在新名上。
+    for (old, new) in &renames {
+        stmts.push(format!(
+            "ALTER TABLE {t} RENAME COLUMN {} TO {}",
+            quote_ident(d, old)?,
+            quote_ident(d, new)?
+        ));
+    }
     // 列 DROP（最后）。
     for c in &removed_c {
         let n = quote_ident(d, c.as_str().unwrap_or(""))?;
@@ -576,12 +771,15 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     // 列变更。PG 逐字段；MySQL 按列合并 MODIFY。
     match d {
         Dialect::MySql => {
-            if let (Some(fc_list), Some(tc_list)) = (&from_cols, &to_cols) {
+            if let (Some(fc_list), Some(tc_list)) = (&from_cols_adj, &to_cols) {
                 for tc in tc_list {
                     if !fc_list.iter().any(|x| x.name == tc.name) {
                         continue;
                     }
-                    let touched = changed_c.iter().any(|e| e["name"] == json!(tc.name))
+                    // field=="name"（rename）不进 MODIFY——RENAME 语句已单独发。
+                    let touched = changed_c
+                        .iter()
+                        .any(|e| e["name"] == json!(tc.name) && e["field"] != json!("name"))
                         || position_changes.iter().any(|e| e["name"] == json!(tc.name));
                     if !touched {
                         continue;
@@ -648,7 +846,7 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     }
 
     // ADD 列（列维度任一端缺省 = 不参与，同 DROP）。
-    if let (Some(f), Some(tc)) = (&from_cols, &to_cols) {
+    if let (Some(f), Some(tc)) = (&from_cols_adj, &to_cols) {
         for c in tc {
             if !f.iter().any(|x| x.name == c.name) {
                 let after = {
@@ -749,7 +947,11 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         }
     }
 
-    Ok(json!({ "diff": Value::Object(diff), "statements": stmts }))
+    Ok(json!({
+        "diff": Value::Object(diff),
+        "statements": stmts,
+        "warnings": warnings,
+    }))
 }
 
 /// FK ADD 语句（两方言同形：ADD CONSTRAINT ... FOREIGN KEY (...) REFERENCES ..(...))。
@@ -954,6 +1156,185 @@ mod tests {
             .join("\n");
         assert!(text2.contains("DROP FOREIGN KEY `fk_a`"), "{text2}");
         assert!(text2.contains("DROP INDEX `ix_a`"), "{text2}");
+    }
+
+    /// REQ-13：previousName 命中 → 单条 RENAME COLUMN，无 DROP/ADD；
+    /// changed 携带 name 条目，diff.columns.renamed 记录对子。
+    #[test]
+    fn rename_produces_single_statement_pg_mysql() {
+        let spec = json!({"objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"}]}});
+        let (pg, my) = both(spec);
+        assert_eq!(
+            pg["statements"],
+            json!(["ALTER TABLE \"t\" RENAME COLUMN \"a\" TO \"b\""])
+        );
+        assert_eq!(
+            my["statements"],
+            json!(["ALTER TABLE `t` RENAME COLUMN `a` TO `b`"])
+        );
+        assert_eq!(
+            pg["diff"]["columns"]["renamed"],
+            json!([{"from": "a", "to": "b"}])
+        );
+        assert!(
+            pg["diff"]["columns"]["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == &json!({"name": "b", "field": "name", "from": "a", "to": "b"}))
+        );
+        assert_eq!(pg["warnings"], json!([]));
+    }
+
+    /// REQ-13 §4.3：六种边界——错必拒（400 文案），previousName===name 视为普通列。
+    #[test]
+    fn rename_boundary_errors() {
+        let from1 = json!({"columns": [{"name": "a", "nativeType": "int4"}]});
+        // previousName 不在 from。
+        let e = ddl_diff(
+            Dialect::Postgres,
+            &json!({
+            "objectType": "table", "name": "t", "from": from1.clone(),
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "x"}]}}),
+        )
+        .unwrap_err();
+        assert!(e.contains("previousName") && e.contains("not found"), "{e}");
+        // 两个 to 列指向同一 previousName。
+        let e = ddl_diff(Dialect::Postgres, &json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}, {"name": "c", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"},
+                               {"name": "d", "nativeType": "int4", "previousName": "a"}]}}))
+        .unwrap_err();
+        assert!(e.contains("previousName"), "{e}");
+        // 互换 a↔b。
+        let e = ddl_diff(Dialect::Postgres, &json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}, {"name": "b", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"},
+                               {"name": "a", "nativeType": "int4", "previousName": "b"}]}}))
+        .unwrap_err();
+        assert!(e.contains("ddl_diff_rename_swap"), "{e}");
+        // 目标名在 from 已存在（未被换走）。
+        let e = ddl_diff(Dialect::Postgres, &json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}, {"name": "b", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"}]}}))
+        .unwrap_err();
+        assert!(e.contains("conflict"), "{e}");
+        // to 既有 previousName:"a" 的列，又有一列 name:"a"。
+        let e = ddl_diff(Dialect::Postgres, &json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}, {"name": "c", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"},
+                               {"name": "a", "nativeType": "int4"}]}}))
+        .unwrap_err();
+        assert!(e.contains("occupies"), "{e}");
+        // previousName === name → 普通列（OK，无 rename 语句）。
+        let (pg, _) = both(json!({
+            "objectType": "table", "name": "t", "from": from1.clone(),
+            "to": {"columns": [{"name": "a", "nativeType": "int8", "previousName": "a"}]}}));
+        let text = pg["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("RENAME"), "{text}");
+    }
+
+    /// REQ-13 §4.4：同型一删一增（无 previousName）→ warnings 告警，语句仍 DROP+ADD。
+    #[test]
+    fn ambiguous_same_type_drop_add_warns() {
+        let (pg, _) = both(json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4"}]}}));
+        let warns = pg["warnings"].as_array().unwrap();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        let w = warns[0].as_str().unwrap();
+        assert!(
+            w.contains('a') && w.contains('b') && w.contains("数据"),
+            "{w}"
+        );
+        let text = pg["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("DROP COLUMN") && text.contains("ADD COLUMN"),
+            "{text}"
+        );
+        // 干净结果：warnings 恒为空数组（schema 稳定）。
+        let (clean, _) = both(json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "a", "nativeType": "int4"}]}}));
+        assert_eq!(clean["warnings"], json!([]));
+    }
+
+    /// REQ-13 §4.2：改名 + 改类型——RENAME 在先，变更语句用新名。
+    #[test]
+    fn rename_plus_type_change_orders_and_uses_new_name() {
+        let (pg, my) = both(json!({
+            "objectType": "table", "name": "t",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int8", "previousName": "a"}]}}));
+        let ss = pg["statements"].as_array().unwrap();
+        assert_eq!(
+            ss[0],
+            json!("ALTER TABLE \"t\" RENAME COLUMN \"a\" TO \"b\"")
+        );
+        assert_eq!(
+            ss[1],
+            json!("ALTER TABLE \"t\" ALTER COLUMN \"b\" TYPE int8 USING \"b\"::int8")
+        );
+        let ss = my["statements"].as_array().unwrap();
+        assert_eq!(ss[0], json!("ALTER TABLE `t` RENAME COLUMN `a` TO `b`"));
+        assert!(
+            ss[1].as_str().unwrap().contains("MODIFY COLUMN `b`"),
+            "{ss:?}"
+        );
+    }
+
+    /// REQ-13 §4.2：被索引/约束引用的列改名——依赖对象随 rename 走，不重建。
+    #[test]
+    fn rename_keeps_index_and_constraint() {
+        let from = json!({
+            "columns": [{"name": "a", "nativeType": "int4"}],
+            "indexes": [{"name": "ix_a", "unique": false, "primary": false, "columns": ["a"]}],
+            "constraints": [{"name": "uq_a", "type": "uq", "definition": "UNIQUE (a)", "columns": ["a"]}],
+        });
+        let to = json!({
+            "columns": [{"name": "b", "nativeType": "int4", "previousName": "a"}],
+            "indexes": [{"name": "ix_a", "unique": false, "primary": false, "columns": ["b"]}],
+            "constraints": [{"name": "uq_a", "type": "uq", "definition": "UNIQUE (b)", "columns": ["b"]}],
+        });
+        let (pg, my) = both(json!({"objectType": "table", "name": "t", "from": from, "to": to}));
+        for v in [pg, my] {
+            let text = v["statements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !text.contains("DROP INDEX") && !text.contains("DROP CONSTRAINT"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("CREATE INDEX") && !text.contains("ADD CONSTRAINT"),
+                "{text}"
+            );
+            assert!(text.contains("RENAME COLUMN"), "{text}");
+        }
     }
 
     /// 畸形 Structure → 参数错误（Err），不 panic。

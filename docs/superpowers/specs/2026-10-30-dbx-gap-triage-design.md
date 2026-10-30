@@ -74,6 +74,11 @@ FfiFuture 取消语义 / 流式进度回调、（仅当旁路被证不足）非�
    db_ddl.rs「缺省=不参与 diff」的显式 spec 气质同构；启发式猜测（同类型同位置）只做
    **fallback 提示**，不进自动路径。列改名 = `RENAME COLUMN`（PG）/ `RENAME COLUMN`（MySQL 8），
    杜绝今天的 DROP+ADD 丢数据。
+   > **批次 2 修订（2026-10-30）**：表面契约以下游 REQ-13 原文为准——
+   > `to.columns[].previousName`（非顶层 `renames` 数组；下游已按此承诺发送并写了
+   > 六边界验收）。语义裁决不变：显式-only、启发式只做 warnings 兜底不进自动路径。
+   > MySQL 版本门槛采 REQ-13 §4.5 方案②：直接生成 8.0 语法，5.7 让 apply 阶段报错
+   > （`DialectCaps` 无版本探测，不为它扩 ABI）。
 2. **schema 定向（0.5d）**：`name` 从裸标识符放宽为 `"schema.name"` 或 `{schema, name}`，
    每段**独立**过 `quote_ident`（NUL/控制字符照拒、段数 ≤2）。分段引用仍在引用通道内，
    不触 SQL 注入红线。
