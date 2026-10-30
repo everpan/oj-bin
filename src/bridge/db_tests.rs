@@ -425,6 +425,128 @@ async fn listing_and_for_schema_matrix_pg_mysql() {
     }
 }
 
+/// REQ-08 §3.1–3.3（env-gated 真库，走完整 op 链）：routines 元数据补全 +
+/// `catalog("ddl")` 对象路由——PG 例程回退（pg_get_functiondef）+ 视图补壳；
+/// MySQL 对象探测 → SHOW CREATE VIEW/FUNCTION。
+#[tokio::test(flavor = "current_thread")]
+async fn real_catalog_routines_and_ddl_routing_pg_mysql() {
+    // ---- PG 腿 ----
+    if let Ok(url) = std::env::var("OJ_TEST_PG") {
+        if !url.is_empty() {
+            let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+            for s in [
+                "drop function if exists f_req08(int,int)",
+                "drop view if exists v_req08",
+                "create function f_req08(a int, b int) returns int language sql as $$ select a + b $$",
+                "create view v_req08 as select 1 as x",
+            ] {
+                db.exec_with_params(s, &[]).await.unwrap();
+            }
+            let b = Bridge::with_dbs_and_loader(
+                std::collections::HashMap::from([("default".to_string(), db as _)]),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                Default::default(),
+            );
+            let cap = b
+                .run_with(
+                    r#"(async () => {
+                         const fnDdl = await db.catalog("ddl", "f_req08");
+                         const vw = await db.catalog("ddl", "v_req08");
+                         const routines = await db.catalog("routines");
+                         const r = (routines.items || []).find((x) => x.name === "f_req08");
+                         json.ok({ fn: fnDdl.items[0], vw: vw.items[0], r });
+                       })().catch(e => json.fail(500, String(e)))"#,
+                    crate::bridge::RequestInfo::default(),
+                )
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{v}");
+            let ddl = v["data"]["fn"]["ddl"].as_str().unwrap_or("");
+            assert!(
+                ddl.starts_with("CREATE OR REPLACE FUNCTION"),
+                "例程 DDL 须可执行: {ddl}"
+            );
+            assert_eq!(v["data"]["fn"]["objectType"], json!("function"));
+            let vddl = v["data"]["vw"]["ddl"].as_str().unwrap_or("");
+            assert!(
+                vddl.starts_with("CREATE OR REPLACE VIEW"),
+                "视图 DDL 须补壳: {vddl}"
+            );
+            let r = &v["data"]["r"];
+            assert!(r["args"].as_str().unwrap_or("").contains("a"), "{r}");
+            assert_eq!(r["returns"], json!("integer"));
+            assert!(r["source"].as_str().unwrap_or("").contains("a + b"), "{r}");
+            assert_eq!(r["language"], json!("sql"));
+        }
+    } else {
+        eprintln!("skip: OJ_TEST_PG unset");
+    }
+    // ---- MySQL 腿 ----
+    if let Ok(url) = std::env::var("OJ_TEST_MYSQL") {
+        if !url.is_empty() {
+            let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+            db.exec_with_params("drop view if exists v_req08", &[])
+                .await
+                .unwrap();
+            // CREATE FUNCTION 不在 MySQL prepared 协议支持集（1295）——setup 走原始
+            // 文本协议；SHOW 族经 prepared 协议可用（同用户真实路径的读侧）。
+            let pool = sqlx::MySqlPool::connect(&url).await.unwrap();
+            for s in [
+                "drop function if exists f_req08",
+                "create function f_req08(a int) returns int deterministic return a",
+            ] {
+                sqlx::raw_sql(s).execute(&pool).await.unwrap();
+            }
+            db.exec_with_params("create view v_req08 as select 1 as x", &[])
+                .await
+                .unwrap();
+            let b = Bridge::with_dbs_and_loader(
+                std::collections::HashMap::from([("default".to_string(), db as _)]),
+                Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                None,
+                Default::default(),
+            );
+            let cap = b
+                .run_with(
+                    r#"(async () => {
+                         const fnDdl = await db.catalog("ddl", "f_req08");
+                         const vw = await db.catalog("ddl", "v_req08");
+                         const routines = await db.catalog("routines");
+                         const r = (routines.items || []).find((x) => x.name === "f_req08");
+                         json.ok({ fn: fnDdl.items[0], vw: vw.items[0], r });
+                       })().catch(e => json.fail(500, String(e)))"#,
+                    crate::bridge::RequestInfo::default(),
+                )
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&cap.body).unwrap();
+            assert_eq!(v["code"], 0, "{v}");
+            let ddl = v["data"]["fn"]["ddl"].as_str().unwrap_or("");
+            assert!(
+                ddl.to_uppercase().starts_with("CREATE") && ddl.to_uppercase().contains("FUNCTION"),
+                "函数 DDL 须可执行: {ddl}"
+            );
+            let vddl = v["data"]["vw"]["ddl"].as_str().unwrap_or("");
+            assert!(
+                vddl.to_uppercase().starts_with("CREATE") && vddl.to_uppercase().contains("VIEW"),
+                "视图 DDL 不再 400: {vddl}"
+            );
+            let r = &v["data"]["r"];
+            assert_eq!(r["volatility"], json!("deterministic"));
+            // 未显式声明 SECURITY INVOKER → MySQL 默认 DEFINER → true（如实映射）。
+            assert_eq!(r["securityDefiner"], json!(true));
+        }
+    } else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
+    }
+}
+
 /// 缺陷修复（env-gated 真库矩阵腿）：listIndexes / listForeignKeys 的投影别名含
 /// 保留字（column / unique / primary），MySQL 8 / PG 下裸投影必现语法错误；以及
 /// scoped（forSchema）下 PG 的 scope 占位符序错致静默空结果

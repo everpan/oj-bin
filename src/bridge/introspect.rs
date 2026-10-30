@@ -234,7 +234,18 @@ pub fn sql(kind: Kind, d: Dialect) -> &'static str {
 /// mysql `SHOW CREATE TABLE` 是**唯一**允许标识符内联的成文例外（铁律 1）：
 /// SHOW 族不接受绑定参数。防线 = 严格白名单字符集（`[A-Za-z0-9_$]`）+ 反引号引用
 /// （校验后本已无反引号，翻倍是纵深）。违规 → Err（`OJ_DB_UNSUPPORTED` 由调用方构造）。
-pub fn mysql_show_create(table: &str) -> Result<String, String> {
+/// REQ-08 §3.2：按探测出的对象类型选 SHOW 动词（table/view/function/procedure）。
+/// 未知类型回退 TABLE——保住「对象不存在」时今天的 fail-loud 报错形态。
+pub fn mysql_show_verb(object_type: &str) -> &'static str {
+    match object_type {
+        "view" => "SHOW CREATE VIEW",
+        "function" => "SHOW CREATE FUNCTION",
+        "procedure" => "SHOW CREATE PROCEDURE",
+        _ => "SHOW CREATE TABLE",
+    }
+}
+
+pub fn mysql_show_create_typed(table: &str, object_type: &str) -> Result<String, String> {
     if table.is_empty()
         || !table
             .bytes()
@@ -242,7 +253,41 @@ pub fn mysql_show_create(table: &str) -> Result<String, String> {
     {
         return Err(format!("invalid identifier for SHOW CREATE: {table:?}"));
     }
-    Ok(format!("SHOW CREATE TABLE `{}`", table.replace('`', "``")))
+    Ok(format!(
+        "{} `{}`",
+        mysql_show_verb(object_type),
+        table.replace('`', "``")
+    ))
+}
+
+/// REQ-08 §3.2：MySQL ddl 路由的对象类型探测（名字跨表/视图/例程三查合一；
+/// 绑定参数 ×3，DATABASE() 谓词照铁律）。返回首行 object_type（无 → 空行集）。
+pub const MYSQL_OBJECT_TYPE: &str = "SELECT 'table' AS object_type \
+     FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? \
+     UNION ALL \
+     SELECT 'view' FROM information_schema.views \
+     WHERE table_schema = DATABASE() AND table_name = ? \
+     UNION ALL \
+     SELECT LOWER(routine_type) FROM information_schema.routines \
+     WHERE routine_schema = DATABASE() AND routine_name = ?";
+
+/// REQ-08 §3.2：PG 例程 DDL 回退（relkind 探测未命中后按名探测 pg_proc；
+/// pg_get_functiondef 一条给完整可执行 DDL）。object_type ∈ function|procedure。
+pub const PG_ROUTINE_DDL: &str = "SELECT p.proname::text AS name, \
+     pg_get_functiondef(p.oid)::text AS ddl, \
+     CASE WHEN p.prokind = 'p' THEN 'procedure' ELSE 'function' END AS object_type \
+     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = current_schema() AND p.proname = ?";
+
+/// REQ-08 §3.3：pg_get_viewdef 片段补壳为可执行 DDL（剥尾分号；物化走 MATERIALIZED）。
+pub fn pg_view_wrap(name: &str, viewdef: &str, materialized: bool) -> String {
+    let def = viewdef.trim_end().trim_end_matches(';');
+    let kw = if materialized {
+        "CREATE MATERIALIZED VIEW"
+    } else {
+        "CREATE OR REPLACE VIEW"
+    };
+    format!("{kw} {} AS {def}", pg_quote_ident(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -552,16 +597,25 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
                   WHERE c.relkind IN ('v','m') AND n.nspname = current_schema() \
                   ORDER BY c.relname",
         ),
-        // ---------------- routines（函数/存储过程清单）----------------
+        // ---------------- routines（函数/存储过程清单；REQ-08 §3.1 元数据补全）----------------
         (Kind::Routines, Dialect::MySql) => Some(
-            "SELECT routine_name AS name, routine_type AS type \
+            "SELECT routine_name AS name, routine_type AS type, \
+                  routine_definition AS source, data_type AS returns, \
+                  is_deterministic AS `deterministic`, security_type AS `security`, \
+                  routine_comment AS comment \
                   FROM information_schema.routines \
                   WHERE routine_schema = DATABASE() ORDER BY routine_name, routine_type",
         ),
         (Kind::Routines, Dialect::Postgres) => Some(
             "SELECT p.proname::text AS name, \
-                  CASE WHEN p.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS type \
+                  CASE WHEN p.prokind = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS type, \
+                  pg_get_function_arguments(p.oid)::text AS args, \
+                  pg_get_function_result(p.oid)::text AS returns, \
+                  p.prosrc::text AS source, l.lanname::text AS language, \
+                  p.provolatile::text AS volatility, p.prosecdef AS secdef, \
+                  obj_description(p.oid, 'pg_proc')::text AS comment \
                   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  JOIN pg_language l ON l.oid = p.prolang \
                   WHERE n.nspname = current_schema() ORDER BY p.proname",
         ),
         // ---------------- sequences（sqlite 无 catalog → unsupported；mysql 为模拟）----------------
@@ -726,20 +780,59 @@ pub fn catalog(kind: Kind, rows: Vec<Value>) -> (Vec<Value>, bool) {
                     Kind::Views | Kind::Ddl => {
                         // mysql SHOW CREATE 的列名是 `Table`/`Create Table`（View 同理）——
                         // name/ddl 都要兜回落（评审 R.1：mysql 侧 name 恒空串）。
+                        // REQ-08 §3.2：Create Function/Procedure 同例；objectType 随
+                        // PG 例程探测透传（mysql SHOW 结果不带类型 → null，devkit 登记）。
                         let name = {
                             let n = str_of(r, "name");
-                            if n.is_empty() {
-                                str_of(r, "Table")
-                            } else {
-                                n
-                            }
+                            if n.is_empty() { str_of(r, "Table") } else { n }
                         };
                         json!({
                             "name": name,
-                            "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table"))).or_else(|| opt_str(r.get("Create View"))),
+                            "ddl": opt_str(r.get("ddl")).or_else(|| opt_str(r.get("Create Table")))
+                                .or_else(|| opt_str(r.get("Create View")))
+                                .or_else(|| opt_str(r.get("Create Function")))
+                                .or_else(|| opt_str(r.get("Create Procedure"))),
+                            "objectType": opt_str(r.get("object_type")),
                         })
                     }
-                    Kind::Routines | Kind::Sequences => json!({
+                    Kind::Routines => {
+                        // REQ-08 §3.1：volatility 跨方言归一（pg provolatile / mysql deterministic）。
+                        let vol_raw = {
+                            let v = str_of(r, "volatility");
+                            if v.is_empty() {
+                                str_of(r, "deterministic")
+                            } else {
+                                v
+                            }
+                        };
+                        let volatility = match vol_raw.as_str() {
+                            "i" => Some("immutable"),
+                            "s" => Some("stable"),
+                            "v" => Some("volatile"),
+                            "YES" => Some("deterministic"),
+                            "NO" => Some("nondeterministic"),
+                            _ => None,
+                        };
+                        let secdef = r.get("secdef").and_then(Value::as_bool).or_else(|| {
+                            match str_of(r, "security").as_str() {
+                                "DEFINER" => Some(true),
+                                "INVOKER" => Some(false),
+                                _ => None,
+                            }
+                        });
+                        json!({
+                            "name": str_of(r, "name"),
+                            "type": str_of(r, "type"),
+                            "args": opt_str(r.get("args")),
+                            "returns": opt_str(r.get("returns")),
+                            "source": opt_str(r.get("source")),
+                            "language": opt_str(r.get("language")),
+                            "volatility": volatility,
+                            "securityDefiner": secdef,
+                            "comment": opt_str(r.get("comment")),
+                        })
+                    }
+                    Kind::Sequences => json!({
                         "name": str_of(r, "name"),
                         "type": str_of(r, "type"),
                     }),
@@ -1199,6 +1292,88 @@ mod tests {
         assert_eq!(roles[0]["name"], "r");
     }
 
+    /// REQ-08 §3.1（v0.1.112）：routines items 带元数据键集（缺省 null，schema 稳定）。
+    #[test]
+    fn routines_shape_carries_metadata() {
+        let (items, _) = catalog(
+            Kind::Routines,
+            vec![json!({
+                "name": "f_add", "type": "FUNCTION", "args": "a integer, b integer",
+                "returns": "integer", "source": "select a+b", "language": "sql",
+                "volatility": "s", "secdef": true, "comment": "c"
+            })],
+        );
+        let it = &items[0];
+        for k in [
+            "args",
+            "returns",
+            "source",
+            "language",
+            "volatility",
+            "securityDefiner",
+            "comment",
+        ] {
+            assert!(it.get(k).is_some(), "missing {k}: {it:?}");
+        }
+        assert_eq!(it["volatility"], "stable");
+        assert_eq!(it["securityDefiner"], json!(true));
+        // mysql 行（deterministic/security 词汇）同口径。
+        let (my, _) = catalog(
+            Kind::Routines,
+            vec![json!({
+                "name": "p", "type": "PROCEDURE", "deterministic": "YES",
+                "security": "DEFINER"
+            })],
+        );
+        assert_eq!(my[0]["volatility"], "deterministic");
+        assert_eq!(my[0]["securityDefiner"], json!(true));
+        // sequences 维度零变化（仍只有 name/type）。
+        let (seq, _) = catalog(
+            Kind::Sequences,
+            vec![json!({"name": "s", "type": "sequence"})],
+        );
+        assert_eq!(seq[0], json!({"name": "s", "type": "sequence"}));
+    }
+
+    /// REQ-08 §3.3：pg_get_viewdef 片段补壳（剥尾分号）为可执行 DDL。
+    #[test]
+    fn pg_view_wrap_adds_create_shell() {
+        assert_eq!(
+            pg_view_wrap("v", " SELECT 1 AS v;", false),
+            "CREATE OR REPLACE VIEW \"v\" AS  SELECT 1 AS v"
+        );
+        assert!(pg_view_wrap("mv", "SELECT 1", true).starts_with("CREATE MATERIALIZED VIEW"));
+        assert!(pg_view_wrap("v", "SELECT 1;", false).ends_with("SELECT 1"));
+    }
+
+    /// REQ-08 §3.2 新常量守卫：PG 例程 DDL（scope 谓词 / 单参数位 / name 域 cast / 无 LIKE）；
+    /// MySQL 对象类型探测（DATABASE() 谓词 ×3、3 参数位、无 LIKE）。
+    #[test]
+    fn req08_routing_constant_guards() {
+        assert!(
+            PG_ROUTINE_DDL.contains("current_schema()"),
+            "{PG_ROUTINE_DDL}"
+        );
+        assert_eq!(PG_ROUTINE_DDL.matches('?').count(), 1, "{PG_ROUTINE_DDL}");
+        assert!(PG_ROUTINE_DDL.contains("proname::text"), "{PG_ROUTINE_DDL}");
+        assert!(!PG_ROUTINE_DDL.contains("LIKE"), "{PG_ROUTINE_DDL}");
+        assert!(
+            MYSQL_OBJECT_TYPE.contains("DATABASE()"),
+            "{MYSQL_OBJECT_TYPE}"
+        );
+        assert_eq!(
+            MYSQL_OBJECT_TYPE.matches('?').count(),
+            3,
+            "{MYSQL_OBJECT_TYPE}"
+        );
+        assert!(!MYSQL_OBJECT_TYPE.contains("LIKE"), "{MYSQL_OBJECT_TYPE}");
+        // SHOW 动词路由。
+        assert_eq!(mysql_show_verb("table"), "SHOW CREATE TABLE");
+        assert_eq!(mysql_show_verb("view"), "SHOW CREATE VIEW");
+        assert_eq!(mysql_show_verb("function"), "SHOW CREATE FUNCTION");
+        assert_eq!(mysql_show_verb("procedure"), "SHOW CREATE PROCEDURE");
+    }
+
     // ---- U-14 批 a：catalog 类的静态守卫（同一组离线防线扩展）----
 
     const CATALOG: [Kind; 10] = [
@@ -1337,12 +1512,19 @@ mod tests {
         }
     }
 
-    /// mysql SHOW 例外：白名单字符集 + 反引号引用；非法标识符拒绝。
+    /// mysql SHOW 例外：白名单字符集 + 反引号引用；非法标识符拒绝；REQ-08 动词路由。
     #[test]
     fn mysql_show_create_whitelist() {
-        assert_eq!(mysql_show_create("t").unwrap(), "SHOW CREATE TABLE `t`");
+        assert_eq!(
+            mysql_show_create_typed("t", "table").unwrap(),
+            "SHOW CREATE TABLE `t`"
+        );
+        assert_eq!(
+            mysql_show_create_typed("v", "view").unwrap(),
+            "SHOW CREATE VIEW `v`"
+        );
         for bad in ["t; DROP TABLE x", "t`", "", "粗", "t a"] {
-            assert!(mysql_show_create(bad).is_err(), "{bad:?}");
+            assert!(mysql_show_create_typed(bad, "table").is_err(), "{bad:?}");
         }
     }
 

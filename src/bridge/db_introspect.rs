@@ -73,7 +73,29 @@ pub async fn op_db_catalog(
             ))));
         }
         // mysql SHOW 族 = 零内联铁律的唯一成文例外（introspect.rs 模块注释），白名单校验在 helper。
-        let sql = match super::introspect::mysql_show_create(arg.as_deref().unwrap_or("")) {
+        // REQ-08 §3.2：先探测对象类型（表/视图/函数/过程）再选 SHOW 动词；探测落空
+        // 回退 TABLE（保住「对象不存在」时今天的 fail-loud 报错形态）。
+        let a = arg.clone().unwrap_or_default();
+        let probe_rows = catalog_query_rows(
+            &state,
+            &target,
+            &name,
+            super::introspect::MYSQL_OBJECT_TYPE,
+            vec![
+                Value::String(a.clone()),
+                Value::String(a.clone()),
+                Value::String(a.clone()),
+            ],
+            None,
+        )
+        .await?;
+        let object_type = probe_rows
+            .first()
+            .and_then(|r| r.get("object_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("table")
+            .to_string();
+        let sql = match super::introspect::mysql_show_create_typed(&a, &object_type) {
             Ok(s) => s,
             Err(e) => return Err(JsErrorBox::generic(e)),
         };
@@ -146,13 +168,53 @@ async fn pg_ddl_dispatch(
         .and_then(|r| r.get("relkind"))
         .and_then(|v| v.as_str());
     match super::introspect::pg_ddl_route(relkind) {
-        super::introspect::PgDdlRoute::Empty => Ok(empty()),
+        super::introspect::PgDdlRoute::Empty => {
+            // REQ-08 §3.2：relkind 未命中 → 例程探测（pg_get_functiondef 一条给全量 DDL）。
+            let rows = match catalog_query_rows(
+                &state,
+                &target,
+                &name,
+                super::introspect::PG_ROUTINE_DDL,
+                params.clone(),
+                scope.clone(),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            if rows.is_empty() {
+                return Ok(empty());
+            }
+            let sql = super::introspect::PG_ROUTINE_DDL.to_string();
+            run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
+        }
         super::introspect::PgDdlRoute::View => {
-            // 既有 pg_get_viewdef 路径逐字节不动（v0.1.100 已发布行为）。
+            // 既有 pg_get_viewdef 路径（v0.1.100）+ REQ-08 §3.3 补壳：viewdef 片段包成
+            // `CREATE [OR REPLACE] VIEW ... AS` 可执行 DDL（items 为空时不动作）。
             let sql = super::introspect::catalog_sql(kind, dialect)
                 .expect("Ddl × PG 常量存在")
                 .to_string();
-            run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await
+            let mut env =
+                run_catalog_sql(state, target, name, kind, dialect, sql, params, scope).await?;
+            if let Some(items) = env
+                .get_mut("items")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for it in items {
+                    if let (Some(n), Some(ddl)) = (
+                        it["name"].as_str().map(String::from),
+                        it["ddl"].as_str().map(String::from),
+                    ) {
+                        it["ddl"] = serde_json::json!(super::introspect::pg_view_wrap(
+                            &n,
+                            &ddl,
+                            relkind == Some("m")
+                        ));
+                    }
+                }
+            }
+            Ok(env)
         }
         // 表 / 分区表 → 拼接器（4+1 查询 + 渲染，整体 deadline + 容量防线）。
         super::introspect::PgDdlRoute::Table => {
