@@ -242,6 +242,21 @@ pub fn parse_raw(raw: &str) -> BridgeError {
 ///
 /// message 模板（设计 §5.5）：`{capability} is not supported on dialect "{dialect}" yet.
 /// See docs/devkit/db-guide.md 方言能力矩阵.`
+/// REQ-11 G1：语句被取消（`db.cancel` / 挂断联动）的结构化错误（`OJ_DB_CANCELLED`）。
+/// 与 `OJ_DB_TIMEOUT` 同 `SessionDisposition::Close`（被弃连接报废不回池），category 可区分。
+pub fn cancelled_error(alias: &str) -> BridgeError {
+    BridgeError {
+        category: DbErrorCategory::Cancelled,
+        retryable: false,
+        session_disposition: SessionDisposition::Close,
+        message: format!("statement cancelled on db '{alias}'"),
+        data: serde_json::json!({ "alias": alias })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
 pub fn unsupported(dialect: &str, capability: &str) -> BridgeError {
     let message = format!(
         "{capability} is not supported on dialect \"{dialect}\" yet. See docs/devkit/db-guide.md 方言能力矩阵."

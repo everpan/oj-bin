@@ -200,6 +200,31 @@ pub trait DataAccessor: Send + Sync {
         Err(unsupported(&self.dialect_info().name, "cancel").into())
     }
 
+    /// REQ-11 G1：可取消查询（池路径真取消——执行侧 `select!` 观测 `shared` 的
+    /// cancel 标志后 drop 在飞 fetch 并 `close_on_drop()` 真关 TCP，服务端语句即死）。
+    /// 默认实现 = 委托 `query_with_params_metered`——插件轴/内存件继承默认（不可取消，
+    /// cancel 标志被忽略），零 ABI 影响；SqlxAccessor 覆盖为真取消。
+    async fn query_cancelable(
+        &self,
+        sql: &str,
+        params: &[Value],
+        meter: &mut super::db_quota::ByteMeter,
+        _shared: &PoolExecShared,
+    ) -> BridgeResult<Vec<Row>> {
+        self.query_with_params_metered(sql, params, meter).await
+    }
+
+    /// REQ-11 G1：`query_cancelable` 的执行版（无行/meter，结果 = affected）。
+    /// 默认实现同口径委托 `exec_with_params`。
+    async fn exec_cancelable(
+        &self,
+        sql: &str,
+        params: &[Value],
+        _shared: &PoolExecShared,
+    ) -> BridgeResult<i64> {
+        self.exec_with_params(sql, params).await
+    }
+
     /// 语句 deadline 竞速到点后，被弃的在飞语句是否**服务端真死**（REQ-05
     /// `data.cancelled` 诚实口径）：SqlxAccessor（sqlite 内置）= true——停止客户端
     /// 拉取、嵌入式无服务端残留；插件轴 = false——宿主弃 FfiFuture 只 free state，
@@ -439,14 +464,14 @@ pub(crate) struct DbStreamShared {
 pub(crate) const DB_STREAM_CHANNEL_CAP: usize = 64;
 
 /// REQ-11 G3：非流式执行的相位事件（`onProgress` 数据源；JS 经 poll 批量取走）。
-pub(crate) struct CallEvent {
+pub struct CallEvent {
     pub phase: &'static str,
     pub elapsed_ms: u64,
     pub rows: Option<u64>,
 }
 
 /// REQ-11：非流式池执行的结果载体（begin/poll/take 模型的 take 源）。
-pub(crate) enum PoolOutcome {
+pub enum PoolOutcome {
     Rows(Vec<Row>),
     Affected(i64),
     Err { category: DbErrorCategory, msg: String },
@@ -455,10 +480,12 @@ pub(crate) enum PoolOutcome {
 /// REQ-11 G1/G2：非流式池执行（db.query/exec）的共享状态。与 `DbStreamShared` 同表异型
 /// 挂在 `ExecRegistry`。cancel = 置标志 + notify；执行侧 `select!` 观测后 drop 在飞
 /// fetch 并 `close_on_drop()` 真关 TCP（服务端语句即死，连接报废不回池——修正案 #2）。
-pub(crate) struct PoolExecShared {
+pub struct PoolExecShared {
     pub owner: super::handle_core::Owner,
     /// 所属库别名（cancel 返回与限额日志用）。
     pub alias: String,
+    /// 执行开始时刻（`sent` 事件与后续相位的 elapsed 基准；登记时取 `Instant::now()`）。
+    pub start: std::time::Instant,
     pub cancel_requested: AtomicBool,
     pub notify: Arc<Notify>,
     /// serve 挂断联动（G2）：本请求级 token；None = WS/任务/测试路径不联动。

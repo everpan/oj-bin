@@ -118,8 +118,21 @@ fn redact_msg(s: &str) -> String {
 }
 
 /// 1=SQLITE_ERROR（语法）；Io/PoolTimedOut/WorkerCrashed=连接；其余=Internal。
-fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {
-    use DbErrorCategory as C;
+/// REQ-11 G3：推入相位事件（elapsed 以 `shared.start` 为基准）。
+fn push_event(shared: &super::db::PoolExecShared, phase: &'static str, rows: Option<u64>) {
+    let elapsed_ms = shared.start.elapsed().as_millis() as u64;
+    shared
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(super::db::CallEvent {
+            phase,
+            elapsed_ms,
+            rows,
+        });
+}
+
+fn sqlite_err(e: &sqlx::Error, ctx: &str) -> BridgeError {    use DbErrorCategory as C;
     let (category, retryable, session_disposition) = match e {
         sqlx::Error::Io(_) => (C::Connection, false, SessionDisposition::Keep),
         sqlx::Error::PoolTimedOut | sqlx::Error::WorkerCrashed => {
@@ -363,6 +376,109 @@ impl DataAccessor for SqlxAccessor {
         Ok(out)
     }
 
+    /// REQ-11 G1/G2：可取消查询。显式 acquire（持有 `PoolConnection` 才能
+    /// `close_on_drop`）；cancel 命中 = drop 在飞 fetch 流 + `close_on_drop()` 真关
+    /// TCP——服务端语句即死、连接报废绝不回池（修正案 #2 机制）。相位事件：
+    /// sent（提交后）/fetching（首行）/done（settle 前，带最终行数）。
+    async fn query_cancelable(
+        &self,
+        sql: &str,
+        params: &[Value],
+        meter: &mut super::db_quota::ByteMeter,
+        shared: &super::db::PoolExecShared,
+    ) -> BridgeResult<Vec<JsRow>> {
+        use std::sync::atomic::Ordering;
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
+        // 开跑前 cancel 竞态：语句不执行，连接不碰
+        if shared.cancel_requested.load(Ordering::SeqCst) {
+            return Err(super::db_error::cancelled_error(&shared.alias).into());
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| sqlite_err(&e, "query acquire"))?;
+        push_event(shared, "sent", None);
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for p in params {
+            q = bind_value(q, p);
+        }
+        let mut stream = q.fetch(&mut *conn);
+        let mut out = Vec::new();
+        let mut first = true;
+        use futures::StreamExt;
+        loop {
+            tokio::select! {
+                row = stream.next() => {
+                    let Some(r) = row else { break };
+                    let v = row_to_json(&r.map_err(|e| sqlite_err(&e, "query"))?)?;
+                    if first {
+                        push_event(shared, "fetching", None);
+                        first = false;
+                    }
+                    if meter.feed(&v) == super::db_quota::Feed::Stop {
+                        break;
+                    }
+                    out.push(v);
+                }
+                _ = shared.notify.notified() => {
+                    // fire_cancel 先置标志后 notify——非取消路径不 notify，故此处
+                    // 命中即取消意图（保守再校验标志）。
+                    if shared.cancel_requested.load(Ordering::SeqCst) {
+                        drop(stream); // 在飞 fetch 报废（协议态不可知）
+                        conn.close_on_drop(); // 真关 TCP；绝不回池
+                        return Err(super::db_error::cancelled_error(&shared.alias).into());
+                    }
+                }
+            }
+        }
+        push_event(shared, "done", Some(out.len() as u64));
+        Ok(out)
+    }
+
+    /// REQ-11 G1/G2：可取消执行（`query_cancelable` 的无行版，结果 = affected）。
+    async fn exec_cancelable(
+        &self,
+        sql: &str,
+        params: &[Value],
+        shared: &super::db::PoolExecShared,
+    ) -> BridgeResult<i64> {
+        use std::sync::atomic::Ordering;
+        oj_plugin_ffi::jsint::reject_u64_markers(
+            params,
+            "the core accessor binds through sqlx::Any, which cannot carry u64 — store it as text",
+        )?;
+        if shared.cancel_requested.load(Ordering::SeqCst) {
+            return Err(super::db_error::cancelled_error(&shared.alias).into());
+        }
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| sqlite_err(&e, "exec acquire"))?;
+        push_event(shared, "sent", None);
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for p in params {
+            q = bind_value(q, p);
+        }
+        tokio::select! {
+            res = q.execute(&mut *conn) => {
+                let r = res.map_err(|e| sqlite_err(&e, "exec"))?;
+                push_event(shared, "done", None);
+                Ok(r.rows_affected() as i64)
+            }
+            _ = shared.notify.notified() => {
+                // execute future 已被 select 取消（协议态不可知）——无论标志与否，
+                // 报废连接并按取消口径返回（当前仅 fire_cancel 会 notify）。
+                conn.close_on_drop();
+                Err(super::db_error::cancelled_error(&shared.alias).into())
+            }
+        }
+    }
+
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
         oj_plugin_ffi::jsint::reject_u64_markers(
             params,
@@ -426,14 +542,110 @@ impl DataAccessor for SqlxAccessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::db::{Dialect, dialect_of};
+    use crate::bridge::db::{Dialect, PoolExecShared, dialect_of};
+    use crate::bridge::handle_core::Owner;
     use crate::bridge::{Bridge, InMemoryKV, SchemaRegistry};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
 
     // 仅类型/构造检查（不连真实库）；保证 SqlxAccessor 满足 DataAccessor trait。
     fn _assert_impl() {
         fn takes<T: DataAccessor>() {}
         takes::<SqlxAccessor>();
+    }
+
+    fn test_shared() -> Arc<PoolExecShared> {
+        Arc::new(PoolExecShared {
+            owner: Owner {
+                tenant: None,
+                user: None,
+                module: None,
+                source: "test",
+            },
+            alias: "d1".to_string(),
+            start: std::time::Instant::now(),
+            cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_token: None,
+            done: std::sync::atomic::AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
+            outcome: Mutex::new(None),
+        })
+    }
+
+    // REQ-11 Task 2：可取消执行的相位事件与取消语义（sqlite 离线腿）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelable_query_records_sent_fetching_done_events() {
+        let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
+        let shared = test_shared();
+        let mut meter =
+            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let rows = db
+            .query_cancelable("select 1 as x union all select 2 as x", &[], &mut meter, &shared)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let ev: Vec<&str> = shared
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.phase)
+            .collect();
+        assert_eq!(ev, vec!["sent", "fetching", "done"]);
+        // done 事件带最终行数
+        assert_eq!(shared.events.lock().unwrap().last().unwrap().rows, Some(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_before_submit_returns_cancelled_without_running() {
+        let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
+        let shared = test_shared();
+        shared.cancel_requested.store(true, Ordering::SeqCst);
+        let mut meter =
+            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let e = db
+            .query_cancelable("select 1", &[], &mut meter, &shared)
+            .await
+            .unwrap_err();
+        let be = e.downcast_ref::<BridgeError>().unwrap();
+        assert_eq!(be.category, DbErrorCategory::Cancelled);
+        // 语句未执行：sent 事件未发
+        assert!(shared.events.lock().unwrap().is_empty());
+        // exec 路径同口径
+        let e2 = db
+            .exec_cancelable("create table nope (id int)", &[], &shared)
+            .await
+            .unwrap_err();
+        assert_eq!(e2.downcast_ref::<BridgeError>().unwrap().category, DbErrorCategory::Cancelled);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_mid_execution_returns_cancelled_category() {
+        let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
+        let shared = test_shared();
+        let s2 = shared.clone();
+        let killer = tokio::spawn(async move {
+            // 有界轮询等 sent 事件（提交已发生），随后发 cancel——非固定 sleep
+            for _ in 0..10_000 {
+                if s2.events.lock().unwrap().iter().any(|e| e.phase == "sent") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            s2.cancel_requested.store(true, Ordering::SeqCst);
+            s2.notify.notify_one();
+        });
+        let mut meter =
+            super::super::db_quota::ByteMeter::new(None, super::super::db_policy::OnExceed::Truncate);
+        let big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000)";
+        let e = db.query_cancelable(big, &[], &mut meter, &shared).await.unwrap_err();
+        killer.await.unwrap();
+        assert_eq!(
+            e.downcast_ref::<BridgeError>().unwrap().category,
+            DbErrorCategory::Cancelled
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

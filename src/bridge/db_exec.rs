@@ -119,7 +119,7 @@ impl ExecRegistry {
             tenant: shared.owner.tenant.clone(),
             user: shared.owner.user.clone(),
             module: shared.owner.module.clone(),
-            source: shared.owner.source.clone(),
+            source: shared.owner.source,
         };
         let alias = shared.alias.clone();
         self.insert(owner, alias, ExecHandle::Pool(shared))
@@ -170,11 +170,12 @@ impl ExecRegistry {
         let g = lock(&self.inner);
         let mut n = 0;
         for e in g.values() {
-            if let ExecHandle::Pool(p) = &e.handle {
-                if !p.done.load(Ordering::SeqCst) && p.cancel_token == Some(token) {
-                    e.handle.fire_cancel();
-                    n += 1;
-                }
+            if let ExecHandle::Pool(p) = &e.handle
+                && !p.done.load(Ordering::SeqCst)
+                && p.cancel_token == Some(token)
+            {
+                e.handle.fire_cancel();
+                n += 1;
             }
         }
         n
@@ -252,6 +253,7 @@ mod tests {
         Arc::new(PoolExecShared {
             owner: owner(Some("t"), Some("u")),
             alias: "d1".to_string(),
+            start: std::time::Instant::now(),
             cancel_requested: AtomicBool::new(false),
             notify: Arc::new(Notify::new()),
             cancel_token: t,
