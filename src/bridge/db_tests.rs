@@ -1708,6 +1708,54 @@ async fn sqlite_stream_matches_query_full_result() {
     assert_eq!(v["data"]["eq"], json!(true), "流式结果与全量查询一致：{v}");
 }
 
+/// REQ-07 欠账补齐（离线，InMemoryAccessor）：`db.stream` 的降级清单经
+/// `it.info().degraded` 外发（与 `exportStatus.degraded` 同形态 `[{col,type}]`，
+/// 干净流 `[]`）——扫描是宿主侧机制（`cellenv::degraded_of` 扫行内信封串），
+/// 与后端无关；插件产信封的真库路径由插件 env-gated 腿钉。
+#[tokio::test(flavor = "current_thread")]
+async fn stream_info_carries_degraded_list() {
+    let acc = Arc::new(InMemoryAccessor::new());
+    acc.seed(vec![
+        json!({"ip": "$inet:MCsrMi4zLjQ=", "n": 42}),
+        json!({"ip": "$inet:MTI3LjAuMC4x", "n": 43}),
+    ]);
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), acc as Arc<dyn DataAccessor>)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const it = db.stream("select ignored");
+                 const rows = [];
+                 for await (const row of it) rows.push(row);
+                 json.ok({
+                   degraded: (await it.info()).degraded,
+                   cell: rows[0] && rows[0].ip,
+                 });
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(
+        d["degraded"],
+        json!([{"col": "ip", "type": "inet"}]),
+        "两行同列同型须去重为单条 [{{col,type}}]: {d}"
+    );
+    assert!(
+        oj_plugin_ffi::cellenv::decode(d["cell"].as_str().unwrap_or("")).is_some(),
+        "seed 信封串应原样流过: {d}"
+    );
+}
+
 /// InMemoryAccessor 流式返回已 seed 的行（dev/fake 路径）。
 #[tokio::test(flavor = "current_thread")]
 async fn inmemory_stream_yields_seeded_rows() {

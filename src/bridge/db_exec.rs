@@ -171,6 +171,7 @@ mod tests {
             cancelled: AtomicBool::new(false),
             truncated: AtomicBool::new(false),
             result_bytes: AtomicU64::new(0),
+            degraded: std::sync::Mutex::new(Vec::new()),
             exec_id: OnceLock::new(),
         })
     }

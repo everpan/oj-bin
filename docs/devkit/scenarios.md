@@ -4245,7 +4245,7 @@ export default {
 | 嗅探 `$` 前缀判定降级列 | 权威面只有 `X-OJ-Degraded` 头 / `exportStatus.degraded`；前缀是编码不是判定依据（TEXT 字面量可能撞形） |
 | handler 里想读 X-OJ-Degraded | 它是响应面元数据，handler 内不感知（`json.header` 只写不读）；handler 需要的场景走导出任务状态或 SQL 里显式 cast |
 | MySQL 表期待对称行为 | `GEOMETRY` 家族仍整条报错（sqlx-mysql 0.9 无公开字节出口，v0.1.111 未降级）；先 `ST_AsText(g) as g` |
-| 等 `db.stream` 批次也带降级汇总 | v0.1.111 暂无（随 REQ-07b 二进制批补齐）；流式大表导出走 `db.export` |
+| 等 `db.stream` 批次也带降级汇总 | **v0.1.112 已补**：`it.info().degraded`（流式无响应头通道，info() 是权威面；`await it.info()`——info() 是 async）；流式大表导出走 `db.export` |
 
 ## 场景 60：改列名不动数据（`previousName`，REQ-13，v0.1.112）
 

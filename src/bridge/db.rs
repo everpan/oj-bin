@@ -427,6 +427,10 @@ pub(crate) struct DbStreamShared {
     pub truncated: AtomicBool,
     /// REQ-05：pump 累计的结果集字节（行 JSON 编码口径；fail 档触顶行也计入）。
     pub result_bytes: AtomicU64,
+    /// REQ-07 欠账补齐（v0.1.112）：流式降级清单（`[{col,type}]`，按值去重）——
+    /// `op_db_stream_next` 交付行时扫 `cellenv::degraded_of` 累积，`info().degraded`
+    /// 外发（与 `exportStatus.degraded` 同形态；干净流恒 `[]`）。
+    pub degraded: std::sync::Mutex<Vec<serde_json::Value>>,
     /// 反向句柄：本流在 `StableState.exec_sessions` 的执行 id（open 时登记，close 摘除）。
     pub exec_id: OnceLock<String>,
 }

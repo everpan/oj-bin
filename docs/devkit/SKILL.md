@@ -130,7 +130,7 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 轮询 db.exportStatus 想要 percent | 流式无总行数（percent 需额外 COUNT + 竞态）——不确定进度条 + rows/bytes 文本；`totalRows` 是留档扩展位 |
 | REQ-05 语句超时 sqlite「不生效」（单条递归 CTE 跑完才返回） | sqlite 驱动同步步进**饿死 current_thread 定时器**——deadline 只在让步点触发；网络型后端（mysql/pg 插件轴）准点。sqlite 大查询用 `max_result_bytes`（边拉边计真早停）+ `max_rows` 挡（api-manual §13 架构边界行） |
 | 超时后 UI 宣称「已向数据库下发取消」 | 插件轴 `e.data.cancelled=false`——宿主只弃句柄，服务端语句可能仍在跑（真取消 = ABI 13 车）；只有 sqlite 内置是 `true`。UI 说「已超时」即可 |
-| `db.stream` 想拿「是否截断」只看行数 | 用 `it.info()`：`{rows, bytes, truncated}`——truncate 档的显式信令；fail 档（缺省）以中途错行 `OJ_DB_CAPACITY` 表达。`timeoutMs` 超配置拒 `OJ_DB_CAPACITY` 点名 `statement_timeout_ms`（只能收紧） |
+| `db.stream` 想拿「是否截断」只看行数 | 用 `it.info()`（**async，须 await**）：`{rows, bytes, truncated, degraded}`——truncate 档的显式信令；`degraded` 是本流 cellenv 降级清单 `[{col,type}]`（按值去重，干净流显式 `[]`，v0.1.112 起，与 `exportStatus.degraded` 同形态——流式无响应头通道，info() 是权威面）。fail 档（缺省）以中途错行 `OJ_DB_CAPACITY` 表达。`timeoutMs` 超配置拒 `OJ_DB_CAPACITY` 点名 `statement_timeout_ms`（只能收紧） |
 | `db.forSchema("x")` 在 sqlite 上报 `OJ_DB_UNSUPPORTED` | **预期**：sqlite 无 schema 概念，不静默给垃圾数据（capability=`for_schema`）。sqlite 的「库」清单用 `db.listDatabases()`（database_list：main + attached） |
 | pg 上 `forSchema` 想跨 **database** | pg 的 database = 独立连接，物理不可行——`listDatabases()` 只出**清单**（任意库连出 pg_database，不换连接）；跨 database 内视 = 再登记一个别名（一连接=一库）。mysql 无此问题：schema≡database，`forSchema` 即跨库 |
 | `forSchema("不存在")` 拿空数组当出错 | 空数组 = scope 下无对象或 scope 名畸形（>128 / 控制字符）——两者**都**返回空（不报错不泄漏），与 listColumns 的「不存在/无权限/别的 schema」同口径。先 `listSchemas()` 确认名字 |

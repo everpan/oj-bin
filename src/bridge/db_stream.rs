@@ -110,6 +110,7 @@ pub async fn op_db_stream_open(
         cancelled: AtomicBool::new(false),
         truncated: AtomicBool::new(false),
         result_bytes: AtomicU64::new(0),
+        degraded: std::sync::Mutex::new(Vec::new()),
         exec_id: std::sync::OnceLock::new(),
     });
     let id = NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
@@ -241,6 +242,14 @@ pub async fn op_db_stream_next(
     let mut rx = shared.rx.lock().await;
     match rx.recv().await {
         Some(Ok(row)) => {
+            // REQ-07 欠账补齐：交付行即扫 cellenv 信封，累积进流的降级清单
+            //（`info().degraded` 外发；扫描是宿主侧机制，与后端是否产信封无关）。
+            for d in oj_plugin_ffi::cellenv::degraded_of(std::slice::from_ref(&row)) {
+                let mut g = shared.degraded.lock().unwrap();
+                if !g.contains(&d) {
+                    g.push(d);
+                }
+            }
             // db 访问控制的行数上限：交付第 cap 行后即停（关闭游标、不再向后端拉取）。
             // 与 raw 的「取回后截断」不同，stream 提前终止是真省资源。
             let n = shared.delivered.fetch_add(1, Ordering::SeqCst) + 1;
@@ -291,6 +300,7 @@ pub async fn op_db_stream_info(
         "rows": shared.delivered.load(Ordering::SeqCst),
         "bytes": shared.result_bytes.load(Ordering::SeqCst),
         "truncated": shared.truncated.load(Ordering::SeqCst),
+        "degraded": shared.degraded.lock().unwrap().clone(),
     }))
 }
 

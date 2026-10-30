@@ -1155,9 +1155,11 @@ globalThis.DB = function (name) {
         return {
           // U-5 v0.1.96: the cross-request cancellation handle (triggers open as a side effect).
           executionId: () => openIds().then((v) => v.executionId),
-          // REQ-05 (U-18 batch Q6): stream runtime info -- {rows, bytes, truncated}.
+          // REQ-05 (U-18 batch Q6): stream runtime info -- {rows, bytes, truncated, degraded}.
           // `truncated` is the explicit max_result_bytes signal (truncate mode); fail mode
           // surfaces as a structured error row instead (OJ_DB_CAPACITY via next()).
+          // `degraded` is the per-stream cellenv list [{col,type}] (deduped; [] when clean,
+          // same shape as exportStatus.degraded) -- v0.1.12x stream degraded manifest.
           info: () => (lastInfo ? Promise.resolve(lastInfo) : readInfo()),
           [Symbol.asyncIterator]() {
             return {
