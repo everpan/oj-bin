@@ -3185,7 +3185,7 @@ async fn disconnect_cancels_running_query_within_5s() {
         tmp.join("src/sleep/api.ts"),
         r#"async function get() {
   try {
-    const rows = await db.query("select pg_sleep(30) as s");
+    const rows = await db.query("select pg_sleep(30) /* oj-req11-disconnect */ as s");
     return json.ok({ n: rows.length });
   } catch (e) {
     return json.fail(500, "sleep failed: " + (e && e.message ? e.message : e));
@@ -3206,7 +3206,7 @@ export default { get };
         tmp.join("src/probe/api.ts"),
         r#"async function get() {
   const rows = await db.query(
-    "select count(*)::int4 as n from pg_stat_activity where state = 'active' and query like '%pg_sleep(30)%' and pid <> pg_backend_pid()");
+    "select count(*)::int4 as n from pg_stat_activity where state = 'active' and query like '%oj-req11-disconnect%' and pid <> pg_backend_pid()");
   return json.ok({ n: rows[0].n });
 }
 export default { get };

@@ -4411,3 +4411,78 @@ export default {
 | 和列改名混用 | 表 RENAME 恒首条，列 RENAME 次之且用新表名——顺序已钉，无需手工排 |
 | schema 段 | 旧引用两段限定（`"schema"."old"`），但 RENAME TO 目标只许裸名（`RENAME TO "new"`）——两方言同律，跨 schema 移动另走 SET SCHEMA |
 | `to: null` 想删表 | 参数错误（v0.1.113 起）——ddlDiff 不产 DROP TABLE，删表走显式迁移 |
+
+## 场景 66：给非流式长查询装「取消按钮」（`onOpen` + `db.cancel`，REQ-11，v0.1.114）
+
+后台报表跑 `db.query` 大聚合，用户刷新/关闭页面后要能真正停掉它——不用改 `db.stream`，
+给 `db.query` 挂上 `onOpen` 回调即登记为可跨请求取消的池执行：
+
+```ts
+// src/report/run/api.ts —— 发起端：onOpen 拿执行 id 落 kv（跨请求句柄）
+export default {
+  async get({ reportId }: { reportId: string }) {
+    let xid = "";
+    const rows = await db.query(
+      "select region, sum(amount) s from orders group by region", [],
+      {
+        onOpen: (executionId) => { xid = executionId; },
+        onProgress: (ev) => { /* 需要推进度条才挂；只为取消可省略 */ },
+      },
+    );
+    // 正常跑完：清掉句柄（幂等，多清无害）
+    if (xid) await kv.del(`cancel:${reportId}`);
+    return json.ok({ rows });
+  },
+};
+
+// src/report/cancel/api.ts —— 停止端：任意后续请求（同主体）调 db.cancel
+export default {
+  async post({ reportId }: { reportId: string }) {
+    const xid = await kv.get(`cancel:${reportId}`);
+    if (!xid) return json.fail(404, "no running report");
+    const r = await db.cancel(xid);
+    await kv.del(`cancel:${reportId}`);
+    return json.ok(r); // {cancelled, alias}
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| 不带回调就指望能取消 | 只有带 `onOpen`/`onProgress` 的执行才进登记表面（跨请求句柄=入场券）；直路 `db.query` 无句柄，`db.cancel` 报 not found |
+| 取消后发起端当「没数据」 | 发起端 reject `db exec exec_… was cancelled via db.cancel`（`e.code=OJ_DB_CANCELLED`）——按错误分流（前端显示「已取消」，不是空结果） |
+| 挂在 `db.tx` / `db.session` 里 | 事务/会话内执行不登记（会话锁定单连接），取消语义只覆盖直连池执行 |
+| 把执行 id 回给前端 | bearer 凭据：存服务端 `kv`，前端只回 `slice(0, 8)` 用于对账 |
+
+> 机制与错误码见 `db-guide.md` §3 / §11.6.5；挂断联动的尽力取消语义见 api-manual §13。
+
+## 场景 67：大导出实时进度条（`db.stream` 的 `onProgress`，REQ-11 G3，v0.1.114）
+
+场景 50 的导出加进度：不用自己数行，`onProgress` 每 100ms 推一次
+`{rows, bytes, elapsedMs}`（bytes 为在飞已计量字节），WS/SSE 推给前端：
+
+```ts
+// src/export/orders/api.ts
+export default {
+  async get() {
+    const s = json.stream({ contentType: "text/csv" });
+    s.write("id,name\n");
+    const t0 = Date.now();
+    await db.stream("select id, name from orders order by id", null, {
+      onRow: (row) => s.write(`${row.id},${row.name}\n`),
+      onProgress: (ev) => {
+        // 100ms 节流；进度可经 ws 房间推前端：{pct: 未知总量时只报 rows/elapsedMs}
+        ws.broadcast("export-progress", { rows: ev.rows, bytes: ev.bytes, elapsedMs: ev.elapsedMs, running: true });
+      },
+    });
+    ws.broadcast("export-progress", { rows: 0, bytes: 0, elapsedMs: Date.now() - t0, running: false });
+    s.end();
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| 拿 `fetching`/`sent` 当进度相位写 UI | `onProgress` 的相位是 `sent`/`fetching`/`done`——done **恒发**；流式的进度只报行数字节数，别等 done 才算「有进度」 |
+| 每行回调里自己打点拖慢导出 | 行回调在泵循环上——重活（落库/网络）请挪走；`onProgress` 已节流，直接用它 |
+| 总量未知想算百分比 | bytes/rows 是累计值不是占比——无总量时分段不定，前端按速率画条形即可；要百分比先 `count(*)` |

@@ -16,6 +16,32 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.114（未打标签）
+
+**feat（db，REQ-11 非流式取消与执行进度全交付）**：
+
+- **G1 回调面**：`db.query`/`db.exec` 的 `opts` 新增 `onOpen(executionId)` 与
+  `onProgress(ev)`。带任一回调即走 begin/poll/take 登记模型（`exec_…` 执行 id 跨请求
+  可取消）；`onProgress` 事件 `{phase, elapsedMs, rows?}`，相位 `sent`（语句已下推）→
+  `fetching`（首批行回）→ `done`（恒发一次，必含行数/受影响数）。节流：同相位 100ms
+  内最多一次；`onOpen` 抛异常只记 warn、不杀执行。
+- **G2 挂断即取消**：HTTP 客户端断开（真 FIN）→ serve 层的 DisconnectGuard 按
+  本次请求的 cancel token 调 `ExecRegistry::cancel_by_token` 尽力取消在飞执行。
+  被挂断的执行体是独立 spawn 任务（不随 handler future 消亡），取消经
+  `notify_waiters` 全量唤醒。语义为**尽力而为**：已提交的结果不写回（客户端已走），
+  in-flight 语句尽量真杀。
+- **G3 流式进度**：`db.stream` 的 `opts` 新增 `onProgress({rows, bytes, elapsedMs})`
+  （100ms 节流；`bytes` 为在飞已计量字节，可随时查）。
+- **`db.cancel` 受理池执行**：`executionId` 现可来自 `db.query`/`db.exec` 的
+  `opts.onOpen`（此前只覆盖 `db.stream`）。池执行取消走真杀路径——pg
+  `pg_cancel_backend` / mysql `KILL QUERY`（= 连接关闭级语义：被取消的连接报废、
+  绝不回池，池瞬时补员）；sqlite 无服务端语句 = 客户端早停（category 仍
+  `OJ_DB_CANCELLED`）。新错误码 `OJ_DB_CANCELLED`（`retryable=false`、
+  `sessionDisposition=close`）与 `OJ_DB_TIMEOUT`（`retryable=true`）区分。
+- **插件轴可取消（零 ABI）**：宿主侧 `FfiDataAccessor::query_cancelable` 复用既有
+  stream vtable 实现取消（drop 行流 → `stream_cancel` 真杀）。限制：插件轴
+  `exec_cancelable`（DML 真杀）不可达 → ABI 13 车。
+
 ## v0.1.113（未打标签）
 
 **feat（db.ddlDiff，REQ-09 剩余收口）**：

@@ -668,7 +668,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn real_pg_mysql_cancel_maps_oj_db_cancelled() {
         let cases = [
-            ("OJ_TEST_PG", "select pg_sleep(30) as s"),
+            ("OJ_TEST_PG", "select pg_sleep(30) /* oj-req11-exec-cancel */ as s"),
             ("OJ_TEST_MYSQL", "select sleep(30) as s"),
         ];
         let mut ran = 0;

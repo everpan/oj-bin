@@ -298,6 +298,20 @@ const n = await db.exec("update account set role = ? where id = ?", ["user", 7])
 - `params` 可省略（无参便捷形式）。
 - 裸 SQL 也过归属守卫：SQL 里出现的表必须是你模块拥有的或已声明 deps 的。
 - 表名/列名无法参数化——动态标识符请改用 `db.table()` 构造器（白名单）。
+- **执行回调面（v0.1.114，REQ-11）**：`opts` 除 `timeoutMs` 外新增两个回调——
+  - `onOpen(executionId)`：语句一开始执行即回调 `exec_…` 执行 id。把它存 `kv` 后，
+    **同一主体的任意请求**可 `db.cancel(id)` 取消这条池执行（见 §3.1）。
+  - `onProgress(ev)`：进度回调，事件 `{phase, elapsedMs, rows?}`——相位
+    `sent`（语句已下推服务端）→ `fetching`（首批行回流）→ `done`（**恒发一次**，
+    必含 `rows`：query 为行数 / exec 为受影响数）。同相位 **100ms 节流**（快语句
+    可能只见 sent + done 两个相位）。**带任一回调即走 begin/poll/take 登记模型**
+    （执行进入跨请求取消登记表，挂断联动因此能定位它）；不带回调维持原直路零开销。
+  - `onOpen` 内抛异常只记 warn、**不杀执行**（进度/取消机制尽力而为，绝不让回调
+    错误污染语句结果）。
+- **挂断取消（v0.1.114，尽力而为）**：HTTP 客户端断开（真 FIN）时，serve 层按
+  本次请求的执行登记**尽力取消**在飞执行——已提交结果不会写回（客户端已走），
+  in-flight 语句经 pg `pg_cancel_backend` / mysql `KILL QUERY` 尽量真杀；不带回调的
+  执行无登记句柄，挂断后语句继续在服务端跑完（与 v0.1.103 前相同）。
 
 ### 3.1 流式查询（`db.stream`，v0.1.37）
 
@@ -323,17 +337,22 @@ for await (const row of db.stream("select id, name from account order by id")) {
 - 取消：传 `opts.signal`（`AbortController.signal`），`abort` 事件触发即中止后端拉取——
   流**干净提前结束**（消费端收到 done，不报错）；服务端行缓冲有界，消费端不拉取时后端
   拉取同步暂停；已回调的行不会回滚。
-- **跨请求取消（`db.cancel`，v0.1.96）**：`executionId` 是开流后发放的跨请求取消句柄
-  （`exec_…` 形状）——回调形态经 `opts.onOpen(executionId)` 拿到，异步迭代形态经
-  `it.executionId()`。把它存到 `kv`/`vars` 后，**同一主体的任意请求**可 `db.cancel(id)`
-  停掉这条流（「请求 A 发起长导出、请求 B 点停止」）。重复取消幂等（同返回值
-  `{cancelled: true, alias}`）；未知/已结束/他人 id 一律 `execution … not found`
-  （不泄露存在性）。被取消后发起方的**下一次拉取抛错**
-  `db stream exec_… was cancelled via db.cancel`（不是静默结束——消费方不得误以为数据取完；
-  已交付的行保留）。后端效果：mysql `KILL QUERY` / pg `pg_cancel_backend` 真取消，其余
-  协作式（游标丢弃、连接回池）。**只覆盖流式执行**：非流式 `db.query/exec` 无后端句柄，
-  登记为已知限制（真覆盖需插件侧 one-shot 执行登记）。id 是 bearer 凭据：日志/错误只出
-  前 8 字符。
+- **跨请求取消（`db.cancel`，v0.1.96；v0.1.114 起受理池执行）**：`executionId` 是
+  开流（或带 `onOpen` 回调的 `db.query`/`db.exec`）后发放的跨请求取消句柄
+  （`exec_…` 形状）——流：回调形态经 `opts.onOpen(executionId)` 拿到，异步迭代形态经
+  `it.executionId()`；池执行：经 `opts.onOpen` 拿到。把它存到 `kv`/`vars` 后，
+  **同一主体的任意请求**可 `db.cancel(id)` 停掉这条执行（「请求 A 发起长导出、
+  请求 B 点停止」）。重复取消幂等（同返回值 `{cancelled: true, alias}`）；
+  未知/已结束/他人 id 一律 `execution … not found`（不泄露存在性）。被取消后发起方的
+  **下一次拉取抛错** `db stream exec_… was cancelled via db.cancel`（流；不是静默
+  结束——消费方不得误以为数据取完；已交付的行保留）；池执行 `db.query`/`db.exec`
+  直接 reject `db exec exec_… was cancelled via db.cancel`（`e.code=OJ_DB_CANCELLED`、
+  `retryable=false`、`sessionDisposition=close`——见 §11.6.5 错误码表）。后端效果：
+  mysql `KILL QUERY` / pg `pg_cancel_backend` 真取消（被取消的连接报废、**绝不回池**，
+  池瞬时补员一条新连接），其余协作式。id 是 bearer 凭据：日志/错误只出前 8 字符。
+- **流式进度（v0.1.114，REQ-11 G3）**：`opts.onProgress({rows, bytes, elapsedMs})`——
+  每行回流驱动（**100ms 节流**），`bytes` 为在飞已计量字节（`it.info()` 之外的
+  低成本进度源；大导出进度条的直接数据源）。
 - **事务内不可用**：`db.stream` 只走 `DB(name)` 直连池，在 `db.tx(...)` 内调用直接报错。
 - 后端支持（v0.1.38 起 ABI 10）：核心 `SqlxAccessor`（内置只承载 sqlite）、测试用
   InMemory，以及第一方插件 `oj-db-mysql`/`oj-db-postgres`（typed 直连，vtable 批量 pull，
@@ -952,6 +971,7 @@ const rows = await DB("analytics").fromJSON(snap).all();   // 在另一个库上
 | `db.query` / `db.exec` / `db.tx` | ✅ | ✅ | ✅ | ✅（裸 SQL 全量可用） |
 | `db.stream` | ✅ | ✅（typed 直连，真流式） | ✅（typed 直连，真流式） | 取决于插件是否声明 `stream`；未声明回落 `db.query` 全量 |
 | `db.stream` 的 `signal` 取消 | 协作式（批间） | ✅ `KILL QUERY` | ✅ `pg_cancel_backend` | 取决于插件是否声明 `cancel`。`db.cancel`（v0.1.96）复用同一取消链，只是触发点跨请求 |
+| `db.query`/`db.exec` 的取消（v0.1.114） | 客户端早停（category 仍 `OJ_DB_CANCELLED`） | ✅ `KILL QUERY`（连接报废不回池） | ✅ `pg_cancel_backend`（连接报废不回池） | 插件轴 query 经宿主侧复用 stream vtable 真杀（query_cancelable）；插件轴 exec 取消不可达（ABI 13 车） |
 | `db.table(...)` 构造器（含 DML / join / CTE / 聚合） | ✅ | ✅ | ✅ | ❌ `OJ_DB_UNSUPPORTED` |
 | `db.listTables` | ✅ | ✅ | ✅ | ❌ |
 | `db.nextSeq` | ✅ | ✅ | ✅ | ❌ |
@@ -1750,10 +1770,10 @@ const evs = await audit.query({ kind: "DB_SESSION_TIMEOUT", sinceMs: Date.now() 
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `db.query` | `query(sql: string, params?: unknown[]): Promise<Row[]>` | 参数化查询 → 行数组 |
-| `db.exec` | `exec(sql: string, params?: unknown[]): Promise<number>` | 参数化执行 → 受影响行数 |
-| `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal; onOpen?: (executionId: string) => void }): Promise<void> \| AsyncIterable<Row> & { executionId(): Promise<string> }` | **流式查询**（v0.1.37）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。**只走直连池**（`db.tx` 内会报错），且**只有部分后端真逐行拉取**（其余回落全量或直接报错，详见下节）。两种形态见下；`onOpen` / `executionId()`（v0.1.96）给跨请求取消句柄，见 §3.1 的 `db.cancel` 条目 |
-| `db.cancel` | `cancel(executionId: string): Promise<{ cancelled: boolean; alias: string }>` | **跨请求取消流式执行**（v0.1.96）。`executionId` 来自 `db.stream` 的 `onOpen` / `executionId()`。同一主体的任意请求可调；重复取消幂等；未知/已结束/他人 id 一律 `execution … not found`。取消后发起方下一次拉取抛 `… was cancelled via db.cancel`。**只覆盖流式执行**（非流式查询无后端句柄，已知限制） |
+| `db.query` | `query(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<Row[]>` | 参数化查询 → 行数组。`opts.timeoutMs` 语句超时；`opts.onOpen`/`opts.onProgress` 执行 id + 进度回调（v0.1.114，见 §3） |
+| `db.exec` | `exec(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<number>` | 参数化执行 → 受影响行数。opts 同 query |
+| `db.stream` | `stream(sql: string, params?: unknown[], opts?: { onRow?: (row: Row) => void; signal?: AbortSignal; onOpen?: (executionId: string) => void; onProgress?: (ev: { rows: number; bytes: number; elapsedMs: number }) => void; timeoutMs?: number }): Promise<void> \| AsyncIterable<Row> & { executionId(): Promise<string> }` | **流式查询**（v0.1.37）。逐行拉取大结果集，避免一次性 `db.query` 全量驻留。**只走直连池**（`db.tx` 内会报错），且**只有部分后端真逐行拉取**（其余回落全量或直接报错，详见下节）。两种形态见下；`onOpen` / `executionId()`（v0.1.96）给跨请求取消句柄，见 §3.1 的 `db.cancel` 条目；`onProgress`（v0.1.114）行级进度（100ms 节流，`bytes` 在飞可查） |
+| `db.cancel` | `cancel(executionId: string): Promise<{ cancelled: boolean; alias: string }>` | **跨请求取消执行**（v0.1.96；v0.1.114 起受理池执行）。`executionId` 来自 `db.stream` 的 `onOpen`/`executionId()`，或带 `onOpen` 回调的 `db.query`/`db.exec`。同一主体的任意请求可调；重复取消幂等；未知/已结束/他人 id 一律 `execution … not found`。流：取消后发起方下一次拉取抛 `… was cancelled via db.cancel`；池执行：reject `OJ_DB_CANCELLED`（`retryable=false`、`sessionDisposition=close`）。后端 pg/mysql 真杀（连接报废不回池），其余协作式 |
 | `db.table` | `table(name: string): QueryBuilder` | 安全查询构造器（标识符白名单 + 参数化值） |
 | `db.nextSeq` | `nextSeq(name: string): Promise<number \| string>` | **平台序列分配**（v0.1.24）。单语句原子取号，是 `max+1` 竞态的终态方案。首次使用自动建平台表 `_oj_sequences`。**库级、跨租户共享**——需隔离就把租户拼进 `name`；`name` 请用服务端常量；账号需 DDL 权限或由迁移预建该表；只在 sqlite/mysql/postgres 上可用（其他方言 `OJ_DB_UNSUPPORTED`）；`memory://` 假后端拿不到返回值（`no value returned`）。`db.tx` 内调用搭车同一连接 |
 | `db.tx` | `tx(fn: (tx: DBInstance) => unknown): Promise<unknown>` | 事务（语义见下） |
@@ -2361,9 +2381,16 @@ db.stream("select * from huge_table", null, { signal: ac.signal, onRow: (r) => {
 | `OJ_DB_TIMEOUT` | 超时（含连接池等待超时） | SQLSTATE 40xxx、`PoolTimedOut` |
 | `OJ_DB_CONNECTION` | 连接失败/已断开 | SQLSTATE 08xxx、io/tls 错 |
 | `OJ_DB_CAPACITY` | 容量/资源耗尽 | SQLSTATE 53xxx |
-| `OJ_DB_CANCELLED` | 查询被取消 | SQLSTATE 57xxx、流取消 |
+| `OJ_DB_CANCELLED` | 查询被取消 | SQLSTATE 57xxx、流取消、`db.cancel` 取消池执行（v0.1.114） |
 | `OJ_DB_UNSUPPORTED` | **该方言不支持这个能力** | 查询构造器 / `listTables` / `nextSeq` / `search.*` / `migrate` / `seed` 遇到宿主未识别的方言 |
 | `OJ_DB_INTERNAL` | 其余（含未知厂商码） | 未映射的错误 |
+
+`OJ_DB_CANCELLED` vs `OJ_DB_TIMEOUT`（v0.1.114 区分口径）：两者都是「语句没跑完」，
+但 **CANCELLED = 有人（`db.cancel`/挂断联动）要它停**——`retryable=false`
+（重试是抗超时/死锁的，对主动取消无意义）、`sessionDisposition=close`（被取消的
+连接已报废）；**TIMEOUT = 资源预算到点**（`statement_timeout_ms`）——`retryable=true`
+（语句本身可能健康，换一个时间窗重试合法）。业务分流按 `retryable` 即可，勿按
+文案猜。
 
 `OJ_DB_UNSUPPORTED` 的 `e.data.capability` 取值（**闭集**，可安全 switch）：
 `query_build` / `query_sql`（构造器 `.all()/.run()` 与 `.toSQL()`）、`list_tables`、

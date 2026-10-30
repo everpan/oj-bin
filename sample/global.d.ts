@@ -720,6 +720,8 @@ declare global {
     // 原始 SQL + 绑定参数（params 可选）。返回行数组。
     // opts.timeoutMs：语句级超时（只能收紧 db_access.<alias>.statement_timeout_ms，
     // 传更大值以 OJ_DB_CAPACITY 拒并点名配置键）；超时回 OJ_DB_TIMEOUT。
+    // opts.onOpen/onProgress（v0.1.114）：执行 id 回调 + 进度回调（sent/fetching/done，
+    // done 恒发）——带回调即登记为可跨请求 db.cancel 的池执行。
     query(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<Row[]>;
     // 执行写操作，返回受影响行数。opts 同 query。
     exec(sql: string, params?: unknown[], opts?: DBCallOpts): Promise<number>;
@@ -803,6 +805,8 @@ declare global {
     /** 流式查询：逐行拉取大结果集。给 onRow 返回 Promise<void>；省略则返回
      * AsyncIterable<Row>。opts.signal 触发 abort 即取消（pg/mysql 真取消）；db.tx 内报错；
      * opts.onOpen(executionId) 回调跨请求取消句柄（迭代形式用 it.executionId()）。
+     * opts.onProgress({rows, bytes, elapsedMs})：进度回调（v0.1.114，100ms 节流；
+     * bytes 为在飞已计量字节）。
      * opts.timeoutMs：语句超时（只能收紧 statement_timeout_ms；pump 全程竞速）；
      * max_result_bytes 触顶——fail 档（缺省）以 OJ_DB_CAPACITY 错行抛错，truncate 档
      * 干净结束且 it.info().truncated=true（it.info() 在迭代结束后仍可读）。 */
@@ -813,6 +817,7 @@ declare global {
         onRow?: (row: Row) => void;
         signal?: AbortSignal;
         onOpen?: (executionId: string) => void;
+        onProgress?: (ev: DbStreamProgressEvent) => void;
         timeoutMs?: number;
       },
     ): Promise<void> | AsyncIterable<Row> & {
@@ -868,9 +873,11 @@ declare global {
      * 不写日志）；会话只锁一个别名，内禁事务控制/SET/USE/PRAGMA（MySQL 隐式提交 ⇒ 假回滚）；
      * 与 db.tx 互斥；无 db.stream；host 管生命周期，**没有自动提交**。 */
     session: DBSessionApi;
-    /** 跨请求取消执行：按 db.stream 的 executionId 取消该流式查询；幂等；
-     * 未知/他人 id 一律 not found（不泄露存在性）。**只覆盖流式执行**——非流式 query/exec
-     * 无句柄（已知限制）。id 是 bearer 凭据：日志只出前 8 字符。 */
+    /** 跨请求取消执行：按 executionId 取消在飞执行（v0.1.114 起覆盖流式 + 池执行）。
+     * id 来自 db.stream 的 onOpen/executionId()，或 db.query/db.exec 的 opts.onOpen
+     * （exec_… 形状）。幂等；未知/他人 id 一律 not found（不泄露存在性）。
+     * 池执行取消 = pg_cancel_backend / KILL QUERY 真杀（被取消的连接报废不回池）；
+     * sqlite 无服务端语句 = 客户端早停。id 是 bearer 凭据：日志只出前 8 字符。 */
     cancel(executionId: string): Promise<{ cancelled: boolean; alias: string }>;
     /** 动态数据源登记（client 轴）：运行期把 DSN 登记为命名数据源。
      * 登记后别名进 `DB(name)` 解析路径（复用 L1 访问控制 + L2 内省 + 全 query/exec/stream）；
@@ -883,10 +890,35 @@ declare global {
     epoch(name: string): number;
   }
 
-  /** db.query/db.exec 的每调用侧选项（REQ-05）。 */
+  /** db.query/db.exec 的每调用侧选项（REQ-05；v0.1.114 扩回调面）。 */
   interface DBCallOpts {
     /** 语句级超时毫秒：只能收紧配置上限，传更大值以 OJ_DB_CAPACITY 拒（点名 statement_timeout_ms）。 */
     timeoutMs?: number;
+    /** REQ-11（v0.1.114）：开执行即回调 `exec_…` 执行 id——同 db.stream 的 onOpen，
+     * 可存 kv 后由同主体任意请求 db.cancel 取消本执行（池执行取消 = pg_cancel_backend /
+     * KILL QUERY 真杀；sqlite 客户端早停）。带 onOpen/onProgress 即走 begin/poll/take
+     * 登记模型。onOpen 抛异常只记 warn，不杀执行。 */
+    onOpen?: (executionId: string) => void;
+    /** REQ-11（v0.1.114）：进度回调 `{phase, elapsedMs, rows?}`——相位 sent（语句已下推）
+     * → fetching（首批行回）→ done（恒发一次，必含行数/受影响数）。同相位 100ms 节流。 */
+    onProgress?: (ev: DbProgressEvent) => void;
+  }
+
+  /** db.query/db.exec 的 onProgress 事件（REQ-11，v0.1.114）。 */
+  interface DbProgressEvent {
+    /** 执行相位：sent（语句已下推）/ fetching（行回流中）/ done（恒发一次）。 */
+    phase: string;
+    /** 自执行开始的毫秒数。 */
+    elapsedMs: number;
+    /** 已回流行数（query）或受影响行数（exec，done 相位）；sent/fetching 相位可能缺省。 */
+    rows?: number;
+  }
+
+  /** db.stream 的 onProgress 事件（REQ-11 G3，v0.1.114）：bytes 为在飞已计量字节。 */
+  interface DbStreamProgressEvent {
+    rows: number;
+    bytes: number;
+    elapsedMs: number;
   }
 
   /** 运行期动态授权面（`db.access`，U-1）。grant 至少一个维度非空（空 allow = 授权给所有人，拒）。 */
