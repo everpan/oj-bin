@@ -11,6 +11,18 @@
 > 改为请求级 cancel token + Drop guard）、取消短连接来源（§4.1：池满时 acquire 会
 > 阻塞，取消连接改走保留 DSN 的池外短连接）、pid 查询热路径开销（§4.1：pid 按物理
 > 连接缓存，稳态零额外 RTT）。修订前 Q1 为阻塞项，修订后无阻塞遗留。
+>
+> **计划期修正案（2026-11-01，#2）——取消机制从「pid + 池外 kill」改为「关闭受害
+> 连接」**：sqlx 0.9 不给池连接任何稳定 id（`Connection` trait 无 `id()`；
+> `PoolConnectionMetadata` 只有 `age`/`idle_for`，`after_connect` 无状态回传通道），
+> pid 侧车缓存没有安全键——裸指针键会被分配器复用，陈旧 pid 可能取消**别的**查询。
+> 替代机制（验收等价、部件更少）：执行 select! 监听 cancel notify → 命中即 drop
+> 在飞 fetch future → `PoolConnection::close_on_drop()` 真关 TCP——PG 后端在客户
+> EOF 时即刻终止查询，MySQL 连接线程随 socket 错误死亡，pg_stat_activity /
+> SHOW PROCESSLIST 内语句消失（= 原验收判据）。同时消掉池外取消连接与 DSN 保留。
+> 代价：取消粒度是整连接（池连接一时刻只服务一条语句，无实际损失）；KILL 语义从
+> 「温和 interrupt」变「hard close」（对被取消语句无差别，对同一连接上的其他会话
+> 状态无影响——checkout 模型保证独占）。
 
 ## 1. 意图与为什么
 
@@ -69,26 +81,20 @@ CANCELLED reject）。`sent` 相位在 onOpen 同刻发，`fetching` 在首行/�
 
 ### 4.1 G1 池路径后端取消（核心新增）
 
-- `SqlxAccessor` 加「可取消执行」包装：`query_with_params_cancelable` /
-  `exec_with_params_cancelable`（旧方法保留 = 内部直接包一层 None）。流程：
-  1. `pool.acquire()` 取连接（等待池空闲的时段可被 cancel 标志提前打断）；
-  2. 取后端标识——PG `SELECT pg_backend_pid()`、MySQL `SELECT CONNECTION_ID()`
-     （一条引擎常量 SQL，prepared 可用）。**pid 是物理连接生命周期内的常量**：
-     按物理连接缓存（连接包装侧车表，键 = pool connection id），每条连接至多查
-     一次——稳态热路径**零额外 RTT**，不翻倍快查询延迟（builder-check Q3 修订）；
-  3. 登记 ExecRegistry（**新 entry 变体**，见 4.2，登记时携带请求 cancel token，
-     见 4.3）→ 发 sent/onOpen → 跑语句 → 完成/出错 settle（done/onProgress）→
-     摘登记。
-- 取消链：`db.cancel(id)` / 挂断联动（4.3）→ 置 `cancel_requested` + notify →
-  登记表现有路由扩成枚举（流式句柄 | 池句柄）→ 池句柄取消 = **池外短连接**发方言
-  取消语句——`SqlxAccessor` 构造时保留 `AnyConnectOptions`（DSN 解密后本就在内存，
-  保留不构成新增暴露面；builder-check Q2 修订：池满时 `pool.acquire()` 会阻塞，
-  取消连接绝不能等池）→ `AnyConnect::connect` 建一条一次性短连接发
-  PG `SELECT pg_cancel_backend($1)` / MySQL `KILL QUERY ?`（prepared 可用，批次 2
-  评审已证）→ 发完即关。
-  → 被 kill 的连接上原语句报错退出 → 判定 `cancel_requested` 标志 →
-  映射 `OJ_DB_CANCELLED`，**连接报废丢弃**（对 `PoolConnection` 调 `close()` 后
-  归还槽位——sqlx 簿记安全，绝不把被 kill 的会话回原池；同流式路径红线）。
+- `SqlxAccessor` 加「可取消执行」包装：`query_cancelable` / `exec_cancelable`
+  （`DataAccessor` trait 新增方法，**带默认实现**委托原方法——插件轴继承默认 =
+  不可取消，零 ABI 影响）。流程（修正案 #2 形态）：
+  1. `pool.acquire()` 取连接；
+  2. **提交前检查** `cancel_requested`（开跑前 cancel 竞态 = 不执行，直接
+     CANCELLED）；
+  3. 登记 ExecRegistry（Pool 变体，见 4.2）→ 发 `sent` 事件/onOpen →
+     `tokio::select!` 在「流式 fetch（首行发 `fetching` 事件）」与
+     `notify.notified()`（cancel）间竞速；
+  4. cancel 命中 → drop 在飞 fetch future → `conn.close_on_drop()`（真关 TCP，
+     服务端语句即死；**绝不回池**）→ 结果 = `OJ_DB_CANCELLED`；
+     正常 settle → 发 `done` 事件 → 连接正常归还 → 摘登记。
+- 取消触发源两路：`db.cancel(id)`（置标志 + notify）与挂断联动（4.3，
+  `cancel_by_token`）——同一条取消链。
 - reject 形态：结构化 envelope，`code = "OJ_DB_CANCELLED"`（`db_error.rs` 已有
   category 直接复用）；op 层 catch 到带 cancel 标志的 error 时改写 category，
   绝不落 `OJ_DB_INTERNAL`。
@@ -98,20 +104,25 @@ CANCELLED reject）。`sent` 相位在 onOpen 同刻发，`fetching` 在首行/�
 ```rust
 enum ExecHandle {
     Stream(Arc<DbStreamShared>),            // 既有
-    Pool {                                 // 新增
-        owner: Owner,
-        alias: String,
-        backend: BackendId,                 // PgPid(i32) | MysqlConnId(u64)
-        cancel_requested: AtomicBool,
-        notify: Arc<Notify>,                // 等池连接阶段的可打断等待
-        dsn: Arc<AnyConnectOptions>,        // 池外取消短连接用（4.1，不从池 acquire）
-    },
+    Pool(Arc<PoolExecShared>),              // 新增
 }
+
+struct PoolExecShared {
+    owner: Owner,
+    alias: String,
+    cancel_requested: AtomicBool,
+    notify: Arc<Notify>,
+    cancel_token: Option<u64>,              // serve G2（4.3；None = WS/任务/测试）
+    done: AtomicBool,
+    events: Mutex<Vec<CallEvent>>,          // G3 相位队列（JS poll  drain）
+    outcome: Mutex<Option<PoolOutcome>>,    // Rows(Vec<Row>) | Affected(i64) | Err(category,msg)
+}
+pub struct CallEvent { pub phase: &'static str, pub elapsed_ms: u64, pub rows: Option<u64> }
 ```
 
-- 路由 `db.cancel` 按变体分发；登记/清扫逻辑（懒惰清扫 + TTL）两型共用。
-- stream 的 id 空间与池执行**同表不同前缀**？——不：保持同一 `exec_` 前缀同空间
-  （REQ §3.1「同一套 id 空间」原文要求）；变体内部分发即可。
+- 路由 `db.cancel` 按变体分发（Pool = 置标志 + notify）；登记/清扫（懒惰清扫 +
+  TTL）两型共用；新增 `cancel_by_token(token) -> usize`（挂断联动用，返回取消数）。
+- stream 的 id 空间与池执行保持同一 `exec_` 前缀同空间（REQ §3.1 原文要求）。
 
 ### 4.3 G2 挂断即取消（请求级 cancel token + Drop guard）
 
@@ -194,10 +205,9 @@ enum ExecHandle {
 
 - serve 断开感知现状未验——计划 Task 0 先验证再定 G2 实现形态（guard 挂 handler
   future 还是 response body；预期前者够用，Capture 是全缓冲的）。
-- `KILL QUERY ?` 参数化在目标 MySQL 8.4 实测（批次 2 评审证过 prepared 可用，但
-  绑定参数形式须真库钉一次）。
 - onOpen 回调抛异常时的 settle 语义（钉：回调异常不影响执行本身，catch 记 warn）。
-- pid 侧车缓存的键选取（pool connection 的稳定 id）与连接报废时的条目清理——
-  计划期定，防内存缓增。
-- `RequestInfo.cancel_token` 新增字段的序列化面：RequestInfo 不经 wire（同进程
-  传递），确认无 serde 兼容面后直加。
+- 池路径 `server_cancel_on_abandon` 语义升级：显式连接 + close_on_drop 使
+  PG/MySQL 弃飞**真杀服务端语句**——`data.cancelled` 可由 false 改 true（诚实口径，
+  真库矩阵用例同步翻转；插件轴仍 false）。计划期 TDD 翻转并登记 devkit。
+- 被 kill 连接 `close_on_drop` 后池槽位回收由 sqlx 簿记保证，计划期用「取消后池
+  不缩容」用例钉一次。
