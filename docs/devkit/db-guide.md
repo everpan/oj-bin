@@ -487,7 +487,8 @@ await db.importCancel(taskId);
 | sqlite | 多值 INSERT | `INSERT OR REPLACE` **仅 `conflictKeys=["rowid"]`** | 同上 | **全单事务**（性能关键） |
 
 - **批收敛**：`batchSize`（100..=50000，缺省 `db_import.default_batch_size` 5000）再按
-  65535 绑定上限/列数收敛。
+  方言变量上限/列数收敛——PG/MySQL 65535，**sqlite 32766**（`SQLITE_MAX_VARIABLE_NUMBER`
+  ≥3.32 默认；7 列宽表默认批会被压到 4680 行/批）。
 - **sqlite 特例（语义差，必读）**：append/upsert 在 sqlite 走**全单事务**——cancel/
   fail 是**整回滚**：`rows=0`、库空。网络方言（PG/MySQL）abort/cancel 则**已提交批保留**
   （`rows`=已提交）。跨方言业务代码不要假设取消后 rows>0。
@@ -502,8 +503,10 @@ await db.importCancel(taskId);
   该租户）；Deny + 未登记 → 拒（同裸 SQL「cannot verify tenant scope」）。逐行租户强制
   （tenant 列强制写成当前 tid）是未来工作，落地前 scoped 表导入保持拒绝。
 - **replace 是危险写**：`allow_ddl` + 危险写确认 token（truncate 同档），先删后插单事务。
-- **标识符红线**：表/列名只走 `quote_ident` + SchemaRegistry 白名单；csv 表头只用于
-  列序匹配——与登记列名不符 → 参数错误 fail-fast，**绝不**把表头文本当标识符拼 SQL。
+- **标识符红线**：表/列名只走 `quote_ident`（NUL/控制字符拒、引号翻倍）；已登记表的列
+  必过 SchemaRegistry 白名单，**未登记表的列名是用户串**——脏标识符（空/控制字符）在
+  渲染期即参数错误，不拼进 SQL。csv 表头只用于列序匹配——与登记列名不符 → 参数错误
+  fail-fast，**绝不**把表头文本当标识符拼 SQL。
 - **配额**（`db_import:` 段，装配期 validate fail-loud）：全局并发 4 / 每主体 2 /
   max_rows 100 万 / max_bytes 512MiB / default_batch_size 5000 / TTL 24h；导入与导出
   配额互相独立。`db.import.start/done/failed/cancelled` 全量落审计。

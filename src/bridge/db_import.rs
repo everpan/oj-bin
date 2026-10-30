@@ -605,7 +605,8 @@ pub mod parse {
                                 "db import: csv header mismatch at line {start_line}: got [{got}] but registered columns are [{want}]"
                             ));
                         }
-                        p.pos += rec.len() + phys; // 越过硬换行（pos 指向 \n，+phys 到下一行）
+                        // 推进 = 切片长 + 1（切片只排除单个终止 \n；嵌入换行已在切片内）
+                        p.pos += rec.len() + 1;
                         p.line += phys as u64;
                     }
                     Err(()) => {
@@ -640,7 +641,8 @@ pub mod parse {
                     }));
                 }
             };
-            self.pos += rec.len() + phys;
+            // 推进 = 切片长 + 1（切片只排除单个终止 \n；嵌入换行已在切片内）
+            self.pos += rec.len() + 1;
             self.line += phys as u64;
             Some(row_from_record(
                 rec,
@@ -721,6 +723,37 @@ pub mod parse {
                     Value::String("a".into()),
                     Value::String("b\nb".into()),
                     Value::String("c".into())
+                ]
+            );
+            assert!(p.next().is_none());
+        }
+
+        /// Final-fix 1（review Critical）：引号内换行的记录**后面还有记录**时，
+        /// 字节推进必须是 rec.len()+1（切片只排除单个终止 \n，嵌入换行已在切片内）。
+        /// 修复前 advance=rec.len()+phys 吃掉下一记录首字节 → 静默损坏。
+        #[test]
+        fn csv_quoted_newline_record_followed_by_more_rows() {
+            let src = b"a,\"b\nb\",c\nx,y,z\n";
+            let types = [ColumnType::Text; 3];
+            let mut p = CsvParser::new(src, &cols(&["x", "y", "z"]), false, &types).unwrap();
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(
+                row.values,
+                vec![
+                    Value::String("a".into()),
+                    Value::String("b\nb".into()),
+                    Value::String("c".into())
+                ]
+            );
+            // 第二记录必须完好（修复前首字节 x 被吃掉 → ",y,z" 格数错 → Bad）
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(row.line, 3, "quoted 记录占 2 物理行，下一记录从第 3 行起");
+            assert_eq!(
+                row.values,
+                vec![
+                    Value::String("x".into()),
+                    Value::String("y".into()),
+                    Value::String("z".into())
                 ]
             );
             assert!(p.next().is_none());
@@ -1030,8 +1063,16 @@ pub mod render {
 
     /// 绑定参数上限收敛（PG/MySQL 同 65535）：按 `65535/列数` 收敛批行数，
     /// 不报错、参数序正确（Review Focus 4）。`cap` = 剩余行数（末批不空跑）。
-    pub fn batch_rows(cap: usize, batch_size: usize, ncols: usize) -> usize {
-        let per_stmt = (65535 / ncols.max(1)).max(1);
+    /// 批行数三向收敛：cap（剩余行数）× batch_size × 方言变量上限/列数。
+    /// sqlite 变量上限 32766（SQLITE_MAX_VARIABLE_NUMBER ≥3.32 默认），低于
+    /// PG/MySQL 的 65535——宽表默认批在其上必然炸（review Important 实锤）。
+    pub fn batch_rows(dialect: Dialect, cap: usize, batch_size: usize, ncols: usize) -> usize {
+        let max_vars = if dialect == Dialect::Sqlite {
+            32766
+        } else {
+            65535
+        };
+        let per_stmt = (max_vars / ncols.max(1)).max(1);
         cap.min(batch_size).min(per_stmt)
     }
 
@@ -1083,7 +1124,7 @@ pub mod render {
                 match dialect {
                     Dialect::Postgres => {
                         let mut b = sea_insert(dialect, table, columns, rows)?;
-                        b.sql.push_str(&pg_on_conflict(conflict_keys, columns));
+                        b.sql.push_str(&pg_on_conflict(conflict_keys, columns)?);
                         Ok(b)
                     }
                     Dialect::MySql => {
@@ -1093,7 +1134,7 @@ pub mod render {
                             ));
                         }
                         let mut b = sea_insert(dialect, table, columns, rows)?;
-                        if let Some(suffix) = mysql_on_dup(conflict_keys, columns) {
+                        if let Some(suffix) = mysql_on_dup(conflict_keys, columns)? {
                             b.sql.push_str(&suffix);
                         }
                         Ok(b)
@@ -1143,42 +1184,50 @@ pub mod render {
 
     /// PG upsert 尾缀：`ON CONFLICT ("k",…) DO UPDATE SET "c" = "excluded"."c", …`
     /// （SET 只含非 key 列；全是 key → DO NOTHING）。纯标识符 + 常量文本。
-    fn pg_on_conflict(keys: &[String], columns: &[String]) -> String {
+    /// PG upsert 尾缀（修正案①：直挂多值 INSERT，不建临时表）。
+    /// 标识符经 quote_ident——Err 落 Err（未登记表的列/键是用户串，须防 panic）。
+    fn pg_on_conflict(keys: &[String], columns: &[String]) -> Result<String, String> {
         let ks = keys
             .iter()
-            .map(|k| quote_ident(Dialect::Postgres, k).expect("caller-validated key"))
-            .collect::<Vec<_>>()
+            .map(|k| quote_ident(Dialect::Postgres, k))
+            .collect::<Result<Vec<_>, _>>()?
             .join(", ");
         let sets: Vec<String> = columns
             .iter()
             .filter(|c| !keys.contains(c))
-            .map(|c| {
-                let q = quote_ident(Dialect::Postgres, c).expect("caller-validated column");
-                format!("{q} = \"excluded\".{q}")
+            .map(|c| -> Result<String, String> {
+                let q = quote_ident(Dialect::Postgres, c)?;
+                Ok(format!("{q} = \"excluded\".{q}"))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         if sets.is_empty() {
-            format!(" ON CONFLICT ({ks}) DO NOTHING")
+            Ok(format!(" ON CONFLICT ({ks}) DO NOTHING"))
         } else {
-            format!(" ON CONFLICT ({ks}) DO UPDATE SET {}", sets.join(", "))
+            Ok(format!(
+                " ON CONFLICT ({ks}) DO UPDATE SET {}",
+                sets.join(", ")
+            ))
         }
     }
 
     /// MySQL upsert 尾缀：`ON DUPLICATE KEY UPDATE `c` = VALUES(`c`), …`。
-    /// 非 key 列为空（全列皆 key）→ None（无后缀：重复键时由方言报错 surfaced）。
-    fn mysql_on_dup(keys: &[String], columns: &[String]) -> Option<String> {
+    /// 非 key 列为空（全列皆 key）→ Ok(None)（无后缀：重复键时由方言报错 surfaced）。
+    fn mysql_on_dup(keys: &[String], columns: &[String]) -> Result<Option<String>, String> {
         let sets: Vec<String> = columns
             .iter()
             .filter(|c| !keys.contains(c))
-            .map(|c| {
-                let q = quote_ident(Dialect::MySql, c).expect("caller-validated column");
-                format!("{q} = VALUES({q})")
+            .map(|c| -> Result<String, String> {
+                let q = quote_ident(Dialect::MySql, c)?;
+                Ok(format!("{q} = VALUES({q})"))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         if sets.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(format!(" ON DUPLICATE KEY UPDATE {}", sets.join(", ")))
+            Ok(Some(format!(
+                " ON DUPLICATE KEY UPDATE {}",
+                sets.join(", ")
+            )))
         }
     }
 
@@ -1289,6 +1338,38 @@ mod render_tests {
         );
     }
 
+    /// Final-fix 4（review Important）：未登记表的列/键是任意用户串——脏标识符
+    /// （空/控制字符）在 quote_ident 处必须落 Err，绝不 panic（panic 在 spawned
+    /// consumer 里 = 任务永卡 running + 配额槽泄漏）。
+    #[test]
+    fn render_upsert_dirty_identifier_is_error_not_panic() {
+        let e = render_batch(
+            Dialect::Postgres,
+            "t",
+            &cols(&["a", "bad\u{1}key"]),
+            &two_rows(),
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("identifier"), "{e}");
+        // MySQL 同路径
+        let e = render_batch(
+            Dialect::MySql,
+            "t",
+            &cols(&["a", "bad\u{1}key"]),
+            &two_rows(),
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &cols(&["a"]),
+        )
+        .unwrap_err();
+        assert!(e.contains("identifier"), "{e}");
+    }
+
     #[test]
     fn render_mysql_upsert_requires_pk() {
         let e = render_batch(
@@ -1389,16 +1470,25 @@ mod render_tests {
 
     #[test]
     fn batch_rows_caps_at_65535() {
+        use super::super::db::Dialect;
         // ncols=10 → 每语句 ≤6553
-        assert_eq!(batch_rows(usize::MAX, 5000, 10), 5000);
-        assert_eq!(batch_rows(usize::MAX, 100_000, 10), 6553);
+        assert_eq!(batch_rows(Dialect::Postgres, usize::MAX, 5000, 10), 5000);
+        assert_eq!(batch_rows(Dialect::Postgres, usize::MAX, 100_000, 10), 6553);
         // ncols=100 → ≤655
-        assert_eq!(batch_rows(usize::MAX, 100_000, 100), 655);
+        assert_eq!(batch_rows(Dialect::Postgres, usize::MAX, 100_000, 100), 655);
         // 用户 batchSize 1_000_000 → 收敛不报错
-        assert_eq!(batch_rows(usize::MAX, 1_000_000, 10), 6553);
+        assert_eq!(
+            batch_rows(Dialect::Postgres, usize::MAX, 1_000_000, 10),
+            6553
+        );
         // cap（剩余行数）优先
-        assert_eq!(batch_rows(5, 5000, 10), 5);
-        assert!(batch_rows(0, 5000, 10) == 0);
+        assert_eq!(batch_rows(Dialect::Postgres, 5, 5000, 10), 5);
+        assert!(batch_rows(Dialect::Postgres, 0, 5000, 10) == 0);
+        // sqlite 变量上限 32766：7 列 → 4680；默认批 5000 必须被压下来
+        assert_eq!(batch_rows(Dialect::Sqlite, usize::MAX, 5000, 7), 4680);
+        assert_eq!(batch_rows(Dialect::Sqlite, usize::MAX, 100_000, 10), 3276);
+        // mysql 同 65535
+        assert_eq!(batch_rows(Dialect::MySql, usize::MAX, 100_000, 10), 6553);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1902,6 +1992,7 @@ pub async fn op_db_import(
                         &registry,
                         &args.table,
                         da.dialect(),
+                        section.max_bytes,
                     )
                     .await
                     .map_err(JsErrorBox::generic)?,
@@ -1914,6 +2005,7 @@ pub async fn op_db_import(
                         &registry,
                         &args.table,
                         da.dialect(),
+                        section.max_bytes,
                     )
                     .await
                     .map_err(JsErrorBox::generic)?,
@@ -2485,6 +2577,109 @@ mod consumer_tests {
         assert_eq!(st["state"], json!("done"), "{st}");
     }
 
+    /// Final-fix 1（review Critical）blob 面：数据记录带引号内换行且**后续还有记录**
+    /// ——字节推进 off-by-phys 会吃掉下一记录首字节（损坏/整任务失败）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_blob_csv_quoted_newline_mid_file_keeps_following_rows() {
+        let (_d, db) = sqlite_file().await;
+        db.exec_with_params(
+            "create table users (id integer primary key, name text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let (_bd, blobs) = tmp_blobs();
+        let b = bridge_with(
+            db.clone(),
+            users_registry(),
+            Some(blobs.clone()),
+            Default::default(),
+        );
+        // header=1；记录1（第 2-3 物理行）含引号内换行；记录2 从第 4 行起
+        let csv = b"id,name\n1,\"a\nb\"\n2,c\n";
+        blobs
+            .default()
+            .unwrap()
+            .put("in/q.csv", csv, None)
+            .await
+            .unwrap();
+        let r = import_js(
+            &b,
+            r#"{ table: "users", blobKey: "in/q.csv", format: "csv" }"#,
+        )
+        .await
+        .unwrap();
+        let st = wait_terminal(&b, r["taskId"].as_str().unwrap()).await;
+        assert_eq!(st["state"], json!("done"), "{st}");
+        assert_eq!(st["rows"], json!(2), "{st}");
+        assert_eq!(count_rows(&db, "users").await, 2);
+    }
+
+    /// Final-fix 2（review Important）：max_bytes 读中强制——超长无换行记录不得
+    /// 一直缓冲到 EOF（防 OOM）；错误点名 max_bytes。
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_source_enforces_max_bytes_mid_record() {
+        let (_bd, blobs) = tmp_blobs();
+        // 首记录完整（open 需要首窗可解析）；第二条记录 ~1.5MiB 无换行 → 跨窗读到超闸
+        let mut csv: Vec<u8> = b"1,a\n2,\"".to_vec();
+        csv.extend(std::iter::repeat_n(b'x', 1536 * 1024));
+        csv.extend_from_slice(b"\"\n");
+        blobs
+            .default()
+            .unwrap()
+            .put("in/huge.csv", &csv, None)
+            .await
+            .unwrap();
+        let registry = SchemaRegistry::new(); // 未登记 → Unknown 类型，列名直通
+        let mut src = super::CsvBlobSource::open(
+            blobs.default().unwrap(),
+            "in/huge.csv",
+            false,
+            &["id".to_string(), "txt".to_string()],
+            &registry,
+            "whatever",
+            super::super::db::Dialect::Sqlite,
+            1024 * 1024, // max_bytes：第二条记录必然读超
+        )
+        .await
+        .unwrap();
+        // 第一条记录正常
+        assert!(matches!(src.next_row().await, Ok(Some(_))));
+        // 第二条：读中拒（点名 max_bytes），而非缓冲到 EOF
+        match src.next_row().await {
+            Err(super::SourceErr::Io(e)) => assert!(e.contains("max_bytes"), "{e}"),
+            _ => panic!("expected max_bytes Io error mid-read"),
+        }
+    }
+
+    /// Final-fix 3（review Important）：sqlite 变量上限 32766（< PG/MySQL 65535）——
+    /// 7 列宽表默认批 5000 行 = 35000 变量，超 sqlite 上限；批收敛须方言感知。
+    #[tokio::test(flavor = "current_thread")]
+    async fn import_sqlite_wide_table_default_batch_converged() {
+        let (_d, db) = sqlite_file().await;
+        db.exec_with_params(
+            "create table wide (id integer primary key, a text, b text, c text, d text, e text, f text)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let registry =
+            SchemaRegistry::new().table("wide", &["id"], &["id", "a", "b", "c", "d", "e", "f"]);
+        let b = bridge_with(db.clone(), registry, None, Default::default());
+        let rows: Vec<String> = (1..=5000)
+            .map(|i| format!(r#"{{ "id": {i}, "a": "a{i}", "b": "b{i}", "c": "c{i}", "d": "d{i}", "e": "e{i}", "f": "f{i}" }}"#))
+            .collect();
+        let args = format!(
+            r#"{{ table: "wide", format: "jsonl", rows: [{}] }}"#,
+            rows.join(",")
+        );
+        let r = import_js(&b, &args).await.unwrap();
+        let st = wait_terminal(&b, r["taskId"].as_str().unwrap()).await;
+        assert_eq!(st["state"], json!("done"), "{st}");
+        assert_eq!(st["rows"], json!(5000), "{st}");
+        assert_eq!(count_rows(&db, "wide").await, 5000);
+    }
+
     /// blob 源超 max_bytes：中途 Failed，错误点名 max_bytes（不静默截断）。
     #[tokio::test(flavor = "current_thread")]
     async fn import_blob_over_max_bytes_fails_named() {
@@ -2787,12 +2982,14 @@ pub(crate) struct CsvBlobSource {
     line: u64,
     eof: bool,
     bytes_read: u64,
+    max_bytes: u64, // 读中硬闸：超限即 Err（防无换行巨记录 OOM）
     columns: Vec<String>,
     col_types: Vec<ColumnType>,
 }
 
 impl CsvBlobSource {
     /// 打开：读首窗 → 解析列（args_columns 优先，否则表头记录）→ 白名单 + 类型。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         blob: Arc<dyn super::blob::BlobBackend>,
         key: &str,
@@ -2801,6 +2998,7 @@ impl CsvBlobSource {
         registry: &super::registry::SchemaRegistry,
         table: &str,
         dialect: super::db::Dialect,
+        max_bytes: u64,
     ) -> Result<Self, String> {
         let w = blob
             .read_range(key, 0, READ_WINDOW)
@@ -2827,7 +3025,8 @@ impl CsvBlobSource {
         };
         let col_types = columns_guard(&columns, registry, table, dialect)?;
         let (pos, line) = if header {
-            (rec.len() + phys, 1 + phys as u64)
+            // pos 推进 = 切片长 + 1（切片只排除单个终止 \n）；line 计物理行（嵌入换行算）
+            (rec.len() + 1, 1 + phys as u64)
         } else {
             (0, 1)
         };
@@ -2840,6 +3039,7 @@ impl CsvBlobSource {
             line,
             eof: false,
             bytes_read,
+            max_bytes,
             columns,
             col_types,
         })
@@ -2860,6 +3060,13 @@ impl CsvBlobSource {
             .map_err(|e| format!("db import: blob read failed: {e}"))?;
         self.offset += w.len() as u64;
         self.bytes_read += w.len() as u64;
+        // 读中硬闸：超限即拒（点名 max_bytes）——无换行巨记录不得缓冲到 OOM
+        if self.bytes_read > self.max_bytes {
+            return Err(format!(
+                "db import: source exceeds db_import.max_bytes ({})",
+                self.max_bytes
+            ));
+        }
         if w.is_empty() {
             self.eof = true;
         } else {
@@ -2900,7 +3107,8 @@ impl CsvBlobSource {
                     // 先用完 rec（借自 self.buf），再动 self.buf，避免借用冲突
                     let row =
                         parse::row_from_record(rec, start_line, &self.columns, &self.col_types);
-                    let advance = rec.len() + phys;
+                    // 推进 = 切片长 + 1（切片只排除单个终止 \n；嵌入换行已在切片内）
+                    let advance = rec.len() + 1;
                     self.pos += advance;
                     self.line += phys as u64;
                     if self.pos > READ_WINDOW as usize {
@@ -2937,6 +3145,7 @@ pub(crate) struct JsonlBlobSource {
     line: u64,
     eof: bool,
     bytes_read: u64,
+    max_bytes: u64, // 读中硬闸（同 CsvBlobSource）
     columns: Vec<String>,
     pending: Option<(u64, String)>,
 }
@@ -2949,6 +3158,7 @@ impl JsonlBlobSource {
         registry: &super::registry::SchemaRegistry,
         table: &str,
         dialect: super::db::Dialect,
+        max_bytes: u64,
     ) -> Result<Self, String> {
         let mut s = Self {
             blob,
@@ -2959,6 +3169,7 @@ impl JsonlBlobSource {
             line: 1,
             eof: false,
             bytes_read: 0,
+            max_bytes,
             columns: Vec::new(),
             pending: None,
         };
@@ -3020,6 +3231,13 @@ impl JsonlBlobSource {
                 .map_err(|e| format!("db import: blob read failed: {e}"))?;
             self.offset += w.len() as u64;
             self.bytes_read += w.len() as u64;
+            // 读中硬闸：超限即拒（点名 max_bytes）——单行巨 JSON 不得缓冲到 OOM
+            if self.bytes_read > self.max_bytes {
+                return Err(format!(
+                    "db import: source exceeds db_import.max_bytes ({})",
+                    self.max_bytes
+                ));
+            }
             if w.is_empty() {
                 self.eof = true;
             } else {
@@ -3262,7 +3480,7 @@ pub(crate) async fn run_import(
                     "db import: source exceeds db_import.max_bytes ({max_bytes})"
                 ));
             }
-            let n = render::batch_rows(usize::MAX, batch_size, ncols);
+            let n = render::batch_rows(dialect, usize::MAX, batch_size, ncols);
             let (batch, done) = match collect_batch(
                 &mut source,
                 n,

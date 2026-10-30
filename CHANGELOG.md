@@ -55,6 +55,19 @@
 - **验证**：500k×10 CSV 全链路实测 PG 1.8s / MySQL 3.3s（预算 <60s）；三腿 env-gated
   （`OJ_TEST_PG` / `OJ_TEST_MYSQL`：性能 / upsert 幂等 / 批间取消已提交保留）。
 
+**fix（v0.1.115 内，whole-branch 评审一轮修复）**：
+
+- **CSV 引号内换行后续记录静默损坏（Critical）**：`read_record` 切片只排除单个终止
+  `\n`，四个推进点误加 `phys`（嵌入换行数）——引号内换行记录后的首字节被吞。修推进 =
+  `rec.len()+1`；补「quoted-newline 记录后还有记录」的解析器/blob 全链路腿。
+- **max_bytes 读中强制（防 OOM）**：blob 源 fill/逐行读按窗口累计检查，超限即拒
+  （点名 `max_bytes`）——此前无换行巨记录会缓冲到 EOF 才可能触发配额。
+- **sqlite 批收敛变量上限 32766**：`batch_rows` 方言感知（sqlite `32766/列数`，
+  PG/MySQL 65535）——7 列宽表默认批 5000 行 = 35000 变量超 sqlite 上限必炸。
+- **upsert 脏标识符 panic → Err**：未登记表的列/键是用户串，`quote_ident` 失败
+  （空/控制字符）在 `pg_on_conflict`/`mysql_on_dup` 处由 `.expect()` 改为落 Err——
+  原行为 panic 在 spawned consumer 里 = 任务永卡 running + 配额槽泄漏。
+
 ## v0.1.114（未打标签）
 
 **feat（db，REQ-11 非流式取消与执行进度全交付）**：
