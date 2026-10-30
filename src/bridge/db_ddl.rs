@@ -348,6 +348,42 @@ fn col_def_sql(d: Dialect, c: &ColSpec, after: Option<&str>) -> String {
     s
 }
 
+/// 语句体校验（REQ-09 §4.6 信任类澄清）：整条语句级文本（definition/partitionBy）
+/// 无嵌入分裂面——拒 NUL、限长 64 KiB，**不拒 `;`/换行**（与嵌入片段的
+/// `check_fragment` 不同档）。重放走 prepared 协议，多语句被服务端拒。
+pub fn validate_statement_body(field: &str, s: &str) -> Result<(), String> {
+    if s.bytes().any(|b| b == 0) || s.len() > 64 * 1024 {
+        return Err(format!("ddlDiff: {field} contains NUL or exceeds 64 KiB"));
+    }
+    Ok(())
+}
+
+/// G2（REQ-09 §4.3）：分区/表选项变更 → 结构化 unsupported 的 capability 判据。
+/// 仅 objectType=table 时判（其余对象类型无该维度）；差异定义 = 一侧有一侧无，
+/// 或两侧文本/值不同。None = 可走正常 diff。
+pub fn unsupported_capability_from_spec(d: Dialect, spec: &Value) -> Option<&'static str> {
+    if spec.get("objectType").and_then(Value::as_str) != Some("table") {
+        return None;
+    }
+    let from = spec.get("from");
+    let to = spec.get("to");
+    fn part(side: Option<&Value>) -> Option<&str> {
+        side.and_then(|v| v.get("partitionBy"))
+            .and_then(Value::as_str)
+    }
+    if part(from) != part(to) {
+        return Some("ddl_diff_partition");
+    }
+    fn opts(side: Option<&Value>) -> Option<&Value> {
+        side.and_then(|v| v.get("options"))
+    }
+    if opts(from) != opts(to) {
+        return Some("ddl_diff_table_options");
+    }
+    let _ = d;
+    None
+}
+
 /// diff + 渲染。spec：`{objectType:"table", name, from: Structure|null, to: Structure}`。
 pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     if spec.get("objectType").and_then(Value::as_str) != Some("table") {
@@ -392,6 +428,12 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         None,
     )?;
     let to_fks = parse_named_defs("to.foreignKeys", to.get("foreignKeys"), None)?;
+
+    // G2（REQ-09 §4.3）：分区/表选项变更显式 unsupported——fail-fast 在列 diff 之前，
+    // 不出半截 statements。op 层另有结构化通道（两层同判据）。
+    if let Some(c) = unsupported_capability_from_spec(d, spec) {
+        return Err(format!("ddlDiff: unsupported capability {c}"));
+    }
 
     // identity 是 PG 专属能力：MySQL 结构里出现 → 参数错误（GENERATED AS IDENTITY 非 MySQL 语法）。
     if d == Dialect::MySql {
@@ -1112,6 +1154,14 @@ pub async fn op_db_ddl_diff(
     };
     let alias = super::guard::bound_db(&state, &name);
     super::db_policy::granted_only(&state, &alias)?;
+    // G2（REQ-09 §4.3）：分区/表选项变更 → 结构化 OJ_DB_UNSUPPORTED（ddl_diff 内部
+    // 字符串兜底是同判据第二层）。须先于 ddl_diff，否则 capability 被 generic 吞掉。
+    if let Some(cap) = unsupported_capability_from_spec(dialect, &spec) {
+        return Err(to_js_err(Box::new(crate::bridge::db_error::unsupported(
+            dialect.as_str(),
+            cap,
+        ))));
+    }
     ddl_diff(dialect, &spec).map_err(JsErrorBox::generic)
 }
 
@@ -1200,6 +1250,72 @@ mod tests {
             .join("\n");
         assert!(joined.contains('a') && joined.contains('c'), "{joined}");
         assert!(joined.contains('b') && joined.contains('d'), "{joined}");
+    }
+
+    /// G2（REQ-09 §4.3）：partitionBy 差异 → unsupported（helper 与 ddl_diff 两路同判据）。
+    #[test]
+    fn partition_change_is_unsupported_ddl_diff_partition() {
+        let spec = json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"d","nativeType":"date"}],"partitionBy":"RANGE (d)"},
+            "to":{"columns":[{"name":"d","nativeType":"date"}],"partitionBy":"RANGE (x)"}});
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::Postgres, &spec),
+            Some("ddl_diff_partition")
+        );
+        let err = ddl_diff(Dialect::Postgres, &spec).unwrap_err();
+        assert!(err.contains("ddl_diff_partition"), "{err}");
+        // 一侧有一侧无同样 unsupported。
+        let spec2 = json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"d","nativeType":"date"}]},
+            "to":{"columns":[{"name":"d","nativeType":"date"}],"partitionBy":"RANGE (d)"}});
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::MySql, &spec2),
+            Some("ddl_diff_partition")
+        );
+        // 皆空 / 皆同 → None（零语句正常路径不被误伤）。
+        let spec3 = json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"d","nativeType":"date"}]},
+            "to":{"columns":[{"name":"d","nativeType":"date"}]}});
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::Postgres, &spec3),
+            None
+        );
+        let spec4 = json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"d","nativeType":"date"}],"partitionBy":"RANGE (d)"},
+            "to":{"columns":[{"name":"d","nativeType":"date"}],"partitionBy":"RANGE (d)"}});
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::Postgres, &spec4),
+            None
+        );
+    }
+
+    /// G2（REQ-09 §4.3）：MySQL options 差异 → ddl_diff_table_options。
+    #[test]
+    fn options_change_is_unsupported_ddl_diff_table_options() {
+        let mk = |e: &str| {
+            json!({"objectType":"table","name":"t",
+                "from":{"columns":[{"name":"id","nativeType":"int"}],
+                        "options":{"engine":"InnoDB"}},
+                "to":{"columns":[{"name":"id","nativeType":"int"}],
+                      "options":{"engine":e}}})
+        };
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::MySql, &mk("MyISAM")),
+            Some("ddl_diff_table_options")
+        );
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::MySql, &mk("InnoDB")),
+            None
+        );
+    }
+
+    /// validate_statement_body：拒 NUL / 超 64 KiB；接受多行与分号（语句体信任类）。
+    #[test]
+    fn validate_statement_body_accepts_multiline_rejects_nul_and_oversize() {
+        validate_statement_body("definition", "BEGIN\n  RETURN 1;\nEND").unwrap();
+        assert!(validate_statement_body("definition", "a\0b").is_err());
+        let big = "x".repeat(64 * 1024 + 1);
+        assert!(validate_statement_body("partitionBy", &big).is_err());
     }
 
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
