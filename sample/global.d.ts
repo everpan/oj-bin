@@ -874,7 +874,7 @@ declare global {
       mode?: "append" | "upsert" | "replace";
       /** upsert 必填（PG: ON CONFLICT / MySQL: 需唯一键 / sqlite: 仅 ["rowid"]）。 */
       conflictKeys?: string[];
-      /** 实现按 65535/列数 与 100..=50000 收敛。 */
+      /** 实现按方言变量上限/列数（PG/MySQL 65535、sqlite 32766）与 100..=50000 收敛。 */
       batchSize?: number;
       /** csv 首行为表头（默认 true；表头与 columns 不符即参数错误 fail-fast）。 */
       header?: boolean;
