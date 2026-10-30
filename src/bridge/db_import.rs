@@ -912,3 +912,432 @@ mod tests {
         assert_eq!(v["errors"], 30);
     }
 }
+
+/// 方言 SQL 渲染（T4）：多值 INSERT 经 sea-query（build_sql 渲染 + value_to_json 提参），
+/// ON CONFLICT / ON DUPLICATE KEY / OR REPLACE 为字符串尾缀——**只拼 quote_ident 过的
+/// 标识符与常量文本，值永不碰 SQL 文本**（注入红线：调用方须先过 has_column 白名单）。
+pub mod render {
+    use serde_json::Value;
+
+    use super::super::db::Dialect;
+    use super::super::db_ddl::quote_ident;
+
+    /// 一批渲染产物：可执行 SQL + 序对齐的绑定参数。
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct BatchSql {
+        pub sql: String,
+        pub params: Vec<Value>,
+    }
+
+    /// 导入模式：Append 纯插 / Upsert 按冲突键幂等 / Replace 整表替换
+    /// （delete + append 两段，T6 单事务内执行 render_delete + 各批）。
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ImportMode {
+        Append,
+        Upsert { conflict_keys: Vec<String> },
+        Replace,
+    }
+
+    /// 绑定参数上限收敛（PG/MySQL 同 65535）：按 `65535/列数` 收敛批行数，
+    /// 不报错、参数序正确（Review Focus 4）。`cap` = 剩余行数（末批不空跑）。
+    pub fn batch_rows(cap: usize, batch_size: usize, ncols: usize) -> usize {
+        let per_stmt = (65535 / ncols.max(1)).max(1);
+        cap.min(batch_size).min(per_stmt)
+    }
+
+    /// Replace 模式的删旧段（T6 在单事务内先执行本句再逐批 insert）。
+    /// 标识符经 quote_ident；DELETE 无条件——整表语义即 spec §3 replace 定义。
+    pub fn render_delete(dialect: Dialect, table: &str) -> Result<String, String> {
+        Ok(format!("DELETE FROM {}", quote_ident(dialect, table)?))
+    }
+
+    /// 渲染一批多值 INSERT。标识符安全由调用方的 `has_column` 白名单保证，本层仍
+    /// 经 `quote_ident` 引号包裹（纵深防御）；值为纯绑定参数，永不进 SQL 文本。
+    pub fn render_batch(
+        dialect: Dialect,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+        mode: &ImportMode,
+        table_pk: &[String],
+    ) -> Result<BatchSql, String> {
+        if rows.is_empty() {
+            return Err("db import: render_batch with no rows".into());
+        }
+        let ncols = columns.len();
+        for r in rows {
+            if r.len() != ncols {
+                return Err(format!(
+                    "db import: row has {} values but {} columns declared",
+                    r.len(),
+                    ncols
+                ));
+            }
+        }
+        match mode {
+            ImportMode::Append => sea_insert(dialect, table, columns, rows),
+            ImportMode::Replace => Err(
+                "db import: replace mode renders via render_delete + append batches".into(),
+            ),
+            ImportMode::Upsert { conflict_keys } => {
+                if conflict_keys.is_empty() {
+                    return Err("db import: upsert requires at least one conflict key".into());
+                }
+                for k in conflict_keys {
+                    if !columns.iter().any(|c| c == k) {
+                        return Err(format!(
+                            "db import: conflict key '{k}' not in import columns"
+                        ));
+                    }
+                }
+                match dialect {
+                    Dialect::Postgres => {
+                        let mut b = sea_insert(dialect, table, columns, rows)?;
+                        b.sql.push_str(&pg_on_conflict(conflict_keys, columns));
+                        Ok(b)
+                    }
+                    Dialect::MySql => {
+                        if table_pk.is_empty() {
+                            return Err(format!(
+                                "db import: upsert on mysql requires a unique key (primary key) on table '{table}'"
+                            ));
+                        }
+                        let mut b = sea_insert(dialect, table, columns, rows)?;
+                        if let Some(suffix) = mysql_on_dup(conflict_keys, columns) {
+                            b.sql.push_str(&suffix);
+                        }
+                        Ok(b)
+                    }
+                    Dialect::Sqlite => {
+                        if conflict_keys.len() != 1 || conflict_keys[0] != "rowid" {
+                            return Err(
+                                "db import: sqlite upsert only supports conflictKeys [\"rowid\"]"
+                                    .into(),
+                            );
+                        }
+                        sqlite_or_replace(table, columns, rows)
+                    }
+                }
+            }
+        }
+    }
+
+    /// sea-query 多值 INSERT 主干（append / PG·MySQL upsert 共用），
+    /// 渲染 + 参数提取全复用 query.rs 既有对（build_sql / value_to_json / to_qv）。
+    fn sea_insert(
+        dialect: Dialect,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<BatchSql, String> {
+        use sea_query::{Alias, Expr, Query};
+        let mut ins = Query::insert();
+        ins.into_table(Alias::new(table));
+        ins.columns(columns.iter().map(Alias::new));
+        for row in rows {
+            let vals: Vec<Expr> = row.iter().map(|v| Expr::val(super::super::query::to_qv(v))).collect();
+            ins.values(vals)
+                .map_err(|e| format!("db import: {e}"))?;
+        }
+        let (sql, vals) = super::super::query::build_sql(dialect, &ins);
+        let mut params = Vec::with_capacity(vals.iter().count());
+        for v in vals.iter() {
+            params.push(
+                super::super::query::value_to_json(v).map_err(|e| format!("db import: {e}"))?,
+            );
+        }
+        Ok(BatchSql { sql, params })
+    }
+
+    /// PG upsert 尾缀：`ON CONFLICT ("k",…) DO UPDATE SET "c" = "excluded"."c", …`
+    /// （SET 只含非 key 列；全是 key → DO NOTHING）。纯标识符 + 常量文本。
+    fn pg_on_conflict(keys: &[String], columns: &[String]) -> String {
+        let ks = keys
+            .iter()
+            .map(|k| quote_ident(Dialect::Postgres, k).expect("caller-validated key"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sets: Vec<String> = columns
+            .iter()
+            .filter(|c| !keys.contains(c))
+            .map(|c| {
+                let q = quote_ident(Dialect::Postgres, c).expect("caller-validated column");
+                format!("{q} = \"excluded\".{q}")
+            })
+            .collect();
+        if sets.is_empty() {
+            format!(" ON CONFLICT ({ks}) DO NOTHING")
+        } else {
+            format!(" ON CONFLICT ({ks}) DO UPDATE SET {}", sets.join(", "))
+        }
+    }
+
+    /// MySQL upsert 尾缀：`ON DUPLICATE KEY UPDATE `c` = VALUES(`c`), …`。
+    /// 非 key 列为空（全列皆 key）→ None（无后缀：重复键时由方言报错 surfaced）。
+    fn mysql_on_dup(keys: &[String], columns: &[String]) -> Option<String> {
+        let sets: Vec<String> = columns
+            .iter()
+            .filter(|c| !keys.contains(c))
+            .map(|c| {
+                let q = quote_ident(Dialect::MySql, c).expect("caller-validated column");
+                format!("{q} = VALUES({q})")
+            })
+            .collect();
+        if sets.is_empty() {
+            None
+        } else {
+            Some(format!(" ON DUPLICATE KEY UPDATE {}", sets.join(", ")))
+        }
+    }
+
+    /// sqlite upsert 特例（spec §4.3）：仅 rowid 键——sea-query 表达不了
+    /// `INSERT OR REPLACE`，整句手渲染；`?` 占位 + quote_ident，参数为行展平。
+    fn sqlite_or_replace(
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<BatchSql, String> {
+        let t = quote_ident(Dialect::Sqlite, table)?;
+        let cols = columns
+            .iter()
+            .map(|c| quote_ident(Dialect::Sqlite, c))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let one = format!("({})", vec!["?"; columns.len()].join(","));
+        let body = vec![one; rows.len()].join(",");
+        let params: Vec<Value> = rows.iter().flatten().cloned().collect();
+        Ok(BatchSql {
+            sql: format!("INSERT OR REPLACE INTO {t} ({cols}) VALUES {body}"),
+            params,
+        })
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::render::*;
+    use super::super::db::Dialect;
+    use serde_json::json;
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn two_rows() -> Vec<Vec<serde_json::Value>> {
+        vec![vec![json!(1), json!("a")], vec![json!(2), json!("b")]]
+    }
+
+    #[test]
+    fn render_pg_append_multivalue() {
+        let b = render_batch(
+            Dialect::Postgres,
+            "t",
+            &cols(&["a", "b"]),
+            &two_rows(),
+            &ImportMode::Append,
+            &[],
+        )
+        .unwrap();
+        let flat: String = b.sql.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("INSERTINTO\"t\"(\"a\",\"b\")VALUES($1,$2),($3,$4)"),
+            "{sql}",
+            sql = b.sql
+        );
+        assert_eq!(b.params, vec![json!(1), json!("a"), json!(2), json!("b")]);
+    }
+
+    #[test]
+    fn render_pg_upsert_on_conflict_clause() {
+        let rows3: Vec<Vec<serde_json::Value>> = vec![
+            vec![json!(1), json!("a"), json!(10)],
+            vec![json!(2), json!("b"), json!(20)],
+        ];
+        let b = render_batch(
+            Dialect::Postgres,
+            "t",
+            &cols(&["a", "b", "c"]),
+            &rows3,
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(
+            b.sql.contains("ON CONFLICT (\"a\") DO UPDATE SET"),
+            "{}",
+            b.sql
+        );
+        // SET 只含非 key 列，excluded 引用正确
+        assert!(b.sql.contains("\"b\" = \"excluded\".\"b\""), "{}", b.sql);
+        assert!(b.sql.contains("\"c\" = \"excluded\".\"c\""), "{}", b.sql);
+        assert!(!b.sql.contains("\"a\" = \"excluded\""), "{}", b.sql);
+        // 参数与 append 同序（suffix 不碰绑定）
+        assert_eq!(b.params.len(), 6);
+    }
+
+    #[test]
+    fn render_pg_upsert_all_keys_do_nothing() {
+        let b = render_batch(
+            Dialect::Postgres,
+            "t",
+            &cols(&["a"]),
+            &[vec![json!(1)]],
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(b.sql.contains("ON CONFLICT (\"a\") DO NOTHING"), "{}", b.sql);
+    }
+
+    #[test]
+    fn render_mysql_upsert_requires_pk() {
+        let e = render_batch(
+            Dialect::MySql,
+            "t",
+            &cols(&["a", "b"]),
+            &two_rows(),
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("requires a unique key"), "{e}");
+        assert!(e.contains("'t'"), "{e}");
+        // 有 pk → ON DUPLICATE KEY UPDATE 只含非 key 列
+        let b = render_batch(
+            Dialect::MySql,
+            "t",
+            &cols(&["a", "b"]),
+            &two_rows(),
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &cols(&["a"]),
+        )
+        .unwrap();
+        assert!(b.sql.contains("ON DUPLICATE KEY UPDATE"), "{}", b.sql);
+        assert!(b.sql.contains("`b` = VALUES(`b`)"), "{}", b.sql);
+        assert!(!b.sql.contains("`a` = VALUES"), "{}", b.sql);
+    }
+
+    #[test]
+    fn render_sqlite_or_replace_only_rowid() {
+        // 仅 conflict_keys == ["rowid"] 合法（spec §4.3）；rowid 须入列清单
+        let rows3: Vec<Vec<serde_json::Value>> = vec![
+            vec![json!(1), json!(1), json!("a")],
+            vec![json!(2), json!(2), json!("b")],
+        ];
+        let b = render_batch(
+            Dialect::Sqlite,
+            "t",
+            &cols(&["rowid", "a", "b"]),
+            &rows3,
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["rowid"]),
+            },
+            &[],
+        )
+        .unwrap();
+        let flat: String = b.sql.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("INSERTORREPLACEINTO\"t\"(\"rowid\",\"a\",\"b\")VALUES(?,?,?)"),
+            "{}",
+            b.sql
+        );
+        assert_eq!(b.params, vec![json!(1), json!(1), json!("a"), json!(2), json!(2), json!("b")]);
+        // 非 rowid 键 → 参数错误
+        let e = render_batch(
+            Dialect::Sqlite,
+            "t",
+            &cols(&["rowid", "a", "b"]),
+            &rows3,
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["a"]),
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("rowid"), "{e}");
+    }
+
+    #[test]
+    fn render_conflict_key_must_be_in_columns() {
+        let e = render_batch(
+            Dialect::Postgres,
+            "t",
+            &cols(&["a", "b"]),
+            &two_rows(),
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["nope"]),
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+    }
+
+    #[test]
+    fn batch_rows_caps_at_65535() {
+        // ncols=10 → 每语句 ≤6553
+        assert_eq!(batch_rows(usize::MAX, 5000, 10), 5000);
+        assert_eq!(batch_rows(usize::MAX, 100_000, 10), 6553);
+        // ncols=100 → ≤655
+        assert_eq!(batch_rows(usize::MAX, 100_000, 100), 655);
+        // 用户 batchSize 1_000_000 → 收敛不报错
+        assert_eq!(batch_rows(usize::MAX, 1_000_000, 10), 6553);
+        // cap（剩余行数）优先
+        assert_eq!(batch_rows(5, 5000, 10), 5);
+        assert!(batch_rows(0, 5000, 10) == 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_real_multivalue_insert_and_or_replace() {
+        use super::super::accessor_sqlx::SqlxAccessor;
+        use super::super::db::DataAccessor;
+        let db = SqlxAccessor::connect("sqlite::memory:").await.unwrap();
+        db.exec_with_params("create table t (a integer, b text)", &[])
+            .await
+            .unwrap();
+        // 多值 append
+        let batch = render_batch(
+            Dialect::Sqlite,
+            "t",
+            &cols(&["a", "b"]),
+            &two_rows(),
+            &ImportMode::Append,
+            &[],
+        )
+        .unwrap();
+        let n = db.exec_with_params(&batch.sql, &batch.params).await.unwrap();
+        assert_eq!(n, 2);
+        let rows = db
+            .query_with_params("select a, b from t order by a", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // rowid OR REPLACE 幂等（同 rowid 覆盖）
+        let batch = render_batch(
+            Dialect::Sqlite,
+            "t",
+            &cols(&["rowid", "a", "b"]),
+            &[vec![json!(1), json!(9), json!("z")]],
+            &ImportMode::Upsert {
+                conflict_keys: cols(&["rowid"]),
+            },
+            &[],
+        )
+        .unwrap();
+        db.exec_with_params(&batch.sql, &batch.params).await.unwrap();
+        let rows = db
+            .query_with_params("select a, b from t order by a", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "or replace 不增行");
+        assert_eq!(rows[1]["b"], json!("z"), "row 1 被覆盖");
+    }
+}

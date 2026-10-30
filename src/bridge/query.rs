@@ -649,7 +649,8 @@ fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsError
     Ok(state.borrow().borrow::<Arc<StableState>>().registry.clone())
 }
 
-fn to_qv(v: &Value) -> Qv {
+// REQ-12：导入批渲染复用（serde → sea_query 值）。
+pub(crate) fn to_qv(v: &Value) -> Qv {
     // 大整数标记（v0.1.22 `$oj$i64` / v0.1.24 `$oj$u64`，`toBigInt()` / `toUBigInt()` 的返回值）：
     // 必须在 `other => to_string()` 之前——否则标记对象会被串化成文本（PG 拒绝 text → bigint）。
     if let Some(i) = oj_plugin_ffi::jsint::marker_i64(v) {
@@ -2600,7 +2601,7 @@ fn apply_tenant_guard(
 }
 
 /// 按方言出 SQL（QueryStatementWriter::build 泛型，四类 statement 通吃）。
-fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, sea_query::Values) {
+pub(crate) fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, sea_query::Values) {
     match d {
         Dialect::Sqlite => q.build(SqliteQueryBuilder),
         Dialect::MySql => q.build(sea_query::MysqlQueryBuilder),
@@ -2616,7 +2617,8 @@ fn build_sql<S: sea_query::QueryStatementWriter>(d: Dialect, q: &S) -> (String, 
 /// 回跑时被绑成 text（PG 报 `bigint but expression is of type text`）——即参数不可重放。
 /// 吐 marker 后既可重放又保持精确；插件侧 `bind_value` 认得这两个形状（见 `jsint`）。
 /// 安全范围内的整数仍吐 number（回放与可读性都不变）。
-fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
+// REQ-12：导入批渲染复用（db_import::render）。
+pub(crate) fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
     let num = |f: f64| {
         serde_json::Number::from_f64(f)
             .map(Value::Number)
