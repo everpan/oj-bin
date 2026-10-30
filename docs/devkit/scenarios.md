@@ -4331,3 +4331,83 @@ export default {
 | PG 的 `elapsedSec` 是 `now()-query_start` | 秒级整数；idle 会话也有值（上次查询以来的空闲时长），按 `state` 过滤 |
 | `truncated: true` | 会话数超 1000 上限被截断——运维页给「结果不完整」提示，别当全量清单 |
 | 想 KILL 会话 | `KILL` 语句自 v0.1.112 分类为 Write：只读会话/只读 allow 面一律拒绝，执行走写面 + `allow_ddl` 无关（KILL 非 DDL，但要写权限） |
+
+## 场景 63：建表保真——分区表与 MySQL 表选项（`partitionBy`/`options`，REQ-09 §4.2，v0.1.113）
+
+`ddlDiff` 建表路径（`from=null`）保真渲染分区与表选项，与 `catalog("ddl")` 互为逆运算
+（抓回 DDL → 切出 `partitionBy` 文本 → `ddlDiff(create)` 重放 → 二次抓回一致）：
+
+```ts
+export default {
+  async post({ name }: { name: string }) {
+    // 1) 抓回既有分区表的建表语句。
+    const c = await db.catalog("ddl", name);
+    const ddl = c.items[0].ddl;
+    const part = (ddl.match(/PARTITION BY ([\s\S]+)$/) || [])[1]?.replace(/\s*\*\/\s*$/, "").trim();
+    // 2) 逆运算：从抓回 DDL 重建 structure 并生成副本建表语句。
+    const cols = (await db.listColumns(name)).map((x) => ({ name: x.name, nativeType: x.nativeType }));
+    const out = await db.ddlDiff({ objectType: "table", name: `${name}_copy`, from: null,
+      to: { columns: cols, partitionBy: part } });
+    // 3) 执行（MySQL 分区 DDL 不受 prepared 协议支持——走迁移通道，勿 db.exec）。
+    return json.ok({ statements: out.statements });
+  },
+};
+```
+
+MySQL 表选项：`to.options = {engine, charset, collate, comment}`（固定序渲染，comment
+单引号翻倍）；PG 给 `options` → 参数错误。
+
+| 坑 | 解 |
+|---|---|
+| 改分区/表选项（from 非 null 两侧不同） | `OJ_DB_UNSUPPORTED`（`ddl_diff_partition`/`ddl_diff_table_options`）——不支持自动迁移，手写迁移 |
+| `db.exec` 重放含分区的建表语句 MySQL 1064 | 分区 DDL 不走 prepared 协议——迁移通道/raw 执行；PG 无此限制 |
+| `partitionBy` 带 `;`/换行 | 合法（语句体信任类，拒 NUL/限 64 KiB）——但别混进第二条语句，prepared 重放会被服务端拒 |
+| SHOW CREATE 的分区段在版本注释里（`/*!50100 PARTITION BY ... */`） | 抓回文本要剥尾部 `*/`；本场景的正则已处理 |
+
+## 场景 64：建视图/例程/触发器等非表对象（`objectType` 扩值，REQ-09 §4.4，v0.1.113）
+
+```ts
+export default {
+  async post() {
+    // 建视图：definition 即完整 SELECT。
+    const v = await db.ddlDiff({ objectType: "view", name: "v_orders", from: null,
+      to: { definition: "SELECT id, total FROM orders WHERE total > 100" } });
+    // 视图定义变更：文本不同 → PG CREATE OR REPLACE VIEW / MySQL ALTER VIEW。
+    const v2 = await db.ddlDiff({ objectType: "view", name: "v_orders",
+      from: { definition: "SELECT id FROM orders" },
+      to: { definition: "SELECT id, total FROM orders" } });
+    // 例程/触发器/索引/序列：create（definition 原样整条）+ drop（to:null）。
+    const f = await db.ddlDiff({ objectType: "routine", name: "f_tax", from: null,
+      to: { definition: "CREATE FUNCTION f_tax(x numeric) RETURNS numeric AS $$ SELECT x * 0.1 $$ LANGUAGE sql" } });
+    return json.ok({ create: v.statements, alter: v2.statements, diff: v2.diff.definition,
+                     routine: f.statements });
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| MySQL drop index 报缺 table | `from.table` 必填（`DROP INDEX ix ON tbl`）；create 路径不强制 |
+| PG drop 重载函数报签名错 | `from.type`（function/procedure）+ `from.args`（签名文本）必填 |
+| index/sequence/routine/trigger 想逐字段 diff | 不支持——只 create/drop 两头，字段级请求参数错误 |
+| view definition 相同却产语句 | 不会——文本严格相等 → 零语句 |
+
+## 场景 65：表改名（`previousName` 表级，REQ-09 §4.1 缺口补齐，v0.1.113）
+
+```ts
+export default {
+  async post({ oldName, newName }: { oldName: string; newName: string }) {
+    const cols = (await db.listColumns(oldName)).map((x) => ({ name: x.name, nativeType: x.nativeType }));
+    const out = await db.ddlDiff({ objectType: "table", name: newName, previousName: oldName,
+      from: { columns: cols }, to: { columns: cols } });
+    // statements[0] 恒为 ALTER TABLE old RENAME TO new；diff.renamed 恒在。
+    return json.ok({ statements: out.statements, renamed: out.diff.renamed });
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| 和列改名混用 | 表 RENAME 恒首条，列 RENAME 次之且用新表名——顺序已钉，无需手工排 |
+| schema 段 | `"schema"."old"` RENAME TO `"schema"."new"` 两段引用 |
+| `to: null` 想删表 | 参数错误（v0.1.113 起）——ddlDiff 不产 DROP TABLE，删表走显式迁移 |

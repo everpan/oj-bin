@@ -16,6 +16,32 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.113（未打标签）
+
+**feat（db.ddlDiff，REQ-09 剩余收口）**：
+
+- **建表保真（§4.2）**：`to` 顶层新增 `partitionBy`（文本，原样拼到 `)` 之后，两方言）
+  与 `options`（仅 MySQL：`engine`/`charset`/`collate`/`comment` 四键固定序，
+  comment 单引号翻倍；PG 出现 → 参数错误）。与 `catalog("ddl")` 互为逆运算
+  （PG 拼接器 `PARTITION BY` 段 v0.1.109 已交付，本批补逆运算真库验证腿）。
+  **修复**：create 路径不再渲染 `FIRST`/`AFTER`（ALTER 专属语法曾使 CREATE TABLE
+  不可重放）；MySQL 表选项排在分区定义之前。
+- **分区/表选项变更显式报错（§4.3）**：`from != null` 时 partitionBy/options 有差异
+  → 结构化 `OJ_DB_UNSUPPORTED`（`capability="ddl_diff_partition"` /
+  `"ddl_diff_table_options"`），fail-fast 不出半截 statements。
+- **非表对象（§4.4）**：`objectType` 扩 `"view" | "index" | "sequence" | "routine" |
+  "trigger"`——view 支持 create / definition 文本 diff（PG `CREATE OR REPLACE VIEW` /
+  MySQL `ALTER VIEW`，挂 `diff.definition`）/ drop；其余四型 create（definition 原样）
+  + drop 只做两头（MySQL index drop 需 `from.table`；routine drop 按 `from.type` +
+  `from.args` 签名）。definition 走语句体校验（NUL/限 64 KiB，不拒 `;`/换行）。
+- **表改名（§4.1 缺口）**：spec 顶层 `previousName` → `ALTER TABLE old RENAME TO new`
+  恒首条（两方言同词法），`diff.renamed` 表级挂点恒在；schema 段两段引用；
+  与列级 previousName 互不干扰。
+- **table 的 `to:null`** 由静默零语句改参数错误（fail-loud）。
+
+**限制登记**：MySQL 分区 DDL 不受 prepared 协议支持——`db.exec` 重放含分区的建表
+语句会 1064，须走迁移/raw 执行通道。
+
 ## v0.1.112（未打标签）
 
 **breaking（db 插件）**：REQ-07b 二进制列恒定 cellenv 信封——PG `BYTEA`（池/流式/Any

@@ -401,6 +401,11 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | 把写操作注册成 GET 给 agent 用（v0.1.110） | 不要——GET tool 带 `readOnlyHint`，agent 会免确认直接调；写操作走 POST/PUT/PATCH/DELETE（DELETE 带 `destructiveHint`），让 agent 的确认链生效 |
 | 线路 A（`oj mcp` 产物）少了新加的接口（v0.1.110） | 文件型快照，不自动跟随路由表——**路由变更须重跑 `oj mcp`**；线路 B（serve 内建）则自动。产物头注释的 spec_hash 可比对漂移 |
 | `oj mcp` 生成的 stdio server 连不上服务 / 401（v0.1.110） | 运行时 env：`OJ_BASE`（必，含 origin 不含 base path）、`OJ_TOKEN`（Bearer JWT）；config 声明租户头时还要 `OJ_TENANT`（头名已内嵌，值走 env）。诊断全在 stderr（stdout 只出协议） |
+| ddlDiff 改分区/表选项却「成功」零语句或 diff 里找不到（v0.1.113 前静默）（v0.1.113 已改为报错） | `from != null` 时 partitionBy/options 有差异 → `OJ_DB_UNSUPPORTED`（`ddl_diff_partition`/`ddl_diff_table_options`）——不支持自动迁移分区，手写迁移 |
+| ddlDiff 的 definition/partitionBy 被 `;` 拒掉（与列 default 混用经验）（v0.1.113） | **语句体**字段（view/routine 等 definition、partitionBy）含 `;`/换行**合法**（拒 NUL/限 64 KiB）；**嵌入片段**（列 default/constraint definition）仍拒 `;`——两档校验别套用 |
+| `db.exec` 重放 ddlDiff 产的分区建表语句 MySQL 1064（v0.1.113 登记） | MySQL 分区 DDL 不受 prepared 协议支持——走迁移通道/raw 执行；非分区语句不受影响 |
+| table 的 ddlDiff `to:null` 曾静默零语句（v0.1.113 已改为参数错误） | DROP TABLE 是独立高危语义，不进 ddlDiff——删表走显式迁移；objectType=view/index/sequence/routine/trigger 的 to:null 才是 drop |
+| MySQL 表改名语句序（v0.1.113） | 表 `previousName` 产 `ALTER TABLE old RENAME TO new`（**RENAME TO**，非 RENAME TABLE）恒首条；与列级 previousName 同 spec 时表 rename 在先、列 rename 用新表名 |
 
 ## 手册
 
