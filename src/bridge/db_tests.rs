@@ -3095,3 +3095,90 @@ async fn no_degraded_header_when_clean() {
         cap.headers
     );
 }
+
+/// Final review I2：同请求多语句（DB("a") + DB("b") 各一条降级查询）时，X-OJ-Degraded
+/// 须**并集合并为一条**——serve 侧同名头 last-wins，分条推会被静默覆盖，前序语句的
+/// 降级单元格失去权威标记。
+#[tokio::test(flavor = "current_thread")]
+async fn degraded_header_merges_across_statements_in_one_request() {
+    let a = Arc::new(InMemoryAccessor::new());
+    a.seed([json!({"ip": "$inet:AQI="})]);
+    let b = Arc::new(InMemoryAccessor::new());
+    b.seed([json!({"g": "$point:AAAA"})]);
+    let b = Bridge::with_dbs(
+        std::collections::HashMap::from([
+            ("a".to_string(), a as Arc<dyn DataAccessor>),
+            ("b".to_string(), b as Arc<dyn DataAccessor>),
+        ]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+    );
+    let cap = b
+        .run(
+            r#"(async () => {
+                const ra = await DB("a").query("select ip from ta");
+                const rb = await DB("b").query("select g from tb");
+                json.ok({ ra, rb });
+              })().catch(e => json.fail(500, String(e)));"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let entries: Vec<&(String, String)> = cap
+        .headers
+        .iter()
+        .filter(|(k, _)| k == "X-OJ-Degraded")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "同名头须并集合并为一条（serve last-wins 会丢前序）: {:?}",
+        cap.headers
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(entries[0].1.as_str()).unwrap(),
+        json!([{"col": "ip", "type": "inet"}, {"col": "g", "type": "point"}]),
+        "{}",
+        entries[0].1
+    );
+}
+
+/// Final review I1：非 ASCII 列名（PG/MySQL 合法，safe_ident 只剔控制字符）降级时，
+/// 头值须纯 ASCII——`\uXXXX` 是合法 JSON 转义；不转义会被 serve 的 HeaderValue
+/// 宽容解析**静默丢弃**，权威判定面无声消失。
+#[tokio::test(flavor = "current_thread")]
+async fn degraded_header_ascii_safe_for_non_ascii_colnames() {
+    let db = Arc::new(InMemoryAccessor::new());
+    db.seed([json!({"地址": "$point:AAAA"})]);
+    let b = Bridge::with_dbs(
+        std::collections::HashMap::from([("default".to_string(), db as Arc<dyn DataAccessor>)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+    );
+    let cap = b
+        .run(
+            r#"db.query("select 地址 from t").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let h = cap
+        .headers
+        .iter()
+        .find(|(k, _)| k == "X-OJ-Degraded")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| panic!("非 ASCII 列名的降级头被静默丢弃: {:?}", cap.headers));
+    assert!(
+        h.is_ascii(),
+        "头值须纯 ASCII（HeaderValue 只容可见 ASCII）: {h:?}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&h).unwrap(),
+        json!([{"col": "地址", "type": "point"}]),
+        "{h}"
+    );
+}

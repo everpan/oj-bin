@@ -172,20 +172,54 @@ pub(crate) async fn query_impl(
     }
     // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
     super::jsnum::sanitize_rows(&mut rows);
-    // REQ-07a：语句级降级清单外发（X-OJ-Degraded，对齐 X-OJ-Row-Limit 先例）。
-    // 这是权威判定面——前缀只是单元格编码，TEXT 字面量撞前缀以本头为准。
-    let degraded = oj_plugin_ffi::cellenv::degraded_of(&rows);
-    if !degraded.is_empty() {
-        state
-            .borrow_mut()
-            .borrow_mut::<super::ReqState>()
-            .headers
-            .push((
-                "X-OJ-Degraded".into(),
-                serde_json::to_string(&degraded).unwrap(),
-            ));
-    }
+    // REQ-07a：语句级降级清单外发（X-OJ-Degraded）。这是权威判定面——前缀只是
+    // 单元格编码，TEXT 字面量撞前缀以本头为准。
+    push_degraded(&state, oj_plugin_ffi::cellenv::degraded_of(&rows));
     Ok(rows)
+}
+
+/// REQ-07a 降级清单外发的统一出口（db.query 裸 SQL 路与构造器路共用）。
+///
+/// 两条硬约束（整支评审 I1/I2，缺一则权威面无声消失）：
+/// - **并集合并**：serve 侧同名响应头 last-wins，同请求多条降级语句分条推会被
+///   静默覆盖——这里与既有头并集去重后收敛为一条；
+/// - **纯 ASCII**：`HeaderValue` 只容可见 ASCII，非 ASCII 列名（PG/MySQL 合法）
+///   的 JSON 不转义会被 serve 宽容解析丢弃——`\uXXXX` 是合法 JSON 转义，消费方
+///   `JSON.parse` 无感。
+pub(crate) fn push_degraded(state: &Rc<RefCell<OpState>>, degraded: Vec<Value>) {
+    if degraded.is_empty() {
+        return;
+    }
+    let mut g = state.borrow_mut();
+    let headers = &mut g.borrow_mut::<super::ReqState>().headers;
+    let mut merged: Vec<Value> = headers
+        .iter()
+        .find(|(k, _)| k == "X-OJ-Degraded")
+        .and_then(|(_, v)| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    for d in degraded {
+        if !merged.contains(&d) {
+            merged.push(d);
+        }
+    }
+    headers.retain(|(k, _)| k != "X-OJ-Degraded");
+    headers.push((
+        "X-OJ-Degraded".into(),
+        ascii_json(&serde_json::to_string(&merged).unwrap()),
+    ));
+}
+
+/// JSON 文本的非 ASCII 字符 → `\uXXXX`（UTF-16 码元级转义，代理对天然正确）。
+fn ascii_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for u in s.encode_utf16() {
+        if u < 0x80 {
+            out.push(u as u8 as char);
+        } else {
+            out.push_str(&format!("\\u{u:04x}"));
+        }
+    }
+    out
 }
 
 /// `Instant` → 毫秒（trace 计时用）。单拧出来是为了变异测试：`* 1000.0` 的量纲换算

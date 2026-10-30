@@ -2342,19 +2342,9 @@ pub async fn op_db_query_build(
                     None,
                     None,
                 );
-                // REQ-07a：语句级降级清单外发（与 db_query.rs 裸 SQL 路同一口径；
-                // 权威判定面是头，前缀只是单元格编码）。
-                let degraded = oj_plugin_ffi::cellenv::degraded_of(&r);
-                if !degraded.is_empty() {
-                    state
-                        .borrow_mut()
-                        .borrow_mut::<super::ReqState>()
-                        .headers
-                        .push((
-                            "X-OJ-Degraded".into(),
-                            serde_json::to_string(&degraded).unwrap(),
-                        ));
-                }
+                // REQ-07a：语句级降级清单外发（与 db_query.rs 裸 SQL 路同一口径/同一
+                // 出口——权威判定面是头，前缀只是单元格编码）。
+                super::db_query::push_degraded(&state, oj_plugin_ffi::cellenv::degraded_of(&r));
                 Ok(Value::Array(r))
             }
             Err(e) => {
