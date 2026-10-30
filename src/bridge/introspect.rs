@@ -604,6 +604,7 @@ pub fn catalog_sql(kind: Kind, d: Dialect) -> Option<&'static str> {
                   JOIN information_schema.key_column_usage kcu \
                        ON kcu.constraint_schema = tc.constraint_schema \
                       AND kcu.constraint_name = tc.constraint_name \
+                      AND kcu.table_name = tc.table_name \
                   WHERE tc.table_schema = DATABASE() AND tc.table_name = ? \
                         AND tc.constraint_type IN ('PRIMARY KEY','UNIQUE') \
                   ORDER BY tc.constraint_name, kcu.ordinal_position",
@@ -1121,6 +1122,58 @@ mod tests {
         Kind::Constraints,
         Kind::Stats,
     ];
+
+    /// BUG-02 守卫：`key_column_usage` JOIN 必须含 table_name 关联。MySQL 全库 PK
+    /// 同名 `PRIMARY`，缺该条件会把同库（乃至被 scope 异库）的列全部聚合串味。
+    #[test]
+    fn mysql_constraints_join_guard() {
+        let sql = catalog_sql(Kind::Constraints, Dialect::MySql).unwrap();
+        assert!(
+            sql.contains("kcu.table_name = tc.table_name"),
+            "BUG-02: JOIN 必须含 table_name 关联，否则全库同名约束串味: {sql}"
+        );
+    }
+
+    /// BUG-02 env-gated 真库腿（OJ_TEST_MYSQL）：同库两表各建 PK/UNIQUE，真跑
+    /// catalog SQL 再喂 `catalog()` 聚合，断言列归属不互串。未设 DSN 诚实 skip。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_mysql_constraints_no_cross_table_leak() {
+        let url = match std::env::var("OJ_TEST_MYSQL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_MYSQL unset");
+                return;
+            }
+        };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for ddl in [
+            "drop table if exists t_b02_a",
+            "drop table if exists t_b02_b",
+            "create table t_b02_a (id int primary key, code int unique)",
+            "create table t_b02_b (id int primary key, name varchar(8))",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        let sql = catalog_sql(Kind::Constraints, Dialect::MySql).unwrap();
+        // t_b02_a：PK(id) + UQ(code)；t_b02_b：仅 PK(id)。串味时两表列集会相同。
+        for (table, want) in [
+            ("t_b02_a", vec!["code", "id"]),
+            ("t_b02_b", vec!["id"]),
+        ] {
+            let rows = db.query_with_params(sql, &[serde_json::json!(table)]).await.unwrap();
+            let items = catalog(Kind::Constraints, rows);
+            let mut cols: Vec<&str> = items
+                .iter()
+                .flat_map(|it| it["columns"].as_array().into_iter().flatten())
+                .filter_map(|c| c.as_str())
+                .collect();
+            cols.sort();
+            assert_eq!(cols, want, "{table} 约束串味: {items:?}");
+        }
+        for ddl in ["drop table if exists t_b02_a", "drop table if exists t_b02_b"] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+    }
 
     /// PG 投影列 `::text` 守卫扩到 catalog 常量（铁律 2：空库不触发、建表后才崩）。
     #[test]
