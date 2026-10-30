@@ -172,6 +172,16 @@ pub(crate) async fn query_impl(
     }
     // 出口护栏：超界整数降十进制字符串，否则 JS 侧拿到 BigInt、json.ok 必 500（见 jsnum）。
     super::jsnum::sanitize_rows(&mut rows);
+    // REQ-07a：语句级降级清单外发（X-OJ-Degraded，对齐 X-OJ-Row-Limit 先例）。
+    // 这是权威判定面——前缀只是单元格编码，TEXT 字面量撞前缀以本头为准。
+    let degraded = oj_plugin_ffi::cellenv::degraded_of(&rows);
+    if !degraded.is_empty() {
+        state
+            .borrow_mut()
+            .borrow_mut::<super::ReqState>()
+            .headers
+            .push(("X-OJ-Degraded".into(), serde_json::to_string(&degraded).unwrap()));
+    }
     Ok(rows)
 }
 

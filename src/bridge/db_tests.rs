@@ -3009,3 +3009,91 @@ async fn catalog_ddl_pg_partitioned_real() {
         .await
         .unwrap();
 }
+
+/// REQ-07a：降级单元格经 `db.query`（裸 SQL 路）后，行值原样交付 + 语句级
+/// `X-OJ-Degraded` 头外发去重清单（TEXT 字面量撞前缀时的权威判定面）。
+/// fake 行的信封串同时钉住 jsnum 出口护栏不得改动 `$…` 字符串（Review Focus #3）。
+#[tokio::test(flavor = "current_thread")]
+async fn degraded_header_on_raw_query_path() {
+    let db = Arc::new(InMemoryAccessor::new());
+    db.seed([
+        json!({"ip": "$inet:AQI=", "name": "ever"}),
+        json!({"ip": "$inet:AgM=", "name": "root"}),
+    ]);
+    let b = Bridge::with_dbs(
+        std::collections::HashMap::from([("default".to_string(), db as Arc<dyn DataAccessor>)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new().table("t", &["id"], &["id"]),
+        false,
+    );
+    let cap = b
+        .run(r#"db.query("select ip, name from t").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    // 信封串原样（sanitize_rows 不得改动）。
+    assert_eq!(v["data"][0]["ip"], json!("$inet:AQI="), "{v}");
+    // 语句级权威清单：按 {col,type} 去重。
+    let h = cap
+        .headers
+        .iter()
+        .find(|(k, _)| k == "X-OJ-Degraded")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| panic!("缺 X-OJ-Degraded 头: {:?}", cap.headers));
+    assert_eq!(
+        serde_json::from_str::<Value>(&h).unwrap(),
+        json!([{"col": "ip", "type": "inet"}]),
+        "{h}"
+    );
+}
+
+/// REQ-07a：构造器路（`op_db_query_build`）同一头外发——两路各自独立接线，缺一即漏。
+#[tokio::test(flavor = "current_thread")]
+async fn degraded_header_on_builder_path() {
+    let db = Arc::new(InMemoryAccessor::new());
+    db.seed([json!({"ip": "$inet:AQI=", "name": "ever"})]);
+    let b = Bridge::with_dbs(
+        std::collections::HashMap::from([("default".to_string(), db as Arc<dyn DataAccessor>)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new().table("t", &["id"], &["id", "name", "ip"]),
+        false,
+    );
+    let cap = b
+        .run(r#"db.table("t").select(["ip"]).all().then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert!(
+        cap.headers
+            .iter()
+            .any(|(k, _)| k == "X-OJ-Degraded"),
+        "构造器路须打 X-OJ-Degraded 头: {:?}",
+        cap.headers
+    );
+}
+
+/// REQ-07a：无降级单元格时**不打**头（对照面，防无脑常置头污染响应）。
+#[tokio::test(flavor = "current_thread")]
+async fn no_degraded_header_when_clean() {
+    let db = Arc::new(InMemoryAccessor::new());
+    db.seed([json!({"id": 1, "name": "ever"})]);
+    let b = Bridge::with_dbs(
+        std::collections::HashMap::from([("default".to_string(), db as Arc<dyn DataAccessor>)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new().table("t", &["id"], &["id", "name"]),
+        false,
+    );
+    let cap = b
+        .run(r#"db.query("select id, name from t").then(r => json.ok(r)).catch(e => json.fail(500, String(e)));"#)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    assert!(
+        cap.headers.iter().all(|(k, _)| k != "X-OJ-Degraded"),
+        "干净结果不得打 X-OJ-Degraded 头: {:?}",
+        cap.headers
+    );
+}
