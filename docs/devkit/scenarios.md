@@ -4246,3 +4246,88 @@ export default {
 | handler 里想读 X-OJ-Degraded | 它是响应面元数据，handler 内不感知（`json.header` 只写不读）；handler 需要的场景走导出任务状态或 SQL 里显式 cast |
 | MySQL 表期待对称行为 | `GEOMETRY` 家族仍整条报错（sqlx-mysql 0.9 无公开字节出口，v0.1.111 未降级）；先 `ST_AsText(g) as g` |
 | 等 `db.stream` 批次也带降级汇总 | v0.1.111 暂无（随 REQ-07b 二进制批补齐）；流式大表导出走 `db.export` |
+
+## 场景 60：改列名不动数据（`previousName`，REQ-13，v0.1.112）
+
+结构编辑器里把 `email` 改成 `contact_email`——不声明意图时 diff 只能按「删一列 + 加一列」
+渲染，数据随之丢失。v0.1.112 起在 to 列上带 `previousName` 即产单条
+`RENAME COLUMN`（改名不动数据，索引/约束成员自动跟随）：
+
+```ts
+export default {
+  async post() {
+    const from = { columns: await db.listColumns("account") }; // from 侧忽略 previousName
+    const to = {
+      columns: (await db.listColumns("account")).map((c) =>
+        c.name === "email" ? { ...c, name: "contact_email", previousName: "email" } : c,
+      ),
+    };
+    const out = await db.ddlDiff({
+      objectType: "table",
+      name: "account",
+      from,                       // from.columns[].previousName 不参与（严格忽略）
+      to,
+    });
+    // out.statements = ["ALTER TABLE \"account\" RENAME COLUMN \"email\" TO \"contact_email\""]
+    // out.diff.columns.renamed = [{from:"email", to:"contact_email"}]
+    for (const s of out.statements) await db.asSystem().exec(s); // 执行仍走 allow_ddl
+    json.ok({ statements: out.statements, warnings: out.warnings });
+  },
+};
+```
+
+| 坑 | 解 |
+|---|---|
+| 想要「重排 + 改名」一步到位 | 可以——RENAME 先于列位置/类型变更发出，后续语句一律打在新名上 |
+| 两列互换名字（a→b、b→a） | 显式拒绝（`capability=ddl_diff_rename_swap`）——先经第三个临时名两步走 |
+| MySQL 5.7 执行 RENAME COLUMN 报错 | 语法需 MySQL 8.0+，报错 fail-loud；5.7 走 ADD+迁移+DROP 手工迁移 |
+| 漏填 `previousName` 的同型一删一增 | statements 仍是 DROP+ADD（数据丢），但 `warnings` 给「疑似改名」——UI 应把 warning 渲染成「看起来是改名，要保留数据请确认」 |
+
+## 场景 61：数据库结构 diff 的告警消费（v0.1.112）
+
+`db.ddlDiff` 输出三键：`diff`（结构化四维）/ `statements`（有序可重放）/ `warnings`
+（结构化 diff 说不清的语义坑，v0.1.112 起新增）。保存按钮的判定顺序：
+
+```ts
+const out = await db.ddlDiff({ objectType: "table", name, from, to });
+if (out.warnings.length > 0) {
+  // 当前唯一形态：同型一删一增（如 int 列 email 删了、varchar 列 email 加了）——
+  // 判定上像删+加（类型变了），又像改名（名字一样）。「疑似重命名，数据会丢失」。
+  // UI：弹出「这看起来是改名，确认按 DROP+ADD 执行吗？」，用户可回去补 previousName。
+  return json.ok({ needConfirm: out.warnings });
+}
+for (const s of out.statements) await db.asSystem().exec(s);
+json.ok({ applied: out.statements.length });
+```
+
+| 坑 | 解 |
+|---|---|
+| 想从 `warnings` 反推安全执行 | 不要——warning 是「人来看」的信号，不是机器可消解的冲突集；要么改 spec（补 previousName），要么人确认 |
+| `schema` 定向（跨 schema 建/改表） | spec 顶层加 `"schema": "app"`——语句渲染 `"app"."t"` / `` `app`.`t` ``，diff 键仍裸名；NUL/控制字符拒（报错点名 schema） |
+
+## 场景 62：数据库会话排障（`catalog("processlist")`，REQ-10 一期，v0.1.112）
+
+谁锁了我的表、哪条 SQL 在跑——运维面板直接读活会话（PG/MySQL 双方言同键集）：
+
+```ts
+export default {
+  async get() {
+    const pl = await db.catalog("processlist"); // {items:[{id,user,database,host,state,elapsedSec,query}], truncated}
+    const slow = pl.items
+      .filter((s) => (s.elapsedSec ?? 0) > 30 && s.state !== "idle")
+      .map((s) => ({ id: s.id, user: s.user, db: s.database, secs: s.elapsedSec, sql: s.query }));
+    json.ok({ slow, truncated: pl.truncated, users: (await db.catalog("users")).items });
+  },
+};
+```
+
+配套 kind：`users`（`{name,host}`，mysql host 含 `%` 通配）/ `roles`（`{name}`）/
+`triggers`（`{name,table,timing,events,body,order,enabled}`，PG timing/events 从触发器
+定义文本解析，body/order 为 null）。
+
+| 坑 | 解 |
+|---|---|
+| `forSchema("x").catalog("processlist")` 报 `OJ_DB_UNSUPPORTED(for_schema)` | 预期——四类 kind 是全实例/全库语义，拒绝 scope 不静默；sqlite 上四类整体 unsupported |
+| PG 的 `elapsedSec` 是 `now()-query_start` | 秒级整数；idle 会话也有值（上次查询以来的空闲时长），按 `state` 过滤 |
+| `truncated: true` | 会话数超 1000 上限被截断——运维页给「结果不完整」提示，别当全量清单 |
+| 想 KILL 会话 | `KILL` 语句自 v0.1.112 分类为 Write：只读会话/只读 allow 面一律拒绝，执行走写面 + `allow_ddl` 无关（KILL 非 DDL，但要写权限） |

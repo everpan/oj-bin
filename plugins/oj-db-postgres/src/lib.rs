@@ -2178,7 +2178,8 @@ mod tests {
             assert!(!payload.is_empty(), "{col} 空信封=红线");
         }
         assert_ne!(
-            rows[0]["u"], serde_json::json!("hello"),
+            rows[0]["u"],
+            serde_json::json!("hello"),
             "合法 UTF-8 二进制不再裸串（REQ-07b breaking）"
         );
         // typed 流式路径同一形态。

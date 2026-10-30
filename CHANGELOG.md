@@ -16,6 +16,38 @@
 
 详见 `docs/devkit/README.md`「版本同步要求」。
 
+## v0.1.112（未打标签）
+
+**breaking（db 插件）**：REQ-07b 二进制列恒定 cellenv 信封——PG `BYTEA`（池/流式/Any
+三路）与 MySQL `BLOB`/`BINARY`/`VARBINARY` 家族**含合法 UTF-8 内容**一律输出
+`$<type>:<base64>`（如 `$bytea:aGVsbG8=`），不再回退可读的 lossy 裸串。消费方用
+`X-OJ-Degraded` 头 / `exportStatus.degraded` 判定降级列，或按 `$<type>:` 前缀解
+base64。TEXT 列行为不变（MySQL 判别依据：binary charset 拒 String 解码，TEXT 永不
+落入二进制臂；MySQL Any 路径维持原状）。
+
+**feat（db.catalog）**：
+
+- **REQ-13 rename**：`db.ddlDiff` 的 `to.columns[].previousName` 产出
+  `RENAME COLUMN`（PG/MySQL 8.0+），改名不动数据；六类边界报错（找不到/一对多/
+  目标冲突/占用旧名/互换/同名跳过），同型一删一增给 `warnings`（疑似改名，数据会
+  丢失）；`diff.columns.renamed` 恒在；索引/约束成员随改名自动对齐。
+- **KILL 分类**：`KILL` 语句在 db 策略中归为 Write（原落默认同级只读面）。
+- **REQ-10 一期**：新 kind `processlist` / `users` / `roles`（全实例/全库语义，
+  **拒绝 scope**，`forSchema(...)` 下报 `OJ_DB_UNSUPPORTED(for_schema)`）。
+- **REQ-08 一期**：`routines` 元数据补全（`args`/`returns`/`language`/`volatility`
+  归一/`securityDefiner`/`comment`）；`catalog("ddl", name)` 对象路由——PG 例程
+  回退 `pg_get_functiondef` + 视图 DDL 补壳（`CREATE [OR REPLACE] VIEW`），MySQL
+  按对象类型选 SHOW 动词（含 Function/Procedure）；新 kind `triggers`
+  （`{name,table,timing,events,body,order,enabled}`，PG timing/events 从定义文本
+  令牌扫）。
+- **truncated 信令**：catalog 信封新增 `truncated` 旗标（行数超 1000 上限时为
+  true，截断不静默）。
+
+**feat（schema 定向，REQ-09-2）**：`db.ddlDiff` spec 新增可选 `schema` 段——表引用
+渲染为 `"schema"."name"` / `` `schema`.`name` ``（diff 输出键仍裸名）；
+MySQL `db.forSchema(s).catalog("ddl", t)` 放开（两段白名单内联，其余 kind 的
+scope 拒绝语义不变；跨库视图类型探测回退 TABLE 动词 → MySQL 报错 fail-loud）。
+
 ## v0.1.111
 
 **fix（db 内省）**：BUG-02 MySQL `catalog("constraints")` 跨表串味修复——

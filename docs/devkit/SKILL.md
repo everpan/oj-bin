@@ -139,6 +139,10 @@ oj（only-js）是一个低代码后端框架：你用 JS/TS 写 handler，框�
 | `db.ddlDiff` 把 `to` 写成 `{columns: [...]}` 后 diff 视图全是 DROP / 或以为旧索引会被保留（v0.1.109） | **缺省维度 = 不参与 diff；空数组 = 期望为空（出 DROP）**——`to` 只给 `columns` 时旧表的索引/约束/外键一个不动（这是对的）；显式 `indexes: []` 才会 DROP 全部索引。给 UI 传 to-Structure 时全维度都要带（from 用 `listColumns`/`listIndexes`/`listForeignKeys` 拼） |
 | 拿 `db.ddlDiff` 的 statements 直接 `db.tx` 里跑（v0.1.109） | 别——MySQL DDL **隐式提交**，事务里跑会断事务。走 `db.exec` + `allow_ddl`（如 `db.asSystem().exec`）逐条执行 |
 | `db.ddlDiff` 里塞带 `;` 的 default/类型/约束定义（v0.1.109） | 预期被拒——verbatim 片段（nativeType/default/definition）拒含 `;`（防语句拆分注入）；标识符只做方言引号+翻倍（合法名可含非 ASCII/空格），NUL/控制字符也拒 |
+| 改列名没填 `previousName`，数据没了（v0.1.112） | 不填 `to.columns[].previousName` 的同型一删一增 = **DROP COLUMN + ADD COLUMN**（数据丢失），只在 `warnings` 里给「疑似改名」告警——改名要保数据，必须在 to 列上带 `previousName`（产单条 `RENAME COLUMN`，PG/MySQL 8.0+，索引/约束自动跟随）。MySQL 5.7 无 RENAME COLUMN → 报错 fail-loud |
+| 查询结果里的 bytea/blob 内容突然变成 `$bytea:aGVsbG8=`（v0.1.112，breaking） | PG `BYTEA` / MySQL `BLOB`/`BINARY`/`VARBINARY` **含合法 UTF-8 内容**也恒定 cellenv 信封（原 lossy 裸串废止）——别按「内容像不像文本」判别：TEXT 家族永不落入（sqlx 对 binary charset 拒 String 解码）。解码取 `$<type>:` 后 base64，权威列清单看 `X-OJ-Degraded` 头 |
+| `db.forSchema("x").catalog("processlist"/"users"/"roles"/"triggers")` 报 `OJ_DB_UNSUPPORTED(for_schema)`（v0.1.112） | 预期——四类是全实例/全库语义，无范围谓词可替换，显式拒绝不静默。要跨 schema 取 triggers 用裸 SQL 查 information_schema/pg_trigger |
+| `db.catalog("ddl")` 对视图/函数在低权限 MySQL 账号下报错（v0.1.112） | MySQL 按对象类型选 SHOW 动词（`SHOW CREATE VIEW/FUNCTION/…`），低权限账号可能拒——fail-loud 不换动词；换高权限账号或 `information_schema` 裸 SQL 绕行。跨库视图（scope≠当前库）类型探测落空回退 TABLE 动词也会报错（一期范围） |
 | 拿 `db.ddlDiff` 给 serial 表加列后期望它建序列（v0.1.109） | ddlDiff **不生成序列对象**——serial 的 `CREATE SEQUENCE` 不在 ALTER 流里；identity 列自管序列（渲染 `GENERATED ... AS IDENTITY`），且 identity 列跳过 default 文本比对（nextval 是派生物） |
 | pg 的 diff 视图里看不到列位置变化 / mysql 出 `AFTER`（v0.1.109） | 预期——pg 无列位置 DDL（位置差忽略，changed 无 position 项）；mysql 位置差产 `AFTER`/`FIRST` |
 | 给 `db.ddlDiff` 的列加 `identity` 在 mysql 上报参数错误（v0.1.109） | 预期——identity 是 **pg-only** 能力（`GENERATED ... AS IDENTITY` 非 MySQL 语法）；mysql 的自增是 `AUTO_INCREMENT`（须配 key），不在 ddlDiff 抽象里。pg 上翻转 identity 出 changed + `ADD/DROP IDENTITY` 语句 |

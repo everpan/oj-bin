@@ -2253,7 +2253,8 @@ mod tests {
             assert!(!payload.is_empty(), "{col} 空信封=红线");
         }
         assert_ne!(
-            r["b"], serde_json::json!("hello"),
+            r["b"],
+            serde_json::json!("hello"),
             "合法 UTF-8 二进制不再裸串（REQ-07b breaking）"
         );
         assert_ne!(r["vb"], serde_json::json!("wörld"), "{v}");
