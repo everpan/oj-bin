@@ -315,24 +315,478 @@ impl ImportRegistry {
         expired
     }
 
-    /// TTL 回收器（懒启动，每 Registry 至多一个）。到点 sweep 摘表即丢。
-    pub fn arm_reaper(self: &Arc<Self>, interval: std::time::Duration, ttl: std::time::Duration) {
-        if self
-            .reaper_armed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let reg = self.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.tick().await; // 首个 tick 立即到——跳过，按整间隔扫
-            loop {
-                tick.tick().await;
-                let _ = reg.sweep(ms_now(), ttl.as_millis() as u64);
+}
+
+/// CSV/JSONL 源解析 + 列类型转换（T3）。行号权威：ParsedRow.line = 源文件绝对行号
+/// （1-based，header 计 1）。解析器不 panic：引号不闭合/坏格/超长一律行级 Bad，
+/// 行缓冲有界（逐记录切片，不累积）。
+pub mod parse {
+    use serde_json::Value;
+
+    use super::super::registry::ColumnType;
+
+    /// 一行解析成果：`values` 与 columns 对齐；`line` = 源文件绝对行号（1-based）。
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ParsedRow {
+        pub values: Vec<Value>,
+        pub line: u64,
+    }
+
+    /// 行级错误（不 panic、不静默跳过——由 consumer 决定 abort/skip 落 samples）。
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ParseError {
+        Bad { line: u64, reason: String, raw: String },
+    }
+
+    /// CSV 文本格 → 列类型值。Text/Unknown/Blob 原样字符串（Blob 的 base64 不猜——
+    /// 编码错的字节落库时由方言报错行进 samples）。
+    pub fn coerce(value: &str, ty: ColumnType) -> Result<Value, String> {
+        match ty {
+            ColumnType::Integer | ColumnType::BigInt => value
+                .parse::<i64>()
+                .map(Value::from)
+                .map_err(|_| format!("invalid integer '{value}'")),
+            ColumnType::Double => value
+                .parse::<f64>()
+                .map(Value::from)
+                .map_err(|_| format!("invalid double '{value}'")),
+            ColumnType::Boolean => match value {
+                "true" | "1" => Ok(Value::Bool(true)),
+                "false" | "0" => Ok(Value::Bool(false)),
+                _ => Err(format!("invalid boolean '{value}'")),
+            },
+            ColumnType::Text | ColumnType::Unknown | ColumnType::Blob => {
+                Ok(Value::String(value.to_string()))
             }
-        });
+        }
+    }
+
+    /// 从 pos 起读一条 CSV 记录（可跨物理行——quoted newline 属一格）。
+    /// 返回 (记录切片[不含末尾换行], 消耗的物理行数)。EOF 时仍在引号内 → Err(())。
+    fn read_record(src: &[u8], mut pos: usize) -> Result<(&[u8], usize), ()> {
+        let start = pos;
+        let mut in_quotes = false;
+        let mut phys = 1usize;
+        while pos < src.len() {
+            match src[pos] {
+                b'"' => {
+                    // "" 转义不切换引号态
+                    if in_quotes && pos + 1 < src.len() && src[pos + 1] == b'"' {
+                        pos += 2;
+                        continue;
+                    }
+                    in_quotes = !in_quotes;
+                    pos += 1;
+                }
+                b'\n' => {
+                    if in_quotes {
+                        phys += 1;
+                        pos += 1;
+                    } else {
+                        return Ok((&src[start..pos], phys));
+                    }
+                }
+                _ => pos += 1,
+            }
+        }
+        if in_quotes {
+            return Err(());
+        }
+        Ok((&src[start..pos], phys))
+    }
+
+    /// 记录切片 → 格序列。规则：`,` 分隔、`""`→`"`、首字符为 `"` 的格按引号格解析。
+    /// 引号格闭合后只许 `,` 或记录尾，否则 malformed。不闭合（调用方已兜底 EOF 情
+    /// 形，这里兜底引号格内异常态）→ None。
+    fn split_record(rec: &[u8]) -> Option<Vec<String>> {
+        let mut cells = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < rec.len() {
+            if rec[i] == b'"' && cur.is_empty() {
+                // 引号格：寻闭合（"" 转义）
+                i += 1;
+                loop {
+                    if i >= rec.len() {
+                        return None; // 不闭合（防御——read_record 已挡 EOF 主路径）
+                    }
+                    if rec[i] == b'"' {
+                        if i + 1 < rec.len() && rec[i + 1] == b'"' {
+                            cur.push(b'"');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        cur.push(rec[i]);
+                        i += 1;
+                    }
+                }
+                // 闭合后只许 `,` 或记录尾
+                if i < rec.len() && rec[i] != b',' {
+                    return None;
+                }
+            } else if rec[i] == b',' {
+                cells.push(String::from_utf8_lossy(&cur).into_owned());
+                cur.clear();
+                i += 1;
+            } else {
+                cur.push(rec[i]);
+                i += 1;
+            }
+        }
+        cells.push(String::from_utf8_lossy(&cur).into_owned());
+        Some(cells)
+    }
+
+    /// CSV 解析器（逐记录迭代；行缓冲 = 单记录，不累积）。
+    #[derive(Debug)]
+    pub struct CsvParser<'a> {
+        src: &'a [u8],
+        pos: usize,
+        /// 下一条记录的绝对起始行号（1-based）。
+        line: u64,
+        columns: Vec<String>,
+        col_types: Vec<ColumnType>,
+        done: bool,
+    }
+
+    impl<'a> CsvParser<'a> {
+        /// header=true：首记录必须与 columns 逐格一致（不猜——表头格与登记列名
+        /// 不符即参数错误，点名两格）。
+        pub fn new(
+            src: &'a [u8],
+            columns: &[String],
+            header: bool,
+            col_types: &[ColumnType],
+        ) -> Result<Self, String> {
+            let mut p = Self {
+                src,
+                pos: 0,
+                line: 1,
+                columns: columns.to_vec(),
+                col_types: col_types.to_vec(),
+                done: src.is_empty(),
+            };
+            if header && !p.done {
+                let start_line = p.line;
+                match read_record(src, p.pos) {
+                    Ok((rec, phys)) => {
+                        let rec = rec.strip_suffix(b"\r").unwrap_or(rec);
+                        let cells = split_record(rec).ok_or_else(|| {
+                            format!(
+                                "db import: unterminated quoted field in header at line {start_line}"
+                            )
+                        })?;
+                        if cells != p.columns {
+                            let got = cells.join(",");
+                            let want = p.columns.join(",");
+                            return Err(format!(
+                                "db import: csv header mismatch at line {start_line}: got [{got}] but registered columns are [{want}]"
+                            ));
+                        }
+                        p.pos += rec.len() + phys; // 越过硬换行（pos 指向 \n，+phys 到下一行）
+                        p.line += phys as u64;
+                    }
+                    Err(()) => {
+                        return Err(format!(
+                            "db import: unterminated quoted field in header at line {start_line}"
+                        ));
+                    }
+                }
+            }
+            Ok(p)
+        }
+    }
+
+    impl Iterator for CsvParser<'_> {
+        type Item = Result<ParsedRow, ParseError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.done || self.pos >= self.src.len() {
+                return None;
+            }
+            let start_line = self.line;
+            let (rec, phys) = match read_record(self.src, self.pos) {
+                Ok(v) => v,
+                Err(()) => {
+                    // 不闭合引号到 EOF：该行 Bad（reason 点名），吞掉剩余输入防死循环
+                    self.done = true;
+                    let raw = String::from_utf8_lossy(&self.src[self.pos..]).into_owned();
+                    return Some(Err(ParseError::Bad {
+                        line: start_line,
+                        reason: "unterminated quoted field".into(),
+                        raw,
+                    }));
+                }
+            };
+            self.pos += rec.len() + phys;
+            self.line += phys as u64;
+            let rec = rec.strip_suffix(b"\r").unwrap_or(rec);
+            let cells = match split_record(rec) {
+                Some(c) => c,
+                None => {
+                    return Some(Err(ParseError::Bad {
+                        line: start_line,
+                        reason: "unterminated quoted field".into(),
+                        raw: String::from_utf8_lossy(rec).into_owned(),
+                    }));
+                }
+            };
+            if cells.len() != self.columns.len() {
+                return Some(Err(ParseError::Bad {
+                    line: start_line,
+                    reason: format!(
+                        "expected {} columns, got {}",
+                        self.columns.len(),
+                        cells.len()
+                    ),
+                    raw: String::from_utf8_lossy(rec).into_owned(),
+                }));
+            }
+            let mut values = Vec::with_capacity(cells.len());
+            for (i, cell) in cells.iter().enumerate() {
+                match coerce(cell, self.col_types[i]) {
+                    Ok(v) => values.push(v),
+                    Err(reason) => {
+                        return Some(Err(ParseError::Bad {
+                            line: start_line,
+                            reason: format!("column '{}': {reason}", self.columns[i]),
+                            raw: cell.clone(),
+                        }));
+                    }
+                }
+            }
+            Some(Ok(ParsedRow {
+                values,
+                line: start_line,
+            }))
+        }
+    }
+
+    /// JSONL 解析器（逐物理行；空白行跳过但计入绝对行号）。
+    #[derive(Debug)]
+    pub struct JsonlParser<'a> {
+        src: &'a [u8],
+        pos: usize,
+        line: u64,
+        columns: Vec<String>,
+        done: bool,
+    }
+
+    impl<'a> JsonlParser<'a> {
+        pub fn new(src: &'a [u8], columns: &[String]) -> Self {
+            Self {
+                src,
+                pos: 0,
+                line: 1,
+                columns: columns.to_vec(),
+                done: src.is_empty(),
+            }
+        }
+    }
+
+    impl Iterator for JsonlParser<'_> {
+        type Item = Result<ParsedRow, ParseError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                if self.done || self.pos >= self.src.len() {
+                    return None;
+                }
+                let start_line = self.line;
+                let nl = self.src[self.pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|i| self.pos + i)
+                    .unwrap_or(self.src.len());
+                let raw = &self.src[self.pos..nl];
+                self.pos = if nl < self.src.len() { nl + 1 } else { nl };
+                self.line += 1;
+                let text = String::from_utf8_lossy(raw);
+                let trimmed = text.trim_end_matches('\r').trim();
+                if trimmed.is_empty() {
+                    continue; // 空白行跳过（绝对行号已推进）
+                }
+                let v: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Some(Err(ParseError::Bad {
+                            line: start_line,
+                            reason: format!("invalid json: {e}"),
+                            raw: trimmed.to_string(),
+                        }));
+                    }
+                };
+                let obj = match v.as_object() {
+                    Some(o) => o,
+                    None => {
+                        return Some(Err(ParseError::Bad {
+                            line: start_line,
+                            reason: "line must be a json object".into(),
+                            raw: trimmed.to_string(),
+                        }));
+                    }
+                };
+                for k in obj.keys() {
+                    if !self.columns.iter().any(|c| c == k) {
+                        return Some(Err(ParseError::Bad {
+                            line: start_line,
+                            reason: format!("unexpected key '{k}'"),
+                            raw: trimmed.to_string(),
+                        }));
+                    }
+                }
+                let values = self
+                    .columns
+                    .iter()
+                    .map(|c| obj.get(c).cloned().unwrap_or(Value::Null))
+                    .collect();
+                return Some(Ok(ParsedRow {
+                    values,
+                    line: start_line,
+                }));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cols(names: &[&str]) -> Vec<String> {
+            names.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn csv_quoted_newline_and_escape() {
+            let src = b"a,\"b\nb\",c\r\n";
+            let types = [ColumnType::Text; 3];
+            let mut p = CsvParser::new(src, &cols(&["x", "y", "z"]), false, &types).unwrap();
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(row.line, 1);
+            assert_eq!(
+                row.values,
+                vec![
+                    Value::String("a".into()),
+                    Value::String("b\nb".into()),
+                    Value::String("c".into())
+                ]
+            );
+            assert!(p.next().is_none());
+        }
+
+        #[test]
+        fn csv_escaped_quote() {
+            let src = b"\"say \"\"hi\"\"\",2\n";
+            let types = [ColumnType::Text, ColumnType::Integer];
+            let mut p = CsvParser::new(src, &cols(&["s", "n"]), false, &types).unwrap();
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(row.values[0], Value::String("say \"hi\"".into()));
+            assert_eq!(row.values[1], Value::from(2));
+        }
+
+        #[test]
+        fn csv_header_mismatch_fails_fast() {
+            let src = b"id,name\n1,a\n";
+            let types = [ColumnType::Integer, ColumnType::Text];
+            let e = CsvParser::new(src, &cols(&["id", "fullname"]), true, &types).unwrap_err();
+            assert!(e.contains("header mismatch"), "{e}");
+            assert!(e.contains("name"), "{e} must name header cell");
+            assert!(e.contains("fullname"), "{e} must name registered column");
+        }
+
+        #[test]
+        fn csv_bad_cell_line_number_absolute() {
+            // header=1, d1=2, d2=3, d3=4（绝对行号；plan 原文「line=5」是算术笔误）
+            let src = b"id,name\n1,a\n2,b\nabc,c\n";
+            let types = [ColumnType::Integer, ColumnType::Text];
+            let mut p = CsvParser::new(src, &cols(&["id", "name"]), true, &types).unwrap();
+            assert!(p.next().unwrap().is_ok());
+            assert!(p.next().unwrap().is_ok());
+            let e = p.next().unwrap().unwrap_err();
+            match e {
+                ParseError::Bad { line, reason, raw } => {
+                    assert_eq!(line, 4);
+                    assert!(reason.contains("integer"), "{reason}");
+                    assert_eq!(raw, "abc");
+                }
+            }
+            assert!(p.next().is_none());
+        }
+
+        #[test]
+        fn csv_unterminated_quote_is_bad_not_panic() {
+            let src = b"a,\"never closed\n";
+            let types = [ColumnType::Text; 2];
+            let mut p = CsvParser::new(src, &cols(&["x", "y"]), false, &types).unwrap();
+            let e = p.next().unwrap().unwrap_err();
+            match e {
+                ParseError::Bad { line, reason, .. } => {
+                    assert_eq!(line, 1);
+                    assert!(reason.contains("unterminated"), "{reason}");
+                }
+            }
+            assert!(p.next().is_none()); // 吞掉剩余输入，不死循环
+        }
+
+        #[test]
+        fn csv_wrong_column_count_bad() {
+            let src = b"a,b\n";
+            let types = [ColumnType::Text; 3];
+            let mut p = CsvParser::new(src, &cols(&["x", "y", "z"]), false, &types).unwrap();
+            let e = p.next().unwrap().unwrap_err();
+            match e {
+                ParseError::Bad { reason, .. } => assert!(reason.contains("3"), "{reason}"),
+            }
+        }
+
+        #[test]
+        fn jsonl_missing_key_null_extra_key_err() {
+            let src = b"{\"id\":1}\n{\"id\":2,\"name\":\"x\",\"extra\":1}\n";
+            let mut p = JsonlParser::new(src, &cols(&["id", "name"]));
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(row.line, 1);
+            assert_eq!(row.values, vec![Value::from(1), Value::Null]);
+            let e = p.next().unwrap().unwrap_err();
+            match e {
+                ParseError::Bad { line, reason, .. } => {
+                    assert_eq!(line, 2);
+                    assert!(reason.contains("extra"), "{reason}");
+                }
+            }
+            assert!(p.next().is_none());
+        }
+
+        #[test]
+        fn jsonl_blank_lines_skipped_but_counted() {
+            let src = b"\n{\"id\":1}\n\n";
+            let mut p = JsonlParser::new(src, &cols(&["id"]));
+            let row = p.next().unwrap().unwrap();
+            assert_eq!(row.line, 2); // 空白行计入绝对行号
+            assert!(p.next().is_none());
+        }
+
+        #[test]
+        fn coerce_boolean_forms() {
+            assert_eq!(coerce("true", ColumnType::Boolean).unwrap(), Value::Bool(true));
+            assert_eq!(coerce("1", ColumnType::Boolean).unwrap(), Value::Bool(true));
+            assert_eq!(coerce("false", ColumnType::Boolean).unwrap(), Value::Bool(false));
+            assert_eq!(coerce("0", ColumnType::Boolean).unwrap(), Value::Bool(false));
+            assert!(coerce("yes", ColumnType::Boolean).is_err());
+            assert_eq!(coerce("42", ColumnType::Integer).unwrap(), Value::from(42));
+            assert!(coerce("4.2", ColumnType::Integer).is_err());
+            assert_eq!(coerce("1.5", ColumnType::Double).unwrap(), Value::from(1.5));
+            assert_eq!(
+                coerce("plain", ColumnType::Text).unwrap(),
+                Value::String("plain".into())
+            );
+            assert_eq!(
+                coerce("raw", ColumnType::Blob).unwrap(),
+                Value::String("raw".into())
+            );
+        }
     }
 }
 
