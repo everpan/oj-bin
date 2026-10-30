@@ -344,8 +344,21 @@ fn row_to_json(row: &AnyRow) -> Result<serde_json::Value, String> {
     for col in row.columns() {
         let name = col.name().to_string();
         let ordinal = col.ordinal();
-        let val = column_json(row, ordinal)
-            .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
+        // REQ-07b：Any 路径同款 BYTEA 短路（type_info 在 Any 行可用）。
+        let val = if col.type_info().name() == "BYTEA" {
+            row.try_get::<Option<Vec<u8>>, _>(ordinal)
+                .ok()
+                .map(|v| match v {
+                    Some(b) => serde_json::Value::String(oj_plugin_ffi::cellenv::encode(
+                        col.type_info().name(),
+                        &b,
+                    )),
+                    None => serde_json::Value::Null,
+                })
+        } else {
+            column_json(row, ordinal)
+        }
+        .ok_or_else(|| undecodable_column(&name, col.type_info().name()))?;
         obj.insert(name, val);
     }
     Ok(serde_json::Value::Object(obj))
@@ -451,6 +464,20 @@ fn row_to_json_pg(row: &PgRow) -> Result<serde_json::Value, String> {
 /// 范围类型、几何、复合类型等）返回 `None` → 调用方响亮报错。
 fn column_json_pg(row: &PgRow, col: &PgColumn) -> Option<serde_json::Value> {
     let ordinal = col.ordinal();
+    // REQ-07b：BYTEA 按类型名短路——恒定 cellenv 信封（含合法 UTF-8 内容，breaking：
+    // 原 lossy 裸串）。探针链的 Vec<u8> lossy 臂随之对 BYTEA 不可达。
+    if col.type_info().name() == "BYTEA" {
+        return row
+            .try_get::<Option<Vec<u8>>, _>(ordinal)
+            .ok()
+            .map(|v| match v {
+                Some(b) => serde_json::Value::String(oj_plugin_ffi::cellenv::encode(
+                    col.type_info().name(),
+                    &b,
+                )),
+                None => serde_json::Value::Null,
+            });
+    }
     if let Ok(v) = row.try_get::<Option<bool>, _>(ordinal) {
         return Some(serde_json::Value::from(v));
     }
@@ -2117,6 +2144,59 @@ mod tests {
         )
         .unwrap_or_else(|| panic!("流式应为 cellenv 信封: {v}"));
         assert_eq!(t, "point");
+        close(h);
+    }
+
+    /// REQ-07b（env-gated，`OJ_TEST_PG`，breaking）：BYTEA 列**含合法 UTF-8 内容**也
+    /// 恒定 cellenv 信封（原 lossy 裸串）——`'\x68656c6c6f'`（"hello"）不再以可读串
+    /// 出现；非 UTF-8 内容同形态；池路径与 typed 流式路径一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_pg_bytea_always_cellenv() {
+        let Ok(url) = std::env::var("OJ_TEST_PG") else {
+            eprintln!("skip: OJ_TEST_PG unset");
+            return;
+        };
+        let _ = std::result::Result::from(init(host(), RString::from("{}")));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let h = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let sql = "select '\\x68656c6c6f'::bytea as u, '\\xdeadbeef'::bytea as b";
+        let bytes = drive(&mut query(h, RString::from(sql), RString::from("[]")))
+            .await
+            .expect("bytea query 不得报错");
+        let rows: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for col in ["u", "b"] {
+            let v = rows[0][col]
+                .as_str()
+                .unwrap_or_else(|| panic!("{col} 应为字符串标量: {rows}"));
+            let (t, payload) = oj_plugin_ffi::cellenv::decode(v)
+                .unwrap_or_else(|| panic!("{col} 应为 cellenv 信封: {v:?}"));
+            assert_eq!(t, "bytea", "{col} 类型段不符");
+            assert!(!payload.is_empty(), "{col} 空信封=红线");
+        }
+        assert_ne!(
+            rows[0]["u"], serde_json::json!("hello"),
+            "合法 UTF-8 二进制不再裸串（REQ-07b breaking）"
+        );
+        // typed 流式路径同一形态。
+        let bytes = drive(&mut stream_open(h, RString::from(sql), RString::from("[]")))
+            .await
+            .expect("stream_open");
+        let sid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["stream_id"]
+            .as_u64()
+            .unwrap();
+        let b = drive(&mut stream_next(h, sid)).await.expect("stream next");
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(v["error"].is_null(), "流式 bytea 应正常带内信封: {v}");
+        let sv = v["rows"][0]["u"]
+            .as_str()
+            .unwrap_or_else(|| panic!("流式 u 应为标量: {v}"));
+        let (t, _) = oj_plugin_ffi::cellenv::decode(sv)
+            .unwrap_or_else(|| panic!("流式应为 cellenv 信封: {sv:?}"));
+        assert_eq!(t, "bytea");
         close(h);
     }
 

@@ -320,7 +320,13 @@ fn column_json_mysql(row: &MySqlRow, col: &MySqlColumn) -> Option<serde_json::Va
     }
     if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(ordinal) {
         return Some(match v {
-            Some(b) => serde_json::Value::String(String::from_utf8_lossy(&b).into_owned()),
+            // REQ-07b：Vec<u8> 探针臂恒定 cellenv 信封（含合法 UTF-8 内容，breaking）。
+            // 判别依据：sqlx 对 binary charset 拒 String 解码，String 探针先行失败——
+            // TEXT 家族（非 BINARY collation）永不落入本臂，无需前置类型名短路。
+            Some(b) => serde_json::Value::String(oj_plugin_ffi::cellenv::encode(
+                col.type_info().name(),
+                &b,
+            )),
             None => serde_json::Value::Null,
         });
     }
@@ -2198,6 +2204,62 @@ mod tests {
         drive(&mut stream_close(handle, sid)).await.expect("close");
 
         ex("drop table if exists oj_dialect_t", "[]").await.unwrap();
+        close(handle);
+    }
+
+    /// REQ-07b（env-gated，`OJ_TEST_MYSQL`，breaking）：BLOB/BINARY/VARBINARY 族
+    /// （Vec<u8> 探针臂）恒定 cellenv 信封——**utf8 合法内容也信封**（判别依据：sqlx 对
+    /// binary charset 拒 String 解码，TEXT 永不落入该臂）；TEXT 列保持可读裸字符串。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_mysql_binary_columns_cellenv() {
+        let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+            eprintln!("skip: OJ_TEST_MYSQL unset");
+            return;
+        };
+        let cfg = serde_json::json!({}).to_string();
+        let _ = init(host(), RString::from(cfg.as_str()));
+        let bytes = drive(&mut connect(RString::from(url.as_str())))
+            .await
+            .expect("connect");
+        let handle: u64 = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["handle"]
+            .as_u64()
+            .unwrap();
+        let ex = |sql: &str| {
+            let mut f = exec(handle, RString::from(sql), RString::from("[]"));
+            async move { drive(&mut f).await }
+        };
+        ex("drop table if exists oj_req07b_t").await.unwrap();
+        ex("create table oj_req07b_t (b blob, vb varbinary(8), bn binary(4), t text)")
+            .await
+            .expect("create");
+        ex("insert into oj_req07b_t values ('hello', 'wörld', 'ab', 'plain')")
+            .await
+            .expect("insert");
+        let mut f = query(
+            handle,
+            RString::from("select b, vb, bn, t from oj_req07b_t"),
+            RString::from("[]"),
+        );
+        let rows = drive(&mut f).await.expect("binary columns must read");
+        let v: serde_json::Value = serde_json::from_slice(&rows).unwrap();
+        let r = &v[0];
+        for (col, ty) in [("b", "blob"), ("vb", "varbinary"), ("bn", "binary")] {
+            let s = r[col]
+                .as_str()
+                .unwrap_or_else(|| panic!("{col} 应为字符串标量: {v}"));
+            let (t, payload) = oj_plugin_ffi::cellenv::decode(s)
+                .unwrap_or_else(|| panic!("{col} 应为 cellenv 信封: {s:?}"));
+            assert_eq!(t, ty, "{col} 类型段不符");
+            assert!(!payload.is_empty(), "{col} 空信封=红线");
+        }
+        assert_ne!(
+            r["b"], serde_json::json!("hello"),
+            "合法 UTF-8 二进制不再裸串（REQ-07b breaking）"
+        );
+        assert_ne!(r["vb"], serde_json::json!("wörld"), "{v}");
+        // TEXT 行为零变化。
+        assert_eq!(r["t"], serde_json::json!("plain"), "{v}");
+        ex("drop table if exists oj_req07b_t").await.unwrap();
         close(handle);
     }
 
