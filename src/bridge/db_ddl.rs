@@ -372,6 +372,16 @@ pub fn unsupported_capability_from_spec(d: Dialect, spec: &Value) -> Option<&'st
     if from.is_none() || to.is_none() {
         return None;
     }
+    // options 非对象 = 畸形输入，留给 ddl_diff 参数错误（不做 capability 判等）。
+    if from
+        .and_then(|v| v.get("options"))
+        .is_some_and(|v| !v.is_object())
+        || to
+            .and_then(|v| v.get("options"))
+            .is_some_and(|v| !v.is_object())
+    {
+        return None;
+    }
     fn part(side: Option<&Value>) -> Option<&str> {
         side.and_then(|v| v.get("partitionBy"))
             .and_then(Value::as_str)
@@ -379,8 +389,16 @@ pub fn unsupported_capability_from_spec(d: Dialect, spec: &Value) -> Option<&'st
     if part(from) != part(to) {
         return Some("ddl_diff_partition");
     }
-    fn opts(side: Option<&Value>) -> Option<&Value> {
+    // Null 规范化：{"comment":null} 与缺键同义——剥掉 Null 值再判等，避免误报。
+    fn opts(side: Option<&Value>) -> Option<serde_json::Map<String, Value>> {
         side.and_then(|v| v.get("options"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, v)| !v.is_null())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
     }
     if opts(from) != opts(to) {
         return Some("ddl_diff_table_options");
@@ -446,6 +464,10 @@ fn ddl_diff_object(d: Dialect, spec: &Value) -> Result<Value, String> {
                     stmts.push(format!("DROP INDEX {t}"));
                 }
             }
+            // 评审 minor：MySQL 无序列对象——渲染 DROP SEQUENCE 必 1064，参数错误。
+            "sequence" if d == Dialect::MySql => {
+                return Err("ddlDiff: sequences are not supported on mysql".into());
+            }
             "sequence" => stmts.push(format!("DROP SEQUENCE {t}")),
             "routine" => {
                 let kw = match from_v.get("type").and_then(Value::as_str) {
@@ -492,6 +514,8 @@ fn ddl_diff_object(d: Dialect, spec: &Value) -> Result<Value, String> {
             return Err("ddlDiff: missing from/to (both null)".into());
         }
     }
+    // renamed 键恒在（评审 minor：信封 schema 与 table 路径同稳定；对象路径无改名语义）。
+    diff.insert("renamed".into(), json!([]));
     Ok(json!({"diff": Value::Object(diff), "statements": stmts, "warnings": []}))
 }
 
@@ -582,6 +606,25 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     // 不出半截 statements。op 层另有结构化通道（两层同判据）。
     if let Some(c) = unsupported_capability_from_spec(d, spec) {
         return Err(format!("ddlDiff: unsupported capability {c}"));
+    }
+    // options 非对象 = 参数错误（评审 minor：原静默忽略）；各键值过语句体校验。
+    for side in ["from", "to"] {
+        if let Some(o) = spec
+            .get(side)
+            .and_then(|v| v.get("options"))
+            .filter(|v| !v.is_null())
+        {
+            let m = o
+                .as_object()
+                .ok_or_else(|| format!("ddlDiff: {side}.options must be an object"))?;
+            for (k, v) in m {
+                if let Some(s) = v.as_str() {
+                    validate_statement_body(&format!("{side}.options.{k}"), s)?;
+                } else if !v.is_null() {
+                    return Err(format!("ddlDiff: options.{k} must be a string"));
+                }
+            }
+        }
     }
 
     // identity 是 PG 专属能力：MySQL 结构里出现 → 参数错误（GENERATED AS IDENTITY 非 MySQL 语法）。
@@ -1851,6 +1894,54 @@ mod tests {
         assert_eq!(d2["statements"][0], json!("DROP PROCEDURE `p`"));
     }
 
+    /// 评审 minors：options 非对象/值校验/Null 规范化/MySQL 序列/object 信封 renamed 键。
+    #[test]
+    fn review_minors_options_and_object_envelope() {
+        // options 非对象值 → 参数错误（原静默忽略）。
+        let err = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"id","nativeType":"int"}],"options":"InnoDB"}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("options"), "{err}");
+        // options 值带 NUL → 参数错误（语句体校验）。
+        let err = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"table","name":"t","from":Value::Null,
+                "to":{"columns":[{"name":"id","nativeType":"int"}],
+                      "options":{"engine":"a\u{0}b"}}}),
+        )
+        .unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
+        // G2 判等 Null 规范化：{"comment":null} 与缺键不得误报 table_options。
+        let spec = json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"id","nativeType":"int"}],
+                    "options":{"engine":"InnoDB","comment":null}},
+            "to":{"columns":[{"name":"id","nativeType":"int"}],
+                  "options":{"engine":"InnoDB"}}});
+        assert_eq!(
+            unsupported_capability_from_spec(Dialect::MySql, &spec),
+            None
+        );
+        // MySQL 无序列 → drop sequence 参数错误。
+        let err = ddl_diff(
+            Dialect::MySql,
+            &json!({"objectType":"sequence","name":"s",
+                "from":{"definition":"CREATE SEQUENCE s"},"to":Value::Null}),
+        )
+        .unwrap_err();
+        assert!(err.contains("sequence"), "{err}");
+        // object 路径信封 schema 稳定：renamed 键恒在。
+        let out = ddl_diff(
+            Dialect::Postgres,
+            &json!({"objectType":"view","name":"v","from":Value::Null,
+                "to":{"definition":"SELECT 1"}}),
+        )
+        .unwrap();
+        assert_eq!(out["diff"]["renamed"], json!([]));
+    }
+
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
     #[test]
     fn absent_field_means_skip_empty_array_means_drop_all() {
@@ -2322,7 +2413,7 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(stmts.len(), 1, "{out:?}");
-        assert!(stmts[0].contains("RENAME"), "{stmts:?}");
+        assert!(stmts[0].contains("RENAME TO"), "{stmts:?}");
         for s in &stmts {
             db.exec_with_params(s, &[]).await.unwrap();
         }
