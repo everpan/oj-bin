@@ -527,6 +527,25 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
     if to.is_null() {
         return Err("ddlDiff: to must not be null for objectType \"table\"".into());
     }
+    // G4（REQ-09 §4.1 表改名缺口）：spec 顶层可选 previousName——与 name 相同或
+    // create 路径（from=null）时忽略（同列 rename 同名跳过语义）。
+    let table_rename: Option<(&str, String)> = match (
+        spec.get("previousName").and_then(Value::as_str),
+        spec.get("from").filter(|v| !v.is_null()),
+    ) {
+        (Some(p), Some(_)) if p != name => {
+            let t_old = quote_ident(d, p)?;
+            let t_old = match spec.get("schema").and_then(Value::as_str) {
+                Some(s) => format!(
+                    "{}.{t_old}",
+                    quote_ident(d, s).map_err(|e| format!("ddlDiff: invalid schema: {e}"))?
+                ),
+                None => t_old,
+            };
+            Some((p, t_old))
+        }
+        _ => None,
+    };
     let from_v = spec.get("from");
 
     let from_cols = parse_columns("from", from_v.and_then(|v| v.get("columns")))?;
@@ -753,6 +772,8 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
         diff.insert("constraints".into(), dim(names(&to_cons)));
         diff.insert("indexes".into(), dim(names(&to_idxs)));
         diff.insert("foreignKeys".into(), dim(names(&to_fks)));
+        // 建表路径无 from → 恒无告警/无改名；warnings/renamed 键恒在（schema 稳定）。
+        diff.insert("renamed".into(), json!([]));
         // 建表路径无 from → 恒无告警；warnings 键恒在（schema 稳定）。
         return Ok(json!({
             "diff": Value::Object(diff),
@@ -1164,6 +1185,15 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                 stmts.push(fk_add_sql(d, &t, f)?);
             }
         }
+    }
+
+    // G4：表改名——RENAME 恒首条（先于一切列/约束/索引语句），diff.renamed 表级挂点
+    // （与 diff.columns 平级；恒在，无改名为空数组）。
+    if let Some((p, t_old)) = table_rename {
+        stmts.insert(0, format!("ALTER TABLE {t_old} RENAME TO {t}"));
+        diff.insert("renamed".into(), json!([{"from": p, "to": name}]));
+    } else {
+        diff.insert("renamed".into(), json!([]));
     }
 
     Ok(json!({
@@ -1696,6 +1726,93 @@ mod tests {
         );
     }
 
+    /// G4（REQ-09 §4.1 表改名缺口）：表×列 rename 叠加——表 RENAME 首条、列 RENAME
+    /// 次之且用新表名（Review Focus #5）。
+    #[test]
+    fn table_rename_plus_column_rename() {
+        let (pg, my) = both(
+            json!({"objectType":"table","name":"t_new","previousName":"t_old",
+            "from":{"columns":[{"name":"a","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"b","nativeType":"int4","previousName":"a"}]}}),
+        );
+        let ss = pg["statements"].as_array().unwrap();
+        assert_eq!(ss[0], json!("ALTER TABLE \"t_old\" RENAME TO \"t_new\""));
+        assert_eq!(
+            ss[1],
+            json!("ALTER TABLE \"t_new\" RENAME COLUMN \"a\" TO \"b\"")
+        );
+        let ss = my["statements"].as_array().unwrap();
+        assert_eq!(ss[0], json!("ALTER TABLE `t_old` RENAME TO `t_new`"));
+        assert!(
+            ss[1]
+                .as_str()
+                .unwrap()
+                .contains("ALTER TABLE `t_new` RENAME COLUMN `a` TO `b`"),
+            "{ss:?}"
+        );
+    }
+
+    /// G4：表 previousName → ALTER TABLE RENAME TO 首条 + diff.renamed；无 previousName
+    /// 时 renamed 恒为空数组、无 RENAME 语句（既有行为零变化）。
+    #[test]
+    fn table_rename_renders_first_and_records_renamed() {
+        let (pg, my) = both(
+            json!({"objectType":"table","name":"t_new","previousName":"t_old",
+            "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int4"}]}}),
+        );
+        assert_eq!(
+            pg["statements"][0],
+            json!("ALTER TABLE \"t_old\" RENAME TO \"t_new\"")
+        );
+        assert_eq!(
+            pg["diff"]["renamed"],
+            json!([{"from":"t_old","to":"t_new"}])
+        );
+        assert_eq!(
+            my["statements"][0],
+            json!("ALTER TABLE `t_old` RENAME TO `t_new`")
+        );
+        // 其余语句用新名渲染。
+        let (pg2, _) = both(
+            json!({"objectType":"table","name":"t_new","previousName":"t_old",
+            "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int8"}]}}),
+        );
+        assert!(
+            pg2["statements"][1].as_str().unwrap().contains("\"t_new\""),
+            "{pg2}"
+        );
+        // 无 previousName → 零回归。
+        let (pg3, _) = both(json!({"objectType":"table","name":"t",
+            "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int4"}]}}));
+        assert_eq!(pg3["diff"]["renamed"], json!([]));
+        assert!(
+            pg3["statements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| !s.as_str().unwrap_or("").contains("RENAME")),
+            "{pg3}"
+        );
+    }
+
+    /// G4：schema 段 + 表改名两段引用。
+    #[test]
+    fn table_rename_with_schema() {
+        let (pg, _) = both(
+            json!({"objectType":"table","schema":"public","name":"t_new",
+            "previousName":"t_old",
+            "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int4"}]}}),
+        );
+        assert_eq!(
+            pg["statements"][0],
+            json!("ALTER TABLE \"public\".\"t_old\" RENAME TO \"public\".\"t_new\"")
+        );
+    }
+
     /// 缺省 = 不参与 diff（零语句）；空数组 = DROP 全量。
     #[test]
     fn absent_field_means_skip_empty_array_means_drop_all() {
@@ -2082,6 +2199,105 @@ mod tests {
                 .is_err()
         );
         db.exec_with_params("drop table if exists t_req13", &[])
+            .await
+            .unwrap();
+    }
+
+    /// G4（REQ-09 §4.1，env-gated 真库重放）：表 previousName → RENAME TO 重放后
+    /// 新表可读、旧表消失、数据保留。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_table_rename_replays() {
+        let url = match std::env::var("OJ_TEST_PG") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_PG unset");
+                return;
+            }
+        };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for ddl in [
+            "drop table if exists t_g4_old",
+            "drop table if exists t_g4_new",
+            "create table t_g4_old (id int4)",
+            "insert into t_g4_old (id) values (7)",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        let spec = json!({"objectType":"table","name":"t_g4_new","previousName":"t_g4_old",
+            "from":{"columns":[{"name":"id","nativeType":"int4"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int4"}]}});
+        let out = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 1, "{out:?}");
+        assert!(stmts[0].contains("RENAME TO"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select id from t_g4_new", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["id"], json!(7), "{rows:?}");
+        assert!(
+            db.query_with_params("select id from t_g4_old", &[])
+                .await
+                .is_err()
+        );
+        db.exec_with_params("drop table if exists t_g4_new", &[])
+            .await
+            .unwrap();
+    }
+
+    /// G4（env-gated 真库重放，MySQL 8.0+）：同上。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_mysql_table_rename_replays() {
+        let url = match std::env::var("OJ_TEST_MYSQL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_MYSQL unset");
+                return;
+            }
+        };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for ddl in [
+            "drop table if exists t_g4_old",
+            "drop table if exists t_g4_new",
+            "create table t_g4_old (id int)",
+            "insert into t_g4_old (id) values (7)",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        let spec = json!({"objectType":"table","name":"t_g4_new","previousName":"t_g4_old",
+            "from":{"columns":[{"name":"id","nativeType":"int"}]},
+            "to":{"columns":[{"name":"id","nativeType":"int"}]}});
+        let out = ddl_diff(Dialect::MySql, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 1, "{out:?}");
+        assert!(stmts[0].contains("RENAME"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select id from t_g4_new", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["id"], json!(7), "{rows:?}");
+        assert!(
+            db.query_with_params("select id from t_g4_old", &[])
+                .await
+                .is_err()
+        );
+        db.exec_with_params("drop table if exists t_g4_new", &[])
             .await
             .unwrap();
     }
