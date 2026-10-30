@@ -880,6 +880,11 @@ fn classify_stmt(w: &[String]) -> (Risk, bool) {
         "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" | "PRAGMA" | "ANALYZE" | "VALUES" => {
             (Risk::ReadOnly, false)
         }
+        "KILL" => {
+            // MySQL 会话/语句取消（REQ-10 一期）：写语义但无 WHERE 面 → 非 dangerous，
+            // 不吃 confirm gate；read_only 别名/会话仍拒（REQ-11 旁路取消的服务端前提）。
+            (Risk::Write, false)
+        }
         _ => (Risk::Unknown, false),
     }
 }
@@ -1461,6 +1466,10 @@ mod tests {
         assert_eq!(risk_of("show tables"), Risk::ReadOnly);
         assert_eq!(risk_of("explain select 1"), Risk::ReadOnly);
         assert_eq!(risk_of("pragma table_info(t)"), Risk::ReadOnly);
+        // MySQL KILL（REQ-10 一期）：会话/语句取消是写语义，但无 WHERE 面 → 非 dangerous。
+        assert_eq!(risk_of("kill 42"), Risk::Write);
+        assert_eq!(risk_of("KILL QUERY 42"), Risk::Write);
+        assert_eq!(risk_of("kIlL 1"), Risk::Write);
     }
 
     /// 对抗性探测：每条都是「试图把写/DDL 伪装成只读」的击穿尝试。
@@ -1580,6 +1589,12 @@ mod tests {
         );
         assert_eq!(
             evaluate(&ro, &ctx, &classify("drop table t")),
+            Verdict::Violation(Reason::ReadOnly)
+        );
+        // KILL 升 Write 后：普通别名放行（旁路取消配方），read_only 仍拒。
+        assert_eq!(evaluate(&base, &ctx, &classify("kill 42")), Verdict::Allow);
+        assert_eq!(
+            evaluate(&ro, &ctx, &classify("kill query 42")),
             Verdict::Violation(Reason::ReadOnly)
         );
         // DDL 门
