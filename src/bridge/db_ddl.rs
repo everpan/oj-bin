@@ -657,14 +657,10 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
             .collect();
         let defs: Vec<String> = t_cols
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let after = if i == 0 {
-                    Some("<first>")
-                } else {
-                    Some(t_cols[i - 1].name.as_str())
-                };
-                col_def_sql(d, c, after)
+            .map(|c| {
+                // create 路径：列位置由声明顺序天然决定——FIRST/AFTER 是 ALTER 专属
+                // 语法，CREATE TABLE 渲染会让整条语句不可重放（逆运算真库腿暴露）。
+                col_def_sql(d, c, None)
             })
             .collect();
         let pk_inline = if pk.is_empty() {
@@ -677,13 +673,11 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                 .join(", ");
             format!(",\n  PRIMARY KEY ({cols})")
         };
-        // G1（REQ-09 §4.2）：建表保真——partitionBy（两方言）与 MySQL options
-        // 拼在闭合括号之后。语句体信任类校验（NUL/限长），标识符仍全走 quote_ident。
-        let mut tail = String::new();
-        if let Some(p) = to.get("partitionBy").and_then(Value::as_str) {
-            validate_statement_body("partitionBy", p)?;
-            tail.push_str(&format!(" PARTITION BY {p}"));
-        }
+        // G1（REQ-09 §4.2）：建表保真——MySQL options 与 partitionBy 拼在闭合括号
+        // 之后。**选项在前、分区在后**（同 SHOW CREATE 序）：MySQL 语法拒绝跟在分区
+        // 定义列表之后的表选项（逆运算真库腿实证 1064）。语句体信任类校验（NUL/限长），
+        // 标识符仍全走 quote_ident。
+        let mut opts_tail = String::new();
         if let Some(o) = to.get("options") {
             if d != Dialect::MySql {
                 return Err("ddlDiff: options are mysql-only".into());
@@ -701,17 +695,22 @@ pub fn ddl_diff(d: Dialect, spec: &Value) -> Result<Value, String> {
                 }
             }
             if let Some(e) = str_opt("engine")? {
-                tail.push_str(&format!(" ENGINE={e}"));
+                opts_tail.push_str(&format!(" ENGINE={e}"));
             }
             if let Some(c) = str_opt("charset")? {
-                tail.push_str(&format!(" DEFAULT CHARSET={c}"));
+                opts_tail.push_str(&format!(" DEFAULT CHARSET={c}"));
             }
             if let Some(c) = str_opt("collate")? {
-                tail.push_str(&format!(" COLLATE={c}"));
+                opts_tail.push_str(&format!(" COLLATE={c}"));
             }
             if let Some(c) = str_opt("comment")? {
-                tail.push_str(&format!(" COMMENT={}", quote_literal(&c)));
+                opts_tail.push_str(&format!(" COMMENT={}", quote_literal(&c)));
             }
+        }
+        let mut tail = opts_tail;
+        if let Some(p) = to.get("partitionBy").and_then(Value::as_str) {
+            validate_statement_body("partitionBy", p)?;
+            tail.push_str(&format!(" PARTITION BY {p}"));
         }
         stmts.push(format!(
             "CREATE TABLE {t} (\n  {}{}\n){tail}",

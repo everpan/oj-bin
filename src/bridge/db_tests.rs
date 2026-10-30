@@ -625,6 +625,193 @@ async fn real_pg_triggers_and_ops_kinds() {
     assert_eq!(d["scoped"]["capability"], json!("for_schema"), "{d}");
 }
 
+/// REQ-09 §4.2 逆运算判据（env-gated 真库，PG）：分区表 catalog("ddl") 抓回 →
+/// 构造 structure 走 ddlDiff(create) → 重放建副本 → 二次抓回比对分区段。
+#[tokio::test(flavor = "current_thread")]
+async fn real_pg_partitioned_roundtrip() {
+    let Ok(url) = std::env::var("OJ_TEST_PG") else {
+        eprintln!("skip: OJ_TEST_PG unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_PG empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    for s in [
+        "drop table if exists t_g5_rt",
+        "drop table if exists t_g5_rt2",
+        "create table t_g5_rt (d date, v int) partition by range (d)",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const c = await db.catalog("ddl", "t_g5_rt");
+                 const ddl = c.items[0].ddl;
+                 const m = ddl.match(/PARTITION BY (.+)$/m);
+                 if (!m) return json.fail(500, "抓回 DDL 缺 PARTITION BY: " + ddl);
+                 const cols = (await db.listColumns("t_g5_rt")).map((c2) =>
+                   ({name: c2.name, nativeType: c2.nativeType}));
+                 const out = await db.ddlDiff({objectType:"table", name:"t_g5_rt2", from:null,
+                   to:{columns:cols, partitionBy:m[1]}});
+                 json.ok({ddl, stmt:out.statements[0], n:out.statements.length});
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["n"], json!(1), "{d}");
+    let stmt = d["stmt"].as_str().unwrap();
+    assert!(
+        stmt.starts_with("CREATE TABLE \"t_g5_rt2\"") && stmt.contains("PARTITION BY RANGE (d)"),
+        "{stmt}"
+    );
+    // 重放建副本 → 二次抓回分区段一致。
+    db.exec_with_params(stmt, &[]).await.unwrap();
+    let b2 = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap2 = b2
+        .run_with(
+            r#"(async () => {
+                 const c = await db.catalog("ddl", "t_g5_rt2");
+                 json.ok({ddl: c.items[0].ddl});
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
+    assert_eq!(v2["code"], 0, "{v2}");
+    let ddl2 = v2["data"]["ddl"].as_str().unwrap();
+    assert!(ddl2.contains("PARTITION BY RANGE (d)"), "{ddl2}");
+    for s in [
+        "drop table if exists t_g5_rt",
+        "drop table if exists t_g5_rt2",
+    ] {
+        db.exec_with_params(s, &[]).await.unwrap();
+    }
+}
+
+/// REQ-09 §4.2 逆运算判据（env-gated 真库，MySQL）：带 ENGINE/CHARSET + 分区的建表
+/// → catalog("ddl") 抓回 → ddlDiff(create) 重放副本 → 二次抓回比对选项与分区段。
+#[tokio::test(flavor = "current_thread")]
+async fn real_mysql_partitioned_and_options_roundtrip() {
+    let Ok(url) = std::env::var("OJ_TEST_MYSQL") else {
+        eprintln!("skip: OJ_TEST_MYSQL unset");
+        return;
+    };
+    if url.is_empty() {
+        eprintln!("skip: OJ_TEST_MYSQL empty");
+        return;
+    }
+    let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+    // MySQL 分区 DDL 不受 prepared 协议支持（1064）——setup/重放走 raw_sql 文本通道；
+    // 内省（catalog）仍走 SqlxAccessor 查询面不受影响。
+    let raw = sqlx::MySqlPool::connect(&url).await.unwrap();
+    for s in [
+        "drop table if exists t_g5m_rt",
+        "drop table if exists t_g5m_rt2",
+        "create table t_g5m_rt (d date, v int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 \
+         PARTITION BY RANGE (YEAR(d)) (PARTITION p0 VALUES LESS THAN (2027))",
+    ] {
+        sqlx::raw_sql(s).execute(&raw).await.unwrap();
+    }
+    let b = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap = b
+        .run_with(
+            r#"(async () => {
+                 const c = await db.catalog("ddl", "t_g5m_rt");
+                 const ddl = c.items[0].ddl;
+                 // SHOW CREATE 把分区段包进版本注释（/*!50100 PARTITION BY ... */）——
+                 // 剥前缀取文本、去尾部 */，ddlDiff 契约是「PARTITION BY 之后」的文本。
+                 const pm = ddl.match(/PARTITION BY ([\s\S]+)$/);
+                 if (!pm) return json.fail(500, "抓回 DDL 缺 PARTITION BY: " + ddl);
+                 const part = pm[1].replace(/\s*\*\/\s*$/, "").trim();
+                 const em = ddl.match(/ENGINE=(\S+)/);
+                 const cm = ddl.match(/DEFAULT CHARSET=(\S+)/);
+                 if (!em || !cm) return json.fail(500, "抓回 DDL 缺 ENGINE/CHARSET: " + ddl);
+                 const out = await db.ddlDiff({objectType:"table", name:"t_g5m_rt2", from:null,
+                   to:{columns:[{name:"d",nativeType:"date"},{name:"v",nativeType:"int"}],
+                       options:{engine:em[1], charset:cm[1]},
+                       partitionBy:part}});
+                 json.ok({stmt:out.statements[0], n:out.statements.length});
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&cap.body).unwrap();
+    assert_eq!(v["code"], 0, "{v}");
+    let d = &v["data"];
+    assert_eq!(d["n"], json!(1), "{d}");
+    let stmt = d["stmt"].as_str().unwrap();
+    assert!(stmt.contains("ENGINE=InnoDB"), "{stmt}");
+    assert!(stmt.contains("DEFAULT CHARSET=utf8mb4"), "{stmt}");
+    assert!(stmt.contains("PARTITION BY RANGE"), "{stmt}");
+    // 重放建副本 → 二次抓回选项与分区段一致（raw_sql：分区 DDL 不走 prepared）。
+    // AssertSqlSafe：stmt 来自本测试 ddlDiff 渲染器对自身 catalog 抓回的重建，非外部输入。
+    let stmt_owned = stmt.to_string();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(stmt_owned))
+        .execute(&raw)
+        .await
+        .unwrap();
+    let b2 = Bridge::with_dbs_and_loader(
+        std::collections::HashMap::from([("default".to_string(), db.clone() as _)]),
+        Arc::new(InMemoryKV::new()),
+        SchemaRegistry::new(),
+        false,
+        None,
+        Default::default(),
+    );
+    let cap2 = b2
+        .run_with(
+            r#"(async () => {
+                 const c = await db.catalog("ddl", "t_g5m_rt2");
+                 json.ok({ddl: c.items[0].ddl});
+               })().catch(e => json.fail(500, String(e)))"#,
+            crate::bridge::RequestInfo::default(),
+        )
+        .await
+        .unwrap();
+    let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
+    assert_eq!(v2["code"], 0, "{v2}");
+    let ddl2 = v2["data"]["ddl"].as_str().unwrap();
+    assert!(ddl2.contains("ENGINE=InnoDB"), "{ddl2}");
+    assert!(ddl2.contains("PARTITION BY RANGE"), "{ddl2}");
+    for s in [
+        "drop table if exists t_g5m_rt",
+        "drop table if exists t_g5m_rt2",
+    ] {
+        sqlx::raw_sql(s).execute(&raw).await.unwrap();
+    }
+}
+
 /// REQ-08 收口 + REQ-10 一期（env-gated 真库，MySQL 腿）：triggers 直映
 /// information_schema 列（AFTER + INSERT，body/order 有值）；processlist / users /
 /// roles 形状；scope 拒绝同 PG 腿。
