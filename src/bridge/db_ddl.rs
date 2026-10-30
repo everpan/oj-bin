@@ -113,12 +113,17 @@ fn parse_columns(dim: &str, v: Option<&Value>) -> Result<Option<Vec<ColSpec>>, S
                 .unwrap_or(false),
             identity: c.get("identity").and_then(Value::as_str).map(String::from),
             comment: c.get("comment").and_then(Value::as_str).map(String::from),
-            previous_name: match c.get("previousName").and_then(Value::as_str) {
-                Some(p) => {
-                    quote_ident(Dialect::Postgres, p)?;
-                    Some(p.to_string())
+            // REQ-13：只认 to 侧；from 侧出现 previousName 一律忽略（含免校验）。
+            previous_name: if dim == "to" {
+                match c.get("previousName").and_then(Value::as_str) {
+                    Some(p) => {
+                        quote_ident(Dialect::Postgres, p)?;
+                        Some(p.to_string())
+                    }
+                    None => None,
                 }
-                None => None,
+            } else {
+                None
             },
         });
     }
@@ -1335,6 +1340,108 @@ mod tests {
             );
             assert!(text.contains("RENAME COLUMN"), "{text}");
         }
+    }
+
+    /// REQ-13 验收 #2/#8（env-gated 真库重放，PG）：rename 语句重放后数据原样、旧名消失。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_pg_rename_column_preserves_data() {
+        let url = match std::env::var("OJ_TEST_PG") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_PG unset");
+                return;
+            }
+        };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for ddl in [
+            "drop table if exists t_req13",
+            "create table t_req13 (a int4, keep int)",
+            "insert into t_req13 (a, keep) values (42, 7)",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        let spec = json!({"objectType": "table", "name": "t_req13",
+            "from": {"columns": [{"name": "a", "nativeType": "int4"},
+                                 {"name": "keep", "nativeType": "int"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int4", "previousName": "a"},
+                               {"name": "keep", "nativeType": "int"}]}});
+        let out = ddl_diff(Dialect::Postgres, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 1, "{out:?}");
+        assert!(stmts[0].contains("RENAME COLUMN"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select b, keep from t_req13", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["b"], json!(42), "{rows:?}");
+        assert_eq!(rows[0]["keep"], json!(7), "{rows:?}");
+        assert!(
+            db.query_with_params("select a from t_req13", &[])
+                .await
+                .is_err()
+        );
+        db.exec_with_params("drop table if exists t_req13", &[])
+            .await
+            .unwrap();
+    }
+
+    /// REQ-13 验收 #2/#8（env-gated 真库重放，MySQL 8.0+）：同上。
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_mysql_rename_column_preserves_data() {
+        let url = match std::env::var("OJ_TEST_MYSQL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skip: OJ_TEST_MYSQL unset");
+                return;
+            }
+        };
+        let db = crate::bridge::SqlxAccessor::arc(&url).await.unwrap();
+        for ddl in [
+            "drop table if exists t_req13",
+            "create table t_req13 (a int, keep int)",
+            "insert into t_req13 (a, keep) values (42, 7)",
+        ] {
+            db.exec_with_params(ddl, &[]).await.unwrap();
+        }
+        let spec = json!({"objectType": "table", "name": "t_req13",
+            "from": {"columns": [{"name": "a", "nativeType": "int"},
+                                 {"name": "keep", "nativeType": "int"}]},
+            "to": {"columns": [{"name": "b", "nativeType": "int", "previousName": "a"},
+                               {"name": "keep", "nativeType": "int"}]}});
+        let out = ddl_diff(Dialect::MySql, &spec).unwrap();
+        let stmts: Vec<&str> = out["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(stmts.len(), 1, "{out:?}");
+        assert!(stmts[0].contains("RENAME COLUMN"), "{stmts:?}");
+        for s in &stmts {
+            db.exec_with_params(s, &[]).await.unwrap();
+        }
+        let rows = db
+            .query_with_params("select b, keep from t_req13", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["b"], json!(42), "{rows:?}");
+        assert_eq!(rows[0]["keep"], json!(7), "{rows:?}");
+        assert!(
+            db.query_with_params("select a from t_req13", &[])
+                .await
+                .is_err()
+        );
+        db.exec_with_params("drop table if exists t_req13", &[])
+            .await
+            .unwrap();
     }
 
     /// 畸形 Structure → 参数错误（Err），不 panic。
