@@ -3,6 +3,11 @@
 > 上游诉求源：`../oj-dbx/docs/upstream/REQ-12-bulk-import-primitive.md`（§3.1-3.4 + §4
 > 三硬约束 + §5 验收）。目标版本 v0.1.115（若与 REQ-11 合并发布则顺延）。纯 host 侧，
 > **零 ABI**。复用面已勘察：`ExportRegistry` 的任务/配额/幂等/清扫模型可直接镜像。
+>
+> **builder-check 修订（2026-11-01）**：三处——守卫三档与 `check_tenant_raw` 对账
+> （§4.2 重写为「镜像裸 SQL 守卫裁决」矩阵，Deny 下未登记表不再放行）；长期方案
+> 定性修正（逐行租户强制是 import 侧工作，非守卫特性）；PG 首选从 COPY 降为
+> 多值 INSERT（`PgCopyIn` 在 Any driver 上不存在，COPY 尝试登记为未来工作）。
 
 ## 1. 意图与为什么
 
@@ -16,8 +21,9 @@
 
 1. **G1 三件套**：`db.import(args) → {taskId}`（任务式，同 export 模型）+
    `importStatus`（state/rows/errors/bytes/samples）+ `importCancel`（幂等）。
-2. **G2 方言实现**：PG COPY FROM STDIN（csv）为首选 + 多值 INSERT 备选/upsert 路径；
-   MySQL 多值 INSERT（ON DUPLICATE KEY UPDATE 支持 upsert）为首选，
+2. **G2 方言实现**：PG / MySQL 均以**多值 INSERT**（全参数化）为主路径——
+   PG upsert = 临时表 + `ON CONFLICT`；`PgCopyIn` 不在 Any driver 上（builder-check
+   Q3），COPY 登记为未来工作；MySQL upsert = `ON DUPLICATE KEY UPDATE`；
    LOAD DATA LOCAL INFILE 不做（托管库常禁）；sqlite 单事务 + 多值 INSERT。
 3. **G3 失败行可定位**：`errors > 0` 时 `samples[]`（源行号 + 原因 + raw 样本），
    行号与源文件一一对应（非批次偏移）。
@@ -86,15 +92,25 @@ importCancel(taskId): Promise<{ cancelled: true }>;
 - **op 层复用（4.1）**：`op_db_import` 走与 `db.exec` 同门判定——`db_access` write
   判定 + `allow_ddl`（mode=replace 需 ddl 许可）+ 危险写确认 token（replace =
   先删后插，按 truncate 同档要求确认 token）。**不开旁路。**
-- **租户守卫（4.3，最关键）——fail-closed 三档**：
-  1. `sql_guard == Off`：放行（导入仍过 op 授权与配额）；
-  2. `sql_guard != Off` 且目标表**未登记** ownership：放行（守卫本就不管未登记
-     表——与裸 SQL 同口径）；
-  3. `sql_guard != Off` 且目标表**已登记**：`OJ_DB_UNSUPPORTED(capability=
-     "import_under_guard")`——**fail-closed，不静默放行**。
-  长期方案（守卫认识 `db.table()` 构造器形状后放开 2→构造器路径）登记为未来工作。
-  **不做**「逐行参数级校验」替代方案（成本高且与守卫的声明式模型分叉，上游推荐
-  方案 3 即本决策）。
+- **租户守卫（4.3，最关键）——镜像裸 SQL 裁决矩阵（builder-check Q1 修订）**：
+  原则：**`db.import` 对目标表的放行绝不宽于等效裸 `INSERT`**（反目标「绕过租户
+  守卫」）。按 `guard.rs::check_tenant_raw` 实际语义（已对账）：
+
+  | guard 模式 | 目标表未登记 | 目标表已登记且 tenant-scoped | 已登记但非 scoped |
+  |---|---|---|---|
+  | Off | 放行 | 放行 | 放行 |
+  | Warn | 放行（记 warn） | **`OJ_DB_UNSUPPORTED(capability="import_under_guard")`** | 放行（同裸 SQL） |
+  | Deny | **拒绝**（同裸 SQL「cannot verify tenant scope」——Deny 下无登记表即拒） | **`import_under_guard`** | 放行（同裸 SQL） |
+
+  即：已登记且 scoped → 一律 fail-closed（守卫只能验「某参数 = 当前 tid」，无法
+  证明导入每行都属该租户）；其余档位**逐档复用守卫对裸 SQL 的既有裁决**（直接调
+  `check_tenant_raw` 的判定 helper，不重写矩阵）。
+- **长期方案定性修正（builder-check Q2）**：真正的解法是 **import 侧逐行租户强制**
+  （导入实现把 tenant 列强制写成当前 tid——多值 INSERT 参数化路径本来就把 tid
+  作为参数绑定，强制是 host 侧小事），而非「守卫认识构造器形状」（`check_tenant_raw`
+  是文本扫描，且带 tid 参数的多值 INSERT 今日已过守卫——卡点从来不是守卫）。
+  登记为未来工作（本批不做）；落地后 Warn/Deny 下 scoped 表从 `import_under_guard`
+  升级为可用。
 - 表名/列名标识符：只走 `quote_ident` + 白名单（**绝不**来自 CSV 表头原文——
   csv 表头只用于列序匹配，列名以 `columns` 参数或 SchemaRegistry 登记为准；
   表头文本与登记列名不符 → 参数错误 fail-fast，不猜）。
@@ -103,9 +119,13 @@ importCancel(taskId): Promise<{ cancelled: true }>;
 
 | 方言 | 首选 | 模式适配 | 批次/事务 |
 |---|---|---|---|
-| PG | `COPY tbl(cols) FROM STDIN WITH (FORMAT csv, HEADER [false])`（`sqlx::postgres::PgCopyIn`，二进制协议，不走 SQL 文本扫描） | append/ replace（先 DELETE）直 COPY；**upsert = COPY 到临时表 + `INSERT ... SELECT ... ON CONFLICT (keys) DO UPDATE`**（COPY 不支持 ON CONFLICT，上游已点名） | 批内单事务；COPY 本身就是一个批量原语，batchSize 按 10k 行收敛内存 |
+| PG | 多值 `INSERT INTO tbl(cols) VALUES (...),(...)`（**builder-check Q3 修订**：`PgCopyIn`/`copy_in_raw` 只在 `PgConnection` 上，`AnyPool` 无 COPY API——COPY 首选放弃，登记为未来工作见 §7） | append 直插；upsert = 多值 INSERT 到临时表 + `INSERT ... SELECT ... ON CONFLICT (keys) DO UPDATE`（COPY 不支持的 ON CONFLICT 由该路径天然解决）；replace = 显式 `DELETE` + 多值 INSERT，批外单事务 | **65535 绑定参数上限 / 列数**双收敛（与 MySQL 同——50 万行 × 10 列 = 100 万参数，须分批）；批内单事务 |
 | MySQL | 多值 `INSERT INTO tbl(cols) VALUES (...),(...)`（构造器形态，守卫若未来放开认识此形状） | append 直插；upsert = `ON DUPLICATE KEY UPDATE`（**要求表上有唯一键**，缺 → 参数错误不猜）；replace 模式**不用** `REPLACE INTO`（隐式删+插，FK  cascade 语义不同）——显式 `DELETE FROM tbl` + 多值 INSERT，批外单事务 | batchSize 按 `max_allowed_packet` 的 1/4 与 65535/列数双收敛；批内单事务 |
 | SQLite | 单事务 + 多值 INSERT | 同 MySQL（无 upsert 原语 → `INSERT OR REPLACE` 仅在 conflictKeys=rowid 时可用，否则参数错误） | 单事务包住全部批次是性能关键 |
+
+- **性能口径**：50 万行 < 60s 验收**骑在多值 INSERT 主路径上**（非 COPY）——
+  PG/MySQL 单批 5k–10k 行、绑定参数、批内单事务是主流做法，60s 预算充足；
+  env-gated 性能腿照验，若不过再升档（COPY 未来工作）而非先射箭后画靶。
 
 - **abort 策略**：批内事务回滚 → 整体 failed，已提交前序批次保留（rows = 已提交）。
 - **skip 策略**：单行失败（类型转换/约束）记 samples（line = 源文件绝对行号：
@@ -123,7 +143,7 @@ importCancel(taskId): Promise<{ cancelled: true }>;
 
 ### 4.5 安全与红线自查
 
-- 值只走绑定参数（COPY 走二进制协议绑定等价物）——SQL 注入红线不破：拼进 SQL
+- 值只走绑定参数（多值 INSERT 全参数化）——SQL 注入红线不破：拼进 SQL
   文本的只有 quote_ident 过的表/列名与引擎常量。
 - `mode=replace` 是危险写：确认 token + allow_ddl + 租户守卫三档全过才执行。
 - 导入任务与导出任务配额**互相独立**（不共享计数器），但同受各自段约束。
@@ -137,7 +157,7 @@ importCancel(taskId): Promise<{ cancelled: true }>;
 | skip + maxErrors=100 超限整体 failed | 离线腿（坏行注入） |
 | 失败样本行号与源文件一一对应 | 离线腿（header 偏移 + 批内偏移断言绝对行号） |
 | upsert + conflictKeys 重跑两次行数不变 | env-gated 双腿 |
-| sql_guard 开启已登记表 → 结构化拒绝 | 离线腿（guard fixture，钉 capability 名） |
+| sql_guard 开启 + 已登记且 scoped 表 → 结构化拒绝（`import_under_guard`）；Deny + 未登记 → 拒绝（镜像裸 SQL） | 离线腿（guard fixture，钉 capability 名与两路裁决） |
 | exportStatus(importId) not found | 离线腿（前缀隔离） |
 
 ## 6. 交付物清单
@@ -154,10 +174,12 @@ importCancel(taskId): Promise<{ cancelled: true }>;
 
 ## 7. 留给计划阶段的口子
 
-- PG COPY 在 `AnyPool` 上的可用性——COPY FROM STDIN 需要 PgConnection 专有 API，
-  Any driver 可能要走 `raw_sql` 的 `COPY` fallback（`COPY ... FROM '路径'` 不行——
-  服务端文件权限；备选 = 多值 INSERT 全程）。**计划 Task 0 验证 PgCopyIn × AnyPool；
-  不通则 PG 首选降为多值 INSERT + 临时表 upsert**（性能验收 60s 对 50 万行仍可过，
-  多值 INSERT 单批 10k × 绑定参数是主流做法）。
 - MySQL `max_allowed_packet` 运行期探测（`SHOW VARIABLES`）vs 配置快照——取保守
   缺省（16MB 的 1/4）+ 配置可覆盖。
+- PG COPY（`PgCopyIn` × typed `PgPool` 旁路，绕开 Any driver）登记为未来工作——
+  触发条件：多值 INSERT 性能腿不过 60s 验收。
+- 守卫矩阵复用面：`check_tenant_raw` 的判定 helper 是否可直接以「单表 + 无文本」
+  形态调用，还是抽一个 `judge_table(table) -> GuardVerdict` 小函数——计划期定，
+  不重写守卫语义。
+- env-gated 取消腿的具体慢批构造（MySQL `SLEEP()` 内嵌 vs 批间 Notify 检查点）
+  ——计划期定。
