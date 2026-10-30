@@ -155,8 +155,12 @@ pub async fn op_db_stream_open(
                     item = stream.next() => {
                         match item {
                             Some(Ok(row)) => {
-                                if meter.feed(&row) == super::db_quota::Feed::Stop {
-                                    pump_shared.result_bytes.store(meter.counted, Ordering::SeqCst);
+                                let feed = meter.feed(&row);
+                                // REQ-11: keep result_bytes live during flight so
+                                // info()/onProgress see cumulative bytes, not just
+                                // the end-of-stream snapshot.
+                                pump_shared.result_bytes.store(meter.counted, Ordering::SeqCst);
+                                if feed == super::db_quota::Feed::Stop {
                                     if meter.exceeded {
                                         match on_exceed {
                                             super::db_policy::OnExceed::Fail => {

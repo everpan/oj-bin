@@ -577,6 +577,77 @@ mod tests {
         assert!(err.contains("not done"), "{err}");
     }
 
+    // REQ-11 Task 4：回调面——onOpen 收 exec_ id、onProgress 相位末位 done。
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_onopen_onprogress_callback_surface() {
+        let (b, _reg) = exec_bridge_with_reg("cbopen").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const seen = { open: null, phases: [] };
+              const rows = await db.query("select id from t order by id", null, {
+                onOpen: (id) => { seen.open = id; },
+                onProgress: (p) => { seen.phases.push(p.phase); },
+              });
+              return json.ok({
+                openOk: typeof seen.open === "string" && seen.open.startsWith("exec_"),
+                n: rows.length,
+                phases: seen.phases,
+              });
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["openOk"], json!(true), "{v}");
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+        let phases = v["data"]["phases"].as_array().expect("phases: {v}");
+        assert!(phases.len() >= 2, "phases: {v}");
+        assert_eq!(phases.last().unwrap(), &json!("done"), "{v}");
+    }
+
+    // REQ-11 Task 4：onOpen 抛异常不得影响执行（记 warn、查询照常返回行）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_onopen_throw_still_returns_rows() {
+        let (b, _reg) = exec_bridge_with_reg("cbthrow").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const rows = await db.query("select id from t order by id", null, {
+                onOpen() { throw new Error("boom"); },
+              });
+              return json.ok({ n: rows.length });
+            })()"#,
+        )
+        .await;
+        assert_eq!(v["data"]["n"], json!(2), "{v}");
+    }
+
+    // REQ-11 Task 4：stream onProgress 节流上报——末条 bytes>=rows、elapsedMs 单调。
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_onprogress_throttled_stats() {
+        let b = exec_bridge("cbprog").await;
+        let v = run(
+            &b,
+            r#"(async () => {
+              const big = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 5000000) SELECT x FROM cnt";
+              const prog = [];
+              const it = db.stream(big, [], { onProgress: (p) => { prog.push(p); } });
+              let n = 0;
+              for await (const row of it) { n++; if (n >= 100) break; }
+              const last = prog.length ? prog[prog.length - 1] : null;
+              let mono = true;
+              for (let i = 1; i < prog.length; i++) {
+                if (prog[i].elapsedMs < prog[i - 1].elapsedMs) mono = false;
+              }
+              return json.ok({ n, count: prog.length, bytesOk: last ? last.bytes >= last.rows : false, mono });
+            })()"#,
+        )
+        .await;
+        assert!(v["data"]["n"].as_i64().unwrap() >= 100, "{v}");
+        assert!(v["data"]["count"].as_i64().unwrap() >= 1, "{v}");
+        assert_eq!(v["data"]["bytesOk"], json!(true), "{v}");
+        assert_eq!(v["data"]["mono"], json!(true), "{v}");
+    }
+
     /// 取消语义落在**请求边界**上：同一请求内开流 → cancel → 下一次 `next` 必须抛
     /// cancelled（而非静默 done——消费方不得误以为数据取完）；错误文案只含 id 前缀。
     #[tokio::test(flavor = "current_thread")]

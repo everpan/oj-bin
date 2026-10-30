@@ -998,6 +998,41 @@ function callOpts(opts) {
   return { timeoutMs: opts.timeoutMs };
 }
 
+// REQ-11 (v0.1.114): callback surface for db.query/db.exec. When opts carries
+// onOpen/onProgress the call runs the begin/poll/take loop instead of the direct
+// op: onOpen(executionId) fires as soon as the execution is registered (the id is
+// the db.cancel handle), onProgress({phase, elapsedMs, rows?}) gets phase events
+// throttled to >=100ms (done always emitted). onOpen throwing is logged and never
+// affects the execution (design doc section 7).
+function callWithCallbacks(name, sql, params, opts, kind) {
+  const begin = kind === "query" ? op_db_query_begin : op_db_exec_begin;
+  const take = kind === "query" ? op_db_query_take : op_db_exec_take;
+  const prog = typeof opts.onProgress === "function" ? opts.onProgress : null;
+  return dbOpWrap(begin(name, sql, params, callOpts(opts))).then((v) => {
+    if (typeof opts.onOpen === "function") {
+      try { opts.onOpen(v.executionId); }
+      catch (e) {
+        // best-effort: some runtime entries (oj test, embedded) wire no console.
+        try { console.warn("onOpen: " + (e && e.message ? e.message : e)); } catch (_) {}
+      }
+    }
+    let lastEmit = 0;
+    const emit = (ev) => {
+      if (ev.phase !== "done" && Date.now() - lastEmit < 100) return;
+      lastEmit = Date.now();
+      const out = { phase: ev.phase, elapsedMs: ev.elapsed_ms };
+      if (ev.rows !== null && ev.rows !== undefined) out.rows = ev.rows;
+      prog(out);
+    };
+    const loop = () => dbOpWrap(op_db_call_poll(String(v.executionId), 100)).then((r) => {
+      if (prog) r.events.forEach(emit);
+      if (r.done) return dbOpWrap(take(String(v.executionId)));
+      return loop();
+    });
+    return loop();
+  });
+}
+
 // v0.1.95: one awaitable surface for db.session. Some of its ops are sync (attach/detach/
 // list/info/stats/touch/closeAll); wrapping them keeps "every session call returns a Promise"
 // true, so a failure always arrives as a rejection at the caller's `await` instead of as a
@@ -1030,9 +1065,23 @@ globalThis.DB = function (name) {
   dbEpoch.set(name, epoch);
   dbCache.set(name, {
       ...condFactories(),
-      // raw SQL + bound params (params optional).
-      query: (sql, params, opts) => dbOpWrap(op_db_query(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
-      exec: (sql, params, opts) => dbOpWrap(op_db_exec(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
+      // raw SQL + bound params (params optional). Callback opts (onOpen/onProgress)
+      // route to the REQ-11 begin/poll/take loop; otherwise the direct op (which is
+      // also fully registered for db.cancel).
+      query: (sql, params, opts) => {
+        const p = params === undefined ? null : encodeParams(params);
+        if (opts && (typeof opts.onOpen === "function" || typeof opts.onProgress === "function")) {
+          return callWithCallbacks(name, String(sql), p, opts, "query");
+        }
+        return dbOpWrap(op_db_query(name, String(sql), p, callOpts(opts)));
+      },
+      exec: (sql, params, opts) => {
+        const p = params === undefined ? null : encodeParams(params);
+        if (opts && (typeof opts.onOpen === "function" || typeof opts.onProgress === "function")) {
+          return callWithCallbacks(name, String(sql), p, opts, "exec");
+        }
+        return dbOpWrap(op_db_exec(name, String(sql), p, callOpts(opts)));
+      },
       // G3 (v0.1.108): cross-dialect execution plan, normalized to a single PlanNode tree.
       explain: (sql, params, opts) => dbOpWrap(op_db_explain(name, String(sql), params === undefined ? null : encodeParams(params), callOpts(opts))),
       // U-18 task-based export (v0.1.104): returns {taskId} immediately; a Rust
@@ -1142,6 +1191,19 @@ globalThis.DB = function (name) {
           swallow(openIds().then((v) => op_db_stream_close(v.id)));
         };
         const emitOpen = (v) => { if (opts && typeof opts.onOpen === "function") opts.onOpen(v.executionId); };
+        // REQ-11 (v0.1.114): throttled progress stats for both consumption modes.
+        const prog = opts && typeof opts.onProgress === "function" ? opts.onProgress : null;
+        const progStart = Date.now();
+        let progLast = 0;
+        const emitProg = (id) => {
+          if (!prog || Date.now() - progLast < 100) return;
+          progLast = Date.now();
+          swallow(
+            dbOpWrap(op_db_stream_info(id))
+              .then((i) => prog({ rows: i.rows, bytes: i.bytes, elapsedMs: Date.now() - progStart }))
+              .catch(() => {})
+          );
+        };
         if (opts && typeof opts.onRow === "function") {
           return (async () => {
             try {
@@ -1151,6 +1213,7 @@ globalThis.DB = function (name) {
                 const row = await dbOpWrap(op_db_stream_next(v.id));
                 if (row === null) break;
                 opts.onRow(row);
+                emitProg(v.id);
               }
             } finally {
               close();
@@ -1178,6 +1241,7 @@ globalThis.DB = function (name) {
                     close();
                     return { done: true, value: undefined };
                   }
+                  emitProg(v.id);
                   return { done: false, value: row };
                 } catch (e) {
                   await readInfo(); // snapshot final stats before close() deregisters
